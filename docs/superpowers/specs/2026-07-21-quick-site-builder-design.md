@@ -53,7 +53,7 @@
 ### 关键设计决策
 
 1. **不做代码生成**。代码生成由 Quick Desktop（或 Quick 集成的 Claude Code / Kiro）完成——这是 Quick 的价值所在。本方案只做 Quick 做不了的"部署到 AWS"一段。参考项目 Solution 2 的 Strands Agent / Code Interpreter / Model Router 整体不引入。
-2. **manus Solution 1（子域名路由）几乎原样复用**，唯一改造：Lambda@Edge 查路由后增加 auth 策略检查（路由表加 `require_auth` / `allowed_users` / `owner` 字段）。
+2. **manus Solution 1（子域名路由）复用改造**：Lambda@Edge 查路由后增加 auth 策略检查（路由表加 `require_auth` / `allowed_users` / `owner` / `route_mode` 字段）。**CloudFront 全站禁用缓存（CACHING_DISABLED）**——origin-request 事件只在 cache miss 时执行，任何缓存都会绕过鉴权并可能跨子域串内容；PoC 流量下无缓存的成本影响可忽略，精细缓存（viewer-request 鉴权 + cache key 分区）记为二期。
 3. **后端部署走 zip + Lambda Web Adapter Layer，不用容器镜像**。manus README 记录的 LWA 失败全部是 Docker 镜像模式（`exec format error` 为镜像架构问题）；参考文档 Solution 2 实测 zip + 公开 Layer ARN（`arn:aws:lambda:<region>:753240598075:layer:LambdaAdapterLayerX86:28`）路线可行，且免去 ECR/Docker 构建链。
 4. **部署异步化**规避 Quick MCP 60 秒工具调用超时（HTTP 424）：`deploy_site` 提交即返回 jobId，Skill 轮询 `get_deploy_status`。
 5. **站点代码零 auth 逻辑**：鉴权统一在边缘做，生成代码越少越不容易错，最符合业务人员场景。
@@ -107,8 +107,8 @@ my-site/
 ```
 
 - `tier`: `static` | `fullstack-nosql` | `fullstack-sql`
-- `backend.runtime`: `nodejs22.x` | `python3.13`（PoC 只支持这两个）
-- `database.engine`: `none` | `dynamodb` | `dsql`；dynamodb 时 `tables` 列表名 + 主键定义；dsql 时 schema 在 `schema.sql`
+- `backend.runtime`: PoC 仅支持 `nodejs22.x`（Express）；Python 支持记为二期（需补 db.py 模板、Python fixture 与 E2E 后才宣称支持）
+- `database.engine`: `none` | `dynamodb` | `dsql`；dynamodb 时 `tables` 列表名 + 主键定义（表名/主键须匹配 `[a-z][a-z0-9_-]*`，至多 10 张，不得重复）；dsql 时 schema 在 `schema.sql`
 - `auth.allowed_users`: `"org"`（全组织飞书用户）或邮箱数组
 
 三档 tier 的生成约束：
@@ -123,8 +123,9 @@ my-site/
 
 1. 前端 API 调用一律相对路径 `/api/*`，禁止 localhost、禁止硬编码域名。前后端同域名部署（路由层按 `/api/*` 分流），消除参考方案里"两步部署 + `{{BACKEND_URL}}` 占位符注入"的复杂度。
 2. 站点代码不写任何登录逻辑。需要当前用户时读请求头 `x-user-email` / `x-user-name`（Edge 鉴权通过后注入），后端直接信任。
-3. DSQL 访问只通过 Skill 提供的固定模板文件 `db.js` / `db.py`（原样复制进 backend/，内部用 IAM token 现签连接并 SET search_path）；schema 全部写在 `schema.sql`（执行器负责执行）；Skill 中写明 DSQL 不支持的 PG 特性（外键约束、SERIAL、JSONB 列、触发器/PLpgSQL、临时表等）要求生成时规避（UUID 主键、TEXT 存 JSON 等替代）。DynamoDB 只用 SDK 基础 CRUD。
-4. 无本地文件写入、无后台常驻任务（Lambda 约束）；监听端口读 `PORT` 环境变量。
+3. DSQL 访问只通过 Skill 提供的固定模板文件 `db.js`（原样复制进 backend/，内部用站点专属 PG role 的非 admin IAM token 现签连接并 SET search_path）；schema 全部写在 `schema.sql`（执行器负责执行）；Skill 中写明 DSQL 不支持的 PG 特性（外键约束、SERIAL、JSONB 列、触发器/PLpgSQL、临时表等）要求生成时规避（UUID 主键、TEXT 存 JSON 等替代）。DynamoDB 只用 SDK 基础 CRUD。
+4. 无本地文件写入、无后台常驻任务（Lambda 约束）；监听端口读 `PORT` 环境变量；API 请求/响应体 ≤1MB（Edge 转发上限）。
+5. 前端渲染用户输入时用 `textContent` 或转义，禁止把输入直接拼进 `innerHTML`（防存储型 XSS——站点在组织内共享会话，XSS 危害被顶域 cookie 放大）。
 
 **Skill 工作流**：需求澄清 → 按 tier 生成代码 → 本地预览确认 → 用户说"部署" → 打包 zip → 调 MCP `deploy_site`（拿 presigned URL 上传产物）→ 轮询 `get_deploy_status` → 返回站点 URL。业务人员全程自然语言对话。
 
@@ -136,12 +137,16 @@ my-site/
 
 | 工具 | 行为 | 返回 |
 |---|---|---|
-| `deploy_site` | 校验 site.json 概要 → 生成 jobId + 产物上传 presigned URL；确认上传后写任务表、启动 Step Functions | jobId、upload_url |
-| `get_deploy_status` | 查任务表 | status/phase/error/url |
-| `list_my_sites` | 按 owner 查任务表 | 站点列表 |
+| `deploy_site` | 新站点分配 siteId（更新则校验 owner）→ 生成 jobId + 产物上传 presigned URL（15 分钟有效，限制大小） | jobId、siteId、upload_url |
+| `confirm_upload` | HeadObject 确认 zip 已上传 → jobs 表条件迁移 PENDING→RUNNING（防重复提交）→ 以 jobId 为 execution name 启动 Step Functions（天然幂等） | status |
+| `get_deploy_status` | 查任务表（owner 校验） | status/phase/error/url |
+| `list_my_sites` | 按 owner 查站点表 | 站点列表 |
 | `undeploy_site` | 校验 owner → 提交下线任务 | jobId |
 
-- **认证**：MCP OAuth 对接 Cognito（同一 User Pool），token 里的飞书邮箱即 `owner`。客户端不支持 OAuth 时降级为个人 API Key（Cognito 侧签发，仍映射飞书身份）。
+`deploy_site`/`confirm_upload` 两段式源于 presigned-URL 上传模式：客户端上传完产物后显式确认，MCP 才启动执行。
+
+- **认证**：MCP OAuth 对接 Cognito（同一 User Pool），token 里的飞书邮箱即 `owner`。客户端不支持 OAuth 时降级为个人 API Key（Cognito 侧签发，仍映射飞书身份）——**记为二期，PoC 仅支持 OAuth**。
+- **前置 Spike**：AgentCore Runtime 对 JWT claims（email）向容器的透传机制需真实环境验证后才能锁定 `_caller_email` 实现（读网关注入头 vs 自行解码 Bearer JWT）。
 - **产物通道**：MCP 不直接传文件（不可靠 + AgentCore 容器无文件落地能力），走 S3 presigned URL 由客户端直接 PUT `site.zip`。
 - **所有工具秒级返回**，无 60s 超时风险。
 
@@ -167,19 +172,29 @@ my-site/
 关键细节：
 
 - **依赖安装在 CodeBuild**：`npm install` / `pip install` 不在 Lambda 里跑（磁盘/可靠性问题），CodeBuild 是无 Docker 依赖的托管构建点；产物 zip 存 artifacts bucket。
-- **DSQL 策略**：共享 cluster、每站点独立 **schema**（DSQL 不支持 `CREATE DATABASE`，每 cluster 仅一个 `postgres` 库；schema 秒级创建，PoC 一个 cluster 足够）。凭证走 IAM auth token（DSQL 原生，无密码管理），站点 Lambda 运行时现签 token 连接，`DSQL_ENDPOINT` + `DSQL_SCHEMA` 环境变量注入。schema.sql 执行时逐条 DDL（DSQL 限制：每事务一条 DDL）。
-- **幂等与更新**：同一 siteId 重复 `deploy_site` = 更新部署（覆盖 S3、更新 Lambda 代码）。schema 演进约定：首次部署执行 `schema.sql`；后续变更写在 `migrations/NNN_*.sql`，执行器按序号执行未跑过的文件（已执行记录存任务表）。subdomain 不变，站点 URL 稳定。
+- **DSQL 策略**：共享 cluster、每站点独立 **schema**（DSQL 不支持 `CREATE DATABASE`，每 cluster 仅一个 `postgres` 库；schema 秒级创建，PoC 一个 cluster 足够）。schema.sql 执行时逐条 DDL（DSQL 限制：每事务一条 DDL），语句拆分用 `sqlparse`（不能裸 `split(";")`——会破坏含分号的字符串与注释）。
+- **站点运行时隔离（站点代码是不可信代码）**：站点由 AI 生成、owner 可任意改，必须按不可信代码对待。**每站点独立 Lambda 执行角色** `site-rt-{site_id}`：
+  - DynamoDB 站点：仅允许访问 `site-data-{site_id}-*` 表；
+  - DSQL 站点：执行器以 admin 建 per-site PG role `site_{id}_app`（`GRANT USAGE/ALL ON SCHEMA site_{id}`，无其他 schema 权限），`AWS IAM GRANT` 映射到该站点执行角色，仅授 `dsql:DbConnect`（非 admin）；站点代码模板 `db.js` 用普通 `getDbConnectAuthToken` + 对应 PG role 连接；
+  - 执行器角色持 `dsql:DbConnectAdmin` 仅用于建 schema/role/migration——平台身份与站点身份严格分离。
+- **幂等与更新**：同一 siteId 重复 `deploy_site` = 更新部署。Step Functions execution name = jobId（同一 job 重复启动被 SFN 拒绝），confirm_upload 前置 jobs 表条件更新 PENDING→RUNNING（重复确认直接报错）。schema 演进约定：首次部署执行 `schema.sql`；后续变更写在 `migrations/NNN_*.sql`，执行器按序号执行未跑过的文件，**每执行完一个文件立即记录**（中途失败不重复执行已完成的）。前端发布走版本化前缀 + 路由原子切换（见 §3.4）。subdomain 不变，站点 URL 稳定。
 - **任务表**（DynamoDB `deploy-jobs`）：`jobId, siteId, owner(飞书email), status, phase, error, url, timestamps`。
-- **权限模型**：执行器角色是全系统权限最大者，所有创建的资源强制 `site-*` 命名前缀 + 项目标签，IAM policy 按前缀限定（沿用 manus 项目 `*WebRouterStack*` 最小权限模式）。
+- **产物防护**：confirm_upload 时 HeadObject 校验 zip 本体 ≤50MB；validate 步骤校验解压后总大小（≤200MB）、文件数（≤2000）、压缩比（≤100:1，防 zip bomb）。（presigned PUT 不支持 content-length-range 条件——那是 presigned POST 的能力，故校验后置。）
+- **权限模型**：执行器角色是全系统权限最大者，所有创建的资源强制 `site-*` 命名前缀 + 项目标签，IAM policy 按前缀限定（沿用 manus 项目 `*WebRouterStack*` 最小权限模式）。S3 批量操作一律走 paginator + 每批 ≤1000 对象。
 
 ### 3.4 路由 + 鉴权层（manus 复用改造）
 
 路由表（DynamoDB）在 manus 原表基础上扩展：
 
 ```
-subdomain (PK) | static_target (S3 网站端点) | api_target (Lambda Function URL)
-| require_auth (bool) | allowed_users ("org" 或 ["a@x.com", ...]) | owner (飞书 email)
+subdomain (PK) | route_mode ("split" | "api-only") | static_prefix (S3 版本化前缀)
+| api_target (Lambda Function URL) | require_auth (bool)
+| allowed_users ("org" 或 ["a@x.com", ...]) | owner (飞书 email)
 ```
+
+- `route_mode=split`：站点默认——`/api/*` 走 api_target，其余走 S3 静态前缀。
+- `route_mode=api-only`：全路径走 api_target——**auth 子域必须用此模式**（其端点是 `/login` `/callback` `/logout`，不匹配 `/api/*`）。
+- `static_prefix` 为版本化前缀 `sites/{site_id}/{job_id}`：新部署先传新前缀，再原子更新路由 item 切流，旧版本由 S3 生命周期清理——更新即时生效且无半发布状态。
 
 Lambda@Edge（origin-request）判定顺序：
 
@@ -189,12 +204,16 @@ Lambda@Edge（origin-request）判定顺序：
   → require_auth?
       否 → 直接路由
       是 → 读 cookie 中的会话 JWT
-            无/过期 → 302 到登录端点（带回跳地址）
+            无/过期 → 302 到登录端点（带回跳地址，含原 query string）
             有效 → 本地验签 + allowed_users 名单检查
                  → 注入 x-user-email / x-user-name 头 → 路由
-  → 路由：/api/* → api_target（SigV4 签名，Function URL 为 AWS_IAM）
-          其余   → static_target
+  → 路由：route_mode=api-only → 全路径 api_target
+          split: /api/* → api_target（SigV4 签名，Function URL 为 AWS_IAM）
+                 其余   → S3 static_prefix
+  → 任何未捕获异常 → 返回 500（fail-closed，绝不透传原请求到默认 origin）
 ```
+
+**带 body 请求的签名**：Edge Lambda 关联必须设 `include_body=True`；SigV4 签名用 base64 解码后的真实 body 计算 payload hash（否则 Function URL 校验必败）。Lambda@Edge origin-request body 上限 1MB、超限时 CloudFront 置 `inputTruncated` 标志——Edge 检测到截断即返回 413，"API 请求体 ≤1MB" 写入部署合同红线。
 
 技术要点：
 
@@ -214,10 +233,17 @@ Lambda@Edge（origin-request）判定顺序：
 
 站点登录流：
 
-1. Edge 发现未登录 → 302 `auth.<域名>/login?redirect=原URL`
+1. Edge 发现未登录 → 302 `auth.<域名>/login?redirect=原URL（含 query string）`
 2. 登录端点（Lambda）→ Cognito Hosted UI → 飞书 OIDC 适配器 → 飞书扫码/免密授权
-3. 回调后登录端点用 Cognito ID token 生成站点会话 JWT（HS256 自签，含 email/name/exp），种 `.<域名>` 顶域 cookie → 302 回站点
+3. 回调后登录端点校验并换取 token，生成站点会话 JWT（HS256 自签，含 email/name/exp），种 `.<域名>` 顶域 cookie → 302 回站点
 4. 顶域 cookie 使所有 `app-*.<域名>` 站点共享一次登录；且与 Quick 共享 Cognito 会话——登录过 Quick 的浏览器打开站点通常静默通过。
+
+OAuth 回调安全要求：
+
+- `state` 参数 HMAC-SHA256 签名（密钥即 JWT_SECRET）+ 5 分钟过期时间戳，回调时验签验期——防 login CSRF 与 redirect 篡改；
+- Cognito `id_token` 必须验签：JWKS（`/.well-known/jwks.json`，Lambda 内存缓存）验 RS256 签名 + 校验 `iss`/`aud`/`exp`/`token_use=id`；
+- redirect 白名单校验（仅 `*.<BASE_DOMAIN>`）在 /login 与 /callback 两端都执行。
+- PKCE/nonce：confidential client + 签名 state 已覆盖 PoC 威胁模型，记为二期增强。
 
 **与 Blog 路线（SAML + Keycloak）的适配关系**：若客户已按 Blog 路线部署 Quick SSO，本方案的站点鉴权层与"Quick 怎么登录"解耦——独立部署自己的 Cognito + 飞书适配器服务站点与 MCP。飞书账号单一身份仍成立（锚定同一飞书企业应用），只是 Quick 会话与站点会话不共享，站点首次访问多一次飞书授权跳转（浏览器有飞书会话时通常静默）。Keycloak 无需任何改动。
 
@@ -246,9 +272,15 @@ Lambda@Edge（origin-request）判定顺序：
 ## 6. 测试策略
 
 - **合同校验单测**：site.json schema、代码红线扫描器（localhost 检测、auth 代码检测）的正反用例。
-- **执行器集成测试**：三个 tier 各一个样例站点（fixture），跑真实 Step Functions 到 SUCCEEDED，断言 URL 可访问、数据可写读。
-- **鉴权端到端**：require_auth 站点未登录 302、登录后放行、名单外用户 403、`x-user-*` 头注入与防伪造（客户端预置同名头须被剥除）。
-- **更新幂等**：同一 siteId 二次部署内容更新且 URL 不变。
+- **执行器集成测试**：三个 tier 各一个样例站点（fixture），跑真实 Step Functions 到 SUCCEEDED。
+- **鉴权与数据端到端（自动化，用 JWT_SECRET 直接 mint 测试会话 cookie，无需人工扫码）**：
+  1. 未登录请求返回 302 且 Location 指向 `auth.<域名>/login`（禁跟随重定向断言）；
+  2. 带有效 cookie：GET 200 → POST 创建 → read-back 验证 → DELETE；
+  3. 名单外用户 403；伪造 `x-user-email` 头被剥除（后端回显的是会话身份）；
+  4. 带 body 的 POST 经全链路（CloudFront→Edge SigV4→Function URL）成功；
+  5. 两个不同子域相同路径内容不串（缓存禁用验证）；
+  6. 更新部署后新内容立即可见；undeploy 后立即 404。
+- **更新幂等**：同一 siteId 二次部署内容更新且 URL 不变；同一 jobId 重复 confirm_upload 被拒。
 - **演示彩排**：完整成功标准链路（Quick Desktop → 部署 → 飞书登录站点 → CRUD）。
 
 ## 7. 成本估算（PoC 量级）
@@ -280,6 +312,10 @@ Lambda@Edge（origin-request）判定顺序：
 - GitOps 化（版本回滚、部署历史审计）
 - ECS Fargate 有状态站点档位
 - 计费/配额、多租户隔离
+- Python 3.13 站点 runtime（db.py 模板、Python fixture、E2E）
+- MCP 个人 API Key 认证（不支持 OAuth 的客户端）
+- CloudFront 精细缓存（viewer-request 鉴权 + cache key 按站点/登录态分区）
+- OAuth PKCE + nonce 增强
 
 ## 10. 实施模块划分（供 writing-plans 参考）
 

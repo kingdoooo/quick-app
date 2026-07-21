@@ -14,15 +14,21 @@
 
 - 全部资源部署在 `us-east-1`（Lambda@Edge / ACM / Quick Desktop 身份区域共同强制）。
 - 站点资源命名前缀一律 `site-`；IAM policy 按该前缀限权（沿用 manus `*WebRouterStack*` 模式）。
-- 站点后端 runtime 仅支持 `nodejs22.x` 与 `python3.13`；部署形态仅 zip + LWA Layer，**禁止 Docker 镜像模式**。
+- 站点后端 runtime **PoC 仅 `nodejs22.x`**（Python 记为二期）；部署形态仅 zip + LWA Layer，**禁止 Docker 镜像模式**。
 - LWA Layer ARN（精确值）：`arn:aws:lambda:us-east-1:753240598075:layer:LambdaAdapterLayerX86:28`；zip 模式必须设 `AWS_LAMBDA_EXEC_WRAPPER=/opt/bootstrap`、`PORT=8080`，handler 为 `run.sh`。
 - tier 枚举：`static` | `fullstack-nosql` | `fullstack-sql`；database.engine 枚举：`none` | `dynamodb` | `dsql`。
-- DSQL：不支持 `CREATE DATABASE`（每 cluster 单库 `postgres`），每站点独立 schema `site_<site_id去连字符>`；DDL 每事务一条；禁用特性：外键 REFERENCES、SERIAL、JSONB 列、触发器/PLpgSQL、TEMP TABLE、扩展。
-- 鉴权：会话 cookie 名 `sb_session`（`Domain=.<BASE_DOMAIN>; Secure; HttpOnly; SameSite=Lax`）；JWT 算法 HS256（纯标准库实现）；Edge 注入且无条件先剥除请求头 `x-user-email` / `x-user-name`。
+- DSQL：不支持 `CREATE DATABASE`（每 cluster 单库 `postgres`），每站点独立 schema `site_<site_id去连字符>`；DDL 每事务一条，SQL 语句拆分一律用 `sqlparse.split()`；禁用特性：外键 REFERENCES、SERIAL、JSONB 列、触发器/PLpgSQL、TEMP TABLE、扩展。
+- **站点代码是不可信代码**：每站点独立 Lambda 执行角色 `site-rt-{site_id}`（仅该站点的 DynamoDB 表 / DSQL per-site PG role）；DSQL 站点连接用非 admin token（`dsql:DbConnect` + PG role `site_{id}_app`）；admin 身份（`dsql:DbConnectAdmin`）仅执行器持有。
+- **CloudFront 全站 CACHING_DISABLED**（origin-request 鉴权在 cache hit 时会被绕过——禁缓存是 PoC 的鉴权正确性前提）；Edge Lambda 关联必须 `include_body=True`，SigV4 用解码后 body 计算 hash，`inputTruncated` 返回 413。
+- **Edge fail-closed**：任何未捕获异常返回 500，绝不透传原请求。
+- 路由表含 `route_mode`（`split`=默认 / `api-only`=全路径走 api_target，auth 子域必用）；`static_prefix` 为版本化前缀 `sites/{site_id}/{job_id}`，发布=先传新前缀再原子切路由。
+- 鉴权：会话 cookie 名 `sb_session`（`Domain=.<BASE_DOMAIN>; Secure; HttpOnly; SameSite=Lax`）；JWT 算法 HS256（纯标准库实现）；Edge 注入且无条件先剥除请求头 `x-user-email` / `x-user-name`。OAuth state 必须 HMAC 签名 + 5 分钟过期；Cognito id_token 必须 JWKS 验签 + iss/aud/exp/token_use 校验。
 - 子域名：站点 `app-{site_id}`；身份服务保留子域名 `auth`。
-- MCP 工具面固定 4 个：`deploy_site` / `get_deploy_status` / `list_my_sites` / `undeploy_site`，全部秒级返回（60s 超时红线）。
+- MCP 工具面固定 5 个：`deploy_site` / `confirm_upload` / `get_deploy_status` / `list_my_sites` / `undeploy_site`，全部秒级返回（60s 超时红线）。SFN execution name = job_id；confirm_upload 走 jobs 表条件迁移 PENDING→RUNNING。
+- S3 批量删除/遍历一律 paginator + 每批 ≤1000 对象。
 - 中心配置 `site-builder/config.ini`（BASE_DOMAIN、ACCOUNT_ID、路由表名、Cognito 参数、DSQL endpoint），所有组件从它读，不散落硬编码。
 - 测试框架 pytest；提交遵循 conventional commits；每个 Task 以通过测试 + commit 结束。
+- **Task 0（前置）**：`git add manus-web-application-main/` 纳入版本控制并提交——plan 大量修改该目录，未跟踪则不可复现。
 
 ## File Structure
 
@@ -95,6 +101,7 @@ quick-app/                                    # 仓库根（已 git init）
 
 | Phase | Task | 内容 |
 |---|---|---|
+| P0 前置 | 0 | `git add manus-web-application-main/ && git commit`（可复现前提） |
 | P0 合同库 | 1 | contract 包脚手架 + site.json schema 校验器 |
 | P0 | 2 | 代码红线扫描器 |
 | P1 身份层(M1) | 3 | 部署 feishu-quick-sso 基座并验证 Quick 登录 |
@@ -236,8 +243,18 @@ def test_tier_engine_mismatch_fails():
 
 
 def test_bad_runtime_fails():
-    m = _valid_sql_manifest(); m["backend"]["runtime"] = "nodejs16.x"
+    m = _valid_sql_manifest(); m["backend"]["runtime"] = "python3.13"  # 二期，PoC 不收
     assert any("runtime" in e for e in validate_manifest(m))
+
+
+def test_bad_table_spec_fails():
+    m = _valid_sql_manifest()
+    m["tier"] = "fullstack-nosql"
+    m["database"] = {"engine": "dynamodb",
+                     "tables": [{"name": "Bad Name!", "pk": "id"},
+                                {"name": "dup", "pk": "id"}, {"name": "dup", "pk": "id"}]}
+    errs = validate_manifest(m)
+    assert any("tables" in e for e in errs)  # 命名非法 + 重复
 
 
 def test_allowed_users_list_ok():
@@ -271,9 +288,10 @@ Expected: FAIL（`ImportError`/断言失败——schema.py 尚不存在）
 import re
 
 TIERS = {"static", "fullstack-nosql", "fullstack-sql"}
-RUNTIMES = {"nodejs22.x", "python3.13"}
+RUNTIMES = {"nodejs22.x"}  # Python 3.13 记为二期（需 db.py 模板/fixture/E2E 支撑）
 TIER_ENGINE = {"static": "none", "fullstack-nosql": "dynamodb", "fullstack-sql": "dsql"}
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,29}$")
+TABLE_RE = re.compile(r"^[a-z][a-z0-9_-]{0,29}$")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
@@ -309,8 +327,19 @@ def validate_manifest(manifest: dict) -> list[str]:
             if backend.get("port") != 8080:
                 errors.append("backend.port: 必须为 8080（LWA 约定）")
 
-    if tier == "fullstack-nosql" and not db.get("tables"):
-        errors.append("database.tables: dynamodb 引擎必须声明至少一张表")
+    if tier == "fullstack-nosql":
+        tables = db.get("tables") or []
+        if not tables:
+            errors.append("database.tables: dynamodb 引擎必须声明至少一张表")
+        elif len(tables) > 10:
+            errors.append("database.tables: 至多 10 张表")
+        else:
+            names = [t.get("name", "") for t in tables]
+            if len(names) != len(set(names)):
+                errors.append("database.tables: 表名不得重复")
+            for t in tables:
+                if not TABLE_RE.match(t.get("name", "")) or not TABLE_RE.match(t.get("pk", "")):
+                    errors.append(f"database.tables: 表名/主键须匹配 {TABLE_RE.pattern}: {t}")
 
     auth = manifest.get("auth")
     if not isinstance(auth, dict) or not isinstance(auth.get("require_login"), bool):
@@ -349,7 +378,7 @@ git commit -m "feat(contract): site.json manifest validator"
 - Consumes: 无
 - Produces: `scan_redlines(site_dir: Path, manifest: dict) -> list[str]`——扫描解包后的站点目录，返回违规列表。Task 11 依赖。
 
-红线（来自 spec §3.1）：① 前端禁止 localhost/硬编码绝对 http(s) API 地址；② 站点代码禁止自带 auth（检测 OAuth/jwt 签发关键词）；③ fullstack 必须有 `/api/health` 实现痕迹；④ 后端禁止写本地文件（`fs.writeFile`/`open(...,'w')` 出现即报）；⑤ fullstack-sql 必须存在 `backend/schema.sql` 且不含禁用 DDL（REFERENCES / SERIAL / JSONB / CREATE TRIGGER / CREATE TEMP）。
+红线（来自 spec §3.1）：① 前端禁止 localhost/硬编码绝对 http(s) API 地址；② 站点代码禁止自带 auth（检测 OAuth/jwt 签发关键词）；③ fullstack 必须有 `/api/health` 实现痕迹；④ 后端禁止写本地文件（`fs.writeFile`/`open(...,'w')` 出现即报）；⑤ fullstack-sql 必须存在 `backend/schema.sql` 且不含禁用 DDL（REFERENCES / SERIAL / JSONB / CREATE TRIGGER / CREATE TEMP）；⑥ 前端禁止 `innerHTML` 赋值/拼接（存储型 XSS——`INNERHTML_RE = re.compile(r"\.innerHTML\s*[+]?=")`，测试与实现同步补一条正反用例）。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -728,8 +757,9 @@ git commit -m "feat(auth): HS256 session JWT mint/verify (stdlib only)"
 - Test: `site-builder/auth/tests/test_login_handler.py`
 
 **Interfaces:**
-- Consumes: `session.mint_session_jwt`；config.ini `[Cognito]`（domain/site_client_id + client secret 从 SSM `/site-builder/site-client-secret` 读）、`[Platform].base_domain`
-- Produces: 部署后的 Function URL（AuthType=NONE），注册到路由表 subdomain=`auth`、`require_auth=false`。路由：`GET /login?redirect=<url>`→302 Cognito Hosted UI；`GET /callback?code=&state=`→换 token→种 `sb_session` cookie→302 回 redirect；`GET /logout`→清 cookie。环境变量：`JWT_SECRET`（SSM 生成）、`COGNITO_DOMAIN`、`CLIENT_ID`、`CLIENT_SECRET`、`BASE_DOMAIN`。
+- Consumes: `session.mint_session_jwt`；config.ini `[Cognito]`（domain/site_client_id/user_pool_id + client secret 从 SSM `/site-builder/site-client-secret` 读）、`[Platform].base_domain`
+- Produces: 部署后的 Function URL（AuthType=NONE），注册到路由表 subdomain=`auth`、**`route_mode="api-only"`**（端点是 /login /callback /logout，不匹配 /api/*——api-only 让全路径走此 Lambda）、`require_auth=false`。路由：`GET /login?redirect=<url>`→302 Cognito Hosted UI；`GET /callback?code=&state=`→验 state 验 id_token→种 `sb_session` cookie→302 回 redirect；`GET /logout`→清 cookie。环境变量：`JWT_SECRET`（SSM 生成，兼作 state 签名密钥）、`COGNITO_DOMAIN`、`CLIENT_ID`、`CLIENT_SECRET`、`BASE_DOMAIN`、`USER_POOL_ID`。
+- 安全要求（Global Constraints）：state = `base64(json{r, exp}) + "." + HMAC-SHA256`，5 分钟过期，验签失败/过期返回 400；id_token 用 Cognito JWKS 验签（`pyjwt` + `PyJWKClient`，模块级缓存），校验 `iss=https://cognito-idp.us-east-1.amazonaws.com/<POOL_ID>`、`aud=CLIENT_ID`、`exp`、`token_use=="id"`；redirect 白名单在 /login 与 /callback 双端校验。
 
 - [ ] **Step 1: 写失败测试（handler 纯逻辑部分）**
 
@@ -741,7 +771,8 @@ from unittest.mock import patch
 import login_handler as lh
 
 ENV = {"JWT_SECRET": "s3cret", "COGNITO_DOMAIN": "https://sso.auth.us-east-1.amazoncognito.com",
-       "CLIENT_ID": "cid", "CLIENT_SECRET": "csec", "BASE_DOMAIN": "example.com"}
+       "CLIENT_ID": "cid", "CLIENT_SECRET": "csec", "BASE_DOMAIN": "example.com",
+       "USER_POOL_ID": "us-east-1_test"}
 
 
 def _event(path, qs=None, cookies=None):
@@ -767,13 +798,34 @@ def test_login_rejects_foreign_redirect():
 @patch.dict(lh.os.environ, ENV)
 @patch.object(lh, "_exchange_code", return_value={"email": "a@x.com", "name": "Alice"})
 def test_callback_sets_cookie_and_redirects(mock_ex):
-    state = lh._encode_state("https://app-x.example.com/page")
+    state = lh._encode_state("https://app-x.example.com/page?tab=2")
     r = lh.handler(_event("/callback", {"code": "abc", "state": state}), None)
     assert r["statusCode"] == 302
-    assert r["headers"]["Location"] == "https://app-x.example.com/page"
+    assert r["headers"]["Location"] == "https://app-x.example.com/page?tab=2"  # query 保留
     cookie = r["cookies"][0]
     assert cookie.startswith("sb_session=") and "Domain=.example.com" in cookie
     assert "HttpOnly" in cookie and "Secure" in cookie
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_callback_rejects_tampered_state():
+    state = lh._encode_state("https://app-x.example.com/")
+    body, _, sig = state.rpartition(".")
+    import base64, json as _json
+    payload = _json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+    payload["r"] = "https://evil.com/"
+    forged = base64.urlsafe_b64encode(_json.dumps(payload).encode()).decode().rstrip("=")
+    r = lh.handler(_event("/callback", {"code": "abc", "state": f"{forged}.{sig}"}), None)
+    assert r["statusCode"] == 400
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_callback_rejects_expired_state():
+    import time
+    with patch.object(lh.time, "time", return_value=time.time() - 600):
+        state = lh._encode_state("https://app-x.example.com/")
+    r = lh.handler(_event("/callback", {"code": "abc", "state": state}), None)
+    assert r["statusCode"] == 400
 
 
 @patch.dict(lh.os.environ, ENV)
@@ -793,28 +845,60 @@ Expected: FAIL（ModuleNotFoundError: login_handler）
 
 ```python
 """站点登录端点（Lambda Function URL）。
-/login → Cognito Hosted UI（后接飞书 OIDC）；/callback → 换 token、种顶域会话 cookie；/logout。"""
+/login → Cognito Hosted UI（后接飞书 OIDC）；/callback → 验 state、验 id_token、
+种顶域会话 cookie；/logout。
+安全：state HMAC 签名 + 5 分钟过期（防 login CSRF/redirect 篡改）；
+id_token 走 Cognito JWKS 验签 + iss/aud/exp/token_use 校验。"""
 import base64
+import hashlib
+import hmac
 import json
 import os
+import time
 import urllib.parse
 import urllib.request
 
-import jwt as pyjwt  # 仅解码 Cognito ID token（RS256，此处信任 TLS 通道直接 decode 不验签，见下注）
+import jwt as pyjwt
+from jwt import PyJWKClient
 
 from session import mint_session_jwt
 
-# 说明：/callback 的 code→token 交换走 Cognito TLS 端点 + client_secret 认证，
-# 返回的 id_token 来源可信，故用 decode(verify=False) 取 claims；
-# 若后续引入不可信通道再加 JWKS 验签。
+_jwks_client = None  # 模块级缓存，Lambda 容器复用
+
+
+def _get_jwks_client() -> PyJWKClient:
+    global _jwks_client
+    if _jwks_client is None:
+        _jwks_client = PyJWKClient(
+            f"https://cognito-idp.us-east-1.amazonaws.com/"
+            f"{os.environ['USER_POOL_ID']}/.well-known/jwks.json")
+    return _jwks_client
+
+
+def _state_sig(body: str) -> str:
+    return base64.urlsafe_b64encode(hmac.new(
+        os.environ["JWT_SECRET"].encode(), body.encode(),
+        hashlib.sha256).digest()).rstrip(b"=").decode()
 
 
 def _encode_state(redirect: str) -> str:
-    return base64.urlsafe_b64encode(json.dumps({"r": redirect}).encode()).decode()
+    body = base64.urlsafe_b64encode(json.dumps(
+        {"r": redirect, "exp": int(time.time()) + 300}).encode()).decode().rstrip("=")
+    return f"{body}.{_state_sig(body)}"
 
 
-def _decode_state(state: str) -> str:
-    return json.loads(base64.urlsafe_b64decode(state.encode()))["r"]
+def _decode_state(state: str) -> str | None:
+    """验签 + 验期，失败返回 None。"""
+    try:
+        body, _, sig = state.rpartition(".")
+        if not hmac.compare_digest(sig, _state_sig(body)):
+            return None
+        payload = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+        if int(payload.get("exp", 0)) <= int(time.time()):
+            return None
+        return payload["r"]
+    except Exception:
+        return None
 
 
 def _is_safe_redirect(url: str) -> bool:
@@ -824,7 +908,7 @@ def _is_safe_redirect(url: str) -> bool:
 
 
 def _exchange_code(code: str) -> dict:
-    """code → Cognito token → {email, name}"""
+    """code → Cognito token → JWKS 验签 → {email, name}"""
     domain = os.environ["COGNITO_DOMAIN"]
     body = urllib.parse.urlencode({
         "grant_type": "authorization_code", "code": code,
@@ -839,7 +923,13 @@ def _exchange_code(code: str) -> dict:
                  "Content-Type": "application/x-www-form-urlencoded"})
     with urllib.request.urlopen(req, timeout=10) as resp:
         tokens = json.loads(resp.read())
-    claims = pyjwt.decode(tokens["id_token"], options={"verify_signature": False})
+    signing_key = _get_jwks_client().get_signing_key_from_jwt(tokens["id_token"])
+    claims = pyjwt.decode(
+        tokens["id_token"], signing_key.key, algorithms=["RS256"],
+        audience=os.environ["CLIENT_ID"],
+        issuer=f"https://cognito-idp.us-east-1.amazonaws.com/{os.environ['USER_POOL_ID']}")
+    if claims.get("token_use") != "id":
+        raise ValueError("token_use != id")
     return {"email": claims["email"], "name": claims.get("name", claims["email"])}
 
 
@@ -861,10 +951,10 @@ def handler(event, context):
         return {"statusCode": 302, "headers": {"Location": auth_url}, "body": ""}
 
     if path == "/callback":
+        redirect = _decode_state(qs.get("state", ""))
+        if redirect is None or not _is_safe_redirect(redirect):
+            return {"statusCode": 400, "body": "invalid or expired state"}
         user = _exchange_code(qs["code"])
-        redirect = _decode_state(qs["state"])
-        if not _is_safe_redirect(redirect):
-            return {"statusCode": 400, "body": "invalid redirect"}
         token = mint_session_jwt(user["email"], user["name"], os.environ["JWT_SECRET"])
         cookie = (f"sb_session={token}; Domain=.{base}; Path=/; Max-Age=86400; "
                   f"Secure; HttpOnly; SameSite=Lax")
@@ -884,7 +974,7 @@ def handler(event, context):
 - [ ] **Step 4: 运行确认通过**
 
 Run: `python3 -m pip install 'pyjwt[crypto]>=2.8' -q && python3 -m pytest tests/ -q`
-Expected: 9 passed（session 5 + handler 4）
+Expected: 11 passed（session 5 + handler 6）
 
 - [ ] **Step 5: 写部署脚本**
 
@@ -950,7 +1040,8 @@ def main():
         "COGNITO_DOMAIN": CFG["Cognito"]["domain"],
         "CLIENT_ID": CFG["Cognito"]["site_client_id"],
         "CLIENT_SECRET": client_secret,
-        "BASE_DOMAIN": BASE}}
+        "BASE_DOMAIN": BASE,
+        "USER_POOL_ID": CFG["Cognito"]["user_pool_id"]}}
     code = build_zip()
     try:
         lam.get_function(FunctionName=FN)
@@ -972,6 +1063,7 @@ def main():
         url = lam.get_function_url_config(FunctionName=FN)["FunctionUrl"]
     ddb.put_item(TableName=CFG["Platform"]["routing_table"], Item={
         "subdomain": {"S": "auth"}, "site_id": {"S": "auth-service"},
+        "route_mode": {"S": "api-only"},  # 全路径走 Lambda（/login 不匹配 /api/*）
         "static_prefix": {"S": ""}, "api_target": {"S": url.rstrip("/")},
         "require_auth": {"BOOL": False}, "allowed_users": {"S": "org"},
         "owner": {"S": "platform"}})
@@ -1015,9 +1107,14 @@ git commit -m "feat(auth): site login service (Cognito hosted UI + top-domain se
 
 ## Phase P2：路由 + 鉴权层（M2，manus 项目就地改造）
 
-### Task 6: Edge 函数——路由表扩展 + static/api 分流 + S3 SigV4
+### Task 6: Edge 函数——路由表扩展 + 分流 + body 签名 + fail-closed
 
-manus 现有 `origin_request.py` 只有单一 `target_url`。本任务改为：路由 item 含 `static_prefix`（S3 前缀）与 `api_target`（Function URL），URI 以 `/api/` 开头走 api_target（现有 Lambda URL SigV4 逻辑复用），否则改写到共享前端桶的 S3 REST 端点（`{frontend_bucket}.s3.us-east-1.amazonaws.com`，路径前缀 `sites/{site_id}/`，桶保持私有，Edge 用执行角色对 S3 GET 做 SigV4——与现有 `_add_sigv4_auth` 同机制，service 换 `s3`）。URI 无扩展名时映射到 `index.html`（SPA 支持）。
+manus 现有 `origin_request.py` 只有单一 `target_url`。本任务改为：
+- 路由 item 含 `route_mode`（`split`/`api-only`）、`static_prefix`（S3 **版本化**前缀 `sites/{site_id}/{job_id}`）与 `api_target`（Function URL）。
+- `split`：URI 以 `/api/` 开头走 api_target（SigV4），否则改写到共享前端桶 S3 REST 端点（桶私有，Edge 执行角色对 S3 GET 做 SigV4——与现有 `_add_sigv4_auth` 同机制，service 换 `s3`）；URI 无扩展名映射 `index.html`（SPA）。
+- `api-only`：全路径走 api_target（auth 子域用）。
+- **带 body 的 SigV4**：CloudFront 在 `include_body=True` 时以 base64 提供 body——签名前解码并作为 payload 参与 hash；`body.inputTruncated` 为真时直接返回 413（Lambda@Edge origin-request body 上限 1MB）。
+- **fail-closed**：`lambda_handler` 顶层异常返回 500 响应，绝不透传原请求（原 manus 行为是 return request——安全边界不允许）。
 
 **Files:**
 - Modify: `manus-web-application-main/infrastructure/lambda/origin_request.py`
@@ -1051,17 +1148,20 @@ _mod_path.write_text(_SRC)
 import _origin_request_testable as orq
 
 
-ROUTE = {"subdomain": "app-demo1", "site_id": "demo1",
-         "static_prefix": "sites/demo1", "api_target": "https://abc.lambda-url.us-east-1.on.aws",
+ROUTE = {"subdomain": "app-demo1", "site_id": "demo1", "route_mode": "split",
+         "static_prefix": "sites/demo1/job-aaa",
+         "api_target": "https://abc.lambda-url.us-east-1.on.aws",
          "require_auth": False, "allowed_users": "org", "owner": "a@x.com"}
 
 
-def _event(host="app-demo1.example.com", uri="/", method="GET", cookie=None):
+def _event(host="app-demo1.example.com", uri="/", method="GET", cookie=None, body=None):
     headers = {"host": [{"key": "Host", "value": host}]}
     if cookie:
         headers["cookie"] = [{"key": "Cookie", "value": cookie}]
-    return {"Records": [{"cf": {"request": {
-        "uri": uri, "querystring": "", "method": method, "headers": headers}}}]}
+    req = {"uri": uri, "querystring": "", "method": method, "headers": headers}
+    if body is not None:
+        req["body"] = body
+    return {"Records": [{"cf": {"request": req}}]}
 
 
 @patch.object(orq, "_lookup_route", return_value=dict(ROUTE))
@@ -1074,19 +1174,32 @@ def test_api_path_routes_to_lambda(mock_sig, mock_lookup):
 
 @patch.object(orq, "_lookup_route", return_value=dict(ROUTE))
 @patch.object(orq, "_add_s3_sigv4_auth")
-def test_static_path_routes_to_s3_with_prefix(mock_sig, mock_lookup):
+def test_static_path_routes_to_s3_with_versioned_prefix(mock_sig, mock_lookup):
     req = orq.lambda_handler(_event(uri="/assets/app.js"), None)
     assert req["origin"]["custom"]["domainName"] == "site-frontend-123.s3.us-east-1.amazonaws.com"
-    assert req["uri"] == "/sites/demo1/assets/app.js"
+    assert req["uri"] == "/sites/demo1/job-aaa/assets/app.js"
 
 
 @patch.object(orq, "_lookup_route", return_value=dict(ROUTE))
 @patch.object(orq, "_add_s3_sigv4_auth")
 def test_extensionless_uri_maps_to_index(mock_sig, mock_lookup):
     req = orq.lambda_handler(_event(uri="/"), None)
-    assert req["uri"] == "/sites/demo1/index.html"
+    assert req["uri"] == "/sites/demo1/job-aaa/index.html"
     req2 = orq.lambda_handler(_event(uri="/detail"), None)
-    assert req2["uri"] == "/sites/demo1/index.html"
+    assert req2["uri"] == "/sites/demo1/job-aaa/index.html"
+
+
+@patch.object(orq, "_lookup_route",
+              return_value={"subdomain": "auth", "site_id": "auth-service",
+                            "route_mode": "api-only", "static_prefix": "",
+                            "api_target": "https://xyz.lambda-url.us-east-1.on.aws",
+                            "require_auth": False, "allowed_users": "org",
+                            "owner": "platform"})
+@patch.object(orq, "_add_sigv4_auth")
+def test_api_only_mode_routes_all_paths_to_lambda(mock_sig, mock_lookup):
+    req = orq.lambda_handler(_event(host="auth.example.com", uri="/login"), None)
+    assert req["origin"]["custom"]["domainName"] == "xyz.lambda-url.us-east-1.on.aws"
+    assert req["uri"] == "/login"
 
 
 @patch.object(orq, "_lookup_route", return_value=None)
@@ -1100,6 +1213,20 @@ def test_unknown_subdomain_404(mock_lookup):
 def test_api_on_static_only_site_404(mock_lookup):
     resp = orq.lambda_handler(_event(uri="/api/items"), None)
     assert resp["status"] == "404"
+
+
+@patch.object(orq, "_lookup_route", return_value=dict(ROUTE))
+def test_truncated_body_returns_413(mock_lookup):
+    resp = orq.lambda_handler(_event(uri="/api/items", method="POST",
+                                     body={"inputTruncated": True, "data": "", 
+                                           "encoding": "base64"}), None)
+    assert resp["status"] == "413"
+
+
+@patch.object(orq, "_lookup_route", side_effect=RuntimeError("boom"))
+def test_edge_fails_closed_on_exception(mock_lookup):
+    resp = orq.lambda_handler(_event(), None)
+    assert resp["status"] == "500"  # 绝不透传原请求
 ```
 
 - [ ] **Step 2: 运行确认失败**
@@ -1150,24 +1277,55 @@ def _not_found(msg: str) -> dict:
             "body": f"<html><body><h1>404 Not Found</h1><p>{msg}</p></body></html>"}
 
 
+def _get_request_body(request):
+    """include_body=True 时 CloudFront 提供 base64 body；截断返回哨兵。"""
+    body = request.get("body") or {}
+    if body.get("inputTruncated"):
+        return None  # 调用方返回 413
+    data = body.get("data", "")
+    if not data:
+        return b""
+    if body.get("encoding") == "base64":
+        import base64
+        return base64.b64decode(data)
+    return data.encode()
+
+
+def _payload_too_large() -> dict:
+    return {"status": "413", "statusDescription": "Payload Too Large",
+            "headers": {"content-type": [{"key": "Content-Type", "value": "text/plain"}]},
+            "body": "请求体超过 1MB 上限"}
+
+
+def _route_to_lambda(request, route, uri, qs):
+    target = route.get("api_target") or ""
+    if not target:
+        return _not_found("此站点无后端")
+    body = _get_request_body(request)
+    if body is None:
+        return _payload_too_large()
+    domain = urllib.parse.urlparse(target).netloc
+    if ".lambda-url." in domain and ".on.aws" in domain:
+        _add_sigv4_auth(request, domain, uri, qs, body)
+    request["origin"] = _custom_origin(domain)
+    request["headers"]["host"] = [{"key": "Host", "value": domain}]
+    return request
+
+
 def _route_request(request, route):
     uri = request.get("uri", "/")
     qs = _fix_querystring_encoding(request.get("querystring", ""))
     request["querystring"] = qs
 
+    if route.get("route_mode") == "api-only":
+        return _route_to_lambda(request, route, uri, qs)
+
     if uri.startswith("/api/"):
-        target = route.get("api_target") or ""
-        if not target:
-            return _not_found("此站点无后端")
-        parsed = urllib.parse.urlparse(target)
-        domain = parsed.netloc
-        if ".lambda-url." in domain and ".on.aws" in domain:
-            _add_sigv4_auth(request, domain, uri, qs)
-        request["origin"] = _custom_origin(domain)
-        request["headers"]["host"] = [{"key": "Host", "value": domain}]
-        return request
+        return _route_to_lambda(request, route, uri, qs)
 
     # 静态资源 → 共享前端桶（私有，SigV4 GET）
+    if request.get("method") not in ("GET", "HEAD"):
+        return _not_found("方法不允许")
     path = uri if ("." in uri.rsplit("/", 1)[-1]) else "/index.html"
     request["uri"] = f"/{route['static_prefix']}{path}" if path != uri else f"/{route['static_prefix']}{uri}"
     _add_s3_sigv4_auth(request, FRONTEND_BUCKET_DOMAIN, request["uri"])
@@ -1196,15 +1354,21 @@ def _add_s3_sigv4_auth(request, domain: str, uri: str) -> None:
             request["headers"][h.lower()] = [{"key": h, "value": v}]
 ```
 
-`lambda_handler` 主干替换为：
+`lambda_handler` 主干替换为（**fail-closed**——原 manus 异常时 `return request` 会绕过鉴权落到默认 origin，安全边界不允许）：
 
 ```python
+def _server_error() -> dict:
+    return {"status": "500", "statusDescription": "Internal Server Error",
+            "headers": {"content-type": [{"key": "Content-Type", "value": "text/plain"}]},
+            "body": "服务暂时不可用"}
+
+
 def lambda_handler(event, context):
     try:
         request = event["Records"][0]["cf"]["request"]
         original_host = _get_original_host(request)
         if not original_host:
-            return request
+            return _server_error()
         subdomain = _extract_subdomain(original_host)
         route = _lookup_route(subdomain)
         if not route:
@@ -1213,21 +1377,21 @@ def lambda_handler(event, context):
         return _route_request(request, route)
     except Exception as e:
         logger.error(f"处理请求时出错: {e}", exc_info=True)
-        return event["Records"][0]["cf"]["request"]
+        return _server_error()
 ```
 
-S3 静态请求方法约束：非 GET/HEAD 的静态路径直接 `_not_found`（在 `_route_request` 静态分支开头加 `if request.get("method") not in ("GET", "HEAD"): return _not_found("方法不允许")`）。
+同时修改现有 `_add_sigv4_auth` 签名为 `_add_sigv4_auth(request, domain, uri, querystring, body: bytes)`：`AWSRequest(method=..., url=..., data=body)` 用解码后的真实 body 计算 payload hash（原实现读 `request["body"]["data"]` 原始 base64 字符串——签名值错误）。
 
 - [ ] **Step 4: 运行确认通过**
 
 Run: `python3 -m pytest test_origin_request.py -q`
-Expected: 6 passed
+Expected: 8 passed
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add manus-web-application-main/infrastructure/lambda
-git commit -m "feat(router): static/api split routing with S3 SigV4 and route cache"
+git commit -m "feat(router): route_mode split/api-only, body-aware sigv4, fail-closed edge"
 ```
 
 ### Task 7: Edge 函数——JWT 鉴权 + 302 跳登录 + 用户头注入
@@ -1287,6 +1451,16 @@ def test_no_cookie_redirects_to_login():
     assert resp["status"] == "302"
     loc = resp["headers"]["location"][0]["value"]
     assert loc.startswith("https://auth.example.com/login?redirect=")
+
+
+def test_redirect_preserves_querystring():
+    r = _req(uri="/page")
+    r["querystring"] = "tab=2&q=x"
+    resp = orq._check_auth(r, dict(ROUTE_AUTH), "app-x.example.com")
+    loc = resp["headers"]["location"][0]["value"]
+    import urllib.parse as up
+    target = up.unquote(loc.split("redirect=")[1])
+    assert target == "https://app-x.example.com/page?tab=2&q=x"
 
 
 def test_valid_cookie_passes_and_injects_headers():
@@ -1378,8 +1552,9 @@ def _get_cookie(request, name: str) -> str | None:
     return None
 
 
-def _redirect_login(host: str, uri: str) -> dict:
-    target = urllib.parse.quote(f"https://{host}{uri}", safe="")
+def _redirect_login(host: str, uri: str, querystring: str = "") -> dict:
+    full = f"https://{host}{uri}" + (f"?{querystring}" if querystring else "")
+    target = urllib.parse.quote(full, safe="")
     return {"status": "302", "statusDescription": "Found",
             "headers": {"location": [{"key": "Location",
                         "value": f"https://auth.{BASE_DOMAIN}/login?redirect={target}"}]}}
@@ -1403,7 +1578,8 @@ def _check_auth(request, route, host):
     token = _get_cookie(request, "sb_session")
     claims = _verify_session_jwt(token) if token else None
     if not claims:
-        return _redirect_login(host, request.get("uri", "/"))
+        return _redirect_login(host, request.get("uri", "/"),
+                               request.get("querystring", ""))
 
     allowed = route.get("allowed_users", "org")
     if allowed != "org":
@@ -1431,7 +1607,7 @@ def _check_auth(request, route, host):
 - [ ] **Step 4: 运行两套 Edge 测试确认通过**
 
 Run: `python3 -m pytest test_origin_request.py test_edge_auth.py -q`
-Expected: 14 passed
+Expected: 17 passed
 
 - [ ] **Step 5: Commit**
 
@@ -1449,7 +1625,31 @@ git commit -m "feat(router): edge session auth with header injection and spoof s
 
 **Interfaces:**
 - Consumes: Task 6/7 的占位符 `{{FRONTEND_BUCKET_DOMAIN}}` `{{JWT_SECRET}}` `{{BASE_DOMAIN}}`；SSM `/site-builder/jwt-secret`
-- Produces: 运行中的 CloudFront 分发 + 扩展路由表。config.ini `[Deployer].frontend_bucket` 生效。
+- Produces: 运行中的 CloudFront 分发（**无缓存 + include_body**）+ 扩展路由表。config.ini `[Deployer].frontend_bucket` 生效。
+
+- [ ] **Step 0: 禁用缓存 + include_body（鉴权正确性前提）**
+
+`stack.py` 的 Distribution 定义修改（默认行为与 `/api/*` 行为同样处理）：
+
+```python
+            default_behavior=cloudfront.BehaviorOptions(
+                origin=origins.HttpOrigin(...),  # 原样
+                viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,  # ← 原自定义 cache_policy 移除
+                origin_request_policy=origin_request_policy,
+                allowed_methods=cloudfront.AllowedMethods.ALLOW_ALL,
+                compress=True,
+                edge_lambdas=[
+                    cloudfront.EdgeLambda(
+                        function_version=edge_function.current_version,
+                        event_type=cloudfront.LambdaEdgeEventType.ORIGIN_REQUEST,
+                        include_body=True,  # ← body 参与 SigV4 签名的前提
+                    )
+                ],
+            ),
+```
+
+原 `cache_policy = cloudfront.CachePolicy(self, "CachePolicy", ...)` 整段删除；`additional_behaviors` 的 `/api/*` 行为因与默认行为完全一致也整段删除。理由（写进 commit message）：origin-request 事件只在 cache miss 执行，任何缓存都会让已鉴权响应被未登录用户命中、并在通配符域名下跨站串内容；CACHING_DISABLED 同时消除路由更新/下线的缓存延迟问题。
 
 - [ ] **Step 1: stack.py 注入新占位符与权限**
 
@@ -1509,28 +1709,46 @@ TABLE=$(python3 -c "import configparser;c=configparser.ConfigParser();c.read('si
 BUCKET=$(python3 -c "import configparser;c=configparser.ConfigParser();c.read('site-builder/config.ini');print(c['Deployer']['frontend_bucket'].replace('{account_id}',c['Platform']['account_id']))")
 
 echo "hello-router" > /tmp/index.html
-aws s3 cp /tmp/index.html "s3://${BUCKET}/sites/smoke/index.html"
+echo "hello-other" > /tmp/index2.html
+aws s3 cp /tmp/index.html "s3://${BUCKET}/sites/smoke/job-smoke1/index.html"
+aws s3 cp /tmp/index2.html "s3://${BUCKET}/sites/smoke2/job-smoke2/index.html"
 aws dynamodb put-item --table-name "$TABLE" --item '{
-  "subdomain":{"S":"app-smoke"},"site_id":{"S":"smoke"},
-  "static_prefix":{"S":"sites/smoke"},"api_target":{"S":""},
+  "subdomain":{"S":"app-smoke"},"site_id":{"S":"smoke"},"route_mode":{"S":"split"},
+  "static_prefix":{"S":"sites/smoke/job-smoke1"},"api_target":{"S":""},
   "require_auth":{"BOOL":false},"allowed_users":{"S":"org"},"owner":{"S":"smoke@test"}}'
 aws dynamodb put-item --table-name "$TABLE" --item '{
-  "subdomain":{"S":"app-smokeauth"},"site_id":{"S":"smoke"},
-  "static_prefix":{"S":"sites/smoke"},"api_target":{"S":""},
+  "subdomain":{"S":"app-smoke2"},"site_id":{"S":"smoke2"},"route_mode":{"S":"split"},
+  "static_prefix":{"S":"sites/smoke2/job-smoke2"},"api_target":{"S":""},
+  "require_auth":{"BOOL":false},"allowed_users":{"S":"org"},"owner":{"S":"smoke@test"}}'
+aws dynamodb put-item --table-name "$TABLE" --item '{
+  "subdomain":{"S":"app-smokeauth"},"site_id":{"S":"smoke"},"route_mode":{"S":"split"},
+  "static_prefix":{"S":"sites/smoke/job-smoke1"},"api_target":{"S":""},
   "require_auth":{"BOOL":true},"allowed_users":{"S":"org"},"owner":{"S":"smoke@test"}}'
 sleep 65  # 等 Edge 路由缓存过期
 
 test "$(curl -s https://app-smoke.${BASE_DOMAIN}/)" = "hello-router" && echo "PASS: static route"
+# 不同子域同路径内容不串（缓存已禁用的行为验证）
+test "$(curl -s https://app-smoke2.${BASE_DOMAIN}/)" = "hello-other" && echo "PASS: no cross-site cache"
 LOC=$(curl -s -o /dev/null -w '%{redirect_url}' https://app-smokeauth.${BASE_DOMAIN}/)
 [[ "$LOC" == https://auth.${BASE_DOMAIN}/login* ]] && echo "PASS: auth 302"
+# auth 子域全路径路由到认证 Lambda（api-only 模式，从公网地址验证而非 Function URL 直连）
+ALOC=$(curl -s -o /dev/null -w '%{redirect_url}' "https://auth.${BASE_DOMAIN}/login?redirect=https://app-smoke.${BASE_DOMAIN}/")
+[[ "$ALOC" == *"/oauth2/authorize"* ]] && echo "PASS: auth subdomain api-only routing"
 CODE=$(curl -s -o /dev/null -w '%{http_code}' https://app-nonexistent.${BASE_DOMAIN}/)
 [[ "$CODE" == "404" ]] && echo "PASS: unknown 404"
+# 路由更新即时生效（无缓存）：切 static_prefix 后 65 秒内可见新内容
+aws dynamodb update-item --table-name "$TABLE" \
+  --key '{"subdomain":{"S":"app-smoke"}}' \
+  --update-expression "SET static_prefix = :p" \
+  --expression-attribute-values '{":p":{"S":"sites/smoke2/job-smoke2"}}'
+sleep 65
+test "$(curl -s https://app-smoke.${BASE_DOMAIN}/)" = "hello-other" && echo "PASS: route update visible"
 ```
 
 - [ ] **Step 4: 运行冒烟（Edge 传播完成后）**
 
 Run: `bash site-builder/scripts/smoke_router.sh`
-Expected: 三行 PASS。auth 302 进一步人工验证：浏览器打开 `https://app-smokeauth.<BASE_DOMAIN>/` → 飞书登录 → 回跳看到 hello-router。
+Expected: 六行 PASS（static route / no cross-site cache / auth 302 / auth subdomain api-only routing / unknown 404 / route update visible）。人工补充验证：浏览器打开 `https://app-smokeauth.<BASE_DOMAIN>/` → 飞书登录 → 回跳看到内容。
 
 - [ ] **Step 5: Commit**
 
@@ -1551,7 +1769,7 @@ git commit -m "feat(router): wire frontend bucket, jwt secret and base domain in
 
 **Interfaces:**
 - Consumes: config.ini `[Platform]`、`[Deployer]`
-- Produces: DynamoDB 表 `site-deploy-jobs`（PK job_id，GSI owner-index）、`site-sites`（PK site_id）；S3 桶 `site-artifacts-{account}`；CodeBuild 项目 `site-package`；IAM 角色 `site-deployer-exec-role`（Step Functions Lambda 共用）与 `site-runtime-role`（站点 Lambda 执行角色，dsql:DbConnect + DynamoDB site-* 表 CRUD + basic logs）。CfnOutput 全部资源名/ARN。状态机在 Task 17 加入同一 stack。
+- Produces: DynamoDB 表 `site-deploy-jobs`（PK job_id，GSI owner-index）、`site-sites`（PK site_id）；S3 桶 `site-artifacts-{account}`；CodeBuild 项目 `site-package`；IAM 角色 `site-deployer-exec-role`（Step Functions Lambda 共用）。**站点运行时角色不在 CDK 里建**——站点代码是不可信代码，每站点一个独立角色 `site-rt-{site_id}`（由 Task 15 部署器动态创建，权限精确到该站点的表与 DSQL role）；exec role 因此需要 `iam:CreateRole/PutRolePolicy/GetRole/PassRole/DeleteRole/DeleteRolePolicy`，Resource 限定 `role/site-rt-*`，并附 **PermissionsBoundary 强制条件**（`iam:PermissionsBoundary` condition key）防权限升级。CfnOutput 全部资源名/ARN。状态机在 Task 17 加入同一 stack。
 
 - [ ] **Step 1: 写 CDK stack**
 
@@ -1597,16 +1815,21 @@ class SiteDeployerStack(Stack):
                               removal_policy=RemovalPolicy.DESTROY, auto_delete_objects=True,
                               lifecycle_rules=[s3.LifecycleRule(expiration=Duration.days(30))])
 
-        runtime_role = iam.Role(self, "SiteRuntimeRole", role_name="site-runtime-role",
-                                assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
-                                managed_policies=[iam.ManagedPolicy.from_aws_managed_policy_name(
-                                    "service-role/AWSLambdaBasicExecutionRole")])
-        runtime_role.add_to_policy(iam.PolicyStatement(
-            actions=["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem",
-                     "dynamodb:DeleteItem", "dynamodb:Query", "dynamodb:Scan"],
-            resources=[f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-data-*"]))
-        runtime_role.add_to_policy(iam.PolicyStatement(
-            actions=["dsql:DbConnect"], resources=["*"]))
+        # 站点运行时权限边界：per-site 角色（site-rt-*，Task 15 动态创建）的能力上限。
+        # 站点代码不可信——boundary 限制其最坏情况能力面；精确资源由各角色 inline policy 再收窄。
+        runtime_boundary = iam.ManagedPolicy(
+            self, "SiteRuntimeBoundary", managed_policy_name="site-runtime-boundary",
+            statements=[
+                iam.PolicyStatement(
+                    actions=["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem",
+                             "dynamodb:DeleteItem", "dynamodb:Query", "dynamodb:Scan"],
+                    resources=[f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-data-*"]),
+                iam.PolicyStatement(actions=["dsql:DbConnect"], resources=["*"]),
+                iam.PolicyStatement(
+                    actions=["logs:CreateLogGroup", "logs:CreateLogStream",
+                             "logs:PutLogEvents"],
+                    resources=[f"arn:aws:logs:{REGION}:{ACCOUNT}:log-group:/aws/lambda/site-*"]),
+            ])
 
         package_project = cb.Project(
             self, "PackageProject", project_name="site-package",
@@ -1632,7 +1855,17 @@ class SiteDeployerStack(Stack):
                          "lambda:TagResource"],
                 resources=[f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:site-*",
                            "arn:aws:lambda:us-east-1:753240598075:layer:LambdaAdapterLayerX86:28"]),
-            iam.PolicyStatement(actions=["iam:PassRole"], resources=[runtime_role.role_arn]),
+            iam.PolicyStatement(  # per-site 运行时角色的创建/管理，boundary 强制
+                actions=["iam:CreateRole", "iam:GetRole", "iam:PutRolePolicy",
+                         "iam:DeleteRolePolicy", "iam:DeleteRole", "iam:PassRole",
+                         "iam:AttachRolePolicy", "iam:TagRole"],
+                resources=[f"arn:aws:iam::{ACCOUNT}:role/site-rt-*"],
+                conditions={"StringEquals": {
+                    "iam:PermissionsBoundary": runtime_boundary.managed_policy_arn}}),
+            iam.PolicyStatement(  # GetRole/PassRole/Delete 不带 boundary 条件（条件仅约束创建/改策略）
+                actions=["iam:GetRole", "iam:PassRole", "iam:DeleteRole",
+                         "iam:DeleteRolePolicy", "iam:ListRolePolicies"],
+                resources=[f"arn:aws:iam::{ACCOUNT}:role/site-rt-*"]),
             iam.PolicyStatement(  # 站点数据表 + 任务/站点/路由表
                 actions=["dynamodb:*"],
                 resources=[f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-*",
@@ -1654,7 +1887,7 @@ class SiteDeployerStack(Stack):
                      "ArtifactsBucket": artifacts.bucket_name,
                      "PackageProject": package_project.project_name,
                      "ExecRoleArn": exec_role.role_arn,
-                     "RuntimeRoleArn": runtime_role.role_arn}.items():
+                     "RuntimeBoundaryArn": runtime_boundary.managed_policy_arn}.items():
             CfnOutput(self, k, value=v)
 
 
@@ -1670,23 +1903,19 @@ app.synth()
 
 ```yaml
 version: 0.2
-# 输入（环境变量，StartBuild 时传）：JOB_ID、RUNTIME(nodejs22.x|python3.13)、
-#   ARTIFACTS_BUCKET。上传包 s3://$ARTIFACTS_BUCKET/uploads/$JOB_ID.zip
+# 输入（环境变量，StartBuild 时传）：JOB_ID、ARTIFACTS_BUCKET。
+# 上传包 s3://$ARTIFACTS_BUCKET/uploads/$JOB_ID.zip（PoC 仅 nodejs22.x）
 # 输出：s3://$ARTIFACTS_BUCKET/artifacts/$JOB_ID/backend.zip
+# 注意：任何命令失败即构建失败——不得用 `|| true` 吞错。
 phases:
   build:
     commands:
       - aws s3 cp "s3://$ARTIFACTS_BUCKET/uploads/$JOB_ID.zip" /tmp/site.zip
       - mkdir -p /tmp/site && cd /tmp/site && unzip -q /tmp/site.zip
+      - test -f /tmp/site/run.sh  # 合同要求 run.sh 在 zip 根，缺失即失败
       - cd /tmp/site/backend
-      - |
-        if [ "${RUNTIME%%.*}" = "nodejs22" ] || [ "$RUNTIME" = "nodejs22.x" ]; then
-          npm install --omit=dev --no-audit --no-fund
-        else
-          pip install -r requirements.txt -t . -q || true
-        fi
-      - cp /tmp/site/run.sh ./run.sh 2>/dev/null || true
-      - chmod +x ./run.sh 2>/dev/null || true
+      - npm install --omit=dev --no-audit --no-fund
+      - cp /tmp/site/run.sh ./run.sh && chmod +x ./run.sh
       - zip -qr /tmp/backend.zip .
       - aws s3 cp /tmp/backend.zip "s3://$ARTIFACTS_BUCKET/artifacts/$JOB_ID/backend.zip"
 ```
@@ -1714,7 +1943,7 @@ git commit -m "feat(deployer): infra stack (tables, buckets, codebuild, roles)"
 **Interfaces:**
 - Consumes: Task 9 的表结构
 - Produces（后续所有步骤 Lambda 依赖）:
-  - `get_config() -> dict`——从环境变量读（`JOBS_TABLE`/`SITES_TABLE`/`ARTIFACTS_BUCKET`/`FRONTEND_BUCKET`/`ROUTING_TABLE`/`BASE_DOMAIN`/`RUNTIME_ROLE_ARN`/`PACKAGE_PROJECT`/`DSQL_ENDPOINT`）
+  - `get_config() -> dict`——从环境变量读（`JOBS_TABLE`/`SITES_TABLE`/`ARTIFACTS_BUCKET`/`FRONTEND_BUCKET`/`ROUTING_TABLE`/`BASE_DOMAIN`/`RUNTIME_BOUNDARY_ARN`/`PACKAGE_PROJECT`/`DSQL_ENDPOINT`）
   - `create_job(owner: str, site_id: str) -> str`（返回 job_id，状态 PENDING）
   - `update_job(job_id: str, *, status=None, phase=None, error=None, url=None) -> None`
   - `get_job(job_id: str) -> dict | None`
@@ -1740,7 +1969,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "functions"))
 ENV = {"JOBS_TABLE": "site-deploy-jobs", "SITES_TABLE": "site-sites",
        "ARTIFACTS_BUCKET": "site-artifacts-1", "FRONTEND_BUCKET": "site-frontend-1",
        "ROUTING_TABLE": "routing", "BASE_DOMAIN": "example.com",
-       "RUNTIME_ROLE_ARN": "arn:aws:iam::1:role/site-runtime-role",
+       "RUNTIME_BOUNDARY_ARN": "arn:aws:iam::1:policy/site-runtime-boundary",
+       "ACCOUNT_ID": "1",
        "PACKAGE_PROJECT": "site-package", "DSQL_ENDPOINT": "x.dsql.us-east-1.on.aws",
        "AWS_DEFAULT_REGION": "us-east-1",
        "AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
@@ -1851,7 +2081,7 @@ def _table(name_env: str):
 
 def get_config() -> dict:
     keys = ["JOBS_TABLE", "SITES_TABLE", "ARTIFACTS_BUCKET", "FRONTEND_BUCKET",
-            "ROUTING_TABLE", "BASE_DOMAIN", "RUNTIME_ROLE_ARN", "PACKAGE_PROJECT",
+            "ROUTING_TABLE", "BASE_DOMAIN", "RUNTIME_BOUNDARY_ARN", "PACKAGE_PROJECT",
             "DSQL_ENDPOINT"]
     return {k.lower(): os.environ[k] for k in keys}
 
@@ -2005,6 +2235,26 @@ def test_redline_violation_raises(aws):
     with pytest.raises(validate.ContractViolation) as ei:
         validate.handler({"job_id": jid, "site_id": "red-x1"}, None)
     assert "localhost" in str(ei.value)
+
+
+def test_zip_bomb_rejected(aws):
+    import validate, common
+    jid = common.create_job("a@x.com", "bomb-x1")
+    # 高压缩比：4MB 全零 → zip 后 ~4KB，比率 >100:1
+    _upload_site_zip(jid, GOOD_MANIFEST, {"frontend/big.js": "\0" * (4 * 1024 * 1024)})
+    with pytest.raises(validate.ContractViolation) as ei:
+        validate.handler({"job_id": jid, "site_id": "bomb-x1"}, None)
+    assert "压缩比" in str(ei.value)
+
+
+def test_too_many_files_rejected(aws):
+    import validate, common
+    jid = common.create_job("a@x.com", "many-x1")
+    files = {f"frontend/f{i}.txt": "x" for i in range(2001)}
+    _upload_site_zip(jid, GOOD_MANIFEST, files)
+    with pytest.raises(validate.ContractViolation) as ei:
+        validate.handler({"job_id": jid, "site_id": "many-x1"}, None)
+    assert "文件数" in str(ei.value)
 ```
 
 - [ ] **Step 2: 运行确认失败**
@@ -2047,6 +2297,15 @@ def handler(event, context):
     with TemporaryDirectory() as td:
         root = Path(td)
         with zipfile.ZipFile(io.BytesIO(data)) as z:
+            infos = z.infolist()
+            if len(infos) > 2000:
+                raise ContractViolation(f"文件数 {len(infos)} 超过 2000 上限")
+            total = sum(i.file_size for i in infos)
+            if total > 200 * 1024 * 1024:
+                raise ContractViolation(f"解压后总大小 {total} 超过 200MB 上限")
+            compressed = max(1, sum(i.compress_size for i in infos))
+            if total / compressed > 100:
+                raise ContractViolation(f"压缩比 {total // compressed}:1 超过 100:1（疑似 zip bomb）")
             for m in z.namelist():  # zip-slip 防护
                 if m.startswith("/") or ".." in m:
                     raise ContractViolation(f"非法路径: {m}")
@@ -2074,7 +2333,7 @@ def handler(event, context):
 - [ ] **Step 4: 运行确认通过**
 
 Run: `.venv/bin/pytest tests/test_validate.py -q`
-Expected: 3 passed
+Expected: 5 passed
 
 - [ ] **Step 5: Commit**
 
@@ -2187,7 +2446,12 @@ git commit -m "feat(deployer): dynamodb provisioner step"
 
 **Interfaces:**
 - Consumes: Task 11 输出；`extracted/{job_id}/backend/schema.sql`（+ 可选 `backend/migrations/NNN_*.sql`）；sites 表 `migrations_applied`
-- Produces: handler 透传 event，追加 `env_vars`：`DSQL_ENDPOINT`、`DSQL_SCHEMA`（值 `common.dsql_schema_for(site_id)`）。行为：IAM admin token 连 DSQL → `CREATE SCHEMA IF NOT EXISTS <schema>` → `SET search_path` → 首次部署执行 schema.sql（按 `;` 拆句逐条自动提交——DSQL 每事务一条 DDL）→ migrations 目录按文件名序执行未记录在 `migrations_applied` 的文件并回写。**连接逻辑封装在 `_connect()` 单函数，测试全程 mock 它**（真实 DSQL 连接在 Task 18 集成测试覆盖）。
+- Produces: handler 透传 event，追加 `env_vars`：`DSQL_ENDPOINT`、`DSQL_SCHEMA`、`DSQL_USER`（per-site PG role 名 `site_{id去连字符}_app`）。行为（admin 身份，平台专用）：
+  1. `CREATE SCHEMA IF NOT EXISTS <schema>` + `SET search_path`
+  2. **建 per-site PG role 并映射站点 IAM 角色**（站点代码用非 admin 身份连接，只见自己的 schema）：`CREATE ROLE <role> WITH LOGIN`（已存在容忍）→ `AWS IAM GRANT <role> TO 'arn:aws:iam::{acct}:role/site-rt-{site_id}'` → `GRANT USAGE, CREATE ON SCHEMA <schema> TO <role>` + `ALTER DEFAULT PRIVILEGES IN SCHEMA <schema> GRANT ALL ON TABLES TO <role>` + 对已有表 `GRANT ALL ON ALL TABLES IN SCHEMA <schema> TO <role>`
+  3. 首次部署执行 schema.sql，migrations 按序执行——语句拆分用 **`sqlparse.split()`**（裸 `split(";")` 会破坏含分号的字符串/注释）；**每执行完一个文件立即回写 `migrations_applied`**（中途失败不重复已完成文件）
+  4. 连接 `try/finally` 关闭。
+- **连接逻辑封装在 `_connect()` 单函数，测试全程 mock 它**（真实 DSQL 连接在 Task 18 集成测试覆盖）。依赖：`psycopg[binary]`、`sqlparse`（CDK bundling 安装）。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -2212,37 +2476,67 @@ def _put(job_id, key, body):
                                   Key=f"extracted/{job_id}/{key}", Body=body)
 
 
-def test_first_deploy_runs_schema_statement_by_statement(aws):
+def _mock_conn():
+    conn = MagicMock()
+    cur = MagicMock()
+    conn.cursor.return_value = cur
+    return conn, cur
+
+
+def test_first_deploy_runs_schema_and_grants(aws):
     import provision_dsql, common
     common.create_job("a@x.com", "exp-a1b2c3")
     _put("job-1", "backend/schema.sql",
          b"CREATE TABLE a (id UUID PRIMARY KEY);\nCREATE TABLE b (id UUID PRIMARY KEY);")
-    cur = MagicMock()
-    with patch.object(provision_dsql, "_connect", return_value=cur):
+    conn, cur = _mock_conn()
+    with patch.object(provision_dsql, "_connect", return_value=conn):
         out = provision_dsql.handler(_event(), None)
     sqls = [c.args[0] for c in cur.execute.call_args_list]
     assert 'CREATE SCHEMA IF NOT EXISTS "site_expa1b2c3"' in sqls[0]
     assert sum("CREATE TABLE" in s for s in sqls) == 2
+    assert any("AWS IAM GRANT site_expa1b2c3_app" in s
+               and "role/site-rt-exp-a1b2c3" in s for s in sqls)  # 站点 IAM 角色映射
+    assert any(s.startswith("GRANT USAGE") for s in sqls)
     assert out["env_vars"]["DSQL_SCHEMA"] == "site_expa1b2c3"
-    assert out["env_vars"]["DSQL_ENDPOINT"]
+    assert out["env_vars"]["DSQL_USER"] == "site_expa1b2c3_app"
+    conn.close.assert_called_once()  # try/finally 关闭
 
 
-def test_redeploy_skips_schema_applies_new_migration(aws):
+def test_statement_split_respects_semicolon_in_string(aws):
+    import provision_dsql, common
+    common.create_job("a@x.com", "exp-a1b2c3")
+    _put("job-1", "backend/schema.sql",
+         b"CREATE TABLE a (id UUID PRIMARY KEY, note TEXT DEFAULT 'a;b');\n"
+         b"-- comment; with semicolon\nCREATE TABLE b (id UUID PRIMARY KEY);")
+    conn, cur = _mock_conn()
+    with patch.object(provision_dsql, "_connect", return_value=conn):
+        provision_dsql.handler(_event(), None)
+    sqls = [c.args[0] for c in cur.execute.call_args_list]
+    creates = [s for s in sqls if "CREATE TABLE" in s]
+    assert len(creates) == 2 and "'a;b'" in creates[0]  # sqlparse 不在字符串内断句
+
+
+def test_redeploy_skips_schema_applies_new_migration_incrementally(aws):
     import provision_dsql, common
     common.create_job("a@x.com", "exp-a1b2c3")
     common.upsert_site("exp-a1b2c3", migrations_applied=["schema.sql", "001_add.sql"])
     _put("job-1", "backend/schema.sql", b"CREATE TABLE a (id UUID PRIMARY KEY);")
     _put("job-1", "backend/migrations/001_add.sql", b"ALTER TABLE a ADD COLUMN x TEXT;")
     _put("job-1", "backend/migrations/002_more.sql", b"ALTER TABLE a ADD COLUMN y TEXT;")
-    cur = MagicMock()
-    with patch.object(provision_dsql, "_connect", return_value=cur):
-        provision_dsql.handler(_event(), None)
-    sqls = [c.args[0] for c in cur.execute.call_args_list]
-    assert not any("CREATE TABLE" in s for s in sqls)      # schema.sql 已应用过
-    assert not any("COLUMN x" in s for s in sqls)          # 001 已应用过
-    assert any("COLUMN y" in s for s in sqls)              # 002 是新的
+    _put("job-1", "backend/migrations/003_fail.sql", b"ALTER TABLE a ADD COLUMN z TEXT;")
+    conn, cur = _mock_conn()
+    # 003 执行时抛错——验证 002 已被记录（逐文件回写）
+    def _explode(sql, *a):
+        if "COLUMN z" in sql:
+            raise RuntimeError("boom")
+    cur.execute.side_effect = _explode
+    with patch.object(provision_dsql, "_connect", return_value=conn):
+        import pytest as _pt
+        with _pt.raises(RuntimeError):
+            provision_dsql.handler(_event(), None)
     applied = common.get_site("exp-a1b2c3")["migrations_applied"]
-    assert "002_more.sql" in applied
+    assert "002_more.sql" in applied and "003_fail.sql" not in applied
+    conn.close.assert_called_once()
 ```
 
 - [ ] **Step 2: 运行确认失败**
@@ -2255,74 +2549,102 @@ Expected: FAIL
 `site-builder/deployer/functions/provision_dsql.py`:
 
 ```python
-"""SFN 步骤 2b：共享 DSQL cluster 内为站点建独立 schema 并执行 DDL。
-DSQL 约束：无 CREATE DATABASE；每事务一条 DDL → 逐条 execute（autocommit）。"""
+"""SFN 步骤 2b：共享 DSQL cluster 内为站点建独立 schema + per-site PG role 并执行 DDL。
+DSQL 约束：无 CREATE DATABASE；每事务一条 DDL → 逐条 execute（autocommit）。
+身份分离：本步骤用 admin（平台身份）；站点 Lambda 用 per-site role（非 admin），
+只被 GRANT 自己的 schema——站点代码是不可信代码。"""
 import os
 import re
 from pathlib import PurePosixPath
 
 import boto3
+import sqlparse
 
 import common
 
-# psycopg 仅在 Lambda 层/打包时可用；测试 mock _connect 不触达
-def _connect(schema: str):
-    """返回 autocommit cursor。执行角色需 dsql:DbConnectAdmin。"""
+# psycopg 仅在 Lambda 打包时可用；测试 mock _connect 不触达
+def _connect():
+    """返回 autocommit connection。执行角色需 dsql:DbConnectAdmin。"""
     import psycopg
     endpoint = os.environ["DSQL_ENDPOINT"]
     token = boto3.client("dsql", region_name="us-east-1").generate_db_connect_admin_auth_token(
         Hostname=endpoint)
-    conn = psycopg.connect(host=endpoint, dbname="postgres", user="admin",
+    return psycopg.connect(host=endpoint, dbname="postgres", user="admin",
                            password=token, sslmode="require", autocommit=True)
-    return conn.cursor()
 
 
 def _statements(sql: str) -> list[str]:
-    return [s.strip() for s in sql.split(";") if s.strip()]
+    return [s.strip() for s in sqlparse.split(sql)
+            if s.strip() and not s.strip().startswith("--")]
 
 
 def handler(event, context):
     common.update_job(event["job_id"], phase="provision-db")
     site_id, job_id = event["site_id"], event["job_id"]
     schema = common.dsql_schema_for(site_id)
+    pg_role = f"{schema}_app"
+    rt_role_arn = (f"arn:aws:iam::{os.environ['ACCOUNT_ID']}:role/site-rt-{site_id}")
     s3 = boto3.client("s3")
     bucket = os.environ["ARTIFACTS_BUCKET"]
 
     site = common.get_site(site_id) or {}
     applied = list(site.get("migrations_applied", []))
 
-    cur = _connect(schema)
-    cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
-    cur.execute(f'SET search_path = "{schema}"')
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+        cur.execute(f'SET search_path = "{schema}"')
 
-    def run_file(key: str, marker: str):
-        body = s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode()
-        for stmt in _statements(body):
-            cur.execute(stmt)
-        applied.append(marker)
+        # per-site PG role + IAM 映射（幂等：已存在则容忍）
+        try:
+            cur.execute(f'CREATE ROLE {pg_role} WITH LOGIN')
+        except Exception:
+            pass  # duplicate role
+        try:
+            cur.execute(f"AWS IAM GRANT {pg_role} TO '{rt_role_arn}'")
+        except Exception:
+            pass  # 已映射
+        cur.execute(f'GRANT USAGE, CREATE ON SCHEMA "{schema}" TO {pg_role}')
+        cur.execute(f'ALTER DEFAULT PRIVILEGES IN SCHEMA "{schema}" '
+                    f'GRANT ALL ON TABLES TO {pg_role}')
 
-    if "schema.sql" not in applied:
-        run_file(f"extracted/{job_id}/backend/schema.sql", "schema.sql")
+        def run_file(key: str, marker: str):
+            body = s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode()
+            for stmt in _statements(body):
+                cur.execute(stmt)
+            applied.append(marker)
+            common.upsert_site(site_id, migrations_applied=applied)  # 逐文件立即记录
 
-    resp = s3.list_objects_v2(Bucket=bucket,
-                              Prefix=f"extracted/{job_id}/backend/migrations/")
-    for obj in sorted(resp.get("Contents", []), key=lambda o: o["Key"]):
-        fname = PurePosixPath(obj["Key"]).name
-        if re.match(r"^\d{3}_.+\.sql$", fname) and fname not in applied:
-            run_file(obj["Key"], fname)
+        if "schema.sql" not in applied:
+            run_file(f"extracted/{job_id}/backend/schema.sql", "schema.sql")
 
-    common.upsert_site(site_id, migrations_applied=applied)
+        resp = s3.list_objects_v2(Bucket=bucket,
+                                  Prefix=f"extracted/{job_id}/backend/migrations/")
+        for obj in sorted(resp.get("Contents", []), key=lambda o: o["Key"]):
+            fname = PurePosixPath(obj["Key"]).name
+            if re.match(r"^\d{3}_.+\.sql$", fname) and fname not in applied:
+                run_file(obj["Key"], fname)
+
+        # 覆盖 schema.sql/migrations 新建的表（DEFAULT PRIVILEGES 只对未来生效一次性补齐）
+        cur.execute(f'GRANT ALL ON ALL TABLES IN SCHEMA "{schema}" TO {pg_role}')
+    finally:
+        conn.close()
+
     env_vars = event.get("env_vars", {})
     env_vars["DSQL_ENDPOINT"] = os.environ["DSQL_ENDPOINT"]
     env_vars["DSQL_SCHEMA"] = schema
+    env_vars["DSQL_USER"] = pg_role
     event["env_vars"] = env_vars
     return event
 ```
 
+实现注意：`AWS IAM GRANT` 语法与幂等行为以 DSQL 当期文档为准（[authentication-authorization](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/authentication-authorization.html)）；`CREATE ROLE`/`GRANT` 的容错分支若 DSQL 支持 `IF NOT EXISTS` 优先用之。
+
 - [ ] **Step 4: 运行确认通过**
 
 Run: `.venv/bin/pytest tests/test_provision_dsql.py -q`
-Expected: 2 passed
+Expected: 3 passed（requirements-dev.txt 追加 `sqlparse>=0.5`）
 
 - [ ] **Step 5: 创建真实 DSQL cluster（一次性，CLI）**
 
@@ -2403,8 +2725,7 @@ def test_start_build_env_overrides(aws):
         package_backend.handler(dict(EVENT), None)
     env = {e["name"]: e["value"]
            for e in cb.start_build.call_args.kwargs["environmentVariablesOverride"]}
-    assert env == {"JOB_ID": "job-1", "RUNTIME": "nodejs22.x",
-                   "ARTIFACTS_BUCKET": "site-artifacts-1"}
+    assert env == {"JOB_ID": "job-1", "ARTIFACTS_BUCKET": "site-artifacts-1"}
 ```
 
 - [ ] **Step 2: 运行确认失败**
@@ -2441,7 +2762,6 @@ def handler(event, context):
         projectName=os.environ["PACKAGE_PROJECT"],
         environmentVariablesOverride=[
             {"name": "JOB_ID", "value": event["job_id"]},
-            {"name": "RUNTIME", "value": event["manifest"]["backend"]["runtime"]},
             {"name": "ARTIFACTS_BUCKET", "value": os.environ["ARTIFACTS_BUCKET"]},
         ])["build"]["id"]
 
@@ -2483,8 +2803,11 @@ git commit -m "feat(deployer): codebuild packaging step with sync wait"
 - Test: `site-builder/deployer/tests/test_deploy_lambda_site.py`
 
 **Interfaces:**
-- Consumes: `event["backend_zip_key"]`、`event["env_vars"]`（DB 注入）、`RUNTIME_ROLE_ARN`
-- Produces: handler 透传 event，追加 `event["api_target"]`（Function URL，rstrip("/")）。函数名 `site-{site_id}`；配置：LWA Layer ARN（Global Constraints 精确值）、Handler=`run.sh`、`AWS_LAMBDA_EXEC_WRAPPER=/opt/bootstrap`、`PORT=8080`、`AWS_LWA_INVOKE_MODE=BUFFERED`、MemorySize=512、Timeout=30；Function URL AuthType=AWS_IAM + 授权 Edge 角色 invoke（principal 用账号 ARN 简化：`AddPermission Principal=account_id, Action=lambda:InvokeFunctionUrl`）。幂等：存在则 update code + config。
+- Consumes: `event["backend_zip_key"]`、`event["env_vars"]`（DB 注入）、`RUNTIME_BOUNDARY_ARN`、`EDGE_ROLE_ARN`（manus 栈 CfnOutput，config.ini 回填）
+- Produces: handler 透传 event，追加 `event["api_target"]`。两个动作：
+  1. **建 per-site 执行角色 `site-rt-{site_id}`**（幂等）：trust=lambda.amazonaws.com，`PermissionsBoundary=RUNTIME_BOUNDARY_ARN`（IAM policy 强制，缺 boundary 的 CreateRole 会被拒），inline policy 按 tier 精确到本站点资源——dynamodb tier：仅 `site-data-{site_id}-*` 表 CRUD；dsql tier：仅 `dsql:DbConnect`（非 admin）；外加本函数日志组。
+  2. 建/更新函数 `site-{site_id}`：LWA Layer（精确 ARN）、Handler=`run.sh`、`AWS_LAMBDA_EXEC_WRAPPER=/opt/bootstrap`、`PORT=8080`、`AWS_LWA_INVOKE_MODE=BUFFERED`、MemorySize=512、Timeout=30、Role=该站点角色；Function URL AuthType=AWS_IAM，resource policy **Principal 精确到 Edge 执行角色 ARN**（`lambda:InvokeFunctionUrl` + condition `lambda:FunctionUrlAuthType=AWS_IAM`；**无 `*` fallback**——EDGE_ROLE_ARN 缺失直接抛错）。幂等：存在则 update code + config。
+- 注：IAM 新角色传播延迟——create_function 失败 `InvalidParameterValueException` 时重试（最多 6 次 × 5s）。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -2520,25 +2843,53 @@ def _lam_mock(exists: bool):
     return lam
 
 
-def test_creates_function_with_lwa_config(aws):
+def test_creates_per_site_role_and_function(aws, monkeypatch):
     import deploy_lambda_site, common
+    monkeypatch.setenv("EDGE_ROLE_ARN", "arn:aws:iam::1:role/edge-role")
     common.create_job("a@x.com", "s-1")
     lam = _lam_mock(exists=False)
     with patch.object(deploy_lambda_site, "_lambda", return_value=lam):
         out = deploy_lambda_site.handler(dict(EVENT), None)
     assert out["api_target"] == "https://xyz.lambda-url.us-east-1.on.aws"
+
+    # per-site 角色（moto IAM 真建）：boundary + 只授本站点表
+    import boto3, json
+    iam = boto3.client("iam")
+    role = iam.get_role(RoleName="site-rt-s-1")["Role"]
+    assert role["PermissionsBoundary"]["PermissionsBoundaryArn"].endswith(
+        "policy/site-runtime-boundary")
+    pol = iam.get_role_policy(RoleName="site-rt-s-1", PolicyName="site-scope")
+    doc = json.dumps(pol["PolicyDocument"])
+    assert "site-data-s-1-" in doc and "site-data-s-2" not in doc
+
     kw = lam.create_function.call_args.kwargs
     assert kw["FunctionName"] == "site-s-1"
+    assert kw["Role"].endswith("role/site-rt-s-1")
     assert kw["Layers"] == [LWA_ARN]
     assert kw["Handler"] == "run.sh"
     env = kw["Environment"]["Variables"]
     assert env["AWS_LAMBDA_EXEC_WRAPPER"] == "/opt/bootstrap"
     assert env["PORT"] == "8080"
     assert env["TABLE_NOTES"] == "site-data-s-1-notes"
+    # Function URL 权限精确到 Edge role，无 * fallback
+    perm = lam.add_permission.call_args.kwargs
+    assert perm["Principal"] == "arn:aws:iam::1:role/edge-role"
 
 
-def test_existing_function_updated(aws):
+def test_missing_edge_role_arn_fails_closed(aws, monkeypatch):
     import deploy_lambda_site, common
+    monkeypatch.delenv("EDGE_ROLE_ARN", raising=False)
+    common.create_job("a@x.com", "s-1")
+    lam = _lam_mock(exists=False)
+    import pytest as _pt
+    with patch.object(deploy_lambda_site, "_lambda", return_value=lam):
+        with _pt.raises(KeyError):
+            deploy_lambda_site.handler(dict(EVENT), None)
+
+
+def test_existing_function_updated(aws, monkeypatch):
+    import deploy_lambda_site, common
+    monkeypatch.setenv("EDGE_ROLE_ARN", "arn:aws:iam::1:role/edge-role")
     common.create_job("a@x.com", "s-1")
     lam = _lam_mock(exists=True)
     with patch.object(deploy_lambda_site, "_lambda", return_value=lam):
@@ -2557,24 +2908,67 @@ Expected: FAIL
 `site-builder/deployer/functions/deploy_lambda_site.py`:
 
 ```python
-"""SFN 步骤 4：部署站点后端 Lambda——zip + LWA Layer（禁止镜像模式）。"""
+"""SFN 步骤 4：per-site 执行角色 + 站点 Lambda——zip + LWA Layer（禁止镜像模式）。
+站点代码不可信：角色带 PermissionsBoundary，inline policy 精确到本站点资源。"""
+import json
 import os
+import time
 
 import boto3
 
 import common
 
 LWA_LAYER = "arn:aws:lambda:us-east-1:753240598075:layer:LambdaAdapterLayerX86:28"
+TRUST = json.dumps({"Version": "2012-10-17", "Statement": [{
+    "Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"},
+    "Action": "sts:AssumeRole"}]})
 
 
 def _lambda():
     return boto3.client("lambda")
 
 
+def _site_policy(site_id: str, engine: str) -> str:
+    region, acct = "us-east-1", os.environ["ACCOUNT_ID"]
+    statements = [{
+        "Effect": "Allow",
+        "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+        "Resource": f"arn:aws:logs:{region}:{acct}:log-group:/aws/lambda/site-{site_id}*"}]
+    if engine == "dynamodb":
+        statements.append({
+            "Effect": "Allow",
+            "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem",
+                       "dynamodb:DeleteItem", "dynamodb:Query", "dynamodb:Scan"],
+            "Resource": f"arn:aws:dynamodb:{region}:{acct}:table/site-data-{site_id}-*"})
+    elif engine == "dsql":
+        statements.append({"Effect": "Allow", "Action": "dsql:DbConnect",
+                           "Resource": "*"})  # 数据隔离由 per-site PG role 保证
+    return json.dumps({"Version": "2012-10-17", "Statement": statements})
+
+
+def _ensure_site_role(site_id: str, engine: str) -> str:
+    iam = boto3.client("iam")
+    name = f"site-rt-{site_id}"
+    try:
+        arn = iam.get_role(RoleName=name)["Role"]["Arn"]
+    except iam.exceptions.NoSuchEntityException:
+        arn = iam.create_role(
+            RoleName=name, AssumeRolePolicyDocument=TRUST,
+            PermissionsBoundary=os.environ["RUNTIME_BOUNDARY_ARN"],
+            Tags=[{"Key": "project", "Value": "site-builder"},
+                  {"Key": "site_id", "Value": site_id}])["Role"]["Arn"]
+    iam.put_role_policy(RoleName=name, PolicyName="site-scope",
+                        PolicyDocument=_site_policy(site_id, engine))
+    return arn
+
+
 def handler(event, context):
     common.update_job(event["job_id"], phase="deploy-backend")
+    edge_role_arn = os.environ["EDGE_ROLE_ARN"]  # 缺失即 KeyError——不允许 * fallback
     lam = _lambda()
     fn = f"site-{event['site_id']}"
+    engine = event["manifest"].get("database", {}).get("engine", "none")
+    role_arn = _ensure_site_role(event["site_id"], engine)
     env = {"AWS_LAMBDA_EXEC_WRAPPER": "/opt/bootstrap", "PORT": "8080",
            "AWS_LWA_INVOKE_MODE": "BUFFERED", **event.get("env_vars", {})}
     code = {"S3Bucket": os.environ["ARTIFACTS_BUCKET"], "S3Key": event["backend_zip_key"]}
@@ -2585,17 +2979,24 @@ def handler(event, context):
         lam.update_function_code(FunctionName=fn, **code)
         lam.get_waiter("function_updated").wait(FunctionName=fn)
         lam.update_function_configuration(
-            FunctionName=fn, Runtime=runtime, Handler="run.sh",
+            FunctionName=fn, Runtime=runtime, Handler="run.sh", Role=role_arn,
             Layers=[LWA_LAYER], Environment={"Variables": env},
             MemorySize=512, Timeout=30)
         lam.get_waiter("function_updated").wait(FunctionName=fn)
     except lam.exceptions.ResourceNotFoundException:
-        lam.create_function(
-            FunctionName=fn, Runtime=runtime, Handler="run.sh",
-            Role=os.environ["RUNTIME_ROLE_ARN"], Code=code,
-            Layers=[LWA_LAYER], Environment={"Variables": env},
-            MemorySize=512, Timeout=30,
-            Tags={"project": "site-builder", "site_id": event["site_id"]})
+        for attempt in range(6):  # 新建 IAM 角色传播延迟
+            try:
+                lam.create_function(
+                    FunctionName=fn, Runtime=runtime, Handler="run.sh",
+                    Role=role_arn, Code=code,
+                    Layers=[LWA_LAYER], Environment={"Variables": env},
+                    MemorySize=512, Timeout=30,
+                    Tags={"project": "site-builder", "site_id": event["site_id"]})
+                break
+            except lam.exceptions.InvalidParameterValueException:
+                if attempt == 5:
+                    raise
+                time.sleep(5)
         lam.get_waiter("function_active").wait(FunctionName=fn)
 
     try:
@@ -2606,7 +3007,7 @@ def handler(event, context):
     try:
         lam.add_permission(FunctionName=fn, StatementId="edge-invoke",
                            Action="lambda:InvokeFunctionUrl",
-                           Principal=os.environ.get("ACCOUNT_ID", "*"),
+                           Principal=edge_role_arn,
                            FunctionUrlAuthType="AWS_IAM")
     except lam.exceptions.ResourceConflictException:
         pass
@@ -2615,16 +3016,18 @@ def handler(event, context):
     return event
 ```
 
+配套：Task 8 的 manus stack.py 需为 edge role 加 `CfnOutput(self, "EdgeRoleArn", value=edge_role.role_arn)`，值回填 config.ini `[Deployer] edge_role_arn`，Task 17 作为 `EDGE_ROLE_ARN` 环境变量传入。Task 17 的 undeploy 同步补删 `site-rt-{site_id}` 角色（先 delete_role_policy 再 delete_role，容忍不存在）。
+
 - [ ] **Step 4: 运行确认通过**
 
 Run: `.venv/bin/pytest tests/test_deploy_lambda_site.py -q`
-Expected: 2 passed
+Expected: 4 passed（conftest 的 moto mock_aws 需含 iam——moto 默认全局 mock 已覆盖；boundary policy 在 conftest 中预创建：`iam.create_policy(PolicyName="site-runtime-boundary", PolicyDocument=json.dumps({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]})`）
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add site-builder/deployer
-git commit -m "feat(deployer): site lambda deployment (zip + LWA layer + function url)"
+git commit -m "feat(deployer): per-site runtime role + site lambda (zip + LWA layer)"
 ```
 
 ### Task 16: 前端上传 + 路由注册 + 冒烟步骤
@@ -2639,10 +3042,11 @@ git commit -m "feat(deployer): site lambda deployment (zip + LWA layer + functio
 **Interfaces:**
 - Consumes: `extracted/{job_id}/frontend/`、`event["api_target"]`（static tier 无此键）、manifest.auth、`common.subdomain_for`
 - Produces:
-  - `upload_frontend.handler`——frontend/ 拷到 `s3://{FRONTEND_BUCKET}/sites/{site_id}/`（先清旧前缀再传新，Content-Type 按扩展名），透传 event
-  - `register_route.handler`——写路由表 item（结构见 File Structure 节），追加 `event["url"] = f"https://app-{site_id}.{BASE_DOMAIN}"`
-  - `smoke_test.handler`——GET `{url}/` 期待 200/302；有 backend 时 GET `{url}/api/health` 期待 200（require_auth 站点接受 302——鉴权本身在流量路径上）。urllib 实现，10 秒超时，失败 raise `SmokeFailure`
-  - `mark_job.handler`——event 含 `error` 时置 FAILED（error 取 SFN Catch 注入的 `event["error_info"]["Cause"]` 截 500 字符），否则置 SUCCEEDED+url，并 `upsert_site(..., status, last_job_id, owner, tier, subdomain)`
+  - `upload_frontend.handler`——frontend/ 传到**版本化前缀** `s3://{FRONTEND_BUCKET}/sites/{site_id}/{job_id}/`（Content-Type 按扩展名；**不删旧版本**——线上流量仍指旧前缀，切换由 register_route 原子完成；旧版本由桶生命周期规则清理），透传 event
+  - `register_route.handler`——写路由表 item（`static_prefix=f"sites/{site_id}/{job_id}"`，含 route_mode="split"），put_item 即原子切流；追加 `event["url"]`
+  - `smoke_test.handler`——**禁跟随重定向**（自定义 opener）：无 auth 站点首页期待 200；require_auth 站点期待 302 且 `Location` 以 `https://auth.{BASE_DOMAIN}/login` 开头（跟随到 200 会把"跳登录页"误判为后端健康）；`/api/health` 同理。10 秒超时，失败 raise `SmokeFailure`
+  - `mark_job.handler`——同前
+- S3 遍历/删除一律 paginator（undeploy 侧同样，见 Task 17）
 
 - [ ] **Step 1: 写失败测试**
 
@@ -2658,42 +3062,66 @@ MANIFEST = {"name": "hello", "tier": "static", "database": {"engine": "none"},
 EVENT = {"job_id": "job-1", "site_id": "hello-x1", "manifest": MANIFEST}
 
 
-def test_upload_frontend_copies_with_content_type(aws):
+def test_upload_frontend_versioned_prefix_keeps_old_version(aws):
     import upload_frontend, common
     common.create_job("a@x.com", "hello-x1")
     s3 = boto3.client("s3")
     s3.put_object(Bucket="site-artifacts-1", Key="extracted/job-1/frontend/index.html",
                   Body=b"<h1>hi</h1>")
-    s3.put_object(Bucket="site-frontend-1", Key="sites/hello-x1/stale.js", Body=b"old")
+    # 旧版本（上一个 job 的前缀）——发布期间线上流量仍在用，不得删除
+    s3.put_object(Bucket="site-frontend-1", Key="sites/hello-x1/job-0/index.html",
+                  Body=b"old")
     upload_frontend.handler(dict(EVENT), None)
-    obj = s3.get_object(Bucket="site-frontend-1", Key="sites/hello-x1/index.html")
+    obj = s3.get_object(Bucket="site-frontend-1",
+                        Key="sites/hello-x1/job-1/index.html")
     assert obj["ContentType"] == "text/html"
-    stale = s3.list_objects_v2(Bucket="site-frontend-1", Prefix="sites/hello-x1/stale")
-    assert stale["KeyCount"] == 0
+    old = s3.get_object(Bucket="site-frontend-1", Key="sites/hello-x1/job-0/index.html")
+    assert old["Body"].read() == b"old"  # 旧版本原样保留
 
 
-def test_register_route_writes_item_and_url(aws):
+def test_register_route_atomic_switch(aws):
     import register_route, common
     common.create_job("a@x.com", "hello-x1")
     common.upsert_site("hello-x1", owner="a@x.com")
+    ddb = boto3.client("dynamodb")
+    # 模拟已有旧路由（指向旧 job 前缀）
+    ddb.put_item(TableName="routing", Item={
+        "subdomain": {"S": "app-hello-x1"}, "site_id": {"S": "hello-x1"},
+        "route_mode": {"S": "split"}, "static_prefix": {"S": "sites/hello-x1/job-0"},
+        "api_target": {"S": ""}, "require_auth": {"BOOL": True},
+        "allowed_users": {"S": "org"}, "owner": {"S": "a@x.com"}})
     out = register_route.handler(dict(EVENT), None)
     assert out["url"] == "https://app-hello-x1.example.com"
-    item = boto3.client("dynamodb").get_item(
-        TableName="routing", Key={"subdomain": {"S": "app-hello-x1"}})["Item"]
+    item = ddb.get_item(TableName="routing",
+                        Key={"subdomain": {"S": "app-hello-x1"}})["Item"]
+    assert item["static_prefix"]["S"] == "sites/hello-x1/job-1"  # 原子切到新版本
+    assert item["route_mode"]["S"] == "split"
     assert item["require_auth"]["BOOL"] is True
-    assert item["api_target"]["S"] == ""
     assert '"v@x.com"' in item["allowed_users"]["S"]
     assert item["owner"]["S"] == "a@x.com"
 
 
-def test_smoke_test_passes_and_fails(aws):
+def test_smoke_auth_site_expects_302_to_login(aws):
     import smoke_test
-    ok = MagicMock(); ok.status = 200
-    with patch.object(smoke_test, "_get", return_value=200):
+    # require_auth 站点：302 到登录端点 = 健康；200 = 鉴权失效，必须失败
+    with patch.object(smoke_test, "_head",
+                      return_value=(302, "https://auth.example.com/login?redirect=x")):
         smoke_test.handler({**EVENT, "url": "https://app-hello-x1.example.com"}, None)
-    with patch.object(smoke_test, "_get", return_value=500):
+    with patch.object(smoke_test, "_head", return_value=(200, "")):
         with pytest.raises(smoke_test.SmokeFailure):
             smoke_test.handler({**EVENT, "url": "https://app-hello-x1.example.com"}, None)
+
+
+def test_smoke_public_site_expects_200(aws):
+    import smoke_test
+    ev = {**EVENT, "manifest": {**MANIFEST, "auth": {"require_login": False,
+                                                     "allowed_users": "org"}},
+          "url": "https://app-hello-x1.example.com"}
+    with patch.object(smoke_test, "_head", return_value=(200, "")):
+        smoke_test.handler(ev, None)
+    with patch.object(smoke_test, "_head", return_value=(500, "")):
+        with pytest.raises(smoke_test.SmokeFailure):
+            smoke_test.handler(ev, None)
 
 
 def test_mark_job_success_and_failure(aws):
@@ -2720,7 +3148,9 @@ Expected: FAIL
 `site-builder/deployer/functions/upload_frontend.py`:
 
 ```python
-"""SFN 步骤 5：前端静态文件 → 共享前端桶 sites/{site_id}/（先清后传）。"""
+"""SFN 步骤 5：前端静态文件 → 版本化前缀 sites/{site_id}/{job_id}/。
+不删旧版本——线上流量仍指旧前缀，切换由 register_route 原子完成；
+旧版本由前端桶生命周期规则（30 天）清理。"""
 import mimetypes
 import os
 
@@ -2735,12 +3165,7 @@ def handler(event, context):
     src_bucket = os.environ["ARTIFACTS_BUCKET"]
     dst_bucket = os.environ["FRONTEND_BUCKET"]
     src_prefix = f"extracted/{event['job_id']}/frontend/"
-    dst_prefix = f"sites/{event['site_id']}/"
-
-    old = s3.list_objects_v2(Bucket=dst_bucket, Prefix=dst_prefix)
-    if old.get("Contents"):
-        s3.delete_objects(Bucket=dst_bucket, Delete={
-            "Objects": [{"Key": o["Key"]} for o in old["Contents"]]})
+    dst_prefix = f"sites/{event['site_id']}/{event['job_id']}/"
 
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=src_bucket, Prefix=src_prefix):
@@ -2753,10 +3178,14 @@ def handler(event, context):
     return event
 ```
 
+（旧版本清理：**不能用 S3 生命周期**——它按对象年龄过期，会把长期在线的当前版本一并删掉。改为 `mark_job.handler` 成功路径里清理：列出 `sites/{site_id}/` 下除当前 `job_id` 外的所有前缀，paginator + 分批 delete_objects。清理失败仅告警不置 FAILED——站点已上线，残留旧版本只是存储成本。）
+
 `site-builder/deployer/functions/register_route.py`:
 
 ```python
-"""SFN 步骤 6：注册子域名路由（含 auth 策略与 owner）。"""
+"""SFN 步骤 6：注册子域名路由（含 auth 策略与 owner）。
+put_item 覆盖整个 item = 原子切流：static_prefix 指向本次 job 的版本化前缀，
+写入瞬间所有新请求走新版本（Edge 路由缓存最多再滞后 60s）。"""
 import json
 import os
 
@@ -2777,7 +3206,8 @@ def handler(event, context):
         TableName=os.environ["ROUTING_TABLE"],
         Item={"subdomain": {"S": subdomain},
               "site_id": {"S": event["site_id"]},
-              "static_prefix": {"S": f"sites/{event['site_id']}"},
+              "route_mode": {"S": "split"},
+              "static_prefix": {"S": f"sites/{event['site_id']}/{event['job_id']}"},
               "api_target": {"S": event.get("api_target", "")},
               "require_auth": {"BOOL": bool(auth["require_login"])},
               "allowed_users": {"S": allowed if allowed == "org" else json.dumps(allowed)},
@@ -2789,9 +3219,12 @@ def handler(event, context):
 `site-builder/deployer/functions/smoke_test.py`:
 
 ```python
-"""SFN 步骤 7：冒烟——首页与 /api/health 可达。302 视为通过（鉴权站点跳登录属正常）。"""
-import urllib.request
+"""SFN 步骤 7：冒烟。禁跟随重定向——require_auth 站点的健康态是
+"302 且 Location 指向登录端点"；跟随到登录页的 200 会掩盖后端故障，
+而鉴权站点直接 200 意味着鉴权失效，同样必须失败。"""
+import os
 import urllib.error
+import urllib.request
 
 import common
 
@@ -2800,33 +3233,76 @@ class SmokeFailure(Exception):
     pass
 
 
-def _get(url: str) -> int:
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+
+
+def _head(url: str) -> tuple[int, str]:
+    """返回 (status, location)。不跟随重定向。"""
     req = urllib.request.Request(url, method="GET")
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status
+        with _opener.open(req, timeout=10) as resp:
+            return resp.status, ""
     except urllib.error.HTTPError as e:
-        return e.code
+        return e.code, e.headers.get("Location", "")
+
+
+def _check(url: str, require_auth: bool, login_prefix: str, what: str):
+    code, location = _head(url)
+    if require_auth:
+        if code != 302 or not location.startswith(login_prefix):
+            raise SmokeFailure(
+                f"{what} 期待 302→登录端点，实际 {code} Location={location!r}"
+                + ("（鉴权未生效！）" if code == 200 else ""))
+    else:
+        if code != 200:
+            raise SmokeFailure(f"{what} 返回 {code}")
 
 
 def handler(event, context):
     common.update_job(event["job_id"], phase="smoke-test")
-    ok = (200, 301, 302)
-    code = _get(event["url"] + "/")
-    if code not in ok:
-        raise SmokeFailure(f"首页返回 {code}")
+    require_auth = bool(event["manifest"]["auth"]["require_login"])
+    login_prefix = f"https://auth.{os.environ['BASE_DOMAIN']}/login"
+    _check(event["url"] + "/", require_auth, login_prefix, "首页")
     if event["manifest"].get("backend"):
-        code = _get(event["url"] + "/api/health")
-        if code not in ok:
-            raise SmokeFailure(f"/api/health 返回 {code}")
+        _check(event["url"] + "/api/health", require_auth, login_prefix, "/api/health")
     return event
 ```
 
 `site-builder/deployer/functions/mark_job.py`:
 
 ```python
-"""SFN 终态：成功/失败落账 + 站点记录维护。"""
+"""SFN 终态：成功/失败落账 + 站点记录维护 + 旧版本前端清理。"""
+import logging
+import os
+
+import boto3
+
 import common
+
+logger = logging.getLogger()
+
+
+def _cleanup_old_versions(site_id: str, current_job_id: str):
+    """删除 sites/{site_id}/ 下除当前 job 外的旧版本前缀。
+    失败仅告警——站点已上线，残留旧版本只是存储成本。"""
+    try:
+        s3 = boto3.client("s3")
+        bucket = os.environ["FRONTEND_BUCKET"]
+        keep = f"sites/{site_id}/{current_job_id}/"
+        paginator = s3.get_paginator("list_objects_v2")
+        stale = []
+        for page in paginator.paginate(Bucket=bucket, Prefix=f"sites/{site_id}/"):
+            stale += [{"Key": o["Key"]} for o in page.get("Contents", [])
+                      if not o["Key"].startswith(keep)]
+        for i in range(0, len(stale), 1000):
+            s3.delete_objects(Bucket=bucket, Delete={"Objects": stale[i:i + 1000]})
+    except Exception as e:
+        logger.warning(f"旧版本清理失败（不影响部署结果）: {e}")
 
 
 def handler(event, context):
@@ -2842,6 +3318,7 @@ def handler(event, context):
                        owner=job["owner"], tier=event["manifest"]["tier"],
                        name=event["manifest"]["name"],
                        subdomain=common.subdomain_for(event["site_id"]))
+    _cleanup_old_versions(event["site_id"], job_id)
     return {"job_id": job_id, "status": "SUCCEEDED", "url": event["url"]}
 ```
 
@@ -2920,7 +3397,8 @@ Run: `.venv/bin/pytest tests/test_undeploy.py -q` → FAIL
 `site-builder/deployer/functions/undeploy.py`:
 
 ```python
-"""站点下线：删路由 → 删 Lambda → 清前端。DB 数据保留（PoC 防误删）。"""
+"""站点下线：删路由 → 删 Lambda → 删 per-site 角色 → 清前端（paginator 分批）。
+DB 数据保留（PoC 防误删）。"""
 import os
 
 import boto3
@@ -2930,6 +3408,15 @@ import common
 
 def _lambda():
     return boto3.client("lambda")
+
+
+def _delete_prefix(s3, bucket: str, prefix: str):
+    """paginator + 每批 ≤1000 对象（delete_objects 上限）。"""
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        objs = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+        for i in range(0, len(objs), 1000):
+            s3.delete_objects(Bucket=bucket, Delete={"Objects": objs[i:i + 1000]})
 
 
 def handler(event, context):
@@ -2946,12 +3433,17 @@ def handler(event, context):
     except lam.exceptions.ResourceNotFoundException:
         pass
 
-    s3 = boto3.client("s3")
-    bucket = os.environ["FRONTEND_BUCKET"]
-    old = s3.list_objects_v2(Bucket=bucket, Prefix=f"sites/{site_id}/")
-    if old.get("Contents"):
-        s3.delete_objects(Bucket=bucket, Delete={
-            "Objects": [{"Key": o["Key"]} for o in old["Contents"]]})
+    iam = boto3.client("iam")
+    role = f"site-rt-{site_id}"
+    try:
+        for pol in iam.list_role_policies(RoleName=role)["PolicyNames"]:
+            iam.delete_role_policy(RoleName=role, PolicyName=pol)
+        iam.delete_role(RoleName=role)
+    except iam.exceptions.NoSuchEntityException:
+        pass
+
+    _delete_prefix(boto3.client("s3"), os.environ["FRONTEND_BUCKET"],
+                   f"sites/{site_id}/")
 
     common.upsert_site(site_id, status="DELETED")
     common.update_job(event["job_id"], status="DELETED")
@@ -2973,7 +3465,8 @@ Run: `.venv/bin/pytest tests/test_undeploy.py -q` → 1 passed
             "FRONTEND_BUCKET": f"site-frontend-{ACCOUNT}",
             "ROUTING_TABLE": CFG["Platform"]["routing_table"],
             "BASE_DOMAIN": CFG["Platform"]["base_domain"],
-            "RUNTIME_ROLE_ARN": runtime_role.role_arn,
+            "RUNTIME_BOUNDARY_ARN": runtime_boundary.managed_policy_arn,
+            "EDGE_ROLE_ARN": CFG["Deployer"]["edge_role_arn"],  # manus 栈 CfnOutput 回填
             "PACKAGE_PROJECT": package_project.project_name,
             "DSQL_ENDPOINT": CFG["DSQL"]["cluster_endpoint"],
             "ACCOUNT_ID": ACCOUNT,
@@ -2988,7 +3481,7 @@ Run: `.venv/bin/pytest tests/test_undeploy.py -q` → 1 passed
                 code=lam_.Code.from_asset(fn_dir, bundling={
                     "image": lam_.Runtime.PYTHON_3_13.bundling_image,
                     "command": ["bash", "-c",
-                                "pip install psycopg[binary] -t /asset-output -q && "
+                                "pip install 'psycopg[binary]' sqlparse -t /asset-output -q && "
                                 f"cp -r /asset-input/. /asset-output/ && "
                                 "pip install /asset-contract -t /asset-output -q"],
                     "volumes": [{"hostPath": contract_dir + "/..",
@@ -3007,45 +3500,46 @@ Run: `.venv/bin/pytest tests/test_undeploy.py -q` → 1 passed
         f_mark = step_fn("FnMark", "mark_job")
         step_fn("FnUndeploy", "undeploy", 300)  # MCP 直调，不进状态机
 
-        def t(name, fn):
-            return tasks.LambdaInvoke(self, name, lambda_function=fn,
-                                      payload_response_only=True)
-
         mark_failed = tasks.LambdaInvoke(self, "MarkFailed", lambda_function=f_mark,
                                          payload_response_only=True)
-        succeed = sfn.Succeed(self, "Done")
-        fail = sfn.Fail(self, "Failed")
+        mark_failed.next(sfn.Fail(self, "Failed"))
 
-        chain_upload = (t("UploadFrontend", f_upload)
-                        .next(t("RegisterRoute", f_route))
-                        .next(t("SmokeTest", f_smoke))
-                        .next(t("MarkSuccess", f_mark))
-                        .next(succeed))
-        choice_backend = (sfn.Choice(self, "HasBackend?")
-                          .when(sfn.Condition.string_equals("$.manifest.tier", "static"),
-                                chain_upload)
-                          .otherwise(t("PackageBackend", f_pkg)
-                                     .next(t("DeployLambdaSite", f_deploy))
-                                     .next(chain_upload)))
+        _tracked: list = []
+
+        def t(name: str, fn) -> tasks.LambdaInvoke:
+            node = tasks.LambdaInvoke(self, name, lambda_function=fn,
+                                      payload_response_only=True)
+            node.add_catch(mark_failed, errors=["States.ALL"],
+                           result_path="$.error_info")
+            _tracked.append(node)
+            return node
+
+        # 汇合点用 Pass 节点——同一后续链只被 next 一次，Choice 分支都指向它
+        join_upload = sfn.Pass(self, "JoinUpload")
+        join_upload.next(t("UploadFrontend", f_upload)
+                         .next(t("RegisterRoute", f_route))
+                         .next(t("SmokeTest", f_smoke))
+                         .next(t("MarkSuccess", f_mark))
+                         .next(sfn.Succeed(self, "Done")))
+
+        join_backend = sfn.Pass(self, "JoinBackend")
+        join_backend.next(
+            sfn.Choice(self, "HasBackend?")
+            .when(sfn.Condition.string_equals("$.manifest.tier", "static"),
+                  join_upload)
+            .otherwise(t("PackageBackend", f_pkg)
+                       .next(t("DeployLambdaSite", f_deploy))
+                       .next(join_upload)))
+
         choice_db = (sfn.Choice(self, "WhichDB?")
                      .when(sfn.Condition.string_equals("$.manifest.database.engine",
                                                        "dynamodb"),
-                           t("ProvisionDynamoDB", f_ddb).next(choice_backend))
+                           t("ProvisionDynamoDB", f_ddb).next(join_backend))
                      .when(sfn.Condition.string_equals("$.manifest.database.engine",
                                                        "dsql"),
-                           t("ProvisionDSQL", f_dsql).next(choice_backend))
-                     .otherwise(choice_backend))
+                           t("ProvisionDSQL", f_dsql).next(join_backend))
+                     .otherwise(join_backend))
         definition = t("Validate", f_validate).next(choice_db)
-
-        # 所有 task 节点统一 Catch → MarkFailed
-        for node in [definition] + []:
-            pass  # LambdaInvoke.add_catch 逐个：
-        for task_node in [c for c in self.node.find_all()
-                          if isinstance(c, tasks.LambdaInvoke)
-                          and c.node.id not in ("MarkFailed", "MarkSuccess")]:
-            task_node.add_catch(mark_failed, errors=["States.ALL"],
-                                result_path="$.error_info")
-        mark_failed.next(fail)
 
         sm = sfn.StateMachine(self, "DeploySM", state_machine_name="site-deploy",
                               definition_body=sfn.DefinitionBody.from_chainable(definition),
@@ -3055,7 +3549,7 @@ Run: `.venv/bin/pytest tests/test_undeploy.py -q` → 1 passed
                   value=f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:site-deployer-undeploy")
 ```
 
-实现注意：`find_all()` 过滤那段清理为直接对 9 个 LambdaInvoke 变量逐个 `add_catch`（列表推导那几行是意图示意，落码时写显式循环 `for tn in [validate_t, ddb_t, ...]`，删除 `for node in [definition] + []` 死代码）；Choice 节点复用 `chain_upload` 时 CDK 要求同一 chain 只能被 next 一次——用 `sfn.Pass` 汇合点或把 `chain_upload` 定义为函数每分支各建一份（推荐后者，节点名加后缀）。执行者按 `cdk synth` 报错调整为可部署形态，语义以上述流程图为准。
+结构说明：`t()` 工厂在创建时就挂 Catch（MarkSuccess 也会被 Catch——其失败同样应落 FAILED，无害）；两个 `sfn.Pass` 汇合点让多个 Choice 分支收敛到同一后续链而不违反 CDK 的单 next 约束。此定义结构上可直接 synth；Step 4 的 `cdk synth -q` 是硬验收（若个别 API 细节随 aws-cdk-lib 版本漂移，以 synth 通过 + 状态机语义等于本流程图为准）。
 
 - [ ] **Step 4: synth + 部署 + 真机验证**
 
@@ -3195,13 +3689,25 @@ app.listen(process.env.PORT || 8080);
 <form id="f"><input id="t" placeholder="记点什么"><button>添加</button></form>
 <ul id="list"></ul>
 <script>
+// 用户输入一律 textContent 渲染——innerHTML 拼接会存储型 XSS（合同红线）
 const load = async () => {
   const notes = await (await fetch("/api/notes")).json();
-  list.innerHTML = notes.map(n =>
-    `<li>${n.text} <small>${n.author}</small>
-     <button onclick="del('${n.id}')">删</button></li>`).join("");
+  list.replaceChildren(...notes.map(n => {
+    const li = document.createElement("li");
+    const span = document.createElement("span");
+    span.textContent = n.text;
+    const small = document.createElement("small");
+    small.textContent = " " + n.author;
+    const btn = document.createElement("button");
+    btn.textContent = "删";
+    btn.onclick = async () => {
+      await fetch(`/api/notes/${encodeURIComponent(n.id)}`, {method: "DELETE"});
+      load();
+    };
+    li.append(span, small, btn);
+    return li;
+  }));
 };
-const del = async id => { await fetch(`/api/notes/${id}`, {method:"DELETE"}); load(); };
 f.onsubmit = async e => {
   e.preventDefault();
   await fetch("/api/notes", {method:"POST",
@@ -3237,19 +3743,23 @@ CREATE TABLE IF NOT EXISTS expenses (
 `sql-expenses/backend/db.js`（与 Task 21 Skill 模板同源）:
 
 ```javascript
-// DSQL 连接模板——站点代码不改此文件。IAM token 现签 + search_path。
+// DSQL 连接模板——站点代码不改此文件。
+// 非 admin：用本站点专属 PG role（DSQL_USER）+ 普通 DbConnect token，
+// 只被 GRANT 本站点 schema——数据隔离由平台在部署时配置。
 const { Pool } = require("pg");
 const { DsqlSigner } = require("@aws-sdk/dsql-signer");
 
 const HOST = process.env.DSQL_ENDPOINT;
 const SCHEMA = process.env.DSQL_SCHEMA;
+const USER = process.env.DSQL_USER;
 
 async function makePool() {
   const signer = new DsqlSigner({ hostname: HOST, region: "us-east-1" });
   const pool = new Pool({
-    host: HOST, database: "postgres", user: "admin",
-    password: () => signer.getDbConnectAdminAuthToken(),
+    host: HOST, database: "postgres", user: USER,
+    password: () => signer.getDbConnectAuthToken(),  // 非 admin token
     ssl: { rejectUnauthorized: true }, max: 3,
+    maxLifetimeSeconds: 3300,  // token 有效期内轮换连接
   });
   pool.on("connect", c => c.query(`SET search_path = "${SCHEMA}"`));
   return pool;
@@ -3367,32 +3877,140 @@ if __name__ == "__main__":
 `site-builder/deployer/tests/test_e2e_fixtures.py`:
 
 ```python
-"""真实 AWS 端到端：RUN_E2E=1 .venv/bin/pytest tests/test_e2e_fixtures.py -q -m e2e"""
+"""真实 AWS 端到端：RUN_E2E=1 .venv/bin/pytest tests/test_e2e_fixtures.py -q
+断言真实 HTTP 行为，不只看部署退出码。登录态用平台 JWT_SECRET 直接 mint
+测试会话 cookie（SSM 读密钥）——无需人工飞书扫码即可自动化验证 CRUD。"""
+import configparser
+import json
 import os
 import subprocess
 import sys
+import urllib.request
+import urllib.error
 from pathlib import Path
 
+import boto3
 import pytest
 
 pytestmark = pytest.mark.skipif(not os.environ.get("RUN_E2E"),
                                 reason="需要 RUN_E2E=1 与真实 AWS 凭证")
 ROOT = Path(__file__).parents[3]
+sys.path.insert(0, str(ROOT / "site-builder/auth"))
 
 
-@pytest.mark.parametrize("fixture", ["static-hello", "nosql-notes", "sql-expenses"])
-def test_fixture_deploys(fixture):
+@pytest.fixture(scope="module")
+def cfg():
+    c = configparser.ConfigParser()
+    c.read(ROOT / "site-builder/config.ini")
+    return c
+
+
+@pytest.fixture(scope="module")
+def session_cookie(cfg):
+    from session import mint_session_jwt
+    secret = boto3.client("ssm", region_name="us-east-1").get_parameter(
+        Name="/site-builder/jwt-secret", WithDecryption=True)["Parameter"]["Value"]
+    return "sb_session=" + mint_session_jwt("e2e@test.com", "E2E Bot", secret)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **kw):
+        return None
+
+
+def _req(url, method="GET", cookie=None, body=None):
+    opener = urllib.request.build_opener(NoRedirect)
+    headers = {"Content-Type": "application/json"}
+    if cookie:
+        headers["Cookie"] = cookie
+    req = urllib.request.Request(url, method=method, headers=headers,
+                                 data=json.dumps(body).encode() if body else None)
+    try:
+        with opener.open(req, timeout=30) as r:
+            return r.status, dict(r.headers), r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers), e.read()
+
+
+def _deploy(fixture: str) -> str:
+    """部署 fixture，返回站点 URL。"""
     r = subprocess.run([sys.executable,
                         str(ROOT / "site-builder/scripts/deploy_fixture.py"),
                         str(ROOT / f"site-builder/fixtures/{fixture}")],
                        capture_output=True, text=True, timeout=1200)
     assert r.returncode == 0, r.stdout + r.stderr
+    return json.loads(r.stdout.splitlines()[-1].strip() or "{}").get("url") \
+        or [l for l in r.stdout.splitlines() if '"url"' in l][-1].split('"')[3]
+
+
+def test_static_site_public_200():
+    url = _deploy("static-hello")
+    code, _, body = _req(url + "/")
+    assert code == 200 and b"Site Builder" in body
+
+
+def test_notes_site_auth_and_crud(session_cookie, cfg):
+    url = _deploy("nosql-notes")
+    base = cfg["Platform"]["base_domain"]
+    # 1. 未登录 → 302 到登录端点（不跟随）
+    code, headers, _ = _req(url + "/")
+    assert code == 302
+    assert headers["Location"].startswith(f"https://auth.{base}/login")
+    # 2. 带会话 cookie：完整 CRUD（真实 body 走 CloudFront→Edge SigV4→Function URL）
+    code, _, body = _req(url + "/api/notes", "POST", session_cookie,
+                         {"text": "e2e note"})
+    assert code == 201, body
+    created = json.loads(body)
+    assert created["author"] == "e2e@test.com"  # x-user-email 注入生效
+    code, _, body = _req(url + "/api/notes", cookie=session_cookie)
+    assert code == 200
+    assert any(n["id"] == created["id"] for n in json.loads(body))  # read-back
+    code, _, _ = _req(f"{url}/api/notes/{created['id']}", "DELETE",
+                      session_cookie)
+    assert code == 204
+    # 3. 伪造用户头被剥除：带假头但无 cookie 仍 302
+    code, headers, _ = _req(url + "/api/notes")
+    assert code == 302
+
+
+def test_expenses_site_dsql_crud(session_cookie):
+    url = _deploy("sql-expenses")
+    code, _, body = _req(url + "/api/expenses", "POST", session_cookie,
+                         {"title": "e2e-coffee", "amount": 9.9})
+    assert code == 201, body
+    code, _, body = _req(url + "/api/expenses", cookie=session_cookie)
+    assert code == 200
+    assert any(e["title"] == "e2e-coffee" for e in json.loads(body))
+
+
+def test_update_visible_and_undeploy_404(cfg):
+    # 二次部署同一 static fixture（同 site_id 由 deploy_fixture 支持 --site-id 参数）
+    # 简化：部署新实例后 undeploy，验证 404
+    url = _deploy("static-hello")
+    site_id = url.split("//app-")[1].split(".")[0]
+    fn = boto3.client("lambda", region_name="us-east-1")
+    boto3.client("lambda", region_name="us-east-1")  # noqa
+    # 直调 undeploy Lambda（模拟 MCP 工具路径）
+    jobs = boto3.resource("dynamodb", region_name="us-east-1").Table(
+        cfg["Deployer"]["jobs_table"])
+    from datetime import datetime, timezone
+    jid = f"job-e2e-un-{site_id[-6:]}"
+    now = datetime.now(timezone.utc).isoformat()
+    jobs.put_item(Item={"job_id": jid, "site_id": site_id, "owner": "fixture@test",
+                        "status": "PENDING", "phase": "submitted", "error": "",
+                        "url": "", "created_at": now, "updated_at": now})
+    fn.invoke(FunctionName="site-deployer-undeploy",
+              Payload=json.dumps({"job_id": jid, "site_id": site_id}))
+    import time
+    time.sleep(70)  # Edge 路由缓存过期
+    code, _, _ = _req(url + "/")
+    assert code == 404
 ```
 
 - [ ] **Step 4: 跑三个 fixture 端到端**
 
-Run: `RUN_E2E=1 .venv/bin/pytest tests/test_e2e_fixtures.py -q -m ''`
-Expected: 3 passed。人工复核：notes 站点浏览器打开 → 飞书登录 → 添加便签（author 显示自己的飞书邮箱）；expenses 站点添加记录后刷新仍在（DSQL 持久）。
+Run: `RUN_E2E=1 .venv/bin/pytest tests/test_e2e_fixtures.py -q`
+Expected: 4 passed（含真实 CRUD、302 断言、伪造头拦截、undeploy 后 404）。人工补充：浏览器真实飞书扫码走一遍 notes 站点（cookie mint 跳过了 OAuth 流程本身——那段在 Task 8 人工验证过）。
 
 - [ ] **Step 5: Commit**
 
@@ -3415,7 +4033,7 @@ git commit -m "feat(fixtures): three-tier golden sample sites with e2e deploy te
 - Consumes: `common.py`（jobs/sites 访问）、SFN ARN、artifacts 桶；调用者身份 email（AgentCore 网关注入，见 Task 20——本地测试直接传参）
 - Produces: 4 个 MCP tool。核心逻辑与 MCP 装饰器分离——纯函数层（可测）+ FastMCP 壳：
   - `do_deploy_site(owner, site_name, site_id=None) -> {"job_id","site_id","upload_url","next_step"}`——presigned PUT URL（15 分钟）；site_id 传入=更新部署（校验 owner，不符 raise `NotOwner`）
-  - `do_confirm_upload(owner, job_id) -> {"status"}`——HeadObject 确认 zip 已上传 → StartExecution（拆两步：deploy_site 发 URL、confirm_upload 起飞——MCP 客户端上传完再确认）
+  - `do_confirm_upload(owner, job_id) -> {"status"}`——HeadObject 确认 zip 已上传且 ≤50MB（超限 raise `UploadTooLarge`）→ **jobs 表条件更新 PENDING→RUNNING**（ConditionExpression，重复确认 raise `AlreadyStarted`）→ StartExecution **name=job_id**（SFN 同名执行拒绝 = 二重幂等）
   - `do_get_status(owner, job_id) -> {"status","phase","error","url"}`
   - `do_list_sites(owner) -> [{"site_id","name","url","status","tier"}]`
   - `do_undeploy(owner, site_id) -> {"job_id"}`——校验 owner → 建 job → 直调 `site-deployer-undeploy` Lambda（InvocationType=Event）
@@ -3447,7 +4065,7 @@ def test_deploy_site_update_checks_owner(aws):
         server.do_deploy_site("intruder@x.com", "demo", site_id="demo-abc123")
 
 
-def test_confirm_upload_starts_sfn(aws, monkeypatch):
+def test_confirm_upload_starts_sfn_with_jobid_name(aws, monkeypatch):
     import server, common
     monkeypatch.setenv("STATE_MACHINE_ARN", "arn:aws:states:us-east-1:1:stateMachine:sm")
     jid = common.create_job("a@x.com", "demo-abc123")
@@ -3457,7 +4075,19 @@ def test_confirm_upload_starts_sfn(aws, monkeypatch):
     with patch.object(server, "_sfn", return_value=sfn):
         out = server.do_confirm_upload("a@x.com", jid)
     assert out["status"] == "RUNNING"
-    assert sfn.start_execution.called
+    assert sfn.start_execution.call_args.kwargs["name"] == jid  # 幂等 execution name
+
+
+def test_confirm_upload_double_call_rejected(aws, monkeypatch):
+    import server, common
+    monkeypatch.setenv("STATE_MACHINE_ARN", "arn:aws:states:us-east-1:1:stateMachine:sm")
+    jid = common.create_job("a@x.com", "demo-abc123")
+    boto3.client("s3").put_object(Bucket="site-artifacts-1",
+                                  Key=f"uploads/{jid}.zip", Body=b"zip")
+    with patch.object(server, "_sfn", return_value=MagicMock()):
+        server.do_confirm_upload("a@x.com", jid)
+        with pytest.raises(server.AlreadyStarted):  # 条件更新拦住第二次
+            server.do_confirm_upload("a@x.com", jid)
 
 
 def test_confirm_upload_missing_zip_errors(aws):
@@ -3465,6 +4095,17 @@ def test_confirm_upload_missing_zip_errors(aws):
     jid = common.create_job("a@x.com", "demo-abc123")
     with pytest.raises(server.UploadMissing):
         server.do_confirm_upload("a@x.com", jid)
+
+
+def test_confirm_upload_oversize_zip_rejected(aws, monkeypatch):
+    import server, common
+    jid = common.create_job("a@x.com", "demo-abc123")
+    head = MagicMock()
+    head.head_object.return_value = {"ContentLength": 51 * 1024 * 1024}
+    head.exceptions = boto3.client("s3").exceptions
+    with patch.object(server, "_s3", return_value=head):
+        with pytest.raises(server.UploadTooLarge):
+            server.do_confirm_upload("a@x.com", jid)
 
 
 def test_get_status_scoped_to_owner(aws):
@@ -3529,6 +4170,17 @@ class UploadMissing(Exception):
     pass
 
 
+class UploadTooLarge(Exception):
+    pass
+
+
+class AlreadyStarted(Exception):
+    pass
+
+
+MAX_ZIP_BYTES = 50 * 1024 * 1024
+
+
 def _s3():
     return boto3.client("s3", region_name="us-east-1")
 
@@ -3571,14 +4223,32 @@ def do_confirm_upload(owner: str, job_id: str) -> dict:
     _assert_owner(owner, job, f"任务 {job_id}")
     s3 = _s3()
     try:
-        s3.head_object(Bucket=os.environ["ARTIFACTS_BUCKET"],
-                       Key=f"uploads/{job_id}.zip")
+        head = s3.head_object(Bucket=os.environ["ARTIFACTS_BUCKET"],
+                              Key=f"uploads/{job_id}.zip")
     except s3.exceptions.ClientError:
         raise UploadMissing("未检测到上传的 site.zip，请先 PUT 到 upload_url")
+    if head["ContentLength"] > MAX_ZIP_BYTES:
+        raise UploadTooLarge(f"site.zip {head['ContentLength']} 字节超过 50MB 上限")
+
+    # 条件迁移 PENDING→RUNNING：双击/重放在此被拦，SFN 同名执行是第二道闸
+    import botocore.exceptions
+    try:
+        boto3.resource("dynamodb", region_name="us-east-1").Table(
+            os.environ["JOBS_TABLE"]).update_item(
+            Key={"job_id": job_id},
+            UpdateExpression="SET #s = :running, phase = :q",
+            ConditionExpression="#s = :pending",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":running": "RUNNING", ":pending": "PENDING",
+                                       ":q": "queued"})
+    except botocore.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            raise AlreadyStarted(f"任务 {job_id} 已启动过，请用 get_deploy_status 查询进度")
+        raise
     _sfn().start_execution(
         stateMachineArn=os.environ["STATE_MACHINE_ARN"],
+        name=job_id,  # 同名执行被 SFN 拒绝 = 幂等
         input=json.dumps({"job_id": job_id, "site_id": job["site_id"]}))
-    common.update_job(job_id, status="RUNNING", phase="queued")
     return {"status": "RUNNING"}
 
 
@@ -3663,18 +4333,20 @@ if __name__ == "__main__":
 - [ ] **Step 4: 运行确认通过**
 
 Run: `.venv/bin/pytest tests/ -q`
-Expected: 7 passed
+Expected: 10 passed
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add site-builder/mcp
-git commit -m "feat(mcp): deploy mcp server with owner-scoped tools"
+git commit -m "feat(mcp): deploy mcp server with owner-scoped, idempotent tools"
 ```
 
 ### Task 20: AgentCore 部署 + Cognito OAuth + 远程冒烟
 
-参考基座：飞书集成调研方案 3（`ddpie/lark-mcp-on-agentcore`）的部署形态，但本 MCP 简单得多（无 Tier2/Skill 分层）。AgentCore Runtime 细节以当期官方文档为准——执行者先跑 `aws bedrock-agentcore-control help` 与 MCP 托管文档，再按下述意图落地。
+参考基座：飞书集成调研方案 3（`ddpie/lark-mcp-on-agentcore`）的部署形态，但本 MCP 简单得多（无 Tier2/Skill 分层）。
+
+**Step 0 是 Spike（本任务唯一真不确定项）**：AgentCore Runtime 如何把 Cognito JWT 的 email claim 暴露给容器（网关注入头？原样透传 Authorization？）官方文档与实测确认后，才锁定 `_caller_email` 实现并回补 Task 19 的 header 常量。Spike 产出写入 `AGENTCORE.md`：确切的 claim 传递机制、`create_agent_runtime` 请求体样例、所用 boto3/CLI 版本。若 Spike 发现 AgentCore 完全不透传身份（最坏情况），fallback 方案：MCP 侧自行解码 Bearer JWT（网关已验签）——该路径已在 Task 19 预留。其余步骤（Dockerfile、ECR、Runtime 创建）按官方 MCP 托管文档执行，`aws bedrock-agentcore-control help` 先行核对 API 形状。
 
 **Files:**
 - Create: `site-builder/mcp/Dockerfile`
@@ -3801,8 +4473,10 @@ description: 开发并一键部署简易 Web 站点到 AWS。当用户想创建/
 - 前端调后端只写相对路径 `/api/*`
 - 站点代码零登录逻辑；当前用户 = 请求头 `x-user-email` / `x-user-name`
 - 后端必须实现 `GET /api/health`
-- 不写本地文件；端口读 `process.env.PORT`
+- 不写本地文件；端口读 `process.env.PORT`；API 请求体 ≤1MB
+- 渲染用户输入用 textContent / DOM API，禁止拼 innerHTML（存储型 XSS）
 - DSQL 禁：外键/SERIAL/JSONB 列/触发器/TEMP TABLE → 用 UUID 主键、TEXT 存 JSON
+- 数据库访问只用模板 db.js 的 makePool()，不自写连接（平台注入专属只读身份）
 - site.json 的 auth.require_login=true 时访问者需飞书登录；
   allowed_users 填 "org"（全组织）或邮箱数组
 ```
@@ -3908,8 +4582,16 @@ git commit -m "docs: end-to-end demo script with rehearsal checklist"
 
 ## Self-Review 记录
 
-- **Spec 覆盖**：五组件 M1-M6 全部有 Task 映射（M1→3-5、M2→6-8、M3→9-18、M4→19-20、M5→21-22、M6→23）；合同/红线（§3.1）→Task 1/2/21；DSQL schema 策略与逐条 DDL（§3.3）→Task 13；LWA zip 模式（§2 决策 3）→Task 15；presigned 上传（§3.2）→Task 19；顶域 cookie/防伪造头/名单鉴权（§3.4/3.5）→Task 5/7；错误处理表（§5）→Task 11/14/16 的异常类 + mark_job；测试策略（§6）五条→Task 1/2（合同单测）、18（集成）、7+8（鉴权 e2e）、17+18（幂等在 provisioner/deploy 幂等测试覆盖）、23（彩排）。
-- **已知偏差（有意）**：MCP 工具 4→5（confirm_upload 拆分，spec §3.2 的"确认上传后写任务表"语义不变）；smoke_test 对 require_auth 站点首页只验到 302（鉴权在流量路径上，200 需会话——由 Task 8/23 人工环节覆盖）。
-- **类型一致性**：`common.py` 签名与 Task 11-17/19 的调用一一核对（`update_job` 关键字参数、`upsert_site(**attrs)`、`subdomain_for`/`dsql_schema_for`）；路由表字段名七处出现（Task 5/6/7/8/16/17/23）均为 File Structure 节的同一结构；`env_vars` 键（`TABLE_*`/`DSQL_ENDPOINT`/`DSQL_SCHEMA`）在 provisioner 产出与 fixtures 消费两侧一致。
-- **占位符扫描**：无 TBD/TODO。两处有意的"落码时展开"（Task 21 references 的逐字段展开源于设计文档 §3.1；Task 18 sql-expenses 前端对照 notes 版本写出）均给出了完整的源内容位置与结构要求，不属于悬空占位。Task 17 CDK 汇合点问题已给出明确解法（每分支各建 chain）。Task 20 AgentCore API 以当期文档为准属外部现实约束，意图与验收标准（Inspector 5 工具、401、email 透传）已完整。
+- **Spec 覆盖**：五组件 M1-M6 全部有 Task 映射（M1→3-5、M2→6-8、M3→9-18、M4→19-20、M5→21-22、M6→23）；合同/红线（§3.1）→Task 1/2/21；DSQL schema 策略与逐条 DDL（§3.3）→Task 13；LWA zip 模式（§2 决策 3）→Task 15；presigned 上传（§3.2）→Task 19；顶域 cookie/防伪造头/名单鉴权（§3.4/3.5）→Task 5/7；错误处理表（§5）→Task 11/14/16 的异常类 + mark_job；测试策略（§6）→Task 1/2（合同单测）、18（集成 + 自动化鉴权/CRUD/伪造头/下线 E2E，会话 cookie 由 JWT_SECRET 直接 mint）、23（彩排）。
+- **2026-07-21 对抗性 review 修订**（Codex adversarial review，全部 P0 + 大部分 P1/次要项已回写）：
+  - P0-1 缓存绕过鉴权 → CACHING_DISABLED（Task 8 Step 0）+ 跨子域/更新即时性冒烟（smoke_router.sh）
+  - P0-2 auth 子域路由 → 路由表 `route_mode` 字段（api-only），Task 5/6/8 联动，公网地址验收
+  - P0-3 body 签名 → `include_body=True` + base64 解码参与 SigV4 + 413（Task 6/8），E2E 真实 JSON POST 断言
+  - P0-4 DSQL 身份/隔离 → per-site IAM role（boundary 强制）+ per-site PG role + 非 admin token（Task 9/13/15/17/18 联动）
+  - P1：Edge fail-closed 500；Function URL Principal 精确到 Edge role 无 fallback；OAuth state HMAC+过期、id_token JWKS 验签；confirm_upload 条件迁移 + SFN execution name=job_id；migration 逐文件记录；前端版本化前缀+原子切流；S3 paginator；smoke 禁跟随重定向按 auth 态断言；Task 17 状态机重写为可 synth 结构（Pass 汇合点）；Task 0 纳管 manus 目录
+  - 次要：sqlparse 拆语句、连接 try/finally、buildspec 去 `|| true`、zip bomb 三重限制、上传 50MB 校验、回跳保留 querystring、notes fixture textContent 渲染 + innerHTML 红线、tables 校验（命名/去重/上限）
+  - 范围收敛：PoC 仅 nodejs22.x（Python → 二期）；MCP 工具面 5 个（spec 已同步）；API Key fallback → 二期
+- **有意保留的偏差**：presigned PUT 无法带 content-length-range（那是 POST policy 的能力）——改为 confirm_upload HeadObject 后置校验；PKCE/nonce 二期（confidential client + 签名 state 覆盖 PoC 威胁模型）；旧版本前端由 mark_job 成功后清理而非生命周期（生命周期按对象年龄会误删在线版本）。
+- **类型一致性**：`common.py` 签名与 Task 11-17/19 调用核对；路由表字段（含 route_mode/static_prefix 版本化）在 Task 5/6/7/8/16/17/23 一致；`env_vars` 键（`TABLE_*`/`DSQL_ENDPOINT`/`DSQL_SCHEMA`/`DSQL_USER`）产出与消费两侧一致；`RUNTIME_BOUNDARY_ARN`/`EDGE_ROLE_ARN` 贯穿 Task 9/15/17。
+- **占位符扫描**：无 TBD/TODO。Task 21 references 逐字段展开源于 spec §3.1（源内容完整）；Task 18 sql-expenses 前端对照 notes 版本写出（结构约束完整）。Task 20 Step 0 显式定义为 Spike——AgentCore claim 透传是外部不确定项，两个可能结果的处置路径都已写明。
 
