@@ -123,7 +123,7 @@ my-site/
 
 1. 前端 API 调用一律相对路径 `/api/*`，禁止 localhost、禁止硬编码域名。前后端同域名部署（路由层按 `/api/*` 分流），消除参考方案里"两步部署 + `{{BACKEND_URL}}` 占位符注入"的复杂度。
 2. 站点代码不写任何登录逻辑。需要当前用户时读请求头 `x-user-email` / `x-user-name`（Edge 鉴权通过后注入），后端直接信任。
-3. DSQL 只用 `pg` / `psycopg` + `DATABASE_URL`；schema 全部写在 `schema.sql`（执行器负责执行）；Skill 中写明 DSQL 不支持的 PG 特性（外键约束、SERIAL 序列等）要求生成时规避（用 UUID 主键等替代）。DynamoDB 只用 SDK 基础 CRUD。
+3. DSQL 访问只通过 Skill 提供的固定模板文件 `db.js` / `db.py`（原样复制进 backend/，内部用 IAM token 现签连接并 SET search_path）；schema 全部写在 `schema.sql`（执行器负责执行）；Skill 中写明 DSQL 不支持的 PG 特性（外键约束、SERIAL、JSONB 列、触发器/PLpgSQL、临时表等）要求生成时规避（UUID 主键、TEXT 存 JSON 等替代）。DynamoDB 只用 SDK 基础 CRUD。
 4. 无本地文件写入、无后台常驻任务（Lambda 约束）；监听端口读 `PORT` 环境变量。
 
 **Skill 工作流**：需求澄清 → 按 tier 生成代码 → 本地预览确认 → 用户说"部署" → 打包 zip → 调 MCP `deploy_site`（拿 presigned URL 上传产物）→ 轮询 `get_deploy_status` → 返回站点 URL。业务人员全程自然语言对话。
@@ -167,7 +167,7 @@ my-site/
 关键细节：
 
 - **依赖安装在 CodeBuild**：`npm install` / `pip install` 不在 Lambda 里跑（磁盘/可靠性问题），CodeBuild 是无 Docker 依赖的托管构建点；产物 zip 存 artifacts bucket。
-- **DSQL 策略**：共享 cluster、每站点独立 database（秒级建库；PoC 一个 cluster 足够）。凭证走 IAM auth token（DSQL 原生，无密码管理），`DATABASE_URL` 由站点 Lambda 执行角色运行时现签。
+- **DSQL 策略**：共享 cluster、每站点独立 **schema**（DSQL 不支持 `CREATE DATABASE`，每 cluster 仅一个 `postgres` 库；schema 秒级创建，PoC 一个 cluster 足够）。凭证走 IAM auth token（DSQL 原生，无密码管理），站点 Lambda 运行时现签 token 连接，`DSQL_ENDPOINT` + `DSQL_SCHEMA` 环境变量注入。schema.sql 执行时逐条 DDL（DSQL 限制：每事务一条 DDL）。
 - **幂等与更新**：同一 siteId 重复 `deploy_site` = 更新部署（覆盖 S3、更新 Lambda 代码）。schema 演进约定：首次部署执行 `schema.sql`；后续变更写在 `migrations/NNN_*.sql`，执行器按序号执行未跑过的文件（已执行记录存任务表）。subdomain 不变，站点 URL 稳定。
 - **任务表**（DynamoDB `deploy-jobs`）：`jobId, siteId, owner(飞书email), status, phase, error, url, timestamps`。
 - **权限模型**：执行器角色是全系统权限最大者，所有创建的资源强制 `site-*` 命名前缀 + 项目标签，IAM policy 按前缀限定（沿用 manus 项目 `*WebRouterStack*` 最小权限模式）。
@@ -198,7 +198,7 @@ Lambda@Edge（origin-request）判定顺序：
 
 技术要点：
 
-- **Edge 内 JWT 验证**：不引入 JWT 库，用 Node 内置 `crypto` 验 HS256；签名密钥在部署时字符串替换注入（manus 已有该机制，Lambda@Edge 不支持环境变量）。纯本地验签、零网络往返，1MB 代码限制内可行。
+- **Edge 内 JWT 验证**：不引入 JWT 库，用 Python 标准库 `hmac`/`hashlib` 验 HS256（manus 的 Edge 函数为 Python 3.11）；签名密钥在部署时字符串替换注入（manus 已有该机制，Lambda@Edge 不支持环境变量）。纯本地验签、零网络往返，1MB 代码限制内可行。
 - **`allowed_users: "org"`**：仅要求"能通过本飞书组织 OAuth 的有效用户"，不查名单；名单模式逐邮箱比对；owner 隐式在名单内。
 - 客户端注入的 `x-user-email` / `x-user-name` 头在 Edge 层无条件剥除后再注入，防伪造。
 
