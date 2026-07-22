@@ -1,0 +1,4 @@
+{"name": "expenses", "tier": "fullstack-sql",
+ "backend": {"runtime": "nodejs22.x", "entrypoint": "node server.js", "port": 8080},
+ "database": {"engine": "dsql", "tables": []},
+ "auth": {"require_login": true, "allowed_users": "org"}}

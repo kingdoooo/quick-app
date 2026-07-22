@@ -1,0 +1,4 @@
+{"name": "notes", "tier": "fullstack-nosql",
+ "backend": {"runtime": "nodejs22.x", "entrypoint": "node server.js", "port": 8080},
+ "database": {"engine": "dynamodb", "tables": [{"name": "notes", "pk": "id"}]},
+ "auth": {"require_login": true, "allowed_users": "org"}}

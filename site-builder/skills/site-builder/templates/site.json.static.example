@@ -1,0 +1,3 @@
+{"name": "hello", "tier": "static",
+ "database": {"engine": "none"},
+ "auth": {"require_login": false, "allowed_users": "org"}}
