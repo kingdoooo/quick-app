@@ -1,0 +1,25 @@
+[Platform]
+base_domain = example.com
+account_id = 000000000000
+region = us-east-1
+routing_table = ApplicationWebRouterStack-subdomain-mapping
+
+[Cognito]
+user_pool_id =
+domain =
+site_client_id =
+mcp_client_id =
+
+[DSQL]
+cluster_endpoint =
+
+[Deployer]
+jobs_table = site-deploy-jobs
+sites_table = site-sites
+artifacts_bucket = site-artifacts-{account_id}
+frontend_bucket = site-frontend-{account_id}
+state_machine_arn =
+edge_role_arn =
+
+[MCP]
+endpoint_url =
