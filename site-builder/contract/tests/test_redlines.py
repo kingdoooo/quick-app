@@ -211,6 +211,31 @@ def test_innerhtml_loose_comparison_passes(tmp_path):
     assert scan_redlines(d, m) == []
 
 
+def test_node_prefix_fs_promises_import_fails(tmp_path):
+    d, m = make_site(tmp_path, server=f"import {{ writeFile }} from 'node:fs/promises';\n{HEALTH_OK}")
+    assert any("本地文件" in v for v in scan_redlines(d, m))
+
+
+def test_node_prefix_fs_promises_require_fails(tmp_path):
+    d, m = make_site(tmp_path, server=f"const {{writeFile}} = require('node:fs/promises'); {HEALTH_OK}")
+    assert any("本地文件" in v for v in scan_redlines(d, m))
+
+
+def test_document_writeln_fails(tmp_path):
+    d, m = make_site(tmp_path, index="document.writeln(x)")
+    assert any("innerHTML" in v for v in scan_redlines(d, m))
+
+
+def test_innerhtml_nullish_assignment_fails(tmp_path):
+    d, m = make_site(tmp_path, index="el.innerHTML ??= x")
+    assert any("innerHTML" in v for v in scan_redlines(d, m))
+
+
+def test_innerhtml_logical_or_assignment_fails(tmp_path):
+    d, m = make_site(tmp_path, index="el.innerHTML ||= x")
+    assert any("innerHTML" in v for v in scan_redlines(d, m))
+
+
 # --- Important 6: 文件遍历健壮性 ---
 
 def test_uppercase_extension_scanned(tmp_path):
@@ -242,6 +267,12 @@ def test_python_open_x_mode_fails(tmp_path):
 def test_python_open_a_plus_fails(tmp_path):
     d, m = make_site(tmp_path)
     (d / "backend/util.py").write_text("f = open(path, 'a+')")
+    assert any("本地文件" in v for v in scan_redlines(d, m))
+
+
+def test_python_open_wb_plus_fails(tmp_path):
+    d, m = make_site(tmp_path)
+    (d / "backend/util.py").write_text("f = open(path, 'wb+')")
     assert any("本地文件" in v for v in scan_redlines(d, m))
 
 

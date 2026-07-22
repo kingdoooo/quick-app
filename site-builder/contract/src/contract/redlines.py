@@ -11,11 +11,12 @@ AUTH_RE = re.compile(
     r"|res\.cookie\(|Set-Cookie|jsonwebtoken|express-session|cookie-session", re.I)
 FILE_WRITE_RE = re.compile(
     r"fs\.writeFile|fs\.appendFile|fs\.promises\.\w+|fs\.createWriteStream"
-    r"|['\"]fs/promises['\"]"
-    r"|open\([^)]*['\"][wax]\+?b?['\"]")
+    r"|['\"](?:node:)?fs/promises['\"]"
+    r"|open\([^)]*['\"][wax][+b]{0,2}['\"]")
 HEALTH_RE = re.compile(r"/api/health")
 INNERHTML_RE = re.compile(
-    r"(?:inner|outer)HTML\s*[+]?=(?!=)|insertAdjacentHTML\(|document\.write\(")
+    r"(?:inner|outer)HTML\s*(?:[+]=|(?:\?\?|\|\|)=|=(?!=))"
+    r"|insertAdjacentHTML\(|document\.write(?:ln)?\(")
 FORBIDDEN_DDL = ["REFERENCES", "SERIAL", "JSONB", "CREATE TRIGGER", "CREATE TEMP"]
 
 
