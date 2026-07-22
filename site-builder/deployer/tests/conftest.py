@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 from pathlib import Path
@@ -47,4 +48,9 @@ def aws(monkeypatch):
         s3c = boto3.client("s3", region_name="us-east-1")
         for b in ("site-artifacts-1", "site-frontend-1"):
             s3c.create_bucket(Bucket=b)
+        iam = boto3.client("iam", region_name="us-east-1")
+        iam.create_policy(
+            PolicyName="site-runtime-boundary",
+            PolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "Action": "*", "Resource": "*"}]}))
         yield
