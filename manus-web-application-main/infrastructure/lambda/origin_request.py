@@ -1,8 +1,9 @@
 """
 Lambda@Edge Origin Request处理器
 
-根据DynamoDB中存储的subdomain映射关系，动态将CloudFront请求路由到不同的后端服务
-支持 AWS_IAM 认证的 Lambda Function URL
+根据DynamoDB中存储的subdomain路由表，将CloudFront请求分流到后端
+Lambda Function URL（SigV4）或共享前端S3桶（SigV4 GET）。
+支持 route_mode：split（/api/ 走后端，其余走S3静态）与 api-only（全路径走后端）。
 """
 import json
 import logging
@@ -21,6 +22,10 @@ logger.setLevel(logging.INFO)
 # 配置常量（Lambda@Edge不支持环境变量，由CDK部署时注入）
 DYNAMODB_TABLE_NAME = "{{DYNAMODB_TABLE_NAME}}"
 DYNAMODB_REGION = "{{DYNAMODB_REGION}}"
+FRONTEND_BUCKET_DOMAIN = "{{FRONTEND_BUCKET_DOMAIN}}"
+JWT_SECRET = "{{JWT_SECRET}}"  # Task 7 使用
+_ROUTE_CACHE: dict = {}  # subdomain -> (expires_epoch, item)
+ROUTE_CACHE_TTL = 60
 DEFAULT_PROTOCOL = "https"
 DEFAULT_PORT = 443
 DEFAULT_SSL_PROTOCOLS = ["TLSv1.2"]
@@ -35,95 +40,46 @@ session = boto3.Session()
 credentials = session.get_credentials()
 
 
-def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    """
-    Lambda@Edge处理器，用于origin request阶段的动态路由
-    
-    参数:
-        event: CloudFront origin request事件
-        context: Lambda上下文对象
-        
-    返回:
-        修改后的CloudFront请求，包含动态设置的源站
-    """
+def _server_error() -> dict:
+    return {"status": "500", "statusDescription": "Internal Server Error",
+            "headers": {"content-type": [{"key": "Content-Type", "value": "text/plain"}]},
+            "body": "服务暂时不可用"}
+
+
+def lambda_handler(event, context):
     try:
         request = event["Records"][0]["cf"]["request"]
-        
-        # 从自定义header中提取原始host
         original_host = _get_original_host(request)
         if not original_host:
-            logger.warning("未找到X-Original-Host header，使用默认源站")
-            return request
-        
-        logger.info(f"处理请求，host: {original_host}")
-        
-        # 提取subdomain
+            return _server_error()
         subdomain = _extract_subdomain(original_host)
-        logger.info(f"提取的subdomain: {subdomain}")
-        
-        # 保留原始URI和query string，处理特殊字符
-        original_uri = request.get("uri", "/")
-        original_querystring = request.get("querystring", "")
-        
-        # 从DynamoDB查询目标后端
-        target_url = _lookup_target_url(subdomain)
-        
-        if target_url:
-            # 处理查询字符串中的特殊字符（如Base64的等号）
-            fixed_querystring = original_querystring
-            if original_querystring:
-                fixed_querystring = _fix_querystring_encoding(original_querystring)
-            
-            # 修改请求，路由到目标后端（传入修复后的查询字符串用于签名）
-            _modify_request_origin(request, target_url, original_uri, fixed_querystring)
-            
-            # 保留原始URI和修复后的query string
-            request["uri"] = original_uri
-            request["querystring"] = fixed_querystring
-            
-            logger.info(
-                f"路由 {subdomain} 到 {target_url} "
-                f"(URI: {original_uri}, QS: {original_querystring})"
-            )
-            return request
-        else:
-            logger.warning(f"未找到subdomain的映射: {subdomain}")
-            # 返回404错误
-            return {
-                'status': '404',
-                'statusDescription': 'Not Found',
-                'headers': {
-                    'content-type': [{
-                        'key': 'Content-Type',
-                        'value': 'text/html'
-                    }]
-                },
-                'body': f'<html><body><h1>404 Not Found</h1><p>Subdomain "{subdomain}" not configured.</p></body></html>'
-            }
-        
+        route = _lookup_route(subdomain)
+        if not route:
+            return _not_found(f'Subdomain "{subdomain}" not configured.')
+        # Task 7 在此处插入鉴权
+        return _route_request(request, route)
     except Exception as e:
-        logger.error(f"处理请求时出错: {str(e)}", exc_info=True)
-        # 出错时返回原始请求，避免中断请求流程
-        return event["Records"][0]["cf"]["request"]
+        logger.error(f"处理请求时出错: {e}", exc_info=True)
+        return _server_error()
 
 
 def _fix_querystring_encoding(querystring: str) -> str:
     """
     修复查询字符串中的编码问题，特别是Base64字符串中的等号
-    
+
     参数:
         querystring: 原始查询字符串
-        
+
     返回:
         修复后的查询字符串
     """
     if not querystring:
         return querystring
-    
+
     try:
         # 解析查询参数
         params = urllib.parse.parse_qs(querystring, keep_blank_values=True)
-        
+
         # 重新构建查询字符串，确保正确编码
         fixed_params = []
         for key, values in params.items():
@@ -131,11 +87,11 @@ def _fix_querystring_encoding(querystring: str) -> str:
                 # 对参数值进行URL编码，特别处理Base64字符串
                 encoded_value = urllib.parse.quote(value, safe='')
                 fixed_params.append(f"{key}={encoded_value}")
-        
+
         result = "&".join(fixed_params)
         logger.info(f"Fixed querystring: {querystring} -> {result}")
         return result
-        
+
     except Exception as e:
         logger.warning(f"Failed to fix querystring encoding: {e}")
         return querystring
@@ -144,27 +100,27 @@ def _fix_querystring_encoding(querystring: str) -> str:
 def _get_original_host(request: Dict[str, Any]) -> Optional[str]:
     """
     从 Host 或 X-Original-Host header 中提取原始 host
-    
+
     参数:
         request: CloudFront请求对象
-        
+
     返回:
         原始host值，如果不存在则返回None
     """
     headers = request.get("headers", {})
-    
+
     # 优先使用 Host header
     if "host" in headers:
         host = headers["host"][0]["value"]
         logger.info(f"Found Host header: {host}")
         return host
-    
+
     # 回退到 X-Original-Host
     if "x-original-host" in headers:
         host = headers["x-original-host"][0]["value"]
         logger.info(f"Found X-Original-Host header: {host}")
         return host
-    
+
     logger.warning("No Host or X-Original-Host header found")
     return None
 
@@ -172,111 +128,153 @@ def _get_original_host(request: Dict[str, Any]) -> Optional[str]:
 def _extract_subdomain(host: str) -> str:
     """
     从hostname中提取subdomain
-    
+
     参数:
         host: 完整的hostname（例如："api.example.com"）
-        
+
     返回:
         subdomain（例如："api"）
     """
     return host.split(".")[0]
 
 
-def _lookup_target_url(subdomain: str) -> Optional[str]:
-    """
-    从DynamoDB查询目标后端URL
-    
-    参数:
-        subdomain: 要查询的subdomain
-        
-    返回:
-        目标URL，如果未找到则返回None
-    """
+def _deser(item: dict) -> dict:
+    """DynamoDB AttributeValue -> plain dict（仅 S/BOOL，本表够用）"""
+    out = {}
+    for k, v in item.items():
+        out[k] = v["S"] if "S" in v else v.get("BOOL", False)
+    return out
+
+
+def _lookup_route(subdomain: str):
+    import time as _t
+    hit = _ROUTE_CACHE.get(subdomain)
+    if hit and hit[0] > _t.time():
+        return hit[1]
     try:
-        response = dynamodb.get_item(
-            TableName=DYNAMODB_TABLE_NAME,
-            Key={"subdomain": {"S": subdomain}},
-            ProjectionExpression="target_url",
-            ConsistentRead=False,  # 使用最终一致性读取以获得更好的性能
-        )
-        
-        if "Item" in response and "target_url" in response["Item"]:
-            return response["Item"]["target_url"]["S"]
-        
-        return None
-        
+        resp = dynamodb.get_item(TableName=DYNAMODB_TABLE_NAME,
+                                 Key={"subdomain": {"S": subdomain}},
+                                 ConsistentRead=False)
+        item = _deser(resp["Item"]) if "Item" in resp else None
     except ClientError as e:
-        logger.error(f"DynamoDB错误: {e.response['Error']['Message']}")
+        logger.error(f"DynamoDB错误: {e}")
         return None
+    _ROUTE_CACHE[subdomain] = (_t.time() + ROUTE_CACHE_TTL, item)
+    return item
 
 
-def _modify_request_origin(request: Dict[str, Any], target_url: str, uri: str = "/", querystring: str = "") -> None:
-    """
-    修改请求以路由到目标后端，支持 AWS_IAM 认证
-    
-    参数:
-        request: CloudFront请求对象（原地修改）
-        target_url: 目标后端URL
-        uri: 请求URI
-        querystring: 查询字符串（已修复编码）
-    """
-    # 解析目标URL以提取域名和路径
-    parsed = urllib.parse.urlparse(target_url)
-    domain = parsed.netloc
-    
-    # 检查是否是 Lambda Function URL (需要 IAM 签名)
-    is_lambda_url = ".lambda-url." in domain and ".on.aws" in domain
-    
-    if is_lambda_url:
-        # 为 Lambda Function URL 添加 SigV4 签名（使用修复后的查询字符串）
-        _add_sigv4_auth(request, domain, uri, querystring)
-    
-    # 更新源站配置
-    request["origin"] = {
-        "custom": {
-            "domainName": domain,
-            "port": DEFAULT_PORT,
-            "protocol": DEFAULT_PROTOCOL,
-            "path": "",
-            "sslProtocols": DEFAULT_SSL_PROTOCOLS,
-            "readTimeout": DEFAULT_READ_TIMEOUT,
-            "keepaliveTimeout": DEFAULT_KEEPALIVE_TIMEOUT,
-            "customHeaders": {},
-        }
-    }
-    
-    # 更新Host header以匹配新的源站
+def _not_found(msg: str) -> dict:
+    return {"status": "404", "statusDescription": "Not Found",
+            "headers": {"content-type": [{"key": "Content-Type", "value": "text/html"}]},
+            "body": f"<html><body><h1>404 Not Found</h1><p>{msg}</p></body></html>"}
+
+
+def _get_request_body(request):
+    """include_body=True 时 CloudFront 提供 base64 body；截断返回哨兵。"""
+    body = request.get("body") or {}
+    if body.get("inputTruncated"):
+        return None  # 调用方返回 413
+    data = body.get("data", "")
+    if not data:
+        return b""
+    if body.get("encoding") == "base64":
+        import base64
+        return base64.b64decode(data)
+    return data.encode()
+
+
+def _payload_too_large() -> dict:
+    return {"status": "413", "statusDescription": "Payload Too Large",
+            "headers": {"content-type": [{"key": "Content-Type", "value": "text/plain"}]},
+            "body": "请求体超过 1MB 上限"}
+
+
+def _route_to_lambda(request, route, uri, qs):
+    target = route.get("api_target") or ""
+    if not target:
+        return _not_found("此站点无后端")
+    body = _get_request_body(request)
+    if body is None:
+        return _payload_too_large()
+    domain = urllib.parse.urlparse(target).netloc
+    if ".lambda-url." in domain and ".on.aws" in domain:
+        _add_sigv4_auth(request, domain, uri, qs, body)
+    request["origin"] = _custom_origin(domain)
     request["headers"]["host"] = [{"key": "Host", "value": domain}]
+    return request
 
 
-def _add_sigv4_auth(request: Dict[str, Any], domain: str, uri: str = "/", querystring: str = "") -> None:
+def _route_request(request, route):
+    uri = request.get("uri", "/")
+    qs = _fix_querystring_encoding(request.get("querystring", ""))
+    request["querystring"] = qs
+
+    if route.get("route_mode") == "api-only":
+        return _route_to_lambda(request, route, uri, qs)
+
+    if uri.startswith("/api/"):
+        return _route_to_lambda(request, route, uri, qs)
+
+    # 静态资源 → 共享前端桶（私有，SigV4 GET）
+    if request.get("method") not in ("GET", "HEAD"):
+        return _not_found("方法不允许")
+    path = uri if ("." in uri.rsplit("/", 1)[-1]) else "/index.html"
+    request["uri"] = f"/{route['static_prefix']}{path}" if path != uri else f"/{route['static_prefix']}{uri}"
+    _add_s3_sigv4_auth(request, FRONTEND_BUCKET_DOMAIN, request["uri"])
+    request["origin"] = _custom_origin(FRONTEND_BUCKET_DOMAIN)
+    request["headers"]["host"] = [{"key": "Host", "value": FRONTEND_BUCKET_DOMAIN}]
+    return request
+
+
+def _custom_origin(domain: str) -> dict:
+    return {"custom": {"domainName": domain, "port": DEFAULT_PORT,
+                       "protocol": DEFAULT_PROTOCOL, "path": "",
+                       "sslProtocols": DEFAULT_SSL_PROTOCOLS,
+                       "readTimeout": DEFAULT_READ_TIMEOUT,
+                       "keepaliveTimeout": DEFAULT_KEEPALIVE_TIMEOUT,
+                       "customHeaders": {}}}
+
+
+def _add_s3_sigv4_auth(request, domain: str, uri: str) -> None:
+    """S3 GET 的 SigV4（Edge 执行角色需有该桶前缀的 s3:GetObject）"""
+    url = f"https://{domain}{urllib.parse.quote(uri)}"
+    aws_request = AWSRequest(method="GET", url=url)
+    SigV4Auth(credentials, "s3", "us-east-1").add_auth(aws_request)
+    for h, v in aws_request.headers.items():
+        if h.lower() in ("authorization", "x-amz-date", "x-amz-security-token",
+                         "x-amz-content-sha256"):
+            request["headers"][h.lower()] = [{"key": h, "value": v}]
+
+
+def _add_sigv4_auth(request: Dict[str, Any], domain: str, uri: str = "/",
+                    querystring: str = "", body: bytes = b"") -> None:
     """
     为请求添加 AWS Signature Version 4 认证头
-    
+
     参数:
         request: CloudFront请求对象
         domain: Lambda Function URL 域名
         uri: 请求URI
         querystring: 查询字符串（已修复编码）
+        body: 解码后的请求体（真实 bytes，参与 payload hash 计算）
     """
     # 提取区域
     region = domain.split(".lambda-url.")[1].split(".")[0]
-    
+
     # 构建请求 URL（使用修复后的查询字符串）
     url = f"https://{domain}{uri}"
     if querystring:
         url += f"?{querystring}"
-    
-    # 获取请求方法和 body
+
+    # 获取请求方法
     method = request.get("method", "GET")
-    body = request.get("body", {}).get("data", "")
-    
-    # 创建 AWS 请求对象
+
+    # 创建 AWS 请求对象（用解码后的真实 body 计算 payload hash）
     aws_request = AWSRequest(method=method, url=url, data=body)
-    
+
     # 添加签名
     SigV4Auth(credentials, "lambda", region).add_auth(aws_request)
-    
+
     # 将签名头添加到 CloudFront 请求
     for header_name, header_value in aws_request.headers.items():
         if header_name.lower() in ['authorization', 'x-amz-date', 'x-amz-security-token']:
@@ -284,5 +282,5 @@ def _add_sigv4_auth(request: Dict[str, Any], domain: str, uri: str = "/", querys
                 "key": header_name,
                 "value": header_value
             }]
-    
+
     logger.info(f"Added SigV4 auth for Lambda URL in region {region} with querystring: {querystring}")
