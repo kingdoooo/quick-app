@@ -16,8 +16,10 @@ import _edge_auth_testable as orq
 def _jwt(email="a@x.com", name="Alice", exp_delta=3600, secret="test-secret"):
     b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
     h = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
-    p = b64(json.dumps({"email": email, "name": name,
-                        "exp": int(time.time()) + exp_delta}).encode())
+    payload = {"name": name, "exp": int(time.time()) + exp_delta}
+    if email is not None:  # email=None -> payload 完全省略 email 字段
+        payload["email"] = email
+    p = b64(json.dumps(payload).encode())
     sig = b64(hmac.new(secret.encode(), f"{h}.{p}".encode(), hashlib.sha256).digest())
     return f"{h}.{p}.{sig}"
 
@@ -87,6 +89,19 @@ def test_spoofed_user_header_stripped():
              extra_headers={"x-user-email": [{"key": "x-user-email", "value": "fake@x.com"}]})
     orq._check_auth(r, dict(ROUTE_AUTH), "app-x.example.com")
     assert r["headers"]["x-user-email"][0]["value"] == "a@x.com"
+
+
+def test_token_missing_email_treated_as_unauthenticated():
+    # 签名正确但 payload 无 email：应当 302 当作未登录，而非 KeyError / 注入 None
+    r = _req(cookie=f"sb_session={_jwt(email=None)}")
+    resp = orq._check_auth(r, dict(ROUTE_AUTH), "app-x.example.com")
+    assert resp["status"] == "302"
+    assert "x-user-email" not in r["headers"]
+
+    # 名单分支同样不应抛 KeyError
+    route = {**ROUTE_AUTH, "allowed_users": json.dumps(["vip@x.com"])}
+    r2 = _req(cookie=f"sb_session={_jwt(email=None)}")
+    assert orq._check_auth(r2, route, "app-x.example.com")["status"] == "302"
 
 
 def test_no_auth_route_strips_spoofed_headers_too():

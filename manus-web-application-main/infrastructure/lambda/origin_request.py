@@ -227,6 +227,9 @@ def _verify_session_jwt(token: str) -> dict | None:
         claims = json.loads(_b64url_decode(p))
         if int(claims.get("exp", 0)) <= int(_t.time()):
             return None
+        email = claims.get("email")
+        if not isinstance(email, str) or not email:
+            return None  # 缺 email 的 token 视为无效，_check_auth 依赖 claims["email"]
         return claims
     except Exception:
         return None
