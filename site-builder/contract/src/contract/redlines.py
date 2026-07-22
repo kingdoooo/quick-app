@@ -2,13 +2,20 @@
 import re
 from pathlib import Path
 
-TEXT_EXT = {".html", ".htm", ".js", ".mjs", ".css", ".py", ".json", ".txt"}
-LOCALHOST_RE = re.compile(r"localhost|127\.0\.0\.1")
-ABS_API_RE = re.compile(r"""["'`]https?://[^"'`]+/api/""")
-AUTH_RE = re.compile(r"jwt\.sign|passport|OAuth2|client_secret|set_cookie\(.*session", re.I)
-FILE_WRITE_RE = re.compile(r"fs\.writeFile|fs\.appendFile|open\([^)]*['\"][wa]['\"]")
+TEXT_EXT = {".html", ".htm", ".js", ".mjs", ".cjs", ".css", ".py", ".json", ".txt"}
+LOCALHOST_RE = re.compile(
+    r"localhost|127\.\d+\.\d+\.\d+|127\.1|0\.0\.0\.0|\[::1\]", re.I)
+ABS_API_RE = re.compile(r"""["'`]https?://[^"'`]+/api/""", re.I)
+AUTH_RE = re.compile(
+    r"jwt\.sign|passport|OAuth2|client_secret|set_cookie\(.*session"
+    r"|res\.cookie\(|Set-Cookie|jsonwebtoken|express-session|cookie-session", re.I)
+FILE_WRITE_RE = re.compile(
+    r"fs\.writeFile|fs\.appendFile|fs\.promises\.\w+|fs\.createWriteStream"
+    r"|['\"]fs/promises['\"]"
+    r"|open\([^)]*['\"][wax]\+?b?['\"]")
 HEALTH_RE = re.compile(r"/api/health")
-INNERHTML_RE = re.compile(r"\.innerHTML\s*[+]?=")
+INNERHTML_RE = re.compile(
+    r"(?:inner|outer)HTML\s*[+]?=(?!=)|insertAdjacentHTML\(|document\.write\(")
 FORBIDDEN_DDL = ["REFERENCES", "SERIAL", "JSONB", "CREATE TRIGGER", "CREATE TEMP"]
 
 
@@ -16,7 +23,7 @@ def _read_all(root: Path) -> list[tuple[Path, str]]:
     out = []
     if root.is_dir():
         for p in sorted(root.rglob("*")):
-            if p.is_file() and p.suffix in TEXT_EXT and "node_modules" not in p.parts:
+            if p.is_file() and p.suffix.lower() in TEXT_EXT and "node_modules" not in p.parts:
                 out.append((p, p.read_text(errors="replace")))
     return out
 
