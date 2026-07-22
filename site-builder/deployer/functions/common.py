@@ -5,6 +5,7 @@ import string
 from datetime import datetime, timezone
 
 import boto3
+from boto3.dynamodb.conditions import Key
 
 _ddb = None
 
@@ -45,11 +46,12 @@ def update_job(job_id: str, *, status=None, phase=None, error=None, url=None) ->
             names[f"#{field}"] = field
             updates.append(f"#{field} = :{field}")
             values[f":{field}"] = val
-    _table("JOBS_TABLE").update_item(
-        Key={"job_id": job_id},
-        UpdateExpression="SET " + ", ".join(updates),
-        ExpressionAttributeNames=names or None,
-        ExpressionAttributeValues=values)
+    kwargs = dict(Key={"job_id": job_id},
+                  UpdateExpression="SET " + ", ".join(updates),
+                  ExpressionAttributeValues=values)
+    if names:
+        kwargs["ExpressionAttributeNames"] = names
+    _table("JOBS_TABLE").update_item(**kwargs)
 
 
 def get_job(job_id: str) -> dict | None:
@@ -59,7 +61,7 @@ def get_job(job_id: str) -> dict | None:
 def list_jobs_by_owner(owner: str) -> list[dict]:
     resp = _table("JOBS_TABLE").query(
         IndexName="owner-index",
-        KeyConditionExpression=boto3.dynamodb.conditions.Key("owner").eq(owner))
+        KeyConditionExpression=Key("owner").eq(owner))
     return resp.get("Items", [])
 
 
