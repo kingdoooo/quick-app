@@ -77,16 +77,18 @@ class SiteDeployerStack(Stack):
                          "lambda:TagResource"],
                 resources=[f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:site-*",
                            "arn:aws:lambda:us-east-1:753240598075:layer:LambdaAdapterLayerX86:28"]),
-            iam.PolicyStatement(  # per-site 运行时角色的创建/管理，boundary 强制
-                actions=["iam:CreateRole", "iam:GetRole", "iam:PutRolePolicy",
-                         "iam:DeleteRolePolicy", "iam:DeleteRole", "iam:PassRole",
-                         "iam:AttachRolePolicy", "iam:TagRole"],
+            iam.PolicyStatement(  # 仅 CreateRole 强制 boundary：iam:PermissionsBoundary 这个
+                # condition key 只在 CreateRole/PutRolePermissionsBoundary 请求上下文存在，
+                # 其他 iam 动作带此条件会因 key 缺失被 StringEquals 判 false 而拒绝。
+                actions=["iam:CreateRole"],
                 resources=[f"arn:aws:iam::{ACCOUNT}:role/site-rt-*"],
                 conditions={"StringEquals": {
                     "iam:PermissionsBoundary": runtime_boundary.managed_policy_arn}}),
-            iam.PolicyStatement(  # GetRole/PassRole/Delete 不带 boundary 条件（条件仅约束创建/改策略）
-                actions=["iam:GetRole", "iam:PassRole", "iam:DeleteRole",
-                         "iam:DeleteRolePolicy", "iam:ListRolePolicies"],
+            iam.PolicyStatement(  # 其余角色管理动作无条件——角色创建时已被 boundary 封顶，
+                # PutRolePolicy 授的权也超不出 boundary 交集，无条件是安全的。
+                actions=["iam:GetRole", "iam:PutRolePolicy", "iam:DeleteRolePolicy",
+                         "iam:AttachRolePolicy", "iam:DeleteRole", "iam:PassRole",
+                         "iam:TagRole", "iam:ListRolePolicies"],
                 resources=[f"arn:aws:iam::{ACCOUNT}:role/site-rt-*"]),
             iam.PolicyStatement(  # 站点数据表 + 任务/站点/路由表
                 actions=["dynamodb:*"],
