@@ -5,3 +5,4 @@ __pycache__/
 .pytest_cache/
 cdk.out/
 site-builder/config.ini
+site-builder/contract/build/

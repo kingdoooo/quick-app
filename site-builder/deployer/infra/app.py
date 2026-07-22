@@ -6,7 +6,8 @@ from pathlib import Path
 
 from aws_cdk import (App, CfnOutput, Duration, Environment, RemovalPolicy, Stack,
                      aws_codebuild as cb, aws_dynamodb as ddb, aws_iam as iam,
-                     aws_s3 as s3)
+                     aws_lambda as lam_, aws_s3 as s3, aws_stepfunctions as sfn,
+                     aws_stepfunctions_tasks as tasks)
 from constructs import Construct
 
 CFG = configparser.ConfigParser()
@@ -113,6 +114,103 @@ class SiteDeployerStack(Stack):
                      "ExecRoleArn": exec_role.role_arn,
                      "RuntimeBoundaryArn": runtime_boundary.managed_policy_arn}.items():
             CfnOutput(self, k, value=v)
+
+        # ---- Task 17: Lambda 函数群 + site-deploy 状态机 ----
+        fn_dir = str(Path(__file__).parents[1] / "functions")
+        contract_dir = str(Path(__file__).parents[2] / "contract" / "src")
+        common_env = {
+            "JOBS_TABLE": jobs.table_name, "SITES_TABLE": sites.table_name,
+            "ARTIFACTS_BUCKET": artifacts.bucket_name,
+            "FRONTEND_BUCKET": f"site-frontend-{ACCOUNT}",
+            "ROUTING_TABLE": CFG["Platform"]["routing_table"],
+            "BASE_DOMAIN": CFG["Platform"]["base_domain"],
+            "RUNTIME_BOUNDARY_ARN": runtime_boundary.managed_policy_arn,
+            # manus 栈 CfnOutput 回填；deploy 前需在 config.ini [Deployer] 填入
+            # edge_role_arn（synth 阶段允许空字符串）
+            "EDGE_ROLE_ARN": CFG["Deployer"]["edge_role_arn"],
+            "PACKAGE_PROJECT": package_project.project_name,
+            "DSQL_ENDPOINT": CFG["DSQL"]["cluster_endpoint"],
+            "ACCOUNT_ID": ACCOUNT,
+        }
+
+        def step_fn(name: str, handler: str, timeout_s: int = 120) -> lam_.Function:
+            # 打包 functions/ + contract 包；psycopg 由 bundling pip 装入
+            return lam_.Function(
+                self, name, function_name=f"site-deployer-{handler}",
+                runtime=lam_.Runtime.PYTHON_3_13,
+                handler=f"{handler}.handler",
+                code=lam_.Code.from_asset(fn_dir, bundling={
+                    "image": lam_.Runtime.PYTHON_3_13.bundling_image,
+                    # 钉死 amd64：Lambda 默认 x86_64，Apple Silicon 上不钉平台
+                    # 会装出 aarch64 的 psycopg 二进制导致运行时 import 失败
+                    "platform": "linux/amd64",
+                    "command": ["bash", "-c",
+                                "pip install 'psycopg[binary]' sqlparse -t /asset-output -q && "
+                                f"cp -r /asset-input/. /asset-output/ && "
+                                "pip install /asset-contract -t /asset-output -q"],
+                    "volumes": [{"hostPath": contract_dir + "/..",
+                                 "containerPath": "/asset-contract"}]}),
+                role=exec_role, timeout=Duration.seconds(timeout_s),
+                memory_size=512, environment=common_env)
+
+        f_validate = step_fn("FnValidate", "validate")
+        f_ddb = step_fn("FnProvDdb", "provision_dynamodb", 300)
+        f_dsql = step_fn("FnProvDsql", "provision_dsql", 300)
+        f_pkg = step_fn("FnPackage", "package_backend", 900)
+        f_deploy = step_fn("FnDeployLambda", "deploy_lambda_site", 300)
+        f_upload = step_fn("FnUpload", "upload_frontend", 300)
+        f_route = step_fn("FnRoute", "register_route")
+        f_smoke = step_fn("FnSmoke", "smoke_test", 60)
+        f_mark = step_fn("FnMark", "mark_job")
+        step_fn("FnUndeploy", "undeploy", 300)  # MCP 直调，不进状态机
+
+        mark_failed = tasks.LambdaInvoke(self, "MarkFailed", lambda_function=f_mark,
+                                         payload_response_only=True)
+        mark_failed.next(sfn.Fail(self, "Failed"))
+
+        _tracked: list = []
+
+        def t(name: str, fn) -> tasks.LambdaInvoke:
+            node = tasks.LambdaInvoke(self, name, lambda_function=fn,
+                                      payload_response_only=True)
+            node.add_catch(mark_failed, errors=["States.ALL"],
+                           result_path="$.error_info")
+            _tracked.append(node)
+            return node
+
+        # 汇合点用 Pass 节点——同一后续链只被 next 一次，Choice 分支都指向它
+        join_upload = sfn.Pass(self, "JoinUpload")
+        join_upload.next(t("UploadFrontend", f_upload)
+                         .next(t("RegisterRoute", f_route))
+                         .next(t("SmokeTest", f_smoke))
+                         .next(t("MarkSuccess", f_mark))
+                         .next(sfn.Succeed(self, "Done")))
+
+        join_backend = sfn.Pass(self, "JoinBackend")
+        join_backend.next(
+            sfn.Choice(self, "HasBackend?")
+            .when(sfn.Condition.string_equals("$.manifest.tier", "static"),
+                  join_upload)
+            .otherwise(t("PackageBackend", f_pkg)
+                       .next(t("DeployLambdaSite", f_deploy))
+                       .next(join_upload)))
+
+        choice_db = (sfn.Choice(self, "WhichDB?")
+                     .when(sfn.Condition.string_equals("$.manifest.database.engine",
+                                                       "dynamodb"),
+                           t("ProvisionDynamoDB", f_ddb).next(join_backend))
+                     .when(sfn.Condition.string_equals("$.manifest.database.engine",
+                                                       "dsql"),
+                           t("ProvisionDSQL", f_dsql).next(join_backend))
+                     .otherwise(join_backend))
+        definition = t("Validate", f_validate).next(choice_db)
+
+        sm = sfn.StateMachine(self, "DeploySM", state_machine_name="site-deploy",
+                              definition_body=sfn.DefinitionBody.from_chainable(definition),
+                              timeout=Duration.minutes(30))
+        CfnOutput(self, "StateMachineArn", value=sm.state_machine_arn)
+        CfnOutput(self, "UndeployFnArn",
+                  value=f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:site-deployer-undeploy")
 
 
 app = App()
