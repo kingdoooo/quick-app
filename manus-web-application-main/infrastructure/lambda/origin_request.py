@@ -56,7 +56,9 @@ def lambda_handler(event, context):
         route = _lookup_route(subdomain)
         if not route:
             return _not_found(f'Subdomain "{subdomain}" not configured.')
-        # Task 7 在此处插入鉴权
+        denied = _check_auth(request, route, original_host)
+        if denied:
+            return denied
         return _route_request(request, route)
     except Exception as e:
         logger.error(f"处理请求时出错: {e}", exc_info=True)
@@ -202,6 +204,85 @@ def _route_to_lambda(request, route, uri, qs):
     request["origin"] = _custom_origin(domain)
     request["headers"]["host"] = [{"key": "Host", "value": domain}]
     return request
+
+
+BASE_DOMAIN = "{{BASE_DOMAIN}}"
+
+
+def _b64url_decode(s: str) -> bytes:
+    import base64
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def _verify_session_jwt(token: str) -> dict | None:
+    """与 site-builder/auth/session.py 同算法（HS256），改动须两处同步。"""
+    import base64, hashlib, hmac as _hmac, time as _t
+    try:
+        h, p, sig = token.split(".")
+        expected = base64.urlsafe_b64encode(
+            _hmac.new(JWT_SECRET.encode(), f"{h}.{p}".encode(), hashlib.sha256).digest()
+        ).rstrip(b"=").decode()
+        if not _hmac.compare_digest(sig, expected):
+            return None
+        claims = json.loads(_b64url_decode(p))
+        if int(claims.get("exp", 0)) <= int(_t.time()):
+            return None
+        return claims
+    except Exception:
+        return None
+
+
+def _get_cookie(request, name: str) -> str | None:
+    for header in request.get("headers", {}).get("cookie", []):
+        for part in header["value"].split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == name:
+                return v
+    return None
+
+
+def _redirect_login(host: str, uri: str, querystring: str = "") -> dict:
+    full = f"https://{host}{uri}" + (f"?{querystring}" if querystring else "")
+    target = urllib.parse.quote(full, safe="")
+    return {"status": "302", "statusDescription": "Found",
+            "headers": {"location": [{"key": "Location",
+                        "value": f"https://auth.{BASE_DOMAIN}/login?redirect={target}"}]}}
+
+
+def _forbidden() -> dict:
+    return {"status": "403", "statusDescription": "Forbidden",
+            "headers": {"content-type": [{"key": "Content-Type", "value": "text/html"}]},
+            "body": "<html><body><h1>403</h1><p>你不在此站点的访问名单内。</p></body></html>"}
+
+
+def _check_auth(request, route, host):
+    """返回 None=放行（用户头已注入）；返回 dict=302/403 响应。"""
+    # 无条件剥除客户端可伪造的用户头
+    request["headers"].pop("x-user-email", None)
+    request["headers"].pop("x-user-name", None)
+
+    if not route.get("require_auth"):
+        return None
+
+    token = _get_cookie(request, "sb_session")
+    claims = _verify_session_jwt(token) if token else None
+    if not claims:
+        return _redirect_login(host, request.get("uri", "/"),
+                               request.get("querystring", ""))
+
+    allowed = route.get("allowed_users", "org")
+    if allowed != "org":
+        try:
+            allowlist = json.loads(allowed)
+        except Exception:
+            allowlist = []
+        if claims["email"] not in allowlist and claims["email"] != route.get("owner"):
+            return _forbidden()
+
+    request["headers"]["x-user-email"] = [{"key": "x-user-email", "value": claims["email"]}]
+    request["headers"]["x-user-name"] = [{"key": "x-user-name",
+                                          "value": urllib.parse.quote(claims.get("name", ""))}]
+    return None
 
 
 def _route_request(request, route):
