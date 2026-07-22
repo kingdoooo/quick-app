@@ -1,3 +1,4 @@
 pytest>=8
 moto[dynamodb,s3]>=5
 boto3
+-e ../contract
