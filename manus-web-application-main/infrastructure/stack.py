@@ -50,6 +50,39 @@ class ConfigLoader:
         return {}
 
 
+def load_jwt_secret() -> str:
+    """Deploy-time JWT secret injection for the edge function.
+
+    Resolution order:
+    1. APP_JWT_SECRET environment variable (explicit override)
+    2. SSM SecureString parameter /site-builder/jwt-secret (us-east-1)
+    3. Synth-only placeholder (SSM unreachable / parameter missing /
+       boto3 not installed) — allows `cdk synth` to run offline, but the
+       resulting template MUST NOT be deployed: with a wrong secret every
+       session token fails verification (fail-closed, endless login
+       redirect). Real deployments must have the SSM parameter in place
+       (aws ssm put-parameter --name /site-builder/jwt-secret
+        --type SecureString --value <secret> --region us-east-1).
+    """
+    env_secret = os.getenv("APP_JWT_SECRET")
+    if env_secret:
+        return env_secret
+    try:
+        import boto3
+        ssm = boto3.client("ssm", region_name="us-east-1")
+        return ssm.get_parameter(
+            Name="/site-builder/jwt-secret", WithDecryption=True
+        )["Parameter"]["Value"]
+    except Exception as exc:  # noqa: BLE001 - deliberate synth-time fallback
+        import sys
+        print(
+            f"WARNING: could not read SSM /site-builder/jwt-secret ({exc}); "
+            "using a synth-only placeholder. DO NOT deploy this template.",
+            file=sys.stderr,
+        )
+        return "SYNTH-ONLY-PLACEHOLDER-DO-NOT-DEPLOY"
+
+
 class WebRouterStack(Stack):
     """CloudFront dynamic subdomain routing Stack"""
     
@@ -97,6 +130,16 @@ class WebRouterStack(Stack):
             actions=["lambda:InvokeFunctionUrl"],
             resources=["*"]
         ))
+
+        # Site-builder: shared frontend bucket (private; edge function reads
+        # static assets via SigV4-signed GET)
+        frontend_bucket = config.get("SiteBuilder", "frontend_bucket", "APP_FRONTEND_BUCKET")
+        base_domain = config.get("SiteBuilder", "base_domain", "APP_BASE_DOMAIN")
+        edge_role.add_to_policy(iam.PolicyStatement(
+            effect=iam.Effect.ALLOW,
+            actions=["s3:GetObject"],
+            resources=[f"arn:aws:s3:::{frontend_bucket}/sites/*"]
+        ))
         
         # Read Lambda code and inject configuration
         lambda_code_path = Path(__file__).parent / "lambda" / "origin_request.py"
@@ -104,12 +147,22 @@ class WebRouterStack(Stack):
             lambda_code = f.read()
         
         lambda_code = lambda_code.replace(
-            '{{DYNAMODB_TABLE_NAME}}', 
+            '{{DYNAMODB_TABLE_NAME}}',
             f"{stack_name}-{config.get('DynamoDB', 'table_name', 'APP_DYNAMODB_TABLE')}"
         ).replace(
-            '{{DYNAMODB_REGION}}', 
+            '{{DYNAMODB_REGION}}',
             config.get("DynamoDB", "region", "APP_DYNAMODB_REGION")
         )
+
+        # Site-builder placeholders (Task 6/7). JWT secret comes from SSM at
+        # deploy time (see load_jwt_secret); the bucket lives in us-east-1
+        # (Lambda@Edge SigV4 in origin_request.py signs for us-east-1).
+        jwt_secret = load_jwt_secret()
+        lambda_code = (lambda_code
+            .replace("{{FRONTEND_BUCKET_DOMAIN}}",
+                     f"{frontend_bucket}.s3.us-east-1.amazonaws.com")
+            .replace("{{JWT_SECRET}}", jwt_secret)
+            .replace("{{BASE_DOMAIN}}", base_domain))
         
         # Write to temporary file
         temp_dir = tempfile.mkdtemp()
@@ -137,22 +190,6 @@ class WebRouterStack(Stack):
             certificate_arn=config.get("CloudFront", "certificate_arn", "APP_CERTIFICATE_ARN")
         )
         
-        # Create custom Cache Policy that includes query strings
-        cache_policy = cloudfront.CachePolicy(
-            self,
-            "CachePolicy",
-            cache_policy_name=f"{stack_name}-CachePolicy",
-            comment="Cache policy that includes all query strings",
-            min_ttl=Duration.seconds(config.get_int("CloudFront", "cache_min_ttl", "APP_CACHE_MIN_TTL")),
-            default_ttl=Duration.seconds(config.get_int("CloudFront", "cache_default_ttl", "APP_CACHE_DEFAULT_TTL")),
-            max_ttl=Duration.seconds(config.get_int("CloudFront", "cache_max_ttl", "APP_CACHE_MAX_TTL")),
-            query_string_behavior=cloudfront.CacheQueryStringBehavior.all(),
-            header_behavior=cloudfront.CacheHeaderBehavior.none(),
-            cookie_behavior=cloudfront.CacheCookieBehavior.none(),
-            enable_accept_encoding_gzip=True,
-            enable_accept_encoding_brotli=True,
-        )
-        
         # Create new OriginRequestPolicy
         origin_request_policy = cloudfront.OriginRequestPolicy(
             self,
@@ -163,6 +200,13 @@ class WebRouterStack(Stack):
             query_string_behavior=cloudfront.OriginRequestQueryStringBehavior.all(),
         )
         
+        # Caching MUST stay disabled: the origin-request Lambda only runs on
+        # cache misses, so any caching would let authenticated responses be
+        # served to unauthenticated users and leak content across subdomains
+        # under the wildcard domain. CACHING_DISABLED also removes the cache
+        # propagation delay for routing-table updates/removals.
+        # include_body=True is required so the request body participates in
+        # the SigV4 signature computed by the edge function.
         distribution = cloudfront.Distribution(
             self,
             "Distribution",
@@ -172,36 +216,18 @@ class WebRouterStack(Stack):
                     protocol_policy=cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
                 ),
                 viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-                cache_policy=cache_policy,
+                cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
                 origin_request_policy=origin_request_policy,
                 allowed_methods=cloudfront.AllowedMethods.ALLOW_ALL,
                 compress=True,
                 edge_lambdas=[
                     cloudfront.EdgeLambda(
                         function_version=edge_function.current_version,
-                        event_type=cloudfront.LambdaEdgeEventType.ORIGIN_REQUEST
+                        event_type=cloudfront.LambdaEdgeEventType.ORIGIN_REQUEST,
+                        include_body=True,
                     )
                 ]
             ),
-            additional_behaviors={
-                "/api/*": cloudfront.BehaviorOptions(
-                    origin=origins.HttpOrigin(
-                        config.get("CloudFront", "default_origin", "APP_DEFAULT_ORIGIN"),
-                        protocol_policy=cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
-                    ),
-                    viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-                    cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
-                    origin_request_policy=origin_request_policy,
-                    allowed_methods=cloudfront.AllowedMethods.ALLOW_ALL,
-                    compress=True,
-                    edge_lambdas=[
-                        cloudfront.EdgeLambda(
-                            function_version=edge_function.current_version,
-                            event_type=cloudfront.LambdaEdgeEventType.ORIGIN_REQUEST
-                        )
-                    ]
-                )
-            },
             domain_names=[config.get("CloudFront", "domain_name", "APP_DOMAIN_NAME")],
             certificate=certificate,
             minimum_protocol_version=cloudfront.SecurityPolicyProtocol.TLS_V1_2_2021,
@@ -211,6 +237,7 @@ class WebRouterStack(Stack):
         # Outputs
         CfnOutput(self, "DynamoDBTableName", value=mapping_table.table_name)
         CfnOutput(self, "EdgeFunctionArn", value=edge_function.current_version.function_arn)
+        CfnOutput(self, "EdgeRoleArn", value=edge_role.role_arn)
         CfnOutput(self, "DistributionDomainName", value=distribution.distribution_domain_name)
         CfnOutput(self, "DistributionId", value=distribution.distribution_id)
 

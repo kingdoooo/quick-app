@@ -24,10 +24,9 @@ certificate_arn = arn:aws:acm:us-east-1:123456789012:certificate/your-cert-id
 default_origin = example.com
 # Origin request policy name (optional, can keep default)
 origin_request_policy_name = ApplicationWebRouterPolicy
-# Cache TTL values in seconds
-cache_min_ttl = 0
-cache_default_ttl = 86400
-cache_max_ttl = 31536000
+# NOTE: CloudFront caching is hard-disabled in stack.py (CACHING_DISABLED).
+# The origin-request edge function performs per-request auth; caching would
+# serve authenticated responses to unauthenticated users. No TTL settings.
 
 # ============================================================================
 # DynamoDB Settings (OPTIONAL - Can keep defaults)
@@ -76,6 +75,23 @@ function_prefix = expressjs-demo
 stack_name = ApplicationWebRouterStack
 # Stack description
 stack_description = CloudFront-based dynamic subdomain routing system using Lambda@Edge and DynamoDB for backend service discovery
+
+# ============================================================================
+# Site Builder Settings (REQUIRED for site-builder integration)
+# ============================================================================
+[SiteBuilder]
+# Shared private S3 bucket holding site static assets under sites/<site_id>/...
+# The edge function reads it with SigV4; the bucket must be in us-east-1.
+frontend_bucket = site-frontend-123456789012
+# Base domain for site subdomains (must match the CloudFront wildcard domain,
+# e.g. domain_name = *.example.com -> base_domain = example.com).
+# auth.<base_domain> hosts the login service.
+base_domain = example.com
+# JWT secret is NOT stored here: it is read at deploy time from the SSM
+# SecureString parameter /site-builder/jwt-secret (us-east-1). Create it with:
+#   aws ssm put-parameter --name /site-builder/jwt-secret --type SecureString \
+#     --value "$(python3 -c 'import secrets;print(secrets.token_hex(32))')" \
+#     --region us-east-1
 
 # ============================================================================
 # Resource Tags (OPTIONAL - Recommended for cost tracking)
