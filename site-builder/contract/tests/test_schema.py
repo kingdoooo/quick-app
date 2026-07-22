@@ -1,4 +1,3 @@
-import pytest
 from contract import validate_manifest
 
 
@@ -58,14 +57,61 @@ def test_bad_runtime_fails():
     assert any("runtime" in e for e in validate_manifest(m))
 
 
-def test_bad_table_spec_fails():
+def test_bad_table_name_fails():
     m = _valid_sql_manifest()
     m["tier"] = "fullstack-nosql"
     m["database"] = {"engine": "dynamodb",
-                     "tables": [{"name": "Bad Name!", "pk": "id"},
-                                {"name": "dup", "pk": "id"}, {"name": "dup", "pk": "id"}]}
+                     "tables": [{"name": "Bad Name!", "pk": "id"}]}
+    assert any("tables" in e for e in validate_manifest(m))
+
+
+def test_duplicate_table_names_fail():
+    m = _valid_sql_manifest()
+    m["tier"] = "fullstack-nosql"
+    m["database"] = {"engine": "dynamodb",
+                     "tables": [{"name": "dup", "pk": "id"}, {"name": "dup", "pk": "id"}]}
+    assert any("重复" in e for e in validate_manifest(m))
+
+
+def test_database_as_string_returns_errors_not_exception():
+    m = _valid_sql_manifest()
+    m["database"] = "oops"
     errs = validate_manifest(m)
-    assert any("tables" in e for e in errs)  # 命名非法 + 重复
+    assert isinstance(errs, list) and any("database" in e for e in errs)
+
+
+def test_tables_item_as_string_returns_errors_not_exception():
+    m = _valid_sql_manifest()
+    m["tier"] = "fullstack-nosql"
+    m["database"] = {"engine": "dynamodb", "tables": ["str"]}
+    errs = validate_manifest(m)
+    assert isinstance(errs, list) and any("tables" in e for e in errs)
+
+
+def test_table_name_non_string_returns_errors_not_exception():
+    m = _valid_sql_manifest()
+    m["tier"] = "fullstack-nosql"
+    m["database"] = {"engine": "dynamodb", "tables": [{"name": 123, "pk": "id"}]}
+    errs = validate_manifest(m)
+    assert isinstance(errs, list) and any("tables" in e for e in errs)
+
+
+def test_name_trailing_newline_fails():
+    m = _valid_sql_manifest()
+    m["name"] = "myapp\n"
+    assert any("name" in e for e in validate_manifest(m))
+
+
+def test_email_trailing_newline_fails():
+    m = _valid_sql_manifest()
+    m["auth"]["allowed_users"] = ["a@x.com\n"]
+    assert any("allowed_users" in e for e in validate_manifest(m))
+
+
+def test_sql_with_nonempty_tables_fails():
+    m = _valid_sql_manifest()
+    m["database"]["tables"] = [{"name": "expenses", "pk": "id"}]
+    assert any("tables" in e for e in validate_manifest(m))
 
 
 def test_allowed_users_list_ok():
