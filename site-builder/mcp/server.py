@@ -132,12 +132,33 @@ mcp = FastMCP("site-builder-deploy", stateless_http=True)
 
 
 def _caller_email() -> str:
-    """AgentCore 网关把 Cognito JWT 的 email 放请求头（Task 20 配置）。"""
-    from mcp.server.fastmcp import get_http_headers
-    email = get_http_headers().get("x-amzn-oauth-email", "")
-    if not email:
-        raise NotOwner("无法识别调用者身份（缺少 OAuth email）")
-    return email
+    """从入站请求的 Authorization: Bearer <JWT> 里取 email claim。
+
+    AgentCore Runtime 的 customJWTAuthorizer 验签后，把原始 Authorization 头
+    透传给容器内的 MCP server（官方 SDK 无 get_http_headers；用 FastMCP 的
+    request_context 拿 starlette Request）。JWT 已被 AgentCore 验过签名，此处
+    只解 payload 取 email，不重复验签。Task 20 spike 已本地验证此路径可用。
+    """
+    import base64
+    import json as _json
+
+    try:
+        request = mcp.get_context().request_context.request
+        auth = dict(request.headers).get("authorization", "") if request else ""
+    except Exception:
+        auth = ""
+    token = auth[7:] if auth[:7].lower() == "bearer " else auth
+    parts = token.split(".")
+    if len(parts) == 3:
+        try:
+            payload = parts[1] + "=" * (-len(parts[1]) % 4)
+            claims = _json.loads(base64.urlsafe_b64decode(payload))
+            email = claims.get("email", "")
+            if email:
+                return email
+        except Exception:
+            pass
+    raise NotOwner("无法识别调用者身份（缺少 OAuth email claim）")
 
 
 @mcp.tool()
