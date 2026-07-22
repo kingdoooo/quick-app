@@ -1,0 +1,33 @@
+<!doctype html><meta charset="utf-8"><title>Expenses</title>
+<h1>记账</h1>
+<form id="f">
+  <input id="title" placeholder="花在哪了" required>
+  <input id="amount" type="number" step="0.01" min="0" placeholder="金额" required>
+  <button>记一笔</button>
+</form>
+<ul id="list"></ul>
+<script>
+// 用户输入一律 textContent 渲染——innerHTML 拼接会存储型 XSS（合同红线）
+const load = async () => {
+  const expenses = await (await fetch("/api/expenses")).json();
+  list.replaceChildren(...expenses.map(x => {
+    const li = document.createElement("li");
+    const span = document.createElement("span");
+    span.textContent = x.title;
+    const strong = document.createElement("strong");
+    strong.textContent = " ¥" + x.amount;
+    const small = document.createElement("small");
+    small.textContent = " " + x.spender;
+    li.append(span, strong, small);
+    return li;
+  }));
+};
+f.onsubmit = async e => {
+  e.preventDefault();
+  await fetch("/api/expenses", {method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({title: title.value, amount: Number(amount.value)})});
+  title.value = ""; amount.value = ""; load();
+};
+load();
+</script>

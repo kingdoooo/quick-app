@@ -1,0 +1,33 @@
+<!doctype html><meta charset="utf-8"><title>Notes</title>
+<h1>便签</h1>
+<form id="f"><input id="t" placeholder="记点什么"><button>添加</button></form>
+<ul id="list"></ul>
+<script>
+// 用户输入一律 textContent 渲染——innerHTML 拼接会存储型 XSS（合同红线）
+const load = async () => {
+  const notes = await (await fetch("/api/notes")).json();
+  list.replaceChildren(...notes.map(n => {
+    const li = document.createElement("li");
+    const span = document.createElement("span");
+    span.textContent = n.text;
+    const small = document.createElement("small");
+    small.textContent = " " + n.author;
+    const btn = document.createElement("button");
+    btn.textContent = "删";
+    btn.onclick = async () => {
+      await fetch(`/api/notes/${encodeURIComponent(n.id)}`, {method: "DELETE"});
+      load();
+    };
+    li.append(span, small, btn);
+    return li;
+  }));
+};
+f.onsubmit = async e => {
+  e.preventDefault();
+  await fetch("/api/notes", {method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({text: t.value})});
+  t.value = ""; load();
+};
+load();
+</script>

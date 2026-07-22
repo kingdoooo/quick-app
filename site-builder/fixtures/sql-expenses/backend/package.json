@@ -1,0 +1,2 @@
+{"name": "expenses-backend", "private": true,
+ "dependencies": {"express": "^4.19", "pg": "^8.12", "@aws-sdk/dsql-signer": "^3"}}
