@@ -1,0 +1,91 @@
+# Application Web Router Configuration Template
+# Copy this file to config.ini and modify the REQUIRED settings
+
+# ============================================================================
+# AWS Account Settings (REQUIRED - Must be modified)
+# ============================================================================
+[AWS]
+# Your AWS account ID (12 digits)
+account_id = 123456789012
+# AWS region for deployment (must be us-east-1 for Lambda@Edge)
+region = us-east-1
+
+# ============================================================================
+# CloudFront Settings (REQUIRED - Must be modified)
+# ============================================================================
+[CloudFront]
+# Your custom domain with wildcard (e.g., *.example.com)
+# This should match your Route53 hosted zone or DNS provider
+domain_name = *.example.com
+# ACM certificate ARN in us-east-1 region for your domain
+# Create certificate in ACM console and copy the ARN here
+certificate_arn = arn:aws:acm:us-east-1:123456789012:certificate/your-cert-id
+# Default origin (placeholder, can keep as is)
+default_origin = example.com
+# Origin request policy name (optional, can keep default)
+origin_request_policy_name = ApplicationWebRouterPolicy
+# Cache TTL values in seconds
+cache_min_ttl = 0
+cache_default_ttl = 86400
+cache_max_ttl = 31536000
+
+# ============================================================================
+# DynamoDB Settings (OPTIONAL - Can keep defaults)
+# ============================================================================
+[DynamoDB]
+# DynamoDB table name for subdomain mappings
+table_name = subdomain-mapping
+# DynamoDB region (should match AWS region)
+region = us-east-1
+
+# ============================================================================
+# Lambda Settings (OPTIONAL - Can keep defaults)
+# ============================================================================
+[Lambda]
+# IAM role name for Lambda execution
+# This role will be created by CDK if it doesn't exist
+execution_role_name = lambda-execution-role
+# Lambda memory size in MB (128-10240)
+memory_size = 128
+# Lambda timeout in seconds (max 30 for Lambda@Edge origin-request)
+timeout_seconds = 5
+
+# ============================================================================
+# Lambda@Edge Settings (OPTIONAL - Can keep defaults)
+# ============================================================================
+[LambdaEdge]
+# Lambda@Edge function name for origin request
+origin_request_function_name = application-web-router
+
+# ============================================================================
+# Lambda Test Settings (OPTIONAL - For testing only)
+# ============================================================================
+[LambdaTest]
+# ECR repository name for test Lambda images
+ecr_repository = expressjs-demo
+# Function name prefix for test deployments
+function_prefix = expressjs-demo
+
+# ============================================================================
+# CDK Stack Settings (OPTIONAL - Can keep defaults)
+# ============================================================================
+[CDK]
+# CDK stack name
+# 注意：如果修改stack名称，请确保新名称包含"WebRouterStack"字符串
+# 否则可能会出现权限不足的情况（IAM策略基于*WebRouterStack*模式匹配）
+stack_name = ApplicationWebRouterStack
+# Stack description
+stack_description = CloudFront-based dynamic subdomain routing system using Lambda@Edge and DynamoDB for backend service discovery
+
+# ============================================================================
+# Resource Tags (OPTIONAL - Recommended for cost tracking)
+# ============================================================================
+[Tags]
+# Project name - used for grouping resources
+project = manus-web-application
+# Environment (e.g., production, staging, development)
+environment = production
+# Managed by (e.g., cdk, terraform, manual)
+managed_by = cdk
+# Cost center or team name for billing
+cost_center = engineering

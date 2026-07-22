@@ -1,0 +1,67 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "IAMRoleManagement",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetRole",
+        "iam:CreateRole",
+        "iam:AttachRolePolicy",
+        "iam:PassRole"
+      ],
+      "Resource": [
+        "arn:aws:iam::*:role/lambda-execution-role*"
+      ]
+    },
+    {
+      "Sid": "IAMPolicyAccess",
+      "Effect": "Allow",
+      "Action": [
+        "iam:AttachRolePolicy"
+      ],
+      "Resource": "arn:aws:iam::*:role/lambda-execution-role*",
+      "Condition": {
+        "StringEquals": {
+          "iam:PolicyArn": "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        }
+      }
+    },
+    {
+      "Sid": "LambdaFunctionManagement",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:CreateFunction",
+        "lambda:GetFunction",
+        "lambda:GetFunctionConfiguration",
+        "lambda:CreateFunctionUrlConfig",
+        "lambda:TagResource"
+      ],
+      "Resource": [
+        "arn:aws:lambda:us-east-1:*:function:*"
+      ]
+    },
+    {
+      "Sid": "DynamoDBAccess",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:DescribeTable",
+        "dynamodb:PutItem"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:us-east-1:*:table/*WebRouterStack*"
+      ]
+    },
+    {
+      "Sid": "ECRImageAccess",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:GetAuthorizationToken",
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:BatchGetImage"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
