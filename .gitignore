@@ -3,4 +3,5 @@
 __pycache__/
 *.egg-info/
 .pytest_cache/
+cdk.out/
 site-builder/config.ini

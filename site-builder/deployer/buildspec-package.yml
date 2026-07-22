@@ -1,0 +1,16 @@
+version: 0.2
+# 输入（环境变量，StartBuild 时传）：JOB_ID、ARTIFACTS_BUCKET。
+# 上传包 s3://$ARTIFACTS_BUCKET/uploads/$JOB_ID.zip（PoC 仅 nodejs22.x）
+# 输出：s3://$ARTIFACTS_BUCKET/artifacts/$JOB_ID/backend.zip
+# 注意：任何命令失败即构建失败——不得用 `|| true` 吞错。
+phases:
+  build:
+    commands:
+      - aws s3 cp "s3://$ARTIFACTS_BUCKET/uploads/$JOB_ID.zip" /tmp/site.zip
+      - mkdir -p /tmp/site && cd /tmp/site && unzip -q /tmp/site.zip
+      - test -f /tmp/site/run.sh  # 合同要求 run.sh 在 zip 根，缺失即失败
+      - cd /tmp/site/backend
+      - npm install --omit=dev --no-audit --no-fund
+      - cp /tmp/site/run.sh ./run.sh && chmod +x ./run.sh
+      - zip -qr /tmp/backend.zip .
+      - aws s3 cp /tmp/backend.zip "s3://$ARTIFACTS_BUCKET/artifacts/$JOB_ID/backend.zip"
