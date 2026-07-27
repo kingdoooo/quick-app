@@ -4,8 +4,9 @@
 单元测试（133 个）已完成并提交；本手册覆盖的是**需要真实 AWS 资源、DNS、飞书凭证**
 的部署门禁，无法自动化。
 
-- **目标账号**：`{account_id}` / `us-east-1`（Lambda@Edge、ACM、Quick Desktop 身份区域共同强制）
-- **域名**：`dsir.cc`（通配符 ACM 证书已就绪：`arn:aws:acm:us-east-1:{account_id}:certificate/2fc6413a-892c-4654-917e-78132db2ad10`，状态 ISSUED）
+- **前置要求**：见 [PREREQUISITES.md](PREREQUISITES.md)（区域/域名/证书/飞书应用/SSM/工具链），全部就绪后再开始
+- **区域**：`us-east-1`（Lambda@Edge、ACM、Quick Desktop 身份区域共同强制）
+- 下文 `<ACCOUNT_ID>`、`<BASE_DOMAIN>` 等占位符替换为你的实际值（与 config.ini 一致）
 - **中心配置**：`site-builder/config.ini`（gitignored，含真实值；部署过程中逐段回填）
 - 设计文档 `docs/superpowers/specs/2026-07-21-quick-site-builder-design.md`，实施计划 `docs/superpowers/plans/2026-07-21-quick-site-builder.md`
 
@@ -22,13 +23,14 @@
 依赖关系：②需要①产出的 JWT_SECRET（已在 SSM）与 edge role；④需要①的 boundary、②的 edge_role_arn、③的 DSQL endpoint；⑤需要④的 state_machine_arn 与①的 Cognito。
 
 前置检查（全部满足才开始）：
-- [x] AWS 凭证指向 {account_id} / us-east-1（`aws sts get-caller-identity`）
-- [x] `*.dsir.cc` ACM 证书 ISSUED
-- [x] SSM `/site-builder/jwt-secret` 已存在（SecureString）
-- [x] `dsir.cc` Route53 hosted zone 存在
+- [ ] AWS 凭证指向目标账号 / us-east-1（`aws sts get-caller-identity`）
+- [ ] `*.<BASE_DOMAIN>` ACM 证书 ISSUED（us-east-1）
+- [ ] SSM `/site-builder/jwt-secret` 已创建（SecureString）
+- [ ] `<BASE_DOMAIN>` DNS 可修改（Route53 hosted zone 或等价）
 - [ ] 飞书企业自建应用（App ID/Secret，权限：获取用户 userid、获取用户邮箱）
-- [ ] 本机 CDK CLI 用 `npx -y aws-cdk@latest`（全局 CLI 2.1100.1 过旧）
-- [ ] Docker 运行中（Task 17 执行器 Lambda 用 bundling 装 psycopg，需拉 x86_64 镜像）
+- [ ] 本机 CDK CLI 用 `npx -y aws-cdk@latest`（部分环境全局 CLI 过旧）
+- [ ] Docker 运行中（④ 执行器 Lambda 用 bundling 装 psycopg，需拉 x86_64 镜像）
+- [ ] `site-builder/config.ini` 与 `router/config.ini` 已从 `.example` 复制并填好
 
 ---
 
@@ -56,7 +58,7 @@
      --allowed-o-auth-flows code --allowed-o-auth-scopes openid email profile \
      --allowed-o-auth-flows-user-pool-client \
      --supported-identity-providers <IdP名> \
-     --callback-urls https://auth.dsir.cc/callback
+     --callback-urls https://auth.<BASE_DOMAIN>/callback
    # → 记录 ClientId 回填 [Cognito] site_client_id
 
    # MCP client（AgentCore 用；回调 URL 见 Task 20 spike 结论）
@@ -83,29 +85,29 @@
 
 ## ② 路由 + 鉴权层 — WebRouterStack（Task 8）
 
-**产出**：CloudFront 分发（`*.dsir.cc`）+ 扩展路由表 + 前端桶；回填 `config.ini [Deployer] edge_role_arn`。
+**产出**：CloudFront 分发（`*.<BASE_DOMAIN>`）+ 扩展路由表 + 前端桶；回填 `config.ini [Deployer] edge_role_arn`。
 
 `router/config.ini` 已配好真实值（account/domain/cert/frontend_bucket/base_domain）。
 
 1. 建私有前端桶（若不存在）：
    ```bash
-   aws s3api create-bucket --bucket site-frontend-{account_id} --region us-east-1
-   aws s3api put-public-access-block --bucket site-frontend-{account_id} \
+   aws s3api create-bucket --bucket site-frontend-<ACCOUNT_ID> --region us-east-1
+   aws s3api put-public-access-block --bucket site-frontend-<ACCOUNT_ID> \
      --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
    ```
 2. 部署栈（首次需先 bootstrap）：
    ```bash
    cd router/infrastructure
    python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -q
-   PATH=.venv/bin:$PATH npx -y aws-cdk@latest bootstrap aws://{account_id}/us-east-1   # 首次
+   PATH=.venv/bin:$PATH npx -y aws-cdk@latest bootstrap aws://<ACCOUNT_ID>/us-east-1   # 首次
    PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never
    ```
    stack.py 部署时会从 SSM 读真实 JWT_SECRET 注入 Edge 函数（`load_jwt_secret`）；若打印
    `SYNTH-ONLY-PLACEHOLDER` 警告说明 SSM 读取失败，**不要继续**——检查凭证与 SSM 参数。
 3. 记录 CfnOutput 的 **EdgeRoleArn**，回填 `site-builder/config.ini [Deployer] edge_role_arn`（Task 17 执行器需要它给站点 Function URL 授权）。记录 **DistributionDomainName**。
-4. DNS：在 Route53 `dsir.cc` 加通配符 CNAME 或 A-alias 指向 CloudFront 域名：
+4. DNS：在 `<BASE_DOMAIN>` 加通配符 CNAME 或 A-alias 指向 CloudFront 域名：
    ```
-   *.dsir.cc  →  <DistributionDomainName>  (如 d1234abcd.cloudfront.net)
+   *.<BASE_DOMAIN>  →  <DistributionDomainName>  (如 d1234abcd.cloudfront.net)
    ```
 5. **部署 auth-service Lambda**（Task 5 的登录端点，依赖①的 Cognito + 本步骤的路由表）：
    ```bash
@@ -115,7 +117,7 @@
    ```
 6. **冒烟**（CloudFront 传播需 15-30 分钟后再跑）：
    ```bash
-   cd /Users/kentpeng/projects/quick-app && bash site-builder/scripts/smoke_router.sh
+   cd <仓库根> && bash site-builder/scripts/smoke_router.sh
    ```
    预期 6 行 PASS：static route / no cross-site cache / auth 302 / auth subdomain api-only routing / unknown 404 / route update visible。
 
@@ -155,13 +157,13 @@ PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never
 
 **冒烟（手工触发一次 static 部署，验证执行器全链路）**：
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd <仓库根>
 RUN_E2E=1 site-builder/deployer/.venv/bin/pytest \
   site-builder/deployer/tests/test_e2e_fixtures.py::test_static_site_public_200 -q
 # 或用 deploy_fixture.py 直接跑：
 python3 site-builder/scripts/deploy_fixture.py site-builder/fixtures/static-hello
 ```
-预期：SFN execution SUCCEEDED，`curl https://app-<siteid>.dsir.cc/` 返回 fixture 首页。
+预期：SFN execution SUCCEEDED，`curl https://app-<siteid>.<BASE_DOMAIN>/` 返回 fixture 首页。
 
 **⚠️ Docker 拉镜像 403**：若 `public.ecr.aws` 凭证过期，先 `docker logout public.ecr.aws`
 再重试（bundling 用匿名拉取）。
@@ -225,7 +227,7 @@ claude mcp add --transport http site-builder-deploy <MCP_ENDPOINT_URL>
 
 ```bash
 # 前一天跑：全链路 E2E（用 JWT_SECRET mint 测试会话 cookie，自动化 CRUD，无需人工扫码）
-cd /Users/kentpeng/projects/quick-app
+cd <仓库根>
 RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/test_e2e_fixtures.py -q
 ```
 预期 4 passed：static 200、notes 未登录 302 + 登录后 CRUD + author=飞书邮箱、expenses DSQL CRUD、undeploy 后 404。
@@ -251,7 +253,7 @@ SSM 参数：`/site-builder/jwt-secret`（已存在）、`/site-builder/site-cli
 ## 已知限制与延后项（向客户声明）
 
 - Quick Desktop 为 preview、身份区域须 us-east-1
-- 顶域 cookie 使所有 `app-*.dsir.cc` 站点共享一次登录（PoC 可接受，产品化需按站点隔离会话）
+- 顶域 cookie 使所有 `app-*.<BASE_DOMAIN>` 站点共享一次登录（PoC 可接受，产品化需按站点隔离会话）
 - PoC 仅 Node.js 后端（Python 3.13 延后）；MCP 仅 OAuth（API Key fallback 延后）
 - CloudFront 全站禁缓存（正确性优先；精细缓存延后）
 - 详见设计文档 §8 风险 / §9 范围外
@@ -270,7 +272,7 @@ SSM 参数：`/site-builder/jwt-secret`（已存在）、`/site-builder/site-cli
 | `npm install` 执行站点 preinstall 脚本（CodeBuild 内任意代码执行） | `--ignore-scripts` + 删 `.npmrc` + 红线拦生命周期脚本 + CodeBuild 角色收窄到 `uploads/*` 只读、`artifacts/*` 只写 | 红线单测 + synth 确认无整桶读写 |
 | 站点 SQL 以 DSQL admin 执行，可跨 schema 读写/销毁 | 拆两个连接：admin 只引导 schema/role；站点提交的 SQL 以 per-site migrator role 执行 | 单测断言站点 DDL 绝不出现在 admin 连接；bootstrap SQL 过 DSQL linter |
 | `CREATE ROLE`/`AWS IAM GRANT` 裸 `except: pass` 吞真实错误 | 只容忍 duplicate（SQLSTATE 42710/42P06），其余抛出 | 单测覆盖 42601 语法错/42501 权限不足必抛 |
-| 回跳白名单可被 `https://evil.com\.dsir.cc/` 绕过 | 拒反斜杠 + 强制 https | 8 组用例；Python urlparse 与 Node WHATWG 解析差异实测 |
+| 回跳白名单可被 `https://evil.com\.<BASE_DOMAIN>/` 绕过 | 拒反斜杠 + 强制 https | 8 组用例；Python urlparse 与 Node WHATWG 解析差异实测 |
 
 **仍需真机验证**：`AWS IAM GRANT` 对真实 DSQL 的语法与幂等 sqlstate（③ 冒烟覆盖）；
 migrator role 的 `ALTER DEFAULT PRIVILEGES FOR ROLE` 是否被接受（失败无损，末尾有显式 GRANT 兜底）。

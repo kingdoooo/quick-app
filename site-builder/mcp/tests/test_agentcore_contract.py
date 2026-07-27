@@ -100,9 +100,9 @@ def test_caller_email_rejects_missing_and_malformed_authorization(monkeypatch):
         return base64.urlsafe_b64encode(_json.dumps(d).encode()).rstrip(b"=").decode()
 
     # 合法：带 email claim
-    tok = f"h.{_b64({'email': 'kent@dsir.cc'})}.sig"
+    tok = f"h.{_b64({'email': 'user@example.com'})}.sig"
     monkeypatch.setattr(server.mcp, "get_context", lambda: _Ctx(f"Bearer {tok}"))
-    assert server._caller_email() == "kent@dsir.cc"
+    assert server._caller_email() == "user@example.com"
 
     # 非法：token 有效但没有 email claim（Cognito access token 默认就是这样）
     tok2 = f"h.{_b64({'sub': 'abc', 'client_id': 'x'})}.sig"
