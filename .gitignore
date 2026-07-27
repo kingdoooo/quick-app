@@ -6,3 +6,7 @@ __pycache__/
 cdk.out/
 site-builder/config.ini
 site-builder/contract/build/
+# deploy_agentcore.py 构建时从 deployer/functions/ 复制进来，构建后删除；
+# 提交它会留下一份会漂移的副本
+site-builder/mcp/common.py
+.DS_Store

@@ -1,2 +1,4 @@
-mcp>=1.9
+# request_context.request（_caller_email 读 Authorization 头用）自 mcp 1.10.0 引入，
+# 1.9.x 上每次工具调用都会退化成"无法识别调用者身份"。
+mcp>=1.10
 boto3

@@ -168,19 +168,41 @@ python3 site-builder/scripts/deploy_fixture.py site-builder/fixtures/static-hell
 
 ---
 
-## ⑤ 部署 MCP — AgentCore Runtime（Task 20，含 Spike）
+## ⑤ 部署 MCP — AgentCore Runtime（Task 20）
 
-**先读 spike 报告** `site-builder/.superpowers/sdd/task-20-spike-report.md`（或 `.superpowers/sdd/`），
-它确定了 AgentCore 如何向容器透传 Cognito email claim，以及 `server.py` 的 `_caller_email()`
-确切实现。**当前 server.py 用的 `get_http_headers` 是 fastmcp 2.x API，官方 mcp SDK 里没有——
-真实 HTTP 调用会 ImportError，必须按 spike 结论先修再部署。**
+**代码已就绪并在本地真实容器里验证过**（ARM64 镜像构建 → 起容器 → 完整 MCP
+握手 → Bearer token 的 email claim 被 `_caller_email()` 正确解出 → 平台注入的
+`Mcp-Session-Id` 被容忍）。`get_http_headers` 问题早已按 spike 结论修掉，
+详见 `site-builder/mcp/AGENTCORE-SPIKE.md`。
 
-修好 `_caller_email()` 后：
-1. Dockerfile（ARM64 容器，AgentCore 要求）已在 `site-builder/mcp/`（若无按 plan Task 20 Step 1 建）
-2. 部署脚本 `deploy_agentcore.py`：cp deployer/functions/common.py 进构建上下文 → `docker buildx --platform linux/arm64` build+push ECR → `create_agent_runtime`（protocolConfiguration serverProtocol=MCP，authorizerConfiguration customJWTAuthorizer 指向 Cognito discovery URL + allowedClients=[mcp_client_id]，环境变量注入 JOBS_TABLE/SITES_TABLE/ARTIFACTS_BUCKET/STATE_MACHINE_ARN/BASE_DOMAIN 等）
-3. Runtime 执行角色：复用 exec-role 权限模式 + `states:StartExecution` + `lambda:InvokeFunction`（undeploy）
-4. 回填 `config.ini [MCP] endpoint_url`
-5. **冒烟**：`npx @modelcontextprotocol/inspector` 连 endpoint（带 Cognito Bearer token），确认列出 5 工具、无 token 返回 401、`list_my_sites` 的 owner == 登录用户飞书邮箱（验证 email claim 透传）。
+**前置**：④ 的 `state_machine_arn`、① 的 `mcp_client_id` / `user_pool_id` 必须已回填。
+
+```bash
+cd site-builder/mcp
+python3 deploy_agentcore.py        # 建 ECR → buildx ARM64 → 推送 → 建角色 → 建/更新 runtime
+# 只改配置不重建镜像：python3 deploy_agentcore.py --skip-build
+```
+
+脚本做的事（全部幂等）：ECR 仓库 → cp `deployer/functions/common.py` 进构建上下文 →
+`docker buildx --platform linux/arm64` 构建推送 → runtime 执行角色
+（jobs/sites 表、`uploads/*` presign、`states:StartExecution`、undeploy `lambda:InvokeFunction`）→
+`create_agent_runtime`（`serverProtocol=MCP`、Cognito `customJWTAuthorizer`、
+`requestHeaderAllowlist=["Authorization"]`）。运行结束会打印要回填的
+`[MCP] endpoint_url`。
+
+**三个契约要点**（违反的症状都是"部署完才发现连不上"，已由 `tests/test_agentcore_contract.py` 锁定）：
+- 容器必须 **ARM64**，监听 **0.0.0.0:8000**、暴露 **POST /mcp**、**stateless** streamable-http；
+- `Authorization` 必须显式进 `requestHeaderAllowlist`，否则平台不透传该头，
+  所有工具报"无法识别调用者身份"；而透传 `Authorization` 又要求配 `customJWTAuthorizer`；
+- `agentRuntimeName` 只允许 `[a-zA-Z][a-zA-Z0-9_]{0,47}`（连字符会被 API 拒）。
+
+**冒烟**：`npx @modelcontextprotocol/inspector` 连 endpoint（带 Cognito Bearer token），
+确认列出 5 工具、无 token 返回 401、`list_my_sites` 的 owner == 登录用户飞书邮箱。
+
+**⚠️ 唯一待真机确认项**：AgentCore 透传的是 id_token 还是 access token。Cognito
+access token 默认**不含 email**——若 owner 取不到，改用
+`allowedAudience=[mcp_client_id]`（id_token 用 `aud`）或加 pre-token-generation
+Lambda 注入 email。处置办法见 `site-builder/docs/client-setup.md`。
 
 ---
 
@@ -193,7 +215,9 @@ claude mcp add --transport http site-builder-deploy <MCP_ENDPOINT_URL>
 ```
 新会话提示："用 site-builder 技能给我做一个团队读书清单站点，能加书标记读完，全组织可看，做完部署" → 应走完 Skill 工作流 → MCP 部署 → 返回 URL → 浏览器飞书登录 + 加书验证。
 
-**Quick Desktop（人工，核心演示通道）**：导入 site-builder Skill + Capabilities→MCP 添加 endpoint（OAuth 走飞书登录）。记录差异到 `site-builder/docs/client-setup.md`。
+**Quick Desktop（人工，核心演示通道）**：导入 site-builder Skill + Capabilities→MCP 添加 endpoint（OAuth 走飞书登录）。
+
+完整步骤、逐客户端冒烟清单与 email claim 排查办法见 **[docs/client-setup.md](docs/client-setup.md)**。
 
 ---
 

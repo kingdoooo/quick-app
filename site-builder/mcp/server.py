@@ -3,11 +3,21 @@
 import json
 import os
 import re
+import sys
+from pathlib import Path
 
 import boto3
 from mcp.server.fastmcp import FastMCP
 
-import common  # deployer/functions/common.py，部署包中同目录
+# common.py 来自 deployer/functions/：容器构建时 cp 到本目录（见 Dockerfile），
+# 本地开发/单测则从源码树取。两条路径都显式加进 sys.path，避免"单测能过、
+# 容器里 ModuleNotFoundError"。
+sys.path.insert(0, str(Path(__file__).parent))
+_DEV_COMMON = Path(__file__).parents[1] / "deployer" / "functions"
+if not (Path(__file__).parent / "common.py").exists() and _DEV_COMMON.is_dir():
+    sys.path.insert(0, str(_DEV_COMMON))
+
+import common  # noqa: E402  deployer/functions/common.py
 
 # 平台生成的 site_id 形态：<name(≤20)>-<6 位随机小写数字>
 SITE_ID_RE = re.compile(r"[a-z][a-z0-9-]{0,19}-[a-z0-9]{6}")
@@ -135,7 +145,11 @@ def do_undeploy(owner: str, site_id: str) -> dict:
 
 # ---------- MCP 壳 ----------
 
-mcp = FastMCP("site-builder-deploy", stateless_http=True)
+# AgentCore Runtime 契约：容器必须监听 0.0.0.0:8000 并暴露 POST /mcp，
+# 且用 stateless streamable-http（平台为每个请求注入 Mcp-Session-Id 做会话隔离）。
+# FastMCP 默认绑 127.0.0.1，在容器里平台探测不到。
+mcp = FastMCP("site-builder-deploy", stateless_http=True,
+              host="0.0.0.0", port=8000)
 
 
 def _caller_email() -> str:
@@ -200,4 +214,5 @@ def undeploy_site(site_id: str) -> dict:
 
 
 if __name__ == "__main__":
+    # streamable-http 挂在 /mcp（FastMCP 默认 streamable_http_path）
     mcp.run(transport="streamable-http")
