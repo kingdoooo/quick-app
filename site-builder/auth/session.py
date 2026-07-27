@@ -1,5 +1,6 @@
 """站点会话 JWT（HS256）——纯标准库实现。
-Edge 函数（manus origin_request.py）内嵌同一算法验签，改动此处须同步 Task 7。"""
+路由层 Edge 函数（infrastructure/lambda/origin_request.py）内嵌同一算法验签，
+两处必须字节等价——改动此处务必同步那边。"""
 import base64
 import hashlib
 import hmac

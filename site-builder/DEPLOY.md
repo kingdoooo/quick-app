@@ -81,7 +81,7 @@
 
 ---
 
-## ② 路由 + 鉴权层 — manus WebRouterStack（Task 8）
+## ② 路由 + 鉴权层 — WebRouterStack（Task 8）
 
 **产出**：CloudFront 分发（`*.dsir.cc`）+ 扩展路由表 + 前端桶；回填 `config.ini [Deployer] edge_role_arn`。
 

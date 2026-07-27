@@ -98,7 +98,7 @@ base_domain = example.com
 # ============================================================================
 [Tags]
 # Project name - used for grouping resources
-project = manus-web-application
+project = site-builder
 # Environment (e.g., production, staging, development)
 environment = production
 # Managed by (e.g., cdk, terraform, manual)

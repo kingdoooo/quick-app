@@ -23,7 +23,7 @@ DOMAIN_NAME = "jendencrazy.win"
 
 # 资源标签
 TAGS = {
-    "project": "manus-web-application",
+    "project": "site-builder",
     "environment": "test",
     "managed_by": "script"
 }

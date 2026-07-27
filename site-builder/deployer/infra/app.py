@@ -140,7 +140,7 @@ class SiteDeployerStack(Stack):
             "ROUTING_TABLE": CFG["Platform"]["routing_table"],
             "BASE_DOMAIN": CFG["Platform"]["base_domain"],
             "RUNTIME_BOUNDARY_ARN": runtime_boundary.managed_policy_arn,
-            # manus 栈 CfnOutput 回填；deploy 前需在 config.ini [Deployer] 填入
+            # 路由层栈 CfnOutput 回填；deploy 前需在 config.ini [Deployer] 填入
             # edge_role_arn（synth 阶段允许空字符串）
             "EDGE_ROLE_ARN": CFG["Deployer"]["edge_role_arn"],
             "PACKAGE_PROJECT": package_project.project_name,

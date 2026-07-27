@@ -70,7 +70,7 @@ Agent 客户端）里用自然语言开发简易全栈站点，说一句"部署"
 | `site-builder/skills/site-builder/` | 建站 Skill 包（SKILL.md + 合同/红线文档 + 模板） |
 | `site-builder/fixtures/` | 三档黄金样例站点（全部通过合同校验，兼演示素材） |
 | `site-builder/scripts/` | smoke_router.sh（路由层冒烟）、deploy_fixture.py |
-| `manus-web-application-main/` | 路由层（在参考项目上改造：分流/鉴权/禁缓存） |
+| `manus-web-application-main/` | 路由层：CloudFront + Lambda@Edge 分流/鉴权/禁缓存（目录名沿用上游参考项目，内容已改造） |
 
 ## 测试与质量
 
