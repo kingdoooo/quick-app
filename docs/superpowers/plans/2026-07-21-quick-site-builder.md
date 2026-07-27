@@ -4,7 +4,7 @@
 
 **Goal:** 业务人员在 Quick Desktop（或任意支持 Skill+MCP 的 Agent 客户端）开发的简易全栈站点，一键部署到 AWS 并获得 `https://app-xxx.<域名>`，站点访问与管理权限绑定飞书账号。
 
-**Architecture:** 五组件：① site-builder Skill（部署合同）→ ② AgentCore 部署 MCP（薄壳，4 工具）→ ③ Step Functions 异步执行器（校验→建库→CodeBuild 打包→建 Lambda→传 S3→注册路由→冒烟）→ ④ manus 路由层改造（Lambda@Edge 查路由+验飞书会话 JWT）→ ⑤ Cognito+飞书 OIDC 身份层（复用 feishu-quick-sso）。
+**Architecture:** 五组件：① site-builder Skill（部署合同）→ ② AgentCore 部署 MCP（薄壳，4 工具）→ ③ Step Functions 异步执行器（校验→建库→CodeBuild 打包→建 Lambda→传 S3→注册路由→冒烟）→ ④ 路由层改造（`router/`，Lambda@Edge 查路由+验飞书会话 JWT）→ ⑤ Cognito+飞书 OIDC 身份层（复用 feishu-quick-sso）。
 
 **Tech Stack:** Python 3.11+（CDK v2 / Lambda / pytest）、Node.js 22（站点后端模板）、Aurora DSQL、DynamoDB、Step Functions、CodeBuild、Lambda Web Adapter（zip+Layer）、Bedrock AgentCore Runtime（MCP protocol）、Cognito、飞书开放平台。
 
@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - 全部资源部署在 `us-east-1`（Lambda@Edge / ACM / Quick Desktop 身份区域共同强制）。
-- 站点资源命名前缀一律 `site-`；IAM policy 按该前缀限权（沿用 manus `*WebRouterStack*` 模式）。
+- 站点资源命名前缀一律 `site-`；IAM policy 按该前缀限权（沿用路由层栈 `*WebRouterStack*` 模式）。
 - 站点后端 runtime **PoC 仅 `nodejs22.x`**（Python 记为二期）；部署形态仅 zip + LWA Layer，**禁止 Docker 镜像模式**。
 - LWA Layer ARN（精确值）：`arn:aws:lambda:us-east-1:753240598075:layer:LambdaAdapterLayerX86:28`；zip 模式必须设 `AWS_LAMBDA_EXEC_WRAPPER=/opt/bootstrap`、`PORT=8080`，handler 为 `run.sh`。
 - tier 枚举：`static` | `fullstack-nosql` | `fullstack-sql`；database.engine 枚举：`none` | `dynamodb` | `dsql`。
@@ -109,7 +109,7 @@ quick-app/                                    # 仓库根（已 git init）
 | P1 | 5 | auth-service Lambda（/login /callback /logout）+ 部署 |
 | P2 路由层(M2) | 6 | Edge 函数：路由表扩展 + static/api 分流 + S3 SigV4 |
 | P2 | 7 | Edge 函数：JWT 鉴权 + 302 + 头注入/剥除 |
-| P2 | 8 | manus CDK 栈更新部署 + 路由层冒烟 |
+| P2 | 8 | 路由层 CDK 栈更新部署 + 路由层冒烟 |
 | P3 执行器(M3) | 9 | deployer 基础设施 CDK（表/桶/角色/CodeBuild 项目） |
 | P3 | 10 | common.py（任务/站点表访问层） |
 | P3 | 11 | validate 步骤（解包 + 合同校验） |
@@ -978,7 +978,7 @@ Expected: 11 passed（session 5 + handler 6）
 
 - [ ] **Step 5: 写部署脚本**
 
-`site-builder/auth/deploy_auth.py`（模式仿 manus `scripts/deploy_lambda.py`，boto3 直建）：
+`site-builder/auth/deploy_auth.py`（模式仿参考项目的 boto3 直建部署脚本）：
 
 ```python
 """部署 auth-service：打 zip（session.py+login_handler.py+pyjwt 依赖）→ 建/更新 Lambda
@@ -1105,16 +1105,16 @@ git add site-builder/auth
 git commit -m "feat(auth): site login service (Cognito hosted UI + top-domain session cookie)"
 ```
 
-## Phase P2：路由 + 鉴权层（M2，manus 项目就地改造）
+## Phase P2：路由 + 鉴权层（M2，`router/` 就地改造）
 
 ### Task 6: Edge 函数——路由表扩展 + 分流 + body 签名 + fail-closed
 
-manus 现有 `origin_request.py` 只有单一 `target_url`。本任务改为：
+参考项目原有 `origin_request.py` 只有单一 `target_url`。本任务改为：
 - 路由 item 含 `route_mode`（`split`/`api-only`）、`static_prefix`（S3 **版本化**前缀 `sites/{site_id}/{job_id}`）与 `api_target`（Function URL）。
 - `split`：URI 以 `/api/` 开头走 api_target（SigV4），否则改写到共享前端桶 S3 REST 端点（桶私有，Edge 执行角色对 S3 GET 做 SigV4——与现有 `_add_sigv4_auth` 同机制，service 换 `s3`）；URI 无扩展名映射 `index.html`（SPA）。
 - `api-only`：全路径走 api_target（auth 子域用）。
 - **带 body 的 SigV4**：CloudFront 在 `include_body=True` 时以 base64 提供 body——签名前解码并作为 payload 参与 hash；`body.inputTruncated` 为真时直接返回 413（Lambda@Edge origin-request body 上限 1MB）。
-- **fail-closed**：`lambda_handler` 顶层异常返回 500 响应，绝不透传原请求（原 manus 行为是 return request——安全边界不允许）。
+- **fail-closed**：`lambda_handler` 顶层异常返回 500 响应，绝不透传原请求（参考项目原行为是 return request——安全边界不允许）。
 
 **Files:**
 - Modify: `router/infrastructure/lambda/origin_request.py`
@@ -1354,7 +1354,7 @@ def _add_s3_sigv4_auth(request, domain: str, uri: str) -> None:
             request["headers"][h.lower()] = [{"key": h, "value": v}]
 ```
 
-`lambda_handler` 主干替换为（**fail-closed**——原 manus 异常时 `return request` 会绕过鉴权落到默认 origin，安全边界不允许）：
+`lambda_handler` 主干替换为（**fail-closed**——参考项目原实现异常时 `return request` 会绕过鉴权落到默认 origin，安全边界不允许）：
 
 ```python
 def _server_error() -> dict:
@@ -1616,7 +1616,7 @@ git add router/infrastructure/lambda
 git commit -m "feat(router): edge session auth with header injection and spoof stripping"
 ```
 
-### Task 8: manus CDK 栈更新部署 + 路由层冒烟
+### Task 8: 路由层 CDK 栈更新部署 + 路由层冒烟
 
 **Files:**
 - Modify: `router/infrastructure/stack.py`
@@ -1694,7 +1694,7 @@ aws s3api put-public-access-block --bucket site-frontend-<ACCOUNT_ID> \
 cd router/infrastructure && source .venv/bin/activate && cdk deploy --require-approval never
 ```
 
-Expected: 栈更新成功（Lambda@Edge 新版本发布，CloudFront 传播 15-30 分钟）。若首次部署：先按 manus README 完成 `config.ini` 全量配置 + `cdk bootstrap` + DNS CNAME。
+Expected: 栈更新成功（Lambda@Edge 新版本发布，CloudFront 传播 15-30 分钟）。若首次部署：先按参考项目 README 完成 `config.ini` 全量配置 + `cdk bootstrap` + DNS CNAME。
 
 - [ ] **Step 3: 写冒烟脚本**
 
@@ -2803,7 +2803,7 @@ git commit -m "feat(deployer): codebuild packaging step with sync wait"
 - Test: `site-builder/deployer/tests/test_deploy_lambda_site.py`
 
 **Interfaces:**
-- Consumes: `event["backend_zip_key"]`、`event["env_vars"]`（DB 注入）、`RUNTIME_BOUNDARY_ARN`、`EDGE_ROLE_ARN`（manus 栈 CfnOutput，config.ini 回填）
+- Consumes: `event["backend_zip_key"]`、`event["env_vars"]`（DB 注入）、`RUNTIME_BOUNDARY_ARN`、`EDGE_ROLE_ARN`（路由层栈 CfnOutput，config.ini 回填）
 - Produces: handler 透传 event，追加 `event["api_target"]`。两个动作：
   1. **建 per-site 执行角色 `site-rt-{site_id}`**（幂等）：trust=lambda.amazonaws.com，`PermissionsBoundary=RUNTIME_BOUNDARY_ARN`（IAM policy 强制，缺 boundary 的 CreateRole 会被拒），inline policy 按 tier 精确到本站点资源——dynamodb tier：仅 `site-data-{site_id}-*` 表 CRUD；dsql tier：仅 `dsql:DbConnect`（非 admin）；外加本函数日志组。
   2. 建/更新函数 `site-{site_id}`：LWA Layer（精确 ARN）、Handler=`run.sh`、`AWS_LAMBDA_EXEC_WRAPPER=/opt/bootstrap`、`PORT=8080`、`AWS_LWA_INVOKE_MODE=BUFFERED`、MemorySize=512、Timeout=30、Role=该站点角色；Function URL AuthType=AWS_IAM，resource policy **Principal 精确到 Edge 执行角色 ARN**（`lambda:InvokeFunctionUrl` + condition `lambda:FunctionUrlAuthType=AWS_IAM`；**无 `*` fallback**——EDGE_ROLE_ARN 缺失直接抛错）。幂等：存在则 update code + config。
@@ -3016,7 +3016,7 @@ def handler(event, context):
     return event
 ```
 
-配套：Task 8 的 manus stack.py 需为 edge role 加 `CfnOutput(self, "EdgeRoleArn", value=edge_role.role_arn)`，值回填 config.ini `[Deployer] edge_role_arn`，Task 17 作为 `EDGE_ROLE_ARN` 环境变量传入。Task 17 的 undeploy 同步补删 `site-rt-{site_id}` 角色（先 delete_role_policy 再 delete_role，容忍不存在）。
+配套：Task 8 的路由层 stack.py 需为 edge role 加 `CfnOutput(self, "EdgeRoleArn", value=edge_role.role_arn)`，值回填 config.ini `[Deployer] edge_role_arn`，Task 17 作为 `EDGE_ROLE_ARN` 环境变量传入。Task 17 的 undeploy 同步补删 `site-rt-{site_id}` 角色（先 delete_role_policy 再 delete_role，容忍不存在）。
 
 - [ ] **Step 4: 运行确认通过**
 
@@ -3466,7 +3466,7 @@ Run: `.venv/bin/pytest tests/test_undeploy.py -q` → 1 passed
             "ROUTING_TABLE": CFG["Platform"]["routing_table"],
             "BASE_DOMAIN": CFG["Platform"]["base_domain"],
             "RUNTIME_BOUNDARY_ARN": runtime_boundary.managed_policy_arn,
-            "EDGE_ROLE_ARN": CFG["Deployer"]["edge_role_arn"],  # manus 栈 CfnOutput 回填
+            "EDGE_ROLE_ARN": CFG["Deployer"]["edge_role_arn"],  # 路由层栈 CfnOutput 回填
             "PACKAGE_PROJECT": package_project.project_name,
             "DSQL_ENDPOINT": CFG["DSQL"]["cluster_endpoint"],
             "ACCOUNT_ID": ACCOUNT,
@@ -4588,7 +4588,7 @@ git commit -m "docs: end-to-end demo script with rehearsal checklist"
   - P0-2 auth 子域路由 → 路由表 `route_mode` 字段（api-only），Task 5/6/8 联动，公网地址验收
   - P0-3 body 签名 → `include_body=True` + base64 解码参与 SigV4 + 413（Task 6/8），E2E 真实 JSON POST 断言
   - P0-4 DSQL 身份/隔离 → per-site IAM role（boundary 强制）+ per-site PG role + 非 admin token（Task 9/13/15/17/18 联动）
-  - P1：Edge fail-closed 500；Function URL Principal 精确到 Edge role 无 fallback；OAuth state HMAC+过期、id_token JWKS 验签；confirm_upload 条件迁移 + SFN execution name=job_id；migration 逐文件记录；前端版本化前缀+原子切流；S3 paginator；smoke 禁跟随重定向按 auth 态断言；Task 17 状态机重写为可 synth 结构（Pass 汇合点）；Task 0 纳管 manus 目录
+  - P1：Edge fail-closed 500；Function URL Principal 精确到 Edge role 无 fallback；OAuth state HMAC+过期、id_token JWKS 验签；confirm_upload 条件迁移 + SFN execution name=job_id；migration 逐文件记录；前端版本化前缀+原子切流；S3 paginator；smoke 禁跟随重定向按 auth 态断言；Task 17 状态机重写为可 synth 结构（Pass 汇合点）；Task 0 纳管路由层目录
   - 次要：sqlparse 拆语句、连接 try/finally、buildspec 去 `|| true`、zip bomb 三重限制、上传 50MB 校验、回跳保留 querystring、notes fixture textContent 渲染 + innerHTML 红线、tables 校验（命名/去重/上限）
   - 范围收敛：PoC 仅 nodejs22.x（Python → 二期）；MCP 工具面 5 个（spec 已同步）；API Key fallback → 二期
 - **有意保留的偏差**：presigned PUT 无法带 content-length-range（那是 POST policy 的能力）——改为 confirm_upload HeadObject 后置校验；PKCE/nonce 二期（confidential client + 签名 state 覆盖 PoC 威胁模型）；旧版本前端由 mark_job 成功后清理而非生命周期（生命周期按对象年龄会误删在线版本）。

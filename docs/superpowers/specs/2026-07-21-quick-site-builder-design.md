@@ -6,7 +6,7 @@
 
 ## 1. 背景与目标
 
-客户业务人员使用 Amazon Quick Desktop（飞书 SSO 登录）开发带 Web 前端 + 数据库后端的简易站点，不希望用 EC2/RDS 等重资产部署。目标是提供类似 manus 的体验：开发完成后一键部署，拿到可分享的子域名 URL，站点访问和管理权限与飞书账号结合。
+客户业务人员使用 Amazon Quick Desktop（飞书 SSO 登录）开发带 Web 前端 + 数据库后端的简易站点，不希望用 EC2/RDS 等重资产部署。目标是提供“开发完即得可分享 URL”的体验：开发完成后一键部署，拿到可分享的子域名 URL，站点访问和管理权限与飞书账号结合。
 
 **成功标准（端到端演示链路）**：业务人员在 Quick Desktop（飞书 SSO 登录）里用自然语言开发一个带数据库的小站点 → 说"部署" → 拿到 `https://app-xxx.<域名>` → 用飞书账号登录该站点 → 增删改查数据——全程不碰 AWS 控制台。
 
@@ -53,8 +53,8 @@
 ### 关键设计决策
 
 1. **不做代码生成**。代码生成由 Quick Desktop（或 Quick 集成的 Claude Code / Kiro）完成——这是 Quick 的价值所在。本方案只做 Quick 做不了的"部署到 AWS"一段。参考项目 Solution 2 的 Strands Agent / Code Interpreter / Model Router 整体不引入。
-2. **manus Solution 1（子域名路由）复用改造**：Lambda@Edge 查路由后增加 auth 策略检查（路由表加 `require_auth` / `allowed_users` / `owner` / `route_mode` 字段）。**CloudFront 全站禁用缓存（CACHING_DISABLED）**——origin-request 事件只在 cache miss 时执行，任何缓存都会绕过鉴权并可能跨子域串内容；PoC 流量下无缓存的成本影响可忽略，精细缓存（viewer-request 鉴权 + cache key 分区）记为二期。
-3. **后端部署走 zip + Lambda Web Adapter Layer，不用容器镜像**。manus README 记录的 LWA 失败全部是 Docker 镜像模式（`exec format error` 为镜像架构问题）；参考文档 Solution 2 实测 zip + 公开 Layer ARN（`arn:aws:lambda:<region>:753240598075:layer:LambdaAdapterLayerX86:28`）路线可行，且免去 ECR/Docker 构建链。
+2. **参考项目的子域名路由方案复用改造**（`router/`）：Lambda@Edge 查路由后增加 auth 策略检查（路由表加 `require_auth` / `allowed_users` / `owner` / `route_mode` 字段）。**CloudFront 全站禁用缓存（CACHING_DISABLED）**——origin-request 事件只在 cache miss 时执行，任何缓存都会绕过鉴权并可能跨子域串内容；PoC 流量下无缓存的成本影响可忽略，精细缓存（viewer-request 鉴权 + cache key 分区）记为二期。
+3. **后端部署走 zip + Lambda Web Adapter Layer，不用容器镜像**。参考项目记录的 LWA 失败全部是 Docker 镜像模式（`exec format error` 为镜像架构问题）；参考文档 Solution 2 实测 zip + 公开 Layer ARN（`arn:aws:lambda:<region>:753240598075:layer:LambdaAdapterLayerX86:28`）路线可行，且免去 ECR/Docker 构建链。
 4. **部署异步化**规避 Quick MCP 60 秒工具调用超时（HTTP 424）：`deploy_site` 提交即返回 jobId，Skill 轮询 `get_deploy_status`。
 5. **站点代码零 auth 逻辑**：鉴权统一在边缘做，生成代码越少越不容易错，最符合业务人员场景。
 6. **一套 Cognito 三个消费方**：飞书身份贯穿全链路——部署时知道"谁部署的"，访问时知道"谁在访问"。
@@ -180,11 +180,11 @@ my-site/
 - **幂等与更新**：同一 siteId 重复 `deploy_site` = 更新部署。Step Functions execution name = jobId（同一 job 重复启动被 SFN 拒绝），confirm_upload 前置 jobs 表条件更新 PENDING→RUNNING（重复确认直接报错）。schema 演进约定：首次部署执行 `schema.sql`；后续变更写在 `migrations/NNN_*.sql`，执行器按序号执行未跑过的文件，**每执行完一个文件立即记录**（中途失败不重复执行已完成的）。前端发布走版本化前缀 + 路由原子切换（见 §3.4）。subdomain 不变，站点 URL 稳定。
 - **任务表**（DynamoDB `deploy-jobs`）：`jobId, siteId, owner(飞书email), status, phase, error, url, timestamps`。
 - **产物防护**：confirm_upload 时 HeadObject 校验 zip 本体 ≤50MB；validate 步骤校验解压后总大小（≤200MB）、文件数（≤2000）、压缩比（≤100:1，防 zip bomb）。（presigned PUT 不支持 content-length-range 条件——那是 presigned POST 的能力，故校验后置。）
-- **权限模型**：执行器角色是全系统权限最大者，所有创建的资源强制 `site-*` 命名前缀 + 项目标签，IAM policy 按前缀限定（沿用 manus 项目 `*WebRouterStack*` 最小权限模式）。S3 批量操作一律走 paginator + 每批 ≤1000 对象。
+- **权限模型**：执行器角色是全系统权限最大者，所有创建的资源强制 `site-*` 命名前缀 + 项目标签，IAM policy 按前缀限定（沿用路由层栈 `*WebRouterStack*` 的最小权限模式）。S3 批量操作一律走 paginator + 每批 ≤1000 对象。
 
-### 3.4 路由 + 鉴权层（manus 复用改造）
+### 3.4 路由 + 鉴权层（`router/`，参考项目复用改造）
 
-路由表（DynamoDB）在 manus 原表基础上扩展：
+路由表（DynamoDB）在参考项目原表基础上扩展：
 
 ```
 subdomain (PK) | route_mode ("split" | "api-only") | static_prefix (S3 版本化前缀)
@@ -217,7 +217,7 @@ Lambda@Edge（origin-request）判定顺序：
 
 技术要点：
 
-- **Edge 内 JWT 验证**：不引入 JWT 库，用 Python 标准库 `hmac`/`hashlib` 验 HS256（manus 的 Edge 函数为 Python 3.11）；签名密钥在部署时字符串替换注入（manus 已有该机制，Lambda@Edge 不支持环境变量）。纯本地验签、零网络往返，1MB 代码限制内可行。
+- **Edge 内 JWT 验证**：不引入 JWT 库，用 Python 标准库 `hmac`/`hashlib` 验 HS256（路由层 Edge 函数为 Python 3.11）；签名密钥在部署时字符串替换注入（参考项目已有该机制，Lambda@Edge 不支持环境变量）。纯本地验签、零网络往返，1MB 代码限制内可行。
 - **`allowed_users: "org"`**：仅要求"能通过本飞书组织 OAuth 的有效用户"，不查名单；名单模式逐邮箱比对；owner 隐式在名单内。
 - 客户端注入的 `x-user-email` / `x-user-name` 头在 Edge 层无条件剥除后再注入，防伪造。
 
@@ -298,7 +298,7 @@ OAuth 回调安全要求：
 
 1. **Quick Desktop 为 preview、身份区域须 us-east-1**——本方案全栈锚 us-east-1（Lambda@Edge/ACM 本就强制），一致；但 preview 状态需向客户声明。
 2. **DSQL PG 兼容性子集**（无外键约束、无 SERIAL 等）——靠 Skill 红线规避；生成代码若触碰会在 schema 执行阶段显式失败，错误可读。
-3. **LWA zip+Layer 路线**已被参考项目实测可行，但 manus README 的容器路线失败记录提示：不要退回 Docker 镜像模式。
+3. **LWA zip+Layer 路线**已被参考项目实测可行，但参考项目的容器路线失败记录提示：不要退回 Docker 镜像模式。
 4. **顶域 cookie 共享登录**意味着任意 `app-*` 站点共享会话——PoC 可接受（同一组织内部），产品化需评估按站点隔离会话。
 5. **Edge 函数 1MB 限制**——JWT 验签用内置 crypto 可控；后续功能膨胀需警惕。
 6. **MCP OAuth 依赖客户端支持**——Quick/主流客户端支持；不支持时降级 API Key。
@@ -322,7 +322,7 @@ OAuth 回调安全要求：
 | 模块 | 内容 | 依赖 |
 |---|---|---|
 | M1 身份层 | 部署 feishu-quick-sso（Cognito + 飞书适配器），验证 Quick Web/Desktop 登录 | 飞书企业应用 |
-| M2 路由层 | manus CDK 栈部署 + Edge 鉴权改造 + 路由表扩展 | ACM/DNS、M1（JWT 密钥/登录端点） |
+| M2 路由层 | `router/` CDK 栈部署 + Edge 鉴权改造 + 路由表扩展 | ACM/DNS、M1（JWT 密钥/登录端点） |
 | M3 执行器 | Step Functions + 校验器 + CodeBuild + DSQL/DynamoDB 开通 + 三个 fixture 站点 | 无（可并行先行） |
 | M4 部署 MCP | AgentCore Runtime 四工具 + Cognito OAuth | M1、M3 |
 | M5 建站 Skill | site-builder Skill（合同 + 红线 + 工作流），三客户端冒烟 | M4 |
