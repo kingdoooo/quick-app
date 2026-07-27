@@ -85,7 +85,7 @@
 
 **产出**：CloudFront 分发（`*.dsir.cc`）+ 扩展路由表 + 前端桶；回填 `config.ini [Deployer] edge_role_arn`。
 
-`manus-web-application-main/config.ini` 已配好真实值（account/domain/cert/frontend_bucket/base_domain）。
+`router/config.ini` 已配好真实值（account/domain/cert/frontend_bucket/base_domain）。
 
 1. 建私有前端桶（若不存在）：
    ```bash
@@ -95,7 +95,7 @@
    ```
 2. 部署栈（首次需先 bootstrap）：
    ```bash
-   cd manus-web-application-main/infrastructure
+   cd router/infrastructure
    python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -q
    PATH=.venv/bin:$PATH npx -y aws-cdk@latest bootstrap aws://{account_id}/us-east-1   # 首次
    PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never

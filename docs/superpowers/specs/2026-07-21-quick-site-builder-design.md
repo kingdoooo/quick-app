@@ -13,7 +13,7 @@
 **参考资料**：
 - 飞书文档《AI Coding Agent 建站平台：三大基础设施模式深度拆解》（YDkddDkyHovVv2xJkU6c6BxcnJd）
 - 飞书文档《Coding Agent 建站平台 — 技术路径拆解》（RmVPd8X71oh0pvxXo0Wc2HHSnUb，Solution 1/2 拼合方案）
-- 本地项目 `manus-web-application-main`（CloudFront + Lambda@Edge + DynamoDB 子域名路由，即 Solution 1）
+- 本地项目 `router`（CloudFront + Lambda@Edge + DynamoDB 子域名路由，即 Solution 1）
 - [aws/aws-lambda-web-adapter](https://github.com/aws/aws-lambda-web-adapter)
 - 飞书 × Quick 集成调研笔记 `~/learning/topics/004-amazon-quick-feishu-integration/README.md`（含 SSO 两条路线、MCP 三方案）
 
@@ -39,7 +39,7 @@
 └──────────────────────────┬──────────────────────────────────┘
                            │ 写路由表（subdomain → targets + auth 策略）
 ┌──────────────────────────▼──────────────────────────────────┐
-│ ④ 路由 + 鉴权层（manus-web-application 复用改造）             │
+│ ④ 路由 + 鉴权层（router/，参考项目复用改造）                   │
 │    CloudFront(*.域名) → Lambda@Edge：查路由 + 验飞书会话      │
 └──────────────────────────┬──────────────────────────────────┘
                            │ 未登录跳转

@@ -5,7 +5,7 @@ Agent 客户端）里用自然语言开发简易全栈站点，说一句"部署"
 `https://app-xxx.dsir.cc` 的可分享 URL；站点访问与管理权限绑定**飞书账号**。
 全程不接触 AWS 控制台，无 EC2/RDS 重资产。
 
-> **当前状态**：全部代码已完成（133 个单元测试全绿，3 个 CDK 栈 synth 通过），
+> **当前状态**：代码已完成并通过两轮独立审查（154 个单元测试全绿，2 个 CDK 栈 synth 通过），
 > 尚未部署到真实 AWS。部署操作手册见 **[site-builder/DEPLOY.md](site-builder/DEPLOY.md)**。
 
 ## 架构
@@ -30,7 +30,7 @@ Agent 客户端）里用自然语言开发简易全栈站点，说一句"部署"
 └──────────────────────────┬──────────────────────────────────┘
                            │ 路由表（subdomain → 目标 + auth 策略）
 ┌──────────────────────────▼──────────────────────────────────┐
-│ ④ 路由 + 鉴权层（CloudFront *.dsir.cc + Lambda@Edge）         │  manus-web-application-main/
+│ ④ 路由 + 鉴权层（CloudFront *.dsir.cc + Lambda@Edge）         │  router/
 │    查路由 → 验飞书会话 JWT → 注入 x-user-email →              │
 │    /api/*→站点Lambda(SigV4) / 其余→S3（全站禁缓存）           │
 └──────────────────────────┬──────────────────────────────────┘
@@ -65,22 +65,24 @@ Agent 客户端）里用自然语言开发简易全栈站点，说一句"部署"
 | `site-builder/DEPLOY.md` | **部署操作手册（下一步从这里开始）** |
 | `site-builder/contract/` | 部署合同库：site.json 校验器 + 红线扫描器（67 测试） |
 | `site-builder/auth/` | 会话 JWT + 站点登录服务（11 测试） |
-| `site-builder/deployer/` | 执行器：7 个 SFN 步骤 + 状态机 CDK + undeploy（27 测试） |
-| `site-builder/mcp/` | 部署 MCP server（10 测试）+ AgentCore spike 报告 |
+| `site-builder/deployer/` | 执行器：7 个 SFN 步骤 + 状态机 CDK + undeploy（30 测试） |
+| `site-builder/mcp/` | 部署 MCP server（23 测试）+ Dockerfile/部署脚本 + AgentCore spike 报告 |
 | `site-builder/skills/site-builder/` | 建站 Skill 包（SKILL.md + 合同/红线文档 + 模板） |
 | `site-builder/fixtures/` | 三档黄金样例站点（全部通过合同校验，兼演示素材） |
 | `site-builder/scripts/` | smoke_router.sh（路由层冒烟）、deploy_fixture.py |
-| `manus-web-application-main/` | 路由层：CloudFront + Lambda@Edge 分流/鉴权/禁缓存（目录名沿用上游参考项目，内容已改造） |
+| `router/` | 路由层：CloudFront + Lambda@Edge 分流/鉴权/禁缓存（23 测试） |
 
 ## 测试与质量
 
-- **133 个单元测试**：contract 67 / auth 11 / router edge 18 / deployer 27 / mcp 10
+- **154 个单元测试**：contract 67 / auth 11 / router edge 23 / deployer 30 / mcp 23
   （另 4 个 E2E 在 `RUN_E2E=1` + 真实部署后运行，含自动化登录 CRUD——用平台
   JWT_SECRET 直接 mint 测试会话 cookie，无需人工飞书扫码）。
 - 每个任务经独立子代理实现 + 审查/裁决 + 修复闭环；开发过程中修复的典型问题：
   CloudFront 缓存绕过鉴权（CRITICAL）、auth 子域路由错位、POST body SigV4 签名、
   DSQL 权限模型、红线扫描器多轮防绕过加固、IAM PermissionsBoundary 条件门 bug。
-- 跑全部测试：各包目录下 `.venv/bin/pytest -q`（venv 已建好）。
+- 跑测试：多数包用各自目录下 `.venv/bin/pytest -q`；两个例外——
+  `site-builder/auth` 无自己的 venv，用 `site-builder/contract/.venv/bin/pytest tests`（含 pyjwt）；
+  `site-builder/deployer` 须 `pytest tests`（裸 `pytest -q` 会误收集 `infra/cdk.out` 的 asset 副本）。
 
 ## 如何继续
 

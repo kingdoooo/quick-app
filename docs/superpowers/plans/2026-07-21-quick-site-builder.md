@@ -28,14 +28,14 @@
 - S3 批量删除/遍历一律 paginator + 每批 ≤1000 对象。
 - 中心配置 `site-builder/config.ini`（BASE_DOMAIN、ACCOUNT_ID、路由表名、Cognito 参数、DSQL endpoint），所有组件从它读，不散落硬编码。
 - 测试框架 pytest；提交遵循 conventional commits；每个 Task 以通过测试 + commit 结束。
-- **Task 0（前置）**：`git add manus-web-application-main/` 纳入版本控制并提交——plan 大量修改该目录，未跟踪则不可复现。
+- **Task 0（前置）**：`git add router/` 纳入版本控制并提交——plan 大量修改该目录，未跟踪则不可复现。
 
 ## File Structure
 
 ```
 quick-app/                                    # 仓库根（已 git init）
 ├── docs/superpowers/{specs,plans}/
-├── manus-web-application-main/               # M2 路由层：就地改造
+├── router/               # M2 路由层：就地改造
 │   ├── infrastructure/stack.py               # 修改：注入 JWT_SECRET 等新替换项、S3 读权限
 │   ├── infrastructure/lambda/origin_request.py  # 修改：auth + static/api 分流
 │   └── infrastructure/lambda/test_origin_request.py  # 新增测试
@@ -101,7 +101,7 @@ quick-app/                                    # 仓库根（已 git init）
 
 | Phase | Task | 内容 |
 |---|---|---|
-| P0 前置 | 0 | `git add manus-web-application-main/ && git commit`（可复现前提） |
+| P0 前置 | 0 | `git add router/ && git commit`（可复现前提） |
 | P0 合同库 | 1 | contract 包脚手架 + site.json schema 校验器 |
 | P0 | 2 | 代码红线扫描器 |
 | P1 身份层(M1) | 3 | 部署 feishu-quick-sso 基座并验证 Quick 登录 |
@@ -693,7 +693,7 @@ Expected: FAIL（ModuleNotFoundError: session）
 
 ```python
 """站点会话 JWT（HS256）——纯标准库实现。
-Edge 函数（manus origin_request.py）内嵌同一算法验签，改动此处须同步 Task 7。"""
+路由层 Edge 函数（router/infrastructure/lambda/origin_request.py）内嵌同一算法验签。"""
 import base64
 import hashlib
 import hmac
@@ -1117,8 +1117,8 @@ manus 现有 `origin_request.py` 只有单一 `target_url`。本任务改为：
 - **fail-closed**：`lambda_handler` 顶层异常返回 500 响应，绝不透传原请求（原 manus 行为是 return request——安全边界不允许）。
 
 **Files:**
-- Modify: `manus-web-application-main/infrastructure/lambda/origin_request.py`
-- Test: `manus-web-application-main/infrastructure/lambda/test_origin_request.py`（新建）
+- Modify: `router/infrastructure/lambda/origin_request.py`
+- Test: `router/infrastructure/lambda/test_origin_request.py`（新建）
 
 **Interfaces:**
 - Consumes: 路由表新 item 结构（见 File Structure 节）；模板占位符机制新增 `{{FRONTEND_BUCKET_DOMAIN}}`、`{{JWT_SECRET}}`（Task 8 注入）
@@ -1126,7 +1126,7 @@ manus 现有 `origin_request.py` 只有单一 `target_url`。本任务改为：
 
 - [ ] **Step 1: 写失败测试**
 
-`manus-web-application-main/infrastructure/lambda/test_origin_request.py`:
+`router/infrastructure/lambda/test_origin_request.py`:
 
 ```python
 """Edge 路由单测——DynamoDB 与签名 mock 掉，测分流与改写逻辑。"""
@@ -1231,7 +1231,7 @@ def test_edge_fails_closed_on_exception(mock_lookup):
 
 - [ ] **Step 2: 运行确认失败**
 
-Run: `cd manus-web-application-main/infrastructure/lambda && python3 -m pytest test_origin_request.py -q`
+Run: `cd router/infrastructure/lambda && python3 -m pytest test_origin_request.py -q`
 Expected: FAIL（`_lookup_route` 不存在——现文件是 `_lookup_target_url`）
 
 - [ ] **Step 3: 改造 origin_request.py**
@@ -1390,15 +1390,15 @@ Expected: 8 passed
 - [ ] **Step 5: Commit**
 
 ```bash
-git add manus-web-application-main/infrastructure/lambda
+git add router/infrastructure/lambda
 git commit -m "feat(router): route_mode split/api-only, body-aware sigv4, fail-closed edge"
 ```
 
 ### Task 7: Edge 函数——JWT 鉴权 + 302 跳登录 + 用户头注入
 
 **Files:**
-- Modify: `manus-web-application-main/infrastructure/lambda/origin_request.py`
-- Test: `manus-web-application-main/infrastructure/lambda/test_edge_auth.py`（新建）
+- Modify: `router/infrastructure/lambda/origin_request.py`
+- Test: `router/infrastructure/lambda/test_edge_auth.py`（新建）
 
 **Interfaces:**
 - Consumes: Task 6 的 `_lookup_route`/`_route_request`；Task 4 的 JWT 格式（HS256、claims `{email,name,exp}`、cookie 名 `sb_session`）；登录端点 `https://auth.{BASE_DOMAIN}/login`
@@ -1406,7 +1406,7 @@ git commit -m "feat(router): route_mode split/api-only, body-aware sigv4, fail-c
 
 - [ ] **Step 1: 写失败测试**
 
-`manus-web-application-main/infrastructure/lambda/test_edge_auth.py`:
+`router/infrastructure/lambda/test_edge_auth.py`:
 
 ```python
 import base64, hashlib, hmac, json, time
@@ -1612,15 +1612,15 @@ Expected: 17 passed
 - [ ] **Step 5: Commit**
 
 ```bash
-git add manus-web-application-main/infrastructure/lambda
+git add router/infrastructure/lambda
 git commit -m "feat(router): edge session auth with header injection and spoof stripping"
 ```
 
 ### Task 8: manus CDK 栈更新部署 + 路由层冒烟
 
 **Files:**
-- Modify: `manus-web-application-main/infrastructure/stack.py`
-- Modify: `manus-web-application-main/config.ini`（真实值，gitignore）
+- Modify: `router/infrastructure/stack.py`
+- Modify: `router/config.ini`（真实值，gitignore）
 - Create: `site-builder/scripts/smoke_router.sh`
 
 **Interfaces:**
@@ -1691,7 +1691,7 @@ base_domain = <BASE_DOMAIN>
 aws s3api create-bucket --bucket site-frontend-<ACCOUNT_ID> --region us-east-1
 aws s3api put-public-access-block --bucket site-frontend-<ACCOUNT_ID> \
   --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
-cd manus-web-application-main/infrastructure && source .venv/bin/activate && cdk deploy --require-approval never
+cd router/infrastructure && source .venv/bin/activate && cdk deploy --require-approval never
 ```
 
 Expected: 栈更新成功（Lambda@Edge 新版本发布，CloudFront 传播 15-30 分钟）。若首次部署：先按 manus README 完成 `config.ini` 全量配置 + `cdk bootstrap` + DNS CNAME。
@@ -1753,7 +1753,7 @@ Expected: 六行 PASS（static route / no cross-site cache / auth 302 / auth sub
 - [ ] **Step 5: Commit**
 
 ```bash
-git add manus-web-application-main/infrastructure/stack.py site-builder/scripts/smoke_router.sh
+git add router/infrastructure/stack.py site-builder/scripts/smoke_router.sh
 git commit -m "feat(router): wire frontend bucket, jwt secret and base domain into edge deploy"
 ```
 
