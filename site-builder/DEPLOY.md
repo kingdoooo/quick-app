@@ -1,14 +1,99 @@
 # Quick 自动化建站方案 — 部署 Runbook
 
-本文档是把 `site-builder` 分支已实现的代码部署到真实 AWS 的操作手册。所有代码 +
-单元测试（133 个）已完成并提交；本手册覆盖的是**需要真实 AWS 资源、DNS、飞书凭证**
-的部署门禁，无法自动化。
+本文档是把本方案部署到**你自己的 AWS 账号**的操作手册。所有代码 + 154 个单元测试
+已完成；本手册覆盖的是**需要真实 AWS 资源、DNS、飞书凭证**的部署门禁，无法自动化。
 
-- **前置要求**：见 [PREREQUISITES.md](PREREQUISITES.md)（区域/域名/证书/飞书应用/SSM/工具链），全部就绪后再开始
 - **区域**：`us-east-1`（Lambda@Edge、ACM、Quick Desktop 身份区域共同强制）
 - 下文 `<ACCOUNT_ID>`、`<BASE_DOMAIN>` 等占位符替换为你的实际值（与 config.ini 一致）
-- **中心配置**：`site-builder/config.ini`（gitignored，含真实值；部署过程中逐段回填）
+- **中心配置**：`site-builder/config.ini` 与 `router/config.ini`（都从同目录
+  `.example` 复制，gitignored；部署过程中逐段回填）
 - 设计文档 `docs/superpowers/specs/2026-07-21-quick-site-builder-design.md`，实施计划 `docs/superpowers/plans/2026-07-21-quick-site-builder.md`
+
+---
+
+## 0. 前置要求（全部备齐才开始）
+
+### AWS 账号与区域
+
+任意 AWS 账号，需有创建 IAM 角色 / Lambda / CloudFront / DynamoDB / S3 /
+Step Functions / CodeBuild / Aurora DSQL 的权限。
+
+区域**必须 `us-east-1`**：Lambda@Edge 函数与 CloudFront 用的 ACM 证书强制在
+us-east-1，Quick Desktop 身份区域当前也要求 us-east-1。这不是偏好而是硬约束——
+换区需要改代码（见文末 Minor 里 region 硬编码的两处）。
+
+### 域名与通配符证书
+
+需要一个你能改 DNS 的域名（记为 `<BASE_DOMAIN>`），以及**签发在 us-east-1 的
+`*.<BASE_DOMAIN>` 通配符证书**。站点 URL 形如
+`https://app-<siteid>.<BASE_DOMAIN>`，登录端点固定 `auth.<BASE_DOMAIN>`——
+所以必须通配符，单域名证书不够。
+
+```bash
+# 申请通配符证书（DNS 验证）
+aws acm request-certificate --region us-east-1 \
+  --domain-name "*.<BASE_DOMAIN>" --validation-method DNS
+# 按输出的 CNAME 完成验证，等状态变 ISSUED：
+aws acm describe-certificate --region us-east-1 \
+  --certificate-arn <CERT_ARN> --query 'Certificate.Status'
+```
+
+证书 ARN 填 `router/config.ini` 的 `[CloudFront] certificate_arn`。
+
+> **建议用专用域名或子域**（如 `apps.example.com`）：会话 cookie 下发在
+> `.<BASE_DOMAIN>`，所有 `app-*.<BASE_DOMAIN>` 站点共享一次登录。用承载其他
+> 业务的主域会让会话作用域覆盖无关系统。
+
+### 飞书企业自建应用
+
+站点登录与部署权限都绑飞书账号，需要一个企业自建应用：App ID / App Secret
+（① 阶段部署 SSO 时作为参数输入），**必需权限：获取用户 userid、获取用户邮箱**。
+重定向 URI 由 ① 阶段产出的 Cognito Hosted UI 决定，建完 Cognito 后回飞书后台补填。
+
+邮箱权限不可省：`owner`（谁部署的、谁能改/删站点）与访问名单 `allowed_users`
+都以飞书邮箱为标识，拿不到邮箱则整个权限模型不成立。
+
+### SSM 参数
+
+| 参数名 | 何时创建 | 用途 |
+|---|---|---|
+| `/site-builder/jwt-secret` | **部署 ② 之前手工创建** | 站点会话 JWT 的 HS256 签名密钥，Edge 函数与登录服务共用 |
+| `/site-builder/site-client-secret` | ① 阶段建完 Cognito 后写入 | 站点登录 App Client 的 secret |
+
+```bash
+aws ssm put-parameter --region us-east-1 \
+  --name /site-builder/jwt-secret --type SecureString \
+  --value "$(openssl rand -hex 32)"
+```
+
+`jwt-secret` 必须早于 ② 存在：② 的栈部署时从 SSM 读它并字符串替换注入 Edge
+函数（Lambda@Edge 不支持环境变量）。读取失败时会打印
+`SYNTH-ONLY-PLACEHOLDER-DO-NOT-DEPLOY` 警告，此时**不要继续**——否则每个会话
+token 都验签失败，表现为无限登录跳转。
+
+### 本机工具链
+
+| 工具 | 要求 |
+|---|---|
+| AWS CLI | 已配置指向目标账号（`aws sts get-caller-identity` 确认） |
+| CDK CLI | 用 `npx -y aws-cdk@latest`（部分环境全局 CDK 过旧） |
+| Docker | ④ 执行器栈需要（bundling 装 psycopg，拉 x86_64 镜像）；⑤ MCP 需 buildx 构 ARM64 镜像 |
+| Python | 3.12+ |
+| Node.js | 仅 `npx`（CDK 与 MCP Inspector） |
+
+### 成本预期（PoC 量级）
+
+| 项 | 估算/月 |
+|---|---|
+| 路由层（CloudFront + Lambda@Edge + DynamoDB，1M 请求） | ~$2-5 |
+| 站点 Lambda + S3（数十站点低流量） | ~$5-20 |
+| Aurora DSQL 共享 cluster（低用量，按请求计费） | ~$0-10 |
+| AgentCore MCP + Step Functions + CodeBuild | ~$5-15 |
+| Cognito（月活 <50） | 免费额度内 |
+| **合计** | **~$15-50/月** |
+
+CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只在 cache miss
+时执行），PoC 流量下成本影响可忽略；高流量场景需评估精细缓存（二期）。
 
 ## 部署顺序总览
 
@@ -22,14 +107,13 @@
 
 依赖关系：②需要①产出的 JWT_SECRET（已在 SSM）与 edge role；④需要①的 boundary、②的 edge_role_arn、③的 DSQL endpoint；⑤需要④的 state_machine_arn 与①的 Cognito。
 
-前置检查（全部满足才开始）：
+开始前的就绪清单（详见上面 §0）：
 - [ ] AWS 凭证指向目标账号 / us-east-1（`aws sts get-caller-identity`）
 - [ ] `*.<BASE_DOMAIN>` ACM 证书 ISSUED（us-east-1）
-- [ ] SSM `/site-builder/jwt-secret` 已创建（SecureString）
 - [ ] `<BASE_DOMAIN>` DNS 可修改（Route53 hosted zone 或等价）
-- [ ] 飞书企业自建应用（App ID/Secret，权限：获取用户 userid、获取用户邮箱）
-- [ ] 本机 CDK CLI 用 `npx -y aws-cdk@latest`（部分环境全局 CLI 过旧）
-- [ ] Docker 运行中（④ 执行器 Lambda 用 bundling 装 psycopg，需拉 x86_64 镜像）
+- [ ] SSM `/site-builder/jwt-secret` 已创建（SecureString）
+- [ ] 飞书企业自建应用（App ID/Secret，含用户 userid + 邮箱权限）
+- [ ] Docker 运行中；`npx` 可用
 - [ ] `site-builder/config.ini` 与 `router/config.ini` 已从 `.example` 复制并填好
 
 ---
@@ -87,7 +171,8 @@
 
 **产出**：CloudFront 分发（`*.<BASE_DOMAIN>`）+ 扩展路由表 + 前端桶；回填 `config.ini [Deployer] edge_role_arn`。
 
-`router/config.ini` 已配好真实值（account/domain/cert/frontend_bucket/base_domain）。
+确认 `router/config.ini` 已填好：account_id / domain_name / certificate_arn /
+frontend_bucket / base_domain（从 `router/config.ini.example` 复制）。
 
 1. 建私有前端桶（若不存在）：
    ```bash

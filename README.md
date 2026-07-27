@@ -62,8 +62,7 @@ Agent 客户端）里用自然语言开发简易全栈站点，说一句"部署"
 |---|---|
 | `docs/superpowers/specs/2026-07-21-quick-site-builder-design.md` | 设计文档（经对抗性 review 修订） |
 | `docs/superpowers/plans/2026-07-21-quick-site-builder.md` | 实施计划（23 任务，含完整代码） |
-| `site-builder/PREREQUISITES.md` | **部署前置要求（先看这里：区域/域名/证书/飞书应用）** |
-| `site-builder/DEPLOY.md` | **部署操作手册（前置备齐后从这里开始）** |
+| `site-builder/DEPLOY.md` | **部署手册：§0 前置要求 + 七阶段操作（下一步从这里开始）** |
 | `site-builder/contract/` | 部署合同库：site.json 校验器 + 红线扫描器（67 测试） |
 | `site-builder/auth/` | 会话 JWT + 站点登录服务（11 测试） |
 | `site-builder/deployer/` | 执行器：7 个 SFN 步骤 + 状态机 CDK + undeploy（30 测试） |
@@ -91,7 +90,7 @@ Agent 客户端）里用自然语言开发简易全栈站点，说一句"部署"
 身份区域共同强制）、一个可改 DNS 的域名 + 该域名的 `*.<域名>` ACM 通配符证书、
 飞书企业自建应用（需用户邮箱权限）、SSM 里的会话签名密钥、本机 Docker。
 
-逐项要求与命令见 **[site-builder/PREREQUISITES.md](site-builder/PREREQUISITES.md)**
+逐项要求与命令见 **[site-builder/DEPLOY.md](site-builder/DEPLOY.md) §0 前置要求**
 （含就绪检查清单与成本预期）。
 
 账号 ID、域名、证书 ARN 等环境相关值全部走配置文件
@@ -100,9 +99,9 @@ Agent 客户端）里用自然语言开发简易全栈站点，说一句"部署"
 
 ## 如何继续
 
-1. **备齐前置**：照 [site-builder/PREREQUISITES.md](site-builder/PREREQUISITES.md)
-   的就绪检查清单逐项确认，并从两份 `config.ini.example` 复制出自己的配置。
-2. **部署**：照 [site-builder/DEPLOY.md](site-builder/DEPLOY.md) 七个阶段执行
+1. **备齐前置**：照 [site-builder/DEPLOY.md](site-builder/DEPLOY.md) §0 的就绪清单
+   逐项确认，并从两份 `config.ini.example` 复制出自己的配置。
+2. **部署**：照同文档七个阶段执行
    （①SSO → ②路由 → ③DSQL → ④执行器 → ⑤MCP → ⑥客户端 → ⑦彩排）；
    每阶段产出的 ARN/ID 按手册回填 `site-builder/config.ini`。
 3. **演示**：⑦ 的 E2E 通过后，演示叙事见实施计划 Task 23。
