@@ -125,9 +125,11 @@ class WebRouterStack(Stack):
             ],
         )
         mapping_table.grant_read_data(edge_role)
+        # Since October 2025 new function URLs require BOTH lambda:InvokeFunctionUrl
+        # and lambda:InvokeFunction; granting only the former yields 403 at the edge.
         edge_role.add_to_policy(iam.PolicyStatement(
             effect=iam.Effect.ALLOW,
-            actions=["lambda:InvokeFunctionUrl"],
+            actions=["lambda:InvokeFunctionUrl", "lambda:InvokeFunction"],
             resources=["*"]
         ))
 
@@ -168,7 +170,7 @@ class WebRouterStack(Stack):
         temp_dir = tempfile.mkdtemp()
         with open(os.path.join(temp_dir, 'index.py'), 'w') as f:
             f.write(lambda_code)
-        
+
         # Lambda@Edge function
         edge_function = lambda_.Function(
             self,
@@ -182,6 +184,27 @@ class WebRouterStack(Stack):
             timeout=Duration.seconds(config.get_int("Lambda", "timeout_seconds", "APP_LAMBDA_TIMEOUT_SECONDS")),
         )
         shutil.rmtree(temp_dir)
+
+        # Origin-response function: strips platform-reserved Set-Cookie coming
+        # back from untrusted site origins, so a site cannot overwrite the
+        # top-domain session cookie (session fixation / forced logout).
+        response_dir = tempfile.mkdtemp()
+        shutil.copyfile(
+            Path(__file__).parent / "lambda" / "origin_response.py",
+            os.path.join(response_dir, "index.py"),
+        )
+        origin_response_function = lambda_.Function(
+            self,
+            "OriginResponseFunction",
+            function_name=f"{stack_name}-origin-response",
+            runtime=lambda_.Runtime.PYTHON_3_11,
+            handler="index.lambda_handler",
+            code=lambda_.Code.from_asset(response_dir),
+            role=edge_role,
+            memory_size=128,
+            timeout=Duration.seconds(5),
+        )
+        shutil.rmtree(response_dir)
         
         # CloudFront Distribution
         certificate = acm.Certificate.from_certificate_arn(
@@ -225,7 +248,11 @@ class WebRouterStack(Stack):
                         function_version=edge_function.current_version,
                         event_type=cloudfront.LambdaEdgeEventType.ORIGIN_REQUEST,
                         include_body=True,
-                    )
+                    ),
+                    cloudfront.EdgeLambda(
+                        function_version=origin_response_function.current_version,
+                        event_type=cloudfront.LambdaEdgeEventType.ORIGIN_RESPONSE,
+                    ),
                 ]
             ),
             domain_names=[config.get("CloudFront", "domain_name", "APP_DOMAIN_NAME")],

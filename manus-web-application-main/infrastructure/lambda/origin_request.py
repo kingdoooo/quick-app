@@ -10,7 +10,7 @@ import logging
 from typing import Dict, Any, Optional
 import boto3
 from botocore.exceptions import ClientError
-from botocore.auth import SigV4Auth
+from botocore.auth import S3SigV4Auth, SigV4Auth
 from botocore.awsrequest import AWSRequest
 import urllib.parse
 
@@ -244,6 +244,37 @@ def _get_cookie(request, name: str) -> str | None:
     return None
 
 
+# 平台保留 cookie：只有 auth-service 能签发，绝不能到达站点代码。
+# 站点 origin 若能读到会话 JWT，即可重放到其他站点（顶域 cookie 共享登录）——
+# 站点代码是不可信代码，因此转发前必须剥除；auth-service（owner=platform）例外。
+RESERVED_COOKIES = ("sb_session",)
+# origin_response 靠此头判断"本响应来自平台自己的 origin，允许写平台 cookie"。
+# 客户端可伪造，故与 x-user-* 一样先无条件剥除再按路由注入。
+PLATFORM_MARK = "x-sb-platform-origin"
+
+
+def _is_platform_route(route: dict) -> bool:
+    return route.get("owner") == "platform"
+
+
+def _strip_reserved_cookies(request) -> None:
+    """从转发给不可信 origin 的请求里删除平台保留 cookie，保留站点自己的 cookie。"""
+    headers = request.get("headers", {})
+    if "cookie" not in headers:
+        return
+    kept_headers = []
+    for header in headers["cookie"]:
+        kept = [p.strip() for p in header["value"].split(";")
+                if p.strip() and p.strip().partition("=")[0] not in RESERVED_COOKIES]
+        if kept:
+            kept_headers.append({"key": header.get("key", "Cookie"),
+                                 "value": "; ".join(kept)})
+    if kept_headers:
+        headers["cookie"] = kept_headers
+    else:
+        headers.pop("cookie", None)
+
+
 def _redirect_login(host: str, uri: str, querystring: str = "") -> dict:
     full = f"https://{host}{uri}" + (f"?{querystring}" if querystring else "")
     target = urllib.parse.quote(full, safe="")
@@ -260,9 +291,10 @@ def _forbidden() -> dict:
 
 def _check_auth(request, route, host):
     """返回 None=放行（用户头已注入）；返回 dict=302/403 响应。"""
-    # 无条件剥除客户端可伪造的用户头
+    # 无条件剥除客户端可伪造的用户头与平台 origin 标记
     request["headers"].pop("x-user-email", None)
     request["headers"].pop("x-user-name", None)
+    request["headers"].pop(PLATFORM_MARK, None)
 
     if not route.get("require_auth"):
         return None
@@ -293,6 +325,12 @@ def _route_request(request, route):
     qs = _fix_querystring_encoding(request.get("querystring", ""))
     request["querystring"] = qs
 
+    # 平台会话 cookie 不下发给站点代码（不可信）；auth-service 需要它做登出等操作
+    if _is_platform_route(route):
+        request["headers"][PLATFORM_MARK] = [{"key": PLATFORM_MARK, "value": "1"}]
+    else:
+        _strip_reserved_cookies(request)
+
     if route.get("route_mode") == "api-only":
         return _route_to_lambda(request, route, uri, qs)
 
@@ -320,10 +358,15 @@ def _custom_origin(domain: str) -> dict:
 
 
 def _add_s3_sigv4_auth(request, domain: str, uri: str) -> None:
-    """S3 GET 的 SigV4（Edge 执行角色需有该桶前缀的 s3:GetObject）"""
+    """S3 GET 的 SigV4（Edge 执行角色需有该桶前缀的 s3:GetObject）。
+
+    必须用 S3SigV4Auth 而非通用 SigV4Auth：S3 要求请求带 x-amz-content-sha256，
+    通用 SigV4Auth 不生成该头，S3 会返回
+    400 InvalidRequest "Missing required header for this request: x-amz-content-sha256"。
+    """
     url = f"https://{domain}{urllib.parse.quote(uri)}"
     aws_request = AWSRequest(method="GET", url=url)
-    SigV4Auth(credentials, "s3", "us-east-1").add_auth(aws_request)
+    S3SigV4Auth(credentials, "s3", "us-east-1").add_auth(aws_request)
     for h, v in aws_request.headers.items():
         if h.lower() in ("authorization", "x-amz-date", "x-amz-security-token",
                          "x-amz-content-sha256"):

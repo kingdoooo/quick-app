@@ -56,7 +56,18 @@ def _decode_state(state: str) -> str | None:
 
 
 def _is_safe_redirect(url: str) -> bool:
-    host = urllib.parse.urlparse(url).hostname or ""
+    """回跳白名单：仅 https 且 host 属于 BASE_DOMAIN。
+
+    反斜杠必须显式拒绝：Python urlparse 把 "https://evil.com\\.dsir.cc/" 的 host
+    解析为 "evil.com\\.dsir.cc"（后缀匹配通过），而浏览器按 WHATWG 规范把 \\ 当
+    /，实际导航到 evil.com——登录成功后会把已认证用户送到攻击者站点。
+    """
+    if not isinstance(url, str) or "\\" in url:
+        return False
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https":
+        return False
+    host = parsed.hostname or ""
     base = os.environ["BASE_DOMAIN"]
     return host == base or host.endswith("." + base)
 

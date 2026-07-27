@@ -73,11 +73,19 @@ def main():
         lam.get_waiter("function_active").wait(FunctionName=FN)
     try:
         url = lam.create_function_url_config(FunctionName=FN, AuthType="NONE")["FunctionUrl"]
-        lam.add_permission(FunctionName=FN, StatementId="public-url",
-                           Action="lambda:InvokeFunctionUrl", Principal="*",
-                           FunctionUrlAuthType="NONE")
     except lam.exceptions.ResourceConflictException:
         url = lam.get_function_url_config(FunctionName=FN)["FunctionUrl"]
+    # 2025-10 起 Function URL 需要 InvokeFunctionUrl + InvokeFunction 两条语句
+    # （AuthType=NONE 也一样，缺一个就 403）。两条各自幂等。
+    for sid, action, extra in (
+        ("public-url", "lambda:InvokeFunctionUrl", {"FunctionUrlAuthType": "NONE"}),
+        ("public-url-invoke", "lambda:InvokeFunction", {"InvokedViaFunctionUrl": True}),
+    ):
+        try:
+            lam.add_permission(FunctionName=FN, StatementId=sid, Action=action,
+                               Principal="*", **extra)
+        except lam.exceptions.ResourceConflictException:
+            pass
     ddb.put_item(TableName=CFG["Platform"]["routing_table"], Item={
         "subdomain": {"S": "auth"}, "site_id": {"S": "auth-service"},
         "route_mode": {"S": "api-only"},  # 全路径走 Lambda（/login 不匹配 /api/*）

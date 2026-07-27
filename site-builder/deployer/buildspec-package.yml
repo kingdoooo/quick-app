@@ -9,8 +9,13 @@ phases:
       - aws s3 cp "s3://$ARTIFACTS_BUCKET/uploads/$JOB_ID.zip" /tmp/site.zip
       - mkdir -p /tmp/site && cd /tmp/site && unzip -q /tmp/site.zip
       - test -f /tmp/site/run.sh  # 合同要求 run.sh 在 zip 根，缺失即失败
+      # 站点自带的 .npmrc 可改 registry 拉恶意包（CLI flag 能盖 ignore-scripts，
+      # 但盖不住 registry），一律删除后再装依赖。
+      - find /tmp/site -name .npmrc -delete
       - cd /tmp/site/backend
-      - npm install --omit=dev --no-audit --no-fund
+      # --ignore-scripts 必需：站点 package.json 由 AI 生成、owner 可任意改，
+      # preinstall/postinstall 会在本构建容器内以 CodeBuild 角色凭证任意执行。
+      - npm install --omit=dev --no-audit --no-fund --ignore-scripts
       - cp /tmp/site/run.sh ./run.sh && chmod +x ./run.sh
       - zip -qr /tmp/backend.zip .
       - aws s3 cp /tmp/backend.zip "s3://$ARTIFACTS_BUCKET/artifacts/$JOB_ID/backend.zip"

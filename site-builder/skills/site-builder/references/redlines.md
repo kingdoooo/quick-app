@@ -156,6 +156,12 @@ CREATE TABLE orders (
 另：DSQL 连接**只允许**原样复制 `templates/db.js` 并通过 `makePool()` 获取
 连接池——不要自写连接串/签名逻辑（平台按站点注入专属数据库身份，自写必错）。
 
+**schema.sql / migrations 的执行身份**：平台用本站点专属的 migrator 角色执行，
+该角色只对本站点 schema 有建对象权限。因此这些 SQL 里**不要**写跨 schema 操作
+（`DROP SCHEMA other`、`GRANT ... TO other`）、角色管理（`CREATE ROLE`、
+`ALTER ROLE`、`AWS IAM GRANT`）或全局 DDL——不是被扫描器拦下，而是执行时因
+权限不足直接失败。只写本站点自己的表/索引/视图。
+
 ## 运行时约束（扫描器不查，但违反同样部署失败或线上出错）
 
 - 监听端口读 `process.env.PORT`，不要硬编码。

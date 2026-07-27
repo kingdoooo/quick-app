@@ -232,9 +232,28 @@ SSM 参数：`/site-builder/jwt-secret`（已存在）、`/site-builder/site-cli
 - CloudFront 全站禁缓存（正确性优先；精细缓存延后）
 - 详见设计文档 §8 风险 / §9 范围外
 
+## 2026-07-27 独立审查后的修复（已实证验证，部署前必读）
+
+两轮独立审查（本机 + Codex）确认的 P0 已修复并用真实 AWS API 验证：
+
+| 问题 | 修复 | 验证方式 |
+|---|---|---|
+| Edge S3 签名缺 `x-amz-content-sha256`，所有静态页 400 | 改用 `S3SigV4Auth` | 真实 us-east-1 桶探针：修前 400 InvalidRequest，修后 404 NoSuchKey（签名被接受） |
+| 顶域 `sb_session` 被转发给不可信站点后端，可跨站重放 | Edge 验签后按 origin 剥除；新增 origin-response 剥除站点写的平台 cookie | 4 个场景单测（站点剥除/站点自有 cookie 保留/auth 子域保留/伪造标记被剥） |
+| Function URL 缺 2025-10 起要求的第二个权限 | 三处各加 `lambda:InvokeFunction` + `InvokedViaFunctionUrl` | AWS 官方文档 urls-auth 明确要求两者 |
+| exec role 缺 `lambda:GetFunctionConfiguration`（waiter 轮询它） | 补该 action | `aws iam simulate-custom-policy`：修前 implicitDeny，修后 allowed |
+| `site_name` 未校验 → DSQL admin SQL 注入 + IAM/Lambda 命名炸裂 | `common.validate_site_name` 入口卡 `^[a-z][a-z0-9-]{1,29}$` | 单测覆盖注入串/空格/大写等 9 种非法输入 |
+| `npm install` 执行站点 preinstall 脚本（CodeBuild 内任意代码执行） | `--ignore-scripts` + 删 `.npmrc` + 红线拦生命周期脚本 + CodeBuild 角色收窄到 `uploads/*` 只读、`artifacts/*` 只写 | 红线单测 + synth 确认无整桶读写 |
+| 站点 SQL 以 DSQL admin 执行，可跨 schema 读写/销毁 | 拆两个连接：admin 只引导 schema/role；站点提交的 SQL 以 per-site migrator role 执行 | 单测断言站点 DDL 绝不出现在 admin 连接；bootstrap SQL 过 DSQL linter |
+| `CREATE ROLE`/`AWS IAM GRANT` 裸 `except: pass` 吞真实错误 | 只容忍 duplicate（SQLSTATE 42710/42P06），其余抛出 | 单测覆盖 42601 语法错/42501 权限不足必抛 |
+| 回跳白名单可被 `https://evil.com\.dsir.cc/` 绕过 | 拒反斜杠 + 强制 https | 8 组用例；Python urlparse 与 Node WHATWG 解析差异实测 |
+
+**仍需真机验证**：`AWS IAM GRANT` 对真实 DSQL 的语法与幂等 sqlstate（③ 冒烟覆盖）；
+migrator role 的 `ALTER DEFAULT PRIVILEGES FOR ROLE` 是否被接受（失败无损，末尾有显式 GRANT 兜底）。
+
 ## 待部署时验证的 Minor（来自各任务审查，记录在 .superpowers/sdd/progress.md）
 
 - `_add_s3_sigv4_auth` 用 `quote(uri)` 签名但转发原样 URI：非 ASCII 文件名（中文/空格）可能 SignatureDoesNotMatch。PoC 生成的资产路径均 ASCII，不受影响；若客户站点用非 ASCII 静态文件名需修。
 - `_site_policy` 与 Edge S3 签名 region 硬编码 us-east-1（与部署区一致，换区需改）。
 - `provision_dsql` 的 `migrations/*.sql` 不经红线扫描（只扫 schema.sql）；migration 里的禁用 DDL 会在 provision-db 阶段才失败（可读报错，非静默）。
-- `provision_dsql` 的 `CREATE ROLE`/`AWS IAM GRANT` 用裸 `except Exception: pass`；`AWS IAM GRANT` 语法/幂等性需对真实 DSQL 验证（④ 冒烟的 SQL fixture 会覆盖）。
+- 跑测试的 venv：`site-builder/auth` 无自己的 venv，用 `site-builder/contract/.venv/bin/pytest tests`（含 pyjwt）；`site-builder/deployer` 必须 `pytest tests`（裸 `pytest -q` 会误收集 `infra/cdk.out` 里的 asset 副本）。

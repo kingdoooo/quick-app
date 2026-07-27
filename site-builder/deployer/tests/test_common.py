@@ -40,7 +40,21 @@ def test_site_upsert_and_get(aws):
 
 
 def test_id_helpers():
-    sid = common.new_site_id("my-long-project-name-way-over-twenty")
+    # 合同允许最长 30 字符；site_id 取前 20 字符 + 6 位随机后缀
+    sid = common.new_site_id("my-long-project-name-abcdefg")
     assert re.match(r"^[a-z][a-z0-9-]{0,19}-[a-z0-9]{6}$", sid)
     assert common.subdomain_for("x-1a2b3c") == "app-x-1a2b3c"
     assert common.dsql_schema_for("x-1a2b3c") == "site_x1a2b3c"
+
+
+def test_site_name_rejects_sql_and_resource_name_hazards():
+    """site_name 会成为 DSQL 标识符与 IAM/Lambda 资源名，必须在入口拦下。"""
+    import pytest
+    for bad in ['x" ; CREATE ROLE attacker WITH LOGIN SUPERUSER; --',
+                "MySite With Spaces!", "UPPER", "-lead", "has_underscore",
+                "a", "x" * 31, "", "sql'inject"]:
+        with pytest.raises(common.InvalidSiteName):
+            common.new_site_id(bad)
+    # 合法名照常通过
+    for good in ("expense-tracker", "notes", "a1", "x" * 30):
+        assert common.new_site_id(good)

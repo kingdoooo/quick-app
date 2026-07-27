@@ -62,7 +62,15 @@ class SiteDeployerStack(Stack):
                 build_image=cb.LinuxBuildImage.STANDARD_7_0,
                 compute_type=cb.ComputeType.SMALL),
             timeout=Duration.minutes(15))
-        artifacts.grant_read_write(package_project)
+        # 构建容器跑的是不可信站点的依赖安装：即使 --ignore-scripts，也不给它
+        # 整桶读写（否则可读/删他人上传包与产物、枚举所有 job）。
+        # 只读 uploads/*、只写 artifacts/*，且不给 ListBucket 与 DeleteObject。
+        package_project.add_to_role_policy(iam.PolicyStatement(
+            actions=["s3:GetObject"],
+            resources=[f"{artifacts.bucket_arn}/uploads/*"]))
+        package_project.add_to_role_policy(iam.PolicyStatement(
+            actions=["s3:PutObject"],
+            resources=[f"{artifacts.bucket_arn}/artifacts/*"]))
 
         exec_role = iam.Role(self, "DeployerExecRole", role_name="site-deployer-exec-role",
                              assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
@@ -70,10 +78,14 @@ class SiteDeployerStack(Stack):
                                  "service-role/AWSLambdaBasicExecutionRole")])
         for stmt in [
             iam.PolicyStatement(  # 站点 Lambda 的创建/更新，限 site- 前缀
+                # GetFunctionConfiguration 是 function_updated/function_active waiter
+                # 实际轮询的 API（不是 GetFunction）——缺它每次部署都 AccessDenied。
                 actions=["lambda:CreateFunction", "lambda:UpdateFunctionCode",
                          "lambda:UpdateFunctionConfiguration", "lambda:GetFunction",
+                         "lambda:GetFunctionConfiguration",
                          "lambda:CreateFunctionUrlConfig", "lambda:GetFunctionUrlConfig",
-                         "lambda:AddPermission", "lambda:DeleteFunction",
+                         "lambda:AddPermission", "lambda:RemovePermission",
+                         "lambda:DeleteFunction",
                          "lambda:DeleteFunctionUrlConfig", "lambda:GetLayerVersion",
                          "lambda:TagResource"],
                 resources=[f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:site-*",
@@ -104,7 +116,10 @@ class SiteDeployerStack(Stack):
                                            f"arn:aws:s3:::site-frontend-{ACCOUNT}/*"]),
             iam.PolicyStatement(actions=["codebuild:StartBuild", "codebuild:BatchGetBuilds"],
                                 resources=[package_project.project_arn]),
-            iam.PolicyStatement(actions=["dsql:DbConnectAdmin"], resources=["*"]),
+            # DbConnectAdmin 仅用于引导 schema/role；DbConnect 用于以 per-site
+            # migrator role 执行站点提交的 SQL（不可信 SQL 不碰 admin 身份）。
+            iam.PolicyStatement(actions=["dsql:DbConnectAdmin", "dsql:DbConnect"],
+                                resources=["*"]),
         ]:
             exec_role.add_to_policy(stmt)
 

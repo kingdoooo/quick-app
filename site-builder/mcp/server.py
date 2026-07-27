@@ -2,11 +2,15 @@
 运行于 AgentCore Runtime；调用者飞书 email 由网关经 JWT claims 传入。"""
 import json
 import os
+import re
 
 import boto3
 from mcp.server.fastmcp import FastMCP
 
 import common  # deployer/functions/common.py，部署包中同目录
+
+# 平台生成的 site_id 形态：<name(≤20)>-<6 位随机小写数字>
+SITE_ID_RE = re.compile(r"[a-z][a-z0-9-]{0,19}-[a-z0-9]{6}")
 
 
 class NotOwner(Exception):
@@ -51,9 +55,12 @@ def _assert_owner(owner: str, record: dict | None, what: str):
 
 def do_deploy_site(owner: str, site_name: str, site_id: str | None = None) -> dict:
     if site_id:
+        # site_id 同样进入资源名/SQL 标识符；只接受本平台生成的形态
+        if not SITE_ID_RE.fullmatch(site_id or ""):
+            raise common.InvalidSiteName(f"site_id 格式非法: {site_id!r}")
         _assert_owner(owner, common.get_site(site_id), f"站点 {site_id}")
     else:
-        site_id = common.new_site_id(site_name)
+        site_id = common.new_site_id(common.validate_site_name(site_name))
         common.upsert_site(site_id, owner=owner, name=site_name, status="DEPLOYING")
     job_id = common.create_job(owner, site_id)
     url = _s3().generate_presigned_url(

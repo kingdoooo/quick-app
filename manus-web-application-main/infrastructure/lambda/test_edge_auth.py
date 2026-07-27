@@ -109,3 +109,66 @@ def test_no_auth_route_strips_spoofed_headers_too():
     r = _req(extra_headers={"x-user-email": [{"key": "x-user-email", "value": "fake@x.com"}]})
     assert orq._check_auth(r, route, "app-x.example.com") is None
     assert "x-user-email" not in r["headers"]
+
+
+# ---- 平台会话 cookie 不得下发给不可信站点 origin ----
+
+SITE_ROUTE = {**ROUTE_AUTH, "route_mode": "split",
+              "api_target": "https://a.lambda-url.us-east-1.on.aws"}
+PLATFORM_ROUTE = {"subdomain": "auth", "site_id": "auth-service",
+                  "route_mode": "api-only", "static_prefix": "",
+                  "api_target": "https://p.lambda-url.us-east-1.on.aws",
+                  "require_auth": False, "allowed_users": "org", "owner": "platform"}
+
+
+def _route(request, route):
+    with patch.object(orq, "_add_sigv4_auth"), patch.object(orq, "_add_s3_sigv4_auth"):
+        return orq._route_request(request, dict(route))
+
+
+def test_session_cookie_not_forwarded_to_site_origin():
+    """站点代码可读到会话 JWT 即可重放到其他站点（顶域 cookie 共享登录）。"""
+    r = _req(uri="/api/x", cookie=f"sb_session={_jwt()}")
+    assert orq._check_auth(r, dict(SITE_ROUTE), "app-x.example.com") is None
+    _route(r, SITE_ROUTE)
+    assert "cookie" not in r["headers"]
+    # 身份仍通过注入头传递给站点
+    assert r["headers"]["x-user-email"][0]["value"] == "a@x.com"
+
+
+def test_site_own_cookies_survive_reserved_strip():
+    r = _req(uri="/api/x", cookie=f"theme=dark; sb_session={_jwt()}; cart=7")
+    orq._check_auth(r, dict(SITE_ROUTE), "app-x.example.com")
+    _route(r, SITE_ROUTE)
+    forwarded = r["headers"]["cookie"][0]["value"]
+    assert "sb_session" not in forwarded
+    assert "theme=dark" in forwarded and "cart=7" in forwarded
+
+
+def test_platform_route_keeps_session_cookie_and_gets_mark():
+    """auth-service 需要读 cookie（/logout）并被允许签发平台 cookie。"""
+    r = _req(uri="/logout", cookie=f"sb_session={_jwt()}")
+    orq._check_auth(r, dict(PLATFORM_ROUTE), "auth.example.com")
+    _route(r, PLATFORM_ROUTE)
+    assert "sb_session" in r["headers"]["cookie"][0]["value"]
+    assert orq.PLATFORM_MARK in r["headers"]
+
+
+def test_spoofed_platform_mark_stripped_on_site_route():
+    """客户端伪造平台标记不得让站点获得签发平台 cookie 的资格。"""
+    r = _req(uri="/api/x", cookie=f"sb_session={_jwt()}",
+             extra_headers={orq.PLATFORM_MARK: [{"key": orq.PLATFORM_MARK, "value": "1"}]})
+    orq._check_auth(r, dict(SITE_ROUTE), "app-x.example.com")
+    _route(r, SITE_ROUTE)
+    assert orq.PLATFORM_MARK not in r["headers"]
+
+
+def test_s3_signing_includes_content_sha256():
+    """S3 要求 x-amz-content-sha256；通用 SigV4Auth 不生成该头会 400 InvalidRequest。"""
+    from botocore.credentials import Credentials
+    orq.credentials = Credentials("AK", "SK", "TOKEN")
+    request = {"uri": "/sites/x/job/index.html", "headers": {}}
+    orq._add_s3_sigv4_auth(request, "b.s3.us-east-1.amazonaws.com", request["uri"])
+    assert "x-amz-content-sha256" in request["headers"]
+    signed = request["headers"]["authorization"][0]["value"]
+    assert "x-amz-content-sha256" in signed  # 且参与签名，不只是附带
