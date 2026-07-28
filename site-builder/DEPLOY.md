@@ -318,12 +318,21 @@ frontend_bucket / base_domain（从 `router/config.ini.example` 复制）。
   ```
    同 zone 下**已有的显式子域记录不受影响**（DNS 显式记录优先于通配符）；但此后
    新增子域在建记录前会先落到本方案并返回 404，排查时留意。
-5. **部署 auth-service Lambda**（Task 5 的登录端点，依赖①的 Cognito + 本步骤的路由表）：
+5. **部署 auth-service Lambda**（Task 5 的登录端点，依赖①的 Cognito + 本步骤的路由表；
+   **还依赖上一步回填的 `[Deployer] edge_role_arn`**，脚本要用它授权 Function URL）：
   ```bash
    cd ../../site-builder/auth && python3 deploy_auth.py
-   # 它会：打 zip（含 pyjwt）→ 建/更新 Lambda site-auth-service → Function URL(NONE)
+   # 它会：打 zip（含 pyjwt）→ 建/更新 Lambda site-auth-service
+   #      → Function URL(AWS_IAM，仅 edge role 可调，公网直连 403)
    #      → 生成/复用 SSM /site-builder/jwt-secret → 路由表注册 subdomain=auth (route_mode=api-only)
   ```
+
+   > Function URL **不要用 AuthType=NONE**：NONE + `Principal:*` 会被判定
+   > world-accessible（AWS 内部曾自动 mitigate——直接删光 resource policy，
+   > 导致 CloudFront 路径也 403）。Edge 对 api-only 路由同样签 SigV4，
+   > AWS_IAM + 只授权 edge role 即可，登录功能不受影响。
+   > 验证：`https://auth.{base_domain}/login` 返回 302（跳 Cognito），
+   > Function URL 直连 `/login` 返回 403 `{"Message":"Forbidden"}`。
 6. **冒烟**（CloudFront 传播需 15-30 分钟后再跑）：
   ```bash
    cd {仓库根} && bash site-builder/scripts/smoke_router.sh

@@ -1,5 +1,6 @@
 """部署 auth-service：打 zip（session.py+login_handler.py+pyjwt 依赖）→ 建/更新 Lambda
-→ Function URL(NONE) → 生成 JWT_SECRET 存 SSM → 路由表注册 subdomain=auth。幂等可重跑。"""
+→ Function URL(AWS_IAM，仅 Edge role 可调) → 生成 JWT_SECRET 存 SSM
+→ 路由表注册 subdomain=auth。幂等可重跑。"""
 import configparser
 import io
 import secrets
@@ -71,19 +72,33 @@ def main():
                             Code={"ZipFile": code}, Timeout=15, MemorySize=256,
                             Environment=env)
         lam.get_waiter("function_active").wait(FunctionName=FN)
+    # AWS_IAM 而非 NONE：NONE + Principal:* 是 world-accessible（曾被 internal security tooling
+    # 自动 mitigate——直接删光 resource policy，连 Edge 路径一起 403）。
+    # Edge 的 _route_to_lambda 对所有 Lambda URL 路由（含 api-only）都签 SigV4，
+    # 所以只授权 edge role 即可，公网直连被 IAM 挡住。
     try:
-        url = lam.create_function_url_config(FunctionName=FN, AuthType="NONE")["FunctionUrl"]
+        url = lam.create_function_url_config(FunctionName=FN, AuthType="AWS_IAM")["FunctionUrl"]
     except lam.exceptions.ResourceConflictException:
-        url = lam.get_function_url_config(FunctionName=FN)["FunctionUrl"]
+        cfg = lam.get_function_url_config(FunctionName=FN)
+        url = cfg["FunctionUrl"]
+        if cfg["AuthType"] != "AWS_IAM":
+            lam.update_function_url_config(FunctionName=FN, AuthType="AWS_IAM")
+    # 清掉历史的 Principal:* 语句（老版本部署留下的；已被 mitigate 删除时容忍不存在）
+    for sid in ("public-url", "public-url-invoke"):
+        try:
+            lam.remove_permission(FunctionName=FN, StatementId=sid)
+        except lam.exceptions.ResourceNotFoundException:
+            pass
     # 2025-10 起 Function URL 需要 InvokeFunctionUrl + InvokeFunction 两条语句
-    # （AuthType=NONE 也一样，缺一个就 403）。两条各自幂等。
+    # （缺一个就 403）。两条各自幂等；与 deploy_lambda_site.py 的站点授权同模式。
+    edge_role_arn = CFG["Deployer"]["edge_role_arn"]
     for sid, action, extra in (
-        ("public-url", "lambda:InvokeFunctionUrl", {"FunctionUrlAuthType": "NONE"}),
-        ("public-url-invoke", "lambda:InvokeFunction", {"InvokedViaFunctionUrl": True}),
+        ("edge-invoke", "lambda:InvokeFunctionUrl", {"FunctionUrlAuthType": "AWS_IAM"}),
+        ("edge-invoke-function", "lambda:InvokeFunction", {"InvokedViaFunctionUrl": True}),
     ):
         try:
             lam.add_permission(FunctionName=FN, StatementId=sid, Action=action,
-                               Principal="*", **extra)
+                               Principal=edge_role_arn, **extra)
         except lam.exceptions.ResourceConflictException:
             pass
     ddb.put_item(TableName=CFG["Platform"]["routing_table"], Item={
