@@ -1,10 +1,19 @@
 """站点下线：删路由 → 删 Lambda → 删 per-site 角色 → 清前端（paginator 分批）。
-DB 数据保留（PoC 防误删）。"""
+
+数据库默认保留（防误删）；event 传 purge_data=True 时额外清理：
+DynamoDB 的 site-data-{site_id}-* 表、DSQL 的 per-site schema / role / IAM 映射。
+清理只能在这里做——站点运行时角色既无 DeleteTable 也无 DbConnectAdmin，
+Skill 与站点代码都没有这个能力。
+"""
+import logging
 import os
 
 import boto3
 
 import common
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 
 def _lambda():
@@ -18,6 +27,61 @@ def _delete_prefix(s3, bucket: str, prefix: str):
         objs = [{"Key": o["Key"]} for o in page.get("Contents", [])]
         for i in range(0, len(objs), 1000):
             s3.delete_objects(Bucket=bucket, Delete={"Objects": objs[i:i + 1000]})
+
+
+def _purge_dynamodb(site_id: str, tables: list[str]) -> list[str]:
+    """删除本站点声明过的 site-data-{site_id}-{name} 表。返回已删表名。
+
+    表名由 manifest 的 database.tables 推导，不用 ListTables 枚举——
+    ListTables 不支持资源级限定，给它权限等于允许列举账号内所有表，
+    而执行器角色的其他 DynamoDB 权限都严格限定在 site-* 前缀内。
+    """
+    ddb = boto3.client("dynamodb")
+    deleted = []
+    for t in tables:
+        name = f"site-data-{site_id}-{t}"
+        try:
+            ddb.delete_table(TableName=name)
+            deleted.append(name)
+        except ddb.exceptions.ResourceNotFoundException:
+            pass
+    return deleted
+
+
+def _purge_dsql(site_id: str) -> str:
+    """删除本站点的 DSQL schema、两个 per-site role 及其 IAM 映射。
+
+    顺序关键：必须先 AWS IAM REVOKE 再 DROP ROLE，否则 DROP ROLE 报 2BP01
+    （有对象依赖）。不做这步会在 sys.iam_pg_role_mappings 里留下指向已删 IAM
+    角色的孤儿映射。
+    """
+    import psycopg
+
+    endpoint = os.environ["DSQL_ENDPOINT"]
+    if not endpoint:
+        return "skipped: DSQL_ENDPOINT 未配置"
+    schema = common.dsql_schema_for(site_id)
+    token = boto3.client("dsql").generate_db_connect_admin_auth_token(Hostname=endpoint)
+    conn = psycopg.connect(host=endpoint, dbname="postgres", user="admin",
+                           password=token, sslmode="require", autocommit=True)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT arn, pg_role_name FROM sys.iam_pg_role_mappings "
+                    "WHERE pg_role_name LIKE %s", (f"{schema}%",))
+        for arn, role in cur.fetchall():
+            try:
+                cur.execute(f"AWS IAM REVOKE {role} FROM '{arn}'")
+            except Exception as e:
+                logger.warning(f"REVOKE {role} <- {arn} 失败: {e}")
+        cur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        for role in (f"{schema}_app", f"{schema}_mig"):
+            try:
+                cur.execute(f"DROP ROLE IF EXISTS {role}")
+            except Exception as e:
+                logger.warning(f"DROP ROLE {role} 失败: {e}")
+        return f"purged schema {schema} + roles"
+    finally:
+        conn.close()
 
 
 def handler(event, context):
@@ -46,6 +110,31 @@ def handler(event, context):
     _delete_prefix(boto3.client("s3"), os.environ["FRONTEND_BUCKET"],
                    f"sites/{site_id}/")
 
+    # 数据清理默认关闭：站点下线通常只是停止对外服务，数据误删不可恢复。
+    # 清理失败不改变下线结果（路由/Lambda 已删，站点确实已下线）。
+    purged: dict = {}
+    if event.get("purge_data"):
+        site = common.get_site(site_id) or {}
+        engine = (event.get("engine")
+                  or ("dsql" if site.get("tier") == "fullstack-sql" else "dynamodb"))
+        # 表名取自 provision_dynamodb 写入 sites 表的 data_tables；
+        # 允许 event 覆盖，便于清理历史站点（该字段是本次新增的）
+        tables = event.get("data_tables") or list(site.get("data_tables", []))
+        try:
+            purged["dynamodb"] = _purge_dynamodb(site_id, tables)
+        except Exception as e:
+            logger.warning(f"DynamoDB 清理失败: {e}")
+            purged["dynamodb_error"] = str(e)[:200]
+        if engine == "dsql":
+            try:
+                purged["dsql"] = _purge_dsql(site_id)
+            except Exception as e:
+                logger.warning(f"DSQL 清理失败: {e}")
+                purged["dsql_error"] = str(e)[:200]
+
     common.upsert_site(site_id, status="DELETED")
     common.update_job(event["job_id"], status="DELETED")
-    return {"job_id": event["job_id"], "status": "DELETED"}
+    result = {"job_id": event["job_id"], "status": "DELETED"}
+    if purged:
+        result["purged"] = purged
+    return result

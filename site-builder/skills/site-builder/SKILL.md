@@ -36,6 +36,10 @@ description: 开发并一键部署简易 Web 站点到 AWS。当用户想创建/
 6. **迭代**：用户要改站点 → 改代码 → 同 site_id 重新走部署流程（URL 不变，
    schema 变更写 `backend/migrations/NNN_描述.sql`，不改已有 schema.sql）。
 7. **管理**：`list_my_sites` 列站点；`undeploy_site(site_id)` 下线（先跟用户确认）。
+   下线默认**保留数据库数据**。若用户明确要求"连数据一起删干净"，再传
+   `purge_data=true`——它会永久删除该站点的数据表 / DSQL schema，**不可恢复**，
+   传之前必须单独确认一次（"确认要一并删除数据吗？此操作不可恢复"）。
+   不确定就用默认值，数据留着比误删好。
 
 ## 关键约束速查（详见 references/）
 

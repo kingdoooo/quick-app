@@ -73,8 +73,15 @@ def build_and_push(image_uri: str) -> None:
         user, pwd = base64.b64decode(token["authorizationToken"]).decode().split(":", 1)
         _run(["docker", "login", "--username", user, "--password-stdin",
               token["proxyEndpoint"]], input=pwd.encode())
-        # buildx + --platform linux/arm64：AgentCore 只接受 ARM64
+        # --platform linux/arm64：AgentCore 只接受 ARM64（Graviton）。
+        # --provenance=false 必需：buildx 默认往 manifest list 里加一条
+        # os=unknown/arch=unknown 的 attestation manifest，CreateAgentRuntime
+        # 校验镜像时会失败，且报错文案误导为
+        # "Access denied while validating ECR URI ... requires permissions for
+        #  ecr:GetAuthorizationToken, ecr:BatchGetImage, ..."
+        # ——实际与 IAM 权限无关（权限齐全时同样报这个）。
         _run(["docker", "buildx", "build", "--platform", "linux/arm64",
+              "--provenance=false",
               "-t", image_uri, "--push", str(HERE)])
     finally:
         (HERE / "common.py").unlink(missing_ok=True)

@@ -23,4 +23,9 @@ def handler(event, context):
             pass
         env_vars[f"TABLE_{spec['name'].upper()}"] = table_name
     event["env_vars"] = env_vars
+    # 记下已建表的逻辑名，供 undeploy --purge_data 精确删除。
+    # 不能靠 ListTables 反查：该动作不支持资源级限定，授权它等于放开全账号表枚举。
+    names = [s["name"] for s in event["manifest"]["database"].get("tables", [])]
+    if names:
+        common.upsert_site(event["site_id"], data_tables=names)
     return event

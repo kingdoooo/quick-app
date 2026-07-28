@@ -134,13 +134,23 @@ def do_list_sites(owner: str) -> list[dict]:
             for s in items]
 
 
-def do_undeploy(owner: str, site_id: str) -> dict:
-    _assert_owner(owner, common.get_site(site_id), f"站点 {site_id}")
+def do_undeploy(owner: str, site_id: str, purge_data: bool = False) -> dict:
+    site = common.get_site(site_id)
+    _assert_owner(owner, site, f"站点 {site_id}")
     job_id = common.create_job(owner, site_id)
+    payload = {"job_id": job_id, "site_id": site_id}
+    if purge_data:
+        payload["purge_data"] = True
+        # tier 决定该清 DynamoDB 表还是 DSQL schema/role
+        payload["engine"] = ("dsql" if (site or {}).get("tier") == "fullstack-sql"
+                            else "dynamodb")
+        tables = list((site or {}).get("data_tables", []))
+        if tables:
+            payload["data_tables"] = tables
     _lambda().invoke(FunctionName="site-deployer-undeploy",
                      InvocationType="Event",
-                     Payload=json.dumps({"job_id": job_id, "site_id": site_id}))
-    return {"job_id": job_id}
+                     Payload=json.dumps(payload))
+    return {"job_id": job_id, "purge_data": bool(purge_data)}
 
 
 # ---------- MCP 壳 ----------
@@ -208,9 +218,13 @@ def list_my_sites() -> list:
 
 
 @mcp.tool()
-def undeploy_site(site_id: str) -> dict:
-    """下线站点（删路由/Lambda/前端；数据库数据保留）。仅站点所有者可操作。"""
-    return do_undeploy(_caller_email(), site_id)
+def undeploy_site(site_id: str, purge_data: bool = False) -> dict:
+    """下线站点：删路由/Lambda/前端。仅站点所有者可操作。
+
+    purge_data=False（默认）：数据库数据保留，可留待排查或后续恢复。
+    purge_data=True：额外永久删除该站点的 DynamoDB 表 / DSQL schema 与角色。
+      不可恢复——必须先向用户明确确认再传 true。"""
+    return do_undeploy(_caller_email(), site_id, purge_data)
 
 
 if __name__ == "__main__":
