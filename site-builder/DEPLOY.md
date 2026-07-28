@@ -331,6 +331,24 @@ frontend_bucket / base_domain（从 `router/config.ini.example` 复制）。
 
    预期 6 行 PASS：static route / no cross-site cache / auth 302 / auth subdomain api-only routing / unknown 404 / route update visible。
 
+   脚本会往路由表与前端桶写测试数据（`app-smoke*` 路由、`sites/smoke*` 对象），
+   验证完记得清理：删掉那几条 `subdomain` item 与 `s3://{frontend_bucket}/sites/smoke*`。
+
+   除脚本外建议再手工验一次**带真实会话 cookie 的鉴权闭环**（脚本只验到 302）：
+  ```bash
+   SECRET=$(aws ssm get-parameter --name /site-builder/jwt-secret --with-decryption \
+     --region us-east-1 --query 'Parameter.Value' --output text)
+   COOKIE=$(python3 -c "
+   import sys; sys.path.insert(0,'site-builder/auth')
+   from session import mint_session_jwt
+   print(mint_session_jwt('you@example.com','You',sys.argv[1]),end='')" "$SECRET")
+   # 对一个 require_auth=true 的测试路由：
+   curl -s -o /dev/null -w '%{http_code}\n' https://app-<test>.{base_domain}/            # 期望 302
+   curl -s -w '\n' -H "Cookie: sb_session=$COOKIE" https://app-<test>.{base_domain}/     # 期望 200 + 内容
+   curl -s -o /dev/null -w '%{http_code}\n' -H "Cookie: sb_session=${COOKIE}x" \
+     https://app-<test>.{base_domain}/                                                    # 期望 302（验签失败）
+  ```
+
 ---
 
 ## ③ Aurora DSQL cluster（Task 13）
