@@ -31,9 +31,32 @@ email 注入 access token。客户端无需任何额外配置；若 owner 取不
 mkdir -p ~/.claude/skills
 cp -r site-builder/skills/site-builder ~/.claude/skills/
 
-# MCP（HTTP transport，OAuth 走浏览器授权）
-claude mcp add --transport http site-builder-deploy "{mcp_endpoint_url}"
+# MCP（HTTP transport，OAuth 走浏览器授权）。
+# 必须带 --client-id 与固定回调端口：Cognito 不支持 RFC 7591 dynamic client
+# registration，裸 add 会报 "Incompatible auth server: does not support
+# dynamic client registration"（2026-07-29 实测）。
+claude mcp add --transport http site-builder-deploy "{mcp_endpoint_url}" \
+  --client-id {mcp_client_id} --callback-port 8765
 ```
+
+还要在 deploy-mcp app client 的 CallbackURLs 里**预注册**
+`http://localhost:8765/callback`（与 AgentCore 的 identities 回调并存）：
+
+```bash
+aws cognito-idp update-user-pool-client --region us-east-1 \
+  --user-pool-id {user_pool_id} --client-id {mcp_client_id} \
+  --client-name deploy-mcp --refresh-token-validity 30 \
+  --supported-identity-providers Feishu \
+  --callback-urls "https://bedrock-agentcore.us-east-1.amazonaws.com/identities/oauth2/callback" \
+                  "http://localhost:8765/callback" \
+  --allowed-o-auth-flows code --allowed-o-auth-scopes openid email \
+  --allowed-o-auth-flows-user-pool-client --enable-token-revocation \
+  --auth-session-validity 3 \
+  --explicit-auth-flows ALLOW_USER_SRP_AUTH ALLOW_REFRESH_TOKEN_AUTH
+```
+
+配好后 `claude mcp list` 显示 `! Needs authentication`，在 Claude Code 会话里
+`/mcp` → 选 site-builder-deploy → Authenticate，浏览器走飞书登录完成授权。
 
 新会话里提示：
 
