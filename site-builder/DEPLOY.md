@@ -391,11 +391,25 @@ migrator role 能在本 schema 建表，但建其他 schema / 建角色 / 改 IA
   to change default privileges）。代码已按 best-effort 处理，末尾对已有表的显式
   `GRANT` 是真正生效的那条——实测运行时 role 靠它拿到读写权限，功能不受影响。
 - **`undeploy` 不清理 DSQL 侧资源**（schema / per-site role / IAM 映射），
-  这是 PoC 有意的"数据保留防误删"。但它会删掉 `site-rt-*` IAM 角色，于是
-  `sys.iam_pg_role_mappings` 里留下指向已删角色的孤儿映射。手工清理顺序有讲究：
-  必须先 `AWS IAM REVOKE {role} FROM '{arn}'`，再 `DROP ROLE`——否则
-  `DROP ROLE` 报 2BP01（有对象依赖）。清 schema 用
-  `DROP SCHEMA "site_xxx" CASCADE`。
+  这是 PoC 有意的"数据保留防误删"，DynamoDB 的 `site-data-*` 表同理保留。
+  但它会删掉 `site-rt-*` IAM 角色，于是 `sys.iam_pg_role_mappings` 里留下指向
+  已删角色的孤儿映射（④ 冒烟后实测复现）。孤儿映射本身无安全风险（目标角色已
+  不存在，无法用它认证），但会累积。手工清理顺序有讲究：
+
+  ```sql
+  -- 必须先 REVOKE 再 DROP ROLE，否则 DROP ROLE 报 2BP01（有对象依赖）
+  AWS IAM REVOKE site_xxx_app FROM 'arn:aws:iam::{account_id}:role/site-rt-xxx';
+  AWS IAM REVOKE site_xxx_mig FROM 'arn:aws:iam::{account_id}:role/site-deployer-exec-role';
+  DROP SCHEMA "site_xxx" CASCADE;
+  DROP ROLE site_xxx_app;
+  DROP ROLE site_xxx_mig;
+  ```
+
+  查残留：
+  ```sql
+  SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE 'site_%';
+  SELECT arn, pg_role_name FROM sys.iam_pg_role_mappings WHERE pg_role_name LIKE 'site_%';
+  ```
 
 ---
 
