@@ -39,8 +39,24 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _ssl_context():
+    """显式用 certifi 的 CA bundle。
+
+    macOS 上系统 Python 的默认信任库常为空（get_ca_certs() 返回 0 条），
+    urllib 会以 CERTIFICATE_VERIFY_FAILED 失败，而同一 URL curl 正常——
+    那是本机环境问题，不该表现为 E2E 失败。
+    """
+    import ssl
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
 def _req(url, method="GET", cookie=None, body=None):
-    opener = urllib.request.build_opener(NoRedirect)
+    opener = urllib.request.build_opener(
+        NoRedirect, urllib.request.HTTPSHandler(context=_ssl_context()))
     headers = {"Content-Type": "application/json"}
     if cookie:
         headers["Cookie"] = cookie
@@ -54,14 +70,23 @@ def _req(url, method="GET", cookie=None, body=None):
 
 
 def _deploy(fixture: str) -> str:
-    """部署 fixture，返回站点 URL。"""
+    """部署 fixture，返回站点 URL。
+
+    deploy_fixture.py 先打印若干进度行（`  [RUNNING] validate`），最后打印
+    json.dumps(job, indent=2) —— 是多行的，最后一行只是 `}`。所以只能从
+    第一个 `{` 起整块解析，不能取最后一行。
+    """
     r = subprocess.run([sys.executable,
                         str(ROOT / "site-builder/scripts/deploy_fixture.py"),
                         str(ROOT / f"site-builder/fixtures/{fixture}")],
                        capture_output=True, text=True, timeout=1200)
     assert r.returncode == 0, r.stdout + r.stderr
-    return json.loads(r.stdout.splitlines()[-1].strip() or "{}").get("url") \
-        or [l for l in r.stdout.splitlines() if '"url"' in l][-1].split('"')[3]
+    start = r.stdout.find("{")
+    assert start != -1, f"未找到 job JSON:\n{r.stdout}"
+    job = json.loads(r.stdout[start:])
+    url = job.get("url")
+    assert url, f"job 无 url 字段: {job}"
+    return url
 
 
 def test_static_site_public_200():
