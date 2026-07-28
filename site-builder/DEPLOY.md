@@ -399,11 +399,14 @@ migrator role 能在本 schema 建表，但建其他 schema / 建角色 / 改 IA
 - `ALTER DEFAULT PRIVILEGES FOR ROLE` **会被 DSQL 拒绝**（42501 permission denied
   to change default privileges）。代码已按 best-effort 处理，末尾对已有表的显式
   `GRANT` 是真正生效的那条——实测运行时 role 靠它拿到读写权限，功能不受影响。
-- **`undeploy` 不清理 DSQL 侧资源**（schema / per-site role / IAM 映射），
-  这是 PoC 有意的"数据保留防误删"，DynamoDB 的 `site-data-*` 表同理保留。
-  但它会删掉 `site-rt-*` IAM 角色，于是 `sys.iam_pg_role_mappings` 里留下指向
-  已删角色的孤儿映射（④ 冒烟后实测复现）。孤儿映射本身无安全风险（目标角色已
-  不存在，无法用它认证），但会累积。手工清理顺序有讲究：
+- **`undeploy` 默认不清理数据侧资源**（DSQL schema / per-site role / IAM 映射，
+  DynamoDB 的 `site-data-*` 表同理），这是"数据保留防误删"的默认行为。
+  传 `purge_data=true`（MCP 工具 `undeploy_site` 的参数，需向用户确认后再传）
+  才会连数据一起清——**已真机验证（2026-07-29）**：purge 后 DSQL 无孤儿
+  schema/role/映射、`site-data-*` 表删除。
+  默认（不 purge）路径会删掉 `site-rt-*` IAM 角色，于是 `sys.iam_pg_role_mappings`
+  里留下指向已删角色的孤儿映射（④ 冒烟后实测复现）。孤儿映射本身无安全风险
+  （目标角色已不存在，无法用它认证），但会累积。手工清理顺序有讲究：
 
   ```sql
   -- 必须先 REVOKE 再 DROP ROLE，否则 DROP ROLE 报 2BP01（有对象依赖）
