@@ -303,6 +303,8 @@ frontend_bucket / base_domain（从 `router/config.ini.example` 复制）。
   ```
    *.{base_domain}  →  {distribution_domain_name}  (如 d1234abcd.cloudfront.net)
   ```
+   同 zone 下**已有的显式子域记录不受影响**（DNS 显式记录优先于通配符）；但此后
+   新增子域在建记录前会先落到本方案并返回 404，排查时留意。
 5. **部署 auth-service Lambda**（Task 5 的登录端点，依赖①的 Cognito + 本步骤的路由表）：
   ```bash
    cd ../../site-builder/auth && python3 deploy_auth.py
