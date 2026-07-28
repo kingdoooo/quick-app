@@ -83,8 +83,9 @@ Agent 客户端）里用自然语言开发简易全栈站点，说一句"部署"
 - 跑测试：多数包用各自目录下 `.venv/bin/pytest -q`；两个例外——
   `site-builder/auth` 无自己的 venv，用 `site-builder/contract/.venv/bin/pytest tests`（含 pyjwt）；
   `site-builder/deployer` 须 `pytest tests`（裸 `pytest -q` 会误收集 `infra/cdk.out` 的 asset 副本）。
-- venv 里的 shebang 是绝对路径：若克隆到别的路径或移动过目录，先 `rm -rf .venv`
-  再重建（`python3 -m venv` 对已存在目录不会重写 shebang，会一直报 bad interpreter）。
+- venv 里的 shebang 是绝对路径：若克隆到别的路径或移动过目录，用
+  `python3 -m venv --clear .venv` 重建（不带 `--clear` 时对已存在目录不会重写
+  shebang，会一直报 bad interpreter）。
 
 ## 部署前置要求
 
