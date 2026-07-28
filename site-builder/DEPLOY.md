@@ -381,6 +381,22 @@ echo "$CID.dsql.us-east-1.on.aws"
 
 > `--no-deletion-protection-enabled` 是为了 PoC 便于清理；生产环境应开启删除保护。
 
+**DSQL 权限模型已在真实 cluster 验证通过**（2026-07-28，此前标注为"未验证"）：
+`AWS IAM GRANT` 语法可用、两条 per-site 映射确实写入 `sys.iam_pg_role_mappings`；
+migrator role 能在本 schema 建表，但建其他 schema / 建角色 / 改 IAM 映射全部被
+拒（sqlstate 42501）；运行时 role 能读写表但不能建表。
+
+两点实测结论：
+- `ALTER DEFAULT PRIVILEGES FOR ROLE` **会被 DSQL 拒绝**（42501 permission denied
+  to change default privileges）。代码已按 best-effort 处理，末尾对已有表的显式
+  `GRANT` 是真正生效的那条——实测运行时 role 靠它拿到读写权限，功能不受影响。
+- **`undeploy` 不清理 DSQL 侧资源**（schema / per-site role / IAM 映射），
+  这是 PoC 有意的"数据保留防误删"。但它会删掉 `site-rt-*` IAM 角色，于是
+  `sys.iam_pg_role_mappings` 里留下指向已删角色的孤儿映射。手工清理顺序有讲究：
+  必须先 `AWS IAM REVOKE {role} FROM '{arn}'`，再 `DROP ROLE`——否则
+  `DROP ROLE` 报 2BP01（有对象依赖）。清 schema 用
+  `DROP SCHEMA "site_xxx" CASCADE`。
+
 ---
 
 ## ④ 异步执行器 — SiteDeployerStack（Task 17）
