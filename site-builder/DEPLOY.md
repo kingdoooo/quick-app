@@ -298,6 +298,19 @@ frontend_bucket / base_domain（从 `router/config.ini.example` 复制）。
 
    stack.py 部署时会从 SSM 读真实 JWT_SECRET 注入 Edge 函数（`load_jwt_secret`）；若打印
    `SYNTH-ONLY-PLACEHOLDER` 警告说明 SSM 读取失败，**不要继续**——检查凭证与 SSM 参数。
+
+   > **`cdk deploy` 会长时间挂在最后一步**（Lambda@Edge 复制到全球边缘节点，可达
+   > 10-20 分钟），期间 CloudFormation 可能已是 `UPDATE_COMPLETE`。用
+   > `aws cloudfront get-distribution --id {distribution_id} --query 'Distribution.Status'`
+   > 判断是否 `Deployed`，不必盯着 CLI 输出。
+   >
+   > **改过 config.ini 后要先 `rm -rf cdk.out`**：陈旧 asset 里仍是旧的
+   > `BASE_DOMAIN`，直接 synth/deploy 会用到过期值。
+   >
+   > **`default_origin` 必须是可解析域名**。origin-request 事件在 CloudFront 解析
+   > origin **之后**才触发，填不可解析的值（如 `.invalid` 保留 TLD）会让所有请求
+   > 在 Edge 执行前就 `502 CloudFront wasn't able to resolve the origin domain name`,
+   > 连 Edge 自己的 404 都返回不了。
 3. 记录 CfnOutput 的 **EdgeRoleArn**，回填 `site-builder/config.ini [Deployer] edge_role_arn`（Task 17 执行器需要它给站点 Function URL 授权）。记录 **DistributionDomainName**。
 4. DNS：在 `{base_domain}` 加通配符 CNAME 或 A-alias 指向 CloudFront 域名：
   ```

@@ -20,7 +20,13 @@ domain_name = *.example.com
 # ACM certificate ARN in us-east-1 region for your domain
 # Create certificate in ACM console and copy the ARN here
 certificate_arn = arn:aws:acm:us-east-1:123456789012:certificate/your-cert-id
-# Default origin (placeholder, can keep as is)
+# Fallback origin. The edge function rewrites the origin on every normal path,
+# but CloudFront resolves this domain BEFORE invoking the origin-request event —
+# so it MUST be a resolvable domain. Using a non-resolvable value (e.g. anything
+# under the reserved .invalid TLD) makes every request fail with
+# "502 CloudFront wasn't able to resolve the origin domain name" before the edge
+# function ever runs, so it cannot even return its own 404/403.
+# Keep example.com unless you have a reason to change it.
 default_origin = example.com
 # Origin request policy name (optional, can keep default)
 origin_request_policy_name = ApplicationWebRouterPolicy
