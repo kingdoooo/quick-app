@@ -43,9 +43,33 @@ aws acm describe-certificate --region us-east-1 \
 
 证书 ARN 填 `router/config.ini` 的 `[CloudFront] certificate_arn`。
 
-> **建议用专用域名或子域**（如 `apps.example.com`）：会话 cookie 下发在
-> `.{base_domain}`，所有 `app-*.{base_domain}` 站点共享一次登录。用承载其他
-> 业务的主域会让会话作用域覆盖无关系统。
+**强烈建议用专用二级子域作为 `{base_domain}`**（如 `app.example.com`，而不是
+`example.com`）。三个原因：
+
+1. **通配符 DNS 会抢占主域下所有未定义子域**。路由层要求
+   `*.{base_domain}` 指向 CloudFront，Edge 查不到路由表记录就返回 404。若主域下
+   已有其他服务（`api.`、`chat.` 等各自指向不同 CloudFront/ALB），显式记录优先级
+   高于通配符、不会被覆盖；但此后**新增**任何子域都会先落到本方案的 404，容易误诊。
+2. **`auth.{base_domain}` 是本方案固定占用的登录端点**。若主域下这个名字已被占用，
+   必须换 `{base_domain}`——代码里 `auth.` 前缀写死在 Edge 重定向、OAuth
+   `redirect_uri` 与 cookie 作用域三处，不是配置项。
+3. 会话 cookie 下发在 `.{base_domain}`，用专用子域能把作用域限制在建站平台内，
+   不外溢到主域其他系统。
+
+**用二级子域时注意证书**：ACM 通配符只匹配一层，`*.example.com` **不覆盖**
+`*.app.example.com`。所以 `{base_domain}=app.example.com` 时必须单独申请
+`*.app.example.com` 证书（已有的 `*.example.com` 证书不能复用）。
+
+代码对二级子域无额外要求：Edge 取 host 第一段 label 作路由键
+（`app-notes-abc.app.example.com` → `app-notes-abc`），层数不影响。
+
+```
+{base_domain} = app.example.com
+  站点：  https://app-{site_id}.app.example.com
+  登录：  https://auth.app.example.com
+  DNS：   *.app.example.com  →  CloudFront
+  证书：  *.app.example.com（us-east-1）
+```
 
 ### 飞书企业自建应用
 
