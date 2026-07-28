@@ -234,15 +234,29 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
 
 **产出**：CloudFront 分发（`*.<BASE_DOMAIN>`）+ 扩展路由表 + 前端桶；回填 `config.ini [Deployer] edge_role_arn`。
 
+**前置**（来自 ①，缺任一项本阶段会失败）：
+- `site-builder/config.ini [Cognito]` 四项已填（步骤 5 的 auth-service 要读
+  `site_client_id`）
+- SSM `/site-builder/site-client-secret` 已写入（① 步骤 6）
+- SSM `/site-builder/jwt-secret` 已存在（§0；栈部署时注入 Edge 函数）
+
 确认 `router/config.ini` 已填好：account_id / domain_name / certificate_arn /
 frontend_bucket / base_domain（从 `router/config.ini.example` 复制）。
 
-1. 建私有前端桶（若不存在）：
+1. 建私有前端桶（若不存在）。**注意此桶不由 CDK 管理**，需手工建并配好
+   public-access-block 与生命周期规则：
   ```bash
+   # us-east-1 不要带 --create-bucket-configuration LocationConstraint
    aws s3api create-bucket --bucket site-frontend-<ACCOUNT_ID> --region us-east-1
    aws s3api put-public-access-block --bucket site-frontend-<ACCOUNT_ID> \
      --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+   # 旧版本前端清理：upload_frontend 只写新前缀不删旧的（发布期间线上仍用旧前缀），
+   # mark_job 成功后清理当前站点旧版本；这条规则是兜底，防残留无限累积。
+   aws s3api put-bucket-lifecycle-configuration --bucket site-frontend-<ACCOUNT_ID> \
+     --lifecycle-configuration '{"Rules":[{"ID":"expire-old-site-versions","Status":"Enabled","Filter":{"Prefix":"sites/"},"Expiration":{"Days":30}}]}'
   ```
+   桶必须保持私有：Edge 函数用 SigV4 签名读它（见 `_add_s3_sigv4_auth`），
+   不依赖公开访问。
 2. 部署栈（首次需先 bootstrap）：
   ```bash
    cd router/infrastructure
