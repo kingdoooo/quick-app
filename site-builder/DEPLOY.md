@@ -356,15 +356,30 @@ frontend_bucket / base_domain（从 `router/config.ini.example` 复制）。
 **产出**：共享 DSQL cluster；回填 `config.ini [DSQL] cluster_endpoint`。
 
 ```bash
-aws dsql create-cluster --region us-east-1 \
+# 建 cluster（返回 identifier，26 位小写字母数字）
+CID=$(aws dsql create-cluster --region us-east-1 \
   --tags Key=project,Value=site-builder \
-  --no-deletion-protection-enabled
-aws dsql list-clusters --region us-east-1
-# 取 endpoint（形如 {cluster_id}.dsql.us-east-1.on.aws），回填 [DSQL] cluster_endpoint
+  --no-deletion-protection-enabled \
+  --query 'identifier' --output text)
+echo "cluster id: $CID"
+
+# 等状态变 ACTIVE（通常几十秒）
+aws dsql get-cluster --identifier "$CID" --region us-east-1 --query 'status' --output text
+
+# endpoint 需按固定格式自己拼——API 不返回它：
+echo "$CID.dsql.us-east-1.on.aws"
 ```
 
-站点数据隔离由执行器在部署 SQL 站点时创建 per-site schema + per-site PG role +
-`AWS IAM GRANT` 到该站点执行角色（provision_dsql.py）。此处只需 cluster 存在。
+**回填 `[DSQL] cluster_endpoint` 用裸主机名**，形如
+`abcdefghij0123456789abcdef.dsql.us-east-1.on.aws`——不要带 `https://`、
+不要带端口、不要带路径。它同时被用作 `generate_db_connect_auth_token` 的
+`Hostname` 参数与 psycopg / pg 的 `host`，多余前缀会导致签名或连接失败。
+
+站点数据隔离由执行器在部署 SQL 站点时创建 per-site schema + 两个 per-site PG role
+（运行时 role 只读写本 schema 的表，migrator role 才能建对象）+ `AWS IAM GRANT`
+映射到对应 IAM 角色（`provision_dsql.py`）。此处只需 cluster 存在且 ACTIVE。
+
+> `--no-deletion-protection-enabled` 是为了 PoC 便于清理；生产环境应开启删除保护。
 
 ---
 
