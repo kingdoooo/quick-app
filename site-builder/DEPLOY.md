@@ -177,7 +177,14 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    aws cognito-idp list-identity-providers --user-pool-id <USER_POOL_ID> \
      --region us-east-1 --query 'Providers[].{Name:ProviderName,Type:ProviderType}'
   ```
-5. 建两个 App Client（站点登录用带 secret，MCP 用）：
+5. 建两个 App Client（**不要复用上游已有的 Desktop/Web client**，那两个是给 Quick
+   登录用的）：
+
+   **回调 URL 用你自己的域名 `https://auth.<BASE_DOMAIN>/callback`**，不是 Cognito
+   的 Hosted UI 域名。`login_handler.py` 在 /login 与 /callback 两处都发送
+   `f"https://auth.{BASE_DOMAIN}/callback"` 作为 `redirect_uri`，Cognito 侧登记的
+   值必须与它逐字符相同，否则换 token 时报 `redirect_mismatch`。
+
   ```bash
    # 站点登录 client（confidential，带 secret）
    aws cognito-idp create-user-pool-client --region us-east-1 \
@@ -186,18 +193,30 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
      --allowed-o-auth-flows code --allowed-o-auth-scopes openid email profile \
      --allowed-o-auth-flows-user-pool-client \
      --supported-identity-providers <IdP名> \
-     --callback-urls https://auth.<BASE_DOMAIN>/callback
-   # → 记录 ClientId 回填 [Cognito] site_client_id
-  
-   # MCP client（AgentCore 用；回调 URL 见 Task 20 spike 结论）
+     --callback-urls https://auth.<BASE_DOMAIN>/callback \
+     --logout-urls https://auth.<BASE_DOMAIN>/logout \
+     --query 'UserPoolClient.ClientId' --output text
+   # → 输出的 ClientId 回填 [Cognito] site_client_id
+   # （--logout-urls 当前代码用不到：/logout 只清本地 cookie 不跳 Cognito 全局登出；
+   #   先登记好，二期接全局登出时免改配置）
+
+   # MCP client（AgentCore 用，public client 不加 --generate-secret）
    aws cognito-idp create-user-pool-client --region us-east-1 \
      --user-pool-id <USER_POOL_ID> --client-name deploy-mcp \
      --allowed-o-auth-flows code --allowed-o-auth-scopes openid email \
      --allowed-o-auth-flows-user-pool-client \
      --supported-identity-providers <IdP名> \
-     --callback-urls https://bedrock-agentcore.us-east-1.amazonaws.com/identities/oauth2/callback
-   # → 记录 ClientId 回填 [Cognito] mcp_client_id
+     --callback-urls https://bedrock-agentcore.us-east-1.amazonaws.com/identities/oauth2/callback \
+     --query 'UserPoolClient.ClientId' --output text
+   # → 输出的 ClientId 回填 [Cognito] mcp_client_id
   ```
+
+   > 建完后可核对回调是否登记正确：
+   > ```bash
+   > aws cognito-idp describe-user-pool-client --user-pool-id <USER_POOL_ID> \
+   >   --client-id <site_client_id> --region us-east-1 \
+   >   --query 'UserPoolClient.{Callbacks:CallbackURLs,Scopes:AllowedOAuthScopes,IdPs:SupportedIdentityProviders}'
+   > ```
 6. 把站点 client 的 secret 存 SSM（Task 5 的 auth-service 部署要读）：
   ```bash
    aws cognito-idp describe-user-pool-client --user-pool-id <USER_POOL_ID> \
