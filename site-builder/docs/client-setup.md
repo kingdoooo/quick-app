@@ -17,13 +17,13 @@ https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/<url-encoded-runtime-
 （`allowedClients=[mcp_client_id]`），调用必须带 `Authorization: Bearer <token>`。
 
 **token 里必须有 `email` claim**——`owner`（谁部署的、谁能改）就取自它。
-Cognito access token 默认不含 email；若冒烟发现 owner 取不到，两个选择：
-
-1. 让 AgentCore 收到 id_token：authorizer 改用 `allowedAudience=[mcp_client_id]`
-   （id_token 用 `aud` 而非 `client_id`），改 `deploy_agentcore.py` 里那一段；
-2. 保留 access token，加 Cognito pre-token-generation Lambda 把 email 注入 claim。
-
-判定方法见下面每个客户端的冒烟步骤。
+这一点已真机钉死（2026-07-29）：网关只接受 **access token**（id_token 会被
+401 拒，"Claim 'client_id' value mismatch"），而 Cognito access token 默认
+不含 email，所以平台已部署 **pre-token-generation V2 Lambda**
+（`auth/pre_token_email.py` → 函数 `site-auth-pre-token`，挂在用户池上）把
+email 注入 access token。客户端无需任何额外配置；若 owner 取不到，先确认该
+触发器还挂在用户池 `LambdaConfig.PreTokenGenerationConfig`（V2_0）上。
+**不要**把 authorizer 改成 `allowedAudience`——那会反过来拒掉 access token。
 
 ## Claude Code（自动化程度最高，先在这里验证）
 

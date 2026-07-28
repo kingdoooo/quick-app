@@ -177,8 +177,11 @@ def deploy_runtime(image_uri: str, role_arn: str) -> dict:
         roleArn=role_arn,
         networkConfiguration={"networkMode": "PUBLIC"},
         protocolConfiguration={"serverProtocol": "MCP"},
-        # allowedClients 对应 access token 的 client_id；若真机确认 AgentCore 透传的是
-        # id_token，改用 allowedAudience=[client_id]（见 AGENTCORE-SPIKE.md §6）。
+        # allowedClients 对应 access token 的 client_id。真机已钉死（2026-07-29）：
+        # MCP 客户端发的就是 access token，id_token 会被网关 401
+        # （"Claim 'client_id' value mismatch"）——不要改 allowedAudience。
+        # email 靠 pre-token-generation Lambda 注入 access token
+        # （auth/pre_token_email.py，见 AGENTCORE-SPIKE.md §7）。
         authorizerConfiguration={"customJWTAuthorizer": {
             "discoveryUrl": _discovery_url(),
             "allowedClients": [client_id]}},

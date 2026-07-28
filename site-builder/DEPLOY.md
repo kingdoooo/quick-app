@@ -487,10 +487,15 @@ python3 deploy_agentcore.py        # 建 ECR → buildx ARM64 → 推送 → 建
 **冒烟**：`npx @modelcontextprotocol/inspector` 连 endpoint（带 Cognito Bearer token），
 确认列出 5 工具、无 token 返回 401、`list_my_sites` 的 owner == 登录用户飞书邮箱。
 
-**⚠️ 唯一待真机确认项**：AgentCore 透传的是 id_token 还是 access token。Cognito
-access token 默认**不含 email**——若 owner 取不到，改用
-`allowedAudience=[mcp_client_id]`（id_token 用 `aud`）或加 pre-token-generation
-Lambda 注入 email。处置办法见 `site-builder/docs/client-setup.md`。
+**token 形态已真机钉死（2026-07-29）**：网关配 `allowedClients` 时只接受
+**access token**（id_token 会 401 "Claim 'client_id' value mismatch"，因为
+id_token 用 `aud` 而非 `client_id`），MCP 客户端按 OAuth 规范发的也正是
+access token。而 Cognito access token 默认不含 email，所以 **email 注入靠
+pre-token-generation V2 Lambda**（`auth/pre_token_email.py` → 函数
+`site-auth-pre-token`，挂在用户池 LambdaConfig，V2_0，要求 Essentials+ tier）。
+真机验证过：5 工具列出、无 token 401、owner == 登录用户邮箱、跨用户查 job 被拒。
+**不要**改 `allowedAudience`——那会反过来把 access token 拒掉。
+详见 `mcp/AGENTCORE-SPIKE.md` §7 与 `docs/client-setup.md`。
 
 ---
 

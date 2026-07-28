@@ -1,6 +1,7 @@
 """部署 auth-service：打 zip（session.py+login_handler.py+pyjwt 依赖）→ 建/更新 Lambda
 → Function URL(AWS_IAM，仅 Edge role 可调) → 生成 JWT_SECRET 存 SSM
-→ 路由表注册 subdomain=auth。幂等可重跑。"""
+→ 路由表注册 subdomain=auth → pre-token-generation 触发器（email 注入 access
+token，部署 MCP 的 owner 识别依赖它）。幂等可重跑。"""
 import configparser
 import io
 import secrets
@@ -107,7 +108,60 @@ def main():
         "static_prefix": {"S": ""}, "api_target": {"S": url.rstrip("/")},
         "require_auth": {"BOOL": False}, "allowed_users": {"S": "org"},
         "owner": {"S": "platform"}})
+    ensure_pre_token_trigger(role_arn)
     print(f"auth-service: {url}  →  https://auth.{BASE}/")
+
+
+# update-user-pool 是整体替换语义——只回传这些已知可变字段，避免误清其他配置。
+_POOL_MUTABLE = ("Policies", "DeletionProtection", "AutoVerifiedAttributes",
+                 "MfaConfiguration", "EmailConfiguration", "AdminCreateUserConfig",
+                 "AccountRecoverySetting", "UserAttributeUpdateSettings",
+                 "VerificationMessageTemplate", "UserPoolTier")
+
+
+def ensure_pre_token_trigger(role_arn: str) -> None:
+    """部署 pre-token-generation V2 Lambda 并挂到用户池。
+
+    真机钉死（2026-07-29，AGENTCORE-SPIKE.md §7）：部署 MCP 网关只接受
+    access token，而 Cognito access token 默认不含 email——owner 识别全靠
+    这个触发器把 email 注入 access token。要求用户池 Essentials+ tier。
+    """
+    fn = "site-auth-pre-token"
+    pool_id = CFG["Cognito"]["user_pool_id"]
+    cog = boto3.client("cognito-idp", region_name=REGION)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(Path(__file__).parent / "pre_token_email.py", "pre_token_email.py")
+    code = buf.getvalue()
+    try:
+        lam.get_function(FunctionName=fn)
+        lam.update_function_code(FunctionName=fn, ZipFile=code)
+    except lam.exceptions.ResourceNotFoundException:
+        lam.create_function(FunctionName=fn, Runtime="python3.13",
+                            Handler="pre_token_email.handler", Role=role_arn,
+                            Code={"ZipFile": code}, Timeout=5, MemorySize=128)
+        lam.get_waiter("function_active").wait(FunctionName=fn)
+    fn_arn = lam.get_function(FunctionName=fn)["Configuration"]["FunctionArn"]
+    try:
+        lam.add_permission(FunctionName=fn, StatementId="cognito-invoke",
+                           Action="lambda:InvokeFunction",
+                           Principal="cognito-idp.amazonaws.com",
+                           SourceArn=f"arn:aws:cognito-idp:{REGION}:"
+                                     f"{CFG['Platform']['account_id']}:userpool/{pool_id}")
+    except lam.exceptions.ResourceConflictException:
+        pass
+    pool = cog.describe_user_pool(UserPoolId=pool_id)["UserPool"]
+    cfg = pool.get("LambdaConfig", {}).get("PreTokenGenerationConfig", {})
+    if cfg.get("LambdaArn") == fn_arn and cfg.get("LambdaVersion") == "V2_0":
+        return  # 已挂好，不动用户池
+    kwargs = {k: pool[k] for k in _POOL_MUTABLE if k in pool}
+    # describe 回传的废弃字段，与 PasswordPolicy.TemporaryPasswordValidityDays
+    # 同传会被 update-user-pool 拒绝
+    kwargs.get("AdminCreateUserConfig", {}).pop("UnusedAccountValidityDays", None)
+    kwargs["LambdaConfig"] = {"PreTokenGenerationConfig": {
+        "LambdaVersion": "V2_0", "LambdaArn": fn_arn}}
+    cog.update_user_pool(UserPoolId=pool_id, **kwargs)
+    print(f"pre-token trigger 已挂到 {pool_id}: {fn_arn}")
 
 
 def ensure_lambda_role() -> str:

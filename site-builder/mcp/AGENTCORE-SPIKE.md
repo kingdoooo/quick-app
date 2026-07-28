@@ -54,11 +54,20 @@ def _caller_email() -> str:
   - 若透传的是 **access token**：Cognito access token **默认不含 email**。此时需要：① app client 配 `email` scope；② 依赖 AgentCore/Cognito 是否把 email 放进 access token（Cognito 需自定义 scope 或 pre-token-generation Lambda 注入）——这是**唯一需真机确认**的点。
 - **建议**：Task 3 的 MCP app client 保留 `openid email` scope（DEPLOY.md 已如此写）。真机冒烟时用 MCP Inspector 打一个真实 Cognito token，让 `list_my_sites` 回显 owner，确认它 == 登录飞书邮箱。若 access token 不含 email，则在 AgentCore authorizer 配置里改用 id_token，或加 Cognito pre-token-generation Lambda 把 email 注入 access token 的 claim。
 
-## 7. 仍需真机验证的点
+## 7. 真机验证结论（2026-07-29，全部钉死）
 
-1. AgentCore 透传的是 id_token 还是 access token（决定 §6 是否要额外配置）——用 Inspector + 真实 token 一次冒烟即可钉死。
-2. `customJWTAuthorizer` 的 discoveryUrl / allowedClients 配置语法以 `aws bedrock-agentcore-control` 当期 API 为准。
-3. 同步工具在 AgentCore 托管的 uvicorn worker 下 `get_context()` 是否始终可用（本地 stateless_http 已验证；AgentCore 运行时理论一致，仍建议冒烟确认）。
+1. **id_token vs access token**：AgentCore 网关不"选择"token——它验证客户端发来的
+   任何 Bearer token。配 `allowedClients` 时**只有 access token 能过**（id_token
+   被 401 拒，报文 `Claim 'client_id' value mismatch with configuration.`——
+   id_token 用 `aud` 而非 `client_id`）。而 MCP 客户端按 OAuth 规范发的就是
+   access token，所以正确做法**不是**改 `allowedAudience`（那会反过来拒掉
+   access token），而是 §6 的方案②：**pre-token-generation V2 Lambda 把 email
+   注入 access token**。已部署 `site-auth-pre-token`（源码
+   `auth/pre_token_email.py`，V2_0，要求用户池 Essentials/Plus tier）。
+2. `customJWTAuthorizer` 语法与本文一致（discoveryUrl + allowedClients），真机可用。
+3. `get_context()` 在 AgentCore 托管运行时下可用：真机 `list_my_sites` 正确解出
+   caller email，owner 归属与跨账号拒绝（"你不是…所有者"）都实测通过。
+4. 无 token / 坏 token 网关直接 401，不触达容器。
 
 ## 8. 部署时其余步骤（不变，见 DEPLOY.md ⑤）
 
