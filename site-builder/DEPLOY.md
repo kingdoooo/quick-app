@@ -263,7 +263,10 @@ frontend_bucket / base_domain（从 `router/config.ini.example` 复制）。
 2. 部署栈（首次需先 bootstrap）：
   ```bash
    cd router/infrastructure
-   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -q
+   # 用 rm -rf 保证干净重建：venv 里的 shebang 是绝对路径，仓库被移动或改名后
+   # 旧 venv 会报 "bad interpreter"，而 python3 -m venv 对已存在目录不会重写 shebang
+   rm -rf .venv && python3 -m venv .venv
+   .venv/bin/pip install -r requirements.txt -q
    PATH=.venv/bin:$PATH npx -y aws-cdk@latest bootstrap aws://{account_id}/us-east-1   # 首次
    PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never
   ```
@@ -315,7 +318,8 @@ aws dsql list-clusters --region us-east-1
 
 ```bash
 cd site-builder/deployer/infra
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -q
+rm -rf .venv && python3 -m venv .venv          # 见 ② 的说明：venv 不可跨路径复用
+.venv/bin/pip install -r requirements.txt -q
 # 部署（bundling 会用 Docker 拉 x86_64 镜像装 psycopg[binary]+sqlparse+contract 包）
 PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never
 ```

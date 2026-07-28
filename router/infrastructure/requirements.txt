@@ -1,2 +1,6 @@
 aws-cdk-lib==2.100.0
 constructs>=10.0.0,<11.0.0
+# stack.py 的 load_jwt_secret 用它从 SSM 读会话签名密钥注入 Edge 函数。
+# 缺 boto3 时不会报错，而是静默落回 SYNTH-ONLY-PLACEHOLDER —— 部署出去所有
+# 会话 token 都验签失败（无限登录跳转），所以必须列为依赖。
+boto3
