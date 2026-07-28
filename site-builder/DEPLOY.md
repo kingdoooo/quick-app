@@ -4,7 +4,10 @@
 已完成；本手册覆盖的是**需要真实 AWS 资源、DNS、飞书凭证**的部署门禁，无法自动化。
 
 - **区域**：`us-east-1`（Lambda@Edge、ACM、Quick Desktop 身份区域共同强制）
-- 下文 `<ACCOUNT_ID>`、`<BASE_DOMAIN>` 等占位符替换为你的实际值（与 config.ini 一致）
+- 下文 `{account_id}`、`{base_domain}` 等**花括号占位符需手工替换成你的实际值**
+  （与 config.ini 中对应字段一致）。注意与 `config.ini` 里的
+  `frontend_bucket = site-frontend-{account_id}` 区分——那处是脚本读取时自动插值的，
+  不需要手改；本文档里的命令是给你复制粘贴执行的，必须先替换
 - **中心配置**：`site-builder/config.ini` 与 `router/config.ini`（都从同目录
 `.example` 复制，gitignored；部署过程中逐段回填）
 - 设计文档 `docs/superpowers/specs/2026-07-21-quick-site-builder-design.md`，实施计划 `docs/superpowers/plans/2026-07-21-quick-site-builder.md`
@@ -24,24 +27,24 @@ us-east-1，Quick Desktop 身份区域当前也要求 us-east-1。这不是偏�
 
 ### 域名与通配符证书
 
-需要一个你能改 DNS 的域名（记为 `<BASE_DOMAIN>`），以及**签发在 us-east-1 的
-`*.<BASE_DOMAIN>` 通配符证书**。站点 URL 形如
-`https://app-<siteid>.<BASE_DOMAIN>`，登录端点固定 `auth.<BASE_DOMAIN>`——
+需要一个你能改 DNS 的域名（记为 `{base_domain}`），以及**签发在 us-east-1 的
+`*.{base_domain}` 通配符证书**。站点 URL 形如
+`https://app-{site_id}.{base_domain}`，登录端点固定 `auth.{base_domain}`——
 所以必须通配符，单域名证书不够。
 
 ```bash
 # 申请通配符证书（DNS 验证）
 aws acm request-certificate --region us-east-1 \
-  --domain-name "*.<BASE_DOMAIN>" --validation-method DNS
+  --domain-name "*.{base_domain}" --validation-method DNS
 # 按输出的 CNAME 完成验证，等状态变 ISSUED：
 aws acm describe-certificate --region us-east-1 \
-  --certificate-arn <CERT_ARN> --query 'Certificate.Status'
+  --certificate-arn {cert_arn} --query 'Certificate.Status'
 ```
 
 证书 ARN 填 `router/config.ini` 的 `[CloudFront] certificate_arn`。
 
 > **建议用专用域名或子域**（如 `apps.example.com`）：会话 cookie 下发在
-> `.<BASE_DOMAIN>`，所有 `app-*.<BASE_DOMAIN>` 站点共享一次登录。用承载其他
+> `.{base_domain}`，所有 `app-*.{base_domain}` 站点共享一次登录。用承载其他
 > 业务的主域会让会话作用域覆盖无关系统。
 
 ### 飞书企业自建应用
@@ -116,8 +119,8 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
 开始前的就绪清单（详见上面 §0）：
 
 - [ ] AWS 凭证指向目标账号 / us-east-1（`aws sts get-caller-identity`）
-- [ ] `*.<BASE_DOMAIN>` ACM 证书 ISSUED（us-east-1）
-- [ ] `<BASE_DOMAIN>` DNS 可修改（Route53 hosted zone 或等价）
+- [ ] `*.{base_domain}` ACM 证书 ISSUED（us-east-1）
+- [ ] `{base_domain}` DNS 可修改（Route53 hosted zone 或等价）
 - [ ] SSM `/site-builder/jwt-secret` 已创建（SecureString）
 - [ ] 飞书企业自建应用（App ID/Secret，含用户 userid + 邮箱权限）
 - [ ] Docker 运行中；`npx` 可用
@@ -146,14 +149,14 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    `DesktopAuthEndpoint` 等是 Quick Desktop SSO 的 API Gateway 代理端点，与站点
    登录无关），必须单独查 user pool 上的 domain 前缀：
   ```bash
-   aws cognito-idp describe-user-pool --user-pool-id <USER_POOL_ID> \
+   aws cognito-idp describe-user-pool --user-pool-id {user_pool_id} \
      --region us-east-1 --query 'UserPool.Domain' --output text
-   # 输出形如：feishu-quick-sso-<ACCOUNT_ID>-us-east-1
+   # 输出形如：feishu-quick-sso-{account_id}-us-east-1
   ```
    拼成完整 URL 回填 `config.ini [Cognito] domain`：
 
    ```
-   https://<上一行输出>.auth.us-east-1.amazoncognito.com
+   https://{上一行输出}.auth.us-east-1.amazoncognito.com
    ```
 
    **格式要求**：必须带 `https://` 前缀、末尾不带斜杠。`login_handler.py` 是直接
@@ -168,19 +171,19 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    验证域名可用（返回 302 说明端点正常；若 DNS 失败或 404 说明域名没建成）：
   ```bash
    curl -s -o /dev/null -w '%{http_code}\n' \
-     "https://<domain前缀>.auth.us-east-1.amazoncognito.com/oauth2/authorize"
+     "https://{domain_prefix}.auth.us-east-1.amazoncognito.com/oauth2/authorize"
   ```
 
 4. 确认上游栈创建的 IdP 名称（下一步 `--supported-identity-providers` 要用，
    通常是 `Feishu`）：
   ```bash
-   aws cognito-idp list-identity-providers --user-pool-id <USER_POOL_ID> \
+   aws cognito-idp list-identity-providers --user-pool-id {user_pool_id} \
      --region us-east-1 --query 'Providers[].{Name:ProviderName,Type:ProviderType}'
   ```
 5. 建两个 App Client（**不要复用上游已有的 Desktop/Web client**，那两个是给 Quick
    登录用的）：
 
-   **回调 URL 用你自己的域名 `https://auth.<BASE_DOMAIN>/callback`**，不是 Cognito
+   **回调 URL 用你自己的域名 `https://auth.{base_domain}/callback`**，不是 Cognito
    的 Hosted UI 域名。`login_handler.py` 在 /login 与 /callback 两处都发送
    `f"https://auth.{BASE_DOMAIN}/callback"` 作为 `redirect_uri`，Cognito 侧登记的
    值必须与它逐字符相同，否则换 token 时报 `redirect_mismatch`。
@@ -188,13 +191,13 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
   ```bash
    # 站点登录 client（confidential，带 secret）
    aws cognito-idp create-user-pool-client --region us-east-1 \
-     --user-pool-id <USER_POOL_ID> --client-name site-auth \
+     --user-pool-id {user_pool_id} --client-name site-auth \
      --generate-secret \
      --allowed-o-auth-flows code --allowed-o-auth-scopes openid email profile \
      --allowed-o-auth-flows-user-pool-client \
-     --supported-identity-providers <IdP名> \
-     --callback-urls https://auth.<BASE_DOMAIN>/callback \
-     --logout-urls https://auth.<BASE_DOMAIN>/logout \
+     --supported-identity-providers {idp_name} \
+     --callback-urls https://auth.{base_domain}/callback \
+     --logout-urls https://auth.{base_domain}/logout \
      --query 'UserPoolClient.ClientId' --output text
    # → 输出的 ClientId 回填 [Cognito] site_client_id
    # （--logout-urls 当前代码用不到：/logout 只清本地 cookie 不跳 Cognito 全局登出；
@@ -202,10 +205,10 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
 
    # MCP client（AgentCore 用，public client 不加 --generate-secret）
    aws cognito-idp create-user-pool-client --region us-east-1 \
-     --user-pool-id <USER_POOL_ID> --client-name deploy-mcp \
+     --user-pool-id {user_pool_id} --client-name deploy-mcp \
      --allowed-o-auth-flows code --allowed-o-auth-scopes openid email \
      --allowed-o-auth-flows-user-pool-client \
-     --supported-identity-providers <IdP名> \
+     --supported-identity-providers {idp_name} \
      --callback-urls https://bedrock-agentcore.us-east-1.amazonaws.com/identities/oauth2/callback \
      --query 'UserPoolClient.ClientId' --output text
    # → 输出的 ClientId 回填 [Cognito] mcp_client_id
@@ -213,16 +216,16 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
 
    > 建完后可核对回调是否登记正确：
    > ```bash
-   > aws cognito-idp describe-user-pool-client --user-pool-id <USER_POOL_ID> \
-   >   --client-id <site_client_id> --region us-east-1 \
+   > aws cognito-idp describe-user-pool-client --user-pool-id {user_pool_id} \
+   >   --client-id {site_client_id} --region us-east-1 \
    >   --query 'UserPoolClient.{Callbacks:CallbackURLs,Scopes:AllowedOAuthScopes,IdPs:SupportedIdentityProviders}'
    > ```
 6. 把站点 client 的 secret 存 SSM（Task 5 的 auth-service 部署要读）：
   ```bash
-   aws cognito-idp describe-user-pool-client --user-pool-id <USER_POOL_ID> \
-     --client-id <site_client_id> --region us-east-1 --query 'UserPoolClient.ClientSecret' --output text
+   aws cognito-idp describe-user-pool-client --user-pool-id {user_pool_id} \
+     --client-id {site_client_id} --region us-east-1 --query 'UserPoolClient.ClientSecret' --output text
    aws ssm put-parameter --name /site-builder/site-client-secret \
-     --type SecureString --value <上一行输出的 secret> --region us-east-1
+     --type SecureString --value {上一行输出的 secret} --region us-east-1
   ```
 7. **验证点（人工门禁）**：在 Quick Web/Desktop 配置该 IdP，用飞书账号登录成功。Desktop 身份区域须 us-east-1。
 
@@ -232,7 +235,7 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
 
 ## ② 路由 + 鉴权层 — WebRouterStack（Task 8）
 
-**产出**：CloudFront 分发（`*.<BASE_DOMAIN>`）+ 扩展路由表 + 前端桶；回填 `config.ini [Deployer] edge_role_arn`。
+**产出**：CloudFront 分发（`*.{base_domain}`）+ 扩展路由表 + 前端桶；回填 `config.ini [Deployer] edge_role_arn`。
 
 **前置**（来自 ①，缺任一项本阶段会失败）：
 - `site-builder/config.ini [Cognito]` 四项已填（步骤 5 的 auth-service 要读
@@ -247,12 +250,12 @@ frontend_bucket / base_domain（从 `router/config.ini.example` 复制）。
    public-access-block 与生命周期规则：
   ```bash
    # us-east-1 不要带 --create-bucket-configuration LocationConstraint
-   aws s3api create-bucket --bucket site-frontend-<ACCOUNT_ID> --region us-east-1
-   aws s3api put-public-access-block --bucket site-frontend-<ACCOUNT_ID> \
+   aws s3api create-bucket --bucket site-frontend-{account_id} --region us-east-1
+   aws s3api put-public-access-block --bucket site-frontend-{account_id} \
      --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
    # 旧版本前端清理：upload_frontend 只写新前缀不删旧的（发布期间线上仍用旧前缀），
    # mark_job 成功后清理当前站点旧版本；这条规则是兜底，防残留无限累积。
-   aws s3api put-bucket-lifecycle-configuration --bucket site-frontend-<ACCOUNT_ID> \
+   aws s3api put-bucket-lifecycle-configuration --bucket site-frontend-{account_id} \
      --lifecycle-configuration '{"Rules":[{"ID":"expire-old-site-versions","Status":"Enabled","Filter":{"Prefix":"sites/"},"Expiration":{"Days":30}}]}'
   ```
    桶必须保持私有：Edge 函数用 SigV4 签名读它（见 `_add_s3_sigv4_auth`），
@@ -261,16 +264,16 @@ frontend_bucket / base_domain（从 `router/config.ini.example` 复制）。
   ```bash
    cd router/infrastructure
    python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -q
-   PATH=.venv/bin:$PATH npx -y aws-cdk@latest bootstrap aws://<ACCOUNT_ID>/us-east-1   # 首次
+   PATH=.venv/bin:$PATH npx -y aws-cdk@latest bootstrap aws://{account_id}/us-east-1   # 首次
    PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never
   ```
 
    stack.py 部署时会从 SSM 读真实 JWT_SECRET 注入 Edge 函数（`load_jwt_secret`）；若打印
    `SYNTH-ONLY-PLACEHOLDER` 警告说明 SSM 读取失败，**不要继续**——检查凭证与 SSM 参数。
 3. 记录 CfnOutput 的 **EdgeRoleArn**，回填 `site-builder/config.ini [Deployer] edge_role_arn`（Task 17 执行器需要它给站点 Function URL 授权）。记录 **DistributionDomainName**。
-4. DNS：在 `<BASE_DOMAIN>` 加通配符 CNAME 或 A-alias 指向 CloudFront 域名：
+4. DNS：在 `{base_domain}` 加通配符 CNAME 或 A-alias 指向 CloudFront 域名：
   ```
-   *.<BASE_DOMAIN>  →  <DistributionDomainName>  (如 d1234abcd.cloudfront.net)
+   *.{base_domain}  →  {distribution_domain_name}  (如 d1234abcd.cloudfront.net)
   ```
 5. **部署 auth-service Lambda**（Task 5 的登录端点，依赖①的 Cognito + 本步骤的路由表）：
   ```bash
@@ -280,7 +283,7 @@ frontend_bucket / base_domain（从 `router/config.ini.example` 复制）。
   ```
 6. **冒烟**（CloudFront 传播需 15-30 分钟后再跑）：
   ```bash
-   cd <仓库根> && bash site-builder/scripts/smoke_router.sh
+   cd {仓库根} && bash site-builder/scripts/smoke_router.sh
   ```
 
    预期 6 行 PASS：static route / no cross-site cache / auth 302 / auth subdomain api-only routing / unknown 404 / route update visible。
@@ -296,7 +299,7 @@ aws dsql create-cluster --region us-east-1 \
   --tags Key=project,Value=site-builder \
   --no-deletion-protection-enabled
 aws dsql list-clusters --region us-east-1
-# 取 endpoint（形如 <id>.dsql.us-east-1.on.aws），回填 [DSQL] cluster_endpoint
+# 取 endpoint（形如 {cluster_id}.dsql.us-east-1.on.aws），回填 [DSQL] cluster_endpoint
 ```
 
 站点数据隔离由执行器在部署 SQL 站点时创建 per-site schema + per-site PG role +
@@ -322,14 +325,14 @@ PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never
 **冒烟（手工触发一次 static 部署，验证执行器全链路）**：
 
 ```bash
-cd <仓库根>
+cd {仓库根}
 RUN_E2E=1 site-builder/deployer/.venv/bin/pytest \
   site-builder/deployer/tests/test_e2e_fixtures.py::test_static_site_public_200 -q
 # 或用 deploy_fixture.py 直接跑：
 python3 site-builder/scripts/deploy_fixture.py site-builder/fixtures/static-hello
 ```
 
-预期：SFN execution SUCCEEDED，`curl https://app-<siteid>.<BASE_DOMAIN>/` 返回 fixture 首页。
+预期：SFN execution SUCCEEDED，`curl https://app-{site_id}.{base_domain}/` 返回 fixture 首页。
 
 **⚠️ Docker 拉镜像 403**：若 `public.ecr.aws` 凭证过期，先 `docker logout public.ecr.aws`
 再重试（bundling 用匿名拉取）。
@@ -381,7 +384,7 @@ Lambda 注入 email。处置办法见 `site-builder/docs/client-setup.md`。
 
 ```bash
 mkdir -p ~/.claude/skills && cp -r site-builder/skills/site-builder ~/.claude/skills/
-claude mcp add --transport http site-builder-deploy <MCP_ENDPOINT_URL>
+claude mcp add --transport http site-builder-deploy {mcp_endpoint_url}
 ```
 
 新会话提示："用 site-builder 技能给我做一个团队读书清单站点，能加书标记读完，全组织可看，做完部署" → 应走完 Skill 工作流 → MCP 部署 → 返回 URL → 浏览器飞书登录 + 加书验证。
@@ -396,7 +399,7 @@ claude mcp add --transport http site-builder-deploy <MCP_ENDPOINT_URL>
 
 ```bash
 # 前一天跑：全链路 E2E（用 JWT_SECRET mint 测试会话 cookie，自动化 CRUD，无需人工扫码）
-cd <仓库根>
+cd {仓库根}
 RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/test_e2e_fixtures.py -q
 ```
 
@@ -425,7 +428,7 @@ SSM 参数：`/site-builder/jwt-secret`（已存在）、`/site-builder/site-cli
 ## 已知限制与延后项（向客户声明）
 
 - Quick Desktop 为 preview、身份区域须 us-east-1
-- 顶域 cookie 使所有 `app-*.<BASE_DOMAIN>` 站点共享一次登录（PoC 可接受，产品化需按站点隔离会话）
+- 顶域 cookie 使所有 `app-*.{base_domain}` 站点共享一次登录（PoC 可接受，产品化需按站点隔离会话）
 - PoC 仅 Node.js 后端（Python 3.13 延后）；MCP 仅 OAuth（API Key fallback 延后）
 - CloudFront 全站禁缓存（正确性优先；精细缓存延后）
 - 详见设计文档 §8 风险 / §9 范围外
@@ -445,7 +448,7 @@ SSM 参数：`/site-builder/jwt-secret`（已存在）、`/site-builder/site-cli
 | `npm install` 执行站点 preinstall 脚本（CodeBuild 内任意代码执行）       | `--ignore-scripts` + 删 `.npmrc` + 红线拦生命周期脚本 + CodeBuild 角色收窄到 `uploads/*` 只读、`artifacts/*` 只写 | 红线单测 + synth 确认无整桶读写                                           |
 | 站点 SQL 以 DSQL admin 执行，可跨 schema 读写/销毁                    | 拆两个连接：admin 只引导 schema/role；站点提交的 SQL 以 per-site migrator role 执行                             | 单测断言站点 DDL 绝不出现在 admin 连接；bootstrap SQL 过 DSQL linter          |
 | `CREATE ROLE`/`AWS IAM GRANT` 裸 `except: pass` 吞真实错误      | 只容忍 duplicate（SQLSTATE 42710/42P06），其余抛出                                                      | 单测覆盖 42601 语法错/42501 权限不足必抛                                    |
-| 回跳白名单可被 `https://evil.com\.<BASE_DOMAIN>/` 绕过             | 拒反斜杠 + 强制 https                                                                               | 8 组用例；Python urlparse 与 Node WHATWG 解析差异实测                     |
+| 回跳白名单可被 `https://evil.com\.{base_domain}/` 绕过             | 拒反斜杠 + 强制 https                                                                               | 8 组用例；Python urlparse 与 Node WHATWG 解析差异实测                     |
 
 
 **仍需真机验证**：`AWS IAM GRANT` 对真实 DSQL 的语法与幂等 sqlstate（③ 冒烟覆盖）；

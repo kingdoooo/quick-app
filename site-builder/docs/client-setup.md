@@ -32,7 +32,7 @@ mkdir -p ~/.claude/skills
 cp -r site-builder/skills/site-builder ~/.claude/skills/
 
 # MCP（HTTP transport，OAuth 走浏览器授权）
-claude mcp add --transport http site-builder-deploy "<MCP_ENDPOINT_URL>"
+claude mcp add --transport http site-builder-deploy "{mcp_endpoint_url}"
 ```
 
 新会话里提示：
@@ -41,7 +41,7 @@ claude mcp add --transport http site-builder-deploy "<MCP_ENDPOINT_URL>"
 
 预期：Skill 走完澄清 → 生成代码 → 本地预览 → `deploy_site` → PUT zip →
 `confirm_upload` → 轮询 `get_deploy_status` 播报 phase → 返回
-`https://app-xxx.<BASE_DOMAIN>`。浏览器打开该 URL 应跳飞书登录，登录后可加书。
+`https://app-xxx.{base_domain}`。浏览器打开该 URL 应跳飞书登录，登录后可加书。
 
 ## Quick Desktop（核心演示通道，人工配置）
 
