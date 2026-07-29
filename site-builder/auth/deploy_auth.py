@@ -73,8 +73,8 @@ def main():
                             Code={"ZipFile": code}, Timeout=15, MemorySize=256,
                             Environment=env)
         lam.get_waiter("function_active").wait(FunctionName=FN)
-    # AWS_IAM 而非 NONE：NONE + Principal:* 是 world-accessible（曾被 internal security tooling
-    # 自动 mitigate——直接删光 resource policy，连 Edge 路径一起 403）。
+    # AWS_IAM 而非 NONE：NONE + Principal:* 是 world-accessible，会触发安全扫描
+    # 告警甚至自动处置（实际发生过：resource policy 被整个删除，连 Edge 路径一起 403）。
     # Edge 的 _route_to_lambda 对所有 Lambda URL 路由（含 api-only）都签 SigV4，
     # 所以只授权 edge role 即可，公网直连被 IAM 挡住。
     try:
