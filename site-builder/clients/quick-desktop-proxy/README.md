@@ -23,7 +23,10 @@ node auth.js "<endpoint_url>" "<client_id>"
 # 2) Quick Desktop → Settings → Capabilities → MCP → Add
 #    Connection type: Local
 #    Command:         node
-#    Args:            /绝对路径/index.js "<endpoint_url>" "<client_id>"
+#    Args:            /绝对路径/index.js <endpoint_url> <client_id>
+#    （UI 字段不是 shell：不要加引号，会成为参数的一部分。
+#      Args 不接受多参数时：Args 只填脚本路径，Env 设
+#      SITE_BUILDER_MCP_ENDPOINT / SITE_BUILDER_MCP_CLIENT_ID）
 ```
 
 `<endpoint_url>` / `<client_id>` 的真实值见部署者生成的 ONBOARDING.md

@@ -70,10 +70,14 @@ Quick Desktop 的 Remote MCP 不支持 OAuth，需用仓库自带的本地 stdio
    node auth.js "{endpoint}" "{client_id}"
    ```
 3. 添加 MCP：Settings → Capabilities → MCP → Add，
-   Connection type=**Local**，Command=`node`，Args：
+   Connection type=**Local**，Command=`node`，Args（**不要加引号**——UI 字段
+   不是 shell，引号会成为参数的一部分；URL 无空格，不需要引号）：
    ```
-   /绝对路径/quick-desktop-proxy/index.js "{endpoint}" "{client_id}"
+   /绝对路径/quick-desktop-proxy/index.js {endpoint} {client_id}
    ```
+   若 Quick 的 Args 字段不接受多参数，改用环境变量（代理两种都认）：
+   Args 只填脚本路径，Env 加 `SITE_BUILDER_MCP_ENDPOINT={endpoint}`
+   与 `SITE_BUILDER_MCP_CLIENT_ID={client_id}`。
 
 ## 开始使用
 

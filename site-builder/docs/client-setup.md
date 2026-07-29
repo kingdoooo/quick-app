@@ -81,7 +81,10 @@ aws cognito-idp update-user-pool-client --region us-east-1 \
    node auth.js "{mcp_endpoint_url}" "{mcp_client_id}"   # 浏览器飞书登录，token 落盘
    ```
    然后 Settings → Capabilities → MCP → Add：Connection type=**Local**，
-   Command=`node`，Args=`/绝对路径/quick-desktop-proxy/index.js "{mcp_endpoint_url}" "{mcp_client_id}"`。
+   Command=`node`，Args=`/绝对路径/quick-desktop-proxy/index.js {mcp_endpoint_url} {mcp_client_id}`
+   （UI 字段里**不要加引号**，不是 shell；URL 无空格无需引号。若 Args 不接受
+   多参数，Args 只填脚本路径 + Env 设 `SITE_BUILDER_MCP_ENDPOINT` /
+   `SITE_BUILDER_MCP_CLIENT_ID`，代理两种都认）。
    代理自动注入并续期 Bearer token；坑清单见该目录 README。
 3. **身份区域必须 us-east-1**（Quick Desktop preview 限制，与本方案全栈一致）。
 4. **与 Quick 的登录方式无关**：Quick 本体用什么登录（飞书/企业 internal/Okta）
