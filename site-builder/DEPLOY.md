@@ -218,12 +218,25 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
   ```
 
    **【标准 IdP】** 则无需上游方案与适配器：自建 user pool（含 Hosted UI domain），
-   在「Social and custom providers」添加你的 OIDC 或 SAML IdP（Okta/Azure AD 等
+   在「Social and external providers」添加你的 OIDC 或 SAML IdP（Okta/Azure AD 等
    都是标准配置），并在 attribute mapping 里**把 IdP 的 email 映射到 pool 的
    email 属性**（这是硬要求，漏了整个权限模型不成立）。IdP 侧登记 Cognito 的
    回调 `https://{hosted-ui-domain}/oauth2/idpresponse`。若还需要 Quick Desktop
    走同一个 pool 登录，另需 offline_access 剥离代理，参考
    [aws-samples Quick Desktop Cognito 方案](https://aws-samples.github.io/sample-amazon-quick-suite-knowledge-hub/amazon-quick-on-desktop/)。
+
+   逐步操作的 AWS 官方文档：
+   - **Okta（SAML，逐步截图版，含 Okta 侧配置）**：
+     [How do I set up Okta as a SAML identity provider in an Amazon Cognito user pool?](https://repost.aws/knowledge-center/cognito-okta-saml-identity-provider)
+     ——第 9 步的 email attribute mapping 就是上面说的硬要求
+   - SAML IdP 通用（控制台/CLI）：
+     [Adding and managing SAML identity providers in a user pool](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pools-managing-saml-idp-console.html)
+   - OIDC IdP 通用（Okta 也可走 OIDC；回调登记、issuer 自动发现）：
+     [Using OIDC identity providers with a user pool](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pools-oidc-idp.html)
+   - attribute mapping 专篇（CLI `--attribute-mapping` 语法在此）：
+     [Mapping IdP attributes to profiles and tokens](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pools-specifying-attribute-mapping.html)
+   - Azure AD / Entra ID：
+     [How to set up Amazon Cognito for federated authentication using Azure AD](https://aws.amazon.com/blogs/security/how-to-set-up-amazon-cognito-for-federated-authentication-using-azure-ad/)
 
 2. 取 **User Pool ID**。上游栈的 CfnOutput 里有（`UserPoolId`），也可以直接查：
   ```bash
