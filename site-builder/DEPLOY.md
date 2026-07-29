@@ -93,6 +93,16 @@ aws cognito-idp describe-identity-provider --user-pool-id {user_pool_id} \
 邮箱权限不可省：`owner`（谁部署的、谁能改/删站点）与访问名单 `allowed_users`
 都以飞书邮箱为标识，拿不到邮箱则整个权限模型不成立。
 
+**⚠️ 两个条件缺一不可（2026-07-29 实测踩坑）**：
+① 应用在「权限管理」开通 `contact:user.email:readonly` + `contact:user.employee:readonly`
+并发布版本；② **用户在通讯录里真的填了邮箱**——飞书个人版账号默认只绑手机号，
+邮箱为空。缺任一个的症状完全相同：OAuth 授权页正常走完，最后回调报
+`invalid_request: Feishu Error - 500 internal_error`（SSO 适配器
+`FeishuQuickSsoFeishuAdapterFunction` 日志里是
+`ValueError: feishu user has no email`）。排查办法：用 app 的 tenant token 调
+`GET /open-apis/contact/v3/users/{open_id}` 看返回里有没有
+email/enterprise_email 字段。
+
 ### SSM 参数
 
 
