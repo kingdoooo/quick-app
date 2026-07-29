@@ -80,11 +80,22 @@ aws cognito-idp update-user-pool-client --region us-east-1 \
    cd site-builder/clients/quick-desktop-proxy
    node auth.js "{mcp_endpoint_url}" "{mcp_client_id}"   # 浏览器飞书登录，token 落盘
    ```
-   然后 Settings → Capabilities → MCP → Add：Connection type=**Local**，
-   Command=`node`，Args=`/绝对路径/quick-desktop-proxy/index.js {mcp_endpoint_url} {mcp_client_id}`
-   （UI 字段里**不要加引号**，不是 shell；URL 无空格无需引号。若 Args 不接受
-   多参数，Args 只填脚本路径 + Env 设 `SITE_BUILDER_MCP_ENDPOINT` /
-   `SITE_BUILDER_MCP_CLIENT_ID`，代理两种都认）。
+   然后注册为 Local MCP。推荐直接编辑
+   `~/.quickwork/profiles/{profile}/mcp_config.json`（重启生效；args 是 JSON
+   数组，零歧义）：
+   ```json
+   "site-builder-deploy": {
+     "command": "node",
+     "args": ["/绝对路径/quick-desktop-proxy/index.js",
+              "{mcp_endpoint_url}", "{mcp_client_id}"],
+     "env": {}
+   }
+   ```
+   或走 UI（Settings → Capabilities → MCP → Add）：Connection type=**Local**，
+   Command=`node`，Args 一行填 `脚本路径 endpoint client_id`——Args 按类 shell
+   规则解析（空格拆分、引号剥除，已向 Quick 源码求证），URL 无空格带不带引号
+   均可；UI 亦有 env 区域，可改用 `SITE_BUILDER_MCP_ENDPOINT` /
+   `SITE_BUILDER_MCP_CLIENT_ID`（代理 argv 与 env 都认）。
    代理自动注入并续期 Bearer token；坑清单见该目录 README。
 3. **身份区域必须 us-east-1**（Quick Desktop preview 限制，与本方案全栈一致）。
 4. **与 Quick 的登录方式无关**：Quick 本体用什么登录（飞书/企业 internal/Okta）

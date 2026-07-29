@@ -20,13 +20,17 @@ Quick Desktop 的 Remote MCP 只支持静态 Headers，不支持 OAuth 授权码
 # 1) 首次 OAuth（浏览器飞书登录，token 落盘，之后代理自动续期）
 node auth.js "<endpoint_url>" "<client_id>"
 
-# 2) Quick Desktop → Settings → Capabilities → MCP → Add
-#    Connection type: Local
-#    Command:         node
-#    Args:            /绝对路径/index.js <endpoint_url> <client_id>
-#    （UI 字段不是 shell：不要加引号，会成为参数的一部分。
-#      Args 不接受多参数时：Args 只填脚本路径，Env 设
-#      SITE_BUILDER_MCP_ENDPOINT / SITE_BUILDER_MCP_CLIENT_ID）
+# 2) 注册为 Local MCP。推荐直接编辑
+#    ~/.quickwork/profiles/{profile}/mcp_config.json（重启生效）：
+#      "site-builder-deploy": {
+#        "command": "node",
+#        "args": ["/绝对路径/index.js", "<endpoint_url>", "<client_id>"]
+#      }
+#    或 UI：Settings → Capabilities → MCP → Add，Connection type=Local，
+#    Command=node，Args 一行填 `路径 endpoint client_id`。
+#    Args 按类 shell 规则解析（空格拆分、引号剥除，源码求证过 parseShellArgs）；
+#    URL 无空格，带不带引号均可。也可用 env：
+#    SITE_BUILDER_MCP_ENDPOINT / SITE_BUILDER_MCP_CLIENT_ID（代理两种都认）。
 ```
 
 `<endpoint_url>` / `<client_id>` 的真实值见部署者生成的 ONBOARDING.md

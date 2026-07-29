@@ -69,15 +69,29 @@ Quick Desktop 的 Remote MCP 不支持 OAuth，需用仓库自带的本地 stdio
    cd site-builder/clients/quick-desktop-proxy
    node auth.js "{endpoint}" "{client_id}"
    ```
-3. 添加 MCP：Settings → Capabilities → MCP → Add，
-   Connection type=**Local**，Command=`node`，Args（**不要加引号**——UI 字段
-   不是 shell，引号会成为参数的一部分；URL 无空格，不需要引号）：
+3. 添加 MCP（两种方式，推荐直接编辑配置文件——零歧义）：
+
+   **方式 a：编辑 `~/.quickwork/profiles/{{profile}}/mcp_config.json`**，
+   在 `mcpServers` 下加一项后重启 Quick Desktop（args 是 JSON 数组，
+   每个元素精确对应一个 argv）：
+   ```json
+   "site-builder-deploy": {{
+     "command": "node",
+     "args": ["/绝对路径/quick-desktop-proxy/index.js",
+              "{endpoint}",
+              "{client_id}"]
+   }}
+   ```
+
+   **方式 b：UI 表单**（Settings → Capabilities → MCP → Add）：
+   Connection type=**Local**，Command=`node`，Args 一行填：
    ```
    /绝对路径/quick-desktop-proxy/index.js {endpoint} {client_id}
    ```
-   若 Quick 的 Args 字段不接受多参数，改用环境变量（代理两种都认）：
-   Args 只填脚本路径，Env 加 `SITE_BUILDER_MCP_ENDPOINT={endpoint}`
-   与 `SITE_BUILDER_MCP_CLIENT_ID={client_id}`。
+   Args 字段按类 shell 规则解析（空格拆分、引号剥除）——URL 无空格，
+   带不带引号都可以。UI 也有 env 区域，等价写法：Args 只填脚本路径，
+   env 设 `SITE_BUILDER_MCP_ENDPOINT` / `SITE_BUILDER_MCP_CLIENT_ID`
+   （代理 argv 与环境变量两种都认）。
 
 ## 开始使用
 
