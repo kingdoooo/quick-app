@@ -68,14 +68,24 @@ aws cognito-idp update-user-pool-client --region us-east-1 \
 `confirm_upload` → 轮询 `get_deploy_status` 播报 phase → 返回
 `https://app-xxx.{base_domain}`。浏览器打开该 URL 应跳飞书登录，登录后可加书。
 
-## Quick Desktop（核心演示通道，人工配置）
+## Quick Desktop（核心演示通道，人工配置；2026-07-29 已真机走通）
 
 1. **导入 Skill**：把 `site-builder/skills/site-builder/` 整个目录按 Quick Desktop
    当期的 Skill 导入入口加载（SKILL.md + references/ + templates/ 一并带上，
    references 与 templates 是合同的一部分，缺了会生成不合规产物）。
-2. **添加 MCP**：Capabilities → MCP → 添加 endpoint，认证选 OAuth，
-   走飞书登录授权。
+2. **添加 MCP——必须走本地 stdio 代理**。Quick Desktop 的 Remote MCP 只支持
+   静态 Headers，**不支持 OAuth 授权码流程**（实测直接填 endpoint 报 401）。
+   用 `site-builder/clients/quick-desktop-proxy/`（纯 Node 内置模块，免 install）：
+   ```bash
+   cd site-builder/clients/quick-desktop-proxy
+   node auth.js "{mcp_endpoint_url}" "{mcp_client_id}"   # 浏览器飞书登录，token 落盘
+   ```
+   然后 Settings → Capabilities → MCP → Add：Connection type=**Local**，
+   Command=`node`，Args=`/绝对路径/quick-desktop-proxy/index.js "{mcp_endpoint_url}" "{mcp_client_id}"`。
+   代理自动注入并续期 Bearer token；坑清单见该目录 README。
 3. **身份区域必须 us-east-1**（Quick Desktop preview 限制，与本方案全栈一致）。
+4. **与 Quick 的登录方式无关**：Quick 本体用什么登录（飞书/企业 internal/Okta）
+   不影响本步骤——MCP 的身份走上面的独立 OAuth。
 
 ## 冒烟检查清单（每个客户端各跑一遍）
 
@@ -94,8 +104,14 @@ npx @modelcontextprotocol/inspector
 | 换另一个账号调 `get_deploy_status(别人的 job)` | 报"你不是…所有者" | owner 校验被绕过 |
 | 完整部署一次 | 拿到 URL 且浏览器能飞书登录访问 | 见 DEPLOY.md 各阶段排查 |
 
-## 已知客户端差异
+## 已知客户端差异（2026-07-29 两通道均真机验证）
 
-（真机验证后补：Skill 导入路径、OAuth 授权弹窗行为、工具超时表现。
+| | Claude Code | Quick Desktop |
+|---|---|---|
+| MCP 接入 | 原生 HTTP transport | Local stdio 代理（Remote MCP 不支持 OAuth） |
+| OAuth | 内置（`--client-id` + `--callback-port`） | 代理的 auth.js（RFC 9728 发现 + PKCE） |
+| token 管理 | 客户端自动 | 代理落盘 `~/.site-builder-deploy-token.json` + 自动续期 |
+| Skill 导入 | `cp -r` 到 `~/.claude/skills/` | profile 的 skills 目录（如 `~/.quickwork/profiles/{profile}/skills/`） |
+
 Quick MCP 工具调用 60 秒超时是本方案异步化的原因——所有工具秒级返回，
-长任务在 Step Functions 里跑，不受此限。）
+长任务在 Step Functions 里跑，不受此限（真机部署实测未触发超时）。

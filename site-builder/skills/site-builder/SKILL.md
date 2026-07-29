@@ -48,6 +48,7 @@ description: 开发并一键部署简易 Web 站点到 AWS。当用户想创建/
 
 - 前端调后端只写相对路径 `/api/*`
 - 站点代码零登录逻辑；当前用户 = 请求头 `x-user-email` / `x-user-name`
+  （name 是 URL 编码的，用 `decodeURIComponent` 解码后再用）
 - 后端必须实现 `GET /api/health`
 - 不写本地文件；端口读 `process.env.PORT`；API 请求体 ≤1MB
 - 渲染用户输入用 textContent / DOM API，禁止拼 innerHTML（存储型 XSS）

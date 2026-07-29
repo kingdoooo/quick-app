@@ -62,7 +62,8 @@
 - **正确**（需要当前用户时读平台注入的请求头，直接信任）：
   ```js
   const email = req.headers["x-user-email"] || "anonymous";
-  const name = req.headers["x-user-name"];
+  // x-user-name 是 URL 编码的（HTTP 头无法携带中文），必须解码后再用/存
+  const name = decodeURIComponent(req.headers["x-user-name"] || "");
   ```
 - **错误**：
   ```js

@@ -57,15 +57,23 @@ claude mcp add --transport http site-builder-deploy \\
    > 用 site-builder 技能列出我部署的站点
    应返回列表（首次为空数组）。
 
-## Quick Desktop 接入（图形界面）
+## Quick Desktop 接入
 
-1. 导入 Skill：把 `site-builder/skills/site-builder/` 整个目录按 Quick Desktop
-   的 Skill 导入入口加载（SKILL.md + references/ + templates/ 缺一不可）。
-2. 添加 MCP：Capabilities → MCP → 添加 endpoint（下面整串是一个 URL）：
+Quick Desktop 的 Remote MCP 不支持 OAuth，需用仓库自带的本地 stdio 代理
+（`site-builder/clients/quick-desktop-proxy/`，纯 Node 18+ 内置模块，免 install）：
+
+1. 导入 Skill：把 `site-builder/skills/site-builder/` 整个目录复制到你的
+   Quick profile 的 skills 目录（如 `~/.quickwork/profiles/{{profile}}/skills/`）。
+2. 首次 OAuth（浏览器飞书登录，token 落盘后代理自动续期）：
+   ```bash
+   cd site-builder/clients/quick-desktop-proxy
+   node auth.js "{endpoint}" "{client_id}"
    ```
-   {endpoint}
+3. 添加 MCP：Settings → Capabilities → MCP → Add，
+   Connection type=**Local**，Command=`node`，Args：
    ```
-   认证选 OAuth，走飞书登录授权。
+   /绝对路径/quick-desktop-proxy/index.js "{endpoint}" "{client_id}"
+   ```
 
 ## 开始使用
 
