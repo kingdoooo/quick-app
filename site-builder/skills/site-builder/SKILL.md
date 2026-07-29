@@ -25,9 +25,12 @@ description: 开发并一键部署简易 Web 站点到 AWS。当用户想创建/
 4. **本地预览**：static 直接开 index.html；fullstack 跑 `node server.js` 演示。
    用户确认后再部署。
 5. **部署**（MCP: site-builder-deploy）：
-   a. 项目目录打包为 site.zip（site.json 在 zip 根）
+   a. 项目目录打包为 site.zip（site.json 在 zip 根；**排除 node_modules**，
+      依赖由平台按 package.json 安装）
    b. 调 `deploy_site(site_name)`（更新已有站点则带 site_id）→ 得 upload_url + job_id
-   c. HTTP PUT site.zip 到 upload_url
+   c. HTTP PUT site.zip 到 upload_url：`curl -X PUT -T site.zip "<upload_url>"`。
+      **不要带 Content-Type 头**——预签名 URL 按无该头签名，
+      加了必 403 SignatureDoesNotMatch
    d. 调 `confirm_upload(job_id)`
    e. 每 15 秒调 `get_deploy_status(job_id)` 直到 SUCCEEDED/FAILED，
       向用户播报 phase 进展（validate → provision-db → package → deploy-backend

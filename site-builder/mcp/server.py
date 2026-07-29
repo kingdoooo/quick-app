@@ -79,7 +79,8 @@ def do_deploy_site(owner: str, site_name: str, site_id: str | None = None) -> di
                 "Key": f"uploads/{job_id}.zip"},
         ExpiresIn=900)
     return {"job_id": job_id, "site_id": site_id, "upload_url": url,
-            "next_step": "将 site.zip PUT 到 upload_url，然后调用 confirm_upload"}
+            "next_step": "将 site.zip PUT 到 upload_url（不要带 Content-Type 头，"
+                         "否则预签名校验 403），然后调用 confirm_upload"}
 
 
 def do_confirm_upload(owner: str, job_id: str) -> dict:
