@@ -250,13 +250,18 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    # （--logout-urls 当前代码用不到：/logout 只清本地 cookie 不跳 Cognito 全局登出；
    #   先登记好，二期接全局登出时免改配置）
 
-   # MCP client（AgentCore 用，public client 不加 --generate-secret）
+   # MCP client（AgentCore 用，public client 不加 --generate-secret）。
+   # 第二条 localhost 回调是给 Claude Code 等本机 MCP 客户端的 OAuth 用的
+   # （Cognito 不支持 dynamic client registration，客户端必须复用本 client
+   #   并预注册固定回调端口；端口选 18765——8765/8766 被 Quick Desktop 的
+   #   quickwork-agent 常驻占用。详见 docs/client-setup.md）
    aws cognito-idp create-user-pool-client --region us-east-1 \
      --user-pool-id {user_pool_id} --client-name deploy-mcp \
      --allowed-o-auth-flows code --allowed-o-auth-scopes openid email \
      --allowed-o-auth-flows-user-pool-client \
      --supported-identity-providers {idp_name} \
      --callback-urls https://bedrock-agentcore.us-east-1.amazonaws.com/identities/oauth2/callback \
+                     http://localhost:18765/callback \
      --query 'UserPoolClient.ClientId' --output text
    # → 输出的 ClientId 回填 [Cognito] mcp_client_id
   ```
@@ -348,6 +353,9 @@ frontend_bucket / base_domain（从 `router/config.ini.example` 复制）。
    # 它会：打 zip（含 pyjwt）→ 建/更新 Lambda site-auth-service
    #      → Function URL(AWS_IAM，仅 edge role 可调，公网直连 403)
    #      → 生成/复用 SSM /site-builder/jwt-secret → 路由表注册 subdomain=auth (route_mode=api-only)
+   #      → 部署 pre-token-generation V2 触发器 site-auth-pre-token 并挂到用户池
+   #        （把 email 注入 access token；⑤ 部署 MCP 的 owner 识别依赖它，
+   #         用户池须 Essentials+ tier，原理见 ⑤ 的 token 形态说明）
   ```
 
    > Function URL **不要用 AuthType=NONE**：NONE + `Principal:*` 会被判定
@@ -510,6 +518,14 @@ python3 deploy_agentcore.py        # 建 ECR → buildx ARM64 → 推送 → 建
 所有工具报"无法识别调用者身份"；而透传 `Authorization` 又要求配 `customJWTAuthorizer`；
 - `agentRuntimeName` 只允许 `[a-zA-Z][a-zA-Z0-9_]{0,47}`（连字符会被 API 拒）。
 
+**⚠️ ECR 镜像校验的误导性报错**：`CreateAgentRuntime` 若报
+"Access denied while validating ECR URI ... requires permissions for
+ecr:GetAuthorizationToken/BatchGetImage/GetDownloadUrlForLayer"，**大概率与
+IAM 无关**（实测权限齐全时同样报）。真实原因是 `docker buildx` 默认给
+manifest list 附加一条 `os=unknown/arch=unknown` 的 attestation manifest，
+AgentCore 校验不认。`deploy_agentcore.py` 已带 `--provenance=false` 规避；
+手工构建镜像时必须同样加上该参数。
+
 **冒烟**：`npx @modelcontextprotocol/inspector` 连 endpoint（带 Cognito Bearer token），
 确认列出 5 工具、无 token 返回 401、`list_my_sites` 的 owner == 登录用户飞书邮箱。
 
@@ -531,10 +547,16 @@ pre-token-generation V2 Lambda**（`auth/pre_token_email.py` → 函数
 
 ```bash
 mkdir -p ~/.claude/skills && cp -r site-builder/skills/site-builder ~/.claude/skills/
-claude mcp add --transport http site-builder-deploy {mcp_endpoint_url}
+# 必须带 --client-id 与固定回调端口（Cognito 不支持 dynamic client registration，
+# 裸 add 报 "Incompatible auth server"）；并需在 deploy-mcp client 预注册
+# http://localhost:18765/callback——完整命令见 docs/client-setup.md
+claude mcp add --transport http site-builder-deploy {mcp_endpoint_url} \
+  --client-id {mcp_client_id} --callback-port 18765
 ```
 
+配好后在会话里 `/mcp` → site-builder-deploy → Authenticate 走飞书 OAuth。
 新会话提示："用 site-builder 技能给我做一个团队读书清单站点，能加书标记读完，全组织可看，做完部署" → 应走完 Skill 工作流 → MCP 部署 → 返回 URL → 浏览器飞书登录 + 加书验证。
+（已实测走通：真实站点部署成功，validate→smoke-test 一次过。）
 
 **Quick Desktop（人工，核心演示通道）**：导入 site-builder Skill + Capabilities→MCP 添加 endpoint（OAuth 走飞书登录）。
 

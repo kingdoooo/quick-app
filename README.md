@@ -5,8 +5,12 @@ Agent 客户端）里用自然语言开发简易全栈站点，说一句"部署"
 `https://app-xxx.<你的域名>` 的可分享 URL；站点访问与管理权限绑定**飞书账号**。
 全程不接触 AWS 控制台，无 EC2/RDS 重资产。
 
-> **当前状态**：代码已完成并通过两轮独立审查（154 个单元测试全绿，2 个 CDK 栈 synth 通过），
-> 尚未部署到真实 AWS。部署操作手册见 **[site-builder/DEPLOY.md](site-builder/DEPLOY.md)**。
+> **当前状态**（2026-07-29）：已在真实 AWS 账号完整部署并验证全部七阶段——
+> 154 个单元测试全绿、4 个 E2E fixture 通过（377s）、真实用户站点经 Claude Code
+> OAuth 接入端到端部署成功（飞书登录 + 鉴权四态实测）。部署中踩到的所有坑
+> （ECR manifest、Function URL 权限、飞书回调/邮箱、token 形态、预签名上传等）
+> 均已回写 **[site-builder/DEPLOY.md](site-builder/DEPLOY.md)** 与
+> [docs/client-setup.md](site-builder/docs/client-setup.md)，换账号重部署照手册执行即可。
 
 ## 架构
 
