@@ -19,11 +19,24 @@ def _lambda():
 _ensure_site_role = common.ensure_site_role
 
 
+def _ensure_log_group(fn: str) -> None:
+    """预建站点日志组并设保留期。Lambda 首次执行会自动建组但不设 retention
+    （永久保留）；这里先建好，站点日志 30 天自动过期。undeploy 时整组删除。"""
+    logs = boto3.client("logs")
+    name = f"/aws/lambda/{fn}"
+    try:
+        logs.create_log_group(logGroupName=name)
+    except logs.exceptions.ResourceAlreadyExistsException:
+        pass
+    logs.put_retention_policy(logGroupName=name, retentionInDays=30)
+
+
 def handler(event, context):
     common.update_job(event["job_id"], phase="deploy-backend")
     edge_role_arn = os.environ["EDGE_ROLE_ARN"]  # 缺失即 KeyError——不允许 * fallback
     lam = _lambda()
     fn = f"site-{event['site_id']}"
+    _ensure_log_group(fn)
     engine = event["manifest"].get("database", {}).get("engine", "none")
     role_arn = _ensure_site_role(event["site_id"], engine)
     env = {"AWS_LAMBDA_EXEC_WRAPPER": "/opt/bootstrap", "PORT": "8080",

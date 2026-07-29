@@ -110,6 +110,14 @@ def handler(event, context):
     _delete_prefix(boto3.client("s3"), os.environ["FRONTEND_BUCKET"],
                    f"sites/{site_id}/")
 
+    # 日志组随站点走（不属于"数据"，不受 purge_data 开关控制）：
+    # 留着既是成本泄漏也把已下线站点的运行痕迹无限期保留。
+    logs = boto3.client("logs")
+    try:
+        logs.delete_log_group(logGroupName=f"/aws/lambda/site-{site_id}")
+    except logs.exceptions.ResourceNotFoundException:
+        pass
+
     # 数据清理默认关闭：站点下线通常只是停止对外服务，数据误删不可恢复。
     # 清理失败不改变下线结果（路由/Lambda 已删，站点确实已下线）。
     purged: dict = {}

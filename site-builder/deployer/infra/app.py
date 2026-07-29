@@ -120,6 +120,12 @@ class SiteDeployerStack(Stack):
             # migrator role 执行站点提交的 SQL（不可信 SQL 不碰 admin 身份）。
             iam.PolicyStatement(actions=["dsql:DbConnectAdmin", "dsql:DbConnect"],
                                 resources=["*"]),
+            iam.PolicyStatement(  # 站点日志组生命周期：建站预建+设保留期，下线删除。
+                # 限 /aws/lambda/site-* 前缀；DeleteLogGroup 只能删站点自己的组。
+                actions=["logs:CreateLogGroup", "logs:PutRetentionPolicy",
+                         "logs:DeleteLogGroup"],
+                resources=[f"arn:aws:logs:{REGION}:{ACCOUNT}:"
+                           "log-group:/aws/lambda/site-*"]),
         ]:
             exec_role.add_to_policy(stmt)
 
