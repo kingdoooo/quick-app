@@ -35,12 +35,14 @@ cp -r site-builder/skills/site-builder ~/.claude/skills/
 # 必须带 --client-id 与固定回调端口：Cognito 不支持 RFC 7591 dynamic client
 # registration，裸 add 会报 "Incompatible auth server: does not support
 # dynamic client registration"（2026-07-29 实测）。
+# 端口用 18765：8765/8766 被 Quick Desktop 的 quickwork-agent 常驻占用
+# （演示机上必装 Quick Desktop，冲突必现）。
 claude mcp add --transport http site-builder-deploy "{mcp_endpoint_url}" \
-  --client-id {mcp_client_id} --callback-port 8765
+  --client-id {mcp_client_id} --callback-port 18765
 ```
 
 还要在 deploy-mcp app client 的 CallbackURLs 里**预注册**
-`http://localhost:8765/callback`（与 AgentCore 的 identities 回调并存）：
+`http://localhost:18765/callback`（与 AgentCore 的 identities 回调并存）：
 
 ```bash
 aws cognito-idp update-user-pool-client --region us-east-1 \
@@ -48,7 +50,7 @@ aws cognito-idp update-user-pool-client --region us-east-1 \
   --client-name deploy-mcp --refresh-token-validity 30 \
   --supported-identity-providers Feishu \
   --callback-urls "https://bedrock-agentcore.us-east-1.amazonaws.com/identities/oauth2/callback" \
-                  "http://localhost:8765/callback" \
+                  "http://localhost:18765/callback" \
   --allowed-o-auth-flows code --allowed-o-auth-scopes openid email \
   --allowed-o-auth-flows-user-pool-client --enable-token-revocation \
   --auth-session-validity 3 \
