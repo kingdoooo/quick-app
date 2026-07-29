@@ -71,7 +71,26 @@ aws acm describe-certificate --region us-east-1 \
   证书：  *.app.example.com（us-east-1）
 ```
 
-### 飞书企业自建应用
+### 身份源（IdP）场景选择
+
+平台对上游 IdP 的唯一硬要求：**Cognito 能联邦到它，且能拿到用户 email claim**
+（owner / allowed_users 全以邮箱为标识）。按你组织的身份源二选一，
+后文所有标 **【飞书】** 的步骤只在飞书场景执行，标准 IdP 场景跳过：
+
+| | 【飞书】场景 | 【标准 IdP】场景（Okta / Azure AD / IAM Identity Center 等） |
+|---|---|---|
+| 适用 | 组织用飞书，用户以飞书账号登录 | 组织已有标准 OIDC/SAML IdP |
+| Cognito 联邦方式 | 经**自建 OIDC 适配器**（① 部署的 API Gateway+Lambda，把飞书 OAuth 包装成 OIDC） | Cognito **原生 OIDC/SAML 联邦**，无需适配器 |
+| ① 阶段做法 | 部署 feishu-quick-sso 上游方案 | 自建 user pool + 控制台添加 IdP（见 ① 的标准 IdP 分支） |
+| email 来源 | 飞书通讯录（两个坑见下节） | IdP 的 email attribute mapping |
+| 本手册验证状态 | **全流程真机验证过** | 架构兼容（平台代码不感知 IdP），未真机验证 |
+
+> 与"用什么登录 Quick"解耦：Quick Desktop/Web 的登录方式（飞书/Okta/IdC）
+> 和本平台的 IdP 是两个独立的认证上下文，互不影响。用户即使用 Okta 登录 Quick，
+> 添加部署 MCP 时走的仍是本平台 Cognito 的 OAuth。两者可同源可不同源；
+> 建议同源，避免 allowed_users 名单里的邮箱与用户实际登录身份的邮箱错配。
+
+### 【飞书】企业自建应用
 
 站点登录与部署权限都绑飞书账号，需要一个企业自建应用：App ID / App Secret
 （① 阶段部署 SSO 时作为参数输入），**必需权限：获取用户 userid、获取用户邮箱**。
@@ -169,22 +188,35 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
 - [ ] `*.{base_domain}` ACM 证书 ISSUED（us-east-1）
 - [ ] `{base_domain}` DNS 可修改（Route53 hosted zone 或等价）
 - [ ] SSM `/site-builder/jwt-secret` 已创建（SecureString）
-- [ ] 飞书企业自建应用（App ID/Secret，含用户 userid + 邮箱权限）
+- [ ] 身份源就绪：【飞书】企业自建应用（App ID/Secret，含用户 userid + 邮箱权限）
+      / 【标准 IdP】OIDC/SAML 应用已建、email attribute 可映射
 - [ ] Docker 运行中；`npx` 可用
 - [ ] `site-builder/config.ini` 与 `router/config.ini` 已从 `.example` 复制并填好
 
 ---
 
-## ① 身份层 — feishu-quick-sso（Task 3）
+## ① 身份层（Task 3）
 
-**产出**：Cognito User Pool + 飞书 OIDC 适配器；回填 `config.ini [Cognito]` 全部 4 项。
+**产出**：Cognito User Pool + 上游 IdP 联邦；回填 `config.ini [Cognito]` 全部 4 项。
+步骤 1 按 §0 选定的场景二选一，**步骤 2 起两个场景通用**（把命令里的 IdP 名
+`Feishu` 换成你实际创建的 provider name 即可）。
 
-1. 克隆并按其 README 部署上游方案（Serverless 路线）：
+1. **【飞书】** 克隆并按其 README 部署上游方案（Serverless 路线，
+   含飞书 OIDC 适配器 + Quick Desktop 代理）：
   ```bash
    git clone https://github.com/aws-samples/sample-for-amazon-quick-sso-with-feishu /tmp/feishu-sso
    cd /tmp/feishu-sso && cat README.md
    # 按 README 部署，飞书 App ID/Secret 作为参数输入
   ```
+
+   **【标准 IdP】** 则无需上游方案与适配器：自建 user pool（含 Hosted UI domain），
+   在「Social and custom providers」添加你的 OIDC 或 SAML IdP（Okta/Azure AD 等
+   都是标准配置），并在 attribute mapping 里**把 IdP 的 email 映射到 pool 的
+   email 属性**（这是硬要求，漏了整个权限模型不成立）。IdP 侧登记 Cognito 的
+   回调 `https://{hosted-ui-domain}/oauth2/idpresponse`。若还需要 Quick Desktop
+   走同一个 pool 登录，另需 offline_access 剥离代理，参考
+   [aws-samples Quick Desktop Cognito 方案](https://aws-samples.github.io/sample-amazon-quick-suite-knowledge-hub/amazon-quick-on-desktop/)。
+
 2. 取 **User Pool ID**。上游栈的 CfnOutput 里有（`UserPoolId`），也可以直接查：
   ```bash
    aws cognito-idp list-user-pools --max-results 20 --region us-east-1 \
@@ -279,7 +311,10 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    aws ssm put-parameter --name /site-builder/site-client-secret \
      --type SecureString --value {上一行输出的 secret} --region us-east-1
   ```
-7. **验证点（人工门禁）**：在 Quick Web/Desktop 配置该 IdP，用飞书账号登录成功。Desktop 身份区域须 us-east-1。
+7. **验证点（人工门禁）**：在 Quick Web/Desktop 配置该 IdP，用上游身份
+   （飞书账号 / Okta 账号等）登录成功。Desktop 身份区域须 us-east-1。
+   （此步只关乎 Quick 登录通道；若组织的 Quick 用别的方式登录、只用本平台
+   建站功能，可跳过。）
 
 **⚠️ 注意**：Task 20 spike 可能改变 MCP client 的 scope 需求（若 AgentCore 只透传 access token，email 需从 id_token 或额外 scope 取）——步骤 5 的第二个 client 配置以 spike 报告 `task-20-spike-report.md` 结论为准，可能需回来调整。
 

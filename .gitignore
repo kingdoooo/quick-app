@@ -10,3 +10,4 @@ site-builder/contract/build/
 # 提交它会留下一份会漂移的副本
 site-builder/mcp/common.py
 .DS_Store
+site-builder/ONBOARDING.md
