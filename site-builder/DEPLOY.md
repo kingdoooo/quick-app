@@ -75,7 +75,20 @@ aws acm describe-certificate --region us-east-1 \
 
 站点登录与部署权限都绑飞书账号，需要一个企业自建应用：App ID / App Secret
 （① 阶段部署 SSO 时作为参数输入），**必需权限：获取用户 userid、获取用户邮箱**。
-重定向 URI 由 ① 阶段产出的 Cognito Hosted UI 决定，建完 Cognito 后回飞书后台补填。
+重定向 URI 需在 ① 部署完后回飞书后台「安全设置 → 重定向 URL」补填。
+**注意填的不是 Cognito Hosted UI 域名**，而是上游 SSO 适配器（API Gateway）的
+callback（2026-07-29 实测，漏注册报飞书错误码 20029"重定向 URL 有误"）：
+
+```bash
+# 从 IdP 配置取适配器 issuer，回调即 {issuer}/callback：
+aws cognito-idp describe-identity-provider --user-pool-id {user_pool_id} \
+  --provider-name Feishu --region us-east-1 \
+  --query 'IdentityProvider.ProviderDetails.oidc_issuer' --output text
+# 形如 https://xxxx.execute-api.us-east-1.amazonaws.com/prod
+# → 在飞书后台注册 https://xxxx.execute-api.us-east-1.amazonaws.com/prod/callback
+```
+
+站点登录、部署 MCP OAuth、Quick Desktop 三条通道共用这一条注册。
 
 邮箱权限不可省：`owner`（谁部署的、谁能改/删站点）与访问名单 `allowed_users`
 都以飞书邮箱为标识，拿不到邮箱则整个权限模型不成立。
