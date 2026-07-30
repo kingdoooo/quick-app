@@ -128,13 +128,14 @@ Edge origin-request（+collaborators 放行、+List 反序列化、+两个 `__Ho
 10. **管理员名单存平台表 + config 种子**。首个管理员从 config.ini 幂等注入，
     后续由现有管理员在控制台增删——管理员变更不走重部署，与二期"在线改"
     主旨一致。
-11. **新 pool 禁止本地用户，身份只能来自企业 IdP**。这是
-    `allowed_users="org"` 语义的前提：Edge 对 org 的判定是"持有任意有效平台
-    会话即放行"，不检查邮箱域。若 pool 允许自注册（`SignUp` API + 托管登录
-    的注册入口），任何互联网用户都能注册后访问全部 org 站点。因此：
-    `AllowAdminCreateUserOnly=True`（关闭自注册）、生产 app client 的
-    `SupportedIdentityProviders` **只列企业 IdP、不含 `COGNITO`**、
-    且 pre-token 触发器注入 `idp` claim 供 Edge 校验来源（见 §3.5）。
+11. **身份只能来自企业 IdP，且这条要在请求路径上被强制**。
+    `allowed_users="org"` 的语义前提：Edge 对 org 的判定是"持有任意有效平台
+    会话即放行"，不检查邮箱域。因此关自注册
+    （`AllowAdminCreateUserOnly=True`）+ 生产 client 不列 `COGNITO` 两条只是
+    减小暴露面——AWS 明确说移除 `COGNITO` **不阻止** SDK 经 user pools API
+    认证本地用户。真正的拦截点是**会话 JWT 的 `idp` claim 校验**
+    （pre-token 注入 → auth 带入会话 → Edge 校验白名单），它是主防线而非
+    可选增强，`REQUIRE_IDP_CLAIM` 置 true 是 M1 的完成条件。详见 §3.5。
 
 ## 3. 权限模型与数据真源
 
@@ -178,6 +179,20 @@ permissions_rev          N（乐观并发版本号，事务条件写用；缺失
   - 两表在同一账号同区域，`TransactWriteItems` 跨表可用；条件失败返回
     `TransactionCanceledException`，按 CancellationReasons 区分是并发冲突
     （提示重试）还是路由缺失（走降级分支）。
+- **`register_route`（部署第 6 步）也必须条件写**，否则事务白做。它的现有形态
+  是"普通读 sites → 无条件 `put_item` 整条路由"，与在线改权限存在这样的交错：
+  ① register_route 读到旧策略（公开）→ ② owner 在线改成私有，事务把两表都改成
+  私有 → ③ register_route 用步骤 ① 的旧快照无条件 put_item → **最终 sites=私有、
+  Edge=公开**，正是事务本该消除的安全状态错误。DynamoDB 事务只保证事务内的
+  原子性，不会把事务之前的普通读与之后的普通写合成一个业务事务（标准读是
+  read-committed，不阻止读后被改）。因此：
+  - 路由表投影带上 `permissions_rev`；
+  - `register_route` 改用 `TransactWriteItems`：对 sites 表做
+    `ConditionCheck`（`permissions_rev` == 读到的值）+ 对路由表 `Put` 整条；
+  - 事务被取消（说明期间有人改了权限）→ 重读 sites、用新策略重建 item 再试，
+    重试上限 3 次；仍失败则该步骤失败（部署 FAILED，比留下错误的公开状态好）。
+  - 首次部署的"权限字段不存在则用 manifest 初始化"同样要条件写
+    （`attribute_not_exists(require_login)`），否则会覆盖并发的首次在线修改。
 - **Edge**：读路由表逻辑不变，新增 collaborators 放行（隐式在 allowed_users
   内，同 owner 现有语义）；`_deser` 扩展支持 List 类型（现状只认 S/BOOL，
   origin_request.py:143-148）。
@@ -262,21 +277,45 @@ allowed_users 从 JSON 字符串转原生 List 在回填时完成；Edge 的 `_d
 
 Edge 对 `"org"` 的判定是"持有本平台签发的有效会话 JWT 即放行"，**不检查邮箱
 域**。这个判定只有在"平台 pool 里的身份必然来自企业 IdP"时才等于"全组织
-用户"。因此两道约束必须同时成立（缺一即 §2 决策 11 描述的越权）：
+用户"。三道约束，**其中第 3 条是唯一真正的执行点**：
 
-1. **pool 侧**：`AllowAdminCreateUserOnly=True` 关闭自注册；生产 app client
-   的 `SupportedIdentityProviders` 只列企业 IdP，不含 `COGNITO`（否则托管
-   登录仍显示本地注册/登录入口）。
-2. **claim 侧**：pre-token 触发器除 email 外注入 `idp` claim（值取
-   `identities[0].providerName`，联邦用户才有）；auth 服务 mint 会话 JWT 时
-   带上它，Edge 校验 `claims["idp"]` 在部署时注入的可信 provider 白名单内
-   （`{{TRUSTED_IDPS}}` 占位符，同 JWT_SECRET 的注入机制）。缺失或不匹配即
-   按未登录处理。
+1. **pool 侧关自注册**：`AllowAdminCreateUserOnly=True`。挡住公开 `SignUp`
+   API。
+2. **生产 app client 的 `SupportedIdentityProviders` 只列企业 IdP，不含
+   `COGNITO`**。注意其**真实效力有限**——AWS 明确说明：把 `COGNITO` 从该列表
+   移除只影响 managed login 登录页展示哪些 IdP，**不阻止**用 SDK 经 user
+   pools API 认证本地用户（官方原文：*"The removal of COGNITO from this list
+   doesn't prevent authentication operations for local users with the user
+   pools API in an AWS SDK. The only way to prevent SDK-based authentication
+   is to block access with a AWS WAF rule."*，见
+   [CreateUserPoolClient](https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_CreateUserPoolClient.html)）。
+   所以这条只是减少暴露面，不能当成边界。
+3. **会话 JWT 的 `idp` claim 校验（主防线）**：pre-token 触发器注入 `idp`
+   （值取 `identities[0].providerName`，只有联邦用户有）→ auth 服务 mint 会话
+   JWT 时带上 → Edge 校验它在部署时注入的可信 provider 白名单内
+   （`{{TRUSTED_IDPS}}` 占位符，同 JWT_SECRET 的注入机制）。缺失或不匹配即按
+   未登录处理。
 
-第 2 条是纵深防御：即便将来有人误开自注册，本地用户签出的会话也没有合规
-`idp` claim，进不了任何 org 站点。**存量兼容**：迁移期已签发的会话 JWT 没有
-`idp` claim，Edge 需允许一个宽限窗口（部署时开关 `{{REQUIRE_IDP_CLAIM}}`，
-切换 pool 且全部用户重新登录后再置 true）——这个开关的翻转是 M1 的验收项。
+**为什么第 3 条必须实现，不能只靠前两条**：既然移除 `COGNITO` 不阻止 SDK 认证
+本地用户，那么只要 pool 里存在任何本地用户（管理员手工建的测试账号、将来有人
+误开自注册、AdminCreateUser 建的服务账号），他就能用 SDK 拿到本 pool 的 token，
+进而拿到平台会话——而 Edge 对 org 不查邮箱域。`idp` claim 是把"必须来自企业
+IdP"这条约束真正落到请求路径上的唯一手段。它不是纵深防御，是主防线；三者的
+关系是"前两条减小暴露面、第 3 条负责拦截"。
+
+**存量兼容**：迁移期已签发的会话 JWT 没有 `idp` claim，Edge 需允许一个宽限
+窗口（部署时开关 `{{REQUIRE_IDP_CLAIM}}`，切换 pool 且全部用户重新登录后置
+true）——**开关翻到 true 是 M1 的完成条件，不是可选项**；停在 false 等于本节
+第 3 条没生效。
+
+**claim 传播链（四段都要落地，缺一即断）**：
+
+| 段 | 落点 | 关键约束 |
+|---|---|---|
+| 注入 | `auth/pre_token_email.py` | pre-token V2 的 `idTokenGeneration` 与 `accessTokenGeneration` 是**两个独立容器**，只写后者不会进 ID token（[官方文档](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-lambda-pre-token-generation.html)）。Web 登录读 ID token、MCP 网关读 access token，**两者都要写** |
+| 换取 | `auth/login_handler.py:_exchange_code` | 从验签后的 id_token claims 里取 `idp` 一并返回 |
+| 签发 | `auth/session.py:mint_session_jwt` | 会话 JWT payload 加 `idp`；与 Edge 的验签算法保持字节级同步的约束不变 |
+| 校验 | `router/.../origin_request.py` | `REQUIRE_IDP_CLAIM` 为真时，`claims["idp"]` 必须在 `TRUSTED_IDPS` 内，否则按未登录处理 |
 
 ## 4. 控制台（管理面板）
 
@@ -522,7 +561,14 @@ site-access-audit  PK site_id, SK "email#date" → {count, first_ts, last_ts}
    IdP 一节改写为两个平行分支，飞书不再是叙述主线。
 3. 三个 app client：`site`（auth 服务）、`mcp`（OAuth 客户端，回调含
    AgentCore identities + `localhost:18765`）、`machine`（key-proxy，
-   client_credentials，新增）。**`site` 与 `mcp` 的
+   client_credentials，新增）。**API 创建的 app client 必须显式套 branding
+   style**：AWS 明确说明经 `CreateUserPoolClient` 建的 client 不会自动获得
+   branding style，*在套上之前 managed login 与 classic hosted UI 页面都不可用*
+   （见 [CreateUserPoolClient](https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_CreateUserPoolClient.html)）——
+   控制台建的 client 会自动有，所以这个坑只在脚本化部署时出现。部署脚本对
+   `site`/`mcp` 调 `CreateManagedLoginBranding(UseCognitoProvidedValues=True)`
+   （用 Cognito 默认样式，不做定制），否则 §7.1 之后的所有登录验证都会在
+   `/oauth2/authorize` 第一步失败。**`site` 与 `mcp` 的
    `SupportedIdentityProviders` 只列企业 IdP，不含 `COGNITO`**——否则托管
    登录仍暴露本地用户登录入口（§3.5 第 1 条）。`machine` 走
    client_credentials，与用户身份无关，不涉及此项。
@@ -601,7 +647,9 @@ Lambda 侧）。
 | 两表仍出现不一致（人为改库、迁移中断等） | 以 sites 表为准；admin 有 `/api/admin/resync/{id}` 手动重投影 |
 | 面板写请求缺 Origin / Origin 不匹配 / 非 JSON Content-Type | 403，不做 Referer 回退（§4.5 CSRF 三条同时满足才放行） |
 | 会话升级 code 被重放 | jti 已消费 → 400；code 过期（>60s）同样 400，前端重走升级流程 |
-| 会话 JWT 缺 `idp` claim | `REQUIRE_IDP_CLAIM=true` 时按未登录处理（302 登录）；迁移宽限期内放行并打点，供确认存量会话已清空 |
+| 会话 JWT 缺 `idp` claim | `REQUIRE_IDP_CLAIM=true` 时按未登录处理（302 登录）；迁移宽限期内放行并打点，供确认存量会话已清空。开关停在 false = §3.5 第 3 条未生效，不算完成 |
+| `register_route` 与在线改权限并发 | 条件事务（§3.2）：检测到 `permissions_rev` 变化即重读重试（≤3 次），仍冲突则该部署 FAILED——绝不用旧快照把路由写回公开 |
+| app client 无 branding style | `/oauth2/authorize` 直接失败（managed login 页面不可用）。部署脚本对 site/mcp 调 `CreateManagedLoginBranding` 后才验证登录（§7.1） |
 | 权限修改生效延迟 | Edge 路由缓存 60s；UI/MCP 返回文案统一"约 1 分钟生效" |
 | key-proxy 收到无效/吊销 Key | 401 + 统一文案，不泄露 Key 是否存在过 |
 | 聚合单区查询失败 | 该区跳过、水位线不推进，下轮重试补齐；stat_key 粒度覆盖写保证幂等 |
@@ -625,9 +673,14 @@ Lambda 侧）。
   （借鉴 mcp 的 do_* 纯函数模式，直接测纯函数层）。
 - **集成/E2E（真实 AWS）**：
   1. 新 pool 全链路登录（飞书 + 标准 IdP 两分支）；
-  2. **公网自注册被拒**：直接调新 pool 的 `SignUp` API 应失败；托管登录页
-     无本地注册/登录入口（§3.5 的两道约束各验一次）；
-  3. **会话缺 `idp` claim 进不了 org 站点**（开关置 true 后）；
+  2. **公网自注册被拒**：调新 pool 的 `SignUp` 应失败。**必须用无 client
+     secret 的 client（`mcp`）做这条负测**——带 secret 的 client 少传
+     `SecretHash` 也会返回 `NotAuthorizedException`，用 `site` client 测会把
+     "缺 SecretHash" 误判成"自注册已禁用"（假通过）；
+  3. **`idp` claim 全链路**：access token 与 **id token** 里都有 `idp`
+     （pre-token 的两个容器各写一次）；会话 cookie 的 JWT payload 里有 `idp`；
+     `REQUIRE_IDP_CLAIM=true` 后，手工 mint 的**无 `idp`** 会话被 302 拦回
+     登录，而正常登录的会话仍可访问——两个方向都要验；
   4. 在线改 allowed_users，60s+缓存窗口内新名单生效（拒绝名单外用户）；
   5. 在线**翻转 require_login**（两个方向各一次）后重部署成功——覆盖
      §3.3.2 的 smoke test 取值路径；
