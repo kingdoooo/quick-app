@@ -167,6 +167,10 @@ permissions_updated_by   email
   `[Platform] admin_seed` 由部署脚本幂等 upsert；后续由现有管理员在控制台
   增删（不能删到名单为空）。管理员对任意站点拥有 owner 等价权限 + 全局
   列表；所有代管操作记 ops-log。
+- **操作审计表 `site-ops-log`**：PK `target`（site_id 或 "platform"）、
+  SK `{ts}#{actor}` → {action, detail}；TTL 400 天。记录：权限修改、协作者
+  变更、owner 转移、下线/purge、Key 创建/吊销、admin 名单变更与代管操作。
+  控制台与 MCP 的写操作都经 permissions 后端统一落一条。
 - **共用校验模块 `permissions.py`**：输入 caller email + site 记录（+admins
   表），输出角色（owner/collaborator/admin/none）；MCP server 与 panel
   Lambda 各自引入（沿用 common.py 的构建时复制模式）。现有 `_assert_owner`
@@ -257,7 +261,8 @@ POST /api/admin/resync/{id}           路由表重同步（仅 admin，见 §8 �
 - 明文：`sk-` + 16 位随机 base62（约 95 bit 熵，内部平台足够）；仅创建响应
   出现一次。
 - `site-api-keys` 表：PK `key_hash`（SHA-256）→ email、name（备注）、
-  prefix（`sk-` 后 8 位，展示用）、created_at、last_used_at、revoked；
+  prefix（`sk-` 后 4 位，展示用——只展示 4 位以保留剩余 12 位约 71 bit
+  熵）、created_at、last_used_at、revoked；
   GSI `email-index`（控制台按人列 Key）。
 - 吊销 = 置 revoked；交换层每请求查表，即时生效。
 - **Key 管理只在控制台**（要求升级会话）。故意不做"MCP 工具管 Key"——
