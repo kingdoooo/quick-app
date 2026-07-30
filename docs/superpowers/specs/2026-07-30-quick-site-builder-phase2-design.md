@@ -128,15 +128,15 @@ Edge origin-request（+collaborators 放行、+List 反序列化、+两个 `__Ho
 10. **管理员名单存平台表 + config 种子**。首个管理员从 config.ini 幂等注入，
     后续由现有管理员在控制台增删——管理员变更不走重部署，与二期"在线改"
     主旨一致。
-11. **身份只能来自企业 IdP，靠四条叠加而非单点**。`allowed_users="org"` 的
-    语义前提：Edge 对 org 只看"持有有效平台会话"，不查邮箱域。四条：
-    ① 关自注册；② 生产 client 不列 `COGNITO`；③ token 的 `idp` +
-    `auth_via` claim 校验（Edge 与 MCP 两个入口）；④ 运维红线——不对本 pool
-    调 `AdminLinkProviderForUser` / `AdminSetUserPassword` / `AdminCreateUser`。
-    **没有哪一条单独是边界**：①② 不阻止 SDK 原生认证（AWS 明说）；③ 的
-    `idp` 来自静态属性，只证明"账号关联过可信 IdP"，linked 用户与设过密码的
-    联邦用户仍可原生登录——所以要配 `auth_via` 只放行托管登录来源，并用 ④
-    堵住制造这类身份的途径。彻底阻断 SDK 原生认证需要 WAF，记入三期。
+11. **身份只能来自企业 IdP；边界是 app client 不开原生认证 flow**。
+    `allowed_users="org"` 的语义前提：Edge 对 org 只看"持有有效平台会话"，
+    不查邮箱域。四条：① 关自注册；② 生产 client 不列 `COGNITO`；
+    ③ token 的 `idp` + `auth_via` claim 校验（Edge 与 MCP 两个入口，纵深）；
+    **④ `ExplicitAuthFlows` 只含 `ALLOW_REFRESH_TOKEN_AUTH`——这是边界**。
+    ①② 不阻止 SDK 原生认证（AWS 明说）；③ 也不够：`idp` 是静态属性、
+    `auth_via` 会被 "原生认证 → refresh 刷一次" 洗白（AWS 明说 refresh token
+    两种来源都签发，`TokenGeneration_RefreshTokens` 不区分）。只有 ④ 让原生
+    认证发不起来。部署脚本必须断言并纠偏 ④ 的配置漂移。
     `REQUIRE_IDP_CLAIM` 置 true 是 M1 的完成条件。详见 §3.5。
 
 ## 3. 权限模型与数据真源
@@ -279,7 +279,8 @@ allowed_users 从 JSON 字符串转原生 List 在回填时完成；Edge 的 `_d
 
 Edge 对 `"org"` 的判定是"持有本平台签发的有效会话 JWT 即放行"，**不检查邮箱
 域**。这个判定只有在"平台 pool 里的身份必然来自企业 IdP"时才等于"全组织
-用户"。三道约束，**其中第 3 条是唯一真正的执行点**：
+用户"。**边界由 app client 的 `ExplicitAuthFlows` 提供（第 4 条），claim 校验
+只是纵深**——下面四条按"谁真正拦住攻击"排序：
 
 1. **pool 侧关自注册**：`AllowAdminCreateUserOnly=True`。挡住公开 `SignUp`
    API。
@@ -292,49 +293,57 @@ Edge 对 `"org"` 的判定是"持有本平台签发的有效会话 JWT 即放行
    is to block access with a AWS WAF rule."*，见
    [CreateUserPoolClient](https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_CreateUserPoolClient.html)）。
    所以这条只是减少暴露面，不能当成边界。
-3. **`idp` claim 校验（拦截层，两个入口都要做）**：pre-token 触发器注入
+3. **`idp` + `auth_via` claim 校验（纵深，两个入口都要做）**：pre-token 触发器注入
    `idp`；**Web 入口** — auth 服务 mint 会话 JWT 时带上，Edge 校验它在可信
    provider 白名单内（`{{TRUSTED_IDPS}}` 占位符，同 JWT_SECRET 的注入机制），
    缺失或不匹配按未登录处理；**MCP 入口** — `_caller_email()` 校验 access
    token 的 `idp`（`TRUSTED_IDPS` 环境变量）。只做 Web 那侧等于防线只做一半：
    MCP 能部署、改权限、下线站点，能力面比访问站点更大。
 
-   **`idp` claim 的效力边界（必须理解，否则会高估它）**：它的取值来自用户档案
-   的静态属性 `identities[0].providerName`，证明的是"**这个账号关联过某个可信
-   IdP**"，**不是**"本次登录由该 IdP 验证"。三条已知绕过路径：
-   - `AdminLinkProviderForUser` 把本地用户链到企业 IdP 后，AWS 明确说明
-     *linked local users can also sign in with SDK-based API operations like
-     `InitiateAuth` after they sign in at least once through their IdP*
-     ——此后原生登录照样带着 `identities`；
-   - 给联邦用户设密码（`AdminSetUserPassword`）会把它从 `EXTERNAL_PROVIDER`
-     变成 `CONFIRMED`，可走原生 API 认证；
-   - refresh token 换 token 时（`triggerSource=TokenGeneration_RefreshTokens`）
-     读的仍是同一份静态属性。
+   **两个 claim 各自的效力边界（都不足以当边界，必须理解）**：
+   - `idp` 取自用户档案的**静态**属性 `identities[0].providerName`，证明的是
+     "这个账号关联过某个可信 IdP"，**不是**"本次登录由它验证"。
+     `AdminLinkProviderForUser` 链过的本地用户（AWS：*linked local users can
+     also sign in with SDK-based API operations like `InitiateAuth` after they
+     sign in at least once through their IdP*）与
+     `AdminSetUserPassword` 设过密码的联邦用户，原生登录时照样带着合法 `idp`。
+   - `auth_via`（pre-token 的 `triggerSource`）证明的是"**本次 token 怎么来
+     的**"，但它**不携带首次认证的 lineage**，因此会被 refresh 流程洗白：
+     原生认证拿到的 token 虽然是 `TokenGeneration_Authentication`（会被拒），
+     但用它换出的 refresh token 再刷一次，新 token 的 triggerSource 就变成
+     `TokenGeneration_RefreshTokens`——落进白名单。AWS 明确说 refresh token
+     *"in response to successful authentication with the managed login
+     authorization-code flow **and with API operations or SDK methods**"*
+     两种来源都会签发，`TokenGeneration_RefreshTokens` 本身不区分二者。
+     若把 `RefreshTokens` 从白名单里去掉，正常用户的会话续期又会全断。
 
-   因此本期把它定位为**拦截层而非边界**：它拦住"从未关联过可信 IdP 的纯本地
-   用户"，这是最可能被误创建出来的一类（手工建的测试账号、误开自注册）；
-   它拦不住上面三条需要管理员主动操作或已有合法首次联邦登录的路径。
+   所以这两个 claim 是纵深，不是边界：它们拦住"从未关联可信 IdP 的纯本地
+   用户"和"直接拿原生 token 来用"，拦不住"原生认证 → refresh 洗白"。
 
-4. **真正的边界是不给原生认证留入口**（本期以运维约束落地，三期上 WAF）：
-   - **不对本平台 pool 调用 `AdminLinkProviderForUser` /
-     `AdminSetUserPassword` / `AdminCreateUser`**——这三个是把"可原生登录的
-     身份"塞进 pool 的唯一途径（自注册已关）。写进 DEPLOY.md 的运维红线；
-   - pre-token 触发器**记录 `triggerSource`** 到 claim（`auth_via`），
-     Edge/MCP 侧只放行 `TokenGeneration_HostedAuth`
-     与 `TokenGeneration_RefreshTokens`——前者是托管登录页（必经 IdP），
-     后者是它换出的 refresh token。`TokenGeneration_Authentication`
-     （原生 `InitiateAuth` 流程完成后触发）一律拒绝。这条把上面第 1、2 条
-     绕过路径也拦住了，代价是"若将来真要支持原生登录得改这里"；
-   - **三期**：按 AWS 的说法，彻底阻断 SDK 原生认证只能靠 WAF 规则挡住
-     user pools API 的 `InitiateAuth`——记入 §11，本期不做（需要 WAF
-     关联 user pool 的额外基建与成本评估）。
+4. **边界：app client 的 `ExplicitAuthFlows` 不开任何原生认证 flow**。
+   这是本期唯一真正不可绕过的一条——原生认证根本发起不了，就不存在
+   "原生 token"，也就不存在可洗白的 refresh token。具体：
+   - `site` / `mcp` client 的 `ExplicitAuthFlows` **只含
+     `ALLOW_REFRESH_TOKEN_AUTH`**，不含 `ALLOW_USER_PASSWORD_AUTH` /
+     `ALLOW_USER_SRP_AUTH` / `ALLOW_CUSTOM_AUTH` / `ALLOW_USER_AUTH` 或任何
+     `ALLOW_ADMIN_USER_PASSWORD_AUTH`。缺了这些 flow，`InitiateAuth` /
+     `AdminInitiateAuth` 对该 client 直接失败——linked 用户与设过密码的联邦
+     用户都无从发起原生登录。**部署脚本必须断言这一点，且每次重跑都纠偏**
+     （client 配置漂移即边界失效）；
+   - 配套运维红线：**不对本平台 pool 调
+     `AdminLinkProviderForUser` / `AdminSetUserPassword` / `AdminCreateUser`**
+     ——它们制造"本可原生登录的身份"，虽然被上一条挡着，但一旦有人给某个
+     client 加回 flow，这些身份立刻可用。写进 DEPLOY.md；
+   - **三期**：WAF 挡 user pools API 是最后一层（防"有人新建了带原生 flow
+     的 client"这类配置漂移）——记入 §11，本期不做。
 
-**四条的关系**：1、2 减小暴露面（关自注册、登录页不暴露本地入口）；
-3 在请求路径上拦截"没有可信 IdP 关联"的身份；4 用运维红线 + `auth_via` claim
-堵住"有关联但走原生认证"的路径。**任何一条单独都不构成边界**——只做 1、2
-时 SDK 原生认证仍可用（AWS 明说移除 `COGNITO` 不阻止它）；只做 3 时
-linked/设过密码的用户仍能绕过。这也是本期把"不调三个 Admin API"写成运维红线
-的原因：在上 WAF 之前，它是唯一能真正关掉原生认证入口的手段。
+**四条的定位一句话**：①② 减小暴露面；③ 纵深（拦纯本地用户与直接的原生
+token）；**④ 是边界**。验收时若只验 ③ 而没验 ④，等于没有边界。
+
+**为什么不能只靠 ①②③**：只做 ①② 时 SDK 原生认证仍可用（AWS 明说移除
+`COGNITO` 不阻止它）；只做 ③ 时 linked / 设过密码的用户可以"原生认证 →
+用 refresh token 刷一次"把 `auth_via` 洗成可信值。④ 从源头上让原生认证发不
+起来，是本期唯一不可绕过的一条。
 
 **存量兼容**：迁移期已签发的会话 JWT 没有 `idp` claim，Edge 需允许一个宽限
 窗口（部署时开关 `{{REQUIRE_IDP_CLAIM}}`，切换 pool 且全部用户重新登录后置
@@ -346,10 +355,10 @@ true）——**开关翻到 true 是 M1 的完成条件，不是可选项**；�
 | 段 | 落点 | 关键约束 |
 |---|---|---|
 | 注入 | `auth/pre_token_email.py` | 注入 `idp`（来源关联）与 `auth_via`（本次 token 的 `triggerSource`）。pre-token V2 的 `idTokenGeneration` 与 `accessTokenGeneration` 是**两个独立容器**，只写后者不会进 ID token（[官方文档](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-lambda-pre-token-generation.html)）。Web 登录读 ID token、MCP 网关读 access token，**两者都要写** |
-| 换取 | `auth/login_handler.py:_exchange_code` | 从验签后的 id_token claims 里取 `idp` 一并返回 |
-| 签发 | `auth/session.py:mint_session_jwt` | 会话 JWT payload 加 `idp`；与 Edge 的验签算法保持字节级同步的约束不变 |
-| 校验（Web） | `router/.../origin_request.py` | `REQUIRE_IDP_CLAIM` 为真时，`claims["idp"]` 必须在 `TRUSTED_IDPS` 内，否则按未登录处理 |
-| 校验（MCP） | `mcp/server.py:_caller_email` | **同一道防线的第二个入口**：AgentCore authorizer 只验 issuer 与 `allowedClients`，不看 `idp`——issuer/client 合法但无 `idp` 的 access token（过渡期本地用户、旧 refresh token 换出的、将来 client auth-flow 漂移）否则能直接部署、改权限、下线站点。`TRUSTED_IDPS` 环境变量为空时放行（迁移宽限期，与 Edge 开关对齐） |
+| 换取 | `auth/login_handler.py:_exchange_code` | 从验签后的 id_token claims 里取 `idp` **与 `auth_via`** 一并返回 |
+| 签发 | `auth/session.py:mint_session_jwt` | 会话 JWT payload 加 `idp` **与 `auth_via`**（都只在非空时写入，保持与一期 token 字节兼容）；与 Edge 的验签算法保持字节级同步的约束不变 |
+| 校验（Web） | `router/.../origin_request.py` | `REQUIRE_IDP_CLAIM` 为真时，`claims["idp"]` 必须在 `TRUSTED_IDPS` 内**且 `claims["auth_via"]` 在受信来源内**，否则按未登录处理 |
+| 校验（MCP） | `mcp/server.py:_caller_email` | **同一道防线的第二个入口**：AgentCore authorizer 只验 issuer 与 `allowedClients`，不看 claim——issuer/client 合法但缺 `idp`/`auth_via` 的 access token 否则能直接部署、改权限、下线站点。同样校验两个 claim；`TRUSTED_IDPS` 为空时放行（迁移宽限期，与 Edge 开关对齐），但 config 已配 IdP 时部署脚本须拒绝空值 |
 
 **两个入口都要配**：只做 Edge 就只保护了站点访问，MCP 这条管理面通道仍然
 开着——而它的能力面比访问站点大得多（部署、改权限、下线）。
@@ -719,12 +728,24 @@ Lambda 侧）。
      secret 的 client（`mcp`）做这条负测**——带 secret 的 client 少传
      `SecretHash` 也会返回 `NotAuthorizedException`，用 `site` client 测会把
      "缺 SecretHash" 误判成"自注册已禁用"（假通过）；
-  3. **`idp` / `auth_via` claim 全链路**：access token 与 **id token** 里都有
-     这两个 claim（pre-token 的两个容器各写一次）；会话 cookie 的 JWT payload
-     里有；`REQUIRE_IDP_CLAIM=true` 后四类负测都被拦（无 `idp`、不可信 `idp`、
-     `auth_via=TokenGeneration_Authentication`、以及一个 linked 本地用户走
-     `InitiateAuth` 拿到的真 token），而正常托管登录的会话仍可访问；
-     MCP 侧同样跑正负一对（可信 token 成功、无 `idp` token 被拒）；
+  3. **边界：原生认证发不起来**（§3.5 第 4 条，最重要的一条）：对
+     `site` / `mcp` client 调 `InitiateAuth`（`USER_PASSWORD_AUTH` /
+     `USER_SRP_AUTH`）与 `AdminInitiateAuth` 均须失败（`InvalidParameter` /
+     `NotAuthorized`：该 flow 未启用）；`describe-user-pool-client` 的
+     `ExplicitAuthFlows` 只有 `ALLOW_REFRESH_TOKEN_AUTH`。
+     **这条不过就没有边界**——③ 的 claim 校验可被 refresh 洗白；
+  4. **`idp` / `auth_via` claim 全链路（纵深）**：access token 与 **id token**
+     里都有这两个 claim（pre-token 的两个容器各写一次）；会话 cookie 的 JWT
+     payload 里有；`REQUIRE_IDP_CLAIM=true` 后三类负测被拦（无 `idp`、
+     不可信 `idp`、`auth_via=TokenGeneration_Authentication`），而正常托管
+     登录的会话仍可访问；MCP 侧跑正负一对（**用同一个 mcp client 签发、
+     issuer/client_id 合法但缺 claim 的 token**——用 machine client 的 token
+     做负测无效，它的 client_id 不在 authorizer 的 allowedClients 里，
+     会在到达容器前被网关拒掉，无论 `_caller_email` 有没有校验都"通过"）；
+  5. **refresh 洗白路径已被 ④ 关闭**：确认无法先拿到原生 token
+     （第 3 条已验），因此不存在"原生认证 → refresh 刷一次"的洗白链。
+     若将来给某个 client 加回原生 flow，本条与第 3 条会同时失败——
+     这是有意的耦合；
   4. 在线改 allowed_users，60s+缓存窗口内新名单生效（拒绝名单外用户）；
   5. 在线**翻转 require_login**（两个方向各一次）后重部署成功——覆盖
      §3.3.2 的 smoke test 取值路径；

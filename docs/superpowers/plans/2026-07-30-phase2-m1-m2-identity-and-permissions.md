@@ -4,7 +4,7 @@
 
 **Goal:** 把平台身份切到专用 Cognito user pool（含 PKCE/nonce 增强），并把站点权限的唯一真源从"site.json + 路由表"迁移到 sites 表，使"在线改权限 / 协作者 / 所有权转移"端到端可用且不再需要重部署。
 
-**Architecture:** 三层改造。① 身份层新建 `site-builder-users` pool（IdP 无关但**禁本地用户**：关自注册 + 生产 client 只列企业 IdP，3 个 app client），pre-token 注入 email + `idp` claim，auth 服务加 PKCE + nonce；② 数据层给 `site-sites` 表加权限字段、`permissions_rev` 与 `owner-index` GSI，新增 `permissions.py` 作为唯一角色判定与权限写入模块——权限写入统一走 `write_permissions`（`TransactWriteItems` 两表原子），MCP 与后续 panel 共用（沿用 `common.py` 的构建时复制模式）；③ 消费层改 `register_route`（权限来自 sites 表并输出 effective policy）、`smoke_test`（读 effective policy）、`mark_job`（不再写 owner）、Edge（collaborators 放行 + List 反序列化）、MCP（角色判定替换 `_assert_owner` + 3 个新工具）。存量站点用一次性脚本从路由表回填 sites 表（损坏数据报错跳过，不扩权）。
+**Architecture:** 三层改造。① 身份层新建 `site-builder-users` pool（IdP 无关但**禁本地用户**：关自注册 + 生产 client 只列企业 IdP + `ExplicitAuthFlows` 不开原生认证 flow=org 边界本体，2 个 app client；machine client 随 M4 的 resource server 一起建），pre-token 注入 email + `idp` claim，auth 服务加 PKCE + nonce；② 数据层给 `site-sites` 表加权限字段、`permissions_rev` 与 `owner-index` GSI，新增 `permissions.py` 作为唯一角色判定与权限写入模块——权限写入统一走 `write_permissions`（`TransactWriteItems` 两表原子），MCP 与后续 panel 共用（沿用 `common.py` 的构建时复制模式）；③ 消费层改 `register_route`（权限来自 sites 表并输出 effective policy）、`smoke_test`（读 effective policy）、`mark_job`（不再写 owner）、Edge（collaborators 放行 + List 反序列化）、MCP（角色判定替换 `_assert_owner` + 3 个新工具）。存量站点用一次性脚本从路由表回填 sites 表（损坏数据报错跳过，不扩权）。
 
 **Tech Stack:** Python 3.13（Lambda/MCP）、Python 3.11（Lambda@Edge）、boto3、DynamoDB、Cognito、CDK（router + deployer 两个栈）、pytest + moto、AgentCore Runtime。
 
@@ -741,7 +741,14 @@ def is_admin(email: str) -> bool:
 
 
 def list_admins() -> list[str]:
-    items = common._paginate(_admins_table().scan, ProjectionExpression="email")
+    """列管理员。用强一致读——撤权/新增后要立刻可见。
+
+    注意：即便强一致，Scan 也没有跨分页快照隔离，所以**不要用它做安全判定**
+    （存在性判定用 is_admin 的强一致 Get，计数约束交给事务条件）。
+    这里只服务于"展示名单"与停写维护。
+    """
+    items = common._paginate(_admins_table().scan, ProjectionExpression="email",
+                             ConsistentRead=True)
     # __count__ 是 remove_admin 的并发 sentinel，不是管理员
     return sorted(i["email"] for i in items if i["email"] != "__count__")
 
@@ -798,10 +805,16 @@ def add_admin(email: str, added_by: str) -> None:
 
 
 def rebuild_admin_count() -> int:
-    """按实际 item 数重建 __count__。
+    """按实际 item 数重建 __count__。**停写维护操作，不要放进正常流程。**
 
-    给存量表（sentinel 引入前建的）与"计数疑似漂移"时用；部署脚本种子
-    管理员后调一次即可。返回重建后的计数。
+    DynamoDB 的 Scan 即便加 ConsistentRead 也**不提供跨分页的快照隔离**：
+    与在线增删并发时会把不同时点的结果混在一起写进 sentinel。计数偏高 →
+    最后一个管理员可能通过 `n > 1` 被删掉（表被删空）；偏低 → 正常删除被
+    永久误拦。所以它只用于：
+      - 存量表首次引入 sentinel（sentinel 之前建的表）；
+      - 事务中途失败后确认计数漂移，人工修复。
+    调用前先确认没有并发的 add/remove（例如临时收回控制台写权限）。
+    正常路径的计数由 add_admin / remove_admin 的事务维护，**不要覆盖它**。
     """
     n = len(list_admins())
     _admins_table().put_item(Item={"email": "__count__", "n": n})
@@ -811,16 +824,14 @@ def rebuild_admin_count() -> int:
 def remove_admin(email: str) -> None:
     """删管理员。名单删空 = 平台永久失去管理入口，因此硬拦。
 
-    scan → delete 两步之间有并发窗口（两个管理员同时删自己，各自都看到
-    "还有两个"，结果表被删空）。用一条 sentinel item 记计数、在同一事务里
-    条件递减来关掉这个窗口：计数降到 0 的那次事务必然失败。
+    **不做 Scan 前置判断**：`list_admins()` 是最终一致 Scan，刚添加的管理员
+    可能扫不到 → 前置检查认为"不存在"直接 return 成功，而 `is_admin()` 的强
+    一致 Get 仍看得到该 item，用户实际保留着管理员权限（静默失败）。
+    存在性与"不是最后一个"全部交给事务条件判定：
+      - Delete 带 attribute_exists(email)：不存在 → 条件失败 → 幂等成功；
+      - sentinel 带 n > 1：删到只剩一个 → 条件失败 → 拒绝。
     """
     import botocore.exceptions
-    current = list_admins()
-    if email not in current:
-        return
-    if len(current) <= 1:
-        raise PermissionDenied("不能删除最后一个管理员")
     ddb = boto3.client("dynamodb",
                        region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
     table = os.environ["ADMINS_TABLE"]
@@ -842,8 +853,12 @@ def remove_admin(email: str) -> None:
         if "TransactionConflict" in reasons:
             raise PermissionConflict(
                 "管理员名单正被他人修改，请重试") from e
-        if "ConditionalCheckFailed" in reasons:
+        # 逐项分辨：第 0 项是 Delete（目标不存在=幂等成功），
+        # 第 1 项是 sentinel（n>1 不成立=这是最后一个管理员）。
+        if len(reasons) > 1 and reasons[1] == "ConditionalCheckFailed":
             raise PermissionDenied("不能删除最后一个管理员") from e
+        if reasons and reasons[0] == "ConditionalCheckFailed":
+            return          # 该邮箱本就不是管理员：幂等成功
         raise               # 容量/校验等：如实抛出，不要伪装成权限问题
 
 
@@ -1037,16 +1052,45 @@ def write_permissions(site_id: str, *, actor: str, action: str,
             raise PermissionConflict(
                 "站点权限已被其他人修改，请刷新后重试") from e
         if route_failed and _ALLOW_ROUTE_ABSENT:
-            # 站点还没首次部署成功（无路由 item）：只写真源，
-            # 首次部署时 register_route 会带上正确值。
-            # 仍要带 rev 条件，避免这条降级路径绕过并发保护。
+            # 站点还没首次部署成功（无路由 item）：只写真源。
+            # **仍然走事务**，不能裸 update_item——裸写会重开两个窗口：
+            #   ① route 在两次写之间被 register_route 创建（用它读到的旧策略，
+            #      公开），fallback 只把 sites 改成私有 → sites 私有 / Edge
+            #      公开，正是事务本该消除的状态；
+            #   ② 首个事务里的 admin ConditionCheck 已随取消一起失效，
+            #      此时 admin 若被撤权，裸写不再校验（admin 变更不推进站点 rev）。
+            # 所以 fallback = sites Update + route "确实不存在" 的
+            # ConditionCheck（+ admin 路径保留 admin ConditionCheck）。
+            fallback = [
+                {"Update": site_update},
+                {"ConditionCheck": {
+                    "TableName": os.environ["ROUTING_TABLE"],
+                    "Key": {"subdomain": {"S": common.subdomain_for(site_id)}},
+                    "ConditionExpression": "attribute_not_exists(subdomain)"}},
+            ]
+            if role == ROLE_ADMIN:
+                fallback.append({"ConditionCheck": {
+                    "TableName": os.environ["ADMINS_TABLE"],
+                    "Key": {"email": {"S": actor}},
+                    "ConditionExpression": "attribute_exists(email)"}})
             try:
-                ddb.update_item(**site_update)
+                ddb.transact_write_items(TransactItems=fallback)
             except botocore.exceptions.ClientError as inner:
-                if inner.response["Error"]["Code"] == "ConditionalCheckFailedException":
-                    raise PermissionConflict(
-                        "站点权限已被其他人修改，请刷新后重试") from inner
-                raise
+                if (inner.response["Error"]["Code"]
+                        != "TransactionCanceledException"):
+                    raise
+                inner_reasons = _cancel_reasons(inner)
+                if len(inner_reasons) > 1 and inner_reasons[1] == "ConditionalCheckFailed":
+                    # route 在这期间被创建了 → 回到正常双表事务重试一次
+                    return write_permissions(
+                        site_id, actor=actor, action=action,
+                        require_login=require_login, allowed_users=allowed_users,
+                        collaborators=collaborators, new_owner=new_owner,
+                        mutate=mutate)
+                if len(inner_reasons) > 2 and inner_reasons[2] == "ConditionalCheckFailed":
+                    raise PermissionDenied("你的管理员权限已被撤销") from inner
+                raise PermissionConflict(
+                    "站点权限已被其他人修改，请刷新后重试") from inner
             return {**effective, "route_synced": False}
         raise
 
@@ -2846,10 +2890,13 @@ import permissions
 seed = cfg['Platform']['admin_seed']
 assert seed, 'config.ini [Platform] admin_seed 为空'
 permissions.add_admin(seed, added_by='seed')
-# 存量表（sentinel 引入前建的）或曾经中断过的 add 会让计数漂移，
-# 种子后重建一次即可对齐
-print('admins:', permissions.list_admins(), 'count:', permissions.rebuild_admin_count())
-"
+print('admins:', permissions.list_admins())
+"""
+
+# 仅当这是**存量表首次引入 sentinel**（或确认计数漂移）时，在没有并发写的
+# 情况下手工重建一次；正常路径的计数由 add_admin/remove_admin 的事务维护，
+# 不要在每次部署时覆盖它（Scan 无快照隔离，覆盖可能写进混合时点的结果）：
+#   python3 -c "... permissions.rebuild_admin_count()"
 ```
 Expected: 打印含你的邮箱的名单。
 
@@ -4536,11 +4583,65 @@ def test_mcp_client_is_public():
     assert dp.client_configs("example.com", [], idp_name="Okta")["mcp"]["GenerateSecret"] is False
 
 
-def test_machine_client_uses_client_credentials():
-    machine = dp.client_configs("example.com", [], idp_name="Okta")["machine"]
+def test_machine_client_not_created_in_m1():
+    """M1 不建 machine client：client_credentials 只能授 resource server 的
+    custom scope，空 scope 会被 Cognito 跨字段校验拒绝——脚本会在建 client
+    这一步中止，后面的 branding / pre-token 触发器都跑不到。M4 再建。"""
+    clients = dp.client_configs("example.com", [], idp_name="Okta")
+    assert set(clients) == {"site", "mcp"}
+
+
+def test_machine_client_requires_scopes_when_requested():
+    with pytest.raises(ValueError, match="scope"):
+        dp.client_configs("example.com", [], idp_name="Okta",
+                          include_machine=True, machine_scopes=())
+
+
+def test_machine_client_with_scopes_is_client_credentials_only():
+    machine = dp.client_configs(
+        "example.com", [], idp_name="Okta", include_machine=True,
+        machine_scopes=("site-builder/deploy",))["machine"]
     assert machine["AllowedOAuthFlows"] == ["client_credentials"]
+    assert machine["AllowedOAuthScopes"] == ["site-builder/deploy"]
     assert machine["GenerateSecret"] is True
     assert machine["CallbackURLs"] == []
+    assert machine["ExplicitAuthFlows"] == []
+
+
+@pytest.mark.parametrize("key", ["site", "mcp"])
+def test_clients_disable_all_native_auth_flows(key):
+    """spec §3.5 第 4 条：这是 org 边界本体。
+
+    只要开了任一原生 flow，linked 用户 / 设过密码的联邦用户就能原生登录，
+    再用 refresh 刷一次就把 auth_via 洗成可信值——claim 校验拦不住那条路。
+    """
+    clients = dp.client_configs("example.com", [], idp_name="Okta")
+    flows = set(clients[key]["ExplicitAuthFlows"])
+    assert flows == {"ALLOW_REFRESH_TOKEN_AUTH"}
+    assert not (flows & set(dp.NATIVE_AUTH_FLOWS))
+
+
+def test_assert_no_native_flows_rejects_drift():
+    with pytest.raises(SystemExit, match="原生认证"):
+        dp._assert_no_native_flows("site", {
+            "ExplicitAuthFlows": ["ALLOW_REFRESH_TOKEN_AUTH",
+                                  "ALLOW_USER_PASSWORD_AUTH"]})
+
+
+def test_verify_no_native_flows_reads_back_from_aws():
+    """下发后必须读回复验：update 是整体替换，漂移只能靠 describe 发现。"""
+    import boto3
+    from botocore.stub import Stubber
+
+    cog = boto3.client("cognito-idp", region_name="us-east-1",
+                       aws_access_key_id="t", aws_secret_access_key="t")
+    with Stubber(cog) as stub:
+        stub.add_response("describe_user_pool_client",
+                          {"UserPoolClient": {"ExplicitAuthFlows":
+                                              ["ALLOW_USER_PASSWORD_AUTH"]}},
+                          {"UserPoolId": "us-east-1_test", "ClientId": "c1"})
+        with pytest.raises(SystemExit, match="org 边界失效"):
+            dp._verify_no_native_flows(cog, "us-east-1_test", {"site": "c1"})
 
 
 def test_client_configs_have_no_managed_login_version():
@@ -4549,7 +4650,7 @@ def test_client_configs_have_no_managed_login_version():
     断言 dict 不够——必须让 botocore 真正校验参数名（见下一个测试）。
     """
     clients = dp.client_configs("example.com", [], idp_name="Okta")
-    for key in ("site", "mcp", "machine"):
+    for key in ("site", "mcp"):
         assert "ManagedLoginVersion" not in clients[key]
 
 
@@ -4566,7 +4667,7 @@ def test_client_configs_pass_botocore_param_validation():
                        aws_access_key_id="t", aws_secret_access_key="t")
     clients = dp.client_configs("example.com", [], idp_name="Okta")
     with Stubber(cog) as stub:
-        for key in ("site", "mcp", "machine"):
+        for key in ("site", "mcp"):
             params = {"UserPoolId": "us-east-1_test", **clients[key]}
             stub.add_response("create_user_pool_client",
                               {"UserPoolClient": {"ClientId": "c"}}, params)
@@ -4608,9 +4709,7 @@ def test_existing_domain_with_v1_is_upgraded():
         assert dp._ensure_domain(cog, "us-east-1_test", "pfx") == "old"
 
 
-def test_machine_client_has_no_user_flows():
-    machine = dp.client_configs("example.com", [], idp_name="Okta")["machine"]
-    assert "code" not in machine["AllowedOAuthFlows"]
+
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -4656,6 +4755,15 @@ HERE = Path(__file__).parent
 POOL_NAME = "site-builder-users"
 MCP_LOCALHOST_CALLBACK = "http://localhost:18765/callback"
 
+# spec §3.5 第 4 条：org 边界 = app client 不开任何原生认证 flow。
+# 只留 refresh（正常会话续期需要）。加入下面任何一项即打破边界：
+#   ALLOW_USER_PASSWORD_AUTH / ALLOW_USER_SRP_AUTH / ALLOW_CUSTOM_AUTH /
+#   ALLOW_USER_AUTH / ALLOW_ADMIN_USER_PASSWORD_AUTH
+NATIVE_AUTH_DISABLED = ["ALLOW_REFRESH_TOKEN_AUTH"]
+NATIVE_AUTH_FLOWS = ("ALLOW_USER_PASSWORD_AUTH", "ALLOW_USER_SRP_AUTH",
+                     "ALLOW_CUSTOM_AUTH", "ALLOW_USER_AUTH",
+                     "ALLOW_ADMIN_USER_PASSWORD_AUTH")
+
 
 def pool_config(base_domain: str) -> dict:
     """CreateUserPool 参数。
@@ -4680,7 +4788,9 @@ def pool_config(base_domain: str) -> dict:
 
 
 def client_configs(base_domain: str, extra_mcp_callbacks: list[str],
-                   idp_name: str | None = None) -> dict:
+                   idp_name: str | None = None, *,
+                   include_machine: bool = False,
+                   machine_scopes: tuple[str, ...] = ()) -> dict:
     """三个 app client 的参数。
 
     idp_name 给出时，site/mcp 的 SupportedIdentityProviders **只列该 IdP**，
@@ -4698,7 +4808,13 @@ def client_configs(base_domain: str, extra_mcp_callbacks: list[str],
         "CallbackURLs": [f"https://auth.{base_domain}/callback"],
         "LogoutURLs": [f"https://auth.{base_domain}/logout"],
         "SupportedIdentityProviders": providers,
-        "ExplicitAuthFlows": ["ALLOW_REFRESH_TOKEN_AUTH"],
+        # spec §3.5 第 4 条 —— **这是 org 边界本体**，不是可调项。
+        # 只留 refresh：不含 ALLOW_USER_PASSWORD_AUTH / ALLOW_USER_SRP_AUTH /
+        # ALLOW_CUSTOM_AUTH / ALLOW_USER_AUTH / ALLOW_ADMIN_USER_PASSWORD_AUTH，
+        # 因此 InitiateAuth / AdminInitiateAuth 对本 client 直接失败——
+        # linked 用户与设过密码的联邦用户都无从发起原生登录，也就不存在
+        # 可被 refresh 洗白的原生 token（claim 校验挡不住那条路）。
+        "ExplicitAuthFlows": NATIVE_AUTH_DISABLED,
     }
     mcp = {
         "ClientName": "site-builder-mcp",
@@ -4708,19 +4824,33 @@ def client_configs(base_domain: str, extra_mcp_callbacks: list[str],
         "AllowedOAuthScopes": ["openid", "email", "profile"],
         "CallbackURLs": [MCP_LOCALHOST_CALLBACK] + list(extra_mcp_callbacks),
         "SupportedIdentityProviders": providers,
-        "ExplicitAuthFlows": ["ALLOW_REFRESH_TOKEN_AUTH"],
+        "ExplicitAuthFlows": NATIVE_AUTH_DISABLED,   # 同上，边界
     }
-    machine = {
-        "ClientName": "site-builder-machine",
-        "GenerateSecret": True,
-        "AllowedOAuthFlows": ["client_credentials"],
-        "AllowedOAuthFlowsUserPoolClient": True,
-        "AllowedOAuthScopes": [],   # 建 resource server 后回填（M4）
-        "CallbackURLs": [],
-        # machine 走 client_credentials，与用户身份无关
-        "SupportedIdentityProviders": ["COGNITO"],
-    }
-    return {"site": site, "mcp": mcp, "machine": machine}
+    # machine client（key-proxy 用）**不在 M1 创建**：client_credentials 授权
+    # 只能授 resource server 的 custom scope，而 AllowedOAuthScopes 为空的
+    # client_credentials client 会被 Cognito 的跨字段校验拒绝——脚本会在创建
+    # app client 这一步中止，后面的 branding、pre-token 触发器都跑不到。
+    # resource server + custom scope 属于 M4 的范围，届时连同 machine client
+    # 一起建（M4 调 client_configs 时传 include_machine=True）。
+    out = {"site": site, "mcp": mcp}
+    if include_machine:
+        if not machine_scopes:
+            raise ValueError(
+                "machine client 需要至少一个 resource server custom scope——"
+                "client_credentials 不能用空 scope 创建（先建 resource server）")
+        out["machine"] = {
+            "ClientName": "site-builder-machine",
+            "GenerateSecret": True,
+            "AllowedOAuthFlows": ["client_credentials"],
+            "AllowedOAuthFlowsUserPoolClient": True,
+            "AllowedOAuthScopes": list(machine_scopes),
+            "CallbackURLs": [],
+            # machine 走 client_credentials，与用户身份无关
+            "SupportedIdentityProviders": ["COGNITO"],
+            # 不开任何原生认证 flow（与 site/mcp 同一条边界）
+            "ExplicitAuthFlows": [],
+        }
+    return out
 
 
 def _cfg() -> configparser.ConfigParser:
@@ -4841,6 +4971,7 @@ def _ensure_clients(cog, pool_id: str, base_domain: str,
     out = {}
     for key, params in client_configs(base_domain, extra_mcp_callbacks,
                                       idp_name).items():
+        _assert_no_native_flows(key, params)
         name = params["ClientName"]
         if name in existing:
             client_id = existing[name]
@@ -4854,6 +4985,35 @@ def _ensure_clients(cog, pool_id: str, base_domain: str,
             print(f"  新建 client {name} = {client_id}")
         out[key] = client_id
     return out
+
+
+def _assert_no_native_flows(key: str, params: dict) -> None:
+    """边界自检：client 参数里不得出现任何原生认证 flow（spec §3.5 第 4 条）。
+
+    放在下发之前——配置漂移（有人为了调试加回 USER_PASSWORD_AUTH）会让
+    allowed_users="org" 的边界失效，而 claim 校验拦不住"原生认证 → refresh
+    洗白"这条路径。
+    """
+    flows = set(params.get("ExplicitAuthFlows") or [])
+    bad = flows & set(NATIVE_AUTH_FLOWS)
+    if bad:
+        raise SystemExit(
+            f"client {key} 开了原生认证 flow {sorted(bad)}——这会打破 org 边界"
+            "（spec §3.5 第 4 条）。要支持原生登录必须先重新设计该边界。")
+
+
+def _verify_no_native_flows(cog, pool_id: str, clients: dict) -> None:
+    """下发后读回复验：update_user_pool_client 是整体替换，漏传即被清空/改写。"""
+    for key, client_id in clients.items():
+        desc = cog.describe_user_pool_client(
+            UserPoolId=pool_id, ClientId=client_id)["UserPoolClient"]
+        flows = set(desc.get("ExplicitAuthFlows") or [])
+        bad = flows & set(NATIVE_AUTH_FLOWS)
+        if bad:
+            raise SystemExit(
+                f"client {key}({client_id}) 线上仍开着 {sorted(bad)}——"
+                "org 边界失效，中止（spec §3.5 第 4 条）")
+    print("  ✓ 所有 client 均未开启原生认证 flow（org 边界成立）")
 
 
 def _ensure_branding(cog, pool_id: str, clients: dict) -> None:
@@ -4911,8 +5071,7 @@ def _store_client_secrets(cog, pool_id: str, clients: dict, region: str) -> None
     """
     import boto3
     ssm = boto3.client("ssm", region_name=region)
-    for key, param in (("site", "/site-builder/site-client-secret"),
-                       ("machine", "/site-builder/machine-client-secret")):
+    for key, param in (("site", "/site-builder/site-client-secret"),):
         secret = cog.describe_user_pool_client(
             UserPoolId=pool_id, ClientId=clients[key])["UserPoolClient"].get(
                 "ClientSecret", "")
@@ -4962,16 +5121,19 @@ def main() -> None:
     print("④ app clients")
     clients = _ensure_clients(cog, pool_id, base_domain, args.mcp_callback, idp_name)
 
-    print("⑤ managed login branding（API 建的 client 必须显式套）")
+    print("⑤ 边界复验：client 不得开原生认证 flow")
+    _verify_no_native_flows(cog, pool_id, clients)
+
+    print("⑥ managed login branding（API 建的 client 必须显式套）")
     _ensure_branding(cog, pool_id, clients)
 
-    print("⑥ pre-token 触发器（注入 email + idp claim）")
+    print("⑦ pre-token 触发器（注入 email + idp/auth_via claim）")
     sys.path.insert(0, str(HERE.parent / "auth"))
     import deploy_auth
     role_arn = deploy_auth.ensure_lambda_role()
     deploy_auth.ensure_pre_token_trigger(role_arn, pool_id=pool_id)
 
-    print("⑦ client secret → SSM")
+    print("⑧ client secret → SSM")
     _store_client_secrets(cog, pool_id, clients, region)
 
     print("\n回填 site-builder/config.ini：")
@@ -4979,7 +5141,7 @@ def main() -> None:
     print(f"  [Cognito] domain = https://{domain_prefix}.auth.{region}.amazoncognito.com")
     print(f"  [Cognito] site_client_id = {clients['site']}")
     print(f"  [Cognito] mcp_client_id = {clients['mcp']}")
-    print(f"  [Cognito] machine_client_id = {clients['machine']}")
+    print("  [Cognito] machine_client_id = （M4 建 resource server 时再填）")
     if idp_name:
         print(f"\n在 IdP（{idp_name}）侧把这个回调加进白名单：")
         print(f"  https://{domain_prefix}.auth.{region}.amazoncognito.com/oauth2/idpresponse")
@@ -5277,6 +5439,34 @@ Expected: `status=302` 且 `location` 指向 IdP 的授权端点（飞书适配�
 - `status=200` 且响应体里有 `name="username"` 输入框：说明 client 里还留着
   `COGNITO`，本地登录入口暴露。
 
+- [ ] **Step 1c: [真机] 边界验证——原生认证必须发不起来（最关键的一条）**
+
+spec §3.5 第 4 条是 org 语义的**边界本体**：client 不开任何原生认证 flow，
+所以 `InitiateAuth` / `AdminInitiateAuth` 对它直接失败。这条不过，claim 校验
+挡不住"原生认证 → 用 refresh token 刷一次把 `auth_via` 洗白"这条链。
+
+Run:
+```bash
+for CLIENT in <site_client_id> <mcp_client_id>; do
+  echo "--- $CLIENT"
+  aws cognito-idp initiate-auth --region us-east-1 --client-id "$CLIENT" \
+    --auth-flow USER_PASSWORD_AUTH \
+    --auth-parameters USERNAME=probe@example.com,PASSWORD='ProbeOnly!2026x' \
+    2>&1 | tail -2
+  aws cognito-idp describe-user-pool-client --region us-east-1 \
+    --user-pool-id <新 pool id> --client-id "$CLIENT" \
+    --query 'UserPoolClient.ExplicitAuthFlows'
+done
+```
+Expected: 每个 client 的 `initiate-auth` 都失败，错误是
+`InvalidParameterException`（*Auth flow not enabled for this client*）或
+`NotAuthorizedException`；`ExplicitAuthFlows` 只有
+`["ALLOW_REFRESH_TOKEN_AUTH"]`。
+
+**若 `initiate-auth` 返回 `UserNotFoundException`**：说明 flow 是开着的
+（只是用户不存在）——边界失效，回去检查 `deploy_pool.py` 的
+`NATIVE_AUTH_DISABLED` 与 `_verify_no_native_flows` 是否真的生效。
+
 - [ ] **Step 2: [真机 spike] IdP 回调 URL 追加**
 
 新 pool 的 Cognito 域名变了，IdP 侧需要把新的 `https://<domain-prefix>.auth.us-east-1.amazoncognito.com/oauth2/idpresponse` 加进回调白名单。
@@ -5393,27 +5583,37 @@ def mint(extra):
     return f"{h}.{p}." + b64(hmac.new(secret.encode(), f"{h}.{p}".encode(),
                                       hashlib.sha256).digest())
 
-print(f"SB_TOK_GOOD={mint({'idp': os.environ['TRUSTED_IDP']})}")
-print(f"SB_TOK_NOIDP={mint({})}")
+# good token 必须同时带 idp 与 auth_via——实现要求两者都可信。
+# 只带 idp 的"good" token 也会被 302，于是两行都是 302，
+# 正确实现反而被误诊成"secret/签名错误"。
+GOOD = {'idp': os.environ['TRUSTED_IDP'],
+        'auth_via': 'TokenGeneration_HostedAuth'}
+print(f"SB_TOK_GOOD={mint(GOOD)}")
+print(f"SB_TOK_NOIDP={mint({'auth_via': 'TokenGeneration_HostedAuth'})}")
+print(f"SB_TOK_NATIVE={mint({**GOOD, 'auth_via': 'TokenGeneration_Authentication'})}")
 PYEOF
 )"
 
-echo -n "带可信 idp（应 200）: "
+echo -n "idp+auth_via 都可信（应 200）: "
 curl -s -o /dev/null -w "%{http_code}\n" -H "Cookie: sb_session=$SB_TOK_GOOD" "$SITE_URL"
-echo -n "无 idp（应 302）:      "
+echo -n "无 idp（应 302）:              "
 curl -s -o /dev/null -w "%{http_code}\n" -H "Cookie: sb_session=$SB_TOK_NOIDP" "$SITE_URL"
+echo -n "原生认证来源（应 302）:        "
+curl -s -o /dev/null -w "%{http_code}\n" -H "Cookie: sb_session=$SB_TOK_NATIVE" "$SITE_URL"
 
-unset SB_JWT_SECRET SB_TOK_GOOD SB_TOK_NOIDP
+unset SB_JWT_SECRET SB_TOK_GOOD SB_TOK_NOIDP SB_TOK_NATIVE
 ```
 
-Expected: 第一行 `200`、第二行 `302`。
+Expected: `200` / `302` / `302`。
 
 判读：
-- 两行都 302 → secret 或签名不对（不是 idp 校验生效），先查 secret 与
-  `router/config.ini` 的 `[SiteBuilder] base_domain`；
-- 两行都 200 → `require_idp_claim` 还是 `false`（或 synth 时占位符没替换成功，
+- **第一行也是 302** → 先排除 secret 与签名（三行全 302 通常是 secret 取错或
+  `base_domain` 不对），再确认 good token 的两个 claim 都带上了；
+- 三行都 200 → `require_idp_claim` 还是 `false`（或 synth 时占位符没替换成功，
   见 Task 8b Step 6）；
-- 第一行 302、第二行 200 → `trusted_idps` 配的值与 token 里的 idp 不一致。
+- 第一行 302、第二行 200 → `trusted_idps` 的值与 token 里的 idp 不一致；
+- 前两行对但第三行 200 → Edge 只校验了 idp、没校验 auth_via
+  （spec §3.5：`auth_via` 是纵深的另一半）。
 
 probe token 5 分钟内自然过期；跑完 `unset` 三个变量。
 
@@ -5424,15 +5624,31 @@ Edge 那侧验完了，MCP 是另一条入口，必须独立验——只验"acce
 通过）。
 
 1. **正向**：用正常登录拿到的 token 调 `list_my_sites` → 成功；
-2. **负向（无 idp）**：把 `TRUSTED_IDPS` 配好后，用一个**没有 idp claim** 的
-   token 调 MCP → 必须 401/被拒。拿这种 token 的办法：临时把 pre-token 触发器
-   的 idp 注入注掉、重新登录取 token，验完恢复；或用 `machine` client 的
-   client_credentials token（它本来就没有 idp——顺便验证 M4 的 key-proxy 路径
-   会被这条拦住，届时要给它单独的放行逻辑）；
-3. **负向（原生认证来源）**：如果 pool 里有 linked 用户，用
-   `InitiateAuth` 拿 token 调 MCP → 必须被拒（`auth_via` 是
-   `TokenGeneration_Authentication`）。没有这类用户就跳过并在 DEPLOY.md 记明
-   "未覆盖"，不要写成已验证。
+2. **负向（无 idp）**：把 `TRUSTED_IDPS` 配好后，用一个**由同一个 mcp client
+   签发、issuer/client_id 都合法但缺 `idp` claim** 的 token 调 MCP → 必须
+   被拒。拿这种 token 的唯一可靠办法：临时把 pre-token 触发器的 idp 注入注掉
+   → 重新走一次 OAuth 取 token → 调用 → 恢复触发器。
+
+   **不要用 machine client 的 token 做这条负测**：它的 `client_id` 不在
+   AgentCore authorizer 的 `allowedClients` 里，请求在到达容器之前就被网关
+   401 了——`_caller_email()` 根本没执行，即便它完全没做校验这条测试也会
+   "通过"（假通过）。同理，任何换 client 的做法都验不了容器内的逻辑。
+
+   验证请求真的到达了容器：调用后查 runtime 日志里有本次请求的记录
+   （`/aws/bedrock-agentcore/*`），确认是应用层拒绝而不是网关拒绝：
+   ```bash
+   aws logs filter-log-events --region us-east-1 \
+     --log-group-name-prefix /aws/bedrock-agentcore \
+     --start-time $(python3 -c 'import time;print(int(time.time()*1000)-300000)') \
+     --filter-pattern '身份来源不被信任' --max-items 5
+   ```
+   Expected: 有命中——说明走到了 `_caller_email()` 的校验分支。无命中且调用
+   返回 401，说明是网关层拒的，这条测试无效，换回"注掉 idp 注入"的办法。
+3. **负向（原生认证来源）**：本期 client 不开任何原生认证 flow
+   （spec §3.5 第 4 条），所以**拿不到 `auth_via=TokenGeneration_Authentication`
+   的真 token**——这正是边界生效的表现。改为验证边界本身：对 mcp client 调
+   `InitiateAuth` 必须失败（见 Step 1c）。容器内 `auth_via` 分支的逻辑由单测
+   覆盖（`test_caller_email_rejects_native_auth_source`）。
 
 Run（确认 runtime 真的拿到了配置）:
 ```bash
@@ -5668,9 +5884,16 @@ Expected: 4 passed（约 6 分钟）。这条验证权限真源改造没有破�
     `InitiateAuth`；
   - `auth_via`（pre-token 的 `triggerSource`）才是本次 token 的来源，只放行
     `TokenGeneration_HostedAuth` 与 `TokenGeneration_RefreshTokens`。
-  配套运维红线：**不对平台 pool 调 `AdminCreateUser` /
-  `AdminSetUserPassword` / `AdminLinkProviderForUser`**（这三个造出可原生
-  登录的身份）。彻底阻断需要 WAF 挡 user pools API，三期做。
+  **但这两个 claim 都只是纵深，不是边界**：`auth_via` 会被"原生认证 →
+  用 refresh token 刷一次"洗白（AWS 明说 refresh token 由托管登录**与** API/
+  SDK 认证两种来源签发，`TokenGeneration_RefreshTokens` 不区分二者）。
+- **org 边界是 app client 的 `ExplicitAuthFlows` 只含
+  `ALLOW_REFRESH_TOKEN_AUTH`**：不开任何 `ALLOW_USER_*` / `ALLOW_CUSTOM_AUTH`
+  / `ALLOW_ADMIN_USER_PASSWORD_AUTH`，原生认证就发不起来，也就不存在可洗白的
+  原生 token。`deploy_pool.py` 每次重跑都断言 + 读回复验这一点（配置漂移即
+  边界失效）。配套运维红线：不对平台 pool 调 `AdminCreateUser` /
+  `AdminSetUserPassword` / `AdminLinkProviderForUser`。彻底兜底需要 WAF 挡
+  user pools API，三期做。
 - **IAM 里没有 `dynamodb:TransactWriteItems`**：事务内 Put/Update/Delete/Get
   的权限由底层同名 action 决定，只有 `ConditionCheck` 需要独立的
   `dynamodb:ConditionCheckItem`。写成不存在的 action 名 IAM 不报错，
@@ -5735,6 +5958,6 @@ Expected: 推送成功。
 | 模块 | 内容 | 前置 |
 |---|---|---|
 | M3 控制台 | `site-builder/panel/`（panel Lambda + 静态前端）、`deploy_panel.py`、会话升级（auth 发一次性 code → **console host 自己**签发 `__Host-sb_console`，见 spec §4.5）+ Origin/Content-Type CSRF 三闸、`site-session-codes` 表、Edge 保留 cookie 名单、`site-ops-log` 审计表、admin 种子并入部署脚本 | M2 ✅ |
-| M4 API Key | `site-api-keys` 表、`sk-` + 16 位 Key、key-proxy Lambda（`mcp.{base_domain}`）、machine client 的 resource server 与 scope、AgentCore spike（client_credentials token + `X-SB-On-Behalf-Of` 头透传） | M1 ✅（machine client 已建） |
+| M4 API Key | `site-api-keys` 表、`sk-` + 16 位 Key、key-proxy Lambda（`mcp.{base_domain}`）、**resource server + custom scope + machine client（M1 不建：client_credentials 不能用空 scope 创建）**、AgentCore spike（client_credentials token 过 authorizer + `X-SB-On-Behalf-Of` 头透传）。**注意**：machine token 天生没有 `idp`/`auth_via` claim，会被 M2 的 `_caller_email` 校验拦住——M4 需要为它设计单独的放行路径（例如 key-proxy 换 token 后由它自己签平台 JWT 带上 on-behalf 身份，而不是让 machine token 直达 MCP） | M1 ✅ |
 | M5 统计 | Edge 访问日志行、聚合 Lambda + EventBridge、`site-access-stats` / `site-access-audit` 表、面板图表、MCP `get_site_stats`、平台 Lambda 日志组补 30 天保留 | M2、M3 |
 | M6 收尾 | 全量 E2E、DEPLOY.md 新阶段、onboarding 重生成、文档同步 | 全部 |
