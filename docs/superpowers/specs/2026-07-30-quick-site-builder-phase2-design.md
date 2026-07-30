@@ -60,18 +60,23 @@
    ⑧ 统计聚合器【新】：EventBridge 每小时 → 跨区 Logs Insights
                  → DynamoDB site-access-stats / site-access-audit
 
-   ⑤ 身份层：平台专用 user pool（二期第一批切换）+ PKCE/nonce 增强
-              + /console-session 面板会话升级端点
+   ⑤ 身份层：平台专用 user pool（禁自注册 + 仅企业 IdP）+ PKCE/nonce 增强
+              + pre-token 注入 email/idp claim
+              + /console-session 发一次性 code → console 侧签发面板会话
 ```
 
-**新增资源**：panel Lambda、key-proxy Lambda、聚合器 Lambda、5 张 DynamoDB 表
+**新增资源**：panel Lambda、key-proxy Lambda、聚合器 Lambda、6 张 DynamoDB 表
 （`site-access-stats`、`site-access-audit`、`site-api-keys`、`site-admins`、
-`site-ops-log`）、1 条 EventBridge 定时规则、1 个新 user pool + 3 个 app client。
+`site-ops-log`、`site-session-codes`——会话升级一次性 code 的消费标记，
+带 TTL）、1 条 EventBridge 定时规则、1 个新 user pool + 3 个 app client。
 
-**改动组件**：sites 表（+权限字段 +GSI，成为真源）、register_route（从 sites
-表读权限）、Edge origin-request（+collaborators 放行、+List 反序列化、
-+sb_console 保留 cookie、+访问日志行）、MCP server（+3 新工具、角色判定替换
-owner 校验、信任代理 on-behalf 头）、auth 服务（PKCE/nonce、/console-session）。
+**改动组件**：sites 表（+权限字段 +`permissions_rev` +GSI，成为真源）、
+register_route（从 sites 表读权限 + 输出 effective policy）、smoke_test
+（读 effective policy 而非 manifest）、mark_job（**不再写 owner**）、
+Edge origin-request（+collaborators 放行、+List 反序列化、+两个 `__Host-`
+保留 cookie、+`idp` claim 校验、+访问日志行）、MCP server（+3 新工具、
+角色判定替换 owner 校验、信任代理 on-behalf 头）、auth 服务（PKCE/nonce、
+/console-session 发一次性 code）、pre_token_email（+`idp` claim）。
 
 **明确不动的东西**（一期安全模型零破坏）：
 
@@ -110,15 +115,26 @@ owner 校验、信任代理 on-behalf 头）、auth 服务（PKCE/nonce、/conso
 7. **协作者两级模型**：owner + collaborator，owner 可转移（原 owner 自动降级
    为 collaborator）。不做三级 viewer（YAGNI）。
 8. **会话隔离折中：仅控制台升级**。普通站点维持顶域共享 cookie（一次登录处
-   处可用的体验保留）；控制台写操作要求 host-only 的 `sb_console` cookie
-   ——把隔离投在风险最高的地方。全量按站点隔离记为后续增强。
-9. **身份层保持 IdP 无关**。新 pool 联邦到任意能给 email claim 的 OIDC/SAML
+   处可用的体验保留）；控制台写操作要求只在 console 子域可见的
+   `__Host-sb_console` cookie——把隔离投在风险最高的地方。该 cookie 必须由
+   **console host 自己**签发（见 §4.5：host-only cookie 的作用域就是签发它
+   的主机，auth 子域签发的发不到 console 子域）。全量按站点隔离记为后续增强。
+9. **身份层保持 IdP 无关**。新 pool 联邦到任意能给 email claim 的 **OIDC**
    IdP：当前用飞书适配器（feishu-quick-sso），标准 IdP（Okta 等）按
    DEPLOY.md 已有分支配置。平台全部组件只消费 email/name claim。二期切新
    pool 时顺带把标准 IdP 分支真机验证一次（覆盖需求清单 B 组遗留项）。
+   SAML 联邦本期不实现（Cognito 支持，但两种 provider 的属性映射与部署脚本
+   路径不同，无真实需求前不做——记入 §11）。
 10. **管理员名单存平台表 + config 种子**。首个管理员从 config.ini 幂等注入，
     后续由现有管理员在控制台增删——管理员变更不走重部署，与二期"在线改"
     主旨一致。
+11. **新 pool 禁止本地用户，身份只能来自企业 IdP**。这是
+    `allowed_users="org"` 语义的前提：Edge 对 org 的判定是"持有任意有效平台
+    会话即放行"，不检查邮箱域。若 pool 允许自注册（`SignUp` API + 托管登录
+    的注册入口），任何互联网用户都能注册后访问全部 org 站点。因此：
+    `AllowAdminCreateUserOnly=True`（关闭自注册）、生产 app client 的
+    `SupportedIdentityProviders` **只列企业 IdP、不含 `COGNITO`**、
+    且 pre-token 触发器注入 `idp` claim 供 Edge 校验来源（见 §3.5）。
 
 ## 3. 权限模型与数据真源
 
@@ -132,6 +148,7 @@ allowed_users            "org" | List<String>（原生 List，不再是 JSON 字
 collaborators            List<String>
 permissions_updated_at   ISO8601
 permissions_updated_by   email
+permissions_rev          N（乐观并发版本号，事务条件写用；缺失视为 0）
 + GSI owner-index（PK owner；照抄 jobs 表既有模式 infra/app.py:27-30）
 ```
 
@@ -144,9 +161,23 @@ permissions_updated_by   email
 - **路由表**：纯投影，仅存 Edge 需要的字段（require_auth、allowed_users、
   collaborators、owner）。`register_route` 改为从 sites 表读权限字段写入
   路由（部署时的整条 put_item 保留——原子切流语义不变，但权限值来自真源）。
-- **在线改权限**：同一后端函数内"写 sites 表 → UpdateItem 同步路由表权限
-  字段"两步；路由表侧只 update 权限字段、不整条覆盖，避免与部署原子切流
-  互踩。
+- **在线改权限走 DynamoDB 事务（`TransactWriteItems`）**，两表一起成功或一起
+  失败。**不能用"先写 sites 再同步路由"的两步顺序写**：若第二步失败，
+  收紧权限的场景会留下"sites 表显示已私有、Edge 仍按旧路由公开放行"的
+  状态——这是安全状态错误，不是可接受的最终一致性。事务两条 item：
+  - sites 表：`Update` 权限字段，`ConditionExpression` 校验 `permissions_rev`
+    等于读取时的值（乐观并发，防两个 owner/collaborator 同时改互相覆盖），
+    同时 `permissions_rev` 自增；
+  - 路由表：`Update` **仅**权限字段（require_auth / allowed_users /
+    collaborators / owner），不整条覆盖——部署时的 `register_route` 是整条
+    `put_item`（原子切流），两者都整写会踩掉 static_prefix / api_target。
+    `ConditionExpression: attribute_exists(subdomain)`。
+  - 站点尚未部署成功（无路由 item）时事务会因该条件失败：此时降级为**只写
+    sites 表**（真源），首次部署时 `register_route` 会带上正确值。这条降级
+    是显式分支，不是异常吞掉。
+  - 两表在同一账号同区域，`TransactWriteItems` 跨表可用；条件失败返回
+    `TransactionCanceledException`，按 CancellationReasons 区分是并发冲突
+    （提示重试）还是路由缺失（走降级分支）。
 - **Edge**：读路由表逻辑不变，新增 collaborators 放行（隐式在 allowed_users
   内，同 owner 现有语义）；`_deser` 扩展支持 List 类型（现状只认 S/BOOL，
   origin_request.py:143-148）。
@@ -172,9 +203,47 @@ permissions_updated_by   email
   变更、owner 转移、下线/purge、Key 创建/吊销、admin 名单变更与代管操作。
   控制台与 MCP 的写操作都经 permissions 后端统一落一条。
 - **共用校验模块 `permissions.py`**：输入 caller email + site 记录（+admins
-  表），输出角色（owner/collaborator/admin/none）；MCP server 与 panel
-  Lambda 各自引入（沿用 common.py 的构建时复制模式）。现有 `_assert_owner`
-  全部替换为按操作粒度的角色判定。
+  表），输出角色。判定顺序 **owner → admin → collaborator**：身兼 collaborator
+  的平台管理员必须拿到 admin 权限（若 collaborator 先匹配，该 admin 会失去
+  undeploy / 转移所有权的能力）。审计需要区分"owner 本人"与"admin 代管"时用
+  单独返回的 `is_admin` 标志，不靠角色字符串。MCP server 与 panel Lambda 各自
+  引入（沿用 common.py 的构建时复制模式）。现有 `_assert_owner` 全部替换为
+  按操作粒度的角色判定。
+
+### 3.3.1 job 的发起者与站点 owner 必须解耦
+
+一期只有 owner 能部署，所以 `mark_job` 在成功分支里用
+`upsert_site(owner=job["owner"])` 把发起者写回站点 owner——同一个人，无害。
+**二期放开 collaborator 部署后这行会变成提权路径**：collaborator B 发起一次
+更新部署，成功后 sites.owner 就变成 B，B 随即获得 undeploy、转移所有权、
+增删协作者的能力；而 `register_route` 早一步写入的仍是原 owner A，最终形成
+sites 表 owner=B、路由表 owner=A 的分裂状态。
+
+因此：
+
+- **`mark_job` 不再写 `owner`**（站点 owner 只由 `permissions.transfer_owner`
+  与首次部署的初始化路径写）；
+- jobs 表的 `owner` 字段语义改为 **`requested_by`**（谁发起了这次部署），
+  保留 `owner` 字段名以兼容存量数据与 `owner-index` GSI，但代码与文档一律
+  按"发起者"理解——它不再参与任何授权判定，只用于审计与"我发起的部署"列表；
+- 首次部署（sites 表无该 site_id）时 `do_deploy_site` 已把调用者写为 owner，
+  这条路径不变；
+- 验收项：collaborator 跑完整 SFN 后，sites.owner 与路由表 owner 都不变
+  （真机 E2E，不能只测"拿到 upload_url"）。
+
+### 3.3.2 部署链上所有 manifest 权限消费方都要改
+
+真源迁移不止 `register_route` 一处。**`smoke_test` 也从
+`event["manifest"]["auth"]["require_login"]` 取值**（`smoke_test.py:47`），
+它据此断言首页应 302（需登录）还是 200（公开）。在线把 require_login 从 true
+改成 false 后重部署，路由按真源写成公开、smoke 按旧 manifest 期待 302，实际
+得到 200 → 部署被判 FAILED，**而路由切换已经发生**（第 6 步早于第 7 步），
+线上处于"新版本已上线但 job 显示失败"的状态。反方向（false→true）同样失败。
+
+因此 `register_route` 把本次实际写入路由的 effective policy 放进 event
+（`event["effective_auth"] = {"require_login": ..., "allowed_users": ...}`），
+`smoke_test` 读它而非 manifest。改真源时必须把 manifest 的所有下游消费方过
+一遍——本期确认只有这两处（`register_route`、`smoke_test`）。
 
 ### 3.4 存量迁移
 
@@ -182,6 +251,32 @@ permissions_updated_by   email
 （已有权限字段的跳过）。迁移完成前 Edge 仍以路由表现值工作，无中断窗口。
 allowed_users 从 JSON 字符串转原生 List 在回填时完成；Edge 的 `_deser` 先上
 （兼容两种格式读），投影写入后统一为 List。
+
+**无法解析的 allowed_users 必须报错并跳过，绝不降级为 `"org"`**：Edge 现行为
+是 JSON 解析失败即用空名单（仅 owner 可访问，fail-closed，
+`origin_request.py:308-315`）。若迁移把它写成 `"org"`，下一次部署会把这个值
+投影到路由表，权限从"仅 owner"扩大为"全体登录用户"——一次数据修复动作变成
+了扩权。这类记录进 `errors` 报告，由人工判断原意后手工修。
+
+### 3.5 `allowed_users="org"` 的语义前提
+
+Edge 对 `"org"` 的判定是"持有本平台签发的有效会话 JWT 即放行"，**不检查邮箱
+域**。这个判定只有在"平台 pool 里的身份必然来自企业 IdP"时才等于"全组织
+用户"。因此两道约束必须同时成立（缺一即 §2 决策 11 描述的越权）：
+
+1. **pool 侧**：`AllowAdminCreateUserOnly=True` 关闭自注册；生产 app client
+   的 `SupportedIdentityProviders` 只列企业 IdP，不含 `COGNITO`（否则托管
+   登录仍显示本地注册/登录入口）。
+2. **claim 侧**：pre-token 触发器除 email 外注入 `idp` claim（值取
+   `identities[0].providerName`，联邦用户才有）；auth 服务 mint 会话 JWT 时
+   带上它，Edge 校验 `claims["idp"]` 在部署时注入的可信 provider 白名单内
+   （`{{TRUSTED_IDPS}}` 占位符，同 JWT_SECRET 的注入机制）。缺失或不匹配即
+   按未登录处理。
+
+第 2 条是纵深防御：即便将来有人误开自注册，本地用户签出的会话也没有合规
+`idp` claim，进不了任何 org 站点。**存量兼容**：迁移期已签发的会话 JWT 没有
+`idp` claim，Edge 需允许一个宽限窗口（部署时开关 `{{REQUIRE_IDP_CLAIM}}`，
+切换 pool 且全部用户重新登录后再置 true）——这个开关的翻转是 M1 的验收项。
 
 ## 4. 控制台（管理面板）
 
@@ -244,15 +339,48 @@ POST /api/sites/{id}/undeploy         下线（仅 owner/admin；purge_data 显�
 GET/POST/DELETE /api/keys             我的 API Key
 GET/PUT /api/admins                   管理员名单（仅 admin）
 POST /api/admin/resync/{id}           路由表重同步（仅 admin，见 §8 错误处理）
+GET  /api/session-callback            会话升级回调（见 §4.5；由 console host
+                                      自己 Set-Cookie，不需要面板会话）
 ```
 
 ### 4.5 鉴权两层
 
 - **身份**：Edge 注入的 `x-user-email`（读操作直接用）。
-- **写操作**（权限修改、undeploy、Key 管理、admin 操作）额外要求面板会话
-  cookie `sb_console`：panel 返回 401 时前端自动 302 经 auth 服务
-  `/console-session` 静默升级（用户无感，不多一次扫码），升级后重放请求。
-  防站点 XSS 偷顶域 `sb_session` 后冒充调面板写 API。
+- **写操作**（权限修改、undeploy、Key 管理、admin 操作）额外要求只在 console
+  子域可见的 `__Host-sb_console` cookie。目的：站点 XSS 偷到顶域 `sb_session`
+  后不能直接冒充调面板写 API。
+
+**签发流程（必须由 console host 自己 Set-Cookie）**：
+
+```
+panel 写 API 缺 __Host-sb_console → 401 {"need":"console-session"}
+  → 前端 302 到 https://auth.{domain}/console-session?redirect=<console URL>
+      auth 校验顶域 sb_session 有效 → 生成一次性 code
+        （HMAC 签名 + 60s 过期 + 绑 email，同 state 的签名机制；一次性由
+         code 内的 jti 落 DynamoDB 消费标记保证）
+      → 302 到 https://console.{domain}/api/session-callback?code=...
+  → panel 的 session-callback 验 code → Set-Cookie:
+      __Host-sb_console=<JWT scope=console, TTL 4h>; Path=/; Secure;
+      HttpOnly; SameSite=Lax     ← 无 Domain 属性，由 console host 签发
+  → 302 回原页面，前端重放请求
+```
+
+**为什么不能让 auth 服务直接种这个 cookie**：不带 `Domain` 属性的 cookie 的
+作用域就是**发送该 Set-Cookie 响应的主机**。`auth.{domain}` 种出来的
+host-only cookie 只会回发给 `auth.{domain}`，兄弟域 `console.{domain}` 永远
+收不到——按那种设计，面板的写操作会 100% 拿不到凭证。`__Host-` 前缀额外强制
+（浏览器校验）：必须 Secure、必须 `Path=/`、**必须无 Domain**，即便将来有人
+误加 Domain，浏览器会直接拒绝这个 cookie 而不是静默放宽作用域。
+
+**CSRF 防护是独立的一层**：host-only cookie 只防"被兄弟子域读取/覆盖"，不防
+兄弟子域发起的跨站请求（同 site，cookie 照发）。因此 panel 的所有写 API 还必须：
+
+- 校验 `Origin` 头等于 `https://console.{base_domain}`（缺失即拒绝，不做
+  Referer 回退）；
+- 要求 `Content-Type: application/json`（阻断 HTML form 的简单请求）；
+- 写操作一律用 `PUT`/`POST`/`DELETE`，不接受 `GET` 触发副作用。
+
+三条同时满足才放行。这也是"站点 XSS → 改全局权限"这条攻击链的最终闸门。
 
 ## 5. API Key 与 MCP 改造
 
@@ -299,13 +427,17 @@ discoveryUrl 指向平台自建 JWKS——形态更重，仅在主案受阻时�
 
 ### 5.4 MCP 工具面变化
 
-新增 3 工具（与控制台共用 permissions 后端语义）：
+新增 4 工具（与控制台共用 permissions 后端语义），分属两个模块：
 
-| 工具 | 授权 | 说明 |
-|---|---|---|
-| `update_site_permissions(site_id, require_login?, allowed_users?)` | owner/collab/admin | 在线改访问策略 |
-| `manage_collaborators(site_id, add?, remove?, transfer_owner?)` | 仅 owner/admin | 协作者与转移 |
-| `get_site_stats(site_id, granularity)` | owner/collab/admin | day/week/month |
+| 工具 | 模块 | 授权 | 说明 |
+|---|---|---|---|
+| `update_site_permissions(site_id, require_login?, allowed_users?)` | M2 | owner/collab/admin | 在线改访问策略 |
+| `manage_collaborators(site_id, add?, remove?, transfer_owner?)` | M2 | 仅 owner/admin | 协作者与转移 |
+| `get_site_permissions(site_id)` | M2 | owner/collab/admin | 读当前策略、owner、协作者、我的角色 |
+| `get_site_stats(site_id, granularity)` | M5 | owner/collab/admin | day/week/month（依赖 M5 的统计表） |
+
+工具数随模块推进：一期 5 → M2 后 8 → M5 后 9。
+`test_agentcore_contract.py` 的期望清单每次同步。
 
 现有 5 工具改造：`_assert_owner` 全部替换为角色判定——`deploy_site`（更新）
 /`get_deploy_status`/`list_my_sites` 放宽到 collaborator；`undeploy_site`
@@ -337,9 +469,11 @@ Dockerfile COPY、test_agentcore_contract.py 工具数断言）按侦察结论�
 
 EventBridge 每小时触发聚合 Lambda：
 
-1. 对"已发现的 Edge 日志组区域清单"逐区跑 Logs Insights
-   （`filter _sb=1 | stats count() by site, e`）；区域清单存 meta item，
-   定期（每日一次）全区 describe-log-groups 发现新区；
+1. 对"已发现的 Edge 日志组区域清单"逐区跑 Logs Insights——查询必须同时产出
+   audit 需要的时间边界，否则第 4 步无从填 first_ts/last_ts：
+   `filter _sb=1 | stats count() as pv, min(t) as first_ts, max(t) as last_ts
+   by site, e`；区域清单存 meta item，定期（每日一次）全区
+   describe-log-groups 发现新区；
 2. 幂等策略：每轮对"水位线以来被触及的自然日"**重查完整当日**（day 起点
    到当前），按 stat_key 覆盖写 day 行——不做增量 ADD，重跑/迟到日志天然
    不重计；水位线（存 stats 表 meta item）只用于确定要重算哪些天（含跨午夜
@@ -377,8 +511,10 @@ site-access-audit  PK site_id, SK "email#date" → {count, first_ts, last_ts}
 ### 7.1 平台专用 user pool（二期第一批）
 
 1. 新建 `site-builder-users` pool（Essentials 档，pre-token V2 需要）+ 域名
-   前缀 + pre-token 触发器（迁移现有 `pre_token_email.py`）。
-2. **IdP 配置保持 IdP 无关**：联邦到任意能给 email claim 的 OIDC/SAML IdP。
+   前缀 + pre-token 触发器（迁移现有 `pre_token_email.py`，扩展为同时注入
+   email 与 `idp` claim，见 §3.5）。**`AllowAdminCreateUserOnly=True`**
+   （关闭自注册，§2 决策 11 的前提）。
+2. **IdP 配置保持 IdP 无关**：联邦到任意能给 email claim 的 OIDC IdP。
    当前部署接飞书适配器（feishu-quick-sso，适配器本身零改动；其回调 URL 需
    在飞书应用后台追加新 Cognito 域名——记实施 spike 确认）；标准 IdP
    （Okta 等）按 DEPLOY.md ① 标准 IdP 分支配置。**二期切换时在新 pool 上把
@@ -386,48 +522,96 @@ site-access-audit  PK site_id, SK "email#date" → {count, first_ts, last_ts}
    IdP 一节改写为两个平行分支，飞书不再是叙述主线。
 3. 三个 app client：`site`（auth 服务）、`mcp`（OAuth 客户端，回调含
    AgentCore identities + `localhost:18765`）、`machine`（key-proxy，
-   client_credentials，新增）。
-4. 切换点：auth 服务 config、AgentCore authorizer discoveryUrl/
+   client_credentials，新增）。**`site` 与 `mcp` 的
+   `SupportedIdentityProviders` 只列企业 IdP，不含 `COGNITO`**——否则托管
+   登录仍暴露本地用户登录入口（§3.5 第 1 条）。`machine` 走
+   client_credentials，与用户身份无关，不涉及此项。
+4. **pre-token 触发器的 Lambda resource policy 必须按 pool 区分
+   StatementId**。一期 `ensure_pre_token_trigger` 用固定
+   `StatementId="cognito-invoke"` 且把 `ResourceConflictException` 直接
+   `pass` 掉：切新 pool 时该语句已存在（绑的是旧 pool 的 SourceArn），冲突被
+   吞掉，Lambda policy 里始终没有新 pool 的授权 → 新 pool 的 pre-token 调用
+   被拒，email/idp claim 注入失败，MCP 的 owner 识别整条链断掉，且 token
+   签发本身可能直接报 trigger 错误。改为 `cognito-invoke-{pool_id}`
+   （pool id 里的下划线等非法字符替换为连字符），迁移期新旧两条并存，
+   验证通过后再删旧语句。
+5. 切换点：auth 服务 config、AgentCore authorizer discoveryUrl/
    allowedClients、onboarding 重生成（`gen_onboarding.py`）。验证通过后清理
-   旧 pool 上的平台配置（触发器、两个 client）——平台与 Quick SSO 共享
-   pool 从此解耦。
-5. 用户影响：一次性重新登录（站点会话 + MCP OAuth），发一句话公告。
+   旧 pool 上的平台配置（触发器授权语句、两个 client）——平台与 Quick SSO
+   共享 pool 从此解耦。
+6. 用户影响：一次性重新登录（站点会话 + MCP OAuth），发一句话公告。
+   重新登录也是 §3.5 `REQUIRE_IDP_CLAIM` 开关得以置 true 的前提。
 
 ### 7.2 PKCE + nonce（auth 服务）
 
-`/login` 生成 code_verifier（进签名 state）+ nonce → Hosted UI 带
-code_challenge（S256）；`/callback` 换 token 带 verifier、验 id_token 的
-nonce claim。改动局限 `login_handler.py`。
+`/login` 生成 code_verifier + nonce → Hosted UI 带 code_challenge（S256）；
+`/callback` 换 token 时带 verifier、验 id_token 的 nonce claim。改动局限
+`login_handler.py`。
 
-### 7.3 面板会话升级（/console-session）
+**verifier 不进 authorize URL 的 state**。RFC 7636 的分工是授权请求只发
+`code_challenge`、令牌请求才发 `code_verifier`；把明文 verifier 放进随
+authorize URL 传输的 state（即便 state 有 HMAC 签名，内容是 base64 明文），
+等于让它经浏览器地址栏、Referer、IdP 侧日志与浏览器历史暴露一遍，PKCE 本
+应提供的"授权码被截获也换不到 token"的独立防护就削弱了。本期 site client
+是 confidential（有 client secret），所以这不是可直接利用的绕过，但没有理由
+自废一层。
 
-auth 服务新增端点：校验现有顶域 `sb_session` 有效 → 签发第二个 JWT
-（claims 加 `scope:"console"`，TTL 4h，同一 JWT_SECRET、同 session.py 算法）
-种 host-only cookie `sb_console`（不设 Domain 属性，仅 console 子域可见）
-→ 302 回面板。
+做法：`/login` 把 verifier 与 nonce 写进 auth 子域的 host-only 短期 cookie
+（`__Host-sb_pkce`，`Max-Age=300`、`Secure`、`HttpOnly`、`SameSite=Lax`），
+state 里只放 redirect 与过期时间（仍 HMAC 签名，防 redirect 篡改）。
+`/callback` 与 `/login` 同在 `auth.{domain}`，能读到该 cookie；用完即
+`Max-Age=0` 清除。cookie 丢失（用户跨浏览器、cookie 被清）时 callback 返回
+400 并提示重新登录——比静默降级到无 PKCE 安全。
 
-**Edge 配套**：`sb_console` 加入 `RESERVED_COOKIES`（站点路由剥除），但对
-platform 路由放行转发（panel Lambda 要读它验证写操作）。
+**为什么不用服务端存储**：auth 服务是多实例无状态 Lambda，存 DynamoDB 要多
+一张表加 TTL 清理；host-only 短期 cookie 在同一子域内往返，语义等价且零新增
+基础设施。（与 §4.5 的 `__Host-sb_console` 是两个不同 cookie：前者在 auth
+子域、生命周期 5 分钟；后者在 console 子域、4 小时。）
+
+### 7.3 面板会话升级（/console-session + console 侧回调）
+
+auth 服务新增 `/console-session`：校验现有顶域 `sb_session` 有效 → 生成
+一次性 code（HMAC 签名 + 60s 过期 + 绑 email + jti 落库防重放）→ 302 到
+`https://console.{domain}/api/session-callback?code=...`。
+
+**cookie 由 console host 签发**，不是 auth 签发——完整理由与流程见 §4.5。
+panel 的 `/api/session-callback` 验 code 后 mint `scope:"console"` 的 JWT
+（TTL 4h，同一 JWT_SECRET、同 session.py 算法）并
+`Set-Cookie: __Host-sb_console=...`。
+
+**Edge 配套**：`__Host-sb_console` 与 `__Host-sb_pkce` 都加入
+`RESERVED_COOKIES`（站点路由剥除，站点代码不可信），但对 platform 路由放行
+转发（panel / auth Lambda 要读它们）。`origin_response.py` 的同名列表同步
+（一期已有的"站点不得写平台 cookie"约束覆盖到新 cookie）。
 
 ### 7.4 Edge 改动汇总（评审 1MB 限制与双同步风险）
 
-collaborators 放行、`_deser` 支持 List、`sb_console` 保留 cookie、访问日志
-print——均为小改，单文件零依赖模式不变；`_verify_session_jwt` 与
-session.py 的字节级同步约束不变（本期 session.py 增加 scope claim 的 mint
-函数，Edge 不验 scope——scope 校验在 panel Lambda 侧）。
+collaborators 放行、`_deser` 支持 List、两个 `__Host-` 保留 cookie、
+`idp` claim 校验（含 `REQUIRE_IDP_CLAIM` 开关与 `TRUSTED_IDPS` 白名单两个新
+占位符）、访问日志 print——均为小改，单文件零依赖模式不变；
+`_verify_session_jwt` 与 session.py 的字节级同步约束不变（本期 session.py
+增加带 scope/idp claim 的 mint 函数，Edge 不验 scope——scope 校验在 panel
+Lambda 侧）。
 
 ## 8. 错误处理
 
 | 场景 | 处理 |
 |---|---|
-| 在线改权限：sites 表成功、路由表同步失败 | 同函数内重试一次；仍失败回滚 sites 表并报错（可重试）。不一致时以 sites 为准，admin 有 `/api/admin/resync/{id}` 手动重同步 |
+| 在线改权限：两表写入 | `TransactWriteItems` 原子提交（§3.2），不存在"一半成功"的中间态。事务被取消时按 CancellationReasons 分流：并发冲突（`permissions_rev` 不匹配）→ 重读后重试一次，仍冲突则返回 409 让用户重试；路由 item 不存在 → 降级为只写 sites 表（站点尚未首次部署成功） |
+| 两表仍出现不一致（人为改库、迁移中断等） | 以 sites 表为准；admin 有 `/api/admin/resync/{id}` 手动重投影 |
+| 面板写请求缺 Origin / Origin 不匹配 / 非 JSON Content-Type | 403，不做 Referer 回退（§4.5 CSRF 三条同时满足才放行） |
+| 会话升级 code 被重放 | jti 已消费 → 400；code 过期（>60s）同样 400，前端重走升级流程 |
+| 会话 JWT 缺 `idp` claim | `REQUIRE_IDP_CLAIM=true` 时按未登录处理（302 登录）；迁移宽限期内放行并打点，供确认存量会话已清空 |
 | 权限修改生效延迟 | Edge 路由缓存 60s；UI/MCP 返回文案统一"约 1 分钟生效" |
 | key-proxy 收到无效/吊销 Key | 401 + 统一文案，不泄露 Key 是否存在过 |
 | 聚合单区查询失败 | 该区跳过、水位线不推进，下轮重试补齐；stat_key 粒度覆盖写保证幂等 |
-| 面板写操作无/过期 sb_console | 401 + 前端自动跳 /console-session 升级后重放 |
+| 面板写操作无/过期 `__Host-sb_console` | 401 `{"need":"console-session"}` + 前端自动走 §4.5 升级流程后重放 |
 | owner 转移目标邮箱打错 | 平台无通讯录可校验：确认对话框输入两遍 + 原 owner 保留 collaborator 兜底 |
 | 管理员误删自己 | 禁止把 admins 名单删空；删自己需二次确认 |
 | 存量站点无权限字段 | 迁移脚本回填（§3.4）；迁移前 Edge 行为不变 |
+| 迁移遇到无法解析的 allowed_users | 进 errors 报告并跳过该站点，**不降级为 "org"**（§3.4：那会把"仅 owner"扩权成"全体登录用户"） |
+| collaborator 部署成功 | 站点 owner 不变（`mark_job` 不再写 owner，§3.3.1）；jobs 表记 `requested_by` |
+| 重部署时 site.json 的 auth 与真源不一致 | 按真源部署，job 结果附提示；smoke test 用本次写入的 effective policy 断言（§3.3.2），不用 manifest |
 | machine token 过期/被拒 | key-proxy 重取一次 token 再转发；仍失败 502 + 日志 |
 
 ## 9. 测试策略
@@ -441,14 +625,26 @@ session.py 的字节级同步约束不变（本期 session.py 增加 scope claim
   （借鉴 mcp 的 do_* 纯函数模式，直接测纯函数层）。
 - **集成/E2E（真实 AWS）**：
   1. 新 pool 全链路登录（飞书 + 标准 IdP 两分支）；
-  2. 在线改 allowed_users，60s+缓存窗口内新名单生效（拒绝名单外用户）；
-  3. collaborator 能部署更新、看统计；undeploy 被拒；
-  4. owner 转移后：新 owner 全权、原 owner 是 collaborator；
-  5. API Key 直连（Quick Desktop Remote MCP 静态 Header）完成一次部署；
-     吊销后立即 401；
-  6. 统计端到端：访问站点 → 下一小时聚合 → 面板/MCP 可查到 PV/UV/审计；
-  7. 面板会话隔离：仅持顶域 sb_session 调面板写 API 应 401；
-  8. admin 强制下线 + ops-log 留痕。
+  2. **公网自注册被拒**：直接调新 pool 的 `SignUp` API 应失败；托管登录页
+     无本地注册/登录入口（§3.5 的两道约束各验一次）；
+  3. **会话缺 `idp` claim 进不了 org 站点**（开关置 true 后）；
+  4. 在线改 allowed_users，60s+缓存窗口内新名单生效（拒绝名单外用户）；
+  5. 在线**翻转 require_login**（两个方向各一次）后重部署成功——覆盖
+     §3.3.2 的 smoke test 取值路径；
+  6. collaborator 能部署更新、看统计；undeploy 被拒；**跑完整 SFN 后
+     sites.owner 与路由表 owner 都不变**（§3.3.1 的提权路径回归）；
+  7. owner 转移后：新 owner 全权、原 owner 是 collaborator；
+  8. 身兼 collaborator 的 admin 仍能 undeploy（§3.3 判定顺序回归）；
+  9. **两表事务**：注入路由表写失败（临时改 IAM 拒 UpdateItem 或用不存在的
+     路由 item），验证 sites 表不会留下"已私有"而 Edge 仍公开的状态；
+  10. API Key 直连（Quick Desktop Remote MCP 静态 Header）完成一次部署；
+      吊销后立即 401；
+  11. 统计端到端：访问站点 → 下一小时聚合 → 面板/MCP 可查到 PV/UV/审计
+      （含 first_ts/last_ts 有值）；
+  12. **面板会话隔离与 CSRF**：仅持顶域 `sb_session` 调面板写 API 应 401；
+      `__Host-sb_console` 确实由 console host 签发且在 auth 子域不可见；
+      伪造 Origin / 缺 Origin / form-urlencoded Content-Type 均 403；
+  13. admin 强制下线 + ops-log 留痕。
 - **冒烟**：`smoke_router.sh` 扩展 console/mcp 子域探测。
 - **迁移彩排**：存量站点（team-reading-list、team-kudos-wall）跑迁移脚本后
   行为不变。
@@ -457,22 +653,31 @@ session.py 的字节级同步约束不变（本期 session.py 增加 scope claim
 
 | 模块 | 内容 | 依赖 |
 |---|---|---|
-| M1 身份层 | 新 pool + 3 client + 切换 + PKCE/nonce + 标准 IdP 验证 | 无（第一批） |
-| M2 权限真源 | sites 表扩展 + GSI + permissions.py + register_route/Edge 改造 + 存量迁移 + MCP 权限工具 | M1 |
-| M3 控制台 | panel Lambda + 前端 + /console-session + admins + ops-log | M2 |
+| M2 权限真源 | sites 表扩展 + GSI + permissions.py + register_route/smoke_test/mark_job/Edge 改造 + 存量迁移 + MCP 权限工具 | 无 |
+| M1 身份层 | 新 pool（禁自注册 + 仅企业 IdP）+ 3 client + pre-token（email+idp）+ PKCE/nonce + 切换 + 标准 IdP 验证 | 无 |
+| M3 控制台 | panel Lambda + 前端 + 会话升级（console 侧签发 + CSRF）+ admins + ops-log | M2 |
 | M4 API Key | keys 表 + key-proxy + AgentCore spike + Quick 直连验证 | M1（与 M3/M5 可并行） |
 | M5 统计 | Edge 日志行 + 聚合器 + stats/audit 表 + 面板图表 + MCP 工具 | M2、M3（图表部分） |
 | M6 收尾 | E2E 全量、DEPLOY.md 扩写（新阶段：panel/key-proxy/聚合器）、onboarding 重生成、文档同步 | 全部 |
+
+**M2 与 M1 相互独立**（权限判定全以 email 为键，与站在哪个 user pool 上无关）。
+推荐顺序 **M2 → M1**：让"在线改权限"这个头号功能最早落地，并把"全员重新
+登录 + 两个 IdP 侧 spike"的风险放在其后。反过来（M1 先）也成立——若更希望
+一次性把身份切干净、后续都建在新 pool 上。**Edge 的 `idp` claim 校验属 M1**，
+但它与 M2 改同一个文件（`origin_request.py`），两模块串行做以免冲突。
 
 **实施 spike 清单**（真机验证后才锁定的点）：
 
 1. AgentCore：client_credentials token 过 authorizer + 自定义头透传（§5.3）；
 2. 飞书应用后台追加新 Cognito 域名回调（§7.1）；
-3. Logs Insights 跨区查询的权限与配额形态（聚合器 IAM 与并发）。
+3. Logs Insights 跨区查询的权限与配额形态（聚合器 IAM 与并发）；
+4. pre-token V2 能否稳定拿到 `identities[0].providerName`（§3.5 的 `idp`
+   claim 来源；联邦用户应有，需真机确认字段形态与首次登录时序）。
 
 ## 11. 范围外（三期候选）
 
 - 全量按站点会话隔离（本期只做控制台）
+- SAML IdP 联邦（Cognito 支持；本期只做 OIDC，两者属性映射与部署脚本路径不同）
 - CloudFront 精细缓存（与统计数据源联动重评）
 - 版本回滚、自定义域名、Fargate 档位、计费/配额、Python 站点 runtime
 - 站点级通知（部署结果/统计周报推送）
