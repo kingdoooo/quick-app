@@ -290,11 +290,14 @@ Edge 对 `"org"` 的判定是"持有本平台签发的有效会话 JWT 即放行
    is to block access with a AWS WAF rule."*，见
    [CreateUserPoolClient](https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_CreateUserPoolClient.html)）。
    所以这条只是减少暴露面，不能当成边界。
-3. **会话 JWT 的 `idp` claim 校验（主防线）**：pre-token 触发器注入 `idp`
-   （值取 `identities[0].providerName`，只有联邦用户有）→ auth 服务 mint 会话
-   JWT 时带上 → Edge 校验它在部署时注入的可信 provider 白名单内
-   （`{{TRUSTED_IDPS}}` 占位符，同 JWT_SECRET 的注入机制）。缺失或不匹配即按
-   未登录处理。
+3. **`idp` claim 校验（主防线，两个入口都要做）**：pre-token 触发器注入 `idp`
+   （值取 `identities[0].providerName`，只有联邦用户有）；
+   **Web 入口** — auth 服务 mint 会话 JWT 时带上，Edge 校验它在部署时注入的
+   可信 provider 白名单内（`{{TRUSTED_IDPS}}` 占位符，同 JWT_SECRET 的注入
+   机制），缺失或不匹配按未登录处理；
+   **MCP 入口** — `_caller_email()` 校验 access token 的 `idp`
+   （`TRUSTED_IDPS` 环境变量），不匹配即拒绝调用。只做 Web 那侧等于防线只做
+   了一半：MCP 能部署、改权限、下线站点，能力面比访问站点更大。
 
 **为什么第 3 条必须实现，不能只靠前两条**：既然移除 `COGNITO` 不阻止 SDK 认证
 本地用户，那么只要 pool 里存在任何本地用户（管理员手工建的测试账号、将来有人
@@ -315,7 +318,11 @@ true）——**开关翻到 true 是 M1 的完成条件，不是可选项**；�
 | 注入 | `auth/pre_token_email.py` | pre-token V2 的 `idTokenGeneration` 与 `accessTokenGeneration` 是**两个独立容器**，只写后者不会进 ID token（[官方文档](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-lambda-pre-token-generation.html)）。Web 登录读 ID token、MCP 网关读 access token，**两者都要写** |
 | 换取 | `auth/login_handler.py:_exchange_code` | 从验签后的 id_token claims 里取 `idp` 一并返回 |
 | 签发 | `auth/session.py:mint_session_jwt` | 会话 JWT payload 加 `idp`；与 Edge 的验签算法保持字节级同步的约束不变 |
-| 校验 | `router/.../origin_request.py` | `REQUIRE_IDP_CLAIM` 为真时，`claims["idp"]` 必须在 `TRUSTED_IDPS` 内，否则按未登录处理 |
+| 校验（Web） | `router/.../origin_request.py` | `REQUIRE_IDP_CLAIM` 为真时，`claims["idp"]` 必须在 `TRUSTED_IDPS` 内，否则按未登录处理 |
+| 校验（MCP） | `mcp/server.py:_caller_email` | **同一道防线的第二个入口**：AgentCore authorizer 只验 issuer 与 `allowedClients`，不看 `idp`——issuer/client 合法但无 `idp` 的 access token（过渡期本地用户、旧 refresh token 换出的、将来 client auth-flow 漂移）否则能直接部署、改权限、下线站点。`TRUSTED_IDPS` 环境变量为空时放行（迁移宽限期，与 Edge 开关对齐） |
+
+**两个入口都要配**：只做 Edge 就只保护了站点访问，MCP 这条管理面通道仍然
+开着——而它的能力面比访问站点大得多（部署、改权限、下线）。
 
 ## 4. 控制台（管理面板）
 
@@ -568,7 +575,12 @@ site-access-audit  PK site_id, SK "email#date" → {count, first_ts, last_ts}
    控制台建的 client 会自动有，所以这个坑只在脚本化部署时出现。部署脚本对
    `site`/`mcp` 调 `CreateManagedLoginBranding(UseCognitoProvidedValues=True)`
    （用 Cognito 默认样式，不做定制），否则 §7.1 之后的所有登录验证都会在
-   `/oauth2/authorize` 第一步失败。**`site` 与 `mcp` 的
+   `/oauth2/authorize` 第一步失败。**`ManagedLoginVersion` 是 domain 级参数**
+   （`CreateUserPoolDomain` / `UpdateUserPoolDomain`）——client API 没有这个
+   字段，传进 `CreateUserPoolClient` 会 `ParamValidationError`；domain 不显式
+   指定时默认 classic hosted UI（v1），与 managed login 的 branding style 不
+   匹配、登录页依然不可用，所以建/更新 domain 时要显式 `ManagedLoginVersion=2`。
+   **`site` 与 `mcp` 的
    `SupportedIdentityProviders` 只列企业 IdP，不含 `COGNITO`**——否则托管
    登录仍暴露本地用户登录入口（§3.5 第 1 条）。`machine` 走
    client_credentials，与用户身份无关，不涉及此项。
