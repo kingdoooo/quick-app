@@ -68,7 +68,7 @@
 **新增资源**：panel Lambda、key-proxy Lambda、聚合器 Lambda、6 张 DynamoDB 表
 （`site-access-stats`、`site-access-audit`、`site-api-keys`、`site-admins`、
 `site-ops-log`、`site-session-codes`——会话升级一次性 code 的消费标记，
-带 TTL）、1 条 EventBridge 定时规则、1 个新 user pool + 3 个 app client。
+带 TTL）、1 条 EventBridge 定时规则、1 个新 user pool + 2 个 app client（`site` / `mcp`；`machine` 随 M4 的 resource server 一起建——client_credentials 不能用空 scope 创建）。
 
 **改动组件**：sites 表（+权限字段 +`permissions_rev` +GSI，成为真源）、
 register_route（从 sites 表读权限 + 输出 effective policy）、smoke_test
@@ -334,6 +334,17 @@ Edge 对 `"org"` 的判定是"持有本平台签发的有效会话 JWT 即放行
      `AdminLinkProviderForUser` / `AdminSetUserPassword` / `AdminCreateUser`**
      ——它们制造"本可原生登录的身份"，虽然被上一条挡着，但一旦有人给某个
      client 加回 flow，这些身份立刻可用。写进 DEPLOY.md；
+   - **漂移恢复不是"改回配置"就完事**：refresh token 一旦签发，在有效期内
+     可持续换新 token，而新 token 的 `auth_via` 正是受信的
+     `TokenGeneration_RefreshTokens`。所以若曾经发生过"原生 flow 被打开"
+     （哪怕只几分钟），关掉 flow **不能**使已签发的 refresh token 失效。
+     恢复流程必须三步：① 改回 `ExplicitAuthFlows`；② **吊销存量 refresh
+     token**——按用户 `AdminUserGlobalSignOut`，或（无法枚举受影响用户时）
+     直接轮换 app client（新建 client + 换 config + 删旧 client，旧 client
+     签发的 token 立即失效）；③ 复验 `initiate-auth` 失败。
+     配套把 `RefreshTokenValidity` 从默认 30 天收到 **1 天**：缩短任何一次
+     漂移的暴露窗口，代价是用户每天重新登录一次（站点会话 cookie 本就是
+     24h，节奏一致）。
    - **三期**：WAF 挡 user pools API 是最后一层（防"有人新建了带原生 flow
      的 client"这类配置漂移）——记入 §11，本期不做。
 
@@ -605,9 +616,11 @@ site-access-audit  PK site_id, SK "email#date" → {count, first_ts, last_ts}
    （Okta 等）按 DEPLOY.md ① 标准 IdP 分支配置。**二期切换时在新 pool 上把
    标准 IdP 分支真机验证一次**（覆盖需求清单 B 组遗留项）。DEPLOY.md 的
    IdP 一节改写为两个平行分支，飞书不再是叙述主线。
-3. 三个 app client：`site`（auth 服务）、`mcp`（OAuth 客户端，回调含
-   AgentCore identities + `localhost:18765`）、`machine`（key-proxy，
-   client_credentials，新增）。**API 创建的 app client 必须显式套 branding
+3. **两个 app client**：`site`（auth 服务）、`mcp`（OAuth 客户端，回调含
+   AgentCore identities + `localhost:18765`）。**`machine`（key-proxy 用）
+   不在本期建**——client_credentials 只能授 resource server 的 custom scope，
+   空 scope 会被 Cognito 跨字段校验拒绝、导致部署脚本在建 client 这步中止；
+   它随 M4 的 resource server 一起建。**API 创建的 app client 必须显式套 branding
    style**：AWS 明确说明经 `CreateUserPoolClient` 建的 client 不会自动获得
    branding style，*在套上之前 managed login 与 classic hosted UI 页面都不可用*
    （见 [CreateUserPoolClient](https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_CreateUserPoolClient.html)）——
@@ -742,10 +755,15 @@ Lambda 侧）。
      issuer/client_id 合法但缺 claim 的 token**——用 machine client 的 token
      做负测无效，它的 client_id 不在 authorizer 的 allowedClients 里，
      会在到达容器前被网关拒掉，无论 `_caller_email` 有没有校验都"通过"）；
-  5. **refresh 洗白路径已被 ④ 关闭**：确认无法先拿到原生 token
-     （第 3 条已验），因此不存在"原生认证 → refresh 刷一次"的洗白链。
-     若将来给某个 client 加回原生 flow，本条与第 3 条会同时失败——
-     这是有意的耦合；
+  5. **refresh 洗白路径已被 ④ 关闭，且暴露窗口有界**：确认无法先拿到原生
+     token（第 3 条已验），因此不存在"原生认证 → refresh 刷一次"的洗白链；
+     `describe-user-pool-client` 的 `RefreshTokenValidity` ≤ 1 天。
+     **漂移恢复演练**（至少做一次，证明恢复流程有效）：临时给一个测试用
+     client 打开 `ALLOW_USER_PASSWORD_AUTH` → 用它拿一个 refresh token →
+     关掉 flow → 确认该 refresh token **仍能**换到新 token（这是预期的，
+     证明"改配置不足以恢复"）→ 执行 `AdminUserGlobalSignOut` 或轮换 client
+     → 确认该 refresh token 失效。演练用独立的临时 client，不要动
+     site/mcp；
   4. 在线改 allowed_users，60s+缓存窗口内新名单生效（拒绝名单外用户）；
   5. 在线**翻转 require_login**（两个方向各一次）后重部署成功——覆盖
      §3.3.2 的 smoke test 取值路径；
@@ -772,7 +790,7 @@ Lambda 侧）。
 | 模块 | 内容 | 依赖 |
 |---|---|---|
 | M2 权限真源 | sites 表扩展 + GSI + permissions.py + register_route/smoke_test/mark_job/Edge 改造 + 存量迁移 + MCP 权限工具 | 无 |
-| M1 身份层 | 新 pool（禁自注册 + 仅企业 IdP）+ 3 client + pre-token（email+idp）+ PKCE/nonce + 切换 + 标准 IdP 验证 | 无 |
+| M1 身份层 | 新 pool（禁自注册 + 仅企业 IdP + `ExplicitAuthFlows` 不开原生认证=org 边界）+ 2 client（site/mcp）+ pre-token（email+idp+auth_via）+ PKCE/nonce + 切换 + 标准 IdP 验证 | 无 |
 | M3 控制台 | panel Lambda + 前端 + 会话升级（console 侧签发 + CSRF）+ admins + ops-log | M2 |
 | M4 API Key | keys 表 + key-proxy + AgentCore spike + Quick 直连验证 | M1（与 M3/M5 可并行） |
 | M5 统计 | Edge 日志行 + 聚合器 + stats/audit 表 + 面板图表 + MCP 工具 | M2、M3（图表部分） |
@@ -796,10 +814,12 @@ Lambda 侧）。
 
 - 全量按站点会话隔离（本期只做控制台）
 - SAML IdP 联邦（Cognito 支持；本期只做 OIDC，两者属性映射与部署脚本路径不同）
-- **WAF 挡住 user pools API 的原生认证**（`InitiateAuth` 等）：按 AWS 的说法
-  这是彻底阻断 SDK 原生登录的唯一手段，也是把 §3.5 从"叠加拦截"提升为"硬边界"
-  的那一步。本期以运维红线 + `auth_via` claim 替代（见 §3.5 第 4 条），
-  三期评估 WAF 关联 user pool 的基建与成本
+- **WAF 挡住 user pools API 的原生认证**（`InitiateAuth` 等）：本期的边界是
+  app client 的 `ExplicitAuthFlows` 不开原生 flow（§3.5 第 4 条），它在
+  "配置正确"的前提下已足够；WAF 的价值是防**配置漂移本身**——例如有人新建了
+  一个带原生 flow 的 client、或临时打开又忘了恢复（那种情况下已签发的
+  refresh token 需要显式吊销才能失效）。三期评估 WAF 关联 user pool 的基建
+  与成本
 - CloudFront 精细缓存（与统计数据源联动重评）
 - 版本回滚、自定义域名、Fargate 档位、计费/配额、Python 站点 runtime
 - 站点级通知（部署结果/统计周报推送）

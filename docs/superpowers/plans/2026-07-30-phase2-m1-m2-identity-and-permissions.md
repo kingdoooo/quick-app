@@ -57,7 +57,7 @@
 | `site-builder/deployer/functions/permissions.py` | 唯一的角色判定 + 权限读写模块（纯逻辑 + DynamoDB 访问）。MCP 与 panel 共用（构建时复制，同 `common.py`） |
 | `site-builder/deployer/tests/test_permissions.py` | `permissions.py` 的角色矩阵与权限写入测试 |
 | `site-builder/scripts/migrate_permissions.py` | 一次性迁移：路由表 → sites 表回填权限字段 |
-| `site-builder/scripts/deploy_pool.py` | 幂等创建/更新平台专用 user pool + 3 个 app client + pre-token 触发器挂载 |
+| `site-builder/scripts/deploy_pool.py` | 幂等创建/更新平台专用 user pool + 2 个 app client（site/mcp）+ branding + pre-token 触发器挂载 |
 | `site-builder/auth/tests/test_pkce.py` | PKCE/nonce 的 state 编解码与 callback 校验测试 |
 | `site-builder/auth/tests/test_pre_token.py` | pre-token 触发器注入 email/idp claim 的测试 |
 | `site-builder/deployer/tests/test_migrate_permissions.py` | 迁移脚本测试（含"损坏名单不扩权"） |
@@ -1333,7 +1333,9 @@ user_pool_id =
 domain =
 site_client_id =
 mcp_client_id =
-# 二期：key-proxy 用的 client_credentials 客户端（M4 才用到，M1 一并创建）
+# 二期 M4：key-proxy 用的 client_credentials 客户端。
+# **M1 不创建**——client_credentials 只能授 resource server 的 custom scope，
+# 空 scope 会被 Cognito 跨字段校验拒绝。M4 建 resource server 时一并创建并回填。
 machine_client_id =
 
 [DSQL]
@@ -1585,11 +1587,11 @@ def test_register_route_refuses_stale_snapshot(aws, monkeypatch):
                        allowed_users="org", collaborators=[], permissions_rev=0)
     job_id = common.create_job("o@x.com", "s-1")
 
-    real_get_site = common.get_site
+    real_get_site = common.get_site_consistent
     calls = {"n": 0}
 
     def _racing_get_site(site_id):
-        site = real_get_site(site_id)
+        site = real_get_site(site_id)   # real_get_site = common.get_site_consistent
         calls["n"] += 1
         if calls["n"] == 1:
             # 第一次读之后、写路由之前，别人把权限收紧了（rev 推进）
@@ -1597,7 +1599,10 @@ def test_register_route_refuses_stale_snapshot(aws, monkeypatch):
                                allowed_users=["vip@x.com"], permissions_rev=1)
         return site
 
-    monkeypatch.setattr(register_route.common, "get_site", _racing_get_site)
+    # 实现用的是 get_site_consistent（强一致），patch 它才能注入竞态；
+    # patch get_site 的话回调根本不会执行，测试变成空跑。
+    monkeypatch.setattr(register_route.common, "get_site_consistent",
+                        _racing_get_site)
     register_route.handler({"job_id": job_id, "site_id": "s-1", "api_target": "",
                             "manifest": {"auth": {"require_login": False,
                                                   "allowed_users": "org"}}}, None)
@@ -1642,7 +1647,14 @@ def test_register_route_uses_consistent_read_after_seed(aws, monkeypatch):
 
     # 最终一致读永远返回 seed 之前的快照（模拟副本滞后）
     stale = {"site_id": "s-1", "owner": "o@x.com"}
-    monkeypatch.setattr(register_route.common, "get_site", lambda sid: dict(stale))
+    # 让**强一致读**返回 seed 之前的快照。注意实现必须调用
+    # get_site_consistent——若它退回 get_site，本测试会因拿到真实数据而
+    # "意外通过"，所以下面额外断言实现确实没走 get_site。
+    monkeypatch.setattr(register_route.common, "get_site_consistent",
+                        lambda sid: dict(stale))
+    monkeypatch.setattr(register_route.common, "get_site",
+                        lambda sid: pytest.fail(
+                            "register_route 必须用 get_site_consistent"))
 
     register_route.handler(
         {"job_id": job_id, "site_id": "s-1", "api_target": "",
@@ -2966,6 +2978,28 @@ provider），只有 `auth_via` claim 能分辨——所以 Edge 与 MCP 都校�
 
 需要给自动化/服务账号发凭证时，用 M4 的 API Key（走 key-proxy 的
 machine client），不要在 pool 里建本地用户。
+
+### 漂移恢复：如果原生 flow 曾被打开过
+
+**改回配置不足以恢复边界。** refresh token 一旦签发，在有效期内可持续换新
+token，而新 token 的 `auth_via` 是受信的 `TokenGeneration_RefreshTokens`。
+所以必须三步：
+
+1. 改回配置：`python3 site-builder/scripts/deploy_pool.py`
+   （它会断言 + 读回复验 `ExplicitAuthFlows`）；
+2. **吊销存量 refresh token**——二选一：
+   ```bash
+   # a) 能确定受影响用户时，逐个全局登出
+   aws cognito-idp admin-user-global-sign-out --region us-east-1 \
+     --user-pool-id <pool id> --username <email>
+
+   # b) 无法枚举时，轮换 app client（旧 client 签发的 token 立即失效）
+   #    新建 client → 回填 config.ini → 重新部署 auth/MCP → 删旧 client
+   ```
+3. 复验：`aws cognito-idp initiate-auth` 对 site/mcp client 必须失败
+   （见 DEPLOY.md 的边界验证步骤）。
+
+`RefreshTokenValidity` 已收到 1 天，所以即便漏了第 2 步，暴露窗口也 ≤24h。
 ```
 
 ```markdown
@@ -3722,7 +3756,7 @@ Expected: PASS
 
 - [ ] **Step 7: 加 IAM 与环境变量**
 
-`site-builder/mcp/deploy_agentcore.py` 的 `ensure_role()` 里，DynamoDB 语句的 `Resource` 加路由表（MCP 现在要写它做投影）：
+`site-builder/mcp/deploy_agentcore.py` 的 `ensure_role()`：
 
 **IAM 里没有 `dynamodb:TransactWriteItems` 这个 action**。AWS 明确：事务内
 `Put`/`Update`/`Delete`/`Get` 的权限由底层
@@ -3737,18 +3771,22 @@ Expected: PASS
              + CFG["Platform"]["routing_table"],
 ```
 
-sites 表那条语句的 `Action` 列表加 `"dynamodb:ConditionCheckItem"`
-（`register_route` 与 admin 路径的条件事务要用）。
-
-admins 表单列一条——MCP 只需读管理员身份 + 在事务里断言"我此刻仍是管理员"，
-**不给它 admins 表的 PutItem/DeleteItem**（增删管理员属于 M3 的 panel role）：
+Task 10 已把语句按表拆开（jobs/sites 读写 + ConditionCheck、admins 只读 +
+ConditionCheck）。这里**再加一条路由表专用语句**——只给投影需要的动作，
+不给 `PutItem`/`DeleteItem`（整条 put_item 是部署链 `register_route` 的事，
+用 deployer 的 exec role）：
 
 ```python
-        {"Sid": "AdminsReadAndConditionCheck", "Effect": "Allow",
-         "Action": ["dynamodb:GetItem", "dynamodb:Scan",
+        # 路由表：只做权限投影（Update 权限字段）+ 事务条件检查
+        {"Sid": "RoutingProjection", "Effect": "Allow",
+         "Action": ["dynamodb:GetItem", "dynamodb:UpdateItem",
                     "dynamodb:ConditionCheckItem"],
-         "Resource": f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-admins"},
+         "Resource": f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/"
+                     + CFG["Platform"]["routing_table"]},
 ```
+
+**别把路由表 ARN 塞进 jobs/sites 那条**：那条带 `PutItem`，会让 MCP 能整条
+覆盖路由 item（踩掉 static_prefix / api_target，即部署的原子切流）。
 
 `deploy_runtime()` 的 `environmentVariables` 加：
 
@@ -4160,7 +4198,28 @@ def test_exchange_code_accepts_matching_nonce():
                                     "name": "Alice", "nonce": "good-nonce"}):
         jwks.return_value.get_signing_key_from_jwt.return_value = _Key()
         out = lh._exchange_code("code", "ver123", "good-nonce")
-    assert out == {"email": "a@x.com", "name": "Alice"}
+    # idp/auth_via 由 pre-token 注入 id_token；此处 decode 被 patch 掉，
+    # 未提供这两个 claim，故回落空串。
+    assert out == {"email": "a@x.com", "name": "Alice", "idp": "", "auth_via": ""}
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_exchange_code_returns_idp_and_auth_via():
+    """两个 claim 都要透出来——mint_session_jwt 要把它们写进会话。"""
+    class _Key:
+        key = "k"
+
+    with patch.object(lh, "_post_token", return_value={"id_token": "h.p.s"}), \
+         patch.object(lh, "_get_jwks_client") as jwks, \
+         patch.object(lh.pyjwt, "decode",
+                      return_value={"token_use": "id", "email": "a@x.com",
+                                    "name": "Alice", "nonce": "n",
+                                    "idp": "Feishu",
+                                    "auth_via": "TokenGeneration_HostedAuth"}):
+        jwks.return_value.get_signing_key_from_jwt.return_value = _Key()
+        out = lh._exchange_code("code", "v", "n")
+    assert out["idp"] == "Feishu"
+    assert out["auth_via"] == "TokenGeneration_HostedAuth"
 
 
 @patch.dict(lh.os.environ, ENV)
@@ -4494,7 +4553,8 @@ git commit -m "feat(auth): OAuth PKCE(S256) + nonce 校验"
 - Consumes: `site-builder/config.ini`
 - Produces:
   - `deploy_pool.pool_config(base_domain: str) -> dict`（CreateUserPool 参数）
-  - `deploy_pool.client_configs(base_domain: str, extra_mcp_callbacks: list[str]) -> dict`（三个 client 的 CreateUserPoolClient 参数，键为 `site` / `mcp` / `machine`）
+  - `deploy_pool.client_configs(base_domain, extra_mcp_callbacks, idp_name=None, *, include_machine=False, machine_scopes=()) -> dict`（CreateUserPoolClient 参数；默认只返回 `site` / `mcp`——`machine` 需要 resource server 的 custom scope，随 M4 建）
+  - `deploy_pool.NATIVE_AUTH_DISABLED` / `NATIVE_AUTH_FLOWS`、`_assert_no_native_flows`、`_verify_no_native_flows`（org 边界的断言与读回复验）
   - CLI：`python3 site-builder/scripts/deploy_pool.py [--idp oidc|none]`，幂等；结束时打印要回填 config.ini 的值
 
 **说明**：IdP 联邦配置（飞书适配器 / Okta）用参数化的 OIDC provider 配置，脚本只负责"如果 config 里给了 IdP 参数就创建/更新 OIDC provider"，不写死任何 IdP。真机联邦验证在 Task 15。
@@ -4621,6 +4681,15 @@ def test_clients_disable_all_native_auth_flows(key):
     assert not (flows & set(dp.NATIVE_AUTH_FLOWS))
 
 
+@pytest.mark.parametrize("key", ["site", "mcp"])
+def test_refresh_token_validity_is_capped(key):
+    """默认 30 天太长：原生 flow 若曾被误开，已签发的 refresh token 在有效期内
+    仍能换出 auth_via=RefreshTokens 的可信 token，关配置也拦不住。"""
+    clients = dp.client_configs("example.com", [], idp_name="Okta")
+    assert clients[key]["RefreshTokenValidity"] == 1
+    assert clients[key]["TokenValidityUnits"]["RefreshToken"] == "days"
+
+
 def test_assert_no_native_flows_rejects_drift():
     with pytest.raises(SystemExit, match="原生认证"):
         dp._assert_no_native_flows("site", {
@@ -4729,12 +4798,13 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'deploy_pool'`
 （pre-token 触发器、app client、token 形态）与 Quick SSO 相互牵制。二期
 把平台身份独立出来，之后改平台配置不再影响别的消费方。
 
-**IdP 无关**：本脚本只建 pool + 三个 app client + pre-token 触发器。
+**IdP 无关**：本脚本只建 pool + 两个 app client（site/mcp）+ branding + pre-token 触发器。
 联邦哪个 IdP 由 config.ini [IdP] 段决定——飞书适配器（feishu-quick-sso 的
 OIDC 适配器）与标准 IdP（Okta、Azure AD 等）走同一条 OIDC provider 路径，
 平台其余部分只消费 email/name claim。
 
-三个 app client：
+两个 app client（machine 随 M4 的 resource server 一起建——
+client_credentials 不能用空 scope 创建，否则脚本会在建 client 这步中止）：
 - site：auth 服务用（confidential，authorization_code）
 - mcp：MCP 客户端 OAuth 用（public，需预注册回调——Cognito 无 dynamic
   client registration）
@@ -4791,7 +4861,7 @@ def client_configs(base_domain: str, extra_mcp_callbacks: list[str],
                    idp_name: str | None = None, *,
                    include_machine: bool = False,
                    machine_scopes: tuple[str, ...] = ()) -> dict:
-    """三个 app client 的参数。
+    """app client 参数（默认只含 site/mcp）。
 
     idp_name 给出时，site/mcp 的 SupportedIdentityProviders **只列该 IdP**，
     不含 COGNITO——否则托管登录页仍暴露本地用户登录/注册入口，
@@ -4808,6 +4878,13 @@ def client_configs(base_domain: str, extra_mcp_callbacks: list[str],
         "CallbackURLs": [f"https://auth.{base_domain}/callback"],
         "LogoutURLs": [f"https://auth.{base_domain}/logout"],
         "SupportedIdentityProviders": providers,
+        # refresh token 有效期收到 1 天（默认 30 天）。理由：refresh token
+        # 一旦签发，在有效期内可持续换新 token，而新 token 的 auth_via 是
+        # 受信的 TokenGeneration_RefreshTokens——万一原生 flow 曾被误开，
+        # 关掉它并不能使已签发的 token 失效，只能靠有效期到期或显式吊销。
+        # 站点会话 cookie 本就是 24h，节奏一致。
+        "RefreshTokenValidity": 1,
+        "TokenValidityUnits": {"RefreshToken": "days"},
         # spec §3.5 第 4 条 —— **这是 org 边界本体**，不是可调项。
         # 只留 refresh：不含 ALLOW_USER_PASSWORD_AUTH / ALLOW_USER_SRP_AUTH /
         # ALLOW_CUSTOM_AUTH / ALLOW_USER_AUTH / ALLOW_ADMIN_USER_PASSWORD_AUTH，
@@ -4824,6 +4901,8 @@ def client_configs(base_domain: str, extra_mcp_callbacks: list[str],
         "AllowedOAuthScopes": ["openid", "email", "profile"],
         "CallbackURLs": [MCP_LOCALHOST_CALLBACK] + list(extra_mcp_callbacks),
         "SupportedIdentityProviders": providers,
+        "RefreshTokenValidity": 1,                   # 同上，限制漂移暴露窗口
+        "TokenValidityUnits": {"RefreshToken": "days"},
         "ExplicitAuthFlows": NATIVE_AUTH_DISABLED,   # 同上，边界
     }
     # machine client（key-proxy 用）**不在 M1 创建**：client_credentials 授权
@@ -5302,31 +5381,53 @@ def test_injects_email_and_idp_into_both_containers(container):
     ev = pt.handler(_event({
         "email": "a@x.com",
         "identities": '[{"providerName":"Feishu","userId":"u1"}]'}), None)
-    assert _claims(ev, container) == {"email": "a@x.com", "idp": "Feishu"}
+    assert _claims(ev, container) == {
+        "email": "a@x.com", "idp": "Feishu",
+        "auth_via": "TokenGeneration_HostedAuth"}
 
 
 def test_local_user_gets_no_idp_claim():
-    """本地用户没有 idp claim——这正是 Edge 要拦的信号（spec §3.5）。"""
+    """本地用户没有 idp claim——这正是 Edge 要拦的信号（spec §3.5）。
+
+    auth_via 仍会写入（它记录的是本次 token 怎么来的，与账号是否联邦无关）。
+    """
     ev = pt.handler(_event({"email": "local@x.com"}), None)
     for container in ("idTokenGeneration", "accessTokenGeneration"):
         claims = _claims(ev, container)
-        assert claims == {"email": "local@x.com"}
+        assert claims == {"email": "local@x.com",
+                          "auth_via": "TokenGeneration_HostedAuth"}
         assert "idp" not in claims
 
 
 def test_malformed_identities_does_not_raise():
     ev = pt.handler(_event({"email": "a@x.com", "identities": "{not json"}), None)
-    assert _claims(ev, "idTokenGeneration") == {"email": "a@x.com"}
-    assert _claims(ev, "accessTokenGeneration") == {"email": "a@x.com"}
+    for container in ("idTokenGeneration", "accessTokenGeneration"):
+        assert _claims(ev, container) == {
+            "email": "a@x.com", "auth_via": "TokenGeneration_HostedAuth"}
 
 
-def test_no_attributes_leaves_response_untouched():
+def test_no_attributes_still_records_auth_via():
+    """没有任何用户属性时也要写 auth_via——Edge 靠它判断来源，缺了就拦不住。
+
+    （实现是"claims 非空就写"，而 auth_via 总会被填上，所以 response
+    一定会被改写；不要断言 response 原样不变。）
+    """
     ev = pt.handler(_event({}), None)
-    assert ev["response"] == {}
+    for container in ("idTokenGeneration", "accessTokenGeneration"):
+        claims = _claims(ev, container)
+        assert claims == {"auth_via": "TokenGeneration_HostedAuth"}
+        assert "email" not in claims
+
+
+def test_missing_trigger_source_yields_empty_auth_via():
+    """triggerSource 缺失（异常事件形态）→ auth_via 为空串 → 下游按不可信处理。"""
+    ev = pt.handler({"request": {"userAttributes": {"email": "a@x.com"}},
+                     "response": {}}, None)
+    assert _claims(ev, "idTokenGeneration")["auth_via"] == ""
 ```
 
 Run: `cd site-builder/auth && ../contract/.venv/bin/pytest tests/test_pre_token.py -q`
-Expected: PASS（5 passed——参数化的两个容器各算一条）
+Expected: PASS（8 passed——含参数化的两个容器）
 
 **注意**：`identities` 属性的确切形态（是 JSON 字符串还是已解析的 list、
 首次登录时是否就位）列为 Task 15 的真机 spike——`_provider_name` 对两种形态
@@ -5363,7 +5464,7 @@ git add site-builder/scripts/deploy_pool.py site-builder/auth/deploy_auth.py \
 # AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
 git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
 # 命中就停下给用户看，确认是故意的 fixture 后再继续
-git commit -m "feat(scripts): 平台专用 user pool 部署脚本（IdP 无关，三个 app client）"
+git commit -m "feat(scripts): 平台专用 user pool 部署脚本（IdP 无关，site/mcp 两个 client）"
 ```
 
 ---
@@ -5389,7 +5490,9 @@ Run:
 ```bash
 python3 site-builder/scripts/deploy_pool.py --domain-prefix <全局唯一前缀>
 ```
-Expected: 打印新 pool id、三个 client id，以及"已写入"两条 SSM 参数
+Expected: 打印新 pool id、**两个** client id（site/mcp），以及"已写入"一条
+SSM 参数（`/site-builder/site-client-secret`；machine 的 secret 随 M4 建 client
+时再写）
 （脚本内部直接 `put_parameter`，**不打印 secret 明文**）。同时打印要在 IdP 侧
 加白名单的 `/oauth2/idpresponse` 回调地址。
 
@@ -5637,10 +5740,18 @@ Edge 那侧验完了，MCP 是另一条入口，必须独立验——只验"acce
    验证请求真的到达了容器：调用后查 runtime 日志里有本次请求的记录
    （`/aws/bedrock-agentcore/*`），确认是应用层拒绝而不是网关拒绝：
    ```bash
-   aws logs filter-log-events --region us-east-1 \
-     --log-group-name-prefix /aws/bedrock-agentcore \
-     --start-time $(python3 -c 'import time;print(int(time.time()*1000)-300000)') \
-     --filter-pattern '身份来源不被信任' --max-items 5
+   # filter-log-events 只接受精确的 --log-group-name（没有 -prefix 参数），
+   # 所以先用 describe-log-groups 解析出实际组名再逐个查。
+   SINCE=$(python3 -c 'import time;print(int(time.time()*1000)-300000)')
+   for LG in $(aws logs describe-log-groups --region us-east-1 \
+       --log-group-name-prefix /aws/bedrock-agentcore \
+       --query 'logGroups[].logGroupName' --output text); do
+     echo "--- $LG"
+     aws logs filter-log-events --region us-east-1 \
+       --log-group-name "$LG" --start-time "$SINCE" \
+       --filter-pattern '身份来源不被信任' --max-items 5 \
+       --query 'events[].message' --output text
+   done
    ```
    Expected: 有命中——说明走到了 `_caller_email()` 的校验分支。无命中且调用
    返回 401，说明是网关层拒的，这条测试无效，换回"注掉 idp 注入"的办法。
@@ -5727,8 +5838,9 @@ Expected: 无输出即成功。**顺序不能反**——先删后验证会让旧
 1. `site-builder/config.ini` 填 `[Platform]`（base_domain / account_id /
    region）与 `[IdP]`（见下面分支）。
 2. `python3 site-builder/scripts/deploy_pool.py --domain-prefix <全局唯一前缀>`
-   —— 幂等，建 pool（Essentials 档，pre-token V2 必需）+ 三个 app client
-   （site / mcp / machine）+ 托管域名 + pre-token 触发器。
+   —— 幂等，建 pool（Essentials 档，pre-token V2 必需）+ **两个** app client
+   （site / mcp）+ 托管域名（managed login v2）+ branding + pre-token 触发器。
+   `machine` client 随 M4 的 resource server 一起建。
 3. 按脚本输出回填 `[Cognito]`，并执行它打印的两条 SSM 写入命令
    （client secret 只进 SSM，不写文件）。
 4. 在 IdP 侧把 `https://<前缀>.auth.us-east-1.amazoncognito.com/oauth2/idpresponse`
@@ -5747,13 +5859,17 @@ Expected: 无输出即成功。**顺序不能反**——先删后验证会让旧
 `[IdP]` 填 IdP 的 OIDC 参数（issuer 用 discovery 文档所在的 issuer）。
 AWS 官方指引见本节末尾链接。属性映射固定 `email → email`、`name → name`。
 
-### 三个 app client 的用途
+### app client 的用途
 
 | client | 用途 | 形态 |
 |---|---|---|
 | site | auth 服务换 token | confidential + code |
 | mcp | MCP 客户端 OAuth | public + code，回调含 `http://localhost:18765/callback`（8765/8766 被 Quick Desktop 占用） |
-| machine | key-proxy 换机器 token（M4） | confidential + client_credentials |
+| machine | key-proxy 换机器 token | **M4 才建**——client_credentials 只能授 resource server 的 custom scope，空 scope 会被 Cognito 拒绝，本期建它会让部署脚本中止 |
+
+两个 client 的共同约束（org 边界，见 spec §3.5 第 4 条）：
+`ExplicitAuthFlows` 只含 `ALLOW_REFRESH_TOKEN_AUTH`、`RefreshTokenValidity=1` 天、
+`SupportedIdentityProviders` 只列企业 IdP。部署脚本每次重跑都断言并读回复验。
 ```
 
 在该节末尾把一期已有的 AWS 官方链接与旧内容保留在"分支 A/B"下对应位置。
