@@ -4,7 +4,7 @@
 
 **Goal:** 把平台身份切到专用 Cognito user pool（含 PKCE/nonce 增强），并把站点权限的唯一真源从"site.json + 路由表"迁移到 sites 表，使"在线改权限 / 协作者 / 所有权转移"端到端可用且不再需要重部署。
 
-**Architecture:** 三层改造。① 身份层新建 `site-builder-users` pool（IdP 无关，3 个 app client），auth 服务加 PKCE + nonce；② 数据层给 `site-sites` 表加权限字段与 `owner-index` GSI，新增 `permissions.py` 作为唯一角色判定与权限写入模块（MCP 与后续 panel 共用，沿用 `common.py` 的构建时复制模式）；③ 消费层改 `register_route`（权限值来自 sites 表而非 manifest）、改 Edge（collaborators 放行 + List 反序列化）、改 MCP（角色判定替换 `_assert_owner` + 3 个新工具）。存量站点用一次性脚本从路由表回填 sites 表。
+**Architecture:** 三层改造。① 身份层新建 `site-builder-users` pool（IdP 无关但**禁本地用户**：关自注册 + 生产 client 只列企业 IdP，3 个 app client），pre-token 注入 email + `idp` claim，auth 服务加 PKCE + nonce；② 数据层给 `site-sites` 表加权限字段、`permissions_rev` 与 `owner-index` GSI，新增 `permissions.py` 作为唯一角色判定与权限写入模块——权限写入统一走 `write_permissions`（`TransactWriteItems` 两表原子），MCP 与后续 panel 共用（沿用 `common.py` 的构建时复制模式）；③ 消费层改 `register_route`（权限来自 sites 表并输出 effective policy）、`smoke_test`（读 effective policy）、`mark_job`（不再写 owner）、Edge（collaborators 放行 + List 反序列化）、MCP（角色判定替换 `_assert_owner` + 3 个新工具）。存量站点用一次性脚本从路由表回填 sites 表（损坏数据报错跳过，不扩权）。
 
 **Tech Stack:** Python 3.13（Lambda/MCP）、Python 3.11（Lambda@Edge）、boto3、DynamoDB、Cognito、CDK（router + deployer 两个栈）、pytest + moto、AgentCore Runtime。
 
@@ -27,6 +27,9 @@
 - **验证纪律**：每处改动用真实 AWS API 实证验证（本项目被 mock 掉的层出过多次问题）。计划中标 `[真机]` 的步骤必须在真实 AWS 上跑，不能只靠 moto。
 - **发现文档与实际不符就同步更新**（`site-builder/DEPLOY.md`、`docs/` 下相关文档、`CLAUDE.md`）。
 - **`allowed_users` 语义**：`"org"`（字面量字符串）或邮箱数组。sites 表里存原生 List；路由表投影里 `"org"` 存 `S`、名单存 `L`（Task 8 起）。
+- **`"org"` 的安全前提**（spec §3.5）：Edge 对 org 的判定只是"持有有效平台会话"，不查邮箱域。因此平台 pool **必须**关自注册（`AllowAdminCreateUserOnly=True`）且生产 client 只列企业 IdP（不含 `COGNITO`）。任何放宽这两条的改动都等于把全部 org 站点对公网开放。
+- **权限写入只走一个入口**：`permissions.write_permissions`（`TransactWriteItems` 两表原子）。**不要**在别处写"先改 sites 再同步路由"的顺序两写——收紧权限时第二步失败会留下 sites 已私有、Edge 仍公开的安全状态错误。
+- **fail-closed 优先**：权限相关的解析/判定失败一律取最严格解释（空名单、按未登录处理、报错跳过），绝不"取最宽松的默认值继续"。
 - **角色语义（两级 + admin）**：owner 可做全部操作；collaborator 可部署更新 / 查状态 / 看统计 / 改 `require_login` 与 `allowed_users`；仅 owner（或 admin）可增删 collaborator、转移 owner、undeploy/purge。admin 对任意站点等价 owner。
 
 ---
@@ -42,16 +45,21 @@
 | `site-builder/scripts/migrate_permissions.py` | 一次性迁移：路由表 → sites 表回填权限字段 |
 | `site-builder/scripts/deploy_pool.py` | 幂等创建/更新平台专用 user pool + 3 个 app client + pre-token 触发器挂载 |
 | `site-builder/auth/tests/test_pkce.py` | PKCE/nonce 的 state 编解码与 callback 校验测试 |
+| `site-builder/auth/tests/test_pre_token.py` | pre-token 触发器注入 email/idp claim 的测试 |
+| `site-builder/deployer/tests/test_migrate_permissions.py` | 迁移脚本测试（含"损坏名单不扩权"） |
 
 **修改：**
 
 | 文件 | 改动 |
 |---|---|
 | `site-builder/auth/login_handler.py` | `/login` 生成 code_verifier + nonce 进签名 state；`/callback` 带 verifier 换 token、验 id_token 的 nonce |
-| `site-builder/auth/deploy_auth.py` | pre-token 触发器逻辑抽出供 `deploy_pool.py` 复用；env 从 config 读新 pool |
+| `site-builder/auth/deploy_auth.py` | pre-token 触发器支持传 pool_id；**StatementId 按 pool 区分**（固定 id + 吞冲突会让新 pool 授权加不上） |
 | `site-builder/config.ini.example` | `[Cognito]` 加 `machine_client_id`；`[Platform]` 加 `admin_seed`；`[Deployer]` 加 `admins_table` |
 | `site-builder/deployer/infra/app.py` | sites 表加 `owner-index` GSI；新增 `site-admins` 表；exec role 权限相应扩展 |
-| `site-builder/deployer/functions/register_route.py` | 权限字段从 sites 表读（不再从 manifest）；首次部署时用 manifest 初始化 sites 表权限 |
+| `site-builder/deployer/functions/register_route.py` | 权限字段从 sites 表读（不再从 manifest）；首次部署时用 manifest 初始化；输出 `effective_auth` 供 smoke_test |
+| `site-builder/deployer/functions/mark_job.py` | **不再写站点 owner**（否则 collaborator 部署一次即夺权，Task 5a） |
+| `site-builder/deployer/functions/smoke_test.py` | 读 `effective_auth` 而非 manifest（Task 5b） |
+| `site-builder/auth/pre_token_email.py` | 额外注入 `idp` claim（org 语义的纵深防御） |
 | `site-builder/deployer/functions/common.py` | 加 `list_sites_by_owner`（用新 GSI） |
 | `router/infrastructure/lambda/origin_request.py` | `_deser` 支持 `L`；`_check_auth` 放行 collaborators；`allowed_users` 兼容 List 与 JSON 字符串两种形态 |
 | `router/infrastructure/lambda/test_edge_auth.py` | 新增 collaborators / List 形态用例 |
@@ -76,8 +84,9 @@
 - Produces:
   - `ROLE_OWNER = "owner"`, `ROLE_COLLABORATOR = "collaborator"`, `ROLE_ADMIN = "admin"`, `ROLE_NONE = "none"`
   - `role_of(email: str, site: dict | None, is_admin: bool = False) -> str`
+    （判定顺序 **owner → admin → collaborator**，见 Step 3 注释）
   - `can(role: str, action: str) -> bool`；`action` ∈ `{"deploy", "read", "set_access_policy", "manage_collaborators", "transfer_owner", "undeploy"}`
-  - `class PermissionDenied(Exception)`
+  - `class PermissionDenied(Exception)`、`class PermissionConflict(Exception)`
   - `assert_can(email: str, site: dict | None, action: str, *, is_admin: bool = False, what: str = "") -> str`（返回 role，失败抛 `PermissionDenied`）
 
 - [ ] **Step 1: 写失败测试**
@@ -112,6 +121,21 @@ def test_admin_flag_wins_over_outsider():
 def test_owner_is_not_downgraded_by_admin_flag():
     # owner 本人同时是 admin 时报 owner——审计与文案更准确，权限集相同
     assert perm.role_of("o@x.com", SITE, is_admin=True) == perm.ROLE_OWNER
+
+
+def test_admin_who_is_also_collaborator_gets_admin():
+    """判定顺序必须 owner→admin→collaborator。
+
+    若 collaborator 先匹配，这个平台管理员会失去 undeploy / 转移所有权的
+    能力——admin 身兼某站点协作者很常见（先是协作者、后被提为管理员），
+    不能因此被降权。
+    """
+    assert perm.role_of("c@x.com", SITE, is_admin=True) == perm.ROLE_ADMIN
+
+
+def test_admin_collaborator_can_undeploy():
+    role = perm.role_of("c@x.com", SITE, is_admin=True)
+    assert perm.can(role, "undeploy") is True
 
 
 def test_role_of_missing_site_is_none():
@@ -182,7 +206,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'permissions'`
 """站点权限的唯一判定与写入模块。
 
 真源是 sites 表（site-sites）：owner / collaborators / require_login /
-allowed_users 全部以此为准；路由表只是给 Edge 读的投影（见 sync_route_projection）。
+allowed_users 全部以此为准；路由表只是给 Edge 读的投影（见 write_permissions）。
 MCP（site-builder/mcp/）与控制台（site-builder/panel/）都引入本模块，
 两处的授权语义因此不会漂移——新增受控动作时只改 CAPABILITIES。
 """
@@ -207,15 +231,28 @@ class PermissionDenied(Exception):
     pass
 
 
+class PermissionConflict(Exception):
+    """并发修改：读到的 permissions_rev 已被别人推进。调用方转 409 提示重试。"""
+    pass
+
+
 def role_of(email: str, site: dict | None, is_admin: bool = False) -> str:
+    """判定顺序 owner → admin → collaborator。
+
+    admin 必须排在 collaborator 之前：管理员身兼某站点协作者时若返回
+    collaborator，他就拿不到 undeploy / transfer_owner（CAPABILITIES 里
+    collaborator 没有这两项）——等于被自己的协作者身份降权。
+    审计要区分"owner 本人"与"admin 代管"时用单独的 is_admin 标志，
+    不要从角色字符串反推。
+    """
     if not site:
         return ROLE_NONE
     if email and email == site.get("owner"):
         return ROLE_OWNER
-    if email and email in (site.get("collaborators") or []):
-        return ROLE_COLLABORATOR
     if is_admin:
         return ROLE_ADMIN
+    if email and email in (site.get("collaborators") or []):
+        return ROLE_COLLABORATOR
     return ROLE_NONE
 
 
@@ -237,7 +274,7 @@ def assert_can(email: str, site: dict | None, action: str, *,
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cd site-builder/deployer && .venv/bin/pytest tests/test_permissions.py -q`
-Expected: PASS（20 passed）
+Expected: PASS（22 passed）
 
 - [ ] **Step 5: 提交**
 
@@ -262,16 +299,21 @@ git commit -m "feat(permissions): 角色判定模块（owner/collaborator/admin 
   - `list_admins() -> list[str]`
   - `add_admin(email: str, added_by: str) -> None`
   - `remove_admin(email: str) -> None`（拒绝删空，抛 `PermissionDenied`）
-  - `set_access_policy(site_id: str, *, actor: str, require_login: bool | None = None, allowed_users=None) -> dict`（写 sites 表，返回更新后的权限 dict）
-  - `set_collaborators(site_id: str, *, actor: str, add: list[str] | None = None, remove: list[str] | None = None) -> list[str]`
-  - `transfer_owner(site_id: str, *, actor: str, new_owner: str) -> dict`（原 owner 降级为 collaborator）
+  - `set_access_policy(site_id: str, *, actor: str, require_login: bool | None = None, allowed_users=None) -> dict`（校验入参后委托 `write_permissions`）
+  - `set_collaborators(site_id: str, *, actor: str, add: list[str] | None = None, remove: list[str] | None = None) -> list[str]`（同上）
+  - `transfer_owner(site_id: str, *, actor: str, new_owner: str) -> dict`（原 owner 降级为 collaborator；同上）
   - `normalize_allowed_users(value) -> str | list[str]`（`"org"` 或去重排序后的邮箱 list）
   - `allowed_users_av(allowed) -> dict`（DynamoDB AttributeValue：`"org"` → `{"S":"org"}`；名单 → `{"L":[...]}`）
-  - `sync_route_projection(site_id: str) -> bool`（把 sites 表权限投影到路由表；路由 item 不存在时返回 False 而非抛错）
   - `now_iso() -> str`（ISO8601 时间戳，register_route 与迁移脚本共用）
   - `EMAIL_RE`（与 contract 的 `EMAIL_RE` 同 pattern）
+  - `class PermissionConflict(Exception)`（并发修改，调用方转 409）
+  - `write_permissions(site_id, *, actor, require_login=None, allowed_users=None, collaborators=None, new_owner=None) -> dict`
+    —— **唯一的权限写入入口**：`TransactWriteItems` 原子更新 sites 表（真源，
+    带 `permissions_rev` 乐观并发条件）+ 路由表投影；路由 item 不存在时降级为
+    只写 sites 表。返回 `{"require_login","allowed_users","collaborators",
+    "owner","route_synced": bool}`
 
-**为什么投影逻辑放这里**：MCP（Task 11）、控制台（M3）、迁移脚本都要写这份投影，放进权限模块是唯一不重复的位置。`register_route` 复用 `allowed_users_av` 保证两条写路径的编码方式一致。
+**为什么必须是一个事务入口**：spec §3.2 要求两表一起成功或一起失败。顺序两写在"收紧权限"场景下会留下 sites 表已私有、Edge 仍按旧路由公开放行的状态——安全状态错误，不是可接受的最终一致性。把它收成单一入口，MCP（Task 11）、控制台（M3）、迁移脚本就不可能各写一份半正确的版本。`register_route` 复用 `allowed_users_av` 保证两条写路径编码一致。
 
 - [ ] **Step 1: 给 conftest 加 admins 表**
 
@@ -420,11 +462,11 @@ def test_allowed_users_av_list_is_L():
     assert perm.allowed_users_av(["a@x.com"]) == {"L": [{"S": "a@x.com"}]}
 
 
-def test_sync_route_projection_updates_route(aws):
+def test_write_permissions_updates_both_tables_atomically(aws):
     import boto3
     import common
-    common.upsert_site("s-1", owner="o@x.com", require_login=False,
-                       allowed_users=["a@x.com"], collaborators=["c@x.com"])
+    common.upsert_site("s-1", owner="o@x.com", require_login=True,
+                       allowed_users="org", collaborators=[])
     ddb = boto3.client("dynamodb")
     ddb.put_item(TableName="routing", Item={
         "subdomain": {"S": "app-s-1"}, "site_id": {"S": "s-1"},
@@ -433,29 +475,70 @@ def test_sync_route_projection_updates_route(aws):
         "require_auth": {"BOOL": True}, "allowed_users": {"S": "org"},
         "collaborators": {"L": []}, "owner": {"S": "o@x.com"}})
 
-    assert perm.sync_route_projection("s-1") is True
+    out = perm.write_permissions("s-1", actor="o@x.com", require_login=False,
+                                 allowed_users=["a@x.com"])
+    assert out["route_synced"] is True
+
+    site = common.get_site("s-1")
+    assert site["require_login"] is False
+    assert site["allowed_users"] == ["a@x.com"]
+    assert int(site["permissions_rev"]) == 1
+
     item = ddb.get_item(TableName="routing",
                         Key={"subdomain": {"S": "app-s-1"}})["Item"]
     assert item["require_auth"]["BOOL"] is False
     assert item["allowed_users"]["L"] == [{"S": "a@x.com"}]
-    assert item["collaborators"]["L"] == [{"S": "c@x.com"}]
     # 投影只动权限字段：部署态字段必须原样保留（否则会踩掉原子切流）
     assert item["static_prefix"]["S"] == "sites/s-1/j"
     assert item["api_target"]["S"] == "https://fn.lambda-url.us-east-1.on.aws"
 
 
-def test_sync_route_projection_missing_route_returns_false(aws):
+def test_write_permissions_degrades_when_route_absent(aws):
+    """站点尚未首次部署成功：只写真源，显式返回 route_synced=False。"""
     import common
     common.upsert_site("nodeploy", owner="o@x.com", require_login=True,
                        allowed_users="org", collaborators=[])
-    assert perm.sync_route_projection("nodeploy") is False
+    out = perm.write_permissions("nodeploy", actor="o@x.com", require_login=False)
+    assert out["route_synced"] is False
+    assert common.get_site("nodeploy")["require_login"] is False
 
 
-def test_sync_route_projection_writes_owner(aws):
+def test_write_permissions_rolls_back_when_route_write_fails(aws, monkeypatch):
+    """路由表写失败时 sites 表不能留下"已收紧"的假象。
+
+    这是 spec §3.2 的核心保证：顺序两写会产生 sites 私有 / Edge 公开的
+    安全状态错误。用事务后，注入失败应让两边都不变。
+    """
+    import boto3
+    import botocore.exceptions
+    import common
+    common.upsert_site("s-1", owner="o@x.com", require_login=False,
+                       allowed_users="org", collaborators=[])
+    # 故意不建路由 item，同时强制关闭降级分支——模拟"路由本该存在但写失败"
+    monkeypatch.setattr(perm, "_ALLOW_ROUTE_ABSENT", False)
+    with pytest.raises(botocore.exceptions.ClientError):
+        perm.write_permissions("s-1", actor="o@x.com", require_login=True)
+    # 真源未被改动：仍是公开
+    assert common.get_site("s-1")["require_login"] is False
+
+
+def test_write_permissions_detects_concurrent_modification(aws):
+    """两个 owner/collaborator 同时改：后到者必须失败而不是静默覆盖。"""
+    import common
+    common.upsert_site("s-1", owner="o@x.com", require_login=True,
+                       allowed_users="org", collaborators=[], permissions_rev=0)
+    perm.write_permissions("s-1", actor="o@x.com", allowed_users=["a@x.com"])
+    # 用陈旧的 rev 再写一次
+    with pytest.raises(perm.PermissionConflict):
+        perm.write_permissions("s-1", actor="b@x.com",
+                               allowed_users=["b@x.com"], expected_rev=0)
+
+
+def test_write_permissions_transfers_owner_to_both_tables(aws):
     import boto3
     import common
-    common.upsert_site("s-1", owner="new@x.com", require_login=True,
-                       allowed_users="org", collaborators=["old@x.com"])
+    common.upsert_site("s-1", owner="old@x.com", require_login=True,
+                       allowed_users="org", collaborators=[])
     ddb = boto3.client("dynamodb")
     ddb.put_item(TableName="routing", Item={
         "subdomain": {"S": "app-s-1"}, "site_id": {"S": "s-1"},
@@ -463,13 +546,21 @@ def test_sync_route_projection_writes_owner(aws):
         "api_target": {"S": ""}, "require_auth": {"BOOL": True},
         "allowed_users": {"S": "org"}, "collaborators": {"L": []},
         "owner": {"S": "old@x.com"}})
-    perm.sync_route_projection("s-1")
+    perm.write_permissions("s-1", actor="old@x.com", new_owner="new@x.com",
+                           collaborators=["old@x.com"])
+    assert common.get_site("s-1")["owner"] == "new@x.com"
     item = ddb.get_item(TableName="routing",
                         Key={"subdomain": {"S": "app-s-1"}})["Item"]
     assert item["owner"]["S"] == "new@x.com"
+    assert item["collaborators"]["L"] == [{"S": "old@x.com"}]
 ```
 
-**注意**：`sync_route_projection` 的测试需要 `ROUTING_TABLE` 环境变量。在 `site-builder/deployer/tests/conftest.py` 的 `ENV` 里已有 `"ROUTING_TABLE": "routing"`，无需再加。
+**注意**：这些测试需要 `ROUTING_TABLE` 环境变量。`site-builder/deployer/tests/conftest.py` 的 `ENV` 里已有 `"ROUTING_TABLE": "routing"`，无需再加。
+
+**moto 的事务支持**：`TransactWriteItems` 在 moto ≥4 已支持（含
+`ConditionExpression` 与 `TransactionCanceledException`）。跑不通先确认
+`site-builder/deployer/.venv` 里的 moto 版本：`.venv/bin/pip show moto`；
+低于 4 则 `.venv/bin/pip install -U moto` 并在提交里带上版本变化。
 
 - [ ] **Step 3: 运行测试确认失败**
 
@@ -556,27 +647,143 @@ def _site_or_raise(site_id: str) -> dict:
     return site
 
 
-def set_access_policy(site_id: str, *, actor: str, require_login=None,
-                      allowed_users=None) -> dict:
-    """写 sites 表的访问策略（真源）。调用方负责先做 assert_can。
+# ---- 权限写入：唯一入口，两表原子提交 ----
+# 真源是 sites 表，路由表是给 Edge 读的投影。两者必须一起成功或一起失败：
+# 顺序两写在"收紧权限"场景下会留下 sites 已私有、Edge 仍公开放行的状态
+# （安全状态错误，不是最终一致性）。见 spec §3.2。
+#
+# 测试钩子：站点尚未首次部署成功时路由 item 不存在，此时降级为只写 sites。
+# 该降级是显式分支——把它关掉才能测"路由本该存在却写失败"的回滚路径。
+_ALLOW_ROUTE_ABSENT = True
 
-    只写传入的字段：None 表示不动，便于面板做单字段保存。
+
+def allowed_users_av(allowed) -> dict:
+    """allowed_users 的 DynamoDB AttributeValue：字面量 org 用 S，名单用 L。
+
+    Edge 的 _deser 必须已支持 L——否则名单会被读成 False，站点变成
+    "全员放行"。部署顺序：Edge 先上，写侧后上。
     """
+    if allowed == "org":
+        return {"S": "org"}
+    return {"L": [{"S": e} for e in allowed]}
+
+
+def _ddb_client():
+    return boto3.client("dynamodb",
+                        region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+
+
+def _cancel_reasons(err) -> list[str]:
+    return [r.get("Code", "") for r in
+            err.response.get("CancellationReasons", [])]
+
+
+def write_permissions(site_id: str, *, actor: str, require_login=None,
+                      allowed_users=None, collaborators=None, new_owner=None,
+                      expected_rev=None) -> dict:
+    """权限写入的唯一入口：sites 表（真源）+ 路由表（投影）原子提交。
+
+    只写传入的字段（None = 不动），便于面板做单字段保存。
+    expected_rev 显式传入时用它做乐观并发条件（面板从 GET 响应里带回来）；
+    不传则用当前读到的 rev——仍能挡住"读后被人改过"的窗口。
+
+    抛 PermissionConflict（并发修改，调用方转 409）或原始 ClientError。
+    """
+    import botocore.exceptions
+
     site = _site_or_raise(site_id)
-    attrs = {}
+    rev = int(site.get("permissions_rev", 0)) if expected_rev is None else int(expected_rev)
+
+    effective = {
+        "require_login": bool(site.get("require_login", True)),
+        "allowed_users": site.get("allowed_users", "org"),
+        "collaborators": list(site.get("collaborators") or []),
+        "owner": site.get("owner", ""),
+    }
+    sets = ["permissions_updated_at = :t", "permissions_updated_by = :by",
+            "permissions_rev = :nrev"]
+    vals = {":t": {"S": now_iso()}, ":by": {"S": actor},
+            ":nrev": {"N": str(rev + 1)}, ":rev": {"N": str(rev)}}
+    names = {}
+
     if require_login is not None:
         if not isinstance(require_login, bool):
             raise ValueError("require_login 必须为布尔值")
-        attrs["require_login"] = require_login
+        effective["require_login"] = require_login
+        sets.append("require_login = :rl")
+        vals[":rl"] = {"BOOL": require_login}
     if allowed_users is not None:
-        attrs["allowed_users"] = normalize_allowed_users(allowed_users)
-    if not attrs:
+        effective["allowed_users"] = normalize_allowed_users(allowed_users)
+        sets.append("allowed_users = :au")
+        vals[":au"] = allowed_users_av(effective["allowed_users"])
+    if collaborators is not None:
+        effective["collaborators"] = list(collaborators)
+        sets.append("collaborators = :co")
+        vals[":co"] = {"L": [{"S": e} for e in effective["collaborators"]]}
+    if new_owner is not None:
+        effective["owner"] = new_owner
+        sets.append("#o = :ow")
+        names["#o"] = "owner"
+        vals[":ow"] = {"S": new_owner}
+    if len(sets) == 3:
         raise ValueError("没有要更新的字段")
-    attrs["permissions_updated_at"] = now_iso()
-    attrs["permissions_updated_by"] = actor
-    common.upsert_site(site_id, **attrs)
-    return {"require_login": attrs.get("require_login", site.get("require_login")),
-            "allowed_users": attrs.get("allowed_users", site.get("allowed_users"))}
+
+    site_update = {
+        "TableName": os.environ["SITES_TABLE"],
+        "Key": {"site_id": {"S": site_id}},
+        "UpdateExpression": "SET " + ", ".join(sets),
+        "ConditionExpression": ("attribute_not_exists(permissions_rev) "
+                                "OR permissions_rev = :rev"),
+        "ExpressionAttributeValues": vals,
+    }
+    if names:
+        site_update["ExpressionAttributeNames"] = names
+
+    # 路由表只 update 权限字段，不整条覆盖——register_route 是整条 put_item
+    # （原子切流），两者都整写会踩掉 static_prefix / api_target。
+    route_update = {
+        "TableName": os.environ["ROUTING_TABLE"],
+        "Key": {"subdomain": {"S": common.subdomain_for(site_id)}},
+        "UpdateExpression": ("SET require_auth = :a, allowed_users = :u, "
+                             "collaborators = :c, #ro = :o"),
+        "ConditionExpression": "attribute_exists(subdomain)",
+        "ExpressionAttributeNames": {"#ro": "owner"},
+        "ExpressionAttributeValues": {
+            ":a": {"BOOL": effective["require_login"]},
+            ":u": allowed_users_av(effective["allowed_users"]),
+            ":c": {"L": [{"S": e} for e in effective["collaborators"]]},
+            ":o": {"S": effective["owner"]}},
+    }
+
+    ddb = _ddb_client()
+    try:
+        ddb.transact_write_items(TransactItems=[{"Update": site_update},
+                                                {"Update": route_update}])
+        return {**effective, "route_synced": True}
+    except botocore.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] != "TransactionCanceledException":
+            raise
+        reasons = _cancel_reasons(e)
+        site_failed = len(reasons) > 0 and reasons[0] == "ConditionalCheckFailed"
+        route_failed = len(reasons) > 1 and reasons[1] == "ConditionalCheckFailed"
+        if site_failed:
+            raise PermissionConflict(
+                "站点权限已被其他人修改，请刷新后重试") from e
+        if route_failed and _ALLOW_ROUTE_ABSENT:
+            # 站点还没首次部署成功（无路由 item）：只写真源，
+            # 首次部署时 register_route 会带上正确值。
+            ddb.update_item(**site_update)
+            return {**effective, "route_synced": False}
+        raise
+
+
+def set_access_policy(site_id: str, *, actor: str, require_login=None,
+                      allowed_users=None) -> dict:
+    """改访问策略。调用方负责先做 assert_can。"""
+    out = write_permissions(site_id, actor=actor, require_login=require_login,
+                            allowed_users=allowed_users)
+    return {"require_login": out["require_login"],
+            "allowed_users": out["allowed_users"]}
 
 
 def set_collaborators(site_id: str, *, actor: str, add=None, remove=None) -> list[str]:
@@ -592,9 +799,8 @@ def set_collaborators(site_id: str, *, actor: str, add=None, remove=None) -> lis
     for e in (remove or []):
         if e in current:
             current.remove(e)
-    common.upsert_site(site_id, collaborators=current,
-                       permissions_updated_at=now_iso(), permissions_updated_by=actor)
-    return current
+    return write_permissions(site_id, actor=actor,
+                             collaborators=current)["collaborators"]
 
 
 def transfer_owner(site_id: str, *, actor: str, new_owner: str) -> dict:
@@ -608,58 +814,10 @@ def transfer_owner(site_id: str, *, actor: str, new_owner: str) -> dict:
     collaborators = [e for e in (site.get("collaborators") or []) if e != new_owner]
     if old_owner and old_owner not in collaborators:
         collaborators.append(old_owner)
-    common.upsert_site(site_id, owner=new_owner, collaborators=collaborators,
-                       permissions_updated_at=now_iso(), permissions_updated_by=actor)
-    return {"owner": new_owner, "collaborators": collaborators,
+    out = write_permissions(site_id, actor=actor, new_owner=new_owner,
+                            collaborators=collaborators)
+    return {"owner": out["owner"], "collaborators": out["collaborators"],
             "previous_owner": old_owner}
-
-
-# ---- 路由表投影（Edge 读的那份） ----
-# 真源是 sites 表；路由表只是投影。写投影的三个调用方（MCP 工具、控制台、
-# 部署时的 register_route）必须用同一份编码逻辑，否则 Edge 侧会读到形态
-# 不一致的字段。
-
-def allowed_users_av(allowed) -> dict:
-    """allowed_users 的 DynamoDB AttributeValue：字面量 org 用 S，名单用 L。
-
-    Edge 的 _deser 必须已支持 L——否则名单会被读成 False，站点变成
-    "全员放行"。部署顺序：Edge 先上，写侧后上。
-    """
-    if allowed == "org":
-        return {"S": "org"}
-    return {"L": [{"S": e} for e in allowed]}
-
-
-def sync_route_projection(site_id: str) -> bool:
-    """把 sites 表的权限投影到路由表。返回是否真的写了。
-
-    只 update 权限字段，不整条覆盖——部署中的 register_route 会 put_item
-    整条（原子切流），两者若都整写会踩掉 static_prefix / api_target。
-    站点尚未部署成功时路由 item 不存在：条件更新失败即返回 False
-    （真源已更新，首次部署时 register_route 会带上正确值）。
-    """
-    import botocore.exceptions
-    site = common.get_site(site_id) or {}
-    try:
-        boto3.client("dynamodb",
-                     region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
-                     ).update_item(
-            TableName=os.environ["ROUTING_TABLE"],
-            Key={"subdomain": {"S": common.subdomain_for(site_id)}},
-            UpdateExpression=("SET require_auth = :a, allowed_users = :u, "
-                              "collaborators = :c, #o = :o"),
-            ConditionExpression="attribute_exists(subdomain)",
-            ExpressionAttributeNames={"#o": "owner"},
-            ExpressionAttributeValues={
-                ":a": {"BOOL": bool(site.get("require_login", True))},
-                ":u": allowed_users_av(site.get("allowed_users", "org")),
-                ":c": {"L": [{"S": e} for e in (site.get("collaborators") or [])]},
-                ":o": {"S": site.get("owner", "")}})
-        return True
-    except botocore.exceptions.ClientError as e:
-        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            return False
-        raise
 ```
 
 - [ ] **Step 5: 运行测试确认通过**
@@ -991,7 +1149,7 @@ git commit -m "feat(common): 按 owner 查站点用 GSI；新增 owner∪collabo
 
 **Interfaces:**
 - Consumes: `common.get_site`、`common.upsert_site`、Task 2 的 `permissions.normalize_allowed_users`
-- Produces: 路由表 item 的权限字段来自 sites 表；首次部署（sites 表无权限字段）时用 manifest 的 `auth` 初始化 sites 表。路由表 `allowed_users` 写法改为：`"org"` → `{"S": "org"}`；名单 → `{"L": [{"S": email}, ...]}`
+- Produces: 路由表 item 的权限字段来自 sites 表；首次部署（sites 表无权限字段）时用 manifest 的 `auth` 初始化 sites 表；`event["effective_auth"] = {"require_login": bool, "allowed_users": "org"|list}` 供下游 smoke_test 使用（Task 5b）。路由表 `allowed_users` 写法改为：`"org"` → `{"S": "org"}`；名单 → `{"L": [{"S": email}, ...]}`
 
 **依赖**：Task 8（Edge `_deser` 支持 L）必须**先于本任务部署到生产**，否则 Edge 读到 `L` 会静默变 `False`。代码合并顺序上本任务可以先写，但**部署顺序必须 Task 8 先上**——在提交信息里写明。
 
@@ -1045,6 +1203,20 @@ def test_register_route_prefers_sites_table_over_manifest(aws):
     assert item["collaborators"]["L"] == [{"S": "c@x.com"}]
     # sites 表不被 manifest 覆盖
     assert common.get_site("s-1")["require_login"] is False
+
+
+def test_register_route_emits_effective_auth_for_smoke_test(aws):
+    """smoke_test 读 event["effective_auth"]，不读 manifest（spec §3.3.2）。"""
+    import common
+    import register_route
+    common.upsert_site("s-1", owner="o@x.com", require_login=False,
+                       allowed_users=["online@x.com"], collaborators=[])
+    job_id = common.create_job("o@x.com", "s-1")
+    event = {"job_id": job_id, "site_id": "s-1", "api_target": "",
+             "manifest": {"auth": {"require_login": True, "allowed_users": "org"}}}
+    out = register_route.handler(event, None)
+    assert out["effective_auth"] == {"require_login": False,
+                                     "allowed_users": ["online@x.com"]}
 
 
 def test_register_route_writes_org_as_string(aws):
@@ -1129,6 +1301,11 @@ def handler(event, context):
               "allowed_users": permissions.allowed_users_av(allowed),
               "collaborators": {"L": [{"S": e} for e in collaborators]},
               "owner": {"S": owner}})
+    # smoke_test 必须按本次实际写入路由的策略断言，不能按 manifest
+    # （在线翻转过 require_login 时两者不一致，会把成功的部署判成 FAILED，
+    #  而路由切换已经发生）。见 spec §3.3.2。
+    event["effective_auth"] = {"require_login": bool(site.get("require_login", True)),
+                               "allowed_users": allowed}
     event["url"] = f"https://{subdomain}.{os.environ['BASE_DOMAIN']}"
     return event
 ```
@@ -1153,6 +1330,204 @@ git commit -m "feat(deployer): register_route 权限取自 sites 表（真源）
 
 部署顺序约束：本改动写入 DynamoDB L 类型，必须在 Edge 的 _deser 支持 L
 之后才能部署到生产，否则名单会被 Edge 读成 False（全员放行）。"
+```
+
+---
+
+## Task 5a: `mark_job` 不再写站点 owner（P0 提权路径）
+
+**Files:**
+- Modify: `site-builder/deployer/functions/mark_job.py:37-42`
+- Test: `site-builder/deployer/tests/test_finalize_steps.py`
+
+**Interfaces:**
+- Consumes: `common.get_job`、`common.upsert_site`
+- Produces: 成功分支不再写 `owner` 字段；jobs 表的 `owner` 语义确立为"发起者"
+
+**为什么这是 P0**：一期只有 owner 能部署，`upsert_site(owner=job["owner"])`
+写回的就是同一个人，无害。Task 10 放开 collaborator 部署后，这行变成提权路径：
+collaborator B 发起一次更新部署，成功后 `sites.owner` 变成 B，B 随即获得
+undeploy / 转移所有权 / 增删协作者的能力；而 `register_route`（第 6 步）早一步
+写入的仍是原 owner A，最终形成 sites 表 owner=B、路由表 owner=A 的分裂状态。
+见 spec §3.3.1。
+
+**本任务必须在 Task 10（放开 collaborator 部署）之前合并。**
+
+- [ ] **Step 1: 写失败测试**
+
+在 `site-builder/deployer/tests/test_finalize_steps.py` 末尾追加：
+
+```python
+def test_mark_success_does_not_change_site_owner(aws):
+    """collaborator 发起的部署成功后，站点 owner 必须不变（spec §3.3.1）。"""
+    import common
+    import mark_job
+    common.upsert_site("s-1", owner="alice@x.com", collaborators=["bob@x.com"],
+                       require_login=True, allowed_users="org")
+    job_id = common.create_job("bob@x.com", "s-1")      # 发起者是协作者
+    mark_job.handler({"job_id": job_id, "site_id": "s-1",
+                      "url": "https://app-s-1.example.com",
+                      "manifest": {"tier": "static", "name": "one"}}, None)
+
+    site = common.get_site("s-1")
+    assert site["owner"] == "alice@x.com"               # 不是 bob
+    assert site["status"] == "ACTIVE"                   # 其余收尾照常
+    assert site["last_job_id"] == job_id
+    assert site["tier"] == "static"
+
+
+def test_mark_success_still_sets_owner_absent_field(aws):
+    """sites 表缺 owner（异常数据）时不因为不写 owner 而永久缺字段——
+    首次部署路径由 do_deploy_site 写入 owner，这里只断言不会崩。"""
+    import common
+    import mark_job
+    common.upsert_site("s-2", name="two")               # 无 owner
+    job_id = common.create_job("carol@x.com", "s-2")
+    mark_job.handler({"job_id": job_id, "site_id": "s-2",
+                      "url": "https://app-s-2.example.com",
+                      "manifest": {"tier": "static", "name": "two"}}, None)
+    assert common.get_site("s-2")["status"] == "ACTIVE"
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `cd site-builder/deployer && .venv/bin/pytest tests/test_finalize_steps.py -q -k owner`
+Expected: FAIL — `assert 'bob@x.com' == 'alice@x.com'`（现实现把发起者写成了 owner）
+
+- [ ] **Step 3: 改实现**
+
+把 `site-builder/deployer/functions/mark_job.py` 的 `handler` 成功分支改为：
+
+```python
+    job = common.get_job(job_id)
+    common.update_job(job_id, status="SUCCEEDED", url=event["url"])
+    # 不写 owner：jobs 表的 owner 字段是**发起者**（requested_by 语义），
+    # 而站点 owner 只由 permissions.transfer_owner 与首次部署的
+    # do_deploy_site 写。二期放开 collaborator 部署后，把发起者写回站点
+    # owner 会让协作者部署一次就夺取所有权（spec §3.3.1）。
+    common.upsert_site(event["site_id"], status="ACTIVE", last_job_id=job_id,
+                       tier=event["manifest"]["tier"],
+                       name=event["manifest"]["name"],
+                       subdomain=common.subdomain_for(event["site_id"]))
+```
+
+`job` 变量若在此之后不再被用到，一并删掉该行（`update_job` 不需要它）——
+用 `grep -n 'job\b' site-builder/deployer/functions/mark_job.py` 确认后再删。
+
+- [ ] **Step 4: 运行测试确认通过**
+
+Run: `cd site-builder/deployer && .venv/bin/pytest tests/test_finalize_steps.py -q`
+Expected: PASS
+
+- [ ] **Step 5: 把 jobs 表的字段语义写进文档**
+
+在 `site-builder/deployer/functions/common.py` 的 `create_job` 上方加注释：
+
+```python
+# jobs 表的 owner 字段是**发起者**（requested_by 语义）：谁按下了这次部署。
+# 它不参与任何授权判定——授权一律走 permissions.py 对 sites 表的角色判定。
+# 保留 owner 这个字段名是为了兼容存量数据与 owner-index GSI。
+```
+
+- [ ] **Step 6: 提交**
+
+```bash
+git add site-builder/deployer/functions/mark_job.py site-builder/deployer/functions/common.py site-builder/deployer/tests/test_finalize_steps.py
+git commit -m "fix(deployer): mark_job 不再把 job 发起者写成站点 owner
+
+放开 collaborator 部署后，原逻辑会让协作者部署一次即夺取所有权
+（并造成 sites/路由表 owner 分裂）。jobs.owner 语义确立为发起者。"
+```
+
+---
+
+## Task 5b: `smoke_test` 改读 effective policy
+
+**Files:**
+- Modify: `site-builder/deployer/functions/smoke_test.py:45-51`
+- Test: `site-builder/deployer/tests/test_finalize_steps.py`
+
+**Interfaces:**
+- Consumes: Task 5 写入的 `event["effective_auth"]`
+- Produces: smoke 断言依据本次实际写入路由的策略，与 manifest 解耦
+
+**故障路径**：线上把 require_login 从 true 改成 false（不重部署），site.json
+仍是 true。下次重部署时 `register_route` 按真源把路由写成公开，`smoke_test`
+按旧 manifest 期待 302，实际拿到 200 → 部署判 FAILED，**而路由切换已经发生**
+（第 6 步早于第 7 步），线上处于"新版本已上线但 job 显示失败"。反方向同样失败。
+见 spec §3.3.2。
+
+- [ ] **Step 1: 写失败测试**
+
+在 `site-builder/deployer/tests/test_finalize_steps.py` 末尾追加：
+
+```python
+def test_smoke_test_uses_effective_auth_not_manifest(aws, monkeypatch):
+    """线上已改成公开、manifest 仍是 true：smoke 必须按公开断言（期待 200）。"""
+    import common
+    import smoke_test
+    job_id = common.create_job("o@x.com", "s-1")
+    calls = []
+
+    def _fake_check(url, require_auth, login_prefix, what):
+        calls.append((url, require_auth))
+
+    monkeypatch.setattr(smoke_test, "_check", _fake_check)
+    smoke_test.handler({"job_id": job_id, "site_id": "s-1",
+                        "url": "https://app-s-1.example.com",
+                        "manifest": {"auth": {"require_login": True}},
+                        "effective_auth": {"require_login": False,
+                                           "allowed_users": "org"}}, None)
+    assert calls and all(require_auth is False for _, require_auth in calls)
+
+
+def test_smoke_test_falls_back_to_manifest_when_effective_absent(aws, monkeypatch):
+    """兼容：老 execution 的 event 里没有 effective_auth（部署过程中升级）。"""
+    import common
+    import smoke_test
+    job_id = common.create_job("o@x.com", "s-1")
+    calls = []
+    monkeypatch.setattr(smoke_test, "_check",
+                        lambda url, ra, lp, what: calls.append(ra))
+    smoke_test.handler({"job_id": job_id, "site_id": "s-1",
+                        "url": "https://app-s-1.example.com",
+                        "manifest": {"auth": {"require_login": True}}}, None)
+    assert calls == [True]
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `cd site-builder/deployer && .venv/bin/pytest tests/test_finalize_steps.py -q -k smoke`
+Expected: FAIL — 第一个测试拿到 `require_auth=True`（现实现读 manifest）
+
+- [ ] **Step 3: 改实现**
+
+把 `site-builder/deployer/functions/smoke_test.py` 的 `handler` 前两行改为：
+
+```python
+def handler(event, context):
+    common.update_job(event["job_id"], phase="smoke-test")
+    # 按本次实际写入路由的策略断言，不按 manifest：用户可能在线改过
+    # require_login，manifest 里是生成代码时的旧值（spec §3.3.2）。
+    # effective_auth 由 register_route 写入；缺失时回落 manifest，
+    # 兼容升级窗口里已在运行的 execution。
+    effective = event.get("effective_auth") or {}
+    require_auth = bool(effective.get("require_login",
+                                      event["manifest"]["auth"]["require_login"]))
+```
+
+- [ ] **Step 4: 运行测试确认通过**
+
+Run: `cd site-builder/deployer && .venv/bin/pytest tests/test_finalize_steps.py -q`
+Expected: PASS
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add site-builder/deployer/functions/smoke_test.py site-builder/deployer/tests/test_finalize_steps.py
+git commit -m "fix(deployer): smoke_test 按 effective policy 断言而非 manifest
+
+在线翻转 require_login 后重部署会被旧 manifest 判成 FAILED（而路由已切换）。"
 ```
 
 ---
@@ -1303,6 +1678,20 @@ def test_skips_platform_routes(aws):
     assert out["scanned"] == 1
 
 
+def test_malformed_allowlist_errors_and_does_not_widen(aws):
+    """损坏的名单必须进 errors 并跳过——绝不能被写成 "org"（扩权）。"""
+    import common
+    import migrate_permissions as mig
+    common.upsert_site("s-bad", owner="o@x.com")
+    _put_route("app-s-bad", "s-bad", allowed="{not json")
+
+    out = mig.migrate("routing", dry_run=False)
+    assert out["migrated"] == []
+    assert out["errors"] and "s-bad" in out["errors"][0]
+    # 真源没被写入任何权限字段，Edge 继续按现行 fail-closed 行为工作
+    assert "allowed_users" not in common.get_site("s-bad")
+
+
 def test_reports_route_without_site_record(aws):
     import migrate_permissions as mig
     _put_route("app-ghost", "ghost")     # sites 表没有对应记录
@@ -1357,8 +1746,18 @@ def _load_config() -> None:
     os.environ.setdefault("AWS_DEFAULT_REGION", cfg["Platform"]["region"])
 
 
+class UnparsableAllowlist(ValueError):
+    pass
+
+
 def _parse_allowed(raw) -> str | list[str]:
-    """路由表的 allowed_users 现状：S 里存 "org" 或 JSON 数组字符串。"""
+    """路由表的 allowed_users 现状：S 里存 "org" 或 JSON 数组字符串。
+
+    **无法解析必须抛错，绝不降级为 "org"**：Edge 现行为是 JSON 解析失败即用
+    空名单（仅 owner 可访问，fail-closed，origin_request.py:308-315）。若迁移
+    把它写成 "org"，下一次部署会把这个值投影到路由表，权限从"仅 owner"扩大成
+    "全体登录用户"——一次数据修复动作变成扩权。见 spec §3.4。
+    """
     if "L" in raw:                       # 已是二期形态
         return [e["S"] for e in raw["L"]]
     value = raw.get("S", "org")
@@ -1366,9 +1765,11 @@ def _parse_allowed(raw) -> str | list[str]:
         return "org"
     try:
         parsed = json.loads(value)
-    except Exception:
-        return "org"                     # 无法解析时按最宽松的 org（Edge 现行为等价）
-    return parsed if isinstance(parsed, list) else "org"
+    except Exception as e:
+        raise UnparsableAllowlist(f"allowed_users 不是合法 JSON: {value!r}") from e
+    if not isinstance(parsed, list):
+        raise UnparsableAllowlist(f"allowed_users 解析后不是数组: {parsed!r}")
+    return parsed
 
 
 def migrate(routing_table: str, *, dry_run: bool = True) -> dict:
@@ -1397,6 +1798,8 @@ def migrate(routing_table: str, *, dry_run: bool = True) -> dict:
                 allowed = permissions.normalize_allowed_users(
                     _parse_allowed(item.get("allowed_users", {})))
             except ValueError as e:
+                # UnparsableAllowlist 也是 ValueError 的子类，一并落在这里：
+                # 报告并跳过，由人工判断原意后手工修——不自动放宽。
                 report["errors"].append(f"{site_id}: allowed_users 无法规范化（{e}）")
                 continue
             report["migrated"].append(site_id)
@@ -1747,6 +2150,10 @@ git commit -m "docs(deploy): 二期 M2 权限真源迁移步骤与部署顺序�
 - Modify: `site-builder/mcp/deploy_agentcore.py`（复制 `permissions.py`；IAM 加 admins 表）
 - Modify: `site-builder/mcp/tests/test_tools.py`
 
+**依赖**：**Task 5a 必须先合并**——放开 collaborator 部署的同时若 `mark_job`
+还在把 job 发起者写成站点 owner，collaborator 部署一次就会夺取所有权
+（spec §3.3.1）。
+
 **Interfaces:**
 - Consumes: `permissions.role_of/can/assert_can/is_admin/PermissionDenied`、`common.list_sites_for_user`
 - Produces: `server.py` 里 `_assert_permission(email, site_id, action, what) -> dict`（返回 site 记录）；`do_list_sites` 返回项多一个 `role` 字段
@@ -1797,6 +2204,19 @@ def test_admin_can_undeploy_others_site(aws):
     common.upsert_site("app-abc123", owner="o@x.com", collaborators=[])
     out = server.do_undeploy("adm@x.com", "app-abc123")
     assert out["job_id"]
+
+
+def test_collaborator_deploy_does_not_change_owner(aws):
+    """与 Task 5a 配套的回归：collaborator 走部署入口后 owner 不变。
+
+    完整 SFN 后的断言在 Task 12 的真机 E2E；这里锁住 MCP 侧入口不会自己
+    改 owner。
+    """
+    import common
+    import server
+    common.upsert_site("app-abc123", owner="o@x.com", collaborators=["c@x.com"])
+    server.do_deploy_site("c@x.com", "app", "app-abc123")
+    assert common.get_site("app-abc123")["owner"] == "o@x.com"
 
 
 def test_collaborator_can_read_status(aws):
@@ -1983,7 +2403,7 @@ git commit -m "feat(mcp): 换用 permissions 角色判定；list_my_sites 走 GS
 - Modify: `site-builder/mcp/tests/test_agentcore_contract.py:70-78`（工具数 5 → 8）
 
 **Interfaces:**
-- Consumes: Task 2 的 `permissions.set_access_policy` / `set_collaborators` / `transfer_owner` / `sync_route_projection`、Task 10 的 `_assert_permission`
+- Consumes: Task 2 的 `permissions.set_access_policy` / `set_collaborators` / `transfer_owner`（三者内部走 `write_permissions` 事务）、`permissions.PermissionConflict`、Task 10 的 `_assert_permission`
 - Produces:
   - `do_update_permissions(caller, site_id, require_login=None, allowed_users=None) -> dict`
   - `do_manage_collaborators(caller, site_id, add=None, remove=None, transfer_owner=None) -> dict`
@@ -2116,6 +2536,20 @@ def test_get_permissions_rejects_outsider(aws):
         server.do_get_permissions("x@x.com", SITE_ID)
 
 
+def test_update_permissions_surfaces_conflict(aws, monkeypatch):
+    """permissions 层的并发冲突必须被转成 MCP 侧的可读异常，不能漏成 500。"""
+    import permissions
+    import server
+    _seed_site_and_route()
+
+    def _boom(*a, **kw):
+        raise permissions.PermissionConflict("站点权限已被其他人修改，请刷新后重试")
+
+    monkeypatch.setattr(permissions, "set_access_policy", _boom)
+    with pytest.raises(server.PermissionConflict):
+        server.do_update_permissions("o@x.com", SITE_ID, require_login=False)
+
+
 def test_update_permissions_works_before_first_deploy(aws):
     """站点还没部署成功（无路由 item）时改权限不能炸——只更新真源即可。"""
     import common
@@ -2134,36 +2568,44 @@ Expected: FAIL — `AttributeError: module 'server' has no attribute 'do_update_
 
 - [ ] **Step 3: 写实现（纯函数层 + 路由投影）**
 
-在 `site-builder/mcp/server.py` 的 `do_undeploy` 之后追加（路由投影用 Task 2 的 `permissions.sync_route_projection`，不在这里重复实现）：
+在 `site-builder/mcp/server.py` 的 `do_undeploy` 之后追加。两表写入由 Task 2 的
+`permissions.write_permissions` 事务完成（`set_access_policy` / `set_collaborators`
+/ `transfer_owner` 内部就走它），**这里不再单独同步路由**——否则又变回顺序两写：
 
 ```python
+class PermissionConflict(Exception):
+    """并发修改。MCP 工具把它转成可读文案让 Agent 提示用户重试。"""
+
+
 def do_update_permissions(caller: str, site_id: str, require_login=None,
                           allowed_users=None) -> dict:
     _assert_permission(caller, site_id, "set_access_policy", f"站点 {site_id}")
-    out = permissions.set_access_policy(site_id, actor=caller,
-                                        require_login=require_login,
-                                        allowed_users=allowed_users)
-    permissions.sync_route_projection(site_id)
+    try:
+        out = permissions.set_access_policy(site_id, actor=caller,
+                                            require_login=require_login,
+                                            allowed_users=allowed_users)
+    except permissions.PermissionConflict as e:
+        raise PermissionConflict(str(e)) from e
     out["note"] = "已生效，边缘缓存最多 1 分钟后全网一致"
     return out
 
 
 def do_manage_collaborators(caller: str, site_id: str, add=None, remove=None,
                             transfer_owner=None) -> dict:
-    if transfer_owner:
-        _assert_permission(caller, site_id, "transfer_owner", f"站点 {site_id}")
-        out = permissions.transfer_owner(site_id, actor=caller,
-                                        new_owner=transfer_owner)
-    else:
+    try:
+        if transfer_owner:
+            _assert_permission(caller, site_id, "transfer_owner", f"站点 {site_id}")
+            return permissions.transfer_owner(site_id, actor=caller,
+                                              new_owner=transfer_owner)
         if not add and not remove:
             raise ValueError("需要指定 add / remove / transfer_owner 之一")
         _assert_permission(caller, site_id, "manage_collaborators", f"站点 {site_id}")
         collaborators = permissions.set_collaborators(site_id, actor=caller,
                                                       add=add, remove=remove)
         site = common.get_site(site_id) or {}
-        out = {"owner": site.get("owner", ""), "collaborators": collaborators}
-    permissions.sync_route_projection(site_id)
-    return out
+        return {"owner": site.get("owner", ""), "collaborators": collaborators}
+    except permissions.PermissionConflict as e:
+        raise PermissionConflict(str(e)) from e
 
 
 def do_get_permissions(caller: str, site_id: str) -> dict:
@@ -2326,6 +2768,48 @@ aws dynamodb get-item --table-name site-sites --region us-east-1 \
   --key '{"site_id":{"S":"<site_id>"}}' --query 'Item.allowed_users'
 ```
 Expected: 仍是你在线改的名单（不是 `"org"`）——这是 Task 5 的核心保证。
+
+- [ ] **Step 4b: [真机] 在线翻转 require_login 后重部署（两个方向）**
+
+这条覆盖 Task 5b 的 smoke_test 取值路径——改前必失败。
+
+1. 对一个 `require_login=true` 的站点调
+   `update_site_permissions(site_id, require_login=False)`；
+2. 等 65s 后确认站点公开可访问（`curl` 直接 200，不再 302）；
+3. 重部署该站点（site.json 里 `auth.require_login` 仍是 `true`）；
+4. Expected: 部署 **SUCCEEDED**（改前会因 smoke 按 manifest 期待 302 而
+   FAILED），且站点仍是公开的；
+5. 反方向再来一次：`update_site_permissions(site_id, require_login=True)`
+   → 等 65s → 确认 302 → 重部署 → 仍 SUCCEEDED。
+
+Run（部署后查 job 状态与线上行为）:
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" https://app-<site_id>.<base_domain>/
+```
+
+- [ ] **Step 4c: [真机] collaborator 完整部署后 owner 不变（P0 验收）**
+
+这是 spec §3.3.1 的核心回归，**必须跑完整 SFN**，不能只测"拿到 upload_url"。
+
+1. 给站点加一个协作者（用你的第二个账号，或临时把自己设为协作者、
+   另一个邮箱设为 owner）；
+2. 以 **collaborator 身份**走完整部署（deploy_site → 上传 → confirm_upload
+   → 轮询到 SUCCEEDED）；
+3. 验证两张表的 owner 都没变：
+
+Run:
+```bash
+SID=<site_id>
+aws dynamodb get-item --table-name site-sites --region us-east-1 \
+  --key "{\"site_id\":{\"S\":\"$SID\"}}" \
+  --query 'Item.{owner:owner.S,collab:collaborators.L[*].S}'
+aws dynamodb get-item --region us-east-1 \
+  --table-name "$(python3 -c "
+import configparser;c=configparser.ConfigParser();c.read('site-builder/config.ini');print(c['Platform']['routing_table'])")" \
+  --key "{\"subdomain\":{\"S\":\"app-$SID\"}}" --query 'Item.owner.S'
+```
+Expected: 两处 owner 都是**原 owner**，不是发起部署的协作者；且两处一致
+（不出现 sites=B / 路由=A 的分裂）。改前这里会看到 sites.owner 变成协作者。
 
 - [ ] **Step 5: [真机] 验证协作者权限边界**
 
@@ -2737,8 +3221,32 @@ def test_pool_config_has_email_attribute():
     assert "email" in cfg["AutoVerifiedAttributes"]
 
 
+def test_pool_config_disables_self_signup():
+    """P0：允许自注册会让 allowed_users="org" 失去"组织"语义。
+
+    Edge 对 org 的判定只是"持有有效平台会话"，不查邮箱域；若任何人能自注册，
+    就等于所有 org 站点对整个互联网开放（spec §3.5）。
+    """
+    cfg = dp.pool_config("example.com")
+    assert cfg["AdminCreateUserConfig"]["AllowAdminCreateUserOnly"] is True
+
+
+def test_production_clients_exclude_local_cognito_users(idp_name="Okta"):
+    """生产 client 不能放 COGNITO——否则托管登录仍暴露本地登录/注册入口。"""
+    clients = dp.client_configs("example.com", [], idp_name=idp_name)
+    for key in ("site", "mcp"):
+        assert clients[key]["SupportedIdentityProviders"] == [idp_name]
+        assert "COGNITO" not in clients[key]["SupportedIdentityProviders"]
+
+
+def test_clients_fall_back_to_cognito_only_without_idp():
+    """未配 IdP 时（首次部署、联邦还没接）允许 COGNITO，但脚本要显式告警。"""
+    clients = dp.client_configs("example.com", [], idp_name=None)
+    assert clients["site"]["SupportedIdentityProviders"] == ["COGNITO"]
+
+
 def test_site_client_callback_is_auth_subdomain():
-    clients = dp.client_configs("example.com", [])
+    clients = dp.client_configs("example.com", [], idp_name="Okta")
     assert clients["site"]["CallbackURLs"] == ["https://auth.example.com/callback"]
 
 
@@ -2748,37 +3256,38 @@ def test_site_client_is_confidential():
 
 
 def test_site_client_flows():
-    site = dp.client_configs("example.com", [])["site"]
+    site = dp.client_configs("example.com", [], idp_name="Okta")["site"]
     assert site["AllowedOAuthFlows"] == ["code"]
     assert set(site["AllowedOAuthScopes"]) == {"openid", "email", "profile"}
 
 
 def test_mcp_client_includes_localhost_callback():
-    clients = dp.client_configs("example.com", [])
+    clients = dp.client_configs("example.com", [], idp_name="Okta")
     # 18765：8765/8766 被 Quick Desktop 常驻占用（一期实测）
     assert "http://localhost:18765/callback" in clients["mcp"]["CallbackURLs"]
 
 
 def test_mcp_client_accepts_extra_callbacks():
     clients = dp.client_configs("example.com",
-                                ["https://agentcore.example/identities/cb"])
+                                ["https://agentcore.example/identities/cb"],
+                                idp_name="Okta")
     assert "https://agentcore.example/identities/cb" in clients["mcp"]["CallbackURLs"]
 
 
 def test_mcp_client_is_public():
     # MCP 客户端（Claude Code 等）无法安全保存 secret
-    assert dp.client_configs("example.com", [])["mcp"]["GenerateSecret"] is False
+    assert dp.client_configs("example.com", [], idp_name="Okta")["mcp"]["GenerateSecret"] is False
 
 
 def test_machine_client_uses_client_credentials():
-    machine = dp.client_configs("example.com", [])["machine"]
+    machine = dp.client_configs("example.com", [], idp_name="Okta")["machine"]
     assert machine["AllowedOAuthFlows"] == ["client_credentials"]
     assert machine["GenerateSecret"] is True
     assert machine["CallbackURLs"] == []
 
 
 def test_machine_client_has_no_user_flows():
-    machine = dp.client_configs("example.com", [])["machine"]
+    machine = dp.client_configs("example.com", [], idp_name="Okta")["machine"]
     assert "code" not in machine["AllowedOAuthFlows"]
 ```
 
@@ -2840,12 +3349,24 @@ def pool_config(base_domain: str) -> dict:
         "UsernameAttributes": ["email"],
         "Schema": [{"Name": "email", "AttributeDataType": "String",
                     "Required": True, "Mutable": True}],
-        "AdminCreateUserConfig": {"AllowAdminCreateUserOnly": False},
+        # AllowAdminCreateUserOnly=True 关闭自注册。这是 allowed_users="org"
+        # 的安全前提：Edge 对 org 的判定只是"持有有效平台会话"，不查邮箱域，
+        # 所以 pool 里绝不能有非企业身份（spec §3.5）。
+        "AdminCreateUserConfig": {"AllowAdminCreateUserOnly": True},
         "UserPoolTags": {"project": "site-builder", "managed_by": "deploy_pool.py"},
     }
 
 
-def client_configs(base_domain: str, extra_mcp_callbacks: list[str]) -> dict:
+def client_configs(base_domain: str, extra_mcp_callbacks: list[str],
+                   idp_name: str | None = None) -> dict:
+    """三个 app client 的参数。
+
+    idp_name 给出时，site/mcp 的 SupportedIdentityProviders **只列该 IdP**，
+    不含 COGNITO——否则托管登录页仍暴露本地用户登录/注册入口，
+    allowed_users="org" 的语义就被击穿（spec §3.5）。未给出时回落
+    ["COGNITO"]（首次部署、联邦还没接），main() 会显式告警。
+    """
+    providers = [idp_name] if idp_name else ["COGNITO"]
     site = {
         "ClientName": "site-builder-site",
         "GenerateSecret": True,
@@ -2854,7 +3375,7 @@ def client_configs(base_domain: str, extra_mcp_callbacks: list[str]) -> dict:
         "AllowedOAuthScopes": ["openid", "email", "profile"],
         "CallbackURLs": [f"https://auth.{base_domain}/callback"],
         "LogoutURLs": [f"https://auth.{base_domain}/logout"],
-        "SupportedIdentityProviders": ["COGNITO"],
+        "SupportedIdentityProviders": providers,
         "ExplicitAuthFlows": ["ALLOW_REFRESH_TOKEN_AUTH"],
     }
     mcp = {
@@ -2864,7 +3385,7 @@ def client_configs(base_domain: str, extra_mcp_callbacks: list[str]) -> dict:
         "AllowedOAuthFlowsUserPoolClient": True,
         "AllowedOAuthScopes": ["openid", "email", "profile"],
         "CallbackURLs": [MCP_LOCALHOST_CALLBACK] + list(extra_mcp_callbacks),
-        "SupportedIdentityProviders": ["COGNITO"],
+        "SupportedIdentityProviders": providers,
         "ExplicitAuthFlows": ["ALLOW_REFRESH_TOKEN_AUTH"],
     }
     machine = {
@@ -2874,6 +3395,7 @@ def client_configs(base_domain: str, extra_mcp_callbacks: list[str]) -> dict:
         "AllowedOAuthFlowsUserPoolClient": True,
         "AllowedOAuthScopes": [],   # 建 resource server 后回填（M4）
         "CallbackURLs": [],
+        # machine 走 client_credentials，与用户身份无关
         "SupportedIdentityProviders": ["COGNITO"],
     }
     return {"site": site, "mcp": mcp, "machine": machine}
@@ -2918,7 +3440,8 @@ def _ensure_domain(cog, pool_id: str, prefix: str) -> str:
 
 
 def _ensure_clients(cog, pool_id: str, base_domain: str,
-                    extra_mcp_callbacks: list[str]) -> dict:
+                    extra_mcp_callbacks: list[str],
+                    idp_name: str | None = None) -> dict:
     existing = {}
     token = None
     while True:
@@ -2931,7 +3454,8 @@ def _ensure_clients(cog, pool_id: str, base_domain: str,
             break
 
     out = {}
-    for key, params in client_configs(base_domain, extra_mcp_callbacks).items():
+    for key, params in client_configs(base_domain, extra_mcp_callbacks,
+                                      idp_name).items():
         name = params["ClientName"]
         if name in existing:
             client_id = existing[name]
@@ -2972,6 +3496,28 @@ def _ensure_oidc_idp(cog, pool_id: str, idp: dict) -> None:
         print(f"  新建 IdP {name}")
 
 
+def _store_client_secrets(cog, pool_id: str, clients: dict, region: str) -> None:
+    """client secret 直接写 SSM SecureString，**不打印明文**。
+
+    不要改成打印 `aws ssm put-parameter --value '<secret>'` 让人手敲：
+    那会把凭证留在 shell history、终端回滚缓冲与 agent transcript 里，
+    执行时还会出现在进程参数（ps 可见）。
+    """
+    import boto3
+    ssm = boto3.client("ssm", region_name=region)
+    for key, param in (("site", "/site-builder/site-client-secret"),
+                       ("machine", "/site-builder/machine-client-secret")):
+        secret = cog.describe_user_pool_client(
+            UserPoolId=pool_id, ClientId=clients[key])["UserPoolClient"].get(
+                "ClientSecret", "")
+        if not secret:
+            print(f"  {param}: 该 client 无 secret（public client），跳过")
+            continue
+        ssm.put_parameter(Name=param, Value=secret, Type="SecureString",
+                          Overwrite=True)
+        print(f"  {param}: 已写入（长度 {len(secret)}）")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--domain-prefix", default="site-builder-auth",
@@ -2986,42 +3532,38 @@ def main() -> None:
     base_domain = cfg["Platform"]["base_domain"]
     cog = boto3.client("cognito-idp", region_name=region)
 
-    print("① user pool")
+    print("① user pool（禁自注册）")
     pool_id = _ensure_pool(cog, base_domain)
 
     print("② 托管域名")
     domain_prefix = _ensure_domain(cog, pool_id, args.domain_prefix)
 
-    print("③ app clients")
-    clients = _ensure_clients(cog, pool_id, base_domain, args.mcp_callback)
-
+    # IdP 必须先建：client 的 SupportedIdentityProviders 要引用它的名字，
+    # 且生产 client 不放 COGNITO（spec §3.5）——顺序颠倒会因 provider
+    # 不存在而 InvalidParameterException。
+    idp_name = None
     if cfg.has_section("IdP") and cfg["IdP"].get("provider_name"):
-        print("④ OIDC IdP 联邦")
+        print("③ OIDC IdP 联邦")
         idp = dict(cfg["IdP"])
         _ensure_oidc_idp(cog, pool_id, idp)
-        for key in ("site", "mcp"):
-            cog.update_user_pool_client(
-                UserPoolId=pool_id, ClientId=clients[key],
-                **{**client_configs(base_domain, args.mcp_callback)[key],
-                   "SupportedIdentityProviders": ["COGNITO", idp["provider_name"]]},
-                **{"GenerateSecret": None} if False else {})
-        print(f"  已把 {idp['provider_name']} 加进 site/mcp client")
+        idp_name = idp["provider_name"]
     else:
-        print("④ 跳过 IdP 联邦（config.ini 无 [IdP] 段）——"
-              "标准 IdP 或飞书适配器参数见 DEPLOY.md ①")
+        print("③ 跳过 IdP 联邦（config.ini 无 [IdP] 段）")
+        print("   ⚠️  未接企业 IdP：site/mcp client 暂时只能用 COGNITO 本地用户。")
+        print("      此状态下 allowed_users=\"org\" 不代表\"全组织\"——")
+        print("      接上 IdP 后重跑本脚本，client 会切成仅该 IdP。")
 
-    print("⑤ pre-token 触发器（email 注入 access token）")
+    print("④ app clients")
+    clients = _ensure_clients(cog, pool_id, base_domain, args.mcp_callback, idp_name)
+
+    print("⑤ pre-token 触发器（注入 email + idp claim）")
     sys.path.insert(0, str(HERE.parent / "auth"))
     import deploy_auth
     role_arn = deploy_auth.ensure_lambda_role()
     deploy_auth.ensure_pre_token_trigger(role_arn, pool_id=pool_id)
 
-    secret = cog.describe_user_pool_client(
-        UserPoolId=pool_id, ClientId=clients["site"])["UserPoolClient"].get(
-            "ClientSecret", "")
-    machine_secret = cog.describe_user_pool_client(
-        UserPoolId=pool_id, ClientId=clients["machine"])["UserPoolClient"].get(
-            "ClientSecret", "")
+    print("⑥ client secret → SSM")
+    _store_client_secrets(cog, pool_id, clients, region)
 
     print("\n回填 site-builder/config.ini：")
     print(f"  [Cognito] user_pool_id = {pool_id}")
@@ -3029,29 +3571,16 @@ def main() -> None:
     print(f"  [Cognito] site_client_id = {clients['site']}")
     print(f"  [Cognito] mcp_client_id = {clients['mcp']}")
     print(f"  [Cognito] machine_client_id = {clients['machine']}")
-    print("\n把 client secret 写进 SSM（不要落到文件里）：")
-    print(f"  aws ssm put-parameter --name /site-builder/site-client-secret "
-          f"--type SecureString --overwrite --region {region} --value '{secret}'")
-    print(f"  aws ssm put-parameter --name /site-builder/machine-client-secret "
-          f"--type SecureString --overwrite --region {region} --value '{machine_secret}'")
+    if idp_name:
+        print(f"\n在 IdP（{idp_name}）侧把这个回调加进白名单：")
+        print(f"  https://{domain_prefix}.auth.{region}.amazoncognito.com/oauth2/idpresponse")
 
 
 if __name__ == "__main__":
     main()
 ```
 
-**注意**：上面 `_ensure_clients` 之后给 client 追加 IdP 的那段有多余的字典技巧，实现时简化为直接构造参数：
-
-```python
-        for key in ("site", "mcp"):
-            params = client_configs(base_domain, args.mcp_callback)[key]
-            params.pop("GenerateSecret", None)   # update 不接受此参数
-            params["SupportedIdentityProviders"] = ["COGNITO", idp["provider_name"]]
-            cog.update_user_pool_client(UserPoolId=pool_id,
-                                        ClientId=clients[key], **params)
-```
-
-- [ ] **Step 4: 改 deploy_auth.ensure_pre_token_trigger 支持传 pool_id**
+- [ ] **Step 4: 改 deploy_auth.ensure_pre_token_trigger：支持 pool_id + 按 pool 区分 StatementId**
 
 修改 `site-builder/auth/deploy_auth.py` 的 `ensure_pre_token_trigger` 签名与首行：
 
@@ -3070,7 +3599,115 @@ def ensure_pre_token_trigger(role_arn: str, pool_id: str | None = None) -> None:
     pool_id = pool_id or CFG["Cognito"]["user_pool_id"]
 ```
 
-（函数体其余不变。）
+**同一函数里把 `add_permission` 的 StatementId 改为按 pool 区分**（这是 M1
+切换能否成功的关键——见下方说明）：
+
+```python
+    # StatementId 必须带 pool 标识：固定 id + 吞掉 ResourceConflictException
+    # 会让新 pool 的授权永远加不上（旧语句已占用该 id，但它的 SourceArn 绑的是
+    # 旧 pool）→ 新 pool 调用触发器被拒 → email/idp claim 注入失败，
+    # MCP 的 owner 识别整条链断掉，token 签发本身也可能报 trigger 错误。
+    # 迁移期新旧两条语句并存，验证通过后再删旧的。
+    sid = "cognito-invoke-" + re.sub(r"[^A-Za-z0-9-]", "-", pool_id)
+    try:
+        lam.add_permission(FunctionName=fn, StatementId=sid,
+                           Action="lambda:InvokeFunction",
+                           Principal="cognito-idp.amazonaws.com",
+                           SourceArn=f"arn:aws:cognito-idp:{REGION}:"
+                                     f"{CFG['Platform']['account_id']}:userpool/{pool_id}")
+        print(f"  已授权 {pool_id} 调用 {fn}（{sid}）")
+    except lam.exceptions.ResourceConflictException:
+        pass  # 同一 pool 重复运行，幂等
+```
+
+文件顶部 import 区加 `import re`。**保留**历史的 `cognito-invoke` 语句不动
+（旧 pool 仍在用），M1 验证通过后由 Task 15 Step 9 显式删除。
+
+- [ ] **Step 4b: 扩展 pre-token 触发器注入 `idp` claim**
+
+`allowed_users="org"` 的纵深防御需要 Edge 能判断会话来自哪个 IdP
+（spec §3.5）。改 `site-builder/auth/pre_token_email.py`：
+
+```python
+def handler(event, context):
+    attrs = event["request"]["userAttributes"]
+    claims = {}
+    email = attrs.get("email", "")
+    if email:
+        claims["email"] = email
+    # 联邦用户的 identities 是 JSON 字符串（Cognito 传参形态），
+    # 本地用户没有该属性——没有 idp claim 正是 Edge 要拦的信号。
+    idp = _provider_name(attrs.get("identities", ""))
+    if idp:
+        claims["idp"] = idp
+    if claims:
+        event["response"]["claimsAndScopeOverrideDetails"] = {
+            "accessTokenGeneration": {"claimsToAddOrOverride": claims}}
+    return event
+
+
+def _provider_name(identities) -> str:
+    """从 identities 属性取 providerName。形态在真机 spike 确认（Task 15）。"""
+    import json
+    if not identities:
+        return ""
+    try:
+        parsed = json.loads(identities) if isinstance(identities, str) else identities
+    except Exception:
+        return ""
+    if isinstance(parsed, list) and parsed:
+        first = parsed[0]
+        if isinstance(first, dict):
+            return str(first.get("providerName", ""))
+    return ""
+```
+
+配套单测 `site-builder/auth/tests/test_pre_token.py`：
+
+```python
+import pre_token_email as pt
+
+
+def _event(attrs):
+    return {"request": {"userAttributes": attrs}, "response": {}}
+
+
+def test_injects_email_and_idp_for_federated_user():
+    ev = pt.handler(_event({
+        "email": "a@x.com",
+        "identities": '[{"providerName":"Feishu","userId":"u1"}]'}), None)
+    claims = ev["response"]["claimsAndScopeOverrideDetails"][
+        "accessTokenGeneration"]["claimsToAddOrOverride"]
+    assert claims == {"email": "a@x.com", "idp": "Feishu"}
+
+
+def test_local_user_gets_no_idp_claim():
+    """本地用户没有 idp claim——这正是 Edge 要拦的信号（spec §3.5）。"""
+    ev = pt.handler(_event({"email": "local@x.com"}), None)
+    claims = ev["response"]["claimsAndScopeOverrideDetails"][
+        "accessTokenGeneration"]["claimsToAddOrOverride"]
+    assert claims == {"email": "local@x.com"}
+    assert "idp" not in claims
+
+
+def test_malformed_identities_does_not_raise():
+    ev = pt.handler(_event({"email": "a@x.com", "identities": "{not json"}), None)
+    claims = ev["response"]["claimsAndScopeOverrideDetails"][
+        "accessTokenGeneration"]["claimsToAddOrOverride"]
+    assert claims == {"email": "a@x.com"}
+
+
+def test_no_attributes_leaves_response_untouched():
+    ev = pt.handler(_event({}), None)
+    assert ev["response"] == {}
+```
+
+Run: `cd site-builder/auth && ../contract/.venv/bin/pytest tests/test_pre_token.py -q`
+Expected: PASS（4 passed）
+
+**注意**：`identities` 属性的确切形态（是 JSON 字符串还是已解析的 list、
+首次登录时是否就位）列为 Task 15 的真机 spike——`_provider_name` 对两种形态
+都容错，spike 后按实测收紧或补注释。
 
 - [ ] **Step 5: 运行测试确认通过**
 
@@ -3124,7 +3761,33 @@ Run:
 ```bash
 python3 site-builder/scripts/deploy_pool.py --domain-prefix <全局唯一前缀>
 ```
-Expected: 打印新 pool id、三个 client id、两条 SSM 写入命令。执行那两条 SSM 命令。
+Expected: 打印新 pool id、三个 client id，以及"已写入"两条 SSM 参数
+（脚本内部直接 `put_parameter`，**不打印 secret 明文**）。同时打印要在 IdP 侧
+加白名单的 `/oauth2/idpresponse` 回调地址。
+
+- [ ] **Step 1b: [真机] 验证自注册确实被关闭（P0 验收）**
+
+Run:
+```bash
+POOL=<新 pool id>; CLIENT=<site_client_id>
+aws cognito-idp sign-up --region us-east-1 --client-id "$CLIENT" \
+  --username probe-$(od -An -N2 -tu2 /dev/urandom | tr -d ' ')@example.com \
+  --password 'ProbeOnly!2026x' 2>&1 | tail -3
+```
+Expected: 失败。可接受的错误是 `NotAuthorizedException`（SignUp is not
+permitted / 自注册已禁用）或 `InvalidParameterException`。**若返回
+`UserSid`/`CodeDeliveryDetails` 即注册成功——立刻停下**：说明
+`AllowAdminCreateUserOnly` 没生效，`allowed_users="org"` 的语义被击穿
+（spec §3.5），修好再继续。
+
+Run（同时确认托管登录页没有本地登录/注册入口）:
+```bash
+curl -s "https://<domain-prefix>.auth.us-east-1.amazoncognito.com/login\
+?response_type=code&client_id=$CLIENT&redirect_uri=https://auth.<base_domain>/callback" \
+  | grep -ci 'signup\|forgot-password\|name="username"' || echo "0（无本地登录表单）"
+```
+Expected: `0`——生产 client 的 `SupportedIdentityProviders` 只有企业 IdP 时，
+Cognito 会直接跳转 IdP 而不渲染本地表单。非 0 说明 client 里还留着 `COGNITO`。
 
 - [ ] **Step 2: [真机 spike] IdP 回调 URL 追加**
 
@@ -3177,6 +3840,59 @@ Expected: OAuth 成功；`list_my_sites` 返回的站点 owner 是你的邮箱�
 
 若报 401 `Claim 'client_id' value mismatch`：确认客户端发的是 access token 而非 id_token（一期钉死的约束，不要改 `allowedAudience`）。
 
+- [ ] **Step 6b: [真机 spike] 确认 access token 里有 `idp` claim**
+
+登录后从 MCP 侧或用 CLI 拿一个 access token，解开 payload：
+
+Run:
+```bash
+python3 -c "
+import base64, json, sys
+tok = sys.argv[1].split('.')[1]
+print(json.dumps(json.loads(base64.urlsafe_b64decode(tok + '=' * (-len(tok) % 4))),
+                 indent=2, ensure_ascii=False))" '<access_token>'
+```
+Expected: payload 含 `email` 与 **`idp`**（值为 IdP provider 名，如 `Feishu`
+或 `Okta`）。这条是 spec §3.5 纵深防御的数据来源。
+
+若 `idp` 缺失：确认 `identities` 属性在 pre-token event 里的实际形态
+（在 `pre_token_email.py` 里临时 `print(json.dumps(event["request"]["userAttributes"]))`
+后看 CloudWatch 日志），按实测调 `_provider_name`。**把结论写进 DEPLOY.md**
+——这是 spec §10 的 spike 4。
+
+- [ ] **Step 6c: [真机] Edge 的 `idp` 校验与开关翻转**
+
+`REQUIRE_IDP_CLAIM` 的翻转属于本模块的验收项（Edge 侧代码在 M1 的 Edge 改动
+里一并部署，占位符默认 `false`）：
+
+1. 确认全部用户已重新登录（旧会话 cookie 里没有 `idp` claim）：距切换
+   ≥24h（会话 TTL 86400s）即可保证旧 cookie 全部过期；
+2. 把 `router/config.ini` 的 `require_idp_claim` 置 `true`，重部署路由层
+   （`rm -rf cdk.out` 后 deploy）；
+3. 验证：正常登录仍可访问鉴权站点；用 `JWT_SECRET` 手工 mint 一个**不含
+   `idp` claim** 的会话 cookie，访问 org 站点应被 302 回登录（而不是放行）。
+
+Run（手工 mint 无 idp 的 cookie 做负向验证）:
+```bash
+python3 -c "
+import base64, hashlib, hmac, json, time, sys
+secret = sys.argv[1]
+b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b'=').decode()
+h = b64(json.dumps({'alg':'HS256','typ':'JWT'},separators=(',',':')).encode())
+p = b64(json.dumps({'email':'probe@x.com','name':'probe',
+                    'exp':int(time.time())+300},separators=(',',':')).encode())
+sig = b64(hmac.new(secret.encode(), f'{h}.{p}'.encode(), hashlib.sha256).digest())
+print(f'{h}.{p}.{sig}')" "$(aws ssm get-parameter --name /site-builder/jwt-secret \
+  --with-decryption --region us-east-1 --query Parameter.Value --output text)"
+```
+然后带上该 cookie 请求站点：
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" -H "Cookie: sb_session=<上面输出>" \
+  https://app-<site_id>.<base_domain>/
+```
+Expected: `302`（被当作未登录）。开关为 false 时这里会是 200——**先确认开关
+已生效再判断结果**。
+
 - [ ] **Step 7: [真机 spike] 标准 IdP 分支验证**
 
 在新 pool 上加一个标准 IdP（Okta 试用租户或 Azure AD），只需 `[IdP]` 段换成它的参数重跑 `deploy_pool.py`，然后用该 IdP 的账号走一次站点登录。
@@ -3205,6 +3921,23 @@ aws cognito-idp list-user-pool-clients --user-pool-id <旧 pool id> \
   --region us-east-1 --query 'UserPoolClients[].{Name:ClientName,Id:ClientId}'
 ```
 Expected: 能区分出平台的两个 client。删除前**与 Quick SSO 的使用方确认**——这一步不可逆。若不确定，跳过删除，只在文档里记录"旧 pool 的平台 client 已废弃"。
+
+同时清掉 pre-token Lambda 上绑旧 pool 的那条历史授权语句（Task 14 Step 4
+保留它是为了迁移期两 pool 并存）：
+
+Run（先看现有语句）:
+```bash
+aws lambda get-policy --function-name site-auth-pre-token --region us-east-1 \
+  --query Policy --output text | python3 -m json.tool | grep -A2 '"Sid"'
+```
+Expected: 能看到 `cognito-invoke`（旧，绑旧 pool）与
+`cognito-invoke-<新 pool id>`。确认新 pool 那条在、且新 pool 登录已验证通过后：
+```bash
+aws lambda remove-permission --function-name site-auth-pre-token \
+  --region us-east-1 --statement-id cognito-invoke
+```
+Expected: 无输出即成功。**顺序不能反**——先删后验证会让旧 pool 的登录立刻失败
+（若还有人在用旧 pool）。
 
 - [ ] **Step 10: 改写 DEPLOY.md ① 阶段**
 
@@ -3287,6 +4020,19 @@ cd site-builder/mcp && python3 -m pytest tests -q
 ```
 Expected: 全部 PASS。记录每个包的测试数（contract 应仍是 67；其余各有增长）。
 
+- [ ] **Step 1b: [真机] 两表事务的失败路径**
+
+验证 spec §3.2 承诺的"不会留下 sites 私有 / Edge 公开"：临时给 MCP runtime
+角色（或本地跑 `permissions.write_permissions` 用的身份）拒掉路由表
+`UpdateItem`，然后对一个**当前公开**的站点执行"改成需登录"。
+
+Expected: 调用报错；`site-sites` 的 `require_login` **仍为 false**（真源没被
+单边改动），路由表也没变。验完恢复 IAM。
+
+若不便改 IAM，退一步用单测里的 `_ALLOW_ROUTE_ABSENT=False` 路径已覆盖同一
+不变量（Task 2 的 `test_write_permissions_rolls_back_when_route_write_fails`）
+——那时在这里记录"以单测覆盖，未做真机注入"，不要写成已真机验证。
+
 - [ ] **Step 2: [真机] 冒烟路由层**
 
 Run: `bash site-builder/scripts/smoke_router.sh`
@@ -3314,6 +4060,17 @@ Expected: 4 passed（约 6 分钟）。这条验证权限真源改造没有破�
 - **路由表新增 DynamoDB `L` 类型字段**（`allowed_users` 名单、
   `collaborators`）：Edge 的 `_deser` 必须先支持 `L` 才能部署写侧——
   顺序颠倒会让名单读成 `False`（等于全员放行）。加新字段类型时同理。
+- **权限写入只走 `permissions.write_permissions`**（两表 `TransactWriteItems`）。
+  别在别处写"先改 sites 再同步路由"：收紧权限时第二步失败会留下 sites 已私有、
+  Edge 仍公开的安全状态错误。
+- **`allowed_users="org"` 依赖 pool 侧两道约束**：关自注册
+  （`AllowAdminCreateUserOnly=True`）+ 生产 client 只列企业 IdP（不含
+  `COGNITO`）。Edge 对 org 只检查"有有效会话"，不查邮箱域——放宽这两条等于
+  把全部 org 站点对公网开放。纵深防御是会话 JWT 的 `idp` claim
+  （`REQUIRE_IDP_CLAIM` 开关）。
+- **jobs 表的 `owner` 是发起者**（requested_by 语义），不参与授权；站点 owner
+  只由 `permissions.transfer_owner` 与首次部署写。`mark_job` **不写 owner**
+  ——写了会让 collaborator 部署一次就夺权。
 ```
 
 并在测试命令一节补一句：
@@ -3355,7 +4112,7 @@ Expected: 推送成功。
 
 | 模块 | 内容 | 前置 |
 |---|---|---|
-| M3 控制台 | `site-builder/panel/`（panel Lambda + 静态前端）、`deploy_panel.py`、auth 的 `/console-session` + `sb_console` host-only cookie、Edge 保留 cookie 名单、`site-ops-log` 审计表、admin 种子并入部署脚本 | M2 ✅ |
+| M3 控制台 | `site-builder/panel/`（panel Lambda + 静态前端）、`deploy_panel.py`、会话升级（auth 发一次性 code → **console host 自己**签发 `__Host-sb_console`，见 spec §4.5）+ Origin/Content-Type CSRF 三闸、`site-session-codes` 表、Edge 保留 cookie 名单、`site-ops-log` 审计表、admin 种子并入部署脚本 | M2 ✅ |
 | M4 API Key | `site-api-keys` 表、`sk-` + 16 位 Key、key-proxy Lambda（`mcp.{base_domain}`）、machine client 的 resource server 与 scope、AgentCore spike（client_credentials token + `X-SB-On-Behalf-Of` 头透传） | M1 ✅（machine client 已建） |
 | M5 统计 | Edge 访问日志行、聚合 Lambda + EventBridge、`site-access-stats` / `site-access-audit` 表、面板图表、MCP `get_site_stats`、平台 Lambda 日志组补 30 天保留 | M2、M3 |
 | M6 收尾 | 全量 E2E、DEPLOY.md 新阶段、onboarding 重生成、文档同步 | 全部 |
