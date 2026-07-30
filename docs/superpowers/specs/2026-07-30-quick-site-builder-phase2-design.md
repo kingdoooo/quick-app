@@ -128,14 +128,16 @@ Edge origin-request（+collaborators 放行、+List 反序列化、+两个 `__Ho
 10. **管理员名单存平台表 + config 种子**。首个管理员从 config.ini 幂等注入，
     后续由现有管理员在控制台增删——管理员变更不走重部署，与二期"在线改"
     主旨一致。
-11. **身份只能来自企业 IdP，且这条要在请求路径上被强制**。
-    `allowed_users="org"` 的语义前提：Edge 对 org 的判定是"持有任意有效平台
-    会话即放行"，不检查邮箱域。因此关自注册
-    （`AllowAdminCreateUserOnly=True`）+ 生产 client 不列 `COGNITO` 两条只是
-    减小暴露面——AWS 明确说移除 `COGNITO` **不阻止** SDK 经 user pools API
-    认证本地用户。真正的拦截点是**会话 JWT 的 `idp` claim 校验**
-    （pre-token 注入 → auth 带入会话 → Edge 校验白名单），它是主防线而非
-    可选增强，`REQUIRE_IDP_CLAIM` 置 true 是 M1 的完成条件。详见 §3.5。
+11. **身份只能来自企业 IdP，靠四条叠加而非单点**。`allowed_users="org"` 的
+    语义前提：Edge 对 org 只看"持有有效平台会话"，不查邮箱域。四条：
+    ① 关自注册；② 生产 client 不列 `COGNITO`；③ token 的 `idp` +
+    `auth_via` claim 校验（Edge 与 MCP 两个入口）；④ 运维红线——不对本 pool
+    调 `AdminLinkProviderForUser` / `AdminSetUserPassword` / `AdminCreateUser`。
+    **没有哪一条单独是边界**：①② 不阻止 SDK 原生认证（AWS 明说）；③ 的
+    `idp` 来自静态属性，只证明"账号关联过可信 IdP"，linked 用户与设过密码的
+    联邦用户仍可原生登录——所以要配 `auth_via` 只放行托管登录来源，并用 ④
+    堵住制造这类身份的途径。彻底阻断 SDK 原生认证需要 WAF，记入三期。
+    `REQUIRE_IDP_CLAIM` 置 true 是 M1 的完成条件。详见 §3.5。
 
 ## 3. 权限模型与数据真源
 
@@ -290,21 +292,49 @@ Edge 对 `"org"` 的判定是"持有本平台签发的有效会话 JWT 即放行
    is to block access with a AWS WAF rule."*，见
    [CreateUserPoolClient](https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_CreateUserPoolClient.html)）。
    所以这条只是减少暴露面，不能当成边界。
-3. **`idp` claim 校验（主防线，两个入口都要做）**：pre-token 触发器注入 `idp`
-   （值取 `identities[0].providerName`，只有联邦用户有）；
-   **Web 入口** — auth 服务 mint 会话 JWT 时带上，Edge 校验它在部署时注入的
-   可信 provider 白名单内（`{{TRUSTED_IDPS}}` 占位符，同 JWT_SECRET 的注入
-   机制），缺失或不匹配按未登录处理；
-   **MCP 入口** — `_caller_email()` 校验 access token 的 `idp`
-   （`TRUSTED_IDPS` 环境变量），不匹配即拒绝调用。只做 Web 那侧等于防线只做
-   了一半：MCP 能部署、改权限、下线站点，能力面比访问站点更大。
+3. **`idp` claim 校验（拦截层，两个入口都要做）**：pre-token 触发器注入
+   `idp`；**Web 入口** — auth 服务 mint 会话 JWT 时带上，Edge 校验它在可信
+   provider 白名单内（`{{TRUSTED_IDPS}}` 占位符，同 JWT_SECRET 的注入机制），
+   缺失或不匹配按未登录处理；**MCP 入口** — `_caller_email()` 校验 access
+   token 的 `idp`（`TRUSTED_IDPS` 环境变量）。只做 Web 那侧等于防线只做一半：
+   MCP 能部署、改权限、下线站点，能力面比访问站点更大。
 
-**为什么第 3 条必须实现，不能只靠前两条**：既然移除 `COGNITO` 不阻止 SDK 认证
-本地用户，那么只要 pool 里存在任何本地用户（管理员手工建的测试账号、将来有人
-误开自注册、AdminCreateUser 建的服务账号），他就能用 SDK 拿到本 pool 的 token，
-进而拿到平台会话——而 Edge 对 org 不查邮箱域。`idp` claim 是把"必须来自企业
-IdP"这条约束真正落到请求路径上的唯一手段。它不是纵深防御，是主防线；三者的
-关系是"前两条减小暴露面、第 3 条负责拦截"。
+   **`idp` claim 的效力边界（必须理解，否则会高估它）**：它的取值来自用户档案
+   的静态属性 `identities[0].providerName`，证明的是"**这个账号关联过某个可信
+   IdP**"，**不是**"本次登录由该 IdP 验证"。三条已知绕过路径：
+   - `AdminLinkProviderForUser` 把本地用户链到企业 IdP 后，AWS 明确说明
+     *linked local users can also sign in with SDK-based API operations like
+     `InitiateAuth` after they sign in at least once through their IdP*
+     ——此后原生登录照样带着 `identities`；
+   - 给联邦用户设密码（`AdminSetUserPassword`）会把它从 `EXTERNAL_PROVIDER`
+     变成 `CONFIRMED`，可走原生 API 认证；
+   - refresh token 换 token 时（`triggerSource=TokenGeneration_RefreshTokens`）
+     读的仍是同一份静态属性。
+
+   因此本期把它定位为**拦截层而非边界**：它拦住"从未关联过可信 IdP 的纯本地
+   用户"，这是最可能被误创建出来的一类（手工建的测试账号、误开自注册）；
+   它拦不住上面三条需要管理员主动操作或已有合法首次联邦登录的路径。
+
+4. **真正的边界是不给原生认证留入口**（本期以运维约束落地，三期上 WAF）：
+   - **不对本平台 pool 调用 `AdminLinkProviderForUser` /
+     `AdminSetUserPassword` / `AdminCreateUser`**——这三个是把"可原生登录的
+     身份"塞进 pool 的唯一途径（自注册已关）。写进 DEPLOY.md 的运维红线；
+   - pre-token 触发器**记录 `triggerSource`** 到 claim（`auth_via`），
+     Edge/MCP 侧只放行 `TokenGeneration_HostedAuth`
+     与 `TokenGeneration_RefreshTokens`——前者是托管登录页（必经 IdP），
+     后者是它换出的 refresh token。`TokenGeneration_Authentication`
+     （原生 `InitiateAuth` 流程完成后触发）一律拒绝。这条把上面第 1、2 条
+     绕过路径也拦住了，代价是"若将来真要支持原生登录得改这里"；
+   - **三期**：按 AWS 的说法，彻底阻断 SDK 原生认证只能靠 WAF 规则挡住
+     user pools API 的 `InitiateAuth`——记入 §11，本期不做（需要 WAF
+     关联 user pool 的额外基建与成本评估）。
+
+**四条的关系**：1、2 减小暴露面（关自注册、登录页不暴露本地入口）；
+3 在请求路径上拦截"没有可信 IdP 关联"的身份；4 用运维红线 + `auth_via` claim
+堵住"有关联但走原生认证"的路径。**任何一条单独都不构成边界**——只做 1、2
+时 SDK 原生认证仍可用（AWS 明说移除 `COGNITO` 不阻止它）；只做 3 时
+linked/设过密码的用户仍能绕过。这也是本期把"不调三个 Admin API"写成运维红线
+的原因：在上 WAF 之前，它是唯一能真正关掉原生认证入口的手段。
 
 **存量兼容**：迁移期已签发的会话 JWT 没有 `idp` claim，Edge 需允许一个宽限
 窗口（部署时开关 `{{REQUIRE_IDP_CLAIM}}`，切换 pool 且全部用户重新登录后置
@@ -315,7 +345,7 @@ true）——**开关翻到 true 是 M1 的完成条件，不是可选项**；�
 
 | 段 | 落点 | 关键约束 |
 |---|---|---|
-| 注入 | `auth/pre_token_email.py` | pre-token V2 的 `idTokenGeneration` 与 `accessTokenGeneration` 是**两个独立容器**，只写后者不会进 ID token（[官方文档](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-lambda-pre-token-generation.html)）。Web 登录读 ID token、MCP 网关读 access token，**两者都要写** |
+| 注入 | `auth/pre_token_email.py` | 注入 `idp`（来源关联）与 `auth_via`（本次 token 的 `triggerSource`）。pre-token V2 的 `idTokenGeneration` 与 `accessTokenGeneration` 是**两个独立容器**，只写后者不会进 ID token（[官方文档](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-lambda-pre-token-generation.html)）。Web 登录读 ID token、MCP 网关读 access token，**两者都要写** |
 | 换取 | `auth/login_handler.py:_exchange_code` | 从验签后的 id_token claims 里取 `idp` 一并返回 |
 | 签发 | `auth/session.py:mint_session_jwt` | 会话 JWT payload 加 `idp`；与 Edge 的验签算法保持字节级同步的约束不变 |
 | 校验（Web） | `router/.../origin_request.py` | `REQUIRE_IDP_CLAIM` 为真时，`claims["idp"]` 必须在 `TRUSTED_IDPS` 内，否则按未登录处理 |
@@ -689,10 +719,12 @@ Lambda 侧）。
      secret 的 client（`mcp`）做这条负测**——带 secret 的 client 少传
      `SecretHash` 也会返回 `NotAuthorizedException`，用 `site` client 测会把
      "缺 SecretHash" 误判成"自注册已禁用"（假通过）；
-  3. **`idp` claim 全链路**：access token 与 **id token** 里都有 `idp`
-     （pre-token 的两个容器各写一次）；会话 cookie 的 JWT payload 里有 `idp`；
-     `REQUIRE_IDP_CLAIM=true` 后，手工 mint 的**无 `idp`** 会话被 302 拦回
-     登录，而正常登录的会话仍可访问——两个方向都要验；
+  3. **`idp` / `auth_via` claim 全链路**：access token 与 **id token** 里都有
+     这两个 claim（pre-token 的两个容器各写一次）；会话 cookie 的 JWT payload
+     里有；`REQUIRE_IDP_CLAIM=true` 后四类负测都被拦（无 `idp`、不可信 `idp`、
+     `auth_via=TokenGeneration_Authentication`、以及一个 linked 本地用户走
+     `InitiateAuth` 拿到的真 token），而正常托管登录的会话仍可访问；
+     MCP 侧同样跑正负一对（可信 token 成功、无 `idp` token 被拒）；
   4. 在线改 allowed_users，60s+缓存窗口内新名单生效（拒绝名单外用户）；
   5. 在线**翻转 require_login**（两个方向各一次）后重部署成功——覆盖
      §3.3.2 的 smoke test 取值路径；
@@ -743,6 +775,10 @@ Lambda 侧）。
 
 - 全量按站点会话隔离（本期只做控制台）
 - SAML IdP 联邦（Cognito 支持；本期只做 OIDC，两者属性映射与部署脚本路径不同）
+- **WAF 挡住 user pools API 的原生认证**（`InitiateAuth` 等）：按 AWS 的说法
+  这是彻底阻断 SDK 原生登录的唯一手段，也是把 §3.5 从"叠加拦截"提升为"硬边界"
+  的那一步。本期以运维红线 + `auth_via` claim 替代（见 §3.5 第 4 条），
+  三期评估 WAF 关联 user pool 的基建与成本
 - CloudFront 精细缓存（与统计数据源联动重评）
 - 版本回滚、自定义域名、Fargate 档位、计费/配额、Python 站点 runtime
 - 站点级通知（部署结果/统计周报推送）

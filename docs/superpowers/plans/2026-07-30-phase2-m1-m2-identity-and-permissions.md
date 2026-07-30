@@ -755,29 +755,46 @@ def add_admin(email: str, added_by: str) -> None:
     ② put 成功但计数未加就崩，重试看到"已存在"直接返回，计数永久偏低
     （正常删除被误拦）。条件 attribute_not_exists 让重复添加走幂等分支。
     """
+    import time as _time
+
     import botocore.exceptions
     if not EMAIL_RE.fullmatch(email or ""):
         raise ValueError(f"非法邮箱: {email!r}")
     ddb = boto3.client("dynamodb",
                        region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
     table = os.environ["ADMINS_TABLE"]
-    try:
-        ddb.transact_write_items(TransactItems=[
-            {"Put": {"TableName": table,
-                     "Item": {"email": {"S": email},
-                              "added_by": {"S": added_by},
-                              "added_at": {"S": now_iso()}},
-                     "ConditionExpression": "attribute_not_exists(email)"}},
-            {"Update": {"TableName": table,
-                        "Key": {"email": {"S": "__count__"}},
-                        "UpdateExpression": ("SET n = if_not_exists(n, :zero) "
-                                             "+ :one"),
-                        "ExpressionAttributeValues": {":zero": {"N": "0"},
-                                                      ":one": {"N": "1"}}}}])
-    except botocore.exceptions.ClientError as e:
-        if e.response["Error"]["Code"] == "TransactionCanceledException":
-            return      # 已存在：幂等成功，计数不动
-        raise
+    items = [
+        {"Put": {"TableName": table,
+                 "Item": {"email": {"S": email},
+                          "added_by": {"S": added_by},
+                          "added_at": {"S": now_iso()}},
+                 "ConditionExpression": "attribute_not_exists(email)"}},
+        {"Update": {"TableName": table,
+                    "Key": {"email": {"S": "__count__"}},
+                    "UpdateExpression": "SET n = if_not_exists(n, :zero) + :one",
+                    "ExpressionAttributeValues": {":zero": {"N": "0"},
+                                                  ":one": {"N": "1"}}}}]
+    # _cancel_reasons 在本文件后面（"权限写入"一节）定义——模块级函数在调用时
+    # 才解析，位置不影响；按本任务给的顺序追加即可，不要为此重排。
+    # TransactionCanceledException 是个笼统的伞：ConditionalCheckFailed（重复
+    # 添加，幂等）、TransactionConflict（另一笔事务在改同一 item，该退避重试）、
+    # ProvisionedThroughputExceeded、ValidationError… 一律当"已存在"吞掉，会把
+    # 真失败报成成功——管理员没建上，调用方以为建好了。必须按 reason 分流。
+    for attempt in range(3):
+        try:
+            ddb.transact_write_items(TransactItems=items)
+            return
+        except botocore.exceptions.ClientError as e:
+            if e.response["Error"]["Code"] != "TransactionCanceledException":
+                raise
+            reasons = _cancel_reasons(e)
+            put_reason = reasons[0] if reasons else ""
+            if put_reason == "ConditionalCheckFailed":
+                return          # 该邮箱已是管理员：幂等成功，计数不动
+            if "TransactionConflict" in reasons and attempt < 2:
+                _time.sleep(0.05 * (2 ** attempt))   # 并发写 __count__，退避重试
+                continue
+            raise               # 容量/校验等其他原因：如实抛出
 
 
 def rebuild_admin_count() -> int:
@@ -819,10 +836,15 @@ def remove_admin(email: str) -> None:
                         "ConditionExpression": "n > :one",
                         "ExpressionAttributeValues": {":one": {"N": "1"}}}}])
     except botocore.exceptions.ClientError as e:
-        if e.response["Error"]["Code"] == "TransactionCanceledException":
-            raise PermissionDenied(
-                "不能删除最后一个管理员（或名单刚被他人修改，请刷新重试）") from e
-        raise
+        if e.response["Error"]["Code"] != "TransactionCanceledException":
+            raise
+        reasons = _cancel_reasons(e)
+        if "TransactionConflict" in reasons:
+            raise PermissionConflict(
+                "管理员名单正被他人修改，请重试") from e
+        if "ConditionalCheckFailed" in reasons:
+            raise PermissionDenied("不能删除最后一个管理员") from e
+        raise               # 容量/校验等：如实抛出，不要伪装成权限问题
 
 
 def normalize_allowed_users(value):
@@ -877,6 +899,13 @@ def _ddb_client():
 
 
 def _cancel_reasons(err) -> list[str]:
+    """TransactionCanceledException 的逐项取消原因（与 TransactItems 同序）。
+
+    可能的值：ConditionalCheckFailed / TransactionConflict /
+    ItemCollectionSizeLimitExceeded / ProvisionedThroughputExceeded /
+    ThrottlingError / ValidationError / None（该项本身没问题）。
+    **不要把整个异常当成"条件失败"**——那会把容量与校验错误报成业务结果。
+    """
     return [r.get("Code", "") for r in
             err.response.get("CancellationReasons", [])]
 
@@ -1554,6 +1583,49 @@ def test_register_route_seed_does_not_overwrite_concurrent_online_change(aws):
     assert site["allowed_users"] == ["early@x.com"]     # 不被 manifest 覆盖
 
 
+def test_register_route_uses_consistent_read_after_seed(aws, monkeypatch):
+    """seed 刚写完就用最终一致读 → 可能读不到，名单被放大成 org。
+
+    moto 的读默认就是强一致，覆盖不到这个场景，所以显式注入一次"陈旧读"：
+    让 get_site（最终一致）返回 seed 之前的样子，验证实现走的是
+    get_site_consistent 而不是 get_site。
+    """
+    import boto3
+    import common
+    import register_route
+    common.upsert_site("s-1", owner="o@x.com")      # 无权限字段（首次部署）
+    job_id = common.create_job("o@x.com", "s-1")
+
+    # 最终一致读永远返回 seed 之前的快照（模拟副本滞后）
+    stale = {"site_id": "s-1", "owner": "o@x.com"}
+    monkeypatch.setattr(register_route.common, "get_site", lambda sid: dict(stale))
+
+    register_route.handler(
+        {"job_id": job_id, "site_id": "s-1", "api_target": "",
+         "manifest": {"auth": {"require_login": True,
+                               "allowed_users": ["a@x.com"]}}}, None)
+
+    item = boto3.client("dynamodb").get_item(
+        TableName="routing", Key={"subdomain": {"S": "app-s-1"}})["Item"]
+    # 必须是 manifest 指定的名单，不能回落成 org
+    assert item["allowed_users"]["L"] == [{"S": "a@x.com"}]
+    assert item["allowed_users"].get("S") is None
+    assert int(item["permissions_rev"]["N"]) == 1
+
+
+def test_seed_advances_rev_to_one(aws):
+    """初始化把 rev 从"缺失"推进到 1，与未初始化状态可区分。"""
+    import common
+    import register_route
+    common.upsert_site("s-2", owner="o@x.com")
+    job_id = common.create_job("o@x.com", "s-2")
+    register_route.handler(
+        {"job_id": job_id, "site_id": "s-2", "api_target": "",
+         "manifest": {"auth": {"require_login": False, "allowed_users": "org"}}},
+        None)
+    assert int(common.get_site("s-2")["permissions_rev"]) == 1
+
+
 def test_register_route_emits_effective_auth_for_smoke_test(aws):
     """smoke_test 读 event["effective_auth"]，不读 manifest（spec §3.3.2）。"""
     import common
@@ -1634,14 +1706,17 @@ def _seed_permissions_if_absent(site_id: str, manifest_auth: dict,
             UpdateExpression=("SET require_login = :rl, allowed_users = :au, "
                               "permissions_updated_at = :t, "
                               "permissions_updated_by = :by, "
-                              "permissions_rev = if_not_exists(permissions_rev, :zero)"),
+                              "permissions_rev = :one"),
             ConditionExpression="attribute_not_exists(require_login)",
             ExpressionAttributeValues={
                 ":rl": bool(manifest_auth["require_login"]),
                 ":au": allowed,
                 ":t": permissions.now_iso(),
                 ":by": owner,
-                ":zero": 0})
+                # rev 明确推进到 1：让"未初始化"(缺字段或 0) 与"已初始化"
+                # 在条件表达式里可区分。若这里留 0，seed 前后的 rev 都是 0，
+                # 后续 ConditionCheck 察觉不到中间发生过初始化。
+                ":one": 1})
     except botocore.exceptions.ClientError as e:
         if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
             raise   # 真源已存在：用它的值，不覆盖
@@ -1681,12 +1756,17 @@ def handler(event, context):
     subdomain = common.subdomain_for(event["site_id"])
     ddb = boto3.client("dynamodb")
 
-    site = common.get_site(event["site_id"]) or {}
+    site = common.get_site_consistent(event["site_id"]) or {}
     owner = site.get("owner") or common.get_job(event["job_id"])["owner"]
     _seed_permissions_if_absent(event["site_id"], event["manifest"]["auth"], owner)
 
     for attempt in range(MAX_ROUTE_ATTEMPTS):
-        site = common.get_site(event["site_id"]) or {}
+        # **必须强一致读**：紧接在 _seed_permissions_if_absent 之后，
+        # 最终一致读可能拿不到刚写入的权限，_route_item 就会回落默认值
+        # （require_login=True / allowed_users="org"）——把指定邮箱名单
+        # 错误地放大成"全体可信 IdP 用户"。且 seed 把 rev 明确写成 1，
+        # 与"未初始化"的 0 区分开，否则条件检查察觉不到这次状态变更。
+        site = common.get_site_consistent(event["site_id"]) or {}
         owner = site.get("owner") or owner
         rev = int(site.get("permissions_rev", 0))
         try:
@@ -2474,14 +2554,17 @@ IdP"的地方**。不做它，`allowed_users="org"` 就等于"任何能拿到本
 # 改完后本文件所有既有用例仍需通过——它们用的 _jwt() 要相应带上 idp。
 
 
-def _jwt_idp(email="a@x.com", idp="Feishu", exp_delta=3600, secret="test-secret"):
-    """带 idp claim 的会话 JWT（Task 13 起 auth 服务签的就是这种）。"""
+def _jwt_idp(email="a@x.com", idp="Feishu", exp_delta=3600, secret="test-secret",
+             auth_via="TokenGeneration_HostedAuth"):
+    """带 idp + auth_via 的会话 JWT（Task 13 起 auth 服务签的就是这种）。"""
     b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
     h = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
     payload = {"email": email, "name": "Alice",
                "exp": int(time.time()) + exp_delta}
     if idp:
         payload["idp"] = idp
+    if auth_via:
+        payload["auth_via"] = auth_via
     p = b64(json.dumps(payload).encode())
     sig = b64(hmac.new(secret.encode(), f"{h}.{p}".encode(), hashlib.sha256).digest())
     return f"{h}.{p}.{sig}"
@@ -2510,6 +2593,30 @@ def test_session_without_idp_is_rejected_when_required():
 
 def test_untrusted_idp_is_rejected():
     r = _req(cookie=f"sb_session={_jwt_idp(idp='EvilCorp')}")
+    assert orq._check_auth(r, dict(ROUTE_AUTH),
+                           "app-x.example.com")["status"] == "302"
+
+
+def test_native_auth_source_is_rejected_even_with_trusted_idp():
+    """linked 本地用户 / 设过密码的联邦用户：idp 合法但走原生 InitiateAuth。
+
+    这是 idp claim 单独拦不住的那一类（spec §3.5 的效力边界）——
+    它们的 identities 里确实有可信 provider，只有 auth_via 能分辨。
+    """
+    r = _req(cookie=f"sb_session={_jwt_idp(idp='Feishu', auth_via='TokenGeneration_Authentication')}")
+    assert orq._check_auth(r, dict(ROUTE_AUTH),
+                           "app-x.example.com")["status"] == "302"
+
+
+def test_refresh_token_source_is_admitted():
+    """托管登录换出的 refresh token 续期属正常路径，不能拦。"""
+    r = _req(cookie=f"sb_session={_jwt_idp(auth_via='TokenGeneration_RefreshTokens')}")
+    assert orq._check_auth(r, dict(ROUTE_AUTH), "app-x.example.com") is None
+
+
+def test_missing_auth_via_is_rejected():
+    """旧会话（升级前签发）没有 auth_via——开关开启后按未登录处理。"""
+    r = _req(cookie=f"sb_session={_jwt_idp(auth_via=None)}")
     assert orq._check_auth(r, dict(ROUTE_AUTH),
                            "app-x.example.com")["status"] == "302"
 
@@ -2563,7 +2670,7 @@ Expected: 多条既有用例 FAIL——`_jwt()` 签的 token 没有 `idp`，而�
 
 ```python
 def _jwt(email="a@x.com", name="Alice", exp_delta=3600, secret="test-secret",
-         idp="Feishu"):
+         idp="Feishu", auth_via="TokenGeneration_HostedAuth"):
     b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
     h = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
     payload = {"name": name, "exp": int(time.time()) + exp_delta}
@@ -2571,6 +2678,8 @@ def _jwt(email="a@x.com", name="Alice", exp_delta=3600, secret="test-secret",
         payload["email"] = email
     if idp:
         payload["idp"] = idp
+    if auth_via:
+        payload["auth_via"] = auth_via
     p = b64(json.dumps(payload).encode())
     sig = b64(hmac.new(secret.encode(), f"{h}.{p}".encode(), hashlib.sha256).digest())
     return f"{h}.{p}.{sig}"
@@ -2598,6 +2707,11 @@ def test_org_route_admits_any_email_from_trusted_idp():
 # 置 true，这是 M1 的完成条件。
 REQUIRE_IDP_CLAIM = "{{REQUIRE_IDP_CLAIM}}".strip().lower() == "true"
 TRUSTED_IDPS = tuple(x.strip() for x in "{{TRUSTED_IDPS}}".split(",") if x.strip())
+# 只放行托管登录页与它换出的 refresh token。原生 InitiateAuth 完成后触发的
+# TokenGeneration_Authentication 一律拒——linked 本地用户与设过密码的联邦
+# 用户走的就是它，而它们的 idp claim 看起来完全合法（spec §3.5）。
+TRUSTED_AUTH_SOURCES = ("TokenGeneration_HostedAuth",
+                        "TokenGeneration_RefreshTokens")
 ```
 
 在 `_check_auth` 里、`claims` 验签通过之后、名单判定之前插入：
@@ -2606,7 +2720,13 @@ TRUSTED_IDPS = tuple(x.strip() for x in "{{TRUSTED_IDPS}}".split(",") if x.strip
     if REQUIRE_IDP_CLAIM:
         # 按未登录处理（302）而非 403：本地用户/旧会话应被引导去正规登录，
         # 403 会让用户以为"没权限"而去找站点 owner 加名单。
-        if claims.get("idp") not in TRUSTED_IDPS:
+        # 两个 claim 都要过：
+        #   idp      —— 账号关联过可信 IdP（拦纯本地用户）
+        #   auth_via —— 本次 token 出自托管登录或其 refresh（拦 linked 用户
+        #               与设过密码的联邦用户走的原生 InitiateAuth 路径；
+        #               它们的 idp 是合法的，只有来源能分辨）
+        if (claims.get("idp") not in TRUSTED_IDPS
+                or claims.get("auth_via") not in TRUSTED_AUTH_SOURCES):
             return _redirect_login(host, request.get("uri", "/"),
                                    request.get("querystring", ""))
 ```
@@ -2660,11 +2780,12 @@ Expected: `0`——占位符已被替换掉，模板里不该再出现它们的�
 - [ ] **Step 7: 提交**
 
 ```bash
-# AGENTS.md 要求：commit 前扫 staged diff
-git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN .*PRIVATE KEY|password[[:space:]]*=' || echo "secret scan: clean"
 git add router/infrastructure/lambda/origin_request.py \
   router/infrastructure/lambda/test_edge_auth.py \
   router/infrastructure/stack.py router/config.ini.example
+# AGENTS.md：commit 前扫 staged diff（必须在 git add 之后，否则扫的是空 stage）
+git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
+# 命中就停下给用户看，确认是故意的 fixture 后再继续
 git commit -m "feat(edge): 校验会话的 idp claim（org 语义的执行点，带迁移开关)"
 ```
 
@@ -2776,6 +2897,29 @@ Expected: `allowed` 是 `{"S":"org"}` 或 `{"L":[...]}`；`collab` 是 `{"L":[]}
 - [ ] **Step 9: 更新 DEPLOY.md**
 
 在 `site-builder/DEPLOY.md` 里加一节（放在路由层/执行器阶段之后）：
+
+**另外在 DEPLOY.md 的身份层一节加一条运维红线**（spec §3.5 第 4 条）：
+
+```markdown
+### ⚠️ 运维红线：不要给平台 pool 制造"可原生登录"的身份
+
+`allowed_users="org"` 的边界依赖"pool 里的身份只能经企业 IdP 登录"。以下三个
+API 会打破它，**对本平台 pool 一律不要调用**：
+
+- `AdminCreateUser` —— 建出可用密码登录的本地用户；
+- `AdminSetUserPassword` —— 给联邦用户设密码后，它能走原生 API 认证
+  （状态从 EXTERNAL_PROVIDER 变 CONFIRMED）；
+- `AdminLinkProviderForUser` —— AWS 明确：linked 本地用户在首次经 IdP 登录后
+  即可用 `InitiateAuth` 等 SDK 操作登录。
+
+这三条造出的身份，其 `idp` claim 看起来完全合法（`identities` 里有可信
+provider），只有 `auth_via` claim 能分辨——所以 Edge 与 MCP 都校验
+`auth_via ∈ {TokenGeneration_HostedAuth, TokenGeneration_RefreshTokens}`。
+彻底阻断原生认证需要 WAF 挡 user pools API，记为三期。
+
+需要给自动化/服务账号发凭证时，用 M4 的 API Key（走 key-proxy 的
+machine client），不要在 pool 里建本地用户。
+```
 
 ```markdown
 ## 二期 M2：权限真源迁移（一次性）
@@ -2960,7 +3104,8 @@ def _with_auth(monkeypatch, token: str):
 def test_caller_email_accepts_trusted_idp(monkeypatch):
     import server
     monkeypatch.setenv("TRUSTED_IDPS", "Feishu,Okta")
-    _with_auth(monkeypatch, _token({"email": "a@x.com", "idp": "Feishu"}))
+    _with_auth(monkeypatch, _token({"email": "a@x.com", "idp": "Feishu",
+                                    "auth_via": "TokenGeneration_HostedAuth"}))
     assert server._caller_email() == "a@x.com"
 
 
@@ -2976,9 +3121,28 @@ def test_caller_email_rejects_token_without_idp(monkeypatch):
 def test_caller_email_rejects_untrusted_idp(monkeypatch):
     import server
     monkeypatch.setenv("TRUSTED_IDPS", "Feishu")
-    _with_auth(monkeypatch, _token({"email": "a@x.com", "idp": "EvilCorp"}))
+    _with_auth(monkeypatch, _token({"email": "a@x.com", "idp": "EvilCorp",
+                                    "auth_via": "TokenGeneration_HostedAuth"}))
     with pytest.raises(server.NotOwner):
         server._caller_email()
+
+
+def test_caller_email_rejects_native_auth_source(monkeypatch):
+    """idp 合法但走原生 InitiateAuth（linked 用户/设过密码的联邦用户）。"""
+    import server
+    monkeypatch.setenv("TRUSTED_IDPS", "Feishu")
+    _with_auth(monkeypatch, _token({"email": "a@x.com", "idp": "Feishu",
+                                    "auth_via": "TokenGeneration_Authentication"}))
+    with pytest.raises(server.NotOwner):
+        server._caller_email()
+
+
+def test_caller_email_accepts_refresh_token_source(monkeypatch):
+    import server
+    monkeypatch.setenv("TRUSTED_IDPS", "Feishu")
+    _with_auth(monkeypatch, _token({"email": "a@x.com", "idp": "Feishu",
+                                    "auth_via": "TokenGeneration_RefreshTokens"}))
+    assert server._caller_email() == "a@x.com"
 
 
 def test_caller_email_skips_idp_check_when_unconfigured(monkeypatch):
@@ -2987,6 +3151,19 @@ def test_caller_email_skips_idp_check_when_unconfigured(monkeypatch):
     monkeypatch.setenv("TRUSTED_IDPS", "")
     _with_auth(monkeypatch, _token({"email": "a@x.com"}))
     assert server._caller_email() == "a@x.com"
+
+
+def test_trusted_idps_read_per_call_not_at_import(monkeypatch):
+    """配置必须每次调用时读——固化成模块常量会让上面的拒绝用例假通过。
+
+    server 在本文件更早的用例里已被导入，若 TRUSTED_IDPS 是模块级 tuple，
+    这里的 setenv 不会改变它。
+    """
+    import server
+    monkeypatch.setenv("TRUSTED_IDPS", "Feishu")
+    assert server._trusted_idps() == ("Feishu",)
+    monkeypatch.setenv("TRUSTED_IDPS", "Okta,Feishu")
+    assert server._trusted_idps() == ("Okta", "Feishu")
 ```
 
 Run: `cd site-builder/mcp && python3 -m pytest tests/test_agentcore_contract.py -q`
@@ -3000,8 +3177,20 @@ Expected: FAIL — 现实现不看 `idp`
 # （AgentCore authorizer 只验 issuer/client_id，不看 idp）。
 # 空值 = 迁移宽限期放行，与 Edge 的 REQUIRE_IDP_CLAIM 开关对齐；
 # 切完 pool、全员重新登录后必须配上。
-TRUSTED_IDPS = tuple(x.strip() for x in
-                     os.environ.get("TRUSTED_IDPS", "").split(",") if x.strip())
+#
+# **每次调用时读环境变量，不在模块导入时固化**：固化成模块级常量后，
+# 测试里的 monkeypatch.setenv 不再生效（server 早已被别的用例导入过），
+# 拒绝类用例会永远看到空 tuple 而假通过。
+def _trusted_idps() -> tuple[str, ...]:
+    return tuple(x.strip() for x in
+                 os.environ.get("TRUSTED_IDPS", "").split(",") if x.strip())
+
+
+# 与 Edge 的 TRUSTED_AUTH_SOURCES 同义：只放行托管登录与其 refresh。
+# 原生 InitiateAuth（TokenGeneration_Authentication）的 token 拒掉——
+# linked 本地用户的 idp claim 看起来合法，只有来源能分辨（spec §3.5）。
+TRUSTED_AUTH_SOURCES = ("TokenGeneration_HostedAuth",
+                        "TokenGeneration_RefreshTokens")
 ```
 
 `_caller_email()` 里：
@@ -3009,10 +3198,16 @@ TRUSTED_IDPS = tuple(x.strip() for x in
 ```python
             email = claims.get("email", "")
             if email:
-                if TRUSTED_IDPS and claims.get("idp") not in TRUSTED_IDPS:
-                    raise NotOwner(
-                        "身份来源不被信任（缺少或非法的 idp claim）——"
-                        "请用企业账号重新登录")
+                trusted = _trusted_idps()
+                if trusted:
+                    if claims.get("idp") not in trusted:
+                        raise NotOwner(
+                            "身份来源不被信任（缺少或非法的 idp claim）——"
+                            "请用企业账号重新登录")
+                    if claims.get("auth_via") not in TRUSTED_AUTH_SOURCES:
+                        raise NotOwner(
+                            "本次登录方式不被信任（非托管登录来源）——"
+                            "请用企业账号重新登录")
                 return email
 ```
 
@@ -3482,16 +3677,41 @@ Expected: PASS
 
 `site-builder/mcp/deploy_agentcore.py` 的 `ensure_role()` 里，DynamoDB 语句的 `Resource` 加路由表（MCP 现在要写它做投影）：
 
+**IAM 里没有 `dynamodb:TransactWriteItems` 这个 action**。AWS 明确：事务内
+`Put`/`Update`/`Delete`/`Get` 的权限由底层
+`PutItem`/`UpdateItem`/`DeleteItem`/`GetItem` 决定，只有 `ConditionCheck`
+需要单独的 **`dynamodb:ConditionCheckItem`**
+（[官方说明](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis-iam.html)）。
+所以要补的是 `ConditionCheckItem`——写成一个不存在的事务 action 会让 policy
+静默无效（IAM 不校验未知 action 名，部署不报错、运行时照样 AccessDenied）。
+
 ```python
              f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/"
              + CFG["Platform"]["routing_table"],
+```
+
+sites 表那条语句的 `Action` 列表加 `"dynamodb:ConditionCheckItem"`
+（`register_route` 与 admin 路径的条件事务要用）。
+
+admins 表单列一条——MCP 只需读管理员身份 + 在事务里断言"我此刻仍是管理员"，
+**不给它 admins 表的 PutItem/DeleteItem**（增删管理员属于 M3 的 panel role）：
+
+```python
+        {"Sid": "AdminsReadAndConditionCheck", "Effect": "Allow",
+         "Action": ["dynamodb:GetItem", "dynamodb:Scan",
+                    "dynamodb:ConditionCheckItem"],
+         "Resource": f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-admins"},
 ```
 
 `deploy_runtime()` 的 `environmentVariables` 加：
 
 ```python
             "ROUTING_TABLE": CFG["Platform"]["routing_table"],
+            "ADMINS_TABLE": CFG["Deployer"]["admins_table"],
 ```
+
+**部署后必须真机验证权限**：moto 不执行 IAM 授权，单测全绿也发现不了缺权限
+（见 Task 12 Step 3b）。
 
 - [ ] **Step 8: 提交**
 
@@ -3528,6 +3748,23 @@ Expected: 构建推送成功（ARM64 + `--provenance=false`），runtime 更新�
 用一期 client-setup 文档里的 Claude Code OAuth 方式连上 MCP（`--client-id` + `--callback-port 18765`），或用 inspector。
 
 Expected: 工具列表含 8 个；`list_my_sites` 返回的项带 `role` 字段且 owner 是你的邮箱。
+
+- [ ] **Step 3b: [真机] 先验 IAM 够不够（事务写权限）**
+
+新工具最终走 `TransactWriteItems`，而 moto 不执行 IAM 授权——单测全绿也可能
+在真机全部 `AccessDeniedException`。所以第一件事是拿真身份跑一次最小事务。
+
+Run（用 MCP runtime 角色的身份，或直接调一次工具）:
+```bash
+# 最省事的验证：对一个自己 owner 的站点改一次策略（改成与当前相同的值也算）
+# 经 MCP 调 update_site_permissions，看是否 AccessDenied
+```
+Expected: 成功。若报 `AccessDeniedException`，对照错误里的 action 名补 IAM：
+- `dynamodb:UpdateItem` on `site-sites` / 路由表 → 事务里的 Update 缺权限；
+- `dynamodb:ConditionCheckItem` on `site-admins` → admin 路径的 ConditionCheck
+  缺权限（**注意不是** `TransactWriteItems`，IAM 没有那个 action）。
+
+改完 IAM 后 `python3 deploy_agentcore.py --skip-build` 重新下发再试。
 
 - [ ] **Step 3: [真机] 在线改权限并验证生效**
 
@@ -3690,7 +3927,7 @@ git commit -m "docs: 权限管理工具写进 Skill 与部署手册"
   - `_decode_state(state: str) -> str | None`（返回 redirect）
   - `_pkce_cookie(verifier, nonce, base) -> str`、`_read_pkce_cookie(event) -> dict | None`、`PKCE_COOKIE = "__Host-sb_pkce"`
   - `_exchange_code(code: str, verifier: str, nonce: str) -> dict`（多两个参数，校验 id_token 的 nonce；返回 `{email, name, idp}`）
-  - `session.mint_session_jwt(email, name, secret, ttl_seconds=86400, idp="", scope="")`（payload 增 `idp`/`scope`，仅在非空时写入）
+  - `session.mint_session_jwt(email, name, secret, ttl_seconds=86400, idp="", scope="", auth_via="")`（payload 增 `idp`/`scope`/`auth_via`，仅在非空时写入）
 
 - [ ] **Step 1: 写失败测试**
 
@@ -3960,7 +4197,7 @@ Expected: FAIL — `mint_session_jwt() got an unexpected keyword argument 'idp'`
 
 ```python
 def mint_session_jwt(email: str, name: str, secret: str, ttl_seconds: int = 86400,
-                     idp: str = "", scope: str = "") -> str:
+                     idp: str = "", scope: str = "", auth_via: str = "") -> str:
     header = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
     claims = {"email": email, "name": name, "exp": int(time.time()) + ttl_seconds}
     # 只在非空时写入：保持与一期已签发 token 的形态兼容，Edge 侧无需改验签。
@@ -3968,6 +4205,8 @@ def mint_session_jwt(email: str, name: str, secret: str, ttl_seconds: int = 8640
         claims["idp"] = idp        # spec §3.5：Edge 据此确认身份来自企业 IdP
     if scope:
         claims["scope"] = scope    # M3 面板会话用（Edge 不校验 scope）
+    if auth_via:
+        claims["auth_via"] = auth_via   # spec §3.5：本次 token 的来源
     payload = _b64url(json.dumps(claims, separators=(",", ":")).encode())
     signing_input = f"{header}.{payload}".encode()
     return f"{header}.{payload}.{_sign(signing_input, secret)}"
@@ -4101,7 +4340,8 @@ def _exchange_code(code: str, verifier: str, nonce: str) -> dict:
     # idp 由 pre-token 触发器注入 id token（两个容器都写，见 Task 14 Step 4b）。
     # 本地用户没有它——会话里就不会有，Edge 据此拦截（spec §3.5）。
     return {"email": claims["email"], "name": claims.get("name", claims["email"]),
-            "idp": claims.get("idp", "")}
+            "idp": claims.get("idp", ""),
+            "auth_via": claims.get("auth_via", "")}
 ```
 
 `handler` 的 `/login` 与 `/callback` 分支替换为：
@@ -4138,7 +4378,8 @@ def _exchange_code(code: str, verifier: str, nonce: str) -> dict:
                     "body": "登录状态已过期，请重新登录"}
         user = _exchange_code(qs["code"], pkce["v"], pkce["n"])
         token = mint_session_jwt(user["email"], user["name"],
-                                 os.environ["JWT_SECRET"], idp=user.get("idp", ""))
+                                 os.environ["JWT_SECRET"], idp=user.get("idp", ""),
+                                 auth_via=user.get("auth_via", ""))
         cookie = (f"sb_session={token}; Domain=.{base}; Path=/; Max-Age=86400; "
                   f"Secure; HttpOnly; SameSite=Lax")
         clear_pkce = f"{PKCE_COOKIE}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax"
@@ -4797,17 +5038,28 @@ def ensure_pre_token_trigger(role_arn: str, pool_id: str | None = None) -> None:
 （spec §3.5）。改 `site-builder/auth/pre_token_email.py`：
 
 ```python
+# 只有这两个来源能证明"本次 token 出自托管登录页（必经 IdP）或它换出的
+# refresh token"。TokenGeneration_Authentication 是原生 InitiateAuth 流程
+# 完成后触发的——linked 本地用户与设过密码的联邦用户走的就是它，
+# 而它们的 identities 里仍有可信 provider，靠 idp claim 分辨不出来。
+TRUSTED_AUTH_SOURCES = ("TokenGeneration_HostedAuth",
+                        "TokenGeneration_RefreshTokens")
+
+
 def handler(event, context):
     attrs = event["request"]["userAttributes"]
     claims = {}
     email = attrs.get("email", "")
     if email:
         claims["email"] = email
-    # 联邦用户的 identities 是 JSON 字符串（Cognito 传参形态），
-    # 本地用户没有该属性——没有 idp claim 正是 Edge 要拦的信号。
+    # idp 来自用户档案的**静态**属性：只证明"这个账号关联过某个 IdP"，
+    # 不证明本次登录由它验证（spec §3.5 的效力边界）。
     idp = _provider_name(attrs.get("identities", ""))
     if idp:
         claims["idp"] = idp
+    # auth_via 才是"本次 token 的来源"：把 triggerSource 透出去，
+    # 让 Edge / MCP 能拒掉原生认证路径。
+    claims["auth_via"] = event.get("triggerSource", "")
     if claims:
         # idTokenGeneration 与 accessTokenGeneration 是**两个独立容器**，
         # 只写一个不会同步到另一个（官方文档明示）。两处都要写：
@@ -4844,8 +5096,9 @@ def _provider_name(identities) -> str:
 import pre_token_email as pt
 
 
-def _event(attrs):
-    return {"request": {"userAttributes": attrs}, "response": {}}
+def _event(attrs, trigger="TokenGeneration_HostedAuth"):
+    return {"request": {"userAttributes": attrs}, "response": {},
+            "triggerSource": trigger}
 
 
 import pytest
@@ -4854,6 +5107,26 @@ import pytest
 def _claims(ev, container):
     return ev["response"]["claimsAndScopeOverrideDetails"][container][
         "claimsToAddOrOverride"]
+
+
+def test_auth_via_carries_trigger_source():
+    """auth_via 必须反映本次 triggerSource——idp 分辨不出原生认证。"""
+    ev = pt.handler({"request": {"userAttributes": {
+        "email": "a@x.com",
+        "identities": '[{"providerName":"Feishu","userId":"u1"}]'}},
+        "response": {},
+        "triggerSource": "TokenGeneration_Authentication"}, None)
+    for c in ("idTokenGeneration", "accessTokenGeneration"):
+        assert _claims(ev, c)["auth_via"] == "TokenGeneration_Authentication"
+        assert _claims(ev, c)["idp"] == "Feishu"   # 静态属性仍在，正是问题所在
+
+
+def test_hosted_auth_is_a_trusted_source():
+    ev = pt.handler({"request": {"userAttributes": {"email": "a@x.com"}},
+                     "response": {},
+                     "triggerSource": "TokenGeneration_HostedAuth"}, None)
+    assert (_claims(ev, "idTokenGeneration")["auth_via"]
+            in pt.TRUSTED_AUTH_SOURCES)
 
 
 @pytest.mark.parametrize("container", ["idTokenGeneration",
@@ -5144,6 +5417,35 @@ Expected: 第一行 `200`、第二行 `302`。
 
 probe token 5 分钟内自然过期；跑完 `unset` 三个变量。
 
+- [ ] **Step 6d: [真机] MCP 侧 idp/auth_via 正负测**
+
+Edge 那侧验完了，MCP 是另一条入口，必须独立验——只验"access token 里有 idp"
+证明不了 MCP 真的在校验它（漏配 `TRUSTED_IDPS` 时防线是关着的，正向测试照样
+通过）。
+
+1. **正向**：用正常登录拿到的 token 调 `list_my_sites` → 成功；
+2. **负向（无 idp）**：把 `TRUSTED_IDPS` 配好后，用一个**没有 idp claim** 的
+   token 调 MCP → 必须 401/被拒。拿这种 token 的办法：临时把 pre-token 触发器
+   的 idp 注入注掉、重新登录取 token，验完恢复；或用 `machine` client 的
+   client_credentials token（它本来就没有 idp——顺便验证 M4 的 key-proxy 路径
+   会被这条拦住，届时要给它单独的放行逻辑）；
+3. **负向（原生认证来源）**：如果 pool 里有 linked 用户，用
+   `InitiateAuth` 拿 token 调 MCP → 必须被拒（`auth_via` 是
+   `TokenGeneration_Authentication`）。没有这类用户就跳过并在 DEPLOY.md 记明
+   "未覆盖"，不要写成已验证。
+
+Run（确认 runtime 真的拿到了配置）:
+```bash
+aws bedrock-agentcore-control list-agent-runtimes --region us-east-1 \
+  --query "agentRuntimes[?agentRuntimeName=='site_builder_deploy'].agentRuntimeId" \
+  --output text
+# 再用 describe 看 environmentVariables 里 TRUSTED_IDPS 非空
+```
+Expected: `TRUSTED_IDPS` 有值。**为空则等于 MCP 侧防线未启用**——
+`deploy_agentcore.py` 应在 config 有 `[IdP] provider_name` 时拒绝以空值部署
+（加一行断言：`if CFG.has_section("IdP") and CFG["IdP"].get("provider_name"):
+assert trusted_idps, "..."`），避免"部署成功但防线关着"这种静默失败。
+
 - [ ] **Step 7: [真机 spike] 标准 IdP 分支验证**
 
 在新 pool 上加一个标准 IdP（Okta 试用租户或 Azure AD），只需 `[IdP]` 段换成它的参数重跑 `deploy_pool.py`，然后用该 IdP 的账号走一次站点登录。
@@ -5358,10 +5660,24 @@ Expected: 4 passed（约 6 分钟）。这条验证权限真源改造没有破�
   （`AllowAdminCreateUserOnly=True`）+ 生产 client 只列企业 IdP（不含
   `COGNITO`）。Edge 对 org 只检查"有有效会话"，不查邮箱域——放宽这两条等于
   把全部 org 站点对公网开放——AWS 明确说移除 `COGNITO` **不阻止** SDK 经
-  user pools API 认证本地用户。**唯一的执行点是会话/token 的 `idp` claim
-  校验**：Web 侧在 Edge（`REQUIRE_IDP_CLAIM` 开关），MCP 侧在
-  `_caller_email()`（`TRUSTED_IDPS` 环境变量）。两处都要配上，
-  否则管理面绕过了这道防线。
+  user pools API 认证本地用户。拦截靠 token 的两个 claim，Web 侧在 Edge
+  （`REQUIRE_IDP_CLAIM` 开关）、MCP 侧在 `_caller_email()`（`TRUSTED_IDPS`
+  环境变量），两处都要配：
+  - `idp`（来自档案静态属性）只证明"账号关联过可信 IdP"，**不证明本次登录
+    来自它**——linked 本地用户与设过密码的联邦用户都能带着合法 idp 走原生
+    `InitiateAuth`；
+  - `auth_via`（pre-token 的 `triggerSource`）才是本次 token 的来源，只放行
+    `TokenGeneration_HostedAuth` 与 `TokenGeneration_RefreshTokens`。
+  配套运维红线：**不对平台 pool 调 `AdminCreateUser` /
+  `AdminSetUserPassword` / `AdminLinkProviderForUser`**（这三个造出可原生
+  登录的身份）。彻底阻断需要 WAF 挡 user pools API，三期做。
+- **IAM 里没有 `dynamodb:TransactWriteItems`**：事务内 Put/Update/Delete/Get
+  的权限由底层同名 action 决定，只有 `ConditionCheck` 需要独立的
+  `dynamodb:ConditionCheckItem`。写成不存在的 action 名 IAM 不报错，
+  运行时才 AccessDenied（moto 不查授权，单测发现不了——真机验一次）。
+- **写完立刻读要用 `get_site_consistent`**：`common.get_site` 是最终一致读。
+  `register_route` 在 seed 权限后紧接着读，用最终一致读可能拿到旧值，
+  `_route_item` 回落默认值 `allowed_users="org"`，把指定名单放大成全体。
 - **jobs 表的 `owner` 是发起者**（requested_by 语义），不参与授权；站点 owner
   只由 `permissions.transfer_owner` 与首次部署写。`mark_job` **不写 owner**
   ——写了会让 collaborator 部署一次就夺权。
