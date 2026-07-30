@@ -24,6 +24,15 @@
 - **Edge 路由表投影只认已支持的 DynamoDB 类型**：本计划 Task 8 之前 `_deser` 只认 `S`/`BOOL`，新增任何 `L`/`N`/`SS` 字段前必须先扩展 `_deser`，否则 Edge 侧静默变成 `False`。
 - **Function URL 一律 `AuthType=AWS_IAM`** 且只授权 edge role，并且需要 `lambda:InvokeFunctionUrl` + `lambda:InvokeFunction`（`InvokedViaFunctionUrl`）**两条**语句，缺一即 403。`AuthType=NONE` + `Principal:*` 会被安全扫描自动处置。
 - **git**：改动分批提交；`git push` 一律带 `--no-verify`。提交信息用中文或英文均可，遵循仓库现有 `type(scope): subject` 风格。
+- **每次 commit 前必须扫 staged diff**（`~/AGENTS.md` 的全局要求，适用于每个仓库的每次提交，"看起来显然安全"也要扫）。本计划的每个提交步骤都写成先扫后提交：
+  ```bash
+  git diff --cached | grep -nE 'AKIA|ASIA|ghp_|gho_|xoxb-|xoxp-|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=|/Users/[a-z]+/|[0-9]{12}' \
+    && echo "⚠️ 上面是命中项，逐条确认是否为故意的 fixture/占位符后再提交" \
+    || echo "secret scan: clean"
+  ```
+  命中不等于必须改——公开 URL、测试 fixture、co-author trailer 都会命中。**但必须先给用户看命中项再提交，不要自动清洗**。新文件首次 `git add` 前也要扫一遍。
+  本计划里可预期的命中：`*@x.com` 假邮箱、`000000000000` 占位账号、`ProbeOnly!2026x` 探测口令、`client_secret =` 空配置项——这些是刻意写的，确认即可。
+- **push 前**（若已过提交点）对待推送的 commit 再扫一次：`git diff origin/<branch>...HEAD | grep -nE '<同上模式>'`。
 - **验证纪律**：每处改动用真实 AWS API 实证验证（本项目被 mock 掉的层出过多次问题）。计划中标 `[真机]` 的步骤必须在真实 AWS 上跑，不能只靠 moto。
 - **发现文档与实际不符就同步更新**（`site-builder/DEPLOY.md`、`docs/` 下相关文档、`CLAUDE.md`）。
 - **`allowed_users` 语义**：`"org"`（字面量字符串）或邮箱数组。sites 表里存原生 List；路由表投影里 `"org"` 存 `S`、名单存 `L`（Task 8 起）。
@@ -279,6 +288,8 @@ Expected: PASS（22 passed）
 - [ ] **Step 5: 提交**
 
 ```bash
+# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
+git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
 git add site-builder/deployer/functions/permissions.py site-builder/deployer/tests/test_permissions.py
 git commit -m "feat(permissions): 角色判定模块（owner/collaborator/admin 两级+管理员）"
 ```
@@ -603,29 +614,67 @@ def now_iso() -> str:
 
 
 def is_admin(email: str) -> bool:
-    if not email:
+    if not email or email == "__count__":
         return False
-    return "Item" in _admins_table().get_item(Key={"email": email})
+    # 强一致读：撤权后必须立刻生效，最终一致读会留下代管窗口
+    return "Item" in _admins_table().get_item(Key={"email": email},
+                                              ConsistentRead=True)
 
 
 def list_admins() -> list[str]:
-    items = _admins_table().scan(ProjectionExpression="email").get("Items", [])
-    return sorted(i["email"] for i in items)
+    items = common._paginate(_admins_table().scan, ProjectionExpression="email")
+    # __count__ 是 remove_admin 的并发 sentinel，不是管理员
+    return sorted(i["email"] for i in items if i["email"] != "__count__")
 
 
 def add_admin(email: str, added_by: str) -> None:
+    """幂等新增管理员，并维护 __count__ sentinel（remove_admin 的条件依赖它）。"""
     if not EMAIL_RE.fullmatch(email or ""):
         raise ValueError(f"非法邮箱: {email!r}")
-    _admins_table().put_item(Item={"email": email, "added_by": added_by,
-                                   "added_at": now_iso()})
+    table = _admins_table()
+    existed = "Item" in table.get_item(Key={"email": email}, ConsistentRead=True)
+    table.put_item(Item={"email": email, "added_by": added_by,
+                         "added_at": now_iso()})
+    if existed:
+        return                      # 重复添加不改计数
+    table.update_item(
+        Key={"email": "__count__"},
+        UpdateExpression="SET n = if_not_exists(n, :zero) + :one",
+        ExpressionAttributeValues={":zero": 0, ":one": 1})
 
 
 def remove_admin(email: str) -> None:
-    # 名单删空 = 平台永久失去管理员（只能改 config 重跑部署脚本重新种子），
-    # 因此在此硬拦。
-    if list_admins() == [email]:
+    """删管理员。名单删空 = 平台永久失去管理入口，因此硬拦。
+
+    scan → delete 两步之间有并发窗口（两个管理员同时删自己，各自都看到
+    "还有两个"，结果表被删空）。用一条 sentinel item 记计数、在同一事务里
+    条件递减来关掉这个窗口：计数降到 0 的那次事务必然失败。
+    """
+    import botocore.exceptions
+    current = list_admins()
+    if email not in current:
+        return
+    if len(current) <= 1:
         raise PermissionDenied("不能删除最后一个管理员")
-    _admins_table().delete_item(Key={"email": email})
+    ddb = boto3.client("dynamodb",
+                       region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+    table = os.environ["ADMINS_TABLE"]
+    try:
+        ddb.transact_write_items(TransactItems=[
+            {"Delete": {"TableName": table,
+                        "Key": {"email": {"S": email}},
+                        "ConditionExpression": "attribute_exists(email)"}},
+            # sentinel 记录当前管理员数；条件保证递减后仍 ≥1
+            {"Update": {"TableName": table,
+                        "Key": {"email": {"S": "__count__"}},
+                        "UpdateExpression": "SET n = n - :one",
+                        "ConditionExpression": "n > :one",
+                        "ExpressionAttributeValues": {":one": {"N": "1"}}}}])
+    except botocore.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] == "TransactionCanceledException":
+            raise PermissionDenied(
+                "不能删除最后一个管理员（或名单刚被他人修改，请刷新重试）") from e
+        raise
 
 
 def normalize_allowed_users(value):
@@ -640,8 +689,14 @@ def normalize_allowed_users(value):
     return sorted(set(value))
 
 
-def _site_or_raise(site_id: str) -> dict:
-    site = common.get_site(site_id)
+def _site_or_raise(site_id: str, *, consistent: bool = False) -> dict:
+    """取站点记录。
+
+    consistent=True 用强一致读：授权判定与 read-modify-write 都基于它，
+    最终一致读会放大"权限刚被撤销但旧请求仍读到旧名单"的窗口。
+    """
+    site = (common.get_site_consistent(site_id) if consistent
+            else common.get_site(site_id))
     if not site:
         raise PermissionDenied(f"站点 {site_id} 不存在")
     return site
@@ -691,7 +746,7 @@ def write_permissions(site_id: str, *, actor: str, require_login=None,
     """
     import botocore.exceptions
 
-    site = _site_or_raise(site_id)
+    site = _site_or_raise(site_id, consistent=True)
     rev = int(site.get("permissions_rev", 0)) if expected_rev is None else int(expected_rev)
 
     effective = {
@@ -745,14 +800,17 @@ def write_permissions(site_id: str, *, actor: str, require_login=None,
         "TableName": os.environ["ROUTING_TABLE"],
         "Key": {"subdomain": {"S": common.subdomain_for(site_id)}},
         "UpdateExpression": ("SET require_auth = :a, allowed_users = :u, "
-                             "collaborators = :c, #ro = :o"),
+                             "collaborators = :c, #ro = :o, permissions_rev = :rv"),
         "ConditionExpression": "attribute_exists(subdomain)",
         "ExpressionAttributeNames": {"#ro": "owner"},
         "ExpressionAttributeValues": {
             ":a": {"BOOL": effective["require_login"]},
             ":u": allowed_users_av(effective["allowed_users"]),
             ":c": {"L": [{"S": e} for e in effective["collaborators"]]},
-            ":o": {"S": effective["owner"]}},
+            ":o": {"S": effective["owner"]},
+            # 投影带上 rev：register_route 用它判断"我读到的策略是否还是最新"
+            # （见 register_route 的条件事务）。
+            ":rv": {"N": str(rev + 1)}},
     }
 
     ddb = _ddb_client()
@@ -787,7 +845,11 @@ def set_access_policy(site_id: str, *, actor: str, require_login=None,
 
 
 def set_collaborators(site_id: str, *, actor: str, add=None, remove=None) -> list[str]:
-    site = _site_or_raise(site_id)
+    # 必须把**这次读**的 rev 传给 write_permissions：否则 write_permissions
+    # 内部会重新读一次、拿到别人刚推进的新 rev，然后用我基于旧快照算出的列表
+    # 覆盖掉对方的修改（丢更新）。
+    site = _site_or_raise(site_id, consistent=True)
+    rev = int(site.get("permissions_rev", 0))
     current = list(site.get("collaborators") or [])
     for e in (add or []):
         if not EMAIL_RE.fullmatch(e or ""):
@@ -799,15 +861,16 @@ def set_collaborators(site_id: str, *, actor: str, add=None, remove=None) -> lis
     for e in (remove or []):
         if e in current:
             current.remove(e)
-    return write_permissions(site_id, actor=actor,
-                             collaborators=current)["collaborators"]
+    return write_permissions(site_id, actor=actor, collaborators=current,
+                             expected_rev=rev)["collaborators"]
 
 
 def transfer_owner(site_id: str, *, actor: str, new_owner: str) -> dict:
     """转移所有权：原 owner 自动降级为 collaborator（防转错人即失联）。"""
     if not EMAIL_RE.fullmatch(new_owner or ""):
         raise ValueError(f"非法邮箱: {new_owner!r}")
-    site = _site_or_raise(site_id)
+    site = _site_or_raise(site_id, consistent=True)
+    rev = int(site.get("permissions_rev", 0))
     old_owner = site.get("owner", "")
     if new_owner == old_owner:
         raise ValueError("新 owner 与当前 owner 相同")
@@ -815,7 +878,7 @@ def transfer_owner(site_id: str, *, actor: str, new_owner: str) -> dict:
     if old_owner and old_owner not in collaborators:
         collaborators.append(old_owner)
     out = write_permissions(site_id, actor=actor, new_owner=new_owner,
-                            collaborators=collaborators)
+                            collaborators=collaborators, expected_rev=rev)
     return {"owner": out["owner"], "collaborators": out["collaborators"],
             "previous_owner": old_owner}
 ```
@@ -833,6 +896,8 @@ Expected: PASS（原有测试 + 新增，无回归）
 - [ ] **Step 7: 提交**
 
 ```bash
+# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
+git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
 git add site-builder/deployer/functions/permissions.py site-builder/deployer/tests/test_permissions.py site-builder/deployer/tests/conftest.py
 git commit -m "feat(permissions): admin 名单与权限写入（访问策略/协作者/所有权转移）"
 ```
@@ -1019,6 +1084,8 @@ endpoint_url =
 - [ ] **Step 7: 提交**
 
 ```bash
+# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
+git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
 git add site-builder/deployer/infra/app.py site-builder/deployer/tests/test_infra_tables.py site-builder/config.ini.example
 git commit -m "feat(infra): sites 表加 owner-index GSI；新增 site-admins 表"
 ```
@@ -1105,11 +1172,34 @@ Expected: FAIL — `AttributeError: module 'common' has no attribute 'list_sites
 在 `site-builder/deployer/functions/common.py` 的 `get_site` 之后追加：
 
 ```python
+def get_site_consistent(site_id: str) -> dict | None:
+    """强一致读。授权判定与 read-modify-write 用它：最终一致读会放大
+    "权限刚被撤销但旧请求仍读到旧名单"的窗口。"""
+    return _table("SITES_TABLE").get_item(
+        Key={"site_id": site_id}, ConsistentRead=True).get("Item")
+
+
+def _paginate(method, **kwargs) -> list[dict]:
+    """DynamoDB query/scan 分页汇总。
+
+    单次 query/scan 最多返回 1MB，**超出会静默截断**——不翻页就会出现
+    "站点列表少了几个"、"管理员名单看起来只剩一个"这类难查的问题。
+    """
+    items, start_key = [], None
+    while True:
+        if start_key:
+            kwargs["ExclusiveStartKey"] = start_key
+        resp = method(**kwargs)
+        items.extend(resp.get("Items", []))
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            return items
+
+
 def list_sites_by_owner(owner: str) -> list[dict]:
-    resp = _table("SITES_TABLE").query(
-        IndexName="owner-index",
-        KeyConditionExpression=Key("owner").eq(owner))
-    return resp.get("Items", [])
+    table = _table("SITES_TABLE")
+    return _paginate(table.query, IndexName="owner-index",
+                     KeyConditionExpression=Key("owner").eq(owner))
 
 
 def list_sites_for_user(email: str) -> list[dict]:
@@ -1119,10 +1209,10 @@ def list_sites_for_user(email: str) -> list[dict]:
     contains 过滤。站点规模到数百时改为维护反向索引表。
     """
     from boto3.dynamodb.conditions import Attr
+    table = _table("SITES_TABLE")
     items = {s["site_id"]: s for s in list_sites_by_owner(email)}
-    resp = _table("SITES_TABLE").scan(
-        FilterExpression=Attr("collaborators").contains(email))
-    for s in resp.get("Items", []):
+    for s in _paginate(table.scan,
+                       FilterExpression=Attr("collaborators").contains(email)):
         items.setdefault(s["site_id"], s)
     return list(items.values())
 ```
@@ -1135,6 +1225,8 @@ Expected: PASS
 - [ ] **Step 6: 提交**
 
 ```bash
+# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
+git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
 git add site-builder/deployer/functions/common.py site-builder/deployer/tests/test_common.py site-builder/deployer/tests/conftest.py site-builder/mcp/tests/conftest.py
 git commit -m "feat(common): 按 owner 查站点用 GSI；新增 owner∪collaborator 列表"
 ```
@@ -1149,7 +1241,8 @@ git commit -m "feat(common): 按 owner 查站点用 GSI；新增 owner∪collabo
 
 **Interfaces:**
 - Consumes: `common.get_site`、`common.upsert_site`、Task 2 的 `permissions.normalize_allowed_users`
-- Produces: 路由表 item 的权限字段来自 sites 表；首次部署（sites 表无权限字段）时用 manifest 的 `auth` 初始化 sites 表；`event["effective_auth"] = {"require_login": bool, "allowed_users": "org"|list}` 供下游 smoke_test 使用（Task 5b）。路由表 `allowed_users` 写法改为：`"org"` → `{"S": "org"}`；名单 → `{"L": [{"S": email}, ...]}`
+- Produces: 路由表 item 的权限字段来自 sites 表，写入走 **`TransactWriteItems`**（sites 的 `ConditionCheck` + 路由 `Put`，冲突重读重试 ≤3 次）；路由 item 多一个 `permissions_rev` 字段；首次部署的权限初始化用条件写 `attribute_not_exists(require_login)`；`event["effective_auth"] = {"require_login": bool, "allowed_users": "org"|list}` 供下游 smoke_test 使用（Task 5b）。路由表 `allowed_users` 写法：`"org"` → `{"S": "org"}`；名单 → `{"L": [{"S": email}, ...]}`
+- Consumes（补）: `permissions.allowed_users_av`、`permissions.now_iso`、`SITES_TABLE` 环境变量（条件写与 ConditionCheck 都要用到——`register_route` 此前只用 `ROUTING_TABLE`，确认 `common_env` 里两者都有）
 
 **依赖**：Task 8（Edge `_deser` 支持 L）必须**先于本任务部署到生产**，否则 Edge 读到 `L` 会静默变 `False`。代码合并顺序上本任务可以先写，但**部署顺序必须 Task 8 先上**——在提交信息里写明。
 
@@ -1203,6 +1296,62 @@ def test_register_route_prefers_sites_table_over_manifest(aws):
     assert item["collaborators"]["L"] == [{"S": "c@x.com"}]
     # sites 表不被 manifest 覆盖
     assert common.get_site("s-1")["require_login"] is False
+
+
+def test_register_route_refuses_stale_snapshot(aws, monkeypatch):
+    """并发交错：读到"公开"后，别人把权限改成私有 → 本次不得把路由写回公开。
+
+    模拟 spec §3.2 描述的那条交错：在 register_route 读完 sites、写路由之前，
+    在线改权限的事务已经把 sites 与路由都改成私有（rev 也推进了）。
+    条件事务必须拒绝这次写入，重读后用新策略成稿。
+    """
+    import boto3
+    import common
+    import register_route
+    common.upsert_site("s-1", owner="o@x.com", require_login=False,
+                       allowed_users="org", collaborators=[], permissions_rev=0)
+    job_id = common.create_job("o@x.com", "s-1")
+
+    real_get_site = common.get_site
+    calls = {"n": 0}
+
+    def _racing_get_site(site_id):
+        site = real_get_site(site_id)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # 第一次读之后、写路由之前，别人把权限收紧了（rev 推进）
+            common.upsert_site(site_id, require_login=True,
+                               allowed_users=["vip@x.com"], permissions_rev=1)
+        return site
+
+    monkeypatch.setattr(register_route.common, "get_site", _racing_get_site)
+    register_route.handler({"job_id": job_id, "site_id": "s-1", "api_target": "",
+                            "manifest": {"auth": {"require_login": False,
+                                                  "allowed_users": "org"}}}, None)
+
+    item = boto3.client("dynamodb").get_item(
+        TableName="routing", Key={"subdomain": {"S": "app-s-1"}})["Item"]
+    # 最终必须是收紧后的策略，而不是第一次读到的"公开"
+    assert item["require_auth"]["BOOL"] is True
+    assert item["allowed_users"]["L"] == [{"S": "vip@x.com"}]
+    assert int(item["permissions_rev"]["N"]) == 1
+
+
+def test_register_route_seed_does_not_overwrite_concurrent_online_change(aws):
+    """首次部署的初始化必须条件写：不能覆盖并发的首次在线权限修改。"""
+    import common
+    import register_route
+    # 用户在首次部署跑到这一步之前就用控制台设了策略
+    common.upsert_site("s-2", owner="o@x.com", require_login=False,
+                       allowed_users=["early@x.com"], collaborators=[],
+                       permissions_rev=1)
+    job_id = common.create_job("o@x.com", "s-2")
+    register_route.handler({"job_id": job_id, "site_id": "s-2", "api_target": "",
+                            "manifest": {"auth": {"require_login": True,
+                                                  "allowed_users": "org"}}}, None)
+    site = common.get_site("s-2")
+    assert site["require_login"] is False               # 在线值保留
+    assert site["allowed_users"] == ["early@x.com"]     # 不被 manifest 覆盖
 
 
 def test_register_route_emits_effective_auth_for_smoke_test(aws):
@@ -1264,48 +1413,109 @@ import common
 import permissions
 
 
-def _seed_permissions_if_absent(site_id: str, site: dict, manifest_auth: dict,
-                                owner: str) -> dict:
-    """首次部署：把 manifest 的 auth 落进 sites 表作为初始值。"""
-    if "require_login" in site:
-        return site
+MAX_ROUTE_ATTEMPTS = 3
+
+
+def _seed_permissions_if_absent(site_id: str, manifest_auth: dict,
+                                owner: str) -> None:
+    """首次部署：把 manifest 的 auth 落进 sites 表作为初始值。
+
+    条件写 attribute_not_exists(require_login)——否则与"用户在首次部署期间
+    就用控制台改了权限"并发时会把在线修改覆盖掉。条件不满足说明已有真源，
+    什么都不做（本次部署用真源的值）。
+    """
+    import botocore.exceptions
     allowed = permissions.normalize_allowed_users(manifest_auth["allowed_users"])
-    attrs = {"require_login": bool(manifest_auth["require_login"]),
-             "allowed_users": allowed,
-             "collaborators": list(site.get("collaborators") or []),
-             "permissions_updated_at": permissions.now_iso(),
-             "permissions_updated_by": owner}
-    common.upsert_site(site_id, **attrs)
-    return {**site, **attrs}
+    try:
+        boto3.resource("dynamodb", region_name=os.environ.get(
+            "AWS_DEFAULT_REGION", "us-east-1")).Table(
+            os.environ["SITES_TABLE"]).update_item(
+            Key={"site_id": site_id},
+            UpdateExpression=("SET require_login = :rl, allowed_users = :au, "
+                              "permissions_updated_at = :t, "
+                              "permissions_updated_by = :by, "
+                              "permissions_rev = if_not_exists(permissions_rev, :zero)"),
+            ConditionExpression="attribute_not_exists(require_login)",
+            ExpressionAttributeValues={
+                ":rl": bool(manifest_auth["require_login"]),
+                ":au": allowed,
+                ":t": permissions.now_iso(),
+                ":by": owner,
+                ":zero": 0})
+    except botocore.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise   # 真源已存在：用它的值，不覆盖
+
+
+def _route_item(event, site: dict, owner: str, subdomain: str) -> dict:
+    allowed = site.get("allowed_users", "org")
+    return {"subdomain": {"S": subdomain},
+            "site_id": {"S": event["site_id"]},
+            "route_mode": {"S": "split"},
+            "static_prefix": {"S": f"sites/{event['site_id']}/{event['job_id']}"},
+            "api_target": {"S": event.get("api_target", "")},
+            "require_auth": {"BOOL": bool(site.get("require_login", True))},
+            "allowed_users": permissions.allowed_users_av(allowed),
+            "collaborators": {"L": [{"S": e} for e in
+                                    (site.get("collaborators") or [])]},
+            "owner": {"S": owner},
+            "permissions_rev": {"N": str(int(site.get("permissions_rev", 0)))}}
 
 
 def handler(event, context):
+    """写路由（原子切流）。权限值取自 sites 表真源，并用条件事务防并发覆盖。
+
+    为什么必须是事务：本步骤是"读 sites → 写整条路由"。若中间有人在线收紧
+    权限（那边是两表事务，sites 与路由都已改成私有），这里再用旧快照
+    put_item 整条，就把路由写回公开——sites=私有 / Edge=公开，正是在线改权限
+    的事务本该消除的安全状态错误。DynamoDB 事务只保证事务内原子，不会把事务
+    之前的普通读与之后的普通写合成一个业务事务。见 spec §3.2。
+
+    做法：对 sites 表做 ConditionCheck（permissions_rev 仍是我读到的值）+
+    对路由表 Put 整条，同一事务提交。冲突则重读重试（≤3 次）；仍冲突就让
+    本步骤失败——部署 FAILED 比留下错误的公开状态好。
+    """
+    import botocore.exceptions
+
     common.update_job(event["job_id"], phase="register-route")
+    subdomain = common.subdomain_for(event["site_id"])
+    ddb = boto3.client("dynamodb")
+
     site = common.get_site(event["site_id"]) or {}
     owner = site.get("owner") or common.get_job(event["job_id"])["owner"]
-    site = _seed_permissions_if_absent(event["site_id"], site,
-                                       event["manifest"]["auth"], owner)
+    _seed_permissions_if_absent(event["site_id"], event["manifest"]["auth"], owner)
 
-    allowed = site.get("allowed_users", "org")
-    collaborators = list(site.get("collaborators") or [])
-    subdomain = common.subdomain_for(event["site_id"])
+    for attempt in range(MAX_ROUTE_ATTEMPTS):
+        site = common.get_site(event["site_id"]) or {}
+        owner = site.get("owner") or owner
+        rev = int(site.get("permissions_rev", 0))
+        try:
+            ddb.transact_write_items(TransactItems=[
+                {"ConditionCheck": {
+                    "TableName": os.environ["SITES_TABLE"],
+                    "Key": {"site_id": {"S": event["site_id"]}},
+                    "ConditionExpression": (
+                        "attribute_not_exists(permissions_rev) OR "
+                        "permissions_rev = :rev"),
+                    "ExpressionAttributeValues": {":rev": {"N": str(rev)}}}},
+                {"Put": {"TableName": os.environ["ROUTING_TABLE"],
+                         "Item": _route_item(event, site, owner, subdomain)}}])
+            break
+        except botocore.exceptions.ClientError as e:
+            if e.response["Error"]["Code"] != "TransactionCanceledException":
+                raise
+            if attempt == MAX_ROUTE_ATTEMPTS - 1:
+                raise RuntimeError(
+                    "写路由时站点权限被并发修改，已重试 "
+                    f"{MAX_ROUTE_ATTEMPTS} 次仍冲突——本次部署失败，请重新部署"
+                ) from e
+            # 重读循环顶部会拿到新 rev 与新策略
 
-    boto3.client("dynamodb").put_item(
-        TableName=os.environ["ROUTING_TABLE"],
-        Item={"subdomain": {"S": subdomain},
-              "site_id": {"S": event["site_id"]},
-              "route_mode": {"S": "split"},
-              "static_prefix": {"S": f"sites/{event['site_id']}/{event['job_id']}"},
-              "api_target": {"S": event.get("api_target", "")},
-              "require_auth": {"BOOL": bool(site.get("require_login", True))},
-              "allowed_users": permissions.allowed_users_av(allowed),
-              "collaborators": {"L": [{"S": e} for e in collaborators]},
-              "owner": {"S": owner}})
     # smoke_test 必须按本次实际写入路由的策略断言，不能按 manifest
     # （在线翻转过 require_login 时两者不一致，会把成功的部署判成 FAILED，
     #  而路由切换已经发生）。见 spec §3.3.2。
     event["effective_auth"] = {"require_login": bool(site.get("require_login", True)),
-                               "allowed_users": allowed}
+                               "allowed_users": site.get("allowed_users", "org")}
     event["url"] = f"https://{subdomain}.{os.environ['BASE_DOMAIN']}"
     return event
 ```
@@ -1325,6 +1535,8 @@ Expected: PASS
 - [ ] **Step 7: 提交**
 
 ```bash
+# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
+git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
 git add site-builder/deployer/functions/register_route.py site-builder/deployer/tests/test_finalize_steps.py
 git commit -m "feat(deployer): register_route 权限取自 sites 表（真源），allowed_users 投影为 L
 
@@ -1432,6 +1644,8 @@ Expected: PASS
 - [ ] **Step 6: 提交**
 
 ```bash
+# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
+git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
 git add site-builder/deployer/functions/mark_job.py site-builder/deployer/functions/common.py site-builder/deployer/tests/test_finalize_steps.py
 git commit -m "fix(deployer): mark_job 不再把 job 发起者写成站点 owner
 
@@ -1524,6 +1738,8 @@ Expected: PASS
 - [ ] **Step 5: 提交**
 
 ```bash
+# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
+git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
 git add site-builder/deployer/functions/smoke_test.py site-builder/deployer/tests/test_finalize_steps.py
 git commit -m "fix(deployer): smoke_test 按 effective policy 断言而非 manifest
 
@@ -1579,6 +1795,8 @@ Expected: PASS（67 tests，无行为变化）
 - [ ] **Step 5: 提交**
 
 ```bash
+# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
+git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
 git add site-builder/skills/site-builder/references/contract.md site-builder/contract/src/contract/schema.py
 git commit -m "docs(contract): 明确 site.json auth 仅首次部署生效，之后以控制台为准"
 ```
@@ -1847,6 +2065,8 @@ Expected: PASS（6 passed）
 - [ ] **Step 5: 提交**
 
 ```bash
+# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
+git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
 git add site-builder/scripts/migrate_permissions.py site-builder/deployer/tests/test_migrate_permissions.py
 git commit -m "feat(scripts): 存量权限迁移脚本（路由表 → sites 表，默认 dry-run）"
 ```
@@ -2002,6 +2222,8 @@ Expected: 远小于 1MB（当前约 15KB）——记录数字，确认改动没�
 - [ ] **Step 7: 提交**
 
 ```bash
+# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
+git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
 git add router/infrastructure/lambda/origin_request.py router/infrastructure/lambda/test_edge_auth.py
 git commit -m "feat(edge): _deser 支持 L/N；名单判定接受原生 List 并放行 collaborators
 
@@ -2009,6 +2231,239 @@ git commit -m "feat(edge): _deser 支持 L/N；名单判定接受原生 List 并
 ```
 
 ---
+
+## Task 8b: Edge 校验 `idp` claim（org 语义的执行点）
+
+**Files:**
+- Modify: `router/infrastructure/lambda/origin_request.py`（新增两个占位符 + `_check_auth` 校验）
+- Modify: `router/infrastructure/stack.py:146-186`（注入两个新占位符）
+- Modify: `router/config.ini.example`（`[SiteBuilder]` 加两项）
+- Modify: `router/infrastructure/lambda/test_edge_auth.py`
+
+**Interfaces:**
+- Consumes: 会话 JWT 的 `idp` claim（Task 13 Step 2b 起由 auth 服务签入）
+- Produces: Edge 侧两个部署期占位符
+  - `REQUIRE_IDP_CLAIM`（`"true"`/`"false"` 字符串，模块级转 bool）
+  - `TRUSTED_IDPS`（逗号分隔的 provider 名单，如 `"Feishu"` 或 `"Okta,Feishu"`）
+
+**为什么必须做**：spec §3.5 的三道约束里，前两条（关自注册、client 不列
+`COGNITO`）只减小暴露面——AWS 明确说移除 `COGNITO` **不阻止** SDK 经 user
+pools API 认证本地用户。**这一条是唯一在请求路径上执行"身份必须来自企业
+IdP"的地方**。不做它，`allowed_users="org"` 就等于"任何能拿到本 pool token
+的人"。
+
+**上线顺序**：本任务与 Task 8 一起部署（同一个 Edge 函数文件），但
+`require_idp_claim` 先配 `false`——存量会话没有 `idp` claim，直接置 true 会把
+所有人拦在门外。翻转到 `true` 是 Task 15 Step 6c（M1 的完成条件）。
+
+- [ ] **Step 1: 写失败测试**
+
+在 `router/infrastructure/lambda/test_edge_auth.py` 末尾追加。注意本文件顶部的
+占位符替换字典也要加两项（否则 `_edge_auth_testable.py` 里留着未替换的
+`{{...}}` 字面量）：
+
+```python
+# 文件顶部的替换字典加这两项：
+#     "{{REQUIRE_IDP_CLAIM}}": "true", "{{TRUSTED_IDPS}}": "Feishu,Okta",
+# 改完后本文件所有既有用例仍需通过——它们用的 _jwt() 要相应带上 idp。
+
+
+def _jwt_idp(email="a@x.com", idp="Feishu", exp_delta=3600, secret="test-secret"):
+    """带 idp claim 的会话 JWT（Task 13 起 auth 服务签的就是这种）。"""
+    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+    h = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+    payload = {"email": email, "name": "Alice",
+               "exp": int(time.time()) + exp_delta}
+    if idp:
+        payload["idp"] = idp
+    p = b64(json.dumps(payload).encode())
+    sig = b64(hmac.new(secret.encode(), f"{h}.{p}".encode(), hashlib.sha256).digest())
+    return f"{h}.{p}.{sig}"
+
+
+def test_trusted_idp_session_is_admitted():
+    r = _req(cookie=f"sb_session={_jwt_idp(idp='Feishu')}")
+    assert orq._check_auth(r, dict(ROUTE_AUTH), "app-x.example.com") is None
+
+
+def test_second_trusted_idp_also_admitted():
+    r = _req(cookie=f"sb_session={_jwt_idp(idp='Okta')}")
+    assert orq._check_auth(r, dict(ROUTE_AUTH), "app-x.example.com") is None
+
+
+def test_session_without_idp_is_rejected_when_required():
+    """本地用户（SDK 直接认证 user pool）签出的会话没有 idp——必须拦住。
+
+    这是 spec §3.5 的核心：移除 COGNITO 不阻止 SDK 认证本地用户，
+    只有这条校验能把"身份必须来自企业 IdP"落到请求路径上。
+    """
+    r = _req(cookie=f"sb_session={_jwt_idp(idp=None)}")
+    resp = orq._check_auth(r, dict(ROUTE_AUTH), "app-x.example.com")
+    assert resp["status"] == "302"          # 按未登录处理，不是 403
+
+
+def test_untrusted_idp_is_rejected():
+    r = _req(cookie=f"sb_session={_jwt_idp(idp='EvilCorp')}")
+    assert orq._check_auth(r, dict(ROUTE_AUTH),
+                           "app-x.example.com")["status"] == "302"
+
+
+def test_idp_check_applies_to_named_allowlist_too():
+    """名单站点同样要过 idp 校验——不能因为在名单里就跳过来源检查。"""
+    route = {**ROUTE_AUTH, "allowed_users": ["a@x.com"]}
+    r = _req(cookie=f"sb_session={_jwt_idp(email='a@x.com', idp=None)}")
+    assert orq._check_auth(r, route, "app-x.example.com")["status"] == "302"
+
+
+def test_public_route_skips_idp_check():
+    """公开站点（require_auth=False）根本不验会话，自然也不验 idp。"""
+    route = {**ROUTE_AUTH, "require_auth": False}
+    r = _req(cookie=f"sb_session={_jwt_idp(idp=None)}")
+    assert orq._check_auth(r, route, "app-x.example.com") is None
+
+
+def test_idp_check_disabled_by_switch():
+    """开关为 false 时放行无 idp 的会话——迁移宽限期的行为。
+
+    用独立的 testable 副本验证：把占位符替换成 false 后重新加载模块。
+    """
+    import importlib
+    import sys
+    src = (Path(__file__).parent / "origin_request.py").read_text()
+    for k, v in {"{{DYNAMODB_TABLE_NAME}}": "t", "{{DYNAMODB_REGION}}": "us-east-1",
+                 "{{FRONTEND_BUCKET_DOMAIN}}": "b.s3.us-east-1.amazonaws.com",
+                 "{{JWT_SECRET}}": "test-secret", "{{BASE_DOMAIN}}": "example.com",
+                 "{{REQUIRE_IDP_CLAIM}}": "false",
+                 "{{TRUSTED_IDPS}}": "Feishu"}.items():
+        src = src.replace(k, v)
+    (Path(__file__).parent / "_edge_noidp_testable.py").write_text(src)
+    sys.path.insert(0, str(Path(__file__).parent))
+    mod = importlib.import_module("_edge_noidp_testable")
+    importlib.reload(mod)
+    r = _req(cookie=f"sb_session={_jwt_idp(idp=None)}")
+    assert mod._check_auth(r, dict(ROUTE_AUTH), "app-x.example.com") is None
+```
+
+顶部若无 `from pathlib import Path` 则加上；`_edge_noidp_testable.py` 与既有的
+`_edge_auth_testable.py` 一样是生成物，加进 `.gitignore`（若该目录的
+gitignore 用的是通配 `_edge_*_testable.py` 则无需改）。
+
+- [ ] **Step 2: 修既有测试（它们现在会因缺 idp 而失败）**
+
+Run: `cd router/infrastructure/lambda && ../../../site-builder/deployer/.venv/bin/pytest . -q`
+Expected: 多条既有用例 FAIL——`_jwt()` 签的 token 没有 `idp`，而占位符已置
+`true`。把 `_jwt()` 的 payload 加上 `"idp": "Feishu"`（保留一个不带 idp 的
+变体给 Step 1 的负向用例用，即上面的 `_jwt_idp(idp=None)`）：
+
+```python
+def _jwt(email="a@x.com", name="Alice", exp_delta=3600, secret="test-secret",
+         idp="Feishu"):
+    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+    h = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+    payload = {"name": name, "exp": int(time.time()) + exp_delta}
+    if email is not None:  # email=None -> payload 完全省略 email 字段
+        payload["email"] = email
+    if idp:
+        payload["idp"] = idp
+    p = b64(json.dumps(payload).encode())
+    sig = b64(hmac.new(secret.encode(), f"{h}.{p}".encode(), hashlib.sha256).digest())
+    return f"{h}.{p}.{sig}"
+```
+
+`test_org_route_admits_anyone_with_valid_session` 的语义也要收紧——它现在断言
+"任意有效会话都能进 org 站点"，与本任务直接冲突。改为：
+
+```python
+def test_org_route_admits_any_email_from_trusted_idp():
+    """org 的语义是"来自可信 IdP 的任何人"，不是"任何有效会话"。"""
+    r = _req(cookie=f"sb_session={_jwt(email='anyone@x.com')}")   # 带 idp
+    assert orq._check_auth(r, dict(ROUTE_AUTH), "app-x.example.com") is None
+```
+
+- [ ] **Step 3: 改 Edge 实现**
+
+`router/infrastructure/lambda/origin_request.py`：在 `BASE_DOMAIN` 声明附近加
+两个占位符与解析：
+
+```python
+# spec §3.5：org 语义的执行点。移除 COGNITO 不阻止 SDK 认证本地用户，
+# 只有这里能把"身份必须来自企业 IdP"落到请求路径上。
+# 迁移宽限期用开关控制（存量会话没有 idp claim）——切 pool 且全员重新登录后
+# 置 true，这是 M1 的完成条件。
+REQUIRE_IDP_CLAIM = "{{REQUIRE_IDP_CLAIM}}".strip().lower() == "true"
+TRUSTED_IDPS = tuple(x.strip() for x in "{{TRUSTED_IDPS}}".split(",") if x.strip())
+```
+
+在 `_check_auth` 里、`claims` 验签通过之后、名单判定之前插入：
+
+```python
+    if REQUIRE_IDP_CLAIM:
+        # 按未登录处理（302）而非 403：本地用户/旧会话应被引导去正规登录，
+        # 403 会让用户以为"没权限"而去找站点 owner 加名单。
+        if claims.get("idp") not in TRUSTED_IDPS:
+            return _redirect_login(host, request.get("uri", "/"),
+                                   request.get("querystring", ""))
+```
+
+- [ ] **Step 4: CDK 注入占位符**
+
+`router/infrastructure/stack.py` 的占位符替换链（`jwt_secret` 那段）加两项：
+
+```python
+        lambda_code = (lambda_code
+            .replace("{{FRONTEND_BUCKET_DOMAIN}}",
+                     f"{frontend_bucket}.s3.us-east-1.amazonaws.com")
+            .replace("{{JWT_SECRET}}", jwt_secret)
+            .replace("{{BASE_DOMAIN}}", base_domain)
+            .replace("{{REQUIRE_IDP_CLAIM}}",
+                     config.get("SiteBuilder", "require_idp_claim",
+                                "APP_REQUIRE_IDP_CLAIM"))
+            .replace("{{TRUSTED_IDPS}}",
+                     config.get("SiteBuilder", "trusted_idps",
+                                "APP_TRUSTED_IDPS")))
+```
+
+`router/config.ini.example` 的 `[SiteBuilder]` 段加：
+
+```ini
+# spec §3.5：会话必须来自可信企业 IdP。存量会话没有 idp claim，
+# 所以首次部署配 false；切到平台专用 pool 且全体用户重新登录后置 true
+# （M1 的完成条件——停在 false 等于这道防线没生效）。
+require_idp_claim = false
+# Cognito 里 IdP 的 provider name，逗号分隔（如 Feishu 或 Okta,Feishu）。
+# 必须与 site-builder/config.ini [IdP] provider_name 一致。
+trusted_idps =
+```
+
+- [ ] **Step 5: 运行测试确认通过**
+
+Run: `cd router/infrastructure/lambda && ../../../site-builder/deployer/.venv/bin/pytest . -q`
+Expected: PASS（既有用例 + 新增 7 条）
+
+- [ ] **Step 6: 确认 synth 能注入（不部署）**
+
+Run:
+```bash
+cd router/infrastructure && PATH=.venv/bin:$PATH npx -y aws-cdk@latest synth 2>/dev/null \
+  | grep -c 'REQUIRE_IDP_CLAIM\|TRUSTED_IDPS'
+```
+Expected: `0`——占位符已被替换掉，模板里不该再出现它们的字面量。若为非 0，
+说明 config 键名拼错或替换链漏了，此时部署出去开关值是字面量字符串
+（`"{{REQUIRE_IDP_CLAIM}}".lower() == "true"` 为 False，等于静默关闭防线）。
+
+- [ ] **Step 7: 提交**
+
+```bash
+# AGENTS.md 要求：commit 前扫 staged diff
+git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN .*PRIVATE KEY|password[[:space:]]*=' || echo "secret scan: clean"
+git add router/infrastructure/lambda/origin_request.py \
+  router/infrastructure/lambda/test_edge_auth.py \
+  router/infrastructure/stack.py router/config.ini.example
+git commit -m "feat(edge): 校验会话的 idp claim（org 语义的执行点，带迁移开关)"
+```
+
+---
+
 
 ## Task 9: 部署 Edge 与 deployer，真机验证权限投影
 
@@ -2136,6 +2591,8 @@ Expected: `allowed` 是 `{"S":"org"}` 或 `{"L":[...]}`；`collab` 是 `{"L":[]}
 - [ ] **Step 10: 提交**
 
 ```bash
+# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
+git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
 git add site-builder/DEPLOY.md
 git commit -m "docs(deploy): 二期 M2 权限真源迁移步骤与部署顺序约束"
 ```
@@ -2389,6 +2846,8 @@ Expected: PASS（工具数仍是 5，本任务未加新工具）
 - [ ] **Step 7: 提交**
 
 ```bash
+# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
+git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
 git add site-builder/mcp/server.py site-builder/mcp/Dockerfile site-builder/mcp/deploy_agentcore.py site-builder/mcp/tests/test_tools.py
 git commit -m "feat(mcp): 换用 permissions 角色判定；list_my_sites 走 GSI 并含协作站点"
 ```
@@ -2709,6 +3168,8 @@ Expected: PASS
 - [ ] **Step 8: 提交**
 
 ```bash
+# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
+git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
 git add site-builder/mcp/server.py site-builder/mcp/tests/test_tools.py site-builder/mcp/tests/test_agentcore_contract.py site-builder/mcp/deploy_agentcore.py
 git commit -m "feat(mcp): 新增 update_site_permissions / manage_collaborators / get_site_permissions"
 ```
@@ -2876,6 +3337,8 @@ Expected: owner 是对方；你在 collaborators 里。再调 `undeploy_site` �
 - [ ] **Step 9: 提交**
 
 ```bash
+# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
+git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
 git add site-builder/skills/site-builder/SKILL.md site-builder/DEPLOY.md
 git commit -m "docs: 权限管理工具写进 Skill 与部署手册"
 ```
@@ -2893,9 +3356,11 @@ git commit -m "docs: 权限管理工具写进 Skill 与部署手册"
 - Consumes: 无（auth 服务内部）
 - Produces:
   - `_pkce_pair() -> tuple[str, str]`（verifier, challenge）
-  - `_encode_state(redirect: str, verifier: str, nonce: str) -> str`
-  - `_decode_state(state: str) -> dict | None`（返回 `{"r":..., "v":..., "n":...}`）
-  - `_exchange_code(code: str, verifier: str, nonce: str) -> dict`（多两个参数，校验 id_token 的 nonce）
+  - `_encode_state(redirect: str) -> str`（state 只含 redirect+exp）
+  - `_decode_state(state: str) -> str | None`（返回 redirect）
+  - `_pkce_cookie(verifier, nonce, base) -> str`、`_read_pkce_cookie(event) -> dict | None`、`PKCE_COOKIE = "__Host-sb_pkce"`
+  - `_exchange_code(code: str, verifier: str, nonce: str) -> dict`（多两个参数，校验 id_token 的 nonce；返回 `{email, name, idp}`）
+  - `session.mint_session_jwt(email, name, secret, ttl_seconds=86400, idp="", scope="")`（payload 增 `idp`/`scope`，仅在非空时写入）
 
 - [ ] **Step 1: 写失败测试**
 
@@ -2917,8 +3382,9 @@ ENV = {"JWT_SECRET": "s3cret",
        "USER_POOL_ID": "us-east-1_test"}
 
 
-def _event(path, qs=None):
+def _event(path, qs=None, cookies=None):
     return {"rawPath": path, "queryStringParameters": qs or {},
+            "cookies": cookies or [],
             "requestContext": {"http": {"method": "GET"}}}
 
 
@@ -2948,29 +3414,104 @@ def test_login_includes_code_challenge_and_nonce():
 
 
 @patch.dict(lh.os.environ, ENV)
-def test_state_roundtrip_carries_verifier_and_nonce():
-    state = lh._encode_state("https://app-x.example.com/", "ver123", "non456")
-    got = lh._decode_state(state)
-    assert got["r"] == "https://app-x.example.com/"
-    assert got["v"] == "ver123"
-    assert got["n"] == "non456"
+def test_state_carries_only_redirect():
+    """verifier/nonce 绝不能进 state（会经 URL/Referer/日志/历史泄漏）。"""
+    import base64 as b64mod
+    import json as jsonmod
+    state = lh._encode_state("https://app-x.example.com/")
+    assert lh._decode_state(state) == "https://app-x.example.com/"
+    body = state.rpartition(".")[0]
+    payload = jsonmod.loads(b64mod.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+    assert set(payload) == {"r", "exp"}
 
 
 @patch.dict(lh.os.environ, ENV)
 def test_tampered_state_rejected():
-    state = lh._encode_state("https://app-x.example.com/", "ver123", "non456")
+    state = lh._encode_state("https://app-x.example.com/")
     body, _, sig = state.rpartition(".")
     assert lh._decode_state(f"{body}x.{sig}") is None
 
 
 @patch.dict(lh.os.environ, ENV)
-def test_callback_passes_verifier_to_token_exchange():
-    state = lh._encode_state("https://app-x.example.com/", "ver123", "non456")
+def test_login_sets_host_only_pkce_cookie():
+    r = lh.handler(_event("/login", {"redirect": "https://app-x.example.com/"}), None)
+    cookie = next(c for c in r["cookies"] if c.startswith(lh.PKCE_COOKIE))
+    assert "Domain=" not in cookie          # __Host- 要求无 Domain
+    assert "Secure" in cookie and "HttpOnly" in cookie
+    assert "Path=/" in cookie and "Max-Age=300" in cookie
+    # authorize URL 里不得出现 verifier
+    assert "code_challenge=" in r["headers"]["Location"]
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_callback_takes_verifier_from_cookie():
+    r_login = lh.handler(_event("/login", {"redirect": "https://app-x.example.com/"}),
+                         None)
+    state = [q.split("state=")[1] for q in [r_login["headers"]["Location"]]
+             if "state=" in q][0]
+    import urllib.parse as up
+    state = up.unquote(state.split("&")[0])
+    pkce_cookie = next(c for c in r_login["cookies"]
+                       if c.startswith(lh.PKCE_COOKIE)).split(";")[0]
     with patch.object(lh, "_exchange_code",
-                      return_value={"email": "a@x.com", "name": "A"}) as ex:
-        r = lh.handler(_event("/callback", {"code": "abc", "state": state}), None)
+                      return_value={"email": "a@x.com", "name": "A",
+                                    "idp": "Feishu"}) as ex:
+        r = lh.handler(_event("/callback", {"code": "abc", "state": state},
+                              cookies=[pkce_cookie]), None)
     assert r["statusCode"] == 302
-    ex.assert_called_once_with("abc", "ver123", "non456")
+    # verifier 来自 cookie，不是 state
+    args = ex.call_args[0]
+    assert args[0] == "abc" and args[1] and args[2]
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_callback_without_pkce_cookie_is_rejected():
+    """cookie 丢失时必须让用户重登，不能静默降级成无 PKCE 交换。"""
+    state = lh._encode_state("https://app-x.example.com/")
+    r = lh.handler(_event("/callback", {"code": "abc", "state": state}), None)
+    assert r["statusCode"] == 400
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_callback_rejects_forged_pkce_cookie():
+    state = lh._encode_state("https://app-x.example.com/")
+    r = lh.handler(_event("/callback", {"code": "abc", "state": state},
+                          cookies=[f"{lh.PKCE_COOKIE}=forged.sig"]), None)
+    assert r["statusCode"] == 400
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_callback_clears_pkce_cookie():
+    r_login = lh.handler(_event("/login", {"redirect": "https://app-x.example.com/"}),
+                         None)
+    import urllib.parse as up
+    state = up.unquote(r_login["headers"]["Location"].split("state=")[1].split("&")[0])
+    pkce_cookie = next(c for c in r_login["cookies"]
+                       if c.startswith(lh.PKCE_COOKIE)).split(";")[0]
+    with patch.object(lh, "_exchange_code",
+                      return_value={"email": "a@x.com", "name": "A", "idp": "Okta"}):
+        r = lh.handler(_event("/callback", {"code": "abc", "state": state},
+                              cookies=[pkce_cookie]), None)
+    assert any(c.startswith(lh.PKCE_COOKIE) and "Max-Age=0" in c
+               for c in r["cookies"])
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_callback_passes_idp_into_session():
+    """idp 必须进会话 JWT，否则 Edge 的校验会把合法用户全拦住。"""
+    r_login = lh.handler(_event("/login", {"redirect": "https://app-x.example.com/"}),
+                         None)
+    import urllib.parse as up
+    state = up.unquote(r_login["headers"]["Location"].split("state=")[1].split("&")[0])
+    pkce_cookie = next(c for c in r_login["cookies"]
+                       if c.startswith(lh.PKCE_COOKIE)).split(";")[0]
+    with patch.object(lh, "_exchange_code",
+                      return_value={"email": "a@x.com", "name": "A",
+                                    "idp": "Feishu"}), \
+         patch.object(lh, "mint_session_jwt", return_value="tok") as mint:
+        lh.handler(_event("/callback", {"code": "abc", "state": state},
+                          cookies=[pkce_cookie]), None)
+    assert mint.call_args.kwargs.get("idp") == "Feishu"
 
 
 @patch.dict(lh.os.environ, ENV)
@@ -3037,6 +3578,79 @@ def test_post_token_body_includes_code_verifier():
 Run: `cd site-builder/auth && ../contract/.venv/bin/pytest tests/test_pkce.py -q`
 Expected: FAIL — `AttributeError: module 'login_handler' has no attribute '_pkce_pair'`
 
+- [ ] **Step 2b: 让 `session.mint_session_jwt` 带 `idp` / `scope` claim**
+
+`idp` 是 spec §3.5 的主防线在会话侧的载体；`scope` 供 M3 的面板会话复用同一
+函数。两者都只在非空时写入 payload——**空值不写**，这样现有 token 的字节形态
+不变，Edge 的验签逻辑无需改动即可兼容。
+
+先写测试 `site-builder/auth/tests/test_session.py`（在现有文件末尾追加）：
+
+```python
+def test_mint_includes_idp_when_given():
+    import json, base64
+    tok = session.mint_session_jwt("a@x.com", "Alice", "s3cret", idp="Feishu")
+    payload = json.loads(base64.urlsafe_b64decode(
+        tok.split(".")[1] + "=" * (-len(tok.split(".")[1]) % 4)))
+    assert payload["idp"] == "Feishu"
+    assert payload["email"] == "a@x.com"
+
+
+def test_mint_omits_idp_when_empty():
+    """空值不写入：保持与一期 token 的字节形态兼容。"""
+    import json, base64
+    tok = session.mint_session_jwt("a@x.com", "Alice", "s3cret")
+    payload = json.loads(base64.urlsafe_b64decode(
+        tok.split(".")[1] + "=" * (-len(tok.split(".")[1]) % 4)))
+    assert "idp" not in payload
+    assert "scope" not in payload
+
+
+def test_mint_includes_scope_for_console_session():
+    import json, base64
+    tok = session.mint_session_jwt("a@x.com", "Alice", "s3cret",
+                                   ttl_seconds=14400, scope="console")
+    payload = json.loads(base64.urlsafe_b64decode(
+        tok.split(".")[1] + "=" * (-len(tok.split(".")[1]) % 4)))
+    assert payload["scope"] == "console"
+
+
+def test_verify_still_accepts_token_with_extra_claims():
+    tok = session.mint_session_jwt("a@x.com", "Alice", "s3cret", idp="Okta")
+    claims = session.verify_session_jwt(tok, "s3cret")
+    assert claims["idp"] == "Okta"
+```
+
+（文件顶部若无 `import session` 则加上；沿用该文件既有的导入风格。）
+
+Run: `cd site-builder/auth && ../contract/.venv/bin/pytest tests/test_session.py -q`
+Expected: FAIL — `mint_session_jwt() got an unexpected keyword argument 'idp'`
+
+然后改 `site-builder/auth/session.py`：
+
+```python
+def mint_session_jwt(email: str, name: str, secret: str, ttl_seconds: int = 86400,
+                     idp: str = "", scope: str = "") -> str:
+    header = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
+    claims = {"email": email, "name": name, "exp": int(time.time()) + ttl_seconds}
+    # 只在非空时写入：保持与一期已签发 token 的形态兼容，Edge 侧无需改验签。
+    if idp:
+        claims["idp"] = idp        # spec §3.5：Edge 据此确认身份来自企业 IdP
+    if scope:
+        claims["scope"] = scope    # M3 面板会话用（Edge 不校验 scope）
+    payload = _b64url(json.dumps(claims, separators=(",", ":")).encode())
+    signing_input = f"{header}.{payload}".encode()
+    return f"{header}.{payload}.{_sign(signing_input, secret)}"
+```
+
+**注意**：`json.dumps` 的 key 顺序即 dict 插入顺序，`email`/`name`/`exp` 三个
+仍在最前，新 claim 追加在后——与 Edge 的 `_verify_session_jwt` 仍字节级兼容
+（它只按 key 取值，不依赖顺序，但保持顺序稳定便于人工比对）。
+
+Run: `cd site-builder/auth && ../contract/.venv/bin/pytest tests -q`
+Expected: PASS
+
+
 - [ ] **Step 3: 改 login_handler.py**
 
 在 `site-builder/auth/login_handler.py` 里：
@@ -3046,20 +3660,28 @@ Expected: FAIL — `AttributeError: module 'login_handler' has no attribute '_pk
 `_encode_state` / `_decode_state` 替换为：
 
 ```python
-def _encode_state(redirect: str, verifier: str, nonce: str) -> str:
+PKCE_COOKIE = "__Host-sb_pkce"
+
+
+def _encode_state(redirect: str) -> str:
+    """state 只放 redirect 与过期时间，**不放 code_verifier / nonce**。
+
+    RFC 7636 的分工是授权请求只发 code_challenge、令牌请求才发 code_verifier。
+    把明文 verifier 放进随 authorize URL 传输的 state（state 有 HMAC 签名，
+    但内容是 base64 明文）会让它经浏览器地址栏、Referer、IdP 侧日志与浏览器
+    历史各暴露一遍，PKCE 本应提供的"授权码被截获也换不到 token"的独立防护
+    就没了；更要紧的是它不再绑定浏览器——攻击者把自己登录产生的 callback URL
+    发给受害者，verifier 跟在 URL 里，后端就能替受害者完成交换并种下攻击者
+    账户的会话（login CSRF / account confusion）。verifier 放 host-only
+    cookie 才与浏览器绑定。见 spec §7.2。
+    """
     body = base64.urlsafe_b64encode(json.dumps(
-        {"r": redirect, "v": verifier, "n": nonce,
-         "exp": int(time.time()) + 300}).encode()).decode().rstrip("=")
+        {"r": redirect, "exp": int(time.time()) + 300}).encode()).decode().rstrip("=")
     return f"{body}.{_state_sig(body)}"
 
 
-def _decode_state(state: str) -> dict | None:
-    """验签 + 验期，失败返回 None。返回 {"r": redirect, "v": verifier, "n": nonce}。
-
-    PKCE 的 code_verifier 与 nonce 都随签名 state 往返——auth 服务无状态
-    （Lambda 多实例），没有服务端会话可存它们；state 已有 HMAC 签名与 5 分钟
-    过期，放在里面不弱于会话存储，且不需要额外存储层。
-    """
+def _decode_state(state: str) -> str | None:
+    """验签 + 验期，失败返回 None；成功返回 redirect。"""
     try:
         body, _, sig = state.rpartition(".")
         if not hmac.compare_digest(sig, _state_sig(body)):
@@ -3067,10 +3689,40 @@ def _decode_state(state: str) -> dict | None:
         payload = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
         if int(payload.get("exp", 0)) <= int(time.time()):
             return None
-        return {"r": payload["r"], "v": payload.get("v", ""),
-                "n": payload.get("n", "")}
+        return payload["r"]
     except Exception:
         return None
+
+
+def _pkce_cookie(verifier: str, nonce: str, base: str) -> str:
+    """把 verifier/nonce 装进 auth 子域的 host-only 短期 cookie。
+
+    __Host- 前缀是浏览器强制的：必须 Secure、必须 Path=/、**必须无 Domain**，
+    因此它只回发给 auth.{base}（/login 与 /callback 同域，读得到）。
+    5 分钟过期，用完即清。
+    """
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"v": verifier, "n": nonce}).encode()).decode().rstrip("=")
+    sig = _state_sig(payload)
+    return (f"{PKCE_COOKIE}={payload}.{sig}; Path=/; Max-Age=300; "
+            f"Secure; HttpOnly; SameSite=Lax")
+
+
+def _read_pkce_cookie(event) -> dict | None:
+    """从 callback 请求里取回 verifier/nonce；验签失败或缺失返回 None。"""
+    for raw in (event.get("cookies") or []):
+        name, _, value = raw.partition("=")
+        if name.strip() != PKCE_COOKIE:
+            continue
+        body, _, sig = value.rpartition(".")
+        if not hmac.compare_digest(sig, _state_sig(body)):
+            return None
+        try:
+            data = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+        except Exception:
+            return None
+        return {"v": data.get("v", ""), "n": data.get("n", "")}
+    return None
 
 
 def _pkce_pair() -> tuple[str, str]:
@@ -3116,7 +3768,10 @@ def _exchange_code(code: str, verifier: str, nonce: str) -> dict:
     # 这个 callback（PKCE 保护授权码，nonce 保护 id_token）。
     if claims.get("nonce") != nonce:
         raise ValueError("id_token nonce 与本次登录不匹配")
-    return {"email": claims["email"], "name": claims.get("name", claims["email"])}
+    # idp 由 pre-token 触发器注入 id token（两个容器都写，见 Task 14 Step 4b）。
+    # 本地用户没有它——会话里就不会有，Edge 据此拦截（spec §3.5）。
+    return {"email": claims["email"], "name": claims.get("name", claims["email"]),
+            "idp": claims.get("idp", "")}
 ```
 
 `handler` 的 `/login` 与 `/callback` 分支替换为：
@@ -3136,34 +3791,62 @@ def _exchange_code(code: str, verifier: str, nonce: str) -> dict:
                         "code_challenge": challenge,
                         "code_challenge_method": "S256",
                         "nonce": nonce,
-                        "state": _encode_state(redirect, verifier, nonce)}))
-        return {"statusCode": 302, "headers": {"Location": auth_url}, "body": ""}
+                        "state": _encode_state(redirect)}))
+        # verifier/nonce 走 host-only cookie（与浏览器绑定），不进 URL
+        return {"statusCode": 302, "headers": {"Location": auth_url},
+                "cookies": [_pkce_cookie(verifier, nonce, base)], "body": ""}
 
     if path == "/callback":
-        st = _decode_state(qs.get("state", ""))
-        if st is None or not _is_safe_redirect(st["r"]):
+        redirect = _decode_state(qs.get("state", ""))
+        if redirect is None or not _is_safe_redirect(redirect):
             return {"statusCode": 400, "body": "invalid or expired state"}
-        user = _exchange_code(qs["code"], st["v"], st["n"])
-        token = mint_session_jwt(user["email"], user["name"], os.environ["JWT_SECRET"])
+        pkce = _read_pkce_cookie(event)
+        if pkce is None:
+            # cookie 丢失（换了浏览器、被清、超过 5 分钟）——比静默降级到
+            # 无 PKCE 安全：让用户重新走一次登录。
+            return {"statusCode": 400,
+                    "body": "登录状态已过期，请重新登录"}
+        user = _exchange_code(qs["code"], pkce["v"], pkce["n"])
+        token = mint_session_jwt(user["email"], user["name"],
+                                 os.environ["JWT_SECRET"], idp=user.get("idp", ""))
         cookie = (f"sb_session={token}; Domain=.{base}; Path=/; Max-Age=86400; "
                   f"Secure; HttpOnly; SameSite=Lax")
-        return {"statusCode": 302, "headers": {"Location": st["r"]},
-                "cookies": [cookie], "body": ""}
+        clear_pkce = f"{PKCE_COOKIE}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax"
+        return {"statusCode": 302, "headers": {"Location": redirect},
+                "cookies": [cookie, clear_pkce], "body": ""}
 ```
 
 - [ ] **Step 4: 修既有测试**
 
-`site-builder/auth/tests/test_login_handler.py` 里三处用到 `_encode_state("...")` 单参数的调用改为三参数：
+`_encode_state` 仍是单参数（只放 redirect），所以 `test_login_handler.py` 里
+既有的 `lh._encode_state("https://...")` 调用**不需要改签名**。但两处 callback
+测试现在会因缺 PKCE cookie 而返回 400，需要补上 cookie：
 
 ```python
-    state = lh._encode_state("https://app-x.example.com/page?tab=2", "v", "n")
+@patch.dict(lh.os.environ, ENV)
+@patch.object(lh, "_exchange_code", return_value={"email": "a@x.com", "name": "Alice",
+                                                  "idp": "Feishu"})
+def test_callback_sets_cookie_and_redirects(mock_ex):
+    r_login = lh.handler(_event("/login", {"redirect": "https://app-x.example.com/page?tab=2"}),
+                         None)
+    import urllib.parse as up
+    state = up.unquote(r_login["headers"]["Location"].split("state=")[1].split("&")[0])
+    pkce = next(c for c in r_login["cookies"]
+                if c.startswith(lh.PKCE_COOKIE)).split(";")[0]
+    r = lh.handler(_event("/callback", {"code": "abc", "state": state},
+                          cookies=[pkce]), None)
+    assert r["statusCode"] == 302
+    assert r["headers"]["Location"] == "https://app-x.example.com/page?tab=2"
+    cookie = next(c for c in r["cookies"] if c.startswith("sb_session="))
+    assert "Domain=.example.com" in cookie
+    assert "HttpOnly" in cookie and "Secure" in cookie
 ```
-```python
-    state = lh._encode_state("https://app-x.example.com/", "v", "n")
-```
-（`test_callback_rejects_tampered_state` 与 `test_callback_rejects_expired_state` 各一处。）
 
-`test_callback_sets_cookie_and_redirects` 的 `@patch.object(lh, "_exchange_code", return_value=...)` 保持可用（签名变了但 patch 掉了）。
+`test_callback_rejects_tampered_state` 与 `test_callback_rejects_expired_state`
+断言的是 400，改前改后都成立（现在也可能因缺 cookie 而 400——但它们验的是
+state 校验，为避免断言到错误原因，给它们也补上有效的 pkce cookie，
+或改成直接断言 `lh._decode_state(...) is None`）。该文件的 `_event` helper
+已支持 `cookies` 参数（一期就有）。
 
 - [ ] **Step 5: 运行测试确认通过**
 
@@ -3173,6 +3856,8 @@ Expected: PASS（原 11 + 新增 10）
 - [ ] **Step 6: 提交**
 
 ```bash
+# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
+git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
 git add site-builder/auth/login_handler.py site-builder/auth/tests/
 git commit -m "feat(auth): OAuth PKCE(S256) + nonce 校验"
 ```
@@ -3286,6 +3971,13 @@ def test_machine_client_uses_client_credentials():
     assert machine["CallbackURLs"] == []
 
 
+def test_production_clients_pin_managed_login_version():
+    """显式钉 ManagedLoginVersion，不依赖账号级默认值。"""
+    clients = dp.client_configs("example.com", [], idp_name="Okta")
+    assert clients["site"]["ManagedLoginVersion"] == 2
+    assert clients["mcp"]["ManagedLoginVersion"] == 2
+
+
 def test_machine_client_has_no_user_flows():
     machine = dp.client_configs("example.com", [], idp_name="Okta")["machine"]
     assert "code" not in machine["AllowedOAuthFlows"]
@@ -3369,6 +4061,10 @@ def client_configs(base_domain: str, extra_mcp_callbacks: list[str],
     providers = [idp_name] if idp_name else ["COGNITO"]
     site = {
         "ClientName": "site-builder-site",
+        # managed login（v2）与 classic hosted UI（v1）二选一；两者都需要
+        # branding style 才可用（见 _ensure_branding）。这里显式钉 v2，
+        # 不依赖账号级默认值。
+        "ManagedLoginVersion": 2,
         "GenerateSecret": True,
         "AllowedOAuthFlows": ["code"],
         "AllowedOAuthFlowsUserPoolClient": True,
@@ -3380,6 +4076,7 @@ def client_configs(base_domain: str, extra_mcp_callbacks: list[str],
     }
     mcp = {
         "ClientName": "site-builder-mcp",
+        "ManagedLoginVersion": 2,
         "GenerateSecret": False,   # Claude Code 等客户端无法安全保存 secret
         "AllowedOAuthFlows": ["code"],
         "AllowedOAuthFlowsUserPoolClient": True,
@@ -3420,14 +4117,52 @@ def _find_pool(cog, name: str) -> str | None:
             return None
 
 
+# update_user_pool 是整体替换语义（一期实测坑）：只回传已知可变字段，
+# 避免误清其他配置。与 deploy_auth.py 的 _POOL_MUTABLE 同源。
+_POOL_MUTABLE = ("Policies", "DeletionProtection", "AutoVerifiedAttributes",
+                 "MfaConfiguration", "EmailConfiguration", "AdminCreateUserConfig",
+                 "AccountRecoverySetting", "UserAttributeUpdateSettings",
+                 "VerificationMessageTemplate", "UserPoolTier", "LambdaConfig")
+
+
 def _ensure_pool(cog, base_domain: str) -> str:
+    """幂等：已有 pool 也要把关键配置纠正回来，不能直接 return。
+
+    否则"幂等重跑"修不了已经建错的 pool——尤其
+    AllowAdminCreateUserOnly（自注册开着就等于全部 org 站点对公网开放，
+    spec §3.5）。
+    """
     existing = _find_pool(cog, POOL_NAME)
-    if existing:
-        print(f"  已存在 pool {existing}")
-        return existing
-    pool_id = cog.create_user_pool(**pool_config(base_domain))["UserPool"]["Id"]
-    print(f"  新建 pool {pool_id}")
-    return pool_id
+    if not existing:
+        pool_id = cog.create_user_pool(**pool_config(base_domain))["UserPool"]["Id"]
+        print(f"  新建 pool {pool_id}")
+        return pool_id
+
+    print(f"  已存在 pool {existing}，核对关键配置")
+    pool = cog.describe_user_pool(UserPoolId=existing)["UserPool"]
+    kwargs = {k: pool[k] for k in _POOL_MUTABLE if k in pool}
+    # describe 回传的废弃字段，与 PasswordPolicy.TemporaryPasswordValidityDays
+    # 同传会被 update-user-pool 拒绝（一期实测）
+    kwargs.get("AdminCreateUserConfig", {}).pop("UnusedAccountValidityDays", None)
+    desired = pool_config(base_domain)
+    kwargs["AdminCreateUserConfig"] = desired["AdminCreateUserConfig"]
+    kwargs["UserPoolTier"] = desired["UserPoolTier"]
+    cog.update_user_pool(UserPoolId=existing, **kwargs)
+
+    # 复验：update 是整体替换，静默漂移过一次就够致命，必须读回确认
+    after = cog.describe_user_pool(UserPoolId=existing)["UserPool"]
+    only_admin = after.get("AdminCreateUserConfig", {}).get(
+        "AllowAdminCreateUserOnly")
+    if only_admin is not True:
+        raise SystemExit(
+            f"pool {existing} 的 AllowAdminCreateUserOnly={only_admin!r}，"
+            "自注册未关闭——allowed_users=\"org\" 会对公网开放，中止")
+    if after.get("UserPoolTier") != "ESSENTIALS":
+        raise SystemExit(
+            f"pool {existing} 的 tier={after.get('UserPoolTier')!r}，"
+            "pre-token V2 需要 ESSENTIALS+，中止")
+    print("  ✓ 自注册已关闭、tier=ESSENTIALS")
+    return existing
 
 
 def _ensure_domain(cog, pool_id: str, prefix: str) -> str:
@@ -3469,6 +4204,25 @@ def _ensure_clients(cog, pool_id: str, base_domain: str,
             print(f"  新建 client {name} = {client_id}")
         out[key] = client_id
     return out
+
+
+def _ensure_branding(cog, pool_id: str, clients: dict) -> None:
+    """给 API 创建的 app client 套 branding style。
+
+    AWS 明确：经 CreateUserPoolClient 建的 client **不会**自动获得 branding
+    style，套上之前 managed login 与 classic hosted UI 页面都不可用
+    （控制台建的会自动有，所以这个坑只在脚本化部署时出现）。不做这步，
+    后面所有登录验证会在 /oauth2/authorize 第一步就失败。
+    用 Cognito 默认样式（UseCognitoProvidedValues=True），不做定制。
+    """
+    for key in ("site", "mcp"):
+        try:
+            cog.create_managed_login_branding(
+                UserPoolId=pool_id, ClientId=clients[key],
+                UseCognitoProvidedValues=True)
+            print(f"  {key}: 已套默认 branding")
+        except cog.exceptions.ManagedLoginBrandingExistsException:
+            print(f"  {key}: branding 已存在")
 
 
 def _ensure_oidc_idp(cog, pool_id: str, idp: dict) -> None:
@@ -3556,13 +4310,16 @@ def main() -> None:
     print("④ app clients")
     clients = _ensure_clients(cog, pool_id, base_domain, args.mcp_callback, idp_name)
 
-    print("⑤ pre-token 触发器（注入 email + idp claim）")
+    print("⑤ managed login branding（API 建的 client 必须显式套）")
+    _ensure_branding(cog, pool_id, clients)
+
+    print("⑥ pre-token 触发器（注入 email + idp claim）")
     sys.path.insert(0, str(HERE.parent / "auth"))
     import deploy_auth
     role_arn = deploy_auth.ensure_lambda_role()
     deploy_auth.ensure_pre_token_trigger(role_arn, pool_id=pool_id)
 
-    print("⑥ client secret → SSM")
+    print("⑦ client secret → SSM")
     _store_client_secrets(cog, pool_id, clients, region)
 
     print("\n回填 site-builder/config.ini：")
@@ -3641,8 +4398,16 @@ def handler(event, context):
     if idp:
         claims["idp"] = idp
     if claims:
+        # idTokenGeneration 与 accessTokenGeneration 是**两个独立容器**，
+        # 只写一个不会同步到另一个（官方文档明示）。两处都要写：
+        #   - id token：auth 服务 /callback 验签后从它取 email/idp 签会话
+        #   - access token：MCP 网关只收 access token，owner 识别靠它
+        # 少写 id token 那份 → 会话 JWT 永远没有 idp → Edge 开关一开
+        # 全部合法用户被 302 拦死。
+        override = {"claimsToAddOrOverride": claims}
         event["response"]["claimsAndScopeOverrideDetails"] = {
-            "accessTokenGeneration": {"claimsToAddOrOverride": claims}}
+            "idTokenGeneration": dict(override),
+            "accessTokenGeneration": dict(override)}
     return event
 
 
@@ -3672,29 +4437,41 @@ def _event(attrs):
     return {"request": {"userAttributes": attrs}, "response": {}}
 
 
-def test_injects_email_and_idp_for_federated_user():
+import pytest
+
+
+def _claims(ev, container):
+    return ev["response"]["claimsAndScopeOverrideDetails"][container][
+        "claimsToAddOrOverride"]
+
+
+@pytest.mark.parametrize("container", ["idTokenGeneration",
+                                       "accessTokenGeneration"])
+def test_injects_email_and_idp_into_both_containers(container):
+    """两个容器都要写：id token 供 auth 签会话，access token 供 MCP 网关。
+
+    只写 accessTokenGeneration 会让会话 JWT 永远没有 idp——Edge 的
+    REQUIRE_IDP_CLAIM 一开，全部合法用户被 302 拦死（spec §3.5）。
+    """
     ev = pt.handler(_event({
         "email": "a@x.com",
         "identities": '[{"providerName":"Feishu","userId":"u1"}]'}), None)
-    claims = ev["response"]["claimsAndScopeOverrideDetails"][
-        "accessTokenGeneration"]["claimsToAddOrOverride"]
-    assert claims == {"email": "a@x.com", "idp": "Feishu"}
+    assert _claims(ev, container) == {"email": "a@x.com", "idp": "Feishu"}
 
 
 def test_local_user_gets_no_idp_claim():
     """本地用户没有 idp claim——这正是 Edge 要拦的信号（spec §3.5）。"""
     ev = pt.handler(_event({"email": "local@x.com"}), None)
-    claims = ev["response"]["claimsAndScopeOverrideDetails"][
-        "accessTokenGeneration"]["claimsToAddOrOverride"]
-    assert claims == {"email": "local@x.com"}
-    assert "idp" not in claims
+    for container in ("idTokenGeneration", "accessTokenGeneration"):
+        claims = _claims(ev, container)
+        assert claims == {"email": "local@x.com"}
+        assert "idp" not in claims
 
 
 def test_malformed_identities_does_not_raise():
     ev = pt.handler(_event({"email": "a@x.com", "identities": "{not json"}), None)
-    claims = ev["response"]["claimsAndScopeOverrideDetails"][
-        "accessTokenGeneration"]["claimsToAddOrOverride"]
-    assert claims == {"email": "a@x.com"}
+    assert _claims(ev, "idTokenGeneration") == {"email": "a@x.com"}
+    assert _claims(ev, "accessTokenGeneration") == {"email": "a@x.com"}
 
 
 def test_no_attributes_leaves_response_untouched():
@@ -3703,7 +4480,7 @@ def test_no_attributes_leaves_response_untouched():
 ```
 
 Run: `cd site-builder/auth && ../contract/.venv/bin/pytest tests/test_pre_token.py -q`
-Expected: PASS（4 passed）
+Expected: PASS（5 passed——参数化的两个容器各算一条）
 
 **注意**：`identities` 属性的确切形态（是 JSON 字符串还是已解析的 list、
 首次登录时是否就位）列为 Task 15 的真机 spike——`_provider_name` 对两种形态
@@ -3734,7 +4511,11 @@ scopes = openid email profile
 - [ ] **Step 7: 提交**
 
 ```bash
-git add site-builder/scripts/deploy_pool.py site-builder/auth/deploy_auth.py site-builder/deployer/tests/test_deploy_pool.py site-builder/config.ini.example
+# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
+git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
+git add site-builder/scripts/deploy_pool.py site-builder/auth/deploy_auth.py \
+  site-builder/auth/pre_token_email.py site-builder/auth/tests/test_pre_token.py \
+  site-builder/deployer/tests/test_deploy_pool.py site-builder/config.ini.example
 git commit -m "feat(scripts): 平台专用 user pool 部署脚本（IdP 无关，三个 app client）"
 ```
 
@@ -3767,27 +4548,49 @@ Expected: 打印新 pool id、三个 client id，以及"已写入"两条 SSM 参
 
 - [ ] **Step 1b: [真机] 验证自注册确实被关闭（P0 验收）**
 
+**必须用 `mcp_client_id`（无 client secret）做这条负测**：`site` client 是
+confidential，带 secret 的 client 调 `SignUp` 少传 `SecretHash` 也会返回
+`NotAuthorizedException`——用它测会把"缺 SecretHash"误判成"自注册已禁用"，
+形成假通过（自注册其实还开着也照样绿）。
+
 Run:
 ```bash
-POOL=<新 pool id>; CLIENT=<site_client_id>
+CLIENT=<mcp_client_id>   # 无 secret 的 public client
 aws cognito-idp sign-up --region us-east-1 --client-id "$CLIENT" \
-  --username probe-$(od -An -N2 -tu2 /dev/urandom | tr -d ' ')@example.com \
+  --username "probe-$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')@example.com" \
   --password 'ProbeOnly!2026x' 2>&1 | tail -3
 ```
-Expected: 失败。可接受的错误是 `NotAuthorizedException`（SignUp is not
-permitted / 自注册已禁用）或 `InvalidParameterException`。**若返回
-`UserSid`/`CodeDeliveryDetails` 即注册成功——立刻停下**：说明
-`AllowAdminCreateUserOnly` 没生效，`allowed_users="org"` 的语义被击穿
+Expected: 失败，且错误文案含 **`SignUp is not permitted`**（关自注册的确切
+表现）。**若返回 `UserSub`/`CodeDeliveryDetails` 即注册成功——立刻停下**：
+`AllowAdminCreateUserOnly` 没生效，`allowed_users="org"` 已对公网开放
 （spec §3.5），修好再继续。
 
-Run（同时确认托管登录页没有本地登录/注册入口）:
+只看到笼统的 `NotAuthorizedException` 而没有 `SignUp is not permitted` 时，
+用 `aws cognito-idp describe-user-pool` 直接读配置复核：
 ```bash
-curl -s "https://<domain-prefix>.auth.us-east-1.amazoncognito.com/login\
-?response_type=code&client_id=$CLIENT&redirect_uri=https://auth.<base_domain>/callback" \
-  | grep -ci 'signup\|forgot-password\|name="username"' || echo "0（无本地登录表单）"
+aws cognito-idp describe-user-pool --user-pool-id <新 pool id> --region us-east-1 \
+  --query 'UserPool.AdminCreateUserConfig.AllowAdminCreateUserOnly'
 ```
-Expected: `0`——生产 client 的 `SupportedIdentityProviders` 只有企业 IdP 时，
-Cognito 会直接跳转 IdP 而不渲染本地表单。非 0 说明 client 里还留着 `COGNITO`。
+Expected: `true`。
+
+Run（确认 authorize 端点真的能起飞，且直接跳 IdP 而非渲染本地表单）:
+```bash
+CLIENT=<site_client_id>
+curl -s -o /dev/null -w "status=%{http_code}\nlocation=%{redirect_url}\n" \
+  "https://<domain-prefix>.auth.us-east-1.amazoncognito.com/oauth2/authorize\
+?response_type=code&client_id=$CLIENT\
+&redirect_uri=https://auth.<base_domain>/callback&scope=openid+email+profile&state=probe"
+```
+Expected: `status=302` 且 `location` 指向 IdP 的授权端点（飞书适配器或 Okta
+的域名）。
+
+**不要用 `curl | grep -c 'signup'` 判断**——那个写法会把"空响应"和"错误页"
+一起判成"没有本地登录表单"（假通过）。按状态码与 Location 判断：
+- `status=400/500` 或 location 空：很可能是 **branding style 未套**
+  （API 建的 client 不会自动获得 style，套上前 managed login 页面不可用），
+  回去确认 `deploy_pool.py` 的 `_ensure_branding` 跑过；
+- `status=200` 且响应体里有 `name="username"` 输入框：说明 client 里还留着
+  `COGNITO`，本地登录入口暴露。
 
 - [ ] **Step 2: [真机 spike] IdP 回调 URL 追加**
 
@@ -3873,25 +4676,36 @@ Expected: payload 含 `email` 与 **`idp`**（值为 IdP provider 名，如 `Fei
    `idp` claim** 的会话 cookie，访问 org 站点应被 302 回登录（而不是放行）。
 
 Run（手工 mint 无 idp 的 cookie 做负向验证）:
+
+**secret 走环境变量，不进命令行参数**——argv 对同机所有进程可见（`ps`），
+还会留在 shell history 与本次会话记录里。签出的 token 也别打到终端：直接管进
+curl 的 header。
+
 ```bash
-python3 -c "
-import base64, hashlib, hmac, json, time, sys
-secret = sys.argv[1]
-b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b'=').decode()
-h = b64(json.dumps({'alg':'HS256','typ':'JWT'},separators=(',',':')).encode())
-p = b64(json.dumps({'email':'probe@x.com','name':'probe',
-                    'exp':int(time.time())+300},separators=(',',':')).encode())
-sig = b64(hmac.new(secret.encode(), f'{h}.{p}'.encode(), hashlib.sha256).digest())
-print(f'{h}.{p}.{sig}')" "$(aws ssm get-parameter --name /site-builder/jwt-secret \
-  --with-decryption --region us-east-1 --query Parameter.Value --output text)"
+# 一步到底：读 secret → mint 无 idp 的 token → 用它请求站点，中间不落盘不回显
+SITE_URL="https://app-<site_id>.<base_domain>/"
+SB_JWT_SECRET="$(aws ssm get-parameter --name /site-builder/jwt-secret \
+  --with-decryption --region us-east-1 --query Parameter.Value --output text)" \
+SB_TOKEN="$(SB_JWT_SECRET="$SB_JWT_SECRET" python3 - <<'PYEOF'
+import base64, hashlib, hmac, json, os, time
+secret = os.environ["SB_JWT_SECRET"]          # 从 env 读，不从 argv
+b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+h = b64(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
+p = b64(json.dumps({"email": "probe@x.com", "name": "probe",
+                    "exp": int(time.time()) + 300},
+                   separators=(",", ":")).encode())
+print(f"{h}.{p}." + b64(hmac.new(secret.encode(), f"{h}.{p}".encode(),
+                                 hashlib.sha256).digest()))
+PYEOF
+)" bash -c 'curl -s -o /dev/null -w "%{http_code}\n" \
+  -H "Cookie: sb_session=$SB_TOKEN" "$0"' "$SITE_URL"
+unset SB_JWT_SECRET SB_TOKEN
 ```
-然后带上该 cookie 请求站点：
-```bash
-curl -s -o /dev/null -w "%{http_code}\n" -H "Cookie: sb_session=<上面输出>" \
-  https://app-<site_id>.<base_domain>/
-```
+
 Expected: `302`（被当作未登录）。开关为 false 时这里会是 200——**先确认开关
 已生效再判断结果**。
+
+跑完 `unset` 两个变量；本步骤结束后该 probe token 5 分钟内自然过期。
 
 - [ ] **Step 7: [真机 spike] 标准 IdP 分支验证**
 
@@ -3992,6 +4806,8 @@ AWS 官方指引见本节末尾链接。属性映射固定 `email → email`、`
 - [ ] **Step 11: 提交**
 
 ```bash
+# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
+git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
 git add site-builder/DEPLOY.md
 git commit -m "docs(deploy): ① 身份层改写为 IdP 无关双分支 + 专用 pool 切换步骤"
 ```
@@ -4020,6 +4836,20 @@ cd site-builder/mcp && python3 -m pytest tests -q
 ```
 Expected: 全部 PASS。记录每个包的测试数（contract 应仍是 67；其余各有增长）。
 
+- [ ] **Step 1a: [真机] idp claim 全链路（P0 验收）**
+
+四段缺一即断（spec §3.5 的表），逐段确认：
+
+1. **注入**：access token 与 **id token** 都有 `idp`（Task 15 Step 6b 已验
+   access token；id token 这份用 auth 服务的 CloudWatch 日志确认——在
+   `_exchange_code` 里临时打印 `claims.keys()`，或直接看会话 cookie 有没有
+   `idp`，有即说明 id token 那份到位了）；
+2. **签发**：解开浏览器里的 `sb_session` cookie，payload 含 `idp`；
+3. **校验**：`require_idp_claim=true` 部署后，正常登录可访问、手工 mint 的
+   无 `idp` 会话被 302（Task 15 Step 6c 的两个方向）；
+4. **开关状态**：`grep require_idp_claim router/config.ini` 是 `true`
+   ——**停在 false 等于这道防线没生效，M1 不算完成**。
+
 - [ ] **Step 1b: [真机] 两表事务的失败路径**
 
 验证 spec §3.2 承诺的"不会留下 sites 私有 / Edge 公开"：临时给 MCP runtime
@@ -4032,6 +4862,29 @@ Expected: 调用报错；`site-sites` 的 `require_login` **仍为 false**（真
 若不便改 IAM，退一步用单测里的 `_ALLOW_ROUTE_ABSENT=False` 路径已覆盖同一
 不变量（Task 2 的 `test_write_permissions_rolls_back_when_route_write_fails`）
 ——那时在这里记录"以单测覆盖，未做真机注入"，不要写成已真机验证。
+
+- [ ] **Step 1c: [真机] register_route 与在线改权限并发**
+
+验 spec §3.2 的条件事务：部署进行中（validate/package 阶段，还没到第 6 步）
+用控制台或 MCP 把该站点权限收紧，然后等部署完成。
+
+Expected: 部署 SUCCEEDED 且路由表最终是**收紧后**的策略（`require_auth=true` /
+新名单），不是部署开始时的旧策略；或部署 FAILED 且错误文案含"权限被并发
+修改"（重试 3 次仍冲突）。**绝不允许**出现 sites 私有而路由公开。
+
+Run（部署完成后核对两处）:
+```bash
+SID=<site_id>
+aws dynamodb get-item --table-name site-sites --region us-east-1 \
+  --key "{\"site_id\":{\"S\":\"$SID\"}}" \
+  --query 'Item.{login:require_login.BOOL,rev:permissions_rev.N}'
+aws dynamodb get-item --region us-east-1 \
+  --table-name "$(python3 -c "
+import configparser;c=configparser.ConfigParser();c.read('site-builder/config.ini');print(c['Platform']['routing_table'])")" \
+  --key "{\"subdomain\":{\"S\":\"app-$SID\"}}" \
+  --query 'Item.{auth:require_auth.BOOL,rev:permissions_rev.N}'
+```
+Expected: 两处的 `login`/`auth` 一致，`rev` 也一致。
 
 - [ ] **Step 2: [真机] 冒烟路由层**
 
@@ -4071,6 +4924,15 @@ Expected: 4 passed（约 6 分钟）。这条验证权限真源改造没有破�
 - **jobs 表的 `owner` 是发起者**（requested_by 语义），不参与授权；站点 owner
   只由 `permissions.transfer_owner` 与首次部署写。`mark_job` **不写 owner**
   ——写了会让 collaborator 部署一次就夺权。
+- **`register_route` 也是条件事务**（ConditionCheck `permissions_rev` + Put
+  route）：它是"读 sites → 写整条路由"，与在线改权限并发时用旧快照
+  `put_item` 会把路由写回公开。冲突重读重试 ≤3 次，仍冲突让部署失败。
+- **API 建的 Cognito app client 必须显式套 branding**
+  （`CreateManagedLoginBranding`）：控制台建的会自动有，脚本建的不会——
+  没套之前 managed login / hosted UI 页面不可用，`/oauth2/authorize` 直接失败。
+- **自注册负测要用无 secret 的 client**：带 client secret 的 client 调
+  `SignUp` 少传 `SecretHash` 也返回 `NotAuthorizedException`，会把"缺
+  SecretHash"误判成"自注册已禁用"。
 ```
 
 并在测试命令一节补一句：
@@ -4095,6 +4957,8 @@ Expected: 4 passed（约 6 分钟）。这条验证权限真源改造没有破�
 - [ ] **Step 6: 提交**
 
 ```bash
+# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
+git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
 git add CLAUDE.md docs/superpowers/specs/2026-07-30-quick-site-builder-phase2-design.md
 git commit -m "docs: M1+M2 收尾——CLAUDE.md 补权限真源与 L 类型顺序约束，spec 回写实施差异"
 ```
