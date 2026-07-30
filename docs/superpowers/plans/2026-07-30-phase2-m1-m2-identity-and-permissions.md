@@ -1,0 +1,3361 @@
+# Site Builder 二期 M1+M2 实施计划（身份层切换 + 权限真源）
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** 把平台身份切到专用 Cognito user pool（含 PKCE/nonce 增强），并把站点权限的唯一真源从"site.json + 路由表"迁移到 sites 表，使"在线改权限 / 协作者 / 所有权转移"端到端可用且不再需要重部署。
+
+**Architecture:** 三层改造。① 身份层新建 `site-builder-users` pool（IdP 无关，3 个 app client），auth 服务加 PKCE + nonce；② 数据层给 `site-sites` 表加权限字段与 `owner-index` GSI，新增 `permissions.py` 作为唯一角色判定与权限写入模块（MCP 与后续 panel 共用，沿用 `common.py` 的构建时复制模式）；③ 消费层改 `register_route`（权限值来自 sites 表而非 manifest）、改 Edge（collaborators 放行 + List 反序列化）、改 MCP（角色判定替换 `_assert_owner` + 3 个新工具）。存量站点用一次性脚本从路由表回填 sites 表。
+
+**Tech Stack:** Python 3.13（Lambda/MCP）、Python 3.11（Lambda@Edge）、boto3、DynamoDB、Cognito、CDK（router + deployer 两个栈）、pytest + moto、AgentCore Runtime。
+
+## Global Constraints
+
+以下约束来自 spec 与仓库 CLAUDE.md，**每个任务都隐含包含**：
+
+- **区域**：一切资源在 `us-east-1`（Lambda@Edge / ACM / Quick 身份区域硬约束）。
+- **配置唯一来源**：`site-builder/config.ini` 与 `router/config.ini`（均 gitignored，从同目录 `.example` 复制）。代码不硬编码账号 ID / 域名。**不要把真实账号值（如 12 位账号 ID、真实域名）写进任何被 git 跟踪的文件**——`.example` 里一律用 `000000000000` / `example.com`。
+- **测试命令按包区分 venv**（照抄，别猜）：
+  - `cd site-builder/contract && .venv/bin/pytest tests -q`
+  - `cd site-builder/auth && ../contract/.venv/bin/pytest tests -q`（auth 无自己的 venv，借 contract 的）
+  - `cd router/infrastructure/lambda && ../../../site-builder/deployer/.venv/bin/pytest . -q`（router 的 .venv 只有 CDK 依赖，借 deployer 的）
+  - `cd site-builder/deployer && .venv/bin/pytest tests -q`（**必须带 `tests`**，裸 pytest 会误收集 `infra/cdk.out` 里的 asset 副本）
+  - `cd site-builder/mcp && python3 -m pytest tests -q`
+- **Edge 函数约束**：Lambda@Edge 不支持环境变量，配置由 CDK synth 时字符串替换 `{{PLACEHOLDER}}` 注入；单文件、零第三方依赖（只用运行时自带 boto3/botocore + 标准库）；1MB 代码上限；`origin_request.py` 的 `_verify_session_jwt` 与 `site-builder/auth/session.py` 的 HS256 算法**必须字节等价**。
+- **Edge 路由表投影只认已支持的 DynamoDB 类型**：本计划 Task 8 之前 `_deser` 只认 `S`/`BOOL`，新增任何 `L`/`N`/`SS` 字段前必须先扩展 `_deser`，否则 Edge 侧静默变成 `False`。
+- **Function URL 一律 `AuthType=AWS_IAM`** 且只授权 edge role，并且需要 `lambda:InvokeFunctionUrl` + `lambda:InvokeFunction`（`InvokedViaFunctionUrl`）**两条**语句，缺一即 403。`AuthType=NONE` + `Principal:*` 会被安全扫描自动处置。
+- **git**：改动分批提交；`git push` 一律带 `--no-verify`。提交信息用中文或英文均可，遵循仓库现有 `type(scope): subject` 风格。
+- **验证纪律**：每处改动用真实 AWS API 实证验证（本项目被 mock 掉的层出过多次问题）。计划中标 `[真机]` 的步骤必须在真实 AWS 上跑，不能只靠 moto。
+- **发现文档与实际不符就同步更新**（`site-builder/DEPLOY.md`、`docs/` 下相关文档、`CLAUDE.md`）。
+- **`allowed_users` 语义**：`"org"`（字面量字符串）或邮箱数组。sites 表里存原生 List；路由表投影里 `"org"` 存 `S`、名单存 `L`（Task 8 起）。
+- **角色语义（两级 + admin）**：owner 可做全部操作；collaborator 可部署更新 / 查状态 / 看统计 / 改 `require_login` 与 `allowed_users`；仅 owner（或 admin）可增删 collaborator、转移 owner、undeploy/purge。admin 对任意站点等价 owner。
+
+---
+
+## 文件结构
+
+**新建：**
+
+| 文件 | 职责 |
+|---|---|
+| `site-builder/deployer/functions/permissions.py` | 唯一的角色判定 + 权限读写模块（纯逻辑 + DynamoDB 访问）。MCP 与 panel 共用（构建时复制，同 `common.py`） |
+| `site-builder/deployer/tests/test_permissions.py` | `permissions.py` 的角色矩阵与权限写入测试 |
+| `site-builder/scripts/migrate_permissions.py` | 一次性迁移：路由表 → sites 表回填权限字段 |
+| `site-builder/scripts/deploy_pool.py` | 幂等创建/更新平台专用 user pool + 3 个 app client + pre-token 触发器挂载 |
+| `site-builder/auth/tests/test_pkce.py` | PKCE/nonce 的 state 编解码与 callback 校验测试 |
+
+**修改：**
+
+| 文件 | 改动 |
+|---|---|
+| `site-builder/auth/login_handler.py` | `/login` 生成 code_verifier + nonce 进签名 state；`/callback` 带 verifier 换 token、验 id_token 的 nonce |
+| `site-builder/auth/deploy_auth.py` | pre-token 触发器逻辑抽出供 `deploy_pool.py` 复用；env 从 config 读新 pool |
+| `site-builder/config.ini.example` | `[Cognito]` 加 `machine_client_id`；`[Platform]` 加 `admin_seed`；`[Deployer]` 加 `admins_table` |
+| `site-builder/deployer/infra/app.py` | sites 表加 `owner-index` GSI；新增 `site-admins` 表；exec role 权限相应扩展 |
+| `site-builder/deployer/functions/register_route.py` | 权限字段从 sites 表读（不再从 manifest）；首次部署时用 manifest 初始化 sites 表权限 |
+| `site-builder/deployer/functions/common.py` | 加 `list_sites_by_owner`（用新 GSI） |
+| `router/infrastructure/lambda/origin_request.py` | `_deser` 支持 `L`；`_check_auth` 放行 collaborators；`allowed_users` 兼容 List 与 JSON 字符串两种形态 |
+| `router/infrastructure/lambda/test_edge_auth.py` | 新增 collaborators / List 形态用例 |
+| `site-builder/mcp/server.py` | `_assert_owner` → `permissions` 角色判定；新增 3 工具；`do_list_sites` 用 GSI + collaborator 维度 |
+| `site-builder/mcp/deploy_agentcore.py` | IAM 加 admins 表与 sites GSI；工具数变化 |
+| `site-builder/mcp/Dockerfile` | `COPY` 加 `permissions.py` |
+| `site-builder/mcp/tests/test_agentcore_contract.py` | 工具数断言 5 → 8 |
+| `site-builder/mcp/tests/conftest.py`、`site-builder/deployer/tests/conftest.py` | sites 表加 GSI 定义；新增 admins 表 |
+| `site-builder/skills/site-builder/references/contract.md` | 写明 `auth` 字段仅首次部署生效、之后以控制台为准 |
+| `site-builder/DEPLOY.md` | ① 阶段改写为 IdP 无关两分支 + 新 pool 部署步骤；加迁移脚本步骤 |
+
+---
+
+## Task 1: `permissions.py` — 角色判定纯逻辑
+
+**Files:**
+- Create: `site-builder/deployer/functions/permissions.py`
+- Test: `site-builder/deployer/tests/test_permissions.py`
+
+**Interfaces:**
+- Consumes: `common.get_site(site_id)`（已存在，返回 dict 或 None）
+- Produces:
+  - `ROLE_OWNER = "owner"`, `ROLE_COLLABORATOR = "collaborator"`, `ROLE_ADMIN = "admin"`, `ROLE_NONE = "none"`
+  - `role_of(email: str, site: dict | None, is_admin: bool = False) -> str`
+  - `can(role: str, action: str) -> bool`；`action` ∈ `{"deploy", "read", "set_access_policy", "manage_collaborators", "transfer_owner", "undeploy"}`
+  - `class PermissionDenied(Exception)`
+  - `assert_can(email: str, site: dict | None, action: str, *, is_admin: bool = False, what: str = "") -> str`（返回 role，失败抛 `PermissionDenied`）
+
+- [ ] **Step 1: 写失败测试**
+
+创建 `site-builder/deployer/tests/test_permissions.py`：
+
+```python
+import pytest
+
+import permissions as perm
+
+
+SITE = {"site_id": "s-1", "owner": "o@x.com", "collaborators": ["c@x.com"]}
+
+
+def test_role_of_owner():
+    assert perm.role_of("o@x.com", SITE) == perm.ROLE_OWNER
+
+
+def test_role_of_collaborator():
+    assert perm.role_of("c@x.com", SITE) == perm.ROLE_COLLABORATOR
+
+
+def test_role_of_outsider():
+    assert perm.role_of("x@x.com", SITE) == perm.ROLE_NONE
+
+
+def test_admin_flag_wins_over_outsider():
+    assert perm.role_of("adm@x.com", SITE, is_admin=True) == perm.ROLE_ADMIN
+
+
+def test_owner_is_not_downgraded_by_admin_flag():
+    # owner 本人同时是 admin 时报 owner——审计与文案更准确，权限集相同
+    assert perm.role_of("o@x.com", SITE, is_admin=True) == perm.ROLE_OWNER
+
+
+def test_role_of_missing_site_is_none():
+    assert perm.role_of("o@x.com", None) == perm.ROLE_NONE
+
+
+def test_missing_collaborators_field_defaults_empty():
+    assert perm.role_of("c@x.com", {"site_id": "s", "owner": "o@x.com"}) == perm.ROLE_NONE
+
+
+@pytest.mark.parametrize("action,expected", [
+    ("read", True), ("deploy", True), ("set_access_policy", True),
+    ("manage_collaborators", False), ("transfer_owner", False), ("undeploy", False)])
+def test_collaborator_capabilities(action, expected):
+    assert perm.can(perm.ROLE_COLLABORATOR, action) is expected
+
+
+@pytest.mark.parametrize("action", [
+    "read", "deploy", "set_access_policy", "manage_collaborators",
+    "transfer_owner", "undeploy"])
+def test_owner_can_everything(action):
+    assert perm.can(perm.ROLE_OWNER, action) is True
+
+
+@pytest.mark.parametrize("action", [
+    "read", "deploy", "set_access_policy", "manage_collaborators",
+    "transfer_owner", "undeploy"])
+def test_admin_can_everything(action):
+    assert perm.can(perm.ROLE_ADMIN, action) is True
+
+
+@pytest.mark.parametrize("action", [
+    "read", "deploy", "set_access_policy", "manage_collaborators",
+    "transfer_owner", "undeploy"])
+def test_none_can_nothing(action):
+    assert perm.can(perm.ROLE_NONE, action) is False
+
+
+def test_unknown_action_denied_for_everyone():
+    # 未知动作一律拒绝（fail-closed）：新增动作忘记登记时不会被静默放行
+    assert perm.can(perm.ROLE_OWNER, "launch_missiles") is False
+
+
+def test_assert_can_returns_role():
+    assert perm.assert_can("c@x.com", SITE, "deploy") == perm.ROLE_COLLABORATOR
+
+
+def test_assert_can_raises_for_outsider():
+    with pytest.raises(perm.PermissionDenied):
+        perm.assert_can("x@x.com", SITE, "read", what="站点 s-1")
+
+
+def test_assert_can_raises_for_missing_site():
+    with pytest.raises(perm.PermissionDenied):
+        perm.assert_can("o@x.com", None, "read", what="站点 s-9")
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `cd site-builder/deployer && .venv/bin/pytest tests/test_permissions.py -q`
+Expected: FAIL — `ModuleNotFoundError: No module named 'permissions'`
+
+- [ ] **Step 3: 写最小实现**
+
+创建 `site-builder/deployer/functions/permissions.py`：
+
+```python
+"""站点权限的唯一判定与写入模块。
+
+真源是 sites 表（site-sites）：owner / collaborators / require_login /
+allowed_users 全部以此为准；路由表只是给 Edge 读的投影（见 sync_route_projection）。
+MCP（site-builder/mcp/）与控制台（site-builder/panel/）都引入本模块，
+两处的授权语义因此不会漂移——新增受控动作时只改 CAPABILITIES。
+"""
+
+ROLE_OWNER = "owner"
+ROLE_COLLABORATOR = "collaborator"
+ROLE_ADMIN = "admin"
+ROLE_NONE = "none"
+
+# 动作 → 允许的角色集合。未登记的动作对所有人拒绝（fail-closed）。
+CAPABILITIES = {
+    "read": {ROLE_OWNER, ROLE_COLLABORATOR, ROLE_ADMIN},
+    "deploy": {ROLE_OWNER, ROLE_COLLABORATOR, ROLE_ADMIN},
+    "set_access_policy": {ROLE_OWNER, ROLE_COLLABORATOR, ROLE_ADMIN},
+    "manage_collaborators": {ROLE_OWNER, ROLE_ADMIN},
+    "transfer_owner": {ROLE_OWNER, ROLE_ADMIN},
+    "undeploy": {ROLE_OWNER, ROLE_ADMIN},
+}
+
+
+class PermissionDenied(Exception):
+    pass
+
+
+def role_of(email: str, site: dict | None, is_admin: bool = False) -> str:
+    if not site:
+        return ROLE_NONE
+    if email and email == site.get("owner"):
+        return ROLE_OWNER
+    if email and email in (site.get("collaborators") or []):
+        return ROLE_COLLABORATOR
+    if is_admin:
+        return ROLE_ADMIN
+    return ROLE_NONE
+
+
+def can(role: str, action: str) -> bool:
+    return role in CAPABILITIES.get(action, frozenset())
+
+
+def assert_can(email: str, site: dict | None, action: str, *,
+               is_admin: bool = False, what: str = "") -> str:
+    role = role_of(email, site, is_admin)
+    if not can(role, action):
+        target = what or "该站点"
+        if role == ROLE_NONE:
+            raise PermissionDenied(f"你无权访问 {target}")
+        raise PermissionDenied(f"{target}：{role} 角色无权执行 {action}")
+    return role
+```
+
+- [ ] **Step 4: 运行测试确认通过**
+
+Run: `cd site-builder/deployer && .venv/bin/pytest tests/test_permissions.py -q`
+Expected: PASS（20 passed）
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add site-builder/deployer/functions/permissions.py site-builder/deployer/tests/test_permissions.py
+git commit -m "feat(permissions): 角色判定模块（owner/collaborator/admin 两级+管理员）"
+```
+
+---
+
+## Task 2: `permissions.py` — admin 名单与权限写入
+
+**Files:**
+- Modify: `site-builder/deployer/functions/permissions.py`
+- Modify: `site-builder/deployer/tests/test_permissions.py`
+- Modify: `site-builder/deployer/tests/conftest.py`（加 `site-admins` 表 + `ADMINS_TABLE` env）
+
+**Interfaces:**
+- Consumes: Task 1 的 `role_of` / `assert_can` / `PermissionDenied`；`common.upsert_site`、`common.get_site`
+- Produces:
+  - `is_admin(email: str) -> bool`（读 `ADMINS_TABLE` 环境变量指向的表）
+  - `list_admins() -> list[str]`
+  - `add_admin(email: str, added_by: str) -> None`
+  - `remove_admin(email: str) -> None`（拒绝删空，抛 `PermissionDenied`）
+  - `set_access_policy(site_id: str, *, actor: str, require_login: bool | None = None, allowed_users=None) -> dict`（写 sites 表，返回更新后的权限 dict）
+  - `set_collaborators(site_id: str, *, actor: str, add: list[str] | None = None, remove: list[str] | None = None) -> list[str]`
+  - `transfer_owner(site_id: str, *, actor: str, new_owner: str) -> dict`（原 owner 降级为 collaborator）
+  - `normalize_allowed_users(value) -> str | list[str]`（`"org"` 或去重排序后的邮箱 list）
+  - `allowed_users_av(allowed) -> dict`（DynamoDB AttributeValue：`"org"` → `{"S":"org"}`；名单 → `{"L":[...]}`）
+  - `sync_route_projection(site_id: str) -> bool`（把 sites 表权限投影到路由表；路由 item 不存在时返回 False 而非抛错）
+  - `now_iso() -> str`（ISO8601 时间戳，register_route 与迁移脚本共用）
+  - `EMAIL_RE`（与 contract 的 `EMAIL_RE` 同 pattern）
+
+**为什么投影逻辑放这里**：MCP（Task 11）、控制台（M3）、迁移脚本都要写这份投影，放进权限模块是唯一不重复的位置。`register_route` 复用 `allowed_users_av` 保证两条写路径的编码方式一致。
+
+- [ ] **Step 1: 给 conftest 加 admins 表**
+
+修改 `site-builder/deployer/tests/conftest.py`：在 `ENV` 字典里加一项（放在 `"ACCOUNT_ID": "1",` 之后）：
+
+```python
+       "ADMINS_TABLE": "site-admins",
+```
+
+并在 `aws` fixture 里、创建 `routing` 表之后加：
+
+```python
+        ddb.create_table(TableName="site-admins",
+                         KeySchema=[{"AttributeName": "email", "KeyType": "HASH"}],
+                         AttributeDefinitions=[{"AttributeName": "email",
+                                                "AttributeType": "S"}],
+                         BillingMode="PAY_PER_REQUEST")
+```
+
+- [ ] **Step 2: 写失败测试**
+
+在 `site-builder/deployer/tests/test_permissions.py` 末尾追加：
+
+```python
+def test_is_admin_false_when_absent(aws):
+    assert perm.is_admin("nobody@x.com") is False
+
+
+def test_add_and_list_admins(aws):
+    perm.add_admin("adm@x.com", added_by="seed")
+    assert perm.is_admin("adm@x.com") is True
+    assert perm.list_admins() == ["adm@x.com"]
+
+
+def test_add_admin_is_idempotent(aws):
+    perm.add_admin("adm@x.com", added_by="seed")
+    perm.add_admin("adm@x.com", added_by="other")
+    assert perm.list_admins() == ["adm@x.com"]
+
+
+def test_remove_admin(aws):
+    perm.add_admin("a@x.com", added_by="seed")
+    perm.add_admin("b@x.com", added_by="seed")
+    perm.remove_admin("a@x.com")
+    assert perm.list_admins() == ["b@x.com"]
+
+
+def test_remove_last_admin_is_refused(aws):
+    perm.add_admin("only@x.com", added_by="seed")
+    with pytest.raises(perm.PermissionDenied):
+        perm.remove_admin("only@x.com")
+    assert perm.is_admin("only@x.com") is True
+
+
+def test_normalize_allowed_users_org():
+    assert perm.normalize_allowed_users("org") == "org"
+
+
+def test_normalize_allowed_users_dedups_and_sorts():
+    assert perm.normalize_allowed_users(
+        ["b@x.com", "a@x.com", "b@x.com"]) == ["a@x.com", "b@x.com"]
+
+
+def test_normalize_allowed_users_rejects_bad_email():
+    with pytest.raises(ValueError):
+        perm.normalize_allowed_users(["not-an-email"])
+
+
+def test_normalize_allowed_users_rejects_empty_list():
+    with pytest.raises(ValueError):
+        perm.normalize_allowed_users([])
+
+
+def test_set_access_policy_writes_sites_table(aws):
+    import common
+    common.upsert_site("s-1", owner="o@x.com", require_login=True,
+                       allowed_users="org", collaborators=[])
+    out = perm.set_access_policy("s-1", actor="o@x.com", require_login=False,
+                                 allowed_users=["a@x.com"])
+    assert out["require_login"] is False
+    assert out["allowed_users"] == ["a@x.com"]
+    site = common.get_site("s-1")
+    assert site["allowed_users"] == ["a@x.com"]
+    assert site["permissions_updated_by"] == "o@x.com"
+    assert site["permissions_updated_at"]
+
+
+def test_set_access_policy_partial_update_keeps_other_field(aws):
+    import common
+    common.upsert_site("s-1", owner="o@x.com", require_login=True,
+                       allowed_users=["keep@x.com"], collaborators=[])
+    perm.set_access_policy("s-1", actor="o@x.com", require_login=False)
+    site = common.get_site("s-1")
+    assert site["require_login"] is False
+    assert site["allowed_users"] == ["keep@x.com"]
+
+
+def test_set_collaborators_add_and_remove(aws):
+    import common
+    common.upsert_site("s-1", owner="o@x.com", collaborators=[])
+    assert perm.set_collaborators("s-1", actor="o@x.com",
+                                  add=["c@x.com", "d@x.com"]) == ["c@x.com", "d@x.com"]
+    assert perm.set_collaborators("s-1", actor="o@x.com", remove=["c@x.com"]) == ["d@x.com"]
+
+
+def test_set_collaborators_refuses_owner_as_collaborator(aws):
+    import common
+    common.upsert_site("s-1", owner="o@x.com", collaborators=[])
+    with pytest.raises(ValueError):
+        perm.set_collaborators("s-1", actor="o@x.com", add=["o@x.com"])
+
+
+def test_transfer_owner_demotes_previous_owner(aws):
+    import common
+    common.upsert_site("s-1", owner="o@x.com", collaborators=["c@x.com"])
+    out = perm.transfer_owner("s-1", actor="o@x.com", new_owner="new@x.com")
+    assert out["owner"] == "new@x.com"
+    site = common.get_site("s-1")
+    assert site["owner"] == "new@x.com"
+    assert "o@x.com" in site["collaborators"]
+    # 新 owner 不应同时留在 collaborators 里
+    assert "new@x.com" not in site["collaborators"]
+
+
+def test_transfer_owner_from_collaborator_position(aws):
+    import common
+    common.upsert_site("s-1", owner="o@x.com", collaborators=["c@x.com"])
+    perm.transfer_owner("s-1", actor="o@x.com", new_owner="c@x.com")
+    site = common.get_site("s-1")
+    assert site["owner"] == "c@x.com"
+    assert site["collaborators"] == ["o@x.com"]
+
+
+def test_transfer_owner_rejects_bad_email(aws):
+    import common
+    common.upsert_site("s-1", owner="o@x.com", collaborators=[])
+    with pytest.raises(ValueError):
+        perm.transfer_owner("s-1", actor="o@x.com", new_owner="oops")
+
+
+def test_allowed_users_av_org_is_string():
+    assert perm.allowed_users_av("org") == {"S": "org"}
+
+
+def test_allowed_users_av_list_is_L():
+    assert perm.allowed_users_av(["a@x.com"]) == {"L": [{"S": "a@x.com"}]}
+
+
+def test_sync_route_projection_updates_route(aws):
+    import boto3
+    import common
+    common.upsert_site("s-1", owner="o@x.com", require_login=False,
+                       allowed_users=["a@x.com"], collaborators=["c@x.com"])
+    ddb = boto3.client("dynamodb")
+    ddb.put_item(TableName="routing", Item={
+        "subdomain": {"S": "app-s-1"}, "site_id": {"S": "s-1"},
+        "route_mode": {"S": "split"}, "static_prefix": {"S": "sites/s-1/j"},
+        "api_target": {"S": "https://fn.lambda-url.us-east-1.on.aws"},
+        "require_auth": {"BOOL": True}, "allowed_users": {"S": "org"},
+        "collaborators": {"L": []}, "owner": {"S": "o@x.com"}})
+
+    assert perm.sync_route_projection("s-1") is True
+    item = ddb.get_item(TableName="routing",
+                        Key={"subdomain": {"S": "app-s-1"}})["Item"]
+    assert item["require_auth"]["BOOL"] is False
+    assert item["allowed_users"]["L"] == [{"S": "a@x.com"}]
+    assert item["collaborators"]["L"] == [{"S": "c@x.com"}]
+    # 投影只动权限字段：部署态字段必须原样保留（否则会踩掉原子切流）
+    assert item["static_prefix"]["S"] == "sites/s-1/j"
+    assert item["api_target"]["S"] == "https://fn.lambda-url.us-east-1.on.aws"
+
+
+def test_sync_route_projection_missing_route_returns_false(aws):
+    import common
+    common.upsert_site("nodeploy", owner="o@x.com", require_login=True,
+                       allowed_users="org", collaborators=[])
+    assert perm.sync_route_projection("nodeploy") is False
+
+
+def test_sync_route_projection_writes_owner(aws):
+    import boto3
+    import common
+    common.upsert_site("s-1", owner="new@x.com", require_login=True,
+                       allowed_users="org", collaborators=["old@x.com"])
+    ddb = boto3.client("dynamodb")
+    ddb.put_item(TableName="routing", Item={
+        "subdomain": {"S": "app-s-1"}, "site_id": {"S": "s-1"},
+        "route_mode": {"S": "split"}, "static_prefix": {"S": "sites/s-1/j"},
+        "api_target": {"S": ""}, "require_auth": {"BOOL": True},
+        "allowed_users": {"S": "org"}, "collaborators": {"L": []},
+        "owner": {"S": "old@x.com"}})
+    perm.sync_route_projection("s-1")
+    item = ddb.get_item(TableName="routing",
+                        Key={"subdomain": {"S": "app-s-1"}})["Item"]
+    assert item["owner"]["S"] == "new@x.com"
+```
+
+**注意**：`sync_route_projection` 的测试需要 `ROUTING_TABLE` 环境变量。在 `site-builder/deployer/tests/conftest.py` 的 `ENV` 里已有 `"ROUTING_TABLE": "routing"`，无需再加。
+
+- [ ] **Step 3: 运行测试确认失败**
+
+Run: `cd site-builder/deployer && .venv/bin/pytest tests/test_permissions.py -q`
+Expected: FAIL — `AttributeError: module 'permissions' has no attribute 'is_admin'`
+
+- [ ] **Step 4: 写实现**
+
+先在 `site-builder/deployer/functions/permissions.py` 的 docstring 之后补 import 区（Task 1 建的文件目前没有 import）：
+
+```python
+import os
+import re
+from datetime import datetime, timezone
+
+import boto3
+
+import common
+```
+
+然后在文件末尾追加：
+
+```python
+# 与 contract.schema.EMAIL_RE 同 pattern：权限入口与合同校验对邮箱的判定必须一致
+EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+
+_ddb = None
+
+
+def _admins_table():
+    global _ddb
+    if _ddb is None:
+        _ddb = boto3.resource("dynamodb",
+                              region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+    return _ddb.Table(os.environ["ADMINS_TABLE"])
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def is_admin(email: str) -> bool:
+    if not email:
+        return False
+    return "Item" in _admins_table().get_item(Key={"email": email})
+
+
+def list_admins() -> list[str]:
+    items = _admins_table().scan(ProjectionExpression="email").get("Items", [])
+    return sorted(i["email"] for i in items)
+
+
+def add_admin(email: str, added_by: str) -> None:
+    if not EMAIL_RE.fullmatch(email or ""):
+        raise ValueError(f"非法邮箱: {email!r}")
+    _admins_table().put_item(Item={"email": email, "added_by": added_by,
+                                   "added_at": now_iso()})
+
+
+def remove_admin(email: str) -> None:
+    # 名单删空 = 平台永久失去管理员（只能改 config 重跑部署脚本重新种子），
+    # 因此在此硬拦。
+    if list_admins() == [email]:
+        raise PermissionDenied("不能删除最后一个管理员")
+    _admins_table().delete_item(Key={"email": email})
+
+
+def normalize_allowed_users(value):
+    """校验并规范化 allowed_users：返回 "org" 或去重排序后的邮箱 list。"""
+    if value == "org":
+        return "org"
+    if not isinstance(value, list) or not value:
+        raise ValueError('allowed_users 必须为 "org" 或非空邮箱数组')
+    for e in value:
+        if not isinstance(e, str) or not EMAIL_RE.fullmatch(e):
+            raise ValueError(f"allowed_users 含非法邮箱: {e!r}")
+    return sorted(set(value))
+
+
+def _site_or_raise(site_id: str) -> dict:
+    site = common.get_site(site_id)
+    if not site:
+        raise PermissionDenied(f"站点 {site_id} 不存在")
+    return site
+
+
+def set_access_policy(site_id: str, *, actor: str, require_login=None,
+                      allowed_users=None) -> dict:
+    """写 sites 表的访问策略（真源）。调用方负责先做 assert_can。
+
+    只写传入的字段：None 表示不动，便于面板做单字段保存。
+    """
+    site = _site_or_raise(site_id)
+    attrs = {}
+    if require_login is not None:
+        if not isinstance(require_login, bool):
+            raise ValueError("require_login 必须为布尔值")
+        attrs["require_login"] = require_login
+    if allowed_users is not None:
+        attrs["allowed_users"] = normalize_allowed_users(allowed_users)
+    if not attrs:
+        raise ValueError("没有要更新的字段")
+    attrs["permissions_updated_at"] = now_iso()
+    attrs["permissions_updated_by"] = actor
+    common.upsert_site(site_id, **attrs)
+    return {"require_login": attrs.get("require_login", site.get("require_login")),
+            "allowed_users": attrs.get("allowed_users", site.get("allowed_users"))}
+
+
+def set_collaborators(site_id: str, *, actor: str, add=None, remove=None) -> list[str]:
+    site = _site_or_raise(site_id)
+    current = list(site.get("collaborators") or [])
+    for e in (add or []):
+        if not EMAIL_RE.fullmatch(e or ""):
+            raise ValueError(f"非法邮箱: {e!r}")
+        if e == site.get("owner"):
+            raise ValueError("owner 已隐式拥有全部权限，不能同时作为协作者")
+        if e not in current:
+            current.append(e)
+    for e in (remove or []):
+        if e in current:
+            current.remove(e)
+    common.upsert_site(site_id, collaborators=current,
+                       permissions_updated_at=now_iso(), permissions_updated_by=actor)
+    return current
+
+
+def transfer_owner(site_id: str, *, actor: str, new_owner: str) -> dict:
+    """转移所有权：原 owner 自动降级为 collaborator（防转错人即失联）。"""
+    if not EMAIL_RE.fullmatch(new_owner or ""):
+        raise ValueError(f"非法邮箱: {new_owner!r}")
+    site = _site_or_raise(site_id)
+    old_owner = site.get("owner", "")
+    if new_owner == old_owner:
+        raise ValueError("新 owner 与当前 owner 相同")
+    collaborators = [e for e in (site.get("collaborators") or []) if e != new_owner]
+    if old_owner and old_owner not in collaborators:
+        collaborators.append(old_owner)
+    common.upsert_site(site_id, owner=new_owner, collaborators=collaborators,
+                       permissions_updated_at=now_iso(), permissions_updated_by=actor)
+    return {"owner": new_owner, "collaborators": collaborators,
+            "previous_owner": old_owner}
+
+
+# ---- 路由表投影（Edge 读的那份） ----
+# 真源是 sites 表；路由表只是投影。写投影的三个调用方（MCP 工具、控制台、
+# 部署时的 register_route）必须用同一份编码逻辑，否则 Edge 侧会读到形态
+# 不一致的字段。
+
+def allowed_users_av(allowed) -> dict:
+    """allowed_users 的 DynamoDB AttributeValue：字面量 org 用 S，名单用 L。
+
+    Edge 的 _deser 必须已支持 L——否则名单会被读成 False，站点变成
+    "全员放行"。部署顺序：Edge 先上，写侧后上。
+    """
+    if allowed == "org":
+        return {"S": "org"}
+    return {"L": [{"S": e} for e in allowed]}
+
+
+def sync_route_projection(site_id: str) -> bool:
+    """把 sites 表的权限投影到路由表。返回是否真的写了。
+
+    只 update 权限字段，不整条覆盖——部署中的 register_route 会 put_item
+    整条（原子切流），两者若都整写会踩掉 static_prefix / api_target。
+    站点尚未部署成功时路由 item 不存在：条件更新失败即返回 False
+    （真源已更新，首次部署时 register_route 会带上正确值）。
+    """
+    import botocore.exceptions
+    site = common.get_site(site_id) or {}
+    try:
+        boto3.client("dynamodb",
+                     region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+                     ).update_item(
+            TableName=os.environ["ROUTING_TABLE"],
+            Key={"subdomain": {"S": common.subdomain_for(site_id)}},
+            UpdateExpression=("SET require_auth = :a, allowed_users = :u, "
+                              "collaborators = :c, #o = :o"),
+            ConditionExpression="attribute_exists(subdomain)",
+            ExpressionAttributeNames={"#o": "owner"},
+            ExpressionAttributeValues={
+                ":a": {"BOOL": bool(site.get("require_login", True))},
+                ":u": allowed_users_av(site.get("allowed_users", "org")),
+                ":c": {"L": [{"S": e} for e in (site.get("collaborators") or [])]},
+                ":o": {"S": site.get("owner", "")}})
+        return True
+    except botocore.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return False
+        raise
+```
+
+- [ ] **Step 5: 运行测试确认通过**
+
+Run: `cd site-builder/deployer && .venv/bin/pytest tests/test_permissions.py -q`
+Expected: PASS（全部通过）
+
+- [ ] **Step 6: 跑 deployer 全量回归**
+
+Run: `cd site-builder/deployer && .venv/bin/pytest tests -q`
+Expected: PASS（原有测试 + 新增，无回归）
+
+- [ ] **Step 7: 提交**
+
+```bash
+git add site-builder/deployer/functions/permissions.py site-builder/deployer/tests/test_permissions.py site-builder/deployer/tests/conftest.py
+git commit -m "feat(permissions): admin 名单与权限写入（访问策略/协作者/所有权转移）"
+```
+
+---
+
+## Task 3: sites 表加 GSI + admins 表（CDK）
+
+**Files:**
+- Modify: `site-builder/deployer/infra/app.py:31-34`（sites 表定义）与 exec role 语句
+- Modify: `site-builder/config.ini.example`
+- Test: `site-builder/deployer/tests/test_infra_tables.py`（新建，用 CDK assertions 断言模板）
+
+**Interfaces:**
+- Consumes: 无（基础设施层）
+- Produces: `site-sites` 表带 `owner-index` GSI（PK `owner`，无 sort key）；`site-admins` 表（PK `email`）；两者的表名与 `ADMINS_TABLE` 环境变量出现在所有 step Lambda 的 `common_env` 里
+
+- [ ] **Step 1: 写失败测试**
+
+创建 `site-builder/deployer/tests/test_infra_tables.py`：
+
+```python
+"""CDK 模板断言：二期新增的表与索引必须存在，且 step Lambda 拿到 ADMINS_TABLE。
+
+**opt-in（默认 skip）**：本文件要 synth 整个 stack，而 step Lambda 用
+Code.from_asset(bundling=...) —— synth 阶段就会起 Docker 装 psycopg。
+所以默认不跑，需要时显式开：
+
+    SB_CDK_TESTS=1 .venv/bin/pytest tests/test_infra_tables.py -q
+
+日常回归靠"部署后 describe-table 真机核对"（见本任务 Step 5 与 Task 9）。
+"""
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+INFRA = Path(__file__).parents[1] / "infra"
+CONFIG = Path(__file__).parents[2] / "config.ini"
+
+pytestmark = [
+    pytest.mark.skipif(os.environ.get("SB_CDK_TESTS") != "1",
+                       reason="需 SB_CDK_TESTS=1（synth 会起 Docker 做 bundling）"),
+    pytest.mark.skipif(not CONFIG.exists(),
+                       reason="需要 site-builder/config.ini"),
+]
+
+
+@pytest.fixture(scope="module")
+def template():
+    aws_cdk = pytest.importorskip("aws_cdk")
+    from aws_cdk import assertions
+    sys.path.insert(0, str(INFRA))
+    import importlib
+    mod = importlib.import_module("app")
+    app = aws_cdk.App()
+    stack = mod.SiteDeployerStack(app, "TestStack")
+    return assertions.Template.from_stack(stack)
+
+
+def test_sites_table_has_owner_index(template):
+    template.has_resource_properties("AWS::DynamoDB::Table", {
+        "TableName": "site-sites",
+        "GlobalSecondaryIndexes": [{
+            "IndexName": "owner-index",
+            "KeySchema": [{"AttributeName": "owner", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"}}]})
+
+
+def test_admins_table_exists(template):
+    template.has_resource_properties("AWS::DynamoDB::Table", {
+        "TableName": "site-admins",
+        "KeySchema": [{"AttributeName": "email", "KeyType": "HASH"}]})
+
+
+def test_step_lambdas_get_admins_table_env(template):
+    template.has_resource_properties("AWS::Lambda::Function", {
+        "FunctionName": "site-deployer-register_route",
+        "Environment": {"Variables": {"ADMINS_TABLE": "site-admins"}}})
+```
+
+**注意**：`app.py` 模块底部直接 `app.synth()`——`import app` 会 synth 一次默认 app（起 Docker bundling，慢但无副作用，不部署）。测试再建一个独立 `App()` 与 stack 实例即可。这也是本文件默认 skip 的原因。
+
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `cd site-builder/deployer && SB_CDK_TESTS=1 .venv/bin/pytest tests/test_infra_tables.py -q`
+Expected: FAIL — sites 表没有 `GlobalSecondaryIndexes`；`site-admins` 表不存在
+（首次运行会拉 Docker 镜像装 psycopg，耗时几分钟；Docker 未运行则报
+`Cannot connect to the Docker daemon`——此时跳过本文件，靠 Step 5 的 synth
+与 Task 9 的真机 describe-table 验证。）
+
+- [ ] **Step 3: 改 CDK**
+
+修改 `site-builder/deployer/infra/app.py`，把 sites 表定义（当前 31-34 行）替换为：
+
+```python
+        sites = ddb.Table(self, "Sites", table_name="site-sites",
+                          partition_key=ddb.Attribute(name="site_id", type=ddb.AttributeType.STRING),
+                          billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
+                          removal_policy=RemovalPolicy.DESTROY)
+        # 二期：list_my_sites / 控制台按 owner 查（替掉全表 Scan）。
+        # 无 sort key——站点数量级小，按 owner 一次 query 即可。
+        sites.add_global_secondary_index(
+            index_name="owner-index",
+            partition_key=ddb.Attribute(name="owner", type=ddb.AttributeType.STRING))
+
+        # 二期：平台管理员名单。首个管理员由 deploy 脚本从 config.ini
+        # [Platform] admin_seed 幂等注入；之后由控制台增删（不走重部署）。
+        admins = ddb.Table(self, "Admins", table_name="site-admins",
+                           partition_key=ddb.Attribute(name="email",
+                                                       type=ddb.AttributeType.STRING),
+                           billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
+                           removal_policy=RemovalPolicy.RETAIN)
+```
+
+**注意 `removal_policy=RETAIN`**：管理员名单误删会让平台失去管理入口，与 jobs/sites 的 DESTROY 语义不同，这是有意为之——在代码注释里写明。
+
+在 `common_env` 字典（当前 142-155 行）里加一项：
+
+```python
+            "ADMINS_TABLE": admins.table_name,
+```
+
+在 `CfnOutput` 循环（当前 132-137 行）的 dict 里加一项：
+
+```python
+                     "AdminsTable": admins.table_name,
+```
+
+exec role 的 DynamoDB 语句已经是 `table/site-*` 前缀通配（当前 106-110 行），`site-admins` 与 `site-sites/index/*` 都已覆盖，无需改动——**在 Step 5 用 synth 输出确认**。
+
+- [ ] **Step 4: 运行测试确认通过**
+
+Run: `cd site-builder/deployer && SB_CDK_TESTS=1 .venv/bin/pytest tests/test_infra_tables.py -q`
+Expected: PASS（3 passed）
+
+- [ ] **Step 5: 确认 exec role 覆盖新表**
+
+Run:
+```bash
+cd site-builder/deployer/infra && PATH=.venv/bin:$PATH npx -y aws-cdk@latest synth 2>/dev/null | grep -A3 'table/site-\*'
+```
+Expected: 输出里包含 `table/site-*` 与 `table/site-*/index/*` 两条 Resource——确认 `site-admins` 与 sites 的 GSI 都在授权范围内。若 `index/*` 不在，把它加进 `app.py` 的 DynamoDB 语句 resources。
+
+- [ ] **Step 6: 加 config 项**
+
+修改 `site-builder/config.ini.example`：
+
+```ini
+[Platform]
+base_domain = example.com
+account_id = 000000000000
+region = us-east-1
+routing_table = ApplicationWebRouterStack-subdomain-mapping
+# 首个平台管理员邮箱（部署脚本幂等写入 site-admins 表）。
+# 之后的管理员增删在控制台完成，不需要改这里重部署。
+admin_seed =
+
+[Cognito]
+user_pool_id =
+domain =
+site_client_id =
+mcp_client_id =
+# 二期：key-proxy 用的 client_credentials 客户端（M4 才用到，M1 一并创建）
+machine_client_id =
+
+[DSQL]
+cluster_endpoint =
+
+[Deployer]
+jobs_table = site-deploy-jobs
+sites_table = site-sites
+admins_table = site-admins
+artifacts_bucket = site-artifacts-{account_id}
+frontend_bucket = site-frontend-{account_id}
+state_machine_arn =
+edge_role_arn =
+
+[MCP]
+endpoint_url =
+```
+
+- [ ] **Step 7: 提交**
+
+```bash
+git add site-builder/deployer/infra/app.py site-builder/deployer/tests/test_infra_tables.py site-builder/config.ini.example
+git commit -m "feat(infra): sites 表加 owner-index GSI；新增 site-admins 表"
+```
+
+---
+
+## Task 4: `common.list_sites_by_owner` + collaborator 查询
+
+**Files:**
+- Modify: `site-builder/deployer/functions/common.py`
+- Modify: `site-builder/deployer/tests/test_common.py`
+- Modify: `site-builder/deployer/tests/conftest.py`（sites 表加 GSI 定义）
+- Modify: `site-builder/mcp/tests/conftest.py`（同上，MCP 测试共用 sites 表）
+
+**Interfaces:**
+- Consumes: Task 3 的 `owner-index` GSI
+- Produces:
+  - `common.list_sites_by_owner(owner: str) -> list[dict]`（GSI query）
+  - `common.list_sites_for_user(email: str) -> list[dict]`（owner 的 ∪ collaborator 的，按 site_id 去重）
+
+- [ ] **Step 1: 给两个 conftest 的 sites 表加 GSI**
+
+`site-builder/deployer/tests/conftest.py` 与 `site-builder/mcp/tests/conftest.py` 里，把 `site-sites` 建表调用替换为（两个文件内容相同）：
+
+```python
+        ddb.create_table(TableName="site-sites",
+                         KeySchema=[{"AttributeName": "site_id", "KeyType": "HASH"}],
+                         AttributeDefinitions=[
+                             {"AttributeName": "site_id", "AttributeType": "S"},
+                             {"AttributeName": "owner", "AttributeType": "S"}],
+                         GlobalSecondaryIndexes=[{
+                             "IndexName": "owner-index",
+                             "KeySchema": [{"AttributeName": "owner", "KeyType": "HASH"}],
+                             "Projection": {"ProjectionType": "ALL"}}],
+                         BillingMode="PAY_PER_REQUEST")
+```
+
+`site-builder/mcp/tests/conftest.py` 的 `ENV` 里也加 `"ADMINS_TABLE": "site-admins",`，并在建表处加 admins 表（与 Task 2 Step 1 相同的建表代码）。
+
+- [ ] **Step 2: 写失败测试**
+
+在 `site-builder/deployer/tests/test_common.py` 末尾追加：
+
+```python
+def test_list_sites_by_owner_uses_gsi(aws):
+    import common
+    common.upsert_site("s-1", owner="o@x.com", name="one")
+    common.upsert_site("s-2", owner="o@x.com", name="two")
+    common.upsert_site("s-3", owner="other@x.com", name="three")
+    got = {s["site_id"] for s in common.list_sites_by_owner("o@x.com")}
+    assert got == {"s-1", "s-2"}
+
+
+def test_list_sites_by_owner_empty(aws):
+    import common
+    assert common.list_sites_by_owner("nobody@x.com") == []
+
+
+def test_list_sites_for_user_includes_collaborations(aws):
+    import common
+    common.upsert_site("s-1", owner="me@x.com", collaborators=[])
+    common.upsert_site("s-2", owner="other@x.com", collaborators=["me@x.com"])
+    common.upsert_site("s-3", owner="other@x.com", collaborators=["nope@x.com"])
+    got = {s["site_id"] for s in common.list_sites_for_user("me@x.com")}
+    assert got == {"s-1", "s-2"}
+
+
+def test_list_sites_for_user_dedups(aws):
+    import common
+    # 理论上 owner 不该同时在 collaborators 里（permissions 层会拦），
+    # 但历史数据可能有——不能返回重复项
+    common.upsert_site("s-1", owner="me@x.com", collaborators=["me@x.com"])
+    got = [s["site_id"] for s in common.list_sites_for_user("me@x.com")]
+    assert got == ["s-1"]
+```
+
+- [ ] **Step 3: 运行测试确认失败**
+
+Run: `cd site-builder/deployer && .venv/bin/pytest tests/test_common.py -q`
+Expected: FAIL — `AttributeError: module 'common' has no attribute 'list_sites_by_owner'`
+
+- [ ] **Step 4: 写实现**
+
+在 `site-builder/deployer/functions/common.py` 的 `get_site` 之后追加：
+
+```python
+def list_sites_by_owner(owner: str) -> list[dict]:
+    resp = _table("SITES_TABLE").query(
+        IndexName="owner-index",
+        KeyConditionExpression=Key("owner").eq(owner))
+    return resp.get("Items", [])
+
+
+def list_sites_for_user(email: str) -> list[dict]:
+    """我 owner 的 ∪ 我是 collaborator 的站点，按 site_id 去重。
+
+    collaborator 维度没有索引（DynamoDB 不能对 List 建 GSI），用 Scan +
+    contains 过滤。站点规模到数百时改为维护反向索引表。
+    """
+    from boto3.dynamodb.conditions import Attr
+    items = {s["site_id"]: s for s in list_sites_by_owner(email)}
+    resp = _table("SITES_TABLE").scan(
+        FilterExpression=Attr("collaborators").contains(email))
+    for s in resp.get("Items", []):
+        items.setdefault(s["site_id"], s)
+    return list(items.values())
+```
+
+- [ ] **Step 5: 运行测试确认通过**
+
+Run: `cd site-builder/deployer && .venv/bin/pytest tests/test_common.py -q`
+Expected: PASS
+
+- [ ] **Step 6: 提交**
+
+```bash
+git add site-builder/deployer/functions/common.py site-builder/deployer/tests/test_common.py site-builder/deployer/tests/conftest.py site-builder/mcp/tests/conftest.py
+git commit -m "feat(common): 按 owner 查站点用 GSI；新增 owner∪collaborator 列表"
+```
+
+---
+
+## Task 5: `register_route` 改为从 sites 表取权限
+
+**Files:**
+- Modify: `site-builder/deployer/functions/register_route.py`
+- Test: `site-builder/deployer/tests/test_finalize_steps.py`（已有 register_route 测试，在此扩展）
+
+**Interfaces:**
+- Consumes: `common.get_site`、`common.upsert_site`、Task 2 的 `permissions.normalize_allowed_users`
+- Produces: 路由表 item 的权限字段来自 sites 表；首次部署（sites 表无权限字段）时用 manifest 的 `auth` 初始化 sites 表。路由表 `allowed_users` 写法改为：`"org"` → `{"S": "org"}`；名单 → `{"L": [{"S": email}, ...]}`
+
+**依赖**：Task 8（Edge `_deser` 支持 L）必须**先于本任务部署到生产**，否则 Edge 读到 `L` 会静默变 `False`。代码合并顺序上本任务可以先写，但**部署顺序必须 Task 8 先上**——在提交信息里写明。
+
+- [ ] **Step 1: 先确认现有测试怎么写的**
+
+Run: `cd site-builder/deployer && .venv/bin/pytest tests/test_finalize_steps.py -q -v 2>&1 | head -30`
+Expected: 看到现有 register_route 相关测试名，了解 fixture 与 event 形状后再动手。
+
+- [ ] **Step 2: 写失败测试**
+
+在 `site-builder/deployer/tests/test_finalize_steps.py` 末尾追加：
+
+```python
+def test_register_route_seeds_permissions_from_manifest_on_first_deploy(aws):
+    import boto3
+    import common
+    import register_route
+    common.upsert_site("s-1", owner="o@x.com", name="one")  # 无权限字段
+    job_id = common.create_job("o@x.com", "s-1")
+    event = {"job_id": job_id, "site_id": "s-1", "api_target": "",
+             "manifest": {"auth": {"require_login": True,
+                                   "allowed_users": ["a@x.com"]}}}
+    register_route.handler(event, None)
+
+    site = common.get_site("s-1")
+    assert site["require_login"] is True
+    assert site["allowed_users"] == ["a@x.com"]
+
+    item = boto3.client("dynamodb").get_item(
+        TableName="routing", Key={"subdomain": {"S": "app-s-1"}})["Item"]
+    assert item["require_auth"]["BOOL"] is True
+    assert item["allowed_users"]["L"] == [{"S": "a@x.com"}]
+
+
+def test_register_route_prefers_sites_table_over_manifest(aws):
+    """在线改过权限后重部署：manifest 的旧值必须被忽略。"""
+    import boto3
+    import common
+    import register_route
+    common.upsert_site("s-1", owner="o@x.com", require_login=False,
+                       allowed_users=["online@x.com"], collaborators=["c@x.com"])
+    job_id = common.create_job("o@x.com", "s-1")
+    event = {"job_id": job_id, "site_id": "s-1", "api_target": "",
+             "manifest": {"auth": {"require_login": True, "allowed_users": "org"}}}
+    register_route.handler(event, None)
+
+    item = boto3.client("dynamodb").get_item(
+        TableName="routing", Key={"subdomain": {"S": "app-s-1"}})["Item"]
+    assert item["require_auth"]["BOOL"] is False           # 线上值，不是 manifest 的 True
+    assert item["allowed_users"]["L"] == [{"S": "online@x.com"}]
+    assert item["collaborators"]["L"] == [{"S": "c@x.com"}]
+    # sites 表不被 manifest 覆盖
+    assert common.get_site("s-1")["require_login"] is False
+
+
+def test_register_route_writes_org_as_string(aws):
+    import boto3
+    import common
+    import register_route
+    common.upsert_site("s-1", owner="o@x.com", require_login=True,
+                       allowed_users="org", collaborators=[])
+    job_id = common.create_job("o@x.com", "s-1")
+    register_route.handler({"job_id": job_id, "site_id": "s-1", "api_target": "",
+                            "manifest": {"auth": {"require_login": True,
+                                                  "allowed_users": "org"}}}, None)
+    item = boto3.client("dynamodb").get_item(
+        TableName="routing", Key={"subdomain": {"S": "app-s-1"}})["Item"]
+    assert item["allowed_users"] == {"S": "org"}
+    assert item["collaborators"] == {"L": []}
+```
+
+- [ ] **Step 3: 运行测试确认失败**
+
+Run: `cd site-builder/deployer && .venv/bin/pytest tests/test_finalize_steps.py -q -k register_route`
+Expected: FAIL — 现实现从 `event["manifest"]["auth"]` 取值，且 `allowed_users` 写成 JSON 字符串
+
+- [ ] **Step 4: 写实现**
+
+用以下内容替换 `site-builder/deployer/functions/register_route.py` 全文：
+
+```python
+"""SFN 步骤 6：注册子域名路由（含 auth 策略与 owner）。
+
+put_item 覆盖整个 item = 原子切流：static_prefix 指向本次 job 的版本化前缀，
+写入瞬间所有新请求走新版本（Edge 路由缓存最多再滞后 60s）。
+
+权限字段（require_auth / allowed_users / collaborators / owner）的**真源是
+sites 表**，不是 manifest——用户可能在控制台在线改过，manifest 里带的是
+生成代码时的旧值。仅首次部署（sites 表尚无 require_login 字段）用 manifest
+的 auth 段初始化真源。改这段逻辑前先读
+docs/superpowers/specs/2026-07-30-quick-site-builder-phase2-design.md §3。
+"""
+import os
+
+import boto3
+
+import common
+import permissions
+
+
+def _seed_permissions_if_absent(site_id: str, site: dict, manifest_auth: dict,
+                                owner: str) -> dict:
+    """首次部署：把 manifest 的 auth 落进 sites 表作为初始值。"""
+    if "require_login" in site:
+        return site
+    allowed = permissions.normalize_allowed_users(manifest_auth["allowed_users"])
+    attrs = {"require_login": bool(manifest_auth["require_login"]),
+             "allowed_users": allowed,
+             "collaborators": list(site.get("collaborators") or []),
+             "permissions_updated_at": permissions.now_iso(),
+             "permissions_updated_by": owner}
+    common.upsert_site(site_id, **attrs)
+    return {**site, **attrs}
+
+
+def handler(event, context):
+    common.update_job(event["job_id"], phase="register-route")
+    site = common.get_site(event["site_id"]) or {}
+    owner = site.get("owner") or common.get_job(event["job_id"])["owner"]
+    site = _seed_permissions_if_absent(event["site_id"], site,
+                                       event["manifest"]["auth"], owner)
+
+    allowed = site.get("allowed_users", "org")
+    collaborators = list(site.get("collaborators") or [])
+    subdomain = common.subdomain_for(event["site_id"])
+
+    boto3.client("dynamodb").put_item(
+        TableName=os.environ["ROUTING_TABLE"],
+        Item={"subdomain": {"S": subdomain},
+              "site_id": {"S": event["site_id"]},
+              "route_mode": {"S": "split"},
+              "static_prefix": {"S": f"sites/{event['site_id']}/{event['job_id']}"},
+              "api_target": {"S": event.get("api_target", "")},
+              "require_auth": {"BOOL": bool(site.get("require_login", True))},
+              "allowed_users": permissions.allowed_users_av(allowed),
+              "collaborators": {"L": [{"S": e} for e in collaborators]},
+              "owner": {"S": owner}})
+    event["url"] = f"https://{subdomain}.{os.environ['BASE_DOMAIN']}"
+    return event
+```
+
+**注意 `require_login` 默认值取 `True`**：sites 表意外缺字段时按"需要登录"处理（fail-closed），不能默认公开。
+
+- [ ] **Step 5: 运行测试确认通过**
+
+Run: `cd site-builder/deployer && .venv/bin/pytest tests/test_finalize_steps.py -q`
+Expected: PASS（含新增 3 个）
+
+- [ ] **Step 6: 跑 deployer 全量**
+
+Run: `cd site-builder/deployer && .venv/bin/pytest tests -q`
+Expected: PASS
+
+- [ ] **Step 7: 提交**
+
+```bash
+git add site-builder/deployer/functions/register_route.py site-builder/deployer/tests/test_finalize_steps.py
+git commit -m "feat(deployer): register_route 权限取自 sites 表（真源），allowed_users 投影为 L
+
+部署顺序约束：本改动写入 DynamoDB L 类型，必须在 Edge 的 _deser 支持 L
+之后才能部署到生产，否则名单会被 Edge 读成 False（全员放行）。"
+```
+
+---
+
+## Task 6: 合同文档与 schema 注释同步
+
+**Files:**
+- Modify: `site-builder/skills/site-builder/references/contract.md`
+- Modify: `site-builder/contract/src/contract/schema.py`（仅注释，校验逻辑不变）
+- Test: `site-builder/contract/tests/`（跑回归，确认无行为变化）
+
+**Interfaces:**
+- Consumes: 无
+- Produces: 无代码接口——这是给 Agent 与人读的语义澄清
+
+- [ ] **Step 1: 找到 contract.md 里描述 auth 的段落**
+
+Run: `grep -n "allowed_users\|require_login" site-builder/skills/site-builder/references/contract.md`
+Expected: 定位到 `auth` 字段说明处
+
+- [ ] **Step 2: 改文档**
+
+在 `site-builder/skills/site-builder/references/contract.md` 的 `auth` 字段说明后追加：
+
+```markdown
+> **`auth` 只在站点首次部署时生效。** 站点建好后，访问策略的真源是平台侧
+> 记录：用户在控制台（`https://console.<域名>`）或 MCP 工具
+> `update_site_permissions` 在线修改，约 1 分钟内全网生效，**不需要重新
+> 部署**。重部署时 `site.json` 里的 `auth` 会被忽略——所以不要靠改
+> `site.json` 来改权限，也不要因为线上策略与 `site.json` 不一致就去"修正"
+> 它。协作者与所有权同理，只能在控制台或 MCP 工具里管理。
+```
+
+- [ ] **Step 3: 在 schema.py 加注释**
+
+修改 `site-builder/contract/src/contract/schema.py`，在 `auth = manifest.get("auth")` 那一行之前插入注释：
+
+```python
+    # auth 段只在首次部署时被 register_route 落进 sites 表作为初始值；
+    # 之后访问策略的真源是 sites 表（控制台/MCP 在线修改，见二期 spec §3）。
+    # 这里仍做完整校验——首次部署要靠它把住格式。
+```
+
+- [ ] **Step 4: 跑 contract 回归**
+
+Run: `cd site-builder/contract && .venv/bin/pytest tests -q`
+Expected: PASS（67 tests，无行为变化）
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add site-builder/skills/site-builder/references/contract.md site-builder/contract/src/contract/schema.py
+git commit -m "docs(contract): 明确 site.json auth 仅首次部署生效，之后以控制台为准"
+```
+
+---
+
+## Task 7: 存量权限迁移脚本
+
+**Files:**
+- Create: `site-builder/scripts/migrate_permissions.py`
+- Test: `site-builder/deployer/tests/test_migrate_permissions.py`
+
+**Interfaces:**
+- Consumes: `common.get_site`、`common.upsert_site`、`permissions.normalize_allowed_users`
+- Produces:
+  - `migrate(routing_table: str, *, dry_run: bool = True) -> dict`（返回 `{"scanned": n, "migrated": [site_id...], "skipped": [...], "errors": [...]}`）
+  - CLI：`python3 site-builder/scripts/migrate_permissions.py [--apply]`（默认 dry-run）
+
+- [ ] **Step 1: 写失败测试**
+
+创建 `site-builder/deployer/tests/test_migrate_permissions.py`：
+
+```python
+"""迁移脚本：路由表现值 → sites 表权限字段。"""
+import sys
+from pathlib import Path
+
+import boto3
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parents[2] / "scripts"))
+
+
+def _put_route(subdomain, site_id, *, require_auth=True, allowed="org",
+               owner="o@x.com"):
+    boto3.client("dynamodb").put_item(TableName="routing", Item={
+        "subdomain": {"S": subdomain}, "site_id": {"S": site_id},
+        "route_mode": {"S": "split"}, "static_prefix": {"S": f"sites/{site_id}/j"},
+        "api_target": {"S": ""}, "require_auth": {"BOOL": require_auth},
+        "allowed_users": {"S": allowed}, "owner": {"S": owner}})
+
+
+def test_migrates_org_route(aws):
+    import common
+    import migrate_permissions as mig
+    common.upsert_site("s-1", owner="o@x.com", name="one")
+    _put_route("app-s-1", "s-1")
+
+    out = mig.migrate("routing", dry_run=False)
+    assert out["migrated"] == ["s-1"]
+    site = common.get_site("s-1")
+    assert site["require_login"] is True
+    assert site["allowed_users"] == "org"
+    assert site["collaborators"] == []
+
+
+def test_migrates_json_string_allowlist(aws):
+    import common
+    import migrate_permissions as mig
+    common.upsert_site("s-2", owner="o@x.com")
+    _put_route("app-s-2", "s-2", require_auth=True, allowed='["b@x.com","a@x.com"]')
+
+    mig.migrate("routing", dry_run=False)
+    # 迁移时顺带规范化：去重 + 排序
+    assert common.get_site("s-2")["allowed_users"] == ["a@x.com", "b@x.com"]
+
+
+def test_dry_run_writes_nothing(aws):
+    import common
+    import migrate_permissions as mig
+    common.upsert_site("s-3", owner="o@x.com")
+    _put_route("app-s-3", "s-3")
+
+    out = mig.migrate("routing", dry_run=True)
+    assert out["migrated"] == ["s-3"]          # 报告"会迁移"
+    assert "require_login" not in common.get_site("s-3")   # 但没写
+
+
+def test_skips_already_migrated(aws):
+    import common
+    import migrate_permissions as mig
+    common.upsert_site("s-4", owner="o@x.com", require_login=False,
+                       allowed_users=["keep@x.com"], collaborators=[])
+    _put_route("app-s-4", "s-4", require_auth=True, allowed="org")
+
+    out = mig.migrate("routing", dry_run=False)
+    assert out["skipped"] == ["s-4"]
+    # 已迁移的站点不被路由表值覆盖
+    assert common.get_site("s-4")["allowed_users"] == ["keep@x.com"]
+
+
+def test_skips_platform_routes(aws):
+    import migrate_permissions as mig
+    _put_route("auth", "auth-service", owner="platform")
+    out = mig.migrate("routing", dry_run=False)
+    assert out["migrated"] == [] and out["skipped"] == []
+    assert out["scanned"] == 1
+
+
+def test_reports_route_without_site_record(aws):
+    import migrate_permissions as mig
+    _put_route("app-ghost", "ghost")     # sites 表没有对应记录
+    out = mig.migrate("routing", dry_run=False)
+    assert out["errors"] and "ghost" in out["errors"][0]
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `cd site-builder/deployer && .venv/bin/pytest tests/test_migrate_permissions.py -q`
+Expected: FAIL — `ModuleNotFoundError: No module named 'migrate_permissions'`
+
+- [ ] **Step 3: 写实现**
+
+创建 `site-builder/scripts/migrate_permissions.py`：
+
+```python
+#!/usr/bin/env python3
+"""一次性迁移：把路由表里的权限现值回填到 sites 表（二期权限真源）。
+
+背景：一期权限存在两处（site.json 每次部署携带 + 路由表 Edge 读），
+sites 表没有权限字段。二期让 sites 表成为唯一真源，存量站点需要回填。
+
+安全性：默认 dry-run 只报告；已有 require_login 字段的站点一律跳过
+（那是二期之后写入的真源，不能被路由表旧值覆盖）。迁移期间 Edge 行为
+不变（仍读路由表现值），无中断窗口。
+
+用法：
+    python3 site-builder/scripts/migrate_permissions.py           # dry-run
+    python3 site-builder/scripts/migrate_permissions.py --apply   # 实际写入
+"""
+import argparse
+import configparser
+import json
+import os
+import sys
+from pathlib import Path
+
+import boto3
+
+HERE = Path(__file__).parent
+sys.path.insert(0, str(HERE.parent / "deployer" / "functions"))
+
+
+def _load_config() -> None:
+    """从 config.ini 填好 common/permissions 需要的环境变量。"""
+    cfg = configparser.ConfigParser()
+    cfg.read(HERE.parent / "config.ini")
+    os.environ.setdefault("SITES_TABLE", cfg["Deployer"]["sites_table"])
+    os.environ.setdefault("JOBS_TABLE", cfg["Deployer"]["jobs_table"])
+    os.environ.setdefault("ADMINS_TABLE", cfg["Deployer"]["admins_table"])
+    os.environ.setdefault("AWS_DEFAULT_REGION", cfg["Platform"]["region"])
+
+
+def _parse_allowed(raw) -> str | list[str]:
+    """路由表的 allowed_users 现状：S 里存 "org" 或 JSON 数组字符串。"""
+    if "L" in raw:                       # 已是二期形态
+        return [e["S"] for e in raw["L"]]
+    value = raw.get("S", "org")
+    if value == "org":
+        return "org"
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        return "org"                     # 无法解析时按最宽松的 org（Edge 现行为等价）
+    return parsed if isinstance(parsed, list) else "org"
+
+
+def migrate(routing_table: str, *, dry_run: bool = True) -> dict:
+    import common
+    import permissions
+
+    ddb = boto3.client("dynamodb")
+    report = {"scanned": 0, "migrated": [], "skipped": [], "errors": []}
+    paginator = ddb.get_paginator("scan")
+    for page in paginator.paginate(TableName=routing_table):
+        for item in page.get("Items", []):
+            report["scanned"] += 1
+            owner = item.get("owner", {}).get("S", "")
+            if owner == "platform":      # auth-service / 控制台等平台路由无站点记录
+                continue
+            site_id = item.get("site_id", {}).get("S", "")
+            site = common.get_site(site_id)
+            if not site:
+                report["errors"].append(
+                    f"路由 {item['subdomain']['S']} 指向的站点 {site_id} 无 sites 记录")
+                continue
+            if "require_login" in site:
+                report["skipped"].append(site_id)
+                continue
+            try:
+                allowed = permissions.normalize_allowed_users(
+                    _parse_allowed(item.get("allowed_users", {})))
+            except ValueError as e:
+                report["errors"].append(f"{site_id}: allowed_users 无法规范化（{e}）")
+                continue
+            report["migrated"].append(site_id)
+            if dry_run:
+                continue
+            common.upsert_site(
+                site_id,
+                require_login=bool(item.get("require_auth", {}).get("BOOL", True)),
+                allowed_users=allowed,
+                collaborators=list(site.get("collaborators") or []),
+                permissions_updated_at=permissions.now_iso(),
+                permissions_updated_by="migration")
+    return report
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--apply", action="store_true", help="实际写入（默认只报告）")
+    args = ap.parse_args()
+    _load_config()
+    cfg = configparser.ConfigParser()
+    cfg.read(HERE.parent / "config.ini")
+    report = migrate(cfg["Platform"]["routing_table"], dry_run=not args.apply)
+    mode = "APPLY" if args.apply else "DRY-RUN"
+    print(f"[{mode}] 扫描 {report['scanned']} 条路由")
+    print(f"  迁移: {len(report['migrated'])} {report['migrated']}")
+    print(f"  跳过（已有真源）: {len(report['skipped'])} {report['skipped']}")
+    if report["errors"]:
+        print(f"  问题: {len(report['errors'])}")
+        for e in report["errors"]:
+            print(f"    - {e}")
+    if not args.apply and report["migrated"]:
+        print("\n确认无误后加 --apply 实际写入")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+- [ ] **Step 4: 运行测试确认通过**
+
+Run: `cd site-builder/deployer && .venv/bin/pytest tests/test_migrate_permissions.py -q`
+Expected: PASS（6 passed）
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add site-builder/scripts/migrate_permissions.py site-builder/deployer/tests/test_migrate_permissions.py
+git commit -m "feat(scripts): 存量权限迁移脚本（路由表 → sites 表，默认 dry-run）"
+```
+
+---
+
+## Task 8: Edge 支持 List 与 collaborators
+
+**Files:**
+- Modify: `router/infrastructure/lambda/origin_request.py:143-148`（`_deser`）与 `:292-320`（`_check_auth`）
+- Test: `router/infrastructure/lambda/test_edge_auth.py`
+
+**Interfaces:**
+- Consumes: 路由表 item（Task 5 写入的形态）
+- Produces: `_deser` 支持 `L`（→ list of str）与 `N`（→ int）；`_check_auth` 的名单判定接受 `list` 与 JSON 字符串两种 `allowed_users` 形态，并把 `collaborators` 视为隐式在名单内
+
+**这个任务必须先于 Task 5 部署到生产。**
+
+- [ ] **Step 1: 写失败测试**
+
+在 `router/infrastructure/lambda/test_edge_auth.py` 末尾追加：
+
+```python
+def test_deser_handles_list_of_strings():
+    out = orq._deser({"allowed_users": {"L": [{"S": "a@x.com"}, {"S": "b@x.com"}]},
+                      "require_auth": {"BOOL": True},
+                      "owner": {"S": "o@x.com"}})
+    assert out["allowed_users"] == ["a@x.com", "b@x.com"]
+    assert out["require_auth"] is True
+    assert out["owner"] == "o@x.com"
+
+
+def test_deser_handles_empty_list():
+    assert orq._deser({"collaborators": {"L": []}})["collaborators"] == []
+
+
+def test_deser_handles_number():
+    assert orq._deser({"n": {"N": "42"}})["n"] == 42
+
+
+def test_native_list_allowlist_admits_member():
+    route = {**ROUTE_AUTH, "allowed_users": ["vip@x.com"]}
+    r = _req(cookie=f"sb_session={_jwt(email='vip@x.com')}")
+    assert orq._check_auth(r, route, "app-x.example.com") is None
+
+
+def test_native_list_allowlist_rejects_outsider():
+    route = {**ROUTE_AUTH, "allowed_users": ["vip@x.com"]}
+    r = _req(cookie=f"sb_session={_jwt(email='nope@x.com')}")
+    assert orq._check_auth(r, route, "app-x.example.com")["status"] == "403"
+
+
+def test_collaborator_admitted_by_named_allowlist():
+    route = {**ROUTE_AUTH, "allowed_users": ["vip@x.com"],
+             "collaborators": ["c@x.com"]}
+    r = _req(cookie=f"sb_session={_jwt(email='c@x.com')}")
+    assert orq._check_auth(r, route, "app-x.example.com") is None
+    assert r["headers"]["x-user-email"][0]["value"] == "c@x.com"
+
+
+def test_non_collaborator_still_rejected():
+    route = {**ROUTE_AUTH, "allowed_users": ["vip@x.com"],
+             "collaborators": ["c@x.com"]}
+    r = _req(cookie=f"sb_session={_jwt(email='stranger@x.com')}")
+    assert orq._check_auth(r, route, "app-x.example.com")["status"] == "403"
+
+
+def test_legacy_json_string_allowlist_still_works():
+    """迁移期间路由表里可能还是一期的 JSON 字符串形态。"""
+    route = {**ROUTE_AUTH, "allowed_users": json.dumps(["vip@x.com"])}
+    r = _req(cookie=f"sb_session={_jwt(email='vip@x.com')}")
+    assert orq._check_auth(r, route, "app-x.example.com") is None
+
+
+def test_unparsable_allowlist_is_fail_closed():
+    route = {**ROUTE_AUTH, "allowed_users": "{not json"}
+    r = _req(cookie=f"sb_session={_jwt(email='a@x.com')}")
+    assert orq._check_auth(r, route, "app-x.example.com")["status"] == "403"
+
+
+def test_org_route_admits_anyone_with_valid_session():
+    r = _req(cookie=f"sb_session={_jwt(email='anyone@x.com')}")
+    assert orq._check_auth(r, dict(ROUTE_AUTH), "app-x.example.com") is None
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `cd router/infrastructure/lambda && ../../../site-builder/deployer/.venv/bin/pytest test_edge_auth.py -q`
+Expected: FAIL — `_deser` 把 `L` 变成 `False`；`collaborators` 未被识别
+
+- [ ] **Step 3: 改 `_deser`**
+
+替换 `router/infrastructure/lambda/origin_request.py` 的 `_deser`（143-148 行）：
+
+```python
+def _deser(item: dict) -> dict:
+    """DynamoDB AttributeValue -> plain dict（本表用到的类型：S / BOOL / L / N）。
+
+    新增类型必须在此登记：未识别的类型会落到 False，而 allowed_users 变成
+    False 意味着名单检查被跳过（全员放行）——加字段前先加解析。
+    """
+    out = {}
+    for k, v in item.items():
+        if "S" in v:
+            out[k] = v["S"]
+        elif "BOOL" in v:
+            out[k] = v["BOOL"]
+        elif "L" in v:
+            out[k] = [e.get("S", "") for e in v["L"]]
+        elif "N" in v:
+            out[k] = int(v["N"])
+        else:
+            out[k] = False
+    return out
+```
+
+- [ ] **Step 4: 改 `_check_auth` 的名单判定**
+
+把 `origin_request.py` 的 `_check_auth` 里从 `allowed = route.get(...)` 到 `return _forbidden()` 的那一段（308-315 行）替换为：
+
+```python
+    allowed = route.get("allowed_users", "org")
+    if allowed != "org":
+        if isinstance(allowed, list):
+            allowlist = allowed
+        else:
+            # 迁移期兼容：一期把名单存成 JSON 字符串。解析失败按空名单处理
+            # （fail-closed：宁可全员 403 也不能全员放行）。
+            try:
+                allowlist = json.loads(allowed)
+            except Exception:
+                allowlist = []
+            if not isinstance(allowlist, list):
+                allowlist = []
+        email = claims["email"]
+        # owner 与 collaborator 隐式在名单内：他们能改这个名单，
+        # 要求他们把自己也写进去只会制造"把自己锁在门外"的工单。
+        insiders = [route.get("owner", "")] + list(route.get("collaborators") or [])
+        if email not in allowlist and email not in insiders:
+            return _forbidden()
+```
+
+- [ ] **Step 5: 运行测试确认通过**
+
+Run: `cd router/infrastructure/lambda && ../../../site-builder/deployer/.venv/bin/pytest . -q`
+Expected: PASS（原 23 + 新增 10）
+
+- [ ] **Step 6: 确认 Edge 代码体积仍在限制内**
+
+Run: `wc -c router/infrastructure/lambda/origin_request.py`
+Expected: 远小于 1MB（当前约 15KB）——记录数字，确认改动没有引入依赖。
+
+- [ ] **Step 7: 提交**
+
+```bash
+git add router/infrastructure/lambda/origin_request.py router/infrastructure/lambda/test_edge_auth.py
+git commit -m "feat(edge): _deser 支持 L/N；名单判定接受原生 List 并放行 collaborators
+
+必须先于 deployer 的 register_route L 类型投影部署（否则名单读成 False）。"
+```
+
+---
+
+## Task 9: 部署 Edge 与 deployer，真机验证权限投影
+
+**Files:**
+- 无代码改动——这是部署与真机验证任务
+- Modify: `site-builder/DEPLOY.md`（记录本次部署顺序约束与踩到的坑）
+
+**Interfaces:**
+- Consumes: Task 3/5/8 的代码
+- Produces: 生产环境的 Edge 与 deployer 已支持权限真源；一条真实站点的路由 item 是二期形态
+
+- [ ] **Step 1: 部署路由层（Edge 先上）**
+
+Run:
+```bash
+cd router/infrastructure && rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never
+```
+Expected: 部署成功。**检查输出里没有 `SYNTH-ONLY-PLACEHOLDER` 警告**——出现即说明 SSM 读取失败，此时部署出去所有会话验签失败，必须先修好 SSM 参数再重部署。
+
+- [ ] **Step 2: 部署执行器**
+
+Run:
+```bash
+cd site-builder/deployer/infra && rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never
+```
+Expected: 部署成功；输出含 `AdminsTable = site-admins`。
+
+- [ ] **Step 3: [真机] 确认 GSI 与新表存在**
+
+Run:
+```bash
+aws dynamodb describe-table --table-name site-sites --region us-east-1 \
+  --query 'Table.GlobalSecondaryIndexes[].{Name:IndexName,Status:IndexStatus}'
+aws dynamodb describe-table --table-name site-admins --region us-east-1 \
+  --query 'Table.{Name:TableName,Status:TableStatus}'
+```
+Expected: `owner-index` 状态 `ACTIVE`；`site-admins` 状态 `ACTIVE`。
+
+- [ ] **Step 4: [真机] 种子管理员**
+
+先在 `site-builder/config.ini` 的 `[Platform]` 填 `admin_seed = <你的邮箱>`，然后：
+
+Run:
+```bash
+cd site-builder && python3 -c "
+import configparser, os, sys
+from pathlib import Path
+cfg = configparser.ConfigParser(); cfg.read('config.ini')
+sys.path.insert(0, 'deployer/functions')
+os.environ['ADMINS_TABLE'] = cfg['Deployer']['admins_table']
+os.environ['AWS_DEFAULT_REGION'] = cfg['Platform']['region']
+import permissions
+seed = cfg['Platform']['admin_seed']
+assert seed, 'config.ini [Platform] admin_seed 为空'
+permissions.add_admin(seed, added_by='seed')
+print('admins:', permissions.list_admins())
+"
+```
+Expected: 打印含你的邮箱的名单。
+
+**注意**：这段种子逻辑在 M3 会并入 `deploy_panel.py`；此处手动执行只为让 M2 的真机验证有 admin 可用。
+
+- [ ] **Step 5: [真机] 跑迁移脚本 dry-run**
+
+Run: `python3 site-builder/scripts/migrate_permissions.py`
+Expected: 报告列出存量站点（一期部署过 `team-reading-list-*`、`team-kudos-wall-*`）。确认 migrated 名单符合预期、errors 为空。
+
+- [ ] **Step 6: [真机] 执行迁移**
+
+Run: `python3 site-builder/scripts/migrate_permissions.py --apply`
+Expected: 迁移条数与 dry-run 一致。
+
+Run（抽查一个站点）:
+```bash
+aws dynamodb get-item --table-name site-sites --region us-east-1 \
+  --key '{"site_id":{"S":"<某个真实 site_id>"}}' \
+  --query 'Item.{login:require_login,allowed:allowed_users,collab:collaborators}'
+```
+Expected: 三个字段都在，值与路由表现值一致。
+
+- [ ] **Step 7: [真机] 验证存量站点访问行为未变**
+
+Run:
+```bash
+curl -s -o /dev/null -w "%{http_code} %{redirect_url}\n" https://app-<真实 site_id>.<base_domain>/
+```
+Expected: 与迁移前一致（鉴权站点 302 到 `https://auth.<base_domain>/login?redirect=...`）。
+
+- [ ] **Step 8: [真机] 重部署一个站点，确认路由 item 变成二期形态**
+
+用一期的 fixture 部署脚本重部署一个已有站点（`site-builder/scripts/deploy_fixture.py`，或直接经 MCP 走一次），然后：
+
+Run:
+```bash
+aws dynamodb get-item --table-name "$(python3 -c "
+import configparser;c=configparser.ConfigParser();c.read('site-builder/config.ini');print(c['Platform']['routing_table'])")" \
+  --region us-east-1 --key '{"subdomain":{"S":"app-<site_id>"}}' \
+  --query 'Item.{allowed:allowed_users,collab:collaborators,auth:require_auth}'
+```
+Expected: `allowed` 是 `{"S":"org"}` 或 `{"L":[...]}`；`collab` 是 `{"L":[]}`；站点仍可正常访问。
+
+- [ ] **Step 9: 更新 DEPLOY.md**
+
+在 `site-builder/DEPLOY.md` 里加一节（放在路由层/执行器阶段之后）：
+
+```markdown
+## 二期 M2：权限真源迁移（一次性）
+
+权限真源从"site.json + 路由表"迁到 sites 表。**部署顺序有硬约束**：
+
+1. 先部署路由层（Edge 支持 DynamoDB `L` 类型）：
+   `cd router/infrastructure && rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never`
+   —— 顺序颠倒会让 Edge 把名单读成 `False`，等于全员放行。
+2. 再部署执行器（`register_route` 从 sites 表取权限并写 `L` 投影）。
+3. `config.ini [Platform] admin_seed` 填首个管理员邮箱。
+4. 迁移存量站点：先 `python3 site-builder/scripts/migrate_permissions.py`
+   看报告，确认无误后 `--apply`。已有 `require_login` 字段的站点会被跳过
+   （不会覆盖在线修改）。
+5. 验证：存量站点访问行为不变；重部署一个站点后路由 item 的
+   `allowed_users` 变成 `L`（或 `S:"org"`）、多出 `collaborators`。
+
+迁移期间无中断窗口：Edge 兼容 JSON 字符串与 `L` 两种形态。
+```
+
+- [ ] **Step 10: 提交**
+
+```bash
+git add site-builder/DEPLOY.md
+git commit -m "docs(deploy): 二期 M2 权限真源迁移步骤与部署顺序约束"
+```
+
+---
+
+## Task 10: MCP 换用角色判定 + `list_my_sites` 走 GSI
+
+**Files:**
+- Modify: `site-builder/mcp/server.py`
+- Modify: `site-builder/mcp/Dockerfile:12`
+- Modify: `site-builder/mcp/deploy_agentcore.py`（复制 `permissions.py`；IAM 加 admins 表）
+- Modify: `site-builder/mcp/tests/test_tools.py`
+
+**Interfaces:**
+- Consumes: `permissions.role_of/can/assert_can/is_admin/PermissionDenied`、`common.list_sites_for_user`
+- Produces: `server.py` 里 `_assert_permission(email, site_id, action, what) -> dict`（返回 site 记录）；`do_list_sites` 返回项多一个 `role` 字段
+
+- [ ] **Step 1: 写失败测试**
+
+在 `site-builder/mcp/tests/test_tools.py` 末尾追加：
+
+```python
+def test_collaborator_can_deploy_update(aws):
+    import common
+    import server
+    common.upsert_site("app-abc123", owner="o@x.com", collaborators=["c@x.com"],
+                       require_login=True, allowed_users="org")
+    out = server.do_deploy_site("c@x.com", "app", "app-abc123")
+    assert out["site_id"] == "app-abc123"
+
+
+def test_outsider_cannot_deploy_update(aws):
+    import common
+    import server
+    common.upsert_site("app-abc123", owner="o@x.com", collaborators=[])
+    with pytest.raises(server.NotOwner):
+        server.do_deploy_site("x@x.com", "app", "app-abc123")
+
+
+def test_collaborator_cannot_undeploy(aws):
+    import common
+    import server
+    common.upsert_site("app-abc123", owner="o@x.com", collaborators=["c@x.com"])
+    with pytest.raises(server.NotOwner):
+        server.do_undeploy("c@x.com", "app-abc123")
+
+
+def test_owner_can_undeploy(aws):
+    import common
+    import server
+    common.upsert_site("app-abc123", owner="o@x.com", collaborators=["c@x.com"])
+    out = server.do_undeploy("o@x.com", "app-abc123")
+    assert out["job_id"]
+
+
+def test_admin_can_undeploy_others_site(aws):
+    import common
+    import permissions
+    import server
+    permissions.add_admin("adm@x.com", added_by="seed")
+    common.upsert_site("app-abc123", owner="o@x.com", collaborators=[])
+    out = server.do_undeploy("adm@x.com", "app-abc123")
+    assert out["job_id"]
+
+
+def test_collaborator_can_read_status(aws):
+    import common
+    import server
+    common.upsert_site("app-abc123", owner="o@x.com", collaborators=["c@x.com"])
+    job_id = common.create_job("o@x.com", "app-abc123")
+    out = server.do_get_status("c@x.com", job_id)
+    assert "status" in out
+
+
+def test_outsider_cannot_read_status(aws):
+    import common
+    import server
+    common.upsert_site("app-abc123", owner="o@x.com", collaborators=[])
+    job_id = common.create_job("o@x.com", "app-abc123")
+    with pytest.raises(server.NotOwner):
+        server.do_get_status("x@x.com", job_id)
+
+
+def test_list_sites_includes_collaborations_with_role(aws):
+    import common
+    import server
+    common.upsert_site("mine-abc123", owner="me@x.com", name="mine",
+                       status="ACTIVE", tier="static", collaborators=[])
+    common.upsert_site("theirs-abc123", owner="o@x.com", name="theirs",
+                       status="ACTIVE", tier="static", collaborators=["me@x.com"])
+    common.upsert_site("hidden-abc123", owner="o@x.com", name="hidden",
+                       status="ACTIVE", tier="static", collaborators=[])
+    got = {s["site_id"]: s["role"] for s in server.do_list_sites("me@x.com")}
+    assert got == {"mine-abc123": "owner", "theirs-abc123": "collaborator"}
+```
+
+在该文件顶部确认已 `import pytest`（若无则加）。
+
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `cd site-builder/mcp && python3 -m pytest tests/test_tools.py -q`
+Expected: FAIL — collaborator 被 `_assert_owner` 拒；`do_list_sites` 无 `role` 字段
+
+- [ ] **Step 3: 改 server.py**
+
+在 `site-builder/mcp/server.py` 里，`import common` 之后加：
+
+```python
+import permissions  # noqa: E402  deployer/functions/permissions.py（同 common 的解析路径）
+```
+
+把 `_assert_owner`（57-61 行）替换为：
+
+```python
+def _assert_permission(email: str, site_id: str, action: str, what: str) -> dict:
+    """按二期角色模型判定（owner / collaborator / admin）。
+
+    权限真源是 sites 表，判定逻辑全在 permissions.py——控制台与 MCP 共用
+    同一模块，两边语义不会漂移。
+    """
+    site = common.get_site(site_id)
+    try:
+        permissions.assert_can(email, site, action,
+                               is_admin=permissions.is_admin(email), what=what)
+    except permissions.PermissionDenied as e:
+        raise NotOwner(str(e))
+    return site or {}
+```
+
+把 `do_deploy_site` 里的 owner 校验（71 行）替换为：
+
+```python
+        _assert_permission(owner, site_id, "deploy", f"站点 {site_id}")
+```
+
+`do_confirm_upload`（88 行）与 `do_get_status`（122 行）的校验替换为——两处都是先取 job、再按 job 的 site_id 判权限：
+
+```python
+    job = common.get_job(job_id)
+    if not job:
+        raise NotOwner(f"任务 {job_id} 不存在")
+    _assert_permission(owner, job["site_id"], "read", f"任务 {job_id}")
+```
+
+（`do_confirm_upload` 用 `"deploy"` 而非 `"read"`：确认上传会启动部署。）
+
+`do_undeploy`（140 行）替换为：
+
+```python
+    site = _assert_permission(owner, site_id, "undeploy", f"站点 {site_id}")
+```
+
+并把该函数后续用到的 `site` 变量保持不变（原本是 `common.get_site(site_id)` 的结果，现在由 `_assert_permission` 返回）。
+
+`do_list_sites`（126-135 行）整体替换为：
+
+```python
+def do_list_sites(owner: str) -> list[dict]:
+    """我 owner 的 ∪ 我是 collaborator 的站点。"""
+    base = os.environ["BASE_DOMAIN"]
+    out = []
+    for s in common.list_sites_for_user(owner):
+        role = permissions.role_of(owner, s)
+        out.append({"site_id": s["site_id"], "name": s.get("name", ""),
+                    "url": f"https://{s.get('subdomain', 'app-' + s['site_id'])}.{base}",
+                    "status": s.get("status", ""), "tier": s.get("tier", ""),
+                    "role": role})
+    return out
+```
+
+- [ ] **Step 4: 运行测试确认通过**
+
+Run: `cd site-builder/mcp && python3 -m pytest tests -q`
+Expected: PASS
+
+- [ ] **Step 5: 改 Dockerfile 与部署脚本**
+
+`site-builder/mcp/Dockerfile` 第 12 行改为：
+
+```dockerfile
+COPY server.py common.py permissions.py ./
+```
+
+`site-builder/mcp/deploy_agentcore.py` 的 `build_and_push`，把单个 `shutil.copyfile` 替换为循环：
+
+```python
+def build_and_push(image_uri: str) -> None:
+    # common.py / permissions.py 必须进构建上下文：server.py 按同目录解析它们
+    copied = []
+    for name in ("common.py", "permissions.py"):
+        shutil.copyfile(HERE.parent / "deployer" / "functions" / name, HERE / name)
+        copied.append(HERE / name)
+    try:
+        token = ecr.get_authorization_token()["authorizationData"][0]
+        user, pwd = base64.b64decode(token["authorizationToken"]).decode().split(":", 1)
+        _run(["docker", "login", "--username", user, "--password-stdin",
+              token["proxyEndpoint"]], input=pwd.encode())
+        # --platform linux/arm64：AgentCore 只接受 ARM64（Graviton）。
+        # --provenance=false 必需：buildx 默认往 manifest list 里加一条
+        # os=unknown/arch=unknown 的 attestation manifest，CreateAgentRuntime
+        # 校验镜像时会失败，且报错文案误导为
+        # "Access denied while validating ECR URI ... requires permissions for
+        #  ecr:GetAuthorizationToken, ecr:BatchGetImage, ..."
+        # ——实际与 IAM 权限无关（权限齐全时同样报这个）。
+        _run(["docker", "buildx", "build", "--platform", "linux/arm64",
+              "--provenance=false",
+              "-t", image_uri, "--push", str(HERE)])
+    finally:
+        for p in copied:
+            p.unlink(missing_ok=True)
+```
+
+`deploy_agentcore.py` 的 `ensure_role()` 里，DynamoDB 语句的 `Resource` 列表加两项：
+
+```python
+             f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-sites/index/*",
+             f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-admins",
+```
+
+同一语句的 `Action` 列表加 `"dynamodb:DeleteItem"`（`remove_admin` 需要；控制台 M3 也用同一路径）。
+
+`deploy_runtime()` 的 `environmentVariables` 加：
+
+```python
+            "ADMINS_TABLE": CFG["Deployer"]["admins_table"],
+```
+
+- [ ] **Step 6: 确认 MCP 契约测试仍过**
+
+Run: `cd site-builder/mcp && python3 -m pytest tests -q`
+Expected: PASS（工具数仍是 5，本任务未加新工具）
+
+- [ ] **Step 7: 提交**
+
+```bash
+git add site-builder/mcp/server.py site-builder/mcp/Dockerfile site-builder/mcp/deploy_agentcore.py site-builder/mcp/tests/test_tools.py
+git commit -m "feat(mcp): 换用 permissions 角色判定；list_my_sites 走 GSI 并含协作站点"
+```
+
+---
+
+## Task 11: MCP 新增 3 个权限工具
+
+**Files:**
+- Modify: `site-builder/mcp/server.py`
+- Modify: `site-builder/mcp/tests/test_tools.py`
+- Modify: `site-builder/mcp/tests/test_agentcore_contract.py:70-78`（工具数 5 → 8）
+
+**Interfaces:**
+- Consumes: Task 2 的 `permissions.set_access_policy` / `set_collaborators` / `transfer_owner` / `sync_route_projection`、Task 10 的 `_assert_permission`
+- Produces:
+  - `do_update_permissions(caller, site_id, require_login=None, allowed_users=None) -> dict`
+  - `do_manage_collaborators(caller, site_id, add=None, remove=None, transfer_owner=None) -> dict`
+  - `do_get_permissions(caller, site_id) -> dict`
+  - MCP 工具：`update_site_permissions`、`manage_collaborators`、`get_site_permissions`
+
+**说明**：spec §5.4 的第三个工具是 `get_site_stats`，但统计表在 M5 才建。本任务用 `get_site_permissions`（读当前权限，面板与 Agent 都需要）占第三个位置，`get_site_stats` 在 M5 加——那时工具数 8 → 9，同步改契约断言。
+
+- [ ] **Step 1: 写失败测试**
+
+在 `site-builder/mcp/tests/test_tools.py` 末尾追加：
+
+在该文件里，站点 id 统一用 `demo-abc123`（与既有测试同风格），路由子域一律经
+`common.subdomain_for()` 计算——**不要手拼**，`subdomain_for("demo-abc123")`
+是 `app-demo-abc123`，手拼容易错位导致投影断言查不到 item：
+
+```python
+SITE_ID = "demo-abc123"
+
+
+def _route_item(site_id=SITE_ID):
+    import boto3
+    import common
+    return boto3.client("dynamodb").get_item(
+        TableName="routing",
+        Key={"subdomain": {"S": common.subdomain_for(site_id)}}).get("Item")
+
+
+def _seed_site_and_route(site_id=SITE_ID, owner="o@x.com", collaborators=None):
+    import boto3
+    import common
+    common.upsert_site(site_id, owner=owner, name="demo", status="ACTIVE",
+                       tier="static", require_login=True, allowed_users="org",
+                       collaborators=collaborators or [])
+    boto3.client("dynamodb").put_item(TableName="routing", Item={
+        "subdomain": {"S": common.subdomain_for(site_id)},
+        "site_id": {"S": site_id}, "route_mode": {"S": "split"},
+        "static_prefix": {"S": f"sites/{site_id}/j"}, "api_target": {"S": ""},
+        "require_auth": {"BOOL": True}, "allowed_users": {"S": "org"},
+        "collaborators": {"L": []}, "owner": {"S": owner}})
+
+
+def test_update_permissions_writes_both_tables(aws):
+    import common
+    import server
+    _seed_site_and_route()
+    out = server.do_update_permissions("o@x.com", SITE_ID,
+                                       require_login=False,
+                                       allowed_users=["a@x.com"])
+    assert out["require_login"] is False
+    assert out["allowed_users"] == ["a@x.com"]
+    assert common.get_site(SITE_ID)["allowed_users"] == ["a@x.com"]
+    item = _route_item()
+    assert item["require_auth"]["BOOL"] is False
+    assert item["allowed_users"]["L"] == [{"S": "a@x.com"}]
+
+
+def test_update_permissions_allows_collaborator(aws):
+    import server
+    _seed_site_and_route(collaborators=["c@x.com"])
+    out = server.do_update_permissions("c@x.com", SITE_ID, require_login=False)
+    assert out["require_login"] is False
+
+
+def test_update_permissions_rejects_outsider(aws):
+    import server
+    _seed_site_and_route()
+    with pytest.raises(server.NotOwner):
+        server.do_update_permissions("x@x.com", SITE_ID, require_login=False)
+
+
+def test_update_permissions_rejects_bad_allowlist(aws):
+    import server
+    _seed_site_and_route()
+    with pytest.raises(ValueError):
+        server.do_update_permissions("o@x.com", SITE_ID,
+                                     allowed_users=["not-an-email"])
+
+
+def test_manage_collaborators_add_syncs_route(aws):
+    import server
+    _seed_site_and_route()
+    out = server.do_manage_collaborators("o@x.com", SITE_ID, add=["c@x.com"])
+    assert out["collaborators"] == ["c@x.com"]
+    assert _route_item()["collaborators"]["L"] == [{"S": "c@x.com"}]
+
+
+def test_manage_collaborators_rejects_collaborator_caller(aws):
+    import server
+    _seed_site_and_route(collaborators=["c@x.com"])
+    with pytest.raises(server.NotOwner):
+        server.do_manage_collaborators("c@x.com", SITE_ID, add=["d@x.com"])
+
+
+def test_transfer_owner_syncs_route(aws):
+    import server
+    _seed_site_and_route()
+    out = server.do_manage_collaborators("o@x.com", SITE_ID,
+                                         transfer_owner="new@x.com")
+    assert out["owner"] == "new@x.com"
+    assert out["collaborators"] == ["o@x.com"]
+    item = _route_item()
+    assert item["owner"]["S"] == "new@x.com"
+    assert item["collaborators"]["L"] == [{"S": "o@x.com"}]
+
+
+def test_transfer_owner_rejected_for_collaborator(aws):
+    import server
+    _seed_site_and_route(collaborators=["c@x.com"])
+    with pytest.raises(server.NotOwner):
+        server.do_manage_collaborators("c@x.com", SITE_ID,
+                                       transfer_owner="c@x.com")
+
+
+def test_get_permissions_returns_current_state(aws):
+    import server
+    _seed_site_and_route(collaborators=["c@x.com"])
+    out = server.do_get_permissions("c@x.com", SITE_ID)
+    assert out["require_login"] is True
+    assert out["allowed_users"] == "org"
+    assert out["collaborators"] == ["c@x.com"]
+    assert out["owner"] == "o@x.com"
+    assert out["my_role"] == "collaborator"
+
+
+def test_get_permissions_rejects_outsider(aws):
+    import server
+    _seed_site_and_route()
+    with pytest.raises(server.NotOwner):
+        server.do_get_permissions("x@x.com", SITE_ID)
+
+
+def test_update_permissions_works_before_first_deploy(aws):
+    """站点还没部署成功（无路由 item）时改权限不能炸——只更新真源即可。"""
+    import common
+    import server
+    common.upsert_site("nodeploy-abc123", owner="o@x.com", require_login=True,
+                       allowed_users="org", collaborators=[])
+    out = server.do_update_permissions("o@x.com", "nodeploy-abc123",
+                                       require_login=False)
+    assert out["require_login"] is False
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `cd site-builder/mcp && python3 -m pytest tests/test_tools.py -q`
+Expected: FAIL — `AttributeError: module 'server' has no attribute 'do_update_permissions'`
+
+- [ ] **Step 3: 写实现（纯函数层 + 路由投影）**
+
+在 `site-builder/mcp/server.py` 的 `do_undeploy` 之后追加（路由投影用 Task 2 的 `permissions.sync_route_projection`，不在这里重复实现）：
+
+```python
+def do_update_permissions(caller: str, site_id: str, require_login=None,
+                          allowed_users=None) -> dict:
+    _assert_permission(caller, site_id, "set_access_policy", f"站点 {site_id}")
+    out = permissions.set_access_policy(site_id, actor=caller,
+                                        require_login=require_login,
+                                        allowed_users=allowed_users)
+    permissions.sync_route_projection(site_id)
+    out["note"] = "已生效，边缘缓存最多 1 分钟后全网一致"
+    return out
+
+
+def do_manage_collaborators(caller: str, site_id: str, add=None, remove=None,
+                            transfer_owner=None) -> dict:
+    if transfer_owner:
+        _assert_permission(caller, site_id, "transfer_owner", f"站点 {site_id}")
+        out = permissions.transfer_owner(site_id, actor=caller,
+                                        new_owner=transfer_owner)
+    else:
+        if not add and not remove:
+            raise ValueError("需要指定 add / remove / transfer_owner 之一")
+        _assert_permission(caller, site_id, "manage_collaborators", f"站点 {site_id}")
+        collaborators = permissions.set_collaborators(site_id, actor=caller,
+                                                      add=add, remove=remove)
+        site = common.get_site(site_id) or {}
+        out = {"owner": site.get("owner", ""), "collaborators": collaborators}
+    permissions.sync_route_projection(site_id)
+    return out
+
+
+def do_get_permissions(caller: str, site_id: str) -> dict:
+    site = _assert_permission(caller, site_id, "read", f"站点 {site_id}")
+    return {"site_id": site_id,
+            "owner": site.get("owner", ""),
+            "collaborators": list(site.get("collaborators") or []),
+            "require_login": bool(site.get("require_login", True)),
+            "allowed_users": site.get("allowed_users", "org"),
+            "my_role": permissions.role_of(caller, site,
+                                           permissions.is_admin(caller))}
+```
+
+- [ ] **Step 4: 加 MCP 工具壳**
+
+在 `site-builder/mcp/server.py` 的 `undeploy_site` 工具之后追加：
+
+```python
+@mcp.tool()
+def update_site_permissions(site_id: str, require_login: bool | None = None,
+                            allowed_users: list | str | None = None) -> dict:
+    """在线修改站点访问策略——不需要重新部署，约 1 分钟内全网生效。
+
+    require_login: true 需登录后访问，false 公开；不传表示不改。
+    allowed_users: "org"（全组织可访问）或邮箱数组；不传表示不改。
+    站点 owner 与协作者均可调用。site.json 里的 auth 字段不再生效。"""
+    return do_update_permissions(_caller_email(), site_id, require_login,
+                                 allowed_users)
+
+
+@mcp.tool()
+def manage_collaborators(site_id: str, add: list | None = None,
+                         remove: list | None = None,
+                         transfer_owner: str = "") -> dict:
+    """管理站点协作者或转移所有权。仅 owner（或平台管理员）可调用。
+
+    add/remove: 协作者邮箱数组。协作者可部署更新、改访问策略、查状态，
+      但不能下线站点、不能增删协作者。
+    transfer_owner: 新 owner 邮箱。转移后原 owner 自动降级为协作者
+      （防转错人失去访问）。此参数与 add/remove 互斥。"""
+    return do_manage_collaborators(_caller_email(), site_id, add, remove,
+                                   transfer_owner or None)
+
+
+@mcp.tool()
+def get_site_permissions(site_id: str) -> dict:
+    """查询站点当前的访问策略、owner、协作者，以及我对它的角色。"""
+    return do_get_permissions(_caller_email(), site_id)
+```
+
+- [ ] **Step 5: 改契约测试的工具清单**
+
+`site-builder/mcp/tests/test_agentcore_contract.py` 现有的
+`test_all_five_tools_registered` 用 `asyncio.run(server.mcp.list_tools())`
+拿真实注册结果（不是读源码文本）。**沿用这个机制**，把它替换为：
+
+```python
+EXPECTED_TOOLS = ["deploy_site", "confirm_upload", "get_deploy_status",
+                  "list_my_sites", "undeploy_site", "update_site_permissions",
+                  "manage_collaborators", "get_site_permissions"]
+
+
+@pytest.mark.parametrize("tool", EXPECTED_TOOLS)
+def test_all_tools_registered(tool):
+    import asyncio
+
+    import server
+    names = {t.name for t in asyncio.run(server.mcp.list_tools())}
+    assert tool in names
+
+
+def test_no_unexpected_tools_registered():
+    """工具面是对外契约：多出未登记的工具（比如调试残留）要在这里被拦。"""
+    import asyncio
+
+    import server
+    names = {t.name for t in asyncio.run(server.mcp.list_tools())}
+    assert names == set(EXPECTED_TOOLS)
+```
+
+- [ ] **Step 6: 运行测试确认通过**
+
+Run: `cd site-builder/mcp && python3 -m pytest tests -q`
+Expected: PASS
+
+- [ ] **Step 7: 加 IAM 与环境变量**
+
+`site-builder/mcp/deploy_agentcore.py` 的 `ensure_role()` 里，DynamoDB 语句的 `Resource` 加路由表（MCP 现在要写它做投影）：
+
+```python
+             f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/"
+             + CFG["Platform"]["routing_table"],
+```
+
+`deploy_runtime()` 的 `environmentVariables` 加：
+
+```python
+            "ROUTING_TABLE": CFG["Platform"]["routing_table"],
+```
+
+- [ ] **Step 8: 提交**
+
+```bash
+git add site-builder/mcp/server.py site-builder/mcp/tests/test_tools.py site-builder/mcp/tests/test_agentcore_contract.py site-builder/mcp/deploy_agentcore.py
+git commit -m "feat(mcp): 新增 update_site_permissions / manage_collaborators / get_site_permissions"
+```
+
+---
+
+## Task 12: 部署 MCP 并真机验证在线改权限
+
+**Files:**
+- Modify: `site-builder/skills/site-builder/SKILL.md`（把新工具写进 Skill 工作流说明）
+- Modify: `site-builder/DEPLOY.md`（MCP 阶段补新工具与新增 IAM）
+
+**Interfaces:**
+- Consumes: Task 10/11 的代码
+- Produces: 生产 MCP runtime 提供 8 个工具；一条真实站点完成"在线改权限并生效"验证
+
+- [ ] **Step 1: 部署 MCP**
+
+Run:
+```bash
+cd site-builder/mcp && python3 deploy_agentcore.py
+```
+Expected: 构建推送成功（ARM64 + `--provenance=false`），runtime 更新成功。
+
+- [ ] **Step 2: [真机] 确认 8 个工具可列出**
+
+用一期 client-setup 文档里的 Claude Code OAuth 方式连上 MCP（`--client-id` + `--callback-port 18765`），或用 inspector。
+
+Expected: 工具列表含 8 个；`list_my_sites` 返回的项带 `role` 字段且 owner 是你的邮箱。
+
+- [ ] **Step 3: [真机] 在线改权限并验证生效**
+
+对一个真实鉴权站点（如一期的 `team-reading-list-*`），调用 `update_site_permissions(site_id, allowed_users=["<你的邮箱>"])`。
+
+然后：
+
+Run:
+```bash
+# 记录时间，等 60s 让 Edge 路由缓存过期
+sleep 65
+aws dynamodb get-item --table-name "$(python3 -c "
+import configparser;c=configparser.ConfigParser();c.read('site-builder/config.ini');print(c['Platform']['routing_table'])")" \
+  --region us-east-1 --key '{"subdomain":{"S":"app-<site_id>"}}' \
+  --query 'Item.allowed_users'
+```
+Expected: `{"L":[{"S":"<你的邮箱>"}]}`
+
+用浏览器访问该站点：你自己应能访问（名单内）。**再用一个不在名单里的邮箱**（或临时把名单改成别人的邮箱后自己访问）验证 403。
+
+- [ ] **Step 4: [真机] 验证重部署不回滚在线修改**
+
+重部署同一个站点（Agent 里说"部署"，site.json 的 `auth` 保持原来的 `"org"`）。
+
+Run（部署成功后）:
+```bash
+aws dynamodb get-item --table-name site-sites --region us-east-1 \
+  --key '{"site_id":{"S":"<site_id>"}}' --query 'Item.allowed_users'
+```
+Expected: 仍是你在线改的名单（不是 `"org"`）——这是 Task 5 的核心保证。
+
+- [ ] **Step 5: [真机] 验证协作者权限边界**
+
+用 `manage_collaborators(site_id, add=["<同事邮箱>"])` 加一个协作者，然后请对方（或用对方的 token）验证：
+
+- `list_my_sites` 能看到该站点、`role` 为 `collaborator`；
+- `get_site_permissions` 可读；
+- `update_site_permissions` 可改；
+- `undeploy_site` 被拒（错误文案含"无权执行 undeploy"）；
+- `manage_collaborators` 被拒。
+
+Expected: 全部符合。若无同事配合，用 `permissions.role_of` 的单测覆盖 + 直接构造另一个 Cognito 用户登录验证。
+
+- [ ] **Step 6: [真机] 验证所有权转移**
+
+`manage_collaborators(site_id, transfer_owner="<同事邮箱>")`，然后确认：
+
+Run:
+```bash
+aws dynamodb get-item --table-name site-sites --region us-east-1 \
+  --key '{"site_id":{"S":"<site_id>"}}' \
+  --query 'Item.{owner:owner,collab:collaborators}'
+```
+Expected: owner 是对方；你在 collaborators 里。再调 `undeploy_site` 应被拒（你现在只是协作者）。
+
+**验证完把 owner 转回自己**（用对方的 token，或用 admin 身份）。
+
+- [ ] **Step 7: 更新 Skill 文档**
+
+在 `site-builder/skills/site-builder/SKILL.md` 的工具列表/工作流部分加入三个新工具的说明：
+
+```markdown
+### 权限管理（不需要重新部署）
+
+站点建好后，访问策略、协作者、所有权都在平台侧管理，**改这些不需要重新
+部署，也不要去改 `site.json`**（重部署时 `auth` 字段会被忽略）：
+
+- `get_site_permissions(site_id)` — 查当前策略、owner、协作者、我的角色
+- `update_site_permissions(site_id, require_login=?, allowed_users=?)` —
+  改访问策略（owner 与协作者均可），约 1 分钟内全网生效
+- `manage_collaborators(site_id, add=?, remove=?, transfer_owner=?)` —
+  管理协作者 / 转移所有权（仅 owner）
+
+用户说"让某某也能改这个站点" → `manage_collaborators(add=[...])`；
+说"只让这几个人看" → `update_site_permissions(allowed_users=[...])`；
+说"这个站点交给某某负责" → `manage_collaborators(transfer_owner=...)`（转移后
+原 owner 自动变协作者，需向用户说明）。
+
+用户也可以在控制台 `https://console.<域名>` 自助完成同样的操作。
+```
+
+- [ ] **Step 8: 更新 DEPLOY.md**
+
+在 `site-builder/DEPLOY.md` 的 MCP 阶段补一段：
+
+```markdown
+二期 M2 后 MCP 有 8 个工具（新增 `update_site_permissions` /
+`manage_collaborators` / `get_site_permissions`）。runtime 角色新增权限：
+路由表写（权限投影）、`site-sites/index/*`（owner-index）、`site-admins`
+读写。镜像多打包 `permissions.py`（与 `common.py` 同为构建时从
+`deployer/functions/` 复制）。
+```
+
+- [ ] **Step 9: 提交**
+
+```bash
+git add site-builder/skills/site-builder/SKILL.md site-builder/DEPLOY.md
+git commit -m "docs: 权限管理工具写进 Skill 与部署手册"
+```
+
+---
+
+## Task 13: auth 服务加 PKCE + nonce
+
+**Files:**
+- Modify: `site-builder/auth/login_handler.py`
+- Create: `site-builder/auth/tests/test_pkce.py`
+- Modify: `site-builder/auth/tests/test_login_handler.py`（现有 callback 测试需适配新 state 结构）
+
+**Interfaces:**
+- Consumes: 无（auth 服务内部）
+- Produces:
+  - `_pkce_pair() -> tuple[str, str]`（verifier, challenge）
+  - `_encode_state(redirect: str, verifier: str, nonce: str) -> str`
+  - `_decode_state(state: str) -> dict | None`（返回 `{"r":..., "v":..., "n":...}`）
+  - `_exchange_code(code: str, verifier: str, nonce: str) -> dict`（多两个参数，校验 id_token 的 nonce）
+
+- [ ] **Step 1: 写失败测试**
+
+创建 `site-builder/auth/tests/test_pkce.py`：
+
+```python
+"""PKCE（S256）+ nonce：防授权码注入与 id_token 重放。"""
+import base64
+import hashlib
+from unittest.mock import patch
+
+import pytest
+
+import login_handler as lh
+
+ENV = {"JWT_SECRET": "s3cret",
+       "COGNITO_DOMAIN": "https://sso.auth.us-east-1.amazoncognito.com",
+       "CLIENT_ID": "cid", "CLIENT_SECRET": "csec", "BASE_DOMAIN": "example.com",
+       "USER_POOL_ID": "us-east-1_test"}
+
+
+def _event(path, qs=None):
+    return {"rawPath": path, "queryStringParameters": qs or {},
+            "requestContext": {"http": {"method": "GET"}}}
+
+
+def test_pkce_pair_challenge_is_s256_of_verifier():
+    verifier, challenge = lh._pkce_pair()
+    expected = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    assert challenge == expected
+
+
+def test_pkce_verifier_length_within_rfc7636():
+    verifier, _ = lh._pkce_pair()
+    assert 43 <= len(verifier) <= 128
+
+
+def test_pkce_pair_is_random():
+    assert lh._pkce_pair()[0] != lh._pkce_pair()[0]
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_login_includes_code_challenge_and_nonce():
+    r = lh.handler(_event("/login", {"redirect": "https://app-x.example.com/"}), None)
+    loc = r["headers"]["Location"]
+    assert "code_challenge=" in loc
+    assert "code_challenge_method=S256" in loc
+    assert "nonce=" in loc
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_state_roundtrip_carries_verifier_and_nonce():
+    state = lh._encode_state("https://app-x.example.com/", "ver123", "non456")
+    got = lh._decode_state(state)
+    assert got["r"] == "https://app-x.example.com/"
+    assert got["v"] == "ver123"
+    assert got["n"] == "non456"
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_tampered_state_rejected():
+    state = lh._encode_state("https://app-x.example.com/", "ver123", "non456")
+    body, _, sig = state.rpartition(".")
+    assert lh._decode_state(f"{body}x.{sig}") is None
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_callback_passes_verifier_to_token_exchange():
+    state = lh._encode_state("https://app-x.example.com/", "ver123", "non456")
+    with patch.object(lh, "_exchange_code",
+                      return_value={"email": "a@x.com", "name": "A"}) as ex:
+        r = lh.handler(_event("/callback", {"code": "abc", "state": state}), None)
+    assert r["statusCode"] == 302
+    ex.assert_called_once_with("abc", "ver123", "non456")
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_exchange_code_rejects_nonce_mismatch():
+    """id_token 的 nonce 与 state 里的不一致 → 拒绝（防 id_token 重放）。"""
+    fake_tokens = {"id_token": "header.payload.sig"}
+
+    class _Key:
+        key = "k"
+
+    with patch.object(lh, "_post_token", return_value=fake_tokens), \
+         patch.object(lh, "_get_jwks_client") as jwks, \
+         patch.object(lh.pyjwt, "decode",
+                      return_value={"token_use": "id", "email": "a@x.com",
+                                    "nonce": "WRONG"}):
+        jwks.return_value.get_signing_key_from_jwt.return_value = _Key()
+        with pytest.raises(ValueError, match="nonce"):
+            lh._exchange_code("code", "ver123", "expected-nonce")
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_exchange_code_accepts_matching_nonce():
+    fake_tokens = {"id_token": "header.payload.sig"}
+
+    class _Key:
+        key = "k"
+
+    with patch.object(lh, "_post_token", return_value=fake_tokens), \
+         patch.object(lh, "_get_jwks_client") as jwks, \
+         patch.object(lh.pyjwt, "decode",
+                      return_value={"token_use": "id", "email": "a@x.com",
+                                    "name": "Alice", "nonce": "good-nonce"}):
+        jwks.return_value.get_signing_key_from_jwt.return_value = _Key()
+        out = lh._exchange_code("code", "ver123", "good-nonce")
+    assert out == {"email": "a@x.com", "name": "Alice"}
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_post_token_body_includes_code_verifier():
+    captured = {}
+
+    def _fake_urlopen(req, timeout=None):
+        captured["body"] = req.data.decode()
+
+        class _R:
+            def read(self):
+                return b'{"id_token":"x"}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        return _R()
+
+    with patch.object(lh.urllib.request, "urlopen", _fake_urlopen):
+        lh._post_token("thecode", "theverifier")
+    assert "code_verifier=theverifier" in captured["body"]
+    assert "grant_type=authorization_code" in captured["body"]
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `cd site-builder/auth && ../contract/.venv/bin/pytest tests/test_pkce.py -q`
+Expected: FAIL — `AttributeError: module 'login_handler' has no attribute '_pkce_pair'`
+
+- [ ] **Step 3: 改 login_handler.py**
+
+在 `site-builder/auth/login_handler.py` 里：
+
+顶部 import 区加 `import secrets`。
+
+`_encode_state` / `_decode_state` 替换为：
+
+```python
+def _encode_state(redirect: str, verifier: str, nonce: str) -> str:
+    body = base64.urlsafe_b64encode(json.dumps(
+        {"r": redirect, "v": verifier, "n": nonce,
+         "exp": int(time.time()) + 300}).encode()).decode().rstrip("=")
+    return f"{body}.{_state_sig(body)}"
+
+
+def _decode_state(state: str) -> dict | None:
+    """验签 + 验期，失败返回 None。返回 {"r": redirect, "v": verifier, "n": nonce}。
+
+    PKCE 的 code_verifier 与 nonce 都随签名 state 往返——auth 服务无状态
+    （Lambda 多实例），没有服务端会话可存它们；state 已有 HMAC 签名与 5 分钟
+    过期，放在里面不弱于会话存储，且不需要额外存储层。
+    """
+    try:
+        body, _, sig = state.rpartition(".")
+        if not hmac.compare_digest(sig, _state_sig(body)):
+            return None
+        payload = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+        if int(payload.get("exp", 0)) <= int(time.time()):
+            return None
+        return {"r": payload["r"], "v": payload.get("v", ""),
+                "n": payload.get("n", "")}
+    except Exception:
+        return None
+
+
+def _pkce_pair() -> tuple[str, str]:
+    """RFC 7636 S256：返回 (code_verifier, code_challenge)。"""
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(48)).rstrip(b"=").decode()
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    return verifier, challenge
+```
+
+`_exchange_code` 拆成 `_post_token` + `_exchange_code`：
+
+```python
+def _post_token(code: str, verifier: str) -> dict:
+    domain = os.environ["COGNITO_DOMAIN"]
+    body = urllib.parse.urlencode({
+        "grant_type": "authorization_code", "code": code,
+        "client_id": os.environ["CLIENT_ID"],
+        "redirect_uri": f"https://auth.{os.environ['BASE_DOMAIN']}/callback",
+        "code_verifier": verifier,
+    }).encode()
+    basic = base64.b64encode(
+        f"{os.environ['CLIENT_ID']}:{os.environ['CLIENT_SECRET']}".encode()).decode()
+    req = urllib.request.Request(
+        f"{domain}/oauth2/token", data=body,
+        headers={"Authorization": f"Basic {basic}",
+                 "Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read())
+
+
+def _exchange_code(code: str, verifier: str, nonce: str) -> dict:
+    """code → Cognito token → JWKS 验签 + nonce 校验 → {email, name}"""
+    tokens = _post_token(code, verifier)
+    signing_key = _get_jwks_client().get_signing_key_from_jwt(tokens["id_token"])
+    claims = pyjwt.decode(
+        tokens["id_token"], signing_key.key, algorithms=["RS256"],
+        audience=os.environ["CLIENT_ID"],
+        issuer=f"https://cognito-idp.us-east-1.amazonaws.com/{os.environ['USER_POOL_ID']}")
+    if claims.get("token_use") != "id":
+        raise ValueError("token_use != id")
+    # nonce 绑定本次 /login：缺失或不匹配都拒绝，防他人的 id_token 被重放进
+    # 这个 callback（PKCE 保护授权码，nonce 保护 id_token）。
+    if claims.get("nonce") != nonce:
+        raise ValueError("id_token nonce 与本次登录不匹配")
+    return {"email": claims["email"], "name": claims.get("name", claims["email"])}
+```
+
+`handler` 的 `/login` 与 `/callback` 分支替换为：
+
+```python
+    if path == "/login":
+        redirect = qs.get("redirect", f"https://{base}/")
+        if not _is_safe_redirect(redirect):
+            return {"statusCode": 400, "body": "invalid redirect"}
+        verifier, challenge = _pkce_pair()
+        nonce = base64.urlsafe_b64encode(secrets.token_bytes(16)).rstrip(b"=").decode()
+        auth_url = (f"{os.environ['COGNITO_DOMAIN']}/oauth2/authorize?"
+                    + urllib.parse.urlencode({
+                        "response_type": "code", "client_id": os.environ["CLIENT_ID"],
+                        "redirect_uri": f"https://auth.{base}/callback",
+                        "scope": "openid email profile",
+                        "code_challenge": challenge,
+                        "code_challenge_method": "S256",
+                        "nonce": nonce,
+                        "state": _encode_state(redirect, verifier, nonce)}))
+        return {"statusCode": 302, "headers": {"Location": auth_url}, "body": ""}
+
+    if path == "/callback":
+        st = _decode_state(qs.get("state", ""))
+        if st is None or not _is_safe_redirect(st["r"]):
+            return {"statusCode": 400, "body": "invalid or expired state"}
+        user = _exchange_code(qs["code"], st["v"], st["n"])
+        token = mint_session_jwt(user["email"], user["name"], os.environ["JWT_SECRET"])
+        cookie = (f"sb_session={token}; Domain=.{base}; Path=/; Max-Age=86400; "
+                  f"Secure; HttpOnly; SameSite=Lax")
+        return {"statusCode": 302, "headers": {"Location": st["r"]},
+                "cookies": [cookie], "body": ""}
+```
+
+- [ ] **Step 4: 修既有测试**
+
+`site-builder/auth/tests/test_login_handler.py` 里三处用到 `_encode_state("...")` 单参数的调用改为三参数：
+
+```python
+    state = lh._encode_state("https://app-x.example.com/page?tab=2", "v", "n")
+```
+```python
+    state = lh._encode_state("https://app-x.example.com/", "v", "n")
+```
+（`test_callback_rejects_tampered_state` 与 `test_callback_rejects_expired_state` 各一处。）
+
+`test_callback_sets_cookie_and_redirects` 的 `@patch.object(lh, "_exchange_code", return_value=...)` 保持可用（签名变了但 patch 掉了）。
+
+- [ ] **Step 5: 运行测试确认通过**
+
+Run: `cd site-builder/auth && ../contract/.venv/bin/pytest tests -q`
+Expected: PASS（原 11 + 新增 10）
+
+- [ ] **Step 6: 提交**
+
+```bash
+git add site-builder/auth/login_handler.py site-builder/auth/tests/
+git commit -m "feat(auth): OAuth PKCE(S256) + nonce 校验"
+```
+
+---
+
+## Task 14: 平台专用 user pool 部署脚本
+
+**Files:**
+- Create: `site-builder/scripts/deploy_pool.py`
+- Modify: `site-builder/auth/deploy_auth.py`（`ensure_pre_token_trigger` 支持传入 pool_id，供新脚本复用）
+- Test: `site-builder/deployer/tests/test_deploy_pool.py`（纯逻辑部分：client 配置生成、回调 URL 组装）
+
+**Interfaces:**
+- Consumes: `site-builder/config.ini`
+- Produces:
+  - `deploy_pool.pool_config(base_domain: str) -> dict`（CreateUserPool 参数）
+  - `deploy_pool.client_configs(base_domain: str, extra_mcp_callbacks: list[str]) -> dict`（三个 client 的 CreateUserPoolClient 参数，键为 `site` / `mcp` / `machine`）
+  - CLI：`python3 site-builder/scripts/deploy_pool.py [--idp oidc|none]`，幂等；结束时打印要回填 config.ini 的值
+
+**说明**：IdP 联邦配置（飞书适配器 / Okta）用参数化的 OIDC provider 配置，脚本只负责"如果 config 里给了 IdP 参数就创建/更新 OIDC provider"，不写死任何 IdP。真机联邦验证在 Task 15。
+
+- [ ] **Step 1: 写失败测试**
+
+创建 `site-builder/deployer/tests/test_deploy_pool.py`：
+
+```python
+"""平台专用 user pool 的配置生成（纯逻辑，不连 AWS）。"""
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parents[2] / "scripts"))
+
+import deploy_pool as dp
+
+
+def test_pool_config_requires_essentials_tier():
+    # pre-token V2（access token 定制）要求 Essentials+
+    assert dp.pool_config("example.com")["UserPoolTier"] == "ESSENTIALS"
+
+
+def test_pool_config_has_email_attribute():
+    cfg = dp.pool_config("example.com")
+    assert "email" in cfg["AutoVerifiedAttributes"]
+
+
+def test_site_client_callback_is_auth_subdomain():
+    clients = dp.client_configs("example.com", [])
+    assert clients["site"]["CallbackURLs"] == ["https://auth.example.com/callback"]
+
+
+def test_site_client_is_confidential():
+    clients = dp.client_configs("example.com", [])
+    assert clients["site"]["GenerateSecret"] is True
+
+
+def test_site_client_flows():
+    site = dp.client_configs("example.com", [])["site"]
+    assert site["AllowedOAuthFlows"] == ["code"]
+    assert set(site["AllowedOAuthScopes"]) == {"openid", "email", "profile"}
+
+
+def test_mcp_client_includes_localhost_callback():
+    clients = dp.client_configs("example.com", [])
+    # 18765：8765/8766 被 Quick Desktop 常驻占用（一期实测）
+    assert "http://localhost:18765/callback" in clients["mcp"]["CallbackURLs"]
+
+
+def test_mcp_client_accepts_extra_callbacks():
+    clients = dp.client_configs("example.com",
+                                ["https://agentcore.example/identities/cb"])
+    assert "https://agentcore.example/identities/cb" in clients["mcp"]["CallbackURLs"]
+
+
+def test_mcp_client_is_public():
+    # MCP 客户端（Claude Code 等）无法安全保存 secret
+    assert dp.client_configs("example.com", [])["mcp"]["GenerateSecret"] is False
+
+
+def test_machine_client_uses_client_credentials():
+    machine = dp.client_configs("example.com", [])["machine"]
+    assert machine["AllowedOAuthFlows"] == ["client_credentials"]
+    assert machine["GenerateSecret"] is True
+    assert machine["CallbackURLs"] == []
+
+
+def test_machine_client_has_no_user_flows():
+    machine = dp.client_configs("example.com", [])["machine"]
+    assert "code" not in machine["AllowedOAuthFlows"]
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `cd site-builder/deployer && .venv/bin/pytest tests/test_deploy_pool.py -q`
+Expected: FAIL — `ModuleNotFoundError: No module named 'deploy_pool'`
+
+- [ ] **Step 3: 写实现**
+
+创建 `site-builder/scripts/deploy_pool.py`：
+
+```python
+#!/usr/bin/env python3
+"""部署平台专用 Cognito user pool（与上游 Quick SSO 的 pool 解耦）。幂等可重跑。
+
+为什么要专用 pool：一期平台复用了 feishu-quick-sso 的 pool，平台侧配置
+（pre-token 触发器、app client、token 形态）与 Quick SSO 相互牵制。二期
+把平台身份独立出来，之后改平台配置不再影响别的消费方。
+
+**IdP 无关**：本脚本只建 pool + 三个 app client + pre-token 触发器。
+联邦哪个 IdP 由 config.ini [IdP] 段决定——飞书适配器（feishu-quick-sso 的
+OIDC 适配器）与标准 IdP（Okta、Azure AD 等）走同一条 OIDC provider 路径，
+平台其余部分只消费 email/name claim。
+
+三个 app client：
+- site：auth 服务用（confidential，authorization_code）
+- mcp：MCP 客户端 OAuth 用（public，需预注册回调——Cognito 无 dynamic
+  client registration）
+- machine：key-proxy 用（client_credentials；M4 才消费，这里一并建好）
+
+用法：
+    python3 site-builder/scripts/deploy_pool.py
+    python3 site-builder/scripts/deploy_pool.py --domain-prefix my-site-builder
+"""
+import argparse
+import configparser
+import json
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).parent
+
+POOL_NAME = "site-builder-users"
+MCP_LOCALHOST_CALLBACK = "http://localhost:18765/callback"
+
+
+def pool_config(base_domain: str) -> dict:
+    """CreateUserPool 参数。
+
+    UserPoolTier=ESSENTIALS 是硬要求：pre-token-generation V2（往 access
+    token 注入 email）只在 Essentials+ 可用，而 MCP 网关只收 access token
+    ——LITE 档会让 owner 识别整条链断掉（一期实测）。
+    """
+    return {
+        "PoolName": POOL_NAME,
+        "UserPoolTier": "ESSENTIALS",
+        "AutoVerifiedAttributes": ["email"],
+        "UsernameAttributes": ["email"],
+        "Schema": [{"Name": "email", "AttributeDataType": "String",
+                    "Required": True, "Mutable": True}],
+        "AdminCreateUserConfig": {"AllowAdminCreateUserOnly": False},
+        "UserPoolTags": {"project": "site-builder", "managed_by": "deploy_pool.py"},
+    }
+
+
+def client_configs(base_domain: str, extra_mcp_callbacks: list[str]) -> dict:
+    site = {
+        "ClientName": "site-builder-site",
+        "GenerateSecret": True,
+        "AllowedOAuthFlows": ["code"],
+        "AllowedOAuthFlowsUserPoolClient": True,
+        "AllowedOAuthScopes": ["openid", "email", "profile"],
+        "CallbackURLs": [f"https://auth.{base_domain}/callback"],
+        "LogoutURLs": [f"https://auth.{base_domain}/logout"],
+        "SupportedIdentityProviders": ["COGNITO"],
+        "ExplicitAuthFlows": ["ALLOW_REFRESH_TOKEN_AUTH"],
+    }
+    mcp = {
+        "ClientName": "site-builder-mcp",
+        "GenerateSecret": False,   # Claude Code 等客户端无法安全保存 secret
+        "AllowedOAuthFlows": ["code"],
+        "AllowedOAuthFlowsUserPoolClient": True,
+        "AllowedOAuthScopes": ["openid", "email", "profile"],
+        "CallbackURLs": [MCP_LOCALHOST_CALLBACK] + list(extra_mcp_callbacks),
+        "SupportedIdentityProviders": ["COGNITO"],
+        "ExplicitAuthFlows": ["ALLOW_REFRESH_TOKEN_AUTH"],
+    }
+    machine = {
+        "ClientName": "site-builder-machine",
+        "GenerateSecret": True,
+        "AllowedOAuthFlows": ["client_credentials"],
+        "AllowedOAuthFlowsUserPoolClient": True,
+        "AllowedOAuthScopes": [],   # 建 resource server 后回填（M4）
+        "CallbackURLs": [],
+        "SupportedIdentityProviders": ["COGNITO"],
+    }
+    return {"site": site, "mcp": mcp, "machine": machine}
+
+
+def _cfg() -> configparser.ConfigParser:
+    cfg = configparser.ConfigParser()
+    cfg.read(HERE.parent / "config.ini")
+    return cfg
+
+
+def _find_pool(cog, name: str) -> str | None:
+    token = None
+    while True:
+        kw = {"NextToken": token} if token else {}
+        resp = cog.list_user_pools(MaxResults=60, **kw)
+        for p in resp.get("UserPools", []):
+            if p["Name"] == name:
+                return p["Id"]
+        token = resp.get("NextToken")
+        if not token:
+            return None
+
+
+def _ensure_pool(cog, base_domain: str) -> str:
+    existing = _find_pool(cog, POOL_NAME)
+    if existing:
+        print(f"  已存在 pool {existing}")
+        return existing
+    pool_id = cog.create_user_pool(**pool_config(base_domain))["UserPool"]["Id"]
+    print(f"  新建 pool {pool_id}")
+    return pool_id
+
+
+def _ensure_domain(cog, pool_id: str, prefix: str) -> str:
+    pool = cog.describe_user_pool(UserPoolId=pool_id)["UserPool"]
+    if pool.get("Domain"):
+        return pool["Domain"]
+    cog.create_user_pool_domain(Domain=prefix, UserPoolId=pool_id)
+    print(f"  域名前缀 {prefix}")
+    return prefix
+
+
+def _ensure_clients(cog, pool_id: str, base_domain: str,
+                    extra_mcp_callbacks: list[str]) -> dict:
+    existing = {}
+    token = None
+    while True:
+        kw = {"NextToken": token} if token else {}
+        resp = cog.list_user_pool_clients(UserPoolId=pool_id, MaxResults=60, **kw)
+        for c in resp.get("UserPoolClients", []):
+            existing[c["ClientName"]] = c["ClientId"]
+        token = resp.get("NextToken")
+        if not token:
+            break
+
+    out = {}
+    for key, params in client_configs(base_domain, extra_mcp_callbacks).items():
+        name = params["ClientName"]
+        if name in existing:
+            client_id = existing[name]
+            update = {k: v for k, v in params.items() if k != "GenerateSecret"}
+            cog.update_user_pool_client(UserPoolId=pool_id, ClientId=client_id,
+                                        **update)
+            print(f"  更新 client {name} = {client_id}")
+        else:
+            client_id = cog.create_user_pool_client(
+                UserPoolId=pool_id, **params)["UserPoolClient"]["ClientId"]
+            print(f"  新建 client {name} = {client_id}")
+        out[key] = client_id
+    return out
+
+
+def _ensure_oidc_idp(cog, pool_id: str, idp: dict) -> None:
+    """联邦一个 OIDC IdP。飞书适配器与标准 IdP（Okta 等）走同一条路径。"""
+    name = idp["provider_name"]
+    details = {
+        "client_id": idp["client_id"],
+        "client_secret": idp["client_secret"],
+        "attributes_request_method": "GET",
+        "oidc_issuer": idp["issuer"],
+        "authorize_scopes": idp.get("scopes", "openid email profile"),
+    }
+    mapping = {"email": "email", "name": "name"}
+    try:
+        cog.describe_identity_provider(UserPoolId=pool_id, ProviderName=name)
+        cog.update_identity_provider(UserPoolId=pool_id, ProviderName=name,
+                                     ProviderDetails=details,
+                                     AttributeMapping=mapping)
+        print(f"  更新 IdP {name}")
+    except cog.exceptions.ResourceNotFoundException:
+        cog.create_identity_provider(UserPoolId=pool_id, ProviderName=name,
+                                     ProviderType="OIDC",
+                                     ProviderDetails=details,
+                                     AttributeMapping=mapping)
+        print(f"  新建 IdP {name}")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--domain-prefix", default="site-builder-auth",
+                    help="Cognito 托管域名前缀（全局唯一）")
+    ap.add_argument("--mcp-callback", action="append", default=[],
+                    help="额外的 MCP 回调 URL（如 AgentCore identities 回调），可重复")
+    args = ap.parse_args()
+
+    import boto3
+    cfg = _cfg()
+    region = cfg["Platform"]["region"]
+    base_domain = cfg["Platform"]["base_domain"]
+    cog = boto3.client("cognito-idp", region_name=region)
+
+    print("① user pool")
+    pool_id = _ensure_pool(cog, base_domain)
+
+    print("② 托管域名")
+    domain_prefix = _ensure_domain(cog, pool_id, args.domain_prefix)
+
+    print("③ app clients")
+    clients = _ensure_clients(cog, pool_id, base_domain, args.mcp_callback)
+
+    if cfg.has_section("IdP") and cfg["IdP"].get("provider_name"):
+        print("④ OIDC IdP 联邦")
+        idp = dict(cfg["IdP"])
+        _ensure_oidc_idp(cog, pool_id, idp)
+        for key in ("site", "mcp"):
+            cog.update_user_pool_client(
+                UserPoolId=pool_id, ClientId=clients[key],
+                **{**client_configs(base_domain, args.mcp_callback)[key],
+                   "SupportedIdentityProviders": ["COGNITO", idp["provider_name"]]},
+                **{"GenerateSecret": None} if False else {})
+        print(f"  已把 {idp['provider_name']} 加进 site/mcp client")
+    else:
+        print("④ 跳过 IdP 联邦（config.ini 无 [IdP] 段）——"
+              "标准 IdP 或飞书适配器参数见 DEPLOY.md ①")
+
+    print("⑤ pre-token 触发器（email 注入 access token）")
+    sys.path.insert(0, str(HERE.parent / "auth"))
+    import deploy_auth
+    role_arn = deploy_auth.ensure_lambda_role()
+    deploy_auth.ensure_pre_token_trigger(role_arn, pool_id=pool_id)
+
+    secret = cog.describe_user_pool_client(
+        UserPoolId=pool_id, ClientId=clients["site"])["UserPoolClient"].get(
+            "ClientSecret", "")
+    machine_secret = cog.describe_user_pool_client(
+        UserPoolId=pool_id, ClientId=clients["machine"])["UserPoolClient"].get(
+            "ClientSecret", "")
+
+    print("\n回填 site-builder/config.ini：")
+    print(f"  [Cognito] user_pool_id = {pool_id}")
+    print(f"  [Cognito] domain = https://{domain_prefix}.auth.{region}.amazoncognito.com")
+    print(f"  [Cognito] site_client_id = {clients['site']}")
+    print(f"  [Cognito] mcp_client_id = {clients['mcp']}")
+    print(f"  [Cognito] machine_client_id = {clients['machine']}")
+    print("\n把 client secret 写进 SSM（不要落到文件里）：")
+    print(f"  aws ssm put-parameter --name /site-builder/site-client-secret "
+          f"--type SecureString --overwrite --region {region} --value '{secret}'")
+    print(f"  aws ssm put-parameter --name /site-builder/machine-client-secret "
+          f"--type SecureString --overwrite --region {region} --value '{machine_secret}'")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**注意**：上面 `_ensure_clients` 之后给 client 追加 IdP 的那段有多余的字典技巧，实现时简化为直接构造参数：
+
+```python
+        for key in ("site", "mcp"):
+            params = client_configs(base_domain, args.mcp_callback)[key]
+            params.pop("GenerateSecret", None)   # update 不接受此参数
+            params["SupportedIdentityProviders"] = ["COGNITO", idp["provider_name"]]
+            cog.update_user_pool_client(UserPoolId=pool_id,
+                                        ClientId=clients[key], **params)
+```
+
+- [ ] **Step 4: 改 deploy_auth.ensure_pre_token_trigger 支持传 pool_id**
+
+修改 `site-builder/auth/deploy_auth.py` 的 `ensure_pre_token_trigger` 签名与首行：
+
+```python
+def ensure_pre_token_trigger(role_arn: str, pool_id: str | None = None) -> None:
+    """部署 pre-token-generation V2 Lambda 并挂到用户池。
+
+    真机钉死（2026-07-29，AGENTCORE-SPIKE.md §7）：部署 MCP 网关只接受
+    access token，而 Cognito access token 默认不含 email——owner 识别全靠
+    这个触发器把 email 注入 access token。要求用户池 Essentials+ tier。
+
+    pool_id 显式传入时用它（deploy_pool.py 建新 pool 后立即挂载）；
+    默认取 config.ini 的当前 pool。
+    """
+    fn = "site-auth-pre-token"
+    pool_id = pool_id or CFG["Cognito"]["user_pool_id"]
+```
+
+（函数体其余不变。）
+
+- [ ] **Step 5: 运行测试确认通过**
+
+Run: `cd site-builder/deployer && .venv/bin/pytest tests/test_deploy_pool.py -q`
+Expected: PASS（10 passed）
+
+- [ ] **Step 6: 加 config.ini.example 的 [IdP] 段**
+
+在 `site-builder/config.ini.example` 末尾追加：
+
+```ini
+# 可选：给平台专用 user pool 联邦一个 OIDC IdP。
+# 平台对 IdP 无感——只要 IdP 能给 email claim 即可（飞书适配器与
+# Okta/Azure AD 等标准 IdP 走同一条配置路径，见 DEPLOY.md ①）。
+# 留空则只建 pool 与 client，联邦另行手工配置。
+[IdP]
+provider_name =
+issuer =
+client_id =
+client_secret =
+scopes = openid email profile
+```
+
+- [ ] **Step 7: 提交**
+
+```bash
+git add site-builder/scripts/deploy_pool.py site-builder/auth/deploy_auth.py site-builder/deployer/tests/test_deploy_pool.py site-builder/config.ini.example
+git commit -m "feat(scripts): 平台专用 user pool 部署脚本（IdP 无关，三个 app client）"
+```
+
+---
+
+## Task 15: 真机切换到专用 pool
+
+**Files:**
+- Modify: `site-builder/config.ini`（本地，gitignored）
+- Modify: `site-builder/DEPLOY.md`（① 阶段改写为 IdP 无关两分支 + 切换步骤）
+- Modify: `docs/superpowers/specs/2026-07-30-quick-site-builder-phase2-design.md`（若 spike 结论与 spec 不符则更新）
+
+**Interfaces:**
+- Consumes: Task 13/14
+- Produces: 生产环境跑在专用 pool 上；旧 pool 的平台配置已清理；标准 IdP 分支已真机验证
+
+**这是 M1 的验收任务，含两个 spike。**
+
+- [ ] **Step 1: [真机] 建 pool 与 client**
+
+先在 `site-builder/config.ini` 填好 `[IdP]` 段（飞书适配器的 issuer / client_id / client_secret，从一期部署记录取），然后：
+
+Run:
+```bash
+python3 site-builder/scripts/deploy_pool.py --domain-prefix <全局唯一前缀>
+```
+Expected: 打印新 pool id、三个 client id、两条 SSM 写入命令。执行那两条 SSM 命令。
+
+- [ ] **Step 2: [真机 spike] IdP 回调 URL 追加**
+
+新 pool 的 Cognito 域名变了，IdP 侧需要把新的 `https://<domain-prefix>.auth.us-east-1.amazoncognito.com/oauth2/idpresponse` 加进回调白名单。
+
+- 飞书适配器路线：**注意一期实测坑**——飞书后台注册的是 SSO 适配器的 `/callback` 而非 Cognito 域名（错误码 20029）。检查适配器的配置里是否有需要更新的 Cognito 回调地址。
+- 标准 IdP（Okta 等）：在 IdP 的 application 里加该 redirect URI。
+
+Run（验证 Hosted UI 能起飞）:
+```bash
+open "https://<domain-prefix>.auth.us-east-1.amazoncognito.com/oauth2/authorize?response_type=code&client_id=<site_client_id>&redirect_uri=https://auth.<base_domain>/callback&scope=openid+email+profile&state=probe"
+```
+Expected: 跳到 IdP 登录页（不是错误页）。**把实际结论记进 DEPLOY.md**——这是 spec 里标记的实施 spike ②。
+
+- [ ] **Step 3: 回填 config 并重部署 auth 服务**
+
+把 Step 1 打印的值填进 `site-builder/config.ini` 的 `[Cognito]`，然后：
+
+Run:
+```bash
+cd site-builder/auth && python3 deploy_auth.py
+```
+Expected: 部署成功。
+
+- [ ] **Step 4: [真机] 端到端登录验证（含 PKCE/nonce）**
+
+浏览器访问一个鉴权站点 `https://app-<site_id>.<base_domain>/`。
+
+Expected: 302 到 `auth.<base_domain>/login` → Hosted UI → IdP 登录 → 回跳站点并可访问。
+
+Run（确认 PKCE 参数真的发出去了）:
+```bash
+curl -s -D- -o /dev/null "https://auth.<base_domain>/login?redirect=https%3A%2F%2Fapp-<site_id>.<base_domain>%2F" | grep -i location
+```
+Expected: Location 里含 `code_challenge=`、`code_challenge_method=S256`、`nonce=`。
+
+- [ ] **Step 5: [真机] 更新 AgentCore authorizer 到新 pool**
+
+Run:
+```bash
+cd site-builder/mcp && python3 deploy_agentcore.py --skip-build
+```
+Expected: runtime 更新成功（`_discovery_url()` 与 `allowedClients` 已指向新 pool 的值，因为它们从 config.ini 读）。
+
+- [ ] **Step 6: [真机] MCP 重新 OAuth 并验证 email claim**
+
+用 Claude Code 重新连 MCP（`--client-id <新 mcp_client_id>` + `--callback-port 18765`；回调 URL 已由 `deploy_pool.py` 预注册）。
+
+Expected: OAuth 成功；`list_my_sites` 返回的站点 owner 是你的邮箱——证明 pre-token 触发器在新 pool 上生效（access token 带 email）。
+
+若报 401 `Claim 'client_id' value mismatch`：确认客户端发的是 access token 而非 id_token（一期钉死的约束，不要改 `allowedAudience`）。
+
+- [ ] **Step 7: [真机 spike] 标准 IdP 分支验证**
+
+在新 pool 上加一个标准 IdP（Okta 试用租户或 Azure AD），只需 `[IdP]` 段换成它的参数重跑 `deploy_pool.py`，然后用该 IdP 的账号走一次站点登录。
+
+Expected: 登录成功，会话 JWT 的 email 是 IdP 给的 email，站点可访问。**这条覆盖需求清单 B 组"标准 IdP 路径真机验证"**。
+
+若无法获得测试租户，把阻塞原因与已验证到哪一步写进 DEPLOY.md，不要宣称已验证。
+
+- [ ] **Step 8: 重生成 onboarding 并通告**
+
+Run:
+```bash
+python3 site-builder/scripts/gen_onboarding.py
+```
+Expected: 生成的 ONBOARDING.md 含新 pool 的 client-id 与域名。
+
+用户影响：一次性重新登录（站点会话 cookie 仍是旧 JWT_SECRET 签的、仍有效，但 MCP 需重新 OAuth）。发一句话公告。
+
+- [ ] **Step 9: [真机] 清理旧 pool 的平台配置**
+
+**确认新 pool 全链路可用后**再做。旧 pool 上：解除 pre-token 触发器指向（若旧 pool 还被 Quick SSO 使用，只需确认它不再被平台依赖，**不要删旧 pool**）；删掉平台建的 site/mcp 两个 app client。
+
+Run（先确认旧 pool 上哪些 client 是平台建的）:
+```bash
+aws cognito-idp list-user-pool-clients --user-pool-id <旧 pool id> \
+  --region us-east-1 --query 'UserPoolClients[].{Name:ClientName,Id:ClientId}'
+```
+Expected: 能区分出平台的两个 client。删除前**与 Quick SSO 的使用方确认**——这一步不可逆。若不确定，跳过删除，只在文档里记录"旧 pool 的平台 client 已废弃"。
+
+- [ ] **Step 10: 改写 DEPLOY.md ① 阶段**
+
+把 `site-builder/DEPLOY.md` 的 ① 身份层一节改成 IdP 无关的两分支结构：
+
+```markdown
+## ① 身份层（平台专用 Cognito user pool）
+
+平台用自己的 user pool（`site-builder-users`），与上游 Quick SSO 的 pool
+解耦——平台侧配置（pre-token 触发器、app client、token 形态）不再影响
+其他消费方。
+
+**平台对 IdP 无感**：只要 IdP 能给 email claim 即可。下面两条分支产出
+同样的结果，后续阶段完全一样。
+
+### 通用步骤
+
+1. `site-builder/config.ini` 填 `[Platform]`（base_domain / account_id /
+   region）与 `[IdP]`（见下面分支）。
+2. `python3 site-builder/scripts/deploy_pool.py --domain-prefix <全局唯一前缀>`
+   —— 幂等，建 pool（Essentials 档，pre-token V2 必需）+ 三个 app client
+   （site / mcp / machine）+ 托管域名 + pre-token 触发器。
+3. 按脚本输出回填 `[Cognito]`，并执行它打印的两条 SSM 写入命令
+   （client secret 只进 SSM，不写文件）。
+4. 在 IdP 侧把 `https://<前缀>.auth.us-east-1.amazoncognito.com/oauth2/idpresponse`
+   加进回调白名单。
+5. 验证 Hosted UI 能跳到 IdP 登录页。
+
+### 分支 A：飞书（经 feishu-quick-sso 的 OIDC 适配器）
+
+`[IdP]` 填适配器的 issuer / client_id / client_secret。注意一期实测坑：
+飞书后台注册的是**适配器的 `/callback`**，不是 Cognito 域名（否则错误码
+20029）；且用户通讯录必须有邮箱、应用需 `contact:user.email:readonly`
+权限（否则回调 500）。
+
+### 分支 B：标准 IdP（Okta / Azure AD 等）
+
+`[IdP]` 填 IdP 的 OIDC 参数（issuer 用 discovery 文档所在的 issuer）。
+AWS 官方指引见本节末尾链接。属性映射固定 `email → email`、`name → name`。
+
+### 三个 app client 的用途
+
+| client | 用途 | 形态 |
+|---|---|---|
+| site | auth 服务换 token | confidential + code |
+| mcp | MCP 客户端 OAuth | public + code，回调含 `http://localhost:18765/callback`（8765/8766 被 Quick Desktop 占用） |
+| machine | key-proxy 换机器 token（M4） | confidential + client_credentials |
+```
+
+在该节末尾把一期已有的 AWS 官方链接与旧内容保留在"分支 A/B"下对应位置。
+
+- [ ] **Step 11: 提交**
+
+```bash
+git add site-builder/DEPLOY.md
+git commit -m "docs(deploy): ① 身份层改写为 IdP 无关双分支 + 专用 pool 切换步骤"
+```
+
+---
+
+## Task 16: M1+M2 全量回归与文档收尾
+
+**Files:**
+- Modify: `CLAUDE.md`（测试命令与架构图补二期新增项）
+- Modify: `docs/superpowers/specs/2026-07-30-quick-site-builder-phase2-design.md`（若实施中发现 spec 有误，回写）
+
+**Interfaces:**
+- Consumes: Task 1-15 全部
+- Produces: 全套测试通过；文档与实际一致；M1+M2 可交付
+
+- [ ] **Step 1: 五个包全量测试**
+
+Run:
+```bash
+cd site-builder/contract && .venv/bin/pytest tests -q
+cd site-builder/auth && ../contract/.venv/bin/pytest tests -q
+cd router/infrastructure/lambda && ../../../site-builder/deployer/.venv/bin/pytest . -q
+cd site-builder/deployer && .venv/bin/pytest tests -q
+cd site-builder/mcp && python3 -m pytest tests -q
+```
+Expected: 全部 PASS。记录每个包的测试数（contract 应仍是 67；其余各有增长）。
+
+- [ ] **Step 2: [真机] 冒烟路由层**
+
+Run: `bash site-builder/scripts/smoke_router.sh`
+Expected: PASS（会写测试数据并清理）。若脚本因权限字段形态变化而失败，修脚本里的路由 item 构造（加 `collaborators` 与 `L` 形态的 `allowed_users`）。
+
+- [ ] **Step 3: [真机] E2E fixture 彩排**
+
+Run:
+```bash
+RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/test_e2e_fixtures.py -q
+```
+Expected: 4 passed（约 6 分钟）。这条验证权限真源改造没有破坏部署主链。
+
+- [ ] **Step 4: 更新 CLAUDE.md**
+
+在 `CLAUDE.md` 的架构图后追加二期 M1+M2 的变化说明，并在"高频坑"里加两条：
+
+```markdown
+- **权限真源是 sites 表**（二期 M2 起）：`require_login` / `allowed_users` /
+  `collaborators` 以 `site-sites` 为准，路由表只是给 Edge 读的投影。
+  `site.json` 的 `auth` 只在首次部署时作初始值，重部署忽略它。改权限走
+  MCP 的 `update_site_permissions` 或控制台，约 1 分钟生效（Edge 路由缓存 60s）。
+  判定逻辑全在 `deployer/functions/permissions.py`（MCP 与控制台共用，
+  构建时复制，同 `common.py`）。
+- **路由表新增 DynamoDB `L` 类型字段**（`allowed_users` 名单、
+  `collaborators`）：Edge 的 `_deser` 必须先支持 `L` 才能部署写侧——
+  顺序颠倒会让名单读成 `False`（等于全员放行）。加新字段类型时同理。
+```
+
+并在测试命令一节补一句：
+
+```markdown
+`deployer` 的测试里新增了 CDK 模板断言（`test_infra_tables.py`）——需要
+`site-builder/config.ini` 存在，否则整文件 skip。
+```
+
+- [ ] **Step 5: 核对 spec 与实现**
+
+逐条读 spec 的 §3（权限模型）与 §7.1-7.2（pool + PKCE），确认实现与之一致。**任何实施中改掉的决定都回写 spec**（例如：`get_site_stats` 推到 M5、第三个工具改为 `get_site_permissions`；`site-admins` 表用 `RemovalPolicy.RETAIN`；`_ROUTE_CACHE` 无失效机制导致的 60s 生效窗口写法）。
+
+在 spec §5.4 的工具表后加一句：
+
+```markdown
+> 实施说明（M2）：`get_site_stats` 依赖 M5 的统计表，M2 阶段第三个新工具
+> 是 `get_site_permissions`（读当前策略与我的角色）。M5 加 stats 工具时
+> MCP 工具数 8 → 9，同步改 `test_agentcore_contract.py` 的期望列表。
+```
+
+- [ ] **Step 6: 提交**
+
+```bash
+git add CLAUDE.md docs/superpowers/specs/2026-07-30-quick-site-builder-phase2-design.md
+git commit -m "docs: M1+M2 收尾——CLAUDE.md 补权限真源与 L 类型顺序约束，spec 回写实施差异"
+```
+
+- [ ] **Step 7: 推送**
+
+```bash
+git push --no-verify
+```
+Expected: 推送成功。
+
+---
+
+## 附：M3-M6 概要（本计划不含，后续单独出计划）
+
+| 模块 | 内容 | 前置 |
+|---|---|---|
+| M3 控制台 | `site-builder/panel/`（panel Lambda + 静态前端）、`deploy_panel.py`、auth 的 `/console-session` + `sb_console` host-only cookie、Edge 保留 cookie 名单、`site-ops-log` 审计表、admin 种子并入部署脚本 | M2 ✅ |
+| M4 API Key | `site-api-keys` 表、`sk-` + 16 位 Key、key-proxy Lambda（`mcp.{base_domain}`）、machine client 的 resource server 与 scope、AgentCore spike（client_credentials token + `X-SB-On-Behalf-Of` 头透传） | M1 ✅（machine client 已建） |
+| M5 统计 | Edge 访问日志行、聚合 Lambda + EventBridge、`site-access-stats` / `site-access-audit` 表、面板图表、MCP `get_site_stats`、平台 Lambda 日志组补 30 天保留 | M2、M3 |
+| M6 收尾 | 全量 E2E、DEPLOY.md 新阶段、onboarding 重生成、文档同步 | 全部 |
