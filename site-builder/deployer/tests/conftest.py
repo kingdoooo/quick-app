@@ -40,7 +40,13 @@ def aws(monkeypatch):
                          BillingMode="PAY_PER_REQUEST")
         ddb.create_table(TableName="site-sites",
                          KeySchema=[{"AttributeName": "site_id", "KeyType": "HASH"}],
-                         AttributeDefinitions=[{"AttributeName": "site_id", "AttributeType": "S"}],
+                         AttributeDefinitions=[
+                             {"AttributeName": "site_id", "AttributeType": "S"},
+                             {"AttributeName": "owner", "AttributeType": "S"}],
+                         GlobalSecondaryIndexes=[{
+                             "IndexName": "owner-index",
+                             "KeySchema": [{"AttributeName": "owner", "KeyType": "HASH"}],
+                             "Projection": {"ProjectionType": "ALL"}}],
                          BillingMode="PAY_PER_REQUEST")
         ddb.create_table(TableName="routing",
                          KeySchema=[{"AttributeName": "subdomain", "KeyType": "HASH"}],

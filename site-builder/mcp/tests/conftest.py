@@ -15,6 +15,7 @@ ENV = {"JOBS_TABLE": "site-deploy-jobs", "SITES_TABLE": "site-sites",
        "ROUTING_TABLE": "routing", "BASE_DOMAIN": "example.com",
        "RUNTIME_BOUNDARY_ARN": "arn:aws:iam::1:policy/site-runtime-boundary",
        "ACCOUNT_ID": "1",
+       "ADMINS_TABLE": "site-admins",
        "PACKAGE_PROJECT": "site-package", "DSQL_ENDPOINT": "x.dsql.us-east-1.on.aws",
        "AWS_DEFAULT_REGION": "us-east-1",
        "AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
@@ -40,11 +41,22 @@ def aws(monkeypatch):
                          BillingMode="PAY_PER_REQUEST")
         ddb.create_table(TableName="site-sites",
                          KeySchema=[{"AttributeName": "site_id", "KeyType": "HASH"}],
-                         AttributeDefinitions=[{"AttributeName": "site_id", "AttributeType": "S"}],
+                         AttributeDefinitions=[
+                             {"AttributeName": "site_id", "AttributeType": "S"},
+                             {"AttributeName": "owner", "AttributeType": "S"}],
+                         GlobalSecondaryIndexes=[{
+                             "IndexName": "owner-index",
+                             "KeySchema": [{"AttributeName": "owner", "KeyType": "HASH"}],
+                             "Projection": {"ProjectionType": "ALL"}}],
                          BillingMode="PAY_PER_REQUEST")
         ddb.create_table(TableName="routing",
                          KeySchema=[{"AttributeName": "subdomain", "KeyType": "HASH"}],
                          AttributeDefinitions=[{"AttributeName": "subdomain", "AttributeType": "S"}],
+                         BillingMode="PAY_PER_REQUEST")
+        ddb.create_table(TableName="site-admins",
+                         KeySchema=[{"AttributeName": "email", "KeyType": "HASH"}],
+                         AttributeDefinitions=[{"AttributeName": "email",
+                                                "AttributeType": "S"}],
                          BillingMode="PAY_PER_REQUEST")
         s3c = boto3.client("s3", region_name="us-east-1")
         for b in ("site-artifacts-1", "site-frontend-1"):

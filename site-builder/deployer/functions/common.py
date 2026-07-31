@@ -105,6 +105,27 @@ def _paginate(method, **kwargs) -> list[dict]:
             return items
 
 
+def list_sites_by_owner(owner: str) -> list[dict]:
+    table = _table("SITES_TABLE")
+    return _paginate(table.query, IndexName="owner-index",
+                     KeyConditionExpression=Key("owner").eq(owner))
+
+
+def list_sites_for_user(email: str) -> list[dict]:
+    """我 owner 的 ∪ 我是 collaborator 的站点，按 site_id 去重。
+
+    collaborator 维度没有索引（DynamoDB 不能对 List 建 GSI），用 Scan +
+    contains 过滤。站点规模到数百时改为维护反向索引表。
+    """
+    from boto3.dynamodb.conditions import Attr
+    table = _table("SITES_TABLE")
+    items = {s["site_id"]: s for s in list_sites_by_owner(email)}
+    for s in _paginate(table.scan,
+                       FilterExpression=Attr("collaborators").contains(email)):
+        items.setdefault(s["site_id"], s)
+    return list(items.values())
+
+
 class InvalidSiteName(ValueError):
     pass
 

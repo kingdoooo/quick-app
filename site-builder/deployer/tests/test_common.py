@@ -58,3 +58,35 @@ def test_site_name_rejects_sql_and_resource_name_hazards():
     # 合法名照常通过
     for good in ("expense-tracker", "notes", "a1", "x" * 30):
         assert common.new_site_id(good)
+
+
+def test_list_sites_by_owner_uses_gsi(aws):
+    import common
+    common.upsert_site("s-1", owner="o@x.com", name="one")
+    common.upsert_site("s-2", owner="o@x.com", name="two")
+    common.upsert_site("s-3", owner="other@x.com", name="three")
+    got = {s["site_id"] for s in common.list_sites_by_owner("o@x.com")}
+    assert got == {"s-1", "s-2"}
+
+
+def test_list_sites_by_owner_empty(aws):
+    import common
+    assert common.list_sites_by_owner("nobody@x.com") == []
+
+
+def test_list_sites_for_user_includes_collaborations(aws):
+    import common
+    common.upsert_site("s-1", owner="me@x.com", collaborators=[])
+    common.upsert_site("s-2", owner="other@x.com", collaborators=["me@x.com"])
+    common.upsert_site("s-3", owner="other@x.com", collaborators=["nope@x.com"])
+    got = {s["site_id"] for s in common.list_sites_for_user("me@x.com")}
+    assert got == {"s-1", "s-2"}
+
+
+def test_list_sites_for_user_dedups(aws):
+    import common
+    # 理论上 owner 不该同时在 collaborators 里（permissions 层会拦），
+    # 但历史数据可能有——不能返回重复项
+    common.upsert_site("s-1", owner="me@x.com", collaborators=["me@x.com"])
+    got = [s["site_id"] for s in common.list_sites_for_user("me@x.com")]
+    assert got == ["s-1"]
