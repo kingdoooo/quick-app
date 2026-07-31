@@ -46,6 +46,13 @@ my-site/
 | `auth.require_login` | boolean | 必填 | `true`：访问者必须飞书登录；`false`：匿名可访问 | `true` |
 | `auth.allowed_users` | string 或 array | 必填 | `"org"`（全组织飞书用户）或非空邮箱数组（每项须为合法邮箱） | `"org"` 或 `["a@corp.com", "b@corp.com"]` |
 
+> **`auth` 只在站点首次部署时生效。** 站点建好后，访问策略的真源是平台侧
+> 记录：用户在控制台（`https://console.<域名>`）或 MCP 工具
+> `update_site_permissions` 在线修改，约 1 分钟内全网生效，**不需要重新
+> 部署**。重部署时 `site.json` 里的 `auth` 会被忽略——所以不要靠改
+> `site.json` 来改权限，也不要因为线上策略与 `site.json` 不一致就去"修正"
+> 它。协作者与所有权同理，只能在控制台或 MCP 工具里管理。
+
 三档完整样例见 `templates/site.json.static.example`、
 `templates/site.json.nosql.example`、`templates/site.json.sql.example`——直接以
 对应样例为底稿改 `name` / `tables` / `auth`，不要凭记忆手写。

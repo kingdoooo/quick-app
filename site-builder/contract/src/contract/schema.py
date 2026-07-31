@@ -72,6 +72,9 @@ def validate_manifest(manifest: dict) -> list[str]:
     if tier == "fullstack-sql" and db.get("tables"):
         errors.append("database.tables: dsql 引擎不使用 tables（schema 写在 backend/schema.sql）")
 
+    # auth 段只在首次部署时被 register_route 落进 sites 表作为初始值；
+    # 之后访问策略的真源是 sites 表（控制台/MCP 在线修改，见二期 spec §3）。
+    # 这里仍做完整校验——首次部署要靠它把住格式。
     auth = manifest.get("auth")
     if not isinstance(auth, dict) or not isinstance(auth.get("require_login"), bool):
         errors.append("auth.require_login: 必须为布尔值")
