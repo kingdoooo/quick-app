@@ -4,7 +4,10 @@
 Code.from_asset(bundling=...) —— synth 阶段就会起 Docker 装 psycopg。
 所以默认不跑，需要时显式开：
 
-    SB_CDK_TESTS=1 .venv/bin/pytest tests/test_infra_tables.py -q
+    # aws_cdk 只装在 infra/.venv（deployer/.venv 只有 boto3/pytest/moto）；不带
+    # PYTHONPATH 桥接时"依赖缺失"会被静默变成 skip——看起来绿了其实什么都没断言。
+    PYTHONPATH="$PWD/infra/.venv/lib/python3.12/site-packages" \
+      SB_CDK_TESTS=1 .venv/bin/pytest tests/test_infra_tables.py -q
 
 日常回归靠"部署后 describe-table 真机核对"（见本任务 Step 5 与 Task 9）。
 """
@@ -27,8 +30,15 @@ pytestmark = [
 
 @pytest.fixture(scope="module")
 def template():
-    aws_cdk = pytest.importorskip("aws_cdk")
-    from aws_cdk import assertions
+    # 显式 opt-in 了就不许再静默 skip：importorskip 会把"aws_cdk 装错 venv"
+    # 伪装成 skip，和默认不跑长得一样，等于这次运行白跑。上面的 pytestmark
+    # 已经管了 SB_CDK_TESTS 未设的情况，所以这里只会在故意开跑时触发。
+    try:
+        import aws_cdk
+        from aws_cdk import assertions
+    except ImportError:
+        pytest.fail("SB_CDK_TESTS=1 但 aws_cdk 不可用——用 docstring 里的 "
+                    "PYTHONPATH 桥接命令跑，否则这次运行什么都没验证")
     sys.path.insert(0, str(INFRA))
     import importlib
     mod = importlib.import_module("app")
@@ -50,6 +60,15 @@ def test_admins_table_exists(template):
     template.has_resource_properties("AWS::DynamoDB::Table", {
         "TableName": "site-admins",
         "KeySchema": [{"AttributeName": "email", "KeyType": "HASH"}]})
+
+
+def test_admins_table_is_retained(template):
+    # RETAIN 是本表唯一有意为之、且运维上要命的属性（名单误删 = 平台失去管理
+    # 入口）。DeletionPolicy 是 resource 级字段，has_resource_properties 看不到
+    # ——必须用 has_resource，否则日后有人改成 DESTROY 全部测试照样绿。
+    template.has_resource("AWS::DynamoDB::Table", {
+        "DeletionPolicy": "Retain",
+        "Properties": {"TableName": "site-admins"}})
 
 
 def test_step_lambdas_get_admins_table_env(template):
