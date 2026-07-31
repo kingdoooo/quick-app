@@ -63,22 +63,49 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# 取待扫文本。**必须与 grep 分开做并检查 git 的退出码**：
+# 早期版本写成 hits="$(git diff --cached | grep -nE ...)"，git 失败时（不在 git
+# 仓库里、--range 给了不存在的 ref）hits 为空 → 报 "clean" → exit 0。
+# 那是 fail-open，正是本脚本要消灭的故障模式（实测：仓库外跑 exit=0 "clean"）。
+text=""
 case "$mode" in
   staged)
-    if git diff --cached --quiet 2>/dev/null; then
+    git rev-parse --git-dir >/dev/null 2>&1 || {
+      echo "🛑 当前目录不是 git 仓库——无法扫描，拒绝放行" >&2; exit 2; }
+    if git diff --cached --quiet; then
       echo "⚠️  stage 是空的——先 git add，否则这次扫描什么都没看（见脚本头注释）" >&2
       exit 2
     fi
     subject="staged diff"
-    hits="$(git diff --cached | grep -nE "$PATTERN")" ;;
+    text="$(git diff --cached)" || {
+      echo "🛑 git diff --cached 失败——无法扫描，拒绝放行" >&2; exit 2; } ;;
   range)
+    git rev-parse --git-dir >/dev/null 2>&1 || {
+      echo "🛑 当前目录不是 git 仓库——无法扫描，拒绝放行" >&2; exit 2; }
     subject="range $range"
-    hits="$(git diff "$range" | grep -nE "$PATTERN")" ;;
+    text="$(git diff "$range")" || {
+      echo "🛑 git diff $range 失败（ref 不存在？）——无法扫描，拒绝放行" >&2
+      exit 2; } ;;
   files)
     if [ "${#files[@]}" -eq 0 ]; then echo "--files 需要至少一个路径" >&2; exit 2; fi
+    for f in "${files[@]}"; do
+      # ${f} 的花括号是必须的：裸 $f 紧跟中文破折号时，bash 会把多字节字符
+      # 并进变量名 → set -u 下 "unbound variable" 崩掉（本脚本已被这个坑咬过
+      # 两次：先是 ${subject}，然后是这里）。所有紧跟中文的插值都要加花括号。
+      [ -r "$f" ] || { echo "🛑 读不到文件: ${f}——拒绝放行" >&2; exit 2; }
+    done
     subject="files ${files[*]}"
-    hits="$(grep -nE "$PATTERN" "${files[@]}")" ;;
+    text="$(cat -- "${files[@]}")" || {
+      echo "🛑 读取文件失败——拒绝放行" >&2; exit 2; } ;;
 esac
+
+# grep 的退出码：0=有命中，1=无命中，≥2=出错。只有 1 才是真正的 clean。
+hits="$(printf '%s\n' "$text" | grep -nE "$PATTERN")"
+grep_status=$?
+if [ "$grep_status" -ge 2 ]; then
+  echo "🛑 grep 执行出错（status=${grep_status}）——无法确认，拒绝放行" >&2
+  exit 2
+fi
 
 if [ -z "$hits" ]; then
   echo "secret scan: clean (${subject})"

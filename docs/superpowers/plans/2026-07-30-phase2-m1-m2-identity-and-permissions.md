@@ -400,7 +400,10 @@ git commit -m "feat(permissions): 角色判定模块（owner/collaborator/admin 
   - `now_iso() -> str`（ISO8601 时间戳，register_route 与迁移脚本共用）
   - `EMAIL_RE`（与 contract 的 `EMAIL_RE` 同 pattern）
   - `class PermissionConflict(Exception)`（并发修改，调用方转 409）
-  - `write_permissions(site_id, *, actor, action, require_login=None, allowed_users=None, collaborators=None, new_owner=None, mutate=None) -> dict`
+  - `MAX_WRITE_ATTEMPTS = 3`
+  - `write_permissions(site_id, *, actor, action, require_login=None, allowed_users=None, collaborators=None, new_owner=None, mutate=None, _attempt=0) -> dict`
+    （`_attempt` 是降级路径递归重试的深度计数，**外部调用方不要传**；耗尽后抛
+    `PermissionConflict` 而不是让它递归成 `RecursionError`）
     —— **唯一的权限写入入口，同时也是唯一的授权判定点**：一次强一致读同时得出
     角色与 `permissions_rev`，二者一起进事务（`TransactWriteItems` 原子更新
     sites 真源 + 路由投影；admin 路径额外对 admins 表做 `ConditionCheck`）。
@@ -641,6 +644,106 @@ def test_write_permissions_rolls_back_when_route_write_fails(aws, monkeypatch):
                                action="set_access_policy", require_login=True)
     # 真源未被改动：仍是公开
     assert common.get_site("s-1")["require_login"] is False
+
+
+def test_write_permissions_retries_when_route_appears_during_fallback(aws, monkeypatch):
+    """降级路径的递归重试分支（write_permissions 四条路径里唯一没被覆盖的一条）。
+
+    交错：① 双表事务因"路由 item 不存在"被取消 → ② 走只写 sites 的降级事务，
+    但降级里那条 attribute_not_exists(subdomain) 的 ConditionCheck 发现
+    route **在这期间被 register_route 创建了** → ③ 必须回到正常双表事务重试，
+    否则就会留下 sites 私有 / Edge 公开（正是事务要消除的状态）。
+
+    用 side effect 精确制造这个时序：第一次读快照后不建路由（让双表事务失败），
+    降级事务提交前把路由建出来（让降级的 not_exists 条件也失败）。
+    """
+    import boto3
+    import common
+    common.upsert_site("s-1", owner="o@x.com", require_login=False,
+                       allowed_users="org", collaborators=[], permissions_rev=0)
+    ddb = boto3.client("dynamodb")
+    state = {"n": 0}
+    real_transact = ddb.transact_write_items
+
+    def _create_route():
+        ddb.put_item(TableName="routing", Item={
+            "subdomain": {"S": "app-s-1"}, "site_id": {"S": "s-1"},
+            "route_mode": {"S": "split"},
+            "static_prefix": {"S": "sites/s-1/j"}, "api_target": {"S": ""},
+            "require_auth": {"BOOL": False}, "allowed_users": {"S": "org"},
+            "collaborators": {"L": []}, "owner": {"S": "o@x.com"},
+            "permissions_rev": {"N": "0"}})
+
+    orig_client = perm._ddb_client
+
+    def _patched_client():
+        client = orig_client()
+        real = client.transact_write_items
+
+        def _wrapped(**kw):
+            state["n"] += 1
+            # 第 2 次调用 = 降级事务：在它执行之前把 route 建出来，
+            # 于是 attribute_not_exists(subdomain) 失败 → 触发递归重试
+            if state["n"] == 2:
+                _create_route()
+            return real(**kw)
+
+        client.transact_write_items = _wrapped
+        return client
+
+    monkeypatch.setattr(perm, "_ddb_client", _patched_client)
+    out = perm.write_permissions("s-1", actor="o@x.com",
+                                 action="set_access_policy", require_login=True)
+
+    # 递归重试后必须落到"两表都写成功"，而不是只写了 sites
+    assert out["route_synced"] is True
+    assert common.get_site("s-1")["require_login"] is True
+    item = ddb.get_item(TableName="routing",
+                        Key={"subdomain": {"S": "app-s-1"}})["Item"]
+    assert item["require_auth"]["BOOL"] is True      # Edge 侧也收紧了
+    assert state["n"] >= 3          # 双表失败 → 降级失败 → 重试，至少三次
+
+
+def test_write_permissions_fallback_recursion_is_bounded(aws, monkeypatch):
+    """route 反复"刚好在降级前出现"时不能无限递归（栈溢出 = 500）。
+
+    真实场景不会一直这样，但 write_permissions 的递归没有深度上限，
+    一个持续制造该时序的并发流会把它打穿。要求实现带 _attempt 上限并在
+    耗尽后抛 PermissionConflict（可读的 409），而不是 RecursionError。
+    """
+    import boto3
+    import common
+    common.upsert_site("s-1", owner="o@x.com", require_login=False,
+                       allowed_users="org", collaborators=[], permissions_rev=0)
+    ddb = boto3.client("dynamodb")
+    orig_client = perm._ddb_client
+
+    def _patched_client():
+        client = orig_client()
+        real = client.transact_write_items
+
+        def _wrapped(**kw):
+            # 每次降级事务前都把 route 建出来、双表事务前又删掉：
+            # 让两条路径永远互相错过
+            has_check = any("ConditionCheck" in i and
+                            i["ConditionCheck"]["ConditionExpression"].startswith(
+                                "attribute_not_exists") for i in kw["TransactItems"])
+            if has_check:
+                ddb.put_item(TableName="routing",
+                             Item={"subdomain": {"S": "app-s-1"},
+                                   "site_id": {"S": "s-1"}})
+            else:
+                ddb.delete_item(TableName="routing",
+                                Key={"subdomain": {"S": "app-s-1"}})
+            return real(**kw)
+
+        client.transact_write_items = _wrapped
+        return client
+
+    monkeypatch.setattr(perm, "_ddb_client", _patched_client)
+    with pytest.raises(perm.PermissionConflict):
+        perm.write_permissions("s-1", actor="o@x.com",
+                               action="set_access_policy", require_login=True)
 
 
 def test_write_permissions_detects_concurrent_modification(aws, monkeypatch):
@@ -1028,10 +1131,13 @@ def _cancel_reasons(err) -> list[str]:
             err.response.get("CancellationReasons", [])]
 
 
+MAX_WRITE_ATTEMPTS = 3
+
+
 def write_permissions(site_id: str, *, actor: str, action: str,
                       require_login=None, allowed_users=None,
                       collaborators=None, new_owner=None,
-                      mutate=None) -> dict:
+                      mutate=None, _attempt: int = 0) -> dict:
     """权限写入的唯一入口：授权判定 + sites 表（真源）+ 路由表（投影）原子提交。
 
     **授权与写入必须绑定同一个快照**，这是本函数把 actor/action 收进来的原因。
@@ -1184,12 +1290,19 @@ def write_permissions(site_id: str, *, actor: str, action: str,
                     raise
                 inner_reasons = _cancel_reasons(inner)
                 if len(inner_reasons) > 1 and inner_reasons[1] == "ConditionalCheckFailed":
-                    # route 在这期间被创建了 → 回到正常双表事务重试一次
+                    # route 在这期间被创建了 → 回到正常双表事务重试。
+                    # **必须带递归上限**：持续制造"降级前 route 刚好出现"这个
+                    # 时序的并发流会让它无限递归成 RecursionError（用户看到 500，
+                    # 且栈里没有任何业务信息）。耗尽后按并发冲突返回可读的 409。
+                    if _attempt + 1 >= MAX_WRITE_ATTEMPTS:
+                        raise PermissionConflict(
+                            "站点权限正被并发修改（路由状态反复变化），请重试"
+                        ) from inner
                     return write_permissions(
                         site_id, actor=actor, action=action,
                         require_login=require_login, allowed_users=allowed_users,
                         collaborators=collaborators, new_owner=new_owner,
-                        mutate=mutate)
+                        mutate=mutate, _attempt=_attempt + 1)
                 if len(inner_reasons) > 2 and inner_reasons[2] == "ConditionalCheckFailed":
                     raise PermissionDenied("你的管理员权限已被撤销") from inner
                 raise PermissionConflict(
@@ -4749,6 +4862,36 @@ def test_pool_config_has_email_attribute():
     assert "email" in cfg["AutoVerifiedAttributes"]
 
 
+def test_spike_pool_secrets_go_to_isolated_ssm_prefix():
+    """隔离 spike 不能覆盖生产的 site client secret。
+
+    `_store_client_secrets` 默认写 /site-builder/site-client-secret —— auth
+    服务运行时就读这个。若 --pool-name 指向临时 pool 时仍写同一个参数名，
+    临时 client 的 secret 会顶掉生产的，线上换 token 立刻失败，而 Cognito
+    侧完全看不出异常（比误改 client 更难查）。
+    """
+    import boto3
+    from botocore.stub import Stubber
+
+    cog = boto3.client("cognito-idp", region_name="us-east-1",
+                       aws_access_key_id="t", aws_secret_access_key="t")
+    ssm = boto3.client("ssm", region_name="us-east-1",
+                       aws_access_key_id="t", aws_secret_access_key="t")
+    with Stubber(cog) as cstub, Stubber(ssm) as sstub:
+        cstub.add_response("describe_user_pool_client",
+                           {"UserPoolClient": {"ClientSecret": "s3cret"}},
+                           {"UserPoolId": "us-east-1_spike", "ClientId": "c1"})
+        # 关键断言：参数名带隔离前缀，不是 /site-builder/site-client-secret
+        sstub.add_response("put_parameter", {},
+                           {"Name": "/site-builder-spike/tmp-pool/site-client-secret",
+                            "Value": "s3cret", "Type": "SecureString",
+                            "Overwrite": True})
+        dp._store_client_secrets(cog, "us-east-1_spike", {"site": "c1"},
+                                 "us-east-1",
+                                 "/site-builder-spike/tmp-pool")
+        sstub.assert_no_pending_responses()
+
+
 def test_default_pool_name_is_production_pool():
     """--pool-name 的默认值必须仍是生产 pool。
 
@@ -5361,16 +5504,22 @@ def _ensure_oidc_idp(cog, pool_id: str, idp: dict) -> None:
         print(f"  新建 IdP {name}")
 
 
-def _store_client_secrets(cog, pool_id: str, clients: dict, region: str) -> None:
+def _store_client_secrets(cog, pool_id: str, clients: dict, region: str,
+                          param_prefix: str = "/site-builder") -> None:
     """client secret 直接写 SSM SecureString，**不打印明文**。
 
     不要改成打印 `aws ssm put-parameter --value '<secret>'` 让人手敲：
     那会把凭证留在 shell history、终端回滚缓冲与 agent transcript 里，
     执行时还会出现在进程参数（ps 可见）。
+
+    param_prefix 随 pool 隔离：隔离 spike（`--pool-name`）**绝不能**把临时
+    pool 的 secret 写进生产参数名——那会覆盖 auth 服务正在用的 site client
+    secret，线上换 token 立刻失败（比"改了生产 client"更隐蔽，因为 Cognito
+    侧看不出任何变化）。见 Task 15 Step 7。
     """
     import boto3
     ssm = boto3.client("ssm", region_name=region)
-    for key, param in (("site", "/site-builder/site-client-secret"),):
+    for key, param in (("site", f"{param_prefix}/site-client-secret"),):
         secret = cog.describe_user_pool_client(
             UserPoolId=pool_id, ClientId=clients[key])["UserPoolClient"].get(
                 "ClientSecret", "")
@@ -5438,7 +5587,12 @@ def main() -> None:
     deploy_auth.ensure_pre_token_trigger(role_arn, pool_id=pool_id)
 
     print("⑧ client secret → SSM")
-    _store_client_secrets(cog, pool_id, clients, region)
+    # 非生产 pool 走独立参数前缀，避免覆盖 auth 服务在用的生产 secret
+    prefix = ("/site-builder" if args.pool_name == POOL_NAME
+              else f"/site-builder-spike/{args.pool_name}")
+    if prefix != "/site-builder":
+        print(f"   （隔离 pool：secret 写入 {prefix}，不动生产参数）")
+    _store_client_secrets(cog, pool_id, clients, region, prefix)
 
     print("\n回填 site-builder/config.ini：")
     print(f"  [Cognito] user_pool_id = {pool_id}")
@@ -5845,6 +5999,26 @@ Expected: OAuth 成功；`list_my_sites` 返回的站点 owner 是你的邮箱�
 
 若报 401 `Claim 'client_id' value mismatch`：确认客户端发的是 access token 而非 id_token（一期钉死的约束，不要改 `allowedAudience`）。
 
+- [ ] **Step 6a: [真机] 15 分钟 access token 不打断 MCP 长会话**
+
+`AccessTokenValidity=15` 分钟（本轮为压缩吊销后残留窗口而收紧，见 §3.5）
+把一个假设压在 MCP 客户端上：**它会用 refresh token 自动续期**。`ALLOW_REFRESH_TOKEN_AUTH`
+是开着的，所以理论上可以；但"客户端实现是否真的做了"必须实测——不做的话用户
+会每 15 分钟被踢一次 OAuth，是明显的体验回退。
+
+Web 侧不受影响（auth 用 id_token 换一次就自己签 24h 的 `sb_session` cookie，
+之后与 Cognito token 无关），所以只验 MCP：
+
+1. 连上 MCP，调一次 `list_my_sites` 成功；
+2. **静置 >16 分钟**（超过 access token 有效期）；
+3. 再调一次 `list_my_sites`。
+
+Expected: 第 3 步仍成功（客户端静默用 refresh token 换了新 access token）。
+若返回 401 且需要重新走 OAuth，说明该客户端不自动续期——此时把
+`AccessTokenValidity` 放宽到 60 分钟（回到默认）并在 DEPLOY.md 记录
+"残留窗口 = refresh + 60min"，**不要**为了这个体验问题去关掉 refresh 或延长
+refresh 有效期。把实测结论（哪个客户端、是否续期）写进 DEPLOY.md。
+
 - [ ] **Step 6b: [真机 spike] 确认 access token 里有 `idp` claim**
 
 登录后从 MCP 侧或用 CLI 拿一个 access token，解开 payload：
@@ -6043,9 +6217,13 @@ aws cognito-idp delete-user-pool-domain --domain <临时前缀> \
   --user-pool-id <临时 pool id> --region us-east-1
 aws cognito-idp delete-user-pool --user-pool-id <临时 pool id> --region us-east-1
 
-# 2) 把 config.ini 的 [IdP] 段改回飞书参数（spike 期间被临时改过）
+# 2) 删掉临时 pool 的隔离 SSM 参数（生产那个 /site-builder/... 不要动！）
+aws ssm delete-parameter --region us-east-1 \
+  --name "/site-builder-spike/<临时 pool 名>/site-client-secret" 2>/dev/null || true
 
-# 3) 复验生产 client 的 provider 列表仍是飞书 —— 这是防"误改生产"的闸门
+# 3) 把 config.ini 的 [IdP] 段改回飞书参数（spike 期间被临时改过）
+
+# 4) 复验生产 client 的 provider 列表仍是飞书 —— 这是防"误改生产"的闸门
 for CLIENT in <site_client_id> <mcp_client_id>; do
   aws cognito-idp describe-user-pool-client --region us-east-1 \
     --user-pool-id <生产 pool id> --client-id "$CLIENT" \
