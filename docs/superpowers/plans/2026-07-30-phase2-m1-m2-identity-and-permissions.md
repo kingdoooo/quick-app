@@ -24,20 +24,27 @@
 - **Edge 路由表投影只认已支持的 DynamoDB 类型**：本计划 Task 8 之前 `_deser` 只认 `S`/`BOOL`，新增任何 `L`/`N`/`SS` 字段前必须先扩展 `_deser`，否则 Edge 侧静默变成 `False`。
 - **Function URL 一律 `AuthType=AWS_IAM`** 且只授权 edge role，并且需要 `lambda:InvokeFunctionUrl` + `lambda:InvokeFunction`（`InvokedViaFunctionUrl`）**两条**语句，缺一即 403。`AuthType=NONE` + `Principal:*` 会被安全扫描自动处置。
 - **git**：改动分批提交；`git push` 一律带 `--no-verify`。提交信息用中文或英文均可，遵循仓库现有 `type(scope): subject` 风格。
-- **每次 commit 前必须扫 staged diff**（`~/AGENTS.md` 的全局要求，适用于每个仓库的每次提交，"看起来显然安全"也要扫）。**顺序很重要**：`git diff --cached` 只看已 stage 的内容，所以必须 **`git add` 之后、`git commit` 之前**扫——放在 `git add` 前扫的是空 stage，永远报 clean，等于没扫。本计划每个提交步骤都是这个顺序：
+- **每次 commit 前必须扫 staged diff**（`~/AGENTS.md` 的全局要求，适用于每个仓库的每次提交，"看起来显然安全"也要扫）。统一用
+  `site-builder/scripts/scan_staged_secrets.sh`（本计划 Task 0 建立）：
   ```bash
   git add <files>
-  git diff --cached | grep -nE 'AKIA|ASIA|ghp_|gho_|xoxb-|xoxp-|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=|/Users/[a-z]+/|[0-9]{12}' \
-    && echo "⚠️ 上面是命中项，逐条确认是否为故意的 fixture/占位符后再提交" \
-    || echo "secret scan: clean"
+  bash site-builder/scripts/scan_staged_secrets.sh || exit 1
   git commit -m "..."
   ```
+  **它必须是阻断式的**。不要退回内联的
+  `git diff --cached | grep ... && echo "⚠️ 命中" || echo clean` 写法——那个写法命中时只
+  打印一行警告，`&&` 后面紧跟的 `git commit` **照常执行**，自动跑整段代码块时敏感信息
+  会直接提交出去，正好违反它想遵守的约束。脚本命中即 `exit 1`，`|| exit 1` 让链停在
+  commit 之前。
+- **顺序很重要**：`git diff --cached` 只看已 stage 的内容，所以必须 **`git add` 之后、`git commit` 之前**扫——放在 `git add` 前扫的是空 stage，永远报 clean，等于没扫。脚本对空 stage 直接报错退出（exit 2），不会给出假的 clean。
 - **新文件首次 `git add` 之前**另扫一遍文件本体（`git diff` 看不到未跟踪文件）：
   ```bash
-  grep -nE '<同上模式>' <新文件路径...> || echo "new-file scan: clean"
+  bash site-builder/scripts/scan_staged_secrets.sh --files <新文件路径...> || exit 1
   ```
-- 命中不等于必须改——公开 URL、测试 fixture、co-author trailer 都会命中。**必须先给用户看命中项再提交，不要自动清洗**。本计划里可预期的命中：`*@x.com` 假邮箱、`000000000000` 占位账号、`ProbeOnly!2026x` 探测口令、`client_secret =` 空配置项——这些是刻意写的，确认即可。
-- **push 前**（若已过提交点）对待推送的 commit 再扫一次：`git diff origin/<branch>...HEAD | grep -nE '<同上模式>'`。
+- 命中不等于必须改——公开 URL、测试 fixture、co-author trailer 都会命中。**必须先给用户看命中项再提交，不要自动清洗**。确认无误后加 `--allow-hits` 重跑放行。本计划里可预期的命中：`*@x.com` 假邮箱、`000000000000` 占位账号、`ProbeOnly!2026x` 探测口令、botocore Stubber 的 `aws_access_key_id="t"`、`client_secret =` 空配置项——这些是刻意写的，确认即可。
+- **push 前**（若已过提交点）对待推送的 commit 再扫一次：
+  `bash site-builder/scripts/scan_staged_secrets.sh --range origin/master...HEAD || exit 1`。
+- 扫描覆盖 `~/AGENTS.md` 列出的全部类别（凭证/令牌/私钥、`Bearer` 头、邮箱与手机号、`/Users/`·`/home/` 家目录、12 位账号 ID、VPC/subnet ID、数据库连接串）——各处不要再各写一份更窄的 regex（原先内联版本漏掉 `gho_`、Slack token、家目录、账号 ID）。
 - **验证纪律**：每处改动用真实 AWS API 实证验证（本项目被 mock 掉的层出过多次问题）。计划中标 `[真机]` 的步骤必须在真实 AWS 上跑，不能只靠 moto。
 - **发现文档与实际不符就同步更新**（`site-builder/DEPLOY.md`、`docs/` 下相关文档、`CLAUDE.md`）。
 - **`allowed_users` 语义**：`"org"`（字面量字符串）或邮箱数组。sites 表里存原生 List；路由表投影里 `"org"` 存 `S`、名单存 `L`（Task 8 起）。
@@ -56,6 +63,7 @@
 |---|---|
 | `site-builder/deployer/functions/permissions.py` | 唯一的角色判定 + 权限读写模块（纯逻辑 + DynamoDB 访问）。MCP 与 panel 共用（构建时复制，同 `common.py`） |
 | `site-builder/deployer/tests/test_permissions.py` | `permissions.py` 的角色矩阵与权限写入测试 |
+| `site-builder/scripts/scan_staged_secrets.sh` | 阻断式 staged secret scan（命中 exit 1，所有提交步骤共用；Task 0） |
 | `site-builder/scripts/migrate_permissions.py` | 一次性迁移：路由表 → sites 表回填权限字段 |
 | `site-builder/scripts/deploy_pool.py` | 幂等创建/更新平台专用 user pool + 2 个 app client（site/mcp）+ branding + pre-token 触发器挂载 |
 | `site-builder/auth/tests/test_pkce.py` | PKCE/nonce 的 state 编解码与 callback 校验测试 |
@@ -84,6 +92,74 @@
 | `site-builder/mcp/tests/conftest.py`、`site-builder/deployer/tests/conftest.py` | sites 表加 GSI 定义；新增 admins 表 |
 | `site-builder/skills/site-builder/references/contract.md` | 写明 `auth` 字段仅首次部署生效、之后以控制台为准 |
 | `site-builder/DEPLOY.md` | ① 阶段改写为 IdP 无关两分支 + 新 pool 部署步骤；加迁移脚本步骤 |
+
+---
+
+## Task 0: 阻断式 staged secret scan 脚本
+
+**Files:**
+- Create: `site-builder/scripts/scan_staged_secrets.sh`
+
+**Interfaces:**
+- Produces: CLI `bash site-builder/scripts/scan_staged_secrets.sh [--files P...] [--range R] [--allow-hits]`
+  —— 命中 exit 1、clean exit 0、空 stage exit 2
+
+**为什么它是 Task 0**：后面 19 个提交步骤都调它。原先每个步骤内联
+`git diff --cached | grep ... && echo "⚠️ 命中" || echo clean`，**命中时不阻断**
+——`&&` 后面只是 echo，紧跟的 `git commit` 照常执行。自动化执行整段代码块时，
+命中敏感信息也会照常提交，直接违反 `~/AGENTS.md`。各处内联 regex 还互相不一致
+（漏 `gho_`、Slack token、家目录、12 位账号 ID）。收成一个脚本后只有一份模式。
+
+- [ ] **Step 1: 写脚本**
+
+创建 `site-builder/scripts/scan_staged_secrets.sh`——内容见本仓库该文件
+（本任务已随计划一并落地，实施时确认它存在且可执行即可）。要点：
+`set -uo pipefail`；模式覆盖 `~/AGENTS.md` 的四类；命中打印行号后 `exit 1`；
+`--allow-hits` 供人工确认后放行；空 stage 报错而不是报 clean。
+
+**注意脚本里 `${subject}` 的花括号**：紧跟中文全角括号时，裸 `$subject` 会被
+bash 把多字节字符并进变量名，`set -u` 下直接 `unbound variable` 退出——命中
+信息根本不打印（写脚本时实测踩到过，看起来"exit 1 了"其实是崩的）。
+
+- [ ] **Step 2: 验证它真的会阻断（不能只看 exit code）**
+
+在临时仓库里跑，四条都要对：
+
+```bash
+cd /tmp && rm -rf scantest && mkdir scantest && cd scantest
+git init -q . && git config user.email a@b.c && git config user.name t
+cp <repo>/site-builder/scripts/scan_staged_secrets.sh .
+echo "print(1)" > seed.py && git add seed.py && git commit -qm seed
+
+# ① clean → exit 0
+echo "print(2)" > clean.py && git add clean.py
+bash scan_staged_secrets.sh; echo "exit=$?"          # 期望 clean / 0
+
+# ② 命中 → 打印命中行且 exit 1
+printf 'KEY = "AKIAIOSFODNN7EXAMPLE"\n' > bad.py && git add bad.py
+bash scan_staged_secrets.sh; echo "exit=$?"          # 期望打印该行 / 1
+
+# ③ && 链真的停在 commit 之前（这条才是本任务的目的）
+if bash scan_staged_secrets.sh >/dev/null 2>&1 && echo "COMMIT WOULD RUN (BAD)"; \
+  then :; else echo "commit correctly blocked"; fi
+
+# ④ 人工确认后可放行
+bash scan_staged_secrets.sh --allow-hits >/dev/null 2>&1; echo "exit=$?"   # 期望 0
+```
+
+Expected: `clean/0`、打印命中行且 `1`、`commit correctly blocked`、`0`。
+**② 只看 exit=1 不够**——脚本自身崩溃也会给 exit 1（上面那个 `${subject}` 的坑
+就是这样伪装成"正常阻断"的）。必须看到命中行被打印出来。
+
+- [ ] **Step 3: 提交**
+
+```bash
+git add site-builder/scripts/scan_staged_secrets.sh
+# 本脚本自身含大量 regex 字面量（AKIA/ghp_/postgres:// 等），扫自己必然命中，
+# 属预期——确认后放行。
+bash site-builder/scripts/scan_staged_secrets.sh --allow-hits || exit 1
+git commit -m "chore(scripts): 阻断式 staged secret scan（命中即 exit 1）"
+```
 
 ---
 
@@ -294,9 +370,8 @@ Expected: PASS（22 passed）
 
 ```bash
 git add site-builder/deployer/functions/permissions.py site-builder/deployer/tests/test_permissions.py
-# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
-git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
-# 命中就停下给用户看，确认是故意的 fixture 后再继续
+# AGENTS.md：commit 前扫 staged diff（必须在 git add 之后——扫空 stage 永远报 clean）
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1   # 命中即阻断；确认是故意的 fixture 后加 --allow-hits 重跑
 git commit -m "feat(permissions): 角色判定模块（owner/collaborator/admin 两级+管理员）"
 ```
 
@@ -386,6 +461,27 @@ def test_remove_last_admin_is_refused(aws):
     with pytest.raises(perm.PermissionDenied):
         perm.remove_admin("only@x.com")
     assert perm.is_admin("only@x.com") is True
+
+
+def test_remove_nonexistent_admin_is_idempotent_even_with_one_admin(aws):
+    """删不存在的邮箱要幂等成功——即便当前只剩一名管理员。
+
+    这两个条件同时成立时事务的两项**都**会 ConditionalCheckFailed
+    （Delete 的 attribute_exists 不成立、sentinel 的 n>1 也不成立），
+    所以异常分流必须先看 Delete 那项。先看 sentinel 会把"目标不存在"
+    误报成"不能删除最后一个管理员"，违反 remove_admin 的幂等契约。
+    """
+    perm.add_admin("only@x.com", added_by="seed")
+    perm.remove_admin("ghost@x.com")            # 不得抛异常
+    assert perm.list_admins() == ["only@x.com"]  # 真管理员没被动过
+
+
+def test_remove_nonexistent_admin_is_idempotent_with_many_admins(aws):
+    """同上的对照组：管理员多于一个时本来就该幂等（sentinel 条件成立）。"""
+    perm.add_admin("a@x.com", added_by="seed")
+    perm.add_admin("b@x.com", added_by="seed")
+    perm.remove_admin("ghost@x.com")
+    assert perm.list_admins() == ["a@x.com", "b@x.com"]
 
 
 def test_normalize_allowed_users_org():
@@ -853,12 +949,19 @@ def remove_admin(email: str) -> None:
         if "TransactionConflict" in reasons:
             raise PermissionConflict(
                 "管理员名单正被他人修改，请重试") from e
-        # 逐项分辨：第 0 项是 Delete（目标不存在=幂等成功），
-        # 第 1 项是 sentinel（n>1 不成立=这是最后一个管理员）。
-        if len(reasons) > 1 and reasons[1] == "ConditionalCheckFailed":
-            raise PermissionDenied("不能删除最后一个管理员") from e
+        # 逐项分辨，**顺序必须是 Delete 先、sentinel 后**：
+        #   第 0 项 Delete —— attribute_exists 失败 = 目标本就不是管理员
+        #   第 1 项 sentinel —— n > 1 失败 = 目标是最后一个管理员
+        # 删一个不存在的邮箱、而当前恰好只有一名管理员时，**两项会同时
+        # ConditionalCheckFailed**（已用 moto 实测：reasons ==
+        # ['ConditionalCheckFailed', 'ConditionalCheckFailed']）。
+        # 先看 sentinel 就会把"目标不存在"误报成"不能删除最后一个管理员"，
+        # 与本函数承诺的幂等语义相反。所以先判 Delete 项。
         if reasons and reasons[0] == "ConditionalCheckFailed":
-            return          # 该邮箱本就不是管理员：幂等成功
+            return          # 该邮箱本就不是管理员：幂等成功（无论剩几个）
+        if len(reasons) > 1 and reasons[1] == "ConditionalCheckFailed":
+            # 目标确实存在，只是它是最后一个
+            raise PermissionDenied("不能删除最后一个管理员") from e
         raise               # 容量/校验等：如实抛出，不要伪装成权限问题
 
 
@@ -1167,9 +1270,8 @@ Expected: PASS（原有测试 + 新增，无回归）
 
 ```bash
 git add site-builder/deployer/functions/permissions.py site-builder/deployer/tests/test_permissions.py site-builder/deployer/tests/conftest.py
-# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
-git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
-# 命中就停下给用户看，确认是故意的 fixture 后再继续
+# AGENTS.md：commit 前扫 staged diff（必须在 git add 之后——扫空 stage 永远报 clean）
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1   # 命中即阻断；确认是故意的 fixture 后加 --allow-hits 重跑
 git commit -m "feat(permissions): admin 名单与权限写入（访问策略/协作者/所有权转移）"
 ```
 
@@ -1358,9 +1460,8 @@ endpoint_url =
 
 ```bash
 git add site-builder/deployer/infra/app.py site-builder/deployer/tests/test_infra_tables.py site-builder/config.ini.example
-# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
-git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
-# 命中就停下给用户看，确认是故意的 fixture 后再继续
+# AGENTS.md：commit 前扫 staged diff（必须在 git add 之后——扫空 stage 永远报 clean）
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1   # 命中即阻断；确认是故意的 fixture 后加 --allow-hits 重跑
 git commit -m "feat(infra): sites 表加 owner-index GSI；新增 site-admins 表"
 ```
 
@@ -1500,9 +1601,8 @@ Expected: PASS
 
 ```bash
 git add site-builder/deployer/functions/common.py site-builder/deployer/tests/test_common.py site-builder/deployer/tests/conftest.py site-builder/mcp/tests/conftest.py
-# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
-git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
-# 命中就停下给用户看，确认是故意的 fixture 后再继续
+# AGENTS.md：commit 前扫 staged diff（必须在 git add 之后——扫空 stage 永远报 clean）
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1   # 命中即阻断；确认是故意的 fixture 后加 --allow-hits 重跑
 git commit -m "feat(common): 按 owner 查站点用 GSI；新增 owner∪collaborator 列表"
 ```
 
@@ -1635,26 +1735,36 @@ def test_register_route_seed_does_not_overwrite_concurrent_online_change(aws):
 def test_register_route_uses_consistent_read_after_seed(aws, monkeypatch):
     """seed 刚写完就用最终一致读 → 可能读不到，名单被放大成 org。
 
-    moto 的读默认就是强一致，覆盖不到这个场景，所以显式注入一次"陈旧读"：
-    让 get_site（最终一致）返回 seed 之前的样子，验证实现走的是
-    get_site_consistent 而不是 get_site。
+    moto 的读默认就是强一致，所以无法真的制造出"副本滞后"。这里换一个
+    **不会让正确实现失败**的等价断言：把最终一致的 get_site 打成陷阱
+    （一调用即 fail），强一致的 get_site_consistent 保持真实。
+    若实现退回 get_site，测试立刻失败；用 get_site_consistent 则读到 seed
+    后的真值，名单不会回落成 org。
+
+    **不要**把 get_site_consistent 本身 patch 成陈旧快照：seed 已经把真实
+    行的 permissions_rev 写成 1，而陈旧快照算出的 rev=0 会让
+    ConditionCheck 每轮都失败，三轮耗尽后实现抛 RuntimeError——正确实现
+    也永远到不了下面的断言（已用 moto 实测：3/3 轮 ConditionalCheckFailed）。
     """
     import boto3
     import common
     import register_route
+
     common.upsert_site("s-1", owner="o@x.com")      # 无权限字段（首次部署）
     job_id = common.create_job("o@x.com", "s-1")
 
-    # 最终一致读永远返回 seed 之前的快照（模拟副本滞后）
-    stale = {"site_id": "s-1", "owner": "o@x.com"}
-    # 让**强一致读**返回 seed 之前的快照。注意实现必须调用
-    # get_site_consistent——若它退回 get_site，本测试会因拿到真实数据而
-    # "意外通过"，所以下面额外断言实现确实没走 get_site。
-    monkeypatch.setattr(register_route.common, "get_site_consistent",
-                        lambda sid: dict(stale))
-    monkeypatch.setattr(register_route.common, "get_site",
-                        lambda sid: pytest.fail(
-                            "register_route 必须用 get_site_consistent"))
+    def _trap(site_id):
+        raise AssertionError(
+            "register_route 必须用 get_site_consistent（最终一致读会在 seed "
+            "之后拿到旧值，_route_item 回落 allowed_users=\"org\"，"
+            "把指定名单放大成全体可信 IdP 用户）")
+
+    # 只打陷阱，不动 get_site_consistent——让它照常读到 seed 后的真值。
+    # 用 AssertionError 而不是 pytest.fail：pytest.fail 抛的 Failed 继承自
+    # BaseException，实现里任何 `except Exception` 都拦不住它，看起来"有效"，
+    # 但若实现改成 except BaseException 就会被静默吞掉；AssertionError 是
+    # Exception 子类，被吞掉时反而会让断言阶段失败，不会假通过。
+    monkeypatch.setattr(register_route.common, "get_site", _trap)
 
     register_route.handler(
         {"job_id": job_id, "site_id": "s-1", "api_target": "",
@@ -1861,7 +1971,7 @@ def handler(event, context):
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cd site-builder/deployer && .venv/bin/pytest tests/test_finalize_steps.py -q`
-Expected: PASS（含新增 3 个）
+Expected: PASS（含 Step 2 新增的 8 个）
 
 - [ ] **Step 6: 跑 deployer 全量**
 
@@ -1872,9 +1982,8 @@ Expected: PASS
 
 ```bash
 git add site-builder/deployer/functions/register_route.py site-builder/deployer/tests/test_finalize_steps.py
-# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
-git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
-# 命中就停下给用户看，确认是故意的 fixture 后再继续
+# AGENTS.md：commit 前扫 staged diff（必须在 git add 之后——扫空 stage 永远报 clean）
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1   # 命中即阻断；确认是故意的 fixture 后加 --allow-hits 重跑
 git commit -m "feat(deployer): register_route 权限取自 sites 表（真源），allowed_users 投影为 L
 
 部署顺序约束：本改动写入 DynamoDB L 类型，必须在 Edge 的 _deser 支持 L
@@ -1982,9 +2091,8 @@ Expected: PASS
 
 ```bash
 git add site-builder/deployer/functions/mark_job.py site-builder/deployer/functions/common.py site-builder/deployer/tests/test_finalize_steps.py
-# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
-git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
-# 命中就停下给用户看，确认是故意的 fixture 后再继续
+# AGENTS.md：commit 前扫 staged diff（必须在 git add 之后——扫空 stage 永远报 clean）
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1   # 命中即阻断；确认是故意的 fixture 后加 --allow-hits 重跑
 git commit -m "fix(deployer): mark_job 不再把 job 发起者写成站点 owner
 
 放开 collaborator 部署后，原逻辑会让协作者部署一次即夺取所有权
@@ -2077,9 +2185,8 @@ Expected: PASS
 
 ```bash
 git add site-builder/deployer/functions/smoke_test.py site-builder/deployer/tests/test_finalize_steps.py
-# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
-git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
-# 命中就停下给用户看，确认是故意的 fixture 后再继续
+# AGENTS.md：commit 前扫 staged diff（必须在 git add 之后——扫空 stage 永远报 clean）
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1   # 命中即阻断；确认是故意的 fixture 后加 --allow-hits 重跑
 git commit -m "fix(deployer): smoke_test 按 effective policy 断言而非 manifest
 
 在线翻转 require_login 后重部署会被旧 manifest 判成 FAILED（而路由已切换）。"
@@ -2135,9 +2242,8 @@ Expected: PASS（67 tests，无行为变化）
 
 ```bash
 git add site-builder/skills/site-builder/references/contract.md site-builder/contract/src/contract/schema.py
-# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
-git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
-# 命中就停下给用户看，确认是故意的 fixture 后再继续
+# AGENTS.md：commit 前扫 staged diff（必须在 git add 之后——扫空 stage 永远报 clean）
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1   # 命中即阻断；确认是故意的 fixture 后加 --allow-hits 重跑
 git commit -m "docs(contract): 明确 site.json auth 仅首次部署生效，之后以控制台为准"
 ```
 
@@ -2406,9 +2512,8 @@ Expected: PASS（6 passed）
 
 ```bash
 git add site-builder/scripts/migrate_permissions.py site-builder/deployer/tests/test_migrate_permissions.py
-# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
-git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
-# 命中就停下给用户看，确认是故意的 fixture 后再继续
+# AGENTS.md：commit 前扫 staged diff（必须在 git add 之后——扫空 stage 永远报 clean）
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1   # 命中即阻断；确认是故意的 fixture 后加 --allow-hits 重跑
 git commit -m "feat(scripts): 存量权限迁移脚本（路由表 → sites 表，默认 dry-run）"
 ```
 
@@ -2564,9 +2669,8 @@ Expected: 远小于 1MB（当前约 15KB）——记录数字，确认改动没�
 
 ```bash
 git add router/infrastructure/lambda/origin_request.py router/infrastructure/lambda/test_edge_auth.py
-# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
-git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
-# 命中就停下给用户看，确认是故意的 fixture 后再继续
+# AGENTS.md：commit 前扫 staged diff（必须在 git add 之后——扫空 stage 永远报 clean）
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1   # 命中即阻断；确认是故意的 fixture 后加 --allow-hits 重跑
 git commit -m "feat(edge): _deser 支持 L/N；名单判定接受原生 List 并放行 collaborators
 
 必须先于 deployer 的 register_route L 类型投影部署（否则名单读成 False）。"
@@ -2820,7 +2924,7 @@ trusted_idps =
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cd router/infrastructure/lambda && ../../../site-builder/deployer/.venv/bin/pytest . -q`
-Expected: PASS（既有用例 + 新增 7 条）
+Expected: PASS（既有用例 + Step 1 新增的 10 条）
 
 - [ ] **Step 6: 确认 synth 能注入（不部署）**
 
@@ -2839,9 +2943,8 @@ Expected: `0`——占位符已被替换掉，模板里不该再出现它们的�
 git add router/infrastructure/lambda/origin_request.py \
   router/infrastructure/lambda/test_edge_auth.py \
   router/infrastructure/stack.py router/config.ini.example
-# AGENTS.md：commit 前扫 staged diff（必须在 git add 之后，否则扫的是空 stage）
-git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
-# 命中就停下给用户看，确认是故意的 fixture 后再继续
+# AGENTS.md：commit 前扫 staged diff（必须在 git add 之后——扫空 stage 永远报 clean）
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1   # 命中即阻断；确认是故意的 fixture 后加 --allow-hits 重跑
 git commit -m "feat(edge): 校验会话的 idp claim（org 语义的执行点，带迁移开关)"
 ```
 
@@ -2996,10 +3099,26 @@ token，而新 token 的 `auth_via` 是受信的 `TokenGeneration_RefreshTokens`
    # b) 无法枚举时，轮换 app client（旧 client 签发的 token 立即失效）
    #    新建 client → 回填 config.ini → 重新部署 auth/MCP → 删旧 client
    ```
-3. 复验：`aws cognito-idp initiate-auth` 对 site/mcp client 必须失败
-   （见 DEPLOY.md 的边界验证步骤）。
+   **第 2 步不是"立即恢复"**：吊销只断掉"再换新 token"的能力，**已经换出去的
+   access token 在过期前仍然可用**。AWS 对 `AdminUserGlobalSignOut` 明说
+   *"Other requests might be valid until your user's token expires"*，
+   token-revocation 文档也说被吊销的 token 对"只校验签名与过期时间的 JWT 库"
+   依然有效——AgentCore 的 inbound authorizer 恰好就是这种（只验
+   discovery/公钥/exp/allowedClients，每次请求不回查 Cognito 撤销状态），
+   Edge 侧验的是我们自己签的会话 JWT，同理不回查。
+   所以**要求立即失效时只有两条路**：① 轮换 app client **并**更新 AgentCore
+   的 `allowedClients`（旧 client_id 不在名单里，残留 access token 当场被网关
+   拒）；② 轮换 `JWT_SECRET` 并重部署路由层（作废全部会话 cookie）。
+3. 复验，两条都要：
+   - `aws cognito-idp initiate-auth` 对 site/mcp client 必须失败
+     （见 DEPLOY.md 的边界验证步骤）；
+   - **拿一个"吊销前签发的" access token 再调一次 MCP**，确认已被拒。
+     只验"refresh 不能再刷"会给出假恢复结论——残留 access token 正是漏掉的
+     那一段。
 
-`RefreshTokenValidity` 已收到 1 天，所以即便漏了第 2 步，暴露窗口也 ≤24h。
+**暴露窗口 = refresh 有效期 + access 有效期**（本期配置：1 天 + 15 分钟，
+约 24h15m），不是 24h。漏掉第 2 步就是这个窗口；做了第 2 步但没轮换 client /
+没换 secret，仍有最长 15 分钟的残留窗口。
 ```
 
 ```markdown
@@ -3025,9 +3144,8 @@ token，而新 token 的 `auth_via` 是受信的 `TokenGeneration_RefreshTokens`
 
 ```bash
 git add site-builder/DEPLOY.md
-# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
-git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
-# 命中就停下给用户看，确认是故意的 fixture 后再继续
+# AGENTS.md：commit 前扫 staged diff（必须在 git add 之后——扫空 stage 永远报 clean）
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1   # 命中即阻断；确认是故意的 fixture 后加 --allow-hits 重跑
 git commit -m "docs(deploy): 二期 M2 权限真源迁移步骤与部署顺序约束"
 ```
 
@@ -3421,14 +3539,47 @@ def build_and_push(image_uri: str) -> None:
             p.unlink(missing_ok=True)
 ```
 
-`deploy_agentcore.py` 的 `ensure_role()` 里，DynamoDB 语句的 `Resource` 列表加两项：
+`deploy_agentcore.py` 的 `ensure_role()`：**把现有那条宽 DynamoDB 语句整体
+替换掉**（当前是 `GetItem/PutItem/UpdateItem/Query/Scan` 覆盖
+jobs+jobs/index+sites 三个资源，`deploy_agentcore.py:120-126`）。
+**不是往它上面追加 admins ARN 和 `DeleteItem`**——IAM 是并集，那样 MCP runtime
+就拿到了 `site-admins` 的 `PutItem`/`UpdateItem`/`DeleteItem`，可以绕过
+`remove_admin()` 的事务直接删管理员或删掉 `__count__` sentinel，
+"不能删最后一个管理员"的保证被击穿。
+
+用下面两条替换那一条（路由表那条在 Task 11 Step 7 再加）：
 
 ```python
-             f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-sites/index/*",
-             f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-admins",
+        # jobs + sites：MCP 的读写主路径（含 owner-index GSI）。
+        # ConditionCheckItem 是 register_route / write_permissions 的事务需要的
+        # ——IAM 里没有 dynamodb:TransactWriteItems 这个 action，事务内
+        # Put/Update/Delete/Get 的权限由底层同名 action 决定，只有
+        # ConditionCheck 需要它（见 Task 11 Step 7 的官方链接）。
+        {"Sid": "JobsAndSites", "Effect": "Allow",
+         "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem",
+                    "dynamodb:Query", "dynamodb:Scan",
+                    "dynamodb:ConditionCheckItem"],
+         "Resource": [
+             f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-deploy-jobs",
+             f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-deploy-jobs/index/*",
+             f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-sites",
+             f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-sites/index/*"]},
+        # admins 表：**只读 + 事务条件检查**。
+        # is_admin() 要 GetItem、list_admins() 要 Scan、write_permissions() 的
+        # admin 代管路径要对 admins 做 ConditionCheck（缺 ConditionCheckItem
+        # 时管理员改任意站点权限会直接 AccessDenied）。
+        # 故意**不给** PutItem/UpdateItem/DeleteItem：增删管理员不走 MCP
+        # runtime 角色（M2 由部署时的种子脚本做，M3 由 panel 自己的角色做）。
+        {"Sid": "AdminsReadOnly", "Effect": "Allow",
+         "Action": ["dynamodb:GetItem", "dynamodb:Scan",
+                    "dynamodb:ConditionCheckItem"],
+         "Resource": f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-admins"},
 ```
 
-同一语句的 `Action` 列表加 `"dynamodb:DeleteItem"`（`remove_admin` 需要；控制台 M3 也用同一路径）。
+**注意 `remove_admin` / `add_admin` 在 MCP runtime 里会 AccessDenied——这是
+有意的**：M2 没有任何 MCP 工具暴露管理员增删（工具面只有 8 个，见 Task 11），
+种子管理员由 Task 9 Step 4 用**你自己的** AWS 凭证跑，不是 runtime 角色。
+M3 的 panel Lambda 需要增删管理员时，在它自己的角色上给 admins 表写权限。
 
 `deploy_runtime()` 的 `environmentVariables` 加：
 
@@ -3445,9 +3596,8 @@ Expected: PASS（工具数仍是 5，本任务未加新工具）
 
 ```bash
 git add site-builder/mcp/server.py site-builder/mcp/Dockerfile site-builder/mcp/deploy_agentcore.py site-builder/mcp/tests/test_tools.py
-# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
-git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
-# 命中就停下给用户看，确认是故意的 fixture 后再继续
+# AGENTS.md：commit 前扫 staged diff（必须在 git add 之后——扫空 stage 永远报 clean）
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1   # 命中即阻断；确认是故意的 fixture 后加 --allow-hits 重跑
 git commit -m "feat(mcp): 换用 permissions 角色判定；list_my_sites 走 GSI 并含协作站点"
 ```
 
@@ -3766,13 +3916,14 @@ Expected: PASS
 所以要补的是 `ConditionCheckItem`——写成一个不存在的事务 action 会让 policy
 静默无效（IAM 不校验未知 action 名，部署不报错、运行时照样 AccessDenied）。
 
-```python
-             f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/"
-             + CFG["Platform"]["routing_table"],
-```
+Task 10 Step 5 已经把原来那条宽语句**替换**成两条：`JobsAndSites`
+（jobs + sites 读写 + `ConditionCheckItem`）与 `AdminsReadOnly`
+（admins 只读 + `ConditionCheckItem`，不含任何写动作）。先
+`grep -n 'AdminsReadOnly' site-builder/mcp/deploy_agentcore.py` 确认那一步真的
+落地了——**若还能在同一条语句里同时看到 `site-admins` 与 `PutItem`，先回去修
+Task 10**，否则 runtime 能绕过 `remove_admin()` 事务直接删管理员。
 
-Task 10 已把语句按表拆开（jobs/sites 读写 + ConditionCheck、admins 只读 +
-ConditionCheck）。这里**再加一条路由表专用语句**——只给投影需要的动作，
+这里**再加一条路由表专用语句**——只给投影需要的动作，
 不给 `PutItem`/`DeleteItem`（整条 put_item 是部署链 `register_route` 的事，
 用 deployer 的 exec role）：
 
@@ -3802,9 +3953,8 @@ ConditionCheck）。这里**再加一条路由表专用语句**——只给投�
 
 ```bash
 git add site-builder/mcp/server.py site-builder/mcp/tests/test_tools.py site-builder/mcp/tests/test_agentcore_contract.py site-builder/mcp/deploy_agentcore.py
-# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
-git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
-# 命中就停下给用户看，确认是故意的 fixture 后再继续
+# AGENTS.md：commit 前扫 staged diff（必须在 git add 之后——扫空 stage 永远报 clean）
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1   # 命中即阻断；确认是故意的 fixture 后加 --allow-hits 重跑
 git commit -m "feat(mcp): 新增 update_site_permissions / manage_collaborators / get_site_permissions"
 ```
 
@@ -3979,9 +4129,24 @@ Expected: owner 是对方；你在 collaborators 里。再调 `undeploy_site` �
 
 ```markdown
 二期 M2 后 MCP 有 8 个工具（新增 `update_site_permissions` /
-`manage_collaborators` / `get_site_permissions`）。runtime 角色新增权限：
-路由表写（权限投影）、`site-sites/index/*`（owner-index）、`site-admins`
-读写。镜像多打包 `permissions.py`（与 `common.py` 同为构建时从
+`manage_collaborators` / `get_site_permissions`）。runtime 角色的 DynamoDB
+权限按表拆成三条语句，**不要合并**：
+
+| 语句 | 表 | 动作 |
+|---|---|---|
+| `JobsAndSites` | jobs、sites（含 `index/*`） | Get/Put/Update/Query/Scan + `ConditionCheckItem` |
+| `AdminsReadOnly` | `site-admins` | **只有** Get/Scan + `ConditionCheckItem` |
+| `RoutingProjection` | 路由表 | Get/Update + `ConditionCheckItem`（**无 Put/Delete**） |
+
+两条"少给"是刻意的：admins 表给了写动作，runtime 就能绕过 `remove_admin()`
+的事务直接删管理员或 `__count__` sentinel；路由表给了 `PutItem`，就能整条覆盖
+路由 item、踩掉 `static_prefix`/`api_target`（部署的原子切流）。
+`ConditionCheckItem` 三条都要有——IAM 里没有 `dynamodb:TransactWriteItems`，
+事务里的 `ConditionCheck` 靠它授权，缺了会让"管理员改任意站点权限"直接
+AccessDenied。增删管理员不用 runtime 角色（M2 用部署者自己的凭证种子，
+M3 用 panel 自己的角色）。
+
+镜像多打包 `permissions.py`（与 `common.py` 同为构建时从
 `deployer/functions/` 复制）。
 ```
 
@@ -3989,9 +4154,8 @@ Expected: owner 是对方；你在 collaborators 里。再调 `undeploy_site` �
 
 ```bash
 git add site-builder/skills/site-builder/SKILL.md site-builder/DEPLOY.md
-# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
-git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
-# 命中就停下给用户看，确认是故意的 fixture 后再继续
+# AGENTS.md：commit 前扫 staged diff（必须在 git add 之后——扫空 stage 永远报 clean）
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1   # 命中即阻断；确认是故意的 fixture 后加 --allow-hits 重跑
 git commit -m "docs: 权限管理工具写进 Skill 与部署手册"
 ```
 
@@ -4528,15 +4692,14 @@ state 校验，为避免断言到错误原因，给它们也补上有效的 pkce
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cd site-builder/auth && ../contract/.venv/bin/pytest tests -q`
-Expected: PASS（原 11 + 新增 10）
+Expected: PASS（原 11 + test_pkce.py 16 条 + test_session.py 4 条）
 
 - [ ] **Step 6: 提交**
 
 ```bash
 git add site-builder/auth/login_handler.py site-builder/auth/tests/
-# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
-git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
-# 命中就停下给用户看，确认是故意的 fixture 后再继续
+# AGENTS.md：commit 前扫 staged diff（必须在 git add 之后——扫空 stage 永远报 clean）
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1   # 命中即阻断；确认是故意的 fixture 后加 --allow-hits 重跑
 git commit -m "feat(auth): OAuth PKCE(S256) + nonce 校验"
 ```
 
@@ -4555,7 +4718,8 @@ git commit -m "feat(auth): OAuth PKCE(S256) + nonce 校验"
   - `deploy_pool.pool_config(base_domain: str) -> dict`（CreateUserPool 参数）
   - `deploy_pool.client_configs(base_domain, extra_mcp_callbacks, idp_name=None, *, include_machine=False, machine_scopes=()) -> dict`（CreateUserPoolClient 参数；默认只返回 `site` / `mcp`——`machine` 需要 resource server 的 custom scope，随 M4 建）
   - `deploy_pool.NATIVE_AUTH_DISABLED` / `NATIVE_AUTH_FLOWS`、`_assert_no_native_flows`、`_verify_no_native_flows`（org 边界的断言与读回复验）
-  - CLI：`python3 site-builder/scripts/deploy_pool.py [--idp oidc|none]`，幂等；结束时打印要回填 config.ini 的值
+  - `deploy_pool.POOL_NAME`、`_ensure_pool(cog, base_domain, pool_name=POOL_NAME)`（`--pool-name` 覆盖，仅供 Task 15 Step 7 的隔离 spike）
+  - CLI：`python3 site-builder/scripts/deploy_pool.py [--domain-prefix X] [--mcp-callback URL]... [--pool-name NAME]`，幂等；结束时打印要回填 config.ini 的值
 
 **说明**：IdP 联邦配置（飞书适配器 / Okta）用参数化的 OIDC provider 配置，脚本只负责"如果 config 里给了 IdP 参数就创建/更新 OIDC provider"，不写死任何 IdP。真机联邦验证在 Task 15。
 
@@ -4583,6 +4747,17 @@ def test_pool_config_requires_essentials_tier():
 def test_pool_config_has_email_attribute():
     cfg = dp.pool_config("example.com")
     assert "email" in cfg["AutoVerifiedAttributes"]
+
+
+def test_default_pool_name_is_production_pool():
+    """--pool-name 的默认值必须仍是生产 pool。
+
+    该参数只为标准 IdP spike 的隔离而存在（Task 15 Step 7）：在生产 pool 上
+    换 [IdP] 重跑会把飞书从生产 client 的 SupportedIdentityProviders 移除，
+    线上登录立即中断。默认值漂了就等于每次部署都建新 pool。
+    """
+    assert dp.POOL_NAME == "site-builder-users"
+    assert dp.pool_config("example.com")["PoolName"] == dp.POOL_NAME
 
 
 def test_pool_config_disables_self_signup():
@@ -4688,6 +4863,24 @@ def test_refresh_token_validity_is_capped(key):
     clients = dp.client_configs("example.com", [], idp_name="Okta")
     assert clients[key]["RefreshTokenValidity"] == 1
     assert clients[key]["TokenValidityUnits"]["RefreshToken"] == "days"
+
+
+@pytest.mark.parametrize("key", ["site", "mcp"])
+def test_access_token_validity_is_capped(key):
+    """access token 也必须显式收（默认 60 分钟）。
+
+    吊销 refresh token **不会**让已经换出去的 access token 立即失效：AWS 对
+    AdminUserGlobalSignOut 明说"Other requests might be valid until your
+    user's token expires"，且被吊销的 token 对"只验签名与过期时间的 JWT 库"
+    仍然有效——AgentCore 的 inbound authorizer 就是这种。所以漂移/泄露后的
+    真实暴露窗口 = refresh 有效期 + access 有效期，两个都要收。
+    """
+    clients = dp.client_configs("example.com", [], idp_name="Okta")
+    assert clients[key]["AccessTokenValidity"] == 15
+    assert clients[key]["IdTokenValidity"] == 15
+    units = clients[key]["TokenValidityUnits"]
+    assert units["AccessToken"] == "minutes"
+    assert units["IdToken"] == "minutes"
 
 
 def test_assert_no_native_flows_rejects_drift():
@@ -4808,7 +5001,8 @@ client_credentials 不能用空 scope 创建，否则脚本会在建 client 这�
 - site：auth 服务用（confidential，authorization_code）
 - mcp：MCP 客户端 OAuth 用（public，需预注册回调——Cognito 无 dynamic
   client registration）
-- machine：key-proxy 用（client_credentials；M4 才消费，这里一并建好）
+- machine：key-proxy 用（client_credentials；**本脚本 M1 不建**——M4 建
+  resource server 时经 `include_machine=True` 一并创建）
 
 用法：
     python3 site-builder/scripts/deploy_pool.py
@@ -4883,8 +5077,20 @@ def client_configs(base_domain: str, extra_mcp_callbacks: list[str],
         # 受信的 TokenGeneration_RefreshTokens——万一原生 flow 曾被误开，
         # 关掉它并不能使已签发的 token 失效，只能靠有效期到期或显式吊销。
         # 站点会话 cookie 本就是 24h，节奏一致。
+        #
+        # access token 也必须显式收：默认 60 分钟，而**吊销 refresh token 不能
+        # 立刻废掉已经换出去的 access token**。AWS 对 AdminUserGlobalSignOut
+        # 明说"Other requests might be valid until your user's token expires"，
+        # 且 token-revocation 文档说被吊销的 token"仍然有效，如果用任何只验
+        # 签名与过期时间的 JWT 库校验"——AgentCore 的 inbound authorizer 正是
+        # 这种（只按 discovery/公钥/exp/allowedClients 验，不回查 Cognito 撤销
+        # 状态）。所以真实暴露窗口 = refresh 有效期 + access 有效期。
+        # 收到 15 分钟：把吊销后的残留窗口从 1 小时压到 15 分钟。
+        "AccessTokenValidity": 15,
+        "IdTokenValidity": 15,
         "RefreshTokenValidity": 1,
-        "TokenValidityUnits": {"RefreshToken": "days"},
+        "TokenValidityUnits": {"AccessToken": "minutes", "IdToken": "minutes",
+                               "RefreshToken": "days"},
         # spec §3.5 第 4 条 —— **这是 org 边界本体**，不是可调项。
         # 只留 refresh：不含 ALLOW_USER_PASSWORD_AUTH / ALLOW_USER_SRP_AUTH /
         # ALLOW_CUSTOM_AUTH / ALLOW_USER_AUTH / ALLOW_ADMIN_USER_PASSWORD_AUTH，
@@ -4901,8 +5107,14 @@ def client_configs(base_domain: str, extra_mcp_callbacks: list[str],
         "AllowedOAuthScopes": ["openid", "email", "profile"],
         "CallbackURLs": [MCP_LOCALHOST_CALLBACK] + list(extra_mcp_callbacks),
         "SupportedIdentityProviders": providers,
-        "RefreshTokenValidity": 1,                   # 同上，限制漂移暴露窗口
-        "TokenValidityUnits": {"RefreshToken": "days"},
+        # 同 site：refresh 1 天 + access/id 15 分钟。mcp client 这条更要紧——
+        # AgentCore authorizer 不回查 Cognito 撤销状态，吊销后残留的 access
+        # token 在过期前仍能调 MCP（部署/改权限/下线）。
+        "AccessTokenValidity": 15,
+        "IdTokenValidity": 15,
+        "RefreshTokenValidity": 1,
+        "TokenValidityUnits": {"AccessToken": "minutes", "IdToken": "minutes",
+                               "RefreshToken": "days"},
         "ExplicitAuthFlows": NATIVE_AUTH_DISABLED,   # 同上，边界
     }
     # machine client（key-proxy 用）**不在 M1 创建**：client_credentials 授权
@@ -4939,6 +5151,8 @@ def _cfg() -> configparser.ConfigParser:
 
 
 def _find_pool(cog, name: str) -> str | None:
+    """按名字找 pool。name 由调用方传入（默认 POOL_NAME）——标准 IdP spike
+    要在独立的临时 pool 上做，不能改生产 pool 的 client 配置（Task 15 Step 7）。"""
     token = None
     while True:
         kw = {"NextToken": token} if token else {}
@@ -4959,16 +5173,22 @@ _POOL_MUTABLE = ("Policies", "DeletionProtection", "AutoVerifiedAttributes",
                  "VerificationMessageTemplate", "UserPoolTier", "LambdaConfig")
 
 
-def _ensure_pool(cog, base_domain: str) -> str:
+def _ensure_pool(cog, base_domain: str, pool_name: str = POOL_NAME) -> str:
     """幂等：已有 pool 也要把关键配置纠正回来，不能直接 return。
 
     否则"幂等重跑"修不了已经建错的 pool——尤其
     AllowAdminCreateUserOnly（自注册开着就等于全部 org 站点对公网开放，
     spec §3.5）。
+
+    pool_name 可覆盖：标准 IdP spike 用独立临时 pool，避免把生产 client 的
+    SupportedIdentityProviders 改成另一个 IdP（会切断线上登录，见 Task 15
+    Step 7）。
     """
-    existing = _find_pool(cog, POOL_NAME)
+    existing = _find_pool(cog, pool_name)
     if not existing:
-        pool_id = cog.create_user_pool(**pool_config(base_domain))["UserPool"]["Id"]
+        cfg = pool_config(base_domain)
+        cfg["PoolName"] = pool_name
+        pool_id = cog.create_user_pool(**cfg)["UserPool"]["Id"]
         print(f"  新建 pool {pool_id}")
         return pool_id
 
@@ -5168,6 +5388,11 @@ def main() -> None:
                     help="Cognito 托管域名前缀（全局唯一）")
     ap.add_argument("--mcp-callback", action="append", default=[],
                     help="额外的 MCP 回调 URL（如 AgentCore identities 回调），可重复")
+    # 标准 IdP spike 用独立临时 pool：在生产 pool 上换 [IdP] 重跑会把飞书从
+    # 生产 client 的 SupportedIdentityProviders 里移除，线上登录立即中断
+    # （Task 15 Step 7）。默认仍是生产 pool 名。
+    ap.add_argument("--pool-name", default=POOL_NAME,
+                    help=f"user pool 名（默认 {POOL_NAME}；仅隔离 spike 时改）")
     args = ap.parse_args()
 
     import boto3
@@ -5176,8 +5401,8 @@ def main() -> None:
     base_domain = cfg["Platform"]["base_domain"]
     cog = boto3.client("cognito-idp", region_name=region)
 
-    print("① user pool（禁自注册）")
-    pool_id = _ensure_pool(cog, base_domain)
+    print(f"① user pool（禁自注册）: {args.pool_name}")
+    pool_id = _ensure_pool(cog, base_domain, args.pool_name)
 
     print("② 托管域名")
     domain_prefix = _ensure_domain(cog, pool_id, args.domain_prefix)
@@ -5436,7 +5661,7 @@ Expected: PASS（8 passed——含参数化的两个容器）
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cd site-builder/deployer && .venv/bin/pytest tests/test_deploy_pool.py -q`
-Expected: PASS（10 passed）
+Expected: PASS（22 passed——20 个函数，两个 parametrize 各展开 2）
 
 - [ ] **Step 6: 加 config.ini.example 的 [IdP] 段**
 
@@ -5461,9 +5686,8 @@ scopes = openid email profile
 git add site-builder/scripts/deploy_pool.py site-builder/auth/deploy_auth.py \
   site-builder/auth/pre_token_email.py site-builder/auth/tests/test_pre_token.py \
   site-builder/deployer/tests/test_deploy_pool.py site-builder/config.ini.example
-# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
-git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
-# 命中就停下给用户看，确认是故意的 fixture 后再继续
+# AGENTS.md：commit 前扫 staged diff（必须在 git add 之后——扫空 stage 永远报 clean）
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1   # 命中即阻断；确认是故意的 fixture 后加 --allow-hits 重跑
 git commit -m "feat(scripts): 平台专用 user pool 部署脚本（IdP 无关，site/mcp 两个 client）"
 ```
 
@@ -5773,13 +5997,66 @@ Expected: `TRUSTED_IDPS` 有值。**为空则等于 MCP 侧防线未启用**—�
 （加一行断言：`if CFG.has_section("IdP") and CFG["IdP"].get("provider_name"):
 assert trusted_idps, "..."`），避免"部署成功但防线关着"这种静默失败。
 
-- [ ] **Step 7: [真机 spike] 标准 IdP 分支验证**
+- [ ] **Step 7: [真机 spike] 标准 IdP 分支验证（必须在隔离 pool 上做）**
 
-在新 pool 上加一个标准 IdP（Okta 试用租户或 Azure AD），只需 `[IdP]` 段换成它的参数重跑 `deploy_pool.py`，然后用该 IdP 的账号走一次站点登录。
+**不要在生产 pool 上把 `[IdP]` 换成 Okta 重跑 `deploy_pool.py`。** 那样会：
+① `client_configs` 把 `SupportedIdentityProviders` **精确设成** `[idp_name]`，
+`_ensure_clients` 对已存在的 client 走 `update_user_pool_client`（整体替换），
+于是飞书被从生产 site/mcp client 里移除，**线上新登录立刻不可用**；
+② Edge 的 `trusted_idps` 与 AgentCore 的 `TRUSTED_IDPS` 还是 `Feishu`
+（Step 6c/6d 就是按它验收的），即便 Okta 登录成功拿到 `idp=Okta`，
+访问站点也会被 Edge 302 拦掉——本步骤没有重新部署路由层/AgentCore，
+也没有恢复飞书配置的动作。两件事叠起来就是"生产登录断了，spike 还没验成"。
 
-Expected: 登录成功，会话 JWT 的 email 是 IdP 给的 email，站点可访问。**这条覆盖需求清单 B 组"标准 IdP 路径真机验证"**。
+做法：**用一个独立的临时 pool**，与生产完全隔离：
+
+```bash
+# 独立 pool + 独立域名前缀；[IdP] 段临时换成 Okta/Azure 的参数
+python3 site-builder/scripts/deploy_pool.py \
+  --domain-prefix <另一个全局唯一前缀> --pool-name site-builder-users-idpspike
+```
+
+`deploy_pool.py` 需要支持 `--pool-name`（默认 `POOL_NAME`）才能这样隔离——
+Task 14 的 `main()` 里把 `POOL_NAME` 换成该参数（`_ensure_pool` /
+`_find_pool` 都接受 pool 名参数），并在 Task 14 Step 1 的测试里补一条
+"默认 pool 名不变"的断言。这比"在生产 pool 上改来改去"安全得多。
+
+验证内容（都在临时 pool 上）：
+
+1. Hosted UI 能跳到该 IdP 登录页；
+2. 用该 IdP 账号登录后，拿到的 id/access token 里 `email` 是 IdP 给的、
+   `idp` 是该 provider 名、`auth_via=TokenGeneration_HostedAuth`
+   ——**证明属性映射与 pre-token 注入对标准 IdP 同样成立**，这就是本 spike
+   要回答的问题（覆盖需求清单 B 组"标准 IdP 路径真机验证"）；
+3. 不需要（也不应该）把站点访问链路切到这个临时 pool。
+
+**若确实要在生产上支持双 IdP 并存**（不属本期范围，记入 §11）：
+`client_configs` 要接受 provider 列表而非单值，且必须**同一批**更新
+`router/config.ini` 的 `trusted_idps` 与 `deploy_agentcore.py` 的
+`TRUSTED_IDPS` 并重部署两者——否则新 IdP 的用户拿着合法 token 仍被拦。
+
+- [ ] **Step 7b: 清理临时 pool 并复验生产未被动过**
+
+```bash
+# 1) 删掉临时 pool（含它的 domain）——它不承载任何生产流量
+aws cognito-idp delete-user-pool-domain --domain <临时前缀> \
+  --user-pool-id <临时 pool id> --region us-east-1
+aws cognito-idp delete-user-pool --user-pool-id <临时 pool id> --region us-east-1
+
+# 2) 把 config.ini 的 [IdP] 段改回飞书参数（spike 期间被临时改过）
+
+# 3) 复验生产 client 的 provider 列表仍是飞书 —— 这是防"误改生产"的闸门
+for CLIENT in <site_client_id> <mcp_client_id>; do
+  aws cognito-idp describe-user-pool-client --region us-east-1 \
+    --user-pool-id <生产 pool id> --client-id "$CLIENT" \
+    --query 'UserPoolClient.{name:ClientName,idps:SupportedIdentityProviders,flows:ExplicitAuthFlows}'
+done
+```
+Expected: 两个 client 的 `idps` 仍只含飞书 provider 名、`flows` 仍只有
+`ALLOW_REFRESH_TOKEN_AUTH`；随后用浏览器走一次真实登录确认生产链路正常。
 
 若无法获得测试租户，把阻塞原因与已验证到哪一步写进 DEPLOY.md，不要宣称已验证。
+**也不要为了"跑通这一步"去改生产 client。**
 
 - [ ] **Step 8: 重生成 onboarding 并通告**
 
@@ -5841,8 +6118,8 @@ Expected: 无输出即成功。**顺序不能反**——先删后验证会让旧
    —— 幂等，建 pool（Essentials 档，pre-token V2 必需）+ **两个** app client
    （site / mcp）+ 托管域名（managed login v2）+ branding + pre-token 触发器。
    `machine` client 随 M4 的 resource server 一起建。
-3. 按脚本输出回填 `[Cognito]`，并执行它打印的两条 SSM 写入命令
-   （client secret 只进 SSM，不写文件）。
+3. 按脚本输出回填 `[Cognito]`（client secret 由脚本直接写入 SSM
+   SecureString——不打印明文、不写文件，无需手工执行任何写入命令）。
 4. 在 IdP 侧把 `https://<前缀>.auth.us-east-1.amazoncognito.com/oauth2/idpresponse`
    加进回调白名单。
 5. 验证 Hosted UI 能跳到 IdP 登录页。
@@ -5869,7 +6146,15 @@ AWS 官方指引见本节末尾链接。属性映射固定 `email → email`、`
 
 两个 client 的共同约束（org 边界，见 spec §3.5 第 4 条）：
 `ExplicitAuthFlows` 只含 `ALLOW_REFRESH_TOKEN_AUTH`、`RefreshTokenValidity=1` 天、
+**`AccessTokenValidity`/`IdTokenValidity=15` 分钟**、
 `SupportedIdentityProviders` 只列企业 IdP。部署脚本每次重跑都断言并读回复验。
+
+两个有效期都要收：**吊销 refresh token 不会让已经换出去的 access token 立即
+失效**（AWS：*"Other requests might be valid until your user's token expires"*，
+且被吊销的 token 对"只验签名与过期时间的 JWT 库"依然有效——AgentCore 的
+authorizer 正是这种）。所以泄露/漂移后的暴露窗口 = refresh 有效期 + access
+有效期。要立即失效必须轮换 app client 并同步更新 AgentCore 的
+`allowedClients`，或轮换 `JWT_SECRET` 重部署路由层。
 ```
 
 在该节末尾把一期已有的 AWS 官方链接与旧内容保留在"分支 A/B"下对应位置。
@@ -5878,9 +6163,8 @@ AWS 官方指引见本节末尾链接。属性映射固定 `email → email`、`
 
 ```bash
 git add site-builder/DEPLOY.md
-# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
-git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
-# 命中就停下给用户看，确认是故意的 fixture 后再继续
+# AGENTS.md：commit 前扫 staged diff（必须在 git add 之后——扫空 stage 永远报 clean）
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1   # 命中即阻断；确认是故意的 fixture 后加 --allow-hits 重跑
 git commit -m "docs(deploy): ① 身份层改写为 IdP 无关双分支 + 专用 pool 切换步骤"
 ```
 
@@ -6010,6 +6294,18 @@ Expected: 4 passed（约 6 分钟）。这条验证权限真源改造没有破�
   边界失效）。配套运维红线：不对平台 pool 调 `AdminCreateUser` /
   `AdminSetUserPassword` / `AdminLinkProviderForUser`。彻底兜底需要 WAF 挡
   user pools API，三期做。
+- **吊销 token ≠ 立即失效**：`AdminUserGlobalSignOut` / `RevokeToken` 只断掉
+  "再换新 token"，已经签发出去的 access token 在自身过期前仍被接受——AWS 明说
+  *"Other requests might be valid until your user's token expires"*，且被吊销的
+  token 对"只校验签名与过期时间的 JWT 库"依然有效，而 AgentCore 的 inbound
+  authorizer 与我们的 Edge 都属于这类（不逐请求回查撤销状态）。因此 client 的
+  `RefreshTokenValidity=1` 天**与** `AccessTokenValidity=15` 分钟两个都要配
+  （只收 refresh 会留最长 1 小时残留窗口）；要立即失效只能轮换 app client +
+  更新 AgentCore `allowedClients`，或轮换 `JWT_SECRET` 重部署路由层。
+- **标准 IdP 验证要用独立临时 pool**（`deploy_pool.py --pool-name`）：
+  `client_configs` 把 `SupportedIdentityProviders` 整体替换成单个 IdP，在生产
+  pool 上换 `[IdP]` 重跑会把原 IdP 从生产 client 移除、切断线上登录；而 Edge 的
+  `trusted_idps` 与 MCP 的 `TRUSTED_IDPS` 不会跟着变，新 IdP 的 token 照样被拦。
 - **IAM 里没有 `dynamodb:TransactWriteItems`**：事务内 Put/Update/Delete/Get
   的权限由底层同名 action 决定，只有 `ConditionCheck` 需要独立的
   `dynamodb:ConditionCheckItem`。写成不存在的 action 名 IAM 不报错，
@@ -6054,9 +6350,8 @@ Expected: 4 passed（约 6 分钟）。这条验证权限真源改造没有破�
 
 ```bash
 git add CLAUDE.md docs/superpowers/specs/2026-07-30-quick-site-builder-phase2-design.md
-# AGENTS.md：commit 前扫 staged diff（命中先确认，不自动清洗）
-git diff --cached | grep -nE 'AKIA|ASIA|ghp_|sk-[A-Za-z0-9]{20}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret|password[[:space:]]*=' || echo "secret scan: clean"
-# 命中就停下给用户看，确认是故意的 fixture 后再继续
+# AGENTS.md：commit 前扫 staged diff（必须在 git add 之后——扫空 stage 永远报 clean）
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1   # 命中即阻断；确认是故意的 fixture 后加 --allow-hits 重跑
 git commit -m "docs: M1+M2 收尾——CLAUDE.md 补权限真源与 L 类型顺序约束，spec 回写实施差异"
 ```
 

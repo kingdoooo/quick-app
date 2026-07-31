@@ -340,11 +340,21 @@ Edge 对 `"org"` 的判定是"持有本平台签发的有效会话 JWT 即放行
      （哪怕只几分钟），关掉 flow **不能**使已签发的 refresh token 失效。
      恢复流程必须三步：① 改回 `ExplicitAuthFlows`；② **吊销存量 refresh
      token**——按用户 `AdminUserGlobalSignOut`，或（无法枚举受影响用户时）
-     直接轮换 app client（新建 client + 换 config + 删旧 client，旧 client
-     签发的 token 立即失效）；③ 复验 `initiate-auth` 失败。
-     配套把 `RefreshTokenValidity` 从默认 30 天收到 **1 天**：缩短任何一次
-     漂移的暴露窗口，代价是用户每天重新登录一次（站点会话 cookie 本就是
-     24h，节奏一致）。
+     直接轮换 app client；③ 复验 `initiate-auth` 失败**且吊销前签发的
+     access token 已被拒**。
+   - **吊销 ≠ 立即失效**：`AdminUserGlobalSignOut` / `RevokeToken` 只断掉
+     "再换新 token"，**已经换出去的 access token 在自身过期前仍可用**。AWS 明
+     说 *"Other requests might be valid until your user's token expires"*，
+     且被吊销的 token 对"只校验签名与过期时间的 JWT 库"依然有效——AgentCore
+     的 inbound authorizer 正是这种（只验 discovery/公钥/exp/`allowedClients`，
+     不逐请求回查 Cognito），Edge 验的是平台自签会话 JWT，同理不回查。
+     要求立即失效只有两条路：轮换 app client **并**同步更新 AgentCore 的
+     `allowedClients`；或轮换 `JWT_SECRET` 并重部署路由层（作废全部会话）。
+   - 配套把 `RefreshTokenValidity` 从默认 30 天收到 **1 天**，并把
+     `AccessTokenValidity` / `IdTokenValidity` 从默认 60 分钟收到 **15 分钟**
+     （两者都要——**暴露窗口 = refresh 有效期 + access 有效期**，只收 refresh
+     会留下最长一小时的残留窗口）。代价是用户每天重新登录一次（站点会话
+     cookie 本就是 24h，节奏一致）。
    - **三期**：WAF 挡 user pools API 是最后一层（防"有人新建了带原生 flow
      的 client"这类配置漂移）——记入 §11，本期不做。
 
@@ -757,13 +767,18 @@ Lambda 侧）。
      会在到达容器前被网关拒掉，无论 `_caller_email` 有没有校验都"通过"）；
   5. **refresh 洗白路径已被 ④ 关闭，且暴露窗口有界**：确认无法先拿到原生
      token（第 3 条已验），因此不存在"原生认证 → refresh 刷一次"的洗白链；
-     `describe-user-pool-client` 的 `RefreshTokenValidity` ≤ 1 天。
+     `describe-user-pool-client` 的 `RefreshTokenValidity` ≤ 1 天
+     **且 `AccessTokenValidity` ≤ 15 分钟**（只查前者会漏掉吊销后残留的
+     access token 窗口）。
      **漂移恢复演练**（至少做一次，证明恢复流程有效）：临时给一个测试用
-     client 打开 `ALLOW_USER_PASSWORD_AUTH` → 用它拿一个 refresh token →
-     关掉 flow → 确认该 refresh token **仍能**换到新 token（这是预期的，
-     证明"改配置不足以恢复"）→ 执行 `AdminUserGlobalSignOut` 或轮换 client
-     → 确认该 refresh token 失效。演练用独立的临时 client，不要动
-     site/mcp；
+     client 打开 `ALLOW_USER_PASSWORD_AUTH` → 用它拿一个 refresh token
+     **与一个 access token** → 关掉 flow → 确认该 refresh token **仍能**换到
+     新 token（这是预期的，证明"改配置不足以恢复"）→ 执行
+     `AdminUserGlobalSignOut` 或轮换 client → 确认该 refresh token 失效，
+     **并用吊销前那个 access token 再调一次受保护入口，确认它是否仍被接受**
+     （AWS 文档说会——把实测结论记进 DEPLOY.md；要立即失效必须轮换 client +
+     更新 AgentCore `allowedClients`，或轮换 `JWT_SECRET`）。演练用独立的临时
+     client，不要动 site/mcp；
   4. 在线改 allowed_users，60s+缓存窗口内新名单生效（拒绝名单外用户）；
   5. 在线**翻转 require_login**（两个方向各一次）后重部署成功——覆盖
      §3.3.2 的 smoke test 取值路径；
@@ -814,6 +829,12 @@ Lambda 侧）。
 
 - 全量按站点会话隔离（本期只做控制台）
 - SAML IdP 联邦（Cognito 支持；本期只做 OIDC，两者属性映射与部署脚本路径不同）
+- **同一 pool 上多 IdP 并存**：本期 `deploy_pool.client_configs` 只接受单个
+  `idp_name`，并把 `SupportedIdentityProviders` 整体替换为它——在生产 pool 上
+  换 IdP 重跑会把原 IdP 移除、切断线上登录。所以标准 IdP 的真机验证用**独立
+  临时 pool**（M1 Task 15 Step 7）。真要并存需要三处同批改并重部署：
+  `client_configs` 收 provider 列表、Edge 的 `trusted_idps`、MCP 的
+  `TRUSTED_IDPS`——漏掉后两者会让新 IdP 用户拿着合法 token 仍被拦
 - **WAF 挡住 user pools API 的原生认证**（`InitiateAuth` 等）：本期的边界是
   app client 的 `ExplicitAuthFlows` 不开原生 flow（§3.5 第 4 条），它在
   "配置正确"的前提下已足够；WAF 的价值是防**配置漂移本身**——例如有人新建了
