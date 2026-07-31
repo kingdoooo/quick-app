@@ -11,13 +11,19 @@ import deploy_pool as dp
 
 @pytest.fixture(autouse=True)
 def _no_real_credentials(monkeypatch):
-    """本模块任何一次"漏出 Stubber"的调用都必须打不到真实账号。
+    """把凭证钉成假值：**改变漏出调用的失败模式，不是网络屏障**。
 
     实测教训（2026-07-31）：本文件早期版本里 `_store_client_secrets` 的测试
     只 stub 了测试自己建的 ssm client，而实现内部另建一个 client——Stubber
     拦不住，那次 put_parameter **真的写进了开发者当前凭证的账号**。
-    环境变量凭证优先级高于共享配置文件，所以钉上假值即可让漏出的调用
-    以鉴权失败告终，而不是静默改动真实资源。
+
+    这个 fixture 的真实效力边界，别当成更强的东西：
+    - 泄漏的调用**仍会发出网络请求**，只是以鉴权失败告终，而不是改动真实资源。
+    - 若 `boto3.DEFAULT_SESSION` 已缓存过凭证，本 pin 对之后新建的 client
+      **完全无效**（本仓库当前无此路径：没有测试在 moto 之外用默认 session）。
+
+    真正的防线是把 client 做成可注入的参数（见 `_store_client_secrets` 的
+    `ssm=` 参数），让 Stubber 能确实拦住它。
     """
     for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
         monkeypatch.setenv(k, "testing")
@@ -211,6 +217,49 @@ def test_assert_no_native_flows_rejects_drift():
         dp._assert_no_native_flows("site", {
             "ExplicitAuthFlows": ["ALLOW_REFRESH_TOKEN_AUTH",
                                   "ALLOW_USER_PASSWORD_AUTH"]})
+
+
+def test_native_auth_flows_covers_entire_enum_except_refresh():
+    """denylist 必须等于 ExplicitAuthFlows 枚举减去 refresh——按真实 service
+    model 比对，而不是照着记忆列。
+
+    漏项的后果不是"少拦一种"，而是两道闸门一起瞎掉：漏掉的值既过
+    _assert_no_native_flows 也过 _verify_no_native_flows，而它开的是真的原生认证。
+    botocore 1.43.53 实测该枚举有 9 个值，legacy 三个（ADMIN_NO_SRP_AUTH /
+    CUSTOM_AUTH_FLOW_ONLY / USER_PASSWORD_AUTH）没有 ALLOW_ 前缀，最易漏。
+    """
+    import botocore.session
+    model = botocore.session.get_session().get_service_model("cognito-idp")
+    enum = set(model.operation_model("CreateUserPoolClient").input_shape
+               .members["ExplicitAuthFlows"].member.enum)
+    assert enum - {"ALLOW_REFRESH_TOKEN_AUTH"} == set(dp.NATIVE_AUTH_FLOWS)
+
+
+@pytest.mark.parametrize("legacy", ["ADMIN_NO_SRP_AUTH", "CUSTOM_AUTH_FLOW_ONLY",
+                                    "USER_PASSWORD_AUTH"])
+def test_assert_rejects_legacy_native_flow_values(legacy):
+    """legacy 值（无 ALLOW_ 前缀）同样开原生认证，必须被拦。
+
+    注意 USER_PASSWORD_AUTH 与 ALLOW_USER_PASSWORD_AUTH 是枚举里两个不同的值。
+    """
+    with pytest.raises(SystemExit, match="原生认证"):
+        dp._assert_no_native_flows("site", {"ExplicitAuthFlows": [legacy]})
+
+
+def test_each_client_gets_its_own_provider_list():
+    """两个 client 不能共享同一个 SupportedIdentityProviders 对象。
+
+    共享时任何一处 append 会静默改掉另一个 client 的 provider 名单——而这正是
+    org 边界字段（实测：往 site 的名单 append "COGNITO"，mcp 的也变成
+    [Okta, COGNITO]）。M4 传 include_machine=True 做 per-client 调整时最可能踩到。
+    """
+    clients = dp.client_configs("example.com", [], idp_name="Okta")
+    site_p = clients["site"]["SupportedIdentityProviders"]
+    mcp_p = clients["mcp"]["SupportedIdentityProviders"]
+    assert site_p == mcp_p == ["Okta"]
+    assert site_p is not mcp_p
+    site_p.append("COGNITO")                      # 污染其中一个
+    assert mcp_p == ["Okta"]                      # 另一个必须毫发无损
 
 
 def test_verify_no_native_flows_reads_back_from_aws():

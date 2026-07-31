@@ -37,9 +37,20 @@ MCP_LOCALHOST_CALLBACK = "http://localhost:18765/callback"
 #   ALLOW_USER_PASSWORD_AUTH / ALLOW_USER_SRP_AUTH / ALLOW_CUSTOM_AUTH /
 #   ALLOW_USER_AUTH / ALLOW_ADMIN_USER_PASSWORD_AUTH
 NATIVE_AUTH_DISABLED = ["ALLOW_REFRESH_TOKEN_AUTH"]
+# **必须覆盖 ExplicitAuthFlows 的全部非 refresh 枚举值，legacy 三个也要列**：
+# botocore 1.43.53 实测该枚举是 9 个值——除 5 个 ALLOW_* 外还有 3 个 legacy
+# 值 ADMIN_NO_SRP_AUTH / CUSTOM_AUTH_FLOW_ONLY / USER_PASSWORD_AUTH
+# （注意最后一个没有 ALLOW_ 前缀，与 ALLOW_USER_PASSWORD_AUTH 是两个不同值）。
+# 漏掉它们的后果实测过：ExplicitAuthFlows=["USER_PASSWORD_AUTH"] 能同时通过
+# _assert_no_native_flows 与 _verify_no_native_flows，而原生密码认证是全开的
+# ——两道闸门一起瞎掉，等于边界不存在。
 NATIVE_AUTH_FLOWS = ("ALLOW_USER_PASSWORD_AUTH", "ALLOW_USER_SRP_AUTH",
                      "ALLOW_CUSTOM_AUTH", "ALLOW_USER_AUTH",
-                     "ALLOW_ADMIN_USER_PASSWORD_AUTH")
+                     "ALLOW_ADMIN_USER_PASSWORD_AUTH",
+                     # legacy（无 ALLOW_ 前缀）——AWS 不允许与 ALLOW_* 混用，
+                     # 但手工建的 client 或调试期改动可能只用它们
+                     "ADMIN_NO_SRP_AUTH", "CUSTOM_AUTH_FLOW_ONLY",
+                     "USER_PASSWORD_AUTH")
 
 
 def pool_config(base_domain: str) -> dict:
@@ -75,7 +86,11 @@ def client_configs(base_domain: str, extra_mcp_callbacks: list[str],
     allowed_users="org" 的语义就被击穿（spec §3.5）。未给出时回落
     ["COGNITO"]（首次部署、联邦还没接），main() 会显式告警。
     """
-    providers = [idp_name] if idp_name else ["COGNITO"]
+    # 每个 client 一份独立副本：共享同一个 list 对象时，任何一处 append
+    # 会静默改掉另一个 client 的 provider 名单——而这正是 org 边界字段
+    # （实测：往 site 的名单 append "COGNITO"，mcp 的也变成 [Okta, COGNITO]）。
+    # M4 走 include_machine=True 时最可能第一次踩到。
+    _providers = [idp_name] if idp_name else ["COGNITO"]
     site = {
         "ClientName": "site-builder-site",
         "GenerateSecret": True,
@@ -84,7 +99,7 @@ def client_configs(base_domain: str, extra_mcp_callbacks: list[str],
         "AllowedOAuthScopes": ["openid", "email", "profile"],
         "CallbackURLs": [f"https://auth.{base_domain}/callback"],
         "LogoutURLs": [f"https://auth.{base_domain}/logout"],
-        "SupportedIdentityProviders": providers,
+        "SupportedIdentityProviders": list(_providers),
         # refresh token 有效期收到 1 天（默认 30 天）。理由：refresh token
         # 一旦签发，在有效期内可持续换新 token，而新 token 的 auth_via 是
         # 受信的 TokenGeneration_RefreshTokens——万一原生 flow 曾被误开，
@@ -119,7 +134,7 @@ def client_configs(base_domain: str, extra_mcp_callbacks: list[str],
         "AllowedOAuthFlowsUserPoolClient": True,
         "AllowedOAuthScopes": ["openid", "email", "profile"],
         "CallbackURLs": [MCP_LOCALHOST_CALLBACK] + list(extra_mcp_callbacks),
-        "SupportedIdentityProviders": providers,
+        "SupportedIdentityProviders": list(_providers),
         # 同 site：refresh 1 天 + access/id 15 分钟。mcp client 这条更要紧——
         # AgentCore authorizer 不回查 Cognito 撤销状态，吊销后残留的 access
         # token 在过期前仍能调 MCP（部署/改权限/下线）。
