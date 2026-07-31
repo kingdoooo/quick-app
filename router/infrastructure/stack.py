@@ -160,22 +160,38 @@ class WebRouterStack(Stack):
         # deploy time (see load_jwt_secret); the bucket lives in us-east-1
         # (Lambda@Edge SigV4 in origin_request.py signs for us-east-1).
         jwt_secret = load_jwt_secret()
-        # require_idp_claim / trusted_idps (Task 8b, spec §3.5): the edge check
-        # that enforces "identity must come from the enterprise IdP". Both keys
-        # are REQUIRED in config.ini — a missing key raises NoOptionError here
-        # (loud) rather than leaving the placeholder literal in the deployed
-        # code, which would silently evaluate to False and disable the defense.
+        # 两个值都要在 synth 时验证——它们控制的是 org 语义在请求路径上的
+        # 唯一执行点，配错的代价不对称：
+        # ① configparser 默认**保留行内注释**（inline_comment_prefixes=()）：
+        #    `require_idp_claim = true   # 按 Task 15 翻开` 读出来的值是
+        #    'true   # 按 Task 15 翻开' → lower() != "true" → **防线静默关闭**，
+        #    部署成功、无警告。翻开关时顺手加注释是完全现实的操作。
+        #    同理 yes/1/on 这些 configparser.getboolean 接受的值这里都算 False。
+        # ② require_idp_claim=true 而 trusted_idps 为空 → 所有人被 302 →
+        #    全站锁死，而 Edge 重部署要 10-20 分钟全球复制才能恢复。
+        # ③ 两个键都是必填：缺键时 ConfigLoader.get 抛 NoOptionError（响亮失败），
+        #    不要给它们加默认值——留占位符字面量同样是"防线静默关闭"。
+        require_idp_claim = config.get("SiteBuilder", "require_idp_claim",
+                                       "APP_REQUIRE_IDP_CLAIM").strip()
+        trusted_idps = config.get("SiteBuilder", "trusted_idps",
+                                  "APP_TRUSTED_IDPS").strip()
+        if require_idp_claim not in ("true", "false"):
+            raise ValueError(
+                f"require_idp_claim 必须是 true/false（当前 {require_idp_claim!r}）"
+                "——行内注释会被并进值里，yes/1/on 也不行（会被当成 false，"
+                "防线静默关闭）")
+        if require_idp_claim == "true" and not trusted_idps:
+            raise ValueError(
+                "require_idp_claim=true 但 trusted_idps 为空——部署出去所有"
+                "用户都会被 302 锁死（Edge 回滚要 10-20 分钟全球复制）。"
+                "先在 [SiteBuilder] 填 trusted_idps。")
         lambda_code = (lambda_code
             .replace("{{FRONTEND_BUCKET_DOMAIN}}",
                      f"{frontend_bucket}.s3.us-east-1.amazonaws.com")
             .replace("{{JWT_SECRET}}", jwt_secret)
             .replace("{{BASE_DOMAIN}}", base_domain)
-            .replace("{{REQUIRE_IDP_CLAIM}}",
-                     config.get("SiteBuilder", "require_idp_claim",
-                                "APP_REQUIRE_IDP_CLAIM"))
-            .replace("{{TRUSTED_IDPS}}",
-                     config.get("SiteBuilder", "trusted_idps",
-                                "APP_TRUSTED_IDPS")))
+            .replace("{{REQUIRE_IDP_CLAIM}}", require_idp_claim)
+            .replace("{{TRUSTED_IDPS}}", trusted_idps))
         
         # Write to temporary file
         temp_dir = tempfile.mkdtemp()
