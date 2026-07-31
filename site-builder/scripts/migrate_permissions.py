@@ -26,13 +26,20 @@ sys.path.insert(0, str(HERE.parent / "deployer" / "functions"))
 
 
 def _load_config() -> None:
-    """从 config.ini 填好 common/permissions 需要的环境变量。"""
+    """从 config.ini 填好 common/permissions 需要的环境变量。
+
+    **直接赋值，不用 setdefault**：config.ini 是部署脚本的唯一取值来源
+    （CLAUDE.md），setdefault 会让 shell 里残留的旧 SITES_TABLE 静默改写
+    写入目标。config.ini 缺失时立刻报错，不留到 KeyError('Deployer')。
+    """
+    path = HERE.parent / "config.ini"
+    if not path.exists():
+        raise SystemExit(f"找不到 {path}——从 config.ini.example 复制并填好再跑")
     cfg = configparser.ConfigParser()
-    cfg.read(HERE.parent / "config.ini")
-    os.environ.setdefault("SITES_TABLE", cfg["Deployer"]["sites_table"])
-    os.environ.setdefault("JOBS_TABLE", cfg["Deployer"]["jobs_table"])
-    os.environ.setdefault("ADMINS_TABLE", cfg["Deployer"]["admins_table"])
-    os.environ.setdefault("AWS_DEFAULT_REGION", cfg["Platform"]["region"])
+    cfg.read(path)
+    os.environ["SITES_TABLE"] = cfg["Deployer"]["sites_table"]
+    os.environ["ADMINS_TABLE"] = cfg["Deployer"]["admins_table"]
+    os.environ["AWS_DEFAULT_REGION"] = cfg["Platform"]["region"]
 
 
 class UnparsableAllowlist(ValueError):
@@ -46,10 +53,26 @@ def _parse_allowed(raw) -> str | list[str]:
     空名单（仅 owner 可访问，fail-closed，origin_request.py:308-315）。若迁移
     把它写成 "org"，下一次部署会把这个值投影到路由表，权限从"仅 owner"扩大成
     "全体登录用户"——一次数据修复动作变成扩权。见 spec §3.4。
+
+    **未知 AttributeValue 类型同样必须抛错**：不能写 raw.get("S", "org")——
+    SS/NULL/N/BOOL 会双双错过 S 和 L 分支、静默落成 "org"（moto 探针实锤过）。
+    这不是理论场景：spec §3.4 的救济流程就是"人工判断原意后手工修"，而人在
+    DynamoDB 控制台给字符串列表选的类型就是 String Set——修完一重跑，owner-only
+    变全组织放行。只有"属性整体缺失"才回落 "org"（Edge 的默认正是如此：
+    route.get("allowed_users", "org")）。
     """
     if "L" in raw:                       # 已是二期形态
-        return [e["S"] for e in raw["L"]]
-    value = raw.get("S", "org")
+        members = raw["L"]
+        if not all(isinstance(e, dict) and "S" in e for e in members):
+            raise UnparsableAllowlist(
+                f"allowed_users 的 L 含非字符串成员: {members!r}")
+        return [e["S"] for e in members]
+    if not raw:                          # 属性缺失：与 Edge 的默认一致
+        return "org"
+    if "S" not in raw:
+        raise UnparsableAllowlist(
+            f"allowed_users 类型不支持（应为 S/L）: {sorted(raw)}")
+    value = raw["S"]
     if value == "org":
         return "org"
     try:
@@ -62,45 +85,95 @@ def _parse_allowed(raw) -> str | list[str]:
 
 
 def migrate(routing_table: str, *, dry_run: bool = True) -> dict:
+    import botocore.exceptions
     import common
     import permissions
 
     ddb = boto3.client("dynamodb")
-    report = {"scanned": 0, "migrated": [], "skipped": [], "errors": []}
+    report = {"scanned": 0, "migrated": [], "skipped": [], "errors": [],
+              "planned": {}}
     paginator = ddb.get_paginator("scan")
     for page in paginator.paginate(TableName=routing_table):
         for item in page.get("Items", []):
             report["scanned"] += 1
-            owner = item.get("owner", {}).get("S", "")
-            if owner == "platform":      # auth-service / 控制台等平台路由无站点记录
-                continue
-            site_id = item.get("site_id", {}).get("S", "")
-            site = common.get_site(site_id)
-            if not site:
-                report["errors"].append(
-                    f"路由 {item['subdomain']['S']} 指向的站点 {site_id} 无 sites 记录")
-                continue
-            if "require_login" in site:
-                report["skipped"].append(site_id)
-                continue
+            # 整个单条处理都在 try 里：一条畸形路由（缺 site_id、L 里混 NULL、
+            # 空字符串键……）**不能中止整个扫描**——apply 模式下中止意味着
+            # 半套迁移 + 没有报告，操作者不知道停在哪。逐条収进 errors 继续。
             try:
-                allowed = permissions.normalize_allowed_users(
-                    _parse_allowed(item.get("allowed_users", {})))
-            except ValueError as e:
-                # UnparsableAllowlist 也是 ValueError 的子类，一并落在这里：
-                # 报告并跳过，由人工判断原意后手工修——不自动放宽。
-                report["errors"].append(f"{site_id}: allowed_users 无法规范化（{e}）")
-                continue
-            report["migrated"].append(site_id)
-            if dry_run:
-                continue
-            common.upsert_site(
-                site_id,
-                require_login=bool(item.get("require_auth", {}).get("BOOL", True)),
-                allowed_users=allowed,
-                collaborators=list(site.get("collaborators") or []),
-                permissions_updated_at=permissions.now_iso(),
-                permissions_updated_by="migration")
+                owner = item.get("owner", {}).get("S", "")
+                if owner == "platform":  # auth-service / 控制台等平台路由无站点记录
+                    continue
+                site_id = item.get("site_id", {}).get("S", "")
+                if not site_id:
+                    report["errors"].append(
+                        f"路由 {item.get('subdomain', {}).get('S', '?')} 缺 site_id")
+                    continue
+                site = common.get_site(site_id)
+                if not site:
+                    report["errors"].append(
+                        f"路由 {item['subdomain']['S']} 指向的站点 {site_id} 无 sites 记录")
+                    continue
+                if "require_login" in site:
+                    report["skipped"].append(site_id)
+                    continue
+                try:
+                    allowed = permissions.normalize_allowed_users(
+                        _parse_allowed(item.get("allowed_users", {})))
+                except ValueError as e:
+                    # UnparsableAllowlist 也是 ValueError 的子类，一并落在这里：
+                    # 报告并跳过，由人工判断原意后手工修——不自动放宽。
+                    report["errors"].append(
+                        f"{site_id}: allowed_users 无法规范化（{e}）")
+                    continue
+                require_login = bool(item.get("require_auth", {}).get("BOOL", True))
+                report["migrated"].append(site_id)
+                # planned：给 dry-run 报告看"将写什么值"。没有它，SS→org 这类
+                # 静默扩权在唯一的人工审查关口（dry-run 输出）上是不可见的。
+                report["planned"][site_id] = {"require_login": require_login,
+                                              "allowed_users": allowed}
+                if dry_run:
+                    continue
+                # 条件写 + rev=1，与 register_route 的 seed 完全同构：
+                # ① attribute_not_exists(require_login)——迁移读快照与写入之间
+                #    若有部署把权限 seed 进来了，绝不能用路由表旧值（可能是
+                #    "org"）盖掉刚 seed 的更紧策略（upsert_site 无条件写做不到
+                #    这一点）；条件失败按 skipped 处理。
+                # ② permissions_rev 推到 1——两个 organic seeder 都写 1，缺失
+                #    会让 register_route 的 ConditionCheck 察觉不到迁移这次
+                #    初始化（它的注释里写明了这个坑）。
+                try:
+                    boto3.resource("dynamodb").Table(
+                        os.environ["SITES_TABLE"]).update_item(
+                        Key={"site_id": site_id},
+                        UpdateExpression=(
+                            "SET require_login = :rl, allowed_users = :au, "
+                            "collaborators = if_not_exists(collaborators, :co), "
+                            # spec §3.4 列了 owner：sites 行缺 owner 时从路由表
+                            # 回填（一期 mark_job 每次部署都写 owner，缺失是
+                            # 异常数据；不回填的话 role_of 对所有人 ROLE_NONE，
+                            # 真 owner 失去自己站点的访问权）。已有则不动。
+                            "#o = if_not_exists(#o, :own), "
+                            "permissions_updated_at = :t, "
+                            "permissions_updated_by = :by, "
+                            "permissions_rev = :one"),
+                        ConditionExpression="attribute_not_exists(require_login)",
+                        ExpressionAttributeNames={"#o": "owner"},
+                        ExpressionAttributeValues={
+                            ":rl": require_login, ":au": allowed, ":co": [],
+                            ":own": owner, ":t": permissions.now_iso(),
+                            ":by": "migration", ":one": 1})
+                except botocore.exceptions.ClientError as e:
+                    if (e.response["Error"]["Code"]
+                            != "ConditionalCheckFailedException"):
+                        raise
+                    # 期间有部署 seed 了真源：它的值更新鲜，让位
+                    report["migrated"].pop()
+                    report["planned"].pop(site_id, None)
+                    report["skipped"].append(site_id)
+            except Exception as e:                        # noqa: BLE001
+                report["errors"].append(
+                    f"{item.get('site_id', {}).get('S', '?')}: "
+                    f"{type(e).__name__}: {e}")
     return report
 
 
@@ -114,7 +187,13 @@ def main() -> None:
     report = migrate(cfg["Platform"]["routing_table"], dry_run=not args.apply)
     mode = "APPLY" if args.apply else "DRY-RUN"
     print(f"[{mode}] 扫描 {report['scanned']} 条路由")
-    print(f"  迁移: {len(report['migrated'])} {report['migrated']}")
+    # 逐条打印"将写什么值"——dry-run 是唯一的人工审查关口，只列 site_id 的话
+    # 任何解析歧义造成的扩权在这里都看不见
+    print(f"  迁移: {len(report['migrated'])}")
+    for sid in report["migrated"]:
+        p = report["planned"][sid]
+        print(f"    - {sid} → require_login={p['require_login']} "
+              f"allowed_users={p['allowed_users']}")
     print(f"  跳过（已有真源）: {len(report['skipped'])} {report['skipped']}")
     if report["errors"]:
         print(f"  问题: {len(report['errors'])}")
