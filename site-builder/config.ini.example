@@ -3,12 +3,19 @@ base_domain = example.com
 account_id = 000000000000
 region = us-east-1
 routing_table = ApplicationWebRouterStack-subdomain-mapping
+# 首个平台管理员邮箱（部署脚本幂等写入 site-admins 表）。
+# 之后的管理员增删在控制台完成，不需要改这里重部署。
+admin_seed =
 
 [Cognito]
 user_pool_id =
 domain =
 site_client_id =
 mcp_client_id =
+# 二期 M4：key-proxy 用的 client_credentials 客户端。
+# **M1 不创建**——client_credentials 只能授 resource server 的 custom scope，
+# 空 scope 会被 Cognito 跨字段校验拒绝。M4 建 resource server 时一并创建并回填。
+machine_client_id =
 
 [DSQL]
 cluster_endpoint =
@@ -16,6 +23,7 @@ cluster_endpoint =
 [Deployer]
 jobs_table = site-deploy-jobs
 sites_table = site-sites
+admins_table = site-admins
 artifacts_bucket = site-artifacts-{account_id}
 frontend_bucket = site-frontend-{account_id}
 state_machine_arn =

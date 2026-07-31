@@ -32,6 +32,21 @@ class SiteDeployerStack(Stack):
                           partition_key=ddb.Attribute(name="site_id", type=ddb.AttributeType.STRING),
                           billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
                           removal_policy=RemovalPolicy.DESTROY)
+        # 二期：list_my_sites / 控制台按 owner 查（替掉全表 Scan）。
+        # 无 sort key——站点数量级小，按 owner 一次 query 即可。
+        sites.add_global_secondary_index(
+            index_name="owner-index",
+            partition_key=ddb.Attribute(name="owner", type=ddb.AttributeType.STRING))
+
+        # 二期：平台管理员名单。首个管理员由 deploy 脚本从 config.ini
+        # [Platform] admin_seed 幂等注入；之后由控制台增删（不走重部署）。
+        # RETAIN 是有意为之：名单误删会让平台失去管理入口，与 jobs/sites 的
+        # DESTROY 语义不同——删栈时保留此表。
+        admins = ddb.Table(self, "Admins", table_name="site-admins",
+                           partition_key=ddb.Attribute(name="email",
+                                                       type=ddb.AttributeType.STRING),
+                           billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
+                           removal_policy=RemovalPolicy.RETAIN)
 
         artifacts = s3.Bucket(self, "Artifacts", bucket_name=f"site-artifacts-{ACCOUNT}",
                               block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
@@ -130,6 +145,7 @@ class SiteDeployerStack(Stack):
             exec_role.add_to_policy(stmt)
 
         for k, v in {"JobsTable": jobs.table_name, "SitesTable": sites.table_name,
+                     "AdminsTable": admins.table_name,
                      "ArtifactsBucket": artifacts.bucket_name,
                      "PackageProjectName": package_project.project_name,
                      "ExecRoleArn": exec_role.role_arn,
@@ -141,6 +157,7 @@ class SiteDeployerStack(Stack):
         contract_dir = str(Path(__file__).parents[2] / "contract" / "src")
         common_env = {
             "JOBS_TABLE": jobs.table_name, "SITES_TABLE": sites.table_name,
+            "ADMINS_TABLE": admins.table_name,
             "ARTIFACTS_BUCKET": artifacts.bucket_name,
             "FRONTEND_BUCKET": f"site-frontend-{ACCOUNT}",
             "ROUTING_TABLE": CFG["Platform"]["routing_table"],
