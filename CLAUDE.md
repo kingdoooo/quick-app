@@ -27,6 +27,10 @@ cd site-builder/mcp      && python3 -m pytest tests -q       # 23 tests
 
 单测跑法：`.venv/bin/pytest tests/test_xxx.py::test_name -q`。
 
+deployer 的 CDK 模板断言（`tests/test_infra_tables.py`）默认 skip；要真跑必须
+带 PYTHONPATH 桥接（aws_cdk 只在 `infra/.venv`，不带时会报错而非静默 skip）：
+`cd site-builder/deployer && PYTHONPATH="$PWD/infra/.venv/lib/python3.12/site-packages" SB_CDK_TESTS=1 .venv/bin/pytest tests/test_infra_tables.py -q`（synth 需 Docker）。
+
 venv 的 shebang 是绝对路径：仓库被移动/克隆到新路径后必须
 `python3 -m venv --clear .venv` 重建（不带 `--clear` 不会重写 shebang，一直报
 bad interpreter）。

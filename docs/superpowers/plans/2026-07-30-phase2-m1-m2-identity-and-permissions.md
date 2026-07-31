@@ -364,7 +364,7 @@ def assert_can(email: str, site: dict | None, action: str, *,
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cd site-builder/deployer && .venv/bin/pytest tests/test_permissions.py -q`
-Expected: PASS（22 passed）
+Expected: PASS（37 passed——13 个普通用例 + 4 个 parametrize × 6；实施时实测）
 
 - [ ] **Step 5: 提交**
 
@@ -386,6 +386,13 @@ git commit -m "feat(permissions): 角色判定模块（owner/collaborator/admin 
 
 **Interfaces:**
 - Consumes: Task 1 的 `role_of` / `assert_can` / `PermissionDenied`；`common.upsert_site`、`common.get_site`
+- **随本任务一并落进 `common.py`**（实施时发现的排序缺陷：下面两个 helper 原计划
+  在 Task 4 才建，但本任务的 `_site_or_raise(consistent=True)` 与 `list_admins`
+  已经用到——Task 4 的代码块里它们保持原样，落地时确认已存在即可）：
+  - `common.get_site_consistent(site_id)`（强一致读）
+  - `common._paginate(method, **kwargs)`（query/scan 分页汇总）
+  两段代码按 Task 4 Step 4 的 verbatim 块转录，Modify 清单相应加
+  `site-builder/deployer/functions/common.py`。
 - Produces:
   - `is_admin(email: str) -> bool`（读 `ADMINS_TABLE` 环境变量指向的表）
   - `list_admins() -> list[str]`
@@ -485,6 +492,72 @@ def test_remove_nonexistent_admin_is_idempotent_with_many_admins(aws):
     perm.add_admin("b@x.com", added_by="seed")
     perm.remove_admin("ghost@x.com")
     assert perm.list_admins() == ["a@x.com", "b@x.com"]
+
+
+def test_remove_admin_rejects_sentinel_and_garbage(aws):
+    """__count__ 是调用方可达输入（控制台/MCP 参数直通）。
+
+    不拦的话：事务的 Delete 与 Update 同落 __count__ 一个 item——DynamoDB 抛
+    ValidationException（不是 TransactionCanceledException），穿过分流变成
+    不可读 500；侥幸执行则删掉计数 sentinel 本身。与 add_admin 的入口校验对称。
+    """
+    perm.add_admin("a@x.com", added_by="seed")
+    with pytest.raises(ValueError):
+        perm.remove_admin("__count__")
+    with pytest.raises(ValueError):
+        perm.remove_admin("not-an-email")
+    assert perm.list_admins() == ["a@x.com"]   # sentinel 与名单都毫发无损
+
+
+def _conflict_injecting_client(monkeypatch, fail_times: int):
+    """让前 fail_times 次 transact_write_items 抛 TransactionConflict。
+
+    覆盖 add_admin 的退避重试与 remove_admin 的冲突转 409——这两个分支
+    若绕开 _ddb_client hook 就永远注入不了（错误实现照样全绿）。
+    """
+    import botocore.exceptions
+    state = {"n": 0}
+    real_factory = perm._ddb_client
+
+    def _factory():
+        client = real_factory()
+        real = client.transact_write_items
+
+        def _wrapped(**kw):
+            if state["n"] < fail_times:
+                state["n"] += 1
+                raise botocore.exceptions.ClientError(
+                    {"Error": {"Code": "TransactionCanceledException",
+                               "Message": "cancelled"},
+                     "CancellationReasons": [
+                         {"Code": "TransactionConflict"},
+                         {"Code": "TransactionConflict"}]},
+                    "TransactWriteItems")
+            return real(**kw)
+
+        client.transact_write_items = _wrapped
+        return client
+
+    monkeypatch.setattr(perm, "_ddb_client", _factory)
+    return state
+
+
+def test_add_admin_retries_through_transaction_conflict(aws, monkeypatch):
+    """并发写 __count__ 的 TransactionConflict：退避重试后成功，不吞不炸。"""
+    state = _conflict_injecting_client(monkeypatch, fail_times=2)
+    perm.add_admin("a@x.com", added_by="seed")
+    assert state["n"] == 2                      # 确实经历了两次冲突
+    assert perm.is_admin("a@x.com") is True     # 第三次成功落库
+
+
+def test_remove_admin_conflict_becomes_permission_conflict(aws, monkeypatch):
+    """remove_admin 遇 TransactionConflict 必须转成可读的 PermissionConflict。"""
+    perm.add_admin("a@x.com", added_by="seed")
+    perm.add_admin("b@x.com", added_by="seed")
+    _conflict_injecting_client(monkeypatch, fail_times=1)
+    with pytest.raises(perm.PermissionConflict):
+        perm.remove_admin("a@x.com")
+    assert perm.is_admin("a@x.com") is True     # 冲突时未删成，如实报告
 
 
 def test_normalize_allowed_users_org():
@@ -966,8 +1039,10 @@ def add_admin(email: str, added_by: str) -> None:
     import botocore.exceptions
     if not EMAIL_RE.fullmatch(email or ""):
         raise ValueError(f"非法邮箱: {email!r}")
-    ddb = boto3.client("dynamodb",
-                       region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+    # 经 _ddb_client() 取 client（而不是就地 boto3.client）：测试要能注入
+    # TransactionConflict 才能覆盖下面的退避重试分支——绕开这个 hook 会让
+    # 冲突分支永远测不到（错误实现照样全绿）。
+    ddb = _ddb_client()
     table = os.environ["ADMINS_TABLE"]
     items = [
         {"Put": {"TableName": table,
@@ -1029,10 +1104,17 @@ def remove_admin(email: str) -> None:
     存在性与"不是最后一个"全部交给事务条件判定：
       - Delete 带 attribute_exists(email)：不存在 → 条件失败 → 幂等成功；
       - sentinel 带 n > 1：删到只剩一个 → 条件失败 → 拒绝。
+
+    **入口必须验邮箱格式**（与 add_admin 对称）：`__count__` 是调用方可达输入
+    （M3 控制台 / MCP 工具的参数），而 email="__count__" 时事务的 Delete 与
+    Update 落在同一个 item 上——DynamoDB 对"同一事务多次操作同一 item"抛的是
+    **ValidationException 而非 TransactionCanceledException**，会穿过下面的
+    分流变成不可读的 500；更糟的是若它侥幸执行，删掉的是计数 sentinel 本身。
     """
     import botocore.exceptions
-    ddb = boto3.client("dynamodb",
-                       region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+    if not EMAIL_RE.fullmatch(email or ""):
+        raise ValueError(f"非法邮箱: {email!r}")
+    ddb = _ddb_client()   # 同 add_admin：走 hook，冲突分支才可注入测试
     table = os.environ["ADMINS_TABLE"]
     try:
         ddb.transact_write_items(TransactItems=[
@@ -1106,8 +1188,11 @@ _ALLOW_ROUTE_ABSENT = True
 def allowed_users_av(allowed) -> dict:
     """allowed_users 的 DynamoDB AttributeValue：字面量 org 用 S，名单用 L。
 
-    Edge 的 _deser 必须已支持 L——否则名单会被读成 False，站点变成
-    "全员放行"。部署顺序：Edge 先上，写侧后上。
+    Edge 的 _deser 必须已支持 L——否则名单会被读成 False，名单站点变成
+    "仅 owner 可访问"（json.loads(False) 抛异常 → 空名单，fail-closed）：
+    合法名单成员全部 403，等于鉴权站点大面积宕机。部署顺序：Edge 先上，
+    写侧后上——顺序颠倒是可用性事故（锁死），不是数据暴露；应急处置是
+    先部署 Edge 的 L 支持，而不是回滚 Edge。
     """
     if allowed == "org":
         return {"S": "org"}
@@ -1412,7 +1497,7 @@ git commit -m "feat(permissions): admin 名单与权限写入（访问策略/协
 Code.from_asset(bundling=...) —— synth 阶段就会起 Docker 装 psycopg。
 所以默认不跑，需要时显式开：
 
-    SB_CDK_TESTS=1 .venv/bin/pytest tests/test_infra_tables.py -q
+    PYTHONPATH="$PWD/infra/.venv/lib/python3.12/site-packages" SB_CDK_TESTS=1 .venv/bin/pytest tests/test_infra_tables.py -q
 
 日常回归靠"部署后 describe-table 真机核对"（见本任务 Step 5 与 Task 9）。
 """
@@ -1470,7 +1555,7 @@ def test_step_lambdas_get_admins_table_env(template):
 
 - [ ] **Step 2: 运行测试确认失败**
 
-Run: `cd site-builder/deployer && SB_CDK_TESTS=1 .venv/bin/pytest tests/test_infra_tables.py -q`
+Run: `cd site-builder/deployer && PYTHONPATH="$PWD/infra/.venv/lib/python3.12/site-packages" SB_CDK_TESTS=1 .venv/bin/pytest tests/test_infra_tables.py -q`
 Expected: FAIL — sites 表没有 `GlobalSecondaryIndexes`；`site-admins` 表不存在
 （首次运行会拉 Docker 镜像装 psycopg，耗时几分钟；Docker 未运行则报
 `Cannot connect to the Docker daemon`——此时跳过本文件，靠 Step 5 的 synth
@@ -1518,7 +1603,7 @@ exec role 的 DynamoDB 语句已经是 `table/site-*` 前缀通配（当前 106-
 
 - [ ] **Step 4: 运行测试确认通过**
 
-Run: `cd site-builder/deployer && SB_CDK_TESTS=1 .venv/bin/pytest tests/test_infra_tables.py -q`
+Run: `cd site-builder/deployer && PYTHONPATH="$PWD/infra/.venv/lib/python3.12/site-packages" SB_CDK_TESTS=1 .venv/bin/pytest tests/test_infra_tables.py -q`
 Expected: PASS（3 passed）
 
 - [ ] **Step 5: 确认 exec role 覆盖新表**
@@ -1657,7 +1742,10 @@ Expected: FAIL — `AttributeError: module 'common' has no attribute 'list_sites
 
 - [ ] **Step 4: 写实现**
 
-在 `site-builder/deployer/functions/common.py` 的 `get_site` 之后追加：
+在 `site-builder/deployer/functions/common.py` 的 `get_site` 之后追加。
+**注意：`get_site_consistent` 与 `_paginate` 已在 Task 2 落地**（Task 2 的
+权限写入就依赖它们，见该任务 Interfaces 的排序缺陷说明）——若已存在则跳过
+这两段、只加 `list_sites_by_owner` / `list_sites_for_user`：
 
 ```python
 def get_site_consistent(site_id: str) -> dict | None:
@@ -1802,12 +1890,18 @@ def test_register_route_refuses_stale_snapshot(aws, monkeypatch):
 
     real_get_site = common.get_site_consistent
     calls = {"n": 0}
+    tx_attempts = {"n": 0}
 
     def _racing_get_site(site_id):
         site = real_get_site(site_id)   # real_get_site = common.get_site_consistent
         calls["n"] += 1
-        if calls["n"] == 1:
-            # 第一次读之后、写路由之前，别人把权限收紧了（rev 推进）
+        if calls["n"] == 2:
+            # **必须在第 2 次读（循环内的读）之后注入**。第 1 次读是 handler
+            # 顶部 seed 前的预读——在那儿注入的话，循环读到的已经是收紧后的
+            # 新值，第一笔事务直接成功，重试路径从未执行：把 ConditionCheck
+            # 整个删掉、MAX_ROUTE_ATTEMPTS 改 1，测试照样全绿（moto 实测，
+            # 上一版正是这么假绿的）。在循环读之后注入，循环拿到的才是
+            # 陈旧快照，事务被 rev 条件取消，才走到重读重试。
             common.upsert_site(site_id, require_login=True,
                                allowed_users=["vip@x.com"], permissions_rev=1)
         return site
@@ -1816,16 +1910,138 @@ def test_register_route_refuses_stale_snapshot(aws, monkeypatch):
     # patch get_site 的话回调根本不会执行，测试变成空跑。
     monkeypatch.setattr(register_route.common, "get_site_consistent",
                         _racing_get_site)
-    register_route.handler({"job_id": job_id, "site_id": "s-1", "api_target": "",
-                            "manifest": {"auth": {"require_login": False,
-                                                  "allowed_users": "org"}}}, None)
+
+    # 数事务次数：只断言最终路由状态无法区分"条件事务重试后成稿"与
+    # "根本没有条件保护、一把裸写"。>=2 才证明第一笔被取消、重试发生过。
+    real_client = boto3.client
+
+    def _counting_client(*args, **kwargs):
+        client = real_client(*args, **kwargs)
+        if args and args[0] == "dynamodb":
+            real_tx = client.transact_write_items
+
+            def _wrapped(**kw):
+                tx_attempts["n"] += 1
+                return real_tx(**kw)
+
+            client.transact_write_items = _wrapped
+        return client
+
+    monkeypatch.setattr(register_route.boto3, "client", _counting_client)
+    out = register_route.handler(
+        {"job_id": job_id, "site_id": "s-1", "api_target": "",
+         "manifest": {"auth": {"require_login": False,
+                               "allowed_users": "org"}}}, None)
 
     item = boto3.client("dynamodb").get_item(
         TableName="routing", Key={"subdomain": {"S": "app-s-1"}})["Item"]
-    # 最终必须是收紧后的策略，而不是第一次读到的"公开"
+    # 最终必须是收紧后的策略，而不是循环第一次读到的"公开"
     assert item["require_auth"]["BOOL"] is True
     assert item["allowed_users"]["L"] == [{"S": "vip@x.com"}]
     assert int(item["permissions_rev"]["N"]) == 1
+    assert tx_attempts["n"] >= 2        # 第一笔被 rev 条件取消 → 真的重试了
+    # effective_auth 必须来自最终成稿的那次快照（不是重试前的旧快照）——
+    # 它喂给 smoke_test，取错快照会把成功部署判成 FAILED（Task 5b）。
+    assert out["effective_auth"] == {"require_login": True,
+                                     "allowed_users": ["vip@x.com"]}
+
+
+def test_register_route_gives_up_after_max_attempts(aws, monkeypatch):
+    """重试耗尽必须让部署 FAILED——绝不用旧快照把路由写回公开。
+
+    每次循环读之后都推进 rev（持续冲突），三次全被取消后应抛 RuntimeError，
+    且路由表里没有 item（宁可失败也不留下陈旧的公开状态）。
+    MAX_ROUTE_ATTEMPTS 改 1 或删掉 ConditionCheck 都会让本测试失败。
+    """
+    import boto3
+    import common
+    import register_route
+    common.upsert_site("s-1", owner="o@x.com", require_login=False,
+                       allowed_users="org", collaborators=[], permissions_rev=0)
+    job_id = common.create_job("o@x.com", "s-1")
+    real = common.get_site_consistent
+    state = {"rev": 0, "reads": 0}
+
+    def _always_racing(site_id):
+        site = real(site_id)
+        state["reads"] += 1
+        if state["reads"] >= 2:                 # 循环内的每次读之后都被人抢先
+            state["rev"] += 1
+            common.upsert_site(site_id, permissions_rev=state["rev"] + 100)
+        return site
+
+    monkeypatch.setattr(register_route.common, "get_site_consistent",
+                        _always_racing)
+    with pytest.raises(RuntimeError, match="并发修改"):
+        register_route.handler(
+            {"job_id": job_id, "site_id": "s-1", "api_target": "",
+             "manifest": {"auth": {"require_login": False,
+                                   "allowed_users": "org"}}}, None)
+    assert "Item" not in boto3.client("dynamodb").get_item(
+        TableName="routing", Key={"subdomain": {"S": "app-s-1"}})
+
+
+def test_seed_reraises_non_conditional_errors(aws, monkeypatch):
+    """seed 的 except 只放过 ConditionalCheckFailed；其余错误必须如实上抛。
+
+    把这个分支放宽成裸 pass 的后果：seed 静默失败 → site 行没有权限字段 →
+    _route_item 回落 allowed_users="org"——指定名单被放大成全体可信 IdP 用户
+    （fail-open）。本测试锁死"其他 ClientError 不被吞"。
+    """
+    import botocore.exceptions
+    import common
+    import register_route
+    common.upsert_site("s-1", owner="o@x.com")
+    job_id = common.create_job("o@x.com", "s-1")
+
+    class _BoomTable:
+        def update_item(self, **kw):
+            raise botocore.exceptions.ClientError(
+                {"Error": {"Code": "ProvisionedThroughputExceededException",
+                           "Message": "throttled"}}, "UpdateItem")
+
+    class _BoomResource:
+        def Table(self, name):
+            return _BoomTable()
+
+    monkeypatch.setattr(register_route.boto3, "resource",
+                        lambda *a, **kw: _BoomResource())
+    with pytest.raises(botocore.exceptions.ClientError):
+        register_route.handler(
+            {"job_id": job_id, "site_id": "s-1", "api_target": "",
+             "manifest": {"auth": {"require_login": True,
+                                   "allowed_users": ["a@x.com"]}}}, None)
+
+
+def test_missing_require_login_defaults_closed(aws, monkeypatch):
+    """sites 快照意外缺 require_login 时按"需要登录"投影（fail-closed）。
+
+    这一行默认值是数据异常与"站点全公开"之间唯一的闸门——把
+    site.get("require_login", True) 的默认改成 False，本测试必须失败。
+    正常路径下 seed 会补齐该字段、moto 强一致读立即可见，默认分支跑不到，
+    所以直接注入"缺字段的快照"（模拟真实 DynamoDB 的异常数据/延迟形态）。
+    **快照必须带 permissions_rev=1**：seed 在真实行上执行并把 rev 推到 1，
+    快照 rev 与之不符会让 ConditionCheck 三连败抛 RuntimeError，测试测不到
+    目标（moto 实测：rev 缺失/0 都 RuntimeError，rev=1 才走到投影）。
+    """
+    import boto3
+    import common
+    import register_route
+    common.upsert_site("s-1", owner="o@x.com")
+    job_id = common.create_job("o@x.com", "s-1")
+    anomalous = {"site_id": "s-1", "owner": "o@x.com", "permissions_rev": 1,
+                 "allowed_users": ["a@x.com"], "collaborators": []}
+    monkeypatch.setattr(register_route.common, "get_site_consistent",
+                        lambda sid: dict(anomalous))
+    out = register_route.handler(
+        {"job_id": job_id, "site_id": "s-1", "api_target": "",
+         "manifest": {"auth": {"require_login": False,   # 故意给 False：
+                               "allowed_users": ["a@x.com"]}}}, None)
+    # manifest 是 False 而快照缺字段——默认必须压过 manifest 的诱导，投影 True
+    item = boto3.client("dynamodb").get_item(
+        TableName="routing", Key={"subdomain": {"S": "app-s-1"}})["Item"]
+    assert item["require_auth"]["BOOL"] is True
+    assert out["effective_auth"]["require_login"] is True
 
 
 def test_register_route_seed_does_not_overwrite_concurrent_online_change(aws):
@@ -1997,8 +2213,11 @@ def _seed_permissions_if_absent(site_id: str, manifest_auth: dict,
                 # 后续 ConditionCheck 察觉不到中间发生过初始化。
                 ":one": 1})
     except botocore.exceptions.ClientError as e:
+        # ConditionalCheckFailed = 真源已存在：用它的值，不覆盖（幂等吞掉）。
+        # 其余错误（限流、校验……）必须如实上抛——放宽成裸 pass 会让 seed
+        # 静默失败，_route_item 回落 allowed_users="org"（fail-open 扩权）。
         if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
-            raise   # 真源已存在：用它的值，不覆盖
+            raise
 
 
 def _route_item(event, site: dict, owner: str, subdomain: str) -> dict:
@@ -2100,7 +2319,8 @@ bash site-builder/scripts/scan_staged_secrets.sh || exit 1   # 命中即阻断�
 git commit -m "feat(deployer): register_route 权限取自 sites 表（真源），allowed_users 投影为 L
 
 部署顺序约束：本改动写入 DynamoDB L 类型，必须在 Edge 的 _deser 支持 L
-之后才能部署到生产，否则名单会被 Edge 读成 False（全员放行）。"
+之后才能部署到生产，否则名单会被 Edge 读成 False（空名单 fail-closed，
+  名单站点锁死）。"
 ```
 
 ---
@@ -2465,8 +2685,9 @@ def test_malformed_allowlist_errors_and_does_not_widen(aws):
     out = mig.migrate("routing", dry_run=False)
     assert out["migrated"] == []
     assert out["errors"] and "s-bad" in out["errors"][0]
-    # 真源没被写入任何权限字段，Edge 继续按现行 fail-closed 行为工作
-    assert "allowed_users" not in common.get_site("s-bad")
+    # 真源没被写入**任何**权限字段（只查 allowed_users 抓不到"写了一半"——
+    # 比如只写了 require_login，下游 get 的默认值照样把名单放大成 org）
+    assert not (PERMISSION_FIELDS & set(common.get_site("s-bad")))
 
 
 def test_reports_route_without_site_record(aws):
@@ -2474,6 +2695,137 @@ def test_reports_route_without_site_record(aws):
     _put_route("app-ghost", "ghost")     # sites 表没有对应记录
     out = mig.migrate("routing", dry_run=False)
     assert out["errors"] and "ghost" in out["errors"][0]
+
+
+PERMISSION_FIELDS = {"require_login", "allowed_users", "collaborators",
+                     "permissions_updated_at", "permissions_updated_by",
+                     "permissions_rev"}
+
+
+@pytest.mark.parametrize("av", [
+    {"SS": ["vip@x.com", "boss@x.com"]},   # 人在控制台修名单最容易选的类型
+    {"NULL": True},
+    {"N": "0"},
+    {"BOOL": False},
+])
+def test_unknown_attribute_type_errors_and_does_not_widen(aws, av):
+    """SS/NULL/N/BOOL 形态的 allowed_users 必须进 errors，绝不落成 "org"。
+
+    raw.get("S", "org") 的写法会让这些类型双双错过 S/L 分支、静默扩权成
+    全组织放行——而 spec §3.4 的救济流程（人工手修路由表）恰好会产出 SS。
+    Edge 对这些类型的现行为是 fail-closed（读成 False → 空名单），迁移
+    绝不能比 Edge 更宽。
+    """
+    import boto3
+    import common
+    import migrate_permissions as mig
+    common.upsert_site("s-odd", owner="o@x.com")
+    boto3.client("dynamodb").put_item(TableName="routing", Item={
+        "subdomain": {"S": "app-s-odd"}, "site_id": {"S": "s-odd"},
+        "route_mode": {"S": "split"}, "static_prefix": {"S": "sites/s-odd/j"},
+        "api_target": {"S": ""}, "require_auth": {"BOOL": True},
+        "allowed_users": av, "owner": {"S": "o@x.com"}})
+    out = mig.migrate("routing", dry_run=False)
+    assert out["migrated"] == []
+    assert out["errors"] and "s-odd" in out["errors"][0]
+    # 一个权限字段都不许写（半套写入照样把下游默认放大成 org）
+    assert not (PERMISSION_FIELDS & set(common.get_site("s-odd")))
+
+
+def test_absent_allowed_users_attribute_falls_back_to_org(aws):
+    """属性整体缺失（极老的路由 item）回落 "org"——与 Edge 的默认一致。
+
+    这与"present 但类型不对"是两回事：后者必须报错（上一测试）。
+    """
+    import boto3
+    import common
+    import migrate_permissions as mig
+    common.upsert_site("s-old", owner="o@x.com")
+    boto3.client("dynamodb").put_item(TableName="routing", Item={
+        "subdomain": {"S": "app-s-old"}, "site_id": {"S": "s-old"},
+        "route_mode": {"S": "split"}, "static_prefix": {"S": "sites/s-old/j"},
+        "api_target": {"S": ""}, "require_auth": {"BOOL": True},
+        "owner": {"S": "o@x.com"}})   # 无 allowed_users 属性
+    out = mig.migrate("routing", dry_run=False)
+    assert out["migrated"] == ["s-old"]
+    assert common.get_site("s-old")["allowed_users"] == "org"
+
+
+def test_dry_run_writes_no_permission_field_at_all(aws):
+    """dry-run 必须一个权限字段都不写——只断言 require_login 抓不到
+    "漏写了一半"的 bug（比如只把 allowed_users 写成了 org）。"""
+    import common
+    import migrate_permissions as mig
+    common.upsert_site("s-3", owner="o@x.com")
+    _put_route("app-s-3", "s-3")
+    out = mig.migrate("routing", dry_run=True)
+    assert out["migrated"] == ["s-3"]
+    assert out["planned"]["s-3"] == {"require_login": True,
+                                     "allowed_users": "org"}
+    assert not (PERMISSION_FIELDS & set(common.get_site("s-3")))
+
+
+def test_one_malformed_route_does_not_abort_scan(aws):
+    """一条畸形路由（L 里混 NULL）不得中止扫描——apply 中止 = 半套迁移 + 无报告。"""
+    import boto3
+    import common
+    import migrate_permissions as mig
+    common.upsert_site("s-good1", owner="o@x.com")
+    common.upsert_site("s-bad", owner="o@x.com")
+    common.upsert_site("s-good2", owner="o@x.com")
+    _put_route("app-s-good1", "s-good1")
+    boto3.client("dynamodb").put_item(TableName="routing", Item={
+        "subdomain": {"S": "app-s-bad"}, "site_id": {"S": "s-bad"},
+        "route_mode": {"S": "split"}, "static_prefix": {"S": "sites/s-bad/j"},
+        "api_target": {"S": ""}, "require_auth": {"BOOL": True},
+        "allowed_users": {"L": [{"S": "a@x.com"}, {"NULL": True}]},
+        "owner": {"S": "o@x.com"}})
+    _put_route("app-s-good2", "s-good2")
+    out = mig.migrate("routing", dry_run=False)
+    assert sorted(out["migrated"]) == ["s-good1", "s-good2"]   # 两条好的都完成
+    assert out["errors"] and "s-bad" in out["errors"][0]
+    assert "require_login" in common.get_site("s-good2")       # 真的写进去了
+
+
+def test_concurrent_seed_wins_over_migration(aws, monkeypatch):
+    """迁移读快照后、写入前，部署把权限 seed 进来了 → 迁移必须让位。
+
+    upsert_site 式的无条件写会用路由表旧值（org）盖掉刚 seed 的更紧名单；
+    条件写 attribute_not_exists(require_login) 失败时按 skipped 处理。
+    """
+    import common
+    import migrate_permissions as mig
+    common.upsert_site("s-race", owner="o@x.com")
+    _put_route("app-s-race", "s-race", allowed="org")
+    real_get_site = common.get_site
+
+    def _seed_after_read(site_id):
+        site = real_get_site(site_id)
+        if site_id == "s-race" and site is not None:
+            # 部署链的 seed 抢在迁移写入之前落库（更紧的名单 + rev=1）
+            common.upsert_site(site_id, require_login=True,
+                               allowed_users=["vip@x.com"], permissions_rev=1)
+        return site
+
+    # migrate() 在函数体内 import common——拿到的是 sys.modules 里同一个模块
+    # 对象，patch common.get_site 即可命中
+    monkeypatch.setattr(common, "get_site", _seed_after_read)
+    out = mig.migrate("routing", dry_run=False)
+    assert out["migrated"] == []
+    assert out["skipped"] == ["s-race"]
+    # seed 的名单毫发无损，没被路由表的 "org" 盖掉
+    assert common.get_site("s-race")["allowed_users"] == ["vip@x.com"]
+
+
+def test_migrated_row_advances_rev_to_one(aws):
+    """迁移写入的行必须带 permissions_rev=1，与两个 organic seeder 同构——
+    缺失会让 register_route 的 ConditionCheck 察觉不到这次初始化。"""
+    import common
+    import migrate_permissions as mig
+    common.upsert_site("s-rev", owner="o@x.com")
+    _put_route("app-s-rev", "s-rev")
+    mig.migrate("routing", dry_run=False)
+    assert int(common.get_site("s-rev")["permissions_rev"]) == 1
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -2514,13 +2866,20 @@ sys.path.insert(0, str(HERE.parent / "deployer" / "functions"))
 
 
 def _load_config() -> None:
-    """从 config.ini 填好 common/permissions 需要的环境变量。"""
+    """从 config.ini 填好 common/permissions 需要的环境变量。
+
+    **直接赋值，不用 setdefault**：config.ini 是部署脚本的唯一取值来源
+    （CLAUDE.md），setdefault 会让 shell 里残留的旧 SITES_TABLE 静默改写
+    写入目标。config.ini 缺失时立刻报错，不留到 KeyError('Deployer')。
+    """
+    path = HERE.parent / "config.ini"
+    if not path.exists():
+        raise SystemExit(f"找不到 {path}——从 config.ini.example 复制并填好再跑")
     cfg = configparser.ConfigParser()
-    cfg.read(HERE.parent / "config.ini")
-    os.environ.setdefault("SITES_TABLE", cfg["Deployer"]["sites_table"])
-    os.environ.setdefault("JOBS_TABLE", cfg["Deployer"]["jobs_table"])
-    os.environ.setdefault("ADMINS_TABLE", cfg["Deployer"]["admins_table"])
-    os.environ.setdefault("AWS_DEFAULT_REGION", cfg["Platform"]["region"])
+    cfg.read(path)
+    os.environ["SITES_TABLE"] = cfg["Deployer"]["sites_table"]
+    os.environ["ADMINS_TABLE"] = cfg["Deployer"]["admins_table"]
+    os.environ["AWS_DEFAULT_REGION"] = cfg["Platform"]["region"]
 
 
 class UnparsableAllowlist(ValueError):
@@ -2534,10 +2893,26 @@ def _parse_allowed(raw) -> str | list[str]:
     空名单（仅 owner 可访问，fail-closed，origin_request.py:308-315）。若迁移
     把它写成 "org"，下一次部署会把这个值投影到路由表，权限从"仅 owner"扩大成
     "全体登录用户"——一次数据修复动作变成扩权。见 spec §3.4。
+
+    **未知 AttributeValue 类型同样必须抛错**：不能写 raw.get("S", "org")——
+    SS/NULL/N/BOOL 会双双错过 S 和 L 分支、静默落成 "org"（moto 探针实锤过）。
+    这不是理论场景：spec §3.4 的救济流程就是"人工判断原意后手工修"，而人在
+    DynamoDB 控制台给字符串列表选的类型就是 String Set——修完一重跑，owner-only
+    变全组织放行。只有"属性整体缺失"才回落 "org"（Edge 的默认正是如此：
+    route.get("allowed_users", "org")）。
     """
     if "L" in raw:                       # 已是二期形态
-        return [e["S"] for e in raw["L"]]
-    value = raw.get("S", "org")
+        members = raw["L"]
+        if not all(isinstance(e, dict) and "S" in e for e in members):
+            raise UnparsableAllowlist(
+                f"allowed_users 的 L 含非字符串成员: {members!r}")
+        return [e["S"] for e in members]
+    if not raw:                          # 属性缺失：与 Edge 的默认一致
+        return "org"
+    if "S" not in raw:
+        raise UnparsableAllowlist(
+            f"allowed_users 类型不支持（应为 S/L）: {sorted(raw)}")
+    value = raw["S"]
     if value == "org":
         return "org"
     try:
@@ -2550,45 +2925,95 @@ def _parse_allowed(raw) -> str | list[str]:
 
 
 def migrate(routing_table: str, *, dry_run: bool = True) -> dict:
+    import botocore.exceptions
     import common
     import permissions
 
     ddb = boto3.client("dynamodb")
-    report = {"scanned": 0, "migrated": [], "skipped": [], "errors": []}
+    report = {"scanned": 0, "migrated": [], "skipped": [], "errors": [],
+              "planned": {}}
     paginator = ddb.get_paginator("scan")
     for page in paginator.paginate(TableName=routing_table):
         for item in page.get("Items", []):
             report["scanned"] += 1
-            owner = item.get("owner", {}).get("S", "")
-            if owner == "platform":      # auth-service / 控制台等平台路由无站点记录
-                continue
-            site_id = item.get("site_id", {}).get("S", "")
-            site = common.get_site(site_id)
-            if not site:
-                report["errors"].append(
-                    f"路由 {item['subdomain']['S']} 指向的站点 {site_id} 无 sites 记录")
-                continue
-            if "require_login" in site:
-                report["skipped"].append(site_id)
-                continue
+            # 整个单条处理都在 try 里：一条畸形路由（缺 site_id、L 里混 NULL、
+            # 空字符串键……）**不能中止整个扫描**——apply 模式下中止意味着
+            # 半套迁移 + 没有报告，操作者不知道停在哪。逐条収进 errors 继续。
             try:
-                allowed = permissions.normalize_allowed_users(
-                    _parse_allowed(item.get("allowed_users", {})))
-            except ValueError as e:
-                # UnparsableAllowlist 也是 ValueError 的子类，一并落在这里：
-                # 报告并跳过，由人工判断原意后手工修——不自动放宽。
-                report["errors"].append(f"{site_id}: allowed_users 无法规范化（{e}）")
-                continue
-            report["migrated"].append(site_id)
-            if dry_run:
-                continue
-            common.upsert_site(
-                site_id,
-                require_login=bool(item.get("require_auth", {}).get("BOOL", True)),
-                allowed_users=allowed,
-                collaborators=list(site.get("collaborators") or []),
-                permissions_updated_at=permissions.now_iso(),
-                permissions_updated_by="migration")
+                owner = item.get("owner", {}).get("S", "")
+                if owner == "platform":  # auth-service / 控制台等平台路由无站点记录
+                    continue
+                site_id = item.get("site_id", {}).get("S", "")
+                if not site_id:
+                    report["errors"].append(
+                        f"路由 {item.get('subdomain', {}).get('S', '?')} 缺 site_id")
+                    continue
+                site = common.get_site(site_id)
+                if not site:
+                    report["errors"].append(
+                        f"路由 {item['subdomain']['S']} 指向的站点 {site_id} 无 sites 记录")
+                    continue
+                if "require_login" in site:
+                    report["skipped"].append(site_id)
+                    continue
+                try:
+                    allowed = permissions.normalize_allowed_users(
+                        _parse_allowed(item.get("allowed_users", {})))
+                except ValueError as e:
+                    # UnparsableAllowlist 也是 ValueError 的子类，一并落在这里：
+                    # 报告并跳过，由人工判断原意后手工修——不自动放宽。
+                    report["errors"].append(
+                        f"{site_id}: allowed_users 无法规范化（{e}）")
+                    continue
+                require_login = bool(item.get("require_auth", {}).get("BOOL", True))
+                report["migrated"].append(site_id)
+                # planned：给 dry-run 报告看"将写什么值"。没有它，SS→org 这类
+                # 静默扩权在唯一的人工审查关口（dry-run 输出）上是不可见的。
+                report["planned"][site_id] = {"require_login": require_login,
+                                              "allowed_users": allowed}
+                if dry_run:
+                    continue
+                # 条件写 + rev=1，与 register_route 的 seed 完全同构：
+                # ① attribute_not_exists(require_login)——迁移读快照与写入之间
+                #    若有部署把权限 seed 进来了，绝不能用路由表旧值（可能是
+                #    "org"）盖掉刚 seed 的更紧策略（upsert_site 无条件写做不到
+                #    这一点）；条件失败按 skipped 处理。
+                # ② permissions_rev 推到 1——两个 organic seeder 都写 1，缺失
+                #    会让 register_route 的 ConditionCheck 察觉不到迁移这次
+                #    初始化（它的注释里写明了这个坑）。
+                try:
+                    boto3.resource("dynamodb").Table(
+                        os.environ["SITES_TABLE"]).update_item(
+                        Key={"site_id": site_id},
+                        UpdateExpression=(
+                            "SET require_login = :rl, allowed_users = :au, "
+                            "collaborators = if_not_exists(collaborators, :co), "
+                            # spec §3.4 列了 owner：sites 行缺 owner 时从路由表
+                            # 回填（一期 mark_job 每次部署都写 owner，缺失是
+                            # 异常数据；不回填的话 role_of 对所有人 ROLE_NONE，
+                            # 真 owner 失去自己站点的访问权）。已有则不动。
+                            "#o = if_not_exists(#o, :own), "
+                            "permissions_updated_at = :t, "
+                            "permissions_updated_by = :by, "
+                            "permissions_rev = :one"),
+                        ConditionExpression="attribute_not_exists(require_login)",
+                        ExpressionAttributeNames={"#o": "owner"},
+                        ExpressionAttributeValues={
+                            ":rl": require_login, ":au": allowed, ":co": [],
+                            ":own": owner, ":t": permissions.now_iso(),
+                            ":by": "migration", ":one": 1})
+                except botocore.exceptions.ClientError as e:
+                    if (e.response["Error"]["Code"]
+                            != "ConditionalCheckFailedException"):
+                        raise
+                    # 期间有部署 seed 了真源：它的值更新鲜，让位
+                    report["migrated"].pop()
+                    report["planned"].pop(site_id, None)
+                    report["skipped"].append(site_id)
+            except Exception as e:                        # noqa: BLE001
+                report["errors"].append(
+                    f"{item.get('site_id', {}).get('S', '?')}: "
+                    f"{type(e).__name__}: {e}")
     return report
 
 
@@ -2602,7 +3027,13 @@ def main() -> None:
     report = migrate(cfg["Platform"]["routing_table"], dry_run=not args.apply)
     mode = "APPLY" if args.apply else "DRY-RUN"
     print(f"[{mode}] 扫描 {report['scanned']} 条路由")
-    print(f"  迁移: {len(report['migrated'])} {report['migrated']}")
+    # 逐条打印"将写什么值"——dry-run 是唯一的人工审查关口，只列 site_id 的话
+    # 任何解析歧义造成的扩权在这里都看不见
+    print(f"  迁移: {len(report['migrated'])}")
+    for sid in report["migrated"]:
+        p = report["planned"][sid]
+        print(f"    - {sid} → require_login={p['require_login']} "
+              f"allowed_users={p['allowed_users']}")
     print(f"  跳过（已有真源）: {len(report['skipped'])} {report['skipped']}")
     if report["errors"]:
         print(f"  问题: {len(report['errors'])}")
@@ -2619,7 +3050,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cd site-builder/deployer && .venv/bin/pytest tests/test_migrate_permissions.py -q`
-Expected: PASS（6 passed）
+Expected: PASS（7 passed——brief 原写 6，实测 7 个用例）
 
 - [ ] **Step 5: 提交**
 
@@ -2724,8 +3155,11 @@ Expected: FAIL — `_deser` 把 `L` 变成 `False`；`collaborators` 未被识�
 def _deser(item: dict) -> dict:
     """DynamoDB AttributeValue -> plain dict（本表用到的类型：S / BOOL / L / N）。
 
-    新增类型必须在此登记：未识别的类型会落到 False，而 allowed_users 变成
-    False 意味着名单检查被跳过（全员放行）——加字段前先加解析。
+    新增类型必须在此登记：未识别的类型会落到 False。落点不同后果不同——
+    allowed_users 变 False 是 fail-closed（json.loads(False) 抛异常 → 空名单
+    → 仅 owner/协作者可访问，名单成员全 403 = 宕机）；**require_auth 变 False
+    才是灾难**（`if not route.get("require_auth")` 直接放行 = 鉴权整段关闭，
+    站点全公开）。加字段前先加解析，尤其是任何会投影到 require_auth 的类型。
     """
     out = {}
     for k, v in item.items():
@@ -3009,17 +3443,44 @@ TRUSTED_AUTH_SOURCES = ("TokenGeneration_HostedAuth",
 `router/infrastructure/stack.py` 的占位符替换链（`jwt_secret` 那段）加两项：
 
 ```python
+        # 两个值都要在 synth 时验证——它们控制的是 org 语义在请求路径上的
+        # 唯一执行点，配错的代价不对称：
+        # ① configparser 默认**保留行内注释**（inline_comment_prefixes=()）：
+        #    `require_idp_claim = true   # 按 Task 15 翻开` 读出来的值是
+        #    'true   # 按 Task 15 翻开' → lower() != "true" → **防线静默关闭**，
+        #    部署成功、无警告。翻开关时顺手加注释是完全现实的操作。
+        #    同理 yes/1/on 这些 configparser.getboolean 接受的值这里都算 False。
+        # ② require_idp_claim=true 而 trusted_idps 为空 → 所有人被 302 →
+        #    全站锁死，而 Edge 重部署要 10-20 分钟全球复制才能恢复。
+        require_idp_claim = config.get("SiteBuilder", "require_idp_claim",
+                                       "APP_REQUIRE_IDP_CLAIM").strip()
+        trusted_idps = config.get("SiteBuilder", "trusted_idps",
+                                  "APP_TRUSTED_IDPS").strip()
+        if require_idp_claim not in ("true", "false"):
+            raise ValueError(
+                f"require_idp_claim 必须是 true/false（当前 {require_idp_claim!r}）"
+                "——行内注释会被并进值里，yes/1/on 也不行（会被当成 false，"
+                "防线静默关闭）")
+        if require_idp_claim == "true" and not trusted_idps:
+            raise ValueError(
+                "require_idp_claim=true 但 trusted_idps 为空——部署出去所有"
+                "用户都会被 302 锁死（Edge 回滚要 10-20 分钟全球复制）。"
+                "先在 [SiteBuilder] 填 trusted_idps。")
+        # trusted_idps 同样吃行内注释的亏：`Feishu   # 飞书` 会整串进白名单，
+        # idp="Feishu" 匹配不上任何项 → 开关为 true 时同样是全站锁死。
+        # provider 名不可能含 #，见到即为注释被并进值。
+        if "#" in trusted_idps or ";" in trusted_idps:
+            raise ValueError(
+                f"trusted_idps 含注释字符（当前 {trusted_idps!r}）——configparser "
+                "会把行内注释并进值，白名单被污染后没有任何 idp 能匹配上"
+                "（require_idp_claim=true 时 = 全站锁死）。值里只放 provider 名。")
         lambda_code = (lambda_code
             .replace("{{FRONTEND_BUCKET_DOMAIN}}",
                      f"{frontend_bucket}.s3.us-east-1.amazonaws.com")
             .replace("{{JWT_SECRET}}", jwt_secret)
             .replace("{{BASE_DOMAIN}}", base_domain)
-            .replace("{{REQUIRE_IDP_CLAIM}}",
-                     config.get("SiteBuilder", "require_idp_claim",
-                                "APP_REQUIRE_IDP_CLAIM"))
-            .replace("{{TRUSTED_IDPS}}",
-                     config.get("SiteBuilder", "trusted_idps",
-                                "APP_TRUSTED_IDPS")))
+            .replace("{{REQUIRE_IDP_CLAIM}}", require_idp_claim)
+            .replace("{{TRUSTED_IDPS}}", trusted_idps))
 ```
 
 `router/config.ini.example` 的 `[SiteBuilder]` 段加：
@@ -3241,7 +3702,9 @@ token，而新 token 的 `auth_via` 是受信的 `TokenGeneration_RefreshTokens`
 
 1. 先部署路由层（Edge 支持 DynamoDB `L` 类型）：
    `cd router/infrastructure && rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never`
-   —— 顺序颠倒会让 Edge 把名单读成 `False`，等于全员放行。
+   —— 顺序颠倒会让 Edge 把名单读成 `False` → 空名单 fail-closed：名单
+   站点仅 owner 可访问，合法成员全部 403（可用性事故，非数据暴露；应急
+   处置是补部署 Edge，不是回滚）。
 2. 再部署执行器（`register_route` 从 sites 表取权限并写 `L` 投影）。
 3. `config.ini [Platform] admin_seed` 填首个管理员邮箱。
 4. 迁移存量站点：先 `python3 site-builder/scripts/migrate_permissions.py`
@@ -3839,6 +4302,21 @@ def test_transfer_owner_rejected_for_collaborator(aws):
                                        transfer_owner="c@x.com")
 
 
+def test_transfer_owner_and_add_are_mutually_exclusive(aws):
+    """docstring 承诺互斥就必须真互斥——静默丢弃 add 是半执行陷阱。"""
+    import common
+    import server
+    _seed_site_and_route()
+    with pytest.raises(ValueError, match="互斥"):
+        server.do_manage_collaborators("o@x.com", SITE_ID,
+                                       add=["keep@x.com"],
+                                       transfer_owner="new@x.com")
+    # 站点纹丝不动：owner 没转，协作者也没加
+    site = common.get_site(SITE_ID)
+    assert site["owner"] == "o@x.com"
+    assert "keep@x.com" not in (site.get("collaborators") or [])
+
+
 def test_get_permissions_returns_current_state(aws):
     import server
     _seed_site_and_route(collaborators=["c@x.com"])
@@ -3920,6 +4398,13 @@ def do_manage_collaborators(caller: str, site_id: str, add=None, remove=None,
                             transfer_owner=None) -> dict:
     try:
         if transfer_owner:
+            # 工具 docstring 承诺"与 add/remove 互斥"——必须真的互斥，不能静默
+            # 丢弃：用户说"加 Bob 并把站点交给 Alice"，Agent 拿到成功响应但
+            # Bob 根本没被加上，这类静默半执行比报错难查得多。
+            if add or remove:
+                raise ValueError(
+                    "transfer_owner 与 add/remove 互斥——请分两次调用"
+                    "（先加/删协作者，再转移所有权）")
             return permissions.transfer_owner(site_id, actor=caller,
                                               new_owner=transfer_owner)
         if not add and not remove:
@@ -6446,7 +6931,8 @@ Expected: 4 passed（约 6 分钟）。这条验证权限真源改造没有破�
   构建时复制，同 `common.py`）。
 - **路由表新增 DynamoDB `L` 类型字段**（`allowed_users` 名单、
   `collaborators`）：Edge 的 `_deser` 必须先支持 `L` 才能部署写侧——
-  顺序颠倒会让名单读成 `False`（等于全员放行）。加新字段类型时同理。
+  顺序颠倒会让名单读成 `False` → 空名单 fail-closed（名单成员全 403 =
+  鉴权站点锁死；`require_auth` 若读成 False 才是全公开）。加新字段类型时同理。
 - **权限写入只走 `permissions.write_permissions`**（两表 `TransactWriteItems`）。
   别在别处写"先改 sites 再同步路由"：收紧权限时第二步失败会留下 sites 已私有、
   Edge 仍公开的安全状态错误。

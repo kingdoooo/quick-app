@@ -353,6 +353,10 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
 
 确认 `router/config.ini` 已填好：account_id / domain_name / certificate_arn /
 frontend_bucket / base_domain（从 `router/config.ini.example` 复制）。
+**二期起 `[SiteBuilder]` 还需 `require_idp_claim` 与 `trusted_idps` 两键**
+（缺任一 synth 直接 NoOptionError；首次部署配 `require_idp_claim = false`，
+翻 true 是 M1 Task 15 Step 6c 的完成条件。值必须是裸 `true`/`false`——
+configparser 会把行内注释并进值，`true  # 注释` 会被当成 false，防线静默关闭）。
 
 1. 建私有前端桶（若不存在）。**注意此桶不由 CDK 管理**，需手工建并配好
    public-access-block 与生命周期规则：
