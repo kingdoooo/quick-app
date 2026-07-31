@@ -148,6 +148,72 @@ def test_remove_nonexistent_admin_is_idempotent_with_many_admins(aws):
     assert perm.list_admins() == ["a@x.com", "b@x.com"]
 
 
+def test_remove_admin_rejects_sentinel_and_garbage(aws):
+    """__count__ 是调用方可达输入（控制台/MCP 参数直通）。
+
+    不拦的话：事务的 Delete 与 Update 同落 __count__ 一个 item——DynamoDB 抛
+    ValidationException（不是 TransactionCanceledException），穿过分流变成
+    不可读 500；侥幸执行则删掉计数 sentinel 本身。与 add_admin 的入口校验对称。
+    """
+    perm.add_admin("a@x.com", added_by="seed")
+    with pytest.raises(ValueError):
+        perm.remove_admin("__count__")
+    with pytest.raises(ValueError):
+        perm.remove_admin("not-an-email")
+    assert perm.list_admins() == ["a@x.com"]   # sentinel 与名单都毫发无损
+
+
+def _conflict_injecting_client(monkeypatch, fail_times: int):
+    """让前 fail_times 次 transact_write_items 抛 TransactionConflict。
+
+    覆盖 add_admin 的退避重试与 remove_admin 的冲突转 409——这两个分支
+    若绕开 _ddb_client hook 就永远注入不了（错误实现照样全绿）。
+    """
+    import botocore.exceptions
+    state = {"n": 0}
+    real_factory = perm._ddb_client
+
+    def _factory():
+        client = real_factory()
+        real = client.transact_write_items
+
+        def _wrapped(**kw):
+            if state["n"] < fail_times:
+                state["n"] += 1
+                raise botocore.exceptions.ClientError(
+                    {"Error": {"Code": "TransactionCanceledException",
+                               "Message": "cancelled"},
+                     "CancellationReasons": [
+                         {"Code": "TransactionConflict"},
+                         {"Code": "TransactionConflict"}]},
+                    "TransactWriteItems")
+            return real(**kw)
+
+        client.transact_write_items = _wrapped
+        return client
+
+    monkeypatch.setattr(perm, "_ddb_client", _factory)
+    return state
+
+
+def test_add_admin_retries_through_transaction_conflict(aws, monkeypatch):
+    """并发写 __count__ 的 TransactionConflict：退避重试后成功，不吞不炸。"""
+    state = _conflict_injecting_client(monkeypatch, fail_times=2)
+    perm.add_admin("a@x.com", added_by="seed")
+    assert state["n"] == 2                      # 确实经历了两次冲突
+    assert perm.is_admin("a@x.com") is True     # 第三次成功落库
+
+
+def test_remove_admin_conflict_becomes_permission_conflict(aws, monkeypatch):
+    """remove_admin 遇 TransactionConflict 必须转成可读的 PermissionConflict。"""
+    perm.add_admin("a@x.com", added_by="seed")
+    perm.add_admin("b@x.com", added_by="seed")
+    _conflict_injecting_client(monkeypatch, fail_times=1)
+    with pytest.raises(perm.PermissionConflict):
+        perm.remove_admin("a@x.com")
+    assert perm.is_admin("a@x.com") is True     # 冲突时未删成，如实报告
+
+
 def test_normalize_allowed_users_org():
     assert perm.normalize_allowed_users("org") == "org"
 

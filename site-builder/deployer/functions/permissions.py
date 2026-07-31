@@ -126,8 +126,10 @@ def add_admin(email: str, added_by: str) -> None:
     import botocore.exceptions
     if not EMAIL_RE.fullmatch(email or ""):
         raise ValueError(f"非法邮箱: {email!r}")
-    ddb = boto3.client("dynamodb",
-                       region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+    # 经 _ddb_client() 取 client（而不是就地 boto3.client）：测试要能注入
+    # TransactionConflict 才能覆盖下面的退避重试分支——绕开这个 hook 会让
+    # 冲突分支永远测不到（错误实现照样全绿）。
+    ddb = _ddb_client()
     table = os.environ["ADMINS_TABLE"]
     items = [
         {"Put": {"TableName": table,
@@ -189,10 +191,17 @@ def remove_admin(email: str) -> None:
     存在性与"不是最后一个"全部交给事务条件判定：
       - Delete 带 attribute_exists(email)：不存在 → 条件失败 → 幂等成功；
       - sentinel 带 n > 1：删到只剩一个 → 条件失败 → 拒绝。
+
+    **入口必须验邮箱格式**（与 add_admin 对称）：`__count__` 是调用方可达输入
+    （M3 控制台 / MCP 工具的参数），而 email="__count__" 时事务的 Delete 与
+    Update 落在同一个 item 上——DynamoDB 对"同一事务多次操作同一 item"抛的是
+    **ValidationException 而非 TransactionCanceledException**，会穿过下面的
+    分流变成不可读的 500；更糟的是若它侥幸执行，删掉的是计数 sentinel 本身。
     """
     import botocore.exceptions
-    ddb = boto3.client("dynamodb",
-                       region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+    if not EMAIL_RE.fullmatch(email or ""):
+        raise ValueError(f"非法邮箱: {email!r}")
+    ddb = _ddb_client()   # 同 add_admin：走 hook，冲突分支才可注入测试
     table = os.environ["ADMINS_TABLE"]
     try:
         ddb.transact_write_items(TransactItems=[
