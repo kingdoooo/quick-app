@@ -18,9 +18,30 @@ if not (Path(__file__).parent / "common.py").exists() and _DEV_COMMON.is_dir():
     sys.path.insert(0, str(_DEV_COMMON))
 
 import common  # noqa: E402  deployer/functions/common.py
+import permissions  # noqa: E402  deployer/functions/permissions.py（同 common 的解析路径）
 
 # 平台生成的 site_id 形态：<name(≤20)>-<6 位随机小写数字>
 SITE_ID_RE = re.compile(r"[a-z][a-z0-9-]{0,19}-[a-z0-9]{6}")
+
+
+# spec §3.5：身份必须来自企业 IdP。Edge 管住站点访问，这里管住管理面
+# （AgentCore authorizer 只验 issuer/client_id，不看 idp）。
+# 空值 = 迁移宽限期放行，与 Edge 的 REQUIRE_IDP_CLAIM 开关对齐；
+# 切完 pool、全员重新登录后必须配上。
+#
+# **每次调用时读环境变量，不在模块导入时固化**：固化成模块级常量后，
+# 测试里的 monkeypatch.setenv 不再生效（server 早已被别的用例导入过），
+# 拒绝类用例会永远看到空 tuple 而假通过。
+def _trusted_idps() -> tuple[str, ...]:
+    return tuple(x.strip() for x in
+                 os.environ.get("TRUSTED_IDPS", "").split(",") if x.strip())
+
+
+# 与 Edge 的 TRUSTED_AUTH_SOURCES 同义：只放行托管登录与其 refresh。
+# 原生 InitiateAuth（TokenGeneration_Authentication）的 token 拒掉——
+# linked 本地用户的 idp claim 看起来合法，只有来源能分辨（spec §3.5）。
+TRUSTED_AUTH_SOURCES = ("TokenGeneration_HostedAuth",
+                        "TokenGeneration_RefreshTokens")
 
 
 class NotOwner(Exception):
@@ -54,11 +75,21 @@ def _lambda():
     return boto3.client("lambda", region_name="us-east-1")
 
 
-def _assert_owner(owner: str, record: dict | None, what: str):
-    if not record:
-        raise NotOwner(f"{what} 不存在")
-    if record.get("owner") != owner:
-        raise NotOwner(f"你不是 {what} 的所有者，无权操作")
+def _assert_permission(email: str, site_id: str, action: str, what: str) -> dict:
+    """按二期角色模型判定（owner / collaborator / admin）。
+
+    权限真源是 sites 表，判定逻辑全在 permissions.py——控制台与 MCP 共用
+    同一模块，两边语义不会漂移。
+    """
+    # 强一致读：撤权/转移必须立刻生效。最终一致读会留下"权限已撤销但旧请求
+    # 仍读到旧名单"的窗口。写路径不用本函数（授权在事务内做，见下方注释）。
+    site = common.get_site_consistent(site_id)
+    try:
+        permissions.assert_can(email, site, action,
+                               is_admin=permissions.is_admin(email), what=what)
+    except permissions.PermissionDenied as e:
+        raise NotOwner(str(e))
+    return site or {}
 
 
 # ---------- 纯函数层（单测目标） ----------
@@ -68,7 +99,7 @@ def do_deploy_site(owner: str, site_name: str, site_id: str | None = None) -> di
         # site_id 同样进入资源名/SQL 标识符；只接受本平台生成的形态
         if not SITE_ID_RE.fullmatch(site_id or ""):
             raise common.InvalidSiteName(f"site_id 格式非法: {site_id!r}")
-        _assert_owner(owner, common.get_site(site_id), f"站点 {site_id}")
+        _assert_permission(owner, site_id, "deploy", f"站点 {site_id}")
     else:
         site_id = common.new_site_id(common.validate_site_name(site_name))
         common.upsert_site(site_id, owner=owner, name=site_name, status="DEPLOYING")
@@ -85,7 +116,10 @@ def do_deploy_site(owner: str, site_name: str, site_id: str | None = None) -> di
 
 def do_confirm_upload(owner: str, job_id: str) -> dict:
     job = common.get_job(job_id)
-    _assert_owner(owner, job, f"任务 {job_id}")
+    if not job:
+        raise NotOwner(f"任务 {job_id} 不存在")
+    # "deploy" 而非 "read"：确认上传会启动部署
+    _assert_permission(owner, job["site_id"], "deploy", f"任务 {job_id}")
     s3 = _s3()
     try:
         head = s3.head_object(Bucket=os.environ["ARTIFACTS_BUCKET"],
@@ -119,25 +153,27 @@ def do_confirm_upload(owner: str, job_id: str) -> dict:
 
 def do_get_status(owner: str, job_id: str) -> dict:
     job = common.get_job(job_id)
-    _assert_owner(owner, job, f"任务 {job_id}")
+    if not job:
+        raise NotOwner(f"任务 {job_id} 不存在")
+    _assert_permission(owner, job["site_id"], "read", f"任务 {job_id}")
     return {k: job.get(k, "") for k in ("status", "phase", "error", "url")}
 
 
 def do_list_sites(owner: str) -> list[dict]:
-    import boto3.dynamodb.conditions as cond
-    table = boto3.resource("dynamodb", region_name="us-east-1").Table(
-        os.environ["SITES_TABLE"])
-    items = table.scan(FilterExpression=cond.Attr("owner").eq(owner)).get("Items", [])
+    """我 owner 的 ∪ 我是 collaborator 的站点。"""
     base = os.environ["BASE_DOMAIN"]
-    return [{"site_id": s["site_id"], "name": s.get("name", ""),
-             "url": f"https://{s.get('subdomain', 'app-' + s['site_id'])}.{base}",
-             "status": s.get("status", ""), "tier": s.get("tier", "")}
-            for s in items]
+    out = []
+    for s in common.list_sites_for_user(owner):
+        role = permissions.role_of(owner, s)
+        out.append({"site_id": s["site_id"], "name": s.get("name", ""),
+                    "url": f"https://{s.get('subdomain', 'app-' + s['site_id'])}.{base}",
+                    "status": s.get("status", ""), "tier": s.get("tier", ""),
+                    "role": role})
+    return out
 
 
 def do_undeploy(owner: str, site_id: str, purge_data: bool = False) -> dict:
-    site = common.get_site(site_id)
-    _assert_owner(owner, site, f"站点 {site_id}")
+    site = _assert_permission(owner, site_id, "undeploy", f"站点 {site_id}")
     job_id = common.create_job(owner, site_id)
     payload = {"job_id": job_id, "site_id": site_id}
     if purge_data:
@@ -187,7 +223,19 @@ def _caller_email() -> str:
             claims = _json.loads(base64.urlsafe_b64decode(payload))
             email = claims.get("email", "")
             if email:
+                trusted = _trusted_idps()
+                if trusted:
+                    if claims.get("idp") not in trusted:
+                        raise NotOwner(
+                            "身份来源不被信任（缺少或非法的 idp claim）——"
+                            "请用企业账号重新登录")
+                    if claims.get("auth_via") not in TRUSTED_AUTH_SOURCES:
+                        raise NotOwner(
+                            "本次登录方式不被信任（非托管登录来源）——"
+                            "请用企业账号重新登录")
                 return email
+        except NotOwner:
+            raise
         except Exception:
             pass
     raise NotOwner("无法识别调用者身份（缺少 OAuth email claim）")

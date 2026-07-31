@@ -65,9 +65,11 @@ def ensure_repo() -> str:
 
 
 def build_and_push(image_uri: str) -> None:
-    # common.py 必须进构建上下文：server.py 按同目录解析它
-    shutil.copyfile(HERE.parent / "deployer" / "functions" / "common.py",
-                    HERE / "common.py")
+    # common.py / permissions.py 必须进构建上下文：server.py 按同目录解析它们
+    copied = []
+    for name in ("common.py", "permissions.py"):
+        shutil.copyfile(HERE.parent / "deployer" / "functions" / name, HERE / name)
+        copied.append(HERE / name)
     try:
         token = ecr.get_authorization_token()["authorizationData"][0]
         user, pwd = base64.b64decode(token["authorizationToken"]).decode().split(":", 1)
@@ -84,7 +86,8 @@ def build_and_push(image_uri: str) -> None:
               "--provenance=false",
               "-t", image_uri, "--push", str(HERE)])
     finally:
-        (HERE / "common.py").unlink(missing_ok=True)
+        for p in copied:
+            p.unlink(missing_ok=True)
 
 
 def ensure_role() -> str:
@@ -117,13 +120,30 @@ def ensure_role() -> str:
          "Resource": f"arn:aws:ecr:{REGION}:{ACCOUNT}:repository/{REPO}"},
         {"Effect": "Allow", "Action": "ecr:GetAuthorizationToken",
          "Resource": "*"},  # 该动作不支持资源级限定
-        {"Effect": "Allow",
+        # jobs + sites：MCP 的读写主路径（含 owner-index GSI）。
+        # ConditionCheckItem 是 register_route / write_permissions 的事务需要的
+        # ——IAM 里没有 dynamodb:TransactWriteItems 这个 action，事务内
+        # Put/Update/Delete/Get 的权限由底层同名 action 决定，只有
+        # ConditionCheck 需要它（见 Task 11 Step 7 的官方链接）。
+        {"Sid": "JobsAndSites", "Effect": "Allow",
          "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem",
-                    "dynamodb:Query", "dynamodb:Scan"],
+                    "dynamodb:Query", "dynamodb:Scan",
+                    "dynamodb:ConditionCheckItem"],
          "Resource": [
              f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-deploy-jobs",
              f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-deploy-jobs/index/*",
-             f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-sites"]},
+             f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-sites",
+             f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-sites/index/*"]},
+        # admins 表：**只读 + 事务条件检查**。
+        # is_admin() 要 GetItem、list_admins() 要 Scan、write_permissions() 的
+        # admin 代管路径要对 admins 做 ConditionCheck（缺 ConditionCheckItem
+        # 时管理员改任意站点权限会直接 AccessDenied）。
+        # 故意**不给** PutItem/UpdateItem/DeleteItem：增删管理员不走 MCP
+        # runtime 角色（M2 由部署时的种子脚本做，M3 由 panel 自己的角色做）。
+        {"Sid": "AdminsReadOnly", "Effect": "Allow",
+         "Action": ["dynamodb:GetItem", "dynamodb:Scan",
+                    "dynamodb:ConditionCheckItem"],
+         "Resource": f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-admins"},
         # presigned PUT 由调用者上传，MCP 侧只需 HeadObject 校验大小
         {"Effect": "Allow", "Action": ["s3:PutObject", "s3:GetObject"],
          "Resource": f"arn:aws:s3:::site-artifacts-{ACCOUNT}/uploads/*"},
@@ -190,6 +210,8 @@ def deploy_runtime(image_uri: str, role_arn: str) -> dict:
         environmentVariables={
             "JOBS_TABLE": CFG["Deployer"]["jobs_table"],
             "SITES_TABLE": CFG["Deployer"]["sites_table"],
+            "ADMINS_TABLE": CFG["Deployer"]["admins_table"],
+            "TRUSTED_IDPS": CFG["IdP"]["provider_name"] if CFG.has_section("IdP") else "",
             "ARTIFACTS_BUCKET": f"site-artifacts-{ACCOUNT}",
             "STATE_MACHINE_ARN": sm_arn,
             "BASE_DOMAIN": BASE_DOMAIN,

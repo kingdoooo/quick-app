@@ -109,3 +109,90 @@ def test_caller_email_rejects_missing_and_malformed_authorization(monkeypatch):
     monkeypatch.setattr(server.mcp, "get_context", lambda: _Ctx(f"Bearer {tok2}"))
     with pytest.raises(server.NotOwner):
         server._caller_email()
+
+
+def _token(claims: dict) -> str:
+    import base64
+    import json as _json
+    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+    return (b64(_json.dumps({"alg": "RS256"}).encode()) + "." +
+            b64(_json.dumps(claims).encode()) + ".sig")
+
+
+def _with_auth(monkeypatch, token: str):
+    """伪造 FastMCP 的请求上下文，只提供 Authorization 头。"""
+    import server
+
+    class _Req:
+        headers = {"authorization": f"Bearer {token}"}
+
+    class _Ctx:
+        class request_context:
+            request = _Req()
+
+    monkeypatch.setattr(server.mcp, "get_context", lambda: _Ctx())
+
+
+def test_caller_email_accepts_trusted_idp(monkeypatch):
+    import server
+    monkeypatch.setenv("TRUSTED_IDPS", "Feishu,Okta")
+    _with_auth(monkeypatch, _token({"email": "a@x.com", "idp": "Feishu",
+                                    "auth_via": "TokenGeneration_HostedAuth"}))
+    assert server._caller_email() == "a@x.com"
+
+
+def test_caller_email_rejects_token_without_idp(monkeypatch):
+    """本地用户/旧 token 没有 idp——必须拒，否则管理面绕过了 §3.5。"""
+    import server
+    monkeypatch.setenv("TRUSTED_IDPS", "Feishu")
+    _with_auth(monkeypatch, _token({"email": "local@x.com"}))
+    with pytest.raises(server.NotOwner):
+        server._caller_email()
+
+
+def test_caller_email_rejects_untrusted_idp(monkeypatch):
+    import server
+    monkeypatch.setenv("TRUSTED_IDPS", "Feishu")
+    _with_auth(monkeypatch, _token({"email": "a@x.com", "idp": "EvilCorp",
+                                    "auth_via": "TokenGeneration_HostedAuth"}))
+    with pytest.raises(server.NotOwner):
+        server._caller_email()
+
+
+def test_caller_email_rejects_native_auth_source(monkeypatch):
+    """idp 合法但走原生 InitiateAuth（linked 用户/设过密码的联邦用户）。"""
+    import server
+    monkeypatch.setenv("TRUSTED_IDPS", "Feishu")
+    _with_auth(monkeypatch, _token({"email": "a@x.com", "idp": "Feishu",
+                                    "auth_via": "TokenGeneration_Authentication"}))
+    with pytest.raises(server.NotOwner):
+        server._caller_email()
+
+
+def test_caller_email_accepts_refresh_token_source(monkeypatch):
+    import server
+    monkeypatch.setenv("TRUSTED_IDPS", "Feishu")
+    _with_auth(monkeypatch, _token({"email": "a@x.com", "idp": "Feishu",
+                                    "auth_via": "TokenGeneration_RefreshTokens"}))
+    assert server._caller_email() == "a@x.com"
+
+
+def test_caller_email_skips_idp_check_when_unconfigured(monkeypatch):
+    """TRUSTED_IDPS 为空 = 迁移宽限期（与 Edge 的开关对齐），放行但不推荐。"""
+    import server
+    monkeypatch.setenv("TRUSTED_IDPS", "")
+    _with_auth(monkeypatch, _token({"email": "a@x.com"}))
+    assert server._caller_email() == "a@x.com"
+
+
+def test_trusted_idps_read_per_call_not_at_import(monkeypatch):
+    """配置必须每次调用时读——固化成模块常量会让上面的拒绝用例假通过。
+
+    server 在本文件更早的用例里已被导入，若 TRUSTED_IDPS 是模块级 tuple，
+    这里的 setenv 不会改变它。
+    """
+    import server
+    monkeypatch.setenv("TRUSTED_IDPS", "Feishu")
+    assert server._trusted_idps() == ("Feishu",)
+    monkeypatch.setenv("TRUSTED_IDPS", "Okta,Feishu")
+    assert server._trusted_idps() == ("Okta", "Feishu")
