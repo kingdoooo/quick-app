@@ -20,11 +20,18 @@ def _sign(msg: bytes, secret: str) -> str:
     return _b64url(hmac.new(secret.encode(), msg, hashlib.sha256).digest())
 
 
-def mint_session_jwt(email: str, name: str, secret: str, ttl_seconds: int = 86400) -> str:
+def mint_session_jwt(email: str, name: str, secret: str, ttl_seconds: int = 86400,
+                     idp: str = "", scope: str = "", auth_via: str = "") -> str:
     header = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
-    payload = _b64url(json.dumps(
-        {"email": email, "name": name, "exp": int(time.time()) + ttl_seconds},
-        separators=(",", ":")).encode())
+    claims = {"email": email, "name": name, "exp": int(time.time()) + ttl_seconds}
+    # 只在非空时写入：保持与一期已签发 token 的形态兼容，Edge 侧无需改验签。
+    if idp:
+        claims["idp"] = idp        # spec §3.5：Edge 据此确认身份来自企业 IdP
+    if scope:
+        claims["scope"] = scope    # M3 面板会话用（Edge 不校验 scope）
+    if auth_via:
+        claims["auth_via"] = auth_via   # spec §3.5：本次 token 的来源
+    payload = _b64url(json.dumps(claims, separators=(",", ":")).encode())
     signing_input = f"{header}.{payload}".encode()
     return f"{header}.{payload}.{_sign(signing_input, secret)}"
 

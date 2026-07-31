@@ -28,14 +28,21 @@ def test_login_rejects_foreign_redirect():
 
 
 @patch.dict(lh.os.environ, ENV)
-@patch.object(lh, "_exchange_code", return_value={"email": "a@x.com", "name": "Alice"})
+@patch.object(lh, "_exchange_code", return_value={"email": "a@x.com", "name": "Alice",
+                                                  "idp": "Feishu"})
 def test_callback_sets_cookie_and_redirects(mock_ex):
-    state = lh._encode_state("https://app-x.example.com/page?tab=2")
-    r = lh.handler(_event("/callback", {"code": "abc", "state": state}), None)
+    r_login = lh.handler(_event("/login", {"redirect": "https://app-x.example.com/page?tab=2"}),
+                         None)
+    import urllib.parse as up
+    state = up.unquote(r_login["headers"]["Location"].split("state=")[1].split("&")[0])
+    pkce = next(c for c in r_login["cookies"]
+                if c.startswith(lh.PKCE_COOKIE)).split(";")[0]
+    r = lh.handler(_event("/callback", {"code": "abc", "state": state},
+                          cookies=[pkce]), None)
     assert r["statusCode"] == 302
-    assert r["headers"]["Location"] == "https://app-x.example.com/page?tab=2"  # query 保留
-    cookie = r["cookies"][0]
-    assert cookie.startswith("sb_session=") and "Domain=.example.com" in cookie
+    assert r["headers"]["Location"] == "https://app-x.example.com/page?tab=2"
+    cookie = next(c for c in r["cookies"] if c.startswith("sb_session="))
+    assert "Domain=.example.com" in cookie
     assert "HttpOnly" in cookie and "Secure" in cookie
 
 
@@ -47,7 +54,10 @@ def test_callback_rejects_tampered_state():
     payload = _json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
     payload["r"] = "https://evil.com/"
     forged = base64.urlsafe_b64encode(_json.dumps(payload).encode()).decode().rstrip("=")
-    r = lh.handler(_event("/callback", {"code": "abc", "state": f"{forged}.{sig}"}), None)
+    # 补一个有效的 PKCE cookie：确保 400 是 state 验签失败导致的，而非缺 cookie
+    pkce = lh._pkce_cookie("v", "n", "example.com").split(";")[0]
+    r = lh.handler(_event("/callback", {"code": "abc", "state": f"{forged}.{sig}"},
+                          cookies=[pkce]), None)
     assert r["statusCode"] == 400
 
 
@@ -56,7 +66,10 @@ def test_callback_rejects_expired_state():
     import time
     with patch.object(lh.time, "time", return_value=time.time() - 600):
         state = lh._encode_state("https://app-x.example.com/")
-    r = lh.handler(_event("/callback", {"code": "abc", "state": state}), None)
+    # 同上：补有效 cookie，锁定 400 的原因是 state 过期
+    pkce = lh._pkce_cookie("v", "n", "example.com").split(";")[0]
+    r = lh.handler(_event("/callback", {"code": "abc", "state": state},
+                          cookies=[pkce]), None)
     assert r["statusCode"] == 400
 
 

@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 import time
 import urllib.parse
 import urllib.request
@@ -35,14 +36,28 @@ def _state_sig(body: str) -> str:
         hashlib.sha256).digest()).rstrip(b"=").decode()
 
 
+PKCE_COOKIE = "__Host-sb_pkce"
+
+
 def _encode_state(redirect: str) -> str:
+    """state 只放 redirect 与过期时间，**不放 code_verifier / nonce**。
+
+    RFC 7636 的分工是授权请求只发 code_challenge、令牌请求才发 code_verifier。
+    把明文 verifier 放进随 authorize URL 传输的 state（state 有 HMAC 签名，
+    但内容是 base64 明文）会让它经浏览器地址栏、Referer、IdP 侧日志与浏览器
+    历史各暴露一遍，PKCE 本应提供的"授权码被截获也换不到 token"的独立防护
+    就没了；更要紧的是它不再绑定浏览器——攻击者把自己登录产生的 callback URL
+    发给受害者，verifier 跟在 URL 里，后端就能替受害者完成交换并种下攻击者
+    账户的会话（login CSRF / account confusion）。verifier 放 host-only
+    cookie 才与浏览器绑定。见 spec §7.2。
+    """
     body = base64.urlsafe_b64encode(json.dumps(
         {"r": redirect, "exp": int(time.time()) + 300}).encode()).decode().rstrip("=")
     return f"{body}.{_state_sig(body)}"
 
 
 def _decode_state(state: str) -> str | None:
-    """验签 + 验期，失败返回 None。"""
+    """验签 + 验期，失败返回 None；成功返回 redirect。"""
     try:
         body, _, sig = state.rpartition(".")
         if not hmac.compare_digest(sig, _state_sig(body)):
@@ -53,6 +68,45 @@ def _decode_state(state: str) -> str | None:
         return payload["r"]
     except Exception:
         return None
+
+
+def _pkce_cookie(verifier: str, nonce: str, base: str) -> str:
+    """把 verifier/nonce 装进 auth 子域的 host-only 短期 cookie。
+
+    __Host- 前缀是浏览器强制的：必须 Secure、必须 Path=/、**必须无 Domain**，
+    因此它只回发给 auth.{base}（/login 与 /callback 同域，读得到）。
+    5 分钟过期，用完即清。
+    """
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"v": verifier, "n": nonce}).encode()).decode().rstrip("=")
+    sig = _state_sig(payload)
+    return (f"{PKCE_COOKIE}={payload}.{sig}; Path=/; Max-Age=300; "
+            f"Secure; HttpOnly; SameSite=Lax")
+
+
+def _read_pkce_cookie(event) -> dict | None:
+    """从 callback 请求里取回 verifier/nonce；验签失败或缺失返回 None。"""
+    for raw in (event.get("cookies") or []):
+        name, _, value = raw.partition("=")
+        if name.strip() != PKCE_COOKIE:
+            continue
+        body, _, sig = value.rpartition(".")
+        if not hmac.compare_digest(sig, _state_sig(body)):
+            return None
+        try:
+            data = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+        except Exception:
+            return None
+        return {"v": data.get("v", ""), "n": data.get("n", "")}
+    return None
+
+
+def _pkce_pair() -> tuple[str, str]:
+    """RFC 7636 S256：返回 (code_verifier, code_challenge)。"""
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(48)).rstrip(b"=").decode()
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    return verifier, challenge
 
 
 def _is_safe_redirect(url: str) -> bool:
@@ -72,13 +126,13 @@ def _is_safe_redirect(url: str) -> bool:
     return host == base or host.endswith("." + base)
 
 
-def _exchange_code(code: str) -> dict:
-    """code → Cognito token → JWKS 验签 → {email, name}"""
+def _post_token(code: str, verifier: str) -> dict:
     domain = os.environ["COGNITO_DOMAIN"]
     body = urllib.parse.urlencode({
         "grant_type": "authorization_code", "code": code,
         "client_id": os.environ["CLIENT_ID"],
         "redirect_uri": f"https://auth.{os.environ['BASE_DOMAIN']}/callback",
+        "code_verifier": verifier,
     }).encode()
     basic = base64.b64encode(
         f"{os.environ['CLIENT_ID']}:{os.environ['CLIENT_SECRET']}".encode()).decode()
@@ -87,7 +141,12 @@ def _exchange_code(code: str) -> dict:
         headers={"Authorization": f"Basic {basic}",
                  "Content-Type": "application/x-www-form-urlencoded"})
     with urllib.request.urlopen(req, timeout=10) as resp:
-        tokens = json.loads(resp.read())
+        return json.loads(resp.read())
+
+
+def _exchange_code(code: str, verifier: str, nonce: str) -> dict:
+    """code → Cognito token → JWKS 验签 + nonce 校验 → {email, name}"""
+    tokens = _post_token(code, verifier)
     signing_key = _get_jwks_client().get_signing_key_from_jwt(tokens["id_token"])
     claims = pyjwt.decode(
         tokens["id_token"], signing_key.key, algorithms=["RS256"],
@@ -95,7 +154,15 @@ def _exchange_code(code: str) -> dict:
         issuer=f"https://cognito-idp.us-east-1.amazonaws.com/{os.environ['USER_POOL_ID']}")
     if claims.get("token_use") != "id":
         raise ValueError("token_use != id")
-    return {"email": claims["email"], "name": claims.get("name", claims["email"])}
+    # nonce 绑定本次 /login：缺失或不匹配都拒绝，防他人的 id_token 被重放进
+    # 这个 callback（PKCE 保护授权码，nonce 保护 id_token）。
+    if claims.get("nonce") != nonce:
+        raise ValueError("id_token nonce 与本次登录不匹配")
+    # idp 由 pre-token 触发器注入 id token（两个容器都写，见 Task 14 Step 4b）。
+    # 本地用户没有它——会话里就不会有，Edge 据此拦截（spec §3.5）。
+    return {"email": claims["email"], "name": claims.get("name", claims["email"]),
+            "idp": claims.get("idp", ""),
+            "auth_via": claims.get("auth_via", "")}
 
 
 def handler(event, context):
@@ -107,24 +174,40 @@ def handler(event, context):
         redirect = qs.get("redirect", f"https://{base}/")
         if not _is_safe_redirect(redirect):
             return {"statusCode": 400, "body": "invalid redirect"}
+        verifier, challenge = _pkce_pair()
+        nonce = base64.urlsafe_b64encode(secrets.token_bytes(16)).rstrip(b"=").decode()
         auth_url = (f"{os.environ['COGNITO_DOMAIN']}/oauth2/authorize?"
                     + urllib.parse.urlencode({
                         "response_type": "code", "client_id": os.environ["CLIENT_ID"],
                         "redirect_uri": f"https://auth.{base}/callback",
                         "scope": "openid email profile",
+                        "code_challenge": challenge,
+                        "code_challenge_method": "S256",
+                        "nonce": nonce,
                         "state": _encode_state(redirect)}))
-        return {"statusCode": 302, "headers": {"Location": auth_url}, "body": ""}
+        # verifier/nonce 走 host-only cookie（与浏览器绑定），不进 URL
+        return {"statusCode": 302, "headers": {"Location": auth_url},
+                "cookies": [_pkce_cookie(verifier, nonce, base)], "body": ""}
 
     if path == "/callback":
         redirect = _decode_state(qs.get("state", ""))
         if redirect is None or not _is_safe_redirect(redirect):
             return {"statusCode": 400, "body": "invalid or expired state"}
-        user = _exchange_code(qs["code"])
-        token = mint_session_jwt(user["email"], user["name"], os.environ["JWT_SECRET"])
+        pkce = _read_pkce_cookie(event)
+        if pkce is None:
+            # cookie 丢失（换了浏览器、被清、超过 5 分钟）——比静默降级到
+            # 无 PKCE 安全：让用户重新走一次登录。
+            return {"statusCode": 400,
+                    "body": "登录状态已过期，请重新登录"}
+        user = _exchange_code(qs["code"], pkce["v"], pkce["n"])
+        token = mint_session_jwt(user["email"], user["name"],
+                                 os.environ["JWT_SECRET"], idp=user.get("idp", ""),
+                                 auth_via=user.get("auth_via", ""))
         cookie = (f"sb_session={token}; Domain=.{base}; Path=/; Max-Age=86400; "
                   f"Secure; HttpOnly; SameSite=Lax")
+        clear_pkce = f"{PKCE_COOKIE}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax"
         return {"statusCode": 302, "headers": {"Location": redirect},
-                "cookies": [cookie], "body": ""}
+                "cookies": [cookie, clear_pkce], "body": ""}
 
     if path == "/logout":
         cookie = (f"sb_session=; Domain=.{base}; Path=/; Max-Age=0; "
