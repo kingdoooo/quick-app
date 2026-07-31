@@ -143,8 +143,11 @@ def _extract_subdomain(host: str) -> str:
 def _deser(item: dict) -> dict:
     """DynamoDB AttributeValue -> plain dict（本表用到的类型：S / BOOL / L / N）。
 
-    新增类型必须在此登记：未识别的类型会落到 False，而 allowed_users 变成
-    False 意味着名单检查被跳过（全员放行）——加字段前先加解析。
+    新增类型必须在此登记：未识别的类型会落到 False。落点不同后果不同——
+    allowed_users 变 False 是 fail-closed（json.loads(False) 抛异常 → 空名单
+    → 仅 owner/协作者可访问，名单成员全 403 = 宕机）；**require_auth 变 False
+    才是灾难**（`if not route.get("require_auth")` 直接放行 = 鉴权整段关闭，
+    站点全公开）。加字段前先加解析，尤其是任何会投影到 require_auth 的类型。
     """
     out = {}
     for k, v in item.items():

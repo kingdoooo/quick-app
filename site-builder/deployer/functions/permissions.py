@@ -275,8 +275,11 @@ _ALLOW_ROUTE_ABSENT = True
 def allowed_users_av(allowed) -> dict:
     """allowed_users 的 DynamoDB AttributeValue：字面量 org 用 S，名单用 L。
 
-    Edge 的 _deser 必须已支持 L——否则名单会被读成 False，站点变成
-    "全员放行"。部署顺序：Edge 先上，写侧后上。
+    Edge 的 _deser 必须已支持 L——否则名单会被读成 False，名单站点变成
+    "仅 owner 可访问"（json.loads(False) 抛异常 → 空名单，fail-closed）：
+    合法名单成员全部 403，等于鉴权站点大面积宕机。部署顺序：Edge 先上，
+    写侧后上——顺序颠倒是可用性事故（锁死），不是数据暴露；应急处置是
+    先部署 Edge 的 L 支持，而不是回滚 Edge。
     """
     if allowed == "org":
         return {"S": "org"}
