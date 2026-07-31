@@ -141,10 +141,23 @@ def _extract_subdomain(host: str) -> str:
 
 
 def _deser(item: dict) -> dict:
-    """DynamoDB AttributeValue -> plain dict（仅 S/BOOL，本表够用）"""
+    """DynamoDB AttributeValue -> plain dict（本表用到的类型：S / BOOL / L / N）。
+
+    新增类型必须在此登记：未识别的类型会落到 False，而 allowed_users 变成
+    False 意味着名单检查被跳过（全员放行）——加字段前先加解析。
+    """
     out = {}
     for k, v in item.items():
-        out[k] = v["S"] if "S" in v else v.get("BOOL", False)
+        if "S" in v:
+            out[k] = v["S"]
+        elif "BOOL" in v:
+            out[k] = v["BOOL"]
+        elif "L" in v:
+            out[k] = [e.get("S", "") for e in v["L"]]
+        elif "N" in v:
+            out[k] = int(v["N"])
+        else:
+            out[k] = False
     return out
 
 
@@ -307,11 +320,22 @@ def _check_auth(request, route, host):
 
     allowed = route.get("allowed_users", "org")
     if allowed != "org":
-        try:
-            allowlist = json.loads(allowed)
-        except Exception:
-            allowlist = []
-        if claims["email"] not in allowlist and claims["email"] != route.get("owner"):
+        if isinstance(allowed, list):
+            allowlist = allowed
+        else:
+            # 迁移期兼容：一期把名单存成 JSON 字符串。解析失败按空名单处理
+            # （fail-closed：宁可全员 403 也不能全员放行）。
+            try:
+                allowlist = json.loads(allowed)
+            except Exception:
+                allowlist = []
+            if not isinstance(allowlist, list):
+                allowlist = []
+        email = claims["email"]
+        # owner 与 collaborator 隐式在名单内：他们能改这个名单，
+        # 要求他们把自己也写进去只会制造"把自己锁在门外"的工单。
+        insiders = [route.get("owner", "")] + list(route.get("collaborators") or [])
+        if email not in allowlist and email not in insiders:
             return _forbidden()
 
     request["headers"]["x-user-email"] = [{"key": "x-user-email", "value": claims["email"]}]

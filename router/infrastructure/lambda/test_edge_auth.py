@@ -172,3 +172,65 @@ def test_s3_signing_includes_content_sha256():
     assert "x-amz-content-sha256" in request["headers"]
     signed = request["headers"]["authorization"][0]["value"]
     assert "x-amz-content-sha256" in signed  # 且参与签名，不只是附带
+
+
+def test_deser_handles_list_of_strings():
+    out = orq._deser({"allowed_users": {"L": [{"S": "a@x.com"}, {"S": "b@x.com"}]},
+                      "require_auth": {"BOOL": True},
+                      "owner": {"S": "o@x.com"}})
+    assert out["allowed_users"] == ["a@x.com", "b@x.com"]
+    assert out["require_auth"] is True
+    assert out["owner"] == "o@x.com"
+
+
+def test_deser_handles_empty_list():
+    assert orq._deser({"collaborators": {"L": []}})["collaborators"] == []
+
+
+def test_deser_handles_number():
+    assert orq._deser({"n": {"N": "42"}})["n"] == 42
+
+
+def test_native_list_allowlist_admits_member():
+    route = {**ROUTE_AUTH, "allowed_users": ["vip@x.com"]}
+    r = _req(cookie=f"sb_session={_jwt(email='vip@x.com')}")
+    assert orq._check_auth(r, route, "app-x.example.com") is None
+
+
+def test_native_list_allowlist_rejects_outsider():
+    route = {**ROUTE_AUTH, "allowed_users": ["vip@x.com"]}
+    r = _req(cookie=f"sb_session={_jwt(email='nope@x.com')}")
+    assert orq._check_auth(r, route, "app-x.example.com")["status"] == "403"
+
+
+def test_collaborator_admitted_by_named_allowlist():
+    route = {**ROUTE_AUTH, "allowed_users": ["vip@x.com"],
+             "collaborators": ["c@x.com"]}
+    r = _req(cookie=f"sb_session={_jwt(email='c@x.com')}")
+    assert orq._check_auth(r, route, "app-x.example.com") is None
+    assert r["headers"]["x-user-email"][0]["value"] == "c@x.com"
+
+
+def test_non_collaborator_still_rejected():
+    route = {**ROUTE_AUTH, "allowed_users": ["vip@x.com"],
+             "collaborators": ["c@x.com"]}
+    r = _req(cookie=f"sb_session={_jwt(email='stranger@x.com')}")
+    assert orq._check_auth(r, route, "app-x.example.com")["status"] == "403"
+
+
+def test_legacy_json_string_allowlist_still_works():
+    """迁移期间路由表里可能还是一期的 JSON 字符串形态。"""
+    route = {**ROUTE_AUTH, "allowed_users": json.dumps(["vip@x.com"])}
+    r = _req(cookie=f"sb_session={_jwt(email='vip@x.com')}")
+    assert orq._check_auth(r, route, "app-x.example.com") is None
+
+
+def test_unparsable_allowlist_is_fail_closed():
+    route = {**ROUTE_AUTH, "allowed_users": "{not json"}
+    r = _req(cookie=f"sb_session={_jwt(email='a@x.com')}")
+    assert orq._check_auth(r, route, "app-x.example.com")["status"] == "403"
+
+
+def test_org_route_admits_anyone_with_valid_session():
+    r = _req(cookie=f"sb_session={_jwt(email='anyone@x.com')}")
+    assert orq._check_auth(r, dict(ROUTE_AUTH), "app-x.example.com") is None
