@@ -433,3 +433,36 @@ def test_mark_success_still_sets_owner_absent_field(aws):
                       "url": "https://app-s-2.example.com",
                       "manifest": {"tier": "static", "name": "two"}}, None)
     assert common.get_site("s-2")["status"] == "ACTIVE"
+
+
+def test_smoke_test_uses_effective_auth_not_manifest(aws, monkeypatch):
+    """线上已改成公开、manifest 仍是 true：smoke 必须按公开断言（期待 200）。"""
+    import common
+    import smoke_test
+    job_id = common.create_job("o@x.com", "s-1")
+    calls = []
+
+    def _fake_check(url, require_auth, login_prefix, what):
+        calls.append((url, require_auth))
+
+    monkeypatch.setattr(smoke_test, "_check", _fake_check)
+    smoke_test.handler({"job_id": job_id, "site_id": "s-1",
+                        "url": "https://app-s-1.example.com",
+                        "manifest": {"auth": {"require_login": True}},
+                        "effective_auth": {"require_login": False,
+                                           "allowed_users": "org"}}, None)
+    assert calls and all(require_auth is False for _, require_auth in calls)
+
+
+def test_smoke_test_falls_back_to_manifest_when_effective_absent(aws, monkeypatch):
+    """兼容：老 execution 的 event 里没有 effective_auth（部署过程中升级）。"""
+    import common
+    import smoke_test
+    job_id = common.create_job("o@x.com", "s-1")
+    calls = []
+    monkeypatch.setattr(smoke_test, "_check",
+                        lambda url, ra, lp, what: calls.append(ra))
+    smoke_test.handler({"job_id": job_id, "site_id": "s-1",
+                        "url": "https://app-s-1.example.com",
+                        "manifest": {"auth": {"require_login": True}}}, None)
+    assert calls == [True]

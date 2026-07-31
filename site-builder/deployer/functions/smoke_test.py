@@ -44,7 +44,13 @@ def _check(url: str, require_auth: bool, login_prefix: str, what: str):
 
 def handler(event, context):
     common.update_job(event["job_id"], phase="smoke-test")
-    require_auth = bool(event["manifest"]["auth"]["require_login"])
+    # 按本次实际写入路由的策略断言，不按 manifest：用户可能在线改过
+    # require_login，manifest 里是生成代码时的旧值（spec §3.3.2）。
+    # effective_auth 由 register_route 写入；缺失时回落 manifest，
+    # 兼容升级窗口里已在运行的 execution。
+    effective = event.get("effective_auth") or {}
+    require_auth = bool(effective.get("require_login",
+                                      event["manifest"]["auth"]["require_login"]))
     login_prefix = f"https://auth.{os.environ['BASE_DOMAIN']}/login"
     _check(event["url"] + "/", require_auth, login_prefix, "首页")
     if event["manifest"].get("backend"):
