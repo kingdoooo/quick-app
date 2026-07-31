@@ -190,6 +190,57 @@ def do_undeploy(owner: str, site_id: str, purge_data: bool = False) -> dict:
     return {"job_id": job_id, "purge_data": bool(purge_data)}
 
 
+class PermissionConflict(Exception):
+    """并发修改。MCP 工具把它转成可读文案让 Agent 提示用户重试。"""
+
+
+# 写路径**不在这里预先鉴权**：授权判定在 permissions.write_permissions 内
+# 与 rev 同源完成（分开做会有 TOCTOU——鉴权通过后权限被撤销，写入仍成功）。
+# 这里只负责把 permissions 层的异常翻译成 MCP 的错误类型。
+
+def do_update_permissions(caller: str, site_id: str, require_login=None,
+                          allowed_users=None) -> dict:
+    try:
+        out = permissions.set_access_policy(site_id, actor=caller,
+                                            require_login=require_login,
+                                            allowed_users=allowed_users)
+    except permissions.PermissionDenied as e:
+        raise NotOwner(str(e)) from e
+    except permissions.PermissionConflict as e:
+        raise PermissionConflict(str(e)) from e
+    out["note"] = "已生效，边缘缓存最多 1 分钟后全网一致"
+    return out
+
+
+def do_manage_collaborators(caller: str, site_id: str, add=None, remove=None,
+                            transfer_owner=None) -> dict:
+    try:
+        if transfer_owner:
+            return permissions.transfer_owner(site_id, actor=caller,
+                                              new_owner=transfer_owner)
+        if not add and not remove:
+            raise ValueError("需要指定 add / remove / transfer_owner 之一")
+        collaborators = permissions.set_collaborators(site_id, actor=caller,
+                                                      add=add, remove=remove)
+        site = common.get_site_consistent(site_id) or {}
+        return {"owner": site.get("owner", ""), "collaborators": collaborators}
+    except permissions.PermissionDenied as e:
+        raise NotOwner(str(e)) from e
+    except permissions.PermissionConflict as e:
+        raise PermissionConflict(str(e)) from e
+
+
+def do_get_permissions(caller: str, site_id: str) -> dict:
+    site = _assert_permission(caller, site_id, "read", f"站点 {site_id}")
+    return {"site_id": site_id,
+            "owner": site.get("owner", ""),
+            "collaborators": list(site.get("collaborators") or []),
+            "require_login": bool(site.get("require_login", True)),
+            "allowed_users": site.get("allowed_users", "org"),
+            "my_role": permissions.role_of(caller, site,
+                                           permissions.is_admin(caller))}
+
+
 # ---------- MCP 壳 ----------
 
 # AgentCore Runtime 契约：容器必须监听 0.0.0.0:8000 并暴露 POST /mcp，
@@ -274,6 +325,38 @@ def undeploy_site(site_id: str, purge_data: bool = False) -> dict:
     purge_data=True：额外永久删除该站点的 DynamoDB 表 / DSQL schema 与角色。
       不可恢复——必须先向用户明确确认再传 true。"""
     return do_undeploy(_caller_email(), site_id, purge_data)
+
+
+@mcp.tool()
+def update_site_permissions(site_id: str, require_login: bool | None = None,
+                            allowed_users: list | str | None = None) -> dict:
+    """在线修改站点访问策略——不需要重新部署，约 1 分钟内全网生效。
+
+    require_login: true 需登录后访问，false 公开；不传表示不改。
+    allowed_users: "org"（全组织可访问）或邮箱数组；不传表示不改。
+    站点 owner 与协作者均可调用。site.json 里的 auth 字段不再生效。"""
+    return do_update_permissions(_caller_email(), site_id, require_login,
+                                 allowed_users)
+
+
+@mcp.tool()
+def manage_collaborators(site_id: str, add: list | None = None,
+                         remove: list | None = None,
+                         transfer_owner: str = "") -> dict:
+    """管理站点协作者或转移所有权。仅 owner（或平台管理员）可调用。
+
+    add/remove: 协作者邮箱数组。协作者可部署更新、改访问策略、查状态，
+      但不能下线站点、不能增删协作者。
+    transfer_owner: 新 owner 邮箱。转移后原 owner 自动降级为协作者
+      （防转错人失去访问）。此参数与 add/remove 互斥。"""
+    return do_manage_collaborators(_caller_email(), site_id, add, remove,
+                                   transfer_owner or None)
+
+
+@mcp.tool()
+def get_site_permissions(site_id: str) -> dict:
+    """查询站点当前的访问策略、owner、协作者，以及我对它的角色。"""
+    return do_get_permissions(_caller_email(), site_id)
 
 
 if __name__ == "__main__":

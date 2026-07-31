@@ -69,14 +69,27 @@ def test_runtime_name_matches_api_pattern():
     assert re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_]{0,47}", name), name
 
 
-@pytest.mark.parametrize("tool", ["deploy_site", "confirm_upload", "get_deploy_status",
-                                  "list_my_sites", "undeploy_site"])
-def test_all_five_tools_registered(tool):
+EXPECTED_TOOLS = ["deploy_site", "confirm_upload", "get_deploy_status",
+                  "list_my_sites", "undeploy_site", "update_site_permissions",
+                  "manage_collaborators", "get_site_permissions"]
+
+
+@pytest.mark.parametrize("tool", EXPECTED_TOOLS)
+def test_all_tools_registered(tool):
     import asyncio
 
     import server
     names = {t.name for t in asyncio.run(server.mcp.list_tools())}
     assert tool in names
+
+
+def test_no_unexpected_tools_registered():
+    """工具面是对外契约：多出未登记的工具（比如调试残留）要在这里被拦。"""
+    import asyncio
+
+    import server
+    names = {t.name for t in asyncio.run(server.mcp.list_tools())}
+    assert names == set(EXPECTED_TOOLS)
 
 
 def test_caller_email_rejects_missing_and_malformed_authorization(monkeypatch):

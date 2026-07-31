@@ -144,6 +144,16 @@ def ensure_role() -> str:
          "Action": ["dynamodb:GetItem", "dynamodb:Scan",
                     "dynamodb:ConditionCheckItem"],
          "Resource": f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-admins"},
+        # 路由表：只做权限投影（Update 权限字段）+ 事务条件检查。
+        # 故意**不给** PutItem/DeleteItem：整条 put_item 是部署链
+        # register_route 的事，用 deployer 的 exec role——给了会让 MCP 能整条
+        # 覆盖路由 item（踩掉 static_prefix / api_target，即部署的原子切流）。
+        # 同理不把本 ARN 并进上面的 JobsAndSites（那条带 PutItem）。
+        {"Sid": "RoutingProjection", "Effect": "Allow",
+         "Action": ["dynamodb:GetItem", "dynamodb:UpdateItem",
+                    "dynamodb:ConditionCheckItem"],
+         "Resource": f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/"
+                     + CFG["Platform"]["routing_table"]},
         # presigned PUT 由调用者上传，MCP 侧只需 HeadObject 校验大小
         {"Effect": "Allow", "Action": ["s3:PutObject", "s3:GetObject"],
          "Resource": f"arn:aws:s3:::site-artifacts-{ACCOUNT}/uploads/*"},
@@ -211,6 +221,8 @@ def deploy_runtime(image_uri: str, role_arn: str) -> dict:
             "JOBS_TABLE": CFG["Deployer"]["jobs_table"],
             "SITES_TABLE": CFG["Deployer"]["sites_table"],
             "ADMINS_TABLE": CFG["Deployer"]["admins_table"],
+            # 权限投影的目标表（permissions.write_permissions 的第二个事务项）
+            "ROUTING_TABLE": CFG["Platform"]["routing_table"],
             "TRUSTED_IDPS": CFG["IdP"]["provider_name"] if CFG.has_section("IdP") else "",
             "ARTIFACTS_BUCKET": f"site-artifacts-{ACCOUNT}",
             "STATE_MACHINE_ARN": sm_arn,
@@ -266,7 +278,7 @@ def main() -> None:
 
     print("\n冒烟（需要一个真实 Cognito token）：")
     print("  npx @modelcontextprotocol/inspector  # 连上面 endpoint，带 Bearer token")
-    print("  检查：5 个工具列出 / 无 token 返回 401 /")
+    print("  检查：8 个工具列出 / 无 token 返回 401 /")
     print("       list_my_sites 的 owner == 登录的飞书邮箱（验证 email claim 透传）")
 
 

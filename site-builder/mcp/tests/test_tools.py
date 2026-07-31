@@ -198,3 +198,143 @@ def test_list_sites_includes_collaborations_with_role(aws):
                        status="ACTIVE", tier="static", collaborators=[])
     got = {s["site_id"]: s["role"] for s in server.do_list_sites("me@x.com")}
     assert got == {"mine-abc123": "owner", "theirs-abc123": "collaborator"}
+
+
+SITE_ID = "demo-abc123"
+
+
+def _route_item(site_id=SITE_ID):
+    import boto3
+    import common
+    return boto3.client("dynamodb").get_item(
+        TableName="routing",
+        Key={"subdomain": {"S": common.subdomain_for(site_id)}}).get("Item")
+
+
+def _seed_site_and_route(site_id=SITE_ID, owner="o@x.com", collaborators=None):
+    import boto3
+    import common
+    common.upsert_site(site_id, owner=owner, name="demo", status="ACTIVE",
+                       tier="static", require_login=True, allowed_users="org",
+                       collaborators=collaborators or [])
+    boto3.client("dynamodb").put_item(TableName="routing", Item={
+        "subdomain": {"S": common.subdomain_for(site_id)},
+        "site_id": {"S": site_id}, "route_mode": {"S": "split"},
+        "static_prefix": {"S": f"sites/{site_id}/j"}, "api_target": {"S": ""},
+        "require_auth": {"BOOL": True}, "allowed_users": {"S": "org"},
+        "collaborators": {"L": []}, "owner": {"S": owner}})
+
+
+def test_update_permissions_writes_both_tables(aws):
+    import common
+    import server
+    _seed_site_and_route()
+    out = server.do_update_permissions("o@x.com", SITE_ID,
+                                       require_login=False,
+                                       allowed_users=["a@x.com"])
+    assert out["require_login"] is False
+    assert out["allowed_users"] == ["a@x.com"]
+    assert common.get_site(SITE_ID)["allowed_users"] == ["a@x.com"]
+    item = _route_item()
+    assert item["require_auth"]["BOOL"] is False
+    assert item["allowed_users"]["L"] == [{"S": "a@x.com"}]
+
+
+def test_update_permissions_allows_collaborator(aws):
+    import server
+    _seed_site_and_route(collaborators=["c@x.com"])
+    out = server.do_update_permissions("c@x.com", SITE_ID, require_login=False)
+    assert out["require_login"] is False
+
+
+def test_update_permissions_rejects_outsider(aws):
+    import server
+    _seed_site_and_route()
+    with pytest.raises(server.NotOwner):
+        server.do_update_permissions("x@x.com", SITE_ID, require_login=False)
+
+
+def test_update_permissions_rejects_bad_allowlist(aws):
+    import server
+    _seed_site_and_route()
+    with pytest.raises(ValueError):
+        server.do_update_permissions("o@x.com", SITE_ID,
+                                     allowed_users=["not-an-email"])
+
+
+def test_manage_collaborators_add_syncs_route(aws):
+    import server
+    _seed_site_and_route()
+    out = server.do_manage_collaborators("o@x.com", SITE_ID, add=["c@x.com"])
+    assert out["collaborators"] == ["c@x.com"]
+    assert _route_item()["collaborators"]["L"] == [{"S": "c@x.com"}]
+
+
+def test_manage_collaborators_rejects_collaborator_caller(aws):
+    import server
+    _seed_site_and_route(collaborators=["c@x.com"])
+    with pytest.raises(server.NotOwner):
+        server.do_manage_collaborators("c@x.com", SITE_ID, add=["d@x.com"])
+
+
+def test_transfer_owner_syncs_route(aws):
+    import server
+    _seed_site_and_route()
+    out = server.do_manage_collaborators("o@x.com", SITE_ID,
+                                         transfer_owner="new@x.com")
+    assert out["owner"] == "new@x.com"
+    assert out["collaborators"] == ["o@x.com"]
+    item = _route_item()
+    assert item["owner"]["S"] == "new@x.com"
+    assert item["collaborators"]["L"] == [{"S": "o@x.com"}]
+
+
+def test_transfer_owner_rejected_for_collaborator(aws):
+    import server
+    _seed_site_and_route(collaborators=["c@x.com"])
+    with pytest.raises(server.NotOwner):
+        server.do_manage_collaborators("c@x.com", SITE_ID,
+                                       transfer_owner="c@x.com")
+
+
+def test_get_permissions_returns_current_state(aws):
+    import server
+    _seed_site_and_route(collaborators=["c@x.com"])
+    out = server.do_get_permissions("c@x.com", SITE_ID)
+    assert out["require_login"] is True
+    assert out["allowed_users"] == "org"
+    assert out["collaborators"] == ["c@x.com"]
+    assert out["owner"] == "o@x.com"
+    assert out["my_role"] == "collaborator"
+
+
+def test_get_permissions_rejects_outsider(aws):
+    import server
+    _seed_site_and_route()
+    with pytest.raises(server.NotOwner):
+        server.do_get_permissions("x@x.com", SITE_ID)
+
+
+def test_update_permissions_surfaces_conflict(aws, monkeypatch):
+    """permissions 层的并发冲突必须被转成 MCP 侧的可读异常，不能漏成 500。"""
+    import permissions
+    import server
+    _seed_site_and_route()
+
+    def _boom(*a, **kw):
+        raise permissions.PermissionConflict("站点权限已被其他人修改，请刷新后重试")
+
+    monkeypatch.setattr(permissions, "set_access_policy", _boom)
+    with pytest.raises(server.PermissionConflict):
+        server.do_update_permissions("o@x.com", SITE_ID, require_login=False)
+
+
+def test_update_permissions_works_before_first_deploy(aws):
+    """站点还没部署成功（无路由 item）时改权限不能炸——只更新真源即可。"""
+    import common
+    import server
+    common.upsert_site("nodeploy-abc123", owner="o@x.com", require_login=True,
+                       allowed_users="org", collaborators=[])
+    out = server.do_update_permissions("o@x.com", "nodeploy-abc123",
+                                       require_login=False)
+    assert out["require_login"] is False
