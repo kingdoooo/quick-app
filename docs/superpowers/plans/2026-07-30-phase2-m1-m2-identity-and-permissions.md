@@ -4772,7 +4772,7 @@ git commit -m "docs: 权限管理工具写进 Skill 与部署手册"
   - `_pkce_pair() -> tuple[str, str]`（verifier, challenge）
   - `_encode_state(redirect: str) -> str`（state 只含 redirect+exp）
   - `_decode_state(state: str) -> str | None`（返回 redirect）
-  - `_pkce_cookie(verifier, nonce, base) -> str`、`_read_pkce_cookie(event) -> dict | None`、`PKCE_COOKIE = "__Host-sb_pkce"`
+  - `_pkce_cookie(verifier, nonce) -> str`、`_read_pkce_cookie(event) -> dict | None`、`PKCE_COOKIE = "__Host-sb_pkce"`
   - `_exchange_code(code: str, verifier: str, nonce: str) -> dict`（多两个参数，校验 id_token 的 nonce；返回 `{email, name, idp}`）
   - `session.mint_session_jwt(email, name, secret, ttl_seconds=86400, idp="", scope="", auth_via="")`（payload 增 `idp`/`scope`/`auth_via`，仅在非空时写入）
 
@@ -4891,6 +4891,60 @@ def test_callback_rejects_forged_pkce_cookie():
     state = lh._encode_state("https://app-x.example.com/")
     r = lh.handler(_event("/callback", {"code": "abc", "state": state},
                           cookies=[f"{lh.PKCE_COOKIE}=forged.sig"]), None)
+    assert r["statusCode"] == 400
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_pkce_cookie_with_valid_sig_but_no_verifier_is_rejected():
+    """state 与 pkce cookie 共用 _state_sig、线格式相同——一个合法 state 值就是
+    "签名合法"的 pkce cookie。它解不出 v/n，若不拦就会带空 verifier 去换 token
+    （静默降级成无 PKCE 交换，只剩 Cognito 兜着）。"""
+    forged = lh._encode_state("https://app-x.example.com/")   # 合法签名，但没有 v/n
+    assert lh._read_pkce_cookie({"cookies": [f"{lh.PKCE_COOKIE}={forged}"]}) is None
+    r = lh.handler(_event("/callback", {"code": "abc", "state": forged},
+                          cookies=[f"{lh.PKCE_COOKIE}={forged}"]), None)
+    assert r["statusCode"] == 400
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_pkce_cookie_with_non_ascii_does_not_crash():
+    """cookie 值全由客户端控制：hmac.compare_digest 遇非 ASCII 会抛 TypeError。
+    整段包 try 才能给出约定的 400，而不是 500 + 堆栈。"""
+    state = lh._encode_state("https://app-x.example.com/")
+    assert lh._read_pkce_cookie({"cookies": [f"{lh.PKCE_COOKIE}=YWJj.ü"]}) is None
+    r = lh.handler(_event("/callback", {"code": "abc", "state": state},
+                          cookies=[f"{lh.PKCE_COOKIE}=YWJj.ü"]), None)
+    assert r["statusCode"] == 400
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_callback_without_code_returns_400():
+    """IdP 带 ?error=access_denied 回调时没有 code——不能让 KeyError 冒成 500。"""
+    r_login = lh.handler(_event("/login", {"redirect": "https://app-x.example.com/"}),
+                         None)
+    import urllib.parse as up
+    state = up.unquote(r_login["headers"]["Location"].split("state=")[1].split("&")[0])
+    pkce = next(c for c in r_login["cookies"]
+                if c.startswith(lh.PKCE_COOKIE)).split(";")[0]
+    r = lh.handler(_event("/callback", {"state": state, "error": "access_denied"},
+                          cookies=[pkce]), None)
+    assert r["statusCode"] == 400
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_callback_nonce_mismatch_returns_400_not_500():
+    """nonce 不匹配（两个登录标签页并发时第二个覆盖了单一 cookie）是可预期的
+    用户侧失败——_exchange_code 抛的 ValueError 必须被翻成 400。"""
+    r_login = lh.handler(_event("/login", {"redirect": "https://app-x.example.com/"}),
+                         None)
+    import urllib.parse as up
+    state = up.unquote(r_login["headers"]["Location"].split("state=")[1].split("&")[0])
+    pkce = next(c for c in r_login["cookies"]
+                if c.startswith(lh.PKCE_COOKIE)).split(";")[0]
+    with patch.object(lh, "_exchange_code",
+                      side_effect=ValueError("id_token nonce 与本次登录不匹配")):
+        r = lh.handler(_event("/callback", {"code": "abc", "state": state},
+                              cookies=[pkce]), None)
     assert r["statusCode"] == 400
 
 
@@ -5131,34 +5185,56 @@ def _decode_state(state: str) -> str | None:
         return None
 
 
-def _pkce_cookie(verifier: str, nonce: str, base: str) -> str:
+def _pkce_cookie(verifier: str, nonce: str) -> str:
     """把 verifier/nonce 装进 auth 子域的 host-only 短期 cookie。
 
     __Host- 前缀是浏览器强制的：必须 Secure、必须 Path=/、**必须无 Domain**，
-    因此它只回发给 auth.{base}（/login 与 /callback 同域，读得到）。
-    5 分钟过期，用完即清。
+    因此它只回发给签发它的那台主机（/login 与 /callback 同在 auth.{base}，
+    读得到）。5 分钟过期，用完即清。
+
+    **不要给本函数加 base/domain 参数**：`__Host-` 前缀下任何 `Domain=` 都会让
+    浏览器直接丢弃该 cookie，于是每次登录都走 callback 的 400 分支。
+    `"t": "pkce"` 是类型标记——state 与本 cookie 共用 `_state_sig`，没有它
+    一个合法 state 值就能充当"签名合法"的 pkce cookie（见 _read_pkce_cookie）。
     """
     payload = base64.urlsafe_b64encode(
-        json.dumps({"v": verifier, "n": nonce}).encode()).decode().rstrip("=")
+        json.dumps({"t": "pkce", "v": verifier, "n": nonce}).encode()).decode().rstrip("=")
     sig = _state_sig(payload)
     return (f"{PKCE_COOKIE}={payload}.{sig}; Path=/; Max-Age=300; "
             f"Secure; HttpOnly; SameSite=Lax")
 
 
 def _read_pkce_cookie(event) -> dict | None:
-    """从 callback 请求里取回 verifier/nonce；验签失败或缺失返回 None。"""
+    """从 callback 请求里取回 verifier/nonce；验签失败、缺失或内容不完整返回 None。
+
+    **整段包在 try 里**（不只包 json.loads）：`hmac.compare_digest` 对含非 ASCII
+    的字符串会抛 `TypeError`，而 cookie 值完全由客户端控制——只包 json.loads
+    时一个 `__Host-sb_pkce=YWJj.ü` 就能让 handler 抛出 500 + 堆栈，而不是约定的
+    400。`_decode_state` 本来就是整段包的，这里必须一致。
+
+    **v/n 必须非空**：`_state_sig` 同时给 state 与本 cookie 签名、且线格式相同，
+    所以一个合法 state 值就是一个"签名合法"的 pkce cookie——它解出来
+    `{"v": "", "n": ""}`，若不检查就会带着空 verifier 去 `_post_token`，
+    正是"静默降级成无 PKCE 交换"（现在只靠 Cognito 拒空 verifier 兜着，
+    不是本地约束）。同时给 payload 打类型标记，彻底断开两种上下文的签名复用。
+    """
     for raw in (event.get("cookies") or []):
         name, _, value = raw.partition("=")
         if name.strip() != PKCE_COOKIE:
             continue
-        body, _, sig = value.rpartition(".")
-        if not hmac.compare_digest(sig, _state_sig(body)):
-            return None
         try:
+            body, _, sig = value.rpartition(".")
+            if not hmac.compare_digest(sig, _state_sig(body)):
+                return None
             data = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+            if data.get("t") != "pkce":      # state 值不能当 pkce cookie 用
+                return None
+            verifier, nonce = data.get("v", ""), data.get("n", "")
+            if not verifier or not nonce:
+                return None
+            return {"v": verifier, "n": nonce}
         except Exception:
             return None
-        return {"v": data.get("v", ""), "n": data.get("n", "")}
     return None
 
 
@@ -5232,7 +5308,7 @@ def _exchange_code(code: str, verifier: str, nonce: str) -> dict:
                         "state": _encode_state(redirect)}))
         # verifier/nonce 走 host-only cookie（与浏览器绑定），不进 URL
         return {"statusCode": 302, "headers": {"Location": auth_url},
-                "cookies": [_pkce_cookie(verifier, nonce, base)], "body": ""}
+                "cookies": [_pkce_cookie(verifier, nonce)], "body": ""}
 
     if path == "/callback":
         redirect = _decode_state(qs.get("state", ""))
@@ -5240,11 +5316,21 @@ def _exchange_code(code: str, verifier: str, nonce: str) -> dict:
             return {"statusCode": 400, "body": "invalid or expired state"}
         pkce = _read_pkce_cookie(event)
         if pkce is None:
-            # cookie 丢失（换了浏览器、被清、超过 5 分钟）——比静默降级到
-            # 无 PKCE 安全：让用户重新走一次登录。
+            # cookie 丢失/被篡改/内容不完整（换了浏览器、被清、超过 5 分钟、
+            # 或拿 state 值来冒充）——比静默降级到无 PKCE 安全：重走一次登录。
             return {"statusCode": 400,
                     "body": "登录状态已过期，请重新登录"}
-        user = _exchange_code(qs["code"], pkce["v"], pkce["n"])
+        # IdP 也可能带着 ?error=access_denied 回调（没有 code），或 code 被重放、
+        # nonce 不匹配（两个登录标签页并发时第二个会覆盖单一 cookie）。
+        # 这些都是可预期的用户侧失败，必须给 400 而不是让异常冒成 500 +堆栈。
+        code = qs.get("code", "")
+        if not code:
+            return {"statusCode": 400,
+                    "body": "授权失败或被取消，请重新登录"}
+        try:
+            user = _exchange_code(code, pkce["v"], pkce["n"])
+        except ValueError:
+            return {"statusCode": 400, "body": "登录校验失败，请重新登录"}
         token = mint_session_jwt(user["email"], user["name"],
                                  os.environ["JWT_SECRET"], idp=user.get("idp", ""),
                                  auth_via=user.get("auth_via", ""))
@@ -5518,6 +5604,49 @@ def test_assert_no_native_flows_rejects_drift():
                                   "ALLOW_USER_PASSWORD_AUTH"]})
 
 
+def test_native_auth_flows_covers_entire_enum_except_refresh():
+    """denylist 必须等于 ExplicitAuthFlows 枚举减去 refresh——按真实 service
+    model 比对，而不是照着记忆列。
+
+    漏项的后果不是"少拦一种"，而是两道闸门一起瞎掉：漏掉的值既过
+    _assert_no_native_flows 也过 _verify_no_native_flows，而它开的是真的原生认证。
+    botocore 1.43.53 实测该枚举有 9 个值，legacy 三个（ADMIN_NO_SRP_AUTH /
+    CUSTOM_AUTH_FLOW_ONLY / USER_PASSWORD_AUTH）没有 ALLOW_ 前缀，最易漏。
+    """
+    import botocore.session
+    model = botocore.session.get_session().get_service_model("cognito-idp")
+    enum = set(model.operation_model("CreateUserPoolClient").input_shape
+               .members["ExplicitAuthFlows"].member.enum)
+    assert enum - {"ALLOW_REFRESH_TOKEN_AUTH"} == set(dp.NATIVE_AUTH_FLOWS)
+
+
+@pytest.mark.parametrize("legacy", ["ADMIN_NO_SRP_AUTH", "CUSTOM_AUTH_FLOW_ONLY",
+                                    "USER_PASSWORD_AUTH"])
+def test_assert_rejects_legacy_native_flow_values(legacy):
+    """legacy 值（无 ALLOW_ 前缀）同样开原生认证，必须被拦。
+
+    注意 USER_PASSWORD_AUTH 与 ALLOW_USER_PASSWORD_AUTH 是枚举里两个不同的值。
+    """
+    with pytest.raises(SystemExit, match="原生认证"):
+        dp._assert_no_native_flows("site", {"ExplicitAuthFlows": [legacy]})
+
+
+def test_each_client_gets_its_own_provider_list():
+    """两个 client 不能共享同一个 SupportedIdentityProviders 对象。
+
+    共享时任何一处 append 会静默改掉另一个 client 的 provider 名单——而这正是
+    org 边界字段（实测：往 site 的名单 append "COGNITO"，mcp 的也变成
+    [Okta, COGNITO]）。M4 传 include_machine=True 做 per-client 调整时最可能踩到。
+    """
+    clients = dp.client_configs("example.com", [], idp_name="Okta")
+    site_p = clients["site"]["SupportedIdentityProviders"]
+    mcp_p = clients["mcp"]["SupportedIdentityProviders"]
+    assert site_p == mcp_p == ["Okta"]
+    assert site_p is not mcp_p
+    site_p.append("COGNITO")                      # 污染其中一个
+    assert mcp_p == ["Okta"]                      # 另一个必须毫发无损
+
+
 def test_verify_no_native_flows_reads_back_from_aws():
     """下发后必须读回复验：update 是整体替换，漂移只能靠 describe 发现。"""
     import boto3
@@ -5648,13 +5777,22 @@ POOL_NAME = "site-builder-users"
 MCP_LOCALHOST_CALLBACK = "http://localhost:18765/callback"
 
 # spec §3.5 第 4 条：org 边界 = app client 不开任何原生认证 flow。
-# 只留 refresh（正常会话续期需要）。加入下面任何一项即打破边界：
-#   ALLOW_USER_PASSWORD_AUTH / ALLOW_USER_SRP_AUTH / ALLOW_CUSTOM_AUTH /
-#   ALLOW_USER_AUTH / ALLOW_ADMIN_USER_PASSWORD_AUTH
+# 只留 refresh（正常会话续期需要）。
 NATIVE_AUTH_DISABLED = ["ALLOW_REFRESH_TOKEN_AUTH"]
+# **必须覆盖 ExplicitAuthFlows 的全部非 refresh 枚举值，legacy 三个也要列**：
+# botocore 1.43.53 实测该枚举是 9 个值——除 5 个 ALLOW_* 外还有 3 个 legacy
+# 值 ADMIN_NO_SRP_AUTH / CUSTOM_AUTH_FLOW_ONLY / USER_PASSWORD_AUTH
+# （注意最后一个没有 ALLOW_ 前缀，与 ALLOW_USER_PASSWORD_AUTH 是两个不同值）。
+# 漏掉它们的后果实测过：ExplicitAuthFlows=["USER_PASSWORD_AUTH"] 能同时通过
+# _assert_no_native_flows 与 _verify_no_native_flows，而原生密码认证是全开的
+# ——两道闸门一起瞎掉，等于边界不存在。
 NATIVE_AUTH_FLOWS = ("ALLOW_USER_PASSWORD_AUTH", "ALLOW_USER_SRP_AUTH",
                      "ALLOW_CUSTOM_AUTH", "ALLOW_USER_AUTH",
-                     "ALLOW_ADMIN_USER_PASSWORD_AUTH")
+                     "ALLOW_ADMIN_USER_PASSWORD_AUTH",
+                     # legacy（无 ALLOW_ 前缀）——AWS 不允许与 ALLOW_* 混用，
+                     # 但手工建的 client 或调试期改动可能只用它们
+                     "ADMIN_NO_SRP_AUTH", "CUSTOM_AUTH_FLOW_ONLY",
+                     "USER_PASSWORD_AUTH")
 
 
 def pool_config(base_domain: str) -> dict:
@@ -5690,7 +5828,11 @@ def client_configs(base_domain: str, extra_mcp_callbacks: list[str],
     allowed_users="org" 的语义就被击穿（spec §3.5）。未给出时回落
     ["COGNITO"]（首次部署、联邦还没接），main() 会显式告警。
     """
-    providers = [idp_name] if idp_name else ["COGNITO"]
+    # 每个 client 一份独立副本：共享同一个 list 对象时，任何一处 append
+    # 会静默改掉另一个 client 的 provider 名单——而这正是 org 边界字段
+    # （实测：往 site 的名单 append "COGNITO"，mcp 的也变成 [Okta, COGNITO]）。
+    # M4 走 include_machine=True 时最可能第一次踩到。
+    _providers = [idp_name] if idp_name else ["COGNITO"]
     site = {
         "ClientName": "site-builder-site",
         "GenerateSecret": True,
@@ -5699,7 +5841,7 @@ def client_configs(base_domain: str, extra_mcp_callbacks: list[str],
         "AllowedOAuthScopes": ["openid", "email", "profile"],
         "CallbackURLs": [f"https://auth.{base_domain}/callback"],
         "LogoutURLs": [f"https://auth.{base_domain}/logout"],
-        "SupportedIdentityProviders": providers,
+        "SupportedIdentityProviders": list(_providers),
         # refresh token 有效期收到 1 天（默认 30 天）。理由：refresh token
         # 一旦签发，在有效期内可持续换新 token，而新 token 的 auth_via 是
         # 受信的 TokenGeneration_RefreshTokens——万一原生 flow 曾被误开，
@@ -5734,7 +5876,7 @@ def client_configs(base_domain: str, extra_mcp_callbacks: list[str],
         "AllowedOAuthFlowsUserPoolClient": True,
         "AllowedOAuthScopes": ["openid", "email", "profile"],
         "CallbackURLs": [MCP_LOCALHOST_CALLBACK] + list(extra_mcp_callbacks),
-        "SupportedIdentityProviders": providers,
+        "SupportedIdentityProviders": list(_providers),
         # 同 site：refresh 1 天 + access/id 15 分钟。mcp client 这条更要紧——
         # AgentCore authorizer 不回查 Cognito 撤销状态，吊销后残留的 access
         # token 在过期前仍能调 MCP（部署/改权限/下线）。
