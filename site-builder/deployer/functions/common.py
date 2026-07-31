@@ -81,6 +81,30 @@ def get_site(site_id: str) -> dict | None:
     return _table("SITES_TABLE").get_item(Key={"site_id": site_id}).get("Item")
 
 
+def get_site_consistent(site_id: str) -> dict | None:
+    """强一致读。授权判定与 read-modify-write 用它：最终一致读会放大
+    "权限刚被撤销但旧请求仍读到旧名单"的窗口。"""
+    return _table("SITES_TABLE").get_item(
+        Key={"site_id": site_id}, ConsistentRead=True).get("Item")
+
+
+def _paginate(method, **kwargs) -> list[dict]:
+    """DynamoDB query/scan 分页汇总。
+
+    单次 query/scan 最多返回 1MB，**超出会静默截断**——不翻页就会出现
+    "站点列表少了几个"、"管理员名单看起来只剩一个"这类难查的问题。
+    """
+    items, start_key = [], None
+    while True:
+        if start_key:
+            kwargs["ExclusiveStartKey"] = start_key
+        resp = method(**kwargs)
+        items.extend(resp.get("Items", []))
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            return items
+
+
 class InvalidSiteName(ValueError):
     pass
 
