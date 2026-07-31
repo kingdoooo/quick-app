@@ -31,3 +31,14 @@ edge_role_arn =
 
 [MCP]
 endpoint_url =
+
+# 可选：给平台专用 user pool 联邦一个 OIDC IdP。
+# 平台对 IdP 无感——只要 IdP 能给 email claim 即可（飞书适配器与
+# Okta/Azure AD 等标准 IdP 走同一条配置路径，见 DEPLOY.md ①）。
+# 留空则只建 pool 与 client，联邦另行手工配置。
+[IdP]
+provider_name =
+issuer =
+client_id =
+client_secret =
+scopes = openid email profile

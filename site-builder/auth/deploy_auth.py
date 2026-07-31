@@ -4,6 +4,7 @@
 token，部署 MCP 的 owner 识别依赖它）。幂等可重跑。"""
 import configparser
 import io
+import re
 import secrets
 import subprocess
 import tempfile
@@ -119,15 +120,18 @@ _POOL_MUTABLE = ("Policies", "DeletionProtection", "AutoVerifiedAttributes",
                  "VerificationMessageTemplate", "UserPoolTier")
 
 
-def ensure_pre_token_trigger(role_arn: str) -> None:
+def ensure_pre_token_trigger(role_arn: str, pool_id: str | None = None) -> None:
     """部署 pre-token-generation V2 Lambda 并挂到用户池。
 
     真机钉死（2026-07-29，AGENTCORE-SPIKE.md §7）：部署 MCP 网关只接受
     access token，而 Cognito access token 默认不含 email——owner 识别全靠
     这个触发器把 email 注入 access token。要求用户池 Essentials+ tier。
+
+    pool_id 显式传入时用它（deploy_pool.py 建新 pool 后立即挂载）；
+    默认取 config.ini 的当前 pool。
     """
     fn = "site-auth-pre-token"
-    pool_id = CFG["Cognito"]["user_pool_id"]
+    pool_id = pool_id or CFG["Cognito"]["user_pool_id"]
     cog = boto3.client("cognito-idp", region_name=REGION)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
@@ -142,14 +146,21 @@ def ensure_pre_token_trigger(role_arn: str) -> None:
                             Code={"ZipFile": code}, Timeout=5, MemorySize=128)
         lam.get_waiter("function_active").wait(FunctionName=fn)
     fn_arn = lam.get_function(FunctionName=fn)["Configuration"]["FunctionArn"]
+    # StatementId 必须带 pool 标识：固定 id + 吞掉 ResourceConflictException
+    # 会让新 pool 的授权永远加不上（旧语句已占用该 id，但它的 SourceArn 绑的是
+    # 旧 pool）→ 新 pool 调用触发器被拒 → email/idp claim 注入失败，
+    # MCP 的 owner 识别整条链断掉，token 签发本身也可能报 trigger 错误。
+    # 迁移期新旧两条语句并存，验证通过后再删旧的。
+    sid = "cognito-invoke-" + re.sub(r"[^A-Za-z0-9-]", "-", pool_id)
     try:
-        lam.add_permission(FunctionName=fn, StatementId="cognito-invoke",
+        lam.add_permission(FunctionName=fn, StatementId=sid,
                            Action="lambda:InvokeFunction",
                            Principal="cognito-idp.amazonaws.com",
                            SourceArn=f"arn:aws:cognito-idp:{REGION}:"
                                      f"{CFG['Platform']['account_id']}:userpool/{pool_id}")
+        print(f"  已授权 {pool_id} 调用 {fn}（{sid}）")
     except lam.exceptions.ResourceConflictException:
-        pass
+        pass  # 同一 pool 重复运行，幂等
     pool = cog.describe_user_pool(UserPoolId=pool_id)["UserPool"]
     cfg = pool.get("LambdaConfig", {}).get("PreTokenGenerationConfig", {})
     if cfg.get("LambdaArn") == fn_arn and cfg.get("LambdaVersion") == "V2_0":
