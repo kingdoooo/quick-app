@@ -98,6 +98,15 @@ base_domain = example.com
 #   aws ssm put-parameter --name /site-builder/jwt-secret --type SecureString \
 #     --value "$(python3 -c 'import secrets;print(secrets.token_hex(32))')" \
 #     --region us-east-1
+# spec §3.5：会话必须来自可信企业 IdP。存量会话没有 idp claim，
+# 所以首次部署配 false；切到平台专用 pool 且全体用户重新登录后置 true
+# （M1 的完成条件——停在 false 等于这道防线没生效）。
+# 两项都是必填：stack.py 直接读，缺键会在 synth 时报 NoOptionError（响亮失败），
+# 而不是把占位符字面量部署出去（那等于静默关闭这道防线）。
+require_idp_claim = false
+# Cognito 里 IdP 的 provider name，逗号分隔（如 Feishu 或 Okta,Feishu）。
+# 必须与 site-builder/config.ini [IdP] provider_name 一致。
+trusted_idps =
 
 # ============================================================================
 # Resource Tags (OPTIONAL - Recommended for cost tracking)

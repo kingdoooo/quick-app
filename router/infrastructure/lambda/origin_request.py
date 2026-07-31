@@ -224,6 +224,18 @@ def _route_to_lambda(request, route, uri, qs):
 
 BASE_DOMAIN = "{{BASE_DOMAIN}}"
 
+# spec §3.5：org 语义的执行点。移除 COGNITO 不阻止 SDK 认证本地用户，
+# 只有这里能把"身份必须来自企业 IdP"落到请求路径上。
+# 迁移宽限期用开关控制（存量会话没有 idp claim）——切 pool 且全员重新登录后
+# 置 true，这是 M1 的完成条件。
+REQUIRE_IDP_CLAIM = "{{REQUIRE_IDP_CLAIM}}".strip().lower() == "true"
+TRUSTED_IDPS = tuple(x.strip() for x in "{{TRUSTED_IDPS}}".split(",") if x.strip())
+# 只放行托管登录页与它换出的 refresh token。原生 InitiateAuth 完成后触发的
+# TokenGeneration_Authentication 一律拒——linked 本地用户与设过密码的联邦
+# 用户走的就是它，而它们的 idp claim 看起来完全合法（spec §3.5）。
+TRUSTED_AUTH_SOURCES = ("TokenGeneration_HostedAuth",
+                        "TokenGeneration_RefreshTokens")
+
 
 def _b64url_decode(s: str) -> bytes:
     import base64
@@ -320,6 +332,19 @@ def _check_auth(request, route, host):
     if not claims:
         return _redirect_login(host, request.get("uri", "/"),
                                request.get("querystring", ""))
+
+    if REQUIRE_IDP_CLAIM:
+        # 按未登录处理（302）而非 403：本地用户/旧会话应被引导去正规登录，
+        # 403 会让用户以为"没权限"而去找站点 owner 加名单。
+        # 两个 claim 都要过：
+        #   idp      —— 账号关联过可信 IdP（拦纯本地用户）
+        #   auth_via —— 本次 token 出自托管登录或其 refresh（拦 linked 用户
+        #               与设过密码的联邦用户走的原生 InitiateAuth 路径；
+        #               它们的 idp 是合法的，只有来源能分辨）
+        if (claims.get("idp") not in TRUSTED_IDPS
+                or claims.get("auth_via") not in TRUSTED_AUTH_SOURCES):
+            return _redirect_login(host, request.get("uri", "/"),
+                                   request.get("querystring", ""))
 
     allowed = route.get("allowed_users", "org")
     if allowed != "org":

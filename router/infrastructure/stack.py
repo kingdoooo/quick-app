@@ -160,11 +160,22 @@ class WebRouterStack(Stack):
         # deploy time (see load_jwt_secret); the bucket lives in us-east-1
         # (Lambda@Edge SigV4 in origin_request.py signs for us-east-1).
         jwt_secret = load_jwt_secret()
+        # require_idp_claim / trusted_idps (Task 8b, spec §3.5): the edge check
+        # that enforces "identity must come from the enterprise IdP". Both keys
+        # are REQUIRED in config.ini — a missing key raises NoOptionError here
+        # (loud) rather than leaving the placeholder literal in the deployed
+        # code, which would silently evaluate to False and disable the defense.
         lambda_code = (lambda_code
             .replace("{{FRONTEND_BUCKET_DOMAIN}}",
                      f"{frontend_bucket}.s3.us-east-1.amazonaws.com")
             .replace("{{JWT_SECRET}}", jwt_secret)
-            .replace("{{BASE_DOMAIN}}", base_domain))
+            .replace("{{BASE_DOMAIN}}", base_domain)
+            .replace("{{REQUIRE_IDP_CLAIM}}",
+                     config.get("SiteBuilder", "require_idp_claim",
+                                "APP_REQUIRE_IDP_CLAIM"))
+            .replace("{{TRUSTED_IDPS}}",
+                     config.get("SiteBuilder", "trusted_idps",
+                                "APP_TRUSTED_IDPS")))
         
         # Write to temporary file
         temp_dir = tempfile.mkdtemp()

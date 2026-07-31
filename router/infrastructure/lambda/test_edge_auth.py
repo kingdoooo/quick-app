@@ -7,18 +7,25 @@ sys.path.insert(0, str(Path(__file__).parent))
 _SRC = (Path(__file__).parent / "origin_request.py").read_text()
 for k, v in {"{{DYNAMODB_TABLE_NAME}}": "t", "{{DYNAMODB_REGION}}": "us-east-1",
              "{{FRONTEND_BUCKET_DOMAIN}}": "b.s3.us-east-1.amazonaws.com",
-             "{{JWT_SECRET}}": "test-secret", "{{BASE_DOMAIN}}": "example.com"}.items():
+             "{{JWT_SECRET}}": "test-secret", "{{BASE_DOMAIN}}": "example.com",
+             "{{REQUIRE_IDP_CLAIM}}": "true",
+             "{{TRUSTED_IDPS}}": "Feishu,Okta"}.items():
     _SRC = _SRC.replace(k, v)
 (Path(__file__).parent / "_edge_auth_testable.py").write_text(_SRC)
 import _edge_auth_testable as orq
 
 
-def _jwt(email="a@x.com", name="Alice", exp_delta=3600, secret="test-secret"):
+def _jwt(email="a@x.com", name="Alice", exp_delta=3600, secret="test-secret",
+         idp="Feishu", auth_via="TokenGeneration_HostedAuth"):
     b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
     h = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
     payload = {"name": name, "exp": int(time.time()) + exp_delta}
     if email is not None:  # email=None -> payload 完全省略 email 字段
         payload["email"] = email
+    if idp:
+        payload["idp"] = idp
+    if auth_via:
+        payload["auth_via"] = auth_via
     p = b64(json.dumps(payload).encode())
     sig = b64(hmac.new(secret.encode(), f"{h}.{p}".encode(), hashlib.sha256).digest())
     return f"{h}.{p}.{sig}"
@@ -231,6 +238,113 @@ def test_unparsable_allowlist_is_fail_closed():
     assert orq._check_auth(r, route, "app-x.example.com")["status"] == "403"
 
 
-def test_org_route_admits_anyone_with_valid_session():
-    r = _req(cookie=f"sb_session={_jwt(email='anyone@x.com')}")
+def test_org_route_admits_any_email_from_trusted_idp():
+    """org 的语义是"来自可信 IdP 的任何人"，不是"任何有效会话"。"""
+    r = _req(cookie=f"sb_session={_jwt(email='anyone@x.com')}")   # 带 idp
     assert orq._check_auth(r, dict(ROUTE_AUTH), "app-x.example.com") is None
+
+
+# ---- Task 8b: idp / auth_via 校验（org 语义的执行点，spec §3.5） ----
+
+
+def _jwt_idp(email="a@x.com", idp="Feishu", exp_delta=3600, secret="test-secret",
+             auth_via="TokenGeneration_HostedAuth"):
+    """带 idp + auth_via 的会话 JWT（Task 13 起 auth 服务签的就是这种）。"""
+    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+    h = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+    payload = {"email": email, "name": "Alice",
+               "exp": int(time.time()) + exp_delta}
+    if idp:
+        payload["idp"] = idp
+    if auth_via:
+        payload["auth_via"] = auth_via
+    p = b64(json.dumps(payload).encode())
+    sig = b64(hmac.new(secret.encode(), f"{h}.{p}".encode(), hashlib.sha256).digest())
+    return f"{h}.{p}.{sig}"
+
+
+def test_trusted_idp_session_is_admitted():
+    r = _req(cookie=f"sb_session={_jwt_idp(idp='Feishu')}")
+    assert orq._check_auth(r, dict(ROUTE_AUTH), "app-x.example.com") is None
+
+
+def test_second_trusted_idp_also_admitted():
+    r = _req(cookie=f"sb_session={_jwt_idp(idp='Okta')}")
+    assert orq._check_auth(r, dict(ROUTE_AUTH), "app-x.example.com") is None
+
+
+def test_session_without_idp_is_rejected_when_required():
+    """本地用户（SDK 直接认证 user pool）签出的会话没有 idp——必须拦住。
+
+    这是 spec §3.5 的核心：移除 COGNITO 不阻止 SDK 认证本地用户，
+    只有这条校验能把"身份必须来自企业 IdP"落到请求路径上。
+    """
+    r = _req(cookie=f"sb_session={_jwt_idp(idp=None)}")
+    resp = orq._check_auth(r, dict(ROUTE_AUTH), "app-x.example.com")
+    assert resp["status"] == "302"          # 按未登录处理，不是 403
+
+
+def test_untrusted_idp_is_rejected():
+    r = _req(cookie=f"sb_session={_jwt_idp(idp='EvilCorp')}")
+    assert orq._check_auth(r, dict(ROUTE_AUTH),
+                           "app-x.example.com")["status"] == "302"
+
+
+def test_native_auth_source_is_rejected_even_with_trusted_idp():
+    """linked 本地用户 / 设过密码的联邦用户：idp 合法但走原生 InitiateAuth。
+
+    这是 idp claim 单独拦不住的那一类（spec §3.5 的效力边界）——
+    它们的 identities 里确实有可信 provider，只有 auth_via 能分辨。
+    """
+    r = _req(cookie=f"sb_session={_jwt_idp(idp='Feishu', auth_via='TokenGeneration_Authentication')}")
+    assert orq._check_auth(r, dict(ROUTE_AUTH),
+                           "app-x.example.com")["status"] == "302"
+
+
+def test_refresh_token_source_is_admitted():
+    """托管登录换出的 refresh token 续期属正常路径，不能拦。"""
+    r = _req(cookie=f"sb_session={_jwt_idp(auth_via='TokenGeneration_RefreshTokens')}")
+    assert orq._check_auth(r, dict(ROUTE_AUTH), "app-x.example.com") is None
+
+
+def test_missing_auth_via_is_rejected():
+    """旧会话（升级前签发）没有 auth_via——开关开启后按未登录处理。"""
+    r = _req(cookie=f"sb_session={_jwt_idp(auth_via=None)}")
+    assert orq._check_auth(r, dict(ROUTE_AUTH),
+                           "app-x.example.com")["status"] == "302"
+
+
+def test_idp_check_applies_to_named_allowlist_too():
+    """名单站点同样要过 idp 校验——不能因为在名单里就跳过来源检查。"""
+    route = {**ROUTE_AUTH, "allowed_users": ["a@x.com"]}
+    r = _req(cookie=f"sb_session={_jwt_idp(email='a@x.com', idp=None)}")
+    assert orq._check_auth(r, route, "app-x.example.com")["status"] == "302"
+
+
+def test_public_route_skips_idp_check():
+    """公开站点（require_auth=False）根本不验会话，自然也不验 idp。"""
+    route = {**ROUTE_AUTH, "require_auth": False}
+    r = _req(cookie=f"sb_session={_jwt_idp(idp=None)}")
+    assert orq._check_auth(r, route, "app-x.example.com") is None
+
+
+def test_idp_check_disabled_by_switch():
+    """开关为 false 时放行无 idp 的会话——迁移宽限期的行为。
+
+    用独立的 testable 副本验证：把占位符替换成 false 后重新加载模块。
+    """
+    import importlib
+    import sys
+    src = (Path(__file__).parent / "origin_request.py").read_text()
+    for k, v in {"{{DYNAMODB_TABLE_NAME}}": "t", "{{DYNAMODB_REGION}}": "us-east-1",
+                 "{{FRONTEND_BUCKET_DOMAIN}}": "b.s3.us-east-1.amazonaws.com",
+                 "{{JWT_SECRET}}": "test-secret", "{{BASE_DOMAIN}}": "example.com",
+                 "{{REQUIRE_IDP_CLAIM}}": "false",
+                 "{{TRUSTED_IDPS}}": "Feishu"}.items():
+        src = src.replace(k, v)
+    (Path(__file__).parent / "_edge_noidp_testable.py").write_text(src)
+    sys.path.insert(0, str(Path(__file__).parent))
+    mod = importlib.import_module("_edge_noidp_testable")
+    importlib.reload(mod)
+    r = _req(cookie=f"sb_session={_jwt_idp(idp=None)}")
+    assert mod._check_auth(r, dict(ROUTE_AUTH), "app-x.example.com") is None
