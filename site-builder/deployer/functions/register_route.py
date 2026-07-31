@@ -50,8 +50,11 @@ def _seed_permissions_if_absent(site_id: str, manifest_auth: dict,
                 # 后续 ConditionCheck 察觉不到中间发生过初始化。
                 ":one": 1})
     except botocore.exceptions.ClientError as e:
+        # ConditionalCheckFailed = 真源已存在：用它的值，不覆盖（幂等吞掉）。
+        # 其余错误（限流、校验……）必须如实上抛——放宽成裸 pass 会让 seed
+        # 静默失败，_route_item 回落 allowed_users="org"（fail-open 扩权）。
         if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
-            raise   # 真源已存在：用它的值，不覆盖
+            raise
 
 
 def _route_item(event, site: dict, owner: str, subdomain: str) -> dict:

@@ -143,12 +143,18 @@ def test_register_route_refuses_stale_snapshot(aws, monkeypatch):
 
     real_get_site = common.get_site_consistent
     calls = {"n": 0}
+    tx_attempts = {"n": 0}
 
     def _racing_get_site(site_id):
         site = real_get_site(site_id)   # real_get_site = common.get_site_consistent
         calls["n"] += 1
-        if calls["n"] == 1:
-            # 第一次读之后、写路由之前，别人把权限收紧了（rev 推进）
+        if calls["n"] == 2:
+            # **必须在第 2 次读（循环内的读）之后注入**。第 1 次读是 handler
+            # 顶部 seed 前的预读——在那儿注入的话，循环读到的已经是收紧后的
+            # 新值，第一笔事务直接成功，重试路径从未执行：把 ConditionCheck
+            # 整个删掉、MAX_ROUTE_ATTEMPTS 改 1，测试照样全绿（moto 实测，
+            # 上一版正是这么假绿的）。在循环读之后注入，循环拿到的才是
+            # 陈旧快照，事务被 rev 条件取消，才走到重读重试。
             common.upsert_site(site_id, require_login=True,
                                allowed_users=["vip@x.com"], permissions_rev=1)
         return site
@@ -157,16 +163,138 @@ def test_register_route_refuses_stale_snapshot(aws, monkeypatch):
     # patch get_site 的话回调根本不会执行，测试变成空跑。
     monkeypatch.setattr(register_route.common, "get_site_consistent",
                         _racing_get_site)
-    register_route.handler({"job_id": job_id, "site_id": "s-1", "api_target": "",
-                            "manifest": {"auth": {"require_login": False,
-                                                  "allowed_users": "org"}}}, None)
+
+    # 数事务次数：只断言最终路由状态无法区分"条件事务重试后成稿"与
+    # "根本没有条件保护、一把裸写"。>=2 才证明第一笔被取消、重试发生过。
+    real_client = boto3.client
+
+    def _counting_client(*args, **kwargs):
+        client = real_client(*args, **kwargs)
+        if args and args[0] == "dynamodb":
+            real_tx = client.transact_write_items
+
+            def _wrapped(**kw):
+                tx_attempts["n"] += 1
+                return real_tx(**kw)
+
+            client.transact_write_items = _wrapped
+        return client
+
+    monkeypatch.setattr(register_route.boto3, "client", _counting_client)
+    out = register_route.handler(
+        {"job_id": job_id, "site_id": "s-1", "api_target": "",
+         "manifest": {"auth": {"require_login": False,
+                               "allowed_users": "org"}}}, None)
 
     item = boto3.client("dynamodb").get_item(
         TableName="routing", Key={"subdomain": {"S": "app-s-1"}})["Item"]
-    # 最终必须是收紧后的策略，而不是第一次读到的"公开"
+    # 最终必须是收紧后的策略，而不是循环第一次读到的"公开"
     assert item["require_auth"]["BOOL"] is True
     assert item["allowed_users"]["L"] == [{"S": "vip@x.com"}]
     assert int(item["permissions_rev"]["N"]) == 1
+    assert tx_attempts["n"] >= 2        # 第一笔被 rev 条件取消 → 真的重试了
+    # effective_auth 必须来自最终成稿的那次快照（不是重试前的旧快照）——
+    # 它喂给 smoke_test，取错快照会把成功部署判成 FAILED（Task 5b）。
+    assert out["effective_auth"] == {"require_login": True,
+                                     "allowed_users": ["vip@x.com"]}
+
+
+def test_register_route_gives_up_after_max_attempts(aws, monkeypatch):
+    """重试耗尽必须让部署 FAILED——绝不用旧快照把路由写回公开。
+
+    每次循环读之后都推进 rev（持续冲突），三次全被取消后应抛 RuntimeError，
+    且路由表里没有 item（宁可失败也不留下陈旧的公开状态）。
+    MAX_ROUTE_ATTEMPTS 改 1 或删掉 ConditionCheck 都会让本测试失败。
+    """
+    import boto3
+    import common
+    import register_route
+    common.upsert_site("s-1", owner="o@x.com", require_login=False,
+                       allowed_users="org", collaborators=[], permissions_rev=0)
+    job_id = common.create_job("o@x.com", "s-1")
+    real = common.get_site_consistent
+    state = {"rev": 0, "reads": 0}
+
+    def _always_racing(site_id):
+        site = real(site_id)
+        state["reads"] += 1
+        if state["reads"] >= 2:                 # 循环内的每次读之后都被人抢先
+            state["rev"] += 1
+            common.upsert_site(site_id, permissions_rev=state["rev"] + 100)
+        return site
+
+    monkeypatch.setattr(register_route.common, "get_site_consistent",
+                        _always_racing)
+    with pytest.raises(RuntimeError, match="并发修改"):
+        register_route.handler(
+            {"job_id": job_id, "site_id": "s-1", "api_target": "",
+             "manifest": {"auth": {"require_login": False,
+                                   "allowed_users": "org"}}}, None)
+    assert "Item" not in boto3.client("dynamodb").get_item(
+        TableName="routing", Key={"subdomain": {"S": "app-s-1"}})
+
+
+def test_seed_reraises_non_conditional_errors(aws, monkeypatch):
+    """seed 的 except 只放过 ConditionalCheckFailed；其余错误必须如实上抛。
+
+    把这个分支放宽成裸 pass 的后果：seed 静默失败 → site 行没有权限字段 →
+    _route_item 回落 allowed_users="org"——指定名单被放大成全体可信 IdP 用户
+    （fail-open）。本测试锁死"其他 ClientError 不被吞"。
+    """
+    import botocore.exceptions
+    import common
+    import register_route
+    common.upsert_site("s-1", owner="o@x.com")
+    job_id = common.create_job("o@x.com", "s-1")
+
+    class _BoomTable:
+        def update_item(self, **kw):
+            raise botocore.exceptions.ClientError(
+                {"Error": {"Code": "ProvisionedThroughputExceededException",
+                           "Message": "throttled"}}, "UpdateItem")
+
+    class _BoomResource:
+        def Table(self, name):
+            return _BoomTable()
+
+    monkeypatch.setattr(register_route.boto3, "resource",
+                        lambda *a, **kw: _BoomResource())
+    with pytest.raises(botocore.exceptions.ClientError):
+        register_route.handler(
+            {"job_id": job_id, "site_id": "s-1", "api_target": "",
+             "manifest": {"auth": {"require_login": True,
+                                   "allowed_users": ["a@x.com"]}}}, None)
+
+
+def test_missing_require_login_defaults_closed(aws, monkeypatch):
+    """sites 快照意外缺 require_login 时按"需要登录"投影（fail-closed）。
+
+    这一行默认值是数据异常与"站点全公开"之间唯一的闸门——把
+    site.get("require_login", True) 的默认改成 False，本测试必须失败。
+    正常路径下 seed 会补齐该字段、moto 强一致读立即可见，默认分支跑不到，
+    所以直接注入"缺字段的快照"（模拟真实 DynamoDB 的异常数据/延迟形态）。
+    **快照必须带 permissions_rev=1**：seed 在真实行上执行并把 rev 推到 1，
+    快照 rev 与之不符会让 ConditionCheck 三连败抛 RuntimeError，测试测不到
+    目标（moto 实测：rev 缺失/0 都 RuntimeError，rev=1 才走到投影）。
+    """
+    import boto3
+    import common
+    import register_route
+    common.upsert_site("s-1", owner="o@x.com")
+    job_id = common.create_job("o@x.com", "s-1")
+    anomalous = {"site_id": "s-1", "owner": "o@x.com", "permissions_rev": 1,
+                 "allowed_users": ["a@x.com"], "collaborators": []}
+    monkeypatch.setattr(register_route.common, "get_site_consistent",
+                        lambda sid: dict(anomalous))
+    out = register_route.handler(
+        {"job_id": job_id, "site_id": "s-1", "api_target": "",
+         "manifest": {"auth": {"require_login": False,   # 故意给 False：
+                               "allowed_users": ["a@x.com"]}}}, None)
+    # manifest 是 False 而快照缺字段——默认必须压过 manifest 的诱导，投影 True
+    item = boto3.client("dynamodb").get_item(
+        TableName="routing", Key={"subdomain": {"S": "app-s-1"}})["Item"]
+    assert item["require_auth"]["BOOL"] is True
+    assert out["effective_auth"]["require_login"] is True
 
 
 def test_register_route_seed_does_not_overwrite_concurrent_online_change(aws):
