@@ -216,6 +216,13 @@ def do_manage_collaborators(caller: str, site_id: str, add=None, remove=None,
                             transfer_owner=None) -> dict:
     try:
         if transfer_owner:
+            # 工具 docstring 承诺"与 add/remove 互斥"——必须真的互斥，不能静默
+            # 丢弃：用户说"加 Bob 并把站点交给 Alice"，Agent 拿到成功响应但
+            # Bob 根本没被加上，这类静默半执行比报错难查得多。
+            if add or remove:
+                raise ValueError(
+                    "transfer_owner 与 add/remove 互斥——请分两次调用"
+                    "（先加/删协作者，再转移所有权）")
             return permissions.transfer_owner(site_id, actor=caller,
                                               new_owner=transfer_owner)
         if not add and not remove:

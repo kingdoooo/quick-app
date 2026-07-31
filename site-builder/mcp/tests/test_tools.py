@@ -297,6 +297,21 @@ def test_transfer_owner_rejected_for_collaborator(aws):
                                        transfer_owner="c@x.com")
 
 
+def test_transfer_owner_and_add_are_mutually_exclusive(aws):
+    """docstring 承诺互斥就必须真互斥——静默丢弃 add 是半执行陷阱。"""
+    import common
+    import server
+    _seed_site_and_route()
+    with pytest.raises(ValueError, match="互斥"):
+        server.do_manage_collaborators("o@x.com", SITE_ID,
+                                       add=["keep@x.com"],
+                                       transfer_owner="new@x.com")
+    # 站点纹丝不动：owner 没转，协作者也没加
+    site = common.get_site(SITE_ID)
+    assert site["owner"] == "o@x.com"
+    assert "keep@x.com" not in (site.get("collaborators") or [])
+
+
 def test_get_permissions_returns_current_state(aws):
     import server
     _seed_site_and_route(collaborators=["c@x.com"])
