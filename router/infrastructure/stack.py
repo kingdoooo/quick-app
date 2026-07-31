@@ -185,6 +185,14 @@ class WebRouterStack(Stack):
                 "require_idp_claim=true 但 trusted_idps 为空——部署出去所有"
                 "用户都会被 302 锁死（Edge 回滚要 10-20 分钟全球复制）。"
                 "先在 [SiteBuilder] 填 trusted_idps。")
+        # trusted_idps 同样吃行内注释的亏：`Feishu   # 飞书` 会整串进白名单，
+        # idp="Feishu" 匹配不上任何项 → 开关为 true 时同样是全站锁死。
+        # provider 名不可能含 #，见到即为注释被并进值。
+        if "#" in trusted_idps or ";" in trusted_idps:
+            raise ValueError(
+                f"trusted_idps 含注释字符（当前 {trusted_idps!r}）——configparser "
+                "会把行内注释并进值，白名单被污染后没有任何 idp 能匹配上"
+                "（require_idp_claim=true 时 = 全站锁死）。值里只放 provider 名。")
         lambda_code = (lambda_code
             .replace("{{FRONTEND_BUCKET_DOMAIN}}",
                      f"{frontend_bucket}.s3.us-east-1.amazonaws.com")
