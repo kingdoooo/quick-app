@@ -402,3 +402,34 @@ def test_register_route_writes_org_as_string(aws):
         TableName="routing", Key={"subdomain": {"S": "app-s-1"}})["Item"]
     assert item["allowed_users"] == {"S": "org"}
     assert item["collaborators"] == {"L": []}
+
+
+def test_mark_success_does_not_change_site_owner(aws):
+    """collaborator 发起的部署成功后，站点 owner 必须不变（spec §3.3.1）。"""
+    import common
+    import mark_job
+    common.upsert_site("s-1", owner="alice@x.com", collaborators=["bob@x.com"],
+                       require_login=True, allowed_users="org")
+    job_id = common.create_job("bob@x.com", "s-1")      # 发起者是协作者
+    mark_job.handler({"job_id": job_id, "site_id": "s-1",
+                      "url": "https://app-s-1.example.com",
+                      "manifest": {"tier": "static", "name": "one"}}, None)
+
+    site = common.get_site("s-1")
+    assert site["owner"] == "alice@x.com"               # 不是 bob
+    assert site["status"] == "ACTIVE"                   # 其余收尾照常
+    assert site["last_job_id"] == job_id
+    assert site["tier"] == "static"
+
+
+def test_mark_success_still_sets_owner_absent_field(aws):
+    """sites 表缺 owner（异常数据）时不因为不写 owner 而永久缺字段——
+    首次部署路径由 do_deploy_site 写入 owner，这里只断言不会崩。"""
+    import common
+    import mark_job
+    common.upsert_site("s-2", name="two")               # 无 owner
+    job_id = common.create_job("carol@x.com", "s-2")
+    mark_job.handler({"job_id": job_id, "site_id": "s-2",
+                      "url": "https://app-s-2.example.com",
+                      "manifest": {"tier": "static", "name": "two"}}, None)
+    assert common.get_site("s-2")["status"] == "ACTIVE"

@@ -34,10 +34,13 @@ def handler(event, context):
         common.update_job(job_id, status="FAILED", error=cause)
         return {"job_id": job_id, "status": "FAILED", "error": cause}
 
-    job = common.get_job(job_id)
     common.update_job(job_id, status="SUCCEEDED", url=event["url"])
+    # 不写 owner：jobs 表的 owner 字段是**发起者**（requested_by 语义），
+    # 而站点 owner 只由 permissions.transfer_owner 与首次部署的
+    # do_deploy_site 写。二期放开 collaborator 部署后，把发起者写回站点
+    # owner 会让协作者部署一次就夺取所有权（spec §3.3.1）。
     common.upsert_site(event["site_id"], status="ACTIVE", last_job_id=job_id,
-                       owner=job["owner"], tier=event["manifest"]["tier"],
+                       tier=event["manifest"]["tier"],
                        name=event["manifest"]["name"],
                        subdomain=common.subdomain_for(event["site_id"]))
     _cleanup_old_versions(event["site_id"], job_id)

@@ -30,6 +30,9 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# jobs 表的 owner 字段是**发起者**（requested_by 语义）：谁按下了这次部署。
+# 它不参与任何授权判定——授权一律走 permissions.py 对 sites 表的角色判定。
+# 保留 owner 这个字段名是为了兼容存量数据与 owner-index GSI。
 def create_job(owner: str, site_id: str) -> str:
     job_id = "job-" + secrets.token_hex(8)
     _table("JOBS_TABLE").put_item(Item={
