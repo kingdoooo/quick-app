@@ -1,8 +1,14 @@
 """站点登录端点（Lambda Function URL）。
-/login → Cognito Hosted UI（后接飞书 OIDC）；/callback → 验 state、验 id_token、
-种顶域会话 cookie；/logout。
-安全：state HMAC 签名 + 5 分钟过期（防 login CSRF/redirect 篡改）；
-id_token 走 Cognito JWKS 验签 + iss/aud/exp/token_use 校验。"""
+/login → Cognito Hosted UI（后接飞书 OIDC）；/callback → 验 state、验 PKCE、
+验 id_token、种顶域会话 cookie；/logout。
+安全：OAuth 授权码 + PKCE(S256) + nonce；state HMAC 签名 + 5 分钟过期
+（防 login CSRF/redirect 篡改）；id_token 走 Cognito JWKS 验签 +
+iss/aud/exp/token_use 校验，并核对 nonce（防 id_token 重放）。
+**code_verifier 与 nonce 放 `__Host-sb_pkce` host-only cookie，不放 state**
+——state 随 authorize URL 明文传输（只有签名、没有加密），把 verifier 放进去
+既会经地址栏/Referer/IdP 日志/浏览器历史泄漏，也不再与浏览器绑定
+（攻击者可把自带 verifier 的 callback URL 发给受害者做 login CSRF）。
+见 _encode_state / _pkce_cookie 的 docstring 与 spec §7.2。"""
 import base64
 import hashlib
 import hmac
@@ -70,34 +76,56 @@ def _decode_state(state: str) -> str | None:
         return None
 
 
-def _pkce_cookie(verifier: str, nonce: str, base: str) -> str:
+def _pkce_cookie(verifier: str, nonce: str) -> str:
     """把 verifier/nonce 装进 auth 子域的 host-only 短期 cookie。
 
     __Host- 前缀是浏览器强制的：必须 Secure、必须 Path=/、**必须无 Domain**，
-    因此它只回发给 auth.{base}（/login 与 /callback 同域，读得到）。
-    5 分钟过期，用完即清。
+    因此它只回发给签发它的那台主机（/login 与 /callback 同在 auth.{base}，
+    读得到）。5 分钟过期，用完即清。
+
+    **不要给本函数加 base/domain 参数**：`__Host-` 前缀下任何 `Domain=` 都会让
+    浏览器直接丢弃该 cookie，于是每次登录都走 callback 的 400 分支。
+    `"t": "pkce"` 是类型标记——state 与本 cookie 共用 `_state_sig`，没有它
+    一个合法 state 值就能充当"签名合法"的 pkce cookie（见 _read_pkce_cookie）。
     """
     payload = base64.urlsafe_b64encode(
-        json.dumps({"v": verifier, "n": nonce}).encode()).decode().rstrip("=")
+        json.dumps({"t": "pkce", "v": verifier, "n": nonce}).encode()).decode().rstrip("=")
     sig = _state_sig(payload)
     return (f"{PKCE_COOKIE}={payload}.{sig}; Path=/; Max-Age=300; "
             f"Secure; HttpOnly; SameSite=Lax")
 
 
 def _read_pkce_cookie(event) -> dict | None:
-    """从 callback 请求里取回 verifier/nonce；验签失败或缺失返回 None。"""
+    """从 callback 请求里取回 verifier/nonce；验签失败、缺失或内容不完整返回 None。
+
+    **整段包在 try 里**（不只包 json.loads）：`hmac.compare_digest` 对含非 ASCII
+    的字符串会抛 `TypeError`，而 cookie 值完全由客户端控制——只包 json.loads
+    时一个 `__Host-sb_pkce=YWJj.ü` 就能让 handler 抛出 500 + 堆栈，而不是约定的
+    400。`_decode_state` 本来就是整段包的，这里必须一致。
+
+    **v/n 必须非空**：`_state_sig` 同时给 state 与本 cookie 签名、且线格式相同，
+    所以一个合法 state 值就是一个"签名合法"的 pkce cookie——它解出来
+    `{"v": "", "n": ""}`，若不检查就会带着空 verifier 去 `_post_token`，
+    正是"静默降级成无 PKCE 交换"（现在只靠 Cognito 拒空 verifier 兜着，
+    不是本地约束）。同时给 payload 打类型标记，彻底断开两种上下文的签名复用。
+    """
     for raw in (event.get("cookies") or []):
         name, _, value = raw.partition("=")
         if name.strip() != PKCE_COOKIE:
             continue
-        body, _, sig = value.rpartition(".")
-        if not hmac.compare_digest(sig, _state_sig(body)):
-            return None
         try:
+            body, _, sig = value.rpartition(".")
+            if not hmac.compare_digest(sig, _state_sig(body)):
+                return None
             data = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+            if data.get("t") != "pkce":      # state 值不能当 pkce cookie 用
+                return None
+            verifier, nonce = data.get("v", ""), data.get("n", "")
+            if not verifier or not nonce:
+                return None
+            return {"v": verifier, "n": nonce}
         except Exception:
             return None
-        return {"v": data.get("v", ""), "n": data.get("n", "")}
     return None
 
 
@@ -187,7 +215,7 @@ def handler(event, context):
                         "state": _encode_state(redirect)}))
         # verifier/nonce 走 host-only cookie（与浏览器绑定），不进 URL
         return {"statusCode": 302, "headers": {"Location": auth_url},
-                "cookies": [_pkce_cookie(verifier, nonce, base)], "body": ""}
+                "cookies": [_pkce_cookie(verifier, nonce)], "body": ""}
 
     if path == "/callback":
         redirect = _decode_state(qs.get("state", ""))
@@ -195,11 +223,21 @@ def handler(event, context):
             return {"statusCode": 400, "body": "invalid or expired state"}
         pkce = _read_pkce_cookie(event)
         if pkce is None:
-            # cookie 丢失（换了浏览器、被清、超过 5 分钟）——比静默降级到
-            # 无 PKCE 安全：让用户重新走一次登录。
+            # cookie 丢失/被篡改/内容不完整（换了浏览器、被清、超过 5 分钟、
+            # 或拿 state 值来冒充）——比静默降级到无 PKCE 安全：重走一次登录。
             return {"statusCode": 400,
                     "body": "登录状态已过期，请重新登录"}
-        user = _exchange_code(qs["code"], pkce["v"], pkce["n"])
+        # IdP 也可能带着 ?error=access_denied 回调（没有 code），或 code 被重放、
+        # nonce 不匹配（两个登录标签页并发时第二个会覆盖单一 cookie）。
+        # 这些都是可预期的用户侧失败，必须给 400 而不是让异常冒成 500 +堆栈。
+        code = qs.get("code", "")
+        if not code:
+            return {"statusCode": 400,
+                    "body": "授权失败或被取消，请重新登录"}
+        try:
+            user = _exchange_code(code, pkce["v"], pkce["n"])
+        except ValueError:
+            return {"statusCode": 400, "body": "登录校验失败，请重新登录"}
         token = mint_session_jwt(user["email"], user["name"],
                                  os.environ["JWT_SECRET"], idp=user.get("idp", ""),
                                  auth_via=user.get("auth_via", ""))

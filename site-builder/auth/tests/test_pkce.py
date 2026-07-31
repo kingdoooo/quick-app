@@ -112,6 +112,60 @@ def test_callback_rejects_forged_pkce_cookie():
 
 
 @patch.dict(lh.os.environ, ENV)
+def test_pkce_cookie_with_valid_sig_but_no_verifier_is_rejected():
+    """state 与 pkce cookie 共用 _state_sig、线格式相同——一个合法 state 值就是
+    "签名合法"的 pkce cookie。它解不出 v/n，若不拦就会带空 verifier 去换 token
+    （静默降级成无 PKCE 交换，只剩 Cognito 兜着）。"""
+    forged = lh._encode_state("https://app-x.example.com/")   # 合法签名，但没有 v/n
+    assert lh._read_pkce_cookie({"cookies": [f"{lh.PKCE_COOKIE}={forged}"]}) is None
+    r = lh.handler(_event("/callback", {"code": "abc", "state": forged},
+                          cookies=[f"{lh.PKCE_COOKIE}={forged}"]), None)
+    assert r["statusCode"] == 400
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_pkce_cookie_with_non_ascii_does_not_crash():
+    """cookie 值全由客户端控制：hmac.compare_digest 遇非 ASCII 会抛 TypeError。
+    整段包 try 才能给出约定的 400，而不是 500 + 堆栈。"""
+    state = lh._encode_state("https://app-x.example.com/")
+    assert lh._read_pkce_cookie({"cookies": [f"{lh.PKCE_COOKIE}=YWJj.ü"]}) is None
+    r = lh.handler(_event("/callback", {"code": "abc", "state": state},
+                          cookies=[f"{lh.PKCE_COOKIE}=YWJj.ü"]), None)
+    assert r["statusCode"] == 400
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_callback_without_code_returns_400():
+    """IdP 带 ?error=access_denied 回调时没有 code——不能让 KeyError 冒成 500。"""
+    r_login = lh.handler(_event("/login", {"redirect": "https://app-x.example.com/"}),
+                         None)
+    import urllib.parse as up
+    state = up.unquote(r_login["headers"]["Location"].split("state=")[1].split("&")[0])
+    pkce = next(c for c in r_login["cookies"]
+                if c.startswith(lh.PKCE_COOKIE)).split(";")[0]
+    r = lh.handler(_event("/callback", {"state": state, "error": "access_denied"},
+                          cookies=[pkce]), None)
+    assert r["statusCode"] == 400
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_callback_nonce_mismatch_returns_400_not_500():
+    """nonce 不匹配（两个登录标签页并发时第二个覆盖了单一 cookie）是可预期的
+    用户侧失败——_exchange_code 抛的 ValueError 必须被翻成 400。"""
+    r_login = lh.handler(_event("/login", {"redirect": "https://app-x.example.com/"}),
+                         None)
+    import urllib.parse as up
+    state = up.unquote(r_login["headers"]["Location"].split("state=")[1].split("&")[0])
+    pkce = next(c for c in r_login["cookies"]
+                if c.startswith(lh.PKCE_COOKIE)).split(";")[0]
+    with patch.object(lh, "_exchange_code",
+                      side_effect=ValueError("id_token nonce 与本次登录不匹配")):
+        r = lh.handler(_event("/callback", {"code": "abc", "state": state},
+                              cookies=[pkce]), None)
+    assert r["statusCode"] == 400
+
+
+@patch.dict(lh.os.environ, ENV)
 def test_callback_clears_pkce_cookie():
     r_login = lh.handler(_event("/login", {"redirect": "https://app-x.example.com/"}),
                          None)

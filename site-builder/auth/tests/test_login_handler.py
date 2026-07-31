@@ -55,7 +55,7 @@ def test_callback_rejects_tampered_state():
     payload["r"] = "https://evil.com/"
     forged = base64.urlsafe_b64encode(_json.dumps(payload).encode()).decode().rstrip("=")
     # 补一个有效的 PKCE cookie：确保 400 是 state 验签失败导致的，而非缺 cookie
-    pkce = lh._pkce_cookie("v", "n", "example.com").split(";")[0]
+    pkce = lh._pkce_cookie("v", "n").split(";")[0]
     r = lh.handler(_event("/callback", {"code": "abc", "state": f"{forged}.{sig}"},
                           cookies=[pkce]), None)
     assert r["statusCode"] == 400
@@ -67,7 +67,7 @@ def test_callback_rejects_expired_state():
     with patch.object(lh.time, "time", return_value=time.time() - 600):
         state = lh._encode_state("https://app-x.example.com/")
     # 同上：补有效 cookie，锁定 400 的原因是 state 过期
-    pkce = lh._pkce_cookie("v", "n", "example.com").split(";")[0]
+    pkce = lh._pkce_cookie("v", "n").split(";")[0]
     r = lh.handler(_event("/callback", {"code": "abc", "state": state},
                           cookies=[pkce]), None)
     assert r["statusCode"] == 400
