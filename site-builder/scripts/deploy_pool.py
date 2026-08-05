@@ -208,12 +208,16 @@ def _find_pool(cog, name: str) -> str | None:
             return None
 
 
-# update_user_pool 是整体替换语义（一期实测坑）：只回传已知可变字段，
-# 避免误清其他配置。与 deploy_auth.py 的 _POOL_MUTABLE 同源。
-_POOL_MUTABLE = ("Policies", "DeletionProtection", "AutoVerifiedAttributes",
-                 "MfaConfiguration", "EmailConfiguration", "AdminCreateUserConfig",
-                 "AccountRecoverySetting", "UserAttributeUpdateSettings",
-                 "VerificationMessageTemplate", "UserPoolTier", "LambdaConfig")
+def pool_update_params(cog, pool: dict) -> dict:
+    """describe_user_pool 结果 → update_user_pool 的完整参数。
+
+    实现在 auth/deploy_auth.py（那边挂 pre-token 触发器时也要用同一套语义）。
+    **两边各留一份手抄白名单正是这个坑上一次的形态**，所以这里只做转发，
+    不要复制实现。详见 deploy_auth.pool_update_params 的 docstring。
+    """
+    sys.path.insert(0, str(HERE.parent / "auth"))
+    import deploy_auth
+    return deploy_auth.pool_update_params(cog, pool)
 
 
 def _ensure_pool(cog, base_domain: str, pool_name: str = POOL_NAME) -> str:
@@ -237,10 +241,9 @@ def _ensure_pool(cog, base_domain: str, pool_name: str = POOL_NAME) -> str:
 
     print(f"  已存在 pool {existing}，核对关键配置")
     pool = cog.describe_user_pool(UserPoolId=existing)["UserPool"]
-    kwargs = {k: pool[k] for k in _POOL_MUTABLE if k in pool}
-    # describe 回传的废弃字段，与 PasswordPolicy.TemporaryPasswordValidityDays
-    # 同传会被 update-user-pool 拒绝（一期实测）
-    kwargs.get("AdminCreateUserConfig", {}).pop("UnusedAccountValidityDays", None)
+    # 回填全部可保留字段（不是手工白名单——见 pool_update_params 的注释），
+    # 再把本脚本真正要纠正的两项盖上去
+    kwargs = pool_update_params(cog, pool)
     desired = pool_config(base_domain)
     kwargs["AdminCreateUserConfig"] = desired["AdminCreateUserConfig"]
     kwargs["UserPoolTier"] = desired["UserPoolTier"]
@@ -329,14 +332,40 @@ def _ensure_clients(cog, pool_id: str, base_domain: str,
     return out
 
 
-# describe_user_pool_client 回传里**不能**原样送回 update_user_pool_client 的字段。
-# 其余键一律回填，否则被重置为默认值（见 _client_update_params）。
-_CLIENT_READONLY_KEYS = frozenset({
-    "UserPoolId", "ClientId", "ClientName", "ClientSecret",
-    "CreationDate", "LastModifiedDate",
-    # GenerateSecret 只在 create 时有效，update 不接受
-    "GenerateSecret",
-})
+# 本脚本**有意不更新**的字段（与 service model 无关的业务决定）。
+#
+# ClientName：update_user_pool_client 其实接受它，但本脚本按 ClientName 查找
+# 已有 client（_ensure_clients 的 existing 字典）。把它当可更新字段会让"改名"
+# 变成"下次重跑按新名字找不到 → 新建一个同配置 client"，旧 client 连同其
+# secret 仍然可用，而 SSM 里存的是哪一个取决于执行顺序。
+# GenerateSecret：只在 create 有效，update 不接受。
+# UserPoolId / ClientId：**两个 shape 里都有**，所以动态求差不会剔掉它们，
+# 而调用方是 update_user_pool_client(UserPoolId=..., ClientId=..., **merged)
+# ——留在 merged 里会 TypeError（同一关键字传了两次）。必须显式排除。
+_CLIENT_SKIP_KEYS = frozenset({"ClientName", "GenerateSecret",
+                               "UserPoolId", "ClientId"})
+
+
+def _client_describe_only_keys(cog) -> frozenset:
+    """describe_user_pool_client 回传但 update 不接受的字段（回填即报错）。
+
+    **按 service model 动态求差，不硬编码。** 硬编码那份"对当前 pinned 版本
+    正确"的清单在本仓库不可复现——requirements 里 boto3 是不钉版本的，
+    换台机器装到新版就可能多出字段。动态求差没有这个问题。
+    """
+    sm = cog.meta.service_model
+    describe_members = set(sm.operation_model(
+        "DescribeUserPoolClient").output_shape.members["UserPoolClient"].members)
+    update_members = set(sm.operation_model(
+        "UpdateUserPoolClient").input_shape.members)
+    return frozenset(describe_members - update_members)
+
+# app client 必须能读写的属性。
+#   email          —— IdP 映射目标 + 授权主键
+#   email_verified —— IdP 映射目标（_ensure_oidc_idp 默认映射它）
+#   name           —— IdP 映射目标（会话里的显示名）
+# 缺任一项的后果见 _client_update_params 的注释。
+_REQUIRED_CLIENT_ATTRIBUTES = frozenset({"email", "email_verified", "name"})
 
 
 def _client_update_params(cog, pool_id: str, client_id: str,
@@ -360,13 +389,26 @@ def _client_update_params(cog, pool_id: str, client_id: str,
     """
     current = cog.describe_user_pool_client(
         UserPoolId=pool_id, ClientId=client_id)["UserPoolClient"]
-    merged = {k: v for k, v in current.items()
-              if k not in _CLIENT_READONLY_KEYS}
-    merged.update({k: v for k, v in desired.items()
-                   if k not in _CLIENT_READONLY_KEYS})
-    # WriteAttributes 必须涵盖全部 IdP 映射属性（官方要求；API 参考说映射不上
-    # 会报错，开发者指南说静默跳过——两种说法都意味着必须包含）。这里不主动
-    # 收窄 WriteAttributes，沿用线上值：为空/缺失时 Cognito 允许写全部标准属性。
+    drop = _client_describe_only_keys(cog) | _CLIENT_SKIP_KEYS
+    merged = {k: v for k, v in current.items() if k not in drop}
+    merged.update({k: v for k, v in desired.items() if k not in drop})
+    # Read/WriteAttributes 必须涵盖全部 IdP 映射属性与 scope 必需属性，
+    # **不能只是沿用线上值**（前一版就是这样，属于半个修复）：线上值是
+    # email_verified 映射之前配的，缺这一项时
+    #   · WriteAttributes 缺 → 联邦登录写不进该属性（官方 API 参考说抛错、
+    #     开发者指南说静默跳过——两种说法都意味着必须包含）；
+    #   · ReadAttributes 缺而请求了 email scope → token 端点 invalid_grant。
+    # 两者都表现为"部署与 Stubber 测试全绿、真机一登录就失败"。
+    #
+    # 语义合并（并集）而不是 fail-fast：这两个字段本就允许运营侧扩展
+    # （加自定义属性），报错中止会把可自愈的配置漂移变成部署阻塞。
+    # 空/缺失保持空——Cognito 的语义是"未指定即全部标准属性可读写"，
+    # 显式塞一份名单反而把它从"全部"收窄成"这几个"。
+    for field in ("ReadAttributes", "WriteAttributes"):
+        existing = merged.get(field)
+        if not existing:
+            continue        # 未指定 = 全部标准属性，已覆盖，不要画蛇添足
+        merged[field] = sorted(set(existing) | _REQUIRED_CLIENT_ATTRIBUTES)
     return merged
 
 

@@ -382,7 +382,8 @@ def test_client_update_preserves_unmanaged_hardening():
     # 线上加固项被保留
     assert merged["PreventUserExistenceErrors"] == "ENABLED"
     assert merged["EnableTokenRevocation"] is True
-    assert merged["ReadAttributes"] == ["email", "name"]
+    # 线上原有属性保留，但必须并上 IdP 映射目标（见下面 email_verified 的用例）
+    assert set(merged["ReadAttributes"]) >= {"email", "name"}
     # 脚本声明的字段仍然生效（本脚本管的就是这些）
     assert merged["SupportedIdentityProviders"] == ["Okta"]
     assert merged["ExplicitAuthFlows"] == dp.NATIVE_AUTH_DISABLED
@@ -405,8 +406,10 @@ def test_client_update_params_strip_create_only_keys():
         merged = dp._client_update_params(cog, "us-east-1_x", "c1", desired)
 
     for k in ("ClientId", "ClientSecret", "GenerateSecret", "UserPoolId",
-              "CreationDate", "LastModifiedDate"):
+              "CreationDate", "LastModifiedDate", "ClientName"):
         assert k not in merged, f"{k} 不能出现在 update 请求里"
+    # 动态求差必须真的覆盖 service model 的全部 describe-only 字段
+    assert not (dp._client_describe_only_keys(cog) & set(merged))
 
 
 def test_client_update_request_passes_service_model_validation():
@@ -508,3 +511,197 @@ def test_idp_mapping_applies_on_update_path_too():
 ])
 def test_truthy_parsing(raw, expected):
     assert dp._truthy(raw) is expected
+
+
+# --- Read/WriteAttributes 必须覆盖 IdP 映射目标（Codex re-review P1） ---
+# 上一版只"保留线上值"，而线上值是 email_verified 映射之前配的：
+# WriteAttributes 缺它 → 联邦登录写不进该属性；ReadAttributes 缺它而请求了
+# email scope → token 端点 invalid_grant。两者都是"部署全绿、真机登录才失败"。
+
+def test_merge_adds_idp_mapping_targets_to_attribute_permissions():
+    import boto3
+    from botocore.stub import Stubber
+
+    cog = boto3.client("cognito-idp", region_name="us-east-1",
+                       aws_access_key_id="t", aws_secret_access_key="t")
+    with Stubber(cog) as stub:
+        stub.add_response("describe_user_pool_client",
+                          {"UserPoolClient": _client_stub_response(
+                              ReadAttributes=["email", "name"],
+                              WriteAttributes=["email", "name"])},
+                          {"UserPoolId": "us-east-1_x", "ClientId": "c1"})
+        desired = dp.client_configs("example.com", [], "Okta")["site"]
+        merged = dp._client_update_params(cog, "us-east-1_x", "c1", desired)
+
+    for field in ("ReadAttributes", "WriteAttributes"):
+        assert "email_verified" in merged[field], field
+        assert "email" in merged[field] and "name" in merged[field]
+
+
+def test_merge_preserves_operator_added_custom_attributes():
+    """并集而非替换：运营加的自定义属性不能被脚本抹掉。"""
+    import boto3
+    from botocore.stub import Stubber
+
+    cog = boto3.client("cognito-idp", region_name="us-east-1",
+                       aws_access_key_id="t", aws_secret_access_key="t")
+    with Stubber(cog) as stub:
+        stub.add_response("describe_user_pool_client",
+                          {"UserPoolClient": _client_stub_response(
+                              ReadAttributes=["email", "custom:dept"],
+                              WriteAttributes=["email", "custom:dept"])},
+                          {"UserPoolId": "us-east-1_x", "ClientId": "c1"})
+        desired = dp.client_configs("example.com", [], "Okta")["site"]
+        merged = dp._client_update_params(cog, "us-east-1_x", "c1", desired)
+
+    assert "custom:dept" in merged["ReadAttributes"]
+    assert "email_verified" in merged["ReadAttributes"]
+
+
+def test_merge_keeps_unset_attributes_unset():
+    """未指定 = Cognito 允许全部标准属性。塞一份名单反而把"全部"收窄。"""
+    import boto3
+    from botocore.stub import Stubber
+
+    cog = boto3.client("cognito-idp", region_name="us-east-1",
+                       aws_access_key_id="t", aws_secret_access_key="t")
+    current = _client_stub_response()
+    current.pop("ReadAttributes", None)
+    current.pop("WriteAttributes", None)
+    with Stubber(cog) as stub:
+        stub.add_response("describe_user_pool_client",
+                          {"UserPoolClient": current},
+                          {"UserPoolId": "us-east-1_x", "ClientId": "c1"})
+        desired = dp.client_configs("example.com", [], "Okta")["site"]
+        merged = dp._client_update_params(cog, "us-east-1_x", "c1", desired)
+
+    assert "ReadAttributes" not in merged
+    assert "WriteAttributes" not in merged
+
+
+def test_required_attributes_cover_every_idp_mapping_target():
+    """白名单必须覆盖 _ensure_oidc_idp 实际下发的全部映射目标。
+
+    从实现抓 mapping，而不是手抄——将来加映射（如 given_name）时这里会红，
+    而不是等真机登录失败。
+    """
+    mapping = _captured_mapping(_idp())
+    targets = set(mapping)          # AttributeMapping 的键是 user pool 属性名
+    assert targets <= dp._REQUIRED_CLIENT_ATTRIBUTES, (
+        f"IdP 映射目标未进必需属性白名单: "
+        f"{sorted(targets - dp._REQUIRED_CLIENT_ATTRIBUTES)}")
+
+
+# --- update_user_pool 必须回填全部可保留字段（Codex re-review P1） ---
+# 手抄可变字段白名单必然随 AWS 加字段而腐烂：实测旧名单漏了 10 项，
+# 其中 UserPoolAddOns 是威胁防护、SmsConfiguration 是短信通道。
+
+def _cog():
+    import boto3
+    return boto3.client("cognito-idp", region_name="us-east-1",
+                        aws_access_key_id="t", aws_secret_access_key="t")
+
+
+def test_pool_update_params_preserves_everything_updatable():
+    """凡是 describe 返回且 update 接受的字段，都必须出现在回填结果里。"""
+    cog = _cog()
+    sm = cog.meta.service_model
+    describe_members = set(sm.operation_model(
+        "DescribeUserPool").output_shape.members["UserPool"].members)
+    update_members = set(sm.operation_model(
+        "UpdateUserPool").input_shape.members)
+    preservable = describe_members & update_members
+
+    # 构造一个"每个可保留字段都有值"的 describe 结果
+    pool = {k: {} if k not in ("MfaConfiguration", "DeletionProtection")
+            else "OFF" for k in preservable}
+    pool.update({"Id": "us-east-1_x", "Name": "p", "Arn": "arn:x"})  # describe-only
+    kwargs = dp.pool_update_params(cog, pool)
+
+    assert set(kwargs) == preservable, (
+        f"漏回填: {sorted(preservable - set(kwargs))}；"
+        f"多回填: {sorted(set(kwargs) - preservable)}")
+
+
+def test_pool_update_params_drops_describe_only_fields():
+    """describe 独有字段回填即 ParamValidationError。"""
+    cog = _cog()
+    pool = {"Id": "us-east-1_x", "Name": "p", "Arn": "arn:x",
+            "Status": "Enabled", "CreationDate": "d", "LastModifiedDate": "d",
+            "SchemaAttributes": [], "EstimatedNumberOfUsers": 1,
+            "MfaConfiguration": "OFF"}
+    kwargs = dp.pool_update_params(cog, pool)
+    for k in ("Id", "Name", "Arn", "Status", "SchemaAttributes",
+              "EstimatedNumberOfUsers", "CreationDate", "LastModifiedDate"):
+        assert k not in kwargs, k
+    assert kwargs["MfaConfiguration"] == "OFF"
+
+
+def test_pool_update_params_preserves_threat_protection_and_sms():
+    """旧手抄名单漏掉的关键项：重跑不得关掉威胁防护/设备/短信配置。"""
+    cog = _cog()
+    pool = {"Id": "us-east-1_x",
+            "UserPoolAddOns": {"AdvancedSecurityMode": "ENFORCED"},
+            "DeviceConfiguration": {"ChallengeRequiredOnNewDevice": True},
+            "SmsConfiguration": {"SnsCallerArn": "arn:sns"},
+            "UserPoolTags": {"project": "site-builder"}}
+    kwargs = dp.pool_update_params(cog, pool)
+    assert kwargs["UserPoolAddOns"]["AdvancedSecurityMode"] == "ENFORCED"
+    assert kwargs["DeviceConfiguration"]["ChallengeRequiredOnNewDevice"] is True
+    assert kwargs["SmsConfiguration"]["SnsCallerArn"] == "arn:sns"
+    assert kwargs["UserPoolTags"] == {"project": "site-builder"}
+
+
+def test_pool_update_params_strips_deprecated_validity_field():
+    """UnusedAccountValidityDays 与 TemporaryPasswordValidityDays 同传会被拒。"""
+    cog = _cog()
+    kwargs = dp.pool_update_params(cog, {
+        "AdminCreateUserConfig": {"AllowAdminCreateUserOnly": True,
+                                  "UnusedAccountValidityDays": 7}})
+    assert "UnusedAccountValidityDays" not in kwargs["AdminCreateUserConfig"]
+    assert kwargs["AdminCreateUserConfig"]["AllowAdminCreateUserOnly"] is True
+
+
+def test_pool_update_params_result_passes_service_model_validation():
+    """回填结果必须能通过 botocore 的 UpdateUserPool 参数校验。"""
+    from botocore.stub import Stubber
+    cog = _cog()
+    pool = {"Id": "us-east-1_x", "MfaConfiguration": "OFF",
+            "UserPoolAddOns": {"AdvancedSecurityMode": "ENFORCED"},
+            "AdminCreateUserConfig": {"AllowAdminCreateUserOnly": True},
+            "UserPoolTags": {"project": "site-builder"}}
+    kwargs = dp.pool_update_params(cog, pool)
+    with Stubber(cog) as stub:
+        stub.add_response("update_user_pool", {},
+                          {"UserPoolId": "us-east-1_x", **kwargs})
+        cog.update_user_pool(UserPoolId="us-east-1_x", **kwargs)
+        stub.assert_no_pending_responses()
+
+
+def test_deploy_auth_and_deploy_pool_share_one_implementation():
+    """两边各留一份手抄名单正是这个坑的上一次形态——必须是同一实现。"""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parents[2] / "auth"))
+    import deploy_auth
+    src = (Path(__file__).parents[2] / "auth" / "deploy_auth.py").read_text()
+    assert "_POOL_MUTABLE" not in src, "deploy_auth 仍留着手抄白名单"
+    pool_src = (Path(__file__).parents[2] / "scripts" / "deploy_pool.py").read_text()
+    assert "_POOL_MUTABLE" not in pool_src, "deploy_pool 仍留着手抄白名单"
+    assert hasattr(deploy_auth, "pool_update_params")
+
+
+def test_client_describe_only_keys_derived_not_hardcoded():
+    """describe-only 字段按 service model 动态求差。
+
+    硬编码"对 pinned 版本正确"的清单在本仓库不可复现——requirements 里
+    boto3 不钉版本，换机器装到新版就可能多出字段。
+    """
+    cog = _cog()
+    derived = dp._client_describe_only_keys(cog)
+    # 当前 service model 的已知成员（回归锚点，不是实现来源）
+    assert {"ClientSecret", "CreationDate", "LastModifiedDate"} <= derived
+    # ClientName 被 update 接受，所以它**不属于** describe-only；
+    # 它由 _CLIENT_SKIP_KEYS 因业务原因单独排除
+    assert "ClientName" not in derived
+    assert "ClientName" in dp._CLIENT_SKIP_KEYS

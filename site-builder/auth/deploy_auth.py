@@ -61,7 +61,13 @@ def main():
         "CLIENT_ID": CFG["Cognito"]["site_client_id"],
         "CLIENT_SECRET": client_secret,
         "BASE_DOMAIN": BASE,
-        "USER_POOL_ID": CFG["Cognito"]["user_pool_id"]}}
+        "USER_POOL_ID": CFG["Cognito"]["user_pool_id"],
+        # email 是授权主键，而联邦 email 默认 unverified——见 login_handler 的
+        # REQUIRE_EMAIL_VERIFIED。默认 "true"；只有接入不发该 claim 的 IdP 时
+        # 才在 config.ini 里设 false。**必须显式下发**：漏了这一项时 Lambda
+        # 环境变量缺失、代码回落默认值（true），行为仍然安全，但配置里写的
+        # false 不生效——运维会以为关掉了却没关。
+        "REQUIRE_EMAIL_VERIFIED": _require_email_verified_cfg()}}
     code = build_zip()
     try:
         lam.get_function(FunctionName=FN)
@@ -113,11 +119,50 @@ def main():
     print(f"auth-service: {url}  →  https://auth.{BASE}/")
 
 
-# update-user-pool 是整体替换语义——只回传这些已知可变字段，避免误清其他配置。
-_POOL_MUTABLE = ("Policies", "DeletionProtection", "AutoVerifiedAttributes",
-                 "MfaConfiguration", "EmailConfiguration", "AdminCreateUserConfig",
-                 "AccountRecoverySetting", "UserAttributeUpdateSettings",
-                 "VerificationMessageTemplate", "UserPoolTier")
+def _require_email_verified_cfg() -> str:
+    """config.ini [IdP] require_email_verified → Lambda 环境变量的字符串值。
+
+    默认 "true"（缺 section / 缺键 / 空值都算默认）。只有显式写成 false
+    才关闭——拼错（yes/0/off 之类）一律当 true，与"安全开关默认开、
+    写错时不静默降级"的取向一致。
+    """
+    raw = ""
+    if CFG.has_section("IdP"):
+        raw = CFG["IdP"].get("require_email_verified", "")
+    # configparser 保留行内注释，先切掉再判断
+    head = raw.split("#")[0].split(";")[0].strip().lower()
+    return "false" if head == "false" else "true"
+
+
+def pool_update_params(cog, pool: dict) -> dict:
+    """describe_user_pool 的结果 → update_user_pool 可接受的**完整**参数。
+
+    **本函数是 deploy_pool.py 与本文件的唯一实现**（deploy_pool 直接 import
+    它）。两边各留一份手抄白名单是这个坑上一次的形态：本文件那份连
+    LambdaConfig 都没有，于是挂触发器时会把它自己刚设的值又清掉。
+
+    为什么不能用手工白名单：update_user_pool 是整体替换语义，官方要求请求
+    携带全部既有配置，遗漏项恢复默认值。手抄名单**必然随 AWS 加字段而腐烂**
+    ——实测当前 botocore 里可保留却不在旧名单上的有 10 项，包括
+    UserPoolAddOns（threat protection）、DeviceConfiguration、SmsConfiguration、
+    UserPoolTags。即"幂等重跑"会静默关掉威胁防护与短信配置。
+
+    按 service model 动态求交：describe 输出成员 ∩ update 输入成员。
+    """
+    sm = cog.meta.service_model
+    describe_members = set(sm.operation_model(
+        "DescribeUserPool").output_shape.members["UserPool"].members)
+    update_members = set(sm.operation_model(
+        "UpdateUserPool").input_shape.members)
+    kwargs = {k: v for k, v in pool.items()
+              if k in describe_members & update_members}
+    # describe 回传的废弃字段，与 PasswordPolicy.TemporaryPasswordValidityDays
+    # 同传会被 update_user_pool 拒绝（一期实测）
+    if isinstance(kwargs.get("AdminCreateUserConfig"), dict):
+        kwargs["AdminCreateUserConfig"] = {
+            k: v for k, v in kwargs["AdminCreateUserConfig"].items()
+            if k != "UnusedAccountValidityDays"}
+    return kwargs
 
 
 def ensure_pre_token_trigger(role_arn: str, pool_id: str | None = None) -> None:
@@ -165,10 +210,7 @@ def ensure_pre_token_trigger(role_arn: str, pool_id: str | None = None) -> None:
     cfg = pool.get("LambdaConfig", {}).get("PreTokenGenerationConfig", {})
     if cfg.get("LambdaArn") == fn_arn and cfg.get("LambdaVersion") == "V2_0":
         return  # 已挂好，不动用户池
-    kwargs = {k: pool[k] for k in _POOL_MUTABLE if k in pool}
-    # describe 回传的废弃字段，与 PasswordPolicy.TemporaryPasswordValidityDays
-    # 同传会被 update-user-pool 拒绝
-    kwargs.get("AdminCreateUserConfig", {}).pop("UnusedAccountValidityDays", None)
+    kwargs = pool_update_params(cog, pool)
     # **在现有 LambdaConfig 上改这一项，不要整体替换**：update_user_pool 是
     # 整体替换语义，而 LambdaConfig 自己也是一个整体——直接赋一个只含
     # PreTokenGenerationConfig 的 dict 会把 pool 上其他触发器

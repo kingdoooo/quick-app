@@ -242,15 +242,20 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
 3. **`router/config.ini` 必须补两个键**（在 `[SiteBuilder]` 段）：
 
    ```ini
-   require_idp_claim = false   # 全体用户在新 pool 重新登录后再翻 true
-   trusted_idps =             # Cognito 里的 provider name，逗号分隔
+   # 全体用户在新 pool 重新登录后再把 require_idp_claim 翻成 true
+   # trusted_idps 填 Cognito 里的 provider name，逗号分隔
+   require_idp_claim = false
+   trusted_idps =
    ```
 
+   **上面的注释必须像这样单独成行——本片段可直接复制。** configparser 会把
+   行内注释并进值：写成 `require_idp_claim = true  # 注释` 时读出来是
+   `'true  # 注释'`，`require_idp_claim` 因此变成 false（防线静默关闭）；
+   `trusted_idps` 则被污染成没有任何 idp 能匹配（开关为 true 时 = 全站锁死）。
+   stack.py 对这两种情况都有断言，所以照错写法会在 synth 阶段被拒。
+
    两个键都是必填：缺键时 CDK synth 直接 `NoOptionError` 报错（响亮失败，
-   不会把占位符部署出去）。**值里不要写行内注释**——configparser 会把
-   `true  # 注释` 整串读进来，`require_idp_claim` 因此变成 false（防线静默
-   关闭），`trusted_idps` 则被污染成没有任何 idp 能匹配（开关为 true 时
-   = 全站锁死）。stack.py 对这两种情况都有断言。
+   不会把占位符部署出去）。
 
    翻 `true` 的时机：切到专用 pool **且全体用户重新登录过**之后。存量会话
    没有 idp claim，提前翻会把他们全部 302 到登录页。
