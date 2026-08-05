@@ -332,18 +332,19 @@ def _ensure_clients(cog, pool_id: str, base_domain: str,
     return out
 
 
-# 本脚本**有意不更新**的字段（与 service model 无关的业务决定）。
+# 本脚本**有意不回填**的字段（与 service model 无关的业务/调用约定）。
 #
-# ClientName：update_user_pool_client 其实接受它，但本脚本按 ClientName 查找
-# 已有 client（_ensure_clients 的 existing 字典）。把它当可更新字段会让"改名"
-# 变成"下次重跑按新名字找不到 → 新建一个同配置 client"，旧 client 连同其
-# secret 仍然可用，而 SSM 里存的是哪一个取决于执行顺序。
 # GenerateSecret：只在 create 有效，update 不接受。
 # UserPoolId / ClientId：**两个 shape 里都有**，所以动态求差不会剔掉它们，
 # 而调用方是 update_user_pool_client(UserPoolId=..., ClientId=..., **merged)
 # ——留在 merged 里会 TypeError（同一关键字传了两次）。必须显式排除。
-_CLIENT_SKIP_KEYS = frozenset({"ClientName", "GenerateSecret",
-                               "UserPoolId", "ClientId"})
+#
+# **ClientName 不在此列**（曾经在，是错的）：update_user_pool_client 接受它，
+# 而 AWS 的契约是"未提供的属性恢复默认值"，跳过它没有依据。原先的理由是
+# "更新名称会导致下次按名称找不到"——但这里是 read-modify-write，回填的就是
+# 当前名称，而 desired["ClientName"] 正是用来查到这个 client 的同一个值，
+# 两者相等，正常回填不可能产生重命名。
+_CLIENT_SKIP_KEYS = frozenset({"GenerateSecret", "UserPoolId", "ClientId"})
 
 
 def _client_describe_only_keys(cog) -> frozenset:

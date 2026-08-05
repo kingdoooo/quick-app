@@ -406,8 +406,10 @@ def test_client_update_params_strip_create_only_keys():
         merged = dp._client_update_params(cog, "us-east-1_x", "c1", desired)
 
     for k in ("ClientId", "ClientSecret", "GenerateSecret", "UserPoolId",
-              "CreationDate", "LastModifiedDate", "ClientName"):
+              "CreationDate", "LastModifiedDate"):
         assert k not in merged, f"{k} 不能出现在 update 请求里"
+    # ClientName 反而**必须**回填：update 接受它，漏传按契约会恢复默认值
+    assert merged["ClientName"] == "site-builder-site"
     # 动态求差必须真的覆盖 service model 的全部 describe-only 字段
     assert not (dp._client_describe_only_keys(cog) & set(merged))
 
@@ -701,7 +703,30 @@ def test_client_describe_only_keys_derived_not_hardcoded():
     derived = dp._client_describe_only_keys(cog)
     # 当前 service model 的已知成员（回归锚点，不是实现来源）
     assert {"ClientSecret", "CreationDate", "LastModifiedDate"} <= derived
-    # ClientName 被 update 接受，所以它**不属于** describe-only；
-    # 它由 _CLIENT_SKIP_KEYS 因业务原因单独排除
+    # ClientName 被 update 接受，所以它**不属于** describe-only，
+    # 也不该被业务规则跳过——必须原样回填
     assert "ClientName" not in derived
-    assert "ClientName" in dp._CLIENT_SKIP_KEYS
+    assert "ClientName" not in dp._CLIENT_SKIP_KEYS
+
+
+def test_client_name_is_backfilled_unchanged():
+    """ClientName 必须回填当前值，且不会造成重命名。
+
+    update_user_pool_client 接受 ClientName，AWS 契约是"未提供的属性恢复
+    默认值"，所以跳过它没有依据。回填是安全的：查找该 client 用的就是这个
+    名字，desired 与线上值相等。
+    """
+    import boto3
+    from botocore.stub import Stubber
+
+    cog = boto3.client("cognito-idp", region_name="us-east-1",
+                       aws_access_key_id="t", aws_secret_access_key="t")
+    with Stubber(cog) as stub:
+        stub.add_response("describe_user_pool_client",
+                          {"UserPoolClient": _client_stub_response()},
+                          {"UserPoolId": "us-east-1_x", "ClientId": "c1"})
+        desired = dp.client_configs("example.com", [], "Okta")["site"]
+        merged = dp._client_update_params(cog, "us-east-1_x", "c1", desired)
+
+    assert merged["ClientName"] == desired["ClientName"]   # 未改名
+    assert merged["ClientName"] == "site-builder-site"
