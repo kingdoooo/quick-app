@@ -4,6 +4,7 @@
 token，部署 MCP 的 owner 识别依赖它）。幂等可重跑。"""
 import configparser
 import io
+import json
 import re
 import secrets
 import subprocess
@@ -50,16 +51,24 @@ def build_zip() -> bytes:
         return buf.getvalue()
 
 
-def main():
-    jwt_secret = ensure_secret("/site-builder/jwt-secret", lambda: secrets.token_hex(32))
-    client_secret = ssm.get_parameter(Name="/site-builder/site-client-secret",
-                                      WithDecryption=True)["Parameter"]["Value"]
-    role_arn = ensure_lambda_role()
-    env = {"Variables": {
-        "JWT_SECRET": jwt_secret,
+JWT_SECRET_PARAM = "/site-builder/jwt-secret"
+CLIENT_SECRET_PARAM = "/site-builder/site-client-secret"
+
+
+def lambda_env() -> dict:
+    """Lambda 环境变量：**只下发参数名，不下发密钥明文**。
+
+    `lambda:GetFunctionConfiguration` 会原样回显环境变量（部署时实测确认），
+    而那是个常见的只读权限。JWT_SECRET 泄漏尤其致命——Edge 只验 HS256 签名，
+    拿到它即可伪造任意用户的会话 cookie，绕过 owner / allowed_users /
+    collaborators 全部判定。运行时由 login_handler._secret() 从 SSM
+    SecureString 读并在容器内缓存。
+    """
+    return {"Variables": {
+        "JWT_SECRET_PARAM": JWT_SECRET_PARAM,
+        "CLIENT_SECRET_PARAM": CLIENT_SECRET_PARAM,
         "COGNITO_DOMAIN": CFG["Cognito"]["domain"],
         "CLIENT_ID": CFG["Cognito"]["site_client_id"],
-        "CLIENT_SECRET": client_secret,
         "BASE_DOMAIN": BASE,
         "USER_POOL_ID": CFG["Cognito"]["user_pool_id"],
         # email 是授权主键，而联邦 email 默认 unverified——见 login_handler 的
@@ -68,6 +77,14 @@ def main():
         # 环境变量缺失、代码回落默认值（true），行为仍然安全，但配置里写的
         # false 不生效——运维会以为关掉了却没关。
         "REQUIRE_EMAIL_VERIFIED": _require_email_verified_cfg()}}
+
+
+def main():
+    # 密钥仍在这里**确保存在**（首次部署要生成 JWT secret），但只写进 SSM，
+    # 不进环境变量——运行时由 login_handler._secret() 去读。
+    ensure_secret(JWT_SECRET_PARAM, lambda: secrets.token_hex(32))
+    role_arn = ensure_lambda_role()
+    env = lambda_env()
     code = build_zip()
     try:
         lam.get_function(FunctionName=FN)
@@ -240,15 +257,43 @@ def ensure_pre_token_trigger(role_arn: str, pool_id: str | None = None,
 
 
 def ensure_lambda_role() -> str:
+    """auth 服务与 pre-token 触发器的执行角色。幂等收敛，不只在创建时配。
+
+    **不能对已存在的角色 early-return**：那样线上角色永远拿不到新增权限
+    （本函数加 SSM 读权限时就踩到——已有角色不补策略，运行时读密钥
+    AccessDenied，症状是所有登录 500）。与 deploy_pool 的
+    "幂等重跑不能把线上加固打回默认"是同一类要求。
+    """
     name = "site-auth-service-role"
     try:
-        return iam.get_role(RoleName=name)["Role"]["Arn"]
+        arn = iam.get_role(RoleName=name)["Role"]["Arn"]
+        created = False
     except iam.exceptions.NoSuchEntityException:
-        r = iam.create_role(RoleName=name, AssumeRolePolicyDocument=json_trust())
-        iam.attach_role_policy(RoleName=name,
-            PolicyArn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole")
+        arn = iam.create_role(RoleName=name,
+                              AssumeRolePolicyDocument=json_trust())["Role"]["Arn"]
+        created = True
+    # 每次都收敛：基础执行策略 + 密钥读取
+    iam.attach_role_policy(RoleName=name,
+        PolicyArn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole")
+    # 密钥从 SSM SecureString 运行时读（见 lambda_env 的说明），故需要
+    # GetParameter + kms:Decrypt。资源限定到本平台的参数前缀——给 "*"
+    # 等于让这个角色能读账号里所有 SecureString。
+    iam.put_role_policy(RoleName=name, PolicyName="read-platform-secrets",
+        PolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": [
+            {"Sid": "ReadPlatformSecrets", "Effect": "Allow",
+             "Action": "ssm:GetParameter",
+             "Resource": f"arn:aws:ssm:{REGION}:{CFG['Platform']['account_id']}"
+                         ":parameter/site-builder/*"},
+            # SecureString 用账号默认的 aws/ssm key 加密；解密走 SSM 服务，
+            # 故用 ViaService 限定，避免这个角色能直接拿 KMS key 干别的。
+            {"Sid": "DecryptViaSSM", "Effect": "Allow",
+             "Action": "kms:Decrypt", "Resource": "*",
+             "Condition": {"StringEquals": {
+                 "kms:ViaService": f"ssm.{REGION}.amazonaws.com"}}},
+        ]}))
+    if created:
         import time; time.sleep(10)  # IAM 传播
-        return r["Role"]["Arn"]
+    return arn
 
 
 def json_trust() -> str:

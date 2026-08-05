@@ -26,6 +26,46 @@ from jwt import PyJWKClient
 from session import mint_session_jwt
 
 _jwks_client = None  # 模块级缓存，Lambda 容器复用
+_secret_cache: dict[str, str] = {}
+_ssm_client = None
+
+
+def _ssm():
+    global _ssm_client
+    if _ssm_client is None:
+        import boto3
+        _ssm_client = boto3.client("ssm", region_name="us-east-1")
+    return _ssm_client
+
+
+def _secret(name: str) -> str:
+    """从 SSM SecureString 读密钥，容器内缓存。
+
+    **不从环境变量下发生产密钥**：`lambda:GetFunctionConfiguration` 会原样
+    回显环境变量明文，而那是个很常见的只读权限（部署时实测确认过）。
+    JWT_SECRET 的后果尤重——Edge 只验 HS256 签名，拿到它即可伪造任意用户的
+    会话 cookie，等于绕过 owner / allowed_users / collaborators 全部判定。
+
+    仍认环境变量直给的值：单测与本地调试依赖它，且生产部署只下发 `*_PARAM`
+    参数名（见 deploy_auth 的 lambda_env），所以明文不会回到线上配置。
+    两个来源都没有时抛错——空密钥签出的 HS256 任何人都能伪造，静默降级
+    在这里等于关掉鉴权。
+    """
+    if name in _secret_cache:
+        return _secret_cache[name]
+    direct = os.environ.get(name)
+    if direct:
+        _secret_cache[name] = direct
+        return direct
+    param = os.environ.get(f"{name}_PARAM")
+    if not param:
+        raise RuntimeError(
+            f"{name} 无来源：既没有环境变量 {name}，也没有 {name}_PARAM 指向 "
+            "SSM 参数。拒绝继续——空密钥签出的会话任何人都能伪造。")
+    value = _ssm().get_parameter(Name=param, WithDecryption=True)[
+        "Parameter"]["Value"]
+    _secret_cache[name] = value
+    return value
 
 
 def _get_jwks_client() -> PyJWKClient:
@@ -39,7 +79,7 @@ def _get_jwks_client() -> PyJWKClient:
 
 def _state_sig(body: str) -> str:
     return base64.urlsafe_b64encode(hmac.new(
-        os.environ["JWT_SECRET"].encode(), body.encode(),
+        _secret("JWT_SECRET").encode(), body.encode(),
         hashlib.sha256).digest()).rstrip(b"=").decode()
 
 
@@ -190,7 +230,7 @@ def _post_token(code: str, verifier: str) -> dict:
         "code_verifier": verifier,
     }).encode()
     basic = base64.b64encode(
-        f"{os.environ['CLIENT_ID']}:{os.environ['CLIENT_SECRET']}".encode()).decode()
+        f"{os.environ['CLIENT_ID']}:{_secret('CLIENT_SECRET')}".encode()).decode()
     req = urllib.request.Request(
         f"{domain}/oauth2/token", data=body,
         headers={"Authorization": f"Basic {basic}",
@@ -402,7 +442,7 @@ def handler(event, context):
             # 平台故障不能伪装成"请重新登录"。
             return {"statusCode": 400, "body": "登录校验失败，请重新登录"}
         token = mint_session_jwt(user["email"], user["name"],
-                                 os.environ["JWT_SECRET"], idp=user.get("idp", ""),
+                                 _secret("JWT_SECRET"), idp=user.get("idp", ""),
                                  auth_via=user.get("auth_via", ""))
         cookie = (f"sb_session={token}; Domain=.{base}; Path=/; Max-Age=86400; "
                   f"Secure; HttpOnly; SameSite=Lax")
