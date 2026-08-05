@@ -130,8 +130,9 @@ def test_expenses_site_dsql_crud(session_cookie):
 
 
 def test_update_visible_and_undeploy_404(cfg):
-    # 二次部署同一 static fixture（同 site_id 由 deploy_fixture 支持 --site-id 参数）
-    # 简化：部署新实例后 undeploy，验证 404
+    # 部署新实例后 undeploy，验证 404。
+    # （deploy_fixture.py **没有** --site-id 参数——site_id 由它随机生成，
+    #   所以"同 site_id 二次部署"这条路径不在本用例覆盖范围内。）
     url = _deploy("static-hello")
     site_id = url.split("//app-")[1].split(".")[0]
     fn = boto3.client("lambda", region_name="us-east-1")

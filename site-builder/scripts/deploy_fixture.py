@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """打包 fixture → 上传 → 建 job → 跑状态机 → 轮询到终态。用法：
-python3 site-builder/scripts/deploy_fixture.py site-builder/fixtures/nosql-notes"""
+python3 site-builder/scripts/deploy_fixture.py site-builder/fixtures/nosql-notes
+python3 site-builder/scripts/deploy_fixture.py <fixture> --owner me@example.com
+
+owner 默认 `fixture@test`（E2E 用，不对应真人）。**要用 MCP 工具操作这个站点时
+必须传 --owner 你的登录邮箱**——否则 role_of() 判你不是 owner，所有权限工具
+都会拒绝，而症状看起来像"工具坏了"。"""
 import configparser
 import io
 import json
@@ -18,7 +23,7 @@ CFG.read(Path(__file__).parents[1] / "config.ini")
 ACCT = CFG["Platform"]["account_id"]
 
 
-def main(fixture_dir: str):
+def main(fixture_dir: str, owner: str = "fixture@test"):
     root = Path(fixture_dir)
     manifest = json.loads((root / "site.json").read_text())
     site_id = f"{manifest['name'][:20]}-{secrets.token_hex(3)}"
@@ -39,7 +44,7 @@ def main(fixture_dir: str):
     now = datetime.now(timezone.utc).isoformat()
     boto3.resource("dynamodb", region_name="us-east-1").Table(
         CFG["Deployer"]["jobs_table"]).put_item(Item={
-            "job_id": job_id, "site_id": site_id, "owner": "fixture@test",
+            "job_id": job_id, "site_id": site_id, "owner": owner,
             "status": "PENDING", "phase": "submitted", "error": "", "url": "",
             "created_at": now, "updated_at": now})
     boto3.client("stepfunctions", region_name="us-east-1").start_execution(
@@ -58,4 +63,10 @@ def main(fixture_dir: str):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("fixture_dir")
+    ap.add_argument("--owner", default="fixture@test",
+                    help="站点 owner 邮箱；要用 MCP 权限工具操作它就填你的登录邮箱")
+    a = ap.parse_args()
+    main(a.fixture_dir, a.owner)
