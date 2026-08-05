@@ -53,6 +53,16 @@ NATIVE_AUTH_FLOWS = ("ALLOW_USER_PASSWORD_AUTH", "ALLOW_USER_SRP_AUTH",
                      "USER_PASSWORD_AUTH")
 
 
+def _truthy(value: str) -> bool:
+    """config.ini 的布尔解析。行内注释会被 configparser 并进值，故先切掉 #/;。
+
+    只认明确的真值词；写错（yes/1/on 之外的拼写）一律当 False，与
+    router/stack.py 对 require_idp_claim 的严格态度一致。
+    """
+    head = str(value).split("#")[0].split(";")[0].strip().lower()
+    return head in ("true", "yes", "1", "on")
+
+
 def pool_config(base_domain: str) -> dict:
     """CreateUserPool 参数。
 
@@ -98,7 +108,12 @@ def client_configs(base_domain: str, extra_mcp_callbacks: list[str],
         "AllowedOAuthFlowsUserPoolClient": True,
         "AllowedOAuthScopes": ["openid", "email", "profile"],
         "CallbackURLs": [f"https://auth.{base_domain}/callback"],
-        "LogoutURLs": [f"https://auth.{base_domain}/logout"],
+        # **/logged-out，不是 /logout**：auth 服务的 /logout 会重定向到 Cognito
+        # 的 /logout?logout_uri=…，而 Cognito 只接受已登记的 sign-out URL。
+        # 若这里登记 /logout，Cognito 登出后又打回 /logout → 无限重定向。
+        # 保留 /logout 以兼容历史登记值（多一个已登记 URL 无害，少一个会报错）。
+        "LogoutURLs": [f"https://auth.{base_domain}/logged-out",
+                       f"https://auth.{base_domain}/logout"],
         "SupportedIdentityProviders": list(_providers),
         # refresh token 有效期收到 1 天（默认 30 天）。理由：refresh token
         # 一旦签发，在有效期内可持续换新 token，而新 token 的 auth_via 是
@@ -302,7 +317,7 @@ def _ensure_clients(cog, pool_id: str, base_domain: str,
         name = params["ClientName"]
         if name in existing:
             client_id = existing[name]
-            update = {k: v for k, v in params.items() if k != "GenerateSecret"}
+            update = _client_update_params(cog, pool_id, existing[name], params)
             cog.update_user_pool_client(UserPoolId=pool_id, ClientId=client_id,
                                         **update)
             print(f"  更新 client {name} = {client_id}")
@@ -312,6 +327,47 @@ def _ensure_clients(cog, pool_id: str, base_domain: str,
             print(f"  新建 client {name} = {client_id}")
         out[key] = client_id
     return out
+
+
+# describe_user_pool_client 回传里**不能**原样送回 update_user_pool_client 的字段。
+# 其余键一律回填，否则被重置为默认值（见 _client_update_params）。
+_CLIENT_READONLY_KEYS = frozenset({
+    "UserPoolId", "ClientId", "ClientName", "ClientSecret",
+    "CreationDate", "LastModifiedDate",
+    # GenerateSecret 只在 create 时有效，update 不接受
+    "GenerateSecret",
+})
+
+
+def _client_update_params(cog, pool_id: str, client_id: str,
+                          desired: dict) -> dict:
+    """read-modify-write：先 Describe，再把本脚本声明的字段盖上去。
+
+    **UpdateUserPoolClient 是整体替换**，官方明示"If you don't provide a value
+    for an attribute, Amazon Cognito sets it to its default value"，并建议
+    "construct this API request to pass the existing configuration of your app
+    client, modified to include the changes that you want to make"。
+    只发本脚本声明的字段（旧实现）会把脚本没管的配置静默打回默认值，其中至少
+    两项是安全相关的：
+      · PreventUserExistenceErrors —— **API 创建/更新的默认值是 LEGACY（关闭）**，
+        而控制台默认是 ENABLED。运营同学在控制台开了它，脚本一重跑就被关掉，
+        用户枚举防护消失，且没有任何输出提示。
+      · EnableTokenRevocation —— 关掉后 refresh token 无法吊销，而
+        AgentCore 的 authorizer 不回查撤销状态，等于延长了被盗 token 的寿命。
+    其余如 ReadAttributes / WriteAttributes / AnalyticsConfiguration 同理。
+
+    ClientName 不回填也不更新：它是 _ensure_clients 的查找键，改名等于新建。
+    """
+    current = cog.describe_user_pool_client(
+        UserPoolId=pool_id, ClientId=client_id)["UserPoolClient"]
+    merged = {k: v for k, v in current.items()
+              if k not in _CLIENT_READONLY_KEYS}
+    merged.update({k: v for k, v in desired.items()
+                   if k not in _CLIENT_READONLY_KEYS})
+    # WriteAttributes 必须涵盖全部 IdP 映射属性（官方要求；API 参考说映射不上
+    # 会报错，开发者指南说静默跳过——两种说法都意味着必须包含）。这里不主动
+    # 收窄 WriteAttributes，沿用线上值：为空/缺失时 Cognito 允许写全部标准属性。
+    return merged
 
 
 def _assert_no_native_flows(key: str, params: dict) -> None:
@@ -365,7 +421,27 @@ def _ensure_branding(cog, pool_id: str, clients: dict) -> None:
 
 
 def _ensure_oidc_idp(cog, pool_id: str, idp: dict) -> None:
-    """联邦一个 OIDC IdP。飞书适配器与标准 IdP（Okta 等）走同一条路径。"""
+    """联邦一个 OIDC IdP。飞书适配器与标准 IdP（Okta 等）走同一条路径。
+
+    **email 的可信度是整个授权模型的地基**：owner / collaborators /
+    allowed_users / 会话 claim 全以 email 为键。而联邦映射进 Cognito 的 email
+    **默认是 unverified**（官方："By default, mapped email addresses are
+    unverified… Instead, map an attribute from your IdP to get the verification
+    status"）。若 IdP 允许用户自行设置未验证邮箱，攻击者把自己的 email 改成
+    某站点 owner 的地址即可继承其权限。
+
+    因此在有 email_verified 的 IdP 上必须映射它。映射本身是安全的：官方明示
+    "Amazon Cognito will map incoming claims to user pool attributes only if
+    the claims exist in the incoming token"——IdP 不发这个 claim 时是 no-op，
+    **不会导致登录失败**。所以默认就映射上（config.ini 可关）。
+
+    注意映射的效力边界（别把它当成完整防线）：
+      · 该属性是**粘性**的——官方说源 claim 消失时 Cognito 不会删除或改写已有
+        值，所以"某次登录带了 true，之后不带"不会退回 false。
+      · 它证明"IdP 声明该邮箱已验证"，不证明"邮箱不可被用户自改"。真正的
+        强约束是企业 IdP 侧保证邮箱唯一且用户不可自改。
+      · 长期正解是把授权主键换成 issuer+subject，email 只作展示（spec 未来项）。
+    """
     name = idp["provider_name"]
     details = {
         "client_id": idp["client_id"],
@@ -375,6 +451,9 @@ def _ensure_oidc_idp(cog, pool_id: str, idp: dict) -> None:
         "authorize_scopes": idp.get("scopes", "openid email profile"),
     }
     mapping = {"email": "email", "name": "name"}
+    # 默认映射 email_verified；IdP 确实不提供且不想留空属性时可显式关掉。
+    if _truthy(idp.get("map_email_verified", "true")):
+        mapping["email_verified"] = "email_verified"
     try:
         cog.describe_identity_provider(UserPoolId=pool_id, ProviderName=name)
         cog.update_identity_provider(UserPoolId=pool_id, ProviderName=name,

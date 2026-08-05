@@ -341,3 +341,170 @@ def test_existing_domain_with_v1_is_upgraded():
                           {"Domain": "old", "UserPoolId": "us-east-1_test",
                            "ManagedLoginVersion": 2})
         assert dp._ensure_domain(cog, "us-east-1_test", "pfx") == "old"
+
+
+# --- 幂等重跑不得重置线上配置（Codex review P2） ---
+# UpdateUserPoolClient 是整体替换语义：官方明示未提供的参数会被设回默认值。
+# 只发脚本声明的字段会把运营/安全加固静默打回默认，其中
+# PreventUserExistenceErrors 经 API 的默认是 LEGACY（关闭）——控制台默认却是
+# ENABLED，所以"控制台开了、脚本重跑关掉"是完全现实的路径。
+
+def _client_stub_response(**overrides) -> dict:
+    """describe_user_pool_client 的线上现状（含脚本不管的加固项）。"""
+    base = {
+        "UserPoolId": "us-east-1_x", "ClientId": "c1",
+        "ClientName": "site-builder-site",
+        "PreventUserExistenceErrors": "ENABLED",
+        "EnableTokenRevocation": True,
+        "ReadAttributes": ["email", "name"],
+        "WriteAttributes": ["email", "name"],
+        "AllowedOAuthFlows": ["code"],
+        "ExplicitAuthFlows": ["ALLOW_REFRESH_TOKEN_AUTH"],
+    }
+    base.update(overrides)
+    return base
+
+
+def test_client_update_preserves_unmanaged_hardening():
+    """脚本不声明的加固项必须原样回填，不能被重置为默认值。"""
+    import boto3
+    from botocore.stub import Stubber
+
+    cog = boto3.client("cognito-idp", region_name="us-east-1",
+                       aws_access_key_id="t", aws_secret_access_key="t")
+    with Stubber(cog) as stub:
+        stub.add_response("describe_user_pool_client",
+                          {"UserPoolClient": _client_stub_response()},
+                          {"UserPoolId": "us-east-1_x", "ClientId": "c1"})
+        desired = dp.client_configs("example.com", [], "Okta")["site"]
+        merged = dp._client_update_params(cog, "us-east-1_x", "c1", desired)
+
+    # 线上加固项被保留
+    assert merged["PreventUserExistenceErrors"] == "ENABLED"
+    assert merged["EnableTokenRevocation"] is True
+    assert merged["ReadAttributes"] == ["email", "name"]
+    # 脚本声明的字段仍然生效（本脚本管的就是这些）
+    assert merged["SupportedIdentityProviders"] == ["Okta"]
+    assert merged["ExplicitAuthFlows"] == dp.NATIVE_AUTH_DISABLED
+    assert merged["AccessTokenValidity"] == 15
+
+
+def test_client_update_params_strip_create_only_keys():
+    """ClientId/ClientSecret/GenerateSecret 等不能进 update 请求。"""
+    import boto3
+    from botocore.stub import Stubber
+
+    cog = boto3.client("cognito-idp", region_name="us-east-1",
+                       aws_access_key_id="t", aws_secret_access_key="t")
+    with Stubber(cog) as stub:
+        stub.add_response("describe_user_pool_client",
+                          {"UserPoolClient": _client_stub_response(
+                              ClientSecret="FAKEclientsecretFAKEclientsec1")},
+                          {"UserPoolId": "us-east-1_x", "ClientId": "c1"})
+        desired = dp.client_configs("example.com", [], "Okta")["site"]
+        merged = dp._client_update_params(cog, "us-east-1_x", "c1", desired)
+
+    for k in ("ClientId", "ClientSecret", "GenerateSecret", "UserPoolId",
+              "CreationDate", "LastModifiedDate"):
+        assert k not in merged, f"{k} 不能出现在 update 请求里"
+
+
+def test_client_update_request_passes_service_model_validation():
+    """合并结果必须能通过 botocore 的 UpdateUserPoolClient 参数校验。
+
+    Stubber 按真实 service model 校验请求参数——回填一个 update 不接受的键
+    （比如 ClientSecret）会在这里以 ParamValidationError 失败，而不是等到真机。
+    """
+    import boto3
+    from botocore.stub import Stubber
+
+    cog = boto3.client("cognito-idp", region_name="us-east-1",
+                       aws_access_key_id="t", aws_secret_access_key="t")
+    desired = dp.client_configs("example.com", [], "Okta")["site"]
+    with Stubber(cog) as stub:
+        stub.add_response("describe_user_pool_client",
+                          {"UserPoolClient": _client_stub_response()},
+                          {"UserPoolId": "us-east-1_x", "ClientId": "c1"})
+        merged = dp._client_update_params(cog, "us-east-1_x", "c1", desired)
+        stub.add_response("update_user_pool_client", {"UserPoolClient": {}},
+                          {"UserPoolId": "us-east-1_x", "ClientId": "c1",
+                           **merged})
+        cog.update_user_pool_client(UserPoolId="us-east-1_x", ClientId="c1",
+                                    **merged)
+        stub.assert_no_pending_responses()
+
+
+# --- 联邦 email 的可信度（Codex review P1） ---
+# 授权主键是 email，而联邦映射进 Cognito 的 email 默认 unverified。
+# 官方：源 claim 不存在时映射是 no-op（不会导致登录失败），所以默认就映射上。
+
+def _idp(**over):
+    base = {"provider_name": "Okta", "client_id": "cid",
+            "client_secret": "csec", "issuer": "https://idp.example.com"}
+    base.update(over)
+    return base
+
+
+def _captured_mapping(idp: dict) -> dict:
+    """跑 _ensure_oidc_idp 的 create 分支，抓它下发的 AttributeMapping。"""
+    seen = {}
+
+    class _Cog:
+        class exceptions:
+            class ResourceNotFoundException(Exception):
+                pass
+
+        def describe_identity_provider(self, **kw):
+            raise self.exceptions.ResourceNotFoundException()
+
+        def create_identity_provider(self, **kw):
+            seen.update(kw)
+
+        def update_identity_provider(self, **kw):
+            seen.update(kw)
+
+    dp._ensure_oidc_idp(_Cog(), "us-east-1_x", idp)
+    return seen["AttributeMapping"]
+
+
+def test_idp_maps_email_verified_by_default():
+    """不映射 email_verified 时，联邦 email 恒为 unverified——
+    允许自设邮箱的 IdP 上等于可冒充任意 owner/collaborator。"""
+    mapping = _captured_mapping(_idp())
+    assert mapping["email_verified"] == "email_verified"
+    assert mapping["email"] == "email"
+
+
+def test_idp_email_verified_mapping_can_be_disabled():
+    """IdP 确实不提供该 claim 时可显式关掉（映射本身是 no-op，但允许留白）。"""
+    mapping = _captured_mapping(_idp(map_email_verified="false"))
+    assert "email_verified" not in mapping
+
+
+def test_idp_mapping_applies_on_update_path_too():
+    """已存在的 IdP 走 update 分支——映射不能只在新建时加上。"""
+    seen = {}
+
+    class _Cog:
+        class exceptions:
+            class ResourceNotFoundException(Exception):
+                pass
+
+        def describe_identity_provider(self, **kw):
+            return {"IdentityProvider": {}}
+
+        def update_identity_provider(self, **kw):
+            seen.update(kw)
+
+    dp._ensure_oidc_idp(_Cog(), "us-east-1_x", _idp())
+    assert seen["AttributeMapping"]["email_verified"] == "email_verified"
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("true", True), ("True", True), ("yes", True), ("1", True), ("on", True),
+    ("false", False), ("no", False), ("", False), ("maybe", False),
+    # configparser 保留行内注释——切掉后仍要判对（router/stack.py 同款坑）
+    ("true   # 默认开", True), ("false  ; 关掉", False),
+])
+def test_truthy_parsing(raw, expected):
+    assert dp._truthy(raw) is expected

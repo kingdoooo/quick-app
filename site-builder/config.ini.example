@@ -36,9 +36,23 @@ endpoint_url =
 # 平台对 IdP 无感——只要 IdP 能给 email claim 即可（飞书适配器与
 # Okta/Azure AD 等标准 IdP 走同一条配置路径，见 DEPLOY.md ①）。
 # 留空则只建 pool 与 client，联邦另行手工配置。
+#
+# ⚠️ 接入 IdP 前必读——**email 的可信度是整个授权模型的地基**：
+# owner / collaborators / allowed_users / 会话 claim 全以 email 为键。
+# 联邦映射进 Cognito 的 email **默认是 unverified**（AWS 官方行为）。
+# 因此对 IdP 的要求不只是"能给 email claim"，而是：
+#   ① 邮箱由管理员/组织分配，终端用户**不能自行修改**；
+#   ② 邮箱在组织内唯一，不会被回收后重新分配给他人。
+# 不满足这两条的 IdP（如允许自助注册并自设邮箱的公共 IdP）绝不能接——
+# 攻击者把自己的 email 改成某站点 owner 的地址即可继承其全部权限。
 [IdP]
 provider_name =
 issuer =
 client_id =
 client_secret =
 scopes = openid email profile
+# 是否把 IdP 的 email_verified claim 映射进用户档案（默认 true）。
+# IdP 不发这个 claim 时映射是 no-op，不会导致登录失败，所以保持 true 无风险。
+# 注意它的效力边界：该属性是**粘性**的（源 claim 消失时 Cognito 不回退），
+# 且只表示"IdP 声明已验证"，不代表"用户不能自改邮箱"——上面的 ①② 才是硬要求。
+map_email_verified = true
