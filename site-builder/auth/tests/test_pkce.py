@@ -383,7 +383,8 @@ def test_logged_out_page_does_not_claim_full_signout():
     assert any(c.startswith("sb_session=;") for c in r["cookies"])
 
 
-def _http_error(status: int, oauth_error=None, reason="Bad Request"):
+def _http_error(status: int, oauth_error=None, reason="Bad Request",
+                body_desc=None):
     """构造带 OAuth 错误体的 HTTPError。
 
     body 必须是真的可读流：实现按 error 字段分流，
@@ -392,7 +393,12 @@ def _http_error(status: int, oauth_error=None, reason="Bad Request"):
     import io
     import json as _json
     import urllib.error
-    body = _json.dumps({"error": oauth_error}).encode() if oauth_error else b""
+    payload = {}
+    if oauth_error:
+        payload["error"] = oauth_error
+    if body_desc:
+        payload["error_description"] = body_desc
+    body = _json.dumps(payload).encode() if payload else b""
     return urllib.error.HTTPError("https://sso/oauth2/token", status, reason,
                                   {}, io.BytesIO(body))
 
@@ -515,3 +521,53 @@ def test_is_verified_is_fail_closed():
         assert lh._is_verified(bad) is False, bad
     for good in (True, "true", "True", " true "):
         assert lh._is_verified(good) is True, good
+
+
+# --- 配置型 invalid_grant 必须留下可告警的痕迹（Codex re-review P1） ---
+# invalid_grant 不只表示"用户 code 有问题"：官方把"app client 缺少 scope 所需
+# 的属性读取权限"也归到这个 code。响应体不足以可靠细分，所以不猜——仍给 400，
+# 但必须打结构化日志，让"突然高频"可被 metric filter 发现。
+
+@patch.dict(lh.os.environ, ENV)
+def test_invalid_grant_emits_structured_log(capsys):
+    state, pkce = _login_state_and_cookie()
+    with patch.object(lh.urllib.request, "urlopen",
+                      side_effect=_http_error(
+                          400, "invalid_grant",
+                          body_desc="client is not authorized to read email_verified")):
+        r = lh.handler(_event("/callback", {"code": "x", "state": state},
+                              cookies=[pkce]), None)
+    assert r["statusCode"] == 400
+    lines = [l for l in capsys.readouterr().out.splitlines() if l.startswith("{")]
+    payload = [__import__("json").loads(l) for l in lines]
+    hit = [p for p in payload
+           if p.get("event") == "token_exchange_invalid_grant"]
+    assert hit, "invalid_grant 必须打结构化日志（否则配置事故不可告警）"
+    # error_description 要带上：它是人工区分"重放"与"配置写坏"的唯一线索
+    assert "email_verified" in hit[0].get("description", "")
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_structured_log_carries_no_authorization_code(capsys):
+    """日志绝不能带 code/token——它会长期留在 CloudWatch。"""
+    state, pkce = _login_state_and_cookie()
+    with patch.object(lh.urllib.request, "urlopen",
+                      side_effect=_http_error(400, "invalid_grant")):
+        lh.handler(_event("/callback", {"code": "SECRETCODE123", "state": state},
+                          cookies=[pkce]), None)
+    assert "SECRETCODE123" not in capsys.readouterr().out
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_upstream_error_also_logged(capsys):
+    """上抛的平台故障同样要有结构化记录（它会 5xx，但日志便于定位 error code）。"""
+    import urllib.error
+    state, pkce = _login_state_and_cookie()
+    with patch.object(lh.urllib.request, "urlopen",
+                      side_effect=_http_error(400, "invalid_client")):
+        with pytest.raises(urllib.error.HTTPError):
+            lh.handler(_event("/callback", {"code": "x", "state": state},
+                              cookies=[pkce]), None)
+    out = capsys.readouterr().out
+    assert "token_exchange_upstream_error" in out
+    assert "invalid_client" in out

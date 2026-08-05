@@ -211,27 +211,55 @@ def _post_token(code: str, verifier: str) -> dict:
         # 把它们全翻成"请重新登录"会让配置事故与限流伪装成用户错误：
         # 用户反复重登都失败，而 Lambda 返回成功的 400，不触发任何 5xx 告警。
         # 只有 invalid_grant 才真正属于"本次授权码不可用"。
-        err = _oauth_error(e)
+        err, desc = _oauth_error(e)
         if err == "invalid_grant":
+            # **invalid_grant 不等于"用户的 code 有问题"**：官方把
+            # "app client 缺少 scope 所需的属性读取权限（如请求 email scope
+            # 却读不到 email_verified）"也归到这个 code 下。那是**全员登录失败**
+            # 的配置事故，与"某个用户重放了 code"混在同一个 400 里。
+            # 响应体不足以可靠细分（error_description 不是稳定契约），所以
+            # 不猜：仍返回用户可读的 400，但**必须留下结构化日志**，让
+            # "invalid_grant 突然高频"这条曲线可被告警发现。
+            # 单个用户重放 = 偶发几条；配置写坏 = 每次登录一条，形态完全不同。
+            _log_auth_failure("token_exchange_invalid_grant", error=err,
+                              description=desc, status=e.code)
             raise TokenExchangeRejected(
                 f"授权码不可用（{err}）: {e.code}") from e
         # 其余 4xx 与全部 5xx 一律上抛成平台故障：宁可 502 告警，
         # 也不要把"secret 过期了"显示成"请重新登录"。
+        _log_auth_failure("token_exchange_upstream_error", error=err,
+                          description=desc, status=e.code)
         raise
 
 
-def _oauth_error(err: urllib.error.HTTPError) -> str:
-    """取 OAuth 错误响应体里的 error 字段；取不到返回 ""。
+def _log_auth_failure(event_type: str, **fields) -> None:
+    """一行 JSON 打进 CloudWatch Logs，供 metric filter / Logs Insights 聚合。
+
+    为什么是结构化而不是 print 文本：这条日志的用途是**发现配置事故**——
+    对 `event="token_exchange_invalid_grant"` 建 metric filter + 阈值告警，
+    高频即代表 app client 属性权限被写坏（而非用户重放）。文本日志做不到
+    可靠聚合。不要在这里放 code / token / cookie 等敏感值。
+    """
+    try:
+        print(json.dumps({"event": event_type, **fields}, ensure_ascii=False))
+    except Exception:
+        pass        # 日志失败绝不能影响请求处理路径
+
+
+def _oauth_error(err: urllib.error.HTTPError) -> tuple[str, str]:
+    """取 OAuth 错误响应体的 (error, error_description)；取不到返回 ("", "")。
 
     读 body 会消耗流，且只读一次——调用方之后不要再读它。
-    body 不是 JSON / 没有 error 字段 / 读失败时一律返回 ""，
+    body 不是 JSON / 没有 error 字段 / 读失败时一律返回空，
     走"当成平台故障上抛"的保守分支（分类不出来时不要替用户下结论）。
     """
     try:
         payload = json.loads(err.read().decode("utf-8", "replace"))
-        return payload.get("error", "") if isinstance(payload, dict) else ""
+        if not isinstance(payload, dict):
+            return "", ""
+        return payload.get("error", ""), payload.get("error_description", "")
     except Exception:
-        return ""
+        return "", ""
 
 
 def _exchange_code(code: str, verifier: str, nonce: str) -> dict:
