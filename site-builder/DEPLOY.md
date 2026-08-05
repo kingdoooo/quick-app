@@ -276,6 +276,27 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    10-20 分钟全球复制，**回滚同样慢**——翻之前先确认 `trusted_idps` 的值与
    Cognito 里的 provider name 逐字符一致。
 
+6. **给登录失败建告警**（否则一类全员事故没人知道）：Cognito 的
+   `invalid_grant` 既表示"用户重放了授权码"，也表示"app client 缺少 scope
+   所需的属性读取权限"——后者是**每个用户每次登录都失败**的配置事故，而两者
+   在响应里无法可靠区分，所以代码统一返回用户可读的 400。
+   区分靠的是**频率**：偶发几条是正常的用户行为，持续高频就是配置写坏。
+   auth 服务已按 `{"event":"token_exchange_invalid_grant",...}` 打结构化日志，
+   部署后建一个 metric filter + 阈值告警：
+
+   ```bash
+   aws logs put-metric-filter --region us-east-1 \
+     --log-group-name /aws/lambda/site-auth-service \
+     --filter-name auth-invalid-grant \
+     --filter-pattern '{ $.event = "token_exchange_invalid_grant" }' \
+     --metric-transformations \
+       metricName=AuthInvalidGrant,metricNamespace=SiteBuilder,metricValue=1
+   ```
+
+   再对 `SiteBuilder/AuthInvalidGrant` 建告警（起步阈值：5 分钟内 ≥ 10 次）。
+   同时 `token_exchange_upstream_error` 事件会伴随 5xx，按 Lambda Errors 告警
+   即可覆盖。日志里**不含** code / token / cookie。
+
 ---
 
 ## ① 身份层（Task 3）
@@ -745,6 +766,34 @@ SSM 参数：`/site-builder/jwt-secret`（已存在）、`/site-builder/site-cli
 - PoC 仅 Node.js 后端（Python 3.13 延后）；MCP 仅 OAuth（API Key fallback 延后）
 - CloudFront 全站禁缓存（正确性优先；精细缓存延后）
 - 详见设计文档 §8 风险 / §9 范围外
+
+### MCP runtime 的信任边界（不要外推 IAM 的保护范围）
+
+**部署 MCP 的 runtime 角色对"站点管理操作"而言属于 TCB（可信计算基）。**
+它的 IAM 策略按属性白名单收窄了**可写哪些字段**，但**不能**限制"可写哪些
+站点的行"：
+
+- `owner` 必须在白名单内（建站写 owner、`transfer_owner` 改 owner 都是正常
+  功能），所以 runtime 一旦被攻破，**可以把任意站点的 owner 改成攻击者**，
+  再以新 owner 身份走正常接口部署/下线/改权限。
+- 这条路径 IAM 关不掉：`dynamodb:LeadingKeys` 只能把主体限制在"由其身份推出
+  的分区键"（多租户模式），而本 runtime 服务全部用户、合法地需要访问任意
+  `site_id`；真正的授权规则（owner/collaborators）**存在行里**，是数据驱动的，
+  而 IAM 策略是静态的、读不到行内容。
+- 同一角色另外还持有 jobs `PutItem`、`states:StartExecution` 和 undeploy
+  Lambda 的调用权限。
+
+因此**站点归属的最终裁决者是应用层代码加上 runtime 角色自身的完整性**，
+不是 IAM。属性白名单的价值在别处：它挡住对部署链字段
+（`data_tables` / `migrations_applied` / `last_job_id` …）的篡改，
+以及路由表的 `static_prefix` / `api_target`（改这两个可劫持流量）。
+
+要让 IAM 真正兜住站点归属，必须把建站 / `transfer_owner` / 权限写入拆成
+**各自持有独立角色并做服务端授权**的窄接口（M3 控制台与 key-proxy 已按
+"独立 IAM 角色"设计，见设计文档 §2）。那是架构改动，未纳入 M1+M2。
+在此之前，运营上的对应措施是：把 runtime 的代码供应链与镜像来源当作
+与站点归属同等重要的资产（ECR 私有仓 + `--provenance=false` 固定构建、
+容器内不执行站点提供的代码）。
 
 ## 2026-07-27 独立审查后的修复（已实证验证，部署前必读）
 

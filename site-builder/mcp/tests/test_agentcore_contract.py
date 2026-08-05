@@ -461,3 +461,29 @@ def test_email_verified_default_is_enforcing(monkeypatch):
     import server
     monkeypatch.delenv("REQUIRE_EMAIL_VERIFIED", raising=False)
     assert server._require_email_verified() is True
+
+
+def test_sites_write_comment_states_trust_boundary_honestly():
+    """注释不得声称 IAM 能阻止 owner takeover（它不能）。
+
+    上一轮的提交消息说攻击链被"两处独立封堵"，实际 sites/routing 都仍允许写
+    owner，真正阻断跨站 cookie 的只有 Edge 一道。这类过度声称比缺少防护更
+    危险：后来的人会据此以为 runtime 被攻破也丢不了站点归属。
+    """
+    src = (MCP_DIR / "deploy_agentcore.py").read_text()
+    start = src.index('"Sid": "SitesWrite"')
+    block = src[max(0, start - 2600):start]
+    assert "TCB" in block or "可信计算基" in block, \
+        "SitesWrite 上方必须写明 runtime 属于 TCB"
+    assert "LeadingKeys" in block, "必须写明为何 IAM 关不掉这条路径"
+
+
+def test_owner_stays_writable_by_design():
+    """owner 必须留在白名单里——这是功能需求，不是遗漏。
+
+    锁住这一点是为了防止有人"为了安全"把它删掉：删掉会让建站与
+    transfer_owner 在线上 AccessDenied，而真正的封堵点不在这里。
+    """
+    import deploy_agentcore as da
+    assert "owner" in da.SITE_WRITABLE_ATTRIBUTES
+    assert "owner" in da.ROUTE_PROJECTION_ATTRIBUTES

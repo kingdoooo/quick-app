@@ -191,12 +191,26 @@ def ensure_role() -> str:
         # migrations_applied 这些**部署链自己的字段**：把 DELETED 站点改回
         # ACTIVE、篡改 data_tables 让后续步骤误操作别的表。
         #
-        # ⚠️ 效力边界，别高估这条：owner 必须留在白名单里（创建站点写 owner、
-        # transfer_owner 改 owner，都是 MCP 的正常功能），所以它**不能**阻止
-        # "改 owner 绕过应用层判定"。那条提权路径真正的封堵点在 Edge——
-        # 平台信任已改为按请求 host 判定，不再从 owner 推导
-        # （router/.../origin_request.py 的 _is_platform_route）。
-        # 这里的价值是把可写面收敛到 MCP 真正需要的字段。
+        # ⚠️ **效力边界（务必按字面理解，不要外推）**：本条约束的是"可写哪些
+        # 字段"，**不是**"可写哪些站点的行"。owner 必须留在白名单里（建站写
+        # owner、transfer_owner 改 owner 都是 MCP 的正常功能），因此
+        # **被攻破的 runtime 仍可把任意站点的 owner 改成攻击者，进而以新 owner
+        # 的身份走正常接口做任何事**。这条路径 IAM 关不掉：
+        #   · dynamodb:LeadingKeys 只能把主体限制在"由其身份推出的分区键"
+        #     （多租户 ${...:user_id} 模式），而本 runtime 服务全部用户、
+        #     合法地需要访问任意 site_id；
+        #   · 真正的授权规则（owner/collaborators）**存在行里**，是数据驱动的，
+        #     而 IAM 策略是静态的、读不到行内容。
+        # 所以站点归属的最终裁决者是**应用层代码 + runtime 角色本身的完整性**：
+        # MCP runtime 对"站点管理操作"而言属于 TCB（可信计算基）。同理它还持有
+        # jobs PutItem、states:StartExecution 与 undeploy Lambda 调用权限。
+        # 若要让 IAM 真正兜住站点归属，必须把建站/transfer_owner/权限写入拆成
+        # 独立角色的窄接口（各自做服务端授权），那是架构改动，不在本轮范围。
+        # 见 DEPLOY.md「MCP runtime 的信任边界」一节。
+        #
+        # 本条仍然值得有：它把可写面收敛到 MCP 真正需要的字段，挡住对**部署链
+        # 字段**（data_tables / migrations_applied / last_job_id …）的篡改——
+        # 那些是纵深防御里独立的一层，与 owner 那条路径无关。
         {"Sid": "SitesWrite", "Effect": "Allow",
          "Action": "dynamodb:UpdateItem",
          "Resource": f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-sites",
