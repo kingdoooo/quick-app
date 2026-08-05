@@ -15,8 +15,12 @@ app.get("/api/notes", async (req, res) => {
   res.json(out.Items || []);
 });
 app.post("/api/notes", async (req, res) => {
+  // x-user-name 是 URL 编码的（HTTP 头不能携带中文），必须解码后再用或存；
+  // x-user-email 是 ASCII，平台不编码它。忘记解码不会报错，只会把
+  // %E5%BD%AD 这类编码串存进数据——合同校验器会在部署前拦下。
   const item = { id: crypto.randomUUID(), text: req.body.text,
                  author: req.headers["x-user-email"] || "anonymous",
+                 author_name: decodeURIComponent(req.headers["x-user-name"] || ""),
                  created_at: new Date().toISOString() };
   await db.send(new PutCommand({ TableName: TABLE, Item: item }));
   res.status(201).json(item);

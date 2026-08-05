@@ -62,7 +62,7 @@
 - **正确**（需要当前用户时读平台注入的请求头，直接信任）：
   ```js
   const email = req.headers["x-user-email"] || "anonymous";
-  // x-user-name 是 URL 编码的（HTTP 头无法携带中文），必须解码后再用/存
+  // x-user-name 必须解码，见红线 4
   const name = decodeURIComponent(req.headers["x-user-name"] || "");
   ```
 - **错误**：
@@ -74,7 +74,30 @@
   `allowed_users`），不在代码里实现。注意扫描含 `Set-Cookie` 等关键词的
   注释/字符串同样命中——后端代码里完全不要出现这些词。
 
-## 红线 4：禁止写本地文件
+## 红线 4：x-user-name 必须 decodeURIComponent
+
+- **规则**：代码里出现 `x-user-name`（前端或后端、任意大小写与引号写法）时，
+  同一文件必须出现 `decodeURIComponent(`。
+- **为什么**：HTTP 头不能携带非 ASCII 字节，所以平台边缘层注入这个头时做了
+  **URL 编码**（不编码的话中文名字会被 CloudFront 直接拒掉）。
+  `x-user-email` 是 ASCII，**不编码**，不需要解码。
+- **为什么值得一条红线**：漏掉解码**不会报错**——页面上显示
+  `%E5%BD%AD%E9%87%91%E5%86%AC`，写进数据库的也是这串编码。等发现时历史数据
+  已经脏了，只能单独清洗。真实站点踩过这个坑。
+- **违反后果**：
+  `backend/server.js: 用了 x-user-name 但没有 decodeURIComponent —— 该头是 URL 编码的…`
+- **正确**：
+  ```js
+  const name = decodeURIComponent(req.headers["x-user-name"] || "");
+  ```
+- **错误**：
+  ```js
+  const name = req.headers["x-user-name"] || "";        // 违规：拿到的是编码串
+  ```
+- 判定按**文件**而非按行：先取头存进变量、在别处解码也算通过。
+  黄金样例见 `fixtures/nosql-notes/backend/server.js`。
+
+## 红线 5：禁止写本地文件
 
 - **规则**：后端禁止 `fs.writeFile`、`fs.appendFile`、`fs.promises.*`、
   `fs.createWriteStream`、引入 `fs/promises`（含 `node:fs/promises`），
@@ -93,7 +116,7 @@
   const fsp = require("node:fs/promises");                  // 违规（整包被禁）
   ```
 
-## 红线 5：后端必须实现 `GET /api/health`
+## 红线 6：后端必须实现 `GET /api/health`
 
 - **规则**：backend 代码中必须出现 `/api/health` 端点。
 - **为什么**：部署最后一步冒烟测试会请求 `/api/health` 验证后端存活，
@@ -106,7 +129,7 @@
   ```
 - **错误**：只写业务路由、没有 health 端点。
 
-## 红线 6：DSQL 禁用特性（仅 fullstack-sql）
+## 红线 7：DSQL 禁用特性（仅 fullstack-sql）
 
 - **规则**：`backend/schema.sql` 必须存在，且不得出现 `REFERENCES`、
   `SERIAL`、`JSONB`、`CREATE TRIGGER`、`CREATE TEMP`。

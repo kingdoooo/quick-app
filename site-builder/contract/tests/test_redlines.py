@@ -280,3 +280,54 @@ def test_python_open_read_passes(tmp_path):
     d, m = make_site(tmp_path)
     (d / "backend/util.py").write_text("f = open(path, 'r')\ng = open(path2, 'rb')")
     assert scan_redlines(d, m) == []
+
+
+# --- x-user-name 必须解码（部署后实测：不解码会把 %E5%BD%AD… 存进数据） ---
+
+def test_raw_x_user_name_without_decode_fails(tmp_path):
+    """Edge 注入的 x-user-name 是 URL 编码的（HTTP 头不能携带非 ASCII）。
+
+    站点直接使用会把 `%E5%BD%AD%E9%87%91%E5%86%AC` 这类编码串当成人名显示、
+    甚至写进数据库——**症状不是报错而是静默脏数据**，所以必须在部署前拦下，
+    不能靠站点作者记得（真实站点 team-kudos-wall 就漏了这一步）。
+    """
+    d, m = make_site(tmp_path, server=(
+        "app.get('/api/health',(q,s)=>s.send('ok'));"
+        "const name = req.headers['x-user-name'] || '';"))
+    assert any("decodeURIComponent" in v for v in scan_redlines(d, m))
+
+
+def test_decoded_x_user_name_passes(tmp_path):
+    d, m = make_site(tmp_path, server=(
+        "app.get('/api/health',(q,s)=>s.send('ok'));"
+        "const name = decodeURIComponent(req.headers['x-user-name'] || '');"))
+    assert scan_redlines(d, m) == []
+
+
+def test_x_user_email_needs_no_decode(tmp_path):
+    """只有 name 需要解码。email 是 ASCII，Edge 不编码它——
+    要求解码 email 会制造无意义的红线（且解码 email 也无害，故不检查）。"""
+    d, m = make_site(tmp_path, server=(
+        "app.get('/api/health',(q,s)=>s.send('ok'));"
+        "const email = req.headers['x-user-email'] || 'anonymous';"))
+    assert scan_redlines(d, m) == []
+
+
+def test_x_user_name_decode_detected_across_quote_styles(tmp_path):
+    """双引号/反引号/中括号换写法都要认得——只认一种等于没拦。"""
+    for i, expr in enumerate(('req.headers["x-user-name"]',
+                              "req.headers[`x-user-name`]",
+                              "req.get('x-user-name')",
+                              "headers['X-User-Name']")):
+        d = tmp_path / f"case{i}"
+        d.mkdir()
+        site, m = make_site(d, server=(
+            "app.get('/api/health',(q,s)=>s.send('ok'));"
+            f"const n = {expr} || '';"))
+        assert any("decodeURIComponent" in v for v in scan_redlines(site, m)), expr
+
+
+def test_frontend_x_user_name_also_checked(tmp_path):
+    """前端也可能拿到这个头（经后端透传到页面），同样要解码。"""
+    d, m = make_site(tmp_path, index="const n = data['x-user-name'];")
+    assert any("decodeURIComponent" in v for v in scan_redlines(d, m))

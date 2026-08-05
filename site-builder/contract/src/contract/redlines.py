@@ -25,6 +25,13 @@ INNERHTML_RE = re.compile(
     r"(?:inner|outer)HTML\s*(?:[+]=|(?:\?\?|\|\|)=|=(?!=))"
     r"|insertAdjacentHTML\(|document\.write(?:ln)?\(")
 FORBIDDEN_DDL = ["REFERENCES", "SERIAL", "JSONB", "CREATE TRIGGER", "CREATE TEMP"]
+# Edge 注入的 x-user-name 是 **URL 编码**的（HTTP 头不能携带非 ASCII 字节——
+# 不编码会让中文名字直接被 CloudFront 拒掉），站点必须 decodeURIComponent。
+# 为什么值得一条红线：漏掉时**不报错**，而是把 `%E5%BD%AD…` 当人名显示、写库，
+# 变成静默脏数据（真实站点 team-kudos-wall 就这样存了一批编码串，事后只能清洗）。
+# 大小写都认：HTTP 头名不区分大小写，Express 的 req.get() 也不区分。
+X_USER_NAME_RE = re.compile(r"""x-user-name""", re.I)
+DECODE_RE = re.compile(r"decodeURIComponent\s*\(")
 
 
 def _read_all(root: Path) -> list[tuple[Path, str]]:
@@ -53,6 +60,21 @@ def _scan_package_json(text: str, rel: Path) -> list[str]:
     return []
 
 
+def _check_user_name_decoded(text: str, rel: Path) -> list[str]:
+    """用了 x-user-name 就必须在同一文件里 decodeURIComponent。
+
+    按**文件**而非按行判定，是有意放宽：取值与解码常常不在一行
+    （先取 header 存进变量，另一处解码）。同文件出现解码调用即放行——
+    这条红线要挡的是"完全不知道需要解码"，不是审查解码位置是否精确。
+    宁可漏报这种少见的跨文件写法，也不要因为误报把合规站点挡在部署外。
+    """
+    if X_USER_NAME_RE.search(text) and not DECODE_RE.search(text):
+        return [f"{rel}: 用了 x-user-name 但没有 decodeURIComponent —— 该头是 "
+                "URL 编码的（HTTP 头不能携带中文），不解码会把 %E5%BD%AD 这类 "
+                "编码串当成用户名显示或写库（静默脏数据，不会报错）"]
+    return []
+
+
 def scan_redlines(site_dir: Path, manifest: dict) -> list[str]:
     site_dir = Path(site_dir)
     violations: list[str] = []
@@ -66,6 +88,7 @@ def scan_redlines(site_dir: Path, manifest: dict) -> list[str]:
             violations.append(f"{rel}: 前端 API 调用禁止绝对地址，改为相对路径 /api/*")
         if INNERHTML_RE.search(text):
             violations.append(f"{rel}: 前端禁止 innerHTML 赋值/拼接（存储型 XSS 风险），改用 textContent 或安全模板")
+        violations += _check_user_name_decoded(text, rel)
 
     if tier == "static":
         return violations
@@ -79,6 +102,7 @@ def scan_redlines(site_dir: Path, manifest: dict) -> list[str]:
             violations.append(f"{rel}: 站点代码禁止自带 auth 逻辑（鉴权由平台边缘层统一处理）")
         if FILE_WRITE_RE.search(text):
             violations.append(f"{rel}: 禁止写本地文件（Lambda 文件系统只读）")
+        violations += _check_user_name_decoded(text, rel)
         if p.name == "package.json":
             violations += _scan_package_json(text, rel)
     if (backend_dir / ".npmrc").exists():
