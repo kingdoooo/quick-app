@@ -37,9 +37,17 @@ def _load_config() -> None:
         raise SystemExit(f"找不到 {path}——从 config.ini.example 复制并填好再跑")
     cfg = configparser.ConfigParser()
     cfg.read(path)
-    os.environ["SITES_TABLE"] = cfg["Deployer"]["sites_table"]
-    os.environ["ADMINS_TABLE"] = cfg["Deployer"]["admins_table"]
-    os.environ["AWS_DEFAULT_REGION"] = cfg["Platform"]["region"]
+    # 一期建的 config.ini 没有 admins_table / routing_table 这些二期键：
+    # 裸 KeyError 不告诉操作者补哪一行，这里换成可执行的提示。
+    try:
+        os.environ["SITES_TABLE"] = cfg["Deployer"]["sites_table"]
+        os.environ["ADMINS_TABLE"] = cfg["Deployer"]["admins_table"]
+        os.environ["AWS_DEFAULT_REGION"] = cfg["Platform"]["region"]
+    except KeyError as e:
+        raise SystemExit(
+            f"config.ini 缺少 {e}——二期新增的键，一期建的 config.ini 里没有。"
+            "\n对照 config.ini.example 补齐 [Deployer] admins_table"
+            "（默认 site-admins）。") from e
 
 
 class UnparsableAllowlist(ValueError):
@@ -113,7 +121,13 @@ def migrate(routing_table: str, *, dry_run: bool = True) -> dict:
                     report["errors"].append(
                         f"路由 {item['subdomain']['S']} 指向的站点 {site_id} 无 sites 记录")
                     continue
-                if "require_login" in site:
+                # **两个字段都在才算"已有真源"**。不能只看 require_login：
+                # 在线接口只持久化调用方传入的字段，所以"只改过 allowed_users"
+                # 的站点 require_login 缺失，单看它会判成"未迁移"，然后用路由表
+                # 旧值（很可能是 "org"）盖掉在线设的私有名单——一次数据修复动作
+                # 变成静默扩权，且报告里显示为 migrated 成功（moto 实证）。
+                # 与 register_route._seed_permissions_if_absent 同构。
+                if "require_login" in site and "allowed_users" in site:
                     report["skipped"].append(site_id)
                     continue
                 try:
@@ -129,8 +143,17 @@ def migrate(routing_table: str, *, dry_run: bool = True) -> dict:
                 report["migrated"].append(site_id)
                 # planned：给 dry-run 报告看"将写什么值"。没有它，SS→org 这类
                 # 静默扩权在唯一的人工审查关口（dry-run 输出）上是不可见的。
-                report["planned"][site_id] = {"require_login": require_login,
-                                              "allowed_users": allowed}
+                # **只列真正会被写入的字段**：稀疏行上另一个字段是 if_not_exists
+                # 保留在线值，若照抄路由表的值会让报告谎报一次覆盖，人在唯一的
+                # 审查关口看到的就不是实际行为。
+                planned = {}
+                if "require_login" not in site:
+                    planned["require_login"] = require_login
+                if "allowed_users" not in site:
+                    planned["allowed_users"] = allowed
+                planned["kept_from_online"] = sorted(
+                    f for f in ("require_login", "allowed_users") if f in site)
+                report["planned"][site_id] = planned
                 if dry_run:
                     continue
                 # 条件写 + rev=1，与 register_route 的 seed 完全同构：
@@ -146,7 +169,11 @@ def migrate(routing_table: str, *, dry_run: bool = True) -> dict:
                         os.environ["SITES_TABLE"]).update_item(
                         Key={"site_id": site_id},
                         UpdateExpression=(
-                            "SET require_login = :rl, allowed_users = :au, "
+                            # 逐字段 if_not_exists：只补缺的，已有的在线值一律
+                            # 保留。无条件 SET 会让"部署前只改过一个字段"的稀疏
+                            # 行被路由表旧值覆盖（扩权）。
+                            "SET require_login = if_not_exists(require_login, :rl), "
+                            "allowed_users = if_not_exists(allowed_users, :au), "
                             "collaborators = if_not_exists(collaborators, :co), "
                             # spec §3.4 列了 owner：sites 行缺 owner 时从路由表
                             # 回填（一期 mark_job 每次部署都写 owner，缺失是
@@ -155,8 +182,11 @@ def migrate(routing_table: str, *, dry_run: bool = True) -> dict:
                             "#o = if_not_exists(#o, :own), "
                             "permissions_updated_at = :t, "
                             "permissions_updated_by = :by, "
-                            "permissions_rev = :one"),
-                        ConditionExpression="attribute_not_exists(require_login)",
+                            "permissions_rev = if_not_exists(permissions_rev, :one)"),
+                        # 与上面的 skip 判定同构：两个字段都在时不该走到这里，
+                        # 走到了（读快照与写之间有部署 seed 进来）就让条件挡下。
+                        ConditionExpression=("attribute_not_exists(require_login) OR "
+                                             "attribute_not_exists(allowed_users)"),
                         ExpressionAttributeNames={"#o": "owner"},
                         ExpressionAttributeValues={
                             ":rl": require_login, ":au": allowed, ":co": [],
@@ -191,9 +221,14 @@ def main() -> None:
     # 任何解析歧义造成的扩权在这里都看不见
     print(f"  迁移: {len(report['migrated'])}")
     for sid in report["migrated"]:
-        p = report["planned"][sid]
-        print(f"    - {sid} → require_login={p['require_login']} "
-              f"allowed_users={p['allowed_users']}")
+        p = dict(report["planned"][sid])
+        kept = p.pop("kept_from_online", [])
+        # 稀疏行只补缺字段，所以这里不能假定两个键都在（假定会 KeyError）
+        writes = " ".join(f"{k}={v!r}" for k, v in sorted(p.items())) or "（无）"
+        line = f"    - {sid} → 写入 {writes}"
+        if kept:
+            line += f"；保留在线值 {','.join(kept)}"
+        print(line)
     print(f"  跳过（已有真源）: {len(report['skipped'])} {report['skipped']}")
     if report["errors"]:
         print(f"  问题: {len(report['errors'])}")

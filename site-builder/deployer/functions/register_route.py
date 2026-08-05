@@ -22,11 +22,21 @@ MAX_ROUTE_ATTEMPTS = 3
 
 def _seed_permissions_if_absent(site_id: str, manifest_auth: dict,
                                 owner: str) -> None:
-    """首次部署：把 manifest 的 auth 落进 sites 表作为初始值。
+    """首次部署：把 manifest 的 auth 用来**补齐真源里缺失的权限字段**。
 
-    条件写 attribute_not_exists(require_login)——否则与"用户在首次部署期间
-    就用控制台改了权限"并发时会把在线修改覆盖掉。条件不满足说明已有真源，
-    什么都不做（本次部署用真源的值）。
+    **逐字段 if_not_exists，不要拿任何单个字段当"整套已初始化"的 sentinel。**
+    早先的实现条件写 attribute_not_exists(require_login) 却同时覆盖
+    require_login + allowed_users，这在稀疏行上是静默扩权（moto 实证）：
+    在线接口只持久化调用方显式传入的字段（permissions.write_permissions），
+    所以"部署前只改过 allowed_users"会留下 require_login 缺失的行 →
+    sentinel 判定"未初始化" → seed 用 manifest 的值把指定邮箱名单盖回
+    "org"，私有站点变成全组织可见。
+
+    反向稀疏同样有坑：只改过 require_login 的行 sentinel 存在 → 整个 seed
+    被跳过 → allowed_users 一直缺失 → _route_item 回落 "org"，也是扩权。
+
+    因此：每个字段独立 if_not_exists 补缺；只要有一个字段缺就写一次
+    （条件表达式保证两个都在时是真正的 no-op，不白推进 updated_at）。
     """
     import botocore.exceptions
     allowed = permissions.normalize_allowed_users(manifest_auth["allowed_users"])
@@ -35,22 +45,30 @@ def _seed_permissions_if_absent(site_id: str, manifest_auth: dict,
             "AWS_DEFAULT_REGION", "us-east-1")).Table(
             os.environ["SITES_TABLE"]).update_item(
             Key={"site_id": site_id},
-            UpdateExpression=("SET require_login = :rl, allowed_users = :au, "
-                              "permissions_updated_at = :t, "
-                              "permissions_updated_by = :by, "
-                              "permissions_rev = :one"),
-            ConditionExpression="attribute_not_exists(require_login)",
+            UpdateExpression=(
+                "SET require_login = if_not_exists(require_login, :rl), "
+                "allowed_users = if_not_exists(allowed_users, :au), "
+                "collaborators = if_not_exists(collaborators, :co), "
+                "permissions_rev = if_not_exists(permissions_rev, :one), "
+                "permissions_updated_at = :t, "
+                "permissions_updated_by = :by"),
+            # 两个安全字段都在 → 什么都不做。缺任一个 → 只补那一个，
+            # 已有的字段由 if_not_exists 原样保留（在线值永不被 manifest 覆盖）。
+            ConditionExpression=("attribute_not_exists(require_login) OR "
+                                 "attribute_not_exists(allowed_users)"),
             ExpressionAttributeValues={
                 ":rl": bool(manifest_auth["require_login"]),
                 ":au": allowed,
+                ":co": [],
                 ":t": permissions.now_iso(),
                 ":by": owner,
-                # rev 明确推进到 1：让"未初始化"(缺字段或 0) 与"已初始化"
-                # 在条件表达式里可区分。若这里留 0，seed 前后的 rev 都是 0，
-                # 后续 ConditionCheck 察觉不到中间发生过初始化。
+                # rev 至少推到 1：让"未初始化"(缺字段或 0) 与"已初始化"在条件
+                # 表达式里可区分。若这里留 0，seed 前后的 rev 都是 0，后续
+                # ConditionCheck 察觉不到中间发生过初始化。已有 rev（在线写
+                # 已推进过）时用 if_not_exists 保留，不回退也不虚增。
                 ":one": 1})
     except botocore.exceptions.ClientError as e:
-        # ConditionalCheckFailed = 真源已存在：用它的值，不覆盖（幂等吞掉）。
+        # ConditionalCheckFailed = 两个字段都已存在：完全用真源的值（幂等吞掉）。
         # 其余错误（限流、校验……）必须如实上抛——放宽成裸 pass 会让 seed
         # 静默失败，_route_item 回落 allowed_users="org"（fail-open 扩权）。
         if e.response["Error"]["Code"] != "ConditionalCheckFailedException":

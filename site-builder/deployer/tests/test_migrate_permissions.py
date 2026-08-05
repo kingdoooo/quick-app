@@ -159,8 +159,10 @@ def test_dry_run_writes_no_permission_field_at_all(aws):
     _put_route("app-s-3", "s-3")
     out = mig.migrate("routing", dry_run=True)
     assert out["migrated"] == ["s-3"]
+    # 完全空的行：两个字段都会写，没有任何在线值需要保留
     assert out["planned"]["s-3"] == {"require_login": True,
-                                     "allowed_users": "org"}
+                                     "allowed_users": "org",
+                                     "kept_from_online": []}
     assert not (PERMISSION_FIELDS & set(common.get_site("s-3")))
 
 
@@ -225,3 +227,66 @@ def test_migrated_row_advances_rev_to_one(aws):
     _put_route("app-s-rev", "s-rev")
     mig.migrate("routing", dry_run=False)
     assert int(common.get_site("s-rev")["permissions_rev"]) == 1
+
+
+def test_sparse_row_keeps_online_allowlist(aws):
+    """只在线改过 allowed_users 的稀疏行：迁移不得用路由表旧值覆盖它。
+
+    旧实现只看 require_login 当 sentinel，判成"未迁移"后无条件 SET 两个字段，
+    把在线设的私有名单盖回路由表里的 "org"——而报告显示为 migrated 成功
+    （moto 实证）。这是数据修复动作变成静默扩权。
+    """
+    import common
+    import permissions
+    import migrate_permissions as mig
+
+    common.upsert_site("s-sparse", owner="o@x.com", name="n")
+    permissions.set_access_policy("s-sparse", actor="o@x.com",
+                                  allowed_users=["only@example.com"])
+    assert "require_login" not in common.get_site_consistent("s-sparse")
+    _put_route("app-s-sparse", "s-sparse", require_auth=True, allowed="org")
+
+    out = mig.migrate("routing", dry_run=False)
+    site = common.get_site_consistent("s-sparse")
+    assert site["allowed_users"] == ["only@example.com"]   # 在线值保留
+    assert site["require_login"] is True                    # 缺字段被补上
+    # 报告只能宣称写了真正写的那个字段
+    assert out["planned"]["s-sparse"]["kept_from_online"] == ["allowed_users"]
+    assert "allowed_users" not in out["planned"]["s-sparse"]
+
+
+def test_sparse_row_keeps_online_require_login(aws):
+    """反向稀疏：只改过 require_login 的行，allowed_users 由路由表补上。"""
+    import common
+    import permissions
+    import migrate_permissions as mig
+
+    common.upsert_site("s-sparse2", owner="o@x.com", name="n")
+    permissions.set_access_policy("s-sparse2", actor="o@x.com", require_login=False)
+    assert "allowed_users" not in common.get_site_consistent("s-sparse2")
+    _put_route("app-s-sparse2", "s-sparse2", require_auth=True,
+               allowed='["from-route@x.com"]')
+
+    mig.migrate("routing", dry_run=False)
+    site = common.get_site_consistent("s-sparse2")
+    assert site["require_login"] is False                     # 在线值保留
+    assert site["allowed_users"] == ["from-route@x.com"]      # 缺字段被补上
+
+
+def test_dry_run_report_renders_for_sparse_rows(aws, capsys):
+    """main() 的打印不得假定 planned 两个键都在（稀疏行只有一个）。"""
+    import common
+    import permissions
+    import migrate_permissions as mig
+
+    common.upsert_site("s-sparse3", owner="o@x.com", name="n")
+    permissions.set_access_policy("s-sparse3", actor="o@x.com",
+                                  allowed_users=["x@example.com"])
+    _put_route("app-s-sparse3", "s-sparse3")
+    report = mig.migrate("routing", dry_run=True)
+    # 复用 main 的渲染逻辑：planned 缺键时不能 KeyError
+    for sid in report["migrated"]:
+        p = dict(report["planned"][sid])
+        kept = p.pop("kept_from_online", [])
+        assert kept == ["allowed_users"]
+        assert "require_login" in p
