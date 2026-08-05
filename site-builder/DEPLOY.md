@@ -812,9 +812,29 @@ SSM 参数：`/site-builder/jwt-secret`（已存在）、`/site-builder/site-cli
 要让 IAM 真正兜住站点归属，必须把建站 / `transfer_owner` / 权限写入拆成
 **各自持有独立角色并做服务端授权**的窄接口（M3 控制台与 key-proxy 已按
 "独立 IAM 角色"设计，见设计文档 §2）。那是架构改动，未纳入 M1+M2。
-在此之前，运营上的对应措施是：把 runtime 的代码供应链与镜像来源当作
-与站点归属同等重要的资产（ECR 私有仓 + `--provenance=false` 固定构建、
-容器内不执行站点提供的代码）。
+
+#### 既然 runtime 是 TCB，镜像完整性就是站点归属的安全边界
+
+`deploy_agentcore.py` 已落实下面五条。**改动构建链前先读这段**——每一条都
+直接对应"谁能换掉这个 TCB"：
+
+| 措施 | 不做会怎样 |
+|---|---|
+| ECR 仓库 `imageTagMutability=IMMUTABLE`（省略时 AWS 默认 **MUTABLE**） | 任何有 push 权限的主体覆盖同名 tag 即换掉 TCB，无痕迹 |
+| 镜像 tag = `git-<sha>`（脏工作区加 `-dirty`） | 用 `latest` 时"线上跑哪份代码"无法回答 |
+| runtime 引用 **image digest**，不引用 tag | tag 是名字，digest 才是内容 |
+| 基础镜像钉 digest（`python:3.13-slim@sha256:…`） | 上游重指 tag 即在无人察觉时换掉 TCB，历史构建不可复现 |
+| 依赖锁版本 + `--require-hashes` | 被污染的上游版本 = 任意站点 owner 可被接管 |
+
+⚠️ **`--provenance=false` 不是供应链保护**。它是关闭 buildx 的 attestation
+manifest（因为 AgentCore 的 CreateAgentRuntime 校验不认，见 ⑤ 的坑），
+与镜像完整性无关——不要把它当成一项防护写进任何说明。
+
+仍未做、需要时另开一轮：把 `scanOnPush` 的扫描结果变成**部署 gate**
+（当前只是开着扫描，有高危发现也不阻断部署）；以及为 ECR 加仓库策略，
+把 push 权限收敛到 CI 主体。
+
+容器内不执行站点提供的代码（站点代码只经 CodeBuild 打包，不进 MCP 容器）。
 
 ## 2026-07-27 独立审查后的修复（已实证验证，部署前必读）
 

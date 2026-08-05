@@ -531,6 +531,40 @@ client 后 client_credentials token 能否过 authorizer；
 回退备选：key-proxy 自签平台 JWT（含 email claim），authorizer 的
 discoveryUrl 指向平台自建 JWKS——形态更重，仅在主案受阻时启用。
 
+### 5.3.1 MCP runtime 是站点归属的 TCB（实施期实证，2026-08-05 回写）
+
+**决定**：部署 MCP 的 AgentCore runtime 角色对"站点管理操作"而言属于
+**可信计算基（TCB）**。runtime 一旦被攻破，攻击者可接管任意站点的 owner，
+进而部署、下线、改权限。这是**已知且被接受**的取舍，不是待修缺陷。
+
+**为什么 IAM 关不掉**（实施期核实，不要再尝试用策略解决）：
+
+- 站点管理的写权限已按 `dynamodb:Attributes` 收窄到白名单，但该条件键约束的是
+  **可写哪些字段**，不是**可写哪些行**；
+- `owner` 必须留在白名单内——建站要写它、`transfer_owner` 要改它，都是 MCP 的
+  正常功能。所以"改 owner 绕过应用层判定"这条路径无法用属性白名单封堵；
+- `dynamodb:LeadingKeys` 只能把主体限制在"由其身份推出的分区键"（多租户
+  `${...:user_id}` 模式），而单个 runtime 角色服务全部用户、合法地需要访问
+  任意 `site_id`；
+- 真正的授权规则（`owner` / `collaborators`）**存在数据行里**，是数据驱动的，
+  而 IAM 策略是静态的、读不到行内容。
+
+**因此站点归属的最终裁决者是应用层代码 + runtime 角色自身的完整性。**
+属性白名单仍然保留，它挡住的是另一层：部署链字段（`data_tables` /
+`migrations_applied` / `last_job_id`）与路由的 `static_prefix` / `api_target`
+（改后两者可劫持流量）。
+
+**推论：镜像完整性即安全边界。** 既然 runtime 是 TCB，"它跑的是哪份字节"就
+等同于"谁能接管站点"。故构建链必须：ECR 仓库 `IMMUTABLE`（省略时 AWS 默认
+`MUTABLE`）、镜像 tag 带 git sha、runtime 按 **digest** 而非 tag 部署、基础
+镜像钉 digest、依赖锁版本 + `--require-hashes`。详见 DEPLOY.md
+「MCP runtime 的信任边界」。注意 `--provenance=false` 与供应链无关，它只是
+规避 AgentCore 不认 attestation manifest。
+
+**收敛方向（M3+）**：把建站 / `transfer_owner` / 权限写入拆成**各自持有独立
+角色并做服务端授权**的窄接口。§2 已把控制台与 key-proxy 定为"走独立 IAM
+角色的平台组件"，届时 MCP runtime 不再持有通用的 sites `UpdateItem`。
+
 ### 5.4 MCP 工具面变化
 
 新增 4 工具（与控制台共用 permissions 后端语义），分属两个模块：

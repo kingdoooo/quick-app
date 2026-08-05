@@ -386,7 +386,10 @@ def _client_update_params(cog, pool_id: str, client_id: str,
         AgentCore 的 authorizer 不回查撤销状态，等于延长了被盗 token 的寿命。
     其余如 ReadAttributes / WriteAttributes / AnalyticsConfiguration 同理。
 
-    ClientName 不回填也不更新：它是 _ensure_clients 的查找键，改名等于新建。
+    ClientName **照常回填当前值**（曾经有一版跳过它，是错的）：update 接受该
+    字段，契约是"未提供即恢复默认值"，跳过没有依据。回填不会造成重命名——
+    这是 read-modify-write，回填的就是线上现值，而 desired["ClientName"] 正是
+    用来查到这个 client 的同一个值。跳过它的字段见 _CLIENT_SKIP_KEYS。
     """
     current = cog.describe_user_pool_client(
         UserPoolId=pool_id, ClientId=client_id)["UserPoolClient"]
