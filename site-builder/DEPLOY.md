@@ -237,6 +237,26 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    `email_verified` 映射）、pre-token 触发器，并把 client secret 写进 SSM。
    跑完回填 `[Cognito]` 四项。
 
+   **切 pool 前的隔离预演（2026-08-05 实测，结论可直接引用）**：用
+   `--pool-name`（会自动隔离 SSM 前缀与 pre-token 函数名）建一个临时 pool
+   走通真实飞书登录，实测结果——
+
+   | 观察项 | 实测值 |
+   |---|---|
+   | 飞书是否要求重新输账号密码 | 否（浏览器已有飞书登录态即可） |
+   | 飞书授权同意页 | **只第一次弹**（"获取用户邮箱信息"），之后静默通过 |
+   | 打开链接 → 拿到授权码 | 3.1–3.2 秒 |
+   | `email_verified` | `true`，**JSON 布尔**（id/access 两个 token 一致） |
+   | `idp` | `Feishu`（与 `trusted_idps` 逐字符一致） |
+   | `auth_via` | `TokenGeneration_HostedAuth`（在 Edge/MCP 的 `TRUSTED_AUTH_SOURCES` 里） |
+   | access token TTL | 900 秒（= 配置的 15 分钟） |
+
+   两点值得记住：① 同一个飞书人在两个 pool 里是**两个独立 Cognito 用户**
+   （`identities.dateCreated` 各自新建），所以切 pool 必然要求全员重新登录一次，
+   顺带把那次同意点掉；② 一期 pool 里联邦用户的 `email_verified` 是 `false`
+   （未配该映射），因此 **`require_email_verified = true` 在一期 pool 上会拒绝
+   所有登录**，只有新 pool 配了映射才通过——先切 pool 再开这个开关。
+
    ⚠️ **接 IdP 前先确认**：平台的授权主键是 email（owner/allowed_users/会话
    claim 全用它），而联邦映射进 Cognito 的 email 默认是 unverified。因此 IdP
    必须满足「邮箱由组织分配、用户不可自改、不被回收再分配」——允许用户自设
