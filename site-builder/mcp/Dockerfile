@@ -25,7 +25,19 @@ COPY server.py common.py permissions.py ./
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
+# **非 root 运行**（AgentCore 容器安全指引要求）。对这个容器格外要紧：它持有
+# 能管理全部站点的 runtime 角色凭证（见 deploy_agentcore.py 的 TCB 说明），
+# 以 root 跑等于把"进程内的漏洞"直接放大成"容器内任意写"。
+# 代码与依赖由 root 装好后不再需要写权限，应用只读执行即可。
+#
+# UID 固定为 10001 而不是让系统分配：镜像层里的所有权是数字 UID，
+# 固定值让"同一份代码换台机器构建"得到一致的文件所有权。
+RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin appuser \
+    && chown -R appuser:appuser /app
+USER 10001
+
 # AgentCore 契约：0.0.0.0:8000，POST /mcp
+# 8000 > 1024，非特权用户可以直接绑定（这也是能降权的前提）。
 EXPOSE 8000
 
 CMD ["python", "server.py"]

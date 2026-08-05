@@ -27,6 +27,17 @@ cd site-builder/mcp      && python3 -m pytest tests -q       # 23 tests
 
 单测跑法：`.venv/bin/pytest tests/test_xxx.py::test_name -q`。
 
+**MCP 的上面那条用宿主机依赖，不等于容器里的依赖**（实测宿主 mcp 1.26.0 /
+boto3 1.43.25，而 `mcp/requirements.txt` 锁的是 1.29.0 / 1.43.64）。
+改过锁定清单、或要确认"部署出去的那套依赖也全绿"时跑：
+
+```bash
+site-builder/mcp/run_locked_tests.sh    # 建 py3.13 venv + --require-hashes 装锁定依赖再跑
+```
+
+它用与 Dockerfile 同一份清单同一套 hash 校验，Python 版本也钉 3.13（与基础镜像
+一致——不同版本解析出的依赖集合与 marker 分支不同）。
+
 deployer 的 CDK 模板断言（`tests/test_infra_tables.py`）默认 skip；要真跑必须
 带 PYTHONPATH 桥接（aws_cdk 只在 `infra/.venv`，不带时会报错而非静默 skip）：
 `cd site-builder/deployer && PYTHONPATH="$PWD/infra/.venv/lib/python3.12/site-packages" SB_CDK_TESTS=1 .venv/bin/pytest tests/test_infra_tables.py -q`（synth 需 Docker）。
