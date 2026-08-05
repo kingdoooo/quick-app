@@ -169,8 +169,22 @@ def ensure_pre_token_trigger(role_arn: str, pool_id: str | None = None) -> None:
     # describe 回传的废弃字段，与 PasswordPolicy.TemporaryPasswordValidityDays
     # 同传会被 update-user-pool 拒绝
     kwargs.get("AdminCreateUserConfig", {}).pop("UnusedAccountValidityDays", None)
-    kwargs["LambdaConfig"] = {"PreTokenGenerationConfig": {
-        "LambdaVersion": "V2_0", "LambdaArn": fn_arn}}
+    # **在现有 LambdaConfig 上改这一项，不要整体替换**：update_user_pool 是
+    # 整体替换语义，而 LambdaConfig 自己也是一个整体——直接赋一个只含
+    # PreTokenGenerationConfig 的 dict 会把 pool 上其他触发器
+    # （PreSignUp / PostAuthentication / CustomMessage……）全部摘掉，
+    # 而 Cognito 侧不会报错：那些触发器就此静默失效。
+    lambda_cfg = dict(pool.get("LambdaConfig") or {})
+    lambda_cfg["PreTokenGenerationConfig"] = {
+        "LambdaVersion": "V2_0", "LambdaArn": fn_arn}
+    # LambdaConfig 里 V1 的 PreTokenGeneration（string）与 V2 的
+    # PreTokenGenerationConfig（structure）是两个并存字段（已对 botocore 的
+    # service model 核实）。pool 上原本挂着 V1 时把它对齐到同一个函数：
+    # 留一个指向旧函数的 V1 指针，会让"当前生效的是哪个版本"变成一个需要
+    # 现场翻配置才能回答的问题，而两版的 event 结构并不相同。
+    if "PreTokenGeneration" in lambda_cfg:
+        lambda_cfg["PreTokenGeneration"] = fn_arn
+    kwargs["LambdaConfig"] = lambda_cfg
     cog.update_user_pool(UserPoolId=pool_id, **kwargs)
     print(f"pre-token trigger 已挂到 {pool_id}: {fn_arn}")
 

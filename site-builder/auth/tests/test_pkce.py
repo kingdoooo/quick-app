@@ -277,3 +277,109 @@ def test_post_token_body_includes_code_verifier():
         lh._post_token("thecode", "theverifier")
     assert "code_verifier=theverifier" in captured["body"]
     assert "grant_type=authorization_code" in captured["body"]
+
+
+# --- token 端点失败的分流（Codex review P2，已实测复现） ---
+# 复现过的现象：_post_token 的 urlopen 对 4xx 抛 urllib.error.HTTPError，
+# 而 HTTPError 不是 ValueError 的子类（URLError→OSError 那条谱系），
+# callback 原先只 except ValueError，于是无效/过期/重放的 code 冒成 502。
+
+def _login_state_and_cookie():
+    import urllib.parse as up
+    r_login = lh.handler(
+        _event("/login", {"redirect": "https://app-x.example.com/"}), None)
+    state = up.unquote(r_login["headers"]["Location"].split("state=")[1].split("&")[0])
+    pkce = next(c for c in r_login["cookies"]
+                if c.startswith(lh.PKCE_COOKIE)).split(";")[0]
+    return state, pkce
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_callback_token_endpoint_4xx_returns_400_not_500():
+    """无效/过期/重放的 code：Cognito 给 400，用户必须看到 400 而不是 502。
+
+    **必须打 urlopen 而不是 _post_token**：4xx→400 的翻译就发生在 _post_token
+    内部，打掉它等于跳过被测代码（本测试第一版正是这样写的，改对实现后仍红）。
+    """
+    import urllib.error
+    state, pkce = _login_state_and_cookie()
+    err = urllib.error.HTTPError("https://sso/oauth2/token", 400,
+                                 "Bad Request", {}, None)
+    with patch.object(lh.urllib.request, "urlopen", side_effect=err):
+        r = lh.handler(_event("/callback", {"code": "replayed", "state": state},
+                              cookies=[pkce]), None)
+    assert r["statusCode"] == 400
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_callback_token_endpoint_5xx_still_raises():
+    """上游故障必须保持 5xx——伪装成"请重新登录"会让真实故障不告警、无重试统计。"""
+    import urllib.error
+    state, pkce = _login_state_and_cookie()
+    err = urllib.error.HTTPError("https://sso/oauth2/token", 503,
+                                 "Service Unavailable", {}, None)
+    with patch.object(lh.urllib.request, "urlopen", side_effect=err):
+        with pytest.raises(urllib.error.HTTPError):
+            lh.handler(_event("/callback", {"code": "abc", "state": state},
+                              cookies=[pkce]), None)
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_callback_upstream_timeout_still_raises():
+    """超时不是用户错误：TimeoutError 必须冒成 5xx，不能被当成"请重新登录"。"""
+    state, pkce = _login_state_and_cookie()
+    with patch.object(lh.urllib.request, "urlopen", side_effect=TimeoutError()):
+        with pytest.raises(TimeoutError):
+            lh.handler(_event("/callback", {"code": "abc", "state": state},
+                              cookies=[pkce]), None)
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_callback_expired_id_token_returns_400_not_500():
+    """pyjwt 的异常基类是 PyJWTError，**不继承 ValueError**——过期 id_token
+    同样会冒成 500，所以 except 子句必须显式含 InvalidTokenError。"""
+    import jwt as pyjwt
+    state, pkce = _login_state_and_cookie()
+    with patch.object(lh, "_exchange_code",
+                      side_effect=pyjwt.ExpiredSignatureError("Signature has expired")):
+        r = lh.handler(_event("/callback", {"code": "abc", "state": state},
+                              cookies=[pkce]), None)
+    assert r["statusCode"] == 400
+
+
+# --- 登出必须结束 Cognito 托管登录会话（Codex review P2 / 继承风险） ---
+# 只清本地 sb_session 时，Cognito 侧会话仍活着：共享设备上"退出"后再访问
+# 任何站点会被静默自动重新登录。Cognito 的 /logout 不登出上游 IdP，
+# 所以文案不能承诺"已完全退出"。
+
+@patch.dict(lh.os.environ, ENV)
+def test_logout_redirects_to_cognito_logout_and_clears_cookie():
+    r = lh.handler(_event("/logout"), None)
+    assert r["statusCode"] == 302
+    loc = r["headers"]["Location"]
+    assert loc.startswith(ENV["COGNITO_DOMAIN"] + "/logout?")
+    assert "client_id=cid" in loc
+    # 平台会话必须同时被清掉（不能只依赖 Cognito 那一跳）
+    assert any(c.startswith("sb_session=;") and "Max-Age=0" in c
+               for c in r["cookies"])
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_logout_uri_is_not_logout_itself():
+    """logout_uri 指回 /logout 会被 Cognito 打回本分支 → 无限重定向。"""
+    import urllib.parse as up
+    r = lh.handler(_event("/logout"), None)
+    qs = up.parse_qs(up.urlparse(r["headers"]["Location"]).query)
+    logout_uri = qs["logout_uri"][0]
+    assert logout_uri == f"https://auth.{ENV['BASE_DOMAIN']}/logged-out"
+    assert not logout_uri.endswith("/logout")
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_logged_out_page_does_not_claim_full_signout():
+    """Cognito /logout 不登出上游 IdP——文案必须提示还需退出 IdP。"""
+    r = lh.handler(_event("/logged-out"), None)
+    assert r["statusCode"] == 200
+    assert "已退出登录" in r["body"]
+    assert "身份提供方" in r["body"]      # 明确告知效力边界
+    assert any(c.startswith("sb_session=;") for c in r["cookies"])

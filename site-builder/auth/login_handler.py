@@ -16,6 +16,7 @@ import json
 import os
 import secrets
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -154,6 +155,15 @@ def _is_safe_redirect(url: str) -> bool:
     return host == base or host.endswith("." + base)
 
 
+class TokenExchangeRejected(Exception):
+    """Cognito 的 token 端点用 4xx 拒了本次交换（无效/过期/已用过的 code）。
+
+    与"上游故障"（5xx、超时、DNS）分开：前者是可预期的用户侧失败，必须给 400；
+    后者是平台故障，应让异常冒出去以便告警与重试统计。混在一起会让真实故障
+    被静默成"请重新登录"。
+    """
+
+
 def _post_token(code: str, verifier: str) -> dict:
     domain = os.environ["COGNITO_DOMAIN"]
     body = urllib.parse.urlencode({
@@ -168,8 +178,18 @@ def _post_token(code: str, verifier: str) -> dict:
         f"{domain}/oauth2/token", data=body,
         headers={"Authorization": f"Basic {basic}",
                  "Content-Type": "application/x-www-form-urlencoded"})
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        # HTTPError **不是** ValueError 的子类（它走 URLError→OSError 这条），
+        # 所以 callback 的 `except ValueError` 接不住它：无效/过期/重放的 code
+        # 会让整个 handler 抛异常 → Function URL 502 + CloudWatch 堆栈，
+        # 而不是注释里承诺的 400。已实测复现（HTTP Error 400: Bad Request）。
+        # 只有 4xx 是"这个 code 不能用"；5xx 是 Cognito 侧故障，照原样上抛。
+        if 400 <= e.code < 500:
+            raise TokenExchangeRejected(f"token 端点拒绝了本次交换: {e.code}") from e
+        raise
 
 
 def _exchange_code(code: str, verifier: str, nonce: str) -> dict:
@@ -236,7 +256,15 @@ def handler(event, context):
                     "body": "授权失败或被取消，请重新登录"}
         try:
             user = _exchange_code(code, pkce["v"], pkce["n"])
-        except ValueError:
+        except (ValueError, TokenExchangeRejected, pyjwt.InvalidTokenError):
+            # 三类都是可预期的用户侧失败，都给 400：
+            #   ValueError            —— nonce/token_use 不匹配、claims 缺失
+            #   TokenExchangeRejected —— code 无效/过期/被重放（token 端点 4xx）
+            #   InvalidTokenError     —— id_token 验签/exp/aud/iss 不过
+            # pyjwt 的异常**不继承 ValueError**（基类是 PyJWTError→Exception），
+            # 过期的 id_token 同样会冒成 500，所以必须显式列出。
+            # 上游 5xx / 超时 / JWKS 拉取失败不在此列，照原样上抛成 5xx——
+            # 平台故障不能伪装成"请重新登录"。
             return {"statusCode": 400, "body": "登录校验失败，请重新登录"}
         token = mint_session_jwt(user["email"], user["name"],
                                  os.environ["JWT_SECRET"], idp=user.get("idp", ""),
@@ -248,10 +276,36 @@ def handler(event, context):
                 "cookies": [cookie, clear_pkce], "body": ""}
 
     if path == "/logout":
+        # 清平台会话，然后**把用户送去 Cognito 的 /logout 结束托管登录会话**。
+        # 只清本地 cookie 是不够的：Cognito 侧的会话 cookie 还活着，共享设备上
+        # 退出后再访问任何站点会被静默自动重新登录（看起来像"登出没生效"）。
+        #
+        # 效力边界，别当成完整登出：Cognito 的 /logout **不会**登出上游 IdP
+        # （官方明示"The logout endpoint doesn't sign users out of OIDC or
+        # social identity providers"）。飞书侧会话仍在，只是下次登录会重新
+        # 经过一次 IdP 授权而不是直接复用 Cognito 会话。真正的全局登出要把
+        # 用户再导向 IdP 自己的登出页，那属于 IdP 特定配置（保持 IdP 无关，
+        # 故不做），因此登出提示文案不能承诺"已完全退出"。
+        cookie = (f"sb_session=; Domain=.{base}; Path=/; Max-Age=0; "
+                  f"Secure; HttpOnly; SameSite=Lax")
+        done = f"https://auth.{base}/logged-out"
+        # logout_uri 必须是该 client 已登记的 sign-out URL，否则 Cognito 报错。
+        # **不能指向 /logout 本身**——那会打回本分支，无限重定向。
+        target = (f"{os.environ['COGNITO_DOMAIN']}/logout?"
+                  + urllib.parse.urlencode({
+                      "client_id": os.environ["CLIENT_ID"],
+                      "logout_uri": done}))
+        return {"statusCode": 302, "headers": {"Location": target},
+                "cookies": [cookie], "body": ""}
+
+    if path == "/logged-out":
+        # Cognito 登出后的落地页。这里已经没有平台会话了；再清一次是幂等兜底
+        # （用户可能直接访问本路径）。
         cookie = (f"sb_session=; Domain=.{base}; Path=/; Max-Age=0; "
                   f"Secure; HttpOnly; SameSite=Lax")
         return {"statusCode": 200, "cookies": [cookie],
-                "headers": {"Content-Type": "text/html"},
-                "body": "<h1>已退出登录</h1>"}
+                "headers": {"Content-Type": "text/html; charset=utf-8"},
+                "body": "<h1>已退出登录</h1>"
+                        "<p>如需彻底结束企业账号会话，请同时退出企业身份提供方。</p>"}
 
     return {"statusCode": 404, "body": "not found"}
