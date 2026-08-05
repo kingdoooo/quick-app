@@ -293,9 +293,30 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
        metricName=AuthInvalidGrant,metricNamespace=SiteBuilder,metricValue=1
    ```
 
-   再对 `SiteBuilder/AuthInvalidGrant` 建告警（起步阈值：5 分钟内 ≥ 10 次）。
-   同时 `token_exchange_upstream_error` 事件会伴随 5xx，按 Lambda Errors 告警
-   即可覆盖。日志里**不含** code / token / cookie。
+   然后建告警（**阈值必须按你的真实流量定**，见下）：
+
+   ```bash
+   aws cloudwatch put-metric-alarm --region us-east-1 \
+     --alarm-name site-builder-auth-invalid-grant \
+     --namespace SiteBuilder --metric-name AuthInvalidGrant \
+     --statistic Sum --period 300 --evaluation-periods 2 \
+     --threshold 10 --comparison-operator GreaterThanOrEqualToThreshold \
+     --treat-missing-data notBreaching \
+     --alarm-actions <SNS topic ARN>
+   ```
+
+   ⚠️ **阈值 10 只是起步值，低流量环境必须调小**：如果日活登录只有几十次，
+   "100% 登录失败"也可能 5 分钟凑不满 10 次——告警永不触发，而这正是它要发现
+   的事故。这类环境改成 `--threshold 1 --evaluation-periods 2`（连续两个周期
+   各 ≥1），或改为对失败率告警。**把最终阈值与理由写回本文档**，否则下一个人
+   无法判断这个数字是否适合当时的流量。
+
+   `token_exchange_upstream_error` 事件伴随 5xx，按 Lambda Errors 告警即可覆盖。
+
+   日志只记**固定词汇**的字段（`event` / `error` / `hint` / `status`），
+   不记上游 `error_description` 原文——Cognito 会在里面回显请求值，实测出现过
+   `bad code <授权码> for user <邮箱>`，原样记录等于把授权码和邮箱写进
+   CloudWatch，而日志保留期远长于授权码寿命。见 `login_handler._describe_hint`。
 
 ---
 
