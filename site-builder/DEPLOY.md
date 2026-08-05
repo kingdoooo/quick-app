@@ -380,6 +380,16 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    各 ≥1），或改为对失败率告警。**把最终阈值与理由写回本文档**，否则下一个人
    无法判断这个数字是否适合当时的流量。
 
+   > **本仓库环境的取值（2026-08-05）**：`--threshold 1 --period 300
+   > --evaluation-periods 2`，即连续两个 5 分钟周期各至少 1 次失败才告警。
+   > 理由：当前只有个位数用户，用起步值 10 会让"全员登录失败"也凑不满阈值；
+   > 而要求**连续两个周期**能滤掉单次用户重放授权码的正常噪声。
+   > 通知发往 SNS topic `site-builder-alarms`（邮件订阅已确认）。
+   > 用户量上来后应重新评估——阈值 1 在高流量下会被正常的偶发失败刷响。
+   >
+   > 端到端验证过一次：打合成数据点 → alarm 进 ALARM → CloudWatch 记录
+   > `Successfully executed action` → 订阅邮箱收到通知 → 删除探针 alarm。
+
    `token_exchange_upstream_error` 事件伴随 5xx，按 Lambda Errors 告警即可覆盖。
 
    日志只记**固定词汇**的字段（`event` / `error` / `hint` / `status`），
