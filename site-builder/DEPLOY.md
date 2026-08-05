@@ -1,7 +1,10 @@
 # Quick 自动化建站方案 — 部署 Runbook
 
-本文档是把本方案部署到**你自己的 AWS 账号**的操作手册。所有代码 + 154 个单元测试
-已完成；本手册覆盖的是**需要真实 AWS 资源、DNS、飞书凭证**的部署门禁，无法自动化。
+本文档是把本方案部署到**你自己的 AWS 账号**的操作手册，覆盖的是**需要真实 AWS
+资源、DNS、IdP 凭证**的部署门禁——这些无法自动化，也是单元测试覆盖不到的部分。
+
+**部署的是当前最新版本**：照 ①→⑦ 走一遍即可，无需先部旧版本再升级。
+已在运行旧版本的环境见[从一期环境升级](#从一期环境升级本仓库自己的环境走过这条路)。
 
 - **区域**：`us-east-1`（Lambda@Edge、ACM、Quick Desktop 身份区域共同强制）
 - 下文 `{account_id}`、`{base_domain}` 等**花括号占位符需手工替换成你的实际值**
@@ -150,6 +153,14 @@ aws ssm put-parameter --region us-east-1 \
 `SYNTH-ONLY-PLACEHOLDER-DO-NOT-DEPLOY` 警告，此时**不要继续**——否则每个会话
 token 都验签失败，表现为无限登录跳转。
 
+**两个密钥都不进 Lambda 环境变量**：auth 服务只拿到参数名
+（`JWT_SECRET_PARAM` / `CLIENT_SECRET_PARAM`），运行时读 SSM 并在容器内缓存。
+原因是 `lambda:GetFunctionConfiguration` 会原样回显环境变量，而那是个很常见的
+只读权限；JWT secret 泄漏尤重——Edge 只验 HS256 签名，拿到它即可伪造任意用户的
+会话 cookie，绕过 owner / allowed_users / collaborators 全部判定。
+auth 的执行角色因此需要 `ssm:GetParameter`（限定 `/site-builder/*`）与
+`kms:Decrypt`（`ViaService` 限定 ssm），`deploy_auth.py` 每次运行都会收敛这两条。
+
 ### 本机工具链
 
 
@@ -180,15 +191,23 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
 
 ## 部署顺序总览
 
+**这份 Runbook 部署的是当前最新版本（含二期 M1+M2）。全新账号照 ①→⑦ 走一遍
+即可，不需要"先部一期再升级"。** 已经跑着一期的环境要升级，见文末
+[从一期环境升级](#从一期环境升级本仓库自己的环境走过这条路)。
+
 组件间有依赖，必须按序：
 
 ```
-①身份层(SSO)  →  ②路由层  →  ③DSQL  →  ④执行器  →  ⑤部署MCP  →  ⑥客户端接入  →  ⑦端到端彩排
-   Cognito        CloudFront    cluster    SFN+Lambda   AgentCore     Skill+MCP      RUN_E2E
-   (Task 3)       (Task 8)      (Task 13)  (Task 17)    (Task 20)     (Task 22)      (Task 23)
+①身份层        →  ②路由层  →  ③DSQL  →  ④执行器  →  ⑤部署MCP  →  ⑥客户端接入  →  ⑦端到端彩排
+   deploy_pool.py   CloudFront    cluster    SFN+Lambda   AgentCore     Skill+MCP      RUN_E2E
+   + deploy_auth    (Task 8)      (Task 13)  (Task 17)    (Task 20)     (Task 22)      (Task 23)
+   (Task 3)
 ```
 
 依赖关系：②需要①产出的 JWT_SECRET（已在 SSM）与 edge role；④需要①的 boundary、②的 edge_role_arn、③的 DSQL endpoint；⑤需要④的 state_machine_arn 与①的 Cognito。
+
+④ 建 `site-admins` 表，而 **admin 种子必须在 ④ 之后单独跑**（CDK 只建表不写
+数据，漏了则谁都不是 admin——见 ① 末尾）。
 
 开始前的就绪清单（详见上面 §0）：
 
@@ -203,12 +222,12 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
 
 ---
 
-## 二期（M1+M2）相对一期的部署差异 —— 先读这节
+## 决定安全边界的几项配置（先读这节）
 
-一期的 ①-⑦ 仍然成立，但二期改了身份层的建法并新增了两个一次性动作。
-**下面几项没做完，二期的安全边界就没生效**（代码里全绿的测试覆盖不到这些）：
+这几项**没做完，安全边界就没生效**，而代码里全绿的测试覆盖不到它们
+（都是配置与一次性动作）：
 
-1. **身份层改用脚本，不再手工建 pool**（替代 ① 的手工命令）：
+1. **身份层用脚本建，不要手工建 pool**：
 
    ```bash
    # 先在 site-builder/config.ini 填好 [IdP] 段（provider_name/issuer/client_id/
@@ -237,25 +256,26 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    `email_verified` 映射）、pre-token 触发器，并把 client secret 写进 SSM。
    跑完回填 `[Cognito]` 四项。
 
-   **切 pool 前的隔离预演（2026-08-05 实测，结论可直接引用）**：用
-   `--pool-name`（会自动隔离 SSM 前缀与 pre-token 函数名）建一个临时 pool
-   走通真实飞书登录，实测结果——
+   **登录链路的实测基线（2026-08-05，飞书适配器路径）**——部署后自己走一遍
+   登录时可拿它对照，值不一致说明配置有偏差：
 
    | 观察项 | 实测值 |
    |---|---|
    | 飞书是否要求重新输账号密码 | 否（浏览器已有飞书登录态即可） |
    | 飞书授权同意页 | **只第一次弹**（"获取用户邮箱信息"），之后静默通过 |
    | 打开链接 → 拿到授权码 | 3.1–3.2 秒 |
-   | `email_verified` | `true`，**JSON 布尔**（id/access 两个 token 一致） |
-   | `idp` | `Feishu`（与 `trusted_idps` 逐字符一致） |
+   | 用户属性 `email_verified` | `true`（靠 `map_email_verified` 映射，见下） |
+   | token 里 `email_verified` | `true`，**JSON 布尔**（id/access 两个 token 一致） |
+   | `idp` | `Feishu`（须与 `trusted_idps` 逐字符一致） |
    | `auth_via` | `TokenGeneration_HostedAuth`（在 Edge/MCP 的 `TRUSTED_AUTH_SOURCES` 里） |
    | access token TTL | 900 秒（= 配置的 15 分钟） |
+   | auth 服务冷启动（含首次读 SSM 密钥） | 约 2.5 秒；`/callback` 换 token 约 850ms |
 
-   两点值得记住：① 同一个飞书人在两个 pool 里是**两个独立 Cognito 用户**
-   （`identities.dateCreated` 各自新建），所以切 pool 必然要求全员重新登录一次，
-   顺带把那次同意点掉；② 一期 pool 里联邦用户的 `email_verified` 是 `false`
-   （未配该映射），因此 **`require_email_verified = true` 在一期 pool 上会拒绝
-   所有登录**，只有新 pool 配了映射才通过——先切 pool 再开这个开关。
+   ⚠️ **`map_email_verified` 与 `require_email_verified` 必须一起看**：联邦
+   映射进 Cognito 的 email **默认 unverified**，而 `require_email_verified`
+   默认 `true` 会拒绝 unverified 的登录。本脚本默认配上 `email_verified`
+   映射，两者因此自洽；若你手工建过 pool 而漏了映射，**该 pool 上所有登录都会
+   被拒**（实测过，见文末升级一节）。
 
    ⚠️ **接 IdP 前先确认**：平台的授权主键是 email（owner/allowed_users/会话
    claim 全用它），而联邦映射进 Cognito 的 email 默认是 unverified。因此 IdP
@@ -263,26 +283,18 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    邮箱的 IdP 上，攻击者改个 email 就能继承他人站点权限。详见
    `config.ini.example` 的 `[IdP]` 注释。
 
-2. **存量站点权限迁移**（一期站点在 sites 表没有权限字段，不迁移则
-   `role_of` 判不出 owner）：
-
-   ```bash
-   python3 site-builder/scripts/migrate_permissions.py           # dry-run，先看报告
-   python3 site-builder/scripts/migrate_permissions.py --apply
-   ```
-
-   dry-run 是唯一的人工审查关口——它逐条打印「将写什么值 / 保留哪些在线值」。
-   报告里出现 `问题:` 的站点一律跳过未写，需要人工判断原意后手工修，
-   **脚本绝不会自动把无法解析的名单降级成 `org`**（那是扩权）。
-
-3. **`router/config.ini` 必须补两个键**（在 `[SiteBuilder]` 段）：
+2. **`router/config.ini` 必须补两个键**（在 `[SiteBuilder]` 段）：
 
    ```ini
-   # 全体用户在新 pool 重新登录后再把 require_idp_claim 翻成 true
-   # trusted_idps 填 Cognito 里的 provider name，逗号分隔
-   require_idp_claim = false
-   trusted_idps =
+   # 全新部署直接填 true（没有存量会话要照顾）；trusted_idps 填 Cognito 里的
+   # provider name，逗号分隔，须与 ① 建的 provider 逐字符一致
+   require_idp_claim = true
+   trusted_idps = Feishu
    ```
+
+   **全新部署直接 `true`**——它是 org 边界的执行点（"身份必须来自企业 IdP"
+   只有这里能落到请求路径上）。留 `false` 只有一个理由：环境里已有不带
+   `idp` claim 的存量会话（见文末升级一节）。
 
    **上面的注释必须像这样单独成行——本片段可直接复制。** configparser 会把
    行内注释并进值：写成 `require_idp_claim = true  # 注释` 时读出来是
@@ -293,11 +305,24 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    两个键都是必填：缺键时 CDK synth 直接 `NoOptionError` 报错（响亮失败，
    不会把占位符部署出去）。
 
-   翻 `true` 的时机：切到专用 pool **且全体用户重新登录过**之后。存量会话
-   没有 idp claim，提前翻会把他们全部 302 到登录页。
+   ⚠️ Edge 改一次要 **10-20 分钟**全球复制，**回滚同样慢**——部署前先确认
+   `trusted_idps` 与 Cognito 里的 provider name 逐字符一致（写错 = 全站锁死）。
+   部署后务必核对部署出去的代码（不是本地源码）：
 
-4. **admin 种子**：`site-builder/config.ini` 的 `admin_seed` 填第一个管理员
-   邮箱，然后跑脚本注入（**CDK 只建 site-admins 表，不会写入任何管理员**）：
+   ```bash
+   # 取 CDK 输出里 EdgeFunctionArn 末尾的版本号，下载该版本实际代码
+   aws lambda get-function --function-name ApplicationWebRouterStack-application-web-router \
+     --qualifier <版本号> --region us-east-1 --query Code.Location --output text \
+     | xargs curl -s -o /tmp/edge.zip && unzip -o -q /tmp/edge.zip -d /tmp/edge
+   grep -E '^(REQUIRE_IDP_CLAIM|TRUSTED_IDPS)' /tmp/edge/index.py
+   grep -c SYNTH-ONLY-PLACEHOLDER /tmp/edge/index.py    # 必须是 0
+   ```
+
+   出现 `SYNTH-ONLY-PLACEHOLDER` 说明 synth 时读 SSM 失败，**部署出去的所有
+   会话验签都会失败**（Lambda@Edge 不支持环境变量，配置靠部署时字符串替换）。
+
+3. **admin 种子**（在 ④ 建出 `site-admins` 表之后跑）：`site-builder/config.ini`
+   的 `admin_seed` 填第一个管理员邮箱，然后注入（**CDK 只建表，不写任何管理员**）：
 
    ```bash
    python3 site-builder/scripts/seed_admin.py           # dry-run
@@ -308,11 +333,7 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    owner 离职或误撤自己权限的站点没有代管入口，而「添加管理员」本身需要
    admin 权限，从 UI 加不了第一个（死锁）。脚本幂等，可重跑。
 
-5. **翻开 Edge 开关后复验**：`require_idp_claim = true` 重部署 Edge 需要
-   10-20 分钟全球复制，**回滚同样慢**——翻之前先确认 `trusted_idps` 的值与
-   Cognito 里的 provider name 逐字符一致。
-
-6. **给登录失败建告警**（否则一类全员事故没人知道）：Cognito 的
+4. **给登录失败建告警**（否则一类全员事故没人知道）：Cognito 的
    `invalid_grant` 既表示"用户重放了授权码"，也表示"app client 缺少 scope
    所需的属性读取权限"——后者是**每个用户每次登录都失败**的配置事故，而两者
    在响应里无法可靠区分，所以代码统一返回用户可读的 400。
@@ -358,23 +379,38 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
 
 ## ① 身份层（Task 3）
 
-**产出**：Cognito User Pool + 上游 IdP 联邦；回填 `config.ini [Cognito]` 全部 4 项。
-步骤 1 按 §0 选定的场景二选一，**步骤 2 起两个场景通用**（把命令里的 IdP 名
-`Feishu` 换成你实际创建的 provider name 即可）。
+**产出**：Cognito User Pool（平台专用）+ IdP 联邦 + site/mcp 两个 app client
++ pre-token 触发器；回填 `config.ini [Cognito]` 全部 4 项。
 
-1. **【飞书】** 克隆并按其 README 部署上游方案（Serverless 路线，
-   含飞书 OIDC 适配器 + Quick Desktop 代理）：
+**pool 与 client 全部由 `scripts/deploy_pool.py` 建，不要手工建**——它一并配好
+几项手工极易漏掉、而漏掉即安全边界失效的东西：只列你的 IdP 不列 COGNITO、
+不开任何原生认证 flow、refresh/access 双 TTL、`email_verified` 映射、
+pre-token 触发器、managed login branding。命令与实测基线见前面
+[决定安全边界的几项配置](#决定安全边界的几项配置先读这节)第 1 项。
+
+下面步骤 1 是**准备 IdP**（按 §0 选定的场景二选一），步骤 2 起是拿到 pool 之后
+的通用核对（把命令里的 IdP 名 `Feishu` 换成你实际的 provider name）。
+
+1. **【飞书】** 克隆并按其 README 部署上游方案（提供 OIDC 适配器 + Quick Desktop
+   代理；平台把这个适配器当成一个普通 OIDC IdP 来联邦）：
   ```bash
    git clone https://github.com/aws-samples/sample-for-amazon-quick-sso-with-feishu /tmp/feishu-sso
    cd /tmp/feishu-sso && cat README.md
    # 按 README 部署，飞书 App ID/Secret 作为参数输入
   ```
 
-   **【标准 IdP】** 则无需上游方案与适配器：自建 user pool（含 Hosted UI domain），
-   在「Social and external providers」添加你的 OIDC 或 SAML IdP（Okta/Azure AD 等
-   都是标准配置），并在 attribute mapping 里**把 IdP 的 email 映射到 pool 的
-   email 属性**（这是硬要求，漏了整个权限模型不成立）。IdP 侧登记 Cognito 的
-   回调 `https://{hosted-ui-domain}/oauth2/idpresponse`。若还需要 Quick Desktop
+   部署完把适配器的 issuer 与联邦 client 凭证填进 `site-builder/config.ini`
+   的 `[IdP]` 段，然后跑 `deploy_pool.py`。适配器的 `/authorize` 不校验
+   `redirect_uri`（原样透传给 Cognito），所以**新建 pool 不需要在飞书后台改
+   任何回调**——飞书侧登记的始终是适配器自己的 `{issuer}/callback`。
+
+   **【标准 IdP】** 无需上游方案与适配器：把 IdP 的 issuer / client_id /
+   client_secret 填进 `[IdP]` 段，`deploy_pool.py` 会用 Cognito 原生 OIDC
+   联邦建好（含 email 与 `email_verified` 映射）。IdP 侧登记 Cognito 的回调
+   `https://{hosted-ui-domain}/oauth2/idpresponse`（脚本跑完会打印这个地址）。
+   SAML IdP 目前脚本未覆盖，需按下面官方文档手工加 provider，其余步骤相同——
+   **attribute mapping 里把 IdP 的 email 映射到 pool 的 email 属性是硬要求**，
+   漏了整个权限模型不成立。若还需要 Quick Desktop
    走同一个 pool 登录，另需 offline_access 剥离代理，参考
    [aws-samples Quick Desktop Cognito 方案](https://aws-samples.github.io/sample-amazon-quick-suite-knowledge-hub/amazon-quick-on-desktop/)。
 
@@ -391,110 +427,65 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    - Azure AD / Entra ID：
      [How to set up Amazon Cognito for federated authentication using Azure AD](https://aws.amazon.com/blogs/security/how-to-set-up-amazon-cognito-for-federated-authentication-using-azure-ad/)
 
-2. 取 **User Pool ID**。上游栈的 CfnOutput 里有（`UserPoolId`），也可以直接查：
+2. **跑脚本建 pool 与 client**（幂等可重跑）：
+
   ```bash
-   aws cognito-idp list-user-pools --max-results 20 --region us-east-1 \
-     --query "UserPools[?contains(Name,'Feishu')].{Id:Id,Name:Name}"
+   # [IdP] 段填好后跑；client_secret 可用 SB_IDP_CLIENT_SECRET 注入不落磁盘
+   python3 site-builder/scripts/deploy_pool.py
   ```
-   回填 `config.ini [Cognito] user_pool_id`。
 
-3. 取 **Hosted UI 域名**。⚠️ **上游栈的 CfnOutput 里没有这一项**（它输出的
-   `DesktopAuthEndpoint` 等是 Quick Desktop SSO 的 API Gateway 代理端点，与站点
-   登录无关），必须单独查 user pool 上的 domain 前缀：
-  ```bash
-   aws cognito-idp describe-user-pool --user-pool-id {user_pool_id} \
-     --region us-east-1 --query 'UserPool.Domain' --output text
-   # 输出形如：feishu-quick-sso-{account_id}-us-east-1
-  ```
-   拼成完整 URL 回填 `config.ini [Cognito] domain`：
+   它建：平台专用 pool（关自注册 + ESSENTIALS tier，pre-token V2 需要）、
+   托管域名（managed login v2）、OIDC 联邦（含 `email` 与 `email_verified`
+   映射）、`site` 与 `mcp` 两个 app client、managed login branding、pre-token
+   触发器，并把 site client 的 secret 写进 SSM `/site-builder/site-client-secret`。
 
-   ```
-   https://{上一行输出}.auth.us-east-1.amazoncognito.com
-   ```
+   跑完按输出回填 `config.ini [Cognito]` 四项。`domain` **必须带 `https://`
+   前缀、末尾不带斜杠**——`login_handler.py` 直接拼接使用
+   （`f"{COGNITO_DOMAIN}/oauth2/authorize"`），裸域名会拼出无 scheme 的地址。
 
-   **格式要求**：必须带 `https://` 前缀、末尾不带斜杠。`login_handler.py` 是直接
-   拼接使用的（`f"{COGNITO_DOMAIN}/oauth2/authorize"`），写成裸域名会拼出无 scheme
-   的地址导致登录跳转失败。
-
-   > **这个 domain 不是你自己的域名**。它是 AWS 自动生成的 Cognito Hosted UI 地址
+   > 这个 domain 不是你自己的域名，是 AWS 生成的 Cognito Hosted UI 地址
    > （承载登录页与 `/oauth2/authorize`、`/oauth2/token`）。你自己的域名填在
    > `[Platform] base_domain`，两者用途不同，别混。
-   > 若用了 Cognito 自定义域名（`CustomDomain` 非空），则填那个自定义域名。
 
-   验证域名可用（返回 302 说明端点正常；若 DNS 失败或 404 说明域名没建成）：
-  ```bash
-   curl -s -o /dev/null -w '%{http_code}\n' \
-     "https://{domain_prefix}.auth.us-east-1.amazoncognito.com/oauth2/authorize"
-  ```
+3. **核对脚本产出**（这几项任一不符，安全边界就不成立）：
 
-4. 确认上游栈创建的 IdP 名称（下一步 `--supported-identity-providers` 要用，
-   通常是 `Feishu`）：
-  ```bash
-   aws cognito-idp list-identity-providers --user-pool-id {user_pool_id} \
-     --region us-east-1 --query 'Providers[].{Name:ProviderName,Type:ProviderType}'
-  ```
-5. 建两个 App Client（**不要复用上游已有的 Desktop/Web client**，那两个是给 Quick
-   登录用的）：
-
-   **回调 URL 用你自己的域名 `https://auth.{base_domain}/callback`**，不是 Cognito
-   的 Hosted UI 域名。`login_handler.py` 在 /login 与 /callback 两处都发送
-   `f"https://auth.{BASE_DOMAIN}/callback"` 作为 `redirect_uri`，Cognito 侧登记的
-   值必须与它逐字符相同，否则换 token 时报 `redirect_mismatch`。
-
-  ```bash
-   # 站点登录 client（confidential，带 secret）
-   aws cognito-idp create-user-pool-client --region us-east-1 \
-     --user-pool-id {user_pool_id} --client-name site-auth \
-     --generate-secret \
-     --allowed-o-auth-flows code --allowed-o-auth-scopes openid email profile \
-     --allowed-o-auth-flows-user-pool-client \
-     --supported-identity-providers {idp_name} \
-     --callback-urls https://auth.{base_domain}/callback \
-     --logout-urls https://auth.{base_domain}/logged-out https://auth.{base_domain}/logout \
-     --query 'UserPoolClient.ClientId' --output text
-   # → 输出的 ClientId 回填 [Cognito] site_client_id
-   # （二期起 /logout 会 302 到 Cognito 的 /logout?logout_uri=…/logged-out
-   #   结束托管登录会话，所以 **/logged-out 必须登记**——Cognito 只接受已登记的
-   #   sign-out URL。**不要把 logout_uri 指向 /logout 本身**：会被打回同一分支，
-   #   无限重定向。注意效力边界：Cognito 的 /logout 不登出上游 IdP（飞书会话仍在），
-   #   所以 UI 文案不能承诺"已完全退出"。二期起本脚本改用 scripts/deploy_pool.py，
-   #   它已按上述形态登记两个 URL。）
-
-   # MCP client（AgentCore 用，public client 不加 --generate-secret）。
-   # 第二条 localhost 回调是给 Claude Code 等本机 MCP 客户端的 OAuth 用的
-   # （Cognito 不支持 dynamic client registration，客户端必须复用本 client
-   #   并预注册固定回调端口；端口选 18765——8765/8766 被 Quick Desktop 的
-   #   quickwork-agent 常驻占用。详见 docs/client-setup.md）
-   aws cognito-idp create-user-pool-client --region us-east-1 \
-     --user-pool-id {user_pool_id} --client-name deploy-mcp \
-     --allowed-o-auth-flows code --allowed-o-auth-scopes openid email \
-     --allowed-o-auth-flows-user-pool-client \
-     --supported-identity-providers {idp_name} \
-     --callback-urls https://bedrock-agentcore.us-east-1.amazonaws.com/identities/oauth2/callback \
-                     http://localhost:18765/callback \
-     --query 'UserPoolClient.ClientId' --output text
-   # → 输出的 ClientId 回填 [Cognito] mcp_client_id
-  ```
-
-   > 建完后可核对回调是否登记正确：
-   > ```bash
-   > aws cognito-idp describe-user-pool-client --user-pool-id {user_pool_id} \
-   >   --client-id {site_client_id} --region us-east-1 \
-   >   --query 'UserPoolClient.{Callbacks:CallbackURLs,Scopes:AllowedOAuthScopes,IdPs:SupportedIdentityProviders}'
-   > ```
-6. 把站点 client 的 secret 存 SSM（Task 5 的 auth-service 部署要读）：
   ```bash
    aws cognito-idp describe-user-pool-client --user-pool-id {user_pool_id} \
-     --client-id {site_client_id} --region us-east-1 --query 'UserPoolClient.ClientSecret' --output text
-   aws ssm put-parameter --name /site-builder/site-client-secret \
-     --type SecureString --value {上一行输出的 secret} --region us-east-1
+     --client-id {site_client_id} --region us-east-1 \
+     --query 'UserPoolClient.{IdPs:SupportedIdentityProviders,Flows:ExplicitAuthFlows,
+              CB:CallbackURLs,LO:LogoutURLs,RefreshD:RefreshTokenValidity,
+              AccessM:AccessTokenValidity}'
   ```
+
+   期望值（2026-08-05 实测基线）：
+
+   | 字段 | 期望 | 不符的后果 |
+   |---|---|---|
+   | `SupportedIdentityProviders` | 只有你的 IdP，**不含 `COGNITO`** | 托管登录页暴露本地用户登录/注册入口，`allowed_users="org"` 的语义被击穿 |
+   | `ExplicitAuthFlows` | 只有 `ALLOW_REFRESH_TOKEN_AUTH` | 开着任何原生 flow 即可绕过联邦、用本地用户密码拿 token |
+   | `CallbackURLs` | `https://auth.{base_domain}/callback` | 与 `login_handler` 发送的 `redirect_uri` 逐字符不同即 `redirect_mismatch` |
+   | `LogoutURLs` | 含 `/logged-out` **与** `/logout` | 缺 `/logged-out` 则登出报错（Cognito 只接受已登记的 sign-out URL）；把 `logout_uri` 指向 `/logout` 本身会无限重定向 |
+   | `RefreshTokenValidity` | 1（天） | 默认 30 天——吊销后残留 token 仍可续期 |
+   | `AccessTokenValidity` | 15（分钟） | AgentCore authorizer 不回查撤销状态，吊销后 access token 在过期前仍能调 MCP |
+
+   mcp client 另需确认**没有 secret**（public client）且回调含
+   `http://localhost:18765/callback`（给 Claude Code 等本机客户端的 OAuth 用；
+   Cognito 不支持 dynamic client registration，端口选 18765 是因为 8765/8766
+   被 Quick Desktop 的 quickwork-agent 常驻占用，详见 `docs/client-setup.md`）
+   与 AgentCore 的 identities 回调。
+
+   > Cognito 的 `/logout` **不登出上游 IdP**（飞书会话仍在），所以 UI 文案不能
+   > 承诺"已完全退出"。
+
 7. **验证点（人工门禁）**：在 Quick Web/Desktop 配置该 IdP，用上游身份
    （飞书账号 / Okta 账号等）登录成功。Desktop 身份区域须 us-east-1。
    （此步只关乎 Quick 登录通道；若组织的 Quick 用别的方式登录、只用本平台
    建站功能，可跳过。）
 
-**⚠️ 注意**：Task 20 spike 可能改变 MCP client 的 scope 需求（若 AgentCore 只透传 access token，email 需从 id_token 或额外 scope 取）——步骤 5 的第二个 client 配置以 spike 报告 `task-20-spike-report.md` 结论为准，可能需回来调整。
+> **MCP 的 token 形态已钉死**（2026-07-29 真机）：AgentCore 网关只接受
+> **access token**（id_token 会被 401 `Claim 'client_id' value mismatch`），
+> 而 Cognito access token 默认不含 email——靠 pre-token V2 触发器注入，
+> `deploy_pool.py` 已一并挂好。**不要把 authorizer 改成 allowedAudience**。
 
 ---
 
@@ -503,17 +494,16 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
 **产出**：CloudFront 分发（`*.{base_domain}`）+ 扩展路由表 + 前端桶；回填 `config.ini [Deployer] edge_role_arn`。
 
 **前置**（来自 ①，缺任一项本阶段会失败）：
-- `site-builder/config.ini [Cognito]` 四项已填（步骤 5 的 auth-service 要读
-  `site_client_id`）
-- SSM `/site-builder/site-client-secret` 已写入（① 步骤 6）
+- `site-builder/config.ini [Cognito]` 四项已填（auth-service 要读 `site_client_id`）
+- SSM `/site-builder/site-client-secret` 已写入（① 的 `deploy_pool.py` 自动写）
 - SSM `/site-builder/jwt-secret` 已存在（§0；栈部署时注入 Edge 函数）
 
 确认 `router/config.ini` 已填好：account_id / domain_name / certificate_arn /
 frontend_bucket / base_domain（从 `router/config.ini.example` 复制）。
-**二期起 `[SiteBuilder]` 还需 `require_idp_claim` 与 `trusted_idps` 两键**
-（缺任一 synth 直接 NoOptionError；首次部署配 `require_idp_claim = false`，
-翻 true 是 M1 Task 15 Step 6c 的完成条件。值必须是裸 `true`/`false`——
-configparser 会把行内注释并进值，`true  # 注释` 会被当成 false，防线静默关闭）。
+`[SiteBuilder]` 段还必须有 `require_idp_claim` 与 `trusted_idps` 两键
+（缺任一 synth 直接 NoOptionError）。**全新部署直接填 `true` + 你的 provider
+name**；值必须是裸 `true`/`false`——configparser 会把行内注释并进值，
+`true  # 注释` 会被当成 false，防线静默关闭。已有存量会话的环境见文末升级一节。
 
 1. 建私有前端桶（若不存在）。**注意此桶不由 CDK 管理**，需手工建并配好
    public-access-block 与生命周期规则：
@@ -745,8 +735,8 @@ AgentCore 校验不认。`deploy_agentcore.py` 已带 `--provenance=false` 规�
 
 **冒烟**：`npx @modelcontextprotocol/inspector` 连 endpoint（带 Cognito Bearer token），
 确认列出 8 工具、无 token 返回 401、`list_my_sites` 的 owner == 登录用户飞书邮箱。
-八个工具 = 一期五个（`deploy_site` / `confirm_upload` / `get_deploy_status` /
-`list_my_sites` / `undeploy_site`）+ 二期权限三件套（`update_site_permissions` /
+八个工具 = 部署五件套（`deploy_site` / `confirm_upload` / `get_deploy_status` /
+`list_my_sites` / `undeploy_site`）+ 权限三件套（`update_site_permissions` /
 `manage_collaborators` / `get_site_permissions`）。工具面由
 `mcp/tests/test_agentcore_contract.py` 的 `EXPECTED_TOOLS` 锁定。
 
@@ -756,8 +746,10 @@ id_token 用 `aud` 而非 `client_id`），MCP 客户端按 OAuth 规范发的�
 access token。而 Cognito access token 默认不含 email，所以 **email 注入靠
 pre-token-generation V2 Lambda**（`auth/pre_token_email.py` → 函数
 `site-auth-pre-token`，挂在用户池 LambdaConfig，V2_0，要求 Essentials+ tier）。
-真机验证过（一期，5 工具时）：工具列出、无 token 401、owner == 登录用户邮箱、
-跨用户查 job 被拒。二期新增的三个权限工具尚未真机验证（Task 12）。
+真机验证过：工具列出、无 token 401、owner == 登录用户邮箱、跨用户查 job 被拒。
+**权限三件套（`update_site_permissions` / `manage_collaborators` /
+`get_site_permissions`）尚未真机验证**——单测覆盖，但 IAM 的字段级闸门
+（`dynamodb:Attributes`）只有真机能证伪。
 **不要**改 `allowedAudience`——那会反过来把 access token 拒掉。
 详见 `mcp/AGENTCORE-SPIKE.md` §7 与 `docs/client-setup.md`。
 
@@ -807,14 +799,26 @@ RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/tes
 
 | 段          | 字段                                                     | 来源                          |
 | ---------- | ------------------------------------------------------ | --------------------------- |
-| [Cognito]  | user_pool_id / domain / site_client_id / mcp_client_id | ①                           |
+| [Platform] | admin_seed                                             | 你指定的首个管理员邮箱（① 末尾的种子脚本要读）    |
+| [IdP]      | provider_name / issuer / client_id / client_secret     | 你的 IdP；secret 可用环境变量注入不落磁盘  |
+| [Cognito]  | user_pool_id / domain / site_client_id / mcp_client_id | ① `deploy_pool.py` 输出       |
 | [DSQL]     | cluster_endpoint                                       | ③                           |
+| [Deployer] | admins_table                                           | 固定 `site-admins`（④ 建表）      |
 | [Deployer] | edge_role_arn                                          | ② CfnOutput EdgeRoleArn     |
 | [Deployer] | state_machine_arn                                      | ④ CfnOutput StateMachineArn |
 | [MCP]      | endpoint_url                                           | ⑤                           |
 
+`router/config.ini` 的 `[SiteBuilder]` 还需 `require_idp_claim` /
+`trusted_idps`（见 ②）。
 
-SSM 参数：`/site-builder/jwt-secret`（已存在）、`/site-builder/site-client-secret`（① 步骤 5 写入）。
+一次性动作（**不做则安全边界不成立，且测试覆盖不到**）：
+
+- [ ] admin 种子已注入（`seed_admin.py --apply`，在 ④ 之后）
+- [ ] `require_idp_claim = true` 且部署出去的 Edge 代码已核对（零占位符）
+- [ ] 登录失败告警已建（metric filter + alarm，阈值按真实流量定）
+- [ ] 自己走过一次真实登录，claim 值与 ① 的实测基线一致
+
+SSM 参数：`/site-builder/jwt-secret`（§0 手工建）、`/site-builder/site-client-secret`（① 的 `deploy_pool.py` 写入）。
 
 ## 已知限制与延后项（向客户声明）
 
@@ -902,3 +906,89 @@ migrator role 的 `ALTER DEFAULT PRIVILEGES FOR ROLE` 是否被接受（失败�
 - `provision_dsql` 的 `migrations/*.sql` 不经红线扫描（只扫 schema.sql）；migration 里的禁用 DDL 会在 provision-db 阶段才失败（可读报错，非静默）。
 - 跑测试的 venv：`site-builder/auth` 无自己的 venv，用 `site-builder/contract/.venv/bin/pytest tests`（含 pyjwt）；`site-builder/deployer` 必须 `pytest tests`（裸 `pytest -q` 会误收集 `infra/cdk.out` 里的 asset 副本）。
 
+
+---
+
+## 从一期环境升级（本仓库自己的环境走过这条路）
+
+**全新部署不需要读这一节**——上面 ①-⑦ 已经是最新版本。这里只记"已经跑着
+一期、要原地升到二期"时额外需要的动作与顺序。本仓库的环境在 2026-08-05
+按这个顺序做过一遍，下面的坑都是实测的。
+
+### 为什么必须换一个 Cognito pool
+
+一期复用了上游 Quick SSO 的 pool。**pre-token 触发器是 pool 级的且不按
+client_id 区分**——它对该 pool 里所有 app client 的 token 一律注入 claim。
+于是平台升级触发器等于改上游 Quick Desktop/Web 在用的 token 形态，反之亦然，
+而这个耦合没有任何测试能覆盖。另外共享 pool 里的 client 可能开着原生认证
+flow（实测那个 mcp client 开着 `ALLOW_USER_SRP_AUTH`），org 边界不成立。
+
+### 顺序（每一步的前后依赖都踩过）
+
+1. **先部 ④ 执行器**：它建 `site-admins` 表与 sites 表的 `owner-index` GSI。
+   GSI 是在线添加、不替换表，等 `IndexStatus` 变 `ACTIVE` 再继续（实测约 60 秒）。
+   注意 `ItemCount` 会有统计延迟显示 0，用一次真实 Query 确认回填才可靠。
+
+2. **建专用 pool**（`deploy_pool.py`，见上面第 1 项），回填 `[Cognito]` 四项。
+
+   想先验证登录体验再切，可以用 `--pool-name <临时名>` 建隔离 pool 预演——
+   它会自动隔离 SSM 前缀与 pre-token 函数名。**这两处隔离缺一不可**：函数名
+   若不隔离，spike 会 `update_function_code` 到生产在用的那个函数上，静默改掉
+   线上 token 形态而 Cognito 侧毫无异常显示。
+
+3. **部 auth 服务**（`deploy_auth.py`），它会把 Lambda 指到新 pool。
+
+4. **迁移存量站点权限**（一期站点在 sites 表没有权限字段，不迁移则
+   `role_of` 判不出 owner）：
+
+   ```bash
+   python3 site-builder/scripts/migrate_permissions.py           # dry-run，先看报告
+   python3 site-builder/scripts/migrate_permissions.py --apply
+   ```
+
+   dry-run 是唯一的人工审查关口——逐条打印「将写什么值 / 保留哪些在线值」。
+   报告里出现 `问题:` 的站点一律跳过未写，需人工判断原意后手工修，
+   **脚本绝不会自动把无法解析的名单降级成 `org`**（那是扩权）。
+
+   迁移范围是**路由表里在线的站点**，不是 sites 表全量——sites 表里还有已下线
+   记录与 fixture。`owner=platform` 的 auth 路由会被正确跳过。
+
+5. **admin 种子**（见上面第 3 项）。
+
+6. **部 ⑤ MCP**：镜像会因代码变化重新构建。若 ECR 仓库是一期用 MUTABLE 建的，
+   脚本会顺手纠正为 IMMUTABLE（实测本环境正是这种情况——此前镜像链一直没有
+   防覆盖保护）。
+
+7. **部 Edge，但 `require_idp_claim` 先留 `false`**。这是与全新部署唯一的实质
+   差异：**存量会话没有 `idp` claim，提前翻 `true` 会把所有已登录用户 302 到
+   登录页**（包括你自己）。
+
+8. **自己走一遍登录**，拿到新 pool 签发的会话。
+
+9. **翻 `require_idp_claim = true`，再部一次 Edge**（`rm -rf cdk.out` 必须，
+   否则用陈旧 asset）。翻之前可以先验证它会怎么判——把部署出去的那份代码下载
+   下来、改开关在本地跑它的判定逻辑，比翻完再补救便宜得多：
+
+   ```bash
+   # 判定点在 index.py 的请求处理里（搜 REQUIRE_IDP_CLAIM），
+   # 不在 _verify_session_jwt（那个只管验签）——测错层会得到"全部放行"的假象
+   ```
+
+   本环境实测结果：新会话（`idp=Feishu` + `auth_via=TokenGeneration_HostedAuth`）
+   与 refresh 续期出的会话放行；一期旧会话、伪造 idp、原生认证来源全部 302。
+
+### 升级期的其它实测坑
+
+- **一期 pool 里联邦用户的 `email_verified` 是 `false`**（一期没配这个映射），
+  而 `require_email_verified` 默认 `true` 会拒绝它——**所以顺序必须是先切 pool
+  再开这个开关**，反过来是全员登录失败。新 pool 由 `deploy_pool.py` 配好映射，
+  实测切完即为 `true`。
+- **同一个人在两个 pool 里是两个独立 Cognito 用户**（`identities.dateCreated`
+  各自新建），所以切 pool 必然要求全员重新登录一次，顺带把飞书那次授权同意
+  点掉（同意页只弹第一次）。
+- **旧 pool 与旧 client 不要立刻删**：迁移期两个 pool 的 pre-token 调用授权并存
+  （`add_permission` 的 StatementId 带 pool 标识），保留旧的即可随时回滚。
+- **一期建的站点可能存着 URL 编码的用户名**：Edge 对 `x-user-name` 做 URL 编码
+  是必须的（HTTP 头不能放非 ASCII），站点须 `decodeURIComponent`。一期的合同
+  示例漏了这句，那时建的站点会把 `%E5%BD%AD...` 存进数据里。改站点代码后重新
+  部署即可，历史脏数据需单独清洗。
