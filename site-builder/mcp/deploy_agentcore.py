@@ -108,6 +108,28 @@ def build_and_push(image_uri: str) -> None:
 ROUTE_PROJECTION_ATTRIBUTES = ("subdomain", "require_auth", "allowed_users",
                                "collaborators", "owner", "permissions_rev")
 
+# MCP runtime 允许在 sites 表上写的属性白名单。
+#
+# 只覆盖**从 MCP 工具真正可达**的写路径：
+#   site_id                     —— 分区键（官方要求主键必列）
+#   owner / name / status       —— do_deploy_site 创建站点时写
+#   require_login / allowed_users / collaborators / permissions_rev /
+#   permissions_updated_at / permissions_updated_by
+#                               —— write_permissions（改权限、协作者、转移所有权）
+#
+# **不含**部署链自己的字段：status 之外的 data_tables / migrations_applied /
+# last_job_id / dsql_schema 等由 SFN 的各步骤用 deployer exec role 写，
+# MCP 不该碰。放进来等于让被攻破的 runtime 能篡改部署状态
+# （例：改 data_tables 让后续步骤对别的表动手）。
+# status 必须留：do_deploy_site 写 DEPLOYING。
+#
+# 新增 MCP 侧写字段时同步这里，否则线上 AccessDenied；
+# 由 test_agentcore_contract 从实现源码解析比对，不手抄第二份清单。
+SITE_WRITABLE_ATTRIBUTES = ("site_id", "owner", "name", "status",
+                            "require_login", "allowed_users", "collaborators",
+                            "permissions_rev", "permissions_updated_at",
+                            "permissions_updated_by")
+
 
 def ensure_role() -> str:
     """Runtime 执行角色：起 SFN、读写 jobs/sites、发 presigned URL、调 undeploy。"""
@@ -151,19 +173,39 @@ def ensure_role() -> str:
          "Resource": [
              f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-deploy-jobs",
              f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-deploy-jobs/index/*"]},
-        # sites：**故意不给 PutItem**，与 jobs 分开成独立 statement。
-        # 合在一条里（旧写法 Sid=JobsAndSites）只是为了 create_job 需要 PutItem，
-        # 代价是 sites 表也跟着获得整条覆盖权限——runtime 一旦被攻破即可绕过
-        # permissions.py 的 owner/collaborator 判定，直接重写任意站点的 owner。
-        # 全部 sites 写路径都是 update_item（common.upsert_site /
-        # permissions.write_permissions），无一需要 PutItem。
-        {"Sid": "Sites", "Effect": "Allow",
-         "Action": ["dynamodb:GetItem", "dynamodb:UpdateItem",
-                    "dynamodb:Query", "dynamodb:Scan",
+        # sites 读：**不能加 dynamodb:Attributes 条件**。
+        # Query/Scan 不带 ProjectionExpression 时请求上下文里没有
+        # dynamodb:Attributes，而写侧那条加了 Null 检查——两者合在一个
+        # statement 里会让 list_my_sites 的 Query 直接 AccessDenied。
+        # 读全字段本身不是问题：调用方能读的站点由应用层 owner 判定收口。
+        {"Sid": "SitesRead", "Effect": "Allow",
+         "Action": ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:Scan",
                     "dynamodb:ConditionCheckItem"],
          "Resource": [
              f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-sites",
              f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-sites/index/*"]},
+        # sites 写：**故意不给 PutItem，且按属性白名单收窄 UpdateItem**。
+        # 不给 PutItem 只挡住"整条覆盖"，挡不住 UpdateItem 改任意属性
+        # （UpdateItem 能编辑任意属性，item 不存在时甚至会创建）——所以必须
+        # 同时上属性闸门，否则 runtime 被攻破可改 status/data_tables/
+        # migrations_applied 这些**部署链自己的字段**：把 DELETED 站点改回
+        # ACTIVE、篡改 data_tables 让后续步骤误操作别的表。
+        #
+        # ⚠️ 效力边界，别高估这条：owner 必须留在白名单里（创建站点写 owner、
+        # transfer_owner 改 owner，都是 MCP 的正常功能），所以它**不能**阻止
+        # "改 owner 绕过应用层判定"。那条提权路径真正的封堵点在 Edge——
+        # 平台信任已改为按请求 host 判定，不再从 owner 推导
+        # （router/.../origin_request.py 的 _is_platform_route）。
+        # 这里的价值是把可写面收敛到 MCP 真正需要的字段。
+        {"Sid": "SitesWrite", "Effect": "Allow",
+         "Action": "dynamodb:UpdateItem",
+         "Resource": f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-sites",
+         "Condition": {
+             "ForAllValues:StringEquals": {
+                 "dynamodb:Attributes": list(SITE_WRITABLE_ATTRIBUTES)},
+             "Null": {"dynamodb:Attributes": "false"},
+             "StringEqualsIfExists": {
+                 "dynamodb:ReturnValues": ["NONE", "UPDATED_OLD", "UPDATED_NEW"]}}},
         # admins 表：**只读 + 事务条件检查**。
         # is_admin() 要 GetItem、list_admins() 要 Scan、write_permissions() 的
         # admin 代管路径要对 admins 做 ConditionCheck（缺 ConditionCheckItem
@@ -204,9 +246,12 @@ def ensure_role() -> str:
         #     该 action 的支持条件键里没有 EnclosingOperation，而 ForAnyValue
         #     在键缺失时返回 false → 每次 ConditionCheck 都被拒。
         #   · 不列 dynamodb:Select（UpdateItem / ConditionCheck 不用该参数）。
+        # 不含 GetItem：MCP 侧没有任何读路由表的代码（权限真源是 sites 表，
+        # 路由表只是投影）。留着它反而是隐患——GetItem 不带 ProjectionExpression
+        # 时请求上下文没有 dynamodb:Attributes，会被同 statement 的 Null 检查拒，
+        # 于是"某天有人加了读路由的代码"会以 AccessDenied 的形态出现在生产。
         {"Sid": "RoutingProjection", "Effect": "Allow",
-         "Action": ["dynamodb:GetItem", "dynamodb:UpdateItem",
-                    "dynamodb:ConditionCheckItem"],
+         "Action": ["dynamodb:UpdateItem", "dynamodb:ConditionCheckItem"],
          "Resource": f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/"
                      + CFG["Platform"]["routing_table"],
          "Condition": {
@@ -233,6 +278,17 @@ def ensure_role() -> str:
     iam.put_role_policy(RoleName=ROLE_NAME, PolicyName="mcp-scope",
                         PolicyDocument=json.dumps(policy))
     return arn
+
+
+def _require_email_verified_cfg() -> str:
+    """config.ini [IdP] require_email_verified → runtime 环境变量字符串。
+
+    与 auth/deploy_auth.py 的同名函数保持一致：默认 "true"，只有显式
+    写成 false 才关闭（拼错一律当 true——安全开关不做静默降级）。
+    """
+    raw = CFG["IdP"].get("require_email_verified", "") if CFG.has_section("IdP") else ""
+    head = raw.split("#")[0].split(";")[0].strip().lower()
+    return "false" if head == "false" else "true"
 
 
 def _discovery_url() -> str:
@@ -286,6 +342,10 @@ def deploy_runtime(image_uri: str, role_arn: str) -> dict:
             # 权限投影的目标表（permissions.write_permissions 的第二个事务项）
             "ROUTING_TABLE": CFG["Platform"]["routing_table"],
             "TRUSTED_IDPS": CFG["IdP"]["provider_name"] if CFG.has_section("IdP") else "",
+            # 与 auth 服务同一个开关（两处语义必须一致）：email 是授权主键，
+            # 而联邦 email 默认 unverified。默认 "true"，只有接入不发该 claim
+            # 的 IdP 时才在 config.ini 设 false。
+            "REQUIRE_EMAIL_VERIFIED": _require_email_verified_cfg(),
             "ARTIFACTS_BUCKET": f"site-artifacts-{ACCOUNT}",
             "STATE_MACHINE_ARN": sm_arn,
             "BASE_DOMAIN": BASE_DOMAIN,

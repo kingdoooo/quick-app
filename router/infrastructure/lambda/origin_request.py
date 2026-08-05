@@ -56,6 +56,9 @@ def lambda_handler(event, context):
         route = _lookup_route(subdomain)
         if not route:
             return _not_found(f'Subdomain "{subdomain}" not configured.')
+        # 平台身份取自**请求 host 解析出的 subdomain**，不是路由 item 里的字段。
+        # 这一步之后 _route_request 只看这个键，见 _is_platform_route。
+        route = {**route, _PLATFORM_KEY: subdomain in PLATFORM_SUBDOMAINS}
         denied = _check_auth(request, route, original_host)
         if denied:
             return denied
@@ -281,8 +284,43 @@ RESERVED_COOKIES = ("sb_session",)
 PLATFORM_MARK = "x-sb-platform-origin"
 
 
+# 平台自有子域名白名单。**平台身份必须由这里判定，不能从路由 item 的字段推导。**
+#
+# 为什么不用 owner == "platform"（原实现）：owner 同时是权限投影字段，
+# 在线改权限那条路径要写它（permissions.write_permissions 的 route_update），
+# 所以任何能写权限投影的角色（MCP runtime）都能把某条路由的 owner 改成
+# "platform"。那一刻这条用户站点就被 Edge 当成平台 origin：
+#   · 顶域 sb_session 不再被剥除 → 用户控制的 origin 直接读到共享会话 JWT，
+#     可重放到该用户能访问的任何站点；
+#   · origin_response 的 PLATFORM_MARK 分支放行它写 sb_session →
+#     可做会话固定/强制登出。
+# 即"信任标记"与"可写数据"是同一个字段，这是权限提升的直接通路。
+#
+# subdomain 是路由表的分区键：它是 Key，不是可 SET 的属性，改它等于写另一条
+# item（需要 PutItem，MCP runtime 没有），且新 item 的 subdomain 必须真的
+# 匹配请求 host 才会被查到。因此按分区键白名单判定是不可伪造的。
+#
+# 与 auth/deploy_auth.py 注册的平台路由保持一致（当前只有 auth）。
+# 新增平台自有子域名（如 M3 控制台）时必须同步这里，否则它拿不到平台待遇。
+PLATFORM_SUBDOMAINS = ("auth",)
+
+# lambda_handler 用请求 host 解析出的 subdomain 算好后放进这个键。
+# 名字带前缀且不是路由表里的属性名：即便有人往路由 item 里写同名字段，
+# lambda_handler 也会用真实 host 的判定结果覆盖它（{**route, ...} 在后）。
+_PLATFORM_KEY = "_platform_origin"
+
+
 def _is_platform_route(route: dict) -> bool:
-    return route.get("owner") == "platform"
+    """是否平台自有 origin。
+
+    **只读 lambda_handler 按请求 host 算出的 _PLATFORM_KEY，缺省 False。**
+    绝不要改回读 route["owner"]/route["subdomain"] 这类存储字段——见上面
+    PLATFORM_SUBDOMAINS 的注释：那些字段对能写权限投影的角色是可控的。
+    缺键即 False 是有意的 fail-closed：判不出平台身份时按不可信站点处理
+    （剥 cookie、不给 mark），最坏结果是 auth-service 功能异常，
+    而不是把会话 JWT 泄漏给站点代码。
+    """
+    return route.get(_PLATFORM_KEY) is True
 
 
 def _strip_reserved_cookies(request) -> None:

@@ -113,7 +113,7 @@ def test_caller_email_rejects_missing_and_malformed_authorization(monkeypatch):
         return base64.urlsafe_b64encode(_json.dumps(d).encode()).rstrip(b"=").decode()
 
     # 合法：带 email claim
-    tok = f"h.{_b64({'email': 'user@example.com'})}.sig"
+    tok = f"h.{_b64({'email': 'user@example.com', 'email_verified': True})}.sig"
     monkeypatch.setattr(server.mcp, "get_context", lambda: _Ctx(f"Bearer {tok}"))
     assert server._caller_email() == "user@example.com"
 
@@ -150,7 +150,8 @@ def test_caller_email_accepts_trusted_idp(monkeypatch):
     import server
     monkeypatch.setenv("TRUSTED_IDPS", "Feishu,Okta")
     _with_auth(monkeypatch, _token({"email": "a@x.com", "idp": "Feishu",
-                                    "auth_via": "TokenGeneration_HostedAuth"}))
+                                    "auth_via": "TokenGeneration_HostedAuth",
+                                    "email_verified": True}))
     assert server._caller_email() == "a@x.com"
 
 
@@ -186,7 +187,8 @@ def test_caller_email_accepts_refresh_token_source(monkeypatch):
     import server
     monkeypatch.setenv("TRUSTED_IDPS", "Feishu")
     _with_auth(monkeypatch, _token({"email": "a@x.com", "idp": "Feishu",
-                                    "auth_via": "TokenGeneration_RefreshTokens"}))
+                                    "auth_via": "TokenGeneration_RefreshTokens",
+                                    "email_verified": True}))
     assert server._caller_email() == "a@x.com"
 
 
@@ -194,7 +196,7 @@ def test_caller_email_skips_idp_check_when_unconfigured(monkeypatch):
     """TRUSTED_IDPS 为空 = 迁移宽限期（与 Edge 的开关对齐），放行但不推荐。"""
     import server
     monkeypatch.setenv("TRUSTED_IDPS", "")
-    _with_auth(monkeypatch, _token({"email": "a@x.com"}))
+    _with_auth(monkeypatch, _token({"email": "a@x.com", "email_verified": True}))
     assert server._caller_email() == "a@x.com"
 
 
@@ -279,13 +281,183 @@ def test_routing_policy_has_null_guard_and_no_putitem():
 
 
 def test_sites_table_has_no_putitem():
-    """sites 表不得有 PutItem：整条覆盖可绕过 owner 判定重写站点归属。
+    """sites 表在**任何** statement 里都不得出现 PutItem/DeleteItem。
 
-    与 jobs 表分开成独立 statement 就是为了这个——合在一条里时 sites
-    会因为 create_job 需要 PutItem 而顺带获得整条写权限。
+    整条覆盖可绕过 owner 判定重写站点归属。按生成的 policy 全表扫描，
+    不按单个 Sid——早先版本写死了 Sid 名，Sid 一改名测试就报
+    ValueError 而不是真正校验（改名时确实发生了）。
     """
-    src = (MCP_DIR / "deploy_agentcore.py").read_text()
-    stmt_start = src.index('"Sid": "Sites"')
-    stmt = src[stmt_start:src.index("},", stmt_start)]
-    assert "PutItem" not in stmt
-    assert "site-sites" in stmt
+    import json
+    from unittest.mock import MagicMock
+
+    import deploy_agentcore as da
+
+    captured = {}
+    fake = MagicMock()
+    fake.get_role.return_value = {"Role": {"Arn": "arn:aws:iam::1:role/r"}}
+    fake.put_role_policy.side_effect = lambda **kw: captured.update(kw)
+    real_iam, da.iam = da.iam, fake
+    try:
+        da.ensure_role()
+    finally:
+        da.iam = real_iam
+    policy = json.loads(captured["PolicyDocument"])
+
+    for stmt in policy["Statement"]:
+        resources = stmt["Resource"]
+        resources = [resources] if isinstance(resources, str) else resources
+        if not any("table/site-sites" in r for r in resources):
+            continue
+        actions = stmt["Action"]
+        actions = [actions] if isinstance(actions, str) else actions
+        assert "dynamodb:PutItem" not in actions, stmt.get("Sid")
+        assert "dynamodb:DeleteItem" not in actions, stmt.get("Sid")
+
+
+def _statement(da, sid: str) -> dict:
+    """跑 ensure_role() 抓真正下发的 policy，按 Sid 取 statement。
+
+    **断言生成结果而不是源码文本**：源码里出现 "Null" 字样不等于它进了下发的
+    JSON（拼错键名、放错嵌套层级、被后面的 dict 覆盖，源码搜索全都看不出来）。
+    """
+    import json
+    from unittest.mock import MagicMock
+
+    captured = {}
+    fake = MagicMock()
+    fake.get_role.return_value = {"Role": {"Arn": "arn:aws:iam::1:role/r"}}
+    fake.put_role_policy.side_effect = lambda **kw: captured.update(kw)
+    real_iam, da.iam = da.iam, fake
+    try:
+        da.ensure_role()
+    finally:
+        da.iam = real_iam
+    policy = json.loads(captured["PolicyDocument"])
+    return next(s for s in policy["Statement"] if s.get("Sid") == sid)
+
+
+# --- sites 表写权限也要字段级闸门（Codex re-review P0） ---
+# 上一轮只给 routing 加了 dynamodb:Attributes，sites 仍是无条件 UpdateItem
+# ——而"不给 PutItem"挡不住 UpdateItem 改任意属性。
+
+def test_sites_write_has_attribute_gate():
+    import deploy_agentcore as da
+    stmt = _statement(da, "SitesWrite")
+    cond = stmt["Condition"]
+    assert cond["ForAllValues:StringEquals"]["dynamodb:Attributes"] == \
+        list(da.SITE_WRITABLE_ATTRIBUTES)
+    assert cond["Null"] == {"dynamodb:Attributes": "false"}
+    assert stmt["Action"] == "dynamodb:UpdateItem"
+
+
+def test_sites_write_excludes_deploy_chain_fields():
+    """部署链自己的字段不得进 MCP 白名单——被攻破的 runtime 可篡改部署状态。"""
+    import deploy_agentcore as da
+    forbidden = {"data_tables", "migrations_applied", "last_job_id",
+                 "dsql_schema", "api_target", "static_prefix"}
+    leaked = forbidden & set(da.SITE_WRITABLE_ATTRIBUTES)
+    assert not leaked, f"部署链字段进了 MCP 可写白名单: {sorted(leaked)}"
+
+
+def test_sites_write_covers_every_reachable_mcp_write():
+    """白名单必须覆盖 MCP 真正会写的字段，否则线上 AccessDenied。
+
+    从实现源码解析：write_permissions 的 site_update + server.py 建站那次
+    upsert_site 的 kwargs。手抄第二份清单的话，permissions.py 加字段时
+    这里不会失败。
+    """
+    import re
+
+    import deploy_agentcore as da
+
+    fn_dir = MCP_DIR.parent / "deployer" / "functions"
+    perm = (fn_dir / "permissions.py").read_text()
+    block = perm[perm.index("sets = ["):perm.index("site_update = {")]
+    fields = set(re.findall(r'"(\w+) = :', block))
+    aliases = dict(re.findall(r'names\["(#\w+)"\]\s*=\s*"(\w+)"', block))
+    fields |= {aliases.get(a, a) for a in re.findall(r'"(#\w+) = :', block)}
+
+    srv = (MCP_DIR / "server.py").read_text()
+    m = re.search(r"common\.upsert_site\(site_id,\s*([^)]*)\)", srv)
+    fields |= set(re.findall(r"(\w+)=", m.group(1)))
+    fields |= {"site_id"}          # 分区键，官方要求主键必列
+
+    allow = set(da.SITE_WRITABLE_ATTRIBUTES)
+    assert fields <= allow, (
+        f"MCP 会写但白名单缺失: {sorted(fields - allow)}——线上 AccessDenied")
+    assert not any(a.startswith("#") for a in allow)
+
+
+def test_sites_read_has_no_attribute_condition():
+    """读侧绝不能带 Attributes/Null 条件。
+
+    Query/Scan 不带 ProjectionExpression 时请求上下文没有 dynamodb:Attributes,
+    Null 检查会把 list_my_sites 直接拒掉——这是"收紧策略反而弄挂功能"的典型。
+    """
+    import deploy_agentcore as da
+    stmt = _statement(da, "SitesRead")
+    assert "Condition" not in stmt
+    assert "dynamodb:Query" in stmt["Action"]
+    assert "dynamodb:UpdateItem" not in stmt["Action"]
+
+
+def test_routing_projection_has_no_getitem():
+    """MCP 无读路由表的代码；留着 GetItem 会被同 statement 的 Null 检查拒。"""
+    import deploy_agentcore as da
+    stmt = _statement(da, "RoutingProjection")
+    assert "dynamodb:GetItem" not in stmt["Action"]
+
+
+# --- email_verified 必须真的参与授权判定（Codex re-review P1） ---
+# 上一轮只把它映射进用户档案，没有任何一处校验它——"只映射不检查"没有形成
+# 技术防线。当前飞书适配器实测会发 email_verified=true，所以严格检查可实施。
+
+def test_caller_email_rejects_unverified_email(monkeypatch):
+    import server
+    monkeypatch.delenv("REQUIRE_EMAIL_VERIFIED", raising=False)
+    monkeypatch.setenv("TRUSTED_IDPS", "Feishu")
+    _with_auth(monkeypatch, _token({"email": "a@x.com", "idp": "Feishu",
+                                    "auth_via": "TokenGeneration_HostedAuth",
+                                    "email_verified": "false"}))
+    with pytest.raises(server.NotOwner):
+        server._caller_email()
+
+
+def test_caller_email_rejects_missing_email_verified(monkeypatch):
+    """缺 claim 也要拒（fail-closed）——否则拿旧 token 就能绕过。"""
+    import server
+    monkeypatch.delenv("REQUIRE_EMAIL_VERIFIED", raising=False)
+    monkeypatch.setenv("TRUSTED_IDPS", "Feishu")
+    _with_auth(monkeypatch, _token({"email": "a@x.com", "idp": "Feishu",
+                                    "auth_via": "TokenGeneration_HostedAuth"}))
+    with pytest.raises(server.NotOwner):
+        server._caller_email()
+
+
+@pytest.mark.parametrize("verified", [True, "true", "True"])
+def test_caller_email_accepts_verified_forms(monkeypatch, verified):
+    """id_token 给 JSON 布尔，pre-token 注入的是字符串——两种都要认。"""
+    import server
+    monkeypatch.delenv("REQUIRE_EMAIL_VERIFIED", raising=False)
+    monkeypatch.setenv("TRUSTED_IDPS", "Feishu")
+    _with_auth(monkeypatch, _token({"email": "a@x.com", "idp": "Feishu",
+                                    "auth_via": "TokenGeneration_HostedAuth",
+                                    "email_verified": verified}))
+    assert server._caller_email() == "a@x.com"
+
+
+def test_email_verified_check_can_be_disabled_for_idp_without_claim(monkeypatch):
+    """接入不发该 claim 的 IdP 时可关（代价是这道防线消失）。"""
+    import server
+    monkeypatch.setenv("REQUIRE_EMAIL_VERIFIED", "false")
+    monkeypatch.setenv("TRUSTED_IDPS", "Feishu")
+    _with_auth(monkeypatch, _token({"email": "a@x.com", "idp": "Feishu",
+                                    "auth_via": "TokenGeneration_HostedAuth"}))
+    assert server._caller_email() == "a@x.com"
+
+
+def test_email_verified_default_is_enforcing(monkeypatch):
+    """默认必须是"要求已验证"——默认关掉等于没修。"""
+    import server
+    monkeypatch.delenv("REQUIRE_EMAIL_VERIFIED", raising=False)
+    assert server._require_email_verified() is True

@@ -153,10 +153,15 @@ def test_site_own_cookies_survive_reserved_strip():
 
 
 def test_platform_route_keeps_session_cookie_and_gets_mark():
-    """auth-service 需要读 cookie（/logout）并被允许签发平台 cookie。"""
+    """auth-service 需要读 cookie（/logout）并被允许签发平台 cookie。
+
+    平台判定由 lambda_handler 按请求 host 算出（见 _is_platform_route），
+    所以这里必须把那个键带上——直接调 _route_request 时它不会自己出现。
+    这正是防线所在：路由 item 里写什么都不影响判定。
+    """
     r = _req(uri="/logout", cookie=f"sb_session={_jwt()}")
     orq._check_auth(r, dict(PLATFORM_ROUTE), "auth.example.com")
-    _route(r, PLATFORM_ROUTE)
+    _route(r, {**PLATFORM_ROUTE, orq._PLATFORM_KEY: True})
     assert "sb_session" in r["headers"]["cookie"][0]["value"]
     assert orq.PLATFORM_MARK in r["headers"]
 
@@ -348,3 +353,66 @@ def test_idp_check_disabled_by_switch():
     importlib.reload(mod)
     r = _req(cookie=f"sb_session={_jwt_idp(idp=None)}")
     assert mod._check_auth(r, dict(ROUTE_AUTH), "app-x.example.com") is None
+
+
+# ---- 平台身份不得从可写字段推导（Codex re-review P0） ----
+# 这些用例必须走完整 lambda_handler：平台判定发生在那里（按请求 host），
+# 只调 _route_request 会绕过它，等于不测真正的防线。
+
+def _full_event(host, uri="/", cookie=None):
+    headers = {"host": [{"key": "Host", "value": host}]}
+    if cookie:
+        headers["cookie"] = [{"key": "Cookie", "value": cookie}]
+    return {"Records": [{"cf": {"request": {
+        "uri": uri, "querystring": "", "method": "GET", "headers": headers}}}]}
+
+
+# owner 是权限投影字段：能写权限投影的角色（MCP runtime）可把任意用户站点的
+# owner 改成 "platform"。若 Edge 据此授予平台待遇，那条站点就能读到顶域
+# sb_session（可重放到该用户的其他站点），并被 origin_response 放行写平台 cookie。
+
+def test_forged_platform_owner_on_site_route_gets_no_platform_treatment():
+    """把站点路由的 owner 改成 platform 不得换来平台待遇（核心攻击链）。"""
+    hijacked = {**SITE_ROUTE, "owner": "platform"}
+    r = _req(uri="/api/x", cookie=f"sb_session={_jwt()}")
+    # 走完整 handler：平台判定只能由请求 host 决定
+    with patch.object(orq, "_lookup_route", return_value=dict(hijacked)), \
+         patch.object(orq, "_add_sigv4_auth"), patch.object(orq, "_add_s3_sigv4_auth"):
+        out = orq.lambda_handler(
+            _full_event("app-x.example.com", "/api/x", f"sb_session={_jwt()}"), None)
+    # 会话 cookie 必须仍被剥除
+    assert "cookie" not in out["headers"] or \
+        "sb_session" not in out["headers"]["cookie"][0]["value"]
+    # 也不得拿到允许签发平台 cookie 的标记
+    assert orq.PLATFORM_MARK not in out["headers"]
+
+
+def test_forged_platform_key_in_route_item_is_overridden():
+    """连 _platform_origin 这个键本身被写进路由 item 也不管用——
+    lambda_handler 用真实 host 的判定结果覆盖它。"""
+    hijacked = {**SITE_ROUTE, orq._PLATFORM_KEY: True, "owner": "platform"}
+    with patch.object(orq, "_lookup_route", return_value=dict(hijacked)), \
+         patch.object(orq, "_add_sigv4_auth"), patch.object(orq, "_add_s3_sigv4_auth"):
+        out = orq.lambda_handler(
+            _full_event("app-x.example.com", "/api/x", f"sb_session={_jwt()}"), None)
+    assert orq.PLATFORM_MARK not in out["headers"]
+
+
+def test_real_platform_subdomain_still_works():
+    """auth 子域名仍须拿到平台待遇（否则 /logout 读不到 cookie）。"""
+    with patch.object(orq, "_lookup_route", return_value=dict(PLATFORM_ROUTE)), \
+         patch.object(orq, "_add_sigv4_auth"), patch.object(orq, "_add_s3_sigv4_auth"):
+        out = orq.lambda_handler(
+            _full_event("auth.example.com", "/logout", f"sb_session={_jwt()}"), None)
+    assert "sb_session" in out["headers"]["cookie"][0]["value"]
+    assert orq.PLATFORM_MARK in out["headers"]
+
+
+def test_platform_treatment_survives_owner_removal_on_auth_route():
+    """反过来：auth 路由即使 owner 字段被清掉也仍是平台（判定不依赖它）。"""
+    stripped = {k: v for k, v in PLATFORM_ROUTE.items() if k != "owner"}
+    with patch.object(orq, "_lookup_route", return_value=stripped), \
+         patch.object(orq, "_add_sigv4_auth"), patch.object(orq, "_add_s3_sigv4_auth"):
+        out = orq.lambda_handler(
+            _full_event("auth.example.com", "/logout", f"sb_session={_jwt()}"), None)
+    assert orq.PLATFORM_MARK in out["headers"]
