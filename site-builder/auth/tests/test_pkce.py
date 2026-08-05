@@ -543,8 +543,9 @@ def test_invalid_grant_emits_structured_log(capsys):
     hit = [p for p in payload
            if p.get("event") == "token_exchange_invalid_grant"]
     assert hit, "invalid_grant 必须打结构化日志（否则配置事故不可告警）"
-    # error_description 要带上：它是人工区分"重放"与"配置写坏"的唯一线索
-    assert "email_verified" in hit[0].get("description", "")
+    # 只记固定词汇的分类值，不回传上游原文（见 _describe_hint）
+    assert hit[0]["hint"] == "attribute_read_permission"
+    assert "description" not in hit[0]
 
 
 @patch.dict(lh.os.environ, ENV)
@@ -571,3 +572,50 @@ def test_upstream_error_also_logged(capsys):
     out = capsys.readouterr().out
     assert "token_exchange_upstream_error" in out
     assert "invalid_client" in out
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_upstream_error_description_is_never_logged_verbatim(capsys):
+    """**上游回显是真实的泄漏渠道**：Cognito 会把请求值写进 error_description。
+
+    实测探针拿到过 `bad code <授权码> for user <邮箱>`——原样记录等于把授权码
+    与邮箱一起写进 CloudWatch，而日志保留期远长于授权码寿命。
+    上一版的测试只断言"本地传给 _post_token 的 code 不在日志里"，
+    完全没覆盖这条路径，所以泄漏照样通过了测试。
+    """
+    state, pkce = _login_state_and_cookie()
+    secret_code = "AUTH_CODE_MUST_NOT_LEAK"
+    victim = "victim@corp.example.com"
+    with patch.object(lh.urllib.request, "urlopen",
+                      side_effect=_http_error(
+                          400, "invalid_grant",
+                          body_desc=f"bad code {secret_code} for user {victim}")):
+        lh.handler(_event("/callback", {"code": secret_code, "state": state},
+                          cookies=[pkce]), None)
+    out = capsys.readouterr().out
+    assert secret_code not in out, "上游回显的授权码进了日志"
+    assert victim not in out, "上游回显的邮箱进了日志"
+    assert "bad code" not in out                      # 原文整体不得出现
+
+
+@pytest.mark.parametrize("desc,expected", [
+    ("client is not authorized to read email_verified", "attribute_read_permission"),
+    ("Client 1a2b is not authorized", "client_config"),
+    ("redirect_uri mismatch", "redirect_uri"),
+    ("Authorization code has expired", "code_state"),
+    ("something entirely new from AWS", "other"),
+    ("", ""),
+])
+def test_describe_hint_maps_to_fixed_vocabulary(desc, expected):
+    """分类值必须来自固定表——上游改文案时进日志的仍只有这几个常量。"""
+    assert lh._describe_hint(desc) == expected
+
+
+def test_describe_hint_never_returns_input_substring():
+    """兜底断言：任何输入都不能让原文片段流出（"other" 之外无自由文本）。"""
+    probes = ["secret-token-abc123", "user@example.com",
+              "https://evil.example/callback?code=xyz"]
+    for p in probes:
+        out = lh._describe_hint(p)
+        assert out in {lbl for lbl, _ in lh._HINT_PATTERNS} | {"other", ""}
+        assert p not in out

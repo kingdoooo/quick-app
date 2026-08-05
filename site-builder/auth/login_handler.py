@@ -222,14 +222,42 @@ def _post_token(code: str, verifier: str) -> dict:
             # "invalid_grant 突然高频"这条曲线可被告警发现。
             # 单个用户重放 = 偶发几条；配置写坏 = 每次登录一条，形态完全不同。
             _log_auth_failure("token_exchange_invalid_grant", error=err,
-                              description=desc, status=e.code)
+                              hint=_describe_hint(desc), status=e.code)
             raise TokenExchangeRejected(
                 f"授权码不可用（{err}）: {e.code}") from e
         # 其余 4xx 与全部 5xx 一律上抛成平台故障：宁可 502 告警，
         # 也不要把"secret 过期了"显示成"请重新登录"。
         _log_auth_failure("token_exchange_upstream_error", error=err,
-                          description=desc, status=e.code)
+                          hint=_describe_hint(desc), status=e.code)
         raise
+
+
+# error_description 里出现这些子串时，归成一个**固定词汇**的分类值。
+# 只用于把"配置写坏"与"用户重放"分开，不承载上游原文。
+_HINT_PATTERNS = (
+    ("attribute_read_permission", ("email_verified", "read attribute",
+                                   "not authorized to read")),
+    ("client_config", ("client", "grant type", "unauthorized_client")),
+    ("redirect_uri", ("redirect",)),
+    ("code_state", ("code", "expired", "consumed", "already")),
+)
+
+
+def _describe_hint(description: str) -> str:
+    """把上游 error_description 压成固定词汇的分类，**绝不回传原文**。
+
+    为什么不能记原文（实测踩过）：Cognito 会在 error_description 里回显请求值，
+    探针里出现过 `bad code <授权码> for user <邮箱>`——授权码与邮箱一起进了
+    CloudWatch，而日志保留期远长于授权码寿命。error_description 还可能带
+    redirect URI、client 信息等。而告警**只依赖频率**，原文对它没有价值。
+    分类值取自上面的固定表，未命中一律 "other"：即便上游改文案，
+    进日志的也只有这几个常量之一。
+    """
+    low = (description or "").lower()
+    for label, needles in _HINT_PATTERNS:
+        if any(n in low for n in needles):
+            return label
+    return "other" if low else ""
 
 
 def _log_auth_failure(event_type: str, **fields) -> None:
@@ -238,7 +266,11 @@ def _log_auth_failure(event_type: str, **fields) -> None:
     为什么是结构化而不是 print 文本：这条日志的用途是**发现配置事故**——
     对 `event="token_exchange_invalid_grant"` 建 metric filter + 阈值告警，
     高频即代表 app client 属性权限被写坏（而非用户重放）。文本日志做不到
-    可靠聚合。不要在这里放 code / token / cookie 等敏感值。
+    可靠聚合。
+
+    **只允许放固定词汇/枚举值，绝不放上游原文或任何请求值**：
+    code / token / cookie / 邮箱 / redirect URI 都不行。上游回显是真实存在的
+    泄漏渠道（见 _describe_hint）。新增字段前先问"这个值的取值集合是否有限"。
     """
     try:
         print(json.dumps({"event": event_type, **fields}, ensure_ascii=False))
