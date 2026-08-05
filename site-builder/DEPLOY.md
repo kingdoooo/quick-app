@@ -203,6 +203,76 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
 
 ---
 
+## 二期（M1+M2）相对一期的部署差异 —— 先读这节
+
+一期的 ①-⑦ 仍然成立，但二期改了身份层的建法并新增了两个一次性动作。
+**下面几项没做完，二期的安全边界就没生效**（代码里全绿的测试覆盖不到这些）：
+
+1. **身份层改用脚本，不再手工建 pool**（替代 ① 的手工命令）：
+
+   ```bash
+   # 先在 site-builder/config.ini 填好 [IdP] 段（provider_name/issuer/client_id/
+   # client_secret），再跑。幂等可重跑。
+   python3 site-builder/scripts/deploy_pool.py
+   ```
+
+   它建平台专用 pool（关自注册 + ESSENTIALS tier）、site/mcp 两个 app client
+   （**不列 COGNITO**，只列你的 IdP）、branding、OIDC 联邦（含
+   `email_verified` 映射）、pre-token 触发器，并把 client secret 写进 SSM。
+   跑完回填 `[Cognito]` 四项。
+
+   ⚠️ **接 IdP 前先确认**：平台的授权主键是 email（owner/allowed_users/会话
+   claim 全用它），而联邦映射进 Cognito 的 email 默认是 unverified。因此 IdP
+   必须满足「邮箱由组织分配、用户不可自改、不被回收再分配」——允许用户自设
+   邮箱的 IdP 上，攻击者改个 email 就能继承他人站点权限。详见
+   `config.ini.example` 的 `[IdP]` 注释。
+
+2. **存量站点权限迁移**（一期站点在 sites 表没有权限字段，不迁移则
+   `role_of` 判不出 owner）：
+
+   ```bash
+   python3 site-builder/scripts/migrate_permissions.py           # dry-run，先看报告
+   python3 site-builder/scripts/migrate_permissions.py --apply
+   ```
+
+   dry-run 是唯一的人工审查关口——它逐条打印「将写什么值 / 保留哪些在线值」。
+   报告里出现 `问题:` 的站点一律跳过未写，需要人工判断原意后手工修，
+   **脚本绝不会自动把无法解析的名单降级成 `org`**（那是扩权）。
+
+3. **`router/config.ini` 必须补两个键**（在 `[SiteBuilder]` 段）：
+
+   ```ini
+   require_idp_claim = false   # 全体用户在新 pool 重新登录后再翻 true
+   trusted_idps =             # Cognito 里的 provider name，逗号分隔
+   ```
+
+   两个键都是必填：缺键时 CDK synth 直接 `NoOptionError` 报错（响亮失败，
+   不会把占位符部署出去）。**值里不要写行内注释**——configparser 会把
+   `true  # 注释` 整串读进来，`require_idp_claim` 因此变成 false（防线静默
+   关闭），`trusted_idps` 则被污染成没有任何 idp 能匹配（开关为 true 时
+   = 全站锁死）。stack.py 对这两种情况都有断言。
+
+   翻 `true` 的时机：切到专用 pool **且全体用户重新登录过**之后。存量会话
+   没有 idp claim，提前翻会把他们全部 302 到登录页。
+
+4. **admin 种子**：`site-builder/config.ini` 的 `admin_seed` 填第一个管理员
+   邮箱，然后跑脚本注入（**CDK 只建 site-admins 表，不会写入任何管理员**）：
+
+   ```bash
+   python3 site-builder/scripts/seed_admin.py           # dry-run
+   python3 site-builder/scripts/seed_admin.py --apply
+   ```
+
+   这一步漏掉的后果不易察觉：表存在、部署全绿，但**谁都不是 admin**——
+   owner 离职或误撤自己权限的站点没有代管入口，而「添加管理员」本身需要
+   admin 权限，从 UI 加不了第一个（死锁）。脚本幂等，可重跑。
+
+5. **翻开 Edge 开关后复验**：`require_idp_claim = true` 重部署 Edge 需要
+   10-20 分钟全球复制，**回滚同样慢**——翻之前先确认 `trusted_idps` 的值与
+   Cognito 里的 provider name 逐字符一致。
+
+---
+
 ## ① 身份层（Task 3）
 
 **产出**：Cognito User Pool + 上游 IdP 联邦；回填 `config.ini [Cognito]` 全部 4 项。
@@ -297,11 +367,15 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
      --allowed-o-auth-flows-user-pool-client \
      --supported-identity-providers {idp_name} \
      --callback-urls https://auth.{base_domain}/callback \
-     --logout-urls https://auth.{base_domain}/logout \
+     --logout-urls https://auth.{base_domain}/logged-out https://auth.{base_domain}/logout \
      --query 'UserPoolClient.ClientId' --output text
    # → 输出的 ClientId 回填 [Cognito] site_client_id
-   # （--logout-urls 当前代码用不到：/logout 只清本地 cookie 不跳 Cognito 全局登出；
-   #   先登记好，二期接全局登出时免改配置）
+   # （二期起 /logout 会 302 到 Cognito 的 /logout?logout_uri=…/logged-out
+   #   结束托管登录会话，所以 **/logged-out 必须登记**——Cognito 只接受已登记的
+   #   sign-out URL。**不要把 logout_uri 指向 /logout 本身**：会被打回同一分支，
+   #   无限重定向。注意效力边界：Cognito 的 /logout 不登出上游 IdP（飞书会话仍在），
+   #   所以 UI 文案不能承诺"已完全退出"。二期起本脚本改用 scripts/deploy_pool.py，
+   #   它已按上述形态登记两个 URL。）
 
    # MCP client（AgentCore 用，public client 不加 --generate-secret）。
    # 第二条 localhost 回调是给 Claude Code 等本机 MCP 客户端的 OAuth 用的
@@ -587,7 +661,11 @@ AgentCore 校验不认。`deploy_agentcore.py` 已带 `--provenance=false` 规�
 手工构建镜像时必须同样加上该参数。
 
 **冒烟**：`npx @modelcontextprotocol/inspector` 连 endpoint（带 Cognito Bearer token），
-确认列出 5 工具、无 token 返回 401、`list_my_sites` 的 owner == 登录用户飞书邮箱。
+确认列出 8 工具、无 token 返回 401、`list_my_sites` 的 owner == 登录用户飞书邮箱。
+八个工具 = 一期五个（`deploy_site` / `confirm_upload` / `get_deploy_status` /
+`list_my_sites` / `undeploy_site`）+ 二期权限三件套（`update_site_permissions` /
+`manage_collaborators` / `get_site_permissions`）。工具面由
+`mcp/tests/test_agentcore_contract.py` 的 `EXPECTED_TOOLS` 锁定。
 
 **token 形态已真机钉死（2026-07-29）**：网关配 `allowedClients` 时只接受
 **access token**（id_token 会 401 "Claim 'client_id' value mismatch"，因为
@@ -595,7 +673,8 @@ id_token 用 `aud` 而非 `client_id`），MCP 客户端按 OAuth 规范发的�
 access token。而 Cognito access token 默认不含 email，所以 **email 注入靠
 pre-token-generation V2 Lambda**（`auth/pre_token_email.py` → 函数
 `site-auth-pre-token`，挂在用户池 LambdaConfig，V2_0，要求 Essentials+ tier）。
-真机验证过：5 工具列出、无 token 401、owner == 登录用户邮箱、跨用户查 job 被拒。
+真机验证过（一期，5 工具时）：工具列出、无 token 401、owner == 登录用户邮箱、
+跨用户查 job 被拒。二期新增的三个权限工具尚未真机验证（Task 12）。
 **不要**改 `allowedAudience`——那会反过来把 access token 拒掉。
 详见 `mcp/AGENTCORE-SPIKE.md` §7 与 `docs/client-setup.md`。
 
