@@ -619,3 +619,70 @@ def test_describe_hint_never_returns_input_substring():
         out = lh._describe_hint(p)
         assert out in {lbl for lbl, _ in lh._HINT_PATTERNS} | {"other", ""}
         assert p not in out
+
+
+# --- 日志的**每个**字段都必须是固定词汇（Codex re-review P2） ---
+# 上一版只收口了 error_description，把 error 原样记录了：探针实证
+# {"error": "custom_AUTH_CODE_LEAKS_VIA_ERROR_FIELD"} 会整串进日志。
+# 教训是别再逐字段收口——下面按"整行输出里不得出现任何注入串"来断言。
+
+@pytest.mark.parametrize("field", ["error", "error_description"])
+def test_no_upstream_field_reaches_log_verbatim(capsys, field):
+    """把哨兵串分别注入 error / error_description，整行日志都不得出现它。"""
+    sentinel = "SENTINEL_MUST_NOT_APPEAR_9f3a"
+    body = {"error": "invalid_grant", "error_description": "safe"}
+    body[field] = (sentinel if field == "error"
+                   else f"leaked {sentinel} here")
+    with patch.dict(lh.os.environ, ENV):
+        state, pkce = _login_state_and_cookie()
+        import io, json as _json, urllib.error
+        err = urllib.error.HTTPError(
+            "https://sso/oauth2/token", 400, "Bad", {},
+            io.BytesIO(_json.dumps(body).encode()))
+        with patch.object(lh.urllib.request, "urlopen", side_effect=err):
+            try:
+                lh.handler(_event("/callback", {"code": "x", "state": state},
+                                  cookies=[pkce]), None)
+            except urllib.error.HTTPError:
+                pass        # error 被压成 other → 走上抛分支，符合预期
+    assert sentinel not in capsys.readouterr().out
+
+
+def test_every_logged_value_is_from_a_fixed_vocabulary(capsys):
+    """兜底：日志里除 status 外的每个值都必须能在固定集合里找到。
+
+    这条断言的形态很重要——它对**新增字段**也生效。逐字段写断言时，
+    下一个人加一个字段就又开了一个泄漏口。
+    """
+    import json as _json
+    allowed = (lh._KNOWN_OAUTH_ERRORS
+               | {lbl for lbl, _ in lh._HINT_PATTERNS}
+               | {"other", "",
+                  "token_exchange_invalid_grant", "token_exchange_upstream_error"})
+    with patch.dict(lh.os.environ, ENV):
+        state, pkce = _login_state_and_cookie()
+        with patch.object(lh.urllib.request, "urlopen",
+                          side_effect=_http_error(400, "invalid_grant",
+                                                  body_desc="whatever text")):
+            lh.handler(_event("/callback", {"code": "x", "state": state},
+                              cookies=[pkce]), None)
+    for line in capsys.readouterr().out.splitlines():
+        if not line.startswith("{"):
+            continue
+        for key, val in _json.loads(line).items():
+            if key == "status":
+                assert isinstance(val, int)
+                continue
+            assert val in allowed, f"{key}={val!r} 不在固定词汇集合里"
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("invalid_grant", "invalid_grant"),
+    ("invalid_client", "invalid_client"),
+    ("slow_down", "slow_down"),
+    ("some_new_aws_code", "other"),
+    ("<script>alert(1)</script>", "other"),
+    ("", ""),
+])
+def test_safe_error_whitelists(raw, expected):
+    assert lh._safe_error(raw) == expected

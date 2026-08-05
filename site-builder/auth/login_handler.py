@@ -221,15 +221,41 @@ def _post_token(code: str, verifier: str) -> dict:
             # 不猜：仍返回用户可读的 400，但**必须留下结构化日志**，让
             # "invalid_grant 突然高频"这条曲线可被告警发现。
             # 单个用户重放 = 偶发几条；配置写坏 = 每次登录一条，形态完全不同。
-            _log_auth_failure("token_exchange_invalid_grant", error=err,
+            _log_auth_failure("token_exchange_invalid_grant",
+                              error=_safe_error(err),
                               hint=_describe_hint(desc), status=e.code)
             raise TokenExchangeRejected(
                 f"授权码不可用（{err}）: {e.code}") from e
         # 其余 4xx 与全部 5xx 一律上抛成平台故障：宁可 502 告警，
         # 也不要把"secret 过期了"显示成"请重新登录"。
-        _log_auth_failure("token_exchange_upstream_error", error=err,
+        _log_auth_failure("token_exchange_upstream_error",
+                          error=_safe_error(err),
                           hint=_describe_hint(desc), status=e.code)
         raise
+
+
+# RFC 6749 §5.2 + Cognito token 端点实际会返回的 error code 全集。
+# **日志只允许出现这里面的值或 "other"**：`error` 字段同样来自上游 JSON，
+# 上一版只把 error_description 收口了，却把 error 原样记录——探针实证
+# `{"error": "custom_AUTH_CODE_LEAKS_VIA_ERROR_FIELD"}` 会整串进日志，
+# 违反 _log_auth_failure 自己的约定。规范上 error 不该含请求值，但"规范上
+# 不该"不是实现保证：网关/代理/未来版本都可能塞别的东西进去。
+_KNOWN_OAUTH_ERRORS = frozenset({
+    "invalid_request", "invalid_client", "invalid_grant",
+    "unauthorized_client", "unsupported_grant_type", "invalid_scope",
+    "slow_down", "access_denied", "server_error",
+    "temporarily_unavailable",
+})
+
+
+def _safe_error(error: str) -> str:
+    """把上游 error 收口到已知词汇；未知值一律压成 "other"。
+
+    分类信息不丢：告警按 event + error 聚合，而 Cognito 正常只会返回
+    _KNOWN_OAUTH_ERRORS 里的值。真出现 "other" 本身就是值得查的信号
+    （上游返回了非规范 error code），此时去看它对应的 HTTP status。
+    """
+    return error if error in _KNOWN_OAUTH_ERRORS else ("other" if error else "")
 
 
 # error_description 里出现这些子串时，归成一个**固定词汇**的分类值。
