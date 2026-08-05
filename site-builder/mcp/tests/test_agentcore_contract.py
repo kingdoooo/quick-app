@@ -515,11 +515,11 @@ def test_no_latest_tag_anywhere():
 
 
 def test_image_tag_is_traceable_to_a_commit():
-    """tag 必须能对回提交；工作区脏时要在 tag 里体现（不可复现的部署）。"""
+    """tag 必须能对回提交；输入未提交时用 wip-<内容 hash> 区分（且唯一）。"""
     src = (MCP_DIR / "deploy_agentcore.py").read_text()
-    block = src[src.index("def image_tag"):src.index("def resolve_digest")]
+    block = src[src.index("def image_tag"):src.index("def find_image_digest")]
     assert "rev-parse" in block
-    assert "dirty" in block
+    assert "wip-" in block and "git-" in block
 
 
 def test_runtime_is_deployed_by_digest_not_tag():
@@ -565,3 +565,86 @@ def test_mcp_pinned_within_tested_major_version():
     lock = (MCP_DIR / "requirements.txt").read_text()
     m = re.search(r"^mcp==(\d+)\.", lock, re.M)
     assert m and m.group(1) == "1", f"锁定到了未验证的主版本: {m and m.group(0)}"
+
+
+# --- IMMUTABLE 仓库下的幂等性（Codex re-review P1） ---
+# 上一版用 `git status --porcelain` 判全仓库脏，于是任何无关改动（本仓库长期
+# 保留未跟踪的 docs/design/）都让 tag 变成固定的 `-dirty`——而 IMMUTABLE 仓库
+# 不允许覆盖同名 tag，第二次运行必然 ImageTagAlreadyExistsException，
+# 脚本 docstring 承诺的"幂等可重跑"随之失效。
+
+def test_dirty_detection_only_considers_build_inputs():
+    """无关文件（文档、别的包、未跟踪目录）不得影响 tag。"""
+    import deploy_agentcore as da
+    for rel in da._BUILD_INPUTS:
+        assert rel.startswith(("mcp/", "deployer/functions/")), rel
+    # Dockerfile 真正 COPY 的东西必须都在清单里
+    df = (MCP_DIR / "Dockerfile").read_text()
+    for name in ("requirements.txt", "server.py"):
+        assert f"mcp/{name}" in da._BUILD_INPUTS, name
+        assert name in df
+    # 复制进上下文的两个外部文件同样是输入
+    assert "deployer/functions/common.py" in da._BUILD_INPUTS
+    assert "deployer/functions/permissions.py" in da._BUILD_INPUTS
+    # 不得再用全仓库 status 判脏
+    src = (MCP_DIR / "deploy_agentcore.py").read_text()
+    fn = src[src.index("def build_inputs_fingerprint"):src.index("def image_tag")]
+    assert "status" not in fn, "dirty 判定不能用 git status（会被无关文件污染）"
+
+
+def test_wip_tag_varies_with_content_not_a_fixed_suffix():
+    """固定的 `-dirty` 后缀会让两次不同改动共用一个 tag → 撞 IMMUTABLE。"""
+    src = (MCP_DIR / "deploy_agentcore.py").read_text()
+    fn = src[src.index("def build_inputs_fingerprint"):src.index("def image_tag")]
+    assert "sha256" in fn, "dirty 后缀必须是输入内容 hash"
+    tag_fn = src[src.index("def image_tag"):src.index("def find_image_digest")]
+    assert '"-dirty"' not in tag_fn
+
+
+def test_existing_tag_is_reused_instead_of_repushed():
+    """同一份输入重跑必须复用已有镜像，不能再 push。"""
+    src = (MCP_DIR / "deploy_agentcore.py").read_text()
+    main = src[src.index("def main()"):]
+    assert "find_image_digest(tag)" in main
+    # 复用分支必须在 build_and_push 之前判掉
+    assert main.index("elif existing") < main.index("build_and_push(image_uri)")
+
+
+def test_find_image_digest_tolerates_missing_tag_and_repo():
+    """查不到不是异常路径——首次部署时仓库和 tag 都不存在。"""
+    src = (MCP_DIR / "deploy_agentcore.py").read_text()
+    fn = src[src.index("def find_image_digest"):src.index("def resolve_digest")]
+    assert "ImageNotFoundException" in fn
+    assert "RepositoryNotFoundException" in fn
+    assert "return None" in fn
+
+
+def test_dirty_build_is_refused_by_default():
+    """TCB 的镜像默认必须能对回提交；联调要显式 --allow-dirty。"""
+    src = (MCP_DIR / "deploy_agentcore.py").read_text()
+    assert "--allow-dirty" in src
+    main = src[src.index("def main()"):]
+    assert "sys.exit(" in main[main.index('tag.startswith("wip-")'):]
+
+
+def test_skip_build_fails_loudly_when_tag_absent():
+    """改过构建输入后加 --skip-build 会指向不存在的 tag，必须明确失败。"""
+    src = (MCP_DIR / "deploy_agentcore.py").read_text()
+    main = src[src.index("def main()"):]
+    seg = main[main.index("if args.skip_build"):main.index("elif existing")]
+    assert "sys.exit(" in seg
+
+
+def test_container_runs_as_non_root():
+    """TCB 容器持有能管理全部站点的角色凭证，不该以 root 跑（AgentCore 安全指引）。
+
+    真机已验证：uid=10001(appuser)，且仍能绑 0.0.0.0:8000
+    （8000 > 1024，非特权用户可直接绑定——这是能降权的前提）。
+    """
+    df = (MCP_DIR / "Dockerfile").read_text()
+    assert re.search(r"^USER\s+10001", df, re.M), "必须显式降权到非 root"
+    assert "useradd" in df and "10001" in df
+    # 降权必须发生在 COPY 之后（否则应用文件属主不对）
+    assert df.index("COPY server.py") < df.index("USER 10001")
+    # chown 让应用目录归该用户，否则 WORKDIR 下不可写会有隐性问题
+    assert "chown" in df

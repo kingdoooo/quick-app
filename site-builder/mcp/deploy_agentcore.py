@@ -81,23 +81,76 @@ def ensure_repo() -> str:
     return uri
 
 
+# 真正进入镜像的文件（Dockerfile 的 COPY + build_and_push 复制进上下文的两个）。
+# **dirty 判定只看这些**：拿 `git status --porcelain` 判全仓库会让任何无关改动
+# （文档、别的包、未跟踪目录）都把镜像标成 dirty——实测本仓库长期保留未跟踪的
+# docs/design/，于是每次构建都是 dirty tag，而 IMMUTABLE 仓库下同名 tag
+# 第二次 push 直接 ImageTagAlreadyExistsException，"幂等可重跑"随之失效。
+_BUILD_INPUTS = ("mcp/Dockerfile", "mcp/requirements.txt", "mcp/server.py",
+                 "deployer/functions/common.py",
+                 "deployer/functions/permissions.py")
+
+
+def _git(*args: str) -> str:
+    return subprocess.run(["git", *args], capture_output=True, text=True,
+                          cwd=HERE).stdout.strip()
+
+
+def build_inputs_fingerprint() -> str:
+    """构建输入的内容指纹；全部已提交且与 HEAD 一致时返回 ""。
+
+    返回非空表示"这次构建的输入不等于 HEAD 里的版本"，值是**输入内容的 hash**
+    而不是固定的 `-dirty`：固定后缀会让两次不同的未提交改动共用一个 tag，
+    在 IMMUTABLE 仓库下第二次 push 失败，而且 tag 也不再对应唯一的镜像内容。
+    """
+    import hashlib
+    h = hashlib.sha256()
+    dirty = False
+    for rel in _BUILD_INPUTS:
+        path = HERE.parent / rel
+        blob = path.read_bytes() if path.exists() else b""
+        h.update(rel.encode() + b"\0" + blob + b"\0")
+        # 与 HEAD 里的同一路径比对：只要有一个不同就算未提交构建
+        committed = subprocess.run(
+            ["git", "show", f"HEAD:site-builder/{rel}"],
+            capture_output=True, cwd=HERE)
+        if committed.returncode != 0 or committed.stdout != blob:
+            dirty = True
+    return h.hexdigest()[:12] if dirty else ""
+
+
 def image_tag() -> str:
-    """本次构建的唯一 tag：`git-<短 sha>[-dirty]`。
+    """本次构建的唯一 tag：`git-<短 sha>` 或 `wip-<输入指纹>`。
 
     **不能再用 `latest`**：IMMUTABLE 仓库下它第二次就 push 不上去，而更重要的是
-    固定 tag 让"线上跑的是哪份代码"无法回答。带 sha 的 tag 把镜像与提交对上，
-    dirty 后缀则暴露"用未提交的工作区构建"这种不可复现的部署。
+    固定 tag 让"线上跑的是哪份代码"无法回答。
+
+    构建输入全部已提交 → `git-<sha>`，可直接对回提交。
+    有未提交改动 → `wip-<输入内容 hash>`：仍然唯一（不同改动不同 tag，
+    不会撞 IMMUTABLE），且一眼能看出这不是一个可复现的正式镜像。
+    """
+    sha = _git("rev-parse", "--short=12", "HEAD")
+    if not sha:
+        sys.exit("拿不到 git sha——镜像 tag 必须可追溯到提交，请在仓库内运行")
+    fingerprint = build_inputs_fingerprint()
+    return f"wip-{fingerprint}" if fingerprint else f"git-{sha}"
+
+
+def find_image_digest(tag: str) -> str | None:
+    """tag 已存在则返回其 digest，否则 None。
+
+    幂等的关键：IMMUTABLE 仓库不允许覆盖同名 tag，所以**构建前先查**。
+    已存在说明这份输入的镜像早就推上去了，直接复用它的 digest——重跑脚本
+    因此变成"确认 runtime 指向正确的 digest"，而不是"再 push 一次然后失败"。
     """
     try:
-        sha = subprocess.run(["git", "rev-parse", "--short=12", "HEAD"],
-                             capture_output=True, text=True, check=True,
-                             cwd=HERE).stdout.strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        sys.exit("拿不到 git sha——镜像 tag 必须可追溯到提交，请在仓库内运行")
-    dirty = subprocess.run(["git", "status", "--porcelain"],
-                           capture_output=True, text=True,
-                           cwd=HERE).stdout.strip()
-    return f"git-{sha}" + ("-dirty" if dirty else "")
+        resp = ecr.describe_images(repositoryName=REPO,
+                                   imageIds=[{"imageTag": tag}])
+    except (ecr.exceptions.ImageNotFoundException,
+            ecr.exceptions.RepositoryNotFoundException):
+        return None
+    details = resp.get("imageDetails") or []
+    return details[0]["imageDigest"] if details else None
 
 
 def resolve_digest(tag: str) -> str:
@@ -107,9 +160,10 @@ def resolve_digest(tag: str) -> str:
     IMMUTABLE 已经挡住覆盖 push，但 digest 让"runtime 到底在跑哪个字节序列"
     变成可验证的事实，而不是依赖仓库策略没被改过。
     """
-    resp = ecr.describe_images(repositoryName=REPO,
-                              imageIds=[{"imageTag": tag}])
-    return resp["imageDetails"][0]["imageDigest"]
+    digest = find_image_digest(tag)
+    if not digest:
+        sys.exit(f"push 后仍查不到 tag {tag} 的 digest——请检查 push 是否真的成功")
+    return digest
 
 
 def build_and_push(image_uri: str) -> None:
@@ -430,6 +484,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--skip-build", action="store_true",
                     help="不重新构镜像，只更新 runtime 配置")
+    ap.add_argument("--allow-dirty", action="store_true",
+                    help="允许用未提交的构建输入构镜像（仅联调；正式部署禁用）")
     args = ap.parse_args()
 
     print("① ECR 仓库（tag 不可变）")
@@ -437,12 +493,34 @@ def main() -> None:
     tag = image_tag()
     image_uri = f"{repo_uri}:{tag}"
     print(f"   {image_uri}")
-    if tag.endswith("-dirty"):
-        print("   ⚠️  工作区有未提交改动：这个镜像无法从提交复现。"
-              "runtime 是 TCB，正式部署请先提交。")
+    if tag.startswith("wip-"):
+        # **默认拒绝，不是警告**：runtime 是 TCB，"线上跑的镜像对不回任何提交"
+        # 这件事不该靠人看见一行 ⚠️ 就自觉处理。想用未提交代码做联调时显式加
+        # --allow-dirty。
+        if not args.allow_dirty:
+            sys.exit(
+                "构建输入有未提交改动，拒绝构建：runtime 是 TCB，正式部署的镜像\n"
+                "必须能对回提交（见 DEPLOY.md「MCP runtime 的信任边界」）。\n"
+                f"改动涉及: {', '.join(_BUILD_INPUTS)} 中的一个或多个\n"
+                "先提交，或联调时显式加 --allow-dirty。")
+        print("   ⚠️  --allow-dirty：这个镜像无法从提交复现，不要用于正式部署。")
 
+    existing = find_image_digest(tag)
     if args.skip_build:
-        print("② 跳过构建（--skip-build）")
+        # --skip-build 只在"这份输入的镜像已经推上去过"时有意义。tag 由构建输入
+        # 决定，所以改过任何构建输入后加 --skip-build 会指向一个不存在的 tag
+        # ——那时应当明确失败，而不是走到 resolve_digest 才报一句含糊的错。
+        if not existing:
+            sys.exit(
+                f"--skip-build 但 ECR 里没有 tag {tag}：\n"
+                "构建输入变了（tag 随输入内容变化），或这份输入从未构建过。\n"
+                "去掉 --skip-build 重跑。")
+        print("② 跳过构建（--skip-build），复用已有镜像")
+    elif existing:
+        # 幂等：IMMUTABLE 仓库不允许覆盖同名 tag，而 tag 已由构建输入唯一确定
+        # ——同一份输入重跑脚本不该再 push（那会 ImageTagAlreadyExistsException）。
+        # 复用已有镜像，本次运行退化成"确认 runtime 指向它"。
+        print(f"② 镜像已存在，复用（tag 由构建输入唯一确定）")
     else:
         print("② 构建并推送 ARM64 镜像")
         build_and_push(image_uri)
