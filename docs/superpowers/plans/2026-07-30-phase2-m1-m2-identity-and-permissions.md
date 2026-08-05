@@ -4599,6 +4599,58 @@ Expected: 成功。若报 `AccessDeniedException`，对照错误里的 action �
 
 改完 IAM 后 `python3 deploy_agentcore.py --skip-build` 重新下发再试。
 
+- [ ] **Step 3b-2: [真机] 属性闸门的负向用例（必须被拒才算生效）**
+
+Step 3b 只证明"允许路径通"。属性白名单是否真的**拦住**越权字段，moto 与
+Stubber 都验不了（前者不执行 IAM 授权，后者只校验请求参数形态）——只有真机
+能证明。**只跑正向用例等于没验这道闸门**：白名单写错、`Null` 检查漏掉、
+或 `dynamodb:Attributes` 收到的是别名而非真实属性名，正向路径全都照样通过。
+
+用 MCP runtime 角色的身份（`aws sts assume-role --role-arn
+arn:aws:iam::<account>:role/site-mcp-runtime-role …`，或在容器里跑）：
+
+Run:
+```bash
+SITE=<一个真实 site_id>
+SUB=app-$SITE
+# ① 越权改 sites 的部署链字段 —— 必须 AccessDenied
+aws dynamodb update-item --table-name site-sites \
+  --key "{\"site_id\":{\"S\":\"$SITE\"}}" \
+  --update-expression 'SET data_tables = :v' \
+  --expression-attribute-values '{":v":{"L":[{"S":"evil"}]}}' ; echo "exit=$?"
+# ② 越权改路由指向 —— 必须 AccessDenied
+aws dynamodb update-item --table-name <routing_table> \
+  --key "{\"subdomain\":{\"S\":\"$SUB\"}}" \
+  --update-expression 'SET api_target = :v' \
+  --expression-attribute-values '{":v":{"S":"https://evil.example"}}' ; echo "exit=$?"
+# ③ 正常权限投影 —— 必须成功（证明闸门没有过紧）
+aws dynamodb update-item --table-name <routing_table> \
+  --key "{\"subdomain\":{\"S\":\"$SUB\"}}" \
+  --update-expression 'SET require_auth = :v' \
+  --expression-attribute-values '{":v":{"BOOL":true}}' ; echo "exit=$?"
+# ④ 读路径没被闸门误伤 —— 必须成功（不带 ProjectionExpression 的 Query）
+aws dynamodb query --table-name site-sites --index-name owner-index \
+  --key-condition-expression 'owner = :o' \
+  --expression-attribute-values '{":o":{"S":"<你的邮箱>"}}' >/dev/null; echo "exit=$?"
+```
+Expected: ① ② 报 `AccessDeniedException`（exit≠0）；③ ④ 成功（exit=0）。
+
+- ① 或 ② **成功**了 → 闸门没生效。最可能是 `dynamodb:Attributes` 条件没下发
+  （`aws iam get-role-policy --role-name site-mcp-runtime-role
+  --policy-name mcp-scope` 看 Condition 是否在），或白名单被人放宽了。
+  这是 P0 级：此时 runtime 可篡改部署状态与路由指向。
+- ③ 失败 → 白名单少字段。**注意报错是 `AccessDeniedException` 而不是
+  `TransactionCanceledException`**，别误判成并发冲突。对照
+  `ROUTE_PROJECTION_ATTRIBUTES` 补齐。
+- ④ 失败 → 读侧被加了 `Attributes`/`Null` 条件。Query/Scan 不带
+  `ProjectionExpression` 时请求上下文没有 `dynamodb:Attributes`，
+  `Null` 检查会把它拒掉。读写必须是两个独立 statement。
+
+**同时确认这条不变量**：`owner` 在白名单内是**有意的**（建站与
+transfer_owner 都要写它），所以"改 owner 接管站点"这条路径 IAM 关不掉——
+它由应用层与 runtime 完整性负责，见 DEPLOY.md「MCP runtime 的信任边界」。
+不要因为本步骤而把 `owner` 从白名单删掉：那会让建站在线上直接 AccessDenied。
+
 - [ ] **Step 3: [真机] 在线改权限并验证生效**
 
 对一个真实鉴权站点（如一期的 `team-reading-list-*`），调用 `update_site_permissions(site_id, allowed_users=["<你的邮箱>"])`。
@@ -6666,6 +6718,36 @@ Expected: payload 含 `email` 与 **`idp`**（值为 IdP provider 名，如 `Fei
 后看 CloudWatch 日志），按实测调 `_provider_name`。**把结论写进 DEPLOY.md**
 ——这是 spec §10 的 spike 4。
 
+- [ ] **Step 6b-2: [真机] `email_verified` 的值与 JSON 类型（两类 token 都要验）**
+
+`email_verified` 是授权主键 email 的可信度依据，也是 auth `/callback` 与 MCP
+`_caller_email()` 两处 fail-closed 检查读的 claim。它有两个只能在真机暴露的
+失败模式：**access token 里缺这个 claim**（Cognito 默认只放 id_token，靠
+pre-token 触发器注入；漏了就是所有 MCP 调用被拒），以及**类型写成字符串**
+（OIDC Core 定义该 claim 为 boolean；本项目 `_is_verified()` 兼容字符串，
+所以单测发现不了，但严格的 OIDC consumer 可能拒绝该 token）。
+
+Run（把 id_token 与 access token 各跑一次）：
+```bash
+python3 -c "
+import base64, json, sys
+tok = sys.argv[1].split('.')[1]
+c = json.loads(base64.urlsafe_b64decode(tok + '=' * (-len(tok) % 4)))
+v = c.get('email_verified', '<MISSING>')
+print('email_verified =', repr(v), ' type =', type(v).__name__)
+assert v is True, f'必须是 JSON true（当前 {v!r} / {type(v).__name__}）'
+print('OK')" '<token>'
+```
+Expected: **两类 token 都** 打印 `email_verified = True  type = bool` 并 `OK`。
+
+- `type = str`（拿到 `'true'`）→ pre-token 写成了字符串。这正是二期修过的
+  缺陷，回归即说明 `pre_token_email.py` 被改回 `str(...).lower()`。
+- access token 里 `<MISSING>` → 触发器没把它注入 access 容器，此时 MCP 侧
+  fail-closed 会拒掉**所有**调用；先查 CloudWatch 里触发器是否被调用。
+- `False` → IdP 没给 `email_verified`，或 `map_email_verified` 被关掉。
+  此时不要为了跑通去关 `require_email_verified`——那是把授权主键的可信度
+  整条防线关掉，先确认 IdP 侧为何不发该 claim。
+
 - [ ] **Step 6c: [真机] Edge 的 `idp` 校验与开关翻转**
 
 `REQUIRE_IDP_CLAIM` 的翻转属于本模块的验收项（Edge 侧代码在 M1 的 Edge 改动
@@ -6996,6 +7078,53 @@ cd site-builder/deployer && .venv/bin/pytest tests -q
 cd site-builder/mcp && python3 -m pytest tests -q
 ```
 Expected: 全部 PASS。记录每个包的测试数（contract 应仍是 67；其余各有增长）。
+
+- [ ] **Step 1-obs: [真机] 登录失败告警端到端可用（不只是"metric filter 建了"）**
+
+`invalid_grant` 既表示"用户重放授权码"，也表示"app client 缺少 scope 所需的
+属性读取权限"——后者是**每个用户每次登录都失败**的配置事故，而两者在响应里
+无法可靠区分，所以代码统一返回 400。**唯一的发现手段是频率告警**，因此
+"日志打了"不算验收完成，必须证明 metric 真的动、alarm 真的响。
+
+Run:
+```bash
+# ① metric filter 与 alarm 都存在
+aws logs describe-metric-filters --region us-east-1 \
+  --log-group-name /aws/lambda/site-auth-service \
+  --filter-name-prefix auth-invalid-grant
+aws cloudwatch describe-alarms --region us-east-1 \
+  --alarm-names site-builder-auth-invalid-grant
+
+# ② 注入一条合成失败：带一个已用过/伪造的 code 访问 callback
+#    （state/PKCE cookie 不匹配时走的是别的分支，必须用真实登录流程拿到的
+#     state+cookie，再把 code 换成垃圾值）
+curl -s -o /dev/null -w '%{http_code}\n' \
+  --cookie "__Host-sb_pkce=<真实登录流程里的 cookie 值>" \
+  "https://auth.<base_domain>/callback?code=GARBAGE&state=<真实 state>"
+
+# ③ 等 1-2 分钟后确认 metric 有数据点
+aws cloudwatch get-metric-statistics --region us-east-1 \
+  --namespace SiteBuilder --metric-name AuthInvalidGrant \
+  --start-time "$(date -u -v-15M +%Y-%m-%dT%H:%M:%SZ)" \
+  --end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --period 300 --statistics Sum
+```
+Expected: ② 返回 `400`（不是 502）；③ `Datapoints` 非空且 Sum ≥ 1。
+
+- ③ 为空 → metric filter 的 pattern 与实际日志不匹配。用
+  `aws logs filter-log-events --log-group-name /aws/lambda/site-auth-service
+  --filter-pattern '{ $.event = "token_exchange_invalid_grant" }'` 直接验
+  pattern；日志形态见 `login_handler._log_auth_failure`。
+- ② 返回 502 → 4xx 分流回归了（`invalid_grant` 应转 400）。
+
+**阈值要按真实流量定，不要照抄**：DEPLOY.md 给的"5 分钟 ≥ 10 次"是起步值，
+在低流量环境下 100% 登录失败也可能长期达不到 10 次——那种环境应改成
+"5 分钟 ≥ 1 次且连续 2 个周期"或对失败率告警。**把最终阈值与理由写进
+DEPLOY.md**，否则下一个人无法判断这个数字是否适合他的流量。
+
+同时抽查一条日志，确认**没有** code/token/邮箱/redirect URI：
+上游会在 `error_description` 里回显请求值，实现只记固定词汇的 `hint`
+（见 `_describe_hint`），抽查是防回归。
 
 - [ ] **Step 1a: [真机] idp claim 全链路（P0 验收）**
 
