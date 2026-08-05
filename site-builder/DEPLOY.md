@@ -362,6 +362,18 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
      --alarm-actions <SNS topic ARN>
    ```
 
+   **建完用脚本验收**（"日志打了/metric 有点了"不等于"alarm 会响"）：
+
+   ```bash
+   SNS_TOPIC_ARN=<topic ARN> ./site-builder/scripts/verify_auth_alarm.sh
+   ```
+
+   它检查正式配置存在、触发一次真实 `invalid_grant`、**确认日志里出现
+   `token_exchange_invalid_grant`**（不然测到的是 cookie 缺失分支的 400，
+   不是目标逻辑）、建临时 1/1 阈值探针 alarm 验证真的进 ALARM，然后自动清理
+   （trap 保证异常路径也清）。最后一步仍需人工：去 SNS 订阅端确认收到通知——
+   **topic 没有订阅或订阅未确认时 alarm 照样进 ALARM 而无人知情**。
+
    ⚠️ **阈值 10 只是起步值，低流量环境必须调小**：如果日活登录只有几十次，
    "100% 登录失败"也可能 5 分钟凑不满 10 次——告警永不触发，而这正是它要发现
    的事故。这类环境改成 `--threshold 1 --evaluation-periods 2`（连续两个周期
@@ -752,6 +764,27 @@ pre-token-generation V2 Lambda**（`auth/pre_token_email.py` → 函数
 （`dynamodb:Attributes`）只有真机能证伪。
 **不要**改 `allowedAudience`——那会反过来把 access token 拒掉。
 详见 `mcp/AGENTCORE-SPIKE.md` §7 与 `docs/client-setup.md`。
+
+---
+
+### IAM 属性闸门的真机验收（部署完 ⑤ 后跑一次）
+
+MCP runtime 角色靠 `dynamodb:Attributes` 条件把可写字段收窄。**这道闸门只有真机
+能证伪**——moto 不执行 IAM 授权，Stubber 只校验请求参数形态，所以单测全绿不代表
+它生效。
+
+```bash
+./site-builder/scripts/verify_mcp_iam_scope.sh
+```
+
+脚本建一个一次性影子角色（只复制线上策略里的 DynamoDB statements）+ fixture 站点，
+跑四条探针：两条越权写必须被拒、一条正常权限投影必须成功、一条 GSI 读必须不被
+误伤；然后自动删除全部探针资源（`trap` 保证 Ctrl-C 与中途失败也删——残留的影子
+角色就是一条可 assume 的站点管理权限后门）。任一探针不符预期即非零退出。
+
+`owner` 在白名单内是**有意的**（建站与 transfer_owner 都要写它），所以"改 owner
+接管站点"这条路径 IAM 关不掉，由应用层与 runtime 完整性负责（见下面的信任边界
+一节）。不要因为这个脚本把 `owner` 从白名单删掉：那会让建站直接 AccessDenied。
 
 ---
 

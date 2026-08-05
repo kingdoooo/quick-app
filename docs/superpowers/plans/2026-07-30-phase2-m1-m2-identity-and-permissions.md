@@ -4611,106 +4611,35 @@ Stubber 都验不了（前者不执行 IAM 授权，后者只校验请求参数�
 宽也会被 role trust 拒），而 AgentCore managed runtime 没有交互式 shell、
 现有 8 个工具也不能执行任意 DynamoDB 调用。所以要造一个一次性的等价身份：
 
-Run（① 建影子角色：与 runtime 角色**同一份** inline policy，但 trust 指向你自己）:
+Run（**用脚本，不要手抄命令**）:
 ```bash
-ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-ME=$(aws sts get-caller-identity --query Arn --output text)
-# 同一份策略——必须从线上真角色导出，不要手抄，否则验的不是同一套约束
-aws iam get-role-policy --role-name site-mcp-runtime-role \
-  --policy-name mcp-scope --query PolicyDocument > /tmp/mcp-scope.json
-aws iam create-role --role-name site-mcp-iamprobe \
-  --assume-role-policy-document "{\"Version\":\"2012-10-17\",\"Statement\":
-    [{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"$ME\"},
-      \"Action\":\"sts:AssumeRole\"}]}"
-aws iam put-role-policy --role-name site-mcp-iamprobe \
-  --policy-name mcp-scope --policy-document file:///tmp/mcp-scope.json
-sleep 10   # IAM 传播
+./site-builder/scripts/verify_mcp_iam_scope.sh
+# 建/删探针资源想用另一套凭证时（避免覆盖调用者环境）：
+# ADMIN_PROFILE=myadmin ./site-builder/scripts/verify_mcp_iam_scope.sh
 ```
+Expected: 四条探针全部 `PASS`，末尾 `影子角色与 fixture 均已删除` + `结果：全部探针通过`，退出码 0。
 
-Run（② 造一次性 fixture，**不要拿真实站点做实验**）:
-```bash
-SITE=iamprobe-$(date +%s)
-aws dynamodb put-item --table-name site-sites \
-  --item "{\"site_id\":{\"S\":\"$SITE\"},\"owner\":{\"S\":\"probe@example.com\"}}"
-aws dynamodb put-item --table-name <routing_table> \
-  --item "{\"subdomain\":{\"S\":\"app-$SITE\"},\"site_id\":{\"S\":\"$SITE\"},
-           \"require_auth\":{\"BOOL\":true},\"owner\":{\"S\":\"probe@example.com\"}}"
-```
+脚本做的事与手工版的差别（这些差别都是踩过的）：
 
-Run（③ 取影子角色的临时凭证，跑四条探针）:
-```bash
-eval $(aws sts assume-role --role-arn "arn:aws:iam::$ACCOUNT:role/site-mcp-iamprobe" \
-  --role-session-name iamprobe --query Credentials \
-  --output text | awk '{print "export AWS_ACCESS_KEY_ID="$1" AWS_SECRET_ACCESS_KEY="$3" AWS_SESSION_TOKEN="$4}')
-
-probe() {  # $1=说明 $2=期望(deny|allow) 剩余=命令
-  desc="$1"; want="$2"; shift 2
-  out=$("$@" 2>&1); rc=$?
-  if echo "$out" | grep -q "AccessDeniedException"; then got=deny
-  elif echo "$out" | grep -q "ValidationException"; then got=INVALID   # 命令本身写错了
-  elif [ $rc -eq 0 ]; then got=allow
-  else got="OTHER:$(echo "$out" | head -1)"; fi
-  [ "$got" = "$want" ] && echo "PASS  $desc ($got)" || echo "FAIL  $desc 期望=$want 实际=$got"
-}
-
-# ① 越权改 sites 的部署链字段 —— 必须被拒
-probe "sites.data_tables 越权" deny \
-  aws dynamodb update-item --table-name site-sites \
-    --key "{\"site_id\":{\"S\":\"$SITE\"}}" \
-    --update-expression 'SET data_tables = :v' \
-    --expression-attribute-values '{":v":{"L":[{"S":"evil"}]}}'
-# ② 越权改路由指向 —— 必须被拒
-probe "routing.api_target 越权" deny \
-  aws dynamodb update-item --table-name <routing_table> \
-    --key "{\"subdomain\":{\"S\":\"app-$SITE\"}}" \
-    --update-expression 'SET api_target = :v' \
-    --expression-attribute-values '{":v":{"S":"https://evil.example"}}'
-# ③ 正常权限投影 —— 必须成功（证明闸门没过紧）
-probe "routing.require_auth 正常投影" allow \
-  aws dynamodb update-item --table-name <routing_table> \
-    --key "{\"subdomain\":{\"S\":\"app-$SITE\"}}" \
-    --update-expression 'SET require_auth = :v' \
-    --expression-attribute-values '{":v":{"BOOL":false}}'
-# ④ 读路径没被闸门误伤 —— 必须成功
-#    **owner 是 DynamoDB 保留字**，KeyConditionExpression 里必须用
-#    ExpressionAttributeNames，否则报 ValidationException（那验的是命令语法，
-#    不是 IAM 结果——probe 会把它标成 INVALID 而不是 PASS）。
-probe "owner-index Query 未被误伤" allow \
-  aws dynamodb query --table-name site-sites --index-name owner-index \
-    --key-condition-expression '#o = :o' \
-    --expression-attribute-names '{"#o":"owner"}' \
-    --expression-attribute-values '{":o":{"S":"probe@example.com"}}'
-```
-Expected: 四条全部 `PASS`。
-
-- 出现 `INVALID` → 是命令写错（保留字、JSON 转义），修命令重跑；**不要**当成
-  IAM 结论。区分这三态是这个 probe 函数存在的理由：只看 exit code 非零会把
-  `ValidationException` 误读成"闸门生效了"。
-- ① 或 ② 得到 `allow` → **P0**：闸门没生效，runtime 可篡改部署状态与路由指向。
-  先 `aws iam get-role-policy --role-name site-mcp-runtime-role
-  --policy-name mcp-scope` 看 `Condition` 是否真的下发了。
-- ③ 得到 `deny` → 白名单少字段。**报错是 `AccessDeniedException` 而不是
-  `TransactionCanceledException`**，别误判成并发冲突。对照
-  `ROUTE_PROJECTION_ATTRIBUTES` 补齐。
-- ④ 得到 `deny` → 读侧被加了 `Attributes`/`Null` 条件。Query/Scan 不带
-  `ProjectionExpression` 时请求上下文没有 `dynamodb:Attributes`，
-  `Null` 检查会把它拒掉。读写必须是两个独立 statement。
-
-Run（④ 清理——**影子角色和 fixture 都必须删掉**）:
-```bash
-unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
-aws iam delete-role-policy --role-name site-mcp-iamprobe --policy-name mcp-scope
-aws iam delete-role --role-name site-mcp-iamprobe
-aws dynamodb delete-item --table-name site-sites \
-  --key "{\"site_id\":{\"S\":\"$SITE\"}}"
-aws dynamodb delete-item --table-name <routing_table> \
-  --key "{\"subdomain\":{\"S\":\"app-$SITE\"}}"
-rm -f /tmp/mcp-scope.json
-aws iam get-role --role-name site-mcp-iamprobe 2>&1 | grep -q NoSuchEntity \
-  && echo "影子角色已删除" || echo "⚠️ 影子角色仍存在，手工删除"
-```
-留着这个影子角色等于留了一条"任何人可 assume 的站点管理权限"后门，
-清理这步不是可选的。
+- `set -euo pipefail` + `trap cleanup EXIT INT TERM`：**中途崩溃/Ctrl-C 也会删掉
+  影子角色**。手工版把清理写在最后一段命令里，异常路径下角色残留——那是一条
+  「指定 principal 可 assume 的站点管理权限」后门。已注入崩溃实测过清理生效。
+- 角色名带随机后缀：固定名在"上次没清理干净"时 create-role 失败，而后续命令
+  仍可能给那个已存在的角色附加策略。
+- **只复制 DynamoDB statements**（从线上真策略里按 action 前缀筛，不手抄）：
+  整份复制会让影子角色同时持有 S3 / Step Functions / undeploy Lambda 权限。
+  实测本环境是 11 条里筛出 5 条。
+- 临时凭证只注入探针子进程，不 `export` 到当前 shell：手工版用
+  `eval ... export AWS_*` 覆盖环境，之后的 `unset` **无法恢复**调用者原本通过
+  环境变量提供的凭证，清理命令可能因此没权限。
+- `get-role-policy` 显式 `--output json`：操作者 CLI 默认输出是 text/table/yaml
+  时，拿到的不是可用的 policy JSON。
+- 任一探针不符预期即**非零退出**（实测注入一条必失败探针，exit=1）。
+- probe 区分四态而非三态：新增 `SETUP-ERROR`（凭证/profile 问题）。**这一条是
+  写脚本时真实踩到的**——原先用 `AWS_PROFILE=` 想清掉 profile 影响，CLI 把空串
+  当成"名为空的 profile"报错，四条探针全部在触及 IAM 之前就死了。若把它归进
+  `OTHER` 而不单列，就会看起来像"闸门行为异常"而不是"探针没跑起来"。正确写法
+  是 `env -u AWS_PROFILE`。
 
 **同时确认这条不变量**：`owner` 在白名单内是**有意的**（建站与
 transfer_owner 都要写它），所以"改 owner 接管站点"这条路径 IAM 关不掉——
@@ -6769,16 +6698,19 @@ refresh 有效期。把实测结论（哪个客户端、是否续期）写进 DE
 
 登录后从 MCP 侧或用 CLI 拿一个 access token，解开 payload：
 
-**token 从 stdin 读，不放命令行参数**：argv 对同机所有进程可见（`ps`），
-还会留在 shell history、终端回滚缓冲和 agent transcript 里。access token 是
-bearer 凭证，泄漏即等于身份被冒用（与本文件 Step 8 对 JWT_SECRET 的同一条纪律）。
+**token 用 `getpass` 读，既不进 argv 也不回显**：argv 对同机所有进程可见
+（`ps`），还会留在 shell history、终端回滚缓冲和 agent transcript 里。
+但**光改成 stdin 不够**——普通终端会把粘贴的内容回显到屏幕与回滚缓冲，
+录屏/共享屏幕时同样泄漏。`getpass.getpass()` 关掉回显才算收口。
+access token 是 bearer 凭证，泄漏即等于身份被冒用（与本文件 Step 8 对
+JWT_SECRET 的同一条纪律）。
 
 Run:
 ```bash
-# 粘贴 token 后回车，再按 Ctrl-D
+# 粘贴 token 后回车（不会回显）
 python3 -c "
-import base64, json, sys
-tok = sys.stdin.read().strip().split('.')[1]
+import base64, getpass, json
+tok = getpass.getpass('token: ').strip().split('.')[1]
 print(json.dumps(json.loads(base64.urlsafe_b64decode(tok + '=' * (-len(tok) % 4))),
                  indent=2, ensure_ascii=False))"
 ```
@@ -6799,12 +6731,12 @@ pre-token 触发器注入；漏了就是所有 MCP 调用被拒），以及**类
 （OIDC Core 定义该 claim 为 boolean；本项目 `_is_verified()` 兼容字符串，
 所以单测发现不了，但严格的 OIDC consumer 可能拒绝该 token）。
 
-Run（把 id_token 与 access token 各跑一次；同样从 stdin 读，理由见 Step 6b）：
+Run（把 id_token 与 access token 各跑一次；同样用 getpass 读，理由见 Step 6b）：
 ```bash
-# 粘贴 token 后回车，再按 Ctrl-D
+# 粘贴 token 后回车（不会回显）
 python3 -c "
-import base64, json, sys
-tok = sys.stdin.read().strip().split('.')[1]
+import base64, getpass, json
+tok = getpass.getpass('token: ').strip().split('.')[1]
 c = json.loads(base64.urlsafe_b64decode(tok + '=' * (-len(tok) % 4)))
 v = c.get('email_verified', '<MISSING>')
 print('email_verified =', repr(v), ' type =', type(v).__name__)
@@ -7160,65 +7092,38 @@ Expected: 全部 PASS。记录每个包的测试数（contract 应仍是 67；�
 "日志打了""metric 有点了"都不算验收完成：必须证明 alarm 会进 ALARM、
 并且通知真的送达。
 
-Run（① 配置存在）:
+Run（**用脚本**）:
 ```bash
-aws logs describe-metric-filters --region us-east-1 \
-  --log-group-name /aws/lambda/site-auth-service \
-  --filter-name-prefix auth-invalid-grant
-aws cloudwatch describe-alarms --region us-east-1 \
-  --alarm-names site-builder-auth-invalid-grant \
-  --query 'MetricAlarms[0].[Threshold,EvaluationPeriods,AlarmActions]'
+# cookie 与 state 从 stdin 读（不回显、不进 argv、不进 history）
+SNS_TOPIC_ARN=arn:aws:sns:us-east-1:<account>:site-builder-alarms \
+  ./site-builder/scripts/verify_auth_alarm.sh
 ```
+Expected: ① 两项 `PASS`；② `/callback` 返回 **400** 且日志里出现
+`token_exchange_invalid_grant`；③ `StateValue=ALARM`；末尾清理干净、退出码 0。
+**最后一步仍需人工**：去 SNS 订阅端确认真的收到通知。
 
-Run（② 触发真实失败——**cookie 不进命令行**）:
-```bash
-# 正常登录一次，从浏览器 devtools 复制 __Host-sb_pkce 的值与 state。
-# PKCE cookie 里含 code_verifier 与 nonce，属于凭证：写进 0600 的文件，
-# 不放 argv（argv 对同机所有进程可见，且会留在 history/transcript 里）。
-umask 077 && : > /tmp/sb_probe_cookie
-read -rs -p "粘贴 __Host-sb_pkce 值: " C && printf '__Host-sb_pkce=%s' "$C" > /tmp/sb_probe_cookie && unset C && echo
-read -rs -p "粘贴 state 值: " STATE && echo
-# code 故意给垃圾值 → Cognito 返回 invalid_grant
-curl -s -o /dev/null -w '%{http_code}\n' \
-  --cookie-jar /dev/null --cookie /tmp/sb_probe_cookie \
-  --get --data-urlencode "code=GARBAGE" --data-urlencode "state=$STATE" \
-  "https://auth.<base_domain>/callback"
-shred -u /tmp/sb_probe_cookie 2>/dev/null || rm -f /tmp/sb_probe_cookie
-unset STATE
-```
-Expected: 返回 `400`（不是 502）。
+脚本相对手工版修掉的两个「测不到目标逻辑」的坑：
 
-Run（③ 让 alarm 真的进 ALARM）:
-```bash
-# 正式阈值是 10/2 周期，一条合成事件永远达不到——**临时把阈值降到 1**，
-# 验证完立刻恢复。不这么做就只能证明"metric 动了"，证明不了"alarm 会响"。
-aws cloudwatch put-metric-alarm --region us-east-1 \
-  --alarm-name site-builder-auth-invalid-grant-probe \
-  --namespace SiteBuilder --metric-name AuthInvalidGrant \
-  --statistic Sum --period 60 --evaluation-periods 1 \
-  --threshold 1 --comparison-operator GreaterThanOrEqualToThreshold \
-  --treat-missing-data notBreaching \
-  --alarm-actions <SNS topic ARN>
-# 再触发一次 ②，然后等 1-3 分钟轮询状态
-for i in $(seq 1 12); do
-  st=$(aws cloudwatch describe-alarms --region us-east-1 \
-        --alarm-names site-builder-auth-invalid-grant-probe \
-        --query 'MetricAlarms[0].StateValue' --output text)
-  echo "StateValue=$st"; [ "$st" = "ALARM" ] && break; sleep 15
-done
-```
-Expected: 最终 `StateValue=ALARM`，**且 SNS 订阅端（邮箱/webhook）真的收到通知**。
-只看 StateValue 不够——SNS topic 没有订阅、或订阅未确认时，alarm 照样进 ALARM
-而没有人被通知到，这正是"告警形同虚设"最常见的形态。
+- **cookie 必须是 Netscape jar，且 secure 字段为 `TRUE`**。`--cookie <文件>`
+  按 jar 解析，单行 `name=value` 不是合法 jar——实测服务端收到的 Cookie 头是
+  `None`，于是 callback 在 `_read_pkce_cookie()` 处直接返回"登录状态已过期"400，
+  **根本不会调用 Cognito token endpoint**，metric 不动、alarm 不变，却因为状态码
+  恰好也是 400 而看起来通过了。
+  `__Host-` 前缀的 cookie curl 只在 secure 且 HTTPS 时发送，所以第 4 列写
+  `FALSE` 时**症状与格式错完全相同**（本地 HTTPS server 实测确认：裸行、
+  jar+FALSE 都收不到，jar+TRUE 才收到）。
+- **必须验证走的是哪个 400 分支**。脚本在触发后查
+  `token_exchange_invalid_grant` 日志——没有这条日志就说明 cookie 没送到，
+  当前测到的是 cookie 缺失分支，不是目标逻辑。只断言状态码是假通过。
 
-Run（④ 清理探针 alarm）:
-```bash
-aws cloudwatch delete-alarms --region us-east-1 \
-  --alarm-names site-builder-auth-invalid-grant-probe
-aws cloudwatch describe-alarms --region us-east-1 \
-  --alarm-names site-builder-auth-invalid-grant-probe \
-  --query 'length(MetricAlarms)'   # 应为 0
-```
+另外：探针 alarm 独立于正式 alarm（不改正式那个的阈值，避免验证期间正式告警
+失灵），且由 trap 保证异常路径下也会删除；未给 `SNS_TOPIC_ARN` 时脚本会显式
+警告"只验证状态机、不验证通知送达"——topic 没订阅或订阅未确认时 alarm 照样进
+ALARM 而无人知情，这是「告警形同虚设」最常见的形态。
+
+探针 alarm 由脚本的 `trap` 自动删除（异常路径也删），无需手工清理。若脚本
+报「探针 alarm 仍存在」则它已非零退出，按提示手工删一次：
+`aws cloudwatch delete-alarms --region us-east-1 --alarm-names site-builder-auth-invalid-grant-probe`
 
 排查：
 - ② 返回 502 → 4xx 分流回归了（`invalid_grant` 应转 400）。
