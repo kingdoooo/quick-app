@@ -78,6 +78,35 @@ def test_spike_pool_secrets_go_to_isolated_ssm_prefix():
         sstub.assert_no_pending_responses()
 
 
+def test_spike_pool_does_not_overwrite_production_pre_token_lambda():
+    """隔离 spike 不能改动生产在用的 pre-token 函数。
+
+    `ensure_pre_token_trigger` 里函数名硬编码为 `site-auth-pre-token`，且对
+    已存在的函数走 `update_function_code`。--pool-name 指向临时 pool 时若仍
+    用这个名字，spike 会把新版代码推到**生产 pool 正在调用的同一个函数上**：
+    实测线上那版只往 access token 注入 email，新版往 id/access 两个容器注入
+    email/email_verified/idp/auth_via 四个 claim——等于在只想"试一下登录体验"
+    的时候改掉了生产的 token 形态，而 Cognito 侧毫无异常显示。
+
+    与 SSM 前缀隔离（见上一个测试）是同一类漏项：凡是 spike 与生产共享的
+    命名，都必须随 pool_name 一起隔离。
+    """
+    sys.path.insert(0, str(Path(__file__).parents[2] / "auth"))
+    import deploy_auth
+
+    import inspect
+    src = inspect.getsource(deploy_auth.ensure_pre_token_trigger)
+    assert "fn_name" in src or "function_name" in src, \
+        "函数名必须可参数化，否则 spike 会覆盖生产在用的 Lambda 代码"
+    sig = inspect.signature(deploy_auth.ensure_pre_token_trigger)
+    assert "fn_name" in sig.parameters, "需要显式的函数名参数供 spike 传隔离值"
+    assert sig.parameters["fn_name"].default == "site-auth-pre-token", \
+        "默认值必须仍是生产函数名"
+    # deploy_pool 侧：非生产 pool 必须传隔离后的函数名
+    dp_src = inspect.getsource(dp.main)
+    assert "fn_name=" in dp_src, "deploy_pool 必须按 pool 传隔离的函数名"
+
+
 def test_default_pool_name_is_production_pool():
     """--pool-name 的默认值必须仍是生产 pool。
 

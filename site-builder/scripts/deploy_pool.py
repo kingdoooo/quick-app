@@ -600,7 +600,15 @@ def main() -> None:
     sys.path.insert(0, str(HERE.parent / "auth"))
     import deploy_auth
     role_arn = deploy_auth.ensure_lambda_role()
-    deploy_auth.ensure_pre_token_trigger(role_arn, pool_id=pool_id)
+    # 非生产 pool 用独立函数名：生产 pool 正在调用 site-auth-pre-token，而
+    # ensure_pre_token_trigger 对已存在的函数走 update_function_code——沿用
+    # 默认名会把 spike 的代码推到生产在用的函数上，静默改掉线上 token 形态。
+    fn_name = ("site-auth-pre-token" if args.pool_name == POOL_NAME
+               else f"site-auth-pre-token-spike-{args.pool_name}"[:64])
+    if fn_name != "site-auth-pre-token":
+        print(f"   （隔离 pool：触发器部署为 {fn_name}，不动生产函数）")
+    deploy_auth.ensure_pre_token_trigger(role_arn, pool_id=pool_id,
+                                        fn_name=fn_name)
 
     print("⑧ client secret → SSM")
     # 非生产 pool 走独立参数前缀，避免覆盖 auth 服务在用的生产 secret

@@ -165,7 +165,8 @@ def pool_update_params(cog, pool: dict) -> dict:
     return kwargs
 
 
-def ensure_pre_token_trigger(role_arn: str, pool_id: str | None = None) -> None:
+def ensure_pre_token_trigger(role_arn: str, pool_id: str | None = None,
+                             fn_name: str = "site-auth-pre-token") -> None:
     """部署 pre-token-generation V2 Lambda 并挂到用户池。
 
     真机钉死（2026-07-29，AGENTCORE-SPIKE.md §7）：部署 MCP 网关只接受
@@ -174,8 +175,15 @@ def ensure_pre_token_trigger(role_arn: str, pool_id: str | None = None) -> None:
 
     pool_id 显式传入时用它（deploy_pool.py 建新 pool 后立即挂载）；
     默认取 config.ini 的当前 pool。
+
+    **fn_name 必须随隔离 pool 一起改**：本函数对已存在的函数走
+    update_function_code，而生产 pool 正在调用 `site-auth-pre-token`——
+    spike 若沿用默认名，会把新版代码推到生产在用的函数上，静默改掉线上
+    token 的 claim 形态（实测差异：线上仅 access token 注 email，新版往
+    id/access 两个容器注 email/email_verified/idp/auth_via）。
+    与 _store_client_secrets 的 SSM 前缀隔离是同一类要求。
     """
-    fn = "site-auth-pre-token"
+    fn = fn_name
     pool_id = pool_id or CFG["Cognito"]["user_pool_id"]
     cog = boto3.client("cognito-idp", region_name=REGION)
     buf = io.BytesIO()
