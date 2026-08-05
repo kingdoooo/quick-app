@@ -228,7 +228,8 @@ def test_exchange_code_accepts_matching_nonce():
          patch.object(lh, "_get_jwks_client") as jwks, \
          patch.object(lh.pyjwt, "decode",
                       return_value={"token_use": "id", "email": "a@x.com",
-                                    "name": "Alice", "nonce": "good-nonce"}):
+                                    "name": "Alice", "nonce": "good-nonce",
+                                    "email_verified": True}):
         jwks.return_value.get_signing_key_from_jwt.return_value = _Key()
         out = lh._exchange_code("code", "ver123", "good-nonce")
     # idp/auth_via 由 pre-token 注入 id_token；此处 decode 被 patch 掉，
@@ -247,7 +248,7 @@ def test_exchange_code_returns_idp_and_auth_via():
          patch.object(lh.pyjwt, "decode",
                       return_value={"token_use": "id", "email": "a@x.com",
                                     "name": "Alice", "nonce": "n",
-                                    "idp": "Feishu",
+                                    "idp": "Feishu", "email_verified": True,
                                     "auth_via": "TokenGeneration_HostedAuth"}):
         jwks.return_value.get_signing_key_from_jwt.return_value = _Key()
         out = lh._exchange_code("code", "v", "n")
@@ -301,11 +302,9 @@ def test_callback_token_endpoint_4xx_returns_400_not_500():
     **必须打 urlopen 而不是 _post_token**：4xx→400 的翻译就发生在 _post_token
     内部，打掉它等于跳过被测代码（本测试第一版正是这样写的，改对实现后仍红）。
     """
-    import urllib.error
     state, pkce = _login_state_and_cookie()
-    err = urllib.error.HTTPError("https://sso/oauth2/token", 400,
-                                 "Bad Request", {}, None)
-    with patch.object(lh.urllib.request, "urlopen", side_effect=err):
+    with patch.object(lh.urllib.request, "urlopen",
+                      side_effect=_http_error(400, "invalid_grant")):
         r = lh.handler(_event("/callback", {"code": "replayed", "state": state},
                               cookies=[pkce]), None)
     assert r["statusCode"] == 400
@@ -316,9 +315,8 @@ def test_callback_token_endpoint_5xx_still_raises():
     """上游故障必须保持 5xx——伪装成"请重新登录"会让真实故障不告警、无重试统计。"""
     import urllib.error
     state, pkce = _login_state_and_cookie()
-    err = urllib.error.HTTPError("https://sso/oauth2/token", 503,
-                                 "Service Unavailable", {}, None)
-    with patch.object(lh.urllib.request, "urlopen", side_effect=err):
+    with patch.object(lh.urllib.request, "urlopen",
+                      side_effect=_http_error(503, None, "Service Unavailable")):
         with pytest.raises(urllib.error.HTTPError):
             lh.handler(_event("/callback", {"code": "abc", "state": state},
                               cookies=[pkce]), None)
@@ -383,3 +381,137 @@ def test_logged_out_page_does_not_claim_full_signout():
     assert "已退出登录" in r["body"]
     assert "身份提供方" in r["body"]      # 明确告知效力边界
     assert any(c.startswith("sb_session=;") for c in r["cookies"])
+
+
+def _http_error(status: int, oauth_error=None, reason="Bad Request"):
+    """构造带 OAuth 错误体的 HTTPError。
+
+    body 必须是真的可读流：实现按 error 字段分流，
+    用 fp=None 的 HTTPError 测不出分流逻辑（读不到 body 一律走上抛分支）。
+    """
+    import io
+    import json as _json
+    import urllib.error
+    body = _json.dumps({"error": oauth_error}).encode() if oauth_error else b""
+    return urllib.error.HTTPError("https://sso/oauth2/token", status, reason,
+                                  {}, io.BytesIO(body))
+
+
+@pytest.mark.parametrize("oauth_error", [
+    "invalid_client",       # client secret 被轮换/写坏
+    "unauthorized_client",  # client 没开 code grant
+    "invalid_request",      # 我们自己把请求拼错了
+])
+@patch.dict(lh.os.environ, ENV)
+def test_config_errors_are_not_disguised_as_user_error(oauth_error):
+    """配置类 400 必须冒成平台故障（5xx 告警），不能翻成"请重新登录"。
+
+    否则 secret 轮换这类事故的表现是"用户反复重登都失败"，而 Lambda 返回
+    成功的 400、不触发任何告警——排查会从错误的方向开始。
+    """
+    import urllib.error
+    state, pkce = _login_state_and_cookie()
+    with patch.object(lh.urllib.request, "urlopen",
+                      side_effect=_http_error(400, oauth_error)):
+        with pytest.raises(urllib.error.HTTPError):
+            lh.handler(_event("/callback", {"code": "abc", "state": state},
+                              cookies=[pkce]), None)
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_throttling_429_is_not_user_error():
+    """429 是限流，重新登录解决不了——必须上抛。"""
+    import urllib.error
+    state, pkce = _login_state_and_cookie()
+    with patch.object(lh.urllib.request, "urlopen",
+                      side_effect=_http_error(429, "slow_down", "Too Many Requests")):
+        with pytest.raises(urllib.error.HTTPError):
+            lh.handler(_event("/callback", {"code": "abc", "state": state},
+                              cookies=[pkce]), None)
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_unclassifiable_4xx_is_not_user_error():
+    """body 不是 JSON / 无 error 字段：分类不出来时按平台故障处理（保守）。"""
+    import urllib.error
+    state, pkce = _login_state_and_cookie()
+    with patch.object(lh.urllib.request, "urlopen",
+                      side_effect=_http_error(400, None)):
+        with pytest.raises(urllib.error.HTTPError):
+            lh.handler(_event("/callback", {"code": "abc", "state": state},
+                              cookies=[pkce]), None)
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_invalid_grant_still_returns_400():
+    """真正的"授权码不可用"仍必须是用户可读的 400，不是 502。"""
+    state, pkce = _login_state_and_cookie()
+    with patch.object(lh.urllib.request, "urlopen",
+                      side_effect=_http_error(400, "invalid_grant")):
+        r = lh.handler(_event("/callback", {"code": "used", "state": state},
+                              cookies=[pkce]), None)
+    assert r["statusCode"] == 400
+
+
+# --- email_verified 必须参与会话签发判定（Codex re-review P1） ---
+
+def _claims(**over):
+    c = {"email": "a@x.com", "name": "A", "token_use": "id",
+         "email_verified": True}
+    c.update(over)
+    return c
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_exchange_rejects_unverified_email(monkeypatch):
+    """未验证邮箱不得换到平台会话——email 是授权主键。"""
+    monkeypatch.delenv("REQUIRE_EMAIL_VERIFIED", raising=False)
+    monkeypatch.setattr(lh, "REQUIRE_EMAIL_VERIFIED", True)
+    with patch.object(lh, "_post_token", return_value={"id_token": "x"}), \
+         patch.object(lh, "_get_jwks_client"), \
+         patch.object(lh.pyjwt, "decode",
+                      return_value=_claims(nonce="n", email_verified=False)):
+        with pytest.raises(ValueError):
+            lh._exchange_code("code", "verifier", "n")
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_exchange_rejects_missing_email_verified(monkeypatch):
+    monkeypatch.setattr(lh, "REQUIRE_EMAIL_VERIFIED", True)
+    claims = _claims(nonce="n")
+    claims.pop("email_verified")
+    with patch.object(lh, "_post_token", return_value={"id_token": "x"}), \
+         patch.object(lh, "_get_jwks_client"), \
+         patch.object(lh.pyjwt, "decode", return_value=claims):
+        with pytest.raises(ValueError):
+            lh._exchange_code("code", "verifier", "n")
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_exchange_accepts_verified_email(monkeypatch):
+    monkeypatch.setattr(lh, "REQUIRE_EMAIL_VERIFIED", True)
+    with patch.object(lh, "_post_token", return_value={"id_token": "x"}), \
+         patch.object(lh, "_get_jwks_client"), \
+         patch.object(lh.pyjwt, "decode", return_value=_claims(nonce="n")):
+        out = lh._exchange_code("code", "verifier", "n")
+    assert out["email"] == "a@x.com"
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_unverified_email_surfaces_as_400_not_500(monkeypatch):
+    """走完整 handler：拒绝必须是可读的 400，不是堆栈。"""
+    monkeypatch.setattr(lh, "REQUIRE_EMAIL_VERIFIED", True)
+    state, pkce = _login_state_and_cookie()
+    with patch.object(lh, "_post_token", return_value={"id_token": "x"}), \
+         patch.object(lh, "_get_jwks_client"), \
+         patch.object(lh.pyjwt, "decode", return_value=_claims(email_verified=False)):
+        r = lh.handler(_event("/callback", {"code": "abc", "state": state},
+                              cookies=[pkce]), None)
+    assert r["statusCode"] == 400
+
+
+def test_is_verified_is_fail_closed():
+    for bad in (None, "", "false", "False", 0, "1", "yes", True and None):
+        assert lh._is_verified(bad) is False, bad
+    for good in (True, "true", "True", " true "):
+        assert lh._is_verified(good) is True, good

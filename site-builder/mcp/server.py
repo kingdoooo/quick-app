@@ -44,6 +44,23 @@ TRUSTED_AUTH_SOURCES = ("TokenGeneration_HostedAuth",
                         "TokenGeneration_RefreshTokens")
 
 
+# 与 auth/login_handler.py 的 REQUIRE_EMAIL_VERIFIED 同义、必须同步。
+# 默认开：email 是授权主键，而联邦 email 默认 unverified。
+# 同样每次调用时读（理由见 _trusted_idps 的注释）。
+def _require_email_verified() -> bool:
+    return os.environ.get(
+        "REQUIRE_EMAIL_VERIFIED", "true").strip().lower() != "false"
+
+
+def _is_verified(value) -> bool:
+    """只认真值，其余（缺失/false/None）一律 False——fail-closed。
+
+    access token 里该 claim 由 pre-token 触发器注入成字符串 "true"/"false"；
+    直接来自 id_token 时是 JSON 布尔。两种形态都要认。
+    """
+    return value is True or str(value).strip().lower() == "true"
+
+
 class NotOwner(Exception):
     pass
 
@@ -291,6 +308,14 @@ def _caller_email() -> str:
                         raise NotOwner(
                             "本次登录方式不被信任（非托管登录来源）——"
                             "请用企业账号重新登录")
+                # email 是授权主键（owner/collaborators/allowed_users 全用它），
+                # 而联邦 email 默认 unverified——只映射不校验等于没有防线。
+                # 与 auth/login_handler.py 的同名开关语义一致，两处必须同步。
+                # 注入靠 pre-token 触发器（access token 默认不含该 claim）。
+                if _require_email_verified() and not _is_verified(
+                        claims.get("email_verified")):
+                    raise NotOwner(
+                        "邮箱未经身份提供方验证，拒绝授权——请用企业账号登录")
                 return email
         except NotOwner:
             raise

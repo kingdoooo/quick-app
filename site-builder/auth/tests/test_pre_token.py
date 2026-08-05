@@ -47,7 +47,9 @@ def test_injects_email_and_idp_into_both_containers(container):
         "identities": '[{"providerName":"Feishu","userId":"u1"}]'}), None)
     assert _claims(ev, container) == {
         "email": "a@x.com", "idp": "Feishu",
-        "auth_via": "TokenGeneration_HostedAuth"}
+        "auth_via": "TokenGeneration_HostedAuth",
+        # 属性缺失 → 空串 → 消费方按未验证处理（fail-closed）
+        "email_verified": ""}
 
 
 def test_local_user_gets_no_idp_claim():
@@ -59,7 +61,8 @@ def test_local_user_gets_no_idp_claim():
     for container in ("idTokenGeneration", "accessTokenGeneration"):
         claims = _claims(ev, container)
         assert claims == {"email": "local@x.com",
-                          "auth_via": "TokenGeneration_HostedAuth"}
+                          "auth_via": "TokenGeneration_HostedAuth",
+                          "email_verified": ""}
         assert "idp" not in claims
 
 
@@ -67,7 +70,8 @@ def test_malformed_identities_does_not_raise():
     ev = pt.handler(_event({"email": "a@x.com", "identities": "{not json"}), None)
     for container in ("idTokenGeneration", "accessTokenGeneration"):
         assert _claims(ev, container) == {
-            "email": "a@x.com", "auth_via": "TokenGeneration_HostedAuth"}
+            "email": "a@x.com", "auth_via": "TokenGeneration_HostedAuth",
+            "email_verified": ""}
 
 
 def test_no_attributes_still_records_auth_via():
@@ -79,7 +83,8 @@ def test_no_attributes_still_records_auth_via():
     ev = pt.handler(_event({}), None)
     for container in ("idTokenGeneration", "accessTokenGeneration"):
         claims = _claims(ev, container)
-        assert claims == {"auth_via": "TokenGeneration_HostedAuth"}
+        assert claims == {"auth_via": "TokenGeneration_HostedAuth",
+                          "email_verified": ""}
         assert "email" not in claims
 
 
@@ -103,3 +108,23 @@ def test_token_containers_are_independent_objects():
             is not details["accessTokenGeneration"])
     details["idTokenGeneration"]["claimsToAddOrOverride"]["probe"] = 1
     assert "probe" not in details["accessTokenGeneration"]["claimsToAddOrOverride"]
+
+
+# --- email_verified 必须注入 access token（Codex re-review P1） ---
+# Cognito 默认只把它放 id_token，而 MCP 网关只收 access token——不注入的话
+# MCP 侧那道 email_verified 检查永远看不到值，等于不存在。
+
+@pytest.mark.parametrize("container", ["idTokenGeneration",
+                                       "accessTokenGeneration"])
+def test_email_verified_injected_into_both_containers(container):
+    ev = pt.handler(_event({"email": "a@x.com", "email_verified": "true"}), None)
+    assert _claims(ev, container)["email_verified"] == "true"
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("true", "true"), ("True", "true"), ("false", "false"), ("", ""),
+])
+def test_email_verified_normalized_to_lowercase(raw, expected):
+    """统一小写字符串：消费方（auth / MCP）只需一套判定，避免两处理解不一致。"""
+    ev = pt.handler(_event({"email": "a@x.com", "email_verified": raw}), None)
+    assert _claims(ev, "accessTokenGeneration")["email_verified"] == expected

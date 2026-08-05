@@ -27,6 +27,13 @@ def handler(event, context):
     email = attrs.get("email", "")
     if email:
         claims["email"] = email
+    # email_verified 必须进 **access token**：Cognito 默认只把它放 id_token，
+    # 而 MCP 网关只收 access token（见上面 email 的同一个理由）。不注入的话
+    # MCP 侧永远看不到验证状态，那道检查等于不存在。
+    # 字符串化：Cognito 的 userAttributes 全是字符串（"true"/"false"），
+    # 这里保持原样透出，由消费方统一按 _is_verified 判定，避免两处对
+    # "true" / True / "1" 的理解不一致。
+    claims["email_verified"] = str(attrs.get("email_verified", "")).lower()
     # idp 来自用户档案的**静态**属性：只证明"这个账号关联过某个 IdP"，
     # 不证明本次登录由它验证（spec §3.5 的效力边界）。
     idp = _provider_name(attrs.get("identities", ""))

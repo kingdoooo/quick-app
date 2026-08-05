@@ -155,6 +155,23 @@ def _is_safe_redirect(url: str) -> bool:
     return host == base or host.endswith("." + base)
 
 
+# 是否要求 email 已被 IdP 验证。默认 **开**——这是 email 作为授权主键的前提。
+# 只有接入不提供 email_verified claim 的 IdP 时才设 "false"，代价是这道
+# 技术防线消失、退回纯选型约束（见 config.ini.example [IdP] 的说明）。
+REQUIRE_EMAIL_VERIFIED = os.environ.get(
+    "REQUIRE_EMAIL_VERIFIED", "true").strip().lower() != "false"
+
+
+def _is_verified(value) -> bool:
+    """email_verified 的判定。**只认真值，其他一律 False（fail-closed）。**
+
+    形态在两条链路上不一致：id_token 里是 JSON 布尔 true，而 pre-token
+    触发器从 userAttributes 拿到的是字符串 "true"。两种都要认；缺失、
+    "false"、None、空串一律不通过。
+    """
+    return value is True or str(value).strip().lower() == "true"
+
+
 class TokenExchangeRejected(Exception):
     """Cognito 的 token 端点用 4xx 拒了本次交换（无效/过期/已用过的 code）。
 
@@ -186,10 +203,35 @@ def _post_token(code: str, verifier: str) -> dict:
         # 所以 callback 的 `except ValueError` 接不住它：无效/过期/重放的 code
         # 会让整个 handler 抛异常 → Function URL 502 + CloudWatch 堆栈，
         # 而不是注释里承诺的 400。已实测复现（HTTP Error 400: Bad Request）。
-        # 只有 4xx 是"这个 code 不能用"；5xx 是 Cognito 侧故障，照原样上抛。
-        if 400 <= e.code < 500:
-            raise TokenExchangeRejected(f"token 端点拒绝了本次交换: {e.code}") from e
+        #
+        # **按 OAuth error code 分流，不能按 HTTP 状态码一刀切**：Cognito 的
+        # token 端点用 400 表达的远不只"这个 code 不能用"——invalid_client
+        # （secret 被轮换/写坏）、unauthorized_client（client 没开 code grant）、
+        # invalid_request（我们自己拼错请求）都是 400，而 429 是限流。
+        # 把它们全翻成"请重新登录"会让配置事故与限流伪装成用户错误：
+        # 用户反复重登都失败，而 Lambda 返回成功的 400，不触发任何 5xx 告警。
+        # 只有 invalid_grant 才真正属于"本次授权码不可用"。
+        err = _oauth_error(e)
+        if err == "invalid_grant":
+            raise TokenExchangeRejected(
+                f"授权码不可用（{err}）: {e.code}") from e
+        # 其余 4xx 与全部 5xx 一律上抛成平台故障：宁可 502 告警，
+        # 也不要把"secret 过期了"显示成"请重新登录"。
         raise
+
+
+def _oauth_error(err: urllib.error.HTTPError) -> str:
+    """取 OAuth 错误响应体里的 error 字段；取不到返回 ""。
+
+    读 body 会消耗流，且只读一次——调用方之后不要再读它。
+    body 不是 JSON / 没有 error 字段 / 读失败时一律返回 ""，
+    走"当成平台故障上抛"的保守分支（分类不出来时不要替用户下结论）。
+    """
+    try:
+        payload = json.loads(err.read().decode("utf-8", "replace"))
+        return payload.get("error", "") if isinstance(payload, dict) else ""
+    except Exception:
+        return ""
 
 
 def _exchange_code(code: str, verifier: str, nonce: str) -> dict:
@@ -206,6 +248,13 @@ def _exchange_code(code: str, verifier: str, nonce: str) -> dict:
     # 这个 callback（PKCE 保护授权码，nonce 保护 id_token）。
     if claims.get("nonce") != nonce:
         raise ValueError("id_token nonce 与本次登录不匹配")
+    # **email 是授权主键**（owner / collaborators / allowed_users 全用它），
+    # 而联邦映射进 Cognito 的 email 默认 unverified。只映射不校验等于没有
+    # 技术防线：允许自设邮箱的 IdP 上，改个 email 就能继承他人站点权限。
+    # 开关默认开（当前飞书适配器确实发 email_verified=true）；接入不发该
+    # claim 的 IdP 时才关，且关掉意味着回到"只靠 IdP 选型兜底"。
+    if REQUIRE_EMAIL_VERIFIED and not _is_verified(claims.get("email_verified")):
+        raise ValueError("邮箱未经身份提供方验证，拒绝签发会话")
     # idp 由 pre-token 触发器注入 id token（两个容器都写，见 Task 14 Step 4b）。
     # 本地用户没有它——会话里就不会有，Edge 据此拦截（spec §3.5）。
     return {"email": claims["email"], "name": claims.get("name", claims["email"]),
