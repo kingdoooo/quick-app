@@ -153,6 +153,23 @@ def find_image_digest(tag: str) -> str | None:
     return details[0]["imageDigest"] if details else None
 
 
+def runtime_current_digest() -> str | None:
+    """当前 runtime 引用的镜像 digest；runtime 不存在或未按 digest 引用时 None。
+
+    这是"复用已有 tag"的守卫依据：tag 从 commit SHA 可预测，而 push 权限
+    尚未收敛到 CI（DEPLOY.md「仍未做」）——"tag 已存在"既可能是上次部署的
+    真实重跑，也可能是抢占者提前 push 的恶意镜像（IMMUTABLE 此时反而保护
+    它不被覆盖）。runtime 已经指向同一 digest 才能证明是前者。
+    """
+    rt_id = _find_runtime()
+    if not rt_id:
+        return None
+    rt = acc.get_agent_runtime(agentRuntimeId=rt_id)
+    uri = (rt.get("agentRuntimeArtifact", {})
+             .get("containerConfiguration", {}).get("containerUri", ""))
+    return uri.split("@", 1)[1] if "@" in uri else None
+
+
 def resolve_digest(tag: str) -> str:
     """push 之后把 tag 解析成 image digest。
 
@@ -486,6 +503,9 @@ def main() -> None:
                     help="不重新构镜像，只更新 runtime 配置")
     ap.add_argument("--allow-dirty", action="store_true",
                     help="允许用未提交的构建输入构镜像（仅联调；正式部署禁用）")
+    ap.add_argument("--trust-existing-image", action="store_true",
+                    help="复用已有 tag 时跳过 runtime digest 校验（仅在人工核实"
+                         "过该镜像来源后使用，见「MCP runtime 的信任边界」）")
     args = ap.parse_args()
 
     print("① ECR 仓库（tag 不可变）")
@@ -524,6 +544,24 @@ def main() -> None:
     else:
         print("② 构建并推送 ARM64 镜像")
         build_and_push(image_uri)
+
+    if existing and not args.trust_existing_image:
+        # **复用守卫**：tag 从 commit SHA 可预测，push 权限未收敛到 CI 之前，
+        # "tag 已存在"不足以证明它是本机构建产物——抢占者可提前 push 恶意
+        # 镜像占住 `git-<sha>`，IMMUTABLE 反而保护它不被覆盖。只有当前
+        # runtime 已指向同一 digest（真正的重跑）才放行；首次部署撞上
+        # 已存在的预期 tag 属于说不通的状态，fail closed。
+        current = runtime_current_digest()
+        if current != existing:
+            sys.exit(
+                f"拒绝复用 ECR 里已有的 tag {tag}：\n"
+                f"  该 tag 指向 {existing}\n"
+                f"  当前 runtime 指向 {current or '（无 runtime 或未按 digest 引用）'}\n"
+                "两者不一致，说明这个镜像不是本机上次部署推上去的——tag 可从\n"
+                "commit SHA 预测，可能被抢占。人工核实镜像来源（比对本地构建\n"
+                "digest / ECR pushedAt 与部署记录）后用 --trust-existing-image\n"
+                "放行，或删除该 tag 后重跑以本机构建覆盖。")
+        print("   守卫通过：runtime 已指向该 tag 的 digest（真实重跑）")
 
     print("③ Runtime 执行角色")
     role_arn = ensure_role()

@@ -821,8 +821,10 @@ SSM 参数：`/site-builder/jwt-secret`（已存在）、`/site-builder/site-cli
 | 措施 | 不做会怎样 |
 |---|---|
 | ECR 仓库 `imageTagMutability=IMMUTABLE`（省略时 AWS 默认 **MUTABLE**） | 任何有 push 权限的主体覆盖同名 tag 即换掉 TCB，无痕迹 |
-| 镜像 tag = `git-<sha>`（脏工作区加 `-dirty`） | 用 `latest` 时"线上跑哪份代码"无法回答 |
+| 镜像 tag = `git-<sha>`（构建输入未提交时 `wip-<内容指纹>`，默认拒绝部署，联调加 `--allow-dirty`） | 用 `latest` 时"线上跑哪份代码"无法回答 |
 | runtime 引用 **image digest**，不引用 tag | tag 是名字，digest 才是内容 |
+| 复用已有 tag 前校验 runtime 当前 digest 与其一致（不一致 fail closed，人工核实后 `--trust-existing-image` 放行） | tag 从 commit SHA 可预测——push 权限收敛到 CI 之前，抢占者可提前 push 恶意镜像占住 `git-<sha>`，IMMUTABLE 反而保护它不被覆盖，脚本会跳过构建直接把攻击者的 digest 部署为 TCB |
+| 容器非 root（UID 10001）且 `/app` 保持 root:root 只读 | 进程内漏洞升级为改写 server.py 的持久后门 |
 | 基础镜像钉 digest（`python:3.13-slim@sha256:…`） | 上游重指 tag 即在无人察觉时换掉 TCB，历史构建不可复现 |
 | 依赖锁版本 + `--require-hashes` | 被污染的上游版本 = 任意站点 owner 可被接管 |
 

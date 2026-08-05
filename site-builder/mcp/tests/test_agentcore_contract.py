@@ -610,6 +610,24 @@ def test_existing_tag_is_reused_instead_of_repushed():
     assert main.index("elif existing") < main.index("build_and_push(image_uri)")
 
 
+def test_reused_tag_must_match_running_digest_or_fail_closed():
+    """tag 从 commit SHA 可预测，而 ECR push 权限尚未收敛到 CI（DEPLOY.md
+    「仍未做」）——任何有 push 权限的主体可抢先 push `git-<sha>`，IMMUTABLE
+    反而保护抢占者的镜像不被覆盖。所以"tag 已存在就复用"必须先证明这是
+    **真正的重跑**：当前 runtime 已指向同一 digest。否则 fail closed，
+    显式逃生口 --trust-existing-image。"""
+    src = (MCP_DIR / "deploy_agentcore.py").read_text()
+    assert "--trust-existing-image" in src
+    assert "def runtime_current_digest" in src
+    main = src[src.index("def main()"):]
+    # 守卫必须在"把 digest 部署为 TCB"（resolve_digest）之前
+    guard = main[main.index("runtime_current_digest"):main.index("resolve_digest(tag)")]
+    assert "sys.exit(" in guard, "digest 不匹配必须拒绝部署，不能只警告"
+    # --skip-build 同样复用已有镜像，守卫必须覆盖两条复用路径：
+    # 写成分支后的统一检查（在 elif existing 之后、resolve 之前）
+    assert main.index("elif existing") < main.index("runtime_current_digest")
+
+
 def test_find_image_digest_tolerates_missing_tag_and_repo():
     """查不到不是异常路径——首次部署时仓库和 tag 都不存在。"""
     src = (MCP_DIR / "deploy_agentcore.py").read_text()
@@ -635,6 +653,25 @@ def test_skip_build_fails_loudly_when_tag_absent():
     assert "sys.exit(" in seg
 
 
+def test_locked_runner_rebuilds_on_lock_change_and_verifies_versions():
+    """旧 venv 里只要有可执行 pytest 就被复用——lock 更新后"锁定测试"跑的仍是
+    旧依赖（Codex 探针实证：宿主 mcp 1.26.0 下自称 locked 且 88 passed）。
+    修复契约：
+      · venv 带 requirements.txt+Python 版本指纹，不匹配 --clear 重建；
+      · 测试依赖（pytest/moto）受 lock 约束（-c），不得升级已锁定的运行依赖；
+      · 安装后程序化比对已装版本 == lock，不一致必须非零退出，不能只打印。
+    """
+    sh = (MCP_DIR / "run_locked_tests.sh").read_text()
+    assert ".lock-stamp" in sh, "必须有 lock 指纹文件"
+    assert "sha256" in sh, "指纹必须含 requirements.txt 内容 hash"
+    assert "--clear" in sh, "指纹不匹配必须整个重建,不做增量修补"
+    assert re.search(r"pip.*install.*-c\b", sh), "测试依赖必须受 lock 约束(-c)"
+    assert "sys.exit" in sh, "版本比对失败必须非零退出"
+    import subprocess
+    assert subprocess.run(["bash", "-n", str(MCP_DIR / "run_locked_tests.sh")],
+                          capture_output=True).returncode == 0
+
+
 def test_container_runs_as_non_root():
     """TCB 容器持有能管理全部站点的角色凭证，不该以 root 跑（AgentCore 安全指引）。
 
@@ -644,7 +681,17 @@ def test_container_runs_as_non_root():
     df = (MCP_DIR / "Dockerfile").read_text()
     assert re.search(r"^USER\s+10001", df, re.M), "必须显式降权到非 root"
     assert "useradd" in df and "10001" in df
-    # 降权必须发生在 COPY 之后（否则应用文件属主不对）
+    # 降权必须发生在 COPY 之后（否则应用文件会以非 root 属主进镜像层）
     assert df.index("COPY server.py") < df.index("USER 10001")
-    # chown 让应用目录归该用户，否则 WORKDIR 下不可写会有隐性问题
-    assert "chown" in df
+
+
+def test_app_dir_is_not_writable_by_runtime_user():
+    """降权的意义是"进程内漏洞 ≠ 容器内任意写"。/app 若归运行用户所有
+    （chown -R appuser /app），被攻破的进程可改写 server.py/permissions.py,
+    后门在容器重启前对所有后续请求生效——这否定了降权本身。
+    代码保持 root:root、运行用户只读执行;server 不写 /app
+    (PYTHONDONTWRITEBYTECODE 已设,工具全部无状态)。
+    """
+    df = (MCP_DIR / "Dockerfile").read_text()
+    assert not re.search(r"chown[^\n]*/app", df), \
+        "/app 不得 chown 给运行用户——代码必须对运行用户只读"

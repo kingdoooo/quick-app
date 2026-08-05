@@ -28,12 +28,16 @@ ENV PYTHONUNBUFFERED=1 \
 # **非 root 运行**（AgentCore 容器安全指引要求）。对这个容器格外要紧：它持有
 # 能管理全部站点的 runtime 角色凭证（见 deploy_agentcore.py 的 TCB 说明），
 # 以 root 跑等于把"进程内的漏洞"直接放大成"容器内任意写"。
-# 代码与依赖由 root 装好后不再需要写权限，应用只读执行即可。
+#
+# **/app 故意不 chown**：代码与依赖由 root 装好后保持 root:root，运行用户
+# 只读执行。若把 /app 交给运行用户，进程内漏洞可改写 server.py，后门在
+# 容器重启前对所有后续请求生效——降权就白做了。server 不写 /app：
+# PYTHONDONTWRITEBYTECODE 关掉 .pyc，工具全部无状态；需要临时文件走
+# /tmp 或 $HOME（--create-home 建出的 /home/appuser 归运行用户）。
 #
 # UID 固定为 10001 而不是让系统分配：镜像层里的所有权是数字 UID，
 # 固定值让"同一份代码换台机器构建"得到一致的文件所有权。
-RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin appuser \
-    && chown -R appuser:appuser /app
+RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin appuser
 USER 10001
 
 # AgentCore 契约：0.0.0.0:8000，POST /mcp
