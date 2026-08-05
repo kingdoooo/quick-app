@@ -4606,50 +4606,117 @@ Stubber 都验不了（前者不执行 IAM 授权，后者只校验请求参数�
 能证明。**只跑正向用例等于没验这道闸门**：白名单写错、`Null` 检查漏掉、
 或 `dynamodb:Attributes` 收到的是别名而非真实属性名，正向路径全都照样通过。
 
-用 MCP runtime 角色的身份（`aws sts assume-role --role-arn
-arn:aws:iam::<account>:role/site-mcp-runtime-role …`，或在容器里跑）：
+**先解决"用什么身份跑"**。`site-mcp-runtime-role` 的 trust policy 只允许
+`bedrock-agentcore.amazonaws.com`，**普通部署者 assume 不了**（身份 policy 再
+宽也会被 role trust 拒），而 AgentCore managed runtime 没有交互式 shell、
+现有 8 个工具也不能执行任意 DynamoDB 调用。所以要造一个一次性的等价身份：
 
-Run:
+Run（① 建影子角色：与 runtime 角色**同一份** inline policy，但 trust 指向你自己）:
 ```bash
-SITE=<一个真实 site_id>
-SUB=app-$SITE
-# ① 越权改 sites 的部署链字段 —— 必须 AccessDenied
-aws dynamodb update-item --table-name site-sites \
-  --key "{\"site_id\":{\"S\":\"$SITE\"}}" \
-  --update-expression 'SET data_tables = :v' \
-  --expression-attribute-values '{":v":{"L":[{"S":"evil"}]}}' ; echo "exit=$?"
-# ② 越权改路由指向 —— 必须 AccessDenied
-aws dynamodb update-item --table-name <routing_table> \
-  --key "{\"subdomain\":{\"S\":\"$SUB\"}}" \
-  --update-expression 'SET api_target = :v' \
-  --expression-attribute-values '{":v":{"S":"https://evil.example"}}' ; echo "exit=$?"
-# ③ 正常权限投影 —— 必须成功（证明闸门没有过紧）
-aws dynamodb update-item --table-name <routing_table> \
-  --key "{\"subdomain\":{\"S\":\"$SUB\"}}" \
-  --update-expression 'SET require_auth = :v' \
-  --expression-attribute-values '{":v":{"BOOL":true}}' ; echo "exit=$?"
-# ④ 读路径没被闸门误伤 —— 必须成功（不带 ProjectionExpression 的 Query）
-aws dynamodb query --table-name site-sites --index-name owner-index \
-  --key-condition-expression 'owner = :o' \
-  --expression-attribute-values '{":o":{"S":"<你的邮箱>"}}' >/dev/null; echo "exit=$?"
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+ME=$(aws sts get-caller-identity --query Arn --output text)
+# 同一份策略——必须从线上真角色导出，不要手抄，否则验的不是同一套约束
+aws iam get-role-policy --role-name site-mcp-runtime-role \
+  --policy-name mcp-scope --query PolicyDocument > /tmp/mcp-scope.json
+aws iam create-role --role-name site-mcp-iamprobe \
+  --assume-role-policy-document "{\"Version\":\"2012-10-17\",\"Statement\":
+    [{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"$ME\"},
+      \"Action\":\"sts:AssumeRole\"}]}"
+aws iam put-role-policy --role-name site-mcp-iamprobe \
+  --policy-name mcp-scope --policy-document file:///tmp/mcp-scope.json
+sleep 10   # IAM 传播
 ```
-Expected: ① ② 报 `AccessDeniedException`（exit≠0）；③ ④ 成功（exit=0）。
 
-- ① 或 ② **成功**了 → 闸门没生效。最可能是 `dynamodb:Attributes` 条件没下发
-  （`aws iam get-role-policy --role-name site-mcp-runtime-role
-  --policy-name mcp-scope` 看 Condition 是否在），或白名单被人放宽了。
-  这是 P0 级：此时 runtime 可篡改部署状态与路由指向。
-- ③ 失败 → 白名单少字段。**注意报错是 `AccessDeniedException` 而不是
+Run（② 造一次性 fixture，**不要拿真实站点做实验**）:
+```bash
+SITE=iamprobe-$(date +%s)
+aws dynamodb put-item --table-name site-sites \
+  --item "{\"site_id\":{\"S\":\"$SITE\"},\"owner\":{\"S\":\"probe@example.com\"}}"
+aws dynamodb put-item --table-name <routing_table> \
+  --item "{\"subdomain\":{\"S\":\"app-$SITE\"},\"site_id\":{\"S\":\"$SITE\"},
+           \"require_auth\":{\"BOOL\":true},\"owner\":{\"S\":\"probe@example.com\"}}"
+```
+
+Run（③ 取影子角色的临时凭证，跑四条探针）:
+```bash
+eval $(aws sts assume-role --role-arn "arn:aws:iam::$ACCOUNT:role/site-mcp-iamprobe" \
+  --role-session-name iamprobe --query Credentials \
+  --output text | awk '{print "export AWS_ACCESS_KEY_ID="$1" AWS_SECRET_ACCESS_KEY="$3" AWS_SESSION_TOKEN="$4}')
+
+probe() {  # $1=说明 $2=期望(deny|allow) 剩余=命令
+  desc="$1"; want="$2"; shift 2
+  out=$("$@" 2>&1); rc=$?
+  if echo "$out" | grep -q "AccessDeniedException"; then got=deny
+  elif echo "$out" | grep -q "ValidationException"; then got=INVALID   # 命令本身写错了
+  elif [ $rc -eq 0 ]; then got=allow
+  else got="OTHER:$(echo "$out" | head -1)"; fi
+  [ "$got" = "$want" ] && echo "PASS  $desc ($got)" || echo "FAIL  $desc 期望=$want 实际=$got"
+}
+
+# ① 越权改 sites 的部署链字段 —— 必须被拒
+probe "sites.data_tables 越权" deny \
+  aws dynamodb update-item --table-name site-sites \
+    --key "{\"site_id\":{\"S\":\"$SITE\"}}" \
+    --update-expression 'SET data_tables = :v' \
+    --expression-attribute-values '{":v":{"L":[{"S":"evil"}]}}'
+# ② 越权改路由指向 —— 必须被拒
+probe "routing.api_target 越权" deny \
+  aws dynamodb update-item --table-name <routing_table> \
+    --key "{\"subdomain\":{\"S\":\"app-$SITE\"}}" \
+    --update-expression 'SET api_target = :v' \
+    --expression-attribute-values '{":v":{"S":"https://evil.example"}}'
+# ③ 正常权限投影 —— 必须成功（证明闸门没过紧）
+probe "routing.require_auth 正常投影" allow \
+  aws dynamodb update-item --table-name <routing_table> \
+    --key "{\"subdomain\":{\"S\":\"app-$SITE\"}}" \
+    --update-expression 'SET require_auth = :v' \
+    --expression-attribute-values '{":v":{"BOOL":false}}'
+# ④ 读路径没被闸门误伤 —— 必须成功
+#    **owner 是 DynamoDB 保留字**，KeyConditionExpression 里必须用
+#    ExpressionAttributeNames，否则报 ValidationException（那验的是命令语法，
+#    不是 IAM 结果——probe 会把它标成 INVALID 而不是 PASS）。
+probe "owner-index Query 未被误伤" allow \
+  aws dynamodb query --table-name site-sites --index-name owner-index \
+    --key-condition-expression '#o = :o' \
+    --expression-attribute-names '{"#o":"owner"}' \
+    --expression-attribute-values '{":o":{"S":"probe@example.com"}}'
+```
+Expected: 四条全部 `PASS`。
+
+- 出现 `INVALID` → 是命令写错（保留字、JSON 转义），修命令重跑；**不要**当成
+  IAM 结论。区分这三态是这个 probe 函数存在的理由：只看 exit code 非零会把
+  `ValidationException` 误读成"闸门生效了"。
+- ① 或 ② 得到 `allow` → **P0**：闸门没生效，runtime 可篡改部署状态与路由指向。
+  先 `aws iam get-role-policy --role-name site-mcp-runtime-role
+  --policy-name mcp-scope` 看 `Condition` 是否真的下发了。
+- ③ 得到 `deny` → 白名单少字段。**报错是 `AccessDeniedException` 而不是
   `TransactionCanceledException`**，别误判成并发冲突。对照
   `ROUTE_PROJECTION_ATTRIBUTES` 补齐。
-- ④ 失败 → 读侧被加了 `Attributes`/`Null` 条件。Query/Scan 不带
+- ④ 得到 `deny` → 读侧被加了 `Attributes`/`Null` 条件。Query/Scan 不带
   `ProjectionExpression` 时请求上下文没有 `dynamodb:Attributes`，
   `Null` 检查会把它拒掉。读写必须是两个独立 statement。
 
+Run（④ 清理——**影子角色和 fixture 都必须删掉**）:
+```bash
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+aws iam delete-role-policy --role-name site-mcp-iamprobe --policy-name mcp-scope
+aws iam delete-role --role-name site-mcp-iamprobe
+aws dynamodb delete-item --table-name site-sites \
+  --key "{\"site_id\":{\"S\":\"$SITE\"}}"
+aws dynamodb delete-item --table-name <routing_table> \
+  --key "{\"subdomain\":{\"S\":\"app-$SITE\"}}"
+rm -f /tmp/mcp-scope.json
+aws iam get-role --role-name site-mcp-iamprobe 2>&1 | grep -q NoSuchEntity \
+  && echo "影子角色已删除" || echo "⚠️ 影子角色仍存在，手工删除"
+```
+留着这个影子角色等于留了一条"任何人可 assume 的站点管理权限"后门，
+清理这步不是可选的。
+
 **同时确认这条不变量**：`owner` 在白名单内是**有意的**（建站与
 transfer_owner 都要写它），所以"改 owner 接管站点"这条路径 IAM 关不掉——
-它由应用层与 runtime 完整性负责，见 DEPLOY.md「MCP runtime 的信任边界」。
-不要因为本步骤而把 `owner` 从白名单删掉：那会让建站在线上直接 AccessDenied。
+它由应用层与 runtime 完整性负责，见 DEPLOY.md「MCP runtime 的信任边界」
+与 spec §5.3.1。不要因为本步骤而把 `owner` 从白名单删掉：那会让建站在线上
+直接 AccessDenied。
 
 - [ ] **Step 3: [真机] 在线改权限并验证生效**
 
@@ -6702,13 +6769,18 @@ refresh 有效期。把实测结论（哪个客户端、是否续期）写进 DE
 
 登录后从 MCP 侧或用 CLI 拿一个 access token，解开 payload：
 
+**token 从 stdin 读，不放命令行参数**：argv 对同机所有进程可见（`ps`），
+还会留在 shell history、终端回滚缓冲和 agent transcript 里。access token 是
+bearer 凭证，泄漏即等于身份被冒用（与本文件 Step 8 对 JWT_SECRET 的同一条纪律）。
+
 Run:
 ```bash
+# 粘贴 token 后回车，再按 Ctrl-D
 python3 -c "
 import base64, json, sys
-tok = sys.argv[1].split('.')[1]
+tok = sys.stdin.read().strip().split('.')[1]
 print(json.dumps(json.loads(base64.urlsafe_b64decode(tok + '=' * (-len(tok) % 4))),
-                 indent=2, ensure_ascii=False))" '<access_token>'
+                 indent=2, ensure_ascii=False))"
 ```
 Expected: payload 含 `email` 与 **`idp`**（值为 IdP provider 名，如 `Feishu`
 或 `Okta`）。这条是 spec §3.5 主防线的数据来源。
@@ -6727,16 +6799,17 @@ pre-token 触发器注入；漏了就是所有 MCP 调用被拒），以及**类
 （OIDC Core 定义该 claim 为 boolean；本项目 `_is_verified()` 兼容字符串，
 所以单测发现不了，但严格的 OIDC consumer 可能拒绝该 token）。
 
-Run（把 id_token 与 access token 各跑一次）：
+Run（把 id_token 与 access token 各跑一次；同样从 stdin 读，理由见 Step 6b）：
 ```bash
+# 粘贴 token 后回车，再按 Ctrl-D
 python3 -c "
 import base64, json, sys
-tok = sys.argv[1].split('.')[1]
+tok = sys.stdin.read().strip().split('.')[1]
 c = json.loads(base64.urlsafe_b64decode(tok + '=' * (-len(tok) % 4)))
 v = c.get('email_verified', '<MISSING>')
 print('email_verified =', repr(v), ' type =', type(v).__name__)
 assert v is True, f'必须是 JSON true（当前 {v!r} / {type(v).__name__}）'
-print('OK')" '<token>'
+print('OK')"
 ```
 Expected: **两类 token 都** 打印 `email_verified = True  type = bool` 并 `OK`。
 
@@ -7079,52 +7152,89 @@ cd site-builder/mcp && python3 -m pytest tests -q
 ```
 Expected: 全部 PASS。记录每个包的测试数（contract 应仍是 67；其余各有增长）。
 
-- [ ] **Step 1-obs: [真机] 登录失败告警端到端可用（不只是"metric filter 建了"）**
+- [ ] **Step 1-obs: [真机] 登录失败告警端到端可用（alarm 必须真的进 ALARM）**
 
 `invalid_grant` 既表示"用户重放授权码"，也表示"app client 缺少 scope 所需的
 属性读取权限"——后者是**每个用户每次登录都失败**的配置事故，而两者在响应里
 无法可靠区分，所以代码统一返回 400。**唯一的发现手段是频率告警**，因此
-"日志打了"不算验收完成，必须证明 metric 真的动、alarm 真的响。
+"日志打了""metric 有点了"都不算验收完成：必须证明 alarm 会进 ALARM、
+并且通知真的送达。
 
-Run:
+Run（① 配置存在）:
 ```bash
-# ① metric filter 与 alarm 都存在
 aws logs describe-metric-filters --region us-east-1 \
   --log-group-name /aws/lambda/site-auth-service \
   --filter-name-prefix auth-invalid-grant
 aws cloudwatch describe-alarms --region us-east-1 \
-  --alarm-names site-builder-auth-invalid-grant
-
-# ② 注入一条合成失败：带一个已用过/伪造的 code 访问 callback
-#    （state/PKCE cookie 不匹配时走的是别的分支，必须用真实登录流程拿到的
-#     state+cookie，再把 code 换成垃圾值）
-curl -s -o /dev/null -w '%{http_code}\n' \
-  --cookie "__Host-sb_pkce=<真实登录流程里的 cookie 值>" \
-  "https://auth.<base_domain>/callback?code=GARBAGE&state=<真实 state>"
-
-# ③ 等 1-2 分钟后确认 metric 有数据点
-aws cloudwatch get-metric-statistics --region us-east-1 \
-  --namespace SiteBuilder --metric-name AuthInvalidGrant \
-  --start-time "$(date -u -v-15M +%Y-%m-%dT%H:%M:%SZ)" \
-  --end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  --period 300 --statistics Sum
+  --alarm-names site-builder-auth-invalid-grant \
+  --query 'MetricAlarms[0].[Threshold,EvaluationPeriods,AlarmActions]'
 ```
-Expected: ② 返回 `400`（不是 502）；③ `Datapoints` 非空且 Sum ≥ 1。
 
-- ③ 为空 → metric filter 的 pattern 与实际日志不匹配。用
+Run（② 触发真实失败——**cookie 不进命令行**）:
+```bash
+# 正常登录一次，从浏览器 devtools 复制 __Host-sb_pkce 的值与 state。
+# PKCE cookie 里含 code_verifier 与 nonce，属于凭证：写进 0600 的文件，
+# 不放 argv（argv 对同机所有进程可见，且会留在 history/transcript 里）。
+umask 077 && : > /tmp/sb_probe_cookie
+read -rs -p "粘贴 __Host-sb_pkce 值: " C && printf '__Host-sb_pkce=%s' "$C" > /tmp/sb_probe_cookie && unset C && echo
+read -rs -p "粘贴 state 值: " STATE && echo
+# code 故意给垃圾值 → Cognito 返回 invalid_grant
+curl -s -o /dev/null -w '%{http_code}\n' \
+  --cookie-jar /dev/null --cookie /tmp/sb_probe_cookie \
+  --get --data-urlencode "code=GARBAGE" --data-urlencode "state=$STATE" \
+  "https://auth.<base_domain>/callback"
+shred -u /tmp/sb_probe_cookie 2>/dev/null || rm -f /tmp/sb_probe_cookie
+unset STATE
+```
+Expected: 返回 `400`（不是 502）。
+
+Run（③ 让 alarm 真的进 ALARM）:
+```bash
+# 正式阈值是 10/2 周期，一条合成事件永远达不到——**临时把阈值降到 1**，
+# 验证完立刻恢复。不这么做就只能证明"metric 动了"，证明不了"alarm 会响"。
+aws cloudwatch put-metric-alarm --region us-east-1 \
+  --alarm-name site-builder-auth-invalid-grant-probe \
+  --namespace SiteBuilder --metric-name AuthInvalidGrant \
+  --statistic Sum --period 60 --evaluation-periods 1 \
+  --threshold 1 --comparison-operator GreaterThanOrEqualToThreshold \
+  --treat-missing-data notBreaching \
+  --alarm-actions <SNS topic ARN>
+# 再触发一次 ②，然后等 1-3 分钟轮询状态
+for i in $(seq 1 12); do
+  st=$(aws cloudwatch describe-alarms --region us-east-1 \
+        --alarm-names site-builder-auth-invalid-grant-probe \
+        --query 'MetricAlarms[0].StateValue' --output text)
+  echo "StateValue=$st"; [ "$st" = "ALARM" ] && break; sleep 15
+done
+```
+Expected: 最终 `StateValue=ALARM`，**且 SNS 订阅端（邮箱/webhook）真的收到通知**。
+只看 StateValue 不够——SNS topic 没有订阅、或订阅未确认时，alarm 照样进 ALARM
+而没有人被通知到，这正是"告警形同虚设"最常见的形态。
+
+Run（④ 清理探针 alarm）:
+```bash
+aws cloudwatch delete-alarms --region us-east-1 \
+  --alarm-names site-builder-auth-invalid-grant-probe
+aws cloudwatch describe-alarms --region us-east-1 \
+  --alarm-names site-builder-auth-invalid-grant-probe \
+  --query 'length(MetricAlarms)'   # 应为 0
+```
+
+排查：
+- ② 返回 502 → 4xx 分流回归了（`invalid_grant` 应转 400）。
+- metric 无数据点 → filter pattern 与日志不匹配。用
   `aws logs filter-log-events --log-group-name /aws/lambda/site-auth-service
   --filter-pattern '{ $.event = "token_exchange_invalid_grant" }'` 直接验
   pattern；日志形态见 `login_handler._log_auth_failure`。
-- ② 返回 502 → 4xx 分流回归了（`invalid_grant` 应转 400）。
+- StateValue 长期 INSUFFICIENT_DATA → `--treat-missing-data` 与 period 不匹配。
 
-**阈值要按真实流量定，不要照抄**：DEPLOY.md 给的"5 分钟 ≥ 10 次"是起步值，
-在低流量环境下 100% 登录失败也可能长期达不到 10 次——那种环境应改成
-"5 分钟 ≥ 1 次且连续 2 个周期"或对失败率告警。**把最终阈值与理由写进
-DEPLOY.md**，否则下一个人无法判断这个数字是否适合他的流量。
+**正式阈值要按真实流量定，并把最终值与理由写回 DEPLOY.md**：DEPLOY 给的
+"5 分钟 ≥10 次"是起步值，低流量环境下 100% 登录失败也可能长期凑不满 10 次
+——那种环境应改成"≥1 次且连续 2 个周期"或对失败率告警。
 
-同时抽查一条日志，确认**没有** code/token/邮箱/redirect URI：
-上游会在 `error_description` 里回显请求值，实现只记固定词汇的 `hint`
-（见 `_describe_hint`），抽查是防回归。
+同时抽查一条日志，确认**没有** code/token/邮箱/redirect URI：上游会在
+`error_description` 里回显请求值，实现只记固定词汇（`_safe_error` /
+`_describe_hint`），抽查是防回归。
 
 - [ ] **Step 1a: [真机] idp claim 全链路（P0 验收）**
 
