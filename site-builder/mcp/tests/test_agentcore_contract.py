@@ -209,3 +209,83 @@ def test_trusted_idps_read_per_call_not_at_import(monkeypatch):
     assert server._trusted_idps() == ("Feishu",)
     monkeypatch.setenv("TRUSTED_IDPS", "Okta,Feishu")
     assert server._trusted_idps() == ("Okta", "Feishu")
+
+
+# --- 路由表写权限的字段级闸门（Codex review P1） ---
+# 背景：不给 PutItem **不足以**限制可写字段——UpdateItem 本身就能改任意属性。
+# 唯一的字段级闸门是 dynamodb:Attributes 条件键。这两个测试锁住两端：
+# 白名单必须覆盖实现真正会碰的字段（少了 → 线上 AccessDenied），
+# 且不得包含路由指向类字段（多了 → runtime 被攻破即可劫持流量）。
+
+def test_routing_projection_allowlist_matches_permissions_writer():
+    """白名单必须与 permissions.write_permissions 的 route_update 精确对齐。
+
+    从实现源码里把字段解析出来比对，而不是手写第二份清单——手写两份的话
+    permissions.py 加字段时这里不会失败，症状是线上改权限报 AccessDenied。
+    """
+    import deploy_agentcore
+
+    src = (MCP_DIR.parent / "deployer" / "functions" / "permissions.py").read_text()
+    # 截取 route_update 定义块
+    start = src.index("route_update = {")
+    block = src[start:src.index("items = [{\"Update\": site_update}", start)]
+
+    update_expr = re.search(r'"UpdateExpression":\s*\((.*?)\),\n', block, re.S).group(1)
+    # SET a = :x, b = :y → 取等号左侧的属性名（#ro 这类别名后面单独解析）
+    written = set(re.findall(r"([#\w]+)\s*=\s*:", update_expr))
+    aliases = dict(re.findall(r'"(#\w+)":\s*"(\w+)"',
+                              re.search(r'"ExpressionAttributeNames":\s*\{([^}]*)\}',
+                                        block).group(1)))
+    # 别名换成真实属性名：dynamodb:Attributes 收的是解析后的名字
+    resolved = {aliases.get(name, name) for name in written}
+    # 条件表达式与 Key 引用的属性同样计入 dynamodb:Attributes
+    resolved |= set(re.findall(r"attribute_exists\((\w+)\)", block))
+    resolved |= {"subdomain"}   # 分区键，官方要求主键必列
+
+    allowlist = set(deploy_agentcore.ROUTE_PROJECTION_ATTRIBUTES)
+    assert resolved <= allowlist, (
+        f"实现会写/读但白名单没有的字段: {sorted(resolved - allowlist)}"
+        "——线上会 AccessDenied（不是事务取消，别误判成条件冲突）")
+    assert allowlist <= resolved, (
+        f"白名单多出实现并不需要的字段: {sorted(allowlist - resolved)}"
+        "——每一个多余字段都是 runtime 被攻破后的可写攻击面")
+    # 别名不能漏进白名单（放 #ro 而非 owner 时闸门形同虚设）
+    assert not any(a.startswith("#") for a in allowlist)
+
+
+def test_routing_projection_cannot_write_traffic_fields():
+    """route_mode / static_prefix / api_target / site_id 绝不能进白名单。
+
+    这四个决定"流量去哪"。owner 也在闸门内但必须保留（权限投影要写它）——
+    它的风险由 Edge 侧 _is_platform_route 承担，见 deploy_agentcore 的注释。
+    """
+    import deploy_agentcore
+    forbidden = {"route_mode", "static_prefix", "api_target", "site_id"}
+    leaked = forbidden & set(deploy_agentcore.ROUTE_PROJECTION_ATTRIBUTES)
+    assert not leaked, f"路由指向字段进了 MCP 可写白名单: {sorted(leaked)}"
+
+
+def test_routing_policy_has_null_guard_and_no_putitem():
+    """三个易错点的源码级锁定（每一个都会让闸门静默失效）。"""
+    src = (MCP_DIR / "deploy_agentcore.py").read_text()
+    stmt_start = src.index('"Sid": "RoutingProjection"')
+    stmt = src[stmt_start:stmt_start + 2000]
+    # ① ForAllValues 在键缺失时为 true —— 必须有 Null 兜底
+    assert '"Null": {"dynamodb:Attributes": "false"}' in stmt
+    # ② UpdateItem 的隐式读能通过 ReturnValues 带回完整 item
+    assert '"dynamodb:ReturnValues"' in stmt
+    # ③ 路由表整条覆盖只能由部署链做
+    assert "PutItem" not in stmt and "DeleteItem" not in stmt
+
+
+def test_sites_table_has_no_putitem():
+    """sites 表不得有 PutItem：整条覆盖可绕过 owner 判定重写站点归属。
+
+    与 jobs 表分开成独立 statement 就是为了这个——合在一条里时 sites
+    会因为 create_job 需要 PutItem 而顺带获得整条写权限。
+    """
+    src = (MCP_DIR / "deploy_agentcore.py").read_text()
+    stmt_start = src.index('"Sid": "Sites"')
+    stmt = src[stmt_start:src.index("},", stmt_start)]
+    assert "PutItem" not in stmt
+    assert "site-sites" in stmt

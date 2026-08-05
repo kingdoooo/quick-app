@@ -90,6 +90,25 @@ def build_and_push(image_uri: str) -> None:
             p.unlink(missing_ok=True)
 
 
+# MCP runtime 允许在路由表上读写的属性白名单（dynamodb:Attributes 条件键）。
+#
+# **必须与 permissions.write_permissions 的 route_update 逐字段对齐**：
+# 少一个 → 在线改权限被 AccessDenied（不是事务取消，报错形态完全不同，
+# 排查时容易误判成条件冲突）；多一个 → 那个字段就成了可被 runtime 改写的
+# 攻击面。当前对应关系（permissions.py 的 route_update）：
+#   subdomain      —— 分区键 + attribute_exists() 条件都要用（官方要求主键必列）
+#   require_auth   —— SET :a
+#   allowed_users  —— SET :u
+#   collaborators  —— SET :c
+#   owner          —— SET #ro（真实名，非别名 #ro）
+#   permissions_rev—— SET :rv
+# **不含** static_prefix / api_target / route_mode / site_id：这四个是部署链
+# register_route 整条 put_item 的字段，用 deployer 的 exec role 写；
+# 把它们放进白名单等于把"改路由指向"的能力交给 MCP runtime。
+ROUTE_PROJECTION_ATTRIBUTES = ("subdomain", "require_auth", "allowed_users",
+                               "collaborators", "owner", "permissions_rev")
+
+
 def ensure_role() -> str:
     """Runtime 执行角色：起 SFN、读写 jobs/sites、发 presigned URL、调 undeploy。"""
     trust = json.dumps({"Version": "2012-10-17", "Statement": [{
@@ -120,18 +139,29 @@ def ensure_role() -> str:
          "Resource": f"arn:aws:ecr:{REGION}:{ACCOUNT}:repository/{REPO}"},
         {"Effect": "Allow", "Action": "ecr:GetAuthorizationToken",
          "Resource": "*"},  # 该动作不支持资源级限定
-        # jobs + sites：MCP 的读写主路径（含 owner-index GSI）。
+        # jobs：MCP 唯一需要**整条写**的表（common.create_job 是 put_item）。
         # ConditionCheckItem 是 register_route / write_permissions 的事务需要的
         # ——IAM 里没有 dynamodb:TransactWriteItems 这个 action，事务内
         # Put/Update/Delete/Get 的权限由底层同名 action 决定，只有
         # ConditionCheck 需要它（见 Task 11 Step 7 的官方链接）。
-        {"Sid": "JobsAndSites", "Effect": "Allow",
+        {"Sid": "Jobs", "Effect": "Allow",
          "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem",
                     "dynamodb:Query", "dynamodb:Scan",
                     "dynamodb:ConditionCheckItem"],
          "Resource": [
              f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-deploy-jobs",
-             f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-deploy-jobs/index/*",
+             f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-deploy-jobs/index/*"]},
+        # sites：**故意不给 PutItem**，与 jobs 分开成独立 statement。
+        # 合在一条里（旧写法 Sid=JobsAndSites）只是为了 create_job 需要 PutItem，
+        # 代价是 sites 表也跟着获得整条覆盖权限——runtime 一旦被攻破即可绕过
+        # permissions.py 的 owner/collaborator 判定，直接重写任意站点的 owner。
+        # 全部 sites 写路径都是 update_item（common.upsert_site /
+        # permissions.write_permissions），无一需要 PutItem。
+        {"Sid": "Sites", "Effect": "Allow",
+         "Action": ["dynamodb:GetItem", "dynamodb:UpdateItem",
+                    "dynamodb:Query", "dynamodb:Scan",
+                    "dynamodb:ConditionCheckItem"],
+         "Resource": [
              f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-sites",
              f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-sites/index/*"]},
         # admins 表：**只读 + 事务条件检查**。
@@ -144,16 +174,48 @@ def ensure_role() -> str:
          "Action": ["dynamodb:GetItem", "dynamodb:Scan",
                     "dynamodb:ConditionCheckItem"],
          "Resource": f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-admins"},
-        # 路由表：只做权限投影（Update 权限字段）+ 事务条件检查。
-        # 故意**不给** PutItem/DeleteItem：整条 put_item 是部署链
-        # register_route 的事，用 deployer 的 exec role——给了会让 MCP 能整条
-        # 覆盖路由 item（踩掉 static_prefix / api_target，即部署的原子切流）。
-        # 同理不把本 ARN 并进上面的 JobsAndSites（那条带 PutItem）。
+        # 路由表：只做权限投影 + 事务条件检查。
+        #
+        # **不给 PutItem/DeleteItem 是必要条件，但远远不够**：DynamoDB 的
+        # UpdateItem 本身就能改任意属性，所以"没有 PutItem 就动不了
+        # static_prefix / api_target"是错的（Codex review P1 指出，官方
+        # specifying-conditions 文档确认）。真正的字段级闸门是
+        # dynamodb:Attributes 条件键——不加它，runtime 被攻破后可以：
+        #   · 改 api_target / static_prefix → 把任意站点的流量指向攻击者后端；
+        #   · 把 owner 改成 "platform" → Edge 的 _is_platform_route 成立，
+        #     顶域 sb_session 不再被剥除，共享会话 cookie 被转发给用户控制的
+        #     origin（origin_request.py 的 RESERVED_COOKIES 剥除逻辑）。
+        #
+        # 官方契约（写这段前逐条核实过，改动前请复核）：
+        #   · dynamodb:Attributes 收的是**请求参数里出现的全部顶层属性**，
+        #     不只是 UpdateExpression 写的那些——Key 与 ConditionExpression
+        #     引用的属性同样计入。故 subdomain（分区键 + attribute_exists
+        #     条件）必须在白名单里，官方 Important 明示"必须列出全部主键属性"。
+        #   · 名单里放**解析后的真实属性名**（owner），不是
+        #     ExpressionAttributeNames 的别名（#ro）。
+        #   · ForAllValues 在请求上下文缺键或空集时返回 **true**（真空真值），
+        #     官方对 ForAllValues+Allow 的建议是必须配 Null 检查兜底，
+        #     否则这条闸门在"键缺失"时静默失效。
+        #   · UpdateItem 会做隐式读，ReturnValues=ALL_OLD/ALL_NEW 能带回完整
+        #     item（绕过属性限制读到未授权字段），故一并收窄；事务路径对应的是
+        #     ReturnValuesOnConditionCheckFailure，同一条件键管辖。
+        #     不传时默认 NONE，在白名单内，所以 IfExists 不会拦住现有调用。
+        #   · **不要**给 ConditionCheckItem 加 dynamodb:EnclosingOperation 条件：
+        #     该 action 的支持条件键里没有 EnclosingOperation，而 ForAnyValue
+        #     在键缺失时返回 false → 每次 ConditionCheck 都被拒。
+        #   · 不列 dynamodb:Select（UpdateItem / ConditionCheck 不用该参数）。
         {"Sid": "RoutingProjection", "Effect": "Allow",
          "Action": ["dynamodb:GetItem", "dynamodb:UpdateItem",
                     "dynamodb:ConditionCheckItem"],
          "Resource": f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/"
-                     + CFG["Platform"]["routing_table"]},
+                     + CFG["Platform"]["routing_table"],
+         "Condition": {
+             "ForAllValues:StringEquals": {
+                 "dynamodb:Attributes": list(ROUTE_PROJECTION_ATTRIBUTES)},
+             # 真空真值兜底：缺键时 ForAllValues 为 true，等于没有这道闸门
+             "Null": {"dynamodb:Attributes": "false"},
+             "StringEqualsIfExists": {
+                 "dynamodb:ReturnValues": ["NONE", "UPDATED_OLD", "UPDATED_NEW"]}}},
         # presigned PUT 由调用者上传，MCP 侧只需 HeadObject 校验大小
         {"Effect": "Allow", "Action": ["s3:PutObject", "s3:GetObject"],
          "Resource": f"arn:aws:s3:::site-artifacts-{ACCOUNT}/uploads/*"},
