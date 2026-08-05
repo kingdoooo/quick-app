@@ -216,6 +216,22 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    python3 site-builder/scripts/deploy_pool.py
    ```
 
+   `client_secret` 也可以不落磁盘——用环境变量注入，优先于 config 值：
+
+   ```bash
+   # secret 存在 Secrets Manager 时（明文只存在于子进程，不进 shell 历史）
+   asm-exec -- env SB_IDP_CLIENT_SECRET='{{resolve:secretsmanager:<secret-arn>:SecretString:<json-key>}}' \
+     python3 site-builder/scripts/deploy_pool.py
+   ```
+
+   走飞书适配器路径时，联邦 secret 在适配器自己的 Secrets Manager 条目里
+   （Lambda 环境变量 `SECRET_ARN` 指向它，JSON 键名见适配器 `handler.py` 的
+   `Secrets` 类——本仓库对接的那版用 `cognitoClientSecret`）。
+
+   两者都缺时脚本在**部署时**明确退出——空 secret 建出的 provider 只在用户
+   登录换 token 那一刻才报 `invalid_client`，症状是"登录页正常、回调失败"，
+   难查得多。
+
    它建平台专用 pool（关自注册 + ESSENTIALS tier）、site/mcp 两个 app client
    （**不列 COGNITO**，只列你的 IdP）、branding、OIDC 联邦（含
    `email_verified` 映射）、pre-token 触发器，并把 client secret 写进 SSM。

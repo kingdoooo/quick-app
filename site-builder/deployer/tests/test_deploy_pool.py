@@ -501,6 +501,55 @@ def _captured_mapping(idp: dict) -> dict:
     return seen["AttributeMapping"]
 
 
+def test_idp_client_secret_can_come_from_env(monkeypatch):
+    """IdP client_secret 必须能从环境变量注入，不必写进 config.ini。
+
+    config.ini 虽然 gitignored，但把联邦 secret 落成磁盘明文仍是不必要的暴露
+    面（会进备份、编辑器缓存、误 cat 的终端回滚）。有了这条通道就能用
+    `asm-exec -- env SB_IDP_CLIENT_SECRET={{resolve:secretsmanager:…}} \
+     python3 deploy_pool.py` 让明文只存在于子进程。
+    环境变量优先于 config 值：两者都在时以显式注入的为准。
+    """
+    seen = {}
+
+    class _Cog:
+        class exceptions:
+            class ResourceNotFoundException(Exception):
+                pass
+
+        def describe_identity_provider(self, **kw):
+            raise self.exceptions.ResourceNotFoundException()
+
+        def create_identity_provider(self, **kw):
+            seen.update(kw)
+
+    monkeypatch.setenv("SB_IDP_CLIENT_SECRET", "from-env-secret")
+    dp._ensure_oidc_idp(_Cog(), "us-east-1_x", _idp(client_secret=""))
+    assert seen["ProviderDetails"]["client_secret"] == "from-env-secret"
+
+
+def test_idp_missing_client_secret_fails_loudly():
+    """config 与环境变量都没有 secret 时必须明确报错。
+
+    Cognito 对空 client_secret 的 OIDC provider 会在**用户登录时**才失败
+    （换 token 阶段 invalid_client），那时症状是"登录页正常、回调报错"，
+    比部署时报错难查得多。
+    """
+    class _Cog:
+        class exceptions:
+            class ResourceNotFoundException(Exception):
+                pass
+
+        def describe_identity_provider(self, **kw):
+            raise self.exceptions.ResourceNotFoundException()
+
+        def create_identity_provider(self, **kw):
+            raise AssertionError("空 secret 不该走到建 IdP")
+
+    with pytest.raises(SystemExit, match="client_secret"):
+        dp._ensure_oidc_idp(_Cog(), "us-east-1_x", _idp(client_secret=""))
+
+
 def test_idp_maps_email_verified_by_default():
     """不映射 email_verified 时，联邦 email 恒为 unverified——
     允许自设邮箱的 IdP 上等于可冒充任意 owner/collaborator。"""

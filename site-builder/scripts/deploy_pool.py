@@ -24,6 +24,7 @@ client_credentials 不能用空 scope 创建，否则脚本会在建 client 这�
 """
 import argparse
 import configparser
+import os
 import sys
 from pathlib import Path
 
@@ -489,9 +490,21 @@ def _ensure_oidc_idp(cog, pool_id: str, idp: dict) -> None:
       · 长期正解是把授权主键换成 issuer+subject，email 只作展示（spec 未来项）。
     """
     name = idp["provider_name"]
+    # secret 优先从环境变量取：config.ini 虽 gitignored，但落成磁盘明文仍会
+    # 进备份 / 编辑器缓存 / 误 cat 的终端回滚。用
+    #   asm-exec -- env SB_IDP_CLIENT_SECRET={{resolve:secretsmanager:…}} \
+    #     python3 deploy_pool.py
+    # 可让明文只存在于子进程。显式注入优先于 config 值。
+    secret = os.environ.get("SB_IDP_CLIENT_SECRET", "").strip() \
+        or idp.get("client_secret", "").strip()
+    if not secret:
+        sys.exit(f"IdP {name} 缺 client_secret：填 config.ini [IdP] client_secret，"
+                 "或用环境变量 SB_IDP_CLIENT_SECRET 注入。\n"
+                 "空值建出的 provider 会在**用户登录时**才失败"
+                 "（回调报 invalid_client），比部署时报错难查得多。")
     details = {
         "client_id": idp["client_id"],
-        "client_secret": idp["client_secret"],
+        "client_secret": secret,
         "attributes_request_method": "GET",
         "oidc_issuer": idp["issuer"],
         "authorize_scopes": idp.get("scopes", "openid email profile"),
