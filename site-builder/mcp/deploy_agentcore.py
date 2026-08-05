@@ -39,7 +39,8 @@ BASE_DOMAIN = CFG["Platform"]["base_domain"]
 REPO = "site-builder-mcp"
 RUNTIME_NAME = "site_builder_deploy"  # 只允许 [a-zA-Z][a-zA-Z0-9_]{0,47}
 ROLE_NAME = "site-mcp-runtime-role"
-IMAGE_TAG = "latest"
+# 没有 IMAGE_TAG 常量：tag 由 image_tag() 按 git sha 生成（`latest` 在
+# IMMUTABLE 仓库下第二次就 push 不上去，也让"线上跑哪份代码"无法回答）。
 
 ecr = boto3.client("ecr", region_name=REGION)
 iam = boto3.client("iam")
@@ -52,16 +53,63 @@ def _run(cmd: list[str], **kw) -> None:
 
 
 def ensure_repo() -> str:
+    """建/纠正 ECR 仓库，并**强制 tag 不可变**。
+
+    为什么这是安全边界而不是洁癖：MCP runtime 对站点管理操作属于 TCB
+    （见 ensure_role 里 SitesWrite 的注释）——runtime 跑什么代码，就等于谁能
+    接管任意站点的 owner。`imageTagMutability` **省略时 AWS 默认 MUTABLE**，
+    于是任何拿到 ECR push 权限的主体都能覆盖同名 tag，静默换掉这个 TCB。
+    IMMUTABLE 之后覆盖 push 会被 ECR 拒绝（ImageAlreadyExistsException），
+    换代码必须换 tag，也就在部署记录里留下痕迹。
+    """
     try:
-        uri = ecr.describe_repositories(repositoryNames=[REPO])["repositories"][0][
-            "repositoryUri"]
+        repo = ecr.describe_repositories(
+            repositoryNames=[REPO])["repositories"][0]
+        uri = repo["repositoryUri"]
+        # 幂等纠正：已存在的仓库可能是早先用 MUTABLE 建的
+        if repo.get("imageTagMutability") != "IMMUTABLE":
+            ecr.put_image_tag_mutability(repositoryName=REPO,
+                                         imageTagMutability="IMMUTABLE")
+            print(f"  tag 可变性 {repo.get('imageTagMutability')} → IMMUTABLE")
     except ecr.exceptions.RepositoryNotFoundException:
         uri = ecr.create_repository(
             repositoryName=REPO,
+            imageTagMutability="IMMUTABLE",
             imageScanningConfiguration={"scanOnPush": True},
             tags=[{"Key": "project", "Value": "site-builder"}],
         )["repository"]["repositoryUri"]
     return uri
+
+
+def image_tag() -> str:
+    """本次构建的唯一 tag：`git-<短 sha>[-dirty]`。
+
+    **不能再用 `latest`**：IMMUTABLE 仓库下它第二次就 push 不上去，而更重要的是
+    固定 tag 让"线上跑的是哪份代码"无法回答。带 sha 的 tag 把镜像与提交对上，
+    dirty 后缀则暴露"用未提交的工作区构建"这种不可复现的部署。
+    """
+    try:
+        sha = subprocess.run(["git", "rev-parse", "--short=12", "HEAD"],
+                             capture_output=True, text=True, check=True,
+                             cwd=HERE).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        sys.exit("拿不到 git sha——镜像 tag 必须可追溯到提交，请在仓库内运行")
+    dirty = subprocess.run(["git", "status", "--porcelain"],
+                           capture_output=True, text=True,
+                           cwd=HERE).stdout.strip()
+    return f"git-{sha}" + ("-dirty" if dirty else "")
+
+
+def resolve_digest(tag: str) -> str:
+    """push 之后把 tag 解析成 image digest。
+
+    runtime 引用 digest 而不是 tag：**tag 是名字，digest 是内容**。
+    IMMUTABLE 已经挡住覆盖 push，但 digest 让"runtime 到底在跑哪个字节序列"
+    变成可验证的事实，而不是依赖仓库策略没被改过。
+    """
+    resp = ecr.describe_images(repositoryName=REPO,
+                              imageIds=[{"imageTag": tag}])
+    return resp["imageDetails"][0]["imageDigest"]
 
 
 def build_and_push(image_uri: str) -> None:
@@ -384,10 +432,14 @@ def main() -> None:
                     help="不重新构镜像，只更新 runtime 配置")
     args = ap.parse_args()
 
-    print("① ECR 仓库")
+    print("① ECR 仓库（tag 不可变）")
     repo_uri = ensure_repo()
-    image_uri = f"{repo_uri}:{IMAGE_TAG}"
+    tag = image_tag()
+    image_uri = f"{repo_uri}:{tag}"
     print(f"   {image_uri}")
+    if tag.endswith("-dirty"):
+        print("   ⚠️  工作区有未提交改动：这个镜像无法从提交复现。"
+              "runtime 是 TCB，正式部署请先提交。")
 
     if args.skip_build:
         print("② 跳过构建（--skip-build）")
@@ -400,7 +452,12 @@ def main() -> None:
     print(f"   {role_arn}")
 
     print("④ AgentCore Runtime")
-    out = deploy_runtime(image_uri, role_arn)
+    # **按 digest 部署，不按 tag**：tag 是名字、digest 是内容。
+    # 见 resolve_digest 的 docstring。
+    digest = resolve_digest(tag)
+    pinned_uri = f"{repo_uri}@{digest}"
+    print(f"   镜像 {pinned_uri}")
+    out = deploy_runtime(pinned_uri, role_arn)
     arn = out.get("agentRuntimeArn", "")
     print(f"   arn: {arn}")
     print(f"   status: {out.get('status', '?')}")

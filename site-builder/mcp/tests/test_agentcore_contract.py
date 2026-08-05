@@ -44,10 +44,13 @@ def test_dockerfile_pins_arm64_and_expected_layout():
 
 
 def test_requirements_floor_supports_request_context():
-    """request_context.request 自 mcp 1.10.0 引入；>=1.9 会让身份识别静默失效。"""
-    req = (MCP_DIR / "requirements.txt").read_text()
+    """request_context.request 自 mcp 1.10.0 引入；>=1.9 会让身份识别静默失效。
+
+    下限声明在 requirements.in（范围真源），锁定产物在 requirements.txt。
+    """
+    req = (MCP_DIR / "requirements.in").read_text()
     m = re.search(r"^mcp>=(\d+)\.(\d+)", req, re.M)
-    assert m, "requirements.txt 必须钉 mcp 下限"
+    assert m, "requirements.in 必须钉 mcp 下限"
     major, minor = int(m.group(1)), int(m.group(2))
     assert (major, minor) >= (1, 10)
 
@@ -487,3 +490,78 @@ def test_owner_stays_writable_by_design():
     import deploy_agentcore as da
     assert "owner" in da.SITE_WRITABLE_ATTRIBUTES
     assert "owner" in da.ROUTE_PROJECTION_ATTRIBUTES
+
+
+# --- TCB 供应链必须可复现、不可变（Codex re-review P1） ---
+# runtime 被攻破 = 任意站点 owner 可被接管（见 SitesWrite 注释）。既然如此，
+# "runtime 跑的是哪份字节"就是安全边界本身，不能依赖可变 tag / 浮动依赖。
+
+def test_ecr_repo_is_created_immutable():
+    """imageTagMutability 省略时 AWS 默认 MUTABLE——任何有 push 权限的主体
+    都能覆盖同名 tag，静默换掉 TCB。必须显式 IMMUTABLE，且对已存在的仓库
+    也要纠正回来。"""
+    src = (MCP_DIR / "deploy_agentcore.py").read_text()
+    block = src[src.index("def ensure_repo"):src.index("def image_tag")]
+    assert '"IMMUTABLE"' in block
+    assert "put_image_tag_mutability" in block, "已存在的仓库也要纠正"
+
+
+def test_no_latest_tag_anywhere():
+    """`latest` 在 IMMUTABLE 仓库下第二次就 push 不上去，且让"线上跑哪份代码"
+    无法回答。"""
+    src = (MCP_DIR / "deploy_agentcore.py").read_text()
+    assert 'IMAGE_TAG = "latest"' not in src
+    assert '"latest"' not in src
+
+
+def test_image_tag_is_traceable_to_a_commit():
+    """tag 必须能对回提交；工作区脏时要在 tag 里体现（不可复现的部署）。"""
+    src = (MCP_DIR / "deploy_agentcore.py").read_text()
+    block = src[src.index("def image_tag"):src.index("def resolve_digest")]
+    assert "rev-parse" in block
+    assert "dirty" in block
+
+
+def test_runtime_is_deployed_by_digest_not_tag():
+    """tag 是名字、digest 是内容。runtime 必须引用 digest。"""
+    src = (MCP_DIR / "deploy_agentcore.py").read_text()
+    assert "resolve_digest" in src
+    main = src[src.index("def main()"):]
+    assert "pinned_uri" in main and "@{digest}" in main
+    # 不得把 tag 形态的 uri 交给 deploy_runtime
+    assert "deploy_runtime(pinned_uri" in main
+
+
+def test_base_image_pinned_by_digest():
+    """`python:3.13-slim` 这个 tag 上游随时会重新指向新镜像。"""
+    df = (MCP_DIR / "Dockerfile").read_text()
+    m = re.search(r"^FROM .*python:3\.13-slim@sha256:[0-9a-f]{64}$", df, re.M)
+    assert m, "基础镜像必须钉 digest"
+    assert "--platform=linux/arm64" in df      # 平台约束不能因此丢掉
+
+
+def test_dependencies_are_hash_locked():
+    """--require-hashes：任何依赖（含传递依赖）少 hash 或对不上即构建失败。"""
+    df = (MCP_DIR / "Dockerfile").read_text()
+    assert "--require-hashes" in df
+    lock = (MCP_DIR / "requirements.txt").read_text()
+    pkgs = re.findall(r"^([A-Za-z0-9._-]+)==", lock, re.M)
+    assert len(pkgs) >= 20, f"锁定清单只有 {len(pkgs)} 个包，像是没含传递依赖"
+    # 每个包都必须至少带一个 hash
+    for pkg in pkgs:
+        seg = lock[lock.index(f"\n{pkg}=="):]
+        seg = seg[:seg.index("\n# via") if "\n# via" in seg[:4000] else 400]
+        assert "--hash=sha256:" in seg, f"{pkg} 没有 hash"
+
+
+def test_mcp_pinned_within_tested_major_version():
+    """锁定的目的是"部署的就是验证过的"。
+
+    全部测试跑在 mcp 1.x 上；让 pip-compile 自由解析到 2.0（主版本跃迁，
+    FastMCP / request_context 无兼容承诺）与这个目的相反。
+    """
+    src = (MCP_DIR / "requirements.in").read_text()
+    assert re.search(r"^mcp>=1\.\d+,<2", src, re.M), "mcp 必须钉上界 <2"
+    lock = (MCP_DIR / "requirements.txt").read_text()
+    m = re.search(r"^mcp==(\d+)\.", lock, re.M)
+    assert m and m.group(1) == "1", f"锁定到了未验证的主版本: {m and m.group(0)}"
