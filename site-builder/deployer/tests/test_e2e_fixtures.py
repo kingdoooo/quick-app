@@ -28,10 +28,28 @@ def cfg():
 
 @pytest.fixture(scope="module")
 def session_cookie(cfg):
+    """合成一个**能通过 Edge 全部检查**的会话 cookie。
+
+    必须带 idp 与 auth_via：Edge 开了 `require_idp_claim=true` 之后，缺这两个
+    claim 的会话会被 302 到登录页，于是后面所有 CRUD 断言都在"根本没到站点"
+    的前提下通过/失败，验的不是它们声称的东西（Codex 审查 2026-08-06 P2）。
+    这两个值必须与 Edge 的 TRUSTED_IDPS / TRUSTED_AUTH_SOURCES 逐字符一致——
+    真机实测过 Cognito 签出的就是 `Feishu` 与 `TokenGeneration_HostedAuth`。
+    idp 从 router/config.ini 读，避免这里和部署配置漂移。
+    """
     from session import mint_session_jwt
     secret = boto3.client("ssm", region_name="us-east-1").get_parameter(
         Name="/site-builder/jwt-secret", WithDecryption=True)["Parameter"]["Value"]
-    return "sb_session=" + mint_session_jwt("e2e@test.com", "E2E Bot", secret)
+    import configparser
+    rc = configparser.ConfigParser(interpolation=None)
+    rc.read(ROOT / "router/config.ini")
+    trusted = rc["SiteBuilder"].get("trusted_idps", "").split("#")[0].strip()
+    idp = trusted.split(",")[0].strip()
+    assert idp, ("router/config.ini 的 trusted_idps 为空——Edge 开关为 true 时"
+                 "任何会话都会被拦，E2E 必然失败")
+    return "sb_session=" + mint_session_jwt(
+        "e2e@test.com", "E2E Bot", secret,
+        idp=idp, auth_via="TokenGeneration_HostedAuth")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -54,12 +72,15 @@ def _ssl_context():
         return ssl.create_default_context()
 
 
-def _req(url, method="GET", cookie=None, body=None):
+def _req(url, method="GET", cookie=None, body=None, extra_headers=None):
     opener = urllib.request.build_opener(
         NoRedirect, urllib.request.HTTPSHandler(context=_ssl_context()))
     headers = {"Content-Type": "application/json"}
     if cookie:
         headers["Cookie"] = cookie
+    # extra_headers 用于"伪造用户头必须被剥除"这类断言——没有它，那条用例
+    # 只是在验"无 cookie 会 302"，与它声称的东西无关（Codex 审查 2026-08-06 P2）
+    headers.update(extra_headers or {})
     req = urllib.request.Request(url, method=method, headers=headers,
                                  data=json.dumps(body).encode() if body else None)
     try:
@@ -114,9 +135,20 @@ def test_notes_site_auth_and_crud(session_cookie, cfg):
     code, _, _ = _req(f"{url}/api/notes/{created['id']}", "DELETE",
                       session_cookie)
     assert code == 204
-    # 3. 伪造用户头被剥除：带假头但无 cookie 仍 302
-    code, headers, _ = _req(url + "/api/notes")
-    assert code == 302
+    # 3a. 伪造用户头 + 无 cookie → 仍 302（假头不能替代会话）
+    fake = {"x-user-email": "attacker@evil.com", "x-user-name": "Attacker"}
+    code, _, _ = _req(url + "/api/notes", extra_headers=fake)
+    assert code == 302, "带伪造用户头竟然被放行"
+    # 3b. 伪造用户头 + **合法 cookie** → 请求成立，但站点看到的必须是 cookie 里
+    #     的身份，不是假头里的。这才是"Edge 无条件剥除客户端头"的真正验证：
+    #     只测 3a 的话，Edge 即使完全不剥头也照样通过（无 cookie 本就 302）。
+    code, _, body = _req(url + "/api/notes", "POST", session_cookie,
+                         {"text": "header-strip probe"}, extra_headers=fake)
+    assert code == 201, body
+    probe = json.loads(body)
+    assert probe["author"] == "e2e@test.com", \
+        f"伪造的 x-user-email 未被剥除，站点看到了 {probe['author']}"
+    _req(f"{url}/api/notes/{probe['id']}", "DELETE", session_cookie)
 
 
 def test_expenses_site_dsql_crud(session_cookie):

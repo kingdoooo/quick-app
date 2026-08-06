@@ -11,3 +11,6 @@ site-builder/contract/build/
 site-builder/mcp/common.py
 .DS_Store
 site-builder/ONBOARDING.md
+
+# 临时设计草稿与给外部审查的上下文（可能含真实资源 ID，不入库）
+docs/design/

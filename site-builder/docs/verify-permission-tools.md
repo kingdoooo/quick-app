@@ -17,13 +17,19 @@
 服务端核对用（只读，不写数据）：
 
 ```bash
-./site-builder/scripts/check_permissions_state.sh <site_id>
-./site-builder/scripts/check_permissions_state.sh <site_id> --watch   # 观察投影生效
+./site-builder/scripts/check_permissions_state.py <site_id>
+./site-builder/scripts/check_permissions_state.py <site_id> --watch   # 观察投影生效
 ```
 
 它打印两张表的权限字段并判定一致性，**区分「影响鉴权的字段」与
 「仅信息性的 permissions_rev」**——后者在刚迁移过的存量站点上必然缺失
 （`migrate_permissions.py` 只写 sites 侧），不是缺陷。
+
+退出码可直接用于验收编排：**0** 一致 / **1** AWS 调用失败或站点不存在
+（状态不可信，**不是**"检查通过"）/ **2** 确实发现不一致。
+第一版是 shell 写的，凭证失效时会打印"路由表无 item、管理员名单空"这种完全
+错误的结论却 exit 0——本机 aws CLI 在 API 错误时也可能返回 exit 0，任何靠
+`|| echo '{}'` 或 `$? -ne 0` 判失败的脚本都会这样。
 
 **用一个新建的 fixture 站点做实验，不要拿现有站点**。现有站点里
 `team-kudos-wall-1d5lpc` 等是验证过的一期产物，改坏了要重部署。

@@ -116,6 +116,36 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# **先确认真实角色没有旁路授权**（Codex 审查 2026-08-06 P1）。
+# 本脚本验的是 mcp-scope 这一份 inline policy 的收窄效果，而 IAM 是把**所有**
+# 适用策略求并集的：真实角色上若还挂着 AmazonDynamoDBFullAccess 或另一条宽泛
+# inline policy，影子角色（只带 mcp-scope）的两条负向 probe 照样 deny、脚本报
+# "全部通过"，而线上 runtime 仍能改 api_target / data_tables。
+# deploy_agentcore.py 只 put_role_policy，不会检查或清掉遗留策略，所以这里必须查。
+echo "── ⓪ 真实角色的策略全集 ─────────────────────────"
+ATTACHED="$(aws_admin iam list-attached-role-policies --role-name "$RUNTIME_ROLE" \
+  --query 'AttachedPolicies[].PolicyName' --output json)"
+INLINE="$(aws_admin iam list-role-policies --role-name "$RUNTIME_ROLE" \
+  --query 'PolicyNames' --output json)"
+echo "  attached: $ATTACHED"
+echo "  inline:   $INLINE"
+if [ "$ATTACHED" != "[]" ]; then
+  echo "FAIL  真实角色挂着 managed policy —— 本脚本只验 mcp-scope，"
+  echo "      有旁路授权时下面的 PASS **不代表线上收窄有效**"
+  FAILURES=$((FAILURES + 1))
+fi
+if ! printf '%s' "$INLINE" | python3 -c "
+import json,sys
+names = json.load(sys.stdin)
+extra = [n for n in names if n != 'mcp-scope']
+if extra:
+    print(f'FAIL  除 mcp-scope 外还有 inline policy: {extra} —— 同上，存在旁路')
+    sys.exit(1)
+print('PASS  真实角色只有 mcp-scope 一条策略，无旁路授权')
+"; then
+  FAILURES=$((FAILURES + 1))
+fi
+
 echo "── ① 影子角色（只复制 DynamoDB statements）────────"
 # --output json 显式指定：操作者的 AWS CLI 默认输出若是 text/table/yaml，
 # 拿到的就不是可用的 policy JSON。
