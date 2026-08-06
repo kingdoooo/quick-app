@@ -26,8 +26,15 @@ from jwt import PyJWKClient
 from session import mint_session_jwt
 
 _jwks_client = None  # 模块级缓存，Lambda 容器复用
-_secret_cache: dict[str, str] = {}
+# (值, 读取时刻) —— 带 TTL，见 _secret 的说明
+_secret_cache: dict[str, tuple[str, float]] = {}
 _ssm_client = None
+# 缓存有效期。Lambda 执行环境可复用数小时，**无 TTL 的缓存会让密钥轮转后
+# warm 容器永久用旧值**，而新容器用新值——登录请求随机落到两类容器，一部分
+# 成功一部分 invalid_client，且没有任何配置变更能触发刷新。
+# 300 秒是延迟与新鲜度的折中：每 5 分钟最多一次 SSM 调用（不会撞节流），
+# 轮转后最长 5 分钟收敛。
+SECRET_TTL_SECONDS = 300
 
 
 def _ssm():
@@ -50,12 +57,24 @@ def _secret(name: str) -> str:
     参数名（见 deploy_auth 的 lambda_env），所以明文不会回到线上配置。
     两个来源都没有时抛错——空密钥签出的 HS256 任何人都能伪造，静默降级
     在这里等于关掉鉴权。
+
+    缓存带 `SECRET_TTL_SECONDS` 的 TTL：无 TTL 时轮转密钥后 warm 容器会永久
+    用旧值（Lambda 执行环境可复用数小时），表现为部分请求成功、部分
+    invalid_client，且改配置也不触发刷新。
+
+    ⚠️ **JWT_SECRET 的轮转不能只靠这个 TTL**：Edge 那份是 CDK 部署时字符串
+    替换注入的（Lambda@Edge 不支持环境变量），改一次要 10-20 分钟全球复制。
+    auth 侧读到新值时 Edge 可能还在用旧值验签 → 这期间新签发的会话全部验签
+    失败，用户登录后立刻被踢回登录页（症状极难定位到密钥版本）。轮转它需要
+    版本化/双密钥或"先让 Edge 同时接受新旧值、复制完成后再切签发"的协调顺序，
+    不在当前实现范围内。
     """
-    if name in _secret_cache:
-        return _secret_cache[name]
+    hit = _secret_cache.get(name)
+    if hit is not None and time.monotonic() - hit[1] < SECRET_TTL_SECONDS:
+        return hit[0]
     direct = os.environ.get(name)
     if direct:
-        _secret_cache[name] = direct
+        _secret_cache[name] = (direct, time.monotonic())
         return direct
     param = os.environ.get(f"{name}_PARAM")
     if not param:
@@ -64,7 +83,7 @@ def _secret(name: str) -> str:
             "SSM 参数。拒绝继续——空密钥签出的会话任何人都能伪造。")
     value = _ssm().get_parameter(Name=param, WithDecryption=True)[
         "Parameter"]["Value"]
-    _secret_cache[name] = value
+    _secret_cache[name] = (value, time.monotonic())
     return value
 
 

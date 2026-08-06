@@ -62,6 +62,61 @@ def test_secret_is_cached_across_calls(monkeypatch):
     assert len(n) == 1, f"应只读一次 SSM，实际 {len(n)} 次"
 
 
+def test_cache_expires_after_ttl(monkeypatch):
+    """缓存必须有 TTL，否则密钥轮转后 warm 容器永久用旧值。
+
+    Codex 审查 2026-08-06 P2。失败场景：轮转 Cognito client secret + SSM 参数
+    但不改 Lambda 配置 → 已有 warm environment 永久用旧 CLIENT_SECRET、新
+    environment 用新值 → 登录请求随机落到两类容器，一部分成功一部分
+    invalid_client，而且**没有任何配置变更能触发刷新**。
+    AWS 说明 Lambda 执行环境可复用数小时，官方 Parameter Store 缓存方案都提供
+    可配置 TTL 正是为此。
+    """
+    n = []
+
+    class _SSM:
+        @staticmethod
+        def get_parameter(Name, WithDecryption=False):
+            n.append(Name)
+            return {"Parameter": {"Value": f"v{len(n)}"}}
+
+    fake_now = [1000.0]
+    lh._secret_cache.clear()
+    monkeypatch.setattr(lh, "_ssm", lambda: _SSM())
+    monkeypatch.setattr(lh.time, "monotonic", lambda: fake_now[0])
+    monkeypatch.delenv("CLIENT_SECRET", raising=False)
+    monkeypatch.setenv("CLIENT_SECRET_PARAM", "/p/cs")
+
+    assert lh._secret("CLIENT_SECRET") == "v1"
+    fake_now[0] += lh.SECRET_TTL_SECONDS - 1      # TTL 内：仍用缓存
+    assert lh._secret("CLIENT_SECRET") == "v1"
+    assert len(n) == 1, "TTL 内不该重读 SSM"
+    fake_now[0] += 2                               # 越过 TTL：重读
+    assert lh._secret("CLIENT_SECRET") == "v2"
+    assert len(n) == 2, "TTL 到期后应重读 SSM"
+
+
+def test_ttl_is_bounded_and_documented():
+    """TTL 要在合理区间：太长等于没有，太短等于每次调用都打 SSM（延迟+节流）。"""
+    assert 60 <= lh.SECRET_TTL_SECONDS <= 900, lh.SECRET_TTL_SECONDS
+
+
+def test_jwt_secret_rotation_hazard_is_documented():
+    """JWT_SECRET 的轮转**不能只靠 TTL**，代码里必须写明这一点。
+
+    Edge 那份 JWT secret 是 CDK 部署时字符串替换注入的（Lambda@Edge 不支持
+    环境变量），且要 10-20 分钟全球复制。auth 侧即使 TTL 到期读到新值，Edge
+    仍在用旧值验签 → 新签发的会话全部验签失败。所以轮转它需要版本化/双密钥
+    或明确的协调切换顺序，不是把 TTL 调短就能解决的。
+    这条测试锁住"文档提醒不被删掉"，因为踩到时的症状（部分用户登录后立刻被
+    踢回登录页）极难定位到密钥版本不一致。
+    """
+    src = (Path(__file__).parents[1] / "login_handler.py").read_text()
+    seg = src[src.index("def _secret"):src.index("def _get_jwks_client")]
+    assert "Edge" in seg and "轮转" in seg, \
+        "_secret 附近必须写明 JWT_SECRET 轮转需与 Edge 协调"
+
+
 def test_env_plaintext_still_honored_for_local_tests(monkeypatch):
     """环境变量直给值时仍可用——单测与本地调试依赖它，且不打 SSM。
 
