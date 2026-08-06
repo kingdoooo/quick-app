@@ -416,3 +416,61 @@ def test_platform_treatment_survives_owner_removal_on_auth_route():
         out = orq.lambda_handler(
             _full_event("auth.example.com", "/logout", f"sb_session={_jwt()}"), None)
     assert orq.PLATFORM_MARK in out["headers"]
+
+
+# --- fail-closed：require_auth / allowed_users 的缺失与错型 ---
+# Codex 审查 2026-08-06 P1：_deser 把 N=0 / 空 L / NULL / 未知类型落到假值，
+# 而判定是 `if not route.get("require_auth"): 放行`——四种形态全部让站点变全公开。
+# 代码注释早就预言了这个后果（"require_auth 变 False 才是灾难"）却没有防住。
+# 实测复现过：missing / N=0 / empty L / NULL 四种都无 cookie 放行。
+
+import pytest
+
+
+@pytest.mark.parametrize("bad", [
+    pytest.param({}, id="require_auth-缺失"),
+    pytest.param({"require_auth": {"N": "0"}}, id="require_auth-N0"),
+    pytest.param({"require_auth": {"L": []}}, id="require_auth-空L"),
+    pytest.param({"require_auth": {"NULL": True}}, id="require_auth-NULL"),
+    pytest.param({"require_auth": {"S": "false"}}, id="require_auth-字符串"),
+    pytest.param({"require_auth": {"M": {}}}, id="require_auth-未知类型M"),
+])
+def test_non_boolean_require_auth_is_fail_closed(bad):
+    """只有**显式 BOOL 值**才能决定公开与否；缺失和错型一律要求登录。
+
+    这些行不是假想：迁移脚本、人工修复、新 writer 都可能写出缺字段或错型的行。
+    fail-open 的后果是私有站点静默全公开，且没有任何告警。
+    """
+    route = {"subdomain": {"S": "app-x"}, "site_id": {"S": "x"},
+             "route_mode": {"S": "api-only"}, "api_target": {"S": "https://x.example"}}
+    route.update(bad)
+    resp = orq._check_auth(_req(), orq._deser(route), "app-x.example.com")
+    assert resp is not None and resp["status"] == "302", \
+        f"{bad} 让未登录请求被放行 —— 站点变全公开"
+
+
+def test_explicit_bool_false_still_makes_site_public():
+    """显式 require_auth=false 必须仍然公开——这是合法的产品能力，别一起改坏。"""
+    route = orq._deser({"subdomain": {"S": "app-x"}, "site_id": {"S": "x"},
+                        "require_auth": {"BOOL": False},
+                        "route_mode": {"S": "api-only"},
+                        "api_target": {"S": "https://x.example"}})
+    assert orq._check_auth(_req(), route, "app-x.example.com") is None
+
+
+def test_missing_allowed_users_does_not_default_to_org():
+    """allowed_users 缺失时不能默认 'org'（= 全组织可见）。
+
+    缺字段说明写入方没有表达意图，默认放宽等于把"未声明"当成"最宽"。
+    正确的默认是最窄：只有 owner/协作者可访问。
+    """
+    route = orq._deser({"subdomain": {"S": "app-x"}, "site_id": {"S": "x"},
+                        "require_auth": {"BOOL": True},
+                        "owner": {"S": "owner@x.com"},
+                        "route_mode": {"S": "api-only"},
+                        "api_target": {"S": "https://x.example"}})
+    # 合法会话但既不是 owner 也不在名单里 → 必须 403
+    r = _req(cookie=f"sb_session={_jwt(email='outsider@x.com')}")
+    resp = orq._check_auth(r, route, "app-x.example.com")
+    assert resp is not None and resp["status"] == "403", \
+        "allowed_users 缺失时默认成了 org，外人被放行"

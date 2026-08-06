@@ -143,14 +143,35 @@ def _extract_subdomain(host: str) -> str:
     return host.split(".")[0]
 
 
+class _Unknown:
+    """未识别 AttributeValue 类型的哨兵。
+
+    **不要用 None/False/"" 之类的常规假值**：鉴权判定里"假值"往往正好是
+    "放宽"的意思（require_auth 为 False = 公开），用假值兜底会让坏数据被当成
+    合法的宽松配置。这个对象不是 bool、不等于任何字面量，下游的类型检查一定
+    会认出它。repr 里带提示，方便在日志里定位坏数据。
+    """
+    def __repr__(self):
+        return "<未识别的 DynamoDB 类型>"
+
+    def __bool__(self):
+        # 真值取 True：万一有分支漏了类型检查而直接 if 判断，也倒向"更严"
+        # （require_auth 为真 = 要求登录），而不是倒向公开。
+        return True
+
+
+_UNKNOWN = _Unknown()
+
+
 def _deser(item: dict) -> dict:
     """DynamoDB AttributeValue -> plain dict（本表用到的类型：S / BOOL / L / N）。
 
-    新增类型必须在此登记：未识别的类型会落到 False。落点不同后果不同——
-    allowed_users 变 False 是 fail-closed（json.loads(False) 抛异常 → 空名单
-    → 仅 owner/协作者可访问，名单成员全 403 = 宕机）；**require_auth 变 False
-    才是灾难**（`if not route.get("require_auth")` 直接放行 = 鉴权整段关闭，
-    站点全公开）。加字段前先加解析，尤其是任何会投影到 require_auth 的类型。
+    未识别类型落到 **`_UNKNOWN` 而不是 False**。原来兜底成 False 是个陷阱：
+    `require_auth` 的公开判定恰好是"值为 False"，于是 `{"NULL":true}` 或任何
+    新类型都会被当成"站主显式声明了公开"，鉴权整段关闭（实测 2026-08-06）。
+    换成一个既不等于 False、也不是布尔的哨兵值，让下游的
+    `isinstance(x, bool)` 检查能把它认成坏数据并 fail-closed。
+    加字段前仍要在此登记类型——哨兵只保证失败方向安全，不代表可以不登记。
     """
     out = {}
     for k, v in item.items():
@@ -163,7 +184,7 @@ def _deser(item: dict) -> dict:
         elif "N" in v:
             out[k] = int(v["N"])
         else:
-            out[k] = False
+            out[k] = _UNKNOWN
     return out
 
 
@@ -362,8 +383,19 @@ def _check_auth(request, route, host):
     request["headers"].pop("x-user-name", None)
     request["headers"].pop(PLATFORM_MARK, None)
 
-    if not route.get("require_auth"):
+    # **只有显式布尔 False 才公开**（fail-closed）。
+    # 原来写的是 `if not route.get("require_auth")`，于是缺字段（None）、
+    # `{"N":"0"}`（0）、`{"L":[]}`（[]）、`{"NULL":true}` 与任何未识别类型
+    # （_deser 落到 False）全部走进"放行"分支——私有站点静默全公开，无告警。
+    # 迁移脚本、人工修复、新 writer 任一写出这样的行就会触发（实测四种形态
+    # 都能放行，2026-08-06）。缺字段说明写入方没表达意图，此时必须取最严。
+    require_auth = route.get("require_auth")
+    if require_auth is False:
         return None
+    if not isinstance(require_auth, bool):
+        # 错型/缺失：当作需要登录，并留一行日志便于定位坏数据来源
+        print(f"[WARN] route {route.get('subdomain')!r} 的 require_auth 不是布尔"
+              f"（{type(require_auth).__name__}={require_auth!r}），按需要登录处理")
 
     token = _get_cookie(request, "sb_session")
     claims = _verify_session_jwt(token) if token else None
@@ -384,7 +416,10 @@ def _check_auth(request, route, host):
             return _redirect_login(host, request.get("uri", "/"),
                                    request.get("querystring", ""))
 
-    allowed = route.get("allowed_users", "org")
+    # 缺失时**不能默认 "org"**（= 全组织可见）：缺字段说明写入方没有表达意图，
+    # 把"未声明"当成"最宽"是 fail-open。默认取最窄——空名单，于是只有
+    # owner/协作者（下面的 insiders 例外）能进。
+    allowed = route.get("allowed_users") if "allowed_users" in route else []
     if allowed != "org":
         if isinstance(allowed, list):
             allowlist = allowed
