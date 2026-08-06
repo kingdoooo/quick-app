@@ -26,6 +26,28 @@ if (!ENDPOINT || !CLIENT_ID) {
 }
 const TOKEN_PATH = path.join(process.env.HOME, '.site-builder-deploy-token.json');
 
+/**
+ * 原子且仅本人可读地写 token 文件。
+ *
+ * 两个都是实测确认的问题（Codex 审查 2026-08-06 P1）：
+ * ① 裸 writeFileSync 不给 mode，在常见 umask 022 下文件是 **0644**——同机
+ *    其他用户可读 refresh token。mcp client 是 public（无 secret），拿到
+ *    refresh token 只需公开的 client ID 就能持续换 access token，以受害者身份
+ *    部署、改权限、下线站点。当前 refresh 有效期 1 天，不是一次性泄漏。
+ *    注意 mode 会被 umask 削减但不会被放宽，且**已存在的文件 mode 不变**，
+ *    所以写完显式 chmod 一次（修复已泄漏的旧文件）。
+ * ② 直接覆写不是原子的：两个代理进程并发刷新、或写入中途崩溃，会留下截断的
+ *    JSON，下次启动解析失败即等于丢失授权。改为写临时文件再 rename（同目录，
+ *    保证同一文件系统，rename 才是原子的）。
+ */
+function writeTokenFile(tokenPath, obj) {
+  const tmp = `${tokenPath}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, tokenPath);
+  fs.chmodSync(tokenPath, 0o600);
+}
+
+
 // --- token 管理 ---
 
 function loadToken() {
@@ -57,7 +79,7 @@ async function refreshToken(tokenData) {
       expires_at: fresh.expires_in ? Date.now() + fresh.expires_in * 1000
                                    : tokenData.expires_at,
     };
-    fs.writeFileSync(TOKEN_PATH, JSON.stringify(updated, null, 2));
+    writeTokenFile(TOKEN_PATH, updated);
     return updated;
   } catch {
     return null;

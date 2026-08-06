@@ -66,9 +66,27 @@ def _purge_dsql(site_id: str) -> str:
                            password=token, sslmode="require", autocommit=True)
     try:
         cur = conn.cursor()
+        # **精确匹配这两个角色，不要用 LIKE 前缀**。
+        # dsql_schema_for 把连字符删掉（site_id.replace("-","")），所以不同
+        # site_id 会产生有前缀关系的 schema 名：
+        #   `aa-abc123`       → site_aaabc123
+        #   `aaabc123-def456` → site_aaabc123def456
+        # 用 LIKE 'site_aaabc123%' 会连后者的 _app/_mig 一起撤销——那个站点的
+        # 数据还在，但运行时与迁移器失去角色映射，立刻断连、后续部署也失败。
+        # site_id 的 name 段用户可控，可被刻意构造（Codex 审查 2026-08-06 P1）。
         cur.execute("SELECT arn, pg_role_name FROM sys.iam_pg_role_mappings "
-                    "WHERE pg_role_name LIKE %s", (f"{schema}%",))
+                    "WHERE pg_role_name IN (%s, %s)",
+                    (f"{schema}_app", f"{schema}_mig"))
+        # 纵深防御：**不信任查询结果**，逐行再核一次角色名。
+        # REVOKE 的 role 是字符串拼进 SQL 的（DSQL 的 AWS IAM REVOKE 不支持
+        # 参数化），而"撤错角色"的后果是另一个站点静默断连——这类不可逆操作
+        # 值得在执行前再确认一次目标，哪怕上面的查询已经收窄。
+        expected_roles = {f"{schema}_app", f"{schema}_mig"}
         for arn, role in cur.fetchall():
+            if role not in expected_roles:
+                logger.error(f"跳过不属于本站点的角色映射: {role}（预期 "
+                             f"{sorted(expected_roles)}）——查询条件可能被改坏")
+                continue
             try:
                 cur.execute(f"AWS IAM REVOKE {role} FROM '{arn}'")
             except Exception as e:
