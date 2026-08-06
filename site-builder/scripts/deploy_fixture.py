@@ -42,6 +42,18 @@ def main(fixture_dir: str, owner: str = "fixture@test"):
     s3.put_object(Bucket=f"site-artifacts-{ACCT}", Key=f"uploads/{job_id}.zip",
                   Body=buf.getvalue())
     now = datetime.now(timezone.utc).isoformat()
+    # **必须先建 sites 记录**：MCP 的 do_deploy_site 会调 common.upsert_site 写
+    # owner/name/status，而本脚本绕过 MCP 直接起状态机——不写的话 sites 表里
+    # 没有 owner（register_route 会从 job 兜底写进路由表，所以只有真源缺失，
+    # 两表不一致）。后果：role_of() 判调用者不是 owner，全部权限工具拒绝，
+    # 症状看起来像"工具坏了"。实测踩过（2026-08-06）。
+    boto3.resource("dynamodb", region_name="us-east-1").Table(
+        CFG["Deployer"]["sites_table"]).update_item(
+            Key={"site_id": site_id},
+            UpdateExpression=("SET #o = :o, #n = :n, #s = :s"),
+            ExpressionAttributeNames={"#o": "owner", "#n": "name", "#s": "status"},
+            ExpressionAttributeValues={":o": owner, ":n": manifest["name"],
+                                       ":s": "DEPLOYING"})
     boto3.resource("dynamodb", region_name="us-east-1").Table(
         CFG["Deployer"]["jobs_table"]).put_item(Item={
             "job_id": job_id, "site_id": site_id, "owner": owner,

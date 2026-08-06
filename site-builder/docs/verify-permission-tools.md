@@ -62,8 +62,12 @@ python3 site-builder/scripts/deploy_fixture.py \
       （这一步才证明 Edge 真按新策略执行；只看表里的值不算）
 - [ ] 改回 `require_login=true` → 未登录访问恢复 302
 - [ ] `allowed_users=["你的邮箱"]` → 你仍能访问
-- [ ] 🔸 `allowed_users=["别人的邮箱"]`（不含你）→ **你自己被拦**
-      （这一项能自己验：把名单设成一个你没登录过的邮箱，你就该被 302/403）
+- [x] `allowed_users=["别人的邮箱"]`（不含你）→ **你仍能访问，这是正确的**：
+      `origin_request.py` 里 owner 与 collaborator **隐式在名单内**
+      （注释原文：他们能改这个名单，要求他们把自己也写进去只会制造"把自己锁在
+      门外"的工单）。所以这一项验的是**免锁例外生效**，不是名单拦截。
+- [ ] 🔸 名单拦截本身**必须用第三方身份验**（既非 owner 也非协作者）——
+      owner 自己永远进得去，用自己测名单等于没测。无第二账号时此项无法验证。
 - [ ] `permissions_rev` 每次写入递增，`permissions_updated_by` == 你的邮箱
 - [ ] 两表 `allowed_users` 一致（脚本判定「鉴权字段两表一致」）
 
@@ -107,3 +111,49 @@ python3 site-builder/scripts/deploy_fixture.py \
 
 发现的产品缺口（错误信息看不懂、需要翻源码才知道怎么用、Agent 会误用的
 参数语义）也记在这里，那些是二期 M3 控制台要解决的输入。
+
+---
+
+## 验证结果（2026-08-06，站点 notes-01d147，身份 owner + 平台管理员）
+
+通道：**Claude Code 走 stdio 代理**（`clients/quick-desktop-proxy`）。直连 HTTP
+transport 走不通——Claude Code 按 MCP 新版规范发 RFC 8707 的 `resource` 参数，
+Cognito 不支持，token 交换返回 `invalid_grant`（客户端日志是
+`Error during auth completion`）。三次对照实验定位：带 scope 无 resource → 成功；
+无 scope 无 resource → 成功；带 resource → 失败。**scope 缺失不是根因**。
+
+### 通过的项
+
+| 项 | 实测 |
+|---|---|
+| `get_site_permissions` 字段与角色 | 五字段齐全，`my_role=owner` |
+| `update_site_permissions` 双写 | `require_login` 改动两表同步，`permissions_rev` 每次递增（1→8），`permissions_updated_by` 正确 |
+| **Edge 真按新策略执行** | `require_login=false` → 未登录 200（约 10 秒生效）；改回 `true` → 恢复 302（约 40 秒）。两个方向都验过 |
+| owner/collaborator 免锁例外 | `allowed_users` 设成不含自己的名单后仍能访问（`origin_request.py` 显式设计） |
+| `add`+`transfer_owner` 互斥 | 报错且**零副作用**：collaborators 空、owner 未变、rev 未推进 |
+| 三参数全空 | 报错「需要指定 add / remove / transfer_owner 之一」 |
+| `add` / `remove` 双写 | 两表同步；重复 add 幂等（名单不重复） |
+| `transfer_owner` 自动降级 | 转出后原 owner 进 collaborators（防转错人失去访问）；转回同样正确 |
+| admin 优先于 collaborator | 转出后 `my_role=admin` 而非 `collaborator`——印证 `role_of` 注释里的排序理由 |
+| admin 代管 | 非 owner 身份仍可改权限、可转移所有权 |
+| **admin 撤销立刻生效** | 从 admins 表删掉自己后，同一调用立刻被拒（强一致读，无缓存窗口） |
+| `list_my_sites` 走 GSI | 10 个站点全返回，`role` 正确，含新建站点 |
+
+### 未验证（需要第二个飞书账号）
+
+- **名单拦截本身**：owner 与 collaborator 隐式在名单内，用自己测等于没测。
+- 协作者视角的越权：以协作者身份调 `manage_collaborators` / `undeploy_site` 应被拒。
+- 并发冲突（409）：需要两个身份或两个终端同时写。
+
+### 发现的产品缺口
+
+1. **不存在的 site_id 报「你无权访问」**。这是刻意的（`role_of` 对 `site=None`
+   返回 `ROLE_NONE`，避免枚举探测），但打错一个字符时提示会让人以为是权限问题
+   而去找 owner 加名单。控制台（M3）应能区分这两种情况。
+2. **重复 add 同一协作者也推进 `permissions_rev`**（4→6）。不影响正确性
+   （rev 只用于并发条件），但"无实际变更也算一次修改"会让审计日志有噪声。
+3. `deploy_fixture.py` 曾不写 sites 记录（已修）：它绕过 MCP 直接起状态机，而
+   `do_deploy_site` 才调 `upsert_site` 写 owner。缺 owner 时站点**能正常访问**
+   （Edge 只读路由表，owner 由 register_route 从 job 兜底写入），但所有权限
+   工具都判你不是 owner——症状看起来像"工具坏了"。
+
