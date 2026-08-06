@@ -17,6 +17,10 @@ endpoint = CFG["MCP"]["endpoint_url"]
 client_id = CFG["Cognito"]["mcp_client_id"]
 pool = CFG["Cognito"]["user_pool_id"]
 region = CFG["Platform"]["region"]
+# 两条客户端通道都走这个 stdio 代理（Claude Code 直连会因 RFC 8707 resource
+# 参数被 Cognito 拒，Quick Desktop 的 Remote MCP 不支持 OAuth）。
+# 用绝对路径：用户可能从任意目录跑生成出的命令。
+proxy_dir = ROOT / "clients/quick-desktop-proxy"
 
 assert endpoint and client_id, "config.ini [MCP]/[Cognito] 未回填——先完成 DEPLOY.md ①⑤"
 
@@ -38,22 +42,32 @@ OUT.write_text(f"""# Site Builder 接入指引（组织内用户）
 
 在仓库根目录（或任何拿到 `site-builder/skills/` 目录拷贝的位置）执行：
 
+**MCP 走本地 stdio 代理，不要用 HTTP transport 直连**：Claude Code 会在 OAuth
+请求里带 RFC 8707 的 `resource` 参数，而 Cognito 不支持——授权页能走完但换
+token 报 `invalid_grant`，状态卡在 `! Needs authentication`（2026-08-06 实测）。
+
 ```bash
 # 1) 安装建站 Skill
 mkdir -p ~/.claude/skills
 cp -r site-builder/skills/site-builder ~/.claude/skills/
 
-# 2) 注册部署 MCP（一字不改，直接复制）
-claude mcp add --transport http site-builder-deploy \\
+# 2) 授权一次（浏览器飞书登录，token 落盘 ~/.site-builder-deploy-token.json）
+node {proxy_dir}/auth.js \\
   "{endpoint}" \\
-  --client-id {client_id} --callback-port 18765
+  "{client_id}"
+
+# 3) 注册部署 MCP（stdio 形态；URL 与 client_id 必须是两个独立参数）
+claude mcp add site-builder-deploy -- \\
+  node {proxy_dir}/index.js \\
+  "{endpoint}" \\
+  "{client_id}"
 ```
 
-3) 完成 OAuth：任意 Claude Code 会话里输入 `/mcp` → 选 `site-builder-deploy`
-   → `Authenticate` → 浏览器弹出飞书登录，登录即完成。
-   `claude mcp list` 显示 ✓ connected 即就绪。
+4) **重启 Claude Code**（stdio server 在启动时加载），然后 `/mcp` 应显示 8 个
+   工具、不再要求授权。若显示需要认证，检查配置里存的是 **3 个** args
+   （脚本路径 / endpoint / client_id）——shell 引号有时会把后两个粘成一个。
 
-4) 验证：新会话说一句
+5) 验证：新会话说一句
    > 用 site-builder 技能列出我部署的站点
    应返回列表（首次为空数组）。
 

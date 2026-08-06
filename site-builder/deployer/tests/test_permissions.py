@@ -97,6 +97,39 @@ def test_assert_can_raises_for_missing_site():
         perm.assert_can("o@x.com", None, "read", what="站点 s-9")
 
 
+def test_denied_message_does_not_leak_site_existence():
+    """站点不存在与确实无权**必须报同一句话**。
+
+    区分开就成了枚举探测器：site_id 形如 `{name}-{6位hex}`，可猜；能区分
+    存在性就能扫出全部站点。所以 role_of 对 site=None 返回 ROLE_NONE、
+    与"外人访问已存在站点"走同一分支——这是有意的，不要"修"。
+    """
+    missing = outsider = None
+    try:
+        perm.assert_can("o@x.com", None, "read", what="站点 s-9")
+    except perm.PermissionDenied as e:
+        missing = str(e)
+    try:
+        perm.assert_can("x@x.com", SITE, "read", what="站点 s-9")
+    except perm.PermissionDenied as e:
+        outsider = str(e)
+    assert missing == outsider, (
+        f"两种拒绝的文案必须一致，否则可据此枚举站点：\n"
+        f"  不存在: {missing}\n  无权:   {outsider}")
+
+
+def test_denied_message_hints_to_check_the_id():
+    """文案要提示"也可能是站点不存在"，否则打错一个字符的人会去找 owner 加名单。
+
+    这不泄漏信息——两种情况仍然返回同一句话，只是让使用者知道该先查拼写。
+    """
+    try:
+        perm.assert_can("x@x.com", SITE, "read", what="站点 s-1")
+    except perm.PermissionDenied as e:
+        msg = str(e)
+    assert "不存在" in msg, f"应提示可能是站点不存在，实际：{msg}"
+
+
 def test_is_admin_false_when_absent(aws):
     assert perm.is_admin("nobody@x.com") is False
 

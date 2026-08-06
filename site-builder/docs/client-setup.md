@@ -30,35 +30,50 @@ email 注入 access token。客户端无需任何额外配置；若 owner 取不
 ```bash
 mkdir -p ~/.claude/skills
 cp -r site-builder/skills/site-builder ~/.claude/skills/
-
-# MCP（HTTP transport，OAuth 走浏览器授权）。
-# 必须带 --client-id 与固定回调端口：Cognito 不支持 RFC 7591 dynamic client
-# registration，裸 add 会报 "Incompatible auth server: does not support
-# dynamic client registration"（2026-07-29 实测）。
-# 端口用 18765：8765/8766 被 Quick Desktop 的 quickwork-agent 常驻占用
-# （演示机上必装 Quick Desktop，冲突必现）。
-claude mcp add --transport http site-builder-deploy "{mcp_endpoint_url}" \
-  --client-id {mcp_client_id} --callback-port 18765
 ```
 
-还要在 deploy-mcp app client 的 CallbackURLs 里**预注册**
-`http://localhost:18765/callback`（与 AgentCore 的 identities 回调并存）：
+**MCP 必须走 stdio 代理，不能用 HTTP transport 直连**（2026-08-06 实测）。
+原因：Claude Code 按 MCP 新版规范在 OAuth 请求里带 RFC 8707 的 `resource`
+参数（Resource Indicator），而 **Cognito 不支持它**——授权页能走完、拿到
+授权码，但换 token 时返回 `invalid_grant`，客户端日志里是
+`Error during auth completion`，状态卡在 `! Needs authentication`。
+
+> 三次对照实验定位（带 scope 无 resource → 成功；无 scope 无 resource → 成功；
+> 带 resource → 失败）。**scope 缺失不是原因**，`resource` 才是。这与本平台
+> 的配置无关，任何用 Cognito 当 authorization server 的 MCP 部署都会遇到。
+
+代理（`site-builder/clients/quick-desktop-proxy/`，纯 Node 18+ 内置模块，
+免 npm install）自己实现 OAuth 且**不发 `resource`**，正好绕过：
 
 ```bash
-aws cognito-idp update-user-pool-client --region us-east-1 \
-  --user-pool-id {user_pool_id} --client-id {mcp_client_id} \
-  --client-name deploy-mcp --refresh-token-validity 30 \
-  --supported-identity-providers Feishu \
-  --callback-urls "https://bedrock-agentcore.us-east-1.amazonaws.com/identities/oauth2/callback" \
-                  "http://localhost:18765/callback" \
-  --allowed-o-auth-flows code --allowed-o-auth-scopes openid email \
-  --allowed-o-auth-flows-user-pool-client --enable-token-revocation \
-  --auth-session-validity 3 \
-  --explicit-auth-flows ALLOW_USER_SRP_AUTH ALLOW_REFRESH_TOKEN_AUTH
+# ① 先授权一次，token 落盘到 ~/.site-builder-deploy-token.json
+node site-builder/clients/quick-desktop-proxy/auth.js \
+  "{mcp_endpoint_url}" "{mcp_client_id}"
+
+# ② 以 stdio 形态加入（Claude Code 不参与 OAuth，token 由代理注入并刷新）
+claude mcp add site-builder-deploy -- \
+  node /绝对路径/site-builder/clients/quick-desktop-proxy/index.js \
+  "{mcp_endpoint_url}" "{mcp_client_id}"
 ```
 
-配好后 `claude mcp list` 显示 `! Needs authentication`，在 Claude Code 会话里
-`/mcp` → 选 site-builder-deploy → Authenticate，浏览器走飞书登录完成授权。
+⚠️ **URL 与 client_id 必须是两个独立参数**。实测踩过：在 `--` 之后用引号包
+URL 时 shell 可能吞掉参数间的空格，两个值粘成一个，代理因缺 client_id 直接
+退出。加完用这条确认存了 **3 个** args：
+
+```bash
+python3 -c "import json;d=json.load(open('$HOME/.claude.json'));\
+print(d['projects']['$PWD']['mcpServers']['site-builder-deploy']['args'])"
+```
+
+**加完必须重启 Claude Code**（stdio server 在启动时加载），然后 `/mcp` 应显示
+8 个工具、无需再授权。
+
+代理需要 `http://localhost:18765/callback` 已在 mcp client 的 CallbackURLs 里
+（`deploy_pool.py` 默认就注册了；端口选 18765 是因为 8765/8766 被 Quick Desktop
+的 quickwork-agent 常驻占用）。**不要用 `aws cognito-idp update-user-pool-client`
+手工改这个 client**——该 API 是整体替换语义，漏掉任一字段就会把二期收紧的边界
+打回默认（原生认证 flow 被重开、refresh TTL 回到 30 天）。要改就重跑
+`deploy_pool.py`。
 
 新会话里提示：
 
@@ -118,13 +133,18 @@ npx @modelcontextprotocol/inspector
 | 换另一个账号调 `get_deploy_status(别人的 job)` | 报"你不是…所有者" | owner 校验被绕过 |
 | 完整部署一次 | 拿到 URL 且浏览器能飞书登录访问 | 见 DEPLOY.md 各阶段排查 |
 
-## 已知客户端差异（2026-07-29 两通道均真机验证）
+## 已知客户端差异（2026-08-06 复核）
+
+**两条通道现在都走同一个 stdio 代理**——原本只有 Quick Desktop 需要它
+（Remote MCP 不支持 OAuth），2026-08-06 发现 Claude Code 也必须用
+（它发的 `resource` 参数 Cognito 不认，见上面 Claude Code 一节）。
 
 | | Claude Code | Quick Desktop |
 |---|---|---|
-| MCP 接入 | 原生 HTTP transport | Local stdio 代理（Remote MCP 不支持 OAuth） |
-| OAuth | 内置（`--client-id` + `--callback-port`） | 代理的 auth.js（RFC 9728 发现 + PKCE） |
-| token 管理 | 客户端自动 | 代理落盘 `~/.site-builder-deploy-token.json` + 自动续期 |
+| MCP 接入 | Local stdio 代理 | Local stdio 代理 |
+| 不能直连的原因 | 发 RFC 8707 `resource`，Cognito 返回 `invalid_grant` | Remote MCP 只支持静态 Headers，不支持 OAuth |
+| OAuth | 代理的 auth.js（RFC 9728 发现 + PKCE，不发 resource） | 同左 |
+| token 管理 | 代理落盘 `~/.site-builder-deploy-token.json` + 自动续期 | 同左 |
 | Skill 导入 | `cp -r` 到 `~/.claude/skills/` | profile 的 skills 目录（如 `~/.quickwork/profiles/{profile}/skills/`） |
 
 Quick MCP 工具调用 60 秒超时是本方案异步化的原因——所有工具秒级返回，

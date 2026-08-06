@@ -68,7 +68,13 @@ def assert_can(email: str, site: dict | None, action: str, *,
     if not can(role, action):
         target = what or "该站点"
         if role == ROLE_NONE:
-            raise PermissionDenied(f"你无权访问 {target}")
+            # **两种情况共用这一句**：站点不存在（role_of 对 site=None 返回
+            # ROLE_NONE）与"存在但你不在名单里"。区分开就是枚举探测器——
+            # site_id 形如 {name}-{6位hex}，可猜，能区分存在性就能扫出全部站点。
+            # 但文案要点出"或不存在"：打错一个字符时，只说"无权访问"会让人
+            # 去找 owner 加名单，而真正该做的是查拼写。提示它不泄漏任何信息，
+            # 因为两种情况返回的仍是同一句话。
+            raise PermissionDenied(f"你无权访问 {target}（或该站点不存在）")
         raise PermissionDenied(f"{target}：{role} 角色无权执行 {action}")
     return role
 
