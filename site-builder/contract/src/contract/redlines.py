@@ -30,8 +30,33 @@ FORBIDDEN_DDL = ["REFERENCES", "SERIAL", "JSONB", "CREATE TRIGGER", "CREATE TEMP
 # 为什么值得一条红线：漏掉时**不报错**，而是把 `%E5%BD%AD…` 当人名显示、写库，
 # 变成静默脏数据（真实站点 team-kudos-wall 就这样存了一批编码串，事后只能清洗）。
 # 大小写都认：HTTP 头名不区分大小写，Express 的 req.get() 也不区分。
-X_USER_NAME_RE = re.compile(r"""x-user-name""", re.I)
+# 直接字面量，或 `'x-user-' + 'name'` 这类拼接（实测拼接能绕过纯字面量匹配）。
+# 完整求值字符串不可能用正则做，但拼接片段是可穷举的常见写法。
+X_USER_NAME_RE = re.compile(
+    r"x-user-name"
+    r"|x-user-['\"`]\s*\+\s*['\"`]name", re.I)
 DECODE_RE = re.compile(r"decodeURIComponent\s*\(")
+# 行注释 / 块注释 / 字符串字面量——判定解码调用前要先剥掉它们，否则
+# `// TODO: decodeURIComponent(raw)` 或 `log('记得 decodeURIComponent(x)')`
+# 就能让整个文件过关，而实际代码拿到的还是编码串（实测两种都能绕过）。
+_COMMENTS_AND_STRINGS_RE = re.compile(
+    r"//[^\n]*"           # 行注释
+    r"|/\*.*?\*/"          # 块注释（跨行）
+    r"|'(?:\\.|[^'\\\n])*'"   # 单引号字符串
+    r'|"(?:\\.|[^"\\\n])*"'   # 双引号字符串
+    r"|`(?:\\.|[^`\\])*`",     # 模板字符串（可跨行）
+    re.S)
+
+
+def _strip_comments_and_strings(text: str) -> str:
+    """把注释与字符串字面量替换成等长空白，用于"这里真的有代码调用吗"的判断。
+
+    等长替换（而不是删除）让行列位置不漂移，便于以后要报行号时复用。
+    注意这是启发式的：正则解析 JS 不可能完全正确（正则字面量、嵌套模板等），
+    但方向是安全的——**误删代码会导致误报（多拦一个站点），不会漏放**。
+    """
+    return _COMMENTS_AND_STRINGS_RE.sub(
+        lambda m: re.sub(r"\S", " ", m.group(0)), text)
 
 
 def _read_all(root: Path) -> list[tuple[Path, str]]:
@@ -68,7 +93,10 @@ def _check_user_name_decoded(text: str, rel: Path) -> list[str]:
     这条红线要挡的是"完全不知道需要解码"，不是审查解码位置是否精确。
     宁可漏报这种少见的跨文件写法，也不要因为误报把合规站点挡在部署外。
     """
-    if X_USER_NAME_RE.search(text) and not DECODE_RE.search(text):
+    # 头名的出现照原文找（它常写在字符串里，剥掉就找不到了）；
+    # 解码调用必须在**剥掉注释与字符串之后**仍然存在，才算真的调用了。
+    if X_USER_NAME_RE.search(text) and not DECODE_RE.search(
+            _strip_comments_and_strings(text)):
         return [f"{rel}: 用了 x-user-name 但没有 decodeURIComponent —— 该头是 "
                 "URL 编码的（HTTP 头不能携带中文），不解码会把 %E5%BD%AD 这类 "
                 "编码串当成用户名显示或写库（静默脏数据，不会报错）"]

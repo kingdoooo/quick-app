@@ -331,3 +331,58 @@ def test_frontend_x_user_name_also_checked(tmp_path):
     """前端也可能拿到这个头（经后端透传到页面），同样要解码。"""
     d, m = make_site(tmp_path, index="const n = data['x-user-name'];")
     assert any("decodeURIComponent" in v for v in scan_redlines(d, m))
+
+
+def test_commented_out_decode_does_not_satisfy_the_redline(tmp_path):
+    """注释里的 decodeURIComponent( 不算解码（Codex 审查 2026-08-06 P2，已复现）。
+
+    文件级判定原本用裸正则找 `decodeURIComponent(`，于是
+    `// TODO: decodeURIComponent(raw)` 这行就能让整个文件过关，而实际代码里
+    拿到的还是编码串。放宽到文件级是有意的（取值与解码常不在一行），但不能
+    连"根本没调用"都放过。
+    """
+    d, m = make_site(tmp_path, server=(
+        "app.get('/api/health',(q,s)=>s.send('ok'));\n"
+        "// TODO: decodeURIComponent(raw)\n"
+        "const raw = req.headers['x-user-name'];\n"
+        "store(raw);"))
+    assert any("decodeURIComponent" in v for v in scan_redlines(d, m))
+
+
+def test_string_literal_decode_does_not_satisfy_the_redline(tmp_path):
+    """字符串里的伪调用同样不算——常见于日志文案。"""
+    d, m = make_site(tmp_path, server=(
+        "app.get('/api/health',(q,s)=>s.send('ok'));\n"
+        "log('记得 decodeURIComponent(name)');\n"
+        "const n = req.headers['x-user-name'];"))
+    assert any("decodeURIComponent" in v for v in scan_redlines(d, m))
+
+
+def test_block_comment_decode_does_not_satisfy_the_redline(tmp_path):
+    d, m = make_site(tmp_path, server=(
+        "app.get('/api/health',(q,s)=>s.send('ok'));\n"
+        "/* decodeURIComponent(x) 见文档 */\n"
+        "const n = req.headers['x-user-name'];"))
+    assert any("decodeURIComponent" in v for v in scan_redlines(d, m))
+
+
+def test_concatenated_header_name_is_detected(tmp_path):
+    """拼接出的 header 名也要认出来（实测 `'x-user-' + 'name'` 能绕过）。
+
+    完整的字符串求值不可能用正则做，但**拼接片段**是可穷举的常见写法：
+    只要文件里同时出现 `x-user-` 与紧跟的 name 片段，就该要求解码。
+    """
+    d, m = make_site(tmp_path, server=(
+        "app.get('/api/health',(q,s)=>s.send('ok'));\n"
+        "const h = 'x-user-' + 'name';\n"
+        "store(req.headers[h]);"))
+    assert any("decodeURIComponent" in v for v in scan_redlines(d, m))
+
+
+def test_real_decode_still_passes_with_comments_around(tmp_path):
+    """真调用 + 周围有注释时不能误报（否则合规站点被挡在部署外）。"""
+    d, m = make_site(tmp_path, server=(
+        "app.get('/api/health',(q,s)=>s.send('ok'));\n"
+        "// x-user-name 是 URL 编码的\n"
+        "const n = decodeURIComponent(req.headers['x-user-name'] || '');"))
+    assert scan_redlines(d, m) == []
