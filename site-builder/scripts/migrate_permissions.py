@@ -156,7 +156,15 @@ def migrate(routing_table: str, *, dry_run: bool = True) -> dict:
                 report["planned"][site_id] = planned
                 if dry_run:
                     continue
-                # 条件写 + rev=1，与 register_route 的 seed 完全同构：
+                # 条件写 + rev=1，与 register_route 的 seed **同源但条件更窄**：
+                # 那边的 ConditionExpression 还包含
+                # `attribute_not_exists(permissions_rev)`（部署路径必须保证 rev
+                # 存在，否则快照守卫会把合法部署卡死）；本脚本刻意不加那一项。
+                # 理由：两个 auth 字段都在时上面的 skip 判定已经**不碰这行**，
+                # 而这种"有 auth 字段、缺 rev"的稀疏行不会被卡住——首次在线权限
+                # 写入的 SET 子句里就有 `permissions_rev = :nrev`，会把它补成 1
+                # （已用 moto 实测：owner 与 collaborator 都能正常写入，外人仍被
+                # 拒）。在这里额外补 rev 要重新取路由表的值，反而多一次扩权风险。
                 # ① attribute_not_exists(require_login)——迁移读快照与写入之间
                 #    若有部署把权限 seed 进来了，绝不能用路由表旧值（可能是
                 #    "org"）盖掉刚 seed 的更紧策略（upsert_site 无条件写做不到

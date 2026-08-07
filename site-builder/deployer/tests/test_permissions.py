@@ -747,3 +747,29 @@ def test_snapshot_condition_system_writer_is_fail_closed():
     expr, _, _ = p.snapshot_condition(rev=0, had_rev=False)
     # 要求 rev 属性存在 → 本次必然失败 → 调用方重读重试，而不是被放行
     assert "attribute_exists(permissions_rev)" in expr
+
+
+def test_legacy_sparse_row_without_rev_self_heals_on_first_write(aws):
+    """存量稀疏行（有 auth 字段、缺 permissions_rev）必须能被正常写入并补上 rev。
+
+    为什么要钉住：register_route 的 seed 现在**要求** rev 存在（守卫 fail-closed），
+    而 migrate_permissions 对这种行是 skip 的（两个 auth 字段都在）。所以"这种行
+    靠首次在线写入自愈"是整条链的前提——它一旦不成立，这批站点会被永久卡死。
+    """
+    import common
+    common.upsert_site("legacy-1", owner="o@x.com", require_login=True,
+                       allowed_users="org", collaborators=[])
+    assert "permissions_rev" not in common.get_site("legacy-1")
+    perm.set_access_policy("legacy-1", actor="o@x.com", require_login=False)
+    assert int(common.get_site("legacy-1")["permissions_rev"]) == 1
+
+
+def test_legacy_sparse_row_still_rejects_outsider(aws):
+    """自愈路径不能顺带放宽鉴权：无 rev 的行上外人仍必须被拒。"""
+    import common
+    common.upsert_site("legacy-2", owner="o@x.com", require_login=True,
+                       allowed_users="org", collaborators=["c@x.com"])
+    with pytest.raises(perm.PermissionDenied):
+        perm.set_access_policy("legacy-2", actor="x@x.com", require_login=False)
+    # 对照：协作者有 set_access_policy 能力，必须放行
+    perm.set_access_policy("legacy-2", actor="c@x.com", require_login=False)
