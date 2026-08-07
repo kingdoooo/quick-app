@@ -89,7 +89,7 @@
   `%E5%BD%AD%E9%87%91%E5%86%AC`，写进数据库的也是这串编码。等发现时历史数据
   已经脏了，只能单独清洗。真实站点踩过这个坑。
 - **违反后果**：
-  `backend/server.js: 用了 x-user-name 但没有 decodeURIComponent —— 该头是 URL 编码的…`
+  `backend/server.js: 用了 x-user-name 但没有对它 decodeURIComponent —— 该头是 URL 编码的…（注意：解码别的东西（如 req.query.x）不算——必须解码这个头的值）`
 - **正确**：
   ```js
   const name = decodeURIComponent(req.headers["x-user-name"] || "");

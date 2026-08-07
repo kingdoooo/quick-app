@@ -40,7 +40,13 @@ DECODE_RE = re.compile(r"decodeURIComponent\s*\(")
 # `// TODO: decodeURIComponent(raw)` 或 `log('记得 decodeURIComponent(x)')`
 # 就能让整个文件过关，而实际代码拿到的还是编码串（实测两种都能绕过）。
 _COMMENTS_AND_STRINGS_RE = re.compile(
-    r"//[^\n]*"           # 行注释
+    # **正则字面量必须排在行注释之前**：`/https?:\/\//g` 里的 `\/\/` 会被
+    # `//[^\n]*` 当成行注释、把整行剩余部分抹掉，于是 decode 的实参被截断、
+    # 合规代码被误判违规（旧规则只要求"存在解码调用"，感觉不到；新规则要看
+    # 实参内容，这个既有的不精确就变成了误报）。
+    # 只认"前面紧邻着能让 `/` 起始正则的符号"这种保守形态，避免把除法当正则。
+    r"(?<=[=(,:\[!&|?{};+\-*%~^<>])\s*/(?![/*])(?:\\.|\[(?:\\.|[^\]\\\n])*\]|[^/\\\n])+/[a-z]*"
+    r"|//[^\n]*"           # 行注释
     r"|/\*.*?\*/"          # 块注释（跨行）
     r"|'(?:\\.|[^'\\\n])*'"   # 单引号字符串
     r'|"(?:\\.|[^"\\\n])*"'   # 双引号字符串
@@ -55,34 +61,94 @@ def _strip_comments_and_strings(text: str, keep_header: bool = False) -> str:
     注意这是启发式的：正则解析 JS 不可能完全正确（正则字面量、嵌套模板等），
     但方向是安全的——**误删代码会导致误报（多拦一个站点），不会漏放**。
 
-    keep_header=True：**只保留** x-user-name 这个头名的字符串字面量，其余照旧
-    抹掉。判"解码的是不是这个头"必须同时看见代码结构与这个头名，而它总是写在
-    字符串里；全抹掉就无从关联（注释里的假解码仍会被抹，所以不放松原有防线）。
+    keep_header=True：含 x-user-name 的注释/字符串**不原样保留**，而是替换成
+    "只剩这个头名、其余全为空白"的等长文本。判"解码的是不是这个头"需要看见
+    这个头名（它总写在字符串里，全抹掉就无从关联），但**绝不能连带保留同一段
+    注释里的代码文本**——原样保留会让
+        // TODO: decodeURIComponent(req.headers['x-user-name'])
+    整段存活，既满足 DECODE_RE 又满足关联判定，于是文件里没有任何真实解码也能
+    过关。那正是上一个提交（a9d4291）刚堵掉的注释绕过，原样保留等于把它重新打开
+    （已实测；独立审查发现）。所以只回填头名本身，注释里的假解码照旧被抹掉。
     """
+    # 头名字面量的规范形式：只回填它，长度不足的部分补空白（保持等长）
+    _HDR = "'x-user-name'"
+
     def _blank(m: re.Match) -> str:
         s = m.group(0)
-        if keep_header and X_USER_NAME_RE.search(s):
-            # 保留这段字面量原样（它只可能是头名，不含可执行代码）
-            return s
-        return re.sub(r"\S", " ", s)
+        if keep_header and X_USER_NAME_RE.search(s) and len(s) >= len(_HDR):
+            # 只留头名，其余（包括同段注释里的 decodeURIComponent 字样）抹白。
+            # 保持换行：跨行的块注释/模板串抹平会让行号漂移。
+            tail = re.sub(r"[^\n]", " ", s[len(_HDR):])
+            return _HDR + tail
+        return re.sub(r"[^\n]", " ", s)
 
     if keep_header:
         # 拼接写法（`'x-user-' + 'name'`）的头名**跨两个字面量**，逐段判断时
         # 两段都不匹配，会被抹成 `[  +  ]` → 关联不上承接它的变量 → 合规代码
-        # 被误报。所以先把整个拼接式规约成一个等价字面量，再走逐段保留。
+        # 被误报。所以先把整个拼接式规约成一个等价字面量，再走逐段处理。
+        # 用 len(_HDR) 而不是硬编码数字：写死 14 时实际长度是 13，每处少一个
+        # 字符、且会吃掉拼接式里的换行（行号漂移）。
         text = re.sub(
             r"['\"`]x-user-['\"`]\s*\+\s*['\"`]name['\"`]",
-            lambda m: "'x-user-name'" + " " * (len(m.group(0)) - 14),
+            lambda m: _HDR + re.sub(r"[^\n]", " ", m.group(0)[len(_HDR):]),
             text, flags=re.I)
 
     return _COMMENTS_AND_STRINGS_RE.sub(_blank, text)
 
 
-# `const raw = req.headers['x-user-name']` / `let n = req.get("x-user-name")`
-# —— 抓住承接头值的变量名，供"先存变量、后解码"这种合法写法放行。
-_HEADER_ASSIGN_RE = re.compile(
-    r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=[^;\n]*?"
-    r"(?:x-user-name|x-user-['\"`]\s*\+\s*['\"`]name)", re.I)
+# 抓住"承接头值"的名字，供"先存变量、后解码"这种合法写法放行。
+# 三种赋值目标都要认，否则合规代码被误拦——**误报比漏报更该避免**：它挡住真实
+# 用户的部署，且会逼人绕过规则。实测被旧写法误拦的合规形态见 tests。
+#   ① 声明：const/let/var raw = … 'x-user-name'
+#   ② 裸赋值 / 属性存储：raw = …  /  req.userName = …
+#   ③ 解构重命名：const {'x-user-name': raw} = req.headers
+#
+# **不能用 `[^;\n]*?`**：prettier 在 `=` 后折行（80 列）会切断关联，而那是最
+# 常见的写法。改成允许跨行，用 `;` 与长度上限兜住，不至于蔓延到整个文件。
+_HEADER_ASSIGN_PATTERNS = (
+    # 解构重命名放最前：它的 `键: 变量` 形态与②的宽松式会互相干扰
+    re.compile(r"['\"`]x-user-name['\"`]\s*\]?\s*:\s*([A-Za-z_$][\w$]*)", re.I),
+    # **`[^;]` 里要排除逗号**，否则 `const q = req.query.q, name = 头` 会锚在
+    # 第一个声明符 `q` 上：解码 q 就被当成解码了这个头，而头值原样使用——与本
+    # 规则要修的绕过同形（独立审查发现）。逗号是声明符边界，必须停在那里。
+    re.compile(r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=[^;,]{0,400}?"
+               r"(?:x-user-name|x-user-['\"`]\s*\+\s*['\"`]name)", re.I | re.S),
+    # 裸赋值与属性存储：`raw =` / `req.userName =` / `this.name =`
+    re.compile(r"([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*=[^;=,]{0,400}?"
+               r"(?:x-user-name|x-user-['\"`]\s*\+\s*['\"`]name)", re.I | re.S),
+)
+
+
+# 把解码包装成工具函数的名字：`const dec = v => decodeURIComponent(...)` /
+# `function dec(v) { … decodeURIComponent(…) }` / `const dec = function(v){…}`。
+# 只要求"名字与 decodeURIComponent 在同一个短距离窗口内"——不做作用域分析，
+# 目的仍是区分"知道要解码"与"完全不知道"。
+_DECODING_HELPER_RE = re.compile(
+    r"(?:function\s+([A-Za-z_$][\w$]*)|"
+    r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=)"
+    r"[^;]{0,200}?decodeURIComponent\s*\(", re.S)
+
+
+def _decoding_helper_names(code: str) -> set[str]:
+    return {n for pair in _DECODING_HELPER_RE.findall(code)
+            for n in pair if n}
+
+
+def _header_holder_names(code: str) -> set[str]:
+    """所有承接过 x-user-name 的名字（变量名，或 `a.b` 形态的属性路径）。
+
+    属性路径连末段一起收（`req.userName` → 也收 `userName`）：解码处可能用解构
+    后的短名。宁可多收几个名字，也不要把合规写法拦下来——这条红线要防的是
+    "完全不知道需要解码"，不是做精确的数据流分析。
+    """
+    names: set[str] = set()
+    for pat in _HEADER_ASSIGN_PATTERNS:
+        for m in pat.finditer(code):
+            name = m.group(1)
+            names.add(name)
+            if "." in name:
+                names.add(name.rsplit(".", 1)[-1])
+    return names
 
 
 def _balanced_arg(code: str, open_paren: int) -> str | None:
@@ -157,17 +223,33 @@ def _check_user_name_decoded(text: str, rel: Path) -> list[str]:
     code = _strip_comments_and_strings(text, keep_header=True)
     if not DECODE_RE.search(code):
         return err
+    # **每个 decode 的实参只解析一次**：原来在"变量 × decode 调用"的双重循环里
+    # 反复调 _balanced_arg，而它最坏会扫到文件末尾 → O(n²)。实测 3000 组调用
+    # （约 287KB 单文件）要 22 秒，而 validate 这步的 Lambda 超时是 120 秒，
+    # 大文件有把整个部署拖到超时的风险。提出来后是线性的。
+    args = [a for a in (_balanced_arg(code, m.end() - 1)
+                        for m in DECODE_RE.finditer(code)) if a is not None]
     # ① 同表达式：decodeURIComponent( ... x-user-name ... )
-    for m in DECODE_RE.finditer(code):
-        arg = _balanced_arg(code, m.end() - 1)
-        if arg is not None and X_USER_NAME_RE.search(arg):
+    if any(X_USER_NAME_RE.search(a) for a in args):
+        return []
+    # ② 变量中转：先把头存进某个名字，再解码那个名字
+    holders = _header_holder_names(code)
+    holder_re = re.compile(
+        r"\b(?:%s)\b" % "|".join(sorted(map(re.escape, holders)))
+    ) if holders else None
+    if holder_re is not None:
+        if any(holder_re.search(a) for a in args):
             return []
-    # ② 变量中转：先把头存进变量，再解码那个变量
-    for var in _HEADER_ASSIGN_RE.findall(code):
-        for m in DECODE_RE.finditer(code):
+    # ③ helper 间接：`const dec = v => decodeURIComponent(v)` 之后
+    #    `dec(req.headers['x-user-name'])`。把"函数体里调了 decode"的 helper
+    #    名字收集起来，再看有没有拿这个头去调它。
+    #    合规写法（把解码封装成工具函数）很常见，不放行等于逼人内联。
+    for helper in _decoding_helper_names(code):
+        for m in re.finditer(r"\b%s\s*\(" % re.escape(helper), code):
             arg = _balanced_arg(code, m.end() - 1)
-            if arg is not None and re.search(
-                    r"\b%s\b" % re.escape(var), arg):
+            if arg is not None and (
+                    X_USER_NAME_RE.search(arg)
+                    or (holder_re is not None and holder_re.search(arg))):
                 return []
     return err
 

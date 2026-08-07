@@ -21,7 +21,7 @@ MAX_ROUTE_ATTEMPTS = 3
 
 
 def _seed_permissions_if_absent(site_id: str, manifest_auth: dict,
-                                owner: str) -> None:
+                                owner: str, site_exists: bool = True) -> None:
     """首次部署：把 manifest 的 auth 用来**补齐真源里缺失的权限字段**。
 
     **逐字段 if_not_exists，不要拿任何单个字段当"整套已初始化"的 sentinel。**
@@ -52,18 +52,34 @@ def _seed_permissions_if_absent(site_id: str, manifest_auth: dict,
                 "permissions_rev = if_not_exists(permissions_rev, :one), "
                 "permissions_updated_at = :t, "
                 "permissions_updated_by = :by"),
-            # 缺任一个受管字段 → 只补那一个，已有的由 if_not_exists 原样保留
-            # （在线值永不被 manifest 覆盖）；三个都在 → 条件失败 = 真正的 no-op。
+            # **`attribute_exists(site_id)` 必须在最外层**，否则本函数会成为
+            # 快照守卫的后门（Codex 之后的独立审查发现，已实测）：
+            # DynamoDB 的 update_item 在 item 不存在时会**创建**它，于是一个
+            # 陈旧/恶意的 job 可以凭自己的 manifest 无中生有地建出 sites 行、
+            # 写入 `permissions_rev = 1` 与 `require_login = false`，随后下面的
+            # 守卫读到 had_rev=True 且 rev 相符——守卫校验的是这个 job 刚刚
+            # **自己伪造**的快照，于是新 owner 的站点变成公开、并托管旧 owner
+            # 的产物。这比原缺陷更糟（原缺陷还要求行已存在且缺 rev）。
+            # 站点行由 do_deploy_site / deploy_fixture 在部署前创建，所以这里
+            # "行不存在"只可能是异常或攻击，一律不该继续。
             #
-            # **permissions_rev 必须进这个条件**：稀疏行可能两个 auth 字段都在、
-            # 而 rev 缺失（upsert_site 建站只写 owner/name/status，在线写也只
-            # 持久化调用方显式传的字段）。漏掉它的话 seed 整体被跳过 → rev 永远
-            # 补不上 → 下面的快照守卫（要求 rev 存在，fail-closed）每轮都失败，
-            # 把一次**合法**部署卡成"权限被并发修改"。本函数是 rev 存在性的
-            # 唯一保证点，条件必须覆盖它要写的每个字段。
-            ConditionExpression=("attribute_not_exists(require_login) OR "
+            # 括号不可省：AND 比 OR 结合更紧，不加括号会变成
+            # `(exists AND not_exists(require_login)) OR not_exists(allowed_users) OR ...`
+            # ——后两个析取项完全不受存在性约束，等于没加这道闸门。
+            #
+            # 三个受管字段各自的 attribute_not_exists 是"缺哪个补哪个"：
+            # 稀疏行可能两个 auth 字段都在而 rev 缺失（upsert_site 建站只写
+            # owner/name/status，在线写也只持久化调用方显式传的字段）。漏掉 rev
+            # 那一项会让 seed 整体跳过 → 守卫（要求 rev 存在，fail-closed）每轮
+            # 失败 → 把一次**合法**部署卡成"权限被并发修改"。
+            # collaborators 也要列：它同在 SET 子句里，条件必须覆盖所写的每个
+            # 字段，否则"三个条件字段都在、collaborators 缺失"的行会跳过 seed，
+            # 将来给 collaborators 加守卫子句就会继承这个洞。
+            ConditionExpression=("attribute_exists(site_id) AND ("
+                                 "attribute_not_exists(require_login) OR "
                                  "attribute_not_exists(allowed_users) OR "
-                                 "attribute_not_exists(permissions_rev)"),
+                                 "attribute_not_exists(collaborators) OR "
+                                 "attribute_not_exists(permissions_rev))"),
             ExpressionAttributeValues={
                 ":rl": bool(manifest_auth["require_login"]),
                 ":au": allowed,
@@ -76,11 +92,23 @@ def _seed_permissions_if_absent(site_id: str, manifest_auth: dict,
                 # 已推进过）时用 if_not_exists 保留，不回退也不虚增。
                 ":one": 1})
     except botocore.exceptions.ClientError as e:
-        # ConditionalCheckFailed = 两个字段都已存在：完全用真源的值（幂等吞掉）。
-        # 其余错误（限流、校验……）必须如实上抛——放宽成裸 pass 会让 seed
+        # ConditionalCheckFailed 现在有**两种**来源，必须分开（加了
+        # attribute_exists(site_id) 之后）：
+        #   · 站点行确实存在、受管字段都齐 → 幂等 no-op，用真源的值，正常继续；
+        #   · 站点行**不存在** → 不能继续。它不是"已经初始化好了"，而是异常或
+        #     攻击（陈旧 job 想给一个已删除的 site_id 建路由）。吞掉的话下面的
+        #     守卫会以 had_rev=False 走系统写入者分支、连续失败三次，最后报
+        #     "写路由时站点权限被并发修改"——把"站点不存在"说成并发冲突，排查时
+        #     会往完全错误的方向查。所以显式判定并给出准确原因。
+        # 其余错误（限流、校验……）一律如实上抛——放宽成裸 pass 会让 seed
         # 静默失败，_route_item 回落 allowed_users="org"（fail-open 扩权）。
         if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
             raise
+        if not site_exists:
+            raise RuntimeError(
+                f"站点 {site_id} 在 sites 表里不存在，拒绝写路由——"
+                "部署前应已创建站点记录（do_deploy_site / deploy_fixture）。"
+                "若站点已被下线，请重新发起部署而不是复用旧任务。") from e
 
 
 def _route_item(event, site: dict, owner: str, subdomain: str) -> dict:
@@ -119,7 +147,10 @@ def handler(event, context):
 
     site = common.get_site_consistent(event["site_id"]) or {}
     owner = site.get("owner") or common.get_job(event["job_id"])["owner"]
-    _seed_permissions_if_absent(event["site_id"], event["manifest"]["auth"], owner)
+    # site_exists 用**上面这次读**的结果，不再额外读一次：多一次读会改变
+    # 调用序列，而并发交错的用例正是按"第几次读"注入竞态的。
+    _seed_permissions_if_absent(event["site_id"], event["manifest"]["auth"],
+                                owner, site_exists=bool(site))
 
     for attempt in range(MAX_ROUTE_ATTEMPTS):
         # **必须强一致读**：紧接在 _seed_permissions_if_absent 之后，

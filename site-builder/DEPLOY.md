@@ -184,16 +184,27 @@ auth 的执行角色因此需要 `ssm:GetParameter`（限定 `/site-builder/*`�
   #     （④ 要用它。`describe-user-pool-client` 只返回 ClientSecret 值、
   #      **不返回 ClientSecretId**，用它拿不到可删除的 id）
   aws cognito-idp list-user-pool-client-secrets --region us-east-1 \
-    --user-pool-id <pool> --client-id <site_client_id>
-  #     返回 ClientSecrets[]，每项含 ClientSecretId 与创建时间（不含明文）；
-  #     创建时间较早的那个就是旧 secret。
+    --user-pool-id <pool> --client-id <site_client_id> \
+    --query 'sort_by(ClientSecrets,&ClientSecretCreateDate)[0].ClientSecretId' \
+    --output text
+  #     返回 ClientSecrets[]（每项含 ClientSecretId 与 ClientSecretCreateDate，
+  #     不含明文）；上面的 --query 直接取**创建时间最早**的那个 id = 旧 secret。
+  #     无需分页：一个 client 同时最多 2 个 secret，API 一次全返回。
 
   # ② 写进 SSM
   aws ssm put-parameter --region us-east-1 --overwrite \
     --name /site-builder/site-client-secret --type SecureString --value "<新值>"
 
   # ③ 等 auth 收敛（≤5 分钟，见 SECRET_TTL_SECONDS）后**实际登录验证一次**
-  #    ——两个 secret 此时都有效，验不过就回退 SSM，不要往下走
+  #    ——两个 secret 此时都有效，验不过就回退 SSM（见下），不要往下走。
+  #
+  #    回退方法：旧值此刻已无处可查（list-user-pool-client-secrets 只给元数据，
+  #    add 的响应也只出现过一次），**唯一来源是 SSM 的历史版本**：
+  #      aws ssm get-parameter-history --region us-east-1 \
+  #        --name /site-builder/site-client-secret --with-decryption \
+  #        --query 'Parameters[-2].Value' --output text
+  #    取到后重新 put-parameter 覆盖回去即可（旧 secret 仍在 Cognito 里有效，
+  #    因为第 ④ 步还没执行——这也是"先验证再删"顺序的意义）。
 
   # ④ 确认无误后删掉旧 secret（删不掉最后一个，所以顺序不能颠倒）
   aws cognito-idp delete-user-pool-client-secret --region us-east-1 \

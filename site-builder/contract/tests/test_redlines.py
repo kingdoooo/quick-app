@@ -433,3 +433,106 @@ def test_user_name_related_decode_is_accepted(desc, code):
     """合规写法一个都不能误报——误报会把站点挡在部署外，比漏报更容易被绕过规则。"""
     from contract.redlines import _check_user_name_decoded
     assert _check_user_name_decoded(code, Path("api/index.js")) == [], desc
+
+
+# ---- 关联判定的误报与漏报（独立代码审查 2026-08-08）----
+# 上一版把"解码必须与这个头关联"做出来了，但两头都过紧/过松：
+#   · 误报：prettier 在 `=` 后折行、解构、裸赋值、属性存储、helper 封装、
+#     实参里带正则字面量——六种**合规**写法被拦。误报会挡住真实用户的部署，
+#     比漏报更该避免（还会逼人绕过规则），所以这些必须放行。
+#   · 漏报：keep_header 原样保留含头名的注释/字符串，把 a9d4291 刚堵上的
+#     注释绕过重新打开；`const q=..., name=头` 的多声明符会锚错变量。
+
+@pytest.mark.parametrize("desc,code", [
+    ("prettier 在 = 后折行",
+     "const rawUserName =\n  req.headers['x-user-name'] || '';\n"
+     "const n = decodeURIComponent(rawUserName);"),
+    ("头名字面量独占一行",
+     "const raw = req.headers[\n  'x-user-name'\n];\n"
+     "const n = decodeURIComponent(raw);"),
+    ("解构重命名",
+     "const {'x-user-name': raw} = req.headers;\n"
+     "const n = decodeURIComponent(raw);"),
+    ("解构多个键",
+     "const {'x-user-email': e, 'x-user-name': raw} = req.headers;\n"
+     "const n = decodeURIComponent(raw);"),
+    ("先声明后裸赋值",
+     "let raw;\nraw = req.headers['x-user-name'];\n"
+     "const n = decodeURIComponent(raw);"),
+    ("存进属性",
+     "req.userName = req.headers['x-user-name'];\n"
+     "const n = decodeURIComponent(req.userName);"),
+    ("helper 箭头函数封装解码",
+     "const dec = v => decodeURIComponent(v || '');\n"
+     "const n = dec(req.headers['x-user-name']);"),
+    ("helper function 声明",
+     "function dec(v) { return decodeURIComponent(v); }\n"
+     "const n = dec(req.headers['x-user-name']);"),
+    ("实参里含正则字面量（内含 //）",
+     "const n = decodeURIComponent("
+     "req.headers['x-user-name'].replace(/https?:\\/\\//g, ''));"),
+    ("多声明符且确实解码了头",
+     "const q = req.query.q, name = req.headers['x-user-name'];\n"
+     "res.json({q, name: decodeURIComponent(name)});"),
+])
+def test_compliant_patterns_are_not_falsely_rejected(desc, code):
+    from contract.redlines import _check_user_name_decoded
+    assert _check_user_name_decoded(code, Path("api/index.js")) == [], desc
+
+
+@pytest.mark.parametrize("desc,code", [
+    ("注释里的解码提到了头名（a9d4291 回归）",
+     "const raw = req.headers['x-user-name'];\n"
+     "// TODO: decodeURIComponent(req.headers['x-user-name'])\n"
+     "db.put({name: raw});"),
+    ("JSDoc @example 里的解码",
+     "const raw = req.headers['x-user-name'];\n"
+     "/** @example decodeURIComponent(req.headers['x-user-name']) */\n"
+     "db.put({name: raw});"),
+    ("字符串里的解码提到了头名",
+     "const raw = req.headers['x-user-name'];\n"
+     "log(\"记得 decodeURIComponent(req.headers['x-user-name'])\");\n"
+     "db.put({name: raw});"),
+    ("模板串里的解码提到了头名",
+     "const raw = req.headers['x-user-name'];\n"
+     "log(`decodeURIComponent(req.headers['x-user-name'])`);\n"
+     "db.put({name: raw});"),
+    ("整个文件只有注释里的假解码",
+     "x = h['x-user-name'];  // decodeURIComponent(h['x-user-name'])"),
+    ("多声明符锚错变量：解码的是 q 不是头",
+     "const q = req.query.q, name = req.headers['x-user-name'];\n"
+     "res.json({q: decodeURIComponent(q), name});"),
+])
+def test_decode_not_associated_with_header_is_rejected(desc, code):
+    from contract.redlines import _check_user_name_decoded
+    assert _check_user_name_decoded(code, Path("api/index.js")), desc
+
+
+def test_scanner_survives_malformed_input():
+    """站点代码是不可信输入：畸形内容只能得出判定，不能崩、不能挂。"""
+    from contract.redlines import _check_user_name_decoded
+    for code in ("", "x-user-name\x00decodeURIComponent(",
+                 "/* x-user-name decodeURIComponent(",
+                 "decodeURIComponent(req.headers['x-user-name']" * 50,
+                 "const n = " + "decodeURIComponent(" * 200
+                 + "req.headers['x-user-name']" + ")" * 200,
+                 "const raw = req.headers['x-user-name'];\r\n"
+                 "const n = decodeURIComponent(raw);\r\n"):
+        _check_user_name_decoded(code, Path("f.js"))   # 不抛异常即通过
+
+
+def test_scanner_is_not_quadratic_on_large_files():
+    """实参解析必须提到循环外。
+
+    旧实现在"变量 × decode 调用"双重循环里反复做括号配平（最坏扫到文件末尾），
+    3000 组调用要 22 秒；validate 那步 Lambda 超时 120 秒，大文件能把部署拖挂。
+    这里用一个宽松上限做回归哨兵——只为抓住"又变成 O(n²)"，不追求精确计时。
+    """
+    import time
+    from contract.redlines import _check_user_name_decoded
+    code = ("const raw = req.headers['x-user-name'];\n"
+            + "\n".join(f"const v{i} = decodeURIComponent(req.query.a{i});"
+                        for i in range(3000)))
+    start = time.monotonic()
+    _check_user_name_decoded(code, Path("f.js"))
+    assert time.monotonic() - start < 10, "疑似退化回 O(n²)"

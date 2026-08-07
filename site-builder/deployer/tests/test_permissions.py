@@ -680,16 +680,29 @@ def test_no_handwritten_rev_guard_outside_permissions_module():
                         and isinstance(body[0].value, ast.Constant)
                         and isinstance(body[0].value.value, str)):
                     body[0].value.value = ""      # 清掉 docstring 内容
+        # **不要再按 `#` 截断**：ast.unparse 已经把注释全部丢掉了，而这一行
+        # 反而会在第一个 `#` 处截断——`#o` / `#ro` 正是本仓库给保留字 owner 写
+        # ExpressionAttributeNames 的方式，于是"别名在前、条件在后"的字典会被
+        # 砍得只剩前半段，本用例要找的表达式刚好被藏起来（独立审查实测：
+        # 把原始脆弱条件重排字段顺序即可逃过检测）。
         code = ast.unparse(tree)
-        code = "\n".join(l.split("#")[0] for l in code.splitlines())
-        # 只认**守卫语法**：`permissions_rev = :x`（拿快照 rev 做相等比较）。
-        # 单纯读属性（site["permissions_rev"]）不算；
-        # `attribute_not_exists(permissions_rev)` 单独出现也不算——那是
-        # register_route 的**初始化**条件（"rev 缺失就补上"），语义与守卫相反，
-        # 是 rev 存在性的唯一保证点，必须允许。危险的是把它**当放行分支**用，
-        # 即与 rev 相等比较并成 OR，所以只要出现相等比较就算手抄。
+        # 两类都要认，缺一不可（两个 P1 各对应一类）：
+        #   ① rev 相等比较——"拿快照 rev 做守卫"的手抄。
+        #      注意 `attribute_not_exists(permissions_rev)` 单独出现**不算**：
+        #      那是 register_route 的初始化条件（"rev 缺失就补上"），语义与守卫
+        #      相反且是 rev 存在性的唯一保证点，必须允许。
+        #   ② 角色事实子句——"无 rev 时按 owner/collaborator 放行"的手抄。
+        #      第一版只查①，于是defect#2（把 owner 与 collaborator 合并）那种
+        #      形态完全查不到，而它恰是危害更大的一类（被降级的旧 owner 仍能
+        #      purge 数据）。
+        hits = []
         if re.search(r'permissions_rev\s*=\s*:\w+', code):
-            offenders.append(str(py.relative_to(root)))
+            hits.append("rev 相等比较")
+        if (re.search(r'contains\(collaborators,\s*:\w+\)', code)
+                or re.search(r'#\w+\s*=\s*:me\b', code)):
+            hits.append("角色事实子句")
+        if hits:
+            offenders.append(f"{py.relative_to(root)}（{'、'.join(hits)}）")
     assert not offenders, (
         "这些文件手写了 permissions_rev 守卫条件，必须改用 "
         f"permissions.sites_snapshot_guard()：{offenders}\n"

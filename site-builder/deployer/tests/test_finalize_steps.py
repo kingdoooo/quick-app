@@ -466,3 +466,60 @@ def test_smoke_test_falls_back_to_manifest_when_effective_absent(aws, monkeypatc
                         "url": "https://app-s-1.example.com",
                         "manifest": {"auth": {"require_login": True}}}, None)
     assert calls == [True]
+
+
+def test_register_route_refuses_when_site_row_absent(aws):
+    """sites 行不存在时必须拒绝写路由，且**不得凭空创建 sites 行**。
+
+    这是快照守卫的后门（独立审查 2026-08-08 P1，已实测）：DynamoDB 的
+    update_item 在 item 不存在时会创建它，所以没有 attribute_exists(site_id) 时
+    一个陈旧/恶意 job 能用自己的 manifest 建出 sites 行、写 permissions_rev=1 与
+    require_login=false，随后守卫读到 had_rev=True 且 rev 相符——守卫校验的是这个
+    job 刚刚自己伪造的快照，结果是站点公开且托管旧 owner 的产物。
+    """
+    import boto3
+    import common
+    import register_route
+    job_id = common.create_job("attacker@x.com", "gone-abc123")
+    with pytest.raises(RuntimeError, match="不存在"):
+        register_route.handler(
+            {"job_id": job_id, "site_id": "gone-abc123", "api_target": "",
+             "manifest": {"auth": {"require_login": False,
+                                   "allowed_users": "org"}}}, None)
+    assert common.get_site("gone-abc123") is None, "sites 行被凭空创建了"
+    assert "Item" not in boto3.client("dynamodb").get_item(
+        TableName="routing",
+        Key={"subdomain": {"S": "app-gone-abc123"}}), "路由被写入了"
+
+
+def test_register_route_seed_fills_rev_and_collaborators(aws):
+    """seed 的条件必须覆盖它要写的每个字段。
+
+    rev 缺失会让守卫（要求 rev 存在，fail-closed）把合法部署卡死；
+    collaborators 缺失是潜在的同类洞（将来给它加守卫子句就会继承）。
+    """
+    import common
+    import register_route
+    # ① 缺 rev（守卫会因此卡死合法部署）
+    common.upsert_site("sparse-abc123", owner="o@x.com", require_login=True,
+                       allowed_users="org")
+    job_id = common.create_job("o@x.com", "sparse-abc123")
+    register_route.handler(
+        {"job_id": job_id, "site_id": "sparse-abc123", "api_target": "",
+         "manifest": {"auth": {"require_login": True,
+                               "allowed_users": "org"}}}, None)
+    assert int(common.get_site("sparse-abc123")["permissions_rev"]) >= 1, \
+        "seed 没补上 rev → 守卫（要求 rev 存在）会把合法部署卡死"
+
+    # ② 只缺 collaborators：其余三个条件字段都在，条件若不覆盖它就会整体跳过。
+    #    目前是潜在洞（rev 在，守卫仍工作），但将来给 collaborators 加守卫子句
+    #    就会继承——所以这里单独钉一遍。
+    common.upsert_site("nocollab-abc123", owner="o@x.com", require_login=True,
+                       allowed_users="org", permissions_rev=3)
+    job2 = common.create_job("o@x.com", "nocollab-abc123")
+    register_route.handler(
+        {"job_id": job2, "site_id": "nocollab-abc123", "api_target": "",
+         "manifest": {"auth": {"require_login": True,
+                               "allowed_users": "org"}}}, None)
+    assert common.get_site("nocollab-abc123").get("collaborators") == [], \
+        "seed 的条件没覆盖 collaborators —— 它在 SET 子句里，条件必须覆盖所写的每个字段"

@@ -712,3 +712,41 @@ def test_legacy_collaborator_deploy_still_allowed_after_downgrade(aws, monkeypat
     sfn.start_execution.assert_called_once()
     site = common.get_site("legacy-abc123")
     assert permissions.can(permissions.role_of("old@x.com", site), "deploy")
+
+
+def test_execution_already_exists_does_not_clobber_succeeded_job(aws, monkeypatch):
+    """已经成功的 job 不能被 ExecutionAlreadyExists 改写成 FAILED。
+
+    可达序列：首次 StartExecution 响应丢失 → 回滚成 PENDING → 那条 execution
+    其实跑完了、mark_job 写入 SUCCEEDED + url → 用户重试 → 事务把 job 置回
+    RUNNING/queued → StartExecution 报 ExecutionAlreadyExists。此时若无条件写
+    FAILED，用户看到"失败"而站点其实已更新好。
+    """
+    import boto3 as _b3
+    import botocore.exceptions
+    import common
+    import server
+    monkeypatch.setenv("STATE_MACHINE_ARN",
+                       "arn:aws:states:us-east-1:1:stateMachine:sm")
+    common.upsert_site("demo-abc123", owner="o@x.com", status="ACTIVE",
+                       permissions_rev=1)
+    jid = common.create_job("o@x.com", "demo-abc123")
+    _b3.client("s3").put_object(Bucket="site-artifacts-1",
+                                Key=f"uploads/{jid}.zip", Body=b"zip")
+    # 那条 execution 已经跑完并回写了成功状态
+    common.update_job(jid, status="SUCCEEDED", phase="done",
+                      url="https://app-demo-abc123.example.com")
+    # 用户重试：条件迁移要求 PENDING，所以这里会先被 AlreadyStarted 拦住；
+    # 直接调到 start_execution 那段的形态用 PENDING + url 已填来构造
+    common.update_job(jid, status="PENDING", phase="submitted")
+    dup = MagicMock()
+    dup.start_execution.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "ExecutionAlreadyExists", "Message": "exists"}},
+        "StartExecution")
+    with patch.object(server, "_sfn", return_value=dup):
+        with pytest.raises(server.AlreadyStarted):
+            server.do_confirm_upload("o@x.com", jid)
+    job = common.get_job(jid)
+    assert job["url"] == "https://app-demo-abc123.example.com", "成功的 url 丢了"
+    assert job["status"] != "FAILED", (
+        f"已成功的部署被改写成 {job['status']}——用户会以为失败而站点其实已更新")

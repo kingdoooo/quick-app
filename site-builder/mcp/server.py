@@ -292,11 +292,36 @@ def do_confirm_upload(owner: str, job_id: str) -> dict:
             # （用户会一直轮询一个永不推进的任务），也不该回滚成 PENDING
             # （重试只会再撞一次同样的错）。如实置 FAILED 并告诉用户重新部署——
             # 重新部署会拿到新 job_id，也就是新的 execution name。
-            common.update_job(
-                job_id, status="FAILED",
-                error="该任务的部署执行已结束但未能回写状态（同名执行已存在且已"
-                      "关闭，其名称 90 天内不可复用）。请重新发起一次部署"
-                      "（会生成新任务）；若站点已更新成功，也可直接查看站点确认。")
+            # **条件写**：只在 job 仍是"我刚写进去、SFN 没碰过"的
+            # RUNNING/queued 时才标 FAILED。无条件写会把一个**已经成功**的
+            # 部署改成 FAILED——序列是：首次调用响应丢失 → 回滚成 PENDING →
+            # 那条 execution 其实跑完了、mark_job 写了 SUCCEEDED → 用户重试 →
+            # 事务把 job 又置回 RUNNING/queued → StartExecution 报
+            # ExecutionAlreadyExists。此时若无条件写 FAILED，用户看到的是
+            # "失败"而站点其实已经更新好了（独立审查发现，clobber 已实测）。
+            # 条件失败说明 job 已被别的写入者推进过，那份状态更可信，不要覆盖。
+            import botocore.exceptions as _be
+            try:
+                boto3.client("dynamodb", region_name="us-east-1").update_item(
+                    TableName=os.environ["JOBS_TABLE"],
+                    Key={"job_id": {"S": job_id}},
+                    UpdateExpression="SET #s = :failed, #e = :err",
+                    ConditionExpression=("#s = :running AND phase = :queued "
+                                         "AND (attribute_not_exists(#u) OR #u = :empty)"),
+                    ExpressionAttributeNames={"#s": "status", "#e": "error",
+                                              "#u": "url"},
+                    ExpressionAttributeValues={
+                        ":failed": {"S": "FAILED"},
+                        ":running": {"S": "RUNNING"},
+                        ":queued": {"S": "queued"},
+                        ":empty": {"S": ""},
+                        ":err": {"S":
+                                 "该任务的部署执行已结束但未能回写状态（同名执行"
+                                 "已存在且已关闭，其名称 90 天内不可复用）。请重新"
+                                 "发起一次部署（会生成新任务）；若站点已更新成功，"
+                                 "也可直接查看站点确认。"}})
+            except _be.ClientError:
+                pass    # 已被推进（含已 SUCCEEDED）：保留那份状态，别覆盖
             raise AlreadyStarted(
                 f"任务 {job_id} 的执行已结束且无法重启，已标记为 FAILED——"
                 "请重新发起部署（会生成新任务）") from start_err
