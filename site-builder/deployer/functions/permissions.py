@@ -62,6 +62,79 @@ def can(role: str, action: str) -> bool:
     return role in CAPABILITIES.get(action, frozenset())
 
 
+# ---- 权限快照守卫：**全仓库唯一定义**，所有写入者必须用它 ----
+#
+# 背景（三轮审查都在同一个不变量上翻车，2026-08-07/08）：
+# "鉴权所依据的权限快照此刻仍然有效"这个条件，原来被**手抄在三处**
+# （mcp/server.py、本文件的 write_permissions、register_route.py），
+# 各自用 DynamoDB 条件表达式独立写了一遍。后果连着出现两次：
+#   ① 审查指出一处漏洞 → 只修那一处，另外两处照旧（P1 重复出现）；
+#   ② 手写的角色判定与 CAPABILITIES 漂移——手抄版把 owner 与 collaborator
+#      合并成"二者之一即可"，而 CAPABILITIES 里 undeploy **不给** collaborator。
+#      于是 transfer_owner 把旧 owner 降级为 collaborator 后，他仍能下线站点
+#      （purge_data 不可恢复）。
+# 所以这里只留一份，且**角色子句从 CAPABILITIES 推导**而不是另写一套：
+# 两者不可能再漂移，新增动作也自动获得正确的守卫。
+def snapshot_condition(*, rev: int, had_rev: bool, actor: str = "",
+                       action: str = "", role: str = "") -> tuple[str, dict, dict]:
+    """→ (ConditionExpression, ExpressionAttributeValues, ExpressionAttributeNames)
+
+    调用方把这三样合并进自己的 Update / ConditionCheck。
+
+    **任何分支都以 `attribute_exists(site_id)` 开头**：item 被删除、或被
+    "同 site_id 重建"时，`attribute_not_exists(permissions_rev)` 这类兼容分支
+    会静默成立，旧主体的写入照样落地（实测可覆盖新 owner 的站点）。
+
+    两种模式：
+      · had_rev=True —— 精确匹配 rev。存量记录之外的一切都走这条（系统写入者
+        如 register_route 也走它：seed 保证 rev 必存在，真缺了就条件失败重读，
+        fail-closed）。
+      · had_rev=False —— 一期存量记录没有 rev 可比，退回断言**角色事实**。
+        允许哪些角色由 `CAPABILITIES[action]` 决定，不在这里另写。
+    """
+    if had_rev:
+        return ("attribute_exists(site_id) AND permissions_rev = :rev",
+                {":rev": {"N": str(rev)}}, {})
+    # --- 无 rev 的存量记录 ---
+    if not actor or not action:
+        # 系统写入者（register_route 等）没有 actor/action 可断言：稀疏存量行
+        # 可能两个 auth 字段都在、rev 却缺失，此时 seed 被跳过，确实会走到这里。
+        # 退回"要求 rev 属性存在"——本次条件必然失败 → 调用方重读重试，
+        # 下一轮 seed/在线写补上 rev 后即通过。**fail-closed 而不是放行**：
+        # 系统写入者没有身份信息，放行等于让守卫消失。
+        return ("attribute_exists(site_id) AND attribute_exists(permissions_rev)",
+                {}, {})
+    if role == ROLE_ADMIN:
+        # admin 既不是 owner 也未必在 collaborators 里，角色事实无从断言；
+        # 它的时效性由调用方另加的 admins ConditionCheck 负责。
+        return ("attribute_exists(site_id)", {}, {})
+    allowed = CAPABILITIES.get(action, frozenset())
+    clauses = []
+    if ROLE_OWNER in allowed:
+        clauses.append("#o = :me")
+    if ROLE_COLLABORATOR in allowed:
+        clauses.append("contains(collaborators, :me)")
+    if not clauses:
+        # 未登记动作，或只有 admin 能做：fail-closed（条件恒不成立）
+        return ("attribute_exists(site_id) AND attribute_not_exists(site_id)",
+                {}, {})
+    return ("attribute_exists(site_id) AND (" + " OR ".join(clauses) + ")",
+            {":me": {"S": actor}}, {"#o": "owner"} if "#o = :me" in clauses else {})
+
+
+def sites_snapshot_guard(site_id: str, **kw) -> dict:
+    """把 snapshot_condition 包成 sites 表上的 TransactItems ConditionCheck。"""
+    expr, vals, names = snapshot_condition(**kw)
+    out = {"TableName": os.environ["SITES_TABLE"],
+           "Key": {"site_id": {"S": site_id}},
+           "ConditionExpression": expr}
+    if vals:
+        out["ExpressionAttributeValues"] = vals
+    if names:
+        out["ExpressionAttributeNames"] = names
+    return {"ConditionCheck": out}
+
+
 def assert_can(email: str, site: dict | None, action: str, *,
                is_admin: bool = False, what: str = "") -> str:
     role = role_of(email, site, is_admin)
@@ -382,12 +455,23 @@ def write_permissions(site_id: str, *, actor: str, action: str,
     if len(sets) == 3:
         raise ValueError("没有要更新的字段")
 
+    # 守卫条件走唯一定义（见 snapshot_condition）：手抄第二份就是三轮审查里
+    # 反复出问题的根因。这里的 actor/action/role 让"无 rev 存量记录"也能按
+    # CAPABILITIES 的角色事实守住，而不是无条件放行。
+    guard_expr, guard_vals, guard_names = snapshot_condition(
+        rev=rev, had_rev=("permissions_rev" in site),
+        actor=actor, action=action, role=role)
+    vals.update(guard_vals)
+    names.update(guard_names)
+    # :rev 只服务于守卫条件（SET 子句用的是 :nrev）。无-rev 分支不引用它，
+    # 而 DynamoDB 会拒绝未被任何表达式使用的 ExpressionAttributeValues。
+    if ":rev" not in guard_vals:
+        vals.pop(":rev", None)
     site_update = {
         "TableName": os.environ["SITES_TABLE"],
         "Key": {"site_id": {"S": site_id}},
         "UpdateExpression": "SET " + ", ".join(sets),
-        "ConditionExpression": ("attribute_not_exists(permissions_rev) "
-                                "OR permissions_rev = :rev"),
+        "ConditionExpression": guard_expr,
         "ExpressionAttributeValues": vals,
     }
     if names:

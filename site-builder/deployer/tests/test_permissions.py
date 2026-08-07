@@ -642,3 +642,108 @@ def test_write_permissions_transfers_owner_to_both_tables(aws):
                         Key={"subdomain": {"S": "app-s-1"}})["Item"]
     assert item["owner"]["S"] == "new@x.com"
     assert item["collaborators"]["L"] == [{"S": "old@x.com"}]
+
+
+# ---- 守卫必须只有一份定义（Codex 2026-08-08 P1 的结构性修复）----
+# 同一个不变量原来手抄在三处（mcp/server.py、write_permissions、register_route），
+# 于是"审查指出一处 → 只修一处 → 另外两处照旧"重复了三轮。这两个用例把
+# "唯一定义"变成可执行约束：再有人手抄第四份就会红。
+
+def test_no_handwritten_rev_guard_outside_permissions_module():
+    """除 permissions.py 自己，任何源码都不得手写 permissions_rev 条件表达式。"""
+    import ast
+    import re
+    from pathlib import Path
+    root = Path(__file__).parents[3]        # 仓库根
+    canonical = (root / "site-builder" / "deployer" / "functions"
+                 / "permissions.py").resolve()
+    offenders = []
+    for py in list((root / "site-builder").rglob("*.py")) + \
+            list((root / "router").rglob("*.py")):
+        if any(part in py.parts for part in
+               (".venv", "cdk.out", "__pycache__", "tests")):
+            continue
+        if py.resolve() == canonical:
+            continue
+        text = py.read_text()
+        # 只看代码，不看注释与 docstring：解释这个表达式为什么危险是允许的
+        # （也是必要的）。用 ast 剥 docstring，再按行剥 # 注释——比正则可靠。
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.FunctionDef,
+                                 ast.AsyncFunctionDef, ast.ClassDef)):
+                body = node.body
+                if (body and isinstance(body[0], ast.Expr)
+                        and isinstance(body[0].value, ast.Constant)
+                        and isinstance(body[0].value.value, str)):
+                    body[0].value.value = ""      # 清掉 docstring 内容
+        code = ast.unparse(tree)
+        code = "\n".join(l.split("#")[0] for l in code.splitlines())
+        # 只认**守卫语法**：`permissions_rev = :x`（拿快照 rev 做相等比较）。
+        # 单纯读属性（site["permissions_rev"]）不算；
+        # `attribute_not_exists(permissions_rev)` 单独出现也不算——那是
+        # register_route 的**初始化**条件（"rev 缺失就补上"），语义与守卫相反，
+        # 是 rev 存在性的唯一保证点，必须允许。危险的是把它**当放行分支**用，
+        # 即与 rev 相等比较并成 OR，所以只要出现相等比较就算手抄。
+        if re.search(r'permissions_rev\s*=\s*:\w+', code):
+            offenders.append(str(py.relative_to(root)))
+    assert not offenders, (
+        "这些文件手写了 permissions_rev 守卫条件，必须改用 "
+        f"permissions.sites_snapshot_guard()：{offenders}\n"
+        "手抄第二份的代价见 permissions.snapshot_condition 的注释（两个 P1）。")
+
+
+def test_snapshot_condition_role_clauses_follow_capabilities():
+    """无-rev 分支的角色子句必须由 CAPABILITIES 推导，不能另写一套。
+
+    逐个受控动作比对：CAPABILITIES 说某角色无权，条件里就不该出现对应子句。
+    undeploy 不含 collaborator 是最要紧的一条——合并两者会让被降级的旧 owner
+    仍能 purge 掉新 owner 的数据。
+    """
+    import permissions as p
+    for action, roles in p.CAPABILITIES.items():
+        expr, _, _ = p.snapshot_condition(
+            rev=0, had_rev=False, actor="me@x.com", action=action,
+            role=p.ROLE_OWNER)
+        assert "attribute_exists(site_id)" in expr, action
+        owner_ok = p.ROLE_OWNER in roles
+        collab_ok = p.ROLE_COLLABORATOR in roles
+        assert ("#o = :me" in expr) == owner_ok, (
+            f"{action}: owner 子句与 CAPABILITIES 不一致")
+        assert ("contains(collaborators, :me)" in expr) == collab_ok, (
+            f"{action}: collaborator 子句与 CAPABILITIES 不一致"
+            f"（CAPABILITIES 允许的角色={sorted(roles)}）")
+    # 具体钉死这一条：undeploy 绝不能放 collaborator 进来
+    expr, _, _ = p.snapshot_condition(rev=0, had_rev=False, actor="me@x.com",
+                                      action="undeploy", role=p.ROLE_OWNER)
+    assert "contains(collaborators" not in expr
+
+
+def test_snapshot_condition_always_requires_item_exists():
+    """所有分支都必须要求 item 存在——否则"删除后同 site_id 重建"可绕过。"""
+    import permissions as p
+    variants = [
+        dict(rev=7, had_rev=True),
+        dict(rev=0, had_rev=False, actor="me@x.com", action="deploy",
+             role=p.ROLE_OWNER),
+        dict(rev=0, had_rev=False, actor="me@x.com", action="deploy",
+             role=p.ROLE_ADMIN),
+        dict(rev=0, had_rev=False),                     # 系统写入者
+        dict(rev=0, had_rev=False, actor="me@x.com", action="nonexistent-action",
+             role=p.ROLE_OWNER),
+    ]
+    for kw in variants:
+        expr, _, _ = p.snapshot_condition(**kw)
+        assert "attribute_exists(site_id)" in expr, kw
+        assert "attribute_not_exists(permissions_rev)" not in expr, kw
+
+
+def test_snapshot_condition_system_writer_is_fail_closed():
+    """没有 actor/action 的系统写入者遇上无-rev 记录时必须 fail-closed。"""
+    import permissions as p
+    expr, _, _ = p.snapshot_condition(rev=0, had_rev=False)
+    # 要求 rev 属性存在 → 本次必然失败 → 调用方重读重试，而不是被放行
+    assert "attribute_exists(permissions_rev)" in expr

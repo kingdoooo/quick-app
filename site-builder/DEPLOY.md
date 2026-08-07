@@ -178,8 +178,15 @@ auth 的执行角色因此需要 `ssm:GetParameter`（限定 `/site-builder/*`�
     --user-pool-id <pool> --client-id <site_client_id>
   #    返回 ClientSecretDescriptor.{ClientSecretId, ClientSecretValue}：
   #    · ClientSecretValue —— 新 secret 明文，**只有本次响应里有**，立刻用于 ②；
-  #    · ClientSecretId    —— 记下来，④ 删旧 secret 时要用（旧的那个 id 可用
-  #      describe-user-pool-client 查）。
+  #    · ClientSecretId    —— 新 secret 的 id，记下来以便区分新旧。
+
+  # ①b 列出该 client 的全部 secret，拿到**旧** secret 的 ClientSecretId
+  #     （④ 要用它。`describe-user-pool-client` 只返回 ClientSecret 值、
+  #      **不返回 ClientSecretId**，用它拿不到可删除的 id）
+  aws cognito-idp list-user-pool-client-secrets --region us-east-1 \
+    --user-pool-id <pool> --client-id <site_client_id>
+  #     返回 ClientSecrets[]，每项含 ClientSecretId 与创建时间（不含明文）；
+  #     创建时间较早的那个就是旧 secret。
 
   # ② 写进 SSM
   aws ssm put-parameter --region us-east-1 --overwrite \

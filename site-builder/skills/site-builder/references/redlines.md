@@ -77,7 +77,11 @@
 ## 红线 4：x-user-name 必须 decodeURIComponent
 
 - **规则**：代码里出现 `x-user-name`（前端或后端、任意大小写与引号写法）时，
-  同一文件必须出现 `decodeURIComponent(`。
+  必须**对这个头的值**调 `decodeURIComponent(`。两种写法都算通过：
+  ① 同一表达式里解码（`decodeURIComponent(req.headers['x-user-name'])`，
+  允许夹 `|| ''`、`String(...)` 等）；② 先把头值存进变量、再解码那个变量。
+  **解码别的东西不算**——文件里有 `decodeURIComponent(req.query.q)` 而头值
+  原样使用，仍会被拦下。
 - **为什么**：HTTP 头不能携带非 ASCII 字节，所以平台边缘层注入这个头时做了
   **URL 编码**（不编码的话中文名字会被 CloudFront 直接拒掉）。
   `x-user-email` 是 ASCII，**不编码**，不需要解码。
@@ -93,8 +97,12 @@
 - **错误**：
   ```js
   const name = req.headers["x-user-name"] || "";        // 违规：拿到的是编码串
+
+  const raw = req.headers["x-user-name"];
+  const q = decodeURIComponent(req.query.q);            // 违规：解码的不是这个头
+  save(raw);
   ```
-- 判定按**文件**而非按行：先取头存进变量、在别处解码也算通过。
+- 判定按**文件**而非按行：先取头存进变量、在别处解码那个变量也算通过。
   黄金样例见 `fixtures/nosql-notes/backend/server.js`。
 
 ## 红线 5：禁止写本地文件

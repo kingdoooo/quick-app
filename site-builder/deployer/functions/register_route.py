@@ -52,10 +52,18 @@ def _seed_permissions_if_absent(site_id: str, manifest_auth: dict,
                 "permissions_rev = if_not_exists(permissions_rev, :one), "
                 "permissions_updated_at = :t, "
                 "permissions_updated_by = :by"),
-            # 两个安全字段都在 → 什么都不做。缺任一个 → 只补那一个，
-            # 已有的字段由 if_not_exists 原样保留（在线值永不被 manifest 覆盖）。
+            # 缺任一个受管字段 → 只补那一个，已有的由 if_not_exists 原样保留
+            # （在线值永不被 manifest 覆盖）；三个都在 → 条件失败 = 真正的 no-op。
+            #
+            # **permissions_rev 必须进这个条件**：稀疏行可能两个 auth 字段都在、
+            # 而 rev 缺失（upsert_site 建站只写 owner/name/status，在线写也只
+            # 持久化调用方显式传的字段）。漏掉它的话 seed 整体被跳过 → rev 永远
+            # 补不上 → 下面的快照守卫（要求 rev 存在，fail-closed）每轮都失败，
+            # 把一次**合法**部署卡成"权限被并发修改"。本函数是 rev 存在性的
+            # 唯一保证点，条件必须覆盖它要写的每个字段。
             ConditionExpression=("attribute_not_exists(require_login) OR "
-                                 "attribute_not_exists(allowed_users)"),
+                                 "attribute_not_exists(allowed_users) OR "
+                                 "attribute_not_exists(permissions_rev)"),
             ExpressionAttributeValues={
                 ":rl": bool(manifest_auth["require_login"]),
                 ":au": allowed,
@@ -123,14 +131,21 @@ def handler(event, context):
         owner = site.get("owner") or owner
         rev = int(site.get("permissions_rev", 0))
         try:
+            # 守卫走 permissions.sites_snapshot_guard（全仓库唯一定义）。
+            # **had_rev 传 site 里的真实情况**，不要写死 True：
+            # _seed_permissions_if_absent 刚把 rev 补成 1，所以正常路径必然
+            # had_rev=True 走精确匹配；真的读不到 rev 说明 seed 没生效或记录
+            # 被替换，此时精确匹配会失败 → 走重试重读（fail-closed），
+            # 而不是被 attribute_not_exists 静默放行。
+            #
+            # 原来手抄的 `attribute_not_exists(permissions_rev) OR rev = :rev`
+            # 在"站点被同 site_id 重建且无 rev"时成立：旧 job 会把新站点的路由
+            # 覆盖成旧 static_prefix / 旧 owner / 旧权限（实测复现，
+            # Codex 复审 2026-08-08 P1）。
             ddb.transact_write_items(TransactItems=[
-                {"ConditionCheck": {
-                    "TableName": os.environ["SITES_TABLE"],
-                    "Key": {"site_id": {"S": event["site_id"]}},
-                    "ConditionExpression": (
-                        "attribute_not_exists(permissions_rev) OR "
-                        "permissions_rev = :rev"),
-                    "ExpressionAttributeValues": {":rev": {"N": str(rev)}}}},
+                permissions.sites_snapshot_guard(
+                    event["site_id"], rev=rev,
+                    had_rev=("permissions_rev" in site)),
                 {"Put": {"TableName": os.environ["ROUTING_TABLE"],
                          "Item": _route_item(event, site, owner, subdomain)}}])
             break

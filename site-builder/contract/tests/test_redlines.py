@@ -386,3 +386,50 @@ def test_real_decode_still_passes_with_comments_around(tmp_path):
         "// x-user-name 是 URL 编码的\n"
         "const n = decodeURIComponent(req.headers['x-user-name'] || '');"))
     assert scan_redlines(d, m) == []
+
+
+# ---- x-user-name：解码必须与这个头有关联（Codex 复审 2026-08-08 P2）----
+# 原规则只要求"同文件存在任意 decodeURIComponent 调用"，于是解码一个**无关**
+# 的值（req.query.q）就能让整个文件过关，而头值仍被原样使用——实测可绕过。
+# 现在要求：同表达式解码，或解码承接该头的变量。
+
+@pytest.mark.parametrize("desc,code", [
+    ("解码的是无关值（Codex 复现）",
+     "const raw = req.headers['x-user-name'];\n"
+     "const q = decodeURIComponent(req.query.q);\nstore(raw);"),
+    ("拼接头名 + 无关解码",
+     "const raw = req.headers['x-user-' + 'name'];\n"
+     "const q = decodeURIComponent(req.query.q);\nstore(raw);"),
+    ("完全没解码", "const name = req.headers['x-user-name'] || '';"),
+    ("只在注释里解码",
+     "const raw = req.headers['x-user-name'];\n// decodeURIComponent(raw)"),
+    ("前端取头未解码",
+     "fetch('/api').then(r => r.headers.get('x-user-name'))"),
+])
+def test_user_name_unrelated_decode_is_rejected(desc, code):
+    from contract.redlines import _check_user_name_decoded
+    assert _check_user_name_decoded(code, Path("api/index.js")), desc
+
+
+@pytest.mark.parametrize("desc,code", [
+    ("同表达式解码",
+     'const name = decodeURIComponent(req.headers["x-user-name"] || "");'),
+    ("先存变量再解码（文档承诺支持）",
+     "const raw = req.headers['x-user-name'];\n"
+     "const name = decodeURIComponent(raw || '');"),
+    ("嵌套调用（要求括号配平）",
+     "const n = decodeURIComponent(String(req.headers['x-user-name']));"),
+    ("拼接头名 + 变量解码",
+     "const raw = req.headers['x-user-' + 'name'];\n"
+     "const n = decodeURIComponent(raw);"),
+    ("req.get 写法",
+     "const raw = req.get('x-user-name');\nconst n = decodeURIComponent(raw);"),
+    ("既解码无关值也解码了头",
+     "const q = decodeURIComponent(req.query.q);\n"
+     "const n = decodeURIComponent(req.headers['x-user-name']);"),
+    ("头名大写", 'const n = decodeURIComponent(req.headers["X-User-Name"]);'),
+])
+def test_user_name_related_decode_is_accepted(desc, code):
+    """合规写法一个都不能误报——误报会把站点挡在部署外，比漏报更容易被绕过规则。"""
+    from contract.redlines import _check_user_name_decoded
+    assert _check_user_name_decoded(code, Path("api/index.js")) == [], desc

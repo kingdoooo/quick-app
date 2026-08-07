@@ -592,11 +592,14 @@ def test_confirm_upload_rolls_back_when_start_execution_fails(aws, monkeypatch):
     ok.start_execution.assert_called_once()
 
 
-def test_confirm_upload_treats_existing_execution_as_success(aws, monkeypatch):
-    """ExecutionAlreadyExists 说明上次其实起成功了：按成功返回且**不**回滚。
+def test_confirm_upload_fails_job_when_execution_already_closed(aws, monkeypatch):
+    """ExecutionAlreadyExists 表示同名执行**已关闭**（官方契约），不是"仍在跑"。
 
-    同 name + 同 input 就是同一次部署（STANDARD 工作流幂等）。若这里误回滚，
-    会把一个真在跑的部署改回 PENDING。
+    同 name + 同 input 且在运行时 StartExecution 是**成功**的；只有已关闭或
+    input 不同才报这个错。本函数的 input 对同一 job 恒定，所以收到它就证明
+    execution 已关闭，而该 name 90 天内不可复用 → 这个 job 永远推不动了。
+    因此必须置 FAILED，既不能报成功（用户永远轮询）也不能回滚成 PENDING
+    （重试只会再撞同一个错）。
     """
     import boto3 as _b3
     import botocore.exceptions
@@ -614,9 +617,11 @@ def test_confirm_upload_treats_existing_execution_as_success(aws, monkeypatch):
         {"Error": {"Code": "ExecutionAlreadyExists", "Message": "exists"}},
         "StartExecution")
     with patch.object(server, "_sfn", return_value=dup):
-        assert server.do_confirm_upload("o@x.com", jid)["status"] == "RUNNING"
-    # 关键：状态留在 RUNNING（真在跑），没有被回滚成 PENDING
-    assert common.get_job(jid)["status"] == "RUNNING"
+        with pytest.raises(server.AlreadyStarted):
+            server.do_confirm_upload("o@x.com", jid)
+    job = common.get_job(jid)
+    assert job["status"] == "FAILED", "必须如实失败，不能谎报成功或卡在 RUNNING"
+    assert job["error"], "要给出可操作的原因"
 
 
 def test_rollback_does_not_touch_advanced_job(aws):
@@ -628,3 +633,82 @@ def test_rollback_does_not_touch_advanced_job(aws):
     server._rollback_job_to_pending(jid)
     job = common.get_job(jid)
     assert job["status"] == "RUNNING" and job["phase"] == "validate"
+
+
+def test_legacy_undeploy_rejected_after_owner_downgraded_to_collaborator(aws):
+    """存量站点(无 rev)：旧 owner 鉴权后发生**合法的** transfer_owner，
+    他被自动降级为 collaborator → undeploy 必须被拒。
+
+    CAPABILITIES 里 undeploy 不含 collaborator。守卫若把 owner 与 collaborator
+    合并成"二者之一即可"，旧 owner 就能 purge 掉新 owner 的数据（不可恢复）。
+    这是"守卫的角色判定必须与 CAPABILITIES 同源"的回归用例。
+    """
+    import boto3 as _b3
+    import common
+    import permissions
+    import server
+    common.upsert_site("legacy-abc123", owner="old@x.com", status="ACTIVE",
+                       collaborators=[], tier="fullstack-sql")
+    _b3.client("dynamodb").put_item(TableName="routing", Item={
+        "subdomain": {"S": "app-legacy-abc123"},
+        "site_id": {"S": "legacy-abc123"}, "owner": {"S": "old@x.com"}})
+    real = server._assert_permission
+
+    def _assert_then_transfer(*a, **kw):
+        out = real(*a, **kw)
+        # 鉴权已过；此刻发生正常的所有权转移（旧 owner 降级为 collaborator）
+        permissions.transfer_owner("legacy-abc123", actor="old@x.com",
+                                   new_owner="new@x.com")
+        return out
+
+    with patch.object(server, "_assert_permission", _assert_then_transfer):
+        lam = MagicMock()
+        with patch.object(server, "_lambda", return_value=lam):
+            with pytest.raises(server.NotOwner):
+                server.do_undeploy("old@x.com", "legacy-abc123", purge_data=True)
+        lam.invoke.assert_not_called()
+    site = common.get_site("legacy-abc123")
+    # 前置事实自检：确认这个场景真的把旧 owner 变成了 collaborator，
+    # 且该角色确实无权 undeploy（否则用例证明的不是我想证明的东西）
+    assert site["owner"] == "new@x.com"
+    assert "old@x.com" in site["collaborators"]
+    assert not permissions.can(permissions.role_of("old@x.com", site), "undeploy")
+
+
+def test_legacy_collaborator_deploy_still_allowed_after_downgrade(aws, monkeypatch):
+    """对照：deploy **含** collaborator，所以降级后仍应放行——
+    守卫必须按 action 区分，不能一律收紧成"只有 owner"。"""
+    import boto3 as _b3
+    import common
+    import permissions
+    import server
+    monkeypatch.setenv("STATE_MACHINE_ARN",
+                       "arn:aws:states:us-east-1:1:stateMachine:sm")
+    common.upsert_site("legacy-abc123", owner="old@x.com", status="ACTIVE",
+                       collaborators=[])
+    jid = common.create_job("old@x.com", "legacy-abc123")
+    _b3.client("s3").put_object(Bucket="site-artifacts-1",
+                                Key=f"uploads/{jid}.zip", Body=b"zip")
+    real_s3 = server._s3
+
+    def _s3_then_transfer():
+        c = real_s3()
+        orig = c.head_object
+
+        def head(**kw):
+            out = orig(**kw)
+            permissions.transfer_owner("legacy-abc123", actor="old@x.com",
+                                       new_owner="new@x.com")
+            return out
+
+        c.head_object = head
+        return c
+
+    sfn = MagicMock()
+    monkeypatch.setattr(server, "_s3", _s3_then_transfer)
+    with patch.object(server, "_sfn", return_value=sfn):
+        out = server.do_confirm_upload("old@x.com", jid)
+    assert out["status"] == "RUNNING"
+    sfn.start_execution.assert_called_once()
+    site = common.get_site("legacy-abc123")
+    assert permissions.can(permissions.role_of("old@x.com", site), "deploy")

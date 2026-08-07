@@ -48,15 +48,59 @@ _COMMENTS_AND_STRINGS_RE = re.compile(
     re.S)
 
 
-def _strip_comments_and_strings(text: str) -> str:
+def _strip_comments_and_strings(text: str, keep_header: bool = False) -> str:
     """把注释与字符串字面量替换成等长空白，用于"这里真的有代码调用吗"的判断。
 
     等长替换（而不是删除）让行列位置不漂移，便于以后要报行号时复用。
     注意这是启发式的：正则解析 JS 不可能完全正确（正则字面量、嵌套模板等），
     但方向是安全的——**误删代码会导致误报（多拦一个站点），不会漏放**。
+
+    keep_header=True：**只保留** x-user-name 这个头名的字符串字面量，其余照旧
+    抹掉。判"解码的是不是这个头"必须同时看见代码结构与这个头名，而它总是写在
+    字符串里；全抹掉就无从关联（注释里的假解码仍会被抹，所以不放松原有防线）。
     """
-    return _COMMENTS_AND_STRINGS_RE.sub(
-        lambda m: re.sub(r"\S", " ", m.group(0)), text)
+    def _blank(m: re.Match) -> str:
+        s = m.group(0)
+        if keep_header and X_USER_NAME_RE.search(s):
+            # 保留这段字面量原样（它只可能是头名，不含可执行代码）
+            return s
+        return re.sub(r"\S", " ", s)
+
+    if keep_header:
+        # 拼接写法（`'x-user-' + 'name'`）的头名**跨两个字面量**，逐段判断时
+        # 两段都不匹配，会被抹成 `[  +  ]` → 关联不上承接它的变量 → 合规代码
+        # 被误报。所以先把整个拼接式规约成一个等价字面量，再走逐段保留。
+        text = re.sub(
+            r"['\"`]x-user-['\"`]\s*\+\s*['\"`]name['\"`]",
+            lambda m: "'x-user-name'" + " " * (len(m.group(0)) - 14),
+            text, flags=re.I)
+
+    return _COMMENTS_AND_STRINGS_RE.sub(_blank, text)
+
+
+# `const raw = req.headers['x-user-name']` / `let n = req.get("x-user-name")`
+# —— 抓住承接头值的变量名，供"先存变量、后解码"这种合法写法放行。
+_HEADER_ASSIGN_RE = re.compile(
+    r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=[^;\n]*?"
+    r"(?:x-user-name|x-user-['\"`]\s*\+\s*['\"`]name)", re.I)
+
+
+def _balanced_arg(code: str, open_paren: int) -> str | None:
+    """取 code[open_paren] 这个 '(' 到其配对 ')' 之间的实参文本。
+
+    用括号配平而不是 `[^)]*`：实参里常有嵌套调用
+    （`decodeURIComponent(String(req.headers['x-user-name']))`），非配平写法
+    会在第一个 ')' 就截断，把合规代码判成违规。
+    """
+    depth = 0
+    for i in range(open_paren, len(code)):
+        if code[i] == "(":
+            depth += 1
+        elif code[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return code[open_paren + 1:i]
+    return None      # 括号不配平（截断的文件）：交给调用方按未通过处理
 
 
 def _read_all(root: Path) -> list[tuple[Path, str]]:
@@ -86,21 +130,46 @@ def _scan_package_json(text: str, rel: Path) -> list[str]:
 
 
 def _check_user_name_decoded(text: str, rel: Path) -> list[str]:
-    """用了 x-user-name 就必须在同一文件里 decodeURIComponent。
+    """用了 x-user-name 就必须**对它**调 decodeURIComponent。
 
-    按**文件**而非按行判定，是有意放宽：取值与解码常常不在一行
-    （先取 header 存进变量，另一处解码）。同文件出现解码调用即放行——
-    这条红线要挡的是"完全不知道需要解码"，不是审查解码位置是否精确。
-    宁可漏报这种少见的跨文件写法，也不要因为误报把合规站点挡在部署外。
+    判定分两步（原来只做第一步的"同文件存在任意解码调用"，代价是
+    `decodeURIComponent(req.query.q)` 这种**与本头无关**的解码就能让整个文件
+    过关，而 x-user-name 仍被原样使用——实测可绕过，Codex 复审 2026-08-08）：
+
+      ① 同一表达式里解码：`decodeURIComponent(req.headers['x-user-name'])`
+         （允许中间夹 `|| ""`、`as string`、`?? ''` 等）；
+      ② 先存变量再解码：`const raw = req.headers['x-user-name']` 之后出现
+         `decodeURIComponent(... raw ...)`。变量名从赋值语句里提取。
+
+    两者都不成立才报错。仍**按文件**判定（解码可以在别处），只是要求解码的
+    对象与这个头有可见的关联，而不是文件里随便有个解码调用。
     """
-    # 头名的出现照原文找（它常写在字符串里，剥掉就找不到了）；
+    if not X_USER_NAME_RE.search(text):
+        return []
+    err = [f"{rel}: 用了 x-user-name 但没有对它 decodeURIComponent —— 该头是 "
+           "URL 编码的（HTTP 头不能携带中文），不解码会把 %E5%BD%AD 这类 "
+           "编码串当成用户名显示或写库（静默脏数据，不会报错）。"
+           "注意：解码别的东西（如 req.query.x）不算——必须解码这个头的值"]
     # 解码调用必须在**剥掉注释与字符串之后**仍然存在，才算真的调用了。
-    if X_USER_NAME_RE.search(text) and not DECODE_RE.search(
-            _strip_comments_and_strings(text)):
-        return [f"{rel}: 用了 x-user-name 但没有 decodeURIComponent —— 该头是 "
-                "URL 编码的（HTTP 头不能携带中文），不解码会把 %E5%BD%AD 这类 "
-                "编码串当成用户名显示或写库（静默脏数据，不会报错）"]
-    return []
+    # 但头名要在原文里找（它总是写在字符串里，剥掉就找不到了），所以这里
+    # 用"把字符串内容替换成占位符、保留结构"的方式：既能识别 decode 调用，
+    # 也能看到 decode 的实参里有没有这个头 / 这个变量。
+    code = _strip_comments_and_strings(text, keep_header=True)
+    if not DECODE_RE.search(code):
+        return err
+    # ① 同表达式：decodeURIComponent( ... x-user-name ... )
+    for m in DECODE_RE.finditer(code):
+        arg = _balanced_arg(code, m.end() - 1)
+        if arg is not None and X_USER_NAME_RE.search(arg):
+            return []
+    # ② 变量中转：先把头存进变量，再解码那个变量
+    for var in _HEADER_ASSIGN_RE.findall(code):
+        for m in DECODE_RE.finditer(code):
+            arg = _balanced_arg(code, m.end() - 1)
+            if arg is not None and re.search(
+                    r"\b%s\b" % re.escape(var), arg):
+                return []
+    return err
 
 
 def scan_redlines(site_dir: Path, manifest: dict) -> list[str]:

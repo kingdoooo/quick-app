@@ -715,37 +715,37 @@ def test_transaction_paths_have_condition_check_permission():
             f"{sid} 缺 ConditionCheckItem（{why}）——线上该路径必 AccessDenied")
 
 
-def test_mcp_transaction_guards_target_expected_tables():
-    """守卫条件必须打在 sites/admins 表上。
+def test_mcp_delegates_snapshot_guard_and_passes_action():
+    """MCP **不得**自己拼守卫条件，必须委托 permissions.sites_snapshot_guard，
+    并把 action 传进去。
 
-    从 server.py 源码解析：写错表名（例如打到 routing）会让条件永远成立，
-    闸门静默失效，而 moto 下的用例照样全绿。
+    条件表达式本身的正确性由 deployer/tests/test_permissions.py 断言（那里是
+    唯一定义）。这里只钉住"MCP 侧确实在用那一份、且带上了 action"——action
+    决定无-rev 分支允许哪些角色：漏传就会退化成"owner/collaborator 二者之一"，
+    而 undeploy 本不该给 collaborator（旧 owner 被降级后仍能 purge 数据）。
     """
     import re
     srv = (MCP_DIR / "server.py").read_text()
     rev_block = srv[srv.index("def _rev_condition_check"):
                     srv.index("def _admin_condition_check")]
-    assert re.search(r'os\.environ\["SITES_TABLE"\]', rev_block), \
-        "rev 守卫没有打在 SITES_TABLE 上"
-    assert "permissions_rev = :rev" in rev_block, "rev 守卫没有比对 permissions_rev"
-    # **每条分支都必须要求 item 存在**（Codex 复审 2026-08-07 第二轮 P1）：
-    # 少了它，站点被删除/用同 site_id 重建（新 owner、无 rev）时旧主体照样通过。
-    # 用 ConditionExpression 的实际取值来数，避免注释里的字样蒙混过关。
-    exprs = re.findall(r'"ConditionExpression":\s*\(?((?:\s*"[^"]*")+)\)?',
-                       rev_block)
-    assert exprs, "解析不到 rev 守卫的 ConditionExpression——本用例已失效，先修用例"
-    for e in exprs:
-        flat = " ".join(re.findall(r'"([^"]*)"', e))
-        assert "attribute_exists(site_id)" in flat, (
-            f"rev 守卫某条分支没要求 item 存在: {flat!r}"
-            "——删除后重建（无 rev）会绕过守卫")
-    assert "attribute_not_exists(permissions_rev)" not in " ".join(
-        " ".join(re.findall(r'"([^"]*)"', e)) for e in exprs), (
-        "rev 守卫不能用 attribute_not_exists(permissions_rev) 放行"
-        "——item 被重建且没写 rev 时同样成立，等于没有守卫")
-    # 存量站点（无 rev）不能被永久拦死：必须有按角色事实的兜底分支
-    assert "contains(collaborators, :me)" in rev_block, \
-        "缺无-rev 存量站点的角色事实兜底分支——一期老站点会被永久拦死"
+    assert "permissions.sites_snapshot_guard" in rev_block, (
+        "MCP 没有委托 permissions.sites_snapshot_guard——手抄第二份守卫是"
+        "三轮审查反复出 P1 的根因")
+    # 不得自己写条件表达式
+    assert '"ConditionExpression"' not in rev_block, (
+        "MCP 又开始自己拼 ConditionExpression 了——守卫只能有一份定义")
+    # 两个调用点都必须显式传 action，且与该工具真实执行的动作一致
+    for call, action in (("deploy", "deploy"), ("undeploy", "undeploy")):
+        assert re.search(
+            r'_rev_condition_check\([^)]*"%s"\)' % re.escape(action), srv), (
+            f"_rev_condition_check 的调用点没传 action={action!r}——"
+            "无 rev 的存量站点会按错误的角色集放行")
+    # undeploy 的 action 必须真是 "undeploy"（若误传 "deploy"，collaborator
+    # 会被放进来，这正是复现过的那个 P1）
+    undeploy_fn = srv[srv.index("def do_undeploy"):srv.index("class PermissionConflict")]
+    assert '_rev_condition_check(authz, site_id, "undeploy")' in undeploy_fn, (
+        "do_undeploy 必须以 action=\"undeploy\" 取守卫——传 deploy 会让"
+        "被降级为 collaborator 的旧 owner 仍能 purge 掉新 owner 的数据")
     admin_block = srv[srv.index("def _admin_condition_check"):
                       srv.index("# ---------- 纯函数层")]
     assert re.search(r'os\.environ\["ADMINS_TABLE"\]', admin_block), \
