@@ -728,9 +728,24 @@ def test_mcp_transaction_guards_target_expected_tables():
     assert re.search(r'os\.environ\["SITES_TABLE"\]', rev_block), \
         "rev 守卫没有打在 SITES_TABLE 上"
     assert "permissions_rev = :rev" in rev_block, "rev 守卫没有比对 permissions_rev"
-    # 存量站点没有该属性，必须兜住，否则老站点全部无法下线
-    assert "attribute_not_exists(permissions_rev)" in rev_block, \
-        "rev 守卫缺 attribute_not_exists 兜底——一期存量站点会被永久拦死"
+    # **每条分支都必须要求 item 存在**（Codex 复审 2026-08-07 第二轮 P1）：
+    # 少了它，站点被删除/用同 site_id 重建（新 owner、无 rev）时旧主体照样通过。
+    # 用 ConditionExpression 的实际取值来数，避免注释里的字样蒙混过关。
+    exprs = re.findall(r'"ConditionExpression":\s*\(?((?:\s*"[^"]*")+)\)?',
+                       rev_block)
+    assert exprs, "解析不到 rev 守卫的 ConditionExpression——本用例已失效，先修用例"
+    for e in exprs:
+        flat = " ".join(re.findall(r'"([^"]*)"', e))
+        assert "attribute_exists(site_id)" in flat, (
+            f"rev 守卫某条分支没要求 item 存在: {flat!r}"
+            "——删除后重建（无 rev）会绕过守卫")
+    assert "attribute_not_exists(permissions_rev)" not in " ".join(
+        " ".join(re.findall(r'"([^"]*)"', e)) for e in exprs), (
+        "rev 守卫不能用 attribute_not_exists(permissions_rev) 放行"
+        "——item 被重建且没写 rev 时同样成立，等于没有守卫")
+    # 存量站点（无 rev）不能被永久拦死：必须有按角色事实的兜底分支
+    assert "contains(collaborators, :me)" in rev_block, \
+        "缺无-rev 存量站点的角色事实兜底分支——一期老站点会被永久拦死"
     admin_block = srv[srv.index("def _admin_condition_check"):
                       srv.index("# ---------- 纯函数层")]
     assert re.search(r'os\.environ\["ADMINS_TABLE"\]', admin_block), \

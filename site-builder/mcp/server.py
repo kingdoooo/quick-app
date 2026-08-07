@@ -98,10 +98,14 @@ class Authz(NamedTuple):
 
     `rev` 是判定所依据的 permissions_rev——把它带到最终动作的事务条件里，
     就能保证"判定之后权限没被改过"（见 _rev_condition_check）。
+    `had_rev` 区分"rev 确实是 0"与"这条记录没有 rev 属性"（一期存量）：
+    后者不能用 rev 相等来守卫，只能退回到按角色事实守卫。
     """
     site: dict
     role: str
     rev: int
+    had_rev: bool
+    actor: str
 
 
 def _assert_permission(email: str, site_id: str, action: str,
@@ -124,7 +128,8 @@ def _assert_permission(email: str, site_id: str, action: str,
     except permissions.PermissionDenied as e:
         raise NotOwner(str(e))
     site = site or {}
-    return Authz(site, role, int(site.get("permissions_rev", 0)))
+    return Authz(site, role, int(site.get("permissions_rev", 0)),
+                 "permissions_rev" in site, email)
 
 
 # 判定与动作之间的撤权窗口：把"权限快照仍是我鉴权时那份"作为事务条件。
@@ -135,21 +140,56 @@ def _assert_permission(email: str, site_id: str, action: str,
 # 那里授权与写入在同一事务，本函数把同一不变量带到 MCP 的两条副作用路径上
 # （Codex 复审 2026-08-07 P1）。
 #
-# ⚠️ **效力边界，按字面理解**：它保证的是"撤权完成后，旧主体的请求无法**开始**
-# 落地"——即 job 不会被置 RUNNING、SFN 不会被启动、undeploy Lambda 不会被调用。
-# 它**不能**中止已经启动的部署：SFN 一旦开跑（约 90 秒到站点上线），撤权不会
-# 回收它，那次部署仍会覆盖站点。要覆盖这段就得在 SFN 步骤里复查 rev 并支持
-# 中止，属于独立改动，不在本轮范围。
-# 所以正确的说法是"撤权后不再有新的写入被接受"，而不是"撤权立刻停止一切在途
-# 部署"。写运维文档时别把前者写成后者。
-def _rev_condition_check(site_id: str, rev: int) -> dict:
+# ⚠️ **效力边界，按字面理解**：线性化点是**本事务提交成功的那一刻**——提交成功
+# 即视为请求已被接受。所以它保证的是"撤权完成后，旧主体的请求不再被接受"，
+# 而**不是**"SFN 启动前都还能拦住"：事务提交后、start_execution 之前发生的撤权
+# 拦不住（那已在接受点之后），SFN 一旦开跑（约 90 秒到上线）更不会被回收。
+# 要覆盖接受点之后的部分，得在 SFN 步骤里复查 rev 并支持中止，属独立改动。
+# 写运维文档时按"提交即接受"表述，别写成"部署开始前都能撤回"
+# （Codex 复审 2026-08-07 第二轮对边界表述的再修正）。
+def _rev_condition_check(authz: "Authz", site_id: str) -> dict:
+    """把"鉴权所依据的授权事实此刻仍然成立"作为事务条件。
+
+    **不能只写 `attribute_not_exists(permissions_rev) OR permissions_rev = :rev`**。
+    那个写法本意是兼容一期存量（没有 rev 属性），但 attribute_not_exists 在
+    **整个 item 不存在、或 item 被删除后用同 site_id 重建且没写 rev** 时同样
+    成立——于是：
+        旧 owner 读到 rev=7 → 站点被删除并重建（新 owner，无 rev）→
+        条件通过 → 旧 owner 的代码覆盖新 owner 的站点。
+    已实测复现（Codex 复审 2026-08-07 P1）。undeploy.py 会 delete 路由 item 并
+    把 sites 置 DELETED，而 do_deploy_site 的 upsert 只写 owner/name/status
+    （不写 rev），"同 site_id 重新建站"这条路径是真实可达的。
+
+    所以分两种情况，都要求 **item 必须存在**：
+      · 鉴权快照带 rev  → 只接受精确相等（重建后无 rev 也会被拒）；
+      · 快照没有 rev（一期存量）→ 退回到按**角色事实**守卫：owner 必须还是我，
+        或 collaborators 里还有我。这样即便记录被重建，新记录的 owner 不是我
+        就会被拒。
+    admin 代管路径由独立的 admins ConditionCheck 负责（见 _admin_condition_check）。
+    """
+    if authz.had_rev:
+        return {"ConditionCheck": {
+            "TableName": os.environ["SITES_TABLE"],
+            "Key": {"site_id": {"S": site_id}},
+            # attribute_exists 不可省：item 被删掉时 permissions_rev = :rev
+            # 本身就不成立，但显式写出来意图更清楚，也挡住"重建且无 rev"。
+            "ConditionExpression": ("attribute_exists(site_id) "
+                                    "AND permissions_rev = :rev"),
+            "ExpressionAttributeValues": {":rev": {"N": str(authz.rev)}}}}
+    # 一期存量：没有 rev 可比，只能断言"我此刻仍是 owner 或 collaborator"。
+    # admin 走这条时角色事实可能两条都不成立，交给 admins ConditionCheck。
+    if authz.role == permissions.ROLE_ADMIN:
+        return {"ConditionCheck": {
+            "TableName": os.environ["SITES_TABLE"],
+            "Key": {"site_id": {"S": site_id}},
+            "ConditionExpression": "attribute_exists(site_id)"}}
     return {"ConditionCheck": {
         "TableName": os.environ["SITES_TABLE"],
         "Key": {"site_id": {"S": site_id}},
-        # rev 为 0 的站点可能压根没有这个属性（一期存量 / 刚建站）
-        "ConditionExpression": ("attribute_not_exists(permissions_rev) "
-                                "OR permissions_rev = :rev"),
-        "ExpressionAttributeValues": {":rev": {"N": str(rev)}}}}
+        "ConditionExpression": ("attribute_exists(site_id) AND "
+                                "(#o = :me OR contains(collaborators, :me))"),
+        "ExpressionAttributeNames": {"#o": "owner"},
+        "ExpressionAttributeValues": {":me": {"S": authz.actor}}}}
 
 
 def _admin_condition_check(email: str) -> dict:
@@ -218,7 +258,7 @@ def do_confirm_upload(owner: str, job_id: str) -> dict:
             "ExpressionAttributeValues": {":running": {"S": "RUNNING"},
                                           ":pending": {"S": "PENDING"},
                                           ":q": {"S": "queued"}}}},
-        _rev_condition_check(job["site_id"], authz.rev),
+        _rev_condition_check(authz, job["site_id"]),
     ]
     if authz.role == permissions.ROLE_ADMIN:
         items.append(_admin_condition_check(owner))
@@ -241,11 +281,66 @@ def do_confirm_upload(owner: str, job_id: str) -> dict:
         if len(reasons) > 2 and reasons[2] == "ConditionalCheckFailed":
             raise NotOwner("你的管理员权限已被撤销") from e
         raise
-    _sfn().start_execution(
-        stateMachineArn=os.environ["STATE_MACHINE_ARN"],
-        name=job_id,  # 同名执行被 SFN 拒绝 = 幂等
-        input=json.dumps({"job_id": job_id, "site_id": job["site_id"]}))
+    # 事务已提交（= 请求已被接受），但 SFN 还没起。这两步之间失败的话，
+    # job 会永久停在 RUNNING 而没有任何 execution 在跑：重试因 status 已非
+    # PENDING 被判成 AlreadyStarted，用户只能一直轮询一个永不推进的任务
+    # ——ExecutionLimitExceeded / 节流 / KMS / 状态机被删都会走到这里
+    # （Codex 复审 2026-08-07 P1，已实测复现）。
+    #
+    # 处置：条件回滚到 PENDING，把重试权还给用户。
+    # 回滚是安全的——StartExecution 对 STANDARD 工作流**幂等**（同 name + 同
+    # input 返回同一个 execution），而本函数的 input 完全由 job_id/site_id 决定，
+    # 所以"其实已经起成功了、只是响应丢了"这种情况下重试也不会起出第二条。
+    sfn_input = json.dumps({"job_id": job_id, "site_id": job["site_id"]})
+    try:
+        _sfn().start_execution(
+            stateMachineArn=os.environ["STATE_MACHINE_ARN"],
+            name=job_id,  # 同名执行被 SFN 拒绝 = 幂等
+            input=sfn_input)
+    except botocore.exceptions.ClientError as start_err:
+        # 按**错误码**判别，不用异常类名：botocore 的异常类是按服务模型动态生成的，
+        # 类名比错误码更容易随 SDK 版本变化。
+        if (start_err.response.get("Error", {}).get("Code")
+                == "ExecutionAlreadyExists"):
+            # 上一次其实起成功了（响应丢了或并发重试）。同 name + 同 input
+            # 就是同一次部署，按成功返回，**不要**回滚。
+            return {"status": "RUNNING"}
+        _rollback_job_to_pending(job_id)
+        raise
+    except Exception:
+        # 非 ClientError（网络中断、连接超时等）同样要回滚——这类失败最可能
+        # 根本没到达 SFN，不回滚就是永久卡死。
+        _rollback_job_to_pending(job_id)
+        raise
+
     return {"status": "RUNNING"}
+
+
+def _rollback_job_to_pending(job_id: str) -> None:
+    """SFN 未起成功时把 job 退回 PENDING，让 confirm_upload 可以重试。
+
+    **条件必须同时匹配 status=RUNNING 且 phase=queued**——也就是"正是本函数刚
+    写进去、还没有任何 SFN 步骤动过"的那个状态。若 execution 其实已经起来并推进
+    到 validate（phase 会变），回滚就会把一个真在跑的任务改回 PENDING，用户重试
+    时又起一条同名 execution（被拒）或误判状态。宁可回滚失败留下 RUNNING，
+    也不能踩掉真在跑的部署。
+
+    回滚本身失败不再抛出：此时要让调用方看到的是 start_execution 的**原始**错误
+    （那才是根因）。回滚失败的后果退化成本函数修的那个老问题，不会更糟。
+    """
+    import botocore.exceptions
+    try:
+        boto3.client("dynamodb", region_name="us-east-1").update_item(
+            TableName=os.environ["JOBS_TABLE"],
+            Key={"job_id": {"S": job_id}},
+            UpdateExpression="SET #s = :pending, phase = :p",
+            ConditionExpression="#s = :running AND phase = :queued",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":pending": {"S": "PENDING"}, ":p": {"S": "submitted"},
+                ":running": {"S": "RUNNING"}, ":queued": {"S": "queued"}})
+    except botocore.exceptions.ClientError:
+        pass    # 见 docstring：原始错误更重要，且回滚失败不会让状态更坏
 
 
 def do_get_status(owner: str, job_id: str) -> dict:
@@ -276,7 +371,7 @@ def do_undeploy(owner: str, site_id: str, purge_data: bool = False) -> dict:
     # 恢复，鉴权之后被转移所有权/撤权的旧请求不能再落地
     # （Codex 复审 2026-08-07 P1）。建 job 失败 → 不调 undeploy Lambda。
     import botocore.exceptions
-    guards = [_rev_condition_check(site_id, authz.rev)]
+    guards = [_rev_condition_check(authz, site_id)]
     if authz.role == permissions.ROLE_ADMIN:
         guards.append(_admin_condition_check(owner))
     try:

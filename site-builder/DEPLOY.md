@@ -165,8 +165,36 @@ auth 的执行角色因此需要 `ssm:GetParameter`（限定 `/site-builder/*`�
 
 两个密钥的轮转代价完全不同，别按同一套做：
 
-- `site-client-secret`：改 SSM 即可。auth 侧最长 5 分钟收敛
-  （`login_handler.SECRET_TTL_SECONDS`），没有第二个消费方。
+- `site-client-secret`：**不能只改 SSM**。这个值不是我们自己定的——它必须是
+  Cognito 那个 app client 认可的 secret。直接写一个新随机值进 SSM，5 分钟后
+  auth 拿着它去换 token，Cognito 一律返回 `invalid_client`：**全员登录失败**
+  （而且这正好是 `token_exchange_invalid_grant` 告警要发现的那类事故）。
+  Cognito 现在支持一个 app client 同时有 **2 个 active secret**，按这个顺序做
+  零停机轮转：
+
+  ```bash
+  # ① Cognito 侧新增第二个 secret（不影响现有那个）
+  aws cognito-idp add-user-pool-client-secret --region us-east-1 \
+    --user-pool-id <pool> --client-id <site_client_id>
+  #    返回 ClientSecretDescriptor.{ClientSecretId, ClientSecretValue}：
+  #    · ClientSecretValue —— 新 secret 明文，**只有本次响应里有**，立刻用于 ②；
+  #    · ClientSecretId    —— 记下来，④ 删旧 secret 时要用（旧的那个 id 可用
+  #      describe-user-pool-client 查）。
+
+  # ② 写进 SSM
+  aws ssm put-parameter --region us-east-1 --overwrite \
+    --name /site-builder/site-client-secret --type SecureString --value "<新值>"
+
+  # ③ 等 auth 收敛（≤5 分钟，见 SECRET_TTL_SECONDS）后**实际登录验证一次**
+  #    ——两个 secret 此时都有效，验不过就回退 SSM，不要往下走
+
+  # ④ 确认无误后删掉旧 secret（删不掉最后一个，所以顺序不能颠倒）
+  aws cognito-idp delete-user-pool-client-secret --region us-east-1 \
+    --user-pool-id <pool> --client-id <site_client_id> \
+    --client-secret-id <旧 secret 的 id>
+  ```
+
+  顺序反了（先删旧、再加新）会在两步之间造成登录中断，且旧值已不可恢复。
 - `jwt-secret`：**只改 SSM 会造成一段全员无法登录的窗口**。它有两个消费方，
   且更新速度不同：
   - auth（签发）——读 SSM，最长 5 分钟切到新值；
@@ -178,10 +206,22 @@ auth 的执行角色因此需要 `ssm:GetParameter`（限定 `/site-builder/*`�
   旧 Edge 节点上有效**，于是同一时刻不同用户、不同地区表现不一致。
   症状（无限登录跳转）与"密钥读取失败"完全一样，极难定位到密钥版本。
 
-**当前实现不支持安全轮转**：Edge 的 `verify_session_jwt` 只接受单个 secret
-（`router/infrastructure/lambda/origin_request.py` 与 `auth/session.py` 各一份，
-必须字节级同步）。真要轮转，先做双密钥验证——让 Edge 接受 `{新, 旧}` 两个值、
-复制完成后再让 auth 切到新值签发、确认无旧 cookie 后移除旧值（三次部署）。
+**当前实现不支持安全轮转**：Edge 只用单个 `{{JWT_SECRET}}` 占位符验签。真要
+做双密钥（Edge 同时接受 `{新, 旧}`、复制完成后 auth 再切到新值签发、确认无旧
+cookie 后移除旧值），**必须改这三处**——少改任何一处方案都部署不出去：
+
+| 文件 | 改什么 |
+|---|---|
+| `router/infrastructure/stack.py:199` | 注入的地方。现在只 `.replace("{{JWT_SECRET}}", jwt_secret)`，要改成读并注入两个版本 |
+| `router/infrastructure/lambda/origin_request.py` | `_verify_session_jwt()` 改成依次试两个 key |
+| `site-builder/auth/session.py` + `login_handler.py` | 签发侧始终只用 active key，配合切换顺序 |
+
+> ⚠️ 别只照"`origin_request.py` 与 `auth/session.py` 两处同步"去改：
+> `session.py` 里的 `verify_session_jwt()` **只有测试在用**，不是生产验签
+> 消费方（生产验签是 Edge 里的 `_verify_session_jwt`）。真正卡住双密钥部署的
+> 是 `stack.py` 那一行——它不改的话，CDK 仍然只注入一个 secret，Edge 代码改了
+> 也拿不到第二个值。
+
 这是代码改动，不在一期/二期范围内。
 
 **如果密钥已泄漏、必须立刻失效**（走"可用性换安全性"，别装作无损）：

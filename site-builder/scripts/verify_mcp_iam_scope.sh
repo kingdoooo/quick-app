@@ -152,25 +152,46 @@ fi
 # 报"全部通过"。身份策略与资源策略是求并集的，只查前者不够。
 # 现网核对过：这几张表当前都没有 resource policy，所以这是防未来假通过。
 echo "── ⓪b 表上的 resource-based policy ───────────────"
-for TBL in "$SITES_TABLE" "$ROUTING_TABLE" \
-           "$(read_cfg Deployer admins_table)"; do
-  # 没有策略时 API 抛 PolicyNotFoundException（不是返回空）——必须把
-  # "确实没有策略"与"调用失败/无权限"分开，否则查不了就等于查过了。
-  OUT="$(aws_admin dynamodb get-resource-policy \
-           --resource-arn "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$TBL" 2>&1)" \
-    && RC=0 || RC=$?
-  if [ "$RC" -eq 0 ]; then
-    echo "FAIL  $TBL 上存在 resource-based policy —— 它可能给 runtime 角色额外"
+# **jobs 表也要查**：它现在同样参与安全事务（undeploy 的 create_job、
+# confirm_upload 的状态迁移都在事务里），"真实角色的完整 DynamoDB 授权并集"
+# 这个断言必须覆盖全部参与表，否则结论推得比证据宽。
+#
+# **必须查两次**：GetResourcePolicy 是**最终一致**读，官方明示
+# "PutResourcePolicy 之后立刻查可能返回 PolicyNotFoundException，等几秒重试"。
+# 单次读到 PolicyNotFound 就报无策略的话，刚附加上宽泛策略的那几秒里本脚本
+# 会假绿，而策略随后就生效（Codex 复审 2026-08-07 第二轮 P2）。
+probe_resource_policy() {  # $1=表名 → 0 无策略 / 1 有策略或查不了
+  local tbl="$1" out rc
+  out="$(aws_admin dynamodb get-resource-policy \
+           --resource-arn "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$tbl" 2>&1)" \
+    && rc=0 || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    echo "FAIL  $tbl 上存在 resource-based policy —— 它可能给 runtime 角色额外"
     echo "      授权，而影子角色（另一个 principal）拿不到，下面的 PASS 不可信。"
-    echo "      内容：$(printf '%s' "$OUT" | head -c 400)"
-    FAILURES=$((FAILURES + 1))
-  elif grep -q "PolicyNotFoundException" <<<"$OUT"; then
-    echo "PASS  $TBL 无 resource-based policy"
-  else
-    echo "FAIL  $TBL 的 resource policy 查不出来（不是'没有策略'）：$(head -1 <<<"$OUT")"
-    echo "      需要 dynamodb:GetResourcePolicy 权限；查不了就不能断言无旁路。"
-    FAILURES=$((FAILURES + 1))
+    echo "      内容：$(printf '%s' "$out" | head -c 400)"
+    return 1
   fi
+  if ! grep -q "PolicyNotFoundException" <<<"$out"; then
+    echo "FAIL  $tbl 的 resource policy 查不出来（不是'没有策略'）：$(head -1 <<<"$out")"
+    echo "      需要 dynamodb:GetResourcePolicy 权限；查不了就不能断言无旁路。"
+    return 1
+  fi
+  return 0
+}
+
+for TBL in "$SITES_TABLE" "$ROUTING_TABLE" \
+           "$(read_cfg Deployer admins_table)" \
+           "$(read_cfg Deployer jobs_table)"; do
+  if ! probe_resource_policy "$TBL"; then
+    FAILURES=$((FAILURES + 1)); continue
+  fi
+  # 第一次读到"无策略"——因最终一致性，隔几秒再确认一次
+  sleep 6
+  if ! probe_resource_policy "$TBL"; then
+    echo "      （第二次读才发现——正是最终一致性窗口，单次读会假绿）"
+    FAILURES=$((FAILURES + 1)); continue
+  fi
+  echo "PASS  $TBL 无 resource-based policy（间隔 6s 两次确认）"
 done
 
 echo "── ① 影子角色（只复制 DynamoDB statements）────────"

@@ -466,3 +466,165 @@ def test_undeploy_works_on_site_without_rev_attribute(aws):
         out = server.do_undeploy("o@x.com", "legacy-abc123")
     assert out["job_id"]
     lam.invoke.assert_called_once()
+
+
+# ---- 守卫的两个漏洞（Codex 复审 2026-08-07 第二轮，均已实测复现）----
+
+def test_confirm_upload_rejected_if_site_deleted_and_recreated(aws, monkeypatch):
+    """站点被删除并用同 site_id 重建（新 owner、无 rev）→ 旧 owner 必须被拒。
+
+    `attribute_not_exists(permissions_rev)` 那个兼容分支在 item 被重建且没写
+    rev 时同样成立，于是旧 owner 的部署会覆盖新 owner 的站点。
+    """
+    import boto3 as _b3
+    import common
+    import server
+    monkeypatch.setenv("STATE_MACHINE_ARN",
+                       "arn:aws:states:us-east-1:1:stateMachine:sm")
+    common.upsert_site("demo-abc123", owner="o@x.com", status="ACTIVE",
+                       permissions_rev=7)
+    jid = common.create_job("o@x.com", "demo-abc123")
+    _b3.client("s3").put_object(Bucket="site-artifacts-1",
+                                Key=f"uploads/{jid}.zip", Body=b"zip")
+    ddb = _b3.client("dynamodb")
+    real_s3 = server._s3
+
+    def _s3_then_recreate():
+        client = real_s3()
+        orig_head = client.head_object
+
+        def head(**kw):
+            out = orig_head(**kw)
+            # 鉴权已完成；此刻站点被删除并以同 site_id 重建（无 permissions_rev）
+            ddb.delete_item(TableName="site-sites",
+                            Key={"site_id": {"S": "demo-abc123"}})
+            ddb.put_item(TableName="site-sites", Item={
+                "site_id": {"S": "demo-abc123"},
+                "owner": {"S": "new@x.com"}, "status": {"S": "ACTIVE"}})
+            return out
+
+        client.head_object = head
+        return client
+
+    sfn = MagicMock()
+    monkeypatch.setattr(server, "_s3", _s3_then_recreate)
+    with patch.object(server, "_sfn", return_value=sfn):
+        with pytest.raises(server.NotOwner):
+            server.do_confirm_upload("o@x.com", jid)
+    sfn.start_execution.assert_not_called()
+    assert common.get_job(jid)["status"] == "PENDING"
+    assert common.get_site("demo-abc123")["owner"] == "new@x.com"
+
+
+def test_undeploy_rejected_if_legacy_site_recreated_by_other_owner(aws):
+    """一期存量站点（无 rev）被重建成别人的 → 旧 owner 的下线必须被拒。
+
+    无 rev 时守卫退回按角色事实判定（owner 仍是我 / 我仍在 collaborators），
+    所以"重建后 owner 变成别人"照样拦得住。
+    """
+    import boto3 as _b3
+    import common
+    import server
+    common.upsert_site("legacy-abc123", owner="o@x.com", status="ACTIVE")
+    ddb = _b3.client("dynamodb")
+    real_assert = server._assert_permission
+
+    def _assert_then_recreate(*a, **kw):
+        out = real_assert(*a, **kw)
+        ddb.put_item(TableName="site-sites", Item={
+            "site_id": {"S": "legacy-abc123"},
+            "owner": {"S": "new@x.com"}, "status": {"S": "ACTIVE"}})
+        return out
+
+    with patch.object(server, "_assert_permission", _assert_then_recreate):
+        lam = MagicMock()
+        with patch.object(server, "_lambda", return_value=lam):
+            with pytest.raises(server.NotOwner):
+                server.do_undeploy("o@x.com", "legacy-abc123", purge_data=True)
+        lam.invoke.assert_not_called()
+
+
+def test_legacy_collaborator_can_still_deploy(aws, monkeypatch):
+    """正向对照：无 rev 的存量站点，协作者仍要能部署（守卫不能误伤）。"""
+    import boto3 as _b3
+    import common
+    import server
+    monkeypatch.setenv("STATE_MACHINE_ARN",
+                       "arn:aws:states:us-east-1:1:stateMachine:sm")
+    common.upsert_site("legacy-abc123", owner="o@x.com",
+                       collaborators=["c@x.com"], status="ACTIVE")
+    jid = common.create_job("c@x.com", "legacy-abc123")
+    _b3.client("s3").put_object(Bucket="site-artifacts-1",
+                                Key=f"uploads/{jid}.zip", Body=b"zip")
+    sfn = MagicMock()
+    with patch.object(server, "_sfn", return_value=sfn):
+        out = server.do_confirm_upload("c@x.com", jid)
+    assert out["status"] == "RUNNING"
+    sfn.start_execution.assert_called_once()
+
+
+def test_confirm_upload_rolls_back_when_start_execution_fails(aws, monkeypatch):
+    """StartExecution 失败 → job 必须退回 PENDING，用户可重试。
+
+    不回滚的话 job 永久停在 RUNNING 而没有 execution 在跑，重试被判
+    AlreadyStarted，用户只能轮询一个永不推进的任务。
+    """
+    import boto3 as _b3
+    import common
+    import server
+    monkeypatch.setenv("STATE_MACHINE_ARN",
+                       "arn:aws:states:us-east-1:1:stateMachine:sm")
+    common.upsert_site("demo-abc123", owner="o@x.com", status="ACTIVE",
+                       permissions_rev=1)
+    jid = common.create_job("o@x.com", "demo-abc123")
+    _b3.client("s3").put_object(Bucket="site-artifacts-1",
+                                Key=f"uploads/{jid}.zip", Body=b"zip")
+    boom = MagicMock()
+    boom.start_execution.side_effect = RuntimeError("SFN 挂了")
+    with patch.object(server, "_sfn", return_value=boom):
+        with pytest.raises(RuntimeError):
+            server.do_confirm_upload("o@x.com", jid)
+    assert common.get_job(jid)["status"] == "PENDING", "没回滚 → 永久卡死"
+    # 重试必须能真正跑通（这才是回滚的目的）
+    ok = MagicMock()
+    with patch.object(server, "_sfn", return_value=ok):
+        assert server.do_confirm_upload("o@x.com", jid)["status"] == "RUNNING"
+    ok.start_execution.assert_called_once()
+
+
+def test_confirm_upload_treats_existing_execution_as_success(aws, monkeypatch):
+    """ExecutionAlreadyExists 说明上次其实起成功了：按成功返回且**不**回滚。
+
+    同 name + 同 input 就是同一次部署（STANDARD 工作流幂等）。若这里误回滚，
+    会把一个真在跑的部署改回 PENDING。
+    """
+    import boto3 as _b3
+    import botocore.exceptions
+    import common
+    import server
+    monkeypatch.setenv("STATE_MACHINE_ARN",
+                       "arn:aws:states:us-east-1:1:stateMachine:sm")
+    common.upsert_site("demo-abc123", owner="o@x.com", status="ACTIVE",
+                       permissions_rev=1)
+    jid = common.create_job("o@x.com", "demo-abc123")
+    _b3.client("s3").put_object(Bucket="site-artifacts-1",
+                                Key=f"uploads/{jid}.zip", Body=b"zip")
+    dup = MagicMock()
+    dup.start_execution.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "ExecutionAlreadyExists", "Message": "exists"}},
+        "StartExecution")
+    with patch.object(server, "_sfn", return_value=dup):
+        assert server.do_confirm_upload("o@x.com", jid)["status"] == "RUNNING"
+    # 关键：状态留在 RUNNING（真在跑），没有被回滚成 PENDING
+    assert common.get_job(jid)["status"] == "RUNNING"
+
+
+def test_rollback_does_not_touch_advanced_job(aws):
+    """回滚条件必须只匹配"刚置 RUNNING/queued"：已推进的任务不能被踩回 PENDING。"""
+    import common
+    import server
+    jid = common.create_job("o@x.com", "demo-abc123")
+    common.update_job(jid, status="RUNNING", phase="validate")   # SFN 已在跑
+    server._rollback_job_to_pending(jid)
+    job = common.get_job(jid)
+    assert job["status"] == "RUNNING" and job["phase"] == "validate"

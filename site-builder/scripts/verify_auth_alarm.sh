@@ -164,6 +164,22 @@ else:
         if got is None or float(got) > want:
             bad.append(f"正式 alarm 的 {key}={got!r} 超过期望上限 {want!r}"
                        f"（{why}）；预期不同请设 {envvar}")
+    # **Period 还有下限，不是"越短越安全"**（Codex 复审 2026-08-07 第二轮）：
+    # AuthInvalidGrant 来自 logs metric filter，PutMetricFilter 没有
+    # StorageResolution 参数，所以它是标准分辨率 metric。官方对 Period 的说明：
+    # 合法值是 10/20/30 与 60 的倍数，但 10/20/30 只应用于 StorageResolution=1
+    # 的 metric——用在标准分辨率上"alarm 会经常落入 INSUFFICIENT_DATA"
+    # （还会按高分辨率 alarm 计费）。配合 EvaluationPeriods=2 + notBreaching，
+    # Period=10 可能永远凑不满连续 breaching 数据点，而只查上限时照样 PASS。
+    period = a.get("Period")
+    if period is not None:
+        if float(period) < 60:
+            bad.append(f"正式 alarm 的 Period={period!r} < 60 —— 该 metric 由 logs "
+                       "metric filter 产生（标准分辨率，无 StorageResolution=1），"
+                       "亚分钟周期会让 alarm 常驻 INSUFFICIENT_DATA 而不告警")
+        elif float(period) % 60 != 0:
+            bad.append(f"正式 alarm 的 Period={period!r} 不是 60 的倍数 —— "
+                       "标准分辨率 metric 只支持 60 的倍数")
     # DatapointsToAlarm 省略时等于 EvaluationPeriods（M-of-N 未启用）；
     # 显式设了就不能大于它，否则永远凑不满。
     dp = a.get("DatapointsToAlarm")
@@ -177,6 +193,14 @@ else:
         print(f"PASS  正式 alarm：{a['Namespace']}/{a['MetricName']} "
               f"{a['Statistic']} 阈值 {a.get('Threshold')} × "
               f"{a.get('EvaluationPeriods')} 周期 → {len(a['AlarmActions'])} 个动作")
+        # **必须至少有一条 SNS action**：本平台的验收目标是"邮件通知真的送达"。
+        # 原来只在遇到 SNS action 时才查订阅，于是 action 全是 Lambda/SSM 时
+        # 整个循环空转、脚本仍 PASS —— 而没有任何人会收到邮件
+        # （Codex 复审 2026-08-07 第二轮）。
+        if not [x for x in a["AlarmActions"] if ":sns:" in x]:
+            bad.append(f"正式 alarm 的 AlarmActions 里没有 SNS topic"
+                       f"（当前 {a['AlarmActions']}）—— 本平台靠 SNS 邮件通知，"
+                       "没有 SNS action 就没人会被通知到")
         # 订阅确认状态：topic 无已确认订阅时 alarm 进 ALARM 也没人知情
         for arn in a["AlarmActions"]:
             if ":sns:" not in arn:
