@@ -695,3 +695,43 @@ def test_app_dir_is_not_writable_by_runtime_user():
     df = (MCP_DIR / "Dockerfile").read_text()
     assert not re.search(r"chown[^\n]*/app", df), \
         "/app 不得 chown 给运行用户——代码必须对运行用户只读"
+
+
+# --- 事务路径需要的 ConditionCheckItem（Codex 复审 2026-08-07 P1 的配套）---
+# do_confirm_upload 与 do_undeploy 现在把"权限快照未变"作为 ConditionCheck 绑进
+# 最终动作的事务。IAM 里没有 dynamodb:TransactWriteItems 这个 action：事务内
+# Put/Update 由同名 action 授权，**ConditionCheck 由 ConditionCheckItem 授权**。
+# 缺这条的表现是"改权限/下线在线上一律 AccessDenied"，而单测用 moto 不做 IAM
+# 授权，永远发现不了 —— 所以必须在这里锁住。
+
+def test_transaction_paths_have_condition_check_permission():
+    import deploy_agentcore as da
+    for sid, why in (("SitesRead", "confirm_upload/undeploy 的 rev ConditionCheck"),
+                     ("AdminsReadOnly", "admin 代管路径的 admin ConditionCheck"),
+                     ("Jobs", "undeploy 的 create_job 事务 Put + confirm 的 Update")):
+        actions = _statement(da, sid)["Action"]
+        actions = [actions] if isinstance(actions, str) else actions
+        assert "dynamodb:ConditionCheckItem" in actions, (
+            f"{sid} 缺 ConditionCheckItem（{why}）——线上该路径必 AccessDenied")
+
+
+def test_mcp_transaction_guards_target_expected_tables():
+    """守卫条件必须打在 sites/admins 表上。
+
+    从 server.py 源码解析：写错表名（例如打到 routing）会让条件永远成立，
+    闸门静默失效，而 moto 下的用例照样全绿。
+    """
+    import re
+    srv = (MCP_DIR / "server.py").read_text()
+    rev_block = srv[srv.index("def _rev_condition_check"):
+                    srv.index("def _admin_condition_check")]
+    assert re.search(r'os\.environ\["SITES_TABLE"\]', rev_block), \
+        "rev 守卫没有打在 SITES_TABLE 上"
+    assert "permissions_rev = :rev" in rev_block, "rev 守卫没有比对 permissions_rev"
+    # 存量站点没有该属性，必须兜住，否则老站点全部无法下线
+    assert "attribute_not_exists(permissions_rev)" in rev_block, \
+        "rev 守卫缺 attribute_not_exists 兜底——一期存量站点会被永久拦死"
+    admin_block = srv[srv.index("def _admin_condition_check"):
+                      srv.index("# ---------- 纯函数层")]
+    assert re.search(r'os\.environ\["ADMINS_TABLE"\]', admin_block), \
+        "admin 守卫没有打在 ADMINS_TABLE 上"

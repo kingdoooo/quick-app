@@ -53,10 +53,18 @@ cleanup() {
   fi
   aws cloudwatch delete-alarms --region "$REGION" \
     --alarm-names "$PROBE_ALARM" 2>/dev/null || true
-  if aws cloudwatch describe-alarms --region "$REGION" \
-       --alarm-names "$PROBE_ALARM" --query 'MetricAlarms[0]' \
-       --output text 2>/dev/null | grep -qv '^None$'; then
-    echo "⚠️  探针 alarm 仍存在：$PROBE_ALARM —— 手工删除"
+  # **"状态未知"必须与"已删除"分开**（Codex 复审 2026-08-07）：原写法把
+  # describe 的输出喂给 `grep -qv '^None$'`，凭证/网络失败时 stdout 为空、
+  # grep 无匹配行返回 1 → 判定"已删除"，而探针 alarm 可能还在。
+  # 只有显式读到 False 才算确认删除；其余（True/空/Unknown）一律要人工确认。
+  local present
+  present="$(aws cloudwatch describe-alarms --region "$REGION" \
+               --alarm-names "$PROBE_ALARM" \
+               --query 'MetricAlarms[0] != null' --output text 2>/dev/null \
+             || echo Unknown)"
+  if [ "$present" != "False" ]; then
+    echo "⚠️  探针 alarm 未确认删除（present=${present:-空}）：$PROBE_ALARM"
+    echo "    手工核对并删除：aws cloudwatch delete-alarms --alarm-names $PROBE_ALARM"
     exit 1
   fi
   echo "探针 alarm 与 cookie 文件已清理"
@@ -89,7 +97,7 @@ echo "── ① 正式配置核对 ──────────────�
 # 用 Python 做比对：多字段结构化对比 + 精确退出码，shell 里做这个已经踩过
 # 一轮陷阱（见 check_permissions_state.py 的 docstring）。
 if python3 - "$REGION" "$LOG_GROUP" <<'PYCHK'
-import json, subprocess, sys
+import json, os, subprocess, sys
 region, log_group = sys.argv[1], sys.argv[2]
 NS, METRIC = "SiteBuilder", "AuthInvalidGrant"
 ALARM = "site-builder-auth-invalid-grant"
@@ -134,6 +142,34 @@ else:
             bad.append(f"正式 alarm 的 {k}={a.get(k)!r}，期望 {want!r}")
     if not a.get("AlarmActions"):
         bad.append("正式 alarm 没有 AlarmActions —— 进 ALARM 也没人被通知到")
+    # **灵敏度参数必须核**（Codex 复审 2026-08-07）：metric/namespace/action 全对
+    # 但 Threshold=1000000 或 ActionsEnabled=false 时，这个 alarm 永远不会通知，
+    # 而下面的 probe alarm 用自己那套正确参数照样进 ALARM —— 整套验收 PASS，
+    # 线上告警是死的。这正是本脚本要防的那类"成功但没证明目标成立"。
+    if a.get("ActionsEnabled") is not True:
+        bad.append(f"正式 alarm 的 ActionsEnabled={a.get('ActionsEnabled')!r}"
+                   " —— 动作被禁用，进 ALARM 也不会发通知")
+    # 期望值可按环境覆盖（低流量环境 DEPLOY.md 建议 1/300/2）。
+    # 上限而非等值比较：把阈值调**低**、周期调**短**只会更灵敏，不是缺陷。
+    limits = [
+        ("Threshold", "EXPECT_THRESHOLD", "1",
+         "阈值过高则事故凑不满数量，告警永不触发"),
+        ("Period", "EXPECT_PERIOD", "300", "周期过长则发现太慢"),
+        ("EvaluationPeriods", "EXPECT_EVAL_PERIODS", "2",
+         "评估周期过多则发现太慢"),
+    ]
+    for key, envvar, default, why in limits:
+        want = float(os.environ.get(envvar, default))
+        got = a.get(key)
+        if got is None or float(got) > want:
+            bad.append(f"正式 alarm 的 {key}={got!r} 超过期望上限 {want!r}"
+                       f"（{why}）；预期不同请设 {envvar}")
+    # DatapointsToAlarm 省略时等于 EvaluationPeriods（M-of-N 未启用）；
+    # 显式设了就不能大于它，否则永远凑不满。
+    dp = a.get("DatapointsToAlarm")
+    if dp is not None and float(dp) > float(a.get("EvaluationPeriods") or 0):
+        bad.append(f"DatapointsToAlarm={dp!r} > EvaluationPeriods="
+                   f"{a.get('EvaluationPeriods')!r} —— 永远无法满足")
     if a.get("TreatMissingData") != "notBreaching":
         bad.append(f"TreatMissingData={a.get('TreatMissingData')!r}，"
                    "低流量环境应为 notBreaching，否则长期 INSUFFICIENT_DATA")
@@ -186,6 +222,14 @@ read -rs STATE; echo
 } > "$COOKIE_JAR"
 unset PKCE
 
+# **先记下起点时刻**，日志检索只看这之后的事件（Codex 复审 2026-08-07）：
+# 原来固定搜"最近 5 分钟"，于是同一窗口内**别人**留下的一条 invalid_grant
+# 就能让检查通过——而本次 cookie 可能已过期、根本没走到 token 交换分支。
+# 那正是这段检查要排除的情况，用旧事件满足它等于没检查。
+# 扣 5 秒容忍本机与 Lambda 的时钟偏差（日志时间戳由 Lambda 侧生成）；
+# 窗口从 300 秒收到约 5 秒，误判概率随之下降两个数量级。
+START_MS="$(python3 -c 'import time;print(int((time.time()-5)*1000))')"
+
 # code 给垃圾值 → Cognito 返回 invalid_grant → auth 打结构化日志
 CODE="$(curl -s -o /dev/null -w '%{http_code}' \
   --cookie-jar /dev/null --cookie "$COOKIE_JAR" \
@@ -200,12 +244,13 @@ echo "  /callback 返回 $CODE"
 echo "  等日志落盘后确认走的是 token 交换分支（而非 cookie 缺失分支）…"
 sleep 20
 if aws logs filter-log-events --region "$REGION" --log-group-name "$LOG_GROUP" \
-     --start-time "$(python3 -c 'import time;print(int((time.time()-300)*1000))')" \
+     --start-time "$START_MS" \
      --filter-pattern '{ $.event = "token_exchange_invalid_grant" }' \
      --query 'events[-1].message' --output text 2>/dev/null | grep -q invalid_grant; then
-  echo "PASS  日志里有 token_exchange_invalid_grant（证明真的走到了 Cognito 换 token）"
+  echo "PASS  本次请求之后出现 token_exchange_invalid_grant"
+  echo "      （证明真的走到了 Cognito 换 token，不是 cookie 缺失分支）"
 else
-  fail "没有 token_exchange_invalid_grant 日志 —— cookie 可能没送到，"
+  fail "本次请求之后没有 token_exchange_invalid_grant 日志 —— cookie 可能没送到，"
   echo "      当前测到的是 cookie 缺失分支的 400，不是目标逻辑。"
   echo "      检查 cookie 值是否已过期（Max-Age=300）或 jar 格式/secure 标记。"
 fi
@@ -227,17 +272,28 @@ else
   echo "     topic 没有订阅（或订阅未确认）时 alarm 照样进 ALARM 而无人知情，"
   echo "     这正是「告警形同虚设」最常见的形态——正式验收请带上这个变量。"
 fi
+# **名字未被占用要在创建前查**（Codex 复审 2026-08-07）。
+# 原来靠"创建后第一次 describe 必须是 INSUFFICIENT_DATA"来发现名字撞车，
+# 但那不是 AWS 的保证：PutMetricAlarm 只承诺新 alarm **先**置
+# INSUFFICIENT_DATA，随后立即评估并转到相应状态。数据点已经存在（上一步刚造）
+# 时评估可能快于我们的 describe，于是一条**成功**的链路被误判成"撞上残留
+# alarm，结果不可信"。改成创建前查存在性：这是确定性的。
+EXISTS="$(aws cloudwatch describe-alarms --region "$REGION" \
+  --alarm-names "$PROBE_ALARM" --query 'MetricAlarms[0] != null' \
+  --output text 2>/dev/null || echo Unknown)"
+if [ "$EXISTS" != "False" ]; then
+  echo "探针 alarm 名已被占用或状态未知（present=${EXISTS:-空}）：$PROBE_ALARM"
+  echo "本轮不创建、不改动任何 alarm——换一次运行（名字带随机后缀）或手工清理。"
+  exit 1
+fi
 aws cloudwatch put-metric-alarm "${ALARM_ARGS[@]}"
 
-# 新建的 alarm 初始必须是 INSUFFICIENT_DATA。若一上来就是 ALARM，说明这个名字
-# 撞上了残留 alarm（随机后缀已极大降低概率，但仍要断言而不是假设）。
+# 初始状态仅打印，**不作断言**（理由见上）：ALARM 在这里是合法的中间结果。
 INIT_STATE="$(aws cloudwatch describe-alarms --region "$REGION" \
   --alarm-names "$PROBE_ALARM" --query 'MetricAlarms[0].StateValue' \
   --output text 2>/dev/null || echo "?")"
-if [ "$INIT_STATE" = "ALARM" ]; then
-  fail "探针 alarm 刚建好就是 ALARM —— 撞上了残留 alarm，本轮结果不可信"
-fi
-echo "  初始状态 $INIT_STATE（期望 INSUFFICIENT_DATA）"
+echo "  初始状态 $INIT_STATE（INSUFFICIENT_DATA 或 ALARM 都正常——"
+echo "   AWS 只保证先置 INSUFFICIENT_DATA，随后立即评估，我们可能只看到评估后的值）"
 
 echo "  轮询状态（最多 3 分钟）…"
 STATE_VAL=""

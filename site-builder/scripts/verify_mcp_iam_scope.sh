@@ -146,6 +146,33 @@ print('PASS  真实角色只有 mcp-scope 一条策略，无旁路授权')
   FAILURES=$((FAILURES + 1))
 fi
 
+# **表上的 resource-based policy 同样是旁路**（Codex 复审 2026-08-07）。
+# 影子角色是**另一个 principal**，拿不到写给 site-mcp-runtime-role 的 resource
+# policy —— 于是真实 runtime 有额外 Allow、而两条负向 probe 仍然 deny，脚本
+# 报"全部通过"。身份策略与资源策略是求并集的，只查前者不够。
+# 现网核对过：这几张表当前都没有 resource policy，所以这是防未来假通过。
+echo "── ⓪b 表上的 resource-based policy ───────────────"
+for TBL in "$SITES_TABLE" "$ROUTING_TABLE" \
+           "$(read_cfg Deployer admins_table)"; do
+  # 没有策略时 API 抛 PolicyNotFoundException（不是返回空）——必须把
+  # "确实没有策略"与"调用失败/无权限"分开，否则查不了就等于查过了。
+  OUT="$(aws_admin dynamodb get-resource-policy \
+           --resource-arn "arn:aws:dynamodb:$REGION:$ACCOUNT:table/$TBL" 2>&1)" \
+    && RC=0 || RC=$?
+  if [ "$RC" -eq 0 ]; then
+    echo "FAIL  $TBL 上存在 resource-based policy —— 它可能给 runtime 角色额外"
+    echo "      授权，而影子角色（另一个 principal）拿不到，下面的 PASS 不可信。"
+    echo "      内容：$(printf '%s' "$OUT" | head -c 400)"
+    FAILURES=$((FAILURES + 1))
+  elif grep -q "PolicyNotFoundException" <<<"$OUT"; then
+    echo "PASS  $TBL 无 resource-based policy"
+  else
+    echo "FAIL  $TBL 的 resource policy 查不出来（不是'没有策略'）：$(head -1 <<<"$OUT")"
+    echo "      需要 dynamodb:GetResourcePolicy 权限；查不了就不能断言无旁路。"
+    FAILURES=$((FAILURES + 1))
+  fi
+done
+
 echo "── ① 影子角色（只复制 DynamoDB statements）────────"
 # --output json 显式指定：操作者的 AWS CLI 默认输出若是 text/table/yaml，
 # 拿到的就不是可用的 policy JSON。

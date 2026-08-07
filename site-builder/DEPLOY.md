@@ -161,6 +161,34 @@ token 都验签失败，表现为无限登录跳转。
 auth 的执行角色因此需要 `ssm:GetParameter`（限定 `/site-builder/*`）与
 `kms:Decrypt`（`ViaService` 限定 ssm），`deploy_auth.py` 每次运行都会收敛这两条。
 
+#### ⚠️ 轮转 `jwt-secret`：当前实现下**不能就地改值**
+
+两个密钥的轮转代价完全不同，别按同一套做：
+
+- `site-client-secret`：改 SSM 即可。auth 侧最长 5 分钟收敛
+  （`login_handler.SECRET_TTL_SECONDS`），没有第二个消费方。
+- `jwt-secret`：**只改 SSM 会造成一段全员无法登录的窗口**。它有两个消费方，
+  且更新速度不同：
+  - auth（签发）——读 SSM，最长 5 分钟切到新值；
+  - Edge（验签）——值是 CDK 部署时**字符串替换**注入的（Lambda@Edge 不支持
+    环境变量），要重新部署 ② 并等 **10–20 分钟全球复制**。
+
+  auth 先切、Edge 后到，这期间新签发的 cookie 在尚未更新的边缘节点验签失败，
+  用户登录后立刻被踢回登录页；而**已登录用户的旧 cookie 在 auth 切换后仍在
+  旧 Edge 节点上有效**，于是同一时刻不同用户、不同地区表现不一致。
+  症状（无限登录跳转）与"密钥读取失败"完全一样，极难定位到密钥版本。
+
+**当前实现不支持安全轮转**：Edge 的 `verify_session_jwt` 只接受单个 secret
+（`router/infrastructure/lambda/origin_request.py` 与 `auth/session.py` 各一份，
+必须字节级同步）。真要轮转，先做双密钥验证——让 Edge 接受 `{新, 旧}` 两个值、
+复制完成后再让 auth 切到新值签发、确认无旧 cookie 后移除旧值（三次部署）。
+这是代码改动，不在一期/二期范围内。
+
+**如果密钥已泄漏、必须立刻失效**（走"可用性换安全性"，别装作无损）：
+按 `SSM 改值 → 立刻重部署 ② → 公告全员重新登录` 执行，并接受
+10–20 分钟内登录不稳定。这是有意选择的取舍，不是回归——处置期间不要因为
+"用户报登录跳转"就回滚 Edge，回滚只会把窗口拉长。
+
 ### 本机工具链
 
 
@@ -610,13 +638,26 @@ name**；值必须是裸 `true`/`false`——configparser 会把行内注释并�
    COOKIE=$(python3 -c "
    import sys; sys.path.insert(0,'site-builder/auth')
    from session import mint_session_jwt
-   print(mint_session_jwt('you@example.com','You',sys.argv[1]),end='')" "$SECRET")
+   print(mint_session_jwt('you@example.com','You',sys.argv[1],
+                          idp='Feishu', auth_via='TokenGeneration_HostedAuth'),
+         end='')" "$SECRET")
    # 对一个 require_auth=true 的测试路由：
    curl -s -o /dev/null -w '%{http_code}\n' https://app-<test>.{base_domain}/            # 期望 302
    curl -s -w '\n' -H "Cookie: sb_session=$COOKIE" https://app-<test>.{base_domain}/     # 期望 200 + 内容
    curl -s -o /dev/null -w '%{http_code}\n' -H "Cookie: sb_session=${COOKIE}x" \
      https://app-<test>.{base_domain}/                                                    # 期望 302（验签失败）
   ```
+
+   > **`idp` 与 `auth_via` 两个 claim 必须带上**（Edge 的
+   > `REQUIRE_IDP_CLAIM=true` 起作用后）：不带就会被 302 回登录页，而这
+   > **看起来与"Edge 回归了"完全一样**——操作者会因此怀疑一次正确的部署。
+   > 两个值要与 `TRUSTED_IDPS` / `TRUSTED_AUTH_SOURCES` 对齐（见
+   > `router/infrastructure/lambda/origin_request.py`）：`idp` 取
+   > `config.ini [IdP] provider_name`（本环境为 `Feishu`），`auth_via` 取
+   > `TokenGeneration_HostedAuth`。
+   > 反过来，**"不带 claim → 302" 本身就是一条值得跑的负向用例**：把上面的
+   > `idp=`/`auth_via=` 去掉再请求一次，期望 302——这证明的是 Edge 真的在
+   > 校验身份来源，而不是碰巧放行了。
 
 ---
 

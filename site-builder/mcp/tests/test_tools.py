@@ -353,3 +353,116 @@ def test_update_permissions_works_before_first_deploy(aws):
     out = server.do_update_permissions("o@x.com", "nodeploy-abc123",
                                        require_login=False)
     assert out["require_login"] is False
+
+
+# ---- 鉴权→动作之间的撤权窗口（Codex 复审 2026-08-07 P1）----
+#
+# 这三个用例的价值全在**交错时机**上：必须在 _assert_permission 已经通过之后、
+# 最终动作提交之前撤权。在别处撤权测的是另一回事（前者是 _assert_permission
+# 本来就拦得住的普通拒绝，后者是"已经落地了再撤"，无从阻止）。
+# 所以用 patch 在中间那一刻注入撤权，而不是先改数据再调用。
+
+def _revoke_collaborator(site_id, email):
+    """把 email 从协作者名单里去掉，并推进 permissions_rev（与真实撤权同形）。"""
+    import common
+    site = common.get_site(site_id) or {}
+    common.upsert_site(
+        site_id,
+        collaborators=[c for c in (site.get("collaborators") or []) if c != email],
+        permissions_rev=int(site.get("permissions_rev", 0)) + 1)
+
+
+def test_confirm_upload_rejected_if_revoked_after_authz(aws, monkeypatch):
+    """协作者鉴权通过后被撤权 → 这次部署必须落不了地。
+
+    没有 rev 条件时：job 被置 RUNNING、SFN 被启动，已撤权的人提交的代码
+    覆盖生产站点。
+    """
+    import boto3 as _b3
+    import common
+    import server
+    monkeypatch.setenv("STATE_MACHINE_ARN",
+                       "arn:aws:states:us-east-1:1:stateMachine:sm")
+    common.upsert_site("demo-abc123", owner="o@x.com", status="ACTIVE",
+                       collaborators=["c@x.com"], permissions_rev=3)
+    jid = common.create_job("c@x.com", "demo-abc123")
+    _b3.client("s3").put_object(Bucket="site-artifacts-1",
+                                Key=f"uploads/{jid}.zip", Body=b"zip")
+
+    # HeadObject 成功之后、事务提交之前撤权
+    real_s3 = server._s3
+
+    def _s3_then_revoke():
+        client = real_s3()
+        orig_head = client.head_object
+
+        def head(**kw):
+            out = orig_head(**kw)
+            _revoke_collaborator("demo-abc123", "c@x.com")
+            return out
+
+        client.head_object = head
+        return client
+
+    sfn = MagicMock()
+    monkeypatch.setattr(server, "_s3", _s3_then_revoke)
+    with patch.object(server, "_sfn", return_value=sfn):
+        with pytest.raises(server.NotOwner):
+            server.do_confirm_upload("c@x.com", jid)
+    # 两条硬断言：SFN 没被启动，job 也没被置 RUNNING
+    sfn.start_execution.assert_not_called()
+    assert common.get_job(jid)["status"] == "PENDING"
+
+
+def test_undeploy_rejected_if_ownership_transferred_after_authz(aws, monkeypatch):
+    """鉴权后所有权被转移 → 旧 owner 的下线请求必须落不了地。
+
+    没有 rev 条件时：undeploy Lambda 被异步调用，purge_data=True 会删掉
+    **新 owner** 的站点数据，不可恢复。
+    """
+    import common
+    import server
+    common.upsert_site("demo-abc123", owner="o@x.com", status="ACTIVE",
+                       permissions_rev=2)
+
+    real_assert = server._assert_permission
+
+    def _assert_then_transfer(*a, **kw):
+        out = real_assert(*a, **kw)
+        # 鉴权已完成，此刻站点被转给别人（rev 前进）
+        common.upsert_site("demo-abc123", owner="new@x.com",
+                           permissions_rev=3)
+        return out
+
+    monkeypatch.setattr(server, "_assert_permission", _assert_then_transfer)
+    lam = MagicMock()
+    with patch.object(server, "_lambda", return_value=lam):
+        with pytest.raises(server.NotOwner):
+            server.do_undeploy("o@x.com", "demo-abc123", purge_data=True)
+    lam.invoke.assert_not_called()
+
+
+def test_undeploy_still_works_when_rev_unchanged(aws):
+    """正向对照：权限没变时前面那道条件不能误拦（否则下线功能直接坏掉）。"""
+    import common
+    import server
+    common.upsert_site("demo-abc123", owner="o@x.com", status="ACTIVE",
+                       permissions_rev=7)
+    lam = MagicMock()
+    with patch.object(server, "_lambda", return_value=lam):
+        out = server.do_undeploy("o@x.com", "demo-abc123")
+    assert out["job_id"]
+    lam.invoke.assert_called_once()
+
+
+def test_undeploy_works_on_site_without_rev_attribute(aws):
+    """一期存量站点没有 permissions_rev 属性——条件必须用
+    attribute_not_exists 兜住，否则老站点全部无法下线。"""
+    import common
+    import server
+    common.upsert_site("legacy-abc123", owner="o@x.com", status="ACTIVE")
+    lam = MagicMock()
+    with patch.object(server, "_lambda", return_value=lam):
+        out = server.do_undeploy("o@x.com", "legacy-abc123")
+    assert out["job_id"]
+    lam.invoke.assert_called_once()

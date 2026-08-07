@@ -33,12 +33,30 @@ def _now() -> str:
 # jobs 表的 owner 字段是**发起者**（requested_by 语义）：谁按下了这次部署。
 # 它不参与任何授权判定——授权一律走 permissions.py 对 sites 表的角色判定。
 # 保留 owner 这个字段名是为了兼容存量数据与 owner-index GSI。
-def create_job(owner: str, site_id: str) -> str:
+def create_job(owner: str, site_id: str, guard_items: list | None = None) -> str:
+    """建任务记录。
+
+    guard_items: 可选的 TransactItems 条目（ConditionCheck 等）。给了就走事务，
+    把"建任务"与这些条件绑成一次提交。MCP 的 undeploy 用它把"鉴权时的权限快照
+    仍然有效"绑进来——鉴权与副作用之间的撤权窗口否则会让旧请求照样落地
+    （见 mcp/server.py 的 _rev_condition_check）。
+    条目形态用低层 client 的 AttributeValue 写法，所以这条路径**不能**走
+    resource.Table：两套 API 的 item 形态不同，混用会 ValidationException。
+    """
     job_id = "job-" + secrets.token_hex(8)
-    _table("JOBS_TABLE").put_item(Item={
-        "job_id": job_id, "site_id": site_id, "owner": owner,
-        "status": "PENDING", "phase": "submitted", "error": "", "url": "",
-        "created_at": _now(), "updated_at": _now()})
+    now = _now()
+    item = {"job_id": job_id, "site_id": site_id, "owner": owner,
+            "status": "PENDING", "phase": "submitted", "error": "", "url": "",
+            "created_at": now, "updated_at": now}
+    if not guard_items:
+        _table("JOBS_TABLE").put_item(Item=item)
+        return job_id
+    boto3.client("dynamodb",
+                 region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+                 ).transact_write_items(TransactItems=[
+                     {"Put": {"TableName": os.environ["JOBS_TABLE"],
+                              "Item": {k: {"S": v} for k, v in item.items()}}},
+                     *guard_items])
     return job_id
 
 

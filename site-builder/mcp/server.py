@@ -5,6 +5,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 import boto3
 from mcp.server.fastmcp import FastMCP
@@ -92,21 +93,75 @@ def _lambda():
     return boto3.client("lambda", region_name="us-east-1")
 
 
-def _assert_permission(email: str, site_id: str, action: str, what: str) -> dict:
+class Authz(NamedTuple):
+    """一次鉴权判定的结果快照。
+
+    `rev` 是判定所依据的 permissions_rev——把它带到最终动作的事务条件里，
+    就能保证"判定之后权限没被改过"（见 _rev_condition_check）。
+    """
+    site: dict
+    role: str
+    rev: int
+
+
+def _assert_permission(email: str, site_id: str, action: str,
+                       what: str) -> Authz:
     """按二期角色模型判定（owner / collaborator / admin）。
 
     权限真源是 sites 表，判定逻辑全在 permissions.py——控制台与 MCP 共用
     同一模块，两边语义不会漂移。
+
+    **返回值里带 role 与 rev**：调用方若要落地一个有副作用的动作，必须把它们
+    绑进最终动作（见 _rev_condition_check / do_undeploy），否则鉴权与动作之间
+    的撤权窗口里旧请求仍会生效。
     """
     # 强一致读：撤权/转移必须立刻生效。最终一致读会留下"权限已撤销但旧请求
     # 仍读到旧名单"的窗口。写路径不用本函数（授权在事务内做，见下方注释）。
     site = common.get_site_consistent(site_id)
     try:
-        permissions.assert_can(email, site, action,
-                               is_admin=permissions.is_admin(email), what=what)
+        role = permissions.assert_can(
+            email, site, action, is_admin=permissions.is_admin(email), what=what)
     except permissions.PermissionDenied as e:
         raise NotOwner(str(e))
-    return site or {}
+    site = site or {}
+    return Authz(site, role, int(site.get("permissions_rev", 0)))
+
+
+# 判定与动作之间的撤权窗口：把"权限快照仍是我鉴权时那份"作为事务条件。
+#
+# permissions.write_permissions 每次成功写入都会推进 sites 表的
+# permissions_rev（撤协作者、改名单、转移所有权都算），所以"rev 未变"等价于
+# "我读到的那套授权数据仍然有效"。这正是 write_permissions 自己用的机制——
+# 那里授权与写入在同一事务，本函数把同一不变量带到 MCP 的两条副作用路径上
+# （Codex 复审 2026-08-07 P1）。
+#
+# ⚠️ **效力边界，按字面理解**：它保证的是"撤权完成后，旧主体的请求无法**开始**
+# 落地"——即 job 不会被置 RUNNING、SFN 不会被启动、undeploy Lambda 不会被调用。
+# 它**不能**中止已经启动的部署：SFN 一旦开跑（约 90 秒到站点上线），撤权不会
+# 回收它，那次部署仍会覆盖站点。要覆盖这段就得在 SFN 步骤里复查 rev 并支持
+# 中止，属于独立改动，不在本轮范围。
+# 所以正确的说法是"撤权后不再有新的写入被接受"，而不是"撤权立刻停止一切在途
+# 部署"。写运维文档时别把前者写成后者。
+def _rev_condition_check(site_id: str, rev: int) -> dict:
+    return {"ConditionCheck": {
+        "TableName": os.environ["SITES_TABLE"],
+        "Key": {"site_id": {"S": site_id}},
+        # rev 为 0 的站点可能压根没有这个属性（一期存量 / 刚建站）
+        "ConditionExpression": ("attribute_not_exists(permissions_rev) "
+                                "OR permissions_rev = :rev"),
+        "ExpressionAttributeValues": {":rev": {"N": str(rev)}}}}
+
+
+def _admin_condition_check(email: str) -> dict:
+    """admin 代管路径：把"此刻仍在管理员名单里"也绑进同一事务。
+
+    admin 被移出名单不会推进任何站点的 permissions_rev，所以 rev 条件管不到
+    这条路径，必须单独加（与 write_permissions 的 admin ConditionCheck 同理）。
+    """
+    return {"ConditionCheck": {
+        "TableName": os.environ["ADMINS_TABLE"],
+        "Key": {"email": {"S": email}},
+        "ConditionExpression": "attribute_exists(email)"}}
 
 
 # ---------- 纯函数层（单测目标） ----------
@@ -136,7 +191,7 @@ def do_confirm_upload(owner: str, job_id: str) -> dict:
     if not job:
         raise NotOwner(f"任务 {job_id} 不存在")
     # "deploy" 而非 "read"：确认上传会启动部署
-    _assert_permission(owner, job["site_id"], "deploy", f"任务 {job_id}")
+    authz = _assert_permission(owner, job["site_id"], "deploy", f"任务 {job_id}")
     s3 = _s3()
     try:
         head = s3.head_object(Bucket=os.environ["ARTIFACTS_BUCKET"],
@@ -146,20 +201,45 @@ def do_confirm_upload(owner: str, job_id: str) -> dict:
     if head["ContentLength"] > MAX_ZIP_BYTES:
         raise UploadTooLarge(f"site.zip {head['ContentLength']} 字节超过 50MB 上限")
 
-    # 条件迁移 PENDING→RUNNING：双击/重放在此被拦，SFN 同名执行是第二道闸
+    # 条件迁移 PENDING→RUNNING：双击/重放在此被拦，SFN 同名执行是第二道闸。
+    #
+    # **走事务而不是裸 update_item**：同一笔里带上"权限快照未变"（+ admin 路径
+    # 的"仍是管理员"）的 ConditionCheck。否则鉴权通过后、启动部署前的窗口里
+    # owner 若移除了协作者，这个旧请求仍会把 job 置 RUNNING 并起 SFN，
+    # 已撤权的人提交的代码照样覆盖生产站点（Codex 复审 2026-08-07 P1）。
     import botocore.exceptions
+    items = [
+        {"Update": {
+            "TableName": os.environ["JOBS_TABLE"],
+            "Key": {"job_id": {"S": job_id}},
+            "UpdateExpression": "SET #s = :running, phase = :q",
+            "ConditionExpression": "#s = :pending",
+            "ExpressionAttributeNames": {"#s": "status"},
+            "ExpressionAttributeValues": {":running": {"S": "RUNNING"},
+                                          ":pending": {"S": "PENDING"},
+                                          ":q": {"S": "queued"}}}},
+        _rev_condition_check(job["site_id"], authz.rev),
+    ]
+    if authz.role == permissions.ROLE_ADMIN:
+        items.append(_admin_condition_check(owner))
     try:
-        boto3.resource("dynamodb", region_name="us-east-1").Table(
-            os.environ["JOBS_TABLE"]).update_item(
-            Key={"job_id": job_id},
-            UpdateExpression="SET #s = :running, phase = :q",
-            ConditionExpression="#s = :pending",
-            ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={":running": "RUNNING", ":pending": "PENDING",
-                                       ":q": "queued"})
+        boto3.client("dynamodb", region_name="us-east-1").transact_write_items(
+            TransactItems=items)
     except botocore.exceptions.ClientError as e:
-        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            raise AlreadyStarted(f"任务 {job_id} 已启动过，请用 get_deploy_status 查询进度")
+        if e.response["Error"]["Code"] != "TransactionCanceledException":
+            raise
+        # 逐项分辨取消原因：整个异常当"已启动过"会把撤权报成重复点击
+        reasons = [r.get("Code", "") for r in
+                   e.response.get("CancellationReasons", [])]
+        if reasons and reasons[0] == "ConditionalCheckFailed":
+            raise AlreadyStarted(
+                f"任务 {job_id} 已启动过，请用 get_deploy_status 查询进度") from e
+        if len(reasons) > 1 and reasons[1] == "ConditionalCheckFailed":
+            raise NotOwner(
+                "站点权限在你提交期间被修改（协作者/所有权变更），本次部署已取消"
+                "——请重新确认权限后再试") from e
+        if len(reasons) > 2 and reasons[2] == "ConditionalCheckFailed":
+            raise NotOwner("你的管理员权限已被撤销") from e
         raise
     _sfn().start_execution(
         stateMachineArn=os.environ["STATE_MACHINE_ARN"],
@@ -190,8 +270,29 @@ def do_list_sites(owner: str) -> list[dict]:
 
 
 def do_undeploy(owner: str, site_id: str, purge_data: bool = False) -> dict:
-    site = _assert_permission(owner, site_id, "undeploy", f"站点 {site_id}")
-    job_id = common.create_job(owner, site_id)
+    authz = _assert_permission(owner, site_id, "undeploy", f"站点 {site_id}")
+    site = authz.site
+    # **建 job 与"权限快照未变"同一笔提交**：下线（尤其 purge_data=True）不可
+    # 恢复，鉴权之后被转移所有权/撤权的旧请求不能再落地
+    # （Codex 复审 2026-08-07 P1）。建 job 失败 → 不调 undeploy Lambda。
+    import botocore.exceptions
+    guards = [_rev_condition_check(site_id, authz.rev)]
+    if authz.role == permissions.ROLE_ADMIN:
+        guards.append(_admin_condition_check(owner))
+    try:
+        job_id = common.create_job(owner, site_id, guard_items=guards)
+    except botocore.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] != "TransactionCanceledException":
+            raise
+        reasons = [r.get("Code", "") for r in
+                   e.response.get("CancellationReasons", [])]
+        if len(reasons) > 2 and reasons[2] == "ConditionalCheckFailed":
+            raise NotOwner("你的管理员权限已被撤销") from e
+        if len(reasons) > 1 and reasons[1] == "ConditionalCheckFailed":
+            raise NotOwner(
+                "站点权限在你提交期间被修改（协作者/所有权变更），本次下线已取消"
+                "——请重新确认权限后再试") from e
+        raise
     payload = {"job_id": job_id, "site_id": site_id}
     if purge_data:
         payload["purge_data"] = True
@@ -255,7 +356,7 @@ def do_manage_collaborators(caller: str, site_id: str, add=None, remove=None,
 
 
 def do_get_permissions(caller: str, site_id: str) -> dict:
-    site = _assert_permission(caller, site_id, "read", f"站点 {site_id}")
+    site = _assert_permission(caller, site_id, "read", f"站点 {site_id}").site
     return {"site_id": site_id,
             "owner": site.get("owner", ""),
             "collaborators": list(site.get("collaborators") or []),

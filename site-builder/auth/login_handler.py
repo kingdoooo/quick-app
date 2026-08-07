@@ -68,6 +68,9 @@ def _secret(name: str) -> str:
     失败，用户登录后立刻被踢回登录页（症状极难定位到密钥版本）。轮转它需要
     版本化/双密钥或"先让 Edge 同时接受新旧值、复制完成后再切签发"的协调顺序，
     不在当前实现范围内。
+    **动手前先读 DEPLOY.md「轮转 jwt-secret：当前实现下不能就地改值」**——
+    那里写了为什么不能就地改、双密钥要改哪两处，以及密钥已泄漏时那条
+    "可用性换安全性"的应急步骤（含"处置期间不要回滚 Edge"）。
     """
     hit = _secret_cache.get(name)
     if hit is not None and time.monotonic() - hit[1] < SECRET_TTL_SECONDS:

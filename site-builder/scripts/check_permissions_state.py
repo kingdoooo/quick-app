@@ -60,8 +60,18 @@ def aws_json(*args: str) -> dict:
     if proc.returncode != 0:
         raise AwsError(f"exit {proc.returncode}: "
                        f"{(proc.stderr or proc.stdout).strip().splitlines()[-1:]}")
+    # **空 stdout 是错误，不是"空结果"**：本函数用到的三条命令都不会返回空输出
+    # ——get-item 找不到 key 时返回的是 `{}` 这三个字符，scan 返回带 Items 的对象。
+    # 真正的空 stdout 只在 CLI 出错时出现（而它可能仍 exit 0）。原来的
+    # `proc.stdout or "{}"` 兜底正好把这种情况解析成合法空对象，于是"读路由表
+    # 失败"被报成"路由确实不存在"→ report() 返回 0 说检查通过
+    # （Codex 复审 2026-08-07）。这与本函数开头那条"不能只看 returncode"是同一
+    # 个陷阱的两半：既要校验输出是 JSON，也不能给失败凑一个合法 JSON 出来。
+    if not proc.stdout.strip():
+        raise AwsError("stdout 为空但 exit 0（CLI 出错的典型形态）: "
+                       f"{(proc.stderr or '').strip()[:200]!r}")
     try:
-        return json.loads(proc.stdout or "{}")
+        return json.loads(proc.stdout)
     except ValueError:
         head = (proc.stdout or proc.stderr).strip().splitlines()
         raise AwsError(f"输出不是 JSON: {head[:1]}") from None
@@ -127,8 +137,20 @@ def report(site: dict, route: dict, admins: list) -> int:
             print(f"    {k:24s} = {site[k]!r}")
 
     if not route:
-        print("  路由表：无 item（站点未首次部署成功，写入走 fallback 只改真源）")
+        # **"无 route" 的对错取决于 status**（Codex 复审 2026-08-07）：
+        #   DEPLOYING/未部署 —— 正常，权限写入走 fallback 只改真源；
+        #   DELETED         —— 正常，undeploy 就是删路由 + 置 DELETED；
+        #   ACTIVE          —— 事故：Edge 对它一律 404，任何访问策略都无从执行
+        #                      （路由被误删、或 register_route 失败而 status 已置）。
+        # 原来一律返回 0，把最后那种情况报成"检查通过"。
+        status = site.get("status", "")
+        print(f"  路由表：无 item（sites.status={status!r}）")
         print(f"  平台管理员名单: {admins}")
+        if status == "ACTIVE":
+            print("    ✗ status=ACTIVE 却没有路由 item —— Edge 对该站点只会 404，"
+                  "鉴权策略无从执行（不是'尚未部署'，是路由丢了）")
+            return 2
+        print("    （尚未首次部署成功或已下线，无 route 属正常）")
         return 0
 
     print("  路由表（Edge 实际读的投影）")
