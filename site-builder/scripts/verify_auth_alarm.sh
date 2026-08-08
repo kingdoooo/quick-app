@@ -27,11 +27,13 @@ PY
 REGION="$(read_cfg "$CFG" Platform region)"
 BASE_DOMAIN="$(read_cfg "$CFG" Platform base_domain)"
 LOG_GROUP="/aws/lambda/site-auth-service"
-# 探针 alarm 名带随机后缀。固定名有两个坑（Codex 审查 2026-08-06 P1）：
+# 探针 alarm 名带 TEST 前缀 + 随机后缀：邮件收件人第一眼就能分辨验收探针，
+# 不会把它误认成生产事故。固定名另有两个坑（Codex 审查 2026-08-06 P1）：
 # ① PutMetricAlarm 更新现有 alarm 时**保留当前状态**，上次残留的若是 ALARM，
 #    本轮第一次查询就 PASS —— 而本轮的事件可能根本没触发过它；
 # ② 两个人同时跑会互相覆盖配置、并在清理时删掉对方的 alarm。
-PROBE_ALARM="site-builder-auth-invalid-grant-probe-$(python3 -c 'import uuid;print(uuid.uuid4().hex[:8])')"
+PROBE_ALARM="TEST-site-builder-auth-invalid-grant-$(python3 -c 'import uuid;print(uuid.uuid4().hex[:8])')"
+PROBE_DESCRIPTION='【验收测试 / TEST ONLY】这是 verify_auth_alarm.sh 创建的一次性探针，不代表生产事故。触发条件：1 个 60 秒周期内 AuthInvalidGrant >= 1。目的：验证 Logs → Metric Filter → CloudWatch Alarm → SNS → Email 全链路；脚本结束后自动删除。ALARM=测试条件触发；OK=告警解除（仅表示指标不再满足条件，告警规则未被删除）。This is a temporary acceptance-test alarm, not a production incident. Threshold: AuthInvalidGrant >= 1 in one 60-second period.'
 
 COOKIE_JAR="$(mktemp -t sbjar.XXXXXX)"
 chmod 600 "$COOKIE_JAR"
@@ -88,6 +90,9 @@ trap cleanup EXIT INT TERM
 
 fail() { echo "FAIL  $1"; FAILURES=$((FAILURES + 1)); }
 
+echo "⚠️  这是一次性验收探针。若在相邻两个正式 5 分钟周期内重复执行，"
+echo "    可能同时触发正式 site-builder-auth-invalid-grant 告警；这是阈值的预期行为。"
+echo
 echo "── ① 正式配置核对 ────────────────────────────────"
 # **逐字段核对，不只看"存在"**：原来只取 Threshold/EvaluationPeriods/
 # AlarmActions[0] 且不比对期望值，于是正式 alarm 即使监控的是拼错的
@@ -142,6 +147,20 @@ else:
             bad.append(f"正式 alarm 的 {k}={a.get(k)!r}，期望 {want!r}")
     if not a.get("AlarmActions"):
         bad.append("正式 alarm 没有 AlarmActions —— 进 ALARM 也没人被通知到")
+    # 第一阶段通知可读性约束：Description 必须同时解释中英文阈值与 OK 语义；
+    # OKActions 必须通知同一条 SNS 链路，让操作者知道"告警条件解除"，而不是
+    # 误以为规则被删除或根因已经确认修复。
+    desc = a.get("AlarmDescription", "")
+    for marker in ("【中文】", "【English】", "告警解除",
+                   "alarm condition cleared"):
+        if marker not in desc:
+            bad.append(f"正式 alarm 的 AlarmDescription 缺少 {marker!r}")
+    sns_alarm = [x for x in a.get("AlarmActions", []) if ":sns:" in x]
+    sns_ok = [x for x in a.get("OKActions", []) if ":sns:" in x]
+    if not sns_ok:
+        bad.append("正式 alarm 没有 SNS OKActions —— 告警解除时不会通知")
+    elif sns_alarm and not set(sns_alarm).intersection(sns_ok):
+        bad.append("正式 alarm 的 ALARM/OK 通知没有使用同一个 SNS topic")
     # **灵敏度参数必须核**（Codex 复审 2026-08-07）：metric/namespace/action 全对
     # 但 Threshold=1000000 或 ActionsEnabled=false 时，这个 alarm 永远不会通知，
     # 而下面的 probe alarm 用自己那套正确参数照样进 ALARM —— 整套验收 PASS，
@@ -284,6 +303,7 @@ echo "── ③ 让 alarm 真的进 ALARM ────────────�
 # 正式阈值是 10/2 周期，一条合成事件永远达不到——临时建一个 1/1 周期的探针
 # alarm（不改正式那个，避免验证期间正式告警失灵）。
 ALARM_ARGS=(--region "$REGION" --alarm-name "$PROBE_ALARM"
+  --alarm-description "$PROBE_DESCRIPTION"
   --namespace SiteBuilder --metric-name AuthInvalidGrant
   --statistic Sum --period 60 --evaluation-periods 1
   --threshold 1 --comparison-operator GreaterThanOrEqualToThreshold
@@ -316,7 +336,7 @@ aws cloudwatch put-metric-alarm "${ALARM_ARGS[@]}"
 INIT_STATE="$(aws cloudwatch describe-alarms --region "$REGION" \
   --alarm-names "$PROBE_ALARM" --query 'MetricAlarms[0].StateValue' \
   --output text 2>/dev/null || echo "?")"
-echo "  初始状态 $INIT_STATE（INSUFFICIENT_DATA 或 ALARM 都正常——"
+echo "  初始状态 ${INIT_STATE}（INSUFFICIENT_DATA 或 ALARM 都正常——"
 echo "   AWS 只保证先置 INSUFFICIENT_DATA，随后立即评估，我们可能只看到评估后的值）"
 
 echo "  轮询状态（最多 3 分钟）…"

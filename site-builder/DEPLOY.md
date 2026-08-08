@@ -441,11 +441,13 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    ```bash
    aws cloudwatch put-metric-alarm --region us-east-1 \
      --alarm-name site-builder-auth-invalid-grant \
+     --alarm-description '【中文】Site Builder 登录授权码交换持续失败。触发条件：连续 2 个 5 分钟周期，每个周期 AuthInvalidGrant >= 1。可能影响：用户可能无法登录。常见原因：授权码过期/重放、Cognito App Client 属性读取权限或 OAuth client/grant/redirect URI 配置错误。ALARM=告警触发；OK=告警解除（仅表示指标不再满足阈值，告警规则仍启用，不代表根因已确认修复；缺失数据按 notBreaching 处理）。【English】Site Builder OAuth authorization-code exchanges are failing continuously. Threshold: AuthInvalidGrant >= 1 in each of 2 consecutive 5-minute periods. ALARM=condition breached; OK=alarm condition cleared. The alarm remains enabled, and OK does not confirm root-cause resolution because missing data is treated as notBreaching.' \
      --namespace SiteBuilder --metric-name AuthInvalidGrant \
      --statistic Sum --period 300 --evaluation-periods 2 \
      --threshold 10 --comparison-operator GreaterThanOrEqualToThreshold \
      --treat-missing-data notBreaching \
-     --alarm-actions <SNS topic ARN>
+     --alarm-actions <SNS topic ARN> \
+     --ok-actions <SNS topic ARN>
    ```
 
    **建完用脚本验收**（"日志打了/metric 有点了"不等于"alarm 会响"）：
@@ -460,6 +462,10 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    （trap 保证异常路径也清）。最后一步仍需人工：去 SNS 订阅端确认收到通知——
    **topic 没有订阅或订阅未确认时 alarm 照样进 ALARM 而无人知情**。
 
+   `OK` 通知统一称为**告警解除**：它只表示最近指标不再满足 ALARM 条件，告警规则
+   仍然存在并持续监控；由于缺失数据按 `notBreaching` 处理，`OK` 也不等于已经确认
+   登录功能或根因恢复。收到告警解除通知后仍应执行一次真实登录验证。
+
    ⚠️ **阈值 10 只是起步值，低流量环境必须调小**：如果日活登录只有几十次，
    "100% 登录失败"也可能 5 分钟凑不满 10 次——告警永不触发，而这正是它要发现
    的事故。这类环境改成 `--threshold 1 --evaluation-periods 2`（连续两个周期
@@ -470,7 +476,9 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    > --evaluation-periods 2`，即连续两个 5 分钟周期各至少 1 次失败才告警。
    > 理由：当前只有个位数用户，用起步值 10 会让"全员登录失败"也凑不满阈值；
    > 而要求**连续两个周期**能滤掉单次用户重放授权码的正常噪声。
-   > 通知发往 SNS topic `site-builder-alarms`（邮件订阅已确认）。
+   > ALARM 与 OK（告警解除）均通知 SNS topic `site-builder-alarms`
+   > （邮件订阅已确认）。验收探针名称使用 `TEST-` 前缀，Description 明确标注
+   > `TEST ONLY`，避免被误认成生产事故。
    > 用户量上来后应重新评估——阈值 1 在高流量下会被正常的偶发失败刷响。
    >
    > 端到端验证过一次：打合成数据点 → alarm 进 ALARM → CloudWatch 记录

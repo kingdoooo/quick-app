@@ -97,7 +97,7 @@ cleanup() {
     present="$(aws_admin dynamodb get-item --table-name "$tbl" --key "$key" \
                  --query 'Item != null' --output text 2>/dev/null || echo Unknown)"
     if [ "$present" != "False" ]; then
-      echo "⚠️  fixture 仍存在（或状态未知）：$tbl / $label（present=$present）"
+      echo "⚠️  fixture 仍存在（或状态未知）：${tbl} / ${label}（present=${present}）"
       leftover=1
     fi
   done
