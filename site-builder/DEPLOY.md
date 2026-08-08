@@ -970,6 +970,26 @@ SSM 参数：`/site-builder/jwt-secret`（§0 手工建）、`/site-builder/site
 - CloudFront 全站禁缓存（正确性优先；精细缓存延后）
 - 详见设计文档 §8 风险 / §9 范围外
 
+### 状态机级超时/中止不落账（job 会停在 RUNNING）
+
+各步骤都挂了 `add_catch(States.ALL) → MarkFailed`，所以**步骤内**的失败都会把
+job 写成 FAILED（真机核对过：历史 3 个 FAILED 执行的 job 都是
+`status=FAILED, phase=provision-db`，没有卡住的）。
+
+但有两类终止**不执行任何 State**，因此 `mark_job` 根本不会被调用：
+
+- 状态机级 `TimeoutSeconds=1800`（30 分钟）到点 → 执行 `TIMED_OUT`；
+- 人工 `StopExecution` → 执行 `ABORTED`。
+
+这两类之后 job 会**永久停在 `RUNNING`**：用户既拿不到结果，也无法重试
+（`confirm_upload` 的条件迁移要求 `PENDING`，会返回"已启动过"）。目前只能人工
+把该 job 改成 FAILED，或让用户重新发起一次部署（会拿到新 job_id）。
+
+要闭合需要一条 EventBridge 规则订阅 Step Functions 执行状态变更、对
+`TIMED_OUT`/`ABORTED` 把对应 job 落成 FAILED —— **未实现**。
+现状与该缺口由 `site-builder/scripts/verify_sfn_failure_paths.py` 持续核对
+（它会把历史上出现过的 TIMED_OUT/ABORTED 报成 FAIL，所以真的发生过就不会被漏掉）。
+
 ### MCP runtime 的信任边界（不要外推 IAM 的保护范围）
 
 **部署 MCP 的 runtime 角色对"站点管理操作"而言属于 TCB（可信计算基）。**
