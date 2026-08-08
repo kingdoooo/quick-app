@@ -160,13 +160,37 @@ def read_cfg(section: str, key: str) -> str:
     return c[section][key].split("#")[0].split(";")[0].strip()
 
 
+def _fetch_package(lam, function_name: str):
+    """下载某个 Lambda 的部署包 → ZipFile。带重试，并**校验是合法 zip**。
+
+    两件事都吃过亏（2026-08-08 实测）：
+      · 预签名 URL 偶发 RemoteDisconnected / reset；
+      · 更阴的是**下到一个截断的片段**（当时拿到 53KB，真实包 5.5MB），
+        `curl` 退出码是 0，只有解 zip 才发现坏。所以必须校验而不是只看
+        有没有抛异常——"下载成功"不等于"下到了完整文件"。
+    """
+    import io
+    import urllib.request
+    import zipfile
+
+    loc = lam.get_function(FunctionName=function_name)["Code"]["Location"]
+    last = None
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(loc, timeout=120) as r:
+                blob = r.read()
+            return zipfile.ZipFile(io.BytesIO(blob))   # 坏包在这里就会抛
+        except Exception as exc:                # noqa: BLE001 连接层/截断都重试
+            last = exc
+            if attempt < 3:
+                time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"{function_name} 部署包下载失败: {last}")
+
+
 def run_deployed() -> None:
     """核对线上 validate Lambda 里的 contract 包与本地一致。"""
     import boto3
     from botocore.config import Config
-    import urllib.request
-    import io
-    import zipfile
 
     region = read_cfg("Platform", "region")
     fn = "site-deployer-validate"
@@ -174,23 +198,9 @@ def run_deployed() -> None:
                        config=Config(retries={"max_attempts": 5,
                                               "mode": "adaptive"}))
     print("\n── ③ 线上 validate Lambda 是否加载了这份 scanner ────")
-    meta = lam.get_function(FunctionName=fn)
-    cfgm = meta["Configuration"]
-    print(f"  {fn}  LastModified={cfgm['LastModified']}")
-    # 预签名 URL 偶发 RemoteDisconnected / reset（审查方实测撞到过一次）。
-    # 重试几次，免得网络抖动被读成"线上代码有问题"。
-    blob = b""
-    for attempt in range(4):
-        try:
-            with urllib.request.urlopen(meta["Code"]["Location"],
-                                        timeout=120) as r:
-                blob = r.read()
-            break
-        except Exception:                   # noqa: BLE001 连接层错误都值得重试
-            if attempt == 3:
-                raise
-            time.sleep(2 * (attempt + 1))
-    zf = zipfile.ZipFile(io.BytesIO(blob))
+    print(f"  {fn}  LastModified="
+          f"{lam.get_function_configuration(FunctionName=fn)['LastModified']}")
+    zf = _fetch_package(lam, fn)
     names = [n for n in zf.namelist() if n.endswith("contract/redlines.py")]
     if not names:
         check(False, "部署包里找不到 contract/redlines.py",
@@ -225,9 +235,7 @@ def run_deployed() -> None:
            if f["FunctionName"].startswith("site-deployer-")]
     mismatched: list[str] = []
     for fname in sorted(fns):
-        m = lam.get_function(FunctionName=fname)
-        with urllib.request.urlopen(m["Code"]["Location"], timeout=120) as r:
-            z = zipfile.ZipFile(io.BytesIO(r.read()))
+        z = _fetch_package(lam, fname)
         pkg = set(z.namelist())
         for base, path in guarded.items():
             if base not in pkg:
@@ -239,6 +247,36 @@ def run_deployed() -> None:
           f"{len(fns)} 个 site-deployer-* 函数里的守卫模块都与本地一致",
           "不一致: " + ", ".join(mismatched[:5]) if mismatched
           else "permissions/register_route/common 三件套逐包核对通过")
+
+    # **auth 服务也要核**：它此前完全没被任何闸门覆盖，结果 SSM TTL 修复
+    # （提交 7238471）在仓库里躺了两天没上线，靠人手查 LastModified 才发现
+    # （2026-08-08）。`session.py` 尤其重要——它与 Edge 的验签算法必须字节级
+    # 同步，两边漂移的症状是"登录成功但立刻被踢回登录页"，极难定位。
+    print("\n── ④ 线上 auth 服务是否加载了这份代码 ──────────────")
+    z = _fetch_package(lam, "site-auth-service")
+    pkg = set(z.namelist())
+    auth_mismatch: list[str] = []
+    for base in ("login_handler.py", "session.py"):
+        local = ROOT / "site-builder/auth" / base
+        if base not in pkg:
+            auth_mismatch.append(f"{base}(包里缺失)")
+            continue
+        if (hashlib.sha256(z.read(base)).hexdigest()
+                != hashlib.sha256(local.read_bytes()).hexdigest()):
+            auth_mismatch.append(base)
+    check(not auth_mismatch,
+          "site-auth-service 的 login_handler.py / session.py 与本地一致",
+          "不一致: " + ", ".join(auth_mismatch) if auth_mismatch
+          else "含 session.py（与 Edge 验签同算法，必须同步）")
+    # TTL 必须是**赋值语句**而不是只出现在注释里（前几轮栽过"断言的字样只活在
+    # 注释里"，所以这里按行首赋值断言）
+    if "login_handler.py" in pkg:
+        body = z.read("login_handler.py").decode()
+        import re as _re
+        check(bool(_re.search(r'^SECRET_TTL_SECONDS = \d+', body, _re.M))
+              and "time.monotonic() - hit[1] < SECRET_TTL_SECONDS" in body,
+              "SSM 密钥缓存的 TTL 在产物中生效（赋值 + 判定都在）",
+              "无 TTL 时轮转密钥后 warm 容器会永久用旧值")
 
 
 def main() -> int:
