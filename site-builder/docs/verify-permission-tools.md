@@ -101,8 +101,31 @@ python3 site-builder/scripts/deploy_fixture.py \
 - [ ] 🔸 对**别人 owner 的站点**调 `get_site_permissions` → 成功，`my_role` == `admin`
 - [ ] 🔸 对别人的站点调 `update_site_permissions` → 成功
       （代管入口就是为「owner 离职/误撤自己权限」准备的）
-- [ ] 从 `site-admins` 表临时删掉自己 → 上面两项应立刻变成被拒
-      （验完记得用 `seed_admin.py --apply` 加回来）
+- [ ] 临时移除自己的管理员身份 → 上面两项应立刻变成被拒。
+      **必须用 `permissions.remove_admin()`，不要直接 `delete-item`**：
+
+      ```bash
+      cd site-builder/deployer && .venv/bin/python -c "
+      import os,sys,configparser; sys.path.insert(0,'functions')
+      c=configparser.ConfigParser(interpolation=None); c.read('../config.ini')
+      g=lambda s,k: c[s][k].split('#')[0].strip()
+      os.environ.update({'ADMINS_TABLE':g('Deployer','admins_table'),
+                         'AWS_DEFAULT_REGION':g('Platform','region')})
+      import permissions as p; p.remove_admin('你的邮箱')"
+      ```
+
+      验完用 `seed_admin.py --apply` 加回来。
+
+      > ⚠️ **为什么不能直接 delete-item**：`site-admins` 里有个 `__count__`
+      > sentinel，`remove_admin` 靠它的 `n > 1` 条件硬拦"删掉最后一个管理员"。
+      > 裸 `delete-item` 删掉行却**不递减** `n`，而加回来时 `add_admin` 会
+      > `+1` —— 一个来回就让 `n` 永久虚高 1。计数虚高的后果正是那道硬拦失效：
+      > `n=2` 而实际只有 1 个管理员时，删掉他会通过条件检查，**平台永久失去
+      > 管理入口**。
+      > 这不是假设——本文档早先的写法就造成了线上 `n=2`/实际 1 个的漂移
+      > （2026-08-08 独立审查发现并已用 `permissions.rebuild_admin_count()` 修复）。
+      > 若怀疑已漂移：`rebuild_admin_count()` 按实际条数重建（停写维护操作，
+      > 见其 docstring）。
 
 ### 5. 并发冲突（可选，需要两个终端）
 

@@ -22,6 +22,7 @@ import argparse
 import configparser
 import hashlib
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).parent
@@ -176,8 +177,19 @@ def run_deployed() -> None:
     meta = lam.get_function(FunctionName=fn)
     cfgm = meta["Configuration"]
     print(f"  {fn}  LastModified={cfgm['LastModified']}")
-    with urllib.request.urlopen(meta["Code"]["Location"], timeout=120) as r:
-        blob = r.read()
+    # 预签名 URL 偶发 RemoteDisconnected / reset（审查方实测撞到过一次）。
+    # 重试几次，免得网络抖动被读成"线上代码有问题"。
+    blob = b""
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(meta["Code"]["Location"],
+                                        timeout=120) as r:
+                blob = r.read()
+            break
+        except Exception:                   # noqa: BLE001 连接层错误都值得重试
+            if attempt == 3:
+                raise
+            time.sleep(2 * (attempt + 1))
     zf = zipfile.ZipFile(io.BytesIO(blob))
     names = [n for n in zf.namelist() if n.endswith("contract/redlines.py")]
     if not names:
@@ -201,6 +213,33 @@ def run_deployed() -> None:
                 ("keep_header", "头名保留（注释里的假解码仍被抹）")):
             check(marker in deployed, f"线上含 {marker} —— {why}")
 
+    # **守卫本体也要核**（2026-08-08 独立审查指出的缺口）：几轮修的缺陷绝大多数
+    # 在 permissions.py / register_route.py / common.py 里，只比 redlines.py
+    # 等于漏掉了主体。逐个函数包核对，才抓得住"部分 Lambda 没更新"这种半量部署。
+    guarded = {
+        "permissions.py": ROOT / "site-builder/deployer/functions/permissions.py",
+        "register_route.py": ROOT / "site-builder/deployer/functions/register_route.py",
+        "common.py": ROOT / "site-builder/deployer/functions/common.py",
+    }
+    fns = [f["FunctionName"] for f in lam.list_functions()["Functions"]
+           if f["FunctionName"].startswith("site-deployer-")]
+    mismatched: list[str] = []
+    for fname in sorted(fns):
+        m = lam.get_function(FunctionName=fname)
+        with urllib.request.urlopen(m["Code"]["Location"], timeout=120) as r:
+            z = zipfile.ZipFile(io.BytesIO(r.read()))
+        pkg = set(z.namelist())
+        for base, path in guarded.items():
+            if base not in pkg:
+                continue        # 该函数包里没有这个模块，正常（打包差异）
+            if (hashlib.sha256(z.read(base)).hexdigest()
+                    != hashlib.sha256(path.read_bytes()).hexdigest()):
+                mismatched.append(f"{fname}:{base}")
+    check(not mismatched,
+          f"{len(fns)} 个 site-deployer-* 函数里的守卫模块都与本地一致",
+          "不一致: " + ", ".join(mismatched[:5]) if mismatched
+          else "permissions/register_route/common 三件套逐包核对通过")
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -215,18 +254,31 @@ def main() -> int:
 
 if __name__ == "__main__":
     rc = 1
+    crashed = ""
     try:
         rc = main()
-    except Exception:                       # noqa: BLE001
+    except Exception as exc:                # noqa: BLE001
         import traceback
         traceback.print_exc()
+        # **必须记在 finally 之外的变量里**：只把 rc 置 1 是不够的，下面的
+        # finally 会按"本地 15 项全过"重算 rc 并把它盖成 0。于是
+        # run_deployed()（本脚本存在的全部理由）一旦抛异常——没凭证、被节流、
+        # 或那个预签名 URL 下载失败（实测会 RemoteDisconnected）——脚本会打印
+        # "15/15 项通过"并 exit 0，等于把最关键的检查静默丢掉
+        # （2026-08-08 独立审查复现）。
+        crashed = f"{type(exc).__name__}: {exc}"
         rc = 1
     finally:
         failed = sum(1 for ok, _, _ in results if not ok)
         # 下限：合规 8 + 违规 7 = 15 项本地判定，少于这个数说明中途挂了
+        # （非 --local 时还有 ③ 的 2 项，但下限只保本地那部分）
         MIN_CHECKS = 15
         print()
-        if len(results) < MIN_CHECKS:
+        if crashed:
+            print(f"结果：执行中断（{crashed}）—— 验收**未完成**，状态不可信。"
+                  "本地判定即便全过也不代表线上是这份 scanner。")
+            rc = 1
+        elif len(results) < MIN_CHECKS:
             print(f"结果：只跑了 {len(results)} 项（预期 ≥{MIN_CHECKS}）—— "
                   "验收**未完成**，状态不可信")
             rc = 1

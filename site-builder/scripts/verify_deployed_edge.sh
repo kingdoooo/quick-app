@@ -12,6 +12,12 @@
 # 用法：
 #   ./verify_deployed_edge.sh            # 核对 CloudFront 当前实际关联的版本
 #   ./verify_deployed_edge.sh 5          # 核对指定版本号
+#
+# ⚠️ **不要按"版本号最大/时间最新"去挑版本，用默认的分发关联版本**。
+# Lambda@Edge 的旧版本要等全球副本排空才能删，CDK 期间会出现多次
+# `DELETE_FAILED (skipped)`，**旧版本的 LastModified 可能因此比新版本更晚**
+# （2026-08-08 实测：v4 的时间戳晚于 v5，而 CloudFront 关联的是 v5）。
+# 拿旧版本号当参数跑本脚本会得到一个**正确的** FAIL——那是旧代码，不是回归。
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -24,7 +30,11 @@ fail() { echo "FAIL  $1"; FAILURES=$((FAILURES + 1)); }
 
 [ -f "$SRC" ] || { echo "找不到源码 $SRC"; exit 1; }
 
-read_cfg() {  # $1=section $2=key（缺失返回空而不报错）
+# **键缺失必须硬失败**，不能返回空串让调用方回落硬编码值：本项目的规则是
+# config.ini 是唯一取值来源，而"回落到刚好等于本环境的字面量"会让脚本在这里
+# 一直"能用"、换个账号就悄悄验错对象（2026-08-08 独立审查指出：原实现读的
+# `[Stack]` 段根本不存在——真实段名是 `[CDK]`——却因回落而无人发现）。
+read_cfg() {  # $1=section $2=key
   python3 - "$CFG" "$1" "$2" <<'PY'
 import configparser, sys
 c = configparser.ConfigParser(interpolation=None)
@@ -32,14 +42,12 @@ c.read(sys.argv[1])
 try:
     print(c[sys.argv[2]][sys.argv[3]].split("#")[0].split(";")[0].strip())
 except KeyError:
-    print("")
+    sys.exit(f"config.ini 缺少 [{sys.argv[2]}] {sys.argv[3]}")
 PY
 }
 
 FN="$(read_cfg LambdaEdge origin_request_function_name)"
-STACK="$(read_cfg Stack stack_name)"
-[ -n "$FN" ] || FN="application-web-router"
-[ -n "$STACK" ] || STACK="ApplicationWebRouterStack"
+STACK="$(read_cfg CDK stack_name)"     # 段名是 [CDK]，不是 [Stack]
 FUNCTION="$STACK-$FN"
 # distribution id 不在 config.ini 里（那份只放输入，不放产出），从栈的
 # CfnOutput 取——这也顺带保证我们查的是**这个栈**当前的分发，而不是手抄的旧值。
@@ -55,8 +63,11 @@ if [ -z "$QUALIFIER" ]; then
   # **默认核对 CloudFront 真正关联的那个版本**，不是 $LATEST：
   # 部署成功但分发仍指向旧版本时，只查最新版本会得出"已生效"的错误结论。
   if [ -z "$DIST_ID" ]; then
-    echo "config.ini 没有 [CloudFront] distribution_id —— 无法确认分发关联的版本"
-    echo "请显式传版本号：$0 <version>"
+    # 别把操作者指向一个不存在的配置键：id 是从栈的 CfnOutput DistributionId
+    # 取的（见上），取不到通常是栈名不对、凭证不对或栈还没建好。
+    echo "取不到栈 $STACK 的 CfnOutput DistributionId —— 无法确认分发关联的版本"
+    echo "  · 确认栈名与 router/config.ini 的 [CDK] stack_name 一致、凭证可用"
+    echo "  · 或显式传版本号（注意：那样就不校验分发是否真的指向它）：$0 <version>"
     exit 1
   fi
   ARN="$(aws cloudfront get-distribution-config --id "$DIST_ID" \
@@ -127,16 +138,26 @@ if grep -qE '^REQUIRE_IDP_CLAIM = "true"' "$TMP/index.py"; then
 else
   fail "REQUIRE_IDP_CLAIM 不是 \"true\"：$(grep -E '^REQUIRE_IDP_CLAIM' "$TMP/index.py" || echo '未找到')"
 fi
-if grep -qE '^TRUSTED_IDPS = .*"[^"]+"' "$TMP/index.py"; then
+# **必须锚在被替换的那个字面量上**。`.*"[^"]+"` 是不够的：源码行是
+#   TRUSTED_IDPS = tuple(x.strip() for x in "{{TRUSTED_IDPS}}".split(",") …)
+# 空替换后变成 `for x in "".split(",")`，而 `"[^"]+"` 会匹配到后面那个 `","`
+# 字面量 —— 于是"白名单为空"这个**全站锁死**的配置被判成 PASS
+# （2026-08-08 独立审查发现并实测）。
+if grep -qE '^TRUSTED_IDPS = tuple\(x\.strip\(\) for x in "[^"]+"\.split' "$TMP/index.py"; then
   echo "PASS  $(grep -E '^TRUSTED_IDPS = ' "$TMP/index.py")"
 else
   fail "TRUSTED_IDPS 为空 —— REQUIRE_IDP_CLAIM=true 且白名单为空 = 全站锁死"
 fi
-# fail-closed 哨兵：本轮修复的核心，必须真在产物里
-if grep -q "_UNKNOWN" "$TMP/index.py"; then
-  echo "PASS  _deser 的 _UNKNOWN fail-closed 哨兵在产物中"
+# fail-closed 哨兵：本轮修复的核心，必须真在产物里。
+# **按赋值语句与实际使用点断言，不用裸 grep**：`_UNKNOWN` 在源码里也出现在
+# 注释与 docstring 中（origin_request.py 有 3 处，其中 2 处是说明文字），
+# 裸 grep 时"回滚了代码但留着解释性注释"照样 PASS——这正是前几轮栽过的
+# "断言的字样只活在注释里"那个坑。
+if grep -qE '^_UNKNOWN = _Unknown\(\)' "$TMP/index.py" \
+   && grep -qE 'out\[k\] = _UNKNOWN' "$TMP/index.py"; then
+  echo "PASS  _deser 的 _UNKNOWN fail-closed 哨兵在产物中（赋值与使用点都在）"
 else
-  fail "产物里没有 _UNKNOWN 哨兵 —— 部署的是 fail-open 的旧代码"
+  fail "产物里没有 _UNKNOWN 的赋值或使用点 —— 部署的是 fail-open 的旧代码"
 fi
 
 echo

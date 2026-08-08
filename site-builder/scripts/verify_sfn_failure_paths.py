@@ -97,22 +97,40 @@ def main() -> int:
 
     # ---------- A. 历史执行：终止后不得停在 RUNNING ----------
     print("\n── A 历史执行的终态与 job 状态一致 ─────────────────")
-    execs = sfn.list_executions(stateMachineArn=sm_arn,
-                                maxResults=60).get("executions", [])
+    # **必须翻页**：原来只取 maxResults=60 却声称"所有已终止执行"，名不副实
+    # （2026-08-08 独立审查指出）。执行数会随时间增长，不翻页迟早漏掉尾部。
+    execs = []
+    token = None
+    while True:
+        kw = {"stateMachineArn": sm_arn, "maxResults": 100}
+        if token:
+            kw["nextToken"] = token
+        resp = sfn.list_executions(**kw)
+        execs.extend(resp.get("executions", []))
+        token = resp.get("nextToken")
+        if not token:
+            break
     by_status: dict[str, int] = {}
     for e in execs:
         by_status[e["status"]] = by_status.get(e["status"], 0) + 1
-    print(f"  历史执行分布: {by_status}")
-    stuck = []
+    print(f"  历史执行分布（共 {len(execs)} 条）: {by_status}")
+    stuck, absent = [], []
     for e in execs:
         if e["status"] in ("RUNNING",):
             continue
         j = job_of(e["name"])          # execution name == job_id（幂等设计）
-        if j and j.get("status") == "RUNNING":
+        if not j:
+            # **"job 行不存在"是未知，不是通过**：原来 `if j and ...` 把它
+            # 静默跳过。undeploy 会删 job 行，所以这类是正常的，但必须报出
+            # 数量，否则"检查了 N 条"里有多少条其实没检查是看不见的。
+            absent.append(e["name"])
+            continue
+        if j.get("status") == "RUNNING":
             stuck.append((e["name"], e["status"], j.get("phase")))
     check(not stuck,
           "所有已终止执行对应的 job 都不停在 RUNNING",
-          f"卡住的: {stuck[:3]}" if stuck else f"检查了 {len(execs)} 条执行")
+          f"卡住的: {stuck[:3]}" if stuck
+          else f"检查了 {len(execs) - len(absent)} 条，{len(absent)} 条 job 行已删除（未检查）")
     # 未被 add_catch 覆盖的终态是已知缺口：明确报告而不是假装没有
     uncaught = {s: n for s, n in by_status.items()
                 if s in ("TIMED_OUT", "ABORTED")}
