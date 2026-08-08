@@ -444,7 +444,7 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
      --alarm-description '【中文】Site Builder 登录授权码交换持续失败。触发条件：连续 2 个 5 分钟周期，每个周期 AuthInvalidGrant >= 1。可能影响：用户可能无法登录。常见原因：授权码过期/重放、Cognito App Client 属性读取权限或 OAuth client/grant/redirect URI 配置错误。ALARM=告警触发；OK=告警解除（仅表示指标不再满足阈值，告警规则仍启用，不代表根因已确认修复；缺失数据按 notBreaching 处理）。【English】Site Builder OAuth authorization-code exchanges are failing continuously. Threshold: AuthInvalidGrant >= 1 in each of 2 consecutive 5-minute periods. ALARM=condition breached; OK=alarm condition cleared. The alarm remains enabled, and OK does not confirm root-cause resolution because missing data is treated as notBreaching.' \
      --namespace SiteBuilder --metric-name AuthInvalidGrant \
      --statistic Sum --period 300 --evaluation-periods 2 \
-     --threshold 10 --comparison-operator GreaterThanOrEqualToThreshold \
+     --threshold 1 --comparison-operator GreaterThanOrEqualToThreshold \
      --treat-missing-data notBreaching \
      --alarm-actions <SNS topic ARN> \
      --ok-actions <SNS topic ARN>
