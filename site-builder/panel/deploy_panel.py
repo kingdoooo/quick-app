@@ -82,9 +82,19 @@ def console_host() -> str:
 
 
 def frontend_prefix(version: str | None = None) -> str:
-    """S3 里前端资源的版本化前缀。旧版本保留以便回滚（同站点前端模式）。"""
+    """S3 里前端资源的版本化前缀。旧版本保留以便回滚（同站点前端模式）。
+
+    **不带尾斜杠**，与 `register_route.py` 写站点 `static_prefix` 的形态一致
+    （`sites/{site_id}/{job_id}`）。Edge 的静态改写是
+    `f"/{route['static_prefix']}{path}"` 且 `path` 已以 `/` 开头——尾斜杠会拼出
+    `platform/console/v1//index.html`，与上传的
+    `platform/console/v1/index.html` **不是同一个对象**，控制台整站 403。
+    两侧单测各自都会绿（一边只看前缀开头、一边只看拼接不报错），所以由
+    `tests/test_frontend_contract.py::test_edge_static_key_matches_what_deploy_panel_uploads`
+    用**真实 Edge 代码**逐字符比对两边的 key。
+    """
     v = version or _cfg("Panel", "console_version", "v1")
-    return f"platform/console/{v}/"
+    return f"platform/console/{v}"
 
 
 def function_url_statements(edge_role_arn: str) -> list[dict]:
@@ -316,7 +326,8 @@ def upload_frontend() -> int:
         return 0
     s3 = boto3.client("s3", region_name=_region())
     bucket = f"site-frontend-{_account()}"
-    prefix = frontend_prefix()
+    # frontend_prefix() 不带尾斜杠（见其 docstring），这里显式补一个分隔符。
+    prefix = frontend_prefix() + "/"
     types = {".html": "text/html", ".js": "application/javascript",
              ".css": "text/css", ".json": "application/json",
              ".svg": "image/svg+xml", ".ico": "image/x-icon"}

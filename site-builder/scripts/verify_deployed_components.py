@@ -454,12 +454,35 @@ def run_mcp_and_route() -> None:
           str(item.get("route_mode")))
     check(bool(item.get("api_target")), "console api_target 非空",
           str(item.get("api_target"))[:60])
-    check(str(item.get("static_prefix", "")).startswith("platform/console/"),
-          "console static_prefix 指向版本化平台前缀",
-          str(item.get("static_prefix")))
+    prefix = str(item.get("static_prefix", ""))
+    check(prefix.startswith("platform/console/"),
+          "console static_prefix 指向版本化平台前缀", prefix)
+    # **尾斜杠是真机 403 的成因**：Edge 的静态改写是
+    # `f"/{static_prefix}{path}"` 且 path 以 "/" 开头，尾斜杠会拼出
+    # `platform/console/v1//index.html`，而上传的是单斜杠版本——同一份前端，
+    # 两个不同的 S3 key，控制台整站 403。startswith 检查抓不到它（两种形态
+    # 都以 "platform/console/" 开头），所以必须单独断言。
+    check(not prefix.endswith("/"),
+          "console static_prefix 无尾斜杠（否则 Edge 拼出双斜杠 → 整站 403）",
+          prefix)
     check(item.get("require_auth") is True,
           "console require_auth=True（面板必须登录）",
           str(item.get("require_auth")))
+
+    # 前端产物真的在 S3 里，且 key 就是 Edge 会去取的那一个。
+    # "route 配好了"不等于"页面能打开"——Task 13 之后线上正是 route 存在但
+    # platform/console/ 下没有对象的状态（登录后拿到 403/404）。
+    bucket = f"site-frontend-{read_cfg('Platform', 'account_id')}"
+    index_key = f"{prefix}/index.html"
+    try:
+        head = boto3.client("s3", region_name=region).head_object(
+            Bucket=bucket, Key=index_key)
+        check(head["ContentLength"] > 0,
+              f"console 首页对象存在（{index_key}）",
+              f"{head['ContentLength']} 字节")
+    except Exception as exc:
+        check(False, f"console 首页对象存在（{index_key}）",
+              f"{type(exc).__name__} —— 前端没上传，或 key 与 Edge 取的不一致")
 
 
 def main() -> int:

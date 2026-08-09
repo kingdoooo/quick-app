@@ -1,0 +1,64 @@
+<!doctype html>
+<!--
+  Site Builder Console — 自助管理控制台
+
+  视图层移植自 Open Design 侧维护的原型（docs/design/site-builder-console.html，
+  gitignored，**不在仓库内编辑它**）。本文件与 app.js / app.css 是移植产物。
+
+  与原型的差异都是"对齐真实后端"的必要改造，逐条见 app.js 顶部注释：
+    · 没有身份切换开关——身份来自 Edge 注入的 x-user-email，前端无法也不该切换
+    · 没有 tier 徽章 / PV 曲线——sites 表不存 tier，M5 才有访问统计
+    · undeploy 是异步的，提交后轮询 job
+    · API Key（M4）与访问统计（M5）是 disabled 占位，**不发任何请求**
+
+  资源引用必须带扩展名：Edge 把"最后一段不含 . 的 URI"一律改写成 index.html
+  （SPA 兜底），所以 <script src="/app"> 会取回 HTML。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=1280" />
+<meta name="referrer" content="same-origin" />
+<title>Site Builder Console · 站点管理</title>
+<link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+<div class="shell">
+  <aside class="sidenav">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 14 14" fill="none" aria-hidden="true">
+          <path d="M7 1.2 12.9 4.6 7 8 1.1 4.6 7 1.2Z" fill="currentColor" />
+          <path d="M1.1 7.6 7 11 12.9 7.6" stroke="currentColor" stroke-width="1.5"
+                stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+      </span>
+      <span class="brand-name">Site Builder</span>
+    </div>
+    <div class="nav-group" id="nav-main"></div>
+    <div class="nav-foot">
+      <p class="prototype-note">站点在 Agent 客户端里创建<br />这里只做管理</p>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="row" id="breadcrumb"></div>
+      <div class="row" style="gap:14px">
+        <button class="user-chip" id="user-chip" type="button">
+          <span class="avatar" id="user-avatar"></span>
+          <span class="mono" id="user-email"></span>
+        </button>
+        <button class="btn btn-quiet btn-sm" id="logout-btn" type="button">登出</button>
+      </div>
+    </header>
+    <main class="page" id="view"></main>
+  </div>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<div id="modal-root"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
