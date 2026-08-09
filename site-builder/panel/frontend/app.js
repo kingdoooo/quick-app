@@ -235,16 +235,31 @@ function goUpgrade(returnTo) {
   return true;
 }
 
-/* 回到控制台后把用户送回原来的位置（升级是整页跳转，会丢 hash）。 */
+/* 回到控制台后把用户送回原来的位置（升级是整页跳转，会丢 hash）。
+ *
+ * **用 history.replaceState 而不是 location.replace**：后者会触发 hashchange，
+ * 而此刻 boot() 还没取到身份（state.me 仍是 null），hashchange → render() →
+ * pageSites() 会直接在 state.me.is_admin 上抛 TypeError。replaceState 只改
+ * 地址栏与历史项，**不派发 hashchange**，把渲染时机完全交回 boot()。
+ * 用 replace 而非 push 是有意的：升级中转不该在后退历史里留一格
+ * （用户按后退会又跳一次升级）。
+ */
 function restoreAfterUpgrade() {
   let back = '';
   try {
     back = sessionStorage.getItem(UPGRADE_BACK) || '';
     if (back) sessionStorage.removeItem(UPGRADE_BACK);
-  } catch (e) { return; }
+  } catch (e) { return false; }
   if (back && back !== location.hash) {
-    location.replace(back);
-    return true;
+    try {
+      history.replaceState(null, '', back);
+      return true;
+    } catch (e) {
+      // 极老的浏览器没有 replaceState：退回改 hash。此时会触发 hashchange，
+      // 但 render() 里对 state.me 有兜底（见其开头），不会抛。
+      location.hash = back;
+      return true;
+    }
   }
   return false;
 }
@@ -1326,6 +1341,11 @@ async function render() {
   stopPolling();
   state.route = parseHash();
   if (state.route.page !== 'site') state.draft = null;
+  /* **身份没到位就不渲染**：每个页面都读 state.me（is_admin 决定范围与入口），
+   * null 上取属性会抛 TypeError 并让页面停在骨架屏。任何在 boot() 取到身份
+   * 之前触发的 hashchange 都会走到这里——与其崩，不如什么都不做，等 boot
+   * 自己 render()。这条兜底是"不变量集中在一处"，而不是在四个页面各写一次。 */
+  if (!state.me) return;
   renderNav();
   if (state.route.page === 'keys') return pageKeys();
   if (state.route.page === 'admin') return pageAdmin();
@@ -1362,14 +1382,24 @@ $('#user-chip').addEventListener('click', () => {
 });
 
 (async function boot() {
-  /* 从升级跳转回来：补上标记并回到原来的位置（整页跳转会丢 hash）。 */
+  /* 从升级跳转回来：补上标记并回到原来的位置（整页跳转会丢 hash）。
+   *
+   * **不能在这里 return**：改 hash 是**同文档导航**，浏览器不会重新加载页面、
+   * 不会重新执行本脚本，只会触发 hashchange。提前 return 的话 boot 再也不会
+   * 继续，`state.me` 永远是 null，而 hashchange → render() → pageSites() 立刻
+   * 在 `state.me.is_admin` 上抛 TypeError——用户看到骨架屏卡死。
+   * （实测确认过这个形态；此处原先的注释"location.replace 会重新执行 boot"是错的。）
+   *
+   * 所以：先把 hash 摆正（此时还没有 hashchange 监听器之外的副作用），
+   * 再照常往下走取身份，最后由 boot 自己 render()。
+   */
   let cameBack = false;
   try {
     cameBack = !!sessionStorage.getItem(UPGRADE_BACK);
   } catch (e) { cameBack = false; }
   if (cameBack) {
     markUpgraded();
-    if (restoreAfterUpgrade()) return;   // location.replace 会重新执行 boot
+    restoreAfterUpgrade();      // 只摆正 hash，**不 return**
   }
 
   try {
