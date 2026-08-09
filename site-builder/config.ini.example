@@ -66,3 +66,13 @@ map_email_verified = true
 # 完全退回上面 ①② 的选型约束。设为 false 后请在变更记录里写明原因。
 # 部署时通过 Lambda 环境变量 REQUIRE_EMAIL_VERIFIED 下发。
 require_email_verified = true
+
+# 告警通知收件人。**真实邮箱只写进 gitignored 的 config.ini，不进本文件。**
+# 也可用环境变量 SB_ALERT_EMAIL 覆盖（CI 场景）。
+#
+# deploy_auth.py 会幂等收敛：metric filter → SNS topic → email 订阅 → alarm。
+# ⚠️ email 订阅**必须由收件人手工点确认链接**——脚本只能创建订阅，
+# 无法代为确认。未确认时 alarm 照样进 ALARM 而无人收到通知，
+# 所以脚本会把 PendingConfirmation 显式报告为「未完成」。
+[Alerting]
+email =

@@ -19,7 +19,7 @@ Quick 自动化建站平台（Site Builder）：业务人员在任意支持 Skil
 
 ```bash
 cd site-builder/contract && .venv/bin/pytest tests -q        # 67 tests
-cd site-builder/auth     && ../contract/.venv/bin/pytest tests -q   # 11 tests；auth 无自己的 venv，借 contract 的（含 pyjwt）
+cd site-builder/auth     && ../contract/.venv/bin/pytest tests -q   # auth 无自己的 venv，借 contract 的——含 pyjwt 与 boto3；重建该 venv 后两者都要手工重装
 cd router/infrastructure/lambda && ../../../site-builder/deployer/.venv/bin/pytest . -q  # 23 tests；router 的 .venv 只有 CDK 依赖没有 pytest，借 deployer 的（含 boto3）
 cd site-builder/deployer && .venv/bin/pytest tests -q        # 必须指定 tests/——裸 pytest 会误收集 infra/cdk.out 里的 asset 副本
 cd site-builder/mcp      && python3 -m pytest tests -q       # 23 tests
