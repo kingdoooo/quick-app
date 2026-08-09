@@ -26,7 +26,9 @@ PY
 }
 REGION="$(read_cfg "$CFG" Platform region)"
 BASE_DOMAIN="$(read_cfg "$CFG" Platform base_domain)"
+ACCOUNT_ID="$(read_cfg "$CFG" Platform account_id)"
 LOG_GROUP="/aws/lambda/site-auth-service"
+AUTH_DIR="$HERE/../auth"
 # 探针 alarm 名带 TEST 前缀 + 随机后缀：邮件收件人第一眼就能分辨验收探针，
 # 不会把它误认成生产事故。固定名另有两个坑（Codex 审查 2026-08-06 P1）：
 # ① PutMetricAlarm 更新现有 alarm 时**保留当前状态**，上次残留的若是 ALARM，
@@ -39,6 +41,8 @@ COOKIE_JAR="$(mktemp -t sbjar.XXXXXX)"
 chmod 600 "$COOKIE_JAR"
 CLEANED=0
 FAILURES=0
+# 与 FAILURES 分开计：见 cleanup 里 MIN_CHECKS 的说明。
+CHECKS=0
 
 cleanup() {
   local rc=$?
@@ -76,6 +80,23 @@ cleanup() {
   fi
   if [ "$rc" -ne 0 ]; then
     exit "$rc"
+  fi
+  # **检查数下限**：FAILURES=0 有两种来源——真的全过，或者中途 `exit` 掉了
+  # 一批检查（探针名撞车、粘贴的 cookie 为空、set -e 撞上意外非零）。后者
+  # 走的也是这个 trap，此时 FAILURES 仍是 0，不设下限就会打印"全部通过"。
+  # 6 项 = ①(1) + ①b 声明值比对(1) + ①c 声明收件人订阅(1)
+  #        + ②(/callback 400、token_exchange_invalid_grant 日志 = 2)
+  #        + ③(探针进 ALARM = 1)。
+  # 计数点就在每项判定处 CHECKS=$((CHECKS + 1))，所以这个数是数出来的、
+  # 不是估的；新增检查项时必须同步加计数与本下限。
+  MIN_CHECKS=6
+  if [ "$CHECKS" -lt "$MIN_CHECKS" ]; then
+    # **`${VAR}` 的花括号在这里是必需的，不是风格**：紧跟变量名的是全角破折号，
+    # bash 会把它的首字节当成变量名的一部分（实测 `$MIN_CHECKS—` 报
+    # `MIN_CHECKS\xe2: unbound variable`），而 set -u 让 cleanup 当场中断。
+    echo "结果：只跑了 ${CHECKS} 项（预期 ≥${MIN_CHECKS}）—— 验收**未完成**，"
+    echo "      状态不可信：没有 FAIL 不等于全部通过（中途退出也会到这里）。"
+    exit 1
   fi
   # **不能笼统说"端到端可用"**：未给 SNS_TOPIC_ARN 时，探针 alarm 没有通知动作，
   # 这一轮只证明了"状态机会进 ALARM"，没证明有人被通知到（Codex 审查 P1）。
@@ -239,6 +260,185 @@ for b in bad:
 sys.exit(1 if bad else 0)
 PYCHK
 then :; else fail "配置核对未通过（见上面 FAIL 行）"; fi
+CHECKS=$((CHECKS + 1))
+
+echo
+echo "── ①b 线上配置 == alarm_pipeline.py 声明值 ────────"
+# 为什么要比对而不只看"存在"：手工改过的 alarm 与脚本声明的可能已漂移，
+# 而上面的"存在 + 上限"检查会全绿。真源只有一份，线上必须等于它。
+#
+# 声明值**从源码 AST 读，不 import**：alarm_pipeline 顶层 import boto3，而本
+# 脚本要能在没装 boto3 的环境跑（auth 借用 contract 的 venv，见 CLAUDE.md）；
+# 且 AST 路径用绝对路径，不依赖调用者的 CWD——sys.path.insert("site-builder/auth")
+# 那种相对写法只在仓库根目录跑时成立，从 scripts/ 里跑会 ModuleNotFound，
+# 而那会被下面的"读不到声明值"判成 FAIL（假红）。
+DECLARED="$(python3 - "$AUTH_DIR" <<'PY' || echo ''
+import ast, json, sys
+
+auth = sys.argv[1]
+
+def parse(name):
+    with open(f"{auth}/{name}", encoding="utf-8") as f:
+        return ast.parse(f.read())
+
+decl = {}
+for node in parse("alarm_pipeline.py").body:
+    if (isinstance(node, ast.Assign)
+            and getattr(node.targets[0], "id", "") in ("ALARM_PARAMS",
+                                                       "ALARM_DESCRIPTION")):
+        decl[node.targets[0].id] = ast.literal_eval(node.value)
+
+# deploy_auth.py 里那次调用的字面量实参就是"声明的资源名/维度"。
+kw = {}
+for node in ast.walk(parse("deploy_auth.py")):
+    if (isinstance(node, ast.Call)
+            and getattr(node.func, "id", "") == "ensure_alarm_pipeline"):
+        for k in node.keywords:
+            if isinstance(k.value, ast.Constant):
+                kw[k.arg] = k.value.value
+
+alarm = dict(decl["ALARM_PARAMS"])
+alarm["AlarmDescription"] = decl["ALARM_DESCRIPTION"]
+alarm["Namespace"] = kw["namespace"]
+alarm["MetricName"] = kw["metric_name"]
+print(json.dumps({"alarm": alarm, "alarm_name": kw["alarm_name"],
+                  "topic_name": kw["topic_name"],
+                  "filter_name": kw["filter_name"]}, sort_keys=True))
+PY
+)"
+CHECKS=$((CHECKS + 1))
+if [ -z "$DECLARED" ]; then
+  fail "读不到 alarm_pipeline.py / deploy_auth.py 的声明值——无法比对线上配置"
+  DECLARED_TOPIC_NAME=""
+else
+  PROD_ALARM="$(printf '%s' "$DECLARED" | python3 -c \
+    'import json,sys; print(json.load(sys.stdin)["alarm_name"])')"
+  DECLARED_TOPIC_NAME="$(printf '%s' "$DECLARED" | python3 -c \
+    'import json,sys; print(json.load(sys.stdin)["topic_name"])')"
+  LIVE="$(aws cloudwatch describe-alarms --region "$REGION" \
+            --alarm-names "$PROD_ALARM" --output json 2>/dev/null || echo '')"
+  # **aws CLI 在 API 错误时也可能 exit 0**（实测）——所以必须校验输出是合法 JSON
+  if ! printf '%s' "$LIVE" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+    fail "无法读取线上 alarm（输出非合法 JSON，可能是凭证/网络问题）"
+  else
+    # $LIVE 作为 argv 传入复用——**不要在 python 里重新调 aws CLI**：那次重查
+    # 不带 --region，会打到默认 region（与 config.ini 不同时报 0 个 alarm 的
+    # 假失败，或比较到另一区域的同名 alarm）。
+    # （不用 stdin 传：heredoc 已占用 stdin。）
+    if python3 - "$DECLARED" "$LIVE" "$ACCOUNT_ID" <<'PY'
+import json, sys
+declared = json.loads(sys.argv[1])
+live = json.loads(sys.argv[2])["MetricAlarms"]
+account_id = sys.argv[3]
+if len(live) != 1:
+    print(f"  线上 alarm 数量为 {len(live)}，期望 1")
+    sys.exit(1)
+a = live[0]
+bad = []
+for k, v in declared["alarm"].items():
+    got = a.get(k)
+    if k in ("Threshold", "Period", "EvaluationPeriods"):
+        ok = got is not None and float(got) == float(v)
+    else:
+        ok = got == v
+    if not ok:
+        bad.append(f"{k}: 线上={got!r} 声明={v!r}")
+# **AlarmActions/OKActions 必须等于声明的 topic ARN**——只验"两者相等且非空"
+# 会漏掉"同时漂移到另一个 topic"的假绿：actions 指向 topic-B，而下面的订阅
+# 检查在查声明的 topic-A，两段各自 PASS 但互不相干。
+#
+# ARN 从 **alarm 自己的 ARN** 取 region/account（而不是拼 config.ini 的值）：
+# 这样比对的是"这个 alarm 所在账号里那个声明名字的 topic"，跨账号凭证错配时
+# 不会因为账号号码来源不同而假绿。同时核对它确实是本平台账号。
+region, acct = a["AlarmArn"].split(":")[3], a["AlarmArn"].split(":")[4]
+if acct != account_id:
+    bad.append(f"alarm 所在账号 {acct} != config.ini 的 {account_id}"
+               "——比对的可能不是本平台的资源")
+expected_topic = f"arn:aws:sns:{region}:{acct}:{declared['topic_name']}"
+if a.get("AlarmActions") != [expected_topic]:
+    bad.append(f"AlarmActions={a.get('AlarmActions')} 期望=[{expected_topic}]")
+if a.get("OKActions") != [expected_topic]:
+    bad.append(f"OKActions={a.get('OKActions')} 期望=[{expected_topic}]")
+if bad:
+    print("  线上 alarm 与声明值漂移：")
+    for b in bad:
+        print(f"          {b}")
+    sys.exit(1)
+print("PASS  线上 alarm 配置 == alarm_pipeline.py 声明值"
+      "（含双语描述、Alarm/OK actions == 声明 topic）")
+PY
+    then :; else fail "线上 alarm 与 alarm_pipeline.py 声明值不一致（见上面明细）"; fi
+  fi
+fi
+
+echo
+echo "── ①c 声明收件人的 SNS 订阅必须已确认 ────────────"
+# 只查"存在任意 confirmed email"有假绿：告警邮箱从 old@ 换成 new@ 后，
+# old 仍 confirmed、new 还在 PendingConfirmation——"存在 1 个 confirmed"
+# 照样 PASS，而声明的新收件人收不到任何通知。必须绑定 Endpoint == 声明值。
+DECLARED_EMAIL="$(python3 - "$CFG" <<'PY' || echo ''
+import configparser, os, sys
+env = os.environ.get("SB_ALERT_EMAIL", "").strip()
+if env:
+    print(env)
+    sys.exit(0)
+c = configparser.ConfigParser(interpolation=None)
+c.read(sys.argv[1])
+raw = c["Alerting"].get("email", "") if c.has_section("Alerting") else ""
+print(raw.split("#")[0].split(";")[0].strip())
+PY
+)"
+# **topic ARN 自己拼，不调 `aws sns create-topic`**：那个调用虽然对已存在的
+# topic 是幂等的，但在 topic 不存在时会**真的建一个**——验收脚本必须只读，
+# 否则"topic 缺失"这个应当 FAIL 的状态会被脚本自己顺手修好并判 PASS。
+if [ -n "$DECLARED_TOPIC_NAME" ]; then
+  DECLARED_TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT_ID}:${DECLARED_TOPIC_NAME}"
+else
+  DECLARED_TOPIC_ARN=""
+fi
+CHECKS=$((CHECKS + 1))
+if [ -z "$DECLARED_EMAIL" ]; then
+  fail "无法读取声明的告警邮箱（config.ini [Alerting] email 或 SB_ALERT_EMAIL）"
+elif [ -z "$DECLARED_TOPIC_ARN" ]; then
+  fail "无法解析声明的 SNS topic ARN（上一段没读到 topic_name）"
+else
+  # 分页完整：list-subscriptions-by-topic 单页 100 条，aws cli 不加
+  # --no-paginate 时自动翻页，但 --query 的 length() 只作用于合并结果——
+  # 用 json 输出交给 python 数，顺带把"状态"算清楚。
+  SUBS_JSON="$(aws sns list-subscriptions-by-topic --region "$REGION" \
+                 --topic-arn "$DECLARED_TOPIC_ARN" --output json 2>/dev/null || echo '')"
+  # email 与订阅 JSON **都走 argv**，两个各有理由：
+  # ① email 不做 shell 插值进 python 源码——邮箱里的引号或换行会把脚本拼坏；
+  # ② 订阅 JSON 不能用管道喂 stdin——**heredoc 已经占用了 stdin**（python 的
+  #    脚本正是从它读的），管道进来的内容永远不会被 json.load 看到，于是这项
+  #    检查恒为 error。这是本文件里第二次踩同一个坑，写法统一成 argv。
+  SUB_STATE="$(python3 - "$DECLARED_EMAIL" "$SUBS_JSON" <<'PY' 2>/dev/null || echo error
+import json, sys
+declared = sys.argv[1].strip()
+subs = json.loads(sys.argv[2]).get("Subscriptions", [])
+mine = [s for s in subs
+        if s.get("Protocol") == "email" and s.get("Endpoint") == declared]
+if any(s.get("SubscriptionArn", "").startswith("arn:") for s in mine):
+    print("confirmed")
+elif mine:
+    print("pending")
+else:
+    print("absent")
+PY
+)"
+  case "$SUB_STATE" in
+    confirmed)
+      echo "PASS  声明收件人（[Alerting] email）在声明 topic 下的订阅已确认" ;;
+    pending)
+      fail "声明收件人的订阅还在 PendingConfirmation——必须点确认链接"
+      echo "      （其他历史收件人是否 confirmed 与本项无关：换邮箱后旧的"
+      echo "       仍 confirmed 会造成假绿，所以只认声明的那一个）" ;;
+    absent)
+      fail "声明 topic 下没有声明收件人的订阅——先跑 deploy_auth.py" ;;
+    *)
+      fail "订阅状态查询失败（凭证/网络/topic 不存在），不能当作通过" ;;
+  esac
+fi
 
 echo
 echo "── ② 触发一次真实 invalid_grant ──────────────────"
@@ -280,12 +480,14 @@ CODE="$(curl -s -o /dev/null -w '%{http_code}' \
   "https://auth.$BASE_DOMAIN/callback")"
 unset STATE
 echo "  /callback 返回 $CODE"
+CHECKS=$((CHECKS + 1))
 [ "$CODE" = "400" ] || fail "期望 400（不是 502），实际 $CODE"
 
 # 关键判读：400 有两种来源，必须区分。cookie 没送到时是"登录状态已过期"分支，
 # 那条路径不碰 Cognito，也就不会有 token_exchange_invalid_grant 日志。
 echo "  等日志落盘后确认走的是 token 交换分支（而非 cookie 缺失分支）…"
 sleep 20
+CHECKS=$((CHECKS + 1))
 if aws logs filter-log-events --region "$REGION" --log-group-name "$LOG_GROUP" \
      --start-time "$START_MS" \
      --filter-pattern '{ $.event = "token_exchange_invalid_grant" }' \
@@ -349,6 +551,7 @@ for _ in $(seq 1 12); do
   [ "$STATE_VAL" = "ALARM" ] && break
   sleep 15
 done
+CHECKS=$((CHECKS + 1))
 if [ "$STATE_VAL" = "ALARM" ]; then
   echo "PASS  alarm 进入 ALARM"
   [ -n "${SNS_TOPIC_ARN:-}" ] && \

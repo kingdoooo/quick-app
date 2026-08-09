@@ -424,43 +424,55 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    所需的属性读取权限"——后者是**每个用户每次登录都失败**的配置事故，而两者
    在响应里无法可靠区分，所以代码统一返回用户可读的 400。
    区分靠的是**频率**：偶发几条是正常的用户行为，持续高频就是配置写坏。
-   auth 服务已按 `{"event":"token_exchange_invalid_grant",...}` 打结构化日志，
-   部署后建一个 metric filter + 阈值告警：
+   auth 服务已按 `{"event":"token_exchange_invalid_grant",...}` 打结构化日志。
+   **告警管道由 `deploy_auth.py` 幂等声明式收敛，不要手工建**（M3 前置 B2）。
 
-   ```bash
-   aws logs put-metric-filter --region us-east-1 \
-     --log-group-name /aws/lambda/site-auth-service \
-     --filter-name auth-invalid-grant \
-     --filter-pattern '{ $.event = "token_exchange_invalid_grant" }' \
-     --metric-transformations \
-       metricName=AuthInvalidGrant,metricNamespace=SiteBuilder,metricValue=1
-   ```
+   唯一配置真源是 `site-builder/auth/alarm_pipeline.py`：日志组与保留期、
+   metric filter、SNS topic、email 订阅、alarm（含双语 AlarmDescription 与
+   Alarm/OK actions）全部在那里声明；资源名与维度是 `deploy_auth.py` 里那次
+   `ensure_alarm_pipeline(...)` 调用的字面量实参。改阈值就改 `ALARM_PARAMS`
+   然后重跑 `cd site-builder/auth && python3 deploy_auth.py`。
 
-   然后建告警（**阈值必须按你的真实流量定**，见下）：
+   > 刻意**不称其为 IaC**：没有状态文件、没有漂移检测、没有依赖图。它只是
+   > 每次运行都把这几样资源收敛到声明值的幂等脚本，与 `deploy_auth.py`
+   > 其余部分同模式。
 
-   ```bash
-   aws cloudwatch put-metric-alarm --region us-east-1 \
-     --alarm-name site-builder-auth-invalid-grant \
-     --alarm-description '【中文】Site Builder 登录授权码交换持续失败。触发条件：连续 2 个 5 分钟周期，每个周期 AuthInvalidGrant >= 1。可能影响：用户可能无法登录。常见原因：授权码过期/重放、Cognito App Client 属性读取权限或 OAuth client/grant/redirect URI 配置错误。ALARM=告警触发；OK=告警解除（仅表示指标不再满足阈值，告警规则仍启用，不代表根因已确认修复；缺失数据按 notBreaching 处理）。【English】Site Builder OAuth authorization-code exchanges are failing continuously. Threshold: AuthInvalidGrant >= 1 in each of 2 consecutive 5-minute periods. ALARM=condition breached; OK=alarm condition cleared. The alarm remains enabled, and OK does not confirm root-cause resolution because missing data is treated as notBreaching.' \
-     --namespace SiteBuilder --metric-name AuthInvalidGrant \
-     --statistic Sum --period 300 --evaluation-periods 2 \
-     --threshold 1 --comparison-operator GreaterThanOrEqualToThreshold \
-     --treat-missing-data notBreaching \
-     --alarm-actions <SNS topic ARN> \
-     --ok-actions <SNS topic ARN>
-   ```
+   **不要再手工 `aws logs put-metric-filter` / `aws cloudwatch put-metric-alarm`**
+   ——那会造出第二个 writer，两份配置互相漂移。尤其注意 `put-metric-filter`
+   的 upsert 键是 `filterName`：**换个名字不是改名，而是在同一日志组上再建
+   一个 filter**，两个 filter 都往 `SiteBuilder/AuthInvalidGrant` 发点，
+   同一条日志被计两次（Sum 翻倍）。现网那个手工 filter 名为
+   `auth-invalid-grant`，脚本就照这个名字收编它。
 
-   **建完用脚本验收**（"日志打了/metric 有点了"不等于"alarm 会响"）：
+   前提：`config.ini` 的 `[Alerting] email` 已填（gitignored），或设
+   `SB_ALERT_EMAIL` 环境变量。缺失时脚本**响亮失败**，不会静默造出一个没人
+   收通知的 alarm。
+
+   ⚠️ **email 订阅必须由收件人手工点确认链接**——脚本只能创建订阅。未确认时
+   alarm 照样进 ALARM 而无人知情，所以脚本把 `PendingConfirmation` 显式报告
+   为「未完成」。
+
+   ⚠️ **首次在存量环境运行会修剪日志**：脚本把日志组保留期收敛到 30 天
+   （母 spec §6.3 的统一值）。现网原为 90 天，**超过 30 天的日志会被标记删除
+   并在约 72 小时内物理删除，事后把保留期调回去也找不回**。这是有意的动作，
+   不是附带效果：执行前先确认 30-90 天窗口的日志无排查/审计价值，否则先
+   `aws logs create-export-task` 导出。
+
+   **从零部署验收**（"日志打了/metric 有点了"不等于"alarm 会响"）：
 
    ```bash
    SNS_TOPIC_ARN=<topic ARN> ./site-builder/scripts/verify_auth_alarm.sh
    ```
 
-   它检查正式配置存在、触发一次真实 `invalid_grant`、**确认日志里出现
-   `token_exchange_invalid_grant`**（不然测到的是 cookie 缺失分支的 400，
+   它**比对线上配置 == 声明值**（阈值/双语描述/Alarm 与 OK actions 都等于声明的
+   topic ARN，声明值由 AST 解析上述两个文件得出，脚本里不复制第二份字面量）、
+   要求存在**声明的那个收件人**的 confirmed 订阅（别人的 confirmed 不算、
+   `PendingConfirmation` 判 FAIL）、触发一次真实 `invalid_grant`、**确认日志里
+   出现 `token_exchange_invalid_grant`**（不然测到的是 cookie 缺失分支的 400,
    不是目标逻辑）、建临时 1/1 阈值探针 alarm 验证真的进 ALARM，然后自动清理
-   （trap 保证异常路径也清）。最后一步仍需人工：去 SNS 订阅端确认收到通知——
-   **topic 没有订阅或订阅未确认时 alarm 照样进 ALARM 而无人知情**。
+   （trap 保证异常路径也清）。脚本全程只读线上状态——**不调
+   `aws sns create-topic`**，否则"topic 缺失"这个该 FAIL 的状态会被脚本自己
+   顺手修好并判 PASS。
 
    `OK` 通知统一称为**告警解除**：它只表示最近指标不再满足 ALARM 条件，告警规则
    仍然存在并持续监控；由于缺失数据按 `notBreaching` 处理，`OK` 也不等于已经确认
@@ -965,7 +977,7 @@ RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/tes
 
 - [ ] admin 种子已注入（`seed_admin.py --apply`，在 ④ 之后）
 - [ ] `require_idp_claim = true` 且部署出去的 Edge 代码已核对（零占位符）
-- [ ] 登录失败告警已建（metric filter + alarm，阈值按真实流量定）
+- [ ] 登录失败告警由 `deploy_auth.py` 自动收敛（**不手工建**），且 `verify_auth_alarm.sh` 全绿（含声明收件人的 confirmed 订阅）
 - [ ] 自己走过一次真实登录，claim 值与 ① 的实测基线一致
 
 SSM 参数：`/site-builder/jwt-secret`（§0 手工建）、`/site-builder/site-client-secret`（① 的 `deploy_pool.py` 写入）。

@@ -5,6 +5,7 @@ token，部署 MCP 的 owner 识别依赖它）。幂等可重跑。"""
 import configparser
 import io
 import json
+import os
 import re
 import secrets
 import subprocess
@@ -13,6 +14,8 @@ import zipfile
 from pathlib import Path
 
 import boto3
+
+from alarm_pipeline import ensure_alarm_pipeline
 
 CFG = configparser.ConfigParser()
 CFG.read(Path(__file__).parent.parent / "config.ini")
@@ -133,7 +136,47 @@ def main():
         "require_auth": {"BOOL": False}, "allowed_users": {"S": "org"},
         "owner": {"S": "platform"}})
     ensure_pre_token_trigger(role_arn)
+    # 登录失败告警：**本脚本是唯一配置真源**（M3 前置 B2）。
+    # 现网那套原本是手工建的；同名 upsert 收编，从此只有一个 writer。
+    #
+    # **filter_name 必须字节级等于现网那个手工 filter 的名字**（实测现网是
+    # `auth-invalid-grant`，而 alarm 是 `site-builder-auth-invalid-grant`
+    # ——两者本来就不同名）。put_metric_filter 的 upsert 键是 filterName：
+    # 换个名字不是"改名"，而是在同一日志组上**再建一个** filter。后果不是
+    # 多一个闲置资源：两个 filter 都往 SiteBuilder/AuthInvalidGrant 发点，
+    # 同一条日志被计两次（Sum 翻倍），而手工那个仍在——"只有一个 writer"
+    # 当场失效，正是本次收编要消灭的状态。
+    result = ensure_alarm_pipeline(
+        region=REGION, log_group=f"/aws/lambda/{FN}",
+        namespace="SiteBuilder", metric_name="AuthInvalidGrant",
+        filter_name="auth-invalid-grant",
+        filter_pattern='{ $.event = "token_exchange_invalid_grant" }',
+        topic_name="site-builder-alarms",
+        alarm_name="site-builder-auth-invalid-grant",
+        email=_alert_email(), account_id=CFG["Platform"]["account_id"])
+    print(f"  告警管道已收敛：{', '.join(result['changed'])}")
+    if result["subscription_state"] != "confirmed":
+        # **不能只打印一行提示**：未确认的订阅意味着 alarm 会进 ALARM 而
+        # 无人收到通知——那是这套告警要防的盲区本身。
+        print(f"⚠️  email 订阅状态：{result['subscription_state']}"
+              f"（**未完成**）——收件人必须点确认链接，否则告警无人知情。"
+              f"确认后重跑本脚本或用 verify_auth_alarm.sh 核对。")
     print(f"auth-service: {url}  →  https://auth.{BASE}/")
+
+
+def _alert_email() -> str:
+    """告警收件人：环境变量优先（CI），否则 config.ini [Alerting] email。
+
+    **不能有默认值**：默认到某个邮箱是错的（发给不相关的人），默认到空串
+    会让 ensure_alarm_pipeline 抛错——那正是我们要的响亮失败。
+    """
+    env = os.environ.get("SB_ALERT_EMAIL", "").strip()
+    if env:
+        return env
+    if CFG.has_section("Alerting"):
+        raw = CFG["Alerting"].get("email", "")
+        return raw.split("#")[0].split(";")[0].strip()
+    return ""
 
 
 def _require_email_verified_cfg() -> str:
