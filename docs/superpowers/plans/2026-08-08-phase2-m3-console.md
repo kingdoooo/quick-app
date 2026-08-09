@@ -150,6 +150,8 @@ Task 14,15 → Task 16 (全量回归 + 文档收尾)
 
 **为什么不能照抄 `_rollback_job_to_pending` 的条件**：那个函数要求 `#s = :running AND phase = :queued`——它保护的是"我刚写进去、SFN 没碰过"的状态。而 TIMED_OUT / ABORTED 可以发生在**任意 phase**（validate / package / register-route…），带 `phase=queued` 条件会让绝大多数真实卡死场景收敛失败。
 
+**`STATE_MACHINE_ARN` 必须每次调用读环境变量，不做模块级常量**（Task 1 实施期发现）：Lambda 里两种写法都能跑（env 在 import 前就绪），但模块级快照在 pytest 里永远是空字符串——测试模块顶部的 `import reconcile_job` 发生在 `aws` fixture 的 `monkeypatch.setenv` **之前**。而守卫是 `if expected_arn and sm_arn != expected_arn`，空串直接短路，于是"外来状态机必须被拒"这条纵深防线成了**永不被验证的死代码**（正是本项目"验证本身无效"的同一类问题）。写成 `_state_machine_arn()` 函数，`handler` 与 `sweeper_handler` 都走它（sweeper 在循环外取一次复用）。
+
 - [ ] **Step 1: 写失败测试（收敛矩阵）**
 
 创建 `site-builder/deployer/tests/test_reconcile_job.py`：
@@ -508,15 +510,24 @@ def sweeper_handler(event, context):
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cd site-builder/deployer && .venv/bin/pytest tests/test_reconcile_job.py -q`
-Expected: PASS（21 个用例：2 + 9 + 3 + 1 + 1 + 1 + 1 + 4 sweeper）
+Expected: PASS（**22** 个用例：2 + 9 + 3 + 1 + 1 + 1 + 1 + 4 sweeper = 22——早先写 21 是算术笔误）
 
 - [ ] **Step 5: 反向验证——确认测试在缺陷存在时会红**
 
 三处各改一次，每次跑测试确认 FAIL，然后**还原**：
 
-1. 把 `ConditionExpression` 里的 `attribute_exists(job_id) AND ` 删掉 →
+1. 把 `ConditionExpression` **整条**删掉（并同步删掉随之不再被引用的
+   `:running` 值，否则 DynamoDB 先报 `ValidationException:
+   ExpressionAttributeValues unused`——那是变异操作的假象而不是缺陷信号）→
    Run: `.venv/bin/pytest tests/test_reconcile_job.py::test_absent_job_is_not_created -q`
-   Expected: **FAIL**（凭空建了 job）
+   Expected: **FAIL**（`assert 'converged' == 'absent'`，凭空建了 job）
+
+   **不要只删 `attribute_exists(job_id) AND `**（Task 1 实施期实测修正）：
+   剩下的 `#s = :running` 在 item 不存在时比较缺失属性 → 条件求值 false →
+   条件检查照样失败，upsert 不发生，用例仍然 **PASS**。即防"凭空建行"的
+   承重条件是 `#s = :running`，`attribute_exists(job_id)` 是冗余的第二道锁
+   （保留它有价值：将来有人把 `#s = :running` 改宽或删掉时它仍能挡住 upsert）
+   ——但**不能把它当成被单测覆盖的防线**。
 2. 在 `ConditionExpression` 末尾加 ` AND phase = :queued`（并加对应 value）→
    Run: `.venv/bin/pytest tests/test_reconcile_job.py::test_converges_from_any_phase -q`
    Expected: **FAIL**（除 queued 外 8 个 phase 全部收敛失败）
@@ -551,7 +562,7 @@ RUNNING 且 confirm_upload 只收 PENDING 导致无法重试。
 - 兜底层：sweeper 扫超龄 RUNNING + DescribeExecution 核对，orphan 不猜终态
 
 条件更新不带 phase=queued（timeout/abort 可发生在任意 phase），
-带 attribute_exists(job_id) 防 UpdateItem 凭空建行。21 个用例含反向验证。"
+带 attribute_exists(job_id) 作为纵深第二道锁。22 个用例含反向验证。"
 ```
 
 ---
