@@ -1071,7 +1071,14 @@ import alarm_pipeline
 
 ARGS = dict(region="us-east-1", log_group="/aws/lambda/site-auth-service",
             namespace="SiteBuilder", metric_name="AuthInvalidGrant",
-            filter_name="site-builder-auth-invalid-grant",
+            # **filter_name 必须字节级等于现网那个手工 filter 的名字**——实测现网
+        # 是 `auth-invalid-grant`（而 alarm 才叫 site-builder-auth-invalid-grant，
+        # 两者本来就不同名）。put_metric_filter 的 upsert 键是 filterName：
+        # 换个名字不是"改名"，而是在同一日志组上**再建一个** filter，两个都往
+        # SiteBuilder/AuthInvalidGrant 发点、同一条日志计两次（Sum 翻倍），
+        # 而手工那个仍在——"只有一个 writer"当场失效，正是本次收编要消灭的状态。
+        # 接入其他环境前先 `aws logs describe-metric-filters` 查实际名字。
+        filter_name="auth-invalid-grant",
             filter_pattern='{ $.event = "token_exchange_invalid_grant" }',
             topic_name="site-builder-alarms",
             alarm_name="site-builder-auth-invalid-grant",
@@ -1478,7 +1485,14 @@ def _alert_email() -> str:
     result = ensure_alarm_pipeline(
         region=REGION, log_group=f"/aws/lambda/{FN}",
         namespace="SiteBuilder", metric_name="AuthInvalidGrant",
-        filter_name="site-builder-auth-invalid-grant",
+        # **filter_name 必须字节级等于现网那个手工 filter 的名字**——实测现网
+        # 是 `auth-invalid-grant`（而 alarm 才叫 site-builder-auth-invalid-grant，
+        # 两者本来就不同名）。put_metric_filter 的 upsert 键是 filterName：
+        # 换个名字不是"改名"，而是在同一日志组上**再建一个** filter，两个都往
+        # SiteBuilder/AuthInvalidGrant 发点、同一条日志计两次（Sum 翻倍），
+        # 而手工那个仍在——"只有一个 writer"当场失效，正是本次收编要消灭的状态。
+        # 接入其他环境前先 `aws logs describe-metric-filters` 查实际名字。
+        filter_name="auth-invalid-grant",
         filter_pattern='{ $.event = "token_exchange_invalid_grant" }',
         topic_name="site-builder-alarms",
         alarm_name="site-builder-auth-invalid-grant",
