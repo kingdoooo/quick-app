@@ -656,13 +656,39 @@ def test_sweeper_schedule_is_every_30_minutes(template):
     assert len(sched) == 1, "sweeper 必须有 30 分钟定时触发"
 
 
-def test_reconciler_role_is_narrow(template):
-    """不得复用 exec_role：只允许 jobs 表条件更新 + DescribeExecution + 日志。"""
+def _narrow_policy(template):
     policies = _resources(template, "AWS::IAM::Policy")
     recon = [p for p in policies.values()
              if "states:DescribeExecution" in str(p["Properties"])]
     assert len(recon) == 1, "reconciler 应有独立的 inline policy"
-    doc = str(recon[0]["Properties"]["PolicyDocument"])
+    return recon[0]
+
+
+def test_reconciler_functions_actually_use_the_narrow_role(template):
+    """两个 reconciler 函数**真的挂在**那个窄角色上。
+
+    **这条不能省**（Task 2 实施期实测）：只断言"窄 policy 存在"挡不住本任务
+    最可能的退化方式——把 `role=recon_role` 改回 `role=exec_role` 时，
+    `recon_role` 构造仍在、窄 policy 照样 synth 出来，于是
+    `test_reconciler_role_is_narrow` 照样绿，而两个函数已经挂上了带
+    `dynamodb:*` / `iam:*` / Lambda 建删的 exec_role。
+    从窄 policy 的 Roles 反查角色逻辑 ID 再比对函数的 Role——不写死 CDK
+    生成的哈希后缀，也不写死字面量 ARN。
+    """
+    role_refs = _narrow_policy(template)["Properties"]["Roles"]
+    assert len(role_refs) == 1
+    role_lid = role_refs[0]["Ref"]
+    fns = {f["Properties"].get("FunctionName"): f["Properties"]["Role"]
+           for f in _resources(template, "AWS::Lambda::Function").values()
+           if isinstance(f["Properties"].get("FunctionName"), str)}
+    for name in ("site-deployer-reconcile-job", "site-deployer-sweep-jobs"):
+        assert fns.get(name) == {"Fn::GetAtt": [role_lid, "Arn"]}, \
+            f"{name} 没有用窄角色（很可能被改回了 exec_role）"
+
+
+def test_reconciler_role_is_narrow(template):
+    """不得复用 exec_role：只允许 jobs 表条件更新 + DescribeExecution + 日志。"""
+    doc = str(_narrow_policy(template)["Properties"]["PolicyDocument"])
     for forbidden in ("iam:CreateRole", "iam:PutRolePolicy",
                       "lambda:CreateFunction", "codebuild:StartBuild",
                       "dsql:DbConnectAdmin", "s3:PutObject",
@@ -693,7 +719,7 @@ cd site-builder/deployer && \
 PYTHONPATH="$PWD/infra/.venv/lib/python3.12/site-packages" SB_CDK_TESTS=1 \
   .venv/bin/pytest tests/test_infra_reconciler.py -q
 ```
-Expected: FAIL —— 7 个用例全红（无 Events::Rule、无 SQS、handler 不存在）
+Expected: FAIL —— 全部用例红（无 Events::Rule、无 SQS、handler 不存在）
 
 - [ ] **Step 3: 在 `infra/app.py` 加 reconciler 定义**
 
@@ -788,14 +814,22 @@ cd site-builder/deployer && \
 PYTHONPATH="$PWD/infra/.venv/lib/python3.12/site-packages" SB_CDK_TESTS=1 \
   .venv/bin/pytest tests/test_infra_reconciler.py -q
 ```
-Expected: PASS（7 个用例）
+Expected: PASS（7 个断言函数）
 
 - [ ] **Step 5: 反向验证 CDK 断言**
 
 1. 把 rule 的 `detail` 里 `"stateMachineArn": [sm.state_machine_arn]` 删掉 →
    Expected: `test_rule_matches_only_terminal_statuses_of_this_state_machine` **FAIL**
-2. 把 `recon_role` 换成 `exec_role` →
-   Expected: `test_reconciler_role_is_narrow` **FAIL**
+2. 把两个 `recon_fn(...)` 调用里的 `role=recon_role` 改成 `role=exec_role` →
+   Expected: `test_reconciler_functions_actually_use_the_narrow_role` **FAIL**
+   （`AssertionError: … 没有用窄角色（很可能被改回了 exec_role）`），
+   而 `test_reconciler_role_is_narrow` **仍然绿**——后者只验"窄 policy 存在"，
+   `recon_role` 构造还在就照样 synth 出来。**这个绿本身就是缺陷信号**，
+   正是必须加第 4 条断言的原因（Task 2 实施期实测）。
+   另一形态（`recon_role = exec_role` 整体别名掉）不会给出干净的断言失败，
+   而是 CDK 自己抛 `Template is undeployable … dependency cycle`
+   （reconciler policy 加到 exec_role 上会把状态机拉进环）——那是"撞墙即拦"，
+   证明不了断言有效性，不要用它做反向验证。
 3. 把 `dead_letter_queue=dlq` 删掉 →
    Expected: `test_rule_target_has_dlq_and_retry` **FAIL**
 
