@@ -30,6 +30,13 @@ class SiteDeployerStack(Stack):
             index_name="owner-index",
             partition_key=ddb.Attribute(name="owner", type=ddb.AttributeType.STRING),
             sort_key=ddb.Attribute(name="created_at", type=ddb.AttributeType.STRING))
+        # 二期 M3：控制台的"部署历史"按 site_id 查。owner-index 是**发起者**
+        # 维度（jobs.owner = requested_by），查不出"这个站点的所有部署"——
+        # 协作者发起的部署 owner 是协作者。
+        jobs.add_global_secondary_index(
+            index_name="site-index",
+            partition_key=ddb.Attribute(name="site_id", type=ddb.AttributeType.STRING),
+            sort_key=ddb.Attribute(name="created_at", type=ddb.AttributeType.STRING))
         sites = ddb.Table(self, "Sites", table_name="site-sites",
                           partition_key=ddb.Attribute(name="site_id", type=ddb.AttributeType.STRING),
                           billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
@@ -49,6 +56,25 @@ class SiteDeployerStack(Stack):
                                                        type=ddb.AttributeType.STRING),
                            billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
                            removal_policy=RemovalPolicy.RETAIN)
+
+        # 二期 M3：操作审计（append-only）。写入方只被授予 PutItem。
+        # RETAIN 与 admins 同理：审计记录误删会丢失合规证据。
+        ops_log = ddb.Table(
+            self, "OpsLog", table_name="site-ops-log",
+            partition_key=ddb.Attribute(name="target", type=ddb.AttributeType.STRING),
+            sort_key=ddb.Attribute(name="ts_actor", type=ddb.AttributeType.STRING),
+            billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
+            time_to_live_attribute="expires_at",
+            removal_policy=RemovalPolicy.RETAIN)
+
+        # 二期 M3：面板会话升级的一次性 code 消费标记（jti）。
+        # DESTROY（不同于 ops_log）：60 秒 TTL 的一次性标记，删栈丢掉无害。
+        session_codes = ddb.Table(
+            self, "SessionCodes", table_name="site-session-codes",
+            partition_key=ddb.Attribute(name="jti", type=ddb.AttributeType.STRING),
+            billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
+            time_to_live_attribute="expires_at",
+            removal_policy=RemovalPolicy.DESTROY)
 
         artifacts = s3.Bucket(self, "Artifacts", bucket_name=f"site-artifacts-{ACCOUNT}",
                               block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
@@ -148,6 +174,8 @@ class SiteDeployerStack(Stack):
 
         for k, v in {"JobsTable": jobs.table_name, "SitesTable": sites.table_name,
                      "AdminsTable": admins.table_name,
+                     "OpsLogTable": ops_log.table_name,
+                     "SessionCodesTable": session_codes.table_name,
                      "ArtifactsBucket": artifacts.bucket_name,
                      "PackageProjectName": package_project.project_name,
                      "ExecRoleArn": exec_role.role_arn,
@@ -160,6 +188,7 @@ class SiteDeployerStack(Stack):
         common_env = {
             "JOBS_TABLE": jobs.table_name, "SITES_TABLE": sites.table_name,
             "ADMINS_TABLE": admins.table_name,
+            "OPS_LOG_TABLE": ops_log.table_name,
             "ARTIFACTS_BUCKET": artifacts.bucket_name,
             "FRONTEND_BUCKET": f"site-frontend-{ACCOUNT}",
             "ROUTING_TABLE": CFG["Platform"]["routing_table"],

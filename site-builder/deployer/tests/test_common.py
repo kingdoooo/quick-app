@@ -90,3 +90,45 @@ def test_list_sites_for_user_dedups(aws):
     common.upsert_site("s-1", owner="me@x.com", collaborators=["me@x.com"])
     got = [s["site_id"] for s in common.list_sites_for_user("me@x.com")]
     assert got == ["s-1"]
+
+
+def test_list_jobs_by_site_returns_newest_first(aws):
+    for jid, ts in [("job-1", "2026-06-01T00:00:00+00:00"),
+                    ("job-2", "2026-07-01T00:00:00+00:00"),
+                    ("job-3", "2026-05-01T00:00:00+00:00")]:
+        common._table("JOBS_TABLE").put_item(Item={
+            "job_id": jid, "site_id": "sx", "owner": "u@x.com",
+            "status": "SUCCEEDED", "phase": "smoke-test", "error": "", "url": "",
+            "created_at": ts, "updated_at": ts})
+    # 另一个站点的 job 不得混入
+    common._table("JOBS_TABLE").put_item(Item={
+        "job_id": "job-other", "site_id": "sy", "owner": "u@x.com",
+        "status": "SUCCEEDED", "phase": "smoke-test", "error": "", "url": "",
+        "created_at": "2026-08-01T00:00:00+00:00",
+        "updated_at": "2026-08-01T00:00:00+00:00"})
+    jobs = common.list_jobs_by_site("sx")
+    assert [j["job_id"] for j in jobs] == ["job-2", "job-1", "job-3"]
+
+
+def test_create_site_record_collision_raises_and_writes_nothing(aws):
+    """碰撞必须抛 SiteIdCollision，且已有站点的**每个字段**原样不动。"""
+    import pytest
+    common._table("SITES_TABLE").put_item(Item={
+        "site_id": "victim-abc123", "owner": "victim@x.com",
+        "name": "victim", "status": "ACTIVE",
+        "created_at": "2026-01-01T00:00:00+00:00"})
+    with pytest.raises(common.SiteIdCollision):
+        common.create_site_record("victim-abc123",
+                                  owner="attacker@x.com", name="attacker")
+    site = common.get_site("victim-abc123")
+    assert site["owner"] == "victim@x.com"      # 不只 created_at——
+    assert site["name"] == "victim"             # owner/name/status 全部
+    assert site["status"] == "ACTIVE"           # 必须原样（假绿教训）
+    assert site["created_at"] == "2026-01-01T00:00:00+00:00"
+
+
+def test_create_site_record_writes_full_record_once(aws):
+    common.create_site_record("s-new", owner="u@x.com", name="fresh")
+    site = common.get_site("s-new")
+    assert site["owner"] == "u@x.com" and site["status"] == "DEPLOYING"
+    assert site["created_at"]

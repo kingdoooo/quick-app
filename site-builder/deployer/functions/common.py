@@ -87,6 +87,21 @@ def list_jobs_by_owner(owner: str) -> list[dict]:
     return resp.get("Items", [])
 
 
+def list_jobs_by_site(site_id: str, limit: int = 50) -> list[dict]:
+    """某站点的部署历史，**最新在前**（控制台"部署历史"标签页）。
+
+    用 site-index 而非 owner-index：后者是**发起者**维度
+    （jobs.owner = requested_by），协作者发起的部署 owner 是协作者，
+    按 owner 查不出"这个站点的所有部署"。
+    """
+    resp = _table("JOBS_TABLE").query(
+        IndexName="site-index",
+        KeyConditionExpression=Key("site_id").eq(site_id),
+        ScanIndexForward=False,    # created_at 倒序
+        Limit=limit)
+    return resp.get("Items", [])
+
+
 def upsert_site(site_id: str, **attrs) -> None:
     if not attrs:
         return
@@ -96,6 +111,48 @@ def upsert_site(site_id: str, **attrs) -> None:
         UpdateExpression="SET " + ", ".join(f"#{k} = :{k}" for k in attrs),
         ExpressionAttributeNames=names,
         ExpressionAttributeValues={f":{k}": v for k, v in attrs.items()})
+
+
+class SiteIdCollision(Exception):
+    """site_id 已被占用。建站路径捕获它并重新生成 ID。"""
+
+
+def create_site_record(site_id: str, *, owner: str, name: str,
+                       status: str = "DEPLOYING") -> None:
+    """**首次**建站：单次条件 UpdateItem 写整条记录，已存在即抛 SiteIdCollision。
+
+    条件必须是 `attribute_not_exists(site_id)` 且**一次写完整条**——不能拆成
+    "条件写 created_at + 无条件 upsert_site(owner/name/…)"两步：第一步条件
+    失败被吞后，第二步会把**已有站点**的 owner/name/status 覆盖成本次调用者，
+    随机 ID 碰撞就变成误接管（Codex review 2026-08-09 P1，moto 已复现；
+    一期的 upsert_site 建站路径本就有此行为，本函数一并修掉）。
+
+    **用 UpdateItem 而非 PutItem**（Codex 复审第二轮 P1）：MCP runtime 的
+    IAM 对 sites 表**故意不给 PutItem**（挡"整条覆盖改站点归属"，
+    `test_sites_table_has_no_putitem` 全表扫描锁定这一点），只有带属性白名单
+    的 UpdateItem。UpdateItem + attribute_not_exists(site_id) 条件在语义上
+    等价于条件 PutItem：item 不存在 → 条件通过并创建；已存在 → 条件失败，
+    **原子性相同**。用 PutItem 会本地 moto 全绿、部署后真实 IAM 全部拒绝。
+    代价：本函数写的字段必须在 deploy_agentcore.py 的
+    SITE_WRITABLE_ATTRIBUTES 白名单内（created_at 需新增）。
+
+    created_at 只在建站这一刻写；碰撞由调用方重新生成 ID 重试，
+    **绝不对已有行继续写**。
+    """
+    import botocore.exceptions
+    try:
+        _table("SITES_TABLE").update_item(
+            Key={"site_id": site_id},
+            UpdateExpression="SET #o = :o, #n = :n, #s = :s, created_at = :t",
+            ConditionExpression="attribute_not_exists(site_id)",
+            ExpressionAttributeNames={"#o": "owner", "#n": "name",
+                                      "#s": "status"},
+            ExpressionAttributeValues={":o": owner, ":n": name,
+                                       ":s": status, ":t": _now()})
+    except botocore.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            raise SiteIdCollision(site_id) from e
+        raise
 
 
 def get_site(site_id: str) -> dict | None:

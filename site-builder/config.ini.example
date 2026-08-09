@@ -76,3 +76,11 @@ require_email_verified = true
 # 所以脚本会把 PendingConfirmation 显式报告为「未完成」。
 [Alerting]
 email =
+
+# 二期 M3 控制台（panel）。deploy_panel.py 从这里取值。
+[Panel]
+ops_log_table = site-ops-log
+session_codes_table = site-session-codes
+# 前端静态资源的版本前缀：S3 platform/console/{console_version}/
+# 每次前端改动递增，旧版本保留以便回滚（与站点前端的版本化上传同模式）。
+console_version = v1

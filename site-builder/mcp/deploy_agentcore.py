@@ -231,7 +231,9 @@ ROUTE_PROJECTION_ATTRIBUTES = ("subdomain", "require_auth", "allowed_users",
 #
 # 只覆盖**从 MCP 工具真正可达**的写路径：
 #   site_id                     —— 分区键（官方要求主键必列）
-#   owner / name / status       —— do_deploy_site 创建站点时写
+#   owner / name / status / created_at
+#                               —— do_deploy_site 创建站点时写
+#                                  （common.create_site_record 的单次条件写）
 #   require_login / allowed_users / collaborators / permissions_rev /
 #   permissions_updated_at / permissions_updated_by
 #                               —— write_permissions（改权限、协作者、转移所有权）
@@ -244,7 +246,7 @@ ROUTE_PROJECTION_ATTRIBUTES = ("subdomain", "require_auth", "allowed_users",
 #
 # 新增 MCP 侧写字段时同步这里，否则线上 AccessDenied；
 # 由 test_agentcore_contract 从实现源码解析比对，不手抄第二份清单。
-SITE_WRITABLE_ATTRIBUTES = ("site_id", "owner", "name", "status",
+SITE_WRITABLE_ATTRIBUTES = ("site_id", "owner", "name", "status", "created_at",
                             "require_login", "allowed_users", "collaborators",
                             "permissions_rev", "permissions_updated_at",
                             "permissions_updated_by")

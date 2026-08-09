@@ -15,6 +15,8 @@ ENV = {"JOBS_TABLE": "site-deploy-jobs", "SITES_TABLE": "site-sites",
        "RUNTIME_BOUNDARY_ARN": "arn:aws:iam::1:policy/site-runtime-boundary",
        "ACCOUNT_ID": "1",
        "ADMINS_TABLE": "site-admins",
+       "OPS_LOG_TABLE": "site-ops-log",
+       "SESSION_CODES_TABLE": "site-session-codes",
        "PACKAGE_PROJECT": "site-package", "DSQL_ENDPOINT": "x.dsql.us-east-1.on.aws",
        "STATE_MACHINE_ARN": "arn:aws:states:us-east-1:1:stateMachine:site-deploy",
        "AWS_DEFAULT_REGION": "us-east-1",
@@ -32,10 +34,15 @@ def aws(monkeypatch):
                          AttributeDefinitions=[
                              {"AttributeName": "job_id", "AttributeType": "S"},
                              {"AttributeName": "owner", "AttributeType": "S"},
+                             {"AttributeName": "site_id", "AttributeType": "S"},
                              {"AttributeName": "created_at", "AttributeType": "S"}],
                          GlobalSecondaryIndexes=[{
                              "IndexName": "owner-index",
                              "KeySchema": [{"AttributeName": "owner", "KeyType": "HASH"},
+                                           {"AttributeName": "created_at", "KeyType": "RANGE"}],
+                             "Projection": {"ProjectionType": "ALL"}}, {
+                             "IndexName": "site-index",
+                             "KeySchema": [{"AttributeName": "site_id", "KeyType": "HASH"},
                                            {"AttributeName": "created_at", "KeyType": "RANGE"}],
                              "Projection": {"ProjectionType": "ALL"}}],
                          BillingMode="PAY_PER_REQUEST")
@@ -56,6 +63,18 @@ def aws(monkeypatch):
         ddb.create_table(TableName="site-admins",
                          KeySchema=[{"AttributeName": "email", "KeyType": "HASH"}],
                          AttributeDefinitions=[{"AttributeName": "email",
+                                                "AttributeType": "S"}],
+                         BillingMode="PAY_PER_REQUEST")
+        ddb.create_table(TableName="site-ops-log",
+                         KeySchema=[{"AttributeName": "target", "KeyType": "HASH"},
+                                    {"AttributeName": "ts_actor", "KeyType": "RANGE"}],
+                         AttributeDefinitions=[
+                             {"AttributeName": "target", "AttributeType": "S"},
+                             {"AttributeName": "ts_actor", "AttributeType": "S"}],
+                         BillingMode="PAY_PER_REQUEST")
+        ddb.create_table(TableName="site-session-codes",
+                         KeySchema=[{"AttributeName": "jti", "KeyType": "HASH"}],
+                         AttributeDefinitions=[{"AttributeName": "jti",
                                                 "AttributeType": "S"}],
                          BillingMode="PAY_PER_REQUEST")
         s3c = boto3.client("s3", region_name="us-east-1")

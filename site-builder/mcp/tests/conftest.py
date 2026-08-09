@@ -16,6 +16,7 @@ ENV = {"JOBS_TABLE": "site-deploy-jobs", "SITES_TABLE": "site-sites",
        "RUNTIME_BOUNDARY_ARN": "arn:aws:iam::1:policy/site-runtime-boundary",
        "ACCOUNT_ID": "1",
        "ADMINS_TABLE": "site-admins",
+       "OPS_LOG_TABLE": "site-ops-log",
        "PACKAGE_PROJECT": "site-package", "DSQL_ENDPOINT": "x.dsql.us-east-1.on.aws",
        "AWS_DEFAULT_REGION": "us-east-1",
        "AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
@@ -32,10 +33,15 @@ def aws(monkeypatch):
                          AttributeDefinitions=[
                              {"AttributeName": "job_id", "AttributeType": "S"},
                              {"AttributeName": "owner", "AttributeType": "S"},
+                             {"AttributeName": "site_id", "AttributeType": "S"},
                              {"AttributeName": "created_at", "AttributeType": "S"}],
                          GlobalSecondaryIndexes=[{
                              "IndexName": "owner-index",
                              "KeySchema": [{"AttributeName": "owner", "KeyType": "HASH"},
+                                           {"AttributeName": "created_at", "KeyType": "RANGE"}],
+                             "Projection": {"ProjectionType": "ALL"}}, {
+                             "IndexName": "site-index",
+                             "KeySchema": [{"AttributeName": "site_id", "KeyType": "HASH"},
                                            {"AttributeName": "created_at", "KeyType": "RANGE"}],
                              "Projection": {"ProjectionType": "ALL"}}],
                          BillingMode="PAY_PER_REQUEST")
@@ -57,6 +63,14 @@ def aws(monkeypatch):
                          KeySchema=[{"AttributeName": "email", "KeyType": "HASH"}],
                          AttributeDefinitions=[{"AttributeName": "email",
                                                 "AttributeType": "S"}],
+                         BillingMode="PAY_PER_REQUEST")
+        # Task 8 的 ops-log 落点在 permissions.py，MCP 的权限工具会走到它
+        ddb.create_table(TableName="site-ops-log",
+                         KeySchema=[{"AttributeName": "target", "KeyType": "HASH"},
+                                    {"AttributeName": "ts_actor", "KeyType": "RANGE"}],
+                         AttributeDefinitions=[
+                             {"AttributeName": "target", "AttributeType": "S"},
+                             {"AttributeName": "ts_actor", "AttributeType": "S"}],
                          BillingMode="PAY_PER_REQUEST")
         s3c = boto3.client("s3", region_name="us-east-1")
         for b in ("site-artifacts-1", "site-frontend-1"):

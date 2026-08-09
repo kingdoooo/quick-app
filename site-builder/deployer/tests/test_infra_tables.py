@@ -81,3 +81,26 @@ def test_step_lambdas_get_admins_table_env(template):
     template.has_resource_properties("AWS::Lambda::Function", {
         "FunctionName": "site-deployer-register_route",
         "Environment": {"Variables": {"ADMINS_TABLE": {"Ref": admins_lid}}}})
+
+
+def test_ops_log_and_session_codes_tables(template):
+    tables = template.find_resources("AWS::DynamoDB::Table")
+    by_name = {t["Properties"]["TableName"]: t
+               for t in tables.values()
+               if isinstance(t["Properties"].get("TableName"), str)}
+    ops = by_name["site-ops-log"]
+    # 审计表误删会丢合规证据——与 site-admins 同为 RETAIN
+    assert ops["DeletionPolicy"] == "Retain"
+    assert ops["Properties"]["TimeToLiveSpecification"]["AttributeName"] == "expires_at"
+    codes = by_name["site-session-codes"]
+    assert codes["Properties"]["TimeToLiveSpecification"]["AttributeName"] == "expires_at"
+
+
+def test_jobs_has_site_index(template):
+    tables = template.find_resources("AWS::DynamoDB::Table")
+    jobs = [t for t in tables.values()
+            if t["Properties"].get("TableName") == "site-deploy-jobs"][0]
+    idx = {g["IndexName"]: g for g in jobs["Properties"]["GlobalSecondaryIndexes"]}
+    assert "site-index" in idx, "控制台部署历史需要按 site_id 查"
+    keys = {k["KeyType"]: k["AttributeName"] for k in idx["site-index"]["KeySchema"]}
+    assert keys == {"HASH": "site_id", "RANGE": "created_at"}

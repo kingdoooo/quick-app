@@ -750,3 +750,19 @@ def test_execution_already_exists_does_not_clobber_succeeded_job(aws, monkeypatc
     assert job["url"] == "https://app-demo-abc123.example.com", "成功的 url 丢了"
     assert job["status"] != "FAILED", (
         f"已成功的部署被改写成 {job['status']}——用户会以为失败而站点其实已更新")
+
+
+def test_deploy_site_regenerates_id_on_collision(aws, monkeypatch):
+    """建站分支撞 ID 时重新生成，不得对已有行做任何写。"""
+    import common
+    import server
+    common._table("SITES_TABLE").put_item(Item={
+        "site_id": "notes-aaaaaa", "owner": "victim@x.com",
+        "name": "notes", "status": "ACTIVE",
+        "created_at": "2026-01-01T00:00:00+00:00"})
+    ids = iter(["notes-aaaaaa", "notes-bbbbbb"])   # 第一次碰撞，第二次成功
+    monkeypatch.setattr(common, "new_site_id", lambda name: next(ids))
+    out = server.do_deploy_site("caller@x.com", "notes")
+    assert out["site_id"] == "notes-bbbbbb"
+    victim = common.get_site("notes-aaaaaa")
+    assert victim["owner"] == "victim@x.com" and victim["status"] == "ACTIVE"

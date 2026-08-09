@@ -186,8 +186,21 @@ def do_deploy_site(owner: str, site_name: str, site_id: str | None = None) -> di
             raise common.InvalidSiteName(f"site_id 格式非法: {site_id!r}")
         _assert_permission(owner, site_id, "deploy", f"站点 {site_id}")
     else:
-        site_id = common.new_site_id(common.validate_site_name(site_name))
-        common.upsert_site(site_id, owner=owner, name=site_name, status="DEPLOYING")
+        # create_site_record 而非 upsert_site：整条记录 attribute_not_exists
+        # 单次条件写。upsert 语义下随机 ID 碰撞会把已有站点的 owner/name/
+        # status 覆盖成本次调用者（误接管）；碰撞重新生成 ID 重试。
+        # 36^6 ≈ 21.8 亿的后缀空间里 3 次连撞视为异常（大概率是环境/代码问题），
+        # 响亮失败而不是无限重试。
+        for _ in range(3):
+            site_id = common.new_site_id(common.validate_site_name(site_name))
+            try:
+                common.create_site_record(site_id, owner=owner, name=site_name)
+                break
+            except common.SiteIdCollision:
+                continue
+        else:
+            raise common.InvalidSiteName(
+                "站点 ID 连续碰撞，请重试；若持续出现请联系平台管理员")
     job_id = common.create_job(owner, site_id)
     url = _s3().generate_presigned_url(
         "put_object",

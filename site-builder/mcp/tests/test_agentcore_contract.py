@@ -362,12 +362,31 @@ def test_sites_write_excludes_deploy_chain_fields():
     assert not leaked, f"部署链字段进了 MCP 可写白名单: {sorted(leaked)}"
 
 
+def _create_site_record_src(common_path) -> str:
+    """common.create_site_record 的函数体源码（**不含 docstring**）。
+
+    用 AST 定位而不是文本切片：该函数的 docstring 里就写着
+    `attribute_not_exists(site_id)`、`UpdateItem`、`PutItem` 这些字样，
+    按文本找会把解释性文字当成实现。本仓库栽过一次同类
+    （断言命中的字样其实只留在注释里，改了代码测试照样绿）。
+    """
+    import ast
+    tree = ast.parse(common_path.read_text())
+    fn = next(n for n in tree.body
+              if isinstance(n, ast.FunctionDef) and n.name == "create_site_record")
+    body = [n for n in fn.body
+            if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
+                    and isinstance(n.value.value, str))]
+    assert body, "create_site_record 只有 docstring，没有实现"
+    return "\n".join(ast.unparse(n) for n in body)
+
+
 def test_sites_write_covers_every_reachable_mcp_write():
     """白名单必须覆盖 MCP 真正会写的字段，否则线上 AccessDenied。
 
-    从实现源码解析：write_permissions 的 site_update + server.py 建站那次
-    upsert_site 的 kwargs。手抄第二份清单的话，permissions.py 加字段时
-    这里不会失败。
+    从实现源码解析：write_permissions 的 site_update + 建站路径
+    common.create_site_record 实际写的字段。手抄第二份清单的话，
+    permissions.py 加字段时这里不会失败。
     """
     import re
 
@@ -380,9 +399,24 @@ def test_sites_write_covers_every_reachable_mcp_write():
     aliases = dict(re.findall(r'names\["(#\w+)"\]\s*=\s*"(\w+)"', block))
     fields |= {aliases.get(a, a) for a in re.findall(r'"(#\w+) = :', block)}
 
-    srv = (MCP_DIR / "server.py").read_text()
-    m = re.search(r"common\.upsert_site\(site_id,\s*([^)]*)\)", srv)
-    fields |= set(re.findall(r"(\w+)=", m.group(1)))
+    # 建站路径：解析 create_site_record 的 UpdateExpression **实际取值**，
+    # 而不是 server.py 那行调用的 kwargs 名。
+    #   · kwargs 名不等于落库字段名（status 是默认参数，调用方根本不传，
+    #     按 kwargs 解析会漏掉它；created_at 更是只在函数体里生成）；
+    #   · 早先版本 regex 匹配 `common.upsert_site(site_id, ...)`，
+    #     改名成 create_site_record 后 re.search 返回 None，测试以
+    #     AttributeError 报错而不是真正校验白名单——正是"源码文本断言锚点
+    #     跟着重构漂移"这一类。锚在被断言的那条写语句上最稳。
+    # 注：_create_site_record_src 返回 ast.unparse 的结果，字符串一律单引号。
+    cm = _create_site_record_src(fn_dir / "common.py")
+    expr = re.search(r"UpdateExpression='([^']*)'", cm).group(1)
+    cm_aliases = dict(re.findall(r"'(#\w+)':\s*'(\w+)'", cm))
+    for tok in re.findall(r"(#?\w+) = :", expr):
+        fields.add(cm_aliases.get(tok, tok))
+    assert not any(f.startswith("#") for f in fields), (
+        f"create_site_record 的别名没解析全: {sorted(fields)}")
+    assert "created_at" in fields, (
+        "没从 create_site_record 解析出 created_at——解析器与实现脱钩了")
     fields |= {"site_id"}          # 分区键，官方要求主键必列
 
     allow = set(da.SITE_WRITABLE_ATTRIBUTES)
