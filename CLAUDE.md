@@ -23,6 +23,7 @@ cd site-builder/auth     && ../contract/.venv/bin/pytest tests -q   # auth 无�
 cd router/infrastructure/lambda && ../../../site-builder/deployer/.venv/bin/pytest . -q  # 23 tests；router 的 .venv 只有 CDK 依赖没有 pytest，借 deployer 的（含 boto3）
 cd site-builder/deployer && .venv/bin/pytest tests -q        # 必须指定 tests/——裸 pytest 会误收集 infra/cdk.out 里的 asset 副本
 cd site-builder/mcp      && python3 -m pytest tests -q       # 23 tests
+cd site-builder/panel    && ../deployer/.venv/bin/pytest tests -q   # panel 无自己的 venv，借 deployer 的（需 moto+boto3）；测试期从 auth/ 直接 import session.py，部署时由 deploy_panel.py 复制
 ```
 
 单测跑法：`.venv/bin/pytest tests/test_xxx.py::test_name -q`。

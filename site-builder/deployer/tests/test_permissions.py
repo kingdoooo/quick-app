@@ -786,3 +786,48 @@ def test_legacy_sparse_row_still_rejects_outsider(aws):
         perm.set_access_policy("legacy-2", actor="x@x.com", require_login=False)
     # 对照：协作者有 set_access_policy 能力，必须放行
     perm.set_access_policy("legacy-2", actor="c@x.com", require_login=False)
+
+
+def test_resync_projects_exactly_the_same_route_fields_as_write_permissions():
+    """两处投影字段必须一致；否则 resync"修完还是脏的"。
+
+    从源码解析实际的 UpdateExpression 取值再比对——手抄第二份清单时，
+    write_permissions 加字段这里不会失败（本仓库的既有教训）。
+    """
+    import ast
+    import re
+    from pathlib import Path
+    src = (Path(__file__).parents[1] / "functions" / "permissions.py").read_text()
+    tree = ast.parse(src)
+
+    def route_fields(fn_name):
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == fn_name)
+        body = ast.unparse(fn)
+        # 只取投影到路由表的那条 UpdateExpression（以 require_auth 开头）
+        exprs = re.findall(r"'SET require_auth = [^']*'", body)
+        assert exprs, f"{fn_name} 里找不到路由投影表达式"
+        return set(re.findall(r"(#?\w+) = :", exprs[0]))
+
+    a = route_fields("write_permissions")
+    b = route_fields("resync_route")
+    assert a == b, f"投影字段漂移：write_permissions={sorted(a)} resync={sorted(b)}"
+    # 别名（#ro → owner）也必须两处一致，否则"字段名相同、指向不同"
+    assert "#ro" in a, "投影表达式里应有 owner 的别名 #ro"
+
+
+def test_resync_requires_route_item_to_exist():
+    """resync 是纠正投影，不是补建路由。
+
+    路由 item 不存在说明站点没成功部署过（或已下线）——无中生有地建一条
+    会让一个不该可达的 subdomain 变成可路由。
+    """
+    import ast
+    import re
+    from pathlib import Path
+    src = (Path(__file__).parents[1] / "functions" / "permissions.py").read_text()
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "resync_route")
+    body = ast.unparse(fn)
+    assert "attribute_exists(subdomain)" in body, (
+        "resync_route 缺 attribute_exists(subdomain) 条件——会无中生有建路由")

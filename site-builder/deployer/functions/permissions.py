@@ -629,3 +629,56 @@ def transfer_owner(site_id: str, *, actor: str, new_owner: str) -> dict:
                             mutate=_mutate)
     return {"owner": out["owner"], "collaborators": out["collaborators"],
             "previous_owner": captured.get("previous_owner", "")}
+
+
+def resync_route(site_id: str, *, actor: str) -> dict:
+    """以 sites 表为准重投影路由表（仅 admin；phase2 spec §8 的人工修复口）。
+
+    与 write_permissions 的区别：**不改 sites 表、不推进 rev**——它修的是
+    投影漂移（人为改库、迁移中断），真源本身没问题。所以这里只写 route，
+    且投影字段集合必须与 write_permissions 的 route_update **完全一致**
+    （少一个字段就等于"修完还是脏的"）；由
+    test_resync_projects_exactly_the_same_route_fields_as_write_permissions
+    从两处的 UpdateExpression 解析比对锁定，不靠人记得同步。
+
+    rev 用 sites 表当前值**原样**投影（不 +1）：register_route 用 route.rev 与
+    sites.rev 比对判断"我读到的策略是否最新"，这里若虚增会让下一次**合法**
+    部署误判成"权限被并发修改"。
+
+    这个函数放在 permissions.py 而不是 panel：panel 禁止手写路由投影
+    （投影字段与守卫语义必须单一真源），而 resync 的本质就是投影。
+    """
+    if not is_admin(actor):
+        raise PermissionDenied("仅平台管理员可重投影路由")
+    site = _site_or_raise(site_id, consistent=True)
+    rev = int(site.get("permissions_rev", 0))
+    # require_login 缺失时取 True（fail-closed：判不出策略时按需要登录处理）。
+    # allowed_users 缺失/为空时退回 "org"——**不能直接调
+    # normalize_allowed_users**，它对空值抛 ValueError，而稀疏存量行确实可能
+    # 没有这个字段（upsert_site 建站只写 owner/name/status）。让一个修复工具
+    # 在最需要它的脏数据上抛异常，等于没有这个工具。
+    raw_allowed = site.get("allowed_users")
+    allowed = normalize_allowed_users(raw_allowed) if raw_allowed else "org"
+    effective = {
+        "require_login": bool(site.get("require_login", True)),
+        "allowed_users": allowed,
+        "collaborators": list(site.get("collaborators") or []),
+        "owner": site.get("owner", ""),
+    }
+    _ddb_client().update_item(
+        TableName=os.environ["ROUTING_TABLE"],
+        Key={"subdomain": {"S": common.subdomain_for(site_id)}},
+        UpdateExpression=("SET require_auth = :a, allowed_users = :u, "
+                          "collaborators = :c, #ro = :o, permissions_rev = :rv"),
+        # 路由 item 必须已存在：本函数是"纠正投影"，不是"补建路由"。
+        # 不存在说明站点没部署成功过（或已下线），此时无中生有地建一条
+        # 会让一个不该可达的 subdomain 变成可路由。
+        ConditionExpression="attribute_exists(subdomain)",
+        ExpressionAttributeNames={"#ro": "owner"},
+        ExpressionAttributeValues={
+            ":a": {"BOOL": effective["require_login"]},
+            ":u": allowed_users_av(effective["allowed_users"]),
+            ":c": {"L": [{"S": e} for e in effective["collaborators"]]},
+            ":o": {"S": effective["owner"]},
+            ":rv": {"N": str(rev)}})
+    return {"site_id": site_id, "permissions_rev": rev, **effective}
