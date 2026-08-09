@@ -2079,6 +2079,26 @@ Run: `cd site-builder/mcp && python3 -m pytest tests/test_agentcore_contract.py 
 Expected: PASS，其中 `test_sites_table_has_no_putitem` 仍绿（`create_site_record`
 用的是 UpdateItem，policy 不需要也不能出现 PutItem）。
 
+> **实测修正（2026-08-09）：本步骤还必须改 `test_agentcore_contract.py` 的
+> 解析器，否则上面这个 Expected: PASS 拿不到。**
+> `test_sites_write_covers_every_reachable_mcp_write` 用
+> `re.search(r"common\.upsert_site\(site_id,\s*([^)]*)\)", srv)` 从
+> `server.py` 抓建站那次调用的 kwargs。Step 5 把该调用改名成
+> `create_site_record` 之后 `re.search` 返回 **None**，测试以
+> `AttributeError: 'NoneType' object has no attribute 'group'` 报错——
+> 不是"校验白名单后失败"，而是**根本没校验**。已在改代码前用脚本实测确认。
+> 而且按 kwargs 解析本就漏字段：`status` 是默认参数（调用方不传）、
+> `created_at` 只在函数体里生成，两者都不在调用点的 kwargs 里。
+> 处置：解析锚点改到**被断言的那条写语句本身**——用 AST 取
+> `common.create_site_record` 的函数体（**排除 docstring**，因为它的
+> docstring 里就写着 `attribute_not_exists(site_id)` / `UpdateItem` /
+> `PutItem` 这些字样，文本切片会把解释性文字当实现），再从
+> `UpdateExpression` 的实际取值 + `ExpressionAttributeNames` 别名表解析出
+> 落库字段名。注意 `ast.unparse` 输出的字符串一律单引号，regex 要按单引号写。
+> 已反向验证：把 `created_at` 从 `SITE_WRITABLE_ATTRIBUTES` 去掉 → 该用例
+> 报 `Extra items in the left set: 'created_at'` 变红，正是它要防的线上
+> AccessDenied。
+
 **Task 13 部署 MCP 后的真机 IAM 探针**（写进 Task 13 验收）：以 runtime role
 的凭证对 sites 表发一次含 `created_at` 的条件 UpdateItem（不存在的探针
 site_id，写后即删），确认不再 AccessDenied——单测与 contract test 都看不到
@@ -2245,7 +2265,22 @@ Expected: PASS
 - [ ] **Step 10: 反向验证**
 
 1. 把回填脚本的 `ConditionExpression="attribute_not_exists(created_at)"` 删掉 →
-   Expected: `test_existing_value_is_not_overwritten` **FAIL**
+   Expected: `test_concurrent_writer_between_scan_and_update_is_not_overwritten`
+   **FAIL**。
+
+   > **实测修正（2026-08-09，本计划原文不准，已按实测改写）**：原文写的是
+   > `test_existing_value_is_not_overwritten` FAIL。**实测它仍然全绿**——
+   > 那条用例被**扫描时**的 `if site.get("created_at"): continue` 满足，
+   > 根本走不到 update，所以它并不覆盖 `ConditionExpression`。
+   > 两道防护对它互为冗余（同 Task 1 mutation 1 的
+   > `attribute_exists(job_id)`：那也是纵深防御而非被单测锁住的守卫）。
+   > 已确认的因果链：删条件 + **同时**删掉扫描期跳过 → 该用例才变红；
+   > 只删条件、保留跳过 → 绿；只保留条件、删掉跳过 → 也绿。
+   > 处置**不是只改计划文字**，而是补一条真正盯住这个不变量的用例
+   > （`test_concurrent_writer_between_scan_and_update_is_not_overwritten`）：
+   > 脚本先扫全表再逐个写，中间那段窗口才是条件写存在的理由，因此在 jobs
+   > 查询（存在性检查之后、update_item 之前）注入并发写入者，正好命中那一刻。
+   > 该用例已反向验证：删条件即红，恢复即绿。
 2. 把"无 job 就跳过"改成 `ts = common._now()` →
    Expected: `test_site_without_jobs_is_reported_not_guessed` **FAIL**
 3. 把 `list_jobs_by_site` 的 `ScanIndexForward=False` 改成 `True` →
