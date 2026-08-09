@@ -156,8 +156,19 @@ def role_statements() -> list[dict]:
                     "dynamodb:UpdateItem", "dynamodb:DeleteItem",
                     "dynamodb:ConditionCheckItem"],
          "Resource": f"{tbl}/site-admins"},
+        # ConditionCheckItem 是**事务必需**的，不是多给的：write_permissions 在
+        # "站点还没首次部署成功（无 route item）"时走降级事务，其中对路由表做的是
+        # `attribute_not_exists(subdomain)` 的 ConditionCheck。缺这个 action 时
+        # 该路径以 AccessDeniedException 收场 → panel 返回 500。
+        # **实测过**：moto 不校验 IAM，所以 144 个单测全绿，真机上"对无 route 的
+        # 站点做任何写操作"全部 500（Task 14 Step 3 真机验收发现）。
+        # MCP 侧的同一张表早就带着它（deploy_agentcore.py 的 RoutingProjection，
+        # 注释写明"register_route / write_permissions 的事务需要"）——panel 漏了。
+        # 仍然**没有 Put/Delete**：update-only 的收窄取向不变（Put 能整条切流、
+        # Delete 能摘掉站点），由 test_panel_role_routing_table_is_update_only 锁定。
         {"Sid": "RoutingProjectionUpdateOnly", "Effect": "Allow",
-         "Action": ["dynamodb:GetItem", "dynamodb:UpdateItem"],
+         "Action": ["dynamodb:GetItem", "dynamodb:UpdateItem",
+                    "dynamodb:ConditionCheckItem"],
          "Resource": f"{tbl}/{routing}"},
         {"Sid": "OpsLogAppendOnly", "Effect": "Allow",
          "Action": "dynamodb:PutItem",

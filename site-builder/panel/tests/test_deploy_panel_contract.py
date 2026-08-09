@@ -159,14 +159,92 @@ def test_panel_role_routing_table_is_update_only():
     assert any(routing in r for r in _resources(stmts[0])), (
         f"Sid 对上了但资源不是路由表: {_resources(stmts[0])}")
     acts = set(_actions(stmts[0]))
+    # ConditionCheckItem 在白名单里：它是降级事务的 attribute_not_exists 检查
+    # 所必需的（见 deploy_panel 里那条注释），且**不能**写数据。
     assert acts <= {"dynamodb:UpdateItem", "dynamodb:GetItem",
-                    "dynamodb:Query"}, f"路由表权限过宽: {sorted(acts)}"
+                    "dynamodb:Query", "dynamodb:ConditionCheckItem"}, \
+        f"路由表权限过宽: {sorted(acts)}"
     # 另外全表扫一遍：路由表不得在**任何**语句里拿到 Put/Delete
     for s in dp.role_statements():
         if any(routing in r for r in _resources(s)):
             bad = {"dynamodb:PutItem", "dynamodb:DeleteItem",
                    "dynamodb:*"} & set(_actions(s))
             assert not bad, f"路由表拿到了 {sorted(bad)}（Sid={s.get('Sid')}）"
+
+
+def test_role_grants_every_dynamodb_action_the_transactions_actually_need():
+    """从 permissions.py 的**事务构造代码**推导所需 action，与 role 交叉核对。
+
+    为什么必须有这条：panel 的 role 原来只给路由表 GetItem+UpdateItem，而
+    `write_permissions` 的降级路径（站点还没首次部署成功、无 route item）对
+    路由表做的是 `ConditionCheck`。**moto 不校验 IAM**，所以 144 个单测全绿，
+    真机上"对任何无 route 的站点做写操作"一律 500
+    （Task 14 Step 3 真机验收实测，AccessDeniedException on
+    dynamodb:ConditionCheckItem）。
+
+    手抄一份"需要哪些 action"的清单没有用——那份清单本身会漂移。这里按
+    **AST 解析 permissions.py 里每个事务项用了哪张表的哪种操作**：
+    TransactItems 元素的 key 是 "Update" / "Put" / "Delete" / "ConditionCheck"，
+    表名来自 `os.environ["<X>_TABLE"]`，与 lambda_environment() 的映射对得上。
+    """
+    perm_src = (PANEL.parent / "deployer" / "functions" / "permissions.py").read_text()
+    tree = ast.parse(perm_src)
+
+    op_to_action = {"Update": "dynamodb:UpdateItem",
+                    "Put": "dynamodb:PutItem",
+                    "Delete": "dynamodb:DeleteItem",
+                    "ConditionCheck": "dynamodb:ConditionCheckItem"}
+
+    def env_key(node):
+        """从 `os.environ["X_TABLE"]` 取出 X_TABLE。"""
+        if (isinstance(node, ast.Subscript)
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "environ"
+                and isinstance(node.slice, ast.Constant)):
+            return node.slice.value
+        return None
+
+    # (env 变量名 → 需要的 action 集合)
+    needed: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        for k, v in zip(node.keys, node.values):
+            if not (isinstance(k, ast.Constant) and k.value in op_to_action):
+                continue
+            if not isinstance(v, ast.Dict):
+                continue
+            for ik, iv in zip(v.keys, v.values):
+                if isinstance(ik, ast.Constant) and ik.value == "TableName":
+                    key = env_key(iv)
+                    if key:
+                        needed.setdefault(key, set()).add(op_to_action[k.value])
+
+    assert needed, "AST 解析不到任何事务项——解析口径坏了，本用例什么都没断言"
+    # 必须真的解析到了路由表的 ConditionCheck（就是漏掉的那条）
+    assert "dynamodb:ConditionCheckItem" in needed.get("ROUTING_TABLE", set()), (
+        f"解析结果里路由表没有 ConditionCheck，可疑: {needed}")
+
+    env = dp.lambda_environment()
+    granted: dict[str, set[str]] = {}
+    for s in dp.role_statements():
+        for res in _resources(s):
+            for env_name, table in env.items():
+                if not env_name.endswith("_TABLE"):
+                    continue
+                if res.endswith(f"/{table}") or f"/{table}/" in res:
+                    granted.setdefault(env_name, set()).update(_actions(s))
+
+    missing = {}
+    for env_name, actions in needed.items():
+        if env_name not in env:        # permissions.py 里有 panel 用不到的表
+            continue
+        gap = actions - granted.get(env_name, set())
+        if gap:
+            missing[f"{env_name}({env[env_name]})"] = sorted(gap)
+    assert not missing, (
+        f"事务需要但 panel role 没给的 DynamoDB 权限: {missing} "
+        "—— 真机会以 AccessDeniedException → 500 的形态出现，而 moto 测不出来")
 
 
 def test_ops_log_is_putitem_only():
