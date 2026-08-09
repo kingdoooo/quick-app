@@ -94,6 +94,49 @@ sites 表、按 permissions.py 写权限（事务含路由表投影）、invoke
 原型 `decorate()` 的 `pv7`（近 7 天 PV）属 M5，前端该列 disabled；
 `last_deploy` 从 jobs `site-index` 首条派生。
 
+### 4.1 接口契约核对结论（视图层 ↔ mock ↔ 后端真实代码三方对照）
+
+方法级映射无缺漏、无多余：视图层实际调用的方法全部在上表，上表也没有
+视图层用不到的方法。字段级核对发现以下缺口与偏差：
+
+**字段级缺口（后端补齐或前端适配）**：
+
+1. **sites 表没有 `created_at`**（`upsert_site` 全链路从不写它，只有 jobs
+   表有）。处理：首次部署路径（`do_deploy_site` 建站分支）开始写入 +
+   一次性幂等回填脚本（从 jobs `site-index` 该站点最早一条 job 的
+   created_at 推导；仿 `migrate_permissions.py` 模式，已有值跳过）。
+2. **sites 表永远不会出现 `status=FAILED`**：`mark_job` 失败分支只写
+   job，不碰 site——首次部署失败的站点永远停在 DEPLOYING。处理：**不改
+   真源**（重部署失败时站点仍在线服务旧版本，写 site=FAILED 是错的）；
+   panel 在**展示层派生**——仅对 `status==DEPLOYING` 的站点查
+   `site-index` 最新 job，若 FAILED 显示失败徽章。
+3. **phase 词表**：原型 `PHASE_LABEL` 的 key 是 SFN 节点名
+   （`Validate`/`PackageBackend`/…），jobs 表实际存小写串（`submitted`
+   / `queued` / `validate` / `provision-db` / `package` /
+   `deploy-backend` / `upload-frontend` / `register-route` /
+   `smoke-test` / `undeploy`）。前端移植时按真实词表重写；注意
+   SUCCEEDED 的 job phase 停留在 `smoke-test`（成功分支不再写 phase）。
+4. **undeploy 是异步的**（返回 job_id 后 `InvocationType=Event`）：原型
+   按同步写（立即置 DELETED）。前端改为提交后显示「下线中」并轮询。
+
+**有 API 无 UI（取向声明）**：
+
+- `POST /api/admin/resync/{id}`：M3 按 **API-only** 交付（罕用人工修复
+  操作），不加页面；
+- ops-log：M3 只写不读，无查看 UI（M5 的访问审计是另一张表，勿混淆）；
+- `GET /api/session-callback`：不可见管道，前端只感知 401→升级→重放；
+- 登出：**不是 panel API**——按钮链去已有的 `auth.{domain}/logout`。
+  残留的 `__Host-sb_console`（4h）无害：§5.4 已要求 cookie email 与
+  `x-user-email` 一致性检查，换人登录后强制重新升级。
+
+**声明即可的偏差（非缺口）**：
+
+- `listSites` 的 q/status/owner 筛选与 `listOwners()`：后端只提供
+  `GET /api/sites[?all=1]`，筛选/派生在新 window.API 实现内客户端完成
+  （站点量级小）——原型方法签名不变，视图层零改动；
+- 原型禁止空 `allowed_users` 名单；后端语义里空名单 = 仅 owner 可访问
+  （合法状态）。保留 UI 侧防呆，不算冲突。
+
 **结论：写路径 100% 复用 permissions.py 高层函数**（`assert_can` /
 `CAPABILITIES` / `write_permissions` / `snapshot_condition` /
 `sites_snapshot_guard` / `set_access_policy` / `set_collaborators` /
@@ -203,6 +246,7 @@ SameSite=Lax、Path=/、**无 Domain**。
 | reconciler/sweeper Lambda + rule + DLQ + schedule | 新建（deployer CDK 栈） | M3 前置 B1 |
 | 告警管道（filter/topic/alarm/subscription） | 收编进 deploy_auth.py | M3 前置 B2 |
 | `verify_deployed_components.py` | 重构自 verify_contract_fixtures.py | M3 前置 |
+| sites `created_at` 回填脚本 | 一次性幂等（§4.1 缺口 1） | M3 |
 | stats / audit / api-keys 表 | **不建** | M4/M5 |
 
 ## 7. 测试硬约束
