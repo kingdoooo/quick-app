@@ -735,7 +735,6 @@ Expected: FAIL —— 7 个用例全红（无 Events::Rule、无 SQS、handler �
                            "reconcile_job.handler")
         f_sweep = recon_fn("FnSweepJobs", "site-deployer-sweep-jobs",
                            "reconcile_job.sweeper_handler")
-        f_sweep.add_alias  # noqa: B018  (占位：无别名，保持对象被引用)
 
         dlq = sqs.Queue(self, "ReconcileDlq",
                         queue_name="site-deployer-reconcile-dlq",
@@ -767,7 +766,7 @@ Expected: FAIL —— 7 个用例全红（无 Events::Rule、无 SQS、handler �
         CfnOutput(self, "ReconcileDlqUrl", value=dlq.queue_url)
 ```
 
-**注意**：删掉上面 `f_sweep.add_alias  # noqa` 那一行（它只是提醒，不要留在代码里）。
+**注意**：`recon_fn` 用不带 bundling 的 `from_asset(fn_dir)`——reconcile_job 只 import `common`（同目录）与运行时自带的 boto3/botocore，不需要 psycopg/sqlparse/contract 包。这与 `step_fn` 的 bundled asset 是两个不同 asset hash，互不影响。
 
 - [ ] **Step 4: 运行 CDK 断言测试确认通过**
 
@@ -1713,19 +1712,36 @@ def create_site_record(site_id: str, **attrs) -> None:
     """**首次**建站：写入 created_at 后调 upsert_site。
 
     created_at 只在建站那一刻有意义，所以单独一个入口而不是塞进 upsert_site
-    （后者被部署链多处调用，每次都写会把创建时间刷成最后一次部署时间）。
-    条件是"该属性不存在"——重复调用不覆盖。
+    （后者被部署链多处调用——mark_job / provision_* 各一次，每次都写会把创建
+    时间刷成最后一次部署时间）。
+
+    条件是"该属性不存在"，**条件失败是正常情况**（同 site_id 重复走建站分支、
+    或回填脚本已经补过），吞掉继续；其他 ClientError 照原样上抛。
     """
-    _table("SITES_TABLE").update_item(
-        Key={"site_id": site_id},
-        UpdateExpression="SET created_at = :t",
-        ConditionExpression="attribute_not_exists(created_at)",
-        ExpressionAttributeValues={":t": _now()})
+    import botocore.exceptions
+    try:
+        _table("SITES_TABLE").update_item(
+            Key={"site_id": site_id},
+            UpdateExpression="SET created_at = :t",
+            ConditionExpression="attribute_not_exists(created_at)",
+            ExpressionAttributeValues={":t": _now()})
+    except botocore.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
     if attrs:
         upsert_site(site_id, **attrs)
 ```
 
-**注意**：条件失败会抛 `ConditionalCheckFailedException`——`create_site_record` 需要捕获它并继续（已有 created_at 是正常情况）。实现时用 try/except `ClientError` 判 `ConditionalCheckFailedException` 后 `pass`。
+同时在 `test_common.py` 追加一条覆盖"不覆盖已有值"的用例：
+
+```python
+def test_create_site_record_does_not_overwrite_created_at(aws):
+    import common
+    common.create_site_record("s-dup", owner="u@x.com", status="DEPLOYING")
+    first = common.get_site("s-dup")["created_at"]
+    common.create_site_record("s-dup", owner="u@x.com", status="DEPLOYING")
+    assert common.get_site("s-dup")["created_at"] == first
+```
 
 - [ ] **Step 5: `mcp/server.py` 建站分支改用 `create_site_record`**
 
@@ -1889,7 +1905,7 @@ Run:
 cd site-builder/deployer && .venv/bin/pytest tests -q && \
 cd ../mcp && python3 -m pytest tests -q
 ```
-Expected: 两处均 PASS（deployer 新增 5 用例，mcp 无回归）
+Expected: 两处均 PASS（deployer 新增 6 用例，mcp 无回归）
 
 CDK 断言：
 ```bash
@@ -1964,11 +1980,21 @@ git commit -m "feat(deployer): M3 数据层——site-index GSI + ops-log/sessio
 >
 > **Task 6-16 概要**（每个任务的 Files / Interfaces / 验收标准）：
 >
-> - **Task 6 panel 授权与 API 纯函数**：`panel/api.py` 的 do_* 层 + `tests/test_authz.py`（owner/collaborator/outsider/admin × 各端点矩阵）+ `tests/test_no_handwritten_guards.py`（AST 扫描：panel 不得出现手写 UpdateExpression、角色字符串比较、admins raw 写）。授权 100% 走 `permissions.assert_can` / 高层写函数。
+> - **Task 6 panel 授权与 API 纯函数**：`panel/api.py` 的 do_* 层 + `tests/test_authz.py`（owner/collaborator/outsider/admin × 各端点矩阵）+ `tests/test_no_handwritten_guards.py`。授权 100% 走 `permissions.assert_can` / 高层写函数。
+>   **必须包含的两条结构性断言**（AST 解析 `panel/*.py`，不用文本匹配——注释里出现这些字样不算违规）：
+>   ① panel 模块内不出现任何 `UpdateExpression=` / `ConditionExpression=` 关键字实参，也不出现对 sites/admins 表的 `put_item`/`update_item`/`delete_item` 调用；权限与 admin 写入只能是对 `permissions.<高层函数>` 的 Call。
+>   ② admin 增删只能命中 `permissions.add_admin` / `permissions.remove_admin`——它们维护 `__count__` sentinel（`remove_admin` 的"不能删到名单为空"条件依赖它）。panel 若 raw 写 admins 表，sentinel 会与实际 item 数漂移，`remove_admin` 的守卫随之失效。
+>   反向验证：在 `panel/api.py` 里临时插一句 `_admins_table().put_item(Item={"email": "x@x.com"})`，确认 ① ② 各自 FAIL 后删除。
 > - **Task 7 console-session + CSRF**：`panel/console_session.py`（HMAC code 签发校验、60s、绑 email、context 标记 `typ:"console-upgrade"`、jti 条件写 `site-session-codes` 原子消费）+ `tests/test_csrf.py`（**副作用前置顺序断言**：mock DynamoDB 客户端，验证 CSRF 失败路径下零写调用）。
 > - **Task 8 ops-log 落点**：`permissions.py` 五个高层写函数 + undeploy 路径内落 ops-log（唯一落点，MCP 与控制台自动同轮覆盖）+ `panel/ops_log.py`（PutItem only、字段脱敏）+ `mcp/deploy_agentcore.py` 补 ops-log PutItem。
 > - **Task 9 panel handler 组装**：`panel/handler.py` 路由分发 + 五步前置校验顺序 + 错误码（401 `{"need":"console-session"}` / 403 / 409）。
-> - **Task 10 `deploy_panel.py`**：Lambda + Function URL(AWS_IAM 仅 exact edge role 双语句，缺 edge_role_arn 抛错) + panel role（表清单见 spec §2，路由表**仅** UpdateItem）+ 前端上传 + console route 注册 + contract test 断言 role/policy。
+> - **Task 10 `deploy_panel.py`**：Lambda + Function URL + panel role（表清单见 spec §2，路由表**仅** UpdateItem）+ 前端上传 S3 `platform/console/{console_version}/` + console route 注册。
+>   **Function URL trust 的三条可验证断言**（contract test + 真机各一遍）：
+>   ① `AuthType == "AWS_IAM"`（不是 NONE——`NONE` + `Principal:*` 会被安全扫描自动处置，实测把整个 resource policy 删光）；
+>   ② resource policy 恰好两条语句、Principal 是**逐字符 exact** edge role ARN（不是 `*`、不是账号根、不做前缀匹配），action 分别是 `lambda:InvokeFunctionUrl`（含 `FunctionUrlAuthType=AWS_IAM` 条件）与 `lambda:InvokeFunction`（含 `InvokedViaFunctionUrl=true` 条件）——2025-10 起缺任一条即 403；
+>   ③ `edge_role_arn` 缺失/空串时 `deploy_panel.py` **抛错中止**，不得 fallback 到 `Principal:*` 或跳过授权（照抄 `deploy_lambda_site.py` 的 KeyError 形态）。
+>   真机：`curl` 直连 Function URL 期望 403；经 `https://console.{base_domain}` 期望 200。**只有请求确实经过 Edge，`x-user-email` 才可信**——②③ 是这个前提的唯一保证。
+>   反向验证：临时把 Principal 改成 `"*"`，确认 contract test FAIL 且真机直连变成 200（证明测试真的在守这条），随后还原并重新部署。
 > - **Task 11 Edge console 白名单**：`PLATFORM_SUBDOMAINS` 加 `console`、`RESERVED_COOKIES` 加两个 `__Host-`（两文件同步）+ 伪造 platform route 负测 + `verify_deployed_edge.sh` 断言产物含新值与 CloudFront 实际关联版本。
 > - **Task 12 auth `/console-session`**：校验顶域 `sb_session` → 签发 code → 302 到 console callback；`__Host-sb_pkce` 与新 cookie 的作用域测试。
 > - **Task 13 三层部署 + `verify_deployed_components.py`**：重构自 `verify_contract_fixtures.py`（7 段，旧脚本删除、文档引用同步），部署 deployer/Edge/auth/panel/MCP 并逐一核对产物。
@@ -1985,3 +2011,15 @@ git commit -m "feat(deployer): M3 数据层——site-index GSI + ops-log/sessio
 **2. 占位符扫描**：Task 1-5 的每个代码步骤都有可直接落地的完整代码；Task 6-16 是**明示的分阶段展开**（附完整 Files/Interfaces/验收标准），不是 "TBD"——理由已写明（数据层真机形态影响 panel 响应契约）。
 
 **3. 类型一致性**：`converge_job_to_failed` 在 Task 1 定义、Task 2 的 CDK handler 引用一致；`list_jobs_by_site` / `create_site_record` 在 Task 5 定义，Task 6/14 消费；`ensure_alarm_pipeline` 在 Task 3 定义、Task 4 消费，参数名逐一对应；`ALARM_PARAMS` / `ALARM_DESCRIPTION` 在 Task 3 定义、Task 4 的验收脚本 import 同名。
+
+**4. 自审发现并已修的五处**（记录于此，避免实施时重蹈）：
+
+| 问题 | 修法 |
+|---|---|
+| Task 2 CDK 片段残留 `f_sweep.add_alias  # noqa` 占位行 | 删除，改为说明 `recon_fn` 与 `step_fn` 的 asset 差异（前者无 bundling） |
+| Task 5 `create_site_record` 的条件失败处理写在正文而非代码里 | 代码内补 try/except `ConditionalCheckFailedException`，并加一条"重复调用不覆盖"的用例（新增用例数 5→6） |
+| Function URL trust 只在 Global Constraints 有一句，Task 10 无可验证断言 | Task 10 展开三条断言（AuthType / exact Principal 双语句 / 缺配置抛错不 fallback）+ 真机正负各一 + 反向验证 |
+| admin `__count__` sentinel 同上——只在约束里，Task 6 无守卫 | Task 6 展开两条 AST 结构性断言（禁 panel 内 UpdateExpression/表直写、admin 增删只能命中 helper）+ 反向验证 |
+| Task 6 的结构性测试原写"AST 扫描"但未说明为何不能用文本匹配 | 明确写出：注释/docstring 里出现这些字样不算违规（本项目历史教训：文本断言锁住了注释里的旧表达式，改错代码仍绿） |
+
+**5. 七个检查点复核**：M3/M4/M5 范围（Global Constraints 第 47 行 + spec §11-clarify，`stats` 在计划里的其余出现均为回填脚本的本地变量名，非 M5 功能）；console 平台白名单（Task 11 + 约束第 32 行禁 `route.owner` 推导）；Function URL trust（Task 10 三条，已补）；EventBridge best-effort + sweeper（Task 1 docstring + Task 2 rule/schedule 断言 + Task 2 Step 10 真机两层各自有效）；admin sentinel（Task 6 两条，已补）；CSRF 前置副作用（Task 7 的"CSRF 失败路径下零写调用"顺序断言 + Task 9 五步顺序）；清理与部署门禁（Task 2/4 各有部署门禁+回滚锚点+回滚方式，Task 15 fixture 清理且硬性早于 Task 16）。
