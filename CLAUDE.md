@@ -9,8 +9,8 @@ Quick 自动化建站平台（Site Builder）：业务人员在任意支持 Skil
 `https://app-{site_id}.{base_domain}` 的可分享 URL。站点访问与管理权限绑定飞书账号
 （身份源可换成任意能给 email claim 的 Cognito 联邦 IdP）。
 
-**当前状态**：一期已在真实 AWS 全量部署并端到端验证（两条客户端通道都走通）；
-二期在推进中。**具体进度不写在本文件**（会过时）——见
+**当前状态**：一期与二期 M1-M3（含 `console.{base_domain}` 自助管理控制台）都已在
+真实 AWS 部署并端到端验证。**具体进度与闸门数字不写在本文件**（会过时）——见
 `docs/design/HANDOFF-2026-08-07.md` 的最新一节，那里是状态真源。
 二期需求清单在 `docs/phase2-requirements.md`；部署手册
 `site-builder/DEPLOY.md` 含全部实测坑。
@@ -20,11 +20,11 @@ Quick 自动化建站平台（Site Builder）：业务人员在任意支持 Skil
 每个包的 venv 归属不同，照抄下面的组合（三个例外都验证过）：
 
 ```bash
-cd site-builder/contract && .venv/bin/pytest tests -q        # 107 tests
+cd site-builder/contract && .venv/bin/pytest tests -q
 cd site-builder/auth     && ../contract/.venv/bin/pytest tests -q   # auth 无自己的 venv，借 contract 的——含 pyjwt 与 boto3；重建该 venv 后两者都要手工重装
-cd router/infrastructure/lambda && ../../../site-builder/deployer/.venv/bin/pytest . -q  # 23 tests；router 的 .venv 只有 CDK 依赖没有 pytest，借 deployer 的（含 boto3）
+cd router/infrastructure/lambda && ../../../site-builder/deployer/.venv/bin/pytest . -q  # router 的 .venv 只有 CDK 依赖没有 pytest，借 deployer 的（含 boto3）
 cd site-builder/deployer && .venv/bin/pytest tests -q        # 必须指定 tests/——裸 pytest 会误收集 infra/cdk.out 里的 asset 副本
-cd site-builder/mcp      && python3 -m pytest tests -q       # 23 tests
+cd site-builder/mcp      && python3 -m pytest tests -q
 cd site-builder/panel    && ../deployer/.venv/bin/pytest tests -q   # panel 无自己的 venv，借 deployer 的（需 moto+boto3）；测试期从 auth/ 直接 import session.py，部署时由 deploy_panel.py 复制
 ```
 
@@ -53,8 +53,12 @@ E2E（需要真实 AWS 部署 + config.ini 已回填）：
 
 ```bash
 RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/test_e2e_fixtures.py -q   # 4 个 fixture，约 6 分钟
-bash site-builder/scripts/smoke_router.sh    # 路由层冒烟（会写测试数据，跑完清理）
+bash site-builder/scripts/smoke_router.sh    # 路由层冒烟（会写测试数据，跑完清理；含 65s 等 Edge 缓存）
+python3 site-builder/scripts/verify_console_e2e.py   # 控制台端到端（**从仓库根跑**）
 ```
+
+`site-builder/scripts/verify_*` 是真机闸门（部署后跑，不是单测）。数量与最新结果
+见 HANDOFF 的最新一节——本文件不记数字（会过时）。
 
 ## 部署/重部署命令
 
@@ -71,6 +75,10 @@ cd site-builder/auth && python3 deploy_auth.py
 # MCP（buildx ARM64 → ECR → AgentCore runtime；--skip-build 只改配置）
 cd site-builder/mcp && python3 deploy_agentcore.py
 
+# 控制台 panel（Lambda + Function URL + 前端上传 + console route，幂等）
+# --skip-frontend 只改后端。改前端后必须重跑（不带该开关）才会上传。
+cd site-builder/panel && python3 deploy_panel.py
+
 # 生成含真实值的用户接入指引（产物 gitignored）
 python3 site-builder/scripts/gen_onboarding.py
 ```
@@ -79,7 +87,7 @@ python3 site-builder/scripts/gen_onboarding.py
 `.example` 复制）。**config.ini 是各部署脚本与 CDK 栈的唯一取值来源**，代码不硬编码
 账号/域名。git 历史已清洗过真实账号 ID——不要把真实账号值写进任何被跟踪的文件。
 
-## 架构（五层，读代码前先建这张图）
+## 架构（五层 + 控制台，读代码前先建这张图）
 
 ```
 ① 建站 Skill (site-builder/skills/)  ← Agent 客户端加载的"部署合同"说明书
@@ -91,6 +99,11 @@ python3 site-builder/scripts/gen_onboarding.py
 ④ 路由+鉴权层 (router/)              ← CloudFront *.{domain} + Lambda@Edge
         ↓ 未登录 302                     查路由表 → 验会话 JWT → 注入 x-user-email → 分流
 ⑤ 身份层 (site-builder/auth/)        ← Cognito(联邦到飞书) + 登录服务 + pre-token 触发器
+
+控制台 (site-builder/panel/)          ← console.{domain}，二期 M3；**建站仍只在 Agent 里**
+   走 ④ 的 split 路由：/api/* → panel Function URL(AWS_IAM 仅 edge role)，其余 → S3
+   自助改权限/协作者/所有权/看部署历史/下线；管理员另有全局视图与 admin 名单
+   写接口要"面板会话"（__Host-sb_console，由 auth 的 /console-session 发一次性 code 换取）
 ```
 
 理解整个系统的关键抽象：
@@ -135,12 +148,19 @@ python3 site-builder/scripts/gen_onboarding.py
   `AWS IAM REVOKE` 再 `DROP ROLE`（否则 2BP01）。
 - git push 用 `--no-verify`（用户全局约定）；us-east-1 是硬约束
   （Lambda@Edge/ACM/Quick 身份区域），换区要改代码。
+- **路由表的 `static_prefix` 不带尾斜杠**。Edge 的静态改写是
+  `f"/{static_prefix}{path}"` 且 `path` 已以 `/` 开头——带尾斜杠会拼出双斜杠，
+  与上传的 key 不是同一个对象，整站 403（两侧单测各自都会绿）。
+- **私有前端桶上，浏览器的约定路径一律 403 而非 404**（`/favicon.ico`、
+  `/robots.txt`、`/.well-known/*`）。排查线上 403 先分清"没权限"还是"没这个对象"。
+- **moto 不校验 IAM**：事务里的 `ConditionCheck` 需要 `dynamodb:ConditionCheckItem`，
+  漏给时单测全绿、真机 500。给 Lambda 加事务路径时同步核对角色策略。
 
 ## 文档地图
 
 | 要做什么 | 看哪里 |
 |---|---|
-| 部署到新账号 / 排查部署问题 | `site-builder/DEPLOY.md`（七阶段 + 全部实测坑） |
+| 部署到新账号 / 排查部署问题 | `site-builder/DEPLOY.md`（①→⑦ + ⑤b 控制台 + 全部实测坑） |
 | 客户端接入（人/Agent） | `site-builder/docs/client-setup.md`；含真实值版本跑 `gen_onboarding.py` |
 | 合同细节（给站点生成方） | `site-builder/skills/site-builder/references/{contract,redlines}.md` |
 | 一期设计决策与范围 | `docs/superpowers/specs/2026-07-21-quick-site-builder-design.md`（已实现快照，勿改） |

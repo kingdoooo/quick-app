@@ -3,7 +3,7 @@
 本文档是把本方案部署到**你自己的 AWS 账号**的操作手册，覆盖的是**需要真实 AWS
 资源、DNS、IdP 凭证**的部署门禁——这些无法自动化，也是单元测试覆盖不到的部分。
 
-**部署的是当前最新版本**：照 ①→⑦ 走一遍即可，无需先部旧版本再升级。
+**部署的是当前最新版本（含二期 M1-M3）**：照 ①→⑦ 走一遍即可（⑤b 控制台可选），无需先部旧版本再升级。
 已在运行旧版本的环境见[从一期环境升级](#从一期环境升级本仓库自己的环境走过这条路)。
 
 - **区域**：`us-east-1`（Lambda@Edge、ACM、Quick Desktop 身份区域共同强制）
@@ -277,20 +277,20 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
 
 ## 部署顺序总览
 
-**这份 Runbook 部署的是当前最新版本（含二期 M1+M2）。全新账号照 ①→⑦ 走一遍
+**这份 Runbook 部署的是当前最新版本（含二期 M1-M3）。全新账号照 ①→⑦ 走一遍
 即可，不需要"先部一期再升级"。** 已经跑着一期的环境要升级，见文末
 [从一期环境升级](#从一期环境升级本仓库自己的环境走过这条路)。
 
 组件间有依赖，必须按序：
 
 ```
-①身份层        →  ②路由层  →  ③DSQL  →  ④执行器  →  ⑤部署MCP  →  ⑥客户端接入  →  ⑦端到端彩排
-   deploy_pool.py   CloudFront    cluster    SFN+Lambda   AgentCore     Skill+MCP      RUN_E2E
-   + deploy_auth    (Task 8)      (Task 13)  (Task 17)    (Task 20)     (Task 22)      (Task 23)
+①身份层        →  ②路由层  →  ③DSQL  →  ④执行器  →  ⑤部署MCP  →  ⑤b控制台   →  ⑥客户端接入  →  ⑦端到端彩排
+   deploy_pool.py   CloudFront    cluster    SFN+Lambda   AgentCore     deploy_panel   Skill+MCP      RUN_E2E
+   + deploy_auth    (Task 8)      (Task 13)  (Task 17)    (Task 20)     (二期 M3)      (Task 22)      (Task 23)
    (Task 3)
 ```
 
-依赖关系：②需要①产出的 JWT_SECRET（已在 SSM）与 edge role；④需要①的 boundary、②的 edge_role_arn、③的 DSQL endpoint；⑤需要④的 state_machine_arn 与①的 Cognito。
+依赖关系：②需要①产出的 JWT_SECRET（已在 SSM）与 edge role；④需要①的 boundary、②的 edge_role_arn、③的 DSQL endpoint；⑤需要④的 state_machine_arn 与①的 Cognito；**⑤b 需要②的 edge_role_arn、④的五张表与①的 jwt-secret**（可选组件：不部署它只是没有控制台，站点与 MCP 通道不受影响）。
 
 ④ 建 `site-admins` 表，而 **admin 种子必须在 ④ 之后单独跑**（CDK 只建表不写
 数据，漏了则谁都不是 admin——见 ① 末尾）。
@@ -917,6 +917,62 @@ MCP runtime 角色靠 `dynamodb:Attributes` 条件把可写字段收窄。**这�
 
 ---
 
+## ⑤b 自助管理控制台 — panel（二期 M3）
+
+业务人员在 `https://console.{base_domain}/` 自助管理站点权限/协作者/所有权/
+部署历史/下线；平台管理员另有全局站点视图与管理员名单。**站点仍然只能在 Agent
+客户端里创建**——控制台不建站。
+
+**为什么排在 ⑤ 之后**：它要 ② 产出的 `edge_role_arn`（Function URL 只授权这个
+角色）、④ 建的 `site-sites` / `site-deploy-jobs` / `site-admins` /
+`site-ops-log` / `site-session-codes` 五张表，以及 ① 的 `/site-builder/jwt-secret`
+（面板会话与站点会话同一套 HS256）。
+
+```bash
+cd site-builder/panel && python3 deploy_panel.py
+# 只改后端不动前端： python3 deploy_panel.py --skip-frontend
+```
+
+脚本幂等，一次做五件事：复制依赖模块打包 → panel role → Lambda +
+Function URL(**AuthType=AWS_IAM，只授权 exact edge role**) → 前端上传到
+`platform/console/{version}/` → 注册 `console` route（`route_mode=split`：
+`/api/*` 走 Function URL，其余走 S3）。
+
+**DNS/证书不需要额外动作**：`console` 是 `*.{base_domain}` 通配证书与 CloudFront
+分发下的一个子域，② 建好之后它自动可解析。前提是 `console` 已在 Edge 的
+`PLATFORM_SUBDOMAINS` 白名单里（M3 的 Edge 版本已含，见 `verify_deployed_edge.sh`）。
+
+`auth` 服务需要 `/console-session` 端点（签发一次性升级码）。若你的 auth 是
+M3 之前部署的，**先重跑一次** `cd site-builder/auth && python3 deploy_auth.py`。
+
+**验收（部署完立刻跑，从仓库根）**：
+
+```bash
+python3 site-builder/scripts/verify_console_e2e.py     # 61 项
+```
+
+它覆盖未登录 fail-closed、伪造 `x-user-email` 直连 Function URL 仍 403、
+前端真的能加载、越权读写全拒且**线上数据零改动**、CSRF 四形态、合法写与审计、
+`/console-session` 全链路（含同一 code 重放 401）。会建 2 条 fixture 记录并自动
+清理（删后强一致读回核对）。
+
+**三个实测坑**（都会让控制台看起来"部署成功但打不开"）：
+
+- **`static_prefix` 不能带尾斜杠**。Edge 的静态改写是
+  `f"/{static_prefix}{path}"` 且 `path` 已以 `/` 开头——带尾斜杠会去取
+  `platform/console/v1//index.html`，与上传的单斜杠 key **不是同一个对象**，
+  整站 403。`verify_deployed_components.py` 第 ⑦ 段专门断言这一条。
+- **panel role 必须有路由表的 `dynamodb:ConditionCheckItem`**。
+  `write_permissions` 在"站点还没首次部署成功（无 route item）"时走降级事务，
+  对路由表做 `attribute_not_exists(subdomain)` 的 ConditionCheck；缺这个 action
+  时**对任何无 route 的站点做写操作都 500**。moto 不校验 IAM，所以单测全绿。
+- **私有桶上浏览器的约定路径一律 403（不是 404）**。`/favicon.ico`、
+  `/robots.txt`、`/.well-known/*` 这些浏览器会自作主张请求的路径在 S3 上不存在，
+  私有桶回 403，读起来像鉴权故障。前端已用内联 data URI 声明 favicon 消掉这条。
+  **排查线上 403 先分清"没权限"还是"没这个对象"。**
+
+---
+
 ## ⑥ 客户端接入（Task 22）
 
 **Claude Code（先做，自动化程度高）**：
@@ -969,6 +1025,8 @@ RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/tes
 | [Deployer] | edge_role_arn                                          | ② CfnOutput EdgeRoleArn     |
 | [Deployer] | state_machine_arn                                      | ④ CfnOutput StateMachineArn |
 | [MCP]      | endpoint_url                                           | ⑤                           |
+| [Alerting] | email                                                  | 你指定的告警收件人（**必须手工点确认订阅链接**） |
+| [Panel]    | ops_log_table / session_codes_table / console_version   | 直接用 `.example` 的默认值（⑤b 读它） |
 
 `router/config.ini` 的 `[SiteBuilder]` 还需 `require_idp_claim` /
 `trusted_idps`（见 ②）。
@@ -979,6 +1037,11 @@ RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/tes
 - [ ] `require_idp_claim = true` 且部署出去的 Edge 代码已核对（零占位符）
 - [ ] 登录失败告警由 `deploy_auth.py` 自动收敛（**不手工建**），且 `verify_auth_alarm.sh` 全绿（含声明收件人的 confirmed 订阅）
 - [ ] 自己走过一次真实登录，claim 值与 ① 的实测基线一致
+- [ ] （部署了 ⑤b 控制台时）`verify_console_e2e.py` 全绿，且在**真浏览器**里确认过
+      `__Host-sb_console` 落盘：Path=/、**无 Domain=**、HttpOnly+Secure。
+      DevTools 的 Domain 列对 `__Host-` cookie 显示的是**精确 host 且无前导点**，
+      那是浏览器推断的 host-only 归属，不代表服务端设了 Domain（设了会被整条丢弃）；
+      对比 `sb_session` 显示的是 `.{base_domain}`（**有**前导点 = 真的设了 Domain）
 
 SSM 参数：`/site-builder/jwt-secret`（§0 手工建）、`/site-builder/site-client-secret`（① 的 `deploy_pool.py` 写入）。
 
@@ -990,7 +1053,7 @@ SSM 参数：`/site-builder/jwt-secret`（§0 手工建）、`/site-builder/site
 - CloudFront 全站禁缓存（正确性优先；精细缓存延后）
 - 详见设计文档 §8 风险 / §9 范围外
 
-### 状态机级超时/中止不落账（job 会停在 RUNNING）
+### 状态机级超时/中止的落账（二期 M3 已闭合，此节保留说明机制）
 
 各步骤都挂了 `add_catch(States.ALL) → MarkFailed`，所以**步骤内**的失败都会把
 job 写成 FAILED（真机核对过：历史 3 个 FAILED 执行的 job 都是
@@ -1001,14 +1064,25 @@ job 写成 FAILED（真机核对过：历史 3 个 FAILED 执行的 job 都是
 - 状态机级 `TimeoutSeconds=1800`（30 分钟）到点 → 执行 `TIMED_OUT`；
 - 人工 `StopExecution` → 执行 `ABORTED`。
 
-这两类之后 job 会**永久停在 `RUNNING`**：用户既拿不到结果，也无法重试
-（`confirm_upload` 的条件迁移要求 `PENDING`，会返回"已启动过"）。目前只能人工
-把该 job 改成 FAILED，或让用户重新发起一次部署（会拿到新 job_id）。
+**二期 M3 已闭合这个缺口（原先 job 会永久停在 `RUNNING`）。** 现在是两层收敛，
+共用同一个条件更新函数（`deployer/functions/reconcile_job.py`）：
 
-要闭合需要一条 EventBridge 规则订阅 Step Functions 执行状态变更、对
-`TIMED_OUT`/`ABORTED` 把对应 job 落成 FAILED —— **未实现**。
-现状与该缺口由 `site-builder/scripts/verify_sfn_failure_paths.py` 持续核对
-（它会把历史上出现过的 TIMED_OUT/ABORTED 报成 FAIL，所以真的发生过就不会被漏掉）。
+- **实时层**：EventBridge 规则 `site-deploy-terminal-status` 订阅本状态机的
+  执行状态变更、只匹配 `TIMED_OUT`/`ABORTED` → `site-deployer-reconcile-job`
+  把对应 job 落成 FAILED（带 SQS DLQ）；
+- **兜底层**：`site-deployer-sweep-jobs` 由 Scheduler 每 30 分钟 `DescribeExecution`
+  扫一遍长时间 RUNNING 的 job（防事件丢失/规则被停用）。
+
+收敛是**条件更新且不带 phase 条件**（超时可发生在任意 phase），幂等、乱序安全、
+对不存在的 job 不创建、对已是终态的 job no-op。
+
+真机核对：`./site-builder/scripts/verify_sfn_failure_paths.py`（11 项，两层各自
+有效性都验）。规则与函数是否真的在线上启用，用这条看：
+
+```bash
+aws events list-rules --query "Rules[?Name=='site-deploy-terminal-status'].[Name,State]" --output text
+aws lambda get-function --function-name site-deployer-reconcile-job --query 'Configuration.LastModified' --output text
+```
 
 ### MCP runtime 的信任边界（不要外推 IAM 的保护范围）
 
