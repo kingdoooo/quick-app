@@ -23,7 +23,7 @@ import urllib.request
 import jwt as pyjwt
 from jwt import PyJWKClient
 
-from session import mint_session_jwt
+from session import mint_session_jwt, mint_upgrade_code, verify_session_jwt
 
 _jwks_client = None  # 模块级缓存，Lambda 容器复用
 # (值, 读取时刻) —— 带 TTL，见 _secret 的说明
@@ -471,6 +471,40 @@ def handler(event, context):
         clear_pkce = f"{PKCE_COOKIE}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax"
         return {"statusCode": 302, "headers": {"Location": redirect},
                 "cookies": [cookie, clear_pkce], "body": ""}
+
+    if path == "/console-session":
+        # 面板会话升级入口：顶域 sb_session（站点/平台通用）→ 一次性 code。
+        #
+        # **为什么要多这一跳**：面板会话必须是 console 域的 host-only
+        # `__Host-sb_console`，而本函数跑在 auth.{base} 上，跨域设不了那个
+        # cookie（`__Host-` 前缀禁止 Domain=）。所以走"auth 发 code → 302 到
+        # console → console 自己 Set-Cookie"（spec §5.4）。
+        #
+        # code 只出现在 Location：不设 cookie、不进 body，且 no-store。
+        # 它 60 秒过期且由 panel 侧原子消费一次（session-codes 表条件写）。
+        session_token = ""
+        for raw in (event.get("cookies") or []):
+            name_, _, value_ = raw.partition("=")
+            if name_.strip() == "sb_session":
+                session_token = value_
+                break
+        claims = verify_session_jwt(session_token, _secret("JWT_SECRET"))
+        if not claims:
+            # 无有效会话（缺失/过期/签名不过）：走完整登录，登录后**回到本
+            # 入口**再换 code。redirect 指回 console 首页是错的——那样用户
+            # 登录完了却仍没有面板会话，面板继续 401。
+            back = urllib.parse.quote(f"https://auth.{base}/console-session",
+                                      safe="")
+            return {"statusCode": 302,
+                    "headers": {"Location": f"https://auth.{base}/login?redirect={back}",
+                                "cache-control": "no-store"},
+                    "body": ""}
+        code = mint_upgrade_code(claims["email"], _secret("JWT_SECRET"))
+        target = (f"https://console.{base}/api/session-callback"
+                  f"?code={urllib.parse.quote(code, safe='')}")
+        return {"statusCode": 302,
+                "headers": {"Location": target, "cache-control": "no-store"},
+                "body": ""}
 
     if path == "/logout":
         # 清平台会话，然后**把用户送去 Cognito 的 /logout 结束托管登录会话**。
