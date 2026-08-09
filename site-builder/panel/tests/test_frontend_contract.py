@@ -699,6 +699,25 @@ def test_frontend_has_no_extensionless_asset_requests():
             f"无扩展名的资源引用 {attr!r} 会被 Edge 改写成 index.html")
 
 
+def test_declares_a_favicon_so_the_browser_stops_requesting_favicon_ico():
+    """必须声明 rel="icon"，否则浏览器自动请求 /favicon.ico → 必然 403。
+
+    Edge 把带扩展名的路径当静态资源去 S3 取（不改写成 index.html），
+    `platform/console/{v}/favicon.ico` 不存在，私有桶返回 **403**。
+    症状：每次打开控制台 DevTools 都记一条错误——真机截图里看到过。
+    内联 data URI 而不是放个 .ico 到 S3：少一个二进制产物、少一次请求。
+    """
+    html = "\n".join(p.read_text() for p in sorted(FE.rglob("*.html")))
+    html_nc = re.sub(r"<!--.*?-->", "", html, flags=re.S)
+    m = re.search(r"""<link[^>]*rel=["']icon["'][^>]*>""", html_nc, re.I)
+    assert m, ("没有 <link rel=\"icon\"> —— 浏览器会自动请求 /favicon.ico，"
+               "而 Edge 取不到该对象会返回 403")
+    tag = m.group(0)
+    assert "data:" in tag, (
+        "favicon 不是内联 data URI —— 指向一个 URL 就又多一次请求，"
+        "且该对象必须真的上传到 S3，否则还是 403")
+
+
 def test_index_html_exists_because_edge_rewrites_bare_paths_to_it():
     """Edge 对无扩展名路径一律改写到 `{prefix}index.html`。
 

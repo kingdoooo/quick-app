@@ -20,6 +20,15 @@
 <meta name="viewport" content="width=1280" />
 <meta name="referrer" content="same-origin" />
 <title>Site Builder Console · 站点管理</title>
+<!--
+  favicon 用内联 data URI，**不是**为了好看，是为了消掉一条必然的 403：
+  浏览器在没有 <link rel="icon"> 时会自动请求 /favicon.ico，Edge 把它当静态资源
+  去取 platform/console/{v}/favicon.ico（带扩展名，不会改写成 index.html），
+  该对象不存在 → 私有桶返回 **403** → 每次打开控制台，DevTools 都记一条错误。
+  声明了 rel="icon" 浏览器就不再猜 /favicon.ico，一个请求都不发。
+  （放一个真 .ico 到 S3 也能修，但那要多一个二进制产物 + 多一次请求。）
+-->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14'%3E%3Cpath d='M7 1.2 12.9 4.6 7 8 1.1 4.6 7 1.2Z' fill='%232563eb'/%3E%3Cpath d='M1.1 7.6 7 11 12.9 7.6' stroke='%232563eb' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
 <link rel="stylesheet" href="/app.css" />
 </head>
 <body>
