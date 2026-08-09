@@ -5,8 +5,10 @@ import configparser
 from pathlib import Path
 
 from aws_cdk import (App, CfnOutput, Duration, Environment, RemovalPolicy, Stack,
-                     aws_codebuild as cb, aws_dynamodb as ddb, aws_iam as iam,
-                     aws_lambda as lam_, aws_s3 as s3, aws_stepfunctions as sfn,
+                     aws_codebuild as cb, aws_dynamodb as ddb,
+                     aws_events as events, aws_events_targets as targets,
+                     aws_iam as iam, aws_lambda as lam_, aws_s3 as s3,
+                     aws_sqs as sqs, aws_stepfunctions as sfn,
                      aws_stepfunctions_tasks as tasks)
 from constructs import Construct
 
@@ -249,6 +251,83 @@ class SiteDeployerStack(Stack):
         CfnOutput(self, "StateMachineArn", value=sm.state_machine_arn)
         CfnOutput(self, "UndeployFnArn",
                   value=f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:site-deployer-undeploy")
+
+        # ---- M3 前置 B1：SFN 终态两层收敛 ----
+        # 缺口：状态机级 TimeoutSeconds 到点（TIMED_OUT）与人工 StopExecution
+        # （ABORTED）**不执行任何 State**——add_catch 只覆盖步骤内失败，于是
+        # mark_job 不被调用、job 永久停在 RUNNING，而 confirm_upload 只接受
+        # PENDING，用户既看不到结果也无法重试。
+        #
+        # 为什么两层：Step Functions 的状态变化事件是 **best-effort**（AWS 不
+        # 保证投递），只挂一条 EventBridge rule 不算闭合。sweeper 定时用
+        # DescribeExecution 兜底。
+        #
+        # **独立窄角色，不用 exec_role**：exec_role 有 dynamodb:* on site-*、
+        # iam:* on site-rt-*、Lambda 建删权限。reconciler 由外部事件触发，
+        # 只需要 jobs 表条件更新 + DescribeExecution + 自身日志。
+        recon_role = iam.Role(
+            self, "ReconcilerRole", role_name="site-deployer-reconciler-role",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            managed_policies=[iam.ManagedPolicy.from_aws_managed_policy_name(
+                "service-role/AWSLambdaBasicExecutionRole")])
+        recon_role.add_to_policy(iam.PolicyStatement(
+            # 只读 + 条件更新 jobs 表。**不给 PutItem/DeleteItem**：收敛只改
+            # 已存在行的 status/error/updated_at，给 PutItem 就等于允许凭空建行。
+            actions=["dynamodb:GetItem", "dynamodb:UpdateItem",
+                     "dynamodb:Scan"],
+            resources=[jobs.table_arn]))
+        recon_role.add_to_policy(iam.PolicyStatement(
+            actions=["states:DescribeExecution"],
+            resources=[f"arn:aws:states:{REGION}:{ACCOUNT}:execution:"
+                       f"{sm.state_machine_name}:*"]))
+
+        recon_env = {"JOBS_TABLE": jobs.table_name,
+                     "STATE_MACHINE_ARN": sm.state_machine_arn}
+
+        def recon_fn(cid: str, fn_name: str, handler: str) -> lam_.Function:
+            # 与 step_fn 不同：不需要 psycopg/contract，纯标准库 + boto3。
+            # 用 from_asset 直接打包 functions/ 目录（reconcile_job 只 import
+            # common，同目录）。
+            return lam_.Function(
+                self, cid, function_name=fn_name,
+                runtime=lam_.Runtime.PYTHON_3_13, handler=handler,
+                code=lam_.Code.from_asset(fn_dir),
+                role=recon_role, timeout=Duration.seconds(60),
+                memory_size=256, environment=recon_env)
+
+        f_recon = recon_fn("FnReconcile", "site-deployer-reconcile-job",
+                           "reconcile_job.handler")
+        f_sweep = recon_fn("FnSweepJobs", "site-deployer-sweep-jobs",
+                           "reconcile_job.sweeper_handler")
+
+        dlq = sqs.Queue(self, "ReconcileDlq",
+                        queue_name="site-deployer-reconcile-dlq",
+                        retention_period=Duration.days(14))
+
+        # rule 只匹配**本状态机**的 TIMED_OUT / ABORTED。
+        # 不匹配 FAILED：那条路径已由每个 Task 的 add_catch → MarkFailed 覆盖，
+        # 重复收敛会把 mark_job 写入的真实错因覆盖成通用文案。
+        events.Rule(
+            self, "TerminalStatusRule", rule_name="site-deploy-terminal-status",
+            event_pattern=events.EventPattern(
+                source=["aws.states"],
+                detail_type=["Step Functions Execution Status Change"],
+                detail={"status": ["TIMED_OUT", "ABORTED"],
+                        "stateMachineArn": [sm.state_machine_arn]}),
+            targets=[targets.LambdaFunction(
+                f_recon, dead_letter_queue=dlq,
+                retry_attempts=2,
+                max_event_age=Duration.hours(2))])
+
+        # 兜底层：30 分钟一轮（超龄阈值 45 分钟 = 状态机 30 分钟上限 + 余量，
+        # 见 reconcile_job.STALE_MINUTES）。
+        events.Rule(
+            self, "JobSweepRule", rule_name="site-deploy-job-sweep",
+            schedule=events.Schedule.rate(Duration.minutes(30)),
+            targets=[targets.LambdaFunction(
+                f_sweep, dead_letter_queue=dlq, retry_attempts=2)])
+
+        CfnOutput(self, "ReconcileDlqUrl", value=dlq.queue_url)
 
 
 app = App()
