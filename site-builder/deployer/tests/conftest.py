@@ -16,6 +16,7 @@ ENV = {"JOBS_TABLE": "site-deploy-jobs", "SITES_TABLE": "site-sites",
        "ACCOUNT_ID": "1",
        "ADMINS_TABLE": "site-admins",
        "PACKAGE_PROJECT": "site-package", "DSQL_ENDPOINT": "x.dsql.us-east-1.on.aws",
+       "STATE_MACHINE_ARN": "arn:aws:states:us-east-1:1:stateMachine:site-deploy",
        "AWS_DEFAULT_REGION": "us-east-1",
        "AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
 
