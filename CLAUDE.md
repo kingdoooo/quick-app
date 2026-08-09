@@ -9,11 +9,11 @@ Quick 自动化建站平台（Site Builder）：业务人员在任意支持 Skil
 `https://app-{site_id}.{base_domain}` 的可分享 URL。站点访问与管理权限绑定飞书账号
 （身份源可换成任意能给 email claim 的 Cognito 联邦 IdP）。
 
-**当前状态**：一期已在真实 AWS 全量部署并端到端验证（两条客户端通道都走通）。
-**二期 M1+M2（身份与权限）已部署；M3（控制台）Task 1-13 与 15 已完成并真机
-部署，Task 14（前端移植）与 16（回归+文档）未做**——接手前先按文末「文档地图」
-的「二期 M3 进行中」三个文件读一遍。二期需求清单在 `docs/phase2-requirements.md`。
-部署手册 `site-builder/DEPLOY.md` 含全部实测坑。
+**当前状态**：一期已在真实 AWS 全量部署并端到端验证（两条客户端通道都走通）；
+二期在推进中。**具体进度不写在本文件**（会过时）——见
+`docs/design/HANDOFF-2026-08-07.md` 的最新一节，那里是状态真源。
+二期需求清单在 `docs/phase2-requirements.md`；部署手册
+`site-builder/DEPLOY.md` 含全部实测坑。
 
 ## 测试命令（有坑，别猜）
 
@@ -147,16 +147,10 @@ python3 site-builder/scripts/gen_onboarding.py
 | 二期需求 | `docs/phase2-requirements.md` |
 | 任务级实现/审查历史（一期） | `.superpowers/sdd/progress.md` |
 
-**二期 M3（控制台）进行中——新会话从这里开始**（三个文件都 gitignored，
-含真实账号/资源值，**不要 `git add -f`**）：
+| 二期进度 / 当前在做什么 | `docs/design/HANDOFF-2026-08-07.md` 的**最新一节**（状态真源，gitignored） |
+| 二期实测发现与结论 | `docs/design/M3-FINDINGS.md`（gitignored；含可复用的断言自查清单） |
+| 二期任务级证据链 | `.superpowers/sdd/<计划日期>-<计划名>/progress.md` |
 
-| 顺序 | 文件 | 内容 |
-|---|---|---|
-| 1 | `docs/design/HANDOFF-2026-08-07.md` **更新 8** | 当前状态真源：进度、部署结果、闸门数字 |
-| 2 | `docs/design/M3-FINDINGS.md` | **实测发现与结论汇总**。§2 是本轮七次"守卫看着有效其实什么都没盯"的清单 + 可复用自查清单；§5 是 Task 14/16 的具体交接 |
-| 3 | `.superpowers/sdd/2026-08-08-phase2-m3-console/progress.md` | 逐任务证据链（比 git log 详细） |
-
-计划在 `docs/superpowers/plans/2026-08-08-phase2-m3-console.md`（Task 1-16 全部
-逐步骤展开）。**Task 1-13 与 15 已完成并真机部署，Task 14/16 未做。**
-`git log origin/master..HEAD` 是最可靠的事实（33 个提交未 push，用户指示
-commit 即可、暂不 push）。
+> **接手二期先读 HANDOFF 的最新一节**——进度、部署状态、闸门数字都在那里，
+> 本文件不重复（会过时）。`docs/design/` 与 `.superpowers/` 都 gitignored
+> （含真实账号/资源值），**不要 `git add -f`**。
