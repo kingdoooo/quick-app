@@ -2432,67 +2432,2813 @@ site_id/账号值**，用计数与形态描述）：
 
 ---
 
-> **Task 6-16 的详细步骤**：本计划已覆盖两个 Blocking 前置（Task 1-4，可立即
-> 开始实施）与 M3 数据层（Task 5）。Task 6-16 的接口契约、文件清单与验收标准
-> 已在上方「文件结构」「任务顺序与依赖」与 spec
-> `2026-08-09-phase2-m3-console-spec.md` 中锁定，逐步骤展开在 **Task 5 全部
-> 完成（含 Step 13-15 的真机部署、GSI ACTIVE、回填与读回）后**由控制器追加
-> ——`site-index` 的真机查询形态与 `created_at` 回填覆盖率（Step 15 记录进
-> progress.md）是 `/api/sites` 与 `/api/sites/{id}/jobs` 响应契约的输入。
-> Task 5 不产出这些就不算完成，展开工作不依赖其他未完成事项（Codex review
-> 2026-08-09：早先版本的 Task 5 只有单测与 commit、没有真机步骤，"等 Task 5
-> 真机结果"构成循环依赖——已由 Step 13-15 修复）。
-> **在 Task 6-16 逐步骤追加进本文件之前，不得开始实施这些任务。**
+> **Task 6-16 展开门禁：已解除（2026-08-09）。**
+> 门禁条件是 Task 5 Step 13-15 的真机产出，现已全部取得并记入
+> `.superpowers/sdd/2026-08-08-phase2-m3-console/progress.md`：
+> ① `site-index` 真机查询形态 —— 经 `common.list_jobs_by_site()` 实查，
+> `ScanIndexForward=False` 在真实数据上生效（created_at 严格倒序），
+> 投影字段恰好 9 个：`created_at / error / job_id / owner / phase /
+> site_id / status / updated_at / url`（`error` 与 `url` 恒存在但可能是空串），
+> 无跨站点混入；② `created_at` 回填覆盖率 **27/27，K=0**（无 job 站点为零），
+> 幂等已验。二者即 `/api/sites` 与 `/api/sites/{id}/jobs` 响应契约的输入。
 >
-> **Task 6-16 概要**（每个任务的 Files / Interfaces / 验收标准）：
+> **已知线上缺口（Task 13 收口）**：`SITE_WRITABLE_ATTRIBUTES` 的
+> `created_at` 已提交但 MCP 尚未重部署——现网 runtime role 对含 `created_at`
+> 的 UpdateItem 是 `implicitDeny`（`iam simulate-principal-policy` 实测）。
+> 即 deployer 栈已领先于 MCP runtime，**Task 13 部署 MCP 前经 MCP 新建站点
+> 会 AccessDenied**。
 >
-> - **Task 6 panel 授权与 API 纯函数**：`panel/api.py` 的 do_* 层 + `tests/test_authz.py`（owner/collaborator/outsider/admin × 各端点矩阵）+ `tests/test_no_handwritten_guards.py`。授权 100% 走 `permissions.assert_can` / 高层写函数。
->   **必须包含的两条结构性断言**（AST 解析 `panel/*.py`，不用文本匹配——注释里出现这些字样不算违规）：
->   ① panel 模块内不出现任何 `UpdateExpression=` / `ConditionExpression=` 关键字实参，也不出现对 sites/admins 表的 `put_item`/`update_item`/`delete_item` 调用；权限与 admin 写入只能是对 `permissions.<高层函数>` 的 Call。
->   ② admin 增删只能命中 `permissions.add_admin` / `permissions.remove_admin`——它们维护 `__count__` sentinel（`remove_admin` 的"不能删到名单为空"条件依赖它）。panel 若 raw 写 admins 表，sentinel 会与实际 item 数漂移，`remove_admin` 的守卫随之失效。
->   反向验证：在 `panel/api.py` 里临时插一句 `_admins_table().put_item(Item={"email": "x@x.com"})`，确认 ① ② 各自 FAIL 后删除。
-> - **Task 7 console-session + CSRF**：
->   ① **code 编解码单一实现进 `auth/session.py`**（`mint_upgrade_code` / `verify_upgrade_code`，HS256 同 JWT_SECRET，载荷 `typ="console-upgrade"` / `email` / `jti` / `exp`≤60s）；panel 构建时复制 `session.py`（同 common.py/permissions.py 模式）——**不得在 panel 里手写第二份编解码**；
->   ② `panel/console_session.py`：调 `verify_upgrade_code` + jti 条件写 `site-session-codes` 原子消费（`attribute_not_exists(jti)`）+ 重放拒绝 + `__Host-sb_console` cookie 构造（Secure/HttpOnly/SameSite=Lax/Path=//无 Domain）；
->   ③ **密钥交付**：panel 环境变量只下发 `JWT_SECRET_PARAM`（参数名），运行时 SSM 读 + TTL 缓存，照抄 auth 的 `_secret()` 模式。**明文严禁进环境变量**（GetFunctionConfiguration 会回显，拿到即可伪造任意用户会话——deploy_auth.py:54-65 已记录）；panel role 的 SSM 语句资源限定**精确 ARN** `parameter/site-builder/jwt-secret`（**不照抄 auth 的 `parameter/site-builder/*` 前缀**——那是 auth 自己还要读 site-client-secret 的业务需要，panel 拿前缀等于被攻破时顺带交出 Cognito client secret；Codex 复审第二轮 P2）+ `kms:Decrypt` ViaService 条件。Task 10 的 contract test 断言：SSM 资源 == 精确 jwt-secret ARN，出现 `*` 结尾的前缀即 FAIL；
->   ④ **交叉契约测试**：同一组用例向量（合法 code / 篡改各字段 / typ 不符 / 过期 / jti 重放）在 auth 与 panel 两个测试包各跑一遍，防两份复制品漂移；
->   ⑤ `tests/test_csrf.py`：**副作用前置顺序断言**——mock DynamoDB 客户端，验证 CSRF 失败路径下零写调用。
-> - **Task 8 ops-log 落点**：`permissions.py` 五个高层写函数 + undeploy 路径内落 ops-log（唯一落点，MCP 与控制台自动同轮覆盖）+ `panel/ops_log.py`（PutItem only、字段脱敏）+ `mcp/deploy_agentcore.py` 补 ops-log PutItem。
-> - **Task 9 panel handler 组装**：`panel/handler.py` 路由分发 + 五步前置校验顺序 + 错误码（401 `{"need":"console-session"}` / 403 / 409）。
-> - **Task 10 `deploy_panel.py`**：Lambda + Function URL + panel role（表清单见 spec §2，路由表**仅** UpdateItem）+ 前端上传 S3 `platform/console/{console_version}/` + console route 注册。
->   **Function URL trust 的三条可验证断言**（contract test + 真机各一遍）：
->   ① `AuthType == "AWS_IAM"`（不是 NONE——`NONE` + `Principal:*` 会被安全扫描自动处置，实测把整个 resource policy 删光）；
->   ② resource policy 恰好两条语句、Principal 是**逐字符 exact** edge role ARN（不是 `*`、不是账号根、不做前缀匹配），action 分别是 `lambda:InvokeFunctionUrl`（含 `FunctionUrlAuthType=AWS_IAM` 条件）与 `lambda:InvokeFunction`（含 `InvokedViaFunctionUrl=true` 条件）——2025-10 起缺任一条即 403；
->   ③ `edge_role_arn` 缺失/空串时 `deploy_panel.py` **抛错中止**，不得 fallback 到 `Principal:*` 或跳过授权（照抄 `deploy_lambda_site.py` 的 KeyError 形态）。
->   真机：unsigned `curl` 直连 Function URL 期望 403（这**只**证明 AuthType=AWS_IAM 在工作）；经 `https://console.{base_domain}` 期望 200。**只有请求确实经过 Edge，`x-user-email` 才可信**——②③ 是这个前提的唯一保证。
->   反向验证 Principal 精确绑定（**不能用 unsigned curl**：AWS_IAM 下未签名请求恒 403，与 resource policy 无关——把 Principal 改成 `*` 后 unsigned curl 依然 403，永远得不到"变 200"的信号；照那个思路做的实施者可能改 AuthType=NONE 去"让测试通过"，反而真正公开 endpoint。Codex review 2026-08-09 P2）：
->   用一个**非 Edge、且无 identity-based lambda:InvokeFunctionUrl 权限**的已签名 IAM principal（如临时建的探针角色）发 SigV4 请求：
->   ① Principal=exact edge role 时 → 探针请求 403（resource policy 不认它）；
->   ② 临时把 Principal 改成 `*` 部署 → 同一探针请求变 200（证明改的就是这条边界）；
->   ③ 还原 exact Principal 重新部署 → 探针再次 403；contract test 同步确认 FAIL→PASS。
->   探针角色用完即删（trap 清理，与 verify 脚本的探针数据同纪律）。
-> - **Task 11 Edge console 白名单 + 平台前缀 S3 权限**：
->   ① `PLATFORM_SUBDOMAINS` 加 `console`、`RESERVED_COOKIES` 加两个 `__Host-`（origin_request/origin_response 两文件同步）+ 伪造 platform route 负测；
->   ② **`stack.py` Edge role 的 S3 policy 加 `{frontend_bucket}/platform/*`**（Codex review 2026-08-09 P1：现只有 `sites/*`，而 console 前端在 `platform/console/{version}/`、route_mode=split 的非 `/api/*` 请求走 S3 SigV4 分支——缺这条则控制台首页 AccessDenied 加载不出来）。收窄取向：给 `platform/*` 而非整桶，站点前缀与平台前缀仍然分离；
->   ③ `verify_deployed_edge.sh` 断言产物含新白名单/新保留 cookie、CloudFront 实际关联版本。**S3 IAM 生效的真机验证用临时探针，不用 console 首页**（Codex 复审第二轮 P1：Task 11 与 Task 10 并行、前端要到 Task 14 才上传——console route/S3 key 此时都不存在，`https://console.{domain}/` 的 404/403 与 IAM 是否正确无关，会把正确的修复误判失败）：上传临时对象 `platform/probe-{随机}/index.html` + 注册临时 probe route（`app-probe-{随机}`，require_auth=False、static_prefix 指向该前缀）→ 经 CloudFront 请求期望 200（探针对象在 `platform/*` 下，200 即证明新 IAM 语句生效）→ trap 清理 route 与对象并强一致读回核对（同 smoke_router.sh 的清理纪律）。**console 首页 200（带会话 cookie）的端到端验收归 Task 14**（那时 route/前端/Edge 全部就位）；
->   ④ CDK 断言：Edge role 的 S3 语句资源集合 == `{sites/*, platform/*}`（不多不少——出现整桶 `/*` 即 FAIL）。
->   反向验证：临时把 `platform/*` 那条删掉 synth → CDK 断言 FAIL；（真机负向不必做——部署前的 AccessDenied 已由现状证明。）
-> - **Task 12 auth `/console-session`**：`session.py` 加 `mint_upgrade_code` / `verify_upgrade_code`（Task 7 契约的签发端）；`login_handler.py` 加 `/console-session` 路径（校验顶域 `sb_session` 有效 → `mint_upgrade_code(email)` → 302 到 `https://console.{base_domain}/api/session-callback?code=...`；无有效会话则 302 到 `/login?redirect=<console-session URL>` 走完整登录）；`__Host-sb_pkce` 与新 cookie 的作用域测试；重部署 auth（`python3 deploy_auth.py`）后真机验证 302 链路。
-> - **Task 13 三层部署 + `verify_deployed_components.py`**：重构自 `verify_contract_fixtures.py`（7 段，旧脚本删除、文档引用同步），部署 deployer/Edge/auth/panel/MCP 并逐一核对产物。另含三项收口：
->   ① **MCP 部署后补跑第二轮 created_at 回填**（dry-run → apply → 读回）：Task 5 回填到 Task 13 部署新 MCP 之间，线上旧 MCP 建的新站点仍走旧 `upsert_site` 不写 created_at（Codex 复审第二轮 P2 时序缺口）。最终 E2E 前要求除 `无 job 跳过` 外零缺失；
->   ② **真机 IAM 探针**（Task 5 Step 5b 的收口）：以 runtime role 凭证对 sites 表发含 `created_at` 的条件 UpdateItem（探针 site_id，写后即删），确认白名单更新真的生效；
->   ③ console 首页端到端（Task 11 移交过来的验收前置——route/前端/Edge 就位后才有意义）。
-> - **Task 14 前端移植 + panel E2E**：原型视图层进 `panel/frontend/`（去敏感值、`window.API` 换真 fetch、M4/M5 入口 disabled、PHASE_LABEL 按 jobs 表真实词表重写、undeploy 改轮询、FAILED 展示层派生）+ spec §7 的 13 项 E2E 全覆盖。
-> - **Task 15 fixture 自动清理**（可与 6-14 并行，**必须在 Task 16 前完成**）：`smoke_router.sh` 随机后缀 + trap + 只删本次 + 强一致读回 + 最小断言数 + `--keep-on-failure`；`test_e2e_fixtures.py` finalizer（记录本次 site_id/job_id、默认 undeploy + purge、清理失败即测试失败、禁按 owner 批量删）。
-> - **Task 16 全量回归与文档收尾**：五个包测试 + 七个真机闸门 + `DEPLOY.md` 新阶段 + `CLAUDE.md` 同步（panel venv 归属、验收脚本改名、`deploy_panel.py` 部署命令）+ `progress.md` + HANDOFF 更新 6。
+> 以下 Task 6-16 为逐步骤展开版本。**实施顺序与写范围互斥见上方「任务顺序与
+> 依赖」**，但注意一处调整：`permissions.py` 原定 Task 8 独占，现 Task 6
+> 也要改它（`resync_route`）——两者**顺序执行同一文件**，不并发。
+
+
+## Task 6: panel 授权与 API 纯函数
+
+**Files:**
+- Create: `site-builder/panel/api.py`（`do_*` 纯函数层，无 HTTP 形态）
+- Create: `site-builder/panel/tests/conftest.py`（moto 表夹具）
+- Create: `site-builder/panel/tests/test_authz.py`（角色 × 端点矩阵）
+- Create: `site-builder/panel/tests/test_no_handwritten_guards.py`（AST 结构性断言）
+- Modify: `site-builder/deployer/functions/permissions.py`（新增 `resync_route`）
+- Modify: `CLAUDE.md`（panel 包借 deployer venv 的约定）
+
+**Interfaces:**
+- Produces（全部是纯函数，入参已是"Edge 认证过的身份"，**不做 HTTP 解析**）：
+  - `do_me(email, name) -> dict` —— `{email, name, is_admin}`
+  - `do_list_sites(email, *, all_sites=False) -> list[dict]`
+  - `do_get_site(email, site_id) -> dict`
+  - `do_list_jobs(email, site_id) -> list[dict]`
+  - `do_set_access(email, site_id, *, require_login=None, allowed_users=None) -> dict`
+  - `do_set_collaborators(email, site_id, *, add=None, remove=None) -> dict`
+  - `do_transfer_owner(email, site_id, *, new_owner) -> dict`
+  - `do_undeploy(email, site_id, *, purge_data=False) -> dict`
+  - `do_list_admins(email) -> list[str]` / `do_add_admin(email, target)` / `do_remove_admin(email, target)`
+  - `do_resync(email, site_id) -> dict`
+  - `permissions.resync_route(site_id, *, actor) -> dict`（以 sites 表为准重投影路由）
+- Consumes: `permissions.{assert_can,role_of,is_admin,list_admins,add_admin,remove_admin,set_access_policy,set_collaborators,transfer_owner,PermissionDenied,PermissionConflict}`、`common.{get_site,get_site_consistent,list_sites_for_user,list_jobs_by_site,subdomain_for,_paginate}`
+
+**计划级偏差（控制器裁决，已记 ledger）**：`resync_route` 放 `permissions.py`
+而不是 panel——「panel 不得手写 UpdateExpression / 路由投影」是硬约束，resync
+的本质就是投影，只能进 permissions。原「`permissions.py` 由 Task 8 独占」的
+写范围互斥因此调整为 **Task 6 → Task 8 顺序执行同一文件**（本轮是控制器串行
+实施，不存在并发 subagent 抢同一文件的风险）。
+
+- [ ] **Step 1: 写失败测试（授权矩阵）**
+
+创建 `site-builder/panel/tests/conftest.py`：照抄 `site-builder/mcp/tests/conftest.py`
+的整体形态（同一套表 + 同一组 ENV），差异只有三处：
+① `sys.path` 插入 `panel` 目录与 `deployer/functions`；
+② ENV 增加 `"OPS_LOG_TABLE": "site-ops-log"`、`"SESSION_CODES_TABLE": "site-session-codes"`、
+`"JWT_SECRET_PARAM": "/site-builder/jwt-secret"`、`"CONSOLE_HOST": "console.example.com"`；
+③ 建表清单增加 `site-session-codes`（PK `jti`）——`site-ops-log` 与 jobs 的
+`site-index` GSI 在 mcp conftest 里已有，照抄过来即可（**Task 5 已确认这两处
+夹具形态与真机一致**）。
+
+创建 `site-builder/panel/tests/test_authz.py`：
+
+```python
+"""panel 授权矩阵：owner / collaborator / admin / outsider × 各端点。
+
+**为什么要整矩阵而不是抽查**：CAPABILITIES 里 collaborator 有
+set_access_policy 但**没有** manage_collaborators / transfer_owner /
+undeploy。这个不对称是 M2 三轮审查的结论（transfer_owner 把旧 owner 降为
+collaborator 后不能再下线站点），panel 必须继承它而不是自己发明一套。
+"""
+import pytest
+
+# (action 名, 调用 api 的 lambda) —— 写操作一律带副作用，便于断言"拒绝时零写"
+WRITE_CALLS = {
+    "set_access_policy": lambda who: __import__("api").do_set_access(
+        who, "s-1", require_login=False),
+    "manage_collaborators": lambda who: __import__("api").do_set_collaborators(
+        who, "s-1", add=["new@x.com"]),
+    "transfer_owner": lambda who: __import__("api").do_transfer_owner(
+        who, "s-1", new_owner="new@x.com"),
+}
+
+# 期望矩阵直接从 permissions.CAPABILITIES 推导，**不手抄第二份**：
+# 手抄的那份会与真源漂移，而漂移方向通常是"放宽"（历史教训）。
+
+
+def _seed(site_id="s-1"):
+    import common
+    common._table("SITES_TABLE").put_item(Item={
+        "site_id": site_id, "owner": "owner@x.com", "name": "s",
+        "status": "ACTIVE", "collaborators": ["collab@x.com"],
+        "require_login": True, "allowed_users": "org", "permissions_rev": 1})
+    common._table("ROUTING_TABLE").put_item(Item={
+        "subdomain": common.subdomain_for(site_id), "site_id": site_id,
+        "owner": "owner@x.com", "require_auth": True, "allowed_users": "org",
+        "collaborators": ["collab@x.com"], "permissions_rev": 1})
+
+
+@pytest.mark.parametrize("action", sorted(WRITE_CALLS))
+@pytest.mark.parametrize("who,role", [("owner@x.com", "owner"),
+                                      ("collab@x.com", "collaborator"),
+                                      ("nobody@x.com", "none")])
+def test_write_matrix_matches_capabilities(aws, action, who, role):
+    import api, permissions
+    _seed()
+    allowed = role in permissions.CAPABILITIES[action]
+    if allowed:
+        WRITE_CALLS[action](who)          # 不抛即通过
+    else:
+        with pytest.raises(permissions.PermissionDenied):
+            WRITE_CALLS[action](who)
+
+
+def test_admin_gets_owner_grade_powers_on_others_site(aws):
+    """admin 代管：CAPABILITIES 里 admin 与 owner 同集合。"""
+    import api, permissions
+    _seed()
+    permissions.add_admin("boss@x.com", "seed")
+    api.do_transfer_owner("boss@x.com", "s-1", new_owner="new@x.com")
+    import common
+    assert common.get_site("s-1")["owner"] == "new@x.com"
+
+
+def test_outsider_cannot_even_read_and_message_hides_existence(aws):
+    """站点不存在与无权访问必须**同一句话**（否则是站点枚举探测器）。"""
+    import api, permissions
+    _seed()
+    with pytest.raises(permissions.PermissionDenied) as a:
+        api.do_get_site("nobody@x.com", "s-1")
+    with pytest.raises(permissions.PermissionDenied) as b:
+        api.do_get_site("nobody@x.com", "s-does-not-exist")
+    assert str(a.value) == str(b.value)
+
+
+def test_list_sites_all_requires_admin(aws):
+    import api, permissions
+    _seed()
+    with pytest.raises(permissions.PermissionDenied):
+        api.do_list_sites("owner@x.com", all_sites=True)
+    permissions.add_admin("boss@x.com", "seed")
+    assert api.do_list_sites("boss@x.com", all_sites=True)
+
+
+def test_list_sites_mine_excludes_others(aws):
+    import api
+    _seed()
+    _seed("s-2")
+    import common
+    common.upsert_site("s-2", owner="other@x.com", collaborators=[])
+    got = {s["site_id"] for s in api.do_list_sites("owner@x.com")}
+    assert got == {"s-1"}
+
+
+def test_admin_endpoints_require_admin(aws):
+    import api, permissions
+    for call in (lambda: api.do_list_admins("owner@x.com"),
+                 lambda: api.do_add_admin("owner@x.com", "x@x.com"),
+                 lambda: api.do_remove_admin("owner@x.com", "x@x.com")):
+        with pytest.raises(permissions.PermissionDenied):
+            call()
+
+
+def test_resync_requires_admin_and_rebuilds_route_from_sites(aws):
+    """resync 以 sites 表为准重投影——被人为改脏的 route 必须被纠正。"""
+    import api, common, permissions
+    _seed()
+    permissions.add_admin("boss@x.com", "seed")
+    # 人为把投影改脏：把 require_auth 改成 False（等于站点被公开）
+    common._table("ROUTING_TABLE").update_item(
+        Key={"subdomain": common.subdomain_for("s-1")},
+        UpdateExpression="SET require_auth = :f",
+        ExpressionAttributeValues={":f": False})
+    with pytest.raises(permissions.PermissionDenied):
+        api.do_resync("owner@x.com", "s-1")     # 非 admin 不行
+    api.do_resync("boss@x.com", "s-1")
+    route = common._table("ROUTING_TABLE").get_item(
+        Key={"subdomain": common.subdomain_for("s-1")})["Item"]
+    assert route["require_auth"] is True, "resync 没有把投影纠回 sites 表的值"
+
+
+def test_jobs_history_is_newest_first_and_derives_duration(aws):
+    import api, common
+    _seed()
+    for jid, c, u in [("job-1", "2026-06-01T00:00:00+00:00",
+                       "2026-06-01T00:01:40+00:00"),
+                      ("job-2", "2026-07-01T00:00:00+00:00",
+                       "2026-07-01T00:00:30+00:00")]:
+        common._table("JOBS_TABLE").put_item(Item={
+            "job_id": jid, "site_id": "s-1", "owner": "owner@x.com",
+            "status": "SUCCEEDED", "phase": "smoke-test", "error": "", "url": "",
+            "created_at": c, "updated_at": u})
+    jobs = api.do_list_jobs("owner@x.com", "s-1")
+    assert [j["job_id"] for j in jobs] == ["job-2", "job-1"]
+    assert jobs[0]["duration_s"] == 30 and jobs[1]["duration_s"] == 100
+    assert jobs[0]["by"] == "owner@x.com"      # requested_by 语义
+```
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `cd site-builder/panel && ../deployer/.venv/bin/pytest tests -q`
+Expected: FAIL（`ModuleNotFoundError: No module named 'api'`）。
+**不是 collection error 就算过**——若报的是 `conftest` 里 moto 建表失败，
+先修夹具再继续（夹具坏掉会让后面每一步都在错误的地基上）。
+
+- [ ] **Step 3: 在 `permissions.py` 加 `resync_route`**
+
+在 `transfer_owner` 之后追加。**它是 panel「不手写投影」约束的落点**：
+
+```python
+def resync_route(site_id: str, *, actor: str) -> dict:
+    """以 sites 表为准重投影路由表（仅 admin；phase2 spec §8 的人工修复口）。
+
+    与 write_permissions 的区别：**不改 sites 表、不推进 rev**——它修的是
+    投影漂移（人为改库、迁移中断），真源本身没问题。所以这里只写 route，
+    且投影字段集合必须与 write_permissions 的 route_update **完全一致**
+    （少一个字段就等于"修完还是脏的"）；由 test_resync_projects_same_fields
+    从两处的 UpdateExpression 解析比对锁定，不靠人记得同步。
+
+    rev 用 sites 表当前值原样投影（不 +1）：register_route 用 route.rev 与
+    sites.rev 比对判断"我读到的策略是否最新"，这里若虚增会让下一次合法部署
+    误判成"权限被并发修改"。
+    """
+    if not is_admin(actor):
+        raise PermissionDenied("仅平台管理员可重投影路由")
+    site = _site_or_raise(site_id, consistent=True)
+    rev = int(site.get("permissions_rev", 0))
+    effective = {
+        "require_login": bool(site.get("require_login", True)),
+        "allowed_users": normalize_allowed_users(site.get("allowed_users")),
+        "collaborators": list(site.get("collaborators") or []),
+        "owner": site.get("owner", ""),
+    }
+    _ddb_client().update_item(
+        TableName=os.environ["ROUTING_TABLE"],
+        Key={"subdomain": {"S": common.subdomain_for(site_id)}},
+        UpdateExpression=("SET require_auth = :a, allowed_users = :u, "
+                          "collaborators = :c, #ro = :o, permissions_rev = :rv"),
+        ConditionExpression="attribute_exists(subdomain)",
+        ExpressionAttributeNames={"#ro": "owner"},
+        ExpressionAttributeValues={
+            ":a": {"BOOL": effective["require_login"]},
+            ":u": allowed_users_av(effective["allowed_users"]),
+            ":c": {"L": [{"S": e} for e in effective["collaborators"]]},
+            ":o": {"S": effective["owner"]},
+            ":rv": {"N": str(rev)}})
+    return {"site_id": site_id, "permissions_rev": rev, **effective}
+```
+
+在 `site-builder/deployer/tests/test_permissions.py` 追加投影字段一致性断言
+（**AST/文本解析两处 UpdateExpression 的实际取值**，不手抄字段清单）：
+
+```python
+def test_resync_projects_exactly_the_same_route_fields_as_write_permissions():
+    """两处投影字段必须一致；否则 resync"修完还是脏的"。
+
+    从源码解析实际的 UpdateExpression 取值再比对——手抄第二份清单时，
+    write_permissions 加字段这里不会失败（本仓库的既有教训）。
+    """
+    import ast
+    import re
+    from pathlib import Path
+    src = (Path(__file__).parents[1] / "functions" / "permissions.py").read_text()
+    tree = ast.parse(src)
+
+    def route_fields(fn_name, var_hint):
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == fn_name)
+        body = ast.unparse(fn)
+        # 只取投影到 ROUTING_TABLE 的那条 UpdateExpression
+        exprs = re.findall(r"'SET require_auth = [^']*'", body)
+        assert exprs, f"{fn_name} 里找不到路由投影表达式"
+        return set(re.findall(r"(#?\w+) = :", exprs[0]))
+
+    a = route_fields("write_permissions", "route_update")
+    b = route_fields("resync_route", None)
+    assert a == b, f"投影字段漂移：write_permissions={sorted(a)} resync={sorted(b)}"
+```
+
+- [ ] **Step 4: 写 `panel/api.py`**
+
+```python
+"""panel 各端点的纯函数层（do_* 模式，无 HTTP 形态）。
+
+**入参 email 已经是 Edge 验证过的身份**（`x-user-email`，只有请求确实经过
+CloudFront+Lambda@Edge 才会存在——Function URL 的 AWS_IAM + exact edge role
+resource policy 是这个前提的保证，见 deploy_panel.py）。本层不做任何身份
+解析，也不碰 cookie / Origin / CSRF —— 那些在 handler.py，且必须**前置于**
+本层的任何调用（spec §5.4：不得出现"先写 DynamoDB 再发现 CSRF 不合法"）。
+
+授权 100% 走 permissions.py 的高层函数：本文件不出现任何
+UpdateExpression / ConditionExpression / 角色判断 / rev 守卫 / admins 表直写。
+test_no_handwritten_guards.py 用 AST 锁定这一点。
+"""
+import os
+
+import common
+import permissions
+
+
+def _base() -> str:
+    return os.environ["BASE_DOMAIN"]
+
+
+def _site_url(site: dict) -> str:
+    sub = site.get("subdomain") or common.subdomain_for(site["site_id"])
+    return f"https://{sub}.{_base()}"
+
+
+def _require_admin(email: str) -> None:
+    """admin 专属端点的守卫。
+
+    用 permissions.is_admin（强一致读）而不是缓存/传入标志：撤权必须立刻生效。
+    """
+    if not permissions.is_admin(email):
+        raise permissions.PermissionDenied("仅平台管理员可执行此操作")
+
+
+def do_me(email: str, name: str) -> dict:
+    return {"email": email, "name": name,
+            "is_admin": permissions.is_admin(email)}
+
+
+def _shape_site(site: dict, viewer: str, *, viewer_is_admin: bool) -> dict:
+    return {"site_id": site["site_id"], "name": site.get("name", ""),
+            "status": site.get("status", ""), "url": _site_url(site),
+            "owner": site.get("owner", ""),
+            "created_at": site.get("created_at", ""),
+            "require_login": bool(site.get("require_login", True)),
+            "allowed_users": permissions.normalize_allowed_users(
+                site.get("allowed_users")),
+            "collaborators": list(site.get("collaborators") or []),
+            "role": permissions.role_of(viewer, site, viewer_is_admin)}
+
+
+def do_list_sites(email: str, *, all_sites: bool = False) -> list[dict]:
+    """mine（owner ∪ collaborator）或 admin 的全量列表。
+
+    created_at 可能为空——Task 5 回填对"无 job 的站点"**不猜**，前端按空处理。
+    """
+    is_adm = permissions.is_admin(email)
+    if all_sites:
+        _require_admin(email)
+        sites = common._paginate(common._table("SITES_TABLE").scan)
+    else:
+        sites = common.list_sites_for_user(email)
+    return [_shape_site(s, email, viewer_is_admin=is_adm)
+            for s in sorted(sites, key=lambda s: s.get("created_at", ""),
+                            reverse=True)]
+
+
+def do_get_site(email: str, site_id: str) -> dict:
+    site = common.get_site_consistent(site_id)
+    is_adm = permissions.is_admin(email)
+    # site 可能是 None——assert_can 对 None 返回 ROLE_NONE 并抛"无权访问（或
+    # 不存在）"，与"存在但无权"同一句话（防站点枚举）。不要在这里提前 404。
+    permissions.assert_can(email, site, "read", is_admin=is_adm,
+                           what=f"站点 {site_id}")
+    out = _shape_site(site, email, viewer_is_admin=is_adm)
+    out["subdomain"] = site.get("subdomain") or common.subdomain_for(site_id)
+    return out
+
+
+def do_list_jobs(email: str, site_id: str) -> list[dict]:
+    """部署历史（最新在前）。字段集合按 Task 5 真机确认的 9 个派生。"""
+    site = common.get_site_consistent(site_id)
+    permissions.assert_can(email, site, "read",
+                           is_admin=permissions.is_admin(email),
+                           what=f"站点 {site_id}")
+    out = []
+    for j in common.list_jobs_by_site(site_id):
+        out.append({"job_id": j["job_id"], "status": j.get("status", ""),
+                    "phase": j.get("phase", ""), "error": j.get("error", ""),
+                    "url": j.get("url", ""),
+                    "created_at": j.get("created_at", ""),
+                    # jobs.owner 是**发起者**（requested_by），不参与授权
+                    "by": j.get("owner", ""),
+                    "duration_s": _duration_s(j)})
+    return out
+
+
+def _duration_s(job: dict) -> int:
+    """updated_at - created_at，派生而不加新字段（spec §4 第 8 行）。"""
+    from datetime import datetime
+    try:
+        a = datetime.fromisoformat(job["created_at"])
+        b = datetime.fromisoformat(job["updated_at"])
+        return max(0, int((b - a).total_seconds()))
+    except Exception:
+        return 0
+
+
+def do_set_access(email: str, site_id: str, *, require_login=None,
+                  allowed_users=None) -> dict:
+    return permissions.set_access_policy(site_id, actor=email,
+                                         require_login=require_login,
+                                         allowed_users=allowed_users)
+
+
+def do_set_collaborators(email: str, site_id: str, *, add=None,
+                         remove=None) -> dict:
+    return {"collaborators": permissions.set_collaborators(
+        site_id, actor=email, add=add, remove=remove)}
+
+
+def do_transfer_owner(email: str, site_id: str, *, new_owner: str) -> dict:
+    return permissions.transfer_owner(site_id, actor=email,
+                                      new_owner=new_owner)
+
+
+def do_list_admins(email: str) -> list[str]:
+    _require_admin(email)
+    return permissions.list_admins()
+
+
+def do_add_admin(email: str, target: str) -> dict:
+    _require_admin(email)
+    permissions.add_admin(target, email)
+    return {"admins": permissions.list_admins()}
+
+
+def do_remove_admin(email: str, target: str) -> dict:
+    _require_admin(email)
+    permissions.remove_admin(target)
+    return {"admins": permissions.list_admins()}
+
+
+def do_resync(email: str, site_id: str) -> dict:
+    return permissions.resync_route(site_id, actor=email)
+```
+
+`do_undeploy` **不在本步实现**：它要复制 MCP 的"建 job 与权限快照守卫同一笔
+事务提交"逻辑（`_rev_condition_check` + admin ConditionCheck），那是 Task 9
+的内容（handler 层要一并处理异步与错误码）。本步只留 `do_get_site` 等读路径
+与四个已有高层写函数的薄封装。
+
+- [ ] **Step 5: 写结构性测试 `test_no_handwritten_guards.py`**
+
+```python
+"""panel 不得手写权限逻辑——AST 断言，注释/docstring 里出现字样不算违规。
+
+为什么必须 AST 而不是文本 grep：本文件断言的正是"panel 里没有
+UpdateExpression"，而 api.py 的 docstring 里就写着这个词。文本匹配会把
+说明文字当违规（假红），更糟的是有人为了让它变绿去删注释（真问题仍在）。
+本仓库还栽过反向的一次：断言的字样只留在注释里，改错代码测试照样绿。
+"""
+import ast
+from pathlib import Path
+
+PANEL = Path(__file__).parents[1]
+FORBIDDEN_KWARGS = {"UpdateExpression", "ConditionExpression",
+                    "ExpressionAttributeValues", "ExpressionAttributeNames"}
+RAW_WRITES = {"put_item", "update_item", "delete_item", "transact_write_items"}
+ADMIN_HELPERS = {"add_admin", "remove_admin", "rebuild_admin_count"}
+
+
+def _panel_modules():
+    return [p for p in PANEL.glob("*.py") if p.name != "deploy_panel.py"]
+
+
+def test_no_handwritten_dynamodb_expressions():
+    for path in _panel_modules():
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                bad = {kw.arg for kw in node.keywords} & FORBIDDEN_KWARGS
+                assert not bad, (
+                    f"{path.name} 手写了 DynamoDB 表达式 {sorted(bad)}"
+                    "——权限写入只能走 permissions.py 的高层函数")
+
+
+def test_no_raw_writes_to_sites_or_admins_tables():
+    """panel 只允许对 ops-log / session-codes 直写（两者都是它自己的表）。"""
+    allowed_tables = {"OPS_LOG_TABLE", "SESSION_CODES_TABLE"}
+    for path in _panel_modules():
+        src = path.read_text()
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in RAW_WRITES):
+                continue
+            # 该调用所在的表达式里必须出现 allowed_tables 之一
+            seg = ast.unparse(node)
+            assert any(t in seg for t in allowed_tables), (
+                f"{path.name} 对非自有表做了 {node.func.attr}：{seg[:120]}"
+                "——sites/admins/routing 的写入必须经 permissions.py")
+
+
+def test_admin_mutations_only_via_permissions_helpers():
+    """admin 增删只能命中 permissions.add_admin / remove_admin。
+
+    它们维护 __count__ sentinel，而 remove_admin 的"不能删到名单为空"条件
+    依赖它。panel 若 raw 写 admins 表，sentinel 与实际 item 数漂移，那道
+    守卫就失效了（能把管理员删空 = 平台失去管理入口）。
+    """
+    api = ast.parse((PANEL / "api.py").read_text())
+    calls = [n for n in ast.walk(api) if isinstance(n, ast.Call)]
+    hits = [n for n in calls if isinstance(n.func, ast.Attribute)
+            and n.func.attr in ADMIN_HELPERS]
+    assert hits, "api.py 没有经 permissions 的 admin 增删入口"
+    for n in hits:
+        assert isinstance(n.func.value, ast.Name) and n.func.value.id == "permissions", (
+            f"admin 增删没走 permissions.*：{ast.unparse(n)[:120]}")
+
+
+def test_no_role_string_comparisons_outside_permissions():
+    """panel 不得自己判角色（如 `if role == "owner"`）——授权走 assert_can。"""
+    for path in _panel_modules():
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Compare):
+                seg = ast.unparse(node)
+                for lit in ('"owner"', "'owner'", '"collaborator"',
+                            "'collaborator'"):
+                    assert lit not in seg or "role_of" in seg, (
+                        f"{path.name} 手写角色判定：{seg[:120]}")
+```
+
+- [ ] **Step 6: 运行测试确认通过**
+
+Run: `cd site-builder/panel && ../deployer/.venv/bin/pytest tests -q`
+Expected: PASS。
+Run: `cd site-builder/deployer && .venv/bin/pytest tests -q`
+Expected: PASS（`resync_route` 的投影一致性断言 +1）。
+
+- [ ] **Step 7: 反向验证（四条守卫各自会红）**
+
+1. 在 `panel/api.py` 里临时插 `permissions._admins_table().put_item(Item={"email": "x@x.com"})` →
+   Expected: `test_no_raw_writes_to_sites_or_admins_tables` **FAIL**
+2. 临时把 `do_add_admin` 里的 `permissions.add_admin(...)` 换成
+   `_admins_table().put_item(...)` →
+   Expected: `test_admin_mutations_only_via_permissions_helpers` **FAIL**
+3. 临时在 `api.py` 加一句带 `UpdateExpression=` 的调用 →
+   Expected: `test_no_handwritten_dynamodb_expressions` **FAIL**
+4. 把 `resync_route` 的投影表达式删掉 `collaborators = :c,` →
+   Expected: `test_resync_projects_exactly_the_same_route_fields_as_write_permissions` **FAIL**
+5. 把 `_require_admin` 改成 `return`（永真放行）→
+   Expected: `test_admin_endpoints_require_admin` 与
+   `test_list_sites_all_requires_admin` **FAIL**
+
+五处还原，重跑 PASS。**若某条没红，先修用例再继续**——它没有在盯它该盯的东西。
+
+- [ ] **Step 8: `CLAUDE.md` 补 panel venv 约定 + Commit**
+
+在测试命令块追加：
+```bash
+cd site-builder/panel && ../deployer/.venv/bin/pytest tests -q   # panel 无自己的 venv，借 deployer 的（需 moto+boto3）
+```
+
+```bash
+git add site-builder/panel/api.py site-builder/panel/tests/ \
+        site-builder/deployer/functions/permissions.py \
+        site-builder/deployer/tests/test_permissions.py CLAUDE.md
+bash site-builder/scripts/scan_staged_secrets.sh --files site-builder/panel/api.py \
+  site-builder/panel/tests/conftest.py site-builder/panel/tests/test_authz.py \
+  site-builder/panel/tests/test_no_handwritten_guards.py || exit 1
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1
+git diff --cached
+git commit -m "feat(panel): 授权与 API 纯函数层 + 结构性守卫
+
+- api.py do_* 层：授权 100% 走 permissions 高层函数，零手写
+  UpdateExpression / 角色判定 / rev 守卫
+- permissions.resync_route：以 sites 表为准重投影（仅 admin，不推进 rev
+  ——虚增会让下次合法部署误判"权限被并发修改"）
+- 授权矩阵从 CAPABILITIES 推导而非手抄（漂移方向通常是放宽）
+- 四条 AST 结构性断言（禁表达式/禁非自有表直写/admin 只走 helper/禁手写
+  角色比较）+ resync 与 write_permissions 投影字段一致性"
+```
+
+---
+
+## Task 7: console-session 一次性 code + CSRF 前置
+
+**Files:**
+- Modify: `site-builder/auth/session.py`（`mint_upgrade_code` / `verify_upgrade_code`——**单一实现**）
+- Create: `site-builder/panel/console_session.py`（验 code + jti 原子消费 + cookie 构造 + SSM 密钥读取）
+- Create: `site-builder/panel/tests/test_console_session.py`
+- Create: `site-builder/panel/tests/test_csrf.py`
+- Create: `site-builder/auth/tests/test_upgrade_code.py`
+- Create: `site-builder/panel/tests/upgrade_code_vectors.py`（两侧共用的用例向量）
+
+**Interfaces:**
+- Produces:
+  - `session.mint_upgrade_code(email: str, secret: str, ttl_seconds: int = 60) -> str`
+  - `session.verify_upgrade_code(code: str, secret: str, now: int | None = None) -> dict | None`
+  - `console_session.consume_code(code: str) -> str`（→ email；重放/过期/篡改抛 `UpgradeRejected`）
+  - `console_session.console_cookie(email: str, name: str) -> str`（`__Host-sb_console`）
+  - `console_session.verify_console_cookie(cookie_header: str, *, x_user_email: str) -> str`
+  - `console_session.check_csrf(method, headers) -> None`（抛 `CsrfRejected`）
+- Consumes: `session.mint_session_jwt(scope="console")` / `verify_session_jwt`
+
+**硬约束（spec §5.4，逐条落测）**：code 载荷 `typ="console-upgrade"` + `email` +
+`jti` + `exp`≤60s；jti 条件写 `site-session-codes` 原子消费；cookie
+`Secure/HttpOnly/SameSite=Lax/Path=//无 Domain`；**明文密钥严禁进环境变量**
+（只下发 `JWT_SECRET_PARAM` 参数名，运行时 SSM 读 + TTL 缓存）。
+
+- [ ] **Step 1: 写失败测试（共用向量 + 两侧各跑一遍）**
+
+创建 `site-builder/panel/tests/upgrade_code_vectors.py`（**auth 与 panel 两个
+测试包 import 同一份**，防两份复制品漂移）：
+
+```python
+"""upgrade code 的契约向量：auth 侧签、panel 侧验，两个包各跑一遍。
+
+为什么要共用一份：panel 构建时**复制** session.py，于是仓库里会有两份
+（`auth/session.py` 与打包进 panel 的副本）。复制品漂移是本项目已知的风险
+类型（Edge 与 session.py 的 HS256 就靠字节级同步测试盯着）。同一组向量在
+两侧都跑，漂移当场暴露。
+"""
+SECRET = "test-secret-not-a-real-one"
+
+# (名字, 变换函数, 期望 verify 结果为 None)
+MUTATIONS = [
+    ("完好", lambda c: c, False),
+    ("签名被截断", lambda c: c[:-4], True),
+    ("篡改 payload", lambda c: c.split(".")[0] + ".eyJhIjoxfQ." + c.split(".")[2], True),
+    ("整段替换成 login state 形态", lambda c: "abc.def.ghi", True),
+    ("空串", lambda c: "", True),
+]
+```
+
+创建 `site-builder/auth/tests/test_upgrade_code.py`：
+
+```python
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parents[2] / "panel" / "tests"))
+
+import session
+from upgrade_code_vectors import MUTATIONS, SECRET
+
+
+def test_payload_shape_is_the_declared_contract():
+    code = session.mint_upgrade_code("u@x.com", SECRET)
+    claims = session.verify_upgrade_code(code, SECRET)
+    assert claims["typ"] == "console-upgrade"    # 上下文标记
+    assert claims["email"] == "u@x.com"
+    assert claims["jti"] and len(claims["jti"]) >= 16
+    assert 0 < claims["exp"] - int(time.time()) <= 60
+
+
+def test_expired_code_is_rejected():
+    code = session.mint_upgrade_code("u@x.com", SECRET, ttl_seconds=1)
+    assert session.verify_upgrade_code(code, SECRET,
+                                       now=int(time.time()) + 5) is None
+
+
+def test_session_jwt_cannot_masquerade_as_upgrade_code():
+    """拿会话 JWT / login state 冒充 code 必须被 typ 挡住。"""
+    jwt = session.mint_session_jwt("u@x.com", "U", SECRET, scope="console")
+    assert session.verify_upgrade_code(jwt, SECRET) is None
+
+
+def test_upgrade_code_is_not_accepted_as_session_jwt():
+    """反向也不行——否则 60 秒 code 能当 4 小时会话用。"""
+    code = session.mint_upgrade_code("u@x.com", SECRET)
+    claims = session.verify_session_jwt(code, SECRET)
+    assert claims is None or claims.get("scope") != "console"
+
+
+@pytest.mark.parametrize("name,mutate,expect_none", MUTATIONS)
+def test_mutation_vectors(name, mutate, expect_none):
+    import pytest
+    code = mutate(session.mint_upgrade_code("u@x.com", SECRET))
+    got = session.verify_upgrade_code(code, SECRET)
+    assert (got is None) is expect_none, name
+```
+
+创建 `site-builder/panel/tests/test_console_session.py`：
+
+```python
+"""panel 侧：验 code、jti 原子消费、cookie 形态、cookie↔header 一致性。"""
+import pytest
+from upgrade_code_vectors import MUTATIONS, SECRET
+
+
+@pytest.fixture
+def secret(monkeypatch):
+    import console_session
+    monkeypatch.setattr(console_session, "_secret", lambda: SECRET)
+    return SECRET
+
+
+def test_code_is_single_use(aws, secret):
+    import console_session, session
+    code = session.mint_upgrade_code("u@x.com", SECRET)
+    assert console_session.consume_code(code) == "u@x.com"
+    with pytest.raises(console_session.UpgradeRejected):
+        console_session.consume_code(code)      # 重放
+
+
+def test_replay_is_rejected_by_conditional_write_not_by_a_read_check(aws, secret):
+    """并发重放：两个请求同时用同一 code，只有一个能成。
+
+    条件写（attribute_not_exists(jti)）才有这个性质；"先 get 再 put"的写法
+    在并发下两边都会看到"没用过"。
+    """
+    import console_session, session
+    code = session.mint_upgrade_code("u@x.com", SECRET)
+    ok = 0
+    for _ in range(2):
+        try:
+            console_session.consume_code(code)
+            ok += 1
+        except console_session.UpgradeRejected:
+            pass
+    assert ok == 1
+
+
+def test_consumed_jti_row_has_ttl(aws, secret):
+    """session-codes 是 60 秒一次性标记——必须带 TTL，否则表无限增长。"""
+    import boto3, console_session, session
+    console_session.consume_code(session.mint_upgrade_code("u@x.com", SECRET))
+    items = boto3.resource("dynamodb", region_name="us-east-1").Table(
+        "site-session-codes").scan()["Items"]
+    assert len(items) == 1 and int(items[0]["expires_at"]) > 0
+
+
+@pytest.mark.parametrize("name,mutate,expect_reject", MUTATIONS)
+def test_same_vectors_as_auth_side(aws, secret, name, mutate, expect_reject):
+    import console_session, session
+    code = mutate(session.mint_upgrade_code("u@x.com", SECRET))
+    if expect_reject:
+        with pytest.raises(console_session.UpgradeRejected):
+            console_session.consume_code(code)
+    else:
+        assert console_session.consume_code(code) == "u@x.com"
+
+
+def test_console_cookie_attributes(aws, secret):
+    import console_session
+    c = console_session.console_cookie("u@x.com", "U")
+    assert c.startswith("__Host-sb_console=")
+    for attr in ("Secure", "HttpOnly", "SameSite=Lax", "Path=/"):
+        assert attr in c, attr
+    assert "Domain=" not in c, "__Host- 前缀下带 Domain 浏览器会整条拒绝"
+
+
+def test_cookie_email_must_match_edge_header(aws, secret):
+    """换人登录后旧 __Host-sb_console 必须失效（spec §5.4 第 1 步）。
+
+    残留 cookie 属 A，Edge 注入的身份是 B —— 必须拒绝并要求重新升级，
+    否则 B 会拿着 A 的面板会话操作 A 的站点。
+    """
+    import console_session
+    cookie = console_session.console_cookie("a@x.com", "A").split(";")[0]
+    assert console_session.verify_console_cookie(cookie,
+                                                 x_user_email="a@x.com") == "a@x.com"
+    with pytest.raises(console_session.UpgradeRejected):
+        console_session.verify_console_cookie(cookie, x_user_email="b@x.com")
+
+
+def test_scope_must_be_console(aws, secret):
+    """站点会话 cookie（无 scope）不能当面板会话用。"""
+    import console_session, session
+    site_jwt = session.mint_session_jwt("u@x.com", "U", SECRET)
+    with pytest.raises(console_session.UpgradeRejected):
+        console_session.verify_console_cookie(f"__Host-sb_console={site_jwt}",
+                                              x_user_email="u@x.com")
+```
+
+创建 `site-builder/panel/tests/test_csrf.py`：
+
+```python
+"""CSRF 五步前置校验，以及**副作用前置顺序**的断言。"""
+import pytest
+
+GOOD = {"origin": "https://console.example.com",
+        "content-type": "application/json"}
+
+
+def test_accepts_wellformed_write():
+    import console_session
+    console_session.check_csrf("PUT", GOOD)      # 不抛
+
+
+@pytest.mark.parametrize("headers,why", [
+    ({**GOOD, "origin": "https://evil.example.com"}, "Origin 不匹配"),
+    ({"content-type": "application/json"}, "缺 Origin"),
+    ({**GOOD, "content-type": "text/plain"}, "Content-Type 不是 json"),
+    ({**GOOD, "origin": "http://console.example.com"}, "http 而非 https"),
+])
+def test_rejects(headers, why):
+    import console_session
+    with pytest.raises(console_session.CsrfRejected):
+        console_session.check_csrf("PUT", headers)
+
+
+def test_missing_origin_does_not_fall_back_to_referer():
+    """spec §5.4 第 3 步：缺 Origin 直接拒绝，**不回退 Referer**。
+
+    Referer 会被代理/隐私设置改写，拿它当同源证据等于给出一条绕过路径。
+    """
+    import console_session
+    with pytest.raises(console_session.CsrfRejected):
+        console_session.check_csrf(
+            "POST", {"referer": "https://console.example.com/x",
+                     "content-type": "application/json"})
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD", "PATCH", "OPTIONS"])
+def test_write_methods_are_whitelisted(method):
+    import console_session
+    with pytest.raises(console_session.CsrfRejected):
+        console_session.check_csrf(method, GOOD)
+```
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `cd site-builder/panel && ../deployer/.venv/bin/pytest tests/test_console_session.py tests/test_csrf.py -q`
+Expected: FAIL（`ModuleNotFoundError: console_session`）
+Run: `cd site-builder/auth && ../contract/.venv/bin/pytest tests/test_upgrade_code.py -q`
+Expected: FAIL（`AttributeError: module 'session' has no attribute 'mint_upgrade_code'`）
+
+- [ ] **Step 3: `session.py` 加 code 的单一实现**
+
+在 `verify_session_jwt` 之后追加。**与会话 JWT 同文件是有意的**——该文件已是
+auth / Edge / panel 三方字节级同步的锚点：
+
+```python
+# ---- console-session 的一次性 upgrade code（M3）----
+# **单一实现**：panel 构建时复制本文件（同 common.py / permissions.py 模式），
+# 不得在 panel 里手写第二份编解码。两侧测试跑同一组向量防复制品漂移。
+#
+# 与会话 JWT 的区别（都不是可选项）：
+#   · typ="console-upgrade" —— 上下文标记。没有它，login state / PKCE cookie /
+#     会话 JWT 可以跨上下文冒充（spec §5.4）。verify 端**先查 typ 再看别的**。
+#   · exp ≤ 60s —— code 只在 302 跳转的那一瞬间有效。
+#   · jti —— 由调用方原子消费一次（panel 的 session-codes 条件写）。
+#     签发端不记状态：谁消费谁负责，签发端记状态会变成第二个真源。
+UPGRADE_TYP = "console-upgrade"
+UPGRADE_MAX_TTL = 60
+
+
+def mint_upgrade_code(email: str, secret: str, ttl_seconds: int = UPGRADE_MAX_TTL) -> str:
+    ttl = min(int(ttl_seconds), UPGRADE_MAX_TTL)
+    header = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"},
+                                separators=(",", ":")).encode())
+    claims = {"typ": UPGRADE_TYP, "email": email,
+              "jti": _b64url(secrets.token_bytes(16)),
+              "exp": int(time.time()) + ttl}
+    payload = _b64url(json.dumps(claims, separators=(",", ":")).encode())
+    return f"{header}.{payload}.{_sign(f'{header}.{payload}'.encode(), secret)}"
+
+
+def verify_upgrade_code(code: str, secret: str, now: int | None = None) -> dict | None:
+    """→ claims 或 None。**任何异常都归为 None**（fail-closed）。"""
+    try:
+        header_b64, payload_b64, sig = code.split(".")
+        expected = _sign(f"{header_b64}.{payload_b64}".encode(), secret)
+        if not hmac.compare_digest(sig, expected):
+            return None
+        claims = json.loads(_b64url_decode(payload_b64))
+        # typ 必须先查：这是"不能跨上下文复用"的唯一技术保证
+        if claims.get("typ") != UPGRADE_TYP:
+            return None
+        if not claims.get("email") or not claims.get("jti"):
+            return None
+        if int(claims.get("exp", 0)) <= (now if now is not None else int(time.time())):
+            return None
+        return claims
+    except Exception:
+        return None
+```
+
+文件顶部 `import secrets`（若尚无）。
+
+**同时给 `mint_session_jwt` 的会话 claim 加 `typ` 断言口**：不改它的载荷
+（会破一期已签发 token 的兼容性），而是在 `verify_upgrade_code` 里靠
+`typ != "console-upgrade"` 拒绝——会话 JWT 没有 `typ` claim，天然不等。
+
+- [ ] **Step 4: 写 `panel/console_session.py`**
+
+```python
+"""面板会话：一次性 code 消费 → __Host-sb_console cookie，以及 CSRF 五步。
+
+**本模块不实现 code 的编解码**——单一实现在 auth/session.py，deploy_panel.py
+打包时复制过来（同 common.py / permissions.py 模式）。这里只做三件事：
+① 用 verify_upgrade_code 验签后**原子消费 jti**（条件写 session-codes）；
+② 构造/校验 __Host-sb_console（scope=console 的会话 JWT，TTL 4h）；
+③ CSRF 五步校验，且必须**前置于**一切业务副作用（spec §5.4）。
+
+密钥：环境变量只有参数名 JWT_SECRET_PARAM，运行时从 SSM SecureString 读 +
+TTL 缓存（照抄 auth 的 _secret 模式）。**明文严禁进环境变量**——
+GetFunctionConfiguration 会原样回显，拿到 JWT_SECRET 即可伪造任意用户会话。
+"""
+import os
+import time
+from datetime import datetime, timezone
+
+import boto3
+
+import session
+
+CONSOLE_COOKIE = "__Host-sb_console"
+CONSOLE_SCOPE = "console"
+CONSOLE_TTL_SECONDS = 4 * 3600
+SECRET_TTL_SECONDS = 300
+_secret_cache: dict[str, tuple[str, float]] = {}
+
+
+class UpgradeRejected(Exception):
+    """code/cookie 不可信。handler 转 401 + {"need": "console-session"}。"""
+
+
+class CsrfRejected(Exception):
+    """前置校验未过。handler 转 403，且**此时尚未发生任何副作用**。"""
+
+
+def _secret() -> str:
+    name = os.environ["JWT_SECRET_PARAM"]
+    hit = _secret_cache.get(name)
+    if hit is not None and time.monotonic() - hit[1] < SECRET_TTL_SECONDS:
+        return hit[0]
+    value = boto3.client("ssm", region_name=os.environ.get(
+        "AWS_DEFAULT_REGION", "us-east-1")).get_parameter(
+            Name=name, WithDecryption=True)["Parameter"]["Value"]
+    _secret_cache[name] = (value, time.monotonic())
+    return value
+
+
+def consume_code(code: str) -> str:
+    """验 code 并**原子消费** jti → email。任何不可信情形抛 UpgradeRejected。
+
+    条件写而不是"先查再写"：并发重放下后者两边都会看到"没用过"。
+    """
+    claims = session.verify_upgrade_code(code or "", _secret())
+    if not claims:
+        raise UpgradeRejected("升级码无效或已过期")
+    import botocore.exceptions
+    table = boto3.resource("dynamodb", region_name=os.environ.get(
+        "AWS_DEFAULT_REGION", "us-east-1")).Table(
+            os.environ["SESSION_CODES_TABLE"])
+    try:
+        table.put_item(
+            Item={"jti": claims["jti"], "email": claims["email"],
+                  "consumed_at": datetime.now(timezone.utc).isoformat(),
+                  # TTL：一次性标记，留 1 小时足够排查，之后自动消失
+                  "expires_at": int(time.time()) + 3600},
+            ConditionExpression="attribute_not_exists(jti)")
+    except botocore.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            raise UpgradeRejected("升级码已被使用") from e
+        raise
+    return claims["email"]
+
+
+def console_cookie(email: str, name: str) -> str:
+    """__Host-sb_console。
+
+    __Host- 前缀是浏览器强制的：必须 Secure、必须 Path=/、**必须无 Domain**。
+    不要给本函数加 domain 参数——任何 Domain= 都会让浏览器整条丢弃 cookie，
+    表现为"登录成功但面板一直 401"（auth 的 PKCE cookie 有同样的注释）。
+    """
+    token = session.mint_session_jwt(email, name, _secret(),
+                                     ttl_seconds=CONSOLE_TTL_SECONDS,
+                                     scope=CONSOLE_SCOPE)
+    return (f"{CONSOLE_COOKIE}={token}; Secure; HttpOnly; "
+            f"SameSite=Lax; Path=/; Max-Age={CONSOLE_TTL_SECONDS}")
+
+
+def verify_console_cookie(cookie_header: str, *, x_user_email: str) -> str:
+    """→ email。验签 + 未过期 + scope==console + **与 Edge 身份一致**。
+
+    最后一条不能省：换人登录后浏览器里可能还留着前一个人的
+    __Host-sb_console（4h TTL），而 x-user-email 是 Edge 刚验过的真身份。
+    不一致就必须重新升级，否则 B 拿着 A 的面板会话操作 A 的站点。
+    """
+    token = ""
+    for part in (cookie_header or "").split(";"):
+        k, _, v = part.strip().partition("=")
+        if k == CONSOLE_COOKIE:
+            token = v
+            break
+    if not token:
+        raise UpgradeRejected("缺少面板会话")
+    claims = session.verify_session_jwt(token, _secret())
+    if not claims:
+        raise UpgradeRejected("面板会话无效或已过期")
+    if claims.get("scope") != CONSOLE_SCOPE:
+        raise UpgradeRejected("该会话不是面板会话")
+    if not x_user_email or claims.get("email") != x_user_email:
+        raise UpgradeRejected("面板会话与当前登录身份不一致")
+    return claims["email"]
+
+
+WRITE_METHODS = ("PUT", "POST", "DELETE")
+
+
+def check_csrf(method: str, headers: dict) -> None:
+    """spec §5.4 的 Origin / Content-Type / 方法三项（会话校验在调用方）。
+
+    **缺 Origin 直接拒绝，不回退 Referer**：Referer 会被代理与隐私设置改写，
+    拿它当同源证据就是一条绕过路径。
+    """
+    if (method or "").upper() not in WRITE_METHODS:
+        raise CsrfRejected(f"方法 {method} 不允许用于写操作")
+    expected = f"https://{os.environ['CONSOLE_HOST']}"
+    origin = (headers or {}).get("origin", "")
+    if not origin:
+        raise CsrfRejected("缺少 Origin 头")
+    if origin != expected:
+        raise CsrfRejected("Origin 不匹配")
+    ctype = (headers or {}).get("content-type", "")
+    if not ctype.startswith("application/json"):
+        raise CsrfRejected("Content-Type 必须是 application/json")
+```
+
+- [ ] **Step 5: 运行测试确认通过**
+
+Run: `cd site-builder/panel && ../deployer/.venv/bin/pytest tests -q`
+Run: `cd site-builder/auth && ../contract/.venv/bin/pytest tests -q`
+Expected: 两处 PASS。
+
+> `panel/tests/conftest.py` 需把 `auth` 目录也加进 `sys.path`（测试期直接
+> import `session`，不依赖构建时复制）。**并加一条断言：`deploy_panel.py`
+> 的复制清单必须包含 `session.py`**——测试期能 import 不等于部署产物里有它
+> （Task 10 Step 4 的 contract test 落这条）。
+
+- [ ] **Step 6: 反向验证**
+
+1. 删掉 `verify_upgrade_code` 里的 `typ` 检查 →
+   Expected: `test_session_jwt_cannot_masquerade_as_upgrade_code`（auth 侧）
+   与 panel 侧同名向量 **FAIL**
+2. 把 jti 消费的 `ConditionExpression` 删掉 →
+   Expected: `test_code_is_single_use` 与
+   `test_replay_is_rejected_by_conditional_write_not_by_a_read_check` **FAIL**
+3. 把 `verify_console_cookie` 的 email 一致性检查删掉 →
+   Expected: `test_cookie_email_must_match_edge_header` **FAIL**
+4. 把 `check_csrf` 的"缺 Origin 拒绝"改成回退 Referer →
+   Expected: `test_missing_origin_does_not_fall_back_to_referer` **FAIL**
+5. `console_cookie` 加 `Domain=example.com` →
+   Expected: `test_console_cookie_attributes` **FAIL**
+
+五处还原重跑 PASS。
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add site-builder/auth/session.py site-builder/auth/tests/test_upgrade_code.py \
+        site-builder/panel/console_session.py site-builder/panel/tests/
+bash site-builder/scripts/scan_staged_secrets.sh --files \
+  site-builder/panel/console_session.py site-builder/panel/tests/test_csrf.py \
+  site-builder/panel/tests/test_console_session.py \
+  site-builder/panel/tests/upgrade_code_vectors.py \
+  site-builder/auth/tests/test_upgrade_code.py || exit 1
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1
+git diff --cached
+git commit -m "feat(panel): console-session 一次性 code + CSRF 前置校验
+
+- code 编解码单一实现进 auth/session.py（panel 构建时复制），typ=
+  console-upgrade 挡跨上下文冒充，exp<=60s
+- jti 走条件写原子消费：'先查再写'在并发重放下两边都会看到没用过
+- __Host-sb_console 无 Domain（带了浏览器整条丢弃）+ cookie email 必须等于
+  Edge 注入的 x-user-email（换人登录后旧 cookie 立即失效）
+- CSRF 缺 Origin 直接拒绝、不回退 Referer（Referer 可被改写）
+- 同一组向量在 auth 与 panel 两侧各跑一遍，防构建时复制品漂移
+- 密钥只下发 SSM 参数名，明文不进环境变量（GetFunctionConfiguration 回显）"
+```
+
+---
+
+## Task 8: ops-log 落点（permissions.py 内部，MCP 与控制台同轮覆盖）
+
+**Files:**
+- Create: `site-builder/panel/ops_log.py`（PutItem only + 字段脱敏）
+- Modify: `site-builder/deployer/functions/permissions.py`（五个高层写函数内落一条）
+- Modify: `site-builder/deployer/functions/undeploy.py`（下线路径落一条）
+- Modify: `site-builder/mcp/deploy_agentcore.py`（runtime role 补 ops-log PutItem）
+- Create: `site-builder/deployer/tests/test_ops_log.py`
+- Modify: `site-builder/mcp/tests/test_agentcore_contract.py`（IAM 断言）
+
+**Interfaces:**
+- Produces: `ops_log.record(*, actor, action, target, result, detail=None, request_id="") -> None`
+- 表形态（Task 5 已建）：PK `target`、SK `ts_actor` = `{ts}#{actor}`、TTL `expires_at`（400 天）
+
+**为什么落点在 `permissions.py` 内部而不是 panel handler**：唯一真源原则。
+在 handler 层落，MCP 侧的同一个动作就漏记了（MCP 不经 panel handler）。
+放进高层写函数，控制台与 MCP **自动同轮覆盖**（spec §5.5）。
+
+**关键取向（spec §5.5）**：业务成功 + 落日志失败 → **返回成功**并打 ERROR 日志，
+不得把已成功的业务动作回滚成未知状态。
+
+- [ ] **Step 1: 写失败测试**
+
+创建 `site-builder/deployer/tests/test_ops_log.py`：
+
+```python
+"""ops-log：五个高层写函数 + undeploy 各落一条，且不记敏感字段。"""
+import boto3
+import pytest
+
+
+def _logs():
+    return boto3.resource("dynamodb", region_name="us-east-1").Table(
+        "site-ops-log").scan()["Items"]
+
+
+def _seed(site_id="s-1", owner="owner@x.com"):
+    import common
+    common._table("SITES_TABLE").put_item(Item={
+        "site_id": site_id, "owner": owner, "name": "s", "status": "ACTIVE",
+        "collaborators": [], "require_login": True, "allowed_users": "org",
+        "permissions_rev": 1})
+    common._table("ROUTING_TABLE").put_item(Item={
+        "subdomain": common.subdomain_for(site_id), "site_id": site_id,
+        "owner": owner, "require_auth": True, "allowed_users": "org",
+        "collaborators": [], "permissions_rev": 1})
+
+
+def test_set_access_policy_records(aws):
+    import permissions
+    _seed()
+    permissions.set_access_policy("s-1", actor="owner@x.com", require_login=False)
+    rows = _logs()
+    assert len(rows) == 1
+    assert rows[0]["action"] == "set_access_policy"
+    assert rows[0]["actor"] == "owner@x.com"
+    assert rows[0]["target"] == "site:s-1"
+    assert rows[0]["result"] == "ok"
+    assert int(rows[0]["expires_at"]) > 0        # TTL 必须有
+
+
+def test_collaborators_transfer_and_admins_all_record(aws):
+    import permissions
+    _seed()
+    permissions.set_collaborators("s-1", actor="owner@x.com", add=["c@x.com"])
+    permissions.transfer_owner("s-1", actor="owner@x.com", new_owner="new@x.com")
+    permissions.add_admin("boss@x.com", "seed")
+    permissions.remove_admin("boss@x.com") if False else None
+    actions = {r["action"] for r in _logs()}
+    assert {"manage_collaborators", "transfer_owner", "add_admin"} <= actions
+
+
+def test_admin_removal_records(aws):
+    import permissions
+    permissions.add_admin("a@x.com", "seed")
+    permissions.add_admin("b@x.com", "seed")
+    permissions.remove_admin("b@x.com")
+    assert any(r["action"] == "remove_admin" for r in _logs())
+
+
+def test_denied_write_also_records(aws):
+    """失败操作也要有可判读记录（spec §5.5）。"""
+    import permissions
+    _seed()
+    with pytest.raises(permissions.PermissionDenied):
+        permissions.set_access_policy("s-1", actor="nobody@x.com",
+                                      require_login=False)
+    rows = [r for r in _logs() if r["result"] != "ok"]
+    assert rows and rows[0]["action"] == "set_access_policy"
+    assert rows[0]["actor"] == "nobody@x.com"
+
+
+def test_log_failure_does_not_break_a_succeeded_business_action(aws, monkeypatch):
+    """落日志失败**不得**把已成功的业务动作变成未知状态。"""
+    import common, ops_log, permissions
+    _seed()
+
+    def boom(**kw):
+        raise RuntimeError("ops-log 表挂了")
+
+    monkeypatch.setattr(ops_log, "_put", boom)
+    permissions.set_access_policy("s-1", actor="owner@x.com", require_login=False)
+    # 业务动作必须已落地
+    assert common.get_site("s-1")["require_login"] is False
+
+
+def test_no_secrets_recorded(aws):
+    """不记 token / cookie / secret / 完整 key / 上游错误原文。
+
+    **按整行断言而非逐字段**：逐字段检查漏掉了未来新增的字段，而"整行不含
+    这些字样"对新增字段自动生效（本项目既有教训）。
+    """
+    import json
+    import permissions
+    _seed()
+    permissions.set_access_policy("s-1", actor="owner@x.com",
+                                  allowed_users=["a@x.com"])
+    blob = json.dumps(_logs(), default=str).lower()
+    for bad in ("authorization", "bearer ", "cookie", "secret", "__host-",
+                "eyj", "aws_access", "sessiontoken"):
+        assert bad not in blob, f"ops-log 里出现敏感字样 {bad!r}"
+
+
+def test_sort_key_is_ts_then_actor(aws):
+    import permissions
+    _seed()
+    permissions.set_access_policy("s-1", actor="owner@x.com", require_login=False)
+    row = _logs()[0]
+    ts, _, actor = row["ts_actor"].partition("#")
+    assert actor == "owner@x.com" and ts.startswith("20")
+```
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `cd site-builder/deployer && .venv/bin/pytest tests/test_ops_log.py -q`
+Expected: FAIL（`ModuleNotFoundError: ops_log`）
+
+- [ ] **Step 3: 写 `panel/ops_log.py`**
+
+放 panel 目录但**由 deployer 的 permissions.py 引用**——与 `common.py` /
+`permissions.py` 反向复制同理：`deploy_panel.py` 打包 panel 时带 permissions，
+而 deployer 的 Lambda 打包时需要带 ops_log。**为避免双向复制**，本文件
+物理放在 `site-builder/deployer/functions/ops_log.py`（与 permissions 同目录，
+两个部署链都已经在复制这个目录），panel 侧照现有模式复制。
+
+> **计划级修正**：原骨架写 `panel/ops_log.py`。实际它必须被
+> `deployer/functions/permissions.py` import，而 deployer 的 Lambda 打包只
+> 复制 `functions/` 目录——放 panel 会让 deployer 侧运行时 ImportError。
+> 落点改为 `deployer/functions/ops_log.py`（唯一真源，两条部署链都自动带上）。
+
+```python
+"""操作审计（append-only）。**唯一写入点**，被 permissions.py 的高层写函数与
+undeploy 路径调用，因此 MCP 与控制台自动同轮覆盖（spec §5.5）。
+
+两条硬规则：
+① **只 PutItem**，不 update/delete——审计记录不可改写（IAM 侧也只给 PutItem）；
+② **业务成功 + 落日志失败 → 业务仍算成功**。审计是旁路，不能把一个已经提交
+   的权限变更变成"用户不知道成没成"的未知状态。所以 record() 内部吞异常并打
+   ERROR 日志；调用方不需要 try。
+"""
+import json
+import logging
+import os
+import time
+from datetime import datetime, timezone
+
+import boto3
+
+log = logging.getLogger(__name__)
+TTL_DAYS = 400
+
+# 绝不入库的字段名（大小写不敏感的子串匹配）。detail 里出现即整体丢弃该键。
+_SENSITIVE = ("secret", "token", "cookie", "authorization", "password",
+              "api_key", "apikey", "credential")
+_ddb = None
+
+
+def _table():
+    global _ddb
+    if _ddb is None:
+        _ddb = boto3.resource("dynamodb", region_name=os.environ.get(
+            "AWS_DEFAULT_REGION", "us-east-1"))
+    return _ddb.Table(os.environ["OPS_LOG_TABLE"])
+
+
+def _scrub(detail) -> str:
+    """detail 只允许扁平的可 JSON 化小结构，敏感键整体丢弃，长度截断。"""
+    if detail is None:
+        return ""
+    if isinstance(detail, dict):
+        detail = {k: v for k, v in detail.items()
+                  if not any(s in str(k).lower() for s in _SENSITIVE)}
+    try:
+        out = json.dumps(detail, default=str, ensure_ascii=False)
+    except Exception:
+        out = "<unserializable>"
+    return out[:1024]
+
+
+def _put(**item) -> None:
+    """真正的写入（测试用 monkeypatch 替换它来模拟落库失败）。"""
+    _table().put_item(Item=item)
+
+
+def record(*, actor: str, action: str, target: str, result: str,
+           detail=None, request_id: str = "") -> None:
+    """写一条审计。**任何异常都被吞掉**——见模块 docstring 第 ② 条。"""
+    try:
+        now = datetime.now(timezone.utc)
+        _put(target=target,
+             ts_actor=f"{now.isoformat()}#{actor}",
+             actor=actor, action=action, result=result,
+             detail=_scrub(detail), request_id=request_id or "",
+             expires_at=int(time.time()) + TTL_DAYS * 86400)
+    except Exception:
+        # 不 re-raise：业务动作已经成功，审计失败不能改变它的结果
+        log.exception("ops-log 写入失败 action=%s target=%s", action, target)
+```
+
+- [ ] **Step 4: 在 `permissions.py` 的高层写函数落点**
+
+`write_permissions` 是三个站点级写函数的公共出口——**落在它里面**，三处
+自动覆盖，且不会漏掉将来新增的写函数（比在每个 setter 里各写一遍更稳）。
+在它的 return 之前、以及各 `raise` 路径上落：
+
+```python
+    # ---- ops-log（spec §5.5）----
+    # 落在 write_permissions 而不是三个 setter 里：这里是唯一出口，
+    # 将来新增写函数自动获得审计，不需要记得补。
+    ops_log.record(actor=actor, action=action, target=f"site:{site_id}",
+                   result="ok",
+                   detail={"role": role, "rev": rev + 1})
+```
+
+授权失败路径（`assert_can` 抛 `PermissionDenied`）也要落。做法是把
+`assert_can` 那一行包起来：
+
+```python
+    try:
+        role = assert_can(actor, site, action, is_admin=caller_is_admin,
+                          what=f"站点 {site_id}")
+    except PermissionDenied as e:
+        # 失败操作也要有可判读记录（spec §5.5）。**不记异常原文**——
+        # 它含站点存在性提示，而审计表的读者与被拒者不是同一批人时，
+        # 原文会成为侧信道。只记结构化的 result。
+        ops_log.record(actor=actor, action=action, target=f"site:{site_id}",
+                       result="denied")
+        raise
+```
+
+`add_admin` / `remove_admin` 各在成功后落一条（target 用 `admins:{email}`）。
+`undeploy.py` 在成功删除后落一条（target `site:{site_id}`、action `undeploy`、
+detail 带 `purge_data` 布尔值）。
+
+顶部 `import ops_log`。
+
+- [ ] **Step 5: MCP runtime role 补 ops-log PutItem**
+
+`deploy_agentcore.py` 的 policy 追加（**只 PutItem**）：
+
+```python
+        # ops-log：审计 append-only。只 PutItem——不给 Update/Delete/Get，
+        # 被攻破的 runtime 不能改写或读取审计历史。
+        {"Sid": "OpsLogAppendOnly", "Effect": "Allow",
+         "Action": "dynamodb:PutItem",
+         "Resource": f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-ops-log"},
+```
+
+`test_agentcore_contract.py` 追加断言：
+
+```python
+def test_ops_log_is_append_only_for_mcp_runtime():
+    """审计表只能 PutItem——给了 Update/Delete 就等于允许篡改审计。"""
+    stmts = _role_statements()      # 复用本文件既有的 policy 提取 helper
+    ops = [s for s in stmts if "site-ops-log" in json.dumps(s.get("Resource"))]
+    assert ops, "MCP runtime role 缺 ops-log 权限——权限变更会写审计失败"
+    actions = set()
+    for s in ops:
+        a = s["Action"]
+        actions |= set(a if isinstance(a, list) else [a])
+    assert actions == {"dynamodb:PutItem"}, f"ops-log 权限过宽: {sorted(actions)}"
+```
+
+- [ ] **Step 6: 运行测试确认通过**
+
+Run: `cd site-builder/deployer && .venv/bin/pytest tests -q`
+Run: `cd site-builder/mcp && python3 -m pytest tests -q`
+Run: `cd site-builder/panel && ../deployer/.venv/bin/pytest tests -q`
+Expected: 三处 PASS。
+
+> **注意 conftest 影响**：`ops_log.record` 现在被 `write_permissions` 无条件
+> 调用，所以**任何**已有的权限测试都会写 ops-log 表。deployer 与 mcp 两个
+> conftest 必须已建该表（Task 5 已加）——若某个测试包报
+> `ResourceNotFoundException`，是它的 conftest 漏了表，不是 ops_log 的问题。
+
+- [ ] **Step 7: 反向验证**
+
+1. 把 `ops_log.record` 的 `try/except` 去掉（让异常外抛）→
+   Expected: `test_log_failure_does_not_break_a_succeeded_business_action` **FAIL**
+2. 把 `_scrub` 的敏感键过滤删掉，并临时在某个 record 调用里传
+   `detail={"cookie": "x"}` →
+   Expected: `test_no_secrets_recorded` **FAIL**
+3. 把授权失败路径的 `ops_log.record` 删掉 →
+   Expected: `test_denied_write_also_records` **FAIL**
+4. MCP policy 里把 ops-log 的 Action 改成 `dynamodb:*` →
+   Expected: `test_ops_log_is_append_only_for_mcp_runtime` **FAIL**
+
+四处还原重跑 PASS。
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add site-builder/deployer/functions/ops_log.py \
+        site-builder/deployer/functions/permissions.py \
+        site-builder/deployer/functions/undeploy.py \
+        site-builder/deployer/tests/test_ops_log.py \
+        site-builder/mcp/deploy_agentcore.py \
+        site-builder/mcp/tests/test_agentcore_contract.py
+bash site-builder/scripts/scan_staged_secrets.sh --files \
+  site-builder/deployer/functions/ops_log.py \
+  site-builder/deployer/tests/test_ops_log.py || exit 1
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1
+git diff --cached
+git commit -m "feat(deployer): ops-log 审计落点在 permissions 高层写函数内部
+
+- 落点选 write_permissions（唯一出口）而非三个 setter：将来新增写函数自动
+  获得审计；放 panel handler 会让 MCP 侧漏记
+- ops_log.py 物理放 deployer/functions（不是 panel）：permissions.py 要
+  import 它，而 deployer Lambda 只打包 functions/ 目录
+- 业务成功 + 落日志失败 → 仍返回成功（审计是旁路，不能把已提交的变更变成
+  未知状态）；record() 内部吞异常打 ERROR
+- 授权失败也落一条，但**不记异常原文**（含站点存在性提示，会成侧信道）
+- MCP runtime role 只补 PutItem：给 Update/Delete 等于允许篡改审计"
+```
+
+---
+
+## Task 9: panel handler 组装（五步前置 + 错误码）
+
+**Files:**
+- Create: `site-builder/panel/handler.py`
+- Create: `site-builder/panel/tests/test_handler.py`
+- Modify: `site-builder/panel/api.py`（补 `do_undeploy`）
+
+**Interfaces:**
+- Produces: `handler(event, context) -> dict`（Function URL / API Gateway v2 payload 形态）
+  - 路由表：`GET /api/me`、`GET /api/sites`、`GET /api/sites/{id}`、
+    `GET /api/sites/{id}/jobs`、`PUT /api/sites/{id}/permissions`、
+    `PUT /api/sites/{id}/collaborators`、`PUT /api/sites/{id}/owner`、
+    `POST /api/sites/{id}/undeploy`、`GET /api/admins`、`PUT /api/admins`、
+    `DELETE /api/admins`、`POST /api/admin/resync/{id}`、`GET /api/session-callback`
+  - 错误码：401 `{"need":"console-session"}` / 403 / 404 / 409 / 400 / 500
+  - `api.do_undeploy(email, site_id, *, purge_data=False) -> dict`
+
+**五步前置顺序（spec §5.4，不可换序）**：
+① 身份（`x-user-email` 必须存在——它只可能来自 Edge）→
+② 写方法才做：CSRF（Origin/Content-Type/方法）→
+③ `__Host-sb_console` 验签 + scope + email 一致 →
+④ 路由分发 →
+⑤ 业务副作用（权限判定在 permissions 内部与写入同快照）。
+
+- [ ] **Step 1: 写失败测试**
+
+创建 `site-builder/panel/tests/test_handler.py`：
+
+```python
+"""handler 层：路由、错误码、以及**副作用前置顺序**。"""
+import json
+from unittest.mock import patch
+
+import pytest
+
+CONSOLE = "console.example.com"
+
+
+def _ev(method, path, *, email="owner@x.com", cookie=None, origin=None,
+        body=None, ctype="application/json"):
+    headers = {"x-user-email": email, "x-user-name": "Owner"}
+    if cookie:
+        headers["cookie"] = cookie
+    if origin is not None:
+        headers["origin"] = origin
+    if ctype:
+        headers["content-type"] = ctype
+    return {"rawPath": path,
+            "requestContext": {"http": {"method": method}},
+            "headers": headers,
+            "body": json.dumps(body) if body is not None else None}
+
+
+def _console_cookie(email="owner@x.com"):
+    import console_session
+    return console_session.console_cookie(email, "Owner").split(";")[0]
+
+
+def test_missing_edge_identity_is_401_not_500(aws, secret):
+    """没有 x-user-email 说明请求没经过 Edge——必须拒绝，且不是 500。"""
+    import handler
+    ev = _ev("GET", "/api/me")
+    del ev["headers"]["x-user-email"]
+    assert handler.handler(ev, None)["statusCode"] == 401
+
+
+def test_read_without_console_session_is_allowed(aws, secret):
+    """读接口只要 Edge 身份即可（面板会话是写操作的前置）。"""
+    import handler
+    r = handler.handler(_ev("GET", "/api/me"), None)
+    assert r["statusCode"] == 200
+    assert json.loads(r["body"])["email"] == "owner@x.com"
+
+
+def test_write_without_console_session_is_401_with_need_hint(aws, secret):
+    import handler
+    r = handler.handler(_ev("PUT", "/api/sites/s-1/permissions",
+                            origin=f"https://{CONSOLE}",
+                            body={"require_login": False}), None)
+    assert r["statusCode"] == 401
+    assert json.loads(r["body"])["need"] == "console-session"
+
+
+def test_csrf_failure_performs_zero_writes(aws, secret):
+    """**副作用前置断言**：CSRF 不合法时不得有任何 DynamoDB 写调用。
+
+    spec §5.4：不得出现"先更新 DynamoDB，再发现 CSRF 不合法"。
+    patch 在 boto3 层：任何写路径都会经过它，比断言业务结果更严
+    （业务结果没变也可能是写了又被覆盖）。
+    """
+    import handler
+    seen = []
+    real = __import__("boto3").resource
+
+    class Spy:
+        def __init__(self, inner): self._i = inner
+        def __getattr__(self, k): return getattr(self._i, k)
+        def Table(self, n):
+            t = self._i.Table(n)
+            class T:
+                def __getattr__(s, k):
+                    if k in ("put_item", "update_item", "delete_item"):
+                        seen.append((n, k))
+                    return getattr(t, k)
+            return T()
+
+    with patch.object(__import__("boto3"), "resource",
+                      lambda *a, **k: Spy(real(*a, **k))):
+        r = handler.handler(_ev("PUT", "/api/sites/s-1/permissions",
+                                cookie=_console_cookie(),
+                                origin="https://evil.example.com",
+                                body={"require_login": False}), None)
+    assert r["statusCode"] == 403
+    assert seen == [], f"CSRF 失败却发生了写调用: {seen}"
+
+
+def test_permission_denied_is_403(aws, secret):
+    import handler
+    from test_authz import _seed
+    _seed()
+    r = handler.handler(_ev("PUT", "/api/sites/s-1/permissions",
+                            email="nobody@x.com",
+                            cookie=_console_cookie("nobody@x.com"),
+                            origin=f"https://{CONSOLE}",
+                            body={"require_login": False}), None)
+    assert r["statusCode"] == 403
+
+
+def test_permission_conflict_is_409(aws, secret):
+    import handler
+    import permissions
+    from test_authz import _seed
+    _seed()
+    with patch.object(permissions, "set_access_policy",
+                      side_effect=permissions.PermissionConflict("并发")):
+        r = handler.handler(_ev("PUT", "/api/sites/s-1/permissions",
+                                cookie=_console_cookie(),
+                                origin=f"https://{CONSOLE}",
+                                body={"require_login": False}), None)
+    assert r["statusCode"] == 409
+
+
+def test_unknown_route_is_404(aws, secret):
+    import handler
+    assert handler.handler(_ev("GET", "/api/nope"), None)["statusCode"] == 404
+
+
+def test_malformed_json_body_is_400_not_500(aws, secret):
+    import handler
+    ev = _ev("PUT", "/api/sites/s-1/permissions", cookie=_console_cookie(),
+             origin=f"https://{CONSOLE}")
+    ev["body"] = "{not json"
+    assert handler.handler(ev, None)["statusCode"] == 400
+
+
+def test_unexpected_exception_is_500_without_leaking_internals(aws, secret):
+    """500 的 body 不得含堆栈/ARN/表名——那是内部结构泄漏。"""
+    import handler, api
+    with patch.object(api, "do_me", side_effect=RuntimeError(
+            "arn:aws:dynamodb:us-east-1:123456789012:table/site-sites 挂了")):
+        r = handler.handler(_ev("GET", "/api/me"), None)
+    assert r["statusCode"] == 500
+    body = r["body"]
+    for bad in ("arn:aws", "site-sites", "Traceback", "RuntimeError"):
+        assert bad not in body, f"500 响应泄漏了 {bad}"
+
+
+def test_session_callback_sets_console_cookie_and_redirects(aws, secret):
+    import handler, session
+    from upgrade_code_vectors import SECRET
+    code = session.mint_upgrade_code("owner@x.com", SECRET)
+    r = handler.handler({"rawPath": "/api/session-callback",
+                         "requestContext": {"http": {"method": "GET"}},
+                         "headers": {"x-user-email": "owner@x.com",
+                                     "x-user-name": "Owner"},
+                         "queryStringParameters": {"code": code}}, None)
+    assert r["statusCode"] == 302
+    assert any("__Host-sb_console=" in c for c in r.get("cookies", []))
+
+
+def test_session_callback_rejects_replayed_code(aws, secret):
+    import handler, session
+    from upgrade_code_vectors import SECRET
+    code = session.mint_upgrade_code("owner@x.com", SECRET)
+    ev = {"rawPath": "/api/session-callback",
+          "requestContext": {"http": {"method": "GET"}},
+          "headers": {"x-user-email": "owner@x.com", "x-user-name": "Owner"},
+          "queryStringParameters": {"code": code}}
+    assert handler.handler(ev, None)["statusCode"] == 302
+    assert handler.handler(ev, None)["statusCode"] == 401
+
+
+def test_callback_code_email_must_match_edge_identity(aws, secret):
+    """拿别人的 code 到自己的会话里换 cookie —— 必须拒绝。"""
+    import handler, session
+    from upgrade_code_vectors import SECRET
+    code = session.mint_upgrade_code("victim@x.com", SECRET)
+    r = handler.handler({"rawPath": "/api/session-callback",
+                         "requestContext": {"http": {"method": "GET"}},
+                         "headers": {"x-user-email": "attacker@x.com",
+                                     "x-user-name": "A"},
+                         "queryStringParameters": {"code": code}}, None)
+    assert r["statusCode"] == 401
+```
+
+`conftest.py` 追加 `secret` fixture（把 `console_session._secret` 与
+`session` 用的密钥都指向 `upgrade_code_vectors.SECRET`）。
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `cd site-builder/panel && ../deployer/.venv/bin/pytest tests/test_handler.py -q`
+Expected: FAIL（`ModuleNotFoundError: handler`）
+
+- [ ] **Step 3: 补 `api.do_undeploy`**
+
+照抄 `mcp/server.py:do_undeploy` 的事务守卫形态（**不是重新发明**——
+"建 job 与权限快照同一笔提交"是 M2 三轮审查的结论）：
+
+```python
+def do_undeploy(email: str, site_id: str, *, purge_data: bool = False) -> dict:
+    """下线（异步）。建 job 与权限快照守卫**同一笔事务**提交。
+
+    与 MCP 的 do_undeploy 同路径同语义：鉴权之后被转移所有权/撤权的旧请求
+    不能再落地（purge_data 不可恢复）。这里**不复制条件表达式**——
+    守卫来自 permissions.sites_snapshot_guard（全仓库唯一定义）。
+    """
+    import botocore.exceptions
+    site = common.get_site_consistent(site_id)
+    is_adm = permissions.is_admin(email)
+    role = permissions.assert_can(email, site, "undeploy", is_admin=is_adm,
+                                  what=f"站点 {site_id}")
+    # sites_snapshot_guard **已经返回** {"ConditionCheck": {...}} —— 不要再包
+    # 一层（实测确认：permissions.py:125-135 的最后一行就是 return
+    # {"ConditionCheck": out}）。双层包裹会得到 ValidationException 而不是
+    # 一个能读懂的错误。
+    guards = [permissions.sites_snapshot_guard(
+        site_id, rev=int(site.get("permissions_rev", 0)),
+        had_rev="permissions_rev" in site, actor=email,
+        action="undeploy", role=role)]
+    if is_adm:
+        # admin 代管路径还要断言"我的管理员身份此刻仍有效"（照 MCP 的
+        # _admin_condition_check 形态；撤权后在途请求不得落地）
+        guards.append({"ConditionCheck": {
+            "TableName": os.environ["ADMINS_TABLE"],
+            "Key": {"email": {"S": email}},
+            "ConditionExpression": "attribute_exists(email)"}})
+    try:
+        job_id = common.create_job(email, site_id, guard_items=guards)
+    except botocore.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] != "TransactionCanceledException":
+            raise
+        # CancellationReasons 的下标与 TransactItems 顺序对应：
+        # [0] = create_job 的 Put、[1] = 快照守卫、[2] = admin 守卫（若有）。
+        # **按下标分辨**而不是笼统报一句：管理员权限被撤销与站点权限被改动
+        # 是两种处置（前者要联系平台，后者重新确认权限即可）。
+        reasons = [r.get("Code", "") for r in
+                   e.response.get("CancellationReasons", [])]
+        if len(reasons) > 2 and reasons[2] == "ConditionalCheckFailed":
+            raise permissions.PermissionDenied("你的管理员权限已被撤销") from e
+        if len(reasons) > 1 and reasons[1] == "ConditionalCheckFailed":
+            raise permissions.PermissionConflict(
+                "站点权限在你提交期间被修改（协作者/所有权变更），本次下线已取消"
+                "——请重新确认权限后再试") from e
+        raise
+    payload = {"job_id": job_id, "site_id": site_id}
+    if purge_data:
+        payload["purge_data"] = True
+    boto3.client("lambda", region_name=os.environ.get(
+        "AWS_DEFAULT_REGION", "us-east-1")).invoke(
+            FunctionName=os.environ["UNDEPLOY_FN"],
+            InvocationType="Event", Payload=json.dumps(payload).encode())
+    return {"job_id": job_id, "status": "PENDING",
+            "note": "下线已提交，请轮询 /api/sites/{id}/jobs"}
+```
+
+> **实施注意**：`sites_snapshot_guard` 的实际签名要现场核对
+> （`permissions.py:125`），不要照抄本计划的参数名——若不一致以源码为准并
+> 在 ledger 记一条偏差。
+
+- [ ] **Step 4: 写 `panel/handler.py`**
+
+```python
+"""panel Lambda 入口：五步前置校验 + 路由分发 + 错误码。
+
+**顺序是安全边界，不是风格**（spec §5.4）：
+  ① 身份：x-user-email 必须存在。它由 Edge 注入且**先被剥除再注入**，
+     所以它存在就等于"请求确实经过 CloudFront + Lambda@Edge"。
+     Function URL 的 AWS_IAM + exact edge role resource policy 是这个推论的
+     前提（见 deploy_panel.py）——两者缺一，本文件的整套身份假设就失效。
+  ② 写方法：CSRF（Origin 精确匹配 / Content-Type / 方法白名单）；
+  ③ 写方法：__Host-sb_console 验签 + scope==console + email 与 ① 一致；
+  ④ 路由分发；
+  ⑤ 业务副作用（权限判定在 permissions 内部与写入同快照，不在这里预判）。
+
+②③ 必须在 ④⑤ 之前：不得出现"先更新 DynamoDB，再发现 CSRF 不合法"。
+test_csrf_failure_performs_zero_writes 用 boto3 层的写调用间谍锁定这一点。
+"""
+import json
+import logging
+import os
+import re
+
+import api
+import console_session
+import permissions
+
+log = logging.getLogger()
+log.setLevel(logging.INFO)
+
+READ_ONLY = ("GET",)
+_SITE = r"(?P<site_id>[a-z][a-z0-9-]{1,63})"
+ROUTES = [
+    ("GET", re.compile(r"^/api/me$")),
+    ("GET", re.compile(r"^/api/sites$")),
+    ("GET", re.compile(rf"^/api/sites/{_SITE}$")),
+    ("GET", re.compile(rf"^/api/sites/{_SITE}/jobs$")),
+    ("PUT", re.compile(rf"^/api/sites/{_SITE}/permissions$")),
+    ("PUT", re.compile(rf"^/api/sites/{_SITE}/collaborators$")),
+    ("PUT", re.compile(rf"^/api/sites/{_SITE}/owner$")),
+    ("POST", re.compile(rf"^/api/sites/{_SITE}/undeploy$")),
+    ("GET", re.compile(r"^/api/admins$")),
+    ("PUT", re.compile(r"^/api/admins$")),
+    ("DELETE", re.compile(r"^/api/admins$")),
+    ("POST", re.compile(rf"^/api/admin/resync/{_SITE}$")),
+    ("GET", re.compile(r"^/api/session-callback$")),
+]
+
+
+def _json(status: int, payload, cookies=None) -> dict:
+    out = {"statusCode": status,
+           "headers": {"content-type": "application/json",
+                       # 面板响应一律不缓存：内容随权限变化
+                       "cache-control": "no-store"},
+           "body": json.dumps(payload, ensure_ascii=False)}
+    if cookies:
+        out["cookies"] = cookies
+    return out
+
+
+def handler(event, context):
+    method = (event.get("requestContext", {}).get("http", {})
+              .get("method", "GET")).upper()
+    path = event.get("rawPath", "/")
+    headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
+    qs = event.get("queryStringParameters") or {}
+
+    # ① 身份
+    email = headers.get("x-user-email", "")
+    if not email:
+        # 没经过 Edge。不给任何提示——直连 Function URL 的探测不该拿到信息。
+        return _json(401, {"error": "未认证"})
+    import urllib.parse
+    name = urllib.parse.unquote(headers.get("x-user-name", "") or email)
+
+    # 路由匹配（先匹配再做写前置：404 不该要求 console-session）
+    matched = None
+    for m, rx in ROUTES:
+        hit = rx.match(path)
+        if hit and m == method:
+            matched = (rx.pattern, hit.groupdict())
+            break
+    if matched is None:
+        return _json(404, {"error": "接口不存在"})
+    pattern, params = matched
+    site_id = params.get("site_id", "")
+
+    # session-callback 是升级入口本身，不能要求已有面板会话
+    if pattern == r"^/api/session-callback$":
+        try:
+            code_email = console_session.consume_code(qs.get("code", ""))
+            if code_email != email:
+                # 拿别人的 code 换自己的 cookie
+                raise console_session.UpgradeRejected("升级码与当前身份不符")
+        except console_session.UpgradeRejected as e:
+            return _json(401, {"need": "console-session", "error": str(e)})
+        return {"statusCode": 302,
+                "headers": {"Location": f"https://{os.environ['CONSOLE_HOST']}/",
+                            "cache-control": "no-store"},
+                "cookies": [console_session.console_cookie(email, name)],
+                "body": ""}
+
+    body = {}
+    if method not in READ_ONLY:
+        # ② CSRF —— 在任何业务调用之前
+        try:
+            console_session.check_csrf(method, headers)
+        except console_session.CsrfRejected as e:
+            return _json(403, {"error": str(e)})
+        # ③ 面板会话
+        try:
+            console_session.verify_console_cookie(headers.get("cookie", ""),
+                                                 x_user_email=email)
+        except console_session.UpgradeRejected as e:
+            return _json(401, {"need": "console-session", "error": str(e)})
+        if event.get("body"):
+            try:
+                body = json.loads(event["body"])
+                if not isinstance(body, dict):
+                    raise ValueError("body 必须是 JSON 对象")
+            except Exception:
+                return _json(400, {"error": "请求体不是合法 JSON 对象"})
+
+    # ④⑤ 分发与副作用
+    try:
+        return _json(200, _dispatch(pattern, method, email, name, site_id,
+                                    qs, body))
+    except permissions.PermissionDenied as e:
+        return _json(403, {"error": str(e)})
+    except permissions.PermissionConflict as e:
+        return _json(409, {"error": str(e)})
+    except ValueError as e:
+        # 入口校验类（非法邮箱、owner 不能同时是协作者等）——用户可纠正
+        return _json(400, {"error": str(e)})
+    except Exception:
+        # **不回显内部错误**：ARN / 表名 / 堆栈都是内部结构。日志里留全量。
+        log.exception("panel 未预期异常 path=%s", path)
+        return _json(500, {"error": "服务内部错误，请稍后重试"})
+
+
+def _dispatch(pattern, method, email, name, site_id, qs, body):
+    if pattern == r"^/api/me$":
+        return api.do_me(email, name)
+    if pattern == r"^/api/sites$":
+        return api.do_list_sites(email, all_sites=qs.get("all") == "1")
+    if pattern.endswith(r"/jobs$"):
+        return api.do_list_jobs(email, site_id)
+    if pattern == rf"^/api/sites/{_SITE}$":
+        return api.do_get_site(email, site_id)
+    if pattern.endswith(r"/permissions$"):
+        return api.do_set_access(email, site_id,
+                                 require_login=body.get("require_login"),
+                                 allowed_users=body.get("allowed_users"))
+    if pattern.endswith(r"/collaborators$"):
+        return api.do_set_collaborators(email, site_id, add=body.get("add"),
+                                        remove=body.get("remove"))
+    if pattern.endswith(r"/owner$"):
+        return api.do_transfer_owner(email, site_id,
+                                     new_owner=body.get("new_owner", ""))
+    if pattern.endswith(r"/undeploy$"):
+        return api.do_undeploy(email, site_id,
+                               purge_data=bool(body.get("purge_data")))
+    if pattern == r"^/api/admins$":
+        if method == "GET":
+            return {"admins": api.do_list_admins(email)}
+        target = body.get("email", "")
+        return (api.do_add_admin(email, target) if method == "PUT"
+                else api.do_remove_admin(email, target))
+    if pattern.startswith(r"^/api/admin/resync/"):
+        return api.do_resync(email, site_id)
+    raise RuntimeError(f"路由已匹配但未分发: {pattern}")
+```
+
+- [ ] **Step 5: 运行测试确认通过**
+
+Run: `cd site-builder/panel && ../deployer/.venv/bin/pytest tests -q`
+Expected: PASS。
+
+- [ ] **Step 6: 反向验证**
+
+1. 把 ②③ 整段移到 `_dispatch` 之后 →
+   Expected: `test_csrf_failure_performs_zero_writes` **FAIL**（会看到写调用）
+2. 把 500 分支改成 `return _json(500, {"error": repr(e)})` →
+   Expected: `test_unexpected_exception_is_500_without_leaking_internals` **FAIL**
+3. 去掉 callback 里的 `code_email != email` 检查 →
+   Expected: `test_callback_code_email_must_match_edge_identity` **FAIL**
+4. 把 `PermissionConflict` 的 except 分支删掉（让它落到 500）→
+   Expected: `test_permission_conflict_is_409` **FAIL**
+5. 把 ① 的身份检查改成 `email = headers.get("x-user-email", "anon@x.com")` →
+   Expected: `test_missing_edge_identity_is_401_not_500` **FAIL**
+   （这条尤其重要：假值兜底鉴权字段是本项目记录过的陷阱）
+
+五处还原重跑 PASS。
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add site-builder/panel/handler.py site-builder/panel/api.py \
+        site-builder/panel/tests/test_handler.py site-builder/panel/tests/conftest.py
+bash site-builder/scripts/scan_staged_secrets.sh --files \
+  site-builder/panel/handler.py site-builder/panel/tests/test_handler.py || exit 1
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1
+git diff --cached
+git commit -m "feat(panel): handler 五步前置校验 + 路由分发 + 错误码
+
+- 顺序是安全边界：身份 → CSRF → 面板会话 → 分发 → 副作用。
+  test_csrf_failure_performs_zero_writes 在 boto3 层装写调用间谍，
+  锁定'先更新 DynamoDB 再发现 CSRF 不合法'不会发生
+- x-user-email 缺失即 401，**不给假值兜底**（假值兜底鉴权字段=放宽，
+  本项目已记录过这个陷阱）
+- session-callback 不要求已有面板会话（它就是升级入口），但 code 里的
+  email 必须等于 Edge 身份——否则能拿别人的 code 换自己的 cookie
+- 500 不回显 ARN/表名/堆栈；409 对应 PermissionConflict（并发改权限）
+- do_undeploy 复用 sites_snapshot_guard（唯一定义），不复制条件表达式"
+```
+
+---
+
+## Task 10: `deploy_panel.py`（Lambda + Function URL + role + 前端 + route）
+
+**Files:**
+- Create: `site-builder/panel/deploy_panel.py`
+- Create: `site-builder/panel/tests/test_deploy_panel_contract.py`
+- Modify: `site-builder/config.ini.example`（`[Panel]` 补 `console_host`）
+
+**Interfaces:**
+- Produces（幂等可重跑）：Lambda `site-panel`、Function URL（`AWS_IAM`）、
+  role `site-panel-role`、S3 `platform/console/{console_version}/`、
+  routing 表的 `console` 记录
+- 复制清单：`common.py` / `permissions.py` / `ops_log.py` / `session.py`
+  （**四个**——`session.py` 是 Task 7 的 code 编解码单一实现，漏了它 panel
+  运行时 ImportError）
+
+**三条可验证断言（contract test + 真机各一遍）**：
+① `AuthType == "AWS_IAM"`（不是 NONE——`NONE` + `Principal:*` 实测会被安全
+扫描自动处置，把整个 resource policy 删光）；
+② resource policy 恰好两条语句、Principal 是**逐字符 exact** edge role ARN，
+action 分别是 `lambda:InvokeFunctionUrl`（`FunctionUrlAuthType=AWS_IAM` 条件）
+与 `lambda:InvokeFunction`（`InvokedViaFunctionUrl=true` 条件）——2025-10 起
+缺任一条即 403；
+③ `edge_role_arn` 缺失/空串时**抛错中止**，不得 fallback 到 `Principal:*`
+或跳过授权。
+
+- [ ] **Step 1: 写失败测试（contract）**
+
+创建 `site-builder/panel/tests/test_deploy_panel_contract.py`：
+
+```python
+"""deploy_panel.py 的部署契约——不实际部署，断言它会构造出什么。"""
+import json
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+PANEL = Path(__file__).parents[1]
+EDGE_ROLE = "arn:aws:iam::000000000000:role/site-edge-role"
+
+
+def test_build_copies_session_py_too():
+    """复制清单必须含 session.py——它是 upgrade code 的单一实现。
+
+    漏了它 panel 运行时 ImportError（测试期能 import 是因为 conftest 加了
+    auth 目录到 sys.path，那**不代表部署产物里有这个文件**）。
+    """
+    import deploy_panel as dp
+    assert set(dp.COPY_FILES) == {"common.py", "permissions.py", "ops_log.py",
+                                  "session.py"}
+
+
+def test_function_url_auth_type_is_iam():
+    import deploy_panel as dp
+    assert dp.FUNCTION_URL_AUTH_TYPE == "AWS_IAM"
+    src = (PANEL / "deploy_panel.py").read_text()
+    assert 'AuthType="NONE"' not in src and "'NONE'" not in src
+
+
+def test_resource_policy_is_exactly_two_statements_bound_to_edge_role():
+    import deploy_panel as dp
+    stmts = dp.function_url_statements(EDGE_ROLE)
+    assert len(stmts) == 2, "2025-10 起缺任一条即 403"
+    by_action = {s["Action"]: s for s in stmts}
+    assert set(by_action) == {"lambda:InvokeFunctionUrl", "lambda:InvokeFunction"}
+    for s in stmts:
+        # 逐字符 exact，不做前缀匹配、不用账号根、绝不 *
+        assert s["Principal"] == EDGE_ROLE, f"Principal 不是 exact edge role: {s}"
+    u = by_action["lambda:InvokeFunctionUrl"]
+    assert u["FunctionUrlAuthType"] == "AWS_IAM"
+    i = by_action["lambda:InvokeFunction"]
+    assert i["InvokedViaFunctionUrl"] is True
+
+
+@pytest.mark.parametrize("bad", ["", None, "   "])
+def test_missing_edge_role_aborts_instead_of_widening(bad):
+    """缺配置必须抛错——fallback 到 Principal:* 会让 Function URL 全网可调。"""
+    import deploy_panel as dp
+    with pytest.raises((KeyError, ValueError)):
+        dp.function_url_statements(bad)
+
+
+def test_panel_role_ssm_resource_is_exact_jwt_secret_arn():
+    """**不照抄 auth 的 parameter/site-builder/\\* 前缀**。
+
+    auth 用前缀是它自己还要读 site-client-secret；panel 拿前缀等于被攻破时
+    顺带交出 Cognito client secret 与该前缀下未来的一切秘密。
+    """
+    import deploy_panel as dp
+    stmts = dp.role_statements()
+    ssm = [s for s in stmts
+           if any("ssm" in a for a in _actions(s))]
+    assert ssm, "panel role 缺 SSM 读取权限"
+    for s in ssm:
+        for res in _resources(s):
+            assert res.endswith("parameter/site-builder/jwt-secret"), (
+                f"SSM 资源不是精确 jwt-secret ARN: {res}")
+            assert not res.endswith("*"), "出现通配前缀——panel 会顺带拿到别的秘密"
+
+
+def test_panel_role_has_no_putitem_on_sites_or_admins():
+    """panel 的写入必须经 permissions 的事务；给它整条覆盖权就绕过了守卫。"""
+    import deploy_panel as dp
+    for s in dp.role_statements():
+        res = json.dumps(_resources(s))
+        acts = _actions(s)
+        if "site-sites" in res or "site-admins" in res:
+            assert "dynamodb:PutItem" not in acts, f"过宽: {s}"
+            assert "dynamodb:*" not in acts, f"过宽: {s}"
+
+
+def test_panel_role_routing_table_is_update_only():
+    """路由表**仅** UpdateItem（spec §2）——Put/Delete 能整条切流或摘掉站点。"""
+    import deploy_panel as dp
+    for s in dp.role_statements():
+        if "routing" in json.dumps(_resources(s)).lower():
+            acts = set(_actions(s))
+            assert acts <= {"dynamodb:UpdateItem", "dynamodb:GetItem",
+                            "dynamodb:Query"}, f"路由表权限过宽: {sorted(acts)}"
+
+
+def test_ops_log_is_putitem_only():
+    import deploy_panel as dp
+    for s in dp.role_statements():
+        if "site-ops-log" in json.dumps(_resources(s)):
+            assert set(_actions(s)) == {"dynamodb:PutItem"}
+
+
+def _actions(stmt):
+    a = stmt.get("Action", [])
+    return a if isinstance(a, list) else [a]
+
+
+def _resources(stmt):
+    r = stmt.get("Resource", [])
+    return r if isinstance(r, list) else [r]
+```
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `cd site-builder/panel && ../deployer/.venv/bin/pytest tests/test_deploy_panel_contract.py -q`
+Expected: FAIL（`ModuleNotFoundError: deploy_panel`）
+
+- [ ] **Step 3: 写 `deploy_panel.py`**
+
+结构照 `site-builder/auth/deploy_auth.py`（同为"幂等脚本 + Function URL"），
+Function URL 的两条授权语句照 `deployer/functions/deploy_lambda_site.py:74-91`
+的实测形态。要点：
+
+- `COPY_FILES = ("common.py", "permissions.py", "ops_log.py", "session.py")`
+  ——前三个从 `deployer/functions/`，`session.py` 从 `auth/`；
+- `function_url_statements(edge_role_arn)`：**空/缺失即 raise**
+  （照 `deploy_lambda_site.py` 的 KeyError 形态），返回上面测试断言的两条；
+- `role_statements()`：sites 表 Get/Query/Scan/UpdateItem（**无 PutItem**）、
+  jobs 表 Get/Query/PutItem（建 undeploy job）、admins 表
+  Get/Scan/PutItem/DeleteItem/UpdateItem（经 permissions 的事务维护
+  sentinel，所以这里需要写权限，但 panel **代码**里禁止 raw 写——
+  Task 6 的 AST 断言是这一层的保证）、routing 表**仅** UpdateItem、
+  ops-log **仅** PutItem、session-codes PutItem、
+  SSM `parameter/site-builder/jwt-secret` **精确 ARN** + `kms:Decrypt`
+  （`kms:ViaService = ssm.{region}.amazonaws.com` 条件）、
+  invoke `site-deployer-undeploy`；
+- 环境变量：**只有** `JWT_SECRET_PARAM`（参数名）、各表名、`BASE_DOMAIN`、
+  `CONSOLE_HOST`、`UNDEPLOY_FN`。**明文密钥严禁进环境变量**；
+- 前端上传到 `s3://site-frontend-{account}/platform/console/{console_version}/`
+  （版本化，旧版保留可回滚）；
+- routing 表注册 `console` 记录：`route_mode=split`、`api_target` 指 Function
+  URL、`static_prefix` 指上面的 S3 前缀、`require_auth=True`、
+  `owner="platform"`。
+  > **注意**：`owner="platform"` 只是记录用，**Edge 不据此判平台身份**
+  > （平台身份只认 host 白名单，见 Task 11）。
+
+- [ ] **Step 4: 加"复制清单必须与 import 一致"的结构性断言**
+
+```python
+def test_copy_files_covers_every_top_level_import_of_panel_modules():
+    """panel 各模块 import 的本地模块必须都在复制清单里。
+
+    比死记清单更稳：Task 7 加 session.py 时，若只改代码不改清单，
+    部署产物会缺文件而单测全绿（测试期 sys.path 有 auth 目录）。
+    """
+    import ast
+    import deploy_panel as dp
+    local = set()
+    for py in PANEL.glob("*.py"):
+        if py.name == "deploy_panel.py":
+            continue
+        for node in ast.walk(ast.parse(py.read_text())):
+            if isinstance(node, ast.Import):
+                local |= {a.name for a in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                local.add(node.module.split(".")[0])
+    panel_own = {p.stem for p in PANEL.glob("*.py")}
+    external = {"os", "json", "re", "time", "logging", "boto3", "botocore",
+                "urllib", "datetime", "hmac", "hashlib", "base64", "secrets"}
+    need = local - panel_own - external
+    assert need <= set(dp.COPY_FILES) | {f[:-3] for f in dp.COPY_FILES}, (
+        f"这些模块被 import 但不在复制清单: {sorted(need - set(dp.COPY_FILES))}")
+```
+
+- [ ] **Step 5: 运行测试确认通过**
+
+Run: `cd site-builder/panel && ../deployer/.venv/bin/pytest tests -q`
+Expected: PASS。
+
+- [ ] **Step 6: 反向验证（contract 层）**
+
+1. 把 `function_url_statements` 的 Principal 改成 `"*"` →
+   Expected: `test_resource_policy_is_exactly_two_statements_bound_to_edge_role` **FAIL**
+2. 删掉 `lambda:InvokeFunction` 那条 →
+   Expected: 同上用例 **FAIL**（断言 len==2）
+3. SSM 资源改成 `parameter/site-builder/*` →
+   Expected: `test_panel_role_ssm_resource_is_exact_jwt_secret_arn` **FAIL**
+4. `COPY_FILES` 去掉 `session.py` →
+   Expected: `test_build_copies_session_py_too` 与
+   `test_copy_files_covers_every_top_level_import_of_panel_modules` **FAIL**
+5. 路由表权限加 `dynamodb:PutItem` →
+   Expected: `test_panel_role_routing_table_is_update_only` **FAIL**
+6. 缺 `edge_role_arn` 时改成 `Principal:*` 兜底 →
+   Expected: `test_missing_edge_role_aborts_instead_of_widening` **FAIL**
+
+六处还原重跑 PASS。
+
+- [ ] **Step 7: Commit**（部署留到 Task 13）
+
+```bash
+git add site-builder/panel/deploy_panel.py \
+        site-builder/panel/tests/test_deploy_panel_contract.py \
+        site-builder/config.ini.example
+bash site-builder/scripts/scan_staged_secrets.sh --files \
+  site-builder/panel/deploy_panel.py \
+  site-builder/panel/tests/test_deploy_panel_contract.py || exit 1
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1
+git diff --cached
+git commit -m "feat(panel): deploy_panel.py 幂等部署脚本 + 部署契约测试
+
+- Function URL：AuthType=AWS_IAM + 恰好两条语句（InvokeFunctionUrl 带
+  FunctionUrlAuthType 条件、InvokeFunction 带 InvokedViaFunctionUrl），
+  Principal 逐字符 exact edge role。缺 edge_role_arn 抛错中止，不 fallback
+- panel role 的 SSM 资源是**精确** jwt-secret ARN，不照抄 auth 的前缀
+  （前缀=被攻破时顺带交出 Cognito client secret）
+- 路由表仅 UpdateItem、ops-log 仅 PutItem、sites 表无 PutItem
+- 复制清单四个文件（含 session.py），并用 AST 断言"被 import 的本地模块
+  都在清单里"——只改代码不改清单会让部署产物缺文件而单测全绿"
+```
+
+---
+
+## Task 11: Edge console 白名单 + 平台前缀 S3 权限
+
+**Files:**
+- Modify: `router/infrastructure/lambda/origin_request.py`（`PLATFORM_SUBDOMAINS`、`RESERVED_COOKIES`）
+- Modify: `router/infrastructure/lambda/origin_response.py`（`RESERVED_COOKIES` 同步）
+- Modify: `router/infrastructure/stack.py`（Edge role 的 S3 资源加 `platform/*`）
+- Modify: `router/infrastructure/lambda/test_edge_auth.py`、`test_origin_request.py`
+- Create: `router/infrastructure/lambda/test_stack_edge_iam.py`（CDK 断言；**放 lambda/ 目录**——router 现在没有 `tests/`，而既有 pytest 入口就是 `cd router/infrastructure/lambda && pytest .`）
+- Modify: `site-builder/scripts/verify_deployed_edge.sh`
+
+**Interfaces:**
+- Produces: `PLATFORM_SUBDOMAINS = ("auth", "console")`；
+  `RESERVED_COOKIES = ("sb_session", "__Host-sb_console", "__Host-sb_pkce")`（两文件一致）；
+  Edge role S3 资源集合 == `{sites/*, platform/*}`
+
+**测试命令**：`cd router/infrastructure/lambda && ../../../site-builder/deployer/.venv/bin/pytest . -q`
+
+- [ ] **Step 1: 写失败测试**
+
+在 `test_edge_auth.py` 追加。**注意本文件的既有机制**：它把
+`origin_request.py` 读进来做 `{{PLACEHOLDER}}` 替换、写成
+`_edge_auth_testable.py` 再 import 成 `orq`（文件头 1-15 行）。
+所以新用例**一律用模块内已有的 `orq`，不要 `import origin_request`**
+——直连原文件会因未替换的占位符（`{{JWT_SECRET}}` 等）而行为不同或报错。
+`origin_response.py` 无占位符，可直接 import。
+
+```python
+def test_console_subdomain_is_platform():
+    """console 必须被当平台路由（放行平台 cookie、不注入站点身份头）。"""
+    assert "console" in orq.PLATFORM_SUBDOMAINS
+
+
+def test_platform_identity_comes_only_from_host_not_route_owner():
+    """伪造 route.owner=platform 不得获得平台待遇。
+
+    owner 是**可写投影字段**——能改权限的角色就能写它。平台身份只能由
+    host 解析出的 hardcoded 白名单判定（spec §5.2）。
+
+    注：平台标记在 `lambda_handler` 里**内联**完成（origin_request.py:61
+    的 `route = {**route, _PLATFORM_KEY: subdomain in PLATFORM_SUBDOMAINS}`），
+    没有独立的 _mark_platform 函数——所以这里直接断言判定函数
+    `_is_platform_route` 的行为：它只读 _PLATFORM_KEY，缺键即 False。
+    """
+    evil = {"site_id": "evil-abc123", "owner": "platform",
+            "require_auth": False, "route_mode": "split"}
+    # 没有 _PLATFORM_KEY（普通站点 host 不会被标记）→ 必须判为非平台
+    assert orq._is_platform_route(evil) is False, (
+        "route.owner 被当成了平台身份判据——这是可写字段")
+    # 连显式写 False 的可写字段也不能翻盘
+    assert orq._is_platform_route({**evil, "_platform_origin": "true"}) is False, (
+        "_PLATFORM_KEY 接受了非 True 的真值——必须是 `is True` 严格判定")
+    # 而 console 这个 host 算出来的标记必须为真
+    assert "console" in orq.PLATFORM_SUBDOMAINS
+    marked = {**evil, orq._PLATFORM_KEY: "console" in orq.PLATFORM_SUBDOMAINS}
+    assert orq._is_platform_route(marked) is True
+
+
+def test_reserved_cookies_cover_both_platform_cookies():
+    import origin_response as ors
+    for name in ("__Host-sb_console", "__Host-sb_pkce", "sb_session"):
+        assert name in orq.RESERVED_COOKIES, name
+    assert tuple(orq.RESERVED_COOKIES) == tuple(ors.RESERVED_COOKIES), (
+        "两份保留 cookie 清单漂移了——站点路由会剥错 cookie")
+
+
+def test_site_route_strips_platform_cookies():
+    """普通站点请求里的平台 cookie 必须被剥掉（不能转发给不可信站点代码）。
+
+    `_strip_reserved_cookies(request)` **原地改 request**、返回 None
+    （origin_request.py:347）——不要按"返回新字符串"写断言，那样的用例
+    永远绿（None 里当然找不到 cookie 名）。
+    """
+    request = {"headers": {"cookie": [
+        {"key": "Cookie",
+         "value": "a=1; __Host-sb_console=secret; sb_session=xyz; b=2"}]}}
+    assert orq._strip_reserved_cookies(request) is None
+    kept = request["headers"]["cookie"][0]["value"]
+    assert "__Host-sb_console" not in kept and "sb_session" not in kept
+    assert "a=1" in kept and "b=2" in kept
+```
+
+> **已现场核对的三处命名**（不要再按直觉改）：平台标记是
+> `lambda_handler` 内联（无 `_mark_platform`）；判定函数是
+> `_is_platform_route(route)`，用 `route.get(_PLATFORM_KEY) is True`
+> 严格判定；剥 cookie 是 `_strip_reserved_cookies(request)`，
+> **原地修改、返回 None**。
+
+创建 `router/infrastructure/lambda/test_stack_edge_iam.py`：
+
+```python
+"""CDK 断言：Edge role 的 S3 资源集合必须恰好是 {sites/*, platform/*}。
+
+为什么要"不多不少"：多了（整桶 /*）等于站点前缀与平台前缀的隔离失效；
+少了 platform/*（现状）则 console 前端 AccessDenied 加载不出来。
+"""
+import os
+
+import pytest
+
+pytestmark = pytest.mark.skipif(os.environ.get("SB_CDK_TESTS") != "1",
+                                reason="需 SB_CDK_TESTS=1")
+
+
+def test_edge_role_s3_resources_are_exactly_sites_and_platform():
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parents[1]))
+    try:
+        import aws_cdk
+        from aws_cdk import assertions
+    except ImportError:
+        pytest.fail("SB_CDK_TESTS=1 但 aws_cdk 不可用——用 PYTHONPATH 桥接 "
+                    "router/infrastructure/.venv 再跑，否则这次运行什么都没验证")
+    import stack as st
+
+    app = aws_cdk.App()
+    # **类名是 WebRouterStack**（stack.py:86），不是 RouterStack。
+    # 它的构造要读 router/config.ini（ConfigLoader）——缺 config.ini 时
+    # 本用例应报错而不是 skip。
+    s = st.WebRouterStack(app, "T")
+    tpl = assertions.Template.from_stack(s)
+    prefixes = set()
+    for pol in tpl.find_resources("AWS::IAM::Policy").values():
+        for stmt in pol["Properties"]["PolicyDocument"]["Statement"]:
+            acts = stmt["Action"]
+            acts = acts if isinstance(acts, list) else [acts]
+            if "s3:GetObject" not in acts:
+                continue
+            res = stmt["Resource"]
+            for r in (res if isinstance(res, list) else [res]):
+                blob = str(r)
+                for p in ("sites/", "platform/"):
+                    if p in blob:
+                        prefixes.add(p.rstrip("/"))
+                assert not blob.rstrip("*").endswith("frontend/"), (
+                    f"Edge role 拿到了整桶权限: {blob}")
+    assert prefixes == {"sites", "platform"}, (
+        f"S3 前缀集合不对: {sorted(prefixes)}——缺 platform 则 console 加载不出来")
+```
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `cd router/infrastructure/lambda && ../../../site-builder/deployer/.venv/bin/pytest . -q`
+Expected: 四条新用例 FAIL。
+
+- [ ] **Step 3: 改 Edge 两文件与 stack.py**
+
+```python
+# origin_request.py
+# console 加入平台白名单（M3）。**平台身份只认这里**——不得根据
+# route.owner == "platform" 或任何 route item 可写字段推导（那些字段对能写
+# 权限投影的角色是可控的，现有注释已记录此攻击面）。
+PLATFORM_SUBDOMAINS = ("auth", "console")
+
+# 平台 cookie 不转发给站点（站点代码按不可信对待）；平台路由放行。
+# **与 origin_response.py 的同名常量必须逐字一致**——两份漂移会出现
+# "请求里剥了、响应里没剥"这类只在真机复现的怪问题。
+# __Host-sb_pkce 是 M1 就有但漏登记的（实施时核对补齐）。
+RESERVED_COOKIES = ("sb_session", "__Host-sb_console", "__Host-sb_pkce")
+```
+
+`stack.py` 的 Edge role S3 语句：
+
+```python
+                # console 前端在 platform/console/{version}/ 下，站点前端在
+                # sites/ 下。**两个前缀都要给、且只给这两个**：
+                # 缺 platform/* → route_mode=split 的 console 静态请求全部
+                # AccessDenied（控制台白屏）；给整桶 → 前缀隔离失效。
+            # 现状是单元素列表里的**字面量 ARN 字符串**（stack.py:142-143
+            # 用的是 f"arn:aws:s3:::{frontend_bucket}/sites/*"，frontend_bucket
+            # 是 config 里的桶**名字**，不是 Bucket 构造体——所以没有
+            # .bucket_arn 可用，别照 CDK 习惯改写）。
+            actions=["s3:GetObject"],
+            resources=[f"arn:aws:s3:::{frontend_bucket}/sites/*",
+                       f"arn:aws:s3:::{frontend_bucket}/platform/*"]
+```
+
+- [ ] **Step 4: 运行测试确认通过**
+
+Run: `cd router/infrastructure/lambda && ../../../site-builder/deployer/.venv/bin/pytest . -q`
+Expected: PASS（含既有 55 条不回归）。
+Run: `cd router/infrastructure/lambda && PYTHONPATH="$PWD/../.venv/lib/python3*/site-packages" SB_CDK_TESTS=1 ../../../site-builder/deployer/.venv/bin/pytest test_stack_edge_iam.py -q`
+Expected: PASS。
+> venv 组合要现场确认：`aws_cdk` 在 `router/infrastructure/.venv`，pytest 在
+> deployer 的 venv——大概率需要 PYTHONPATH 桥接（同 deployer 的 CDK 断言）。
+> 桥接不上时**必须报错而不是 skip**（照 `test_infra_tables.py` 的
+> `pytest.fail` 形态），否则这次运行什么都没验证。
+
+- [ ] **Step 5: 反向验证**
+
+1. `stack.py` 删掉 `platform/*` 那条 → Expected: CDK 断言 **FAIL**
+2. 改成整桶 `/*` → Expected: 同一条 **FAIL**（"不多不少"两个方向都盯）
+3. `origin_response.py` 的 `RESERVED_COOKIES` 少写一个 →
+   Expected: `test_reserved_cookies_cover_both_platform_cookies` **FAIL**
+4. 把 `_is_platform_route` 改成 `route.get(_PLATFORM_KEY) is True or route.get("owner") == "platform"` →
+   Expected: `test_platform_identity_comes_only_from_host_not_route_owner` **FAIL**
+
+四处还原重跑 PASS。
+
+- [ ] **Step 6: `verify_deployed_edge.sh` 补断言**
+
+在既有产物核对段追加：产物里必须出现 `"console"` 在 `PLATFORM_SUBDOMAINS`、
+`__Host-sb_console` 与 `__Host-sb_pkce` 在 `RESERVED_COOKIES`；
+并保留既有的"零 `SYNTH-ONLY-PLACEHOLDER`"与"CloudFront 实际关联版本"断言。
+**最小检查数下限同步 +3**（脚本已有下限机制）。
+
+- [ ] **Step 7: Commit**（部署留到 Task 13）
+
+```bash
+git add router/infrastructure/lambda/origin_request.py \
+        router/infrastructure/lambda/origin_response.py \
+        router/infrastructure/stack.py \
+        router/infrastructure/lambda/test_edge_auth.py \
+        router/infrastructure/lambda/test_origin_request.py \
+        router/infrastructure/lambda/test_stack_edge_iam.py \
+        site-builder/scripts/verify_deployed_edge.sh
+bash site-builder/scripts/scan_staged_secrets.sh --files \
+  router/infrastructure/lambda/test_stack_edge_iam.py || exit 1
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1
+git diff --cached
+git commit -m "feat(router): console 平台子域白名单 + Edge role 的 platform/* S3 权限
+
+- PLATFORM_SUBDOMAINS 加 console；平台身份**只认 host 白名单**，不得从
+  route.owner 推导（可写字段）——加负测锁定
+- RESERVED_COOKIES 加 __Host-sb_console 与 __Host-sb_pkce（后者 M1 就有但
+  漏登记），两文件逐字一致由用例断言
+- stack.py Edge role S3 资源 = {sites/*, platform/*}，不多不少：缺
+  platform/* 则 console 前端 AccessDenied 白屏，给整桶则前缀隔离失效"
+```
+
+- [ ] **Step 8: [真机] S3 IAM 生效验证（临时探针，不用 console 首页）**
+
+**部署门禁**：Step 4-5 全绿 + Step 7 已提交。Edge 部署本身在 Task 13。
+
+> **为什么不用 console 首页验**：本任务与 Task 10 并行、前端要到 Task 14 才
+> 上传——此刻 console route 与 S3 key 都不存在，`https://console.{domain}/`
+> 的 404/403 与"IAM 是否正确"无关，会把一个正确的修复误判成失败
+> （Codex 复审第二轮 P1）。console 首页端到端归 Task 13/14。
+
+```bash
+# 随机后缀 + trap 清理（同 smoke_router.sh 纪律）
+SUF=$(python3 -c "import secrets;print(secrets.token_hex(4))")
+# 1) 上传探针对象到 platform/ 前缀
+# 2) 注册临时 probe route（app-probe-$SUF，require_auth=False，
+#    static_prefix 指向该前缀，route_mode=split）
+# 3) 经 CloudFront 请求 https://app-probe-$SUF.{base_domain}/ 期望 200
+#    —— 探针对象在 platform/* 下，200 即证明新 IAM 语句生效
+# 4) trap：删 route + 删对象，并**强一致读回核对**确认真的删掉了
+```
+Expected: 探针 200。清理后读回：route 与对象均不存在。
+**若探针 403**：说明 Edge role 的 `platform/*` 未生效（检查是否真的部署了
+新版本、CloudFront 是否关联新版本）。
+
+---
+
+## Task 12: auth `/console-session`
+
+**Files:**
+- Modify: `site-builder/auth/login_handler.py`（新增 `/console-session` 路径）
+- Modify: `site-builder/auth/deploy_auth.py`（`CONSOLE_HOST` 环境变量）
+- Modify: `site-builder/auth/tests/test_login_handler.py`
+
+**Interfaces:**
+- Produces: `GET /console-session` →
+  - 有有效顶域 `sb_session`：302 到
+    `https://console.{base_domain}/api/session-callback?code=<upgrade code>`
+  - 无有效会话：302 到 `/login?redirect=<console-session 的完整 URL>`（走完整登录后自动回来）
+
+**依赖**：Task 7 的 `session.mint_upgrade_code`（同一文件，Task 7 先做）。
+
+- [ ] **Step 1: 写失败测试**
+
+```python
+def test_console_session_issues_code_and_redirects_to_console(monkeypatch):
+    """有效顶域会话 → 302 带 code 到 console callback。"""
+    import login_handler as lh, session
+    _set_env(monkeypatch)          # 复用本文件既有的环境夹具
+    token = session.mint_session_jwt("u@x.com", "U", "s3cr3t")
+    r = lh.handler({"rawPath": "/console-session",
+                    "headers": {"cookie": f"sb_session={token}"}}, None)
+    assert r["statusCode"] == 302
+    loc = r["headers"]["Location"]
+    assert loc.startswith("https://console.example.com/api/session-callback?code=")
+    code = loc.split("code=")[1]
+    claims = session.verify_upgrade_code(code, "s3cr3t")
+    assert claims and claims["email"] == "u@x.com"
+
+
+def test_console_session_without_session_goes_to_login_with_redirect_back(monkeypatch):
+    import login_handler as lh
+    _set_env(monkeypatch)
+    r = lh.handler({"rawPath": "/console-session", "headers": {}}, None)
+    assert r["statusCode"] == 302
+    loc = r["headers"]["Location"]
+    assert loc.startswith("https://auth.example.com/login?redirect=")
+    # 登录完必须回到 /console-session（否则用户登录后停在首页，面板还是 401）
+    assert "console-session" in loc
+
+
+def test_console_session_rejects_tampered_session_cookie(monkeypatch):
+    """签名不过的 sb_session 不得换出 code（否则等于伪造任意身份）。"""
+    import login_handler as lh, session
+    _set_env(monkeypatch)
+    bad = session.mint_session_jwt("u@x.com", "U", "wrong-secret")
+    r = lh.handler({"rawPath": "/console-session",
+                    "headers": {"cookie": f"sb_session={bad}"}}, None)
+    assert r["statusCode"] == 302
+    assert "/login" in r["headers"]["Location"], "篡改会话竟然换出了 code"
+
+
+def test_console_session_code_is_not_in_a_logged_header(monkeypatch):
+    """code 只出现在 Location，不得进 Set-Cookie/body（降低泄漏面）。"""
+    import login_handler as lh, session
+    _set_env(monkeypatch)
+    token = session.mint_session_jwt("u@x.com", "U", "s3cr3t")
+    r = lh.handler({"rawPath": "/console-session",
+                    "headers": {"cookie": f"sb_session={token}"}}, None)
+    assert not r.get("cookies"), "code 流程不该设任何 cookie"
+    assert not r.get("body")
+```
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `cd site-builder/auth && ../contract/.venv/bin/pytest tests/test_login_handler.py -q`
+Expected: FAIL（404 或 KeyError——`/console-session` 未实现）
+
+- [ ] **Step 3: 实现 `/console-session`**
+
+在 `handler` 的 `/logout` 之前插入：
+
+```python
+    if path == "/console-session":
+        # 面板会话升级入口：顶域 sb_session（站点/平台通用）→ 一次性 code。
+        # **不在这里签面板会话**：面板 cookie 必须是 host-only
+        # __Host-sb_console，而本函数跑在 auth.{base} 上，设不了 console 域的
+        # host-only cookie。所以走"发 code → 302 到 console → console 自己
+        # Set-Cookie"这一跳（spec §5.4）。
+        console_url = f"https://console.{base}/api/session-callback"
+        claims = session.verify_session_jwt(
+            _cookie_value(event, "sb_session"), _secret("JWT_SECRET"))
+        if not claims:
+            # 无有效会话：走完整登录，登录后回到本入口再换 code。
+            # redirect 必须指回 /console-session 而不是 console 首页——
+            # 直接回首页的话用户登录完了但还没有面板会话，面板仍然 401。
+            back = urllib.parse.quote(f"https://auth.{base}/console-session",
+                                      safe="")
+            return {"statusCode": 302,
+                    "headers": {"Location": f"https://auth.{base}/login?redirect={back}"},
+                    "body": ""}
+        code = session.mint_upgrade_code(claims["email"], _secret("JWT_SECRET"))
+        return {"statusCode": 302,
+                "headers": {"Location": f"{console_url}?code={urllib.parse.quote(code)}",
+                            # code 一次性且 60 秒过期，但仍然不进任何缓存
+                            "cache-control": "no-store"},
+                "body": ""}
+```
+
+> `_cookie_value` 若不存在则按本文件既有的 cookie 解析方式取（现场核对，
+> 不要新写第二份解析）。`_is_safe_redirect` 已存在，`/login` 分支会校验它，
+> 所以这里构造的 redirect 必须能通过它——**实施时先跑一遍确认**，
+> 否则会得到 400 而不是登录页。
+
+`deploy_auth.py` 的环境变量补 `CONSOLE_HOST=console.{base_domain}`（若
+实现里用到）。
+
+- [ ] **Step 4: 运行测试确认通过 + 反向验证**
+
+Run: `cd site-builder/auth && ../contract/.venv/bin/pytest tests -q`
+Expected: PASS。
+
+反向验证：
+1. 把 `verify_session_jwt` 的返回值检查去掉（无会话也签 code）→
+   Expected: `test_console_session_rejects_tampered_session_cookie` **FAIL**
+2. 把 redirect 改成 console 首页 →
+   Expected: `test_console_session_without_session_goes_to_login_with_redirect_back` **FAIL**
+
+两处还原重跑 PASS。
+
+- [ ] **Step 5: Commit**（重部署 auth 归 Task 13）
+
+```bash
+git add site-builder/auth/login_handler.py site-builder/auth/deploy_auth.py \
+        site-builder/auth/tests/test_login_handler.py
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1
+git diff --cached
+git commit -m "feat(auth): /console-session 签发一次性升级码
+
+- 顶域 sb_session 有效 → mint_upgrade_code → 302 到 console callback；
+  无效/篡改 → 302 到 /login 且 redirect 指回 /console-session
+  （指回 console 首页的话用户登录完仍无面板会话，面板还是 401）
+- 不在 auth 域签面板 cookie：__Host-sb_console 必须是 console 的 host-only
+  cookie，跨域设不了——这是要多一跳 302 的原因
+- code 只出现在 Location，不设 cookie 不进 body"
+```
+
+---
+
+## Task 13: 三层部署 + `verify_deployed_components.py`
+
+**Files:**
+- Create: `site-builder/scripts/verify_deployed_components.py`（7 段，唯一组件部署一致性真源）
+- Delete: `site-builder/scripts/verify_contract_fixtures.py`（不留兼容 shim）
+- Modify: `CLAUDE.md`、`site-builder/DEPLOY.md`（引用同步）
+
+**七段**：① contract fixture 与模板字节一致；② 线上 deployer Lambda 产物 ==
+本地源码（含 `ops_log.py`）；③ Edge 产物 == 源码 + 新白名单/保留 cookie +
+CloudFront 实际关联版本；④ auth 产物含 `/console-session` 与
+`mint_upgrade_code`；⑤ panel 产物含四个复制文件 + Function URL AuthType 与
+resource policy 两条语句 + 环境变量**无明文密钥**；⑥ MCP 镜像 digest 与本地
+构建一致 + runtime role 含 ops-log PutItem 与 `created_at` 白名单；⑦ console
+route 记录形态正确。
+
+- [ ] **Step 1: 写脚本骨架与下限**
+
+`MIN_CHECKS` **不预估**——先跑一次全绿运行数出来再写死（Task 2 的教训：
+计划估 12、实测 11）。脚本必须：用 `raise` 不用 `assert`（`python -O` 会剔除）；
+每个 AWS 调用校验输出是合法 JSON（**aws CLI 在 API 错误时也可能 exit 0**）；
+少于 `MIN_CHECKS` 项即非零退出并打印"状态不可信"。
+
+- [ ] **Step 2: 迁移 `verify_contract_fixtures.py` 的既有三段**
+
+原脚本 19 项全部保留语义，**删除原文件**（Global Constraints：只能有一个
+组件部署一致性真源，不留 shim）。`CLAUDE.md` 与 `DEPLOY.md` 的引用同步改名。
+
+- [ ] **Step 3: [真机] 部署五层（顺序有讲究）**
+
+**部署门禁**：Task 6-12 全部提交且测试全绿。**逐层部署后立刻核对该层产物**，
+不要五层部署完再一起验（错在哪一层会说不清）。
+
+```bash
+# 1) deployer（ops_log.py 进 asset）
+cd site-builder/deployer/infra && rm -rf cdk.out && \
+  PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never
+# 2) Edge（约 8 分钟 + 10-20 分钟全球复制）
+cd router/infrastructure && rm -rf cdk.out && \
+  PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never
+# 3) auth（/console-session 生效）
+cd site-builder/auth && python3 deploy_auth.py
+# 4) panel（新建）
+cd site-builder/panel && python3 deploy_panel.py
+# 5) MCP（ops-log PutItem + created_at 白名单生效）
+cd site-builder/mcp && python3 deploy_agentcore.py
+```
+
+**回滚锚点**：每层部署前导出现值（Lambda CodeSha256 / Edge 版本号 /
+runtime digest / route item），存 `/tmp`。
+**预期的非回归 sha 变化**：deployer 的 10 个共享 asset Lambda 会全部变
+（现在多含 `ops_log.py`）——按 Task 5 的纪律**解包核对逻辑文件字节一致**
+再判定，不要凭"变了"就当回归。
+
+- [ ] **Step 4: [真机] ① MCP 部署后补跑第二轮 created_at 回填**
+
+Task 5 回填到本步之间，线上旧 MCP 建的新站点仍走旧路径不写 created_at
+（Codex 复审第二轮 P2 的时序缺口）：
+
+```bash
+./site-builder/scripts/backfill_site_created_at.py            # dry-run
+./site-builder/scripts/backfill_site_created_at.py --apply
+```
+Expected: 最终 E2E 前，除 `无 job 跳过` 外**零缺失**。
+
+- [ ] **Step 5: [真机] ② IAM 探针：`created_at` 白名单真的生效**
+
+Task 5 已用 `iam simulate-principal-policy` 证明**部署前**是
+`implicitDeny`（ledger 有记录）。本步是它的收口——部署后必须变 `allowed`：
+
+```bash
+aws iam simulate-principal-policy \
+  --policy-source-arn arn:aws:iam::{account}:role/site-mcp-runtime-role \
+  --action-names dynamodb:UpdateItem \
+  --resource-arns arn:aws:dynamodb:{region}:{account}:table/site-sites \
+  --context-entries 'ContextKeyName=dynamodb:Attributes,ContextKeyType=stringList,ContextKeyValues=site_id,owner,name,status,created_at' \
+  --query 'EvaluationResults[0].EvalDecision' --output text
+```
+Expected: `allowed`（部署前实测是 `implicitDeny`）。
+再以 runtime role 的**真实凭证**对探针 site_id 发一次含 `created_at` 的条件
+UpdateItem（写后即删 + 强一致读回确认删掉）——模拟器算的是策略，真实调用才
+证明端到端。
+
+- [ ] **Step 6: [真机] ③ console 首页端到端**
+
+route / 前端 / Edge 全部就位后（前端上传在 Task 10 的 `deploy_panel.py` 里，
+真正的视图层在 Task 14——本步先用占位 index.html 亦可）：
+- 未登录访问 `https://console.{base_domain}/` → 302 到登录；
+- 走完 `/console-session` 链路 → 首页 200 且浏览器收到
+  `Set-Cookie: __Host-sb_console`；
+- unsigned `curl` 直连 panel Function URL → **403**（只证明 AuthType=AWS_IAM
+  在工作，不证明 Principal 绑定——后者由 Task 10 的探针角色正反验证）。
+
+- [ ] **Step 7: 跑满七个闸门 + Commit**
+
+七个：`verify_deployed_components.py`（新）、`verify_deployed_edge.sh`、
+`verify_permission_matrix.py`、`verify_sfn_failure_paths.py`、
+`verify_mcp_iam_scope.sh`、`verify_auth_alarm.sh`、`smoke_router.sh`。
+逐个记录项数，写进 ledger。
+
+---
+
+## Task 14: 前端移植 + panel E2E
+
+**Files:**
+- Create: `site-builder/panel/frontend/index.html`（+ 拆出的 js/css）
+- Create: `site-builder/panel/tests/test_frontend_contract.py`
+- Modify: `site-builder/panel/deploy_panel.py`（若前端文件清单变化）
+
+**移植五项改造（spec §4.1）**：
+① 去掉原型里的一切真实值（邮箱/域名/账号）——`docs/design/` 的原型
+**不在仓库内编辑**，只取视图层；
+② `window.API` 的 17 个方法换成真 fetch（`credentials: "same-origin"`，
+写请求带 `Content-Type: application/json`；**401 且 body 含
+`need=console-session` 时自动跳 `/console-session` 再重放一次**）；
+③ M4（API Key）与 M5（analytics/visitors/pv7）入口 **disabled**，
+**不得请求不存在的 API**；
+④ `PHASE_LABEL` 按 jobs 表真实词表重写（`submitted`/`queued`/`validate`/
+`provision-db`/`package`/`deploy-backend`/`upload-frontend`/`register-route`/
+`smoke-test`/`undeploy`；**SUCCEEDED 的 job phase 停在 `smoke-test`**）；
+⑤ undeploy 改轮询（异步）；站点 `status=DEPLOYING` 时查最新 job，
+FAILED 则**展示层派生**失败徽章（真源不写 site=FAILED——重部署失败时站点
+仍在线服务旧版本）。
+
+- [ ] **Step 1: 契约测试（静态解析前端，不跑浏览器）**
+
+```python
+"""前端与后端契约：方法名、路径、M4/M5 不发请求、phase 词表一致。"""
+import json
+import re
+from pathlib import Path
+
+FE = Path(__file__).parents[1] / "frontend"
+
+
+def test_no_real_values_in_frontend():
+    """前端不得残留原型里的真实值。
+
+    **禁用值不写死在本文件里**——把真实账号 ID / 真实域名写进被 git 跟踪的
+    测试就等于泄漏它们（本计划 Global Constraints 明令禁止，写这条用例时
+    自己先踩了一次）。改为按**形态**判定 + 从 gitignored 的 config.ini 读
+    当前环境的真实值来比对。
+    """
+    import configparser
+    blob = "\n".join(p.read_text() for p in FE.rglob("*") if p.is_file())
+    # 形态判定：12 位连续数字（AWS 账号 ID）、私人邮箱域、内网/绝对路径
+    assert not re.search(r"\b\d{12}\b", blob), "疑似 12 位账号 ID"
+    assert "/Users/" not in blob and "/home/" not in blob, "残留本机绝对路径"
+    # 与当前环境的真实值比对（config.ini 是 gitignored 的唯一取值来源）
+    cfg = configparser.ConfigParser(interpolation=None)
+    cfg.read(Path(__file__).parents[2] / "config.ini")
+    if cfg.has_section("Platform"):
+        for key in ("account_id", "base_domain"):
+            val = (cfg["Platform"].get(key) or "").split("#")[0].strip()
+            if val:
+                assert val not in blob, f"前端残留真实 {key}"
+
+
+def test_every_api_path_exists_in_handler_routes():
+    """前端请求的每个路径都必须在 handler.ROUTES 里（拼错会 404 且难查）。"""
+    import handler
+    blob = "\n".join(p.read_text() for p in FE.rglob("*.js"))
+    paths = set(re.findall(r"[\"'`](/api/[^\"'`?]+)", blob))
+    assert paths, "前端没有任何 /api 调用——解析失败了？"
+    for p in paths:
+        probe = re.sub(r"\$\{[^}]+\}", "s-abc123", p)
+        assert any(rx.match(probe) for _, rx in handler.ROUTES), (
+            f"前端请求了 handler 没有的路径: {p}")
+
+
+def test_m4_m5_features_do_not_call_any_api():
+    """M4/M5 必须是 disabled 占位，不得请求不存在的接口。"""
+    blob = "\n".join(p.read_text() for p in FE.rglob("*.js"))
+    for forbidden in ("/api/keys", "/api/analytics", "/api/visitors",
+                      "/api/stats"):
+        assert forbidden not in blob, f"前端请求了未实现的 {forbidden}"
+
+
+def test_phase_label_matches_real_job_phases():
+    """PHASE_LABEL 的 key 必须是 jobs 表真实的小写 phase，不是 SFN 节点名。"""
+    blob = "\n".join(p.read_text() for p in FE.rglob("*.js"))
+    m = re.search(r"PHASE_LABEL\s*=\s*\{(.*?)\}", blob, re.S)
+    assert m, "找不到 PHASE_LABEL"
+    keys = set(re.findall(r"[\"']?([a-z][a-z-]+)[\"']?\s*:", m.group(1)))
+    real = {"submitted", "queued", "validate", "provision-db", "package",
+            "deploy-backend", "upload-frontend", "register-route",
+            "smoke-test", "undeploy"}
+    assert keys <= real, f"PHASE_LABEL 含非真实 phase: {sorted(keys - real)}"
+    assert "smoke-test" in keys, "SUCCEEDED 的 job 停在 smoke-test，必须有词条"
+    for sfn_node in ("Validate", "PackageBackend", "RegisterRoute"):
+        assert f'"{sfn_node}"' not in m.group(1), f"残留 SFN 节点名 {sfn_node}"
+
+
+def test_401_triggers_session_upgrade_then_single_replay():
+    """401+need=console-session → 跳升级 → **只重放一次**（防无限循环）。"""
+    blob = "\n".join(p.read_text() for p in FE.rglob("*.js"))
+    assert "console-session" in blob
+    assert re.search(r"(retried|_retry|once)", blob), (
+        "看不到'只重放一次'的守卫——升级失败会变成无限跳转")
+```
+
+- [ ] **Step 2-4: 移植、跑通、真机 E2E（spec §7 的 13 项）**
+
+13 项 E2E 在真机浏览器/`browser-act` 跑：登录跳转、面板会话升级、站点列表
+（mine/all）、详情、改访问策略、增删协作者、转移所有权、部署历史、下线轮询、
+admin 名单增删、非 owner 越权被拒、CSRF 被拒、M4/M5 入口 disabled。
+
+- [ ] **Step 5: Commit**
+
+---
+
+## Task 15: fixture 自动清理
+
+**Files:**
+- Modify: `site-builder/scripts/smoke_router.sh`
+- Modify: `site-builder/deployer/tests/test_e2e_fixtures.py`
+
+**要求**：随机后缀 + `trap` 全覆盖 + **只删本次创建的**（禁按 owner 批量删）
++ 强一致读回核对 + 最小断言数 + `--keep-on-failure`；
+E2E finalizer 记录本次 site_id/job_id、默认 undeploy + purge、
+**清理失败即测试失败**（静默泄漏资源比测试红更糟）。
+
+- [ ] **Step 1: 写失败测试**（用 moto 造"清理漏删"的场景，断言会失败）
+- [ ] **Step 2-3: 实现 + 反向验证**（故意让清理漏一个 → 测试必须红）
+- [ ] **Step 4: [真机] 跑一遍 `smoke_router.sh` 与 E2E，确认零残留**
+- [ ] **Step 5: Commit**
+
+---
+
+## Task 16: 全量回归与文档收尾
+
+- [ ] **Step 1: 六个包测试全绿**
+
+```bash
+cd site-builder/contract && .venv/bin/pytest tests -q
+cd site-builder/auth     && ../contract/.venv/bin/pytest tests -q
+cd site-builder/deployer && .venv/bin/pytest tests -q
+cd site-builder/mcp      && python3 -m pytest tests -q
+cd site-builder/panel    && ../deployer/.venv/bin/pytest tests -q
+cd router/infrastructure/lambda && ../../../site-builder/deployer/.venv/bin/pytest . -q
+site-builder/mcp/run_locked_tests.sh     # 锁定依赖那一套
+```
+
+- [ ] **Step 2: 七个真机闸门全绿**（逐个记项数）
+- [ ] **Step 3: `DEPLOY.md` 新阶段**（panel 部署 + console DNS/证书 + 七闸门更名）
+- [ ] **Step 4: `CLAUDE.md` 同步**（panel venv 归属、`deploy_panel.py`、脚本改名）
+- [ ] **Step 5: `progress.md` + HANDOFF 更新**
+- [ ] **Step 6: Commit**
 
 ---
 
 ## Self-Review 结论
 
-**1. Spec 覆盖**：phase2 spec §11-pre.1（Task 1-2）、§11-pre.2（Task 3-4）、§11-pre.3（Task 15）、§11-pre.4（Task 13）；M3 spec §2 平台约束（Task 10）、§3 前端（Task 14）、§4 接口映射（Task 6/9）、§4.1 四个缺口（Task 5 的 created_at 与 Task 14 的 FAILED 派生/phase 词表/undeploy 轮询）、§5.1-5.5 安全硬约束（Task 6/7/8/10/11）、§6 资源清单（Task 5/10）、§7 测试硬约束（各任务的反向验证步骤 + Task 13/14）。**Task 1-5 已逐步骤覆盖无遗漏；Task 6-16 为锁定契约后的分阶段展开**（早先版本此处写"无遗漏"是过度声明——Codex review 指出后修正）。
+**1. Spec 覆盖**：phase2 spec §11-pre.1（Task 1-2）、§11-pre.2（Task 3-4）、§11-pre.3（Task 15）、§11-pre.4（Task 13）；M3 spec §2 平台约束（Task 10）、§3 前端（Task 14）、§4 接口映射（Task 6/9）、§4.1 四个缺口（Task 5 的 created_at 与 Task 14 的 FAILED 派生/phase 词表/undeploy 轮询）、§5.1-5.5 安全硬约束（Task 6/7/8/10/11）、§6 资源清单（Task 5/10）、§7 测试硬约束（各任务的反向验证步骤 + Task 13/14）。**Task 1-16 现已全部逐步骤展开**（Task 6-16 的展开于 2026-08-09 完成，门禁 = Task 5 Step 13-15 的真机产出已取得）。
 
-**2. 占位符扫描**：Task 1-5 的每个代码步骤都有可直接落地的完整代码；Task 6-16 是**明示的分阶段展开**（附完整 Files/Interfaces/验收标准），不是 "TBD"——理由已写明（数据层真机形态影响 panel 响应契约）。
+**2. 占位符扫描**：Task 1-16 的每个代码步骤都有可直接落地的完整代码或明确的"照抄某个既有实测形态"指引。**Task 6-16 展开时现场核对过的五处命名/契约**（避免实施者按直觉写出永绿或报错的用例）：
+① `permissions.sites_snapshot_guard()` **已返回** `{"ConditionCheck": {...}}`——再包一层得到 ValidationException（Task 9）；
+② Edge 的平台标记在 `lambda_handler` 内联，无 `_mark_platform`；判定是 `_is_platform_route(route)` 且 `is True` 严格判定（Task 11）；
+③ `_strip_reserved_cookies(request)` **原地改 request 返回 None**——按"返回新字符串"写的用例永远绿（Task 11）；
+④ `router` 的 Edge 测试 import 的是**占位符替换后**的 `_edge_auth_testable`，不是 `origin_request`（Task 11）；
+⑤ router stack 类名是 `WebRouterStack`，S3 资源是**字面量 ARN 字符串**（`frontend_bucket` 是桶名而非 Bucket 构造体，没有 `.bucket_arn`）（Task 11）。
+另有两处落点在展开时被修正：`ops_log.py` 物理放 `deployer/functions/`（不是 `panel/`——`permissions.py` 要 import 它，而 deployer Lambda 只打包 `functions/`）；`resync_route` 放 `permissions.py`（panel 禁手写投影）。
 
 **3. 类型一致性**：`converge_job_to_failed` 在 Task 1 定义、Task 2 的 CDK handler 引用一致；`list_jobs_by_site` / `create_site_record` 在 Task 5 定义，Task 6/14 消费；`ensure_alarm_pipeline` 在 Task 3 定义、Task 4 消费，参数名逐一对应；`ALARM_PARAMS` / `ALARM_DESCRIPTION` 在 Task 3 定义、Task 4 的验收脚本 import 同名。
 
