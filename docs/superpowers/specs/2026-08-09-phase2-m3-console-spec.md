@@ -43,6 +43,10 @@ sites 表、按 permissions.py 写权限（事务含路由表投影）、invoke
   - 路由表：**仅** UpdateItem（permissions.py 的 `write_permissions` 事务
     做权限字段投影所需，与 MCP runtime 同模式；ConditionCheck 所需权限
     一并核对）——没有 PutItem/DeleteItem（整条路由写只属于部署链）；
+  - SSM：`ssm:GetParameter` 限定 `parameter/site-builder/*` +
+    `kms:Decrypt`（ViaService 条件）——验 upgrade code 与 mint
+    `__Host-sb_console` 需要 JWT_SECRET，照抄 auth role 的
+    `read-platform-secrets` 语句（见 §5.4 密钥交付）；
   - **没有**：建删基础设施权限、stats/audit/api-keys 表（M4/M5 才建）；
 - 路由表注册 `console` 子域：`route_mode=split`、`require_auth=True`、
   `allowed_users="org"`、`owner=platform`——不进 sites 表，
@@ -213,6 +217,31 @@ host-only `__Host-sb_console`（JWT scope=console，TTL 4h，
 `session.py:mint_session_jwt(scope=...)` 已具备）：Secure、HttpOnly、
 SameSite=Lax、Path=/、**无 Domain**。
 
+**跨 Lambda 密钥与契约（Codex review 2026-08-09 补齐——安全边界不留给
+实施期临场发明）**：
+
+- **密钥交付**：auth（签 code、验 `sb_session`）与 panel（验 code、
+  mint/验 `__Host-sb_console`）共用**同一个已存在的 SSM 参数**
+  `/site-builder/jwt-secret`——不新开密钥通道。panel 沿用 auth 的运行时
+  读取模式：环境变量只下发**参数名**（`JWT_SECRET_PARAM`），Lambda 内从
+  SSM SecureString 读取并带 TTL 缓存。**明文密钥严禁进 Lambda 环境变量**
+  （`deploy_auth.py` 已注释原因：`GetFunctionConfiguration` 会原样回显，
+  拿到 JWT_SECRET 即可伪造任意用户会话）。panel role 需要精确的
+  `ssm:GetParameter`（资源限定 `parameter/site-builder/*`）+
+  `kms:Decrypt`（`kms:ViaService = ssm.{region}.amazonaws.com` 条件），
+  照抄 auth role 的 `read-platform-secrets` 语句。
+- **code 编解码的字节级契约**：编码/解码函数**单一实现**放
+  `site-builder/auth/session.py`（与会话 JWT 同文件——它已经是 auth 与
+  Edge 之间字节级同步的锚点），panel 构建时复制该文件（同 `common.py` /
+  `permissions.py` 的构建时复制模式，`deploy_panel.py` 打包时带上
+  `session.py`）。code 载荷字段固定：`typ="console-upgrade"`（上下文
+  标记，login state / PKCE cookie 不认此值）、`email`、`jti`、`exp`
+  （60 秒）；签名算法与 `mint_session_jwt` 同族（HS256 同密钥）。
+- **交叉契约测试**：auth 侧签 code → panel 侧验通过；篡改任一字段 →
+  验失败；`typ` 不符（拿 login state 冒充）→ 拒绝；auth 与 panel 两个包
+  的测试各跑一遍同一组用例向量（防两份复制品漂移——与 Edge/session.py
+  的字节级同步测试同思路）。
+
 ### 5.5 ops-log
 
 - 新表 `site-ops-log`（phase2 spec §3.3 形态：PK target、SK
@@ -242,6 +271,7 @@ SameSite=Lax、Path=/、**无 Domain**。
 | console route（路由表） | 新建（deploy_panel.py 注册） | M3 |
 | S3 `platform/console/{version}/` | 新建前缀 | M3 |
 | Edge：PLATFORM_SUBDOMAINS、RESERVED_COOKIES | 改动 + 重部署 | M3 |
+| Edge role S3 policy：`{frontend_bucket}/platform/*` | 新增（现只有 `sites/*`——console 前端走 S3 SigV4 分支，缺则 AccessDenied） | M3 |
 | auth：`/console-session` | 改动 + 重部署 | M3 |
 | reconciler/sweeper Lambda + rule + DLQ + schedule | 新建（deployer CDK 栈） | M3 前置 B1 |
 | 告警管道（filter/topic/alarm/subscription） | 收编进 deploy_auth.py | M3 前置 B2 |

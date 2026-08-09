@@ -63,9 +63,9 @@
 | `site-builder/auth/tests/test_alarm_pipeline.py` | 告警管道幂等性与参数正确性单测（botocore Stubber） |
 | `site-builder/panel/handler.py` | panel Lambda 入口：路由分发 + 身份提取 + CSRF/console-session 前置校验 |
 | `site-builder/panel/api.py` | 各 `/api/*` 端点的纯函数实现（do_* 模式，便于单测） |
-| `site-builder/panel/console_session.py` | 一次性 upgrade code 的签发校验（HMAC + 60s + 绑 email + context 标记 + jti 原子消费）与 `__Host-sb_console` cookie 构造 |
+| `site-builder/panel/console_session.py` | upgrade code 校验入口（调构建时复制的 `session.py:verify_upgrade_code`）+ jti 原子消费 + `__Host-sb_console` cookie 构造。**code 编解码不在此实现**——单一实现在 `auth/session.py`，panel 构建时复制 |
 | `site-builder/panel/ops_log.py` | ops-log 写入（append-only，PutItem only，字段脱敏） |
-| `site-builder/panel/deploy_panel.py` | 幂等部署脚本：Lambda + Function URL(AWS_IAM 仅 edge role) + panel role + 前端上传 S3 + console route 注册 |
+| `site-builder/panel/deploy_panel.py` | 幂等部署脚本：Lambda（打包时构建复制 `permissions.py`/`common.py`/`session.py`）+ Function URL(AWS_IAM 仅 edge role) + panel role（含 SSM `read-platform-secrets` 语句）+ 前端上传 S3 + console route 注册 |
 | `site-builder/panel/frontend/index.html` 等 | 移植的静态 SPA（原型视图层 + 真 fetch 实现的 window.API） |
 | `site-builder/panel/tests/conftest.py` | panel 测试的 moto 表夹具（sites/jobs/admins/ops-log/session-codes/routing） |
 | `site-builder/panel/tests/test_authz.py` | panel 授权矩阵（owner/collaborator/outsider/admin × 各端点） |
@@ -82,11 +82,12 @@
 | `site-builder/deployer/infra/app.py` | jobs 表加 `site-index` GSI；新增 `site-ops-log`（RETAIN）与 `site-session-codes`（TTL）表；新增 reconciler/sweeper Lambda + 独立窄角色 + EventBridge rule + Scheduler + SQS DLQ |
 | `site-builder/auth/deploy_auth.py` | `main()` 末尾调 `ensure_alarm_pipeline()`；新增 `/console-session` 所需环境变量（session-codes 表名）；role 补 SNS/CW 所需权限（若脚本自身调用需要） |
 | `site-builder/auth/login_handler.py` | 新增 `/console-session` 路径：校验顶域 `sb_session` → 签发一次性 code → 302 到 console callback |
-| `site-builder/auth/session.py` | 无算法改动；确认 `mint_session_jwt(scope=...)` 已可用（M1 已加） |
+| `site-builder/auth/session.py` | 新增 `mint_upgrade_code` / `verify_upgrade_code`（console-session 一次性 code 的**单一编解码实现**，HS256 同 JWT_SECRET，`typ="console-upgrade"`）；`mint_session_jwt(scope=...)` M1 已具备不动 |
 | `site-builder/deployer/functions/common.py` | 加 `list_jobs_by_site`（用新 `site-index` GSI）；`upsert_site` 首次部署路径写 `created_at` |
-| `site-builder/mcp/server.py` | `do_deploy_site` 建站分支写 `created_at` |
+| `site-builder/mcp/server.py` | `do_deploy_site` 建站分支改用 `create_site_record`（单次条件写整条记录）+ `SiteIdCollision` 重生成 ID（≤3 次） |
 | `site-builder/deployer/functions/permissions.py` | 五个高层写函数 + undeploy 路径内落 ops-log（唯一落点） |
 | `site-builder/mcp/deploy_agentcore.py` | MCP runtime role 补 `site-ops-log` PutItem |
+| `router/infrastructure/stack.py` | Edge role 的 S3 GetObject 资源加 `{frontend_bucket}/platform/*`（现只有 `sites/*`——console 前端在 `platform/console/{version}/`，缺这条则 route_mode=split 的静态请求全部 AccessDenied，控制台页面加载不出来） |
 | `router/infrastructure/lambda/origin_request.py` | `PLATFORM_SUBDOMAINS` 加 `console`；`RESERVED_COOKIES` 加 `__Host-sb_console`、`__Host-sb_pkce` |
 | `router/infrastructure/lambda/origin_response.py` | `RESERVED_COOKIES` 同步（两份必须一致） |
 | `router/infrastructure/lambda/test_edge_auth.py` | console 平台路由用例 + 伪造 platform route 负测 |
@@ -1005,8 +1006,19 @@ def clients(monkeypatch):
         s.deactivate()
 
 
-def _stub_common(stubs, *, subs, sub_result=None):
-    """公共调用序列：metric filter upsert → topic upsert → 列订阅 → alarm upsert"""
+def _stub_common(stubs, *, subs, sub_result=None, fresh_account=False):
+    """公共调用序列：建日志组（幂等）→ retention → metric filter → topic
+    → 列订阅 → alarm。
+
+    fresh_account=True 模拟全新账号：日志组不存在，create_log_group 成功；
+    默认模拟现网：日志组已存在，create 抛 AlreadyExists 被吞。
+    """
+    if fresh_account:
+        stubs["logs"].add_response("create_log_group", {})
+    else:
+        stubs["logs"].add_client_error("create_log_group",
+                                       "ResourceAlreadyExistsException")
+    stubs["logs"].add_response("put_retention_policy", {})
     stubs["logs"].add_response("put_metric_filter", {})
     stubs["sns"].add_response("create_topic", {"TopicArn": TOPIC_ARN})
     stubs["sns"].add_response("list_subscriptions_by_topic",
@@ -1092,6 +1104,35 @@ def test_empty_email_raises_instead_of_silently_skipping(clients):
     """email 缺失时必须响亮失败——静默跳过会造出一个没人收通知的 alarm。"""
     with pytest.raises(ValueError, match="email"):
         alarm_pipeline.ensure_alarm_pipeline(email="", **ARGS)
+
+
+def test_fresh_account_creates_log_group_before_metric_filter(clients):
+    """全新账号：/aws/lambda/<fn> 日志组在函数**第一次被调用**时才自动创建。
+    刚 CreateFunction 完还没人调过 → 不先建组，put_metric_filter 直接
+    ResourceNotFoundException（Codex review 2026-08-09：从零部署会失败在
+    半部署状态）。Stubber 的顺序断言保证 create_log_group 在 filter 之前。"""
+    logs, sns, cw, stubs = clients
+    _stub_common(stubs, subs=[{"Protocol": "email",
+                               "Endpoint": "ops@example.com",
+                               "SubscriptionArn": TOPIC_ARN + ":abc"}],
+                 fresh_account=True)
+    out = alarm_pipeline.ensure_alarm_pipeline(email="ops@example.com", **ARGS)
+    assert "log_group" in out["changed"]
+    for s in stubs.values():
+        s.assert_no_pending_responses()
+
+
+def test_existing_log_group_still_converges_retention(clients):
+    """现网路径：组已存在（AlreadyExists 被吞），retention 仍要收敛到 30 天
+    （spec §6.3 平台日志组统一 30 天；现网曾是 90 天）。"""
+    logs, sns, cw, stubs = clients
+    _stub_common(stubs, subs=[{"Protocol": "email",
+                               "Endpoint": "ops@example.com",
+                               "SubscriptionArn": TOPIC_ARN + ":abc"}])
+    out = alarm_pipeline.ensure_alarm_pipeline(email="ops@example.com", **ARGS)
+    assert "log_group" not in out["changed"]
+    for s in stubs.values():
+        s.assert_no_pending_responses()
 ```
 
 - [ ] **Step 2: 运行确认失败**
@@ -1178,6 +1219,19 @@ def ensure_alarm_pipeline(*, region, log_group, namespace, metric_name,
     logs, sns, cw = _clients(region)
     changed = []
 
+    # ⓪ 日志组必须先存在：Lambda 的 /aws/lambda/<fn> 日志组在**函数第一次被
+    # 调用**时才自动创建，不是 CreateFunction 时。全新账号跑 deploy_auth.py
+    # 时函数刚建好还没被调过 → put_metric_filter 直接
+    # ResourceNotFoundException，B2 部署失败且 auth Lambda 已被改动（半部署）。
+    # 幂等建组，并顺手收敛保留期到 30 天（spec §6.3：平台日志组统一 30 天；
+    # 现网该组曾是 90 天）。
+    try:
+        logs.create_log_group(logGroupName=log_group)
+        changed.append("log_group")
+    except logs.exceptions.ResourceAlreadyExistsException:
+        pass
+    logs.put_retention_policy(logGroupName=log_group, retentionInDays=30)
+
     # ① metric filter：put 是 upsert 语义，直接声明即可
     logs.put_metric_filter(
         logGroupName=log_group, filterName=filter_name,
@@ -1226,7 +1280,7 @@ def ensure_alarm_pipeline(*, region, log_group, namespace, metric_name,
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cd site-builder/auth && ../contract/.venv/bin/pytest tests/test_alarm_pipeline.py -q`
-Expected: PASS（7 个用例）
+Expected: PASS（9 个用例）
 
 - [ ] **Step 5: 反向验证**
 
@@ -1236,8 +1290,11 @@ Expected: PASS（7 个用例）
    Expected: `test_confirmed_subscription_is_not_recreated` **FAIL**（Stubber 报未预期的 subscribe 调用）
 3. 把 `ALARM_DESCRIPTION` 里"告警解除"改成"已恢复" →
    Expected: `test_alarm_description_is_bilingual_and_says_alarm_cleared` **FAIL**
+4. 把 `create_log_group` / `put_retention_policy` 两行删掉 →
+   Expected: `test_fresh_account_creates_log_group_before_metric_filter` **FAIL**
+   （Stubber 报 create_log_group 响应未被消费）
 
-三处还原，重跑 PASS。
+四处还原，重跑 PASS。
 
 - [ ] **Step 6: 在 `config.ini.example` 加 `[Alerting]` 段**
 
@@ -1258,7 +1315,7 @@ email =
 - [ ] **Step 7: 运行 auth 全量回归**
 
 Run: `cd site-builder/auth && ../contract/.venv/bin/pytest tests -q`
-Expected: PASS（原有 105 基线 + 7 新增）
+Expected: PASS（原有 105 基线 + 9 新增）
 
 - [ ] **Step 8: Commit**
 
@@ -1388,36 +1445,82 @@ for k, v in declared.items():
         ok = got == v
     if not ok:
         bad.append(f"{k}: 线上={got!r} 声明={v!r}")
-# ALARM 与 OK 必须通知同一 topic，且都非空
-if not a.get("AlarmActions") or a.get("AlarmActions") != a.get("OKActions"):
-    bad.append(f"AlarmActions={a.get('AlarmActions')} OKActions={a.get('OKActions')}")
+# **AlarmActions/OKActions 必须等于声明的 topic ARN**——只验"两者相等且非空"
+# 会漏掉"同时漂移到另一个 topic"的假绿：actions 指向 topic-B，而下面的订阅
+# 检查在查 topic-A（site-builder-alarms），两段各自 PASS 但互不相干。
+expected_topic = (f"arn:aws:sns:{a['AlarmArn'].split(':')[3]}:"
+                  f"{a['AlarmArn'].split(':')[4]}:site-builder-alarms")
+if a.get("AlarmActions") != [expected_topic]:
+    bad.append(f"AlarmActions={a.get('AlarmActions')} 期望=[{expected_topic}]")
+if a.get("OKActions") != [expected_topic]:
+    bad.append(f"OKActions={a.get('OKActions')} 期望=[{expected_topic}]")
 if bad:
     print("  FAIL  线上 alarm 与声明值漂移：")
     for b in bad:
         print(f"          {b}")
     sys.exit(1)
-print("  PASS  线上 alarm 配置 == alarm_pipeline.py 声明值（含双语描述与 OK actions）")
+print("  PASS  线上 alarm 配置 == alarm_pipeline.py 声明值"
+      "（含双语描述、Alarm/OK actions == 声明 topic）")
 PY
 fi
 
-# ── SNS 订阅必须**已确认**（PendingConfirmation 不算） ─────────────────
+# ── SNS 订阅：**声明的那个收件人**必须已确认 ────────────────────────────
+# 只查"存在任意 confirmed email"有假绿：告警邮箱从 old@ 换成 new@ 后，
+# old 仍 confirmed、new 还在 PendingConfirmation——"存在 1 个 confirmed"
+# 照样 PASS，而声明的新收件人收不到任何通知。必须绑定 Endpoint == 声明值。
+DECLARED_EMAIL="$(SB_ALERT_EMAIL="${SB_ALERT_EMAIL:-}" python3 - <<'PY'
+import configparser, os, sys
+env = os.environ.get("SB_ALERT_EMAIL", "").strip()
+if env:
+    print(env); sys.exit(0)
+c = configparser.ConfigParser(interpolation=None)
+c.read("site-builder/config.ini")
+raw = c["Alerting"].get("email", "") if c.has_section("Alerting") else ""
+print(raw.split("#")[0].split(";")[0].strip())
+PY
+)"
 TOPIC="$(aws sns create-topic --region "$REGION" --name site-builder-alarms \
            --query TopicArn --output text 2>/dev/null || echo '')"
-if [ -z "$TOPIC" ] || [ "$TOPIC" = "None" ]; then
+if [ -z "$DECLARED_EMAIL" ]; then
+  echo "  FAIL  无法读取声明的告警邮箱（[Alerting] email 或 SB_ALERT_EMAIL）"
+  FAILURES=$((FAILURES + 1))
+elif [ -z "$TOPIC" ] || [ "$TOPIC" = "None" ]; then
   echo "  FAIL  无法解析 SNS topic ARN"
   FAILURES=$((FAILURES + 1))
 else
-  CONFIRMED="$(aws sns list-subscriptions-by-topic --region "$REGION" \
-                 --topic-arn "$TOPIC" \
-                 --query "length(Subscriptions[?Protocol=='email' && starts_with(SubscriptionArn, 'arn:')])" \
-                 --output text 2>/dev/null || echo 0)"
-  if [ "${CONFIRMED:-0}" -ge 1 ]; then
-    echo "  PASS  SNS email 订阅已确认（${CONFIRMED} 个）"
-  else
-    echo "  FAIL  没有已确认的 email 订阅——alarm 会进 ALARM 但无人收到通知"
-    echo "        （PendingConfirmation 不算：收件人必须点确认链接）"
-    FAILURES=$((FAILURES + 1))
-  fi
+  # 分页完整：list-subscriptions-by-topic 单页 100 条，aws cli 不加
+  # --no-paginate 时自动翻页，但 --query 的 length() 只作用于合并结果——
+  # 用 json 输出交给 python 数，顺带把"状态"算清楚。
+  SUB_STATE="$(aws sns list-subscriptions-by-topic --region "$REGION" \
+                 --topic-arn "$TOPIC" --output json 2>/dev/null | \
+               python3 -c "
+import json, sys
+declared = '''$DECLARED_EMAIL'''.strip()
+subs = json.load(sys.stdin).get('Subscriptions', [])
+mine = [s for s in subs
+        if s.get('Protocol') == 'email' and s.get('Endpoint') == declared]
+if any(s.get('SubscriptionArn', '').startswith('arn:') for s in mine):
+    print('confirmed')
+elif mine:
+    print('pending')
+else:
+    print('absent')
+" 2>/dev/null || echo error)"
+  case "$SUB_STATE" in
+    confirmed)
+      echo "  PASS  声明收件人（[Alerting] email）的订阅已确认" ;;
+    pending)
+      echo "  FAIL  声明收件人的订阅还在 PendingConfirmation——必须点确认链接"
+      echo "        （其他历史收件人是否 confirmed 与本项无关：换邮箱后旧的"
+      echo "         仍 confirmed 会造成假绿，所以只认声明的那一个）"
+      FAILURES=$((FAILURES + 1)) ;;
+    absent)
+      echo "  FAIL  topic 下没有声明收件人的订阅——先跑 deploy_auth.py"
+      FAILURES=$((FAILURES + 1)) ;;
+    *)
+      echo "  FAIL  订阅状态查询失败（凭证/网络），不能当作通过"
+      FAILURES=$((FAILURES + 1)) ;;
+  esac
 fi
 ```
 
@@ -1445,7 +1548,9 @@ Expected: 输出含 `告警管道已收敛：metric_filter, alarm`（订阅已�
 - [ ] **Step 5: [真机] 跑扩展后的 `verify_auth_alarm.sh`**
 
 Run: `SNS_TOPIC_ARN="$(aws sns create-topic --name site-builder-alarms --query TopicArn --output text)" ./site-builder/scripts/verify_auth_alarm.sh`
-Expected: 全部 PASS，含新增两项（`线上 alarm 配置 == 声明值`、`SNS email 订阅已确认`），探针 alarm 清理确认。
+Expected: 全部 PASS，含新增两项（`线上 alarm 配置 == 声明值`——Alarm/OK actions 必须等于声明 topic ARN；`声明收件人的订阅已确认`——绑定 `[Alerting] email`，其他收件人 confirmed 不算），探针 alarm 清理确认。
+
+**负向验证（假绿场景真的会红）**：临时把 `config.ini` 的 `[Alerting] email` 改成一个未订阅的假邮箱再跑脚本 → Expected: `声明收件人` 一项 **FAIL**（`absent`），即使现网旧收件人仍 confirmed。改回后重跑 PASS。
 
 - [ ] **Step 6: 验证幂等——再跑一次 `deploy_auth.py`**
 
@@ -1526,8 +1631,8 @@ DEPLOY.md 手工命令段改写为自动收敛，明确不称 IaC、禁止第二
 
 **Files:**
 - Modify: `site-builder/deployer/infra/app.py`（jobs 表 `site-index` GSI；`site-ops-log`；`site-session-codes`）
-- Modify: `site-builder/deployer/functions/common.py`（`list_jobs_by_site`；`created_at` 写入）
-- Modify: `site-builder/mcp/server.py`（`do_deploy_site` 建站分支写 `created_at`）
+- Modify: `site-builder/deployer/functions/common.py`（`list_jobs_by_site`；`create_site_record` + `SiteIdCollision`）
+- Modify: `site-builder/mcp/server.py`（`do_deploy_site` 建站分支改用 `create_site_record` + 碰撞重试）
 - Create: `site-builder/scripts/backfill_site_created_at.py`
 - Create: `site-builder/deployer/tests/test_backfill_created_at.py`
 - Modify: `site-builder/deployer/tests/conftest.py`、`site-builder/mcp/tests/conftest.py`（新表与 GSI 夹具）
@@ -1540,6 +1645,7 @@ DEPLOY.md 手工命令段改写为自动收敛，明确不称 IaC、禁止第二
   - 表 `site-ops-log`（PK `target`, SK `ts_actor`, TTL `expires_at`, RemovalPolicy RETAIN）
   - 表 `site-session-codes`（PK `jti`, TTL `expires_at`, RemovalPolicy DESTROY）
   - `common.list_jobs_by_site(site_id: str, limit: int = 50) -> list[dict]` —— 按 created_at 倒序
+  - `common.create_site_record(site_id: str, *, owner: str, name: str, status: str = "DEPLOYING") -> None` —— 整条记录 `attribute_not_exists(site_id)` 单次条件写；碰撞抛 `common.SiteIdCollision`
   - `backfill_site_created_at.py` CLI：`--dry-run`（默认）/ `--apply`
 
 **为什么 session-codes 用 DESTROY 而 ops-log 用 RETAIN**：session-codes 是 60 秒 TTL 的一次性消费标记，删栈时丢掉无害；ops-log 是审计记录（TTL 400 天），误删会丢失合规证据——与 `site-admins` 的 RETAIN 同理。
@@ -1708,54 +1814,110 @@ def list_jobs_by_site(site_id: str, limit: int = 50) -> list[dict]:
 在 `upsert_site` 的 docstring 后追加一个专用函数（不改 `upsert_site` 语义，避免所有调用方都写 created_at）：
 
 ```python
-def create_site_record(site_id: str, **attrs) -> None:
-    """**首次**建站：写入 created_at 后调 upsert_site。
+class SiteIdCollision(Exception):
+    """site_id 已被占用。建站路径捕获它并重新生成 ID。"""
 
-    created_at 只在建站那一刻有意义，所以单独一个入口而不是塞进 upsert_site
-    （后者被部署链多处调用——mark_job / provision_* 各一次，每次都写会把创建
-    时间刷成最后一次部署时间）。
 
-    条件是"该属性不存在"，**条件失败是正常情况**（同 site_id 重复走建站分支、
-    或回填脚本已经补过），吞掉继续；其他 ClientError 照原样上抛。
+def create_site_record(site_id: str, *, owner: str, name: str,
+                       status: str = "DEPLOYING") -> None:
+    """**首次**建站：整条记录单次条件写，site_id 已存在即抛 SiteIdCollision。
+
+    条件必须是 `attribute_not_exists(site_id)` 且**一次写完整条**——不能拆成
+    "条件写 created_at + 无条件 upsert_site(owner/name/…)"两步：第一步条件
+    失败被吞后，第二步会把**已有站点**的 owner/name/status 覆盖成本次调用者，
+    随机 ID 碰撞就变成误接管（Codex review 2026-08-09 P1，moto 已复现；
+    一期的 upsert_site 建站路径本就有此行为，本函数一并修掉）。
+
+    created_at 只在建站这一刻写；碰撞由调用方重新生成 ID 重试，
+    **绝不对已有行继续写**。
     """
     import botocore.exceptions
+    item = {"site_id": site_id, "owner": owner, "name": name,
+            "status": status, "created_at": _now()}
     try:
-        _table("SITES_TABLE").update_item(
-            Key={"site_id": site_id},
-            UpdateExpression="SET created_at = :t",
-            ConditionExpression="attribute_not_exists(created_at)",
-            ExpressionAttributeValues={":t": _now()})
+        _table("SITES_TABLE").put_item(
+            Item=item,
+            ConditionExpression="attribute_not_exists(site_id)")
     except botocore.exceptions.ClientError as e:
-        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
-            raise
-    if attrs:
-        upsert_site(site_id, **attrs)
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            raise SiteIdCollision(site_id) from e
+        raise
 ```
 
-同时在 `test_common.py` 追加一条覆盖"不覆盖已有值"的用例：
+同时在 `test_common.py` 追加**三条**用例——断言必须覆盖 owner/name/status（只断言 created_at 会假绿：覆盖行为恰好不碰 created_at）：
 
 ```python
-def test_create_site_record_does_not_overwrite_created_at(aws):
+def test_create_site_record_collision_raises_and_writes_nothing(aws):
+    """碰撞必须抛 SiteIdCollision，且已有站点的**每个字段**原样不动。"""
     import common
-    common.create_site_record("s-dup", owner="u@x.com", status="DEPLOYING")
-    first = common.get_site("s-dup")["created_at"]
-    common.create_site_record("s-dup", owner="u@x.com", status="DEPLOYING")
-    assert common.get_site("s-dup")["created_at"] == first
+    common._table("SITES_TABLE").put_item(Item={
+        "site_id": "victim-abc123", "owner": "victim@x.com",
+        "name": "victim", "status": "ACTIVE",
+        "created_at": "2026-01-01T00:00:00+00:00"})
+    import pytest
+    with pytest.raises(common.SiteIdCollision):
+        common.create_site_record("victim-abc123",
+                                  owner="attacker@x.com", name="attacker")
+    site = common.get_site("victim-abc123")
+    assert site["owner"] == "victim@x.com"      # 不只 created_at——
+    assert site["name"] == "victim"             # owner/name/status 全部
+    assert site["status"] == "ACTIVE"           # 必须原样（假绿教训）
+    assert site["created_at"] == "2026-01-01T00:00:00+00:00"
+
+
+def test_create_site_record_writes_full_record_once(aws):
+    import common
+    common.create_site_record("s-new", owner="u@x.com", name="fresh")
+    site = common.get_site("s-new")
+    assert site["owner"] == "u@x.com" and site["status"] == "DEPLOYING"
+    assert site["created_at"]
+
+
+前两条进 `site-builder/deployer/tests/test_common.py`；第三条（走到 `do_deploy_site`）进 `site-builder/mcp/tests/test_tools.py`：
+
+```python
+def test_deploy_site_regenerates_id_on_collision(aws, monkeypatch):
+    """建站分支撞 ID 时重新生成，不得对已有行做任何写。"""
+    import common, server
+    common._table("SITES_TABLE").put_item(Item={
+        "site_id": "notes-aaaaaa", "owner": "victim@x.com",
+        "name": "notes", "status": "ACTIVE",
+        "created_at": "2026-01-01T00:00:00+00:00"})
+    ids = iter(["notes-aaaaaa", "notes-bbbbbb"])   # 第一次碰撞，第二次成功
+    monkeypatch.setattr(common, "new_site_id", lambda name: next(ids))
+    out = server.do_deploy_site("caller@x.com", "notes")
+    assert out["site_id"] == "notes-bbbbbb"
+    victim = common.get_site("notes-aaaaaa")
+    assert victim["owner"] == "victim@x.com" and victim["status"] == "ACTIVE"
 ```
 
-- [ ] **Step 5: `mcp/server.py` 建站分支改用 `create_site_record`**
+- [ ] **Step 5: `mcp/server.py` 建站分支改用 `create_site_record` + 碰撞重试**
 
 把 `do_deploy_site` 里的
 ```python
+        site_id = common.new_site_id(common.validate_site_name(site_name))
         common.upsert_site(site_id, owner=owner, name=site_name, status="DEPLOYING")
 ```
 改为
 ```python
-        # create_site_record 而非 upsert_site：首次建站要写 created_at
-        # （控制台显示创建时间；条件写，重复调用不覆盖）。
-        common.create_site_record(site_id, owner=owner, name=site_name,
-                                  status="DEPLOYING")
+        # create_site_record 而非 upsert_site：整条记录 attribute_not_exists
+        # 单次条件写。upsert 语义下随机 ID 碰撞会把已有站点的 owner/name/
+        # status 覆盖成本次调用者（误接管）；碰撞重新生成 ID 重试。
+        # 36^6 ≈ 21.8 亿的后缀空间里 3 次连撞视为异常（大概率是环境/代码问题），
+        # 响亮失败而不是无限重试。
+        for _ in range(3):
+            site_id = common.new_site_id(common.validate_site_name(site_name))
+            try:
+                common.create_site_record(site_id, owner=owner, name=site_name)
+                break
+            except common.SiteIdCollision:
+                continue
+        else:
+            raise common.InvalidSiteName(
+                "站点 ID 连续碰撞，请重试；若持续出现请联系平台管理员")
 ```
+
+**注意**：`SiteIdCollision` 定义在 `common.py`（Step 4 的代码块里），`server.py` 通过 `common.SiteIdCollision` 引用。
 
 - [ ] **Step 6: 写回填脚本**
 
@@ -1905,7 +2067,7 @@ Run:
 cd site-builder/deployer && .venv/bin/pytest tests -q && \
 cd ../mcp && python3 -m pytest tests -q
 ```
-Expected: 两处均 PASS（deployer 新增 6 用例，mcp 无回归）
+Expected: 两处均 PASS（deployer 新增 7 用例：回填 4 + list_jobs_by_site 1 + 碰撞 2；mcp 新增 1：碰撞重生成）
 
 CDK 断言：
 ```bash
@@ -1923,8 +2085,13 @@ Expected: PASS
    Expected: `test_site_without_jobs_is_reported_not_guessed` **FAIL**
 3. 把 `list_jobs_by_site` 的 `ScanIndexForward=False` 改成 `True` →
    Expected: `test_list_jobs_by_site_returns_newest_first` **FAIL**
+4. 把 `create_site_record` 改回"条件写 created_at 被吞 + 无条件 upsert_site"
+   的两步写法 →
+   Expected: `test_create_site_record_collision_raises_and_writes_nothing`
+   **FAIL**（owner 被覆盖成 attacker@x.com——这正是 Codex 复现的接管路径；
+   若此用例在两步写法下仍绿，说明断言漏了 owner/name/status，用例本身是坏的）
 
-三处还原，重跑 PASS。
+四处还原，重跑 PASS。
 
 - [ ] **Step 11: 在 `config.ini.example` 加 `[Panel]` 段**
 
@@ -1962,21 +2129,120 @@ git commit -m "feat(deployer): M3 数据层——site-index GSI + ops-log/sessio
   维度，协作者发起的部署查不出\"这个站点的所有部署\"
 - site-ops-log（RETAIN + TTL）：审计误删会丢合规证据，同 site-admins
 - site-session-codes（DESTROY + TTL）：60 秒一次性标记，删栈丢掉无害
-- create_site_record()：首次建站条件写 created_at（不塞进 upsert_site——
-  它被部署链多处调用，每次都写会把创建时间刷成最后一次部署时间）
+- create_site_record()：整条记录 attribute_not_exists(site_id) 单次条件写，
+  碰撞抛 SiteIdCollision 由建站分支重生成 ID。修掉一期 upsert 建站的
+  \"随机 ID 碰撞误接管已有站点\"路径（Codex review 复现）
 - backfill_site_created_at.py：从最早一条 job 推导；**无 job 不猜**（写 now
   是错日期且看不出是猜的），报告后跳过。默认 dry-run"
 ```
+
+- [ ] **Step 13: [真机] 部署 deployer 栈并等待 `site-index` ACTIVE**
+
+**部署门禁**：Step 9-10 全绿 + Step 12 已提交。
+
+```bash
+cd site-builder/deployer/infra && rm -rf cdk.out && \
+  PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never
+```
+
+**GSI 加到已有表后先处于 CREATING，期间 Query 会报错**（AWS 契约：backfilling
+完成转 ACTIVE 前不可查）。存量 job 数量级小（几十条），通常几分钟内 ACTIVE，
+但必须显式等待而不是假设：
+
+```bash
+JOBS_TABLE=$(python3 -c "import configparser;c=configparser.ConfigParser();c.read('site-builder/config.ini');print(c['Deployer']['jobs_table'])")
+for i in $(seq 1 60); do
+  S=$(aws dynamodb describe-table --table-name "$JOBS_TABLE" \
+        --query "Table.GlobalSecondaryIndexes[?IndexName=='site-index'].IndexStatus | [0]" \
+        --output text)
+  echo "site-index: $S"
+  [ "$S" = "ACTIVE" ] && break
+  sleep 10
+done
+[ "$S" = "ACTIVE" ] || { echo "FAIL: site-index 未在 10 分钟内 ACTIVE"; exit 1; }
+```
+
+Expected: `site-index: ACTIVE`。再真机验证 GSI 可查（任取一个存量站点）：
+
+```bash
+aws dynamodb query --table-name "$JOBS_TABLE" --index-name site-index \
+  --key-condition-expression "site_id = :s" \
+  --expression-attribute-values "{\":s\":{\"S\":\"<存量 site_id>\"}}" \
+  --no-scan-index-forward --max-items 3 \
+  --query 'Items[].{job:job_id.S,at:created_at.S,st:#s.S}' \
+  --output table 2>/dev/null || \
+aws dynamodb query --table-name "$JOBS_TABLE" --index-name site-index \
+  --key-condition-expression "site_id = :s" \
+  --expression-attribute-values "{\":s\":{\"S\":\"<存量 site_id>\"}}" \
+  --no-scan-index-forward --max-items 3 --output json | python3 -m json.tool | head -30
+```
+
+Expected: 返回该站点的 job（最新在前）。**这个真机形态（返回字段、排序）
+是 Task 6 `/api/sites/{id}/jobs` 响应契约的输入。**
+
+- [ ] **Step 14: [真机] 跑 created_at 回填（先 dry-run 再 apply 再读回）**
+
+```bash
+./site-builder/scripts/backfill_site_created_at.py            # dry-run
+```
+Expected: 报告"将回填 N 个 / 已有值跳过 0 / 无 job 跳过 K"。人工过目
+`将回填` 列表（site_id → 推导出的时间戳）无异常后：
+
+```bash
+./site-builder/scripts/backfill_site_created_at.py --apply
+```
+Expected: `已回填 N`（与 dry-run 的 N 一致）。
+
+**读回核对**（强一致读，逐站点确认真的写进去了）：
+
+```bash
+SITES_TABLE=$(python3 -c "import configparser;c=configparser.ConfigParser();c.read('site-builder/config.ini');print(c['Deployer']['sites_table'])")
+aws dynamodb scan --table-name "$SITES_TABLE" --consistent-read \
+  --projection-expression "site_id, created_at" --output json | \
+python3 -c "
+import json, sys
+items = json.load(sys.stdin)['Items']
+missing = [i['site_id']['S'] for i in items if 'created_at' not in i]
+print(f'站点 {len(items)} 个，缺 created_at：{len(missing)} 个')
+for s in missing: print(f'  （无 job 站点，控制台创建时间显示为空）{s}')
+"
+```
+Expected: 缺 created_at 的数量 == dry-run 报告的 `无 job 跳过 K`（且这 K 个
+已人工确认）。**回填的实际覆盖率是 Task 14 前端"创建时间"列展示逻辑的输入。**
+
+再幂等验证：重跑 `--apply` 一次，Expected: `已回填 0｜已有值跳过 N+...`
+（不重复写）。
+
+**回滚方式**：created_at 是新增字段，回滚 = 逐站点 `REMOVE created_at`
+（无消费方读它——panel 尚未部署）；GSI 回滚 = `git revert` 后重新 deploy
+（CDK 删索引）。两者都不影响现有部署链。
+
+- [ ] **Step 15: 记录真机结果供 Task 6 展开使用**
+
+把以下三项写进 `.superpowers/sdd/progress.md` 的 Task 5 条目（**不含真实
+site_id/账号值**，用计数与形态描述）：
+
+1. `site-index` Query 的真机返回形态（字段集合、`ScanIndexForward=False`
+   生效与否）；
+2. created_at 回填覆盖率（N 回填 / K 无 job）；
+3. 无 job 站点清单的处置结论（前端显示为空 or 人工补）。
+
+**此步骤产出即 Task 6-16 展开所需的全部真机输入**——展开工作不依赖其他
+未完成事项。
 
 ---
 
 > **Task 6-16 的详细步骤**：本计划已覆盖两个 Blocking 前置（Task 1-4，可立即
 > 开始实施）与 M3 数据层（Task 5）。Task 6-16 的接口契约、文件清单与验收标准
 > 已在上方「文件结构」「任务顺序与依赖」与 spec
-> `2026-08-09-phase2-m3-console-spec.md` 中锁定，逐步骤展开在 Task 5 完成后
-> 追加——避免在数据层真机验证前把 panel 的 handler 签名写死（`site-index`
-> GSI 的真机查询形态、`created_at` 回填的实际覆盖率会影响 `/api/sites` 与
-> `/api/sites/{id}/jobs` 的响应契约）。
+> `2026-08-09-phase2-m3-console-spec.md` 中锁定，逐步骤展开在 **Task 5 全部
+> 完成（含 Step 13-15 的真机部署、GSI ACTIVE、回填与读回）后**由控制器追加
+> ——`site-index` 的真机查询形态与 `created_at` 回填覆盖率（Step 15 记录进
+> progress.md）是 `/api/sites` 与 `/api/sites/{id}/jobs` 响应契约的输入。
+> Task 5 不产出这些就不算完成，展开工作不依赖其他未完成事项（Codex review
+> 2026-08-09：早先版本的 Task 5 只有单测与 commit、没有真机步骤，"等 Task 5
+> 真机结果"构成循环依赖——已由 Step 13-15 修复）。
+> **在 Task 6-16 逐步骤追加进本文件之前，不得开始实施这些任务。**
 >
 > **Task 6-16 概要**（每个任务的 Files / Interfaces / 验收标准）：
 >
@@ -1985,7 +2251,12 @@ git commit -m "feat(deployer): M3 数据层——site-index GSI + ops-log/sessio
 >   ① panel 模块内不出现任何 `UpdateExpression=` / `ConditionExpression=` 关键字实参，也不出现对 sites/admins 表的 `put_item`/`update_item`/`delete_item` 调用；权限与 admin 写入只能是对 `permissions.<高层函数>` 的 Call。
 >   ② admin 增删只能命中 `permissions.add_admin` / `permissions.remove_admin`——它们维护 `__count__` sentinel（`remove_admin` 的"不能删到名单为空"条件依赖它）。panel 若 raw 写 admins 表，sentinel 会与实际 item 数漂移，`remove_admin` 的守卫随之失效。
 >   反向验证：在 `panel/api.py` 里临时插一句 `_admins_table().put_item(Item={"email": "x@x.com"})`，确认 ① ② 各自 FAIL 后删除。
-> - **Task 7 console-session + CSRF**：`panel/console_session.py`（HMAC code 签发校验、60s、绑 email、context 标记 `typ:"console-upgrade"`、jti 条件写 `site-session-codes` 原子消费）+ `tests/test_csrf.py`（**副作用前置顺序断言**：mock DynamoDB 客户端，验证 CSRF 失败路径下零写调用）。
+> - **Task 7 console-session + CSRF**：
+>   ① **code 编解码单一实现进 `auth/session.py`**（`mint_upgrade_code` / `verify_upgrade_code`，HS256 同 JWT_SECRET，载荷 `typ="console-upgrade"` / `email` / `jti` / `exp`≤60s）；panel 构建时复制 `session.py`（同 common.py/permissions.py 模式）——**不得在 panel 里手写第二份编解码**；
+>   ② `panel/console_session.py`：调 `verify_upgrade_code` + jti 条件写 `site-session-codes` 原子消费（`attribute_not_exists(jti)`）+ 重放拒绝 + `__Host-sb_console` cookie 构造（Secure/HttpOnly/SameSite=Lax/Path=//无 Domain）；
+>   ③ **密钥交付**：panel 环境变量只下发 `JWT_SECRET_PARAM`（参数名），运行时 SSM 读 + TTL 缓存，照抄 auth 的 `_secret()` 模式。**明文严禁进环境变量**（GetFunctionConfiguration 会回显，拿到即可伪造任意用户会话——deploy_auth.py:54-65 已记录）；panel role 的 SSM/KMS 语句照抄 auth role `read-platform-secrets`（资源限定 `parameter/site-builder/*` + ViaService 条件），Task 10 的 contract test 断言此语句存在且无更宽资源；
+>   ④ **交叉契约测试**：同一组用例向量（合法 code / 篡改各字段 / typ 不符 / 过期 / jti 重放）在 auth 与 panel 两个测试包各跑一遍，防两份复制品漂移；
+>   ⑤ `tests/test_csrf.py`：**副作用前置顺序断言**——mock DynamoDB 客户端，验证 CSRF 失败路径下零写调用。
 > - **Task 8 ops-log 落点**：`permissions.py` 五个高层写函数 + undeploy 路径内落 ops-log（唯一落点，MCP 与控制台自动同轮覆盖）+ `panel/ops_log.py`（PutItem only、字段脱敏）+ `mcp/deploy_agentcore.py` 补 ops-log PutItem。
 > - **Task 9 panel handler 组装**：`panel/handler.py` 路由分发 + 五步前置校验顺序 + 错误码（401 `{"need":"console-session"}` / 403 / 409）。
 > - **Task 10 `deploy_panel.py`**：Lambda + Function URL + panel role（表清单见 spec §2，路由表**仅** UpdateItem）+ 前端上传 S3 `platform/console/{console_version}/` + console route 注册。
@@ -1993,10 +2264,20 @@ git commit -m "feat(deployer): M3 数据层——site-index GSI + ops-log/sessio
 >   ① `AuthType == "AWS_IAM"`（不是 NONE——`NONE` + `Principal:*` 会被安全扫描自动处置，实测把整个 resource policy 删光）；
 >   ② resource policy 恰好两条语句、Principal 是**逐字符 exact** edge role ARN（不是 `*`、不是账号根、不做前缀匹配），action 分别是 `lambda:InvokeFunctionUrl`（含 `FunctionUrlAuthType=AWS_IAM` 条件）与 `lambda:InvokeFunction`（含 `InvokedViaFunctionUrl=true` 条件）——2025-10 起缺任一条即 403；
 >   ③ `edge_role_arn` 缺失/空串时 `deploy_panel.py` **抛错中止**，不得 fallback 到 `Principal:*` 或跳过授权（照抄 `deploy_lambda_site.py` 的 KeyError 形态）。
->   真机：`curl` 直连 Function URL 期望 403；经 `https://console.{base_domain}` 期望 200。**只有请求确实经过 Edge，`x-user-email` 才可信**——②③ 是这个前提的唯一保证。
->   反向验证：临时把 Principal 改成 `"*"`，确认 contract test FAIL 且真机直连变成 200（证明测试真的在守这条），随后还原并重新部署。
-> - **Task 11 Edge console 白名单**：`PLATFORM_SUBDOMAINS` 加 `console`、`RESERVED_COOKIES` 加两个 `__Host-`（两文件同步）+ 伪造 platform route 负测 + `verify_deployed_edge.sh` 断言产物含新值与 CloudFront 实际关联版本。
-> - **Task 12 auth `/console-session`**：校验顶域 `sb_session` → 签发 code → 302 到 console callback；`__Host-sb_pkce` 与新 cookie 的作用域测试。
+>   真机：unsigned `curl` 直连 Function URL 期望 403（这**只**证明 AuthType=AWS_IAM 在工作）；经 `https://console.{base_domain}` 期望 200。**只有请求确实经过 Edge，`x-user-email` 才可信**——②③ 是这个前提的唯一保证。
+>   反向验证 Principal 精确绑定（**不能用 unsigned curl**：AWS_IAM 下未签名请求恒 403，与 resource policy 无关——把 Principal 改成 `*` 后 unsigned curl 依然 403，永远得不到"变 200"的信号；照那个思路做的实施者可能改 AuthType=NONE 去"让测试通过"，反而真正公开 endpoint。Codex review 2026-08-09 P2）：
+>   用一个**非 Edge、且无 identity-based lambda:InvokeFunctionUrl 权限**的已签名 IAM principal（如临时建的探针角色）发 SigV4 请求：
+>   ① Principal=exact edge role 时 → 探针请求 403（resource policy 不认它）；
+>   ② 临时把 Principal 改成 `*` 部署 → 同一探针请求变 200（证明改的就是这条边界）；
+>   ③ 还原 exact Principal 重新部署 → 探针再次 403；contract test 同步确认 FAIL→PASS。
+>   探针角色用完即删（trap 清理，与 verify 脚本的探针数据同纪律）。
+> - **Task 11 Edge console 白名单 + 平台前缀 S3 权限**：
+>   ① `PLATFORM_SUBDOMAINS` 加 `console`、`RESERVED_COOKIES` 加两个 `__Host-`（origin_request/origin_response 两文件同步）+ 伪造 platform route 负测；
+>   ② **`stack.py` Edge role 的 S3 policy 加 `{frontend_bucket}/platform/*`**（Codex review 2026-08-09 P1：现只有 `sites/*`，而 console 前端在 `platform/console/{version}/`、route_mode=split 的非 `/api/*` 请求走 S3 SigV4 分支——缺这条则控制台首页 AccessDenied 加载不出来）。收窄取向：给 `platform/*` 而非整桶，站点前缀与平台前缀仍然分离；
+>   ③ `verify_deployed_edge.sh` 断言产物含新白名单/新保留 cookie、CloudFront 实际关联版本，**并加一条真机静态资源读取**：部署后 `curl -s -o /dev/null -w '%{http_code}' https://console.{base_domain}/`（带合法会话 cookie）期望 200 而非 403——这是 S3 IAM 生效的直接证据；
+>   ④ CDK 断言：Edge role 的 S3 语句资源集合 == `{sites/*, platform/*}`（不多不少——出现整桶 `/*` 即 FAIL）。
+>   反向验证：临时把 `platform/*` 那条删掉 synth → CDK 断言 FAIL；（真机负向不必做——部署前的 AccessDenied 已由现状证明。）
+> - **Task 12 auth `/console-session`**：`session.py` 加 `mint_upgrade_code` / `verify_upgrade_code`（Task 7 契约的签发端）；`login_handler.py` 加 `/console-session` 路径（校验顶域 `sb_session` 有效 → `mint_upgrade_code(email)` → 302 到 `https://console.{base_domain}/api/session-callback?code=...`；无有效会话则 302 到 `/login?redirect=<console-session URL>` 走完整登录）；`__Host-sb_pkce` 与新 cookie 的作用域测试；重部署 auth（`python3 deploy_auth.py`）后真机验证 302 链路。
 > - **Task 13 三层部署 + `verify_deployed_components.py`**：重构自 `verify_contract_fixtures.py`（7 段，旧脚本删除、文档引用同步），部署 deployer/Edge/auth/panel/MCP 并逐一核对产物。
 > - **Task 14 前端移植 + panel E2E**：原型视图层进 `panel/frontend/`（去敏感值、`window.API` 换真 fetch、M4/M5 入口 disabled、PHASE_LABEL 按 jobs 表真实词表重写、undeploy 改轮询、FAILED 展示层派生）+ spec §7 的 13 项 E2E 全覆盖。
 > - **Task 15 fixture 自动清理**（可与 6-14 并行，**必须在 Task 16 前完成**）：`smoke_router.sh` 随机后缀 + trap + 只删本次 + 强一致读回 + 最小断言数 + `--keep-on-failure`；`test_e2e_fixtures.py` finalizer（记录本次 site_id/job_id、默认 undeploy + purge、清理失败即测试失败、禁按 owner 批量删）。
@@ -2006,7 +2287,7 @@ git commit -m "feat(deployer): M3 数据层——site-index GSI + ops-log/sessio
 
 ## Self-Review 结论
 
-**1. Spec 覆盖**：phase2 spec §11-pre.1（Task 1-2）、§11-pre.2（Task 3-4）、§11-pre.3（Task 15）、§11-pre.4（Task 13）；M3 spec §2 平台约束（Task 10）、§3 前端（Task 14）、§4 接口映射（Task 6/9）、§4.1 四个缺口（Task 5 的 created_at 与 Task 14 的 FAILED 派生/phase 词表/undeploy 轮询）、§5.1-5.5 安全硬约束（Task 6/7/8/10/11）、§6 资源清单（Task 5/10）、§7 测试硬约束（各任务的反向验证步骤 + Task 13/14）。**无遗漏**。
+**1. Spec 覆盖**：phase2 spec §11-pre.1（Task 1-2）、§11-pre.2（Task 3-4）、§11-pre.3（Task 15）、§11-pre.4（Task 13）；M3 spec §2 平台约束（Task 10）、§3 前端（Task 14）、§4 接口映射（Task 6/9）、§4.1 四个缺口（Task 5 的 created_at 与 Task 14 的 FAILED 派生/phase 词表/undeploy 轮询）、§5.1-5.5 安全硬约束（Task 6/7/8/10/11）、§6 资源清单（Task 5/10）、§7 测试硬约束（各任务的反向验证步骤 + Task 13/14）。**Task 1-5 已逐步骤覆盖无遗漏；Task 6-16 为锁定契约后的分阶段展开**（早先版本此处写"无遗漏"是过度声明——Codex review 指出后修正）。
 
 **2. 占位符扫描**：Task 1-5 的每个代码步骤都有可直接落地的完整代码；Task 6-16 是**明示的分阶段展开**（附完整 Files/Interfaces/验收标准），不是 "TBD"——理由已写明（数据层真机形态影响 panel 响应契约）。
 
@@ -2017,9 +2298,21 @@ git commit -m "feat(deployer): M3 数据层——site-index GSI + ops-log/sessio
 | 问题 | 修法 |
 |---|---|
 | Task 2 CDK 片段残留 `f_sweep.add_alias  # noqa` 占位行 | 删除，改为说明 `recon_fn` 与 `step_fn` 的 asset 差异（前者无 bundling） |
-| Task 5 `create_site_record` 的条件失败处理写在正文而非代码里 | 代码内补 try/except `ConditionalCheckFailedException`，并加一条"重复调用不覆盖"的用例（新增用例数 5→6） |
-| Function URL trust 只在 Global Constraints 有一句，Task 10 无可验证断言 | Task 10 展开三条断言（AuthType / exact Principal 双语句 / 缺配置抛错不 fallback）+ 真机正负各一 + 反向验证 |
+| Task 5 `create_site_record` 的条件失败处理写在正文而非代码里 | ~~补 try/except 吞条件失败~~ **此修法本身有缺陷**，被 Codex review F1 推翻——见下方第 6 节 |
+| Function URL trust 只在 Global Constraints 有一句，Task 10 无可验证断言 | Task 10 展开三条断言（AuthType / exact Principal 双语句 / 缺配置抛错不 fallback）+ 真机正负各一 + 反向验证（反向验证方式后被 Codex F7 修正，见第 6 节） |
 | admin `__count__` sentinel 同上——只在约束里，Task 6 无守卫 | Task 6 展开两条 AST 结构性断言（禁 panel 内 UpdateExpression/表直写、admin 增删只能命中 helper）+ 反向验证 |
 | Task 6 的结构性测试原写"AST 扫描"但未说明为何不能用文本匹配 | 明确写出：注释/docstring 里出现这些字样不算违规（本项目历史教训：文本断言锁住了注释里的旧表达式，改错代码仍绿） |
 
 **5. 七个检查点复核**：M3/M4/M5 范围（Global Constraints 第 47 行 + spec §11-clarify，`stats` 在计划里的其余出现均为回填脚本的本地变量名，非 M5 功能）；console 平台白名单（Task 11 + 约束第 32 行禁 `route.owner` 推导）；Function URL trust（Task 10 三条，已补）；EventBridge best-effort + sweeper（Task 1 docstring + Task 2 rule/schedule 断言 + Task 2 Step 10 真机两层各自有效）；admin sentinel（Task 6 两条，已补）；CSRF 前置副作用（Task 7 的"CSRF 失败路径下零写调用"顺序断言 + Task 9 五步顺序）；清理与部署门禁（Task 2/4 各有部署门禁+回滚锚点+回滚方式，Task 15 fixture 清理且硬性早于 Task 16）。
+
+**6. Codex review（2026-08-09，7 findings）处置记录**：
+
+| # | Finding | 处置 | 落点 |
+|---|---|---|---|
+| F1 | `create_site_record` 两步写在 ID 碰撞时接管已有站点（moto 复现成立） | **接受修法，拒绝定性**：覆盖行为源自一期 `upsert_site` 建站路径（`server.py:190`），非 7e22215 新引入；且攻击者无法选 site_id（36^6 随机 + 直传分支有格式校验与 `_assert_permission`），是健壮性缺陷非可诱导攻击。修法照做：整条记录 `attribute_not_exists(site_id)` 单次条件写 + `SiteIdCollision` + 建站分支重生成 ID（≤3 次）；用例断言 owner/name/status 全字段 | Task 5 Step 4/5/10 |
+| F2 | Edge role S3 只有 `sites/*`，console 前端 `platform/console/*` 必然 AccessDenied | **接受**（本轮最实际的一条） | Task 11 ②③④ + 文件表 `stack.py` 行 |
+| F3 | console-session 缺跨 Lambda 密钥交付与 code 字节级契约 | **接受**（修正其前提：JWT_SECRET 是沿用现有 SSM 参数 + `_secret()` 模式，非新通道）。编解码单一实现进 `auth/session.py`，panel 构建时复制；密钥明文禁进环境变量；交叉契约测试 | M3 spec §5.4 + Task 7/12 概要 + 文件表 |
+| F4 | Task 6-16 占位 + "等 Task 5 真机结果"是循环依赖 | **部分接受**：循环依赖成立——Task 5 补 Step 13-15（deploy、GSI ACTIVE 等待、回填 dry-run/apply、读回核对、结果记录）；"不算完整 plan"不接受——分阶段展开是显式声明的交付方式，但自审"无遗漏"确系过度声明，已改口径，并加"Task 6-16 未展开前不得实施"门禁 | Task 5 Step 13-15 + 展开说明 + 自审第 1 节 |
+| F5 | 从零部署时日志组不存在，`put_metric_filter` 抛 ResourceNotFound | **接受**（严重性下调：现网组已存在 retention 90 天，这是"从零部署"路径缺陷——但那正是 B2 的目标）。`ensure_alarm_pipeline` 加 ⓪ 段：幂等 `create_log_group` + retention 收敛 30 天（顺手满足 spec §6.3）；Stubber 加 fresh-account 正反两用例 | Task 3 Step 1/3/4/5 |
+| F6 | 告警验收未绑定声明 topic + 声明收件人，两个假绿场景 | **接受**：actions 必须 == 声明 topic ARN（不只 Alarm==OK）；订阅必须是 `[Alerting] email` 那个 Endpoint 已确认（其他人 confirmed 不算）；分页交给 python 数；加负向验证（假邮箱必 FAIL） | Task 4 Step 3/5 |
+| F7 | "Principal=* 后 unsigned curl 变 200"违反 AWS_IAM 契约 | **接受**（P2，自审引入的错误）：AWS_IAM 下未签名请求恒 403 与 resource policy 无关，且该指引会诱导实施者改 AuthType=NONE。改为已签名的非 Edge 探针 principal 做正反验证，并写明原因 | Task 10 反向验证段 |
