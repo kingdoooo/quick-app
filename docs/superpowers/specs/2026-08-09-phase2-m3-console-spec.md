@@ -43,10 +43,12 @@ sites 表、按 permissions.py 写权限（事务含路由表投影）、invoke
   - 路由表：**仅** UpdateItem（permissions.py 的 `write_permissions` 事务
     做权限字段投影所需，与 MCP runtime 同模式；ConditionCheck 所需权限
     一并核对）——没有 PutItem/DeleteItem（整条路由写只属于部署链）；
-  - SSM：`ssm:GetParameter` 限定 `parameter/site-builder/*` +
-    `kms:Decrypt`（ViaService 条件）——验 upgrade code 与 mint
-    `__Host-sb_console` 需要 JWT_SECRET，照抄 auth role 的
-    `read-platform-secrets` 语句（见 §5.4 密钥交付）；
+  - SSM：`ssm:GetParameter` 限定**精确参数 ARN**
+    `parameter/site-builder/jwt-secret`（不是 auth role 的
+    `parameter/site-builder/*` 前缀——auth 用前缀是因为它还要读
+    `site-client-secret`；panel 只需要 JWT_SECRET，照抄前缀会让被攻破的
+    panel 顺带读到 Cognito client secret 与该前缀下未来的一切秘密）+
+    `kms:Decrypt`（ViaService 条件，机制照抄、资源不照抄；见 §5.4）；
   - **没有**：建删基础设施权限、stats/audit/api-keys 表（M4/M5 才建）；
 - 路由表注册 `console` 子域：`route_mode=split`、`require_auth=True`、
   `allowed_users="org"`、`owner=platform`——不进 sites 表，
@@ -226,10 +228,14 @@ SameSite=Lax、Path=/、**无 Domain**。
   读取模式：环境变量只下发**参数名**（`JWT_SECRET_PARAM`），Lambda 内从
   SSM SecureString 读取并带 TTL 缓存。**明文密钥严禁进 Lambda 环境变量**
   （`deploy_auth.py` 已注释原因：`GetFunctionConfiguration` 会原样回显，
-  拿到 JWT_SECRET 即可伪造任意用户会话）。panel role 需要精确的
-  `ssm:GetParameter`（资源限定 `parameter/site-builder/*`）+
-  `kms:Decrypt`（`kms:ViaService = ssm.{region}.amazonaws.com` 条件），
-  照抄 auth role 的 `read-platform-secrets` 语句。
+  拿到 JWT_SECRET 即可伪造任意用户会话）。panel role 需要
+  `ssm:GetParameter` 资源限定**精确 ARN**
+  `parameter/site-builder/jwt-secret` + `kms:Decrypt`
+  （`kms:ViaService = ssm.{region}.amazonaws.com` 条件）。**机制照抄
+  auth 的 `read-platform-secrets`，资源不照抄**：auth 用
+  `parameter/site-builder/*` 前缀是它自己的业务需要（还要读
+  `site-client-secret`），不是最小权限模板——panel 拿前缀等于被攻破时
+  顺带交出 Cognito client secret 与该前缀下未来的一切秘密。
 - **code 编解码的字节级契约**：编码/解码函数**单一实现**放
   `site-builder/auth/session.py`（与会话 JWT 同文件——它已经是 auth 与
   Edge 之间字节级同步的锚点），panel 构建时复制该文件（同 `common.py` /

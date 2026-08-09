@@ -65,7 +65,7 @@
 | `site-builder/panel/api.py` | 各 `/api/*` 端点的纯函数实现（do_* 模式，便于单测） |
 | `site-builder/panel/console_session.py` | upgrade code 校验入口（调构建时复制的 `session.py:verify_upgrade_code`）+ jti 原子消费 + `__Host-sb_console` cookie 构造。**code 编解码不在此实现**——单一实现在 `auth/session.py`，panel 构建时复制 |
 | `site-builder/panel/ops_log.py` | ops-log 写入（append-only，PutItem only，字段脱敏） |
-| `site-builder/panel/deploy_panel.py` | 幂等部署脚本：Lambda（打包时构建复制 `permissions.py`/`common.py`/`session.py`）+ Function URL(AWS_IAM 仅 edge role) + panel role（含 SSM `read-platform-secrets` 语句）+ 前端上传 S3 + console route 注册 |
+| `site-builder/panel/deploy_panel.py` | 幂等部署脚本：Lambda（打包时构建复制 `permissions.py`/`common.py`/`session.py`）+ Function URL(AWS_IAM 仅 edge role) + panel role（SSM 限定精确 jwt-secret ARN，**不用 auth 的前缀**）+ 前端上传 S3 + console route 注册 |
 | `site-builder/panel/frontend/index.html` 等 | 移植的静态 SPA（原型视图层 + 真 fetch 实现的 window.API） |
 | `site-builder/panel/tests/conftest.py` | panel 测试的 moto 表夹具（sites/jobs/admins/ops-log/session-codes/routing） |
 | `site-builder/panel/tests/test_authz.py` | panel 授权矩阵（owner/collaborator/outsider/admin × 各端点） |
@@ -943,6 +943,7 @@ git commit -m "test(scripts): verify_sfn_failure_paths 覆盖两层收敛（6→
 - Create: `site-builder/auth/alarm_pipeline.py`
 - Create: `site-builder/auth/tests/test_alarm_pipeline.py`
 - Modify: `site-builder/config.ini.example`（`[Alerting]` 段）
+- Modify: `CLAUDE.md`（auth 测试 venv 注释：contract venv 需含 boto3）
 
 **Interfaces:**
 - Consumes: `config.ini` 的 `[Alerting] email`（gitignored）或环境变量 `SB_ALERT_EMAIL`
@@ -955,6 +956,23 @@ git commit -m "test(scripts): verify_sfn_failure_paths 覆盖两层收敛（6→
 **为什么真源选 `deploy_auth.py` 而不是 CDK**：告警监控的就是 `deploy_auth.py` 部署的那个 Lambda 的日志组，同一脚本声明全部配套资源、生命周期一致；CDK 方案要跨体系引用日志组、email 还得新开 context 通道并会进 `cdk.out` 模板。**文档中不称其为 IaC**，称"幂等声明式 provisioning"。
 
 **为什么必须自动化**：现网这套（metric filter + SNS topic + alarm + 双语描述 + Alarm/OK actions）是**手工建的**——只跑现有部署脚本不会收敛出它，"从零部署"得不到相同环境。
+
+- [ ] **Step 0: 给 contract venv 补 boto3/botocore（auth 测试的宿主 venv）**
+
+auth 测试借 `contract/.venv`（CLAUDE.md 约定），该 venv **只有 PyJWT 没有
+boto3/botocore**（实测 `ModuleNotFoundError`）——本任务的 Stubber 测试会在
+collection 阶段就挂掉（Codex 复审第二轮实测确认）。PyJWT 本身也不在 contract
+的 pyproject 里，是当年为 auth 测试手工补进去的；boto3 照同一模式补：
+
+```bash
+site-builder/contract/.venv/bin/pip install -q 'boto3>=1.40' && \
+site-builder/contract/.venv/bin/python -c "import boto3, botocore.stub; print('OK')"
+```
+
+Expected: `OK`。
+
+同时更新 `CLAUDE.md` 测试命令一节的 auth 行注释：
+`（auth 无自己的 venv，借 contract 的——含 pyjwt 与 boto3；重建该 venv 后两者都要手工重装）`。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -1063,15 +1081,17 @@ def test_missing_subscription_is_created_once(clients):
 
 def test_alarm_params_match_current_environment(clients):
     """阈值必须与当前环境一致：Sum/300/2/1/GTE/notBreaching，
-    且 ALARM 与 OK 通知同一 topic。"""
+    且 ALARM 与 OK 通知同一 topic。
+
+    走 _stub_common 而不是自铺调用序列：实现的调用序列变化（如新增日志组
+    前置）时只改一处，否则本用例会 Operation mismatch（Codex 复审第二轮
+    实际抓到：这里曾直接从 put_metric_filter 开始 stub，而实现第一个调用
+    已是 create_log_group）。
+    """
     logs, sns, cw, stubs = clients
-    stubs["logs"].add_response("put_metric_filter", {})
-    stubs["sns"].add_response("create_topic", {"TopicArn": TOPIC_ARN})
-    stubs["sns"].add_response("list_subscriptions_by_topic", {"Subscriptions": [
-        {"Protocol": "email", "Endpoint": "ops@example.com",
-         "SubscriptionArn": TOPIC_ARN + ":abc"}]})
-    captured = {}
-    stubs["cw"].add_response("put_metric_alarm", {}, captured)
+    _stub_common(stubs, subs=[{"Protocol": "email",
+                               "Endpoint": "ops@example.com",
+                               "SubscriptionArn": TOPIC_ARN + ":abc"}])
     alarm_pipeline.ensure_alarm_pipeline(email="ops@example.com", **ARGS)
     p = alarm_pipeline.ALARM_PARAMS
     assert p["Statistic"] == "Sum"
@@ -1223,13 +1243,16 @@ def ensure_alarm_pipeline(*, region, log_group, namespace, metric_name,
     # 调用**时才自动创建，不是 CreateFunction 时。全新账号跑 deploy_auth.py
     # 时函数刚建好还没被调过 → put_metric_filter 直接
     # ResourceNotFoundException，B2 部署失败且 auth Lambda 已被改动（半部署）。
-    # 幂等建组，并顺手收敛保留期到 30 天（spec §6.3：平台日志组统一 30 天；
-    # 现网该组曾是 90 天）。
     try:
         logs.create_log_group(logGroupName=log_group)
         changed.append("log_group")
     except logs.exceptions.ResourceAlreadyExistsException:
         pass
+    # retention 收敛到 30 天（spec §6.3：平台日志组统一 30 天）。
+    # ⚠️ 这是**有意的数据修剪**，不是无害配置：现网若是更长保留期（曾是
+    # 90 天），超过 30 天的日志会被标记删除、约 72 小时内物理删除，事后调回
+    # 也找不回。首次在存量环境运行前，部署方必须确认历史日志无保留需要
+    # （deploy 门禁项，见 plan Task 4 Step 4）。
     logs.put_retention_policy(logGroupName=log_group, retentionInDays=30)
 
     # ① metric filter：put 是 upsert 语义，直接声明即可
@@ -1426,13 +1449,14 @@ if ! printf '%s' "$LIVE" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>
   echo "  FAIL  无法读取线上 alarm（输出非合法 JSON，可能是凭证/网络问题）"
   FAILURES=$((FAILURES + 1))
 else
-  python3 - "$DECLARED" <<'PY' || FAILURES=$((FAILURES + 1))
-import json, subprocess, sys
+  # $LIVE 作为 argv 传入复用——**不要在 python 里重新调 aws CLI**：那次重查
+  # 不带 --region，会打到默认 region（与 config.ini 不同时报 0 个 alarm 的
+  # 假失败，或比较到另一区域的同名 alarm；Codex 复审第二轮 P2）。
+  # （不用 stdin 传：heredoc 已占用 stdin。）
+  python3 - "$DECLARED" "$LIVE" <<'PY' || FAILURES=$((FAILURES + 1))
+import json, sys
 declared = json.loads(sys.argv[1])
-live = json.loads(subprocess.run(
-    ["aws", "cloudwatch", "describe-alarms", "--alarm-names",
-     "site-builder-auth-invalid-grant", "--output", "json"],
-    capture_output=True, text=True, check=True).stdout)["MetricAlarms"]
+live = json.loads(sys.argv[2])["MetricAlarms"]
 if len(live) != 1:
     print(f"  FAIL  线上 alarm 数量为 {len(live)}，期望 1"); sys.exit(1)
 a = live[0]
@@ -1528,9 +1552,9 @@ fi
 
 - [ ] **Step 4: [真机] 跑 `deploy_auth.py` 收编现网资源**
 
-**部署门禁**：Step 2 全绿；`config.ini` 的 `[Alerting] email` 已填真实邮箱（gitignored）。
+**部署门禁**：Step 2 全绿；`config.ini` 的 `[Alerting] email` 已填真实邮箱（gitignored）；**已确认 30-90 天窗口的历史日志无保留需要（或已导出）**——见下方 retention 警告。
 
-**回滚锚点**：先导出现网配置：
+**回滚锚点**：先导出现网配置（含**日志组 retention**——脚本会把它收敛到 30 天）：
 ```bash
 aws cloudwatch describe-alarms --alarm-names site-builder-auth-invalid-grant \
   --output json > /tmp/alarm-before.json
@@ -1539,8 +1563,24 @@ aws logs describe-metric-filters --log-group-name /aws/lambda/site-auth-service 
 aws sns list-subscriptions-by-topic \
   --topic-arn "$(aws sns create-topic --name site-builder-alarms --query TopicArn --output text)" \
   --output json > /tmp/subs-before.json
+aws logs describe-log-groups --log-group-name-prefix /aws/lambda/site-auth-service \
+  --query 'logGroups[0].retentionInDays' --output text > /tmp/retention-before.txt
 ```
-**回滚方式**：`aws cloudwatch put-metric-alarm` 用 `/tmp/alarm-before.json` 的值还原（或直接 `git revert` 后重跑脚本）。收编是同名 upsert，不删除任何资源——订阅不会丢，最坏是描述/阈值被改写，可用备份还原。
+
+**⚠️ retention 30 天是一次有意的数据修剪，不是可逆配置**：现网该组是
+90 天，收敛到 30 天后，**超过 30 天的历史日志会被标记删除（通常 72 小时内
+物理删除）**——事后把 retention 改回 90 **找不回已删的日志**。30 天符合
+母 spec §6.3「平台日志组统一 30 天」，但执行前必须单独确认：
+
+- 若近 90 天日志有排查/审计价值（如最近的登录失败调查还没结案），先导出
+  再部署：`aws logs create-export-task`（导 S3）或按需 Insights 查询存档；
+- 该确认是 Step 4 部署门禁的一部分，**不视为告警收编的附带效果**。
+
+**回滚方式**：alarm/filter/subscription 用三份 `/tmp/*-before.json` 的值
+还原（同名 upsert 不删资源，订阅不会丢）；retention 可改回
+`/tmp/retention-before.txt` 的值，但**只对之后的新日志生效**，30-90 天窗口
+内已删的日志不可恢复——这是本任务唯一不可逆的动作，所以放在部署门禁里而
+不是回滚说明里兜底。
 
 Run: `cd site-builder/auth && python3 deploy_auth.py`
 Expected: 输出含 `告警管道已收敛：metric_filter, alarm`（订阅已存在时不含 `subscription`），且**不**出现 `⚠️ email 订阅状态`（因为现网订阅已确认）。
@@ -1820,7 +1860,7 @@ class SiteIdCollision(Exception):
 
 def create_site_record(site_id: str, *, owner: str, name: str,
                        status: str = "DEPLOYING") -> None:
-    """**首次**建站：整条记录单次条件写，site_id 已存在即抛 SiteIdCollision。
+    """**首次**建站：单次条件 UpdateItem 写整条记录，已存在即抛 SiteIdCollision。
 
     条件必须是 `attribute_not_exists(site_id)` 且**一次写完整条**——不能拆成
     "条件写 created_at + 无条件 upsert_site(owner/name/…)"两步：第一步条件
@@ -1828,16 +1868,28 @@ def create_site_record(site_id: str, *, owner: str, name: str,
     随机 ID 碰撞就变成误接管（Codex review 2026-08-09 P1，moto 已复现；
     一期的 upsert_site 建站路径本就有此行为，本函数一并修掉）。
 
+    **用 UpdateItem 而非 PutItem**（Codex 复审第二轮 P1）：MCP runtime 的
+    IAM 对 sites 表**故意不给 PutItem**（挡"整条覆盖改站点归属"，
+    `test_sites_table_has_no_putitem` 全表扫描锁定这一点），只有带属性白名单
+    的 UpdateItem。UpdateItem + attribute_not_exists(site_id) 条件在语义上
+    等价于条件 PutItem：item 不存在 → 条件通过并创建；已存在 → 条件失败，
+    **原子性相同**。用 PutItem 会本地 moto 全绿、部署后真实 IAM 全部拒绝。
+    代价：本函数写的字段必须在 deploy_agentcore.py 的
+    SITE_WRITABLE_ATTRIBUTES 白名单内（created_at 需新增，见 Step 5b）。
+
     created_at 只在建站这一刻写；碰撞由调用方重新生成 ID 重试，
     **绝不对已有行继续写**。
     """
     import botocore.exceptions
-    item = {"site_id": site_id, "owner": owner, "name": name,
-            "status": status, "created_at": _now()}
     try:
-        _table("SITES_TABLE").put_item(
-            Item=item,
-            ConditionExpression="attribute_not_exists(site_id)")
+        _table("SITES_TABLE").update_item(
+            Key={"site_id": site_id},
+            UpdateExpression="SET #o = :o, #n = :n, #s = :s, created_at = :t",
+            ConditionExpression="attribute_not_exists(site_id)",
+            ExpressionAttributeNames={"#o": "owner", "#n": "name",
+                                      "#s": "status"},
+            ExpressionAttributeValues={":o": owner, ":n": name,
+                                       ":s": status, ":t": _now()})
     except botocore.exceptions.ClientError as e:
         if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
             raise SiteIdCollision(site_id) from e
@@ -1918,6 +1970,32 @@ def test_deploy_site_regenerates_id_on_collision(aws, monkeypatch):
 ```
 
 **注意**：`SiteIdCollision` 定义在 `common.py`（Step 4 的代码块里），`server.py` 通过 `common.SiteIdCollision` 引用。
+
+- [ ] **Step 5b: `deploy_agentcore.py` 的 `SITE_WRITABLE_ATTRIBUTES` 加 `created_at`**
+
+`create_site_record` 用带属性白名单的 UpdateItem 写 sites 表，新写入的
+`created_at` 必须进白名单——**少这一项时线上建站直接 AccessDenied**（且报错
+形态是 IAM 拒绝，不是条件冲突，排查时容易误判；见该常量注释的既有说明）。
+
+```python
+SITE_WRITABLE_ATTRIBUTES = ("site_id", "owner", "name", "status", "created_at",
+                            "require_login", "allowed_users", "collaborators",
+                            "permissions_rev", "permissions_updated_at",
+                            "permissions_updated_by")
+```
+
+并在常量注释的"do_deploy_site 创建站点时写"一行加上 created_at。
+`test_agentcore_contract.py` 从实现源码解析比对该清单（不手抄第二份），
+本步骤后跑 mcp 测试确认：
+
+Run: `cd site-builder/mcp && python3 -m pytest tests/test_agentcore_contract.py -q`
+Expected: PASS，其中 `test_sites_table_has_no_putitem` 仍绿（`create_site_record`
+用的是 UpdateItem，policy 不需要也不能出现 PutItem）。
+
+**Task 13 部署 MCP 后的真机 IAM 探针**（写进 Task 13 验收）：以 runtime role
+的凭证对 sites 表发一次含 `created_at` 的条件 UpdateItem（不存在的探针
+site_id，写后即删），确认不再 AccessDenied——单测与 contract test 都看不到
+真实 IAM，这一步是唯一的真机证据。
 
 - [ ] **Step 6: 写回填脚本**
 
@@ -2254,7 +2332,7 @@ site_id/账号值**，用计数与形态描述）：
 > - **Task 7 console-session + CSRF**：
 >   ① **code 编解码单一实现进 `auth/session.py`**（`mint_upgrade_code` / `verify_upgrade_code`，HS256 同 JWT_SECRET，载荷 `typ="console-upgrade"` / `email` / `jti` / `exp`≤60s）；panel 构建时复制 `session.py`（同 common.py/permissions.py 模式）——**不得在 panel 里手写第二份编解码**；
 >   ② `panel/console_session.py`：调 `verify_upgrade_code` + jti 条件写 `site-session-codes` 原子消费（`attribute_not_exists(jti)`）+ 重放拒绝 + `__Host-sb_console` cookie 构造（Secure/HttpOnly/SameSite=Lax/Path=//无 Domain）；
->   ③ **密钥交付**：panel 环境变量只下发 `JWT_SECRET_PARAM`（参数名），运行时 SSM 读 + TTL 缓存，照抄 auth 的 `_secret()` 模式。**明文严禁进环境变量**（GetFunctionConfiguration 会回显，拿到即可伪造任意用户会话——deploy_auth.py:54-65 已记录）；panel role 的 SSM/KMS 语句照抄 auth role `read-platform-secrets`（资源限定 `parameter/site-builder/*` + ViaService 条件），Task 10 的 contract test 断言此语句存在且无更宽资源；
+>   ③ **密钥交付**：panel 环境变量只下发 `JWT_SECRET_PARAM`（参数名），运行时 SSM 读 + TTL 缓存，照抄 auth 的 `_secret()` 模式。**明文严禁进环境变量**（GetFunctionConfiguration 会回显，拿到即可伪造任意用户会话——deploy_auth.py:54-65 已记录）；panel role 的 SSM 语句资源限定**精确 ARN** `parameter/site-builder/jwt-secret`（**不照抄 auth 的 `parameter/site-builder/*` 前缀**——那是 auth 自己还要读 site-client-secret 的业务需要，panel 拿前缀等于被攻破时顺带交出 Cognito client secret；Codex 复审第二轮 P2）+ `kms:Decrypt` ViaService 条件。Task 10 的 contract test 断言：SSM 资源 == 精确 jwt-secret ARN，出现 `*` 结尾的前缀即 FAIL；
 >   ④ **交叉契约测试**：同一组用例向量（合法 code / 篡改各字段 / typ 不符 / 过期 / jti 重放）在 auth 与 panel 两个测试包各跑一遍，防两份复制品漂移；
 >   ⑤ `tests/test_csrf.py`：**副作用前置顺序断言**——mock DynamoDB 客户端，验证 CSRF 失败路径下零写调用。
 > - **Task 8 ops-log 落点**：`permissions.py` 五个高层写函数 + undeploy 路径内落 ops-log（唯一落点，MCP 与控制台自动同轮覆盖）+ `panel/ops_log.py`（PutItem only、字段脱敏）+ `mcp/deploy_agentcore.py` 补 ops-log PutItem。
@@ -2274,11 +2352,14 @@ site_id/账号值**，用计数与形态描述）：
 > - **Task 11 Edge console 白名单 + 平台前缀 S3 权限**：
 >   ① `PLATFORM_SUBDOMAINS` 加 `console`、`RESERVED_COOKIES` 加两个 `__Host-`（origin_request/origin_response 两文件同步）+ 伪造 platform route 负测；
 >   ② **`stack.py` Edge role 的 S3 policy 加 `{frontend_bucket}/platform/*`**（Codex review 2026-08-09 P1：现只有 `sites/*`，而 console 前端在 `platform/console/{version}/`、route_mode=split 的非 `/api/*` 请求走 S3 SigV4 分支——缺这条则控制台首页 AccessDenied 加载不出来）。收窄取向：给 `platform/*` 而非整桶，站点前缀与平台前缀仍然分离；
->   ③ `verify_deployed_edge.sh` 断言产物含新白名单/新保留 cookie、CloudFront 实际关联版本，**并加一条真机静态资源读取**：部署后 `curl -s -o /dev/null -w '%{http_code}' https://console.{base_domain}/`（带合法会话 cookie）期望 200 而非 403——这是 S3 IAM 生效的直接证据；
+>   ③ `verify_deployed_edge.sh` 断言产物含新白名单/新保留 cookie、CloudFront 实际关联版本。**S3 IAM 生效的真机验证用临时探针，不用 console 首页**（Codex 复审第二轮 P1：Task 11 与 Task 10 并行、前端要到 Task 14 才上传——console route/S3 key 此时都不存在，`https://console.{domain}/` 的 404/403 与 IAM 是否正确无关，会把正确的修复误判失败）：上传临时对象 `platform/probe-{随机}/index.html` + 注册临时 probe route（`app-probe-{随机}`，require_auth=False、static_prefix 指向该前缀）→ 经 CloudFront 请求期望 200（探针对象在 `platform/*` 下，200 即证明新 IAM 语句生效）→ trap 清理 route 与对象并强一致读回核对（同 smoke_router.sh 的清理纪律）。**console 首页 200（带会话 cookie）的端到端验收归 Task 14**（那时 route/前端/Edge 全部就位）；
 >   ④ CDK 断言：Edge role 的 S3 语句资源集合 == `{sites/*, platform/*}`（不多不少——出现整桶 `/*` 即 FAIL）。
 >   反向验证：临时把 `platform/*` 那条删掉 synth → CDK 断言 FAIL；（真机负向不必做——部署前的 AccessDenied 已由现状证明。）
 > - **Task 12 auth `/console-session`**：`session.py` 加 `mint_upgrade_code` / `verify_upgrade_code`（Task 7 契约的签发端）；`login_handler.py` 加 `/console-session` 路径（校验顶域 `sb_session` 有效 → `mint_upgrade_code(email)` → 302 到 `https://console.{base_domain}/api/session-callback?code=...`；无有效会话则 302 到 `/login?redirect=<console-session URL>` 走完整登录）；`__Host-sb_pkce` 与新 cookie 的作用域测试；重部署 auth（`python3 deploy_auth.py`）后真机验证 302 链路。
-> - **Task 13 三层部署 + `verify_deployed_components.py`**：重构自 `verify_contract_fixtures.py`（7 段，旧脚本删除、文档引用同步），部署 deployer/Edge/auth/panel/MCP 并逐一核对产物。
+> - **Task 13 三层部署 + `verify_deployed_components.py`**：重构自 `verify_contract_fixtures.py`（7 段，旧脚本删除、文档引用同步），部署 deployer/Edge/auth/panel/MCP 并逐一核对产物。另含三项收口：
+>   ① **MCP 部署后补跑第二轮 created_at 回填**（dry-run → apply → 读回）：Task 5 回填到 Task 13 部署新 MCP 之间，线上旧 MCP 建的新站点仍走旧 `upsert_site` 不写 created_at（Codex 复审第二轮 P2 时序缺口）。最终 E2E 前要求除 `无 job 跳过` 外零缺失；
+>   ② **真机 IAM 探针**（Task 5 Step 5b 的收口）：以 runtime role 凭证对 sites 表发含 `created_at` 的条件 UpdateItem（探针 site_id，写后即删），确认白名单更新真的生效；
+>   ③ console 首页端到端（Task 11 移交过来的验收前置——route/前端/Edge 就位后才有意义）。
 > - **Task 14 前端移植 + panel E2E**：原型视图层进 `panel/frontend/`（去敏感值、`window.API` 换真 fetch、M4/M5 入口 disabled、PHASE_LABEL 按 jobs 表真实词表重写、undeploy 改轮询、FAILED 展示层派生）+ spec §7 的 13 项 E2E 全覆盖。
 > - **Task 15 fixture 自动清理**（可与 6-14 并行，**必须在 Task 16 前完成**）：`smoke_router.sh` 随机后缀 + trap + 只删本次 + 强一致读回 + 最小断言数 + `--keep-on-failure`；`test_e2e_fixtures.py` finalizer（记录本次 site_id/job_id、默认 undeploy + purge、清理失败即测试失败、禁按 owner 批量删）。
 > - **Task 16 全量回归与文档收尾**：五个包测试 + 七个真机闸门 + `DEPLOY.md` 新阶段 + `CLAUDE.md` 同步（panel venv 归属、验收脚本改名、`deploy_panel.py` 部署命令）+ `progress.md` + HANDOFF 更新 6。
@@ -2316,3 +2397,17 @@ site_id/账号值**，用计数与形态描述）：
 | F5 | 从零部署时日志组不存在，`put_metric_filter` 抛 ResourceNotFound | **接受**（严重性下调：现网组已存在 retention 90 天，这是"从零部署"路径缺陷——但那正是 B2 的目标）。`ensure_alarm_pipeline` 加 ⓪ 段：幂等 `create_log_group` + retention 收敛 30 天（顺手满足 spec §6.3）；Stubber 加 fresh-account 正反两用例 | Task 3 Step 1/3/4/5 |
 | F6 | 告警验收未绑定声明 topic + 声明收件人，两个假绿场景 | **接受**：actions 必须 == 声明 topic ARN（不只 Alarm==OK）；订阅必须是 `[Alerting] email` 那个 Endpoint 已确认（其他人 confirmed 不算）；分页交给 python 数；加负向验证（假邮箱必 FAIL） | Task 4 Step 3/5 |
 | F7 | "Principal=* 后 unsigned curl 变 200"违反 AWS_IAM 契约 | **接受**（P2，自审引入的错误）：AWS_IAM 下未签名请求恒 403 与 resource policy 无关，且该指引会诱导实施者改 AuthType=NONE。改为已签名的非 Edge 探针 principal 做正反验证，并写明原因 | Task 10 反向验证段 |
+
+**7. Codex 复审第二轮（2026-08-09，3 P1 + 4 P2）处置记录**：
+
+| # | Finding | 处置 | 落点 |
+|---|---|---|---|
+| R1 | F1 改用 PutItem 与 MCP runtime IAM 冲突（policy 只有 UpdateItem，`test_sites_table_has_no_putitem` 全表禁 PutItem）——本地 moto 全绿、线上建站全挂 | **接受**（上一轮修复引入的真实部署回归——"加固动作自己带缺陷"第 N 次）：`create_site_record` 改**单次条件 UpdateItem**（`attribute_not_exists(site_id)` + 一次 SET 全字段，原子性与条件 PutItem 等价）；新增 Step 5b：`SITE_WRITABLE_ATTRIBUTES` 加 `created_at` + contract test 复核 + Task 13 真机 IAM 探针 | Task 5 Step 4/5b、Task 13 概要 ② |
+| R2 | contract venv 无 boto3/botocore，Task 3 测试 collection 即挂（实测确认）；且 `test_alarm_params_match_current_environment` 自铺 stub 序列漏了新加的 create_log_group | **接受**（两个独立错误都成立，实测复核一致）：新增 Task 3 Step 0 给 contract venv 补 boto3（照 PyJWT 当年同模式）+ 更新 CLAUDE.md venv 注释；该用例改走 `_stub_common`（调用序列只维护一处） | Task 3 Step 0/1、CLAUDE.md |
+| R3 | Task 11 的"console 首页 200"验收在其执行阶段不可能成立（与 Task 10 并行、前端在 Task 14）——会把正确的 IAM 修复误判失败 | **接受**（采纳其方案二）：Task 11 改用临时 `platform/probe-*` 对象 + 临时 probe route 只验 S3 IAM（trap 清理 + 读回核对）；console 首页端到端移到 Task 14/13 | Task 11 概要 ③、Task 13 概要 ③ |
+| R4 | Task 5 回填到 Task 13 部署新 MCP 之间，旧 MCP 建的新站点仍缺 created_at，Step 15 覆盖率过期 | **接受**（采纳其方案二——先部署 MCP 会把 Task 13 的部署拆散）：Task 13 部署 MCP 后强制第二轮回填（dry-run→apply→读回），最终 E2E 前除 `无 job 跳过` 外零缺失 | Task 13 概要 ① |
+| R5 | panel 照抄 auth 的 `parameter/site-builder/*` 前缀过宽——顺带能读 site-client-secret | **接受**：收窄到精确 `parameter/site-builder/jwt-secret` ARN；spec 与 plan 同步改写为"机制照抄、资源不照抄"，contract test 断言出现前缀即 FAIL | spec §2/§5.4、Task 7 概要 ③、文件表 |
+| R6 | 验收脚本第一遍带 `--region` 查到 `$LIVE` 后丢弃，python 里重查不带 region——默认 region 不同时假失败/比错对象 | **接受**（本机默认恰是 us-east-1 所以没炸，但缺陷真实）：`$LIVE` 作为 argv 传给 python 复用，不二次调 aws CLI（heredoc 占 stdin，故用 argv 不用管道） | Task 4 Step 3 |
+| R7 | retention 90→30 会删 30-90 天历史日志（72h 内物理删除），回滚说明"最坏是描述/阈值被改写"失真，且不该称"顺手" | **接受**：回滚锚点补导出 retention 现值；Step 4 部署门禁加"确认历史日志无保留需要（或先导出）"；回滚方式写明 retention 改回**不可恢复已删日志**；`alarm_pipeline.py` 注释从"顺手收敛"改为"有意的数据修剪 + 门禁确认" | Task 4 Step 4、Task 3 Step 3 注释 |
+
+**对第二轮两个非 finding 结论的回应**：①"本提交只改 Spec/Plan 未实现代码"——符合预期：当前在计划阶段（brainstorm→spec→plan→自审→实施），代码属 Task 1 起的实施阶段，计划文档就是本阶段的交付物；②"Task 6-16 仍不是完整计划"——立场同上轮 F4：分阶段展开是显式声明的交付方式，展开门禁（Task 5 Step 13-15 真机产出）已闭环，实施顺序上 Task 1-4 先行、展开发生在 Task 5 之后，不阻塞开工。
