@@ -160,6 +160,34 @@ else
   fail "产物里没有 _UNKNOWN 的赋值或使用点 —— 部署的是 fail-open 的旧代码"
 fi
 
+# ---- M3：console 平台子域与两个平台保留 cookie ----
+# 同样**按赋值整行断言**：这些名字在注释里也出现（PLATFORM_SUBDOMAINS 上方
+# 就有一整段说明），裸 grep 会让"回滚了常量但留着注释"照样 PASS。
+if grep -qE '^PLATFORM_SUBDOMAINS = \(.*"console".*\)' "$TMP/index.py"; then
+  echo "PASS  $(grep -E '^PLATFORM_SUBDOMAINS = ' "$TMP/index.py")"
+else
+  fail "产物的 PLATFORM_SUBDOMAINS 不含 console —— 控制台会被当普通站点处理"
+fi
+# 两个 __Host- cookie 必须都在保留名单里：漏 __Host-sb_console 会把面板会话
+# 转发给不可信站点代码；漏 __Host-sb_pkce 同理（M1 就有但曾漏登记）。
+RC_LINE="$(grep -E '^RESERVED_COOKIES = ' "$TMP/index.py" || true)"
+if [ -z "$RC_LINE" ]; then
+  fail "产物里找不到 RESERVED_COOKIES 赋值"
+else
+  MISSING=""
+  for c in "sb_session" "__Host-sb_console" "__Host-sb_pkce"; do
+    case "$RC_LINE" in
+      *"\"$c\""*) ;;
+      *) MISSING="$MISSING $c" ;;
+    esac
+  done
+  if [ -n "$MISSING" ]; then
+    fail "RESERVED_COOKIES 缺:$MISSING —— 平台 cookie 会被转发给站点代码"
+  else
+    echo "PASS  $RC_LINE"
+  fi
+fi
+
 echo
 if [ "$FAILURES" -gt 0 ]; then
   echo "结果：$FAILURES 项未达预期 —— 线上 Edge 与预期不一致，先排查再继续"

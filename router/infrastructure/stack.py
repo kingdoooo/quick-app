@@ -137,10 +137,17 @@ class WebRouterStack(Stack):
         # static assets via SigV4-signed GET)
         frontend_bucket = config.get("SiteBuilder", "frontend_bucket", "APP_FRONTEND_BUCKET")
         base_domain = config.get("SiteBuilder", "base_domain", "APP_BASE_DOMAIN")
+        # 站点前端在 sites/ 下；M3 控制台前端在 platform/console/{version}/ 下。
+        # **两个前缀都要给、且只给这两个**：
+        #   · 缺 platform/* → route_mode=split 的 console 静态请求全部
+        #     AccessDenied（控制台白屏，而 /api/* 正常，症状很误导）；
+        #   · 给整桶 /* → 站点前缀与平台前缀的隔离失效。
+        # 由 test_stack_edge_iam.py 断言资源集合恰好是这两个。
         edge_role.add_to_policy(iam.PolicyStatement(
             effect=iam.Effect.ALLOW,
             actions=["s3:GetObject"],
-            resources=[f"arn:aws:s3:::{frontend_bucket}/sites/*"]
+            resources=[f"arn:aws:s3:::{frontend_bucket}/sites/*",
+                       f"arn:aws:s3:::{frontend_bucket}/platform/*"]
         ))
         
         # Read Lambda code and inject configuration

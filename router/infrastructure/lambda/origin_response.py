@@ -12,7 +12,7 @@ import logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-RESERVED_COOKIES = ("sb_session",)
+RESERVED_COOKIES = ("sb_session", "__Host-sb_console", "__Host-sb_pkce")
 # origin_request 对平台路由（auth-service）注入此头，允许其签发平台 cookie
 PLATFORM_MARK = "x-sb-platform-origin"
 

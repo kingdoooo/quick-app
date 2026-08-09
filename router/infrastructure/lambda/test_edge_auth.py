@@ -474,3 +474,66 @@ def test_missing_allowed_users_does_not_default_to_org():
     resp = orq._check_auth(r, route, "app-x.example.com")
     assert resp is not None and resp["status"] == "403", \
         "allowed_users 缺失时默认成了 org，外人被放行"
+
+
+# ---- M3: console 平台子域 + 平台保留 cookie ----
+# 注意本文件的既有机制：origin_request.py 被读进来做 {{PLACEHOLDER}} 替换后
+# 写成 _edge_auth_testable.py 再 import 成 `orq`（文件头 1-15 行）。
+# 新用例**一律用 orq**，不要 `import origin_request`——直连原文件会带着未替换
+# 的占位符。origin_response.py 无占位符，可直接 import。
+
+def test_console_subdomain_is_platform():
+    """console 必须被当平台路由（放行平台 cookie、不注入站点身份头）。"""
+    assert "console" in orq.PLATFORM_SUBDOMAINS
+
+
+def test_platform_identity_comes_only_from_host_not_route_owner():
+    """伪造 route.owner=platform 不得获得平台待遇。
+
+    owner 是**可写投影字段**——能改权限的角色就能写它。平台身份只能由
+    host 解析出的 hardcoded 白名单判定（spec §5.2）。
+
+    平台标记在 lambda_handler 里内联完成（`route = {**route, _PLATFORM_KEY:
+    subdomain in PLATFORM_SUBDOMAINS}`），没有独立的 _mark_platform 函数——
+    所以这里断言判定函数 _is_platform_route 的行为。
+    """
+    evil = {"site_id": "evil-abc123", "owner": "platform",
+            "require_auth": False, "route_mode": "split"}
+    assert orq._is_platform_route(evil) is False, (
+        "route.owner 被当成了平台身份判据——这是可写字段")
+    # 连"真值但不是 True"也不能翻盘（必须是 `is True` 严格判定）
+    assert orq._is_platform_route({**evil, "_platform_origin": "true"}) is False
+    marked = {**evil, orq._PLATFORM_KEY: True}
+    assert orq._is_platform_route(marked) is True
+
+
+def test_reserved_cookies_cover_both_platform_cookies():
+    import origin_response as ors
+    for name in ("__Host-sb_console", "__Host-sb_pkce", "sb_session"):
+        assert name in orq.RESERVED_COOKIES, name
+    assert tuple(orq.RESERVED_COOKIES) == tuple(ors.RESERVED_COOKIES), (
+        "两份保留 cookie 清单漂移了——会出现'请求里剥了、响应里没剥'")
+
+
+def test_site_route_strips_platform_cookies():
+    """普通站点请求里的平台 cookie 必须被剥掉（不转发给不可信站点代码）。
+
+    `_strip_reserved_cookies(request)` **原地改 request**、返回 None——
+    不要按"返回新字符串"写断言，那样的用例永远绿。
+    """
+    request = {"headers": {"cookie": [
+        {"key": "Cookie",
+         "value": "a=1; __Host-sb_console=secret; sb_session=xyz; b=2"}]}}
+    assert orq._strip_reserved_cookies(request) is None
+    kept = request["headers"]["cookie"][0]["value"]
+    assert "__Host-sb_console" not in kept and "sb_session" not in kept
+    assert "a=1" in kept and "b=2" in kept
+
+
+def test_pkce_cookie_is_also_stripped_from_site_requests():
+    """__Host-sb_pkce 是 M1 就有但漏登记的——站点也不该看到它。"""
+    request = {"headers": {"cookie": [
+        {"key": "Cookie", "value": "__Host-sb_pkce=verifier; keep=1"}]}}
+    orq._strip_reserved_cookies(request)
+    kept = request["headers"]["cookie"][0]["value"]
+    assert "__Host-sb_pkce" not in kept and "keep=1" in kept

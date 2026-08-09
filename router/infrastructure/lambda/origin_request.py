@@ -299,7 +299,11 @@ def _get_cookie(request, name: str) -> str | None:
 # 平台保留 cookie：只有 auth-service 能签发，绝不能到达站点代码。
 # 站点 origin 若能读到会话 JWT，即可重放到其他站点（顶域 cookie 共享登录）——
 # 站点代码是不可信代码，因此转发前必须剥除；auth-service（owner=platform）例外。
-RESERVED_COOKIES = ("sb_session",)
+# 平台 cookie 不转发给站点（站点代码按不可信对待）；平台路由放行。
+# **与 origin_response.py 的同名常量必须逐字一致**——两份漂移会出现
+# "请求里剥了、响应里没剥"这类只在真机复现的怪问题，由用例断言两者相等。
+# __Host-sb_pkce 是 M1 就实现但漏登记的（M3 一并补上）。
+RESERVED_COOKIES = ("sb_session", "__Host-sb_console", "__Host-sb_pkce")
 # origin_response 靠此头判断"本响应来自平台自己的 origin，允许写平台 cookie"。
 # 客户端可伪造，故与 x-user-* 一样先无条件剥除再按路由注入。
 PLATFORM_MARK = "x-sb-platform-origin"
@@ -323,7 +327,10 @@ PLATFORM_MARK = "x-sb-platform-origin"
 #
 # 与 auth/deploy_auth.py 注册的平台路由保持一致（当前只有 auth）。
 # 新增平台自有子域名（如 M3 控制台）时必须同步这里，否则它拿不到平台待遇。
-PLATFORM_SUBDOMAINS = ("auth",)
+# console 加入平台白名单（M3）。**平台身份只认这里**——不得根据
+# route.owner == "platform" 或任何 route item 可写字段推导（那些字段对能写
+# 权限投影的角色是可控的，见 _is_platform_route 的注释）。
+PLATFORM_SUBDOMAINS = ("auth", "console")
 
 # lambda_handler 用请求 host 解析出的 subdomain 算好后放进这个键。
 # 名字带前缀且不是路由表里的属性名：即便有人往路由 item 里写同名字段，
