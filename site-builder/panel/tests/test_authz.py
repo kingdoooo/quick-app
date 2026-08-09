@@ -210,3 +210,56 @@ def test_site_shape_exposes_created_at_even_when_absent(aws):
     common._table("SITES_TABLE").update_item(
         Key={"site_id": "s-1"}, UpdateExpression="REMOVE created_at")
     assert api.do_get_site("owner@x.com", "s-1")["created_at"] == ""
+
+
+def test_ever_live_is_false_until_a_deploy_succeeds(aws):
+    """`ever_live` 区分"正在部署"与"从未上线"——两者的 site.status 都是 DEPLOYING。
+
+    为什么需要这个派生：`site.status` 只有三个写入点（建站写 DEPLOYING、
+    `mark_job` 成功写 ACTIVE、`undeploy` 写 DELETED），**没有任何地方把它从
+    DEPLOYING 改回去**。所以首次部署失败的站点会永久停在 DEPLOYING，控制台若
+    照字面显示"部署中"，用户会一直等一个不会来的结果（真机上确实有 2 个这样的
+    站点，URL 是 404、没有 route）。
+
+    判据是 `last_job_id` 的**存在性**——它只由 `mark_job` 的成功分支写。
+    """
+    _seed()
+    common._table("SITES_TABLE").update_item(
+        Key={"site_id": "s-1"},
+        UpdateExpression="SET #s = :d REMOVE last_job_id",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":d": "DEPLOYING"})
+    site = api.do_get_site("owner@x.com", "s-1")
+    assert site["status"] == "DEPLOYING"
+    assert site["ever_live"] is False, "没有 last_job_id 却说上线过了"
+
+    # 模拟 mark_job 的成功分支：写 last_job_id + ACTIVE
+    common.upsert_site("s-1", status="ACTIVE", last_job_id="job-ok")
+    after = api.do_get_site("owner@x.com", "s-1")
+    assert after["ever_live"] is True, "有 last_job_id 却说没上线过"
+
+
+def test_ever_live_is_present_in_list_shape_too(aws):
+    """列表接口**没有** job 数据，所以这个派生必须由后端给。
+
+    漏在列表里的症状：站点卡片显示"部署中"、详情页显示"未上线"，同一个站点
+    两处不一致。
+    """
+    _seed()
+    for s in api.do_list_sites("owner@x.com"):
+        assert "ever_live" in s, f"列表形态缺 ever_live: {sorted(s)}"
+        assert isinstance(s["ever_live"], bool)
+
+
+def test_ever_live_does_not_depend_on_job_rows_being_readable(aws):
+    """派生只看 sites 表自己的字段，不查 jobs 表。
+
+    列表页会一次返回几十个站点；若每个都去 query 一次 jobs，那是 N 次
+    DynamoDB 往返。这条用例锁定"不引入 N+1"：删掉全部 job 行后派生仍正确。
+    """
+    _seed()
+    jobs = common._table("JOBS_TABLE")
+    for row in jobs.scan().get("Items", []):
+        jobs.delete_item(Key={"job_id": row["job_id"]})
+    common.upsert_site("s-1", status="ACTIVE", last_job_id="job-ok")
+    assert api.do_get_site("owner@x.com", "s-1")["ever_live"] is True

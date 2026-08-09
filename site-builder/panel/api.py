@@ -50,6 +50,17 @@ def _shape_site(site: dict, viewer: str, *, viewer_is_admin: bool) -> dict:
     created_at 可能是空串：Task 5 的回填对"没有 job 可推导"的站点**不猜**
     （写 now() 会是个错日期且看不出是猜的）。前端按空值处理，不要在这里
     编一个默认时间。
+
+    `ever_live`：这个站点**有没有成功上线过**。
+    为什么需要它：`status` 只有三个写入点——建站写 `DEPLOYING`（初始值）、
+    `mark_job` 成功写 `ACTIVE`、`undeploy` 写 `DELETED`，**没有任何地方把它从
+    DEPLOYING 改回去**。所以 `DEPLOYING` 同时covers"正在部署"与"首次部署失败后
+    再没成功过"两种情况，仅凭 sites 表的 status 分不出来，而两者对用户的含义
+    完全相反（后者的 URL 是 404、没有 route）。
+    判据用 `last_job_id` 的**存在性**：它只由 `mark_job` 的成功分支写
+    （`upsert_site(status="ACTIVE", last_job_id=...)`）。真机核对过全部站点：
+    `DEPLOYING` 且无 `last_job_id` ⟺ 从未成功过，且没有 ACTIVE 站点缺这个字段。
+    列表接口没有 job 数据，所以这个派生必须在后端做——前端拿不到依据就只能猜。
     """
     return {"site_id": site["site_id"], "name": site.get("name", ""),
             "status": site.get("status", ""), "url": _site_url(site),
@@ -58,6 +69,7 @@ def _shape_site(site: dict, viewer: str, *, viewer_is_admin: bool) -> dict:
             "require_login": bool(site.get("require_login", True)),
             "allowed_users": site.get("allowed_users", "org"),
             "collaborators": list(site.get("collaborators") or []),
+            "ever_live": bool(site.get("last_job_id")),
             "role": permissions.role_of(viewer, site, viewer_is_admin)}
 
 

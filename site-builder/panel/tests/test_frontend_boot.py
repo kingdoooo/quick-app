@@ -154,3 +154,86 @@ def test_harness_models_hash_assignment_as_firing_hashchange(tmp_path):
     assert "hashListeners" not in replace_state, (
         "harness 让 replaceState 也派发了 hashchange —— 与真实浏览器不符，"
         f"会把正确的修复判成缺陷。函数体: {replace_state!r}")
+
+
+# ── 站点状态文案：DEPLOYING 的两种含义必须分开说 ──────────────────────
+
+def _probe() -> list[dict]:
+    code, out = run_boot("probe")
+    assert out["cases"], "probe 场景没有产出判定表"
+    return out["cases"]
+
+
+def _case(desc_part: str) -> dict:
+    hit = [c for c in _probe() if desc_part in c["desc"]]
+    assert len(hit) == 1, f"判定表里找不到唯一匹配 {desc_part!r}"
+    return hit[0]
+
+
+def test_never_live_decision_table_matches_expectations():
+    """`site.status == 'DEPLOYING'` 有两种含义，判定表逐行锁定。
+
+    真源侧：status 只有三个写入点（建站 DEPLOYING / mark_job 成功 ACTIVE /
+    undeploy DELETED），**没有任何地方把它从 DEPLOYING 改回去**。所以首次部署
+    失败的站点永久停在 DEPLOYING。真机上 27 个站点里有 2 个是这样
+    （无 route、URL 404）。照字面显示"部署中"会让用户一直等一个不会来的结果。
+    """
+    for c in _probe():
+        assert c["got"] == c["want"], (
+            f"{c['desc']}: neverLive={c['got']} 期望 {c['want']}")
+
+
+def test_a_site_still_deploying_is_not_called_never_live_in_the_ui():
+    """**首次部署仍在跑**时不得显示"未上线"、更不得说"失败"。
+
+    这条是判定表发现的我自己的缺陷：neverLive 只判"还没有可访问版本"，
+    首次部署进行中同样满足它——若徽章直接按 neverLive 显示，一个正在正常部署
+    的站点会被说成未上线/失败。所以文案层还要用 isDeployFailed 分流。
+    """
+    c = _case("首次部署仍在跑")
+    assert c["running"] is True and c["failed"] is False
+    assert c["badge_text"] == "部署中", (
+        f"正在部署却显示 {c['badge_text']!r} —— 用户会以为部署已经没戏了")
+    assert c["callout_has_failed_wording"] is False, "对正在部署的站点说了「失败」"
+
+
+def test_first_deploy_failure_says_never_live_not_last_deploy_failed():
+    """首次部署失败要说"从未成功上线"，**不能**说"最近一次部署失败"。
+
+    后者暗示"原本有个好版本"，而这种站点一次都没成过、URL 是 404。
+    我的第一版对两种情况用了同一句话（按重部署那个假设写的）。
+    """
+    c = _case("首次失败·job 全 FAILED")
+    assert c["badge_text"] == "未上线", f"徽章是 {c['badge_text']!r}"
+    assert "从未成功上线" in c["hint_text"], f"提示是 {c['hint_text']!r}"
+    assert "最近一次部署失败" not in c["hint_text"], (
+        "对从未上线的站点说「最近一次部署失败」——暗示存在一个好版本")
+    assert c["callout_has_failed_wording"] is True, "该说明失败原因却没说"
+
+
+def test_redeploy_failure_still_reassures_that_the_old_version_serves():
+    """重部署失败要明确"线上仍是上一版"——这才是真源不写 site=FAILED 的原因。"""
+    c = _case("重部署失败·曾成功")
+    assert c["got"] is False, "曾成功上线过的站点不该被判成「从未上线」"
+    assert "线上仍是上一版" in c["hint_text"], f"提示是 {c['hint_text']!r}"
+
+
+def test_list_page_uses_neutral_wording_because_it_has_no_job_data():
+    """列表页拿不到 job，分不出"失败"还是"在跑"，所以只能中性陈述。
+
+    列表接口只返回 site（含后端派生的 ever_live），没有 job。断言失败会在
+    "正在首次部署"的站点上说错话，所以文案必须是中性的"未上线"。
+    """
+    c = _case("首次失败·仅 ever_live")
+    assert c["badge_text"] == "未上线"
+    assert "失败" not in c["badge_text"], "列表页无 job 数据却断言失败"
+
+
+def test_frontend_falls_back_to_jobs_when_backend_omits_ever_live():
+    """后端漏给 `ever_live` 时用 job 历史兜底，不误报"未上线"。
+
+    两个来源不一致时取更保守的那个，但"job 里明明有 SUCCEEDED"是强证据——
+    站点确实上线过，此时不能因为字段缺失就说它没上线。
+    """
+    c = _case("后端漏给 ever_live 但 job 成功过")
+    assert c["got"] is False, "字段缺失导致误报「从未上线」"

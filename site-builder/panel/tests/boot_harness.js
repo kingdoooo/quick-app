@@ -130,6 +130,44 @@ process.on('unhandledRejection', (e) => {
 
 eval(fs.readFileSync(APP, 'utf8'));
 
+/* 场景 probe：不看启动流程，只把纯判定函数的**判定表**打出来。
+ * 为什么复用本 harness 而不另写一个更小的 stub：app.js 顶层就绑了
+ * DOM 事件（$('#logout-btn').addEventListener…），任何"更薄"的 stub 都会在
+ * 那一行崩——实测踩过。判定表用真实代码跑才有意义，所以共用这套 stub。 */
+if (SCENARIO === 'probe') {
+  const CASES = [
+    ['首次失败·仅 ever_live', { status: 'DEPLOYING', ever_live: false }, null, true],
+    ['首次失败·job 全 FAILED', { status: 'DEPLOYING', ever_live: false },
+     [{ status: 'FAILED' }], true],
+    ['首次部署仍在跑', { status: 'DEPLOYING', ever_live: false },
+     [{ status: 'RUNNING' }], true],
+    ['重部署失败·曾成功', { status: 'DEPLOYING', ever_live: true },
+     [{ status: 'FAILED' }, { status: 'SUCCEEDED' }], false],
+    ['正常在线', { status: 'ACTIVE', ever_live: true },
+     [{ status: 'SUCCEEDED' }], false],
+    ['已下线', { status: 'DELETED', ever_live: true },
+     [{ status: 'DELETED' }, { status: 'SUCCEEDED' }], false],
+    ['后端漏给 ever_live 但 job 成功过', { status: 'DEPLOYING' },
+     [{ status: 'SUCCEEDED' }], false],
+  ];
+  const out = CASES.map(([desc, site, jobs, want]) => {
+    const st = jobs ? deployState(site, jobs) : null;
+    const badge = st ? siteStatusBadge(site, st) : listStatusBadge(site);
+    return {
+      desc, want, got: neverLive(site, st),
+      failed: isDeployFailed(st), running: isDeployRunning(st),
+      /* 文案层的实际产出：判定对了但文案说错同样是缺陷（"还在跑"被说成
+       * "失败"就是本轮由这张表发现的问题）。 */
+      badge_text: String(badge).replace(/<[^>]*>/g, ''),
+      hint_text: st ? String(deployHint(site, st)).replace(/<[^>]*>/g, '') : '',
+      callout_has_failed_wording: st
+        ? /失败/.test(String(neverLiveCallout(site, st))) : false,
+    };
+  });
+  console.log(JSON.stringify({ scenario: 'probe', cases: out }));
+  process.exit(out.every((c) => c.got === c.want) ? 0 : 3);
+}
+
 setTimeout(() => {
   const askedMe = fetched.some((u) => u.includes('/api/me'));
   console.log(JSON.stringify({

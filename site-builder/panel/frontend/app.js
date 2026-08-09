@@ -131,6 +131,20 @@ function statusBadge(status) {
   return '<span class="badge ' + cls + '"><span class="dot"></span>' + esc(label) + '</span>';
 }
 
+/* 列表里的站点徽章：DEPLOYING 且从未上线过时显示"未上线"而不是"部署中"
+ * ——后者会让用户一直等一个不会来的结果（真机上有 2 个这样的站点）。 */
+function listStatusBadge(item) {
+  if (neverLiveFromSite(item)) {
+    /* 列表页拿不到 job，**分不出"失败了"还是"还在跑"**，所以用中性文案
+     * "未上线"（陈述事实：还没有可访问版本），不断言失败。点进详情页才有
+     * job 数据，那里才会说清是失败还是进行中。
+     * 用 badge-off（灰）而不是 badge-fail（红）：列表里一片红会让人以为出了
+     * 大事，而这里只是"还没成"。 */
+    return '<span class="badge badge-off"><span class="dot"></span>未上线</span>';
+  }
+  return statusBadge(item.status);
+}
+
 function jobBadge(status) {
   const cls = JOB_CLASS[status] || 'badge-off';
   const label = JOB_LABEL[status] || status || '未知';
@@ -526,7 +540,7 @@ function siteCard(item) {
       '<div style="min-width:0"><div class="name">' + esc(item.name || item.site_id) + '</div>' +
       '<span class="url" title="' + esc(item.url) + '">' +
         esc(String(item.url || '').replace(/^https:\/\//, '')) + '</span></div>' +
-      statusBadge(item.status) +
+      listStatusBadge(item) +
     '</div>' +
     '<div class="row wrap" style="gap:6px;margin-top:12px">' +
       roleTag(item.role) +
@@ -548,7 +562,7 @@ function siteTable(sites) {
         'href="' + esc(item.url) + '">' +
         esc(String(item.url || '').replace(/^https:\/\//, '')) + '</a></td>' +
       '<td class="mono">' + esc(item.owner) + '</td>' +
-      '<td>' + statusBadge(item.status) + '</td>' +
+      '<td>' + listStatusBadge(item) + '</td>' +
       '<td>' + roleTag(item.role) + '</td>' +
       '<td class="meta">' + esc(policySummary(item)) + '</td>' +
       '<td class="mono">' + esc(when(item.created_at)) + '</td>' +
@@ -596,29 +610,42 @@ async function pageSite() {
 
   /* 部署失败徽章由**展示层派生**：真源不会把 site.status 写成 FAILED
    * （重部署失败时站点仍在线服务旧版本，mark_job.py 只标 job）。
-   * 所以站点处于 DEPLOYING 时要看最新一条 job 才知道是"正在部署"还是"失败了"。 */
-  let latestJob = null;
+   *
+   * 要**整份 job 列表**而不只是最新一条：区分"从未上线"与"重部署失败"必须知道
+   * 历史上有没有 SUCCEEDED 过（见 deployState 的注释）。只取 [0] 分不出来。 */
+  let jobs = [];
   try {
     const res = await apiGet('/api/sites/' + encodeURIComponent(siteId) + '/jobs');
-    latestJob = (res.jobs || [])[0] || null;
+    jobs = res.jobs || [];
   } catch (err) {
-    latestJob = null;   // 读不到部署历史不该让整页打不开
+    jobs = [];          // 读不到部署历史不该让整页打不开
   }
+  const dstate = deployState(site, jobs);
+  const latestJob = dstate.latest;
+  /* 从未上线的站点没有 route、URL 是 404——"打开站点"必须禁用，
+   * 否则用户点进去看到 404 会以为是平台坏了。 */
+  const openable = !neverLive(site, dstate);
 
   const tabs = [['overview', '概览'], ['access', '权限'], ['deploys', '部署历史'],
                 ['analytics', '访问统计']];
   view.innerHTML =
     '<section><div class="row-between" style="align-items:flex-start;margin-bottom:18px">' +
       '<div><div class="row" style="gap:10px"><h1 class="mono" style="font-size:22px">' +
-        esc(site.name || site.site_id) + '</h1>' + statusBadge(site.status) +
-        deployHint(site, latestJob) + '</div>' +
+        esc(site.name || site.site_id) + '</h1>' + siteStatusBadge(site, dstate) +
+        deployHint(site, dstate) + '</div>' +
         '<div class="row" style="gap:8px;margin-top:6px">' +
-          '<a class="mono link" target="_blank" rel="noreferrer" href="' + esc(site.url) + '">' +
-            esc(site.url) + '</a>' +
+          (openable
+            ? '<a class="mono link" target="_blank" rel="noreferrer" href="' +
+              esc(site.url) + '">' + esc(site.url) + '</a>'
+            : '<span class="mono meta" title="该站点从未成功上线，此 URL 目前是 404">' +
+              esc(site.url) + '</span>') +
           '<span class="meta">· site_id ' + esc(site.site_id) + '</span></div></div>' +
       '<div class="row" style="gap:8px">' +
-        '<a class="btn" target="_blank" rel="noreferrer" href="' + esc(site.url) + '">' +
-          ICON.ext + '打开站点</a>' +
+        (openable
+          ? '<a class="btn" target="_blank" rel="noreferrer" href="' + esc(site.url) + '">' +
+            ICON.ext + '打开站点</a>'
+          : '<span class="btn is-disabled coming-later" aria-disabled="true" ' +
+            'title="该站点从未成功上线，URL 目前是 404">' + ICON.ext + '打开站点</span>') +
         '<button class="btn" id="copy-url" type="button">' + ICON.copy + '复制 URL</button>' +
       '</div></div>' +
     '<div class="tabs" role="tablist">' + tabs.map((t) =>
@@ -638,30 +665,123 @@ async function pageSite() {
   if (tab === 'access') renderAccessTab(panel, site);
   else if (tab === 'deploys') renderDeploysTab(panel, site);
   else if (tab === 'analytics') renderAnalyticsTab(panel);
-  else renderOverviewTab(panel, site, latestJob);
+  else renderOverviewTab(panel, site, dstate);
 }
 
-/* DEPLOYING + 最新 job FAILED = 上次重部署失败，线上仍是旧版本。 */
-function deployHint(site, job) {
+/* `site.status === 'DEPLOYING'` 有**两种**完全不同的含义，必须区分，
+ * 否则"部署中"与"部署失败"两个徽章并排出现，读起来像自相矛盾。
+ *
+ * 真源侧的事实（`site.status` 只有三个写入点）：
+ *   · `create_site_record` 建站时写 DEPLOYING（**首次**，且这是它的初始值）
+ *   · `mark_job` 成功时写 ACTIVE
+ *   · `undeploy` 写 DELETED
+ * **没有任何地方把它从 DEPLOYING 改回去**。所以 DEPLOYING 是"从未成功过"
+ * 与"正在部署"共用的值，靠 site 自己分不出来——必须看 job 历史：
+ *
+ *   有 SUCCEEDED 过 → 站点**曾经上线**。此刻 DEPLOYING+FAILED = 重部署失败，
+ *                     线上仍在服务旧版本（mark_job 只标 job，不回退 site）。
+ *   从未 SUCCEEDED  → 站点**从未上线**（无 route、URL 404）。说"最近一次部署
+ *                     失败"会让用户以为原本有个好的版本，其实一次都没成过。
+ *
+ * 第二种情况实测存在（真机上 27 个站点里有 2 个），我第一版对两者用了同一句
+ * "最近一次部署失败"——按重部署那个假设写的，对首次失败是误导。
+ */
+function deployState(site, jobs) {
+  const list = jobs || [];
+  const latest = list[0] || null;
+  const everLive = list.some((j) => j.status === 'SUCCEEDED');
+  return { latest: latest, everLive: everLive, list: list };
+}
+
+/* "还没有可访问版本"的**唯一判定**（= 站点从未成功上线过）。写成一个函数而
+ * 不是在多处各写一遍同样的条件：这个仓库栽过几次"同一个不变量被手抄多份，
+ * 改一处漏三处"。
+ *
+ * 两个数据来源：
+ *   · 列表页只有 site（没有 job 数据）→ 用后端给的 `ever_live`
+ *     （按 last_job_id 的存在性派生，见 api._shape_site 的注释）；
+ *   · 详情页另外拿到了 job 列表 → 用"历史上有没有 SUCCEEDED"交叉核对。
+ *     两个来源不一致时**取更保守的那个**（认为还没上线），不给"站点在线"的
+ *     乐观错觉。
+ *
+ * **注意它不区分"失败了"与"还在跑"**——两者都还没有可访问版本，但对用户是两
+ * 件事：一个要去修，一个只需要等。所以文案层再用 isDeployFailed() 分流；
+ * 判定表用例里"首次部署仍在跑"就是靠这个区分才不会被说成失败的
+ * （harness 的 probe 场景把这张表打出来）。
+ */
+function neverLive(site, st) {
+  if (site.status !== 'DEPLOYING') return false;
+  const byField = site.ever_live === false;         // 后端派生（列表页唯一依据）
+  const byJobs = st && st.list && st.list.length
+    ? !st.everLive : null;                          // 详情页才有
+  if (byJobs === null) return byField;
+  return byField || byJobs;
+}
+
+/* 最新一次尝试是**失败**了（而不是还在跑）。没有 job 数据时返回 false：
+ * 宁可少说一句"失败"，也不要把一个正在部署的站点说成失败的。 */
+function isDeployFailed(st) {
+  return !!(st && st.latest && st.latest.status === 'FAILED');
+}
+
+/* 还在部署中（首次或重部署都算）。 */
+function isDeployRunning(st) {
+  return !!(st && st.latest
+            && (st.latest.status === 'RUNNING' || st.latest.status === 'PENDING'));
+}
+
+/* 列表页用：只有 site，没有 job。 */
+function neverLiveFromSite(site) {
+  return neverLive(site, null);
+}
+
+function deployHint(site, st) {
+  const job = st.latest;
   if (site.status !== 'DEPLOYING' || !job) return '';
-  if (job.status === 'FAILED') {
-    return '<span class="tag" style="color:var(--danger)">最近一次部署失败</span>';
-  }
   if (job.status === 'RUNNING' || job.status === 'PENDING') {
     return '<span class="tag">' + ICON.clock + ' ' + esc(phaseText(job.phase)) + '</span>';
+  }
+  if (job.status === 'FAILED') {
+    return st.everLive
+      ? '<span class="tag" style="color:var(--danger)">最近一次部署失败（线上仍是上一版）</span>'
+      : '<span class="tag" style="color:var(--danger)">从未成功上线</span>';
   }
   return '';
 }
 
-function renderOverviewTab(panel, site, job) {
+/* 状态徽章：DEPLOYING 且从未成功过时**不显示"部署中"**——它不在部署，
+ * 它是停在初始状态。显示"部署中"会让用户一直等一个不会来的结果。 */
+function siteStatusBadge(site, st) {
+  if (neverLive(site, st) && isDeployFailed(st)) {
+    return '<span class="badge badge-fail"><span class="dot"></span>未上线</span>';
+  }
+  return statusBadge(site.status);
+}
+
+/* 给"从未上线"的站点一句能照做的下一步。它没有 route、URL 是 404，
+ * 所以"打开站点"按钮也该是禁用的（见 pageSite）。 */
+function neverLiveCallout(site, st) {
+  if (!(neverLive(site, st) && isDeployFailed(st))) return '';
+  return '<div class="callout danger" style="margin-top:14px">' + ICON.err +
+    '<span><strong>这个站点从未成功上线。</strong>首次部署在「' +
+    esc(phaseText(st.latest.phase)) + '」阶段失败，因此还没有可访问的版本——' +
+    '现在打开它的 URL 会是 404。<br />在 Agent 客户端里按下面的错误摘要修好后，' +
+    '重新说一次「部署」即可；不需要在这里做任何操作。</span></div>';
+}
+
+function renderOverviewTab(panel, site, st) {
+  const job = st.latest;
   panel.innerHTML =
     '<section style="display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr);gap:16px">' +
       '<div class="card"><div class="card-head"><h2>站点信息</h2>' +
         '<span class="meta">创建于 ' + esc(when(site.created_at)) + '</span></div>' +
         '<div class="card-body"><dl class="kv">' +
-          '<dt>访问地址</dt><dd><a class="mono link" target="_blank" rel="noreferrer" ' +
-            'href="' + esc(site.url) + '">' + esc(site.url) + '</a></dd>' +
-          '<dt>状态</dt><dd>' + statusBadge(site.status) + '</dd>' +
+          '<dt>访问地址</dt><dd>' + (neverLive(site, st)
+            ? '<span class="mono meta">' + esc(site.url) +
+              '</span><div class="meta" style="margin-top:4px">该地址目前返回 404</div>'
+            : '<a class="mono link" target="_blank" rel="noreferrer" href="' +
+              esc(site.url) + '">' + esc(site.url) + '</a>') + '</dd>' +
+          '<dt>状态</dt><dd>' + siteStatusBadge(site, st) + '</dd>' +
           '<dt>子域</dt><dd class="mono">' + esc(site.subdomain || '—') + '</dd>' +
           '<dt>所有者</dt><dd><span class="row" style="gap:7px">' +
             '<span class="avatar sm">' + esc(initials(site.owner)) + '</span>' +
@@ -673,7 +793,7 @@ function renderOverviewTab(panel, site, job) {
               ? '<div class="meta" style="margin-top:6px">' +
                 site.collaborators.map(esc).join(' · ') + '</div>' : '') + '</dd>' +
           '<dt>我的角色</dt><dd>' + roleTag(site.role) + '</dd>' +
-        '</dl></div></div>' +
+        '</dl>' + neverLiveCallout(site, st) + '</div></div>' +
       '<div class="stack" style="gap:16px">' +
         '<div class="card"><div class="card-head"><h2>访问策略</h2>' +
           '<a class="btn btn-sm" href="#/sites/' + esc(site.site_id) + '/access">修改</a></div>' +
@@ -1264,7 +1384,7 @@ async function pageAdmin() {
             '<td><span class="row" style="gap:7px"><span class="avatar sm">' +
               esc(initials(item.owner)) + '</span><span class="mono">' + esc(item.owner) +
               '</span></span></td>' +
-            '<td>' + statusBadge(item.status) + '</td>' +
+            '<td>' + listStatusBadge(item) + '</td>' +
             '<td class="meta">' + esc(policySummary(item)) + '</td>' +
             '<td class="mono">' + esc(when(item.created_at)) + '</td>' +
             '<td style="text-align:right;white-space:nowrap">' +

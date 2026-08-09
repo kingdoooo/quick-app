@@ -264,8 +264,13 @@ def main() -> int:
               str(shaped.get("role")))
         check(set(shaped) >= {"site_id", "name", "status", "url", "owner",
                               "created_at", "require_login", "allowed_users",
-                              "collaborators", "role"},
-              "站点形态含 10 个字段", f"{len(shaped)} 个字段")
+                              "collaborators", "role", "ever_live"},
+              "站点形态含全部对外字段（含 ever_live）", f"{len(shaped)} 个字段")
+        # ever_live 是"有没有成功上线过"的派生：fixture 站点没有 last_job_id，
+        # 所以必须是 False。它决定控制台把 DEPLOYING 显示成"部署中"还是"未上线"。
+        check(shaped.get("ever_live") is False,
+              "没有 last_job_id 的站点 ever_live=False（控制台据此显示「未上线」）",
+              str(shaped.get("ever_live")))
 
         print("\n── ⑥ 越权：outsider 读不到、也改不了 ────────────────")
         ck_out = cookies_for(outsider, console_session=True)
