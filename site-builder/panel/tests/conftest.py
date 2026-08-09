@@ -93,3 +93,18 @@ def aws(monkeypatch):
             PolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": [
                 {"Effect": "Allow", "Action": "*", "Resource": "*"}]}))
         yield
+
+
+@pytest.fixture
+def secret(monkeypatch):
+    """把 panel 的密钥读取指向测试向量的固定密钥。
+
+    直接 patch `console_session._secret`（而不是往环境变量里塞明文）：
+    生产路径就是"环境变量只有参数名、运行时从 SSM 读"，把明文放进环境
+    会让测试与生产形态不一致，也违反本项目"明文不进环境变量"的约束。
+    _secret 自身的行为（读 SSM、TTL 缓存）另有专门用例覆盖。
+    """
+    import console_session
+    from upgrade_code_vectors import SECRET
+    monkeypatch.setattr(console_session, "_secret", lambda: SECRET)
+    return SECRET

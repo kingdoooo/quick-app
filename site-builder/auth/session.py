@@ -5,6 +5,7 @@ import base64
 import hashlib
 import hmac
 import json
+import secrets
 import time
 
 
@@ -43,6 +44,61 @@ def verify_session_jwt(token: str, secret: str, now: int | None = None) -> dict 
         if not hmac.compare_digest(sig, expected):
             return None
         claims = json.loads(_b64url_decode(payload_b64))
+        if int(claims.get("exp", 0)) <= (now if now is not None else int(time.time())):
+            return None
+        return claims
+    except Exception:
+        return None
+
+
+# ---- console-session 的一次性 upgrade code（M3）----
+#
+# **单一实现**：panel 构建时复制本文件（同 common.py / permissions.py 模式），
+# 不得在 panel 里手写第二份编解码。两侧测试跑同一组向量（
+# panel/tests/upgrade_code_vectors.py）防复制品漂移——本文件与 Edge 的 HS256
+# 就是靠这种同步测试盯住的。
+#
+# 与会话 JWT 的三个区别（都不是可选项）：
+#   · typ="console-upgrade" —— 上下文标记。没有它，login state / PKCE cookie /
+#     会话 JWT 可以跨上下文冒充（spec §5.4）。verify 端**先查 typ**。
+#   · exp ≤ 60s —— code 只在 302 跳转的那一瞬间有效。**上限而非默认值**：
+#     调用方传更大的值也会被压到 60，否则等于多出一个长期凭证。
+#   · jti —— 由调用方原子消费一次（panel 对 session-codes 表条件写）。
+#     签发端**不记状态**：谁消费谁负责；签发端记状态会变成第二个真源。
+UPGRADE_TYP = "console-upgrade"
+UPGRADE_MAX_TTL = 60
+
+
+def mint_upgrade_code(email: str, secret: str,
+                      ttl_seconds: int = UPGRADE_MAX_TTL) -> str:
+    ttl = min(int(ttl_seconds), UPGRADE_MAX_TTL)
+    header = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"},
+                                separators=(",", ":")).encode())
+    claims = {"typ": UPGRADE_TYP, "email": email,
+              "jti": _b64url(secrets.token_bytes(16)),
+              "exp": int(time.time()) + ttl}
+    payload = _b64url(json.dumps(claims, separators=(",", ":")).encode())
+    signing_input = f"{header}.{payload}".encode()
+    return f"{header}.{payload}.{_sign(signing_input, secret)}"
+
+
+def verify_upgrade_code(code: str, secret: str, now: int | None = None) -> dict | None:
+    """→ claims 或 None。**任何异常都归为 None**（fail-closed）。
+
+    返回 None 而不是抛异常：调用方是 Lambda handler，它要的是"拒绝"，
+    抛异常会变成 500 + 堆栈。
+    """
+    try:
+        header_b64, payload_b64, sig = code.split(".")
+        expected = _sign(f"{header_b64}.{payload_b64}".encode(), secret)
+        if not hmac.compare_digest(sig, expected):
+            return None
+        claims = json.loads(_b64url_decode(payload_b64))
+        # typ 必须先查：这是"不能跨上下文复用"的唯一技术保证
+        if claims.get("typ") != UPGRADE_TYP:
+            return None
+        if not claims.get("email") or not claims.get("jti"):
+            return None
         if int(claims.get("exp", 0)) <= (now if now is not None else int(time.time())):
             return None
         return claims
