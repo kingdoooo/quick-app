@@ -859,6 +859,142 @@ Lambda 侧）。
 4. pre-token V2 能否稳定拿到 `identities[0].providerName`（§3.5 的 `idp`
    claim 来源；联邦用户应有，需真机确认字段形态与首次登录时序）。
 
+## 11-pre. M3 前置：运行时正确性、自动化部署与测试卫生（2026-08-09 追加）
+
+> 本节在 M1+M2 全量部署并真机验证后追加（brainstorming 结论）。分两类：
+> **Blocking**（M3 核心开发前必须完成）与 **Parallel**（可与 M3 并行，
+> 最迟在 M3 最终 E2E 前完成）。M3 本身的细化 spec 见
+> `2026-08-09-phase2-m3-console-spec.md`（本文件只增不改的原则不变）。
+
+### 11-pre.1 Blocking 1：SFN 终态 reconciler（两层收敛）
+
+**缺口**：每个 Task 有 `add_catch(States.ALL) → MarkFailed`，但状态机整体
+`TimeoutSeconds=1800` 到点产生的 `TIMED_OUT` 与人工 `StopExecution` 产生的
+`ABORTED` **不执行任何 State** → `mark_job` 不被调用 → job 永久停在
+RUNNING；`confirm_upload` 只接受 PENDING，用户无法重试。历史 0 例，缺口真实。
+
+**Step Functions 状态变化事件是 best-effort**——只实现一条 EventBridge rule
+不算闭合，必须两层收敛：
+
+**实时层：EventBridge reconciler**（并入 deployer CDK 栈——它监控的就是本栈
+的状态机与 jobs 表，ARN 同栈引用零硬编码，rule/target/DLQ 可被 CDK 断言锁定）：
+
+- rule 只匹配当前 deploy state machine ARN，status 只匹配
+  `TIMED_OUT` / `ABORTED`；
+- job_id 从 execution ARN 提取 execution name（当前约定 name == job_id），
+  **不从不可信/可变的 input 里猜**；
+- handler 只在 job 存在且 `status == RUNNING` 时条件更新——**不得照抄
+  `_rollback_job_to_pending` 的 `phase=queued` 条件**：timeout/abort 可发生在
+  任意 phase；
+- 更新内容：`status=FAILED`、保留最后 phase、写入固定且无敏感信息的 error
+  文案、刷 `updated_at`；
+- job 不存在 → 只记结构化日志，**不得**通过 UpdateItem 凭空创建 job；
+- 已 SUCCEEDED / FAILED / DELETED → no-op（条件失败即静默）；
+- 重复/乱序事件幂等（条件更新天然幂等，乱序不覆盖终态）；
+- Lambda 失败 retry（×2）+ SQS DLQ；
+- **独立窄 IAM 角色**（不用 exec_role）：jobs 表条件更新 + 自身日志，无其他。
+
+**兜底层：周期 sweeper**（EventBridge Scheduler 每 30 分钟）：
+
+- 扫描超龄仍 RUNNING 的 job（阈值 45 分钟 = 状态机 1800s 上限 + 余量）；
+- 按 execution name（=job_id）拼 ARN 调 `DescribeExecution`：
+  - execution 已 TIMED_OUT / ABORTED / FAILED 而 job 仍 RUNNING →
+    **与实时层相同的条件更新**收敛到 FAILED；
+  - execution 仍 RUNNING → 不处理；
+  - 找不到 execution → 记 ERROR 级结构化日志（进告警面），**不直接猜终态**；
+- 分页、限流、重复执行安全；不允许扫全表后无界并发（站点量级下串行处理）。
+
+**验收**：
+
+- 单测矩阵：RUNNING+TIMED_OUT→FAILED；RUNNING+ABORTED→FAILED；已
+  SUCCEEDED/FAILED/DELETED→no-op；job 不存在→不创建；重复事件幂等；乱序
+  事件不覆盖终态；**任意 phase 的 RUNNING 都能收敛**；
+- CDK 断言测试锁定 rule / target / IAM / DLQ / schedule；
+- 真机验收用临时 execution / 探针 job，**不得 Stop 当前真实生产部署**；
+- 扩展 `verify_sfn_failure_paths.py`：证明 EventBridge 与 sweeper 两层均有效。
+
+### 11-pre.2 Blocking 2：登录失败告警自动化部署
+
+**缺口**：现网 `invalid_grant` alarm（metric filter + SNS `site-builder-alarms`
++ alarm，双语描述、AlarmActions/OKActions 均已配）是**手工创建**的；只运行
+现有 CDK/部署脚本不会收敛出该配置，"从零部署"得不到相同环境。
+
+**唯一真源 = `deploy_auth.py` 的幂等声明式 provisioning**（brainstorming
+决策：告警监控的就是该脚本部署的 auth Lambda 日志组，同一脚本声明全部配套
+资源，生命周期一致；**文档中不称其为 IaC**）。不得再维护第二个 writer——
+现网手工资源被脚本同名 upsert 收编。
+
+自动收敛的对象与当前环境阈值：
+
+- CloudWatch Logs Metric Filter、SNS Topic、CloudWatch Metric Alarm；
+- 双语 AlarmDescription、AlarmActions、OKActions（ALARM 与 OK 同一 topic）；
+- Sum / Period=300 / EvaluationPeriods=2 / Threshold=1 /
+  GreaterThanOrEqualToThreshold / TreatMissingData=notBreaching。
+
+约束：
+
+- email 地址不写入任何 git tracked 文件——从 gitignored config.ini
+  （`[Alerting]`）或环境变量输入；
+- subscription 创建幂等（先 list 后建），不得每次部署重复创建；
+- `PendingConfirmation` 必须显式报告为「未完成」（email 订阅需收件人手工
+  确认，文档写清楚）；从零部署验收必须验证实际 **confirmed** subscription；
+- OK 文案统一称**「告警解除」**：只表示指标不再满足阈值，规则仍启用，
+  不代表根因确认修复。
+
+**验收**：`verify_auth_alarm.sh` 增加「线上配置 == 脚本声明值」比对段与
+confirmed subscription 检查。
+
+### 11-pre.3 Parallel：测试 fixture 自动清理
+
+非阻塞，可与 M3 开发并行，**必须在 M3 最终 E2E 前完成**。
+
+**smoke_router.sh**：
+
+- 随机后缀，禁止固定 `app-smoke*`；
+- trap 覆盖成功、失败、Ctrl-C；
+- 只删除本次创建的 route / S3 objects；删除后用强一致读 / 实际 S3 list 核对；
+- 少于预期断言数判定「未完成」，不能 0/0 通过；
+- 显式 `--keep-on-failure` 供排查，默认清理。
+
+**E2E fixture finalizer**：
+
+- 每个测试记录自己创建的 site_id / job_id，只清理本次创建的资源；
+- 默认 undeploy + `purge_data=true`；清理范围含 NoSQL table、DSQL
+  schema/role、Lambda、IAM role、S3、route；
+- **清理失败必须让测试失败**，不能 warning 后继续报绿；
+- 失败时可通过显式开关保留现场；
+- 不得按 `owner=fixture@test` 之类批量删除历史资源。
+
+### 11-pre.4 组件部署一致性真源脚本重构
+
+`verify_contract_fixtures.py` 的职责已扩到「线上 Lambda 产物 == 本地源码」，
+M3 还要覆盖 panel Lambda / permissions.py / common.py 字节比对、panel
+Function URL AuthType 与 resource policy、console route、CloudFront 实际
+关联的 Edge 版本、console-session callback 的 cookie 行为。**重构为
+`verify_deployed_components.py`**：contract scanner 段原样保留为其中一段，
+旧脚本删除、文档引用全部同步——组件部署一致性只能有一个真源，不维护两份
+互相漂移的脚本。
+
+## 11-clarify. M3/M4/M5 边界澄清（2026-08-09 追加）
+
+§4 是跨 M3/M4/M5 的完整产品视图，不代表其中所有功能都属于 M3：
+
+- **M3 实现**：panel Lambda + Function URL、`deploy_panel.py`、console 静态
+  前端与路由、console-session 升级 + CSRF、/api/me、我的/全部站点列表、站点
+  基础详情、permissions / collaborators / owner transfer、jobs 历史、
+  undeploy / purge_data、admin 名单与代管、admin resync、ops-log；
+- **M4**（不在 M3 写假接口/假数据/临时表）：API Key 的 UI 与 API（§4.4 的
+  `/api/keys`、§5 全部）。原型（Open Design 侧维护）里的 `sk-site-` 前缀与
+  `key_id` 字段与本 spec §5.1（`sk-` + 16 位 base62、PK=`key_hash`）
+  **不一致，是 M4 待确认项**，以 M4 实施时的决议为准；
+- **M5**（同上不做假实现）：stats / audit 数据、`/api/sites/{id}/stats`、
+  `/api/sites/{id}/audit`、图表与站点列表的 PV 迷你趋势；
+- 前端对 M4/M5 入口显示明确的 disabled / coming later 状态，或不显示，
+  **不得请求不存在的 API**。
+
+M3 的完整细化（window.API 接口契约映射、前端移植方案、安全硬约束展开）见
+`docs/superpowers/specs/2026-08-09-phase2-m3-console-spec.md`。
+
 ## 11. 范围外（三期候选）
 
 - 全量按站点会话隔离（本期只做控制台）
