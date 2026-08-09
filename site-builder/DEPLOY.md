@@ -468,7 +468,7 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    topic ARN，声明值由 AST 解析上述两个文件得出，脚本里不复制第二份字面量）、
    要求存在**声明的那个收件人**的 confirmed 订阅（别人的 confirmed 不算、
    `PendingConfirmation` 判 FAIL）、触发一次真实 `invalid_grant`、**确认日志里
-   出现 `token_exchange_invalid_grant`**（不然测到的是 cookie 缺失分支的 400,
+   出现 `token_exchange_invalid_grant`**（不然测到的是 cookie 缺失分支的 400，
    不是目标逻辑）、建临时 1/1 阈值探针 alarm 验证真的进 ALARM，然后自动清理
    （trap 保证异常路径也清）。脚本全程只读线上状态——**不调
    `aws sns create-topic`**，否则"topic 缺失"这个该 FAIL 的状态会被脚本自己

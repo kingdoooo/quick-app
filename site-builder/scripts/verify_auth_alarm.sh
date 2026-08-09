@@ -559,7 +559,10 @@ if [ "$STATE_VAL" = "ALARM" ]; then
   [ -n "${SNS_TOPIC_ARN:-}" ] && \
     echo "        只看 StateValue 证明不了有人被通知到。"
 else
-  fail "alarm 未进入 ALARM（最终 $STATE_VAL）"
+  # `${}` 必需：紧跟的是全角括号，裸 $STATE_VAL 会把它的首字节吃进变量名，
+  # set -u 下当场 `unbound variable` —— 而这里正是"告警没响"的诊断路径，
+  # 报错会把真正的原因盖掉（与 cleanup 里 MIN_CHECKS 同一个坑）。
+  fail "alarm 未进入 ALARM（最终 ${STATE_VAL}）"
   echo "      metric filter 的 pattern 与日志实际字段不匹配是最常见原因："
   echo "      aws logs filter-log-events --log-group-name $LOG_GROUP \\"
   echo "        --filter-pattern '{ \$.event = \"token_exchange_invalid_grant\" }'"
