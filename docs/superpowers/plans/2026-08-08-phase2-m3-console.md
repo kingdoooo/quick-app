@@ -957,7 +957,35 @@ Expected: JSON 含 `"status": ["TIMED_OUT", "ABORTED"]` 与本状态机 ARN。
           f"status={still}")
 ```
 
-同时把脚本头部的最小检查数下限从 6 提到 **12**（原 6 段 + 新 6 项）。需要新增两个小 helper：`_poll_job_status(table, job_id, *, want, timeout_s)` 轮询强一致读；`stale_iso(minutes)` 生成回拨时间戳。
+同时把最小检查数下限从 6 提到 **11**——**这是全绿运行的实测产出，不是
+`check()` 的静态条数**（15 条里有 4 处是互斥分支/条件触发，全绿时只走一侧）。
+下限写错方向不同后果不同：写大了每次都判"未完成"，写小了掩盖中途崩溃。
+实测明细：A1 + B1 + C2 + D1 + E1 + F3 + G2 = 11。
+
+需要的 helper（**都要做成唯一入口的可执行闸门，不是注释约定**）：
+`poll_job_status(jid, want, *, timeout_s)` 有界轮询强一致读；
+`stale_iso(minutes)` 回拨时间戳；`probe_update(...)` 改 job 行的唯一入口
+（非本轮 `probe_jobs` 一律 raise）；`stop_probe_execution(arn)` StopExecution
+的唯一入口（校验前缀 + 本轮 probe_jobs）；`invoke_sweeper()` 同步调 sweeper
+并**检查 `FunctionError`**（Lambda 内部抛异常时 invoke 仍返回 200，不查会把
+"权限不足根本没干活"伪装成"没收敛"）。
+
+闸门一律用 `raise` 而不是 `assert`：`python -O` 会把 assert 整条剔除，
+保护生产执行的闸门不能依赖解释器开关。
+
+**三个实施期踩到的假通过陷阱（照抄本段时务必保留对应写法）**：
+1. **error 断言必须逐字匹配 `reconcile_job.ABORT_ERROR`**，不能只断言"非空且
+   不含 ARN"：探针 input 里带 `job_id` 时，Validate 失败会走 add_catch →
+   MarkFailed 抢先把 job 写成 FAILED，其原始 Cause 同样满足弱断言——两次运行
+   分别命中两个写入者，而 reconciler 根本没被验证。**input 里不放 job_id**，
+   MarkFailed 读不到它就碰不到探针行。
+2. **必须先校验探针执行真的进入 ABORTED**：Validate 缺字段约 300ms 就失败，
+   start 后立刻 stop 约 1/4 概率抢不过它，终态变 FAILED，而 rule 只匹配
+   TIMED_OUT/ABORTED → 无事件投递。换名重试 3 次；始终抢不到就如实报
+   "无法验证"，**绝不退化成会被 MarkFailed 满足的弱断言**。
+3. **A 段不能保留"存在 TIMED_OUT/ABORTED 即 FAIL"**：F 段自己就造 ABORTED
+   探针，于是第二次运行必红——那是脚本自我否定。改为报告，并由"终止执行对应
+   的 job 不停在 RUNNING"那条 check 覆盖它们。
 
 - [ ] **Step 11: [真机] 跑扩展后的验收脚本**
 
