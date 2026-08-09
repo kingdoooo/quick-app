@@ -88,7 +88,8 @@ def ensure_repo() -> str:
 # 第二次 push 直接 ImageTagAlreadyExistsException，"幂等可重跑"随之失效。
 _BUILD_INPUTS = ("mcp/Dockerfile", "mcp/requirements.txt", "mcp/server.py",
                  "deployer/functions/common.py",
-                 "deployer/functions/permissions.py")
+                 "deployer/functions/permissions.py",
+                 "deployer/functions/ops_log.py")
 
 
 def _git(*args: str) -> str:
@@ -184,9 +185,11 @@ def resolve_digest(tag: str) -> str:
 
 
 def build_and_push(image_uri: str) -> None:
-    # common.py / permissions.py 必须进构建上下文：server.py 按同目录解析它们
+    # 这些必须进构建上下文：server.py 按同目录解析它们。
+    # **ops_log.py 也要**：permissions.py import 它（M3 审计落点），
+    # 少一个文件 = 容器起来后每次改权限都 ImportError。
     copied = []
-    for name in ("common.py", "permissions.py"):
+    for name in ("common.py", "permissions.py", "ops_log.py"):
         shutil.copyfile(HERE.parent / "deployer" / "functions" / name, HERE / name)
         copied.append(HERE / name)
     try:
@@ -351,6 +354,16 @@ def ensure_role() -> str:
          "Action": ["dynamodb:GetItem", "dynamodb:Scan",
                     "dynamodb:ConditionCheckItem"],
          "Resource": f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-admins"},
+        # ops-log：操作审计，**只 PutItem**（M3）。
+        # 权限变更经 permissions.write_permissions 落审计，而该函数跑在 MCP
+        # runtime 里，缺这条则每次改权限都在审计写入处 AccessDenied。
+        # 不给 Update/Delete：被攻破的 runtime 不能改写审计历史；
+        # 也不给 Get/Scan/Query：runtime 没有读审计的业务需要，给了等于多一条
+        # "谁改过谁的权限"的信息泄漏面。由 contract test 锁定动作集恰好为
+        # {PutItem}。
+        {"Sid": "OpsLogAppendOnly", "Effect": "Allow",
+         "Action": "dynamodb:PutItem",
+         "Resource": f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-ops-log"},
         # 路由表：只做权限投影 + 事务条件检查。
         #
         # **不给 PutItem/DeleteItem 是必要条件，但远远不够**：DynamoDB 的

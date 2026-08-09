@@ -784,3 +784,103 @@ def test_mcp_delegates_snapshot_guard_and_passes_action():
                       srv.index("# ---------- 纯函数层")]
     assert re.search(r'os\.environ\["ADMINS_TABLE"\]', admin_block), \
         "admin 守卫没有打在 ADMINS_TABLE 上"
+
+
+def test_ops_log_is_append_only_for_mcp_runtime():
+    """审计表只能 PutItem——给 Update/Delete 就等于允许篡改审计历史。
+
+    也不给读：runtime 没有读审计的业务需要，Scan 权限等于多一条"谁改过谁的
+    权限"的泄漏面。断言动作集**恰好**是 {PutItem}，不是"包含 PutItem"。
+    """
+    import json
+    from unittest.mock import MagicMock
+
+    import deploy_agentcore as da
+
+    captured = {}
+    fake = MagicMock()
+    fake.get_role.return_value = {"Role": {"Arn": "arn:aws:iam::1:role/r"}}
+    fake.put_role_policy.side_effect = lambda **kw: captured.update(kw)
+    real_iam, da.iam = da.iam, fake
+    try:
+        da.ensure_role()
+    finally:
+        da.iam = real_iam
+    policy = json.loads(captured["PolicyDocument"])
+
+    ops_stmts = []
+    for stmt in policy["Statement"]:
+        resources = stmt["Resource"]
+        resources = [resources] if isinstance(resources, str) else resources
+        if any("table/site-ops-log" in r for r in resources):
+            ops_stmts.append(stmt)
+    assert ops_stmts, (
+        "MCP runtime role 缺 ops-log 权限——permissions.write_permissions 跑在 "
+        "runtime 里，每次改权限都会在审计写入处 AccessDenied")
+    actions = set()
+    for stmt in ops_stmts:
+        a = stmt["Action"]
+        actions |= set(a if isinstance(a, list) else [a])
+    assert actions == {"dynamodb:PutItem"}, f"ops-log 权限过宽: {sorted(actions)}"
+
+
+def test_image_carries_every_local_module_the_server_chain_imports():
+    """镜像里必须有 server.py 传递 import 到的**每个**本地模块。
+
+    这条是实测踩出来的：M3 给 permissions.py 加了 `import ops_log` 之后，
+    Dockerfile 的 `COPY server.py common.py permissions.py ./` 与
+    build_and_push 的复制清单都没跟着改——单测全绿（宿主机上
+    deployer/functions/ 在 sys.path 里），但**容器起来后每次改权限都
+    ImportError**。逐个文件枚举的复制清单必须有机器来核对。
+
+    做法：从 server.py 出发做传递闭包，凡是能在 deployer/functions/ 里找到
+    同名 .py 的 import 都算"必须进镜像"，然后与 Dockerfile 的 COPY 行
+    以及 build_and_push 的复制元组比对。
+    """
+    import ast
+
+    fn_dir = MCP_DIR.parent / "deployer" / "functions"
+
+    def local_imports(path: Path) -> set[str]:
+        names = set()
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Import):
+                names |= {a.name.split(".")[0] for a in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names.add(node.module.split(".")[0])
+        return names
+
+    needed, queue, seen = set(), ["server.py"], set()
+    while queue:
+        cur = queue.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        path = MCP_DIR / cur if (MCP_DIR / cur).exists() else fn_dir / cur
+        if not path.exists():
+            continue
+        for name in local_imports(path):
+            candidate = fn_dir / f"{name}.py"
+            if candidate.exists():
+                needed.add(f"{name}.py")
+                queue.append(f"{name}.py")
+
+    assert "ops_log.py" in needed, (
+        "传递闭包没算出 ops_log.py——本用例的解析逻辑坏了（permissions.py "
+        "确实 import 它）")
+
+    dockerfile = (MCP_DIR / "Dockerfile").read_text()
+    copy_line = next(l for l in dockerfile.splitlines()
+                     if l.startswith("COPY") and "server.py" in l)
+    src = (MCP_DIR / "deploy_agentcore.py").read_text()
+    copy_tuple = re.search(r'for name in \(([^)]*)\)', src).group(1)
+
+    for mod in sorted(needed):
+        assert mod in copy_line, (
+            f"Dockerfile 的 COPY 缺 {mod}——容器里会 ImportError（{copy_line}）")
+        assert mod in copy_tuple, (
+            f"build_and_push 的复制清单缺 {mod}，构建上下文里不会有它")
+        # 指纹也要覆盖：漏了它，改 ops_log.py 不会让镜像标记为 dirty，
+        # tag 仍指向旧内容
+        assert f"functions/{mod}" in src, (
+            f"_BUILD_INPUTS 缺 {mod}——改它不会触发新 tag，会部署出陈旧镜像")

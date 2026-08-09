@@ -20,7 +20,7 @@ RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 
 # server.py 与 common.py（deploy_agentcore.py 从 deployer/functions/ 复制进构建
 # 上下文）必须同目录：server.py 按同目录解析 common。
-COPY server.py common.py permissions.py ./
+COPY server.py common.py permissions.py ops_log.py ./
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1

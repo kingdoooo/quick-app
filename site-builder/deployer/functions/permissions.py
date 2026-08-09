@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import boto3
 
 import common
+import ops_log
 
 ROLE_OWNER = "owner"
 ROLE_COLLABORATOR = "collaborator"
@@ -230,6 +231,10 @@ def add_admin(email: str, added_by: str) -> None:
     for attempt in range(3):
         try:
             ddb.transact_write_items(TransactItems=items)
+            # 审计 admin 名单变化（spec §5.5 要求覆盖）。target 用
+            # admins:{email} 而不是 site:*——被改的对象是名单，不是站点。
+            ops_log.record(actor=added_by, action="add_admin",
+                           target=f"admins:{email}", result="ok")
             return
         except botocore.exceptions.ClientError as e:
             if e.response["Error"]["Code"] != "TransactionCanceledException":
@@ -237,7 +242,12 @@ def add_admin(email: str, added_by: str) -> None:
             reasons = _cancel_reasons(e)
             put_reason = reasons[0] if reasons else ""
             if put_reason == "ConditionalCheckFailed":
-                return          # 该邮箱已是管理员：幂等成功，计数不动
+                # 该邮箱已是管理员：幂等成功，计数不动。**仍然落审计**，
+                # 但 result 区分开——"谁在什么时候尝试提权"本身就是审计线索，
+                # 而把它记成 ok 会让名单人数与 add_admin 条数对不上。
+                ops_log.record(actor=added_by, action="add_admin",
+                               target=f"admins:{email}", result="noop")
+                return
             if "TransactionConflict" in reasons and attempt < 2:
                 _time.sleep(0.05 * (2 ** attempt))   # 并发写 __count__，退避重试
                 continue
@@ -261,8 +271,12 @@ def rebuild_admin_count() -> int:
     return n
 
 
-def remove_admin(email: str) -> None:
+def remove_admin(email: str, removed_by: str = "") -> None:
     """删管理员。名单删空 = 平台永久失去管理入口，因此硬拦。
+
+    removed_by 是审计用的操作者（spec §5.5 要求覆盖 admin 名单变化）。
+    **可选参数**：一期的种子脚本等既有调用方不传它，审计里记空 actor 也比
+    改动它们的签名安全；panel / MCP 这些有身份的入口必须传。
 
     **不做 Scan 前置判断**：`list_admins()` 是最终一致 Scan，刚添加的管理员
     可能扫不到 → 前置检查认为"不存在"直接 return 成功，而 `is_admin()` 的强
@@ -309,11 +323,19 @@ def remove_admin(email: str) -> None:
         # 先看 sentinel 就会把"目标不存在"误报成"不能删除最后一个管理员"，
         # 与本函数承诺的幂等语义相反。所以先判 Delete 项。
         if reasons and reasons[0] == "ConditionalCheckFailed":
-            return          # 该邮箱本就不是管理员：幂等成功（无论剩几个）
+            # 该邮箱本就不是管理员：幂等成功（无论剩几个）。
+            # 仍落审计但 result=noop，理由同 add_admin 的幂等分支。
+            ops_log.record(actor=removed_by, action="remove_admin",
+                           target=f"admins:{email}", result="noop")
+            return
         if len(reasons) > 1 and reasons[1] == "ConditionalCheckFailed":
             # 目标确实存在，只是它是最后一个
+            ops_log.record(actor=removed_by, action="remove_admin",
+                           target=f"admins:{email}", result="denied")
             raise PermissionDenied("不能删除最后一个管理员") from e
         raise               # 容量/校验等：如实抛出，不要伪装成权限问题
+    ops_log.record(actor=removed_by, action="remove_admin",
+                   target=f"admins:{email}", result="ok")
 
 
 def normalize_allowed_users(value):
@@ -411,8 +433,16 @@ def write_permissions(site_id: str, *, actor: str, action: str,
     site = _site_or_raise(site_id, consistent=True)
     caller_is_admin = is_admin(actor)
     # 与 rev 同源的授权判定——不要在调用方另做一次
-    role = assert_can(actor, site, action, is_admin=caller_is_admin,
-                      what=f"站点 {site_id}")
+    try:
+        role = assert_can(actor, site, action, is_admin=caller_is_admin,
+                          what=f"站点 {site_id}")
+    except PermissionDenied:
+        # 失败操作也要有可判读记录（spec §5.5）。**不记异常原文**——它含
+        # "或该站点不存在"的存在性提示，而审计表的读者与被拒者不是同一批人，
+        # 落库等于开一条侧信道。只记结构化的 result。
+        ops_log.record(actor=actor, action=action, target=f"site:{site_id}",
+                       result="denied")
+        raise
     rev = int(site.get("permissions_rev", 0))
     if mutate is not None:
         overrides = mutate(site) or {}
@@ -505,9 +535,22 @@ def write_permissions(site_id: str, *, actor: str, action: str,
             "Key": {"email": {"S": actor}},
             "ConditionExpression": "attribute_exists(email)"}})
 
+    def _audit(route_synced: bool) -> None:
+        """事务提交成功后落审计。
+
+        **两条成功路径都要落**（正常双表事务、以及 route 不存在时的降级路径）
+        ——只在其中一处落会让降级场景静默漏记，而降级恰恰是更值得审计的情形。
+        detail 只放结构化小字段：role / 新 rev / 是否同步了路由投影。
+        """
+        ops_log.record(actor=actor, action=action, target=f"site:{site_id}",
+                       result="ok",
+                       detail={"role": role, "rev": rev + 1,
+                               "route_synced": route_synced})
+
     ddb = _ddb_client()
     try:
         ddb.transact_write_items(TransactItems=items)
+        _audit(True)
         return {**effective, "route_synced": True}
     except botocore.exceptions.ClientError as e:
         if e.response["Error"]["Code"] != "TransactionCanceledException":
@@ -569,6 +612,7 @@ def write_permissions(site_id: str, *, actor: str, action: str,
                     raise PermissionDenied("你的管理员权限已被撤销") from inner
                 raise PermissionConflict(
                     "站点权限已被其他人修改，请刷新后重试") from inner
+            _audit(False)
             return {**effective, "route_synced": False}
         raise
 

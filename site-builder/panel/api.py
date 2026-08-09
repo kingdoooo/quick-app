@@ -203,7 +203,8 @@ def do_add_admin(email: str, target: str) -> dict:
 
 def do_remove_admin(email: str, target: str) -> dict:
     _require_admin(email)
-    permissions.remove_admin(target)
+    # 传 removed_by：审计要记"谁摘掉了谁的管理员"，缺它审计行的 actor 是空
+    permissions.remove_admin(target, removed_by=email)
     return {"admins": permissions.list_admins()}
 
 

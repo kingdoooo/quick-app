@@ -11,6 +11,7 @@ import os
 import boto3
 
 import common
+import ops_log
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -160,6 +161,14 @@ def handler(event, context):
 
     common.upsert_site(site_id, status="DELETED")
     common.update_job(event["job_id"], status="DELETED")
+    # 审计（spec §5.5）：下线是不可恢复动作，purge_data 更是——必须留痕。
+    # actor 取 job 的发起者（jobs.owner = requested_by），SFN 侧没有别的身份。
+    # 落在最后：审计的是"确实完成了"，中途失败会走异常路径不落 ok。
+    job = common.get_job(event["job_id"]) or {}
+    ops_log.record(actor=job.get("owner", ""), action="undeploy",
+                   target=f"site:{site_id}", result="ok",
+                   detail={"purge_data": bool(event.get("purge_data")),
+                           "purged": sorted(purged) if purged else []})
     result = {"job_id": event["job_id"], "status": "DELETED"}
     if purged:
         result["purged"] = purged
