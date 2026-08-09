@@ -10,15 +10,17 @@ Quick 自动化建站平台（Site Builder）：业务人员在任意支持 Skil
 （身份源可换成任意能给 email claim 的 Cognito 联邦 IdP）。
 
 **当前状态**：一期已在真实 AWS 全量部署并端到端验证（两条客户端通道都走通）。
-二期需求清单在 `docs/phase2-requirements.md`。部署手册 `site-builder/DEPLOY.md`
-含全部实测坑；一期实现的任务级审查记录在 `.superpowers/sdd/progress.md`。
+**二期 M1+M2（身份与权限）已部署；M3（控制台）Task 1-13 与 15 已完成并真机
+部署，Task 14（前端移植）与 16（回归+文档）未做**——接手前先按文末「文档地图」
+的「二期 M3 进行中」三个文件读一遍。二期需求清单在 `docs/phase2-requirements.md`。
+部署手册 `site-builder/DEPLOY.md` 含全部实测坑。
 
 ## 测试命令（有坑，别猜）
 
 每个包的 venv 归属不同，照抄下面的组合（三个例外都验证过）：
 
 ```bash
-cd site-builder/contract && .venv/bin/pytest tests -q        # 67 tests
+cd site-builder/contract && .venv/bin/pytest tests -q        # 107 tests
 cd site-builder/auth     && ../contract/.venv/bin/pytest tests -q   # auth 无自己的 venv，借 contract 的——含 pyjwt 与 boto3；重建该 venv 后两者都要手工重装
 cd router/infrastructure/lambda && ../../../site-builder/deployer/.venv/bin/pytest . -q  # 23 tests；router 的 .venv 只有 CDK 依赖没有 pytest，借 deployer 的（含 boto3）
 cd site-builder/deployer && .venv/bin/pytest tests -q        # 必须指定 tests/——裸 pytest 会误收集 infra/cdk.out 里的 asset 副本
@@ -143,4 +145,18 @@ python3 site-builder/scripts/gen_onboarding.py
 | 合同细节（给站点生成方） | `site-builder/skills/site-builder/references/{contract,redlines}.md` |
 | 一期设计决策与范围 | `docs/superpowers/specs/2026-07-21-quick-site-builder-design.md`（已实现快照，勿改） |
 | 二期需求 | `docs/phase2-requirements.md` |
-| 任务级实现/审查历史 | `.superpowers/sdd/progress.md` |
+| 任务级实现/审查历史（一期） | `.superpowers/sdd/progress.md` |
+
+**二期 M3（控制台）进行中——新会话从这里开始**（三个文件都 gitignored，
+含真实账号/资源值，**不要 `git add -f`**）：
+
+| 顺序 | 文件 | 内容 |
+|---|---|---|
+| 1 | `docs/design/HANDOFF-2026-08-07.md` **更新 8** | 当前状态真源：进度、部署结果、闸门数字 |
+| 2 | `docs/design/M3-FINDINGS.md` | **实测发现与结论汇总**。§2 是本轮七次"守卫看着有效其实什么都没盯"的清单 + 可复用自查清单；§5 是 Task 14/16 的具体交接 |
+| 3 | `.superpowers/sdd/2026-08-08-phase2-m3-console/progress.md` | 逐任务证据链（比 git log 详细） |
+
+计划在 `docs/superpowers/plans/2026-08-08-phase2-m3-console.md`（Task 1-16 全部
+逐步骤展开）。**Task 1-13 与 15 已完成并真机部署，Task 14/16 未做。**
+`git log origin/master..HEAD` 是最可靠的事实（33 个提交未 push，用户指示
+commit 即可、暂不 push）。
