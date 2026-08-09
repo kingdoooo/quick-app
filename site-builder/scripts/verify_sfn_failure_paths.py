@@ -13,9 +13,11 @@ F/G 两段验的是 SFN **终态收敛**（`reconcile_job` 的两层）：状态
 不到，只能靠 EventBridge 实时层 + sweeper 定时层兜底。这两层只有真机能验——
 事件投递与 DescribeExecution 都不是本地能造出来的。
 
-只碰一次性探针数据（job_id 前缀 `job-sfnprobe-`），不动真实 job 与站点；
-StopExecution **只打在本脚本自己起的探针 execution 上**（stop_probe_execution
-里有"前缀 + 本轮 probe_jobs"双重断言，是可执行闸门而不是注释）。
+只碰一次性探针数据（job_id 前缀 `job-sfnprobe-`），不动真实 job 与站点。
+两处写操作各有**唯一入口 + 可执行闸门**（不是注释约定）：
+  · StopExecution → stop_probe_execution（前缀 + 本轮 probe_jobs 双重检查）
+  · 改 job 行     → probe_update（只允许本轮 probe_jobs 里的 job_id）
+用 raise 而非 assert，`python -O` 下也不会被剔除。
 用法：
     ./verify_sfn_failure_paths.py
     ./verify_sfn_failure_paths.py --keep    # 保留探针数据
@@ -221,8 +223,9 @@ def main() -> int:
     # check 的内容（终止执行对应的 job 不停在 RUNNING），它已覆盖这些执行。
     #
     # **不能保留原来的"存在 TIMED_OUT/ABORTED 即 FAIL"**：本脚本 F 段自己就会
-    # 造 ABORTED 探针执行，于是第二次运行必然红——那是脚本自我否定，不是缺陷
-    # （2026-08-09 实机踩到：F 段跑完后 A 段开始报 {'ABORTED': 2}）。
+    # 造 ABORTED 探针执行，那条判据会让**下一次**运行必然红——脚本自我否定，
+    # 不是缺陷。（探针 job 行跑完就删，但 execution 记录会留在 SFN 历史里，
+    # list_executions 仍看得到；90 天后过期。）
     uncaught = {s: n for s, n in by_status.items()
                 if s in ("TIMED_OUT", "ABORTED")}
     if uncaught:
@@ -235,11 +238,8 @@ def main() -> int:
     print("\n── B StartExecution 失败 → job 退回 PENDING，可重试 ────")
     jid = new_probe_job(f"sfnprobe-{SUFFIX}")
     # 直接驱动回滚函数：它是失败处置的唯一入口
-    ddb.update_item(TableName=jobs_t, Key={"job_id": {"S": jid}},
-                    UpdateExpression="SET #s = :r, phase = :q",
-                    ExpressionAttributeNames={"#s": "status"},
-                    ExpressionAttributeValues={":r": {"S": "RUNNING"},
-                                               ":q": {"S": "queued"}})
+    probe_update(jid, "SET #s = :r, phase = :q", {"#s": "status"},
+                 {":r": {"S": "RUNNING"}, ":q": {"S": "queued"}})
     server._rollback_job_to_pending(jid)
     check(job_of(jid).get("status") == "PENDING",
           "刚置 RUNNING/queued 的 job 可被回滚成 PENDING",
@@ -248,11 +248,8 @@ def main() -> int:
     # ---------- C. 回滚不得踩掉真在推进的部署 ----------
     print("\n── C 回滚条件足够窄：已推进的 job 不受影响 ─────────")
     jid2 = new_probe_job(f"sfnprobe-{SUFFIX}")
-    ddb.update_item(TableName=jobs_t, Key={"job_id": {"S": jid2}},
-                    UpdateExpression="SET #s = :r, phase = :p",
-                    ExpressionAttributeNames={"#s": "status"},
-                    ExpressionAttributeValues={":r": {"S": "RUNNING"},
-                                               ":p": {"S": "validate"}})
+    probe_update(jid2, "SET #s = :r, phase = :p", {"#s": "status"},
+                 {":r": {"S": "RUNNING"}, ":p": {"S": "validate"}})
     server._rollback_job_to_pending(jid2)
     j2 = job_of(jid2)
     check(j2.get("status") == "RUNNING" and j2.get("phase") == "validate",
@@ -260,12 +257,10 @@ def main() -> int:
           f"status={j2.get('status')} phase={j2.get('phase')}")
 
     jid3 = new_probe_job(f"sfnprobe-{SUFFIX}")
-    ddb.update_item(TableName=jobs_t, Key={"job_id": {"S": jid3}},
-                    UpdateExpression="SET #s = :s, phase = :p, #u = :u",
-                    ExpressionAttributeNames={"#s": "status", "#u": "url"},
-                    ExpressionAttributeValues={
-                        ":s": {"S": "SUCCEEDED"}, ":p": {"S": "done"},
-                        ":u": {"S": "https://probe.invalid/"}})
+    probe_update(jid3, "SET #s = :s, phase = :p, #u = :u",
+                 {"#s": "status", "#u": "url"},
+                 {":s": {"S": "SUCCEEDED"}, ":p": {"S": "done"},
+                  ":u": {"S": "https://probe.invalid/"}})
     server._rollback_job_to_pending(jid3)
     check(job_of(jid3).get("status") == "SUCCEEDED",
           "已 SUCCEEDED 的 job → 回滚是 no-op（终态不被覆盖）")
@@ -308,99 +303,112 @@ def main() -> int:
     print("\n── F 实时层：EventBridge → reconciler 收敛 ABORTED ────")
     # **绝不 Stop 任何真实生产部署**：StopExecution 只经 stop_probe_execution
     # （前缀 + 本轮 probe_jobs 双闸门，用 raise 不用 assert）。
-    probe_recon = new_probe_job(f"sfnprobe-{SUFFIX}")
-    # phase 刻意用 package（**不是 queued**）：证明任意 phase 都能收敛，
-    # 即没有照抄 _rollback_job_to_pending 的 phase=queued 条件。
-    probe_update(probe_recon, "SET #s = :r, phase = :p", {"#s": "status"},
-                 {":r": {"S": "RUNNING"}, ":p": {"S": "package"}})
-    def abort_probe_execution(job_id: str, attempts: int = 3):
-        """起一条探针 execution 并把它停成 ABORTED，返回 (ex_arn, status)。
+    def abort_probe_execution(attempts: int = 4) -> tuple[str, str | None]:
+        """造出"execution 已终态、job 仍 RUNNING"的探针。
 
-        **必须校验真的到了 ABORTED 才能继续断言收敛**——这是本段的前置条件，
-        不是可以假设的背景。实测（2026-08-09）：Validate 在缺字段时约 300ms
-        就失败，start 后立刻 stop 仍有约 1/4 概率抢不过它，执行终态变成
-        **FAILED**；而 rule 只匹配 TIMED_OUT/ABORTED，于是根本没有事件投递，
-        reconciler 未被触发——此时若直接断言"job 应为 FAILED"，
-        断言会因为 MarkFailed 抢先写入而"通过"，验的却不是 reconciler。
-        所以：赢不到这场竞速就重试；重试仍失败就如实报告无法验证。
+        返回 (job_id, execution 终态)；execution 完全没起来时终态为 None。
+        调用方**按终态分别把门**（两层的前提不同，不能共用一个布尔）：
+          · F（实时层）要 ABORTED —— rule 只匹配 TIMED_OUT/ABORTED；
+          · G（兜底层）任何终态都行 —— sweeper 按 DescribeExecution 收敛
+            FAILED/TIMED_OUT/ABORTED 三者。
+
+        每次尝试都**新建一条探针 job 并让 execution 与它同名**（execution name
+        == job_id 是平台既有不变量，reconciler 正是靠它从 ARN 反推 job_id）。
+        重试必须连 job 行一起换，不能只给执行名加后缀：那样名字与 job 行对不上，
+        reconciler 会去收敛一个不存在的 job（返回 absent），断言随即失败，
+        看起来像"收敛坏了"，其实是探针自己搭错了。
+
+        竞速：探针 input **刻意不含 job_id**，于是 Validate 第一行
+        `event["job_id"]` 立即 KeyError；add_catch 转到 MarkFailed，而 mark_job
+        同样读 event["job_id"]，也 KeyError——**没有任何写入者会碰探针行**，
+        error 文案的归属因此不会被混淆（这正是 F 段第三条断言的立足点）。
+        代价是这条执行失败得很快，start 之后立刻 stop 未必抢得到；抢不到时终态
+        是 FAILED 而非 ABORTED，rule 不匹配 FAILED，实时层就没有事件可验。
+        故最多试 attempts 次，仍拿不到 ABORTED 就如实报"无法验证"，
+        绝不退化成宽松断言。
+
+        （反过来说，input 里放 job_id 会让 Validate 把 phase 改成 validate、
+        让 MarkFailed 把 status 写成 FAILED——F 段三条断言都变成在验别的写入者。
+        别"顺手补上"这个字段。）
         """
         st = None
+        jid = ""
         for i in range(attempts):
-            name = job_id if i == 0 else f"{job_id}-r{i}"
+            jid = new_probe_job(f"sfnprobe-{SUFFIX}")
+            # phase 刻意用 package（**不是 queued**）：证明任意 phase 都能收敛，
+            # 即没有照抄 _rollback_job_to_pending 的 phase=queued 条件。
+            probe_update(jid, "SET #s = :r, phase = :p", {"#s": "status"},
+                         {":r": {"S": "RUNNING"}, ":p": {"S": "package"}})
             try:
                 arn = sfn.start_execution(
-                    stateMachineArn=sm_arn, name=name,
-                    # **input 里刻意不放 job_id**：万一竞速失败、执行走到
-                    # add_catch → MarkFailed，它读 event["job_id"] 会直接
-                    # KeyError 而碰不到探针行，于是"谁写的"不会被混淆。
+                    stateMachineArn=sm_arn, name=jid,
                     input=json.dumps({"probe": SUFFIX}))["executionArn"]
             except botocore.exceptions.ClientError as e:
-                check(False, "起探针 execution 失败（F 段无法验证）",
+                # 起不来就如实记一项失败并返回，让调用方跳过后续断言，
+                # 而不是抛异常中断整个脚本（cleanup 必须照常跑）。
+                check(False, "起探针 execution 失败（F/G 段无法验证）",
                       e.response["Error"]["Code"])
-                return None, None
-            # 重试用的名字（job_id-r1/-r2）不在 probe_jobs 里，先登记再停，
-            # 这样 stop_probe_execution 的"本轮 probe_jobs"闸门与 cleanup
-            # 的删除都能覆盖它。
-            probe_jobs.add(arn.rsplit(":", 1)[-1])
-            stop_probe_execution(arn)   # 两道硬闸门在该函数内（用 raise 不用 assert）
+                return jid, None
+            stop_probe_execution(arn)   # 两道硬闸门在该函数内（raise，不用 assert）
             for _ in range(20):
                 st = sfn.describe_execution(executionArn=arn)["status"]
                 if st != "RUNNING":
                     break
                 time.sleep(1)
             if st == "ABORTED":
-                return arn, st
-            print(f"  ⓘ 第 {i + 1} 次探针执行终态是 {st}（抢不过 Validate 的"
-                  "快速失败），换名字重试")
-        return None, st
+                return jid, st
+            print(f"  ⓘ 第 {i + 1} 次探针执行终态是 {st}（没抢在 Validate 快速"
+                  f"失败之前停下）"
+                  + ("，换一条探针重试" if i + 1 < attempts else "，不再重试"))
+        return jid, st
 
-    # execution name == job_id 是平台既有不变量（幂等设计），reconciler 正是
-    # 靠它从 execution ARN 反推 job_id。竞速与安全闸门都在这个 helper 里。
-    ex_arn, ex_status = abort_probe_execution(probe_recon)
-    if ex_arn is None and ex_status is not None:
-        # 三次都抢不过 Validate 的快速失败：如实报"无法验证"，
-        # **不要**退化成"断言 job 是 FAILED"——那条断言会被 MarkFailed 满足，
+    probe_recon, ex_status = abort_probe_execution()
+    if ex_status is not None and ex_status != "ABORTED":
+        # 没抢到 ABORTED：如实报"无法验证实时层"，**不要**退化成
+        # "断言 job 是 FAILED"——那条断言可能由别的写入者满足，
         # 读起来像通过而 reconciler 根本没跑。
-        check(False, "探针执行未能进入 ABORTED（F 段无法验证 reconciler）",
+        check(False, "探针执行未能进入 ABORTED（F 段无法验证实时层）",
               f"最后一次终态={ex_status}；rule 只匹配 TIMED_OUT/ABORTED")
 
-    if ex_arn:
+    if ex_status == "ABORTED":
         converged = poll_job_status(probe_recon, "FAILED", timeout_s=120)
         check(converged, "EventBridge reconciler 把 ABORTED 收敛成 FAILED",
-              f"job={probe_recon}，execution 终态={ex_status}")
+              f"job={probe_recon}")
         j = job_of(probe_recon)
         check(j.get("phase") == "package",
               "收敛保留最后 phase（非 queued 也能收敛）",
               f"phase={j.get('phase')}")
-        # **必须断言是 reconciler 写的那一份文案，不能只断言"非空且不含 ARN"**：
-        # 探针输入缺 site_id 会让 Validate 抛错 → add_catch → MarkFailed 抢先把
-        # job 写成 FAILED，error 是 SFN 的原始 Cause（形如
-        # {"errorMessage": "'site_id'", ...}）。那种情况下宽松断言照样 PASS，
-        # 而 reconciler 其实**根本没被验证**——收敛与否都看不出来
-        # （2026-08-09 实机实测到这一路径：同一条检查两次运行分别命中两个写入者）。
-        # 判据改为逐字匹配 reconcile_job 的固定文案。
+        # **逐字匹配 reconciler 的固定文案，不能只断言"非空且不含 ARN"**：
+        # 宽松判据下，任何把 error 写成非空的写入者都能让这条 PASS，
+        # reconciler 究竟有没有收敛就看不出来了。文案从 reconcile_job 取
+        # （收敛语义的唯一定义），不在本脚本复制字面量——否则改文案时这里会
+        # 悄悄失配成红，或更糟：判据与实现各说各话。
         err = j.get("error", "")
-        from reconcile_job import ABORT_ERROR, TIMEOUT_ERROR
-        is_recon_copy = err in (ABORT_ERROR, TIMEOUT_ERROR)
+        expected = (reconcile_job.ABORT_ERROR, reconcile_job.TIMEOUT_ERROR)
+        is_recon_copy = err in expected
         check(is_recon_copy and "arn:aws" not in err,
               "error 是 reconciler 的固定文案（不含 ARN，且证明确由它写入）",
-              f"error={err[:60]}…" if not is_recon_copy else "逐字匹配 ABORT_ERROR")
+              "逐字匹配 ABORT_ERROR/TIMEOUT_ERROR" if is_recon_copy
+              else f"非 reconciler 文案: {err[:60]}")
 
     # ---------- G. 兜底层：周期 sweeper ----------
     print("\n── G 兜底层：sweeper 收敛\"执行已终态、job 仍 RUNNING\" ──")
-    if ex_arn:
-        # 造出缺口本身：execution 已 ABORTED，把 job 改回 RUNNING，
-        # 并把 updated_at 回拨到超龄阈值（STALE_MINUTES=45）之前——
-        # 不回拨的话 sweeper 会正确地跳过它，那样验的就不是收敛能力。
+    # 这一层的前提比 F 宽：sweeper 按 DescribeExecution 的真实状态收敛
+    # FAILED/TIMED_OUT/ABORTED 三者，所以上面竞速输了（终态 FAILED）也能验。
+    if ex_status in ("ABORTED", "FAILED", "TIMED_OUT"):
+        # 造出缺口本身：execution 已终态，把 job 改回 RUNNING，并把 updated_at
+        # 回拨到超龄阈值（STALE_MINUTES=45）之前——不回拨的话 sweeper 会
+        # **正确地**跳过它，那样验的就不是收敛能力而是"什么都没发生"。
         probe_update(probe_recon, "SET #s = :r, updated_at = :old",
                      {"#s": "status"},
                      {":r": {"S": "RUNNING"}, ":old": {"S": stale_iso(90)}})
         swept = invoke_sweeper()      # 内部查 FunctionError，异常不会伪装成"没收敛"
         check(poll_job_status(probe_recon, "FAILED", timeout_s=60),
               "sweeper 收敛 execution 已终态但 job 仍 RUNNING 的缺口",
-              f"job={probe_recon}，sweeper 自报 {swept}")
+              f"job={probe_recon}，execution 终态={ex_status}，sweeper 自报 {swept}")
     else:
-        check(False, "sweeper 收敛验证未执行（F 段的探针执行没起来）")
+        check(False, "sweeper 收敛验证未执行（探针 execution 没起来）",
+              f"execution 终态={ex_status}")
 
     # 未超龄的 RUNNING 不能被动——否则正在跑的真实部署会被误杀成 FAILED
     fresh = new_probe_job(f"sfnprobe-{SUFFIX}")
@@ -453,17 +461,20 @@ if __name__ == "__main__":
         failed = sum(1 for ok, _, _ in results if not ok)
         left = cleanup(_region, _keep and failed > 0)
         # 下限存在的理由：脚本中途崩溃/凭证失效时 results 会很短，
-        # 而"0/0 项通过"读起来像成功（2026-08-08 实际踩过）。
+        # 而"0/0 项通过"读起来像成功。
         #
-        # **11 是全绿运行的实测产出**，不是 check() 的静态个数（15）——
-        # 有 4 处是互斥分支或条件触发，全绿时只有一侧会执行：
-        #   A 第 2 项  仅当历史上存在 TIMED_OUT/ABORTED 才 check（现在没有）
+        # 11 = **全绿路径应产出的条数**，不是 check() 的静态个数（15）：
+        # 有 4 处是互斥分支或只在故障时触发，全绿时不执行——
+        #   A 第 2 项  已改成 print（TIMED_OUT/ABORTED 不再算缺陷，见 A 段注释）
         #   D 两项     start 成功 / ExecutionAlreadyExists 二者只中一个
-        #   F 第 1 项  仅当探针 execution 起不来才 check(False)
-        #   G 第 2 项  仅当 F 段没起来才 check(False)
+        #   F 起执行失败、F 未拿到 ABORTED、G 探针没起来：三条都是 check(False)
         # 全绿明细：A1 + B1 + C2 + D1 + E1 + F3 + G2 = 11。
-        # 改动本脚本增删 check 时同步这个数——**照抄计划里的"12"是错的**
-        # （计划按静态条数估算，实测为 11；2026-08-09 实机核对）。
+        #
+        # 该数由**读代码逐段推算**得出（本文件作者未跑真机；计划书里写的 12 是
+        # 按静态条数估的，与分支结构不符）。首次真机运行若不是 11，
+        # 以实跑为准并回来更正这段说明。
+        # 另注：D 段在"状态机从未有已结束执行"的空账号上产出 0 项，
+        # 那种情况下即使一切正常也会触发下限——属预期（无历史即无法验 D）。
         MIN_CHECKS = 11
         print()
         if len(results) < MIN_CHECKS:
