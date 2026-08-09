@@ -11,7 +11,10 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 VENV="${1:-/tmp/sb-mcp-locked-venv}"
 PY="${PYTHON:-python3.13}"        # 与 Dockerfile 基础镜像一致
-command -v "$PY" >/dev/null || { echo "找不到 $PY（Dockerfile 基础镜像是 3.13，版本不一致时解析出的依赖集合可能不同）"; exit 1; }
+# `${PY}` 的花括号必需：紧跟的是全角括号，裸 $PY 会把它的首字节吃进变量名，
+# `set -u` 下当场 `unbound variable`——于是"找不到 python3.13"这个本该给出
+# 明确指引的分支，反而报成一个看不懂的 shell 错误（实测确认）。
+command -v "$PY" >/dev/null || { echo "找不到 ${PY}（Dockerfile 基础镜像是 3.13，版本不一致时解析出的依赖集合可能不同）"; exit 1; }
 
 # **venv 复用必须凭指纹，不能凭"pytest 存在"**：旧 venv 里有可执行 pytest
 # 不代表它装的是当前 lock 的版本——那样"锁定测试"会在旧依赖下全绿（实测过：
