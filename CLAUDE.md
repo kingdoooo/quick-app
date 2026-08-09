@@ -146,7 +146,6 @@ python3 site-builder/scripts/gen_onboarding.py
 | 一期设计决策与范围 | `docs/superpowers/specs/2026-07-21-quick-site-builder-design.md`（已实现快照，勿改） |
 | 二期需求 | `docs/phase2-requirements.md` |
 | 任务级实现/审查历史（一期） | `.superpowers/sdd/progress.md` |
-
 | 二期进度 / 当前在做什么 | `docs/design/HANDOFF-2026-08-07.md` 的**最新一节**（状态真源，gitignored） |
 | 二期实测发现与结论 | `docs/design/M3-FINDINGS.md`（gitignored；含可复用的断言自查清单） |
 | 二期任务级证据链 | `.superpowers/sdd/<计划日期>-<计划名>/progress.md` |
