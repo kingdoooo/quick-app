@@ -26,6 +26,65 @@ def cfg():
     return c
 
 
+# ---- fixture 自动清理（spec §11-pre.3）----
+#
+# **本次运行创建的 site_id 逐个记账**，清理只碰这些。绝不按 owner 批量删：
+# 试点环境里有长期存在的真站点，它们的 owner 恰好也是跑测试的这个人，
+# 按 owner 清理会把它们一起下线（purge_data 更是不可恢复）。
+#
+# **清理失败 = 测试失败**：静默泄漏比红更糟——没人会去看"绿了但留下 7 个
+# 站点"，而残留会干扰下一轮（本项目的 verify 脚本已因残留探针自我否定过一次）。
+_created_site_ids: list[str] = []
+
+
+def _record_created(url: str) -> str:
+    """从站点 URL 记账 site_id，返回它。"""
+    site_id = url.split("//app-")[1].split(".")[0]
+    if site_id not in _created_site_ids:
+        _created_site_ids.append(site_id)
+    return site_id
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _cleanup_created_sites():
+    """module 级 autouse：跑完把本次部署的站点全部下线 + 清数据。
+
+    autouse 是有意的——靠每个用例记得调用清理一定会漏（而漏掉的那次正好是
+    失败退出的那次）。
+    """
+    yield
+    if os.environ.get("SB_KEEP_FIXTURES"):
+        print(f"\nSB_KEEP_FIXTURES：保留 {_created_site_ids}")
+        return
+    import common
+    import permissions        # noqa: F401  确保表名环境变量一致的依赖已就位
+    leaked, errors = [], []
+    for site_id in list(_created_site_ids):
+        try:
+            job_id = f"job-e2e-cleanup-{site_id[-6:]}"
+            common._table("JOBS_TABLE").put_item(Item={
+                "job_id": job_id, "site_id": site_id, "owner": "e2e@cleanup",
+                "status": "PENDING", "phase": "submitted", "error": "", "url": "",
+                "created_at": common._now(), "updated_at": common._now()})
+            # purge_data=True：留下 DynamoDB 表 / DSQL schema 会持续计费，
+            # 也会让下一轮的同名探针数据串味
+            boto3.client("lambda", region_name="us-east-1").invoke(
+                FunctionName="site-deployer-undeploy",
+                Payload=json.dumps({"job_id": job_id, "site_id": site_id,
+                                    "purge_data": True}).encode())
+            # 强一致读回：invoke 返回 200 不等于站点真的下线了
+            site = common.get_site_consistent(site_id)
+            if site and site.get("status") != "DELETED":
+                leaked.append(site_id)
+        except Exception as e:      # noqa: BLE001  汇总后统一失败，不吞
+            errors.append(f"{site_id}: {type(e).__name__}: {e}")
+    if errors or leaked:
+        raise AssertionError(
+            "fixture 清理未完成——**资源已泄漏，必须手工处理**。\n"
+            f"  未确认删除: {leaked}\n  清理报错: {errors}\n"
+            "（要保留现场排查请设 SB_KEEP_FIXTURES=1 重跑）")
+
+
 @pytest.fixture(scope="module")
 def session_cookie(cfg):
     """合成一个**能通过 Edge 全部检查**的会话 cookie。
@@ -107,6 +166,9 @@ def _deploy(fixture: str) -> str:
     job = json.loads(r.stdout[start:])
     url = job.get("url")
     assert url, f"job 无 url 字段: {job}"
+    # **记账在 return 之前**：任何后续断言失败时清理仍能找到这个站点。
+    # 放在调用方记账会漏掉"部署成功但第一条断言就失败"的那条路径。
+    _record_created(url)
     return url
 
 
