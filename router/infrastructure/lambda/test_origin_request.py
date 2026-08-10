@@ -23,11 +23,13 @@ ROUTE = {"subdomain": "app-demo1", "site_id": "demo1", "route_mode": "split",
          "require_auth": False, "allowed_users": "org", "owner": "a@x.com"}
 
 
-def _event(host="app-demo1.example.com", uri="/", method="GET", cookie=None, body=None):
+def _event(host="app-demo1.example.com", uri="/", method="GET", cookie=None, body=None,
+           querystring=""):
     headers = {"host": [{"key": "Host", "value": host}]}
     if cookie:
         headers["cookie"] = [{"key": "Cookie", "value": cookie}]
-    req = {"uri": uri, "querystring": "", "method": method, "headers": headers}
+    req = {"uri": uri, "querystring": querystring, "method": method,
+           "headers": headers}
     if body is not None:
         req["body"] = body
     return {"Records": [{"cf": {"request": req}}]}
@@ -96,3 +98,38 @@ def test_truncated_body_returns_413(mock_lookup):
 def test_edge_fails_closed_on_exception(mock_lookup):
     resp = orq.lambda_handler(_event(), None)
     assert resp["status"] == "500"  # 绝不透传原请求
+
+
+# ── query string 脱敏（Codex 审查 2026-08-10 P2-3）─────────────────────
+# 真机证据：Edge 日志里已经存着明文 Cognito OAuth code
+#   ap-northeast-1 2026-08-03  "Fixed querystring: code=ab27...&state=eyJ..."
+# 认证材料（OAuth code / console upgrade code）绝不能整值进长期日志。
+
+def test_redact_querystring_keeps_names_drops_values():
+    """脱敏后：参数名可见、值不可见（只留长度）。"""
+    out = orq._redact_querystring(
+        "code=ab279620-f66e-4091-8bd9-ba09e54774b2&state=eyJyIjoiaHR0cHMifQ")
+    assert "ab279620" not in out and "f66e" not in out
+    assert "eyJyIjoiaHR0cHMifQ" not in out
+    assert "code" in out and "state" in out
+
+
+def test_redact_querystring_handles_empty_and_valueless():
+    assert orq._redact_querystring("") == ""
+    assert "flag" in orq._redact_querystring("flag")
+
+
+@patch.object(orq, "_lookup_route", return_value=dict(ROUTE))
+@patch.object(orq, "_add_sigv4_auth")
+def test_no_log_line_contains_raw_query_value(mock_sig, mock_lookup, caplog):
+    """**整条 query 值不得出现在任何日志行里**（两个 INFO 点都覆盖）。
+
+    按整行断言而非逐字段：换个 f-string 写法就能绕过字段级断言。
+    """
+    secret = "ab279620-f66e-4091-8bd9-ba09e54774b2"
+    import logging as _l
+    with caplog.at_level(_l.INFO):
+        orq.lambda_handler(_event(uri="/api/session-callback",
+                                  querystring=f"code={secret}"), None)
+    joined = "\n".join(r.getMessage() for r in caplog.records)
+    assert secret not in joined, f"认证材料整值进了日志:\n{joined}"

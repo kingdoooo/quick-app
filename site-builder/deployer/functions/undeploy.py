@@ -104,8 +104,40 @@ def _purge_dsql(site_id: str) -> str:
 
 
 def handler(event, context):
+    """下线的顶层。**必须收敛到终态**（Codex 审查 2026-08-10 P1-4）。
+
+    没有顶层 try 的时候，中途任一步失败会留下这个状态（实测复现）：
+        job=RUNNING/phase=undeploy、route=已删除、site=ACTIVE
+    即站点已经打不开、控制台却显示正常、任务永远转圈。而 sweeper 救不了它：
+    `reconcile_job.sweeper_handler` 假设每个 RUNNING job 都有一个 SFN
+    execution，undeploy 是独立异步 Lambda，没有 execution，它只会记一条
+    `job_running_without_execution` 然后放着。
+
+    所以失败路径由**本函数自己**负责写终态，再把异常抛出去（异步调用的
+    OnFailure destination 需要它才会触发）。
+    """
+    try:
+        return _undeploy(event, context)
+    except Exception as e:
+        # 终态优先：先让用户/控制台看到确定的结果，再让异常冒出去告警。
+        # 写终态自身失败也不能盖掉原始异常（那才是根因）。
+        try:
+            common.update_job(event["job_id"], status="FAILED",
+                              error=f"下线中途失败，站点可能处于部分删除状态："
+                                    f"{type(e).__name__}: {str(e)[:200]}")
+        except Exception:
+            logger.exception("下线失败后写 job 终态也失败 job_id=%s",
+                             event.get("job_id"))
+        logger.exception("下线失败 site_id=%s", event.get("site_id"))
+        raise
+
+
+def _undeploy(event, context):
     site_id = event["site_id"]
-    common.update_job(event["job_id"], status="RUNNING", phase="undeploy")
+    # kind=undeploy：sweeper 要按 job 类型分流收敛规则（deploy 的 job 有 SFN
+    # execution 可核对，undeploy 的没有）。
+    common.update_job(event["job_id"], status="RUNNING", phase="undeploy",
+                      kind="undeploy")
 
     boto3.client("dynamodb").delete_item(
         TableName=os.environ["ROUTING_TABLE"],
@@ -159,17 +191,36 @@ def handler(event, context):
                 logger.warning(f"DSQL 清理失败: {e}")
                 purged["dsql_error"] = str(e)[:200]
 
+    # **"站点已下线"与"数据已清除"是两件事**（Codex 审查 2026-08-10 P1-3）。
+    # 站点确实下线了（路由/Lambda/前端都删了），所以 site 写 DELETED；
+    # 但 purge 失败时 job **不能**报 DELETED——undeploy 是异步调用，返回值里的
+    # dynamodb_error/dsql_error 没有任何人看得到，用户在控制台看到的是
+    # "已下线"，而他刚才勾的是"永久删除数据"。
+    #
+    # 用 PURGE_FAILED 而不是 FAILED：站点真的下线了，报 FAILED 会让前端显示
+    # "下线失败"，那是另一个方向的谎（用户会以为 URL 还活着）。
+    purge_errors = {k: v for k, v in purged.items() if k.endswith("_error")}
     common.upsert_site(site_id, status="DELETED")
-    common.update_job(event["job_id"], status="DELETED")
+    if purge_errors:
+        # 摘要落在 job 上：这是用户唯一能看到的地方
+        detail = "；".join(f"{k.removesuffix('_error')}: {v}"
+                          for k, v in sorted(purge_errors.items()))
+        common.update_job(event["job_id"], status="PURGE_FAILED",
+                          error=f"站点已下线，但数据清理未全部完成：{detail}。"
+                                f"请联系平台管理员确认残留数据。")
+    else:
+        common.update_job(event["job_id"], status="DELETED")
     # 审计（spec §5.5）：下线是不可恢复动作，purge_data 更是——必须留痕。
     # actor 取 job 的发起者（jobs.owner = requested_by），SFN 侧没有别的身份。
     # 落在最后：审计的是"确实完成了"，中途失败会走异常路径不落 ok。
     job = common.get_job(event["job_id"]) or {}
     ops_log.record(actor=job.get("owner", ""), action="undeploy",
-                   target=f"site:{site_id}", result="ok",
+                   target=f"site:{site_id}",
+                   result="partial" if purge_errors else "ok",
                    detail={"purge_data": bool(event.get("purge_data")),
                            "purged": sorted(purged) if purged else []})
-    result = {"job_id": event["job_id"], "status": "DELETED"}
+    result = {"job_id": event["job_id"],
+              "status": "PURGE_FAILED" if purge_errors else "DELETED"}
     if purged:
         result["purged"] = purged
     return result

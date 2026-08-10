@@ -81,9 +81,14 @@ email =
 [Panel]
 ops_log_table = site-ops-log
 session_codes_table = site-session-codes
-# 前端静态资源的版本前缀：S3 platform/console/{console_version}/
-# 每次前端改动递增，旧版本保留以便回滚（与站点前端的版本化上传同模式）。
-console_version = v1
+# 前端静态资源的版本前缀：S3 platform/console/{version}/
+# **留空（推荐）**：版本段自动取前端产物的内容指纹，改了前端就是新前缀，
+# 不依赖人记得递增。前缀不可变——deploy_panel 拒绝往已发布且内容不同的前缀
+# 写入，旧版本因此留存，回滚 = 把 console route 的 static_prefix 指回旧前缀。
+# 只在**手工回滚到某个已知前缀**时才填具体值（如 a1b2c3d4e5f6）。
+# 历史：这里曾固定为 v1，导致每次前端修复都原地覆盖、旧产物不可恢复
+# （桶未开版本控制），"可回滚"只是接口能力（Codex 审查 2026-08-10 P2-2）。
+console_version =
 
 # ── API Key（二期 M4，**可选组件**）─────────────────────────────────
 # **整段不配置 = 平台只允许 OAuth 一条认证路径**，这是推荐的默认。

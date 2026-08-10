@@ -25,6 +25,7 @@ Function URL（AWS_IAM，仅授权 edge role）→ 上传前端到版本化 S3 �
 """
 import argparse
 import configparser
+import hashlib
 import io
 import json
 import os
@@ -81,8 +82,35 @@ def console_host() -> str:
     return f"console.{_base_domain()}"
 
 
+def frontend_content_version() -> str:
+    """前端产物的内容指纹（12 位 hex），用作版本段。
+
+    为什么不是 config 里的 `console_version = v1`（Codex 审查 2026-08-10
+    P2-2）：那个值没人会记得改，于是每次前端修复都传到同一个 `v1/` 前缀里
+    **原地覆盖**。真机核对过：`platform/console/` 下只有 v1 的三个对象，且
+    桶未开版本控制——旧内容不可恢复，"可回滚"是句空话。
+
+    改成由内容推导后，"改了前端"与"换了前缀"变成同一件事，不依赖人的记性。
+    指纹覆盖**文件相对路径 + 内容**：只哈希内容会让"重命名文件"得到同一个
+    版本；带上路径才能反映出增删改名。
+    """
+    src = HERE / "frontend"
+    h = hashlib.sha256()
+    for path in sorted(p for p in src.rglob("*") if p.is_file()):
+        h.update(str(path.relative_to(src)).encode())
+        h.update(b"\0")
+        h.update(path.read_bytes())
+        h.update(b"\0")
+    return h.hexdigest()[:12]
+
+
 def frontend_prefix(version: str | None = None) -> str:
-    """S3 里前端资源的版本化前缀。旧版本保留以便回滚（同站点前端模式）。
+    """S3 里前端资源的版本化前缀。
+
+    版本段默认是**内容指纹**（见 frontend_content_version），所以每个前缀
+    一旦发布就**不可变**（immutable）：`upload_frontend` 拒绝往已存在且内容
+    不同的前缀里写。旧版本因此自然留存，回滚 = 把 route 的 static_prefix
+    指回旧前缀。**这不是靠 S3 版本控制**——那个桶没开。
 
     **不带尾斜杠**，与 `register_route.py` 写站点 `static_prefix` 的形态一致
     （`sites/{site_id}/{job_id}`）。Edge 的静态改写是
@@ -93,7 +121,9 @@ def frontend_prefix(version: str | None = None) -> str:
     `tests/test_frontend_contract.py::test_edge_static_key_matches_what_deploy_panel_uploads`
     用**真实 Edge 代码**逐字符比对两边的 key。
     """
-    v = version or _cfg("Panel", "console_version", "v1")
+    # config 的 console_version 仍可作为**显式覆盖**（回滚到手工指定的前缀），
+    # 但默认不再用它——留空即走内容指纹。
+    v = version or _cfg("Panel", "console_version", "") or frontend_content_version()
     return f"platform/console/{v}"
 
 
@@ -193,9 +223,36 @@ def role_statements() -> list[dict]:
     ]
 
 
-def lambda_environment() -> dict:
-    """Lambda 环境变量。**只有参数名，没有明文密钥**（见模块 docstring）。"""
+def edge_role_id(edge_role_arn: str) -> str:
+    """Edge 执行角色的 **RoleId**（`AROA...`），给 handler 校验调用者用。
+
+    为什么需要它而不能直接用 ARN（Codex 审查 2026-08-10 P1-1）：Edge 调过来
+    的身份是 STS assumed-role 形态，`callerId` 是 `{RoleId}:{session_name}`，
+    与 config 里的 `arn:aws:iam::<acct>:role/<name>` **永不相等**。真机实测：
+        callerId: AROAX5GBA74KFZAAWDGMT:us-east-1.ApplicationWebRouterStack-...
+    RoleId 由 IAM 分配、STS 填写，调用方不可伪造，是这里唯一稳定的锚点。
+
+    用 get_role 现查而不是让人往 config 里再抄一个值：手抄的第二份真源会漂移
+    （本项目记录过"不变量被手抄多份"这一类缺陷）。
+    """
+    name = (edge_role_arn or "").strip().rsplit("/", 1)[-1]
+    if not name:
+        raise ValueError("edge_role_arn 为空，无法解析 Edge 角色名")
+    role_id = boto3.client("iam").get_role(RoleName=name)["Role"]["RoleId"]
+    if not role_id.startswith("AROA"):
+        raise ValueError(f"解析出的 RoleId 形态不对: {role_id!r}")
+    return role_id
+
+
+def lambda_environment(edge_role_id_value: str = "") -> dict:
+    """Lambda 环境变量。**只有参数名，没有明文密钥**（见模块 docstring）。
+
+    EDGE_ROLE_ID 不是秘密（它是个公开的资源标识，不能用来签发任何东西），
+    但**缺了它 handler 会拒绝所有请求**——见 handler._edge_caller_ok：
+    "配置缺失就不检查"恰好是这个缺陷的原始形态，所以宁可整站拒绝。
+    """
     return {
+        "EDGE_ROLE_ID": edge_role_id_value,
         "JOBS_TABLE": "site-deploy-jobs",
         "SITES_TABLE": "site-sites",
         "ADMINS_TABLE": "site-admins",
@@ -281,9 +338,9 @@ def ensure_role() -> str:
     return arn
 
 
-def ensure_function(role_arn: str, code: bytes) -> str:
+def ensure_function(role_arn: str, code: bytes, edge_role_id_value: str) -> str:
     lam = boto3.client("lambda", region_name=_region())
-    env = {"Variables": lambda_environment()}
+    env = {"Variables": lambda_environment(edge_role_id_value)}
     try:
         lam.get_function(FunctionName=FN_NAME)
         lam.update_function_code(FunctionName=FN_NAME, ZipFile=code)
@@ -330,7 +387,14 @@ def ensure_function(role_arn: str, code: bytes) -> str:
 
 
 def upload_frontend() -> int:
-    """上传 frontend/ 到版本化前缀。返回文件数。"""
+    """上传 frontend/ 到版本化前缀。返回文件数。
+
+    **版本前缀不可变**（Codex 审查 2026-08-10 P2-2）：前缀已存在且内容不同时
+    直接中止。这是"旧版本可回滚"的技术前提——桶没开版本控制，一旦允许覆盖，
+    旧产物就永久消失了（真机核对过：此前 `platform/console/v1/` 被反复覆盖，
+    只剩当前一份）。
+    同前缀同内容仍然放行：那是重跑部署脚本，本脚本的幂等契约不能破。
+    """
     src = HERE / "frontend"
     if not src.exists():
         print("  frontend/ 不存在，跳过（Task 14 才移植视图层）")
@@ -339,6 +403,24 @@ def upload_frontend() -> int:
     bucket = f"site-frontend-{_account()}"
     # frontend_prefix() 不带尾斜杠（见其 docstring），这里显式补一个分隔符。
     prefix = frontend_prefix() + "/"
+
+    # 已存在的对象逐个比 ETag（S3 的 ETag 对非分段上传就是 MD5；本目录都是
+    # 几十 KB 的小文件，不会走分段）。**只要有一个不同就中止**——那说明这个
+    # 前缀已经发布过别的构建，覆盖它等于销毁可回滚的旧版本。
+    existing = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
+    if existing.get("KeyCount"):
+        local = {prefix + str(p.relative_to(src)):
+                 hashlib.md5(p.read_bytes()).hexdigest()
+                 for p in sorted(src.rglob("*")) if p.is_file()}
+        for obj in existing.get("Contents", []):
+            key, remote = obj["Key"], obj.get("ETag", "").strip('"')
+            if key not in local or local[key] != remote:
+                sys.exit(
+                    f"前缀 {prefix} 已发布过**不同内容**（{key} 的 ETag 不一致）。\n"
+                    f"版本前缀不可变：请先确认是否需要回滚，或改动前端让内容指纹"
+                    f"变化后重跑。\n"
+                    f"（当前指纹 {frontend_content_version()}；"
+                    f"如需强制指定前缀，设 config.ini [Panel] console_version）")
     types = {".html": "text/html", ".js": "application/javascript",
              ".css": "text/css", ".json": "application/json",
              ".svg": "image/svg+xml", ".ico": "image/x-icon"}
@@ -368,14 +450,20 @@ def main() -> int:
     args = ap.parse_args()
 
     print("① 校验 Function URL 授权配置（缺 edge_role_arn 即中止）")
-    function_url_statements(_cfg("Deployer", "edge_role_arn", ""))
+    edge_arn = _cfg("Deployer", "edge_role_arn", "")
+    function_url_statements(edge_arn)
+    # RoleId 现查：handler 用它确认调用者真是 Edge（同账号 IAM 身份能绕开
+    # resource policy 直连，见 handler._edge_caller_ok）。查不到就中止——
+    # 空值会让线上拒绝所有请求。
+    eid = edge_role_id(edge_arn)
+    print(f"   Edge RoleId: {eid}")
 
     print("② IAM 角色")
     role_arn = ensure_role()
     print(f"   {role_arn}")
 
     print("③ 打包并部署 Lambda")
-    url = ensure_function(role_arn, _build_zip())
+    url = ensure_function(role_arn, _build_zip(), eid)
     print(f"   Function URL: {url}")
 
     if not args.skip_frontend:

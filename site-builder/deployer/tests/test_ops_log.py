@@ -141,12 +141,19 @@ def test_detail_is_length_capped(aws):
     assert len(_logs()[0]["detail"]) <= 1024
 
 
-def test_sort_key_is_ts_then_actor(aws):
+def test_sort_key_is_ts_then_actor_then_unique(aws):
+    """SK = `{ts}#{actor}#{uniq}`（uniq 是 P2-1 加的防碰撞后缀）。
+
+    时间戳必须在最前（排序即时间线）；actor 居中（可按人前缀筛）；
+    随机段在最后（只为唯一性，不参与排序语义）。
+    """
     _seed()
     permissions.set_access_policy("s-1", actor="owner@x.com", require_login=False)
-    row = _logs()[0]
-    ts, sep, actor = row["ts_actor"].partition("#")
-    assert sep == "#" and actor == "owner@x.com" and ts.startswith("20")
+    ts, sep, rest = _logs()[0]["ts_actor"].partition("#")
+    assert sep == "#" and ts.startswith("20")
+    actor, sep2, uniq = rest.rpartition("#")
+    assert sep2 == "#" and actor == "owner@x.com"
+    assert uniq and uniq != actor, f"缺唯一后缀: {rest}"
 
 
 def test_two_actions_on_same_site_do_not_collide(aws):
@@ -166,3 +173,63 @@ def test_record_is_put_only_never_update(aws):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             assert node.func.attr not in ("update_item", "delete_item"), (
                 f"ops_log 出现了 {node.func.attr}——审计必须 append-only")
+
+
+# ── 真正的 append-only：同时间戳也不许覆盖（Codex 审查 2026-08-10 P2-1）──
+# 上面的 test_two_actions_on_same_site_do_not_collide 之所以绿，只是因为两次
+# datetime.now() 通常不同——它从没测过真正的碰撞。固定时钟后原实现只剩 1 行。
+
+def _freeze_clock(monkeypatch, iso="2026-08-10T12:00:00+00:00"):
+    from datetime import datetime, timezone
+    fixed = datetime.fromisoformat(iso)
+
+    class FakeDT:
+        @staticmethod
+        def now(tz=None):
+            return fixed
+
+    monkeypatch.setattr(ops_log, "datetime", FakeDT)
+
+
+def test_identical_timestamp_and_actor_still_appends(aws, monkeypatch):
+    """时钟固定 + 同 target 同 actor：两条都必须留存。"""
+    _freeze_clock(monkeypatch)
+    ops_log.record(actor="a@x.com", action="set_access", target="site:s1",
+                   result="ok", detail={"n": 1})
+    ops_log.record(actor="a@x.com", action="undeploy", target="site:s1",
+                   result="ok", detail={"n": 2})
+    rows = _logs()
+    assert len(rows) == 2, f"同时间戳的第二条覆盖了第一条: {rows}"
+    assert {r["action"] for r in rows} == {"set_access", "undeploy"}
+
+
+def test_sort_key_still_starts_with_timestamp(aws, monkeypatch):
+    """加唯一后缀不能破坏"按时间排序"——SK 必须仍以 ISO 时间戳开头。
+
+    ops-log 的读取方式是按 target Query 后按 SK 排序看时间线；把随机数放到
+    前面会让排序变成随机顺序。
+    """
+    _freeze_clock(monkeypatch)
+    ops_log.record(actor="a@x.com", action="set_access", target="site:s1",
+                   result="ok")
+    sk = _logs()[0]["ts_actor"]
+    assert sk.startswith("2026-08-10T12:00:00+00:00"), sk
+    assert "a@x.com" in sk, f"actor 仍要在 SK 里（便于按人筛）: {sk}"
+
+
+def test_many_records_same_instant_all_survive(aws, monkeypatch):
+    """批量同瞬间写入：一条都不许丢（唯一后缀必须真的唯一）。"""
+    _freeze_clock(monkeypatch)
+    for i in range(20):
+        ops_log.record(actor="a@x.com", action=f"act{i}", target="site:s1",
+                       result="ok")
+    assert len(_logs()) == 20, "同瞬间的记录发生了覆盖"
+
+
+def test_put_uses_condition_to_refuse_overwrite(aws):
+    """写入必须带 attribute_not_exists 条件——纵深：万一后缀真撞了也不静默覆盖。"""
+    import ast
+    from pathlib import Path
+    src = Path(ops_log.__file__).read_text()
+    assert "attribute_not_exists" in src, (
+        "PutItem 没有条件表达式——主键相同时会静默覆盖，append-only 只是口号")

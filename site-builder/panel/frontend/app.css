@@ -136,6 +136,8 @@
   .badge-run     { background: var(--accent-soft); color: var(--accent); }
   .badge-fail    { background: var(--danger-soft); color: var(--danger); }
   .badge-off     { background: var(--fg-soft);     color: var(--muted); }
+  /* PURGE_FAILED：站点已下线但数据没清完——警告而非失败（URL 确实已失效） */
+  .badge-warn    { background: var(--warn-soft);   color: var(--warn); }
   .tag { display: inline-flex; align-items: center; height: 21px; padding: 0 7px;
          border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface);
          font-family: var(--font-mono); font-size: 11.5px; color: var(--fg-dim); white-space: nowrap; }

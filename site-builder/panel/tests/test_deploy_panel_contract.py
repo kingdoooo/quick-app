@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 import pytest
+from unittest.mock import patch
 
 import deploy_panel as dp
 
@@ -309,3 +310,146 @@ def test_frontend_prefix_is_versioned():
     p1 = dp.frontend_prefix("v1")
     p2 = dp.frontend_prefix("v2")
     assert p1 != p2 and p1.startswith("platform/console/")
+
+
+# ── EDGE_ROLE_ID 必须下发（Codex 审查 2026-08-10 P1-1）──────────────────
+
+def test_lambda_environment_carries_edge_role_id():
+    """handler 靠它确认调用者是 Edge；不下发 = 线上拒绝所有请求。"""
+    env = dp.lambda_environment("AROAEXAMPLE")
+    assert env["EDGE_ROLE_ID"] == "AROAEXAMPLE"
+
+
+def test_edge_role_id_is_resolved_from_iam_not_hand_copied():
+    """RoleId 由 get_role 现查，**不许在 config 里再抄一份**。
+
+    手抄的第二份真源会漂移（本项目记录过"不变量被手抄多份"这一类缺陷）。
+    """
+    import re
+    src = (PANEL / "deploy_panel.py").read_text()
+    assert "get_role" in src, "没有现查 RoleId"
+    m = re.search(r"def edge_role_id\(.*?\n(?=\ndef )", src, re.S)
+    assert m, "找不到 edge_role_id"
+    assert "_cfg(" not in m.group(0), (
+        "edge_role_id 从 config 取值——那是第二份真源，会与 IAM 漂移")
+
+
+def test_edge_role_id_rejects_non_role_id_shapes():
+    """解析结果必须是 AROA 形态；拿到别的东西要抛错而不是照发。"""
+    import types
+    class FakeIam:
+        def __init__(self, rid): self._r = rid
+        def get_role(self, RoleName): return {"Role": {"RoleId": self._r}}
+
+    for bad in ("AIDANOTAROLE", "", "arn:aws:iam::1:role/x"):
+        with patch.object(dp.boto3, "client", lambda *a, **k: FakeIam(bad)):
+            with pytest.raises(ValueError):
+                dp.edge_role_id("arn:aws:iam::1:role/EdgeRole")
+    with patch.object(dp.boto3, "client",
+                      lambda *a, **k: FakeIam("AROAGOOD123")):
+        assert dp.edge_role_id("arn:aws:iam::1:role/EdgeRole") == "AROAGOOD123"
+
+
+def test_empty_edge_role_arn_aborts_before_calling_iam():
+    with pytest.raises(ValueError):
+        dp.edge_role_id("")
+
+
+# ── 前端真版本化（Codex 审查 2026-08-10 P2-2）───────────────────────────
+# 原状：所有前端修复都传到 platform/console/v1/，桶未开版本控制，旧内容被
+# 原地覆盖。真机核对过：platform/console/ 下只有 v1 的三个对象。
+# 所以 docstring 里的"旧版本保留以便回滚"是**假的**——只是接口能力。
+
+def test_frontend_prefix_derives_from_content_not_a_fixed_literal():
+    """默认前缀必须由**内容**决定：改了前端就是新前缀。"""
+    v1 = dp.frontend_content_version()
+    assert re.fullmatch(r"[0-9a-f]{8,}", v1), f"版本段形态不对: {v1}"
+    # 改一个字节 → 版本必须变
+    target = PANEL / "frontend" / "app.js"
+    original = target.read_bytes()
+    try:
+        target.write_bytes(original + b"\n/* probe */\n")
+        v2 = dp.frontend_content_version()
+    finally:
+        target.write_bytes(original)
+    assert v1 != v2, "前端内容变了但版本前缀没变——旧版本会被原地覆盖"
+    assert dp.frontend_content_version() == v1, "还原后版本必须回到原值"
+
+
+def test_frontend_prefix_is_stable_across_calls():
+    """同样的内容必须得到同样的前缀（否则每次部署都换前缀、白占空间）。"""
+    assert dp.frontend_prefix() == dp.frontend_prefix()
+
+
+def test_frontend_prefix_still_has_no_trailing_slash():
+    """尾斜杠会让 Edge 拼出双斜杠 → 整站 403（既有实测坑，不能回归）。"""
+    p = dp.frontend_prefix()
+    assert not p.endswith("/"), p
+    assert p.startswith("platform/console/")
+    assert "//" not in p
+
+
+def test_upload_refuses_to_overwrite_a_different_build(monkeypatch):
+    """同前缀下已有**不同内容**时必须中止，不能静默覆盖。
+
+    这是"可回滚"的技术前提：一个版本前缀一旦发布就不可变。
+    """
+    calls = []
+
+    class FakeS3:
+        def list_objects_v2(self, **kw):
+            # 该前缀已存在对象，且 ETag 与将要上传的不同
+            return {"KeyCount": 1, "Contents": [
+                {"Key": kw["Prefix"] + "index.html", "ETag": '"deadbeef"'}]}
+
+        def head_object(self, **kw):
+            return {"ETag": '"deadbeef"'}
+
+        def put_object(self, **kw):
+            calls.append(kw["Key"])
+
+    monkeypatch.setattr(dp.boto3, "client", lambda *a, **k: FakeS3())
+    with pytest.raises(SystemExit):
+        dp.upload_frontend()
+    assert calls == [], f"中止前已经写了对象: {calls}"
+
+
+def test_upload_is_idempotent_when_content_matches(monkeypatch):
+    """同前缀同内容 = 重跑部署脚本，必须放行（幂等是本脚本的既有契约）。"""
+    import hashlib
+
+    src = PANEL / "frontend"
+    etags = {}
+    for p in sorted(src.rglob("*")):
+        if p.is_file():
+            key = dp.frontend_prefix() + "/" + str(p.relative_to(src))
+            etags[key] = '"%s"' % hashlib.md5(p.read_bytes()).hexdigest()
+
+    class FakeS3:
+        def list_objects_v2(self, **kw):
+            items = [{"Key": k, "ETag": v} for k, v in etags.items()]
+            return {"KeyCount": len(items), "Contents": items}
+
+        def head_object(self, **kw):
+            return {"ETag": etags[kw["Key"]]}
+
+        def put_object(self, **kw):
+            return {}
+
+    monkeypatch.setattr(dp.boto3, "client", lambda *a, **k: FakeS3())
+    assert dp.upload_frontend() >= 0      # 不抛错即可
+
+
+def test_docstring_no_longer_claims_rollback_it_cannot_do():
+    """`frontend_prefix` 的注释不得再声称"旧版本保留以便回滚"除非确有其事。
+
+    M3-FINDINGS 的教训：文档写了做不到的事比没写更糟（审查时会被当成已有能力）。
+    """
+    src = (PANEL / "deploy_panel.py").read_text()
+    m = re.search(r"def frontend_prefix\(.*?\n(?=\ndef )", src, re.S)
+    assert m, "找不到 frontend_prefix"
+    body = m.group(0)
+    if "回滚" in body:
+        assert "不可变" in body or "immutable" in body.lower(), (
+            "仍然声称可回滚，但没说明是靠「前缀不可变」实现的——"
+            "桶没开版本控制，覆盖式部署下这句话是假的")

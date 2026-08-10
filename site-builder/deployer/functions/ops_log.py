@@ -18,6 +18,7 @@ deployer 侧运行时 ImportError。panel 侧照 common.py / permissions.py 的
 import json
 import logging
 import os
+import secrets
 import time
 from datetime import datetime, timezone
 
@@ -60,21 +61,33 @@ def _scrub(detail) -> str:
 
 
 def _put(**item) -> None:
-    """真正的写入。测试用 monkeypatch 替换它来模拟落库失败。"""
-    _table().put_item(Item=item)
+    """真正的写入。测试用 monkeypatch 替换它来模拟落库失败。
+
+    条件写 `attribute_not_exists(ts_actor)` 是**纵深防御**：SK 已经带了随机
+    后缀，正常不会撞；但"静默覆盖一条审计"是不可接受的失败模式，宁可让它
+    报错进 ERROR 日志（record() 会吞掉异常，业务不受影响）。
+    """
+    _table().put_item(Item=item,
+                      ConditionExpression="attribute_not_exists(ts_actor)")
 
 
 def record(*, actor: str, action: str, target: str, result: str,
            detail=None, request_id: str = "") -> None:
     """写一条审计。**任何异常都被吞掉**——见模块 docstring 第 ② 条。
 
-    SK 是 `{ts}#{actor}`：带上时间戳才能让同一 target 上的多次操作共存
-    （只用 actor 会让后一条覆盖前一条，append-only 就失效了）。
+    SK 是 `{ts}#{actor}#{uniq}`（Codex 审查 2026-08-10 P2-1）：
+      · `ts` 在**最前面**——读取方式是按 target Query 再按 SK 排序看时间线，
+        把随机段放前面会让排序变成随机顺序；
+      · `actor` 居中，便于按人做前缀筛选；
+      · `uniq` 是随机后缀，**不可省**。只有 `{ts}#{actor}` 时，同一 target
+        上同一个人在同一微秒的两次操作会命中同一主键，第二条静默覆盖第一条
+        ——`append-only` 就只是口号。原来的用例之所以绿，只是因为两次
+        `datetime.now()` 通常不同；固定时钟后表里只剩一行（实测）。
     """
     try:
         now = datetime.now(timezone.utc)
         _put(target=target,
-             ts_actor=f"{now.isoformat()}#{actor}",
+             ts_actor=f"{now.isoformat()}#{actor}#{secrets.token_hex(4)}",
              actor=actor, action=action, result=result,
              detail=_scrub(detail), request_id=request_id or "",
              expires_at=int(time.time()) + TTL_DAYS * 86400)

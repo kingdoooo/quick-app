@@ -60,10 +60,19 @@ def create_job(owner: str, site_id: str, guard_items: list | None = None) -> str
     return job_id
 
 
-def update_job(job_id: str, *, status=None, phase=None, error=None, url=None) -> None:
+def update_job(job_id: str, *, status=None, phase=None, error=None, url=None,
+               kind=None) -> None:
+    """更新 job 字段。
+
+    `kind`（"deploy"/"undeploy"）：收敛逻辑要按类型分流——deploy 的 job 有
+    SFN execution 可以 DescribeExecution 核对，undeploy 是独立异步 Lambda
+    没有 execution。缺这个字段时 sweeper 只能把后者当孤儿放着（Codex 审查
+    2026-08-10 P1-4）。
+    """
     updates, values = ["updated_at = :t"], {":t": _now()}
     names = {}
-    for field, val in (("status", status), ("phase", phase), ("error", error), ("url", url)):
+    for field, val in (("status", status), ("phase", phase), ("error", error),
+                       ("url", url), ("kind", kind)):
         if val is not None:
             names[f"#{field}"] = field
             updates.append(f"#{field} = :{field}")

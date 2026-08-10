@@ -15,6 +15,11 @@ from upgrade_code_vectors import SECRET
 CONSOLE = "console.example.com"
 
 
+# Edge 执行角色的 RoleId（测试用）。真机形态见 test_real_edge_caller_shape_is_accepted
+# 附近的注释：callerId 是 `{RoleId}:{带区域前缀的 session name}`。
+EDGE_ROLE_ID = "AROAEDGEROLEIDXXXXXX"
+
+
 def _ev(method, path, *, email="owner@x.com", cookie=None, origin=None,
         body=None, ctype="application/json", qs=None):
     headers = {"x-user-email": email, "x-user-name": "Owner"}
@@ -25,7 +30,13 @@ def _ev(method, path, *, email="owner@x.com", cookie=None, origin=None,
     if ctype:
         headers["content-type"] = ctype
     return {"rawPath": path,
-            "requestContext": {"http": {"method": method}},
+            # 默认带**合规的 Edge IAM 上下文**：真实请求一定经过 Edge，
+            # handler 的第 ⓪ 步会校验它（P1-1）。要测"非 Edge 直连"的用例
+            # 自己覆盖 requestContext.authorizer。
+            "requestContext": {
+                "http": {"method": method},
+                "authorizer": {"iam": {
+                    "callerId": f"{EDGE_ROLE_ID}:us-east-1.RouterStack-fn"}}},
             "headers": headers,
             "queryStringParameters": qs or {},
             "body": json.dumps(body) if body is not None else None}
@@ -328,3 +339,200 @@ def test_undeploy_dispatch_is_async_and_returns_job(aws, secret, monkeypatch):
     assert r["statusCode"] == 200
     assert json.loads(r["body"])["job_id"].startswith("job-")
     assert invoked and invoked[0]["InvocationType"] == "Event"
+
+
+# ── purge_data 必须是真布尔（Codex 审查 2026-08-10 P1-2）───────────────
+# bool("false") is True ——任何非空字符串都为真，所以 {"purge_data":"false"}
+# 会被解释成"永久删除数据"。不可恢复动作的入口绝不能靠"唯一前端永远正确"，
+# 必须在 API 边界拒绝非布尔。
+
+def _undeploy_spy(monkeypatch):
+    """拦住异步 invoke，返回收到的 payload 列表。"""
+    invoked = []
+    real_client = boto3.client
+
+    class Spy:
+        def __init__(self, inner):
+            self._i = inner
+
+        def __getattr__(self, k):
+            return getattr(self._i, k)
+
+        def invoke(self, **kw):
+            invoked.append(json.loads(kw["Payload"].decode()))
+            return {"StatusCode": 202}
+
+    monkeypatch.setattr(boto3, "client",
+                        lambda *a, **k: Spy(real_client(*a, **k))
+                        if a and a[0] == "lambda" else real_client(*a, **k))
+    return invoked
+
+
+@pytest.mark.parametrize("bad", ["false", "0", "true", "", 1, 0, [], {},
+                                 ["yes"], None])
+def test_undeploy_rejects_non_boolean_purge_data(aws, secret, monkeypatch, bad):
+    """字符串/数字/数组/对象/null 一律 400，且**零副作用**（不发 invoke）。"""
+    _seed()
+    invoked = _undeploy_spy(monkeypatch)
+    r = handler.handler(_write_ev("/api/sites/s-1/undeploy", method="POST",
+                                  body={"purge_data": bad}), None)
+    assert r["statusCode"] == 400, f"purge_data={bad!r} 被接受了"
+    assert not invoked, f"purge_data={bad!r} 已经触发下线: {invoked}"
+
+
+def test_undeploy_missing_purge_data_defaults_to_false(aws, secret, monkeypatch):
+    """字段缺失 = 不清数据（默认必须是最安全的那一侧）。"""
+    _seed()
+    invoked = _undeploy_spy(monkeypatch)
+    r = handler.handler(_write_ev("/api/sites/s-1/undeploy", method="POST",
+                                  body={}), None)
+    assert r["statusCode"] == 200
+    assert invoked and "purge_data" not in invoked[0], invoked
+
+
+def test_undeploy_true_boolean_still_purges(aws, secret, monkeypatch):
+    """别把校验写成"什么都不清"——真布尔 True 仍要透传。"""
+    _seed()
+    invoked = _undeploy_spy(monkeypatch)
+    r = handler.handler(_write_ev("/api/sites/s-1/undeploy", method="POST",
+                                  body={"purge_data": True}), None)
+    assert r["statusCode"] == 200
+    assert invoked and invoked[0]["purge_data"] is True, invoked
+
+
+def test_undeploy_invoke_failure_does_not_leave_pending_job(aws, secret,
+                                                            monkeypatch):
+    """调 undeploy Lambda 失败时，不得留下永久 PENDING 的 job。
+
+    Codex 审查 2026-08-10 P1-4 的最后一条：job 先建（PENDING），再异步调
+    Lambda。invoke 本身失败（限流/权限/网络）时若不收敛，这个 job 永远
+    PENDING——sweeper 只扫 RUNNING，谁都不会再碰它，用户看到"排队中"到永远。
+    """
+    _seed()
+    real_client = boto3.client
+
+    class Boom:
+        def __init__(self, inner):
+            self._i = inner
+
+        def __getattr__(self, k):
+            return getattr(self._i, k)
+
+        def invoke(self, **kw):
+            raise RuntimeError("invoke 失败（注入）")
+
+    monkeypatch.setattr(boto3, "client",
+                        lambda *a, **k: Boom(real_client(*a, **k))
+                        if a and a[0] == "lambda" else real_client(*a, **k))
+    r = handler.handler(_write_ev("/api/sites/s-1/undeploy", method="POST",
+                                  body={"purge_data": False}), None)
+    assert r["statusCode"] == 500, r
+    # 找到刚建的 job，它必须已被收敛成 FAILED（不能停在 PENDING）
+    jobs = api.do_list_jobs("owner@x.com", "s-1")
+    assert jobs, "没有 job 记录"
+    assert jobs[0]["status"] == "FAILED", (
+        f"job 停在 {jobs[0]['status']}——sweeper 只扫 RUNNING，它永远不会被收敛")
+    assert jobs[0]["error"], "没有错误摘要"
+
+
+# ── Function URL 的调用者必须真是 Edge（Codex 审查 2026-08-10 P1-1）──────
+# 原实现只靠 resource policy 保证"只有 Edge 能调"，然后无条件信任
+# x-user-email。但 AWS 的真实规则是：**同账号 principal 只要 identity policy
+# 允许 lambda:InvokeFunctionUrl + lambda:InvokeFunction，无需命中 resource
+# policy 也能调用**。真机实测确认（2026-08-10）：直接签名调用线上 Function
+# URL 并自带 x-user-email，/api/me 返回 200 且识别成管理员，
+# /api/sites?all=1 返回全部 27 个站点。
+#
+# **不能拿 config 里的 edge_role_arn 逐字符比**（Codex 建议的做法会 403 整站）：
+# 真机抓到的 caller 是 STS 形态 + 区域前缀的 session name——
+#   userArn: arn:aws:sts::<acct>:assumed-role/<EdgeRoleName>/us-east-1.ApplicationWebRouterStack-...
+#   callerId: AROAX5GBA74KFZAAWDGMT:us-east-1.ApplicationWebRouterStack-...
+# 而 config 里是 arn:aws:iam::<acct>:role/<EdgeRoleName>。两者永不相等。
+# 稳定且不可伪造的锚点是 callerId 的 AROA 段 = 该角色的 RoleId（已核对相等）。
+
+# _ev() 默认就带合规的 Edge IAM 上下文（见文件顶部），所以 _edge_ev 就是 _ev。
+_edge_ev = _ev
+
+
+def test_real_edge_caller_shape_is_accepted(aws, secret, monkeypatch):
+    """真机抓到的 callerId 形态必须放行——否则整个控制台 403。
+
+    这条是防"修复本身把站点打死"的护栏：如果有人把校验改成与
+    edge_role_arn 逐字符比较，它会立刻变红。
+    """
+    monkeypatch.setenv("EDGE_ROLE_ID", EDGE_ROLE_ID)
+    r = handler.handler(_edge_ev("GET", "/api/me"), None)
+    assert r["statusCode"] == 200, r
+
+
+def test_same_account_non_edge_signed_request_is_403(aws, secret, monkeypatch):
+    """同账号、非 Edge、但有 Function URL 调用权限的签名请求必须被拒。
+
+    这是 P1-1 的核心断言：resource policy 挡不住它，只有校验 caller 能挡。
+    """
+    monkeypatch.setenv("EDGE_ROLE_ID", EDGE_ROLE_ID)
+    ev = _ev("GET", "/api/me")
+    # 真机上就是这个形态：IAM user Kent（AdministratorAccess）直连
+    ev["requestContext"].update(
+        {"authorizer": {"iam": {"callerId": "AIDAX5GBA74KD2LIPY7AJ"}}})
+    r = handler.handler(ev, None)
+    assert r["statusCode"] == 403, f"伪造身份的直连请求被放行了: {r}"
+    # 不得回显内部细节（探测者不该知道我们在比什么）
+    assert "AROA" not in r["body"] and "EDGE_ROLE_ID" not in r["body"]
+
+
+def test_role_id_prefix_must_not_be_substring_matchable(aws, secret, monkeypatch):
+    """必须按 `AROA...:` 边界比，不能用 startswith/in 之类的松匹配。
+
+    `AROAEDGEROLEIDXXXXXXEVIL:...` 能骗过 startswith；
+    `AIDAX:AROAEDGEROLEIDXXXXXX` 能骗过 `in`。
+    """
+    monkeypatch.setenv("EDGE_ROLE_ID", EDGE_ROLE_ID)
+    for bad in (f"{EDGE_ROLE_ID}EVIL:us-east-1.x",
+                f"AIDAX5GB:{EDGE_ROLE_ID}",
+                f"x{EDGE_ROLE_ID}:s",
+                EDGE_ROLE_ID.lower() + ":s"):
+        ev = _ev("GET", "/api/me")
+        ev["requestContext"].update({"authorizer": {"iam": {"callerId": bad}}})
+        assert handler.handler(ev, None)["statusCode"] == 403, (
+            f"松匹配放行了 {bad!r}")
+
+
+def test_missing_iam_context_is_403_not_open(aws, secret, monkeypatch):
+    """拿不到 IAM 上下文时 fail-closed（缺字段不等于放行）。"""
+    monkeypatch.setenv("EDGE_ROLE_ID", EDGE_ROLE_ID)
+    for ctx in ({"authorizer": {}}, {"authorizer": {"iam": {}}},
+                {"authorizer": {"iam": {"callerId": ""}}},
+                {"authorizer": None}):
+        ev = _ev("GET", "/api/me")
+        ev["requestContext"].update(ctx)
+        assert handler.handler(ev, None)["statusCode"] == 403, ctx
+    # authorizer 整个键缺失（**要真删掉**，update({}) 删不掉 _ev 的默认值）
+    ev = _ev("GET", "/api/me")
+    del ev["requestContext"]["authorizer"]
+    assert handler.handler(ev, None)["statusCode"] == 403
+    # requestContext 整体缺失
+    ev = _ev("GET", "/api/me")
+    ev.pop("requestContext")
+    assert handler.handler(ev, None)["statusCode"] == 403
+
+
+def test_unconfigured_edge_role_id_fails_closed(aws, secret, monkeypatch):
+    """**没配 EDGE_ROLE_ID 时必须拒绝所有请求**，不能"没配就不检查"。
+
+    "配置缺失 → 跳过校验"是本项目记录过的陷阱形态（假值兜底恰好是放宽）。
+    宁可整站 503/403 也不能静默回到可被绕过的状态。
+    """
+    monkeypatch.delenv("EDGE_ROLE_ID", raising=False)
+    r = handler.handler(_edge_ev("GET", "/api/me"), None)
+    assert r["statusCode"] in (403, 500), r
+
+
+def test_write_path_also_checks_caller(aws, secret, monkeypatch):
+    """写路径同样要校验——别只在读路径加。"""
+    monkeypatch.setenv("EDGE_ROLE_ID", EDGE_ROLE_ID)
+    _seed()
+    ev = _write_ev("/api/sites/s-1/permissions", body={"require_login": False})
+    ev["requestContext"].update(
+        {"authorizer": {"iam": {"callerId": "AIDANOTEDGE"}}})
+    assert handler.handler(ev, None)["statusCode"] == 403

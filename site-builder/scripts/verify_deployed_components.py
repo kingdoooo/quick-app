@@ -385,6 +385,77 @@ def run_panel() -> None:
           "Principal 逐字符 == edge role（不是 * 不是账号根）",
           f"实际 {sorted(principals)}")
 
+    # **resource policy 正确 ≠ 只有 Edge 能调**（Codex 审查 2026-08-10 P1-1）。
+    # AWS 的规则：同账号 principal 只要 identity policy 允许
+    # lambda:InvokeFunctionUrl + InvokeFunction，无需命中 resource policy 也能
+    # 调用。真机验证过：直接签名调用并自带 x-user-email，/api/me 返回 200 且
+    # is_admin=true、/api/sites?all=1 返回全部站点。
+    # 所以这里必须**真的打一次直连请求**，而不是只读配置。
+    env_eid = env.get("EDGE_ROLE_ID", "")
+    edge_role_name = edge_role.rsplit("/", 1)[-1]
+    try:
+        real_eid = boto3.client("iam").get_role(
+            RoleName=edge_role_name)["Role"]["RoleId"]
+    except Exception as e:
+        real_eid = f"<查不到: {e}>"
+    check(bool(env_eid) and env_eid == real_eid,
+          "panel 下发的 EDGE_ROLE_ID == Edge 角色真实 RoleId",
+          f"env={env_eid or '缺失'} vs iam={real_eid}"
+          + ("" if env_eid else " —— 缺失时 handler 拒绝所有请求（fail-closed）"))
+
+    _verify_direct_invoke_is_rejected(lam, fn)
+
+
+def _verify_direct_invoke_is_rejected(lam, fn: str) -> None:
+    """**反向验收**：同账号非 Edge 的签名直连必须被拒（403）。
+
+    这条是 P1-1 的真正闸门。它要求当前 AWS 身份**有** Function URL 调用权限
+    才有意义——没有权限时拿到的 403 来自 IAM 而不是来自 handler 的校验，
+    那样这条断言就是假绿，所以此时明确报 SKIP 而不是 PASS。
+    """
+    import urllib.error
+    import urllib.request
+
+    import boto3
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+
+    try:
+        url = lam.get_function_url_config(FunctionName=fn)["FunctionUrl"]
+        arn = lam.get_function(FunctionName=fn)["Configuration"]["FunctionArn"]
+        me = boto3.client("sts").get_caller_identity()["Arn"]
+        sim = boto3.client("iam").simulate_principal_policy(
+            PolicySourceArn=me, ActionNames=["lambda:InvokeFunctionUrl"],
+            ResourceArns=[arn])["EvaluationResults"][0]["EvalDecision"]
+    except Exception as e:
+        print(f"  SKIP  非 Edge 直连必须 403（准备阶段失败: {e}）")
+        return
+    if sim != "allowed":
+        # 没有调用权限时，403 来自 IAM 而非 handler —— 无法证明校验生效
+        print("  SKIP  非 Edge 直连必须 403"
+              f"（当前身份无 InvokeFunctionUrl 权限，测不出 handler 的判定）")
+        return
+
+    target = url.rstrip("/") + "/api/me"
+    creds = boto3.Session().get_credentials().get_frozen_credentials()
+    req = AWSRequest(method="GET", url=target,
+                     headers={"x-user-email": "verify-probe@invalid.local"})
+    SigV4Auth(creds, "lambda", read_cfg("Platform", "region")).add_auth(req)
+    try:
+        resp = urllib.request.urlopen(
+            urllib.request.Request(target, headers=dict(req.headers)),
+            timeout=25)
+        status, body = resp.status, resp.read().decode()[:200]
+    except urllib.error.HTTPError as e:
+        status, body = e.code, e.read().decode()[:200]
+    except Exception as e:
+        print(f"  SKIP  非 Edge 直连必须 403（请求失败: {e}）")
+        return
+    check(status == 403,
+          "同账号非 Edge 的签名直连被拒（伪造 x-user-email 无效）",
+          f"实际 {status} {body}"
+          + (" —— 身份可被伪造，读接口全部越权" if status == 200 else ""))
+
 
 def run_mcp_and_route() -> None:
     """⑥ MCP runtime 与 ⑦ console route。"""

@@ -433,9 +433,22 @@ def do_undeploy(owner: str, site_id: str, purge_data: bool = False) -> dict:
         tables = list((site or {}).get("data_tables", []))
         if tables:
             payload["data_tables"] = tables
-    _lambda().invoke(FunctionName="site-deployer-undeploy",
-                     InvocationType="Event",
-                     Payload=json.dumps(payload))
+    try:
+        _lambda().invoke(FunctionName="site-deployer-undeploy",
+                         InvocationType="Event",
+                         Payload=json.dumps(payload))
+    except Exception:
+        # **job 已建好（PENDING），invoke 失败必须就地收敛**
+        # （Codex 审查 2026-08-10 P1-4）：sweeper 只扫 RUNNING，停在 PENDING
+        # 的 job 谁都不会再碰。panel 的 api.do_undeploy 有同样的处理——
+        # 两个 writer 都要，不能只修一处（M3-FINDINGS「别打地鼠，修那一类」）。
+        try:
+            common.update_job(job_id, status="FAILED",
+                              error="下线任务提交失败（未开始执行），站点未做任何"
+                                    "改动。请重新发起下线。")
+        except Exception:
+            pass
+        raise
     return {"job_id": job_id, "purge_data": bool(purge_data)}
 
 

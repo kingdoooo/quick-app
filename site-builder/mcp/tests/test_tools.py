@@ -766,3 +766,24 @@ def test_deploy_site_regenerates_id_on_collision(aws, monkeypatch):
     assert out["site_id"] == "notes-bbbbbb"
     victim = common.get_site("notes-aaaaaa")
     assert victim["owner"] == "victim@x.com" and victim["status"] == "ACTIVE"
+
+
+def test_undeploy_invoke_failure_does_not_leave_pending_job(aws):
+    """MCP 侧同样：invoke 失败不得留下永久 PENDING 的 job。
+
+    与 panel 的 test_undeploy_invoke_failure_does_not_leave_pending_job 同一个
+    缺陷类（Codex 审查 2026-08-10 P1-4）——两个 writer 都要收敛，
+    照 M3-FINDINGS「别打地鼠，修那一类」的要求清点全部调用点。
+    """
+    import server, common
+    server.common.upsert_site("demo-abc123", owner="o@x.com", status="ACTIVE",
+                              tier="fullstack-nosql")
+    lam = MagicMock()
+    lam.invoke.side_effect = RuntimeError("invoke 失败（注入）")
+    with patch.object(server, "_lambda", return_value=lam):
+        with pytest.raises(RuntimeError):
+            server.do_undeploy("o@x.com", "demo-abc123")
+    jobs = common.list_jobs_by_site("demo-abc123")
+    assert jobs, "没有 job 记录"
+    assert jobs[0]["status"] == "FAILED", (
+        f"job 停在 {jobs[0]['status']}——sweeper 只扫 RUNNING，永远不会被收敛")

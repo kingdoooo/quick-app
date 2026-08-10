@@ -23,6 +23,9 @@ ENV = {"JOBS_TABLE": "site-deploy-jobs", "SITES_TABLE": "site-sites",
        "SESSION_CODES_TABLE": "site-session-codes",
        "JWT_SECRET_PARAM": "/site-builder/jwt-secret",
        "CONSOLE_HOST": "console.example.com",
+       # Edge 执行角色的 RoleId：handler 用它确认调用者真是 Edge（P1-1）。
+       # 与 test_handler.EDGE_ROLE_ID 必须一致。
+       "EDGE_ROLE_ID": "AROAEDGEROLEIDXXXXXX",
        "UNDEPLOY_FN": "site-deployer-undeploy",
        "PACKAGE_PROJECT": "site-package", "DSQL_ENDPOINT": "x.dsql.us-east-1.on.aws",
        "AWS_DEFAULT_REGION": "us-east-1",

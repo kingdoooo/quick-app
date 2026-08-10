@@ -1,10 +1,16 @@
-"""panel Lambda 入口：五步前置校验 + 路由分发 + 错误码。
+"""panel Lambda 入口：六步前置校验 + 路由分发 + 错误码。
 
 **顺序是安全边界，不是风格**（spec §5.4）：
-  ① 身份：x-user-email 必须存在。它由 Edge **先剥除再注入**，所以它存在就
-     等于"请求确实经过 CloudFront + Lambda@Edge"。Function URL 的 AWS_IAM +
-     exact edge role resource policy 是这个推论的前提（见 deploy_panel.py）
-     ——两者缺一，本文件的整套身份假设就失效。
+  ⓪ 传输层：**IAM 调用者必须是 Edge 执行角色**（_edge_caller_ok）。
+     resource policy 单独不够——同账号 principal 只要 identity policy 给了
+     lambda:InvokeFunctionUrl + InvokeFunction，就能绕开 resource policy 直连
+     并自带伪造的 x-user-email（Codex 审查 2026-08-10 P1-1，真机验证过：
+     `/api/me` 返回 200 且 is_admin=true、`/api/sites?all=1` 返回全部站点）。
+  ① 身份：x-user-email 必须存在。它由 Edge **先剥除再注入**，所以在 ⓪ 已经
+     确认调用者是 Edge 的前提下，它存在就等于"请求确实经过 CloudFront +
+     Lambda@Edge"。⓪ 与 Function URL 的 AWS_IAM + exact edge role resource
+     policy 是这个推论的前提（见 deploy_panel.py）——缺任一层，本文件的整套
+     身份假设就失效。
   ② 写方法：CSRF（Origin 精确匹配 / Content-Type / 方法白名单）；
   ③ 写方法：__Host-sb_console 验签 + scope==console + email 与 ① 一致；
   ④ 路由分发；
@@ -51,6 +57,42 @@ ROUTES = [
 CALLBACK = r"^/api/session-callback$"
 
 
+def _edge_caller_ok(event) -> bool:
+    """请求的 **IAM 调用者**是否就是 Edge 的执行角色。
+
+    为什么不能只靠 resource policy（Codex 审查 2026-08-10 P1-1，已真机验证）：
+    AWS 的规则是"同账号 principal 只要 identity policy 允许
+    lambda:InvokeFunctionUrl + lambda:InvokeFunction，**无需命中 resource
+    policy** 也能调用"。实测直接签名调用线上 Function URL 并自带
+    x-user-email，`/api/me` 返回 200 且识别成管理员、`/api/sites?all=1`
+    返回全部站点。所以"x-user-email 存在 ⇒ 来自 Edge"这个推论必须由本函数
+    补上，不能只写在注释里。
+
+    **锚点是 callerId 的 AROA 段，不是 config 里的 edge_role_arn**。
+    真机抓到的形态（用一次性 probe Function URL 挂在真 Edge 后面测得）：
+        userArn : arn:aws:sts::<acct>:assumed-role/<EdgeRoleName>/us-east-1.<...>
+        callerId: AROAX5GBA74KFZAAWDGMT:us-east-1.ApplicationWebRouterStack-<...>
+    而 config.ini 里是 `arn:aws:iam::<acct>:role/<EdgeRoleName>`——两者**永不
+    相等**，拿它逐字符比会 403 整个控制台。callerId 冒号前那段是角色的
+    RoleId（已核对 == `aws iam get-role` 的 Role.RoleId），由 STS 填写，
+    调用方不可伪造。session name 段含区域前缀且会变，不参与判定。
+
+    **按 `:` 边界比，不用 startswith/in**：`{id}EVIL:s` 骗得过 startswith，
+    `AIDAX:{id}` 骗得过 in。
+    """
+    expected = os.environ.get("EDGE_ROLE_ID", "").strip()
+    if not expected:
+        # **配置缺失不得退化成"不检查"**：本项目记录过这个陷阱形态——
+        # 鉴权字段的"默认值"往往正好是"放宽"。宁可整站拒绝也不留绕过路径。
+        logger.error("EDGE_ROLE_ID 未配置——无法确认调用者是 Edge，拒绝所有请求")
+        return False
+    iam = ((event.get("requestContext") or {}).get("authorizer") or {})
+    caller = (iam.get("iam") or {}).get("callerId") or ""
+    # assumed-role 的 callerId 是 `{RoleId}:{session_name}`；只取角色段比较。
+    role_id = caller.split(":", 1)[0]
+    return role_id == expected
+
+
 def _json(status: int, payload, cookies=None) -> dict:
     out = {"statusCode": status,
            "headers": {"content-type": "application/json",
@@ -68,6 +110,14 @@ def handler(event, context):
     path = event.get("rawPath", "/")
     headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
     qs = event.get("queryStringParameters") or {}
+
+    # ⓪ 传输层：调用者必须真是 Edge 的执行角色。
+    #    ① 的整套推论（"x-user-email 存在 ⇒ 请求经过 Edge"）依赖它——
+    #    同账号 IAM 身份可以绕开 resource policy 直连 Function URL 并自带
+    #    伪造的 x-user-email（真机验证过，见 _edge_caller_ok）。
+    #    与 ① 同样不回显原因：探测者不该知道我们在比什么。
+    if not _edge_caller_ok(event):
+        return _json(403, {"error": "禁止访问"})
 
     # ① 身份。**不给假值兜底**：鉴权字段的"默认值"往往正好是"放宽"
     #    （本项目已记录过这个陷阱）。也不回显原因——直连 Function URL 的
@@ -93,10 +143,11 @@ def handler(event, context):
     # session-callback 是升级入口本身，不能要求"已有面板会话"
     if pattern == CALLBACK:
         try:
-            code_email = console_session.consume_code(qs.get("code", ""))
-            if code_email != email:
-                # 拿别人的 code 换自己的 cookie
-                raise console_session.UpgradeRejected("升级码与当前身份不符")
+            # 身份比对在 consume_code **内部**、且在原子消费 jti **之前**
+            # （Codex 审查 2026-08-10 P2-3）。原来是"先消费再在这里比对"，
+            # 于是拿别人的 code 提交一次就把它提前作废了。
+            console_session.consume_code(qs.get("code", ""),
+                                         expected_email=email)
         except console_session.UpgradeRejected as e:
             return _json(401, {"need": "console-session", "error": str(e)})
         return {"statusCode": 302,
@@ -144,6 +195,32 @@ def handler(event, context):
         return _json(500, {"error": "服务内部错误，请稍后重试"})
 
 
+def _strict_bool(body: dict, field: str) -> bool:
+    """取一个**必须是真布尔**的字段；缺失 = False。非布尔抛 ValueError（→400）。
+
+    不用 `bool(body.get(field))`（Codex 审查 2026-08-10 P1-2）：Python 里任何
+    非空字符串都为真，于是 `{"purge_data": "false"}` 会被解释成"永久删除数据"
+    ——一个**不可恢复**的动作。JSON 有真正的布尔类型，客户端没理由发别的；
+    API 边界不能依赖"唯一前端永远正确"，第二个客户端（脚本/curl/其他 Agent）
+    随时会出现。
+
+    注意 `isinstance(True, int)` 也成立，所以必须先查 bool 再谈数字——
+    反过来写会把 1/0 放进来。
+
+    **显式 `null` 也拒**（不等同于缺失）：字段不在 body 里说明调用方没表达
+    意图，取安全默认；而显式写了 `null` 说明它表达了一个不是布尔的东西，
+    通常是客户端 bug（把 undefined 变量序列化进去）。两种情形的安全方向
+    相同，但报 400 能让 bug 当场暴露，而不是静默按 False 跑过去。
+    """
+    if field not in body:
+        return False
+    value = body[field]
+    if not isinstance(value, bool):
+        raise ValueError(f"{field} 必须是布尔值 true/false，"
+                         f"收到 {type(value).__name__}")
+    return value
+
+
 def _dispatch(pattern, method, email, name, site_id, qs, body):
     if pattern == r"^/api/me$":
         return api.do_me(email, name)
@@ -165,7 +242,7 @@ def _dispatch(pattern, method, email, name, site_id, qs, body):
                                      new_owner=body.get("new_owner", ""))
     if pattern.endswith(r"/undeploy$"):
         return api.do_undeploy(email, site_id,
-                               purge_data=bool(body.get("purge_data")))
+                               purge_data=_strict_bool(body, "purge_data"))
     if pattern == r"^/api/admins$":
         if method == "GET":
             return api.do_list_admins(email)

@@ -9,9 +9,9 @@ from upgrade_code_vectors import MUTATIONS, SECRET
 
 def test_code_is_single_use(aws, secret):
     code = session.mint_upgrade_code("u@x.com", SECRET)
-    assert console_session.consume_code(code) == "u@x.com"
+    assert console_session.consume_code(code, expected_email="u@x.com") == "u@x.com"
     with pytest.raises(console_session.UpgradeRejected):
-        console_session.consume_code(code)      # 重放
+        console_session.consume_code(code, expected_email="u@x.com")  # 重放
 
 
 def test_replay_is_rejected_by_conditional_write_not_by_a_read_check(aws, secret):
@@ -24,7 +24,7 @@ def test_replay_is_rejected_by_conditional_write_not_by_a_read_check(aws, secret
     ok = 0
     for _ in range(2):
         try:
-            console_session.consume_code(code)
+            console_session.consume_code(code, expected_email="u@x.com")
             ok += 1
         except console_session.UpgradeRejected:
             pass
@@ -33,7 +33,8 @@ def test_replay_is_rejected_by_conditional_write_not_by_a_read_check(aws, secret
 
 def test_consumed_jti_row_has_ttl(aws, secret):
     """session-codes 是一次性标记——必须带 TTL，否则表无限增长。"""
-    console_session.consume_code(session.mint_upgrade_code("u@x.com", SECRET))
+    console_session.consume_code(session.mint_upgrade_code("u@x.com", SECRET),
+                                expected_email="u@x.com")
     items = boto3.resource("dynamodb", region_name="us-east-1").Table(
         "site-session-codes").scan()["Items"]
     assert len(items) == 1 and int(items[0]["expires_at"]) > 0
@@ -45,7 +46,7 @@ def test_expired_code_is_rejected_before_being_consumed(aws, secret):
     code = session.mint_upgrade_code("u@x.com", SECRET, ttl_seconds=1)
     time.sleep(1.1)
     with pytest.raises(console_session.UpgradeRejected):
-        console_session.consume_code(code)
+        console_session.consume_code(code, expected_email="u@x.com")
     items = boto3.resource("dynamodb", region_name="us-east-1").Table(
         "site-session-codes").scan()["Items"]
     assert items == []
@@ -56,9 +57,9 @@ def test_same_vectors_as_auth_side(aws, secret, name, mutate, expect_reject):
     code = mutate(session.mint_upgrade_code("u@x.com", SECRET))
     if expect_reject:
         with pytest.raises(console_session.UpgradeRejected):
-            console_session.consume_code(code)
+            console_session.consume_code(code, expected_email="u@x.com")
     else:
-        assert console_session.consume_code(code) == "u@x.com"
+        assert console_session.consume_code(code, expected_email="u@x.com") == "u@x.com"
 
 
 def test_console_cookie_attributes(aws, secret):
@@ -165,3 +166,62 @@ def test_secret_cache_has_a_ttl(aws, monkeypatch):
         val, -console_session.SECRET_TTL_SECONDS * 2)
     console_session._secret()
     assert len(calls) == 2, "过期后应重新读 SSM"
+
+
+# ── 身份不符不得消费 jti（Codex 审查 2026-08-10 P2-3）──────────────────
+# 原实现：handler 先 consume_code() 原子写 jti，**之后**才比对 code 的 email
+# 与 Edge 身份。于是拿别人的 code 提交一次（401）就把它作废了，合法持有者
+# 随后再用会得到"升级码已被使用"。实测复现过这个顺序。
+
+def test_mismatched_identity_does_not_consume_jti(aws, secret):
+    """错身份提交 → 拒绝，且 code **仍可被正确身份使用**。"""
+    code = session.mint_upgrade_code("victim@x.com", SECRET)
+    with pytest.raises(console_session.UpgradeRejected):
+        console_session.consume_code(code, expected_email="attacker@x.com")
+    # 表里不得留下消费标记
+    items = boto3.resource("dynamodb", region_name="us-east-1").Table(
+        "site-session-codes").scan()["Items"]
+    assert items == [], f"错身份提交后 jti 已被写入: {items}"
+    # 合法持有者仍然能用
+    assert console_session.consume_code(
+        code, expected_email="victim@x.com") == "victim@x.com"
+
+
+def test_expected_email_is_required_to_match_exactly(aws, secret):
+    """匹配必须逐字符相等，且空值不得视为通过。"""
+    code = session.mint_upgrade_code("u@x.com", SECRET)
+    for bad in ("", "U@X.COM", "u@x.com ", "u@x.co"):
+        with pytest.raises(console_session.UpgradeRejected):
+            console_session.consume_code(code, expected_email=bad)
+    assert console_session.consume_code(
+        code, expected_email="u@x.com") == "u@x.com"
+
+
+def test_handler_callback_rejects_mismatch_without_burning_code(aws, secret):
+    """走 handler 的真实路径：错身份的 callback 不得作废 code。
+
+    这是用户可见面——单独测 consume_code 不够，handler 里的调用顺序才是
+    缺陷所在（它原来先消费再比对）。
+    """
+    import handler
+    from test_handler import EDGE_ROLE_ID
+    code = session.mint_upgrade_code("victim@x.com", SECRET)
+    ev = {"requestContext": {
+              "http": {"method": "GET"},
+              # 合规的 Edge IAM 上下文——本用例测的是 code 消费顺序，
+              # 不是 P1-1 的传输层校验（那个由 test_handler 覆盖）。
+              "authorizer": {"iam": {
+                  "callerId": f"{EDGE_ROLE_ID}:us-east-1.RouterStack-fn"}}},
+          "rawPath": "/api/session-callback",
+          "headers": {"x-user-email": "attacker@x.com"},
+          "queryStringParameters": {"code": code}}
+    r = handler.handler(ev, None)
+    assert r["statusCode"] == 401, r
+    items = boto3.resource("dynamodb", region_name="us-east-1").Table(
+        "site-session-codes").scan()["Items"]
+    assert items == [], f"错身份的 callback 把 code 作废了: {items}"
+    # 合法身份随后仍能换到面板会话
+    ev["headers"]["x-user-email"] = "victim@x.com"
+    r2 = handler.handler(ev, None)
+    assert r2["statusCode"] == 302, r2
+    assert any(console_session.CONSOLE_COOKIE in c for c in r2.get("cookies", []))

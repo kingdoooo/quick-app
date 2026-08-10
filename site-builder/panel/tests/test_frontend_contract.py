@@ -662,7 +662,9 @@ def test_edge_static_key_matches_what_deploy_panel_uploads(uri, rel):
     # upload_frontend 的 key 算法：frontend_prefix() + "/" + 相对路径。
     # **必须与它逐字符一致**——这里自己拼一遍是有意的：如果 upload_frontend
     # 改了拼法而本用例没改，本用例就应该红（它是两边形态的仲裁者）。
-    uploaded = dp.frontend_prefix("v1") + "/" + rel
+    # **不写死 "v1"**：版本段现在是前端内容指纹（P2-2），写死会让这条用例
+    # 在每次前端改动后变红，而它要盯的是"两边 key 逐字符相等"，不是版本值。
+    uploaded = dp.frontend_prefix() + "/" + rel
     route = {"subdomain": "console", "route_mode": "split",
              "static_prefix": dp.console_route_item(
                  "https://x.lambda-url.us-east-1.on.aws")["static_prefix"],
@@ -982,3 +984,42 @@ def test_toast_and_modal_escape_their_text_arguments():
     assert "opts.body" in modal_fn.group(1) and \
         not re.search(r"esc\(\s*opts\.body", modal_fn.group(1)), (
         "openModal 的 body 被 esc 了：它是调用方拼好的 HTML，转义后弹窗会显示源码")
+
+
+# ── ⑪ purge 失败不得被显示成"永久删除完成"（Codex 审查 2026-08-10 P1-3）──
+
+def test_job_label_covers_purge_failed():
+    """PURGE_FAILED 是 undeploy 新增的真实终态，缺词条会显示成空徽章。"""
+    m = re.search(r"const JOB_LABEL\s*=\s*\{(.*?)\n\}", _js(), re.S)
+    assert m, "找不到 JOB_LABEL"
+    labeled = set(re.findall(r"""['"]?([A-Z_]+)['"]?\s*:""", m.group(1)))
+    assert "PURGE_FAILED" in labeled, (
+        "JOB_LABEL 缺 PURGE_FAILED——undeploy 在数据清理失败时写这个状态")
+
+
+def test_purge_failed_is_registered_in_job_class():
+    """徽章样式同样要有，否则状态可见但没有失败色（读起来像成功）。"""
+    m = re.search(r"const JOB_CLASS\s*=\s*\{(.*?)\n\}", _js(), re.S)
+    assert m, "找不到 JOB_CLASS"
+    assert "PURGE_FAILED" in m.group(1), "JOB_CLASS 缺 PURGE_FAILED"
+
+
+def test_polling_does_not_report_success_on_purge_failed():
+    """轮询看到 PURGE_FAILED 时**不得**走"站点已下线"的成功分支。
+
+    这是 P1-3 的用户可见面：用户勾了"下线并清除数据"，数据没清掉却看到
+    删除成功。断言绑定到 PURGE_FAILED 在轮询函数里被单独处理。
+    """
+    blob = _js()
+    m = re.search(r"function\s+pollUndeploy\s*\([^)]*\)\s*\{(.*?)\n\}",
+                  blob, re.S)
+    assert m, "找不到 pollUndeploy"
+    body = m.group(1)
+    assert "PURGE_FAILED" in body, (
+        "pollUndeploy 没有分辨 PURGE_FAILED——它会落到 DELETED 的成功分支，"
+        "把「数据没清干净」显示成「站点已下线」")
+    # 成功分支不能把 PURGE_FAILED 一起收进去
+    ok_branch = re.search(r"if\s*\(job\s*&&\s*\((.*?)\)\)", body)
+    assert ok_branch, "找不到成功分支的条件"
+    assert "PURGE_FAILED" not in ok_branch.group(1), (
+        "PURGE_FAILED 被并进了成功分支")

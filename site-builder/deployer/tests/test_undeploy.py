@@ -147,13 +147,98 @@ def test_purge_dsql_selects_roles_exactly_not_by_prefix(aws):
     assert any("site_aaabc123_mig" in s for s in revokes), revokes
 
 
-def test_purge_failure_does_not_fail_undeploy(aws):
-    """清理失败不改变下线结果——路由/Lambda 已删，站点确实已下线。"""
+def test_purge_failure_keeps_site_deleted_but_job_reports_purge_failed(aws):
+    """站点确实已下线（路由/Lambda 已删），但**数据没清掉不能报成功**。
+
+    改自旧的 `test_purge_failure_does_not_fail_undeploy`（Codex 审查
+    2026-08-10 P1-3）：那条把"purge 失败仍写 DELETED"当成正确契约锁住了。
+    "站点已下线"与"数据已清除"是两件事，必须分别汇报——undeploy 是异步调用，
+    返回值里的 dynamodb_error 没人看得到，用户在控制台看到的是"删除成功"。
+
+    job 用 PURGE_FAILED 而不是 FAILED：站点真的下线了，报 FAILED 会让前端
+    显示"下线失败"，那是另一个方向的谎。
+    """
     import undeploy, common
     jid = _seed(common, boto3)
     with patch.object(undeploy, "_lambda", return_value=_lam_mock()), \
          patch.object(undeploy, "_purge_dynamodb", side_effect=RuntimeError("boom")):
         out = undeploy.handler({"job_id": jid, "site_id": "hello-x1",
                                 "purge_data": True}, None)
-    assert out["status"] == "DELETED"
+    # 站点侧：确实已下线
+    assert common.get_site("hello-x1")["status"] == "DELETED"
+    # 任务侧：必须能看出"数据没清干净"
+    job = common.get_job(jid)
+    assert job["status"] == "PURGE_FAILED", job
     assert "boom" in out["purged"]["dynamodb_error"]
+    # 错误摘要要落到 job 上（异步调用的返回值用户看不到）
+    assert job.get("error"), "purge 失败摘要没写进 job，用户无从得知"
+    assert "dynamodb" in job["error"].lower(), job["error"]
+
+
+def test_purge_success_reports_deleted(aws):
+    """别把上面那条写成"purge 一律 PURGE_FAILED"——全成功仍要是 DELETED。"""
+    import undeploy, common
+    jid = _seed(common, boto3, tier="fullstack-nosql")
+    with patch.object(undeploy, "_lambda", return_value=_lam_mock()):
+        undeploy.handler({"job_id": jid, "site_id": "hello-x1",
+                          "purge_data": True}, None)
+    assert common.get_job(jid)["status"] == "DELETED"
+
+
+def test_dsql_purge_failure_also_reports_purge_failed(aws):
+    """DSQL 侧失败同样不得报成功（两条清理路径都要覆盖）。"""
+    import undeploy, common
+    jid = _seed(common, boto3, tier="fullstack-sql")
+    with patch.object(undeploy, "_lambda", return_value=_lam_mock()), \
+         patch.object(undeploy, "_purge_dsql", side_effect=RuntimeError("pgboom")):
+        undeploy.handler({"job_id": jid, "site_id": "hello-x1",
+                          "purge_data": True}, None)
+    job = common.get_job(jid)
+    assert job["status"] == "PURGE_FAILED", job
+    assert "dsql" in job["error"].lower(), job["error"]
+
+
+# ── 中途失败必须收敛到终态（Codex 审查 2026-08-10 P1-4）────────────────
+# 实测复现过：注入 IAM 永久失败后
+#   job_status=RUNNING / job_phase=undeploy / route=已删除 / site=ACTIVE
+# 即"站点已经打不开了，控制台却显示 ACTIVE、任务永远转圈"。
+# sweeper 也救不了它：undeploy 是独立异步 Lambda，没有 SFN execution，
+# reconcile_job 的 sweeper 只会记一条 job_running_without_execution。
+
+def test_midway_failure_writes_terminal_state_and_reraises(aws):
+    """删 IAM 角色炸了：job 必须是 FAILED，且异常仍要抛出（触发 DLQ/告警）。"""
+    import undeploy, common
+    jid = _seed(common, boto3)
+    real_client = boto3.client
+
+    def fake(name, *a, **k):
+        c = real_client(name, *a, **k)
+        if name == "iam":
+            m = MagicMock()
+            m.exceptions.NoSuchEntityException = c.exceptions.NoSuchEntityException
+            m.list_role_policies.side_effect = RuntimeError("IAM 永久失败（注入）")
+            return m
+        return c
+
+    with patch.object(undeploy, "_lambda", return_value=_lam_mock()), \
+         patch.object(boto3, "client", fake):
+        try:
+            undeploy.handler({"job_id": jid, "site_id": "hello-x1"}, None)
+            raised = False
+        except RuntimeError:
+            raised = True
+    assert raised, "异常被吞了——异步调用失败必须冒出去才会进 DLQ/告警"
+    job = common.get_job(jid)
+    assert job["status"] == "FAILED", f"job 停在 {job['status']}，永远转圈"
+    assert job.get("error"), "没有错误摘要，用户不知道发生了什么"
+    # 中途失败**不得**把站点写成 DELETED（它没删干净）
+    assert common.get_site("hello-x1")["status"] != "DELETED"
+
+
+def test_job_marked_undeploy_kind_for_sweeper(aws):
+    """job 要能被认出是 undeploy（sweeper 的收敛规则不同于 deploy）。"""
+    import undeploy, common
+    jid = _seed(common, boto3)
+    with patch.object(undeploy, "_lambda", return_value=_lam_mock()):
+        undeploy.handler({"job_id": jid, "site_id": "hello-x1"}, None)
+    assert common.get_job(jid).get("kind") == "undeploy"

@@ -194,10 +194,23 @@ def do_undeploy(email: str, site_id: str, *, purge_data: bool = False) -> dict:
     payload = {"job_id": job_id, "site_id": site_id}
     if purge_data:
         payload["purge_data"] = True
-    boto3.client("lambda", region_name=os.environ.get(
-        "AWS_DEFAULT_REGION", "us-east-1")).invoke(
-            FunctionName=os.environ["UNDEPLOY_FN"],
-            InvocationType="Event", Payload=json.dumps(payload).encode())
+    try:
+        boto3.client("lambda", region_name=os.environ.get(
+            "AWS_DEFAULT_REGION", "us-east-1")).invoke(
+                FunctionName=os.environ["UNDEPLOY_FN"],
+                InvocationType="Event", Payload=json.dumps(payload).encode())
+    except Exception as e:
+        # **job 已经建好了（PENDING），invoke 失败必须就地收敛**
+        # （Codex 审查 2026-08-10 P1-4）：sweeper 只扫 RUNNING，一个停在
+        # PENDING 的 job 谁都不会再碰，用户看到"排队中"到永远。
+        # 收敛失败也不能盖掉原始异常（那才是根因）。
+        try:
+            common.update_job(job_id, status="FAILED",
+                              error="下线任务提交失败（未开始执行），站点未做任何"
+                                    "改动。请重新发起下线。")
+        except Exception:
+            pass
+        raise e
     return {"job_id": job_id, "status": "PENDING",
             "note": "下线已提交，请轮询该站点的部署历史查看进度"}
 

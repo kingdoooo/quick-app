@@ -68,6 +68,33 @@ def lambda_handler(event, context):
         return _server_error()
 
 
+def _redact_querystring(querystring: str) -> str:
+    """query string 的**可日志形态**：只留参数名与值长度，绝不留值本身。
+
+    为什么必需（Codex 审查 2026-08-10 P2-3）：query 里会出现认证材料——
+    Cognito 的 OAuth authorization code（`/callback?code=...`）与面板升级码
+    （`/api/session-callback?code=...`）。**真机证据**：本函数加进来之前，
+    ap-northeast-1 的 Edge 日志里已经存着一条明文 OAuth code
+    （2026-08-03T09:57:48Z，`code=ab27...&state=eyJ...`）。CloudWatch 日志是
+    长期留存且多区域分布的，认证材料进去就等于凭证落盘。
+
+    只打名字不打值：排查路由问题需要知道"带了哪些参数"，从不需要值本身。
+    """
+    if not querystring:
+        return ""
+    try:
+        out = []
+        for pair in querystring.split("&"):
+            if not pair:
+                continue
+            name, sep, value = pair.partition("=")
+            out.append(f"{name}=<{len(value)}b>" if sep else name)
+        return "&".join(out)
+    except Exception:
+        # 脱敏自身绝不能把原值当兜底返回——那正是要避免的事
+        return "<unparseable>"
+
+
 def _fix_querystring_encoding(querystring: str) -> str:
     """
     修复查询字符串中的编码问题，特别是Base64字符串中的等号
@@ -94,7 +121,10 @@ def _fix_querystring_encoding(querystring: str) -> str:
                 fixed_params.append(f"{key}={encoded_value}")
 
         result = "&".join(fixed_params)
-        logger.info(f"Fixed querystring: {querystring} -> {result}")
+        # **脱敏后再打**：query 里可能是 OAuth code / 面板升级码（见
+        # _redact_querystring 的 docstring，含真机泄漏证据）
+        logger.info(f"Fixed querystring: {_redact_querystring(querystring)} "
+                    f"-> {_redact_querystring(result)}")
         return result
 
     except Exception as e:
@@ -542,4 +572,6 @@ def _add_sigv4_auth(request: Dict[str, Any], domain: str, uri: str = "/",
                 "value": header_value
             }]
 
-    logger.info(f"Added SigV4 auth for Lambda URL in region {region} with querystring: {querystring}")
+    # 同样脱敏：这一行也会打到带 code= 的请求（见 _redact_querystring）
+    logger.info(f"Added SigV4 auth for Lambda URL in region {region} "
+                f"with querystring: {_redact_querystring(querystring)}")

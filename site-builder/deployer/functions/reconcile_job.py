@@ -25,7 +25,20 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # 终态：这些状态的 job 不得被覆盖。
-TERMINAL = ("SUCCEEDED", "FAILED", "DELETED")
+# PURGE_FAILED（M3 修复引入）："站点已下线但数据没清干净"——它是终态，
+# 不能被 sweeper 再收敛成 FAILED（那会把"URL 已失效"说成"下线失败"）。
+TERMINAL = ("SUCCEEDED", "FAILED", "DELETED", "PURGE_FAILED")
+
+# undeploy job 的超龄阈值。比 STALE_MINUTES 短得多：undeploy 是单个异步
+# Lambda（timeout ≤15 分钟），不像部署要走 30 分钟的状态机。超过这个时长还
+# RUNNING，只可能是 Lambda 被杀/超时/OOM——那些情形下进程没机会写终态。
+UNDEPLOY_STALE_MINUTES = 20
+
+# undeploy 中途失败/被杀后的固定文案。**不含事件里的 cause**（可能带用户
+# 数据或内部 ARN）。措辞要如实：站点可能已经部分删除，不能说"未受影响"。
+UNDEPLOY_ORPHAN_ERROR = (
+    "下线任务异常中断（执行进程未能写入结果）。站点可能处于部分下线状态："
+    "路由可能已删除但资源尚未清理完毕。请联系平台管理员核对，勿直接重试。")
 
 # sweeper 的超龄阈值：状态机 TimeoutSeconds=1800（30 分钟）+ 余量。
 STALE_MINUTES = 45
@@ -36,7 +49,8 @@ TIMEOUT_ERROR = ("部署执行超时已被系统终止（超过 30 分钟上限�
                  "请重新发起一次部署（会生成新任务）。")
 ABORT_ERROR = ("部署执行已被中止。请重新发起一次部署（会生成新任务）。")
 _REASON_ERROR = {"TIMED_OUT": TIMEOUT_ERROR, "ABORTED": ABORT_ERROR,
-                 "FAILED": ABORT_ERROR}
+                 "FAILED": ABORT_ERROR,
+                 "UNDEPLOY_ORPHAN": UNDEPLOY_ORPHAN_ERROR}
 
 _sfn_client = None
 
@@ -145,9 +159,21 @@ def sweeper_handler(event, context):
     分页安全、串行处理（站点量级下不需要并发；无界并发会打爆 SFN 的
     DescribeExecution 限流）。找不到 execution 时**不猜终态**——只计 orphan
     并打 ERROR 日志（进告警面）。
+
+    **按 kind 分流**（Codex 审查 2026-08-10 P1-4）：undeploy 是独立异步
+    Lambda，没有 SFN execution。原来对它调 DescribeExecution 必然
+    ExecutionDoesNotExist，于是被计成 orphan 后永久停在 RUNNING——
+    实测复现过 job=RUNNING/route=已删除/site=ACTIVE 这个不收敛状态。
+    undeploy 的判据只有"超龄"：它的 Lambda timeout ≤15 分钟，超过
+    UNDEPLOY_STALE_MINUTES 还 RUNNING 只可能是进程被杀/超时/OOM，
+    那些情形下代码没有机会写终态。
     """
-    cutoff = (datetime.now(timezone.utc)
-              - timedelta(minutes=STALE_MINUTES)).isoformat()
+    # 取两个阈值里更宽松的那个做扫描下限，各类型再按自己的阈值判定，
+    # 避免把 undeploy 的短阈值套到 deploy 上（那会误杀正常部署）。
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(minutes=STALE_MINUTES)).isoformat()
+    undeploy_cutoff = (now - timedelta(minutes=UNDEPLOY_STALE_MINUTES)).isoformat()
+    scan_cutoff = min(cutoff, undeploy_cutoff)
     sm_arn = _state_machine_arn()
     table = common._table("JOBS_TABLE")
     scanned = converged = orphans = 0
@@ -157,15 +183,28 @@ def sweeper_handler(event, context):
             "FilterExpression": "#s = :running AND updated_at < :cutoff",
             "ExpressionAttributeNames": {"#s": "status"},
             "ExpressionAttributeValues": {":running": "RUNNING",
-                                          ":cutoff": cutoff},
-            "ProjectionExpression": "job_id",
+                                          ":cutoff": scan_cutoff},
+            # kind 必须投影出来，否则分不出 deploy/undeploy
+            "ProjectionExpression": "job_id, kind, updated_at",
         }
         if start_key:
             kwargs["ExclusiveStartKey"] = start_key
         resp = table.scan(**kwargs)
         for item in resp.get("Items", []):
-            scanned += 1
             job_id = item["job_id"]
+            # ---- undeploy：不查 SFN，只看超龄 ----
+            if item.get("kind") == "undeploy":
+                if item.get("updated_at", "") >= undeploy_cutoff:
+                    continue        # 还没到它自己的阈值
+                scanned += 1
+                if converge_job_to_failed(
+                        job_id, reason="UNDEPLOY_ORPHAN") == "converged":
+                    converged += 1
+                continue
+            # ---- deploy：保持原逻辑（DescribeExecution 核对真实状态）----
+            if item.get("updated_at", "") >= cutoff:
+                continue            # 未达部署阈值（扫描下限更宽松，这里再筛）
+            scanned += 1
             arn = f"{sm_arn.replace(':stateMachine:', ':execution:')}:{job_id}"
             try:
                 ex_status = _sfn().describe_execution(

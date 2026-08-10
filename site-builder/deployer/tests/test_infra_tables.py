@@ -104,3 +104,27 @@ def test_jobs_has_site_index(template):
     assert "site-index" in idx, "控制台部署历史需要按 site_id 查"
     keys = {k["KeyType"]: k["AttributeName"] for k in idx["site-index"]["KeySchema"]}
     assert keys == {"HASH": "site_id", "RANGE": "created_at"}
+
+
+def test_undeploy_has_async_failure_destination(template):
+    """undeploy 的异步调用失败必须有去处（Codex 审查 2026-08-10 P1-4）。
+
+    它由 MCP/panel 以 InvocationType=Event 调用，不进状态机——add_catch 与
+    SFN 的收敛都覆盖不到。**线上实测过**：没有 EventInvokeConfig 也没有
+    DeadLetterConfig，Lambda 重试后静默丢弃，站点部分删除却无人知晓。
+
+    按 FunctionName 反查逻辑 ID 再断言（同 test_step_lambdas 的理由：模板里
+    是 Ref 不是字面量）。
+    """
+    undeploy_lid = next(
+        lid for lid, res in
+        template.find_resources("AWS::Lambda::Function").items()
+        if res["Properties"].get("FunctionName") == "site-deployer-undeploy")
+    configs = template.find_resources("AWS::Lambda::EventInvokeConfig")
+    mine = [c for c in configs.values()
+            if c["Properties"].get("FunctionName", {}).get("Ref") == undeploy_lid]
+    assert mine, "site-deployer-undeploy 没有 EventInvokeConfig（失败即静默丢弃）"
+    props = mine[0]["Properties"]
+    assert "OnFailure" in props.get("DestinationConfig", {}), props
+    # 删除类动作不自动重试：部分删除后重跑会撞"资源已不存在"，掩盖真实根因
+    assert props.get("MaximumRetryAttempts") == 0, props

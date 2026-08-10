@@ -48,12 +48,16 @@ const STATUS_LABEL = {
 const STATUS_CLASS = {
   ACTIVE: 'badge-ok', DEPLOYING: 'badge-run', FAILED: 'badge-fail', DELETED: 'badge-off'
 };
+/* PURGE_FAILED：站点确实已下线，但数据清理没全部成功（undeploy.py 写入）。
+ * 它**不是**"下线失败"——URL 已经打不开了，只是数据可能还在。所以标签说
+ * 数据，样式取警告色而不是失败色。 */
 const JOB_LABEL = {
-  SUCCEEDED: '成功', FAILED: '失败', RUNNING: '进行中', PENDING: '排队中', DELETED: '已下线'
+  SUCCEEDED: '成功', FAILED: '失败', RUNNING: '进行中', PENDING: '排队中',
+  DELETED: '已下线', PURGE_FAILED: '已下线·数据未清完'
 };
 const JOB_CLASS = {
   SUCCEEDED: 'badge-ok', FAILED: 'badge-fail', RUNNING: 'badge-run',
-  PENDING: 'badge-off', DELETED: 'badge-off'
+  PENDING: 'badge-off', DELETED: 'badge-off', PURGE_FAILED: 'badge-warn'
 };
 
 /* permissions.py 的 ROLE_* 四个常量，一个不多一个不少。
@@ -1280,7 +1284,18 @@ function pollUndeploy(siteId, jobId, tries) {
       job = null;
     }
     if (job && (job.status === 'DELETED' || job.status === 'SUCCEEDED')) {
+      /* 只有走到这里才是"请求的清理全部完成"。勾了清除数据时，后端在
+       * 清理失败的情况下写 PURGE_FAILED 而不是 DELETED，所以这条成功文案
+       * 不会误报（Codex 审查 2026-08-10 P1-3）。 */
       toast('站点已下线', '路由与运行时已删除', 'ok');
+      if (state.route.page === 'site') pageSite(); else pageSites();
+      return;
+    }
+    /* **站点已下线 ≠ 数据已清除**。用户勾的是"永久删除数据"，清理失败时
+     * 绝不能显示删除成功——数据可能还在。这里如实说明并指向管理员。 */
+    if (job && job.status === 'PURGE_FAILED') {
+      toast('站点已下线，但数据未清理完成',
+            job.error || '部分数据可能仍然存在，请联系平台管理员核对', 'err');
       if (state.route.page === 'site') pageSite(); else pageSites();
       return;
     }

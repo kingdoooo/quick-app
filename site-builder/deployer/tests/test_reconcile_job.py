@@ -155,3 +155,63 @@ def test_sweeper_reports_orphan_without_guessing(aws):
         out = reconcile_job.sweeper_handler({}, None)
     assert out["orphans"] == 1 and out["converged"] == 0
     assert _get_job("job-orphan")["status"] == "RUNNING", "不得猜测终态"
+
+
+# ── undeploy job 的独立收敛规则（Codex 审查 2026-08-10 P1-4）───────────
+# undeploy 是**独立异步 Lambda**，没有 SFN execution。原 sweeper 假设每个
+# RUNNING job 都对应一个 execution，于是 undeploy 中途失败后只会记一条
+# job_running_without_execution，job 永久 RUNNING（实测复现过）。
+# 所以按 kind 分流：undeploy 不查 SFN，只看超龄。
+
+def _stale_undeploy(job_id, minutes, status="RUNNING"):
+    t = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+    boto3.resource("dynamodb", region_name="us-east-1").Table(
+        "site-deploy-jobs").put_item(Item={
+            "job_id": job_id, "site_id": "s1", "owner": "u@x.com",
+            "status": status, "phase": "undeploy", "kind": "undeploy",
+            "error": "", "url": "", "created_at": t, "updated_at": t})
+
+
+def test_sweeper_converges_stale_undeploy_without_calling_sfn(aws):
+    """超龄的 undeploy job 必须收敛，且**不查 SFN**（它本来就没有 execution）。"""
+    _stale_undeploy("job-und1", 60)
+    sfn = MagicMock()
+    with patch.object(reconcile_job, "_sfn", return_value=sfn):
+        out = reconcile_job.sweeper_handler({}, None)
+    sfn.describe_execution.assert_not_called()
+    assert out["converged"] == 1, out
+    job = _get_job("job-und1")
+    assert job["status"] == "FAILED", job
+    assert job.get("error"), "收敛后必须留下用户可读的原因"
+
+
+def test_sweeper_skips_fresh_undeploy(aws):
+    """未超龄的 undeploy 不碰——它可能正在正常执行（清 DSQL 可能要几十秒）。"""
+    _stale_undeploy("job-und-fresh", 5)
+    sfn = MagicMock()
+    with patch.object(reconcile_job, "_sfn", return_value=sfn):
+        out = reconcile_job.sweeper_handler({}, None)
+    assert out["converged"] == 0
+    assert _get_job("job-und-fresh")["status"] == "RUNNING"
+
+
+def test_sweeper_does_not_touch_purge_failed(aws):
+    """PURGE_FAILED 是终态：站点确实已下线，不能被改写成"下线失败"。"""
+    _stale_undeploy("job-und-pf", 60, status="PURGE_FAILED")
+    sfn = MagicMock()
+    with patch.object(reconcile_job, "_sfn", return_value=sfn):
+        reconcile_job.sweeper_handler({}, None)
+    assert _get_job("job-und-pf")["status"] == "PURGE_FAILED"
+
+
+def test_purge_failed_is_registered_terminal(aws):
+    """漏登记 TERMINAL 会让新状态被当成"可覆盖"——按常量断言，不靠行为推断。"""
+    assert "PURGE_FAILED" in reconcile_job.TERMINAL
+
+
+def test_converge_does_not_overwrite_purge_failed(aws):
+    """即便被直接调用，也不得覆盖 PURGE_FAILED（条件写只认 RUNNING）。"""
+    _stale_undeploy("job-und-pf2", 60, status="PURGE_FAILED")
+    assert reconcile_job.converge_job_to_failed(
+        "job-und-pf2", reason="ABORTED") == "noop"
+    assert _get_job("job-und-pf2")["status"] == "PURGE_FAILED"

@@ -61,19 +61,31 @@ def _codes_table():
             os.environ["SESSION_CODES_TABLE"])
 
 
-def consume_code(code: str) -> str:
+def consume_code(code: str, *, expected_email: str) -> str:
     """验 code 并**原子消费** jti → email。任何不可信情形抛 UpgradeRejected。
 
     条件写而不是"先查再写"：并发重放下后者两边都会看到"没用过"，两个请求
     都能换到面板会话。
 
-    验签**在消费之前**：否则一个伪造的 code 也能往表里写一行（垃圾数据 +
-    可被用来探测 jti 空间）。
+    **三步顺序不可调换**（每一步都在挡一类攻击）：
+      ① 验签 —— 否则伪造的 code 也能往表里写一行（垃圾数据 + 探测 jti 空间）；
+      ② 比对 expected_email —— **必须在消费之前**（Codex 审查 2026-08-10
+         P2-3）。原来是"先消费再由 handler 比对"，于是拿别人的 code 提交一次
+         （得到 401）就把它作废了，合法持有者随后只会看到"升级码已被使用"。
+         实测复现过。这一步放在条件写之前，错身份就不会留下任何痕迹；
+      ③ 原子消费 jti。
+
+    `expected_email` 是**必填关键字参数**：给默认值等于允许调用方忘记传，
+    而"忘记传"恰好退化成原来那个缺陷。
     """
     import botocore.exceptions
     claims = session.verify_upgrade_code(code or "", _secret())
     if not claims:
         raise UpgradeRejected("升级码无效或已过期")
+    # **空值不得视为相等**（同 verify_console_cookie 的理由）：两边都空时
+    # `==` 成立，等于放行一个无身份的请求。
+    if not expected_email or claims.get("email") != expected_email:
+        raise UpgradeRejected("升级码与当前身份不符")
     try:
         _codes_table().put_item(
             Item={"jti": claims["jti"], "email": claims["email"],

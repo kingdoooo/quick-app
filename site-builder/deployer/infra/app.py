@@ -7,7 +7,8 @@ from pathlib import Path
 from aws_cdk import (App, CfnOutput, Duration, Environment, RemovalPolicy, Stack,
                      aws_codebuild as cb, aws_dynamodb as ddb,
                      aws_events as events, aws_events_targets as targets,
-                     aws_iam as iam, aws_lambda as lam_, aws_s3 as s3,
+                     aws_iam as iam, aws_lambda as lam_,
+                     aws_lambda_destinations as destinations, aws_s3 as s3,
                      aws_sqs as sqs, aws_stepfunctions as sfn,
                      aws_stepfunctions_tasks as tasks)
 from constructs import Construct
@@ -231,7 +232,7 @@ class SiteDeployerStack(Stack):
         f_route = step_fn("FnRoute", "register_route")
         f_smoke = step_fn("FnSmoke", "smoke_test", 60)
         f_mark = step_fn("FnMark", "mark_job")
-        step_fn("FnUndeploy", "undeploy", 300)  # MCP 直调，不进状态机
+        f_undeploy = step_fn("FnUndeploy", "undeploy", 300)  # MCP/panel 直调，不进状态机
 
         mark_failed = tasks.LambdaInvoke(self, "MarkFailed", lambda_function=f_mark,
                                          payload_response_only=True)
@@ -332,6 +333,20 @@ class SiteDeployerStack(Stack):
         dlq = sqs.Queue(self, "ReconcileDlq",
                         queue_name="site-deployer-reconcile-dlq",
                         retention_period=Duration.days(14))
+
+        # undeploy 的**异步调用失败去处**（Codex 审查 2026-08-10 P1-4）。
+        # 它由 MCP/panel 以 InvocationType=Event 调用，不进状态机，所以
+        # add_catch 与 SFN 的任何收敛都覆盖不到它。没有 destination 时，
+        # Lambda 重试两次后**静默丢弃**——线上实测确认过它既没有
+        # EventInvokeConfig 也没有 DeadLetterConfig。
+        # 站点已部分删除却无人知晓，是这条链上最后一个静默失败点。
+        # 注意 job 的终态由 undeploy.handler 自己写（DLQ 只保证事件不丢、
+        # 有告警面）——两者都要，不可互相替代。
+        f_undeploy.configure_async_invoke(
+            retry_attempts=0,       # 删除类动作不自动重试：部分删除后重跑
+                                    # 会撞上"资源已不存在"，掩盖真实根因
+            max_event_age=Duration.hours(1),
+            on_failure=destinations.SqsDestination(dlq))
 
         # rule 只匹配**本状态机**的 TIMED_OUT / ABORTED。
         # 不匹配 FAILED：那条路径已由每个 Task 的 add_catch → MarkFailed 覆盖，
