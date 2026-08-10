@@ -492,15 +492,57 @@ host-only cookie 只会回发给 `auth.{domain}`，兄弟域 `console.{domain}` 
 
 ### 5.1 Key 形态与存储
 
-- 明文：`sk-` + 16 位随机 base62（约 95 bit 熵，内部平台足够）；仅创建响应
-  出现一次。
-- `site-api-keys` 表：PK `key_hash`（SHA-256）→ email、name（备注）、
-  prefix（`sk-` 后 4 位，展示用——只展示 4 位以保留剩余 12 位约 71 bit
-  熵）、created_at、last_used_at、revoked；
+**（2026-08-10 定稿：与控制台原型的形态冲突已裁决——取 spec 的密码学 + 原型的
+非秘密标识符。原型的 `sk-site-` 前缀与"`key_id` 作 PK"均不采用，理由见下。）**
+
+- 明文：`sk-` + 16 位随机 base62（**实算 95.3 bit** 熵，内部平台足够）；
+  仅创建响应出现一次。
+  **不用 `sk-site-` 前缀**（原型形态）：更长的静态前缀不增加任何安全性，
+  只占静态 Header 预算；`sk-` 已是"密钥"的通行约定。
+- `site-api-keys` 表：**PK `key_hash`（SHA-256(明文)）** → email、
+  name（备注）、prefix（`sk-` 后 4 位，展示用——只展示 4 位以保留剩余 12 位
+  **实算 71.5 bit** 熵）、created_at、last_used_at、revoked、**key_id**；
   GSI `email-index`（控制台按人列 Key）。
+  **PK 必须是 hash 而不是 `key_id`**：库被读走时攻击者只拿到哈希，反推不出可用
+  的 Key。这是这张表最值得保护的性质，也是不整体照搬原型的原因。
+- **`key_id`：独立随机 8 位 base62，非秘密**，供控制台列表与吊销引用。
+  为什么必须有它：spec 原文只有 `key_hash`，而哈希由明文导出、服务端不存明文，
+  于是 `DELETE /api/keys` 无法指定"删哪一把"。两种没有它的做法都不可接受——
+  传明文吊销（用户要粘贴秘密才能删，且会进日志），或用 4 位 prefix 匹配
+  （会碰撞，一个人有十来把 Key 时概率不可忽略，而碰撞的后果是**误删别的 Key**）。
+  **`key_id` 不得由 `key_hash` 派生**（那会让它变成哈希预言机），必须独立随机。
 - 吊销 = 置 revoked；交换层每请求查表，即时生效。
+  **交换层禁止缓存 hash→email 的映射**：一缓存"即时吊销"就不成立，而即时吊销
+  正是本设计存在的理由（代价是每次 MCP 调用一次 DynamoDB 读，已接受）。
 - **Key 管理只在控制台**（要求升级会话）。故意不做"MCP 工具管 Key"——
   持 Key 者能再造 Key 会让吊销失去意义。
+
+### 5.1.1 API Key 是**可选组件**（2026-08-10 定稿）
+
+**不配置 API Key 时，平台只允许 OAuth 一条认证路径。** 站点访问平面完全不受
+影响——API Key 只认证"谁在调部署 MCP"，与访问已部署站点的
+`require_login` / `allowed_users` 是两套独立的认证平面，Key 永远碰不到后者。
+
+**两层门禁都要有**（用户 2026-08-10 决定；单靠任一层都不够）：
+
+1. **组件门禁（主）——不配置就没有可对话的对象。** `config.ini` 无 `[ApiKey]`
+   段时：不建 resource server 与 machine client、不部署 key-proxy、不注册
+   `mcp.{base_domain}` route、`deploy_agentcore.py` **不把 machine client 加进
+   `allowedClients`**、也不把 `X-SB-On-Behalf-Of` 加进 `requestHeaderAllowlist`。
+   于是即使有人拿到一把 Key，也在**网关层**就被拒——不经过我们任何代码。
+   > 为什么以它为主而不是只用一个 flag：本项目已多次栽在"同一不变量被手抄多份、
+   > 漏判一处即失效"。machine client 根本不在 `allowedClients` 里时，**没有可写错
+   > 的代码路径**。spike 已实证这条链路 fail-closed：machine client 已进
+   > `allowedClients` 但 server 未改造时，机器 token 调工具得到
+   > "无法识别调用者身份"，拿不到任何数据（见 `docs/design/M4-SPIKE-2026-08-10.md`）。
+2. **显式开关（副）——已部署但要临时关。** `[ApiKey] enabled = false` 时
+   key-proxy 立即拒绝全部 Key（怀疑泄漏时的一键关闸，不必拆组件、不必重部
+   AgentCore）。它是应急手段，**不是**主门禁；实施时必须有结构性断言盯住
+   "所有判定点都读同一个开关"，否则就是上面那类手抄缺陷。
+
+**控制台入口同步门禁**：组件未部署时，API Key 页面必须显式 disabled 并说明原因
+（同 M3 对 M4/M5 占位的做法）——不得渲染一个看起来能用的表单，让用户创建出
+根本不通的 Key。
 
 ### 5.2 交换层（key-proxy）
 
@@ -524,6 +566,17 @@ Lambda（Function URL，AWS_IAM 仅 edge role）：
 `_caller_email()` 扩展：token 有 `email` claim 直接用（现有 OAuth 路径不变）；
 否则若 token 的 `client_id` == machine client **且**带 `X-SB-On-Behalf-Of`
 头，取头值为 caller（只有 key-proxy 持有 machine client secret，且已验 Key）。
+
+> **✅ 2026-08-10 spike 已完成，主案成立，备选不必启用。**
+> 实测结论（详见 `docs/design/M4-SPIKE-2026-08-10.md`，gitignored）：
+> ① machine client 进 `allowedClients` 后 `client_credentials` token
+> **能过网关**（HTTP 200，容器正常回 MCP `initialize`）；前置是**必须先建
+> resource server + scope**（不能用空 scope 建 client）。
+> ② `X-SB-On-Behalf-Of` 进 `requestHeaderAllowlist` 后请求能过，**但当前
+> `_caller_email()` 忽略该头**——"网关放行"与"容器采信"是两件事，M4 必须显式
+> 改造 §5.3 的信任规则。改造前机器 token 拿不到任何数据（fail-closed）。
+> ③ 踩点：**AgentCore runtime 删除是异步的**，`delete` 返回后立刻 list 仍能
+> 看到它，清理核对要轮询。
 
 **实施期 spike（真机验证后才锁定）**：AgentCore `allowedClients` 加 machine
 client 后 client_credentials token 能否过 authorizer；
@@ -984,9 +1037,11 @@ Function URL AuthType 与 resource policy、console route、CloudFront 实际
   基础详情、permissions / collaborators / owner transfer、jobs 历史、
   undeploy / purge_data、admin 名单与代管、admin resync、ops-log；
 - **M4**（不在 M3 写假接口/假数据/临时表）：API Key 的 UI 与 API（§4.4 的
-  `/api/keys`、§5 全部）。原型（Open Design 侧维护）里的 `sk-site-` 前缀与
-  `key_id` 字段与本 spec §5.1（`sk-` + 16 位 base62、PK=`key_hash`）
-  **不一致，是 M4 待确认项**，以 M4 实施时的决议为准；
+  `/api/keys`、§5 全部）。~~原型的 `sk-site-` 前缀与 `key_id` 字段与 §5.1
+  不一致，是 M4 待确认项~~ → **2026-08-10 已裁决**：取 §5.1 的密码学
+  （`sk-` + 16 base62、PK=`key_hash`）+ 原型的非秘密 `key_id`（独立随机，
+  供列表/吊销引用）。详见 §5.1 定稿说明。API Key 另定为**可选组件**，
+  两层门禁见 §5.1.1；
 - **M5**（同上不做假实现）：stats / audit 数据、`/api/sites/{id}/stats`、
   `/api/sites/{id}/audit`、图表与站点列表的 PV 迷你趋势；
 - 前端对 M4/M5 入口显示明确的 disabled / coming later 状态，或不显示，

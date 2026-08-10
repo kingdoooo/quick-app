@@ -84,3 +84,23 @@ session_codes_table = site-session-codes
 # 前端静态资源的版本前缀：S3 platform/console/{console_version}/
 # 每次前端改动递增，旧版本保留以便回滚（与站点前端的版本化上传同模式）。
 console_version = v1
+
+# ── API Key（二期 M4，**可选组件**）─────────────────────────────────
+# **整段不配置 = 平台只允许 OAuth 一条认证路径**，这是推荐的默认。
+# 不配置时：不建 Cognito resource server / machine client、不部署 key-proxy、
+# 不注册 mcp 子域、deploy_agentcore.py 不把 machine client 加进 allowedClients、
+# 也不放行 X-SB-On-Behalf-Of 头。于是即使有人拿到一把 Key 也在**网关层**被拒，
+# 不经过任何业务代码（spec §5.1.1 的"组件门禁"）。
+#
+# API Key 只认证"谁在调部署 MCP"，与访问已部署站点的 require_login /
+# allowed_users 是**两套独立的认证平面**——它碰不到站点访问。
+#
+# 需要给"只能配静态 Header 的客户端"（如 Quick Desktop Remote MCP）用时才配：
+# [ApiKey]
+# # 已部署组件后的应急开关：false = key-proxy 立即拒绝全部 Key（怀疑泄漏时
+# # 一键关闸，不必拆组件/重部 AgentCore）。它是副门禁，不替代上面的组件门禁。
+# enabled = true
+# keys_table = site-api-keys
+# # client_credentials 必须有 resource server + scope（不能用空 scope 建 client）
+# resource_server_id = site-builder-mcp
+# scope = invoke
