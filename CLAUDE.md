@@ -168,6 +168,7 @@ python3 site-builder/scripts/gen_onboarding.py
 | 任务级实现/审查历史（一期） | `.superpowers/sdd/progress.md` |
 | 二期进度 / 当前在做什么 | `docs/design/HANDOFF-2026-08-07.md` 的**最新一节**（状态真源，gitignored） |
 | 二期实测发现与结论 | `docs/design/M3-FINDINGS.md`（gitignored；含可复用的断言自查清单） |
+| M4 前置 spike 结论 | `docs/design/M4-SPIKE-2026-08-10.md`（gitignored；已验证过的别再跑一遍） |
 | 二期任务级证据链 | `.superpowers/sdd/<计划日期>-<计划名>/progress.md` |
 
 > **接手二期先读 HANDOFF 的最新一节**——进度、部署状态、闸门数字都在那里，
