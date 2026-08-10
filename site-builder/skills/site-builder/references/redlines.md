@@ -146,11 +146,18 @@
   这条对 `schema.sql` 与 `migrations/*.sql` **一视同仁**。
 - **为什么**：这些 PostgreSQL 特性在 DSQL 上不可用（DDL 会在 provision-db 阶段
   执行失败），静态扫描把它们拦在 validate 阶段。
-  **`JSONB` 是唯一的例外**：真机实测 DSQL **支持** jsonb 列与
-  `->>` / `jsonb_array_elements_text` 等运算符（2026-08-10 在本平台 cluster 上
-  建表、写入、查询、`information_schema` 报 `jsonb` 全部通过）。它留在禁用清单里
-  是**平台侧的保守选择**（一期定的，`TEXT` 存 JSON 已够用），不是 DSQL 的限制。
-  所以别在文档或提示里说"DSQL 不支持 JSONB"——那是错的。
+- **`JSONB` 的准确情况**（2026-08-10 真机实测，别照抄旧说法）：
+  - **数据层全部可用**：jsonb 列、`NOT NULL DEFAULT '{}'::jsonb`、
+    `->` `->>` `#>` `@>` `?`、`jsonb_set` / `jsonb_agg` / `jsonb_build_object` /
+    `jsonb_array_elements_text`，以非 admin 的 per-site role 身份也全部通过。
+  - **但 GIN 索引不支持**：`CREATE INDEX ASYNC ... USING GIN (col)` 报
+    `USING not supported for CREATE INDEX`。实测 `@>` 查询的计划是**全表扫描
+    + Filter**，不是索引查找。
+  - 所以"DSQL 不支持 JSONB"是错的，"用 JSONB 没有代价"也是错的：
+    **它可用但不可索引**。数据量一大、又要按 jsonb 内容过滤时会退化成全表扫。
+  - 平台因此**继续禁用**它：`TEXT` 存 JSON 至少不会让人误以为有索引加速。
+    确实需要按某个字段过滤时，把它**提成一个独立列**（可建普通索引），
+    这比塞进 jsonb 再指望索引更快也更清晰。
   migrations 文件不做静态扫描，但同样的禁用特性会在 provision-db 执行时
   直接报 SQL 错误——**写 migrations 时同样遵守本表**。
 - **违反后果**：
@@ -169,7 +176,7 @@
 |---|---|
 | 外键约束（`REFERENCES` / `FOREIGN KEY`） | 只存关联 id 列（如 `owner_id UUID NOT NULL`），关联存在性由应用层校验 |
 | `SERIAL` / `BIGSERIAL` 自增主键 | `id UUID PRIMARY KEY DEFAULT gen_random_uuid()` |
-| `JSONB` 列（**平台暂不开放，非 DSQL 限制**） | `TEXT` 存 JSON 字符串；确需 SQL 内解析时查询时转换 `col::jsonb` |
+| `JSONB` 列（DSQL 可存但**无法建 GIN 索引**，见上） | `TEXT` 存 JSON 字符串；**要按内容过滤就提成独立列**（可建普通索引）；确需 SQL 内解析时查询时转换 `col::jsonb` |
 | `ON DELETE CASCADE` | 软删除（`deleted_at TIMESTAMPTZ` 标记），或应用层按序删除子记录 |
 | 触发器（`CREATE TRIGGER` / PLpgSQL） | 逻辑放应用层（Express 路由内处理） |
 | 临时表（`CREATE TEMP TABLE`） | 用 CTE（`WITH ... AS`）或普通表 |

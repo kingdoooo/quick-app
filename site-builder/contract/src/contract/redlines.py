@@ -25,11 +25,16 @@ INNERHTML_RE = re.compile(
     r"(?:inner|outer)HTML\s*(?:[+]=|(?:\?\?|\|\|)=|=(?!=))"
     r"|insertAdjacentHTML\(|document\.write(?:ln)?\(")
 # 这些在 DSQL 上确实不可用，DDL 会在 provision-db 阶段失败。
-# **`JSONB` 是例外**：真机实测（2026-08-10，本平台 cluster）DSQL **支持** jsonb 列
-# 与 `->>` / `jsonb_array_elements_text`，`information_schema` 报的类型就是 jsonb。
-# 它留在这里是**一期定下的平台侧保守选择**（TEXT 存 JSON 已够用），不是 DSQL 限制。
-# 要放开的话：删掉这一项 + 同步 skills 的 redlines.md + 加一个用 jsonb 的 fixture
-# 真机跑一遍。别只删清单——那样文档与校验器会打架。
+#
+# **`JSONB` 的理由与其它几项不同**（2026-08-10 真机实测，改动前先读完）：
+#   · 数据层**可用**：jsonb 列、`@>` `?` `->>` `#>`、jsonb_set/jsonb_agg 等，
+#     以非 admin 的 per-site role 身份也全部通过。所以"DSQL 不支持 JSONB"是错的。
+#   · 但 **GIN 索引不支持**：`... USING GIN (col)` 报
+#     `USING not supported for CREATE INDEX`；实测 `@>` 查询走**全表扫描 + Filter**。
+#   · 即：**可用但不可索引**。禁用它是为了不让站点误以为 jsonb 能加速内容过滤——
+#     数据量一大就是全表扫。要按内容过滤的字段应该**提成独立列**（可建普通索引）。
+# 若将来要放开：先真机复测 GIN 是否已支持，再同步 skills 的 redlines.md +
+# 加一个用 jsonb 的 fixture。别只删这一项——那样文档与校验器会打架。
 FORBIDDEN_DDL = ["REFERENCES", "SERIAL", "JSONB", "CREATE TRIGGER", "CREATE TEMP"]
 # DSQL **不支持同步建索引**：`CREATE INDEX` 必须写成 `CREATE INDEX ASYNC`，
 # 否则 provision-db 阶段报 `unsupported mode. please use CREATE INDEX ASYNC.`
