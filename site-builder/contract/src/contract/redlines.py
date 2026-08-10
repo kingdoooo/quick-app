@@ -24,6 +24,12 @@ HEALTH_RE = re.compile(r"/api/health")
 INNERHTML_RE = re.compile(
     r"(?:inner|outer)HTML\s*(?:[+]=|(?:\?\?|\|\|)=|=(?!=))"
     r"|insertAdjacentHTML\(|document\.write(?:ln)?\(")
+# 这些在 DSQL 上确实不可用，DDL 会在 provision-db 阶段失败。
+# **`JSONB` 是例外**：真机实测（2026-08-10，本平台 cluster）DSQL **支持** jsonb 列
+# 与 `->>` / `jsonb_array_elements_text`，`information_schema` 报的类型就是 jsonb。
+# 它留在这里是**一期定下的平台侧保守选择**（TEXT 存 JSON 已够用），不是 DSQL 限制。
+# 要放开的话：删掉这一项 + 同步 skills 的 redlines.md + 加一个用 jsonb 的 fixture
+# 真机跑一遍。别只删清单——那样文档与校验器会打架。
 FORBIDDEN_DDL = ["REFERENCES", "SERIAL", "JSONB", "CREATE TRIGGER", "CREATE TEMP"]
 # DSQL **不支持同步建索引**：`CREATE INDEX` 必须写成 `CREATE INDEX ASYNC`，
 # 否则 provision-db 阶段报 `unsupported mode. please use CREATE INDEX ASYNC.`

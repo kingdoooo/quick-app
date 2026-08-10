@@ -144,8 +144,13 @@
 - **规则（索引）**：建索引**必须**写 `CREATE INDEX ASYNC`（`UNIQUE` 同理：
   `CREATE UNIQUE INDEX ASYNC`）。DSQL 不支持同步建索引。
   这条对 `schema.sql` 与 `migrations/*.sql` **一视同仁**。
-- **为什么**：Aurora DSQL 不支持这些 PostgreSQL 特性，DDL 会在
-  provision-db 阶段执行失败；静态扫描把它们拦在 validate 阶段。
+- **为什么**：这些 PostgreSQL 特性在 DSQL 上不可用（DDL 会在 provision-db 阶段
+  执行失败），静态扫描把它们拦在 validate 阶段。
+  **`JSONB` 是唯一的例外**：真机实测 DSQL **支持** jsonb 列与
+  `->>` / `jsonb_array_elements_text` 等运算符（2026-08-10 在本平台 cluster 上
+  建表、写入、查询、`information_schema` 报 `jsonb` 全部通过）。它留在禁用清单里
+  是**平台侧的保守选择**（一期定的，`TEXT` 存 JSON 已够用），不是 DSQL 的限制。
+  所以别在文档或提示里说"DSQL 不支持 JSONB"——那是错的。
   migrations 文件不做静态扫描，但同样的禁用特性会在 provision-db 执行时
   直接报 SQL 错误——**写 migrations 时同样遵守本表**。
 - **违反后果**：
@@ -164,7 +169,7 @@
 |---|---|
 | 外键约束（`REFERENCES` / `FOREIGN KEY`） | 只存关联 id 列（如 `owner_id UUID NOT NULL`），关联存在性由应用层校验 |
 | `SERIAL` / `BIGSERIAL` 自增主键 | `id UUID PRIMARY KEY DEFAULT gen_random_uuid()` |
-| `JSONB` 列 | `TEXT` 存 JSON 字符串；确需 SQL 内解析时查询时转换 `col::jsonb` |
+| `JSONB` 列（**平台暂不开放，非 DSQL 限制**） | `TEXT` 存 JSON 字符串；确需 SQL 内解析时查询时转换 `col::jsonb` |
 | `ON DELETE CASCADE` | 软删除（`deleted_at TIMESTAMPTZ` 标记），或应用层按序删除子记录 |
 | 触发器（`CREATE TRIGGER` / PLpgSQL） | 逻辑放应用层（Express 路由内处理） |
 | 临时表（`CREATE TEMP TABLE`） | 用 CTE（`WITH ... AS`）或普通表 |
