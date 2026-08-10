@@ -25,6 +25,19 @@ INNERHTML_RE = re.compile(
     r"(?:inner|outer)HTML\s*(?:[+]=|(?:\?\?|\|\|)=|=(?!=))"
     r"|insertAdjacentHTML\(|document\.write(?:ln)?\(")
 FORBIDDEN_DDL = ["REFERENCES", "SERIAL", "JSONB", "CREATE TRIGGER", "CREATE TEMP"]
+# DSQL **不支持同步建索引**：`CREATE INDEX` 必须写成 `CREATE INDEX ASYNC`，
+# 否则 provision-db 阶段报 `unsupported mode. please use CREATE INDEX ASYNC.`
+# （FeatureNotSupported）。真机踩过：站点 returns-dashboard 的 schema.sql 写了三条
+# 普通 CREATE INDEX，首次部署在 provision-db 失败，站点从未上线。
+#
+# 为什么单独一条规则而不是塞进 FORBIDDEN_DDL：那份清单是"整个特性不可用"（如
+# SERIAL 没有替代语法），而索引是**可用的、只是要换关键字**。两者给用户的
+# 提示完全不同——前者要改设计，后者加一个词就行。
+#
+# 匹配口径：`CREATE [UNIQUE] INDEX` 后面紧跟的必须是 `ASYNC`。允许
+# `IF NOT EXISTS`（DSQL 支持且推荐用于幂等），所以 ASYNC 出现在它之前。
+CREATE_INDEX_RE = re.compile(
+    r"\bCREATE\s+(?:UNIQUE\s+)?INDEX\b(?!\s+ASYNC\b)", re.IGNORECASE)
 # Edge 注入的 x-user-name 是 **URL 编码**的（HTTP 头不能携带非 ASCII 字节——
 # 不编码会让中文名字直接被 CloudFront 拒掉），站点必须 decodeURIComponent。
 # 为什么值得一条红线：漏掉时**不报错**，而是把 `%E5%BD%AD…` 当人名显示、写库，
@@ -298,4 +311,32 @@ def scan_redlines(site_dir: Path, manifest: dict) -> list[str]:
             for kw in FORBIDDEN_DDL:
                 if kw in sql_upper:
                     violations.append(f"backend/schema.sql: 含 DSQL 不支持的 {kw}（见红线文档替代方案）")
+        # 索引规则对 schema.sql 与 migrations/*.sql **一视同仁**：
+        # provision_dsql.py 用同一个连接、同样逐条 execute 两者，所以同步建索引
+        # 在哪个文件里都会失败。只扫 schema.sql 会让"写进 migrations 就能绕过"
+        # ——而绕过的结果是部署失败，不是绕过成功。
+        for sql_file in _dsql_sql_files(backend_dir):
+            rel = sql_file.relative_to(backend_dir.parent).as_posix()
+            body = sql_file.read_text(errors="replace")
+            if CREATE_INDEX_RE.search(body):
+                violations.append(
+                    f"{rel}: DSQL 建索引必须写 CREATE INDEX ASYNC"
+                    "（同步建索引报 unsupported mode，站点会部署失败）")
     return violations
+
+
+def _dsql_sql_files(backend_dir):
+    """schema.sql + migrations/ 下按约定命名的迁移文件。
+
+    命名口径与 `provision_dsql.py` 的 `^\\d{3}_.+\\.sql$` **保持一致**——执行器
+    只跑符合该形态的文件，校验器多扫或少扫都会与真实行为不符。
+    """
+    out = []
+    schema = backend_dir / "schema.sql"
+    if schema.exists():
+        out.append(schema)
+    migrations = backend_dir / "migrations"
+    if migrations.is_dir():
+        out += sorted(p for p in migrations.glob("*.sql")
+                      if re.match(r"^\d{3}_.+\.sql$", p.name))
+    return out

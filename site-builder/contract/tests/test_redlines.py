@@ -536,3 +536,90 @@ def test_scanner_is_not_quadratic_on_large_files():
     start = time.monotonic()
     _check_user_name_decoded(code, Path("f.js"))
     assert time.monotonic() - start < 10, "疑似退化回 O(n²)"
+
+
+# ── DSQL 建索引必须 ASYNC（真机踩过：站点因此从未上线）─────────────────
+
+SYNC_INDEX_SQL = ("CREATE TABLE t (id UUID PRIMARY KEY, d DATE);\n"
+                  "CREATE INDEX IF NOT EXISTS idx_d ON t (d);")
+ASYNC_INDEX_SQL = ("CREATE TABLE t (id UUID PRIMARY KEY, d DATE);\n"
+                   "CREATE INDEX ASYNC IF NOT EXISTS idx_d ON t (d);")
+
+
+def test_sync_create_index_in_schema_fails(tmp_path):
+    """同步 CREATE INDEX 必须在 validate 阶段被拦下。
+
+    **这是真实事故的形态**：某站点的 schema.sql 写了三条普通
+    `CREATE INDEX IF NOT EXISTS`，provision-db 阶段报
+    `unsupported mode. please use CREATE INDEX ASYNC.`（FeatureNotSupported），
+    首次部署失败 → 站点永久停在 DEPLOYING、无 route、URL 404。
+    校验器当时不认识这条规则，所以平台接受了自己执行不了的 SQL。
+    """
+    d, m = make_site(tmp_path, schema=SYNC_INDEX_SQL)
+    assert any("ASYNC" in v for v in scan_redlines(d, m)), (
+        "同步建索引没被拦下——站点会在 provision-db 阶段失败")
+
+
+def test_async_create_index_passes(tmp_path):
+    """正确写法不得误报，否则用户没有可用的建索引方式。
+
+    这条与上一条成对：只有"错的被拦、对的放行"同时成立，规则才是可用的。
+    """
+    d, m = make_site(tmp_path, schema=ASYNC_INDEX_SQL)
+    assert scan_redlines(d, m) == [], (
+        f"正确的 CREATE INDEX ASYNC 被误报: {scan_redlines(d, m)}")
+
+
+@pytest.mark.parametrize("sql,should_fail", [
+    ("CREATE INDEX i ON t (c);", True),
+    ("CREATE UNIQUE INDEX i ON t (c);", True),
+    ("create index i on t (c);", True),                    # 大小写不敏感
+    ("CREATE  INDEX   i ON t (c);", True),                 # 多空格
+    ("CREATE INDEX ASYNC i ON t (c);", False),
+    ("CREATE UNIQUE INDEX ASYNC i ON t (c);", False),
+    ("CREATE INDEX ASYNC IF NOT EXISTS i ON t (c);", False),  # DSQL 推荐的幂等写法
+    ("create index async i on t (c);", False),
+])
+def test_index_rule_matrix(tmp_path, sql, should_fail):
+    """逐形态锁定：UNIQUE、大小写、空白、IF NOT EXISTS 都要判对。
+
+    只测一种写法的规则很容易被一个变体绕过（比如只认大写、或被 UNIQUE 打断）。
+    """
+    d, m = make_site(tmp_path,
+                     schema="CREATE TABLE t (id UUID PRIMARY KEY, c TEXT);\n" + sql)
+    hit = any("ASYNC" in v for v in scan_redlines(d, m))
+    assert hit == should_fail, f"{sql!r} 命中={hit} 期望={should_fail}"
+
+
+def test_sync_create_index_in_migrations_also_fails(tmp_path):
+    """migrations/*.sql 与 schema.sql **同等对待**。
+
+    `provision_dsql.py` 用同一个连接、同样逐条 execute 两者，所以同步建索引写在
+    migrations 里一样会失败。只扫 schema.sql 会让人以为"挪到 migrations 就行"，
+    而结果仍然是部署失败。
+    """
+    d, m = make_site(tmp_path)
+    mig = d / "backend/migrations"
+    mig.mkdir()
+    (mig / "001_add_index.sql").write_text("CREATE INDEX idx_x ON t (c);")
+    v = scan_redlines(d, m)
+    assert any("ASYNC" in x and "001_add_index.sql" in x for x in v), (
+        f"migrations 里的同步建索引没被拦下: {v}")
+
+
+def test_migration_file_naming_matches_the_executor(tmp_path):
+    """只扫执行器真会跑的文件名形态（`\\d{3}_*.sql`）。
+
+    校验器比执行器多扫会误报（用户放了个 notes.sql 当笔记却被拦），
+    少扫会漏（漏的那条到 provision-db 才炸）。两边口径必须一致。
+    """
+    d, m = make_site(tmp_path)
+    mig = d / "backend/migrations"
+    mig.mkdir()
+    # 不符合命名约定 → 执行器不会跑它 → 校验器也不该报
+    (mig / "scratch.sql").write_text("CREATE INDEX idx_x ON t (c);")
+    assert not any("ASYNC" in x for x in scan_redlines(d, m)), (
+        "执行器不会执行 scratch.sql，校验器却报了它")
+    # 符合约定 → 两边都要认
+    (mig / "002_real.sql").write_text("CREATE INDEX idx_y ON t (c);")
+    assert any("ASYNC" in x for x in scan_redlines(d, m))

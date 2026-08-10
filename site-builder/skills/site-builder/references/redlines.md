@@ -141,6 +141,9 @@
 
 - **规则**：`backend/schema.sql` 必须存在，且不得出现 `REFERENCES`、
   `SERIAL`、`JSONB`、`CREATE TRIGGER`、`CREATE TEMP`。
+- **规则（索引）**：建索引**必须**写 `CREATE INDEX ASYNC`（`UNIQUE` 同理：
+  `CREATE UNIQUE INDEX ASYNC`）。DSQL 不支持同步建索引。
+  这条对 `schema.sql` 与 `migrations/*.sql` **一视同仁**。
 - **为什么**：Aurora DSQL 不支持这些 PostgreSQL 特性，DDL 会在
   provision-db 阶段执行失败；静态扫描把它们拦在 validate 阶段。
   migrations 文件不做静态扫描，但同样的禁用特性会在 provision-db 执行时
@@ -149,6 +152,9 @@
   - `backend/schema.sql: fullstack-sql 必须提供建表 SQL`（文件缺失）
   - `backend/schema.sql: 含 DSQL 不支持的 REFERENCES（见红线文档替代方案）`
     （逐关键词报，`SERIAL`/`JSONB`/`CREATE TRIGGER`/`CREATE TEMP` 同理）
+  - `backend/schema.sql: DSQL 建索引必须写 CREATE INDEX ASYNC`
+    （漏 `ASYNC` 时 provision-db 阶段报
+    `unsupported mode. please use CREATE INDEX ASYNC.`，**站点不会上线**）
 - 扫描是大写后子串匹配：**注释里出现这些词也会命中**，schema.sql 里
   不要写含 `references`、`serial` 等词的注释。
 
@@ -162,6 +168,11 @@
 | `ON DELETE CASCADE` | 软删除（`deleted_at TIMESTAMPTZ` 标记），或应用层按序删除子记录 |
 | 触发器（`CREATE TRIGGER` / PLpgSQL） | 逻辑放应用层（Express 路由内处理） |
 | 临时表（`CREATE TEMP TABLE`） | 用 CTE（`WITH ... AS`）或普通表 |
+| 同步建索引（`CREATE INDEX`） | `CREATE INDEX ASYNC`（加一个词即可，索引本身完全可用） |
+
+> **索引不是禁用特性，只是换关键字。** 上表其它几项要改设计，这项加个
+> `ASYNC` 就行。DSQL 的索引是异步构建的：语句立刻返回，索引在后台建好，
+> 期间查询照常可用（只是暂时用不上该索引）。
 
 **正确的 schema.sql 样例**（黄金样例，来自 templates 同源 fixture）：
 
@@ -173,6 +184,9 @@ CREATE TABLE IF NOT EXISTS expenses (
   spender TEXT NOT NULL,
   created_at TIMESTAMPTZ DEFAULT now()
 );
+
+-- 需要索引时**必须**带 ASYNC（DSQL 不支持同步建索引）
+CREATE INDEX ASYNC IF NOT EXISTS idx_expenses_created_at ON expenses (created_at);
 ```
 
 **错误写法**：
@@ -183,6 +197,10 @@ CREATE TABLE orders (
   user_id UUID REFERENCES users(id) ON DELETE CASCADE, -- 违规：REFERENCES
   meta JSONB                                           -- 违规：JSONB
 );
+
+-- 违规：缺 ASYNC。provision-db 阶段报
+-- unsupported mode. please use CREATE INDEX ASYNC. → 站点不会上线
+CREATE INDEX idx_orders_user ON orders (user_id);
 ```
 
 另：DSQL 连接**只允许**原样复制 `templates/db.js` 并通过 `makePool()` 获取
