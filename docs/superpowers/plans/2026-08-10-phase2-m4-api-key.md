@@ -1034,8 +1034,13 @@ import pathlib
 # key-proxy/keystore.py —— 那个文件不存在，用例会 error 而不是 fail
 # （又一处"模块搬家后引用没跟着改"，同 Codex P1-4 的形态）。
 KP = pathlib.Path(__file__).parents[1]                      # site-builder/key-proxy
-FN = KP.parents[1] / "deployer" / "functions"               # deployer/functions
+FN = KP.parent / "deployer" / "functions"                   # deployer/functions
 MODULES = {"keystore.py": FN, "handler.py": KP}
+# **目录用 assert，文件才用 skip**（Task 3 实施期实测）：控制器 pre-flight 的
+# 第一版写成 `KP.parents[1]`，那是 quick-app/ —— 拼出的目录不存在，而用例既不
+# error 也不 fail，是 **skip**："我找错了地方"被伪装成"Task 5 还没做"。
+# 所以对目录 `assert directory.is_dir()`（找不到是本文件自己的 bug），
+# 只对文件缺失用 skip 并写明"文件缺失不等于已检查通过"。
 
 
 def _tree(name):
