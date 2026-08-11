@@ -231,8 +231,10 @@ def edge_role_id(edge_role_arn: str) -> str:
 
     为什么需要它而不能直接用 ARN（Codex 审查 2026-08-10 P1-1）：Edge 调过来
     的身份是 STS assumed-role 形态，`callerId` 是 `{RoleId}:{session_name}`，
-    与 config 里的 `arn:aws:iam::<acct>:role/<name>` **永不相等**。真机实测：
-        callerId: AROAX5GBA74KFZAAWDGMT:us-east-1.ApplicationWebRouterStack-...
+    与 config 里的 `arn:aws:iam::<acct>:role/<name>` **永不相等**。真机实测
+    （RoleId 本体按仓库红线打码成 `AROA<...>`——形态是这里唯一有信息量的
+    部分，真值现查 `aws iam get-role`）：
+        callerId: AROA<...>:us-east-1.ApplicationWebRouterStack-...
     RoleId 由 IAM 分配、STS 填写，调用方不可伪造，是这里唯一稳定的锚点。
 
     用 get_role 现查而不是让人往 config 里再抄一个值：手抄的第二份真源会漂移

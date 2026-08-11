@@ -448,9 +448,11 @@ def test_undeploy_invoke_failure_does_not_leave_pending_job(aws, secret,
 # /api/sites?all=1 返回全部 27 个站点。
 #
 # **不能拿 config 里的 edge_role_arn 逐字符比**（Codex 建议的做法会 403 整站）：
-# 真机抓到的 caller 是 STS 形态 + 区域前缀的 session name——
+# 真机抓到的 caller 是 STS 形态 + 区域前缀的 session name（RoleId 本体按仓库
+# 红线打码成 `AROA<...>`——形态是这里唯一有信息量的部分，真值现查
+# `aws iam get-role`）——
 #   userArn: arn:aws:sts::<acct>:assumed-role/<EdgeRoleName>/us-east-1.ApplicationWebRouterStack-...
-#   callerId: AROAX5GBA74KFZAAWDGMT:us-east-1.ApplicationWebRouterStack-...
+#   callerId: AROA<...>:us-east-1.ApplicationWebRouterStack-...
 # 而 config 里是 arn:aws:iam::<acct>:role/<EdgeRoleName>。两者永不相等。
 # 稳定且不可伪造的锚点是 callerId 的 AROA 段 = 该角色的 RoleId（已核对相等）。
 
