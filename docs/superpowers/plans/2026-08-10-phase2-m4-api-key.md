@@ -1028,12 +1028,19 @@ Lambda 的模块级变量跨请求存活，所以缓存可以在不改任何函�
 import ast
 import pathlib
 
-MODULES = ["keystore.py", "handler.py"]
-HERE = pathlib.Path(__file__).parents[1]
+# **两个模块住在不同的包里**（控制器 pre-flight 修正 2026-08-11）：
+# keystore.py 在 deployer/functions/（panel 与 key-proxy 共用，见补充 E），
+# handler.py 在 key-proxy/。按 parents[1] 拼 keystore.py 会指向
+# key-proxy/keystore.py —— 那个文件不存在，用例会 error 而不是 fail
+# （又一处"模块搬家后引用没跟着改"，同 Codex P1-4 的形态）。
+KP = pathlib.Path(__file__).parents[1]                      # site-builder/key-proxy
+FN = KP.parents[1] / "deployer" / "functions"               # deployer/functions
+MODULES = {"keystore.py": FN, "handler.py": KP}
 
 
 def _tree(name):
-    return ast.parse((HERE / name).read_text()), (HERE / name).read_text()
+    src = (MODULES[name] / name).read_text()
+    return ast.parse(src), src
 
 
 def test_no_module_level_mutable_containers(): ...
