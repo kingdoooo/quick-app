@@ -4,9 +4,9 @@
 
 **Goal:** 让"只能配静态 Header"的客户端（Quick Desktop Remote MCP 等）用一把 `sk-` API Key 直连部署 MCP，免 stdio 代理；Key 由用户在控制台自助创建/吊销，可即时生效；整套能力是**可选组件**（不配置 `[ApiKey]` 即 OAuth-only），且带一个 admin 可在控制台操作的应急关闸开关。
 
-**Architecture:** 四段。① 数据面：新表 `site-api-keys`（PK=`key_hash`，两个 GSI）+ 一条 `__switch__` 哨兵行承载全局开关，表访问收口在 `deployer/functions/keystore.py`（panel 与 key-proxy 都复制它）；② 交换层：新组件 `site-builder/key-proxy/`（Lambda + Function URL AWS_IAM 仅 edge role + `mcp.{base_domain}` route），验 Key 与开关（**同一次 BatchGetItem、强一致、不缓存**）→ 换 Cognito machine token（**进程内缓存至过期前 5 分钟**）→ **不懂 MCP 协议地透明转发**到 AgentCore endpoint；③ 信任规则：`_caller_email()` 新增 on-behalf 路径（`client_id == machine client` **且** `X-SB-On-Behalf-Of` 头存在且是邮箱形态），以及三处"缺一即不通"的组件门禁（`deploy_pool` 建 resource server + machine client、`deploy_agentcore` 的 `allowedClients` + `requestHeaderAllowlist`、`deploy_key_proxy` 部署与 route）；④ 控制台：`/api/keys` 三个端点 + `/api/settings/api-key` 开关（admin-only）+ 前端把 `pageKeys()` 占位换成真实实现。
+**Architecture:** 四段。① 数据面：新表 `site-api-keys`（PK=`key_hash`，两个 GSI）+ 一条 `__switch__` 哨兵行承载全局开关，表访问收口在 `deployer/functions/keystore.py`（panel 与 key-proxy 都复制它）；② 交换层：新组件 `site-builder/key-proxy/`（Lambda + Function URL AWS_IAM 仅 edge role + `mcp.{base_domain}` route），**先强一致读开关（关则立即拒、不读 Key、不产生任何写），再强一致读 Key**，两者都不缓存 → 换 Cognito machine token（**进程内缓存至过期前 5 分钟**）→ **不懂 MCP 协议地透明转发**到 AgentCore endpoint；③ 信任规则：`_caller_email()` 新增 on-behalf 路径（`client_id == machine client` **且** `X-SB-On-Behalf-Of` 头存在且是邮箱形态），以及三处"缺一即不通"的组件门禁（`deploy_pool` 建 resource server + machine client、`deploy_agentcore` 的 `allowedClients` + `requestHeaderAllowlist`、`deploy_key_proxy` 部署与 route）；④ 控制台：`/api/keys` 三个端点 + `/api/settings/api-key` 开关（admin-only）+ 前端把 `pageKeys()` 占位换成真实实现。
 
-**Tech Stack:** Python 3.13（key-proxy / panel Lambda）、Python 3.12（MCP 容器，实际由 Dockerfile 决定）、boto3、DynamoDB（BatchGetItem 强一致 + 两个 GSI + 条件写）、Cognito（resource server + custom scope + client_credentials）、Bedrock AgentCore Runtime（customJWTAuthorizer + requestHeaderAllowlist）、Lambda Function URL（AWS_IAM）、CDK（deployer 栈）、pytest + moto、原生 JS 静态 SPA（无构建链）。
+**Tech Stack:** Python 3.13（key-proxy / panel Lambda）、Python 3.12（MCP 容器，实际由 Dockerfile 决定）、boto3、DynamoDB（强一致 GetItem + 两个 GSI + 条件写/条件更新）、Cognito（resource server + custom scope + client_credentials）、Bedrock AgentCore Runtime（customJWTAuthorizer + requestHeaderAllowlist）、Lambda Function URL（AWS_IAM）、CDK（deployer 栈）、pytest + moto、原生 JS 静态 SPA（无构建链）。
 
 ---
 
@@ -57,7 +57,7 @@
 - **禁止缓存授权数据**（spec §5.1 定死）。这不是"不写缓存代码"就自动满足的——**Lambda 的模块级变量跨请求存活**，把 `key_hash → email` 或开关值放进任何模块级 dict / `functools.lru_cache` / 模块级单例，就会在容器复用期间静默变成缓存。允许缓存的只有 machine token（它不是授权判定，只是 key-proxy 证明自己身份的凭证）。参照 `mcp/server.py:36` 的既有教训（`_trusted_idps()` 每次调用读环境变量，固化成模块级常量后 monkeypatch 失效）。
 - **明文 Key 只出现在创建响应体里**，不得进任何 `logger` / `print` / ops-log / 异常消息 / URL / 查询参数。
 - **响应体不得出现 `key_hash`**（哪怕是 admin 视图）。
-- **判定顺序：先开关后 Key。** 关闸时不做任何 Key 查询、不更新 `last_used_at`——关闸期间不该产生任何写。
+- **判定顺序：先开关后 Key，两次独立的强一致 `GetItem`。** 关闸时**不发出 Key 的读请求**、不更新 `last_used_at`——关闸期间不该产生任何写。**不得合并成 `BatchGetItem`**：那样 Key 行必然被一起请求，短路就不成立（Codex P2-6）。
 - **key-proxy 不读任何 cookie。** `mcp` 子域**不进** `PLATFORM_SUBDOMAINS`（决定已定），所以 Edge 会剥除保留 cookie；代码层再加一层"不读 cookie"的断言，两层冗余。
 - **单把 Key 的启用/禁用就是 `revoked`，不加第三个状态。** 明文只在创建时显示一次、服务端不存明文，所以"暂停再恢复"的前提是用户手里还留着明文——安全收益为零，而多一个状态就多一处可能写成 fail-open 的分支。
 - **整体开关必须是独立的、优先于逐 Key 判定的短路，不是逐 Key 状态的聚合。** 逐个吊销全部 Key 不等价于关闸：非原子（N 次写，中途失败即"关了一半"）、不覆盖未来创建的 Key、且若泄漏的是面板会话则攻击者能一边建一边吊销。
@@ -75,7 +75,7 @@
 | 3 | Key 管理**只在控制台**（要求面板会话）；故意不做"MCP 工具管 Key" | spec §5.1 |
 | 4 | API Key 是**可选组件**，两层门禁：组件门禁为主（无 `[ApiKey]` 段 → machine client 不进 `allowedClients` → 网关层就拒）、开关为副（应急关闸） | spec §5.1.1 |
 | 5 | 主案成立（machine token + on-behalf 头），**不必回退**"自签 JWT + 自建 JWKS" | spike，spec §5.3 |
-| 6 | **开关落 DDB 哨兵行**（`site-api-keys` 表 `key_hash="__switch__"`），由 console 上的 admin 操作；`config.ini` 的 `[ApiKey]` **不再有 `enabled` 键** | brainstorming 2026-08-10 |
+| 6 | **开关落 DDB 哨兵行**（`site-api-keys` 表 `key_hash="__switch__"`），由 console 上的 admin 操作；`config.ini` 的 `[ApiKey]` **不再有 `enabled` 键**。**spec §5.1.1 与 `config.ini.example` 已在 2026-08-11 同步改掉**（Codex P1-1：两个真源比没有开关更危险——运维照旧文档设 `enabled=false` 而实现只读哨兵行，Key 全部继续有效且现场以为已关） | brainstorming 2026-08-10；spec 回写 2026-08-11 |
 | 7 | key-proxy 是**不懂协议的透明管道**：不解 JSON-RPC、不看 method、不过滤工具名；双向透传 `Mcp-Session-Id` / `Accept` / `Content-Type`，SSE 整体缓冲后原样回传 | brainstorming 2026-08-10 |
 | 8 | on-behalf 的 email 可信性由**创建时已验**保证（Key 只能在 console 创建，而 console 身份来自 Edge 注入的 `x-user-email`，那条路径已过 `REQUIRE_IDP_CLAIM` 的 `idp`/`auth_via` 校验）。机器 token 天生没有这三个 claim，on-behalf 路径**跳过**它们，但必须断言 `client_id == machine` 且头存在且是邮箱形态。已知取舍：用户离职后旧 Key 仍有效，靠审计 + 吊销处理 | brainstorming 2026-08-10 |
 | 9 | `mcp` 子域**不进** `PLATFORM_SUBDOMAINS` | brainstorming 2026-08-10 |
@@ -84,10 +84,11 @@
 
 | # | 补充 | 推导链 |
 |---|---|---|
-| A | `site-api-keys` 加 GSI **`keyid-index`**（PK `key_id`） | spec §4.4 的 `DELETE /api/keys` 拿到的是 `key_id`，而表 PK 是 `key_hash`。没有这个 GSI 只能全表 Scan；而吊销必须先查到该行的 `email` 与调用者比对（"只能吊销自己的"），Scan 在这条路径上既慢又容易写成"扫到就删" |
-| B | 开关与 Key 在**同一次 `BatchGetItem`** 取回 | spec §5.1 只说"每请求查表"。放同一次往返使"不缓存"的成本从两次读降到一次，且两个值来自同一时刻的强一致快照 |
-| C | `/api/me` 新增 `features.api_key` | spec §5.1.1 要求"组件未部署时 API Key 页面必须显式 disabled"。判据必须由**后端派生**（keys 表可读 + 哨兵行存在），不能让前端读 config.ini |
+| A | `site-api-keys` 加 GSI **`keyid-index`**（PK `key_id`）；**`key_id` 的唯一性由创建时的条件写保证，不靠 GSI** | spec §4.4 的 `DELETE /api/keys` 拿到的是 `key_id`，而表 PK 是 `key_hash`。没有这个 GSI 只能全表 Scan；而吊销必须先查到该行的 `email` 与调用者比对（"只能吊销自己的"），Scan 在这条路径上既慢又容易写成"扫到就删"。**唯一性部分是 Codex 审查 2026-08-11 P2-7 补的**——DynamoDB 的 GSI **不提供唯一约束**，而原方案的"生成 3000 个没重复"只证明了随机源没坏，不构成线上唯一性保证（8 位 base62 ≈ 47.6 bit，生日碰撞在几万把 Key 量级仍是小概率但非零）。三条补救见下 |
+| B | **先读开关（强一致），关则短路；再读 Key（强一致）**——两次独立 `GetItem`，不合并 | spec §5.1 只说"每请求查表"。**这一条是 Codex 审查 2026-08-11 P2-6 改的**：原方案写"同一次 `BatchGetItem` 拿两条，是同一时刻的原子快照"，两处都错。① `BatchGetItem` 是多个 `GetItem` 的并行 wrapper，`ConsistentRead=True` 只保证**每项**强一致，**不提供跨项原子快照**（要原子读集得用 `TransactGetItems`）；② 更要紧的是它与我自己定的"关闸时不查 Key"**自相矛盾**——一次 BatchGet 必然把 Key 行一起请求了。取舍：关闸时 1 次读、放行时 2 次读（原方案恒 1 次）。为多出的那次读换回真正的短路语义与自洽的成本论证，值得 |
+| C | `/api/me` 新增 `features.api_key`，**是三态对象不是布尔** | spec §5.1.1 要求"组件未部署时 API Key 页面必须显式 disabled"。判据必须由**后端派生**（哨兵行可读性 + 其 `enabled` 值），不能让前端读 config.ini。**三态是 Codex 审查 2026-08-11 P1-5 改的**：原方案是单布尔，而首次部署强制把哨兵行建成 `enabled=false`，若前端按 `api_key=false` 就"不发请求、不渲染入口"，admin 将**无处点开闸**——部署流程自锁。形态定为 `{"deployed": bool, "enabled": bool}`：`deployed` 决定 UI 是否可用，`enabled` 只驱动状态提示与开关初值 |
 | D | Edge 调用者校验提成**唯一实现** `deployer/functions/edge_caller.py`，panel 与 key-proxy 共用 | `44aef8d` 的 P1-1 给 panel 加了 `_edge_caller_ok()`（真机实证：同账号 principal 只要 identity policy 允许就能绕开 resource policy 直连）。key-proxy 是同一个缺陷面，抄第二份就是新的漂移源（M3-FINDINGS「别打地鼠，修那一类」）。落点见下方「为什么三个共享模块都落 `deployer/functions/`」 |
+| F | 组件门禁判定 `api_key_enabled()` 落 **`deployer/functions/api_key_config.py`**，不落 `deploy_pool.py` | **Codex 审查 2026-08-11 P1-3 改的，已复现**：原方案让 `deploy_agentcore.py` 与 `deploy_key_proxy.py` 都 `import deploy_pool`，但两个脚本的实际执行目录（`site-builder/mcp/`、`site-builder/key-proxy/`）都不含 `scripts/`。实测 `cd site-builder/mcp && python3 -c 'import deploy_pool'` → `ModuleNotFoundError`，即两个部署脚本会在任何 AWS 调用**之前**崩。落 `functions/` 后三个脚本都能 `sys.path.insert` 同一个相对路径（`deploy_pool.py` 现成的 `HERE.parent / "auth"` 就是这个形态），且它天然进 Lambda/容器打包 |
 | E | `keygen.py` 与 `keystore.py` 同样落 `deployer/functions/`，而不是 `key-proxy/` | 同 D 的落点理由，**self-review 期改的**。两条推力：① `panel/tests/test_deploy_panel_contract.py:43-44` 的传递闭包只搜 `deployer/functions` 与 `auth`，放 key-proxy 会迫使我**加宽一条既有安全断言的搜索路径**——"改断言让它通过"是本项目最危险的操作方向（M3-FINDINGS §2.16）；② 这两个模块**两个组件都要用**（panel 建 Key/改开关，key-proxy 验 Key/读开关），而哨兵行的形态（`enabled` 必须是布尔 `True`）必须只有一个定义，否则写入侧写字符串、读取侧按布尔判，症状是"控制台显示开着但所有 Key 都 401"且两侧单测各自都绿 |
 
 ---
@@ -107,10 +108,11 @@
 
 **新建：**
 
-> **为什么三个共享模块都落 `deployer/functions/`**（`edge_caller.py`、`keygen.py`、`keystore.py`）：三条理由叠加，与 `ops_log.py` 当年的落点决定同源（M3-FINDINGS §2.14）。
+> **为什么四个共享模块都落 `deployer/functions/`**（`edge_caller.py`、`keygen.py`、`keystore.py`、`api_key_config.py`）：三条理由叠加，与 `ops_log.py` 当年的落点决定同源（M3-FINDINGS §2.14）。
 > ① deployer 的 Lambda 打包**整个 `functions/` 目录**，所以放这里对 deployer 侧零成本；
 > ② panel / key-proxy 都已有"构建时复制"机制（`COPY_FILES`），复制源目录本就包含它；
 > ③ **`panel/tests/test_deploy_panel_contract.py:43-44` 的传递闭包只搜 `deployer/functions` 与 `auth`**。放这两个目录之外，就得去加宽那条既有安全断言的搜索路径——本项目已记录过"放宽断言让它通过"如何让断言永久失效（M3-FINDINGS §2.16）。
+> ④（`api_key_config.py` 专属）**部署脚本从三个不同目录执行**（`site-builder/`、`site-builder/mcp/`、`site-builder/key-proxy/`），只有 `functions/` 是三者都能用同一个相对路径 `sys.path.insert` 到的位置。放 `scripts/` 会让后两个脚本 `ModuleNotFoundError`（Codex P1-3 已实测复现）。
 >
 > 推论：**key-proxy 自己的 `COPY_FILES` 闭包断言也要用同样的两个搜索目录**，这样两个组件的复制清单断言形态一致，将来再加共享模块时两边都会自动变红。
 
@@ -120,7 +122,7 @@
 | `site-builder/deployer/tests/test_keygen.py` | Key 生成/哈希的单测（**随模块落 deployer 包**，跑法 `cd site-builder/deployer && .venv/bin/pytest tests -q`） |
 | `site-builder/deployer/tests/test_edge_caller.py` | 判定矩阵 + 四种绕过形态负测（`{id}EVIL:s` / `AIDAX:{id}` / `x{id}:s` / 小写） |
 | `site-builder/key-proxy/handler.py` | Function URL 入口：⓪ Edge 调用者 → ① 开关 → ② Key → ③ 换 token → ④ 透明转发 |
-| `site-builder/deployer/functions/keystore.py` | `site-api-keys` 的**唯一**访问层（panel 与 key-proxy 都复制）：`lookup()` / `touch_last_used()`（key-proxy 用）、`create()` / `list_for()` / `revoke()` / `switch_enabled()` / `set_switch()`（panel 用）。落点理由同 `keygen.py`，另见 Task 3 |
+| `site-builder/deployer/functions/keystore.py` | `site-api-keys` 的**唯一**访问层（panel 与 key-proxy 都复制）：`lookup()` / `touch_last_used()`（key-proxy 用）、`create()` / `list_for()` / `revoke()` / `switch_state()` / `set_switch()`（panel 用）。落点理由同 `keygen.py`，另见 Task 3 |
 | `site-builder/key-proxy/machine_token.py` | `client_credentials` 换 token + 进程内缓存至**过期前 5 分钟**；`invalidate()` 供 502 重试路径 |
 | `site-builder/deployer/functions/keygen.py` | Key 生成与哈希的**唯一**实现：`new_key() -> (plaintext, key_hash, key_id, prefix)`、`hash_key(plaintext)`、`SWITCH_PK`。panel 与 key-proxy 构建时各自复制（落点理由见本表上方的说明框） |
 | `site-builder/key-proxy/deploy_key_proxy.py` | 幂等部署：role + Lambda + Function URL(AWS_IAM 仅 edge role) + `mcp` route + `__switch__` 哨兵行（首次创建为 `enabled=false`） |
@@ -140,13 +142,13 @@
 | `site-builder/deployer/infra/app.py` | 新增 `site-api-keys` 表（PK `key_hash`，GSI `email-index` / `keyid-index`，`RemovalPolicy.RETAIN`） |
 | `site-builder/deployer/tests/test_infra_tables.py` | 新表与两个 GSI 的 CDK 断言 + RETAIN 断言 |
 | `site-builder/scripts/deploy_pool.py` | 新增 `ensure_resource_server()` 与 `api_key_enabled()`；**`_ensure_clients()` 签名加 `include_machine` / `machine_scopes` 两个 kwarg 并透传给 `client_configs`**（现签名只到 `idp_name`，`client_configs` 的 `include_machine` 分支目前没有调用方）；`_store_client_secrets` 的循环加 machine；`main()` 在有 `[ApiKey]` 段时建 resource server；回填提示补 `machine_client_id` |
-| `site-builder/mcp/deploy_agentcore.py` | `allowedClients` 与 `requestHeaderAllowlist` 从**硬编码单值**改为按 `[ApiKey]` 段派生；`_BUILD_INPUTS` 与 `build_and_push` 复制清单不变（server.py 改动已被指纹覆盖） |
+| `site-builder/mcp/deploy_agentcore.py` | `allowedClients` 与 `requestHeaderAllowlist` 从**硬编码单值**改为按 `[ApiKey]` 段派生；**`environmentVariables` 增加 `MACHINE_CLIENT_ID`**（有 `[ApiKey]` 段时取 `[Cognito] machine_client_id`，否则空串——**漏了这一条则容器内 `_machine_client_id()` 恒为空、所有 API Key 调用被 fail-closed 拒绝**，Codex 审查 2026-08-11 P1-2b）；`_BUILD_INPUTS` 与 `build_and_push` 复制清单不变（server.py 改动已被指纹覆盖） |
 | `site-builder/mcp/server.py` | `_caller_email()` 新增 on-behalf 路径；新增 `_machine_client_id()`（每次读环境变量） |
 | `site-builder/mcp/tests/test_tools.py` | on-behalf 正负测（**含"普通 OAuth 用户加头冒充他人"必须被拒**） |
 | `site-builder/panel/handler.py` | `ROUTES` 加 5 条；`_dispatch` 加分支；`_edge_caller_ok` 改为委托 `edge_caller.caller_is_edge` |
 | `site-builder/panel/api.py` | `do_list_keys` / `do_create_key` / `do_revoke_key` / `do_get_key_switch` / `do_set_key_switch`；`do_me` 加 `features` |
-| `site-builder/panel/deploy_panel.py` | 复制清单加 `edge_caller.py` + `keygen.py`；role 加 api-keys 表读写与两个 GSI Query；环境变量加 `API_KEYS_TABLE` |
-| `site-builder/panel/frontend/app.js` | `pageKeys()` 实现；导航去掉"规划中"；admin 页加开关；组件未部署时按 `features.api_key` 显示 disabled |
+| `site-builder/panel/deploy_panel.py` | 复制清单加 **`edge_caller.py` + `keystore.py` + `keygen.py` + `api_key_config.py`**（四个都在 `deployer/functions/`，`_build_zip` 现成的两目录查找即可命中）；role 加 api-keys 表读写与两个 GSI Query；环境变量加 `API_KEYS_TABLE`。**漏 `keystore.py` 会让契约测试当场红，放宽它则真机 panel 全部 500**（Codex 审查 2026-08-11 P1-4） |
+| `site-builder/panel/frontend/app.js` | `pageKeys()` 实现；导航去掉"规划中"；admin 页加开关；**按 `features.api_key.deployed` 决定 disabled**（不是 `.enabled`——见 Task 9） |
 | `site-builder/panel/tests/test_frontend_contract.py` | Key 页面的静态契约（明文只显示一次的警告、复制按钮、不请求不存在的接口） |
 | `site-builder/panel/tests/test_handler.py` | 新端点的六步前置继承（CSRF / 面板会话 / admin-only） |
 | `site-builder/panel/tests/test_deploy_panel_contract.py` | 复制清单与 role 权限的推导式断言（沿用 §2.18 的 AST 交叉核对形态） |
@@ -415,13 +417,19 @@ cd site-builder/panel && ../deployer/.venv/bin/pytest tests -q
 
 **`key_id` 必须独立随机，不得由 `key_hash` 派生**（spec §5.1）：派生会让它变成哈希预言机——拿到 `key_id` 就能验证对 `key_hash` 的猜测。
 
+**`key_id` 的唯一性必须由写入路径保证**（Codex P2-7）。**不改 spec 定稿的 8 位长度**——它是给人看/给人粘的标识符，加长会牺牲那个用途，而正确的修法本来就在写入侧而不是长度侧（加长只是把碰撞概率压小，不是消除，仍然需要下面第 2、3 条来处理"万一"）。三条一起做：
+
+1. **创建时检测并重试**：`keystore.create()` 先按 `keyid-index` Query 该 `key_id`，命中则重新生成（≤5 次，全失败则抛错而不是硬写下去）。这不是原子的（GSI 最终一致 + 无条件约束），所以还需要第 2 条兜底。
+2. **吊销时 Query 返回行数 ≠ 1 一律 fail-closed**：0 行 → 与"别人的 Key"同一句话（不泄露存在性）；**≥2 行 → 拒绝并记 ERROR 日志**，绝不"取第一行删掉"——那会误吊销别人的 Key（M3-FINDINGS 记过 prefix 匹配误删的同类风险）。
+3. **吊销的 `UpdateItem` 带条件表达式** `key_id = :kid AND email = :em`：Query 到 `key_hash` 之后的这一步是真正落地的写，条件必须重新断言两个字段。理由与 `sites_snapshot_guard` 同源——Query 与 Update 之间有窗口，而 GSI 是最终一致的（读到的行可能已经被改过）。
+
 **`__switch__` 与真 hash 不可能碰撞**：真 hash 是 64 位小写 hex，`__switch__` 含下划线。这条要有断言（而不是靠"显然"）——将来若有人把 hash 换成 base64 形态，`_` 就在字符集里了。
 
 - [ ] **Step 1: 写失败测试**
 
 创建 `site-builder/key-proxy/tests/conftest.py`（本 Task 先建好，Task 3 起真正用它）：照抄 `site-builder/panel/tests/conftest.py` 的整体形态，差异：
 ① `sys.path` 插入 `key-proxy` 目录与 `deployer/functions`（后者提供 `keygen` / `edge_caller` / `ops_log`）；
-② ENV 只需 `API_KEYS_TABLE` / `ROUTING_TABLE` / `AGENTCORE_ENDPOINT` / `COGNITO_DOMAIN` / `MACHINE_CLIENT_ID` / `MACHINE_SECRET_PARAM` / `EDGE_ROLE_ID` / `AWS_DEFAULT_REGION`；
+② ENV 需 `API_KEYS_TABLE` / `ROUTING_TABLE` / `AGENTCORE_ENDPOINT` / `COGNITO_DOMAIN` / `MACHINE_CLIENT_ID` / `MACHINE_SECRET_PARAM` / **`MACHINE_SCOPE`** / `EDGE_ROLE_ID` / `AWS_DEFAULT_REGION`（`MACHINE_SCOPE` 是 Codex P1-2a 补的，见 Task 4）；
 ③ 建表清单只需 `site-api-keys`（PK `key_hash`，两个 GSI）与 routing。
 
 创建 `site-builder/deployer/tests/test_keygen.py`（跑法是 deployer 包的 venv；**已核对** `deployer/tests/conftest.py:10` 把 `functions/` 插进了 `sys.path`，所以 `import keygen` 直接可用）：
@@ -498,6 +506,12 @@ def test_prefix_is_sk_plus_first_4_and_leaves_12_chars_secret():
 
 
 def test_entropy_no_collision_in_bulk():
+    """随机源自检。**这条不构成线上唯一性保证**（Codex P2-7）——
+
+    它只证明随机源没坏（比如没退化成常量或低位固定）。8 位 base62 ≈ 47.6 bit，
+    线上唯一性由 keystore.create() 的"Query 检测 + 重试"与吊销侧的
+    "行数 ≠ 1 即 fail-closed"共同保证，见 test_keystore.py 的对应用例。
+    """
     ks = [keygen.new_key() for _ in range(3000)]
     assert len({k.plaintext for k in ks}) == 3000
     assert len({k.key_hash for k in ks}) == 3000
@@ -613,21 +627,31 @@ cd site-builder/key-proxy && ../deployer/.venv/bin/pytest tests -q   # key-proxy
 **Interfaces:**
 - Produces（**这张表的全部访问都在本模块**，panel 与 key-proxy 都复制它）：
   - `Verdict` —— `NamedTuple(ok: bool, email: str, key_id: str, reason: str)`；`reason` 只用于**日志**，不回给客户端
-  - `lookup(plaintext: str) -> Verdict` —— 形态校验 → 一次 `BatchGetItem`（强一致）取 `[hash, __switch__]` → **先判开关后判 Key**（key-proxy 用）
+  - `lookup(plaintext: str) -> Verdict` —— 形态校验 → **强一致读开关（关即短路返回）→ 强一致读 Key**（key-proxy 用）
   - `touch_last_used(key_hash: str, key_id: str) -> None` —— 节流更新（每 Key 每小时至多一次写），失败只记日志不影响转发（key-proxy 用）
-  - `create(email, *, name) -> dict` / `list_for(email) -> list[dict]` / `revoke(key_id, *, actor) -> dict`（panel 用）
-  - `switch_enabled() -> bool` / `set_switch(enabled: bool, *, actor: str) -> None`（panel 与部署脚本用）
+  - `create(email, *, name) -> dict` —— 生成 + **`key_id` 唯一性重试（≤5 次）** + `PutItem` with `attribute_not_exists(key_hash)`
+  - `list_for(email) -> list[dict]` / `revoke(key_id, *, actor) -> dict` —— revoke 经 `keyid-index` Query，**行数 ≠ 1 一律 fail-closed**，`UpdateItem` 带 `key_id + email` 条件
+  - `switch_state() -> tuple[bool, bool]` —— 返回 `(deployed, enabled)`。**不是单个 `switch_enabled()`**（Codex P1-5）：`deployed` = 哨兵行可读，`enabled` = 该行 `enabled is True`。两者必须分开返回，否则控制台无法区分"未部署"与"已部署但关闸"，而首次部署后正是后者
+  - `set_switch(enabled: bool, *, actor: str) -> None`（panel 与部署脚本用）
   - `SWITCH_PK` —— 从 `keygen` 再导出（**同一个常量，不重新定义**）
 - Consumes: `keygen.{PLAINTEXT_RE, hash_key, new_key, SWITCH_PK}`、`ops_log.record`、`boto3` DynamoDB
 
 **为什么落 `deployer/functions/` 且是唯一访问层**（self-review 期修正，与补充 E 同源）：
-- panel 需要 `switch_enabled` / `set_switch` / CRUD，key-proxy 需要 `lookup` / `touch_last_used`。**两个组件都要**，所以必须落在两边复制清单都覆盖的目录（panel 的传递闭包只搜 `deployer/functions` 与 `auth`）。
+- panel 需要 `switch_state` / `set_switch` / CRUD，key-proxy 需要 `lookup` / `touch_last_used`。**两个组件都要**，所以必须落在两边复制清单都覆盖的目录（panel 的传递闭包只搜 `deployer/functions` 与 `auth`）。
 - 更重要的是**哨兵行的形态只能有一个定义**：panel 写它、key-proxy 读它。拆成两个模块就等于把"`enabled` 必须是布尔 `True`"这条不变量写两遍——而写入侧写成字符串、读取侧按布尔判，症状是"控制台显示开着但所有 Key 都 401"，且两侧单测各自都绿。这正是本项目反复出现的缺陷形态（M3-FINDINGS「别打地鼠，修那一类」）。
 - 同一理由下，`permissions.py` 当年也是这么收口的（权限写入只走 `write_permissions` 一个入口）。
 
 **key-proxy 的包里会有它不需要的 `create`**：这是有意接受的。key-proxy 的 role **没有** `PutItem`（Task 8 的断言锁定），所以那条路径在真机上会 AccessDenied——代码在但权限不在，是纵深而非缺陷。反过来把模块拆开的代价（上一条）更大。
 
-**开关与 Key 一次取回**（计划级补充 B）：`BatchGetItem` 单表两个 Key，`ConsistentRead=True`。
+**先开关后 Key，两次独立强一致读**（计划级补充 B，Codex P2-6 修正）：
+
+```
+_get_switch()  →  GetItem(__switch__, ConsistentRead=True)
+    enabled is not True  →  立即返回 Verdict(ok=False)   ← 不读 Key、不写 last_used
+_get_key(hash)  →  GetItem(key_hash, ConsistentRead=True)
+```
+
+**不要合并成 `BatchGetItem`**：那样"关闸时不查 Key"就不成立（一次 BatchGet 必然把两条一起请求），而这条短路是"关闸期间零写、零 Key 查询"的前提。也**不要用 `TransactGetItems`** 去追求原子快照——两个值之间没有需要原子性的不变量（开关关了就拒，与 Key 行当时是什么状态无关），`TransactGetItems` 只会带来两倍的读容量成本与一个 `dynamodb:TransactGetItems` 权限。
 
 **判定顺序：先开关后 Key。** 关闸时立即返回，不判 Key、**不调 `touch_last_used`**。理由：关闸期间不该产生任何写；且"关闸时仍在更新 last_used_at"会让审计看起来像"关闸没生效"。
 
@@ -637,8 +661,9 @@ cd site-builder/key-proxy && ../deployer/.venv/bin/pytest tests -q   # key-proxy
 |---|---|---|
 | 哨兵行不存在 | **拒** | 表刚建好还没跑部署脚本时，默认必须是关 |
 | 哨兵行 `enabled` 不是布尔 `True`（缺失/`"true"` 字符串/`1`/`None`） | **拒** | 照 Edge `require_auth` 的既有形态：`if x is not True`，不是 `if not x`。M3 实测过四种非布尔形态都能骗过 `if not x` |
-| `BatchGetItem` 抛异常 | **拒** | 读不到就不知道开关状态，此时放行等于开关形同虚设 |
-| `BatchGetItem` 返回 `UnprocessedKeys`（节流） | **拒** | 部分结果不可用于授权判定。**不重试**——重试会把一次限流放大成多次，且转发已经有超时预算 |
+| 开关 `GetItem` 抛异常 | **拒** | 读不到就不知道开关状态，此时放行等于开关形同虚设 |
+| Key `GetItem` 抛异常 | **拒** | 不能因为"开关是开的"就放行 |
+| 任一读被节流 | **拒，且不重试** | 重试会把一次限流放大成多次，且转发已经有超时预算 |
 | Key 行不存在 | 拒 | — |
 | Key 行 `revoked` 为真值（任何形态） | **拒** | 这一侧要 `if truthy` 而不是 `if x is True`——**与开关方向相反**：开关是"必须显式为真才放行"，吊销是"只要像真就拒绝"。两个方向都取最严 |
 | Key 行缺 `email` 或 `email` 不是邮箱形态 | **拒** | 脏数据不能变成"以空身份调用"（下游 `_caller_email` 会拿到空串） |
@@ -731,24 +756,36 @@ def test_switch_non_boolean_true_rejects(aws, bad):
     assert keystore.lookup(k.plaintext).ok is False
 
 
-def test_read_failure_rejects(aws, monkeypatch):
+def test_switch_read_failure_rejects(aws, monkeypatch):
     """读不到就不知道开关状态——此时放行等于开关形同虚设。"""
     def boom(*a, **kw):
         raise RuntimeError("throttled")
-    monkeypatch.setattr(keystore, "_batch_get", boom)
+    monkeypatch.setattr(keystore, "_get_switch_row", boom)
     assert keystore.lookup("sk-" + "a" * 16).ok is False
 
 
-def test_unprocessed_keys_rejects_and_does_not_retry(aws, monkeypatch):
-    """部分结果不可用于授权判定；**不重试**（会把一次限流放大成多次）。"""
-    calls = []
+def test_key_read_failure_rejects(aws, monkeypatch):
+    """开关读到了、Key 读失败 —— 同样必须拒（不能"开关是开的就放行"）。"""
+    _put_switch(True)
+    def boom(*a, **kw):
+        raise RuntimeError("throttled")
+    monkeypatch.setattr(keystore, "_get_key_row", boom)
+    assert keystore.lookup(_put_key().plaintext).ok is False
 
-    def partial(*a, **kw):
-        calls.append(1)
-        return {}, {"site-api-keys": {"Keys": [{"key_hash": {"S": "x"}}]}}
-    monkeypatch.setattr(keystore, "_batch_get", partial)
-    assert keystore.lookup("sk-" + "a" * 16).ok is False
-    assert len(calls) == 1, "不得重试"
+
+def test_neither_read_is_retried(aws, monkeypatch):
+    """两个读都**不重试**：重试会把一次限流放大成多次，而转发本身有超时预算。"""
+    n = {"switch": 0, "key": 0}
+    rs, rk = keystore._get_switch_row, keystore._get_key_row
+    monkeypatch.setattr(keystore, "_get_switch_row",
+                        lambda *a, **kw: (n.__setitem__("switch", n["switch"] + 1),
+                                          rs(*a, **kw))[1])
+    monkeypatch.setattr(keystore, "_get_key_row",
+                        lambda *a, **kw: (n.__setitem__("key", n["key"] + 1),
+                                          rk(*a, **kw))[1])
+    _put_switch(True)
+    keystore.lookup(_put_key().plaintext)
+    assert n == {"switch": 1, "key": 1}
 
 
 # ---------- Key 侧的 fail-closed ----------
@@ -789,7 +826,7 @@ def test_dirty_email_rejects(aws, email):
 def test_malformed_plaintext_rejects_without_db_read(aws, bad, monkeypatch):
     """形态不对时**不查库**：省一次读，也防止把任意长串当 key 去 hash。"""
     calls = []
-    monkeypatch.setattr(keystore, "_batch_get",
+    monkeypatch.setattr(keystore, "_get_key_row",
                         lambda *a, **kw: calls.append(1) or ({}, {}))
     assert keystore.lookup(bad).ok is False
     assert calls == [], "形态校验必须在查库之前"
@@ -826,7 +863,7 @@ def test_switch_flip_takes_effect_on_next_call(aws):
 
 
 def test_every_lookup_hits_the_database(aws, monkeypatch):
-    """计数断言：N 次 lookup 必须有 N 次读。
+    """计数断言：N 次 lookup 必须有 N 次开关读 + N 次 Key 读。
 
     上面两条能抓住"永久缓存"，抓不住"带 TTL 的缓存"（TTL 内的第二次调用
     仍是旧值，但用例里两次调用间隔远小于 TTL 时也会红——不可靠）。
@@ -834,48 +871,102 @@ def test_every_lookup_hits_the_database(aws, monkeypatch):
     """
     _put_switch(True)
     k = _put_key()
-    n = 0
-    real = keystore._batch_get
+    n = {"switch": 0, "key": 0}
+    rs, rk = keystore._get_switch_row, keystore._get_key_row
 
-    def counted(*a, **kw):
-        nonlocal n
-        n += 1
-        return real(*a, **kw)
-    monkeypatch.setattr(keystore, "_batch_get", counted)
+    def cs(*a, **kw):
+        n["switch"] += 1
+        return rs(*a, **kw)
+
+    def ck(*a, **kw):
+        n["key"] += 1
+        return rk(*a, **kw)
+    monkeypatch.setattr(keystore, "_get_switch_row", cs)
+    monkeypatch.setattr(keystore, "_get_key_row", ck)
     for _ in range(5):
         keystore.lookup(k.plaintext)
-    assert n == 5, f"5 次 lookup 只读了 {n} 次——存在缓存"
+    assert n == {"switch": 5, "key": 5}, f"存在缓存: {n}"
 
 
-def test_consistent_read_is_requested(aws, monkeypatch):
-    """必须 ConsistentRead=True：最终一致读会留下"吊销后仍放行"的窗口。"""
-    seen = {}
-    real = keystore._batch_get
+def test_both_reads_are_strongly_consistent(aws):
+    """两个读都必须 ConsistentRead=True：最终一致读会留下"吊销后仍放行"、
+    "关闸后仍放行"的窗口。
 
-    def spy(keys, **kw):
-        seen.update(kw)
-        return real(keys, **kw)
-    monkeypatch.setattr(keystore, "_batch_get", spy)
+    断言方式：读 keystore 记录的最后一次请求参数（模块暴露
+    LAST_READ_CONSISTENCY 供测试观察，它不是授权数据，见
+    test_no_module_level_cache 的白名单说明）。
+    """
     _put_switch(True)
     keystore.lookup(_put_key().plaintext)
-    # 断言实际发给 DynamoDB 的请求带了强一致标志
-    assert keystore.LAST_REQUEST_WAS_CONSISTENT is True
+    assert keystore.LAST_READ_CONSISTENCY == {"switch": True, "key": True}
 
 
-def test_switch_and_key_come_from_one_request(aws, monkeypatch):
-    """两个值必须来自**同一次**往返（同一时刻的强一致快照，且只读一次）。"""
-    batches = []
-    real = keystore._batch_get
+def test_switch_is_read_before_key_and_short_circuits(aws, monkeypatch):
+    """顺序断言：开关先读；关闸时**根本没有** Key 读。
 
-    def spy(keys, **kw):
-        batches.append(list(keys))
-        return real(keys, **kw)
-    monkeypatch.setattr(keystore, "_batch_get", spy)
+    这条替代了原方案的"两者必须来自同一次 BatchGetItem"（Codex P2-6：
+    BatchGetItem 不提供跨项原子快照，且一次 BatchGet 必然把 Key 行一起
+    请求了——与"关闸时不查 Key"自相矛盾）。
+    """
+    order = []
+    rs, rk = keystore._get_switch_row, keystore._get_key_row
+    monkeypatch.setattr(keystore, "_get_switch_row",
+                        lambda *a, **kw: (order.append("switch"), rs(*a, **kw))[1])
+    monkeypatch.setattr(keystore, "_get_key_row",
+                        lambda *a, **kw: (order.append("key"), rk(*a, **kw))[1])
     _put_switch(True)
     k = _put_key()
     keystore.lookup(k.plaintext)
-    assert len(batches) == 1, "开关与 Key 分了两次读"
-    assert {keygen.SWITCH_PK, k.key_hash} == set(batches[0])
+    assert order == ["switch", "key"], "开关必须先读"
+    order.clear()
+    _put_switch(False)
+    keystore.lookup(k.plaintext)
+    assert order == ["switch"], f"关闸时仍查了 Key: {order}"
+
+
+# ---------- key_id 唯一性（Codex P2-7）----------
+
+def test_create_retries_on_key_id_collision(aws, monkeypatch):
+    """GSI 不提供唯一约束，唯一性必须由创建路径保证。"""
+    _put_switch(True)
+    first = keystore.create("a@x.com", name="one")
+    # 强迫下一次生成撞上已有的 key_id 一次，然后恢复随机
+    seq = [first["key_id"]]
+    real_new = keygen.new_key
+
+    def rigged():
+        k = real_new()
+        return k._replace(key_id=seq.pop(0)) if seq else k
+    monkeypatch.setattr(keygen, "new_key", rigged)
+    second = keystore.create("b@x.com", name="two")
+    assert second["key_id"] != first["key_id"], "碰撞未被检测与重试"
+
+
+def test_revoke_fails_closed_when_index_returns_multiple_rows(aws, monkeypatch):
+    """**≥2 行绝不能"取第一行删掉"**——那会误吊销别人的 Key。"""
+    _put_switch(True)
+    a = keystore.create("a@x.com", name="one")
+    monkeypatch.setattr(keystore, "_query_by_key_id",
+                        lambda kid: [{"key_hash": "h1", "email": "a@x.com",
+                                      "key_id": kid},
+                                     {"key_hash": "h2", "email": "b@x.com",
+                                      "key_id": kid}])
+    with pytest.raises(Exception):
+        keystore.revoke(a["key_id"], actor="a@x.com")
+
+
+def test_revoke_update_carries_key_id_and_email_condition(aws):
+    """Query 与 Update 之间有窗口，且 GSI 是最终一致的——落地的那一步
+    必须重新断言两个字段（同 sites_snapshot_guard 的既有理由）。"""
+    _put_switch(True)
+    k = keystore.create("a@x.com", name="one")
+    import ast, pathlib
+    src = pathlib.Path(keystore.__file__).read_text()
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "revoke")
+    body = ast.get_source_segment(src, fn) or ""
+    assert "ConditionExpression" in body
+    assert "key_id" in body and "email" in body
 
 
 # ---------- 哨兵行不得出现在 GSI ----------
@@ -951,7 +1042,7 @@ def test_no_module_level_mutable_containers(): ...
 
 
 def test_no_lru_cache_on_authorization_functions(): ...
-    # lookup / _batch_get / switch_enabled 不得被 functools.lru_cache /
+    # lookup / _get_switch_row / _get_key_row / switch_state 不得被 functools.lru_cache /
     # cache / cached_property 装饰
 
 
@@ -970,9 +1061,10 @@ Expected: FAIL（`No module named 'keystore'`）。
 - [ ] **Step 3: 实现 `keystore.py`**
 
 要点：
-- `_batch_get(keys, **kw)` 是**唯一**的读入口（测试靠 monkeypatch 它做计数与故障注入），返回 `(items_by_hash, unprocessed)`
-- `LAST_REQUEST_WAS_CONSISTENT` 模块级布尔**是允许的**（它不是授权数据，只是给测试看的最后一次请求形态）——在 `test_no_module_level_mutable_containers` 的白名单里显式列出并注明理由
-- `lookup()` 的顺序严格是：形态 → `_batch_get` → `unprocessed` 判定 → 开关 → Key → `revoked` → `email` 形态
+- **两个读入口**：`_get_switch_row()` 与 `_get_key_row(key_hash)`，各自 `GetItem(ConsistentRead=True)`。测试靠 monkeypatch 它们做计数、顺序与故障注入
+- `_query_by_key_id(key_id)` 是 `keyid-index` 的唯一查询入口（revoke 用；测试注入多行场景靠它）
+- `LAST_READ_CONSISTENCY` 模块级 dict **是允许的**（它不是授权数据，只是给测试看的最后一次请求形态）——在 `test_no_module_level_mutable_containers` 的白名单里显式列出并注明理由
+- `lookup()` 的顺序严格是：形态 → 开关（关即 return）→ Key → `revoked` → `email` 形态
 - 节流用 `ConditionExpression`（`attribute_not_exists(last_used_at) OR last_used_at < :cutoff`）而不是"先读再写"——并发下"先读再写"会两边都写
 - `set_switch()` 用 `PutItem`（整行覆盖，字段固定），并调 `ops_log.record()`（**不自己拼 SK**，见衔接点 1）
 
@@ -983,14 +1075,19 @@ Expected: FAIL（`No module named 'keystore'`）。
 | 注入 | 必须变红 |
 |---|---|
 | `lookup` 顶部加 `_CACHE: dict` 并命中即返回 | `test_revocation_takes_effect_on_next_call`、`test_switch_flip_*`、`test_every_lookup_hits_the_database`、`test_no_module_level_mutable_containers` |
-| 给 `_batch_get` 加 `@functools.lru_cache` | 同上 + `test_no_lru_cache_*` |
+| 给 `_get_switch_row` 或 `_get_key_row` 加 `@functools.lru_cache` | 同上 + `test_no_lru_cache_*` |
 | 开关判定改 `if not enabled: reject` | 8 条 `test_switch_non_boolean_true_rejects` |
+| 开关与 Key 合并成一次 `BatchGetItem` | `test_switch_is_read_before_key_and_short_circuits`（关闸时会多出一条 "key"） |
+| 先读 Key 再读开关 | 同上（`order` 反了） |
+| `create` 去掉碰撞检测重试 | `test_create_retries_on_key_id_collision` |
+| `revoke` 在多行时取第一行 | `test_revoke_fails_closed_when_index_returns_multiple_rows` |
+| `revoke` 的 `UpdateItem` 去掉条件表达式 | `test_revoke_update_carries_key_id_and_email_condition` |
+| 任一读改 `ConsistentRead=False` | `test_both_reads_are_strongly_consistent` |
 | 吊销判定改 `if revoked is True` | `test_revoked_truthy_rejects` 的 `"true"`/`1`/`"yes"`/`["x"]` 四条 |
 | 哨兵行缺失时 `return Verdict(ok=True, ...)` | `test_switch_missing_row_rejects` |
-| `_batch_get` 异常时 `pass` 继续 | `test_read_failure_rejects` |
-| `unprocessed` 非空时重试一次 | `test_unprocessed_keys_rejects_and_does_not_retry` |
-| `ConsistentRead=False` | `test_consistent_read_is_requested` |
-| 开关与 Key 分两次 `get_item` | `test_switch_and_key_come_from_one_request` |
+| 开关读异常时 `pass` 继续 | `test_switch_read_failure_rejects` |
+| Key 读异常时按"开关是开的"放行 | `test_key_read_failure_rejects` |
+| 任一读加重试 | `test_neither_read_is_retried` |
 | 形态校验挪到查库之后 | `test_malformed_plaintext_rejects_without_db_read` |
 | 关闸分支里仍调 `touch_last_used` | `test_switch_off_does_not_write_last_used` |
 | 节流改成无条件写 | `test_touch_last_used_throttles_*` |
@@ -1014,6 +1111,9 @@ Expected: FAIL（`No module named 'keystore'`）。
   - `invalidate() -> None` —— 丢弃缓存（供转发拿到 401/403 时重取一次，spec §8）
   - `TokenUnavailable` —— 换不到 token 的异常（handler 转成 502）
 - Consumes: Cognito `POST {domain}/oauth2/token`（`grant_type=client_credentials`）、SSM SecureString 读 machine client secret（TTL 缓存，照 `panel/console_session._secret()` 的既有形态）
+- 环境变量：`COGNITO_DOMAIN`、`MACHINE_CLIENT_ID`、`MACHINE_SECRET_PARAM`、**`MACHINE_SCOPE`**
+
+**`MACHINE_SCOPE` 必须由部署脚本从 config 派生下发**（Codex 审查 2026-08-11 P1-2a）：`config.ini` 的 `[ApiKey]` 允许自定义 `resource_server_id` 与 `scope`，而 token 请求要带 `scope={resource_server_id}/{scope}`。原方案的环境变量清单里两个值都没有，实施者只能二选一——硬编码 `site-builder-mcp/invoke`（违反"config 是唯一取值来源"）或自行发明一个未记录的变量（说明计划不完整）。定为**下发拼好的完整 scope 串**而不是两个分量：拼接逻辑只应存在于 `deploy_key_proxy.py` 一处，运行时不再重新拼（少一处可写错的地方）。缺失/空 → `TokenUnavailable`（**不能用空 scope 去换**：Cognito 会拒，而错误文案指向 client 配置，排查方向会被带偏）。
 
 **为什么这个模块允许缓存**：token 不是授权判定，只是 key-proxy 向 AgentCore 证明"我是 key-proxy"的凭证。它的作用域是**整个组件**，与"哪个用户在调"无关——吊销某个用户的 Key 不需要换 token（用户身份走 on-behalf 头，每请求现查）。不缓存会让每次 MCP 调用多一次 Cognito 往返并撞频率限制。
 
@@ -1036,7 +1136,8 @@ Expected: FAIL（`No module named 'keystore'`）。
 | `test_token_is_not_logged` | 同上（token 也是凭证） |
 | `test_exchange_failure_raises_token_unavailable` | 非 200 / 网络异常 → `TokenUnavailable`，**不返回空串**（空串会变成 `Authorization: Bearer ` 打到网关） |
 | `test_failure_does_not_poison_cache` | 一次失败后下次调用要重试，不能把失败结果缓存住 |
-| `test_scope_is_sent` | 请求体含 `scope={resource_server}/{scope}`（缺 scope 时 Cognito 会拒） |
+| `test_scope_is_sent` | 请求体含 `scope` 且其值**逐字符等于** `MACHINE_SCOPE` 环境变量（不是硬编码的 `site-builder-mcp/invoke`——把环境变量设成别的值，断言必须跟着变） |
+| `test_missing_scope_env_raises_not_empty_scope_request` | `MACHINE_SCOPE` 缺失/空 → `TokenUnavailable`，且**没有发出任何 HTTP**（不能拿空 scope 去撞 Cognito） |
 
 **时钟注入**：`machine_token._now()` 函数（测试 monkeypatch 它）。不要用 `time.monotonic` 直接调用——那样只能靠 sleep 测。
 
@@ -1053,6 +1154,8 @@ Expected: FAIL（`No module named 'keystore'`）。
 | secret 改从环境变量读 | `test_secret_read_from_ssm_not_env` |
 | 加一行 `logger.info(token)` | `test_token_is_not_logged` |
 | 请求体去掉 scope | `test_scope_is_sent` |
+| scope 改成硬编码 `"site-builder-mcp/invoke"` | `test_scope_is_sent`（它按环境变量断言，硬编码时改环境变量就不一致） |
+| `MACHINE_SCOPE` 缺失时用空串继续 | `test_missing_scope_env_raises_not_empty_scope_request` |
 
 - [ ] **Step 6: 提交**
 
@@ -1176,8 +1279,8 @@ Expected: FAIL（`No module named 'keystore'`）。
   - `do_revoke_key(email, *, key_id) -> dict` —— 经 `keyid-index` 查行 → 比对 email → 置 `revoked`
   - `do_get_key_switch(email) -> dict` —— admin-only
   - `do_set_key_switch(email, *, enabled: bool) -> dict` —— admin-only，落 ops_log
-  - `do_me` 增加 `features: {"api_key": bool}`（计划级补充 C）
-- Consumes: `keystore.{create,list_for,revoke,switch_enabled,set_switch}`、`permissions.is_admin`。**panel 不直接碰 api-keys 表、也不直接调 `keygen`**——全部经 keystore（同 panel 对 sites 表「只走 permissions.py 高层函数」的既有约束，由 `test_no_handwritten_guards.py` 的同类断言扩展锁定）
+  - `do_me` 增加 `features: {"api_key": {"deployed": bool, "enabled": bool}}`（计划级补充 C，Codex P1-5）
+- Consumes: `keystore.{create,list_for,revoke,switch_state,set_switch}`、`permissions.is_admin`。**panel 不直接碰 api-keys 表、也不直接调 `keygen`**——全部经 keystore（同 panel 对 sites 表「只走 permissions.py 高层函数」的既有约束，由 `test_no_handwritten_guards.py` 的同类断言扩展锁定）
 
 **路由（spec §4.4）：**
 ```
@@ -1192,7 +1295,11 @@ PUT    /api/settings/api-key      改开关（admin-only，body: {enabled}）
 
 **`enabled` 必须严格 `isinstance(bool)`**：`44aef8d` 的 P1-2 就是 `bool("false") is True` 导致 `{"purge_data":"false"}` 被当成永久删除。开关是同一个陷阱形态——`{"enabled":"false"}` 若被当成 True 就是"以为关了其实开着"。显式 `null` 也拒。
 
-**`features.api_key` 的派生**（不读 config.ini）：`keystore.switch_enabled()` 能读到哨兵行 → 组件已部署。读不到（表不存在 / 行不存在 / AccessDenied）→ `False`。**这个派生只影响 UI 展示，不是门禁**——真门禁在网关层。
+**`features.api_key` 的派生**（不读 config.ini）：调 `keystore.switch_state()` 得 `(deployed, enabled)`。`deployed` = 哨兵行**读到了**（表不存在 / 行不存在 / AccessDenied 一律 `False`）；`enabled` = 该行 `enabled is True`。**这个派生只影响 UI 展示，不是门禁**——真门禁在网关层。
+
+**为什么必须是两个字段而不是一个布尔**（Codex 审查 2026-08-11 P1-5）：首次部署强制把哨兵行建成 `enabled=false`，若只有一个布尔且前端按它 disabled + 零请求，管理员**无处点开闸**，部署流程自锁。`deployed` 决定 UI 可用性，`enabled` 只驱动状态提示与开关初值。
+
+对应的硬用例（Task 6 Step 1 的开关组）：**哨兵行存在且 `enabled=false` 时，`do_me` 必须返回 `deployed=true`**，且 admin 仍能 `do_get_key_switch` / `do_set_key_switch`；同一状态下 key-proxy 侧的 `lookup` 必须拒绝（Task 3 已覆盖）。两者同时成立才是正确的"已部署但关闸"。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -1248,7 +1355,8 @@ def _shape_key(row: dict) -> dict:
 ```
 
 `deploy_panel.py`：
-- 复制清单加 `keygen.py`（从 `key-proxy/` 复制，与 `session.py` 从 `auth/` 复制同模式）
+- **`COPY_FILES` 加四个模块**：`edge_caller.py`（Task 1 已加）、`keystore.py`、`keygen.py`、`api_key_config.py`——**全部从 `deployer/functions/` 取**（`_build_zip` 现成的 `fn_dir` → `auth_dir` 两级查找会自动命中第一级，不需要改它）。
+  > 这一条被 Codex P1-4 抓出过两个错：原文写"从 `key-proxy/` 复制 `keygen.py`"（那个目录里已经没有它了，是我 self-review 期移走后漏改的），且**整个清单漏了 `keystore.py`**——而 Task 6 的 `api.py` 正是只经 keystore 访问表。后果链是确定的：加 `import keystore` → `test_copy_files_covers_every_local_module_panel_imports` 变红 → 若为赶进度放宽该测试 → 真机 panel `ModuleNotFoundError: keystore`，**所有**控制台 API 500（不只 Key 相关的，因为 `api.py` 顶层 import 失败）。
 - role 加 `site-api-keys` 的 `GetItem`/`PutItem`/`UpdateItem`/`Query`（含两个 GSI 的 `index/*`）。**不给 `DeleteItem`**——吊销是置 `revoked` 不是删行（保留审计痕迹）；也**不给 `Scan`**
 - 环境变量加 `API_KEYS_TABLE`
 
@@ -1289,12 +1397,22 @@ def _shape_key(row: dict) -> dict:
 **Interfaces:**
 - Produces:
   - `deploy_pool.ensure_resource_server(cog, pool_id, *, identifier, scope) -> str` —— 幂等；返回 `{identifier}/{scope}`
-  - `deploy_pool.api_key_enabled(cfg) -> bool` —— **唯一**的"有没有 `[ApiKey]` 段"判定，三个脚本共用（不各自 `cfg.has_section`）
+  - **`api_key_config.py`（新建于 `deployer/functions/`）**：`api_key_enabled(cfg) -> bool`（唯一的"有没有 `[ApiKey]` 段"判定）、`machine_scope(cfg) -> str`（唯一的 `{resource_server_id}/{scope}` 拼接）、`mcp_subdomain(cfg) -> str`。三个部署脚本共用（不各自 `cfg.has_section`、不各自拼 scope）
   - `deploy_agentcore.allowed_clients(cfg) -> list[str]` / `request_header_allowlist(cfg) -> list[str]` —— 从配置派生，纯函数（可单测）
   - `server._machine_client_id() -> str` —— **每次调用读环境变量**
 - Consumes: Cognito `CreateResourceServer` / `DescribeResourceServer`
 
-**`api_key_enabled()` 必须是唯一判定**：三个脚本各写一次 `cfg.has_section("ApiKey")` 就是三个判定点，漏改一处即"部分部署"——而部分部署恰好是最危险的状态（例如 allowlist 放了头但 machine client 没进 allowedClients，或者反过来）。它放 `deploy_pool.py`（三个脚本里最先跑的那个），另两个 import 它。
+**`api_key_enabled()` 必须是唯一判定**：三个脚本各写一次 `cfg.has_section("ApiKey")` 就是三个判定点，漏改一处即"部分部署"——而部分部署恰好是最危险的状态（例如 allowlist 放了头但 machine client 没进 allowedClients，或者反过来）。
+
+**落点是 `deployer/functions/api_key_config.py`，不是 `deploy_pool.py`**（Codex 审查 2026-08-11 P1-3，**已实测复现**）：三个脚本从三个不同目录执行——
+```
+cd site-builder          && python3 scripts/deploy_pool.py
+cd site-builder/mcp      && python3 deploy_agentcore.py
+cd site-builder/key-proxy && python3 deploy_key_proxy.py
+```
+后两个目录都不含 `scripts/`。实测 `cd site-builder/mcp && python3 -c 'import deploy_pool'` → `ModuleNotFoundError`，即**两个部署脚本会在任何 AWS 调用之前直接崩**。放 `functions/` 后三者都能用同一个相对路径 `sys.path.insert`（`deploy_pool.py:219` 现成的 `HERE.parent / "auth"` 就是这个形态），且它天然进 Lambda/容器打包，key-proxy 运行时也能用同一份判定。
+
+**每个脚本都要有一条"按文档里的真实 CLI 命令执行"的测试**（不只是 pytest 里 import 得到）：用 `subprocess` 从计划/DEPLOY.md 写的那个工作目录跑 `python3 <脚本> --help`（或一个 dry-run 开关），断言退出码 0 且 stderr 无 `ModuleNotFoundError`。理由：pytest 的 `sys.path` 与真实执行目录不同，本条缺陷正是只在真实调用形态下暴露。
 
 **`_caller_email()` 的改造（M4 安全核心）：**
 
@@ -1424,6 +1542,11 @@ Run: `cd site-builder/mcp && python3 -m pytest tests -q`
 ```python
 ON_BEHALF_HEADER = "X-SB-On-Behalf-Of"
 
+# api_key_config 来自 deployer/functions/（**不是** scripts/deploy_pool）——
+# 本脚本从 site-builder/mcp/ 执行，那个目录看不到 scripts/（Codex P1-3 实测）。
+sys.path.insert(0, str(HERE.parent / "deployer" / "functions"))
+from api_key_config import api_key_enabled  # noqa: E402
+
 
 def allowed_clients(cfg) -> list[str]:
     """authorizer 的 allowedClients。**这是组件门禁的第一层**（spec §5.1.1）。
@@ -1444,6 +1567,21 @@ def allowed_clients(cfg) -> list[str]:
 
 **`machine_client_id` 为空必须中止而不是静默跳过**：静默跳过会得到"以为部署了 API Key 其实网关不认"的状态，而排查方向会指向 server 端。
 
+**同一处还要加 `environmentVariables` 的 `MACHINE_CLIENT_ID`**（Codex 审查 2026-08-11 P1-2b——原计划的修改清单漏了它，直到真机步骤才要求读回，严格照 Task 7 实施会得到"网关放行但容器内 `_machine_client_id()` 恒为空 → 所有 API Key 调用 fail-closed 被拒"）：
+
+```python
+        environmentVariables={
+            ...
+            # 有 [ApiKey] 段时下发；否则空串（server 侧空值 = 拒绝全部
+            # on-behalf 请求，与组件门禁同向 fail-closed）。
+            "MACHINE_CLIENT_ID": (CFG["Cognito"]["machine_client_id"].strip()
+                                  if api_key_enabled(CFG) else ""),
+            ...
+        }
+```
+
+配套断言（纯函数层，不需要真机）：`allowed_clients` 含 machine client **当且仅当** `environmentVariables["MACHINE_CLIENT_ID"]` 非空。这两者一个来自网关配置、一个来自容器环境，**分别写就会漂移**——而漂移的那一半正好是"网关放行、容器拒绝"这个最难排查的状态（症状是 200 的 HTTP 加一句业务错误文案）。
+
 - [ ] **Step 5: 实现 `server._caller_email()` 的 on-behalf 路径**
 
 在现有 `if email:` 分支之后、`raise NotOwner` 之前插入。取头用与现有 `authorization` 相同的方式（`dict(request.headers)` 已 lower-case）。
@@ -1463,6 +1601,9 @@ def allowed_clients(cfg) -> list[str]:
 | `machine_client_id` 空时不中止 | 对应用例 |
 | `request_header_allowlist` 无条件加头 | 同上 |
 | `deploy_agentcore` 自己写 `has_section("ApiKey")` | AST 那条 |
+| `environmentVariables` 去掉 `MACHINE_CLIENT_ID` | "allowedClients 含 machine ⟺ MACHINE_CLIENT_ID 非空"那条 |
+| `MACHINE_CLIENT_ID` 无条件下发（无 `[ApiKey]` 段也给值） | 同上（反方向） |
+| 从 `site-builder/mcp/` 跑 `python3 deploy_agentcore.py --help` | 真实 CLI 那条（若 import 路径写错，这里 `ModuleNotFoundError`） |
 
 - [ ] **Step 8: `config.ini.example` 更新**
 
@@ -1508,7 +1649,7 @@ def allowed_clients(cfg) -> list[str]:
   - `mcp_route_item(function_url) -> dict` —— `route_mode=api-only`、`require_auth=False`、`owner=platform`、`static_prefix=""`
   - `ensure_switch_row() -> str` —— 幂等：**不存在才建，且建成 `enabled=false`**；已存在则**一字不改**并返回当前值
   - `main() -> int`
-- Consumes: `keygen.SWITCH_PK`、`deploy_pool.api_key_enabled`、`edge_caller.EDGE_ROLE_ID_ENV`
+- Consumes: `keygen.SWITCH_PK`、`api_key_config.{api_key_enabled,machine_scope,mcp_subdomain}`（来自 `deployer/functions/`，**不是** `scripts/deploy_pool`——见 Task 7 的 P1-3 说明）、`edge_caller.EDGE_ROLE_ID_ENV`
 
 **`ensure_switch_row` 的幂等语义是本 Task 最容易写错的地方**：
 - 不存在 → `PutItem` with `attribute_not_exists(key_hash)`，`enabled=False`
@@ -1526,12 +1667,13 @@ def allowed_clients(cfg) -> list[str]:
 | 门禁 | 无 `[ApiKey]` 段时 `main()` 返回 0 且**零 AWS 调用**（boto3 层装间谍） |
 | 门禁 | 无段时不建 route、不建哨兵行 |
 | Function URL | 恰好两条语句、两个 action、Principal 逐字符等于 edge role；缺 `edge_role_arn` 抛错**中止** |
-| role | 只对 api-keys 表有 `GetItem`/`BatchGetItem`/`UpdateItem`（**无 `PutItem`**——创建在 panel；**无 `DeleteItem`**；**无 `Scan`**）；SSM 只有精确 ARN 的 `GetParameter`（**不用前缀**）；无 `iam:*`、无 `lambda:*` |
-| 环境变量 | 无明文密钥（沿用 verify 脚本的两类判据）；含 `MACHINE_SECRET_PARAM` 而非 secret；含 `EDGE_ROLE_ID` |
+| role | 只对 api-keys 表有 `GetItem`/`UpdateItem`（**无 `BatchGetItem`**——已改成两次 GetItem；**无 `PutItem`**——创建在 panel；**无 `DeleteItem`**；**无 `Scan`**）；SSM 只有精确 ARN 的 `GetParameter`（**不用前缀**）；无 `iam:*`、无 `lambda:*` |
+| 环境变量 | 无明文密钥（沿用 verify 脚本的两类判据）；含 `MACHINE_SECRET_PARAM` 而非 secret；含 `EDGE_ROLE_ID`；**含 `MACHINE_SCOPE` 且其值 == `{resource_server_id}/{scope}`（从 config 派生，不得硬编码 `site-builder-mcp/invoke`）** |
 | route | `route_mode == "api-only"`、`require_auth is False`（**布尔不是字符串**）、`owner == "platform"`、`static_prefix == ""`、`api_target` 无尾斜杠 |
 | 哨兵行 | 首次建为 `enabled=False`（**不是 True**）；已存在时重跑**一字不改**（先置 True 再重跑，仍是 True） |
 | 哨兵行 | `attribute_not_exists` 条件写（并发部署不会互相覆盖） |
-| 复制清单 | 传递闭包核对 `handler.py` 的 import 链（照 panel 的 `test_copy_files_covers_every_local_module_panel_imports`） |
+| 复制清单 | 传递闭包核对 `handler.py` 的 import 链（照 panel 的 `test_copy_files_covers_every_local_module_panel_imports`，**用同样的两个搜索目录**）。清单至少含 `edge_caller.py` / `keystore.py` / `keygen.py` / `api_key_config.py` |
+| 真实 CLI | `subprocess` 从 `site-builder/key-proxy/` 跑 `python3 deploy_key_proxy.py --help`，退出码 0 且 stderr 无 `ModuleNotFoundError`（Codex P1-3：pytest 的 sys.path 与真实执行目录不同） |
 
 - [ ] **Step 2-4: 确认失败 → 实现 → 确认转绿**
 
@@ -1542,6 +1684,8 @@ def allowed_clients(cfg) -> list[str]:
 | 注入 | 必须变红 |
 |---|---|
 | 门禁改成无段也部署 | 门禁两条 |
+| `MACHINE_SCOPE` 不下发 / 硬编码 `site-builder-mcp/invoke` | 环境变量组的 `MACHINE_SCOPE == {resource_server_id}/{scope}` 那条 |
+| `import deploy_pool` 取门禁判定 | 真实 CLI 那条（`ModuleNotFoundError`） |
 | 哨兵行首次建成 `True` | 哨兵行第一条 |
 | `ensure_switch_row` 改成无条件 `PutItem(enabled=cfg值)` | 哨兵行第二条（重跑不改） |
 | 去掉 `attribute_not_exists` | 条件写那条 |
@@ -1566,7 +1710,7 @@ def allowed_clients(cfg) -> list[str]:
 - Modify: `site-builder/panel/tests/test_frontend_contract.py`
 - Modify: `site-builder/panel/tests/test_frontend_boot.py`（如启动路径受影响）
 
-**Interfaces:** 前端调 Task 6 的 5 个端点；`state.me.features.api_key` 决定 disabled 与否。
+**Interfaces:** 前端调 Task 6 的 5 个端点；`state.me.features.api_key.deployed` 决定 disabled 与否，`.enabled` 只驱动状态提示与开关初值（Codex P1-5：**不能用 `.enabled` 做 UI 门禁**，否则首次部署后 admin 无处点开闸）。
 
 **三层测试分工照 M3-FINDINGS §2.20 的结论**（不可互相替代）：
 - `test_frontend_contract.py` 查"代码里有没有"
@@ -1580,7 +1724,8 @@ def allowed_clients(cfg) -> list[str]:
 2. 创建：明文**完整显示一次** + 复制按钮 + "关闭后不再显示"警告
 3. 吊销：二次确认
 4. admin 额外：开关（含"关闸后所有 Key 立即失效"的说明）
-5. `features.api_key` 为 false → 页面与导航显示 disabled + 说明原因，**不发任何请求**
+5. `features.api_key.deployed` 为 false → 页面与导航显示 disabled + 说明原因，**不发任何请求**
+6. `deployed=true` 且 `enabled=false`（首次部署后的正常状态）→ **页面可用**：列表/创建照常，顶部显示"API Key 当前已被管理员全局关闸，新建的 Key 暂时无法调用"，admin 额外看到开关且能打开
 
 - [ ] **Step 1: 写失败测试**
 
@@ -1591,18 +1736,19 @@ def allowed_clients(cfg) -> list[str]:
 | 创建响应的明文**只写进 DOM 一次**且不进 `localStorage`/`sessionStorage`/URL | 断言不出现 `localStorage.setItem` 与 `location.hash =` 携带明文的形态 |
 | 明文展示区有"不再显示"警告文案 | 查该文案常量 |
 | 吊销走 `DELETE` + body 带 `key_id`（**不是明文**） | 解析该 fetch 调用的 method 与 body 键 |
-| `features.api_key` 为 false 时**零 fetch** | 在 boot harness 里跑，间谍 fetch |
+| `deployed=false` 时**零 fetch** | 在 boot harness 里跑，间谍 fetch |
+| `deployed=true, enabled=false` 时**页面可用且 admin 能看到开关** | 同一 harness 换 features 取值；断言渲染出开关控件且发了列表请求。**这条是部署自锁的闸门**——按单布尔实现时它必红 |
 | 所有插值过 `esc()` | 按顶层 `+` 切分（M3-FINDINGS §2.17 第 11 条的二段坑：不能要求两侧都有 `+`，续行开头的表达式会被跳过） |
 | 开关 UI 只在 `is_admin` 时渲染 | — |
 | 不请求 M5 的 stats/audit | 沿用既有断言 |
 
-`test_frontend_boot.py`：Key 页面在 `features.api_key` 两种取值下都能渲染不崩（M3 那条"骨架屏卡死"就是 boot 路径的执行顺序问题，静态断言看不见）。
+`test_frontend_boot.py`：Key 页面在 `features.api_key` 的**三种**状态下都能渲染不崩（`deployed=false` / `deployed=true,enabled=false` / 两者都 true）。M3 那条"骨架屏卡死"就是 boot 路径的执行顺序问题，静态断言看不见。
 
 - [ ] **Step 2-4: 确认失败 → 实现 → 确认转绿**
 
 - [ ] **Step 5: 反向验证**
 
-删掉"不再显示"警告、把 `key_id` 换成明文、把 `esc()` 去掉一处、`features` 为 false 时仍发请求、开关对非 admin 也渲染——逐条确认变红。
+删掉"不再显示"警告、把 `key_id` 换成明文、把 `esc()` 去掉一处、`deployed=false` 时仍发请求、开关对非 admin 也渲染、**把门禁判据从 `.deployed` 改成 `.enabled`**（必须让"已部署但关闸"那条红）——逐条确认变红。
 
 **假红同样要处理**（M3-FINDINGS §2.16）：新断言若命中的是自己写的注释，必须修断言（用剥注释器）而不是放宽它。
 
@@ -1671,7 +1817,7 @@ cd site-builder/mcp && python3 deploy_agentcore.py
 ```
 （不带 `--skip-build`：server.py 改了，要重建镜像。`_BUILD_INPUTS` 含 `mcp/server.py`，tag 会变。）
 
-读回：runtime 按新 digest 部署（`@sha256:` 变了）、环境变量含 `MACHINE_CLIENT_ID`。
+读回：runtime 按新 digest 部署（`@sha256:` 变了）、**环境变量 `MACHINE_CLIENT_ID` 非空且等于 config 里的值**（Task 7 已把它加进 `environmentVariables`；若为空则容器内所有 on-behalf 请求都会 fail-closed 被拒——这正是 Codex P1-2b 指出的漏接线）。
 
 **此时验证正路径**：手动用 machine token + on-behalf 头调 `list_my_sites` → 应返回**该 email 的站点**。同时验冒充负测：用自己的 OAuth token + `X-SB-On-Behalf-Of: 别人` → 必须返回**自己的**站点。
 
@@ -1680,7 +1826,7 @@ cd site-builder/mcp && python3 deploy_agentcore.py
 ```bash
 cd site-builder/key-proxy && python3 deploy_key_proxy.py
 ```
-读回：Lambda 存在、Function URL AuthType=AWS_IAM + 两条语句、`mcp` route 形态正确、**哨兵行 `enabled=false`**、脚本明确打印了"开关是关的，去控制台开"。
+读回：Lambda 存在、Function URL AuthType=AWS_IAM + 两条语句、`mcp` route 形态正确、**哨兵行 `enabled=false`**、**环境变量 `MACHINE_SCOPE` 等于 `{resource_server_id}/{scope}`**、脚本明确打印了"开关是关的，去控制台开"。
 
 此时用一把 Key 直连 → 必须 401（开关关着）。
 
@@ -1695,7 +1841,9 @@ cd site-builder/panel && python3 deploy_panel.py
 
 - [ ] **Step 8: ⑤ 控制台开闸**
 
-浏览器进控制台 → admin 打开开关 → 读回哨兵行 `enabled=true`、`updated_by` 是操作者、ops_log 有一条。
+**开闸之前先验"已部署但关闸"这个状态是可操作的**（Codex P1-5 的真机确认）：此时哨兵行是 `enabled=false`，浏览器进控制台 → API Key 页面**必须可用**（不是 disabled）、`/api/me` 返回 `features.api_key = {deployed: true, enabled: false}`、admin 能看到开关。**若此时页面是 disabled，就是自锁缺陷，停止并回到 Task 6/9。**
+
+然后 admin 打开开关 → 读回哨兵行 `enabled=true`、`updated_by` 是操作者、ops_log 有一条。
 
 - [ ] **Step 9: `verify_deployed_components.py` 第 ⑧ 段**
 
@@ -1713,6 +1861,8 @@ cd site-builder/panel && python3 deploy_panel.py
 | **`mcp` 不在 Edge 产物的 `PLATFORM_SUBDOMAINS` 里** | 决定 9 的闸门 |
 | `allowedClients` 含 machine client、allowlist 含 on-behalf 头 | 从线上 runtime 读 |
 | 哨兵行存在且 `enabled` 是**布尔** | 类型也要断言（字符串 `"true"` 会被 keystore 拒，症状是"开了但全 401"） |
+| key-proxy 环境变量 `MACHINE_SCOPE` == config 派生值 | 硬编码或缺失都要抓（Codex P1-2a） |
+| MCP runtime 环境变量 `MACHINE_CLIENT_ID` 非空 ⟺ `allowedClients` 含 machine client | 两者分处网关与容器，**分别写就会漂移**；漂移的那一半正好是最难排查的"网关放行、容器拒绝"（Codex P1-2b） |
 | key-proxy role 无 `PutItem`/`DeleteItem`/`Scan` on api-keys | 权限收窄的闸门 |
 
 **最小检查数下限**要相应提高（Global Constraints）。
@@ -1807,7 +1957,20 @@ cd site-builder/key-proxy && ../deployer/.venv/bin/pytest tests -q
 
 M3 的八个 + 新增 `verify_api_key_e2e.py`。数字记进 HANDOFF，**不写进 `CLAUDE.md`**（会过时）。
 
-- [ ] **Step 3: `DEPLOY.md` 新阶段「⑤c API Key 组件（可选）」**
+- [ ] **Step 3: 核对 spec 与 `config.ini.example` 的开关口径已经是哨兵行**
+
+**这一步在 2026-08-11 已经先做掉了**（Codex 审查 P1-1 要求"不能把 spec 修复留到实施后"，而当时 Task 12 也没写这件事）：
+- `spec §5.1.1` 第 2 条已从 `[ApiKey] enabled = false` 改为哨兵行，并写明"两个真源比没有开关更危险"与三条选型理由，另追加"未部署 vs 已部署但关闸必须可区分"（P1-5）；
+- `config.ini.example` 的 `[ApiKey]` 段已删掉 `enabled` 键，补 `mcp_subdomain` 与"开关在控制台 + 应急旁路指向 DEPLOY.md ⑤c"。
+
+本步只需**核对没有回退**（改代码期间可能有人照旧文档又加回来）：
+```bash
+grep -n "enabled" site-builder/config.ini.example        # [ApiKey] 段内不得有 enabled =
+grep -n "ApiKey. enabled" docs/superpowers/specs/2026-07-30-quick-site-builder-phase2-design.md
+```
+两条都应无命中（spec 里只应出现在"已改为哨兵行"的说明文字中）。
+
+- [ ] **Step 4: `DEPLOY.md` 新阶段「⑤c API Key 组件（可选）」**
 
 必须含：
 - **四步部署顺序与"任一步停下都不产生提权窗口"的理由**
@@ -1817,31 +1980,52 @@ M3 的八个 + 新增 `verify_api_key_e2e.py`。数字记进 HANDOFF，**不写�
 - 不需要 API Key 时**整段不配置**即可（推荐默认）
 - 已知取舍：用户离职后旧 Key 仍有效（决定 8）
 
-- [ ] **Step 4: `CLAUDE.md`**
+- [ ] **Step 5: `CLAUDE.md`**
 
 架构图补 ⑦ key-proxy；测试命令补 key-proxy 包；部署命令补 `deploy_key_proxy.py`；高频坑补两条（哨兵行 `enabled` 必须是布尔；`mcp` 子域故意不在平台白名单）。**不写测试数与闸门数字**（指向 HANDOFF）。
 
-- [ ] **Step 5: `client-setup.md` + `gen_onboarding.py`**
+- [ ] **Step 6: `client-setup.md` + `gen_onboarding.py`**
 
 Remote MCP + 静态 Header 的配置片段；stdio 代理降级标注为"兼容方案"。`gen_onboarding.py` 在组件已部署时输出 API Key 章节。
 
-- [ ] **Step 6: HANDOFF「更新 12」**
+- [ ] **Step 7: HANDOFF「更新 12」**
 
 进度、部署状态、闸门数字、本轮的实测发现、以及**下一步（M5）的入口**。
 
-- [ ] **Step 7: 实测发现归档**
+- [ ] **Step 8: 实测发现归档**
 
 本轮凡是"跑出来才知道"的都要记（形态照 M3-FINDINGS §2）：假绿/假红的具体形态、真机与文档不符之处、以及每条"注入后确实变红"的记录。
 
-- [ ] **Step 8: 提交**
+- [ ] **Step 9: 提交**
 
 `docs(m4): 全量回归 + DEPLOY/CLAUDE/client-setup 同步（M4 交付）`
+
+---
+
+## Codex 审查轮（2026-08-11）：5 个 P1 + 2 个 P2，全部已改
+
+审查基线：spec `3d7c3f3` / M3 修复 `44aef8d` / 本计划 `a6b3106`。结论是 NO-GO，**7 条我全部核对后接受**（其中 P1-3 我在本仓库实测复现了 `ModuleNotFoundError`）。两个 P2 的**诊断**接受、**建议的修法**未采纳，理由见下。
+
+| # | 问题 | 处置 |
+|---|---|---|
+| P1-1 | 开关有两个真源：spec §5.1.1 与 `config.ini.example` 仍写 `enabled=false`，而计划只读哨兵行 → 运维按文档设 `false` 而 Key 全部继续有效 | **接受**。spec §5.1.1 与 `config.ini.example` **本轮就改**（不留到实施后），Task 12 加一步核对没回退 |
+| P1-2a | key-proxy 不知道该请求哪个 scope（环境变量清单里既无 `resource_server_id` 也无完整 scope），实施者只能硬编码或自造变量 | **接受**。新增 `MACHINE_SCOPE` 环境变量，由 `deploy_key_proxy.py` 从 config 拼好下发；缺失即 `TokenUnavailable` 且不发 HTTP |
+| P1-2b | Task 7 的修改清单没要求把 `MACHINE_CLIENT_ID` 加进 AgentCore `environmentVariables`，直到真机步骤才读回它 → 严格照 Task 7 实施则容器内恒为空、所有 Key 调用被拒 | **接受**。Task 7 显式加该环境变量 + 一条"`allowedClients` 含 machine ⟺ 环境变量非空"的纯函数断言 |
+| P1-3 | `deploy_agentcore.py` / `deploy_key_proxy.py` 从各自目录执行，都看不到 `scripts/`，`import deploy_pool` 必崩（**已实测复现**） | **接受**。门禁判定移到 `deployer/functions/api_key_config.py`；每个脚本加一条"按文档里的真实 CLI 命令跑 `--help`"的 subprocess 测试 |
+| P1-4 | panel 复制清单漏 `keystore.py`，且 `keygen.py` 写成从已不存在的 `key-proxy/` 复制 | **接受**。这是我 self-review 期移动模块后漏改的自相矛盾。清单明确为四个模块、全部从 `deployer/functions/` 取 |
+| P1-5 | `features.api_key` 单布尔无法表达三态；首次部署哨兵行是关的 → 前端 disabled + 零请求 → admin 无处开闸，**部署自锁** | **接受**。改 `{"deployed", "enabled"}`；`deployed` 决定 UI 可用性，`enabled` 只驱动提示。Task 9 与 Task 10 Step 8 各加一条闸门 |
+| P2-6 | "同一次 `BatchGetItem` = 同一时刻原子快照"是错误的 AWS 契约；且它与"关闸时不查 Key"自相矛盾 | **诊断接受，修法二选一里取"先开关后 Key 两次读"**。不用它提的 `TransactGetItems`：两个值之间没有需要原子性的不变量（开关关了就拒，与 Key 当时什么状态无关），用事务读只是白付两倍读容量 + 多一个 IAM action |
+| P2-7 | `key_id` 当唯一吊销标识但 GSI 无唯一约束；"3000 个不重复"不证明线上唯一 | **诊断接受，不采纳"改成 128-bit"**。`key_id` 是给人看/粘的标识符，spec §5.1 已定 8 位，加长牺牲该用途且**仍需**处理"万一"。改在写入侧：创建时 Query 检测 + 重试（≤5）、吊销时行数 ≠ 1 一律 fail-closed（**绝不取第一行**）、`UpdateItem` 带 `key_id + email` 条件 |
+
+**这一轮暴露的方法论问题**（值得记进 M4-FINDINGS）：P1-4 与 P1-2b 都是**我自己在 self-review 期改了落点/加了要求，但没有把所有引用处一起改**——与 M3-FINDINGS「别打地鼠，修那一类」同源，只不过这次载体是计划文档而不是代码。教训：移动一个模块后要 grep 全文所有提到它的地方（我只改了"文件结构"表，漏了 Task 6 的正文步骤）。
 
 ---
 
 ## Self-Review 结论
 
 **Placeholder 扫描**：Task 3 的 `test_no_module_level_cache.py` 三个函数体标了"Step 3 补全"——这是有意的（函数体依赖实现细节，先定意图与边界），不是 TBD。其余无占位。
+
+**Codex 轮之后的一致性复查**（2026-08-11）：`switch_enabled` → `switch_state` 全文替换完毕；`_batch_get` / `BatchGetItem` 的残留只剩两处，都是**有意的**（补充 B 里解释"原方案为什么错"、Task 3 反向验证表里作为要注入的缺陷）；`features.api_key` 的所有引用都已带 `.deployed` / `.enabled` 限定；key-proxy role 的 action 清单去掉了 `BatchGetItem`；Tech Stack 行改成"强一致 GetItem"。
 
 **内部一致性**：
 - 决定 6（开关落 DDB）与 Task 7 Step 8（`config.ini.example` 删 `enabled` 键）一致

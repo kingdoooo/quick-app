@@ -102,10 +102,25 @@ console_version =
 #
 # 需要给"只能配静态 Header 的客户端"（如 Quick Desktop Remote MCP）用时才配：
 # [ApiKey]
-# # 已部署组件后的应急开关：false = key-proxy 立即拒绝全部 Key（怀疑泄漏时
-# # 一键关闸，不必拆组件/重部 AgentCore）。它是副门禁，不替代上面的组件门禁。
-# enabled = true
 # keys_table = site-api-keys
-# # client_credentials 必须有 resource server + scope（不能用空 scope 建 client）
+# # client_credentials 必须有 resource server + scope（不能用空 scope 建 client）。
+# # 这两个值拼成 machine token 请求的 scope（{resource_server_id}/{scope}），
+# # 由 deploy_key_proxy.py 下发给 key-proxy，运行时不再重新拼。
 # resource_server_id = site-builder-mcp
 # scope = invoke
+# # 交换层的子域（route_mode=api-only、require_auth=False）。
+# # **它不进 Edge 的 PLATFORM_SUBDOMAINS**：key-proxy 只认 X-API-Key，不需要
+# # 平台 cookie，进白名单只会让一个公网组件白拿一个顶域会话 JWT。
+# mcp_subdomain = mcp
+#
+# ⚠️ **应急关闸开关不在这里**（2026-08-11 定；此前本段有个 enabled 键，已删）。
+# 它是 site-api-keys 表里的一条哨兵行（key_hash="__switch__"），由管理员在
+# 控制台开关：即时生效、有审计。
+#
+# 为什么不放配置文件——**两个真源比没有开关更危险**：你在这里写
+# enabled = false 而实现只读哨兵行，结果是 Key 全部继续有效，而现场以为
+# 已经关了。另外配置项要改文件 + 重跑部署脚本才生效，而部署脚本"把配置收敛
+# 到线上"的语义会把管理员的关闸静默覆盖成开。
+#
+# 首次部署时哨兵行建成**关**（fail-closed）——部署完要去控制台开一次。
+# 控制台自己不可用时的应急旁路（aws CLI 直改该行）见 DEPLOY.md「⑤c」。
