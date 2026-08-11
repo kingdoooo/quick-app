@@ -1864,7 +1864,8 @@ cd site-builder/panel && python3 deploy_panel.py
 | 断言 | 说明 |
 |---|---|
 | `site-key-proxy` 存在 + LastModified | — |
-| 产物的模块与本地字节一致 | `handler.py`/`keystore.py`/`machine_token.py`/`keygen.py`/`edge_caller.py` |
+| 产物的模块与本地字节一致 | `handler.py`/`keystore.py`/`machine_token.py`/`keygen.py`/`edge_caller.py`/`api_key_config.py`（**从 `deploy_key_proxy.COPY_FILES` 推导，不手抄**） |
+| **同时修 ⑤ 段（panel）的清单** | 现在是**硬编码的 7 个模块**（`verify_deployed_components.py:316-333`），而 panel 的 `COPY_FILES` 已是 5 个共享模块 + Task 6 后共 8 个 → `edge_caller.py` 等**进了部署包却从不做真机字节比对**，单测闭包与这道闸门**同时绿**。改成从 `deploy_panel.COPY_FILES` + panel 自有 `.py` **推导**（Task 1 审查的 Minor 2；手抄的清单本身就是下一个漂移源，M3-FINDINGS §2.18） |
 | 环境变量无明文密钥 | 沿用两类判据；含 `MACHINE_SECRET_PARAM` 且以 `/` 开头 |
 | Function URL AuthType=AWS_IAM + 恰好两条语句 + Principal 逐字符 | — |
 | `EDGE_ROLE_ID` == IAM 真实 RoleId | 沿用第 ⑤ 段的现查形态 |
