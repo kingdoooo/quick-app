@@ -26,6 +26,7 @@ cd router/infrastructure/lambda && ../../../site-builder/deployer/.venv/bin/pyte
 cd site-builder/deployer && .venv/bin/pytest tests -q        # 必须指定 tests/——裸 pytest 会误收集 infra/cdk.out 里的 asset 副本
 cd site-builder/mcp      && python3 -m pytest tests -q
 cd site-builder/panel    && ../deployer/.venv/bin/pytest tests -q   # panel 无自己的 venv，借 deployer 的（需 moto+boto3）；测试期从 auth/ 直接 import session.py，部署时由 deploy_panel.py 复制
+cd site-builder/key-proxy && ../deployer/.venv/bin/pytest tests -q   # key-proxy 无自己的 venv，借 deployer 的（需 moto+boto3）；keygen/edge_caller 的单测在 deployer 包里（模块落 functions/）
 ```
 
 单测跑法：`.venv/bin/pytest tests/test_xxx.py::test_name -q`。

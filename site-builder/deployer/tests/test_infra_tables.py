@@ -96,6 +96,39 @@ def test_ops_log_and_session_codes_tables(template):
     assert codes["Properties"]["TimeToLiveSpecification"]["AttributeName"] == "expires_at"
 
 
+def test_api_keys_table_pk_is_key_hash_with_both_gsis(template):
+    """二期 M4：PK 必须是 key_hash，且两个 GSI 都在。
+
+    PK 不是 key_id 是安全属性（spec §5.1）：库被读走时攻击者只拿到哈希。
+    keyid-index 不是"优化"而是**吊销路径的前提**——DELETE 拿到的是 key_id，
+    没有它就只能全表 Scan，而吊销必须先查到该行 email 与调用者比对。
+    """
+    tables = template.find_resources("AWS::DynamoDB::Table")
+    keys_tbl = next(t for t in tables.values()
+                    if t["Properties"].get("TableName") == "site-api-keys")
+    assert keys_tbl["Properties"]["KeySchema"] == [
+        {"AttributeName": "key_hash", "KeyType": "HASH"}], \
+        "PK 必须是 key_hash——换成 key_id 等于把可用凭证的标识符当主键"
+    idx = {g["IndexName"]: g
+           for g in keys_tbl["Properties"]["GlobalSecondaryIndexes"]}
+    assert set(idx) == {"email-index", "keyid-index"}, idx
+    assert idx["email-index"]["KeySchema"] == [
+        {"AttributeName": "email", "KeyType": "HASH"}]
+    assert idx["keyid-index"]["KeySchema"] == [
+        {"AttributeName": "key_id", "KeyType": "HASH"}]
+
+
+def test_api_keys_table_is_retained(template):
+    # 凭证表误删 = 全体 Key 用户断服，且**无法恢复**（服务端不存明文，用户
+    # 手里的 Key 再也对不上任何行）。DeletionPolicy 是 resource 级字段，
+    # has_resource_properties 看不到——必须用 has_resource，否则日后有人改成
+    # DESTROY 全部测试照样绿（与 test_admins_table_is_retained 同理）。
+    template.has_resource("AWS::DynamoDB::Table", {
+        "DeletionPolicy": "Retain",
+        "UpdateReplacePolicy": "Retain",
+        "Properties": {"TableName": "site-api-keys"}})
+
+
 def test_jobs_has_site_index(template):
     tables = template.find_resources("AWS::DynamoDB::Table")
     jobs = [t for t in tables.values()

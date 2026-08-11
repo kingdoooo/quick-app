@@ -77,6 +77,30 @@ class SiteDeployerStack(Stack):
             time_to_live_attribute="expires_at",
             removal_policy=RemovalPolicy.DESTROY)
 
+        # 二期 M4：API Key。PK 是 **key_hash**（SHA-256(明文)）而不是 key_id
+        # ——库被读走时攻击者只拿到哈希，反推不出可用的 Key（spec §5.1）。
+        # RETAIN 与 admins/ops_log 同理：这是凭证表，误删等于全体 Key 用户断服，
+        # 而且**无法恢复**（服务端不存明文，用户手里的 Key 再也对不上任何行）。
+        api_keys = ddb.Table(
+            self, "ApiKeys", table_name="site-api-keys",
+            partition_key=ddb.Attribute(name="key_hash",
+                                        type=ddb.AttributeType.STRING),
+            billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
+            removal_policy=RemovalPolicy.RETAIN)
+        # 控制台按人列 Key。
+        api_keys.add_global_secondary_index(
+            index_name="email-index",
+            partition_key=ddb.Attribute(name="email",
+                                        type=ddb.AttributeType.STRING))
+        # **吊销必须靠它**（计划级补充 A）：DELETE /api/keys 拿到的是 key_id，
+        # 而 PK 是 key_hash。没有这个 GSI 就只能全表 Scan，而吊销路径必须先
+        # 查到该行的 email 与调用者比对（"只能吊销自己的"）——Scan 在这条
+        # 路径上既慢又容易写成"扫到就删"。
+        api_keys.add_global_secondary_index(
+            index_name="keyid-index",
+            partition_key=ddb.Attribute(name="key_id",
+                                        type=ddb.AttributeType.STRING))
+
         artifacts = s3.Bucket(self, "Artifacts", bucket_name=f"site-artifacts-{ACCOUNT}",
                               block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
                               removal_policy=RemovalPolicy.DESTROY, auto_delete_objects=True,
