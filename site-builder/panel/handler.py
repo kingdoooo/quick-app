@@ -1,7 +1,9 @@
 """panel Lambda 入口：六步前置校验 + 路由分发 + 错误码。
 
 **顺序是安全边界，不是风格**（spec §5.4）：
-  ⓪ 传输层：**IAM 调用者必须是 Edge 执行角色**（_edge_caller_ok）。
+  ⓪ 传输层：**IAM 调用者必须是 Edge 执行角色**
+     （`edge_caller.caller_is_edge`——**唯一实现**，panel 与 key-proxy 共用，
+     本文件不自己解析 callerId；判定形态与真机证据见那个模块）。
      resource policy 单独不够——同账号 principal 只要 identity policy 给了
      lambda:InvokeFunctionUrl + InvokeFunction，就能绕开 resource policy 直连
      并自带伪造的 x-user-email（Codex 审查 2026-08-10 P1-1，真机验证过：
@@ -30,6 +32,7 @@ import urllib.parse
 
 import api
 import console_session
+import edge_caller
 import permissions
 
 logger = logging.getLogger()
@@ -57,42 +60,6 @@ ROUTES = [
 CALLBACK = r"^/api/session-callback$"
 
 
-def _edge_caller_ok(event) -> bool:
-    """请求的 **IAM 调用者**是否就是 Edge 的执行角色。
-
-    为什么不能只靠 resource policy（Codex 审查 2026-08-10 P1-1，已真机验证）：
-    AWS 的规则是"同账号 principal 只要 identity policy 允许
-    lambda:InvokeFunctionUrl + lambda:InvokeFunction，**无需命中 resource
-    policy** 也能调用"。实测直接签名调用线上 Function URL 并自带
-    x-user-email，`/api/me` 返回 200 且识别成管理员、`/api/sites?all=1`
-    返回全部站点。所以"x-user-email 存在 ⇒ 来自 Edge"这个推论必须由本函数
-    补上，不能只写在注释里。
-
-    **锚点是 callerId 的 AROA 段，不是 config 里的 edge_role_arn**。
-    真机抓到的形态（用一次性 probe Function URL 挂在真 Edge 后面测得）：
-        userArn : arn:aws:sts::<acct>:assumed-role/<EdgeRoleName>/us-east-1.<...>
-        callerId: AROAX5GBA74KFZAAWDGMT:us-east-1.ApplicationWebRouterStack-<...>
-    而 config.ini 里是 `arn:aws:iam::<acct>:role/<EdgeRoleName>`——两者**永不
-    相等**，拿它逐字符比会 403 整个控制台。callerId 冒号前那段是角色的
-    RoleId（已核对 == `aws iam get-role` 的 Role.RoleId），由 STS 填写，
-    调用方不可伪造。session name 段含区域前缀且会变，不参与判定。
-
-    **按 `:` 边界比，不用 startswith/in**：`{id}EVIL:s` 骗得过 startswith，
-    `AIDAX:{id}` 骗得过 in。
-    """
-    expected = os.environ.get("EDGE_ROLE_ID", "").strip()
-    if not expected:
-        # **配置缺失不得退化成"不检查"**：本项目记录过这个陷阱形态——
-        # 鉴权字段的"默认值"往往正好是"放宽"。宁可整站拒绝也不留绕过路径。
-        logger.error("EDGE_ROLE_ID 未配置——无法确认调用者是 Edge，拒绝所有请求")
-        return False
-    iam = ((event.get("requestContext") or {}).get("authorizer") or {})
-    caller = (iam.get("iam") or {}).get("callerId") or ""
-    # assumed-role 的 callerId 是 `{RoleId}:{session_name}`；只取角色段比较。
-    role_id = caller.split(":", 1)[0]
-    return role_id == expected
-
-
 def _json(status: int, payload, cookies=None) -> dict:
     out = {"statusCode": status,
            "headers": {"content-type": "application/json",
@@ -114,9 +81,12 @@ def handler(event, context):
     # ⓪ 传输层：调用者必须真是 Edge 的执行角色。
     #    ① 的整套推论（"x-user-email 存在 ⇒ 请求经过 Edge"）依赖它——
     #    同账号 IAM 身份可以绕开 resource policy 直连 Function URL 并自带
-    #    伪造的 x-user-email（真机验证过，见 _edge_caller_ok）。
+    #    伪造的 x-user-email（真机验证过，判定形态见 edge_caller）。
+    #    **不在这里重写判定**：唯一实现在 edge_caller.py，panel 与 key-proxy
+    #    共用一份（同一逻辑存在两处时"改对一处、漏改另一处"是本项目反复
+    #    出现的缺陷形态）。test_panel_delegates_edge_caller_check_* 盯着这点。
     #    与 ① 同样不回显原因：探测者不该知道我们在比什么。
-    if not _edge_caller_ok(event):
+    if not edge_caller.caller_is_edge(event):
         return _json(403, {"error": "禁止访问"})
 
     # ① 身份。**不给假值兜底**：鉴权字段的"默认值"往往正好是"放宽"

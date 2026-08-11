@@ -57,13 +57,16 @@ ROLE_NAME = "site-panel-role"
 FUNCTION_URL_AUTH_TYPE = "AWS_IAM"
 RUNTIME = "python3.13"
 
-# 构建时复制进包的模块。**四个都必需**：
+# 构建时复制进包的模块。**五个都必需**：
 #   common.py / permissions.py —— 授权与表访问的单一真源
 #   ops_log.py                 —— permissions.py import 它（M3 审计落点）
 #   session.py                 —— upgrade code 与会话 JWT 的单一编解码实现
+#   edge_caller.py             —— "调用者真是 Edge"的单一判定（handler 的第 ⓪ 步，
+#                                 与 key-proxy 共用同一份，见该模块 docstring）
 # 漏任何一个都是"单测全绿、部署后 ImportError"，由
 # test_copy_files_covers_every_local_module_panel_imports 按传递闭包核对。
-COPY_FILES = ("common.py", "permissions.py", "ops_log.py", "session.py")
+COPY_FILES = ("common.py", "permissions.py", "ops_log.py", "session.py",
+              "edge_caller.py")
 
 
 def _region() -> str:
@@ -248,7 +251,7 @@ def lambda_environment(edge_role_id_value: str = "") -> dict:
     """Lambda 环境变量。**只有参数名，没有明文密钥**（见模块 docstring）。
 
     EDGE_ROLE_ID 不是秘密（它是个公开的资源标识，不能用来签发任何东西），
-    但**缺了它 handler 会拒绝所有请求**——见 handler._edge_caller_ok：
+    但**缺了它 handler 会拒绝所有请求**——见 edge_caller.caller_is_edge：
     "配置缺失就不检查"恰好是这个缺陷的原始形态，所以宁可整站拒绝。
     """
     return {

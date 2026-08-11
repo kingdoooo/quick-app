@@ -29,9 +29,12 @@ def test_build_copies_session_py_too():
     漏了它 panel 运行时 ImportError（测试期能 import 是因为 conftest 把
     auth 目录加进了 sys.path，那**不代表部署产物里有这个文件**）。
     Task 8 已经在 MCP 镜像上真踩过一次同类问题。
+
+    edge_caller.py 同理：它是"调用者真是 Edge"的唯一判定，漏复制 = handler
+    的第 ⓪ 步 ImportError → 整个面板 500（比放行安全，但同样是线上故障）。
     """
     assert set(dp.COPY_FILES) == {"common.py", "permissions.py", "ops_log.py",
-                                  "session.py"}
+                                  "session.py", "edge_caller.py"}
 
 
 def test_copy_files_covers_every_local_module_panel_imports():

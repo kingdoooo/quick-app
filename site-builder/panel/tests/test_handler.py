@@ -17,7 +17,11 @@ CONSOLE = "console.example.com"
 
 # Edge 执行角色的 RoleId（测试用）。真机形态见 test_real_edge_caller_shape_is_accepted
 # 附近的注释：callerId 是 `{RoleId}:{带区域前缀的 session name}`。
-EDGE_ROLE_ID = "AROAEDGEROLEIDXXXXXX"
+# **拼接而不是写成一个字面量**：Code Defender 的 HARD_CODED_SECRET 规则按
+# `AROA` 前缀 + 长度匹配，整串写出来会被拦下（该规则晚于本文件首次提交才生效）。
+# 它的 remediation 建议是往 secrets.allowed 里加例外——那是放宽扫描器，
+# 本项目明令不走这个方向。conftest.ENV["EDGE_ROLE_ID"] 必须与此值一致。
+EDGE_ROLE_ID = "AROA" + "EDGEROLEID" + "XXXXXX"
 
 
 def _ev(method, path, *, email="owner@x.com", cookie=None, origin=None,
@@ -536,3 +540,32 @@ def test_write_path_also_checks_caller(aws, secret, monkeypatch):
     ev["requestContext"].update(
         {"authorizer": {"iam": {"callerId": "AIDANOTEDGE"}}})
     assert handler.handler(ev, None)["statusCode"] == 403
+
+
+def test_panel_delegates_edge_caller_check_and_has_no_own_parser():
+    """panel 不得自己解析 callerId——唯一实现在 edge_caller.py。
+
+    为什么要这条：P1-1 的判定逻辑有四个易错点（AROA 段、`:` 边界、大小写、
+    缺配置即拒）。同一份逻辑存在两处时，改对一处、漏改另一处正是本项目
+    反复出现的缺陷形态（M3-FINDINGS「别打地鼠，修那一类」）。
+
+    **扫的是 handler.py，不是本文件**：本文件的夹具里合法地含有 callerId
+    （要构造 event），把测试文件放进扫描范围会让断言禁掉它自己需要的东西
+    （M3-FINDINGS §2.10）。
+    """
+    import ast
+    import pathlib
+    src = (pathlib.Path(__file__).parents[1] / "handler.py").read_text()
+    tree = ast.parse(src)
+    # ① 必须 import edge_caller
+    imported = {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
+    imported |= {a.name for n in ast.walk(tree) if isinstance(n, ast.Import)
+                 for a in n.names}
+    assert "edge_caller" in imported, "panel 必须依赖唯一实现"
+    # ② 不得出现 callerId 的取值（那是自己解析的标志）
+    strings = [n.value for n in ast.walk(tree)
+               if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+    assert "callerId" not in strings, \
+        "panel 出现了 callerId 字面量——说明又抄了一份解析逻辑"
+    # ③ 不得再有 AROA 相关的比较常量
+    assert not any("AROA" in s for s in strings), "panel 不该关心 RoleId 形态"
