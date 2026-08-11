@@ -17,6 +17,7 @@ ENV = {"JOBS_TABLE": "site-deploy-jobs", "SITES_TABLE": "site-sites",
        "ADMINS_TABLE": "site-admins",
        "OPS_LOG_TABLE": "site-ops-log",
        "SESSION_CODES_TABLE": "site-session-codes",
+       "API_KEYS_TABLE": "site-api-keys",
        "PACKAGE_PROJECT": "site-package", "DSQL_ENDPOINT": "x.dsql.us-east-1.on.aws",
        "STATE_MACHINE_ARN": "arn:aws:states:us-east-1:1:stateMachine:site-deploy",
        "AWS_DEFAULT_REGION": "us-east-1",
@@ -76,6 +77,24 @@ def aws(monkeypatch):
                          KeySchema=[{"AttributeName": "jti", "KeyType": "HASH"}],
                          AttributeDefinitions=[{"AttributeName": "jti",
                                                 "AttributeType": "S"}],
+                         BillingMode="PAY_PER_REQUEST")
+        # 二期 M4：API Key。形态与 infra/app.py 的 ApiKeys 表、以及
+        # key-proxy/tests/conftest.py 的同名表**必须一致**（PK key_hash +
+        # 两个 GSI）——keystore 是这张表的唯一访问层，两个包各跑自己的用例，
+        # 夹具形态漂移会让一侧绿另一侧红，而真机只有一张表。
+        ddb.create_table(TableName="site-api-keys",
+                         KeySchema=[{"AttributeName": "key_hash", "KeyType": "HASH"}],
+                         AttributeDefinitions=[
+                             {"AttributeName": "key_hash", "AttributeType": "S"},
+                             {"AttributeName": "email", "AttributeType": "S"},
+                             {"AttributeName": "key_id", "AttributeType": "S"}],
+                         GlobalSecondaryIndexes=[{
+                             "IndexName": "email-index",
+                             "KeySchema": [{"AttributeName": "email", "KeyType": "HASH"}],
+                             "Projection": {"ProjectionType": "ALL"}}, {
+                             "IndexName": "keyid-index",
+                             "KeySchema": [{"AttributeName": "key_id", "KeyType": "HASH"}],
+                             "Projection": {"ProjectionType": "ALL"}}],
                          BillingMode="PAY_PER_REQUEST")
         s3c = boto3.client("s3", region_name="us-east-1")
         for b in ("site-artifacts-1", "site-frontend-1"):
