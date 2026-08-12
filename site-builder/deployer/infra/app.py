@@ -92,7 +92,7 @@ class SiteDeployerStack(Stack):
             index_name="email-index",
             partition_key=ddb.Attribute(name="email",
                                         type=ddb.AttributeType.STRING))
-        # **吊销必须靠它**（计划级补充 A）：DELETE /api/keys 拿到的是 key_id，
+        # **吊销必须靠它**（计划级补充 A）：POST /api/keys/revoke 拿到的是 key_id，
         # 而 PK 是 key_hash。没有这个 GSI 就只能全表 Scan，而吊销路径必须先
         # 查到该行的 email 与调用者比对（"只能吊销自己的"）——Scan 在这条
         # 路径上既慢又容易写成"扫到就删"。

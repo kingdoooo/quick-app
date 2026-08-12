@@ -1324,7 +1324,7 @@ function pollUndeploy(siteId, jobId, tries) {
 /* ══ 页面 3：API Key（M4）════════════════════════════════════════════
  *
  * 给"只能配静态 Header"的客户端用（支持 OAuth 的客户端不需要 Key）。接的是
- * Task 6 的五个端点：`GET/POST/DELETE /api/keys` 与
+ * Task 6 的五个端点：`GET/POST /api/keys`、`POST /api/keys/revoke` 与
  * `GET/PUT /api/settings/api-key`（后两个 admin-only）。
  *
  * ── 明文的生命周期（这一段是本页最要紧的约束）─────────────────────────

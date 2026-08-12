@@ -372,7 +372,8 @@ def test_every_api_path_exists_in_handler_routes():
             f"前端请求了 handler 没有的路由: {method} {path}")
 
 
-# 二期 M4 的 Key 路由（`GET/POST/DELETE /api/keys`、`GET/PUT /api/settings/api-key`）
+# 二期 M4 的 Key 路由（`GET/POST /api/keys`、`POST /api/keys/revoke`、
+# `GET/PUT /api/settings/api-key`）
 # 曾经在这里有一份 `M4_PENDING_FRONTEND` 临时豁免：Task 6 落了后端、前端还没接，
 # 而当时紧邻的"M4 入口不得发请求"那条守卫与"handler 的端点都要有人接"互斥。
 # **Task 9 接完前端后豁免已删除**（连同盯着它的那条用例），五条 Key 路由现在
