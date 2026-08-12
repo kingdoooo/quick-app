@@ -53,20 +53,48 @@ ROUTES = [
     ("POST", re.compile(rf"^/api/sites/{_SITE}/undeploy$")),
     ("GET", re.compile(r"^/api/admins$")),
     ("PUT", re.compile(r"^/api/admins$")),
-    ("DELETE", re.compile(r"^/api/admins$")),
+    # **移除管理员是 POST /api/admins/remove，不是 DELETE /api/admins**。
+    # 见 ROUTES 下方那段根因注释：带请求体的 DELETE 在这条链路上
+    # 根本到不了这里（2026-08-13 真机隔离）。
+    ("POST", re.compile(r"^/api/admins/remove$")),
     ("POST", re.compile(rf"^/api/admin/resync/{_SITE}$")),
     # 二期 M4：API Key。三个写方法自动继承 ②③（CSRF + 面板会话），
     # 开关的两条另有 api._require_admin（admin-only 不靠路由表达）。
     ("GET", re.compile(r"^/api/keys$")),
     ("POST", re.compile(r"^/api/keys$")),
-    ("DELETE", re.compile(r"^/api/keys$")),
+    ("POST", re.compile(r"^/api/keys/revoke$")),
     ("GET", re.compile(r"^/api/settings/api-key$")),
     ("PUT", re.compile(r"^/api/settings/api-key$")),
     ("GET", re.compile(r"^/api/session-callback$")),
 ]
 CALLBACK = r"^/api/session-callback$"
 KEYS = r"^/api/keys$"
+KEY_REVOKE = r"^/api/keys/revoke$"
+ADMIN_REMOVE = r"^/api/admins/remove$"
 KEY_SWITCH = r"^/api/settings/api-key$"
+
+# **这条链路上的写请求一律不用"DELETE + 请求体"**（2026-08-13 真机隔离出来的）。
+#
+# CloudFront 把 DELETE 的请求体交给了 Lambda@Edge（分发配了 `include_body=True`，
+# 所以 Edge 按**真实 body** 算 payload hash 去签 SigV4），但转发到源站时那个 body
+# 不在了——Function URL 按**空 body** 算哈希，两个哈希不等，于是
+# `403 The request signature we calculated does not match…`，**在本文件任何代码
+# 之前**就被拒。四组对照：
+#   · `DELETE /api/keys` 带 body      → 403 签名不匹配（到不了 panel）
+#   · `DELETE /api/keys` 不带 body    → 到达 panel（返回业务错误）
+#   · `POST   /api/keys` 带 body      → 200
+#   · `DELETE /api/admins` 带 body    → 同样 403
+#
+# 所以这**不是 M4 引入的**：`DELETE /api/admins` 从 M3 上线起就不可用，只是没有
+# 任何闸门发过"带 body 的 DELETE"——单测直接调本文件的 handler，不经 CloudFront，
+# 于是单测全绿而功能在生产上坏着。verify_api_key_e2e.py 的场景 ③ 是第一个发它的。
+#
+# 为什么改成 POST 而不是把参数搬进查询串：查询串会进 CloudFront/CloudWatch 的
+# 访问日志，而这两个参数里有 `key_id` 与**管理员邮箱**；请求头与请求体不会。
+# 本项目已经为"明文不进日志"专门写了一条真机负测（N4），没道理在这里反着来。
+#
+# 由 test_handler.py 的 test_no_route_uses_delete_with_body 按 ROUTES 锁定：
+# 再有人加 DELETE 路由时当场红。
 
 
 def _json(status: int, payload, cookies=None) -> dict:
@@ -225,16 +253,16 @@ def _dispatch(pattern, method, email, name, site_id, qs, body):
     if pattern == r"^/api/admins$":
         if method == "GET":
             return api.do_list_admins(email)
-        target = body.get("email", "")
-        return (api.do_add_admin(email, target) if method == "PUT"
-                else api.do_remove_admin(email, target))
+        return api.do_add_admin(email, body.get("email", ""))
+    if pattern == ADMIN_REMOVE:
+        return api.do_remove_admin(email, body.get("email", ""))
     if pattern.startswith(r"^/api/admin/resync/"):
         return api.do_resync(email, site_id)
     if pattern == KEYS:
         if method == "GET":
             return api.do_list_keys(email)
-        if method == "POST":
-            return api.do_create_key(email, name=body.get("name", ""))
+        return api.do_create_key(email, name=body.get("name", ""))
+    if pattern == KEY_REVOKE:
         return api.do_revoke_key(email, key_id=body.get("key_id", ""))
     if pattern == KEY_SWITCH:
         if method == "GET":

@@ -581,7 +581,7 @@ def test_panel_delegates_edge_caller_check_and_has_no_own_parser():
 # 不是重新验证 CSRF/会话本身（那些各有自己的用例）。
 
 KEY_WRITES = [("POST", "/api/keys", {"name": "笔记本"}),
-              ("DELETE", "/api/keys", {"key_id": "abcd1234"}),
+              ("POST", "/api/keys/revoke", {"key_id": "abcd1234"}),
               ("PUT", "/api/settings/api-key", {"enabled": True})]
 
 
@@ -678,7 +678,7 @@ def test_key_crud_dispatches_end_to_end(aws, secret):
     assert key["plaintext"] not in json.dumps(listed)
     assert "key_hash" not in json.dumps(listed)
 
-    revoked = handler.handler(_write_ev("/api/keys", method="DELETE",
+    revoked = handler.handler(_write_ev("/api/keys/revoke", method="POST",
                                         body={"key_id": key["key_id"]}), None)
     assert revoked["statusCode"] == 200, revoked
     after = json.loads(handler.handler(_ev("GET", "/api/keys"), None)["body"])
@@ -689,9 +689,9 @@ def test_revoking_someone_elses_key_over_http_is_403(aws, secret):
     """403 而不是 500——而且与"不存在"同一句话（api 层用例覆盖文案一致性）。"""
     import keystore
     victim = keystore.create("victim@x.com", name="victim")
-    mine = handler.handler(_write_ev("/api/keys", method="DELETE",
+    mine = handler.handler(_write_ev("/api/keys/revoke", method="POST",
                                      body={"key_id": victim["key_id"]}), None)
-    missing = handler.handler(_write_ev("/api/keys", method="DELETE",
+    missing = handler.handler(_write_ev("/api/keys/revoke", method="POST",
                                         body={"key_id": "zzzzzzzz"}), None)
     assert mine["statusCode"] == 403 and missing["statusCode"] == 403
     assert mine["body"] == missing["body"], "两种情形的响应可区分 = 枚举探测器"
@@ -755,7 +755,7 @@ def test_every_new_key_route_is_dispatched(aws, secret):
     """
     permissions.add_admin("boss@x.com", "seed")
     cases = [("GET", "/api/keys", None), ("POST", "/api/keys", {"name": "n"}),
-             ("DELETE", "/api/keys", {"key_id": "zzzzzzzz"}),
+             ("POST", "/api/keys/revoke", {"key_id": "zzzzzzzz"}),
              ("GET", "/api/settings/api-key", None),
              ("PUT", "/api/settings/api-key", {"enabled": False})]
     for method, path, body in cases:
@@ -764,3 +764,44 @@ def test_every_new_key_route_is_dispatched(aws, secret):
         r = handler.handler(ev, None)
         assert r["statusCode"] != 500, f"{method} {path} 落到未分发兜底: {r}"
         assert "接口不存在" not in r["body"], f"{method} {path} 没进 ROUTES"
+
+
+# ── 这条链路上不允许"DELETE + 请求体"（2026-08-13 真机隔离）──────────────
+
+def test_no_route_uses_delete_with_body():
+    """`ROUTES` 里**一条 DELETE 都不许有**。
+
+    根因写在 `handler.py` 的 `ROUTES` 下方：CloudFront 把 DELETE 的请求体交给了
+    Lambda@Edge（`include_body=True`，Edge 因此按真实 body 算 payload hash 去签
+    SigV4），但转发到源站时那个 body 不在了——Function URL 按空 body 算哈希，
+    签名不匹配，**在 handler 任何代码之前**就 403。
+
+    **为什么这条断言必须按 `ROUTES` 写、而不是逐个路径写**：逐个写的话，下一个
+    人加一条新的 DELETE 路由时它照样绿。而这个缺陷的形态恰恰是"单测全绿、生产
+    不可用"——`DELETE /api/admins` 从 M3 上线起就坏着，没有任何用例发现，因为
+    单测直接调本模块的 handler，压根不经过 CloudFront。
+
+    真要加 DELETE 就必须先证明它**不带请求体**（参数走路径段）。那时改这条断言
+    的人会被迫读上面那段根因，这正是它存在的目的。
+    """
+    deletes = [pat.pattern for method, pat in handler.ROUTES
+               if method.upper() == "DELETE"]
+    assert deletes == [], (
+        f"新增了 DELETE 路由 {deletes}——带请求体的 DELETE 在 CloudFront → "
+        "Lambda@Edge → Function URL 这条链路上必 403（见 handler.ROUTES 下方注释）。"
+        "改成 POST，或证明该路由不带请求体。")
+
+
+def test_revoke_and_admin_remove_are_post_routes():
+    """两个"删除"动作的落点是 POST 子路径，且**仍然是写方法**。
+
+    断言路由表而不是断言行为：行为各有自己的用例（吊销的三态、移除管理员的
+    最后一名管理员保护），这里锁的是"它们没有退回 DELETE"。写方法这一点同样要
+    锁——POST 在 `console_session.WRITE_METHODS` 里，所以 CSRF + 面板会话两道
+    前置自动继承；万一有人改成 GET，那两道就整体失效了。
+    """
+    import console_session
+    routes = {(m.upper(), p.pattern) for m, p in handler.ROUTES}
+    assert ("POST", r"^/api/keys/revoke$") in routes
+    assert ("POST", r"^/api/admins/remove$") in routes
+    assert "POST" in console_session.WRITE_METHODS

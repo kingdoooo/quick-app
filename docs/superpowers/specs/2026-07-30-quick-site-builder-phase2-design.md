@@ -442,7 +442,8 @@ PUT  /api/sites/{id}/permissions      改 require_login/allowed_users（owner+co
 PUT  /api/sites/{id}/collaborators    增删协作者（仅 owner/admin）
 PUT  /api/sites/{id}/owner            转移所有权（仅 owner/admin）
 POST /api/sites/{id}/undeploy         下线（仅 owner/admin；purge_data 显式传）
-GET/POST/DELETE /api/keys             我的 API Key
+GET/POST /api/keys                    我的 API Key（列出 / 创建）
+POST /api/keys/revoke                 吊销（body: {key_id}）
 GET/PUT /api/admins                   管理员名单（仅 admin）
 POST /api/admin/resync/{id}           路由表重同步（仅 admin，见 §8 错误处理）
 GET  /api/session-callback            会话升级回调（见 §4.5；由 console host
@@ -484,7 +485,13 @@ host-only cookie 只会回发给 `auth.{domain}`，兄弟域 `console.{domain}` 
 - 校验 `Origin` 头等于 `https://console.{base_domain}`（缺失即拒绝，不做
   Referer 回退）；
 - 要求 `Content-Type: application/json`（阻断 HTML form 的简单请求）；
-- 写操作一律用 `PUT`/`POST`/`DELETE`，不接受 `GET` 触发副作用。
+- 写操作一律用 `PUT`/`POST`，不接受 `GET` 触发副作用；**也不用 `DELETE`**：
+  CloudFront 把 DELETE 的请求体交给 Lambda@Edge（`include_body=True`，Edge 因此
+  按真实 body 算 payload hash 去签 SigV4），但转发到源站时那个 body 不在了，
+  Function URL 按空 body 校验 → `403 signature does not match`，**在 panel 任何
+  代码之前**就被拒。2026-08-13 真机隔离（四组对照见 `panel/handler.py` 的 ROUTES
+  下方注释）。所以删除类动作是 `POST /api/keys/revoke` 与 `POST /api/admins/remove`；
+  参数也不搬进查询串——那会把 `key_id` 与管理员邮箱写进 CloudFront 访问日志。
 
 三条同时满足才放行。这也是"站点 XSS → 改全局权限"这条攻击链的最终闸门。
 

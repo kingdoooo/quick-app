@@ -1197,15 +1197,23 @@ def test_keys_page_requests_nothing_when_component_is_not_deployed():
 
 
 def test_revoke_sends_key_id_and_never_the_plaintext():
-    """吊销的请求体**只带 `key_id`**。
+    """吊销走 **`POST /api/keys/revoke`**，请求体只带 `key_id`。
 
     带明文等于把一个凭证放进请求体，沿途每一层日志都可能留下它；而 key_id 是
     刻意设计成"非秘密标识符"的（keygen 的注释）。
+
+    **为什么是 POST 而不是 DELETE**（2026-08-13 真机隔离，见 `handler.ROUTES`
+    下方注释）：CloudFront 不把 DELETE 的请求体转发到源站，而 Edge 已经按真实
+    body 签了 SigV4 → Function URL 按空 body 校验 → 403，前端点"吊销"只会拿到
+    一个与功能无关的签名错误。参数也不能搬进查询串——`key_id` 会因此进 CloudFront
+    的访问日志。
     """
     blob = _js()
-    m = re.search(r"""api\(\s*['"]DELETE['"]\s*,\s*['"]/api/keys['"]\s*,\s*\{([^}]*)\}""",
-                  blob)
-    assert m, "找不到 DELETE /api/keys 的调用 —— 吊销没接上？"
+    m = re.search(
+        r"""api\(\s*['"]POST['"]\s*,\s*['"]/api/keys/revoke['"]\s*,\s*\{([^}]*)\}""",
+        blob)
+    assert m, ("找不到 POST /api/keys/revoke 的调用 —— 吊销没接上？"
+               "（若改回了 DELETE：那条路在 CloudFront 上必 403）")
     fields = set(re.findall(r"([a-z_]+)\s*:", m.group(1)))
     assert fields == {"key_id"}, (
         f"吊销请求体的字段是 {sorted(fields)}，必须**恰好**是 key_id")

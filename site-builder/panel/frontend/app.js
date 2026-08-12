@@ -1633,7 +1633,7 @@ function confirmRevoke(keyId, name, prefix) {
     btn.disabled = true;
     btn.textContent = '吊销中…';
     try {
-      await api('DELETE', '/api/keys', { key_id: keyId });
+      await api('POST', '/api/keys/revoke', { key_id: keyId });
       closeModal();
       toast('Key 已吊销', name || keyId, 'ok');
       pageKeys();
@@ -1779,7 +1779,7 @@ async function pageAdmin() {
     }
     b.disabled = true;
     try {
-      await api('DELETE', '/api/admins', { email: target });
+      await api('POST', '/api/admins/remove', { email: target });
       toast('已移出管理员名单', target, 'ok');
       state.me = await apiGet('/api/me');
       renderNav();

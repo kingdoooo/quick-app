@@ -1298,7 +1298,7 @@ Expected: FAIL（`No module named 'keystore'`）。
 ```
 GET    /api/keys                  列我的 Key
 POST   /api/keys                  创建（body: {name}）
-DELETE /api/keys                  吊销（body: {key_id}）
+POST   /api/keys/revoke           吊销（body: {key_id}）
 GET    /api/settings/api-key      开关状态（admin-only）
 PUT    /api/settings/api-key      改开关（admin-only，body: {enabled}）
 ```
@@ -1747,7 +1747,7 @@ def allowed_clients(cfg) -> list[str]:
 |---|---|
 | 创建响应的明文**只写进 DOM 一次**且不进 `localStorage`/`sessionStorage`/URL | 断言不出现 `localStorage.setItem` 与 `location.hash =` 携带明文的形态 |
 | 明文展示区有"不再显示"警告文案 | 查该文案常量 |
-| 吊销走 `DELETE` + body 带 `key_id`（**不是明文**） | 解析该 fetch 调用的 method 与 body 键 |
+| 吊销走 `POST /api/keys/revoke` + body 带 `key_id`（**不是明文**） | 解析该 fetch 调用的 method 与 body 键 |
 | `deployed=false` 时**零 fetch** | 在 boot harness 里跑，间谍 fetch |
 | `deployed=true, enabled=false` 时**页面可用且 admin 能看到开关** | 同一 harness 换 features 取值；断言渲染出开关控件且发了列表请求。**这条是部署自锁的闸门**——按单布尔实现时它必红 |
 | 所有插值过 `esc()` | 按顶层 `+` 切分（M3-FINDINGS §2.17 第 11 条的二段坑：不能要求两侧都有 `+`，续行开头的表达式会被跳过） |

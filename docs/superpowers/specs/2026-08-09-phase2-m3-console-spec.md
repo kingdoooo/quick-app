@@ -88,7 +88,7 @@ sites 表、按 permissions.py 写权限（事务含路由表投影）、invoke
 | 14 | `revokeApiKey(keyId)` | — | 同上 | **M4，不做** |
 | 15 | `listAdmins()` | `GET /api/admins` | `permissions.list_admins`（已滤 `__count__`） | 已有 |
 | 16 | `addAdmin(email)` | `PUT /api/admins` | `permissions.add_admin`（维护 `__count__` sentinel） | 已有 |
-| 17 | `removeAdmin(email)` | `DELETE /api/admins` | `permissions.remove_admin`（禁删空、入口验邮箱格式） | 已有 |
+| 17 | `removeAdmin(email)` | `POST /api/admins/remove` | `permissions.remove_admin`（禁删空、入口验邮箱格式） | 已有 |
 
 原型之外、属 M3 的补充接口（均已在 phase2 spec 定义）：
 
