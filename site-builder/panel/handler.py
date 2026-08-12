@@ -55,9 +55,18 @@ ROUTES = [
     ("PUT", re.compile(r"^/api/admins$")),
     ("DELETE", re.compile(r"^/api/admins$")),
     ("POST", re.compile(rf"^/api/admin/resync/{_SITE}$")),
+    # 二期 M4：API Key。三个写方法自动继承 ②③（CSRF + 面板会话），
+    # 开关的两条另有 api._require_admin（admin-only 不靠路由表达）。
+    ("GET", re.compile(r"^/api/keys$")),
+    ("POST", re.compile(r"^/api/keys$")),
+    ("DELETE", re.compile(r"^/api/keys$")),
+    ("GET", re.compile(r"^/api/settings/api-key$")),
+    ("PUT", re.compile(r"^/api/settings/api-key$")),
     ("GET", re.compile(r"^/api/session-callback$")),
 ]
 CALLBACK = r"^/api/session-callback$"
+KEYS = r"^/api/keys$"
+KEY_SWITCH = r"^/api/settings/api-key$"
 
 
 def _json(status: int, payload, cookies=None) -> dict:
@@ -221,6 +230,20 @@ def _dispatch(pattern, method, email, name, site_id, qs, body):
                 else api.do_remove_admin(email, target))
     if pattern.startswith(r"^/api/admin/resync/"):
         return api.do_resync(email, site_id)
+    if pattern == KEYS:
+        if method == "GET":
+            return api.do_list_keys(email)
+        if method == "POST":
+            return api.do_create_key(email, name=body.get("name", ""))
+        return api.do_revoke_key(email, key_id=body.get("key_id", ""))
+    if pattern == KEY_SWITCH:
+        if method == "GET":
+            return api.do_get_key_switch(email)
+        # **原样透传 body 里的值**，不做 `bool(...)` 也不给缺失兜个默认：
+        # `bool("false") is True`（`44aef8d` 的 P1-2 就是这个），而"缺 enabled
+        # 就当 False"会让一个畸形请求静默关掉全平台的 Key 通道。真布尔的判定
+        # 在 keystore.set_switch（唯一定义），非布尔一律 ValueError → 400。
+        return api.do_set_key_switch(email, enabled=body.get("enabled"))
     # 路由已匹配却没有分支 = 加了 ROUTES 忘了加分发。抛出让 500 + 日志暴露它，
     # 而不是静默返回空对象（那会让前端拿到 200 和空数据，极难查）。
     raise RuntimeError(f"路由已匹配但未分发: {pattern}")

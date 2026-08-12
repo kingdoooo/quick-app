@@ -21,6 +21,10 @@ ENV = {"JOBS_TABLE": "site-deploy-jobs", "SITES_TABLE": "site-sites",
        "ADMINS_TABLE": "site-admins",
        "OPS_LOG_TABLE": "site-ops-log",
        "SESSION_CODES_TABLE": "site-session-codes",
+       # 二期 M4：keystore 读它（api.py 经 keystore 访问这张表）。
+       # 名字与 deploy_panel.lambda_environment() 必须一致，由
+       # test_deploy_panel_contract 的推导式断言交叉核对。
+       "API_KEYS_TABLE": "site-api-keys",
        "JWT_SECRET_PARAM": "/site-builder/jwt-secret",
        "CONSOLE_HOST": "console.example.com",
        # Edge 执行角色的 RoleId：handler 用它确认调用者真是 Edge（P1-1）。
@@ -86,6 +90,24 @@ def aws(monkeypatch):
                          KeySchema=[{"AttributeName": "jti", "KeyType": "HASH"}],
                          AttributeDefinitions=[{"AttributeName": "jti",
                                                 "AttributeType": "S"}],
+                         BillingMode="PAY_PER_REQUEST")
+        # 二期 M4：API Key。形态与 `deployer/infra/app.py` 的 ApiKeys 表、
+        # `deployer/tests/conftest.py`、`key-proxy/tests/conftest.py` 的同名表
+        # **必须一致**（PK key_hash + email-index + keyid-index）——真机只有
+        # 一张表，夹具形态漂移会让一侧绿另一侧红。
+        ddb.create_table(TableName="site-api-keys",
+                         KeySchema=[{"AttributeName": "key_hash", "KeyType": "HASH"}],
+                         AttributeDefinitions=[
+                             {"AttributeName": "key_hash", "AttributeType": "S"},
+                             {"AttributeName": "email", "AttributeType": "S"},
+                             {"AttributeName": "key_id", "AttributeType": "S"}],
+                         GlobalSecondaryIndexes=[{
+                             "IndexName": "email-index",
+                             "KeySchema": [{"AttributeName": "email", "KeyType": "HASH"}],
+                             "Projection": {"ProjectionType": "ALL"}}, {
+                             "IndexName": "keyid-index",
+                             "KeySchema": [{"AttributeName": "key_id", "KeyType": "HASH"}],
+                             "Projection": {"ProjectionType": "ALL"}}],
                          BillingMode="PAY_PER_REQUEST")
         s3c = boto3.client("s3", region_name="us-east-1")
         for b in ("site-artifacts-1", "site-frontend-1"):

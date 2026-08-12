@@ -32,9 +32,33 @@ def test_build_copies_session_py_too():
 
     edge_caller.py 同理：它是"调用者真是 Edge"的唯一判定，漏复制 = handler
     的第 ⓪ 步 ImportError → 整个面板 500（比放行安全，但同样是线上故障）。
+
+    keystore.py / keygen.py（二期 M4）：api.py **顶层** import keystore，所以
+    漏复制不是"Key 功能挂了"，而是 api.py import 失败 → **所有**控制台 API 500。
+    keygen.py 是 keystore.py 的传递依赖（明文/哈希的唯一算法）。
+    这条是**恒定集合**的快照，隔壁那条按传递闭包推导——两条一起才既挡住
+    "改了代码忘了改清单"，也挡住"往清单里塞了不存在的文件"（后者会让
+    `_build_zip` 在真机上 `sys.exit`，而闭包断言不看这个方向）。
     """
     assert set(dp.COPY_FILES) == {"common.py", "permissions.py", "ops_log.py",
-                                  "session.py", "edge_caller.py"}
+                                  "session.py", "edge_caller.py",
+                                  "keystore.py", "keygen.py"}
+
+
+def test_every_copied_module_actually_exists_on_disk():
+    """清单里的每个文件都必须真能找到源——`_build_zip` 找不到就 `sys.exit`。
+
+    为什么单独一条：闭包断言只查"被 import 的都在清单里"（少了会红），
+    多出一个不存在的文件名它不会红，而那会在**真机部署时**才炸。
+    计划里原本要求加一个 Task 7 才创建的 `api_key_config.py`，就是这个方向。
+    查找顺序与 `_build_zip` 一致（`deployer/functions` → `auth`）。
+    """
+    fn_dir = PANEL.parent / "deployer" / "functions"
+    auth_dir = PANEL.parent / "auth"
+    for name in dp.COPY_FILES:
+        assert (fn_dir / name).exists() or (auth_dir / name).exists(), (
+            f"复制清单里的 {name} 在 {fn_dir} 与 {auth_dir} 都找不到——"
+            "部署时 _build_zip 会 sys.exit")
 
 
 def test_copy_files_covers_every_local_module_panel_imports():
@@ -249,6 +273,143 @@ def test_role_grants_every_dynamodb_action_the_transactions_actually_need():
     assert not missing, (
         f"事务需要但 panel role 没给的 DynamoDB 权限: {missing} "
         "—— 真机会以 AccessDeniedException → 500 的形态出现，而 moto 测不出来")
+
+
+# ── api-keys 表的权限从 keystore.py 的操作推导（二期 M4）────────────────
+# 手抄一份"需要哪些 action"就是下一个漂移源（M3-FINDINGS §2.18）：panel 曾漏
+# ConditionCheckItem，144 个单测全绿而真机上所有写操作 500。这里沿用隔壁那条
+# 事务断言的形态，扩展到"keystore 对 api-keys 表做的每个操作 + 每个 IndexName"。
+
+KEYSTORE_SRC = PANEL.parent / "deployer" / "functions" / "keystore.py"
+
+DDB_METHOD_TO_ACTION = {
+    "get_item": "dynamodb:GetItem", "put_item": "dynamodb:PutItem",
+    "update_item": "dynamodb:UpdateItem", "delete_item": "dynamodb:DeleteItem",
+    "query": "dynamodb:Query", "scan": "dynamodb:Scan",
+    "batch_get_item": "dynamodb:BatchGetItem",
+    "batch_write_item": "dynamodb:BatchWriteItem",
+    "transact_get_items": "dynamodb:TransactGetItems",
+    "transact_write_items": "dynamodb:TransactWriteItems"}
+
+
+def _keystore_table_ops() -> tuple[set[str], set[str]]:
+    """(keystore 需要的 action, 它用到的 IndexName)，全部从源码 AST 推导。
+
+    两种调用形态都要认：`_table().get_item(...)` 是直接调用，而
+    `common._paginate(_table().query, IndexName=...)` 把**方法本身**当参数传出去
+    （节点是 Attribute 而不是 Call）。按"属性挂在 `_table()` 调用上"来判就能一条
+    规则覆盖两种——只认 `ast.Call` 会漏掉全部 Query，而 Query 恰好是本表最容易
+    漏权限的那个（GSI 要的是索引 ARN）。
+    """
+    tree = ast.parse(KEYSTORE_SRC.read_text())
+    actions, indexes = set(), set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Attribute)
+                and node.attr in DDB_METHOD_TO_ACTION
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id == "_table"):
+            actions.add(DDB_METHOD_TO_ACTION[node.attr])
+        if (isinstance(node, ast.keyword) and node.arg == "IndexName"
+                and isinstance(node.value, ast.Constant)):
+            indexes.add(node.value.value)
+    return actions, indexes
+
+
+def _api_keys_table() -> str:
+    """表名取自**下发给 Lambda 的环境变量**，不写字面量。
+
+    keystore 读 `os.environ["API_KEYS_TABLE"]`，所以"role 授权的那张表"与
+    "代码实际访问的那张表"同名才成立；两处漂移时本文件所有断言会一起变红。
+    """
+    return dp.lambda_environment()["API_KEYS_TABLE"]
+
+
+def test_keystore_op_parser_is_not_vacuous():
+    """守卫的守卫：解析口径一坏，下面两条会静默变成空转。"""
+    actions, indexes = _keystore_table_ops()
+    assert {"dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem",
+            "dynamodb:Query"} <= actions, (
+        f"解析不到 keystore 的基本操作，口径坏了: {sorted(actions)}")
+    assert indexes == {"email-index", "keyid-index"}, (
+        f"解析出的 GSI 不是那两个: {sorted(indexes)}")
+
+
+def test_role_grants_every_api_keys_action_keystore_needs():
+    """keystore 会做的每个操作、用到的每个 GSI，role 都必须授权。
+
+    **GSI 上的 Query 要的是索引 ARN**（`table/T/index/I`），不是表 ARN。
+    漏 `index/*` 时列 Key 与吊销都会 AccessDenied → 500，而 moto 不校验 IAM，
+    单测这一侧看不出任何异常。
+    """
+    actions, indexes = _keystore_table_ops()
+    table = _api_keys_table()
+
+    base_granted: set[str] = set()
+    index_grants: list[tuple[str, set[str]]] = []
+    for s in dp.role_statements():
+        for res in _resources(s):
+            if res.endswith(f"/{table}"):
+                base_granted |= set(_actions(s))
+            if f"/{table}/index/" in res:
+                index_grants.append((res, set(_actions(s))))
+
+    assert base_granted, f"role 里找不到 {table} 的任何授权"
+    missing = actions - base_granted
+    assert not missing, (
+        f"keystore 会做但 panel role 没给的权限: {sorted(missing)} "
+        "—— 真机以 AccessDeniedException → 500 出现，moto 测不出来")
+    for idx in sorted(indexes):
+        covered = any("dynamodb:Query" in acts
+                      and (res.endswith(f"/index/{idx}")
+                           or res.endswith("/index/*"))
+                      for res, acts in index_grants)
+        assert covered, (
+            f"GSI {idx} 上的 Query 没有被授权（现有索引资源: "
+            f"{[r for r, _ in index_grants]}）——GSI 查询要的是索引 ARN")
+
+
+def test_api_keys_role_has_no_deleteitem_and_no_scan():
+    """吊销是置 `revoked` 而**不删行**（保留审计痕迹），所以不给 DeleteItem；
+    也不给 Scan（按人列 Key 走 email-index，Scan 等于能读全表凭证行）。
+
+    两个方向都查：role 里没给，keystore 里也确实没用——只查 role 时，
+    将来 keystore 里冒出一个 `scan` 会以真机 AccessDenied 的形态出现；
+    只查代码时，role 多给的宽权限没人管。
+    """
+    table = _api_keys_table()
+    for s in dp.role_statements():
+        if not any(f"/{table}" in r for r in _resources(s)):
+            continue
+        bad = ({"dynamodb:DeleteItem", "dynamodb:Scan", "dynamodb:*"}
+               & set(_actions(s)))
+        assert not bad, f"api-keys 表拿到了 {sorted(bad)}（Sid={s.get('Sid')}）"
+    actions, _ = _keystore_table_ops()
+    over = {"dynamodb:DeleteItem", "dynamodb:Scan"} & actions
+    assert not over, (
+        f"keystore 里出现了 {sorted(over)}——真机会 AccessDenied。"
+        "该改的是 keystore（吊销必须置 revoked、列 Key 必须走 GSI），不是放宽 role")
+
+
+def test_environment_covers_every_env_var_keystore_reads():
+    """keystore 读的环境变量必须都下发。
+
+    为什么隔壁 `test_environment_covers_every_env_var_the_code_reads` 覆盖不到：
+    它只 glob `panel/*.py`，而 keystore.py 住在 `deployer/functions/`，只在
+    部署时被复制进包——漏下发 `API_KEYS_TABLE` 的症状是真机 KeyError → 500，
+    而单测有 conftest 兜着看不出来。
+    这里**只**扩展到 keystore：整条复制闭包不适用，common.py 会读
+    `ACCOUNT_ID` / `RUNTIME_BOUNDARY_ARN`，那是 panel 永不调用的建站路径，
+    要求下发它们等于把无关配置塞进 panel。
+    """
+    env = set(dp.lambda_environment())
+    src = KEYSTORE_SRC.read_text()
+    read = set(re.findall(r'os\.environ\[[\'"]([A-Z_]+)[\'"]\]', src))
+    read |= set(re.findall(r'os\.environ\.get\([\'"]([A-Z_]+)[\'"]', src))
+    read -= {"AWS_DEFAULT_REGION", "AWS_REGION"}
+    assert "API_KEYS_TABLE" in read, f"解析口径坏了: {sorted(read)}"
+    missing = read - env
+    assert not missing, f"keystore 会读但部署没下发的环境变量: {sorted(missing)}"
 
 
 def test_ops_log_is_putitem_only():

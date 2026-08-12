@@ -9,15 +9,22 @@ resource policy 是这个前提的保证，见 deploy_panel.py）。本层不做
 授权 100% 走 permissions.py 的高层函数：本文件不出现任何手写的
 DynamoDB 表达式、角色判定、权限 rev 守卫，也不直写 sites/admins/routing 表。
 tests/test_no_handwritten_guards.py 用 AST 锁定这一点。
+
+二期 M4 的 `site-api-keys` 表同理，唯一访问层是 keystore.py（本文件既不碰那张
+表也不调 keygen），由 tests/test_keys_api.py 的结构组锁定。
 """
 import json
+import logging
 import os
 from datetime import datetime
 
 import boto3
 
 import common
+import keystore
 import permissions
+
+logger = logging.getLogger(__name__)
 
 
 def _base() -> str:
@@ -39,9 +46,35 @@ def _require_admin(email: str) -> None:
         raise permissions.PermissionDenied("仅平台管理员可执行此操作")
 
 
+def _api_key_feature() -> dict:
+    """`features.api_key` 的派生。**只影响 UI 展示，不是门禁**（真门禁在网关层）。
+
+    **两个字段而不是一个布尔**（Codex 审查 2026-08-11 P1-5）：首次部署强制把
+    哨兵行建成 `enabled=false`，若只有一个布尔、前端据它 disabled 且零请求，
+    管理员就**无处点开闸**——部署流程自锁。所以 `deployed` 决定 UI 可用性，
+    `enabled` 只驱动状态提示与开关初值。
+
+    读失败一律 `(False, False)`：表不存在 / 哨兵行不存在 / AccessDenied 都算
+    "没部署"。**这与 keystore.switch_state 的"读失败就抛"不矛盾**——两个调用点
+    的代价完全不同：
+      · 这里是 `/api/me`，控制台的**启动请求**。让它 500 等于 M4 一没部署好，
+        整个控制台（连站点管理）都打不开——把一个功能开关的故障放大成全站故障；
+      · `do_get_key_switch` 是 admin 专属端点，那里**故意不接**这个异常：读失败
+        照 keystore 的口径变成 500，管理员看到的是"读不出来"而不是"未部署"
+        （后者会让他以为平台没这功能，正是自锁的那一步）。
+    """
+    try:
+        deployed, enabled = keystore.switch_state()
+    except Exception:
+        logger.warning("API Key 开关状态读取失败——按未部署展示", exc_info=True)
+        return {"deployed": False, "enabled": False}
+    return {"deployed": deployed, "enabled": enabled}
+
+
 def do_me(email: str, name: str) -> dict:
     return {"email": email, "name": name,
-            "is_admin": permissions.is_admin(email)}
+            "is_admin": permissions.is_admin(email),
+            "features": {"api_key": _api_key_feature()}}
 
 
 def _shape_site(site: dict, viewer: str, *, viewer_is_admin: bool) -> dict:
@@ -235,3 +268,98 @@ def do_remove_admin(email: str, target: str) -> dict:
 
 def do_resync(email: str, site_id: str) -> dict:
     return permissions.resync_route(site_id, actor=email)
+
+
+# ------------------------------------------------------------------ API Key
+# 表访问 100% 经 keystore（同本文件对 sites 表"只走 permissions.py 高层函数"的
+# 既有约束）：`site-api-keys` 只能有一个访问层，否则"哨兵行 enabled 必须是布尔
+# True"这条不变量就会被抄成两份（keystore.py 的模块 docstring 有完整理由）。
+# panel 也**不直接调 keygen**——明文/哈希的生成只在 keystore.create 里发生一次。
+# tests/test_keys_api.py 的 AST 断言锁定这两点。
+
+def _shape_key(row: dict) -> dict:
+    """Key 的对外形态。**唯一出口**——绝不返回 key_hash。
+
+    为什么必须收口到一个函数：key_hash 是这张表最值得保护的字段
+    （spec §5.1：库被读走时攻击者只拿到哈希）。把它挡在一个地方，
+    比在三个端点各写一次 `del row["key_hash"]` 可靠——后者漏一处即泄漏，
+    而"漏一处"正是本项目反复出现的缺陷形态。
+
+    形态是**白名单**而不是"复制 row 再删几个键"：白名单下将来给表加字段
+    （比如 `revoked_by`、内部标记）默认不出网；黑名单下默认出网，得靠人记得
+    每次加字段都回来改这里。
+    tests/test_keys_api.py 用 AST 锁定所有返回路径都经过本函数。
+    """
+    return {"key_id": row.get("key_id", ""), "name": row.get("name", ""),
+            "prefix": row.get("prefix", ""),
+            "created_at": row.get("created_at", ""),
+            "last_used_at": row.get("last_used_at", ""),
+            "revoked": bool(row.get("revoked"))}
+
+
+def do_list_keys(email: str) -> dict:
+    """我的全部 Key（含已吊销的——控制台要显示吊销状态）。
+
+    只按 `email-index` 查自己那一批：哪个人能看到哪些 Key 由**分区键**决定，
+    不是查回来再过滤（后者一旦漏掉过滤条件就是全表泄漏）。哨兵行没有 email
+    属性，天然不进这个 GSI，所以它不会出现在任何人的列表里。
+    """
+    return {"keys": [_shape_key(row) for row in keystore.list_for(email)]}
+
+
+def do_create_key(email: str, *, name: str) -> dict:
+    """发一把新 Key。响应里的 `plaintext` 是明文在服务端**唯一一次**出场。
+
+    name / 邮箱形态的校验在 keystore.create 里，**不在这里再抄一份**：两份校验
+    迟早分叉，而分叉方向通常是"这一侧更松"。
+    """
+    row = keystore.create(email, name=name)
+    out = _shape_key(row)
+    # 明文**不放进 _shape_key**：那个形态是列表与创建共用的，让它有能力输出
+    # 明文就等于给列表接口留了一条泄漏路径。整个服务端只有这一行贴明文。
+    out["plaintext"] = row["plaintext"]
+    return out
+
+
+def do_revoke_key(email: str, *, key_id: str) -> dict:
+    """吊销我的一把 Key（置 `revoked`，不删行——删了就没有审计痕迹）。
+
+    "不存在"与"是别人的"由 keystore 抛**同一个异常同一句文案**，这里只做状态码
+    转换、**绝不按情形分支**：能区分两者就是 key_id 枚举探测器（8 位 base62）。
+    转成 PermissionDenied（403）而不是让 KeystoreError 落到 500，口径同
+    `do_get_site` 对"站点不存在/无权访问"的既有处理。
+    """
+    try:
+        return keystore.revoke(key_id, actor=email)
+    except keystore.KeyNotFound as e:
+        raise permissions.PermissionDenied(str(e)) from e
+
+
+def do_get_key_switch(email: str) -> dict:
+    """开关状态（admin-only）。
+
+    **不接 keystore 的读异常**（与 `_api_key_feature` 刻意相反，见那里的理由）：
+    管理员必须能区分"没部署"与"读不出来"，把后者显示成前者会让他以为平台没有
+    这个功能。
+    """
+    _require_admin(email)
+    deployed, enabled = keystore.switch_state()
+    return {"deployed": deployed, "enabled": enabled}
+
+
+def do_set_key_switch(email: str, *, enabled: bool) -> dict:
+    """改开关（admin-only，落 ops_log）。
+
+    **`enabled` 必须是真布尔，判定在 keystore.set_switch**（`"false"` / `"0"` /
+    `0` / `1` / `None` / `[]` 全部 ValueError → 400）。不在这里再写一次
+    `isinstance`：写入侧的收紧只能有一个定义，两份迟早有一份变松，而这个陷阱
+    的症状是"以为关了其实开着"（同 `44aef8d` 的 `bool("false") is True`）。
+    审计也由 keystore 落（`{enable,disable}_api_key_switch`）。
+
+    返回的 `deployed` 直接是 True：`set_switch` 的 PutItem 成功就意味着哨兵行
+    此刻存在，这是**从写入结果推出来的**而不是猜的。刻意不回读一次——回读失败
+    会把一次已经成功的开关变更报成 500，管理员会以为没生效而重复操作。
+    """
+    _require_admin(email)
+    keystore.set_switch(enabled, actor=email)
+    return {"deployed": True, "enabled": enabled}

@@ -57,16 +57,22 @@ ROLE_NAME = "site-panel-role"
 FUNCTION_URL_AUTH_TYPE = "AWS_IAM"
 RUNTIME = "python3.13"
 
-# 构建时复制进包的模块。**五个都必需**：
+# 构建时复制进包的模块。**七个都必需**：
 #   common.py / permissions.py —— 授权与表访问的单一真源
 #   ops_log.py                 —— permissions.py import 它（M3 审计落点）
 #   session.py                 —— upgrade code 与会话 JWT 的单一编解码实现
 #   edge_caller.py             —— "调用者真是 Edge"的单一判定（handler 的第 ⓪ 步，
 #                                 与 key-proxy 共用同一份，见该模块 docstring）
+#   keystore.py                —— `site-api-keys` 的唯一访问层（api.py 只经它
+#                                 碰这张表）。漏了它 api.py 顶层 import 就失败，
+#                                 **所有**控制台 API 500——不只 Key 相关的
+#   keygen.py                  —— keystore.py import 它（明文/哈希的唯一算法）
+# 全部从 `deployer/functions/` 取（`_build_zip` 的两级查找会命中第一级）。
 # 漏任何一个都是"单测全绿、部署后 ImportError"，由
-# test_copy_files_covers_every_local_module_panel_imports 按传递闭包核对。
+# test_copy_files_covers_every_local_module_panel_imports 按传递闭包核对——
+# **清单以那条断言为准**，不要照着记性加减（本清单曾经漏过 keystore.py）。
 COPY_FILES = ("common.py", "permissions.py", "ops_log.py", "session.py",
-              "edge_caller.py")
+              "edge_caller.py", "keystore.py", "keygen.py")
 
 
 def _region() -> str:
@@ -170,6 +176,8 @@ def role_statements() -> list[dict]:
       · 路由表：**仅 UpdateItem**——Put 能整条切流、Delete 能摘掉站点；
       · ops-log：**仅 PutItem**，审计 append-only；
       · session-codes：PutItem（jti 一次性消费的条件写）；
+      · api-keys：Get/Put/Update + 两个 GSI 的 Query，**无 DeleteItem**（吊销
+        是置 `revoked` 而不是删行，删了就没有审计痕迹）、**无 Scan**；
       · SSM：**精确** jwt-secret ARN + kms:Decrypt 带 ViaService。
     """
     region, acct = _region(), _account()
@@ -209,6 +217,17 @@ def role_statements() -> list[dict]:
         {"Sid": "SessionCodesConsume", "Effect": "Allow",
          "Action": "dynamodb:PutItem",
          "Resource": f"{tbl}/site-session-codes"},
+        # 二期 M4：api.py 经 keystore 访问这张表。**index/\\* 不可省**——
+        # 列 Key 走 email-index、吊销走 keyid-index，GSI 上的 Query 要的是
+        # **索引 ARN** 而不是表 ARN。moto 不校验 IAM，所以漏了它单测全绿、
+        # 真机 AccessDenied → 500（M3-FINDINGS §2.18 的同一形态：panel 曾漏
+        # ConditionCheckItem，144 个单测全绿而真机全 500）。
+        # 权限集不手抄：test_role_grants_every_api_keys_action_keystore_needs
+        # 从 keystore.py 的操作与 IndexName 推导后交叉核对。
+        {"Sid": "ApiKeysViaKeystore", "Effect": "Allow",
+         "Action": ["dynamodb:GetItem", "dynamodb:PutItem",
+                    "dynamodb:UpdateItem", "dynamodb:Query"],
+         "Resource": [f"{tbl}/site-api-keys", f"{tbl}/site-api-keys/index/*"]},
         {"Sid": "ReadJwtSecretOnly", "Effect": "Allow",
          "Action": "ssm:GetParameter",
          "Resource": f"arn:aws:ssm:{region}:{acct}:parameter/site-builder/jwt-secret"},
@@ -263,6 +282,10 @@ def lambda_environment(edge_role_id_value: str = "") -> dict:
         "ADMINS_TABLE": "site-admins",
         "OPS_LOG_TABLE": "site-ops-log",
         "SESSION_CODES_TABLE": "site-session-codes",
+        # 二期 M4：keystore.py 读它（表名与 role_statements 的 api-keys 资源
+        # 必须同名，由 test_role_grants_every_api_keys_action_keystore_needs
+        # 交叉核对——它按这个环境变量的值去 role 里找资源）。
+        "API_KEYS_TABLE": "site-api-keys",
         "ROUTING_TABLE": _cfg("Platform", "routing_table"),
         "BASE_DOMAIN": _base_domain(),
         "CONSOLE_HOST": console_host(),
@@ -458,8 +481,9 @@ def main() -> int:
     edge_arn = _cfg("Deployer", "edge_role_arn", "")
     function_url_statements(edge_arn)
     # RoleId 现查：handler 用它确认调用者真是 Edge（同账号 IAM 身份能绕开
-    # resource policy 直连，见 handler._edge_caller_ok）。查不到就中止——
-    # 空值会让线上拒绝所有请求。
+    # resource policy 直连，判定见 edge_caller.caller_is_edge——Task 1 把它提成
+    # panel 与 key-proxy 共用的唯一实现，原来那个 handler._edge_caller_ok 已不
+    # 存在）。查不到就中止——空值会让线上拒绝所有请求。
     eid = edge_role_id(edge_arn)
     print(f"   Edge RoleId: {eid}")
 

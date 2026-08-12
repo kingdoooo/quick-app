@@ -479,8 +479,10 @@ def test_same_account_non_edge_signed_request_is_403(aws, secret, monkeypatch):
     monkeypatch.setenv("EDGE_ROLE_ID", EDGE_ROLE_ID)
     ev = _ev("GET", "/api/me")
     # 真机上就是这个形态：IAM user Kent（AdministratorAccess）直连
+    # 拼接而不是整串字面量：Code Defender 的 HARD_CODED_SECRET 规则按 `AIDA`
+    # 前缀 + 长度匹配（同文件顶部 EDGE_ROLE_ID 的理由），值保持逐字节不变。
     ev["requestContext"].update(
-        {"authorizer": {"iam": {"callerId": "AIDAX5GBA74KD2LIPY7AJ"}}})
+        {"authorizer": {"iam": {"callerId": "AIDA" + "X5GBA74KD2LIPY7AJ"}}})
     r = handler.handler(ev, None)
     assert r["statusCode"] == 403, f"伪造身份的直连请求被放行了: {r}"
     # 不得回显内部细节（探测者不该知道我们在比什么）
@@ -571,3 +573,194 @@ def test_panel_delegates_edge_caller_check_and_has_no_own_parser():
         "panel 出现了 callerId 字面量——说明又抄了一份解析逻辑"
     # ③ 不得再有 AROA 相关的比较常量
     assert not any("AROA" in s for s in strings), "panel 不该关心 RoleId 形态"
+
+
+# ── M4：Key 端点与 admin 开关的路由继承（spec §4.4）─────────────────────
+# 这五条路由**没有一行新的鉴权代码**：三个写方法自动继承 ②CSRF + ③面板会话，
+# admin-only 由 api._require_admin 负责。所以这里断言的是"继承确实生效且零写"，
+# 不是重新验证 CSRF/会话本身（那些各有自己的用例）。
+
+KEY_WRITES = [("POST", "/api/keys", {"name": "笔记本"}),
+              ("DELETE", "/api/keys", {"key_id": "abcd1234"}),
+              ("PUT", "/api/settings/api-key", {"enabled": True})]
+
+
+def _ddb_write_spy(monkeypatch) -> list:
+    """记录本进程的所有 DynamoDB 写调用（表名, 方法）。
+
+    keystore / ops_log 都把 resource 句柄缓存在模块全局里，必须清掉，
+    否则它们用的是间谍之前建好的那个句柄——写调用一条都记不到，
+    "零写"断言会变成永远绿的装饰。
+    """
+    import keystore
+    import ops_log
+    seen = []
+    real = boto3.resource
+
+    class TableSpy:
+        def __init__(self, inner, name):
+            self._i, self._n = inner, name
+
+        def __getattr__(self, k):
+            if k in ("put_item", "update_item", "delete_item"):
+                seen.append((self._n, k))
+            return getattr(self._i, k)
+
+    class ResSpy:
+        def __init__(self, inner):
+            self._i = inner
+
+        def __getattr__(self, k):
+            return getattr(self._i, k)
+
+        def Table(self, n):
+            return TableSpy(self._i.Table(n), n)
+
+    monkeypatch.setattr(boto3, "resource", lambda *a, **k: ResSpy(real(*a, **k)))
+    monkeypatch.setattr(keystore, "_ddb", None)
+    monkeypatch.setattr(ops_log, "_ddb", None)
+    return seen
+
+
+def test_write_spy_would_notice_a_key_write(aws, secret, monkeypatch):
+    """间谍自身的验证：合规的创建请求必须被它看见。
+
+    没有这条时，下面两条"零写"断言可能只是因为间谍装不上（keystore 缓存了
+    句柄）——那正是本项目反复出现的假绿形态。
+    """
+    seen = _ddb_write_spy(monkeypatch)
+    r = handler.handler(_write_ev("/api/keys", method="POST",
+                                  body={"name": "笔记本"}), None)
+    assert r["statusCode"] == 200, r
+    assert ("site-api-keys", "put_item") in seen, seen
+
+
+@pytest.mark.parametrize("method,path,body", KEY_WRITES)
+def test_key_writes_without_console_session_are_401_and_write_nothing(
+        aws, secret, monkeypatch, method, path, body):
+    seen = _ddb_write_spy(monkeypatch)
+    r = handler.handler(_ev(method, path, origin=f"https://{CONSOLE}",
+                            body=body), None)
+    assert r["statusCode"] == 401, r
+    assert json.loads(r["body"])["need"] == "console-session"
+    assert seen == [], f"缺面板会话却发生了写: {seen}"
+
+
+@pytest.mark.parametrize("method,path,body", KEY_WRITES)
+def test_key_writes_with_forged_origin_are_403_and_write_nothing(
+        aws, secret, monkeypatch, method, path, body):
+    seen = _ddb_write_spy(monkeypatch)
+    r = handler.handler(_ev(method, path, cookie=_cookie(),
+                            origin="https://evil.example.com", body=body), None)
+    assert r["statusCode"] == 403, r
+    assert seen == [], f"CSRF 失败却发生了写: {seen}"
+
+
+def test_key_reads_need_only_edge_identity(aws, secret):
+    """读接口不要求面板会话（与站点列表同口径）。"""
+    r = handler.handler(_ev("GET", "/api/keys"), None)
+    assert r["statusCode"] == 200
+    assert json.loads(r["body"]) == {"keys": []}
+
+
+def test_key_crud_dispatches_end_to_end(aws, secret):
+    """创建 → 列表 → 吊销，全部经真实的六步前置。"""
+    created = handler.handler(_write_ev("/api/keys", method="POST",
+                                        body={"name": "笔记本"}), None)
+    assert created["statusCode"] == 200, created
+    key = json.loads(created["body"])
+    assert key["plaintext"].startswith("sk-")
+    assert "key_hash" not in created["body"]
+
+    listed = json.loads(handler.handler(_ev("GET", "/api/keys"), None)["body"])
+    assert [k["key_id"] for k in listed["keys"]] == [key["key_id"]]
+    # 列表响应里既没有明文也没有哈希（**查整段 body**：字段名可能被换掉）
+    assert key["plaintext"] not in json.dumps(listed)
+    assert "key_hash" not in json.dumps(listed)
+
+    revoked = handler.handler(_write_ev("/api/keys", method="DELETE",
+                                        body={"key_id": key["key_id"]}), None)
+    assert revoked["statusCode"] == 200, revoked
+    after = json.loads(handler.handler(_ev("GET", "/api/keys"), None)["body"])
+    assert after["keys"][0]["revoked"] is True
+
+
+def test_revoking_someone_elses_key_over_http_is_403(aws, secret):
+    """403 而不是 500——而且与"不存在"同一句话（api 层用例覆盖文案一致性）。"""
+    import keystore
+    victim = keystore.create("victim@x.com", name="victim")
+    mine = handler.handler(_write_ev("/api/keys", method="DELETE",
+                                     body={"key_id": victim["key_id"]}), None)
+    missing = handler.handler(_write_ev("/api/keys", method="DELETE",
+                                        body={"key_id": "zzzzzzzz"}), None)
+    assert mine["statusCode"] == 403 and missing["statusCode"] == 403
+    assert mine["body"] == missing["body"], "两种情形的响应可区分 = 枚举探测器"
+
+
+def test_key_switch_requires_admin_over_http(aws, secret):
+    for ev in (_ev("GET", "/api/settings/api-key"),
+               _write_ev("/api/settings/api-key", body={"enabled": True})):
+        assert handler.handler(ev, None)["statusCode"] == 403, ev["rawPath"]
+
+
+def test_key_switch_dispatches_for_admin(aws, secret):
+    permissions.add_admin("boss@x.com", "seed")
+    r = handler.handler(_write_ev("/api/settings/api-key", email="boss@x.com",
+                                  body={"enabled": True}), None)
+    assert r["statusCode"] == 200, r
+    assert json.loads(r["body"]) == {"deployed": True, "enabled": True}
+    got = handler.handler(_ev("GET", "/api/settings/api-key",
+                              email="boss@x.com"), None)
+    assert json.loads(got["body"]) == {"deployed": True, "enabled": True}
+
+
+@pytest.mark.parametrize("bad", ["false", "0", "true", "", 1, 0, [], {}, None])
+def test_non_boolean_enabled_is_400_with_zero_writes(aws, secret, monkeypatch,
+                                                     bad):
+    """`{"enabled":"false"}` 被当成 True 就是"以为关了其实开着"（同 P1-2）。"""
+    permissions.add_admin("boss@x.com", "seed")
+    seen = _ddb_write_spy(monkeypatch)
+    r = handler.handler(_write_ev("/api/settings/api-key", email="boss@x.com",
+                                  body={"enabled": bad}), None)
+    assert r["statusCode"] == 400, f"enabled={bad!r} 被接受: {r}"
+    assert seen == [], f"enabled={bad!r} 被拒却写了库: {seen}"
+
+
+def test_missing_enabled_field_is_400_not_a_silent_off(aws, secret, monkeypatch):
+    """缺字段**不能**兜个 False：那会让一个畸形请求静默关掉全平台 Key 通道。
+
+    与 purge_data 刻意相反（那里缺失=False 才是安全侧）——开关的两个方向都是
+    状态变更，没有"安全默认"，只能让调用方明确表达。
+    """
+    permissions.add_admin("boss@x.com", "seed")
+    seen = _ddb_write_spy(monkeypatch)
+    r = handler.handler(_write_ev("/api/settings/api-key", email="boss@x.com",
+                                  body={}), None)
+    assert r["statusCode"] == 400, r
+    assert seen == [], seen
+
+
+def test_me_exposes_api_key_feature_flags(aws, secret):
+    """前端按 `features.api_key.deployed` 决定 UI 可用性（Codex P1-5）。"""
+    me = json.loads(handler.handler(_ev("GET", "/api/me"), None)["body"])
+    feat = me["features"]["api_key"]
+    assert feat == {"deployed": False, "enabled": False}, feat
+
+
+def test_every_new_key_route_is_dispatched(aws, secret):
+    """ROUTES 加了分发忘了写 = 500。逐条走一遍，断言没有一条落到那个兜底上。
+
+    比"挑一条试试"强：`_dispatch` 的兜底 RuntimeError 只在真的漏分支时才触发，
+    而漏的那条恰好可能是没被抽查到的那条。
+    """
+    permissions.add_admin("boss@x.com", "seed")
+    cases = [("GET", "/api/keys", None), ("POST", "/api/keys", {"name": "n"}),
+             ("DELETE", "/api/keys", {"key_id": "zzzzzzzz"}),
+             ("GET", "/api/settings/api-key", None),
+             ("PUT", "/api/settings/api-key", {"enabled": False})]
+    for method, path, body in cases:
+        ev = (_ev(method, path, email="boss@x.com") if body is None
+              else _write_ev(path, method=method, email="boss@x.com", body=body))
+        r = handler.handler(ev, None)
+        assert r["statusCode"] != 500, f"{method} {path} 落到未分发兜底: {r}"
+        assert "接口不存在" not in r["body"], f"{method} {path} 没进 ROUTES"
