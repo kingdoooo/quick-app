@@ -394,13 +394,13 @@ def test_api_keys_role_has_no_deleteitem_and_no_scan():
 def test_environment_covers_every_env_var_keystore_reads():
     """keystore 读的环境变量必须都下发。
 
-    为什么隔壁 `test_environment_covers_every_env_var_the_code_reads` 覆盖不到：
-    它只 glob `panel/*.py`，而 keystore.py 住在 `deployer/functions/`，只在
-    部署时被复制进包——漏下发 `API_KEYS_TABLE` 的症状是真机 KeyError → 500，
-    而单测有 conftest 兜着看不出来。
-    这里**只**扩展到 keystore：整条复制闭包不适用，common.py 会读
-    `ACCOUNT_ID` / `RUNTIME_BOUNDARY_ARN`，那是 panel 永不调用的建站路径，
-    要求下发它们等于把无关配置塞进 panel。
+    keystore.py 住在 `deployer/functions/`，只在部署时被复制进包——漏下发
+    `API_KEYS_TABLE` 的症状是真机 KeyError → 500，而单测有 conftest 兜着
+    看不出来。
+    2026-08-12 起隔壁 `test_environment_covers_every_env_var_the_code_reads`
+    已经加宽到整个进包清单（含本模块），本条**保留**为直读式的兜底：它不依赖
+    那边的可达性闭包，闭包解析哪天坏了，keystore 这张表的键仍然有人盯。
+    （那边为什么不能整文件一刀切扫 common.py：见它上面那段注释。）
     """
     env = set(dp.lambda_environment())
     src = KEYSTORE_SRC.read_text()
@@ -440,19 +440,159 @@ def test_environment_has_no_plaintext_secret():
         "部署脚本不该读出明文密钥再塞进环境变量")
 
 
+# ── 环境变量扫描跟随"真正进包的那批文件"（2026-08-12 加宽，故意的）────────
+# 原状：只 glob `panel/*.py`。但 zip 里还有 COPY_FILES 复制进来的模块，它们也读
+# 环境变量（keystore.py 读 `API_KEYS_TABLE`、ops_log.py 读 `OPS_LOG_TABLE`）。
+# 那些键当时恰好都已下发，所以没出故障——但守卫在它们**没**下发时同样是绿的
+# （实测过：把 API_KEYS_TABLE 从 lambda_environment() 里删掉，本用例照样 pass），
+# 下一个复制进来的模块读一个新键时也照样绿。症状是运行时 KeyError → 500。
+# 文件集**从 COPY_FILES 推导**，查找顺序与 `_build_zip` 一致：手抄第二份清单
+# 就是下一个漂移源（M3-FINDINGS §2.18，本仓库已被这一类咬过多次）。
+#
+# 加宽后必须按**可达性**归属，不能整文件一刀切：common.py 的 `site_role_arn` /
+# `site_policy` / `ensure_site_role` 读 `ACCOUNT_ID` / `RUNTIME_BOUNDARY_ARN`，
+# 那是建站路径，panel 的任何入口都到不了（整文件扫描实测会把这两个键报成
+# "缺下发"，而真去下发它们等于把无关配置塞进 panel——那才是错的方向）。
+# 所以从 panel 自己的模块出发算传递闭包，只对**可达**的单元收环境变量读取。
+# 判"可达"看的是**引用**而不是"调用"：`common._paginate(_table().query)` 把方法
+# 本身当参数传出去（节点是 Attribute 而不是 Call），只认 `ast.Call` 会漏掉这类。
+
+
+def _shipped_modules() -> dict[str, Path]:
+    """会进 Lambda zip 的模块名 → 源文件。
+
+    查找顺序与 `_build_zip` 一致（`deployer/functions` → `auth`）；复制来的那份
+    后放是因为 `_build_zip` 先把它们 copy 进 panel 目录再 glob，同名时复制的
+    那份覆盖 panel 自己的。
+    """
+    mods = {p.stem: p for p in PANEL.glob("*.py") if p.name != "deploy_panel.py"}
+    fn_dir, auth_dir = PANEL.parent / "deployer" / "functions", PANEL.parent / "auth"
+    for name in dp.COPY_FILES:
+        src = next((d / name for d in (fn_dir, auth_dir) if (d / name).exists()),
+                   None)
+        assert src, f"复制清单里的 {name} 找不到源文件"
+        mods[src.stem] = src
+    return mods
+
+
+def _env_keys_read(node: ast.AST, consts: dict[str, str]) -> set[str]:
+    """一段 AST 里 `os.environ` 读到的键名。
+
+    `os.environ["X"]` 与 `os.environ.get("X", ...)` 两种形态都认；键是**模块级
+    字符串常量**时按常量表解析——edge_caller 读的是
+    `os.environ.get(EDGE_ROLE_ID_ENV, "")`，只认字面量会漏掉 `EDGE_ROLE_ID`，
+    而缺它线上拒绝所有请求（P1-1 的原始形态）。
+    """
+    keys: set[str] = set()
+
+    def resolve(n):
+        if isinstance(n, ast.Constant) and isinstance(n.value, str):
+            return n.value
+        if isinstance(n, ast.Name):
+            return consts.get(n.id)     # 模块级常量；解析不了就返回 None
+        return None
+
+    for n in ast.walk(node):
+        if (isinstance(n, ast.Subscript) and isinstance(n.value, ast.Attribute)
+                and n.value.attr == "environ"):
+            keys.add(resolve(n.slice))
+        elif (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "get"
+                and isinstance(n.func.value, ast.Attribute)
+                and n.func.value.attr == "environ" and n.args):
+            keys.add(resolve(n.args[0]))
+    return keys - {None}
+
+
+def _reachable_env_reads() -> tuple[set[str], set[tuple[str, str]]]:
+    """(进包代码在 panel 可达路径上读的环境变量, 走到过的 `(模块, 单元)`)。
+
+    单元 = 模块顶层的一个 def/class，或 `<module>`（import 就会执行的顶层代码）。
+    入口取 panel **自己**模块的全部单元（都在包里、都是 panel 的代码，不去解析
+    handler 的路由分发表）+ 每个进包模块的 `<module>`。函数内的 import 也记进
+    模块级别名表——那只会让可达集偏大，方向是安全的（宁可多要一个键）。
+    """
+    mods = _shipped_modules()
+    panel_own = {p.stem for p in PANEL.glob("*.py") if p.name != "deploy_panel.py"}
+
+    units: dict[tuple[str, str], ast.AST] = {}
+    # 模块 → {本地名 → (目标模块, 属性名或 None)}；None 表示 `import mod` 形态
+    imports: dict[str, dict[str, tuple[str, str | None]]] = {}
+    consts: dict[str, dict[str, str]] = {}
+    for mod, path in mods.items():
+        imports[mod], consts[mod], top = {}, {}, []
+        for st in ast.parse(path.read_text()).body:
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                units[(mod, st.name)] = st
+            else:
+                top.append(st)
+            if (isinstance(st, ast.Assign) and isinstance(st.value, ast.Constant)
+                    and isinstance(st.value.value, str)):
+                consts[mod].update({t.id: st.value.value for t in st.targets
+                                    if isinstance(t, ast.Name)})
+            for n in ast.walk(st):
+                if isinstance(n, ast.Import):
+                    for a in n.names:
+                        if a.name in mods:
+                            imports[mod][a.asname or a.name] = (a.name, None)
+                elif (isinstance(n, ast.ImportFrom) and n.level == 0
+                        and n.module in mods):
+                    for a in n.names:
+                        imports[mod][a.asname or a.name] = (n.module, a.name)
+        units[(mod, "<module>")] = ast.Module(body=top, type_ignores=[])
+
+    reached: set[tuple[str, str]] = set()
+    queue = [u for u in units if u[0] in panel_own]
+    queue += [(m, "<module>") for m in mods]
+    while queue:
+        cur = queue.pop()
+        if cur in reached or cur not in units:
+            continue
+        reached.add(cur)
+        mod = cur[0]
+        for n in ast.walk(units[cur]):
+            if isinstance(n, ast.Name):
+                queue.append((mod, n.id))               # 同模块内的引用
+                tgt = imports[mod].get(n.id)
+                if tgt and tgt[1]:
+                    queue.append((tgt[0], tgt[1]))      # from X import f
+            elif isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name):
+                tgt = imports[mod].get(n.value.id)
+                if tgt and tgt[1] is None:
+                    queue.append((tgt[0], n.attr))      # X.f
+    keys: set[str] = set()
+    for mod, name in reached:
+        keys |= _env_keys_read(units[(mod, name)], consts[mod])
+    return keys, reached
+
+
+def test_shipped_env_scan_is_not_vacuous():
+    """守卫的守卫：闭包解析一坏，下面那条会静默变成空转。
+
+    三个键各验一段传递：`API_KEYS_TABLE` 是 `api.py → keystore.list_keys →
+    keystore._table`（跨模块再进模块内私有函数）；`OPS_LOG_TABLE` 是
+    `permissions → ops_log.record → ops_log._table`（两个复制模块之间的传递）；
+    `EDGE_ROLE_ID` 只以模块级常量的形态出现（见 `_env_keys_read`）。
+    单元名也一起断言：只看键集时，"闭包没走到但别处读了同名键"也会绿。
+    """
+    keys, reached = _reachable_env_reads()
+    assert {"API_KEYS_TABLE", "OPS_LOG_TABLE", "EDGE_ROLE_ID"} <= keys, (
+        f"环境变量闭包解析坏了，读不到复制模块的键: {sorted(keys)}")
+    assert {("keystore", "_table"), ("ops_log", "_table"),
+            ("edge_caller", "caller_is_edge")} <= reached, (
+        "可达性闭包没走进复制模块的私有函数——解析口径坏了")
+
+
 def test_environment_covers_every_env_var_the_code_reads():
     """代码里 os.environ[...] 读到的键必须都在环境变量里下发。
 
     少一个的症状是运行时 KeyError → 500，而单测有 conftest 兜着看不出来。
+
+    扫描范围是**整个进包清单**（panel 自己的 `*.py` + COPY_FILES 复制进来的），
+    按可达性归属——理由见上面那段注释，别改回只 glob `panel/*.py`。
     """
     env = set(dp.lambda_environment())
-    read = set()
-    for py in PANEL.glob("*.py"):
-        if py.name == "deploy_panel.py":
-            continue
-        src = py.read_text()
-        read |= set(re.findall(r'os\.environ\[[\'"]([A-Z_]+)[\'"]\]', src))
-        read |= set(re.findall(r'os\.environ\.get\([\'"]([A-Z_]+)[\'"]', src))
+    read, _ = _reachable_env_reads()
     # AWS 运行时自带的
     read -= {"AWS_DEFAULT_REGION", "AWS_REGION", "AWS_LAMBDA_FUNCTION_NAME"}
     missing = read - env

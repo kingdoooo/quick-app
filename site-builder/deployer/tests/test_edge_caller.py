@@ -29,7 +29,11 @@ def test_missing_env_rejects_everything(monkeypatch, caplog):
     """**配置缺失不得退化成"不检查"**——那正是 P1-1 的原始形态。"""
     monkeypatch.delenv("EDGE_ROLE_ID", raising=False)
     assert edge_caller.caller_is_edge(_event(f"{ROLE_ID}:s")) is False
-    assert any("EDGE_ROLE_ID" in r.message for r in caplog.records), \
+    # **级别也要断言**（2026-08-12）：原来只匹配消息文本，于是把 logger.error
+    # 降成 logger.warning 照样 pass（caplog 默认捕到 WARNING，只有 info/debug
+    # 会变红）。而这一行的用途就是"整站 403 时能被告警捞出来"——降级即失效。
+    assert any("EDGE_ROLE_ID" in r.message and r.levelname == "ERROR"
+               for r in caplog.records), \
         "缺配置必须留一行可告警的 ERROR，否则整站 403 无从排查"
 
 
