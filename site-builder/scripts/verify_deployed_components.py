@@ -6,25 +6,40 @@
 "部署产物 == 本地源码"这件事只能有一个脚本回答。**旧名不留 shim**：两个入口
 会让人只跑其中一个，而漏掉的那个正好是没覆盖的层。
 
-七段（缺一不可）：
+八段（缺一不可）：
   ① 合同 scanner 的真实项目风格判定——合规写法一个都不能误拦；
   ② 已知绕过与真违规一个都不能放过；
      （①② 是纯本地判定，--local 时只跑这两段。x-user-name 那条红线进过
       "修漏报 → 引入误报 → 再修"的循环，所以正反两侧都要覆盖。）
   ③ 线上 deployer Lambda 群：contract/redlines.py + 守卫三件套逐包核对；
   ④ 线上 auth 服务：login_handler.py / session.py + SSM TTL 在产物中；
-  ⑤ 线上 panel：四个复制模块 + Function URL AuthType 与 resource policy
-     两条语句 + 环境变量**无明文密钥**；
+  ⑤ 线上 panel：**进包清单从 `deploy_panel.COPY_FILES` 推导**后逐字节核对
+     + Function URL AuthType 与 resource policy 两条语句 + 环境变量**无明文
+     密钥** + 非 Edge 的签名直连必须 403；
   ⑥ 线上 MCP runtime：镜像 digest 可追溯 + runtime role 含 ops-log PutItem
      与 created_at 白名单；
-  ⑦ console route 记录形态（split / api_target / static_prefix / require_auth）。
+  ⑦ console route 记录形态（split / api_target / static_prefix / require_auth）；
+  ⑧ 线上 key-proxy（二期 M4 的 API Key 交换层，**仅在 config.ini 有 `[ApiKey]`
+     段时才跑**——没有该段 = 平台只允许 OAuth 一条认证路径，组件本就不存在）：
+     进包清单从 `deploy_key_proxy.COPY_FILES` 推导后逐字节核对 + Function URL
+     授权三条 + 环境变量无明文密钥且整体 == 本地 `lambda_environment()` 推导值
+     + 非 Edge 直连 403 + `mcp` route 形态 + **`mcp` 不在 Edge 产物的
+     `PLATFORM_SUBDOMAINS` 里** + 网关 allowedClients/allowlist 与容器
+     `MACHINE_CLIENT_ID` **同开同关** + 哨兵行的 `enabled` 是**布尔**
+     + role 对凭证表没有 `PutItem`/`DeleteItem`/`Scan`。
+
+**⑤⑧ 的进包清单为什么必须"推导"而不是手抄**（Task 1 审查的 Minor 2）：
+两段各自硬编码一份模块名清单时，每加一个共享模块就多漏一个——`edge_caller.py`
+与 `keystore.py` 曾经进了 panel 的部署包却**从不做真机字节比对**，而 panel 的
+复制闭包单测与这道闸门当时**同时是绿的**。手抄的清单本身就是下一个漂移源
+（M3-FINDINGS §2.18）。
 
 **为什么本地 pytest 不能替代它**：单测跑本地源码，线上跑的是另一份产物。
 实测过两次"仓库里修好了、线上还是旧的"：validate 的 LastModified 停在五个
 提交之前；auth 的 SSM TTL 修复在仓库里躺了两天没上线。
 
 用法：
-    ./verify_deployed_components.py           # 全部七段
+    ./verify_deployed_components.py           # 全部八段
     ./verify_deployed_components.py --local   # 只跑 ①②（无 AWS 凭证时）
 """
 import argparse
@@ -38,8 +53,24 @@ HERE = Path(__file__).parent
 ROOT = HERE.parent.parent
 sys.path.insert(0, str(ROOT / "site-builder/contract/src"))
 CFG_PATH = HERE.parent / "config.ini"
+# Lambda@Edge 的产物在 router 那一侧（⑧ 要读它的 PLATFORM_SUBDOMAINS）
+ROUTER_CFG_PATH = ROOT / "router" / "config.ini"
 
 results: list[tuple[bool, str, str]] = []
+
+# ---- 检查数下限（Global Constraints）----
+# "少于下限就是没跑完"这条下限只在**数得准**时有意义，所以按段分开记，且
+# **只数不可 SKIP 的项**：非 Edge 直连那条在当前身份无 InvokeFunctionUrl 权限时
+# 合法地 SKIP（那时的 403 来自 IAM 而不是 handler，算 PASS 就是假绿）。
+MIN_LOCAL_CHECKS = 15       # ① 合规 8 + ② 违规 7
+MIN_DEPLOYED_CHECKS = 20    # ③ 2 + ④ 2 + ⑤ 7 + ⑥ 3 + ⑦ 6
+# ⑧ 只在 [ApiKey] 段存在（组件启用）时计入：产物 1 + 环境变量 2 + scope 1 +
+# Function URL 3 + EDGE_ROLE_ID 1 + 环境变量整体 1 + route 6 + Edge 白名单 1 +
+# runtime 3 + 哨兵行 2 + role 2 = 23
+MIN_KEY_PROXY_CHECKS = 23
+# 实际下限由 main() 按"这次真跑了哪几段"累加，finally 里读它。初值是本地那部分
+# ——main() 之前就崩掉时走的是 crashed 分支，不靠这个值。
+min_expected = MIN_LOCAL_CHECKS
 
 
 def check(ok: bool, name: str, detail: str = "") -> None:
@@ -163,14 +194,191 @@ def run_local() -> None:
         check(bool(errs), f"拦下：{name}", "" if errs else "被放过")
 
 
-def read_cfg(section: str, key: str) -> str:
+def _parsed_cfg(path: Path) -> configparser.ConfigParser:
+    """读一份 config.ini，**并断言它真的读到了**。
+
+    `ConfigParser.read()` 对不存在的路径是**静默返回空**的（不抛异常）。于是
+    "cwd 漂了 / 路径错了"与"文件里真没这一段"在下游是同一个症状，而后者的判定
+    （`has_section` / `KeyError`）会给出一个**看起来言之有理的错误结论**。
+    2026-08-13 实测栽过：在 `deployer/infra/` 下用相对路径读 `site-builder/
+    config.ini`，`has_section('IdP')` 全 False，据此推出了一条根本不存在的
+    生产隐患。本函数是那条教训的落点——路径读不到就当场炸，绝不返回空配置。
+    """
     c = configparser.ConfigParser(interpolation=None)
-    c.read(CFG_PATH)
-    return c[section][key].split("#")[0].split(";")[0].strip()
+    c.read(path)
+    if not c.sections():
+        raise RuntimeError(
+            f"{path} 读不到任何段——configparser 对缺失文件是静默的，"
+            "此时任何 has_section/取值判断都会得出假结论。请从仓库根用绝对路径跑。")
+    return c
 
 
-def _fetch_package(lam, function_name: str):
+def read_cfg(section: str, key: str) -> str:
+    return _parsed_cfg(CFG_PATH)[section][key].split("#")[0].split(";")[0].strip()
+
+
+def _load_deploy_module(name: str, path: Path):
+    """按文件路径加载一个部署脚本，只为取它的 `COPY_FILES` 等**真源常量**。
+
+    为什么是 import 而不是正则/AST 抠那个字面量：清单的唯一定义就在那个模块里，
+    import 拿到的是**它真正会用的值**；扒源码等于在这里再造一个解析器，而它对
+    "清单改成计算出来的"这类变化会静默给出旧答案。
+
+    两个脚本 import 时都只有 `configparser.read()` 这一类副作用（不发 AWS 调用）。
+    `deploy_key_proxy` 会自己 `sys.path.insert` 它依赖的两个目录，所以这里**不做
+    任何 sys.path 干预**——干预反而会让 `import handler` 命中 panel 的同名文件。
+    """
+    import importlib.util
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"加载不了 {path}——它还在原地吗？")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _expected_package_modules(deploy_mod, own_dir: Path) -> dict[str, Path]:
+    """部署包里**应该**出现的每个模块名 → 它的本地源文件。
+
+    从部署脚本的 `COPY_FILES` 推导，查找顺序与两个 `_build_zip` 一致
+    （`deployer/functions` → `auth`），外加该组件自己的顶层 `*.py`
+    （`_build_zip` 打的就是 `HERE.glob("*.py")`，排除部署脚本本身）。
+
+    **不在这里手抄第二份清单**：见模块 docstring 里 ⑤⑧ 那段。清单漂移的症状是
+    "新模块进了部署包却永远不被真机比对"，而两侧单测都是绿的。
+    """
+    fn_dir = ROOT / "site-builder/deployer/functions"
+    auth_dir = ROOT / "site-builder/auth"
+    out: dict[str, Path] = {}
+    for name in deploy_mod.COPY_FILES:
+        src = fn_dir / name
+        if not src.exists():
+            src = auth_dir / name
+        if not src.exists():
+            raise RuntimeError(
+                f"{deploy_mod.__name__}.COPY_FILES 里的 {name} 在本地找不到源文件"
+                f"（找过 {fn_dir} 与 {auth_dir}）——部署脚本自己也会在这里中止")
+        out[name] = src
+    script = Path(deploy_mod.__file__).name
+    for py in sorted(own_dir.glob("*.py")):
+        if py.name == script:
+            continue
+        out[py.name] = py
+    return out
+
+
+def _check_package_modules(z, label: str, expected: dict[str, Path]) -> None:
+    """产物里的每个模块与本地逐字节一致。少一个就是运行时 ImportError。"""
+    pkg = set(z.namelist())
+    bad: list[str] = []
+    for base, path in sorted(expected.items()):
+        if base not in pkg:
+            bad.append(f"{base}(缺失)")
+            continue
+        if (hashlib.sha256(z.read(base)).hexdigest()
+                != hashlib.sha256(path.read_bytes()).hexdigest()):
+            bad.append(base)
+    check(not bad, f"{label} 产物的 {len(expected)} 个模块与本地一致",
+          "不一致: " + ", ".join(bad) if bad
+          else "清单由 COPY_FILES 推导（加了共享模块会自动纳入比对）")
+
+
+# ---- 环境变量里不得出现明文密钥：判据两类，⑤⑧ 共用 ----
+# 都不能只看长度——实测 ROUTING_TABLE 的值
+# `ApplicationWebRouterStack-subdomain-mapping` 有 42 字符且全是 [A-Za-z0-9-]，
+# 被"长度 > 40 的不透明串"这条误判成明文密钥（假红一次）。改为要求"无分隔符 +
+# 大小写数字混排"（真实的 base64/hex 密钥形态），资源名里的连字符/点会把它排除。
+SECRETISH = ("SECRET", "TOKEN", "PASSWORD", "PASSWD", "CREDENTIAL", "PRIVATE_KEY")
+
+
+def _looks_high_entropy(v: str) -> bool:
+    import re as _re
+    if len(v) < 32 or not _re.fullmatch(r"[A-Za-z0-9+/=]{32,}", v):
+        return False        # 含 - . _ / : 的资源名、ARN、URL 一概排除
+    return (any(c.isupper() for c in v) and any(c.islower() for c in v)
+            and any(c.isdigit() for c in v))
+
+
+def _check_env_has_no_plaintext_secret(env: dict, label: str,
+                                       param_key: str) -> None:
+    """① 键名像密钥（`*_PARAM` 除外——那只是参数名）；② 值像高熵串。
+
+    `lambda:GetFunctionConfiguration` 会**原样回显**环境变量，而它是个常见的
+    只读权限：拿到 JWT_SECRET 即可伪造任意用户会话，拿到 machine client secret
+    即可自己换机器 token。
+    """
+    leaked = [k for k, v in env.items()
+              if (any(s in k.upper() for s in SECRETISH)
+                  and not k.upper().endswith("_PARAM"))
+              or _looks_high_entropy(str(v))]
+    check(not leaked, f"{label} 环境变量无明文密钥",
+          f"疑似明文: {leaked}" if leaked
+          else f"只有参数名 {param_key}={env.get(param_key, '缺失')}")
+    check(env.get(param_key, "").startswith("/"),
+          f"{label} 下发的是 SSM 参数名（不是 secret 本体）",
+          env.get(param_key, "缺失"))
+
+
+def _check_function_url_authz(lam, fn: str, label: str, edge_role: str) -> None:
+    """Function URL 的 AuthType + resource policy 恰好两条动作 + Principal 逐字符。
+
+    2025-10 起需要 `InvokeFunctionUrl` + `InvokeFunction`(InvokedViaFunctionUrl)
+    两条，缺一即 403；`AuthType=NONE` + `Principal:*` 会被安全扫描自动处置
+    （实测删光整个 resource policy）。
+    """
+    import json
+
+    url_conf = lam.get_function_url_config(FunctionName=fn)
+    check(url_conf["AuthType"] == "AWS_IAM",
+          f"{label} Function URL AuthType=AWS_IAM",
+          f"实际 {url_conf['AuthType']}"
+          + ("" if url_conf["AuthType"] == "AWS_IAM"
+             else " —— NONE 等于 endpoint 全网可调"))
+    policy = json.loads(lam.get_policy(FunctionName=fn)["Policy"])
+    actions, principals = set(), set()
+    for s in policy.get("Statement", []):
+        a = s.get("Action")
+        actions |= set(a if isinstance(a, list) else [a])
+        p = s.get("Principal", {})
+        principals.add(p.get("AWS") if isinstance(p, dict) else p)
+    check(actions == {"lambda:InvokeFunctionUrl", "lambda:InvokeFunction"},
+          f"{label} resource policy 恰好两条动作（2025-10 起缺一即 403）",
+          f"实际 {sorted(actions)}")
+    check(principals == {edge_role},
+          f"{label} Principal 逐字符 == edge role（不是 * 不是账号根）",
+          f"实际 {sorted(principals)}")
+
+
+def _check_edge_role_id_env(env: dict, edge_role: str, label: str) -> str:
+    """`EDGE_ROLE_ID` == IAM **现查**的真实 RoleId。返回现查到的值。
+
+    现查而不是让人往 config 里再抄一遍：手抄的第二份真源会漂移。缺这个值时
+    `edge_caller.caller_is_edge` 刻意 fail-closed（拒绝所有请求）——所以它既是
+    正确性断言也是可用性断言。
+    """
+    import boto3
+
+    env_eid = env.get("EDGE_ROLE_ID", "")
+    try:
+        real_eid = boto3.client("iam").get_role(
+            RoleName=edge_role.rsplit("/", 1)[-1])["Role"]["RoleId"]
+    except Exception as e:                  # noqa: BLE001 查不到也要给出结论
+        real_eid = f"<查不到: {e}>"
+    check(bool(env_eid) and env_eid == real_eid,
+          f"{label} 下发的 EDGE_ROLE_ID == Edge 角色真实 RoleId",
+          f"env={env_eid or '缺失'} vs iam={real_eid}"
+          + ("" if env_eid else " —— 缺失时 handler 拒绝所有请求（fail-closed）"))
+    return real_eid
+
+
+def _fetch_package(lam, function_name: str, qualifier: str = ""):
     """下载某个 Lambda 的部署包 → ZipFile。带重试，并**校验是合法 zip**。
+
+    `qualifier` 给版本化的函数用（Lambda@Edge 只能按版本取，`$LATEST` 不是
+    CloudFront 实际执行的那份）。
 
     两件事都吃过亏（2026-08-08 实测）：
       · 预签名 URL 偶发 RemoteDisconnected / reset；
@@ -182,7 +390,8 @@ def _fetch_package(lam, function_name: str):
     import urllib.request
     import zipfile
 
-    loc = lam.get_function(FunctionName=function_name)["Code"]["Location"]
+    kw = {"Qualifier": qualifier} if qualifier else {}
+    loc = lam.get_function(FunctionName=function_name, **kw)["Code"]["Location"]
     last = None
     for attempt in range(4):
         try:
@@ -289,10 +498,7 @@ def run_deployed() -> None:
 
 
 def run_panel() -> None:
-    """⑤ 线上 panel：复制模块、Function URL 授权、环境变量无明文密钥。"""
-    import json
-    import re as _re
-
+    """⑤ 线上 panel：进包模块、Function URL 授权、环境变量无明文密钥。"""
     import boto3
     from botocore.config import Config
 
@@ -309,81 +515,21 @@ def run_panel() -> None:
         return
     print(f"  {fn}  LastModified={conf['LastModified']}")
 
-    # 复制清单：panel 的四个依赖模块必须在产物里，且与本地字节一致。
-    # 少任何一个都是运行时 ImportError（Task 8 在 MCP 镜像上真踩过）。
-    z = _fetch_package(lam, fn)
-    pkg = set(z.namelist())
-    sources = {
-        "common.py": ROOT / "site-builder/deployer/functions/common.py",
-        "permissions.py": ROOT / "site-builder/deployer/functions/permissions.py",
-        "ops_log.py": ROOT / "site-builder/deployer/functions/ops_log.py",
-        "session.py": ROOT / "site-builder/auth/session.py",
-        "handler.py": ROOT / "site-builder/panel/handler.py",
-        "api.py": ROOT / "site-builder/panel/api.py",
-        "console_session.py": ROOT / "site-builder/panel/console_session.py",
-    }
-    bad: list[str] = []
-    for base, path in sources.items():
-        if base not in pkg:
-            bad.append(f"{base}(缺失)")
-            continue
-        if (hashlib.sha256(z.read(base)).hexdigest()
-                != hashlib.sha256(path.read_bytes()).hexdigest()):
-            bad.append(base)
-    check(not bad, "panel 产物的 7 个模块与本地一致",
-          "不一致: " + ", ".join(bad) if bad
-          else "含 session.py（upgrade code 单一实现）与 ops_log.py")
+    # 进包清单：**从 deploy_panel.COPY_FILES 推导**，不在这里手抄第二份
+    # （见模块 docstring 的 ⑤⑧ 那段）。少任何一个模块都是运行时 ImportError
+    # （Task 8 在 MCP 镜像上真踩过）。
+    dp = _load_deploy_module("deploy_panel",
+                             ROOT / "site-builder/panel/deploy_panel.py")
+    _check_package_modules(_fetch_package(lam, fn), "panel",
+                           _expected_package_modules(
+                               dp, ROOT / "site-builder/panel"))
 
-    # **环境变量不得含明文密钥**：GetFunctionConfiguration 会原样回显，
-    # 拿到 JWT_SECRET 即可伪造任意用户会话。
     env = conf.get("Environment", {}).get("Variables", {})
-    # 判据分两类，都不能只看长度：
-    #   ① 键名像密钥（SECRET/TOKEN/PASSWORD/KEY），但 `*_PARAM`（只是参数名）除外；
-    #   ② 值像**高熵**串。长度不够——实测 ROUTING_TABLE 的值
-    #      `ApplicationWebRouterStack-subdomain-mapping` 有 42 字符且全是
-    #      [A-Za-z0-9-]，被"长度 > 40 的不透明串"这条误判成明文密钥（假红一次）。
-    #      改为要求"无分隔符 + 大小写数字混排"（真实的 base64/hex 密钥形态），
-    #      资源名里的连字符/点会把它排除掉。
-    def _looks_high_entropy(v: str) -> bool:
-        if len(v) < 32 or not _re.fullmatch(r"[A-Za-z0-9+/=]{32,}", v):
-            return False        # 含 - . _ / : 的资源名、ARN、URL 一概排除
-        return (any(c.isupper() for c in v) and any(c.islower() for c in v)
-                and any(c.isdigit() for c in v))
+    _check_env_has_no_plaintext_secret(env, "panel", "JWT_SECRET_PARAM")
 
-    SECRETISH = ("SECRET", "TOKEN", "PASSWORD", "PASSWD", "CREDENTIAL",
-                 "PRIVATE_KEY")
-    leaked = [k for k, v in env.items()
-              if (any(s in k.upper() for s in SECRETISH)
-                  and not k.upper().endswith("_PARAM"))
-              or _looks_high_entropy(str(v))]
-    check(not leaked, "panel 环境变量无明文密钥",
-          f"疑似明文: {leaked}" if leaked
-          else f"只有参数名 JWT_SECRET_PARAM={env.get('JWT_SECRET_PARAM', '缺失')}")
-    check(env.get("JWT_SECRET_PARAM", "").startswith("/"),
-          "panel 下发的是 SSM 参数名", env.get("JWT_SECRET_PARAM", "缺失"))
-
-    # Function URL：AuthType 与 resource policy 的两条语句
-    url_conf = lam.get_function_url_config(FunctionName=fn)
-    check(url_conf["AuthType"] == "AWS_IAM",
-          "panel Function URL AuthType=AWS_IAM",
-          f"实际 {url_conf['AuthType']}"
-          + ("" if url_conf["AuthType"] == "AWS_IAM"
-             else " —— NONE 等于 endpoint 全网可调"))
-    policy = json.loads(lam.get_policy(FunctionName=fn)["Policy"])
-    stmts = policy.get("Statement", [])
     edge_role = read_cfg("Deployer", "edge_role_arn")
-    actions, principals = set(), set()
-    for s in stmts:
-        a = s.get("Action")
-        actions |= set(a if isinstance(a, list) else [a])
-        p = s.get("Principal", {})
-        principals.add(p.get("AWS") if isinstance(p, dict) else p)
-    check(actions == {"lambda:InvokeFunctionUrl", "lambda:InvokeFunction"},
-          "resource policy 恰好两条动作（2025-10 起缺一即 403）",
-          f"实际 {sorted(actions)}")
-    check(principals == {edge_role},
-          "Principal 逐字符 == edge role（不是 * 不是账号根）",
-          f"实际 {sorted(principals)}")
+    _check_function_url_authz(lam, fn, "panel", edge_role)
+    _check_edge_role_id_env(env, edge_role, "panel")
 
     # **resource policy 正确 ≠ 只有 Edge 能调**（Codex 审查 2026-08-10 P1-1）。
     # AWS 的规则：同账号 principal 只要 identity policy 允许
@@ -391,28 +537,30 @@ def run_panel() -> None:
     # 调用。真机验证过：直接签名调用并自带 x-user-email，/api/me 返回 200 且
     # is_admin=true、/api/sites?all=1 返回全部站点。
     # 所以这里必须**真的打一次直连请求**，而不是只读配置。
-    env_eid = env.get("EDGE_ROLE_ID", "")
-    edge_role_name = edge_role.rsplit("/", 1)[-1]
-    try:
-        real_eid = boto3.client("iam").get_role(
-            RoleName=edge_role_name)["Role"]["RoleId"]
-    except Exception as e:
-        real_eid = f"<查不到: {e}>"
-    check(bool(env_eid) and env_eid == real_eid,
-          "panel 下发的 EDGE_ROLE_ID == Edge 角色真实 RoleId",
-          f"env={env_eid or '缺失'} vs iam={real_eid}"
-          + ("" if env_eid else " —— 缺失时 handler 拒绝所有请求（fail-closed）"))
-
-    _verify_direct_invoke_is_rejected(lam, fn)
+    _verify_direct_invoke_is_rejected(
+        lam, fn, "/api/me", "同账号非 Edge 的签名直连被拒（伪造 x-user-email 无效）",
+        headers={"x-user-email": "verify-probe@invalid.local"},
+        on_200="身份可被伪造，读接口全部越权")
 
 
-def _verify_direct_invoke_is_rejected(lam, fn: str) -> None:
-    """**反向验收**：同账号非 Edge 的签名直连必须被拒（403）。
+def _verify_direct_invoke_is_rejected(lam, fn: str, path: str, name: str,
+                                      headers: dict | None = None,
+                                      method: str = "GET",
+                                      on_200: str = "") -> None:
+    """**反向验收**：同账号非 Edge 的签名直连必须被 handler 拒掉（403）。
 
     这条是 P1-1 的真正闸门。它要求当前 AWS 身份**有** Function URL 调用权限
     才有意义——没有权限时拿到的 403 来自 IAM 而不是来自 handler 的校验，
     那样这条断言就是假绿，所以此时明确报 SKIP 而不是 PASS。
+
+    **状态码之外还看响应体**：403 有两个来源，而它们要区分开。IAM 拒的响应体是
+    `{"Message":"Forbidden"}`，handler 拒的是 `{"error":"禁止访问"}`
+    （panel 与 key-proxy 的 ⓪ 步共用 `edge_caller`，两边同一份文案）。只断言
+    状态码时，"IAM 恰好也拒了"会让这条闸门在 handler 的校验被删掉之后仍然绿——
+    而 simulate_principal_policy 那道 SKIP 前置只挡得住"稳定无权限"的环境，挡不住
+    "策略刚好在这一刻不允许"。所以判据是**响应体里有我们自己的 `error` 键**。
     """
+    import json
     import urllib.error
     import urllib.request
 
@@ -428,33 +576,39 @@ def _verify_direct_invoke_is_rejected(lam, fn: str) -> None:
             PolicySourceArn=me, ActionNames=["lambda:InvokeFunctionUrl"],
             ResourceArns=[arn])["EvaluationResults"][0]["EvalDecision"]
     except Exception as e:
-        print(f"  SKIP  非 Edge 直连必须 403（准备阶段失败: {e}）")
+        print(f"  SKIP  {name}（准备阶段失败: {e}）")
         return
     if sim != "allowed":
         # 没有调用权限时，403 来自 IAM 而非 handler —— 无法证明校验生效
-        print("  SKIP  非 Edge 直连必须 403"
-              f"（当前身份无 InvokeFunctionUrl 权限，测不出 handler 的判定）")
+        print(f"  SKIP  {name}"
+              "（当前身份无 InvokeFunctionUrl 权限，测不出 handler 的判定）")
         return
 
-    target = url.rstrip("/") + "/api/me"
+    target = url.rstrip("/") + path
     creds = boto3.Session().get_credentials().get_frozen_credentials()
-    req = AWSRequest(method="GET", url=target,
-                     headers={"x-user-email": "verify-probe@invalid.local"})
+    req = AWSRequest(method=method, url=target, headers=dict(headers or {}))
     SigV4Auth(creds, "lambda", read_cfg("Platform", "region")).add_auth(req)
     try:
         resp = urllib.request.urlopen(
-            urllib.request.Request(target, headers=dict(req.headers)),
-            timeout=25)
+            urllib.request.Request(target, headers=dict(req.headers),
+                                   method=method), timeout=25)
         status, body = resp.status, resp.read().decode()[:200]
     except urllib.error.HTTPError as e:
         status, body = e.code, e.read().decode()[:200]
     except Exception as e:
-        print(f"  SKIP  非 Edge 直连必须 403（请求失败: {e}）")
+        print(f"  SKIP  {name}（请求失败: {e}）")
         return
-    check(status == 403,
-          "同账号非 Edge 的签名直连被拒（伪造 x-user-email 无效）",
+    try:
+        from_handler = isinstance(json.loads(body), dict) and \
+            "error" in json.loads(body)
+    except ValueError:
+        from_handler = False
+    check(status == 403 and from_handler, name,
           f"实际 {status} {body}"
-          + (" —— 身份可被伪造，读接口全部越权" if status == 200 else ""))
+          + (f" —— {on_200}" if status == 200 and on_200 else "")
+          + ("" if from_handler
+             else " —— 响应体不是 handler 的 {\"error\":…}，这个 403 来自 IAM，"
+                  "证明不了 handler 的校验还在"))
 
 
 def run_mcp_and_route() -> None:
@@ -556,16 +710,347 @@ def run_mcp_and_route() -> None:
               f"{type(exc).__name__} —— 前端没上传，或 key 与 Edge 取的不一致")
 
 
+def _edge_deployed_source() -> str:
+    """CloudFront **当前关联的那个版本**的 Edge 产物 → `index.py` 文本。
+
+    版本选择规则与 `verify_deployed_edge.sh` ① 段一致，**不按"版本号最大/时间
+    最新"挑**：Lambda@Edge 的旧版本要等全球副本排空才能删，CDK 期间会出现多次
+    `DELETE_FAILED (skipped)`，实测**旧版本的 LastModified 比新版本更晚**。
+
+    这里与那个 shell 脚本有一段重复的定位逻辑。之所以可以接受：本段只问一个
+    问题——`mcp` 有没有进 `PLATFORM_SUBDOMAINS`——而这个答案对"读到哪个版本"
+    不敏感（`mcp` 从来没进过任何版本；真有人把它加进去并部署了，$LATEST 与
+    关联版本都会带上它）。也就是说这份重复**不可能让两个脚本给出相反的结论**。
+    """
+    import boto3
+
+    region = "us-east-1"        # Lambda@Edge / ACM 的硬约束区域
+    rcfg = _parsed_cfg(ROUTER_CFG_PATH)
+    stack = rcfg["CDK"]["stack_name"].split("#")[0].strip()
+    short = rcfg["LambdaEdge"]["origin_request_function_name"] \
+        .split("#")[0].strip()
+    outs = boto3.client("cloudformation", region_name=region).describe_stacks(
+        StackName=stack)["Stacks"][0].get("Outputs", [])
+    dist = next((o["OutputValue"] for o in outs
+                 if o["OutputKey"] == "DistributionId"), "")
+    if not dist:
+        raise RuntimeError(f"栈 {stack} 没有 CfnOutput DistributionId")
+    assoc = (boto3.client("cloudfront").get_distribution_config(Id=dist)
+             ["DistributionConfig"]["DefaultCacheBehavior"]
+             .get("LambdaFunctionAssociations", {}).get("Items", []))
+    arns = [a["LambdaFunctionARN"] for a in assoc
+            if a.get("EventType") == "origin-request"]
+    if len(arns) != 1:
+        raise RuntimeError(f"origin-request 关联的 Lambda 不是恰好一个: {arns}")
+    qualifier = arns[0].rsplit(":", 1)[-1]
+    if not qualifier.isdigit():
+        raise RuntimeError(f"分发关联的不是一个具体版本: {arns[0]}")
+    z = _fetch_package(boto3.client("lambda", region_name=region),
+                       f"{stack}-{short}", qualifier)
+    if "index.py" not in set(z.namelist()):
+        raise RuntimeError("Edge 产物里没有 index.py——打包方式变了？")
+    return z.read("index.py").decode()
+
+
+def _check_mcp_is_not_a_platform_subdomain(sub: str) -> None:
+    """决定 9 的闸门：`{mcp_subdomain}` **不得**进 Edge 的 `PLATFORM_SUBDOMAINS`。
+
+    key-proxy 只认 `X-API-Key`，不需要平台 cookie；进了这个白名单只会让一个
+    公网组件白拿一个顶域会话 JWT（Edge 会把保留 cookie 转发给它）。
+
+    **按赋值整行断言再解析元组**，不用裸 `grep`：`PLATFORM_SUBDOMAINS` 这个名字
+    在源码注释里也出现，裸匹配时"改了常量但留着注释"照样过——这正是前几轮栽过的
+    "断言的字样只活在注释里"。
+    """
+    import ast
+
+    name = f"{sub} 不在 Edge 产物的 PLATFORM_SUBDOMAINS 里（决定 9）"
+    try:
+        src = _edge_deployed_source()
+    except Exception as exc:            # noqa: BLE001 读不到就是没验成
+        check(False, name,
+              f"读不到 Edge 产物（{type(exc).__name__}: {exc}）——这条未验成，"
+              "不能当通过")
+        return
+    line = next((ln for ln in src.splitlines()
+                 if ln.startswith("PLATFORM_SUBDOMAINS = ")), "")
+    if not line:
+        check(False, name, "产物里找不到 PLATFORM_SUBDOMAINS 的赋值行")
+        return
+    try:
+        subs = ast.literal_eval(line.split("=", 1)[1].strip())
+    except (SyntaxError, ValueError) as exc:
+        check(False, name, f"赋值行解析不了（{exc}）: {line[:80]}")
+        return
+    check(sub not in tuple(subs), name,
+          f"产物里是 {tuple(subs)}"
+          + (f" —— 含 {sub}，交换层会拿到平台会话 cookie" if sub in tuple(subs)
+             else ""))
+
+
+def _check_key_proxy_role_is_narrow(dkp, cfg) -> None:
+    """key-proxy 执行角色：对凭证表**没有** `PutItem`/`DeleteItem`/`Scan`。
+
+    发 Key 是控制台（panel）的事；吊销是置 `revoked` 而不是删行（删了就没有
+    审计痕迹）；`Scan` 等于能读全表凭证行。包里带着 `keystore.create` 是有意
+    接受的——**代码在但权限不在**是纵深。
+
+    **inline 与 attached 两类策略都要扫**：只扫 inline 时，任何人挂一个
+    `AmazonDynamoDBFullAccess` 上去，这道闸门照样绿。
+    """
+    import boto3
+
+    iam = boto3.client("iam")
+    role = dkp.ROLE_NAME
+    docs = []
+    try:
+        for pname in iam.list_role_policies(RoleName=role)["PolicyNames"]:
+            docs.append((f"inline:{pname}",
+                         iam.get_role_policy(RoleName=role,
+                                             PolicyName=pname)["PolicyDocument"]))
+        for att in iam.list_attached_role_policies(RoleName=role)["AttachedPolicies"]:
+            pol = iam.get_policy(PolicyArn=att["PolicyArn"])["Policy"]
+            doc = iam.get_policy_version(
+                PolicyArn=att["PolicyArn"],
+                VersionId=pol["DefaultVersionId"])["PolicyVersion"]["Document"]
+            docs.append((f"attached:{att['PolicyName']}", doc))
+    except iam.exceptions.NoSuchEntityException:
+        check(False, f"{role} 存在", "key-proxy 尚未部署")
+        return
+
+    FORBIDDEN = ("dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Scan",
+                 "dynamodb:BatchWriteItem", "dynamodb:*", "*")
+    table = dkp.API_KEYS_TABLE
+    granted: list[str] = []
+    for src, doc in docs:
+        for s in doc.get("Statement", []):
+            if s.get("Effect") != "Allow":
+                continue
+            res = s.get("Resource", "")
+            res = res if isinstance(res, list) else [res]
+            # `*` 与 `…:table/*` 也覆盖这张表——不能只匹配表名字面量
+            if not any(r == "*" or table in r or r.endswith(":table/*")
+                       for r in res):
+                continue
+            acts = s.get("Action", "")
+            acts = acts if isinstance(acts, list) else [acts]
+            granted += [f"{src}:{a}" for a in acts if a in FORBIDDEN]
+    check(not granted,
+          f"key-proxy role 对 {table} 无 PutItem/DeleteItem/Scan（含通配）",
+          f"被授予了: {granted}" if granted
+          else f"扫了 {len(docs)} 份策略（inline + attached）")
+
+    # 更强的一条：inline 策略**逐条等于**本地 role_statements() 推导的结果。
+    # 上面那条挡的是已知的坏动作，这条挡的是"多了一条谁也没注意的语句"。
+    want = dkp.role_statements(cfg)
+    got = next((d for n, d in docs if n == "inline:key-proxy-access"), None)
+    same = got is not None and got.get("Statement") == want
+    check(same, "key-proxy role 的 inline 策略 == 本地 role_statements() 推导值",
+          "线上与本地不一致（Sid 或语句集漂了）——线上跑的不是这份权限模型"
+          if not same else f"{len(want)} 条语句逐条相同")
+
+
+def run_key_proxy() -> int:
+    """⑧ 线上 key-proxy（M4 API Key 交换层）。
+
+    返回**这一段承诺的最小检查数**（`MIN_KEY_PROXY_CHECKS` 或 0），由 main()
+    累加进下限。组件未启用、或组件根本没部署时返回 0——前者是合法默认状态，
+    后者已经落了一条 FAIL，不需要再靠下限报第二次。
+    """
+    import boto3
+    from botocore.config import Config
+
+    cfg = _parsed_cfg(CFG_PATH)
+    dkp = _load_deploy_module(
+        "deploy_key_proxy", ROOT / "site-builder/key-proxy/deploy_key_proxy.py")
+    # 门禁判定走**唯一真源**（`deployer/functions/api_key_config`），本脚本不再
+    # 写一次 `has_section("ApiKey")`：多一个判定点就多一处漂移，而漂移的结果是
+    # "部分部署"——网关放行、容器拒绝，症状是 HTTP 200 加一句业务错误文案。
+    # 这个 import 能成立是因为 deploy_key_proxy 已经把 functions/ 铺进了 sys.path。
+    import api_key_config
+
+    print("\n── ⑧ 线上 key-proxy（M4 API Key 交换层）─────────────")
+    if not api_key_config.api_key_enabled(cfg):
+        print("  SKIP  config.ini 无 [ApiKey] 段 = 平台只允许 OAuth 一条认证路径"
+              "（组件按设计不存在，不是缺陷）")
+        return 0
+
+    region = read_cfg("Platform", "region")
+    lam = boto3.client("lambda", region_name=region,
+                       config=Config(retries={"max_attempts": 5,
+                                              "mode": "adaptive"}))
+    fn = dkp.FN_NAME
+    try:
+        conf = lam.get_function_configuration(FunctionName=fn)
+    except lam.exceptions.ResourceNotFoundException:
+        check(False, f"{fn} 存在",
+              "config.ini 有 [ApiKey] 段但组件没部署——"
+              "先跑 key-proxy/deploy_key_proxy.py")
+        return 0
+    print(f"  {fn}  LastModified={conf['LastModified']}")
+
+    # 进包清单**从 deploy_key_proxy.COPY_FILES 推导**（+ key-proxy 自己的 *.py）
+    _check_package_modules(_fetch_package(lam, fn), "key-proxy",
+                           _expected_package_modules(
+                               dkp, ROOT / "site-builder/key-proxy"))
+
+    env = conf.get("Environment", {}).get("Variables", {})
+    _check_env_has_no_plaintext_secret(env, "key-proxy", "MACHINE_SECRET_PARAM")
+
+    # MACHINE_SCOPE 必须是 **config 派生**值（Codex 审查 2026-08-11 P1-2a）：
+    # 硬编码 `site-builder-mcp/invoke` 绕开了"config.ini 是唯一取值来源"，而
+    # 两处各拼一次会出现"建的 scope 与换 token 用的 scope 不是同一个"——
+    # Cognito 报 `invalid_scope`，报错文案把排查方向带向 client 配置。
+    want_scope = api_key_config.machine_scope(cfg)
+    check(bool(want_scope) and env.get("MACHINE_SCOPE") == want_scope,
+          "key-proxy 的 MACHINE_SCOPE == config 派生的 {resource_server}/{scope}",
+          f"env={env.get('MACHINE_SCOPE', '缺失')} vs 派生={want_scope}")
+
+    edge_role = read_cfg("Deployer", "edge_role_arn")
+    _check_function_url_authz(lam, fn, "key-proxy", edge_role)
+    real_eid = _check_edge_role_id_env(env, edge_role, "key-proxy")
+
+    # 环境变量**整体**与本地 `lambda_environment()` 的推导值一致。上面几条是有
+    # 专门诊断文案的重点项，这条兜住其余键（表名 / AgentCore 端点 / Cognito 域 /
+    # machine client id）的漂移：任一处漂了都是"部署成功而组件全挂"。
+    # **只报差异的键名、不报值**：值里有端点 URL 与 client id，没必要打出来。
+    try:
+        want_env = dkp.lambda_environment(real_eid, cfg)
+    except SystemExit as exc:       # 本地推导自己就中止了（配置缺项）
+        check(False, "key-proxy 环境变量 == 本地 lambda_environment() 推导值",
+              f"本地推导即中止: {exc}")
+    else:
+        diff = sorted(k for k in set(want_env) | set(env)
+                      if env.get(k) != want_env.get(k))
+        check(not diff, "key-proxy 环境变量 == 本地 lambda_environment() 推导值",
+              f"这些键与本地不一致: {diff}" if diff
+              else f"{len(want_env)} 个键逐一相同")
+
+    # 非 Edge 直连必须被 handler 的 ⓪ 步拒掉。对 key-proxy 而言绕过 Edge 不等于
+    # 绕过认证（还得有一把有效 Key），但 **Edge 是限流与可观测性的唯一位置**。
+    _verify_direct_invoke_is_rejected(
+        lam, fn, "/", "非 Edge 的签名直连被 key-proxy 拒（handler 的 ⓪ 步）",
+        on_200="绕过 Edge 可直连交换层，Key 的暴力尝试不留任何可告警痕迹")
+
+    # ---- route 形态 ----
+    sub = api_key_config.mcp_subdomain(cfg)
+    route = boto3.resource("dynamodb", region_name=region).Table(
+        read_cfg("Platform", "routing_table")).get_item(
+            Key={"subdomain": sub}, ConsistentRead=True).get("Item")
+    if not route:
+        check(False, f"{sub} route 存在", "先跑 deploy_key_proxy.py")
+    else:
+        check(route.get("route_mode") == "api-only",
+              f"{sub} route_mode=api-only（单端点 POST，没有静态资源）",
+              str(route.get("route_mode")))
+        # **布尔不是字符串**：Edge 的判定是 `require_auth is False`，字符串会落进
+        # "按需要登录处理"→ 302 到登录页，而调用方是只会发 MCP 的客户端，
+        # 它拿到的是一坨 HTML。
+        check(route.get("require_auth") is False,
+              f"{sub} require_auth 是布尔 False（不是字符串）",
+              f"{route.get('require_auth')!r}")
+        check(route.get("owner") == "platform",
+              f"{sub} owner=platform（记录用；Edge 判平台身份只认 host 白名单）",
+              str(route.get("owner")))
+        target = str(route.get("api_target", ""))
+        live = lam.get_function_url_config(
+            FunctionName=fn)["FunctionUrl"].rstrip("/")
+        check(target == live,
+              f"{sub} api_target == 线上 Function URL",
+              "route 指向的不是当前 Function URL——改过函数/重建过 URL 后没重跑部署"
+              if target != live else target[:44] + "…")
+        # 尾斜杠单独断言：Edge 拼接会得到双斜杠，与实际路径不是同一个
+        # （M3 实测整站 403）。上面那条等值断言已经隐含它，但这条的症状太特殊，
+        # 值得有一句自己的错误文案。
+        check(bool(target) and not target.endswith("/"),
+              f"{sub} api_target 无尾斜杠（否则 Edge 拼出双斜杠）", target[-24:])
+        check(str(route.get("static_prefix", "")) == "",
+              f"{sub} static_prefix 为空串（api-only 没有静态前缀）",
+              f"{route.get('static_prefix')!r}")
+
+    _check_mcp_is_not_a_platform_subdomain(sub)
+
+    # ---- 网关与容器的三道门禁"同开同关"----
+    # allowedClients 在网关配置里、MACHINE_CLIENT_ID 在容器环境里，**分处两地
+    # 分别写就会漂移**，而漂移的那一半正好是最难排查的"网关放行、容器拒绝"
+    # （HTTP 200 加一句业务错误文案，Codex 审查 2026-08-11 P1-2b）。
+    # 期望值取自 deploy_agentcore 的**同一个派生点**，不在这里手抄。
+    da = _load_deploy_module("deploy_agentcore",
+                            ROOT / "site-builder/mcp/deploy_agentcore.py")
+    machine_id = dkp.machine_client_id(cfg)
+    accc = boto3.client("bedrock-agentcore-control", region_name=region)
+    rts = accc.list_agent_runtimes().get("agentRuntimes", [])
+    target_rt = [r for r in rts
+                 if r.get("agentRuntimeName") == da.RUNTIME_NAME]
+    if not target_rt:
+        check(False, f"找到 {da.RUNTIME_NAME} runtime", "MCP 尚未部署")
+    else:
+        rt = accc.get_agent_runtime(
+            agentRuntimeId=target_rt[0]["agentRuntimeId"])
+        allowed = list((rt.get("authorizerConfiguration", {})
+                        .get("customJWTAuthorizer", {})
+                        .get("allowedClients") or []))
+        allowlist = list((rt.get("requestHeaderConfiguration", {})
+                          .get("requestHeaderAllowlist") or []))
+        rt_env = rt.get("environmentVariables") or {}
+        check(sorted(allowed) == sorted(da.allowed_clients(cfg)),
+              "AgentCore allowedClients == 本地 allowed_clients() 推导值"
+              "（含 machine client）",
+              f"线上 {len(allowed)} 个 / 本地 {len(da.allowed_clients(cfg))} 个"
+              + ("" if machine_id in allowed
+                 else " —— machine client 不在名单里，机器 token 在网关层就被拒"))
+        check(sorted(allowlist) == sorted(da.request_header_allowlist(cfg)),
+              f"requestHeaderAllowlist == 本地推导值（含 "
+              f"{api_key_config.ON_BEHALF_HEADER}）", str(allowlist))
+        # **当且仅当**：网关名单里有 machine client ⟺ 容器拿到了同一个 id。
+        in_gateway = machine_id in allowed
+        container_id = (rt_env.get(da.MACHINE_CLIENT_ID_ENV) or "").strip()
+        check(in_gateway == bool(container_id)
+              and (not container_id or container_id == machine_id),
+              f"网关 allowedClients 与容器 {da.MACHINE_CLIENT_ID_ENV} 同开同关"
+              "且是同一个 client id",
+              f"网关含={in_gateway} 容器有值={bool(container_id)} "
+              f"两者相同={container_id == machine_id}")
+
+    # ---- 哨兵行 ----
+    # `enabled` 必须是 DynamoDB **BOOL**：`keystore.lookup` 的判定是
+    # `enabled is not True`，字符串 `"true"` 同样被拒，症状是"控制台显示开着但
+    # 所有 Key 都 401"（两侧单测各自都绿）。**不断言它是开还是关**——关闸是
+    # 管理员的合法状态，这里只报告它。
+    # 主键取 `keygen.SWITCH_PK`（deploy_key_proxy 从那里 import 的同一个值），
+    # 不在这里写 `"__switch__"` 字面量：手抄的主键漂了就会读到一行不存在的记录，
+    # 而"读不到"与"没有这一行"在这里是同一个症状。
+    row = boto3.resource("dynamodb", region_name=region).Table(
+        dkp.API_KEYS_TABLE).get_item(
+            Key={"key_hash": dkp.SWITCH_PK}, ConsistentRead=True).get("Item")
+    check(row is not None and "enabled" in row,
+          f"{dkp.API_KEYS_TABLE} 的哨兵行存在且有 enabled 字段",
+          "哨兵行缺失——keystore.lookup 会把所有 Key 都拒掉" if not row
+          else f"updated_by={row.get('updated_by', '?')}")
+    check(isinstance((row or {}).get("enabled"), bool),
+          "哨兵行的 enabled 是布尔（字符串 \"true\" 会让所有 Key 401）",
+          f"{(row or {}).get('enabled')!r}（当前总开关："
+          f"{'开' if (row or {}).get('enabled') is True else '关'}）")
+
+    _check_key_proxy_role_is_narrow(dkp, cfg)
+    return MIN_KEY_PROXY_CHECKS
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--local", action="store_true",
                     help="只跑本地 scanner 判定（①②），不查线上组件")
     args = ap.parse_args()
+    global min_expected
     run_local()
+    min_expected = MIN_LOCAL_CHECKS
     if not args.local:
         run_deployed()
         run_panel()
         run_mcp_and_route()
+        min_expected += MIN_DEPLOYED_CHECKS
+        # ⑧ 只在组件启用时计入下限（返回值就是它承诺的最小项数）
+        min_expected += run_key_proxy()
     return 0
 
 
@@ -587,9 +1072,9 @@ if __name__ == "__main__":
         rc = 1
     finally:
         failed = sum(1 for ok, _, _ in results if not ok)
-        # 下限：合规 8 + 违规 7 = 15 项本地判定，少于这个数说明中途挂了
-        # （非 --local 时还有 ③ 的 2 项，但下限只保本地那部分）
-        MIN_CHECKS = 15
+        # 下限由 main() 按"这次真跑了哪几段"累加（见 MIN_* 常量）。旧版只保本地
+        # 那 15 项，于是任何线上段整段静默跳过都不会被下限抓到。
+        MIN_CHECKS = min_expected
         print()
         if crashed:
             print(f"结果：执行中断（{crashed}）—— 验收**未完成**，状态不可信。"
