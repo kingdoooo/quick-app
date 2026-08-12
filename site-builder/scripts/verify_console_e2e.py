@@ -46,7 +46,7 @@ CHECKS = 0
 FAILURES = 0
 # 全绿时的实际断言条数下限。**不是估的**：低于它说明脚本中途崩了或分支被跳过，
 # 而"跑了 3 项全过"读起来跟"30 项全过"一样像成功（M3-FINDINGS §2.3 的教训）。
-MIN_CHECKS = 55
+MIN_CHECKS = 57      # M4 把 ⑪ 段的 /api/keys 从 1 条"不存在"换成 3 条行为断言
 
 
 def cfg(section: str, key: str, default: str | None = None) -> str:
@@ -390,11 +390,44 @@ def main() -> int:
         check(int(cnt.get("n", -1)) == 1,
               "管理员名单未被越权请求改动（__count__ 仍为 1）", f"n={cnt.get('n')}")
 
-        print("\n── ⑪ M4/M5 的接口确实不存在 ────────────────────────")
-        for path in ("/api/keys", "/api/analytics", "/api/visitors"):
+        print("\n── ⑪ 尚未实现的接口确实不存在 ──────────────────────")
+        # **这一段原来把 `/api/keys` 也列在"不存在"里**，那在 M3 是对的，M4 落地
+        # 当天就变成了假红：Task 6/9 实现了它，于是线上返回 200 而闸门要求 404
+        # （2026-08-13 跑 Task 10 Step 10 时真的红了）。教训不是"改个数字"——
+        # **枚举"什么还不存在"的断言天生会随下一个里程碑过期**，所以下面把
+        # `/api/keys` 换成对它**真实行为**的断言，剩下两个 M5 接口才继续用
+        # "不存在"这条形态。
+        for path in ("/api/analytics", "/api/visitors"):
             st, _, _ = request("GET", origin + path, cookies=ck_new)
-            check(st == 404, f"{path} → 404（M4/M5 未实现，前端也不请求它）",
+            check(st == 404, f"{path} → 404（M5 未实现，前端也不请求它）",
                   f"实际 {st}")
+
+        # `/api/keys`（M4）：组件启用与否走**唯一真源**判定，不在这里再写一次
+        # has_section（那就是第二个判定点）。
+        import api_key_config                       # deployer/functions/
+        _c = configparser.ConfigParser(interpolation=None)
+        _c.read(CFG_PATH)
+        assert _c.sections(), f"{CFG_PATH} 读空了——configparser 对缺失文件是静默的"
+        if not api_key_config.api_key_enabled(_c):
+            # 无 `[ApiKey]` 段时 panel 的这条路径没有被本轮验证过（表名环境变量
+            # 都不该下发），**不在这里猜它该返回什么**：编一个期望值等于把猜测
+            # 变成闸门。留作 OAuth-only 部署的待验项。
+            print("  SKIP  /api/keys（config.ini 无 [ApiKey] 段，组件未启用；"
+                  "该形态下的行为本轮未验，不猜期望值）")
+        else:
+            st, _, text = request("GET", origin + "/api/keys", cookies=ck_new)
+            check(st == 200, "/api/keys → 200（M4 已实现）", f"实际 {st}")
+            # **列表接口一个字节的明文/哈希都不能出**（M4 的核心保证：明文在
+            # 服务端只在创建响应里出现一次）。这里的账号没有 Key，所以断言的是
+            # "形态正确且不含这两个字段名"——真有 Key 时的逐字段核对在
+            # Task 11 的 verify_api_key_e2e.py 场景 1。
+            body = json.loads(text) if text else {}
+            check(isinstance(body.get("keys"), list),
+                  "/api/keys 响应形态是 {keys: [...]}", f"实际 {list(body)}")
+            check("plaintext" not in text and "key_hash" not in text,
+                  "/api/keys 响应里没有 plaintext / key_hash 字段",
+                  "响应里出现了明文或哈希字段名——列表接口不得有泄漏路径"
+                  if ("plaintext" in text or "key_hash" in text) else "两者都不在")
 
         print("\n── ⑫ 面板会话的边界 ────────────────────────────────")
         # 拿 A 的面板会话配 B 的站点会话：必须拒（换人登录后的残留 cookie）
