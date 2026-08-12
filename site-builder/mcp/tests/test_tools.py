@@ -787,3 +787,267 @@ def test_undeploy_invoke_failure_does_not_leave_pending_job(aws):
     assert jobs, "没有 job 记录"
     assert jobs[0]["status"] == "FAILED", (
         f"job 停在 {jobs[0]['status']}——sweeper 只扫 RUNNING，永远不会被收敛")
+
+
+# ================= on-behalf 信任规则（二期 M4，spec §5.3）=================
+#
+# `_caller_email()` 从此有两条信任路径，而**第二条决定"这个请求以谁的身份行事"**
+# ——写错就是"任何 OAuth 用户加一个头即可冒充任意人"。所以这一组里负测比正路径
+# 重要得多，顺序也按危险程度排。
+#
+# 规则（实现里同一份注释）：
+#   token 有 email claim → 既有 OAuth 路径，一字不改（idp / auth_via /
+#                          email_verified 三重校验照旧）
+#   token 无 email claim → 只有在 ① MACHINE_CLIENT_ID 非空、② token 的
+#                          client_id 与它 compare_digest 相等、③ 头值过
+#                          permissions.EMAIL_RE.fullmatch 时，才信 on-behalf 头
+#   其余                 → NotOwner（文案一字不改）
+
+MACHINE_CLIENT = "machine1234567890abcdef"
+MCP_CLIENT = "mcpclient1234567890abcd"
+
+
+def _machine_token(**over):
+    """机器 token 的真实 claim 形态：**没有** email / idp / auth_via /
+    email_verified 任何一项（spike 实测 client_credentials token 的 10 个
+    claim 里一个都不是）——这正是它必须走第二条路径的原因。"""
+    from conftest import make_token
+    claims = {"sub": MACHINE_CLIENT, "client_id": MACHINE_CLIENT,
+              "token_use": "access", "scope": "site-builder-mcp/invoke",
+              "iss": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_x"}
+    claims.update(over)
+    return make_token(claims)
+
+
+def _on_behalf(email: str) -> dict:
+    import server
+    return {server.ON_BEHALF_HEADER: email}
+
+
+def test_ordinary_oauth_user_cannot_impersonate_with_the_header(monkeypatch):
+    """**只看头 = 任何 OAuth 用户加个头就能冒充别人。**
+
+    这条是 M4 最重要的负测。构造：一个**合法的** OAuth 用户 token（有 email
+    claim、idp/auth_via 齐全、能正常调工具），额外带上
+    X-SB-On-Behalf-Of: victim@x.com。必须解析成**他自己**，绝不是受害者。
+    """
+    import server
+    from conftest import make_token, with_auth
+    monkeypatch.setenv("TRUSTED_IDPS", "Feishu")
+    monkeypatch.setenv(server.MACHINE_CLIENT_ID_ENV, MACHINE_CLIENT)
+    with_auth(monkeypatch, make_token({
+        "email": "caller@x.com", "idp": "Feishu",
+        "auth_via": "TokenGeneration_HostedAuth", "email_verified": True,
+        "client_id": MCP_CLIENT}), **_on_behalf("victim@x.com"))
+    assert server._caller_email() == "caller@x.com"
+
+
+def test_oauth_user_token_with_machine_client_id_still_uses_its_own_email(monkeypatch):
+    """纵深防御：即使 token 的 client_id 恰好等于 machine client，只要它带
+    email claim 就走第一条路径。on-behalf 头**只对无 email claim 的 token 生效**
+    ——否则"拿到一个 machine client 签出的用户 token"就能冒充。"""
+    import server
+    from conftest import make_token, with_auth
+    monkeypatch.setenv("TRUSTED_IDPS", "Feishu")
+    monkeypatch.setenv(server.MACHINE_CLIENT_ID_ENV, MACHINE_CLIENT)
+    with_auth(monkeypatch, make_token({
+        "email": "caller@x.com", "idp": "Feishu",
+        "auth_via": "TokenGeneration_HostedAuth", "email_verified": True,
+        "client_id": MACHINE_CLIENT}), **_on_behalf("victim@x.com"))
+    assert server._caller_email() == "caller@x.com"
+
+
+def test_untrusted_oauth_token_cannot_fall_through_to_on_behalf(monkeypatch):
+    """三重校验拒掉的 token 不得"退而"走 on-behalf 路径。
+
+    有 email claim 但 idp 不受信 → 必须直接 NotOwner。若实现把三重校验的拒绝
+    改成"继续往下试 on-behalf"，一个来源不受信的 token 配上 machine client_id
+    就能拿到任意身份。
+    """
+    import server
+    from conftest import make_token, with_auth
+    monkeypatch.setenv("TRUSTED_IDPS", "Feishu")
+    monkeypatch.setenv(server.MACHINE_CLIENT_ID_ENV, MACHINE_CLIENT)
+    with_auth(monkeypatch, make_token({
+        "email": "evil@x.com", "idp": "EvilCorp",
+        "auth_via": "TokenGeneration_HostedAuth", "email_verified": True,
+        "client_id": MACHINE_CLIENT}), **_on_behalf("victim@x.com"))
+    with pytest.raises(server.NotOwner):
+        server._caller_email()
+
+
+def test_machine_token_without_header_is_rejected(monkeypatch):
+    """spike 已实证改造前的行为（"无法识别调用者身份"）；改造后仍必须拒。
+
+    机器 token 自己不代表任何人——身份完全来自 on-behalf 头。没有头就没有身份，
+    不得回退成任何默认值（空 owner / machine client 名 / 第一个管理员）。
+    """
+    import server
+    from conftest import with_auth
+    monkeypatch.setenv(server.MACHINE_CLIENT_ID_ENV, MACHINE_CLIENT)
+    with_auth(monkeypatch, _machine_token())
+    with pytest.raises(server.NotOwner):
+        server._caller_email()
+
+
+def test_machine_token_with_header_resolves_to_header_value(monkeypatch):
+    """正路径：machine client 的 token + 合法头 → 头里那个 email。"""
+    import server
+    from conftest import with_auth
+    monkeypatch.setenv(server.MACHINE_CLIENT_ID_ENV, MACHINE_CLIENT)
+    with_auth(monkeypatch, _machine_token(), **_on_behalf("owner@x.com"))
+    assert server._caller_email() == "owner@x.com"
+
+
+def test_on_behalf_path_is_the_only_one_allowed_to_skip_claim_checks(monkeypatch):
+    """机器 token 天生没有 idp/auth_via/email_verified，所以这条路径**必须**跳过
+    三重校验——把它锁住，免得将来有人"顺手补齐"而让全部 Key 调用当场失效。
+
+    可信性来自**创建时**：Key 只能在控制台创建，而控制台身份是 Edge 注入的
+    x-user-email，那条路径已过 REQUIRE_IDP_CLAIM 校验（决定 8）。
+    """
+    import server
+    from conftest import with_auth
+    monkeypatch.setenv("TRUSTED_IDPS", "Feishu")          # 严格模式也要通
+    monkeypatch.setenv("REQUIRE_EMAIL_VERIFIED", "true")
+    monkeypatch.setenv(server.MACHINE_CLIENT_ID_ENV, MACHINE_CLIENT)
+    with_auth(monkeypatch, _machine_token(), **_on_behalf("owner@x.com"))
+    assert server._caller_email() == "owner@x.com"
+
+
+def test_wrong_client_id_with_header_is_rejected(monkeypatch):
+    """client_id 不是 machine client 的 token 带头 → 拒。
+
+    注意构造：**不能**用 mcp client 的 token 做这条（它有 email claim，会走
+    第一条路径）。这里是"无 email claim 且 client_id 是别的值"。
+    """
+    import server
+    from conftest import with_auth
+    monkeypatch.setenv(server.MACHINE_CLIENT_ID_ENV, MACHINE_CLIENT)
+    with_auth(monkeypatch, _machine_token(client_id="someothelient00000000"),
+              **_on_behalf("victim@x.com"))
+    with pytest.raises(server.NotOwner):
+        server._caller_email()
+
+
+def test_user_token_without_email_claim_cannot_use_the_header(monkeypatch):
+    """真实会发生的形态：pre-token 触发器没挂/挂错时，mcp client 的 access token
+    **没有 email claim**。此时带上 on-behalf 头必须拒——否则任何登录用户都能在
+    那段时间里冒充任意人。"""
+    import server
+    from conftest import with_auth
+    monkeypatch.setenv(server.MACHINE_CLIENT_ID_ENV, MACHINE_CLIENT)
+    with_auth(monkeypatch, _machine_token(client_id=MCP_CLIENT),
+              **_on_behalf("victim@x.com"))
+    with pytest.raises(server.NotOwner):
+        server._caller_email()
+
+
+@pytest.mark.parametrize("claim", [None, "", 123, ["m"], {"c": 1}])
+def test_token_without_usable_client_id_cannot_use_the_header(monkeypatch, claim):
+    """client_id 缺失或不是字符串 → 拒。
+
+    实现刻意不写"client_id 为空就拒"那句（那会挡住空环境变量的闸门、让它无法被
+    测试证明，见 _on_behalf_email 的注释），所以类型/缺失这条路必须单独钉住。
+    """
+    import server
+    from conftest import make_token, with_auth
+    monkeypatch.setenv(server.MACHINE_CLIENT_ID_ENV, MACHINE_CLIENT)
+    claims = {"sub": MACHINE_CLIENT, "token_use": "access"}
+    if claim is not None:
+        claims["client_id"] = claim
+    with_auth(monkeypatch, make_token(claims), **_on_behalf("victim@x.com"))
+    with pytest.raises(server.NotOwner):
+        server._caller_email()
+
+
+@pytest.mark.parametrize("env", ["", "   ", None])
+def test_missing_machine_client_env_rejects_all_on_behalf(monkeypatch, env):
+    """**配置缺失不得退化成"不比对"**。
+
+    没配 MACHINE_CLIENT_ID 就是"本平台没启用 API Key"，此时任何 on-behalf 头都
+    必须拒。若实现让空值走进 compare_digest，`"" == ""` 会让**任何**无 email
+    claim 的 token（含 client_id 缺失的）拿到任意身份——本仓库记过的
+    "默认值恰好意味着放行"那一类。
+    """
+    import server
+    from conftest import with_auth
+    if env is None:
+        monkeypatch.delenv(server.MACHINE_CLIENT_ID_ENV, raising=False)
+    else:
+        monkeypatch.setenv(server.MACHINE_CLIENT_ID_ENV, env)
+    # 两种 token 都要拒：client_id 与环境值"相同"的空串形态最危险
+    for token in (_machine_token(), _machine_token(client_id=""),
+                  _machine_token(client_id="   ")):
+        with_auth(monkeypatch, token, **_on_behalf("victim@x.com"))
+        with pytest.raises(server.NotOwner):
+            server._caller_email()
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "notanemail", "a@b",
+                                 "a@b.c,d@e.f",
+                                 "a@b.com\nX-Injected: 1"])
+def test_malformed_on_behalf_header_is_rejected(monkeypatch, bad):
+    """头值必须过 permissions.EMAIL_RE.fullmatch。
+
+    最后一条（含换行）尤其重要：邮箱形态校验顺带挡住头注入。倒数第二条
+    （逗号分隔）锁的是 fullmatch 而不是 match——`match` 会让这两条都通过，
+    而通过之后那个字符串会被当成授权主键去查 owner/collaborators。
+    """
+    import server
+    from conftest import with_auth
+    monkeypatch.setenv(server.MACHINE_CLIENT_ID_ENV, MACHINE_CLIENT)
+    with_auth(monkeypatch, _machine_token(), **_on_behalf(bad))
+    with pytest.raises(server.NotOwner):
+        server._caller_email()
+
+
+# `<script>@x.com` **过** permissions.EMAIL_RE（`[^@\s]+` 允许 < >），所以它
+# 不在上面的拒绝清单里——这是**有意的**：头值的形态闸门必须与平台其它入口
+# （控制台加协作者、site.json 的 allowed_users）**完全同一个判定**。在这里单独
+# 加严会造成"控制台能加的协作者，用 Key 却调不了"，而它换不来安全收益：这个头
+# 只在机器 token 后面才被读，而 key-proxy 每次都用 Key 记录里的 email 覆写它。
+# 所以下面锁的是**等价性**，不是某个具体清单——将来 EMAIL_RE 收严，这里自动跟上。
+@pytest.mark.parametrize("value", [
+    "owner@x.com", "a.b+tag@sub.example.com", "A@B.COM", "<script>@x.com",
+    "", "   ", "notanemail", "a@b", "a@b.c,d@e.f", "a@b.com\nX-Injected: 1",
+    "a@b.com ", " a@b.com", "a@b.com,", "\ta@b.com"])
+def test_on_behalf_shape_gate_is_exactly_permissions_email_re(monkeypatch, value):
+    import permissions
+    import server
+    from conftest import with_auth
+    monkeypatch.setenv(server.MACHINE_CLIENT_ID_ENV, MACHINE_CLIENT)
+    with_auth(monkeypatch, _machine_token(), **_on_behalf(value))
+    accepted = bool(permissions.EMAIL_RE.fullmatch(value))
+    if accepted:
+        assert server._caller_email() == value
+    else:
+        with pytest.raises(server.NotOwner):
+            server._caller_email()
+
+
+def test_machine_client_id_is_read_per_call_not_module_level(monkeypatch):
+    """照 _trusted_idps 的既有形态：固化成模块级常量会让拒绝类用例假通过。
+
+    做法：server 在本文件更早的用例里已被导入（那时 env 未设），现在 setenv
+    必须能被看到——看不到就说明值在 import 时被固化了。
+    """
+    import server
+    monkeypatch.setenv(server.MACHINE_CLIENT_ID_ENV, MACHINE_CLIENT)
+    assert server._machine_client_id() == MACHINE_CLIENT
+    monkeypatch.setenv(server.MACHINE_CLIENT_ID_ENV, "another-machine-client")
+    assert server._machine_client_id() == "another-machine-client"
+    monkeypatch.delenv(server.MACHINE_CLIENT_ID_ENV, raising=False)
+    assert server._machine_client_id() == ""
+
+
+def test_on_behalf_header_is_read_case_insensitively(monkeypatch):
+    """starlette 给的头名全小写，实现必须按小写取。
+
+    这条防的是"实现按 `X-SB-On-Behalf-Of` 原样取值"——那样线上永远取不到头，
+    症状是所有 Key 调用都报"无法识别调用者身份"，而单测若也用大写键构造请求
+    就会一起瞎掉（conftest.with_auth 因此强制小写化）。
+    """
+    import server
+    monkeypatch.setenv(server.MACHINE_CLIENT_ID_ENV, MACHINE_CLIENT)
+    assert server.ON_BEHALF_HEADER == server.ON_BEHALF_HEADER.lower()

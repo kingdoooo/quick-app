@@ -1,5 +1,6 @@
 """部署 MCP——薄壳：4 工具全部秒级返回，重活交给 Step Functions。
 运行于 AgentCore Runtime；调用者飞书 email 由网关经 JWT claims 传入。"""
+import hmac
 import json
 import os
 import re
@@ -51,6 +52,76 @@ TRUSTED_AUTH_SOURCES = ("TokenGeneration_HostedAuth",
 def _require_email_verified() -> bool:
     return os.environ.get(
         "REQUIRE_EMAIL_VERIFIED", "true").strip().lower() != "false"
+
+
+# ---------- API Key 的 on-behalf 路径（二期 M4，spec §5.3）----------
+#
+# 交换层（key-proxy）用 machine client 的 client_credentials token 调本服务，
+# 并带一个 `X-SB-On-Behalf-Of: {email}` 说明"以谁的身份行事"。
+#
+# **头名与环境变量名的真源是 `deployer/functions/api_key_config.py`**
+# （那里还给网关的 requestHeaderAllowlist 与部署脚本用）。本模块留一份小写镜像
+# 而不是 import 它：容器只 COPY server.py / common.py / permissions.py /
+# ops_log.py，多一个模块就要同步 Dockerfile、构建输入指纹与复制清单。两处由
+# `mcp/tests/test_component_gate.py` 的 real-value 断言绑定，漂了当场红。
+#
+# 小写是**必须**的：starlette 的 `dict(request.headers)` 键全小写，按原样
+# 大小写取值会永远取不到——症状是所有 Key 调用都报"无法识别调用者身份"。
+ON_BEHALF_HEADER = "x-sb-on-behalf-of"
+MACHINE_CLIENT_ID_ENV = "MACHINE_CLIENT_ID"
+
+
+# **每次调用时读环境变量**（同 _trusted_idps 的理由，那条教训在本文件更上面）。
+# 空值 = 本平台没启用 API Key 组件 → 拒绝全部 on-behalf 请求，与网关侧
+# "machine client 不在 allowedClients"同向 fail-closed。
+def _machine_client_id() -> str:
+    return os.environ.get(MACHINE_CLIENT_ID_ENV, "").strip()
+
+
+def _on_behalf_email(claims: dict, headers: dict) -> str:
+    """机器 token + on-behalf 头 → 被代理的用户 email；不成立时返回 ""。
+
+    三个条件全过才认（缺一即返回空，由调用方按"识别不出身份"拒绝）：
+      ① `_machine_client_id()` 非空——**没配置绝不能退化成"不比对"**，
+         那正是 fail-open：`"" == ""` 会让任何 token 拿到任意身份；
+      ② token 的 `client_id` 与它 `compare_digest` 相等（机器 token 只能由
+         持有 machine client secret 的组件换到，而那个 secret 只在 SSM 里、
+         只有 key-proxy 读）；
+      ③ 头值过 `permissions.EMAIL_RE.fullmatch`——**复用平台唯一的邮箱形态
+         判定**，不写第二个正则。`fullmatch` 而非 `match`：`match` 会放过
+         "a@b.com\\nX-Injected: 1" 与逗号分隔的多值，于是形态校验顺带丢掉了
+         挡头注入的作用。
+
+    **为什么这条路径可以跳过 idp / auth_via / email_verified 三重校验**
+    （全仓库只有这一条能跳，别照抄到别处）：机器 token 天生没有这三个 claim
+    （spike 实测 client_credentials token 的 claim 里一个都不是），补齐它们做不到
+    ——这不是"漏了校验"，而是那三个 claim 在这条链路上不存在。email 的可信性来自
+    **创建时**：Key 只能在控制台创建，控制台身份是 Edge 注入的 `x-user-email`，
+    那条路径已经过了 `REQUIRE_IDP_CLAIM` 校验（决定 8）。已知取舍：用户离职后旧
+    Key 仍有效，靠审计 + 吊销处理（哨兵行可一键全禁）。
+    """
+    machine = _machine_client_id()
+    if not machine:
+        return ""
+    client_id = claims.get("client_id")
+    # **这里刻意不写 `or not client_id`**（反向验证 2026-08-12 的发现）：
+    # 那个多余的判断会把上面那条空值闸门挡在身后——`client_id == ""` 先被它拒掉，
+    # 于是"把 `if not machine: return ""` 删掉"这种注入**没有任何测试会变红**，
+    # 空值闸门看起来有、实际上无法证明它在起作用（本仓库记过的
+    # 「加固测试必须先会红」）。现在 `"" == ""` 这条路只由上面那一处闸门挡着，
+    # 删掉它 test_missing_machine_client_env_rejects_all_on_behalf 立刻变红。
+    # 安全性不变：machine 非空时 compare_digest("", machine) 恒为假。
+    if not isinstance(client_id, str):
+        return ""
+    # bytes 比对：compare_digest 对含非 ASCII 的 str 会 TypeError，
+    # 而 client_id 来自入站 token（不受我们控制）。
+    if not hmac.compare_digest(client_id.encode("utf-8"),
+                               machine.encode("utf-8")):
+        return ""
+    value = headers.get(ON_BEHALF_HEADER, "")
+    if not isinstance(value, str) or not permissions.EMAIL_RE.fullmatch(value):
+        return ""
+    return value
 
 
 def _is_verified(value) -> bool:
@@ -526,15 +597,24 @@ def _caller_email() -> str:
     透传给容器内的 MCP server（官方 SDK 无 get_http_headers；用 FastMCP 的
     request_context 拿 starlette Request）。JWT 已被 AgentCore 验过签名，此处
     只解 payload 取 email，不重复验签。Task 20 spike 已本地验证此路径可用。
+
+    **两条信任路径，顺序不可换**（二期 M4）：
+      · token 有 email claim → 既有 OAuth 路径，三重 claim 校验一字不改。
+        这条**必须在前**：否则一个合法用户只要额外带个 on-behalf 头就能冒充
+        别人（M4 最重要的负测盯的就是这一点）。
+      · token 无 email claim → 才看 on-behalf 头（`_on_behalf_email`，那里写了
+        为什么它可以跳过三重校验）。
+    两条都不成立 → 下面那句 NotOwner（文案与 M4 之前一致）。
     """
     import base64
     import json as _json
 
     try:
         request = mcp.get_context().request_context.request
-        auth = dict(request.headers).get("authorization", "") if request else ""
+        headers = dict(request.headers) if request else {}
     except Exception:
-        auth = ""
+        headers = {}
+    auth = headers.get("authorization", "")
     token = auth[7:] if auth[:7].lower() == "bearer " else auth
     parts = token.split(".")
     if len(parts) == 3:
@@ -562,6 +642,12 @@ def _caller_email() -> str:
                     raise NotOwner(
                         "邮箱未经身份提供方验证，拒绝授权——请用企业账号登录")
                 return email
+            # 无 email claim：唯一的另一条路径是 API Key 的交换层。
+            # 注意这里**不是** else 兜底——上面的 `if email:` 分支只以 return
+            # 或 raise 结束，所以带 email 的 token 永远到不了这行。
+            on_behalf = _on_behalf_email(claims, headers)
+            if on_behalf:
+                return on_behalf
         except NotOwner:
             raise
         except Exception:

@@ -30,6 +30,15 @@ from pathlib import Path
 
 HERE = Path(__file__).parent
 
+# "有没有 [ApiKey] 段"的判定只有一处：deployer/functions/api_key_config.py。
+# 本脚本、deploy_agentcore.py、deploy_key_proxy.py 共用它——各写一次
+# has_section 就是三个判定点，漏改一处即"部分部署"（最危险的状态）。
+# 落 functions/ 而不是本目录：另两个脚本从 mcp/ 与 key-proxy/ 执行，
+# 那两个目录看不到 scripts/（Codex 审查 2026-08-11 P1-3 已实测）。
+sys.path.insert(0, str(HERE.parent / "deployer" / "functions"))
+from api_key_config import (api_key_enabled, machine_scope,  # noqa: E402
+                            resource_server_id, scope_name)
+
 POOL_NAME = "site-builder-users"
 MCP_LOCALHOST_CALLBACK = "http://localhost:18765/callback"
 
@@ -300,9 +309,54 @@ def _ensure_domain(cog, pool_id: str, prefix: str) -> str:
     return existing
 
 
+SCOPE_DESCRIPTION = "Invoke the site-builder deploy MCP"
+
+
+def ensure_resource_server(cog, pool_id: str, *, identifier: str,
+                           scope: str) -> str:
+    """幂等建 resource server + custom scope；返回 `{identifier}/{scope}`。
+
+    machine client 的存在前提：`client_credentials` 只能授 resource server 的
+    custom scope，空 scope 会被 Cognito 的跨字段校验拒绝。
+
+    **UpdateResourceServer 与 UpdateUserPoolClient 一样是整体替换**：补 scope
+    时必须把已有的 scope 一起回填。只发新 scope 会把别的 scope 从 resource
+    server 上抹掉，而那些 scope 可能已经授给了别的 client——症状是那个 client
+    换 token 报 invalid_scope，与本次改动看不出关系。
+    """
+    want = {"ScopeName": scope, "ScopeDescription": SCOPE_DESCRIPTION}
+    try:
+        current = cog.describe_resource_server(
+            UserPoolId=pool_id, Identifier=identifier)["ResourceServer"]
+    except cog.exceptions.ResourceNotFoundException:
+        cog.create_resource_server(UserPoolId=pool_id, Identifier=identifier,
+                                   Name=identifier, Scopes=[want])
+        print(f"  新建 resource server {identifier}，scope {scope}")
+        return f"{identifier}/{scope}"
+
+    scopes = list(current.get("Scopes") or [])
+    if any(s.get("ScopeName") == scope for s in scopes):
+        print(f"  resource server {identifier} 已有 scope {scope}")
+        return f"{identifier}/{scope}"
+    cog.update_resource_server(
+        UserPoolId=pool_id, Identifier=identifier,
+        Name=current.get("Name") or identifier, Scopes=scopes + [want])
+    print(f"  resource server {identifier}: 补上 scope {scope}"
+          f"（保留原有 {[s.get('ScopeName') for s in scopes]}）")
+    return f"{identifier}/{scope}"
+
+
 def _ensure_clients(cog, pool_id: str, base_domain: str,
                     extra_mcp_callbacks: list[str],
-                    idp_name: str | None = None) -> dict:
+                    idp_name: str | None = None, *,
+                    include_machine: bool = False,
+                    machine_scopes: tuple[str, ...] = ()) -> dict:
+    """建/更新 app client。
+
+    include_machine / machine_scopes **原样透传**给 client_configs：那两个参数
+    在 M1 落地时没有任何调用方（machine client 属于 M4），所以这里漏加就是
+    main() 一传参数就 TypeError，而 client_configs 自己的用例照样全绿。
+    """
     existing = {}
     token = None
     while True:
@@ -316,7 +370,9 @@ def _ensure_clients(cog, pool_id: str, base_domain: str,
 
     out = {}
     for key, params in client_configs(base_domain, extra_mcp_callbacks,
-                                      idp_name).items():
+                                      idp_name,
+                                      include_machine=include_machine,
+                                      machine_scopes=machine_scopes).items():
         _assert_no_native_flows(key, params)
         name = params["ClientName"]
         if name in existing:
@@ -548,7 +604,14 @@ def _store_client_secrets(cog, pool_id: str, clients: dict, region: str,
     if ssm is None:
         import boto3
         ssm = boto3.client("ssm", region_name=region)
-    for key, param in (("site", f"{param_prefix}/site-client-secret"),):
+    # **按 clients 里实际存在的 client 取**，不写死清单：machine client 只在
+    # 启用 API Key 组件时才建，硬编码"两个都写"会在这一步 KeyError 中止，
+    # 而前面七步已经改过线上资源（部署脚本停在中途最难收拾）。
+    # 反过来漏了 machine 则 key-proxy 永远换不到 token（secret 只在这里落 SSM）。
+    for key, param in ((k, f"{param_prefix}/{name}") for k, name in
+                       (("site", "site-client-secret"),
+                        ("machine", "machine-client-secret"))
+                       if k in clients):
         secret = cog.describe_user_pool_client(
             UserPoolId=pool_id, ClientId=clients[key])["UserPoolClient"].get(
                 "ClientSecret", "")
@@ -600,8 +663,32 @@ def main() -> None:
         print("      此状态下 allowed_users=\"org\" 不代表\"全组织\"——")
         print("      接上 IdP 后重跑本脚本，client 会切成仅该 IdP。")
 
+    # ④a 组件门禁（spec §5.1.1）：没配 [ApiKey] 段 = 平台只允许 OAuth 一条路径，
+    # 此时**不建** resource server、也不建 machine client。这是"API Key 是可选
+    # 组件"的 pool 侧实现——建了它们，deploy_agentcore 那边的 allowedClients
+    # 门禁就还有东西可放行了。
+    machine_scopes = ()
+    if api_key_enabled(cfg):
+        print("④a resource server + custom scope（API Key 组件已启用）")
+        scope = ensure_resource_server(cog, pool_id,
+                                       identifier=resource_server_id(cfg),
+                                       scope=scope_name(cfg))
+        # 建出来的 scope 必须与 key-proxy 换 token 时请求的那一串逐字符相同
+        # （machine_scope 是那个拼接的唯一实现）。不等就说明两处读配置的方式漂了
+        # ——那时的症状是换 token 报 invalid_scope，而文案指向 client 配置。
+        if scope != machine_scope(cfg):
+            raise SystemExit(
+                f"scope 拼接不一致：本脚本建的是 {scope!r}，而 key-proxy 会请求 "
+                f"{machine_scope(cfg)!r}——两处必须同源（api_key_config）")
+        machine_scopes = (scope,)
+    else:
+        print("④a 跳过 resource server / machine client"
+              "（config.ini 无 [ApiKey] 段 = OAuth-only，spec §5.1.1 组件门禁）")
+
     print("④ app clients")
-    clients = _ensure_clients(cog, pool_id, base_domain, args.mcp_callback, idp_name)
+    clients = _ensure_clients(cog, pool_id, base_domain, args.mcp_callback,
+                              idp_name, include_machine=bool(machine_scopes),
+                              machine_scopes=machine_scopes)
 
     print("⑤ 边界复验：client 不得开原生认证 flow")
     _verify_no_native_flows(cog, pool_id, clients)
@@ -636,7 +723,14 @@ def main() -> None:
     print(f"  [Cognito] domain = https://{domain_prefix}.auth.{region}.amazoncognito.com")
     print(f"  [Cognito] site_client_id = {clients['site']}")
     print(f"  [Cognito] mcp_client_id = {clients['mcp']}")
-    print("  [Cognito] machine_client_id = （M4 建 resource server 时再填）")
+    if "machine" in clients:
+        print(f"  [Cognito] machine_client_id = {clients['machine']}")
+        print("  ⚠️  回填后必须重跑 deploy_agentcore.py：machine client 要同时进"
+              "网关的 allowedClients 与容器的 MACHINE_CLIENT_ID，"
+              "否则 Key 调用会以「网关放行、容器拒绝」的形态失败。")
+    else:
+        print("  [Cognito] machine_client_id = （无 [ApiKey] 段：OAuth-only，"
+              "不需要）")
     if idp_name:
         print(f"\n在 IdP（{idp_name}）侧把这个回调加进白名单：")
         print(f"  https://{domain_prefix}.auth.{region}.amazoncognito.com/oauth2/idpresponse")

@@ -15,6 +15,11 @@ mcp_client_id =
 # 二期 M4：key-proxy 用的 client_credentials 客户端。
 # **M1 不创建**——client_credentials 只能授 resource server 的 custom scope，
 # 空 scope 会被 Cognito 跨字段校验拒绝。M4 建 resource server 时一并创建并回填。
+#
+# 只在下面配了 [ApiKey] 段时才会有值，且**回填之后必须重跑
+# deploy_agentcore.py**：这个 id 要同时进网关的 allowedClients 与容器的
+# MACHINE_CLIENT_ID（两者由同一处派生，见 deploy_agentcore.machine_client_id）。
+# 只回填不重跑 = 网关放行、容器拒绝，症状是 HTTP 200 加一句业务错误文案。
 machine_client_id =
 
 [DSQL]

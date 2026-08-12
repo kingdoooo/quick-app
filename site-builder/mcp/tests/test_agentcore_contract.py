@@ -57,9 +57,20 @@ def test_requirements_floor_supports_request_context():
 
 def test_deploy_script_sets_authorization_allowlist_and_jwt_authorizer():
     """Authorization 不进 allowlist 就到不了容器，_caller_email 必失败；
-    而 Authorization 透传又要求 runtime 配 customJWTAuthorizer。"""
+    而 Authorization 透传又要求 runtime 配 customJWTAuthorizer。
+
+    断言**构造出来的真实参数**而不是源码字符串：allowlist 自 M4 起是从配置派生
+    的（多一个 on-behalf 头，见 test_component_gate.py），字符串匹配那种写法会
+    在派生化的当天变红，而它本来要守的不变量（Authorization 恒在）没变。
+    """
+    import configparser
+
+    import deploy_agentcore as da
+    cfg = configparser.ConfigParser()
+    cfg.read_string("[Platform]\nregion = us-east-1\n"
+                    "[Cognito]\nuser_pool_id = us-east-1_x\nmcp_client_id = c\n")
+    assert da.request_header_allowlist(cfg) == ["Authorization"]
     src = (MCP_DIR / "deploy_agentcore.py").read_text()
-    assert '"requestHeaderAllowlist": ["Authorization"]' in src
     assert "customJWTAuthorizer" in src
     assert '"serverProtocol": "MCP"' in src
     assert "linux/arm64" in src
@@ -127,26 +138,10 @@ def test_caller_email_rejects_missing_and_malformed_authorization(monkeypatch):
         server._caller_email()
 
 
-def _token(claims: dict) -> str:
-    import base64
-    import json as _json
-    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
-    return (b64(_json.dumps({"alg": "RS256"}).encode()) + "." +
-            b64(_json.dumps(claims).encode()) + ".sig")
-
-
-def _with_auth(monkeypatch, token: str):
-    """伪造 FastMCP 的请求上下文，只提供 Authorization 头。"""
-    import server
-
-    class _Req:
-        headers = {"authorization": f"Bearer {token}"}
-
-    class _Ctx:
-        class request_context:
-            request = _Req()
-
-    monkeypatch.setattr(server.mcp, "get_context", lambda: _Ctx())
+# token / 请求上下文的构造在 conftest（**一份实现**）：on-behalf 那组用例
+# （test_tools.py）需要同样的构造再多一个头，两边各抄一份的话，其中一份
+# 忘记小写化头名就会让拒绝类用例假通过。
+from conftest import make_token as _token, with_auth as _with_auth  # noqa: E402
 
 
 def test_caller_email_accepts_trusted_idp(monkeypatch):

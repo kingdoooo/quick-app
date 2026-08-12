@@ -808,3 +808,226 @@ def test_client_name_is_backfilled_unchanged():
 
     assert merged["ClientName"] == desired["ClientName"]   # 未改名
     assert merged["ClientName"] == "site-builder-site"
+
+
+# --- M4：resource server + machine client（组件门禁的 pool 侧）---
+# 判定"有没有 [ApiKey] 段"的唯一实现在 deployer/functions/api_key_config.py，
+# 本脚本只消费它（mcp/tests/test_component_gate.py 有 AST 守卫盯着这点）。
+
+
+def _resource_server_cog():
+    import boto3
+    return boto3.client("cognito-idp", region_name="us-east-1",
+                        aws_access_key_id="t", aws_secret_access_key="t")
+
+
+def test_ensure_resource_server_creates_and_returns_full_scope():
+    """新建路径：返回值必须是 `{identifier}/{scope}`（换 token 用的完整 scope）。"""
+    from botocore.stub import Stubber
+    cog = _resource_server_cog()
+    with Stubber(cog) as stub:
+        stub.add_client_error("describe_resource_server",
+                              service_error_code="ResourceNotFoundException")
+        stub.add_response("create_resource_server", {"ResourceServer": {}}, {
+            "UserPoolId": "us-east-1_x", "Identifier": "site-builder-mcp",
+            "Name": "site-builder-mcp",
+            "Scopes": [{"ScopeName": "invoke",
+                        "ScopeDescription": "Invoke the site-builder deploy MCP"}]})
+        scope = dp.ensure_resource_server(cog, "us-east-1_x",
+                                          identifier="site-builder-mcp",
+                                          scope="invoke")
+        assert scope == "site-builder-mcp/invoke"
+        stub.assert_no_pending_responses()
+
+
+def test_ensure_resource_server_is_idempotent_when_scope_present():
+    """已有且 scope 齐全 → 不再 create/update（重跑不得白改线上资源）。"""
+    from botocore.stub import Stubber
+    cog = _resource_server_cog()
+    with Stubber(cog) as stub:
+        stub.add_response("describe_resource_server", {"ResourceServer": {
+            "UserPoolId": "us-east-1_x", "Identifier": "site-builder-mcp",
+            "Name": "site-builder-mcp",
+            "Scopes": [{"ScopeName": "invoke", "ScopeDescription": "d"}]}},
+            {"UserPoolId": "us-east-1_x", "Identifier": "site-builder-mcp"})
+        assert dp.ensure_resource_server(
+            cog, "us-east-1_x", identifier="site-builder-mcp",
+            scope="invoke") == "site-builder-mcp/invoke"
+        stub.assert_no_pending_responses()   # 多一次调用就会在这里红
+
+
+def test_ensure_resource_server_adds_missing_scope_preserving_others():
+    """UpdateResourceServer 是整体替换：补 scope 时必须把已有的 scope 回填。
+
+    只发新 scope 会把别的 scope 从 resource server 上抹掉，而那些 scope 可能
+    已经授给了别的 client——症状是那个 client 换 token 报 invalid_scope，
+    与本次改动看不出关系（同 UpdateUserPoolClient 的整体替换教训）。
+    """
+    from botocore.stub import Stubber
+    cog = _resource_server_cog()
+    with Stubber(cog) as stub:
+        stub.add_response("describe_resource_server", {"ResourceServer": {
+            "UserPoolId": "us-east-1_x", "Identifier": "site-builder-mcp",
+            "Name": "site-builder-mcp",
+            "Scopes": [{"ScopeName": "legacy", "ScopeDescription": "别人在用"}]}},
+            {"UserPoolId": "us-east-1_x", "Identifier": "site-builder-mcp"})
+        stub.add_response("update_resource_server", {"ResourceServer": {}}, {
+            "UserPoolId": "us-east-1_x", "Identifier": "site-builder-mcp",
+            "Name": "site-builder-mcp",
+            "Scopes": [{"ScopeName": "legacy", "ScopeDescription": "别人在用"},
+                       {"ScopeName": "invoke",
+                        "ScopeDescription": "Invoke the site-builder deploy MCP"}]})
+        assert dp.ensure_resource_server(
+            cog, "us-east-1_x", identifier="site-builder-mcp",
+            scope="invoke") == "site-builder-mcp/invoke"
+        stub.assert_no_pending_responses()
+
+
+def test_machine_client_passes_both_native_flow_gates():
+    """machine client 的 ExplicitAuthFlows 是**空列表**，两道闸门必须放行它。
+
+    两道闸门判的是"有没有**开**原生 flow"（与 NATIVE_AUTH_FLOWS 求交集），
+    不是"有没有配 flow"。将来若有人把判定"收严"成
+    `flows == set(NATIVE_AUTH_DISABLED)`，machine client 会当场部署失败——
+    而那个改动看起来像是加固。这条用例锁住这一点。
+    """
+    from botocore.stub import Stubber
+    machine = dp.client_configs("example.com", [], idp_name="Okta",
+                                include_machine=True,
+                                machine_scopes=("site-builder-mcp/invoke",))["machine"]
+    assert machine["ExplicitAuthFlows"] == []
+    dp._assert_no_native_flows("machine", machine)          # 不得抛
+
+    cog = _resource_server_cog()
+    with Stubber(cog) as stub:
+        stub.add_response("describe_user_pool_client",
+                          {"UserPoolClient": {"ExplicitAuthFlows": []}},
+                          {"UserPoolId": "us-east-1_x", "ClientId": "m1"})
+        dp._verify_no_native_flows(cog, "us-east-1_x", {"machine": "m1"})
+
+
+def test_store_client_secrets_writes_machine_secret_when_it_exists():
+    """machine client 的 secret 必须落 SSM（key-proxy 靠它换 token）。"""
+    import boto3
+    from botocore.stub import Stubber
+    fake_site = "FAKEclientsecretFAKEclientsec1"
+    fake_machine = "FAKEmachinesecretFAKEmachine2"
+    cog = _resource_server_cog()
+    ssm = boto3.client("ssm", region_name="us-east-1",
+                       aws_access_key_id="t", aws_secret_access_key="t")
+    with Stubber(cog) as cstub, Stubber(ssm) as sstub:
+        cstub.add_response("describe_user_pool_client",
+                           {"UserPoolClient": {"ClientSecret": fake_site}},
+                           {"UserPoolId": "us-east-1_x", "ClientId": "c1"})
+        sstub.add_response("put_parameter", {},
+                           {"Name": "/site-builder/site-client-secret",
+                            "Value": fake_site, "Type": "SecureString",
+                            "Overwrite": True})
+        cstub.add_response("describe_user_pool_client",
+                           {"UserPoolClient": {"ClientSecret": fake_machine}},
+                           {"UserPoolId": "us-east-1_x", "ClientId": "m1"})
+        sstub.add_response("put_parameter", {},
+                           {"Name": "/site-builder/machine-client-secret",
+                            "Value": fake_machine, "Type": "SecureString",
+                            "Overwrite": True})
+        dp._store_client_secrets(cog, "us-east-1_x",
+                                 {"site": "c1", "mcp": "p1", "machine": "m1"},
+                                 "us-east-1", ssm=ssm)
+        sstub.assert_no_pending_responses()
+        cstub.assert_no_pending_responses()
+
+
+def test_store_client_secrets_skips_machine_when_component_disabled():
+    """没建 machine client 时不得去写那个参数（`clients` 里没有这个键）。
+
+    硬编码成"两个都写"会 KeyError 中止在 ⑧ 步——而前面七步已经改过线上资源。
+    """
+    import boto3
+    from botocore.stub import Stubber
+    fake_site = "FAKEclientsecretFAKEclientsec1"
+    cog = _resource_server_cog()
+    ssm = boto3.client("ssm", region_name="us-east-1",
+                       aws_access_key_id="t", aws_secret_access_key="t")
+    with Stubber(cog) as cstub, Stubber(ssm) as sstub:
+        cstub.add_response("describe_user_pool_client",
+                           {"UserPoolClient": {"ClientSecret": fake_site}},
+                           {"UserPoolId": "us-east-1_x", "ClientId": "c1"})
+        sstub.add_response("put_parameter", {},
+                           {"Name": "/site-builder/site-client-secret",
+                            "Value": fake_site, "Type": "SecureString",
+                            "Overwrite": True})
+        dp._store_client_secrets(cog, "us-east-1_x", {"site": "c1", "mcp": "p1"},
+                                 "us-east-1", ssm=ssm)
+        sstub.assert_no_pending_responses()
+
+
+def test_machine_secret_also_honours_the_isolated_prefix():
+    """隔离 spike 的 machine secret 同样不得覆盖生产参数（见 site 那条的教训）。"""
+    import boto3
+    from botocore.stub import Stubber
+    fake_machine = "FAKEmachinesecretFAKEmachine2"
+    cog = _resource_server_cog()
+    ssm = boto3.client("ssm", region_name="us-east-1",
+                       aws_access_key_id="t", aws_secret_access_key="t")
+    with Stubber(cog) as cstub, Stubber(ssm) as sstub:
+        cstub.add_response("describe_user_pool_client",
+                           {"UserPoolClient": {"ClientSecret": fake_machine}},
+                           {"UserPoolId": "us-east-1_spike", "ClientId": "m1"})
+        sstub.add_response("put_parameter", {},
+                           {"Name": "/site-builder-spike/tmp-pool/machine-client-secret",
+                            "Value": fake_machine, "Type": "SecureString",
+                            "Overwrite": True})
+        dp._store_client_secrets(cog, "us-east-1_spike", {"machine": "m1"},
+                                 "us-east-1", "/site-builder-spike/tmp-pool",
+                                 ssm=ssm)
+        sstub.assert_no_pending_responses()
+
+
+def test_ensure_clients_passes_machine_flags_through():
+    """`_ensure_clients` 必须把 include_machine/machine_scopes 透传给 client_configs。
+
+    签名不改的话 main() 传这两个参数会 TypeError——而 client_configs 的
+    include_machine 分支在 M1 之后一直没有调用方，漏改不会被别的用例发现。
+    """
+    import inspect
+    sig = inspect.signature(dp._ensure_clients)
+    assert sig.parameters["include_machine"].default is False
+    assert sig.parameters["machine_scopes"].default == ()
+
+    seen = {}
+
+    class _Cog:
+        def list_user_pool_clients(self, **kw):
+            return {"UserPoolClients": []}
+
+        def create_user_pool_client(self, **kw):
+            seen[kw["ClientName"]] = kw
+            return {"UserPoolClient": {"ClientId": "id-" + kw["ClientName"]}}
+
+    out = dp._ensure_clients(_Cog(), "us-east-1_x", "example.com", [], "Okta",
+                             include_machine=True,
+                             machine_scopes=("site-builder-mcp/invoke",))
+    assert set(out) == {"site", "mcp", "machine"}
+    assert seen["site-builder-machine"]["AllowedOAuthScopes"] == \
+        ["site-builder-mcp/invoke"]
+
+
+def test_ensure_clients_defaults_to_no_machine_client():
+    """不传参数时行为与 M1 完全一致（没配 [ApiKey] 段就不该有 machine client）。"""
+    class _Cog:
+        def list_user_pool_clients(self, **kw):
+            return {"UserPoolClients": []}
+
+        def create_user_pool_client(self, **kw):
+            return {"UserPoolClient": {"ClientId": "id"}}
+
+    assert set(dp._ensure_clients(_Cog(), "us-east-1_x", "example.com", [],
+                                  "Okta")) == {"site", "mcp"}
+
+
+def test_deploy_pool_uses_the_shared_gate_not_its_own_judgement():
+    """判定必须来自 api_key_config（`deployer/functions/`），不是本脚本自己写。"""
+    src = (Path(__file__).parents[2] / "scripts" / "deploy_pool.py").read_text()
+    assert "from api_key_config import" in src
+    assert 'has_section("ApiKey")' not in src
+    assert hasattr(dp, "api_key_enabled")

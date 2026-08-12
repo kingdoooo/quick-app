@@ -11,6 +11,9 @@ requestHeaderAllowlist=["Authorization"]）→ 打印 endpoint 与冒烟指引�
 - Authorization 头要透传给容器，必须显式加进 requestHeaderAllowlist，
   且 runtime 必须配 customJWTAuthorizer——否则该头被平台拦掉，
   server.py 的 _caller_email() 取不到 email，所有工具报"无法识别调用者身份"。
+- allowedClients / requestHeaderAllowlist / MACHINE_CLIENT_ID 三者都由
+  config.ini 有没有 [ApiKey] 段派生（组件门禁，spec §5.1.1）——见
+  allowed_clients() 与 runtime_kwargs() 的注释。三者必须同开同关。
 
 用法：
     python3 deploy_agentcore.py            # 构建 + 推送 + 部署
@@ -29,8 +32,20 @@ from pathlib import Path
 import boto3
 
 HERE = Path(__file__).parent
+
+# api_key_config 来自 deployer/functions/（**不是** scripts/deploy_pool）——
+# 本脚本从 site-builder/mcp/ 执行，那个目录看不到 scripts/，`import deploy_pool`
+# 会在任何 AWS 调用之前 ModuleNotFoundError（Codex 审查 2026-08-11 P1-3 实测）。
+# 形态照 deploy_pool.py 里 `HERE.parent / "auth"` 那条既有做法。
+sys.path.insert(0, str(HERE.parent / "deployer" / "functions"))
+from api_key_config import ON_BEHALF_HEADER, api_key_enabled  # noqa: E402
+
 CFG = configparser.ConfigParser()
 CFG.read(HERE.parent / "config.ini")
+
+# 容器里读同名变量的实现在 server.py（那里有一份小写的头名镜像与同名常量，
+# 由 mcp/tests/test_component_gate.py 的 real-value 断言绑定）。
+MACHINE_CLIENT_ID_ENV = "MACHINE_CLIENT_ID"
 
 ACCOUNT = CFG["Platform"]["account_id"]
 REGION = CFG["Platform"]["region"]
@@ -428,23 +443,68 @@ def ensure_role() -> str:
     return arn
 
 
-def _require_email_verified_cfg() -> str:
+def _require_email_verified_cfg(cfg) -> str:
     """config.ini [IdP] require_email_verified → runtime 环境变量字符串。
 
     与 auth/deploy_auth.py 的同名函数保持一致：默认 "true"，只有显式
     写成 false 才关闭（拼错一律当 true——安全开关不做静默降级）。
     """
-    raw = CFG["IdP"].get("require_email_verified", "") if CFG.has_section("IdP") else ""
+    raw = cfg["IdP"].get("require_email_verified", "") if cfg.has_section("IdP") else ""
     head = raw.split("#")[0].split(";")[0].strip().lower()
     return "false" if head == "false" else "true"
 
 
-def _discovery_url() -> str:
-    pool = CFG["Cognito"]["user_pool_id"]
+def _discovery_url(cfg) -> str:
+    pool = cfg["Cognito"]["user_pool_id"]
     if not pool:
         sys.exit("config.ini [Cognito] user_pool_id 为空——先完成 DEPLOY.md ① 身份层")
-    return (f"https://cognito-idp.{REGION}.amazonaws.com/{pool}"
+    return (f"https://cognito-idp.{cfg['Platform']['region']}.amazonaws.com/{pool}"
             f"/.well-known/openid-configuration")
+
+
+def machine_client_id(cfg) -> str:
+    """key-proxy 用的 machine client id；**没配 [ApiKey] 段时返回 ""**。
+
+    这是三道组件门禁的**共同派生点**：allowedClients、requestHeaderAllowlist、
+    容器的 MACHINE_CLIENT_ID 都从这一个函数的返回值推出来。三处各自判一次
+    "有没有 [ApiKey] 段"就会漂移，而漂移的那一半正好是最难排查的状态——
+    网关放行、容器拒绝，症状是 HTTP 200 加一句业务错误文案。
+
+    **段存在但值为空必须中止，不能静默跳过**：静默跳过会得到"以为部署了
+    API Key 其实网关不认"的状态，而排查方向会指向 server 端（那里什么都没错）。
+    """
+    if not api_key_enabled(cfg):
+        return ""
+    mid = cfg["Cognito"].get("machine_client_id", "").split("#")[0].strip()
+    if not mid:
+        sys.exit("[ApiKey] 段存在但 [Cognito] machine_client_id 为空——"
+                 "先跑 deploy_pool.py 建 machine client 并回填 config.ini")
+    return mid
+
+
+def allowed_clients(cfg) -> list[str]:
+    """authorizer 的 allowedClients。**这是组件门禁的第一层**（spec §5.1.1）。
+
+    无 [ApiKey] 段时 machine client 不在此列 → 机器 token 在**网关层**就被拒，
+    不经过我们任何代码。spike 已实证这条链 fail-closed。
+    """
+    out = [cfg["Cognito"]["mcp_client_id"]]
+    mid = machine_client_id(cfg)
+    if mid:
+        out.append(mid)
+    return out
+
+
+def request_header_allowlist(cfg) -> list[str]:
+    """透传给容器的头。Authorization 恒在（少了它所有工具当场失效）。
+
+    on-behalf 头是组件门禁的第二层：没配 [ApiKey] 段时它不在 allowlist 里，
+    平台会把头丢掉——即使有人绕过第一层拿到了机器 token，容器也收不到身份。
+    """
+    out = ["Authorization"]
+    if machine_client_id(cfg):
+        out.append(ON_BEHALF_HEADER)
+    return out
 
 
 def _find_runtime() -> str | None:
@@ -460,15 +520,22 @@ def _find_runtime() -> str | None:
             return None
 
 
-def deploy_runtime(image_uri: str, role_arn: str) -> dict:
-    client_id = CFG["Cognito"]["mcp_client_id"]
+def runtime_kwargs(cfg, image_uri: str, role_arn: str) -> dict:
+    """create/update_agent_runtime 的公共参数——**纯函数，只从 cfg 派生**。
+
+    抽出来是为了让"三道组件门禁同开同关"可单测：allowedClients 来自网关配置、
+    MACHINE_CLIENT_ID 来自容器环境，两者写在不同的地方，只有在同一个构造结果上
+    断言才能发现漂移（mcp/tests/test_component_gate.py 的当且仅当那条）。
+    """
+    client_id = cfg["Cognito"]["mcp_client_id"]
     if not client_id:
         sys.exit("config.ini [Cognito] mcp_client_id 为空——先完成 DEPLOY.md ①")
-    sm_arn = CFG["Deployer"]["state_machine_arn"]
+    sm_arn = cfg["Deployer"]["state_machine_arn"]
     if not sm_arn:
         sys.exit("config.ini [Deployer] state_machine_arn 为空——先完成 DEPLOY.md ④")
+    account, region = cfg["Platform"]["account_id"], cfg["Platform"]["region"]
 
-    common = dict(
+    return dict(
         agentRuntimeArtifact={"containerConfiguration": {"containerUri": image_uri}},
         roleArn=role_arn,
         networkConfiguration={"networkMode": "PUBLIC"},
@@ -478,29 +545,40 @@ def deploy_runtime(image_uri: str, role_arn: str) -> dict:
         # （"Claim 'client_id' value mismatch"）——不要改 allowedAudience。
         # email 靠 pre-token-generation Lambda 注入 access token
         # （auth/pre_token_email.py，见 AGENTCORE-SPIKE.md §7）。
+        # 名单第二项（machine client）由组件门禁决定，见 allowed_clients()。
         authorizerConfiguration={"customJWTAuthorizer": {
-            "discoveryUrl": _discovery_url(),
-            "allowedClients": [client_id]}},
+            "discoveryUrl": _discovery_url(cfg),
+            "allowedClients": allowed_clients(cfg)}},
         # Authorization 头不在 allowlist 里就不会到达容器，_caller_email() 必失败
-        requestHeaderConfiguration={"requestHeaderAllowlist": ["Authorization"]},
+        requestHeaderConfiguration={
+            "requestHeaderAllowlist": request_header_allowlist(cfg)},
         environmentVariables={
-            "JOBS_TABLE": CFG["Deployer"]["jobs_table"],
-            "SITES_TABLE": CFG["Deployer"]["sites_table"],
-            "ADMINS_TABLE": CFG["Deployer"]["admins_table"],
+            "JOBS_TABLE": cfg["Deployer"]["jobs_table"],
+            "SITES_TABLE": cfg["Deployer"]["sites_table"],
+            "ADMINS_TABLE": cfg["Deployer"]["admins_table"],
             # 权限投影的目标表（permissions.write_permissions 的第二个事务项）
-            "ROUTING_TABLE": CFG["Platform"]["routing_table"],
-            "TRUSTED_IDPS": CFG["IdP"]["provider_name"] if CFG.has_section("IdP") else "",
+            "ROUTING_TABLE": cfg["Platform"]["routing_table"],
+            "TRUSTED_IDPS": cfg["IdP"]["provider_name"] if cfg.has_section("IdP") else "",
             # 与 auth 服务同一个开关（两处语义必须一致）：email 是授权主键，
             # 而联邦 email 默认 unverified。默认 "true"，只有接入不发该 claim
             # 的 IdP 时才在 config.ini 设 false。
-            "REQUIRE_EMAIL_VERIFIED": _require_email_verified_cfg(),
-            "ARTIFACTS_BUCKET": f"site-artifacts-{ACCOUNT}",
+            "REQUIRE_EMAIL_VERIFIED": _require_email_verified_cfg(cfg),
+            # 组件门禁的第三层：有 [ApiKey] 段时下发 machine client id，否则空串
+            # （server 侧空值 = 拒绝全部 on-behalf 请求，与前两层同向 fail-closed）。
+            # **与 allowedClients 同一个派生点**（machine_client_id()）——分别写
+            # 就会漂移，而"网关放行、容器拒绝"是最难排查的那一半。
+            MACHINE_CLIENT_ID_ENV: machine_client_id(cfg),
+            "ARTIFACTS_BUCKET": f"site-artifacts-{account}",
             "STATE_MACHINE_ARN": sm_arn,
-            "BASE_DOMAIN": BASE_DOMAIN,
-            "ACCOUNT_ID": ACCOUNT,
-            "AWS_DEFAULT_REGION": REGION,
+            "BASE_DOMAIN": cfg["Platform"]["base_domain"],
+            "ACCOUNT_ID": account,
+            "AWS_DEFAULT_REGION": region,
         },
     )
+
+
+def deploy_runtime(image_uri: str, role_arn: str) -> dict:
+    common = runtime_kwargs(CFG, image_uri, role_arn)
 
     existing = _find_runtime()
     if existing:

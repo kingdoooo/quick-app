@@ -22,6 +22,46 @@ ENV = {"JOBS_TABLE": "site-deploy-jobs", "SITES_TABLE": "site-sites",
        "AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
 
 
+def make_token(claims: dict) -> str:
+    """伪造一个 JWT（只有 payload 有意义）。
+
+    网关已验过签名，`server._caller_email()` 只解 payload——所以单测不需要
+    真签名，但**必须是三段**（实现按 `.` 切成 3 段才解析）。
+    """
+    import base64
+    import json as _json
+
+    def b64(b: bytes) -> str:
+        return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+    return (b64(_json.dumps({"alg": "RS256"}).encode()) + "." +
+            b64(_json.dumps(claims).encode()) + ".sig")
+
+
+def with_auth(monkeypatch, token: str, **extra_headers: str):
+    """伪造 FastMCP 的请求上下文。
+
+    `extra_headers` 的键按 starlette 的行为**小写化**：真实请求里
+    `dict(request.headers)` 拿到的键全是小写，测试若给大写键，实现用小写取值
+    就会永远取不到——那会让"带头也拒"的用例以假通过的方式变绿。
+    """
+    import server
+
+    headers = {"authorization": f"Bearer {token}"}
+    headers.update({k.lower(): v for k, v in extra_headers.items()})
+
+    class _Req:
+        pass
+
+    _Req.headers = headers
+
+    class _Ctx:
+        class request_context:
+            request = _Req()
+
+    monkeypatch.setattr(server.mcp, "get_context", lambda: _Ctx())
+
+
 @pytest.fixture
 def aws(monkeypatch):
     for k, v in ENV.items():
