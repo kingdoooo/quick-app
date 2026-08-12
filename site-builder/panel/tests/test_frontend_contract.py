@@ -372,21 +372,12 @@ def test_every_api_path_exists_in_handler_routes():
             f"前端请求了 handler 没有的路由: {method} {path}")
 
 
-# 二期 M4 的 Key 路由（`GET/POST/DELETE /api/keys`、`GET/PUT /api/settings/api-key`
-# 共两个 pattern）：后端在 Task 6 落地，前端在 **Task 9** 接。
-#
-# **这期间豁免是唯一自洽的状态**，不是图省事：紧邻的
-# test_m4_m5_features_do_not_call_any_api 断言 app.js 里**不得出现** `/api/keys`
-# （M4 入口此刻必须是 disabled 占位），所以"让前端接上"会让那条红——两条守卫
-# 在 Task 6 这个时点互斥，只能靠豁免过渡。
-#
-# 代价是这两个 pattern 上"后端加了端点、前端漏接"的检测被临时关掉，所以下面
-# test_m4_key_routes_are_exempt_only_until_the_frontend_lands 盯着它：Task 9 一接
-# 前端，那条就会红并要求删掉本集合。**不要把它留成永久豁免。**
-M4_PENDING_FRONTEND = {
-    (r"^/api/keys$", "Task 9 接入前端后必须删除本豁免"),
-    (r"^/api/settings/api-key$", "Task 9 接入前端后必须删除本豁免"),
-}
+# 二期 M4 的 Key 路由（`GET/POST/DELETE /api/keys`、`GET/PUT /api/settings/api-key`）
+# 曾经在这里有一份 `M4_PENDING_FRONTEND` 临时豁免：Task 6 落了后端、前端还没接，
+# 而当时紧邻的"M4 入口不得发请求"那条守卫与"handler 的端点都要有人接"互斥。
+# **Task 9 接完前端后豁免已删除**（连同盯着它的那条用例），五条 Key 路由现在
+# 由下面的可达性核对正常覆盖。留这段注释是因为"临时豁免变永久"是本项目记录过
+# 的形态——它这次确实被收回了。
 
 
 def test_every_handler_route_is_reachable_or_explicitly_unused():
@@ -402,7 +393,7 @@ def test_every_handler_route_is_reachable_or_explicitly_unused():
         # 管理员手工修复口，控制台不暴露入口（spec §8：人工排障用）
         (r"^/api/admin/resync/(?P<site_id>[a-z][a-z0-9-]{1,63})$",
          "人工修复投影用，不做 UI 入口"),
-    } | M4_PENDING_FRONTEND
+    }
     exempt_patterns = {p for p, _ in exempt}
     calls = _frontend_calls()
     unreached = []
@@ -415,40 +406,20 @@ def test_every_handler_route_is_reachable_or_explicitly_unused():
         f"handler 有端点前端没接（漏接或该加豁免说明）: {unreached}")
 
 
-def test_m4_key_routes_are_exempt_only_until_the_frontend_lands():
-    """M4 的临时豁免必须**恰好**是那两个 pattern，且前端确实还没接。
+# ── ③ M5 必须是 disabled 占位，不得请求不存在的 API ────────────────────
 
-    没有这条时，一个"临时"豁免会永久留在文件里，而"后端加了端点、前端没接"的
-    检测就在那两条路由上永久失效——本项目记录过的"放宽一次就再没人回来收"形态。
-    Task 9 接完前端后本用例会红，提示把 M4_PENDING_FRONTEND 一起删掉。
-    """
-    import handler
-    patterns = {p for p, _ in M4_PENDING_FRONTEND}
-    assert patterns == {r"^/api/keys$", r"^/api/settings/api-key$"}, (
-        f"临时豁免的范围变了，必须逐条复核: {sorted(patterns)}")
-    # 豁免的 pattern 必须真在 ROUTES 里——写错字的豁免是个哑弹（既不生效，
-    # 也让人以为已经处理过了）
-    known = {rx.pattern for _, rx in handler.ROUTES}
-    assert patterns <= known, f"豁免了 ROUTES 里不存在的 pattern: {patterns - known}"
-    assert all(reason.strip() for _, reason in M4_PENDING_FRONTEND), "豁免缺理由"
-    for _, path in _frontend_calls():
-        assert not (path.startswith("/api/keys")
-                    or path.startswith("/api/settings/api-key")), (
-            f"前端已经接了 {path}——请删掉 M4_PENDING_FRONTEND 这个临时豁免，"
-            "让真正的可达性核对重新生效")
-
-
-# ── ③ M4/M5 必须是 disabled 占位，不得请求不存在的 API ─────────────────
-
-def test_m4_m5_features_do_not_call_any_api():
-    """M4（API Key）与 M5（analytics/visitors）不得发请求。
+def test_m5_features_do_not_call_any_api():
+    """M5（analytics/visitors）不得发请求。
 
     不只查几个猜出来的路径：把前端请求的全部路径与 handler 的真实路由集合
     做差集，任何"不在 handler 里"的 /api 路径都是假接口。
+
+    **M4 的 `/api/keys` 已经从禁用清单里移出**（Task 9 接了前端，端点真实存在）；
+    `/api/api-keys` 这个**拼错形态**留着——它不在 ROUTES 里，写成它会 404。
     """
     import handler
     blob = _js()          # 已剥注释：注释里写"不要请求 /api/analytics"不该变红
-    for forbidden in ("/api/keys", "/api/api-keys", "/api/analytics",
+    for forbidden in ("/api/api-keys", "/api/analytics",
                       "/api/visitors", "/api/stats", "/api/pv"):
         assert forbidden not in blob, f"前端请求了未实现的 {forbidden}"
     known = {rx.pattern for _, rx in handler.ROUTES}
@@ -457,17 +428,19 @@ def test_m4_m5_features_do_not_call_any_api():
             f"{path} 不在 handler 的 {len(known)} 条路由里")
 
 
-def test_m4_m5_entries_are_disabled_in_markup():
-    """入口要**看得见地** disabled，而不是悄悄删掉。
+def test_disabled_entries_are_visibly_disabled_in_markup():
+    """占位/未启用的入口要**看得见地** disabled，而不是悄悄删掉。
 
-    spec §4.1 要求显示"coming later"；只删掉入口的话用户不知道该功能规划中，
-    产品意图丢失。这里要求同时出现 disabled 语义与说明文案。
+    spec §4.1 要求显示"coming later"；只删掉入口的话用户不知道该功能的状态，
+    产品意图丢失。现在有两类：M5 的访问统计（规划中）与 API Key 组件**未部署**
+    时的入口（`features.api_key.deployed=false`）。两类都要求 disabled 语义
+    与说明文案同时出现。
     """
     blob = _markup_without_comments()
     assert "coming-later" in blob or "规划中" in blob, (
-        "看不到 M4/M5 的 coming-later 说明")
+        "看不到 coming-later / 规划中 的说明")
     assert "aria-disabled" in blob, (
-        "M4/M5 入口缺 aria-disabled —— 只靠视觉变灰对读屏用户等于没禁用")
+        "占位入口缺 aria-disabled —— 只靠视觉变灰对读屏用户等于没禁用")
 
 
 # ── ④ PHASE_LABEL 用真实小写 phase 词表 ────────────────────────────────
@@ -922,8 +895,10 @@ def test_all_interpolated_values_go_through_esc():
         # 误报。判据：片段里含 `?` 但没有对应的 `:`，或括号明显不平衡。
         if e.count("(") != e.count(")") or ("?" in e and ":" not in e):
             return False
-        # 只关心"读了某个对象的字段"这种形态——它才可能承载用户数据
-        return bool(re.search(r"\b(site|job|admins?|item|v|d|res|err|state)\."
+        # 只关心"读了某个对象的字段"这种形态——它才可能承载用户数据。
+        # `row` 是 Key 列表的行（M4）：备注名 `row.name` 是用户自己填的，
+        # 漏在这个清单外就等于新页面完全不在本条断言的覆盖面里。
+        return bool(re.search(r"\b(site|job|admins?|item|row|v|d|res|err|state)\."
                               r"[a-z_]", e))
 
     def builds_html(line: str) -> bool:
@@ -1063,3 +1038,361 @@ def test_polling_does_not_report_success_on_purge_failed():
     assert ok_branch, "找不到成功分支的条件"
     assert "PURGE_FAILED" not in ok_branch.group(1), (
         "PURGE_FAILED 被并进了成功分支")
+
+
+# ── ⑫ API Key 页面（二期 M4，Task 9）────────────────────────────────────
+#
+# 这一组的每条都绑到**本功能特有**的东西上（M3-FINDINGS §2.17：绑 setTimeout /
+# application/json 这类通用字样的断言删掉实现照样绿）。行为面（三态渲染、零请求、
+# 转义）在 test_frontend_boot.py，线上通不通在 Task 11 的真机脚本，三层不可互相
+# 替代。
+
+def _fn_body(name: str, blob: str | None = None) -> str:
+    """按大括号配平取出一个函数的**完整函数体**（字符串字面量不参与配平）。
+
+    为什么不用本文件既有的 `function X\\([^)]*\\)\\s*\\{(.*?)\\n\\}`：那条靠"行首
+    右花括号"收尾，遇到内嵌函数（pageKeys 里有两个内嵌 async 函数）会在第一个
+    行首 `}` 处**提前截断**，于是所有断言只看了函数的前半段——看起来在查，
+    实际查不到后半段里的东西。这正是"假绿"的一种。
+    """
+    src = _js() if blob is None else blob
+    m = re.search(r"(?:async\s+)?function\s+" + re.escape(name) + r"\s*\([^)]*\)\s*\{",
+                  src)
+    assert m, f"找不到函数 {name}() —— 实现改名了？本组断言会全部失效"
+    i, depth, quote, out = m.end(), 1, "", []
+    while i < len(src) and depth:
+        ch = src[i]
+        if quote:
+            if ch == "\\":
+                out.append(src[i:i + 2])
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+        elif ch in "'\"`":
+            quote = ch
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if not depth:
+                break
+        out.append(ch)
+        i += 1
+    assert depth == 0, f"{name}() 的花括号没有配平——提取器坏了"
+    return "".join(out)
+
+
+def test_function_body_extractor_stops_at_the_matching_brace():
+    """提取器自身的验证：不能在内嵌 `}` 处提前收尾，也不能溢出到下一个函数。
+
+    两个方向都要证（M3-FINDINGS §2.11：一个只会说 clean 的检测器比没有更糟）。
+    """
+    src = ('function a() {\n  const o = { x: 1 };\n'
+           '  function inner() { return "}"; }\n  return o;\n}\n'
+           'function b() { return 2; }\n')
+    body = _fn_body("a", src)
+    assert "inner" in body and "return o;" in body, "在内嵌花括号处提前截断了"
+    assert "return 2" not in body, "溢出到了下一个函数里"
+
+
+def _keys_blob() -> str:
+    """Key 页面全部函数体拼一起（作用域内查找用，避免与站点页的同名变量串味）。"""
+    blob = _js()
+    return "\n".join(_fn_body(n, blob) for n in
+                     ("pageKeys", "keyRow", "keySwitchCard", "showNewKey",
+                      "keysUndeployedCard", "apiKeyFeature"))
+
+
+def test_api_key_feature_has_exactly_one_derivation_and_fails_closed():
+    """`features.api_key` 只能有**一处**读法，且缺字段一律按 false。
+
+    两处读法必然漂移，而这个不变量的漂移方向恰好是"某一处把 undefined 当成了
+    开着"。`=== true` 而不是真值判断：后端换形态（比如给回字符串）时展示层
+    宁可少给入口。
+    """
+    blob = _js()
+    body = _fn_body("apiKeyFeature", blob)
+    outside = blob.replace(body, "")
+    assert ".features" not in outside, (
+        "apiKeyFeature() 之外还有地方直接读 state.me.features —— "
+        "这个判定必须只有一处（本仓库栽过几次「同一不变量被手抄多份」）")
+    assert body.count("=== true") == 2, (
+        "deployed / enabled 必须各自 `=== true` 判定（缺字段按 false），"
+        f"实际只找到 {body.count('=== true')} 处")
+
+
+def test_key_page_is_gated_on_deployed_never_on_enabled():
+    """门禁判据是 `deployed`。用 `enabled` 做门禁 = **部署自锁**（Codex P1-5）。
+
+    首次部署把哨兵行建成 `enabled=false`，此时若页面 disabled 且零请求，
+    管理员就没有任何地方能把闸开回来。所以：`enabled` 不得出现在"第一个请求
+    之前"的那段代码里。
+    """
+    body = _fn_body("pageKeys")
+    first_call = min([body.index(t) for t in ("apiGet(", "api(") if t in body],
+                     default=-1)
+    assert first_call > 0, "pageKeys 里找不到任何请求 —— 页面还是占位的？"
+    head = body[:first_call]
+    assert re.search(r"if\s*\(!feat\.deployed\)\s*\{[^{}]*return", head, re.S), (
+        "pageKeys 的开头没有「未部署就直接返回」的守卫")
+    assert "enabled" not in head, (
+        "请求之前就读了 enabled —— 这是把关闸当成未部署的形态，"
+        "管理员会无处开闸（部署自锁）")
+
+
+def test_nav_entry_is_gated_on_deployed_and_stays_visible_when_undeployed():
+    """导航项同样按 deployed 分流；未部署时是**看得见的** disabled，不是删掉。"""
+    body = _fn_body("renderNav")
+    assert re.search(r"\.deployed", body), "导航没有按 deployed 分流"
+    assert "enabled" not in body, (
+        "导航读了 enabled —— 关闸时入口会消失，管理员进不去开关页面")
+    assert "aria-disabled" in body, "未部署态的导航项缺 aria-disabled"
+    assert re.search(r"""item\(\s*['"]#/keys['"]""", body), (
+        "已部署时导航项必须是真链接（走 item()），否则页面进不去")
+
+
+def test_keys_page_requests_nothing_when_component_is_not_deployed():
+    """静态侧的"零请求"：守卫在**任何**请求之前，且守卫分支自己也不发请求。
+
+    行为侧由 test_frontend_boot 的 keys-admin-undeployed 场景真跑一遍
+    （间谍 fetch）。两条都要：静态的能指出是哪一行，行为的不依赖解析器正确。
+
+    **第二段是反向验证逼出来的**：第一版只比"守卫的位置早于第一个请求"，于是
+    把一次 `await apiGet('/api/keys')` 塞进守卫**分支内部**之后本用例仍然是绿的
+    （只有 boot 那条真跑的用例红了）。这正是"守卫只覆盖了它自己设想的那个世界"
+    ——顺序对了不等于那条分支干净。
+    """
+    body = _fn_body("pageKeys")
+    anchor = "if (!feat.deployed) {"
+    assert anchor in body, (
+        f"pageKeys 里找不到 {anchor!r} —— 门禁形态变了，本用例的两段都失效")
+    guard = body.index(anchor)
+    for token in ("apiGet(", "api("):
+        if token in body:
+            assert body.index(token) > guard, (
+                f"{token} 出现在 deployed 守卫之前 —— 未部署时也会打接口")
+    # 守卫分支自身（到配平的右花括号为止）不得出现任何请求
+    i, depth = body.index("{", guard), 0
+    branch = []
+    while i < len(body):
+        branch.append(body[i])
+        if body[i] == "{":
+            depth += 1
+        elif body[i] == "}":
+            depth -= 1
+            if not depth:
+                break
+        i += 1
+    assert depth == 0, "守卫分支的花括号没配平"
+    inner = "".join(branch)
+    for token in ("apiGet(", "api(", "fetch("):
+        assert token not in inner, (
+            f"未部署的分支里有 {token} —— 组件没部署时那些端点可能 404/500，"
+            f"请求它们只会把「平台没启用」翻译成一串看不懂的错误。分支: {inner!r}")
+    # 未部署那张卡片是纯静态的（它渲染的是说明，不是数据）
+    undeployed = _fn_body("keysUndeployedCard")
+    assert "api" not in undeployed.replace("API Key", ""), (
+        "未部署卡片里出现了请求")
+
+
+def test_revoke_sends_key_id_and_never_the_plaintext():
+    """吊销的请求体**只带 `key_id`**。
+
+    带明文等于把一个凭证放进请求体，沿途每一层日志都可能留下它；而 key_id 是
+    刻意设计成"非秘密标识符"的（keygen 的注释）。
+    """
+    blob = _js()
+    m = re.search(r"""api\(\s*['"]DELETE['"]\s*,\s*['"]/api/keys['"]\s*,\s*\{([^}]*)\}""",
+                  blob)
+    assert m, "找不到 DELETE /api/keys 的调用 —— 吊销没接上？"
+    fields = set(re.findall(r"([a-z_]+)\s*:", m.group(1)))
+    assert fields == {"key_id"}, (
+        f"吊销请求体的字段是 {sorted(fields)}，必须**恰好**是 key_id")
+    assert "plaintext" not in m.group(1), "吊销请求体里带了明文"
+
+
+def test_create_shows_the_plaintext_once_with_a_will_not_show_again_warning():
+    """创建结果里明文**完整显示一次** + 复制按钮 + "不再显示"警告。
+
+    警告绑到一个常量上（而不是随手写在模板里）：这句话是这个功能的**契约**
+    ——服务端只在创建响应里给一次明文，用户没抄下来就只能吊销重发。
+    """
+    blob = _js()
+    warn = re.search(r"const\s+(KEY_[A-Z_]+)\s*=\s*'([^']*不再显示[^']*)'", blob)
+    assert warn, "找不到含「不再显示」文案的常量 —— 用户不知道这是唯一一次"
+    body = _fn_body("showNewKey", blob)
+    assert warn.group(1) in body, (
+        f"{warn.group(1)} 定义了但没用在明文展示区")
+    assert re.search(r"esc\(\s*row\.plaintext\s*\)", body), (
+        "明文没过 esc() 就进 innerHTML（明文是 base62，但形态一变就是注入点）")
+    assert re.search(r"clipboard\.writeText\(\s*row\.plaintext\s*\)", body), (
+        "明文展示区没有复制按钮 —— 手抄 19 个字符是错误率最高的一步")
+
+
+def test_the_list_path_never_touches_the_plaintext():
+    """列表渲染**不碰** plaintext：GET 根本不返回它（api._shape_key 的白名单）。
+
+    列表里读一个永远 undefined 的字段，症状是页面显示 "undefined"，而更糟的
+    版本是有人为了"让列表也能看 Key"去后端把明文加进 `_shape_key`。
+    """
+    for fn in ("keyRow", "pageKeys"):
+        assert "plaintext" not in _fn_body(fn), (
+            f"{fn}() 里出现了 plaintext —— 明文只在创建响应里存在一次")
+
+
+def test_plaintext_is_never_persisted_and_never_put_in_a_url():
+    """明文不进 localStorage / sessionStorage / URL。
+
+    做法是**白名单**而不是"查 plaintext 有没有出现在 setItem 旁边"：后者被
+    一个中间变量（`const pt = res.plaintext; sessionStorage.setItem(k, pt)`）
+    就绕过了。把全部持久化点与全部 URL 写入点逐个列举，新增任何一处都会红，
+    必须由人解释——这才是"这一类"缺陷的守卫（不是打地鼠）。
+    """
+    blob = _js()
+    stored = {k.strip() for _, k in
+              re.findall(r"(localStorage|sessionStorage)\.setItem\(\s*([^,]+),", blob)}
+    assert stored == {"UPGRADE_MARK", "UPGRADE_ONCE", "UPGRADE_BACK"}, (
+        f"持久化的键变了: {sorted(stored)} —— 只允许面板会话升级用的那三个常量。"
+        "新增一处请在这里说明它存的是什么，并确认不含任何凭证")
+    # 白名单只盖住了 setItem 这一条路。`localStorage['k'] = v` 与
+    # `localStorage.k = v` 同样能落盘，而且上面那条完全看不见它们
+    # （反向验证时确认过：注入 `localStorage['sb_last_key'] = row.plaintext`
+    # 时白名单与下面的语句扫描**都**是绿的）。所以这里把访问形态也钉住。
+    assert not re.search(r"(localStorage|sessionStorage)\s*\[", blob), (
+        "用下标写 storage —— 绕过了本用例的键白名单，请改成 setItem 并登记键名")
+    methods = set(re.findall(r"(?:localStorage|sessionStorage)\.(\w+)", blob))
+    assert methods <= {"getItem", "setItem", "removeItem"}, (
+        f"storage 上出现了别的访问形态: {sorted(methods - {'getItem', 'setItem', 'removeItem'})}"
+        " —— 属性赋值同样会落盘，且不受键白名单约束")
+    urls = {u.rstrip(") ;").strip() for u in re.findall(
+        r"location\.(?:hash\s*=|href\s*=|assign\(|replace\()\s*([^;\n]*)", blob)}
+    assert urls == {"hash", "back", "authOrigin() + '/console-session'",
+                    "authOrigin() + '/logout'"}, (
+        f"写入地址栏的表达式变了: {sorted(urls)} —— URL 会进浏览器历史、"
+        "Referer 与代理日志，任何凭证都不能出现在这里")
+    # 直指具体错法的一条（白名单已经能兜住，这条给出可读的失败原因）
+    for stmt in re.split(r"[;\n]", blob):
+        if "plaintext" not in stmt:
+            continue
+        assert not re.search(r"setItem|location\.|history\.|\bgo\(", stmt), (
+            f"明文进了存储或地址栏: {stmt.strip()!r}")
+
+
+def test_admin_switch_is_rendered_only_for_admins():
+    """开关 UI 只在 `state.me.is_admin` 时渲染，admin 专属端点也只有 admin 请求。
+
+    后端 `_require_admin` 会拒，所以这不是安全边界；但一个**看得见却一点就
+    403** 的开关是照着来的 bug 报告，而且它会让非管理员以为自己能关闸。
+    """
+    blob = _js()
+    card = _fn_body("keySwitchCard", blob)
+    outside = blob.replace(card, "")
+    # 区分**产出标记**（`id="sw-apikey"`）与**选取元素**（`#sw-apikey`）：
+    # 绑定与写入路径当然要选它，那不是第二个渲染点。第一版没分清，于是被
+    # `$('#sw-apikey')` 判红——假红要修断言而不是放宽它（M3-FINDINGS §2.16）。
+    assert 'id="sw-apikey"' in card, "keySwitchCard() 没有产出开关控件"
+    assert 'id="sw-apikey"' not in outside, (
+        "开关控件的标记出现在 keySwitchCard() 之外 —— 它必须只有一个产出点，"
+        "否则「只对 admin 渲染」这个判据要在多处各写一遍")
+    assert re.search(r"state\.me\.is_admin\s*\?\s*keySwitchCard\(", blob), (
+        "keySwitchCard() 的调用点没有被 state.me.is_admin 守住")
+    page = _fn_body("pageKeys", blob)
+    assert re.search(r"if\s*\(state\.me\.is_admin\)\s*\{[^}]*?"
+                     r"/api/settings/api-key", page, re.S), (
+        "GET /api/settings/api-key 不在 is_admin 分支里 —— 普通用户会吃一个 403")
+
+
+def test_switch_note_says_closing_the_gate_kills_every_key_immediately():
+    """开关旁必须写明"关闸后所有 Key 立即失效"（spec §4.3 第 4 条）。
+
+    这是**平台级**动作：闸门在网关，关掉之后已经发出去的 Key 全部 401。
+    管理员点它之前必须知道影响面不只是"新建的 Key"。
+    """
+    blob = _js()
+    m = re.search(r"const\s+(KEY_[A-Z_]+)\s*=\s*'([^']*立即失效[^']*)'", blob)
+    assert m, "找不到含「立即失效」的说明常量"
+    card = _fn_body("keySwitchCard", blob)
+    assert m.group(1) in card, f"{m.group(1)} 定义了但没显示在开关旁边"
+    # 写入路径上必须有二次确认：一次误点让全平台的 Key 立刻不可用
+    write = _fn_body("setKeySwitch", blob)
+    assert re.search(r"window\.confirm|openModal\(", write), (
+        "关闸没有二次确认 —— 一次误点会让全平台的 Key 立刻不可用")
+
+
+def test_switch_write_sends_a_real_json_boolean():
+    """`PUT /api/settings/api-key` 的 `enabled` 必须是真布尔。
+
+    后端 `keystore.set_switch` 对 `"false"` / `0` / `null` 一律 400，正是因为
+    `bool("false") is True` 这个陷阱（提交 `44aef8d` 的 P1-2）。前端别去试探它：
+    发字符串会得到一个 400，而发 `"false"` 在任何放宽了的后端上都意味着"以为
+    关了其实开着"。
+    """
+    blob = _js()
+    m = re.search(r"""api\(\s*['"]PUT['"]\s*,\s*['"]/api/settings/api-key['"]\s*,\s*\{([^}]*)\}""",
+                  blob)
+    assert m, "找不到 PUT /api/settings/api-key 的调用"
+    arg = m.group(1)
+    assert re.search(r"enabled\s*:\s*(!|next\b|true\b|false\b|Boolean\()", arg), (
+        f"enabled 的取值形态可疑（必须是布尔表达式）: {arg.strip()!r}")
+    assert not re.search(r"""enabled\s*:\s*['"]""", arg), (
+        "enabled 发的是字符串 —— 后端 400，且这正是「以为关了其实开着」的形态")
+    assert "String(" not in arg, "enabled 被 String() 包了"
+
+
+def _shape_key_fields() -> set[str]:
+    """从 api.py 的 `_shape_key` 解析它真实返回的字段（同 _shape_site 的做法）。"""
+    src = (PANEL / "api.py").read_text()
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "_shape_key")
+    fields = {k.value for node in ast.walk(fn) if isinstance(node, ast.Dict)
+              for k in node.keys
+              if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+    assert fields, "解析 _shape_key 失败"
+    return fields
+
+
+def test_frontend_reads_exactly_the_key_fields_the_backend_returns():
+    """Key 的字段口径钉在 `_shape_key` 上：不多读（显示 undefined），不少读。
+
+    "不少读"是功能要求的另一半（spec §4.3 第 4 条：备注名 / 前缀 / 创建时间 /
+    最后使用 / 状态）——少一列就是用户分不清哪把 Key 该吊销。
+    """
+    backend = _shape_key_fields()
+    used = set(re.findall(r"\brow\.([a-z_][a-z0-9_]*)", _keys_blob()))
+    unknown = used - backend - {"plaintext"}
+    assert not unknown, (
+        f"前端读了 _shape_key 不返回的字段: {sorted(unknown)}（后端: {sorted(backend)}）")
+    for must in ("name", "prefix", "created_at", "last_used_at", "revoked",
+                 "key_id"):
+        assert must in used, (
+            f"列表没有用到 {must} —— 五列信息缺一列，用户分不清该吊销哪把")
+
+
+def test_key_name_limit_matches_keystore_name_max():
+    """前端的备注长度上限必须等于 `keystore.NAME_MAX`。
+
+    前端放得更宽 → 用户填完才拿到 400（他刚想好的名字被吞掉）；前端更严 →
+    平台能力被前端悄悄削掉。两侧都不该手抄一个数字，所以这里从真源核对。
+    """
+    src = (REPO / "site-builder" / "deployer" / "functions" / "keystore.py").read_text()
+    m = re.search(r"^NAME_MAX = (\d+)", src, re.M)
+    assert m, "keystore.py 里找不到 NAME_MAX"
+    fe = re.search(r"const\s+KEY_NAME_MAX\s*=\s*(\d+)", _js())
+    assert fe, "前端没有 KEY_NAME_MAX 常量"
+    assert fe.group(1) == m.group(1), (
+        f"前端上限 {fe.group(1)} ≠ keystore.NAME_MAX {m.group(1)}")
+
+
+def test_globally_disabled_banner_text_exists_and_is_not_a_gate():
+    """关闸提示是一句**说明**，不是门禁：它不得出现在任何 return / disabled 判据里。"""
+    blob = _js()
+    m = re.search(r"const\s+(KEY_[A-Z_]+)\s*=\s*'([^']*已被管理员全局关闸[^']*)'",
+                  blob)
+    assert m, "找不到「已被管理员全局关闸」的提示常量"
+    page = _fn_body("pageKeys", blob)
+    assert m.group(1) in page or m.group(1) in _keys_blob(), (
+        f"{m.group(1)} 定义了但没有任何地方显示它")
+    assert not re.search(r"if\s*\([^)]*\benabled\b[^)]*\)\s*\{[^{}]*return",
+                         _keys_blob(), re.S), (
+        "有以 enabled 为条件的提前返回 —— 关闸不该让页面不可用")

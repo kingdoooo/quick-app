@@ -17,7 +17,8 @@
  * 用法：node boot_harness.js <app.js 路径> <场景名>
  *   场景 first-visit  —— 首次进入（sessionStorage 空）
  *   场景 came-back    —— 从 /console-session 升级跳转回来
- * 输出：一行 JSON（fetched / errors / hash_after / assigned）
+ *   场景 keys-*       —— API Key 页面的 features.api_key 三态（见 KEY_SCENARIOS）
+ * 输出：一行 JSON（fetched / errors / hash_after / assigned / html）
  * 退出码：0 = 取到身份且无异常；3 = 否
  */
 const fs = require('fs');
@@ -29,6 +30,12 @@ const fetched = [];
 const errors = [];
 const assigned = [];
 const hashListeners = [];
+/* 每一次 innerHTML 赋值都记下来。
+ * 为什么需要：Key 页面的"三态"里有两态的判据是**渲染出了什么**
+ * （关闸时创建按钮不能是 disabled、admin 必须看到开关），而 fetched 只能证明
+ * "发过请求"。DOM stub 每次 querySelector 都返回**新的** Proxy，所以事后从
+ * 元素上读不回来，只能在赋值那一刻录。 */
+const htmlWrites = [];
 
 function stubEl() {
   return new Proxy({}, {
@@ -47,7 +54,11 @@ function stubEl() {
       if (k === 'querySelectorAll') return () => [];
       return t[k];
     },
-    set(t, k, v) { t[k] = v; return true; },
+    set(t, k, v) {
+      if (k === 'innerHTML') htmlWrites.push(String(v));
+      t[k] = v;
+      return true;
+    },
   });
 }
 
@@ -64,6 +75,42 @@ const sessionSeed = SCENARIO === 'came-back'
              ['sb_console_upgrade_retried', '1']])
   : new Map();
 
+/* ── Key 页面的三态场景 ──────────────────────────────────────────────
+ *
+ * `features.api_key` 是**两个字段**（deployed / enabled），门禁只能看 deployed。
+ * 按单布尔实现时"已部署但关闸"这一格会零请求 + 空页面，管理员无处开闸——
+ * 静态断言看不出这个（代码里 `enabled` 与 `deployed` 都在），必须真跑一遍。
+ * is_admin 也要能单独设：开关控件只对 admin 渲染，且 GET /api/settings/api-key
+ * 对非 admin 是 403，不该被请求。 */
+const KEY_SCENARIOS = {
+  'keys-admin-live': { admin: true, api_key: { deployed: true, enabled: true } },
+  'keys-admin-gated': { admin: true, api_key: { deployed: true, enabled: false } },
+  'keys-admin-undeployed': { admin: true, api_key: { deployed: false, enabled: false } },
+  'keys-user-live': { admin: false, api_key: { deployed: true, enabled: true } },
+  'keys-user-gated': { admin: false, api_key: { deployed: true, enabled: false } },
+};
+const KEYCASE = KEY_SCENARIOS[SCENARIO] || null;
+
+/* Key 场景要直接落在 #/keys 上，且不能被"先去升级面板会话"截住——
+ * 所以预置一个**新鲜的**升级标记。键名必须是 app.js 的 UPGRADE_MARK
+ * （`sb_console_upgraded_at`）：写错的话 boot 会跳去 /console-session 然后
+ * return，场景退化成 first-visit，全部 Key 用例静默空转。 */
+const localSeed = KEYCASE
+  ? new Map([['sb_console_upgraded_at', String(Date.now())]])
+  : new Map();
+
+/* 一个**含 HTML 元字符的备注名**：Key 的 name 是用户自己填的，漏一处 esc()
+ * 就是控制台里的存储型 XSS（在这里执行脚本能改权限）。静态扫描按顶层 `+`
+ * 切分能查大多数形态，但真跑一遍是唯一不依赖扫描器正确性的证据。 */
+const HOSTILE_NAME = '<img src=x onerror=alert(1)>';
+const KEY_ROWS = [
+  { key_id: 'ab12cd34', name: HOSTILE_NAME, prefix: 'sk-a1b2',
+    created_at: '2026-08-12T03:04:05', last_used_at: '', revoked: false },
+  { key_id: 'ef56gh78', name: '旧的那把', prefix: 'sk-z9y8',
+    created_at: '2026-08-01T00:00:00', last_used_at: '2026-08-11T09:00:00',
+    revoked: true },
+];
+
 global.document = {
   querySelector: () => stubEl(),
   querySelectorAll: () => [],
@@ -73,12 +120,12 @@ global.document = {
 };
 global.window = global;
 global.navigator = { clipboard: null };
-global.localStorage = store(new Map());
+global.localStorage = store(localSeed);
 global.sessionStorage = store(sessionSeed);
 global.confirm = () => true;
 
 const loc = {
-  _hash: '',
+  _hash: KEYCASE ? '#/keys' : '',
   hostname: 'console.app.example.com',
   protocol: 'https:',
   origin: 'https://console.app.example.com',
@@ -114,14 +161,29 @@ global.addEventListener = (evt, fn) => {
   if (evt === 'hashchange') hashListeners.push(fn);
 };
 
+/* 按路径给不同的响应体。**Key 场景必须这样**：一份固定响应体没法同时表达
+ * "/api/me 的 features 是这一格"与"/api/keys 返回哪些行"，而 features 正是被测
+ * 判据本身。非 Key 场景保持原来的那份形态（既有用例依赖它）。 */
+function responseFor(u) {
+  if (u.includes('/api/me')) {
+    return { email: 'probe@example.com', name: 'P',
+             is_admin: !!(KEYCASE && KEYCASE.admin),
+             features: { api_key: KEYCASE
+               ? KEYCASE.api_key : { deployed: false, enabled: false } },
+             sites: [], jobs: [], admins: [] };
+  }
+  if (u.includes('/api/settings/api-key')) {
+    return KEYCASE ? KEYCASE.api_key : { deployed: false, enabled: false };
+  }
+  if (u.includes('/api/keys')) return { keys: KEY_ROWS };
+  return { email: 'probe@example.com', name: 'P',
+           is_admin: false, sites: [], jobs: [], admins: [] };
+}
+
 global.fetch = async (url) => {
-  fetched.push(String(url));
-  return {
-    ok: true,
-    status: 200,
-    json: async () => ({ email: 'probe@example.com', name: 'P',
-                         is_admin: false, sites: [], jobs: [], admins: [] }),
-  };
+  const u = String(url);
+  fetched.push(u);
+  return { ok: true, status: 200, json: async () => responseFor(u) };
 };
 
 process.on('unhandledRejection', (e) => {
@@ -173,6 +235,13 @@ setTimeout(() => {
   console.log(JSON.stringify({
     scenario: SCENARIO, fetched_me: askedMe, fetched,
     hash_after: loc._hash, assigned, errors,
+    html: htmlWrites.join('\n'),
+    /* 明文只应活在创建响应的那个闭包里。这两份是"有没有被存起来"的证据面
+     * ——harness 里没有点击，所以创建流程不会跑，这两个断言在**本文件**只能
+     * 证明启动路径没写；真正盯住明文的是 test_frontend_contract 的白名单
+     * （所有 setItem 调用点逐个列举）。分工写在这里以免有人以为已经覆盖了。 */
+    local_storage: Object.fromEntries(localSeed),
+    session_storage: Object.fromEntries(sessionSeed),
   }));
   process.exit(askedMe && errors.length === 0 ? 0 : 3);
 }, 250);

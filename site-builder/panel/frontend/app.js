@@ -434,11 +434,20 @@ function renderNav() {
     ICON[key] + '<span>' + esc(label) + '</span></a>';
 
   let html = item('#/sites', 'sites', '我的站点', p === 'sites' || p === 'site');
-  /* M4（API Key）：**disabled 占位，不请求任何接口**。
-   * 用 aria-disabled 而不是删掉入口——删掉的话用户不知道这个能力在规划中。 */
-  html += '<span class="nav-item is-disabled coming-later" aria-disabled="true" ' +
-    'title="规划中：M4 提供给不支持 OAuth 的客户端">' + ICON.key +
-    '<span>API Key</span><span class="tag" style="margin-left:auto">规划中</span></span>';
+  /* API Key（M4）：组件部署了才给真入口。
+   *
+   * 判据**只能是 deployed**：按 enabled 的话，管理员一关闸入口就消失，他再也
+   * 找不到开关页面（见 apiKeyFeature 的注释——这是部署自锁的另一半）。
+   * 未部署时保留一个**看得见的** disabled 项而不是删掉它：删掉的话用户既不
+   * 知道平台有这个能力，也不知道为什么自己没有。 */
+  const keyFeat = apiKeyFeature();
+  if (keyFeat.deployed) {
+    html += item('#/keys', 'key', 'API Key', p === 'keys');
+  } else {
+    html += '<span class="nav-item is-disabled coming-later" aria-disabled="true" ' +
+      'title="平台尚未启用 API Key 组件">' + ICON.key +
+      '<span>API Key</span><span class="tag" style="margin-left:auto">未启用</span></span>';
+  }
   if (state.me && state.me.is_admin) {
     html += '<div class="nav-label">平台管理</div>';
     html += item('#/admin', 'shield', '全局管理', p === 'admin');
@@ -1312,21 +1321,352 @@ function pollUndeploy(siteId, jobId, tries) {
   }, POLL_INTERVAL_MS);
 }
 
-/* ══ 页面 3：API Key（M4 占位，不发请求）═════════════════════════════ */
+/* ══ 页面 3：API Key（M4）════════════════════════════════════════════
+ *
+ * 给"只能配静态 Header"的客户端用（支持 OAuth 的客户端不需要 Key）。接的是
+ * Task 6 的五个端点：`GET/POST/DELETE /api/keys` 与
+ * `GET/PUT /api/settings/api-key`（后两个 admin-only）。
+ *
+ * ── 明文的生命周期（这一段是本页最要紧的约束）─────────────────────────
+ * 明文只在 `POST /api/keys` 的响应里出现**一次**：库里存的是哈希，列表接口的
+ * 白名单（api._shape_key）不含它，服务端**没有第二次给它的通道**。所以前端
+ * 拿到它之后只做两件事：塞进弹窗的 DOM、按需写进剪贴板。它**不进 state**
+ * （下一次渲染会把它带到别的页面上）、**不进 localStorage/sessionStorage**
+ * （等于把一个不会过期的凭证留在磁盘上）、**不进地址栏**（URL 会落进浏览器
+ * 历史、Referer 与各级代理日志）。
+ * tests/test_frontend_contract.py 用"持久化点与地址栏写入点**全量白名单**"
+ * 锁这条——而不是"查 plaintext 附近有没有 setItem"：后者被一个中间变量
+ * （`const pt = res.plaintext`）就绕过去了。
+ */
 
-function pageKeys() {
+/* 与 keystore.NAME_MAX 一致。前端更宽 → 用户填完才吃一个 400；前端更严 →
+ * 悄悄削掉平台能力。这个数字不该有两份手抄，所以有一条用例从 keystore.py
+ * 核对它。 */
+const KEY_NAME_MAX = 64;
+
+/* 关闸提示。**是一句说明，不是门禁**：`deployed=true & enabled=false` 是首次
+ * 部署后的正常状态，页面必须照常可用（否则管理员无处开闸，见 apiKeyFeature）。*/
+const KEY_GATED_NOTE = 'API Key 当前已被管理员全局关闸，新建的 Key 暂时无法调用；' +
+  '管理界面照常可用，开闸后既有 Key 立即恢复。';
+
+/* 明文只显示这一次。写成常量而不是散在模板里：这句话是这个功能的**契约**
+ * （服务端存哈希，没抄下来只能吊销重发），改它等于改契约。 */
+const KEY_ONCE_WARNING = '这是你唯一一次看到完整 Key，关闭后不再显示。';
+
+/* 开关旁的说明。影响面必须写清是**平台级**的：关闸后已经发出去的 Key 全部
+ * 立刻失效，不只是"新建的用不了"。 */
+const KEY_SWITCH_NOTE = '关闸后所有已发出的 Key 立即失效（网关直接拒绝），' +
+  '不只是新建的；开闸后立即恢复。逐把 Key 的吊销在各自所有者手里。';
+
+/* `features.api_key` 的**唯一**读法。
+ *
+ * 两个字段而不是一个布尔（Codex 审查 2026-08-11 P1-5）：
+ *   · `deployed` —— 组件部署了没有。**只有它是 UI 门禁**；
+ *   · `enabled`  —— 平台总开关此刻的位置，只驱动提示文案与开关初值。
+ * 首次部署强制把哨兵行建成 `enabled=false`，所以"已部署 + 关闸"是部署后的
+ * **正常状态**。若按 enabled 做门禁，那一刻页面 disabled 且零请求，管理员没有
+ * 任何地方能把闸开回来——部署流程自锁，线上表现是"功能上线了但永远打不开"。
+ *
+ * 用 `=== true` 而不是真值判断：字段缺失（旧后端）或形态变了一律按 false，
+ * 展示层宁可少给入口，也不要请求一批可能不存在的端点。 */
+function apiKeyFeature() {
+  const f = (state.me && state.me.features && state.me.features.api_key) || {};
+  return { deployed: f.deployed === true, enabled: f.enabled === true };
+}
+
+async function pageKeys() {
+  const view = $('#view');
   renderCrumb([{ label: 'API Key' }]);
-  $('#view').innerHTML =
-    '<section><div style="margin-bottom:20px"><h1>API Key</h1>' +
-      '<p class="meta" style="margin-top:4px">给不支持 OAuth 的 Agent 客户端直连 MCP 用</p>' +
-      '</div></section>' +
-    '<section class="card coming-later" aria-disabled="true"><div class="empty">' +
+  const feat = apiKeyFeature();
+  /* 未部署 → **一个请求都不发**：`site-api-keys` 表还不存在，/api/keys 会 500，
+   * 那等于把"平台没启用这个功能"翻译成一串看不懂的错误。而这个事实
+   * /api/me 已经告诉我们了，不需要再去问一次。 */
+  if (!feat.deployed) {
+    view.innerHTML = keysHeader() + keysUndeployedCard();
+    return;
+  }
+  view.innerHTML = keysHeader() + skeletonTable(3, 6);
+
+  let keys;
+  try {
+    const res = await apiGet('/api/keys');
+    keys = res.keys || [];
+  } catch (err) {
+    view.innerHTML = keysHeader() + errorCard('无法加载 API Key 列表', err);
+    return;
+  }
+
+  /* 开关的**权威值**只从 admin 专属端点取。/api/me 里那份是派生的：它读失败时
+   * 会退化成"未部署"（那是控制台的启动请求，不能因为一个功能开关就 500 掉整个
+   * 控制台），而给管理员显示一个**位置可能相反**的开关比不显示更糟。这个端点
+   * 故意不接 keystore 的读异常——读不出来就报错，见 api.do_get_key_switch。
+   * 非 admin 不请求它：后端 _require_admin 会 403。 */
+  let sw = null;
+  let swErr = null;
+  if (state.me.is_admin) {
+    try {
+      sw = await apiGet('/api/settings/api-key');
+    } catch (err) {
+      swErr = err;
+    }
+  }
+  const gated = sw ? sw.enabled !== true : !feat.enabled;
+
+  view.innerHTML = keysHeader() +
+    (gated ? '<div class="callout warn" style="margin-bottom:16px">' + ICON.err +
+      '<span>' + KEY_GATED_NOTE + '</span></div>' : '') +
+    keysCreateCard() +
+    keysListCard(keys, gated) +
+    (state.me.is_admin ? keySwitchCard(sw, swErr) : '');
+
+  bindKeysPage(keys);
+}
+
+function keysHeader() {
+  return '<section><div style="margin-bottom:20px"><h1>API Key</h1>' +
+    '<p class="meta" style="margin-top:4px">给不支持 OAuth 的 Agent 客户端直连 MCP 用：' +
+    '把 Key 放进客户端的 <span class="mono">X-API-Key</span> 头，端点是 ' +
+    '<span class="mono">mcp.' + baseDomain() + '</span>。' +
+    '具体配置见平台的客户端接入指引。</p></div></section>';
+}
+
+/* 组件未部署时的整页说明。**纯静态，不发请求**（见 pageKeys 的守卫）。 */
+function keysUndeployedCard() {
+  return '<section class="card coming-later" aria-disabled="true"><div class="empty">' +
+    '<div class="empty-mark">' + ICON.key + '</div>' +
+    '<h2>平台尚未启用 API Key</h2>' +
+    '<p>这个平台还没有部署 API Key 组件（或读不到它的状态），所以这里既不能创建也' +
+    '看不到 Key。支持 OAuth 登录的客户端（Claude Code、Quick Desktop）不需要 Key，' +
+    '现在就能直接接入。</p>' +
+    '<p class="meta" style="margin-top:14px">平台管理员：组件部署完成后本页会自动可用，' +
+    '不需要改前端。</p>' +
+  '</div></section>';
+}
+
+function keysCreateCard() {
+  return '<section class="card" style="margin-bottom:16px">' +
+    '<div class="card-head"><div><h2>创建新的 Key</h2>' +
+      '<p class="meta" style="margin-top:2px">备注名只给你自己看，用来分辨这把 Key ' +
+      '配在哪个客户端上（最长 ' + KEY_NAME_MAX + ' 字）。</p></div></div>' +
+    '<div class="card-body"><div class="row" style="gap:8px">' +
+      '<input class="input" id="key-name" placeholder="例如：Quick Desktop（工作机）" ' +
+        'maxlength="' + KEY_NAME_MAX + '" style="flex:1" />' +
+      '<button class="btn btn-primary" id="key-create" type="button">' + ICON.plus +
+        '创建 Key</button>' +
+    '</div></div></section>';
+}
+
+function keysListCard(keys, gated) {
+  if (!keys.length) {
+    return '<section class="card"><div class="empty">' +
       '<div class="empty-mark">' + ICON.key + '</div>' +
-      '<h2>API Key 规划中</h2>' +
-      '<p>支持 OAuth 登录的客户端（Claude Code、Quick Desktop）现在就能直接接入，' +
-      '不需要 Key。只有"只能配置静态 Header"的客户端才需要——该能力属于后续里程碑（M4）。</p>' +
-      '<p class="meta" style="margin-top:14px">接入方式见平台的客户端接入指引。</p>' +
+      '<h2>还没有 API Key</h2>' +
+      '<p>支持 OAuth 登录的客户端（Claude Code、Quick Desktop）不需要 Key，登录即可。' +
+      '只有"只能配静态 Header"的客户端才需要在这里创建一把。</p>' +
     '</div></section>';
+  }
+  return '<section class="card"><div class="card-head"><div><h2>我的 Key</h2>' +
+    '<p class="meta" style="margin-top:2px">共 ' + keys.length +
+    ' 把 · 明文只在创建时显示一次，之后这里只能看到前缀</p></div></div>' +
+    '<div class="card-body tight"><table class="tbl">' +
+    '<thead><tr><th>备注名</th><th>前缀</th><th>创建时间</th><th>最后使用</th>' +
+    '<th>状态</th><th style="text-align:right">操作</th></tr></thead><tbody>' +
+    keys.map((row) => keyRow(row, gated)).join('') +
+    '</tbody></table></div></section>';
+}
+
+/* 一行 Key。字段口径 = api._shape_key 的白名单（没有 key_hash，也没有明文）。
+ * 备注名是**用户自己填的**，必须过 esc()——控制台是管理界面，在这里执行脚本
+ * 就能改权限。 */
+function keyRow(row, gated) {
+  return '<tr><td>' + esc(row.name) + '</td>' +
+    '<td class="mono">' + esc(row.prefix) + '…</td>' +
+    '<td class="mono">' + esc(when(row.created_at)) + '</td>' +
+    '<td class="mono">' +
+      (row.last_used_at ? esc(when(row.last_used_at))
+                        : '<span class="meta">从未使用</span>') + '</td>' +
+    '<td>' + keyStatusBadge(row, gated) + '</td>' +
+    '<td style="text-align:right;white-space:nowrap">' +
+      (row.revoked ? '<span class="meta">—</span>'
+        : '<button class="btn btn-sm btn-danger-quiet" type="button" data-revoke="' +
+          esc(row.key_id) + '">吊销…</button>') +
+    '</td></tr>';
+}
+
+/* 行内状态。吊销过的就是吊销了（与总开关无关）；没吊销但平台关闸时这把 Key
+ * 此刻**调不通**——显示"生效中"是在说谎，所以单独一个"已关闸"的态。 */
+function keyStatusBadge(row, gated) {
+  if (row.revoked) {
+    return '<span class="badge badge-off"><span class="dot"></span>已吊销</span>';
+  }
+  if (gated) {
+    return '<span class="badge badge-warn"><span class="dot"></span>已关闸</span>';
+  }
+  return '<span class="badge badge-ok"><span class="dot"></span>生效中</span>';
+}
+
+/* admin 专属：平台总开关。**只在 state.me.is_admin 时被调用**（见 pageKeys）。
+ * 后端还有 _require_admin 兜着，所以这不是安全边界；但一个看得见、一点就 403
+ * 的开关是照着来的 bug 报告，也会让普通用户以为自己能关闸。 */
+function keySwitchCard(sw, swErr) {
+  const head = '<section class="card" style="margin-top:16px">' +
+    '<div class="card-head"><div><h2>平台总开关（管理员）</h2>' +
+    '<p class="meta" style="margin-top:2px">控制整个平台的 API Key 通道。' +
+    '所有开关变更都会记进审计日志（ops-log）。</p></div></div>' +
+    '<div class="card-body stack" style="gap:12px">';
+  const foot = '</div></section>';
+  /* 读不到权威值时**不画开关**：一个位置可能相反的开关比没有开关更危险
+   * （管理员以为关着，其实开着）。如实说明并给一次重试。 */
+  if (swErr) {
+    return head + '<div class="callout danger">' + ICON.err +
+      '<span><strong>开关状态读取失败，暂不显示开关。</strong>' +
+      esc((swErr && swErr.message) || '未知错误') +
+      '</span></div><div><button class="btn" id="key-switch-retry" type="button">' +
+      '重试</button></div>' + foot;
+  }
+  const on = !!(sw && sw.enabled === true);
+  return head +
+    '<div class="row-between" style="align-items:flex-start">' +
+      '<div><div style="font-size:13.5px;font-weight:500">允许用 API Key 调用 MCP</div>' +
+        '<p class="meta" style="max-width:52ch">' + KEY_SWITCH_NOTE + '</p></div>' +
+      '<button class="switch" id="sw-apikey" role="switch" aria-checked="' + on +
+        '" aria-label="API Key 平台总开关"></button></div>' + foot;
+}
+
+function bindKeysPage(keys) {
+  const create = $('#key-create');
+  const input = $('#key-name');
+
+  async function submit() {
+    const val = (input.value || '').trim();
+    if (!val) {
+      toast('请先填备注名', '用来分辨这把 Key 配在哪个客户端上', 'err');
+      return;
+    }
+    /* 长度在后端也会挡（keystore.create → 400）；这里先挡一次是为了少一次
+     * 白跑的往返，**不是**唯一防线。 */
+    if (val.length > KEY_NAME_MAX) {
+      toast('备注名太长', '最长 ' + KEY_NAME_MAX + ' 字', 'err');
+      return;
+    }
+    create.disabled = true;
+    create.textContent = '创建中…';
+    try {
+      const res = await api('POST', '/api/keys', { name: val });
+      input.value = '';
+      /* 明文只往下传给弹窗（活在那个闭包里）。列表随后刷新一次——弹窗在
+       * #modal-root，不受 #view 重渲染影响。 */
+      showNewKey(res);
+      pageKeys();
+    } catch (err) {
+      reportError('创建失败', err);
+      create.disabled = false;
+      create.textContent = '创建 Key';
+    }
+  }
+  create.addEventListener('click', submit);
+  input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') submit(); });
+
+  $$('[data-revoke]').forEach((b) => b.addEventListener('click', () => {
+    const hit = (keys || []).filter((x) => x.key_id === b.dataset.revoke)[0] || {};
+    confirmRevoke(b.dataset.revoke, hit.name, hit.prefix);
+  }));
+
+  const sw = $('#sw-apikey');
+  if (sw) {
+    sw.addEventListener('click', () =>
+      setKeySwitch(sw.getAttribute('aria-checked') !== 'true'));
+  }
+  const retry = $('#key-switch-retry');
+  if (retry) retry.addEventListener('click', () => pageKeys());
+}
+
+/* 创建结果：明文**完整显示一次** + 复制按钮 + "关闭后不再显示"的警告。
+ *
+ * 这个函数是明文在前端的唯一落点（见本节开头的"明文的生命周期"）。 */
+function showNewKey(row) {
+  const modal = openModal({
+    title: 'Key 已创建：' + (row.name || ''),
+    desc: '把它配到客户端里就能用了。',
+    body:
+      '<div class="callout warn">' + ICON.err + '<span><strong>' + KEY_ONCE_WARNING +
+        '</strong>请立刻复制并存进密码管理器——服务端只存哈希，没有第二次查看的' +
+        '通道；丢了只能吊销后重新创建。</span></div>' +
+      '<div class="secret"><span style="flex:1">' + esc(row.plaintext) + '</span>' +
+        '<button class="btn" id="copy-key" type="button">' + ICON.copy + '复制</button></div>' +
+      '<dl class="kv" style="grid-template-columns:76px 1fr">' +
+        '<dt>备注名</dt><dd>' + esc(row.name) + '</dd>' +
+        '<dt>前缀</dt><dd class="mono">' + esc(row.prefix) + '…</dd>' +
+        '<dt>key_id</dt><dd class="mono">' + esc(row.key_id) + '</dd>' +
+        '<dt>创建时间</dt><dd class="mono">' + esc(when(row.created_at)) + '</dd></dl>',
+    footer: '<button class="btn btn-primary" data-close type="button">我已保存</button>'
+  });
+  $('[data-close]', modal).addEventListener('click', closeModal);
+  $('#copy-key', modal).addEventListener('click', () => {
+    if (navigator.clipboard) navigator.clipboard.writeText(row.plaintext);
+    /* toast 里**不带明文**：它会在角落多停几秒，而且脱离了这个弹窗
+     * "我已保存"的语境。 */
+    toast('已复制到剪贴板', '关闭弹窗后这个值不会再出现', 'info');
+  });
+}
+
+/* 吊销：**发 key_id，不是明文**。key_id 是刻意设计成非秘密标识符的
+ * （keygen 的注释），而明文一进请求体就会进沿途每一层日志。
+ * 二次确认：使用这把 Key 的客户端会立刻 401，且不可恢复。 */
+function confirmRevoke(keyId, name, prefix) {
+  const modal = openModal({
+    title: '吊销 Key「' + (name || keyId) + '」',
+    desc: '吊销后使用这把 Key 的客户端会立刻收到 401。',
+    body:
+      '<div class="callout danger">' + ICON.err + '<span><strong>此操作不可撤销。</strong>' +
+        '还要继续用的话，请创建一把新的 Key 并换到客户端里，再吊销这把。</span></div>' +
+      '<dl class="kv" style="grid-template-columns:76px 1fr">' +
+        '<dt>备注名</dt><dd>' + esc(name) + '</dd>' +
+        '<dt>前缀</dt><dd class="mono">' + esc(prefix) + '…</dd>' +
+        '<dt>key_id</dt><dd class="mono">' + esc(keyId) + '</dd></dl>',
+    footer: '<button class="btn" data-close type="button">取消</button>' +
+            '<button class="btn btn-danger" id="do-revoke" type="button">确认吊销</button>'
+  });
+  $('[data-close]', modal).addEventListener('click', closeModal);
+  const btn = $('#do-revoke', modal);
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    btn.textContent = '吊销中…';
+    try {
+      await api('DELETE', '/api/keys', { key_id: keyId });
+      closeModal();
+      toast('Key 已吊销', name || keyId, 'ok');
+      pageKeys();
+    } catch (err) {
+      reportError('吊销失败', err);
+      btn.disabled = false;
+      btn.textContent = '确认吊销';
+    }
+  });
+}
+
+async function setKeySwitch(next) {
+  /* 关闸的影响面是**平台级**的（已发出的 Key 全部立刻 401），给一次确认；
+   * 开闸不问——它只是把既有能力恢复回去。 */
+  if (!next && !window.confirm(
+      '关闸后所有已发出的 API Key 立即失效（网关直接拒绝）。确认关闸？')) {
+    return;
+  }
+  const btn = $('#sw-apikey');
+  if (btn) btn.disabled = true;
+  try {
+    /* 发**真布尔**：keystore.set_switch 对 "false" / 0 / null 一律 400
+     * （`bool("false") is True` 那个陷阱已经在写入侧钉死了，前端别去试探它）。 */
+    await api('PUT', '/api/settings/api-key', { enabled: next });
+    toast(next ? 'API Key 通道已开启' : 'API Key 通道已关闸',
+          next ? '既有 Key 立即恢复可用' : '所有已发出的 Key 立即失效', 'ok');
+    /* 重新拉一次权威值，而不是就地把 aria-checked 拨过去：本地拨一下只是
+     * "我以为它变了"。 */
+    pageKeys();
+  } catch (err) {
+    if (btn) btn.disabled = false;
+    reportError('开关修改失败', err);
+  }
 }
 
 /* ══ 页面 4：全局管理（仅管理员）═════════════════════════════════════ */
