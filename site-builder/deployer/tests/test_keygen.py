@@ -54,10 +54,18 @@ def test_key_id_is_independent_of_hash():
 
 
 def test_keygen_source_does_not_derive_id_from_hash():
-    """源码级：key_id 的赋值表达式不得引用 key_hash / sha256 / digest。
+    """源码级：key_id 的来源表达式不得引用 key_hash / sha256 / digest。
 
     行为断言抓不到"取 hash 的第 9-16 位当 key_id"这种派生（子串检查会抓到，
     但"取 hash 再另做一次 hash"就抓不到了）。用 AST 定位 key_id 的来源。
+
+    **2026-08-12 补关键字实参形态（独立审查发现的盲区）**：原版只看
+    `ast.Assign` 且目标名是 `key_id` 的语句。把派生**内联**写成
+    `NewKey(..., key_id=hash_key(key_hash)[:8], ...)` 会同时骗过两个预言机——
+    源码里没有 Assign 节点（本条看不见），而"又 hash 了一次"让
+    test_key_id_is_independent_of_hash 的子串检查也失效。所以这里把
+    `key_id=` 关键字实参一并纳入，并把 `hash_key` 本身也列进禁用名单：
+    合法来源只有 `_random_base62(KEY_ID_LEN)`，不存在需要引用它的写法。
     """
     import ast
     import pathlib
@@ -65,18 +73,23 @@ def test_keygen_source_does_not_derive_id_from_hash():
     tree = ast.parse(src)
     fn = next(n for n in ast.walk(tree)
               if isinstance(n, ast.FunctionDef) and n.name == "new_key")
-    # 找出所有形如 key_id = <expr> 的赋值，检查 expr 里不出现这些名字
-    banned = {"key_hash", "sha256", "digest", "hexdigest", "h"}
+    banned = {"key_hash", "sha256", "digest", "hexdigest", "hash_key", "h"}
+    # 「给 key_id 一个值」的两种形态：`key_id = <expr>` 与 `f(key_id=<expr>)`
+    sources = []
     for node in ast.walk(fn):
-        if isinstance(node, ast.Assign):
-            targets = {t.id for t in node.targets if isinstance(t, ast.Name)}
-            if "key_id" in targets:
-                names = {n.id for n in ast.walk(node.value)
-                         if isinstance(n, ast.Name)}
-                names |= {n.attr for n in ast.walk(node.value)
-                          if isinstance(n, ast.Attribute)}
-                assert not (names & banned), \
-                    f"key_id 的来源引用了 {names & banned}——那是哈希预言机"
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "key_id"
+                for t in node.targets):
+            sources.append(node.value)
+        elif isinstance(node, ast.keyword) and node.arg == "key_id":
+            sources.append(node.value)
+    # 自查：一个来源都找不到说明本守卫已与 new_key 脱节（那时它是永远绿的装饰）。
+    assert sources, "找不到任何 key_id 的来源表达式——先修本守卫"
+    for value in sources:
+        names = {n.id for n in ast.walk(value) if isinstance(n, ast.Name)}
+        names |= {n.attr for n in ast.walk(value) if isinstance(n, ast.Attribute)}
+        assert not (names & banned), \
+            f"key_id 的来源引用了 {names & banned}——那是哈希预言机"
 
 
 def test_prefix_is_sk_plus_first_4_and_leaves_12_chars_secret():

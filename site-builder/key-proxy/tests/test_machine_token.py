@@ -238,15 +238,25 @@ def test_env_plaintext_secret_is_never_used(aws, clock, ssm, http, monkeypatch,
 
 
 def test_source_never_reads_a_plaintext_secret_env_var():
-    """AST：源码里除白名单外不得读任何 `*SECRET*` 环境变量。
+    """AST：源码读的环境变量必须落在**闭集** EXPECTED_ENV 内。
 
     **为什么要 AST 而不只靠上一条**：上一条只能枚举它想到的名字。这条按
     **真源**（源码里所有 `os.environ` 的键）反过来查，新起一个名字也拦得住。
     白名单只有 `MACHINE_SECRET_PARAM`——那是**参数名**，不是密钥。
+
+    **2026-08-12 从"名字里带 SECRET 就拦"改成闭集（独立审查发现的盲区）**：
+    原版只标记 `"SECRET" in k.upper()` 的键，于是一条叫 `MACHINE_CLIENT_PW`
+    （或 `..._PASSWORD` / `..._CRED`）的明文兜底两头都能溜过去——AST 这条不认
+    那个名字，而上面那条行为用例只参数化了三个名字。本模块该读的环境变量就是
+    下面五个，多出任何一个都要有人解释它是什么；这比"猜哪些名字像密钥"严格，
+    而且不花额外代价。
     """
     import ast
     import pathlib
     allowed = {"MACHINE_SECRET_PARAM"}
+    # 本模块环境变量的**全集**（`_config` / `_secret` / `_ssm` 的实际读取）。
+    expected = {"AWS_DEFAULT_REGION", "COGNITO_DOMAIN", "MACHINE_CLIENT_ID",
+                "MACHINE_SCOPE", "MACHINE_SECRET_PARAM"}
     src = pathlib.Path(mt.__file__).read_text()
 
     def _is_environ(node) -> bool:
@@ -274,6 +284,12 @@ def test_source_never_reads_a_plaintext_secret_env_var():
     # 永远绿的装饰，而它的全部价值就在于"按真源查"。
     assert allowed <= keys, (f"AST 扫不到 {sorted(allowed - keys)}"
                              "——本守卫的取值方式已经与源码脱节，先修它")
+    # 闭集：新增的键一律红。真是新配置项就连同 expected 一起更新（那是一次
+    # 有意的决定）；是凭证兜底就删掉它——环境里只允许出现非机密配置。
+    assert keys <= expected, (
+        f"源码新读了环境变量 {sorted(keys - expected)}——若它是密钥/凭证的兜底"
+        "就删掉（GetFunctionConfiguration 会原样回显环境变量），若确实是新配置项"
+        "就连同本用例的 expected 一起更新")
     suspicious = {k for k in keys if "SECRET" in k.upper() and k not in allowed}
     assert not suspicious, (
         f"源码读了明文密钥环境变量 {sorted(suspicious)}——环境里只允许出现"

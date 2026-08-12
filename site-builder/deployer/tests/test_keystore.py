@@ -235,12 +235,20 @@ def test_non_string_or_empty_email_rejects_by_injection(aws, monkeypatch, email)
                                 "sk-" + "a" * 17, "sk_" + "a" * 16,
                                 "sk-" + "a" * 15 + "-", "x" * 500])
 def test_malformed_plaintext_rejects_without_db_read(aws, bad, monkeypatch):
-    """形态不对时**不查库**：省一次读，也防止把任意长串当 key 去 hash。"""
-    calls = []
+    """形态不对时**不查库**：省一次读，也防止把任意长串当 key 去 hash。
+
+    **2026-08-12 连开关读一起数（独立审查发现的盲区）**：原版只数 `_get_key_row`,
+    于是把形态校验挪到**开关读之后**（`switch → 形态 → key`）仍然全绿——而不变量
+    是"非法输入不产生任何一次库读"。开关读是一次真实的 DynamoDB 强一致读，且这条
+    路径任何人都能免费触发（一串垃圾就够），少数一个入口就少一半覆盖。
+    """
+    reads = []
+    monkeypatch.setattr(keystore, "_get_switch_row",
+                        lambda *a, **kw: reads.append("switch") or {"enabled": True})
     monkeypatch.setattr(keystore, "_get_key_row",
-                        lambda *a, **kw: calls.append(1) or ({}, {}))
+                        lambda *a, **kw: reads.append("key") or None)
     assert keystore.lookup(bad).ok is False
-    assert calls == [], "形态校验必须在查库之前"
+    assert reads == [], f"形态校验必须在任何一次库读之前，实际读了 {reads}"
 
 
 # ---------- 不缓存（行为层） ----------
@@ -420,19 +428,96 @@ def test_revoke_marks_revoked_without_deleting_the_row(aws):
     assert keystore.lookup(k["plaintext"]).ok is False
 
 
-def test_revoke_update_carries_key_id_and_email_condition(aws):
-    """Query 与 Update 之间有窗口，且 GSI 是最终一致的——落地的那一步
-    必须重新断言两个字段（同 sites_snapshot_guard 的既有理由）。"""
-    _put_switch(True)
-    k = keystore.create("a@x.com", name="one")
+def _condition_attribute_names(fn_name: str) -> set[str]:
+    """`keystore.<fn_name>` 里每个 `update_item` 的条件表达式**实际断言的属性名**。
+
+    取的是**值**而不是源码文本：解析 `ConditionExpression` 字面量，把 `#别名`
+    经 `ExpressionAttributeNames` 解析回真实属性名，`:值占位符` 不算（它是被
+    比较的那一侧，不是被断言的属性）。改名、换顺序、增删别名都跟得住。
+    """
     import ast
     import pathlib
+    import re
     src = pathlib.Path(keystore.__file__).read_text()
     fn = next(n for n in ast.walk(ast.parse(src))
-              if isinstance(n, ast.FunctionDef) and n.name == "revoke")
-    body = ast.get_source_segment(src, fn) or ""
-    assert "ConditionExpression" in body
-    assert "key_id" in body and "email" in body
+              if isinstance(n, ast.FunctionDef) and n.name == fn_name)
+    calls = [n for n in ast.walk(fn)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+             and n.func.attr == "update_item"]
+    # 自查：找不到调用说明本守卫已与源码脱节（同 §2.10「分不清没找到与干净」）。
+    assert calls, f"{fn_name} 里找不到 update_item 调用——先修本守卫"
+    names = set()
+    for call in calls:
+        kw = {k.arg: k.value for k in call.keywords}
+        assert "ConditionExpression" in kw, \
+            f"{fn_name} 的 update_item 没有 ConditionExpression"
+        try:
+            expr = ast.literal_eval(kw["ConditionExpression"])
+            alias = ast.literal_eval(kw["ExpressionAttributeNames"]) \
+                if "ExpressionAttributeNames" in kw else {}
+        except ValueError as e:      # 拼出来的（变量/f-string）——读不到值就红
+            raise AssertionError(
+                f"{fn_name} 的条件表达式不是字面量，本守卫读不到它的值: {e}") from e
+        for tok in re.findall(r"(?<![:\w#])(#?[A-Za-z_][A-Za-z0-9_]*)", expr):
+            if tok.startswith("#"):
+                assert tok in alias, f"{tok} 没有对应的 ExpressionAttributeNames"
+                names.add(alias[tok])
+            else:
+                names.add(tok)
+    return names
+
+
+def test_revoke_update_carries_key_id_and_email_condition(aws):
+    """Query 与 Update 之间有窗口，且 GSI 是最终一致的——落地的那一步
+    必须重新断言两个字段（同 sites_snapshot_guard 的既有理由）。
+
+    **2026-08-12 重写：原版是假绿（独立审查发现，已实测确认）**。原版对
+    `ast.get_source_segment(revoke)` 做 `"key_id" in body and "email" in body`
+    子串检查，而 revoke 的 **docstring 本身**就把这两个词各写了好几次——于是把
+    `ConditionExpression="#kid = :kid AND #em = :em"` 改成 `"#kid = :kid"`
+    并删掉随之无用的 `#em` 别名与 `:em` 值（开发者真会这么改），53 条用例
+    **全绿**；只有把 `ConditionExpression=` 整个删掉才会红，也就是计划恰好
+    预测到的那一种形态。子串匹配源码永远有这个问题：注释与文档也在里面。
+    现在断言解析后的属性名集合，行为面另有下面那条参数化用例。
+    """
+    assert {"key_id", "email"} <= _condition_attribute_names("revoke"), \
+        "落地的 UpdateItem 必须同时重新断言 key_id 与 email"
+
+
+@pytest.mark.parametrize("stale", ["email", "key_id"])
+def test_revoke_fails_closed_when_the_index_projection_is_stale(
+        aws, monkeypatch, stale):
+    """上一条的**行为面**：GSI 给旧投影时一个字段都不能被改。
+
+    摆法（这是唯一能让条件表达式成为**唯一**防线的摆法）：表里的真行属于
+    b@x.com，而注入的"投影"声称它属于调用者 a@x.com（`stale="email"`）；或真行
+    的 key_id 是别的值，投影声称它就是调用者要吊销的那一个（`stale="key_id"`）。
+    两种摆法下 Query 之后的每一步判断都会通过——`len(rows)==1` 成立、
+    `row["email"] == actor` 也成立——只有 UpdateItem 的条件能拦住它。
+    少了 email 那半个条件，一次陈旧投影就等于"用别人的 Key 换自己的吊销"；
+    少了 key_id 那半个，被改的会是同一行上完全另一把 Key。
+    """
+    _put_switch(True)
+    victim = keystore.create("b@x.com", name="victim")
+    key_hash = keygen.hash_key(victim["plaintext"])
+    if stale == "email":
+        # 真行 email=b@x.com，投影谎称 a@x.com；key_id 是真的。
+        row = {"key_hash": key_hash, "email": "a@x.com",
+               "key_id": victim["key_id"]}
+        target = victim["key_id"]
+    else:
+        # 真行 key_id 是 victim 的，投影谎称是 "zzzzzzzz"；email 用真行的。
+        row = {"key_hash": key_hash, "email": "b@x.com", "key_id": "zzzzzzzz"}
+        target = "zzzzzzzz"
+    actor = row["email"]
+    monkeypatch.setattr(keystore, "_query_by_key_id", lambda kid: [row])
+    with pytest.raises(keystore.KeyNotFound):
+        keystore.revoke(target, actor=actor)
+    import boto3
+    got = boto3.resource("dynamodb", region_name="us-east-1").Table(
+        "site-api-keys").get_item(Key={"key_hash": key_hash})["Item"]
+    assert got["revoked"] is False, \
+        f"陈旧的 {stale} 投影让吊销落地了——UpdateItem 的条件没拦住"
 
 
 # ---------- 哨兵行不得出现在 GSI ----------
