@@ -340,14 +340,22 @@ def _run_cli(script: Path, cwd: Path) -> subprocess.CompletedProcess:
                           capture_output=True, text=True, timeout=120)
 
 
-@pytest.mark.parametrize("name", ["deploy_pool.py", "deploy_agentcore.py"])
+@pytest.mark.parametrize("name", sorted(DEPLOY_SCRIPTS))
 def test_deploy_scripts_import_the_gate_from_their_real_working_directory(name):
     """从 DEPLOY.md 写的那个目录跑 `--help`：不得出现 ModuleNotFoundError。
 
     `deploy_pool.py` 的真实形态是 `cd site-builder && python3 scripts/…`，
     所以 cwd 与脚本目录**不同**——这正是 sys.path 相对路径写错时的暴露点。
+
+    **按 DEPLOY_SCRIPTS 全量参数化**（Task 8 起三个脚本都在）：手写清单会漏掉
+    新脚本，而漏掉的那个正好是没人验过 import 路径的那个（Task 7 报告 §4-E 的
+    交接项）。文件缺失时**断言失败而不是 skip**——"文件不在"与"import 路径没问题"
+    必须是两个可区分的结果。
     """
     path, cwd = DEPLOY_SCRIPTS[name]
+    assert path.exists(), (
+        f"{name} 不存在于 {path}——脚本被删/搬家了就必须同步 DEPLOY_SCRIPTS，"
+        "否则本条守卫会静默变成空转")
     # 真实命令是 `python3 scripts/deploy_pool.py`：按 cwd 的相对路径调用
     rel = path.relative_to(cwd)
     proc = subprocess.run([sys.executable, str(rel), "--help"], cwd=cwd,
