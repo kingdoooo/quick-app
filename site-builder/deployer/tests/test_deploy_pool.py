@@ -1031,3 +1031,226 @@ def test_deploy_pool_uses_the_shared_gate_not_its_own_judgement():
     assert "from api_key_config import" in src
     assert 'has_section("ApiKey")' not in src
     assert hasattr(dp, "api_key_enabled")
+
+
+# --- 无 [IdP] 段时不得清掉线上的 IdP 名单（2026-08-12）---
+# client_configs 在无 IdP 时回落 ["COGNITO"]，而已存在的 client 走
+# update_user_pool_client（read-modify-write，整体替换）——把回落值盖上去就是
+# 把 Feishu 从生产 client 的 SupportedIdentityProviders 里摘掉：
+#   · 全部用户当场登不进（托管登录页不再有 IdP 入口）；
+#   · Cognito 本地登录/注册重新暴露，allowed_users="org" 的边界失效
+#     （spec §3.5、§11——§11 明写了"换 IdP 重跑会移除原 IdP、切断线上登录"）。
+# 已部署平台的 config.ini **确实没有 [IdP] 段**，所以这是"一条命令之外"的事故。
+# 修的方向：缺配置 = 不动线上（最严解释），而不是 = 恢复默认。
+
+def _live_client(name: str, client_id: str, providers: list[str]) -> dict:
+    """线上现状（describe_user_pool_client 的回包），带 provider 名单。"""
+    return _client_stub_response(ClientName=name, ClientId=client_id,
+                                 SupportedIdentityProviders=providers)
+
+
+def _two_existing_clients() -> list[dict]:
+    return [{"ClientName": "site-builder-site", "ClientId": "c-site"},
+            {"ClientName": "site-builder-mcp", "ClientId": "c-mcp"}]
+
+
+def _capture_update_params(cog) -> list:
+    """抓真正发给 UpdateUserPoolClient 的参数。
+
+    Stubber 只校验参数、不把它回传，所以挂 botocore 的 provide-client-params
+    事件（注册在前缀上，匹配该事件的全部操作，再按 model.name 过滤）。
+    这样**既拿到参数又仍然经过真实 service model 校验**——序列化发生在这个
+    事件之后，非法参数照样以 ParamValidationError 失败。
+    """
+    seen = []
+
+    def _grab(params, model, **kw):
+        if model.name == "UpdateUserPoolClient":
+            seen.append(dict(params))
+
+    cog.meta.events.register("provide-client-params", _grab)
+    return seen
+
+
+def test_update_without_idp_config_preserves_live_federation():
+    """回归：无 [IdP] 段重跑，线上的 Feishu 必须还在，且不得被换成 COGNITO。
+
+    这就是已部署平台今天的真实状态：config.ini 无 [IdP] 段，而 site/mcp 两个
+    生产 client 的 SupportedIdentityProviders 都是 ['Feishu']。旧实现在这里
+    下发 ['COGNITO']——登录全断 + 本地注册入口重开。
+    """
+    from botocore.stub import Stubber
+
+    cog = _cog()
+    seen = _capture_update_params(cog)
+    with Stubber(cog) as stub:
+        stub.add_response("list_user_pool_clients",
+                          {"UserPoolClients": _two_existing_clients()},
+                          {"UserPoolId": "us-east-1_x", "MaxResults": 60})
+        for name, cid in (("site-builder-site", "c-site"),
+                          ("site-builder-mcp", "c-mcp")):
+            stub.add_response(
+                "describe_user_pool_client",
+                {"UserPoolClient": _live_client(name, cid, ["Feishu"])},
+                {"UserPoolId": "us-east-1_x", "ClientId": cid})
+            # 参数不预期死值——用事件抓下来断言（见 _capture_update_params）
+            stub.add_response("update_user_pool_client", {"UserPoolClient": {}})
+        dp._ensure_clients(cog, "us-east-1_x", "example.com", [], None)
+        stub.assert_no_pending_responses()
+
+    assert len(seen) == 2, "两个 client 都要走 update"
+    for params in seen:
+        who = params["ClientName"]
+        assert params["SupportedIdentityProviders"] == ["Feishu"], who
+        assert "COGNITO" not in params["SupportedIdentityProviders"], who
+
+
+def test_update_path_omits_provider_key_entirely_without_idp(monkeypatch):
+    """fail-closed 的**形状**本身：无 [IdP] 时 desired 里不许有这个键。
+
+    只断言"结果里有 Feishu"不够——那也能用"先读一遍线上再塞回 desired"实现，
+    而那种实现一旦读取失败或走了空值兜底，就又把名单清掉了（本仓库的
+    "假值兜底鉴权是陷阱"同一类）。唯一稳的形状是这个键压根不出现在 desired
+    里，由 _client_update_params 的回填保留现值。
+    """
+    captured = {}
+
+    def _spy(cog, pool_id, client_id, desired):
+        captured[desired["ClientName"]] = desired
+        return {"ClientName": desired["ClientName"]}
+
+    monkeypatch.setattr(dp, "_client_update_params", _spy)
+
+    class _Cog:
+        def list_user_pool_clients(self, **kw):
+            return {"UserPoolClients": _two_existing_clients()}
+
+        def update_user_pool_client(self, **kw):
+            return {"UserPoolClient": {}}
+
+    dp._ensure_clients(_Cog(), "us-east-1_x", "example.com", [], None)
+    assert set(captured) == {"site-builder-site", "site-builder-mcp"}
+    for name, desired in captured.items():
+        assert "SupportedIdentityProviders" not in desired, name
+    # 只摘这一个键，别的照常声明（不是"整个 desired 都不发了"）
+    site = captured["site-builder-site"]
+    assert site["ExplicitAuthFlows"] == dp.NATIVE_AUTH_DISABLED
+    assert site["AccessTokenValidity"] == 15
+
+
+def test_create_without_idp_config_still_uses_cognito_only():
+    """create 路径没有"现值"可保留，仍下发 ["COGNITO"]（main() 已为此告警）。"""
+    seen = {}
+
+    class _Cog:
+        def list_user_pool_clients(self, **kw):
+            return {"UserPoolClients": []}
+
+        def create_user_pool_client(self, **kw):
+            seen[kw["ClientName"]] = kw
+            return {"UserPoolClient": {"ClientId": "id-" + kw["ClientName"]}}
+
+    dp._ensure_clients(_Cog(), "us-east-1_x", "example.com", [], None)
+    for name in ("site-builder-site", "site-builder-mcp"):
+        assert seen[name]["SupportedIdentityProviders"] == ["COGNITO"], name
+        # 探针 IdP 名只用于本进程内比对，绝不能出现在下发参数里
+        assert dp._PROBE_IDP not in seen[name]["SupportedIdentityProviders"]
+
+
+def test_create_with_idp_config_lists_only_that_idp():
+    """配了 IdP 的 create 路径行为不变：只列该 IdP，不含 COGNITO。"""
+    seen = {}
+
+    class _Cog:
+        def list_user_pool_clients(self, **kw):
+            return {"UserPoolClients": []}
+
+        def create_user_pool_client(self, **kw):
+            seen[kw["ClientName"]] = kw
+            return {"UserPoolClient": {"ClientId": "id"}}
+
+    dp._ensure_clients(_Cog(), "us-east-1_x", "example.com", [], "Okta")
+    for name in ("site-builder-site", "site-builder-mcp"):
+        assert seen[name]["SupportedIdentityProviders"] == ["Okta"], name
+        assert "COGNITO" not in seen[name]["SupportedIdentityProviders"], name
+
+
+def test_update_with_idp_config_still_replaces_provider_list():
+    """配了 IdP 时 update 路径必须照旧下发 [provider_name]。
+
+    这条盯的是"修过头"：把这个键在 update 路径上一律摘掉，就再也没法用本脚本
+    把 client 切到新 IdP（也就修不了配错的线上名单）。省略只在**缺配置**时成立。
+    """
+    from botocore.stub import Stubber
+
+    cog = _cog()
+    seen = _capture_update_params(cog)
+    with Stubber(cog) as stub:
+        stub.add_response("list_user_pool_clients",
+                          {"UserPoolClients": _two_existing_clients()},
+                          {"UserPoolId": "us-east-1_x", "MaxResults": 60})
+        for name, cid in (("site-builder-site", "c-site"),
+                          ("site-builder-mcp", "c-mcp")):
+            stub.add_response(
+                "describe_user_pool_client",
+                {"UserPoolClient": _live_client(name, cid, ["Feishu"])},
+                {"UserPoolId": "us-east-1_x", "ClientId": cid})
+            stub.add_response("update_user_pool_client", {"UserPoolClient": {}})
+        dp._ensure_clients(cog, "us-east-1_x", "example.com", [], "Okta")
+        stub.assert_no_pending_responses()
+
+    assert len(seen) == 2
+    for params in seen:
+        assert params["SupportedIdentityProviders"] == ["Okta"], params["ClientName"]
+        assert "COGNITO" not in params["SupportedIdentityProviders"]
+
+
+def test_machine_client_keeps_cognito_on_update_without_idp(monkeypatch):
+    """machine 的 ["COGNITO"] 是写死的正确值，不是 IdP 回落——不能一起被摘掉。
+
+    它走 client_credentials，与用户身份无关；把这个键从它的 desired 里摘掉就
+    等于放弃纠正（有人手工给它加了联邦 provider 时再也改不回来）。
+    """
+    captured = {}
+
+    def _spy(cog, pool_id, client_id, desired):
+        captured[desired["ClientName"]] = desired
+        return {"ClientName": desired["ClientName"]}
+
+    monkeypatch.setattr(dp, "_client_update_params", _spy)
+
+    class _Cog:
+        def list_user_pool_clients(self, **kw):
+            return {"UserPoolClients": _two_existing_clients() + [
+                {"ClientName": "site-builder-machine", "ClientId": "c-machine"}]}
+
+        def update_user_pool_client(self, **kw):
+            return {"UserPoolClient": {}}
+
+    dp._ensure_clients(_Cog(), "us-east-1_x", "example.com", [], None,
+                       include_machine=True,
+                       machine_scopes=("site-builder-mcp/invoke",))
+    assert captured["site-builder-machine"]["SupportedIdentityProviders"] == \
+        ["COGNITO"]
+    # 联邦的那两个仍然一个键都不声明
+    for name in ("site-builder-site", "site-builder-mcp"):
+        assert "SupportedIdentityProviders" not in captured[name], name
+
+
+def test_idp_derived_keys_are_probed_from_client_configs():
+    """"哪些 client 跟着 [IdP] 走"必须从 client_configs 探出来，不能手抄名单。
+
+    手抄的 {"site","mcp"} 会在加第四个联邦 client 时腐烂，而腐烂的症状正是
+    本次修的这个缺陷（新 client 的线上名单在无 [IdP] 重跑时被清成 COGNITO）。
+    这里直接拿 client_configs 的真实输出反推，两者必须一致。
+    """
+    scopes = ("site-builder-mcp/invoke",)
+    keys = dp._idp_derived_client_keys("example.com", [], include_machine=True,
+                                       machine_scopes=scopes)
+    clients = dp.client_configs("example.com", [], "Okta", include_machine=True,
+                                machine_scopes=scopes)
+    assert keys == {k for k, v in clients.items()
+                    if v["SupportedIdentityProviders"] == ["Okta"]}
+    assert keys == {"site", "mcp"}          # 当前形态的回归锚点
+    # machine 不在其中：它的 COGNITO 与 [IdP] 无关
+    assert "machine" not in keys

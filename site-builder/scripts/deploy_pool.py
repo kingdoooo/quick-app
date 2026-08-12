@@ -105,6 +105,11 @@ def client_configs(base_domain: str, extra_mcp_callbacks: list[str],
     不含 COGNITO——否则托管登录页仍暴露本地用户登录/注册入口，
     allowed_users="org" 的语义就被击穿（spec §3.5）。未给出时回落
     ["COGNITO"]（首次部署、联邦还没接），main() 会显式告警。
+
+    **那个 ["COGNITO"] 回落只对"新建"成立**：已存在的 client 走
+    update_user_pool_client（整体替换），把回落值盖上去等于把线上的联邦
+    provider 摘掉。所以 _ensure_clients 在 update 路径上会把这个键整个删掉，
+    让 read-modify-write 保留线上现值——详见 _idp_derived_client_keys。
     """
     # 每个 client 一份独立副本：共享同一个 list 对象时，任何一处 append
     # 会静默改掉另一个 client 的 provider 名单——而这正是 org 边界字段
@@ -346,6 +351,34 @@ def ensure_resource_server(cog, pool_id: str, *, identifier: str,
     return f"{identifier}/{scope}"
 
 
+# 探针 provider 名：**只在本进程内做比对，绝不下发给 AWS**。
+# 取一个不可能是真实 provider 名的值（Cognito 的 provider 名不含下划线包裹的
+# 这种形态，且真值来自 config.ini 的 [IdP] provider_name）。
+_PROBE_IDP = "__idp_probe__"
+
+
+def _idp_derived_client_keys(base_domain: str, extra_mcp_callbacks: list[str],
+                             *, include_machine: bool,
+                             machine_scopes: tuple[str, ...]) -> frozenset:
+    """哪些 client 的 SupportedIdentityProviders 是"跟着 [IdP] 段走"的。
+
+    用探针 IdP 名跑一遍 client_configs 再比对，**不手抄一份
+    {"site", "mcp"} 名单**：手抄的那份会在加第四个联邦 client 时腐烂，而腐烂
+    的症状恰好就是本次要修的那个缺陷（新 client 的线上 provider 名单在无
+    [IdP] 重跑时被清空）。唯一定义仍在 client_configs 里。
+
+    machine client 探不到，这是对的：它的 ["COGNITO"] 是写死的正确值
+    （client_credentials 与用户身份无关），不随 [IdP] 变，所以它照常被下发。
+    反过来若有人手工往 machine 上加了联邦 provider，重跑会纠回 COGNITO
+    ——方向是收紧，不是放开。
+    """
+    probe = client_configs(base_domain, extra_mcp_callbacks, _PROBE_IDP,
+                           include_machine=include_machine,
+                           machine_scopes=machine_scopes)
+    return frozenset(k for k, v in probe.items()
+                     if v.get("SupportedIdentityProviders") == [_PROBE_IDP])
+
+
 def _ensure_clients(cog, pool_id: str, base_domain: str,
                     extra_mcp_callbacks: list[str],
                     idp_name: str | None = None, *,
@@ -356,6 +389,17 @@ def _ensure_clients(cog, pool_id: str, base_domain: str,
     include_machine / machine_scopes **原样透传**给 client_configs：那两个参数
     在 M1 落地时没有任何调用方（machine client 属于 M4），所以这里漏加就是
     main() 一传参数就 TypeError，而 client_configs 自己的用例照样全绿。
+
+    **create 与 update 对"没有 [IdP] 段"的处理必须不同**（2026-08-12 修）：
+    client_configs 在无 IdP 时回落 ["COGNITO"]，而 update 是 read-modify-write
+    ——盖上去就把线上的联邦 provider（如 Feishu）从生产 client 上摘掉：
+      · 全部用户当场登不进（托管登录页不再有 IdP 入口）；
+      · 同时把 Cognito 本地登录/注册重新暴露出来，allowed_users="org" 的边界
+        （spec §3.5、§11）随之失效。
+    "配置缺失"在这里绝不能被当成"删掉联邦"。本仓库的一贯方向是缺/读不出配置
+    就取最严解释，而这里最严的解释是**一个字节都不动线上的 provider 名单**：
+    所以 update 路径把这个键整个删掉，让 _client_update_params 的回填保留现值。
+    create 路径没有"现值"可保留，仍用 ["COGNITO"]（main() 已为该情形告警）。
     """
     existing = {}
     token = None
@@ -368,6 +412,9 @@ def _ensure_clients(cog, pool_id: str, base_domain: str,
         if not token:
             break
 
+    federated = _idp_derived_client_keys(base_domain, extra_mcp_callbacks,
+                                         include_machine=include_machine,
+                                         machine_scopes=machine_scopes)
     out = {}
     for key, params in client_configs(base_domain, extra_mcp_callbacks,
                                       idp_name,
@@ -377,7 +424,16 @@ def _ensure_clients(cog, pool_id: str, base_domain: str,
         name = params["ClientName"]
         if name in existing:
             client_id = existing[name]
-            update = _client_update_params(cog, pool_id, existing[name], params)
+            desired = params
+            if not idp_name and key in federated:
+                # 无 [IdP] 段 → 不声明这个字段，交给 read-modify-write 保留现值
+                desired = {k: v for k, v in params.items()
+                           if k != "SupportedIdentityProviders"}
+            update = _client_update_params(cog, pool_id, existing[name], desired)
+            if desired is not params:
+                live = update.get("SupportedIdentityProviders")
+                print(f"  {name}: 无 [IdP] 段 → 保留线上 IdP 名单 "
+                      f"{live if live else '（线上未显式设置，同样不动）'}")
             cog.update_user_pool_client(UserPoolId=pool_id, ClientId=client_id,
                                         **update)
             print(f"  更新 client {name} = {client_id}")
@@ -659,9 +715,12 @@ def main() -> None:
         idp_name = idp["provider_name"]
     else:
         print("③ 跳过 IdP 联邦（config.ini 无 [IdP] 段）")
-        print("   ⚠️  未接企业 IdP：site/mcp client 暂时只能用 COGNITO 本地用户。")
+        print("   ⚠️  未接企业 IdP：**新建**的 site/mcp client 只能用 COGNITO 本地用户。")
         print("      此状态下 allowed_users=\"org\" 不代表\"全组织\"——")
         print("      接上 IdP 后重跑本脚本，client 会切成仅该 IdP。")
+        # 已存在的 client 不受影响：④ 会保留线上现有的 provider 名单
+        # （缺配置 ≠ 删联邦，见 _ensure_clients 的 docstring）。
+        print("      已存在的 client 保持线上现有 IdP 名单不变（见 ④ 的输出）。")
 
     # ④a 组件门禁（spec §5.1.1）：没配 [ApiKey] 段 = 平台只允许 OAuth 一条路径，
     # 此时**不建** resource server、也不建 machine client。这是"API Key 是可选
