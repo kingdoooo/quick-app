@@ -466,8 +466,16 @@ def upload_frontend() -> int:
     return n
 
 
-def register_route(function_url: str) -> None:
+def register_route(function_url: str, static_prefix: str | None = None) -> None:
+    """写 console route。`static_prefix` 只在 `--skip-frontend` 时传。
+
+    传值 = "保留线上现有前缀"。默认 None 走 `console_route_item` 里按**内容指纹**
+    算出的新前缀（正常全量部署的语义）。见 main() 里那段注释：只部后端却把 route
+    挪到未上传的前缀上，会让控制台整站 403 而部署脚本全程"成功"。
+    """
     item = console_route_item(function_url)
+    if static_prefix is not None:
+        item["static_prefix"] = static_prefix
     boto3.resource("dynamodb", region_name=_region()).Table(
         _cfg("Platform", "routing_table")).put_item(Item=item)
 
@@ -500,7 +508,29 @@ def main() -> int:
         print(f"   {upload_frontend()} 个文件 → {frontend_prefix()}")
 
     print("⑤ 注册 console route")
-    register_route(url)
+    # **`--skip-frontend` 时绝不能把 route 挪到新算出来的前缀上。**
+    # 2026-08-13 实测踩到：前缀是**前端内容的指纹**，所以改过前端之后即使这次
+    # 只部后端，`frontend_prefix()` 也会算出一个新值——而 `--skip-frontend`
+    # 跳过了上传，于是 route 指向一个**从未上传过的前缀**，控制台整站 403/404。
+    # 症状还特别隐蔽：部署脚本全程"成功"，只有真去开页面才发现
+    # （这次是 verify_deployed_components ⑦ 段的"首页对象存在"抓出来的）。
+    # 正确语义：只部后端时保留线上现有前缀（那份前端还在，是可用的）。
+    keep = None
+    if args.skip_frontend:
+        cur = boto3.resource("dynamodb", region_name=_region()).Table(
+            _cfg("Platform", "routing_table")).get_item(
+                Key={"subdomain": "console"}, ConsistentRead=True).get("Item")
+        cur_prefix = str((cur or {}).get("static_prefix", ""))
+        if not cur_prefix:
+            sys.exit("--skip-frontend 但线上没有 console route（或没有 "
+                     "static_prefix）——首次部署不能跳过前端")
+        if cur_prefix != frontend_prefix():
+            print(f"   ⚠️  前端内容已变（线上 {cur_prefix} → 本地算出 "
+                  f"{frontend_prefix()}），但本次 --skip-frontend 没上传。")
+            print("      **保留线上前缀**，不把 route 指向未上传的对象。"
+                  "要发布新前端请去掉 --skip-frontend 重跑。")
+        keep = cur_prefix
+    register_route(url, static_prefix=keep)
     print(f"   https://{console_host()}/")
     return 0
 

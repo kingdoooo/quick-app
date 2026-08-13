@@ -409,9 +409,13 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    #    连飞书都连不上，比泄漏本身严重得多。用 jq 保住其它字段：
    NEW="$(openssl rand -base64 36 | tr -d '\n' | cut -c1-48)"
    ARN="<adapter-secret-arn>"
+   #    **用 `env.NEW` 而不是 `jq --arg s "$NEW"`**：后者会把展开后的明文放进
+   #    jq 的**进程参数**里，同机的 `ps` / 进程审计能看到它，与"密文不进命令
+   #    参数"的目标相矛盾（Codex 审查 2026-08-13 P2-2）。环境变量只有同一用户
+   #    读得到 /proc/<pid>/environ，暴露面小一档。
    aws secretsmanager get-secret-value --secret-id "$ARN" \
         --query SecretString --output text \
-     | jq --arg s "$NEW" '.cognitoClientSecret = $s' \
+     | NEW="$NEW" jq '.cognitoClientSecret = env.NEW' \
      | aws secretsmanager put-secret-value --secret-id "$ARN" \
          --secret-string file:///dev/stdin
    #    改完核对**键的数量与名字没变**（只打键名，不打值）：
@@ -437,8 +441,30 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    secret）。拿上面那张「登录链路实测基线」表对照。失败症状是回调
    `invalid_client` —— 此时把 ③④ 两侧都回滚成旧值即可恢复。
 
-   **回滚**：把 ③ 和 ④ 都换回旧 secret。所以第 ① 步的指纹要留着——它是"我回滚到
-   的确实是原来那个值"的唯一凭据（旧明文不该留副本）。
+   **回滚**：旧明文不该留副本，所以回滚**不是**"把旧值粘回去"，而是从
+   Secrets Manager 的 `AWSPREVIOUS` 版本取回它（`put-secret-value` 会自动把上一版
+   打成这个标签）。第 ① 步那个指纹的作用是**核对**，不是还原——指纹不可逆
+   （Codex 审查 2026-08-13 P2-2 指出原文这里自相矛盾）。
+
+   ```bash
+   # ③' 适配器一侧：把 cognitoClientSecret 换回上一版的值（其余字段取当前版本，
+   #     只回退这一个键——同一条记录里还有飞书 App Secret）
+   OLD="$(aws secretsmanager get-secret-value --secret-id "$ARN" \
+            --version-stage AWSPREVIOUS --query SecretString --output text \
+          | jq -r '.cognitoClientSecret')"
+   aws secretsmanager get-secret-value --secret-id "$ARN" \
+        --query SecretString --output text \
+     | OLD="$OLD" jq '.cognitoClientSecret = env.OLD' \
+     | aws secretsmanager put-secret-value --secret-id "$ARN" \
+         --secret-string file:///dev/stdin
+   unset OLD
+   # ④' Cognito 一侧：重跑第 ④ 步那条 asm-exec 命令（它从 Secrets Manager 读，
+   #     所以 ③' 落盘之后它自然拿到回退后的值）
+   # ⑤' 再打一次指纹：必须回到第 ① 步记下的那个值
+   ```
+
+   注意 `AWSPREVIOUS` 只保留**一代**。如果轮换后又误改了一次，第一次的旧值就
+   取不回来了——所以每次只改一个键、改完立刻验证登录，别连续改两轮。
 
    它建平台专用 pool（关自注册 + ESSENTIALS tier）、site/mcp 两个 app client
    （**不列 COGNITO**，只列你的 IdP）、branding、OIDC 联邦（含
@@ -1216,6 +1242,42 @@ python3 site-builder/scripts/verify_oauth_and_impersonation.py  # 需先 auth.js
 - **机器 token 的 scope 是 `{resource_server_id}/{scope}` 拼好的完整串**，拼接
   只在 `api_key_config.machine_scope` 发生一次。两处各拼一次会出现"建的 scope 与
   换 token 用的不是同一个"，而 Cognito 报 `invalid_scope`、文案指向 client 配置。
+
+### 下线这个组件（**删掉 `[ApiKey]` 段是不够的**）
+
+Codex 审查 2026-08-13 P1-3：组件门禁只对**首次部署**成立。已经启用过之后再把
+`config.ini` 的 `[ApiKey]` 段删掉，`deploy_key_proxy.py` 会打印"跳过"并返回 0、
+**一次 AWS 调用都不发**——于是线上的 Lambda、`mcp` route、已开的哨兵行、
+未吊销的 Key、machine client 与它的 SSM secret **一个都不会被拆**。
+配置显示 OAuth-only 而凭证通道仍然通，这正是本项目反复栽过的双真源。
+
+**正确的下线顺序**（先断通道，再拆资源——反过来会留下一段"route 还在但后端没了"
+的 502 窗口）：
+
+```bash
+# ① 先关闸：所有 Key 立刻 401（管理员在控制台点，或用上面的应急旁路命令）
+# ② 吊销存量 Key（可选但建议：留着的话将来重新开闸它们会立刻复活）
+#    按人吊销用 scripts/revoke_keys_for.py；要全量的话遍历 email-index
+# ③ 摘掉 route（Edge 立刻不再把 mcp 子域转给 key-proxy）
+aws dynamodb delete-item --region us-east-1 \
+  --table-name "$(python3 -c "import configparser;c=configparser.ConfigParser(interpolation=None);c.read('site-builder/config.ini');print(c['Platform']['routing_table'].split('#')[0].strip())")" \
+  --key '{"subdomain":{"S":"mcp"}}'
+# ④ 删 Lambda 与 Function URL
+aws lambda delete-function --region us-east-1 --function-name site-key-proxy
+# ⑤ 关掉网关侧两道门禁：删 config.ini 的 [ApiKey] 段后重跑
+cd site-builder/mcp && python3 deploy_agentcore.py   # machine client 出 allowedClients、
+                                                     # on-behalf 头出 allowlist
+# ⑥ 收掉 machine client 与它的 secret（Cognito + SSM）——按需
+# ⑦ 核对：无 [ApiKey] 段时 ⑧ 段会跑 absence 断言（**不是 SKIP**）
+python3 site-builder/scripts/verify_deployed_components.py
+```
+
+第 ⑦ 步是这套流程能不能信的关键：`verify_deployed_components.py` 在**无
+`[ApiKey]` 段**时不再 SKIP，而是断言"线上真的没有这条通道"——Lambda 不存在、
+route 不存在、总开关不是开、`allowedClients` 没多出 machine client、
+allowlist 没有 on-behalf 头。**凭证表本身是 `RemovalPolicy.RETAIN` + deletion
+protection，不会也不该被删**（历史 Key 行是审计证据）；断言盯的是"开关不是开"，
+因为只要它是开的、又还有未吊销的 Key，通道就仍然是通的。
 
 ### 已知取舍（向使用方说明）
 

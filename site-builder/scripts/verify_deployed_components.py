@@ -68,6 +68,9 @@ MIN_DEPLOYED_CHECKS = 20    # ③ 2 + ④ 2 + ⑤ 7 + ⑥ 3 + ⑦ 6
 # Function URL 3 + EDGE_ROLE_ID 1 + 环境变量整体 1 + route 6 + Edge 白名单 1 +
 # runtime 3 + 哨兵行 2 + role 2 = 23
 MIN_KEY_PROXY_CHECKS = 23
+# 无 [ApiKey] 段时改跑 absence 断言（Codex P1-3）：Lambda / route / 开关 /
+# allowedClients / allowlist 五条。**不是 SKIP**——见 _verify_component_is_absent。
+MIN_KEY_PROXY_ABSENT_CHECKS = 5
 # 实际下限由 main() 按"这次真跑了哪几段"累加，finally 里读它。初值是本地那部分
 # ——main() 之前就崩掉时走的是 crashed 分支，不靠这个值。
 min_expected = MIN_LOCAL_CHECKS
@@ -850,6 +853,81 @@ def _check_key_proxy_role_is_narrow(dkp, cfg) -> None:
           if not same else f"{len(want)} 条语句逐条相同")
 
 
+def _verify_component_is_absent(cfg, api_key_config) -> int:
+    """无 `[ApiKey]` 段时：断言线上**真的**没有这条凭证通道（Codex P1-3）。
+
+    spec §5.1.1 承诺的是"整段不配 = 平台只允许 OAuth 一条认证路径"。但那只对
+    **首次部署**成立——组件已经启用过再把配置段删掉，`deploy_key_proxy.py` 会
+    报告"跳过"并返回 0，而线上的 Lambda / route / 已开的哨兵行**一个都不会被拆**
+    （凭证表是 RemovalPolicy.RETAIN）。于是配置与线上成了两个真源，而这正是本项目
+    反复栽过的那一类（`config.ini` 里那个 `enabled` 键就是同一个陷阱）。
+
+    子域名从 `DEFAULT_MCP_SUBDOMAIN` 取：配置段没了，`mcp_subdomain(cfg)` 返回
+    空串，但线上那条 route 用的是**当初**的名字。默认值是绝大多数部署的实际取值；
+    若当初自定义过，本段查不到它——所以退化时的文案要说清这一点，别让人以为
+    "查过了没有"。
+    """
+    import boto3
+
+    region = read_cfg("Platform", "region")
+    sub = api_key_config.DEFAULT_MCP_SUBDOMAIN
+    print("  config.ini 无 [ApiKey] 段 → 断言线上这条通道**真的不存在**"
+          f"（子域按默认名 {sub!r} 探测）")
+
+    lam = boto3.client("lambda", region_name=region)
+    try:
+        lam.get_function_configuration(FunctionName="site-key-proxy")
+        gone = False
+    except lam.exceptions.ResourceNotFoundException:
+        gone = True
+    check(gone, "site-key-proxy 已不存在",
+          "**仍在线**——删配置段不会拆组件，见 DEPLOY.md ⑤c 的下线步骤"
+          if not gone else "")
+
+    route = boto3.resource("dynamodb", region_name=region).Table(
+        read_cfg("Platform", "routing_table")).get_item(
+            Key={"subdomain": sub}, ConsistentRead=True).get("Item")
+    check(route is None, f"{sub} route 已不存在",
+          f"**route 仍在**，指向 {str(route.get('api_target'))[:40]}…"
+          if route else "")
+
+    # 哨兵行在 RETAIN 表里，删配置段不会动它。**开着的哨兵行 + 活着的 Key
+    # = 通道仍然通**，所以这里断言"要么没这行，要么它是关的"。
+    try:
+        row = boto3.resource("dynamodb", region_name=region).Table(
+            "site-api-keys").get_item(Key={"key_hash": "__switch__"},
+                                      ConsistentRead=True).get("Item")
+    except Exception:                       # noqa: BLE001 表可能已经不在
+        row = None
+    off = row is None or row.get("enabled") is not True
+    check(off, "总开关不是「开」（凭证表是 RETAIN，删配置段不会关它）",
+          "**哨兵行 enabled=true**——只要还有未吊销的 Key，通道就是通的"
+          if not off else ("哨兵行不存在" if row is None else "已关"))
+
+    # 网关侧的两道门禁：machine client 与 on-behalf 头都不该还在
+    try:
+        acc = boto3.client("bedrock-agentcore-control", region_name=region)
+        rts = acc.list_agent_runtimes().get("agentRuntimes", [])
+        t = [r for r in rts if r.get("agentRuntimeName") == "site_builder_deploy"]
+        rt = acc.get_agent_runtime(agentRuntimeId=t[0]["agentRuntimeId"]) if t else {}
+        allowed = list((rt.get("authorizerConfiguration", {})
+                        .get("customJWTAuthorizer", {}).get("allowedClients") or []))
+        allowlist = list((rt.get("requestHeaderConfiguration", {})
+                          .get("requestHeaderAllowlist") or []))
+    except Exception as exc:                # noqa: BLE001
+        check(False, "读到 AgentCore runtime 配置", f"{type(exc).__name__}: {exc}")
+        return MIN_KEY_PROXY_ABSENT_CHECKS
+    check(len(allowed) <= 1,
+          "allowedClients 里没有多出来的 machine client",
+          f"有 {len(allowed)} 个 client——多出来的那个还能换机器 token"
+          if len(allowed) > 1 else "只有 mcp client")
+    check(api_key_config.ON_BEHALF_HEADER not in allowlist,
+          f"requestHeaderAllowlist 里没有 {api_key_config.ON_BEHALF_HEADER}",
+          f"**头仍在白名单里**: {allowlist}"
+          if api_key_config.ON_BEHALF_HEADER in allowlist else str(allowlist))
+    return MIN_KEY_PROXY_ABSENT_CHECKS
+
+
 def run_key_proxy() -> int:
     """⑧ 线上 key-proxy（M4 API Key 交换层）。
 
@@ -871,9 +949,15 @@ def run_key_proxy() -> int:
 
     print("\n── ⑧ 线上 key-proxy（M4 API Key 交换层）─────────────")
     if not api_key_config.api_key_enabled(cfg):
-        print("  SKIP  config.ini 无 [ApiKey] 段 = 平台只允许 OAuth 一条认证路径"
-              "（组件按设计不存在，不是缺陷）")
-        return 0
+        # **不 SKIP，而是断言组件真的不存在**（Codex 审查 2026-08-13 P1-3）。
+        # 原来这里直接 SKIP，于是"配置显示 OAuth-only 而线上凭证通道仍然活着"
+        # 这个状态**没有任何闸门查得出来**——而 spec §5.1.1 承诺的正是"无
+        # [ApiKey] 段 = 平台只允许 OAuth 一条认证路径"。
+        # 组件门禁只对**首次部署**成立：`deploy_key_proxy.py` 看到无该段就返回 0、
+        # 一次 AWS 调用都不发，所以它**不会拆除**已经存在的 Lambda / route /
+        # 已开的哨兵行（凭证表还是 RETAIN 的）。把 SKIP 换成 absence 断言，
+        # 是让"我以为关了"与"真的关了"这两件事不再靠人的记忆区分。
+        return _verify_component_is_absent(cfg, api_key_config)
 
     region = read_cfg("Platform", "region")
     lam = boto3.client("lambda", region_name=region,

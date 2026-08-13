@@ -757,3 +757,50 @@ def test_docstring_no_longer_claims_rollback_it_cannot_do():
         assert "不可变" in body or "immutable" in body.lower(), (
             "仍然声称可回滚，但没说明是靠「前缀不可变」实现的——"
             "桶没开版本控制，覆盖式部署下这句话是假的")
+
+
+def test_skip_frontend_must_not_move_route_to_an_unuploaded_prefix():
+    """`--skip-frontend` 时 route 必须**保留线上前缀**，不能指向未上传的对象。
+
+    2026-08-13 实测踩到的真机缺陷：前缀是**前端内容的指纹**，所以改过前端之后
+    即使这次只部后端，`frontend_prefix()` 也算出一个新值；而 `--skip-frontend`
+    跳过了上传，于是 route 指向一个从未上传过的前缀 → 控制台整站 403/404，
+    而部署脚本全程打印"成功"。是 verify_deployed_components ⑦ 段的"首页对象存在"
+    抓出来的。
+
+    这里锁两件事：`register_route` 接受 `static_prefix` 覆盖；传了就用它，
+    不传就用按内容指纹算的那个（正常全量部署的语义）。
+    """
+    import inspect
+    sig = inspect.signature(dp.register_route)
+    assert "static_prefix" in sig.parameters, (
+        "register_route 没有 static_prefix 参数——--skip-frontend 就只能把 route "
+        "挪到新算出来的前缀上，而那个前缀没有对象")
+    assert sig.parameters["static_prefix"].default is None, (
+        "static_prefix 默认值必须是 None（= 用内容指纹算出的新前缀）")
+
+    captured = {}
+    dp.console_route_item  # 触发属性存在性
+    item = dp.console_route_item("https://example.invalid")
+    assert item["static_prefix"] == dp.frontend_prefix(), (
+        "默认路径应当用内容指纹前缀")
+    # 覆盖路径：模拟 --skip-frontend 保留线上旧前缀
+    import boto3
+    real = boto3.resource
+
+    class _T:
+        def put_item(self, Item):
+            captured.update(Item)
+
+    class _R:
+        def Table(self, _name):
+            return _T()
+
+    boto3.resource = lambda *a, **k: _R()
+    try:
+        dp.register_route("https://example.invalid",
+                          static_prefix="platform/console/OLD")
+    finally:
+        boto3.resource = real
+    assert captured["static_prefix"] == "platform/console/OLD", (
+        f"传了 static_prefix 却没生效: {captured.get('static_prefix')}")
