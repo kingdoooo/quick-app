@@ -52,10 +52,16 @@ class SiteDeployerStack(Stack):
         # [Platform] admin_seed 幂等注入；之后由控制台增删（不走重部署）。
         # RETAIN 是有意为之：名单误删会让平台失去管理入口，与 jobs/sites 的
         # DESTROY 语义不同——删栈时保留此表。
+        # `deletion_protection` 与 RETAIN 是两道不同的保护，见 api_keys 处的
+        # 长注释。**不变量**：凡是设了 RETAIN 的表（= 我们已经判定"这份数据不能
+        # 丢"），都要一并挡住直接 `DeleteTable`——否则 RETAIN 只是挡了删栈，一条
+        # aws CLI 照样能删掉它。由 test_every_retained_table_has_deletion_protection
+        # 按模板里的 DeletionPolicy 推导校验，新增 RETAIN 表时会自动要求这一条。
         admins = ddb.Table(self, "Admins", table_name="site-admins",
                            partition_key=ddb.Attribute(name="email",
                                                        type=ddb.AttributeType.STRING),
                            billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
+                           deletion_protection=True,
                            removal_policy=RemovalPolicy.RETAIN)
 
         # 二期 M3：操作审计（append-only）。写入方只被授予 PutItem。
@@ -66,6 +72,7 @@ class SiteDeployerStack(Stack):
             sort_key=ddb.Attribute(name="ts_actor", type=ddb.AttributeType.STRING),
             billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
             time_to_live_attribute="expires_at",
+            deletion_protection=True,        # 同上：RETAIN 挡不住 DeleteTable
             removal_policy=RemovalPolicy.RETAIN)
 
         # 二期 M3：面板会话升级的一次性 code 消费标记（jti）。

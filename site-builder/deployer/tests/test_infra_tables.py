@@ -129,23 +129,33 @@ def test_api_keys_table_is_retained(template):
         "Properties": {"TableName": "site-api-keys"}})
 
 
-def test_api_keys_table_has_deletion_protection(template):
-    """凭证表还要挡**直接 `DeleteTable`**，不只是挡删栈。
+def test_every_retained_table_has_deletion_protection(template):
+    """**不变量（按类断言，不列表名）**：设了 `DeletionPolicy: Retain` 的表，
+    必须同时有 `DeletionProtectionEnabled`。
 
-    `RemovalPolicy.RETAIN`（上一条用例）管的是 CloudFormation 删栈/替换资源；
-    它对"有人拿着 `dynamodb:DeleteTable` 直接删表"**一点保护都没有**。这张表
-    误删无法恢复（服务端不存明文，用户手里的 Key 再也对不上任何行），所以两道
-    都要。
+    两者防的不是同一件事：RETAIN 只在**删栈/替换资源**时起作用，对"有人拿着
+    `dynamodb:DeleteTable` 直接删表"一点保护都没有。而给一张表设 RETAIN 本身就
+    等于声明了"这份数据不能丢"——那个声明不该只在删栈这一条路径上成立。
 
-    断言写在 `Properties` 里（与 RETAIN 那条的 resource 级字段不同）——
-    `DeletionProtectionEnabled` 是表属性，不是 CFN 的 DeletionPolicy。
+    **为什么按 DeletionPolicy 推导、而不是写死三个表名**：写死表名的话，下一个人
+    加一张新的 RETAIN 表时这条照样绿，于是同一个洞再开一个。本项目已经反复栽在
+    "手抄的清单就是下一个漂移源"上（M3-FINDINGS §2.18、M4-FINDINGS §3.9）。
+    这条断言的覆盖面**跟着 RETAIN 的声明自动长**。
+
+    反过来不断言：DESTROY 语义的表（jobs / sites / session-codes）**不该**加保护
+    ——`site-session-codes` 是 60 秒 TTL 的一次性标记，给它加保护会让
+    `cdk destroy` 卡在一张按设计可丢的表上。
     """
     tables = template.find_resources("AWS::DynamoDB::Table")
-    keys_tbl = next(t for t in tables.values()
-                    if t["Properties"].get("TableName") == "site-api-keys")
-    assert keys_tbl["Properties"].get("DeletionProtectionEnabled") is True, (
-        "site-api-keys 少了 DeletionProtectionEnabled——RETAIN 只挡删栈，"
-        "挡不住一条 aws dynamodb delete-table")
+    retained = {t["Properties"].get("TableName"): t for t in tables.values()
+                if t.get("DeletionPolicy") == "Retain"}
+    assert retained, "模板里一张 RETAIN 表都没有——本用例的前提已失效，先查 app.py"
+    missing = sorted(name for name, t in retained.items()
+                     if t["Properties"].get("DeletionProtectionEnabled") is not True)
+    assert not missing, (
+        f"这些表设了 RETAIN 却没开 DeletionProtection: {missing}。"
+        "RETAIN 只挡删栈，挡不住一条 aws dynamodb delete-table——而 RETAIN 本身"
+        "就是在声明这份数据不能丢。")
 
 
 def test_jobs_has_site_index(template):
