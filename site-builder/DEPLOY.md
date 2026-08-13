@@ -1219,9 +1219,30 @@ python3 site-builder/scripts/verify_oauth_and_impersonation.py  # 需先 auth.js
 
 ### 已知取舍（向使用方说明）
 
-- **用户离职后旧 Key 仍然有效**（决定 8）：Key 绑的是 email 字符串，不联动 IdP
-  的账号状态。离职流程里要显式吊销该用户的 Key（控制台按 owner 列得出来），
-  或整体关闸。OAuth 那条路径不受影响——那边一撤销 IdP 账号就登不进来。
+- **用户离职后旧 Key 仍然有效**（决定 8）：Key 绑的是 email 字符串，
+     **不联动 IdP 的账号状态**。IdP 账号一禁用，OAuth 那条路立刻走不通，
+     但他手里的 Key 还能建新站点、重新部署、改自己仍有权限站点的策略，并持续
+     产生 AWS 费用。所以离职流程里必须显式吊销：
+
+     ```bash
+     python3 site-builder/scripts/revoke_keys_for.py 离职者@example.com        # dry-run
+     python3 site-builder/scripts/revoke_keys_for.py 离职者@example.com --yes  # 执行
+     ```
+
+     **控制台做不到这件事**（2026-08-13 更正）：本文档此前写的"控制台按 owner
+     列得出来"是**错的**——`do_list_keys` 只查调用者自己的 email 分区、
+     `keystore.revoke` 硬性要求 `row.email == actor`，管理员手里只有全局总开关
+     （关掉会同时中断所有正常用户，不能当常规 offboarding 手段）。
+     一个**不存在的补偿控制比没有更糟**：它让人以为 offboarding 已经有办法了。
+     上面那个脚本就是这句话的落地（带 ops_log 审计，action 是
+     `revoke_api_key_offboard`，与本人自助吊销分得开）。
+
+     它**刻意不接进控制台**："能吊销任意人的 Key"放进公网端点要多背一整套授权面
+     （谁算 admin、CSRF、防 key_id 枚举），而 offboarding 本来就是带 AWS 凭证的
+     运维动作——攻击面留在 IAM 比留在 HTTP 小。
+
+     注意吊销 Key **不影响**他已部署站点的存在，只断掉用 Key 调部署 MCP 的通道；
+     站点的所有权转移/下线是另一件事。
 - Key **只认证"谁在调部署 MCP"**，与访问已部署站点的 `require_login` /
   `allowed_users` 是两套独立的认证平面，它碰不到站点访问。
 - 明文 Key 在服务端**只出现一次**（创建响应）。用户没抄下来只能吊销重发；

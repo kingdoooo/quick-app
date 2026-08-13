@@ -1085,3 +1085,38 @@ def test_getitem_is_not_attribute_restricted():
     cond = gets[0].get("Condition", {})
     assert "dynamodb:Attributes" not in str(cond), (
         "GetItem 带了字段限制——lookup 读不到 email/revoked/enabled 会拒绝所有 Key")
+
+
+# ── P1-2（Codex 审查 2026-08-13）：offboarding 能力的边界 ────────────────────
+
+def test_panel_never_calls_revoke_all_for():
+    """`revoke_all_for` **不得**接进 panel 的 HTTP 面。
+
+    它能吊销**任意人**的 Key。放进公网端点就要额外背一整套授权面（谁算 admin、
+    CSRF、防 key_id 枚举），而 offboarding 本来就是带 AWS 凭证的运维动作——
+    攻击面留在 IAM 比留在 HTTP 小得多。
+
+    断言 panel 的两个文件都不提它：`api.py`（分发层）与 `handler.py`（路由层）。
+    将来真要做成控制台功能，改这条断言的人会被迫先读上面这段理由。
+    """
+    panel = Path(dkp.__file__).parents[1] / "panel"
+    for name in ("api.py", "handler.py"):
+        src = (panel / name).read_text()
+        assert "revoke_all_for" not in src, (
+            f"panel/{name} 引用了 revoke_all_for——那是运维脚本专用的能力，"
+            "接进 HTTP 面需要先设计 admin 授权与防枚举")
+
+
+def test_key_proxy_role_cannot_perform_offboarding_revoke():
+    """纵深：key-proxy 的包里**有** revoke_all_for 的代码，但**没有**权限跑它。
+
+    它写 `revoked` 字段，而 UpdateItem 已按字段收窄到 key_hash + last_used_at
+    （P1-1）。所以即使 handler 被改成去调它，真机也是 AccessDenied——
+    "代码在但权限不在"，与包里带着 `keystore.create` 是同一个模式。
+    """
+    upd = [s for s in dkp.role_statements(_cfg())
+           if "dynamodb:UpdateItem" in _actions(s)]
+    attrs = set(upd[0].get("Condition", {})
+                .get("ForAllValues:StringEquals", {}).get("dynamodb:Attributes", []))
+    assert "revoked" not in attrs, (
+        "UpdateItem 允许写 revoked——key-proxy 就能自己吊销别人的 Key 了")

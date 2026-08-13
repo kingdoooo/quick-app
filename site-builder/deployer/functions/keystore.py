@@ -403,6 +403,64 @@ def revoke(key_id: str, *, actor: str) -> dict:
     return {"key_id": key_id, "revoked": True}
 
 
+
+def revoke_all_for(email: str, *, actor: str) -> dict:
+    """**离职 offboarding**：吊销某个 email 的全部 Key。`actor` 与 `email` 不同。
+
+    为什么必须有这个函数（Codex 审查 2026-08-13 P1-2）：`revoke()` 硬性要求
+    `row.email == actor`，`list_for()` 只查调用者自己的分区，admin 只有全局开关。
+    于是"用户离职后显式吊销他的 Key"这个**文档里承诺过的补偿控制在实现上不存在**
+    ——DEPLOY.md 甚至写了"控制台按 owner 列得出来"，那是错的。一个不存在的补偿
+    控制比没有更糟：它让人以为 offboarding 已经有办法了。
+
+    **刻意不接进 panel 的 HTTP 面**：它跑在运维手里（要 AWS 凭证），由
+    `scripts/revoke_keys_for.py` 调用。理由是"能吊销任意人的 Key"这个能力放进
+    公网端点会多出一整套授权面（谁算 admin、怎么防 CSRF、怎么防枚举），而
+    offboarding 本来就是带凭证的运维动作。`test_panel_never_calls_revoke_all_for`
+    盯着这条边界。
+
+    **不是"删行"而是置 `revoked`**，与 `revoke()` 同理：删了就没有审计痕迹。
+    每一把都单独落一条 ops_log（action 与自助吊销**分开**，事后能区分"本人吊销"
+    与"离职被吊销"）。
+
+    落地的 `UpdateItem` 重新断言 `email`：GSI 最终一致，可能返回一行已经改过
+    email 的旧投影——那时宁可这一把失败让运维重跑，也不能吊销错人的 Key。
+
+    返回 `{"revoked": [...], "already_revoked": [...], "failed": [...]}`。
+    **调用方必须检查 `failed`**：部分吊销是真实存在的中间态，静默忽略它等于
+    "报告已 offboard 而实际还有活着的 Key"。
+    """
+    if not isinstance(email, str) or not permissions.EMAIL_RE.fullmatch(email):
+        raise ValueError(f"非法邮箱: {email!r}")
+    if not isinstance(actor, str) or not actor:
+        raise ValueError("actor 不能为空——吊销他人 Key 必须记得下是谁做的")
+    # 这里**不能用 list_for**：它把 key_hash 摘掉了（那是有意的），而落地要用它做主键
+    rows = common._paginate(_table().query, IndexName="email-index",
+                            KeyConditionExpression=Key("email").eq(email))
+    out = {"revoked": [], "already_revoked": [], "failed": []}
+    for row in rows:
+        kid = row.get("key_id", "")
+        if row.get("revoked"):
+            out["already_revoked"].append(kid)
+            continue
+        try:
+            _table().update_item(
+                Key={"key_hash": row["key_hash"]},
+                UpdateExpression="SET #rv = :t, revoked_at = :n, revoked_by = :a",
+                ConditionExpression="#em = :em",
+                ExpressionAttributeNames={"#rv": "revoked", "#em": "email"},
+                ExpressionAttributeValues={":t": True, ":n": _now_iso(),
+                                           ":a": actor, ":em": email})
+        except Exception as e:            # noqa: BLE001 逐把记账，不中断整批
+            logger.warning("离职吊销失败 key_id=%s: %s", kid, type(e).__name__)
+            out["failed"].append(kid)
+            continue
+        ops_log.record(actor=actor, action="revoke_api_key_offboard",
+                       target=f"apikey:{email}", result="ok",
+                       detail={"key_id": kid, "reason": "offboarding"})
+        out["revoked"].append(kid)
+    return out
+
 # --------------------------------------------------------------------- 总开关
 
 def switch_state() -> tuple[bool, bool]:
