@@ -129,6 +129,25 @@ def test_api_keys_table_is_retained(template):
         "Properties": {"TableName": "site-api-keys"}})
 
 
+def test_api_keys_table_has_deletion_protection(template):
+    """凭证表还要挡**直接 `DeleteTable`**，不只是挡删栈。
+
+    `RemovalPolicy.RETAIN`（上一条用例）管的是 CloudFormation 删栈/替换资源；
+    它对"有人拿着 `dynamodb:DeleteTable` 直接删表"**一点保护都没有**。这张表
+    误删无法恢复（服务端不存明文，用户手里的 Key 再也对不上任何行），所以两道
+    都要。
+
+    断言写在 `Properties` 里（与 RETAIN 那条的 resource 级字段不同）——
+    `DeletionProtectionEnabled` 是表属性，不是 CFN 的 DeletionPolicy。
+    """
+    tables = template.find_resources("AWS::DynamoDB::Table")
+    keys_tbl = next(t for t in tables.values()
+                    if t["Properties"].get("TableName") == "site-api-keys")
+    assert keys_tbl["Properties"].get("DeletionProtectionEnabled") is True, (
+        "site-api-keys 少了 DeletionProtectionEnabled——RETAIN 只挡删栈，"
+        "挡不住一条 aws dynamodb delete-table")
+
+
 def test_jobs_has_site_index(template):
     tables = template.find_resources("AWS::DynamoDB::Table")
     jobs = [t for t in tables.values()

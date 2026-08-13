@@ -81,11 +81,21 @@ class SiteDeployerStack(Stack):
         # ——库被读走时攻击者只拿到哈希，反推不出可用的 Key（spec §5.1）。
         # RETAIN 与 admins/ops_log 同理：这是凭证表，误删等于全体 Key 用户断服，
         # 而且**无法恢复**（服务端不存明文，用户手里的 Key 再也对不上任何行）。
+        # **`deletion_protection` 与 `RemovalPolicy.RETAIN` 防的不是同一件事**，
+        # 两个都要（2026-08-13 补）：
+        #   · RETAIN 只在**删栈/替换资源**时起作用——CloudFormation 不删这张表；
+        #   · deletion_protection 挡的是**直接调 `DeleteTable`**：控制台点删除、
+        #     一条 aws CLI、任何拿到 `dynamodb:DeleteTable` 的脚本或自动化。
+        #     开了之后必须先显式关掉保护才能删，多一道人工确认。
+        # 对这张表值得多花这一道：它是凭证表，误删**无法恢复**——服务端不存明文，
+        # 用户手里的 Key 再也对不上任何行，而且症状是"全体 Key 用户同时断服"。
+        # 代价：`cdk destroy` 会在这张表上失败，要先手工关保护。这是有意的取舍。
         api_keys = ddb.Table(
             self, "ApiKeys", table_name="site-api-keys",
             partition_key=ddb.Attribute(name="key_hash",
                                         type=ddb.AttributeType.STRING),
             billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
+            deletion_protection=True,
             removal_policy=RemovalPolicy.RETAIN)
         # 控制台按人列 Key。
         api_keys.add_global_secondary_index(
