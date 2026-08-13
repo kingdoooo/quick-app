@@ -259,13 +259,41 @@ def role_statements(cfg=None) -> list[dict]:
     region, acct = _region(cfg), _account(cfg)
     tbl = f"arn:aws:dynamodb:{region}:{acct}:table"
     return [
-        # lookup 的两次强一致 GetItem（开关行 + Key 行）与 touch_last_used 的
-        # 条件 UpdateItem。权限集不手抄：
-        # test_role_grants_exactly_what_the_key_proxy_paths_need 从 keystore.py
-        # 的 AST 推导 lookup / touch_last_used 实际用到的操作再交叉核对。
-        {"Sid": "ApiKeysLookupAndTouch", "Effect": "Allow",
-         "Action": ["dynamodb:GetItem", "dynamodb:UpdateItem"],
+        # lookup 的两次强一致 GetItem（开关行 + Key 行）。**读整行**——判定要用到
+        # email / revoked / enabled，所以这一条不能带 dynamodb:Attributes 限制。
+        # 权限集不手抄：test_role_grants_exactly_what_the_key_proxy_paths_need
+        # 从 keystore.py 的 AST 推导 lookup / touch_last_used 实际用到的操作。
+        {"Sid": "ApiKeysLookupRead", "Effect": "Allow",
+         "Action": "dynamodb:GetItem",
          "Resource": f"{tbl}/{API_KEYS_TABLE}"},
+        # touch_last_used 的节流写。**必须按字段收窄，不能只给裸 UpdateItem**
+        # （Codex 审查 2026-08-13 P1-1，本仓库实测 IAM 引擎判为 allowed）：
+        #   · DynamoDB 的 UpdateItem 默认是 **upsert**——主键不存在就建行。
+        #     `_update_last_used` 自己带了 `attribute_exists(key_hash)` 挡住它，
+        #     但那是**代码层**的防线，而这条授权要防的是"代码被绕过"
+        #     （公网组件被 RCE 后攻击者直接拿这个 role 调 API）；
+        #   · 不带字段限制时可以写**任意**属性，于是能
+        #     ① 造一行带任意 email 的凭证（伪造的 Key 从此可从任何地方经正常路径
+        #        使用，**RCE 修好之后依然有效** = 持久化后门）；
+        #     ② 把 `__switch__.enabled` 改回 true，**击穿管理员的应急关闸**。
+        #
+        # 需要说清的是：被 RCE 的 key-proxy 本来就能冒充任何人（它持有
+        # MACHINE_SECRET_PARAM、能换机器 token，而容器信任的正是它发的
+        # X-SB-On-Behalf-Of）。所以这条收窄挡的**不是**"冒充"，而是上面那两条
+        # ——持久化与关闸完整性。定级按这两条，别按"防冒充"。
+        #
+        # `ForAllValues` 的语义陷阱：条件键缺失时它返回 true。这里可以接受——
+        # UpdateItem 请求必然带主键，`dynamodb:Attributes` 不可能缺。
+        # `ReturnValues` 用 `IfExists`：我们的调用不传该参数（默认 NONE），
+        # 而显式传 ALL_OLD 的攻击请求会被拒——否则 UpdateItem 能被当读接口用，
+        # 把整行（含 email）回显出来，绕过上面的字段限制。
+        {"Sid": "ApiKeysTouchLastUsedOnly", "Effect": "Allow",
+         "Action": "dynamodb:UpdateItem",
+         "Resource": f"{tbl}/{API_KEYS_TABLE}",
+         "Condition": {
+             "ForAllValues:StringEquals": {
+                 "dynamodb:Attributes": ["key_hash", "last_used_at"]},
+             "StringEqualsIfExists": {"dynamodb:ReturnValues": "NONE"}}},
         {"Sid": "ReadMachineClientSecretOnly", "Effect": "Allow",
          "Action": "ssm:GetParameter",
          "Resource": (f"arn:aws:ssm:{region}:{acct}:parameter"

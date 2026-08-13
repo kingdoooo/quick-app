@@ -86,7 +86,7 @@ CHECKS = 0
 FAILURES = 0
 # 全绿时的实际断言条数。低于它说明脚本中途退出或某个分支被跳过，而
 # "跑了 3 项全过"读起来跟"30 项全过"一样像成功（M3-FINDINGS §2.3）。
-MIN_CHECKS = 33
+MIN_CHECKS = 34
 
 # 哨兵行与审计里的署名。**不是某个人**——见模块 docstring 里"开关为什么不经
 # 控制台 admin 接口翻"那一段。
@@ -469,6 +469,18 @@ def main() -> int:
         check(row.get("owner") == owner,
               "sites 表里的 owner == Key 持有者（on-behalf 身份真的落地了）",
               f"owner={row.get('owner')} 期望={owner}")
+
+        # **`last_used_at` 必须真的写进去了**（Codex 审查 2026-08-13 P1-1 的连带）：
+        # key-proxy 的 UpdateItem 权限已按字段收窄（只允许 key_hash +
+        # last_used_at），而 `touch_last_used` **吞掉所有异常**——万一收窄写错了，
+        # 真机表现是遥测悄悄停摆、只有一条 warning 日志，功能测试全绿。
+        # 所以这条断言的对象不是"遥测有用"，而是"那条 IAM 收窄没把自己挡死"。
+        krow = keys_tbl.get_item(Key={"key_hash": keygen.hash_key(k1)},
+                                 ConsistentRead=True).get("Item") or {}
+        check(bool(krow.get("last_used_at")),
+              "转发后 last_used_at 已写入（证明收窄后的 UpdateItem 权限仍够用）",
+              str(krow.get("last_used_at"))[:25] if krow.get("last_used_at")
+              else "**没写进去**——IAM 收窄把遥测挡掉了，而它是静默失败的")
 
         # ─────────────────────── ③ 吊销后立即 401 ──────────────────────────
         print("\n── ③ 吊销后**立即** 401（不等待，证明不缓存）──────────")

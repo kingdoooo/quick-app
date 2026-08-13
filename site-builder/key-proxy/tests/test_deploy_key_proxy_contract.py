@@ -1006,3 +1006,82 @@ def test_no_real_account_values_in_the_script():
     src = SCRIPT.read_text()
     for m in re.finditer(r"\b\d{12}\b", src):
         assert m.group(0) == "000000000000", f"疑似真实账号 ID: {m.group(0)}"
+
+
+# ── P1-1（Codex 审查 2026-08-13）：UpdateItem 必须按字段收窄 ────────────────
+
+def _update_last_used_attributes() -> set:
+    """从 `keystore._update_last_used` 的 **AST** 推导它这次请求会引用哪些属性。
+
+    手抄一份"允许写哪些字段"的清单就是下一个漂移源：将来 `_update_last_used`
+    多写一个字段时，手抄的策略会让真机 AccessDenied——而 `touch_last_used`
+    **吞掉所有异常**，所以那个失败是**静默**的（只有一条 warning 日志），
+    遥测悄悄停摆而没有任何人会发现。所以这里从代码推。
+    """
+    tree = ast.parse((Path(dkp.__file__).parents[1] / "deployer" / "functions"
+                      / "keystore.py").read_text())
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "_update_last_used")
+    call = next(n for n in ast.walk(fn)
+                if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute) and n.func.attr == "update_item")
+    attrs = set()
+    for kw in call.keywords:
+        if kw.arg == "Key" and isinstance(kw.value, ast.Dict):
+            attrs |= {k.value for k in kw.value.keys if isinstance(k, ast.Constant)}
+        if kw.arg == "ExpressionAttributeNames" and isinstance(kw.value, ast.Dict):
+            attrs |= {v.value for v in kw.value.values if isinstance(v, ast.Constant)}
+    assert attrs, "推导口径坏了——没从 _update_last_used 里提出任何属性名"
+    return attrs
+
+
+def test_update_item_is_narrowed_to_the_telemetry_attributes_only():
+    """裸 `UpdateItem` 足以**伪造凭证**并**改回总开关**，必须按字段收窄。
+
+    为什么这不是洁癖（Codex P1-1，本仓库实测 IAM 引擎对旧策略判 allowed）：
+      · DynamoDB 的 UpdateItem 默认是 **upsert**，主键不存在就建行；
+      · 不带 `dynamodb:Attributes` 时可以写**任意**属性。
+    于是拿到这个 role 的人能 ① 造一行带任意 email 的凭证（伪造的 Key 之后可从
+    任何地方经正常路径使用，**RCE 被修掉之后依然有效**）；② 把
+    `__switch__.enabled` 改回 true，**击穿管理员的应急关闸**。
+
+    `_update_last_used` 自己带了 `attribute_exists(key_hash)`，但那是**代码层**
+    的防线；这条授权要防的恰恰是"代码被绕过"（公网组件被攻破后直接调 API）。
+
+    **定级说明**：这条挡的不是"冒充"——被 RCE 的 key-proxy 本来就能冒充任何人
+    （它持有 MACHINE_SECRET_PARAM、能换机器 token，而容器信任的正是它发的
+    on-behalf 头）。它挡的是**持久化**与**关闸完整性**。
+    """
+    allowed_attrs = _update_last_used_attributes()
+    upd = [s for s in dkp.role_statements(_cfg())
+           if "dynamodb:UpdateItem" in _actions(s)]
+    assert len(upd) == 1, f"UpdateItem 应当只出现在一条语句里: {len(upd)}"
+    cond = upd[0].get("Condition", {})
+    got = set(cond.get("ForAllValues:StringEquals", {}).get("dynamodb:Attributes", []))
+    assert got == allowed_attrs, (
+        f"UpdateItem 允许的字段是 {sorted(got)}，而代码实际只写 "
+        f"{sorted(allowed_attrs)}——多给任何一个字段都可能被用来伪造凭证或改开关")
+    # 逐个点名最危险的几个：断言"不在名单里"比断言集合相等更能说明**为什么**
+    for forbidden in ("email", "revoked", "enabled", "key_id", "name"):
+        assert forbidden not in got, (
+            f"UpdateItem 竟允许写 {forbidden}——"
+            f"{'能伪造可用凭证' if forbidden in ('email','revoked') else '能改总开关/篡改标识'}")
+    # ReturnValues 不收窄的话，UpdateItem 能被当读接口用把整行回显出来，
+    # 上面的字段限制就被绕过了。用 IfExists：我们的调用不传该参数。
+    assert cond.get("StringEqualsIfExists", {}).get("dynamodb:ReturnValues") == "NONE", (
+        "缺 ReturnValues 限制——攻击者传 ALL_OLD 就能用 UpdateItem 读出整行（含 email）")
+
+
+def test_getitem_is_not_attribute_restricted():
+    """反向：`GetItem` **不能**带字段限制——lookup 要读 email/revoked/enabled。
+
+    没有这一条时，"给 UpdateItem 加限制"的人很容易顺手给 GetItem 也加一份，
+    而那会让 lookup 读不到判定字段。症状是所有 Key 一律被拒（fail-closed 是对的，
+    但原因完全不透明），而单测因为 moto 不校验 IAM 全绿。
+    """
+    gets = [s for s in dkp.role_statements(_cfg())
+            if "dynamodb:GetItem" in _actions(s)]
+    assert len(gets) == 1, f"GetItem 应当只出现在一条语句里: {len(gets)}"
+    cond = gets[0].get("Condition", {})
+    assert "dynamodb:Attributes" not in str(cond), (
+        "GetItem 带了字段限制——lookup 读不到 email/revoked/enabled 会拒绝所有 Key")

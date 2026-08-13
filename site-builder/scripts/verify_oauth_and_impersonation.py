@@ -65,7 +65,7 @@ sys.path.insert(0, str(HERE.parent / "key-proxy"))
 
 CHECKS = 0
 FAILURES = 0
-MIN_CHECKS = 10
+MIN_CHECKS = 11
 
 # MCP over streamable-http 的客户端**只有一份实现**：verify_api_key_e2e.py 的
 # `Mcp`。在这里再写一遍就会出现"两个脚本走的其实不是同一个协议路径"，而那正是
@@ -267,12 +267,16 @@ def main() -> int:
         os.environ["MACHINE_SECRET_PARAM"] = "/site-builder/machine-client-secret"
         import machine_token
         mt = machine_token.get_token()
-    except Exception as exc:                # noqa: BLE001 没凭证是合法情形
-        print(f"  SKIP  正对照（拿不到机器 token: {type(exc).__name__}）——"
-              "本条需要 AWS 凭证。\n        交叉证据："
-              "verify_api_key_e2e.py 场景 ② 里站点 owner == Key 持有者，"
-              "\n        那个 owner 正是 key-proxy 用同一个头传过去的，"
-              "等价地证明了头会到达服务端。")
+    except Exception as exc:                # noqa: BLE001
+        # **正对照不是可选项**（Codex 审查 2026-08-13 P2-1）。原来这里 SKIP，而
+        # MIN_CHECKS 恰好等于正对照之前的 check 数——于是"拿不到机器 token"会
+        # 输出 ✅ 10/10 并返回 0，而此时两个负测**可能全是空转的**
+        # （头没到达服务端 ⇒ "身份没被改写"因一个完全无关的原因成立）。
+        # 一个可能空转的负测报成功，比报"未验证"糟得多：它会被当成"防冒充已验证"
+        # 写进交付结论。所以这里落一条 FAIL。
+        check(False, "正对照：机器 token + on-behalf=自己 → 返回自己的站点",
+              f"拿不到机器 token（{type(exc).__name__}）——本条需要 AWS 凭证，"
+              "且**不能跳过**：没有它，上面两个负测证明不了任何事")
     else:
         m5 = Mcp(endpoint, {"authorization": f"Bearer {mt}",
                             "x-sb-on-behalf-of": me})
