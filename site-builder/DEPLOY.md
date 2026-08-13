@@ -337,6 +337,76 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    登录换 token 那一刻才报 `invalid_client`，症状是"登录页正常、回调失败"，
    难查得多。
 
+   #### 轮换这个 secret（泄漏后必做）
+
+   **先分清它是什么**：走飞书适配器路径时，Cognito IdP 里那个 `client_secret`
+   **不是飞书 App Secret**。看 `describe-identity-provider` 就明白——
+   `client_id` 是 `cognito-federation-client`、`oidc_issuer` 指向适配器自己的
+   API Gateway。它是**适配器 ↔ Cognito** 这一对的凭证，两份副本：
+
+   | 持有方 | 位置 |
+   |---|---|
+   | Cognito | IdP `ProviderDetails.client_secret` |
+   | 适配器 | 它自己的 Secrets Manager 条目，JSON 键 `cognitoClientSecret` |
+
+   所以**飞书后台一个字都不用改**（飞书 App ID/Secret 是同一条 Secrets Manager
+   记录里的**另外**几个字段，与本次轮换无关）。这一点值得先确认，否则会误以为
+   要去协调飞书管理员、把一个 10 分钟的操作拖成跨团队排期。
+
+   **影响面比想象的小**：这个 secret 只在"Cognito 拿授权码去适配器换 token"
+   那一步用到。所以
+   - **已登录的用户不受影响**——会话 JWT 是平台自己用 `JWT_SECRET` 签的；
+   - **refresh 也不受影响**——Cognito 刷新不回调 IdP；
+   - 受影响的只有**轮换窗口内的新登录**（回调报 `invalid_client`）。
+
+   **窗口不可避免**：上游适配器（`aws-samples/sample-for-amazon-quick-sso-with-feishu`，
+   本仓库不含其源码）不同时接受新旧两个值。所以两侧更新之间必然有一段新登录失败，
+   选低峰期做，两条命令背靠背执行。
+
+   ```bash
+   # ① 记下当前指纹（只打指纹，绝不打印密文）——回滚与核对都要它
+   python3 - <<'EOF'
+   import boto3, configparser, hashlib
+   c = configparser.ConfigParser(interpolation=None); c.read("site-builder/config.ini")
+   assert c.sections(), "config.ini 读空了"
+   pool = c["Cognito"]["user_pool_id"].split("#")[0].strip()
+   name = c["IdP"]["provider_name"].split("#")[0].strip()
+   d = boto3.client("cognito-idp", region_name=c["Platform"]["region"].split("#")[0].strip())
+   v = d.describe_identity_provider(UserPoolId=pool, ProviderName=name
+       )["IdentityProvider"]["ProviderDetails"]["client_secret"]
+   print(f"当前 client_secret: {len(v)} 字符, sha256[:12]={hashlib.sha256(v.encode()).hexdigest()[:12]}")
+   EOF
+
+   # ② 生成新值（48 字符，与现值同形态）。**别落盘、别进 shell 历史**
+   #    ——直接管进下一步，或存进剪贴板管理器之外的临时变量
+   openssl rand -base64 36 | tr -d '\n' | cut -c1-48
+
+   # ③ 更新**适配器**那一侧：改它 Secrets Manager 条目的 cognitoClientSecret 键。
+   #    本仓库不含适配器源码，用控制台或 asm-exec 改（注意是改 JSON 里的一个键，
+   #    整条 put-secret-value 会把飞书 App Secret 等其它字段一起覆盖掉）。
+
+   # ④ 更新 Cognito 那一侧：走**唯一的写入口** deploy_pool.py，明文只经环境变量
+   #    进子进程、不落 config.ini
+   asm-exec -- env SB_IDP_CLIENT_SECRET='{{resolve:secretsmanager:<adapter-secret-arn>:SecretString:cognitoClientSecret}}' \
+     python3 site-builder/scripts/deploy_pool.py
+
+   # ⑤ 用 ① 那段再打一次指纹：必须与 ② 的新值一致、与 ① 的旧值不同
+   ```
+
+   **为什么第 ④ 步不写个专用轮换脚本**：`deploy_pool._ensure_oidc_idp` 是
+   `ProviderDetails` 的**唯一写入方**（它把 issuer / scopes / 属性映射一并声明）。
+   再写一个只改 secret 的脚本就是第二份真源——漏掉 `email_verified` 映射之类的字段
+   时，症状是"登录成功但邮箱变成未验证"，而那正是整个授权模型的地基。
+   `deploy_pool.py` 幂等，重跑它是安全的（它同时会读回并保住 client 的
+   `ExplicitAuthFlows` 与 IdP 名单，见 ④ 的输出）。
+
+   **验证只能靠真人登录一次**（HTTP 层验不出来：要走完飞书同意页才会用到这个
+   secret）。拿上面那张「登录链路实测基线」表对照。失败症状是回调
+   `invalid_client` —— 此时把 ③④ 两侧都回滚成旧值即可恢复。
+
+   **回滚**：把 ③ 和 ④ 都换回旧 secret。所以第 ① 步的指纹要留着——它是"我回滚到
+   的确实是原来那个值"的唯一凭据（旧明文不该留副本）。
+
    它建平台专用 pool（关自注册 + ESSENTIALS tier）、site/mcp 两个 app client
    （**不列 COGNITO**，只列你的 IdP）、branding、OIDC 联邦（含
    `email_verified` 映射）、pre-token 触发器，并把 client secret 写进 SSM。
