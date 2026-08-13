@@ -363,6 +363,28 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    本仓库不含其源码）不同时接受新旧两个值。所以两侧更新之间必然有一段新登录失败，
    选低峰期做，两条命令背靠背执行。
 
+   **适配器确实校验这个 secret（2026-08-13 实测，不是假设）。** 判定方法可复用——
+   拿一个**明显无效**的 code 去打两次 `{issuer}/token`：不消费任何真实凭据、不改
+   任何状态，只看两次报错的差异：
+
+   | 探测 | 实测结果 | 含义 |
+   |---|---|---|
+   | client_secret **正确** | `502 {"error":"upstream_error"}` | 过了客户端认证，之后拿假 code 去飞书换才失败 |
+   | client_secret **错误** | `401 {"error":"invalid_client"}` | 在客户端认证这一步就被拒 |
+
+   两次报错不同 ⇒ 校验真实存在 ⇒ **两侧必须同值，③ 不能跳**（只改 Cognito 一侧的
+   后果是所有新登录立刻 `invalid_client`）。这条值得记**方法**而不只记结论：哪天
+   换了适配器实现、两次报错变成一样，那说明它不校验客户端凭证——那时该修的是
+   适配器，而不是庆幸轮换省了一步。
+
+   顺带一条会被低估的事：本节上文记着适配器的 `/authorize` **不校验 `redirect_uri`**。
+   拿到这个 client_secret 的人就能在它的 token 端点换 code——两条弱点叠加，比单看
+   泄漏更值得处理。
+
+   **适配器可能缓存 secret**（源码不在本仓库，缓存行为未核实）。若 ③④ 都做完后
+   登录仍报 `invalid_client`，**先等约 5 分钟**让 warm 容器回收再试一次，**然后**
+   才考虑回滚——否则会把一次缓存滞后误判成轮换失败，进而把已经正确的两侧又改回旧值。
+
    ```bash
    # ① 记下当前指纹（只打指纹，绝不打印密文）——回滚与核对都要它
    python3 - <<'EOF'
@@ -381,9 +403,20 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    #    ——直接管进下一步，或存进剪贴板管理器之外的临时变量
    openssl rand -base64 36 | tr -d '\n' | cut -c1-48
 
-   # ③ 更新**适配器**那一侧：改它 Secrets Manager 条目的 cognitoClientSecret 键。
-   #    本仓库不含适配器源码，用控制台或 asm-exec 改（注意是改 JSON 里的一个键，
-   #    整条 put-secret-value 会把飞书 App Secret 等其它字段一起覆盖掉）。
+   # ③ 更新**适配器**那一侧：只改它 Secrets Manager 条目里的 cognitoClientSecret
+   #    键。**必须 read-modify-write**——这条记录是多字段 JSON（同一条里还装着
+   #    飞书 App Secret），只发一个键的写入会把其它字段一起覆盖掉，结果是适配器
+   #    连飞书都连不上，比泄漏本身严重得多。用 jq 保住其它字段：
+   NEW="$(openssl rand -base64 36 | tr -d '\n' | cut -c1-48)"
+   ARN="<adapter-secret-arn>"
+   aws secretsmanager get-secret-value --secret-id "$ARN" \
+        --query SecretString --output text \
+     | jq --arg s "$NEW" '.cognitoClientSecret = $s' \
+     | aws secretsmanager put-secret-value --secret-id "$ARN" \
+         --secret-string file:///dev/stdin
+   #    改完核对**键的数量与名字没变**（只打键名，不打值）：
+   aws secretsmanager get-secret-value --secret-id "$ARN" \
+        --query SecretString --output text | jq -r 'keys | @csv'
 
    # ④ 更新 Cognito 那一侧：走**唯一的写入口** deploy_pool.py，明文只经环境变量
    #    进子进程、不落 config.ini
