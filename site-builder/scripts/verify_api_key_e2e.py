@@ -231,13 +231,21 @@ class Mcp:
         st, _, text = self._post(payload)
         return st, text
 
-    def call_tool(self, name: str, args: dict | None = None):
-        """→ (ok, payload_or_error_text)。
+    def call_tool(self, name: str, args: dict | None = None, *,
+                  expect: str = "dict"):
+        """→ (ok, payload_or_error_text)。`expect` 是 `"dict"` 或 `"list"`。
 
-        FastMCP 的成功响应把结果放在 `result.structuredContent`（或
-        `result.content[0].text` 里的 JSON 文本）；工具抛异常时
-        `result.isError` 为真、文案在 content 里。两种都要能取到，否则"上游
-        报了业务错误"会被读成"格式不对"。
+        工具抛异常时 `result.isError` 为真、文案在 content 里；成功时结果可能在
+        `result.structuredContent`，**也可能只有 content 文本块**。
+
+        **为什么必须由调用方声明 `expect`，不能自动猜**（2026-08-13 实测）：
+        线上这台 MCP server **根本不发 `structuredContent`**，而返回列表的工具
+        （`list_my_sites`）会被序列化成**每个元素一个 text 块**——实测 12 个站点
+        = 12 个块。于是"取 content[0] 解析"这种写法会**静默只返回第一个元素**，
+        断言看起来在比对却少了 11 条数据。反过来，"有多个块就当列表"也不行：
+        只有一个站点时列表会退化成 1 个块，与"返回单个 dict 的工具"在形态上
+        完全一样。两种猜法各有一半的情况是错的，而错的那一半**不报错、只是
+        数据少了**——所以这里改成调用方声明期望形态，不猜。
         """
         st, resp = self.rpc("tools/call", {"name": name,
                                            "arguments": args or {}})
@@ -248,21 +256,31 @@ class Mcp:
                  if isinstance(c, dict)]
         if result.get("isError"):
             return False, " ".join(texts) or json.dumps(resp)[:200]
+        if expect not in ("dict", "list"):
+            raise ValueError(f"expect 只能是 dict / list，收到 {expect!r}")
         if "structuredContent" in result:
+            # 别的 FastMCP 版本会发它。**非 dict** 返回值被裹成 `{"result": ...}`；
+            # 判据是"只有这一个键"，不是"有这个键"——工具自己返回的 dict 里恰好有
+            # `result` 字段时，后者会把整个载荷替换成那个字段的值，而症状是
+            # "少了几个字段"，排查方向会指向服务端。
             inner = result["structuredContent"]
-            # FastMCP 把**非 dict** 返回值裹成 `{"result": ...}`。判据是"只有这一个
-            # 键"，不是"有这个键"：工具自己返回的 dict 里恰好有 `result` 字段时，
-            # 后者会把整个载荷替换成那个字段的值——而症状是"少了几个字段"，
-            # 排查方向会指向服务端。
             if isinstance(inner, dict) and set(inner) == {"result"}:
-                return True, inner["result"]
+                inner = inner["result"]
             return True, inner
+        parsed = []
         for t in texts:
             try:
-                return True, json.loads(t)
+                parsed.append(json.loads(t))
             except ValueError:
-                continue
-        return True, texts[0] if texts else resp.get("result")
+                return False, f"content 块不是合法 JSON: {t[:120]}"
+        if expect == "list":
+            # 空列表 → `content: []` → 这里如实返回 []（实测过：返回空列表的工具
+            # 既没有 content 块也没有 structuredContent）
+            return True, parsed
+        if len(parsed) != 1:
+            return False, (f"expect=dict 但拿到 {len(parsed)} 个 content 块"
+                           "——这个工具返回的是列表？调用方的 expect 写错了")
+        return True, parsed[0]
 
 
 def main() -> int:
@@ -549,7 +567,7 @@ def main() -> int:
                      {"authorization": f"Bearer {token}"})
         st, _ = direct.initialize()
         check(st == 200, "机器 token 过网关（allowedClients 含它）", f"HTTP {st}")
-        ok, out = direct.call_tool("list_my_sites")
+        ok, out = direct.call_tool("list_my_sites", expect="list")
         check(not ok and "无法识别调用者身份" in str(out),
               "不带 on-behalf 头调工具 → 容器 fail-closed 拒绝",
               str(out)[:120] if not ok else f"**放行了**，返回 {str(out)[:80]}")

@@ -25,15 +25,18 @@ MCP 没有 whoami 工具，"解析成了谁"只能从**副作用**观察。`list
 但这条断言**只有在前置成立时才有意义**，所以前置也各写成一条 check：
   · 自己的站点集合**非空**——空集时"两次都空"会让断言永远绿；
   · 伪造的 email **不等于**自己——否则测的是"自己冒充自己"；
-  · 变体 b 里那个真实 owner 的站点集合**与自己的不同**——相同的话，即便冒充
-    成功也看不出差别。
-三条里任一不成立就报 SKIP 或 FAIL，绝不让它静默变成一条装饰。
+  · 变体 b 的基线（不带头时）必须先是 owner/admin——否则"两次一致"可能只是
+    "两次都被拒"。
+三条里任一不成立就报 FAIL，绝不让它静默变成一条装饰。
 
 两个伪造变体缺一不可：
   · a) 形态合法但**不存在**的 email：冒充成功的表现是返回空集；
-  · b) **真实存在的另一个 owner**（从 sites 表现查）：冒充成功的表现是返回
-       那个人的站点。只做 a) 时，"把身份解析成一个查不到站点的用户"与
-       "正确地解析成自己但恰好返回空"在结果上分不开。
+  · b) 换一个**完全不同的观察量**：对自己的站点查权限。`_assert_permission`
+       对无权访问者是**抛异常**，所以"冒充成功"的表现是调用直接失败，而不是
+       "返回的数据少了几条"。一个看数据、一个看鉴权决策，覆盖两种失效方式。
+
+本脚本**不需要 AWS 凭证**，只需要那个用户 token——它验的就是"以普通用户身份
+调 MCP"这条路径，带上 AWS 管理员权限反而会让它偏离被验的场景。
 
 用法（**从仓库根跑**）：
     # 若 token 已过期且 refresh 也失效，先在浏览器里登录一次（只需这一步）：
@@ -44,22 +47,25 @@ import argparse
 import configparser
 import importlib.util
 import json
+import os
 import sys
 import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
-import boto3
-
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 CFG_PATH = HERE.parent / "config.ini"
 TOKEN_PATH = Path.home() / ".site-builder-deploy-token.json"
 
+# 正对照要换机器 token，复用 key-proxy 的 machine_token（换 token 的唯一实现）
+sys.path.insert(0, str(HERE.parent / "deployer" / "functions"))
+sys.path.insert(0, str(HERE.parent / "key-proxy"))
+
 CHECKS = 0
 FAILURES = 0
-MIN_CHECKS = 8
+MIN_CHECKS = 10
 
 # MCP over streamable-http 的客户端**只有一份实现**：verify_api_key_e2e.py 的
 # `Mcp`。在这里再写一遍就会出现"两个脚本走的其实不是同一个协议路径"，而那正是
@@ -109,8 +115,12 @@ def _load_token(client_id: str) -> str:
                  f'"<endpoint_url>" "<mcp_client_id>"')
     data = json.loads(TOKEN_PATH.read_text())
     token = data.get("access_token") or ""
-    # 留 60s 余量：正好在过期边缘的 token 会让后面某一次调用莫名 401
-    if token and _claims(token).get("exp", 0) - time.time() > 60:
+    # **余量必须覆盖整场跑完的时间，不是"还没过期就行"。**
+    # access token 只有 15 分钟（M1 收紧的边界）。第一版留 60s，结果注入验证那
+    # 一跑真的踩到了：① 段拿到 12 个站点后，token 在中途过期，后面几条全变成
+    # HTTP 401，而错误文案是"身份被头改写了"——**一条假的安全告警**，比不报还糟。
+    # 本脚本会连发 ~8 次 MCP 调用，300s 余量足够，且离 15 分钟上限还很远。
+    if token and _claims(token).get("exp", 0) - time.time() > 300:
         return token
 
     refresh = data.get("refresh_token")
@@ -151,32 +161,6 @@ def _site_ids(payload) -> set | None:
     return {s.get("site_id") for s in payload if isinstance(s, dict)}
 
 
-def _other_owner_with_sites(region: str, sites_table: str, me: str,
-                            my_ids: set) -> tuple[str, set] | tuple[None, None]:
-    """现查一个**真实存在**的其他 owner，且其站点集合与我的不同（变体 b 用）。
-
-    只读 sites 表。挑的是 ACTIVE 站点的 owner——已下线的 owner 会返回空集，
-    那样变体 b 就退化成变体 a 了。
-    """
-    tbl = boto3.resource("dynamodb", region_name=region).Table(sites_table)
-    owners: dict = {}
-    kw = {"ProjectionExpression": "site_id,#o,#s",
-          "ExpressionAttributeNames": {"#o": "owner", "#s": "status"}}
-    while True:
-        page = tbl.scan(**kw)
-        for it in page.get("Items", []):
-            owner = str(it.get("owner", ""))
-            if owner and owner != me and it.get("status") == "ACTIVE":
-                owners.setdefault(owner, set()).add(it.get("site_id"))
-        if "LastEvaluatedKey" not in page:
-            break
-        kw["ExclusiveStartKey"] = page["LastEvaluatedKey"]
-    for owner, ids in sorted(owners.items()):
-        if ids and ids != my_ids:
-            return owner, ids
-    return None, None
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -190,10 +174,8 @@ def main() -> int:
     def cfg(sec, key):
         return c[sec][key].split("#")[0].split(";")[0].strip()
 
-    region = cfg("Platform", "region")
     endpoint = cfg("MCP", "endpoint_url")
     client_id = cfg("Cognito", "mcp_client_id")
-    sites_table = cfg("Deployer", "sites_table")
 
     token = _load_token(client_id)
     claims = _claims(token)
@@ -213,7 +195,7 @@ def main() -> int:
     names = {t.get("name") for t in (resp.get("result") or {}).get("tools", [])}
     check(len(names) >= 8, "tools/list 返回全部工具", f"{len(names)} 个")
 
-    ok, payload = m.call_tool("list_my_sites")
+    ok, payload = m.call_tool("list_my_sites", expect="list")
     mine = _site_ids(payload) if ok else None
     check(ok and mine is not None,
           "list_my_sites 成功（OAuth 身份解析正常）",
@@ -235,7 +217,7 @@ def main() -> int:
     m2 = Mcp(endpoint, {"authorization": f"Bearer {token}",
                         "x-sb-on-behalf-of": fake})
     st, _ = m2.initialize()
-    ok, payload = m2.call_tool("list_my_sites")
+    ok, payload = m2.call_tool("list_my_sites", expect="list")
     got = _site_ids(payload) if ok else None
     check(ok and got == mine,
           "变体 a：伪造一个不存在的 email → 仍解析成自己",
@@ -243,26 +225,67 @@ def main() -> int:
           f"与自己的 {len(mine)} 个"
           + ("一致" if got == mine else "**不一致——身份被头改写了**"))
 
-    other, other_ids = _other_owner_with_sites(region, sites_table, me, mine)
-    if not other:
-        print("  SKIP  变体 b（sites 表里找不到另一个「有 ACTIVE 站点且集合与自己"
-              "不同」的 owner——本环境构造不出这个更强的变体）")
+    # 变体 b：换一个**完全不同的观察量**——权限判定，而不是列表内容。
+    # 对自己的一个站点查权限：`do_get_permissions` 里的 `_assert_permission`
+    # 对无权访问者是**抛异常**（isError），所以"冒充成功"的表现是这次调用直接
+    # 失败，而不是"返回的数据少了几条"。两个变体一个看数据、一个看鉴权决策，
+    # 覆盖的是两种不同的失效方式。
+    #
+    # **为什么不用"伪造成另一个真实 owner 再比对他的站点"**：本环境里调用者拥有
+    # 全部 ACTIVE 站点，构造不出那个变体（第一版实现试过，永远 SKIP）。而永久
+    # SKIP 的检查是死重量——它看起来覆盖了什么，实际上一次都没跑过。
+    probe_site = sorted(mine)[0]
+    ok, base = m.call_tool("get_site_permissions", {"site_id": probe_site})
+    base_role = base.get("my_role") if isinstance(base, dict) else None
+    check(ok and base_role in ("owner", "admin"),
+          "前置：不带伪造头查自己站点的权限 → owner/admin",
+          f"my_role={base_role}" if ok else str(base)[:120])
+
+    m4 = Mcp(endpoint, {"authorization": f"Bearer {token}",
+                        "x-sb-on-behalf-of": fake})
+    m4.initialize()
+    ok, got = m4.call_tool("get_site_permissions", {"site_id": probe_site})
+    got_role = got.get("my_role") if isinstance(got, dict) else None
+    check(ok and got_role == base_role,
+          "变体 b：带伪造头查同一站点 → 权限判定仍按自己算",
+          f"my_role={got_role}（与不带头时一致）" if ok and got_role == base_role
+          else f"**{str(got)[:110]}** —— 身份被头改写，鉴权按别人算了")
+
+    # ── 正对照：证明这个头**真的到达了服务端** ───────────────────────────
+    # 没有这一条，上面两个变体是**空转的**：如果网关的 requestHeaderAllowlist
+    # 把 `X-SB-On-Behalf-Of` 丢掉了，头压根到不了容器，那么"身份没被改写"就会
+    # 因为一个完全无关的原因成立——负测全绿而冒充防线其实从未被测到。
+    # 机器 token 是这条链路上**唯一被允许**用这个头指定身份的调用者，所以拿它
+    # 带上"我自己"的邮箱：能返回我的站点 ⇒ 头确实到达且被采信。
+    try:
+        os.environ.setdefault("AWS_DEFAULT_REGION",
+                              cfg("Platform", "region"))
+        os.environ["COGNITO_DOMAIN"] = cfg("Cognito", "domain")
+        os.environ["MACHINE_CLIENT_ID"] = cfg("Cognito", "machine_client_id")
+        import api_key_config
+        os.environ["MACHINE_SCOPE"] = api_key_config.machine_scope(c)
+        os.environ["MACHINE_SECRET_PARAM"] = "/site-builder/machine-client-secret"
+        import machine_token
+        mt = machine_token.get_token()
+    except Exception as exc:                # noqa: BLE001 没凭证是合法情形
+        print(f"  SKIP  正对照（拿不到机器 token: {type(exc).__name__}）——"
+              "本条需要 AWS 凭证。\n        交叉证据："
+              "verify_api_key_e2e.py 场景 ② 里站点 owner == Key 持有者，"
+              "\n        那个 owner 正是 key-proxy 用同一个头传过去的，"
+              "等价地证明了头会到达服务端。")
     else:
-        # 前置③：那个人的站点集合与我的不同，否则冒充成功也看不出差别
-        check(other_ids != mine,
-              "前置：被冒充者的站点集合与自己不同（否则看不出差别）",
-              f"对方 {len(other_ids)} 个 vs 自己 {len(mine)} 个")
-        m3 = Mcp(endpoint, {"authorization": f"Bearer {token}",
-                            "x-sb-on-behalf-of": other})
-        st, _ = m3.initialize()
-        ok, payload = m3.call_tool("list_my_sites")
-        got = _site_ids(payload) if ok else None
-        check(ok and got == mine,
-              "变体 b：伪造一个**真实存在**的其他 owner → 仍解析成自己",
-              "返回的是自己的站点"
-              if got == mine else
-              f"**返回了 {len(got) if got is not None else '?'} 个站点，"
-              f"不是自己的 {len(mine)} 个——可越权读取他人站点**")
+        m5 = Mcp(endpoint, {"authorization": f"Bearer {mt}",
+                            "x-sb-on-behalf-of": me})
+        m5.initialize()
+        ok, got = m5.call_tool("list_my_sites", expect="list")
+        got_ids = _site_ids(got) if ok else None
+        check(ok and got_ids == mine,
+              "正对照：机器 token + on-behalf=自己 → 返回自己的站点"
+              "（证明头真的到达服务端，上面两个负测不是空转）",
+              f"返回 {len(got_ids) if got_ids is not None else '?'} 个，"
+              f"自己 {len(mine)} 个"
+              + ("" if got_ids == mine
+                 else " —— 头没被采信，那么负测的「没被改写」说明不了任何事"))
 
     print()
     if CHECKS < MIN_CHECKS:
