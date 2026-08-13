@@ -948,7 +948,7 @@ M3 之前部署的，**先重跑一次** `cd site-builder/auth && python3 deploy
 **验收（部署完立刻跑，从仓库根）**：
 
 ```bash
-python3 site-builder/scripts/verify_console_e2e.py     # 61 项
+python3 site-builder/scripts/verify_console_e2e.py     # 64 项
 ```
 
 它覆盖未登录 fail-closed、伪造 `x-user-email` 直连 Function URL 仍 403、
@@ -970,6 +970,159 @@ python3 site-builder/scripts/verify_console_e2e.py     # 61 项
   `/robots.txt`、`/.well-known/*` 这些浏览器会自作主张请求的路径在 S3 上不存在，
   私有桶回 403，读起来像鉴权故障。前端已用内联 data URI 声明 favicon 消掉这条。
   **排查线上 403 先分清"没权限"还是"没这个对象"。**
+
+---
+
+## ⑤c API Key 组件（二期 M4，**可选**）
+
+给"只能配静态 Header 的 MCP 客户端"（如 Quick Desktop 的 Remote MCP）一条不走
+浏览器 OAuth 的路：客户端把 `X-API-Key: sk-…` 打到 `https://mcp.{base_domain}/`，
+交换层验 Key → 换组件自身的机器 token → **不懂 MCP 协议地透明转发**到 AgentCore，
+只多一个 `X-SB-On-Behalf-Of: {email}` 告诉 MCP server 以谁的身份行事。
+
+**不需要就整段不配置——这是推荐的默认。** `config.ini` 没有 `[ApiKey]` 段 =
+平台只允许 OAuth 一条认证路径：不建 Cognito resource server / machine client、
+不部署 key-proxy、不注册 `mcp` 子域、machine client 不进 AgentCore 的
+`allowedClients`、`X-SB-On-Behalf-Of` 也不在网关的 allowlist 里。即使有人拿到
+一把 Key 也在**网关层**被拒，不经过任何业务代码。四个部署脚本各自会打印
+"跳过：无 `[ApiKey]` 段"并**返回 0**（不是报错——"没配置"是合法状态，部署全平台
+的脚本链不该因此中断）。
+
+### 四步顺序，以及为什么任一步停下都不产生提权窗口
+
+先在 `config.ini` 配好 `[ApiKey]` 段（照 `config.ini.example` 的注释块），然后：
+
+```bash
+# ① Cognito：建 resource server + scope + machine client（secret 落 SSM）
+cd site-builder && python3 scripts/deploy_pool.py
+#    回填 config.ini 的 [Cognito] machine_client_id
+
+# ② 执行器栈：建 site-api-keys 表（PK=key_hash，email-index / keyid-index）
+cd site-builder/deployer/infra && rm -rf cdk.out && \
+  PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never
+
+# ③ MCP runtime：machine client 进 allowedClients、放行 on-behalf 头、
+#    容器下发 MACHINE_CLIENT_ID（三者同一个派生点，同开同关）
+cd site-builder/mcp && python3 deploy_agentcore.py
+
+# ④ 交换层：key-proxy Lambda + Function URL(AWS_IAM 仅 edge role) +
+#    mcp route + 哨兵行（**建成关**）
+cd site-builder/key-proxy && python3 deploy_key_proxy.py
+
+# ⑤ 控制台前端要能看到 Key 页面
+cd site-builder/panel && python3 deploy_panel.py
+```
+
+**中途停下不会开出一条提权路径**，每一步都缺后一步的必要条件：
+
+| 停在哪 | 为什么安全 |
+|---|---|
+| ① 之后 | machine client 存在且能换 token，但它**不在** AgentCore 的 `allowedClients` 里 → 拿它直调网关是 `401 Claim 'client_id' value mismatch`（本仓库实测过） |
+| ② 之后 | 表建好了但没人能写它（发 Key 的接口在 panel，交换层还不存在） |
+| ③ 之后 | 网关认这个 client 了，但没有交换层把 Key 换成它——而 machine client 的 secret 只在 SSM，公开的 `mcp` client **换不到** client_credentials token（实测 `400 invalid_client`） |
+| ④ 之后 | 组件齐了，但**哨兵行是关的** → 任何 Key 直连都 401 |
+
+### 三处组件门禁：漏一处的症状（排查表）
+
+三处都从 `deployer/functions/api_key_config.api_key_enabled` 这**同一个判定**派生，
+正常情况下同开同关。真出现不一致时按症状定位：
+
+| 缺的是哪一处 | 症状 | 怎么确认 |
+|---|---|---|
+| ① machine client 不在 `allowedClients` | 所有 Key 调用 **HTTP 401**，响应体是网关的 `Claim 'client_id' value mismatch` 而不是我们的 JSON | `get_agent_runtime` 读 `authorizerConfiguration.customJWTAuthorizer.allowedClients` |
+| ② `X-SB-On-Behalf-Of` 不在 `requestHeaderAllowlist` | 请求过网关但容器收不到身份 → **HTTP 200 + "无法识别调用者身份"** 的业务文案 | 读 `requestHeaderConfiguration.requestHeaderAllowlist` |
+| ③ 容器的 `MACHINE_CLIENT_ID` 为空 | 与 ② 同症状（**最难查的那一半**：网关放行、容器拒绝） | 读 runtime 的 `environmentVariables` |
+
+**②③ 是最容易漂的一对**——它们分处网关配置与容器环境，分别写就会不一致。
+`verify_deployed_components.py` 第 ⑧ 段有一条"当且仅当"断言盯着它。
+
+### 首次部署后开关是**关**的，要去控制台开一次
+
+`deploy_key_proxy.py` 建哨兵行时写 `enabled=false`（fail-closed），并且**重跑时
+一个字都不改**——否则下一次部署会把管理员的关闸静默覆盖成开。所以部署完的正确
+状态就是"组件已上线、通道未开"，脚本最后会明确打印这一点。
+
+开闸：管理员进 `https://console.{base_domain}/` 的 API Key 页面打开开关。
+**每次开关变更都落 `site-ops-log` 审计**（`enable_api_key_switch` /
+`disable_api_key_switch` + actor）。
+
+### 应急旁路：控制台不可用时直改哨兵行
+
+**只在控制台打不开时用**（正常关闸一律走控制台——CLI 直改**绕过 ops_log
+审计**，事后没人查得出是谁关的）：
+
+```bash
+# 关闸（enabled 必须是 BOOL，不是字符串 "false"）
+aws dynamodb update-item --region us-east-1 --table-name site-api-keys \
+  --key '{"key_hash":{"S":"__switch__"}}' \
+  --update-expression "SET #e = :f, #t = :now, #w = :who" \
+  --expression-attribute-names '{"#e":"enabled","#t":"updated_at","#w":"updated_by"}' \
+  --expression-attribute-values "{\":f\":{\"BOOL\":false},\":now\":{\"S\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"},\":who\":{\"S\":\"emergency-cli\"}}"
+
+# 读回核对（**必须强一致读**，最终一致读可能还是旧值）
+aws dynamodb get-item --region us-east-1 --table-name site-api-keys \
+  --key '{"key_hash":{"S":"__switch__"}}' --consistent-read \
+  --query 'Item.enabled'
+```
+
+三条纪律：
+
+- **`enabled` 必须写成 DynamoDB `BOOL`**。`keystore.lookup` 的判定是
+  `enabled is not True`，字符串 `"true"` 同样被拒——症状是"控制台显示开着但所有
+  Key 都 401"，而两侧单测各自都是绿的。`update-item` 用 `{"BOOL":false}`，别用
+  `{"S":"false"}`。
+- **只 `SET` 这三个字段，别用 `put-item` 整行覆盖**。哨兵行绝不能带 `email` /
+  `key_id`——那两个是 `email-index` / `keyid-index` 的分区键，带上会让平台开关行
+  冒进某个人的 Key 列表。
+- `enabled` 走 `ExpressionAttributeNames`（`#e`）而不是裸名，省得踩 DynamoDB
+  保留字。
+- 用完之后**回控制台再点一次**，让后续变更重新有审计。
+
+### 验收（部署完立刻跑，从仓库根）
+
+```bash
+python3 site-builder/scripts/verify_deployed_components.py    # 含第 ⑧ 段
+python3 site-builder/scripts/verify_api_key_e2e.py            # 六场景 + 四负测
+python3 site-builder/scripts/verify_oauth_and_impersonation.py  # 需先 auth.js 登录
+```
+
+`verify_api_key_e2e.py` 会**创建真实 Key 并完成一次真实部署**，跑完删除并读回
+核对；其中场景 ④ 会**临时关闸再开回来**（`finally` 恢复成进入时的值）。
+`verify_oauth_and_impersonation.py` 需要一个真实用户 token：先跑一次
+`node site-builder/clients/quick-desktop-proxy/auth.js "<endpoint>" "<client_id>"`
+（refresh 有效期只有 1 天，超时重登是**预期行为**不是故障）。
+
+### 实测坑（都在真机上踩过）
+
+- **带请求体的 `DELETE` 在这条链路上必 403**。CloudFront 把 DELETE 的 body 交给
+  Lambda@Edge（`include_body=True`，Edge 因此按真实 body 算 payload hash 去签
+  SigV4），但转发到源站时那个 body 不在了——Function URL 按空 body 校验，
+  `403 The request signature we calculated does not match…`，**在 panel 任何代码
+  之前**就被拒。四组对照：DELETE 带 body → 403；DELETE 不带 body → 到达 panel；
+  POST 带 body → 200；`DELETE /api/admins` 带 body → 同样 403。
+  所以控制台的删除类动作是 `POST /api/keys/revoke` 与 `POST /api/admins/remove`；
+  参数也**不搬进查询串**（那会把 `key_id` 与管理员邮箱写进 CloudFront 访问日志）。
+  `panel/tests/test_handler.py::test_no_route_uses_delete_with_body` 按路由表锁住
+  "一条 DELETE 都不许有"。
+- **`deploy_agentcore.py` 不接受 `--skip-build`**（当 `server.py` 改过时）：
+  tag 由构建输入的内容指纹派生，指向一个 ECR 里不存在的镜像会被脚本拒绝。
+  于是"配置先行、镜像后行"的中间态在本仓库的设计下**不可分**，③ 是一步到位的。
+- **预签名 PUT 不能带 `Content-Type`**（签名按无该头计算，带了必 403）。注意
+  Python 的 `urllib.request` 在有 body 时会**自动补**这个头——用它上传必失败，
+  而报错指向签名、把排查方向带向 IAM。
+- **机器 token 的 scope 是 `{resource_server_id}/{scope}` 拼好的完整串**，拼接
+  只在 `api_key_config.machine_scope` 发生一次。两处各拼一次会出现"建的 scope 与
+  换 token 用的不是同一个"，而 Cognito 报 `invalid_scope`、文案指向 client 配置。
+
+### 已知取舍（向使用方说明）
+
+- **用户离职后旧 Key 仍然有效**（决定 8）：Key 绑的是 email 字符串，不联动 IdP
+  的账号状态。离职流程里要显式吊销该用户的 Key（控制台按 owner 列得出来），
+  或整体关闸。OAuth 那条路径不受影响——那边一撤销 IdP 账号就登不进来。
+- Key **只认证"谁在调部署 MCP"**，与访问已部署站点的 `require_login` /
+  `allowed_users` 是两套独立的认证平面，它碰不到站点访问。
+- 明文 Key 在服务端**只出现一次**（创建响应）。用户没抄下来只能吊销重发；
+  列表接口与所有日志里都没有明文（有一条真机负测扫两个日志组做零命中断言）。
 
 ---
 

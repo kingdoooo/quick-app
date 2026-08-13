@@ -76,6 +76,10 @@ cd site-builder/auth && python3 deploy_auth.py
 # MCP（buildx ARM64 → ECR → AgentCore runtime；--skip-build 只改配置）
 cd site-builder/mcp && python3 deploy_agentcore.py
 
+# API Key 交换层 key-proxy（二期 M4，**可选组件**；无 [ApiKey] 段时打印跳过并返回 0）
+# 顺序：deploy_pool → deployer 栈 → deploy_agentcore → 本脚本 → deploy_panel
+cd site-builder/key-proxy && python3 deploy_key_proxy.py
+
 # 控制台 panel（Lambda + Function URL + 前端上传 + console route，幂等）
 # --skip-frontend 只改后端。改前端后必须重跑（不带该开关）才会上传。
 cd site-builder/panel && python3 deploy_panel.py
@@ -100,6 +104,11 @@ python3 site-builder/scripts/gen_onboarding.py
 ④ 路由+鉴权层 (router/)              ← CloudFront *.{domain} + Lambda@Edge
         ↓ 未登录 302                     查路由表 → 验会话 JWT → 注入 x-user-email → 分流
 ⑤ 身份层 (site-builder/auth/)        ← Cognito(联邦到飞书) + 登录服务 + pre-token 触发器
+
+交换层 (site-builder/key-proxy/)      ← mcp.{domain}，二期 M4 的**可选**组件
+   给只能配静态 Header 的 MCP 客户端一条路：验 X-API-Key → 换组件自身的机器
+   token → 不懂协议地透明转发到 ②，只多一个 X-SB-On-Behalf-Of 头告诉 ② 以谁
+   的身份行事。config.ini 无 [ApiKey] 段 = 整个组件不存在（推荐默认）
 
 控制台 (site-builder/panel/)          ← console.{domain}，二期 M3；**建站仍只在 Agent 里**
    走 ④ 的 split 路由：/api/* → panel Function URL(AWS_IAM 仅 edge role)，其余 → S3
@@ -154,6 +163,19 @@ python3 site-builder/scripts/gen_onboarding.py
   与上传的 key 不是同一个对象，整站 403（两侧单测各自都会绿）。
 - **私有前端桶上，浏览器的约定路径一律 403 而非 404**（`/favicon.ico`、
   `/robots.txt`、`/.well-known/*`）。排查线上 403 先分清"没权限"还是"没这个对象"。
+- **带请求体的 `DELETE` 在 CloudFront → Edge → Function URL 这条链路上必 403**。
+  Edge 拿到 body 并按它算 payload hash 去签 SigV4，而 CloudFront 转发到源站时
+  那个 body 不在了 → 源站按空 body 校验 → 签名不匹配，**在业务代码之前**就被拒。
+  所以删除类接口一律用 POST 子路径（`/api/keys/revoke`、`/api/admins/remove`），
+  参数放请求体、**不放查询串**（查询串会进 CloudFront 访问日志）。
+  `panel/tests/test_handler.py::test_no_route_uses_delete_with_body` 按路由表锁死。
+  这个缺陷在生产上活了整个 M3 周期——单测直接调 handler，不经 CloudFront。
+- **API Key 总开关的 `enabled` 必须是 DynamoDB `BOOL`**：`keystore.lookup` 判的是
+  `enabled is not True`，字符串 `"true"` 同样被拒。症状是"控制台显示开着但所有
+  Key 都 401"，而两侧单测各自都绿。手工改哨兵行时用 `{"BOOL":false}`。
+- **`mcp` 子域故意不在 Edge 的 `PLATFORM_SUBDOMAINS` 里**：key-proxy 只认
+  `X-API-Key`，不需要平台 cookie；进白名单只会让一个公网组件白拿一个顶域会话
+  JWT。别"顺手补齐"这个名单。
 - **moto 不校验 IAM**：事务里的 `ConditionCheck` 需要 `dynamodb:ConditionCheckItem`，
   漏给时单测全绿、真机 500。给 Lambda 加事务路径时同步核对角色策略。
 
@@ -161,14 +183,14 @@ python3 site-builder/scripts/gen_onboarding.py
 
 | 要做什么 | 看哪里 |
 |---|---|
-| 部署到新账号 / 排查部署问题 | `site-builder/DEPLOY.md`（①→⑦ + ⑤b 控制台 + 全部实测坑） |
+| 部署到新账号 / 排查部署问题 | `site-builder/DEPLOY.md`（①→⑦ + ⑤b 控制台 + ⑤c API Key + 全部实测坑） |
 | 客户端接入（人/Agent） | `site-builder/docs/client-setup.md`；含真实值版本跑 `gen_onboarding.py` |
 | 合同细节（给站点生成方） | `site-builder/skills/site-builder/references/{contract,redlines}.md` |
 | 一期设计决策与范围 | `docs/superpowers/specs/2026-07-21-quick-site-builder-design.md`（已实现快照，勿改） |
 | 二期需求 | `docs/phase2-requirements.md` |
 | 任务级实现/审查历史（一期） | `.superpowers/sdd/progress.md` |
 | 二期进度 / 当前在做什么 | `docs/design/HANDOFF-2026-08-07.md` 的**最新一节**（状态真源，gitignored） |
-| 二期实测发现与结论 | `docs/design/M3-FINDINGS.md`（gitignored；含可复用的断言自查清单） |
+| 二期实测发现与结论 | `docs/design/M3-FINDINGS.md` 与 `M4-FINDINGS.md`（gitignored；含可复用的断言自查清单） |
 | M4 前置 spike 结论 | `docs/design/M4-SPIKE-2026-08-10.md`（gitignored；已验证过的别再跑一遍） |
 | 二期任务级证据链 | `.superpowers/sdd/<计划日期>-<计划名>/progress.md` |
 

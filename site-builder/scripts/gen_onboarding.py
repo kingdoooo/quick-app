@@ -5,9 +5,14 @@
 人（照抄命令），以及被人要求"帮我接入建站平台"的 Agent（可直接执行）。
 """
 import configparser
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
+# 组件启用判定走**唯一真源**（三个部署脚本用的是同一个函数）——在这里再写一次
+# `has_section("ApiKey")` 就是第四个判定点
+sys.path.insert(0, str(ROOT / "deployer" / "functions"))
+import api_key_config                                    # noqa: E402
 # interpolation=None：endpoint_url 是 URL-encoded ARN，含 % 字符
 CFG = configparser.ConfigParser(interpolation=None)
 CFG.read(ROOT / "config.ini")
@@ -23,6 +28,29 @@ region = CFG["Platform"]["region"]
 proxy_dir = ROOT / "clients/quick-desktop-proxy"
 
 assert endpoint and client_id, "config.ini [MCP]/[Cognito] 未回填——先完成 DEPLOY.md ①⑤"
+
+# API Key 章节只在组件启用时出现。**不启用时一个字都不提**：写"本平台未启用"
+# 只会让读者去问"那怎么启用"，而那是部署者的决定，不是用户能做的事。
+if api_key_config.api_key_enabled(CFG):
+    _mcp_host = f"{api_key_config.mcp_subdomain(CFG)}.{base}"
+    api_key_section = f"""## Quick Desktop 免代理接入（Remote MCP + API Key）
+
+本平台启用了 API Key，所以 Quick Desktop 可以**不用**上面那个 stdio 代理：
+
+1. 打开 `https://console.{base}/` 的 **API Key** 页面，点"创建"。
+   **明文只显示这一次**——服务端不保存明文，抄漏了只能吊销重发。
+2. Settings → Capabilities → MCP → Add，Connection type = **Remote**：
+   - URL：`https://{_mcp_host}/`
+   - Headers：`X-API-Key: 你刚创建的那把`
+3. 不需要 Node、不需要 `auth.js`、不需要本机进程常驻。
+
+两条路径的身份语义完全一致：Key 绑定创建它的人的邮箱，经它部署的站点 owner
+就是你。别人拿到你的 Key 就等于拿到你的身份——**像密码一样保管**，可疑时立刻
+去同一个页面吊销（立即生效）。
+
+"""
+else:
+    api_key_section = ""
 
 OUT = ROOT / "ONBOARDING.md"
 OUT.write_text(f"""# Site Builder 接入指引（组织内用户）
@@ -107,7 +135,7 @@ Quick Desktop 的 Remote MCP 不支持 OAuth，需用仓库自带的本地 stdio
    env 设 `SITE_BUILDER_MCP_ENDPOINT` / `SITE_BUILDER_MCP_CLIENT_ID`
    （代理 argv 与环境变量两种都认）。
 
-## 开始使用
+{api_key_section}## 开始使用
 
 对 Agent 说需求即可，例如：
 

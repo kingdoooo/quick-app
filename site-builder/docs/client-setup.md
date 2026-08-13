@@ -116,6 +116,30 @@ print(d['projects']['$PWD']['mcpServers']['site-builder-deploy']['args'])"
 4. **与 Quick 的登录方式无关**：Quick 本体用什么登录（飞书/企业 internal/Okta）
    不影响本步骤——MCP 的身份走上面的独立 OAuth。
 
+## Quick Desktop Remote MCP + API Key（二期 M4，**仅在平台启用了该组件时可用**）
+
+上面那条 stdio 代理是**兼容方案**——它存在的唯一原因是 Remote MCP 不支持 OAuth。
+平台配了 `[ApiKey]` 段之后，Quick Desktop 可以直接用 Remote MCP：
+
+1. 在 `https://console.{base_domain}/` 的 **API Key** 页面点"创建"，
+   **明文只显示这一次**（服务端不留明文，抄漏了只能吊销重发）。
+2. Quick Desktop → Settings → Capabilities → MCP → Add，
+   Connection type = **Remote**：
+   - URL：`https://mcp.{base_domain}/`
+   - Headers：`X-API-Key: sk-…`
+3. 不需要 `auth.js`、不需要 Node、不需要本机进程常驻。
+
+**它与 OAuth 是两条平行的认证路径，身份语义完全一致**：Key 绑定创建它的人的
+邮箱，所以经它部署的站点 owner 就是那个人。交换层不接受客户端自带的
+`X-SB-On-Behalf-Of`（那个头只有交换层自己能设），所以持 Key 者无法冒充别人。
+
+**吊销与关闸**：控制台可以单把吊销（**立即**生效，交换层每次现读不缓存）；
+管理员还有一个全局总开关，关掉之后**所有** Key 一律 401。开关变更有审计。
+
+**已知取舍**：Key 绑的是邮箱字符串，不联动 IdP 账号状态——用户离职后旧 Key
+仍然有效，离职流程里要显式吊销（控制台按 owner 列得出来）。OAuth 那条路径不受
+影响（IdP 账号一撤销就登不进来）。
+
 ## 冒烟检查清单（每个客户端各跑一遍）
 
 用 MCP Inspector 先验协议层，再验业务层：
@@ -146,6 +170,7 @@ npx @modelcontextprotocol/inspector
 | OAuth | 代理的 auth.js（RFC 9728 发现 + PKCE，不发 resource） | 同左 |
 | token 管理 | 代理落盘 `~/.site-builder-deploy-token.json` + 自动续期 | 同左 |
 | Skill 导入 | `cp -r` 到 `~/.claude/skills/` | profile 的 skills 目录（如 `~/.quickwork/profiles/{profile}/skills/`） |
+| 免代理方案 | 无（`resource` 参数问题绕不开） | **Remote MCP + `X-API-Key`**（需平台启用 `[ApiKey]` 组件，见上一节） |
 
 Quick MCP 工具调用 60 秒超时是本方案异步化的原因——所有工具秒级返回，
 长任务在 Step Functions 里跑，不受此限（真机部署实测未触发超时）。
