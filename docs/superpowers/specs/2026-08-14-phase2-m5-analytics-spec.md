@@ -197,6 +197,13 @@ phase2 spec §6 的日志侧聚合，**只需替换写入端**，不动 schema /
 - `email`：`allow` 与 `denied_403` 时是**已验签**的邮箱；`redirect_login`
   （未登录）时为空串 `""`（无身份可言）。公开站点（`require_auth=False`）
   同样为空串——只有 PV 无 UV，与需求 §C 的说明一致。
+- **落实这条契约要看 sink 的赋值时机**（Codex 审查 2026-08-14 P2-1，已实测）：
+  `_check_auth` 里"验签成功"与"IdP 来源可信"是**两道**检查，中间那一段返回的是
+  302。若在验签成功后立刻写 sink，一个签名有效但 `idp`/`auth_via` 不可信的会话
+  （linked 本地用户、旧会话）会产出 `decision=redirect_login` 且 `email` 非空
+  ——实测 `status=302, sink={'email': ...}`，直接违反本契约，且扩大 PII 落盘。
+  **正确位置：IdP 来源检查通过之后、allowlist 检查之前。** 这样恰好满足
+  「403 有邮箱、302 无邮箱」。
 - SK 的随机后缀照 `ops_log.ts_actor` 先例：同毫秒两条请求不会互相覆盖
   （`ops_log` 的 docstring 记过「固定时钟后表里只剩一行（实测）」）。
 - **不给 `UpdateItem` / `DeleteItem`**：Edge 是公网请求路径上的组件，只该有
@@ -379,6 +386,14 @@ GET /api/sites/{site_id}/visitors?days=<N>&limit=<M>&cursor=<opaque>
   ——今天的数字实时，历史耐久。
 - `period=week|month` 且区间超出 90 天明细窗口 ⇒ `uv: null` +
   `uv_exact: false`（§1.4）。`uv_exact` 是契约的一部分，不是可选字段。
+- **`n` 是「最近 n 个日历桶」，桶必须对齐日历边界**（Codex 审查 2026-08-14
+  P2-2，已实测）：按 `n × 7`／`n × 31` 天回溯再分桶会返回 **n+1 个残缺桶**
+  ——固定 2026-08-14 实测：`month n=1` → `['2026-07','2026-08']`、
+  `n=2` → 3 个、`week n=4` → 5 个，**五种参数全错**，且边界桶只是部分区间却
+  没有任何标注，用户会当成完整周/月读。
+  正确做法：从**当前日历桶**往回数 n 个桶，取第一个桶的起始日作为区间起点。
+  返回恰好 n 个桶，其中**最后一个是进行中的当前桶**（"本月至今"），这是统计
+  产品的通行语义，不需要额外标注。
 
 `visitors` 响应契约（要点）：
 
@@ -434,6 +449,24 @@ get_site_analytics(site_id: str, period: str = "day", days: int = 30) -> dict
 - `renderAnalyticsTab` 由占位改为真实图表 + 访问明细表。
 - 超出明细窗口的周/月桶，UV 位置显示显式标注而非数字（§1.4）。
 - 现有那段「**不发任何请求**」的注释与占位文案一并删除/改写。
+- **站点列表的 PV 迷你趋势（`pv7`）**——本轮范围内（Codex 审查 2026-08-14
+  P2-3）。它不是新增需求，而是**被我漏掉的既定范围**：母 spec §11-clarify 的
+  M5 清单与 M3 spec 第 64 行都列了「站点列表 PV 迷你趋势」，控制台原型里
+  `pv7` 出现 6 处、`sparkline` 4 处。
+  形态：`GET /api/sites` 的每个站点多一个 `pv7`（近 7 天日 PV 数组，长度恒为 7，
+  缺失日补 0），前端画 sparkline。数据只来自聚合表 + 今天的实时值，不新增表。
+  **成本注意**：站点数 × 1 次 Query（当前 31 个站点）。管理员全局视图
+  （`?all=1`）同理，站点数长到三位数时要改成批量或缓存——届时重评，本轮按
+  实测规模直接实现。
+
+### 3.6 与母 spec §11-clarify 的端点命名偏移（显式记录）
+
+母 spec §11-clarify 把 M5 的端点写成 `/api/sites/{id}/stats` 与
+`/api/sites/{id}/audit`；本 spec 用 **`/analytics` 与 `/visitors`**。
+
+理由：控制台原型（前端契约初稿，M3 spec §4 逐个映射过的那份）用的是
+`analytics` / `analyticsGran`，前端已有 `analytics` 页签。跟原型一致比跟母
+spec 的两个词一致更有价值。**记在此处使这条偏移是申报过的，不是默认的。**
 
 ---
 

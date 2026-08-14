@@ -15,6 +15,8 @@ panel Function URL（Python 3.13）、FastMCP、pytest。
 
 ## Global Constraints
 
+- **命令一律假定 cwd = 仓库根**，路径写仓库相对（对齐 M3/M4 计划；
+  绝对路径会把 host-local 信息写进被跟踪文件，且换机器就失效）。
 - **spec 是本计划的上级**：`docs/superpowers/specs/2026-08-14-phase2-m5-analytics-spec.md`。冲突以 spec 为准。
 - **不 push**。分支 master（用户已批准直接在 master 上做）。commit **不带** `--no-verify`。
 - **一切文件操作从仓库根用绝对路径**。`configparser.read()` 读不到文件是静默返回空 → 任何 `has_section`/取值前先 `assert c.sections()`。
@@ -47,7 +49,7 @@ CDK 模板断言（默认 skip，需显式开 + PYTHONPATH 桥接，synth 需 Do
 cd site-builder/deployer && PYTHONPATH="$PWD/infra/.venv/lib/python3.12/site-packages" \
   SB_CDK_TESTS=1 .venv/bin/pytest tests/test_infra_tables.py -q
 # router
-cd router/infrastructure/lambda && PYTHONPATH="$PWD/../.venv/lib/python3.13/site-packages" \
+cd router/infrastructure/lambda && PYTHONPATH="$PWD/../.venv/lib/python3.12/site-packages" \
   SB_CDK_TESTS=1 ../../../site-builder/deployer/.venv/bin/pytest test_stack_edge_iam.py -q
 ```
 
@@ -61,8 +63,9 @@ cd router/infrastructure/lambda && PYTHONPATH="$PWD/../.venv/lib/python3.13/site
 |---|---|
 | `site-builder/deployer/functions/access_rollup.py` | 每日聚合：Query 明细分区 → 算 pv/uv/pv_denied → 覆盖写聚合行。纯标准库 + boto3 |
 | `site-builder/deployer/tests/test_access_rollup.py` | rollup 的单测（moto） |
-| `site-builder/panel/analytics.py` | panel 侧读取层：唯一访问这两张表的模块（照 `keystore.py` 的"唯一访问层"先例） |
-| `site-builder/panel/tests/test_analytics.py` | 读取层 + 两个端点的单测 |
+| `site-builder/deployer/functions/analytics.py` | **共享**读取层：panel 与 MCP 唯一访问这两张表的模块。**必须落在 `deployer/functions/`**——那是本仓库共享模块的既有位置，也是 MCP 传递闭包守卫**唯一会扫的目录**（`test_agentcore_contract.py` 的 `candidate = fn_dir / f"{name}.py"`）。放在 `panel/` 下会被该守卫静默忽略，容器里则 `ModuleNotFoundError`（Codex 审查 P1-2，已实测 Dockerfile 只 COPY 四个文件） |
+| `site-builder/deployer/tests/test_analytics.py` | 读取层单测（模块落 `functions/` ⇒ 单测落 `deployer/tests/`，与 keygen/edge_caller 同惯例） |
+| `site-builder/panel/tests/test_analytics_api.py` | 两个端点的授权/参数单测 |
 | `site-builder/scripts/verify_analytics_e2e.py` | 真机闸门 |
 
 **改动**
@@ -106,7 +109,7 @@ cd router/infrastructure/lambda && PYTHONPATH="$PWD/../.venv/lib/python3.13/site
 - [ ] **Step 1: 确认现状（该文件到 §3.12 为止）**
 
 ```bash
-grep -n "^## §3" /Users/kentpeng/projects/quick-app/docs/design/M4-FINDINGS.md | tail -3
+grep -n "^## §3" docs/design/M4-FINDINGS.md | tail -3
 ```
 
 预期：最后一条是 `## §3.12`。若已有 §3.13 则本 Task 已完成，跳过。
@@ -144,7 +147,7 @@ grep -n "^## §3" /Users/kentpeng/projects/quick-app/docs/design/M4-FINDINGS.md 
 - [ ] **Step 3: 复核编号与可读性**
 
 ```bash
-grep -n "^## §3.1[234]" /Users/kentpeng/projects/quick-app/docs/design/M4-FINDINGS.md
+grep -n "^## §3.1[234]" docs/design/M4-FINDINGS.md
 ```
 
 预期：`§3.12` / `§3.13` / `§3.14` 三行，编号连续无重复。
@@ -152,7 +155,7 @@ grep -n "^## §3.1[234]" /Users/kentpeng/projects/quick-app/docs/design/M4-FINDI
 - [ ] **Step 4: 确认它没被 git 跟踪**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app && git status --short && git check-ignore -v docs/design/M4-FINDINGS.md
+cd "$(git rev-parse --show-toplevel)" && git status --short && git check-ignore -v docs/design/M4-FINDINGS.md
 ```
 
 预期：`git status` 里**没有** M4-FINDINGS；`check-ignore` 输出命中规则。本 Task **无提交**。
@@ -168,9 +171,57 @@ cd /Users/kentpeng/projects/quick-app && git status --short && git check-ignore 
 **Interfaces:**
 - Produces: 表名 `site-access-events`（PK `site_date` S / SK `ts_id` S / TTL `expires_at` / `TableV2` 3 区副本 / DESTROY）与 `site-access-daily`（PK `site_id` S / SK `date` S / TTL `expires_at` / RETAIN + `deletion_protection=True`）。后续 Task 3/5/8/10 按这两个名字与键名取值。
 
+- [ ] **Step 0: 先修测试 fixture——否则本 Task 的测试无法运行**
+
+**`TableV2` + `replicas` 在 region-agnostic 栈里直接 synth 抛错**（2026-08-14
+实测）：
+
+```
+«ReplicaTablesNotSupportedInRegionAgnosticStack» Replica tables are not
+supported in a region agnostic stack
+```
+
+而 `site-builder/deployer/tests/test_infra_tables.py:46` 建栈时**没有传 env**：
+
+```python
+stack = mod.SiteDeployerStack(app, "TestStack")
+```
+
+后果不是「断言无效」而是**整个文件崩**——fixture 一抛异常，连
+`test_every_retained_table_has_deletion_protection`（RETAIN 不变量）一起挂。
+真实入口 `app.py:419` 是带 env 的，所以这只是测试侧的缺口。
+
+改成（`ACCOUNT`/`REGION` 是 app.py 从 config.ini 读出来的模块级常量）：
+
+```python
+    app = aws_cdk.App()
+    # **必须传 env**：TableV2 的 replicas 在 region-agnostic 栈里会抛
+    # ReplicaTablesNotSupportedInRegionAgnosticStack（2026-08-14 实测），
+    # fixture 一抛异常会让本文件所有用例连带失效（含 RETAIN 不变量那条）。
+    # 顺带的好处：带 env 后 self.account/region 渲染成字面量而不是
+    # Fn::Join + Ref(AWS::AccountId)，模板断言可以直接比字符串。
+    stack = mod.SiteDeployerStack(
+        app, "TestStack",
+        env=aws_cdk.Environment(account=mod.ACCOUNT, region=mod.REGION))
+```
+
+跑一次确认既有用例仍全绿（**这一步先于新断言**，否则分不清红的是新表还是
+fixture）：
+
+```bash
+cd site-builder/deployer && \
+  PYTHONPATH="$PWD/infra/.venv/lib/python3.12/site-packages" SB_CDK_TESTS=1 \
+  .venv/bin/pytest tests/test_infra_tables.py -q
+```
+
 - [ ] **Step 1: 写失败的测试**
 
 追加到 `site-builder/deployer/tests/test_infra_tables.py`：
+
+> 实测确认的模板形态（2026-08-14 synth）：资源类型是
+> **`AWS::DynamoDB::GlobalTable`**；`Properties.Replicas` **包含主区**
+> （实测 `['ap-southeast-1','ap-northeast-1','us-east-1']`）；
+> `Properties.TimeToLiveSpecification` 在顶层；`DeletionPolicy` 为 `Delete`。
 
 ```python
 def test_access_events_table_is_a_three_region_global_table(template):
@@ -213,7 +264,7 @@ def test_access_daily_table_is_retained_and_protected(template):
 - [ ] **Step 2: 跑测试确认失败**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app/site-builder/deployer && \
+cd site-builder/deployer && \
   PYTHONPATH="$PWD/infra/.venv/lib/python3.12/site-packages" SB_CDK_TESTS=1 \
   .venv/bin/pytest tests/test_infra_tables.py -q -k access
 ```
@@ -265,7 +316,7 @@ cd /Users/kentpeng/projects/quick-app/site-builder/deployer && \
 - [ ] **Step 4: 跑测试确认通过**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app/site-builder/deployer && \
+cd site-builder/deployer && \
   PYTHONPATH="$PWD/infra/.venv/lib/python3.12/site-packages" SB_CDK_TESTS=1 \
   .venv/bin/pytest tests/test_infra_tables.py -q
 ```
@@ -276,7 +327,7 @@ cd /Users/kentpeng/projects/quick-app/site-builder/deployer && \
 - [ ] **Step 5: 反向验证（两条守卫各一次）**
 
 ```bash
-cp /Users/kentpeng/projects/quick-app/site-builder/deployer/infra/app.py /tmp/app.py.bak
+cp site-builder/deployer/infra/app.py /tmp/app.py.bak
 ```
 
 ① 删掉 `ap-northeast-1` 那一行副本 → 重跑 → 预期 `副本区集合不对: ['ap-southeast-1', 'us-east-1']`。
@@ -286,15 +337,15 @@ cp /Users/kentpeng/projects/quick-app/site-builder/deployer/infra/app.py /tmp/ap
 还原并双证：
 
 ```bash
-cp /tmp/app.py.bak /Users/kentpeng/projects/quick-app/site-builder/deployer/infra/app.py
-diff -q /tmp/app.py.bak /Users/kentpeng/projects/quick-app/site-builder/deployer/infra/app.py && \
-  cd /Users/kentpeng/projects/quick-app && git status --short
+cp /tmp/app.py.bak site-builder/deployer/infra/app.py
+diff -q /tmp/app.py.bak site-builder/deployer/infra/app.py && \
+  cd "$(git rev-parse --show-toplevel)" && git status --short
 ```
 
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git add site-builder/deployer/infra/app.py site-builder/deployer/tests/test_infra_tables.py
 git commit -m "feat(m5): 访问明细表（3 区 Global Table）与日聚合表（RETAIN+保护）
 
@@ -387,16 +438,29 @@ def test_region_without_a_replica_falls_back_to_primary(monkeypatch):
 
 # ── 页面级判定必须与静态改写用同一个条件（spec §2.2）────────────────
 
-@pytest.mark.parametrize("uri,is_page", [
-    ("/", True), ("/notes", True), ("/a/b", True),
+# oracle **必须来自真实的 _route_request**，不能复刻它的条件。
+# 初版就是复刻的，于是漏了 /api/ 前置分支还全绿（P1-1）。
+# 另注：oracle 也不能写成"进了静态桶"——`.css` 也进桶。判据是**被改写成
+# index.html**（我第一次写这个 oracle 时就选错了，表格看着对、结论是错的）。
+_PAGE_CASES = [
+    ("/", True), ("/notes", True), ("/a/b", True), ("/.well-known/x", True),
     ("/app.css", False), ("/x/main.js", False), ("/favicon.ico", False),
-])
-def test_page_detection_matches_the_static_rewrite_condition(uri, is_page):
-    route = {"route_mode": "split", "static_prefix": "sites/x"}
-    assert orq._is_page_request(route, uri) is is_page
-    # 与 _route_request 的改写条件一致：页面 ⇔ 会被改写成 /index.html
-    rewritten = uri if ("." in uri.rsplit("/", 1)[-1]) else "/index.html"
-    assert (rewritten == "/index.html") is is_page
+    # ↓ P1-1 的回归：split 站点的 /api/* 走后端，**不是页面**
+    ("/api/data", False), ("/api/sites/x/jobs", False), ("/api/x.json", False),
+]
+
+
+@pytest.mark.parametrize("uri,is_page", _PAGE_CASES)
+def test_page_detection_agrees_with_real_routing(uri, is_page):
+    route = {"route_mode": "split", "static_prefix": "sites/x",
+             "api_target": "https://f.lambda-url.us-east-1.on.aws/"}
+    req = {"uri": uri, "method": "GET", "querystring": "", "headers": {}}
+    out = orq._route_request(req, dict(route))
+    # 真实判据：被改写成 index.html ⇔ 这是一次页面浏览
+    really_a_page = str(out.get("uri", "")).endswith("/index.html")
+    assert really_a_page is is_page, f"用例表与真实路由不符: {uri}"
+    assert orq._is_page_request(route, uri) is really_a_page, (
+        f"_is_page_request 与 _route_request 对 {uri} 判断不一致")
 
 
 def test_api_only_sites_record_every_request():
@@ -542,12 +606,48 @@ def test_sink_carries_email_even_when_access_is_forbidden():
                              sink)
     assert denied and denied["status"] == "403"
     assert sink["email"] == "out@b.co"
+
+
+def test_untrusted_idp_session_yields_302_without_an_email():
+    """P2-1 的回归：签名有效但 idp/auth_via 不可信 → 302 且 sink 里**没有**邮箱。
+
+    这条与上一条是一对：403 必须有邮箱（"谁被拒了"），302 必须没有
+    （契约说 redirect_login 的 email 是空串）。只写其中一条都会漏掉 P2-1。
+    需要 REQUIRE_IDP_CLAIM=true 的副本，机制照 test_edge_auth.py 的
+    `_edge_noidp_testable` 形态：把占位符替换成 true 后重新加载模块。
+    """
+    import importlib
+    src = (Path(__file__).parents[0] / "origin_request.py").read_text()
+    subs = dict(_SUBS, **{"{{REQUIRE_IDP_CLAIM}}": "true"})
+    for k, v in subs.items():
+        src = src.replace(k, v)
+    (Path(__file__).parent / "_edge_access_idp_testable.py").write_text(src)
+    mod = importlib.import_module("_edge_access_idp_testable")
+    import base64, hashlib, hmac, time
+    head = base64.urlsafe_b64encode(b'{"alg":"HS256"}').rstrip(b"=").decode()
+    payload = base64.urlsafe_b64encode(json.dumps(
+        {"email": "linked@b.co", "exp": int(time.time()) + 600,
+         "idp": "Cognito",
+         "auth_via": "TokenGeneration_Authentication"}).encode()).rstrip(b"=").decode()
+    sig = base64.urlsafe_b64encode(hmac.new(
+        b"test-secret", f"{head}.{payload}".encode(), hashlib.sha256).digest()
+    ).rstrip(b"=").decode()
+    req = {"uri": "/", "method": "GET", "querystring": "",
+           "headers": {"host": [{"key": "Host", "value": "app-x.example.test"}],
+                       "cookie": [{"key": "Cookie",
+                                   "value": f"sb_session={head}.{payload}.{sig}"}]}}
+    sink = {}
+    denied = mod._check_auth(req, {"require_auth": True, "allowed_users": "org"},
+                             "app-x.example.test", sink)
+    assert denied and denied["status"] == "302"
+    assert sink.get("email", "") == "", (
+        f"302 却带了邮箱: {sink}——违反 spec §1.1 的 redirect_login 契约")
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app/router/infrastructure/lambda && \
+cd router/infrastructure/lambda && \
   ../../../site-builder/deployer/.venv/bin/pytest test_edge_access_log.py -q
 ```
 
@@ -621,12 +721,21 @@ def _access_client(region: str):
 def _is_page_request(route: dict, uri: str) -> bool:
     """页面级 ⇔ `_route_request` 会把它改写成 /index.html。
 
-    **复用同一个条件，不新写扩展名清单**：两处判定漂移的症状是"统计与路由对
-    同一个 URI 判断不一致"，而两侧单测各自都会绿。
-    api-only 站点没有"页面 vs 资源"之分，全记。
+    **必须逐条镜像 `_route_request` 的分支顺序，不只抄"有没有点号"那一条。**
+    初版漏了 `/api/` 前置分支（Codex 审查 2026-08-14 P1-1），实测后果：
+    split 站点的 `/api/data`、`/api/sites/x/jobs` 没有扩展名 → 被判成页面，
+    而它们真实是走后端的。一次 SPA 打开 + 5 个接口调用 = **PV 放大到 6 倍**，
+    且 rollup / panel / MCP 会一致地返回同一个错误数字（没有任何一侧会红）。
+
+    分支顺序（与 `_route_request` 一一对应）：
+      ① api-only 站点 → 全路径走后端，没有"页面 vs 资源"之分，全记；
+      ② `/api/` 前缀 → 走后端，**不是页面**；
+      ③ 其余：有扩展名 → 静态资源；无扩展名 → 改写成 /index.html = 页面。
     """
     if route.get("route_mode") == "api-only":
         return True
+    if uri.startswith("/api/"):
+        return False
     return "." not in uri.rsplit("/", 1)[-1]
 
 
@@ -700,9 +809,17 @@ def _check_auth(request, route, host, sink=None):
     """
 ```
 
-在 `_verify_session_jwt` 成功之后（`if REQUIRE_IDP_CLAIM:` 之前）插入：
+插入位置：**IdP 来源检查通过之后、allowlist 检查之前**（不是"验签成功后立刻"）。
+即紧接 `if REQUIRE_IDP_CLAIM:` 那个 `if` 块**之后**、`allowed = route.get(...)`
+**之前**：
 
 ```python
+    # 契约（spec §1.1）：403 有邮箱、302 无邮箱。
+    # **位置不能提前到验签成功处**（Codex 审查 2026-08-14 P2-1，已实测）：
+    # 验签成功与 IdP 来源可信是两道检查，中间那段返回 302。提前赋值会让一个
+    # 签名有效但 idp/auth_via 不可信的会话（linked 本地用户、旧会话）产出
+    # `decision=redirect_login` 且 email 非空——实测 status=302、
+    # sink={'email': ...}，违反契约且扩大 PII 落盘。
     if sink is not None:
         sink["email"] = claims["email"]
 ```
@@ -734,7 +851,7 @@ def _check_auth(request, route, host, sink=None):
 - [ ] **Step 4: 跑测试确认通过**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app/router/infrastructure/lambda && \
+cd router/infrastructure/lambda && \
   ../../../site-builder/deployer/.venv/bin/pytest . -q
 ```
 
@@ -744,7 +861,7 @@ cd /Users/kentpeng/projects/quick-app/router/infrastructure/lambda && \
 - [ ] **Step 5: 反向验证（三条最关键的守卫）**
 
 ```bash
-cp /Users/kentpeng/projects/quick-app/router/infrastructure/lambda/origin_request.py /tmp/orq.py.bak
+cp router/infrastructure/lambda/origin_request.py /tmp/orq.py.bak
 ```
 
 ① 把 `_access_region` 最后那个"不在副本清单就回落"的判断删掉 → 预期
@@ -754,19 +871,24 @@ cp /Users/kentpeng/projects/quick-app/router/infrastructure/lambda/origin_reques
 ③ 把 `_maybe_record` 的调用挪到 `_route_request` **之后**并改用
 `request.get("uri")` → 预期 `test_written_item_shape` 里 `path` 变成
 `/sites/...` 形态（**若不红，说明该断言没盯住 path，补断言**）。
+④ 把 `_is_page_request` 里 `if uri.startswith("/api/")` 那两行删掉 → 预期
+`test_page_detection_agrees_with_real_routing[/api/data-False]` 变红。
+**这一条是 P1-1 的回归闸门**：删之前那个实现全绿。
+⑤ 把 sink 赋值挪回 `if REQUIRE_IDP_CLAIM:` **之前** → 预期
+`test_untrusted_idp_session_yields_302_without_an_email` 变红。
 
 还原并双证：
 
 ```bash
-cp /tmp/orq.py.bak /Users/kentpeng/projects/quick-app/router/infrastructure/lambda/origin_request.py
-diff -q /tmp/orq.py.bak /Users/kentpeng/projects/quick-app/router/infrastructure/lambda/origin_request.py && \
-  cd /Users/kentpeng/projects/quick-app && git status --short
+cp /tmp/orq.py.bak router/infrastructure/lambda/origin_request.py
+diff -q /tmp/orq.py.bak router/infrastructure/lambda/origin_request.py && \
+  cd "$(git rev-parse --show-toplevel)" && git status --short
 ```
 
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git add router/infrastructure/lambda/origin_request.py \
         router/infrastructure/lambda/test_origin_request.py \
         router/infrastructure/lambda/test_edge_access_log.py
@@ -835,6 +957,7 @@ def test_edge_role_may_only_put_items_into_the_access_events_table(template):
                cfg["SiteBuilder"]["access_replica_regions"].split(",") if r.strip()]
     assert len(regions) >= 2, f"副本清单至少要有主区+1: {regions}"
 
+    account = cfg["AWS"]["account_id"].strip()
     puts = [s for s in _ddb_statements(template)
             if "dynamodb:PutItem" in (s["Action"] if isinstance(s["Action"], list)
                                       else [s["Action"]])]
@@ -843,13 +966,16 @@ def test_edge_role_may_only_put_items_into_the_access_events_table(template):
     for s in puts:
         res = s["Resource"]
         for r in (res if isinstance(res, list) else [res]):
-            got.add(str(r))
-    expected_tails = {f"{rg}:*:table/{table}" for rg in regions}
-    tails = {":".join(r.split(":")[3:]) for r in got}
-    # ARN 里的账号段由 CDK 渲染成 token/真实值，只比区域与表名
-    normalized = {t.replace(t.split(":")[1], "*", 1) for t in tails}
-    assert normalized == expected_tails, (
-        f"PutItem 资源集合不对\n  实际: {sorted(normalized)}\n  期望: {sorted(expected_tails)}")
+            # **必须是字符串**。若是 dict（Fn::Join / Fn::GetAtt）说明实现用了
+            # self.account 或 table_arn，那种形态没法逐字比（2026-08-14 实测）
+            assert isinstance(r, str), (
+                f"Resource 渲染成了 {type(r).__name__} 而不是字符串: {r}"
+                "——实现里应该用 config 的账号字面量，不是 self.account")
+            got.add(r)
+    expected = {f"arn:aws:dynamodb:{rg}:{account}:table/{table}" for rg in regions}
+    assert got == expected, (
+        f"PutItem 资源集合不对（**逐字比**，漏一个区 = 该区静默零数据）"
+        f"\n  实际: {sorted(got)}\n  期望: {sorted(expected)}")
 
 
 def test_edge_role_has_no_write_actions_beyond_put_item(template):
@@ -896,8 +1022,8 @@ access_replica_regions = us-east-1,ap-southeast-1,ap-northeast-1
 同样两行手工加进 `router/config.ini`（gitignored，**不要 `git add`**）。
 
 ```bash
-cd /Users/kentpeng/projects/quick-app/router/infrastructure/lambda && \
-  PYTHONPATH="$PWD/../.venv/lib/python3.13/site-packages" SB_CDK_TESTS=1 \
+cd router/infrastructure/lambda && \
+  PYTHONPATH="$PWD/../.venv/lib/python3.12/site-packages" SB_CDK_TESTS=1 \
   ../../../site-builder/deployer/.venv/bin/pytest test_stack_edge_iam.py -q
 ```
 
@@ -915,6 +1041,13 @@ cd /Users/kentpeng/projects/quick-app/router/infrastructure/lambda && \
         # test_stack_edge_iam.py 从它推导断言。
         # 只给 PutItem：Edge 是公网请求路径上的组件，只该能"追加一行"，
         # 不该能改写或删除访问历史。
+        # **账号取自 config，不用 `self.account`**（Codex 审查 2026-08-14 P2-4）：
+        # 实测 `self.account` 在无显式 env 的栈里渲染成
+        # {"Fn::Join": ["", ["arn:...:", {"Ref": "AWS::AccountId"}, ":table/..."]]}
+        # ——一个 **dict**，模板断言没法按字符串比。用 config 的字面量则渲染成
+        # 普通字符串，断言可以逐字比。这也更符合 CLAUDE.md 的「config.ini 是
+        # 账号/域名的唯一取值来源」。
+        access_account = config.get("AWS", "account_id", "APP_ACCOUNT_ID").strip()
         access_table = config.get("SiteBuilder", "access_table",
                                   "APP_ACCESS_TABLE").strip()
         access_regions = [r.strip() for r in
@@ -928,7 +1061,7 @@ cd /Users/kentpeng/projects/quick-app/router/infrastructure/lambda && \
         edge_role.add_to_policy(iam.PolicyStatement(
             effect=iam.Effect.ALLOW,
             actions=["dynamodb:PutItem"],
-            resources=[f"arn:aws:dynamodb:{rg}:{self.account}:table/{access_table}"
+            resources=[f"arn:aws:dynamodb:{rg}:{access_account}:table/{access_table}"
                        for rg in access_regions]))
 ```
 
@@ -942,8 +1075,8 @@ cd /Users/kentpeng/projects/quick-app/router/infrastructure/lambda && \
 - [ ] **Step 4: 跑测试确认通过**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app/router/infrastructure/lambda && \
-  PYTHONPATH="$PWD/../.venv/lib/python3.13/site-packages" SB_CDK_TESTS=1 \
+cd router/infrastructure/lambda && \
+  PYTHONPATH="$PWD/../.venv/lib/python3.12/site-packages" SB_CDK_TESTS=1 \
   ../../../site-builder/deployer/.venv/bin/pytest test_stack_edge_iam.py -q
 ```
 
@@ -952,7 +1085,7 @@ cd /Users/kentpeng/projects/quick-app/router/infrastructure/lambda && \
 - [ ] **Step 5: 反向验证（三条各一次，cache policy 那条必须证明会红）**
 
 ```bash
-cp /Users/kentpeng/projects/quick-app/router/infrastructure/stack.py /tmp/stack.py.bak
+cp router/infrastructure/stack.py /tmp/stack.py.bak
 ```
 
 ① 把 `resources=[...]` 里的列表推导改成只取 `access_regions[0]` → 预期
@@ -966,18 +1099,25 @@ cp /Users/kentpeng/projects/quick-app/router/infrastructure/stack.py /tmp/stack.
 还原并双证：
 
 ```bash
-cp /tmp/stack.py.bak /Users/kentpeng/projects/quick-app/router/infrastructure/stack.py
-diff -q /tmp/stack.py.bak /Users/kentpeng/projects/quick-app/router/infrastructure/stack.py && \
-  cd /Users/kentpeng/projects/quick-app && git status --short
+cp /tmp/stack.py.bak router/infrastructure/stack.py
+diff -q /tmp/stack.py.bak router/infrastructure/stack.py && \
+  cd "$(git rev-parse --show-toplevel)" && git status --short
 ```
 
 预期 `git status` 只有 `stack.py`、`config.ini.example`、`test_stack_edge_iam.py`
 ——**`router/config.ini` 不得出现**（gitignored）。
 
+- [ ] **Step 5b: 顺手修仓库自己写错的 venv 路径**
+
+`test_stack_edge_iam.py` 的 docstring 写 `python3.13`，而实际目录是
+`python3.12`（2026-08-14 实测 `ls router/infrastructure/.venv/lib/`）。
+照抄那条命令会得到"aws_cdk 不可用"并按该文件的设计**fail 而不是 skip**——
+不致命但会浪费下一个人的时间。改成 3.12，并保留原有的"按实际 venv 调整"提示。
+
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git add router/infrastructure/stack.py router/config.ini.example \
         router/infrastructure/lambda/test_stack_edge_iam.py
 git commit -m "feat(m5): edge_role 的 PutItem（三个副本 ARN，从清单推导）+ 缓存策略的第一条断言
@@ -1153,7 +1293,7 @@ def test_sites_are_enumerated_from_the_sites_table(tables):
 - [ ] **Step 2: 跑测试确认失败**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app/site-builder/deployer && \
+cd site-builder/deployer && \
   PYTHONPATH=functions .venv/bin/pytest tests/test_access_rollup.py -q
 ```
 
@@ -1291,7 +1431,7 @@ def handler(event, context) -> dict:
 - [ ] **Step 4: 跑测试确认通过**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app/site-builder/deployer && \
+cd site-builder/deployer && \
   PYTHONPATH=functions .venv/bin/pytest tests/test_access_rollup.py -q && \
   .venv/bin/pytest tests -q
 ```
@@ -1301,7 +1441,7 @@ cd /Users/kentpeng/projects/quick-app/site-builder/deployer && \
 - [ ] **Step 5: 反向验证**
 
 ```bash
-cp /Users/kentpeng/projects/quick-app/site-builder/deployer/functions/access_rollup.py /tmp/ar.py.bak
+cp site-builder/deployer/functions/access_rollup.py /tmp/ar.py.bak
 ```
 
 ① `rollup_day` 的 `if not rows: return None` 删掉 → 预期
@@ -1316,7 +1456,7 @@ cp /Users/kentpeng/projects/quick-app/site-builder/deployer/functions/access_rol
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git add site-builder/deployer/functions/access_rollup.py \
         site-builder/deployer/tests/test_access_rollup.py
 git commit -m "feat(m5): 每日聚合——幂等覆盖写 + 7 天回溯，不用水位线
@@ -1357,24 +1497,47 @@ def test_rollup_role_can_only_query_events_and_put_daily(template):
     给它 PutItem 到明细表 = 聚合器能伪造访问历史；给它 Scan 明细表 = 不必要的
     全表能力（它只按分区 Query）。
     """
-    stmts = []
-    for pol in template.find_resources("AWS::IAM::Policy").values():
-        doc = pol["Properties"]["PolicyDocument"]
-        body = str(doc)
-        if "site-access" not in body:
-            continue
-        stmts.extend(doc["Statement"])
-    assert stmts, "找不到涉及 site-access 表的策略"
+    # **不能按 "site-access" 字面量筛策略**（Codex 审查 2026-08-14 P2-4）：
+    # `table_arn` 渲染成 {"Fn::GetAtt": ["AccessEvents832F10D1", "Arn"]}（实测），
+    # policy 文本里根本没有表名字面量，那样筛会把目标策略全筛掉 → 用例空转。
+    # 改成按**逻辑 ID** 对应：先从模板里查出两张表的逻辑 ID，再看语句引用了谁。
+    def _logical_id(res_type: str, table_name: str) -> str:
+        for lid, res in template.find_resources(res_type).items():
+            if res["Properties"].get("TableName") == table_name:
+                return lid
+        raise AssertionError(f"模板里找不到 {table_name}")
+
+    ev_lid = _logical_id("AWS::DynamoDB::GlobalTable", "site-access-events")
+    da_lid = _logical_id("AWS::DynamoDB::Table", "site-access-daily")
+
+    def _refs(resource) -> set[str]:
+        """语句 Resource 里引用到的逻辑 ID 集合（Fn::GetAtt / Ref 都算）。"""
+        out = set()
+        for r in (resource if isinstance(resource, list) else [resource]):
+            if isinstance(r, dict):
+                for k, v in r.items():
+                    if k in ("Fn::GetAtt", "Ref"):
+                        out.add(v[0] if isinstance(v, list) else v)
+        return out
+
     events_actions, daily_actions = set(), set()
-    for s in stmts:
-        acts = s["Action"] if isinstance(s["Action"], list) else [s["Action"]]
-        res = str(s["Resource"])
-        if "site-access-events" in res:
-            events_actions |= {str(a) for a in acts}
-        if "site-access-daily" in res:
-            daily_actions |= {str(a) for a in acts}
-    assert events_actions <= {"dynamodb:Query", "dynamodb:PutItem"}, events_actions
-    assert "dynamodb:PutItem" not in (events_actions - {"dynamodb:PutItem"}) or True
+    for pol in template.find_resources("AWS::IAM::Policy").values():
+        for st in pol["Properties"]["PolicyDocument"]["Statement"]:
+            acts = st["Action"] if isinstance(st["Action"], list) else [st["Action"]]
+            acts = {str(a) for a in acts if str(a).startswith("dynamodb:")}
+            if not acts:
+                continue
+            refs = _refs(st["Resource"])
+            if ev_lid in refs:
+                events_actions |= acts
+            if da_lid in refs:
+                daily_actions |= acts
+    # **两个都要非空**，否则本用例在筛不到语句时会静默通过（上一版就是这样）
+    assert events_actions, "没有任何语句引用明细表——筛选逻辑坏了，本条空转"
+    assert daily_actions, "没有任何语句引用聚合表——筛选逻辑坏了，本条空转"
+    assert events_actions == {"dynamodb:Query"}, (
+        f"明细表的动作集合必须恰好是 Query（给 PutItem = 聚合器能伪造历史）: "
+        f"{sorted(events_actions)}")
     assert daily_actions == {"dynamodb:PutItem"}, (
         f"聚合表的动作集合不对: {sorted(daily_actions)}")
 
@@ -1394,7 +1557,7 @@ def test_rollup_runs_daily_and_has_a_dlq(template):
 - [ ] **Step 2: 跑测试确认失败**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app/site-builder/deployer && \
+cd site-builder/deployer && \
   PYTHONPATH="$PWD/infra/.venv/lib/python3.12/site-packages" SB_CDK_TESTS=1 \
   .venv/bin/pytest tests/test_infra_tables.py -q -k rollup
 ```
@@ -1443,7 +1606,7 @@ cd /Users/kentpeng/projects/quick-app/site-builder/deployer && \
 - [ ] **Step 4: 跑测试确认通过**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app/site-builder/deployer && \
+cd site-builder/deployer && \
   PYTHONPATH="$PWD/infra/.venv/lib/python3.12/site-packages" SB_CDK_TESTS=1 \
   .venv/bin/pytest tests/test_infra_tables.py -q
 ```
@@ -1458,7 +1621,7 @@ cd /Users/kentpeng/projects/quick-app/site-builder/deployer && \
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git add site-builder/deployer/infra/app.py site-builder/deployer/tests/test_infra_tables.py
 git commit -m "feat(m5): rollup Lambda + 每日 EventBridge 规则（照 JobSweepRule 形态）
 
@@ -1510,7 +1673,7 @@ def test_unregistered_analytics_typo_is_denied_to_everyone():
 - [ ] **Step 2: 跑测试确认失败**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app/site-builder/deployer && \
+cd site-builder/deployer && \
   .venv/bin/pytest tests -q -k analytics
 ```
 
@@ -1531,13 +1694,13 @@ cd /Users/kentpeng/projects/quick-app/site-builder/deployer && \
 - [ ] **Step 4: 跑测试确认通过**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app/site-builder/deployer && .venv/bin/pytest tests -q
+cd site-builder/deployer && .venv/bin/pytest tests -q
 ```
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git add site-builder/deployer/functions/permissions.py site-builder/deployer/tests/
 git commit -m "feat(m5): CAPABILITIES 加 view_analytics（owner/collaborator/admin）
 
@@ -1552,8 +1715,9 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ## Task 8: panel 的读取层与两个 GET 端点
 
 **Files:**
-- Create: `site-builder/panel/analytics.py`
-- Create: `site-builder/panel/tests/test_analytics.py`
+- Create: `site-builder/deployer/functions/analytics.py`
+- Create: `site-builder/deployer/tests/test_analytics.py`（读取层）
+- Create: `site-builder/panel/tests/test_analytics_api.py`（端点层）
 - Modify: `site-builder/panel/api.py`
 - Modify: `site-builder/panel/handler.py:45-74`（ROUTES + 常量）与 `_dispatch`
 
@@ -1567,7 +1731,8 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 - [ ] **Step 1: 写失败的测试**
 
-新建 `site-builder/panel/tests/test_analytics.py`：
+新建 `site-builder/deployer/tests/test_analytics.py`（读取层）与
+`site-builder/panel/tests/test_analytics_api.py`（端点层，即下面「端点层：授权」那两条）：
 
 ```python
 """panel 读取层单测。
@@ -1681,6 +1846,28 @@ def test_month_uv_is_exact_inside_the_detail_window(env):
     assert b["uv_exact"] is True
 
 
+@pytest.mark.parametrize("period,n", [("day", 7), ("week", 1), ("week", 4),
+                                      ("month", 1), ("month", 2), ("month", 3)])
+def test_series_returns_exactly_n_calendar_aligned_buckets(env, period, n):
+    """P2-2 的回归：n 是桶数。上一版用 n×7 / n×31 天回溯，**五种参数全错**
+    （month n=1 给 2 个、n=2 给 3 个、week n=4 给 5 个）。"""
+    import analytics
+    out = analytics.series("s1", period, n)
+    assert len(out) == n, f"{period} n={n} 给了 {len(out)} 个桶: {[b['bucket'] for b in out]}"
+    keys = [b["bucket"] for b in out]
+    assert keys == sorted(keys), "桶没有升序"
+    assert len(set(keys)) == n, f"桶键重复: {keys}"
+
+
+def test_last_bucket_is_the_current_in_progress_one(env):
+    """最后一个桶必然是"至今"的当前桶——这是契约，前端据此不给它画完整周期。"""
+    import analytics
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).date()
+    assert analytics.series("s1", "month", 3)[-1]["bucket"] == today.strftime("%Y-%m")
+    assert analytics.series("s1", "day", 3)[-1]["bucket"] == today.isoformat()
+
+
 def test_visitors_returns_rows_with_decision_and_paginates(env):
     import analytics
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -1767,18 +1954,22 @@ def test_every_route_still_has_a_dispatch_branch():
 - [ ] **Step 2: 跑测试确认失败**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app/site-builder/panel && \
-  ../deployer/.venv/bin/pytest tests/test_analytics.py -q
+cd site-builder/deployer && PYTHONPATH=functions .venv/bin/pytest tests/test_analytics.py -q
+cd site-builder/panel && ../deployer/.venv/bin/pytest tests/test_analytics_api.py -q
 ```
 
 预期：`ModuleNotFoundError: analytics`。
 
 - [ ] **Step 3: 写实现**
 
-新建 `site-builder/panel/analytics.py`：
+新建 `site-builder/deployer/functions/analytics.py`：
 
 ```python
-"""panel 侧访问统计的**唯一**读取层（照 keystore.py 的先例：api.py 不出现表名）。
+"""访问统计的**唯一**读取层，panel 与 MCP 共用（api.py / server.py 都不出现表名）。
+
+**位置是 `deployer/functions/` 不是 `panel/`**：那是共享模块的既有位置，也是
+MCP 传递闭包守卫唯一会扫的目录——放在 panel 下会让守卫静默放过，而容器里
+`import analytics` 直接 ModuleNotFoundError（Codex 审查 2026-08-14 P1-2）。
 
 两条契约要点：
   · 今天的数从明细实时算，`date < today` 读聚合表——今天实时、历史耐久；
@@ -1791,12 +1982,12 @@ import base64
 import json
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import boto3
 
 # 口径唯一：pv/uv 的定义只有 access_rollup.day_stats 一份。
-# 部署时由 deploy_panel.py 把它复制进包（见该脚本的 COPY_FILES）。
+# 同目录，所以 panel 的 COPY_FILES 与 MCP 的三份清单都要带上这两个文件。
 from access_rollup import day_stats
 
 logger = logging.getLogger(__name__)
@@ -1860,15 +2051,54 @@ def _bucket_of(day: str, period: str) -> str:
     return f"{year}-W{week:02d}"
 
 
+def _bucket_keys(period: str, n: int, today: date) -> list[str]:
+    """最近 n 个**日历桶**的键，升序，长度恒为 n。
+
+    **不能用 `n×7` / `n×31` 天回溯再分桶**（Codex 审查 2026-08-14 P2-2，
+    已实测）：那样会返回 **n+1 个残缺桶**——固定 2026-08-14：`month n=1` 得
+    `['2026-07','2026-08']`、`n=2` 得 3 个、`week n=4` 得 5 个，**五种参数全错**，
+    而边界桶只是部分区间却没有任何标注，用户会当成完整周/月读。
+    这里从**当前桶**往回数 n 个，最后一个桶必然是进行中的当前桶
+    （"本月至今"），这是统计产品的通行语义。
+    """
+    if period == "day":
+        return [(today - timedelta(days=i)).isoformat()
+                for i in range(n - 1, -1, -1)][:n]
+    if period == "week":
+        monday = today - timedelta(days=today.weekday())
+        out = []
+        for i in range(n - 1, -1, -1):
+            d = monday - timedelta(weeks=i)
+            y, w, _ = d.isocalendar()
+            out.append(f"{y}-W{w:02d}")
+        return out
+    out = []
+    for i in range(n - 1, -1, -1):
+        total = today.year * 12 + (today.month - 1) - i
+        out.append(f"{total // 12:04d}-{total % 12 + 1:02d}")
+    return out
+
+
+def _bucket_first_day(period: str, key: str) -> date:
+    """桶键 → 它的第一天（用来定 Query 的下界）。"""
+    if period == "day":
+        return date.fromisoformat(key)
+    if period == "month":
+        y, m = key.split("-")
+        return date(int(y), int(m), 1)
+    y, w = key.split("-W")
+    return date.fromisocalendar(int(y), int(w), 1)
+
+
 def series(site_id: str, period: str = "day", n: int = 30) -> list[dict]:
     """时间序列。`period` ∈ day|week|month，`n` = 桶数。"""
     if period not in ("day", "week", "month"):
         raise ValueError(f"period 必须是 day/week/month，收到 {period!r}")
     if not 1 <= n <= 400:
         raise ValueError(f"n 必须在 1..400，收到 {n}")
-    span = {"day": n, "week": n * 7, "month": n * 31}[period]
     today = datetime.now(timezone.utc).date()
-    start = today - timedelta(days=span - 1)
+    keys = _bucket_keys(period, n, today)      # 恰好 n 个，日历对齐
+    start = _bucket_first_day(period, keys[0])
     daily = _daily_rows(site_id, start.isoformat())
     # 今天没被封口（rollup 只处理完整日）→ 实时算
     live = day_stats(_day_rows(site_id, _today()))
@@ -1876,12 +2106,16 @@ def series(site_id: str, period: str = "day", n: int = 30) -> list[dict]:
         daily[_today()] = live
 
     detail_floor = today - timedelta(days=DETAIL_DAYS - 1)
-    buckets: dict[str, dict] = {}
+    # **零填充恰好 n 个桶**：契约是"最近 n 个日历桶"，没有数据的桶要给 0 而不是
+    # 消失（前端 sparkline 与 pv7 都依赖长度固定）。
+    buckets: dict[str, dict] = {
+        k: {"bucket": k, "pv": 0, "uv": 0, "pv_denied": 0, "_days": [],
+            "uv_exact": True} for k in keys}
     for day, st in sorted(daily.items()):
         key = _bucket_of(day, period)
-        b = buckets.setdefault(key, {"bucket": key, "pv": 0, "uv": 0,
-                                     "pv_denied": 0, "_days": [],
-                                     "uv_exact": True})
+        if key not in buckets:
+            continue          # 落在区间外（Query 下界是桶首日，可能多带几天）
+        b = buckets[key]
         b["pv"] += st["pv"]
         b["pv_denied"] += st["pv_denied"]
         b["_days"].append(day)
@@ -1908,7 +2142,7 @@ def series(site_id: str, period: str = "day", n: int = 30) -> list[dict]:
                 if email:
                     visitors.add(email)
         b["uv"] = len(visitors)
-    return [buckets[k] for k in sorted(buckets)]
+    return [buckets[k] for k in keys]      # 恒为 n 个，升序
 
 
 def _encode(key: dict) -> str:
@@ -2019,7 +2253,7 @@ VISITORS = rf"^/api/sites/{_SITE}/visitors$"
 - [ ] **Step 4: 跑测试确认通过**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app/site-builder/panel && \
+cd site-builder/panel && \
   ../deployer/.venv/bin/pytest tests -q
 ```
 
@@ -2042,13 +2276,15 @@ cd /Users/kentpeng/projects/quick-app/site-builder/panel && \
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
-git add site-builder/panel/analytics.py site-builder/panel/api.py \
-        site-builder/panel/handler.py site-builder/panel/tests/
+cd "$(git rev-parse --show-toplevel)"
+git add site-builder/deployer/functions/analytics.py \
+        site-builder/deployer/tests/test_analytics.py \
+        site-builder/panel/api.py site-builder/panel/handler.py \
+        site-builder/panel/tests/
 git commit -m "feat(m5): panel 的读取层与两个 GET 端点
 
-analytics.py 是 panel 侧唯一碰这两张表的模块（照 keystore.py 先例，api.py
-不出现表名）。今天从明细实时算、历史读聚合表；pv/uv 的口径 import
+analytics.py 落在 deployer/functions/（共享模块的既有位置，也是 MCP 闭包守卫
+唯一会扫的目录——放在 panel/ 下守卫会静默放过而容器里 ImportError）。今天从明细实时算、历史读聚合表；pv/uv 的口径 import
 access_rollup.day_stats，不另写一份。
 
 uv_exact 是契约的一部分：日 UV 永远精确，周/月 UV 只在区间完整落在 90 天明细
@@ -2128,7 +2364,7 @@ def test_path_extractor_sees_every_api_literal_in_the_source():
 - [ ] **Step 2: 跑测试确认失败**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app/site-builder/panel && \
+cd site-builder/panel && \
   ../deployer/.venv/bin/pytest tests/test_frontend_contract.py -q
 ```
 
@@ -2216,7 +2452,7 @@ function visitorTable(rows) {
 - [ ] **Step 4: 跑测试确认通过**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app/site-builder/panel && \
+cd site-builder/panel && \
   ../deployer/.venv/bin/pytest tests -q
 ```
 
@@ -2242,7 +2478,7 @@ def test_frontend_flags_inexact_uv_instead_of_printing_a_number():
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git add site-builder/panel/frontend/app.js site-builder/panel/tests/test_frontend_contract.py
 git commit -m "feat(m5): 控制台统计页接真实数据 + 前端守卫改成从 ROUTES 推导
 
@@ -2253,6 +2489,156 @@ git commit -m "feat(m5): 控制台统计页接真实数据 + 前端守卫改成�
 不许漏出网口"的完整性断言（那才是清单在替它做的事）。
 
 超出 90 天明细窗口的桶显示标注而不是数字（uv 为 null，不是 0）。
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Task 9b: 站点列表的 PV 迷你趋势（`pv7`）
+
+**为什么在这里**：这不是新增需求，是**被我漏掉的既定范围**（Codex 审查
+2026-08-14 P2-3）。母 spec §11-clarify 的 M5 清单与 M3 spec 第 64 行都列了
+「站点列表 PV 迷你趋势」，控制台原型里 `pv7` 出现 6 处、`sparkline` 4 处。
+**必须排在 Task 15 部署之前。**
+
+**Files:**
+- Modify: `site-builder/deployer/functions/analytics.py`（加 `pv7`）
+- Modify: `site-builder/panel/api.py`（`do_list_sites` 每站点带 `pv7`）
+- Modify: `site-builder/panel/frontend/app.js`（列表里画 sparkline）
+- Test: `site-builder/deployer/tests/test_analytics.py` · `site-builder/panel/tests/test_analytics_api.py`
+
+**Interfaces:**
+- Consumes: Task 8 的 `series(site_id, "day", 7)`（已零填充、恒 7 个桶）。
+- Produces: `analytics.pv7(site_id) -> list[int]`（**长度恒为 7**，升序，缺失日为 0）；
+  `GET /api/sites` 每个站点多一个 `pv7` 字段。
+
+- [ ] **Step 1: 写失败的测试**
+
+```python
+def test_pv7_is_always_seven_numbers_oldest_first(env):
+    """长度恒为 7 且零填充——前端 sparkline 依赖固定长度，缺失日给 0 不是给空。"""
+    import analytics
+    from datetime import datetime, timedelta, timezone
+    y = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+    _daily(env, "s1", y, pv=5, uv=2)
+    out = analytics.pv7("s1")
+    assert isinstance(out, list) and len(out) == 7, out
+    assert all(isinstance(x, int) for x in out), out
+    assert out[-2] == 5, f"倒数第二个应是昨天的 5: {out}"
+    assert out[-1] == 0, f"最后一个是今天（本轮无数据）: {out}"
+
+
+def test_pv7_of_a_site_without_data_is_seven_zeros(env):
+    import analytics
+    assert analytics.pv7("never-visited") == [0] * 7
+
+
+def test_list_sites_carries_pv7(monkeypatch, env):
+    """站点列表的迷你趋势（母 spec §11-clarify 的 M5 项）。"""
+    import api
+    import permissions
+    monkeypatch.setattr("common.list_sites_for_user",
+                        lambda e: [{"site_id": "s1", "owner": e,
+                                    "status": "ACTIVE", "collaborators": []}])
+    monkeypatch.setattr(permissions, "is_admin", lambda e: False)
+    out = api.do_list_sites("me@x.co")
+    assert len(out[0]["pv7"]) == 7, out[0]
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+```bash
+cd site-builder/deployer && PYTHONPATH=functions .venv/bin/pytest tests/test_analytics.py -q -k pv7
+cd site-builder/panel && ../deployer/.venv/bin/pytest tests/test_analytics_api.py -q -k pv7
+```
+
+预期：`AttributeError: module 'analytics' has no attribute 'pv7'`。
+
+- [ ] **Step 3: 写实现**
+
+`analytics.py` 追加：
+
+```python
+def pv7(site_id: str) -> list[int]:
+    """近 7 天的日 PV，升序，**长度恒为 7**（缺失日为 0）。
+
+    给站点列表画 sparkline 用（母 spec §11-clarify 的 M5 项）。直接复用
+    `series()`——它已经零填充且日历对齐，所以这里不做第二套取数逻辑。
+    """
+    return [b["pv"] for b in series(site_id, "day", 7)]
+```
+
+`api.py` 的 `do_list_sites` 在组装每个站点的返回字段时加：
+
+```python
+        # 站点列表的迷你趋势。**成本**：站点数 × 1 次分区 Query
+        # （当前 31 个站点，实测规模下可接受）。管理员全局视图同理——
+        # 站点数长到三位数时改批量或缓存，届时重评（spec §3.5 已记）。
+        "pv7": analytics.pv7(site["site_id"]),
+```
+
+`app.js` 的站点列表卡片里加一个 sparkline（用现成的 `pv7` 数组，SVG polyline，
+不引任何库；最大值为 0 时画一条平线而不是除零）：
+
+```javascript
+/* 站点列表的 PV 迷你趋势。pv7 长度恒为 7（后端契约），所以不做长度兜底；
+ * 全 0 时画平线——不能除零，也不该画成"没有数据"（0 次访问是一个事实）。 */
+function sparkline(pv7) {
+  var max = Math.max.apply(null, pv7);
+  var h = 18, w = 56, step = w / (pv7.length - 1);
+  var pts = pv7.map(function (v, i) {
+    var y = max === 0 ? h - 1 : h - 1 - (v / max) * (h - 2);
+    return (i * step).toFixed(1) + ',' + y.toFixed(1);
+  }).join(' ');
+  return '<svg class="spark" width="' + w + '" height="' + h +
+    '" viewBox="0 0 ' + w + ' ' + h + '" aria-hidden="true">' +
+    '<polyline points="' + pts + '" fill="none" stroke="currentColor" ' +
+    'stroke-width="1.5" stroke-linejoin="round"/></svg>' +
+    '<span class="meta" style="margin-left:6px">近 7 天 ' +
+    pv7.reduce(function (a, b) { return a + b; }, 0) + ' PV</span>';
+}
+```
+
+- [ ] **Step 4: 跑测试确认通过**
+
+```bash
+cd site-builder/deployer && .venv/bin/pytest tests -q
+cd site-builder/panel && ../deployer/.venv/bin/pytest tests -q
+```
+
+预期全绿（前端契约那组也要绿——本 Task **不新增路由**，列表本来就在调
+`/api/sites`，所以可达性核对不受影响）。
+
+- [ ] **Step 5: 反向验证**
+
+① `pv7` 改成 `return [b["pv"] for b in series(site_id, "day", 5)]` → 预期
+`test_pv7_is_always_seven_numbers_oldest_first` 报长度 5。
+② `sparkline` 去掉 `max === 0` 分支 → 全 0 站点会产出 `NaN` 坐标；补一条前端断言：
+
+```python
+def test_sparkline_handles_all_zero_without_dividing_by_zero():
+    blob = _js()
+    assert "max === 0" in blob, "sparkline 没处理全 0（会产出 NaN 坐标）"
+```
+
+还原 + 双证。
+
+- [ ] **Step 6: Commit**
+
+```bash
+cd "$(git rev-parse --show-toplevel)"
+git add site-builder/deployer/functions/analytics.py site-builder/deployer/tests/ \
+        site-builder/panel/api.py site-builder/panel/frontend/app.js \
+        site-builder/panel/tests/
+git commit -m "feat(m5): 站点列表的 PV 迷你趋势（pv7）
+
+不是新增需求——母 spec §11-clarify 与 M3 spec 第 64 行都把它列进 M5，原型里
+pv7/sparkline 一直在。我第一版 spec 漏了它，self-review 只核对了新 spec 自己
+而没核对母 spec 的 M5 交付边界（Codex 审查 P2-3）。
+
+pv7 直接复用 series(site_id, 'day', 7)——它已零填充且日历对齐，不做第二套
+取数逻辑。成本是站点数 × 1 次分区 Query，当前 31 个站点可接受。
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
@@ -2332,7 +2718,7 @@ def test_invalid_period_is_rejected(monkeypatch, period):
 - [ ] **Step 2: 跑测试确认失败**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app/site-builder/mcp && python3 -m pytest tests/test_analytics_tool.py -q
+cd site-builder/mcp && python3 -m pytest tests/test_analytics_tool.py -q
 ```
 
 预期：`AttributeError: module 'server' has no attribute 'get_site_analytics'`。
@@ -2343,7 +2729,12 @@ cd /Users/kentpeng/projects/quick-app/site-builder/mcp && python3 -m pytest test
 
 ```python
 def _analytics_payload(site_id: str, period: str, days: int) -> dict:
-    """读取层。与 panel 的 analytics.py 用同一组表与同一份 pv/uv 口径。"""
+    """读取层。与 panel **共用同一个** deployer/functions/analytics.py。
+
+    该模块必须进镜像（Dockerfile COPY + build_and_push 复制元组 +
+    _BUILD_INPUTS 三处，见 Task 11）——容器里只有四个 .py 时这行会
+    ModuleNotFoundError，而部署会显示成功（Codex 审查 P1-2 实测）。
+    """
     import analytics
     return {"series": analytics.series(site_id, period, days),
             "recent_visitors": analytics.visitors(site_id, days=min(days, 7),
@@ -2377,7 +2768,7 @@ def get_site_analytics(site_id: str, period: str = "day",
 - [ ] **Step 4: 跑测试确认通过**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app/site-builder/mcp && python3 -m pytest tests -q
+cd site-builder/mcp && python3 -m pytest tests -q
 ```
 
 预期：新文件全绿 + 既有 172 项仍绿。
@@ -2393,7 +2784,7 @@ cd /Users/kentpeng/projects/quick-app/site-builder/mcp && python3 -m pytest test
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git add site-builder/mcp/server.py site-builder/mcp/tests/test_analytics_tool.py
 git commit -m "feat(m5): MCP 工具 get_site_analytics（返回单个 dict）
 
@@ -2406,12 +2797,29 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 ---
 
-## Task 11: 部署脚本的表名下发
+## Task 11: 表名下发 + **MCP 镜像的三份清单**
 
 **Files:**
-- Modify: `site-builder/panel/deploy_panel.py:280-290`（环境变量 + `COPY_FILES`）
-- Modify: `site-builder/mcp/deploy_agentcore.py`（容器环境变量，位置照 `API_KEYS_TABLE` 的先例）
+- Modify: `site-builder/panel/deploy_panel.py`（环境变量 + `COPY_FILES`）
+- Modify: `site-builder/mcp/Dockerfile:21-23`（`COPY` 行）
+- Modify: `site-builder/mcp/deploy_agentcore.py`（环境变量 + `_BUILD_INPUTS` + `build_and_push` 复制元组 + IAM）
+- Test: `site-builder/mcp/tests/test_agentcore_contract.py`（既有闭包守卫 + 一条新守卫）
 - Test: `site-builder/panel/tests/`（既有的复制闭包/环境变量测试）
+
+**这个 Task 是 P1-2 的收口**。MCP 容器现在只有四个文件
+（`server.py common.py permissions.py ops_log.py`，Dockerfile 实测），
+`import analytics` 会 `ModuleNotFoundError`，**部署成功、工具一调就废**。
+
+两件事要分清：
+
+1. **传递闭包守卫会自动逮住 Dockerfile 与 `build_and_push`**——因为 Task 8 已把
+   `analytics.py` 放进 `deployer/functions/`，而该守卫正是从那个目录做闭包
+   （`candidate = fn_dir / f"{name}.py"`）。所以这两处漏了会**当场红**，
+   不需要新守卫。这是"把模块放到守卫能看见的地方"而不是"再加一个守卫"。
+2. **`_BUILD_INPUTS` 不在那个守卫的范围内**（它只比 Dockerfile 的 COPY 行与
+   `build_and_push` 的元组）。而 `_BUILD_INPUTS` 决定**内容指纹 tag**——漏了
+   它，改 `analytics.py` 不会改 tag，`deploy_agentcore.py` 会复用**旧镜像**
+   并打印成功。这是本仓库最熟悉的那种静默失效，所以要**新加一条守卫**。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -2447,10 +2855,63 @@ def test_panel_env_carries_both_access_tables():
 > 先 `grep -n "SESSION_CODES_TABLE" site-builder/panel/deploy_panel.py` 看那个
 > 环境变量字典叫什么名字（Task 起手第一步），把上面的 `dp.ENV` 换成真名。
 
+追加到 `site-builder/mcp/tests/test_agentcore_contract.py`：
+
+```python
+def test_build_inputs_covers_every_module_that_enters_the_image():
+    """`_BUILD_INPUTS` 决定内容指纹 tag，漏一个模块 = 改它不会改 tag =
+    deploy_agentcore.py 复用**旧镜像**并打印成功。
+
+    既有的传递闭包守卫只比 Dockerfile 的 COPY 行与 build_and_push 的元组，
+    **不管指纹清单**——所以这条是它的补集，从同一份闭包推导，不手抄。
+    """
+    import ast
+    import importlib.util
+    from pathlib import Path
+
+    mcp_dir = Path(__file__).parents[1]
+    fn_dir = mcp_dir.parent / "deployer" / "functions"
+
+    def local_imports(path):
+        names = set()
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Import):
+                names |= {a.name.split(".")[0] for a in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names.add(node.module.split(".")[0])
+        return names
+
+    needed, queue, seen = set(), ["server.py"], set()
+    while queue:
+        cur = queue.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        path = mcp_dir / cur if (mcp_dir / cur).exists() else fn_dir / cur
+        if not path.exists():
+            continue
+        for name in local_imports(path):
+            if (fn_dir / f"{name}.py").exists():
+                needed.add(f"{name}.py")
+                queue.append(f"{name}.py")
+    assert "analytics.py" in needed, (
+        "闭包没算出 analytics.py——server.py 应该 import 它（解析逻辑坏了）")
+
+    spec = importlib.util.spec_from_file_location(
+        "da", mcp_dir / "deploy_agentcore.py")
+    da = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(da)
+    inputs = {Path(x).name for x in da._BUILD_INPUTS}
+    missing = needed - inputs
+    assert not missing, (
+        f"_BUILD_INPUTS 漏了 {sorted(missing)}——改这些文件不会改镜像 tag，"
+        "部署会复用旧镜像并打印成功")
+```
+
 - [ ] **Step 2: 跑测试确认失败**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app/site-builder/panel && \
+cd site-builder/panel && \
   ../deployer/.venv/bin/pytest tests -q -k access
 ```
 
@@ -2469,25 +2930,59 @@ cd /Users/kentpeng/projects/quick-app/site-builder/panel && \
 panel role 的 IAM 加：明细表 `Query`、聚合表 `Query`（**只读**，不给 PutItem
 ——panel 不该能改统计）。位置照 `site-api-keys` 那段。
 
-`deploy_agentcore.py` 同样加这两个环境变量与两条只读 IAM。
+`deploy_agentcore.py` 三处都要改：
+
+```python
+# ① 环境变量（照 API_KEYS_TABLE 的位置）
+"ACCESS_EVENTS_TABLE": "site-access-events",
+"ACCESS_DAILY_TABLE": "site-access-daily",
+
+# ② 内容指纹清单——**漏了它 = 改 analytics.py 不改 tag = 复用旧镜像**
+_BUILD_INPUTS = ("mcp/Dockerfile", "mcp/requirements.txt", "mcp/server.py",
+                 "deployer/functions/common.py",
+                 "deployer/functions/permissions.py",
+                 "deployer/functions/ops_log.py",
+                 "deployer/functions/analytics.py",
+                 "deployer/functions/access_rollup.py")
+
+# ③ build_and_push 的复制元组（server.py 按同目录解析它们）
+for name in ("common.py", "permissions.py", "ops_log.py",
+             "analytics.py", "access_rollup.py"):
+```
+
+`Dockerfile` 的 COPY 行：
+
+```dockerfile
+COPY server.py common.py permissions.py ops_log.py analytics.py access_rollup.py ./
+```
+
+再加两条只读 IAM（明细表与聚合表各 `dynamodb:Query`，**不给 PutItem**）。
 
 - [ ] **Step 4: 跑测试确认通过 + 全包回归**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app/site-builder/panel && ../deployer/.venv/bin/pytest tests -q
-cd /Users/kentpeng/projects/quick-app/site-builder/mcp && python3 -m pytest tests -q
+cd site-builder/panel && ../deployer/.venv/bin/pytest tests -q
+cd site-builder/mcp && python3 -m pytest tests -q
 ```
 
 - [ ] **Step 5: 反向验证**
 
-把 `access_rollup.py` 从 `COPY_FILES` 去掉 → 预期
-`test_analytics_modules_are_in_the_deploy_package` 变红。还原 + 双证。
+① 把 `access_rollup.py` 从 panel 的 `COPY_FILES` 去掉 → 预期
+`test_analytics_modules_are_in_the_deploy_package` 变红。
+② 把 `analytics.py` 从 **Dockerfile 的 COPY 行**去掉 → 预期**既有的**
+`test_agentcore_contract` 闭包守卫变红（证明"把模块放对位置"确实让既有守卫生效，
+而不是靠新守卫）。
+③ 把 `analytics.py` 从 **`_BUILD_INPUTS`** 去掉 → 预期只有新加的
+`test_build_inputs_covers_every_module_that_enters_the_image` 变红，
+**既有闭包守卫仍绿**——这正好证明它是既有守卫的补集，不是重复。
+每次还原 + 双证。
 
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git add site-builder/panel/deploy_panel.py site-builder/mcp/deploy_agentcore.py \
+        site-builder/mcp/Dockerfile site-builder/mcp/tests/test_agentcore_contract.py \
         site-builder/panel/tests/
 git commit -m "feat(m5): panel/MCP 下发两张表名与只读 IAM
 
@@ -2569,20 +3064,20 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 本段从 2 条变成 7 条 → 找到 `MIN_*_CHECKS` 常量并 +5。
 
 ```bash
-grep -n "MIN_.*CHECKS" /Users/kentpeng/projects/quick-app/site-builder/scripts/verify_console_e2e.py
+grep -n "MIN_.*CHECKS" site-builder/scripts/verify_console_e2e.py
 ```
 
 - [ ] **Step 3: 语法与静态检查（真机跑在 Task 15）**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app && python3 -m py_compile site-builder/scripts/verify_console_e2e.py && echo OK
+cd "$(git rev-parse --show-toplevel)" && python3 -m py_compile site-builder/scripts/verify_console_e2e.py && echo OK
 grep -n "／\|“\|”" site-builder/scripts/verify_console_e2e.py || echo "无全角引号"
 ```
 
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git add site-builder/scripts/verify_console_e2e.py
 git commit -m "test(m5): ⑪ 段那两条 404 断言删掉，换成真实端点的行为断言
 
@@ -2607,7 +3102,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 在 `run_key_proxy()` 之后加：
 
 ```python
-MIN_ANALYTICS_CHECKS = 9
+MIN_ANALYTICS_CHECKS = 11
 
 
 def run_analytics() -> int:
@@ -2618,6 +3113,7 @@ def run_analytics() -> int:
     """
     print("\n── ⑨ 线上 M5 统计管道 ──────────────────────────────")
     cfg = _parsed_cfg(ROUTER_CFG_PATH)
+    cfg_sb = _parsed_cfg(CFG_PATH)          # site-builder 侧（account_id 在这）
     table = cfg["SiteBuilder"]["access_table"].strip()
     regions = [r.strip() for r in
                cfg["SiteBuilder"]["access_replica_regions"].split(",") if r.strip()]
@@ -2626,10 +3122,15 @@ def run_analytics() -> int:
     d = boto3.client("dynamodb", region_name=REGION)
     desc = d.describe_table(TableName=table)["Table"]
     check(desc["TableStatus"] == "ACTIVE", f"{table} ACTIVE", desc["TableStatus"])
-    # 读回**被改的那个属性**，不看栈状态
+    # 读回**被改的那个属性**，不看栈状态（§3.13）。
+    # 用**并集**写法：`Replicas` 是否包含被查询的那个区取决于 API 行为，
+    # CFN 模板里它**是包含主区的**（2026-08-14 synth 实测
+    # `['ap-southeast-1','ap-northeast-1','us-east-1']`），而 DescribeTable
+    # 的运行时行为本轮未实测——并集对两种行为都成立。
+    # （上一版这里的注释写"主区不出现在 Replicas 里"，是错的。）
     live = {r["RegionName"]: r.get("ReplicaStatus", "?")
             for r in desc.get("Replicas", [])}
-    live[REGION] = "ACTIVE"          # 主区不出现在 Replicas 里
+    live.setdefault(REGION, "ACTIVE")
     check(set(live) == set(regions),
           f"副本区集合 == 清单（{sorted(regions)}）", f"线上 {sorted(live)}")
     check(all(v == "ACTIVE" for v in live.values()),
@@ -2640,26 +3141,52 @@ def run_analytics() -> int:
           "site-access-daily 开着 deletion protection",
           str(daily.get("DeletionProtectionEnabled")))
 
-    # Edge 角色：有且只有明细表的 PutItem，且资源恰好覆盖每个副本区
+    # Edge 角色：有且只有明细表的 PutItem，**且资源逐字覆盖每个副本区**。
+    # 上一版只累计 action 就报绿（Codex 审查 2026-08-14 P1-4）——那恰好漏掉了
+    # 它声称要防的东西：只给 us-east-1 一个 ARN 时 action 仍是 PutItem，闸门
+    # 绿灯，而两个亚洲区写入 AccessDenied 后被 _record_access 吞掉
+    # ⇒ 按实测流量分布 **96.1% 的数据静默缺失**。
+    # 也**必须读 attached policies**：只读 inline 时，把语句搬进托管策略即绕过。
     iam = boto3.client("iam")
     edge_role = cfg["Lambda"]["execution_role_name"].strip()
-    puts, extra = set(), set()
-    for pol in iam.list_role_policies(RoleName=edge_role)["PolicyNames"]:
-        doc = iam.get_role_policy(RoleName=edge_role, PolicyName=pol)["PolicyDocument"]
-        for s in doc["Statement"]:
-            acts = s["Action"] if isinstance(s["Action"], list) else [s["Action"]]
+    account = cfg_sb["Platform"]["account_id"].strip()
+    docs = []
+    for name in iam.list_role_policies(RoleName=edge_role)["PolicyNames"]:
+        docs.append(iam.get_role_policy(RoleName=edge_role,
+                                        PolicyName=name)["PolicyDocument"])
+    attached = iam.list_attached_role_policies(RoleName=edge_role)["AttachedPolicies"]
+    for pol in attached:
+        meta = iam.get_policy(PolicyArn=pol["PolicyArn"])["Policy"]
+        docs.append(iam.get_policy_version(
+            PolicyArn=pol["PolicyArn"],
+            VersionId=meta["DefaultVersionId"])["PolicyVersion"]["Document"])
+    check(bool(docs), "读到了 Edge 角色的策略（inline + attached）",
+          f"inline={len(docs) - len(attached)} attached={len(attached)}")
+
+    put_arns, acts_on_table, extra = set(), set(), set()
+    for doc in docs:
+        for st in doc["Statement"]:
+            acts = st["Action"] if isinstance(st["Action"], list) else [st["Action"]]
             acts = [str(a) for a in acts]
             if not any(a.startswith("dynamodb:") for a in acts):
                 continue
-            res = s["Resource"]
-            for r in (res if isinstance(res, list) else [res]):
-                if f"table/{table}" in str(r):
-                    puts |= set(acts)
+            res = st["Resource"]
+            hit = [str(r) for r in (res if isinstance(res, list) else [res])
+                   if f"table/{table}" in str(r)]
+            if hit:
+                acts_on_table |= set(acts)
+                if "dynamodb:PutItem" in acts:
+                    put_arns |= set(hit)
             extra |= {a for a in acts
                       if a in ("dynamodb:UpdateItem", "dynamodb:DeleteItem",
                                "dynamodb:BatchWriteItem", "dynamodb:*")}
-    check(puts == {"dynamodb:PutItem"},
-          "Edge 角色对明细表**有且只有** PutItem", str(sorted(puts)))
+    check(acts_on_table == {"dynamodb:PutItem"},
+          "Edge 角色对明细表**有且只有** PutItem", str(sorted(acts_on_table)))
+    expected_arns = {f"arn:aws:dynamodb:{rg}:{account}:table/{table}"
+                     for rg in regions}
+    check(put_arns == expected_arns,
+          f"PutItem 资源**逐字**覆盖全部 {len(regions)} 个副本区",
+          f"缺 {sorted(expected_arns - put_arns)} / 多 {sorted(put_arns - expected_arns)}")
     check(not extra, "Edge 角色没有任何 DynamoDB 写扩权动作", str(sorted(extra)))
 
     ev = boto3.client("events", region_name=REGION)
@@ -2684,19 +3211,24 @@ def run_analytics() -> int:
 - [ ] **Step 2: 语法检查**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app && python3 -m py_compile site-builder/scripts/verify_deployed_components.py && echo OK
+cd "$(git rev-parse --show-toplevel)" && python3 -m py_compile site-builder/scripts/verify_deployed_components.py && echo OK
 ```
 
 - [ ] **Step 3: Commit**（真机跑在 Task 15）
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git add site-builder/scripts/verify_deployed_components.py
-git commit -m "test(m5): ⑨ 段——副本、保护、Edge 权限、rollup 规则
+git commit -m "test(m5): ⑨ 段——副本、保护、Edge 权限（逐字比三个 ARN）、rollup 规则
 
-副本区集合从 config.ini 的清单推导后与 describe_table 的 Replicas 比对，
-不手抄；Edge 角色断言"有且只有 PutItem"——漏一个副本 ARN 的症状是该区静默
-零数据。读回的是被改的那个属性，不是 StackStatus（§3.13）。
+Edge 权限那条**逐字比对资源 ARN 集合**，不只看 action：只累计 action 的写法
+恰好漏掉它声称要防的东西——只给 us-east-1 一个 ARN 时 action 仍是 PutItem、
+闸门绿灯，而两个亚洲区 AccessDenied 被埋点吞掉 = 按实测流量 96.1% 数据静默
+缺失。同时读 inline + attached（只读 inline 时把语句搬进托管策略即可绕过）。
+
+副本集合与清单比对用并集写法：DescribeTable 是否包含被查询区本轮未实测，
+而 CFN 模板实测**是包含主区的**——并集对两种行为都成立。读回的是被改的那个
+属性，不是 StackStatus（§3.13）。
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
@@ -2706,7 +3238,19 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ## Task 14: `verify_analytics_e2e.py`
 
 **Files:**
+- Create: `site-builder/scripts/_mcp_client.py`（从 `verify_api_key_e2e.py:184` 的
+  `class Mcp` + token 获取提取出来的共享封装）
+- Modify: `site-builder/scripts/verify_api_key_e2e.py`（改成 import 那份）
 - Create: `site-builder/scripts/verify_analytics_e2e.py`
+
+- [ ] **Step 0: 先提取 MCP 客户端封装**
+
+`class Mcp` 现在长在 `verify_api_key_e2e.py:184`。本闸门要用它，但**不能复制
+一份**——两份 OAuth/token 逻辑必然漂移（本仓库反复记过这个形态）。提到
+`site-builder/scripts/_mcp_client.py`，两个闸门都 import。
+
+提取后**必须重跑 `verify_api_key_e2e.py` 确认仍 34/34**（否则这次重构本身就是
+一次回归），再继续。
 
 **关键设计（spec §0.4）**：Global Table 复制是异步的（典型 <1s，无 SLA），
 所以**必须轮询等待**那一行、有上限、超时即红。发完请求立刻断言 = 做出一个
@@ -2740,7 +3284,7 @@ import boto3
 ROOT = Path(__file__).resolve().parents[2]
 CFG_PATH = ROOT / "site-builder" / "config.ini"
 ROUTER_CFG_PATH = ROOT / "router" / "config.ini"
-MIN_CHECKS = 14
+MIN_CHECKS = 24
 results = []
 
 
@@ -2865,11 +3409,116 @@ def main() -> int:
         check(int(agg["pv_denied"]["N"]) >= 1, "聚合 pv_denied 记下了未登录那次",
               agg["pv_denied"]["N"])
 
-    print("\n── ⑤ 面板与 MCP 返回同一个数字 ─────────────────────")
-    print("  （手工核对：控制台该站点「访问统计」页签今天的 PV，"
-          f"以及 MCP get_site_analytics(site_id='{site_id}') 的 series）")
-    print(f"  线上聚合行 pv={agg['pv']['N'] if agg else '?'} "
-          f"uv={agg['uv']['N'] if agg else '?'}")
+    print("\n── ⑤ 不在名单 → denied_403（带已验签邮箱）──────────")
+    # 这一段需要一个**有会话但不在该站点名单**的身份。没有第二个身份时不猜、
+    # 不伪造——但也不能就这么跳过（永久 SKIP 是死重量，§3.6）：改成换一个
+    # **观察量**——用同一身份请求一个自己无权访问的站点。
+    other = input("一个你**无权访问**的 ACTIVE 站点 site_id（留空则跳过 ⑤）: ").strip()
+    if other:
+        probe4 = f"/m5probe4-{int(time.time())}"
+        st, _ = get(probe4.replace(probe4, probe4), ck=cookie)  # 同 cookie
+        import urllib.request as _u
+        req = _u.Request(f"https://app-{other}.{base}{probe4}")
+        req.add_header("Cookie", f"sb_session={cookie}")
+        try:
+            with _u.urlopen(req) as r:
+                st4 = r.status
+        except urllib.error.HTTPError as e:
+            st4 = e.code
+        check(st4 == 403, f"无权站点返回 403（实际 {st4}）", str(st4))
+        row4, _ = wait_for_row(ddb, events_table, other, day, probe4)
+        if row4:
+            check(row4["decision"]["S"] == "denied_403",
+                  "decision == denied_403", row4["decision"]["S"])
+            check("@" in row4["email"]["S"],
+                  "被拒记录带**已验签**邮箱（"谁被拒了"是这条记录的全部价值）",
+                  row4["email"]["S"][:3] + "…")
+        else:
+            check(False, "denied_403 的明细行出现", "超时未出现")
+    else:
+        print("  SKIP  ⑤（没有第二个站点可用）——**这不是通过**，"
+              "MIN_CHECKS 会因此不达标而报红")
+
+    print("\n── ⑥ 平台子域不产生记录（负测 + 正对照）──────────")
+    import urllib.request as _u2
+    cprobe = f"/m5cprobe-{int(time.time())}"
+    try:
+        rq = _u2.Request(f"https://console.{base}{cprobe}")
+        rq.add_header("Cookie", f"sb_session={cookie}")
+        with _u2.urlopen(rq) as r:
+            pass
+    except Exception:
+        pass          # 404/403 都无所谓，我们只看有没有产生明细行
+    found = False
+    for probe_site in ("console", site_id):
+        r, _ = wait_for_row(ddb, events_table, probe_site, day, cprobe, timeout=6)
+        found = found or (r is not None)
+    check(not found, "console 子域的请求**没有**产生任何明细行（app- 前缀判定）", "")
+    # 正对照已在 ② 段给过（同一时刻的页面请求确实产生了行），此处复用其结论
+
+    print("\n── ⑦ 面板 API 与 MCP 返回同一个数字（**自动比对**）────")
+    # 上一版这里只 print 一行"手工核对"就 return 0（Codex 审查 P1-3）——
+    # 于是 spec §5.1 承诺的"面板与 MCP 返回同一数字"从未被闸门验证，
+    # 而 MIN_CHECKS 光靠 ①-④ 就能达标 ⇒ MCP 完全不可用时本脚本照样 exit 0。
+    agg_pv = int(agg["pv"]["N"]) if agg else -1
+
+    console_cookie = input("粘一个 __Host-sb_console cookie 值（面板会话）: ").strip()
+    if console_cookie:
+        rq = _u2.Request(f"https://console.{base}/api/sites/{site_id}"
+                         "/analytics?period=day&n=2")
+        rq.add_header("Cookie", f"sb_session={cookie}; "
+                                f"__Host-sb_console={console_cookie}")
+        try:
+            with _u2.urlopen(rq) as r:
+                pbody = json.loads(r.read())
+            pv_today = next((b["pv"] for b in pbody.get("series", [])
+                             if b["bucket"] == day), None)
+            check(pv_today is not None, "面板 analytics 返回了今天的桶",
+                  str([b["bucket"] for b in pbody.get("series", [])]))
+            check(pv_today == agg_pv,
+                  f"面板 PV == 聚合行 PV（{pv_today} vs {agg_pv}）",
+                  f"面板 {pv_today} / 聚合 {agg_pv}")
+            check(len(pbody.get("series", [])) == 2,
+                  "n=2 返回恰好 2 个桶（日历对齐契约）",
+                  str(len(pbody.get("series", []))))
+        except Exception as e:
+            check(False, "面板 analytics 可调用", f"{type(e).__name__}: {e}")
+    else:
+        check(False, "面板 analytics 已核对",
+              "没给面板会话 cookie —— 未验证，不计为通过")
+
+    # MCP：走**真实调用路径**（不手构造参数，§5.4）。
+    #
+    # 复用 `verify_api_key_e2e.py:184` 的 `class Mcp`——**不要在本文件重写一个**
+    # （两份 OAuth/token 逻辑必然漂移）。它的 `call_tool(name, args, *,
+    # expect="dict"|"list") -> (ok, payload)`：`expect` **必须由调用方声明**，
+    # 因为线上这台 server 不发 `structuredContent`，自动猜返回形态在一半情况下
+    # 会静默少数据（M4-FINDINGS §3.4）。
+    #
+    # 本 Task 的前置一步：把 `class Mcp` 与它的 token 获取从
+    # `verify_api_key_e2e.py` 提到 `site-builder/scripts/_mcp_client.py`，
+    # 两个闸门都 import 它（提取后 verify_api_key_e2e 必须重跑确认仍 34/34）。
+    print("  MCP：调 get_site_analytics 并与聚合行比对")
+    try:
+        sys.path.insert(0, str(ROOT / "site-builder" / "scripts"))
+        from _mcp_client import Mcp, user_token, mcp_endpoint
+        m = Mcp(mcp_endpoint(), {"authorization": f"Bearer {user_token()}"})
+        ok, payload = m.call_tool("get_site_analytics",
+                                  {"site_id": site_id, "period": "day",
+                                   "days": 2}, expect="dict")
+        check(ok, "MCP get_site_analytics 调用成功", str(payload)[:120])
+        if ok:
+            check(isinstance(payload, dict),
+                  "MCP 工具返回单个 dict（不是裸列表，§3.4）",
+                  type(payload).__name__)
+            mpv = next((b["pv"] for b in payload.get("series", [])
+                        if b["bucket"] == day), None)
+            check(mpv == agg_pv, f"MCP PV == 聚合行 PV（{mpv} vs {agg_pv}）",
+                  f"MCP {mpv} / 聚合 {agg_pv}")
+    except Exception as e:
+        # 不 SKIP：MCP 不可用正是 P1-2 的症状，必须红
+        check(False, "MCP get_site_analytics 可调用", f"{type(e).__name__}: {e}")
+
     return 0
 
 
@@ -2905,22 +3554,26 @@ if __name__ == "__main__":
 - [ ] **Step 2: 语法与全角引号检查**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app && python3 -m py_compile site-builder/scripts/verify_analytics_e2e.py && echo OK
+cd "$(git rev-parse --show-toplevel)" && python3 -m py_compile site-builder/scripts/verify_analytics_e2e.py && echo OK
 ```
 
 - [ ] **Step 3: Commit**（真机跑在 Task 15）
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git add site-builder/scripts/verify_analytics_e2e.py
-git commit -m "test(m5): verify_analytics_e2e——从真实页面请求走到聚合行
+git commit -m "test(m5): verify_analytics_e2e——走到 panel 与 MCP，自动比数字
 
-轮询等待明细行（Global Table 复制异步、无 SLA）：立刻断言会做出一个 flaky
-闸门，而 flaky 闸门的代价是下一个人学会忽略它。
+初版只到聚合行就 print 一行"手工核对"然后 return 0（Codex 审查 P1-3）：于是
+spec §5.1 承诺的"面板与 MCP 返回同一数字"从未被闸门验证，而 MIN_CHECKS 光靠
+前四段就能达标 ⇒ **MCP 完全不可用时本脚本照样 exit 0**。现在两侧都自动调用并
+与聚合行逐个比对，未能核对一律记 FAIL 而不是 SKIP。
 
-两条负测各配正对照（§3.5）：\".css 不记\" 配 \"同一时刻的页面请求确实记了\"
-——否则\"埋点压根没部署\"会让负测全绿。三种 decision 各验一次。
-异常记在 finally 之外，避免被\"项数够了\"重算成 exit 0。
+三种 decision 现在真的各验一次（初版只验了 allow 与 redirect_login，而提交
+信息声称三种都验——那是一句假话）。另补 console 子域不产生记录的负测。
+
+轮询等待明细行（Global Table 复制异步、无 SLA）：立刻断言会做出 flaky 闸门。
+异常记在 finally 之外，避免被"项数够了"重算成 exit 0。
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
@@ -2937,7 +3590,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 - [ ] **Step 1: 部署 deployer 栈（建两张表 + rollup）**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app/site-builder/deployer/infra && \
+cd site-builder/deployer/infra && \
   rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never
 ```
 
@@ -2957,7 +3610,7 @@ daily 表 ACTIVE 且 `DeletionProtectionEnabled=true`；规则 ENABLED。
 - [ ] **Step 2: 部署 Edge（版本 8，含区域探测）**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app/router/infrastructure && \
+cd router/infrastructure && \
   rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never
 ```
 
@@ -2993,8 +3646,8 @@ done
 - [ ] **Step 5: 部署 panel 与 MCP**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app/site-builder/panel && python3 deploy_panel.py
-cd /Users/kentpeng/projects/quick-app/site-builder/mcp && python3 deploy_agentcore.py
+cd site-builder/panel && python3 deploy_panel.py
+cd site-builder/mcp && python3 deploy_agentcore.py
 ```
 
 > `deploy_panel.py` **不要带 `--skip-frontend`**（本轮改了前端；带上会保留旧
@@ -3003,9 +3656,9 @@ cd /Users/kentpeng/projects/quick-app/site-builder/mcp && python3 deploy_agentco
 - [ ] **Step 6: 跑全部真机闸门**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
-python3 site-builder/scripts/verify_analytics_e2e.py          # 新增，≥14 项
-python3 site-builder/scripts/verify_deployed_components.py     # 应为 69/69
+cd "$(git rev-parse --show-toplevel)"
+python3 site-builder/scripts/verify_analytics_e2e.py          # 新增，≥24 项
+python3 site-builder/scripts/verify_deployed_components.py     # 应为 71/71
 python3 site-builder/scripts/verify_console_e2e.py             # ⑪ 段 7 条
 bash    site-builder/scripts/verify_deployed_edge.sh           # 版本 8
 bash    site-builder/scripts/smoke_router.sh
@@ -3081,14 +3734,14 @@ aws logs describe-log-groups --region <rg> --log-group-name-prefix <name> \
 - [ ] **Step 1: 七包 + 锁定依赖全量回归**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app/site-builder/contract  && .venv/bin/pytest tests -q
-cd /Users/kentpeng/projects/quick-app/site-builder/auth      && ../contract/.venv/bin/pytest tests -q
-cd /Users/kentpeng/projects/quick-app/router/infrastructure/lambda && ../../../site-builder/deployer/.venv/bin/pytest . -q
-cd /Users/kentpeng/projects/quick-app/site-builder/deployer  && .venv/bin/pytest tests -q
-cd /Users/kentpeng/projects/quick-app/site-builder/mcp       && python3 -m pytest tests -q
-cd /Users/kentpeng/projects/quick-app/site-builder/panel     && ../deployer/.venv/bin/pytest tests -q
-cd /Users/kentpeng/projects/quick-app/site-builder/key-proxy && ../deployer/.venv/bin/pytest tests -q
-bash /Users/kentpeng/projects/quick-app/site-builder/mcp/run_locked_tests.sh
+cd site-builder/contract  && .venv/bin/pytest tests -q
+cd site-builder/auth      && ../contract/.venv/bin/pytest tests -q
+cd router/infrastructure/lambda && ../../../site-builder/deployer/.venv/bin/pytest . -q
+cd site-builder/deployer  && .venv/bin/pytest tests -q
+cd site-builder/mcp       && python3 -m pytest tests -q
+cd site-builder/panel     && ../deployer/.venv/bin/pytest tests -q
+cd site-builder/key-proxy && ../deployer/.venv/bin/pytest tests -q
+bash site-builder/mcp/run_locked_tests.sh
 ```
 
 记下每包的项数（HANDOFF 用）。
@@ -3121,7 +3774,7 @@ bash /Users/kentpeng/projects/quick-app/site-builder/mcp/run_locked_tests.sh
 - [ ] **Step 5: 一致性核对（有没有回退）**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git log --oneline 4302a15..HEAD | wc -l          # M5 的提交数
 git status --short                                # 必须干净
 # 八个真实值逐一确认不在被跟踪文件里（按 M4 的收尾形态）
@@ -3130,7 +3783,7 @@ git status --short                                # 必须干净
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git add site-builder/DEPLOY.md CLAUDE.md
 git commit -m "docs(m5): 部署顺序、埋点超时预算的坑、架构图补埋点
 
@@ -3140,6 +3793,52 @@ git commit -m "docs(m5): 部署顺序、埋点超时预算的坑、架构图补�
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
+
+---
+
+## Codex 审查（2026-08-14）的处置记录
+
+审查锚定 `4302a15..d6397ee`。**9 条：接受 8 条、部分接受 1 条；另有 3 条是
+它没发现、我实测出来的。** 每条都实测核实过，不是照单全收。
+
+| # | 判定 | 落在哪 | 实测依据 |
+|---|---|---|---|
+| P1-1 `/api/*` 被当页面 | 完全接受 | Task 3（+ 3 条回归用例 + 反向验证 ④） | 用**真实 `_route_request`** 跑对照：错 2 条；加 `/api/` 守卫后 10 条全对 |
+| P1-2 MCP 无 `analytics.py` | 完全接受 | Task 8（迁到 `deployer/functions/`）+ Task 11（三份清单 + 新守卫） | Dockerfile 实测只 COPY 四个文件 |
+| P1-3 E2E 不调 panel/MCP | 完全接受 | Task 14（自动比数字，MIN_CHECKS 14→24） | 17 个 `check(` 全在 ①-④，下限可在零个 panel/MCP 断言下达标 |
+| P1-4 IAM 闸门不比 ARN | 完全接受 | Task 13（逐字比 + 读 attached） | 原实现只 `puts |= set(acts)`，从未比对资源 |
+| P2-1 sink 时机 → 302 带 email | 完全接受 | Task 3（+ 一条 302 无邮箱的负测） | 按计划插入后实测 `status=302, sink={'email': ...}` |
+| P2-2 week/month 给 n+1 桶 | 完全接受 | Task 8（日历对齐 + 零填充 + 2 条用例） | 五种参数**全错**：`month n=1`→2 个、`n=2`→3 个、`week n=4`→5 个 |
+| P2-3 漏了列表迷你趋势 | 完全接受 | **新增 Task 9b** | 母 spec §11-clarify **与** M3 spec 第 64 行都列了；原型里 `pv7`×6、`sparkline`×4 |
+| P2-4 两组 CDK 断言无效 | 完全接受 | Task 4（config 账号字面量）+ Task 6（按逻辑 ID 匹配、删恒真式） | 实测 `self.account`→`Fn::Join` dict；`table_arn`→`Fn::GetAtt`，policy 里无表名字面量 |
+| P2-5 host-local 路径 | **部分接受** | 全局改成仓库相对 / `git rev-parse` | 接受要改：M3/M4 计划里 `/Users/kentpeng` 各 **0** 次，我 69 次破坏惯例。**驳回它的定性**——那不是凭证，且它引的「本轮 AGENTS.md」在本仓库**不存在**（`ls AGENTS.md` → No such file）。按惯例改，不按 secret-scan 改 |
+
+### Codex 没发现的三条（我实测出来的）
+
+1. **`TableV2` + `replicas` 在 region-agnostic 栈里直接 synth 抛错**
+   （`ReplicaTablesNotSupportedInRegionAgnosticStack`），而
+   `test_infra_tables.py:46` 建栈**没传 env**。后果比 P2-4 更重：不是"断言无效"，
+   是**整个文件连 RETAIN 不变量一起崩**，且 Task 2 的 Step 4 永远不可能通过。
+   → Task 2 加了 **Step 0** 先修 fixture。
+2. **Task 13 的注释「主区不出现在 `Replicas` 里」是错的**——模板实测
+   `Replicas` **包含** `us-east-1`。并集写法本身没错，注释错了（而下一个人会
+   照注释改）。→ 改成并集 + 写明"运行时行为本轮未实测"。
+3. **Task 4 的命令写 `python3.13`，router venv 实际是 `python3.12`**
+   （仓库自己的 docstring 也是这个错）→ 三处已改，并加 Step 5b 顺手修仓库。
+
+另外**我自己引入的一处假引用**：Task 14 里写 `from mcp_call import call_tool`
+——那个模块**不存在**，真实封装是 `verify_api_key_e2e.py:184` 的 `class Mcp`
+（方法签名 `call_tool(name, args, *, expect) -> (ok, payload)`）。已改成先提取
+到 `_mcp_client.py` 再两处共用，并要求提取后重跑 `verify_api_key_e2e` 确认
+仍 34/34。
+
+### 这轮审查暴露的一个方法论问题（记进 M5-FINDINGS）
+
+我的 self-review 声称「spec 21 个小节逐条映射、无遗漏」——**核对的只是我自己
+那份 spec**。P2-3 恰好落在它的盲区：一个上级文档已经划定的交付边界，不在我
+自己的小节清单里，所以"逐条映射"全绿而范围少了一块。
+**判据**：范围核对的基准必须是**上级文档的交付清单**，不能是自己写的那份
+spec 的目录——后者天然自洽。
 
 ---
 
@@ -3162,8 +3861,9 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 | §3.1 面板 API | Task 8 |
 | §3.2 权限 | Task 7 |
 | §3.3 rollup | Task 5（逻辑）· Task 6（接线） |
-| §3.4 MCP 工具 | Task 10 |
-| §3.5 前端 | Task 9 |
+| §3.4 MCP 工具 | Task 10 · Task 11（进镜像） |
+| §3.6 端点命名偏移（申报） | 已记入 spec，无需 Task |
+| §3.5 前端（含列表 `pv7` 迷你趋势） | Task 9 · **Task 9b** |
 | §4.1 ⑪ 段 | Task 12 |
 | §4.2 前端守卫 | Task 9 Step 1 |
 | §4.3 缓存断言 | Task 4 |
@@ -3173,6 +3873,9 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 | §6 资源清单 | Task 11（部署脚本）· Task 17（文档） |
 
 **无遗漏**。M4-FINDINGS 补条目（spec §5.4 提到的）= Task 1。
+**另核对上级文档**（这次才补上的一步）：母 spec §11-clarify 的 M5 清单
+= stats/audit 数据（Task 2/3/5）· 两个端点（Task 8）· 图表（Task 9）·
+**站点列表 PV 迷你趋势（Task 9b）**；端点命名偏移已在 spec §3.6 申报。
 
 **2. 占位符扫描**：无 TBD/TODO。三处「先 grep 确认真名」是**明确的一步动作**
 （`ENV` 字典名、`escapeHtml` 函数名、`outsider_site` 变量名），不是"自行斟酌"。
