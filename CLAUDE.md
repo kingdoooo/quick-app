@@ -55,11 +55,24 @@ E2E（需要真实 AWS 部署 + config.ini 已回填）：
 ```bash
 RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/test_e2e_fixtures.py -q   # 4 个 fixture，约 6 分钟
 bash site-builder/scripts/smoke_router.sh    # 路由层冒烟（会写测试数据，跑完清理；含 65s 等 Edge 缓存）
-python3 site-builder/scripts/verify_console_e2e.py   # 控制台端到端（**从仓库根跑**）
+python3 site-builder/scripts/verify_console_e2e.py      # 控制台端到端（**从仓库根跑**）
+python3 site-builder/scripts/verify_analytics_e2e.py    # 统计端到端（二期 M5；**从仓库根跑**）
 ```
 
 `site-builder/scripts/verify_*` 是真机闸门（部署后跑，不是单测）。数量与最新结果
 见 HANDOFF 的最新一节——本文件不记数字（会过时）。
+
+**这些脚本一律用系统 `python3` 跑，不要借 `deployer/.venv/bin/python3`**：那个解释器的
+CA 信任库是空的（`ssl.create_default_context().cert_store_stats()` 全 0），于是每一次
+HTTPS 都 `CERTIFICATE_VERIFY_FAILED`——症状读起来像网络/代理故障，其实不是。
+系统 `python3` 走 pip 装的 `truststore`（读 macOS keychain），且同样有 boto3。
+
+`verify_analytics_e2e.py` 会自建 fixture 站点、发真实请求、跑一次 rollup 再清理，
+其中 MCP 那一段要求**用户 OAuth token 是新鲜的**（二期把 refresh TTL 收到 1 天）；
+过期时要先在浏览器里登录一次（`node site-builder/clients/quick-desktop-proxy/auth.js`）。
+三个 verify 脚本共用 `site-builder/scripts/_mcp_client.py`（MCP 客户端 + token 读取，
+`verify_analytics_e2e.py` / `verify_api_key_e2e.py` / `verify_oauth_and_impersonation.py`）
+——改它要意识到是同时改三个闸门。
 
 ## 部署/重部署命令
 
@@ -97,12 +110,13 @@ python3 site-builder/scripts/gen_onboarding.py
 ```
 ① 建站 Skill (site-builder/skills/)  ← Agent 客户端加载的"部署合同"说明书
         ↓ MCP 调用（OAuth 带飞书身份）
-② 部署 MCP (site-builder/mcp/)       ← AgentCore Runtime，5 工具全部秒级返回
+② 部署 MCP (site-builder/mcp/)       ← AgentCore Runtime，9 工具全部秒级返回
         ↓ 条件迁移 PENDING→RUNNING + 启动 SFN
 ③ 异步执行器 (site-builder/deployer/) ← Step Functions 10 步：validate → provision-db
         ↓ 写路由表                       → CodeBuild 打包 → 站点 Lambda → 前端 S3 → 路由 → 冒烟
 ④ 路由+鉴权层 (router/)              ← CloudFront *.{domain} + Lambda@Edge
         ↓ 未登录 302                     查路由表 → 验会话 JWT → 注入 x-user-email → 分流
+                                         顺带写一行访问明细（只页面级、只 `app-` 前缀；二期 M5）
 ⑤ 身份层 (site-builder/auth/)        ← Cognito(联邦到飞书) + 登录服务 + pre-token 触发器
 
 交换层 (site-builder/key-proxy/)      ← mcp.{domain}，二期 M4 的**可选**组件
@@ -178,6 +192,12 @@ python3 site-builder/scripts/gen_onboarding.py
   JWT。别"顺手补齐"这个名单。
 - **moto 不校验 IAM**：事务里的 `ConditionCheck` 需要 `dynamodb:ConditionCheckItem`，
   漏给时单测全绿、真机 500。给 Lambda 加事务路径时同步核对角色策略。
+- **统计埋点的超时预算不能按同区算**：Edge 写本区副本是 6ms（冷 58ms），但回落路径是
+  跨区 229ms（冷 **719ms**，实测）。预算的下限由回落决定；收紧到「够本区用」就等于让
+  回落路径静默丢行。埋点异常一律吞掉（统计不是安全控制），所以丢行是**无声的**。
+- **改了 `permissions.py` 这类共享模块，要重部的是三个组件**：panel、key-proxy、MCP
+  各自把它打进自己的产物（key-proxy 也带，虽然它只用 `EMAIL_RE`）。漏一个的症状是
+  产物陈旧而部署脚本一切正常——`verify_deployed_components.py` 是唯一会点出来的地方。
 
 ## 文档地图
 

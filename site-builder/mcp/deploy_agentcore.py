@@ -714,7 +714,7 @@ def main() -> None:
 
     print("\n冒烟（需要一个真实 Cognito token）：")
     print("  npx @modelcontextprotocol/inspector  # 连上面 endpoint，带 Bearer token")
-    print("  检查：8 个工具列出 / 无 token 返回 401 /")
+    print("  检查：9 个工具列出 / 无 token 返回 401 /")
     print("       list_my_sites 的 owner == 登录的飞书邮箱（验证 email claim 透传）")
 
 

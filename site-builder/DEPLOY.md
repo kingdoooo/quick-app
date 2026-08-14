@@ -288,7 +288,13 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    deploy_pool.py   CloudFront    cluster    SFN+Lambda   AgentCore     deploy_panel   Skill+MCP      RUN_E2E
    + deploy_auth    (Task 8)      (Task 13)  (Task 17)    (Task 20)     (二期 M3)      (Task 22)      (Task 23)
    (Task 3)
+                                             ⑤c API Key（可选，二期 M4）· ⑤d 访问统计（二期 M5）
 ```
+
+⑤c 与 ⑤d 不是独立的部署阶段，而是**跨已有组件的改动**：全新账号照 ①→⑦ 走一遍就
+把它们一起装上了（两张统计表在 ④ 的栈里、埋点在 ② 的 Edge 里、读侧在 ⑤/⑤b 里）。
+**已经在跑的环境要单独升级到 M5，见下面的 `⑤d 访问统计` 一节——那里的顺序是硬依赖，
+反了不会报错，只会静默丢数据。**
 
 依赖关系：②需要①产出的 JWT_SECRET（已在 SSM）与 edge role；④需要①的 boundary、②的 edge_role_arn、③的 DSQL endpoint；⑤需要④的 state_machine_arn 与①的 Cognito；**⑤b 需要②的 edge_role_arn、④的五张表与①的 jwt-secret**（可选组件：不部署它只是没有控制台，站点与 MCP 通道不受影响）。
 
@@ -1309,6 +1315,176 @@ protection，不会也不该被删**（历史 Key 行是审计证据）；断言
   `allowed_users` 是两套独立的认证平面，它碰不到站点访问。
 - 明文 Key 在服务端**只出现一次**（创建响应）。用户没抄下来只能吊销重发；
   列表接口与所有日志里都没有明文（有一条真机负测扫两个日志组做零命中断言）。
+
+---
+
+## ⑤d 访问统计（二期 M5）
+
+站点 owner 在控制台看自己站点的 PV/UV 趋势与访问明细，Agent 侧同一组数字由 MCP 的
+`get_site_analytics` 返回。数据来自 **Edge 主动埋点**（不是 CloudFront 访问日志）：
+`origin_request` 在鉴权判完之后顺带写一行明细，**只记页面级请求、只记 `app-` 前缀的
+站点子域**；每天一次 rollup 把昨天及更早的明细聚合成日粒度。
+
+两张表都由 ④ 的执行器栈（`SiteDeployerStack`）创建：
+
+| 表 | 键 | 保留 | 说明 |
+|---|---|---|---|
+| `site-access-events` | `site_date` + `ts_id` | TTL 90 天 | 明细。DynamoDB **Global Table**，副本区见下 |
+| `site-access-daily` | `site_id` + `date` | TTL 400 天 | 日聚合。`RETAIN` + deletion protection |
+
+### 部署目标是**五个**，顺序不能随便调
+
+| # | 目标 | 命令 |
+|---|---|---|
+| ① | 执行器栈（两张表 + rollup Lambda + EventBridge 规则） | `cd site-builder/deployer/infra && rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never` |
+| ② | 路由层（Edge 埋点 + edge role 的 PutItem） | `cd router/infrastructure && rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never` |
+| ③ | 控制台 panel（统计页 + 站点列表迷你趋势） | `cd site-builder/panel && python3 deploy_panel.py` |
+| ④ | key-proxy（**容易漏**，见下） | `cd site-builder/key-proxy && python3 deploy_key_proxy.py` |
+| ⑤ | MCP（第 9 个工具） | `cd site-builder/mcp && python3 deploy_agentcore.py` |
+
+**两条硬依赖，而且违反时两边都是静默的**：
+
+- **① 必须在 ② 之前。** Edge 的 `PutItem` 授权的是三个副本 ARN；表不存在时写入
+  AccessDenied/ResourceNotFound，而埋点失败**按设计被吞掉**（统计不能拖垮鉴权路径）
+  ⇒ 没有任何报错，只是一条数据都不落。
+- **① 必须在 ③ 之前。** `/api/sites`（控制台首页）要算每个站点的 `pv7` 迷你趋势。
+
+**不要拿「控制台首页能打开」当作顺序正确的证据**：`pv7` 读失败是**刻意降级**的
+（返回 `[]` = 未知，前端就不画那条线，只留一条 CloudWatch warning），首页照样正常
+打开。要判定顺序对不对，看**统计页签 / MCP 工具 / 验收脚本**，或直接查 panel 日志里
+有没有那条 warning。三档响度：
+
+| 路径 | 表缺失 / 缺 IAM 时 | 响亮吗 |
+|---|---|---|
+| `/api/sites`（首页 + `pv7`） | 正常打开、趋势线不画、一条 warning | **不响亮** |
+| `/api/sites/{id}/analytics`、`/visitors` | 500 | 响亮 |
+| MCP `get_site_analytics` | 工具报错 | 响亮 |
+| **Edge 埋点** | 异常被设计性吞掉 | **完全静默，只丢数据** |
+
+**为什么 key-proxy 也在名单里**：M5 给 `permissions.py` 加了 `view_analytics` 能力，
+而 panel、key-proxy、MCP **三个组件各自把这个共享模块打进自己的产物**（key-proxy 只
+用它的 `EMAIL_RE`、从不读 `CAPABILITIES`，所以功能上无影响——但产物陈旧本身就是个
+要留到下次去排查的坑）。**改了 `permissions.py`，这三个都要重部。**
+`verify_deployed_components.py` 是唯一会点出产物陈旧的地方。
+
+其它两条部署面的注意事项：
+
+- **Edge 改动要 10-20 分钟做全球复制**。CDK 返回成功 ≠ 各区已经在跑新代码；紧接着
+  跑验收会看到旧行为。用 `verify_deployed_edge.sh` 确认版本号。
+- **panel 改了前端就不能带 `--skip-frontend`**（M5 动了 `app.js`）。那个开关只跳过上传，
+  部署脚本仍会全绿。
+
+### 副本清单三处必须一致
+
+`site-access-events` 是 Global Table，副本区清单出现在三个地方，**唯一真源是
+`router/config.ini` 的 `access_replica_regions`**：
+
+1. deployer 的 CDK（`TableV2(replicas=...)`）——决定表真的有哪些副本；
+2. router 栈的 IAM（edge role 的 PutItem 资源逐个副本 ARN）；
+3. Edge 代码里的 `ACCESS_REPLICA_REGIONS` 常量（部署时字符串替换注入）。
+
+第 2、3 条腿由 router 的单测锁在真源上，**但第 1 条腿钉的是 deployer 测试里的字面量
+集合、看不见 `router/config.ini`**。所以「只往 `router/config.ini` 加一个区」会让两个
+包的单测都绿，而 Edge 往一个不存在的副本写、异常被吞 ⇒ **那个区静默零数据**。
+兜住这条的是 `verify_deployed_components.py` 第 ⑨ 段的真机 `describe_table`
+`Replicas` 检查——单测覆盖不到。
+
+**`_access_region` 的那行 INFO 日志是有意留下的**（`origin_request.py`）：每记一条页面
+请求打一行 `[INFO] m5-region env=… arn=… -> …`。Lambda@Edge 拿不到自定义环境变量，
+所以「副本路径在用、还是一直在跨区回落」这件事**线上只有这一行能证明**（回落是正确
+但慢的，不报错，没有它就永远分不清两者）。三个值都不敏感。流量长上去之后再考虑采样。
+
+### 新账号首次部署会踩一次：首建 Global Table 的 SLR 传播竞态
+
+本账号第一张 DynamoDB Global Table 会让 CloudFormation 顺带创建
+`AWSServiceRoleForDynamoDBReplication`，而约 **10 秒后**的建副本调用会失败：
+
+```
+UnrecognizedClientException: The security token included in the request is invalid
+```
+
+**这个报文是误导性的**——凭证没问题，是刚创建的 IAM principal 还没传播到副本区。
+（可以先排除掉三个经典成因：副本区 `list-tables` 通不通、区域 opt-in 状态、
+`get-session-token` 在副本区是否成功。都通的话就是这条。）
+
+**处置：重跑同一条部署命令即可**（SLR 此后永久存在）。但**回滚会留下一张孤儿表**，
+让原地重试因名字冲突必然失败：`site-access-daily` 是 `RETAIN` + deletion protection，
+回滚时被打成 `DELETE_SKIPPED`——**这正是「统计数据不能被一次回滚删掉」这条不变量在
+起作用，不是缺陷**。重试前的清理步骤：
+
+```bash
+# ① 确认它真的是空的——**必须实时 scan**：describe-table 的 ItemCount 有最多 6 小时延迟
+aws dynamodb scan --table-name site-access-daily --select COUNT --region us-east-1
+# ② 确认它不属于任何栈（describe-stack-resources 查不到 site-access 资源）
+# ③ 关掉 deletion protection，再删
+aws dynamodb update-table --table-name site-access-daily \
+  --no-deletion-protection-enabled --region us-east-1
+aws dynamodb delete-table --table-name site-access-daily --region us-east-1
+# ④ 读回确认不存在，然后重跑部署
+```
+
+### 验收（部署完立刻跑，从仓库根）
+
+```bash
+python3 site-builder/scripts/verify_analytics_e2e.py
+```
+
+**必须用系统 `python3`**：`site-builder/deployer/.venv/bin/python3` 的 CA 信任库是空的
+（`ssl.create_default_context().cert_store_stats()` 全 0），于是每一次 HTTPS 都
+`CERTIFICATE_VERIFY_FAILED`——读起来像网络/代理故障，其实不是。这条对所有
+`scripts/verify_*` 都成立。
+
+脚本自建 fixture 站点、发真实请求、跑一次 rollup 再清理，数字精确到「一行不多一行
+不少」。已在真机证明的关键性质：真实 Edge 写入落库且**非零**（区分「读不到」与
+「没数据」）、三种 `decision` 逐字一致、真实 `LastEvaluatedKey` 分页、伪造游标不越权、
+rollup **重算即修复**、**绝不封今天**、封口后面板读的是聚合表、panel 与 MCP 返回
+**字段级相同**的 series。
+
+**它的 MCP 那一段要求用户 OAuth token 是新鲜的**（二期把 refresh TTL 收到 1 天）。
+过期时先登录一次：`node site-builder/clients/quick-desktop-proxy/auth.js`。
+拿不到 token **不 SKIP 而是记 FAIL**（设计如此：`MIN_CHECKS` 达不到就
+`sys.exit(1)`，「验收未完成」不能长得像「验收通过」）。
+
+顺带一并跑 `verify_deployed_components.py`（第 ⑨ 段是 M5 的跨包一致性）与
+`verify_console_e2e.py`（⑪ 段换成了统计端点的真实行为断言）。
+
+### 日志组保留期（M5 收尾时统一过一轮）
+
+平台自己的日志组此前有一批**从未设过保留期**（= 永久留存，一直在计费）。M5 收尾时把
+它们统一设成 **90 天**。当前分布（三个区合计，2026-08-15 实测）：
+
+| 保留期 | 数量 | 是谁 |
+|---|---|---|
+| 90 天 | 24 | 执行器各步 / rollup / panel / key-proxy / auth pre-token / CodeBuild / Edge（三区各 2） |
+| 30 天 | 7 | `site-auth-service` + 每个 per-site Lambda |
+| 731 天 | 2 | 飞书适配器（上游组件，不是本仓库的代码） |
+| **未设** | **2** | **见下** |
+
+**两个仍未设保留期的（本文档发现，尚未处理）**：MCP 的 AgentCore runtime 日志组
+（`/aws/bedrock-agentcore/runtimes/{runtime_name}-{id}-DEFAULT`，AgentCore 自己建的）
+与执行器栈里 CDK 自动生成的 S3 auto-delete 自定义资源 Lambda
+（`/aws/lambda/SiteDeployerStack-CustomS3AutoDeleteObjects…`）。两者都属于本平台，
+**但名字不符合 `/aws/lambda/site-*` 这条清扫惯例**，所以上一轮按前缀扫的时候漏掉了。
+前者尤其值得处理——那是部署 MCP 每次调用的日志。
+
+**⚠️ 30 天那一档与「统一 90 天」是一个未解决的冲突，不要手工改**：那 7 个是
+**代码管理**的——`deployer/functions/deploy_lambda_site.py:31` 给每个新建站点的 Lambda
+写死 30 天，`auth/alarm_pipeline.py:89` 也写死 30 天并注明「spec §6.3：平台日志组统一
+30 天」。手工调成 90 天会**与真源漂移**，而且对**将来新建的站点无效**（下次部署又变回
+30）。这是一处需要改代码/改 spec 的决定，不是运维动作。
+
+### 两个已知的可观测性缺口（运维项，M5 不交付）
+
+一次性闸门覆盖不了这两件事，而**偶发变红的闸门比没有闸门更糟**（下一个人会学会忽略
+它，连带它本来能抓的真问题）。正确形态都是告警：
+
+1. **没有任何东西证明每日 rollup 真的跑过**。该配「24 小时内无成功调用」告警
+   （rollup Lambda 的 `Invocations`/`Errors`，或 EventBridge 规则的失败投递 + 已有的 DLQ）。
+   这是目前最大的一个缺口。
+2. **某个 Edge 区在运行时静默写失败，没有任何东西会发现**。该配 CloudWatch Logs
+   metric filter 盯 `[WARN] 访问埋点失败` + 阈值告警（「1 小时内 > N 条」）。
+   **不要做成闸门里的断言**：埋点刻意不重试（`max_attempts: 0`），偶发跨区超时会让它
+   偶发变红。
 
 ---
 
