@@ -10,6 +10,19 @@ MCP 传递闭包守卫唯一会扫的目录——放在 panel 下会让守卫静
     周/月 UV 只在区间**完整落在 90 天明细窗口内**时精确，否则 `uv=None` +
     `uv_exact=False`，由前端显式标注"超出明细留存窗口"。
     不显示一个站不住的数字。
+
+**两个面的成本上界刻意不同**（Codex 审查 2026-08-14 P1）：
+
+  · `pv7()` —— 控制台**首页**的迷你趋势，站点数 × 每站一遍，所以它的读取
+    **必须有硬上界**：聚合表那次由 `BETWEEN` 的键条件封住（每天最多一行），
+    今天那次由 `Limit` 封住（`PV7_LIVE_ROW_CAP`），超出即返回 `[]` = 未知。
+    理由不是"省钱"：Edge 给**每一个页面级请求**都记一行明细，**包括未登录的
+    302 redirect_login**，而 CloudFront 全站禁缓存（鉴权正确性的前提）让每个
+    请求都真的到 Edge —— 于是"今天有多少行"是一个**匿名方可控的输入**。
+    首页同时是改权限、下线这些恢复手段的入口，它不能被行数拖到 30s 超时
+    （超时**接不住**：进程被杀，没有异常可 catch）。
+  · `series()` / `visitors()` —— 单站、刻意打开的统计页，今天照旧全量分页、
+    照旧精确。它可以比列表贵，因为它是一次一站、由用户主动发起的。
 """
 import base64
 import json
@@ -28,7 +41,23 @@ logger = logging.getLogger(__name__)
 DETAIL_DAYS = 90        # = 明细表 TTL，UV 精确窗口的上界
 MAX_VISITOR_DAYS = 90
 MAX_VISITOR_LIMIT = 100
+# 首页迷你趋势读"今天"的**硬上界**（行数，非字节）。取 1000：当前全平台日均
+# 124 行（M5-FINDINGS §4.26），单站 1000 行留了近一个数量级余量，而最坏情况
+# 站点数 × 1000 行小对象仍是秒级。**这个数不是安全边界的来源**——上界本身是，
+# 它由 Query 的 Limit 落实；这个数只决定"多大的站还能看到趋势线"。
+# 某个**真实**站点长期超过它时，正确的动作是让 rollup 也写一行"今天至此"的
+# 部分聚合，而不是把这个数改大（改大等于把上界还给攻击者）。
+PV7_LIVE_ROW_CAP = 1000
 _ddb = None
+
+
+class ReadTooLarge(Exception):
+    """要读的明细超出调用方给的上界。
+
+    **只由 `pv7()` 触发并被它接住**（它给了 `live_row_cap`）；`series()` /
+    `visitors()` 不传上界，所以这个异常不会从那两条路上冒出来，`handler.py`
+    也就不需要为它加映射。
+    """
 
 
 def _client():
@@ -42,12 +71,32 @@ def _today() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-def _day_rows(site_id: str, day: str) -> list[dict]:
-    rows, kwargs = [], {
+def _day_rows(site_id: str, day: str, max_rows: int | None = None) -> list[dict]:
+    """某一天的明细行。
+
+    `max_rows=None`（统计页 / 周月 UV 去重）——全量分页，数字精确。
+    `max_rows=N`（首页的迷你趋势）——**一次 Query、`Limit=N+1`、多一行就 raise**。
+
+    上界由 Query 自己带（服务端截断），不是"拉回整页再在客户端 break"：行数是
+    匿名请求可控的输入，客户端 break 仍会把最多 1MB 拉回来反序列化，而"翻几页"
+    这件事本身还是跟着行数走。`N+1` 是为了区分「刚好 N 行」（照常给真数）与
+    「还有更多」（给不出，raise）——**绝不返回截断的结果**：一个偏小的 PV 与
+    真实的 PV 在 sparkline 上完全一样，是一张看着像真数据的错图。
+    """
+    kwargs = {
         "TableName": os.environ["ACCESS_EVENTS_TABLE"],
         "KeyConditionExpression": "site_date = :sd",
         "ExpressionAttributeValues": {":sd": {"S": f"{site_id}#{day}"}},
         "ProjectionExpression": "email, decision"}
+    if max_rows is not None:
+        kwargs["Limit"] = max_rows + 1
+        resp = _client().query(**kwargs)
+        rows = resp.get("Items", [])
+        if len(rows) > max_rows or "LastEvaluatedKey" in resp:
+            raise ReadTooLarge(
+                f"{site_id} 在 {day} 的明细超过 {max_rows} 行，不在本次读取的上界内")
+        return rows
+    rows = []
     while True:
         resp = _client().query(**kwargs)
         rows.extend(resp.get("Items", []))
@@ -56,12 +105,20 @@ def _day_rows(site_id: str, day: str) -> list[dict]:
         kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
 
 
-def _daily_rows(site_id: str, since: str) -> dict:
+def _daily_rows(site_id: str, since: str, until: str) -> dict:
+    """聚合表上 `since..until`（含两端）的行，day → {pv,uv,pv_denied}。
+
+    **两端都给**：`date` 是排序键且每天最多一行，所以带上界之后"返回多少条"
+    由键条件本身封住（= 区间天数），不跟表里存了多少天走。首页那条迷你趋势的
+    上界有一半落在这里。
+    """
     out, kwargs = {}, {
         "TableName": os.environ["ACCESS_DAILY_TABLE"],
-        "KeyConditionExpression": "site_id = :s AND #d >= :since",
+        "KeyConditionExpression": "site_id = :s AND #d BETWEEN :since AND :until",
         "ExpressionAttributeNames": {"#d": "date"},
-        "ExpressionAttributeValues": {":s": {"S": site_id}, ":since": {"S": since}}}
+        "ExpressionAttributeValues": {":s": {"S": site_id},
+                                      ":since": {"S": since},
+                                      ":until": {"S": until}}}
     while True:
         resp = _client().query(**kwargs)
         for it in resp.get("Items", []):
@@ -123,8 +180,14 @@ def _bucket_first_day(period: str, key: str) -> date:
     return date.fromisocalendar(int(y), int(w), 1)
 
 
-def series(site_id: str, period: str = "day", n: int = 30) -> list[dict]:
-    """时间序列。`period` ∈ day|week|month，`n` = 桶数。"""
+def series(site_id: str, period: str = "day", n: int = 30,
+           live_row_cap: int | None = None) -> list[dict]:
+    """时间序列。`period` ∈ day|week|month，`n` = 桶数。
+
+    `live_row_cap` 只由 `pv7()`（首页）传：给今天那次明细读加硬上界，超出则
+    `raise ReadTooLarge`。统计页与 MCP 都不传 → 行为与加这个参数之前逐字一致
+    （两侧"字段完全相同"的闸门断言因此不受影响）。
+    """
     if period not in ("day", "week", "month"):
         raise ValueError(f"period 必须是 day/week/month，收到 {period!r}")
     if not 1 <= n <= 400:
@@ -132,9 +195,10 @@ def series(site_id: str, period: str = "day", n: int = 30) -> list[dict]:
     today = datetime.now(timezone.utc).date()
     keys = _bucket_keys(period, n, today)      # 恰好 n 个，日历对齐
     start = _bucket_first_day(period, keys[0])
-    daily = _daily_rows(site_id, start.isoformat())
+    # 上界钉在今天：未来日期的行只可能来自时钟异常，落进"本月至今"会污染当前桶。
+    daily = _daily_rows(site_id, start.isoformat(), today.isoformat())
     # 今天没被封口（rollup 只处理完整日）→ 实时算
-    live = day_stats(_day_rows(site_id, _today()))
+    live = day_stats(_day_rows(site_id, _today(), max_rows=live_row_cap))
     if live["pv"] or live["pv_denied"]:
         daily[_today()] = live
 
@@ -182,23 +246,85 @@ def series(site_id: str, period: str = "day", n: int = 30) -> list[dict]:
 
 
 def pv7(site_id: str) -> list[int]:
-    """近 7 天的日 PV，升序，**长度恒为 7**（缺失日为 0）。
+    """近 7 天的日 PV，升序，**长度恒为 7**（缺失日为 0）；读不完整时给 `[]`。
 
-    给站点列表画 sparkline 用（母 spec §11-clarify 的 M5 项）。直接复用
-    `series()`——它已经零填充且日历对齐，所以这里不做第二套取数逻辑。
+    给站点列表画 sparkline 用（母 spec §11-clarify 的 M5 项）。仍然复用
+    `series()`（零填充、日历对齐、pv 的口径都在那边），这里只多给一个上界。
+
+    **`[]` = 未知**，与 `api._pv7_or_unknown()` 的降级值、与 `uv_exact=False`
+    同一个口径：前端那条"恰好 7 个有限数字"的守卫据此什么都不画。返回一个偏小的
+    真数字是更坏的选择——错图没有任何视觉标记。
+
+    触发条件只有一个：**今天**那个明细分区超过 `PV7_LIVE_ROW_CAP` 行。此时
+    改用统计页（`series()` 不带上界）看这个站点的精确数字。
     """
-    return [b["pv"] for b in series(site_id, "day", 7)]
+    try:
+        return [b["pv"] for b in series(site_id, "day", 7,
+                                        live_row_cap=PV7_LIVE_ROW_CAP)]
+    except ReadTooLarge as e:
+        # warning 不是可选的：这条是"某个站点今天的行数异常多"的唯一信号，
+        # 而那既可能是站点真的火了，也可能是有人在灌明细。
+        logger.warning("站点 %s 今天的明细超出首页读取上界（%d 行），本次趋势"
+                       "按未知返回（统计页仍给精确数）: %s",
+                       site_id, PV7_LIVE_ROW_CAP, e)
+        return []
 
 
 def _encode(key: dict) -> str:
     return base64.urlsafe_b64encode(json.dumps(key).encode()).decode()
 
 
-def _decode(cursor: str) -> dict:
+_CURSOR_FIELDS = {"day", "key"}
+_EVENTS_KEY_FIELDS = {"site_date", "ts_id"}      # = 明细表的主键形态，一字不差
+
+
+def _decode(cursor: str, site_id: str, day_window: list[str]) -> dict:
+    """游标 → `{day, key}`，**形状不对一律 ValueError（→ 400）**。
+
+    上一版只判"能不能 base64+JSON 解出来"。于是一批语法合法、形状不对的游标会
+    在业务代码里炸出别的异常，而 `handler.py` 只把 `ValueError` 映射成 400：
+      · `[]` / `"x"` / `3` / `null` → `state.get()` 抛 `AttributeError` → **500**；
+      · `{"day": 123}` → 后面 `day > start_at` 抛 `TypeError` → **500**；
+      · `key` 里塞非键属性或错类型 → botocore `ParamValidationError` / 真机
+        `ValidationException` → **500**（M5-FINDINGS §4.21 实测的那个 wart）。
+    全都是**调用方能自己纠正**的入参错误，一个都不该表述成服务故障。
+
+    `key` 额外**绑定到 (site_id, day)**：`site_date` 是明细表的分区键，它就在
+    游标里，所以"把 A 站的游标投到 B 站"这件事在**业务代码之前**就被拒。
+    不另加签名/HMAC：这里没有任何需要保密或防篡改的东西——绑定之后，篡改的唯一
+    结果是 400，而能被合法构造出来的游标只能指向调用方自己已经通过授权的分区
+    （授权在 `api.do_get_visitors` 里、在本函数之前）。多一个密钥要多一处轮换。
+    """
     try:
-        return json.loads(base64.urlsafe_b64decode(cursor.encode()))
+        state = json.loads(base64.urlsafe_b64decode(cursor.encode()))
     except Exception:
         raise ValueError("cursor 不是本接口发出的游标")
+    if not isinstance(state, dict) or set(state) - _CURSOR_FIELDS:
+        raise ValueError("cursor 不是本接口发出的游标")
+    day = state.get("day")
+    if day is not None and day not in day_window:
+        # **一句成员判定同时管住类型、格式、范围**：`day_window` 的每一项都是
+        # `date.isoformat()` 生成的字符串，所以"不是 str"、"不是 ISO 日期"、
+        # "不在本次 days 覆盖的范围内"三种输入都在这里被拒。
+        # **刻意不再叠 `isinstance` + `date.fromisoformat` 两层**：逐条打掉守卫
+        # 实测过，那两层**没有任何输入能让它们单独变红**（都会落到这一句上），
+        # 即死守卫——而死守卫会让下一个人以为这里有三层保护、改动时只看其中一层。
+        # `day` 合法性的真源只有 `day_window` 一处。
+        # 典型成因：换了 days 参数、或跨过 UTC 零点后重放旧游标。
+        raise ValueError("cursor 指向的日期不在本次查询的天数范围内，请重新翻页")
+    if "key" in state:
+        key = state["key"]
+        if day is None:
+            raise ValueError("cursor 不是本接口发出的游标")
+        if not isinstance(key, dict) or set(key) != _EVENTS_KEY_FIELDS:
+            raise ValueError("cursor 不是本接口发出的游标")
+        for v in key.values():
+            if not isinstance(v, dict) or list(v) != ["S"] \
+                    or not isinstance(v["S"], str):
+                raise ValueError("cursor 不是本接口发出的游标")
+        if key["site_date"]["S"] != f"{site_id}#{day}":
+            raise ValueError("cursor 与本次查询的站点/日期不一致，请重新翻页")
+    return state
 
 
 def visitors(site_id: str, days: int = 7, limit: int = 50,
@@ -210,7 +336,7 @@ def visitors(site_id: str, days: int = 7, limit: int = 50,
         raise ValueError(f"limit 必须在 1..{MAX_VISITOR_LIMIT}，收到 {limit}")
     today = datetime.now(timezone.utc).date()
     day_list = [(today - timedelta(days=i)).isoformat() for i in range(days)]
-    state = _decode(cursor) if cursor else {}
+    state = _decode(cursor, site_id, day_list) if cursor else {}
     start_at = state.get("day", day_list[0])
     rows: list[dict] = []
     nxt = None

@@ -135,6 +135,97 @@ def test_list_sites_returns_200_when_the_trend_cannot_be_read(monkeypatch, aws,
     assert sites[0]["pv7"] == [] and sites[0]["status"] == "ACTIVE", sites[0]
 
 
+@pytest.mark.parametrize("state,want_status", [
+    # ① 闸门 verify_analytics_e2e ⑦ 段那条"分区键被改成别的站点"的游标。
+    #    实测行为一直是 **500**（真实 DynamoDB 的 ValidationException），闸门
+    #    因此写成「≥400 且响应体里没有 rows」而不是 `== 500`（M5-FINDINGS §4.21）。
+    #    绑定校验之后它是干净的 400——闸门那条断言仍然成立，这里逐字复算一遍。
+    ("cross-site", 400),
+    ("garbage", 400),                     # 闸门同段的 `cursor=not-a-cursor`
+    ("legit", 200),                       # 正对照：合法游标照常 200
+])
+def test_the_gates_cursor_cases_map_to_stable_status_codes(monkeypatch, aws,
+                                                           state, want_status):
+    """把闸门里那三个游标输入接到**完整 handler** 上算一遍状态码与响应体。
+
+    读取层单测只看 `visitors()` 抛不抛 `ValueError`；"那到底是 400 还是 500"
+    由 handler 的异常映射决定（只有 `ValueError` → 400），所以这一层必须单独钉。
+    """
+    import base64
+    import json
+    import handler
+    import permissions
+    from datetime import datetime, timezone
+    from test_handler import _ev
+    monkeypatch.setattr("common.get_site_consistent",
+                        lambda sid: {"site_id": sid, "owner": "me@x.co",
+                                     "collaborators": []})
+    monkeypatch.setattr(permissions, "is_admin", lambda e: False)
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if state == "garbage":
+        cur = "not-a-cursor"
+    else:
+        site = "s1" if state == "legit" else "nosuch-site"
+        cur = base64.urlsafe_b64encode(json.dumps(
+            {"day": day, "key": {"site_date": {"S": f"{site}#{day}"},
+                                 "ts_id": {"S": f"{day}T00:00:00+00:00#000"}}}
+        ).encode()).decode()
+    r = handler.handler(_ev("GET", "/api/sites/s1/visitors", email="me@x.co",
+                            qs={"days": "1", "limit": "5", "cursor": cur}), None)
+    assert r["statusCode"] == want_status, f"{state}: {r}"
+    if want_status != 200:
+        # 闸门断言的那半：不返回任何数据。
+        assert '"rows"' not in r["body"], r["body"]
+
+
+def test_the_home_page_does_not_traverse_todays_detail_rows(monkeypatch, aws,
+                                                            caplog):
+    """P1 回归（端点这一侧）：明细分区多大，首页都只打**一次**明细 Query。
+
+    上一版 `pv7` 对今天走 `while True` 全量分页，而 Edge 给**每一个页面级请求**
+    都记一行明细、**包括未登录的 302**——即"今天有多少行"是匿名方可控的输入，
+    首页（同时是改权限、下线的入口）的耗时因此被外部决定。`_pv7_or_unknown` 的
+    兜底**接不住超时**（进程被杀，没有异常），所以上界必须在读取那侧。
+
+    断言盯的是**做了多少活**（Query 次数），不是墙上时间：耗时断言在系统健康时
+    会偶发变红（M5-FINDINGS §4.20），也证明不了"没翻页"。
+    读取层自己的用例在 `deployer/tests/test_analytics.py`（含 Limit/BETWEEN
+    是否真进了 Query），这条只证明首页这条完整路径确实拿到了那个上界。
+    """
+    import logging
+    import analytics
+    import api
+    import permissions
+    _one_site(monkeypatch, permissions)
+    calls, real = [], analytics._client()
+
+    class _Spy:
+        """明细表永远"还有下一页"——无上界的读法会翻到抛错（红）。"""
+
+        def query(self, **kw):
+            calls.append(kw["TableName"])
+            if kw["TableName"] == "site-access-events":
+                n = calls.count("site-access-events")
+                if n > 5:
+                    raise RuntimeError(f"首页翻了 {n} 页明细——读取没有上界")
+                return {"Items": [{"email": {"S": "a@x.co"},
+                                   "decision": {"S": "allow"}}],
+                        "LastEvaluatedKey": {"site_date": {"S": "x#y"},
+                                             "ts_id": {"S": f"p{n}"}}}
+            return real.query(**kw)
+
+    monkeypatch.setattr(analytics, "_client", lambda: _Spy())
+    with caplog.at_level(logging.WARNING):
+        out = api.do_list_sites("me@x.co")
+    assert calls.count("site-access-events") == 1, (
+        f"首页打了 {calls.count('site-access-events')} 次明细 Query: {calls}")
+    assert out[0]["pv7"] == [], f"读不完整时必须给「未知」: {out[0]['pv7']}"
+    assert out[0]["status"] == "ACTIVE", "趋势未知不该影响站点本身的字段"
+    assert any("s1" in r.getMessage() for r in caplog.records
+               if r.levelno == logging.WARNING), \
+        "行数超上界却没有任何 warning —— 变成了静默降级"
+
+
 @pytest.mark.parametrize("exc", [
     ValueError("n 必须在 1..400，收到 0"),               # series 的参数校验
     TypeError("unsupported operand"),                    # 纯代码缺陷

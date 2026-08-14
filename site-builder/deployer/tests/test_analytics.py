@@ -3,6 +3,7 @@
 `uv_exact` 是**契约的一部分**，不是可选字段：周/月 UV 只在区间完整落在 90 天
 明细窗口内才精确（日 UV 永远精确，聚合行里就存着）。不显示一个站不住的数字。
 """
+import base64
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -165,6 +166,139 @@ def test_pv7_of_a_site_without_data_is_seven_zeros(env):
     assert analytics.pv7("never-visited") == [0] * 7
 
 
+# ── 首页那条迷你趋势的读取**必须有上界** ───────────────────────────────────
+#
+# Edge 给**每一个页面级请求**都记一行明细，**包括未登录的 302 redirect_login**
+# （`origin_request.py`）。所以任何匿名方只要对一个已知站点反复请求扩展名为空的
+# 路径，就能把今天那个明细分区撑到任意大（CloudFront 全站禁缓存是鉴权正确性的
+# 前提，每个请求都真的到 Edge）。
+#
+# 而 `/api/sites` 是控制台**首页**接口：它给每个站点算 pv7，串行。上一版 pv7 走
+# `series()`，`series()` 对今天恒走 `_day_rows()` 的 `while True` 全量分页
+# —— 于是"今天的行数"这个**攻击者可控的输入**直接决定首页的耗时，31 个站点里
+# 只要有一个被灌爆，首页就会撞 panel 的 30s 超时。`_pv7_or_unknown()` 接的是
+# `ClientError`/`BotoCoreError`/`KeyError`，**接不住超时**（进程被杀，没有异常），
+# 所以 Task 9b 那层降级防的是"错"不防"慢"，而恢复手段（改权限、下线）就在这个
+# 首页里。M5-FINDINGS §4.26 记的「当前日均 124」不是安全上界，它是一个可被改写
+# 的观测值。
+#
+# 断言盯的一律是**做了多少活**（打了几次 Query、Query 自己带没带上界），不是
+# 墙上时间：耗时断言在系统健康时会偶发变红（§4.20），而且它证明不了"没翻页"。
+
+
+class _SpyClient:
+    """包一层真 client，记下每次 Query 的入参；可选地把明细表伪装成无限分页。
+
+    `events_page_cap` 给了值时：明细表的每次 Query 都返回"还有下一页"，翻到第
+    `cap+1` 页就抛错。**这是本组用例的红/绿判据**——无上界的读法会一路翻到抛错
+    （红），有上界的读法只打一次（绿）。用抛错而不是真的无限循环，是为了让红是
+    一条明确的失败信息而不是挂住。
+    """
+
+    def __init__(self, real, events_page_cap=None):
+        self._real, self._cap, self.kw = real, events_page_cap, []
+
+    def query(self, **kw):
+        self.kw.append(kw)
+        if self._cap is not None and kw["TableName"] == EVENTS:
+            n = self.tables.count(EVENTS)
+            if n > self._cap:
+                raise RuntimeError(
+                    f"今天的明细被翻了 {n} 页——首页的读取没有上界，"
+                    f"行数由匿名请求决定")
+            return {"Items": [{"email": {"S": "a@x.co"},
+                               "decision": {"S": "allow"}}],
+                    "LastEvaluatedKey": {"site_date": {"S": "x#y"},
+                                         "ts_id": {"S": f"p{n}"}}}
+        return self._real.query(**kw)
+
+    @property
+    def tables(self):
+        return [k["TableName"] for k in self.kw]
+
+    def of(self, table):
+        return [k for k in self.kw if k["TableName"] == table]
+
+
+def _spy(monkeypatch, analytics, events_page_cap=None):
+    spy = _SpyClient(analytics._client(), events_page_cap)
+    monkeypatch.setattr(analytics, "_client", lambda: spy)
+    return spy
+
+
+def test_pv7_does_not_paginate_todays_detail_rows(env, monkeypatch):
+    """P1 回归：今天的明细再多，首页也只打一次明细 Query，且给出「未知」。
+
+    上一版会一路翻页（本用例会红在 `_SpyClient` 的 RuntimeError 上）。
+    """
+    import analytics
+    spy = _spy(monkeypatch, analytics, events_page_cap=20)
+    out = analytics.pv7("s1")
+    assert spy.tables.count(EVENTS) <= 1, (
+        f"明细表被打了 {spy.tables.count(EVENTS)} 次——首页仍在跟着行数翻页")
+    assert out == [], (
+        f"今天读不完整时必须给「未知」（`[]`，前端什么都不画），"
+        f"不是一个截断出来的、看着像真数据的数: {out}")
+
+
+def test_pv7_puts_the_bound_in_the_query_itself(env, monkeypatch):
+    """上界必须由**读取**落实（Limit / BETWEEN），不是"指望数据不多"。
+
+    只在客户端 `break` 的写法在真机上仍会把整页（最多 1MB）拉回来并反序列化，
+    而聚合表那次若只给下界，返回条数就跟着表里有多少天走。
+    """
+    import analytics
+    spy = _spy(monkeypatch, analytics)
+    analytics.pv7("s1")
+    assert spy.tables == [DAILY, EVENTS], (
+        f"pv7 的取数不是「聚合表一次 + 今天一次」: {spy.tables}")
+    ev = spy.of(EVENTS)[0]
+    assert ev.get("Limit") == analytics.PV7_LIVE_ROW_CAP + 1, (
+        f"今天那次 Query 没带服务端上界（Limit=cap+1 才能区分"
+        f"「刚好到上界」与「还有更多」）: {ev.get('Limit')}")
+    assert "ExclusiveStartKey" not in ev, "首页不该翻页"
+    # 聚合表那次必须**两端都有界**（每天最多一行 → 条数 = 区间天数）。断言的是
+    # "键条件里引用了一个上界值、且那个值是今天"，不是某个写法（BETWEEN 与
+    # `#d <= :until` 等价，钉字面量会让等价改写变成假红）。
+    dk = spy.of(DAILY)[0]
+    assert ":until" in dk["KeyConditionExpression"], (
+        f"聚合表那次只有下界，返回条数跟着表里存了多少天走: "
+        f"{dk['KeyConditionExpression']!r}")
+    assert dk["ExpressionAttributeValues"][":until"]["S"] == \
+        datetime.now(timezone.utc).strftime("%Y-%m-%d"), dk
+
+
+def test_pv7_is_unknown_instead_of_truncated_beyond_the_cap(env, monkeypatch):
+    """真表（moto）上过一遍 Limit 语义：超上界 → `[]`；上界之内 → 真数。"""
+    import analytics
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    for i in range(3):
+        _event(env, "s1", today, "a@x.co", i=i)
+    monkeypatch.setattr(analytics, "PV7_LIVE_ROW_CAP", 3)
+    assert analytics.pv7("s1")[-1] == 3, "**刚好到上界**必须照常给真数（差一错）"
+    _event(env, "s1", today, "a@x.co", i=4)
+    assert analytics.pv7("s1") == [], "超出上界必须是「未知」"
+    monkeypatch.setattr(analytics, "PV7_LIVE_ROW_CAP", 50)
+    assert analytics.pv7("s1")[-1] == 4, "放宽上界后要能重新给出真数"
+
+
+def test_the_analytics_page_still_counts_every_row_today(env, monkeypatch):
+    """**明确不动的那一面**：单站统计页是刻意打开的视图，今天照旧精确、照旧分页。
+
+    首页的上界不得漏进 `series()`——否则为了修首页把统计页的准确性一起改了。
+    """
+    import analytics
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    for i in range(5):
+        _event(env, "s1", today, f"u{i}@x.co", i=i)
+    monkeypatch.setattr(analytics, "PV7_LIVE_ROW_CAP", 2)
+    spy = _spy(monkeypatch, analytics)
+    out = {b["bucket"]: b for b in analytics.series("s1", "day", 1)}
+    assert out[today]["pv"] == 5, f"统计页的今天被首页的上界截断了: {out[today]}"
+    assert "Limit" not in spy.of(EVENTS)[0], (
+        "首页的 Limit 漏进了 series()——统计页会静默少数")
+
+
 def test_visitors_returns_rows_with_decision_and_paginates(env):
     import analytics
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -192,3 +326,93 @@ def test_visitors_rejects_out_of_range_parameters(env, days, limit):
     import analytics
     with pytest.raises(ValueError):
         analytics.visitors("s1", days=days, limit=limit, cursor=None)
+
+
+# ── 游标：**每一种可纠正的错都必须是稳定的 400** ─────────────────────────────
+#
+# 上一版 `_decode()` 只判"能不能 base64+JSON 解出来"，不判解出来的**形状**。
+# 于是一批语法合法、形状不对的游标会在业务代码里炸出 `AttributeError` /
+# `TypeError`（`handler.py` 只把 `ValueError` 映射成 400）→ 调用方拿到 500，
+# 一个纯入参问题被表述成"服务故障"。逐条列在下面的 `why` 里。
+
+def _cur(state) -> str:
+    return base64.urlsafe_b64encode(json.dumps(state).encode()).decode()
+
+
+def _key(site, day, ts="2026-01-01T00:00:00+00:00#abc"):
+    return {"site_date": {"S": f"{site}#{day}"}, "ts_id": {"S": ts}}
+
+
+BAD_CURSORS = [
+    (lambda s, d: [], "JSON 数组——`state.get()` 抛 AttributeError → 500"),
+    (lambda s, d: "x", "JSON 字符串——同上"),
+    (lambda s, d: 3, "JSON 数字"),
+    (lambda s, d: None, "JSON null"),
+    (lambda s, d: {"day": 123}, "day 是数字——后面 str/int 比较抛 TypeError → 500"),
+    (lambda s, d: {"day": "2026-8-1"}, "day 不是 ISO 日期"),
+    (lambda s, d: {"day": "9999-01-01"}, "day 在未来"),
+    (lambda s, d: {"day": "1999-01-01"}, "day 早于本次 days 覆盖的窗口"),
+    (lambda s, d: {"day": d, "extra": 1}, "多出本接口从不发的字段"),
+    (lambda s, d: {"key": _key(s, d)}, "有 key 没有 day（无法判定它属于哪一天）"),
+    # 这一条是"有 key 必须有 day"那个守卫**唯一**能单独变红的输入：day 缺失时
+    # 绑定判据退化成 `f"{site_id}#None"`，于是一个字面写着 `站点#None` 的分区键
+    # 会**通过**绑定判定，然后被拿去当另一天分区的 ExclusiveStartKey——真机
+    # ValidationException → 500。moto 不校验这个（M5-FINDINGS §4.6），所以没有
+    # 这条用例时，那个守卫在单测里是不可观测的。
+    (lambda s, d: {"key": _key(s, "None")}, "site_date 里写着字面量 None"),
+    (lambda s, d: {"day": d, "key": []}, "key 不是字典"),
+    (lambda s, d: {"day": d, "key": {"site_date": {"S": f"{s}#{d}"}}}, "key 缺 ts_id"),
+    (lambda s, d: {"day": d, "key": {**_key(s, d), "email": {"S": "a@x.co"}}},
+     "key 多带非键属性（真机 ValidationException → 500）"),
+    (lambda s, d: {"day": d, "key": {"site_date": {"S": f"{s}#{d}"},
+                                     "ts_id": {"N": "1"}}}, "ts_id 的类型不是 S"),
+    (lambda s, d: {"day": d, "key": {"site_date": "x", "ts_id": "y"}},
+     "键值不是 DynamoDB AttributeValue"),
+    (lambda s, d: {"day": d, "key": _key("other-site", d)},
+     "分区键被改成别的站点（真机 ValidationException → 500，M5-FINDINGS §4.21）"),
+    (lambda s, d: {"day": d, "key": _key(s, "1999-01-01")},
+     "分区键里的日期与 day 不一致"),
+]
+
+
+@pytest.mark.parametrize("make,why", BAD_CURSORS,
+                         ids=[str(i) for i in range(len(BAD_CURSORS))])
+def test_visitors_rejects_cursors_of_the_wrong_shape(env, make, why):
+    """形状不对的游标一律 ValueError（→ 400），一个都不许漏成 500。"""
+    import analytics
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    with pytest.raises(ValueError):
+        analytics.visitors("s1", days=1, limit=5,
+                           cursor=_cur(make("s1", today)))
+    # 反向：同一个游标不能只是"抛了别的异常"就算过——上面那句用 ValueError
+    # 精确匹配，AttributeError / TypeError / ClientError 都会让本条红。
+
+
+def test_a_cursor_cannot_be_replayed_against_another_site(env):
+    """游标**绑站点**：s1 的游标拿到 s2 上必须 400，而不是去读 s2 的分区。
+
+    形态上它本来就读不到 s1 的数据（分区键在游标里），但"把别人的游标原样投进
+    另一个上下文"是一个不该有清晰失败信息的入口——绑定让它在**业务代码之前**
+    就被拒，也顺手把 §4.21 那条实测出来的 500 变成 400。
+    """
+    import analytics
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    for i in range(3):
+        _event(env, "s1", today, f"u{i}@x.co", i=i)
+    nxt = analytics.visitors("s1", days=1, limit=1)["next"]
+    assert nxt, "前置条件不成立：没拿到游标"
+    assert analytics.visitors("s1", days=1, limit=1, cursor=nxt)["rows"], \
+        "正对照：原站点上这个游标必须照常能翻页"
+    with pytest.raises(ValueError):
+        analytics.visitors("s2", days=1, limit=1, cursor=nxt)
+
+
+def test_a_valid_cursor_survives_a_wider_window(env):
+    """正对照：合法游标在**更宽**的窗口里照常可用（校验不是"只准原样重放"）。"""
+    import analytics
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    for i in range(3):
+        _event(env, "s1", today, f"u{i}@x.co", i=i)
+    nxt = analytics.visitors("s1", days=1, limit=1)["next"]
+    page = analytics.visitors("s1", days=7, limit=1, cursor=nxt)
+    assert len(page["rows"]) == 1, page

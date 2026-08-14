@@ -123,6 +123,12 @@ def _pv7_or_unknown(site_id: str) -> list[int]:
     （`sparkline` 里那条"恰好 7 个数字"的守卫）。口径同 `uv_exact`：
     不显示一个站不住的数字。
 
+    **这层兜底防"错"不防"慢"**：Lambda 超时与 OOM 不是异常（进程被杀），
+    `except` 接不住。所以"首页不会被行数拖挂"这件事**只能在读取那侧**保证，
+    不在这里——`analytics.pv7()` 的两次 Query 各自带上界（聚合表 `BETWEEN`、
+    今天 `Limit`），超出上界时它自己返回 `[]`。见 analytics 模块头部注释里
+    "两个面的成本上界刻意不同"那一段（Codex 审查 2026-08-14 P1）。
+
     **范围刻意收窄**：只接基础设施读失败。
       · `ClientError` —— ResourceNotFound / AccessDenied / 限流；
       · `BotoCoreError` —— 端点、凭证、连接；
@@ -158,11 +164,15 @@ def do_list_sites(email: str, *, all_sites: bool = False) -> list[dict]:
     else:
         sites = common.list_sites_for_user(email)
     return [{**_shape_site(s, email, viewer_is_admin=is_adm),
-             # 站点列表的迷你趋势。**成本**：站点数 × 2 次分区 Query
+             # 站点列表的迷你趋势。**成本**：站点数 × 恰好 2 次分区 Query
              # （日聚合表一次 + 今天的明细分区一次——`series()` 对今天恒走实时
-             # 计算，spec §3.5 的「1 次」少算了一次，且明细那次随**今天的访问量**
-             # 分页）。当前 31 个站点可接受。管理员全局视图同理——站点数长到
-             # 三位数时改批量或缓存，届时重评（spec §3.5 已记）。
+             # 计算，spec §3.5 的「1 次」少算了一次），**两次都不分页**：
+             # 聚合表那次的条数由 `BETWEEN` 封住（7 天最多 7 行），今天那次由
+             # `Limit=PV7_LIVE_ROW_CAP+1` 封住、超出即整条趋势按未知返回。
+             # 上一版今天那次跟着**今天的访问量**分页——而 Edge 给未登录的 302
+             # 也记一行，即行数是匿名方可控的输入，等于把首页的耗时交给外部
+             # （Codex 审查 2026-08-14 P1）。当前 31 个站点可接受；长到三位数时
+             # 改批量或并发，届时重评（spec §3.5 已记）。
              # 取数走 `_pv7_or_unknown`：这个字段的故障**不得**放大成首页 500。
              "pv7": _pv7_or_unknown(s["site_id"])}
             for s in sorted(sites, key=lambda s: s.get("created_at", ""),
