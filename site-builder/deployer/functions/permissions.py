@@ -27,6 +27,9 @@ CAPABILITIES = {
     "manage_collaborators": {ROLE_OWNER, ROLE_ADMIN},
     "transfer_owner": {ROLE_OWNER, ROLE_ADMIN},
     "undeploy": {ROLE_OWNER, ROLE_ADMIN},
+    # M5：看访问统计与访问明细。**不复用 read**——明细含其他访问者的邮箱，
+    # 是另一个敏感度等级。单独动作名让"收紧成只有 owner+admin"是改一个字典项。
+    "view_analytics": {ROLE_OWNER, ROLE_COLLABORATOR, ROLE_ADMIN},
 }
 
 

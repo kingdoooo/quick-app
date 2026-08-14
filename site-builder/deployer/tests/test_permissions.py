@@ -831,3 +831,25 @@ def test_resync_requires_route_item_to_exist():
     body = ast.unparse(fn)
     assert "attribute_exists(subdomain)" in body, (
         "resync_route 缺 attribute_exists(subdomain) 条件——会无中生有建路由")
+
+
+def test_view_analytics_is_a_registered_action_for_the_three_roles():
+    """访问明细含**其他访问者的邮箱**，是与站点元数据不同的敏感度等级。
+
+    单独一个动作名（而不是复用 read）让"以后要收紧成只有 owner+admin"变成改
+    一个字典项，且不牵动其它读路径。
+    """
+    from permissions import (CAPABILITIES, ROLE_ADMIN, ROLE_COLLABORATOR,
+                             ROLE_NONE, ROLE_OWNER, can)
+    assert CAPABILITIES["view_analytics"] == {
+        ROLE_OWNER, ROLE_COLLABORATOR, ROLE_ADMIN}
+    assert can(ROLE_OWNER, "view_analytics")
+    assert can(ROLE_COLLABORATOR, "view_analytics")
+    assert can(ROLE_ADMIN, "view_analytics")
+    assert not can(ROLE_NONE, "view_analytics")
+
+
+def test_unregistered_analytics_typo_is_denied_to_everyone():
+    """未登记动作对所有人拒绝（fail-closed）——拼错动作名不会变成放行。"""
+    from permissions import ROLE_OWNER, can
+    assert not can(ROLE_OWNER, "view_analytic")
