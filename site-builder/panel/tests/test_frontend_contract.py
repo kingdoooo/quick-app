@@ -1,4 +1,9 @@
-"""前端与后端的契约：路径、方法名、M4/M5 不发请求、phase 词表、无真实值。
+"""前端与后端的契约：路径、方法名、各种词表、disabled 语义、无真实值。
+
+**判据一律从真源推导，不留手写清单**：路径核对唯一判据是 `handler.ROUTES`，
+词表核对唯一判据是写入方的源码。本文件历史上有过两份手写清单（M4/M5 的
+"禁止路径"与临时豁免），它们的共同结局是"端点真实存在之后变成永远绿的死断言"，
+两份都已随对应里程碑的前端落地删除。
 
 **为什么是静态解析而不是跑浏览器**：这些断言要在 CI/单测里挡住"改了后端路由
 忘了改前端"这类漂移，必须无依赖、秒级、可无人值守。真实交互行为由 Task 14
@@ -364,7 +369,20 @@ def test_all_network_calls_go_through_the_api_helper():
 
 
 def test_every_api_path_exists_in_handler_routes():
-    """前端请求的每个路径都必须在 handler.ROUTES 里（拼错会 404 且难查）。"""
+    """前端请求的每个路径都必须在 handler.ROUTES 里（拼错会 404 且难查）。
+
+    **唯一判据是 handler.ROUTES，不是任何手写清单**。本文件的第 ③ 组曾经另有
+    一份手写的"禁止路径"清单（`/api/analytics`、`/api/visitors`、`/api/stats`、
+    `/api/pv`）替这条做一半的事。M5 落地时那份清单会变成**永远绿的死断言**：
+    真实路由是 `/api/sites/{id}/analytics`，与清单里的裸路径不是同一个字符串，
+    所以它既抓不到问题也不会红——正是 M4-FINDINGS §3.6 说的死重量，与 §3.2 的
+    "枚举什么还不存在"是同一个病（M4 的 `/api/keys` 已经栽过一次：端点真实存在
+    之后那一条只能靠人记得回来删）。
+
+    从真源推导的这条在下一个里程碑加路由时既不假红也不假绿，所以 Task 9 把
+    清单删了；它唯一还有价值的那一半（"扫描器不许漏出网口"）改成
+    test_path_extractor_sees_every_api_literal_in_the_source。
+    """
     import handler
     for method, path in sorted(_frontend_calls()):
         assert any(m == method and rx.match(path)
@@ -381,21 +399,10 @@ def test_every_api_path_exists_in_handler_routes():
 # 的形态——它这次确实被收回了。
 
 # 二期 M5 的两条读路由（`GET /api/sites/{id}/analytics`、
-# `GET /api/sites/{id}/visitors`）：后端在 Task 8 落地，前端在 **Task 9** 接。
-#
-# **这期间豁免是唯一自洽的状态**，与 M4 当时同一形态（见上面那段注释）：紧邻的
-# test_disabled_entries_are_visibly_disabled_in_markup 要求 M5 入口此刻仍是
-# 可见 disabled 的占位，所以"让前端接上"与它互斥，只能靠豁免过渡。
-#
-# 代价是这两个 pattern 上"后端加了端点、前端漏接"的检测被临时关掉，所以下面
-# test_m5_analytics_routes_are_exempt_only_until_the_frontend_lands 盯着它：
-# Task 9 一接前端，那条就会红并要求删掉本集合。**不要把它留成永久豁免。**
-M5_PENDING_FRONTEND = {
-    (r"^/api/sites/(?P<site_id>[a-z][a-z0-9-]{1,63})/analytics$",
-     "Task 9 接入前端后必须删除本豁免"),
-    (r"^/api/sites/(?P<site_id>[a-z][a-z0-9-]{1,63})/visitors$",
-     "Task 9 接入前端后必须删除本豁免"),
-}
+# `GET /api/sites/{id}/visitors`）走过**完全相同的一轮**：Task 8 落后端时加了
+# `M5_PENDING_FRONTEND` 临时豁免 + 一条盯着它的用例，**Task 9 接完前端后两者
+# 一起删除**（那条用例正是被"前端已经接了 /analytics"判红的——红本身就是豁免
+# 到期的信号）。两个里程碑各一次收回，"临时豁免变永久"这个形态目前 0 例存量。
 
 
 def test_every_handler_route_is_reachable_or_explicitly_unused():
@@ -411,7 +418,7 @@ def test_every_handler_route_is_reachable_or_explicitly_unused():
         # 管理员手工修复口，控制台不暴露入口（spec §8：人工排障用）
         (r"^/api/admin/resync/(?P<site_id>[a-z][a-z0-9-]{1,63})$",
          "人工修复投影用，不做 UI 入口"),
-    } | M5_PENDING_FRONTEND
+    }
     exempt_patterns = {p for p, _ in exempt}
     calls = _frontend_calls()
     unreached = []
@@ -424,66 +431,102 @@ def test_every_handler_route_is_reachable_or_explicitly_unused():
         f"handler 有端点前端没接（漏接或该加豁免说明）: {unreached}")
 
 
-def test_m5_analytics_routes_are_exempt_only_until_the_frontend_lands():
-    """M5 的临时豁免必须**恰好**是那两个 pattern，且前端确实还没接。
+# ── ③ 扫描器自身不许漏出网口；disabled 入口的无障碍语义 ────────────────
 
-    形态照抄 M4 当时那条（已随 Task 9 一起删除，见上面的注释）：没有这条时，
-    一个"临时"豁免会永久留在文件里，而"后端加了端点、前端没接"的检测就在那两条
-    路由上永久失效——本项目记录过的"放宽一次就再没人回来收"形态。
-    Task 9 接完前端后本用例会红，提示把 M5_PENDING_FRONTEND 一起删掉。
+def test_path_extractor_sees_every_api_literal_in_the_source():
+    """源码里的 `/api` 字面量不能比解析出的路径多。
+
+    这才是那份被删掉的"禁止路径"清单唯一在替人做的事，也是本文件真正的风险
+    面：`_frontend_calls()` 是上面**每一条**路径断言的前置，它漏掉一个出网口
+    时那些断言全部在一个子集上说 clean（"一个只会说 clean 的检测器比没有更糟"，
+    M3-FINDINGS §2.11）。清单的做法只覆盖几个**猜出来的**字符串；这条覆盖
+    源码里真实存在的每一个。
+
+    判据是前缀：字面量是拼接的头段（`'/api/sites/'`），解析出的是具体化后的
+    完整路径（`/api/sites/s-abc123/jobs`）。
     """
-    import handler
-    patterns = {p for p, _ in M5_PENDING_FRONTEND}
-    assert patterns == {
-        r"^/api/sites/(?P<site_id>[a-z][a-z0-9-]{1,63})/analytics$",
-        r"^/api/sites/(?P<site_id>[a-z][a-z0-9-]{1,63})/visitors$"}, (
-        f"临时豁免的范围变了，必须逐条复核: {sorted(patterns)}")
-    # 豁免的 pattern 必须真在 ROUTES 里——写错字的豁免是个哑弹（既不生效，
-    # 也让人以为已经处理过了）
-    known = {rx.pattern for _, rx in handler.ROUTES}
-    assert patterns <= known, f"豁免了 ROUTES 里不存在的 pattern: {patterns - known}"
-    assert all(reason.strip() for _, reason in M5_PENDING_FRONTEND), "豁免缺理由"
-    for _, path in _frontend_calls():
-        assert not (path.endswith("/analytics") or path.endswith("/visitors")), (
-            f"前端已经接了 {path}——请删掉 M5_PENDING_FRONTEND 这个临时豁免，"
-            "让真正的可达性核对重新生效")
+    import re as _re
+    blob = _js()
+    literals = {m.group(1) for m in
+                _re.finditer(r"""['"](/api/[A-Za-z0-9_\-/]*)['"]""", blob)}
+    assert literals, "源码里一个 /api 字面量都没有——调用形态变了，本用例必须同步更新"
+    parsed_prefixes = {p for _, p in _frontend_calls()}
+    for lit in literals:
+        head = lit.rstrip("/")
+        assert any(p.startswith(head) for p in parsed_prefixes), (
+            f"源码里有 /api 字面量 {lit!r} 但解析器没把它算成一次调用"
+            "——扫描器漏了一个出网口，本文件的其它断言对它全部失效")
 
 
-# ── ③ M5 必须是 disabled 占位，不得请求不存在的 API ────────────────────
+def test_frontend_flags_inexact_uv_instead_of_printing_a_number():
+    """超出 90 天明细窗口的桶：`uv` 是 **null 而不是 0**，前端必须读 uv_exact。
 
-def test_m5_features_do_not_call_any_api():
-    """M5（analytics/visitors）不得发请求。
-
-    不只查几个猜出来的路径：把前端请求的全部路径与 handler 的真实路由集合
-    做差集，任何"不在 handler 里"的 /api 路径都是假接口。
-
-    **M4 的 `/api/keys` 已经从禁用清单里移出**（Task 9 接了前端，端点真实存在）；
-    `/api/api-keys` 这个**拼错形态**留着——它不在 ROUTES 里，写成它会 404。
+    后端契约（Task 8）：区间没有完整落在明细留存窗口里时无法去重，`uv` 给
+    null。不读 uv_exact 就会把 null 直接拼进 HTML（页面显示 "null"），或者被
+    `|| 0` 兜成 0——后者更糟，"0 个独立访客"是一句错的事实陈述。
     """
-    import handler
-    blob = _js()          # 已剥注释：注释里写"不要请求 /api/analytics"不该变红
-    for forbidden in ("/api/api-keys", "/api/analytics",
-                      "/api/visitors", "/api/stats", "/api/pv"):
-        assert forbidden not in blob, f"前端请求了未实现的 {forbidden}"
-    known = {rx.pattern for _, rx in handler.ROUTES}
-    for _, path in _frontend_calls():
-        assert any(rx.match(path) for _, rx in handler.ROUTES), (
-            f"{path} 不在 handler 的 {len(known)} 条路由里")
+    blob = _js()
+    assert "uv_exact" in blob, "前端没有读 uv_exact——超窗口的桶会显示 null 或 0"
 
 
 def test_disabled_entries_are_visibly_disabled_in_markup():
-    """占位/未启用的入口要**看得见地** disabled，而不是悄悄删掉。
+    """产出 disabled 外观的每一处都必须同时带 `aria-disabled`。
 
-    spec §4.1 要求显示"coming later"；只删掉入口的话用户不知道该功能的状态，
-    产品意图丢失。现在有两类：M5 的访问统计（规划中）与 API Key 组件**未部署**
-    时的入口（`features.api_key.deployed=false`）。两类都要求 disabled 语义
-    与说明文案同时出现。
+    spec §4.1 要求未启用/不可用的入口**看得见地**禁用而不是悄悄删掉：删掉的话
+    用户既不知道平台有这个能力，也不知道为什么自己没有。而只给视觉（变灰的
+    `is-disabled` / `coming-later`）对读屏用户等于没禁用。
+
+    **Task 9 改过判据**。上一版是两句 blob 级的"字样存在"断言，其中一句还带
+    `or`（`"coming-later" in blob or "规划中" in blob`）：M5 的访问统计落地后
+    "规划中"这个词从前端消失，而那条**仍然是绿的**——它被另一处不相干的标记
+    （从未上线站点的"打开站点"按钮）满足了。同形的还有 `aria-disabled in blob`：
+    整份 JS 里有一处带就绿，第二处忘了写它看不见。
+    所以改成**逐处配对**：这是"修那一类"而不是"再列一遍现在有哪几类"——下一个
+    里程碑新加占位入口时，忘了无障碍属性会被指名。
     """
     blob = _markup_without_comments()
-    assert "coming-later" in blob or "规划中" in blob, (
-        "看不到 coming-later / 规划中 的说明")
-    assert "aria-disabled" in blob, (
-        "占位入口缺 aria-disabled —— 只靠视觉变灰对读屏用户等于没禁用")
+    marks = list(re.finditer(r"""class=["'][^"']*\b(?:is-disabled|coming-later)\b""",
+                             blob))
+    assert marks, ("找不到任何 disabled 外观的标记 —— 未启用的入口被删掉了？"
+                   "（API Key 组件未部署时必须留一个看得见的 disabled 项）")
+    for m in marks:
+        # 标签的属性区到它的第一个 `>` 为止。拼接跨行不影响：`+`、引号与
+        # `'title="…"'` 里都没有 `>`，所以第一个 `>` 就是这个标签的收尾。
+        end = blob.find(">", m.end())
+        assert end > 0, f"标签没有闭合: {blob[m.start():m.start() + 120]!r}"
+        tag = blob[m.start():end]
+        assert "aria-disabled" in tag, (
+            "有 disabled 外观但缺 aria-disabled —— 只靠视觉变灰对读屏用户等于"
+            f"没禁用: {tag!r}")
+
+
+def test_decision_label_matches_what_the_edge_writes():
+    """访问明细的 `decision` 词表必须等于 Edge 真正写入的三个字面量。
+
+    与 PHASE_LABEL 那条同一个纪律（"手抄清单必须能被真源打假"）：词表在前端，
+    真源在 `origin_request.py` 里赋给 `decision` 的三个常量。Edge 改了取值
+    （或加了第四种）而前端没跟，"结果"列会显示原始英文串——用户看到
+    `denied_403`，而这一列的全部意义就是把它翻成人话。
+    """
+    src = (REPO / "router" / "infrastructure" / "lambda"
+           / "origin_request.py").read_text()
+    real = set()
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == "decision"
+                   for t in node.targets):
+            continue
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            real.add(node.value.value)
+    assert real == {"allow", "denied_403", "redirect_login"}, (
+        f"Edge 写入的 decision 取值变了: {sorted(real)}"
+        "——前端 DECISION_LABEL 与本用例的预期都要同步")
+    m = re.search(r"const DECISION_LABEL\s*=\s*\{(.*?)\n\}", _js(), re.S)
+    assert m, "找不到 DECISION_LABEL"
+    keys = set(re.findall(r"""['"]?([a-z_0-9]+)['"]?\s*:""", m.group(1)))
+    assert keys == real, (
+        f"DECISION_LABEL 的键 {sorted(keys)} ≠ Edge 写入的 {sorted(real)}")
 
 
 # ── ④ PHASE_LABEL 用真实小写 phase 词表 ────────────────────────────────

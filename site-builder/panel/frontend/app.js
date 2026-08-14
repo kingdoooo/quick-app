@@ -11,11 +11,14 @@
  *    也改不了；is_admin 由后端 /api/me 给（强一致读 admins 表）。原型那个
  *    切换器是演示用的，留着会让人以为前端能提权。
  *
- * ③ 去掉 tier 徽章、PV 曲线、访问审计、API Key 的真实数据：
- *    · `tier` —— sites 表**不存这个字段**，_shape_site 也不返回（照搬会
- *      让每张卡片显示 undefined）；
- *    · PV/UV/访客明细 —— M5 才做，入口 disabled 且**不发任何请求**；
- *    · API Key —— M4 才做，同上。
+ * ③ 原型里三处"有界面没后端"的地方，各自的结局不同：
+ *    · `tier` —— **永久去掉**：sites 表不存这个字段，_shape_site 也不返回
+ *      （照搬会让每张卡片显示 undefined）；
+ *    · API Key —— M4 接上了真实数据（`/api/keys`）；
+ *    · PV/UV/访客明细 —— M5 接上了真实数据（`/api/sites/{id}/analytics`
+ *      与 `.../visitors`）。两者都曾是"入口 disabled 且不发任何请求"的占位，
+ *      现在都不是了——**改这段注释是接前端的一部分**：留着旧说法会让下一个
+ *      人以为这里还不能发请求。
  *
  * ④ PHASE_LABEL 用 jobs 表真实的**小写** phase（common.update_job 写入的值），
  *    不是 SFN 状态机节点名。SUCCEEDED 的 job 停在 `smoke-test`
@@ -85,6 +88,14 @@ const PHASE_LABEL = {
 };
 const PHASE_ORDER = ['submitted', 'queued', 'validate', 'provision-db', 'package',
                      'deploy-backend', 'upload-frontend', 'register-route', 'smoke-test'];
+
+/* 访问明细的 decision 三个真实取值（Edge 埋点 origin_request.py 里赋给
+ * `decision` 的字面量，一个不多一个不少）。缺词条会让"结果"列显示原始英文串。 */
+const DECISION_LABEL = {
+  allow: '放行',
+  denied_403: '不在名单',
+  redirect_login: '未登录'
+};
 
 const ICON = {
   sites: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="2.5" width="12" height="4" rx="1"/><rect x="2" y="9.5" width="12" height="4" rx="1"/></svg>',
@@ -677,7 +688,7 @@ async function pageSite() {
   const panel = $('#tabpanel');
   if (tab === 'access') renderAccessTab(panel, site);
   else if (tab === 'deploys') renderDeploysTab(panel, site);
-  else if (tab === 'analytics') renderAnalyticsTab(panel);
+  else if (tab === 'analytics') renderAnalyticsTab(panel, site);
   else renderOverviewTab(panel, site, dstate);
 }
 
@@ -1177,22 +1188,76 @@ function progressHint(job) {
   return ' <span class="meta">' + (idx + 1) + '/' + PHASE_ORDER.length + '</span>';
 }
 
-/* ── 访问统计（M5 占位）────────────────────────────────────────────── */
+/* ── 访问统计（M5）─────────────────────────────────────────────────── */
 
-function renderAnalyticsTab(panel) {
-  /* **不发任何请求**：M5 的 /api/analytics、/api/visitors 都不存在，
-   * 请求它们只会拿到 404（handler 对未知路由返回 404 而不是 401，
-   * 见 handler.py 的 docstring）。假接口/假数据一律不写。 */
-  panel.innerHTML =
-    '<section class="card coming-later" aria-disabled="true"><div class="empty">' +
-      '<div class="empty-mark">' + ICON.clock + '</div>' +
-      '<h2>访问统计规划中</h2>' +
-      '<p>PV / UV 趋势与按人查看的访问审计属于后续里程碑（M5）。' +
-      '鉴权站点在边缘验签后已知访问者身份，具备做审计的条件，但数据管道尚未建立——' +
-      '所以这里不显示任何数字，避免把空数据当成"没人访问"。</p>' +
-      '<p class="meta" style="margin-top:14px">需要临时排查访问情况时，' +
-      '可在 CloudWatch 里查该站点的 Lambda 日志组。</p>' +
-    '</div></section>';
+/* `uv` 在 `uv_exact === false` 时是 **null 而不是 0**（后端契约）：该区间没有
+ * 完整落在 90 天明细留存窗口里，无法去重。显式标注而不是显示数字——
+ * 显示 null 是个 bug 的样子，而被 `|| 0` 兜成 0 更糟："0 个独立访客"是一句
+ * 错的事实陈述，而这一格恰恰是"我们不知道"。
+ * 日桶永远精确；周/月桶只在整个区间都在窗口内才精确。 */
+function uvCell(row) {
+  if (row.uv_exact === false || row.uv === null || row.uv === undefined) {
+    return '<span class="meta" title="该区间已超出 90 天明细留存窗口，' +
+      '独立访客数无法精确去重">—</span>';
+  }
+  return esc(fmt(row.uv));
+}
+
+function renderAnalyticsTab(panel, site) {
+  panel.innerHTML = '<section class="card"><div class="card-body">' +
+    '<p class="meta">正在加载访问统计…</p></div></section>';
+  const id = encodeURIComponent(site.site_id);
+  /* 两个请求并发：趋势与明细互不依赖，串起来会让这一屏等两个 RTT。
+   * 任一失败都进 catch —— 只画半屏并且不说原因，比整屏报错更难排查。 */
+  Promise.all([
+    apiGet('/api/sites/' + id + '/analytics?period=day&n=30'),
+    apiGet('/api/sites/' + id + '/visitors?days=7&limit=50')
+  ]).then((res) => {
+    const series = (res[0] && res[0].series) || [];
+    const rows = (res[1] && res[1].rows) || [];
+    panel.innerHTML =
+      '<section class="card"><div class="card-head"><h2>访问趋势（近 30 天）</h2>' +
+        '<span class="meta">按自然日聚合（UTC）</span></div>' +
+        '<div class="card-body tight">' + trendTable(series) + '</div></section>' +
+      '<section class="card" style="margin-top:28px">' +
+        '<div class="card-head"><h2>访问明细（近 7 天）</h2>' +
+        '<span class="tag">含被拒记录</span></div>' +
+        '<div class="card-body tight">' + visitorTable(rows) + '</div></section>';
+  }).catch((err) => {
+    panel.innerHTML = '<section class="card"><div class="card-body">' +
+      '<p class="meta">访问统计读取失败：' +
+      esc((err && err.message) || '未知错误') + '</p></div></section>';
+  });
+}
+
+function trendTable(series) {
+  if (!series.length) {
+    return '<p class="meta" style="padding:18px">这段时间没有访问记录。</p>';
+  }
+  const body = series.map((row) =>
+    '<tr><td class="mono">' + esc(row.bucket) + '</td>' +
+      '<td class="num-col">' + esc(fmt(row.pv)) + '</td>' +
+      '<td class="num-col">' + uvCell(row) + '</td>' +
+      '<td class="num-col">' + esc(fmt(row.pv_denied || 0)) + '</td></tr>').join('');
+  return '<table class="tbl"><thead><tr><th>日期</th>' +
+    '<th class="num-col">PV</th><th class="num-col">独立访客</th>' +
+    '<th class="num-col">被拒</th></tr></thead><tbody>' + body + '</tbody></table>';
+}
+
+/* 未登录访问者的 email 是**空串**（Edge 的 redirect_login 契约：302 那一刻还
+ * 不知道是谁），所以这里不能拿 email 当"有身份"的判据去显示空白格。 */
+function visitorTable(rows) {
+  if (!rows.length) {
+    return '<p class="meta" style="padding:18px">近 7 天没有访问记录。</p>';
+  }
+  const body = rows.map((row) =>
+    '<tr><td class="mono">' + esc(when(row.ts)) + '</td>' +
+      '<td>' + esc(row.email || '（未登录）') + '</td>' +
+      '<td class="mono">' + esc(row.path) + '</td>' +
+      '<td>' + esc(DECISION_LABEL[row.decision] || row.decision) +
+      '</td></tr>').join('');
+  return '<table class="tbl"><thead><tr><th>时间</th><th>访问者</th>' +
+    '<th>路径</th><th>结果</th></tr></thead><tbody>' + body + '</tbody></table>';
 }
 
 /* ── 危险区域：下线 ─────────────────────────────────────────────────── */
