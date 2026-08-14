@@ -118,6 +118,40 @@ class SiteDeployerStack(Stack):
             partition_key=ddb.Attribute(name="key_id",
                                         type=ddb.AttributeType.STRING))
 
+        # 二期 M5：访问明细。**Global Table（3 区）**——Edge 写它执行区的本地
+        # 副本。实测跨区写 229ms / 同区 6ms（spec §0.1、§0.4），97% 的代价是
+        # 那条跨太平洋的腿，不是"同步写"本身。副本区集合与
+        # router/config.ini 的 access_replica_regions 必须一致，由
+        # test_stack_edge_iam.py 从同一份清单推导锁死（漏一个 = 该区静默零数据）。
+        #
+        # 用 TableV2 而不是给 Table 配 replication_regions：后者是自定义资源。
+        # 本表是仓库里唯一的多区表，引入第二种构造类型是有意的局部选择。
+        #
+        # DESTROY（不同于 daily）：90 天滚动明细，删栈丢掉可接受。所以它**不进**
+        # RETAIN⇒deletion_protection 那条不变量的范围。
+        access_events = ddb.TableV2(
+            self, "AccessEvents", table_name="site-access-events",
+            partition_key=ddb.Attribute(name="site_date",
+                                        type=ddb.AttributeType.STRING),
+            sort_key=ddb.Attribute(name="ts_id", type=ddb.AttributeType.STRING),
+            billing=ddb.Billing.on_demand(),
+            time_to_live_attribute="expires_at",
+            replicas=[ddb.ReplicaTableProps(region="ap-southeast-1"),
+                      ddb.ReplicaTableProps(region="ap-northeast-1")],
+            removal_policy=RemovalPolicy.DESTROY)
+
+        # 二期 M5：日聚合。RETAIN + deletion_protection 与 ops_log/admins 同理
+        # ——400 天趋势**一旦丢不可重建**（明细只活 90 天）。写入方只有 rollup。
+        access_daily = ddb.Table(
+            self, "AccessDaily", table_name="site-access-daily",
+            partition_key=ddb.Attribute(name="site_id",
+                                        type=ddb.AttributeType.STRING),
+            sort_key=ddb.Attribute(name="date", type=ddb.AttributeType.STRING),
+            billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
+            time_to_live_attribute="expires_at",
+            deletion_protection=True,
+            removal_policy=RemovalPolicy.RETAIN)
+
         artifacts = s3.Bucket(self, "Artifacts", bucket_name=f"site-artifacts-{ACCOUNT}",
                               block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
                               removal_policy=RemovalPolicy.DESTROY, auto_delete_objects=True,

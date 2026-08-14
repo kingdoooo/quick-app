@@ -43,7 +43,14 @@ def template():
     import importlib
     mod = importlib.import_module("app")
     app = aws_cdk.App()
-    stack = mod.SiteDeployerStack(app, "TestStack")
+    # **必须传 env**：TableV2 的 replicas 在 region-agnostic 栈里会抛
+    # ReplicaTablesNotSupportedInRegionAgnosticStack（2026-08-14 实测），
+    # fixture 一抛异常会让本文件所有用例连带失效（含 RETAIN 不变量那条）。
+    # 顺带的好处：带 env 后 self.account/region 渲染成字面量而不是
+    # Fn::Join + Ref(AWS::AccountId)，模板断言可以直接比字符串。
+    stack = mod.SiteDeployerStack(
+        app, "TestStack",
+        env=aws_cdk.Environment(account=mod.ACCOUNT, region=mod.REGION))
     return assertions.Template.from_stack(stack)
 
 
@@ -190,3 +197,40 @@ def test_undeploy_has_async_failure_destination(template):
     assert "OnFailure" in props.get("DestinationConfig", {}), props
     # 删除类动作不自动重试：部分删除后重跑会撞"资源已不存在"，掩盖真实根因
     assert props.get("MaximumRetryAttempts") == 0, props
+
+
+def test_access_events_table_is_a_three_region_global_table(template):
+    """明细表必须是 3 区 Global Table（spec §0.4）。
+
+    漏一个副本区 = 那个区的埋点跨区回落（正确但慢）；而 IAM 少给一个副本 ARN
+    = 那个区静默零数据（Task 4 锁 IAM，这里只锁表）。
+    """
+    tables = template.find_resources("AWS::DynamoDB::GlobalTable")
+    hit = [t for t in tables.values()
+           if t["Properties"].get("TableName") == "site-access-events"]
+    assert len(hit) == 1, f"site-access-events 不是 GlobalTable：{list(tables)}"
+    props = hit[0]["Properties"]
+    regions = {r["Region"] for r in props["Replicas"]}
+    assert regions == {"us-east-1", "ap-southeast-1", "ap-northeast-1"}, (
+        f"副本区集合不对: {sorted(regions)}")
+    keys = {k["AttributeName"]: k["KeyType"] for k in props["KeySchema"]}
+    assert keys == {"site_date": "HASH", "ts_id": "RANGE"}, keys
+    assert props["TimeToLiveSpecification"]["AttributeName"] == "expires_at"
+    assert props["TimeToLiveSpecification"]["Enabled"] is True
+
+
+def test_access_daily_table_is_retained_and_protected(template):
+    """聚合表 400 天趋势丢了不可重建（明细 90 天就没了）→ RETAIN + 保护。
+
+    RETAIN 那半由 test_every_retained_table_has_deletion_protection 从模板推导，
+    本条只钉键与 TTL 属性名——键名错了下游全部 Query 失败。
+    """
+    for res in template.find_resources("AWS::DynamoDB::Table").values():
+        if res["Properties"].get("TableName") != "site-access-daily":
+            continue
+        keys = {k["AttributeName"]: k["KeyType"] for k in res["Properties"]["KeySchema"]}
+        assert keys == {"site_id": "HASH", "date": "RANGE"}, keys
+        assert res["Properties"]["TimeToLiveSpecification"]["AttributeName"] == "expires_at"
+        assert res["DeletionPolicy"] == "Retain"
+        return
+    raise AssertionError("模板里找不到 site-access-daily")
