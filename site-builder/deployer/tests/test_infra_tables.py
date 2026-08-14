@@ -403,31 +403,41 @@ def test_every_retained_table_has_pitr(template):
         "都只挡删表，挡不住一次写坏——而 RETAIN 本身就是在声明这份数据不能丢。")
 
 
-def test_access_events_replicas_all_have_pitr(template):
-    """明细表（`TableV2` → `AWS::DynamoDB::GlobalTable`）**每个副本**都要开 PITR。
+def test_every_global_table_replica_has_pitr(template):
+    """**不变量（按资源类型推导，不列表名）**：每张 `AWS::DynamoDB::GlobalTable`
+    的**每个副本**都要开 PITR。
 
     **属性形状与普通表不同，必须读渲染后的模板**：`AWS::DynamoDB::Table` 的
     `PointInTimeRecoverySpecification` 在顶层，而 GlobalTable 的在**每个 replica
     里各一份**（CDK 的表级 prop 会分发到含主副本在内的每个 replica）。拿 Table
     那个形状去断言 GlobalTable 会永远查不到那个键 → 用例空转，而两侧都"绿"。
+    这也是为什么上面那条（只扫 `AWS::DynamoDB::Table`）看不见它：**不是重复用例，
+    是另一种资源类型**。
 
-    本表按设计是 DESTROY（90 天滚动明细），所以它**不在**上面那条 RETAIN 不变量
-    的范围里——这里显式点名，理由是它是聚合表的**重建来源**："只要明细还在，数就
-    还能算回来"（模块 docstring 与 spec §0.1 用来否掉日志侧聚合的正是这条属性）
-    只在明细自己没被写坏时成立。PITR 又是**按副本**计费与恢复的，所以要求每个副本
-    都有：只在一个区开，另外两个区被写坏时没有可回溯的点。
+    **按资源类型推导而不是点名 `site-access-events`**：将来再加多区表会自动被
+    要求，与 `test_every_retained_table_has_deletion_protection` 同一条纪律
+    （手抄的清单就是下一个漂移源）。
+
+    唯一那张多区表按设计是 DESTROY（90 天滚动明细），所以它**不在**上面那条
+    RETAIN 不变量的范围里，只能由本条覆盖。它值得 PITR 的理由与聚合表不同：
+    它是**其它一切数字的来源**（rollup / 面板 / MCP 都从它算），而"只要明细还在，
+    数就还能算回来"（spec §0.1 用来否掉日志侧聚合的正是这条属性）只在明细自己
+    没被写坏时成立。PITR 又是**按副本**计费与恢复的，所以要求逐个副本都有：
+    只在一个区开，另外两个区被写坏时没有可回溯的点。
     """
-    gts = [t for t in template.find_resources("AWS::DynamoDB::GlobalTable").values()
-           if t["Properties"].get("TableName") == "site-access-events"]
-    assert len(gts) == 1, f"site-access-events 不是恰好一张 GlobalTable：{gts}"
-    replicas = gts[0]["Properties"]["Replicas"]
-    assert len(replicas) == 3, replicas      # 少一个副本另有 test 管，这里防空转
-    missing = sorted(r["Region"] for r in replicas
-                     if (r.get("PointInTimeRecoverySpecification") or {}
-                         ).get("PointInTimeRecoveryEnabled") is not True)
-    assert not missing, (
-        f"这些副本没开 PITR: {missing}。明细是聚合表的重建来源，写坏之后"
-        "「重算即修复」就不成立了；GlobalTable 的 PITR 是按副本设的。")
+    gts = template.find_resources("AWS::DynamoDB::GlobalTable")
+    assert gts, "模板里没有 GlobalTable——本条前提已失效（多区表换回 Table 了？）"
+    for res in gts.values():
+        props = res["Properties"]
+        replicas = props.get("Replicas") or []
+        assert replicas, f"{props.get('TableName')} 一个副本都没渲染出来——本条会空转"
+        missing = sorted(r["Region"] for r in replicas
+                         if (r.get("PointInTimeRecoverySpecification") or {}
+                             ).get("PointInTimeRecoveryEnabled") is not True)
+        assert not missing, (
+            f"{props.get('TableName')} 这些副本没开 PITR: {missing}。明细是聚合表的"
+            "重建来源，写坏之后「重算即修复」就不成立了；GlobalTable 的 PITR "
+            "是按副本设的，漏一个就是那个区没有时点恢复能力。")
 
 
 def _alarm(template, alarm_name: str) -> dict:
@@ -482,9 +492,13 @@ def test_edge_analytics_alarm_watches_the_metric_the_rollup_publishes(template):
     # Maximum 而不是 Sum：手工重跑 rollup 会在同一窗口里多打一个数据点
     assert props["Statistic"] == "Maximum", props
     assert props["Period"] == 86400, props
-    # 阈值 0 = 一天内 ≥1 条失败即计入（实测全区合计 ≈2.6 次写入/天，
-    # 起步值 10 那类阈值连 100% 失败都凑不满）
-    assert props["Threshold"] == 0, props
+    # 阈值 3（配 GreaterThanThreshold ⇒ 一天 ≥4 条失败、连续两天才响）。
+    # **这个数字挂在一个未测量的量上**（埋点的正常失败底噪）：现网实测流量
+    # ≈134 次写入/天，而失败样本只有"18 次里 0 次失败"，按 rule of three 只能
+    # 把失败率上界压到 ≈17% —— 也就是说底噪是 0 还是 20 次/天，现有数据分不出。
+    # 所以 3 是**假设**（"底噪 < 3/天"）不是结论，理由、可证伪的观测、以及
+    # 一周后的复查触发条件全写在 app.py 与 DEPLOY.md，改这里必须一起改。
+    assert props["Threshold"] == 3, props
     assert props["ComparisonOperator"] == "GreaterThanThreshold", props
     # 2/2：period=86400 的告警评估**滚动** 24h 窗口，1/1 时健康也会响
     assert props["EvaluationPeriods"] == 2, props

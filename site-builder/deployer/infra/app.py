@@ -187,7 +187,9 @@ class SiteDeployerStack(Stack):
                       ddb.ReplicaTableProps(region="ap-northeast-1")],
             # TableV2 的表级 PITR 会分发到**含主副本在内的每个** replica
             # （GlobalTable 的 PITR 是逐副本属性，只在一个区开等于另两个区没有
-            # 可回溯的点）。由 test_access_events_replicas_all_have_pitr 逐副本钉。
+            # 可回溯的点）。由 test_every_global_table_replica_has_pitr 逐副本钉
+            # ——**逐个**副本，不是"有一个开了就算"（反向验证里单独注入过：只把
+            # ap-southeast-1 那个副本关掉，那条断言要能只点出这一个区）。
             point_in_time_recovery_specification=_PITR,
             removal_policy=RemovalPolicy.DESTROY)
 
@@ -564,9 +566,29 @@ class SiteDeployerStack(Stack):
         # ① 跨区聚合的 Edge 埋点失败。指标由 access_rollup 每轮发**一个**无维度值。
         #
         # 阈值/周期的实测依据（改任何一个数字前先读 DEPLOY.md 那一节）：
-        #  · **threshold=0**（一天内 ≥1 条失败即计入）：实测全区合计的埋点写入尝试
-        #    是 7 天 18 次（≈2.6 次/天）。这个量级下「> 10」那类起步值**连 100%
-        #    失败都凑不满** ⇒ 告警永不触发，而那正是它要发现的事故。
+        #  · **threshold=3**（配 GreaterThanThreshold ⇒ 一天 ≥4 条、连续两天才响）。
+        #    分母是实测流量 **≈134 次写入/天**（≈5.6 次/小时）：18 条 `[INFO] m5-region`
+        #    落在 **3.2 小时**里，而不是 7 天——那行探针是 `8a8fb20` 才随路由层上线的，
+        #    比它更早的日志里根本没有它。`analytics.py` 旁边独立写着的「全平台日均
+        #    124 行」（M5-FINDINGS §4.26）对得上这个量级。
+        #    于是 4/134 ≈ **3%**：这条告警说的是"一天丢了 3% 以上的访问行，两天连着"。
+        #    旧的「> 10 条/小时」仍然作废（5.6/小时的 100% 失败也凑不满 10），那是
+        #    本次改动的出发点，没有变。
+        #  · **底噪没有测过，所以 3 是假设不是结论**：失败样本是"18 次里 0 次失败"，
+        #    按 rule of three（3/n）只能把失败率上界压到 ≈17% —— 底噪是 0 还是
+        #    20 次/天，现有数据分不出。埋点写入**不重试**（origin_request 那边刻意
+        #    max_attempts=0）、跨区回落实测 719ms 冷启动对 2s 读超时，所以偶发超时
+        #    是可能的。取 3 是在两种错法之间选：threshold=0 在底噪只有 1%（≈1.3/天）
+        #    时就会长期误报（Poisson：P(X≥1)≈73%，连着两天≈53%），而 threshold=3
+        #    在同一底噪下约 1.4 年才误报一次（P(X≥4)≈4.6%，成对≈0.2%）。
+        #    **可证伪的观测**：部署后手工调一次 rollup 发出来的那个数就是底噪的第一个
+        #    24h 真样本——它 >0 就说明底噪不是 0，本注释的假设当场被推翻。
+        #    **复查触发条件**：上线第一周内若在没有真故障时响过 ⇒ 底噪高于 0，
+        #    抬阈值或改成比率（分母用同法扫 `[INFO] m5-region`，见 DEPLOY.md）。
+        #  · **能抓到多大的故障**（按各区流量占比换算）：全平台全坏 ≈134/天、
+        #    ap-southeast-1 全坏 ≈118/天、ap-northeast-1 全坏 ≈7/天 —— 都远超阈值；
+        #    us-east-1 全坏 ≈4.7/天，要几天才凑够连续两天；**单个小区（<1/天）
+        #    抓不到**，那一格仍然靠 verify_analytics_e2e.py 的确定性核对。
         #  · **2/2**：周期 86400 的告警评估的是**滚动** 24h 窗口（实测线上
         #    StateReasonData 的 startDate = queryDate - 24h）。每日那一轮的落点会
         #    抖动（EventBridge 调度延迟 + 封口耗时），只要今天比昨天晚一点，窗口里
@@ -584,10 +606,14 @@ class SiteDeployerStack(Stack):
                 alarm_description=(
                     "全部 POP 所在区的 Edge 埋点失败条数（由 site-access-rollup 每日"
                     "跨区扫日志聚合成一个指标）。埋点异常按设计被吞掉，所以这是唯一能"
-                    "发现「某个区在静默丢访问数据」的信号。指标**缺数据**同样是告警"
-                    "条件——那表示扫描器本轮没扫成，即我们瞎了。灵敏度依赖当前的低"
-                    "流量（实测 ≈2.6 次写入/天）：流量涨几个数量级后应改成比率告警。"),
-                threshold=0, comparison_operator=(
+                    "发现「某个区在静默丢访问数据」的信号。触发条件：连续 2 个 24 小时"
+                    "窗口，每个窗口的最大值 > 3（≈ 当前 134 次写入/天 的 3%）。"
+                    "指标**缺数据**同样是告警条件——那表示扫描器本轮没扫成，即我们瞎了。"
+                    "阈值 3 是按「正常失败底噪低于 3/天」这个**未经测量的假设**取的："
+                    "若上线第一周在没有真故障时响过，说明底噪高于 0，应抬阈值或改成"
+                    "比率告警（失败数 ÷ 当天写入尝试数）。OK=告警解除（仅表示指标不再"
+                    "满足条件，不代表已确认修复）。"),
+                threshold=3, comparison_operator=(
                     cw.ComparisonOperator.GREATER_THAN_THRESHOLD),
                 evaluation_periods=2, datapoints_to_alarm=2,
                 treat_missing_data=cw.TreatMissingData.BREACHING))
