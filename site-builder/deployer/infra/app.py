@@ -423,6 +423,39 @@ class SiteDeployerStack(Stack):
             max_event_age=Duration.hours(1),
             on_failure=destinations.SqsDestination(dlq))
 
+        # M5 每日聚合。**独立角色**：它是唯一能写聚合表的身份，而对明细表只读。
+        # 给它明细表的 PutItem 就等于让聚合器能伪造访问历史；给它 Scan 也不必要
+        # （只按分区 Query）。sites 表只读（枚举 site_id，DynamoDB 无法枚举分区键）。
+        rollup_role = iam.Role(
+            self, "AccessRollupRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            managed_policies=[iam.ManagedPolicy.from_aws_managed_policy_name(
+                "service-role/AWSLambdaBasicExecutionRole")])
+        rollup_role.add_to_policy(iam.PolicyStatement(
+            actions=["dynamodb:Query"], resources=[access_events.table_arn]))
+        rollup_role.add_to_policy(iam.PolicyStatement(
+            actions=["dynamodb:PutItem"], resources=[access_daily.table_arn]))
+        rollup_role.add_to_policy(iam.PolicyStatement(
+            actions=["dynamodb:Scan"], resources=[sites.table_arn]))
+
+        f_rollup = lam_.Function(
+            self, "FnAccessRollup", function_name="site-access-rollup",
+            runtime=lam_.Runtime.PYTHON_3_13,
+            handler="access_rollup.handler",
+            code=lam_.Code.from_asset(fn_dir),
+            role=rollup_role, timeout=Duration.seconds(300), memory_size=256,
+            environment={"ACCESS_EVENTS_TABLE": access_events.table_name,
+                         "ACCESS_DAILY_TABLE": access_daily.table_name,
+                         "SITES_TABLE": sites.table_name})
+
+        # 每天 00:20 UTC。**只封口完整日**，所以不需要更高频率；一轮失败由
+        # 下一轮的 7 天回溯窗口自动补上（access_rollup.LOOKBACK_DAYS）。
+        events.Rule(
+            self, "AccessRollupRule", rule_name="site-access-rollup-daily",
+            schedule=events.Schedule.cron(minute="20", hour="0"),
+            targets=[targets.LambdaFunction(
+                f_rollup, dead_letter_queue=dlq, retry_attempts=2)])
+
         # rule 只匹配**本状态机**的 TIMED_OUT / ABORTED。
         # 不匹配 FAILED：那条路径已由每个 Task 的 add_catch → MarkFailed 覆盖，
         # 重复收敛会把 mark_job 写入的真实错因覆盖成通用文案。

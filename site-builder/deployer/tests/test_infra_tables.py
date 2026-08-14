@@ -234,3 +234,66 @@ def test_access_daily_table_is_retained_and_protected(template):
         assert res["DeletionPolicy"] == "Retain"
         return
     raise AssertionError("模板里找不到 site-access-daily")
+
+
+def test_rollup_role_can_only_query_events_and_put_daily(template):
+    """rollup 是唯一能写聚合表的身份，且对明细表只读。
+
+    给它 PutItem 到明细表 = 聚合器能伪造访问历史；给它 Scan 明细表 = 不必要的
+    全表能力（它只按分区 Query）。
+    """
+    # **不能按 "site-access" 字面量筛策略**（Codex 审查 2026-08-14 P2-4）：
+    # `table_arn` 渲染成 {"Fn::GetAtt": ["AccessEvents832F10D1", "Arn"]}（实测），
+    # policy 文本里根本没有表名字面量，那样筛会把目标策略全筛掉 → 用例空转。
+    # 改成按**逻辑 ID** 对应：先从模板里查出两张表的逻辑 ID，再看语句引用了谁。
+    def _logical_id(res_type: str, table_name: str) -> str:
+        for lid, res in template.find_resources(res_type).items():
+            if res["Properties"].get("TableName") == table_name:
+                return lid
+        raise AssertionError(f"模板里找不到 {table_name}")
+
+    ev_lid = _logical_id("AWS::DynamoDB::GlobalTable", "site-access-events")
+    da_lid = _logical_id("AWS::DynamoDB::Table", "site-access-daily")
+
+    def _refs(resource) -> set[str]:
+        """语句 Resource 里引用到的逻辑 ID 集合（Fn::GetAtt / Ref 都算）。"""
+        out = set()
+        for r in (resource if isinstance(resource, list) else [resource]):
+            if isinstance(r, dict):
+                for k, v in r.items():
+                    if k in ("Fn::GetAtt", "Ref"):
+                        out.add(v[0] if isinstance(v, list) else v)
+        return out
+
+    events_actions, daily_actions = set(), set()
+    for pol in template.find_resources("AWS::IAM::Policy").values():
+        for st in pol["Properties"]["PolicyDocument"]["Statement"]:
+            acts = st["Action"] if isinstance(st["Action"], list) else [st["Action"]]
+            acts = {str(a) for a in acts if str(a).startswith("dynamodb:")}
+            if not acts:
+                continue
+            refs = _refs(st["Resource"])
+            if ev_lid in refs:
+                events_actions |= acts
+            if da_lid in refs:
+                daily_actions |= acts
+    # **两个都要非空**，否则本用例在筛不到语句时会静默通过（上一版就是这样）
+    assert events_actions, "没有任何语句引用明细表——筛选逻辑坏了，本条空转"
+    assert daily_actions, "没有任何语句引用聚合表——筛选逻辑坏了，本条空转"
+    assert events_actions == {"dynamodb:Query"}, (
+        f"明细表的动作集合必须恰好是 Query（给 PutItem = 聚合器能伪造历史）: "
+        f"{sorted(events_actions)}")
+    assert daily_actions == {"dynamodb:PutItem"}, (
+        f"聚合表的动作集合不对: {sorted(daily_actions)}")
+
+
+def test_rollup_runs_daily_and_has_a_dlq(template):
+    rules = template.find_resources("AWS::Events::Rule")
+    hit = [r for r in rules.values()
+           if r["Properties"].get("Name") == "site-access-rollup-daily"]
+    assert len(hit) == 1, f"找不到 site-access-rollup-daily：{list(rules)}"
+    props = hit[0]["Properties"]
+    assert props["ScheduleExpression"] == "cron(20 0 * * ? *)", props["ScheduleExpression"]
+    assert props["State"] == "ENABLED"
+    target = props["Targets"][0]
+    assert "DeadLetterConfig" in target, "rollup 的 target 没有 DLQ"
