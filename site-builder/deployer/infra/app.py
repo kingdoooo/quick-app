@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Deployer 基础设施：任务/站点表、产物桶、CodeBuild 打包项目、执行角色。
 状态机定义在 Task 17 追加到本 stack。"""
+import ast
 import configparser
 from pathlib import Path
 
 from aws_cdk import (App, CfnOutput, Duration, Environment, RemovalPolicy, Stack,
+                     aws_cloudwatch as cw,
+                     aws_cloudwatch_actions as cw_actions,
                      aws_codebuild as cb, aws_dynamodb as ddb,
                      aws_events as events, aws_events_targets as targets,
                      aws_iam as iam, aws_lambda as lam_,
                      aws_lambda_destinations as destinations, aws_s3 as s3,
-                     aws_sqs as sqs, aws_stepfunctions as sfn,
+                     aws_sns as sns, aws_sqs as sqs, aws_stepfunctions as sfn,
                      aws_stepfunctions_tasks as tasks)
 from constructs import Construct
 
@@ -17,6 +20,47 @@ CFG = configparser.ConfigParser()
 CFG.read(Path(__file__).parents[2] / "config.ini")
 ACCOUNT = CFG["Platform"]["account_id"]
 REGION = CFG["Platform"]["region"]
+
+
+def _rollup_const(name: str) -> str:
+    """从 `functions/access_rollup.py` 里读一个模块级字符串常量，**不 import**
+    （import 需要 boto3，而 `infra/.venv` 只有 CDK 依赖）。
+
+    IAM 里的日志组前缀与指标 namespace 必须与运行时用的是**同一个字面量**：
+    手抄第二份就是下一次「两侧单测都绿、线上 AccessDenied」。
+    """
+    src = (Path(__file__).parents[1] / "functions" / "access_rollup.py").read_text(
+        encoding="utf-8")
+    for node in ast.walk(ast.parse(src)):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and getattr(node.targets[0], "id", None) == name
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)):
+            return node.value.value
+    raise RuntimeError(f"access_rollup.py 里找不到字符串常量 {name}")
+
+
+EDGE_LOG_GROUP_PREFIX = _rollup_const("EDGE_LOG_GROUP_PREFIX")
+ROLLUP_METRIC_NAMESPACE = _rollup_const("METRIC_NAMESPACE")
+ROLLUP_METRIC_NAME = _rollup_const("METRIC_NAME")
+
+# 告警通知的 SNS topic。**建者不是本栈**——它由 `auth/deploy_auth.py`
+# （`alarm_pipeline.py`）幂等收敛，连带那个必须由收件人手工确认的邮件订阅。
+# 本栈**只按名字引用**：两个创建方就是两个真源，症状是告警照样进 ALARM 而
+# 没有任何人收到通知（已确认的订阅挂在另一个 topic 上）。
+# 两侧字面量由 test_alarm_topic_name_matches_the_script_that_creates_it 跨文件钉住。
+ALARM_TOPIC_NAME = "site-builder-alarms"
+
+# **PITR 只防"写坏"这一类**，与 RETAIN / deletion_protection / TTL 都不重叠：
+#   · RETAIN 只在删栈/替换资源时起作用；
+#   · deletion_protection 挡直接 `DeleteTable`；
+#   · 三者对"一次错的覆盖写"毫无作用。
+# 而 rollup 的设计**就是**反复覆盖同一批行，`site-access-daily` 的 400 天历史在
+# 明细 90 天 TTL 到期后不可重建 ⇒ 写坏之后没有 PITR 就只剩"接受错的数字"。
+# 凡 RETAIN 的表都加（= 已经声明过"这份数据不能丢"），由
+# test_every_retained_table_has_pitr 按 DeletionPolicy 推导校验，新增 RETAIN 表
+# 自动被要求。明细表虽然是 DESTROY 也加：它是聚合表的重建来源。
+_PITR = ddb.PointInTimeRecoverySpecification(point_in_time_recovery_enabled=True)
 
 
 class SiteDeployerStack(Stack):
@@ -62,6 +106,7 @@ class SiteDeployerStack(Stack):
                                                        type=ddb.AttributeType.STRING),
                            billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
                            deletion_protection=True,
+                           point_in_time_recovery_specification=_PITR,
                            removal_policy=RemovalPolicy.RETAIN)
 
         # 二期 M3：操作审计（append-only）。写入方只被授予 PutItem。
@@ -73,6 +118,7 @@ class SiteDeployerStack(Stack):
             billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
             time_to_live_attribute="expires_at",
             deletion_protection=True,        # 同上：RETAIN 挡不住 DeleteTable
+            point_in_time_recovery_specification=_PITR,
             removal_policy=RemovalPolicy.RETAIN)
 
         # 二期 M3：面板会话升级的一次性 code 消费标记（jti）。
@@ -103,6 +149,7 @@ class SiteDeployerStack(Stack):
                                         type=ddb.AttributeType.STRING),
             billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
             deletion_protection=True,
+            point_in_time_recovery_specification=_PITR,
             removal_policy=RemovalPolicy.RETAIN)
         # 控制台按人列 Key。
         api_keys.add_global_secondary_index(
@@ -138,6 +185,10 @@ class SiteDeployerStack(Stack):
             time_to_live_attribute="expires_at",
             replicas=[ddb.ReplicaTableProps(region="ap-southeast-1"),
                       ddb.ReplicaTableProps(region="ap-northeast-1")],
+            # TableV2 的表级 PITR 会分发到**含主副本在内的每个** replica
+            # （GlobalTable 的 PITR 是逐副本属性，只在一个区开等于另两个区没有
+            # 可回溯的点）。由 test_access_events_replicas_all_have_pitr 逐副本钉。
+            point_in_time_recovery_specification=_PITR,
             removal_policy=RemovalPolicy.DESTROY)
 
         # 二期 M5：日聚合。RETAIN + deletion_protection 与 ops_log/admins 同理
@@ -150,6 +201,7 @@ class SiteDeployerStack(Stack):
             billing_mode=ddb.BillingMode.PAY_PER_REQUEST,
             time_to_live_attribute="expires_at",
             deletion_protection=True,
+            point_in_time_recovery_specification=_PITR,
             removal_policy=RemovalPolicy.RETAIN)
 
         artifacts = s3.Bucket(self, "Artifacts", bucket_name=f"site-artifacts-{ACCOUNT}",
@@ -438,6 +490,36 @@ class SiteDeployerStack(Stack):
         rollup_role.add_to_policy(iam.PolicyStatement(
             actions=["dynamodb:Scan"], resources=[sites.table_arn]))
 
+        # 跨区扫 Lambda@Edge 日志 → 发**一个**聚合指标（access_rollup 下半部分）。
+        # Lambda@Edge 在 POP 所在区落日志，而 CloudWatch 告警不能跨区，所以按区
+        # 建告警的方案在别的部署上不可移植（不知道 POP 会落在哪些区）。
+        #
+        # 资源里的 **region 段只能是 `*`**——要扫哪些区在部署期未知，这正是可移植性
+        # 要求本身。但其余各段都收窄：
+        #  · FilterLogEvents 限定在 Lambda@Edge 日志组的前缀上。裸 `*` 等于让聚合器
+        #    能读 auth / panel / 站点的**全部**日志（里面有邮箱），那是白拿的权限；
+        #  · DescribeLogGroups 拿不到更细的粒度（列举操作按整个 log-group 命名空间
+        #    鉴权），至少限定到本账号本服务。
+        rollup_role.add_to_policy(iam.PolicyStatement(
+            actions=["logs:DescribeLogGroups"],
+            resources=[f"arn:aws:logs:*:{self.account}:log-group:*"]))
+        rollup_role.add_to_policy(iam.PolicyStatement(
+            actions=["logs:FilterLogEvents"],
+            resources=[
+                f"arn:aws:logs:*:{self.account}:log-group:"
+                f"{EDGE_LOG_GROUP_PREFIX}*",
+                f"arn:aws:logs:*:{self.account}:log-group:"
+                f"{EDGE_LOG_GROUP_PREFIX}*:log-stream:*"]))
+        # 区清单运行时问 AWS（不硬编码）。
+        rollup_role.add_to_policy(iam.PolicyStatement(
+            actions=["ec2:DescribeRegions"], resources=["*"]))
+        # PutMetricData **没有资源级权限**，唯一的收窄手段是 namespace 条件；
+        # 不带它这个角色能往任何 namespace 写，包括伪造别的告警的输入指标。
+        rollup_role.add_to_policy(iam.PolicyStatement(
+            actions=["cloudwatch:PutMetricData"], resources=["*"],
+            conditions={"StringEquals": {
+                "cloudwatch:namespace": ROLLUP_METRIC_NAMESPACE}}))
+
         f_rollup = lam_.Function(
             self, "FnAccessRollup", function_name="site-access-rollup",
             runtime=lam_.Runtime.PYTHON_3_13,
@@ -455,6 +537,83 @@ class SiteDeployerStack(Stack):
             schedule=events.Schedule.cron(minute="20", hour="0"),
             targets=[targets.LambdaFunction(
                 f_rollup, dead_letter_queue=dlq, retry_attempts=2)])
+
+        # ── M5 的两条埋点可观测性告警 ────────────────────────────────────
+        # **必须在 CDK 里声明，不能手工建**：手工建的告警新部署拿不到、被人删掉
+        # 也不会被发现——那就不是可复现的交付物。这与保留期那一轮写进 DEPLOY.md 的
+        # 「真源是代码不是控制台」是同一条纪律（这两条此前正是手工建的，已作废）。
+        #
+        # 两条**互为对方的守卫**，别删任何一条：
+        #   · liveness 抓「聚合器自己停了」——它一停，下面那条只会表现成指标缺数据，
+        #     而缺数据要连续两天才够条件；
+        #   · edge-analytics 抓「某个 POP 所在区在静默丢埋点行」——rollup 调用成功
+        #     并不意味着它扫出来的数是对的。
+        alarm_topic = sns.Topic.from_topic_arn(
+            self, "AlarmTopic",
+            self.format_arn(service="sns", resource=ALARM_TOPIC_NAME))
+
+        def _wire(alarm: cw.Alarm) -> cw.Alarm:
+            """ALARM 与 OK 都通知。**OK 不是可选的**：本项目统一把 OK 称作
+            「告警解除」并同样发通知（与 auth 那条登录失败告警同一套用词），
+            只发 ALARM 时收件人无法区分「还在坏」与「已恢复」。"""
+            action = cw_actions.SnsAction(alarm_topic)
+            alarm.add_alarm_action(action)
+            alarm.add_ok_action(action)
+            return alarm
+
+        # ① 跨区聚合的 Edge 埋点失败。指标由 access_rollup 每轮发**一个**无维度值。
+        #
+        # 阈值/周期的实测依据（改任何一个数字前先读 DEPLOY.md 那一节）：
+        #  · **threshold=0**（一天内 ≥1 条失败即计入）：实测全区合计的埋点写入尝试
+        #    是 7 天 18 次（≈2.6 次/天）。这个量级下「> 10」那类起步值**连 100%
+        #    失败都凑不满** ⇒ 告警永不触发，而那正是它要发现的事故。
+        #  · **2/2**：周期 86400 的告警评估的是**滚动** 24h 窗口（实测线上
+        #    StateReasonData 的 startDate = queryDate - 24h）。每日那一轮的落点会
+        #    抖动（EventBridge 调度延迟 + 封口耗时），只要今天比昨天晚一点，窗口里
+        #    就会有几分钟一个数据点都没有 ⇒ 1/1 下**系统健康时也会响**（§4.20：
+        #    偶发变红的告警的代价是下一个人学会忽略它）。
+        #  · **Maximum 而不是 Sum**：手工重跑 rollup 会在同一窗口里多打一个数据点，
+        #    Sum 会把它们加起来、凭空越过阈值。
+        #  · **breaching**：这是「扫成功也要发显式 0」那条设计的另一半——发了 0 之后
+        #    缺数据只剩一个含义（本轮没扫成），于是"瞎了"与"健康"可区分。
+        _wire(cw.Metric(
+            namespace=ROLLUP_METRIC_NAMESPACE, metric_name=ROLLUP_METRIC_NAME,
+            statistic="Maximum", period=Duration.days(1)).create_alarm(
+                self, "EdgeAnalyticsFailedAlarm",
+                alarm_name="m5-edge-analytics-failed-global",
+                alarm_description=(
+                    "全部 POP 所在区的 Edge 埋点失败条数（由 site-access-rollup 每日"
+                    "跨区扫日志聚合成一个指标）。埋点异常按设计被吞掉，所以这是唯一能"
+                    "发现「某个区在静默丢访问数据」的信号。指标**缺数据**同样是告警"
+                    "条件——那表示扫描器本轮没扫成，即我们瞎了。灵敏度依赖当前的低"
+                    "流量（实测 ≈2.6 次写入/天）：流量涨几个数量级后应改成比率告警。"),
+                threshold=0, comparison_operator=(
+                    cw.ComparisonOperator.GREATER_THAN_THRESHOLD),
+                evaluation_periods=2, datapoints_to_alarm=2,
+                treat_missing_data=cw.TreatMissingData.BREACHING))
+
+        # ② 聚合器活性。**用 `Invocations - Errors` 而不是 `Errors > 0`**：要抓的头号
+        # 形态是「根本没被触发」（rule 被删/禁用、触发权限丢了），那时 Errors 不产生
+        # 任何数据点，`Errors > 0` 永远不会响。配 breaching 才能把"没有数据"变成信号。
+        _lambda_day = {"period": Duration.days(1), "statistic": "Sum"}
+        _wire(cw.MathExpression(
+            expression="inv - err", label="成功调用数", period=Duration.days(1),
+            using_metrics={"inv": f_rollup.metric_invocations(**_lambda_day),
+                           "err": f_rollup.metric_errors(**_lambda_day)}
+            ).create_alarm(
+                self, "RollupLivenessAlarm",
+                alarm_name="m5-rollup-no-successful-invocation-24h",
+                alarm_description=(
+                    "site-access-rollup 连续 2 天没有成功调用（Invocations-Errors<1）。"
+                    "它停了没人会发现：今天的数字仍由读路径实时算，历史曲线只会静默"
+                    "停在最后一次封口那天。需要 2 个周期的理由与另一条告警相同——"
+                    "周期 86400 评估的是滚动 24h 窗口，而定时任务在 00:20 的落点会"
+                    "抖动，1/1 会让健康的系统每天误报一次。恢复后 7 天内的空洞由"
+                    "LOOKBACK_DAYS 自动补齐，更久的中断要显式补跑。"),
+                threshold=1,
+                comparison_operator=cw.ComparisonOperator.LESS_THAN_THRESHOLD,
+                evaluation_periods=2, datapoints_to_alarm=2,
+                treat_missing_data=cw.TreatMissingData.BREACHING))
 
         # rule 只匹配**本状态机**的 TIMED_OUT / ABORTED。
         # 不匹配 FAILED：那条路径已由每个 Task 的 add_catch → MarkFailed 覆盖，

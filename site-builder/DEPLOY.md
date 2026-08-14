@@ -1489,18 +1489,250 @@ rollup **重算即修复**、**绝不封今天**、封口后面板读的是聚�
 （永久留存）设成 90 天同样是有损的——本轮那一个组只有一条 2026-07-28 起的流，
 早于 90 天的日志根本不存在，才确认无损后执行。将来再收紧任何一档前先算这笔账。
 
-### 两个已知的可观测性缺口（运维项，M5 不交付）
+### 两条埋点可观测性告警（原「两个已知的可观测性缺口」，2026-08-15 闭合）
 
 一次性闸门覆盖不了这两件事，而**偶发变红的闸门比没有闸门更糟**（下一个人会学会忽略
-它，连带它本来能抓的真问题）。正确形态都是告警：
+它，连带它本来能抓的真问题）。所以两件都做成告警，**互为对方的守卫**：
 
-1. **没有任何东西证明每日 rollup 真的跑过**。该配「24 小时内无成功调用」告警
-   （rollup Lambda 的 `Invocations`/`Errors`，或 EventBridge 规则的失败投递 + 已有的 DLQ）。
-   这是目前最大的一个缺口。
-2. **某个 Edge 区在运行时静默写失败，没有任何东西会发现**。该配 CloudWatch Logs
-   metric filter 盯 `[WARN] 访问埋点失败` + 阈值告警（「1 小时内 > N 条」）。
-   **不要做成闸门里的断言**：埋点刻意不重试（`max_attempts: 0`），偶发跨区超时会让它
-   偶发变红。
+| 告警 | 抓什么 | 谁抓不到它 |
+|---|---|---|
+| `m5-rollup-no-successful-invocation-24h` | 聚合器**本身**停了（定时任务没跑、或每次都报错） | 下面那条：聚合器不跑就不发指标，而缺数据要连续两天才告警 |
+| `m5-edge-analytics-failed-global` | 任意 POP 所在区的埋点在**静默丢行** | 上面那条：rollup 调用成功 ≠ 它扫出来的数是对的 |
+
+第二条的完整设计见下一节。第一条是 `Invocations - Errors < 1`（metric math，周期
+86400、连续 2 个周期、缺失数据按 breaching），**留着别删**：它是「聚合器的宿主死了」
+这一格，而聚合器正是第二条告警的数据来源——只有第二条时，rollup 停了会表现成
+「指标缺数据」，但那要连续两天才够条件；只有第一条时，rollup 跑得好好的而扫描每轮
+都失败会完全无声。
+
+**两条都由执行器栈声明**（`site-builder/deployer/infra/app.py`，构造 ID
+`EdgeAnalyticsFailedAlarm` / `RollupLivenessAlarm`；通知发到 `auth/deploy_auth.py`
+建的那个 `site-builder-alarms`）。**手工 `put-metric-alarm` 建的不算交付物**，理由与
+参数逐条的实测依据见下一节末尾「两条告警都由 CDK 声明」与「阈值与周期」。
+
+### 跨区聚合 Edge 埋点失败（`m5-edge-analytics-failed-global`）
+
+**问题**：Lambda@Edge 在 **POP 所在区**执行，日志就落在那个区。而 CloudWatch 告警
+**不能跨区**——它只读同区指标、只能通知同区 SNS topic。本账号实测有 **8 个区**
+执行过 Edge 函数，分布极不均：
+
+| 区 | 占比 |
+|---|---|
+| `ap-southeast-1` | 87.8% |
+| `ap-northeast-1` | 5.3% |
+| `us-east-1` | 3.5% |
+| 其余五个区合计 | 2.4% |
+
+所以一条 us-east-1 的告警只盯得住 **3.5%** 的流量。
+
+**为什么不按区各建一条**（曾经就是这么建的三条 metric filter + 一条告警，已删）：
+别的部署**不知道自己的 POP 会落在哪些区**（随 CloudFront 选路、也随 AWS 新开区变化），
+按区建的资源在新账号上根本不存在。同理不能用 Logs metric filter——metric filter
+本身就是按区建的资源。
+
+**做法**：把跨区扫描搭进**已有的** `site-access-rollup`（每天 00:20 UTC 那一轮，
+us-east-1），**零新增基础设施**。每轮：
+
+1. `ec2:DescribeRegions` **动态**枚举本账号已启用的区（实测 18 个）——不硬编码区列表，
+   这就是可移植性要求本身；
+2. 每个区按**形状**发现 Edge 日志组：前缀 `/aws/lambda/us-east-1.`。
+   Lambda@Edge 的日志组在**每个执行区**都叫 `/aws/lambda/{函数归属区}.{函数名}`，
+   前缀里的区是**归属区**（Edge 函数只能建在 us-east-1，平台硬约束），与执行区无关。
+   **不能拼函数名**：它是 `{stack_name}-{origin_request_function_name}`，两段都来自
+   `router/config.ini`（本仓库当前值是 `ApplicationWebRouterStack-application-web-router`），
+   每个部署可以不一样；
+
+   > ⚠️ **这个前缀会连账号里别人的 Edge 函数一起扫到——那是有意接受的代价，
+   > 不要"顺手优化"掉。** 本账号实测就有两个不相干的：`us-east-1.redirectEdge`
+   > （多数区都有）与 `us-east-1.BedrockproxyStack-…`（us-west-2）。它们**不可能
+   > 产生假阳性**，因为判据是那两条中文 WARN 短语，别的函数不会打；代价只是每天多
+   > 几十次 API 调用（18 区 × ≤3 组）。
+   >
+   > 把发现改成"硬编码栈名/函数名"看起来更精确，实际是**把这个设计存在的理由删掉**
+   > ——那个名字来自 gitignored 的 `router/config.ini`，换个部署就扫不到任何日志组，
+   > 而症状是指标恒为 0（= 一切健康），**没有任何东西会报错**。
+   > `test_log_group_discovery_does_not_hardcode_this_deployment_s_stack_name`
+   > 从 `router/config.ini.example` 读出栈名、断言它**没有**出现在
+   > `access_rollup.py` 里，就是为了挡这次"优化"。
+3. 对发现到的每个组发 `logs:FilterLogEvents`，窗口 24 小时，pattern
+   `?"[WARN] 访问埋点失败" ?"[WARN] 埋点判定失败"`（`?A ?B` 是 CloudWatch 的 **OR**；
+   空格分隔的裸短语是 AND，写错方向的症状是一条都匹配不到而两侧单测照样绿）。
+   两条 WARN 都盯：一条是写失败、一条是判定失败，结果都是少一行且无人知晓；
+4. 把总条数发成 **us-east-1 的一个指标** `SiteBuilder/M5 / EdgeAnalyticsFailedGlobal`，
+   **不带任何维度**（加了区维度就又回到按区建告警）。
+
+于是一条告警覆盖所有 POP，**包括将来才出现的区**。
+
+**承重的两条设计**（改之前先读）：
+
+- **扫成功且为 0 时必须发一个显式 0**。只在有失败时才发的话，「健康」与「扫描器瞎了」
+  在指标上是同一个形态（都没有数据点），告警分不开这两件事。发了显式 0 之后，
+  缺数据只剩一个含义——本轮没扫成——交给 `TreatMissingData=breaching`。
+- **任何一个区扫不动就整体不发，绝不发部分和**。部分和会被当成「就这么多」= 健康。
+  扫描失败时 rollup 只记一条 `logger.warning` 并**什么都不发**（既不发 0，也不是
+  `except: pass`）；真正的信号是指标缺数据。扫描放在**封口之后**且异常不外抛——
+  封口是耐久工作，观测不能把它带崩，也不该让 rollup 那次调用被标记成失败
+  （那会触发 EventBridge 重试 + DLQ，还会把上面第一条告警一起拖响）。
+
+**IAM**（`infra/app.py` 的 `rollup_role`，CDK 断言钉在
+`tests/test_infra_tables.py::test_rollup_role_can_scan_cross_region_logs_and_publish_one_metric`
+与 `…_has_no_over_broad_actions`）：资源里的 **region 段只能是 `*`**（要扫哪些区在
+部署期未知），但其余各段都收窄——`logs:FilterLogEvents` 限定在
+`log-group:/aws/lambda/us-east-1.*`（裸 `*` 等于让聚合器能读 auth/panel/站点的全部
+日志，里面有邮箱），`cloudwatch:PutMetricData` 带 `cloudwatch:namespace` 条件
+（该动作没有资源级权限，namespace 条件是唯一的收窄手段）。**没有任何新增的
+DynamoDB 写权限。**
+
+**两条告警都由 CDK 声明，不要手工建。** 真源是
+`site-builder/deployer/infra/app.py`（挨着 rollup Lambda 与那条 EventBridge 规则），
+随执行器栈一起部署：
+
+```bash
+cd site-builder/deployer/infra && rm -rf cdk.out && PATH=.venv/bin:$PATH \
+  npx -y aws-cdk@latest deploy --require-approval never
+```
+
+**为什么不能 `aws cloudwatch put-metric-alarm`**（这两条一开始正是那么建的，已作废）：
+手工建的告警**新部署拿不到**、**被人删掉不会被任何东西发现**，而当时的 DEPLOY.md
+还把它们写成「M5 不交付的缺口」——即它不是可复现的交付物。这与本文档
+「日志组保留期」一节刚立的**真源是代码不是控制台**是同一条纪律。
+配置由 `tests/test_infra_tables.py` 的 5 条断言逐项钉住（指标坐标从
+`access_rollup.py` 派生，不在测试里抄第二份；阈值/周期/2-of-2/breaching/
+两组通知动作全部按值断言）。
+
+**SNS topic 由本栈"引用"而不是"创建"**：`site-builder-alarms` 的真源是
+`auth/deploy_auth.py`（`alarm_pipeline.py` 幂等收敛，**连带那个必须由收件人手工点
+确认的邮件订阅**）。两个创建方就是两个真源，症状是告警照样进 ALARM 而没有任何人
+收到通知（已确认的订阅挂在另一个 topic 上）。两侧的名字字面量由
+`test_alarm_topic_name_matches_the_script_that_creates_it` 跨文件 AST 断言钉住
+——因为 **CloudWatch 不校验 action 指向的 topic 是否存在**，任一侧改名后告警照样
+建得出来、照样进 ALARM，只是通知发进虚空。
+
+> 由此还有一条**部署顺序**的软依赖：全新账号若先部执行器栈、后跑 `deploy_auth.py`，
+> 那段时间里告警存在但 topic 还不存在 ⇒ 通知无处可去。名字一致时 topic 建出来后
+> 会自动生效（ARN 对得上），所以不是硬阻塞，但别把它当"已经在通知了"。
+
+⚠️ **阈值与周期是按实测流量定的，换环境必须重算**（与登录失败告警同一条纪律）：
+
+> **本仓库环境的取值（2026-08-15）**：`--threshold 0`（即一天内 ≥1 条失败即计入）、
+> `--period 86400`、`--evaluation-periods 2 --datapoints-to-alarm 2`、
+> `--statistic Maximum`、`--treat-missing-data breaching`。
+>
+> · **为什么阈值是 0 而不是 10**：实测**全区合计**的埋点写入尝试是 **7 天 18 次**
+>   （≈2.6 次/天；按 `[INFO] m5-region` 计数，每次尝试写恰好打一行）。这个量级下
+>   「1 小时内 > 10 条」这类起步值**连 100% 失败都凑不满**，告警永不触发——而那正是
+>   它要发现的事故。低流量环境只能把阈值压到 0。
+> · **为什么要求连续两个周期**：周期 86400 的告警评估的是**滚动 24 小时窗口**
+>   （实测 `StateReasonData` 的 `startDate` 就是 `queryDate - 24h`，不对齐 UTC 零点）。
+>   而每日那一轮的落点会有抖动（EventBridge 调度延迟 + 封口耗时），只要今天比昨天晚
+>   一点，窗口里就会有几分钟一个数据点都没有 ⇒ 1/1 配置下**系统健康时也会响**。
+>   要求 2/2 之后，单个空窗被相邻窗口的数据点兜住。代价是检出延迟到约 48 小时——
+>   可以接受：系统性故障（IAM 挂了、副本表没了）不会自愈，而「宿主死了」这一格由
+>   `m5-rollup-no-successful-invocation-24h` 在 24 小时内独立覆盖。
+> · **`Maximum` 而不是 `Sum`**：手工重跑 rollup 会在同一个窗口里多打一个数据点，
+>   `Sum` 会把它们加起来、凭空越过阈值。
+> · **已知的覆盖边界（低流量的代价）**：告警的灵敏度挂在流量上。埋点全坏时，
+>   一天里若**一次页面请求都没有**，那天的失败数就是 0，连续性会被打断。所以
+>   「写路径是不是好的」这件事的确定性检查仍然是 `verify_analytics_e2e.py`
+>   （它做一次真实访问再逐行核对），告警只负责持续盯着。
+> · **什么时候必须改成比率告警**（写在这里免得下一个人只是"觉得 0 太敏感"就把数字
+>   调大）：现在这套的前提是**流量很低**。`阈值 0 + 2/2` 在 ≈2.6 次/天下是对的，
+>   因为任何一条失败都值得看；等日写入涨到几个数量级以上（比如 >1000/天），偶发的
+>   跨区超时会天天有一两条，这套配置就会开始误报。**那时正确的动作不是把绝对值调大**
+>   （那等于回到"永不触发"的另一头），而是换成**比率**：失败条数 / 当天埋点写入尝试数
+>   （分母可由 `[INFO] m5-region` 那行同法扫出，或由 rollup 一并发第二个指标），
+>   阈值按"丢多少比例的访问数据算事故"来定。触发这次改造的信号是：这条告警开始
+>   出现"看一眼发现只有一两条、没什么可做的"的 ALARM。
+
+**这个账号上曾经存在、需要删掉的东西**（CDK 里那两条告警上线后即被取代；新部署
+根本不会有这些，**别照着老状态复原**）：
+
+| 要删的 | 是什么 | 为什么取代 |
+|---|---|---|
+| `m5-edge-access-write-failed` × 3 | us-east-1 / ap-southeast-1 / ap-northeast-1 各一条 metric filter，指标 `SiteBuilder/M5 / EdgeAccessWriteFailed` | metric filter 本身就是**按区建的资源**，新部署不会有；而三条里只有一条的指标真被告警读着 |
+| `m5-edge-access-write-failed-us-east-1` | 手工建的告警（Sum / 3600 / 阈值 10 / `notBreaching`） | 只覆盖 **3.5%** 的流量；阈值 10 在本环境**永不触发**；`notBreaching` 让"扫不到"与"没失败"同样判健康 |
+
+三条 filter 都指向同一个日志组名——那部分是**对的**（Lambda@Edge 的日志组名在各区
+相同，见上面那段），问题在于**告警不能跨区**，于是另外两个区的指标没有任何告警在读。
+
+```bash
+for r in us-east-1 ap-southeast-1 ap-northeast-1; do
+  aws logs delete-metric-filter --region $r \
+    --log-group-name /aws/lambda/us-east-1.{路由层栈名}-{origin_request_function_name} \
+    --filter-name m5-edge-access-write-failed
+done
+aws cloudwatch delete-alarms --region us-east-1 \
+  --alarm-names m5-edge-access-write-failed-us-east-1
+```
+
+**顺序要求**：先部署（让 CDK 那两条告警到位）**再删**，否则中间有一段完全无覆盖的窗口。
+删完读回确认：三个区 `describe-metric-filters` 都查不到该名字、
+`describe-alarms` 查不到旧告警、且**查得到** CDK 建的那两条。
+
+**`SiteBuilder/M5` 里那个 `IamProbeDeleteMe` 指标是什么**：一次性 IAM 探测的产物
+（用 `sts:GetFederationToken` 带 rollup 那套策略验证过正/负权限，见下面 PITR 那节的
+同一条纪律）。值恒为 0，**没有任何告警读它**。CloudWatch **指标名无法删除**，
+约 15 个月后自然消失——所以看到它不是有东西坏了。
+
+### 数据表的时点恢复（PITR）：防的是"写坏"，不是"被删"
+
+四道保护各管一段，**互不重叠，别拿一个当另一个用**：
+
+| 机制 | 挡什么 | 挡不住什么 |
+|---|---|---|
+| `RemovalPolicy.RETAIN` | 删栈 / 资源被替换时 CloudFormation 不删表 | 一条 `aws dynamodb delete-table` |
+| `deletion_protection` | 直接调 `DeleteTable`（控制台、CLI、任何拿到该权限的脚本） | **写坏** |
+| TTL | 到期行自动消失 | **写坏** |
+| **PITR** | **写坏**——回到过去 35 天内任意一秒 | 表被删（PITR 随表一起消失） |
+
+**为什么这一轮必须补上**：`site-access-daily` 的 400 天趋势在明细 90 天 TTL 到期后
+**不可重建**（`infra/app.py` 自己就是这么声明的），而 rollup 的设计**就是反复覆盖同一
+批行**（连"归零对账"都会覆盖已存在的行）。一个跑错版本的 rollup、一个手工补跑脚本、
+或写入逻辑的一个缺陷，都能把没有第二份来源的历史改坏——而上面前三道**一道都拦不住**。
+
+覆盖范围（CDK 声明，`infra/app.py` 的 `_PITR`）：
+
+- **凡 `RETAIN` 的表都开**：`site-admins`、`site-ops-log`、`site-api-keys`、
+  `site-access-daily`。判据不是手抄的表名，而是**"设了 RETAIN"这个声明本身**
+  ——设 RETAIN 就等于宣布"这份数据不能丢"，那个宣布不该只在删表这条路径上成立。
+  `test_every_retained_table_has_pitr` 按模板里的 `DeletionPolicy` 推导，
+  **新增 RETAIN 表时自动被要求**（与紧邻的 deletion-protection 那条同一套推导）。
+- **明细表 `site-access-events` 也开**，尽管它是 `DESTROY`（90 天滚动、删栈可丢）：
+  它是聚合表的**重建来源**。模块 docstring 与 spec §0.1 用来否掉"日志侧聚合"的那条
+  属性是「只要明细还在，数就还能算回来」——那句话只在明细**自己没被写坏**时成立。
+
+⚠️ **两种资源类型的属性形状不同，断言必须读渲染后的模板**（实测）：
+
+- `AWS::DynamoDB::Table` → `PointInTimeRecoverySpecification` 在**顶层**；
+- `TableV2` 渲染成 `AWS::DynamoDB::GlobalTable` → 顶层**根本没有这个键**，
+  它在**每个 replica 里各一份**（CDK 的表级 prop 会分发到含主副本在内的全部 3 个）。
+
+拿 `Table` 那个形状去断言 GlobalTable 会永远查不到那个键 ⇒ **用例空转而两侧都"绿"**。
+所以那条按副本断言（`test_access_events_replicas_all_have_pitr`），并且要求**逐副本**
+——PITR 是按副本计费与恢复的，只在一个区开等于另两个区没有可回溯的点。
+
+**部署后必须读回**，不要拿 `StackStatus` 当证据：
+
+```bash
+for t in site-access-daily site-access-events site-admins site-ops-log site-api-keys; do
+  echo -n "$t: "
+  aws dynamodb describe-continuous-backups --table-name $t --region us-east-1 \
+    --query 'ContinuousBackupsDescription.PointInTimeRecoveryDescription.PointInTimeRecoveryStatus' \
+    --output text
+done
+# 明细表的副本要逐区查（PITR 按副本设）
+for r in ap-southeast-1 ap-northeast-1; do
+  echo -n "site-access-events@$r: "
+  aws dynamodb describe-continuous-backups --table-name site-access-events --region $r \
+    --query 'ContinuousBackupsDescription.PointInTimeRecoveryDescription.PointInTimeRecoveryStatus' \
+    --output text
+done
+```
+
+全部应为 `ENABLED`。**`site-deploy-jobs` 与 `site-sites` 目前没有开**（两者都是
+`DESTROY` 语义）。`site-sites` 值得单独评估一次——它存 `owner` / `allowed_users`，
+是**授权投影**，写坏的后果不是"数字不好看"而是"权限错了"；只是它能从各站点的
+部署记录部分重建，且不在本轮范围内。**这是一个明确留下的待决项，不是遗漏。**
 
 ---
 
@@ -1567,6 +1799,11 @@ RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/tes
 - [ ] admin 种子已注入（`seed_admin.py --apply`，在 ④ 之后）
 - [ ] `require_idp_claim = true` 且部署出去的 Edge 代码已核对（零占位符）
 - [ ] 登录失败告警由 `deploy_auth.py` 自动收敛（**不手工建**），且 `verify_auth_alarm.sh` 全绿（含声明收件人的 confirmed 订阅）
+- [ ] 两条埋点告警**由执行器栈部署出来**（`m5-rollup-no-successful-invocation-24h`
+      与 `m5-edge-analytics-failed-global`，**不手工建**），且阈值按**本环境实测流量**
+      重算过并写回文档（见「两条埋点可观测性告警」；起步值在低流量下会让告警永不触发）
+- [ ] 五张表的 PITR 读回全部 `ENABLED`（`describe-continuous-backups`，明细表要
+      **逐副本区**查），不拿 `StackStatus` 当证据（见「数据表的时点恢复」）
 - [ ] 自己走过一次真实登录，claim 值与 ① 的实测基线一致
 - [ ] （部署了 ⑤b 控制台时）`verify_console_e2e.py` 全绿，且在**真浏览器**里确认过
       `__Host-sb_console` 落盘：Path=/、**无 Domain=**、HttpOnly+Secure。
