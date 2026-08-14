@@ -664,18 +664,27 @@ def test_frontend_never_sets_origin_or_reads_cookie():
 # ── ⑦ 站点字段口径必须与 api._shape_site 一致 ──────────────────────────
 
 def _shape_site_fields() -> set[str]:
-    """从 api.py 的 _shape_site 解析它真实返回的字段名。"""
+    """从 api.py 解析后端**真实返回**的站点字段名。
+
+    **两个函数都要解析**：`_shape_site` 是列表与详情共用的形态，而
+    `do_list_sites` 在它之上多给一个 `pv7`（M5 Task 9b 的迷你趋势；只有列表
+    需要，详情页不为它多打两次 Query）。只解析 `_shape_site` 的话，列表独有的
+    字段会被判成"后端不返回"，前端读它就是误报——而误报会被当成"前端写错了"
+    去改前端。
+    """
     src = (PANEL / "api.py").read_text()
     tree = ast.parse(src)
-    fn = next(n for n in ast.walk(tree)
-              if isinstance(n, ast.FunctionDef) and n.name == "_shape_site")
     fields = set()
-    for node in ast.walk(fn):
-        if isinstance(node, ast.Dict):
-            for k in node.keys:
-                if isinstance(k, ast.Constant) and isinstance(k.value, str):
-                    fields.add(k.value)
-    assert fields, "解析 _shape_site 失败"
+    for name in ("_shape_site", "do_list_sites"):
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == name)
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Dict):
+                for k in node.keys:
+                    # `{**_shape_site(...), "pv7": ...}` 的展开项 key 是 None
+                    if isinstance(k, ast.Constant) and isinstance(k.value, str):
+                        fields.add(k.value)
+    assert fields, "解析 api.py 的站点形态失败"
     return fields
 
 
@@ -683,8 +692,9 @@ def test_frontend_only_reads_site_fields_the_backend_returns():
     """前端读的 site 字段必须是后端真给的。
 
     原型依赖 tier / pv7 / last_deploy / my_role / auth.require_login 等字段，
-    **sites 表里没有 tier，_shape_site 也不返回 pv7 / last_deploy**，
-    照搬会让页面显示 undefined。这条用例把口径钉在 _shape_site 上。
+    **sites 表里没有 tier，也不返回 last_deploy**，照搬会让页面显示 undefined。
+    这条用例把口径钉在 api.py 的真实返回形态上（`pv7` 从 M5 Task 9b 起是真有
+    的，由 `do_list_sites` 给——所以它在 `_shape_site_fields()` 里）。
     """
     backend = _shape_site_fields() | {"subdomain"}   # /api/sites/{id} 多这个
     blob = _js()
@@ -957,6 +967,13 @@ def test_all_interpolated_values_go_through_esc():
     SAFE_WRAPPERS = ("esc(", "fmt(", "dur(", "when(", "initials(",
                      "statusBadge(", "jobBadge(", "roleTag(", "phaseText(",
                      "avatarStack(", "policySummary(",
+                     # M5 Task 9b：`sparkline(item.pv7)` 的插值**全是数字**
+                     # （宽高、`.toFixed(1)` 的坐标、`fmt()` 过的总数），产不出
+                     # 调用方给的字符串。这条豁免不是白给的——
+                     # test_frontend_boot 的 `sites-list-hostile` 场景往 pv7 里
+                     # 塞可执行串真跑一遍，证明它渲染不出标签（同 toast/
+                     # openModal 那条：被豁免的前提必须自己被盯住）。
+                     "sparkline(",
                      # URL 段：进的是 href/fetch 路径，且本身就是编码函数
                      "encodeURIComponent(")
     # 前端自造、不含用户数据的片段（图标常量、已拼好的 HTML 变量、计数）
@@ -1490,3 +1507,16 @@ def test_globally_disabled_banner_text_exists_and_is_not_a_gate():
     assert not re.search(r"if\s*\([^)]*\benabled\b[^)]*\)\s*\{[^{}]*return",
                          _keys_blob(), re.S), (
         "有以 enabled 为条件的提前返回 —— 关闸不该让页面不可用")
+
+
+# ── ⑬ 站点列表的 PV 迷你趋势（二期 M5，Task 9b）──────────────────────────
+#
+# 这一节只有**源码存在性**这一条，它的分量有限：M5-FINDINGS §4.8 记的就是
+# "整文件存在性检查证不了正确性，还可能从写下那天起就是死的"。真正的判据在
+# test_frontend_boot 的 `sites-list*` 三个场景——那里真跑 siteCard + sparkline，
+# 断言全 0 时渲染不出 NaN、且 pv7 里的可执行串渲染不出标签。
+# 留着这一条是因为它便宜且指向明确（能直接说出"除零分支没了"）。
+
+def test_sparkline_handles_all_zero_without_dividing_by_zero():
+    blob = _js()
+    assert "max === 0" in blob, "sparkline 没处理全 0（会产出 NaN 坐标）"

@@ -115,7 +115,13 @@ def do_list_sites(email: str, *, all_sites: bool = False) -> list[dict]:
         sites = common._paginate(common._table("SITES_TABLE").scan)
     else:
         sites = common.list_sites_for_user(email)
-    return [_shape_site(s, email, viewer_is_admin=is_adm)
+    return [{**_shape_site(s, email, viewer_is_admin=is_adm),
+             # 站点列表的迷你趋势。**成本**：站点数 × 2 次分区 Query
+             # （日聚合表一次 + 今天的明细分区一次——`series()` 对今天恒走实时
+             # 计算，spec §3.5 的「1 次」少算了一次，且明细那次随**今天的访问量**
+             # 分页）。当前 31 个站点可接受。管理员全局视图同理——站点数长到
+             # 三位数时改批量或缓存，届时重评（spec §3.5 已记）。
+             "pv7": analytics.pv7(s["site_id"])}
             for s in sorted(sites, key=lambda s: s.get("created_at", ""),
                             reverse=True)]
 

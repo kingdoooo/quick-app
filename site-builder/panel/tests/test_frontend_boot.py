@@ -537,6 +537,152 @@ def test_harness_catches_the_empty_state_rendering_a_headers_only_table(tmp_path
         f"第二张表的 tbody 不是空的 —— 注入的退化形态与预期不同: {last!r}")
 
 
+# ── 站点列表的 PV 迷你趋势：真渲染一遍（M5 Task 9b）─────────────────────
+#
+# 静态侧只有一条 `"max === 0" in blob`。它便宜，但**证不了正确性**
+# （M5-FINDINGS §4.8）：那个字样在源码里，函数却可能压根没人调用；全 0 的站点
+# 真渲染出什么坐标，只有跑一遍才知道。这一组就是跑一遍。
+
+def _cards(scenario: str, app: Path | None = None) -> tuple[dict, str]:
+    out, last = _last_write(scenario, app)
+    assert "site-card" in last, (
+        f"最后一次渲染里没有站点卡片 —— 场景 {scenario} 空转了: {last[:300]!r}")
+    return out, last
+
+
+def _card_of(html: str, site_id: str) -> str:
+    """只取某一张卡片的 HTML。
+
+    不按 polyline 出现的顺序取：顺序对了也可能是"两张卡片画了同一份数据"，
+    而按 site_id 定位能让"标错卡片"这种缺陷显出来。
+    """
+    marker = 'href="#/sites/' + site_id + '"'
+    assert marker in html, f"渲染结果里没有 {site_id} 这张卡片"
+    return html.split(marker, 1)[1].split("</a>", 1)[0]
+
+
+COORD = re.compile(r"^\d+(?:\.\d+)?,\d+(?:\.\d+)?$")
+
+
+def _points(card: str) -> list[str]:
+    m = re.search(r'<polyline points="([^"]*)"', card)
+    assert m, f"这张卡片里没有 sparkline 的 polyline: {card[:300]!r}"
+    return m.group(1).split(" ")
+
+
+def test_site_list_draws_one_sparkline_per_card_from_pv7():
+    """正向：每张卡片一条趋势线，画的是 pv7 里的数（不是一条恒定平线）。"""
+    out, last = _cards("sites-list")
+    assert not out["errors"], f"站点列表渲染时抛异常: {out['errors']}"
+    assert last.count('class="spark"') == 2, (
+        f"两个站点却画了 {last.count('class=\"spark\"')} 条趋势线")
+    pts = _points(_card_of(last, "s-busy"))
+    assert len(pts) == 7, f"pv7 有 7 个点，画出来 {len(pts)} 个: {pts}"
+    ys = {p.split(",")[1] for p in pts}
+    assert len(ys) > 1, (
+        f"有访问量的站点画成了平线 —— 数据没进坐标: {pts}")
+    # 总数也要是真数（S_BUSY 之和 = 56），否则"画了线但读的是别的数组"看不出来
+    assert "近 7 天 56 PV" in _card_of(last, "s-busy"), (
+        f"卡片上的近 7 天总数不对: {_card_of(last, 's-busy')[-200:]!r}")
+
+
+def test_all_zero_pv7_renders_a_flat_line_not_nan_coordinates():
+    """**除零那条路径**：全 0 的站点必须画出一条合法的平线。
+
+    `max` 为 0 时 `v / max` 是 `0/0 = NaN`，`NaN.toFixed(1)` 是字符串 `'NaN'`
+    —— 它会原样进 `points` 属性，浏览器把整条 polyline 判为非法后**什么都不画**
+    （不是画错，是消失），而控制台里不会有任何报错。所以断言的是坐标本身合法，
+    不是"页面没崩"。
+    """
+    out, last = _cards("sites-list")
+    assert not out["errors"], f"全 0 的站点渲染时抛异常: {out['errors']}"
+    card = _card_of(last, "s-quiet")
+    pts = _points(card)
+    assert len(pts) == 7, f"全 0 的站点画出 {len(pts)} 个点: {pts}"
+    assert all(COORD.match(p) for p in pts), (
+        f"全 0 的站点产出了非法坐标（NaN / 空 / 残缺）: {pts}")
+    assert len({p.split(",")[1] for p in pts}) == 1, (
+        f"全 0 却不是平线: {pts}")
+    assert "近 7 天 0 PV" in card, (
+        "全 0 的卡片没有明说「0 PV」—— 0 次访问是一个事实，不该看起来像没数据")
+    assert "NaN" not in last, f"整页渲染里出现了 NaN: {last!r}"
+
+
+def test_sparkline_cannot_emit_a_string_its_caller_passed_in():
+    """`sparkline(` 被登记进 XSS 扫描的 SAFE_WRAPPERS —— 这里证明那条豁免成立。
+
+    不证明就是循环论证：静态扫描靠"这个函数产不出调用方的字符串"豁免了
+    `sparkline(item.pv7)` 这个插值点，那么这个前提本身必须被盯住（同
+    test_frontend_contract 里 toast/openModal 的那条）。
+
+    pv7 的值域由后端契约保证是整数，所以这一格**不是**真实攻击面的建模，而是
+    豁免前提的实证：塞一个可执行串进去，产物里不得出现标签。
+    """
+    _, last = _cards("sites-list-hostile")
+    assert "<img src=x" not in last, (
+        f"pv7 里的可执行串原样进了 innerHTML —— SAFE_WRAPPERS 那条豁免是错的: {last!r}")
+    # 正对照：串确实到达了 sparkline（被数字化成 NaN），不是"根本没渲染"
+    assert "近 7 天 NaN PV" in last, (
+        f"没看到被数字化的痕迹 —— 本用例可能空转（卡片没渲染）: {last[-400:]!r}")
+
+
+# ── 反向验证：把迷你趋势的三处实现分别改坏 ──────────────────────────────
+
+def test_harness_catches_removing_the_all_zero_guard(tmp_path):
+    """反向 ①：去掉 `max === 0` 分支 —— 全 0 的站点产出 NaN 坐标。
+
+    这条是上面那条行为断言的存在理由。静态侧那条 `"max === 0" in blob` 注入后
+    同样会红，但它红的是"字样不见了"；只有这条能说出**渲染结果**坏成了什么。
+    """
+    app = _mutated(tmp_path,
+                   "    var y = max === 0 ? h - 1 : h - 1 - (v / max) * (h - 2);",
+                   "    var y = h - 1 - (v / max) * (h - 2);")
+    _, last = _cards("sites-list", app)
+    pts = _points(_card_of(last, "s-quiet"))
+    assert not all(COORD.match(p) for p in pts), (
+        f"去掉除零分支后坐标居然还是合法的 —— 那条正向断言没盯住东西: {pts}")
+    assert "NaN" in last, f"预期出现 NaN 坐标，实际: {pts}"
+
+
+def test_harness_catches_the_card_never_calling_sparkline(tmp_path):
+    """反向 ②：`siteCard` 不再调 `sparkline` —— 函数还在，卡片上什么都没有。
+
+    这是"存在性检查从写下那天起就是死的"那个形态：静态侧的
+    `"max === 0" in blob` 在这个注入下**照样是绿的**（源码里那行还在），
+    而用户一条趋势线也看不到。
+
+    注入点带上整行而不是只写 `sparkline(item.pv7)`：那个片段在 app.js 里出现
+    两次（调用点，以及**说明它为什么必须留在这一行的那句注释**），而
+    `_mutated` 只替换第一处 —— 于是被改掉的是注释，页面照旧渲染，本用例第一版
+    因此假红。真实踩到过，写在这里以免有人"简化"回去。
+    """
+    app = _mutated(
+        tmp_path,
+        "'<div class=\"row\" style=\"margin-top:12px\">' + sparkline(item.pv7)",
+        "'<div class=\"row\" style=\"margin-top:12px\">' + ''")
+    _, last = _cards("sites-list", app)
+    assert 'class="spark"' not in last, (
+        "去掉调用之后页面上仍然有趋势线 —— 注入点没生效")
+    # 同时说明静态那条为什么不够：它在这个注入下仍然绿
+    assert "max === 0" in app.read_text(), (
+        "本注入不该动 sparkline 的实现（否则证不了静态断言的盲区）")
+
+
+def test_harness_catches_the_total_not_going_through_fmt(tmp_path):
+    """反向 ③：总数不过 `fmt()` —— pv7 里的字符串会原样进 innerHTML。
+
+    这条盯的是 SAFE_WRAPPERS 里 `sparkline(` 那条豁免的**唯一承重点**：
+    坐标经 `.toFixed(1)` 天然产不出字符串，而 `reduce` 的加法对字符串是拼接
+    （`0 + '<img …>'` 就是那个串）。所以豁免成立与否，全押在这个 fmt 上。
+    """
+    app = _mutated(tmp_path,
+                   "    fmt(pv7.reduce(function (a, b) { return a + b; }, 0)) +",
+                   "    pv7.reduce(function (a, b) { return a + b; }, 0) +")
+    _, last = _cards("sites-list-hostile", app)
+    assert "<img src=x" in last, (
+        "去掉 fmt 之后可执行串居然没进 HTML —— 那条豁免的证明用例是空转的")
+
+
 def test_harness_catches_the_tab_not_being_handed_the_site(tmp_path):
     """反向 ④：调用点退回 `renderAnalyticsTab(panel)` → 页面直接崩。
 

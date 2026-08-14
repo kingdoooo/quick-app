@@ -181,6 +181,15 @@ def series(site_id: str, period: str = "day", n: int = 30) -> list[dict]:
     return [buckets[k] for k in keys]      # 恒为 n 个，升序
 
 
+def pv7(site_id: str) -> list[int]:
+    """近 7 天的日 PV，升序，**长度恒为 7**（缺失日为 0）。
+
+    给站点列表画 sparkline 用（母 spec §11-clarify 的 M5 项）。直接复用
+    `series()`——它已经零填充且日历对齐，所以这里不做第二套取数逻辑。
+    """
+    return [b["pv"] for b in series(site_id, "day", 7)]
+
+
 def _encode(key: dict) -> str:
     return base64.urlsafe_b64encode(json.dumps(key).encode()).decode()
 

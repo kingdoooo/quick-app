@@ -558,6 +558,31 @@ function bindSearch(sel, setter, rerender) {
   });
 }
 
+/* 站点列表的 PV 迷你趋势。pv7 长度恒为 7（后端契约），所以不做长度兜底；
+ * 全 0 时画平线——不能除零，也不该画成"没有数据"（0 次访问是一个事实）。
+ *
+ * 插值全是**数字**（宽高、坐标、总数），没有一处能承载调用方给的字符串：
+ * 坐标经 `.toFixed(1)`（非数字入参 → 'NaN'，注不进 HTML），总数经 `fmt()`
+ * （`Number(n).toLocaleString()` 同理）。这不是顺手写的：前端契约测试的 XSS
+ * 扫描把 `sparkline(` 登记进了 SAFE_WRAPPERS 白名单，而那条豁免只有在"本函数
+ * 确实产不出调用方的字符串"时才成立（boot harness 的 sites-list-hostile 场景
+ * 真塞一个可执行串进来盯着它）。改这个函数时，任何新插值要么是数字、
+ * 要么必须过 esc()。 */
+function sparkline(pv7) {
+  var max = Math.max.apply(null, pv7);
+  var h = 18, w = 56, step = w / (pv7.length - 1);
+  var pts = pv7.map(function (v, i) {
+    var y = max === 0 ? h - 1 : h - 1 - (v / max) * (h - 2);
+    return (i * step).toFixed(1) + ',' + y.toFixed(1);
+  }).join(' ');
+  return '<svg class="spark" width="' + w + '" height="' + h +
+    '" viewBox="0 0 ' + w + ' ' + h + '" aria-hidden="true">' +
+    '<polyline points="' + pts + '" fill="none" stroke="currentColor" ' +
+    'stroke-width="1.5" stroke-linejoin="round"/></svg>' +
+    '<span class="meta" style="margin-left:6px">近 7 天 ' +
+    fmt(pv7.reduce(function (a, b) { return a + b; }, 0)) + ' PV</span>';
+}
+
 function siteCard(item) {
   return '<a class="site-card" href="#/sites/' + esc(item.site_id) + '">' +
     '<div class="row-between" style="align-items:flex-start">' +
@@ -570,6 +595,11 @@ function siteCard(item) {
       roleTag(item.role) +
       '<span class="tag tag-role">' + esc(policySummary(item)) + '</span>' +
     '</div>' +
+    /* 迷你趋势自己一行（不塞进下面那条 `spark-row`）：那一行是
+     * `space-between` 的两栏，硬挤第三栏在三列网格里会溢出。
+     * **`sparkline(item.pv7)` 必须留在这条带标签的行上**——XSS 扫描只查
+     * "在拼 HTML 的行"，挪到一条没有 `<` 的行上会让它静默出了覆盖面。 */
+    '<div class="row" style="margin-top:12px">' + sparkline(item.pv7) + '</div>' +
     '<div class="spark-row"><div><div class="meta">创建时间</div>' +
       '<div class="mono" style="font-size:12.5px">' + esc(when(item.created_at)) + '</div></div>' +
       '<div style="text-align:right"><div class="meta">协作者</div>' +

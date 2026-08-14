@@ -44,3 +44,15 @@ def test_owner_may_read_both_endpoints(monkeypatch, aws):
     assert "series" in api.do_get_analytics("me@x.co", "s1", period="day", n=7)
     assert "rows" in api.do_get_visitors("me@x.co", "s1", days=7, limit=10,
                                          cursor=None)
+
+
+def test_list_sites_carries_pv7(monkeypatch, aws):
+    """站点列表的迷你趋势（母 spec §11-clarify 的 M5 项）。"""
+    import api
+    import permissions
+    monkeypatch.setattr("common.list_sites_for_user",
+                        lambda e: [{"site_id": "s1", "owner": e,
+                                    "status": "ACTIVE", "collaborators": []}])
+    monkeypatch.setattr(permissions, "is_admin", lambda e: False)
+    out = api.do_list_sites("me@x.co")
+    assert len(out[0]["pv7"]) == 7, out[0]

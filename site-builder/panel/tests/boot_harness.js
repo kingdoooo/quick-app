@@ -110,11 +110,48 @@ const ANALYTICS_SCENARIOS = {
 };
 const ACASE = ANALYTICS_SCENARIOS[SCENARIO] || null;
 
+/* ── 站点列表的 PV 迷你趋势（M5 Task 9b）──────────────────────────────
+ *
+ * 为什么必须真跑：`sparkline()` 与 siteCard 里调用它那一行，在**任何地方都没
+ * 有执行过**——既有场景里 `/api/sites` 返回的是空列表，走的是 emptyState()，
+ * 一张卡片都不渲染。而这个函数里恰好有一条除零分支，静态断言只能查源码里有
+ * 没有 `max === 0` 这个字样（M5-FINDINGS §4.8：整文件存在性检查证不了正确性，
+ * 而且可能从写下那天起就是死的）。
+ *
+ * 夹具分工：
+ *   · `s-busy` 有真实访问量 —— 证明画出来的是数据，不是一条恒定平线；
+ *   · `s-quiet` 全 0 —— 走除零分支，产物里不得出现 NaN 或残缺坐标；
+ *   · hostile 单开一个场景 —— 它的产物**故意**含 NaN（可执行串被数字化了），
+ *     和上面混在一起会让"不得出现 NaN"那条断言没法写。 */
+const S_ZERO = [0, 0, 0, 0, 0, 0, 0];
+const S_BUSY = [0, 3, 12, 7, 0, 25, 9];
+
+function siteRow(id, name, pv7) {
+  return { site_id: id, name: name, status: 'ACTIVE',
+           url: 'https://app-' + id + '.example.com',
+           owner: 'probe@example.com', created_at: '2026-08-01T00:00:00',
+           require_login: true, allowed_users: 'org', collaborators: [],
+           ever_live: true, role: 'owner', pv7: pv7 };
+}
+
+/* pv7 的值域由后端契约保证是整数（`analytics.pv7` 逐项 `int(pv)`），所以这一格
+ * **不是**对真实攻击面的建模，而是一条豁免的证明：test_frontend_contract 的
+ * XSS 扫描把 `sparkline(` 登记进了 SAFE_WRAPPERS，那条豁免的前提是"本函数产不
+ * 出调用方给的字符串"。塞一个可执行串进去真跑一遍，是这个前提唯一的实证
+ * （同 toast/openModal 的那条：被豁免者自己必须被盯住）。 */
+const S_HOSTILE = ['<img src=x onerror=alert(1)>', 0, 0, 0, 0, 0, 0];
+const SITE_SCENARIOS = {
+  'sites-list': [siteRow('s-busy', '有访问量的站', S_BUSY),
+                 siteRow('s-quiet', '零访问的站', S_ZERO)],
+  'sites-list-hostile': [siteRow('s-busy', '有访问量的站', S_HOSTILE)],
+};
+const SCASE = SITE_SCENARIOS[SCENARIO] || null;
+
 /* Key / analytics 场景要直接落在自己的路由上，且不能被"先去升级面板会话"
  * 截住——所以预置一个**新鲜的**升级标记。键名必须是 app.js 的 UPGRADE_MARK
  * （`sb_console_upgraded_at`）：写错的话 boot 会跳去 /console-session 然后
  * return，场景退化成 first-visit，那一组用例全部静默空转。 */
-const localSeed = (KEYCASE || ACASE)
+const localSeed = (KEYCASE || ACASE || SCASE)
   ? new Map([['sb_console_upgraded_at', String(Date.now())]])
   : new Map();
 
@@ -190,7 +227,9 @@ global.sessionStorage = store(sessionSeed);
 global.confirm = () => true;
 
 const loc = {
-  _hash: KEYCASE ? '#/keys' : ACASE ? '#/sites/' + A_SITE_ID + '/analytics' : '',
+  _hash: KEYCASE ? '#/keys'
+    : ACASE ? '#/sites/' + A_SITE_ID + '/analytics'
+      : SCASE ? '#/sites' : '',
   hostname: 'console.app.example.com',
   protocol: 'https:',
   origin: 'https://console.app.example.com',
@@ -249,6 +288,12 @@ function responseFor(u) {
     return { rows: ACASE && ACASE.rows === 'none' ? [] : A_ROWS, next: null };
   }
   if (u.includes('/jobs')) return { jobs: A_JOBS };
+  /* 列表端点要**精确**匹配（结尾或带查询串），不能用 includes('/api/sites')：
+   * 那会把 `/api/sites/{id}` 也吞掉，站点详情页拿到一个列表响应体，页面渲染成
+   * 空壳而用例照样"跑通了"。 */
+  if (SCASE && (u.endsWith('/api/sites') || u.includes('/api/sites?'))) {
+    return { sites: SCASE };
+  }
   if (u.includes('/api/sites/' + A_SITE_ID)) return A_SITE;
   return { email: 'probe@example.com', name: 'P',
            is_admin: false, sites: [], jobs: [], admins: [] };

@@ -147,6 +147,24 @@ def test_last_bucket_is_the_current_in_progress_one(env):
     assert analytics.series("s1", "day", 3)[-1]["bucket"] == today.isoformat()
 
 
+def test_pv7_is_always_seven_numbers_oldest_first(env):
+    """长度恒为 7 且零填充——前端 sparkline 依赖固定长度，缺失日给 0 不是给空。"""
+    import analytics
+    from datetime import datetime, timedelta, timezone
+    y = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+    _daily(env, "s1", y, pv=5, uv=2)
+    out = analytics.pv7("s1")
+    assert isinstance(out, list) and len(out) == 7, out
+    assert all(isinstance(x, int) for x in out), out
+    assert out[-2] == 5, f"倒数第二个应是昨天的 5: {out}"
+    assert out[-1] == 0, f"最后一个是今天（本轮无数据）: {out}"
+
+
+def test_pv7_of_a_site_without_data_is_seven_zeros(env):
+    import analytics
+    assert analytics.pv7("never-visited") == [0] * 7
+
+
 def test_visitors_returns_rows_with_decision_and_paginates(env):
     import analytics
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
