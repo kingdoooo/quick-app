@@ -6,7 +6,7 @@
 "部署产物 == 本地源码"这件事只能有一个脚本回答。**旧名不留 shim**：两个入口
 会让人只跑其中一个，而漏掉的那个正好是没覆盖的层。
 
-八段（缺一不可）：
+九段（缺一不可）：
   ① 合同 scanner 的真实项目风格判定——合规写法一个都不能误拦；
   ② 已知绕过与真违规一个都不能放过；
      （①② 是纯本地判定，--local 时只跑这两段。x-user-name 那条红线进过
@@ -27,6 +27,18 @@
      `PLATFORM_SUBDOMAINS` 里** + 网关 allowedClients/allowlist 与容器
      `MACHINE_CLIENT_ID` **同开同关** + 哨兵行的 `enabled` 是**布尔**
      + role 对凭证表没有 `PutItem`/`DeleteItem`/`Scan`。
+  ⑨ 线上 M5 统计管道：明细表的**真实副本区集合 == `router/config.ini` 的清单**
+     + 每个副本 ACTIVE + 聚合表开着 deletion protection + Edge 角色对明细表
+     **有且只有 PutItem 且资源逐字覆盖每个副本区** + 无写扩权 + rollup 规则
+     ENABLED / cron / target 是 rollup 函数。
+
+**⑨ 为什么只能在真机上验**：副本清单有三条腿，而它们分处两个包——router 栈
+给 edge_role 的 PutItem 资源集合与 Edge 代码的 `ACCESS_REPLICA_REGIONS` 都从
+`router/config.ini` 推导，而 deployer 栈 `TableV2` 的 replicas 被
+`deployer/tests/test_infra_tables.py` 钉在一份**字面量**上，它看不见
+`router/config.ini`。往清单里加一个区，**两个包的单测都还是绿的**，而 Edge 在
+往一个不存在的副本写——埋点的写失败是**有意吞掉**的，那个区于是静默零数据。
+`describe_table` 读回的真实 `Replicas` 是这件事的唯一闸门。
 
 **⑤⑧ 的进包清单为什么必须"推导"而不是手抄**（Task 1 审查的 Minor 2）：
 两段各自硬编码一份模块名清单时，每加一个共享模块就多漏一个——`edge_caller.py`
@@ -39,7 +51,7 @@
 提交之前；auth 的 SSM TTL 修复在仓库里躺了两天没上线。
 
 用法：
-    ./verify_deployed_components.py           # 全部八段
+    ./verify_deployed_components.py           # 全部九段
     ./verify_deployed_components.py --local   # 只跑 ①②（无 AWS 凭证时）
 """
 import argparse
@@ -71,6 +83,10 @@ MIN_KEY_PROXY_CHECKS = 23
 # 无 [ApiKey] 段时改跑 absence 断言（Codex P1-3）：Lambda / route / 开关 /
 # allowedClients / allowlist 五条。**不是 SKIP**——见 _verify_component_is_absent。
 MIN_KEY_PROXY_ABSENT_CHECKS = 5
+# ⑨ M5 统计管道：清单 1 + 明细表 3（存在/副本集合/副本 ACTIVE）+ 聚合表 1 +
+# Edge 角色 4（读到策略/只有 PutItem/资源逐字/无扩权）+ rollup 规则 3
+# （ENABLED/cron/target）= 12。**无条件计入**——M5 不是可选组件。
+MIN_ANALYTICS_CHECKS = 12
 # 实际下限由 main() 按"这次真跑了哪几段"累加，finally 里读它。初值是本地那部分
 # ——main() 之前就崩掉时走的是 crashed 分支，不靠这个值。
 min_expected = MIN_LOCAL_CHECKS
@@ -1120,6 +1136,202 @@ def run_key_proxy() -> int:
     return MIN_KEY_PROXY_CHECKS
 
 
+def _describe_table_or_none(ddb, table: str):
+    """`describe_table`，表不存在时返回 None **而不是把异常抛出去**。
+
+    ⑨ 段里最能抓东西的是 Edge 角色那几条（本仓唯一看得见跨包副本漂移的地方），
+    而它们排在这几个 describe 之后。任何一个 describe 抛出去都会中断整段——于是
+    "deployer 栈还没部署这一版 / 正在分步部署"这种**部分部署**中间态下，真正要看
+    的那几条一条也不跑，而部分部署恰好是 DEPLOY.md 那套分步流程的正常中间态。
+    表不存在时照样落 FAIL，段内检查数不变（下限还数得准）。
+    """
+    try:
+        return ddb.describe_table(TableName=table)["Table"]
+    except ddb.exceptions.ResourceNotFoundException:
+        return None
+
+
+def _mask_account(text: str) -> str:
+    """把 12 位账号 ID 换成 `<acct>`。
+
+    ⑨ 段的失败文案里带 ARN，而这些输出会被贴进 findings / 交接文档 / 审查报告。
+    账号 ID 不该跟着走——git 历史已经清洗过一次真实账号值。
+    """
+    import re as _re
+    return _re.sub(r"\d{12}", "<acct>", text)
+
+
+def run_analytics() -> int:
+    """⑨ M5 统计管道的线上形态。返回本段承诺的最小检查数。
+
+    **别拿 CFN 的 StackStatus 当结论**（M4-FINDINGS §3.13）——直接
+    `describe_table` 读回 `Replicas` / `DeletionProtectionEnabled`，那才是被改的
+    那个属性。栈状态 UPDATE_COMPLETE 只说明"上一次部署的模板收敛了"。
+
+    这一段扛的是模块 docstring 里 ⑨ 那段说的事：副本清单的三条腿分处两个包，
+    加一个区时两个包的单测都还是绿的，而 Edge 往不存在的副本写、失败被埋点吞掉。
+    """
+    import boto3
+
+    print("\n── ⑨ 线上 M5 统计管道 ──────────────────────────────")
+    region = read_cfg("Platform", "region")
+    # `_parsed_cfg` 读不到任何段就当场炸，不返回空配置（M4-FINDINGS §3.10）：
+    # 否则"cwd 漂了"与"配置里真没这一段"在下游是同一个症状。
+    rcfg = _parsed_cfg(ROUTER_CFG_PATH)
+    # **清单从 router/config.ini 推导，不在这里手抄第二份**：手抄的清单每加一个
+    # 区就漏一个，而漏掉的那个区正是静默零数据的那个（M4-FINDINGS §3.9）。
+    # 顺带把行内注释切掉（configparser 默认保留它）——`stack.py` 拼 ARN 时只
+    # `.strip()`，所以配置里真带了注释时线上 ARN 会**带着注释**，与这里推导出的
+    # 干净值不等 ⇒ 下面那条逐字断言会响亮地红，而不是两边一起被污染后假绿。
+    table = rcfg["SiteBuilder"]["access_table"].split("#")[0].split(";")[0].strip()
+    regions = [r.strip() for r in
+               rcfg["SiteBuilder"]["access_replica_regions"]
+               .split("#")[0].split(";")[0].split(",") if r.strip()]
+    check(len(regions) >= 2, f"副本清单至少主区+1（{len(regions)} 个）", str(regions))
+
+    d = boto3.client("dynamodb", region_name=region)
+    desc = _describe_table_or_none(d, table)
+    check(desc is not None and desc["TableStatus"] == "ACTIVE",
+          f"{table} 存在且 ACTIVE",
+          "**表不存在**——deployer 栈还没部署这一版" if desc is None
+          else desc["TableStatus"])
+    # 用**并集**写法：`Replicas` 里是否包含被查询的那个区取决于 API 行为，
+    # CFN 模板里它**是包含主区的**（2026-08-14 synth 实测
+    # ['ap-southeast-1','ap-northeast-1','us-east-1']），而 DescribeTable 的
+    # 运行时行为本轮未实测——并集对两种行为都成立。主区补 ACTIVE 的依据是
+    # describe 本身在主区成功返回了。
+    live = {r["RegionName"]: r.get("ReplicaStatus", "?")
+            for r in (desc or {}).get("Replicas", [])}
+    if desc is not None:
+        live.setdefault(region, "ACTIVE")
+    missing, unexpected = set(regions) - set(live), set(live) - set(regions)
+    check(bool(live) and not missing and not unexpected,
+          f"副本区集合 == 清单（{sorted(regions)}）",
+          f"线上 {sorted(live)}"
+          + (f"；清单有而线上无 {sorted(missing)} —— Edge 会往不存在的副本写，"
+             "AccessDenied 被埋点吞掉 = 该区静默零数据" if missing else "")
+          + (f"；线上有而清单无 {sorted(unexpected)} —— Edge 不会写它，"
+             "白付跨区复制的钱" if unexpected else ""))
+    # `all()` 对空集合是真——先断言读到了副本（M5-FINDINGS §4.5）
+    check(bool(live) and all(v == "ACTIVE" for v in live.values()),
+          "每个副本都是 ACTIVE", str(live) if live else "一个副本都读不到")
+
+    # 聚合表名在本仓各处都是字面量（deployer 栈 / deploy_panel / deploy_agentcore
+    # 都写死它），没有 config 键可推导——这里跟着写字面量。
+    daily = _describe_table_or_none(d, "site-access-daily")
+    check((daily or {}).get("DeletionProtectionEnabled") is True,
+          "site-access-daily 开着 deletion protection",
+          "**表不存在**——deployer 栈还没部署这一版" if daily is None
+          else f"{daily.get('DeletionProtectionEnabled')!r}"
+               + ("" if daily.get("DeletionProtectionEnabled") is True
+                  else " —— 400 天趋势一旦删掉不可重建（明细只活 90 天）"))
+
+    # Edge 角色：有且只有明细表的 PutItem，**且资源逐字覆盖每个副本区**。
+    # 只累计 action 的写法恰好漏掉它声称要防的东西：只给 us-east-1 一个 ARN 时
+    # action 仍然是 PutItem、闸门绿灯，而两个亚洲区写入 AccessDenied 后被
+    # `_record_access` 吞掉 ⇒ 按实测流量分布 **96.1% 的数据静默缺失**。
+    # 也**必须读 attached policies**：只读 inline 时，把语句搬进托管策略即绕过。
+    #
+    # 角色名取自 site-builder/config.ini 的 `[Deployer] edge_role_arn`——与
+    # `_check_edge_role_id_env` 和 ⑤⑧ 的 Principal 断言同一个来源。
+    # **不用 router/config.ini 的 `[Lambda] execution_role_name`**：那个键与线上
+    # Edge 角色无关（角色由 CDK 生成名字，实测线上叫
+    # `ApplicationWebRouterStack-EdgeFunctionRole…`），拿它去 list_role_policies
+    # 得到的是 NoSuchEntity——闸门会红，但红的理由是假的。
+    iam = boto3.client("iam")
+    edge_role = read_cfg("Deployer", "edge_role_arn").rsplit("/", 1)[-1]
+    # 账号取 router 的 `[AWS] account_id`：`stack.py` 拼这几个 ARN 用的就是它
+    # （见那里 Codex P2-4 的注释），拿别处的值比等于比一个不同的真源。
+    account = rcfg["AWS"]["account_id"].split("#")[0].split(";")[0].strip()
+    docs, n_attached = [], 0
+    try:
+        for name in iam.list_role_policies(RoleName=edge_role)["PolicyNames"]:
+            docs.append(iam.get_role_policy(RoleName=edge_role,
+                                            PolicyName=name)["PolicyDocument"])
+        attached = iam.list_attached_role_policies(
+            RoleName=edge_role)["AttachedPolicies"]
+        n_attached = len(attached)
+        for pol in attached:
+            meta = iam.get_policy(PolicyArn=pol["PolicyArn"])["Policy"]
+            docs.append(iam.get_policy_version(
+                PolicyArn=pol["PolicyArn"],
+                VersionId=meta["DefaultVersionId"])["PolicyVersion"]["Document"])
+    except iam.exceptions.NoSuchEntityException as exc:
+        print(f"  （Edge 角色 {edge_role} 的策略读到一半就没了: {exc}）")
+    check(bool(docs), "读到了 Edge 角色的策略（inline + attached）",
+          f"inline={len(docs) - n_attached} attached={n_attached}")
+
+    # 出现在**任何资源**上都算扩权的动作。PutItem 不在这里——它在那三个明细表
+    # ARN 上正是期望值，只有落在宽资源（`*` / `…:table/*`）上才算扩权。
+    BROAD_WRITE = {"dynamodb:UpdateItem", "dynamodb:DeleteItem",
+                   "dynamodb:BatchWriteItem", "dynamodb:*", "*"}
+    put_arns, acts_on_table, extra = set(), set(), set()
+    for doc in docs:
+        stmts = doc.get("Statement", [])
+        for st in (stmts if isinstance(stmts, list) else [stmts]):
+            # 只数 Allow。**这一段查不出显式 Deny**（真机上 Deny 掉明细表的
+            # PutItem 会让埋点全挂而这里照样绿）——那件事由 Task 14 的
+            # verify_analytics_e2e.py 真写一行来兜。
+            if st.get("Effect") != "Allow":
+                continue
+            acts = st.get("Action", [])
+            acts = {str(a) for a in (acts if isinstance(acts, list) else [acts])}
+            # `*` 也要进来：挂一个 AdministratorAccess 上去时 action 是 `*`，
+            # 不是 `dynamodb:` 前缀，只按前缀过滤会把它整条跳过。
+            if not any(a.startswith("dynamodb:") or a == "*" for a in acts):
+                continue
+            res = st.get("Resource", [])
+            res = [str(r) for r in (res if isinstance(res, list) else [res])]
+            hit = {r for r in res if f"table/{table}" in r}
+            if hit:
+                acts_on_table |= acts
+                if "dynamodb:PutItem" in acts:
+                    put_arns |= hit
+            extra |= acts & BROAD_WRITE
+            if any(r == "*" or r.endswith(":table/*") for r in res):
+                extra |= acts & {"dynamodb:PutItem"}
+    check(acts_on_table == {"dynamodb:PutItem"},
+          "Edge 角色对明细表**有且只有** PutItem",
+          str(sorted(acts_on_table))
+          + (" —— 一条都没有：Edge 的埋点全部 AccessDenied 后被吞掉"
+             if not acts_on_table else ""))
+    expected_arns = {f"arn:aws:dynamodb:{rg}:{account}:table/{table}"
+                     for rg in regions}
+    check(put_arns == expected_arns,
+          f"PutItem 资源**逐字**覆盖全部 {len(regions)} 个副本区",
+          _mask_account(f"缺 {sorted(expected_arns - put_arns)} / "
+                        f"多 {sorted(put_arns - expected_arns)}"))
+    check(not extra, "Edge 角色没有任何 DynamoDB 写扩权动作", str(sorted(extra)))
+
+    ev = boto3.client("events", region_name=region)
+    rule_name = "site-access-rollup-daily"
+    try:
+        rule = ev.describe_rule(Name=rule_name)
+        targets = ev.list_targets_by_rule(Rule=rule_name)["Targets"]
+    except ev.exceptions.ResourceNotFoundException:
+        rule, targets = {}, []
+    check(rule.get("State") == "ENABLED", f"{rule_name} 规则 ENABLED",
+          rule.get("State", "**规则不存在**——deployer 栈还没部署这一版"))
+    check(rule.get("ScheduleExpression") == "cron(20 0 * * ? *)",
+          "rollup 每日 00:20 UTC",
+          str(rule.get("ScheduleExpression", "规则不存在")))
+    # **ENABLED + cron 正确 + 零个 target 是个完全合法的 EventBridge 规则**：
+    # 它每天准点触发、什么也不做。聚合表于是停在最后一次成功那天，而控制台只会
+    # 显示一条越来越旧的趋势线——没有报错、没有告警、`describe_rule` 全绿。
+    lam = boto3.client("lambda", region_name=region)
+    try:
+        rollup_arn = lam.get_function_configuration(
+            FunctionName="site-access-rollup")["FunctionArn"]
+    except lam.exceptions.ResourceNotFoundException:
+        rollup_arn = ""
+    got = {str(t.get("Arn", "")) for t in targets}
+    check(bool(rollup_arn) and got == {rollup_arn},
+          f"{rule_name} 的 target 恰好是 site-access-rollup 函数",
+          "**site-access-rollup 函数不存在**" if not rollup_arn
+          else _mask_account(f"target={sorted(got)}"))
+    return MIN_ANALYTICS_CHECKS
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--local", action="store_true",
@@ -1135,6 +1347,8 @@ def main() -> int:
         min_expected += MIN_DEPLOYED_CHECKS
         # ⑧ 只在组件启用时计入下限（返回值就是它承诺的最小项数）
         min_expected += run_key_proxy()
+        # ⑨ 无条件计入：M5 统计管道不是可选组件
+        min_expected += run_analytics()
     return 0
 
 
