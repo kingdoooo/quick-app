@@ -47,6 +47,10 @@ ROUTES = [
     ("GET", re.compile(r"^/api/sites$")),
     ("GET", re.compile(rf"^/api/sites/{_SITE}$")),
     ("GET", re.compile(rf"^/api/sites/{_SITE}/jobs$")),
+    # M5：两个读端点。GET ⇒ 自动免 CSRF 与面板会话（READ_ONLY），
+    # 授权走 api 层的 view_analytics。
+    ("GET", re.compile(rf"^/api/sites/{_SITE}/analytics$")),
+    ("GET", re.compile(rf"^/api/sites/{_SITE}/visitors$")),
     ("PUT", re.compile(rf"^/api/sites/{_SITE}/permissions$")),
     ("PUT", re.compile(rf"^/api/sites/{_SITE}/collaborators$")),
     ("PUT", re.compile(rf"^/api/sites/{_SITE}/owner$")),
@@ -68,6 +72,8 @@ ROUTES = [
     ("GET", re.compile(r"^/api/session-callback$")),
 ]
 CALLBACK = r"^/api/session-callback$"
+ANALYTICS = rf"^/api/sites/{_SITE}/analytics$"
+VISITORS = rf"^/api/sites/{_SITE}/visitors$"
 KEYS = r"^/api/keys$"
 KEY_REVOKE = r"^/api/keys/revoke$"
 ADMIN_REMOVE = r"^/api/admins/remove$"
@@ -235,6 +241,15 @@ def _dispatch(pattern, method, email, name, site_id, qs, body):
         return {"sites": api.do_list_sites(email, all_sites=qs.get("all") == "1")}
     if pattern.endswith(r"/jobs$"):
         return {"jobs": api.do_list_jobs(email, site_id)}
+    if pattern == ANALYTICS:
+        return api.do_get_analytics(email, site_id,
+                                    period=qs.get("period", "day"),
+                                    n=int(qs.get("n", 30)))
+    if pattern == VISITORS:
+        return api.do_get_visitors(email, site_id,
+                                   days=int(qs.get("days", 7)),
+                                   limit=int(qs.get("limit", 50)),
+                                   cursor=qs.get("cursor") or None)
     if pattern == rf"^/api/sites/{_SITE}$":
         return api.do_get_site(email, site_id)
     if pattern.endswith(r"/permissions$"):

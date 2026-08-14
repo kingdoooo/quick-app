@@ -805,3 +805,25 @@ def test_revoke_and_admin_remove_are_post_routes():
     assert ("POST", r"^/api/keys/revoke$") in routes
     assert ("POST", r"^/api/admins/remove$") in routes
     assert "POST" in console_session.WRITE_METHODS
+
+
+def test_analytics_routes_are_registered_and_read_only():
+    """两个新端点必须是 GET（写路径才需要 CSRF + 面板会话）。"""
+    import handler
+    pats = {(m, rx.pattern) for m, rx in handler.ROUTES}
+    assert ("GET", r"^/api/sites/(?P<site_id>[a-z][a-z0-9-]{1,63})/analytics$") in pats
+    assert ("GET", r"^/api/sites/(?P<site_id>[a-z][a-z0-9-]{1,63})/visitors$") in pats
+
+
+def test_every_route_still_has_a_dispatch_branch():
+    """加了 ROUTES 忘了加分发 = 500。这条盯着两个新端点。"""
+    import handler
+    for m, rx in handler.ROUTES:
+        if rx.pattern == handler.CALLBACK:
+            continue
+        try:
+            handler._dispatch(rx.pattern, m, "me@x.co", "me", "s1", {}, {})
+        except RuntimeError as e:
+            assert "路由已匹配但未分发" not in str(e), f"{m} {rx.pattern} 没有分发分支"
+        except Exception:
+            pass          # 其它异常（权限/表不存在）说明分支存在，本条不关心

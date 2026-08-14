@@ -20,6 +20,7 @@ from datetime import datetime
 
 import boto3
 
+import analytics
 import common
 import keystore
 import permissions
@@ -363,3 +364,29 @@ def do_set_key_switch(email: str, *, enabled: bool) -> dict:
     _require_admin(email)
     keystore.set_switch(enabled, actor=email)
     return {"deployed": True, "enabled": enabled}
+
+
+# ----------------------------------------------------------------- 访问统计
+# 表访问 100% 经 analytics.py（同上面两节对 sites 表与 api-keys 表的既有约束）：
+# 本文件不出现 site-access-events / site-access-daily 的表名，也不自己分桶——
+# pv/uv 的口径只有 access_rollup.day_stats 一份，analytics.py import 它。
+
+def do_get_analytics(email: str, site_id: str, *, period: str = "day",
+                     n: int = 30) -> dict:
+    """PV/UV 时间序列。`uv_exact=False` 的桶其 `uv` 为 null（analytics 模块的
+    契约），前端要显式标注而不是显示 0。"""
+    site = common.get_site_consistent(site_id)
+    permissions.assert_can(email, site, "view_analytics",
+                           is_admin=permissions.is_admin(email),
+                           what=f"站点 {site_id} 的访问统计")
+    return {"period": period, "series": analytics.series(site_id, period, n)}
+
+
+def do_get_visitors(email: str, site_id: str, *, days: int = 7,
+                    limit: int = 50, cursor: str | None = None) -> dict:
+    """访问明细/审计（含被拒记录）。"""
+    site = common.get_site_consistent(site_id)
+    permissions.assert_can(email, site, "view_analytics",
+                           is_admin=permissions.is_admin(email),
+                           what=f"站点 {site_id} 的访问明细")
+    return analytics.visitors(site_id, days=days, limit=limit, cursor=cursor)

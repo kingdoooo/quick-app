@@ -67,12 +67,18 @@ RUNTIME = "python3.13"
 #                                 碰这张表）。漏了它 api.py 顶层 import 就失败，
 #                                 **所有**控制台 API 500——不只 Key 相关的
 #   keygen.py                  —— keystore.py import 它（明文/哈希的唯一算法）
+#   analytics.py               —— 访问统计的唯一读取层（二期 M5）。api.py 同样是
+#                                 **顶层** import，所以漏它 = 所有控制台 API 500
+#   access_rollup.py           —— analytics.py import 它的 day_stats（pv/uv 口径的
+#                                 唯一定义）。两份会漂移成"今天的数与历史曲线口径
+#                                 不同"，所以读取层不重写、直接 import
 # 全部从 `deployer/functions/` 取（`_build_zip` 的两级查找会命中第一级）。
 # 漏任何一个都是"单测全绿、部署后 ImportError"，由
 # test_copy_files_covers_every_local_module_panel_imports 按传递闭包核对——
 # **清单以那条断言为准**，不要照着记性加减（本清单曾经漏过 keystore.py）。
 COPY_FILES = ("common.py", "permissions.py", "ops_log.py", "session.py",
-              "edge_caller.py", "keystore.py", "keygen.py")
+              "edge_caller.py", "keystore.py", "keygen.py",
+              "analytics.py", "access_rollup.py")
 
 
 def _region() -> str:
@@ -228,6 +234,15 @@ def role_statements() -> list[dict]:
          "Action": ["dynamodb:GetItem", "dynamodb:PutItem",
                     "dynamodb:UpdateItem", "dynamodb:Query"],
          "Resource": [f"{tbl}/site-api-keys", f"{tbl}/site-api-keys/index/*"]},
+        # 二期 M5：analytics.py 只对这两张表做 Query（明细按 site_date 分区、
+        # 聚合按 site_id + date 区间），**没有任何写权限**——读取层不该能改数，
+        # 明细的唯一写入者是 Edge、聚合的唯一写入者是 rollup Lambda。
+        # 也**不给 Scan**：Scan 能跨站点读出别人站点的访问明细（含邮箱），而
+        # 本层的每个查询都带 site_id 分区键，压根不需要它。
+        # 没有 GSI，所以不需要 index/*（与 api-keys 那条刻意不同）。
+        {"Sid": "AccessTablesQueryOnly", "Effect": "Allow",
+         "Action": "dynamodb:Query",
+         "Resource": [f"{tbl}/site-access-events", f"{tbl}/site-access-daily"]},
         {"Sid": "ReadJwtSecretOnly", "Effect": "Allow",
          "Action": "ssm:GetParameter",
          "Resource": f"arn:aws:ssm:{region}:{acct}:parameter/site-builder/jwt-secret"},
@@ -286,6 +301,13 @@ def lambda_environment(edge_role_id_value: str = "") -> dict:
         # 必须同名，由 test_role_grants_every_api_keys_action_keystore_needs
         # 交叉核对——它按这个环境变量的值去 role 里找资源）。
         "API_KEYS_TABLE": "site-api-keys",
+        # 二期 M5：analytics.py 读这两个（api.py 经 analytics 访问访问明细与
+        # 日聚合表）。缺任一个的症状是 KeyError → 500，而 conftest 里有值兜着
+        # 所以单测看不出来——由 test_environment_covers_every_env_var_the_code_reads
+        # 按进包清单的可达性闭包核对。表名与 role_statements 的 AccessTablesQueryOnly
+        # 资源、以及 infra/app.py 建的两张表必须同名。
+        "ACCESS_EVENTS_TABLE": "site-access-events",
+        "ACCESS_DAILY_TABLE": "site-access-daily",
         "ROUTING_TABLE": _cfg("Platform", "routing_table"),
         "BASE_DOMAIN": _base_domain(),
         "CONSOLE_HOST": console_host(),

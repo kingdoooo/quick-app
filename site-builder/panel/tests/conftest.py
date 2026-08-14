@@ -25,6 +25,10 @@ ENV = {"JOBS_TABLE": "site-deploy-jobs", "SITES_TABLE": "site-sites",
        # 名字与 deploy_panel.lambda_environment() 必须一致，由
        # test_deploy_panel_contract 的推导式断言交叉核对。
        "API_KEYS_TABLE": "site-api-keys",
+       # 二期 M5：访问明细与每日聚合。analytics.py 读它们（api.py 经 analytics
+       # 访问这两张表），名字同样必须与下发给 Lambda 的环境变量一致。
+       "ACCESS_EVENTS_TABLE": "site-access-events",
+       "ACCESS_DAILY_TABLE": "site-access-daily",
        "JWT_SECRET_PARAM": "/site-builder/jwt-secret",
        "CONSOLE_HOST": "console.example.com",
        # Edge 执行角色的 RoleId：handler 用它确认调用者真是 Edge（P1-1）。
@@ -108,6 +112,24 @@ def aws(monkeypatch):
                              "IndexName": "keyid-index",
                              "KeySchema": [{"AttributeName": "key_id", "KeyType": "HASH"}],
                              "Projection": {"ProjectionType": "ALL"}}],
+                         BillingMode="PAY_PER_REQUEST")
+        # 二期 M5：形态与 `deployer/infra/app.py` 的两张访问表、以及
+        # `deployer/tests/test_analytics.py` 的同名夹具**必须一致**
+        # （events: site_date + ts_id；daily: site_id + date）——真机只有一套表，
+        # 夹具形态漂移会让一侧绿另一侧红。
+        ddb.create_table(TableName="site-access-events",
+                         KeySchema=[{"AttributeName": "site_date", "KeyType": "HASH"},
+                                    {"AttributeName": "ts_id", "KeyType": "RANGE"}],
+                         AttributeDefinitions=[
+                             {"AttributeName": "site_date", "AttributeType": "S"},
+                             {"AttributeName": "ts_id", "AttributeType": "S"}],
+                         BillingMode="PAY_PER_REQUEST")
+        ddb.create_table(TableName="site-access-daily",
+                         KeySchema=[{"AttributeName": "site_id", "KeyType": "HASH"},
+                                    {"AttributeName": "date", "KeyType": "RANGE"}],
+                         AttributeDefinitions=[
+                             {"AttributeName": "site_id", "AttributeType": "S"},
+                             {"AttributeName": "date", "AttributeType": "S"}],
                          BillingMode="PAY_PER_REQUEST")
         s3c = boto3.client("s3", region_name="us-east-1")
         for b in ("site-artifacts-1", "site-frontend-1"):

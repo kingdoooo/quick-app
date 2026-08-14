@@ -380,6 +380,23 @@ def test_every_api_path_exists_in_handler_routes():
 # 由下面的可达性核对正常覆盖。留这段注释是因为"临时豁免变永久"是本项目记录过
 # 的形态——它这次确实被收回了。
 
+# 二期 M5 的两条读路由（`GET /api/sites/{id}/analytics`、
+# `GET /api/sites/{id}/visitors`）：后端在 Task 8 落地，前端在 **Task 9** 接。
+#
+# **这期间豁免是唯一自洽的状态**，与 M4 当时同一形态（见上面那段注释）：紧邻的
+# test_disabled_entries_are_visibly_disabled_in_markup 要求 M5 入口此刻仍是
+# 可见 disabled 的占位，所以"让前端接上"与它互斥，只能靠豁免过渡。
+#
+# 代价是这两个 pattern 上"后端加了端点、前端漏接"的检测被临时关掉，所以下面
+# test_m5_analytics_routes_are_exempt_only_until_the_frontend_lands 盯着它：
+# Task 9 一接前端，那条就会红并要求删掉本集合。**不要把它留成永久豁免。**
+M5_PENDING_FRONTEND = {
+    (r"^/api/sites/(?P<site_id>[a-z][a-z0-9-]{1,63})/analytics$",
+     "Task 9 接入前端后必须删除本豁免"),
+    (r"^/api/sites/(?P<site_id>[a-z][a-z0-9-]{1,63})/visitors$",
+     "Task 9 接入前端后必须删除本豁免"),
+}
+
 
 def test_every_handler_route_is_reachable_or_explicitly_unused():
     """反向核对：handler 的路由要么被前端用到，要么在豁免名单里。
@@ -394,7 +411,7 @@ def test_every_handler_route_is_reachable_or_explicitly_unused():
         # 管理员手工修复口，控制台不暴露入口（spec §8：人工排障用）
         (r"^/api/admin/resync/(?P<site_id>[a-z][a-z0-9-]{1,63})$",
          "人工修复投影用，不做 UI 入口"),
-    }
+    } | M5_PENDING_FRONTEND
     exempt_patterns = {p for p, _ in exempt}
     calls = _frontend_calls()
     unreached = []
@@ -405,6 +422,31 @@ def test_every_handler_route_is_reachable_or_explicitly_unused():
             unreached.append(f"{method} {rx.pattern}")
     assert not unreached, (
         f"handler 有端点前端没接（漏接或该加豁免说明）: {unreached}")
+
+
+def test_m5_analytics_routes_are_exempt_only_until_the_frontend_lands():
+    """M5 的临时豁免必须**恰好**是那两个 pattern，且前端确实还没接。
+
+    形态照抄 M4 当时那条（已随 Task 9 一起删除，见上面的注释）：没有这条时，
+    一个"临时"豁免会永久留在文件里，而"后端加了端点、前端没接"的检测就在那两条
+    路由上永久失效——本项目记录过的"放宽一次就再没人回来收"形态。
+    Task 9 接完前端后本用例会红，提示把 M5_PENDING_FRONTEND 一起删掉。
+    """
+    import handler
+    patterns = {p for p, _ in M5_PENDING_FRONTEND}
+    assert patterns == {
+        r"^/api/sites/(?P<site_id>[a-z][a-z0-9-]{1,63})/analytics$",
+        r"^/api/sites/(?P<site_id>[a-z][a-z0-9-]{1,63})/visitors$"}, (
+        f"临时豁免的范围变了，必须逐条复核: {sorted(patterns)}")
+    # 豁免的 pattern 必须真在 ROUTES 里——写错字的豁免是个哑弹（既不生效，
+    # 也让人以为已经处理过了）
+    known = {rx.pattern for _, rx in handler.ROUTES}
+    assert patterns <= known, f"豁免了 ROUTES 里不存在的 pattern: {patterns - known}"
+    assert all(reason.strip() for _, reason in M5_PENDING_FRONTEND), "豁免缺理由"
+    for _, path in _frontend_calls():
+        assert not (path.endswith("/analytics") or path.endswith("/visitors")), (
+            f"前端已经接了 {path}——请删掉 M5_PENDING_FRONTEND 这个临时豁免，"
+            "让真正的可达性核对重新生效")
 
 
 # ── ③ M5 必须是 disabled 占位，不得请求不存在的 API ────────────────────

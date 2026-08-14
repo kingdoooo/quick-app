@@ -36,13 +36,21 @@ def test_build_copies_session_py_too():
     keystore.py / keygen.py（二期 M4）：api.py **顶层** import keystore，所以
     漏复制不是"Key 功能挂了"，而是 api.py import 失败 → **所有**控制台 API 500。
     keygen.py 是 keystore.py 的传递依赖（明文/哈希的唯一算法）。
+
+    analytics.py / access_rollup.py（二期 M5）：形态与 M4 那对完全一样——api.py
+    顶层 import analytics（漏它 = 所有控制台 API 500，不只统计页），而
+    access_rollup.py 是它的传递依赖（pv/uv 口径的唯一定义，读取层 import 而不是
+    另写一份）。**位置是 `deployer/functions/` 而不是 `panel/`**，正是为了让
+    这条与隔壁的闭包断言能看见它们。
+
     这条是**恒定集合**的快照，隔壁那条按传递闭包推导——两条一起才既挡住
     "改了代码忘了改清单"，也挡住"往清单里塞了不存在的文件"（后者会让
     `_build_zip` 在真机上 `sys.exit`，而闭包断言不看这个方向）。
     """
     assert set(dp.COPY_FILES) == {"common.py", "permissions.py", "ops_log.py",
                                   "session.py", "edge_caller.py",
-                                  "keystore.py", "keygen.py"}
+                                  "keystore.py", "keygen.py",
+                                  "analytics.py", "access_rollup.py"}
 
 
 def test_every_copied_module_actually_exists_on_disk():
