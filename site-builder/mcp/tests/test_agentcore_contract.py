@@ -85,7 +85,8 @@ def test_runtime_name_matches_api_pattern():
 
 EXPECTED_TOOLS = ["deploy_site", "confirm_upload", "get_deploy_status",
                   "list_my_sites", "undeploy_site", "update_site_permissions",
-                  "manage_collaborators", "get_site_permissions"]
+                  "manage_collaborators", "get_site_permissions",
+                  "get_site_analytics"]
 
 
 @pytest.mark.parametrize("tool", EXPECTED_TOOLS)

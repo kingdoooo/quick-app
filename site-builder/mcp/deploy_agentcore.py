@@ -104,7 +104,9 @@ def ensure_repo() -> str:
 _BUILD_INPUTS = ("mcp/Dockerfile", "mcp/requirements.txt", "mcp/server.py",
                  "deployer/functions/common.py",
                  "deployer/functions/permissions.py",
-                 "deployer/functions/ops_log.py")
+                 "deployer/functions/ops_log.py",
+                 "deployer/functions/analytics.py",
+                 "deployer/functions/access_rollup.py")
 
 
 def _git(*args: str) -> str:
@@ -203,8 +205,14 @@ def build_and_push(image_uri: str) -> None:
     # 这些必须进构建上下文：server.py 按同目录解析它们。
     # **ops_log.py 也要**：permissions.py import 它（M3 审计落点），
     # 少一个文件 = 容器起来后每次改权限都 ImportError。
+    # **analytics.py / access_rollup.py 同理**（M5 统计读取层，后者是 analytics
+    # 顶层 import 的 pv/uv 口径真源）：这份清单与 Dockerfile 的 COPY 行、
+    # _BUILD_INPUTS 三处必须同时列全，由
+    # tests/test_agentcore_contract.py::test_image_carries_every_local_module_the_server_chain_imports
+    # 按 server.py 的传递闭包核对。
     copied = []
-    for name in ("common.py", "permissions.py", "ops_log.py"):
+    for name in ("common.py", "permissions.py", "ops_log.py", "analytics.py",
+                 "access_rollup.py"):
         shutil.copyfile(HERE.parent / "deployer" / "functions" / name, HERE / name)
         copied.append(HERE / name)
     try:

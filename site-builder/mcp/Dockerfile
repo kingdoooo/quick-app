@@ -20,7 +20,10 @@ RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 
 # server.py 与 common.py（deploy_agentcore.py 从 deployer/functions/ 复制进构建
 # 上下文）必须同目录：server.py 按同目录解析 common。
-COPY server.py common.py permissions.py ops_log.py ./
+# analytics.py 是 get_site_analytics 的读取层，access_rollup.py 是它的 pv/uv
+# 口径真源（analytics 顶层 import 它）——**传递闭包里的每一个都要在这行**，
+# 少一个的症状是"部署显示成功、容器里一调统计就 ImportError"。
+COPY server.py common.py permissions.py ops_log.py analytics.py access_rollup.py ./
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1

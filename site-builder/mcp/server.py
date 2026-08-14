@@ -581,6 +581,27 @@ def do_get_permissions(caller: str, site_id: str) -> dict:
                                            permissions.is_admin(caller))}
 
 
+def _analytics_payload(site_id: str, period: str, days: int) -> dict:
+    """读取层。与 panel **共用同一个** deployer/functions/analytics.py。
+
+    该模块必须进镜像（Dockerfile COPY + build_and_push 复制元组 +
+    _BUILD_INPUTS 三处，见 Task 11）——容器里只有四个 .py 时这行会
+    ModuleNotFoundError，而部署会显示成功（Codex 审查 P1-2 实测）。
+    """
+    import analytics
+    return {"series": analytics.series(site_id, period, days),
+            "recent_visitors": analytics.visitors(site_id, days=min(days, 7),
+                                                  limit=50)["rows"]}
+
+
+def do_get_analytics(caller: str, site_id: str, period: str, days: int) -> dict:
+    if period not in ("day", "week", "month"):
+        raise ValueError(f"period 必须是 day/week/month，收到 {period!r}")
+    _assert_permission(caller, site_id, "view_analytics",
+                       what=f"站点 {site_id} 的访问统计")
+    return _analytics_payload(site_id, period, days)
+
+
 # ---------- MCP 壳 ----------
 
 # AgentCore Runtime 契约：容器必须监听 0.0.0.0:8000 并暴露 POST /mcp，
@@ -720,6 +741,19 @@ def manage_collaborators(site_id: str, add: list | None = None,
 def get_site_permissions(site_id: str) -> dict:
     """查询站点当前的访问策略、owner、协作者，以及我对它的角色。"""
     return do_get_permissions(_caller_email(), site_id)
+
+
+@mcp.tool()
+def get_site_analytics(site_id: str, period: str = "day",
+                       days: int = 30) -> dict:
+    """查询站点的访问统计（PV / 独立访客 / 被拒次数）与最近的访问明细。
+
+    period: day|week|month。**返回单个对象**，`series` 与 `recent_visitors`
+    是它的字段——不返回裸列表（列表会被拆成多个 text 块并被调用方静默截断）。
+    `uv_exact=false` 的桶其 `uv` 为 null：该区间超出 90 天明细留存窗口，
+    独立访客数无法精确去重。
+    """
+    return do_get_analytics(_caller_email(), site_id, period, days)
 
 
 if __name__ == "__main__":
