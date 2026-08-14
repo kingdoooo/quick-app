@@ -569,6 +569,21 @@ function bindSearch(sel, setter, rerender) {
  * 真塞一个可执行串进来盯着它）。改这个函数时，任何新插值要么是数字、
  * 要么必须过 esc()。 */
 function sparkline(pv7) {
+  /* 形状守卫：**恰好 7 个有限数字**，别的一律什么都不画。
+   *
+   * 后端读失败时给的是 `[]`（= 未知，见 api._pv7_or_unknown），不是 `[0]*7`
+   * ——一条平的 0 线与"真的零访问"在界面上无法区分，那是一句假数据。所以这里
+   * 不能兜成平线、也不能画半条：`[]` / 长度不对 / 字段压根没下发（后端回滚过）
+   * / 非数字，都只显示一个"读不到"的占位。同 uvCell 的口径：不显示一个站不住
+   * 的数字。
+   * `Number.isFinite` 一次挡掉字符串、null、NaN、Infinity（全局 isFinite 会把
+   * '5' 判成真，不能用）。没有这条守卫时：`[1,2,3]` 会画出一张**看起来像真数据
+   * 的错图**，而字段缺失直接 `undefined.map` 崩掉整个站点列表。 */
+  var ok = Array.isArray(pv7) && pv7.length === 7 &&
+    pv7.every(function (v) { return Number.isFinite(v); });
+  if (!ok) {
+    return '<span class="meta" title="访问趋势暂时读不到（不是没有访问）">—</span>';
+  }
   var max = Math.max.apply(null, pv7);
   var h = 18, w = 56, step = w / (pv7.length - 1);
   var pts = pv7.map(function (v, i) {

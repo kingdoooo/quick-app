@@ -19,6 +19,7 @@
  *   场景 came-back    —— 从 /console-session 升级跳转回来
  *   场景 keys-*       —— API Key 页面的 features.api_key 三态（见 KEY_SCENARIOS）
  *   场景 analytics-*  —— 访问统计页的三态（见 ANALYTICS_SCENARIOS）
+ *   场景 sites-list*  —— 站点列表卡片与 pv7 迷你趋势（见 SITE_SCENARIOS）
  * 输出：一行 JSON（fetched / errors / hash_after / assigned / html）
  * 退出码：0 = 取到身份且无异常；3 = 否
  */
@@ -134,16 +135,38 @@ function siteRow(id, name, pv7) {
            ever_live: true, role: 'owner', pv7: pv7 };
 }
 
-/* pv7 的值域由后端契约保证是整数（`analytics.pv7` 逐项 `int(pv)`），所以这一格
- * **不是**对真实攻击面的建模，而是一条豁免的证明：test_frontend_contract 的
- * XSS 扫描把 `sparkline(` 登记进了 SAFE_WRAPPERS，那条豁免的前提是"本函数产不
- * 出调用方给的字符串"。塞一个可执行串进去真跑一遍，是这个前提唯一的实证
- * （同 toast/openModal 的那条：被豁免者自己必须被盯住）。 */
+/* ── pv7 的四种"不是 7 个数字"的形状 ──────────────────────────────────
+ *
+ * 后端读失败时给 `[]`（= 未知，`api._pv7_or_unknown`），**不是** `[0]*7`：
+ * 平的 0 线与真的零访问无法区分，那是假数据。前端因此有一条"恰好 7 个有限
+ * 数字"的守卫，这一组就是它的判别力证明——四种形状都必须"什么都不画"：
+ *   · `[]`        —— 后端降级值（表没建 / IAM 缺 Query / 环境变量没下发）；
+ *   · `[1,2,3]`   —— 长度不对。**没有守卫时它最危险**：画出一张看起来像真
+ *                    数据的错图（3 个点铺满整宽），没有任何地方看得出是错的；
+ *   · 字段缺失    —— 后端回滚 / 前端先上线。没有守卫时 `undefined.map` 直接
+ *                    崩掉整个站点列表；
+ *   · 含可执行串  —— pv7 的值域由后端契约保证是整数（`int(pv)`），所以这格
+ *                    **不是**真实攻击面的建模，而是 SAFE_WRAPPERS 里
+ *                    `sparkline(` 那条豁免的证明（同 toast/openModal：
+ *                    被豁免者自己必须被盯住）。
+ */
 const S_HOSTILE = ['<img src=x onerror=alert(1)>', 0, 0, 0, 0, 0, 0];
+
+function siteRowWithoutPv7(id, name) {
+  const row = siteRow(id, name, []);
+  delete row.pv7;                 // 后端根本没给这个字段
+  return row;
+}
+
 const SITE_SCENARIOS = {
   'sites-list': [siteRow('s-busy', '有访问量的站', S_BUSY),
                  siteRow('s-quiet', '零访问的站', S_ZERO)],
-  'sites-list-hostile': [siteRow('s-busy', '有访问量的站', S_HOSTILE)],
+  /* 三种都不会让"去掉守卫"的版本崩，所以这个场景能观察到**退化后的图形** */
+  'sites-list-unknown': [siteRow('s-unknown', '读不到趋势的站', []),
+                         siteRow('s-short', '长度不对的站', [1, 2, 3]),
+                         siteRow('s-hostile', '值域被污染的站', S_HOSTILE)],
+  /* 字段缺失单独一个场景：去掉守卫时它**崩整页**，混在上面会看不到那三种图形 */
+  'sites-list-missing': [siteRowWithoutPv7('s-missing', '后端没给 pv7 的站')],
 };
 const SCASE = SITE_SCENARIOS[SCENARIO] || null;
 

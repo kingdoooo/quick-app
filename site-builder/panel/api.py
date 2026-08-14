@@ -107,6 +107,48 @@ def _shape_site(site: dict, viewer: str, *, viewer_is_admin: bool) -> dict:
             "role": permissions.role_of(viewer, site, viewer_is_admin)}
 
 
+def _pv7_or_unknown(site_id: str) -> list[int]:
+    """站点列表的迷你趋势。**读失败不外溢**——降级成 `[]`（= 未知）。
+
+    为什么必须降级：`/api/sites` 是控制台的**首页**接口。pv7 让它开始依赖两张
+    访问表，于是"表名环境变量没下发 / 表还没建 / IAM 少了 Query"这三种情况会从
+    "统计页签空着"升级成"**整个站点列表打不开**"——连改权限、下线这些恢复手段
+    都进不去，等于把一个装饰性字段的故障放大成全站故障。这不是新判断：
+    `_api_key_feature()` 对 `/api/me` 的读失败刻意兜底，理由是同一句话。
+    风险主要落在**部署顺序**上（必须先建两张表再部署 panel），而颠倒时的症状
+    不是"统计页空"而是"首页 500"。
+
+    **降级值是 `[]` 而不是 `[0] * 7`**：一条平的 0 线与"真的零访问"在界面上
+    无法区分，那是一句假数据。`[]` 的含义是"未知"，前端据此**什么都不画**
+    （`sparkline` 里那条"恰好 7 个数字"的守卫）。口径同 `uv_exact`：
+    不显示一个站不住的数字。
+
+    **范围刻意收窄**：只接基础设施读失败。
+      · `ClientError` —— ResourceNotFound / AccessDenied / 限流；
+      · `BotoCoreError` —— 端点、凭证、连接；
+      · `KeyError` —— 表名环境变量没下发（部署顺序颠倒的那个症状）。
+    `ValueError`（`series` 的参数校验；本路径传的是字面量 `"day"` / `7`，报错
+    只可能是代码写坏了）、`PermissionDenied`、`TypeError` 一律**继续外溢**，
+    由 test_pv7_failures_that_are_not_infrastructure_still_propagate 钉住。
+    代价交代清楚：`analytics` 内部若有字典 `KeyError`（代码缺陷）也会被这里
+    吞成"未知"——选这个方向是因为两侧代价不对称（少一条趋势线 vs 首页 500），
+    而 warning 保证它不是静默的。
+
+    **这个 except 盖不住授权失败**：授权在它之前就做完了（`_require_admin` /
+    `list_sites_for_user` 决定了哪些站点能进列表），它只包着一个取数调用，
+    不包 shaping、不包任何判定。
+    `logger.warning` 不是可选的——静默吞异常正是本轮 §4.2 踩过的形态。
+    """
+    import botocore.exceptions
+    try:
+        return analytics.pv7(site_id)
+    except (botocore.exceptions.ClientError,
+            botocore.exceptions.BotoCoreError, KeyError) as e:
+        logger.warning("站点 %s 的访问趋势读取失败，本次按未知返回（不影响站点"
+                       "列表本身）: %r", site_id, e, exc_info=True)
+        return []
+
+
 def do_list_sites(email: str, *, all_sites: bool = False) -> list[dict]:
     """mine（owner ∪ collaborator）或 admin 的全量列表，按创建时间倒序。"""
     is_adm = permissions.is_admin(email)
@@ -121,7 +163,8 @@ def do_list_sites(email: str, *, all_sites: bool = False) -> list[dict]:
              # 计算，spec §3.5 的「1 次」少算了一次，且明细那次随**今天的访问量**
              # 分页）。当前 31 个站点可接受。管理员全局视图同理——站点数长到
              # 三位数时改批量或缓存，届时重评（spec §3.5 已记）。
-             "pv7": analytics.pv7(s["site_id"])}
+             # 取数走 `_pv7_or_unknown`：这个字段的故障**不得**放大成首页 500。
+             "pv7": _pv7_or_unknown(s["site_id"])}
             for s in sorted(sites, key=lambda s: s.get("created_at", ""),
                             reverse=True)]
 

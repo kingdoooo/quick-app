@@ -608,6 +608,9 @@ def test_all_zero_pv7_renders_a_flat_line_not_nan_coordinates():
     assert "NaN" not in last, f"整页渲染里出现了 NaN: {last!r}"
 
 
+PLACEHOLDER = "访问趋势暂时读不到"      # 形状守卫的占位（app.js 里的唯一特征串）
+
+
 def test_sparkline_cannot_emit_a_string_its_caller_passed_in():
     """`sparkline(` 被登记进 XSS 扫描的 SAFE_WRAPPERS —— 这里证明那条豁免成立。
 
@@ -617,13 +620,53 @@ def test_sparkline_cannot_emit_a_string_its_caller_passed_in():
 
     pv7 的值域由后端契约保证是整数，所以这一格**不是**真实攻击面的建模，而是
     豁免前提的实证：塞一个可执行串进去，产物里不得出现标签。
+
+    **两层挡着它，顺序要说清**：形状守卫（`Number.isFinite`）先把非数字整个挡掉，
+    `fmt()` 是第二层（`reduce` 的加法对字符串是拼接，`0 + '<img …>'` 就是那个串）。
+    所以本用例观察到的是守卫的效果；`fmt` 那一层由
+    test_harness_catches_the_total_not_going_through_fmt 用**复合注入**证明
+    ——单独去掉 fmt 时守卫仍然挡住，这正说明它是"深度"而不是唯一防线。
     """
-    _, last = _cards("sites-list-hostile")
+    _, last = _cards("sites-list-unknown")
+    card = _card_of(last, "s-hostile")
     assert "<img src=x" not in last, (
         f"pv7 里的可执行串原样进了 innerHTML —— SAFE_WRAPPERS 那条豁免是错的: {last!r}")
-    # 正对照：串确实到达了 sparkline（被数字化成 NaN），不是"根本没渲染"
-    assert "近 7 天 NaN PV" in last, (
-        f"没看到被数字化的痕迹 —— 本用例可能空转（卡片没渲染）: {last[-400:]!r}")
+    # 正对照：这张卡片确实渲染了、且走到了守卫（不是"场景空转"）
+    assert PLACEHOLDER in card, (
+        f"污染值那张卡片没有占位 —— 本用例可能空转: {card[-300:]!r}")
+    assert "<polyline" not in card, f"非数字的 pv7 居然画出了线: {card!r}"
+
+
+def test_unknown_or_malformed_pv7_draws_nothing_instead_of_a_wrong_line():
+    """后端给"未知"（`[]`）、长度不对、或压根没给这个字段时：**什么都不画**。
+
+    判别力是这条的全部意义，逐个说明退化形态（都实测过，见反向那两条）：
+      · `[]` —— 后端 `_pv7_or_unknown` 的降级值。**不能兜成 `[0]*7`**：那是一条
+        与"真的零访问"无法区分的平线，也就是一句假数据（同 uv_exact 的口径）。
+        没有守卫时它会被画成"近 7 天 0 PV"，比不画更糟；
+      · `[1,2,3]` —— 没有守卫时画出一张**看起来像真数据的错图**（3 个点铺满整宽，
+        标"近 7 天 6 PV"），界面上完全看不出是错的；
+      · 字段缺失 —— 后端回滚 / 前端先上线。没有守卫时 `undefined` 进不了
+        `.length`，**整个站点列表崩掉**。
+    """
+    out, last = _cards("sites-list-unknown")
+    assert not out["errors"], f"降级形状渲染时抛异常: {out['errors']}"
+    for site_id in ("s-unknown", "s-short", "s-hostile"):
+        card = _card_of(last, site_id)
+        assert PLACEHOLDER in card, f"{site_id} 没有显示「读不到」占位: {card!r}"
+        assert "<polyline" not in card, f"{site_id} 画出了趋势线: {card!r}"
+        assert "近 7 天" not in card, (
+            f"{site_id} 仍然报了一个总数 —— 读不到就不该给数字: {card!r}")
+    assert 'class="spark"' not in last, "降级形状里画出了 svg 趋势线"
+    assert "NaN" not in last, f"页面上出现了 NaN: {last!r}"
+
+    # 字段整个缺失的那一格单独一个场景（去掉守卫时它崩整页，混在一起看不到上面
+    # 三种图形），但**必须一样什么都不画**
+    out2, last2 = _cards("sites-list-missing")
+    assert not out2["errors"], (
+        f"后端没给 pv7 时渲染抛异常 —— 守卫没接住 undefined: {out2['errors']}")
+    assert PLACEHOLDER in _card_of(last2, "s-missing"), "字段缺失没有走占位"
+    assert "<polyline" not in last2 and "NaN" not in last2
 
 
 # ── 反向验证：把迷你趋势的三处实现分别改坏 ──────────────────────────────
@@ -668,19 +711,86 @@ def test_harness_catches_the_card_never_calling_sparkline(tmp_path):
         "本注入不该动 sparkline 的实现（否则证不了静态断言的盲区）")
 
 
-def test_harness_catches_the_total_not_going_through_fmt(tmp_path):
-    """反向 ③：总数不过 `fmt()` —— pv7 里的字符串会原样进 innerHTML。
+GUARD = "  if (!ok) {"           # sparkline 的形状守卫（恰好 7 个有限数字）
+FMT_TOTAL = "    fmt(pv7.reduce(function (a, b) { return a + b; }, 0)) +"
 
-    这条盯的是 SAFE_WRAPPERS 里 `sparkline(` 那条豁免的**唯一承重点**：
-    坐标经 `.toFixed(1)` 天然产不出字符串，而 `reduce` 的加法对字符串是拼接
-    （`0 + '<img …>'` 就是那个串）。所以豁免成立与否，全押在这个 fmt 上。
+
+def _mutated_all(tmp_path: Path, *pairs: tuple[str, str]) -> Path:
+    """多处注入。防御**层次**的验证需要同时拆掉两层，单处注入证不了。
+
+    比 `_mutated` 多一条 `count == 1`：文本锚点必须在全文件唯一，而"解释这行
+    代码"的注释天生会破坏唯一性（本 Task 真踩过——注入改掉的是注释而不是代码，
+    页面照旧渲染，用例假红）。把这条断言写在这里，下一次会红在注入点上而不是
+    红在一句不相干的断言上。
     """
-    app = _mutated(tmp_path,
-                   "    fmt(pv7.reduce(function (a, b) { return a + b; }, 0)) +",
-                   "    pv7.reduce(function (a, b) { return a + b; }, 0) +")
-    _, last = _cards("sites-list-hostile", app)
-    assert "<img src=x" in last, (
-        "去掉 fmt 之后可执行串居然没进 HTML —— 那条豁免的证明用例是空转的")
+    src = APP.read_text()
+    for old, new in pairs:
+        assert src.count(old) == 1, (
+            f"注入点在全文件里出现 {src.count(old)} 次（0=代码改过，"
+            f">1=有注释抄了它）: {old[:60]!r}")
+        src = src.replace(old, new, 1)
+    out = tmp_path / "app.js"
+    out.parent.mkdir(parents=True, exist_ok=True)   # 同一条用例要两份注入版本
+    out.write_text(src)
+    return out
+
+
+def test_harness_catches_removing_the_shape_guard(tmp_path):
+    """反向 ③：去掉形状守卫 —— 三种降级形状各自坏成什么样，逐个钉住。
+
+    实测过的退化形态（不是推测）：`[]` → `近 7 天 0 PV` 的空线（**凭空的 0**，
+    正是"平的 0 线是假数据"那条要防的）；`[1,2,3]` → 3 个点铺满整宽的错图，
+    标"近 7 天 6 PV"；污染值 → 一串 NaN 坐标。
+    """
+    app = _mutated_all(tmp_path, (GUARD, "  if (false) {"))
+    _, last = _cards("sites-list-unknown", app)
+    short = _card_of(last, "s-short")
+    assert len(_points(short)) == 3, (
+        f"预期长度不对的 pv7 被画成 3 个点的错图，实际: {_points(short)}")
+    assert "近 7 天 6 PV" in short, f"错图没有配一个错总数: {short!r}"
+    assert "近 7 天 0 PV" in _card_of(last, "s-unknown"), (
+        "「未知」没有退化成凭空的 0 —— 那条正向断言可能没盯住东西")
+    assert "NaN" in _card_of(last, "s-hostile"), "污染值没有退化成 NaN 坐标"
+
+
+def test_harness_catches_the_guard_not_covering_a_missing_field(tmp_path):
+    """反向 ④：守卫去掉后，后端**没给** pv7 会崩掉整个站点列表。
+
+    这是本轮最该防的形态：它不是"少一条趋势线"，而是首页整屏挂掉——而后端
+    回滚、或前端先上线，都会造出这一格。
+    """
+    app = _mutated_all(tmp_path, (GUARD, "  if (false) {"))
+    code, out = run_boot("sites-list-missing", app)
+    assert out["errors"] and code != 0, (
+        f"字段缺失且无守卫却没崩 —— 说明这个场景没渲染卡片（空转）: {out}")
+    assert any("undefined" in e for e in out["errors"]), (
+        f"崩的原因不是 undefined —— 与预期的退化形态不同: {out['errors']}")
+
+
+def test_harness_catches_the_total_not_going_through_fmt(tmp_path):
+    """反向 ⑤：**复合注入**——同时拆掉形状守卫与 `fmt()`，可执行串才进 HTML。
+
+    为什么必须是复合：`fmt` 是第二层。单独去掉它，形状守卫仍然把非数字整个挡在
+    外面（实测：`<img src=x` 不出现），于是"单处注入"会得出"fmt 无所谓"的错
+    结论。两层一起拆掉时实测渲染出
+    `近 7 天 0<img src=x onerror=alert(1)>000000 PV` —— 也就是说一旦哪天有人放宽
+    守卫（比如只判长度不判类型），`fmt` 就是 pv7 与 innerHTML 之间**唯一**的东西。
+    """
+    only_fmt = _mutated_all(
+        tmp_path / "a",
+        (FMT_TOTAL, "    pv7.reduce(function (a, b) { return a + b; }, 0) +"))
+    _, last = _cards("sites-list-unknown", only_fmt)
+    assert "<img src=x" not in last, (
+        "只去掉 fmt 就注入成功了 —— 那说明形状守卫没在挡非数字，"
+        f"上面那条正向断言的结论是错的: {last!r}")
+
+    both = _mutated_all(
+        tmp_path / "b",
+        (GUARD, "  if (false) {"),
+        (FMT_TOTAL, "    pv7.reduce(function (a, b) { return a + b; }, 0) +"))
+    _, last2 = _cards("sites-list-unknown", both)
+    assert "<img src=x" in last2, (
+        "两层都拆了可执行串仍然没进 HTML —— 那 fmt 那条豁免证明是空转的")
 
 
 def test_harness_catches_the_tab_not_being_handed_the_site(tmp_path):
