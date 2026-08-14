@@ -367,11 +367,18 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: Task 2 的表名与键名。
-- Produces: `_access_region(context) -> str`、`_access_client(region)`、
-  `_is_page_request(route, uri) -> bool`、`_record_access(context, site_id, uri, decision, email) -> None`、
-  `_maybe_record(context, subdomain, uri, route, denied, sink) -> None`；
-  `_check_auth(request, route, host, sink=None)` 新增**可选** out-param。
-  占位符 `{{ACCESS_TABLE}}` / `{{ACCESS_REPLICA_REGIONS}}`（Task 4 注入）。
+- Produces:
+  - `_route_kind(route, uri, method) -> "lambda"|"page"|"asset"|"reject"`
+    ——**路由分流判定的唯一定义**，`_route_request` 与埋点都消费它；
+  - `_is_page_request(route, uri, method) -> bool`（从 `_route_kind` 派生）；
+  - `_access_region(context) -> str`、`_access_client(region)`；
+  - `_record_access(context, site_id, uri, decision, email) -> None`；
+  - `_maybe_record(context, subdomain, uri, method, route, denied, sink) -> None`；
+  - `_check_auth(request, route, host, sink=None)` 新增**可选** out-param
+    （返回类型不变）；
+  - 占位符 `{{ACCESS_TABLE}}` / `{{ACCESS_REPLICA_REGIONS}}`（Task 4 注入）。
+- 改动既有函数：`_route_request` 的尾部改为消费 `_route_kind`（行为不变，
+  由既有 63 项 edge 测试兜底）。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -442,29 +449,56 @@ def test_region_without_a_replica_falls_back_to_primary(monkeypatch):
 # 初版就是复刻的，于是漏了 /api/ 前置分支还全绿（P1-1）。
 # 另注：oracle 也不能写成"进了静态桶"——`.css` 也进桶。判据是**被改写成
 # index.html**（我第一次写这个 oracle 时就选错了，表格看着对、结论是错的）。
-_PAGE_CASES = [
-    ("/", True), ("/notes", True), ("/a/b", True), ("/.well-known/x", True),
-    ("/app.css", False), ("/x/main.js", False), ("/favicon.ico", False),
-    # ↓ P1-1 的回归：split 站点的 /api/* 走后端，**不是页面**
-    ("/api/data", False), ("/api/sites/x/jobs", False), ("/api/x.json", False),
-]
+_ROUTE = {"route_mode": "split", "static_prefix": "sites/x",
+          "api_target": "https://f.lambda-url.us-east-1.on.aws/"}
+_URIS = ["/", "/notes", "/a/b", "/.well-known/x", "/app.css", "/x/main.js",
+         "/favicon.ico", "/api/data", "/api/sites/x/jobs", "/api/x.json"]
+_METHODS = ["GET", "HEAD", "POST", "PUT", "OPTIONS", "DELETE"]
 
 
-@pytest.mark.parametrize("uri,is_page", _PAGE_CASES)
-def test_page_detection_agrees_with_real_routing(uri, is_page):
-    route = {"route_mode": "split", "static_prefix": "sites/x",
+def _observed_kind(uri, method):
+    """从**真实 _route_request** 观察它到底怎么处理了这个请求。
+
+    oracle 必须是观察出来的，不能是复刻的条件——复刻已经错过两轮。
+    也不能写成"进了静态桶"：`.css` 也进桶，判据是**改写成 index.html**。
+    """
+    req = {"uri": uri, "method": method, "querystring": "", "headers": {}}
+    out = orq._route_request(req, dict(_ROUTE))
+    if out.get("status") == "404":
+        return "reject"
+    u = str(out.get("uri", ""))
+    if u.endswith("/index.html"):
+        return "page"
+    if u.startswith("/sites/"):
+        return "asset"
+    return "lambda"
+
+
+@pytest.mark.parametrize("method", _METHODS)
+@pytest.mark.parametrize("uri", _URIS)
+def test_route_kind_matches_what_route_request_actually_does(uri, method):
+    """**60 组组合逐个比对**：_route_kind 是唯一定义，它说的必须就是真实发生的。
+
+    第二轮审查（2026-08-14）实测：只看 uri 不看 method 时，POST/PUT/OPTIONS/
+    DELETE 打到无扩展名路径会被记成 allow PV，而真实是 404——4 条不一致。
+    method 维度不进参数化就抓不到。
+    """
+    assert orq._route_kind(_ROUTE, uri, method) == _observed_kind(uri, method), (
+        f"_route_kind 与真实处理不一致: {method} {uri}")
+
+
+@pytest.mark.parametrize("method", _METHODS)
+@pytest.mark.parametrize("uri", _URIS)
+def test_only_real_page_views_are_recorded(uri, method):
+    assert orq._is_page_request(_ROUTE, uri, method) is (
+        _observed_kind(uri, method) == "page")
+
+
+def test_api_only_sites_record_every_request_including_writes():
+    route = {"route_mode": "api-only",
              "api_target": "https://f.lambda-url.us-east-1.on.aws/"}
-    req = {"uri": uri, "method": "GET", "querystring": "", "headers": {}}
-    out = orq._route_request(req, dict(route))
-    # 真实判据：被改写成 index.html ⇔ 这是一次页面浏览
-    really_a_page = str(out.get("uri", "")).endswith("/index.html")
-    assert really_a_page is is_page, f"用例表与真实路由不符: {uri}"
-    assert orq._is_page_request(route, uri) is really_a_page, (
-        f"_is_page_request 与 _route_request 对 {uri} 判断不一致")
-
-
-def test_api_only_sites_record_every_request():
-    assert orq._is_page_request({"route_mode": "api-only"}, "/x.css") is True
+    for m in _METHODS:
+        assert orq._is_page_request(route, "/x.css", m) is True, m
 
 
 # ── 只记 app- 前缀（spec §2.1）─────────────────────────────────────
@@ -477,7 +511,7 @@ def test_only_app_prefixed_subdomains_are_recorded(monkeypatch, sub, recorded):
     seen = []
     monkeypatch.setattr(orq, "_record_access",
                         lambda *a, **k: seen.append(a))
-    orq._maybe_record(Ctx(), sub, "/", {"route_mode": "split"}, None, {})
+    orq._maybe_record(Ctx(), sub, "/", "GET", {"route_mode": "split"}, None, {})
     assert bool(seen) is recorded
 
 
@@ -486,8 +520,8 @@ def test_site_id_is_the_subdomain_minus_the_app_prefix(monkeypatch):
     monkeypatch.setattr(orq, "_record_access",
                         lambda ctx, site_id, uri, decision, email:
                         seen.append((site_id, decision, email)))
-    orq._maybe_record(Ctx(), "app-notes-01d147", "/", {"route_mode": "split"},
-                      None, {"email": "a@b.co"})
+    orq._maybe_record(Ctx(), "app-notes-01d147", "/", "GET",
+                      {"route_mode": "split"}, None, {"email": "a@b.co"})
     assert seen == [("notes-01d147", "allow", "a@b.co")]
 
 
@@ -502,8 +536,8 @@ def test_decision_covers_allow_and_both_denials(monkeypatch, denied, decision):
     seen = []
     monkeypatch.setattr(orq, "_record_access",
                         lambda ctx, site_id, uri, d, email: seen.append(d))
-    orq._maybe_record(Ctx(), "app-x-abc123", "/", {"route_mode": "split"},
-                      denied, {"email": "a@b.co"})
+    orq._maybe_record(Ctx(), "app-x-abc123", "/", "GET",
+                      {"route_mode": "split"}, denied, {"email": "a@b.co"})
     assert seen == [decision]
 
 
@@ -528,8 +562,8 @@ def test_client_construction_failure_is_also_swallowed(monkeypatch):
     """兜底必须覆盖 client 取用本身，不能只包住 put_item 调用。"""
     monkeypatch.setattr(orq, "_access_region",
                         lambda ctx: (_ for _ in ()).throw(RuntimeError("x")))
-    orq._maybe_record(Ctx(), "app-x-abc123", "/", {"route_mode": "split"},
-                      None, {"email": "a@b.co"})   # 不抛即通过
+    orq._maybe_record(Ctx(), "app-x-abc123", "/", "GET",
+                      {"route_mode": "split"}, None, {"email": "a@b.co"})   # 不抛即通过
 
 
 # ── 不许往返回的 request 对象加自定义键（spec §2.3 规矩 1）───────────
@@ -718,25 +752,39 @@ def _access_client(region: str):
     return _ACCESS_CLIENTS[region]
 
 
-def _is_page_request(route: dict, uri: str) -> bool:
-    """页面级 ⇔ `_route_request` 会把它改写成 /index.html。
+def _route_kind(route: dict, uri: str, method: str) -> str:
+    """这个请求会被怎么处理：`"lambda" | "page" | "asset" | "reject"`。
 
-    **必须逐条镜像 `_route_request` 的分支顺序，不只抄"有没有点号"那一条。**
-    初版漏了 `/api/` 前置分支（Codex 审查 2026-08-14 P1-1），实测后果：
-    split 站点的 `/api/data`、`/api/sites/x/jobs` 没有扩展名 → 被判成页面，
-    而它们真实是走后端的。一次 SPA 打开 + 5 个接口调用 = **PV 放大到 6 倍**，
-    且 rollup / panel / MCP 会一致地返回同一个错误数字（没有任何一侧会红）。
-
-    分支顺序（与 `_route_request` 一一对应）：
-      ① api-only 站点 → 全路径走后端，没有"页面 vs 资源"之分，全记；
-      ② `/api/` 前缀 → 走后端，**不是页面**；
-      ③ 其余：有扩展名 → 静态资源；无扩展名 → 改写成 /index.html = 页面。
+    **唯一定义**——`_route_request` 与埋点判定都调它，谁也不许再写第二份。
+    这条设计是被两次同类缺陷逼出来的（Codex 审查 2026-08-14 两轮，都实测）：
+      · 第一版只抄了"有没有扩展名"，漏掉 `/api/` 前置分支 → split 站点的
+        `/api/data` 被记成页面，一次 SPA 打开 + 5 个接口 = **PV 放大 6 倍**；
+      · 第二版补了 `/api/`，仍漏掉**方法检查** → `POST /notes` 真实是 404
+        （分发是 ALLOW_ALL，非 GET/HEAD 的静态请求被 `_not_found` 拒），
+        却被记成一条 `allow` PV。实测 4 条不一致（POST/PUT/OPTIONS/DELETE
+        × 无扩展名路径）。
+    两次都是"镜像一份判定"这个做法本身的问题——所以改成**一处判定、两处引用**。
+    往这里加分支时，`_route_request` 自动跟着变，不存在漂移。
     """
     if route.get("route_mode") == "api-only":
-        return True
+        return "lambda"
     if uri.startswith("/api/"):
-        return False
-    return "." not in uri.rsplit("/", 1)[-1]
+        return "lambda"
+    if method not in ("GET", "HEAD"):
+        return "reject"        # 静态桶只接受读方法，其余 404
+    return "asset" if "." in uri.rsplit("/", 1)[-1] else "page"
+
+
+def _is_page_request(route: dict, uri: str, method: str) -> bool:
+    """要不要记这一条。**从 `_route_kind` 派生，不自己判。**
+
+    api-only 站点没有"页面 vs 资源"之分，全记；其余只记会被改写成
+    `/index.html` 的那些。`reject`（方法不允许 → 404）与 `asset` 都不记。
+    """
+    kind = _route_kind(route, uri, method)
+    if route.get("route_mode") == "api-only":
+        return kind == "lambda"
+    return kind == "page"
 
 
 def _record_access(context, site_id: str, uri: str, decision: str,
@@ -767,7 +815,7 @@ def _record_access(context, site_id: str, uri: str, decision: str,
               f"{type(e).__name__}: {e}")
 
 
-def _maybe_record(context, subdomain: str, uri: str, route: dict,
+def _maybe_record(context, subdomain: str, uri: str, method: str, route: dict,
                   denied, sink: dict) -> None:
     """记不记、记什么。
 
@@ -781,7 +829,7 @@ def _maybe_record(context, subdomain: str, uri: str, route: dict,
     try:
         if not subdomain.startswith("app-"):
             return
-        if not _is_page_request(route, uri):
+        if not _is_page_request(route, uri, method):
             return
         if denied is None:
             decision = "allow"
@@ -794,6 +842,30 @@ def _maybe_record(context, subdomain: str, uri: str, route: dict,
     except Exception as e:      # noqa: BLE001
         print(f"[WARN] 埋点判定失败 sub={subdomain}: {type(e).__name__}: {e}")
 ```
+
+`_route_request` 的尾部改成**消费** `_route_kind`（行为不变，由既有 63 项
+edge 测试兜底回归）：
+
+```python
+    kind = _route_kind(route, uri, request.get("method", "GET"))
+    if kind == "lambda":
+        return _route_to_lambda(request, route, uri, qs)
+    if kind == "reject":
+        # 静态桶只接受读方法。**这条判定原来写在本函数里**，M5 把它连同
+        # api-only / /api/ / 扩展名一起收进 _route_kind——因为埋点也要用同一份
+        # 判定，而"镜像一份"已经错过两次（见 _route_kind 的 docstring）。
+        return _not_found("方法不允许")
+    path = "/index.html" if kind == "page" else uri
+    request["uri"] = f"/{route['static_prefix']}{path}"
+    _add_s3_sigv4_auth(request, FRONTEND_BUCKET_DOMAIN, request["uri"])
+    request["origin"] = _custom_origin(FRONTEND_BUCKET_DOMAIN)
+    request["headers"]["host"] = [{"key": "Host", "value": FRONTEND_BUCKET_DOMAIN}]
+    return request
+```
+
+> 注意**原来那行拼接有个已知陷阱**（CLAUDE.md 记过）：`static_prefix` 不带尾
+> 斜杠，而 `path` 已以 `/` 开头。上面的写法与原实现拼出的字符串逐字相同，
+> 改完必须跑 `test_origin_request.py` 里针对静态改写的那几条确认。
 
 `_check_auth` 增加可选 out-param（**返回类型一个字不改**）：
 
@@ -832,10 +904,12 @@ def _check_auth(request, route, host, sink=None):
         # **在 _route_request 之前抓 uri**：那个函数会把静态请求的 uri 改写成
         # 桶内 key（f"/{static_prefix}{path}"），埋点要记的是用户看到的路径。
         original_uri = request.get("uri", "/")
+        original_method = request.get("method", "GET")
         sink: dict = {}
         denied = _check_auth(request, route, original_host, sink)
         result = denied if denied else _route_request(request, route)
-        _maybe_record(context, subdomain, original_uri, route, denied, sink)
+        _maybe_record(context, subdomain, original_uri, original_method,
+                      route, denied, sink)
         return result
 ```
 
@@ -871,11 +945,15 @@ cp router/infrastructure/lambda/origin_request.py /tmp/orq.py.bak
 ③ 把 `_maybe_record` 的调用挪到 `_route_request` **之后**并改用
 `request.get("uri")` → 预期 `test_written_item_shape` 里 `path` 变成
 `/sites/...` 形态（**若不红，说明该断言没盯住 path，补断言**）。
-④ 把 `_is_page_request` 里 `if uri.startswith("/api/")` 那两行删掉 → 预期
-`test_page_detection_agrees_with_real_routing[/api/data-False]` 变红。
-**这一条是 P1-1 的回归闸门**：删之前那个实现全绿。
-⑤ 把 sink 赋值挪回 `if REQUIRE_IDP_CLAIM:` **之前** → 预期
+④ 把 `_route_kind` 里 `if uri.startswith("/api/")` 那两行删掉 → 预期
+`test_route_kind_matches_what_route_request_actually_does` 在 `/api/data` 上变红。
+⑤ 把 `_route_kind` 里 `if method not in ("GET", "HEAD")` 那两行删掉 → 预期在
+`POST /notes` 上变红。**这两条是 P1-1 两轮的回归闸门**：删之前的实现分别全绿。
+⑥ 把 sink 赋值挪回 `if REQUIRE_IDP_CLAIM:` **之前** → 预期
 `test_untrusted_idp_session_yields_302_without_an_email` 变红。
+⑦ 让 `_route_request` 不再调 `_route_kind`、改回自己判 → 预期
+`test_route_kind_matches_what_route_request_actually_does` 在某些组合上变红
+（证明"唯一定义"这条结构约束真的被测着，而不是靠人自觉）。
 
 还原并双证：
 
@@ -1828,6 +1906,22 @@ def test_month_uv_is_null_and_flagged_outside_the_detail_window(env):
     assert b["uv"] is None and b["uv_exact"] is False
 
 
+def test_empty_bucket_outside_the_window_is_also_flagged(env):
+    """P2-2 的回归：零填充之后，**没有任何数据**的旧月份同样要标 uv_exact=False。
+
+    上一版按"桶里有哪些天有数据"判定 → 空桶的 days=[] → any() 为 False →
+    被标成 uv_exact=True 且 uv=0，等于对一个查不到的区间宣称"0 个独立访客"。
+    """
+    import analytics
+    out = {b["bucket"]: b for b in analytics.series("never-visited", "month", 8)}
+    oldest = sorted(out)[0]
+    assert out[oldest]["uv"] is None, out[oldest]
+    assert out[oldest]["uv_exact"] is False, out[oldest]
+    # 正对照：当前月份（在窗口内）必须给精确的 0，而不是 null
+    newest = sorted(out)[-1]
+    assert out[newest]["uv"] == 0 and out[newest]["uv_exact"] is True, out[newest]
+
+
 def test_month_uv_is_exact_inside_the_detail_window(env):
     """正对照：窗口内的月份必须给出精确 UV（跨天去重，不是日 UV 相加）。"""
     import analytics
@@ -1898,8 +1992,14 @@ def test_visitors_rejects_out_of_range_parameters(env, days, limit):
 
 
 # ── 端点层：授权 ─────────────────────────────────────────────────
+# **fixture 用 panel conftest 的 `aws`，不是 deployer 那个 `env`**（Codex 复审
+# 2026-08-14 P2-1）：`env` 只定义在 deployer 的 test_analytics.py 里，在这里写
+# 它会直接 `fixture 'env' not found`。而 `aws` 已经 `with mock_aws()` 并建好了
+# jobs/sites/routing/admins——**再嵌一层 mock_aws 是错的**，正确做法是往
+# conftest 的 `aws` 里补这两张表 + 两个环境变量（下面 Step 3 有 diff）。
 
-def test_endpoints_require_view_analytics(monkeypatch, env):
+
+def test_endpoints_require_view_analytics(monkeypatch, aws):
     """无权者必须 403，且走 CAPABILITIES 的判定，不在 api.py 另写角色子句。"""
     import api
     import permissions
@@ -1913,7 +2013,7 @@ def test_endpoints_require_view_analytics(monkeypatch, env):
         api.do_get_visitors("nobody@x.co", "s1", days=7, limit=10, cursor=None)
 
 
-def test_owner_may_read_both_endpoints(monkeypatch, env):
+def test_owner_may_read_both_endpoints(monkeypatch, aws):
     """正对照：不能只验"拒"——头压根没到达也会让负测全绿（§3.5）。"""
     import api
     import permissions
@@ -2122,17 +2222,20 @@ def series(site_id: str, period: str = "day", n: int = 30) -> list[dict]:
         if period == "day":
             b["uv"] = st["uv"]              # 日 UV 直接取，永远精确
 
-    for b in buckets.values():
+    for key, b in buckets.items():
         if period == "day":
             b.pop("_days")
             continue
         days = b.pop("_days")
-        # **UV 不能相加去重**：跨天去重必须回明细。区间任一天掉出明细窗口，
-        # 这个桶的 UV 就给不出精确值——此时给 null 而不是给一个上界。
-        if any(datetime.strptime(d, "%Y-%m-%d").date() < detail_floor
-               for d in days):
+        # **判据是桶的日历边界，不是桶内恰好有哪些数据行**（Codex 复审
+        # 2026-08-14 P2-2）：零填充之后，一个 200 天前、没有任何聚合行的月份
+        # 其 `days` 是空列表 → `any(...)` 为 False → 会被标成 `uv_exact=True`
+        # 且 `uv=0`，与 spec §1.4「超出窗口就 null」直接冲突。
+        # 用桶自己的首日判定，与桶里有没有数据无关。
+        if _bucket_first_day(period, key) < detail_floor:
             b["uv"], b["uv_exact"] = None, False
             continue
+        # **UV 不能相加去重**：跨天去重必须回明细。
         visitors = set()
         for d in days:
             for r in _day_rows(site_id, d):
@@ -2219,6 +2322,33 @@ def do_get_visitors(email: str, site_id: str, *, days: int = 7,
     return analytics.visitors(site_id, days=days, limit=limit, cursor=cursor)
 ```
 
+`site-builder/panel/tests/conftest.py` 的 `aws` fixture 补两张表与两个环境变量
+（**在已有的 `with mock_aws()` 块里加，不要另起一层**）：
+
+```python
+        ddb.create_table(TableName="site-access-events",
+                         KeySchema=[{"AttributeName": "site_date", "KeyType": "HASH"},
+                                    {"AttributeName": "ts_id", "KeyType": "RANGE"}],
+                         AttributeDefinitions=[
+                             {"AttributeName": "site_date", "AttributeType": "S"},
+                             {"AttributeName": "ts_id", "AttributeType": "S"}],
+                         BillingMode="PAY_PER_REQUEST")
+        ddb.create_table(TableName="site-access-daily",
+                         KeySchema=[{"AttributeName": "site_id", "KeyType": "HASH"},
+                                    {"AttributeName": "date", "KeyType": "RANGE"}],
+                         AttributeDefinitions=[
+                             {"AttributeName": "site_id", "AttributeType": "S"},
+                             {"AttributeName": "date", "AttributeType": "S"}],
+                         BillingMode="PAY_PER_REQUEST")
+```
+
+并在该文件顶部的 `ENV` 字典里加：
+
+```python
+    "ACCESS_EVENTS_TABLE": "site-access-events",
+    "ACCESS_DAILY_TABLE": "site-access-daily",
+```
+
 `handler.py`：ROUTES 在 `/jobs` 之后加两条 + 常量 + 分发。
 
 ```python
@@ -2265,8 +2395,11 @@ cd site-builder/panel && \
 
 ① `do_get_analytics` 的 `assert_can` 删掉 → 预期
 `test_endpoints_require_view_analytics` 变红。
-② `series()` 里"任一天掉出窗口就给 null"的判断删掉 → 预期
-`test_month_uv_is_null_and_flagged_outside_the_detail_window` 变红。
+② `series()` 里按桶首日判窗口的那行删掉 → 预期
+`test_month_uv_is_null_and_flagged_outside_the_detail_window` **与**
+`test_empty_bucket_outside_the_window_is_also_flagged` 一起变红。
+② bis 把该判据改回"看桶内有哪些天有数据"（`any(... for d in days)`）→ 预期
+**只有**空桶那条红（有数据的旧月份仍绿）——这正好证明两条覆盖的是不同失效。
 ③ `series()` 的月桶 UV 改成日 UV 相加 → 预期
 `test_month_uv_is_exact_inside_the_detail_window` 报"同一个人跨两天被算成两个"。
 ④ ROUTES 加了但不加分发分支 → 预期 `test_every_route_still_has_a_dispatch_branch` 变红。
@@ -2280,7 +2413,7 @@ cd "$(git rev-parse --show-toplevel)"
 git add site-builder/deployer/functions/analytics.py \
         site-builder/deployer/tests/test_analytics.py \
         site-builder/panel/api.py site-builder/panel/handler.py \
-        site-builder/panel/tests/
+        site-builder/panel/tests/conftest.py site-builder/panel/tests/
 git commit -m "feat(m5): panel 的读取层与两个 GET 端点
 
 analytics.py 落在 deployer/functions/（共享模块的既有位置，也是 MCP 闭包守卫
@@ -2534,7 +2667,7 @@ def test_pv7_of_a_site_without_data_is_seven_zeros(env):
     assert analytics.pv7("never-visited") == [0] * 7
 
 
-def test_list_sites_carries_pv7(monkeypatch, env):
+def test_list_sites_carries_pv7(monkeypatch, aws):
     """站点列表的迷你趋势（母 spec §11-clarify 的 M5 项）。"""
     import api
     import permissions
@@ -2828,8 +2961,13 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 ```python
 def test_analytics_modules_are_in_the_deploy_package():
-    """analytics.py import access_rollup（pv/uv 口径的唯一定义），
-    所以两者都必须进包——漏一个的症状是线上 ImportError 而单测全绿。"""
+    """两个模块都必须进包。
+
+    **漏 analytics.py 的症状不是"统计端点失效"**：api.py 顶层 import 它，
+    所以整个 panel Lambda import 失败 → **所有**控制台 API 500
+    （keystore.py 的复制清单注释记的是同一个形态）。
+    漏 access_rollup.py 则是 analytics.py 自己 import 失败，结果一样。
+    """
     import importlib.util
     from pathlib import Path
     spec = importlib.util.spec_from_file_location(
@@ -2837,7 +2975,8 @@ def test_analytics_modules_are_in_the_deploy_package():
     dp = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(dp)
     names = {Path(p).name for p in dp.COPY_FILES}
-    assert "access_rollup.py" in names, f"access_rollup.py 没进包: {sorted(names)}"
+    for mod in ("analytics.py", "access_rollup.py"):
+        assert mod in names, f"{mod} 没进包: {sorted(names)}"
 
 
 def test_panel_env_carries_both_access_tables():
@@ -2917,7 +3056,27 @@ cd site-builder/panel && \
 
 - [ ] **Step 3: 写实现**
 
-`deploy_panel.py` 的环境变量字典加两项、`COPY_FILES` 加 `access_rollup.py`：
+`deploy_panel.py` 有**三处**要改（Codex 复审 2026-08-14 P1-2）：
+
+`_build_zip()` 只打包 `panel/*.py` + `COPY_FILES` 里列的文件。`api.py` 顶层
+`import analytics`，而 `analytics.py` 现在住在 `deployer/functions/` ——所以
+**两个模块都要进 COPY_FILES**，漏 `analytics.py` 的后果不是"统计端点失效"，
+而是 **api.py import 失败 → 整个 panel Lambda 500**（keystore.py 那条注释记的
+就是同一个形态）：
+
+```python
+COPY_FILES = ("common.py", "permissions.py", "ops_log.py", "session.py",
+              "edge_caller.py", "keystore.py", "keygen.py",
+              # M5：api.py 顶层 import analytics，analytics 又 import
+              # access_rollup（pv/uv 口径的唯一定义）。两个都漏不得。
+              "analytics.py", "access_rollup.py")
+```
+
+`test_deploy_panel_contract.py:44-46` 是**恒定集合快照**（`assert
+set(dp.COPY_FILES) == {...}`），必须同步加这两个名字——它与隔壁的传递闭包断言
+是一对：闭包挡"改了代码忘了改清单"，快照挡"往清单里塞了不存在的文件"。
+
+然后环境变量字典加两项：
 
 ```python
         "API_KEYS_TABLE": "site-api-keys",
@@ -2967,8 +3126,10 @@ cd site-builder/mcp && python3 -m pytest tests -q
 
 - [ ] **Step 5: 反向验证**
 
-① 把 `access_rollup.py` 从 panel 的 `COPY_FILES` 去掉 → 预期
-`test_analytics_modules_are_in_the_deploy_package` 变红。
+① 把 `analytics.py` 从 panel 的 `COPY_FILES` 去掉 → 预期**三条**一起红：
+新加的那条、既有的 `test_copy_files_covers_every_local_module_panel_imports`
+（传递闭包）、以及 `test_build_copies_session_py_too`（恒定集合快照）。
+三条同时红是对的——它们盯的是同一个不变量的三个方向。
 ② 把 `analytics.py` 从 **Dockerfile 的 COPY 行**去掉 → 预期**既有的**
 `test_agentcore_contract` 闭包守卫变红（证明"把模块放对位置"确实让既有守卫生效，
 而不是靠新守卫）。
@@ -3047,21 +3208,26 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
                            cookies=ck_new)
         check(st == 400, "visitors days=91 → 400（不静默夹到 90）", f"实际 {st}")
 
-        # 负测的正对照：无权者必须 403（§3.5——只验"拒"时，"请求压根没到达"
-        # 会让负测永远绿）
-        st, _, _ = request("GET", origin + f"/api/sites/{outsider_site}/analytics",
-                           cookies=ck_new)
-        check(st == 403, "无权站点的 analytics → 403", f"实际 {st}")
+        # 越权负测：**用 outsider 的 cookie 打本次真实创建的站点**。
+        # 本脚本第 276 行已经有 `ck_out = cookies_for(outsider, ...)`，
+        # 而 `outsider_site` 这个变量**并不存在**（Codex 复审 2026-08-14 P2-3
+        # 指出，我上一版凭空引了它）。
+        # 也**不要**退化成"请求一个不存在的 site_id"——那只证明 site=None 被拒，
+        # 证不出"一个真实存在的站点不会被无权者读到"，而后者才是要防的。
+        st, _, _ = request("GET", origin + f"/api/sites/{site_id}/analytics",
+                          cookies=ck_out)
+        check(st == 403, "outsider 读真实站点的 analytics → 403", f"实际 {st}")
+        st, _, _ = request("GET", origin + f"/api/sites/{site_id}/visitors",
+                          cookies=ck_out)
+        check(st == 403, "outsider 读真实站点的 visitors → 403", f"实际 {st}")
 ```
 
-> `outsider_site` 用本脚本已有的"他人站点"变量名（`grep -n "outsider" site-builder/scripts/verify_console_e2e.py` 确认）；
-> 若脚本里没有这样的 fixture，改成对一个**不存在**的 site_id 断言 403
-> （`assert_can` 对 `site=None` 返回 ROLE_NONE → PermissionDenied → 403，
-> 且文案不区分"不存在"与"无权"，这正是防枚举的设计）。
+> `ck_out` 在本脚本第 276 行已存在（`cookies_for(outsider, console_session=True)`）。
+> 若这两条要放在 ⑥ 段之前，把 `ck_out` 的构造上移即可——**不要新建一个身份**。
 
 - [ ] **Step 2: 改下限常量**
 
-本段从 2 条变成 7 条 → 找到 `MIN_*_CHECKS` 常量并 +5。
+本段从 2 条变成 8 条 → 找到 `MIN_*_CHECKS` 常量并 +6。
 
 ```bash
 grep -n "MIN_.*CHECKS" site-builder/scripts/verify_console_e2e.py
@@ -3245,12 +3411,27 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 - [ ] **Step 0: 先提取 MCP 客户端封装**
 
-`class Mcp` 现在长在 `verify_api_key_e2e.py:184`。本闸门要用它，但**不能复制
-一份**——两份 OAuth/token 逻辑必然漂移（本仓库反复记过这个形态）。提到
-`site-builder/scripts/_mcp_client.py`，两个闸门都 import。
+要提取的是**两个来源**（我上一版只说了一个，还凭空引了两个不存在的
+helper——Codex 复审 P1-3d）：
 
-提取后**必须重跑 `verify_api_key_e2e.py` 确认仍 34/34**（否则这次重构本身就是
-一次回归），再继续。
+| 要什么 | 现在在哪 | 实测确认 |
+|---|---|---|
+| `class Mcp`（含 `initialize()` / `call_tool(..., expect=)`） | `verify_api_key_e2e.py:184` | ✔ |
+| 用户 token | **`verify_oauth_and_impersonation.py:105` 的 `_load_token()`** | ✔ 不在 Mcp 类里 |
+| MCP endpoint | `cfg("MCP", "endpoint_url")`（同文件 :177） | ✔ |
+
+新建 `site-builder/scripts/_mcp_client.py`，导出 `Mcp`、
+`load_user_token()`（= 原 `_load_token`）、`mcp_endpoint()`。两个既有闸门改成
+import 它——**不能复制一份**，两份 OAuth/token 逻辑必然漂移。
+
+**`call_tool` 之前必须先 `initialize()`**：协议要求 initialize 后再发一条
+`notifications/initialized`，否则服务端按"未完成握手"拒掉后续请求
+（`Mcp.initialize` 的注释就是这么写的）。我上一版直接调 `call_tool`，那不是
+真实调用路径。
+
+提取后**两个来源闸门都要重跑**确认没回归：`verify_api_key_e2e.py` 仍 **34/34**、
+`verify_oauth_and_impersonation.py` 仍 **11/11**。这一步不过不许往下走——
+重构一个共享封装本身就是一次改动。
 
 **关键设计（spec §0.4）**：Global Table 复制是异步的（典型 <1s，无 SLA），
 所以**必须轮询等待**那一行、有上限、超时即红。发完请求立刻断言 = 做出一个
@@ -3284,7 +3465,7 @@ import boto3
 ROOT = Path(__file__).resolve().parents[2]
 CFG_PATH = ROOT / "site-builder" / "config.ini"
 ROUTER_CFG_PATH = ROOT / "router" / "config.ini"
-MIN_CHECKS = 24
+MIN_CHECKS = 30
 results = []
 
 
@@ -3334,9 +3515,13 @@ def main() -> int:
     if not cookie:
         raise SystemExit("需要 sb_session")
 
+    import urllib.error
     import urllib.request
-    def get(path, ck=cookie):
-        req = urllib.request.Request(f"https://app-{site_id}.{base}{path}")
+
+    def get(path, ck=cookie, host=None):
+        """发一次真实请求。`host` 默认被测站点，可覆盖成别的子域。"""
+        h = host or f"app-{site_id}"
+        req = urllib.request.Request(f"https://{h}.{base}{path}")
         if ck:
             req.add_header("Cookie", f"sb_session={ck}")
         try:
@@ -3344,6 +3529,13 @@ def main() -> int:
                 return r.status, r.read()[:200]
         except urllib.error.HTTPError as e:
             return e.code, e.read()[:200]
+
+    def get_json(url, cookie=""):
+        req = urllib.request.Request(url)
+        if cookie:
+            req.add_header("Cookie", cookie)
+        with urllib.request.urlopen(req) as r:
+            return json.loads(r.read())
 
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     probe = f"/m5probe-{int(time.time())}"
@@ -3410,99 +3602,101 @@ def main() -> int:
               agg["pv_denied"]["N"])
 
     print("\n── ⑤ 不在名单 → denied_403（带已验签邮箱）──────────")
-    # 这一段需要一个**有会话但不在该站点名单**的身份。没有第二个身份时不猜、
-    # 不伪造——但也不能就这么跳过（永久 SKIP 是死重量，§3.6）：改成换一个
-    # **观察量**——用同一身份请求一个自己无权访问的站点。
-    other = input("一个你**无权访问**的 ACTIVE 站点 site_id（留空则跳过 ⑤）: ").strip()
+    # 需要一个**有会话但不在该站点名单**的场景。用同一身份请求一个自己无权访问
+    # 的站点：403 分支的邮箱已验签，所以"谁被拒了"这条记录仍然成立。
+    # **注意不要顺手请求本站点**——上一版这里有一行
+    # `get(probe4, ck=cookie)` 会给被测站点多加一条 allow 记录，
+    # 而 agg_pv 已经在 ④ 段快照过 ⇒ ⑦ 段的比对必然失败（Codex 复审 P1-3b）。
+    other = input("一个你**无权访问**的 ACTIVE 站点 site_id（留空则本段记 FAIL）: ").strip()
     if other:
         probe4 = f"/m5probe4-{int(time.time())}"
-        st, _ = get(probe4.replace(probe4, probe4), ck=cookie)  # 同 cookie
-        import urllib.request as _u
-        req = _u.Request(f"https://app-{other}.{base}{probe4}")
-        req.add_header("Cookie", f"sb_session={cookie}")
-        try:
-            with _u.urlopen(req) as r:
-                st4 = r.status
-        except urllib.error.HTTPError as e:
-            st4 = e.code
+        st4, _ = get(probe4, host=f"app-{other}")
         check(st4 == 403, f"无权站点返回 403（实际 {st4}）", str(st4))
         row4, _ = wait_for_row(ddb, events_table, other, day, probe4)
         if row4:
             check(row4["decision"]["S"] == "denied_403",
                   "decision == denied_403", row4["decision"]["S"])
             check("@" in row4["email"]["S"],
-                  "被拒记录带**已验签**邮箱（"谁被拒了"是这条记录的全部价值）",
+                  "被拒记录带已验签邮箱（「谁被拒了」是这条记录的全部价值）",
                   row4["email"]["S"][:3] + "…")
         else:
             check(False, "denied_403 的明细行出现", "超时未出现")
     else:
-        print("  SKIP  ⑤（没有第二个站点可用）——**这不是通过**，"
-              "MIN_CHECKS 会因此不达标而报红")
+        # **不 SKIP**：永久 SKIP 是死重量（§3.6）。记 FAIL 让下限报红。
+        check(False, "denied_403 已验证", "没给第二个站点 —— 本段未验证")
+        check(False, "被拒记录带已验签邮箱", "同上")
 
     print("\n── ⑥ 平台子域不产生记录（负测 + 正对照）──────────")
-    import urllib.request as _u2
     cprobe = f"/m5cprobe-{int(time.time())}"
-    try:
-        rq = _u2.Request(f"https://console.{base}{cprobe}")
-        rq.add_header("Cookie", f"sb_session={cookie}")
-        with _u2.urlopen(rq) as r:
-            pass
-    except Exception:
-        pass          # 404/403 都无所谓，我们只看有没有产生明细行
-    found = False
+    get(cprobe, host="console")
+    found = []
     for probe_site in ("console", site_id):
         r, _ = wait_for_row(ddb, events_table, probe_site, day, cprobe, timeout=6)
-        found = found or (r is not None)
-    check(not found, "console 子域的请求**没有**产生任何明细行（app- 前缀判定）", "")
-    # 正对照已在 ② 段给过（同一时刻的页面请求确实产生了行），此处复用其结论
+        if r is not None:
+            found.append(probe_site)
+    check(not found, "console 子域的请求**没有**产生明细行（app- 前缀判定）",
+          f"却在 {found} 下找到了")
+    # 正对照在 ② 段已给（同一时刻的页面请求确实产生了行），此处复用其结论
 
-    print("\n── ⑦ 面板 API 与 MCP 返回同一个数字（**自动比对**）────")
-    # 上一版这里只 print 一行"手工核对"就 return 0（Codex 审查 P1-3）——
-    # 于是 spec §5.1 承诺的"面板与 MCP 返回同一数字"从未被闸门验证，
-    # 而 MIN_CHECKS 光靠 ①-④ 就能达标 ⇒ MCP 完全不可用时本脚本照样 exit 0。
-    agg_pv = int(agg["pv"]["N"]) if agg else -1
+    print("\n── ⑦ 面板与 MCP 都与明细表对得上（**自动比对**）──────")
+    # 上一版这里只 print 一行"手工核对"就 return 0（Codex 审查 P1-3）：于是
+    # spec §5.1 承诺的"面板与 MCP 返回同一数字"从未被闸门验证，而 MIN_CHECKS
+    # 光靠前四段就能达标 ⇒ MCP 完全不可用时本脚本照样 exit 0。
+    #
+    # **比对基准不用 ④ 段的 agg_pv 快照**（Codex 复审 P1-3b）：today 的数由读
+    # 路径实时算，而本脚本在 ④ 之后还发了探针，真实站点上也可能有别人的流量。
+    # 改成**夹逼**：live_before ≤ 被测值 ≤ live_after。today 的 PV 在本轮内
+    # 单调不减，所以这个断言既防竞态又抓得住真错（读错表/错字段/差 N 都会越界）。
+    def live_allow_pv() -> int:
+        """独立数一遍今天的 allow 行——**不 import 实现来算期望值**（那是循环论证）。"""
+        n, kwargs = 0, {"TableName": events_table,
+                        "KeyConditionExpression": "site_date = :sd",
+                        "ExpressionAttributeValues": {":sd": {"S": f"{site_id}#{day}"}},
+                        "ProjectionExpression": "decision"}
+        while True:
+            resp = ddb.query(**kwargs)
+            n += sum(1 for it in resp.get("Items", [])
+                     if it.get("decision", {}).get("S") == "allow")
+            if "LastEvaluatedKey" not in resp:
+                return n
+            kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+
+    live_before = live_allow_pv()
+    check(live_before >= 2, f"明细表里今天的 allow 行 ≥ 2（实际 {live_before}）",
+          str(live_before))
 
     console_cookie = input("粘一个 __Host-sb_console cookie 值（面板会话）: ").strip()
+    panel_pv = None
     if console_cookie:
-        rq = _u2.Request(f"https://console.{base}/api/sites/{site_id}"
-                         "/analytics?period=day&n=2")
-        rq.add_header("Cookie", f"sb_session={cookie}; "
-                                f"__Host-sb_console={console_cookie}")
         try:
-            with _u2.urlopen(rq) as r:
-                pbody = json.loads(r.read())
-            pv_today = next((b["pv"] for b in pbody.get("series", [])
-                             if b["bucket"] == day), None)
-            check(pv_today is not None, "面板 analytics 返回了今天的桶",
-                  str([b["bucket"] for b in pbody.get("series", [])]))
-            check(pv_today == agg_pv,
-                  f"面板 PV == 聚合行 PV（{pv_today} vs {agg_pv}）",
-                  f"面板 {pv_today} / 聚合 {agg_pv}")
-            check(len(pbody.get("series", [])) == 2,
-                  "n=2 返回恰好 2 个桶（日历对齐契约）",
-                  str(len(pbody.get("series", []))))
+            body = get_json(f"https://console.{base}/api/sites/{site_id}"
+                            "/analytics?period=day&n=2",
+                            cookie=f"sb_session={cookie}; "
+                                   f"__Host-sb_console={console_cookie}")
+            series = body.get("series", [])
+            check(len(series) == 2, "n=2 返回恰好 2 个桶（日历对齐契约）",
+                  str([b.get("bucket") for b in series]))
+            today_bucket = next((b for b in series if b["bucket"] == day), None)
+            check(today_bucket is not None, "面板返回了今天的桶",
+                  str([b.get("bucket") for b in series]))
+            if today_bucket:
+                panel_pv = today_bucket["pv"]
+                check("uv_exact" in today_bucket,
+                      "桶带 uv_exact（契约字段，不是可选项）", str(today_bucket))
         except Exception as e:
             check(False, "面板 analytics 可调用", f"{type(e).__name__}: {e}")
     else:
-        check(False, "面板 analytics 已核对",
-              "没给面板会话 cookie —— 未验证，不计为通过")
+        check(False, "面板 analytics 已核对", "没给面板会话 cookie —— 未验证")
 
-    # MCP：走**真实调用路径**（不手构造参数，§5.4）。
-    #
-    # 复用 `verify_api_key_e2e.py:184` 的 `class Mcp`——**不要在本文件重写一个**
-    # （两份 OAuth/token 逻辑必然漂移）。它的 `call_tool(name, args, *,
-    # expect="dict"|"list") -> (ok, payload)`：`expect` **必须由调用方声明**，
-    # 因为线上这台 server 不发 `structuredContent`，自动猜返回形态在一半情况下
-    # 会静默少数据（M4-FINDINGS §3.4）。
-    #
-    # 本 Task 的前置一步：把 `class Mcp` 与它的 token 获取从
-    # `verify_api_key_e2e.py` 提到 `site-builder/scripts/_mcp_client.py`，
-    # 两个闸门都 import 它（提取后 verify_api_key_e2e 必须重跑确认仍 34/34）。
-    print("  MCP：调 get_site_analytics 并与聚合行比对")
+    # MCP：走**真实调用路径**。必须先 initialize（协议要求，且服务端会按
+    # "未完成握手"拒掉后续请求——verify_api_key_e2e 的 Mcp.initialize 注释记了）。
+    mcp_pv = None
     try:
         sys.path.insert(0, str(ROOT / "site-builder" / "scripts"))
-        from _mcp_client import Mcp, user_token, mcp_endpoint
-        m = Mcp(mcp_endpoint(), {"authorization": f"Bearer {user_token()}"})
+        from _mcp_client import Mcp, load_user_token, mcp_endpoint
+        m = Mcp(mcp_endpoint(), {"authorization": f"Bearer {load_user_token()}"})
+        st_i, _ = m.initialize()
+        check(st_i == 200, f"MCP initialize（HTTP {st_i}）", str(st_i))
         ok, payload = m.call_tool("get_site_analytics",
                                   {"site_id": site_id, "period": "day",
                                    "days": 2}, expect="dict")
@@ -3511,13 +3705,27 @@ def main() -> int:
             check(isinstance(payload, dict),
                   "MCP 工具返回单个 dict（不是裸列表，§3.4）",
                   type(payload).__name__)
-            mpv = next((b["pv"] for b in payload.get("series", [])
-                        if b["bucket"] == day), None)
-            check(mpv == agg_pv, f"MCP PV == 聚合行 PV（{mpv} vs {agg_pv}）",
-                  f"MCP {mpv} / 聚合 {agg_pv}")
+            tb = next((b for b in payload.get("series", [])
+                       if b["bucket"] == day), None)
+            check(tb is not None, "MCP 返回了今天的桶", str(payload)[:120])
+            if tb:
+                mcp_pv = tb["pv"]
     except Exception as e:
         # 不 SKIP：MCP 不可用正是 P1-2 的症状，必须红
         check(False, "MCP get_site_analytics 可调用", f"{type(e).__name__}: {e}")
+
+    live_after = live_allow_pv()
+    for label, value in (("面板", panel_pv), ("MCP", mcp_pv)):
+        check(value is not None and live_before <= value <= live_after,
+              f"{label} 的今日 PV 落在明细实测区间 [{live_before}, {live_after}]",
+              f"{label} 给的是 {value}")
+    check(panel_pv is not None and panel_pv == mcp_pv,
+          "面板与 MCP 给出同一个数字", f"面板 {panel_pv} / MCP {mcp_pv}")
+
+    # ④ 段的聚合行也要与明细对得上（rollup 的口径正确性）
+    check(agg is not None and live_before >= int(agg["pv"]["N"]),
+          "聚合行 pv ≤ 之后读到的明细 allow 数（rollup 口径一致，允许期间新增）",
+          f"聚合 {agg['pv']['N'] if agg else '?'} / 明细 {live_before}")
 
     return 0
 
@@ -3561,7 +3769,10 @@ cd "$(git rev-parse --show-toplevel)" && python3 -m py_compile site-builder/scri
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"
-git add site-builder/scripts/verify_analytics_e2e.py
+git add site-builder/scripts/_mcp_client.py \
+        site-builder/scripts/verify_api_key_e2e.py \
+        site-builder/scripts/verify_oauth_and_impersonation.py \
+        site-builder/scripts/verify_analytics_e2e.py
 git commit -m "test(m5): verify_analytics_e2e——走到 panel 与 MCP，自动比数字
 
 初版只到聚合行就 print 一行"手工核对"然后 return 0（Codex 审查 P1-3）：于是
@@ -3657,7 +3868,7 @@ cd site-builder/mcp && python3 deploy_agentcore.py
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"
-python3 site-builder/scripts/verify_analytics_e2e.py          # 新增，≥24 项
+python3 site-builder/scripts/verify_analytics_e2e.py          # 新增，≥30 项
 python3 site-builder/scripts/verify_deployed_components.py     # 应为 71/71
 python3 site-builder/scripts/verify_console_e2e.py             # ⑪ 段 7 条
 bash    site-builder/scripts/verify_deployed_edge.sh           # 版本 8
@@ -3811,7 +4022,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 | P2-2 week/month 给 n+1 桶 | 完全接受 | Task 8（日历对齐 + 零填充 + 2 条用例） | 五种参数**全错**：`month n=1`→2 个、`n=2`→3 个、`week n=4`→5 个 |
 | P2-3 漏了列表迷你趋势 | 完全接受 | **新增 Task 9b** | 母 spec §11-clarify **与** M3 spec 第 64 行都列了；原型里 `pv7`×6、`sparkline`×4 |
 | P2-4 两组 CDK 断言无效 | 完全接受 | Task 4（config 账号字面量）+ Task 6（按逻辑 ID 匹配、删恒真式） | 实测 `self.account`→`Fn::Join` dict；`table_arn`→`Fn::GetAtt`，policy 里无表名字面量 |
-| P2-5 host-local 路径 | **部分接受** | 全局改成仓库相对 / `git rev-parse` | 接受要改：M3/M4 计划里 `/Users/kentpeng` 各 **0** 次，我 69 次破坏惯例。**驳回它的定性**——那不是凭证，且它引的「本轮 AGENTS.md」在本仓库**不存在**（`ls AGENTS.md` → No such file）。按惯例改，不按 secret-scan 改 |
+| P2-5 host-local 路径 | **完全接受**（上一轮我判成"部分接受"，**判错了**，见下） | 全局改成仓库相对 / `git rev-parse` | M3/M4 计划里各 **0** 次，我 69 次破坏惯例 |
 
 ### Codex 没发现的三条（我实测出来的）
 
@@ -3832,7 +4043,52 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 到 `_mcp_client.py` 再两处共用，并要求提取后重跑 `verify_api_key_e2e` 确认
 仍 34/34。
 
-### 这轮审查暴露的一个方法论问题（记进 M5-FINDINGS）
+### 我上一轮驳错的那条（P2-5），更正记录
+
+上一轮我写「驳回它的定性——那不是凭证，且它引的『本轮 AGENTS.md』在本仓库
+**不存在**」。**两处都错**：
+
+1. **我查错了位置。** 我跑的是 `ls AGENTS.md`（仓库根）。它说的是**全局**配置：
+   全局 `AGENTS.md`（家目录下那份）**确实存在**，第 13 行明写
+   `Host-local info: absolute home paths like /Users/<name>/… or /home/<name>/…`。
+   一条"查无此文"的结论，检查范围必须覆盖对方引用的位置——我只查了一处就下了
+   全称判断。
+2. **我驳的不是它的主张。** 它说的是"属于必须在 commit/push 前披露的
+   host-local 信息类别"，从没说那是凭证。我却去论证"那不是凭证"——**打赢了一个
+   对方没提的论点**，而真正的主张没被回应。
+
+**判据（比这条缺陷本身更值得记）**：驳回一条审查意见之前，先做两件事——
+① 把对方的主张按原话复述一遍，确认自己驳的是它；② 确认自己的检查范围覆盖了
+它引用的位置（全局配置 / 上级文档 / 别的目录都算）。这两条我都漏了，而结果是
+一个自信的错误结论进了被跟踪文件。
+
+## Codex 第二轮复审（2026-08-14）的处置：**7 条全部接受**
+
+复审锚定 `d6397ee..c0987dc`。它确认第一轮的 P1-4 / P2-1 / pv7 / TableV2 fixture /
+Replicas 注释 / venv 路径已关闭。剩下 7 条我**全部接受**，每条都实测：
+
+| # | 判定 | 落在哪 | 实测依据 |
+|---|---|---|---|
+| P1-1 页面判定漏 method | 接受 | Task 3 改成**唯一定义** `_route_kind`，`_route_request` 与埋点都消费它；测试 6 method × 10 uri = **60 组**逐个比真实处理 | 实测 4 条不一致：`POST/PUT/OPTIONS/DELETE` 打无扩展名路径 → 真实 404，却被记成 `allow` PV |
+| P1-2 panel 包缺 analytics.py | 接受 | Task 11：`COPY_FILES` 加**两个**模块 + 更新恒定集合快照 | `_build_zip` 只打 `panel/*.py` + `COPY_FILES`；`api.py` 顶层 import ⇒ 漏了是**整个 panel 500**，不只是统计端点 |
+| P1-3a Task 14 有 SyntaxError | 接受 | 改用 `「」` | 机器扫全部 48 个 python 块，确认那一处是真错（另一处是 dict 片段，非缺陷）；**修完重扫 0 处** |
+| P1-3b rollup 后又发请求 → 比对必失败 | 接受 | ⑦ 段基准改成**夹逼** `live_before ≤ 值 ≤ live_after`；删掉那行多余请求 | 我写的 `get(probe4.replace(probe4, probe4))` 打的是原站点，纯属手误；且快照比实时在真实站点上天生有竞态 |
+| P1-3c 缺 MCP initialize | 接受 | Task 14 先 `initialize()` 再 `call_tool` | `Mcp.initialize` 的注释原话：不发 `notifications/initialized` 会被按"未完成握手"拒掉 |
+| P1-3d `user_token`/`mcp_endpoint` 是假引用 | 接受 | 提取表写明**两个来源**：`Mcp` 来自 `verify_api_key_e2e.py:184`、token 来自 `verify_oauth_and_impersonation.py:105` 的 `_load_token` | 那两个 helper 我凭空造的，仓库里不存在 |
+| P1-3e commit 漏两个文件 | 接受 | `git add` 补 `_mcp_client.py` 与两个被改的闸门 | 本地有未跟踪文件时验收会假绿，换一次 checkout 就失败 |
+| P2-1 panel 测试用了不存在的 `env` fixture | 接受 | 改用 conftest 的 `aws`，并往它里面加两张表 + 两个环境变量 | panel conftest 只有 `aws` 与 `secret`；`aws` 已在 `mock_aws()` 里，**再嵌一层是错的** |
+| P2-2 空桶被标 `uv_exact=true` | 接受 | 判据改成**桶的日历首日**，与桶内有没有数据无关 | 零填充后旧月份 `_days=[]` → `any()` 为 False → 对查不到的区间宣称"0 个独立访客" |
+| P2-3 `outsider_site` 不存在 | 接受 | 改成用既有 `ck_out` 打**本次真实创建**的站点 | `outsider`/`ck_out` 在第 152/276 行确实有，`outsider_site` 没有；且"不存在的 site_id"只证明 `site=None` 被拒 |
+| P2-4 我上一轮驳错 | 接受 | 见下节「更正记录」 | 全局 AGENTS.md 确实存在且明列 host-local |
+
+### 这两轮的净结果
+
+`_is_page_request` 被同一类缺陷咬了**两次**（第一轮漏 `/api/`、第二轮漏
+method）。第三次不能再靠"这次镜像全了"——所以定版是**一处判定、两处引用**
+（`_route_kind`），并加了一条反向验证专门盯这个结构约束（把
+`_route_request` 改回自己判 → 测试必须红）。
+
+### 我上一轮驳错的那条（P2-5），更正记录
 
 我的 self-review 声称「spec 21 个小节逐条映射、无遗漏」——**核对的只是我自己
 那份 spec**。P2-3 恰好落在它的盲区：一个上级文档已经划定的交付边界，不在我
@@ -3877,8 +4133,11 @@ spec 的目录——后者天然自洽。
 = stats/audit 数据（Task 2/3/5）· 两个端点（Task 8）· 图表（Task 9）·
 **站点列表 PV 迷你趋势（Task 9b）**；端点命名偏移已在 spec §3.6 申报。
 
-**2. 占位符扫描**：无 TBD/TODO。三处「先 grep 确认真名」是**明确的一步动作**
-（`ENV` 字典名、`escapeHtml` 函数名、`outsider_site` 变量名），不是"自行斟酌"。
+**2. 占位符扫描**：无 TBD/TODO。两处「先 grep 确认真名」是**明确的一步动作**
+（`deploy_panel.py` 的环境变量字典名、`app.js` 里的 HTML 转义函数名），
+不是"自行斟酌"。
+**48 个 python 代码块全部过 `compile()`**：0 处语法错（第二轮审查在这里抓到
+过一处嵌套 ASCII 引号，所以这条改成机器扫，不靠眼看）。
 
 **3. 类型一致性**
 
@@ -3886,5 +4145,9 @@ spec 的目录——后者天然自洽。
 - `series(...) -> list[{"bucket","pv","uv","pv_denied","uv_exact"}]`：Task 8 定义 → Task 9 前端 → Task 10 MCP → Task 12 闸门断言，四处字段名一致。
 - `visitors(...) -> {"rows":[{"ts","email","path","decision"}], "next"}`：Task 8 定义 → Task 9/12 一致（Task 12 断言"恰好四个字段"）。
 - `decision` 三个字面量 `allow`/`denied_403`/`redirect_login`：Task 3 产生 → Task 5 聚合 → Task 9 中文标签 → Task 14 闸门，四处一致。
+- `_route_kind` 的四个返回值 `lambda`/`page`/`asset`/`reject`：Task 3 内部唯一使用，
+  测试的 `_observed_kind` 用同一组字面量做 oracle。
+- `_is_page_request` / `_maybe_record` 都带 `method` 参数；Task 3 的实现、
+  `lambda_handler` 接线、四处测试调用点已逐个核对为三/七参形态。
 - 表名 `site-access-events`/`site-access-daily`：Task 2 定义，Task 4/5/6/11/13/14 引用，一致。
 - 副本清单：**唯一真源在 `router/config.ini`**，Task 2（CDK）与 Task 3（Edge 常量）各自引用，Task 4 的断言从它推导比对——三处一致由测试锁死。
