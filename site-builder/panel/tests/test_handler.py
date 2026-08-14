@@ -816,7 +816,12 @@ def test_analytics_routes_are_registered_and_read_only():
 
 
 def test_every_route_still_has_a_dispatch_branch():
-    """加了 ROUTES 忘了加分发 = 500。这条盯着两个新端点。"""
+    """加了 ROUTES 忘了加分发 = 500。这条盯着两个新端点。
+
+    **它自己不保证判别力**——遍历 ROUTES 的用例在集合为空/被截断时与"全部通过"
+    不可区分（实测：这两条 M5 路由还没进 ROUTES 时它就是绿的）。非空/下限由
+    下面的 test_dispatch_branch_scan_is_not_vacuous 守着。
+    """
     import handler
     for m, rx in handler.ROUTES:
         if rx.pattern == handler.CALLBACK:
@@ -827,3 +832,48 @@ def test_every_route_still_has_a_dispatch_branch():
             assert "路由已匹配但未分发" not in str(e), f"{m} {rx.pattern} 没有分发分支"
         except Exception:
             pass          # 其它异常（权限/表不存在）说明分支存在，本条不关心
+
+
+def test_dispatch_branch_scan_is_not_vacuous():
+    """守卫的守卫：上面那条遍历 `ROUTES`，**"没有对象可查"与"全部通过"长得一样**。
+
+    这不是假想的失效——Task 8 里实测过：那两条 M5 路由还没加进 `ROUTES` 时，
+    上面那条就已经绿了（它遍历的集合里压根没有要检查的东西），它的判别力完全
+    由"有路由却不给分发分支"那次缺陷注入建立。ROUTES 将来被截断、被重命名、
+    或某次重构里被延迟填充时，它会静默退回那个恒真状态。
+    形态照本仓库既有的两条同类守卫：`test_there_are_panel_modules_to_check`
+    与 `test_deploy_panel_contract.test_shipped_env_scan_is_not_vacuous`。
+
+    **锚点断言的是 pattern 集合，不是只有条数**：条数是个弱下限——内容被换掉
+    （删了两条 M5 读路由、又加了两条别的）时 `len` 照样对得上，而上面那条正是
+    为这两条路由加的。所以这里逐条钉住"每一种分发形态至少有一个代表"。
+
+    **锚点从 handler 自己的常量取，且刻意不抄全表**：抄全表等于把路由表写成两份，
+    以后加一条路由要改两个地方，漏改一处就是本文件最爱出的那类缺陷；而
+    `handler.ANALYTICS` 这些常量与 `ROUTES` 列表是**两个独立的对象**——把条目从
+    ROUTES 里删掉不会连带删掉常量，所以截断照样会被这条抓到。
+    """
+    import handler
+    patterns = {rx.pattern for _, rx in handler.ROUTES}
+    # **先断言真正的空转条件**：CALLBACK 是唯一被 continue 掉的 pattern，所以
+    # "除它之外还剩至少一条"才是那条用例真的执行过循环体的充要条件。
+    # 这条必须排在锚点之前，否则它永远不可能先红（少了路由 ⇒ 锚点那条先失败），
+    # 于是变成一句永不失效的装饰——正是本文件在防的那种形态。
+    assert patterns - {handler.CALLBACK}, (
+        "ROUTES 里除 CALLBACK 之外没有任何路由——"
+        "test_every_route_still_has_a_dispatch_branch 一次循环体都不会执行")
+    # 每个锚点代表 _dispatch 里的一种分支形态：
+    anchors = {
+        r"^/api/me$",                                   # 字面量精确匹配
+        rf"^/api/sites/{handler._SITE}/jobs$",          # .endswith 后缀匹配
+        handler.ANALYTICS,                              # M5：模块常量等值
+        handler.VISITORS,                               # M5：模块常量等值
+        handler.KEY_SWITCH,                             # 同 pattern 按 method 分流
+        handler.ADMIN_REMOVE,                           # POST 子路径（不是 DELETE）
+        handler.CALLBACK,                               # 上面那条**跳过**的那一条
+    }
+    missing = anchors - patterns
+    assert not missing, (
+        f"ROUTES 里少了这些锚点: {sorted(missing)}——"
+        "上面那条 test_every_route_still_has_a_dispatch_branch 会因此少扫甚至"
+        "空转（集合为空时它是恒真的）。要么补回路由，要么先读它的 docstring")
