@@ -118,22 +118,64 @@ phase2 spec §6 的日志侧聚合，**只需替换写入端**，不动 schema /
 修剪日志……超过 30 天的日志会被标记删除」）。把 90 天收敛到 30 天前要先确认
 30-90 天窗口内的日志无排查/审计价值——**这是有损操作，不是附带效果**。
 
-### 0.4 记录在案的升级路径：Global Table 副本（本轮不做）
+### 0.4 消掉跨区，而不是消掉同步（**本轮范围内**）
 
-实测同区暖连接只要 **6ms**（跨区 229ms）。给明细表在 **ap-southeast-1 +
-ap-northeast-1** 加 DynamoDB Global Table 副本即覆盖实测 **96.1%** 的流量，
-把埋点成本从 229ms 压到个位数 ms（**约 38 倍**），而**代码形状不变**、写量成本
-仍是每月几分钱。
+**先看代价的拆分**（用 §0.1 的两组实测数相减）：
 
-**本轮不做**（YAGNI：日均 124 请求下 229ms 可接受），但记录在此使日后决策成本
-接近于零。**前置条件必须先验证，不得假定**：
+```
+229ms  =  223ms 跨太平洋的网络  +  6ms DynamoDB 本身
+```
 
-- `AWS_REGION` 运行时变量在 Lambda@Edge 里是否可用（CLAUDE.md 说的「不支持环境
-  变量」指**用户自定义**变量，运行时注入的是另一回事——**本轮未验证**）；
-- 无副本区域的执行需回落到 us-east-1（正确但慢），回落路径要有测试；
-- 三期若做精细缓存，本项与 §4.3 的联动要一并重评。
+**97% 的代价是那条腿，不是「同步写」这个动作。** 同步写本身只要 6ms，低于噪声。
+所以对症的解法是给明细表加 **DynamoDB Global Table 副本**，让 Edge 写它执行区
+的本地副本：
 
-**这条比换成方案 c 更该先试**：它治的是 a 的唯一代价，而不引入 c 的静默少算。
+| | 单表 us-east-1 | 加 ap-southeast-1 + ap-northeast-1 副本 |
+|---|---|---|
+| 暖连接写 | 229ms | **6ms** |
+| 冷连接首次写 | 719ms | **58ms** |
+| 覆盖流量 | — | **96.1%**（§0.1 实测执行区分布） |
+| 页面请求 Edge p50 | 2ms → 231ms | 2ms → **约 8ms** |
+| 成本 | 约 3700 写/月 | ×3 区 ×1.5 rWCU，仍是每月几分钱 |
+
+**这与方案 c 的性质完全不同**：异步（c）是用可靠性换延迟；加副本是**直接把延迟
+拿掉，不换任何东西**——没有水位线、没有区域发现、没有静默少算，明细行仍是耐久
+的可复算真源。
+
+#### 落地顺序（三步，任一步失败都不丢数据）
+
+有一个前置未知：**`AWS_REGION` 运行时变量在 Lambda@Edge 里是否可用，本轮开始时
+未验证**。CLAUDE.md 那条「Lambda@Edge 不支持环境变量」指的是**用户自定义**变量，
+运行时注入的是另一回事——但**不拿推测当结论**（§5.4）。因此：
+
+1. **第一次部署 Edge（版本 8）时带一行探测**，把 `os.environ.get("AWS_REGION")`
+   与 `context.invoked_function_arn` 打进日志。M5 本来就要部 Edge，这一步不额外
+   花时间，也不额外部署一次。
+2. **埋点代码把「写哪个 endpoint」做成单一解析值 + 硬回落 us-east-1。**
+   区域检测失败 = 跨区写 = **正确但慢**，永不丢数据。于是第 1 步的结果无论如何
+   都不会变成故障，最坏情况只是「229ms 保持现状」。
+   - 若 `AWS_REGION` 不可用，第二候选是从 `context.invoked_function_arn` 解析
+     区域（**同样未验证**，按第 1 步的日志判定）；两者都拿不到就回落。
+   - 解析出的区域**不在副本清单里**时也回落 us-east-1（不能对着没有副本的区域
+     发请求）。副本清单是代码里的常量，与 CDK 的副本配置由测试锁死一致。
+3. 读回日志确认后再开副本（**对存量表加副本是在线操作**），并按 §5.1 复验。
+
+#### 由此产生的三个连带要求
+
+- **IAM 资源集合变成三个 ARN**（每个副本区一个），不是一个。副本表的 ARN 是
+  `arn:aws:dynamodb:{replica_region}:{account}:table/site-access-events`，是
+  **独立资源**——漏给一个 = 那个区的埋点全部 AccessDenied 后被 §2.3 规矩 3
+  吞掉 = **该区静默零数据**。`test_stack_edge_iam.py` 按副本清单**推导**断言，
+  不手抄（§3.9 的教训）。
+- **复制是异步的**（典型 < 1s，无 SLA）。面板与 rollup 都读 us-east-1 副本，
+  所以「今天的实时数」可能落后约 1s——对统计无影响，但**闸门必须轮询等待**，
+  不能发完请求立刻断言，否则 `verify_analytics_e2e.py` 会是个 flaky 闸门。
+- **`site-access-daily` 不做全球表**：只有 rollup 写它，而 rollup 在 us-east-1
+  跑。多一个副本只增加成本与删表复杂度。
+
+#### 仍留给三期
+
+三期若做 CloudFront 精细缓存，本项与 §4.3 的联动要一并重评。
 
 ---
 
@@ -148,7 +190,8 @@ ap-northeast-1** 加 DynamoDB Global Table 副本即覆盖实测 **96.1%** 的�
 | 属性 | `site_id` · `email` · `path` · `decision` · `expires_at` |
 | 计费 | PAY_PER_REQUEST |
 | 策略 | `RemovalPolicy.DESTROY`（90 天滚动数据，删栈丢掉可接受） |
-| 唯一 writer | **Edge 角色，且只有 `dynamodb:PutItem`** |
+| 副本 | **Global Table：us-east-1（主）+ ap-southeast-1 + ap-northeast-1**（§0.4） |
+| 唯一 writer | **Edge 角色，且只有 `dynamodb:PutItem`**（三个副本 ARN 各一条） |
 
 - `decision` ∈ `{"allow", "denied_403", "redirect_login"}`。
 - `email`：`allow` 与 `denied_403` 时是**已验签**的邮箱；`redirect_login`
@@ -163,8 +206,19 @@ ap-northeast-1** 加 DynamoDB Global Table 副本即覆盖实测 **96.1%** 的�
   `DeletionPolicy: Retain` 推导，DESTROY 表天然在范围外）。
 
 **为什么按 `site_id#date` 分区**：一次 Query 该分区即同时得到当天 PV（行数）
-与 UV（distinct `email`），不需要计数器行——于是**热路径只有一次写**，省掉
-第二次跨区往返（229ms × 2 是不可接受的）。
+与 UV（distinct `email`），不需要计数器行——于是**热路径只有一次写**。
+（这条在加了副本之后依然成立：省一次往返总是对的，且未命中副本的区域仍要回落
+跨区，那时一次与两次的差别就是 229ms 与 458ms。）
+
+**Global Table 的两个实现注意点**：
+
+- CDK 侧用 `aws_dynamodb.TableV2`（原生多区）比给 `Table` 配
+  `replication_regions`（自定义资源）干净。本表是仓库里唯一的多区表，引入第二种
+  构造类型是有意的局部选择，其余 `site-*` 表不动。
+- TTL 删除会复制到各副本；SK 全局唯一（随机后缀），不存在需要 last-write-wins
+  仲裁的写冲突。
+- 删表要先摘副本——本表 `DESTROY`，所以 `cdk destroy` 路径要能处理（`TableV2`
+  负责），实施时实测一次而不是假定。
 
 ### 1.2 `site-access-daily`（日聚合，TTL 400 天）
 
@@ -241,7 +295,7 @@ record iff subdomain.startswith("app-")   →   site_id = subdomain[4:]
 `route_mode == "api-only"` 的用户站点没有「页面 vs 资源」之分，全记。
 **当前有零个这样的站点**（9 个用户站点全为 split），但规则必须先定义。
 
-### 2.3 五条 Lambda@Edge 约束 → 实现规矩
+### 2.3 六条 Lambda@Edge 约束 → 实现规矩
 
 1. **不往返回的 `request` 对象加自定义键**——CloudFront 会校验其形状。已验签
    邮箱通过一个**独立的 out-param dict** 从 `_check_auth` 带出，
@@ -268,7 +322,13 @@ record iff subdomain.startswith("app-")   →   site_id = subdomain[4:]
      情况延迟 ×3，有界且罕见，且整段在 `try/except` 内。
    - **不要为了「给埋点单独的超时」而回退到新建 client**——那正是被实测否掉的
      那一版。要调超时只能连路由查询一起评估。
-5. **调用点在 `lambda_handler` 里、所有鉴权判定之后、`return` 之前**，
+5. **写哪个 endpoint 是一个单一解析值，且硬回落 us-east-1**（§0.4 第 2 步）。
+   区域解析顺序：`AWS_REGION` → `context.invoked_function_arn` → 回落。
+   解析出的区域**不在副本清单常量里**同样回落。回落 = 跨区写 = **正确但慢**，
+   **永不丢数据**——这条是「加副本」这个优化不会变成故障的唯一保证，注入验证
+   必须覆盖「解析不出区域」与「解析出一个没有副本的区域」两种情形。
+   副本清单常量与 CDK 的副本配置由测试锁死一致（两处漂移 = 某区静默零数据）。
+6. **调用点在 `lambda_handler` 里、所有鉴权判定之后、`return` 之前**，
    三种 `decision` 走同一条记录路径（`allow` / `denied_403` /
    `redirect_login`）。**被拒记录只可能在 origin-request 拿到**：302/403 由
    origin-request 直接生成响应，此时 origin-response 根本不触发。
@@ -278,11 +338,15 @@ record iff subdomain.startswith("app-")   →   site_id = subdomain[4:]
 - `site-access-events` / `site-access-daily` 建在 **deployer 栈**（与全部
   `site-*` 表一致，继承 TTL / RETAIN / deletion-protection 的既有形态与不变量
   测试）。
-- **router 栈**给 edge_role 加 `dynamodb:PutItem`，资源为明细表 ARN，表名走
-  `router/config.ini` 的 `[SiteBuilder]` 新键（照 `frontend_bucket` /
-  `base_domain` 先例：router 栈按名字串引用 site-builder 侧资源）。
+- **router 栈**给 edge_role 加 `dynamodb:PutItem`，资源为明细表在**每个副本区**
+  的 ARN（§0.4：三个），表名与副本清单走 `router/config.ini` 的 `[SiteBuilder]`
+  新键（照 `frontend_bucket` / `base_domain` 先例：router 栈按名字串引用
+  site-builder 侧资源）。
 - `router/infrastructure/lambda/test_stack_edge_iam.py` 加断言锁死
-  **恰好这一个 action、恰好这一个资源**（该文件已用同样形态锁着 S3 的两个前缀）。
+  **恰好这一个 action、恰好这组资源**，且资源集合**从副本清单推导**、不手抄
+  （该文件已用同样形态锁着 S3 的两个前缀；手抄的清单每加一个区就漏一个，§3.9）。
+  同一份副本清单同时被 Edge 代码的回落判定用（§2.3 规矩 5），**三处必须由测试
+  锁成一致**：CDK 副本配置 / IAM 资源集合 / Edge 的清单常量。
 - **部署顺序有依赖**：表必须先于 Edge 存在。反了的话写失败被 §2.3 规矩 3 吞掉，
   症状是**「部署全绿、零数据」**。这条要进 DEPLOY.md，**并由闸门验证**
   （§5.1）——只写文档不够。
@@ -412,14 +476,23 @@ get_site_analytics(site_id: str, period: str = "day", days: int = 30) -> dict
 - **新增 `verify_analytics_e2e.py`**：真机发一次页面请求 → 明细表出现一行
   （`email` / `decision` / `path` 逐字核对）→ 触发 rollup → 聚合行出现 →
   面板 API 返回同一数字 → MCP 工具返回同一数字。
+  - **必须轮询等待那一行**（有上限、超时即红），不能发完立刻断言：Global Table
+    复制是异步的（§0.4）。立刻断言会做出一个 flaky 闸门，而 flaky 闸门的代价
+    是下一个人学会忽略它（同 §3.2 的假红逻辑）。
+  - **副本落点核对**：读回该行时确认它在 us-east-1 可见（面板/rollup 的读侧），
+    并在 §0.4 第 1 步的日志里确认 Edge 实际写的是本地副本而非回落——否则
+    「副本已开但代码一直在回落」会是一个只表现为「慢」的静默退化。
   - **负测必须配正对照**（M4-FINDINGS §3.5）：请求 `.css` 不产生行、请求
     `console` 不产生行——**各自配一条**「页面请求确实产生了行」的正对照。
     否则「埋点压根没部署」会让两条负测永远绿。
   - `denied_403` 与 `redirect_login` 各验一次（被拒记录是本轮明确要的能力）。
   - 清理：先恢复全局状态、再按**依赖顺序**删（M4-FINDINGS §3.8）。
-- **`verify_deployed_components.py` 新增一段**：明细表存在 · Edge 角色**有且
-  只有** `PutItem` · 聚合表 deletion protection 开着 · rollup 的 EventBridge
-  规则 enabled。这一段同时是 §2.4「部署顺序」的闸门。
+- **`verify_deployed_components.py` 新增一段**：明细表存在 · **三个副本区各自
+  ACTIVE**（`describe_table` 的 `Replicas`，按副本清单推导，不手抄）· Edge 角色
+  **有且只有** `PutItem` 且资源恰好是那三个 ARN · 聚合表 deletion protection
+  开着 · rollup 的 EventBridge 规则 enabled。这一段同时是 §2.4「部署顺序」的闸门。
+  **别拿 CFN 的 `StackStatus` 当副本已开的结论**——直接 `describe_table` 读回
+  `Replicas`（§5.4）。
 - **`verify_deployed_edge.sh`**：核对 Edge 版本 8（Edge 改动要 10-20 分钟
   全球复制）。
 - **`verify_console_e2e.py`**：按 §4.1 改造 ⑪ 段。
@@ -427,11 +500,14 @@ get_site_analytics(site_id: str, period: str = "day", days: int = 30) -> dict
 ### 5.2 单测（按包）
 
 - **edge**：`app-` 前缀判定的正/负、页面级判定与静态改写条件的一致性、
+  **区域解析与回落**（解析不出区域 → 回落；解析出无副本的区域 → 回落；两种都
+  要注入验证，§2.3 规矩 5）、
   三种 decision 的记录形态、埋点异常不影响返回值、**不往 request 加键**、
   **摄取层可替换性**（§0.2：断言写入点只有一处）。
 - **deployer**：两张表的 PK/SK/TTL/RemovalPolicy、RETAIN⇒deletion protection
   不变量（自动纳入）、rollup 的幂等与 7 天回溯窗口、无行不写、IAM 最小集。
-- **router 栈**：`test_stack_edge_iam.py` 的精确 action/资源集合、
+- **router 栈**：`test_stack_edge_iam.py` 的精确 action/资源集合（**从副本清单
+  推导**）、「CDK 副本配置 / IAM 资源集合 / Edge 清单常量三处一致」的锁定断言、
   §4.3 的 cache policy 断言。
 - **panel**：两个新路由 · `view_analytics` 授权（含 403 路径）· 分页游标 ·
   `uv_exact` 语义 · `days`/`limit` 上限 · `test_no_route_uses_delete_with_body`
@@ -471,18 +547,18 @@ get_site_analytics(site_id: str, period: str = "day", days: int = 30) -> dict
 
 | 资源 | 位置 |
 |---|---|
-| `site-access-events` 表（DESTROY，TTL 90d） | deployer 栈 |
+| `site-access-events` 表（`TableV2`，DESTROY，TTL 90d，**3 区 Global Table**） | deployer 栈 |
 | `site-access-daily` 表（RETAIN + deletion protection，TTL 400d） | deployer 栈 |
 | `site-access-rollup` Lambda + EventBridge daily rule + DLQ | deployer 栈 |
 | `verify_analytics_e2e.py` | `site-builder/scripts/` |
-| `[SiteBuilder]` 新键（明细表名） | `router/config.ini(.example)` |
+| `[SiteBuilder]` 新键（明细表名 + **副本区清单**） | `router/config.ini(.example)` |
 
 **改动**
 
 | 文件 | 改什么 |
 |---|---|
 | `router/infrastructure/lambda/origin_request.py` | 埋点（§2）→ Edge 版本 8 |
-| `router/infrastructure/stack.py` | edge_role 的 PutItem 语句 |
+| `router/infrastructure/stack.py` | edge_role 的 PutItem 语句（**三个副本 ARN**） |
 | `router/infrastructure/lambda/test_stack_edge_iam.py` | 精确资源集合断言 + cache policy 断言（§4.3） |
 | `site-builder/deployer/functions/permissions.py` | `CAPABILITIES` 加 `view_analytics` |
 | `site-builder/panel/handler.py` / `api.py` | 两个新 GET 路由 |
