@@ -350,3 +350,203 @@ def test_frontend_falls_back_to_jobs_when_backend_omits_ever_live():
     """
     c = _case("后端漏给 ever_live 但 job 成功过")
     assert c["got"] is False, "字段缺失导致误报「从未上线」"
+
+
+# ── 访问统计页：三条渲染路径都要真跑一遍（M5 Task 9）─────────────────────
+#
+# 为什么这组必须在 harness 里：`renderAnalyticsTab` 的成功 / 空态 / 失败三条路径
+# 此前**在任何地方都没有执行过**。静态断言（test_frontend_contract）只能证明源码
+# 里"提到了" uv_exact、"提到了" catch —— 而本项目栽过的正是这个形态
+# （"30 条静态断言 + 61/61 HTTP E2E 全绿，页面仍然崩"，见本文件顶部那段）。
+#
+# 判据一律取**最后一次** innerHTML 写入（`html_writes[-1]`）而不是 `html`：
+# 后者是所有写入的并集，"加载中…"的占位与上一次渲染都还在里面，在它上面断言
+# "页面上没有 X"是不精确的。三态的判据恰恰全是"最终渲染出了什么"。
+
+UV_NOTE = "该区间已超出 90 天明细留存窗口"     # uvCell 标注分支的唯一特征串
+ERR_SENTINEL = "PROBE-E500-SENTINEL"           # harness 注入的 500 错误文案
+
+
+def _last_write(scenario: str, app: Path | None = None) -> tuple[dict, str]:
+    _, out = run_boot(scenario, app)
+    writes = out["html_writes"]
+    assert writes, f"一次 innerHTML 写入都没有 —— 场景 {scenario} 空转了"
+    return out, writes[-1]
+
+
+def test_analytics_page_renders_both_tables_from_live_data():
+    """正向：两个端点都有数据 → 趋势表与明细表都渲染出来，且不抛异常。
+
+    同时钉住**请求参数**：页面固定要近 30 天的日桶与近 7 天的明细，参数漂了
+    （比如 n 变成 7）用户看到的时间范围就和标题写的不一样，而两侧单测都不会红。
+    """
+    out, last = _last_write("analytics-live")
+    assert not out["errors"], f"统计页渲染时抛异常: {out['errors']}"
+    assert "/api/sites/s-probe/analytics?period=day&n=30" in out["fetched"], (
+        f"趋势请求的参数不对（标题说近 30 天）: {out['fetched']}")
+    assert "/api/sites/s-probe/visitors?days=7&limit=50" in out["fetched"], (
+        f"明细请求的参数不对（标题说近 7 天）: {out['fetched']}")
+    assert "访问趋势" in last and "访问明细" in last, f"两张表没都渲染: {last[:300]!r}"
+    # 数据真的落进了单元格（不是渲染了两张空表）
+    assert "2026-08-12" in last and "1,234" in last, (
+        f"趋势表里看不到夹具数据 —— 表渲染了但没填数: {last[:400]!r}")
+    assert last.count("<tr>") >= 6, (
+        f"行数不对（3 个桶 + 3 条明细 + 2 个表头）: {last.count('<tr>')}")
+
+
+def test_analytics_translates_every_decision_and_names_anonymous_visitors():
+    """三个 decision 都要翻成人话；`email` 空串必须显示成"（未登录）"。
+
+    这是 DECISION_LABEL 存在的全部意义。缺词条时用户看到的是 `denied_403`；
+    而空串照原样渲染就是一个**空白格**——看起来像数据丢了，实际是未登录访问。
+    """
+    _, last = _last_write("analytics-live")
+    for label in ("放行", "不在名单", "未登录"):
+        assert label in last, f"decision 词表缺 {label}（会显示原始英文串）"
+    assert "（未登录）" in last, (
+        "email 为空串的行没有显示「（未登录）」—— 那一格会是空白，"
+        "读起来像数据丢失（Edge 的 redirect_login 契约就是给空串）")
+    assert "denied_403" not in last and "redirect_login" not in last, (
+        f"页面上出现了原始 decision 值: {last!r}")
+
+
+def test_analytics_annotates_the_inexact_uv_bucket_instead_of_printing_null():
+    """`uv_exact: false` / `uv: null` 的桶渲染成标注，**不是** null 也不是 0。
+
+    这条是 uvCell 那个分支唯一真跑一遍的地方。静态断言只查了源码里有
+    "uv_exact"这个词——它证明不了渲染结果。
+    """
+    _, last = _last_write("analytics-live")
+    assert UV_NOTE in last, f"超窗口的桶没有标注: {last!r}"
+    assert "null" not in last, (
+        f"页面上出现了 null —— uv 为 null 的桶被直接拼进了 HTML: {last!r}")
+    # 标注必须落在**那一个**桶上（而不是标错行），也不能被 `|| 0` 兜成数字
+    inexact_row = last.split("2026-08-14")[1].split("</tr>")[0]
+    assert UV_NOTE in inexact_row, (
+        f"标注不在超窗口那一行里（标到别的桶上了）: {inexact_row!r}")
+
+
+def test_analytics_empty_visitor_list_says_so_instead_of_an_empty_table():
+    """空态：明细为空时给一句话，而不是一张只有表头的表。
+
+    **两张表分别为空**是有意的夹具设计（趋势有数据、明细没有）：一起空的话
+    分不出是哪一半的空态写错了，而"0 次访问"与"读取失败"在用户那边完全不同。
+    """
+    out, last = _last_write("analytics-empty")
+    assert not out["errors"], f"空态渲染抛异常: {out['errors']}"
+    assert "近 7 天没有访问记录" in last, f"明细空态没有说明: {last!r}"
+    # 趋势表照常渲染 —— 证明空态是**局部**的，不是整页退化
+    assert "1,234" in last, "趋势表跟着一起空了 —— 空态判据串到了另一半"
+    assert last.count("<table") == 1, (
+        "明细空态仍然渲染了一张表（只有表头的表读起来像加载失败）: "
+        f"{last.count('<table')} 张表")
+
+
+def test_analytics_shows_the_error_instead_of_half_a_page_when_one_call_fails():
+    """失败态：两个请求里任一失败 → 整屏报错，**不渲染半张页面**。
+
+    半屏（趋势画出来了、明细没有且不说原因）比整屏报错更难排查：用户以为
+    "这个站点没有访客明细"，而真相是那次请求 500 了。
+    """
+    out, last = _last_write("analytics-failed")
+    assert not out["errors"], (
+        f"失败态把异常漏出去了（catch 没接住）: {out['errors']}")
+    assert "访问统计读取失败" in last, f"失败态没有报错文案: {last!r}"
+    assert ERR_SENTINEL in last, (
+        "后端给的错误原文没显示出来 —— 用户只看到一句通用的「读取失败」，"
+        f"排查时问不出是 403 还是 500: {last!r}")
+    assert "访问趋势" not in last and "访问明细" not in last, (
+        f"失败时仍然渲染了半张页面: {last!r}")
+
+
+def test_visitor_supplied_path_is_escaped_at_render_time():
+    """`path` 是**匿名访问者可控**的，渲染前必须转义。
+
+    攻击面是真的：任何人 curl 一个带 HTML 元字符的路径 → Edge 原样写进 events
+    表 → 它出现在**站点所有者的控制台**里，而控制台是能改权限的管理界面。
+    与静态的 esc() 扫描互补：那边依赖扫描器把每一处插值都切对
+    （而它的覆盖面还挂在循环变量名上），这边直接看渲染出来的字符串。
+    """
+    _, last = _last_write("analytics-live")
+    # 顺序有意：**先**断言原始形态不在（那是安全结论），再断言转义形态在
+    # （那是"本用例没空转"）。反过来写的话，路径没转义时先红的是后者，
+    # 而它的失败文案说的是"表可能没渲染"——把 XSS 报成解析问题。
+    assert "<img src=x" not in last, (
+        f"访问路径未转义就进了 innerHTML —— 匿名访问者可写的控制台 XSS: {last!r}")
+    assert "&lt;img src=x" in last, (
+        "渲染结果里找不到转义后的路径 —— 明细表可能根本没渲染（用例空转）")
+
+
+# ── 反向验证：把三条路径各自的实现改坏，必须变红 ──────────────────────
+#
+# 用 `_mutated`（写一份改坏的 app.js 到 tmp_path）而不是改仓库里的 app.js：
+# 被测文件从头到尾没被动过，也就没有"还原漏了"的风险。
+
+def test_harness_catches_uv_cell_fabricating_a_zero(tmp_path):
+    """反向 ①：uvCell 不再看 uv_exact → 那一格变成**凭空的 0**。
+
+    **实测修正过预期**：我原本以为退化形态是"页面显示 null"，注入后实际渲染的是
+    `0` —— 因为 fallthrough 走的是 `esc(fmt(row.uv))`，而 `fmt` 是
+    `Number(n).toLocaleString()`，`Number(null)` 就是 0。也就是说这个实现的退化
+    方向正好是两种里**更糟的那个**：null 至少看得出是 bug，一个 0 会被读成
+    "这段时间没有独立访客"，而真相是"我们不知道"。
+    所以断言绑到"那一行的 UV 格是 0"，不是绑到 "null" 这个字样。
+    """
+    app = _mutated(
+        tmp_path,
+        "  if (row.uv_exact === false || row.uv === null || row.uv === undefined) {",
+        "  if (false) {")
+    _, last = _last_write("analytics-live", app)
+    assert UV_NOTE not in last, (
+        f"注入了「不看 uv_exact」但标注还在 —— 注入点没生效: {last!r}")
+    inexact_row = last.split("2026-08-14")[1].split("</tr>")[0]
+    assert '<td class="num-col">0</td>' in inexact_row, (
+        "预期那一格退化成凭空的 0（fmt(null) === '0'），实际不是 —— "
+        f"上面那条正向用例可能没盯住东西: {inexact_row!r}")
+
+
+def test_harness_catches_a_missing_catch_on_the_analytics_promise(tmp_path):
+    """反向 ②：把 `.catch(...)` 换成 `.then(...)` → 失败态变成未捕获的 rejection。
+
+    这条证明"失败态显示错误"不是恰好绿：没有 catch 时页面**停在"正在加载…"**，
+    错误只出现在 DevTools 里——用户看到一个永远转不完的加载态。
+    """
+    app = _mutated(tmp_path, "  }).catch((err) => {", "  }).then((err) => {")
+    out, last = _last_write("analytics-failed", app)
+    assert out["errors"], (
+        "去掉 catch 之后居然没有未捕获的 rejection —— 失败态那条正向用例"
+        f"证明不了 catch 是承重墙: {out}")
+    assert "正在加载访问统计" in last, (
+        f"页面没有停在加载态（预期：错误没人接手，占位一直留着）: {last!r}")
+
+
+def test_harness_catches_the_empty_state_rendering_a_headers_only_table(tmp_path):
+    """反向 ③：去掉明细的空态守卫 → 落到建表分支，渲染出一张只有表头的表。
+
+    注入的是**守卫条件**而不是它的返回值：第一版把 `return '<p>…'` 换成
+    `return ''`，那只是"空态什么都不说"（渲染出一张空卡片），并没有产生要防的
+    那个形态。改成让守卫永不成立，代码才真的落进建表分支——一张有表头、
+    `<tbody>` 为空的表，读起来像"加载失败"。
+    """
+    app = _mutated(tmp_path, "  if (!rows.length) {", "  if (false) {")
+    _, last = _last_write("analytics-empty", app)
+    assert "近 7 天没有访问记录" not in last, "注入点没生效（空态文案还在）"
+    assert last.count("<table") == 2, (
+        f"预期渲染出两张表（第二张只有表头），实际 {last.count('<table')} 张: {last!r}")
+    assert "<tbody></tbody>" in last, (
+        f"第二张表的 tbody 不是空的 —— 注入的退化形态与预期不同: {last!r}")
+
+
+def test_harness_catches_the_tab_not_being_handed_the_site(tmp_path):
+    """反向 ④：调用点退回 `renderAnalyticsTab(panel)` → 页面直接崩。
+
+    这是 Task 9 改的那一行。没有这条时，"两张表渲染出来了"可能只是因为
+    harness 恰好没走到这个分支。
+    """
+    app = _mutated(
+        tmp_path,
+        "  else if (tab === 'analytics') renderAnalyticsTab(panel, site);",
+        "  else if (tab === 'analytics') renderAnalyticsTab(panel);")
+    code, out = run_boot("analytics-live", app)
+    assert out["errors"] and code != 0, (
+        f"不传 site 也没崩 —— 说明统计页压根没被渲染（用例空转）: {out}")

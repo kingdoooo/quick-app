@@ -18,6 +18,7 @@
  *   场景 first-visit  —— 首次进入（sessionStorage 空）
  *   场景 came-back    —— 从 /console-session 升级跳转回来
  *   场景 keys-*       —— API Key 页面的 features.api_key 三态（见 KEY_SCENARIOS）
+ *   场景 analytics-*  —— 访问统计页的三态（见 ANALYTICS_SCENARIOS）
  * 输出：一行 JSON（fetched / errors / hash_after / assigned / html）
  * 退出码：0 = 取到身份且无异常；3 = 否
  */
@@ -91,11 +92,29 @@ const KEY_SCENARIOS = {
 };
 const KEYCASE = KEY_SCENARIOS[SCENARIO] || null;
 
-/* Key 场景要直接落在 #/keys 上，且不能被"先去升级面板会话"截住——
- * 所以预置一个**新鲜的**升级标记。键名必须是 app.js 的 UPGRADE_MARK
+/* ── 访问统计页的三态场景（M5 Task 9）────────────────────────────────
+ *
+ * 为什么必须真跑：`renderAnalyticsTab` 的成功 / 空态 / 失败三条路径在**任何
+ * 地方都没有执行过**。静态断言只能证明源码里"提到了" uv_exact、"提到了"
+ * catch —— 本项目栽过的正是这个形态（"30 条静态断言 + 61/61 HTTP E2E 全绿，
+ * 页面仍然崩"，见本文件顶部）。
+ *
+ * `rows`: 'full' = 明细有数据；'none' = 明细为空（趋势仍有数据——**两张表要
+ *          能各自独立为空**，一起空分不出是"哪一半的空态"写错了）。
+ * `fail`: 命中该子串的请求返回非 2xx（api() 抛 ApiError），用来跑 catch 分支。 */
+const A_SITE_ID = 's-probe';
+const ANALYTICS_SCENARIOS = {
+  'analytics-live': { rows: 'full', fail: null },
+  'analytics-empty': { rows: 'none', fail: null },
+  'analytics-failed': { rows: 'full', fail: '/visitors' },
+};
+const ACASE = ANALYTICS_SCENARIOS[SCENARIO] || null;
+
+/* Key / analytics 场景要直接落在自己的路由上，且不能被"先去升级面板会话"
+ * 截住——所以预置一个**新鲜的**升级标记。键名必须是 app.js 的 UPGRADE_MARK
  * （`sb_console_upgraded_at`）：写错的话 boot 会跳去 /console-session 然后
- * return，场景退化成 first-visit，全部 Key 用例静默空转。 */
-const localSeed = KEYCASE
+ * return，场景退化成 first-visit，那一组用例全部静默空转。 */
+const localSeed = (KEYCASE || ACASE)
   ? new Map([['sb_console_upgraded_at', String(Date.now())]])
   : new Map();
 
@@ -109,6 +128,52 @@ const KEY_ROWS = [
   { key_id: 'ef56gh78', name: '旧的那把', prefix: 'sk-z9y8',
     created_at: '2026-08-01T00:00:00', last_used_at: '2026-08-11T09:00:00',
     revoked: true },
+];
+
+/* ── 访问统计的响应体（形态照 Task 8 的两个端点契约）────────────────── */
+
+const A_SITE = {
+  site_id: A_SITE_ID, name: '统计探针站', status: 'ACTIVE',
+  url: 'https://app-' + A_SITE_ID + '.example.com', owner: 'probe@example.com',
+  created_at: '2026-08-01T00:00:00', require_login: true, allowed_users: 'org',
+  collaborators: [], ever_live: true, role: 'owner', subdomain: 'app-' + A_SITE_ID,
+};
+const A_JOBS = [
+  { job_id: 'jjjj1111', status: 'SUCCEEDED', phase: 'smoke-test',
+    created_at: '2026-08-13T10:00:00', finished_at: '2026-08-13T10:01:30',
+    duration_s: 90, error: '' },
+];
+
+/* 第三个桶是 `uv_exact: false` / `uv: null`。
+ *
+ * **它在生产上目前打不出来**，如实说明：`analytics.py` 的 `period == "day"`
+ * 分支永远给 `uv_exact=True`（只有 week/month 的桶首日早于明细窗口下界时才
+ * 置 null），而本页固定请求 `period=day&n=30`。所以 `uvCell` 的标注分支是
+ * **防御性**的——一旦加了周期选择器、或明细留存窗口被缩短（Task 16 会动
+ * 保留期），它就会被走到。harness 造出这一格是为了证明"真会渲染成标注而不是
+ * null / 0"，不是为了证明生产会走到它。 */
+const A_SERIES = [
+  { bucket: '2026-08-12', pv: 1234, uv: 56, pv_denied: 0, uv_exact: true },
+  { bucket: '2026-08-13', pv: 7, uv: 3, pv_denied: 2, uv_exact: true },
+  { bucket: '2026-08-14', pv: 9, uv: null, pv_denied: 1, uv_exact: false },
+];
+
+/* `path` 是**匿名访问者完全可控**的：任何人 curl 一个带 HTML 元字符的路径，
+ * Edge 就把它原样写进 events 表（`_record_access(..., uri, ...)` 不做净化，
+ * 也不该做——净化的位置在展示层），然后它渲染在**站点所有者的控制台**里。
+ * 控制台是管理界面，在这里执行脚本能改权限，所以这一列的转义是真实攻击面。
+ * 静态扫描按顶层 `+` 切分能查大多数形态，但真跑一遍是唯一不依赖扫描器
+ * 正确性的证据（与 HOSTILE_NAME 同理）。 */
+const HOSTILE_PATH = '/<img src=x onerror=alert(1)>';
+const A_ROWS = [
+  { ts: '2026-08-14T09:15:00', email: 'someone@example.com',
+    path: '/', decision: 'allow' },
+  { ts: '2026-08-14T09:16:20', email: 'outsider@example.com',
+    path: '/secret', decision: 'denied_403' },
+  /* email 是**空串**而不是 null：Edge 的 redirect_login 契约（302 那一刻还
+   * 不知道是谁）。前端必须把它显示成"（未登录）"而不是空白格。 */
+  { ts: '2026-08-14T09:17:00', email: '', path: HOSTILE_PATH,
+    decision: 'redirect_login' },
 ];
 
 global.document = {
@@ -125,7 +190,7 @@ global.sessionStorage = store(sessionSeed);
 global.confirm = () => true;
 
 const loc = {
-  _hash: KEYCASE ? '#/keys' : '',
+  _hash: KEYCASE ? '#/keys' : ACASE ? '#/sites/' + A_SITE_ID + '/analytics' : '',
   hostname: 'console.app.example.com',
   protocol: 'https:',
   origin: 'https://console.app.example.com',
@@ -176,6 +241,15 @@ function responseFor(u) {
     return KEYCASE ? KEYCASE.api_key : { deployed: false, enabled: false };
   }
   if (u.includes('/api/keys')) return { keys: KEY_ROWS };
+  /* 顺序要紧：`/api/sites/s-probe/jobs` 也 includes `/api/sites/s-probe`，
+   * 所以子路径必须先判，否则站点详情的响应体会被当成 jobs / 统计的响应体，
+   * 页面渲染出空表而用例仍然"跑通了"。 */
+  if (u.includes('/analytics')) return { period: 'day', series: A_SERIES };
+  if (u.includes('/visitors')) {
+    return { rows: ACASE && ACASE.rows === 'none' ? [] : A_ROWS, next: null };
+  }
+  if (u.includes('/jobs')) return { jobs: A_JOBS };
+  if (u.includes('/api/sites/' + A_SITE_ID)) return A_SITE;
   return { email: 'probe@example.com', name: 'P',
            is_admin: false, sites: [], jobs: [], admins: [] };
 }
@@ -183,6 +257,18 @@ function responseFor(u) {
 global.fetch = async (url) => {
   const u = String(url);
   fetched.push(u);
+  /* 注入失败：**非 2xx 而不是 reject**。真实的失败面是 HTTP 层
+   * （403 / 500 / 502），走的是 api() 里 `if (!resp.ok) throw new ApiError`
+   * 那条路——直接 reject 掉 fetch 只会测到 node 的网络错误，那不是用户会遇到
+   * 的形态，也绕过了 ApiError 的 message 组装（页面显示的就是它）。 */
+  /* 错误文案是一个**唯一哨兵**，不含任何用例会断言的其它字样。第一版写的是
+   * "访问明细读取失败（探针注入）"，于是它把"访问明细"这个词带进了页面——
+   * 而"失败态不得渲染出访问明细那张表"正是要断言的东西，那条断言就有了两个
+   * 满足来源。夹具自己制造字样碰撞，与本轮记录的假绿是同一族。 */
+  if (ACASE && ACASE.fail && u.includes(ACASE.fail)) {
+    return { ok: false, status: 500,
+             json: async () => ({ error: 'PROBE-E500-SENTINEL' }) };
+  }
   return { ok: true, status: 200, json: async () => responseFor(u) };
 };
 
@@ -236,6 +322,10 @@ setTimeout(() => {
     scenario: SCENARIO, fetched_me: askedMe, fetched,
     hash_after: loc._hash, assigned, errors,
     html: htmlWrites.join('\n'),
+    /* 逐次写入也给出来。`html` 是**所有**写入的并集，所以"页面上没有 X"这类
+     * 断言在它上面是不精确的：加载中的占位、上一次渲染的内容都还在里面。
+     * 最终态要看 html_writes[-1]（统计页三态的判据全是"最后渲染出了什么"）。 */
+    html_writes: htmlWrites,
     /* 明文只应活在创建响应的那个闭包里。这两份是"有没有被存起来"的证据面
      * ——harness 里没有点击，所以创建流程不会跑，这两个断言在**本文件**只能
      * 证明启动路径没写；真正盯住明文的是 test_frontend_contract 的白名单
