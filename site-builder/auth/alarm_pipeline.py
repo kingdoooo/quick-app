@@ -81,12 +81,12 @@ def ensure_alarm_pipeline(*, region, log_group, namespace, metric_name,
         changed.append("log_group")
     except logs.exceptions.ResourceAlreadyExistsException:
         pass
-    # retention 收敛到 30 天（spec §6.3：平台日志组统一 30 天）。
-    # ⚠️ 这是**有意的数据修剪**，不是无害配置：现网若是更长保留期（曾是
-    # 90 天），超过 30 天的日志会被标记删除、约 72 小时内物理删除，事后调回
-    # 也找不回。首次在存量环境运行前，部署方必须确认历史日志无保留需要
-    # （deploy 门禁项，见 plan Task 4 Step 4）。
-    logs.put_retention_policy(logGroupName=log_group, retentionInDays=30)
+    # retention 声明为 90 天（2026-08-15 用户决定：全平台日志组统一 90 天，
+    # 取代二期 design spec §6.3 的「统一 30 天」）。
+    # 与旧值不同，**这一行不再修剪数据**：90 天是抬高保留期，只让日志活得更久，
+    # 无损、可反复运行。（旧的 30 天是有意的数据修剪，需要部署前确认历史日志
+    # 无保留需要；该门禁随本次统一一并作废。）
+    logs.put_retention_policy(logGroupName=log_group, retentionInDays=90)
 
     # ① metric filter：put 是 upsert 语义，直接声明即可
     logs.put_metric_filter(

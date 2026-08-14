@@ -21,14 +21,18 @@ _ensure_site_role = common.ensure_site_role
 
 def _ensure_log_group(fn: str) -> None:
     """预建站点日志组并设保留期。Lambda 首次执行会自动建组但不设 retention
-    （永久保留）；这里先建好，站点日志 30 天自动过期。undeploy 时整组删除。"""
+    （永久保留）；这里先建好，站点日志 90 天自动过期（2026-08-15 用户决定的
+    全平台统一值，取代原 30 天）。undeploy 时整组删除。
+
+    这里是**新建站点保留期的唯一真源**：手工改存量日志组不影响新站点，
+    下次部署仍按这个值写回。"""
     logs = boto3.client("logs")
     name = f"/aws/lambda/{fn}"
     try:
         logs.create_log_group(logGroupName=name)
     except logs.exceptions.ResourceAlreadyExistsException:
         pass
-    logs.put_retention_policy(logGroupName=name, retentionInDays=30)
+    logs.put_retention_policy(logGroupName=name, retentionInDays=90)
 
 
 def handler(event, context):

@@ -587,11 +587,13 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    alarm 照样进 ALARM 而无人知情，所以脚本把 `PendingConfirmation` 显式报告
    为「未完成」。
 
-   ⚠️ **首次在存量环境运行会修剪日志**：脚本把日志组保留期收敛到 30 天
-   （母 spec §6.3 的统一值）。现网原为 90 天，**超过 30 天的日志会被标记删除
-   并在约 72 小时内物理删除，事后把保留期调回去也找不回**。这是有意的动作，
-   不是附带效果：执行前先确认 30-90 天窗口的日志无排查/审计价值，否则先
-   `aws logs create-export-task` 导出。
+   保留期：脚本把该日志组声明为 **90 天**（2026-08-15 起的全平台统一值，见
+   下方「日志组保留期」一节）。**这一行不再修剪日志**——90 天是抬高保留期，
+   无损、可反复运行，没有配套门禁。
+   > 2026-08-15 之前这里写的是 30 天并附一条"首次在存量环境运行会修剪日志"
+   > 的警告（超过 30 天的日志会被标记删除、约 72 小时内物理删除）。统一到
+   > 90 天后该危险消失，警告与门禁一并作废；留这一句只为让读过旧版的人知道
+   > 它是**被撤销**的，不是被忘了。
 
    **从零部署验收**（"日志打了/metric 有点了"不等于"alarm 会响"）：
 
@@ -1448,30 +1450,44 @@ rollup **重算即修复**、**绝不封今天**、封口后面板读的是聚�
 顺带一并跑 `verify_deployed_components.py`（第 ⑨ 段是 M5 的跨包一致性）与
 `verify_console_e2e.py`（⑪ 段换成了统计端点的真实行为断言）。
 
-### 日志组保留期（M5 收尾时统一过一轮）
+### 日志组保留期（统一 90 天，2026-08-15 定稿）
 
-平台自己的日志组此前有一批**从未设过保留期**（= 永久留存，一直在计费）。M5 收尾时把
-它们统一设成 **90 天**。当前分布（三个区合计，2026-08-15 实测）：
+**现行口径：平台全部日志组一律 90 天。** 用户 2026-08-15 的决定（原话「统一到 90 天，
+内部访问量不大。如果真的变大，可以后面再来改」），**取代此前「统一 30 天」的口径**。
+本节是这个数字的现行真源。
+
+统一后的实测分布（三个区合计，2026-08-15；按 `site-` / `site_builder` / `SiteDeployer` /
+`ApplicationWebRouter` 四个模式合并统计）：
 
 | 保留期 | 数量 | 是谁 |
 |---|---|---|
-| 90 天 | 24 | 执行器各步 / rollup / panel / key-proxy / auth pre-token / CodeBuild / Edge（三区各 2） |
-| 30 天 | 7 | `site-auth-service` + 每个 per-site Lambda |
-| 731 天 | 2 | 飞书适配器（上游组件，不是本仓库的代码） |
-| **未设** | **2** | **见下** |
+| **90 天** | **33** | **全部**：执行器 12 步 / rollup / panel / key-proxy / auth 服务 / auth pre-token（含 spike 遗留）/ CodeBuild / MCP 的 AgentCore runtime / 6 个 per-site Lambda / Edge 两函数（三区各 2）/ 执行器栈的 S3 auto-delete 自定义资源 |
+| 未设 | **0** | —— |
 
-**两个仍未设保留期的（本文档发现，尚未处理）**：MCP 的 AgentCore runtime 日志组
-（`/aws/bedrock-agentcore/runtimes/{runtime_name}-{id}-DEFAULT`，AgentCore 自己建的）
-与执行器栈里 CDK 自动生成的 S3 auto-delete 自定义资源 Lambda
-（`/aws/lambda/SiteDeployerStack-CustomS3AutoDeleteObjects…`）。两者都属于本平台，
-**但名字不符合 `/aws/lambda/site-*` 这条清扫惯例**，所以上一轮按前缀扫的时候漏掉了。
-前者尤其值得处理——那是部署 MCP 每次调用的日志。
+（另有 2 个 731 天的 `FeishuQuickSso*` 组属飞书适配器——上游组件，不是本仓库的代码，不动。）
 
-**⚠️ 30 天那一档与「统一 90 天」是一个未解决的冲突，不要手工改**：那 7 个是
-**代码管理**的——`deployer/functions/deploy_lambda_site.py:31` 给每个新建站点的 Lambda
-写死 30 天，`auth/alarm_pipeline.py:89` 也写死 30 天并注明「spec §6.3：平台日志组统一
-30 天」。手工调成 90 天会**与真源漂移**，而且对**将来新建的站点无效**（下次部署又变回
-30）。这是一处需要改代码/改 spec 的决定，不是运维动作。
+**这个数字的真源是代码，不是控制台。** 只手工改存量日志组是无效的：
+
+- `deployer/functions/deploy_lambda_site.py` 的 `_ensure_log_group` 给**每个新建站点**的
+  Lambda 写 90 天——手工改存量组不影响新站点，下次部署又按代码里的值写回去。
+- `auth/alarm_pipeline.py` 的 ⓪ 段给 `site-auth-service` 组写 90 天（`deploy_auth.py` 重跑即收敛）。
+
+两处的数字现在各有用例锁住：`deployer/tests/test_deploy_lambda_site.py::test_site_log_group_retention_is_ninety_days`
+（moto 读回 `describe_log_groups`）与 `auth/tests/test_alarm_pipeline.py` 的 Stubber
+`expected_params`。**2026-08-15 之前两侧都只断言"调用发生了"、不断言值**——把 30 改成
+任何别的数字，两个包的单测都照样全绿。加断言时先反向验证过（改回 30 → 两侧确实变红）。
+
+**「母 spec §6.3 统一 30 天」已作废。** 那句话的出处是
+`docs/superpowers/specs/2026-07-30-quick-site-builder-phase2-design.md` §6.3
+（原文：「原始 Edge 日志组统一设 30 天保留」），M5 spec 的 §0.3 与 M3 计划各引用了它。
+这些都是**已实现快照 / 历史决策记录**，按仓库惯例不回改（见 CLAUDE.md「勿改」约定），
+所以**现行策略只看本节**。`docs/phase2-requirements.md` 只写了"参照日志组 30 天先例"，
+没定策略。
+
+**方向决定有损与否**：30→90 无损（只让日志活得更久，可反复运行）；反向的 90→30 有损
+（超过 30 天的日志被标记删除、约 72 小时内物理删除，事后调回也找不回）。把**未设**
+（永久留存）设成 90 天同样是有损的——本轮那一个组只有一条 2026-07-28 起的流，
+早于 90 天的日志根本不存在，才确认无损后执行。将来再收紧任何一档前先算这笔账。
 
 ### 两个已知的可观测性缺口（运维项，M5 不交付）
 

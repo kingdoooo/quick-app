@@ -73,6 +73,25 @@ def test_missing_edge_role_arn_fails_closed(aws, monkeypatch):
             deploy_lambda_site.handler(dict(EVENT), None)
 
 
+def test_site_log_group_retention_is_ninety_days(aws, monkeypatch):
+    """站点日志组保留期钉在 90 天（2026-08-15 用户决定的全平台统一值）。
+
+    这行代码管的是**将来每一个新建站点**——手工把存量日志组改成 90 天不会
+    影响新站点，下次部署又按代码里的值写回去。所以数字必须由用例锁住。
+    """
+    import deploy_lambda_site, common
+    monkeypatch.setenv("EDGE_ROLE_ARN", "arn:aws:iam::1:role/edge-role")
+    common.create_job("a@x.com", "s-1")
+    lam = _lam_mock(exists=False)
+    with patch.object(deploy_lambda_site, "_lambda", return_value=lam):
+        deploy_lambda_site.handler(dict(EVENT), None)
+    import boto3
+    groups = boto3.client("logs", region_name="us-east-1").describe_log_groups(
+        logGroupNamePrefix="/aws/lambda/site-s-1")["logGroups"]
+    assert [(g["logGroupName"], g.get("retentionInDays")) for g in groups] == [
+        ("/aws/lambda/site-s-1", 90)]
+
+
 def test_existing_function_updated(aws, monkeypatch):
     import deploy_lambda_site, common
     monkeypatch.setenv("EDGE_ROLE_ARN", "arn:aws:iam::1:role/edge-role")

@@ -55,7 +55,13 @@ def _stub_common(stubs, *, subs, sub_result=None, fresh_account=False):
     else:
         stubs["logs"].add_client_error("create_log_group",
                                        "ResourceAlreadyExistsException")
-    stubs["logs"].add_response("put_retention_policy", {})
+    # retention 的**值**必须进 expected_params：不带它的 add_response 只匹配
+    # 操作名，`retentionInDays` 改成任何数字用例都照样绿（2026-08-15 统一到
+    # 90 天时发现这里从未钉住过那个数字）。
+    stubs["logs"].add_response(
+        "put_retention_policy", {},
+        expected_params={"logGroupName": ARGS["log_group"],
+                         "retentionInDays": 90})
     stubs["logs"].add_response("put_metric_filter", {})
     stubs["sns"].add_response("create_topic", {"TopicArn": TOPIC_ARN})
     stubs["sns"].add_response("list_subscriptions_by_topic",
@@ -161,9 +167,10 @@ def test_fresh_account_creates_log_group_before_metric_filter(clients):
         s.assert_no_pending_responses()
 
 
-def test_existing_log_group_still_converges_retention(clients):
-    """现网路径：组已存在（AlreadyExists 被吞），retention 仍要收敛到 30 天
-    （spec §6.3 平台日志组统一 30 天；现网曾是 90 天）。"""
+def test_existing_log_group_still_declares_retention(clients):
+    """现网路径：组已存在（AlreadyExists 被吞），retention 仍要被声明成
+    90 天（2026-08-15 用户决定：全平台日志组统一 90 天，取代原「统一 30 天」）。
+    不再叫「收敛」：90 天是**抬高**保留期，无损。"""
     logs, sns, cw, stubs = clients
     _stub_common(stubs, subs=[{"Protocol": "email",
                                "Endpoint": "ops@example.com",
