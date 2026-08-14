@@ -46,7 +46,7 @@ CHECKS = 0
 FAILURES = 0
 # 全绿时的实际断言条数下限。**不是估的**：低于它说明脚本中途崩了或分支被跳过，
 # 而"跑了 3 项全过"读起来跟"30 项全过"一样像成功（M3-FINDINGS §2.3 的教训）。
-MIN_CHECKS = 57      # M4 把 ⑪ 段的 /api/keys 从 1 条"不存在"换成 3 条行为断言
+MIN_CHECKS = 65      # M5 把 ⑪ 段的两条"不存在"换成 10 条真实端点行为断言（净 +8）
 
 
 def cfg(section: str, key: str, default: str | None = None) -> str:
@@ -390,17 +390,62 @@ def main() -> int:
         check(int(cnt.get("n", -1)) == 1,
               "管理员名单未被越权请求改动（__count__ 仍为 1）", f"n={cnt.get('n')}")
 
-        print("\n── ⑪ 尚未实现的接口确实不存在 ──────────────────────")
-        # **这一段原来把 `/api/keys` 也列在"不存在"里**，那在 M3 是对的，M4 落地
-        # 当天就变成了假红：Task 6/9 实现了它，于是线上返回 200 而闸门要求 404
-        # （2026-08-13 跑 Task 10 Step 10 时真的红了）。教训不是"改个数字"——
-        # **枚举"什么还不存在"的断言天生会随下一个里程碑过期**，所以下面把
-        # `/api/keys` 换成对它**真实行为**的断言，剩下两个 M5 接口才继续用
-        # "不存在"这条形态。
-        for path in ("/api/analytics", "/api/visitors"):
-            st, _, _ = request("GET", origin + path, cookies=ck_new)
-            check(st == 404, f"{path} → 404（M5 未实现，前端也不请求它）",
-                  f"实际 {st}")
+        print("\n── ⑪ M5 统计端点的真实行为 ────────────────────────")
+        # **这一段的历史是一条方法论**：M3 写它时枚举了
+        # `/api/keys`、`/api/analytics`、`/api/visitors` 三个"还不存在"的路径
+        # 并断言 404。M4 落地当天 `/api/keys` 变成假红（它被实现了），已换成
+        # 行为断言。M5 落地时另两条**不会变红——会永远绿**：真实路由是
+        # `/api/sites/{id}/analytics`，与那两个裸路径不是同一个字符串。
+        # 永远绿的断言是死重量（M4-FINDINGS §3.6），且它伪装成"有覆盖"。
+        # 所以：**删掉它们**，换成对真实端点的行为断言。
+        # "不泄漏路由表"由 ⑩ 段那条通用的"未知路由 → 404"继续覆盖。
+        st, _, text = request("GET", origin + f"/api/sites/{site_id}/analytics"
+                              "?period=day&n=7", cookies=ck_new)
+        check(st == 200, "/api/sites/{id}/analytics → 200", f"实际 {st}")
+        body = as_json(text)
+        check(isinstance(body.get("series"), list),
+              "analytics 返回 {series:[...]} 形态", f"实际 keys={list(body)}")
+        # `series` 对 `period=day&n=7` **恒为 7 个零填充桶**（analytics.series 的
+        # 契约），所以下面这条在 fixture 站点上也真的逐桶判定，不是空转。
+        check(all({"bucket", "pv", "uv", "pv_denied", "uv_exact"} <= set(b)
+                  for b in body.get("series", [])) or not body.get("series"),
+              "每个桶都带 uv_exact（契约字段，不是可选项）",
+              f"实际 {body.get('series')[:1] if body.get('series') else '空序列'}")
+
+        st, _, text = request("GET", origin + f"/api/sites/{site_id}/visitors"
+                              "?days=1&limit=5", cookies=ck_new)
+        check(st == 200, "/api/sites/{id}/visitors → 200", f"实际 {st}")
+        vbody = as_json(text)
+        check(isinstance(vbody.get("rows"), list),
+              "visitors 返回 {rows:[...]} 形态", f"实际 keys={list(vbody)}")
+        # 顶层**恰好** {rows,next}：`next` 只能是本接口自己编码的游标，
+        # DynamoDB 的 LastEvaluatedKey / 表名之类内部结构不得原样带出来。
+        # 与下一条不同——它在零明细的 fixture 站点上仍然会判定。
+        check(set(vbody) == {"rows", "next"},
+              "visitors 顶层恰好 {rows,next}（不外泄内部分页结构）",
+              f"实际 {sorted(vbody)}")
+        # 下一条在 fixture 站点上通常空转（本次新建的站点没有访问明细）；
+        # 有数据时的逐字段核对在 verify_analytics_e2e.py。放在这里是为了
+        # "真有行时字段多一个就红"，不是为了在这里造数据。
+        check(all({"ts", "email", "path", "decision"} == set(r)
+                  for r in vbody.get("rows", [])) or not vbody.get("rows"),
+              "明细行恰好四个字段（多字段 = 泄漏了内部结构）",
+              f"实际 {vbody.get('rows')[:1] if vbody.get('rows') else '空'}")
+
+        # 越界参数必须 400 而不是被静默夹住（days ≤ 90 = 明细留存）
+        st, _, _ = request("GET", origin + f"/api/sites/{site_id}/visitors?days=91",
+                           cookies=ck_new)
+        check(st == 400, "visitors days=91 → 400（不静默夹到 90）", f"实际 {st}")
+
+        # 越权负测：**用 outsider 的 cookie 打本次真实创建的站点**。
+        # 不退化成"请求一个不存在的 site_id"——那只证明 site=None 被拒，
+        # 证不出"一个真实存在的站点不会被无权者读到"，而后者才是要防的。
+        st, _, _ = request("GET", origin + f"/api/sites/{site_id}/analytics",
+                           cookies=ck_out)
+        check(st == 403, "outsider 读真实站点的 analytics → 403", f"实际 {st}")
+        st, _, _ = request("GET", origin + f"/api/sites/{site_id}/visitors",
+                           cookies=ck_out)
+        check(st == 403, "outsider 读真实站点的 visitors → 403", f"实际 {st}")
 
         # `/api/keys`（M4）：组件启用与否走**唯一真源**判定，不在这里再写一次
         # has_section（那就是第二个判定点）。
