@@ -432,6 +432,22 @@ def ensure_role() -> str:
              "Null": {"dynamodb:Attributes": "false"},
              "StringEqualsIfExists": {
                  "dynamodb:ReturnValues": ["NONE", "UPDATED_OLD", "UPDATED_NEW"]}}},
+        # M5 统计表：**只 Query**（明细按 site_date 分区、聚合按 site_id + date
+        # 区间，analytics.py 的每个查询都带分区键）。
+        # 不给任何写动作：明细的唯一写入者是 Edge、聚合的唯一写入者是 rollup
+        # Lambda。runtime 是 TCB（见上面 SitesWrite 的说明），给它写权限等于让
+        # 被攻破的 runtime 能伪造统计、或抹掉自己留下的访问记录。
+        # 也不给 Scan：Scan 能跨站点读出别人站点的访问明细（**含访问者邮箱**），
+        # 而读取层压根不需要它——这与 sites 表"读全字段不是问题"的取向不同，
+        # 因为那边由应用层 owner 判定收口，而这里的明细是逐条身份记录。
+        # 没有 GSI，所以不需要 index/*（与 panel 的 api-keys 那条刻意不同）。
+        # 动作集由 tests/test_agentcore_contract.py 从 analytics.py 的
+        # boto3 方法名推导后交叉核对，不手抄第二份清单。
+        {"Sid": "AccessTablesQueryOnly", "Effect": "Allow",
+         "Action": "dynamodb:Query",
+         "Resource": [
+             f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-access-events",
+             f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/site-access-daily"]},
         # presigned PUT 由调用者上传，MCP 侧只需 HeadObject 校验大小
         {"Effect": "Allow", "Action": ["s3:PutObject", "s3:GetObject"],
          "Resource": f"arn:aws:s3:::site-artifacts-{ACCOUNT}/uploads/*"},
@@ -566,6 +582,16 @@ def runtime_kwargs(cfg, image_uri: str, role_arn: str) -> dict:
             "ADMINS_TABLE": cfg["Deployer"]["admins_table"],
             # 权限投影的目标表（permissions.write_permissions 的第二个事务项）
             "ROUTING_TABLE": cfg["Platform"]["routing_table"],
+            # M5 统计：analytics.py 读这两个（get_site_analytics 的读取层，与
+            # panel 共用同一份模块）。缺任一个的症状是容器里 KeyError——部署打印
+            # 成功、工具一调就废，而单测侧全程 monkeypatch 看不到这一格。
+            # 表名是字面量而不是 cfg 项：建表方（deployer/infra/app.py）写的也是
+            # 字面量，config.ini 里没有这两项。三处必须同名，由
+            # tests/test_agentcore_contract.py 的
+            # test_runtime_table_names_match_the_tables_the_stack_creates
+            # 钉到建表语句上（panel 侧有对称的一条）。
+            "ACCESS_EVENTS_TABLE": "site-access-events",
+            "ACCESS_DAILY_TABLE": "site-access-daily",
             "TRUSTED_IDPS": cfg["IdP"]["provider_name"] if cfg.has_section("IdP") else "",
             # 与 auth 服务同一个开关（两处语义必须一致）：email 是授权主键，
             # 而联邦 email 默认 unverified。默认 "true"，只有接入不发该 claim

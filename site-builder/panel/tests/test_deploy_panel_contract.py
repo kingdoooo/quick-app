@@ -399,6 +399,143 @@ def test_api_keys_role_has_no_deleteitem_and_no_scan():
         "该改的是 keystore（吊销必须置 revoked、列 Key 必须走 GSI），不是放宽 role")
 
 
+# ── 统计表的权限从 analytics.py 的操作推导（二期 M5）────────────────────
+# 为什么必须单独有这一组（Task 8 报告 §8.4 点出的缺口）：隔壁两条 IAM 推导断言
+# 都看不见这张表——一条解析 permissions.py 的**事务项**（TransactItems 的
+# "Update"/"ConditionCheck" 字典），一条解析 keystore.py 挂在 `_table()` 上的
+# **资源级方法**。analytics.py 用的是低阶 client 的 `_client().query(**kwargs)`，
+# 表名在 kwargs 里，两个解析器的词汇表都不认。于是 `AccessTablesQueryOnly`
+# 整条缺失、或被放宽到 Scan，**没有任何单测会红**，而真机是 AccessDenied → 500
+# （moto 不校验 IAM，这一类本仓库已被咬过多次）。
+
+ANALYTICS_SRC = PANEL.parent / "deployer" / "functions" / "analytics.py"
+
+
+def _analytics_ddb_actions() -> set[str]:
+    """analytics.py 对 DynamoDB 做的每个操作 → IAM action，全从 AST 推导。
+
+    判据是"方法挂在 `_client()` 调用上"：`_client().query(**kwargs)` 是低阶
+    client 形态，与 keystore 那条的 `_table()` 同形不同名。手抄一份"需要哪些
+    action"的清单本身就是下一个漂移源。
+    """
+    actions = set()
+    for node in ast.walk(ast.parse(ANALYTICS_SRC.read_text())):
+        if (isinstance(node, ast.Attribute)
+                and node.attr in DDB_METHOD_TO_ACTION
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id == "_client"):
+            actions.add(DDB_METHOD_TO_ACTION[node.attr])
+    return actions
+
+
+def _analytics_env_keys() -> set[str]:
+    """analytics.py 读的环境变量键名（AST），用来找出它访问的是哪两张表。
+
+    **只扫 analytics.py**，不扫 access_rollup.py：读取层只 import 它的
+    `day_stats`（纯函数），那些 `os.environ[...]` 属于 rollup Lambda 的 handler
+    路径。整文件一刀切会要求 panel 下发 rollup 专用配置——与上面那段
+    可达性归属的理由是同一个。
+    """
+    keys = set()
+    for node in ast.walk(ast.parse(ANALYTICS_SRC.read_text())):
+        if (isinstance(node, ast.Subscript)
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "environ"
+                and isinstance(node.slice, ast.Constant)):
+            keys.add(node.slice.value)
+    return keys
+
+
+def _access_tables() -> dict[str, str]:
+    """analytics.py 读的 `*_TABLE` 键 → **下发给 Lambda 的**表名。
+
+    表名不写字面量：analytics 读 `os.environ["ACCESS_EVENTS_TABLE"]`，所以
+    "role 授权的那张表"与"代码实际访问的那张表"同名才成立；两处漂移时本组
+    断言会一起变红。形态照隔壁 `_api_keys_table()`。
+    """
+    env = dp.lambda_environment()
+    return {k: env[k] for k in sorted(_analytics_env_keys())
+            if k.endswith("_TABLE") and k in env}
+
+
+def test_analytics_op_parser_is_not_vacuous():
+    """守卫的守卫：解析口径一坏，下面三条会静默变成空转。"""
+    assert "dynamodb:Query" in _analytics_ddb_actions(), (
+        f"解析不到 analytics.py 的 Query: {sorted(_analytics_ddb_actions())}")
+    assert set(_analytics_env_keys()) >= {"ACCESS_EVENTS_TABLE",
+                                         "ACCESS_DAILY_TABLE"}, (
+        f"解析不到 analytics.py 读的表名环境变量: {sorted(_analytics_env_keys())}")
+    assert len(_access_tables()) == 2, (
+        f"两张统计表没有都在环境变量里: {_access_tables()}")
+
+
+def test_role_grants_every_access_table_action_analytics_needs():
+    """analytics.py 会做的每个操作，panel role 都必须授权。
+
+    缺 Query 的症状是 AccessDeniedException → 统计端点 500，而 moto 不校验
+    IAM，`test_analytics_api.py` 那一侧全绿也说明不了什么。
+    没有 GSI，所以**不需要** `index/*`（与 api-keys 那条刻意不同）。
+    """
+    needed = _analytics_ddb_actions()
+    for key, table in _access_tables().items():
+        granted = set()
+        for s in dp.role_statements():
+            for res in _resources(s):
+                if res.endswith(f"/{table}") or f"/{table}/" in res:
+                    granted |= set(_actions(s))
+        assert granted, (
+            f"panel role 里找不到 {table}（{key}）的任何授权——真机 AccessDenied → 500")
+        missing = needed - granted
+        assert not missing, (
+            f"{table} 上 analytics.py 需要但没授权的动作: {sorted(missing)} "
+            "—— 真机以 AccessDeniedException → 500 出现，moto 测不出来")
+
+
+def test_access_tables_are_query_only_no_scan_no_writes():
+    """统计表对 panel **只读**：不给任何写动作，也不给 Scan。
+
+    不给写：明细的唯一写入者是 Edge、聚合的唯一写入者是 rollup Lambda——控制台
+    能改数就等于统计可被伪造（还包括抹掉自己的访问记录）。
+    不给 Scan：Scan 能跨站点读出别人站点的访问明细（**含访问者邮箱**），而读取层
+    每个查询都带 site_id 分区键，压根不需要它。
+    两个方向都查（形态照 api-keys 那条）：只查 role 时，将来 analytics 里冒出一个
+    `scan` 会以真机 AccessDenied 出现；只查代码时，role 多给的宽权限没人管。
+    """
+    forbidden = {"dynamodb:PutItem", "dynamodb:UpdateItem",
+                 "dynamodb:DeleteItem", "dynamodb:BatchWriteItem",
+                 "dynamodb:Scan", "dynamodb:*"}
+    for key, table in _access_tables().items():
+        for s in dp.role_statements():
+            if not any(f"/{table}" in r for r in _resources(s)):
+                continue
+            bad = forbidden & set(_actions(s))
+            assert not bad, (
+                f"{table}（{key}）拿到了 {sorted(bad)}（Sid={s.get('Sid')}）"
+                "——统计表对 panel 只能 Query")
+    over = forbidden & _analytics_ddb_actions()
+    assert not over, (
+        f"analytics.py 里出现了 {sorted(over)}——真机会 AccessDenied。"
+        "该改的是 analytics.py（读取层不写数、查询都带分区键），不是放宽 role")
+
+
+def test_access_table_names_match_the_tables_the_stack_creates():
+    """下发的表名必须是 CDK 栈真建出来的那两张（真值锚点）。
+
+    三个部署目标各写一份字面量（deployer 栈建表、panel 下发、MCP 下发），改名时
+    只改一处的症状是真机 ResourceNotFoundException，而各包单测都绿。
+    MCP 那份钉在
+    `mcp/tests/test_agentcore_contract.py::test_runtime_table_names_match_the_tables_the_stack_creates`。
+    """
+    app_src = (PANEL.parent / "deployer" / "infra" / "app.py").read_text()
+    tables = _access_tables()
+    assert tables, "没解析到任何统计表——本用例会静默空转"
+    for key, table in tables.items():
+        assert f'table_name="{table}"' in app_src, (
+            f"{key}={table!r} 在 infra/app.py 里找不到对应的建表语句——"
+            "表名漂移了，真机 ResourceNotFoundException")
+
+
 def test_environment_covers_every_env_var_keystore_reads():
     """keystore 读的环境变量必须都下发。
 

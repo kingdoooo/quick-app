@@ -880,3 +880,250 @@ def test_image_carries_every_local_module_the_server_chain_imports():
         # tag 仍指向旧内容
         assert f"functions/{mod}" in src, (
             f"_BUILD_INPUTS 缺 {mod}——改它不会触发新 tag，会部署出陈旧镜像")
+
+
+def _server_chain_closure() -> set[str]:
+    """server.py 传递 import 到的、住在 `deployer/functions/` 的模块文件名。
+
+    与上面那条守卫**同一份闭包逻辑**，抽出来给下面的指纹守卫复用：两处各写一遍
+    传递闭包，就等于把"什么必须进镜像"这个不变量抄成两份。
+    """
+    import ast
+
+    fn_dir = MCP_DIR.parent / "deployer" / "functions"
+
+    def local_imports(path: Path) -> set[str]:
+        names = set()
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Import):
+                names |= {a.name.split(".")[0] for a in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names.add(node.module.split(".")[0])
+        return names
+
+    needed, queue, seen = set(), ["server.py"], set()
+    while queue:
+        cur = queue.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        path = MCP_DIR / cur if (MCP_DIR / cur).exists() else fn_dir / cur
+        if not path.exists():
+            continue
+        for name in local_imports(path):
+            if (fn_dir / f"{name}.py").exists():
+                needed.add(f"{name}.py")
+                queue.append(f"{name}.py")
+    return needed
+
+
+def test_build_inputs_covers_every_module_that_enters_the_image():
+    """`_BUILD_INPUTS` 决定内容指纹 tag，漏一个模块 = 改它不会改 tag =
+    deploy_agentcore.py 复用**旧镜像**并打印成功（本仓库最熟悉的那种静默失效）。
+
+    与上面那条守卫的关系是**补集**，不是重复：那条按源码文本查
+    `f"functions/{mod}" in src`，所以模块名只要在**注释里**出现过它就绿，
+    而注释不进指纹清单。这条 import 出真正的 `_BUILD_INPUTS` 元组来比对，
+    "名字在注释里、不在元组里"这一格只有它会红。
+    """
+    import importlib.util
+
+    needed = _server_chain_closure()
+    assert "analytics.py" in needed, (
+        "闭包没算出 analytics.py——server.py 应该 import 它（解析逻辑坏了）")
+
+    spec = importlib.util.spec_from_file_location(
+        "da_for_inputs", MCP_DIR / "deploy_agentcore.py")
+    da = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(da)
+    inputs = {Path(x).name for x in da._BUILD_INPUTS}
+    missing = needed - inputs
+    assert not missing, (
+        f"_BUILD_INPUTS 漏了 {sorted(missing)}——改这些文件不会改镜像 tag，"
+        "部署会复用旧镜像并打印成功")
+
+
+# --- M5 统计表：表名下发 + 只读 IAM（Task 11）------------------------------
+# 两件事在同一个方向上失效：漏下发环境变量 = 容器里 KeyError；漏 IAM =
+# AccessDenied。两者都发生在**业务代码之前**，而单测这一侧
+# （test_analytics_tool.py 全程 monkeypatch / moto）永远看不到——
+# moto 不校验 IAM 是本仓库反复被咬的那一条。
+#
+# cfg 构造复用 test_component_gate 的那份（**一份实现**）：runtime_kwargs 要求的
+# 段很多，各抄一份的话，哪天多一个必填段两处会以不同方式坏掉。
+from test_component_gate import _cfg as _runtime_cfg  # noqa: E402
+
+DDB_METHOD_TO_ACTION = {
+    "get_item": "dynamodb:GetItem", "put_item": "dynamodb:PutItem",
+    "update_item": "dynamodb:UpdateItem", "delete_item": "dynamodb:DeleteItem",
+    "query": "dynamodb:Query", "scan": "dynamodb:Scan",
+    "batch_get_item": "dynamodb:BatchGetItem",
+    "batch_write_item": "dynamodb:BatchWriteItem",
+    "transact_get_items": "dynamodb:TransactGetItems",
+    "transact_write_items": "dynamodb:TransactWriteItems"}
+
+ANALYTICS_SRC = (Path(__file__).parents[2] / "deployer" / "functions"
+                 / "analytics.py")
+
+
+def _analytics_env_keys() -> set[str]:
+    """analytics.py 读的环境变量键名，从源码 AST 推导。
+
+    **只扫 analytics.py**，不扫 access_rollup.py：读取层只 import 它的
+    `day_stats`（纯函数），而 access_rollup 里那些 `os.environ[...]` 属于 rollup
+    Lambda 自己的 handler 路径。整文件一刀切会要求 MCP 下发 rollup 专用的配置，
+    那是错的方向（panel 侧同一处判断见 test_deploy_panel_contract 的可达性闭包）。
+    """
+    import ast
+
+    keys: set[str] = set()
+    for node in ast.walk(ast.parse(ANALYTICS_SRC.read_text())):
+        if (isinstance(node, ast.Subscript)
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "environ"
+                and isinstance(node.slice, ast.Constant)):
+            keys.add(node.slice.value)
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get"
+                and isinstance(node.func.value, ast.Attribute)
+                and node.func.value.attr == "environ" and node.args
+                and isinstance(node.args[0], ast.Constant)):
+            keys.add(node.args[0].value)
+    return keys
+
+
+def _analytics_ddb_actions() -> set[str]:
+    """analytics.py 对 DynamoDB 做的每个操作 → IAM action，全从 AST 推导。
+
+    判据是"方法挂在 `_client()` 调用上"（低阶 client，表名在 kwargs 里）——
+    与 panel 侧 keystore 那条同形，只是那边挂在 `_table()` 上。
+    手抄一份"需要哪些 action"就是下一个漂移源。
+    """
+    import ast
+
+    actions = set()
+    for node in ast.walk(ast.parse(ANALYTICS_SRC.read_text())):
+        if (isinstance(node, ast.Attribute)
+                and node.attr in DDB_METHOD_TO_ACTION
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id == "_client"):
+            actions.add(DDB_METHOD_TO_ACTION[node.attr])
+    return actions
+
+
+def test_analytics_source_parsers_are_not_vacuous():
+    """守卫的守卫：这两个解析口径一坏，下面三条会静默变成空转。"""
+    assert {"ACCESS_EVENTS_TABLE", "ACCESS_DAILY_TABLE"} <= _analytics_env_keys(), (
+        f"解析不到 analytics.py 读的表名环境变量: {sorted(_analytics_env_keys())}")
+    assert "dynamodb:Query" in _analytics_ddb_actions(), (
+        f"解析不到 analytics.py 的 Query: {sorted(_analytics_ddb_actions())}")
+
+
+def _runtime_env() -> dict:
+    import deploy_agentcore as da
+    return da.runtime_kwargs(_runtime_cfg(), "repo@sha256:x",
+                             "arn:aws:iam::1:role/r")["environmentVariables"]
+
+
+def test_runtime_env_carries_every_table_the_analytics_layer_reads():
+    """analytics.py 是**镜像里**的模块，它读的键必须由 runtime 下发。
+
+    漏了的症状是容器里 KeyError（工具一调就废，而部署打印成功）；单测侧
+    test_analytics_tool.py 全程 monkeypatch，看不到这一格。
+    """
+    env = _runtime_env()
+    missing = _analytics_env_keys() - set(env)
+    assert not missing, (
+        f"analytics.py 会读但 runtime 没下发的环境变量: {sorted(missing)} "
+        "—— 容器里 KeyError，工具一调就废")
+
+
+def test_runtime_table_names_match_the_tables_the_stack_creates():
+    """下发的表名必须是 CDK 栈真建出来的那两张（真值锚点）。
+
+    三个部署目标（deployer 栈建表、panel 下发、MCP 下发）各写一份字面量，
+    改名时只改一处的症状是 ResourceNotFoundException——而两侧单测各自都绿。
+    这里把 MCP 那份钉到建表的那份上。
+    """
+    app_src = (Path(__file__).parents[2] / "deployer" / "infra" / "app.py").read_text()
+    env = _runtime_env()
+    for key in sorted(k for k in _analytics_env_keys() if k.endswith("_TABLE")):
+        table = env[key]
+        assert f'table_name="{table}"' in app_src, (
+            f"{key}={table!r} 在 infra/app.py 里找不到对应的建表语句——"
+            "表名漂移了，真机 ResourceNotFoundException")
+
+
+def _runtime_policy_statements() -> list[dict]:
+    """跑 ensure_role() 抓真正下发的 policy 语句（不看源码文本）。"""
+    import json
+    from unittest.mock import MagicMock
+
+    import deploy_agentcore as da
+
+    captured = {}
+    fake = MagicMock()
+    fake.get_role.return_value = {"Role": {"Arn": "arn:aws:iam::1:role/r"}}
+    fake.put_role_policy.side_effect = lambda **kw: captured.update(kw)
+    real_iam, da.iam = da.iam, fake
+    try:
+        da.ensure_role()
+    finally:
+        da.iam = real_iam
+    return json.loads(captured["PolicyDocument"])["Statement"]
+
+
+def _actions_on(table: str) -> set[str]:
+    """policy 里所有涉及该表（含索引 ARN）的 statement 的动作并集。"""
+    acts: set[str] = set()
+    for stmt in _runtime_policy_statements():
+        res = stmt["Resource"]
+        res = [res] if isinstance(res, str) else res
+        if any(r.endswith(f"/{table}") or f"/{table}/" in r for r in res):
+            a = stmt["Action"]
+            acts |= set(a if isinstance(a, list) else [a])
+    return acts
+
+
+def test_runtime_role_grants_every_access_table_action_analytics_needs():
+    """analytics.py 会做的每个 DynamoDB 操作，runtime 角色都必须授权。
+
+    缺 Query 的症状是 AccessDeniedException → 工具报错，**在业务代码之前**。
+    moto 不校验 IAM，所以 test_analytics_tool.py 那一侧全绿也说明不了什么
+    （M3-FINDINGS §2.18 的同一形态：panel 曾漏 ConditionCheckItem，144 个单测
+    全绿而真机全 500）。
+    """
+    env = _runtime_env()
+    needed = _analytics_ddb_actions()
+    for key in sorted(k for k in _analytics_env_keys() if k.endswith("_TABLE")):
+        table = env[key]
+        granted = _actions_on(table)
+        assert granted, f"runtime 角色里找不到 {table} 的任何授权"
+        missing = needed - granted
+        assert not missing, (
+            f"{table} 上 analytics.py 需要但没授权的动作: {sorted(missing)}")
+
+
+def test_runtime_access_tables_are_query_only():
+    """统计表对 MCP 只读：**不给任何写动作，也不给 Scan**。
+
+    不给写：改统计只属于 rollup Lambda（聚合表）与 Edge（明细表）；被攻破的
+    runtime 不该能改写或删掉访问历史。
+    不给 Scan：Scan 能跨站点读出别人站点的访问明细（含邮箱），而读取层每个查询
+    都带 site_id 分区键，压根不需要它。
+    两个方向都查——只查角色时，将来代码里冒出一个 `scan` 会以真机 AccessDenied
+    的形态出现；只查代码时，角色多给的宽权限没人管。
+    """
+    forbidden = {"dynamodb:PutItem", "dynamodb:UpdateItem",
+                 "dynamodb:DeleteItem", "dynamodb:BatchWriteItem",
+                 "dynamodb:Scan", "dynamodb:*"}
+    env = _runtime_env()
+    for key in sorted(k for k in _analytics_env_keys() if k.endswith("_TABLE")):
+        table = env[key]
+        bad = forbidden & _actions_on(table)
+        assert not bad, f"{table} 上给了 {sorted(bad)}——统计表对 MCP 只能 Query"
+    over = forbidden & _analytics_ddb_actions()
+    assert not over, (
+        f"analytics.py 里出现了 {sorted(over)}——真机会 AccessDenied。"
+        "该改的是 analytics.py（读取层不写数、查询都带分区键），不是放宽角色")
