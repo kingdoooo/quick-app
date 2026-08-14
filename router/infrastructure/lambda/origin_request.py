@@ -72,7 +72,12 @@ def _access_region(context) -> str:
         parts = arn.split(":")
         region = parts[3] if len(parts) > 3 else ""
     if region not in ACCESS_REPLICA_REGIONS:
-        return DYNAMODB_REGION
+        region = DYNAMODB_REGION
+    # spec §0.4 第 1 步的线上探测。**读完保留**：Lambda@Edge 拿不到自定义环境
+    # 变量，所以"副本路径在用、还是一直在跨区回落"这件事，线上只有这一行能证明
+    # （回落是正确但慢的，不报错——没有它就永远分不清两者）。三个值都不敏感。
+    print(f"[INFO] m5-region env={os.environ.get('AWS_REGION')!r} "
+          f"arn={getattr(context, 'invoked_function_arn', '')!r} -> {region}")
     return region
 
 
