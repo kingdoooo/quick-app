@@ -45,39 +45,28 @@ MCP 没有 whoami 工具，"解析成了谁"只能从**副作用**观察。`list
 """
 import argparse
 import configparser
-import importlib.util
-import json
 import os
 import sys
-import time
-import urllib.parse
-import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parents[1]
 CFG_PATH = HERE.parent / "config.ini"
-TOKEN_PATH = Path.home() / ".site-builder-deploy-token.json"
 
 # 正对照要换机器 token，复用 key-proxy 的 machine_token（换 token 的唯一实现）
 sys.path.insert(0, str(HERE.parent / "deployer" / "functions"))
 sys.path.insert(0, str(HERE.parent / "key-proxy"))
+sys.path.insert(0, str(HERE))       # 直接跑时 sys.path[0] 已是这里；被 import 时不是
 
 CHECKS = 0
 FAILURES = 0
 MIN_CHECKS = 11
 
-# MCP over streamable-http 的客户端**只有一份实现**：verify_api_key_e2e.py 的
-# `Mcp`。在这里再写一遍就会出现"两个脚本走的其实不是同一个协议路径"，而那正是
-# 负测最不能有的性质（本项目已因"手抄第二份"栽过多次）。按路径加载而不是包
-# 导入，是因为 scripts/ 不是包。
-_spec = importlib.util.spec_from_file_location(
-    "_vake", HERE / "verify_api_key_e2e.py")
-assert _spec and _spec.loader
-_vake = importlib.util.module_from_spec(_spec)
-sys.modules["_vake"] = _vake
-_spec.loader.exec_module(_vake)
-Mcp, http = _vake.Mcp, _vake.http
+# MCP 客户端与用户 token 的获取**只有一份实现**：`_mcp_client.py`。在这里再写
+# 一遍就会出现"几个脚本走的其实不是同一个协议路径"，而那正是负测最不能有的
+# 性质（本项目已因"手抄第二份"栽过多次）。`_claims` / `_load_token` 原来是本
+# 文件的私有函数，M5 的统计闸门也要用，所以一并搬进去了——**行为一字未改**。
+from _mcp_client import (Mcp, claims as _claims,  # noqa: E402
+                         load_user_token as _load_token, mcp_endpoint)
 
 
 def check(ok: bool, desc: str, detail: str = "") -> bool:
@@ -87,71 +76,6 @@ def check(ok: bool, desc: str, detail: str = "") -> bool:
     if not ok:
         FAILURES += 1
     return ok
-
-
-def _claims(access_token: str) -> dict:
-    """access token 的 claims（**只解 payload，不验签**）。
-
-    不验签是有意的：这里不是授权判定，只是要读出 `email` 好知道"应该解析成谁"。
-    真正的验签在网关（`customJWTAuthorizer`）——如果 token 是伪造的，下面每一次
-    调用都会 401，而不是靠这里挡。
-    """
-    import base64
-    payload = access_token.split(".")[1]
-    payload += "=" * (-len(payload) % 4)
-    return json.loads(base64.urlsafe_b64decode(payload))
-
-
-def _load_token(client_id: str) -> str:
-    """有效的用户 access token。过期就用 refresh_token 续；续不动则明确要求人登录。
-
-    **续到的新 token 写回文件**（与 proxy 同一个落点、同一份格式）：不写回的话
-    下一次跑本脚本又要续一次，而 refresh 每次都会让 Cognito 轮转 refresh token，
-    白丢一次可用期。
-    """
-    if not TOKEN_PATH.exists():
-        sys.exit(f"没有 {TOKEN_PATH} —— 先在浏览器里登录一次：\n"
-                 f"  node {ROOT}/site-builder/clients/quick-desktop-proxy/auth.js "
-                 f'"<endpoint_url>" "<mcp_client_id>"')
-    data = json.loads(TOKEN_PATH.read_text())
-    token = data.get("access_token") or ""
-    # **余量必须覆盖整场跑完的时间，不是"还没过期就行"。**
-    # access token 只有 15 分钟（M1 收紧的边界）。第一版留 60s，结果注入验证那
-    # 一跑真的踩到了：① 段拿到 12 个站点后，token 在中途过期，后面几条全变成
-    # HTTP 401，而错误文案是"身份被头改写了"——**一条假的安全告警**，比不报还糟。
-    # 本脚本会连发 ~8 次 MCP 调用，300s 余量足够，且离 15 分钟上限还很远。
-    if token and _claims(token).get("exp", 0) - time.time() > 300:
-        return token
-
-    refresh = data.get("refresh_token")
-    endpoint = data.get("token_endpoint")
-    if not (refresh and endpoint):
-        sys.exit("access token 已过期且没有 refresh_token —— 请重新登录（见 --help）")
-    body = urllib.parse.urlencode({"grant_type": "refresh_token",
-                                   "client_id": client_id,
-                                   "refresh_token": refresh}).encode()
-    st, _, text = http("POST", endpoint, raw=body,
-                       headers={"content-type": "application/x-www-form-urlencoded"})
-    if st != 200:
-        # 二期把 refresh TTL 收到 1 天（M1 的边界决定），所以"几天没用就要重登"
-        # 是**预期行为**，不是故障。文案必须说清，否则会被当成缺陷去查。
-        err = ""
-        try:
-            err = json.loads(text).get("error", "")
-        except ValueError:
-            err = text[:80]
-        sys.exit(f"refresh 失败（HTTP {st} {err}）——二期把 refresh 有效期收紧到 "
-                 "1 天，超过就必须重新登录。请在浏览器里跑一次：\n"
-                 f"  node {ROOT}/site-builder/clients/quick-desktop-proxy/auth.js "
-                 f'"<endpoint_url>" "<mcp_client_id>"')
-    fresh = json.loads(text)
-    data["access_token"] = fresh["access_token"]
-    data["expires_at"] = int(time.time()) + int(fresh.get("expires_in", 900))
-    if fresh.get("refresh_token"):
-        data["refresh_token"] = fresh["refresh_token"]
-    TOKEN_PATH.write_text(json.dumps(data, indent=2))
-    print("  （access token 已用 refresh_token 自动续期并写回）")
-    return data["access_token"]
 
 
 def _site_ids(payload) -> set | None:
@@ -174,7 +98,7 @@ def main() -> int:
     def cfg(sec, key):
         return c[sec][key].split("#")[0].split(";")[0].strip()
 
-    endpoint = cfg("MCP", "endpoint_url")
+    endpoint = mcp_endpoint()           # 与另两个闸门取同一处配置
     client_id = cfg("Cognito", "mcp_client_id")
 
     token = _load_token(client_id)

@@ -62,9 +62,7 @@ import os
 import secrets
 import sys
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import zipfile
 from datetime import datetime, timedelta, timezone
 from http.client import HTTPSConnection
@@ -81,6 +79,12 @@ FIXTURE = HERE.parent / "fixtures" / "static-hello"
 sys.path.insert(0, str(HERE.parent / "auth"))
 sys.path.insert(0, str(HERE.parent / "deployer" / "functions"))
 sys.path.insert(0, str(HERE.parent / "key-proxy"))
+sys.path.insert(0, str(HERE))       # 直接跑时 sys.path[0] 已是这里；被 import 时不是
+
+# MCP 客户端（`http` / `sse_json` / `Mcp`）搬去了 `_mcp_client.py`：三个闸门
+# 共用同一份协议实现，见那个文件的 docstring。这里**只是 import 位置变了**，
+# 行为一字未改。
+from _mcp_client import Mcp, http       # noqa: E402  (要先设好 sys.path)
 
 CHECKS = 0
 FAILURES = 0
@@ -124,27 +128,6 @@ def cfg(c, section: str, key: str, default: str | None = None) -> str:
         sys.exit(f"config.ini 缺 [{section}] {key}")
 
 
-def http(method: str, url: str, *, headers=None, body=None, raw: bytes | None = None,
-         timeout: int = 60) -> tuple[int, dict, str]:
-    """→ (status, headers, text)。**不跟随重定向**（302 本身可能是断言对象）。"""
-    data = raw if raw is not None else (
-        json.dumps(body).encode() if body is not None else None)
-    h = dict(headers or {})
-    if body is not None:
-        h.setdefault("content-type", "application/json")
-    req = urllib.request.Request(url, data=data, method=method, headers=h)
-
-    class NoRedirect(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, *a, **kw):
-            return None
-
-    try:
-        with urllib.request.build_opener(NoRedirect).open(req, timeout=timeout) as r:
-            return r.status, dict(r.headers), r.read().decode(errors="replace")
-    except urllib.error.HTTPError as e:
-        return e.code, dict(e.headers), e.read().decode(errors="replace")
-
-
 def presigned_put(url: str, blob: bytes) -> int:
     """预签名 PUT。**只带 Content-Length，绝不带 Content-Type**（见模块 docstring）。
 
@@ -162,125 +145,6 @@ def presigned_put(url: str, blob: bytes) -> int:
         return conn.getresponse().status
     finally:
         conn.close()
-
-
-def sse_json(text: str) -> dict:
-    """streamable-http 的响应体是 SSE（`event: message` + `data: {...}`）。
-
-    只取 `data:` 行拼起来解析。**不按行重组语义**——我们只是要那一个 JSON-RPC
-    响应，而 FastMCP 每个响应就是一个 data 块。
-    """
-    payload = "".join(ln[len("data:"):].strip()
-                      for ln in text.splitlines() if ln.startswith("data:"))
-    if not payload:
-        # 非 SSE（例如我们自己的 401/502 JSON）时按普通 JSON 解
-        payload = text
-    try:
-        return json.loads(payload)
-    except ValueError:
-        return {}
-
-
-class Mcp:
-    """一个 MCP streamable-http 会话。**认证方式由 `headers` 决定**：
-
-    · 场景 ①-⑥ 走 `X-API-Key` 打到 `mcp.{base_domain}`（即真实客户端的形态）；
-    · N2 走 `Authorization: Bearer {机器 token}` 直连 AgentCore（绕过 key-proxy）。
-
-    两者的协议部分完全一样，所以共用这个类——分成两份实现就会出现"负测走的其实
-    不是同一个协议路径"。
-    """
-
-    def __init__(self, url: str, auth: dict):
-        self.url = url
-        self.auth = dict(auth)
-        self.session_id = ""
-        self._id = 0
-
-    def _post(self, payload: dict) -> tuple[int, dict, str]:
-        h = dict(self.auth)
-        h["accept"] = "application/json, text/event-stream"
-        if self.session_id:
-            h["mcp-session-id"] = self.session_id
-        return http("POST", self.url, headers=h, body=payload, timeout=120)
-
-    def initialize(self) -> tuple[int, dict]:
-        self._id += 1
-        st, hd, text = self._post({
-            "jsonrpc": "2.0", "id": self._id, "method": "initialize",
-            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-                       "clientInfo": {"name": "verify-api-key-e2e",
-                                      "version": "1"}}})
-        for k, v in hd.items():
-            if k.lower() == "mcp-session-id":
-                self.session_id = v
-        if st == 200:
-            # 协议要求：initialize 之后发一条 initialized 通知，否则后续请求
-            # 会被服务端按"未完成握手"拒掉。
-            self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        return st, sse_json(text)
-
-    def rpc(self, method: str, params: dict | None = None) -> tuple[int, dict]:
-        self._id += 1
-        st, _, text = self._post({"jsonrpc": "2.0", "id": self._id,
-                                  "method": method, "params": params or {}})
-        return st, sse_json(text)
-
-    def raw_body(self, payload: dict) -> tuple[int, str]:
-        """不解析、原样返回响应体——⑥ 的逐字节比对要的就是原始 bytes 语义。"""
-        st, _, text = self._post(payload)
-        return st, text
-
-    def call_tool(self, name: str, args: dict | None = None, *,
-                  expect: str = "dict"):
-        """→ (ok, payload_or_error_text)。`expect` 是 `"dict"` 或 `"list"`。
-
-        工具抛异常时 `result.isError` 为真、文案在 content 里；成功时结果可能在
-        `result.structuredContent`，**也可能只有 content 文本块**。
-
-        **为什么必须由调用方声明 `expect`，不能自动猜**（2026-08-13 实测）：
-        线上这台 MCP server **根本不发 `structuredContent`**，而返回列表的工具
-        （`list_my_sites`）会被序列化成**每个元素一个 text 块**——实测 12 个站点
-        = 12 个块。于是"取 content[0] 解析"这种写法会**静默只返回第一个元素**，
-        断言看起来在比对却少了 11 条数据。反过来，"有多个块就当列表"也不行：
-        只有一个站点时列表会退化成 1 个块，与"返回单个 dict 的工具"在形态上
-        完全一样。两种猜法各有一半的情况是错的，而错的那一半**不报错、只是
-        数据少了**——所以这里改成调用方声明期望形态，不猜。
-        """
-        st, resp = self.rpc("tools/call", {"name": name,
-                                           "arguments": args or {}})
-        if st != 200:
-            return False, f"HTTP {st}"
-        result = resp.get("result") or {}
-        texts = [c.get("text", "") for c in result.get("content", [])
-                 if isinstance(c, dict)]
-        if result.get("isError"):
-            return False, " ".join(texts) or json.dumps(resp)[:200]
-        if expect not in ("dict", "list"):
-            raise ValueError(f"expect 只能是 dict / list，收到 {expect!r}")
-        if "structuredContent" in result:
-            # 别的 FastMCP 版本会发它。**非 dict** 返回值被裹成 `{"result": ...}`；
-            # 判据是"只有这一个键"，不是"有这个键"——工具自己返回的 dict 里恰好有
-            # `result` 字段时，后者会把整个载荷替换成那个字段的值，而症状是
-            # "少了几个字段"，排查方向会指向服务端。
-            inner = result["structuredContent"]
-            if isinstance(inner, dict) and set(inner) == {"result"}:
-                inner = inner["result"]
-            return True, inner
-        parsed = []
-        for t in texts:
-            try:
-                parsed.append(json.loads(t))
-            except ValueError:
-                return False, f"content 块不是合法 JSON: {t[:120]}"
-        if expect == "list":
-            # 空列表 → `content: []` → 这里如实返回 []（实测过：返回空列表的工具
-            # 既没有 content 块也没有 structuredContent）
-            return True, parsed
-        if len(parsed) != 1:
-            return False, (f"expect=dict 但拿到 {len(parsed)} 个 content 块"
-                           "——这个工具返回的是列表？调用方的 expect 写错了")
-        return True, parsed[0]
 
 
 def main() -> int:
