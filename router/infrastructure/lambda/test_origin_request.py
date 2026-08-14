@@ -54,9 +54,14 @@ def test_static_path_routes_to_s3_with_versioned_prefix(mock_sig, mock_lookup):
     assert req["uri"] == "/sites/demo1/job-aaa/assets/app.js"
 
 
+# 本用例走完整 handler 且 `/` 与 `/detail` 都是页面级请求，于是会触发 M5 埋点。
+# 这是一条**路由**用例，不关心埋点，所以显式 patch 掉 `_record_access` 表明
+# "我不写"。不 patch 的话会真的向生产表发 PutItem——conftest.py 的护栏会把它
+# 变成 teardown 断言失败（加护栏之前它是静默出网的，实测两次真实调用）。
 @patch.object(orq, "_lookup_route", return_value=dict(ROUTE))
 @patch.object(orq, "_add_s3_sigv4_auth")
-def test_extensionless_uri_maps_to_index(mock_sig, mock_lookup):
+@patch.object(orq, "_record_access")
+def test_extensionless_uri_maps_to_index(mock_record, mock_sig, mock_lookup):
     req = orq.lambda_handler(_event(uri="/"), None)
     assert req["uri"] == "/sites/demo1/job-aaa/index.html"
     req2 = orq.lambda_handler(_event(uri="/detail"), None)
