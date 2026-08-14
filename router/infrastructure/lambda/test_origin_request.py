@@ -11,7 +11,10 @@ _SRC = (Path(__file__).parent / "origin_request.py").read_text()
 _SRC = (_SRC.replace("{{DYNAMODB_TABLE_NAME}}", "test-table")
             .replace("{{DYNAMODB_REGION}}", "us-east-1")
             .replace("{{FRONTEND_BUCKET_DOMAIN}}", "site-frontend-123.s3.us-east-1.amazonaws.com")
-            .replace("{{JWT_SECRET}}", "test-secret"))
+            .replace("{{JWT_SECRET}}", "test-secret")
+            .replace("{{ACCESS_TABLE}}", "site-access-events")
+            .replace("{{ACCESS_REPLICA_REGIONS}}",
+                     "us-east-1,ap-southeast-1,ap-northeast-1"))
 _mod_path = Path(__file__).parent / "_origin_request_testable.py"
 _mod_path.write_text(_SRC)
 import _origin_request_testable as orq

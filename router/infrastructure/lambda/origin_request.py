@@ -7,8 +7,12 @@ Lambda Function URL（SigV4）或共享前端S3桶（SigV4 GET）。
 """
 import json
 import logging
+import os
+import secrets
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 from botocore.auth import S3SigV4Auth, SigV4Auth
 from botocore.awsrequest import AWSRequest
@@ -35,6 +39,144 @@ DEFAULT_KEEPALIVE_TIMEOUT = 5
 # 初始化DynamoDB客户端
 dynamodb = boto3.client("dynamodb", region_name=DYNAMODB_REGION)
 
+# ── 访问埋点（M5）──────────────────────────────────────────────────
+# 只记**页面级**请求，且只记 app- 前缀的用户站点。写本区副本（Global Table）。
+ACCESS_TABLE = "{{ACCESS_TABLE}}"
+ACCESS_REPLICA_REGIONS = tuple(
+    x.strip() for x in "{{ACCESS_REPLICA_REGIONS}}".split(",") if x.strip())
+ACCESS_TTL_DAYS = 90
+_ACCESS_CLIENTS: dict = {}
+
+# 超时预算经过两次修正，**别收紧**（spec §2.3 规矩 4）：
+#   · 初版 0.3/0.5 被实测否掉——跨区冷连接首次 PutItem 要 719ms，于是每个冷
+#     容器的首次埋点必然超时并被下面的 except 吞掉 = 静默丢行；
+#   · 正常路径是同区副本（实测冷 58ms / 暖 6ms），离这个预算差两个数量级；
+#   · 预算的**下限由回落路径**（跨区 719ms）决定，不是由同区 58ms 决定。
+#     收紧到"够本区用"就等于让回落路径静默丢行。
+# 不给重试：埋点重试的价值低于它带来的延迟方差。
+_ACCESS_CFG = Config(connect_timeout=1.0, read_timeout=2.0,
+                     retries={"max_attempts": 0})
+
+
+def _access_region(context) -> str:
+    """写哪个副本。
+
+    **解析不出、或解析出一个没有副本的区，都回落主区**——回落 = 跨区写 =
+    正确但慢，**永不丢数据**。这条是"加副本"这个优化不会变成故障的唯一保证。
+    `AWS_REGION` 在 Lambda@Edge 里是否可用由部署时的日志实测确定（spec §0.4
+    第 1 步）；拿不到就退到 ARN 解析，两者都拿不到就回落。
+    """
+    region = os.environ.get("AWS_REGION") or ""
+    if region not in ACCESS_REPLICA_REGIONS:
+        arn = getattr(context, "invoked_function_arn", "") or ""
+        parts = arn.split(":")
+        region = parts[3] if len(parts) > 3 else ""
+    if region not in ACCESS_REPLICA_REGIONS:
+        return DYNAMODB_REGION
+    return region
+
+
+def _access_client(region: str):
+    """按区缓存的 client。**不复用模块级 `dynamodb`**——那个钉在主区，
+    而这里要写本区副本，两者不是同一个连接池（spec §2.3 规矩 4 第二版被推翻的
+    正是"复用就能蹭到暖连接"这个推论）。"""
+    if region not in _ACCESS_CLIENTS:
+        _ACCESS_CLIENTS[region] = boto3.client("dynamodb", region_name=region,
+                                               config=_ACCESS_CFG)
+    return _ACCESS_CLIENTS[region]
+
+
+def _route_kind(route: dict, uri: str, method: str) -> str:
+    """这个请求会被怎么处理：`"lambda" | "page" | "asset" | "reject"`。
+
+    **唯一定义**——`_route_request` 与埋点判定都调它，谁也不许再写第二份。
+    这条设计是被两次同类缺陷逼出来的（Codex 审查 2026-08-14 两轮，都实测）：
+      · 第一版只抄了"有没有扩展名"，漏掉 `/api/` 前置分支 → split 站点的
+        `/api/data` 被记成页面，一次 SPA 打开 + 5 个接口 = **PV 放大 6 倍**；
+      · 第二版补了 `/api/`，仍漏掉**方法检查** → `POST /notes` 真实是 404
+        （分发是 ALLOW_ALL，非 GET/HEAD 的静态请求被 `_not_found` 拒），
+        却被记成一条 `allow` PV。实测 4 条不一致（POST/PUT/OPTIONS/DELETE
+        × 无扩展名路径）。
+    两次都是"镜像一份判定"这个做法本身的问题——所以改成**一处判定、两处引用**。
+    往这里加分支时，`_route_request` 自动跟着变，不存在漂移。
+    """
+    if route.get("route_mode") == "api-only":
+        return "lambda"
+    if uri.startswith("/api/"):
+        return "lambda"
+    if method not in ("GET", "HEAD"):
+        return "reject"        # 静态桶只接受读方法，其余 404
+    return "asset" if "." in uri.rsplit("/", 1)[-1] else "page"
+
+
+def _is_page_request(route: dict, uri: str, method: str) -> bool:
+    """要不要记这一条。**从 `_route_kind` 派生，不自己判。**
+
+    api-only 站点没有"页面 vs 资源"之分，全记；其余只记会被改写成
+    `/index.html` 的那些。`reject`（方法不允许 → 404）与 `asset` 都不记。
+    """
+    kind = _route_kind(route, uri, method)
+    if route.get("route_mode") == "api-only":
+        return kind == "lambda"
+    return kind == "page"
+
+
+def _record_access(context, site_id: str, uri: str, decision: str,
+                   email: str) -> None:
+    """写一行访问明细。**任何异常都吞掉**——统计不是安全控制，这里 fail-open
+    是对的（与本文件其它 fail-closed 判定的区别是有意的，别"统一"掉）。
+    兜底覆盖 client 取用本身，不只包住 put_item。
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        _access_client(_access_region(context)).put_item(
+            TableName=ACCESS_TABLE,
+            Item={"site_date": {"S": f"{site_id}#{now.strftime('%Y-%m-%d')}"},
+                  # ts 在最前面：读取方式是按分区 Query 再按 SK 排时间线。
+                  # 随机后缀不可省——同一微秒两条请求会撞同一主键，第二条
+                  # 静默覆盖第一条（ops_log.record 的 docstring 记过实测）。
+                  "ts_id": {"S": f"{now.isoformat()}#{secrets.token_hex(3)}"},
+                  "site_id": {"S": site_id},
+                  # 空串合法（DynamoDB 只禁**键**属性为空）：302 未登录时确实
+                  # 没有身份可言，写 "-" 之类的哨兵会污染 distinct email 的计数。
+                  "email": {"S": email},
+                  "path": {"S": uri[:512]},
+                  "decision": {"S": decision},
+                  "expires_at": {"N": str(int(now.timestamp())
+                                          + ACCESS_TTL_DAYS * 86400)}})
+    except Exception as e:      # noqa: BLE001
+        print(f"[WARN] 访问埋点失败 site={site_id} decision={decision}: "
+              f"{type(e).__name__}: {e}")
+
+
+def _maybe_record(context, subdomain: str, uri: str, method: str, route: dict,
+                  denied, sink: dict) -> None:
+    """记不记、记什么。
+
+    **判定用分区键前缀**（`app-`），不用 `owner`/`_is_platform_route()`：
+      · `owner` 是权限投影字段，能写权限的角色可控（见 PLATFORM_SUBDOMAINS 上方
+        那段长注释否掉的同一种推导）；
+      · `mcp` 子域**故意**不在 PLATFORM_SUBDOMAINS 里，用它会把 key-proxy 的
+        每次调用记成一个"站点"，还给每次调用加一次跨区写。
+    `subdomain` 是路由表分区键、由真实 Host 解析，不可伪造。
+    """
+    try:
+        if not subdomain.startswith("app-"):
+            return
+        if not _is_page_request(route, uri, method):
+            return
+        if denied is None:
+            decision = "allow"
+        elif str(denied.get("status")) == "403":
+            decision = "denied_403"
+        else:
+            decision = "redirect_login"
+        _record_access(context, subdomain[4:], uri, decision,
+                       sink.get("email", ""))
+    except Exception as e:      # noqa: BLE001
+        print(f"[WARN] 埋点判定失败 sub={subdomain}: {type(e).__name__}: {e}")
+
+
 # 初始化 boto3 session 用于签名
 session = boto3.Session()
 credentials = session.get_credentials()
@@ -59,10 +201,16 @@ def lambda_handler(event, context):
         # 平台身份取自**请求 host 解析出的 subdomain**，不是路由 item 里的字段。
         # 这一步之后 _route_request 只看这个键，见 _is_platform_route。
         route = {**route, _PLATFORM_KEY: subdomain in PLATFORM_SUBDOMAINS}
-        denied = _check_auth(request, route, original_host)
-        if denied:
-            return denied
-        return _route_request(request, route)
+        # **在 _route_request 之前抓 uri**：那个函数会把静态请求的 uri 改写成
+        # 桶内 key（f"/{static_prefix}{path}"），埋点要记的是用户看到的路径。
+        original_uri = request.get("uri", "/")
+        original_method = request.get("method", "GET")
+        sink: dict = {}
+        denied = _check_auth(request, route, original_host, sink)
+        result = denied if denied else _route_request(request, route)
+        _maybe_record(context, subdomain, original_uri, original_method,
+                      route, denied, sink)
+        return result
     except Exception as e:
         logger.error(f"处理请求时出错: {e}", exc_info=True)
         return _server_error()
@@ -413,8 +561,15 @@ def _forbidden() -> dict:
             "body": "<html><body><h1>403</h1><p>你不在此站点的访问名单内。</p></body></html>"}
 
 
-def _check_auth(request, route, host):
-    """返回 None=放行（用户头已注入）；返回 dict=302/403 响应。"""
+def _check_auth(request, route, host, sink=None):
+    """返回 None=放行（用户头已注入）；返回 dict=302/403 响应。
+
+    `sink` 是**可选的 out-param**：验签成功后把邮箱放进去，供埋点使用
+    （403 分支也要有——"谁被拒了"是被拒记录的全部价值）。
+    **用 out-param 而不是改成返回二元组**：M4-FINDINGS §3.3——因审查从单值改
+    多值的函数，调用方最容易按旧签名继续用。也**不往 request 上挂键**：
+    CloudFront 会校验 request 对象的形状。
+    """
     # 无条件剥除客户端可伪造的用户头与平台 origin 标记
     request["headers"].pop("x-user-email", None)
     request["headers"].pop("x-user-name", None)
@@ -452,6 +607,15 @@ def _check_auth(request, route, host):
                 or claims.get("auth_via") not in TRUSTED_AUTH_SOURCES):
             return _redirect_login(host, request.get("uri", "/"),
                                    request.get("querystring", ""))
+
+    # 契约（spec §1.1）：403 有邮箱、302 无邮箱。
+    # **位置不能提前到验签成功处**（Codex 审查 2026-08-14 P2-1，已实测）：
+    # 验签成功与 IdP 来源可信是两道检查，中间那段返回 302。提前赋值会让一个
+    # 签名有效但 idp/auth_via 不可信的会话（linked 本地用户、旧会话）产出
+    # `decision=redirect_login` 且 email 非空——实测 status=302、
+    # sink={'email': ...}，违反契约且扩大 PII 落盘。
+    if sink is not None:
+        sink["email"] = claims["email"]
 
     # 缺失时**不能默认 "org"**（= 全组织可见）：缺字段说明写入方没有表达意图，
     # 把"未声明"当成"最宽"是 fail-open。默认取最窄——空名单，于是只有
@@ -493,17 +657,16 @@ def _route_request(request, route):
     else:
         _strip_reserved_cookies(request)
 
-    if route.get("route_mode") == "api-only":
+    kind = _route_kind(route, uri, request.get("method", "GET"))
+    if kind == "lambda":
         return _route_to_lambda(request, route, uri, qs)
-
-    if uri.startswith("/api/"):
-        return _route_to_lambda(request, route, uri, qs)
-
-    # 静态资源 → 共享前端桶（私有，SigV4 GET）
-    if request.get("method") not in ("GET", "HEAD"):
+    if kind == "reject":
+        # 静态桶只接受读方法。**这条判定原来写在本函数里**，M5 把它连同
+        # api-only / /api/ / 扩展名一起收进 _route_kind——因为埋点也要用同一份
+        # 判定，而"镜像一份"已经错过两次（见 _route_kind 的 docstring）。
         return _not_found("方法不允许")
-    path = uri if ("." in uri.rsplit("/", 1)[-1]) else "/index.html"
-    request["uri"] = f"/{route['static_prefix']}{path}" if path != uri else f"/{route['static_prefix']}{uri}"
+    path = "/index.html" if kind == "page" else uri
+    request["uri"] = f"/{route['static_prefix']}{path}"
     _add_s3_sigv4_auth(request, FRONTEND_BUCKET_DOMAIN, request["uri"])
     request["origin"] = _custom_origin(FRONTEND_BUCKET_DOMAIN)
     request["headers"]["host"] = [{"key": "Host", "value": FRONTEND_BUCKET_DOMAIN}]
