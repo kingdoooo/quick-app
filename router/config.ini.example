@@ -107,6 +107,12 @@ require_idp_claim = false
 # Cognito 里 IdP 的 provider name，逗号分隔（如 Feishu 或 Okta,Feishu）。
 # 必须与 site-builder/config.ini [IdP] provider_name 一致。
 trusted_idps =
+# M5 访问统计：明细表名与它的 Global Table 副本区清单（**含主区**）。
+# 这份清单是唯一真源，三处必须一致：deployer 栈的 TableV2 replicas、
+# 本栈给 edge_role 的 PutItem 资源集合、Edge 代码里的 ACCESS_REPLICA_REGIONS。
+# 漏一个区 = 那个区的埋点 AccessDenied 后被吞掉 = 该区静默零数据。
+access_table = site-access-events
+access_replica_regions = us-east-1,ap-southeast-1,ap-northeast-1
 
 # ============================================================================
 # Resource Tags (OPTIONAL - Recommended for cost tracking)

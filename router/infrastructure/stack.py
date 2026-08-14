@@ -149,7 +149,36 @@ class WebRouterStack(Stack):
             resources=[f"arn:aws:s3:::{frontend_bucket}/sites/*",
                        f"arn:aws:s3:::{frontend_bucket}/platform/*"]
         ))
-        
+
+        # M5 埋点：只给明细表的 PutItem，且**每个副本区一条资源**。
+        # 副本清单是 config.ini 里的唯一真源（deployer 栈的 TableV2 replicas 与
+        # Edge 代码的 ACCESS_REPLICA_REGIONS 用同一份），由
+        # test_stack_edge_iam.py 从它推导断言。
+        # 只给 PutItem：Edge 是公网请求路径上的组件，只该能"追加一行"，
+        # 不该能改写或删除访问历史。
+        # **账号取自 config，不用 `self.account`**（Codex 审查 2026-08-14 P2-4）：
+        # 实测 `self.account` 在无显式 env 的栈里渲染成
+        # {"Fn::Join": ["", ["arn:...:", {"Ref": "AWS::AccountId"}, ":table/..."]]}
+        # ——一个 **dict**，模板断言没法按字符串比。用 config 的字面量则渲染成
+        # 普通字符串，断言可以逐字比。这也更符合 CLAUDE.md 的「config.ini 是
+        # 账号/域名的唯一取值来源」。
+        access_account = config.get("AWS", "account_id", "APP_ACCOUNT_ID").strip()
+        access_table = config.get("SiteBuilder", "access_table",
+                                  "APP_ACCESS_TABLE").strip()
+        access_regions = [r.strip() for r in
+                          config.get("SiteBuilder", "access_replica_regions",
+                                     "APP_ACCESS_REPLICA_REGIONS").split(",")
+                          if r.strip()]
+        if len(access_regions) < 2:
+            raise ValueError(
+                f"access_replica_regions 至少要有主区+1 个副本（当前 {access_regions}）"
+                "——只有一个区时应该直接去掉副本设计，而不是配一个残缺清单")
+        edge_role.add_to_policy(iam.PolicyStatement(
+            effect=iam.Effect.ALLOW,
+            actions=["dynamodb:PutItem"],
+            resources=[f"arn:aws:dynamodb:{rg}:{access_account}:table/{access_table}"
+                       for rg in access_regions]))
+
         # Read Lambda code and inject configuration
         lambda_code_path = Path(__file__).parent / "lambda" / "origin_request.py"
         with open(lambda_code_path, 'r') as f:
@@ -206,7 +235,9 @@ class WebRouterStack(Stack):
             .replace("{{JWT_SECRET}}", jwt_secret)
             .replace("{{BASE_DOMAIN}}", base_domain)
             .replace("{{REQUIRE_IDP_CLAIM}}", require_idp_claim)
-            .replace("{{TRUSTED_IDPS}}", trusted_idps))
+            .replace("{{TRUSTED_IDPS}}", trusted_idps)
+            .replace("{{ACCESS_TABLE}}", access_table)
+            .replace("{{ACCESS_REPLICA_REGIONS}}", ",".join(access_regions)))
         
         # Write to temporary file
         temp_dir = tempfile.mkdtemp()
