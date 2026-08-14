@@ -22,12 +22,13 @@ ACCOUNT = CFG["Platform"]["account_id"]
 REGION = CFG["Platform"]["region"]
 
 
-def _rollup_const(name: str) -> str:
-    """从 `functions/access_rollup.py` 里读一个模块级字符串常量，**不 import**
+def _rollup_const(name: str, kind: type = str):
+    """从 `functions/access_rollup.py` 里读一个模块级常量，**不 import**
     （import 需要 boto3，而 `infra/.venv` 只有 CDK 依赖）。
 
     IAM 里的日志组前缀与指标 namespace 必须与运行时用的是**同一个字面量**：
-    手抄第二份就是下一次「两侧单测都绿、线上 AccessDenied」。
+    手抄第二份就是下一次「两侧单测都绿、线上 AccessDenied」。同理内存/超时要与
+    运行时的线程数、扫描预算对得上（`kind=int` 的那几个）。
     """
     src = (Path(__file__).parents[1] / "functions" / "access_rollup.py").read_text(
         encoding="utf-8")
@@ -35,14 +36,39 @@ def _rollup_const(name: str) -> str:
         if (isinstance(node, ast.Assign) and len(node.targets) == 1
                 and getattr(node.targets[0], "id", None) == name
                 and isinstance(node.value, ast.Constant)
-                and isinstance(node.value.value, str)):
+                and isinstance(node.value.value, kind)):
             return node.value.value
-    raise RuntimeError(f"access_rollup.py 里找不到字符串常量 {name}")
+    raise RuntimeError(f"access_rollup.py 里找不到 {kind.__name__} 常量 {name}")
 
 
 EDGE_LOG_GROUP_PREFIX = _rollup_const("EDGE_LOG_GROUP_PREFIX")
 ROLLUP_METRIC_NAMESPACE = _rollup_const("METRIC_NAMESPACE")
 ROLLUP_METRIC_NAME = _rollup_const("METRIC_NAME")
+
+# ── rollup 的内存与时限 ────────────────────────────────────────────────
+# **内存下界由扫描线程数决定，不由区数决定**：跨区扫描每个线程持一个 boto3
+# Session（各自一份 botocore endpoints/服务模型），见 `access_rollup._logs_client`。
+# 2026-08-15 的线上回归就是这条没成立时的样子——那时是"每区一个 Session"，18 个
+# 已启用区把 256MB 顶穿（六次 REPORT 全部 used≈256/256MB，约一半调用
+# `Runtime.OutOfMemory`）。所以这里的两个常量都从**实测**来，且与运行时的
+# `SCAN_WORKERS` 绑在一条式子上：调大线程数不同时调大内存 ⇒ CDK 断言红
+# （`test_rollup_memory_is_sized_for_its_scan_threads`）。
+ROLLUP_SCAN_WORKERS = _rollup_const("SCAN_WORKERS", int)
+ROLLUP_SCAN_BUDGET_SECONDS = _rollup_const("SCAN_BUDGET_SECONDS", int)
+ROLLUP_TIMEOUT_SECONDS = 300
+# 下面三个数**全部来自真机 REPORT 的 Max Memory Used**（2026-08-15，先按 1024MB
+# 探测再定尺寸，不猜）：
+#   · 冷容器第一次调用峰值 202MB；
+#   · 同一个热容器连打 21 次，峰值单调涨到 434MB 后**收平**（最后四次都是 434）
+#     ——`Max Memory Used` 是容器生命周期的高水位，每轮新建 8 个线程/Session、
+#     反复分配再释放，让高水位收敛在这里；不是泄漏（泄漏会按每轮 +100MB 线性涨）。
+#     线上每天只跑一次（容器必然是冷的），但闸门脚本与手工重跑会连打，所以
+#     **按 434MB 定尺寸**。
+# 拆成"基线 + 每线程"是为了让式子随 `SCAN_WORKERS` 走：
+ROLLUP_MEM_BASE_MB = 110        # 202 − 8 个 Session（各实测 ≈12MB）≈ 103，取整 110
+ROLLUP_MEM_PER_WORKER_MB = 40   # (434 热态收平 − 110) / 8 ≈ 40.5
+ROLLUP_MEM_HEADROOM = 2         # 建模峰值之上的余量倍数
+ROLLUP_MEMORY_MB = 1024         # = 实测热态峰值 434MB 的 2.36 倍
 
 # 告警通知的 SNS topic。**建者不是本栈**——它由 `auth/deploy_auth.py`
 # （`alarm_pipeline.py`）幂等收敛，连带那个必须由收件人手工确认的邮件订阅。
@@ -527,7 +553,9 @@ class SiteDeployerStack(Stack):
             runtime=lam_.Runtime.PYTHON_3_13,
             handler="access_rollup.handler",
             code=lam_.Code.from_asset(fn_dir),
-            role=rollup_role, timeout=Duration.seconds(300), memory_size=256,
+            role=rollup_role,
+            timeout=Duration.seconds(ROLLUP_TIMEOUT_SECONDS),
+            memory_size=ROLLUP_MEMORY_MB,
             environment={"ACCESS_EVENTS_TABLE": access_events.table_name,
                          "ACCESS_DAILY_TABLE": access_daily.table_name,
                          "SITES_TABLE": sites.table_name})

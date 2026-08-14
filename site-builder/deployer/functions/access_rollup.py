@@ -32,6 +32,7 @@ LOOKBACK_DAYS 天，最老的那几天不会自己回来，得显式补一次：
 """
 import logging
 import os
+import threading
 import time
 from concurrent import futures
 from datetime import datetime, timedelta, timezone
@@ -230,8 +231,20 @@ EDGE_FAILURE_PATTERN = " ".join(f'?"{t}"' for t in EDGE_FAILURE_TERMS)
 METRIC_NAMESPACE = "SiteBuilder/M5"
 METRIC_NAME = "EdgeAnalyticsFailedGlobal"
 SCAN_HOURS = 24        # 与每日一轮的节奏对齐
-SCAN_WORKERS = 8       # 18 个已启用区串行扫会顶到 Lambda 的 300s
+SCAN_WORKERS = 8       # 18 个已启用区串行扫会顶到 Lambda 的 300s。**同时也是内存
+                       # 上界的那个乘数**（每线程一个 Session，见 _logs_client）
+                       # ——调大它必须同时调大函数内存，由 CDK 断言
+                       # `test_rollup_memory_is_sized_for_its_scan_threads` 钉住。
 MAX_EVENT_PAGES = 40   # 见 _count_matches
+
+# 扫描自己的时限。**扫描绝不许把封口那次调用拖挂**：区数（AWS 开新区）与日志组数
+# （别人往本账号部署 Edge 函数，前缀发现会一起扫到）都不是我们的输入，一路吃到
+# Lambda 的 300s 超时就是「观测把耐久工作标记成失败」——EventBridge 重试 + DLQ +
+# 把 `m5-rollup-no-successful-invocation-24h` 一起拖响。真正的上界取两者小值：
+# 这个固定预算（CDK 断言钉住它落在 Timeout 的一半以内）与**本次调用剩余时间**减
+# 收尾余量（见 `_scan_budget`）。超预算 ⇒ 抛，绝不返回部分和。
+SCAN_BUDGET_SECONDS = 120
+SCAN_TIME_MARGIN_SECONDS = 30   # 留给 put_metric_data + 收尾日志
 
 # 扫描是纯观测，**要重试**（与埋点写入刻意 max_attempts=0 相反）：偶发限流让
 # 整轮扫描失败 ⇒ 指标缺数据 ⇒ 告警响一次假的，而偶发变红的告警的代价是下一个人
@@ -240,12 +253,37 @@ _SCAN_CFG = Config(retries={"mode": "standard", "max_attempts": 4},
                    connect_timeout=5, read_timeout=30)
 
 
+class ScanIncomplete(RuntimeError):
+    """这一轮**没读完**。与「读到了 0」是两件事，所以必须是异常而不是返回值：
+    调用方（`handler`）据此不发任何数据点，让「指标缺数据」成为唯一的信号。"""
+
+
+# 每**线程**一个 Session，跨区复用。
+_thread_state = threading.local()
+
+
 def _logs_client(region: str):
-    """每次新建、不做模块级缓存：扫描是多线程的，而 boto3 的**默认 session**
-    不是线程安全的建 client 入口（同一个 session 并发建 client 会撞上共享的
-    loader 缓存）。每线程一个 Session 是官方给的做法。"""
-    return boto3.session.Session().client("logs", region_name=region,
-                                          config=_SCAN_CFG)
+    """建一个 logs client。
+
+    两条约束都要满足，而 2026-08-15 之前只满足了第一条：
+
+    · **不能用模块级共享的 session/client**：扫描是多线程的，而 boto3 的默认
+      session 不是线程安全的建 client 入口（同一个 session 并发建 client 会撞上
+      共享的 loader 缓存）。
+    · **也不能每次新建 Session**：每个 Session 各自加载一份 botocore 的
+      endpoints/服务模型（实测 ≈12MB/个），"每区一个"在 18 个已启用区上就是
+      200MB+ 活内存 —— 那正是线上一半调用挂 `Runtime.OutOfMemory` 的原因，
+      而**区数是 AWS 说了算的输入**，光调大内存等于把旋钮留在那儿。
+
+    每线程一个 Session 两头都占：建 client 的入口是线程私有的（`threading.local`，
+    从不被并发访问），而活着的 Session 数被 `SCAN_WORKERS` 钉住，不随区数增长。
+    同一线程内跨区复用的是 Session（那份服务模型），client 仍按区建——client 上带
+    着区，共用不了。
+    """
+    session = getattr(_thread_state, "session", None)
+    if session is None:
+        session = _thread_state.session = boto3.session.Session()
+    return session.client("logs", region_name=region, config=_SCAN_CFG)
 
 
 def _cloudwatch_client():
@@ -264,17 +302,44 @@ def enabled_regions() -> list[str]:
     return sorted(r["RegionName"] for r in resp["Regions"])
 
 
-def _count_matches(logs, group: str, start_ms: int, end_ms: int) -> int:
+def _scan_budget(context=None) -> float:
+    """这一轮允许扫多久（秒）。
+
+    两个上界取小：`SCAN_BUDGET_SECONDS`，以及**本次调用真正剩下的时间**减去收尾
+    余量。后者才是真源——封口在前，慢的那天剩下多少时间只有运行时知道；固定预算
+    是给"没有 context"的路径（本地/单测）与"部署期可断言"用的。
+    """
+    remaining = getattr(context, "get_remaining_time_in_millis", None)
+    if remaining is None:
+        return float(SCAN_BUDGET_SECONDS)
+    return min(float(SCAN_BUDGET_SECONDS),
+               remaining() / 1000.0 - SCAN_TIME_MARGIN_SECONDS)
+
+
+def _check_budget(deadline: float, where: str) -> None:
+    """预算用完就抛。**在每次翻页前查**：一个区里的组数 × 每组页数全在一次
+    `_scan_region` 里，只在入口查一次等于没有上界。
+
+    消息里不写具体秒数：本轮的有效预算可能是 `SCAN_BUDGET_SECONDS`，也可能是
+    被剩余时间压小后的值（`_scan_budget`），写死一个会误导排查的人。
+    """
+    if time.monotonic() > deadline:
+        raise ScanIncomplete(f"扫描用尽了本轮时间预算（停在 {where}）——本轮不报数")
+
+
+def _count_matches(logs, group: str, start_ms: int, end_ms: int,
+                   deadline: float) -> int:
     """一个日志组在窗口内的匹配条数。
 
     **空页也可能带 nextToken**——真机实测：同一次查询先返回两页 0 事件、第三页
     才有 17 条。所以终止条件只能是「没有 nextToken」，见到空页就停会漏数。
 
-    `MAX_EVENT_PAGES` 是防跑满 Lambda 时限的上限：真撞到它说明这一轮的失败条数
-    是十万量级，早已远超任何告警阈值，截断不影响结论。
+    `MAX_EVENT_PAGES` 是单组的页数上限：真撞到它说明这一轮的失败条数是十万量级，
+    早已远超任何告警阈值，截断不影响结论。它管不了"组很多"，那由 `deadline` 管。
     """
     total, token, pages = 0, None, 0
     while True:
+        _check_budget(deadline, f"{group} 第 {pages + 1} 页事件")
         kwargs = {"logGroupName": group, "startTime": start_ms,
                   "endTime": end_ms, "filterPattern": EDGE_FAILURE_PATTERN}
         if token:
@@ -286,7 +351,8 @@ def _count_matches(logs, group: str, start_ms: int, end_ms: int) -> int:
             return total
 
 
-def _scan_region(region: str, start_ms: int, end_ms: int) -> int:
+def _scan_region(region: str, start_ms: int, end_ms: int,
+                 deadline: float) -> int:
     """一个区里全部 Edge 日志组的匹配条数之和。
 
     **按前缀发现，不拼组名**：拼出来的名字在没有 Edge 日志的区会
@@ -298,6 +364,7 @@ def _scan_region(region: str, start_ms: int, end_ms: int) -> int:
     logs = _logs_client(region)
     groups, token = [], None
     while True:
+        _check_budget(deadline, f"{region} 的日志组清单")
         kwargs = {"logGroupNamePrefix": EDGE_LOG_GROUP_PREFIX}
         if token:
             kwargs["nextToken"] = token
@@ -306,25 +373,34 @@ def _scan_region(region: str, start_ms: int, end_ms: int) -> int:
         token = resp.get("nextToken")
         if not token:
             break
-    return sum(_count_matches(logs, g, start_ms, end_ms) for g in groups)
+    return sum(_count_matches(logs, g, start_ms, end_ms, deadline)
+               for g in groups)
 
 
-def scan_edge_analytics_failures(end: datetime | None = None) -> int:
+def scan_edge_analytics_failures(end: datetime | None = None,
+                                 budget_seconds: float | None = None) -> int:
     """全部已启用区、过去 SCAN_HOURS 小时的埋点失败条数。
 
     **任何一个区扫不动就整体抛出，绝不返回部分和**：部分和会被下游当成
     「就这么多」= 健康，而真相是「有一段没读到」。「读不到」必须与「没有」
-    可区分（Task 14 定下的同一条纪律，M5-FINDINGS §4.20）。
+    可区分（Task 14 定下的同一条纪律，M5-FINDINGS §4.20）。**预算耗尽走的是
+    同一条路**（`ScanIncomplete`）——它同样是「没读完」，不是一个数。
     """
     end = end or datetime.now(timezone.utc)
     start_ms = int((end - timedelta(hours=SCAN_HOURS)).timestamp() * 1000)
     end_ms = int(end.timestamp() * 1000)
+    budget = SCAN_BUDGET_SECONDS if budget_seconds is None else budget_seconds
+    if budget <= 0:
+        raise ScanIncomplete(
+            f"本次调用剩余时间不够扫描（预算 {budget:.1f}s）——本轮不报数")
+    deadline = time.monotonic() + budget
     regions = enabled_regions()
     if not regions:
-        raise RuntimeError("枚举不到任何已启用区——扫描结果不可信，不发指标")
+        raise ScanIncomplete("枚举不到任何已启用区——扫描结果不可信，不发指标")
     total = 0
     with futures.ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
-        jobs = [pool.submit(_scan_region, r, start_ms, end_ms) for r in regions]
+        jobs = [pool.submit(_scan_region, r, start_ms, end_ms, deadline)
+                for r in regions]
         for job in jobs:
             total += job.result()       # 任一区抛出即整体抛出
     return total
@@ -369,7 +445,7 @@ def handler(event, context) -> dict:
     end = datetime.now(timezone.utc) - timedelta(
         hours=float((event or {}).get("scan_end_offset_hours") or 0))
     try:
-        count = scan_edge_analytics_failures(end)
+        count = scan_edge_analytics_failures(end, _scan_budget(context))
     except Exception as e:      # noqa: BLE001
         logger.warning("Edge 埋点失败扫描未完成，本轮**不发指标**"
                        "（指标缺数据即告警条件）: %s: %s", type(e).__name__, e)

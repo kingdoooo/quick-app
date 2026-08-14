@@ -7,6 +7,7 @@ CDK 断言 + Task 13 的真机闸门各自盯（M4 踩过：事务里的 Conditi
 import ast
 import configparser
 import os
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -715,6 +716,201 @@ def test_backfill_stamps_the_datapoint_at_the_end_of_the_scanned_window(
     assert abs(end_ms / 1000 - before.timestamp()) < 60
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 扫描的资源上界（2026-08-15 线上回归：`Runtime.OutOfMemory`）
+#
+# 上线后约一半调用挂在 `Runtime.OutOfMemory`（256MB 的函数，六次 REPORT 全部
+# used=255~256/256MB）。根因不是扫描逻辑——是 `_logs_client` **每区新建一个
+# boto3 Session**：每个 Session 各自加载一份 botocore 的 endpoints/服务模型
+# （本机实测 ≈12.3MB/个），18 个已启用区 × 并发 8 就是 200MB+ 的活内存。
+#
+# 而**区数与日志组数都不是我们的输入**：AWS 会开新区，别的团队会往本账号部署
+# Edge 函数（前缀发现会一起扫到）。所以光调大内存不够——下面两条钉的是"上界由
+# 我们控制的量决定"：活着的 Session 数由**线程数**钉住，扫描时长由**预算**钉住。
+# 两条都必须保住原有的两条纪律：① 建 client 的入口线程私有（不许退回模块级
+# 共享 Session/client）；② 读不到就抛，绝不返回部分和（部分和 = 伪装成健康）。
+# ══════════════════════════════════════════════════════════════════════
+
+
+@pytest.fixture
+def sessions(monkeypatch):
+    """接住 **Session 工厂**而不接管 `_logs_client`——要测的正是后者的生命周期。
+
+    返回 `install(specs) -> (made, used, rec)`：
+      `made` —— `[(session id, 建它的线程 id), ...]`
+      `used` —— `[(session id, 用它建 client 的线程 id, region), ...]`
+    """
+    import access_rollup as ar
+    rec, made, used, box = {"described": [], "filtered": []}, [], [], {}
+
+    class _FakeSession:
+        def __init__(self):
+            made.append((id(self), threading.get_ident()))
+
+        def client(self, service, **kw):
+            region = kw.get("region_name")
+            used.append((id(self), threading.get_ident(), region))
+            assert service == "logs", f"扫描只该建 logs client：{service}"
+            return _FakeLogs(region, box["specs"][region], rec)
+
+    def install(specs: dict):
+        box["specs"] = specs
+        monkeypatch.setattr(ar, "enabled_regions", lambda: list(specs))
+        monkeypatch.setattr(ar.boto3.session, "Session", _FakeSession)
+        # 线程本地状态是模块级的，主线程那份会跨用例残留。`raising=False`：
+        # 这个属性还不存在时（= 修复前）不许把断言的红变成夹具的错。
+        monkeypatch.setattr(ar, "_thread_state", threading.local(), raising=False)
+        return made, used, rec
+
+    return install
+
+
+def test_live_sessions_are_bounded_by_worker_count_not_region_count(sessions):
+    """活着的 boto3 Session 数由 `SCAN_WORKERS` 钉住，**不随区数增长**。
+
+    这就是 2026-08-15 那次 OOM 的那颗旋钮：每区一个 Session ⇒ 内存随 AWS 开新区
+    线性上涨，而开区不是我们说了算的。每**线程**一个 Session 之后上界是
+    `SCAN_WORKERS`（≤8 份 botocore 数据），与区数无关。
+    """
+    import access_rollup as ar
+    specs = {f"r-{i}": _one_group(1) for i in range(18)}
+    assert len(specs) > ar.SCAN_WORKERS, "区数没超过线程数 ⇒ 本条空转"
+    made, _, _ = sessions(specs)
+    assert ar.scan_edge_analytics_failures() == 18       # 一区不落
+    assert made, "一个 Session 都没建 ⇒ 本条空转（工厂没被接住）"
+    assert len(made) <= ar.SCAN_WORKERS, (
+        f"建了 {len(made)} 个 Session 扫 {len(specs)} 个区——上界应当是线程数 "
+        f"{ar.SCAN_WORKERS}，否则内存随区数涨")
+
+
+def test_no_session_is_shared_across_threads(sessions):
+    """线程安全那一半不许丢：每个 Session 只许被**建它的那个线程**使用。
+
+    boto3 的默认 session 不是线程安全的建 client 入口（并发建 client 会撞上共享的
+    loader 缓存），所以"省内存"的正确方向是每线程一个，**不是**退回模块级共享。
+    这条在修复前后都该绿——它是防止修复方向跑偏的那道反向闸门。
+    """
+    import access_rollup as ar
+    made, used, _ = sessions({f"r-{i}": _one_group(1) for i in range(18)})
+    ar.scan_edge_analytics_failures()
+    owner = dict(made)
+    assert used, "没有任何 client 被建出来 ⇒ 本条空转"
+    assert len({tid for _, tid, _ in used}) > 1, "只跑了一个线程 ⇒ 本条空转"
+    for sid, tid, region in used:
+        assert sid in owner, f"{region} 用的 Session 不是本次扫描建的"
+        assert owner[sid] == tid, (
+            f"{region} 在线程 {tid} 里用了属于线程 {owner[sid]} 的 Session "
+            f"⇒ 建 client 的入口被并发共享")
+
+
+def test_the_scan_gives_up_on_its_own_budget_instead_of_eating_the_timeout(
+        scan, monkeypatch):
+    """预算耗尽 ⇒ **抛**，不返回已经数到的那部分。
+
+    日志组数同样不是我们的输入（别的团队往本账号部署 Edge 函数，前缀发现会一起
+    扫到），所以扫描要有自己的时限——不然它会一路吃到 Lambda 的 300s 超时，把
+    **封口那次调用**也标记成失败（EventBridge 重试 + DLQ + 拖响存活告警）。
+    """
+    import access_rollup as ar
+    install, _ = scan
+    install({"us-east-1": _one_group(3)})
+    monkeypatch.setattr(ar, "SCAN_BUDGET_SECONDS", 0)
+    with pytest.raises(ar.ScanIncomplete):
+        ar.scan_edge_analytics_failures()
+
+
+def test_the_budget_is_checked_between_pages_not_only_before_the_first_call(
+        scan, monkeypatch):
+    """预算要在**翻页之间**查。
+
+    一个区里的组数 × 每组的页数全在一次 `_scan_region` 里，只在入口查一次等于没有
+    上界。这里的假时钟在**第一页事件返回之后**才跳过预算：那之后必须停手（第二页
+    不再发出），而不是把这一组翻完。
+    """
+    import access_rollup as ar
+    install, rec = scan
+    name = "/aws/lambda/us-east-1.Edge"
+    install({"us-east-1": {"groups": [([name], None)],
+                           "events": {name: [1, 1]}}})
+    monkeypatch.setattr(ar.time, "monotonic",
+                        lambda: 1000.0 if rec["filtered"] else 0.0)
+    with pytest.raises(ar.ScanIncomplete):
+        ar.scan_edge_analytics_failures()
+    assert len(rec["described"]) == 1, rec["described"]
+    assert len(rec["filtered"]) == 1, (
+        f"预算超了之后还在翻页（发了 {len(rec['filtered'])} 次 filter）"
+        "⇒ 检查点不在循环里")
+
+
+def test_the_budget_shrinks_to_what_this_invocation_has_left(tables, scan, cw,
+                                                             monkeypatch):
+    """真源是**本次调用剩下的时间**：封口在前，慢的那天剩余时间才是真上界。
+
+    固定预算只是上限的另一半（部署期由 CDK 断言钉在 Timeout 之内），两者取小。
+    """
+    import access_rollup as ar
+    install, _ = scan
+    install({"us-east-1": _one_group(0)})
+    seen = []
+    real = ar.scan_edge_analytics_failures
+
+    def _spy(end=None, budget_seconds=None):
+        seen.append(budget_seconds)
+        return real(end, budget_seconds)
+
+    monkeypatch.setattr(ar, "scan_edge_analytics_failures", _spy)
+
+    class _Ctx:
+        def get_remaining_time_in_millis(self):
+            return 40_000
+
+    ar.handler({"days": ["2026-08-10"], "sites": ["s1"]}, _Ctx())
+    assert seen and seen[0] is not None, "handler 没有把预算传下去"
+    assert seen[0] < ar.SCAN_BUDGET_SECONDS, (
+        f"剩 40s 时的预算还是固定的 {ar.SCAN_BUDGET_SECONDS}s ⇒ 会吃穿超时")
+    assert seen[0] <= 40 - ar.SCAN_TIME_MARGIN_SECONDS + 0.5, seen
+
+
+def test_a_budget_stop_is_not_reported_as_zero_failures(tables, scan, cw, caplog,
+                                                        monkeypatch):
+    """预算停手是「读不到」，**不是「没有失败」**——一个数据点都不许发。
+
+    与已有的 `test_scan_failure_publishes_nothing_and_still_seals_the_day` 的区别：
+    那条把 `scan_edge_analytics_failures` 整个替成抛异常的桩，走不到新加的这条
+    真实路径。这条驱动的是**真的预算守卫**，并且顺带钉住封口不受影响。
+    """
+    import access_rollup as ar
+    install, _ = scan
+    install({"us-east-1": _one_group(7)})
+    _ev(tables, "s1", "2026-08-10", "a@x.co")
+    monkeypatch.setattr(ar, "SCAN_BUDGET_SECONDS", 0)
+    with caplog.at_level("WARNING"):
+        out = ar.handler({"days": ["2026-08-10"], "sites": ["s1"]}, None)
+    assert cw == [], "预算停手时发了数据点 ⇒ 「读不到」被伪装成了一个数字"
+    assert out["edge_failures"] is None
+    got = tables.query(TableName=DAILY, KeyConditionExpression="site_id = :s",
+                       ExpressionAttributeValues={":s": {"S": "s1"}})
+    assert got["Count"] == 1 and got["Items"][0]["pv"]["N"] == "1", "封口被带崩了"
+    assert any("不发指标" in r.getMessage() for r in caplog.records
+               if r.levelname == "WARNING"), "预算停手没留下 warning ⇒ 纯静默"
+
+
+def test_no_remaining_time_means_no_number_at_all(tables, scan, cw):
+    """剩余时间已经不够收尾 ⇒ 连扫都不开始，照样不发 0。"""
+    import access_rollup as ar
+    install, rec = scan
+    install({"us-east-1": _one_group(7)})
+
+    class _Ctx:
+        def get_remaining_time_in_millis(self):
+            return 1_000
+
+    out = ar.handler({"days": ["2026-08-10"], "sites": ["s1"]}, _Ctx())
+    assert out["edge_failures"] is None
+    assert cw == []
+    assert rec["filtered"] == [], "没有预算却还是发了 filter 调用"
+
+
 def test_access_rollup_stays_pure_stdlib_plus_boto3():
     """本模块被复制进 panel 与 MCP 的产物，多一个依赖就是三处部署的事。"""
     tree = ast.parse(ROLLUP_SRC.read_text(encoding="utf-8"))
@@ -726,5 +922,5 @@ def test_access_rollup_stays_pure_stdlib_plus_boto3():
             roots.add(node.module.split(".")[0])
     assert roots, "一个 import 都没解析出来——本条空转"
     allowed = {"boto3", "botocore", "concurrent", "datetime", "logging", "os",
-               "time"}
+               "threading", "time"}
     assert roots <= allowed, f"引入了不该有的依赖：{sorted(roots - allowed)}"

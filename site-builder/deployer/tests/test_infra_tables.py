@@ -609,6 +609,64 @@ def test_alarm_topic_name_matches_the_script_that_creates_it(template):
         f"infra/app.py={infra_app.ALARM_TOPIC_NAME}")
 
 
+def _rollup_fn(template) -> dict:
+    hit = [res["Properties"] for res in
+           template.find_resources("AWS::Lambda::Function").values()
+           if res["Properties"].get("FunctionName") == "site-access-rollup"]
+    assert len(hit) == 1, f"模板里没有唯一的 site-access-rollup：{len(hit)}"
+    return hit[0]
+
+
+def test_rollup_memory_is_sized_for_its_scan_threads(template):
+    """内存不许再回到 256MB，且**必须随扫描线程数走**。
+
+    2026-08-15 线上回归：跨区扫描上线后约一半调用挂 `Runtime.OutOfMemory`
+    （256MB 的函数，六次 REPORT 全部 used≈255~256/256MB）。根因是每区新建一个
+    boto3 Session（各自一份 botocore endpoints/服务模型），18 个已启用区 × 并发 8
+    ⇒ 200MB+ 活内存。运行时那侧已改成**每线程一个 Session**，于是活内存的乘数从
+    "区数"（AWS 说了算）变成 `SCAN_WORKERS`（我们说了算）。
+
+    这条钉的就是那条式子：
+      · `MemorySize` 逐字等于 `infra/app.py` 的 `ROLLUP_MEMORY_MB`（防"悄悄改回
+        256"）；
+      · 而 `ROLLUP_MEMORY_MB` 必须 ≥ (基线 + 每线程 × 线程数) × 余量倍数
+        ——**调大 `SCAN_WORKERS` 而不调内存 ⇒ 这条红**，那正是上一次那个"新开一个区
+        就悄悄坏掉"的旋钮；
+      · 线程数从 `functions/access_rollup.py` 的源码读（单一真源，不手抄）。
+    """
+    import app as infra_app
+    workers = infra_app.ROLLUP_SCAN_WORKERS
+    assert workers >= 1, workers
+    floor = ((infra_app.ROLLUP_MEM_BASE_MB
+              + infra_app.ROLLUP_MEM_PER_WORKER_MB * workers)
+             * infra_app.ROLLUP_MEM_HEADROOM)
+    props = _rollup_fn(template)
+    assert props["MemorySize"] == infra_app.ROLLUP_MEMORY_MB, props["MemorySize"]
+    assert props["MemorySize"] >= floor, (
+        f"MemorySize={props['MemorySize']}MB 撑不住 {workers} 个扫描线程"
+        f"（下界 {floor}MB = (基线 {infra_app.ROLLUP_MEM_BASE_MB} + 每线程 "
+        f"{infra_app.ROLLUP_MEM_PER_WORKER_MB} × {workers}) × "
+        f"{infra_app.ROLLUP_MEM_HEADROOM}）")
+    assert props["MemorySize"] > 256, "256MB 就是 2026-08-15 那次 OOM 的尺寸"
+
+
+def test_the_scan_budget_leaves_room_inside_the_rollup_timeout(template):
+    """扫描的自限预算必须**明显小于**函数超时。
+
+    扫描是观测，封口是耐久工作，两者在同一次调用里（封口在前）。预算的全部意义
+    是"扫不完就放手"，而不是"扫到超时"——超时会把封口那次调用一起标记成失败
+    （EventBridge 重试 + DLQ + 拖响 `m5-rollup-no-successful-invocation-24h`）。
+    所以留一半给封口与收尾：预算 × 2 ≤ 超时。
+    """
+    import app as infra_app
+    props = _rollup_fn(template)
+    assert props["Timeout"] == infra_app.ROLLUP_TIMEOUT_SECONDS, props["Timeout"]
+    budget = infra_app.ROLLUP_SCAN_BUDGET_SECONDS
+    assert budget > 0, budget
+    assert budget * 2 <= props["Timeout"], (
+        f"扫描预算 {budget}s 在 {props['Timeout']}s 超时里没留出封口余量")
+
+
 def test_rollup_runs_daily_and_has_a_dlq(template):
     rules = template.find_resources("AWS::Events::Rule")
     hit = [r for r in rules.values()
