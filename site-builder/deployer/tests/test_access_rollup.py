@@ -103,6 +103,29 @@ def test_rerun_is_idempotent(tables):
     assert got["Items"][0]["pv"]["N"] == "1"
 
 
+def test_rerun_recomputes_instead_of_keeping_the_first_number(tables):
+    """重算即修复：封口后又到的明细行必须体现在重跑结果里。
+
+    **与上面那条 test_rerun_is_idempotent 不重复，别删任何一条**：
+    「重跑不产生重复行」是 daily 表的键结构（site_id + date）本身保证的，
+    与实现是不是覆盖写无关——所以上面那条对「写一次就再也不覆盖」的实现
+    （PutItem 带 attribute_not_exists 条件 + 吞掉冲突）照样全绿，实测过。
+    本条钉的是另一半、也是真正承重的那半：重跑必须用**重新算出的**数盖掉旧行。
+    spec §0.1 就是用「重算即修复」否掉日志侧聚合的（那边真源会过期，
+    聚合器坏一个月即永久丢数；这边明细耐久，所以重跑能全恢复）。
+    """
+    import access_rollup as ar
+    _ev(tables, "s1", "2026-08-10", "a@x.co", i=0)
+    ar.handler({"days": ["2026-08-10"], "sites": ["s1"]}, None)
+    _ev(tables, "s1", "2026-08-10", "b@x.co", i=1)      # 迟到 / 上轮只跑了半天
+    ar.handler({"days": ["2026-08-10"], "sites": ["s1"]}, None)
+    got = tables.query(TableName=DAILY, KeyConditionExpression="site_id = :s",
+                       ExpressionAttributeValues={":s": {"S": "s1"}})
+    assert got["Count"] == 1
+    assert got["Items"][0]["pv"]["N"] == "2"            # 不是 "1"
+    assert got["Items"][0]["uv"]["N"] == "2"
+
+
 def test_today_is_never_sealed(tables):
     """今天的数由读路径实时算；封口今天会把半天的数字固化成"全天"。"""
     import access_rollup as ar
