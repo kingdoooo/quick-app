@@ -1593,6 +1593,26 @@ us-east-1），**零新增基础设施**。每轮：
 （该动作没有资源级权限，namespace 条件是唯一的收窄手段）。**没有任何新增的
 DynamoDB 写权限。**
 
+> **⚠️ 手工建过同名资源的话，必须先删再部——删除是部署的前置条件，不是善后。**
+> 2026-08-15 实测：这两条告警先前是手工 `put-metric-alarm` 建的，于是第一次
+> `cdk deploy` 直接失败：
+>
+> ```
+> Resource of type 'AWS::CloudWatch::Alarm' with identifier
+> 'm5-rollup-no-successful-invocation-24h' already exists.
+> (at /Resources/RollupLivenessAlarm72085CAD)
+> ```
+>
+> **CloudFormation 接管不了不是它建的资源**，所以手工建的东西不只是「不可复现」，
+> 它会**主动阻塞代码版本永远无法存在**。当时的判断是「先部署成功、再删手工资源，
+> 免得中间出现监控空窗」——**顺序正好是反的**。正确做法：先
+> `aws cloudwatch delete-alarms --alarm-names <名字>`（本轮还一并删了三个分区
+> metric filter），再 `cdk deploy`。空窗只有几分钟，而且新告警本来就要等
+> 指标有数据才离开 `INSUFFICIENT_DATA`。失败那次 `LastUpdatedTime` 没动、
+> 零部分应用，所以直接重部即可。
+>
+> 这条对**任何**与 CDK 资源同名的手工资源都成立，不限于告警。
+
 **两条告警都由 CDK 声明，不要手工建。** 真源是
 `site-builder/deployer/infra/app.py`（挨着 rollup Lambda 与那条 EventBridge 规则），
 随执行器栈一起部署：
