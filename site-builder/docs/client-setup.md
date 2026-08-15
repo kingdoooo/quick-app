@@ -66,7 +66,8 @@ print(d['projects']['$PWD']['mcpServers']['site-builder-deploy']['args'])"
 ```
 
 **加完必须重启 Claude Code**（stdio server 在启动时加载），然后 `/mcp` 应显示
-8 个工具、无需再授权。
+<!-- tool-count:begin -->9<!-- tool-count:end --> 个工具（清单见下面
+「冒烟检查清单」一节）、无需再授权。
 
 代理需要 `http://localhost:18765/callback` 已在 mcp client 的 CallbackURLs 里
 （`deploy_pool.py` 默认就注册了；端口选 18765 是因为 8765/8766 被 Quick Desktop
@@ -151,11 +152,24 @@ npx @modelcontextprotocol/inspector
 
 | 检查 | 预期 | 失败含义 |
 |---|---|---|
-| 列出工具 | 5 个：deploy_site / confirm_upload / get_deploy_status / list_my_sites / undeploy_site | 容器未起或协议不匹配（应为 stateless streamable-http，0.0.0.0:8000/mcp） |
+| 列出工具 | <!-- tool-count:begin -->9<!-- tool-count:end --> 个（清单见下） | 容器未起或协议不匹配（应为 stateless streamable-http，0.0.0.0:8000/mcp） |
 | 不带 token 调用 | 401 | authorizer 未生效——任何人可部署 |
 | `list_my_sites` 的 owner | == 你的飞书邮箱 | email claim 没透传：检查 `requestHeaderAllowlist` 含 `Authorization`，再按上文选 id_token 或 pre-token Lambda |
 | 换另一个账号调 `get_deploy_status(别人的 job)` | 报"你不是…所有者" | owner 校验被绕过 |
 | 完整部署一次 | 拿到 URL 且浏览器能飞书登录访问 | 见 DEPLOY.md 各阶段排查 |
+
+上表第一行应当列出的工具面（工具面的真源是 `mcp/server.py` 的装饰器，
+由 `mcp/tests/test_agentcore_contract.py` 与 `test_doc_tool_surface.py` 两侧锁定）：
+
+<!-- tool-list:begin  本区域由 site-builder/mcp/tests/test_doc_tool_surface.py 对着
+     MCP 实时注册表校验；区域内只写工具名，别的标识符写到区域外。 -->
+
+- 部署：`deploy_site` → `confirm_upload` → `get_deploy_status`
+- 管理：`list_my_sites` / `get_site_permissions` / `update_site_permissions` /
+  `manage_collaborators` / `undeploy_site`
+- 统计：`get_site_analytics`（二期 M5）
+
+<!-- tool-list:end -->
 
 ## 已知客户端差异（2026-08-06 复核）
 

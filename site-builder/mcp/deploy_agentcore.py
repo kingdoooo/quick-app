@@ -57,6 +57,15 @@ ROLE_NAME = "site-mcp-runtime-role"
 # 没有 IMAGE_TAG 常量：tag 由 image_tag() 按 git sha 生成（`latest` 在
 # IMMUTABLE 仓库下第二次就 push 不上去，也让"线上跑哪份代码"无法回答）。
 
+# 部署完打印的冒烟清单里那个"应列出几个工具"。**由
+# `tests/test_doc_tool_surface.py` 对着 server.py 的实时注册表校验**——这个数字
+# 在 M6 之前被手抄进六个文件、写成过 4/5/8 三种，照它排查的人会去找一个不存在的
+# 故障。这里不 import server.py 取长度：那会把部署脚本绑上容器侧的全部依赖
+# （mcp / boto3 客户端构造），代价远大于一条守卫。
+# tool-count:begin
+EXPECTED_TOOL_COUNT = 9
+# tool-count:end
+
 ecr = boto3.client("ecr", region_name=REGION)
 iam = boto3.client("iam")
 acc = boto3.client("bedrock-agentcore-control", region_name=REGION)
@@ -714,7 +723,7 @@ def main() -> None:
 
     print("\n冒烟（需要一个真实 Cognito token）：")
     print("  npx @modelcontextprotocol/inspector  # 连上面 endpoint，带 Bearer token")
-    print("  检查：9 个工具列出 / 无 token 返回 401 /")
+    print(f"  检查：{EXPECTED_TOOL_COUNT} 个工具列出 / 无 token 返回 401 /")
     print("       list_my_sites 的 owner == 登录的飞书邮箱（验证 email claim 透传）")
 
 

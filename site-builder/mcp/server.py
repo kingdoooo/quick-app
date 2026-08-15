@@ -1,4 +1,7 @@
-"""部署 MCP——薄壳：4 工具全部秒级返回，重活交给 Step Functions。
+"""部署 MCP——薄壳：工具全部秒级返回，重活交给 Step Functions。
+
+工具数**刻意不写在这里**：真源是本文件下半部分的 `@mcp.tool()` 装饰器，
+在同一个文件里再抄一个数字只会像 M6 之前那样漂掉（当时这行还写着 4）。
 运行于 AgentCore Runtime；调用者飞书 email 由网关经 JWT claims 传入。"""
 import hmac
 import json

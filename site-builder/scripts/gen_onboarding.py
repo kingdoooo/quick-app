@@ -27,6 +27,19 @@ region = CFG["Platform"]["region"]
 # 用绝对路径：用户可能从任意目录跑生成出的命令。
 proxy_dir = ROOT / "clients/quick-desktop-proxy"
 
+# 接入成功后 `/mcp` 应显示的工具数。**这个数字与下面那份清单都由
+# `mcp/tests/test_doc_tool_surface.py` 对着 MCP 实时注册表校验**——加了工具却没
+# 同步这里会变红。手抄的下场见 M6：同一个数字曾在六个文件里写成 4/5/8 三种。
+# tool-count:begin
+TOOL_COUNT = 9
+# tool-count:end
+# 对应清单（正文只报数量，这里留清单给维护者对照；同样受上面那条守卫约束）：
+# tool-list:begin
+#   deploy_site / confirm_upload / get_deploy_status / list_my_sites /
+#   undeploy_site / update_site_permissions / manage_collaborators /
+#   get_site_permissions / get_site_analytics
+# tool-list:end
+
 assert endpoint and client_id, "config.ini [MCP]/[Cognito] 未回填——先完成 DEPLOY.md ①⑤"
 
 # API Key 章节只在组件启用时出现。**不启用时一个字都不提**：写"本平台未启用"
@@ -91,7 +104,7 @@ claude mcp add site-builder-deploy -- \\
   "{client_id}"
 ```
 
-4) **重启 Claude Code**（stdio server 在启动时加载），然后 `/mcp` 应显示 8 个
+4) **重启 Claude Code**（stdio server 在启动时加载），然后 `/mcp` 应显示 {TOOL_COUNT} 个
    工具、不再要求授权。若显示需要认证，检查配置里存的是 **3 个** args
    （脚本路径 / endpoint / client_id）——shell 引号有时会把后两个粘成一个。
 
@@ -144,10 +157,24 @@ Quick Desktop 的 Remote MCP 不支持 OAuth，需用仓库自带的本地 stdio
 Agent 会走完：需求澄清 → 生成代码 → 本地预览 → 部署 → 返回站点 URL。
 站点访问权限在部署时声明（全组织可见 / 指定邮箱名单 / 完全公开）。
 
+**建完之后也直接跟 Agent 说**，不用自己找入口——这些都有对应工具：
+
+> 我有哪些站点 / 把这个站点改成只给这几个人看 / 让某某也能改它 /
+> 把站点转给某某 / 这个站点有人用吗、谁来过 / 把它下线
+
+## 控制台（可选，点着看的那个入口）
+
+`https://console.{base}/`——用同一个飞书账号登录，能干的事和上面那些工具是
+同一套后端：改访问权限、加减协作者、转移所有权、看部署历史、下线站点，以及
+**访问统计页**（页面访问量 / 独立访客 / 被拒次数，与最近的访问明细）。
+建站与更新代码仍然只在 Agent 里做。
+
 ## 权限模型（你能做什么）
 
 - 任何完成接入的人都能创建站点；站点归属（owner）自动绑定你的飞书邮箱。
-- 你只能查看/更新/下线**自己**的站点；他人站点对你不可见。
+- 你能看到并管理**自己 owner 的**站点，以及**别人把你加为协作者的**站点；
+  其余站点对你不可见。协作者能更新代码、改访问策略、看统计，但**不能**下线
+  站点、不能增删协作者（那两件只有 owner 与平台管理员能做）。
 - 下线默认保留数据；连数据一起删需要显式确认（不可恢复）。
 
 ## 常见错误对照

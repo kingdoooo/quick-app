@@ -1012,11 +1012,21 @@ AgentCore 校验不认。`deploy_agentcore.py` 已带 `--provenance=false` 规�
 手工构建镜像时必须同样加上该参数。
 
 **冒烟**：`npx @modelcontextprotocol/inspector` 连 endpoint（带 Cognito Bearer token），
-确认列出 8 工具、无 token 返回 401、`list_my_sites` 的 owner == 登录用户飞书邮箱。
-八个工具 = 部署五件套（`deploy_site` / `confirm_upload` / `get_deploy_status` /
-`list_my_sites` / `undeploy_site`）+ 权限三件套（`update_site_permissions` /
-`manage_collaborators` / `get_site_permissions`）。工具面由
-`mcp/tests/test_agentcore_contract.py` 的 `EXPECTED_TOOLS` 锁定。
+确认列出 <!-- tool-count:begin -->9<!-- tool-count:end --> 个工具、无 token 返回 401、
+`list_my_sites` 的 owner == 登录用户飞书邮箱。应当列出的是：
+
+<!-- tool-list:begin  本区域由 site-builder/mcp/tests/test_doc_tool_surface.py 对着
+     MCP 实时注册表校验；区域内只写工具名。 -->
+
+- 部署三件套：`deploy_site` / `confirm_upload` / `get_deploy_status`
+- 管理五件套：`list_my_sites` / `undeploy_site` / `update_site_permissions` /
+  `manage_collaborators` / `get_site_permissions`
+- 统计（二期 M5）：`get_site_analytics`
+
+<!-- tool-list:end -->
+
+工具面在运行时由 `mcp/tests/test_agentcore_contract.py` 的 `EXPECTED_TOOLS` 锁定，
+在文档里由 `mcp/tests/test_doc_tool_surface.py` 锁定（两侧都对着实时注册表比）。
 
 **token 形态已真机钉死（2026-07-29）**：网关配 `allowedClients` 时只接受
 **access token**（id_token 会 401 "Claim 'client_id' value mismatch"，因为

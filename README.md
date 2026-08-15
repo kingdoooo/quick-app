@@ -14,6 +14,10 @@ Agent 客户端）里用自然语言开发简易全栈站点，说一句"部署"
 
 ## 架构
 
+<!-- tool-list:begin  ② 那格的工具面由 site-builder/mcp/tests/test_doc_tool_surface.py
+     对着 MCP 实时注册表校验（漏一个、或留着已删除的都会变红）。本图里除工具名外
+     不要出现别的 snake_case 标识符，否则会被当成"多出来的工具"。 -->
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │ ① 建站 Skill（Agent Skills 开放标准，"部署合同"）             │  site-builder/skills/
@@ -21,9 +25,11 @@ Agent 客户端）里用自然语言开发简易全栈站点，说一句"部署"
 └──────────────────────────┬──────────────────────────────────┘
                            │ MCP 调用（OAuth 携带飞书身份）
 ┌──────────────────────────▼──────────────────────────────────┐
-│ ② 部署 MCP（AgentCore Runtime，薄壳，5 工具秒级返回）         │  site-builder/mcp/
+│ ② 部署 MCP（AgentCore Runtime，薄壳，工具全部秒级返回）       │  site-builder/mcp/
 │    deploy_site / confirm_upload / get_deploy_status /         │
-│    list_my_sites / undeploy_site                              │
+│    list_my_sites / undeploy_site / get_site_analytics /       │
+│    update_site_permissions / manage_collaborators /           │
+│    get_site_permissions                                       │
 └──────────────────────────┬──────────────────────────────────┘
                            │ 条件迁移 PENDING→RUNNING + SFN 启动
 ┌──────────────────────────▼──────────────────────────────────┐
@@ -44,6 +50,8 @@ Agent 客户端）里用自然语言开发简易全栈站点，说一句"部署"
 │    一套 Cognito 三处消费：Quick SSO / 站点访问 / MCP 部署权限   │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+<!-- tool-list:end -->
 
 ### 关键设计决策
 
