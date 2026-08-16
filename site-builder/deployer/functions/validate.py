@@ -12,6 +12,37 @@ from contract import scan_redlines, validate_manifest
 import common
 
 
+# 解包上界。**Task A5 的 CDK 断言按名字 AST 取这两个值**给 validate 定磁盘尺寸
+# ——改上界不同时改磁盘即红（同 access_rollup 的 SCAN_WORKERS ↔ 内存那条式子）。
+MAX_ZIP_ENTRIES = 2000
+MAX_UNPACKED_BYTES = 200 * 1024 * 1024
+
+# CodeBuild 唯一允许的输入前缀。owner 只有 uploads/{job_id}.zip 的预签名 PUT，
+# 碰不到这里 ⇒ 本前缀下的对象在 job 生命周期内不可变。
+VALIDATED_PREFIX = "validated"
+
+
+def validated_key(job_id: str) -> str:
+    return f"{VALIDATED_PREFIX}/{job_id}/backend-src.zip"
+
+
+def _pack_build_input(root: Path) -> bytes:
+    """把**已解包并逐文件扫描过的那棵树**里构建所需的部分重新打包。
+
+    不是重新读一遍上传 key ⇒ 不存在"校验的字节"与"构建的字节"不同的窗口（P1-1）。
+    只打 run.sh + backend/：buildspec 也只用这两样，前端与 site.json 不进构建容器。
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in sorted(root.rglob("*")):
+            if not p.is_file():
+                continue
+            rel = p.relative_to(root).as_posix()
+            if rel == "run.sh" or rel.startswith("backend/"):
+                z.write(p, rel)
+    return buf.getvalue()
+
+
 class ContractViolation(Exception):
     pass
 
@@ -29,11 +60,12 @@ def handler(event, context):
         root = Path(td)
         with zipfile.ZipFile(io.BytesIO(data)) as z:
             infos = z.infolist()
-            if len(infos) > 2000:
-                raise ContractViolation(f"文件数 {len(infos)} 超过 2000 上限")
+            if len(infos) > MAX_ZIP_ENTRIES:
+                raise ContractViolation(f"文件数 {len(infos)} 超过 {MAX_ZIP_ENTRIES} 上限")
             total = sum(i.file_size for i in infos)
-            if total > 200 * 1024 * 1024:
-                raise ContractViolation(f"解压后总大小 {total} 超过 200MB 上限")
+            if total > MAX_UNPACKED_BYTES:
+                raise ContractViolation(
+                    f"解压后总大小 {total} 超过 {MAX_UNPACKED_BYTES // 1024 // 1024}MB 上限")
             compressed = max(1, sum(i.compress_size for i in infos))
             if total / compressed > 100:
                 raise ContractViolation(f"压缩比 {total // compressed}:1 超过 100:1（疑似 zip bomb）")
@@ -63,5 +95,9 @@ def handler(event, context):
                 s3.put_object(Bucket=bucket,
                               Key=f"extracted/{job_id}/{p.relative_to(root)}",
                               Body=p.read_bytes())
+
+        # CodeBuild 的唯一输入。**必须在校验全部通过之后写**。
+        s3.put_object(Bucket=bucket, Key=validated_key(job_id),
+                      Body=_pack_build_input(root))
 
     return {"job_id": job_id, "site_id": site_id, "manifest": manifest}

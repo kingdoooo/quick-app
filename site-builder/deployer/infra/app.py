@@ -261,12 +261,13 @@ class SiteDeployerStack(Stack):
                 build_image=cb.LinuxBuildImage.STANDARD_7_0,
                 compute_type=cb.ComputeType.SMALL),
             timeout=Duration.minutes(15))
-        # 构建容器跑的是不可信站点的依赖安装：即使 --ignore-scripts，也不给它
-        # 整桶读写（否则可读/删他人上传包与产物、枚举所有 job）。
-        # 只读 uploads/*、只写 artifacts/*，且不给 ListBucket 与 DeleteObject。
+        # 构建容器跑的是不可信站点的依赖安装：只读 validated/*（validate 产出的
+        # 不可变工件）、只写 artifacts/*，且不给 ListBucket 与 DeleteObject。
+        # **不能改成"从 extracted/ 递归拷贝"**：aws s3 cp --recursive 必须
+        # ListObjectsV2 = 要 ListBucket = 让构建容器能枚举所有 job。
         package_project.add_to_role_policy(iam.PolicyStatement(
             actions=["s3:GetObject"],
-            resources=[f"{artifacts.bucket_arn}/uploads/*"]))
+            resources=[f"{artifacts.bucket_arn}/validated/*"]))
         package_project.add_to_role_policy(iam.PolicyStatement(
             actions=["s3:PutObject"],
             resources=[f"{artifacts.bucket_arn}/artifacts/*"]))

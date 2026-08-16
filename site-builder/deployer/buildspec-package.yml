@@ -1,12 +1,16 @@
 version: 0.2
 # 输入（环境变量，StartBuild 时传）：JOB_ID、ARTIFACTS_BUCKET。
-# 上传包 s3://$ARTIFACTS_BUCKET/uploads/$JOB_ID.zip（PoC 仅 nodejs22.x）
+# 构建输入 s3://$ARTIFACTS_BUCKET/validated/$JOB_ID/backend-src.zip（PoC 仅 nodejs22.x）
+#   —— **不是** uploads/{job_id}.zip：那个 key 的预签名 PUT 在有效期内可被重复
+#   使用并覆盖，于是"校验过的 zip"与"构建的 zip"可以是两份不同的字节（P1-1）。
+#   这里的反例故意写 {job_id} 而非 shell 变量形态：守卫按整份文件文本断言旧前缀
+#   的变量形态在本文件里一次都不出现，写成变量形态会让守卫红在自己的说明注释上。
 # 输出：s3://$ARTIFACTS_BUCKET/artifacts/$JOB_ID/backend.zip
 # 注意：任何命令失败即构建失败——不得用 `|| true` 吞错。
 phases:
   build:
     commands:
-      - aws s3 cp "s3://$ARTIFACTS_BUCKET/uploads/$JOB_ID.zip" /tmp/site.zip
+      - aws s3 cp "s3://$ARTIFACTS_BUCKET/validated/$JOB_ID/backend-src.zip" /tmp/site.zip
       - mkdir -p /tmp/site && cd /tmp/site && unzip -q /tmp/site.zip
       - test -f /tmp/site/run.sh  # 合同要求 run.sh 在 zip 根，缺失即失败
       # 站点自带的 .npmrc 可改 registry 拉恶意包（CLI flag 能盖 ignore-scripts，
