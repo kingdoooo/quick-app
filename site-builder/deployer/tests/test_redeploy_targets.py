@@ -83,6 +83,26 @@ def test_auth_sourced_module_maps_to_panel():
     assert "panel" not in w.targets_for(["site-builder/auth/pre_token_email.py"])
 
 
+def test_hand_asserted_coupling_pulls_in_the_edge():
+    """session.py 改了也要重部 router——这条边推不出来，只能手写。
+
+    `auth/session.py` 与 `router/infrastructure/lambda/origin_request.py` 是**两份独立
+    实现靠人手同步**同一套 HS256 会话验签（CLAUDE.md:145「两处必须字节级同步」、
+    origin_request.py:453 同款注释），不是文件复制，任何复制清单里都没有它。
+    答成 `auth, panel` 而漏掉 router 的后果是**全平台会话验签失败**——这个工具存在
+    的意义就是不在这类事上安静地答错。
+
+    手写的边要能与推导出来的边**分开**（`coupled_targets`）：读者得看出哪条有真源、
+    哪条需要人维护。
+    """
+    import which_targets_to_redeploy as w
+    assert {"auth", "panel", "router"} <= w.targets_for(["site-builder/auth/session.py"])
+    assert w.coupled_targets(["site-builder/auth/session.py"]) == {"router"}
+    # 反面两条：别的 auth 文件没有这条耦合；推导层不该凭空多出手写的目标。
+    assert "router" not in w.targets_for(["site-builder/auth/pre_token_email.py"])
+    assert w.coupled_targets(["site-builder/deployer/functions/permissions.py"]) == set()
+
+
 def test_partially_parseable_copy_list_raises_instead_of_returning_short_list(tmp_path):
     """清单解析不动时必须抛，不能返回"部分清单"。
 

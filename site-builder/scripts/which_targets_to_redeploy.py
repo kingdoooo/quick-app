@@ -7,12 +7,13 @@
 （permissions.py 漏 key-proxy、access_rollup.py 漏 panel），原有指引"改共享模块前
 先 grep 部署脚本"是人的流程，第二次照样漏——本脚本把它变成一个能问的问题。
 
-两层规则：
+三层规则，前两层有真源、第三层没有（所以分开显示）：
   ① 目录归属 —— 用 PurePath.parts 判（不是子串：`"/router/" in p` 对
      `router/...` 这种无前导斜杠的路径永不匹配，v1 就栽在这里）；
   ② vendored 反向映射 —— deployer/functions/*.py 被谁打进了自己的产物，
      从三份复制清单推导（panel 的 COPY_FILES、key-proxy 的 COPY_FILES、
-     mcp 的 Dockerfile COPY 行）。
+     mcp 的 Dockerfile COPY 行）；
+  ③ 手工断言的耦合边（`SEMANTIC_COUPLINGS`）—— 推不出来、靠人维护的那一条。
 
 期望值由 `deployer/tests/test_redeploy_targets.py` 的硬编码快照核对——**不要**让
 测试从本模块自己的解析结果生成期望，那样守卫恒真（v1 的 copied_files_not_in_map
@@ -52,6 +53,26 @@ VENDOR_SRC_DIRS = (
     ("site-builder", "deployer", "functions"),
     ("site-builder", "auth"),
 )
+
+# **手工断言的耦合边** —— 与上面两组不同，这里的边**不是从任何真源推导出来的**，
+# 所以单独放、单独显示，别混进有清单可查的那些边里。
+#
+# 唯一一条：`auth/session.py` ↔ `router/infrastructure/lambda/origin_request.py`。
+# 那是**两份独立实现靠人手保持一致**的同一套 HS256 会话验签，不是文件复制，因此
+# 没有任何复制清单能解析出这条边。两处锚点都写着这件事（按引号里的原文 grep，
+# 行号只是写这行时的位置、会漂）：
+#   - CLAUDE.md「两处必须字节级同步」（当时 :145）
+#   - router/infrastructure/lambda/origin_request.py「改动须两处同步」（当时 :453）
+# 改了 session.py 只重部 auth 的后果是**全平台会话验签失败**，这个代价大到值得
+# 破一次"只答推导得出的东西"的规矩。
+#
+# 代价要认：手写的边不会随代码自动更新，**得靠人维护**——上面那两处注释挪走或
+# 改写时，这条边可能已经不成立而这里还留着。CLI 因此把它与推导出来的边分开打印，
+# 并明说需要人工确认。不要把这里长成配置文件或扫描机制：一条边 + 一段响亮的注释
+# 就是全部范围（真发现第二条，先报告，不要顺手加）。
+SEMANTIC_COUPLINGS = {
+    ("site-builder", "auth", "session.py"): {"router"},
+}
 
 
 def _list_const(py: Path, name: str) -> list[str]:
@@ -93,8 +114,10 @@ def _mcp_files() -> list[str]:
     """Dockerfile 的 COPY 行 —— 真正进入镜像的那一份清单。
 
     deploy_agentcore.py 里还有两份平行清单（`_BUILD_INPUTS` 与 build_and_push 的
-    复制循环），由 mcp/tests/test_agentcore_contract.py 按 server.py 的传递闭包
-    与这里对齐；本脚本只读 Dockerfile，不重复那个断言。
+    复制循环）。本脚本**只读 Dockerfile**，故意不重复那个交叉核对——保证三份一致的是
+    `mcp/tests/test_agentcore_contract.py::test_image_carries_every_local_module_the_server_chain_imports`
+    （按 server.py 的传递闭包核对）。**删掉那条测试，这里只读一份清单的做法就不再
+    安全**：复制循环多列一个文件时，那个文件静默不进镜像，而本脚本一样看不出来。
     """
     df = (ROOT / "mcp" / "Dockerfile").read_text()
     return sorted({m for line in df.splitlines()
@@ -151,7 +174,8 @@ def _vendored_name(parts: tuple[str, ...]) -> str | None:
     return None
 
 
-def targets_for(paths) -> set[str]:
+def _derived_targets(paths) -> set[str]:
+    """能从真源推导出来的目标：目录归属 + vendored 复制清单。"""
     vmap, out = vendor_map(), set()
     for p in paths:
         parts = _repo_parts(p)
@@ -162,6 +186,23 @@ def targets_for(paths) -> set[str]:
         if name:
             out |= vmap.get(name, set())
     return out
+
+
+def coupled_targets(paths) -> set[str]:
+    """`SEMANTIC_COUPLINGS` 命中的目标 —— 手工断言、没有真源的那部分。
+
+    单独一个函数是为了让调用方（CLI 与守卫）能把它与推导出来的目标**分开**：
+    混在一起看不出哪条需要人维护。
+    """
+    out = set()
+    for p in paths:
+        out |= SEMANTIC_COUPLINGS.get(_repo_parts(p), set())
+    return out
+
+
+def targets_for(paths) -> set[str]:
+    """全部要重部的目标（推导出来的 + 手工断言的）。"""
+    return _derived_targets(paths) | coupled_targets(paths)
 
 
 def main() -> int:
@@ -178,7 +219,15 @@ def main() -> int:
     if unmatched:
         print("\n未归类（不在任何目标的目录规则里，请人工确认）:",
               *unmatched, sep="\n  ")
-    print("\n需要重部:", ", ".join(sorted(targets_for(paths))) or "（无）")
+    # 推导出来的边与手工断言的边**分开打印**：前者跟着部署脚本自动更新，后者靠人
+    # 维护、可能已经过时，操作者有权知道自己在信哪一种。
+    derived = _derived_targets(paths)
+    asserted = coupled_targets(paths) - derived
+    print("\n需要重部（从部署脚本的复制清单与目录规则推导）:",
+          ", ".join(sorted(derived)) or "（无）")
+    if asserted:
+        print("需要重部（手工断言的耦合边，请人工确认它仍然成立）:",
+              ", ".join(sorted(asserted)))
     return 0
 
 
