@@ -23,7 +23,8 @@
 
 用法：
     python3 site-builder/scripts/which_targets_to_redeploy.py [PATH ...]
-无参时读 `git diff --name-only HEAD`（含已 staged 的改动）。
+无参时读 `git diff --name-only HEAD`（含已 staged 的改动）**加上未跟踪文件**
+（`git ls-files --others --exclude-standard`）——见 `_changed_paths`。
 """
 import ast
 import re
@@ -205,10 +206,25 @@ def targets_for(paths) -> set[str]:
     return _derived_targets(paths) | coupled_targets(paths)
 
 
+def _changed_paths() -> list[str]:
+    """默认模式的输入：已跟踪文件的改动 **+ 未跟踪文件**。
+
+    只跑 `git diff` 会漏掉 untracked，而"新写一个共享模块或部署脚本"正是最需要提示
+    额外重部的那类改动（Codex 复审 P2-f：建一个未跟踪的 panel 文件后本工具输出
+    "没有改动的文件"）。`-z` 而不是按空白切：路径可以含空格，`.split()` 会把一条拆成
+    两条——既进不了任何目录规则（被算作"未归类"），又凭空造出不存在的路径。
+    """
+    out: list[str] = []
+    for argv in (["git", "diff", "--name-only", "-z", "HEAD"],
+                 ["git", "ls-files", "--others", "--exclude-standard", "-z"]):
+        r = subprocess.run(argv, capture_output=True, text=True, check=True,
+                           cwd=REPO)
+        out += [p for p in r.stdout.split("\0") if p]
+    return sorted(set(out))
+
+
 def main() -> int:
-    paths = sys.argv[1:] or subprocess.run(
-        ["git", "diff", "--name-only", "HEAD"], capture_output=True, text=True,
-        check=True, cwd=REPO).stdout.split()
+    paths = sys.argv[1:] or _changed_paths()
     if not paths:
         print("没有改动的文件")
         return 0

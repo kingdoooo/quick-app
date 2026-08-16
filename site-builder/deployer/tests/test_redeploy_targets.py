@@ -6,6 +6,7 @@
 **期望值一律硬编码**。v1 的 copied_files_not_in_map() 用同三个解析器同时生成
 "实际"与"期望"，差集恒为空——解析器漏一个文件两边同时漏，守卫永远不红（§4.28）。
 """
+import subprocess
 import sys
 from pathlib import Path
 
@@ -125,3 +126,48 @@ def test_absolute_paths_are_normalized_to_repo_relative():
     got = w.targets_for([str(REPO / "site-builder" / "deployer" / "functions"
                              / "permissions.py")])
     assert {"deployer", "panel", "key-proxy", "mcp"} <= got
+
+
+def _fake_git(tracked, untracked):
+    """假造两条 git 命令的输出。
+
+    **按 argv 里有没有 `-z` 决定分隔符**，像真 git 那样：把 `-z` 去掉这个退化在这里
+    就是真的退化，而不是被 fake 悄悄补上。不在仓库里真建文件——那会污染工作树。
+    """
+    def run(argv, *a, **kw):
+        if "ls-files" in argv:
+            names = untracked
+        elif "diff" in argv:
+            names = tracked
+        else:
+            raise AssertionError(f"意料之外的 git 命令：{argv}")
+        sep = "\0" if "-z" in argv else "\n"
+        return subprocess.CompletedProcess(
+            argv, 0, stdout="".join(n + sep for n in names))
+    return run
+
+
+def test_default_mode_sees_untracked_files(monkeypatch):
+    """无参模式漏 untracked = 在最需要提示的场景静默漏报：新写一个共享模块时
+    `git diff` 看不见它（Codex 复审 P2-f 实测：未跟踪的 panel 文件 → "没有改动的文件"）。
+    """
+    import which_targets_to_redeploy as w
+    new = "site-builder/panel/new_shared_thing.py"
+    monkeypatch.setattr(w.subprocess, "run", _fake_git([], [new]))
+    paths = w._changed_paths()
+    assert new in paths, f"未跟踪的新文件没被收进来：{paths}"
+    assert "panel" in w.targets_for(paths), f"收进来了却没算出 panel：{paths}"
+
+
+def test_paths_with_spaces_survive_parsing(monkeypatch):
+    """按空白切会把一个含空格的路径拆成两条：既进不了任何目录规则（被算作"未归类"），
+    又可能凭空造出不存在的路径。所以两条 git 命令都用 -z。
+    """
+    import which_targets_to_redeploy as w
+    weird = "site-builder/panel/my new file.py"
+    monkeypatch.setattr(w.subprocess, "run",
+                        _fake_git(["site-builder/panel/a.py"], [weird]))
+    paths = w._changed_paths()
+    assert weird in paths, f"含空格的路径没有整条保留：{paths}"
+    # 拆坏的形态不只是"少了一条"，还会凭空多出几条不存在的路径
+    assert not ({"site-builder/panel/my", "new", "file.py"} & set(paths)), paths
