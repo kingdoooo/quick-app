@@ -335,6 +335,22 @@ class SiteDeployerStack(Stack):
             iam.PolicyStatement(  # 站点 Lambda 的创建/更新，限 site- 前缀
                 # GetFunctionConfiguration 是 function_updated/function_active waiter
                 # 实际轮询的 API（不是 GetFunction）——缺它每次部署都 AccessDenied。
+                #
+                # 后六个是 **blue/green 的（Phase B）**，**故意先于代码进来**
+                # （Ruling 39）：发版 `PublishVersion`、两个固定 alias 的
+                # `CreateAlias`/`UpdateAlias`、判当前颜色的 `GetAlias`、健康门带
+                # Qualifier 直调新版本的 `InvokeFunction`、旧版本清理前列举的
+                # `ListVersionsByFunction`。**为什么不等 B1 一起加**：moto 不校验
+                # IAM ⇒ B1-B6 的单测会全绿地做完，直到 C1 在真机上 AccessDenied
+                # 全线失败（CLAUDE.md 点名的那条陷阱）。两条 CDK 断言看着这件事：
+                # 一条从 functions/*.py 的实际调用反推所需动作、要求本列表是超集
+                # （新调用不同步 IAM 就红），一条在调用落地前先把这六个钉住。
+                #
+                # **补这六个不放大控制面风险**：资源仍限 `function:site-*`，而下面
+                # 那条 Deny 用**精确平台名**盖住带/不带限定符两种 ARN 形态，且
+                # `test_deployer_cannot_touch_platform_functions` 会从本列表推导
+                # 动作集、要求同一条 Deny 全覆盖 ⇒ 这里加动作而 Deny 没跟上就红。
+                # InvokeFunction 尤其要靠那条 Deny：否则部署器能直调 site-panel。
                 actions=["lambda:CreateFunction", "lambda:UpdateFunctionCode",
                          "lambda:UpdateFunctionConfiguration", "lambda:GetFunction",
                          "lambda:GetFunctionConfiguration",
@@ -342,7 +358,10 @@ class SiteDeployerStack(Stack):
                          "lambda:AddPermission", "lambda:RemovePermission",
                          "lambda:DeleteFunction",
                          "lambda:DeleteFunctionUrlConfig", "lambda:GetLayerVersion",
-                         "lambda:TagResource"],
+                         "lambda:TagResource",
+                         "lambda:PublishVersion", "lambda:CreateAlias",
+                         "lambda:UpdateAlias", "lambda:GetAlias",
+                         "lambda:InvokeFunction", "lambda:ListVersionsByFunction"],
                 resources=[f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:site-*",
                            "arn:aws:lambda:us-east-1:753240598075:layer:LambdaAdapterLayerX86:28"]),
             iam.PolicyStatement(  # 仅 CreateRole 强制 boundary：iam:PermissionsBoundary 这个

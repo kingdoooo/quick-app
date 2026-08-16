@@ -793,6 +793,179 @@ def test_deployer_cannot_touch_platform_functions(template):
     assert not wild, f"Deny 用了通配——会误伤真实站点：{wild}"
 
 
+# ── B0: exec_role 的 lambda 动作要覆盖 functions/ 实际调用的每个 API ──────
+# boto3 方法名 → IAM 动作的**已知命名不规则**（其余按 snake_case → PascalCase 机械
+# 映射）。这张表不是偷懒，每条都有依据：
+#   · `invoke`     → InvokeFunction（方法名与动作名不同）
+#   · `get_waiter("function_updated"/"function_active")` 实际轮询的是
+#     GetFunctionConfiguration（**不是** GetFunction）——app.py 那条既有注释记着这个
+#     实测教训：缺它每次部署都 AccessDenied
+#   · `get_paginator("x")` → 按它的字符串参数解（`list_versions_by_function` 这种）
+#   · `exceptions` 是属性访问，不是 API
+LAMBDA_CALL_TO_ACTION = {
+    "invoke": "lambda:InvokeFunction",
+    "get_waiter": "lambda:GetFunctionConfiguration",
+    "get_paginator": None,
+    "exceptions": None,
+}
+
+# Phase B（blue/green）会用到、但**调用还没写进 functions/** 的动作。真源是
+# B1-B6 的 brief，不是代码——所以这张表是手抄的，且必须手抄：上面那条采集式守卫
+# 只看得见"已经写下来的调用"，而这六个动作要**先于**代码进 IAM，否则 B1-B6 全绿地
+# 做完再在真机上 AccessDenied（moto 不校验 IAM）。等 B1-B6 的调用落地后，采集式
+# 守卫会自动接管这六项，本表就退化成一条冗余的双保险。
+PHASE_B_BLUE_GREEN_ACTIONS = {
+    "lambda:GetAlias",                  # B1:77-81 / B4:58 / B5:39 判当前颜色
+    "lambda:PublishVersion",            # B1:90 / B5:47 发版
+    "lambda:CreateAlias",               # B2 首次建两个固定 alias
+    "lambda:UpdateAlias",               # B2 切色、B4 回滚
+    "lambda:InvokeFunction",            # B1:174 健康门直调（带 Qualifier）
+    "lambda:ListVersionsByFunction",    # B4:108 旧版本清理前的列举
+}
+
+
+def _pascal(snake: str) -> str:
+    return "".join(part.title() for part in snake.split("_"))
+
+
+def _is_lambda_client_call(node) -> bool:
+    """`boto3.client("lambda")`。"""
+    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "client"
+            and getattr(node.func.value, "id", None) == "boto3"
+            and bool(node.args) and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value == "lambda")
+
+
+def _lambda_client_names(tree) -> tuple[set[str], set[str]]:
+    """这个模块里 lambda 客户端的两种拿法 → (变量名集合, 工厂函数名集合)。
+
+    **名字不写死**（本仓库当下是 `def _lambda(): return boto3.client("lambda")` 再
+    `lam = _lambda()`，但那是可以改的）：先找出返回 lambda 客户端的工厂函数，再收集
+    直接赋值与"赋值 = 调用那个工厂"两种绑定。写死 `lam` 的话，改个变量名就会让这条
+    守卫静默退化成恒真。
+
+    工厂名也一并返回：`_lambda().get_function(...)` 这种不落变量的写法同样要算进来
+    ——只认变量名的话，把调用改成直接链在工厂上就能绕过整条守卫，而那正是最自然的
+    重构之一。
+    """
+    factories = {node.name for node in ast.walk(tree)
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                 and any(_is_lambda_client_call(n.value)
+                         for n in ast.walk(node) if isinstance(n, ast.Return))}
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        v = node.value
+        if _is_lambda_client_call(v) or (
+                isinstance(v, ast.Call)
+                and getattr(v.func, "id", None) in factories):
+            names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+    return names, factories
+
+
+def _receiver_is_lambda_client(value, clients: set[str], factories: set[str]) -> bool:
+    """`<recv>.method(...)` 里的 `<recv>` 是不是 lambda 客户端。
+
+    三种形态：变量（`lam`）、直接工厂调用（`_lambda()`）、就地 boto3 调用
+    （`boto3.client("lambda")`）。
+    """
+    if isinstance(value, ast.Name):
+        return value.id in clients
+    if isinstance(value, ast.Call):
+        return (getattr(value.func, "id", None) in factories
+                or _is_lambda_client_call(value))
+    return False
+
+
+def _lambda_actions_called_in(src: str) -> set[str]:
+    """一个 `functions/*.py` 里对 lambda 客户端发起的调用 → 需要的 IAM 动作集合。"""
+    tree = ast.parse(src)
+    clients, factories = _lambda_client_names(tree)
+    out: set[str] = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and _receiver_is_lambda_client(node.func.value, clients, factories)):
+            continue
+        method = node.func.attr
+        if method in LAMBDA_CALL_TO_ACTION:
+            mapped = LAMBDA_CALL_TO_ACTION[method]
+            if mapped:
+                out.add(mapped)
+            elif method == "get_paginator" and node.args \
+                    and isinstance(node.args[0], ast.Constant):
+                out.add(f"lambda:{_pascal(node.args[0].value)}")
+            continue
+        out.add(f"lambda:{_pascal(method)}")
+    return out
+
+
+def _exec_role_lambda_allows(template) -> set[str]:
+    """模板里 exec_role 被 Allow 的 lambda 动作集（`lambda:*`/`*` 原样留着）。"""
+    return {a for st in _exec_role_statements(template)
+            if st.get("Effect", "Allow") == "Allow"
+            for a in _as_list(st.get("Action", []))
+            if isinstance(a, str) and (a == "*" or a.startswith("lambda:"))}
+
+
+def test_exec_role_can_do_every_lambda_call_the_functions_actually_make(template):
+    """**期望值从 `functions/*.py` 实际调用的 API 推导**，不是手抄一份动作清单。
+
+    这条守卫挡的是本仓库记过的那一整类："moto 不校验 IAM ⇒ 漏给权限时单测全绿、
+    真机 500"。单测直接调 handler、moto 不看角色，所以"这个调用有没有权限"在整个
+    单测层面**没有任何东西在看**——只有从调用点反推、再跟模板对账才看得见。
+
+    抓得到：给 deployer 新增任何一个 lambda API 调用而没同步 exec_role。
+    抓不到：调用名是变量拼出来的（`getattr(lam, op)`）——那种写法本仓库没有，
+    出现时这条会漏，所以**不许**那样写。
+
+    **本条今天是绿的，而且这就是对的**：blue/green 那六个调用还没写进 functions/
+    （B1-B6 才落地），所以今天的 needed 全都已经被授予。它的价值在 B1-B6：那时新
+    调用一进来，没同步 IAM 就会红。它有牙这件事由注入验证（临时加一句
+    `put_function_concurrency` ⇒ 报缺 PutFunctionConcurrency），不是由"今天就红"。
+    """
+    fn_dir = Path(__file__).parents[1] / "functions"
+    per_file = {p.name: _lambda_actions_called_in(p.read_text(encoding="utf-8"))
+                for p in sorted(fn_dir.glob("*.py"))}
+    needed = set().union(*per_file.values())
+    # 空转防护：采集器坏掉（变量名换了、客户端换了拿法）时 needed 会变空，而
+    # 空集是任何东西的子集 ⇒ 断言恒真。所以先要求它非空，再要求它被覆盖。
+    assert needed, ("从 functions/*.py 抽不到任何 lambda 调用——采集器坏了（本条已"
+                    "退化成恒真）。先查 _lambda_client_names 认不认现在的拿法")
+    assert len(needed) >= 5, f"只抽到 {sorted(needed)}——太少，像是采集只命中了一处"
+
+    granted = _exec_role_lambda_allows(template)
+    if "*" in granted or "lambda:*" in granted:
+        return          # 全给了（本仓库不这么做，但别在这里误报）
+    missing = needed - granted
+    assert not missing, (
+        f"functions/ 里调了这些 lambda API 而 exec_role 没授权：{sorted(missing)}"
+        f"\n调用出处：{ {k: sorted(v & missing) for k, v in per_file.items() if v & missing} }"
+        "\nmoto 不校验 IAM ⇒ 单测会全绿，真机 AccessDenied")
+
+
+def test_exec_role_has_the_lambda_actions_phase_b_blue_green_will_need(template):
+    """六个 blue/green 动作**先于代码**进 IAM，所以要单独钉一次（Ruling 39）。
+
+    上面那条采集式守卫看不见它们：`get_alias` / `publish_version` / `create_alias` /
+    `update_alias` / `invoke(Qualifier=…)` / `list_versions_by_function` 的调用点在
+    B1-B6 才写进 `functions/`，今天 needed 里没有 ⇒ 今天删掉其中任何一个动作，所有
+    测试照绿，而 B1-B6 依然会做完再在 C1 真机上 AccessDenied。这条把那个窗口关上。
+
+    真源是 B1-B6 的 brief（`PHASE_B_BLUE_GREEN_ACTIONS` 上方逐条注了出处），不是
+    `app.py`——所以它不与被测代码同源。等那六个调用落地后本条变成冗余双保险，
+    采集式守卫会自动接管。
+    """
+    granted = _exec_role_lambda_allows(template)
+    if "*" in granted or "lambda:*" in granted:
+        return
+    missing = PHASE_B_BLUE_GREEN_ACTIONS - granted
+    assert not missing, (
+        f"exec_role 缺 blue/green 要用的动作：{sorted(missing)}——Phase B 的任务会在"
+        "单测里全绿（moto 不校验 IAM），然后在真机上 AccessDenied")
+
+
 PLATFORM_FN_RE = re.compile(r"site-[a-z0-9-]+")
 
 # 平台 Lambda 的**创建方**（= 名字的真源）里，本栈之外的那三个部署脚本。
