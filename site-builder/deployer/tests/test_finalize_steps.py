@@ -771,3 +771,216 @@ def test_register_route_does_not_commit_when_snapshot_read_fails(aws, monkeypatc
     assert ddb.get_item(TableName="routing",
                         Key={"subdomain": {"S": "app-s-1"}})["Item"] == old, \
         "快照读失败了，但路由已经被切走了"
+
+
+# ── B4: 失败恢复路由（三态）+ 版本清理 ───────────────────────────────────
+#
+# **`previous_route` 是三态契约，不是"有/没有"**（register_route 那段注释写了，
+# 这里按它测）：
+#   · 键**不在**      = register_route 还没提交 ⇒ 线上从未变过，动它才是制造故障；
+#   · 键在、值 None   = 提交过，但切换前没有路由（首次部署）⇒ 该把刚写的那条删掉；
+#   · 键在、值是 item = 提交过且有上一版 ⇒ 整值写回。
+# 写成 `if not prev: return` 会把前两态合并 —— 首次部署失败时那条指向失败站点的
+# 路由会**留在线上**，子域名被一个 FAILED 的部署占住。
+
+def _routing_item(site_id="s-1"):
+    import os
+
+    import boto3
+    return boto3.client("dynamodb").get_item(
+        TableName=os.environ["ROUTING_TABLE"],
+        Key={"subdomain": {"S": f"app-{site_id}"}}).get("Item")
+
+
+def _put_routing(item):
+    import os
+
+    import boto3
+    boto3.client("dynamodb").put_item(
+        TableName=os.environ["ROUTING_TABLE"], Item=item)
+
+
+def _lam_versions_mock(versions, aliases, *, alias_error=None):
+    """lambda 替身：`list_versions_by_function` 返回 `versions`，两个颜色的
+    alias 指向 `aliases`（缺的颜色抛 ResourceNotFoundException）。
+
+    `alias_error`: 给 get_alias 注入一个**别的**异常类型，用来验"查不到 alias
+    的原因不是'该色不存在'时，清理必须整体放弃"——不放弃就可能删掉线上正在用的
+    那个版本。
+    """
+    lam = MagicMock()
+    lam.exceptions.ResourceNotFoundException = type(
+        "ResourceNotFoundException", (Exception,), {})
+    lam.get_paginator.return_value.paginate.return_value = [
+        {"Versions": [{"Version": v} for v in versions]}]
+
+    def _get_alias(FunctionName, Name):
+        if alias_error is not None:
+            raise alias_error
+        if Name in aliases:
+            return {"FunctionVersion": aliases[Name]}
+        raise lam.exceptions.ResourceNotFoundException()
+    lam.get_alias.side_effect = _get_alias
+    return lam
+
+
+def _deleted_qualifiers(lam):
+    return [c.kwargs.get("Qualifier") for c in lam.delete_function.call_args_list]
+
+
+def test_failed_job_restores_the_previous_route_item(aws):
+    """提交点之后失败（如 smoke 红）⇒ 路由**整值**写回切换前。
+
+    断言整值相等而不是逐字段：`_old_route` 里的 `legacy_marker` 是恢复方没有理由
+    知道的字段，逐字段写回会把它丢掉，而 Edge 对缺失字段是按默认值回落 = 一次
+    静默的策略变更。
+    """
+    import common
+    import mark_job
+    job_id = common.create_job("a@x.com", "s-1")
+    prev = _old_route("s-1")
+    # 线上当前是这次部署刚切过去的那条（green + 新前缀）
+    _put_routing({"subdomain": {"S": "app-s-1"},
+                  "api_target": {"S": "https://g.lambda-url.us-east-1.on.aws"},
+                  "static_prefix": {"S": f"sites/s-1/{job_id}"}})
+    mark_job.handler({"job_id": job_id, "site_id": "s-1",
+                      "previous_route": prev,
+                      "error_info": {"Cause": "smoke failed"}}, None)
+    assert _routing_item("s-1") == prev
+
+
+def test_failed_job_without_snapshot_does_not_touch_route(aws, monkeypatch):
+    """健康门在切路由之前失败 ⇒ 快照那个**键根本不在** ⇒ 一次路由写都不许有。
+
+    断言"没有写"而不是"值没变"：值没变也可能是写了一条一模一样的回去，而那在真机
+    上会推进 Edge 的缓存与 DynamoDB 的写指标，也会让"提交点只有一次写"不再成立。
+    """
+    import common
+    import mark_job
+    job_id = common.create_job("a@x.com", "s-1")
+    live = {"subdomain": {"S": "app-s-1"},
+            "api_target": {"S": "https://b.lambda-url.us-east-1.on.aws"}}
+    _put_routing(live)
+    calls = _spy_dynamodb(monkeypatch)
+    mark_job.handler({"job_id": job_id, "site_id": "s-1",
+                      "error_info": {"Cause": "BackendUnhealthy"}}, None)
+    assert _routing_writes(calls) == []
+    assert _routing_item("s-1") == live
+
+
+def test_failed_first_deploy_removes_the_route_it_just_created(aws):
+    """键在、值是 None = 提交过但切换前没有路由（首次部署）⇒ 删掉刚写的那条。
+
+    这一态 brief 漏了，而它正是 `if not prev: return` 会吃掉的那个：合并成"没快照
+    就什么都不做"的话，一个 FAILED 的首次部署会把子域名留在线上指向自己——用户拿到
+    的 URL 打开是一个部署失败的站点，而不是 404。
+    """
+    import common
+    import mark_job
+    job_id = common.create_job("a@x.com", "s-1")
+    _put_routing({"subdomain": {"S": "app-s-1"},
+                  "api_target": {"S": "https://b.lambda-url.us-east-1.on.aws"},
+                  "static_prefix": {"S": f"sites/s-1/{job_id}"}})
+    mark_job.handler({"job_id": job_id, "site_id": "s-1",
+                      "previous_route": None,
+                      "error_info": {"Cause": "smoke failed"}}, None)
+    assert _routing_item("s-1") is None, \
+        "首次部署失败后那条路由还在——子域名被一个 FAILED 的部署占着"
+
+
+def test_cleanup_keeps_alias_referenced_and_recent_versions(aws):
+    """健康门失败留下的版本不许永久堆积；两个 alias 引用的版本必须留。"""
+    import mark_job
+    lam = _lam_versions_mock(["$LATEST", "1", "2", "3", "4", "5"],
+                             {"blue": "5", "green": "2"})
+    with patch.object(mark_job, "_lambda", return_value=lam):
+        mark_job._cleanup_versions("s-1")
+    deleted = set(_deleted_qualifiers(lam))
+    assert "5" not in deleted and "2" not in deleted and "$LATEST" not in deleted
+    assert "1" in deleted
+    # 最近 N 个也要留：3/4 虽然没人引用，但它们是回滚的落点
+    assert {"3", "4"} & deleted == set()
+
+
+def test_cleanup_treats_a_missing_color_as_nothing_to_keep(aws):
+    """只建了一个颜色的站点（迁移中）：另一色的 get_alias 抛
+    ResourceNotFoundException，那条 except **必须真的被执行到**（Ruling 58），
+    且清理照常进行。"""
+    import mark_job
+    lam = _lam_versions_mock(["$LATEST", "1", "2", "3", "4", "5"],
+                             {"blue": "5"})            # green 不存在
+    with patch.object(mark_job, "_lambda", return_value=lam):
+        mark_job._cleanup_versions("s-1")
+    assert lam.get_alias.call_count == 2, "两个颜色都要查——少查一个就等于少留一个"
+    deleted = set(_deleted_qualifiers(lam))
+    assert "5" not in deleted                       # blue 引用
+    assert {"1", "2"} <= deleted                    # green 不存在 ⇒ 2 不再被引用
+    assert {"3", "4"} & deleted == set()
+
+
+def test_cleanup_aborts_when_an_alias_lookup_fails_for_any_other_reason(aws):
+    """**查不到 alias 的原因不是"该色不存在"时，整体放弃清理。**
+
+    这是删除类操作唯一安全的方向：一次限流/超时会让 keep 集合少一个版本，而那个
+    版本可能正是**线上 alias 指着的**那个——删掉它，正在服务的站点立刻 500。
+    宽 `except Exception: pass` 恰好把这两种原因混成一种（brief 里就是这么写的）。
+    """
+    import mark_job
+    lam = _lam_versions_mock(["$LATEST", "1", "2", "3", "4", "5"],
+                             {"blue": "5", "green": "2"},
+                             alias_error=RuntimeError("Throttling"))
+    with patch.object(mark_job, "_lambda", return_value=lam):
+        mark_job._cleanup_versions("s-1")           # 只告警，不抛
+    lam.delete_function.assert_not_called()
+
+
+def test_cleanup_never_deletes_the_function_itself(aws):
+    """`delete_function` **不带 Qualifier 就是删整个函数**——站点当场消失。
+
+    所以每一次调用都必须带一个纯数字的 Qualifier。版本号来自 API，理论上就是数字，
+    但这条断言的代价接近零，而它挡住的是本仓库里破坏性最强的一次误操作。
+    """
+    import mark_job
+    lam = _lam_versions_mock(["$LATEST", "1", "2", "3", "4", "5", "bogus"],
+                             {"blue": "5", "green": "2"})
+    with patch.object(mark_job, "_lambda", return_value=lam):
+        mark_job._cleanup_versions("s-1")
+    quals = _deleted_qualifiers(lam)
+    assert quals, "一个版本都没删——本条已空转"
+    for q in quals:
+        assert q is not None and str(q).isdigit(), \
+            f"delete_function 的 Qualifier 是 {q!r}——不带/非版本号会删掉整个函数"
+
+
+def test_cleanup_keeps_the_version_this_job_just_deployed(aws):
+    """B2 产出的 `deploy_version` 在这里被消费：**无论 alias 怎么读，刚部署的那个
+    版本都不删**。
+
+    为什么需要它：alias 的读与"刚把 alias 指过去"之间有一个瞬间，读到旧值时 keep
+    里就没有本次的版本号，而它恰好可能落在"没人引用且不在最近 N 个"里 ⇒ 被删。
+    传进来的这一个是不依赖读一致性的兜底。
+    """
+    import mark_job
+    lam = _lam_versions_mock(["$LATEST", "1", "2", "3", "4", "5", "6"],
+                             {"blue": "6", "green": "2"})
+    with patch.object(mark_job, "_lambda", return_value=lam):
+        mark_job._cleanup_versions("s-1", keep_extra=("3",))
+    deleted = set(_deleted_qualifiers(lam))
+    assert "3" not in deleted, "刚部署的版本被删了"
+    assert "1" in deleted, "本条已空转——没有任何版本被删，说明 keep 把全部吃掉了"
+
+
+def test_success_path_cleans_versions_with_the_deployed_version_kept(aws):
+    """handler 成功分支真的会调清理，且把 deploy_version 传下去——否则上一条
+    只测了一个没人调用的函数。"""
+    import common
+    import mark_job
+    job_id = common.create_job("a@x.com", "s-1")
+    ev = {"job_id": job_id, "site_id": "s-1", "url": "https://app-s-1.example.com",
+          "deploy_color": "green", "deploy_version": "7",
+          "manifest": {"name": "n", "tier": "static"}}
+    with patch.object(mark_job, "_cleanup_versions") as cv:
+        mark_job.handler(ev, None)
+    cv.assert_called_once()
+    assert cv.call_args.args[0] == "s-1"
+    assert "7" in tuple(cv.call_args.kwargs.get("keep_extra", ()))
