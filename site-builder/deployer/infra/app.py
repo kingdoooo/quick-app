@@ -59,10 +59,14 @@ def _validate_const(name: str, kind=str):
 # 一条式子上，调大上界不同时调大磁盘 ⇒ CDK 断言红
 # （test_validate_disk_covers_the_unpacked_size_limit），同 rollup 的
 # SCAN_WORKERS ↔ 内存那条。
-# 2 倍余量的理由：那道预检查看的是 zip 里**声明的** file_size，落盘的却是实际
-# 写出的字节——刚好卡在声明值上时，症状会从 ContractViolation（说得清是用户包
+# **2 倍是两项之和**，不是拍出来的余量：/tmp 上同时有解包出来的整棵树，以及
+# `_pack_build_input` 重新打包出来的工件（run.sh + backend/ 子集，最坏情况几乎
+# 与树同量级——已压缩过的资产再压不动）。二者各 ≤ 上界 ⇒ 下界 = 上界 × 2。
+# 顺带的余量也用得上：那道上界预检查看的是 zip 里**声明的** file_size，落盘的却是
+# 实际写出的字节，刚好卡在声明值上时症状会从 ContractViolation（说得清是用户包
 # 太大）退化成 ENOSPC（读起来像平台故障）。
-# 只算解包树：下载缓冲与 _pack_build_input 重新打的 zip 都在内存里，不占 /tmp。
+# 内存那条轴**本常量管不到**：下载下来的上传包与 extracted/ 循环里当下那个文件
+# 都在内存里，而 step_fn 给的是 memory_size=512（M7 遗留项，另有跟进任务）。
 VALIDATE_EPHEMERAL_MB = 1024
 
 EDGE_LOG_GROUP_PREFIX = _rollup_const("EDGE_LOG_GROUP_PREFIX")

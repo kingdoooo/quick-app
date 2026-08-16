@@ -201,6 +201,63 @@ def test_static_site_writes_no_build_artifact(aws):
     assert err.value.response["Error"]["Code"] == "NoSuchKey"
 
 
+def test_build_artifact_streams_from_disk_instead_of_memory(aws, monkeypatch):
+    """重新打包出来的工件必须**落到 /tmp 再流式上传**，不许整份常驻内存。
+
+    A2 引入这份重新打包时它是 `io.BytesIO`：峰值内存于是同时有下载下来的上传包
+    **与**这个 zip 两份全尺寸副本（M7 之前只有前者），而 validate 的 memory_size
+    是 512MB。磁盘那侧已经由 CDK 断言按解包上界定过尺寸
+    （`VALIDATE_EPHEMERAL_MB`），所以正确的落点是磁盘而不是内存。
+
+    断言的是**机制**不是"内存用了多少"：后者在单测里量不出来，而机制退化
+    （`Body=` 又变回 bytes / BytesIO）恰好就是复发形态。`.name` 指向一个当场
+    存在的真文件，是"落盘"与"BytesIO 冒充流"的分水岭。
+    """
+    import boto3, validate, common
+    from pathlib import Path
+    jid = common.create_job("a@x.com", "stream-x1")
+    _upload_site_zip(jid, FULLSTACK_MANIFEST, GOOD_BACKEND)
+    key = validate.validated_key(jid)
+    seen, real_client = {}, boto3.client
+
+    class _Spy:
+        """只在写工件那一次记下 Body 的形态，其余一律透传。"""
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        def put_object(self, **kw):
+            if kw.get("Key") == key:
+                body = kw["Body"]
+                name = getattr(body, "name", None)
+                seen.update(type_=type(body), readable=hasattr(body, "read"),
+                            name=name,
+                            on_disk=bool(name) and Path(name).is_file())
+            return self._inner.put_object(**kw)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    def _client(svc, *a, **kw):
+        c = real_client(svc, *a, **kw)
+        return _Spy(c) if svc == "s3" else c
+
+    monkeypatch.setattr(validate.boto3, "client", _client)
+    validate.handler({"job_id": jid, "site_id": "stream-x1"}, None)
+
+    assert seen, f"没有任何一次 put_object 写到 {key}——本条空转"
+    assert not issubclass(seen["type_"], (bytes, bytearray, io.BytesIO)), (
+        f"工件是整份内存副本（Body={seen['type_'].__name__}）——要的是落盘后的文件流")
+    assert seen["readable"], seen
+    assert seen["on_disk"], (
+        f"Body 不是磁盘上的文件（name={seen['name']!r}）——BytesIO 也有 read()，"
+        "只有 .name 指向真文件才证明这份 zip 没在内存里")
+    # 落盘之后内容仍要对：流式上传最容易的错法是传了个没 seek 回 0 的句柄 ⇒ 空对象
+    got = boto3.client("s3").get_object(Bucket="site-artifacts-1", Key=key)["Body"].read()
+    with zipfile.ZipFile(io.BytesIO(got)) as z:
+        assert sorted(z.namelist()) == ["backend/app.js", "run.sh"], z.namelist()
+
+
 def test_buildspec_and_iam_name_the_validated_prefix_only():
     """三处命名同一前缀（validate.py / buildspec / CDK IAM），按真源核对。
 

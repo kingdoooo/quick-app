@@ -672,13 +672,16 @@ def test_validate_disk_covers_the_unpacked_size_limit(template):
     """磁盘下界由**合同的解包上界**决定：`extractall` 把整棵树写进 `/tmp`
     （`TemporaryDirectory()` 在 Lambda 上就落那里）。改上界不同时改磁盘 ⇒ 本条红。
 
-    **留 2 倍而不是刚好等于上界**：那道上界预检查的是 zip 中央目录里**声明的**
-    `file_size`，而真正落盘的是 `extractall` 实际写出的字节，两者不必相等
-    （CRC 不符要等写完才发现）。磁盘刚好卡在声明值上时，症状会从
-    `ContractViolation`（说得清是用户包太大）退化成 ENOSPC（读起来像平台故障）。
+    **2 倍是两项之和**：/tmp 上同时有 `extractall` 解出来的整棵树，与
+    `_pack_build_input` 重新打包出来的工件（run.sh + backend/ 子集，最坏情况几乎
+    与树同量级——已压缩过的资产再压不动）。二者各 ≤ 上界 ⇒ 下界 = 上界 × 2。
+    顺带的余量也用得上：那道上界预检查的是 zip 中央目录里**声明的** `file_size`，
+    而真正落盘的是实际写出的字节，两者不必相等（CRC 不符要等写完才发现）；磁盘
+    刚好卡在声明值上时，症状会从 `ContractViolation`（说得清是用户包太大）退化成
+    ENOSPC（读起来像平台故障）。
 
-    只算解包树：下载缓冲与 `_pack_build_input` 重新打的那个 zip 都在**内存**里
-    （两处都是 `io.BytesIO`），不占 /tmp。
+    **本条只绑磁盘这一条轴。** 内存那条轴（下载下来的上传包 + extracted/ 循环里
+    当下那个文件）没有任何常量绑着，是 M7 的遗留项，另有跟进任务。
     """
     import app as appmod
     limit_mb = appmod._validate_const("MAX_UNPACKED_BYTES", int) // (1024 * 1024)
