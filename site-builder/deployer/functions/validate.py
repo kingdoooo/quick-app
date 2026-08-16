@@ -31,15 +31,25 @@ def _pack_build_input(root: Path) -> bytes:
 
     不是重新读一遍上传 key ⇒ 不存在"校验的字节"与"构建的字节"不同的窗口（P1-1）。
     只打 run.sh + backend/：buildspec 也只用这两样，前端与 site.json 不进构建容器。
+
+    没有任何构建输入（static tier）时返回 `b""` 这个哨兵，调用方据此**不写对象**。
+    "空"必须由条目数判定再编码成 `b""`，不能让调用方直接对打包结果做真值判断：
+    零条目的 zip 自身就是 22 字节的合法 zip（只有 EOCD 记录），恒为真。留下这种空对象
+    会让"validated/ 下有对象"不再等价于"有东西要构建"。
     """
+    members = []
+    for p in sorted(root.rglob("*")):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(root).as_posix()
+        if rel == "run.sh" or rel.startswith("backend/"):
+            members.append((p, rel))
+    if not members:
+        return b""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for p in sorted(root.rglob("*")):
-            if not p.is_file():
-                continue
-            rel = p.relative_to(root).as_posix()
-            if rel == "run.sh" or rel.startswith("backend/"):
-                z.write(p, rel)
+        for p, rel in members:
+            z.write(p, rel)
     return buf.getvalue()
 
 
@@ -104,8 +114,12 @@ def handler(event, context):
                               Key=f"extracted/{job_id}/{p.relative_to(root)}",
                               Body=p.read_bytes())
 
-        # CodeBuild 的唯一输入。**必须在校验全部通过之后写**。
-        s3.put_object(Bucket=bucket, Key=validated_key(job_id),
-                      Body=_pack_build_input(root))
+        # CodeBuild 的唯一输入。**必须在校验全部通过之后写**——提到校验之前，
+        # 失败的运行就会覆盖上一次的好工件
+        # （test_validation_failure_writes_no_build_artifact 锁死）。
+        build_input = _pack_build_input(root)
+        if build_input:      # static tier 没有构建输入，不留空对象
+            s3.put_object(Bucket=bucket, Key=validated_key(job_id),
+                          Body=build_input)
 
     return {"job_id": job_id, "site_id": site_id, "manifest": manifest}

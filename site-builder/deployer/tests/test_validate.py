@@ -21,6 +21,18 @@ GOOD_MANIFEST = {"name": "hello", "tier": "static",
                  "database": {"engine": "none"},
                  "auth": {"require_login": False, "allowed_users": "org"}}
 
+# 需要"打包结果非空"的用例都用它：static 树没有 run.sh/backend/，打出来是空包
+# 而空包根本不写对象，于是"validated/ 下没有对象"在 static 上恒成立——拿 static
+# 去断言"失败不写工件"会与那条跳过逻辑同谋成恒真。
+FULLSTACK_MANIFEST = {"name": "fullstack", "tier": "fullstack-nosql",
+                      "database": {"engine": "dynamodb",
+                                   "tables": [{"name": "t", "pk": "id"}]},
+                      "backend": {"runtime": "nodejs22.x",
+                                  "entrypoint": "node app.js", "port": 8080},
+                      "auth": {"require_login": False, "allowed_users": "org"}}
+GOOD_BACKEND = {"run.sh": "#!/bin/sh\nnode app.js\n",
+                "backend/app.js": "// GET /api/health\nok()"}
+
 
 def test_valid_static_site_passes(aws):
     import validate, common
@@ -99,36 +111,110 @@ def test_codebuild_input_is_immune_to_upload_swap(aws):
     import io, zipfile, boto3, validate, common
     s3 = boto3.client("s3")
     jid = common.create_job("a@x.com", "swap-x1")
-    good = {"name": "swap", "tier": "fullstack-nosql",
-            "database": {"engine": "dynamodb", "tables": [{"name": "t", "pk": "id"}]},
-            "backend": {"runtime": "nodejs22.x", "entrypoint": "node app.js", "port": 8080},
-            "auth": {"require_login": False, "allowed_users": "org"}}
-    _upload_site_zip(jid, good, {"run.sh": "#!/bin/sh\nnode app.js\n",
-                                 "backend/app.js": "// GET /api/health\nok()",
-                                 "frontend/index.html": "<h1>hi</h1>"})
+    _upload_site_zip(jid, FULLSTACK_MANIFEST,
+                     {**GOOD_BACKEND, "frontend/index.html": "<h1>hi</h1>"})
     validate.handler({"job_id": jid, "site_id": "swap-x1"}, None)
     key = validate.validated_key(jid)
     before = s3.get_object(Bucket="site-artifacts-1", Key=key)["Body"].read()
 
-    _upload_site_zip(jid, good, {"run.sh": "#!/bin/sh\nnode app.js\n",
-                                 "backend/app.js": "res.cookie('s', x)  // GET /api/health"})
+    # 换包之后**必须真的再跑一次 handler**：只在换包前后各读一次，两次之间没有任何
+    # 写入者，`after == before` 恒成立——那样这条断言在任何实现下都不会红。让失败的
+    # 那一次运行真的发生，它才咬得住"校验失败不许动已有工件"。
+    _upload_site_zip(jid, FULLSTACK_MANIFEST,
+                     {**GOOD_BACKEND,
+                      "backend/app.js": "res.cookie('s', x)  // GET /api/health"})
+    with pytest.raises(validate.ContractViolation) as ei:
+        validate.handler({"job_id": jid, "site_id": "swap-x1"}, None)
+    # 换上去的那份确实**是**红线违规（res.cookie ⇒ 站点自带 auth），不是随便一个错：
+    # 否则"第二次跑失败了"可能只是因为包坏了，证不到本例想证的东西。
+    assert "auth 逻辑" in str(ei.value)
+
     after = s3.get_object(Bucket="site-artifacts-1", Key=key)["Body"].read()
-    assert after == before, "validated/ 工件被上传覆盖影响了"
+    assert after == before, "校验失败的那次运行覆盖了已有的 validated/ 工件"
     with zipfile.ZipFile(io.BytesIO(after)) as z:
         assert "res.cookie" not in z.read("backend/app.js").decode()
         assert sorted(z.namelist()) == ["backend/app.js", "run.sh"]  # 前端不进构建容器
 
 
-def test_buildspec_and_iam_name_the_validated_prefix_only(aws):
-    """三处命名同一前缀（validate.py / buildspec / CDK IAM），按真源核对。"""
+def test_successful_run_reads_the_upload_exactly_once(aws, monkeypatch):
+    """打包只能来自已解包并扫描过的那棵树。哪天改回"在 put 时重新 get 一遍上传
+    key"（P1-1 最可能的复发形态），get_object 就会变成两次——按次数锁死。"""
+    import boto3, validate, common
+    jid = common.create_job("a@x.com", "once-x1")
+    _upload_site_zip(jid, FULLSTACK_MANIFEST, GOOD_BACKEND)
+    reads, real_client = [], boto3.client
+
+    class _Spy:
+        """只拦 get_object 记 key，其余一律透传给真客户端。"""
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        def get_object(self, **kw):
+            reads.append(kw["Key"])
+            return self._inner.get_object(**kw)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    def _client(svc, *a, **kw):
+        c = real_client(svc, *a, **kw)
+        return _Spy(c) if svc == "s3" else c   # common 走 boto3.resource，不受影响
+
+    monkeypatch.setattr(validate.boto3, "client", _client)
+    validate.handler({"job_id": jid, "site_id": "once-x1"}, None)
+    assert reads == [f"uploads/{jid}.zip"]
+
+
+def test_validation_failure_writes_no_build_artifact(aws):
+    """工件必须在**全部**校验通过之后才写：把 put_object 提到 scan_redlines 之前，
+    整个套件仍会绿（既有违规用例只断 raises，不看 validated/）——本例补上那一刀。
+
+    用 fullstack 树是必需的：static 打出来是空包、本就不写对象，拿它断言"失败不写"
+    会与那条跳过逻辑同谋成恒真。"""
+    import botocore.exceptions, boto3, validate, common
+    jid = common.create_job("a@x.com", "nowrite-x1")
+    _upload_site_zip(jid, FULLSTACK_MANIFEST, {
+        **GOOD_BACKEND,
+        "frontend/index.html": "<script>fetch('http://localhost:8080/api/x')</script>"})
+    with pytest.raises(validate.ContractViolation) as ei:
+        validate.handler({"job_id": jid, "site_id": "nowrite-x1"}, None)
+    assert "localhost" in str(ei.value)
+    with pytest.raises(botocore.exceptions.ClientError) as err:
+        boto3.client("s3").get_object(Bucket="site-artifacts-1",
+                                      Key=validate.validated_key(jid))
+    assert err.value.response["Error"]["Code"] == "NoSuchKey"
+
+
+def test_static_site_writes_no_build_artifact(aws):
+    """static 没有 run.sh/backend/ ⇒ 没有构建输入，不该产出工件。
+
+    空 zip 也是**合法** zip（22 字节 EOCD），照写会让"validated/ 下有对象"不再
+    等价于"有东西要构建"，上面那条失败用例也就失去信号。"""
+    import botocore.exceptions, boto3, validate, common
+    jid = common.create_job("a@x.com", "staticnb-x1")
+    _upload_site_zip(jid, GOOD_MANIFEST, {"frontend/index.html": "<h1>hi</h1>"})
+    validate.handler({"job_id": jid, "site_id": "staticnb-x1"}, None)
+    with pytest.raises(botocore.exceptions.ClientError) as err:
+        boto3.client("s3").get_object(Bucket="site-artifacts-1",
+                                      Key=validate.validated_key(jid))
+    assert err.value.response["Error"]["Code"] == "NoSuchKey"
+
+
+def test_buildspec_and_iam_name_the_validated_prefix_only():
+    """三处命名同一前缀（validate.py / buildspec / CDK IAM），按真源核对。
+
+    buildspec 那侧比**整个 key**而不只是前缀：只比前缀会让对象名
+    （backend-src.zip）两侧脱钩——改掉它，两边单测照绿，而真机每次构建都死在
+    第一条 `aws s3 cp` 上（404）。IAM 那侧仍按前缀比，因为它授的就是前缀。
+    纯文本核对，不碰 AWS，所以不取 moto 夹具。"""
     from pathlib import Path
     import validate
-    prefix = validate.VALIDATED_PREFIX
     root = Path(__file__).parent.parent
     spec = (root / "buildspec-package.yml").read_text()
-    assert f"{prefix}/$JOB_ID/" in spec and "uploads/$JOB_ID" not in spec
+    assert validate.validated_key("$JOB_ID") in spec and "uploads/$JOB_ID" not in spec
     app = (root / "infra" / "app.py").read_text()
-    assert f"/{prefix}/*" in app and "/uploads/*" not in app
+    assert f"/{validate.VALIDATED_PREFIX}/*" in app and "/uploads/*" not in app
 
 
 def test_extraction_path_collision_rejected(aws):
