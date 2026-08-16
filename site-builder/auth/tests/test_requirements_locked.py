@@ -10,20 +10,17 @@
 import ast
 import re
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
-
-import pytest
 
 # parents: [0]=tests [1]=auth [2]=site-builder（**不是 [3]，那是仓库根**）
 AUTH_DIR = Path(__file__).parents[1]
 AUTH_REQ = AUTH_DIR / "requirements.txt"
+DEPLOY_AUTH = AUTH_DIR / "deploy_auth.py"
 INFRA_DIR = Path(__file__).parents[2] / "deployer" / "infra"
 BUNDLING_REQ = INFRA_DIR / "bundling-requirements.txt"
 APP_PY = INFRA_DIR / "app.py"
-# deploy_auth 在**模块级**读 config.ini（gitignored），缺它时 import 就 KeyError。
-# 只有真要 import 它的那条用例受影响，所以在那条上单独 skip，不影响其余三条。
-CONFIG = Path(__file__).parents[2] / "config.ini"
 
 
 def _str_consts(node: ast.AST) -> list[str]:
@@ -114,8 +111,6 @@ def test_bundling_every_package_is_pinned_and_hashed():
     assert {"psycopg", "sqlparse"} <= names, f"缺 bundling 的顶层依赖：{names}"
 
 
-@pytest.mark.skipif(not CONFIG.exists(),
-                    reason="deploy_auth 模块级读 site-builder/config.ini")
 def test_deploy_auth_installs_with_require_hashes():
     """开关必须**真的到达 pip**，不是"源码里写着这四个字"。
 
@@ -142,6 +137,96 @@ def test_deploy_auth_installs_with_require_hashes():
     # 开关要作用在**这一次** `-r <清单>` 安装上，不是漂在别处
     assert argv.index("--require-hashes") < argv.index("-r"), f"开关位置不对：{argv}"
     assert argv[argv.index("-r") + 1].endswith("requirements.txt"), argv
+
+
+# 模块级出现这些方法调用即等于 import 时读配置 / 建 AWS client。
+_CONFIG_OR_CLIENT_ATTRS = ("read", "read_file", "read_string",
+                           "client", "resource", "Session")
+
+
+def _is_main_guard(node: ast.AST) -> bool:
+    """`if __name__ == "__main__":` ——这一块 import 时不执行，不在本守卫范围内。"""
+    return (isinstance(node, ast.If)
+            and any(isinstance(n, ast.Name) and n.id == "__name__"
+                    for n in ast.walk(node.test)))
+
+
+def test_deploy_auth_reads_no_config_at_import_time():
+    """deploy_auth 不许在**模块级**读配置或建 client。
+
+    模块级读 config.ini（gitignored）会让上面那条截获真实 pip argv 的守卫在干净
+    clone 里被 skip——Codex 复审 P2-e：`git archive` 出来的树实测 3 passed / 1
+    skipped，skip 掉的正是唯一真正验证 `--require-hashes` 到达 pip 的那条。
+
+    按 **AST 判模块级语句**，不靠"缺配置时 import 会不会炸"：本机有 config.ini，
+    那种判据在本机永远绿，等于没有守卫。
+
+    "谁算可疑"取自这个文件自己的 AST（模块级 `def` 的名字集合），不手抄一份访问器
+    清单：新加一个 `def region()` 之后写 `REGION = region()`，这条自动会红。
+    """
+    tree = ast.parse(DEPLOY_AUTH.read_text(encoding="utf-8"))
+    defined = {n.name for n in tree.body
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    assert defined, "deploy_auth.py 里一个模块级函数都没解析出来——本条已空转"
+    bad = []
+    for node in tree.body:
+        # 函数/类体内随便用——懒加载**就是**要这些调用发生在那里
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if _is_main_guard(node):
+            continue
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Call):
+                fn = sub.func
+                if (isinstance(fn, ast.Attribute)
+                        and fn.attr in _CONFIG_OR_CLIENT_ATTRS):
+                    bad.append(f".{fn.attr}() at line {sub.lineno}")
+                if isinstance(fn, ast.Name) and fn.id in defined:
+                    bad.append(f"{fn.id}() at line {sub.lineno}")
+            if (isinstance(sub, ast.Subscript) and isinstance(sub.value, ast.Name)
+                    and sub.value.id in ("CFG", "_CFG")):
+                bad.append(f"{sub.value.id}[...] at line {sub.lineno}")
+    assert not bad, ("deploy_auth 在模块级读配置/建 client，会让上面那条 argv 守卫"
+                     f"在干净树里被 skip：{bad}")
+
+
+# 子进程里先把"读配置"和"建 client"换成一调用就抛，再 import deploy_auth。
+_IMPORT_PROBE = '''
+import configparser
+import boto3
+
+
+def _forbid(what):
+    def _boom(*a, **kw):
+        raise AssertionError("import 时调用了 " + what)
+    return _boom
+
+
+configparser.ConfigParser.read = _forbid("ConfigParser.read")
+configparser.ConfigParser.read_file = _forbid("ConfigParser.read_file")
+configparser.ConfigParser.read_string = _forbid("ConfigParser.read_string")
+boto3.client = _forbid("boto3.client")
+boto3.resource = _forbid("boto3.resource")
+boto3.Session = _forbid("boto3.Session")
+
+import deploy_auth  # noqa: E402,F401
+
+print("IMPORT_CLEAN")
+'''
+
+
+def test_importing_deploy_auth_touches_neither_config_nor_boto3():
+    """同一条不变量的**行为判据**：import 真的没碰配置、没建 client。
+
+    上面那条按源码形状判（能点出行号），这条按运行时判（换个写法绕过形状也逃不掉，
+    比如把读配置藏进一个模块级 import 的副作用里）。两条都在本机会红——"缺配置时
+    import 会炸吗"那种判据才是本机永远绿的那种。
+    """
+    r = subprocess.run([sys.executable, "-c", _IMPORT_PROBE], cwd=AUTH_DIR,
+                       capture_output=True, text=True)
+    assert "IMPORT_CLEAN" in r.stdout, (
+        "import deploy_auth 时读了配置或建了 boto3 client——干净 clone 里"
+        f"config.ini 不存在，于是 argv 守卫直接失效：\n{r.stdout}\n{r.stderr}")
 
 
 def _segments(cmd: str) -> list[str]:

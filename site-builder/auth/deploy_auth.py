@@ -17,19 +17,70 @@ import boto3
 
 from alarm_pipeline import ensure_alarm_pipeline
 
-CFG = configparser.ConfigParser()
-CFG.read(Path(__file__).parent.parent / "config.ini")
-REGION = CFG["Platform"]["region"]
-BASE = CFG["Platform"]["base_domain"]
 FN = "site-auth-service"
+CFG_PATH = Path(__file__).parent.parent / "config.ini"
+_CFG: configparser.ConfigParser | None = None
+_CLIENTS: dict[str, object] = {}
 
-ssm = boto3.client("ssm", region_name=REGION)
-lam = boto3.client("lambda", region_name=REGION)
-ddb = boto3.client("dynamodb", region_name=REGION)
-iam = boto3.client("iam")
+
+def cfg() -> configparser.ConfigParser:
+    """**懒读**配置。形状照 mcp/server.py 的 _s3()/_sfn()（函数 + 模块级缓存）。
+
+    模块级读会让 tests/test_requirements_locked.py 里那条截获真实 pip argv 的守卫
+    在干净 clone 里被 skip（config.ini 是 gitignored，Codex 复审 P2-e 实测
+    3 passed / 1 skipped）——而它是"依赖真的按 hash 装"的唯一证据。
+
+    **不给缺配置留兜底默认值**：拿假值继续跑会把资源建到错的账号/区域上去。
+    """
+    global _CFG
+    if _CFG is None:
+        c = configparser.ConfigParser()
+        if not c.read(CFG_PATH):
+            raise SystemExit(f"缺少 {CFG_PATH}——从同目录 config.ini.example 复制并回填")
+        _CFG = c
+    return _CFG
+
+
+def region() -> str:
+    return cfg()["Platform"]["region"]
+
+
+def base_domain() -> str:
+    return cfg()["Platform"]["base_domain"]
+
+
+def _client(service: str, *, regional: bool = True):
+    """懒建 + **缓存** boto3 client。
+
+    缓存不只是省时间：`except lam.exceptions.ResourceNotFoundException` 这种写法
+    比对的是 client 实例上动态生成的异常类，每次新建 client 就有让 except 匹配不上
+    的风险——那会把"函数不存在所以要创建"变成一次崩溃。
+    """
+    if service not in _CLIENTS:
+        kw = {"region_name": region()} if regional else {}
+        _CLIENTS[service] = boto3.client(service, **kw)
+    return _CLIENTS[service]
+
+
+def _ssm():
+    return _client("ssm")
+
+
+def _lam():
+    return _client("lambda")
+
+
+def _ddb():
+    return _client("dynamodb")
+
+
+def _iam():
+    # IAM 是全局服务，原来这个 client 就不带 region_name
+    return _client("iam", regional=False)
 
 
 def ensure_secret(name: str, generate) -> str:
+    ssm = _ssm()
     try:
         return ssm.get_parameter(Name=name, WithDecryption=True)["Parameter"]["Value"]
     except ssm.exceptions.ParameterNotFound:
@@ -75,10 +126,10 @@ def lambda_env() -> dict:
     return {"Variables": {
         "JWT_SECRET_PARAM": JWT_SECRET_PARAM,
         "CLIENT_SECRET_PARAM": CLIENT_SECRET_PARAM,
-        "COGNITO_DOMAIN": CFG["Cognito"]["domain"],
-        "CLIENT_ID": CFG["Cognito"]["site_client_id"],
-        "BASE_DOMAIN": BASE,
-        "USER_POOL_ID": CFG["Cognito"]["user_pool_id"],
+        "COGNITO_DOMAIN": cfg()["Cognito"]["domain"],
+        "CLIENT_ID": cfg()["Cognito"]["site_client_id"],
+        "BASE_DOMAIN": base_domain(),
+        "USER_POOL_ID": cfg()["Cognito"]["user_pool_id"],
         # email 是授权主键，而联邦 email 默认 unverified——见 login_handler 的
         # REQUIRE_EMAIL_VERIFIED。默认 "true"；只有接入不发该 claim 的 IdP 时
         # 才在 config.ini 里设 false。**必须显式下发**：漏了这一项时 Lambda
@@ -94,6 +145,7 @@ def main():
     role_arn = ensure_lambda_role()
     env = lambda_env()
     code = build_zip()
+    lam = _lam()
     try:
         lam.get_function(FunctionName=FN)
         lam.update_function_code(FunctionName=FN, ZipFile=code)
@@ -112,9 +164,11 @@ def main():
     try:
         url = lam.create_function_url_config(FunctionName=FN, AuthType="AWS_IAM")["FunctionUrl"]
     except lam.exceptions.ResourceConflictException:
-        cfg = lam.get_function_url_config(FunctionName=FN)
-        url = cfg["FunctionUrl"]
-        if cfg["AuthType"] != "AWS_IAM":
+        # 局部名不叫 cfg——那会把模块级的 cfg() 在**整个 main() 里**变成局部名
+        # （Python 的作用域是按函数整体判的），后面每一处 cfg()[...] 都会炸。
+        url_cfg = lam.get_function_url_config(FunctionName=FN)
+        url = url_cfg["FunctionUrl"]
+        if url_cfg["AuthType"] != "AWS_IAM":
             lam.update_function_url_config(FunctionName=FN, AuthType="AWS_IAM")
     # 清掉历史的 Principal:* 语句（老版本部署留下的；已被 mitigate 删除时容忍不存在）
     for sid in ("public-url", "public-url-invoke"):
@@ -124,7 +178,7 @@ def main():
             pass
     # 2025-10 起 Function URL 需要 InvokeFunctionUrl + InvokeFunction 两条语句
     # （缺一个就 403）。两条各自幂等；与 deploy_lambda_site.py 的站点授权同模式。
-    edge_role_arn = CFG["Deployer"]["edge_role_arn"]
+    edge_role_arn = cfg()["Deployer"]["edge_role_arn"]
     for sid, action, extra in (
         ("edge-invoke", "lambda:InvokeFunctionUrl", {"FunctionUrlAuthType": "AWS_IAM"}),
         ("edge-invoke-function", "lambda:InvokeFunction", {"InvokedViaFunctionUrl": True}),
@@ -134,7 +188,7 @@ def main():
                                Principal=edge_role_arn, **extra)
         except lam.exceptions.ResourceConflictException:
             pass
-    ddb.put_item(TableName=CFG["Platform"]["routing_table"], Item={
+    _ddb().put_item(TableName=cfg()["Platform"]["routing_table"], Item={
         "subdomain": {"S": "auth"}, "site_id": {"S": "auth-service"},
         "route_mode": {"S": "api-only"},  # 全路径走 Lambda（/login 不匹配 /api/*）
         "static_prefix": {"S": ""}, "api_target": {"S": url.rstrip("/")},
@@ -152,13 +206,13 @@ def main():
     # 同一条日志被计两次（Sum 翻倍），而手工那个仍在——"只有一个 writer"
     # 当场失效，正是本次收编要消灭的状态。
     result = ensure_alarm_pipeline(
-        region=REGION, log_group=f"/aws/lambda/{FN}",
+        region=region(), log_group=f"/aws/lambda/{FN}",
         namespace="SiteBuilder", metric_name="AuthInvalidGrant",
         filter_name="auth-invalid-grant",
         filter_pattern='{ $.event = "token_exchange_invalid_grant" }',
         topic_name="site-builder-alarms",
         alarm_name="site-builder-auth-invalid-grant",
-        email=_alert_email(), account_id=CFG["Platform"]["account_id"])
+        email=_alert_email(), account_id=cfg()["Platform"]["account_id"])
     print(f"  告警管道已收敛：{', '.join(result['changed'])}")
     if result["subscription_state"] != "confirmed":
         # **不能只打印一行提示**：未确认的订阅意味着 alarm 会进 ALARM 而
@@ -166,7 +220,7 @@ def main():
         print(f"⚠️  email 订阅状态：{result['subscription_state']}"
               f"（**未完成**）——收件人必须点确认链接，否则告警无人知情。"
               f"确认后重跑本脚本或用 verify_auth_alarm.sh 核对。")
-    print(f"auth-service: {url}  →  https://auth.{BASE}/")
+    print(f"auth-service: {url}  →  https://auth.{base_domain()}/")
 
 
 def _alert_email() -> str:
@@ -178,8 +232,8 @@ def _alert_email() -> str:
     env = os.environ.get("SB_ALERT_EMAIL", "").strip()
     if env:
         return env
-    if CFG.has_section("Alerting"):
-        raw = CFG["Alerting"].get("email", "")
+    if cfg().has_section("Alerting"):
+        raw = cfg()["Alerting"].get("email", "")
         return raw.split("#")[0].split(";")[0].strip()
     return ""
 
@@ -192,8 +246,8 @@ def _require_email_verified_cfg() -> str:
     写错时不静默降级"的取向一致。
     """
     raw = ""
-    if CFG.has_section("IdP"):
-        raw = CFG["IdP"].get("require_email_verified", "")
+    if cfg().has_section("IdP"):
+        raw = cfg()["IdP"].get("require_email_verified", "")
     # configparser 保留行内注释，先切掉再判断
     head = raw.split("#")[0].split(";")[0].strip().lower()
     return "false" if head == "false" else "true"
@@ -249,8 +303,9 @@ def ensure_pre_token_trigger(role_arn: str, pool_id: str | None = None,
     与 _store_client_secrets 的 SSM 前缀隔离是同一类要求。
     """
     fn = fn_name
-    pool_id = pool_id or CFG["Cognito"]["user_pool_id"]
-    cog = boto3.client("cognito-idp", region_name=REGION)
+    lam = _lam()
+    pool_id = pool_id or cfg()["Cognito"]["user_pool_id"]
+    cog = boto3.client("cognito-idp", region_name=region())
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         z.write(Path(__file__).parent / "pre_token_email.py", "pre_token_email.py")
@@ -274,14 +329,16 @@ def ensure_pre_token_trigger(role_arn: str, pool_id: str | None = None,
         lam.add_permission(FunctionName=fn, StatementId=sid,
                            Action="lambda:InvokeFunction",
                            Principal="cognito-idp.amazonaws.com",
-                           SourceArn=f"arn:aws:cognito-idp:{REGION}:"
-                                     f"{CFG['Platform']['account_id']}:userpool/{pool_id}")
+                           SourceArn=f"arn:aws:cognito-idp:{region()}:"
+                                     f"{cfg()['Platform']['account_id']}"
+                                     f":userpool/{pool_id}")
         print(f"  已授权 {pool_id} 调用 {fn}（{sid}）")
     except lam.exceptions.ResourceConflictException:
         pass  # 同一 pool 重复运行，幂等
     pool = cog.describe_user_pool(UserPoolId=pool_id)["UserPool"]
-    cfg = pool.get("LambdaConfig", {}).get("PreTokenGenerationConfig", {})
-    if cfg.get("LambdaArn") == fn_arn and cfg.get("LambdaVersion") == "V2_0":
+    # 局部名不叫 cfg（理由同 main() 里那处）：本函数上面就在用 cfg()
+    ptg = pool.get("LambdaConfig", {}).get("PreTokenGenerationConfig", {})
+    if ptg.get("LambdaArn") == fn_arn and ptg.get("LambdaVersion") == "V2_0":
         return  # 已挂好，不动用户池
     kwargs = pool_update_params(cog, pool)
     # **在现有 LambdaConfig 上改这一项，不要整体替换**：update_user_pool 是
@@ -313,6 +370,7 @@ def ensure_lambda_role() -> str:
     "幂等重跑不能把线上加固打回默认"是同一类要求。
     """
     name = "site-auth-service-role"
+    iam = _iam()
     try:
         arn = iam.get_role(RoleName=name)["Role"]["Arn"]
         created = False
@@ -330,14 +388,15 @@ def ensure_lambda_role() -> str:
         PolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": [
             {"Sid": "ReadPlatformSecrets", "Effect": "Allow",
              "Action": "ssm:GetParameter",
-             "Resource": f"arn:aws:ssm:{REGION}:{CFG['Platform']['account_id']}"
+             "Resource": f"arn:aws:ssm:{region()}:"
+                         f"{cfg()['Platform']['account_id']}"
                          ":parameter/site-builder/*"},
             # SecureString 用账号默认的 aws/ssm key 加密；解密走 SSM 服务，
             # 故用 ViaService 限定，避免这个角色能直接拿 KMS key 干别的。
             {"Sid": "DecryptViaSSM", "Effect": "Allow",
              "Action": "kms:Decrypt", "Resource": "*",
              "Condition": {"StringEquals": {
-                 "kms:ViaService": f"ssm.{REGION}.amazonaws.com"}}},
+                 "kms:ViaService": f"ssm.{region()}.amazonaws.com"}}},
         ]}))
     if created:
         import time; time.sleep(10)  # IAM 传播
