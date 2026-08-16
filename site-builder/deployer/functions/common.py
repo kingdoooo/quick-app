@@ -267,6 +267,22 @@ def subdomain_for(site_id: str) -> str:
     return f"app-{site_id}"
 
 
+def route_api_target(site_id: str) -> str:
+    """路由表里这个站点当前对外的 `api_target`（不存在返回 `""`）。
+
+    blue/green 的"当前是哪个颜色在服务"由它推导——**不另存第二份 live_color**。
+    两份状态必然漂移，而漂移的后果是往正在服务的那个颜色上部署。
+
+    用 client 而不是 `_table()` 的 resource 接口：路由表由 `register_route`
+    以 client + 显式类型描述符写入（`{"S": ...}`），读侧保持同一套 API 才不会
+    在类型转换上出分歧。
+    """
+    item = boto3.client("dynamodb").get_item(
+        TableName=os.environ["ROUTING_TABLE"],
+        Key={"subdomain": {"S": subdomain_for(site_id)}}).get("Item") or {}
+    return item.get("api_target", {}).get("S", "")
+
+
 def dsql_schema_for(site_id: str) -> str:
     return "site_" + site_id.replace("-", "")
 

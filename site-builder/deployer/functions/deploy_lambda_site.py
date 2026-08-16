@@ -107,6 +107,12 @@ def _health_check(lam, fn: str, qualifier: str) -> None:
             if attempt == VERSION_READY_ATTEMPTS - 1:
                 raise
             time.sleep(VERSION_READY_SLEEP)
+    else:
+        # 只有 VERSION_READY_ATTEMPTS <= 0 才走到这里（循环体一次没进）。那是配置
+        # 错，不是运行时状况——但不写这条 else，`resp` 就可能未绑定，症状会是
+        # UnboundLocalError 而不是"这个常量配错了"。
+        raise RuntimeError(
+            f"VERSION_READY_ATTEMPTS={VERSION_READY_ATTEMPTS} 不合法（须 ≥ 1）")
     if resp.get("FunctionError"):
         detail = resp["Payload"].read()[:400].decode(errors="replace")
         raise BackendUnhealthy(
@@ -160,6 +166,22 @@ def handler(event, context):
 
     try:
         lam.get_function(FunctionName=fn)
+        exists = True
+    except lam.exceptions.ResourceNotFoundException:
+        exists = False
+
+    if exists:
+        # **先判颜色，后动任何字节**：未迁移的站点必须在 update_function_code
+        # 之前就被拒掉。反过来（先推 $LATEST 再检查）就是 v1 的 P1-1——那会把
+        # 未经健康门的代码留在 $LATEST 上，而未迁移站点的 Function URL 正挂在
+        # $LATEST，等于当场上线。
+        urls = _color_urls(lam, fn)
+        live = _live_color(common.route_api_target(event["site_id"]), urls)
+        if live is None and not urls:
+            raise UnmigratedSite(
+                f"{fn} 还没进 blue/green 模型（路由指向无 qualifier 的 Function "
+                "URL）。先跑 scripts/migrate_sites_to_blue_green.py，再重试部署。")
+        color = _idle_color(live)
         lam.update_function_code(FunctionName=fn, **code)
         lam.get_waiter("function_updated").wait(FunctionName=fn)
         lam.update_function_configuration(
@@ -167,7 +189,8 @@ def handler(event, context):
             Layers=[LWA_LAYER], Environment={"Variables": env},
             MemorySize=512, Timeout=30)
         lam.get_waiter("function_updated").wait(FunctionName=fn)
-    except lam.exceptions.ResourceNotFoundException:
+    else:
+        color = COLORS[0]
         for attempt in range(6):  # 新建 IAM 角色传播延迟
             try:
                 lam.create_function(
@@ -183,28 +206,44 @@ def handler(event, context):
                 time.sleep(5)
         lam.get_waiter("function_active").wait(FunctionName=fn)
 
+    # 不可变版本 → 指给**空闲色** → 健康门。线上那一色全程没被碰过。
+    # **顺序是 alias 先动、健康门后跑**：颜色的 Function URL 挂在 alias 这个
+    # qualifier 上，所以只有 invoke 那个 alias 才是在验"真正会服务流量的东西"。
+    # 先健康门再移 alias 的话，验的是版本号那个 qualifier，而移 alias 本身就成了
+    # 没被验证的动作。空闲色不在路由上 ⇒ 先移它对线上零影响。
+    version = lam.publish_version(FunctionName=fn)["Version"]
     try:
-        url = lam.create_function_url_config(FunctionName=fn,
+        lam.update_alias(FunctionName=fn, Name=color, FunctionVersion=version)
+    except lam.exceptions.ResourceNotFoundException:
+        lam.create_alias(FunctionName=fn, Name=color, FunctionVersion=version)
+    _health_check(lam, fn, color)      # 不过则抛：路由从未切换
+
+    # 挂 URL 与授权都在健康门**之后**：这两步是让这一色可被外部调用，候选没通过
+    # 健康门就不该具备被调用的条件。
+    try:
+        url = lam.create_function_url_config(FunctionName=fn, Qualifier=color,
                                              AuthType="AWS_IAM")["FunctionUrl"]
     except lam.exceptions.ResourceConflictException:
-        url = lam.get_function_url_config(FunctionName=fn)["FunctionUrl"]
+        url = lam.get_function_url_config(FunctionName=fn,
+                                          Qualifier=color)["FunctionUrl"]
     # 2025-10 起新建 Function URL 需要 InvokeFunctionUrl + InvokeFunction 两个权限
     # （AWS 官方文档 urls-auth）；只给前者会让 Edge 调用返回 403。
     # InvokedViaFunctionUrl 把 InvokeFunction 限定为仅经 Function URL 调用。
-    try:
-        lam.add_permission(FunctionName=fn, StatementId="edge-invoke",
-                           Action="lambda:InvokeFunctionUrl",
-                           Principal=edge_role_arn,
-                           FunctionUrlAuthType="AWS_IAM")
-    except lam.exceptions.ResourceConflictException:
-        pass
-    try:
-        lam.add_permission(FunctionName=fn, StatementId="edge-invoke-function",
-                           Action="lambda:InvokeFunction",
-                           Principal=edge_role_arn,
-                           InvokedViaFunctionUrl=True)
-    except lam.exceptions.ResourceConflictException:
-        pass
+    # **权限也要带 Qualifier**：不带就授在函数上，与"URL 只挂在颜色上"不一致。
+    for sid, action, extra in (
+            ("edge-invoke", "lambda:InvokeFunctionUrl",
+             {"FunctionUrlAuthType": "AWS_IAM"}),
+            ("edge-invoke-function", "lambda:InvokeFunction",
+             {"InvokedViaFunctionUrl": True})):
+        try:
+            lam.add_permission(FunctionName=fn, Qualifier=color, StatementId=sid,
+                               Action=action, Principal=edge_role_arn, **extra)
+        except lam.exceptions.ResourceConflictException:
+            pass
 
+    # **只是候选**：真正上线由 register_route 那一次 put_item 完成（唯一提交点）。
+    # 本步骤到此为止没有写过路由表——失败对线上零影响就是靠这条。
     event["api_target"] = url.rstrip("/")
+    event["deploy_color"] = color
+    event["deploy_version"] = version
     return event
