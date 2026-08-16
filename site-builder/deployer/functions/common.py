@@ -85,8 +85,18 @@ def update_job(job_id: str, *, status=None, phase=None, error=None, url=None,
     _table("JOBS_TABLE").update_item(**kwargs)
 
 
-def get_job(job_id: str) -> dict | None:
-    return _table("JOBS_TABLE").get_item(Key={"job_id": job_id}).get("Item")
+def get_job(job_id: str, *, consistent: bool = False) -> dict | None:
+    """读任务记录。
+
+    `consistent=True` 走强一致读——只在"这条记录是刚刚写的、读到旧副本会造成硬失败"
+    时才需要（`validate` 读 `upload_etag` 是唯一这样的调用方，见那里的注释）。
+    **默认仍是最终一致**：其余调用方读的都是早已写定的字段，让它们一起翻倍成本没有
+    收益。
+    """
+    kwargs = {"Key": {"job_id": job_id}}
+    if consistent:
+        kwargs["ConsistentRead"] = True
+    return _table("JOBS_TABLE").get_item(**kwargs).get("Item")
 
 
 def list_jobs_by_owner(owner: str) -> list[dict]:

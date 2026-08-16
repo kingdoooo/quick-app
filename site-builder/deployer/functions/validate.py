@@ -98,7 +98,13 @@ def handler(event, context):
     # 可以读到不同的包：extracted/ 变成两棵树的并集（旧前端文件仍会被发布、被删掉的
     # migration 仍会执行），且 SFN 携带的 manifest 与 CodeBuild 读到的代码可能来自
     # 不同 attempt。IfMatch 让第二种情况变成 412 而不是静默分歧。
-    job = common.get_job(job_id) or {}
+    #
+    # **强一致读**：这条记录是 confirm_upload 几百毫秒前刚写的，而最终一致读一旦读到
+    # 旧副本就是**硬失败、不会自愈**——`ContractViolation` 是函数错误，SFN 对本步骤的
+    # Retry 只列了四条 Lambda **服务**异常（`Lambda.ServiceException` 等），函数错误
+    # 直接走 `States.ALL` 的 catch 到 MarkFailed。而此刻 job 已是 RUNNING，用户拿到
+    # 的"请重新调用 confirm_upload"根本执行不了。
+    job = common.get_job(job_id, consistent=True) or {}
     etag = job.get("upload_etag")
     if not etag:
         raise ContractViolation(
@@ -107,7 +113,9 @@ def handler(event, context):
     try:
         obj = s3.get_object(Bucket=bucket, Key=f"uploads/{job_id}.zip", IfMatch=etag)
     except botocore.exceptions.ClientError as e:
-        if e.response.get("Error", {}).get("Code") not in ("PreconditionFailed", "412"):
+        # 只认 `PreconditionFailed`：真实 S3 与 moto 给的都是这一个码，再列一个
+        # `"412"` 的分支永远不会被任何用例覆盖。
+        if e.response.get("Error", {}).get("Code") != "PreconditionFailed":
             raise
         raise ContractViolation(
             "上传的 site.zip 在确认之后被改动过，本次部署已取消——请重新上传并"

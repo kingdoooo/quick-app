@@ -153,3 +153,40 @@ def test_existing_site_names_still_valid():
     for n in ("notes", "promo-roi-tracker", "return-analysis",
               "returns-dashboard", "team-kudos-wall", "voc-dashboard"):
         assert common.validate_site_name(n) == n
+
+
+def test_get_job_consistent_read_is_opt_in(aws):
+    """`consistent=True` 必须真的把 `ConsistentRead=True` 传到 `get_item`，
+    默认调用必须**不**带它。
+
+    断言的是**传下去的 kwargs**而不是"读到的值"：moto 与真机的最终一致窗口都测不出来
+    （moto 的读恒为强一致），所以"读对了"这种断言在任何实现下都会绿——包括把参数
+    整个丢掉的实现。默认那半边同样要锁：把默认改成 True 会让每一次 job 读都变成
+    强一致读（成本翻倍且与既有调用方的语义不符），那也是退化。
+    """
+    seen = []
+    real_table = common._table
+
+    class _Spy:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def get_item(self, **kw):
+            seen.append(kw)
+            return self._inner.get_item(**kw)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    jid = common.create_job("a@x.com", "demo-abc123")
+    common._table = lambda env: _Spy(real_table(env))
+    try:
+        assert common.get_job(jid)["job_id"] == jid
+        assert common.get_job(jid, consistent=True)["job_id"] == jid
+    finally:
+        common._table = real_table
+
+    assert len(seen) == 2, seen
+    assert "ConsistentRead" not in seen[0], f"默认调用带上了强一致读：{seen[0]}"
+    assert seen[1].get("ConsistentRead") is True, (
+        f"consistent=True 没有传到 get_item：{seen[1]}")

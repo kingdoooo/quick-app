@@ -432,3 +432,30 @@ def test_upload_cap_matches_the_50mb_check_at_the_mcp_entrance(aws):
     assert found, "mcp/server.py 里找不到 MAX_ZIP_BYTES 的赋值——本条已空转"
     expected = eval(compile(ast.Expression(found[0]), "<mcp>", "eval"))
     assert validate.MAX_UPLOAD_BYTES == expected
+
+
+def test_validate_reads_the_job_record_with_a_consistent_read(aws, monkeypatch):
+    """`upload_etag` 是 confirm_upload 几百毫秒前刚写的，这里必须**强一致**读。
+
+    最终一致读读到旧副本时不会自愈：`ContractViolation` 是**函数错误**，而 SFN 对本
+    步骤的 Retry 只列了四条 Lambda **服务**异常（实测合成模板的 `ErrorEquals`）⇒ 不
+    重试，直接走 `States.ALL` 的 catch 到 MarkFailed。于是部署硬失败，且报的是"请重新
+    调用 confirm_upload"——而此刻 job 已是 RUNNING，用户根本没法再 confirm。
+
+    断言的是**传给 common.get_job 的参数**：moto 的读恒为强一致，"读到了正确的值"
+    在最终一致实现下同样会绿（本条真正要防的那个 bug 在单测里没有可观测的后果）。
+    """
+    import validate, common
+    jid = common.create_job("a@x.com", "cons-x1")
+    _upload_site_zip(jid, GOOD_MANIFEST, {"frontend/index.html": "<h1>hi</h1>"})
+    calls, real = [], common.get_job
+
+    def _spy(job_id, **kw):
+        calls.append((job_id, kw))
+        return real(job_id, **kw)
+
+    monkeypatch.setattr(validate.common, "get_job", _spy)
+    validate.handler({"job_id": jid, "site_id": "cons-x1"}, None)
+    assert calls, "validate 没有读 job 记录——本条已空转"
+    assert all(kw.get("consistent") is True for _, kw in calls), (
+        f"validate 用最终一致读取 upload_etag：{calls}")

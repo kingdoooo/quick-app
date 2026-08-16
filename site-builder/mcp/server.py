@@ -317,6 +317,11 @@ def do_confirm_upload(owner: str, job_id: str) -> dict:
     #   · validate 用它做 `IfMatch` 读同一份字节（deployer/functions/validate.py
     #     的 MAX_UPLOAD_BYTES 那段）。SFN 对每个步骤都有 MaxAttempts:6 的
     #     service-exception 重试，不钉的话两次 attempt 可以读到不同的包；
+    #   · `upload_bytes` 是**审计字段，不是控制点**——别看到"记录里有个字节数"就以为
+    #     大小校验在这里。真正的校验有两处：本函数上面那次 HEAD 的 50MB，以及 validate
+    #     对 `get_object` 返回的 `ContentLength` 与 `MAX_UPLOAD_BYTES` 那一次比较
+    #     （`IfMatch` 已经比字节数强，所以没人读它）。留着它是为了真机排障时不必再
+    #     HEAD 一次就知道当时那个包多大；
     #   · 与 PENDING→RUNNING **同一笔**：第二次点击（AlreadyStarted）因此既不推进
     #     状态也改不到 etag，否则重放能把已经开跑的 job 钉到新字节上。
     import botocore.exceptions
