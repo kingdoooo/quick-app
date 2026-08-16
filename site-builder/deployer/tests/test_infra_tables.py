@@ -718,14 +718,25 @@ def test_deployer_cannot_touch_platform_functions(template):
     覆写控制面的代码，这比 M7 要加的 InvokeFunction 严重得多（M7-SPEC §2.1）。
     用显式 Deny 兜（Deny 胜过 Allow），资源写**精确名**——通配不可判定。
     """
-    import json
     import app as appmod
     denies = [s for s in _exec_role_statements(template) if s.get("Effect") == "Deny"]
     assert denies, "exec_role 没有任何 Deny 语句"
-    covered = json.dumps(denies)
+    covered = set()
+    for st in denies:
+        r = st["Resource"]
+        covered |= set(r if isinstance(r, list) else [r])
+    # **按整串比，不按子串**，且两种形态都要：不带限定符的 ARN 管住
+    # UpdateFunctionCode 这类不指版本的调用，`:*` 管住指到别名/版本上的调用。
+    # 子串式断言在这里会漏掉最省事的那种退化——只保留 `:*` 一份（此时
+    # "function:site-panel" 仍是 "function:site-panel:*" 的子串，断言照样绿，
+    # 而不带限定符的 UpdateFunctionCode 已经重新放行了）。
     for fn in appmod.PLATFORM_FUNCTION_NAMES:
-        assert f"function:{fn}" in covered, f"Deny 没覆盖平台函数 {fn}"
-    assert "function:site-*" not in covered, "Deny 用了通配——会误伤真实站点"
+        for suffix in ("", ":*"):
+            arn = (f"arn:aws:lambda:{appmod.REGION}:{appmod.ACCOUNT}"
+                   f":function:{fn}{suffix}")
+            assert arn in covered, f"Deny 没覆盖 {arn}"
+    wild = sorted(r for r in covered if "function:site-*" in r)
+    assert not wild, f"Deny 用了通配——会误伤真实站点：{wild}"
 
 
 PLATFORM_FN_RE = re.compile(r"site-[a-z0-9-]+")
