@@ -147,6 +147,28 @@ def test_reserved_prefixes_rejected_so_platform_wildcards_stay_decidable():
         assert common.validate_site_name(ok) == ok   # 只拦"整词或 name- 起头"
 
 
+def test_reserved_prefixes_are_documented_in_the_agent_facing_contract():
+    """入口拒绝了、而给生成方 Agent 的正式合同里查不到 ⇒ Agent 只能靠报错文案自解释。
+
+    期望值**遍历代码里的真源**（`common.RESERVED_SITE_NAME_PREFIXES`），所以往元组里
+    加一项而忘了改文档时这条会红——反过来抄一份前缀清单到测试里就没有这个性质。
+
+    判定落在**那一节之内、按反引号字面量**，不是全文 substring：全文 substring 下
+    七项里有三项凭空变绿——`rt` 被 `backend.port` 的两个字母满足、`auth` 被 site.json
+    的 auth 字段满足、`runtime` 被 `backend.runtime` 满足（实测：全文判时只报缺 4 项）。
+    "守卫被无关文本满足"正是本轮反复栽的那一类。
+    """
+    from pathlib import Path
+    doc = (Path(__file__).parents[2] / "skills" / "site-builder" / "references"
+           / "contract.md").read_text(encoding="utf-8")
+    anchor = "## 站点名的保留前缀"
+    assert anchor in doc, f"合同里找不到 {anchor!r} 这一节——本条已空转"
+    section = doc.split(anchor, 1)[1].split("\n## ", 1)[0]
+    missing = [p for p in common.RESERVED_SITE_NAME_PREFIXES
+               if f"`{p}`" not in section]
+    assert not missing, f"这些保留前缀没写进给 Agent 的合同：{missing}"
+
+
 def test_existing_site_names_still_valid():
     """现有 6 个站点无一冲突——加这条校验不需要数据迁移。"""
     import common

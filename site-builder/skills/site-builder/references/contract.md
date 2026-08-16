@@ -31,7 +31,7 @@ my-site/
 
 | 字段路径 | 类型 | 必填 | 约束 | 示例值 |
 |---|---|---|---|---|
-| `name` | string | 必填 | 小写字母开头，仅含 `[a-z0-9-]`，长度 2–30（正则 `[a-z][a-z0-9-]{1,29}`） | `"expense-tracker"` |
+| `name` | string | 必填 | 小写字母开头，仅含 `[a-z0-9-]`，长度 2–30（正则 `[a-z][a-z0-9-]{1,29}`）；且不得命中**保留前缀**（见下节） | `"expense-tracker"` |
 | `tier` | string（枚举） | 必填 | `static` \| `fullstack-nosql` \| `fullstack-sql` 三选一 | `"fullstack-sql"` |
 | `backend` | object | fullstack 必填；`tier=static` 时**禁止出现** | 见下三行 | — |
 | `backend.runtime` | string（枚举） | fullstack 必填 | 目前仅支持 `nodejs22.x`（Express）；Python 记为二期 | `"nodejs22.x"` |
@@ -56,6 +56,24 @@ my-site/
 三档完整样例见 `templates/site.json.static.example`、
 `templates/site.json.nosql.example`、`templates/site.json.sql.example`——直接以
 对应样例为底稿改 `name` / `tables` / `auth`，不要凭记忆手写。
+
+## 站点名的保留前缀
+
+下面这些词是平台自留的，`name` **不能是它们本身、也不能以「该词 + 连字符」起头**
+（不写个数——数字会随代码漂，真源是 `common.RESERVED_SITE_NAME_PREFIXES`）：
+
+`panel`、`auth`、`key-proxy`、`access`、`deployer`、`runtime`、`rt`
+
+判定规则只有这两种形态（整词，或 `词-` 起头），**不是任意位置的子串**：所以
+`authors`、`paneling`、`accessible`、`runtimes` 都是合法站点名，而 `auth`、
+`auth-tool`、`rt-foo`、`panel-v2` 会在 `deploy_site` 入口就被拒绝，报错文案会点名
+是哪个前缀。取名时撞上了就换一个词，不要试图绕（比如改成 `authtool` 虽然合法，
+但意思已经变了——不如换个真正描述用途的名字）。
+
+为什么留：平台自己的 Lambda 也叫 `site-*`（`site-auth-service`、`site-panel-api`
+……），而站点名 `auth-tool` 会生成 `site-auth-tool-x1y2z3`。两者共用一个命名空间时，
+任何按前缀通配平台函数的安全策略（IAM Deny / SCP）都不再可判定——留出这几个前缀，
+通配才有确定含义。
 
 ## 三档 tier 生成约束
 
