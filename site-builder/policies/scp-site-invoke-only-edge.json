@@ -1,0 +1,23 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyInvokingUserSiteFunctionsFromAnyoneButEdgeAndDeployer",
+      "Effect": "Deny",
+      "Action": [
+        "lambda:InvokeFunctionUrl",
+        "lambda:InvokeFunction"
+      ],
+      "Resource": "{user_site_function_arns}",
+      "Condition": {
+        "ArnNotLike": {
+          "aws:PrincipalArn": [
+            "arn:aws:iam::{account_id}:role/{edge_role_name}",
+            "arn:aws:iam::{account_id}:role/site-deployer-exec-role",
+            "arn:aws:iam::{account_id}:role/{panel_role_name}"
+          ]
+        }
+      }
+    }
+  ]
+}

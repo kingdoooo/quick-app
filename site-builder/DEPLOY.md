@@ -1932,6 +1932,30 @@ aws events list-rules --query "Rules[?Name=='site-deploy-terminal-status'].[Name
 aws lambda get-function --function-name site-deployer-reconcile-job --query 'Configuration.LastModified' --output text
 ```
 
+### 账号级加固（可选，**不是部署步骤**）
+
+`site-builder/policies/` 下有一份 SCP 模板
+（`scp-site-invoke-only-edge.json`）与它的说明（`policies/README.md`），用来收窄
+"同账号 principal 直接 `lambda:Invoke` 站点函数、绕过 Edge 鉴权"这条路。
+**贴不贴都能正常运行，本手册的任何步骤都不依赖它。**
+
+贴之前必须读 `policies/README.md` 的三条边界，其中两条会直接决定它有没有用：
+
+1. **SCP 对 Organizations 管理账号无效**（AWS 硬规则，包括 root）。**本部署所在的
+   账号就是管理账号** ⇒ 在这里贴上它对本账号里的 IAM 身份没有任何约束。想真的生效
+   得先把工作负载搬到成员账号。**所以：贴了它不等于那条绕过被关闭。**
+2. **资源不能用 `function:site-*` 通配**：平台自己的函数与用户站点共用 `site-`
+   命名空间，通配会同时命中 `site-panel` / `site-auth-service` / `site-deployer-*`，
+   后果是**所有部署与下线立刻失效**。模板用显式 ARN 列表占位符，README 给了生成命令
+   （按 `PLATFORM_FUNCTION_NAMES` 排除平台函数）。
+3. 例外名单里 `site-deployer-exec-role` **必须在**——M7 的健康门会直接 invoke 候选
+   颜色，漏了它每次部署都在健康门失败。
+
+代码侧的 `functions/edge_caller.py` 只挡得住**经 Function URL** 的那条路
+（`callerId` 由 STS 填写、不可伪造）；**直接 `lambda:Invoke` 可以自造整个 payload
+里的 `callerId`**（2026-08-15 对 site-panel 实测：伪造成 Edge 的 RoleId → 200）。
+两者合起来是纵深防御，**不是**这条缺陷的修复——当前暴露面按 README 那三条边界判断。
+
 ### MCP runtime 的信任边界（不要外推 IAM 的保护范围）
 
 **部署 MCP 的 runtime 角色对"站点管理操作"而言属于 TCB（可信计算基）。**

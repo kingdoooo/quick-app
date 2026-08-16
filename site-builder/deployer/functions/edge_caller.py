@@ -17,6 +17,26 @@ key-proxy 复制不到，放任一侧都会让另一侧变成"跨包 import"（�
 **缺配置即全拒**：`EDGE_ROLE_ID` 未配置/为空时返回 False 并打 ERROR。
 "配置缺失就不检查"恰是该缺陷的原始形态——鉴权字段的"默认值"往往正好是
 "放宽"。宁可整站拒绝也不留绕过路径；ERROR 日志是这条拒绝唯一的可告警线索。
+
+**本函数挡得住什么、挡不住什么（别外推）**
+
+同账号绕过有两条路，本函数只覆盖第二条：
+
+  · **Path A：直接 `lambda:Invoke`**（不经 Function URL）。调用方自己构造**整个
+    payload**，包括 `requestContext.authorizer.iam.callerId` 这个字段本身 ⇒ 它可以把
+    自己**伪造**成 Edge 的 RoleId。2026-08-15 对 site-panel 实测过：伪造后
+    `/api/me` 返回 200 并被识别成管理员。**本函数读的就是那个字段，所以在这条路上
+    天然被绕过**——不是实现不严，是这一层拿不到可信输入。
+  · **Path B：经 Function URL 调用**（SigV4）。`callerId` 由 **STS** 填写，调用方
+    不可伪造 ⇒ 本函数在这条路上是有效的。
+
+**真正能关掉 Path A 的是账号级 IAM 收窄**：让同账号里除 Edge / 部署器 / 面板之外的
+身份根本没有 `lambda:InvokeFunction` on 站点函数。`site-builder/policies/` 下有一份
+**可选**的 SCP 模板与它的三条边界，其中最要紧的一条是：**SCP 对 Organizations 管理
+账号无效，而本部署就在管理账号里** ⇒ 贴上它也不等于这条路被关闭。
+
+所以本层的定位是**纵深防御**，**不是**同账号绕过这条缺陷的修复。看到这段不要推论成
+"已经没有绕过路径了"；要判断当前暴露面，读 `policies/README.md` 那三条边界。
 """
 import logging
 import os
