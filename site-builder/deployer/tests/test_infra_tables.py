@@ -668,6 +668,29 @@ def test_the_scan_budget_leaves_room_inside_the_rollup_timeout(template):
         f"扫描预算 {budget}s 在 {props['Timeout']}s 超时里没留出封口余量")
 
 
+def test_validate_disk_covers_the_unpacked_size_limit(template):
+    """磁盘下界由**合同的解包上界**决定：`extractall` 把整棵树写进 `/tmp`
+    （`TemporaryDirectory()` 在 Lambda 上就落那里）。改上界不同时改磁盘 ⇒ 本条红。
+
+    **留 2 倍而不是刚好等于上界**：那道上界预检查的是 zip 中央目录里**声明的**
+    `file_size`，而真正落盘的是 `extractall` 实际写出的字节，两者不必相等
+    （CRC 不符要等写完才发现）。磁盘刚好卡在声明值上时，症状会从
+    `ContractViolation`（说得清是用户包太大）退化成 ENOSPC（读起来像平台故障）。
+
+    只算解包树：下载缓冲与 `_pack_build_input` 重新打的那个 zip 都在**内存**里
+    （两处都是 `io.BytesIO`），不占 /tmp。
+    """
+    import app as appmod
+    limit_mb = appmod._validate_const("MAX_UNPACKED_BYTES", int) // (1024 * 1024)
+    assert limit_mb > 0, limit_mb
+    assert appmod.VALIDATE_EPHEMERAL_MB >= limit_mb * 2, (
+        f"解包上界 {limit_mb}MB 需要至少 {limit_mb * 2}MB 磁盘，"
+        f"当前 {appmod.VALIDATE_EPHEMERAL_MB}MB")
+    template.has_resource_properties("AWS::Lambda::Function", {
+        "Handler": "validate.handler",
+        "EphemeralStorage": {"Size": appmod.VALIDATE_EPHEMERAL_MB}})
+
+
 def _exec_role_statements(template):
     """`site-deployer-exec-role` **自己那些** inline 策略语句。
 

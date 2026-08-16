@@ -5,7 +5,8 @@ import ast
 import configparser
 from pathlib import Path
 
-from aws_cdk import (App, CfnOutput, Duration, Environment, RemovalPolicy, Stack,
+from aws_cdk import (App, CfnOutput, Duration, Environment, RemovalPolicy, Size,
+                     Stack,
                      aws_cloudwatch as cw,
                      aws_cloudwatch_actions as cw_actions,
                      aws_codebuild as cb, aws_dynamodb as ddb,
@@ -40,6 +41,29 @@ def _rollup_const(name: str, kind: type = str):
             return node.value.value
     raise RuntimeError(f"access_rollup.py 里找不到 {kind.__name__} 常量 {name}")
 
+
+def _validate_const(name: str, kind=str):
+    """从 functions/validate.py 取常量——磁盘尺寸的单一真源（同 _rollup_const）。"""
+    src = (Path(__file__).parents[1] / "functions" / "validate.py").read_text(
+        encoding="utf-8")
+    for node in ast.parse(src).body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and getattr(node.targets[0], "id", None) == name):
+            # 允许字面量与 `200 * 1024 * 1024` 这样的常量表达式
+            return kind(eval(compile(ast.Expression(node.value), "<c>", "eval")))
+    raise RuntimeError(f"validate.py 里找不到常量 {name}")
+
+
+# validate 的 /tmp 尺寸。**下界是合同的解包上界**（`MAX_UNPACKED_BYTES`）：
+# `extractall` 把整棵树写进 TemporaryDirectory = Lambda 的 /tmp。上界与磁盘绑在
+# 一条式子上，调大上界不同时调大磁盘 ⇒ CDK 断言红
+# （test_validate_disk_covers_the_unpacked_size_limit），同 rollup 的
+# SCAN_WORKERS ↔ 内存那条。
+# 2 倍余量的理由：那道预检查看的是 zip 里**声明的** file_size，落盘的却是实际
+# 写出的字节——刚好卡在声明值上时，症状会从 ContractViolation（说得清是用户包
+# 太大）退化成 ENOSPC（读起来像平台故障）。
+# 只算解包树：下载缓冲与 _pack_build_input 重新打的 zip 都在内存里，不占 /tmp。
+VALIDATE_EPHEMERAL_MB = 1024
 
 EDGE_LOG_GROUP_PREFIX = _rollup_const("EDGE_LOG_GROUP_PREFIX")
 ROLLUP_METRIC_NAMESPACE = _rollup_const("METRIC_NAMESPACE")
@@ -386,7 +410,8 @@ class SiteDeployerStack(Stack):
             "ACCOUNT_ID": ACCOUNT,
         }
 
-        def step_fn(name: str, handler: str, timeout_s: int = 120) -> lam_.Function:
+        def step_fn(name: str, handler: str, timeout_s: int = 120,
+                    ephemeral_mb: int | None = None) -> lam_.Function:
             # 打包 functions/ + contract 包；psycopg 由 bundling pip 装入
             return lam_.Function(
                 self, name, function_name=f"site-deployer-{handler}",
@@ -404,9 +429,14 @@ class SiteDeployerStack(Stack):
                     "volumes": [{"hostPath": contract_dir + "/..",
                                  "containerPath": "/asset-contract"}]}),
                 role=exec_role, timeout=Duration.seconds(timeout_s),
-                memory_size=512, environment=common_env)
+                memory_size=512, environment=common_env,
+                # None ⇒ 不渲染 EphemeralStorage，沿用 Lambda 默认 512MB。
+                # 只有真的往 /tmp 写东西的步骤才显式给（当下只有 validate）。
+                ephemeral_storage_size=(Size.mebibytes(ephemeral_mb)
+                                        if ephemeral_mb else None))
 
-        f_validate = step_fn("FnValidate", "validate")
+        f_validate = step_fn("FnValidate", "validate",
+                             ephemeral_mb=VALIDATE_EPHEMERAL_MB)
         f_ddb = step_fn("FnProvDdb", "provision_dynamodb", 300)
         f_dsql = step_fn("FnProvDsql", "provision_dsql", 300)
         f_pkg = step_fn("FnPackage", "package_backend", 900)
