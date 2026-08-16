@@ -24,7 +24,15 @@ def _lambda():
     return boto3.client("lambda")
 
 
-def _restore_route(event) -> None:
+# 补偿被放弃时写进 **job 错误信息**的说明。只 logger.error 不够：看到部署失败的人
+# 看的是 job 记录，CloudWatch 里那行他们看不到，而"路由没回滚"是需要人去处置的。
+ROUTE_NOT_ROLLED_BACK = (
+    "路由未回滚，仍停在本次部署的新目标上：切换前的快照与线上现状已不匹配"
+    "（冒烟期间有人改过站点权限、站点被下线，或快照来自没有 permissions_rev 的"
+    "存量数据）。强行回滚会把旧权限写回、或让已下线的站点复活，因此放弃——需人工介入。")
+
+
+def _restore_route(event) -> str | None:
     """把路由还原到本次部署切换之前。**`previous_route` 是三态契约**，
     见 `register_route` 里那段注释：
 
@@ -40,9 +48,43 @@ def _restore_route(event) -> None:
     策略变更（可能是扩权）。
 
     失败仅告警：此刻已经在失败分支里，抛异常只会用"恢复也失败了"盖掉原始错误。
+
+    **写回必须带条件**：快照是提交那一刻拍的，而 smoke 有几十秒。这段时间里线上
+    可能已经变了，两条都可达：
+      · 有人在线收紧权限（`permissions.py` 是"sites 推 rev + 改路由"同一事务）
+        ⇒ 无条件整值写回会把 allowed_users 一起写回收紧**之前**的样子，
+        fail-open 扩权，而且只 warning ⇒ 静默；
+      · 站点被下线（`undeploy.py` 删掉这一行）⇒ 写回等于让一个已删除的站点的
+        子域名重新可路由，把"已删除"撤销了。
+    所以条件是"线上的 permissions_rev 还是我快照里那个"，**精确匹配**。
+
+    条件失败 = 世界变过了 ⇒ **放弃**，不重试、不挑字段合并（挑字段会丢掉
+    route_mode / require_auth / collaborators……而 Edge 对缺失字段按默认值回落，
+    等于一次静默的策略变更）。返回一句说明由 handler 写进 job 错误信息。
+
+    **精确匹配，不用 `attribute_not_exists(permissions_rev) OR rev = :snap`**：
+    那种宽松析取在 **item 不存在**时前半成立 ⇒ 恰好把上面第二条（站点已下线）
+    放行，路由被复活。同一形态在 `register_route` 里也是被删掉的手抄版本，
+    见 `permissions.snapshot_condition` 的 docstring（"这类兼容分支会静默成立，
+    旧主体的写入照样落地"，实测复现过）。这里的语义与该函数 `had_rev` 的两条分支
+    一致，但**没有复用它**：它的表达式钉在 sites 表的属性名上
+    （`attribute_exists(site_id)`），而路由 item 的存在性键是 subdomain。
+
+    快照里没有 rev（M3 之前的存量路由）⇒ 条件退化成"线上也还没有 rev"，
+    而 `register_route` 总会写 rev ⇒ 实际上必然失败 ⇒ 放弃。这是**故意的**：
+    没有可比的 rev 就无法证明期间没人改过，放弃的代价只是可用性（路由留在这次
+    失败的部署上，而它的权限是按**当前**真源算的，并没有扩权），放行的代价是
+    可能把旧权限写回去。两边不对等。
+
+    **值为 `None` 那一态（首次部署 ⇒ 删掉）不带条件，这个不对称是有意的**：
+    删除不写回任何权限值，它比任何权限状态都更"关"（子域名直接不解析）；被丢掉的
+    只是权限的**投影**，而真源在 sites 表里还在（`permissions.py` 本来就有
+    `_ALLOW_ROUTE_ABSENT` 这条"站点还没首次部署成功"的路径，下次部署会重新投影）。
+    反过来给删除加条件的代价是实打实的：条件一失败，一个 FAILED 的首次部署就把
+    子域名继续占着、指向一个坏站点——那正是这一态存在的理由。
     """
     if "previous_route" not in event:
-        return
+        return None
     prev = event["previous_route"]
     subdomain = common.subdomain_for(event["site_id"])
     try:
@@ -51,11 +93,25 @@ def _restore_route(event) -> None:
             ddb.delete_item(TableName=os.environ["ROUTING_TABLE"],
                             Key={"subdomain": {"S": subdomain}})
             logger.warning(f"首次部署失败，已撤掉 {subdomain} 的路由")
+            return None
+        kwargs = {}
+        snap_rev = prev.get("permissions_rev")
+        if snap_rev is None:
+            expr = "attribute_not_exists(permissions_rev)"
         else:
-            ddb.put_item(TableName=os.environ["ROUTING_TABLE"], Item=prev)
-            logger.warning(f"已把 {subdomain} 的路由整值恢复到切换前")
+            expr = "permissions_rev = :snap_rev"
+            kwargs["ExpressionAttributeValues"] = {":snap_rev": snap_rev}
+        try:
+            ddb.put_item(TableName=os.environ["ROUTING_TABLE"], Item=prev,
+                         ConditionExpression=expr, **kwargs)
+        except ddb.exceptions.ConditionalCheckFailedException:
+            logger.error(f"{subdomain}: {ROUTE_NOT_ROLLED_BACK}")
+            return ROUTE_NOT_ROLLED_BACK
+        logger.warning(f"已把 {subdomain} 的路由整值恢复到切换前")
+        return None
     except Exception as e:      # noqa: BLE001
         logger.error(f"路由恢复失败（需人工介入）: {e}")
+        return None
 
 
 def _cleanup_versions(site_id: str, *, keep_extra=()) -> None:
@@ -130,7 +186,12 @@ def handler(event, context):
         # 先落账再补偿：恢复自己吞掉所有异常，所以顺序对结果没影响，但"失败已被
         # 记录"是排查的前提——万一恢复那步在真机上卡住，job 也不该停在 RUNNING。
         common.update_job(job_id, status="FAILED", error=cause)
-        _restore_route(event)
+        note = _restore_route(event)
+        if note:
+            # 补偿被放弃是**可操作**信息，必须落到用户看得见的地方（job 记录）。
+            # 截断时砍**原因**、不砍这条提示：提示被截掉就等于没写。
+            cause = f"{cause[:max(0, 500 - len(note) - 3)]} | {note}"
+            common.update_job(job_id, error=cause)
         return {"job_id": job_id, "status": "FAILED", "error": cause}
 
     common.update_job(job_id, status="SUCCEEDED", url=event["url"])

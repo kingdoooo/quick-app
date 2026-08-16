@@ -839,10 +839,18 @@ def test_failed_job_restores_the_previous_route_item(aws):
     import mark_job
     job_id = common.create_job("a@x.com", "s-1")
     prev = _old_route("s-1")
-    # 线上当前是这次部署刚切过去的那条（green + 新前缀）
+    # 线上当前是这次部署刚切过去的那条（green + 新前缀）。
+    # **`permissions_rev` 必须在**：`register_route._route_item` 总会写它
+    # （`permissions.py` 的在线改权限与自愈投影也都写），所以"提交过、但线上这条
+    # 没有 rev"是**不可达**状态。少了它，恢复的条件守卫就只能靠一条
+    # `attribute_not_exists(permissions_rev)` 的宽松析取才能过——而那条析取在
+    # item 被 undeploy 删掉时会成立，把已下线的站点复活（见
+    # test_restore_does_not_resurrect_a_route_deleted_during_smoke）。
+    # 值取 4 = 快照里那个 rev：期间没人改过权限时两者本就相等。
     _put_routing({"subdomain": {"S": "app-s-1"},
                   "api_target": {"S": "https://g.lambda-url.us-east-1.on.aws"},
-                  "static_prefix": {"S": f"sites/s-1/{job_id}"}})
+                  "static_prefix": {"S": f"sites/s-1/{job_id}"},
+                  "permissions_rev": {"N": "4"}})
     mark_job.handler({"job_id": job_id, "site_id": "s-1",
                       "previous_route": prev,
                       "error_info": {"Cause": "smoke failed"}}, None)
@@ -1026,3 +1034,125 @@ def test_route_snapshot_read_is_strongly_consistent(aws, monkeypatch):
         f"路由表的快照读发生了 {len(reads)} 次，期望恰好 1 次"
     assert reads[0].get("ConsistentRead") is True, \
         "快照读不是强一致 ⇒ 可能读到「在线收紧权限」之前的公开路由，失败恢复会扩权"
+
+
+# ---------------------------------------------------------------------------
+# B4 fix：恢复路由必须带条件——补偿只在"世界还是我离开时的样子"才允许落地
+# ---------------------------------------------------------------------------
+
+def _fail_event(job_id, prev, site_id="s-1"):
+    return {"job_id": job_id, "site_id": site_id, "previous_route": prev,
+            "error_info": {"Cause": "smoke failed"}}
+
+
+def test_abandons_restore_when_permissions_changed_during_smoke(aws, monkeypatch):
+    """提交之后、smoke 期间有人在线收紧权限 ⇒ **放弃恢复**，不许把权限写回去。
+
+    交错：register_route 提交（快照 rev=4）→ 有人在线改权限（"sites 推 rev +
+    改路由"同一事务，路由 rev 变 5、名单收紧）→ smoke 失败 → 恢复。
+    无条件整值写回会把 allowed_users 一起写回收紧**之前**的样子 = fail-open 扩权，
+    而且是静默的（恢复本来就只 warning）。
+
+    **Ruling 54：这条和"根本没提交所以没恢复"是两条不同的分支**，不能只断言
+    "路由没变"——那两条分支的路由都没变。区分点是**有没有尝试过写**：
+    没提交那条一次写都没有（B4 的
+    test_failed_job_without_snapshot_does_not_touch_route 断言 == []），
+    而这一条必须**尝试了一次并被条件拒掉**。
+    """
+    import common
+    import mark_job
+    job_id = common.create_job("a@x.com", "s-1")
+    prev = _old_route("s-1", rev="4")                       # 快照：rev 4，公开名单
+    tightened = _old_route("s-1", require_auth=True,
+                           allowed_users=[{"S": "vip@x.com"}], rev="5",
+                           api_target="https://g.lambda-url.us-east-1.on.aws")
+    _put_routing(tightened)                                 # 线上：已被收紧过
+
+    calls = _spy_dynamodb(monkeypatch)
+    mark_job.handler(_fail_event(job_id, prev), None)
+
+    # ① 分支身份：确实**尝试**了一次恢复（不是"没提交所以没动"那条分支）
+    writes = _routing_writes(calls)
+    assert len(writes) == 1 and writes[0][0] == "PutItem", \
+        f"没有发生恢复尝试，落到了别的分支：{[op for op, _ in calls]}"
+    # ② 结果：被条件拒掉，收紧后的权限原样留着
+    assert _routing_item("s-1") == tightened, "恢复把收紧前的权限写回去了（扩权）"
+    # ③ 如实告知：错误信息里要能看出"路由留在新目标上、需要人工介入"
+    err = common.get_job(job_id)["error"]
+    assert "smoke failed" in err, "原始错因被盖掉了"
+    assert "人工" in err and "权限" in err, \
+        f"补偿被放弃却没写进 job 错误信息，只有 CloudWatch 里有：{err!r}"
+
+
+def test_restore_does_not_resurrect_a_route_deleted_during_smoke(aws, monkeypatch):
+    """smoke 期间站点被下线（undeploy 删掉了路由）⇒ 恢复**不许把它复活**。
+
+    这条是"条件写成 `attribute_not_exists(permissions_rev) OR rev = :snap` 那种
+    宽松析取"会漏掉的那根轴：item 不存在时 `attribute_not_exists(...)` **成立**，
+    于是一个已被下线的站点的子域名又变回可路由——比扩权更糟，它把"已删除"撤销了。
+    精确匹配 rev 在 item 缺失时条件为假，恢复自动放弃。
+
+    `undeploy.py` 确实会删这一行，且 smoke 有几十秒窗口，所以这是可达的交错，
+    不是纸面问题。
+    """
+    import common
+    import mark_job
+    job_id = common.create_job("a@x.com", "s-1")
+    prev = _old_route("s-1", rev="4")
+    assert _routing_item("s-1") is None                     # 线上已被 undeploy 删掉
+
+    calls = _spy_dynamodb(monkeypatch)
+    mark_job.handler(_fail_event(job_id, prev), None)
+
+    assert len(_routing_writes(calls)) == 1                 # 尝试过（分支身份）
+    assert _routing_item("s-1") is None, \
+        "把一个已被下线的站点的路由复活了——恢复必须精确匹配 rev，不能用宽松析取"
+    assert "人工" in common.get_job(job_id)["error"]
+
+
+def test_abandons_restore_when_the_snapshot_has_no_rev(aws, monkeypatch):
+    """快照里没有 permissions_rev（M3 之前的存量路由）⇒ 无法证明期间没人改过 ⇒
+    放弃恢复，不猜。
+
+    这是 `permissions.snapshot_condition` 里 `had_rev=False` 那条系统写入者分支
+    的同一取舍："没有可比的 rev 就 fail-closed，而不是放行"。放弃的代价只是可用性
+    （路由留在这次失败的部署上，而它的权限是 register_route 按**当前**真源算的，
+    并没有扩权）；放行的代价是可能把旧权限写回去。两边不对等，所以选放弃。
+    """
+    import common
+    import mark_job
+    job_id = common.create_job("a@x.com", "s-1")
+    prev = _old_route("s-1")
+    del prev["permissions_rev"]                             # 存量：没有 rev
+    live = _old_route("s-1", rev="7",
+                      api_target="https://g.lambda-url.us-east-1.on.aws")
+    _put_routing(live)
+
+    calls = _spy_dynamodb(monkeypatch)
+    mark_job.handler(_fail_event(job_id, prev), None)
+
+    assert len(_routing_writes(calls)) == 1                 # 尝试过（分支身份）
+    assert _routing_item("s-1") == live, "无 rev 的快照被当成可信快照写回去了"
+    assert "人工" in common.get_job(job_id)["error"]
+
+
+def test_long_error_cause_does_not_truncate_the_manual_intervention_note(aws):
+    """原因很长时，截断要砍**原因**而不是砍那条提示。
+
+    job 的 error 字段有 500 字上限，而"路由没回滚、需人工介入"是里面唯一**可操作**
+    的部分。先拼后截会正好把它切掉——症状是"长错误的那些部署看不到提示"，短错误的
+    却看得到，很难联想到截断。
+    """
+    import common
+    import mark_job
+    job_id = common.create_job("a@x.com", "s-1")
+    prev = _old_route("s-1", rev="4")
+    _put_routing(_old_route("s-1", rev="5"))        # rev 不匹配 ⇒ 放弃恢复
+    ev = _fail_event(job_id, prev)
+    ev["error_info"] = {"Cause": "X" * 5000}
+    mark_job.handler(ev, None)
+
+    err = common.get_job(job_id)["error"]
+    assert mark_job.ROUTE_NOT_ROLLED_BACK in err, "提示被截断切掉了"
+    assert len(err) <= 500, f"error 字段超了 500：{len(err)}"
+    assert "X" in err, "原因被整段丢掉了——应该是截断，不是丢弃"
