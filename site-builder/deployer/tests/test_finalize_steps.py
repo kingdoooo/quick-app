@@ -1,3 +1,4 @@
+import json
 import boto3
 from unittest.mock import MagicMock, patch
 import pytest
@@ -523,3 +524,250 @@ def test_register_route_seed_fills_rev_and_collaborators(aws):
                                "allowed_users": "org"}}}, None)
     assert common.get_site("nocollab-abc123").get("collaborators") == [], \
         "seed 的条件没覆盖 collaborators —— 它在 SET 子句里，条件必须覆盖所写的每个字段"
+
+
+# ---------------------------------------------------------------------------
+# M7 B3：register_route 是**唯一提交点** + 切换前的整值路由快照
+#
+# 提交点之后只剩 smoke_test（它必须打公网 URL，只能排在切路由之后——这是不可
+# 消除的顺序）。所以补偿机制是"切换前的整值快照 + 失败时原样写回"，快照由本
+# 步骤留在 event["previous_route"] 里，mark_job 的失败分支消费它。
+# ---------------------------------------------------------------------------
+
+# 只读操作白名单。判"写"用的是它的**补集**：将来出现任何没见过的操作名都会被
+# 算成写，于是"提交点只有一个"这条断言宁可弄红也不会放过第二次写（fail-closed
+# 方向）。反之若用写操作白名单，漏列一个新操作就是静默放行。
+_DDB_READ_OPS = {"GetItem", "BatchGetItem", "Query", "Scan", "DescribeTable",
+                 "DescribeTimeToLive", "ListTables", "DescribeEndpoints"}
+
+
+def _spy_dynamodb(monkeypatch, on_call=None):
+    """在 botocore 的**唯一出口**上录下所有 DynamoDB 调用。
+
+    不逐个包装 client 上的方法名（`put_item` / `transact_write_items` …）：
+    那样只能看住我列举的那几个，将来改用 `batch_write_item` /
+    `execute_statement` 写路由就悄悄漏掉——而"提交点只有一个"这条断言的全部
+    价值就在于挡住多出来的那次写。`_make_api_call` 是所有 API 调用必经的
+    单一出口，从这里录不可能被绕过。
+
+    on_call: 可选钩子 `(operation_name, api_params) -> None`，抛异常即注入故障。
+    """
+    import botocore.client
+    real = botocore.client.BaseClient._make_api_call
+    calls = []
+
+    def _spy(self, operation_name, api_params):
+        if self.meta.service_model.service_name == "dynamodb":
+            calls.append((operation_name, api_params))
+            if on_call is not None:
+                on_call(operation_name, api_params)
+        return real(self, operation_name, api_params)
+
+    monkeypatch.setattr(botocore.client.BaseClient, "_make_api_call", _spy)
+    return calls
+
+
+def _routing_writes(calls, table="routing"):
+    """`calls` 里所有可能改动路由表的调用。
+
+    表名按 `"TableName": "<table>"` 的序列化形态匹配，所以顶层参数
+    （put_item / update_item）与嵌在 TransactItems 里的都能命中，且不会被
+    某个恰好等于表名的属性值误伤。事务里对路由表只做 ConditionCheck 也会被
+    算成写——同样是 fail-closed 方向的过计数。
+    """
+    needle = json.dumps({"TableName": table})[1:-1]
+    return [(op, p) for op, p in calls
+            if op not in _DDB_READ_OPS
+            and needle in json.dumps(p, default=str)]
+
+
+def _b3_event(job_id, site_id, api_target="https://g.lambda-url.us-east-1.on.aws"):
+    return {"job_id": job_id, "site_id": site_id, "owner": "a@x.com",
+            "api_target": api_target, "deploy_color": "green",
+            "manifest": {"name": "n", "tier": "fullstack-nosql",
+                         "auth": {"require_login": True, "allowed_users": "org"}}}
+
+
+def _old_route(site_id, *, api_target="https://b.lambda-url.us-east-1.on.aws",
+               static_prefix=None, require_auth=True, allowed_users=None, rev="4"):
+    """上一版路由 item（DynamoDB 形态）。
+
+    `legacy_marker` 是实现方**没有理由知道**的字段：逐字段挑选的"快照"会把它
+    丢掉，整值快照不会。它是"整值"这条断言的着力点。
+    """
+    return {"subdomain": {"S": f"app-{site_id}"}, "site_id": {"S": site_id},
+            "route_mode": {"S": "split"}, "api_target": {"S": api_target},
+            "static_prefix": {"S": static_prefix or f"sites/{site_id}/job-old"},
+            "require_auth": {"BOOL": require_auth},
+            "allowed_users": {"L": allowed_users or [{"S": "v@x.com"}]},
+            "collaborators": {"L": []}, "owner": {"S": "a@x.com"},
+            "permissions_rev": {"N": rev}, "legacy_marker": {"S": "keep-me"}}
+
+
+def test_register_route_snapshots_previous_item_for_compensation(aws):
+    """切换前的整个 route item 必须原样留在 event 里，不是挑几个字段。
+
+    mark_job 的失败分支要把路由**原样写回**。挑字段的快照写回后会静默丢掉
+    没挑的那些（route_mode / require_auth / allowed_users / collaborators /
+    permissions_rev …）——恢复出来的是一条残缺的路由，Edge 按缺失字段回落
+    默认值，等于一次静默的策略变更。所以断言是整值相等，不是逐字段。
+    """
+    import boto3
+    import common
+    import register_route
+    common.upsert_site("s-1", owner="a@x.com", require_login=True,
+                       allowed_users="org", collaborators=[], permissions_rev=4)
+    job_id = common.create_job("a@x.com", "s-1")
+    ddb = boto3.client("dynamodb")
+    old = _old_route("s-1")
+    ddb.put_item(TableName="routing", Item=old)
+
+    out = register_route.handler(_b3_event(job_id, "s-1"), None)
+
+    assert out["previous_route"] == old, "快照必须是切换前的整个 item"
+    # 快照是"切换前"的：新路由确实已经切过去了（否则快照相等只是因为没切）
+    now = ddb.get_item(TableName="routing",
+                       Key={"subdomain": {"S": "app-s-1"}})["Item"]
+    assert now["api_target"]["S"] == "https://g.lambda-url.us-east-1.on.aws"
+    assert now["static_prefix"]["S"] == f"sites/s-1/{job_id}"
+
+
+def test_register_route_switches_backend_and_frontend_in_one_write(aws, monkeypatch):
+    """一次写同时切 api_target 与 static_prefix——那一次写就是提交点。
+
+    分成两次写（先切后端再切前端）会在两次之间留出一个"新后端 + 旧前端"的
+    窗口：旧前端的 JS 打新后端的接口。而且那个窗口里失败，补偿要还原**两条**
+    半提交状态。所以路由表在本步骤里**只能被写一次**。
+    """
+    import common
+    import register_route
+    common.upsert_site("s-2", owner="a@x.com")
+    job_id = common.create_job("a@x.com", "s-2")
+
+    calls = _spy_dynamodb(monkeypatch)
+    register_route.handler(_b3_event(job_id, "s-2"), None)
+
+    writes = _routing_writes(calls)
+    assert len(writes) == 1, \
+        f"路由表被写了 {len(writes)} 次：{[op for op, _ in writes]}"
+    blob = json.dumps(writes[0][1], default=str)
+    assert "https://g.lambda-url.us-east-1.on.aws" in blob, "后端没在这次写里切"
+    assert f"sites/s-2/{job_id}" in blob, "前端不在同一次写里 → 提交点不止一个"
+
+
+def test_register_route_marks_first_deploy_with_explicit_none(aws):
+    """首次部署没有上一版路由：键必须**在**、值为 None。
+
+    写成 `if prev: event["previous_route"] = prev` 会让键整个缺席，于是
+    mark_job 的失败分支分不清两件事：① register_route 还没提交（路由不该动）；
+    ② 提交过、但这是首次部署（该把刚写的路由删掉，别让一个冒烟失败的新站点
+    留在线上）。两者都表现为"键不存在"，键缺席就把这个区分永久丢掉了。
+    """
+    import boto3
+    import common
+    import register_route
+    common.upsert_site("s-3", owner="a@x.com")
+    job_id = common.create_job("a@x.com", "s-3")
+    assert "Item" not in boto3.client("dynamodb").get_item(
+        TableName="routing", Key={"subdomain": {"S": "app-s-3"}})
+
+    out = register_route.handler(_b3_event(job_id, "s-3"), None)
+
+    assert "previous_route" in out, "首次部署也必须留下快照位（None = 之前没有路由）"
+    assert out["previous_route"] is None
+
+
+def test_register_route_resnapshots_route_before_each_commit_attempt(aws, monkeypatch):
+    """快照必须在**每次提交尝试之前**重读，不能在重试循环外读一次。
+
+    交错（与 test_register_route_refuses_stale_snapshot 同一条，但看的是快照）：
+    我们读完 sites（公开）→ 别人在线把权限收紧（sites 与路由同一事务，rev 推进）
+    → 我们的事务被 rev 条件取消 → 重读重试。若快照是循环外读的那一份，它记的是
+    **收紧之前**的公开路由；mark_job 的失败分支照它写回，就把刚被收紧的站点还原
+    成公开（fail-open 扩权）。循环内重读拿到的才是收紧后的那一版。
+    """
+    import boto3
+    import common
+    import register_route
+    ddb = boto3.client("dynamodb")
+    common.upsert_site("s-1", owner="a@x.com", require_login=False,
+                       allowed_users="org", collaborators=[], permissions_rev=0)
+    job_id = common.create_job("a@x.com", "s-1")
+    public = _old_route("s-1", require_auth=False,
+                        allowed_users=[{"S": "org"}], rev="0")
+    ddb.put_item(TableName="routing", Item=public)
+    tightened = _old_route("s-1", require_auth=True,
+                           allowed_users=[{"S": "vip@x.com"}], rev="1")
+
+    real_get_site = common.get_site_consistent
+    reads = {"n": 0}
+
+    def _racing_get_site(site_id):
+        site = real_get_site(site_id)
+        reads["n"] += 1
+        if reads["n"] == 2:
+            # 必须在**循环内**那次读之后注入（第 1 次读是 seed 前的预读）：在
+            # 预读后注入的话循环第一笔事务就成功，重试路径从未执行。
+            # 在线改权限是"sites + 路由"同一事务，所以两张表一起改。
+            common.upsert_site(site_id, require_login=True,
+                               allowed_users=["vip@x.com"], permissions_rev=1)
+            ddb.put_item(TableName="routing", Item=tightened)
+        return site
+
+    monkeypatch.setattr(register_route.common, "get_site_consistent",
+                        _racing_get_site)
+    calls = _spy_dynamodb(monkeypatch)
+    out = register_route.handler(_b3_event(job_id, "s-1"), None)
+
+    # 独立于快照断言的旁证：第一笔事务真的被 rev 条件取消、真的重试过。
+    # 没有它，下面那条断言可能只是"从没进过重试路径"的假绿。
+    assert len([op for op, _ in calls if op == "TransactWriteItems"]) >= 2
+    assert out["previous_route"] == tightened, \
+        "快照是循环外读的那一份（收紧之前的公开路由）→ 失败恢复会把站点还原成公开"
+
+
+def test_register_route_does_not_commit_when_snapshot_read_fails(aws, monkeypatch):
+    """快照读失败必须让本步骤失败在**提交之前**——不许"读不到就算了"。
+
+    把这次 get_item 包进 `try/except: pass` 的后果：路由照切，但
+    previous_route 缺席 → 冒烟失败时 mark_job 无从还原 → 线上停在新版本上。
+    提交点之前失败对线上零影响，所以"抛出去"就是正确行为。
+
+    注入的错误码用 AccessDenied 不是随便挑的：exec_role 若少了路由表的
+    GetItem，真机就是这个形态，而 moto 不校验 IAM（单测永远绿）。
+    """
+    import boto3
+    import botocore.exceptions
+    import common
+    import register_route
+    common.upsert_site("s-1", owner="a@x.com", require_login=True,
+                       allowed_users="org", collaborators=[], permissions_rev=4)
+    job_id = common.create_job("a@x.com", "s-1")
+    ddb = boto3.client("dynamodb")
+    old = _old_route("s-1")
+    ddb.put_item(TableName="routing", Item=old)
+
+    fired = {"n": 0}
+
+    def _fail_first_routing_get(op, params):
+        # 只炸第一次（handler 那次）：否则本用例末尾自己的核对读也会被炸掉。
+        # 「只响一次」同时是旁证——它证明注入确实作用在 handler 的那次读上。
+        if op == "GetItem" and params.get("TableName") == "routing":
+            fired["n"] += 1
+            if fired["n"] == 1:
+                raise botocore.exceptions.ClientError(
+                    {"Error": {"Code": "AccessDeniedException",
+                               "Message": "snapshot-read-boom"}}, "GetItem")
+
+    _spy_dynamodb(monkeypatch, on_call=_fail_first_routing_get)
+    # match= 钉住是**哪一条**失败：只断言 ClientError 的话，任何一次 DynamoDB
+    # 报错都能让用例过绿，而快照这根轴其实没人看着（Ruling 54）。
+    with pytest.raises(botocore.exceptions.ClientError, match="snapshot-read-boom"):
+        register_route.handler(_b3_event(job_id, "s-1"), None)
+
+    assert fired["n"] == 1, "handler 根本没读路由表 → 这次注入什么都没测到"
+    # 独立于异常的旁证：路由**没被切**（提交点之前失败 = 线上零影响）。
+    # 快照读挪到事务之后也会抛同样的异常，只有这条断言能抓住它。
+    assert ddb.get_item(TableName="routing",
+                        Key={"subdomain": {"S": "app-s-1"}})["Item"] == old, \
+        "快照读失败了，但路由已经被切走了"

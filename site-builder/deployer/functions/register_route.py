@@ -1,7 +1,11 @@
 """SFN 步骤 6：注册子域名路由（含 auth 策略与 owner）。
 
-put_item 覆盖整个 item = 原子切流：static_prefix 指向本次 job 的版本化前缀，
-写入瞬间所有新请求走新版本（Edge 路由缓存最多再滞后 60s）。
+**这一次写就是整个部署的提交点**（M7）：一次覆盖整个 item，同时切
+`api_target`（本次部署的那个颜色的 Function URL）与 `static_prefix`（本次 job
+的版本化前缀），写入瞬间所有新请求走新版本（Edge 路由缓存最多再滞后 60s）。
+分成两次写会留出"新后端 + 旧前端"的窗口，也会让补偿要还原两条半提交状态——
+所以路由表在本步骤里只能被写一次。这之前失败对线上零影响；这之后只剩
+smoke_test，靠 `event["previous_route"]` 这份整值快照补偿（见 handler 内注释）。
 
 权限字段（require_auth / allowed_users / collaborators / owner）的**真源是
 sites 表**，不是 manifest——用户可能在控制台在线改过，manifest 里带的是
@@ -161,6 +165,34 @@ def handler(event, context):
         site = common.get_site_consistent(event["site_id"]) or {}
         owner = site.get("owner") or owner
         rev = int(site.get("permissions_rev", 0))
+        # ---- 切换前的整值快照（mark_job 的失败分支据此原样写回）----
+        # 提交点之后只剩 smoke_test（它必须打公网 URL，所以只能排在切路由之后
+        # ——这是不可消除的顺序）。所以在这里留一份快照来补偿。三个要点：
+        #
+        # ① **整值**，不是挑几个字段：恢复要写回的是"切换前的那条路由"，挑字段
+        #    会静默丢掉没挑的（route_mode / require_auth / allowed_users /
+        #    collaborators / permissions_rev …），恢复出一条残缺的 item，Edge
+        #    按缺失字段回落默认值 = 一次静默的策略变更。
+        # ② **强一致读**：最终一致读可能拿不到"刚刚在线收紧权限"那次写，快照就
+        #    记成收紧之前的公开状态；失败恢复照它写回 = fail-open 扩权。
+        # ③ **在重试循环内**，紧贴事务之前：循环外读一次的话，被 rev 条件取消
+        #    后重试成稿，快照仍是第一次读到的旧版本（同样是把收紧前的公开路由
+        #    当成"上一版"）。快照与提交之间仍有一个瞬间，但那个窗口被下面的
+        #    permissions_rev ConditionCheck 关掉了：在线改权限是"sites 推 rev +
+        #    改路由"同一事务，任何插在中间的路由改动都会让本次事务被取消 → 带着
+        #    新快照重试。
+        #
+        # 值为 None = 切换前没有路由（首次部署）。**键一定在**：mark_job 靠
+        # "键在不在"区分"register_route 还没提交（路由不该动）"与"提交过、但这是
+        # 首次部署（该把刚写的路由删掉）"，写成 `if prev:` 会把这个区分丢掉。
+        #
+        # 这次读失败一律上抛：失败在提交之前，对线上零影响；吞掉的话路由照切而
+        # 快照缺席，冒烟失败时无从还原。恢复完备还要求旧色 alias、旧色 URL、旧
+        # 前端前缀都还在，所以清理只在成功分支做（见 mark_job 的版本清理）。
+        event["previous_route"] = ddb.get_item(
+            TableName=os.environ["ROUTING_TABLE"],
+            Key={"subdomain": {"S": subdomain}},
+            ConsistentRead=True).get("Item")
         try:
             # 守卫走 permissions.sites_snapshot_guard（全仓库唯一定义）。
             # **had_rev 传 site 里的真实情况**，不要写死 True：
