@@ -13,6 +13,7 @@ Code.from_asset(bundling=...) —— synth 阶段就会起 Docker 装 psycopg。
 """
 import ast
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -665,6 +666,115 @@ def test_the_scan_budget_leaves_room_inside_the_rollup_timeout(template):
     assert budget > 0, budget
     assert budget * 2 <= props["Timeout"], (
         f"扫描预算 {budget}s 在 {props['Timeout']}s 超时里没留出封口余量")
+
+
+def _exec_role_statements(template):
+    """`site-deployer-exec-role` **自己那些** inline 策略语句。
+
+    与 `_rollup_statements` 同一条纪律：不在全模板里按 Effect/动作筛——那样别的
+    角色上的一条 Deny 就足以让"exec_role 有 Deny"这个结论成立，而 exec_role 自己
+    一条都没有。先从 RoleName 反查逻辑 ID，再取挂在它名下的 policy。
+    """
+    role_lid = next(
+        (lid for lid, res in template.find_resources("AWS::IAM::Role").items()
+         if res["Properties"].get("RoleName") == "site-deployer-exec-role"), None)
+    assert role_lid, "模板里找不到 site-deployer-exec-role——本条空转"
+    stmts = []
+    for pol in template.find_resources("AWS::IAM::Policy").values():
+        roles = [r.get("Ref") for r in pol["Properties"].get("Roles", [])
+                 if isinstance(r, dict)]
+        if role_lid in roles:
+            stmts.extend(pol["Properties"]["PolicyDocument"]["Statement"])
+    assert stmts, f"{role_lid} 名下没有任何 inline 策略语句——本条空转"
+    return stmts
+
+
+def test_deployer_cannot_touch_platform_functions(template):
+    """**存量过度授权**：exec_role 一直持有 UpdateFunctionCode on site-*，而
+    site-* 同时匹配 site-panel / site-key-proxy / site-auth-service。部署器能
+    覆写控制面的代码，这比 M7 要加的 InvokeFunction 严重得多（M7-SPEC §2.1）。
+    用显式 Deny 兜（Deny 胜过 Allow），资源写**精确名**——通配不可判定。
+    """
+    import json
+    import app as appmod
+    denies = [s for s in _exec_role_statements(template) if s.get("Effect") == "Deny"]
+    assert denies, "exec_role 没有任何 Deny 语句"
+    covered = json.dumps(denies)
+    for fn in appmod.PLATFORM_FUNCTION_NAMES:
+        assert f"function:{fn}" in covered, f"Deny 没覆盖平台函数 {fn}"
+    assert "function:site-*" not in covered, "Deny 用了通配——会误伤真实站点"
+
+
+PLATFORM_FN_RE = re.compile(r"site-[a-z0-9-]+")
+
+# 平台 Lambda 的**创建方**（= 名字的真源）里，本栈之外的那三个部署脚本。
+EXTERNAL_FN_SCRIPTS = ("panel/deploy_panel.py", "key-proxy/deploy_key_proxy.py",
+                       "auth/deploy_auth.py")
+
+
+def _fn_names_declared_in(script: Path) -> set[str]:
+    """从一个部署脚本里抽出**它创建的 Lambda 函数名**字面量。
+
+    只认挂在"名字里含 fn 的模块级常量或形参默认值"上的 `site-*` 字面量
+    （`FN_NAME` / `FN` / `fn_name=`）——所以 `ROLE_NAME = "site-panel-role"`
+    这类同前缀的角色名不会混进来。抽不到就让调用处红：常量改名时本条会**自报
+    空转**，而不是静默把覆盖面缩到零（同 test_alarm_topic_name_... 的处理）。
+    """
+    out: set[str] = set()
+
+    def _take(target: str, value) -> None:
+        if ("fn" in target.lower() and isinstance(value, ast.Constant)
+                and isinstance(value.value, str)
+                and PLATFORM_FN_RE.fullmatch(value.value)):
+            out.add(value.value)
+
+    for node in ast.walk(ast.parse(script.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    _take(t.id, node.value)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            a = node.args
+            pos = a.posonlyargs + a.args
+            for arg, d in zip(pos[len(pos) - len(a.defaults):], a.defaults):
+                _take(arg.arg, d)
+            for arg, d in zip(a.kwonlyargs, a.kw_defaults):
+                if d is not None:
+                    _take(arg.arg, d)
+    return out
+
+
+def test_platform_function_name_list_matches_what_creates_them(template):
+    """名单漏一个就等于给部署器留一个可覆写的控制面函数，所以**期望值必须来自
+    别处**：本栈创建的从**模板**里数，另外四个从**创建它们的部署脚本**里 AST 抽。
+
+    这条的形状是有意的。若期望值也读 `PLATFORM_FUNCTION_NAMES`（本任务 brief 里
+    最初就是那样），从名单里摘掉一项时策略与期望**一起**变小 ⇒ 断言恒真
+    ——实测过：摘掉 `site-panel` 后三条 platform 断言全绿（plan Global Constraints
+    点名的 v1 `copied_files_not_in_map()` 是同一个错）。
+
+    抓得到的两种退化：本栈新增/改名一个平台函数而没进名单；panel / key-proxy /
+    auth 那侧改了函数名而这边没跟。抓不到的：**新写一个部署脚本**创建新的平台
+    函数——没有便宜办法发现，所以 EXTERNAL_FN_SCRIPTS 是手工清单，加脚本时要加。
+    """
+    import app as appmod
+    listed = set(appmod.PLATFORM_FUNCTION_NAMES)
+
+    created = {p["Properties"]["FunctionName"]
+               for p in template.find_resources("AWS::Lambda::Function").values()
+               if isinstance(p.get("Properties", {}).get("FunctionName"), str)}
+    assert created, "模板里一个具名 Lambda 都没有——本条空转"
+    assert created - listed == set(), \
+        f"这些本栈创建的函数没进 Deny 名单：{sorted(created - listed)}"
+
+    root = Path(__file__).parents[2]
+    for rel in EXTERNAL_FN_SCRIPTS:
+        names = _fn_names_declared_in(root / rel)
+        assert names, (f"{rel} 里抽不出 site-* 函数名字面量——本条已空转，"
+                       "先查那边的常量名（FN_NAME / FN / fn_name=）")
+        assert names - listed == set(), (
+            f"{rel} 创建的这些平台函数没进 Deny 名单：{sorted(names - listed)}"
+            "——部署器现在能覆写它们的代码")
 
 
 def test_rollup_runs_daily_and_has_a_dlq(template):

@@ -139,8 +139,8 @@ def test_reserved_prefixes_rejected_so_platform_wildcards_stay_decidable():
     `site-auth-tool-x1y2z3`，会匹配 `site-auth-*` 通配。任何按前缀通配平台函数的
     策略（IAM Deny / SCP）都因此不可判定——所以在入口就把这些前缀留出来。"""
     import common, pytest
-    for bad in ("auth", "panel", "deployer", "key-proxy", "access",
-                "auth-tool", "panel-v2", "deployer-x"):
+    for bad in ("auth", "panel", "deployer", "key-proxy", "access", "rt",
+                "auth-tool", "panel-v2", "deployer-x", "rt-foo"):
         with pytest.raises(common.InvalidSiteName):
             common.validate_site_name(bad)
     for ok in ("notes", "voc-dashboard", "authors", "paneling", "accessible"):

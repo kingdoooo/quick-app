@@ -88,6 +88,23 @@ ALARM_TOPIC_NAME = "site-builder-alarms"
 # 自动被要求。明细表虽然是 DESTROY 也加：它是聚合表的重建来源。
 _PITR = ddb.PointInTimeRecoverySpecification(point_in_time_recovery_enabled=True)
 
+# 平台自己的 Lambda。**精确名，不用通配**：`site-auth-*` 会命中用户站点
+# site-auth-tool-x1y2z3（站点名保留前缀由 common.RESERVED_SITE_NAME_PREFIXES 兜，
+# 但策略侧不该依赖那条校验的历史生效时间）。
+# 本栈创建的那 13 个由 test_platform_function_name_list_matches_what_creates_them
+# 按模板核对；另 4 个由别的部署脚本创建（panel / key-proxy / auth），同一条断言从
+# 那三个脚本的源码里 AST 抽函数名核对——任一侧改名都红，名单不会静默变陈旧。
+PLATFORM_FUNCTION_NAMES = (
+    "site-panel", "site-key-proxy", "site-auth-service", "site-auth-pre-token",
+    "site-access-rollup",
+    "site-deployer-validate", "site-deployer-package_backend",
+    "site-deployer-deploy_lambda_site", "site-deployer-register_route",
+    "site-deployer-upload_frontend", "site-deployer-smoke_test",
+    "site-deployer-mark_job", "site-deployer-provision_dsql",
+    "site-deployer-provision_dynamodb", "site-deployer-undeploy",
+    "site-deployer-reconcile-job", "site-deployer-sweep-jobs",
+)
+
 
 class SiteDeployerStack(Stack):
     def __init__(self, scope: Construct, cid: str, **kw):
@@ -326,6 +343,16 @@ class SiteDeployerStack(Stack):
                          "logs:DeleteLogGroup"],
                 resources=[f"arn:aws:logs:{REGION}:{ACCOUNT}:"
                            "log-group:/aws/lambda/site-*"]),
+            iam.PolicyStatement(  # **存量过度授权的兜底**：site-* 同时匹配平台自己的
+                # 17 个函数，于是部署器一直能覆写 site-panel / site-auth-service
+                # 的代码。Deny 胜过 Allow，所以这一条把上面那些 site-* 的 Allow
+                # 精确挖掉平台部分，用户站点不受影响。
+                effect=iam.Effect.DENY,
+                actions=["lambda:*"],
+                resources=[f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:{n}"
+                           for n in PLATFORM_FUNCTION_NAMES]
+                          + [f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:{n}:*"
+                             for n in PLATFORM_FUNCTION_NAMES]),
         ]:
             exec_role.add_to_policy(stmt)
 

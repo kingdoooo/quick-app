@@ -225,8 +225,13 @@ SITE_NAME_RE = re.compile(r"[a-z][a-z0-9-]{1,29}")
 # 与用户站点函数 site-{site_id} 共用一个命名空间。留出这些词，`site-{平台名}*`
 # 这类通配才可判定——否则站点名 `auth-tool` 会产出 site-auth-tool-x1y2z3，
 # 被 `site-auth-*` 命中，进而被平台自己的 IAM Deny/SCP 误伤（M7-SPEC §2.1）。
+# `rt` 同理但方向相反：per-site 角色叫 site-rt-{site_id}（`site_role_name`），IAM 里
+# 已有 role/site-rt-* 通配，而站点名 `rt` 会产出**函数** site-rt-x1y2z3——同一个词在
+# 两种资源类型上指不同的东西。目前没有策略通配 function:site-rt-*，所以这是**潜在**
+# 危险而非现存缺陷；留出它是为了让"site-rt-* 指什么"始终只有一个答案。
+# 与 `runtime` 不互相包含（判定是"整词或 词- 起头"），两个都要留。
 RESERVED_SITE_NAME_PREFIXES = ("panel", "auth", "key-proxy", "access",
-                               "deployer", "runtime")
+                               "deployer", "runtime", "rt")
 
 
 def validate_site_name(name: str) -> str:
