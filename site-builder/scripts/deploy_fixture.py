@@ -2,15 +2,27 @@
 """打包 fixture → 上传 → 建 job → 跑状态机 → 轮询到终态。用法：
 python3 site-builder/scripts/deploy_fixture.py site-builder/fixtures/nosql-notes
 python3 site-builder/scripts/deploy_fixture.py <fixture> --owner me@example.com
+python3 site-builder/scripts/deploy_fixture.py <fixture> --site-id notes-abc123 --marker m7-b
 
 owner 默认 `fixture@test`（E2E 用，不对应真人）。**要用 MCP 工具操作这个站点时
 必须传 --owner 你的登录邮箱**——否则 role_of() 判你不是 owner，所有权限工具
-都会拒绝，而症状看起来像"工具坏了"。"""
+都会拒绝，而症状看起来像"工具坏了"。
+
+`--site-id` 复用同一个 site_id（不给就随机，行为与从前逐字相同），`--marker` 把一个
+串写进后端 `/api/health` 的响应体。**两个开关是配套的**：只有"同一个站点连着部两次、
+每次带不同的 marker"才能把"第二次部署真的换上了新字节"与"第二次部署被整个忽略了"
+区分开——后者在只断言 HTTP 200 的 E2E 里同样是绿的（M7 spec §5）。
+"""
+import argparse
 import configparser
+import contextlib
 import io
 import json
+import re
 import secrets
+import shutil
 import sys
+import tempfile
 import time
 import zipfile
 from datetime import datetime, timezone
@@ -18,29 +30,121 @@ from pathlib import Path
 
 import boto3
 
-CFG = configparser.ConfigParser()
-CFG.read(Path(__file__).parents[1] / "config.ini")
-ACCT = CFG["Platform"]["account_id"]
+CFG_PATH = Path(__file__).parents[1] / "config.ini"
+_CFG: configparser.ConfigParser | None = None
+
+# marker 落在响应对象的这个字段上。E2E 只按**随机串出现在响应体里**断言，不依赖
+# 字段名——所以改名不会悄悄让那些断言失效，但保留一个固定名字便于人工 curl 排查。
+MARKER_FIELD = "sb_marker"
+# marker 会被写进一个 JS 字符串字面量。带引号/空白/换行的值不是安全问题（值由跑
+# 测试的人给），而是**站点起不来**：真机上表现为莫名的 BackendUnhealthy，根因离
+# 症状隔了整条流水线。所以在这里就拒掉。
+MARKER_RE = re.compile(r"[A-Za-z0-9._-]{1,60}")
+# 注入点：`/api/health` 那一行的 `res.json({`。只认同一行内的写法——合同要求后端
+# 必须有 GET /api/health（contract/redlines.py），而黄金 fixture 都是一行写完的。
+# 认不出来就抛（见 inject_marker），不做"找不到就当没这回事"的静默回落。
+_HEALTH_JSON_RE = re.compile(r"/api/health[^\n]*?res\.json\(\s*\{")
+_BACKEND_SUFFIXES = (".js", ".mjs", ".cjs")
 
 
-def main(fixture_dir: str, owner: str = "fixture@test"):
-    root = Path(fixture_dir)
-    manifest = json.loads((root / "site.json").read_text())
-    site_id = f"{manifest['name'][:20]}-{secrets.token_hex(3)}"
-    job_id = f"job-{secrets.token_hex(8)}"
+def cfg() -> configparser.ConfigParser:
+    """config.ini 懒加载。
 
+    **不在 import 时读**：config.ini 是 gitignored 的，模块级读取会让任何 import
+    这个脚本的单测在干净 clone 里直接报错（而不是通过）。同 auth/deploy_auth.py。
+    """
+    global _CFG
+    if _CFG is None:
+        c = configparser.ConfigParser()
+        if not c.read(CFG_PATH):
+            raise SystemExit(
+                f"缺少 {CFG_PATH}——从同目录 config.ini.example 复制并回填")
+        _CFG = c
+    return _CFG
+
+
+def inject_marker(tree: Path, marker: str) -> Path:
+    """把 marker 写进后端 `/api/health` 的响应对象。返回被改的文件。
+
+    **就地改 `tree`**，所以调用方必须先把 fixture 复制到临时目录：直接改仓库里的
+    fixture 会让工作树被污染，之后每一次部署都带着上一次的 marker。
+
+    **找不到注入点一律抛，不静默跳过**：静默的话 E2E 那几条 marker 断言会去验一个
+    根本不存在的字段，而部署照样绿——那正是本任务要消除的假绿形态。
+    """
+    if not MARKER_RE.fullmatch(marker or ""):
+        raise SystemExit(
+            f"--marker 只允许 {MARKER_RE.pattern}（它会被写进 JS 字符串字面量，"
+            f"带引号或空白会让站点起不来）：得到 {marker!r}")
+    backend = tree / "backend"
+    if not backend.is_dir():
+        raise SystemExit(
+            f"{tree} 没有 backend/ 目录（static fixture 没有 /api/health），"
+            "--marker 对它无意义")
+    hits = []
+    for p in sorted(backend.rglob("*")):
+        if (p.is_file() and p.suffix in _BACKEND_SUFFIXES
+                and "node_modules" not in p.parts):
+            text = p.read_text(encoding="utf-8", errors="replace")
+            if _HEALTH_JSON_RE.search(text):
+                hits.append((p, text))
+    if not hits:
+        raise SystemExit(
+            f"{backend} 里找不到 `/api/health` 的 `res.json({{` 注入点——"
+            "--marker 无法证明新字节上线了，拒绝继续")
+    if len(hits) > 1:
+        raise SystemExit(
+            f"{backend} 里有多处 `/api/health` 注入点（{[str(p) for p, _ in hits]}），"
+            "无法判断该改哪一处")
+    path, text = hits[0]
+    m = _HEALTH_JSON_RE.search(text)
+    path.write_text(text[:m.end()] + f' "{MARKER_FIELD}": "{marker}",'
+                    + text[m.end():], encoding="utf-8")
+    return path
+
+
+def build_zip(tree: Path, manifest: dict, run_sh: Path) -> bytes:
+    """打上传包。`run_sh` 由调用方给：它在 fixture 的**父目录**里，而带 marker 时
+    打包的是临时副本——从 `tree.parent` 取会静默丢掉它（Lambda 的 Handler 就是
+    run.sh，丢了以后真机上表现为 BackendUnhealthy）。"""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for p in root.rglob("*"):
+        for p in tree.rglob("*"):
             if p.is_file():
-                z.write(p, p.relative_to(root))
-        run_sh = root.parent / "run.sh"
-        if manifest["tier"] != "static" and run_sh.exists():
+                z.write(p, p.relative_to(tree))
+        if manifest["tier"] != "static":
+            if not run_sh.exists():
+                raise SystemExit(
+                    f"缺少 {run_sh}——非 static 的 fixture 必须带 run.sh"
+                    "（Lambda 的 Handler 就是它）")
             z.write(run_sh, "run.sh")
+    return buf.getvalue()
 
+
+def main(fixture_dir: str, owner: str = "fixture@test", *,
+         site_id: str | None = None, marker: str | None = None):
+    root = Path(fixture_dir)
+    manifest = json.loads((root / "site.json").read_text())
+    # site_id 缺省仍是"name + 6 位随机"，与从前逐字相同。给了就逐字用——那是
+    # "同一个站点的更新路径"唯一的入口。
+    site_id = site_id or f"{manifest['name'][:20]}-{secrets.token_hex(3)}"
+    job_id = f"job-{secrets.token_hex(8)}"
+    run_sh = root.parent / "run.sh"
+
+    with contextlib.ExitStack() as stack:
+        tree = root
+        if marker:
+            # 注入在**临时副本**上做，仓库里的 fixture 一个字节都不动。
+            tmp = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+            tree = tmp / root.name
+            shutil.copytree(root, tree)
+            inject_marker(tree, marker)
+        body = build_zip(tree, manifest, run_sh)
+
+    conf = cfg()
+    acct = conf["Platform"]["account_id"]
     s3 = boto3.client("s3", region_name="us-east-1")
-    body = buf.getvalue()
-    put = s3.put_object(Bucket=f"site-artifacts-{ACCT}",
+    put = s3.put_object(Bucket=f"site-artifacts-{acct}",
                         Key=f"uploads/{job_id}.zip", Body=body)
     now = datetime.now(timezone.utc).isoformat()
     # **必须先建 sites 记录**：MCP 的 do_deploy_site 会调 common.upsert_site 写
@@ -49,7 +153,7 @@ def main(fixture_dir: str, owner: str = "fixture@test"):
     # 两表不一致）。后果：role_of() 判调用者不是 owner，全部权限工具拒绝，
     # 症状看起来像"工具坏了"。实测踩过（2026-08-06）。
     boto3.resource("dynamodb", region_name="us-east-1").Table(
-        CFG["Deployer"]["sites_table"]).update_item(
+        conf["Deployer"]["sites_table"]).update_item(
             Key={"site_id": site_id},
             UpdateExpression=("SET #o = :o, #n = :n, #s = :s"),
             ExpressionAttributeNames={"#o": "owner", "#n": "name", "#s": "status"},
@@ -63,17 +167,17 @@ def main(fixture_dir: str, owner: str = "fixture@test"):
     # 已经看到另一个对象（与 mcp/server.py 里同一条理由）。
     # upload_bytes 只是审计字段，真正的校验是 validate 对 ContentLength 那一次。
     boto3.resource("dynamodb", region_name="us-east-1").Table(
-        CFG["Deployer"]["jobs_table"]).put_item(Item={
+        conf["Deployer"]["jobs_table"]).put_item(Item={
             "job_id": job_id, "site_id": site_id, "owner": owner,
             "status": "PENDING", "phase": "submitted", "error": "", "url": "",
             "upload_etag": put["ETag"], "upload_bytes": len(body),
             "created_at": now, "updated_at": now})
     boto3.client("stepfunctions", region_name="us-east-1").start_execution(
-        stateMachineArn=CFG["Deployer"]["state_machine_arn"],
+        stateMachineArn=conf["Deployer"]["state_machine_arn"],
         input=json.dumps({"job_id": job_id, "site_id": site_id}))
 
     jobs = boto3.resource("dynamodb", region_name="us-east-1").Table(
-        CFG["Deployer"]["jobs_table"])
+        conf["Deployer"]["jobs_table"])
     while True:
         job = jobs.get_item(Key={"job_id": job_id})["Item"]
         print(f"  [{job['status']}] {job['phase']}")
@@ -83,11 +187,20 @@ def main(fixture_dir: str, owner: str = "fixture@test"):
         time.sleep(10)
 
 
-if __name__ == "__main__":
-    import argparse
+def cli(argv=None) -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("fixture_dir")
     ap.add_argument("--owner", default="fixture@test",
                     help="站点 owner 邮箱；要用 MCP 权限工具操作它就填你的登录邮箱")
-    a = ap.parse_args()
-    main(a.fixture_dir, a.owner)
+    ap.add_argument("--site-id",
+                    help="复用/指定 site_id（默认按 site.json 的 name 随机生成）；"
+                         "同一个 site_id 再部一次走的就是「更新」路径")
+    ap.add_argument("--marker",
+                    help=f"把这个串写进后端 /api/health 响应的 {MARKER_FIELD} 字段，"
+                         "用来证明这次部署的字节真的上线了")
+    a = ap.parse_args(argv)
+    main(a.fixture_dir, a.owner, site_id=a.site_id, marker=a.marker)
+
+
+if __name__ == "__main__":
+    cli()
