@@ -715,29 +715,55 @@ def _exec_role_statements(template):
     return stmts
 
 
+def _as_list(v) -> list:
+    return v if isinstance(v, list) else [v]
+
+
 def test_deployer_cannot_touch_platform_functions(template):
     """**存量过度授权**：exec_role 一直持有 UpdateFunctionCode on site-*，而
     site-* 同时匹配 site-panel / site-key-proxy / site-auth-service。部署器能
     覆写控制面的代码，这比 M7 要加的 InvokeFunction 严重得多（M7-SPEC §2.1）。
     用显式 Deny 兜（Deny 胜过 Allow），资源写**精确名**——通配不可判定。
+
+    这条断言的三根自由度都要锁住：Effect、Resource、**Action**。只锁前两根是
+    Codex P2-d 实测过的假绿——把 `actions=["lambda:*"]` 改成 `["lambda:GetFunction"]`
+    时旧版本 2 passed，而那一步等于把 UpdateFunctionCode/DeleteFunction 重新放行。
+    Action 的期望值**从模板里 exec_role 自己的 Allow 语句推导**（不是手抄一份危险动作
+    表——那会过时）：部署器被允许对 site-* 做的每个 lambda 动作，都必须在平台 ARN 上
+    被**同一条** Deny 挡住。并集式判定同样堵掉：覆盖 ARN 的那条语句必须自己就管住动作。
     """
     import app as appmod
-    denies = [s for s in _exec_role_statements(template) if s.get("Effect") == "Deny"]
+    stmts = _exec_role_statements(template)
+
+    # 部署器实际被授予的 lambda 动作（真源 = 模板里的 Allow 语句）
+    allowed = {a for st in stmts if st.get("Effect", "Allow") == "Allow"
+               for a in _as_list(st.get("Action", []))
+               if isinstance(a, str) and (a == "*" or a.startswith("lambda:"))}
+    assert allowed, "抽不到 exec_role 的 lambda Allow 动作——本条已空转，先查那些语句"
+    if "*" in allowed or "lambda:*" in allowed:
+        allowed = {"lambda:*"}   # 全给了就只需 Deny 全量
+
+    denies = [st for st in stmts if st.get("Effect") == "Deny"]
     assert denies, "exec_role 没有任何 Deny 语句"
-    covered = set()
-    for st in denies:
-        r = st["Resource"]
-        covered |= set(r if isinstance(r, list) else [r])
-    # **按整串比，不按子串**，且两种形态都要：不带限定符的 ARN 管住
-    # UpdateFunctionCode 这类不指版本的调用，`:*` 管住指到别名/版本上的调用。
-    # 子串式断言在这里会漏掉最省事的那种退化——只保留 `:*` 一份（此时
-    # "function:site-panel" 仍是 "function:site-panel:*" 的子串，断言照样绿，
-    # 而不带限定符的 UpdateFunctionCode 已经重新放行了）。
+
+    def _covers(st, arn: str) -> bool:
+        if arn not in set(_as_list(st.get("Resource", []))):
+            return False
+        acts = set(_as_list(st.get("Action", [])))
+        return "*" in acts or "lambda:*" in acts or allowed <= acts
+
+    # **按整串比，不按子串**，且两种形态都要：不带限定符的 ARN 管住 UpdateFunctionCode
+    # 这类不指版本的调用，`:*` 管住指到别名/版本上的调用。子串式断言会漏掉最省事的
+    # 那种退化——只保留 `:*` 一份（此时 "function:site-panel" 仍是
+    # "function:site-panel:*" 的子串，断言照样绿，而不带限定符的调用已重新放行）。
     for fn in appmod.PLATFORM_FUNCTION_NAMES:
         for suffix in ("", ":*"):
             arn = (f"arn:aws:lambda:{appmod.REGION}:{appmod.ACCOUNT}"
                    f":function:{fn}{suffix}")
-            assert arn in covered, f"Deny 没覆盖 {arn}"
+            assert any(_covers(st, arn) for st in denies), (
+                f"没有**单独一条** Deny 同时覆盖 {arn} 与动作 {sorted(allowed)}"
+                "——分散在两条语句里不算，Resource 取并集会把这种退化判绿")
+    covered = {r for st in denies for r in _as_list(st.get("Resource", []))}
     wild = sorted(r for r in covered if "function:site-*" in r)
     assert not wild, f"Deny 用了通配——会误伤真实站点：{wild}"
 
