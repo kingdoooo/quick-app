@@ -65,8 +65,11 @@ def _validate_const(name: str, kind=str):
 # 顺带的余量也用得上：那道上界预检查看的是 zip 里**声明的** file_size，落盘的却是
 # 实际写出的字节，刚好卡在声明值上时症状会从 ContractViolation（说得清是用户包
 # 太大）退化成 ENOSPC（读起来像平台故障）。
-# 内存那条轴**本常量管不到**：下载下来的上传包与 extracted/ 循环里当下那个文件
-# 都在内存里，而 step_fn 给的是 memory_size=512（M7 遗留项，另有跟进任务）。
+# 内存那条轴**本常量管不到**，但它已经不是全无上界了：下载下来的上传包由
+# `validate.MAX_UPLOAD_BYTES` 在 `read()` **之前**按 ContentLength 兜住（Task F1；
+# 在那之前它无常量可绑）。仍无上界的只剩 extracted/ 上传循环里**当下那一个文件**的
+# 字节——单文件最坏只被 `MAX_UNPACKED_BYTES` 那道（按 zip 声明值算的）总量预检查间接
+# 兜着，而 step_fn 给的是 memory_size=512。这一条仍是 M7 遗留项，另有跟进任务。
 VALIDATE_EPHEMERAL_MB = 1024
 
 # CodeBuild 的唯一输入前缀，**真源是运行时代码**（`validate.VALIDATED_PREFIX`）。
