@@ -36,15 +36,22 @@ MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 # CodeBuild 唯一允许的输入前缀。owner 只有 uploads/{job_id}.zip 的预签名 PUT，
 # 碰不到这里 ⇒ **owner 写不进本前缀**（这一条为真）。
 #
-# 但"本前缀下的对象在 job 生命周期内不可变"**不成立**，别那么读：
-#   · validate 自己在重试时会重写它（SFN 对本步骤有 MaxAttempts:6 的
-#     service-exception 重试）。重写的字节是同一份——那由下面 `IfMatch` 保证
-#     （test_upload_is_pinned_to_the_bytes_confirm_upload_checked /
-#      test_retry_with_the_pinned_bytes_still_succeeds），而不是由"没人能写"保证；
-#   · `infra/app.py` 里所有 step Lambda 共用的 `exec_role` 对整个 artifacts 桶
-#     都有 `PutObject`/`DeleteObject` ⇒ 兄弟步骤在 IAM 上也能写这里。
-# "只有 validate 能写这个前缀"要靠独立 IAM 角色 + exec_role 显式 Deny 收口
-# （Task F7），**本文件不承诺那一条**。
+# **写方已收口到本函数**（Task F7）：validate 走自己的窄角色
+# `site-deployer-validate-role`（uploads/* 读 + extracted/、validated/ 写 + jobs 表
+# GetItem/UpdateItem，就这些），而兄弟步骤共用的 `exec_role` 上有一条显式 Deny 把这
+# 两个前缀的 `PutObject`/`DeleteObject` 挖掉——在那之前所有 step Lambda 共用
+# `exec_role`，它对整个 artifacts 桶有写权限，于是"只有 validate 能写这里"只是注释里
+# 的说法。现在由 `test_nobody_but_validate_can_write_the_validated_prefix` 按 CDK
+# 模板判它（遍历每个角色名下的语句，拿具体 key ARN 当探针）。
+# **本常量是那两处 IAM 前缀的真源**：`infra/app.py` 按 AST 读它
+# （`VALIDATED_PREFIX = _validate_const("VALIDATED_PREFIX")`）⇒ 改这个名字，窄角色的
+# Allow 与 exec_role 的 Deny 一起跟着走，不会出现"代码写 A、IAM 管 B"。
+#
+# 但"本前缀下的对象在 job 生命周期内不可变"仍**不成立**，别那么读：validate 自己在
+# 重试时会重写它（SFN 对本步骤有 MaxAttempts:6 的 service-exception 重试）。重写的
+# 字节是同一份——那由下面 `IfMatch` 保证
+# （test_upload_is_pinned_to_the_bytes_confirm_upload_checked /
+#  test_retry_with_the_pinned_bytes_still_succeeds），而不是由"没人能写"保证。
 VALIDATED_PREFIX = "validated"
 
 

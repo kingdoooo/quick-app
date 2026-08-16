@@ -12,6 +12,7 @@ Code.from_asset(bundling=...) —— synth 阶段就会起 Docker 装 psycopg。
 日常回归靠"部署后 describe-table 真机核对"（见本任务 Step 5 与 Task 9）。
 """
 import ast
+import json
 import os
 import re
 import sys
@@ -694,6 +695,33 @@ def test_validate_disk_covers_the_unpacked_size_limit(template):
         "EphemeralStorage": {"Size": appmod.VALIDATE_EPHEMERAL_MB}})
 
 
+def _role_lid_by_name(template, role_name: str) -> str:
+    role_lid = next(
+        (lid for lid, res in template.find_resources("AWS::IAM::Role").items()
+         if res["Properties"].get("RoleName") == role_name), None)
+    assert role_lid, f"模板里找不到 {role_name}——本条空转"
+    return role_lid
+
+
+def _statements_by_role(template) -> dict[str, list[dict]]:
+    """角色逻辑 ID → 挂在它名下的**全部**策略语句（独立 Policy + 内联 Policies）。
+
+    两种承载形态都要收：`add_to_policy` 渲染成独立的 `AWS::IAM::Policy`，而
+    `iam.Role(policies=...)` 会内联在角色里。只看一种的守卫会把另一种形态写出来的
+    权限当成不存在——那正是"遍历所有语句"这句话最容易空转的地方。
+    """
+    out: dict[str, list[dict]] = {}
+    for lid, res in template.find_resources("AWS::IAM::Role").items():
+        for pol in res["Properties"].get("Policies") or []:
+            out.setdefault(lid, []).extend(pol["PolicyDocument"]["Statement"])
+    for pol in template.find_resources("AWS::IAM::Policy").values():
+        for r in pol["Properties"].get("Roles") or []:
+            if isinstance(r, dict) and r.get("Ref"):
+                out.setdefault(r["Ref"], []).extend(
+                    pol["Properties"]["PolicyDocument"]["Statement"])
+    return out
+
+
 def _exec_role_statements(template):
     """`site-deployer-exec-role` **自己那些** inline 策略语句。
 
@@ -701,17 +729,9 @@ def _exec_role_statements(template):
     角色上的一条 Deny 就足以让"exec_role 有 Deny"这个结论成立，而 exec_role 自己
     一条都没有。先从 RoleName 反查逻辑 ID，再取挂在它名下的 policy。
     """
-    role_lid = next(
-        (lid for lid, res in template.find_resources("AWS::IAM::Role").items()
-         if res["Properties"].get("RoleName") == "site-deployer-exec-role"), None)
-    assert role_lid, "模板里找不到 site-deployer-exec-role——本条空转"
-    stmts = []
-    for pol in template.find_resources("AWS::IAM::Policy").values():
-        roles = [r.get("Ref") for r in pol["Properties"].get("Roles", [])
-                 if isinstance(r, dict)]
-        if role_lid in roles:
-            stmts.extend(pol["Properties"]["PolicyDocument"]["Statement"])
-    assert stmts, f"{role_lid} 名下没有任何 inline 策略语句——本条空转"
+    role_lid = _role_lid_by_name(template, "site-deployer-exec-role")
+    stmts = _statements_by_role(template).get(role_lid, [])
+    assert stmts, f"{role_lid} 名下没有任何策略语句——本条空转"
     return stmts
 
 
@@ -763,7 +783,12 @@ def test_deployer_cannot_touch_platform_functions(template):
             assert any(_covers(st, arn) for st in denies), (
                 f"没有**单独一条** Deny 同时覆盖 {arn} 与动作 {sorted(allowed)}"
                 "——分散在两条语句里不算，Resource 取并集会把这种退化判绿")
-    covered = {r for st in denies for r in _as_list(st.get("Resource", []))}
+    # Resource 未必是字符串：`f"{bucket.bucket_arn}/x/*"` 渲染成 `Fn::Join`（F7 起
+    # exec_role 的 S3 Deny 就是这种形态）。序列化之后再查子串——直接进 set 会
+    # `TypeError: unhashable type: 'dict'`，只取 isinstance(str) 则会把藏在 token
+    # 里的通配静默漏掉。
+    covered = [r if isinstance(r, str) else json.dumps(r, sort_keys=True)
+               for st in denies for r in _as_list(st.get("Resource", []))]
     wild = sorted(r for r in covered if "function:site-*" in r)
     assert not wild, f"Deny 用了通配——会误伤真实站点：{wild}"
 
@@ -838,6 +863,290 @@ def test_platform_function_name_list_matches_what_creates_them(template):
         assert names - listed == set(), (
             f"{rel} 创建的这些平台函数没进 Deny 名单：{sorted(names - listed)}"
             "——部署器现在能覆写它们的代码")
+
+
+# ── F7: validate 的独立角色 + validated/ 只有它能写 ──────────────────────
+VALIDATE_ROLE_NAME = "site-deployer-validate-role"
+EXEC_ROLE_NAME = "site-deployer-exec-role"
+
+# `service-role/AWSLambdaBasicExecutionRole` 在模板里的渲染形态（partition 是 Ref）。
+# **按结构比，不按 json.dumps 子串**：子串式断言连 `NotAction` 里出现这串都算命中。
+BASIC_EXEC_MANAGED_POLICY = {"Fn::Join": ["", [
+    "arn:", {"Ref": "AWS::Partition"},
+    ":iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"]]}
+
+
+def _fn_role_lid(fn_res: dict) -> str:
+    """Lambda 资源的 `Role` 属性 → 角色逻辑 ID（`Fn::GetAtt[lid, "Arn"]`）。"""
+    role = fn_res["Properties"]["Role"]
+    assert isinstance(role, dict) and isinstance(role.get("Fn::GetAtt"), list), \
+        f"Role 不是 Fn::GetAtt 形态，本条无法判定：{role}"
+    return role["Fn::GetAtt"][0]
+
+
+def _fn_lid_by_handler(template, handler: str) -> str:
+    hit = [lid for lid, res in template.find_resources("AWS::Lambda::Function").items()
+           if res["Properties"].get("Handler") == handler]
+    assert len(hit) == 1, f"按 Handler={handler} 找到 {len(hit)} 个函数：{hit}"
+    return hit[0]
+
+
+def _state_machine_step_fn_lids(template) -> set[str]:
+    """状态机里被当成 Task Resource 的 Lambda 逻辑 ID 集合。
+
+    "别的 step 是谁"**不手抄**（会随状态机改）：CDK 把每个 `LambdaInvoke` 的 ARN
+    渲染成 `DefinitionString` 那个 `Fn::Join` 里的一个
+    `Fn::GetAtt[<函数逻辑 ID>, "Arn"]` 片段，从那里取。
+    """
+    sms = template.find_resources("AWS::StepFunctions::StateMachine")
+    assert sms, "模板里没有状态机——本条空转"
+    fn_lids = set(template.find_resources("AWS::Lambda::Function"))
+    out: set[str] = set()
+    for sm in sms.values():
+        parts = sm["Properties"]["DefinitionString"]["Fn::Join"][1]
+        for p in parts:
+            ga = p.get("Fn::GetAtt") if isinstance(p, dict) else None
+            if isinstance(ga, list) and len(ga) == 2 and ga[1] == "Arn" \
+                    and ga[0] in fn_lids:
+                out.add(ga[0])
+    assert len(out) >= 5, f"状态机定义里只抽到 {len(out)} 个 Lambda——本条近乎空转"
+    return out
+
+
+def _resolve_arn(template, val):
+    """把模板里的一个 Resource 值解析成**具体字符串**（可能带 `*` 通配）。
+
+    返回 `None` = 解析不了。**调用处必须把 None 判成红**：本文件那条"遍历所有语句
+    找 validated/ 的写方"的守卫，一旦把解析不了的 Resource 静默当成"匹配不上"，
+    就正好把最需要发现的那种形态（`f"{bucket.bucket_arn}/artifacts/*"` 渲染成
+    `Fn::Join`）漏掉——那是本仓库里真实存在的写法（package_project 的两条）。
+    """
+    if isinstance(val, str):
+        return val
+    if not isinstance(val, dict) or len(val) != 1:
+        return None
+    key, arg = next(iter(val.items()))
+    if key == "Ref":
+        if arg == "AWS::Partition":
+            return "aws"
+        props = template.find_resources("AWS::S3::Bucket").get(arg, {}).get("Properties")
+        return props.get("BucketName") if props else None
+    if key == "Fn::GetAtt" and isinstance(arg, list) and len(arg) == 2 and arg[1] == "Arn":
+        props = template.find_resources("AWS::S3::Bucket").get(arg[0], {}).get("Properties")
+        name = props.get("BucketName") if props else None
+        return f"arn:aws:s3:::{name}" if isinstance(name, str) else None
+    if key == "Fn::Join" and isinstance(arg, list) and len(arg) == 2 and arg[0] == "":
+        parts = [_resolve_arn(template, p) for p in arg[1]]
+        return None if any(p is None for p in parts) else "".join(parts)
+    return None
+
+
+def _iam_glob_matches(pattern: str, concrete: str) -> bool:
+    """IAM 的 `*`/`?` 通配匹配（整串锚定，不是子串）。"""
+    rx = "".join(".*" if c == "*" else "." if c == "?" else re.escape(c)
+                 for c in pattern)
+    return re.fullmatch(rx, concrete) is not None
+
+
+def _grants(template, stmts: list[dict], action: str, probe: str) -> bool:
+    """`stmts` 里是否有一条 Allow 同时命中 `action` 与具体资源 `probe`。"""
+    for st in stmts:
+        if st.get("Effect", "Allow") != "Allow" or "NotAction" in st:
+            continue
+        if not any(_iam_glob_matches(a, action)
+                   for a in _as_list(st.get("Action", [])) if isinstance(a, str)):
+            continue
+        for r in _as_list(st.get("Resource", [])):
+            resolved = _resolve_arn(template, r)
+            assert resolved is not None, (
+                f"解析不出这个 Resource，本条会把它静默当成'匹配不上' ⇒ 空转：{r}")
+            if _iam_glob_matches(resolved, probe):
+                return True
+    return False
+
+
+def _denies(template, stmts: list[dict], action: str, probe: str) -> bool:
+    """`stmts` 里是否有一条**无条件** Deny 同时盖住 `action` 与具体资源 `probe`。
+
+    带 `Condition` 的 Deny 不算：它只在条件成立时生效，不能作为"谁都写不了"的依据。
+    """
+    for st in stmts:
+        if st.get("Effect") != "Deny" or "Condition" in st or "NotResource" in st:
+            continue
+        if not any(_iam_glob_matches(a, action)
+                   for a in _as_list(st.get("Action", [])) if isinstance(a, str)):
+            continue
+        for r in _as_list(st.get("Resource", [])):
+            resolved = _resolve_arn(template, r)
+            assert resolved is not None, (
+                f"解析不出这个 Deny 的 Resource，本条会把它当成'没盖住' ⇒ 假红：{r}")
+            if _iam_glob_matches(resolved, probe):
+                return True
+    return False
+
+
+@pytest.fixture(scope="module")
+def artifacts_probes(template):
+    """artifacts 桶下三个前缀的**具体** key ARN（不是通配式），用来探策略。
+
+    桶名与前缀都不手抄：桶名从 validate 函数的 `ARTIFACTS_BUCKET` 环境变量指到的
+    桶资源取，`validated/` 从 `functions/validate.py` 的 `VALIDATED_PREFIX` 取
+    （运行时代码是那个前缀的真源——改名时 IAM 与本守卫一起跟着走）。
+    """
+    import app as appmod
+    env = template.find_resources("AWS::Lambda::Function")[
+        _fn_lid_by_handler(template, "validate.handler")]["Properties"][
+            "Environment"]["Variables"]
+    bucket_lid = env["ARTIFACTS_BUCKET"]["Ref"]
+    bucket = template.find_resources("AWS::S3::Bucket")[bucket_lid][
+        "Properties"]["BucketName"]
+    assert isinstance(bucket, str) and bucket, bucket
+    validated = appmod._validate_const("VALIDATED_PREFIX", str)
+    assert validated, "validate.py 里 VALIDATED_PREFIX 是空的"
+    return {"bucket_arn": f"arn:aws:s3:::{bucket}",
+            "validated_prefix": validated,
+            "uploads": f"arn:aws:s3:::{bucket}/uploads/job-abc123.zip",
+            "extracted": f"arn:aws:s3:::{bucket}/extracted/job-abc123/site.json",
+            "validated": (f"arn:aws:s3:::{bucket}/{validated}"
+                          "/job-abc123/backend-src.zip")}
+
+
+def test_validate_runs_under_its_own_role_not_the_shared_exec_role(template):
+    """所有 step Lambda 共用 `exec_role` 时，"只有 validate 能写 validated/"在 IAM 上
+    不成立（Codex 复审 P1-a）。从模板里按 Handler 取 Role 判两半：
+
+    · validate 的角色**不是** exec_role 那个逻辑 ID；
+    · 状态机里**别的** step 仍是 exec_role。
+
+    只断言前半句的话，"把所有 step 都换成新角色"这种退化（新角色于是又变成共用的
+    宽角色）会照样绿。后半句的 step 集合从状态机的 `DefinitionString` 取，不手抄。
+    """
+    exec_lid = _role_lid_by_name(template, EXEC_ROLE_NAME)
+    validate_role_lid = _role_lid_by_name(template, VALIDATE_ROLE_NAME)
+    assert validate_role_lid != exec_lid
+
+    fns = template.find_resources("AWS::Lambda::Function")
+    validate_lid = _fn_lid_by_handler(template, "validate.handler")
+    assert _fn_role_lid(fns[validate_lid]) == validate_role_lid, (
+        f"validate 挂的是 {_fn_role_lid(fns[validate_lid])}，不是 {VALIDATE_ROLE_NAME}"
+        "——它与兄弟步骤共用角色时，'只有它能写 validated/'在 IAM 上不成立")
+
+    steps = _state_machine_step_fn_lids(template)
+    assert validate_lid in steps, "validate 不在状态机里？后半句的比较对象不对"
+    siblings = steps - {validate_lid}
+    assert siblings, "状态机里除 validate 之外没有别的 step——后半句已空转"
+    wrong = {lid: _fn_role_lid(fns[lid]) for lid in siblings
+             if _fn_role_lid(fns[lid]) != exec_lid}
+    assert not wrong, (
+        f"这些兄弟步骤没在 {EXEC_ROLE_NAME} 上：{wrong}——若它们也换到了 validate "
+        "的角色，那个角色就又是共用的宽角色，本项等于只改了个名字")
+
+
+def test_validate_role_grants_exactly_the_four_things_it_needs(
+        template, artifacts_probes):
+    """新角色的语句集要**精确**，否则"独立角色"只是换了个名字。
+
+    validate 的全部 AWS 调用面（`functions/validate.py`）：`update_job` +
+    `get_job(consistent=True)`（F1 起要读 `upload_etag`）⇒ jobs 表
+    UpdateItem/GetItem；`get_object` on `uploads/{job_id}.zip`；`put_object` on
+    `extracted/{job_id}/*` 与 `validated/{job_id}/backend-src.zip`。就这四件事。
+
+    锁四根轴：① 动作集**恰好**等于那四个（`s3:*`/`dynamodb:*`/`*` 都会红）；
+    ② 每个 s3 资源都必须落在 `uploads|extracted|validated` 某个前缀下——桶级 ARN
+    与整桶 `/*` 都不行（`ListBucket` 需要桶级 ARN，所以这一条同时把它挡在门外）；
+    ③ ddb 资源恰好是 jobs 表的 ARN（不是 `table/site-*`）；
+    ④ `AWSLambdaBasicExecutionRole` 挂着——**自带 `role=` 时 CDK 不会替你加**，
+    漏了就静默丢日志（部署不报错，出事时没有 CloudWatch 可看）。
+    """
+    role_lid = _role_lid_by_name(template, VALIDATE_ROLE_NAME)
+    stmts = _statements_by_role(template).get(role_lid, [])
+    assert stmts, f"{VALIDATE_ROLE_NAME} 名下没有任何策略语句——本条空转"
+
+    grants: dict[str, set[str]] = {}
+    for st in stmts:
+        assert st.get("Effect", "Allow") == "Allow", f"新角色不该有 Deny：{st}"
+        assert "NotAction" not in st and "NotResource" not in st, st
+        assert "Condition" not in st, f"条件式授权在本条里不可判定：{st}"
+        for a in _as_list(st["Action"]):
+            # s3 的资源在这里解析成具体串；非 s3（ddb 表是 `Fn::GetAtt`，解不出来是
+            # 预期的）只登记动作名，资源在下面按原始结构比。
+            hits = grants.setdefault(a, set())
+            if not a.startswith("s3:"):
+                continue
+            resolved = {_resolve_arn(template, r) for r in _as_list(st["Resource"])}
+            assert None not in resolved, f"解析不出 Resource ⇒ 无法判定：{st}"
+            hits.update(resolved)
+
+    art, validated = artifacts_probes["bucket_arn"], artifacts_probes["validated_prefix"]
+    assert set(grants) == {"s3:GetObject", "s3:PutObject",
+                           "dynamodb:GetItem", "dynamodb:UpdateItem"}, (
+        f"动作集不精确：{sorted(grants)}")
+    assert grants["s3:GetObject"] == {f"{art}/uploads/*"}, grants["s3:GetObject"]
+    assert grants["s3:PutObject"] == {f"{art}/extracted/*",
+                                      f"{art}/{validated}/*"}, grants["s3:PutObject"]
+
+    # ddb：`_resolve_arn` 只解 S3，表的 `Fn::GetAtt` 解不出来是预期的，所以这两项按
+    # **原始结构**比——期望值里的逻辑 ID 来自环境变量那一侧，不是策略这一侧。
+    jobs_lid = template.find_resources("AWS::Lambda::Function")[
+        _fn_lid_by_handler(template, "validate.handler")]["Properties"][
+            "Environment"]["Variables"]["JOBS_TABLE"]["Ref"]
+    want_ddb = {"Fn::GetAtt": [jobs_lid, "Arn"]}
+    for st in stmts:
+        for a in _as_list(st["Action"]):
+            if a.startswith("dynamodb:"):
+                assert _as_list(st["Resource"]) == [want_ddb], (
+                    f"{a} 的资源不是 jobs 表本身：{st['Resource']}")
+
+    props = template.find_resources("AWS::IAM::Role")[role_lid]["Properties"]
+    assert BASIC_EXEC_MANAGED_POLICY in (props.get("ManagedPolicyArns") or []), (
+        f"{VALIDATE_ROLE_NAME} 没挂 AWSLambdaBasicExecutionRole——自带 role= 时 CDK "
+        f"不会替你加：{props.get('ManagedPolicyArns')}")
+
+
+def test_nobody_but_validate_can_write_the_validated_prefix(
+        template, artifacts_probes):
+    """本项的交付物就是这句话，所以按模板判它，而不是靠注释声明。
+
+    遍历**每个角色名下的全部**策略语句（独立 `AWS::IAM::Policy` + 角色内联
+    `Policies`，见 `_statements_by_role`），拿一个**具体的** validated/ key ARN 当
+    探针去匹配（通配式资源如 `…-{ACCOUNT}/*` 会命中，正是要抓的那种）。任何 Allow
+    了 `s3:PutObject` 的角色，除 validate 自己之外，都必须在**同一个角色**上另有一
+    条无条件 Deny 盖住 validated/ 的 Put 与 Delete。
+
+    exec_role 就是那种情况：它对整个 artifacts 桶的 Allow **保留**给别的步骤
+    （`deploy_lambda_site` 读 artifacts/*、`upload_frontend` 与 `provision_dsql` 读
+    extracted/*、`mark_job`/`undeploy` 删前端桶），靠 Deny 精确挖掉两个前缀。
+
+    **本条只管身份策略。** 资源策略那侧另判一次：artifacts 桶的 bucket policy 不许
+    给任何主体 `s3:PutObject`（CDK 的 `auto_delete_objects` 会在那里留一条
+    `s3:DeleteObject*` 给它自己的清理角色——那是删桶时的 teardown 授权，只删不写，
+    故意不在本条的作用面内）。
+    """
+    probe = artifacts_probes["validated"]
+    validate_role_lid = _role_lid_by_name(template, VALIDATE_ROLE_NAME)
+    by_role = _statements_by_role(template)
+    assert by_role, "模板里一条角色策略语句都抽不到——本条空转"
+
+    writers = {lid for lid, stmts in by_role.items()
+               if _grants(template, stmts, "s3:PutObject", probe)}
+    assert writers, ("没有任何角色能写 validated/——连 validate 自己都不能？"
+                     "本条已空转，先查 _grants 与探针")
+    assert validate_role_lid in writers, \
+        f"{VALIDATE_ROLE_NAME} 自己都写不了 validated/"
+
+    roles = template.find_resources("AWS::IAM::Role")
+    for lid in writers - {validate_role_lid}:
+        name = roles.get(lid, {}).get("Properties", {}).get("RoleName") or lid
+        for act in ("s3:PutObject", "s3:DeleteObject"):
+            assert _denies(template, by_role[lid], act, probe), (
+                f"{name} 的 Allow 能命中 {probe} 而它没有一条无条件 Deny 盖住 "
+                f"{act}——'只有 validate 能写 validated/'在 IAM 上不成立")
+
+    for pol in template.find_resources("AWS::S3::BucketPolicy").values():
+        for st in pol["Properties"]["PolicyDocument"]["Statement"]:
+            assert not _grants(template, [st], "s3:PutObject", probe), (
+                f"桶策略把 validated/ 的写授给了 {st.get('Principal')}——"
+                f"身份策略那侧收紧了也没用：{st.get('Action')}")
 
 
 def test_rollup_runs_daily_and_has_a_dlq(template):

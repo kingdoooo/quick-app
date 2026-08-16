@@ -284,20 +284,74 @@ def test_build_artifact_streams_from_disk_instead_of_memory(aws, monkeypatch):
         assert sorted(z.namelist()) == ["backend/app.js", "run.sh"], z.namelist()
 
 
+def _package_project_resources(app_src: str, consts: dict) -> set[str]:
+    """`infra/app.py` 里 `package_project.add_to_role_policy(...)` 授出的资源集合。
+
+    按 **AST 定位到那个角色**，不在全文里查子串：这条断言的主语是"构建容器那个角色
+    能碰哪些前缀"，而 app.py 里还有别的角色（F7 起 validate 的窄角色就合法地拿着
+    `uploads/*` 的读权限）。全文 `"/uploads/*" not in app` 分不开这两者——F7 落地时
+    它就是这么假红的，而真正要防的"给 package_project 加 uploads/"它反倒判不出。
+
+    f-string 里的插值渲染成占位符（`artifacts.bucket_arn` → `<bucket_arn>`），
+    `consts` 里给了值的名字用真值替换，于是前缀那一段仍与 validate.py 对齐。
+    """
+    import ast
+
+    def render(node) -> str:
+        if isinstance(node, ast.Constant):
+            return str(node.value)
+        if isinstance(node, ast.JoinedStr):
+            return "".join(render(v) for v in node.values)
+        if isinstance(node, ast.FormattedValue):
+            return render(node.value)
+        if isinstance(node, ast.Name):
+            return consts.get(node.id, "{" + node.id + "}")
+        if isinstance(node, ast.Attribute):
+            return f"<{node.attr}>"
+        return "<?>"
+
+    out: set[str] = set()
+    calls = 0
+    for node in ast.walk(ast.parse(app_src)):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "add_to_role_policy"
+                and getattr(node.func.value, "id", None) == "package_project"):
+            continue
+        calls += 1
+        for arg in node.args:
+            for kw in getattr(arg, "keywords", []):
+                if kw.arg == "resources":
+                    out.update(render(e) for e in kw.value.elts)
+    assert calls >= 2, (f"只找到 {calls} 处 package_project.add_to_role_policy——"
+                        "本条已空转，先查那边的写法（改名/换成 role.attach_policy 了？）")
+    assert out, "抽不到任何 resources——本条空转"
+    return out
+
+
 def test_buildspec_and_iam_name_the_validated_prefix_only():
     """三处命名同一前缀（validate.py / buildspec / CDK IAM），按真源核对。
 
     buildspec 那侧比**整个 key**而不只是前缀：只比前缀会让对象名
     （backend-src.zip）两侧脱钩——改掉它，两边单测照绿，而真机每次构建都死在
-    第一条 `aws s3 cp` 上（404）。IAM 那侧仍按前缀比，因为它授的就是前缀。
-    纯文本核对，不碰 AWS，所以不取 moto 夹具。"""
+    第一条 `aws s3 cp` 上（404）。IAM 那侧按前缀比，因为它授的就是前缀。
+    纯文本/AST 核对，不碰 AWS，所以不取 moto 夹具。
+
+    IAM 那半的作用面是**构建容器那个角色**：断言它拿到的资源恰好是 validated/（读
+    输入）与 artifacts/（写产物）两项，于是"再给它 uploads/"这类退化会红。**不能**
+    退回全文子串——app.py 里 validate 自己的窄角色合法地持有 `uploads/*`（Task F7）。
+    """
     from pathlib import Path
     import validate
     root = Path(__file__).parent.parent
     spec = (root / "buildspec-package.yml").read_text()
     assert validate.validated_key("$JOB_ID") in spec and "uploads/$JOB_ID" not in spec
+
     app = (root / "infra" / "app.py").read_text()
-    assert f"/{validate.VALIDATED_PREFIX}/*" in app and "/uploads/*" not in app
+    prefix = validate.VALIDATED_PREFIX
+    got = _package_project_resources(app, {"VALIDATED_PREFIX": prefix})
+    assert got == {f"<bucket_arn>/{prefix}/*", "<bucket_arn>/artifacts/*"}, (
+        f"构建容器那个角色的资源集不对：{sorted(got)}——它只该读 {prefix}/（validate "
+        "产出的工件）、写 artifacts/，多一项就是给不可信构建多开一个前缀")
 
 
 def test_extraction_path_collision_rejected(aws):

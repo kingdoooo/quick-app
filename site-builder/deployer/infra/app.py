@@ -69,6 +69,13 @@ def _validate_const(name: str, kind=str):
 # 都在内存里，而 step_fn 给的是 memory_size=512（M7 遗留项，另有跟进任务）。
 VALIDATE_EPHEMERAL_MB = 1024
 
+# CodeBuild 的唯一输入前缀，**真源是运行时代码**（`validate.VALIDATED_PREFIX`）。
+# 下面三处都用它：validate 自己那个窄角色的 PutObject、exec_role 上把这个前缀挖掉
+# 的 Deny、以及 package_project 的 GetObject。手抄成字面量的话，改前缀就会得到
+# "代码写 A、IAM 管 B"——那种错在部署前不报，出事时表现为运行期 AccessDenied 或
+# （更糟）Deny 落空而没人知道。绑在一个常量上让这一类错在**结构上**不成立。
+VALIDATED_PREFIX = _validate_const("VALIDATED_PREFIX")
+
 EDGE_LOG_GROUP_PREFIX = _rollup_const("EDGE_LOG_GROUP_PREFIX")
 ROLLUP_METRIC_NAMESPACE = _rollup_const("METRIC_NAMESPACE")
 ROLLUP_METRIC_NAME = _rollup_const("METRIC_NAME")
@@ -312,7 +319,7 @@ class SiteDeployerStack(Stack):
         # ListObjectsV2 = 要 ListBucket = 让构建容器能枚举所有 job。
         package_project.add_to_role_policy(iam.PolicyStatement(
             actions=["s3:GetObject"],
-            resources=[f"{artifacts.bucket_arn}/validated/*"]))
+            resources=[f"{artifacts.bucket_arn}/{VALIDATED_PREFIX}/*"]))
         package_project.add_to_role_policy(iam.PolicyStatement(
             actions=["s3:PutObject"],
             resources=[f"{artifacts.bucket_arn}/artifacts/*"]))
@@ -381,8 +388,61 @@ class SiteDeployerStack(Stack):
                            for n in PLATFORM_FUNCTION_NAMES]
                           + [f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:{n}:*"
                              for n in PLATFORM_FUNCTION_NAMES]),
+            iam.PolicyStatement(  # **validate 产物的写入面收口**（Codex 复审 P1-a）：
+                # 上面那条整桶 Allow 让**每个** step Lambda 都能写 validated/ 与
+                # extracted/，于是 validate.py 里"本前缀由 validate 独占"这句话在
+                # IAM 上不成立。validate 现在走自己的窄角色（下面的 validate_role），
+                # exec_role 这一侧用 Deny 把两个前缀挖掉。
+                #
+                # **为什么是 Deny 而不是重新推导那条整桶 Allow**：整桶 Allow 还养着
+                # 别的步骤（deploy_lambda_site 读 artifacts/*、upload_frontend 与
+                # provision_dsql 读 extracted/*、mark_job 与 undeploy 删前端桶），
+                # 重推容易把其中一个弄断，而那种断法要跑真机部署才看得见。Deny 的
+                # 作用面窄且可证：artifacts 桶下的**写方**只有 validate（这两个前缀）
+                # 与 CodeBuild（自有角色，只写 artifacts/*）——逐函数枚举过
+                # `put_object`/`delete_object` 的全部调用点，mark_job:25 与
+                # undeploy:161 打的都是 FRONTEND_BUCKET，upload_frontend:26 的
+                # 目的桶同样是前端桶。所以这条 Deny 不误伤任何现有步骤。
+                #
+                # 读权限故意不动：兄弟步骤要读 extracted/（上面已枚举），Deny 只列写。
+                effect=iam.Effect.DENY,
+                actions=["s3:PutObject", "s3:DeleteObject"],
+                resources=[f"{artifacts.bucket_arn}/{VALIDATED_PREFIX}/*",
+                           f"{artifacts.bucket_arn}/extracted/*"]),
         ]:
             exec_role.add_to_policy(stmt)
+
+        # validate 的**独立窄角色**（同 recon_role / rollup_role 的 idiom）。它是
+        # validated/ 与 extracted/ 的唯一写方，所以不能和兄弟步骤共用 exec_role
+        # ——共用时 exec_role 的 dynamodb:* on site-* / iam:* on site-rt-* / Lambda
+        # 建删权限也一并落到这个"只解压和校验用户上传包"的函数上。
+        #
+        # **必须自己显式挂 AWSLambdaBasicExecutionRole**：CDK 只在它替你创建执行
+        # 角色时才加这条 managed policy，自带 `role=` 时不会。漏了不报错——函数照样
+        # 部署、照样运行，只是没有 logs:CreateLogStream/PutLogEvents，于是**静默
+        # 没有日志**，出事时无从查起。
+        validate_role = iam.Role(
+            self, "ValidateRole", role_name="site-deployer-validate-role",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            managed_policies=[iam.ManagedPolicy.from_aws_managed_policy_name(
+                "service-role/AWSLambdaBasicExecutionRole")])
+        # 权限恰好是 validate.handler 的全部 AWS 调用面，一条不多：
+        #   · get_object on uploads/{job_id}.zip（owner 预签名 PUT 上来的那份）
+        #   · put_object on extracted/{job_id}/* 与 validated/{job_id}/backend-src.zip
+        #   · jobs 表 UpdateItem（update_job 写 phase/status）+ GetItem
+        #     （F1 起 get_job(consistent=True) 读 upload_etag——漏了它 validate 必挂）
+        # **不给整桶通配、不给 ListBucket（要桶级 ARN）、不给 DeleteObject**：这个
+        # 函数处理的是不可信上传包，它自己也没有任何删除或枚举的调用点。
+        validate_role.add_to_policy(iam.PolicyStatement(
+            actions=["s3:GetObject"],
+            resources=[f"{artifacts.bucket_arn}/uploads/*"]))
+        validate_role.add_to_policy(iam.PolicyStatement(
+            actions=["s3:PutObject"],
+            resources=[f"{artifacts.bucket_arn}/extracted/*",
+                       f"{artifacts.bucket_arn}/{VALIDATED_PREFIX}/*"]))
+        validate_role.add_to_policy(iam.PolicyStatement(
+            actions=["dynamodb:GetItem", "dynamodb:UpdateItem"],
+            resources=[jobs.table_arn]))
 
         for k, v in {"JobsTable": jobs.table_name, "SitesTable": sites.table_name,
                      "AdminsTable": admins.table_name,
@@ -420,7 +480,8 @@ class SiteDeployerStack(Stack):
         }
 
         def step_fn(name: str, handler: str, timeout_s: int = 120,
-                    ephemeral_mb: int | None = None) -> lam_.Function:
+                    ephemeral_mb: int | None = None,
+                    role: iam.IRole | None = None) -> lam_.Function:
             # 打包 functions/ + contract 包；psycopg 由 bundling pip 装入
             return lam_.Function(
                 self, name, function_name=f"site-deployer-{handler}",
@@ -474,7 +535,8 @@ class SiteDeployerStack(Stack):
                                  "containerPath": "/asset-contract"},
                                 {"hostPath": locks_dir,
                                  "containerPath": "/asset-locks"}]}),
-                role=exec_role, timeout=Duration.seconds(timeout_s),
+                # 默认共用 exec_role；只有 validate 传自己的窄角色（见上）。
+                role=role or exec_role, timeout=Duration.seconds(timeout_s),
                 memory_size=512, environment=common_env,
                 # None ⇒ 不渲染 EphemeralStorage，沿用 Lambda 默认 512MB。
                 # 只有真的往 /tmp 写东西的步骤才显式给（当下只有 validate）。
@@ -482,7 +544,8 @@ class SiteDeployerStack(Stack):
                                         if ephemeral_mb else None))
 
         f_validate = step_fn("FnValidate", "validate",
-                             ephemeral_mb=VALIDATE_EPHEMERAL_MB)
+                             ephemeral_mb=VALIDATE_EPHEMERAL_MB,
+                             role=validate_role)
         f_ddb = step_fn("FnProvDdb", "provision_dynamodb", 300)
         f_dsql = step_fn("FnProvDsql", "provision_dsql", 300)
         f_pkg = step_fn("FnPackage", "package_backend", 900)
