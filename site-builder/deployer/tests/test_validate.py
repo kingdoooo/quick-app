@@ -70,3 +70,23 @@ def test_too_many_files_rejected(aws):
     with pytest.raises(validate.ContractViolation) as ei:
         validate.handler({"job_id": jid, "site_id": "many-x1"}, None)
     assert "文件数" in str(ei.value)
+
+
+def test_duplicate_zip_entries_rejected(aws):
+    """重名 ⇒ zipfile（扫描方）与 unzip（构建方）对它的处置不必然一致。"""
+    import io, json, warnings, zipfile, boto3, validate, common
+    jid = common.create_job("a@x.com", "dup-x1")
+    buf = io.BytesIO()
+    # 重名正是本例要造的畸形，zipfile 自己那句 Duplicate name 警告是噪声——
+    # 让它冒到套件输出里，等于用一条恒响的警告把别的警告淹掉。
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("site.json", json.dumps(GOOD_MANIFEST))
+            z.writestr("frontend/index.html", "<h1>good</h1>")
+            z.writestr("frontend/index.html", "<h1>evil</h1>")
+    boto3.client("s3").put_object(Bucket="site-artifacts-1",
+                                  Key=f"uploads/{jid}.zip", Body=buf.getvalue())
+    with pytest.raises(validate.ContractViolation) as ei:
+        validate.handler({"job_id": jid, "site_id": "dup-x1"}, None)
+    assert "重名" in str(ei.value)
