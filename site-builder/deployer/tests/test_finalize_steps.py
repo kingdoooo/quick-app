@@ -984,3 +984,45 @@ def test_success_path_cleans_versions_with_the_deployed_version_kept(aws):
     cv.assert_called_once()
     assert cv.call_args.args[0] == "s-1"
     assert "7" in tuple(cv.call_args.kwargs.get("keep_extra", ()))
+
+
+def test_route_snapshot_read_is_strongly_consistent(aws, monkeypatch):
+    """快照那次 GetItem 必须**真的把 `ConsistentRead=True` 传给 API**。
+
+    为什么要单独一条：这根轴在 moto 下**行为上造不出差异**（moto 的读本来就是
+    强一致），所以任何"跑一遍看结果"的用例都抓不到它——把 `ConsistentRead=True`
+    删掉，本文件照样全绿（实测）。它只能在**真实 API 边界上按参数**断言：
+    "源码里写着" ≠ "真的传给了 API"。
+
+    为什么这根轴值钱：最终一致读可能拿不到"刚刚在线收紧权限"那次写（在线改权限
+    是"sites 推 rev + 改路由"同一事务），快照就记成收紧**之前**的公开路由；
+    mark_job 的失败分支照它整值写回，等于把刚被收紧的站点还原成公开——
+    fail-open 扩权，而且是静默的。
+
+    断言写成 `is True` 而不是"有没有 ConsistentRead 这个键"：`ConsistentRead=False`
+    同样有键，而它恰好就是要防的那个值。
+
+    **别和 test_register_route_uses_consistent_read_after_seed 搞混**：那条管的是
+    **sites 表**的权限读（`get_site` vs `get_site_consistent`），与这里的**路由表
+    快照读**是两个不同的对象。两条名字几乎一样，曾因此造成"已被覆盖"的假象。
+    """
+    import boto3
+    import common
+    import register_route
+    common.upsert_site("s-4", owner="a@x.com", require_login=True,
+                       allowed_users="org", collaborators=[], permissions_rev=4)
+    job_id = common.create_job("a@x.com", "s-4")
+    boto3.client("dynamodb").put_item(TableName="routing", Item=_old_route("s-4"))
+
+    calls = _spy_dynamodb(monkeypatch)
+    register_route.handler(_b3_event(job_id, "s-4"), None)
+
+    reads = [p for op, p in calls
+             if op == "GetItem" and p.get("TableName") == "routing"]
+    # 先证明守卫不是空转：真的有那么一次读，而且只有一次（提交点前每次尝试重读，
+    # 本用例不制造冲突 ⇒ 恰好一次）。没有这条的话，快照读被整个删掉时下面那句
+    # 会 IndexError——红是红，但读起来像守卫自己坏了。
+    assert len(reads) == 1, \
+        f"路由表的快照读发生了 {len(reads)} 次，期望恰好 1 次"
+    assert reads[0].get("ConsistentRead") is True, \
+        "快照读不是强一致 ⇒ 可能读到「在线收紧权限」之前的公开路由，失败恢复会扩权"
