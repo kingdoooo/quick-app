@@ -4,6 +4,9 @@ import re
 TIERS = {"static", "fullstack-nosql", "fullstack-sql"}
 RUNTIMES = {"nodejs22.x"}  # Python 3.13 记为二期（需 db.py 模板/fixture/E2E 支撑）
 TIER_ENGINE = {"static": "none", "fullstack-nosql": "dynamodb", "fullstack-sql": "dsql"}
+# 合同侧只管字符集。站点名还有一条**保留前缀**规则（平台自己的 Lambda 也叫
+# site-*，见 M7-SPEC §2.1），它由入口的 `common.validate_site_name` 单点拦下——
+# 不在这里复制一份：规则抄成两处就迟早对不上。
 NAME_RE = re.compile(r"[a-z][a-z0-9-]{1,29}")
 TABLE_RE = re.compile(r"[a-z][a-z0-9_-]{0,29}")
 EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
@@ -14,7 +17,8 @@ def validate_manifest(manifest: dict) -> list[str]:
 
     name = manifest.get("name")
     if not isinstance(name, str) or not NAME_RE.fullmatch(name):
-        errors.append("name: 必须为小写字母开头、仅含 [a-z0-9-]、长度 2-30")
+        errors.append("name: 必须为小写字母开头、仅含 [a-z0-9-]、长度 2-30"
+                      "（另有保留前缀，由部署入口校验）")
 
     tier = manifest.get("tier")
     if tier not in TIERS:

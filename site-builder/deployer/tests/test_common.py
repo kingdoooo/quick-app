@@ -132,3 +132,24 @@ def test_create_site_record_writes_full_record_once(aws):
     site = common.get_site("s-new")
     assert site["owner"] == "u@x.com" and site["status"] == "DEPLOYING"
     assert site["created_at"]
+
+
+def test_reserved_prefixes_rejected_so_platform_wildcards_stay_decidable():
+    """平台与用户站点共用 `site-` 命名空间：站点名 `auth-tool` ⇒ 函数
+    `site-auth-tool-x1y2z3`，会匹配 `site-auth-*` 通配。任何按前缀通配平台函数的
+    策略（IAM Deny / SCP）都因此不可判定——所以在入口就把这些前缀留出来。"""
+    import common, pytest
+    for bad in ("auth", "panel", "deployer", "key-proxy", "access",
+                "auth-tool", "panel-v2", "deployer-x"):
+        with pytest.raises(common.InvalidSiteName):
+            common.validate_site_name(bad)
+    for ok in ("notes", "voc-dashboard", "authors", "paneling", "accessible"):
+        assert common.validate_site_name(ok) == ok   # 只拦"整词或 name- 起头"
+
+
+def test_existing_site_names_still_valid():
+    """现有 6 个站点无一冲突——加这条校验不需要数据迁移。"""
+    import common
+    for n in ("notes", "promo-roi-tracker", "return-analysis",
+              "returns-dashboard", "team-kudos-wall", "voc-dashboard"):
+        assert common.validate_site_name(n) == n

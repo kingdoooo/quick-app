@@ -221,12 +221,24 @@ class InvalidSiteName(ValueError):
 # Lambda 函数名、IAM 角色名、S3 前缀与子域名，必须在入口就收窄字符集。
 SITE_NAME_RE = re.compile(r"[a-z][a-z0-9-]{1,29}")
 
+# 平台自己的 Lambda 也叫 site-*（site-panel / site-auth-service / site-deployer-* …），
+# 与用户站点函数 site-{site_id} 共用一个命名空间。留出这些词，`site-{平台名}*`
+# 这类通配才可判定——否则站点名 `auth-tool` 会产出 site-auth-tool-x1y2z3，
+# 被 `site-auth-*` 命中，进而被平台自己的 IAM Deny/SCP 误伤（M7-SPEC §2.1）。
+RESERVED_SITE_NAME_PREFIXES = ("panel", "auth", "key-proxy", "access",
+                               "deployer", "runtime")
+
 
 def validate_site_name(name: str) -> str:
     """校验站点名。放行非法字符会导致 DSQL DDL 注入与 IAM/Lambda 命名失败。"""
     if not isinstance(name, str) or not SITE_NAME_RE.fullmatch(name):
         raise InvalidSiteName(
             "站点名必须以小写字母开头，仅含小写字母、数字与连字符，长度 2-30")
+    for p in RESERVED_SITE_NAME_PREFIXES:
+        if name == p or name.startswith(p + "-"):
+            raise InvalidSiteName(
+                f"站点名不能是保留词 {p!r} 或以 {p + '-'!r} 开头"
+                "（与平台自身的 Lambda 命名空间冲突）")
     return name
 
 
