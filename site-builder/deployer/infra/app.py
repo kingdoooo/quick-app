@@ -435,13 +435,42 @@ class SiteDeployerStack(Stack):
                     # 这些函数建 per-site IAM 角色、写路由表、连 DSQL admin，是执行器
                     # 的 TCB；范围声明意味着每次 deploy 都可能装到不同版本。清单里有
                     # hash 但装时不校验等于什么都没做，所以开关和清单必须一起改。
+                    #
+                    # **合同包用 cp 而不是 pip**（Codex 复审 P1-b）：contract 是 PEP 517
+                    # 项目（`requires = ["setuptools>=68"]` + setuptools.build_meta），
+                    # `pip install /asset-contract` 在默认 build isolation 下会**联网
+                    # 下载并执行**一个未锁版本、未锁 hash 的 setuptools，而它的输出进的
+                    # 是全部 site-deployer-* 产物。只锁上面那条 install、放开构建后端，
+                    # 等于闭包根本没闭（实测：加 `--no-index` 后它直接报
+                    # "Could not find a version that satisfies the requirement
+                    # setuptools>=68"，证明那一步真的在向外拿东西）。
+                    # **cp 安全的依据**：site-contract 是本仓库自己的纯 Python 包、
+                    # `dependencies = []`，且没有任何代码读它的 dist 元数据（grep 过
+                    # functions/、contract/src/、mcp/：无 importlib.metadata /
+                    # pkg_resources 消费方）⇒ 装出来的 site-packages 与直接拷包目录
+                    # 对 import 完全等价，少一整条构建工具链。
+                    # 顺带清掉宿主机的 `__pycache__`：pip 是从源码建 wheel（不带
+                    # pycache），cp 会把开发机上用别的 Python 版本编出来的 .pyc 一起
+                    # 塞进产物——它们在 Lambda 上只会被忽略，但让同一份源码产出的
+                    # 工件随开发机状态变化。
+                    #
+                    # **挂载卷的内容不进 CDK asset hash**（ledger 实测：两份不同的
+                    # lockfile 算出同一个 asset.14ea085b…）——asset hash 只看
+                    # /asset-input 那个源目录（functions/）。所以改 contract/ 或改锁定
+                    # 清单之后**必须 `rm -rf cdk.out`**，否则 CDK 复用旧 asset，
+                    # 部署出去的还是上一次的字节。
                     "command": ["bash", "-c",
                                 "pip install --require-hashes -r "
                                 "/asset-locks/bundling-requirements.txt "
                                 "-t /asset-output -q && "
                                 f"cp -r /asset-input/. /asset-output/ && "
-                                "pip install /asset-contract -t /asset-output -q"],
-                    "volumes": [{"hostPath": contract_dir + "/..",
+                                "cp -r /asset-contract/contract /asset-output/ && "
+                                "find /asset-output/contract -name __pycache__ "
+                                "-type d -prune -exec rm -rf {} +"],
+                    # 挂 contract/src（= contract_dir）而不是它的父目录：父目录是整个
+                    # `contract/`，把 `contract/.venv`、build/、tests/ 一并暴露给构建
+                    # 容器，而容器里真正需要的只有 `src/contract` 这一个包目录。
+                    "volumes": [{"hostPath": contract_dir,
                                  "containerPath": "/asset-contract"},
                                 {"hostPath": locks_dir,
                                  "containerPath": "/asset-locks"}]}),

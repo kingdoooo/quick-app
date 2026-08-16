@@ -144,6 +144,79 @@ def test_deploy_auth_installs_with_require_hashes():
     assert argv[argv.index("-r") + 1].endswith("requirements.txt"), argv
 
 
+def _segments(cmd: str) -> list[str]:
+    """`&&` 串起来的 shell 命令 → 逐段。
+
+    判定必须落在**段**上而不是整串：整串 substring 匹配下，只要命令里任何一处
+    出现过那个开关，"这条 install 校验了 hash"就成立——而我们要判的是**每一条**
+    install 各自带没带。这正是 Ruling 24 那次更正换掉的形态。
+    """
+    return [s.strip() for s in cmd.split("&&")]
+
+
+def test_every_pip_install_in_bundling_requires_hashes():
+    """bundling 命令里**每一段** pip install 都必须带 --require-hashes。
+
+    A7 只保证了第一条（装 bundling-requirements.txt）。第二条原来是
+    `pip install /asset-contract`，而 site-contract 是 PEP 517 项目
+    （requires = ["setuptools>=68"]）⇒ 默认 build isolation 会联网下载并**执行**一个
+    未锁版本、未锁 hash 的 setuptools，全部 site-deployer-* 产物都受它影响
+    （Codex 复审 P1-b；实测 `--no-index` 下报 Could not find a version that satisfies
+    the requirement setuptools>=68）。所以判定要落在**每一段**上，不是"命令里出现过
+    这个开关"。
+
+    第二条断言堵的是"换个写法把 PEP 517 装回来"：`/asset-contract` 不许与
+    `pip install` 同段——那个挂载点是本仓库自己的源码目录，进产物的正确方式是拷贝
+    文件，不是让 pip 去 build 它。
+    """
+    specs = _bundling_specs(APP_PY.read_text())
+    assert specs, "app.py 里找不到带 command+volumes 的 bundling 配置"
+    n_pip = 0
+    for cmd, _ in specs:
+        for seg in _segments(cmd):
+            if "pip install" not in seg:
+                continue
+            n_pip += 1
+            assert "--require-hashes" in seg, (
+                f"这一段 pip install 不校验 hash，装出来的东西没有任何来源保证："
+                f"{seg}")
+            assert "/asset-contract" not in seg, (
+                f"又让 pip 去 build 合同包了（PEP 517 会联网装未锁的 setuptools "
+                f"并执行它）：{seg}")
+    assert n_pip, "bundling 里一条 pip install 都没解析出来——本条已空转，先查 app.py"
+
+
+def test_contract_package_lands_in_the_asset_without_pep517():
+    """合同包必须以文件形式进产物：断言 cp 段的源路径落在挂载卷的 containerPath
+    之下（挂载路径与 cp 源路径不一致时 synth 会 FailedToBundleAsset，但那要跑
+    Docker 才看得见，所以这里按配置对齐一次）。
+
+    只拷 `/asset-contract/contract` 这个**包目录**，不拷挂载根——挂载根是
+    `contract/src`，还有个 `site_contract.egg-info` 不该进 Lambda 产物。
+    """
+    specs = _bundling_specs(APP_PY.read_text())
+    assert specs, "app.py 里找不到带 command+volumes 的 bundling 配置"
+    checked = 0
+    for cmd, mounts in specs:
+        for seg in _segments(cmd):
+            if "/asset-contract" not in seg:
+                continue
+            checked += 1
+            assert seg.startswith("cp "), (
+                f"合同包要用 cp 拷进产物，不许再走 pip/PEP 517：{seg}")
+            srcs = re.findall(r"(/asset-contract[\w./-]*)", seg)
+            assert srcs, seg
+            for src in srcs:
+                assert any(src.startswith(m.rstrip("/") + "/") for m in mounts), (
+                    f"{src} 不在任何 containerPath({sorted(mounts)}) 之下："
+                    f"容器里没有这个路径，synth 会 FailedToBundleAsset")
+            assert any(s.endswith("/contract") for s in srcs), (
+                f"要拷的是包目录 /asset-contract/contract，不是挂载根（会把 "
+                f"egg-info 一起塞进产物）：{seg}")
+    assert checked == 1, (
+        f"预期恰好一段命令引用 /asset-contract，实际 {checked} 段")
+
+
 def test_bundling_lockfile_is_mounted_not_reached_via_asset_input_parent():
     """清单在容器里的路径必须真的挂进去了，且那条 install 真的校验 hash。
 
