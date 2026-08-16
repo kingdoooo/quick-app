@@ -41,7 +41,12 @@ def ensure_secret(name: str, generate) -> str:
 def build_zip() -> bytes:
     src = Path(__file__).parent
     with tempfile.TemporaryDirectory() as td:
-        subprocess.run(["python3", "-m", "pip", "install", "-r", str(src / "requirements.txt"),
+        # --require-hashes：清单里有 hash 但装的时候不校验，等于什么都没做。
+        # 全量语义——任何一个包（含传递依赖）缺 hash 或对不上即整条 install
+        # 失败，而不是静默装一个被替换过的包。requirements.txt 的平台/Python
+        # 参数必须与下面这三个开关一致，理由见那个文件的头部。
+        subprocess.run(["python3", "-m", "pip", "install", "--require-hashes",
+                        "-r", str(src / "requirements.txt"),
                         "-t", td, "-q", "--platform", "manylinux2014_x86_64",
                         "--only-binary", ":all:", "--python-version", "3.13"], check=True)
         buf = io.BytesIO()

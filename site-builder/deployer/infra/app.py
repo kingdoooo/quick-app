@@ -397,6 +397,11 @@ class SiteDeployerStack(Stack):
         # ---- Task 17: Lambda 函数群 + site-deploy 状态机 ----
         fn_dir = str(Path(__file__).parents[1] / "functions")
         contract_dir = str(Path(__file__).parents[2] / "contract" / "src")
+        # bundling 的锁定清单放在本目录，**必须显式挂进容器**：/asset-input 挂的是
+        # functions/，它在容器里的父目录是 `/` 而不是宿主的 infra/——写
+        # /asset-input/../infra/bundling-requirements.txt 会在容器里指向 /infra/…，
+        # 那个路径不存在，pip 直接找不到清单。
+        locks_dir = str(Path(__file__).parent)
         common_env = {
             "JOBS_TABLE": jobs.table_name, "SITES_TABLE": sites.table_name,
             "ADMINS_TABLE": admins.table_name,
@@ -426,12 +431,20 @@ class SiteDeployerStack(Stack):
                     # 钉死 amd64：Lambda 默认 x86_64，Apple Silicon 上不钉平台
                     # 会装出 aarch64 的 psycopg 二进制导致运行时 import 失败
                     "platform": "linux/amd64",
+                    # --require-hashes 装锁定清单，不再裸装 'psycopg[binary]' sqlparse：
+                    # 这些函数建 per-site IAM 角色、写路由表、连 DSQL admin，是执行器
+                    # 的 TCB；范围声明意味着每次 deploy 都可能装到不同版本。清单里有
+                    # hash 但装时不校验等于什么都没做，所以开关和清单必须一起改。
                     "command": ["bash", "-c",
-                                "pip install 'psycopg[binary]' sqlparse -t /asset-output -q && "
+                                "pip install --require-hashes -r "
+                                "/asset-locks/bundling-requirements.txt "
+                                "-t /asset-output -q && "
                                 f"cp -r /asset-input/. /asset-output/ && "
                                 "pip install /asset-contract -t /asset-output -q"],
                     "volumes": [{"hostPath": contract_dir + "/..",
-                                 "containerPath": "/asset-contract"}]}),
+                                 "containerPath": "/asset-contract"},
+                                {"hostPath": locks_dir,
+                                 "containerPath": "/asset-locks"}]}),
                 role=exec_role, timeout=Duration.seconds(timeout_s),
                 memory_size=512, environment=common_env,
                 # None ⇒ 不渲染 EphemeralStorage，沿用 Lambda 默认 512MB。
