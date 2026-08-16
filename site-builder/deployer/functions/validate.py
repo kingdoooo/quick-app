@@ -70,14 +70,22 @@ def handler(event, context):
             if total / compressed > 100:
                 raise ContractViolation(f"压缩比 {total // compressed}:1 超过 100:1（疑似 zip bomb）")
             names = z.namelist()
-            if len(names) != len(set(names)):
-                dup = sorted({n for n in names if names.count(n) > 1})
-                raise ContractViolation(
-                    f"zip 内有重名条目 {dup[:5]}——解包方与校验方对重名的处置"
-                    "不必然一致，一律拒绝")
-            for m in z.namelist():  # zip-slip 防护
+            for m in names:  # zip-slip 防护
                 if m.startswith("/") or ".." in m:
                     raise ContractViolation(f"非法路径: {m}")
+            # 按**落盘路径**去重，不是按原名：extractall 丢掉空段与 "." 段
+            # （"backend/app.js"、"./backend/app.js"、"backend//app.js" 全落到同一个
+            # 文件）且保留**最后**一份字节，于是三个各不相同的 namelist 条目只留一份
+            # ——按原名去重看不见这种撞车。".." 已被上面拒掉，故只需处理 "" 与 "."。
+            # 不替用户挑赢家，一律拒绝。**这段必须留在 MAX_ZIP_ENTRIES 之下**：下面的
+            # count() 是 O(n²)，靠条目数上限先兜住（test_entry_cap_precedes_dup_check 锁死）。
+            paths = ["/".join(s for s in n.split("/") if s not in ("", "."))
+                     for n in names]
+            if len(paths) != len(set(paths)):
+                dup = sorted({p for p in paths if paths.count(p) > 1})
+                raise ContractViolation(
+                    f"zip 内有重名条目（按落盘路径）{dup[:5]}——解包方与校验方对重名的"
+                    "处置不必然一致，一律拒绝")
             z.extractall(root)
 
         manifest_path = root / "site.json"

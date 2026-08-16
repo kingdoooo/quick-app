@@ -1,5 +1,6 @@
 import io
 import json
+import warnings
 import zipfile
 
 import boto3
@@ -74,7 +75,7 @@ def test_too_many_files_rejected(aws):
 
 def test_duplicate_zip_entries_rejected(aws):
     """重名 ⇒ zipfile（扫描方）与 unzip（构建方）对它的处置不必然一致。"""
-    import io, json, warnings, zipfile, boto3, validate, common
+    import validate, common
     jid = common.create_job("a@x.com", "dup-x1")
     buf = io.BytesIO()
     # 重名正是本例要造的畸形，zipfile 自己那句 Duplicate name 警告是噪声——
@@ -128,3 +129,42 @@ def test_buildspec_and_iam_name_the_validated_prefix_only(aws):
     assert f"{prefix}/$JOB_ID/" in spec and "uploads/$JOB_ID" not in spec
     app = (root / "infra" / "app.py").read_text()
     assert f"/{prefix}/*" in app and "/uploads/*" not in app
+
+
+def test_extraction_path_collision_rejected(aws):
+    """`./a` 与 `a//b` 在 namelist 里各自独立，extractall 却把它们折叠成同一个
+    落盘路径、只保留最后一份字节——按原名去重看不见这种撞车。"""
+    import validate, common
+    jid = common.create_job("a@x.com", "coll-x1")
+    _upload_site_zip(jid, GOOD_MANIFEST, {"backend/app.js": "FIRST",
+                                          "./backend/app.js": "SECOND",
+                                          "backend//app.js": "THIRD"})
+    raw = boto3.client("s3").get_object(
+        Bucket="site-artifacts-1", Key=f"uploads/{jid}.zip")["Body"].read()
+    names = zipfile.ZipFile(io.BytesIO(raw)).namelist()
+    assert len(names) == len(set(names)), "前提：不能有精确重名，否则测的是上一条守卫"
+
+    with pytest.raises(validate.ContractViolation) as ei:
+        validate.handler({"job_id": jid, "site_id": "coll-x1"}, None)
+    assert "重名" in str(ei.value)
+
+
+def test_entry_cap_precedes_dup_check(aws):
+    """条目数上限必须留在重名检查**之上**：重名检查里的 count() 是 O(n²)，
+    没有上限先兜住就是个 CPU 放大面。既超量又重名 ⇒ 必须报「文件数」。"""
+    import validate, common
+    jid = common.create_job("a@x.com", "order-x1")
+    buf = io.BytesIO()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("site.json", json.dumps(GOOD_MANIFEST))
+            for i in range(validate.MAX_ZIP_ENTRIES):
+                z.writestr(f"frontend/f{i}.txt", "x")
+            z.writestr("frontend/f0.txt", "dup")  # 精确重名，且总数已超上限
+    boto3.client("s3").put_object(Bucket="site-artifacts-1",
+                                  Key=f"uploads/{jid}.zip", Body=buf.getvalue())
+    with pytest.raises(validate.ContractViolation) as ei:
+        validate.handler({"job_id": jid, "site_id": "order-x1"}, None)
+    assert "文件数" in str(ei.value)
+    assert "重名" not in str(ei.value)
