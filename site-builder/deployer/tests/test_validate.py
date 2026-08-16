@@ -459,3 +459,61 @@ def test_validate_reads_the_job_record_with_a_consistent_read(aws, monkeypatch):
     assert calls, "validate 没有读 job 记录——本条已空转"
     assert all(kw.get("consistent") is True for _, kw in calls), (
         f"validate 用最终一致读取 upload_etag：{calls}")
+
+
+def test_scripts_that_bypass_mcp_to_create_jobs_pin_the_upload_etag():
+    """绕过 MCP 自己建 job 并起状态机的脚本，必须自己补上 confirm_upload 那一步。
+
+    **这条守卫的全部价值在于把一个只有真机才暴露的断路提前到单测。**
+    `scripts/deploy_fixture.py` 完全绕过 MCP（自己 put_object 到 uploads/、自己
+    put_item 建 job、自己 start_execution），而 validate 现在缺 `upload_etag` 就
+    fail-closed ⇒ 它建的每个 job 都会在第一步失败。它断的是本计划的主闸门：
+    `tests/test_e2e_fixtures.py` 用 subprocess 调它，而那是 P1-1/P1-2 唯一的真机证据。
+    真机跑一次要 6 分钟且需要 AWS 凭证——所以这条必须是静态的、免费的。
+
+    按**类**锁而不是只钉 deploy_fixture.py 一个文件名：判据是"既往 uploads/ 写东西、
+    又起状态机"，将来任何新的 bypass 脚本都会被这条自动罩住。`deploy_fixture.py`
+    本身写成硬性下界，防的是判据哪天失效后集合悄悄变空、这条断言恒真
+    （本仓库记过的"空集合上 all() 恒真"形态）。
+
+    两侧的松紧**故意不对称**：
+      · **选谁来查**用纯文本，宁可多选——多选一个脚本只是多要求它写 etag（安全方向），
+        漏选才是致命的；
+      · **判它写了没有**必须走 AST 的字符串字面量。这条是实测教训不是洁癖：我第一版
+        用文本搜 `upload_etag`，而我给 deploy_fixture.py 补的**注释里就有这个词**
+        ⇒ 删掉真正那行赋值之后守卫照样绿（注释自己满足了自己的断言，与上一个提交
+        修掉的 A7 同型）。注释不在 AST 里，docstring 显式剔除。
+    """
+    import ast
+    from pathlib import Path
+
+    def _code_strings(src: str) -> list[str]:
+        """源码里**代码位置**的字符串字面量：注释天然不进 AST，docstring 剔掉。"""
+        tree = ast.parse(src)
+        docs = set()
+        for node in ast.walk(tree):
+            body = getattr(node, "body", None)
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                                 ast.AsyncFunctionDef)) and body:
+                first = body[0]
+                if (isinstance(first, ast.Expr)
+                        and isinstance(first.value, ast.Constant)
+                        and isinstance(first.value.value, str)):
+                    docs.add(id(first.value))
+        return [n.value for n in ast.walk(tree)
+                if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                and id(n) not in docs]
+
+    scripts = sorted((Path(__file__).parents[2] / "scripts").rglob("*.py"))
+    assert scripts, "找不到 site-builder/scripts/——本条已空转"
+    sources = {p: p.read_text(encoding="utf-8") for p in scripts}
+    bypass = {p: s for p, s in sources.items()
+              if "uploads/" in s and "start_execution" in s}
+    assert "deploy_fixture.py" in {p.name for p in bypass}, (
+        "判据没能选出 deploy_fixture.py——它是已知的 bypass 脚本，选不中说明这条"
+        f"守卫已经空转（当前选中：{sorted(p.name for p in bypass)}）")
+    missing = sorted(p.name for p, s in bypass.items()
+                     if not any("upload_etag" in lit for lit in _code_strings(s)))
+    assert not missing, (
+        f"{missing} 绕过 MCP 建 job 但没写 upload_etag——它建的每个 job 都会在 "
+        "validate 第一步以「任务记录里没有 upload_etag」失败（E2E 闸门全红）")

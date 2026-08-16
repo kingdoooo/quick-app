@@ -39,8 +39,9 @@ def main(fixture_dir: str, owner: str = "fixture@test"):
             z.write(run_sh, "run.sh")
 
     s3 = boto3.client("s3", region_name="us-east-1")
-    s3.put_object(Bucket=f"site-artifacts-{ACCT}", Key=f"uploads/{job_id}.zip",
-                  Body=buf.getvalue())
+    body = buf.getvalue()
+    put = s3.put_object(Bucket=f"site-artifacts-{ACCT}",
+                        Key=f"uploads/{job_id}.zip", Body=body)
     now = datetime.now(timezone.utc).isoformat()
     # **必须先建 sites 记录**：MCP 的 do_deploy_site 会调 common.upsert_site 写
     # owner/name/status，而本脚本绕过 MCP 直接起状态机——不写的话 sites 表里
@@ -54,10 +55,18 @@ def main(fixture_dir: str, owner: str = "fixture@test"):
             ExpressionAttributeNames={"#o": "owner", "#n": "name", "#s": "status"},
             ExpressionAttributeValues={":o": owner, ":n": manifest["name"],
                                        ":s": "DEPLOYING"})
+    # **同理必须自己钉 upload_etag**：MCP 的 do_confirm_upload 会把它 HEAD 到的
+    # ETag 写进 job 记录，而 validate 用 `IfMatch` 读同一份字节、缺这个属性一律
+    # fail-closed（不做假值兜底）。本脚本绕过 MCP ⇒ 不写的话它建的**每个** job 都会
+    # 在第一步以"任务记录里没有 upload_etag"失败，连带 test_e2e_fixtures.py 全红。
+    # ETag 取**上面那次 put_object 的返回**，不为此再 HEAD 一次：第二次 HEAD 可能
+    # 已经看到另一个对象（与 mcp/server.py 里同一条理由）。
+    # upload_bytes 只是审计字段，真正的校验是 validate 对 ContentLength 那一次。
     boto3.resource("dynamodb", region_name="us-east-1").Table(
         CFG["Deployer"]["jobs_table"]).put_item(Item={
             "job_id": job_id, "site_id": site_id, "owner": owner,
             "status": "PENDING", "phase": "submitted", "error": "", "url": "",
+            "upload_etag": put["ETag"], "upload_bytes": len(body),
             "created_at": now, "updated_at": now})
     boto3.client("stepfunctions", region_name="us-east-1").start_execution(
         stateMachineArn=CFG["Deployer"]["state_machine_arn"],
