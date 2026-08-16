@@ -7,6 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import boto3
+import botocore.exceptions
 
 from contract import scan_redlines, validate_manifest
 import common
@@ -19,14 +20,31 @@ import common
 # 落 /tmp 的有两样，所以磁盘下界是本上界的 2 倍：
 #   · `extractall` 解出来的整棵树（≤ 本上界；准确说 ≤ zip 里**声明**的总大小）；
 #   · `_pack_build_input` 重新打包出来的工件（run.sh + backend/ 的子集）。
-# 留在**内存**里的是另一回事，本上界管不到：下载下来的整个上传包（`data`，在任何
-# 检查之前就 read() 了）、以及 extracted/ 上传循环里当下那一个文件的字节。
-# 那条轴目前没有任何常量绑着（M7 遗留项，另有跟进任务）。
+# 留在**内存**里的是另一回事，本上界管不到：下载下来的整个上传包（`data`）、
+# 以及 extracted/ 上传循环里当下那一个文件的字节。前者现在由下面的
+# `MAX_UPLOAD_BYTES` 在 `read()` **之前**兜住（Task F1；在那之前它无常量可绑）。
 MAX_ZIP_ENTRIES = 2000
 MAX_UNPACKED_BYTES = 200 * 1024 * 1024
 
+# confirm_upload 在 MCP 入口对**那一刻**的对象查过 50MB（mcp/server.py 的
+# MAX_ZIP_BYTES，由 test_upload_cap_matches_the_50mb_check_at_the_mcp_entrance
+# 按 AST 锁住两处相等）。这里再查一次是因为那个检查是 HEAD、而预签名 PUT URL 还活
+# 900s ⇒ 确认之后仍可被覆盖成任意大小。**必须在 read() 之前**：本函数 512MB 内存，
+# 读一个 5GB 对象是 OOM 而不是拒绝。
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+
 # CodeBuild 唯一允许的输入前缀。owner 只有 uploads/{job_id}.zip 的预签名 PUT，
-# 碰不到这里 ⇒ 本前缀下的对象在 job 生命周期内不可变。
+# 碰不到这里 ⇒ **owner 写不进本前缀**（这一条为真）。
+#
+# 但"本前缀下的对象在 job 生命周期内不可变"**不成立**，别那么读：
+#   · validate 自己在重试时会重写它（SFN 对本步骤有 MaxAttempts:6 的
+#     service-exception 重试）。重写的字节是同一份——那由下面 `IfMatch` 保证
+#     （test_upload_is_pinned_to_the_bytes_confirm_upload_checked /
+#      test_retry_with_the_pinned_bytes_still_succeeds），而不是由"没人能写"保证；
+#   · `infra/app.py` 里所有 step Lambda 共用的 `exec_role` 对整个 artifacts 桶
+#     都有 `PutObject`/`DeleteObject` ⇒ 兄弟步骤在 IAM 上也能写这里。
+# "只有 validate 能写这个前缀"要靠独立 IAM 角色 + exec_role 显式 Deny 收口
+# （Task F7），**本文件不承诺那一条**。
 VALIDATED_PREFIX = "validated"
 
 
@@ -75,7 +93,29 @@ def handler(event, context):
     s3 = boto3.client("s3")
     bucket = os.environ["ARTIFACTS_BUCKET"]
 
-    obj = s3.get_object(Bucket=bucket, Key=f"uploads/{job_id}.zip")
+    # 钉住 confirm_upload 当时那份字节。SFN 对本步骤有 MaxAttempts:6 的
+    # service-exception 重试，而上传 URL 在 900s 内仍可覆盖 ⇒ 不钉的话两次 attempt
+    # 可以读到不同的包：extracted/ 变成两棵树的并集（旧前端文件仍会被发布、被删掉的
+    # migration 仍会执行），且 SFN 携带的 manifest 与 CodeBuild 读到的代码可能来自
+    # 不同 attempt。IfMatch 让第二种情况变成 412 而不是静默分歧。
+    job = common.get_job(job_id) or {}
+    etag = job.get("upload_etag")
+    if not etag:
+        raise ContractViolation(
+            "任务记录里没有 upload_etag——请重新调用 confirm_upload（本任务可能由旧版"
+            "MCP 创建）")
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=f"uploads/{job_id}.zip", IfMatch=etag)
+    except botocore.exceptions.ClientError as e:
+        if e.response.get("Error", {}).get("Code") not in ("PreconditionFailed", "412"):
+            raise
+        raise ContractViolation(
+            "上传的 site.zip 在确认之后被改动过，本次部署已取消——请重新上传并"
+            "重新确认（校验与构建必须是同一份字节）") from e
+    if obj["ContentLength"] > MAX_UPLOAD_BYTES:
+        raise ContractViolation(
+            f"site.zip {obj['ContentLength']} 字节超过 "
+            f"{MAX_UPLOAD_BYTES // 1024 // 1024}MB 上限")
     data = obj["Body"].read()
 
     # 两个临时目录都在 /tmp（尺寸由 VALIDATE_EPHEMERAL_MB 覆盖）：`root` 是解包树，

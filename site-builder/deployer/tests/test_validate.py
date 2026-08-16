@@ -7,14 +7,36 @@ import boto3
 import pytest
 
 
-def _upload_site_zip(job_id: str, manifest: dict, files: dict):
+def _pin(job_id: str, etag: str, length: int):
+    """模拟 confirm_upload：把 HEAD 到的 ETag 钉进 job 记录。
+
+    真实流程里 validate 之前必然经过 confirm_upload，助手如实建出那个状态才对
+    ——`pin=False` 就是"模拟老 MCP / 绕过 confirm"。
+    """
+    boto3.client("dynamodb").update_item(
+        TableName="site-deploy-jobs", Key={"job_id": {"S": job_id}},
+        UpdateExpression="SET upload_etag = :e, upload_bytes = :n",
+        ExpressionAttributeValues={":e": {"S": etag}, ":n": {"N": str(length)}})
+
+
+def _upload_site_zip(job_id: str, manifest: dict, files: dict,
+                     *, pin: bool = True) -> str:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("site.json", json.dumps(manifest))
         for path, content in files.items():
             z.writestr(path, content)
-    boto3.client("s3").put_object(Bucket="site-artifacts-1",
-                                  Key=f"uploads/{job_id}.zip", Body=buf.getvalue())
+    body = buf.getvalue()
+    r = boto3.client("s3").put_object(Bucket="site-artifacts-1",
+                                      Key=f"uploads/{job_id}.zip", Body=body)
+    if pin:
+        _pin(job_id, r["ETag"], len(body))
+    return r["ETag"]
+
+
+def _s3_keys(prefix: str) -> list[str]:
+    return sorted(o["Key"] for o in boto3.client("s3").list_objects_v2(
+        Bucket="site-artifacts-1", Prefix=prefix).get("Contents", []))
 
 
 GOOD_MANIFEST = {"name": "hello", "tier": "static",
@@ -98,8 +120,12 @@ def test_duplicate_zip_entries_rejected(aws):
             z.writestr("site.json", json.dumps(GOOD_MANIFEST))
             z.writestr("frontend/index.html", "<h1>good</h1>")
             z.writestr("frontend/index.html", "<h1>evil</h1>")
-    boto3.client("s3").put_object(Bucket="site-artifacts-1",
-                                  Key=f"uploads/{jid}.zip", Body=buf.getvalue())
+    # 手工造包也要走 confirm_upload 那一步，否则先撞上"缺 upload_etag"那条守卫，
+    # 测的就不是重名了（本文件里 _upload_site_zip 帮不上忙的两处之一）。
+    body = buf.getvalue()
+    r = boto3.client("s3").put_object(Bucket="site-artifacts-1",
+                                      Key=f"uploads/{jid}.zip", Body=body)
+    _pin(jid, r["ETag"], len(body))
     with pytest.raises(validate.ContractViolation) as ei:
         validate.handler({"job_id": jid, "site_id": "dup-x1"}, None)
     assert "重名" in str(ei.value)
@@ -305,9 +331,104 @@ def test_entry_cap_precedes_dup_check(aws):
             for i in range(validate.MAX_ZIP_ENTRIES):
                 z.writestr(f"frontend/f{i}.txt", "x")
             z.writestr("frontend/f0.txt", "dup")  # 精确重名，且总数已超上限
-    boto3.client("s3").put_object(Bucket="site-artifacts-1",
-                                  Key=f"uploads/{jid}.zip", Body=buf.getvalue())
+    body = buf.getvalue()
+    r = boto3.client("s3").put_object(Bucket="site-artifacts-1",
+                                      Key=f"uploads/{jid}.zip", Body=body)
+    _pin(jid, r["ETag"], len(body))
     with pytest.raises(validate.ContractViolation) as ei:
         validate.handler({"job_id": jid, "site_id": "order-x1"}, None)
     assert "文件数" in str(ei.value)
     assert "重名" not in str(ei.value)
+
+
+def test_upload_is_pinned_to_the_bytes_confirm_upload_checked(aws):
+    """同一个 job 的上传 key 在不同时刻可以是不同字节：SFN 对每个 LambdaInvoke 都有
+    MaxAttempts:6 的 service-exception 重试（实测合成模板），而预签名 PUT URL 还活
+    900s。两次 attempt 读到不同包时，发布出去的前端是两棵树的并集、被删掉的 migration
+    仍会执行、manifest 与代码可能来自不同 attempt——三者都不是"字节没校验"，而是
+    "这个组合没被一起校验过"。钉住 confirm 当时那份字节后，重试要么同字节要么 412。"""
+    import validate, common
+    jid = common.create_job("a@x.com", "pin-x1")
+    _upload_site_zip(jid, FULLSTACK_MANIFEST, GOOD_BACKEND)          # attempt 1，已钉
+    _upload_site_zip(jid, FULLSTACK_MANIFEST,                        # owner 用仍有效的
+                     {**GOOD_BACKEND, "backend/app.js": "// GET /api/health\nok2()"},
+                     pin=False)                                      # 预签名 URL 覆盖
+    with pytest.raises(validate.ContractViolation) as ei:
+        validate.handler({"job_id": jid, "site_id": "pin-x1"}, None)
+    assert "确认" in str(ei.value) and "重新上传" in str(ei.value)
+    assert _s3_keys(f"validated/{jid}/") == []      # 也不许留下构建工件
+
+
+def test_missing_upload_etag_fails_closed(aws):
+    """缺 etag 一律拒，**不做"那就不钉了直接读"的兜底**——那等于把这条守卫做成可选的
+    （本仓库记过的"假值兜底"形态）。代价是一条部署顺序约束：MCP 必须先于 deployer 栈
+    部署，否则窗口内旧 MCP 建的 job 全在第一步失败（已进 ledger Ruling 30 与 C1）。"""
+    import validate, common
+    jid = common.create_job("a@x.com", "noetag-x1")
+    _upload_site_zip(jid, GOOD_MANIFEST, {"frontend/index.html": "<h1>hi</h1>"},
+                     pin=False)
+    with pytest.raises(validate.ContractViolation) as ei:
+        validate.handler({"job_id": jid, "site_id": "noetag-x1"}, None)
+    assert "upload_etag" in str(ei.value)
+
+
+def test_oversized_upload_rejected_before_reading_the_body(aws, monkeypatch):
+    """confirm 的 50MB 只对 HEAD 当时那个对象成立（HEAD→GET TOCTOU）。**Body.read 一被
+    调用就炸**，所以这条锁的是"顺序"，不只是"有个检查"——把大小检查写在 read 之后
+    同样能让"太大就拒"的断言变绿，而内存已经炸了。"""
+    import validate, common
+    jid = common.create_job("a@x.com", "huge-x1")
+    _upload_site_zip(jid, GOOD_MANIFEST, {"frontend/index.html": "<h1>hi</h1>"})
+
+    class _Boom:
+        def read(self, *a, **k):
+            raise AssertionError("不许在大小检查之前读 Body")
+
+    orig = boto3.client
+    real_s3 = orig("s3")
+
+    class _FakeS3:
+        exceptions = real_s3.exceptions
+
+        def get_object(self, **kw):
+            return {"ContentLength": 5 * 1024 ** 3, "Body": _Boom()}
+
+        def __getattr__(self, n):
+            return getattr(real_s3, n)
+
+    monkeypatch.setattr(validate.boto3, "client",
+                        lambda name, *a, **kw: _FakeS3() if name == "s3"
+                        else orig(name, *a, **kw))
+    with pytest.raises(validate.ContractViolation) as ei:
+        validate.handler({"job_id": jid, "site_id": "huge-x1"}, None)
+    assert "上限" in str(ei.value)
+
+
+def test_retry_with_the_pinned_bytes_still_succeeds(aws):
+    """钉住字节**不许**把合法重试变成失败：service-exception 重试是对真实瞬时故障有用
+    的机制，本项不砍它（Ruling 29）。同一份字节重跑必须仍然成功、结果一致、
+    extracted/ 集合不变（= 没有陈旧并集）。"""
+    import validate, common
+    jid = common.create_job("a@x.com", "retry-x1")
+    _upload_site_zip(jid, FULLSTACK_MANIFEST, GOOD_BACKEND)
+    first = validate.handler({"job_id": jid, "site_id": "retry-x1"}, None)
+    before = _s3_keys(f"extracted/{jid}/")
+    second = validate.handler({"job_id": jid, "site_id": "retry-x1"}, None)
+    assert second == first
+    assert _s3_keys(f"extracted/{jid}/") == before
+
+
+def test_upload_cap_matches_the_50mb_check_at_the_mcp_entrance(aws):
+    """期望值**从 MCP 的源码 AST 里取**，不抄字面量：两处不一致时，MCP 放宽而这边没跟
+    的症状是"合法上传在部署第一步被拒"，反向则是这条硬上限失去意义。"""
+    import ast
+    from pathlib import Path
+    import validate
+    src = (Path(__file__).parents[2] / "mcp" / "server.py").read_text(encoding="utf-8")
+    found = [n.value for n in ast.walk(ast.parse(src))
+             if isinstance(n, ast.Assign) and len(n.targets) == 1
+             and isinstance(n.targets[0], ast.Name)
+             and n.targets[0].id == "MAX_ZIP_BYTES"]
+    assert found, "mcp/server.py 里找不到 MAX_ZIP_BYTES 的赋值——本条已空转"
+    expected = eval(compile(ast.Expression(found[0]), "<mcp>", "eval"))
+    assert validate.MAX_UPLOAD_BYTES == expected

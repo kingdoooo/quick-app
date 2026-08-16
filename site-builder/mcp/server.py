@@ -307,17 +307,32 @@ def do_confirm_upload(owner: str, job_id: str) -> dict:
     # 的"仍是管理员"）的 ConditionCheck。否则鉴权通过后、启动部署前的窗口里
     # owner 若移除了协作者，这个旧请求仍会把 job 置 RUNNING 并起 SFN，
     # 已撤权的人提交的代码照样覆盖生产站点（Codex 复审 2026-08-07 P1）。
+    #
+    # 同一笔里还把**上面那一次 HEAD** 的 ETag 与字节数钉进 job 记录：
+    #   · 钉的必须是**那一次** HEAD 的返回，不许为取 etag 再 HEAD 一次——上面的
+    #     50MB 是对第一次看到的那个对象查的，第二次 HEAD 可能已经是另一个对象
+    #     （预签名 PUT URL 还活 900s，谁都没有机制作废它），于是"被钉住的字节"
+    #     与"被查过大小的字节"就不是同一份了（test_confirm_upload_pins_the_etag_
+    #     it_head_checked 按 head_object 的**次数**锁死）；
+    #   · validate 用它做 `IfMatch` 读同一份字节（deployer/functions/validate.py
+    #     的 MAX_UPLOAD_BYTES 那段）。SFN 对每个步骤都有 MaxAttempts:6 的
+    #     service-exception 重试，不钉的话两次 attempt 可以读到不同的包；
+    #   · 与 PENDING→RUNNING **同一笔**：第二次点击（AlreadyStarted）因此既不推进
+    #     状态也改不到 etag，否则重放能把已经开跑的 job 钉到新字节上。
     import botocore.exceptions
     items = [
         {"Update": {
             "TableName": os.environ["JOBS_TABLE"],
             "Key": {"job_id": {"S": job_id}},
-            "UpdateExpression": "SET #s = :running, phase = :q",
+            "UpdateExpression": ("SET #s = :running, phase = :q, "
+                                 "upload_etag = :etag, upload_bytes = :len"),
             "ConditionExpression": "#s = :pending",
             "ExpressionAttributeNames": {"#s": "status"},
             "ExpressionAttributeValues": {":running": {"S": "RUNNING"},
                                           ":pending": {"S": "PENDING"},
-                                          ":q": {"S": "queued"}}}},
+                                          ":q": {"S": "queued"},
+                                          ":etag": {"S": head["ETag"]},
+                                          ":len": {"N": str(head["ContentLength"])}}}},
         _rev_condition_check(authz, job["site_id"], "deploy"),
     ]
     if authz.role == permissions.ROLE_ADMIN:

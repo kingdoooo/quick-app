@@ -1051,3 +1051,76 @@ def test_on_behalf_header_is_read_case_insensitively(monkeypatch):
     import server
     monkeypatch.setenv(server.MACHINE_CLIENT_ID_ENV, MACHINE_CLIENT)
     assert server.ON_BEHALF_HEADER == server.ON_BEHALF_HEADER.lower()
+
+
+def _job_item(job_id: str) -> dict:
+    return boto3.client("dynamodb", region_name="us-east-1").get_item(
+        TableName="site-deploy-jobs", Key={"job_id": {"S": job_id}})["Item"]
+
+
+def test_confirm_upload_pins_the_etag_it_head_checked(aws, monkeypatch):
+    """把 ETag 写进 job 记录的那一步必须**在同一笔事务里**、且用**那一次 HEAD** 的
+    ETag：为取 etag 再 HEAD 一次会重新打开 TOCTOU（第二次 HEAD 可能看到另一个对象，
+    于是钉住的是"第二次看到的字节"而 50MB 是对第一次查的）。
+
+    validate 用这个 etag 做 `IfMatch`（deployer 侧
+    test_upload_is_pinned_to_the_bytes_confirm_upload_checked），所以"钉的是哪一次
+    HEAD"不是风格问题：钉错一次，被校验的字节与被查过 50MB 的字节就不是同一个对象。
+    """
+    import server, common
+    monkeypatch.setenv("STATE_MACHINE_ARN",
+                       "arn:aws:states:us-east-1:1:stateMachine:sm")
+    common.upsert_site("demo-abc123", owner="a@x.com", status="ACTIVE")
+    jid = common.create_job("a@x.com", "demo-abc123")
+    body = b"zip-bytes-of-a-known-length"
+    put = boto3.client("s3").put_object(Bucket="site-artifacts-1",
+                                        Key=f"uploads/{jid}.zip", Body=body)
+    real = boto3.client("s3", region_name="us-east-1")
+    heads = []
+
+    class _Spy:
+        """只记 head_object 的次数，其余一律透传给真客户端。"""
+
+        exceptions = real.exceptions
+
+        def head_object(self, **kw):
+            heads.append(kw["Key"])
+            return real.head_object(**kw)
+
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+    with patch.object(server, "_s3", return_value=_Spy()), \
+         patch.object(server, "_sfn", return_value=MagicMock()):
+        server.do_confirm_upload("a@x.com", jid)
+
+    item = _job_item(jid)
+    assert item["upload_etag"]["S"] == put["ETag"]
+    assert item["upload_bytes"]["N"] == str(len(body))
+    assert heads == [f"uploads/{jid}.zip"], (
+        f"head_object 被调用 {len(heads)} 次——为取 etag 再 HEAD 一次就重新打开了"
+        "那个 TOCTOU（钉住的字节与查过 50MB 的字节可以是两个对象）")
+
+
+def test_double_confirm_does_not_repin(aws, monkeypatch):
+    """etag 与 PENDING→RUNNING 在同一笔事务 ⇒ 第二次点击（AlreadyStarted）既不推进
+    状态也不许改 etag。否则重放能把已经开跑的 job 钉到新字节上。"""
+    import server, common
+    monkeypatch.setenv("STATE_MACHINE_ARN",
+                       "arn:aws:states:us-east-1:1:stateMachine:sm")
+    common.upsert_site("demo-abc123", owner="a@x.com", status="ACTIVE")
+    jid = common.create_job("a@x.com", "demo-abc123")
+    s3 = boto3.client("s3")
+    first = s3.put_object(Bucket="site-artifacts-1", Key=f"uploads/{jid}.zip",
+                          Body=b"first-bytes")["ETag"]
+    with patch.object(server, "_sfn", return_value=MagicMock()):
+        server.do_confirm_upload("a@x.com", jid)
+        assert _job_item(jid)["upload_etag"]["S"] == first
+        # 预签名 URL 还活着：把对象换成另一份字节再点一次确认
+        second = s3.put_object(Bucket="site-artifacts-1", Key=f"uploads/{jid}.zip",
+                               Body=b"second-bytes-are-different")["ETag"]
+        assert second != first, "前提：两次上传的 ETag 必须不同，否则本例测不到东西"
+        with pytest.raises(server.AlreadyStarted):
+            server.do_confirm_upload("a@x.com", jid)
+    assert _job_item(jid)["upload_etag"]["S"] == first, (
+        "第二次确认改掉了 etag——重放能把已经开跑的 job 钉到新字节上")
