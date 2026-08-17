@@ -80,8 +80,8 @@ Agent 客户端）里用自然语言开发简易全栈站点，说一句"部署"
 
 | 路径 | 内容 |
 |---|---|
-| `docs/superpowers/specs/2026-07-21-quick-site-builder-design.md` | 设计文档（经对抗性 review 修订） |
-| `docs/superpowers/plans/2026-07-21-quick-site-builder.md` | 实施计划（23 任务，含完整代码） |
+| `docs/superpowers/specs/2026-07-21-quick-site-builder-design.md` | **一期**设计文档（已实现快照，勿改）——二期的控制台/API Key/统计/blue-green 都不在其中 |
+| `docs/superpowers/plans/2026-07-21-quick-site-builder.md` | **一期**实施计划（23 任务；同为快照）。当前架构口径见本文件与 `CLAUDE.md` |
 | `site-builder/DEPLOY.md` | **部署手册：§0 前置要求 + 七阶段操作（下一步从这里开始）** |
 | `site-builder/contract/` | 部署合同库：site.json 校验器 + 红线扫描器 |
 | `site-builder/auth/` | 会话 JWT + 站点登录服务 |
@@ -130,5 +130,8 @@ Agent 客户端）里用自然语言开发简易全栈站点，说一句"部署"
    （①SSO → ②路由 → ③DSQL → ④执行器 → ⑤MCP → ⑥客户端 → ⑦彩排）；
    每阶段产出的 ARN/ID 按手册回填 `site-builder/config.ini`。
 3. **演示**：⑦ 的 E2E 通过后，演示叙事见实施计划 Task 23。
-4. **二期候选**（设计文档 §9）：Python 站点 runtime、MCP API-Key、精细缓存、
-   PKCE/nonce、站点协作者、管理面板。
+4. **仍未交付的候选**：Python 站点 runtime（当前仅 Node.js 后端）、精细缓存
+   （当前 CloudFront 全站禁缓存，那是鉴权正确性的前提）。
+   原清单里的 MCP API-Key、站点协作者、管理面板、PKCE/nonce **都已在二期交付**
+   （分别是 `site-builder/key-proxy/`、panel 的协作者接口、`console.<域名>`
+   控制台、`auth/login_handler.py` 的 PKCE S256 + nonce 校验）。

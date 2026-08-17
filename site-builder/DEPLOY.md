@@ -1948,7 +1948,9 @@ SSM 参数：`/site-builder/jwt-secret`（§0 手工建）、`/site-builder/site
 
 - Quick Desktop 为 preview、身份区域须 us-east-1
 - 顶域 cookie 使所有 `app-*.{base_domain}` 站点共享一次登录（PoC 可接受，产品化需按站点隔离会话）
-- PoC 仅 Node.js 后端（Python 3.13 延后）；MCP 仅 OAuth（API Key fallback 延后）
+- PoC 仅 Node.js 后端（Python 3.13 延后）
+- MCP 接入有 OAuth 与 **API Key** 两条路（API Key 走可选组件 key-proxy，二期 M4 已交付；
+  无 `[ApiKey]` 段时该组件整体不存在）
 - CloudFront 全站禁缓存（正确性优先；精细缓存延后）
 - 详见设计文档 §8 风险 / §9 范围外
 

@@ -286,3 +286,60 @@ def test_deploy_md_calls_the_scp_template_unverified():
         "没写明这是未经真机验证的模板、贴之前要先验"
     for bad in ("已验证的配置", "已验证配置"):
         assert bad not in sec, f"把 SCP 模板描述成了 {bad!r}"
+
+
+# ── C4: 「延后项」清单里不许留已交付的东西 ─────────────────────────────────
+#
+# 这一类过时最误导：读者据此判断"这个能力还没有"，于是重复造或误报缺口。
+# 判定各项是否已交付都有代码/目录证据（见每条断言的注释），不是凭印象。
+
+def test_readme_future_candidates_do_not_list_delivered_capabilities():
+    """README「如何继续」的二期候选清单里，已交付的能力必须去掉。
+
+    实测各项现状：MCP API-Key = 已交付（`site-builder/key-proxy/`，二期 M4）；
+    站点协作者 = 已交付（panel 的 collaborators 接口，M3）；管理面板 = 已交付
+    （`site-builder/panel/`，console.{base_domain}，M3）；PKCE/nonce = 已交付
+    （`auth/login_handler.py` 的 `PKCE_COOKIE` + S256 + nonce 校验）。
+    仍未交付的只有 Python 站点 runtime 与精细缓存。
+    """
+    sec = _section(_read(README), "## 如何继续")
+    # **不能简单断言"这些名字不出现"**：这一段合理地需要提到它们，只是要说清"已交付"
+    # ——我第一版就是那么写的，于是被我自己那句"…都已在二期交付"判红了。
+    # 正确的形态是：**凡提到它们的那句话，必须同时说它已交付**。
+    # 这样"把它挪回候选清单"会红（那句话里没有"交付"），而如实说明不会。
+    # 标记词必须是**否定句造不出来的**那个。第一版我查的是 `"交付" in sentence`，
+    # 而候选那句写着"仍未**交付**的候选" ⇒ 断言被**否定句**满足，把 MCP API-Key 挪回
+    # 候选清单时它照样绿。这正是本轮假绿总表第 11 行（散文里的 token 会被无关的偶然
+    # 提及、甚至被反义句满足）——**在记录这条判据的用例里又踩了一次**。
+    # `已交付` / `已在二期交付` 都不可能由"仍未交付"产生。
+    for delivered in ("MCP API-Key", "站点协作者", "管理面板", "PKCE/nonce"):
+        for sentence in sec.split("。"):
+            if delivered in sentence:
+                assert "已交付" in sentence or "已在二期交付" in sentence, (
+                    f"提到 {delivered!r} 的这句话没说明它**已**交付，读者会以为它还没有："
+                    f"{sentence.strip()[:90]}")
+    # 正向：仍未交付的那两项应当还在（否则这条断言退化成"把整段删掉就绿"）
+    assert "Python" in sec and "缓存" in sec, \
+        "仍未交付的 Python runtime / 精细缓存被一起删掉了——那是另一种失真"
+
+
+def test_deploy_md_known_limits_do_not_list_delivered_capabilities():
+    """DEPLOY.md 的「已知限制与延后项（向客户声明）」是**对客户**的口径，
+    把已交付的 API Key fallback 写成"延后"比 README 那处更严重。"""
+    sec = _section(_read(DEPLOY), "## 已知限制与延后项（向客户声明）")
+    assert "API Key fallback 延后" not in sec, \
+        "向客户声明里还写着 API Key fallback 延后，而 M4 已交付 key-proxy"
+    assert "Node.js" in sec, "仍未交付的「仅 Node.js 后端」被删掉了"
+
+
+def test_readme_marks_the_phase_one_docs_as_snapshots():
+    """README 目录导览把一期的 spec/plan 当成有效入口，而它们是**一期快照**
+    （CLAUDE.md 的文档地图写着"已实现快照，勿改"）。新读者照它们理解当前架构会错
+    ——二期的控制台/API Key/统计/blue-green 都不在里面。
+    """
+    sec = _section(_read(README), "## 目录导览")
+    for row_needle in ("specs/2026-07-21-quick-site-builder-design.md",
+                       "plans/2026-07-21-quick-site-builder.md"):
+        row = _row(sec, row_needle)
+        assert "一期" in row and ("快照" in row or "勿改" in row), (
+            f"这一行没标明是一期快照：{row.strip()[:110]}")
