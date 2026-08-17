@@ -117,6 +117,25 @@ def _platform_function_names() -> tuple:
     raise AssertionError("app.py 里找不到 PLATFORM_FUNCTION_NAMES——本条空转")
 
 
+def _deployer_exec_role_name() -> str:
+    """`infra/app.py` 里 `DeployerExecRole` 那个构造的 `role_name`。
+
+    **按构造 ID（`"DeployerExecRole"`）定位，不按角色名找**——按名字找就是拿期望值
+    去匹配期望值，改错了两边一起变。构造 ID 与角色名是两个不同的字符串，所以这条
+    交叉核对是真的（SCP 的例外名单若与栈里的角色名漂移，真机上会把部署器锁在外面）。
+    """
+    src = (Path(__file__).parents[1] / "infra" / "app.py").read_text(encoding="utf-8")
+    for node in ast.walk(ast.parse(src)):
+        if not (isinstance(node, ast.Call) and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value == "DeployerExecRole"):
+            continue
+        for kw in node.keywords:
+            if kw.arg == "role_name" and isinstance(kw.value, ast.Constant):
+                return kw.value.value
+    raise AssertionError("app.py 里找不到 DeployerExecRole 的 role_name——本条空转")
+
+
 def test_docstring_does_not_claim_it_closes_same_account_bypass():
     """`edge_caller` 只挡经 Function URL 的调用（Path B）。直接 `lambda:Invoke`
     可以自造整个 payload 里的 callerId（Path A，2026-08-15 对 site-panel 实测：
@@ -201,10 +220,23 @@ def test_scp_artifact_denies_both_actions_and_excludes_platform_functions():
     # **必须有例外名单**：没有 Condition 的 Deny 会把 Edge 自己也拒掉，
     # 于是所有站点 403 —— 那不是加固，是把平台关掉。
     cond = st.get("Condition", {})
-    principals = json.dumps(cond, ensure_ascii=False)
-    assert "aws:PrincipalArn" in principals, "Deny 没有按调用方豁免 ⇒ 连 Edge 都会被拒"
-    assert "StringNotEquals" in cond or "ArnNotLike" in cond, \
-        f"例外名单的条件运算符不对：{list(cond)}"
+    op = next((k for k in ("ArnNotLike", "StringNotEquals") if k in cond), None)
+    assert op, f"例外名单的条件运算符不对：{list(cond)}"
+    exempt = cond[op]["aws:PrincipalArn"]
+    exempt = exempt if isinstance(exempt, list) else [exempt]
+
+    # **例外集的组成本身要被断言，不只是"存在某个例外"。** 这份制品的价值全在
+    # "最小例外集"上：多一个不需要的条目会教会读者错误的心智模型，少一个会把平台
+    # 自己锁在外面。所以两个方向都锁死——**恰好**这两个角色，不多不少。
+    #   · Edge 执行角色：唯一合法的站点调用方，漏了它所有站点 403；
+    #   · site-deployer-exec-role：M7 的健康门直接 invoke 候选颜色
+    #     （deploy_lambda_site._health_check 带 Qualifier），漏了它每次部署都在
+    #     健康门失败。**这个名字从 infra/app.py 取，不手抄**（不同源）。
+    want = {f"arn:aws:iam::{{account_id}}:role/{{edge_role_name}}",
+            f"arn:aws:iam::{{account_id}}:role/{_deployer_exec_role_name()}"}
+    assert set(exempt) == want, (
+        f"例外集不是最小集：多了 {sorted(set(exempt) - want)}、"
+        f"少了 {sorted(want - set(exempt))}")
 
 
 def test_policies_readme_states_the_three_boundaries():
@@ -217,3 +249,8 @@ def test_policies_readme_states_the_three_boundaries():
     # 生成资源列表的办法必须给出来，否则那个占位符没人填得对
     assert "{user_site_function_arns}" in txt and "aws lambda" in txt, \
         "没说明怎么生成用户站点的 ARN 列表"
+    # 例外集是最小集，但"什么情况下要加回来"必须留一行——否则下一个把 Resource
+    # 扩大到平台函数的人会带着一份不够用的例外名单上生产（panel 走
+    # site-deployer-undeploy，那是平台函数）。
+    assert "panel" in txt and "扩大" in txt, \
+        "没写明'若把 Resource 扩大到平台函数，则需把 panel 角色加回例外'"

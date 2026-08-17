@@ -73,13 +73,21 @@ aws lambda list-functions --query 'Functions[?starts_with(FunctionName, `site-`)
 区分平台与用户"这件事本身不成立。A3 之后前缀才是可判定的——**但即便可判定，本模板
 仍然用显式列表**，因为可判定只保证"能写对通配"，不保证"写对了"。
 
-## 例外名单里那三个角色，各自为什么必须在
+## 例外名单是**最小集**：恰好两个角色
 
-| 角色 | 为什么 |
+| 角色 | 为什么必须在 |
 |---|---|
 | `{edge_role_name}`（Lambda@Edge 执行角色） | 它是唯一合法的站点调用方。漏了它 = 所有站点 403。 |
 | `site-deployer-exec-role` | **M7 的健康门会直接 invoke 候选颜色**（`deploy_lambda_site._health_check` 带 `Qualifier`）。漏了它 = 每次部署都在健康门失败。 |
-| `{panel_role_name}` | 防御性列入：panel 触发下线走的是 `site-deployer-undeploy`（平台函数，本来就不在 `Resource` 里）。若你把资源列表扩大到包含平台函数（**不推荐**，见边界②），它必须在例外里。 |
+
+**为什么 panel 的角色不在里面**（它曾经在，已删）：panel 触发下线走的是
+`site-deployer-undeploy` —— 那是**平台函数**，本来就不在本策略的 `Resource` 里，所以
+panel 根本不需要豁免。留着一个并不需要的条目会教出错误的心智模型（"panel 需要直调站点
+函数"），而这份制品的全部价值就在于例外集**最小且每一项都有理由**。
+
+**唯一需要把 panel 角色加回例外的情形**：你把 `Resource` **扩大**到包含平台函数
+（见边界②，**不推荐**）。那时 panel、Step Functions 的角色、以及任何调
+`site-deployer-*` 的身份都要一起加进例外，否则部署与下线立刻全断。
 
 **`aws:PrincipalArn` 的形态要在目标账号里先验一次再贴。** 对 assumed-role 会话，这个
 键的取值（角色 ARN 还是 `assumed-role/.../session`）取决于调用形态；模板用
