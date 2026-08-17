@@ -3,7 +3,9 @@
 本文档是把本方案部署到**你自己的 AWS 账号**的操作手册，覆盖的是**需要真实 AWS
 资源、DNS、IdP 凭证**的部署门禁——这些无法自动化，也是单元测试覆盖不到的部分。
 
-**部署的是当前最新版本（含二期 M1-M3）**：照 ①→⑦ 走一遍即可（⑤b 控制台可选），无需先部旧版本再升级。
+**部署的是当前最新版本（含二期全部里程碑：控制台、API Key 交换层、访问统计、
+blue/green 原子更新）**：照 ①→⑦ 走一遍即可（⑤b 控制台、⑤c API Key 均可选），
+无需先部旧版本再升级。
 已在运行旧版本的环境见[从一期环境升级](#从一期环境升级本仓库自己的环境走过这条路)。
 
 - **区域**：`us-east-1`（Lambda@Edge、ACM、Quick Desktop 身份区域共同强制）
@@ -277,7 +279,7 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
 
 ## 部署顺序总览
 
-**这份 Runbook 部署的是当前最新版本（含二期 M1-M3）。全新账号照 ①→⑦ 走一遍
+**这份 Runbook 部署的是当前最新版本（含二期全部里程碑）。全新账号照 ①→⑦ 走一遍
 即可，不需要"先部一期再升级"。** 已经跑着一期的环境要升级，见文末
 [从一期环境升级](#从一期环境升级本仓库自己的环境走过这条路)。
 
@@ -290,6 +292,46 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
    (Task 3)
                                              ⑤c API Key（可选，二期 M4）· ⑤d 访问统计（二期 M5）
 ```
+
+### ⚠️ 存量重部时顺序不同：**MCP 必须先于执行器栈**
+
+上面那条 ①→⑦ 是**全新账号首次 bootstrap** 的顺序，那时 `config.ini` 的
+`state_machine_arn` 还空着，必须先建栈再回填，MCP 才有 ARN 可用
+（`deploy_agentcore.py` 启动时就在检查这件事，空值直接退出并让你回到 ④）。
+
+**已经在跑的环境重部时，顺序要反过来：先 ⑤ MCP，再 ④ 执行器栈。**
+
+| | 为什么 |
+|---|---|
+| 先 MCP 是安全的 | 存量环境里 `config.ini` 已回填，而 `deploy_agentcore.py` **只读 config.ini 里那个静态值、不读 CloudFormation 输出**（全文没有 `describe_stacks` 消费）⇒ 它不依赖本次栈更新 |
+| 先栈**不**安全 | 新版 `validate` 在任务记录缺 `upload_etag` 时**一律 fail-closed**（不做假值兜底），而旧版 MCP 不写这个属性 ⇒ 从栈更新完成到 MCP 部署完成的那个窗口里，**所有**部署都会在第一步失败 |
+
+**这条是无声的**：顺序错了的症状是"所有部署都在第一步挂"，与代码缺陷难以分辨。
+**排障锚点**——看到下面这句原文就说明 MCP 还没部署（或 jobs 表读到了旧副本）：
+
+```
+任务记录里没有 upload_etag——请重新调用 confirm_upload（本任务可能由旧版MCP 创建）
+```
+
+### 存量站点迁移到 blue/green（M7；**只有存量环境需要**）
+
+栈更新之后，已有站点还挂在旧的"函数级 Function URL"上（`$LATEST`）。新版部署逻辑对
+**未迁移**的站点是 fail-closed 的（抛 `UnmigratedSite`，拒绝隐式半迁移），所以升级后
+要跑一次迁移：
+
+```bash
+cd /path/to/repo            # 从仓库根跑
+python3 site-builder/scripts/migrate_sites_to_blue_green.py              # 默认 dry-run，只打印计划
+python3 site-builder/scripts/migrate_sites_to_blue_green.py --apply      # 真的写
+python3 site-builder/scripts/migrate_sites_to_blue_green.py --apply --site-id <site_id>   # 单点重跑
+```
+
+- **默认 dry-run**：不带 `--apply` 时一个字都不写，先看计划再执行。
+- **`--site-id` 可单点重跑**：某个站点失败后不必重跑全量。
+- **`static` 站点会被报成 `skipped`，那不是失败**：纯静态站点没有后端 Lambda，
+  没有 alias 可建，本来就不参与 blue/green。看到 `skipped: static` 是预期结果。
+- **共用同一个旧 Function URL 的站点会被**拒绝**并要求人工处理**：那种情况下无法判定
+  该把哪个站点切到哪个颜色，脚本不猜。
 
 ⑤c 与 ⑤d 不是独立的部署阶段，而是**跨已有组件的改动**：全新账号照 ①→⑦ 走一遍就
 把它们一起装上了（两张统计表在 ④ 的栈里、埋点在 ② 的 Edge 里、读侧在 ⑤/⑤b 里）。
@@ -807,6 +849,12 @@ name**；值必须是裸 `true`/`false`——configparser 会把行内注释并�
    > **改过 config.ini 后要先 `rm -rf cdk.out`**：陈旧 asset 里仍是旧的
    > `BASE_DOMAIN`，直接 synth/deploy 会用到过期值。
    >
+   > **改过依赖清单（`bundling-requirements.txt`）也必须 `rm -rf cdk.out`**，而且这
+   > 一条与上一条是**两个独立的原因**：CDK 的 asset hash **只看 `/asset-input` 那个
+   > 源目录，不含挂载卷里的清单内容**——实测过两份不同的 lockfile 算出同一个
+   > `asset.<同一串>`。于是"只改清单、不改 `app.py`"时 CDK 会复用旧 asset，
+   > 新清单当次**根本没生效**，而部署脚本一切正常。
+   >
    > **`default_origin` 必须是可解析域名**。origin-request 事件在 CloudFront 解析
    > origin **之后**才触发，填不可解析的值（如 `.invalid` 保留 TLD）会让所有请求
    > 在 Edge 执行前就 `502 CloudFront wasn't able to resolve the origin domain name`,
@@ -951,7 +999,10 @@ migrator role 能在本 schema 建表，但建其他 schema / 建角色 / 改 IA
 cd site-builder/deployer/infra
 python3 -m venv --clear .venv                  # 见 ② 的说明：venv 不可跨路径复用
 .venv/bin/pip install -r requirements.txt -q
-# 部署（bundling 会用 Docker 拉 x86_64 镜像装 psycopg[binary]+sqlparse+contract 包）
+# 部署（bundling 用 Docker 拉 x86_64 镜像，按锁定清单 --require-hashes 装
+#  psycopg[binary]+sqlparse；**合同包是 cp 包目录进去的，不走 pip**——site-contract 是
+#  PEP 517 项目，pip 会在默认 build isolation 下联网装一个未锁版本、未锁 hash 的
+#  setuptools 并执行它，那等于「依赖已锁」这个结论对构建工具链不成立）
 PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never
 ```
 
@@ -1939,6 +1990,11 @@ aws lambda get-function --function-name site-deployer-reconcile-job --query 'Con
 "同账号 principal 直接 `lambda:Invoke` 站点函数、绕过 Edge 鉴权"这条路。
 **贴不贴都能正常运行，本手册的任何步骤都不依赖它。**
 
+**这份模板未经真机验证**：`aws:PrincipalArn` 对 assumed-role 会话的取值没有实测过，
+所以模板用 `ArnNotLike` 容忍两种写法。**贴之前先用 IAM policy simulator，或先挂到一个
+空 OU 上试**——写错的后果是把平台自己锁在外面。（相对地，`policies/README.md` 里那条
+生成用户站点 ARN 列表的命令**已在真机跑过**：输出正好是用户站点函数，平台函数全被排除。）
+
 贴之前必须读 `policies/README.md` 的三条边界，其中两条会直接决定它有没有用：
 
 1. **SCP 对 Organizations 管理账号无效**（AWS 硬规则，包括 root）。**本部署所在的
@@ -2018,7 +2074,7 @@ manifest（因为 AgentCore 的 CreateAgentRuntime 校验不认，见 ⑤ 的坑
 | Function URL 缺 2025-10 起要求的第二个权限                          | 三处各加 `lambda:InvokeFunction` + `InvokedViaFunctionUrl`                                        | AWS 官方文档 urls-auth 明确要求两者                                      |
 | exec role 缺 `lambda:GetFunctionConfiguration`（waiter 轮询它） | 补该 action                                                                                     | `aws iam simulate-custom-policy`：修前 implicitDeny，修后 allowed    |
 | `site_name` 未校验 → DSQL admin SQL 注入 + IAM/Lambda 命名炸裂     | `common.validate_site_name` 入口卡 `^[a-z][a-z0-9-]{1,29}$`                                      | 单测覆盖注入串/空格/大写等 9 种非法输入                                         |
-| `npm install` 执行站点 preinstall 脚本（CodeBuild 内任意代码执行）       | `--ignore-scripts` + 删 `.npmrc` + 红线拦生命周期脚本 + CodeBuild 角色收窄到 `uploads/*` 只读、`artifacts/*` 只写 | 红线单测 + synth 确认无整桶读写                                           |
+| `npm install` 执行站点 preinstall 脚本（CodeBuild 内任意代码执行）       | `--ignore-scripts` + 删 `.npmrc` + 红线拦生命周期脚本 + CodeBuild 角色收窄到 `validated/*` 只读（validate 产出的不可变工件，非 owner 上传的原包）、`artifacts/*` 只写 | 红线单测 + synth 确认无整桶读写                                           |
 | 站点 SQL 以 DSQL admin 执行，可跨 schema 读写/销毁                    | 拆两个连接：admin 只引导 schema/role；站点提交的 SQL 以 per-site migrator role 执行                             | 单测断言站点 DDL 绝不出现在 admin 连接；bootstrap SQL 过 DSQL linter          |
 | `CREATE ROLE`/`AWS IAM GRANT` 裸 `except: pass` 吞真实错误      | 只容忍 duplicate（SQLSTATE 42710/42P06），其余抛出                                                      | 单测覆盖 42601 语法错/42501 权限不足必抛                                    |
 | 回跳白名单可被 `https://evil.com\.{base_domain}/` 绕过             | 拒反斜杠 + 强制 https                                                                               | 8 组用例；Python urlparse 与 Node WHATWG 解析差异实测                     |

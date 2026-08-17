@@ -24,8 +24,13 @@ pool = CFG["Cognito"]["user_pool_id"]
 region = CFG["Platform"]["region"]
 # 两条客户端通道都走这个 stdio 代理（Claude Code 直连会因 RFC 8707 resource
 # 参数被 Cognito 拒，Quick Desktop 的 Remote MCP 不支持 OAuth）。
-# 用绝对路径：用户可能从任意目录跑生成出的命令。
-proxy_dir = ROOT / "clients/quick-desktop-proxy"
+# **两种路径形态各有理由，别统一**：
+#   · `auth.js` 那条（下面 Claude Code 段）用**仓库相对路径 + "从仓库根执行"**——
+#     插值成绝对路径的话，产物里带的是**生成这份指引的那台机器**的路径，换台机器
+#     照抄就找不到文件；
+#   · `claude mcp add` 注册的是常驻配置，进程的 cwd 不确定，**必须**绝对路径，所以
+#     那里保留占位符 `<仓库绝对路径>`（与下面 Quick Desktop 段的 `/绝对路径/` 写法同源）。
+proxy_rel = "site-builder/clients/quick-desktop-proxy"
 
 # 接入成功后 `/mcp` 应显示的工具数。**这个数字与下面那份清单都由
 # `mcp/tests/test_doc_tool_surface.py` 对着 MCP 实时注册表校验**——加了工具却没
@@ -93,13 +98,16 @@ mkdir -p ~/.claude/skills
 cp -r site-builder/skills/site-builder ~/.claude/skills/
 
 # 2) 授权一次（浏览器飞书登录，token 落盘 ~/.site-builder-deploy-token.json）
-node {proxy_dir}/auth.js \\
+#    **从仓库根执行**（下面是仓库相对路径）
+node {proxy_rel}/auth.js \\
   "{endpoint}" \\
   "{client_id}"
 
 # 3) 注册部署 MCP（stdio 形态；URL 与 client_id 必须是两个独立参数）
+# 注册的是常驻配置，进程 cwd 不确定 ⇒ 这里**必须**绝对路径，把
+# <仓库绝对路径> 换成你本机 clone 的位置
 claude mcp add site-builder-deploy -- \\
-  node {proxy_dir}/index.js \\
+  node <仓库绝对路径>/{proxy_rel}/index.js \\
   "{endpoint}" \\
   "{client_id}"
 ```
@@ -132,7 +140,7 @@ Quick Desktop 的 Remote MCP 不支持 OAuth，需用仓库自带的本地 stdio
    ```json
    "site-builder-deploy": {{
      "command": "node",
-     "args": ["/绝对路径/quick-desktop-proxy/index.js",
+     "args": ["<仓库绝对路径>/{proxy_rel}/index.js",
               "{endpoint}",
               "{client_id}"]
    }}
@@ -141,7 +149,7 @@ Quick Desktop 的 Remote MCP 不支持 OAuth，需用仓库自带的本地 stdio
    **方式 b：UI 表单**（Settings → Capabilities → MCP → Add）：
    Connection type=**Local**，Command=`node`，Args 一行填：
    ```
-   /绝对路径/quick-desktop-proxy/index.js {endpoint} {client_id}
+   <仓库绝对路径>/{proxy_rel}/index.js {endpoint} {client_id}
    ```
    Args 字段按类 shell 规则解析（空格拆分、引号剥除）——URL 无空格，
    带不带引号都可以。UI 也有 env 区域，等价写法：Args 只填脚本路径，

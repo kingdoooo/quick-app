@@ -9,9 +9,12 @@ Quick 自动化建站平台（Site Builder）：业务人员在任意支持 Skil
 `https://app-{site_id}.{base_domain}` 的可分享 URL。站点访问与管理权限绑定飞书账号
 （身份源可换成任意能给 email claim 的 Cognito 联邦 IdP）。
 
-**当前状态**：一期与二期 M1-M3（含 `console.{base_domain}` 自助管理控制台）都已在
-真实 AWS 部署并端到端验证。**具体进度与闸门数字不写在本文件**（会过时）——见
+**当前状态**：一期与二期（含 `console.{base_domain}` 自助管理控制台、API Key 交换层、
+访问统计聚合）都已在真实 AWS 部署并端到端验证；站点更新走 blue/green 原子切换
+（M7）。**具体进度与闸门数字不写在本文件**（会过时）——见
 `docs/design/HANDOFF-2026-08-07.md` 的最新一节，那里是状态真源。
+**注意那个文件是 git-ignored 的**：新 clone 里不存在，此时口径以本文件 + `README.md` +
+`site-builder/DEPLOY.md` 为准，确切数字靠下面的测试命令自己跑。
 二期需求清单在 `docs/phase2-requirements.md`；部署手册
 `site-builder/DEPLOY.md` 含全部实测坑。
 
@@ -30,6 +33,19 @@ cd site-builder/key-proxy && ../deployer/.venv/bin/pytest tests -q   # key-proxy
 ```
 
 单测跑法：`.venv/bin/pytest tests/test_xxx.py::test_name -q`。
+
+**两条实测坑（都花过时间，别重踩）**：
+
+- **改了 `deployer/infra/app.py` 的 bundling 段，要跑 auth 那套才会红**。那段的守卫
+  （每条 pip install 都必须带 `--require-hashes`、合同包必须 cp 不 pip）住在
+  `auth/tests/test_requirements_locked.py` 里——AST 解析器在那边。只跑 deployer 全绿
+  不代表 bundling 改对了。这是一条跨包耦合：deployer 的源码，auth 的守卫。
+- **E2E 的 CA 陷阱**：`deployer/.venv` 的**默认** SSL 上下文信任库是空的
+  （`ssl.create_default_context().cert_store_stats()` 全 0），而 E2E 会**在进程内调用
+  发起 HTTPS 的生产代码**——那条路径用的是默认上下文，不是测试自己造的那个。
+  **只设 `SSL_CERT_FILE` 不够**：`HTTPSHandler` 在构造时就把上下文定格了。现在由
+  fixture 自动修好，但看到 `CERTIFICATE_VERIFY_FAILED` 时**别当成网络/证书故障**去查
+  代理和防火墙——先确认是不是又碰到了这个上下文。
 
 **MCP 的上面那条用宿主机依赖，不等于容器里的依赖**（实测宿主 mcp 1.26.0 /
 boto3 1.43.25，而 `mcp/requirements.txt` 锁的是 1.29.0 / 1.43.64）。
@@ -96,6 +112,12 @@ cd site-builder/key-proxy && python3 deploy_key_proxy.py
 # 控制台 panel（Lambda + Function URL + 前端上传 + console route，幂等）
 # --skip-frontend 只改后端。改前端后必须重跑（不带该开关）才会上传。
 cd site-builder/panel && python3 deploy_panel.py
+
+# 存量站点迁移到 blue/green（M7；**只有存量环境需要**，新账号不必跑）
+# 默认 dry-run 只打印计划，--apply 才写；--site-id 可单点重跑。
+# static 站点会被报成 skipped（没有后端 Lambda，不参与 blue/green）——那不是失败。
+python3 site-builder/scripts/migrate_sites_to_blue_green.py            # 看计划
+python3 site-builder/scripts/migrate_sites_to_blue_green.py --apply    # 真写
 
 # 生成含真实值的用户接入指引（产物 gitignored）
 python3 site-builder/scripts/gen_onboarding.py
