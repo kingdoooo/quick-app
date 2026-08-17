@@ -16,6 +16,7 @@ import configparser
 import hashlib
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -407,6 +408,55 @@ def test_cli_defaults_keep_both_flags_absent():
     assert m.call_args.kwargs["marker"] is None
 
 
+# ------------------------- E2E 生成的 site_id 不许撞上真站点（真机顺出来的隐患）
+#
+# 真机跑完清点资源时发现：试点环境里有一个**真站点**的 site_id 形如
+# `notes-<6 位十六进制>`（真人 owner，permissions_rev 已经十几）——而 E2E 的
+# `_new_site_id("notes")` 生成的**正是同一个形状**。
+#
+# 撞上的后果不是"测试失败"，是**不可恢复地毁掉一个真用户的站点**：
+#   ① `--site-id` 会让部署覆盖那个站点的 Lambda 与路由，并把 owner 改成 fixture@test；
+#   ② module 级清理接着按 `purge_data=True` 下线它 ⇒ 连 DynamoDB 数据表一起删。
+# 概率是 1/16^6（每个 id），但代价是不可逆的，所以按 fail-closed 处理而不是赌概率。
+# 文件里原有的注释只防住了"按 owner 批量删"，没防住"site_id 撞车"。
+
+def test_e2e_site_ids_are_marked_as_test_ids(monkeypatch):
+    """生成的 site_id 必须带一眼可辨的 `e2e` 标记。
+
+    这条是**可读性**上的纵深：人在控制台看到 `notes-e2e1a2b` 能立刻判断"这是测试
+    造的"，而纯随机后缀与真站点无法区分。真正的闸门是下面那条存在性检查。
+    """
+    import test_e2e_fixtures as e2e
+    monkeypatch.setattr(e2e, "_assert_site_id_is_free", lambda sid: None)
+    sid = e2e._new_site_id()
+    assert re.fullmatch(r"notes-e2e[0-9a-f]{4,}", sid), sid
+
+
+def test_e2e_refuses_a_site_id_that_already_exists(monkeypatch):
+    """撞上**任何**已存在的 sites 行就必须抛，绝不继续。
+
+    反向验证的注入点就是"表里已经有这一行"——真站点与已 DELETED 的旧行都算：
+    复用一个 DELETED 的 id 会让清理去动一段别人的历史记录，同样不该发生。
+    """
+    import test_e2e_fixtures as e2e
+    monkeypatch.setattr(e2e, "_site_row", lambda sid: {"site_id": sid,
+                                                       "status": "ACTIVE"})
+    with pytest.raises(AssertionError) as exc:
+        e2e._new_site_id()
+    assert "已存在" in str(exc.value), exc.value
+
+
+def test_e2e_accepts_a_free_site_id(monkeypatch):
+    """对照组：表里没有这一行时正常返回并记账。
+
+    没有这条的话上一条在"`_new_site_id` 无条件抛"时也绿——那样四条 E2E 全都跑不了。
+    """
+    import test_e2e_fixtures as e2e
+    monkeypatch.setattr(e2e, "_site_row", lambda sid: None)
+    sid = e2e._new_site_id()
+    assert sid in e2e._created_site_ids, "生成了却没记账——失败路径上会泄漏资源"
+
+
 # ------------------------------------------- E2E 那几个 fixture 变体的离线证据
 #
 # `tests/test_e2e_fixtures.py` 里的 M7 用例要在 tmpdir 里造两个**故意坏的**后端。
@@ -480,6 +530,116 @@ def test_e2e_smoke_poison_backend_passes_the_gate_but_fails_public(tmp_path):
     assert got["gate"] == {"ok": True, "gate": "passed"}, got["gate"]
     assert got["public"].get("__status") == 500, got["public"]
     assert got["empty"].get("__status") == 500, got["empty"]
+
+
+# 子进程脚本：**忠实复现**真机那次失败的形态——先 import smoke_test（此刻信任库还是
+# 空的，它的 opener 就地定格），再跑修复，然后看那个**同一个** opener 的上下文。
+# 必须用子进程：同一个 pytest 进程里 smoke_test 早就被别的用例 import 过（而且可能
+# 已经修好了），在里面无法复现"带着空信任库 import"这个前提。
+# 全程不发网络请求——判据是那个 opener 手里的上下文有没有 CA。
+_SSL_PROBE = """\
+import json, os, ssl, sys, urllib.request
+os.environ.pop("SSL_CERT_FILE", None)
+sys.path.insert(0, sys.argv[1])          # deployer/functions
+sys.path.insert(0, sys.argv[2])          # deployer/tests
+import smoke_test                        # opener 在这一刻定格
+import test_e2e_fixtures as e2e
+
+
+def ctx_of(mod):
+    for h in mod._opener.handlers:
+        if isinstance(h, urllib.request.HTTPSHandler):
+            return h._context
+    raise SystemExit("smoke_test._opener 里没有 HTTPSHandler")
+
+
+def cas(ctx):
+    try:
+        return ctx.cert_store_stats()["x509_ca"]
+    except NotImplementedError:
+        return -1                        # truststore：委托给操作系统，无静态计数
+
+
+before = cas(ctx_of(smoke_test))
+note = e2e._ensure_default_ssl_trust()
+after = cas(ctx_of(smoke_test))
+print(json.dumps({"before": before, "after": after, "note": note,
+                  "default_after": cas(ssl.create_default_context())}))
+"""
+
+
+def test_e2e_fixture_repairs_the_ssl_trust_of_in_process_production_code():
+    """E2E 的 `_platform_env` 必须让**进程内被调用的生产代码**也能验证证书。
+
+    真机第一次跑就栽在这里：spec §5.4 那条用例在进程内调 `migrate_one` →
+    `smoke_test._check` → `_head` → `urlopen()`，走的是 `smoke_test` 在**模块级**建好
+    的 opener，而 `deployer/.venv` 的默认上下文一个 CA 都没有 ⇒
+    CERTIFICATE_VERIFY_FAILED，**跑了 21 分钟才炸**，症状读起来像证书/网络故障。
+    测试自己发的请求走 `_ssl_context()`（显式 certifi），一直是好的——所以这个缺陷
+    在"测试自己能访问站点"这件事上完全看不出来。
+
+    只设 `SSL_CERT_FILE` **不够**（我第一版就是这样，实测没修好）：
+    `urllib.request.HTTPSHandler.__init__` 在构造时就把上下文定格了，所以已经 import
+    过的 `smoke_test` 手里那个 opener 不受环境变量影响，必须换掉它的上下文。
+
+    这条守卫**不需要 RUN_E2E**，普通套件里就能拦住回归——同样的缺陷下次不必再花
+    21 分钟真机跑才发现。
+    """
+    tests_dir = Path(__file__).parent
+    out = subprocess.run(
+        [sys.executable, "-c", _SSL_PROBE,
+         str(tests_dir.parent / "functions"), str(tests_dir)],
+        capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, f"探针跑不起来：{out.stderr}"
+    got = json.loads(out.stdout.strip().splitlines()[-1])
+    # 核心不变量：修完之后，生产模块那个 opener 手里的上下文能验证证书。
+    # -1 = truststore（系统 python3），也算可用。
+    assert got["after"] > 0 or got["after"] == -1, got
+    assert got["default_after"] > 0 or got["default_after"] == -1, got
+    # 顺带把"当初到底坏不坏"记下来：venv 上 before 必须是 0（否则这条守卫没在
+    # 复现真机那个前提，等于换了个题目在验）
+    if got["after"] > 0:
+        assert got["before"] == 0, (
+            f"没复现出「带空信任库 import」的前提（before={got['before']}）——"
+            f"这条守卫此刻验的不是真机那个缺陷。{got}")
+        assert "smoke_test._opener" in got["note"], got["note"]
+
+
+def test_e2e_frozen_opener_scan_skips_vendored_packages():
+    """扫"哪些模块定格了 opener"时必须排除 vendored 目录。
+
+    `.venv` 就在仓库根下面，只判 `startswith(ROOT)` 会把三百多个三方模块一起扫进来
+    （实测 336 个）——对它们的每个属性做 getattr，范围远超本函数的意图。
+    """
+    import test_e2e_fixtures as e2e
+    root = Path(__file__).parents[3]
+    assert e2e._is_our_source(root / "site-builder/deployer/functions/smoke_test.py")
+    assert e2e._is_our_source(root / "site-builder/scripts/deploy_fixture.py")
+    for vendored in (
+            "site-builder/deployer/.venv/lib/python3.12/site-packages/botocore/x.py",
+            "site-builder/deployer/infra/cdk.out/asset.abc/handler.py",
+            "site-builder/mcp/node_modules/foo/index.py"):
+        assert not e2e._is_our_source(root / vendored), vendored
+    assert not e2e._is_our_source("/usr/lib/python3.12/ssl.py")
+
+
+def test_e2e_ssl_helper_does_not_override_an_explicit_cert_file(monkeypatch, tmp_path):
+    """外部显式设了 `SSL_CERT_FILE` 就不覆盖它（可能指向企业 CA 包）。
+
+    覆盖的后果不是"更安全"，而是**静默换掉操作者选定的信任集合**——那种改动在
+    连不上内网 HTTPS 时最难查。
+    """
+    import test_e2e_fixtures as e2e
+    bundle = tmp_path / "corp-ca.pem"
+    bundle.write_text("")            # 空文件：有它就一定不是 certifi 那份
+    monkeypatch.setenv("SSL_CERT_FILE", str(bundle))
+    try:
+        e2e._ensure_default_ssl_trust()
+    except RuntimeError as exc:
+        # 空 bundle ⇒ 默认上下文仍无 CA ⇒ 按设计如实报错而不是偷偷换掉它
+        assert "已设置" in str(exc), exc
+    assert os.environ["SSL_CERT_FILE"] == str(bundle), \
+        "外部显式设置的 SSL_CERT_FILE 被覆盖了"
 
 
 def test_e2e_poison_user_agent_matches_the_real_health_gate(monkeypatch):

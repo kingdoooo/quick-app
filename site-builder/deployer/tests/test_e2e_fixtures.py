@@ -13,6 +13,7 @@ import json
 import os
 import secrets
 import shutil
+import ssl
 import subprocess
 import sys
 import time
@@ -49,6 +50,133 @@ def cfg():
     return c
 
 
+# ---- 默认 SSL 上下文的 CA 信任库 ----
+#
+# 本文件有**两类** HTTPS 请求，过去只管了第一类：
+#   ① 测试自己发的 —— 走下面的 `_ssl_context()`，显式用 certifi，一直是好的；
+#   ② **在进程内被调用的生产代码**发的 —— 走 Python 的**默认**上下文。
+#      `migrate_sites_to_blue_green._public_check` → `smoke_test._head` → `urlopen()`
+#      就是这一类（spec §5.4 那条用例在进程内直接调 `migrate_one`）。
+#
+# `deployer/.venv/bin/python3` 的默认上下文**一个 CA 都没有**（实测
+# `cert_store_stats()` 全 0，CLAUDE.md 记过这个坑），于是第二类请求以
+# CERTIFICATE_VERIFY_FAILED 失败——症状读起来像网络/证书故障，其实是本机解释器的
+# 信任库是空的。真机第一次跑就栽在这里（21 分钟之后才炸）。
+#
+# **生产上没有这个问题**：`smoke_test` 在 Lambda 里跑，迁移脚本按 CLAUDE.md 用系统
+# `python3`（走 pip 注入的 truststore，读 macOS keychain）。所以要修的是本 harness，
+# **不是** `smoke_test.py` 或迁移脚本——改那两个文件等于为了 harness 的缺陷去动生产码。
+
+def _ctx_trust_ok(ctx) -> bool:
+    """这个 SSL 上下文能不能验证证书。
+
+    两种都算可用：
+      · `cert_store_stats()["x509_ca"] > 0` —— 静态信任库里有 CA；
+      · `cert_store_stats()` 抛 `NotImplementedError` —— pip 注入的 truststore
+        （`pip._vendor.truststore._api.SSLContext`），校验委托给操作系统钥匙串，
+        它本来就没有静态计数。
+    **把第二种当失败**会让这条判定在系统 `python3` 上恒假，于是守卫只在 venv 上成立。
+    """
+    try:
+        return ctx.cert_store_stats()["x509_ca"] > 0
+    except NotImplementedError:
+        return True
+
+
+def _default_trust_ok() -> bool:
+    return _ctx_trust_ok(ssl.create_default_context())
+
+
+# vendored 依赖住在仓库里（`.venv` 在仓库根下），所以"我们自己的源码"不能只判仓库前缀。
+_VENDORED_DIRS = (".venv", "site-packages", "node_modules", "cdk.out")
+
+
+def _is_our_source(path) -> bool:
+    parts = Path(path).parts
+    return str(path).startswith(str(ROOT)) and not any(v in parts
+                                                       for v in _VENDORED_DIRS)
+
+
+def _frozen_https_contexts() -> list:
+    """本仓库**已被 import** 的模块里，那些在模块级建好的 opener 已经定格的
+    HTTPS 上下文。
+
+    为什么会有"定格"：`urllib.request.HTTPSHandler.__init__` 在**构造时**就调
+    `http.client._create_https_context()` 把上下文存进 `self._context`
+    （CPython 3.12 实测）。`smoke_test` 在模块级 `build_opener(...)`，所以它的信任库
+    在 **import 那一刻**就定了——之后再改 `SSL_CERT_FILE` 对它无效。
+    真机第一次跑就是这样：我先设了环境变量也救不了一个已经 import 过的 smoke_test。
+
+    不写死模块名：按"文件是**我们自己的**源码 + 属性是 OpenerDirector"扫，将来任何
+    一个照同样写法建 opener 的模块都会被自动罩住。
+
+    **必须排除 vendored 目录**：`.venv` 就在仓库根下面，只判 `startswith(ROOT)` 会把
+    三百多个三方模块一起扫进来（实测 336 个），于是对它们的每个属性做 getattr、还可能
+    去改它们的上下文。改动本身仍是安全的（下面只换**一个 CA 都没有**的上下文，被刻意
+    钉到私有 CA 的上下文有 CA、会被跳过），但那个范围不是本函数的意图。
+    """
+    out = []
+    for mod in list(sys.modules.values()):
+        path = getattr(mod, "__file__", None)
+        if not path or not _is_our_source(path):
+            continue
+        for name in dir(mod):
+            try:
+                obj = getattr(mod, name)
+            except Exception:       # noqa: BLE001  属性可能是会抛的 property
+                continue
+            if isinstance(obj, urllib.request.OpenerDirector):
+                out += [(mod.__name__, name, h) for h in obj.handlers
+                        if isinstance(h, urllib.request.HTTPSHandler)]
+    return out
+
+
+def _ensure_default_ssl_trust() -> str:
+    """把**默认** SSL 上下文（以及已经定格的 opener）的信任库修好。
+
+    返回一行说明，打进 E2E 日志便于排查。
+
+    `SSL_CERT_FILE` 是 OpenSSL 每次建上下文都会重读的（实测：设了→121 个 CA，
+    删了→回到 0），所以进程跑起来之后再设对**之后**建的上下文有效；已经定格的那些
+    要单独换掉，见 `_frozen_https_contexts`。
+
+    外部显式设过 `SSL_CERT_FILE` 就不覆盖（可能指向企业 CA 包）。
+    """
+    notes = []
+    if _default_trust_ok():
+        notes.append("默认上下文本来就可用")
+    elif os.environ.get("SSL_CERT_FILE"):
+        # 外部设了却仍然不可用 —— 覆盖它反而会掩盖配置错误，如实报出来
+        raise RuntimeError(
+            f"SSL_CERT_FILE={os.environ['SSL_CERT_FILE']} 已设置，但默认 SSL "
+            "上下文仍然没有 CA——请先确认那个文件是有效的 CA bundle")
+    else:
+        import certifi   # 缺它就没得修：让 ImportError 直接上抛，别静默继续
+        os.environ["SSL_CERT_FILE"] = certifi.where()
+        notes.append(f"已设 SSL_CERT_FILE={certifi.where()}")
+        if not _default_trust_ok():
+            raise RuntimeError(
+                f"设了 SSL_CERT_FILE={os.environ['SSL_CERT_FILE']} 之后默认 SSL "
+                "上下文仍然没有 CA——进程内调用的生产代码会以 "
+                "CERTIFICATE_VERIFY_FAILED 失败，而那读起来像证书/网络故障")
+
+    # 已经定格的 opener：换掉那个上下文本身。用 create_default_context() 重建而不是
+    # reload 整个模块——reload 会重定义 SmokeFailure 之类的异常类，持有旧引用的
+    # `except` 就捕不到了。
+    repaired = []
+    for mod_name, attr, handler in _frozen_https_contexts():
+        if _ctx_trust_ok(handler._context):
+            continue
+        handler._context = ssl.create_default_context()
+        if not _ctx_trust_ok(handler._context):
+            raise RuntimeError(
+                f"{mod_name}.{attr} 的 HTTPS 上下文换过之后仍然没有 CA——"
+                "进程内那条 urlopen 会以 CERTIFICATE_VERIFY_FAILED 失败")
+        repaired.append(f"{mod_name}.{attr}")
+    notes.append(f"已修定格 opener: {repaired}" if repaired else "无定格 opener 待修")
+    return "；".join(notes)
+
+
 # ---- fixture 自动清理（spec §11-pre.3）----
 #
 # **本次运行创建的 site_id 逐个记账**，清理只碰这些。绝不按 owner 批量删：
@@ -74,14 +202,18 @@ def _record_created(url: str) -> str:
 
 @pytest.fixture(scope="module", autouse=True)
 def _platform_env(cfg):
-    """把 config.ini 的表名/域名/角色导成环境变量。
+    """把 config.ini 的表名/域名/角色导成环境变量，并修好默认 SSL 信任库。
 
     清理路径 `import common` 后走 `common._table("JOBS_TABLE")`，迁移脚本走
     `os.environ["ROUTING_TABLE"]`，健康门合成事件要 `BASE_DOMAIN`——都从环境变量取。
     不设的话 module 级清理以 KeyError 收场，读起来像"清理逻辑坏了"，其实是缺配置
     （而清理失败会被报成"资源已泄漏"，把人引到完全错的方向）。
 
-    跑完还原：这是进程级副作用，留着会污染同一次 pytest 里的其它文件。
+    SSL 那一项见 `_ensure_default_ssl_trust` 上面那段：本文件会在进程内直接调生产
+    代码，而那些代码用**默认** SSL 上下文，venv 里它是空的。
+
+    跑完还原（含 `SSL_CERT_FILE`）：这是进程级副作用，留着会污染同一次 pytest 里的
+    其它文件。
     """
     want = {"JOBS_TABLE": cfg["Deployer"]["jobs_table"],
             "SITES_TABLE": cfg["Deployer"]["sites_table"],
@@ -89,8 +221,10 @@ def _platform_env(cfg):
             "BASE_DOMAIN": cfg["Platform"]["base_domain"],
             "EDGE_ROLE_ARN": cfg["Deployer"]["edge_role_arn"],
             "AWS_DEFAULT_REGION": cfg["Platform"]["region"]}
-    saved = {k: os.environ.get(k) for k in want}
+    # SSL_CERT_FILE 由 _ensure_default_ssl_trust 决定要不要设，但**还原名单里必须有它**
+    saved = {k: os.environ.get(k) for k in list(want) + ["SSL_CERT_FILE"]}
     os.environ.update(want)
+    print(f"\n默认 SSL 信任库：{_ensure_default_ssl_trust()}")
     yield
     for k, v in saved.items():
         if v is None:
@@ -354,13 +488,49 @@ def _ddb():
     return boto3.client("dynamodb", region_name="us-east-1")
 
 
+def _site_row(site_id: str) -> dict | None:
+    """sites 表里这个 site_id 的行（强一致）。不存在返回 None。"""
+    import common
+    return common.get_site_consistent(site_id)
+
+
+def _assert_site_id_is_free(site_id: str) -> None:
+    """这个 site_id 在 sites 表里**必须不存在**，否则拒绝使用。
+
+    这条是 fail-closed 的闸门，不是洁癖。真机跑完清点资源时发现：试点环境里有一个
+    **真站点**的 site_id 形如 `notes-<6 位十六进制>`（真人 owner，permissions_rev 已经
+    十几），而本函数从前生成的**正是同一个形状**。撞上之后：
+
+      ① `--site-id` 让部署覆盖那个站点的 Lambda 与路由，并把 owner 改成 fixture@test；
+      ② 紧接着 module 级清理按 `purge_data=True` 下线它 ⇒ 连 DynamoDB 数据表一起删。
+
+    也就是**不可恢复地毁掉一个真用户的站点**。单次概率 1/16^6，但代价不可逆，所以
+    按闸门处理而不是赌概率。已 DELETED 的旧行同样拒绝：复用那种 id 会让本次清理去动
+    一段别人的历史记录。
+
+    本文件原有的注释只防住了"按 owner 批量删"这一种误伤，没防住 site_id 撞车。
+    """
+    row = _site_row(site_id)
+    assert row is None, (
+        f"site_id {site_id} 在 sites 表里**已存在**"
+        f"（status={row.get('status')!r}, owner={row.get('owner')!r}）——"
+        "拒绝使用：E2E 会用 --site-id 覆盖它、再按 purge_data=True 清理掉它，"
+        "那对真站点是不可恢复的。请重跑（会换一个新的随机 id）")
+
+
 def _new_site_id(name: str = "notes") -> str:
-    """本次运行专用的 site_id（形态与 common.new_site_id 一致：name + 6 位）。
+    """本次运行专用的 site_id。
 
     **必须自己生成**：M7 的用例要在两次部署之间复用同一个 id，那是"更新"路径的
     唯一入口。**生成时就记账**——第一次部署之后的任何一步失败都还要能清理掉它。
+
+    形态是 `{name}-e2e{4 位十六进制}`：那个 `e2e` 段是给**人**看的——在控制台里
+    一眼能判断"这是测试造的"，而纯随机后缀与真站点无法区分（既有的 `e2ekey*` 测试
+    站点用的是同一个约定）。真正的闸门是 `_assert_site_id_is_free`。
     """
-    return _record_site_id(f"{name}-{secrets.token_hex(3)}")
+    site_id = f"{name}-e2e{secrets.token_hex(2)}"
+    _assert_site_id_is_free(site_id)
+    return _record_site_id(site_id)
 
 
 def _marker(tag: str) -> str:
