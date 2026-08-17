@@ -840,14 +840,17 @@ def test_failed_job_restores_the_previous_route_item(aws):
     job_id = common.create_job("a@x.com", "s-1")
     prev = _old_route("s-1")
     # 线上当前是这次部署刚切过去的那条（green + 新前缀）。
-    # **`permissions_rev` 必须在**：`register_route._route_item` 总会写它
-    # （`permissions.py` 的在线改权限与自愈投影也都写），所以"提交过、但线上这条
-    # 没有 rev"是**不可达**状态。少了它，恢复的条件守卫就只能靠一条
-    # `attribute_not_exists(permissions_rev)` 的宽松析取才能过——而那条析取在
-    # item 被 undeploy 删掉时会成立，把已下线的站点复活（见
-    # test_restore_does_not_resurrect_a_route_deleted_during_smoke）。
-    # 值取 4 = 快照里那个 rev：期间没人改过权限时两者本就相等。
-    _put_routing({"subdomain": {"S": "app-s-1"},
+    # **必须带上 `register_route._route_item` 必写的那些字段**（这里是 `site_id`
+    # 与 `permissions_rev`）：本用例的前提是"register_route 已经提交过"，而它写出来的
+    # item 一定有这两个（`permissions.py` 的在线改权限与自愈投影是 update，不会去掉
+    # 它们；undeploy 是整行删除）。所以"提交过、但线上这条缺这些字段"是**不可达**状态。
+    # 留着一条不可达的 fixture 的代价不是测试红，而是**逼恢复的条件守卫放宽**才能过
+    # ——而放宽的那两种形态各自都有真洞：`attribute_not_exists(permissions_rev)` 的
+    # 析取会在 item 被 undeploy 删掉时成立（把已下线站点复活，见
+    # test_restore_does_not_resurrect_a_route_deleted_during_smoke），去掉
+    # `attribute_exists(site_id)` 则丢掉同一层保护。
+    # rev 取 4 = 快照里那个：期间没人改过权限时两者本就相等。
+    _put_routing({"subdomain": {"S": "app-s-1"}, "site_id": {"S": "s-1"},
                   "api_target": {"S": "https://g.lambda-url.us-east-1.on.aws"},
                   "static_prefix": {"S": f"sites/s-1/{job_id}"},
                   "permissions_rev": {"N": "4"}})
@@ -1118,6 +1121,14 @@ def test_abandons_restore_when_the_snapshot_has_no_rev(aws, monkeypatch):
     的同一取舍："没有可比的 rev 就 fail-closed，而不是放行"。放弃的代价只是可用性
     （路由留在这次失败的部署上，而它的权限是 register_route 按**当前**真源算的，
     并没有扩权）；放行的代价是可能把旧权限写回去。两边不对等，所以选放弃。
+
+    **一次写请求都不该发**：没有可比的 rev 时任何条件都注定被拒，发出去只是消耗
+    配额、在 CloudWatch 里制造一条会被误读成"恢复失败"的噪声。
+
+    **Ruling 54 的分支身份在这里靠"有没有那条提示"区分**，不靠写次数：本分支与
+    "快照键根本不在"（B4 的 test_failed_job_without_snapshot_does_not_touch_route）
+    都是零次写，区别是那条**不该**有提示（线上从未变过，没什么要人工处置），
+    而这条**必须**有（路由停在新目标上了）。
     """
     import common
     import mark_job
@@ -1131,8 +1142,10 @@ def test_abandons_restore_when_the_snapshot_has_no_rev(aws, monkeypatch):
     calls = _spy_dynamodb(monkeypatch)
     mark_job.handler(_fail_event(job_id, prev), None)
 
-    assert len(_routing_writes(calls)) == 1                 # 尝试过（分支身份）
+    assert _routing_writes(calls) == [], \
+        "发了一次注定被拒的写请求——没有可比的 rev 时应当直接放弃"
     assert _routing_item("s-1") == live, "无 rev 的快照被当成可信快照写回去了"
+    # 分支身份：零次写 + **有**提示 = 本分支；零次写 + 无提示 = "快照键不在"那条
     assert "人工" in common.get_job(job_id)["error"]
 
 

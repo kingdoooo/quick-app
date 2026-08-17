@@ -9,6 +9,7 @@ import os
 import boto3
 
 import common
+import permissions
 # blue/green 的颜色词表**只有一处定义**（deploy_lambda_site.COLORS）。这里 import
 # 而不是再抄一份 ("blue", "green")：抄第二份之后，加第三个颜色或改名时清理逻辑会
 # 静默地只看旧的两个 —— 而"漏看一个颜色"在这里的后果是删掉它正在用的版本。
@@ -94,13 +95,32 @@ def _restore_route(event) -> str | None:
                             Key={"subdomain": {"S": subdomain}})
             logger.warning(f"首次部署失败，已撤掉 {subdomain} 的路由")
             return None
-        kwargs = {}
         snap_rev = prev.get("permissions_rev")
         if snap_rev is None:
-            expr = "attribute_not_exists(permissions_rev)"
-        else:
-            expr = "permissions_rev = :snap_rev"
-            kwargs["ExpressionAttributeValues"] = {":snap_rev": snap_rev}
+            # 快照里没有 rev ⇒ 没有可比的 rev 就无法证明期间没人改过 ⇒ 放弃，
+            # 而且**一次写请求都不发**：任何条件在这一态都注定被拒，发出去只是
+            # 消耗配额、并在 CloudWatch 里留一条会被误读成"恢复失败"的噪声。
+            logger.error(f"{subdomain}: {ROUTE_NOT_ROLLED_BACK}")
+            return ROUTE_NOT_ROLLED_BACK
+        # **条件表达式走 permissions.snapshot_condition（全仓库唯一定义），不在这里
+        # 手写**。`tests/test_permissions.py::
+        # test_no_handwritten_rev_guard_outside_permissions_module` 按 AST 扫源码
+        # 钉死这一点，而它存在的理由正是本函数上面讲的那个坑的另一面：手抄第二份
+        # 之后，"兼容分支静默成立"的形态会在第二处复活（仓库里两个 P1 都是这么来的）。
+        #
+        # `had_rev=True` 给出的是 "attribute_exists(site_id) AND permissions_rev = :rev"：
+        #   · `permissions_rev = :rev` —— 精确匹配，正是这里要的；
+        #   · `attribute_exists(site_id)` —— 多一层 anti-resurrection。路由 item 被
+        #     undeploy 删掉后该条件为假，恢复自动放弃，不会把已下线站点的子域名
+        #     复活。路由 item 一定带 site_id（`register_route._route_item` 必写，
+        #     在线改权限与自愈投影都是 update 不动它）。
+        # **不用 had_rev=False**：那条分支是给带重试循环的调用方设计的（条件必然
+        # 失败 → 重读重试），mark_job 只有一次机会，语义不对。
+        expr, values, names = permissions.snapshot_condition(
+            rev=int(snap_rev["N"]), had_rev=True)
+        kwargs = {"ExpressionAttributeValues": values} if values else {}
+        if names:
+            kwargs["ExpressionAttributeNames"] = names
         try:
             ddb.put_item(TableName=os.environ["ROUTING_TABLE"], Item=prev,
                          ConditionExpression=expr, **kwargs)
