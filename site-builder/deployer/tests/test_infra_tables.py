@@ -1290,36 +1290,44 @@ def test_nobody_but_validate_can_write_the_validated_prefix(
     （`deploy_lambda_site` 读 artifacts/*、`upload_frontend` 与 `provision_dsql` 读
     extracted/*、`mark_job`/`undeploy` 删前端桶），靠 Deny 精确挖掉两个前缀。
 
+    **`extracted/` 与 `validated/` 都要判**（Ruling 26 的同一课，实测过）：exec_role
+    的那条 Deny 的 `resources` 是一个**两元素列表**，那就是两根独立的自由度。此前只拿
+    validated/ 探针判，于是把 Deny 收窄成 `[validated/*]` 一项时 **33 passed**——而那
+    一步等于让每个兄弟步骤重新能覆写 `extracted/`（validate 已校验的那棵树），
+    `provision_dsql` 按前缀列举 migrations、`upload_frontend` 按前缀发布前端，都会读到
+    被改过的字节。两个前缀同为 validate 的输出，判据必须逐个前缀各走一遍。
+
     **本条只管身份策略。** 资源策略那侧另判一次：artifacts 桶的 bucket policy 不许
     给任何主体 `s3:PutObject`（CDK 的 `auto_delete_objects` 会在那里留一条
     `s3:DeleteObject*` 给它自己的清理角色——那是删桶时的 teardown 授权，只删不写，
     故意不在本条的作用面内）。
     """
-    probe = artifacts_probes["validated"]
     validate_role_lid = _role_lid_by_name(template, VALIDATE_ROLE_NAME)
     by_role = _statements_by_role(template)
     assert by_role, "模板里一条角色策略语句都抽不到——本条空转"
-
-    writers = {lid for lid, stmts in by_role.items()
-               if _grants(template, stmts, "s3:PutObject", probe)}
-    assert writers, ("没有任何角色能写 validated/——连 validate 自己都不能？"
-                     "本条已空转，先查 _grants 与探针")
-    assert validate_role_lid in writers, \
-        f"{VALIDATE_ROLE_NAME} 自己都写不了 validated/"
-
     roles = template.find_resources("AWS::IAM::Role")
-    for lid in writers - {validate_role_lid}:
-        name = roles.get(lid, {}).get("Properties", {}).get("RoleName") or lid
-        for act in ("s3:PutObject", "s3:DeleteObject"):
-            assert _denies(template, by_role[lid], act, probe), (
-                f"{name} 的 Allow 能命中 {probe} 而它没有一条无条件 Deny 盖住 "
-                f"{act}——'只有 validate 能写 validated/'在 IAM 上不成立")
 
-    for pol in template.find_resources("AWS::S3::BucketPolicy").values():
-        for st in pol["Properties"]["PolicyDocument"]["Statement"]:
-            assert not _grants(template, [st], "s3:PutObject", probe), (
-                f"桶策略把 validated/ 的写授给了 {st.get('Principal')}——"
-                f"身份策略那侧收紧了也没用：{st.get('Action')}")
+    for prefix in ("validated", "extracted"):
+        probe = artifacts_probes[prefix]
+        writers = {lid for lid, stmts in by_role.items()
+                   if _grants(template, stmts, "s3:PutObject", probe)}
+        assert writers, (f"没有任何角色能写 {prefix}/——连 validate 自己都不能？"
+                         "本条已空转，先查 _grants 与探针")
+        assert validate_role_lid in writers, \
+            f"{VALIDATE_ROLE_NAME} 自己都写不了 {prefix}/"
+
+        for lid in writers - {validate_role_lid}:
+            name = roles.get(lid, {}).get("Properties", {}).get("RoleName") or lid
+            for act in ("s3:PutObject", "s3:DeleteObject"):
+                assert _denies(template, by_role[lid], act, probe), (
+                    f"{name} 的 Allow 能命中 {probe} 而它没有一条无条件 Deny 盖住 "
+                    f"{act}——'只有 validate 能写 {prefix}/'在 IAM 上不成立")
+
+        for pol in template.find_resources("AWS::S3::BucketPolicy").values():
+            for st in pol["Properties"]["PolicyDocument"]["Statement"]:
+                assert not _grants(template, [st], "s3:PutObject", probe), (
+                    f"桶策略把 {prefix}/ 的写授给了 {st.get('Principal')}——"
+                    f"身份策略那侧收紧了也没用：{st.get('Action')}")
 
 
 def test_rollup_runs_daily_and_has_a_dlq(template):
