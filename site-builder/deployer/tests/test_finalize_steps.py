@@ -849,14 +849,14 @@ def test_failed_job_restores_the_previous_route_item(aws):
     # 析取会在 item 被 undeploy 删掉时成立（把已下线站点复活，见
     # test_restore_does_not_resurrect_a_route_deleted_during_smoke），去掉
     # `attribute_exists(site_id)` 则丢掉同一层保护。
-    # rev 取 4 = 快照里那个：期间没人改过权限时两者本就相等。
+    # rev 取 4 = register_route 写进去的那个（`committed_permissions_rev`），
+    # static_prefix 取本次 job 的：这两项就是补偿的条件锚点，"世界没变过"即两者
+    # 都还在线上。
     _put_routing({"subdomain": {"S": "app-s-1"}, "site_id": {"S": "s-1"},
                   "api_target": {"S": "https://g.lambda-url.us-east-1.on.aws"},
-                  "static_prefix": {"S": f"sites/s-1/{job_id}"},
+                  "static_prefix": {"S": common.static_prefix_for("s-1", job_id)},
                   "permissions_rev": {"N": "4"}})
-    mark_job.handler({"job_id": job_id, "site_id": "s-1",
-                      "previous_route": prev,
-                      "error_info": {"Cause": "smoke failed"}}, None)
+    mark_job.handler(_fail_event(job_id, prev), None)
     assert _routing_item("s-1") == prev
 
 
@@ -889,12 +889,12 @@ def test_failed_first_deploy_removes_the_route_it_just_created(aws):
     import common
     import mark_job
     job_id = common.create_job("a@x.com", "s-1")
-    _put_routing({"subdomain": {"S": "app-s-1"},
-                  "api_target": {"S": "https://b.lambda-url.us-east-1.on.aws"},
-                  "static_prefix": {"S": f"sites/s-1/{job_id}"}})
-    mark_job.handler({"job_id": job_id, "site_id": "s-1",
-                      "previous_route": None,
-                      "error_info": {"Cause": "smoke failed"}}, None)
+    # 线上 = 这次首次部署刚写进去的那条。**必须带 permissions_rev**：
+    # register_route 必写它，而删除现在也按提交端锚点（static_prefix + rev）
+    # 设条件——留一条缺 rev 的 fixture 只会逼那道条件放宽。
+    _put_routing(_committed_route("s-1", job_id, rev="1",
+                                  api_target="https://b.lambda-url.us-east-1.on.aws"))
+    mark_job.handler(_fail_event(job_id, None, committed_rev=1), None)
     assert _routing_item("s-1") is None, \
         "首次部署失败后那条路由还在——子域名被一个 FAILED 的部署占着"
 
@@ -1043,9 +1043,32 @@ def test_route_snapshot_read_is_strongly_consistent(aws, monkeypatch):
 # B4 fix：恢复路由必须带条件——补偿只在"世界还是我离开时的样子"才允许落地
 # ---------------------------------------------------------------------------
 
-def _fail_event(job_id, prev, site_id="s-1"):
-    return {"job_id": job_id, "site_id": site_id, "previous_route": prev,
-            "error_info": {"Cause": "smoke failed"}}
+def _fail_event(job_id, prev, site_id="s-1", committed_rev=4):
+    """提交点之后失败的 event。
+
+    `committed_permissions_rev` 是 register_route 提交成功后写进 event 的**提交端
+    锚点**（= 它写进路由 item 的那个 rev）。补偿的条件锚在这一端而不是快照端，
+    理由见 `permissions.committed_route_condition`。默认 4 = `_old_route` 的默认
+    rev，即"期间没人改过权限"。传 None 模拟升级窗口里老代码起的 execution。
+    """
+    ev = {"job_id": job_id, "site_id": site_id, "previous_route": prev,
+          "error_info": {"Cause": "smoke failed"}}
+    if committed_rev is not None:
+        ev["committed_permissions_rev"] = committed_rev
+    return ev
+
+
+def _committed_route(site_id, job_id, *, rev="4", **kw):
+    """register_route 提交之后线上那条路由（= 本次部署的新目标）。
+
+    `static_prefix` 必须是 `common.static_prefix_for(site_id, job_id)`：补偿的
+    条件就是按它比的，随手写个别的值会让"条件通过"的用例永远走不到。
+    """
+    import common
+    kw.setdefault("api_target", "https://g.lambda-url.us-east-1.on.aws")
+    return _old_route(site_id, rev=rev,
+                      static_prefix=common.static_prefix_for(site_id, job_id),
+                      **kw)
 
 
 def test_abandons_restore_when_permissions_changed_during_smoke(aws, monkeypatch):
@@ -1066,9 +1089,12 @@ def test_abandons_restore_when_permissions_changed_during_smoke(aws, monkeypatch
     import mark_job
     job_id = common.create_job("a@x.com", "s-1")
     prev = _old_route("s-1", rev="4")                       # 快照：rev 4，公开名单
-    tightened = _old_route("s-1", require_auth=True,
-                           allowed_users=[{"S": "vip@x.com"}], rev="5",
-                           api_target="https://g.lambda-url.us-east-1.on.aws")
+    # 线上 = 本次提交的那条（static_prefix 是本 job 的）**再被在线收紧过一次**：
+    # `write_permissions` 只改权限字段并把 rev 推到 5，**不动 static_prefix**。
+    # 所以这里唯一与提交端不同的就是 rev —— 本用例验的正是"只靠 static_prefix
+    # 不够、rev 那一项必须在"。
+    tightened = _committed_route("s-1", job_id, rev="5", require_auth=True,
+                                 allowed_users=[{"S": "vip@x.com"}])
     _put_routing(tightened)                                 # 线上：已被收紧过
 
     calls = _spy_dynamodb(monkeypatch)
@@ -1093,7 +1119,8 @@ def test_restore_does_not_resurrect_a_route_deleted_during_smoke(aws, monkeypatc
     这条是"条件写成 `attribute_not_exists(permissions_rev) OR rev = :snap` 那种
     宽松析取"会漏掉的那根轴：item 不存在时 `attribute_not_exists(...)` **成立**，
     于是一个已被下线的站点的子域名又变回可路由——比扩权更糟，它把"已删除"撤销了。
-    精确匹配 rev 在 item 缺失时条件为假，恢复自动放弃。
+    现在的条件全是属性**相等**比较（`static_prefix` + `permissions_rev`），
+    item 缺失时一律为假，恢复自动放弃，不需要另加 `attribute_exists`。
 
     `undeploy.py` 确实会删这一行，且 smoke 有几十秒窗口，所以这是可达的交错，
     不是纸面问题。
@@ -1113,40 +1140,170 @@ def test_restore_does_not_resurrect_a_route_deleted_during_smoke(aws, monkeypatc
     assert "人工" in common.get_job(job_id)["error"]
 
 
-def test_abandons_restore_when_the_snapshot_has_no_rev(aws, monkeypatch):
-    """快照里没有 permissions_rev（M3 之前的存量路由）⇒ 无法证明期间没人改过 ⇒
-    放弃恢复，不猜。
+def test_restores_a_legacy_snapshot_that_has_no_rev(aws, monkeypatch):
+    """快照里没有 permissions_rev（M3 之前写入的存量路由）**照样能回滚**。
 
-    这是 `permissions.snapshot_condition` 里 `had_rev=False` 那条系统写入者分支
-    的同一取舍："没有可比的 rev 就 fail-closed，而不是放行"。放弃的代价只是可用性
-    （路由留在这次失败的部署上，而它的权限是 register_route 按**当前**真源算的，
-    并没有扩权）；放行的代价是可能把旧权限写回去。两边不对等，所以选放弃。
+    这是 Codex 2026-08-17 P1-4：实测生产 6 条站点路由里有 5 条没有 rev
+    （只有 app-notes-01d147 有）。旧实现把条件锚在**快照端**，于是"快照里没有 rev
+    可比"只能放弃恢复——那 5 个站点第一次更新若 smoke 失败就回滚不了，路由留在
+    失败的新目标上。
 
-    **一次写请求都不该发**：没有可比的 rev 时任何条件都注定被拒，发出去只是消耗
-    配额、在 CloudWatch 里制造一条会被误读成"恢复失败"的噪声。
+    锚**提交端**之后这一态不再特殊：`register_route` 总会写 rev，所以"我写出去的
+    那份"永远有 rev 可比；条件成立即证明期间无人改动，rev-less 的快照可以原样
+    整值写回（写回后这条路由仍然没有 rev —— 它就是切换前的样子，而 Edge 不读
+    这个字段）。
 
-    **Ruling 54 的分支身份在这里靠"有没有那条提示"区分**，不靠写次数：本分支与
-    "快照键根本不在"（B4 的 test_failed_job_without_snapshot_does_not_touch_route）
-    都是零次写，区别是那条**不该**有提示（线上从未变过，没什么要人工处置），
-    而这条**必须**有（路由停在新目标上了）。
+    红的条件：恢复被放弃（回到 P1-4）、或写回的不是整值。
     """
     import common
     import mark_job
     job_id = common.create_job("a@x.com", "s-1")
     prev = _old_route("s-1")
-    del prev["permissions_rev"]                             # 存量：没有 rev
-    live = _old_route("s-1", rev="7",
-                      api_target="https://g.lambda-url.us-east-1.on.aws")
-    _put_routing(live)
+    del prev["permissions_rev"]                             # 存量：快照没有 rev
+    # 线上 = 本次提交的那条。**它有 rev**（register_route 必写），所以提交端锚点
+    # 齐全 —— 这正是"快照缺 rev 不影响回滚"的机理。
+    _put_routing(_committed_route("s-1", job_id, rev="4"))
 
     calls = _spy_dynamodb(monkeypatch)
     mark_job.handler(_fail_event(job_id, prev), None)
 
+    assert len(_routing_writes(calls)) == 1, "一次恢复写都没有发出去"
+    assert _routing_item("s-1") == prev, (
+        "存量（无 rev）路由没能整值回滚——生产上 5/6 条站点路由是这个形状")
+    assert "人工" not in (common.get_job(job_id).get("error") or ""), \
+        "恢复成功了却还在提示需要人工介入"
+
+
+def test_gives_up_when_the_commit_anchor_is_absent(aws, monkeypatch):
+    """event 里没有 `committed_permissions_rev`（升级窗口里老代码起的 execution）
+    ⇒ 放弃恢复并如实告知，**不退回快照 rev 那套守卫**。
+
+    退回去才是错的：快照端那套恰是被本次改动认定不可靠的一套（认不出并发部署、
+    存量无 rev 时又必然放弃），在最不该的时候用一个已知有洞的守卫没有任何好处。
+
+    **一次写请求都不该发**：没有可锚的提交端时任何条件都只能是猜。
+
+    分支身份靠"有没有那条提示"区分，不靠写次数：本分支与"快照键根本不在"
+    （test_failed_job_without_snapshot_does_not_touch_route）都是零次写，区别是
+    那条**不该**有提示（线上从未变过），而这条**必须**有（路由停在新目标上了）。
+    """
+    import common
+    import mark_job
+    job_id = common.create_job("a@x.com", "s-1")
+    prev = _old_route("s-1", rev="4")
+    live = _committed_route("s-1", job_id, rev="4")
+    _put_routing(live)
+
+    calls = _spy_dynamodb(monkeypatch)
+    mark_job.handler(_fail_event(job_id, prev, committed_rev=None), None)
+
     assert _routing_writes(calls) == [], \
-        "发了一次注定被拒的写请求——没有可比的 rev 时应当直接放弃"
-    assert _routing_item("s-1") == live, "无 rev 的快照被当成可信快照写回去了"
-    # 分支身份：零次写 + **有**提示 = 本分支；零次写 + 无提示 = "快照键不在"那条
+        "发了一次只能靠猜的恢复写——没有提交端锚点时应当直接放弃"
+    assert _routing_item("s-1") == live
     assert "人工" in common.get_job(job_id)["error"]
+
+
+def test_refuses_to_overwrite_a_newer_deploys_committed_route(aws, monkeypatch):
+    """同一站点另一次**更晚**的部署已经提交 ⇒ 旧 job 的补偿必须放弃，不许覆盖。
+
+    这是 Codex 2026-08-17 P1-2。可达性：`do_confirm_upload` 的条件只管它自己那条
+    job 的 PENDING→RUNNING；部署租约（后补的）挡的是新执行的**创建**，
+    存量在跑的执行仍可能交错，所以本守卫独立必要、不因租约而冗余。
+
+    交错：旧 job 提交路由（rev=4）→ 新 job 提交路由（rev 仍是 4，因为期间没人改
+    权限）→ 旧 job 的 smoke 失败 → 旧 job 补偿。
+
+    锚快照 rev 时这里会**通过**：两个 job 看到的 rev 相同，"线上 rev 还等于我的
+    快照 rev"对旧 job 同样成立 ⇒ 新 job 刚提交成功的路由被整条覆盖回更早的版本，
+    而新 job 的成功分支已经在清理前缀了，覆盖出来的那条可能指向一个不存在的前缀。
+    锚提交端时 `static_prefix` 带 job_id ⇒ 天然唯一 ⇒ 条件必然失败。
+
+    红的条件：新 job 的路由被改动。
+    """
+    import common
+    import mark_job
+    old_job = common.create_job("a@x.com", "s-1")
+    prev = _old_route("s-1", rev="4")                    # 旧 job 切换前的快照
+    newer = _committed_route("s-1", "job-newer", rev="4")   # 线上：更晚那次的路由
+    _put_routing(newer)
+
+    calls = _spy_dynamodb(monkeypatch)
+    mark_job.handler(_fail_event(old_job, prev), None)
+
+    assert len(_routing_writes(calls)) == 1, "没有发生恢复尝试，落到了别的分支"
+    assert _routing_item("s-1") == newer, \
+        "旧 job 的补偿覆盖了更晚那次成功部署的路由"
+    assert "人工" in common.get_job(old_job)["error"]
+
+
+def test_restore_api_failure_is_reported_in_the_job(aws, monkeypatch):
+    """恢复的写请求本身失败（AWS 报错）⇒ job 错误信息里必须说出来。
+
+    这是 Codex 2026-08-17 P2：宽 except 只 `logger.error` 然后返回 None，于是
+    handler 拿不到 note，job 记录只写"smoke failed"。看到 job 的人会以为部署只是
+    失败了，不知道那条失败的新路由还在线上服务。CloudWatch 里那行他们不看。
+
+    文案必须与"条件判定为不该回滚"分开：那是一个正确的决定，这是一次故障。
+    """
+    import common
+    import mark_job
+    job_id = common.create_job("a@x.com", "s-1")
+    common.update_job(job_id, status="RUNNING")   # MarkFailed 被调时 job 必然 RUNNING
+    prev = _old_route("s-1", rev="4")
+    live = _committed_route("s-1", job_id, rev="4")
+    _put_routing(live)
+
+    armed = {"on": True}      # 第二次调用前解除注入 = 模拟 SFN 的下一次 attempt
+
+    def _boom(op, params):
+        # 只打路由表的 PutItem：update_job 也走 DynamoDB，一律炸掉的话连
+        # "错因已落账"这个前提都没了，验的就不是本分支。
+        if armed["on"] and op == "PutItem" and params.get("TableName") == "routing":
+            raise RuntimeError("ddb unavailable")
+
+    _spy_dynamodb(monkeypatch, on_call=_boom)
+    # 恢复的 AWS 调用失败 ⇒ **抛出而不是写 FAILED**（Codex 2026-08-18 R4 P1-1
+    # 的子项）：写 FAILED 就是放开租约让新部署在未回滚的路由上开跑。抛出让 SFN
+    # 重试（补偿幂等）；job 保持 RUNNING，租约继续挡着。
+    with pytest.raises(RuntimeError, match="回滚请求失败"):
+        mark_job.handler(_fail_event(job_id, prev), None)
+
+    job = common.get_job(job_id)
+    assert job["status"] == "RUNNING", \
+        f"恢复失败却写了终态 {job['status']}——租约被提前放开"
+    assert "smoke failed" in job["error"], "原始错因没有先落账"
+    # 重试成功那一侧：去掉注入后重跑 = SFN 的下一次 attempt
+    armed["on"] = False
+    mark_job.handler(_fail_event(job_id, prev), None)
+    assert _routing_item("s-1") == prev
+    assert common.get_job(job_id)["status"] == "FAILED"
+
+
+def test_first_deploy_route_removal_failure_is_reported_in_the_job(aws, monkeypatch):
+    """首次部署失败时"删掉刚写的那条路由"也可能失败 ⇒ 同样要写进 job。
+
+    这一态的后果比一般恢复失败更直接：子域名被一个 FAILED 的首次部署占着，
+    用户拿到的 URL 打开是一个坏站点。静默 = 没人会去处置它。
+    """
+    import common
+    import mark_job
+    job_id = common.create_job("a@x.com", "s-1")
+    common.update_job(job_id, status="RUNNING")   # MarkFailed 被调时 job 必然 RUNNING
+    live = {"subdomain": {"S": "app-s-1"},
+            "static_prefix": {"S": common.static_prefix_for("s-1", job_id)}}
+    _put_routing(live)
+
+    def _boom(op, params):
+        if op == "DeleteItem" and params.get("TableName") == "routing":
+            raise RuntimeError("ddb unavailable")
+
+    _spy_dynamodb(monkeypatch, on_call=_boom)
+    with pytest.raises(RuntimeError, match="回滚请求失败"):
+        mark_job.handler(_fail_event(job_id, None), None)
+
+    assert _routing_item("s-1") == live                  # 没删掉（注入的故障）
+    assert common.get_job(job_id)["status"] == "RUNNING", \
+        "删除失败却写了终态——租约被提前放开"
 
 
 def test_long_error_cause_does_not_truncate_the_manual_intervention_note(aws):
@@ -1169,3 +1326,604 @@ def test_long_error_cause_does_not_truncate_the_manual_intervention_note(aws):
     assert mark_job.ROUTE_NOT_ROLLED_BACK in err, "提示被截断切掉了"
     assert len(err) <= 500, f"error 字段超了 500：{len(err)}"
     assert "X" in err, "原因被整段丢掉了——应该是截断，不是丢弃"
+
+
+# ---------------------------------------------------------------------------
+# 前端版本前缀的清理：删早了就是线上 403（Codex 2026-08-17 P1-1）
+# ---------------------------------------------------------------------------
+
+def _put_frontend(*prefixes):
+    """在前端桶里给每个前缀放一个 index.html。返回 s3 client。"""
+    import boto3
+    s3 = boto3.client("s3")
+    for p in prefixes:
+        s3.put_object(Bucket="site-frontend-1", Key=f"{p.rstrip('/')}/index.html",
+                      Body=b"<html>")
+    return s3
+
+
+def _frontend_prefixes():
+    """桶里现存的版本前缀集合（不带尾斜杠，与路由表的 static_prefix 同形）。"""
+    import boto3
+    resp = boto3.client("s3").list_objects_v2(Bucket="site-frontend-1",
+                                             Prefix="sites/")
+    return {o["Key"].rsplit("/", 1)[0] for o in resp.get("Contents", [])}
+
+
+def _age_out(monkeypatch):
+    """把 mark_job 眼里的"现在"推到 KEEP_PREFIX_MINUTES 之后，让桶里已有的对象
+    全部变成"陈旧"。moto 不允许指定 LastModified，年龄分支只能从这一端注入。"""
+    from datetime import datetime, timedelta, timezone
+    import mark_job
+    monkeypatch.setattr(mark_job, "_utcnow", lambda: (
+        datetime.now(timezone.utc)
+        + timedelta(minutes=mark_job.KEEP_PREFIX_MINUTES + 1)))
+
+
+def test_cleanup_keeps_the_previous_live_prefix_for_the_edge_cache_window(
+        aws, monkeypatch):
+    """上一版正在服务的前缀**不许在成功之后立刻删掉**。
+
+    这是 Codex 2026-08-17 P1-1，M7"原子切换"的必要条件：切路由是一次 put_item，
+    但 Edge 每个实例把整条路由 item 缓存 60s（origin_request.ROUTE_CACHE_TTL），
+    提交之后仍有 warm 实例按**旧** static_prefix 改写请求。旧前缀被立刻删掉 ⇒
+    那些实例打到一个不存在的对象上，而前端桶是私有的 ⇒ 浏览器拿到 **403 而不是
+    404**，最长约 60s。
+
+    红的条件：上一版前缀被删（旧实现必红——它删掉除当前 job 外的一切）。
+    用例把"现在"推到 KEEP_PREFIX_MINUTES 之后，所以保留**不是**靠年龄那一条侥幸
+    成立的，而是靠 previous_route 这个显式锚点。
+    """
+    import mark_job
+    _put_frontend("sites/s-1/job-prev", "sites/s-1/job-new", "sites/s-1/job-ancient")
+    _age_out(monkeypatch)
+
+    mark_job._cleanup_old_versions("s-1", "job-new",
+                                   previous_prefix="sites/s-1/job-prev")
+
+    left = _frontend_prefixes()
+    assert "sites/s-1/job-new" in left, "把线上正在服务的那一份删了"
+    assert "sites/s-1/job-prev" in left, (
+        "上一版前缀被立刻删掉——仍持有旧路由缓存的 Edge 实例会 403，最长约 60s")
+    assert "sites/s-1/job-ancient" not in left, "更早的版本没被清理，存储会无限累积"
+
+
+def test_cleanup_keeps_a_concurrent_deploys_fresh_upload(aws, monkeypatch):
+    """同一站点另一次**正在跑**的部署刚上传完的前缀不许删。
+
+    可达性：`do_confirm_upload` 的条件只管它自己那条 job 的 PENDING→RUNNING，
+    部署租约只挡新执行的创建，存量在跑的执行仍可能交错。删掉之后那次部署随后提交的路由会
+    指向一个空前缀 ⇒ 整站 403。
+
+    这里**不推时钟**：新上传的对象年龄接近 0，本用例验的就是年龄那一条闸门。
+    """
+    import mark_job
+    _put_frontend("sites/s-1/job-new", "sites/s-1/job-concurrent")
+
+    mark_job._cleanup_old_versions("s-1", "job-new", previous_prefix=None)
+
+    assert "sites/s-1/job-concurrent" in _frontend_prefixes(), (
+        "把另一次正在跑的部署刚上传的前端删了——那次部署提交后会整站 403")
+
+
+def test_cleanup_does_not_touch_other_sites(aws, monkeypatch):
+    """只清理本站点。前端桶是所有站点共用的，前缀算错一段就是删别人的站。"""
+    import mark_job
+    _put_frontend("sites/s-1/job-old", "sites/s-2/job-old")
+    _age_out(monkeypatch)
+
+    mark_job._cleanup_old_versions("s-1", "job-new", previous_prefix=None)
+
+    left = _frontend_prefixes()
+    assert "sites/s-2/job-old" in left, "删到别的站点了"
+    assert "sites/s-1/job-old" not in left
+
+
+def test_cleanup_keeps_the_previous_prefix_even_when_the_route_value_has_no_slash(
+        aws, monkeypatch):
+    """路由表里的 static_prefix **不带**尾斜杠，而清理是按分组键（带尾斜杠）比相等。
+
+    两个都要挡住，本用例的 fixture 同时覆盖：
+      · 忘了补尾斜杠 ⇒ `p in keep` 永远为假 ⇒ 每次都删掉要保的那个上一版；
+      · 用 `startswith` 判归属 ⇒ `sites/s-1/job-1` 会命中 `sites/s-1/job-11/...`
+        的对象，删除范围随 job_id 的字面前缀关系漂移（"偶尔删错，换个 job_id 就好"）。
+    同一类尾斜杠错误在 Edge 的静态改写上造成过整站 403。
+    """
+    import mark_job
+    _put_frontend("sites/s-1/job-1", "sites/s-1/job-11")
+    _age_out(monkeypatch)
+
+    mark_job._cleanup_old_versions("s-1", "job-11", previous_prefix="sites/s-1/job-1")
+
+    assert _frontend_prefixes() == {"sites/s-1/job-1", "sites/s-1/job-11"}
+
+
+def test_success_path_passes_the_previous_prefix_to_the_cleanup(aws, monkeypatch):
+    """成功分支必须把 `previous_route` 里那个前缀传给清理。
+
+    单测 `_cleanup_old_versions` 本身全绿、而 handler 忘了传 —— 那正是这条 P1 的
+    真实形态（旧实现的 handler 只传了 site_id 与 job_id）。所以这里按 handler
+    的实际调用断言，不是再测一遍那个函数。
+    """
+    import common
+    import mark_job
+    job_id = common.create_job("a@x.com", "s-1")
+    seen = {}
+    monkeypatch.setattr(mark_job, "_cleanup_old_versions",
+                        lambda *a, **kw: seen.update(args=a, kwargs=kw))
+    monkeypatch.setattr(mark_job, "_cleanup_versions", lambda *a, **kw: None)
+
+    mark_job.handler({"job_id": job_id, "site_id": "s-1",
+                      "url": "https://app-s-1.example.com",
+                      "previous_route": _old_route("s-1"),
+                      "manifest": {"name": "n", "tier": "fullstack-nosql"}}, None)
+
+    assert seen["kwargs"].get("previous_prefix") == "sites/s-1/job-old", (
+        "成功分支没把上一版前缀传给清理——那一版会被立刻删掉（Edge 缓存 403）")
+
+
+def test_success_path_survives_a_first_deploy_without_a_previous_route(aws,
+                                                                      monkeypatch):
+    """首次部署时 `previous_route` 是 None ⇒ 不许因此抛异常。
+
+    站点此刻已经上线了，清理是最后一步；这里抛异常会把一次成功的部署报成 FAILED。
+    """
+    import common
+    import mark_job
+    job_id = common.create_job("a@x.com", "s-1")
+    _put_frontend("sites/s-1/job-new")
+    monkeypatch.setattr(mark_job, "_cleanup_versions", lambda *a, **kw: None)
+
+    out = mark_job.handler({"job_id": job_id, "site_id": "s-1",
+                            "url": "https://app-s-1.example.com",
+                            "previous_route": None,
+                            "manifest": {"name": "n", "tier": "fullstack-nosql"}},
+                           None)
+
+    assert out["status"] == "SUCCEEDED"
+
+
+def test_register_route_records_the_rev_it_committed(aws):
+    """提交成功后必须把**写进路由的那个 rev** 留在 event 里。
+
+    这是 mark_job 补偿的提交端锚点。忘了写的后果不是报错而是**恢复静默停摆**：
+    mark_job 拿不到 `committed_permissions_rev` ⇒ 一律放弃回滚（fail-closed），
+    每次 smoke 失败都只留一条"需人工介入"。所以按 event 断言，不是只看路由表。
+    """
+    import boto3
+    import common
+    import register_route
+    common.upsert_site("s-1", owner="o@x.com", require_login=False,
+                       allowed_users="org", collaborators=[], permissions_rev=6)
+    job_id = common.create_job("o@x.com", "s-1")
+
+    out = register_route.handler(_b3_event(job_id, "s-1"), None)
+
+    item = boto3.client("dynamodb").get_item(
+        TableName="routing", Key={"subdomain": {"S": "app-s-1"}})["Item"]
+    assert out["committed_permissions_rev"] == int(item["permissions_rev"]["N"]), (
+        "event 里记的 rev 与真正写进路由的那个不一致——补偿会锚一份从未落地的状态")
+    assert out["committed_permissions_rev"] == 6
+
+
+def test_register_route_does_not_record_a_rev_it_never_committed(aws, monkeypatch):
+    """事务失败（提交没发生）⇒ event 里**不许**出现 `committed_permissions_rev`。
+
+    留一个下来就等于告诉 mark_job "我提交过"，而路由其实一个字没改。那会让
+    `previous_route` 三态契约的第一态（键不在 ⇒ 线上从未变过 ⇒ 别动）失去意义：
+    补偿会拿着一个凭空的锚点去写路由。
+    """
+    import botocore.exceptions
+    import pytest
+
+    import common
+    import register_route
+    common.upsert_site("s-1", owner="o@x.com", require_login=False,
+                       allowed_users="org", collaborators=[], permissions_rev=1)
+    job_id = common.create_job("o@x.com", "s-1")
+    ev = _b3_event(job_id, "s-1")
+
+    def _always_cancelled(**kw):
+        raise botocore.exceptions.ClientError(
+            {"Error": {"Code": "TransactionCanceledException"}},
+            "TransactWriteItems")
+
+    real_client = boto3.client
+
+    def _patched(*a, **kw):
+        c = real_client(*a, **kw)
+        if a and a[0] == "dynamodb":
+            c.transact_write_items = _always_cancelled
+        return c
+
+    monkeypatch.setattr(register_route.boto3, "client", _patched)
+    with pytest.raises(RuntimeError, match="并发修改"):
+        register_route.handler(ev, None)
+
+    assert "committed_permissions_rev" not in ev, \
+        "提交从未成功却留下了提交端锚点"
+
+
+# ---------------------------------------------------------------------------
+# Step Functions 的 Task 自动重试（每个 Task 都有 MaxAttempts=6，四种错误都属于
+# "函数可能已经执行完，只是响应没回来"）。Codex 2026-08-17 P1-1 / P2。
+# 复现方式统一为：**用同一份原始输入把 handler 调第二次**——SFN 重试就是这样，
+# 它不会带上第一次丢失的输出。
+# ---------------------------------------------------------------------------
+
+def test_register_route_retry_keeps_the_first_snapshot(aws):
+    """RegisterRoute 被重试时，快照必须仍是**第一次**拍下的那条旧路由。
+
+    这是 P1-1。旧实现把 `previous_route` 只放在返回值里：重试用原始输入 ⇒ 第一次的
+    快照丢失 ⇒ 第二次拍到的是自己刚写进去的**新**路由 ⇒ 后续 smoke 失败时"回滚"成
+    写回新路由的 no-op，而日志照样说"已恢复到切换前"。
+
+    红的条件：第二次返回的 previous_route 变成了新路由（= 快照丢了）。
+    """
+    import boto3
+    import common
+    import register_route
+    common.upsert_site("s-1", owner="o@x.com", require_login=False,
+                       allowed_users="org", collaborators=[], permissions_rev=3)
+    job_id = common.create_job("o@x.com", "s-1")
+    old = _old_route("s-1", rev="3")
+    boto3.client("dynamodb").put_item(TableName="routing", Item=old)
+    ev = _b3_event(job_id, "s-1")
+
+    first = register_route.handler(dict(ev), None)
+    assert first["previous_route"] == old, "前提不成立：第一次就没拍到旧路由"
+
+    # ---- SFN 重试：同一份**原始**输入再调一次 ----
+    second = register_route.handler(dict(ev), None)
+    assert second["previous_route"] == old, (
+        "重试把自己刚写的新路由当成了『切换前快照』——补偿会变成 no-op，"
+        f"而日志会说已恢复：{second['previous_route']}")
+    assert second["committed_permissions_rev"] == first["committed_permissions_rev"]
+    assert second["effective_auth"] == first["effective_auth"]
+
+
+def test_register_route_retry_does_not_write_the_route_again(aws, monkeypatch):
+    """重试必须**一次路由写都不发**：提交点只能发生一次。
+
+    再写一遍即使内容相同也不是无害的：它会覆盖掉这期间任何更晚的成功部署，
+    并且推进 Edge 缓存与写指标，让"提交点只有一次写"这条不再成立。
+    """
+    import boto3
+    import common
+    import register_route
+    common.upsert_site("s-1", owner="o@x.com", require_login=False,
+                       allowed_users="org", collaborators=[], permissions_rev=3)
+    job_id = common.create_job("o@x.com", "s-1")
+    boto3.client("dynamodb").put_item(TableName="routing",
+                                      Item=_old_route("s-1", rev="3"))
+    ev = _b3_event(job_id, "s-1")
+    register_route.handler(dict(ev), None)
+
+    calls = _spy_dynamodb(monkeypatch)
+    register_route.handler(dict(ev), None)
+    assert _routing_writes(calls) == [], \
+        f"重试又写了一次路由：{[op for op, _ in calls]}"
+
+
+def test_register_route_retry_after_a_lost_response_is_still_recoverable(aws):
+    """第一次提交成功但**响应丢失**（event 上的字段没传下去）⇒ 重试后仍能完整回滚。
+
+    这条把 P1-1 的两端接起来：重试拿回快照 → mark_job 据它把路由整值写回。
+    旧实现在这里会"恢复"成新路由（no-op）并报成功。
+    """
+    import boto3
+    import common
+    import mark_job
+    import register_route
+    common.upsert_site("s-1", owner="o@x.com", require_login=False,
+                       allowed_users="org", collaborators=[], permissions_rev=3)
+    job_id = common.create_job("o@x.com", "s-1")
+    old = _old_route("s-1", rev="3")
+    boto3.client("dynamodb").put_item(TableName="routing", Item=old)
+    ev = _b3_event(job_id, "s-1")
+
+    register_route.handler(dict(ev), None)          # 第一次：提交了，响应"丢失"
+    retried = register_route.handler(dict(ev), None)  # SFN 用原始输入重试
+    retried["error_info"] = {"Cause": "smoke failed"}
+    mark_job.handler(retried, None)
+
+    assert _routing_item("s-1") == old, "重试之后回滚不再有效——快照在重试里丢了"
+    assert "人工" not in (common.get_job(job_id).get("error") or "")
+
+
+def test_mark_failed_retry_does_not_claim_the_route_was_not_rolled_back(aws):
+    """MarkFailed 被重试时不许谎报"路由未回滚、需人工介入"。
+
+    这是 P2。第一次已经把路由写回旧值 ⇒ 第二次的提交端条件必然不成立（线上已经
+    不是我提交的那份）。把这一态报成"需人工介入"是**谎报**：路由其实好着，而这条
+    提示会让人去处置一个不存在的问题，等真出问题时也就不再被当真。
+    """
+    import common
+    import mark_job
+    job_id = common.create_job("a@x.com", "s-1")
+    prev = _old_route("s-1", rev="4")
+    _put_routing(_committed_route("s-1", job_id, rev="4"))
+    ev = _fail_event(job_id, prev)
+
+    mark_job.handler(dict(ev), None)
+    assert _routing_item("s-1") == prev, "前提不成立：第一次就没恢复成功"
+
+    mark_job.handler(dict(ev), None)                # SFN 重试
+    assert _routing_item("s-1") == prev, "第二次把路由改坏了"
+    err = common.get_job(job_id)["error"]
+    assert mark_job.ROUTE_NOT_ROLLED_BACK not in err, \
+        f"重试谎报了『路由未回滚』，而路由其实已经恢复好了：{err!r}"
+    assert mark_job.ROUTE_RESTORE_FAILED not in err
+
+
+def test_mark_failed_retry_of_a_first_deploy_deletion_is_idempotent(aws):
+    """首次部署那一态（previous_route=None ⇒ 删掉）被重试时同样不许谎报。"""
+    import common
+    import mark_job
+    job_id = common.create_job("a@x.com", "s-1")
+    _put_routing(_committed_route("s-1", job_id, rev="1"))
+    ev = _fail_event(job_id, None, committed_rev=1)
+
+    mark_job.handler(dict(ev), None)
+    assert _routing_item("s-1") is None, "前提不成立：第一次就没删掉"
+
+    mark_job.handler(dict(ev), None)                # SFN 重试
+    assert _routing_item("s-1") is None
+    err = common.get_job(job_id)["error"]
+    assert mark_job.ROUTE_NOT_ROLLED_BACK not in err, \
+        f"重试谎报了『路由未回滚』，而那条路由已经撤掉了：{err!r}"
+
+
+def test_first_deploy_deletion_refuses_to_remove_a_newer_deploys_route(aws,
+                                                                      monkeypatch):
+    """失败的**首次部署**不许删掉一次更晚的成功部署写下的路由。
+
+    这是 Codex 2026-08-17 P1-2：`previous_route is None` 那一态原先是**无条件**
+    delete_item，于是这个交错会让整条路由消失——比"停在旧目标"更糟，子域名直接
+    不解析。
+
+    交错：首次部署 A 提交（切换前无路由 ⇒ 快照 None）→ 更新 B 成功提交 →
+    A 的 smoke 失败 → A 补偿。
+    """
+    import common
+    import mark_job
+    job_a = common.create_job("a@x.com", "s-1")
+    newer = _committed_route("s-1", "job-newer", rev="1")
+    _put_routing(newer)
+
+    calls = _spy_dynamodb(monkeypatch)
+    mark_job.handler(_fail_event(job_a, None, committed_rev=1), None)
+
+    assert _routing_item("s-1") == newer, \
+        "失败的首次部署删掉了更晚那次成功部署的路由——子域名直接不解析了"
+    assert len(_routing_writes(calls)) == 1, "分支身份：应当尝试过一次条件删除"
+    assert "人工" in common.get_job(job_a)["error"]
+
+
+def test_missing_snapshot_but_route_already_switched_is_reported(aws):
+    """`previous_route` 键缺席、而线上前缀已经是本 job 的 ⇒ 必须如实告知。
+
+    键缺席**通常**意味着 register_route 还没提交（那时一个字都不该动）。但重试
+    交错下"提交过、快照却没传到"是可达的，此刻静默什么都不做等于把"路由停在失败
+    的新目标上"藏起来。判据是线上前缀是不是我写的——那是只有提交过才可能出现的。
+    """
+    import common
+    import mark_job
+    job_id = common.create_job("a@x.com", "s-1")
+    _put_routing(_committed_route("s-1", job_id, rev="4"))
+
+    mark_job.handler({"job_id": job_id, "site_id": "s-1",
+                      "error_info": {"Cause": "smoke failed"}}, None)
+
+    assert mark_job.ROUTE_SNAPSHOT_LOST in common.get_job(job_id)["error"], \
+        "路由已切而快照缺席，却什么都没说"
+
+
+def test_missing_snapshot_with_an_unrelated_route_stays_silent(aws, monkeypatch):
+    """键缺席且线上前缀不是本 job 的 ⇒ 这是"没提交过"，必须**一个字都不说、
+    一次写都不发**。
+
+    与上一条是同一个判据的两侧。报成"需人工介入"会让每一次健康门失败都带上一条
+    假警报——而健康门失败是最常见的失败。
+    """
+    import common
+    import mark_job
+    job_id = common.create_job("a@x.com", "s-1")
+    live = _old_route("s-1", rev="4")
+    _put_routing(live)
+
+    calls = _spy_dynamodb(monkeypatch)
+    mark_job.handler({"job_id": job_id, "site_id": "s-1",
+                      "error_info": {"Cause": "BackendUnhealthy"}}, None)
+
+    assert _routing_writes(calls) == []
+    assert _routing_item("s-1") == live
+    err = common.get_job(job_id)["error"]
+    assert "人工" not in err, f"健康门失败被加上了假警报：{err!r}"
+
+
+def test_upload_frontend_refuses_an_empty_frontend(aws):
+    """前端产物为空 ⇒ 在**提交点之前** fail closed（Codex 2026-08-17 P1-5）。
+
+    空前缀意味着提交之后每个非 /api 请求都 403（桶是私有的，"没这个对象"就是 403
+    而不是 404），而这一点没有任何下游能发现：register_route 照样把 static_prefix
+    切过去，require_auth 站点的 smoke 只断言"302 到登录端点"、根本不碰 S3，
+    于是这样的部署会被标成 SUCCEEDED，等 Edge 缓存过期之后才整站坏掉。
+
+    红的条件：不抛（旧行为——静默上传 0 个对象然后继续）。
+    """
+    import pytest
+
+    import common
+    import upload_frontend
+    common.create_job("a@x.com", "hello-x1")
+    # extracted/job-1/frontend/ 下什么都没有（zip 里没有 frontend 目录）
+    with pytest.raises(RuntimeError, match="前端产物为空"):
+        upload_frontend.handler(dict(EVENT), None)
+
+
+def test_upload_frontend_accepts_a_non_index_frontend(aws):
+    """有对象就放行，**不**额外要求 index.html。
+
+    index.html 的要求**存在，但住在合同层**（`contract/redlines.py`，
+    Codex 2026-08-18 P1-5B 之后）：validate 步骤在部署链最早、还没动任何资源时
+    就把缺 index.html 的包拦下。上传步骤只守"非空"这一条兜底——在这里再查一遍
+    index.html 就是同一条合同要求的第二份手抄，两份漂移时错的那份决定行为。
+    本条钉住这个分层。
+    """
+    import boto3
+    import common
+    import upload_frontend
+    common.create_job("a@x.com", "hello-x1")
+    boto3.client("s3").put_object(
+        Bucket="site-artifacts-1",
+        Key="extracted/job-1/frontend/app.js", Body=b"console.log(1)")
+    out = upload_frontend.handler(dict(EVENT), None)
+    assert out["job_id"] == "job-1"
+
+
+def test_restore_falls_back_to_the_persisted_route_commit(aws):
+    """事件里两个补偿字段都缺、但 job 里有 route_commit ⇒ **完整回滚**，
+    不是报"需人工介入"（独立评审 2026-08-18 Important-2）。
+
+    可达路径：SFN 的 add_catch 把错误并进**失败那个 Task 的输入**。RegisterRoute
+    提交成功后若全部重试仍失败（transact 落地后进程被杀、每次重试都栽在回放读上），
+    MarkFailed 拿到的是 upload_frontend 的输出——没有 previous_route 也没有
+    committed_permissions_rev。而 job 里有与提交同一笔事务落库的 route_commit，
+    系统完全有能力自动回滚；只报 SNAPSHOT_LOST 是把能自动做的事推给人工。
+
+    红的条件：路由没被写回、或 job 错误里出现"人工"。
+    """
+    import boto3 as b3
+    import common
+    import mark_job
+    job_id = common.create_job("a@x.com", "s-1")
+    prev = _old_route("s-1", rev="4")
+    committed = _committed_route("s-1", job_id, rev="4")
+    _put_routing(committed)                       # 线上：本次提交的新目标
+    # job 里有与提交同一笔落库的 route_commit（register_route 的产物形态）
+    b3.client("dynamodb").update_item(
+        TableName="site-deploy-jobs", Key={"job_id": {"S": job_id}},
+        UpdateExpression="SET route_commit = :rc",
+        ExpressionAttributeValues={":rc": {"M": {
+            "previous_route": {"M": prev},
+            "committed_route": {"M": committed}}}})
+
+    # MarkFailed 收到的是 RegisterRoute 的**输入**：两个补偿字段都不在
+    mark_job.handler({"job_id": job_id, "site_id": "s-1",
+                      "error_info": {"Cause": "States.TaskFailed"}}, None)
+
+    assert _routing_item("s-1") == prev, \
+        "job 里有 route_commit 却没回滚——把系统能自动做的事推给了人工"
+    err = common.get_job(job_id)["error"]
+    assert "人工" not in err, f"回滚成功却还在喊需人工介入：{err!r}"
+
+
+def test_restore_falls_back_for_a_first_deploy_commit_too(aws):
+    """同一回落对首次部署（previous_route=NULL）也成立：删掉刚写的那条。"""
+    import boto3 as b3
+    import common
+    import mark_job
+    job_id = common.create_job("a@x.com", "s-1")
+    committed = _committed_route("s-1", job_id, rev="1")
+    _put_routing(committed)
+    b3.client("dynamodb").update_item(
+        TableName="site-deploy-jobs", Key={"job_id": {"S": job_id}},
+        UpdateExpression="SET route_commit = :rc",
+        ExpressionAttributeValues={":rc": {"M": {
+            "previous_route": {"NULL": True},
+            "committed_route": {"M": committed}}}})
+
+    mark_job.handler({"job_id": job_id, "site_id": "s-1",
+                      "error_info": {"Cause": "States.TaskFailed"}}, None)
+
+    assert _routing_item("s-1") is None, \
+        "首次部署的 route_commit 回落没删掉刚写的路由——子域名被 FAILED 部署占着"
+
+
+def test_job_stays_running_until_the_compensation_finishes(aws, monkeypatch):
+    """MarkFailed 必须**先补偿、后写 FAILED**（Codex 2026-08-18 R4 P1-1）。
+
+    部署租约判"忙"看的是 holder 的 RUNNING：status 先写成 FAILED 的话，租约在
+    补偿完成前就可被抢——新部署 B 在"已提交但未回滚"的路由上算 live/idle 色，
+    随后本 job 的补偿把路由写回 B 正在改的那个色，B 还没过健康门的版本就这样
+    接上了线上流量。这与 undeploy 那条 Critical（先清租约后 purge）是同一类。
+
+    断言的是**进入补偿那一刻的 status**——只看最终状态的用例对顺序缺陷全盲。
+    """
+    import common
+    import mark_job
+    job_id = common.create_job("a@x.com", "s-1")
+    common.update_job(job_id, status="RUNNING")
+    prev = _old_route("s-1", rev="4")
+    _put_routing(_committed_route("s-1", job_id, rev="4"))
+
+    seen = {}
+    real = mark_job._restore_route
+
+    def _spy(event):
+        seen["status_at_restore"] = common.get_job(job_id, consistent=True)["status"]
+        return real(event)
+
+    monkeypatch.setattr(mark_job, "_restore_route", _spy)
+    mark_job.handler(_fail_event(job_id, prev), None)
+
+    assert seen["status_at_restore"] == "RUNNING", (
+        f"进入补偿时 job 已是 {seen['status_at_restore']}——租约此刻已可被抢，"
+        "新部署会与补偿交错")
+    assert common.get_job(job_id)["status"] == "FAILED"   # 终态照写，只是在后
+    assert _routing_item("s-1") == prev                    # 补偿本身照常生效
+
+
+def test_a_failed_route_commit_read_keeps_the_job_running(aws, monkeypatch):
+    """读 route_commit 失败（暂时性超时）⇒ MarkFailed **抛出并保持 RUNNING**，
+    不许写 FAILED（Codex 2026-08-18 R5 P1）。
+
+    此刻系统不知道路由是否提交过、要不要恢复。把读失败折叠成"无需补偿"会让
+    job 进终态、租约被抢，新部署在一条**状态未知**的路由上开跑——与"补偿动作
+    尚未确定完成时锁不能变得可抢"是同一条纪律。抛出让 SFN 重试这次读。
+    """
+    import common
+    import mark_job
+    job_id = common.create_job("a@x.com", "s-1")
+    common.update_job(job_id, status="RUNNING")
+    live = _committed_route("s-1", job_id, rev="4")
+    _put_routing(live)
+
+    armed = {"on": True}
+
+    def _boom(op, params):
+        if (armed["on"] and op == "GetItem"
+                and params.get("TableName") == "site-deploy-jobs"):
+            raise RuntimeError("jobs 读超时（注入）")
+
+    _spy_dynamodb(monkeypatch, on_call=_boom)
+    # 事件缺两个补偿字段（Task 重试的原始输入形态）⇒ 必须读 route_commit 才知道
+    # 有没有提交过——而这次读失败了。
+    with pytest.raises(RuntimeError, match="回滚请求失败"):
+        mark_job.handler({"job_id": job_id, "site_id": "s-1",
+                          "error_info": {"Cause": "smoke failed"}}, None)
+
+    armed["on"] = False          # 断言自己也要读 jobs 表
+    assert common.get_job(job_id)["status"] == "RUNNING", \
+        "补偿状态读失败却写了终态——租约被放给了新部署"
+    assert _routing_item("s-1") == live, "状态未知时不许动路由"
+
+
+def test_a_failed_live_route_read_keeps_the_job_running(aws, monkeypatch):
+    """route_commit 为空后、判定"提交过没有"的**线上路由读**失败 ⇒ 同样抛出保持
+    RUNNING。这次读是最后的判定依据，读失败 = 状态未知 ≠ 无需补偿。"""
+    import common
+    import mark_job
+    job_id = common.create_job("a@x.com", "s-1")
+    common.update_job(job_id, status="RUNNING")
+
+    def _boom(op, params):
+        if op == "GetItem" and params.get("TableName") == "routing":
+            raise RuntimeError("路由读超时（注入）")
+
+    _spy_dynamodb(monkeypatch, on_call=_boom)
+    with pytest.raises(RuntimeError, match="回滚请求失败"):
+        mark_job.handler({"job_id": job_id, "site_id": "s-1",
+                          "error_info": {"Cause": "BackendUnhealthy"}}, None)
+    assert common.get_job(job_id)["status"] == "RUNNING"

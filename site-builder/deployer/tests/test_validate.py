@@ -53,7 +53,10 @@ FULLSTACK_MANIFEST = {"name": "fullstack", "tier": "fullstack-nosql",
                                   "entrypoint": "node app.js", "port": 8080},
                       "auth": {"require_login": False, "allowed_users": "org"}}
 GOOD_BACKEND = {"run.sh": "#!/bin/sh\nnode app.js\n",
-                "backend/app.js": "// GET /api/health\nok()"}
+                "backend/app.js": "// GET /api/health\nok()",
+                # index.html 是合同要求（缺失 = 首页永久 403，见
+                # contract/redlines.py）——"合法站点"的 fixture 必须带上
+                "frontend/index.html": "<h1>hi</h1>"}
 
 
 def test_valid_static_site_passes(aws):

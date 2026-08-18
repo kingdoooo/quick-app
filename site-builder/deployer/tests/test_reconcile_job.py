@@ -144,13 +144,41 @@ def test_sweeper_leaves_still_running_execution_alone(aws):
     assert _get_job("job-longrun")["status"] == "RUNNING"
 
 
-def test_sweeper_reports_orphan_without_guessing(aws):
-    """找不到 execution → 计入 orphans 并记日志，**不猜终态**。"""
+def test_sweeper_converges_a_job_whose_execution_never_started(aws):
+    """ExecutionDoesNotExist → **收敛成 FAILED**，不再只记 orphan。
+
+    这不是猜（旧口径"不猜终态"针对的是 name 不确定的年代）：execution name ==
+    job_id 是两个入口都钉死的约定，且 execution 结束后记录保留 90 天——
+    "这个 name 不存在"就是"start 从未发生"的权威证词。而且这一态现在**合法
+    可达**：StartExecution 网络错误、结果不确定时，入口保持 RUNNING 不回滚
+    （Codex 2026-08-18 R4 P1-2），把核实交给这里。不收敛的话租约永远 busy，
+    站点**永久锁死**。
+    """
     import botocore.exceptions
     _stale_job("job-orphan", 60)
     sfn = MagicMock()
     sfn.describe_execution.side_effect = botocore.exceptions.ClientError(
         {"Error": {"Code": "ExecutionDoesNotExist"}}, "DescribeExecution")
+    with patch.object(reconcile_job, "_sfn", return_value=sfn):
+        out = reconcile_job.sweeper_handler({}, None)
+    assert out["converged"] == 1 and out["orphans"] == 0
+    job = _get_job("job-orphan")
+    assert job["status"] == "FAILED"
+    assert "未能启动" in job["error"], \
+        f"错误文案要点出『没启动、站点未改动』：{job['error']!r}"
+
+
+def test_sweeper_still_does_not_guess_on_validation_exception(aws):
+    """ValidationException（ARN 拼不出来）→ 仍只记 orphan，不收敛。
+
+    这一类**无法核实** execution 状态——收敛可能杀掉一个活着的执行的 job。
+    与 ExecutionDoesNotExist 的区别就是有没有权威证词。
+    """
+    import botocore.exceptions
+    _stale_job("job-orphan", 60)
+    sfn = MagicMock()
+    sfn.describe_execution.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "ValidationException"}}, "DescribeExecution")
     with patch.object(reconcile_job, "_sfn", return_value=sfn):
         out = reconcile_job.sweeper_handler({}, None)
     assert out["orphans"] == 1 and out["converged"] == 0
@@ -215,3 +243,269 @@ def test_converge_does_not_overwrite_purge_failed(aws):
     assert reconcile_job.converge_job_to_failed(
         "job-und-pf2", reason="ABORTED") == "noop"
     assert _get_job("job-und-pf2")["status"] == "PURGE_FAILED"
+
+
+# ---------------------------------------------------------------------------
+# 收敛之后的路由补偿（Codex 2026-08-18 P1-4）
+# ---------------------------------------------------------------------------
+
+def _routing_item(site_id="s1"):
+    return boto3.client("dynamodb", region_name="us-east-1").get_item(
+        TableName="routing",
+        Key={"subdomain": {"S": f"app-{site_id}"}}).get("Item")
+
+
+def _put_committed_state(job_id="job-r1", site_id="s1"):
+    """构造"路由已提交、job 里有完整 route_commit"的状态，返回切换前的旧路由。
+
+    形态照 register_route 的产物：线上是本次 job 的新路由（static_prefix 带
+    job_id、rev=4），job 记录里 route_commit 持久化了整值快照与提交锚。
+    """
+    import common
+    ddb = boto3.client("dynamodb", region_name="us-east-1")
+    prev = {"subdomain": {"S": f"app-{site_id}"}, "site_id": {"S": site_id},
+            "route_mode": {"S": "split"},
+            "api_target": {"S": "https://b.lambda-url.us-east-1.on.aws"},
+            "static_prefix": {"S": f"sites/{site_id}/job-old"},
+            "require_auth": {"BOOL": True},
+            "allowed_users": {"L": [{"S": "v@x.com"}]},
+            "collaborators": {"L": []}, "owner": {"S": "u@x.com"},
+            "permissions_rev": {"N": "4"}, "legacy_marker": {"S": "keep-me"}}
+    committed = dict(prev)
+    committed["api_target"] = {"S": "https://g.lambda-url.us-east-1.on.aws"}
+    committed["static_prefix"] = {
+        "S": common.static_prefix_for(site_id, job_id)}
+    ddb.put_item(TableName="routing", Item=committed)     # 线上：新目标
+    ddb.update_item(
+        TableName="site-deploy-jobs", Key={"job_id": {"S": job_id}},
+        UpdateExpression="SET route_commit = :rc",
+        ExpressionAttributeValues={":rc": {"M": {
+            "previous_route": {"M": prev},
+            "committed_route": {"M": committed}}}})
+    return prev
+
+
+def test_timed_out_after_route_commit_restores_the_route(aws):
+    """路由已提交后状态机 TIMED_OUT ⇒ 收敛 job **并且**把路由整值写回切换前。
+
+    这是收敛闭环缺的另一半：TIMED_OUT/ABORTED 不执行任何 State，MarkFailed 的
+    补偿没人做。只把 job 改成 FAILED 的后果有两层，且互相放大——路由停在这次
+    从未通过验证的新目标上；而 job 一到 FAILED，部署租约立即可抢，下一次部署在
+    一个"路由不是任何一次成功部署写下的"状态上开跑。
+
+    红的条件：路由没被恢复（旧实现必红——converge 只改 job 状态）。
+    """
+    _put_job(status="RUNNING", phase="smoke-test")
+    prev = _put_committed_state()
+
+    out = reconcile_job.handler(_event("TIMED_OUT"), None)
+
+    assert out["outcome"] == "converged"
+    assert _get_job()["status"] == "FAILED"
+    assert _routing_item() == prev, (
+        "TIMED_OUT 之后路由没有恢复——仍停在未经验证的新目标上\n"
+        f"  线上: {_routing_item()}")
+
+
+def test_timed_out_before_route_commit_leaves_the_route_alone(aws):
+    """route_commit 缺席（超时发生在 register_route 之前）⇒ 路由一个字不动。"""
+    _put_job(status="RUNNING", phase="package")
+    live = {"subdomain": {"S": "app-s1"},
+            "api_target": {"S": "https://b.lambda-url.us-east-1.on.aws"},
+            "static_prefix": {"S": "sites/s1/job-old"}}
+    boto3.client("dynamodb", region_name="us-east-1").put_item(
+        TableName="routing", Item=live)
+
+    reconcile_job.handler(_event("TIMED_OUT"), None)
+
+    assert _get_job()["status"] == "FAILED"
+    assert _routing_item() == live, "没提交过路由却动了路由"
+
+
+def test_compensation_abandons_when_a_newer_deploy_committed(aws):
+    """超时 job 的补偿同样要认得"更晚的部署已提交"——放弃并如实写进 job。
+
+    补偿函数与 MarkFailed **同一份**（mark_job._restore_route），所以提交端锚
+    （static_prefix + rev）的全部判定这里自动生效。本用例锁的是 reconcile 这条
+    调用路径没有绕过那些判定。
+    """
+    _put_job(status="RUNNING", phase="smoke-test")
+    _put_committed_state()
+    # 更晚的部署已经把路由换成了它自己的
+    import common
+    newer = {"subdomain": {"S": "app-s1"}, "site_id": {"S": "s1"},
+             "api_target": {"S": "https://n.lambda-url.us-east-1.on.aws"},
+             "static_prefix": {"S": common.static_prefix_for("s1", "job-newer")},
+             "permissions_rev": {"N": "4"}}
+    boto3.client("dynamodb", region_name="us-east-1").put_item(
+        TableName="routing", Item=newer)
+
+    reconcile_job.handler(_event("TIMED_OUT"), None)
+
+    assert _routing_item() == newer, "把更晚那次成功部署的路由覆盖了"
+    assert "人工" in _get_job()["error"], "补偿被放弃却没写进 job 错误信息"
+
+
+def test_sweeper_compensates_a_failed_execution_after_commit(aws):
+    """sweeper 路径同样要补偿：execution FAILED 而 job 还 RUNNING = MarkFailed
+    自己重试耗尽都没跑成，路由补偿没人做过。"""
+    _put_job(status="RUNNING", phase="smoke-test")
+    prev = _put_committed_state()
+    # 让 job 超龄
+    old = (datetime.now(timezone.utc) - timedelta(minutes=60)).isoformat()
+    boto3.resource("dynamodb", region_name="us-east-1").Table(
+        "site-deploy-jobs").update_item(
+        Key={"job_id": "job-r1"}, UpdateExpression="SET updated_at = :t",
+        ExpressionAttributeValues={":t": old})
+    sfn = MagicMock()
+    sfn.describe_execution.return_value = {"status": "FAILED"}
+    with patch.object(reconcile_job, "_sfn", return_value=sfn):
+        reconcile_job.sweeper_handler({}, None)
+
+    assert _get_job()["status"] == "FAILED"
+    assert _routing_item() == prev, "sweeper 收敛了 job 却没有恢复路由"
+
+
+def test_reconciler_compensates_before_writing_the_terminal_state(aws, monkeypatch):
+    """reconciler 同样**先补偿、后收敛**（Codex 2026-08-18 R4 P1-1）。
+
+    converge 一写 FAILED 租约即可被抢，而补偿还没跑——与 MarkFailed 同一条
+    顺序纪律。断言进入补偿那一刻 job 仍是 RUNNING。
+    """
+    _put_job(status="RUNNING", phase="smoke-test")
+    prev = _put_committed_state()
+
+    seen = {}
+    import mark_job
+    real = mark_job._restore_route
+
+    def _spy(event):
+        seen["status"] = _get_job()["status"]
+        return real(event)
+
+    monkeypatch.setattr(mark_job, "_restore_route", _spy)
+    out = reconcile_job.handler(_event("TIMED_OUT"), None)
+
+    assert out["outcome"] == "converged"
+    assert seen.get("status") == "RUNNING", (
+        f"进入补偿时 job 已是 {seen.get('status')}——租约此刻已可被抢")
+    assert _get_job()["status"] == "FAILED"
+    assert _routing_item() == prev
+
+
+def test_sweeper_is_the_last_resort_for_a_persistently_failing_restore(aws,
+                                                                      monkeypatch):
+    """恢复的 AWS 调用持续失败时，sweeper 是**最后一环**：收敛 + 如实写 note，
+    不再"保持 busy 重试"——那会把站点永久锁死。
+
+    分工：MarkFailed 遇到恢复调用失败会**抛出**（保持 RUNNING，把重试预算交给
+    SFN）；重试耗尽后 execution FAILED、job 还 RUNNING，落到这里。这里若也
+    "保持 busy"，一个持久性的恢复故障（如 IAM 配错）= 站点无限期不可部署且
+    没有任何用户可见的信号。收敛 + note 让操作者在 job 记录里看到确切处置。
+    """
+    import botocore.client
+    _put_job(status="RUNNING", phase="compensating")
+    _put_committed_state()
+    old = (datetime.now(timezone.utc) - timedelta(minutes=60)).isoformat()
+    boto3.resource("dynamodb", region_name="us-east-1").Table(
+        "site-deploy-jobs").update_item(
+        Key={"job_id": "job-r1"}, UpdateExpression="SET updated_at = :t",
+        ExpressionAttributeValues={":t": old})
+
+    real = botocore.client.BaseClient._make_api_call
+
+    def _boom(self, op, params):
+        if op in ("PutItem", "DeleteItem") and params.get("TableName") == "routing":
+            raise RuntimeError("ddb unavailable（注入）")
+        return real(self, op, params)
+
+    monkeypatch.setattr(botocore.client.BaseClient, "_make_api_call", _boom)
+    sfn = MagicMock()
+    sfn.describe_execution.return_value = {"status": "FAILED"}
+    with patch.object(reconcile_job, "_sfn", return_value=sfn):
+        reconcile_job.sweeper_handler({}, None)
+
+    job = _get_job()
+    assert job["status"] == "FAILED", "最后一环也不收敛 = 站点永久锁死"
+    assert "回滚请求失败" in job["error"], \
+        f"收敛了却没如实告知路由可能没回滚：{job['error']!r}"
+
+
+def test_last_resort_convergence_reports_a_failed_compensation_read(aws,
+                                                                   monkeypatch):
+    """最后一环（reconciler）补偿状态**读失败** ⇒ 仍收敛，但 job.error 必须带
+    人工处置提示（Codex 2026-08-18 R5 P1）。
+
+    折叠成 None 的后果：CloudWatch 里有"路由可能仍停在新目标"，job.error 里只有
+    普通的"部署执行超时"——操作者完全不知道要去查路由。
+    """
+    import botocore.client
+    _put_job(status="RUNNING", phase="smoke-test")
+    _put_committed_state()
+
+    real = botocore.client.BaseClient._make_api_call
+    armed = {"on": True}
+
+    def _boom(self, op, params):
+        # 只打 jobs 表的 GetItem（route_commit 读）；converge 的 UpdateItem 照常
+        if (armed["on"] and op == "GetItem"
+                and params.get("TableName") == "site-deploy-jobs"):
+            raise RuntimeError("jobs 读超时（注入）")
+        return real(self, op, params)
+    monkeypatch.setattr(botocore.client.BaseClient, "_make_api_call", _boom)
+
+    out = reconcile_job.handler(_event("TIMED_OUT"), None)
+    armed["on"] = False          # 断言自己也要读 jobs 表
+
+    assert out["outcome"] == "converged"
+    job = _get_job()
+    assert job["status"] == "FAILED", "最后一环必须收敛（否则永久锁站）"
+    assert "回滚请求失败" in job["error"], (
+        f"补偿状态读失败却没写人工处置提示，操作者不知道要查路由：{job['error']!r}")
+
+
+def test_terminal_state_and_manual_note_land_in_one_write(aws, monkeypatch):
+    """终态与人工处置提示必须在**同一个** UpdateItem 里落库（Codex 2026-08-19
+    R6 P2）。
+
+    分两笔写的失败形态：第一笔（FAILED + 普通超时文案）成功、第二笔（补提示）
+    暂时失败 → 重试进来时 job 已 FAILED → 补偿因非 RUNNING 跳过、converge 是
+    noop → 提示**再也没有机会写回**。一个已知"路由状态未知"的场景静默退化成
+    普通超时——false-green 运维信号。
+
+    断言两件事：① 最终 error 含提示；② 对 jobs 表**只有一笔**同时写 status 与
+    error 的 UpdateItem（两笔写的实现即使内容最终对了也红——窗口本身就是缺陷）。
+    """
+    import botocore.client
+    _put_job(status="RUNNING", phase="smoke-test")
+    _put_committed_state()
+
+    real = botocore.client.BaseClient._make_api_call
+    writes = []
+
+    def _spy(self, op, params):
+        if (op == "UpdateItem"
+                and params.get("TableName") == "site-deploy-jobs"
+                and "job-r1" in str(params.get("Key"))):
+            writes.append(params)
+        # 让补偿的恢复写失败 ⇒ note = ROUTE_RESTORE_FAILED（要有提示可写）
+        if op in ("PutItem", "DeleteItem") and params.get("TableName") == "routing":
+            raise RuntimeError("ddb unavailable（注入）")
+        return real(self, op, params)
+
+    monkeypatch.setattr(botocore.client.BaseClient, "_make_api_call", _spy)
+    out = reconcile_job.handler(_event("TIMED_OUT"), None)
+
+    assert out["outcome"] == "converged"
+    job = _get_job()
+    assert job["status"] == "FAILED"
+    assert "回滚请求失败" in job["error"], f"提示丢了：{job['error']!r}"
+    status_and_error = [
+        w for w in writes
+        if "status" in str(w.get("ExpressionAttributeNames", {}).values())
+        and ":err" in str(w.get("ExpressionAttributeValues", {}))]
+    error_writes = [w for w in writes
+                    if "回滚请求失败" in str(w.get("ExpressionAttributeValues"))]
+    assert len(error_writes) == 1 and error_writes[0] in status_and_error, (
+        f"提示不在写终态的那一笔里（共 {len(writes)} 笔 UpdateItem）——"
+        "两笔写之间第二笔失败即提示永久丢失")

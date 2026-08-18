@@ -1,9 +1,15 @@
 # Quick 自动化建站方案（Site Builder）
 
-业务人员在 **Amazon Quick Desktop**（或 Claude Code / Kiro 等任意支持 Skill + MCP 的
-Agent 客户端）里用自然语言开发简易全栈站点，说一句"部署"即获得
-`https://app-xxx.<你的域名>` 的可分享 URL；站点访问与管理权限绑定**飞书账号**。
+业务人员在**任意支持 Skill + MCP 的 Agent 客户端**（Claude Code / Codex /
+Amazon Quick / Kiro …）里用自然语言开发简易全栈站点，说一句"部署"即获得
+`https://app-xxx.<你的域名>` 的可分享 URL；站点访问与管理权限绑定**飞书账号**
+（或任意能提供 email claim 的企业 OIDC/SAML IdP 身份）。
 全程不接触 AWS 控制台，无 EC2/RDS 重资产。
+
+> **与 Agent 客户端的账号体系无关**：Claude Code / Codex / Quick 各自怎么登录是
+> 客户端自己的事，本方案不做任何假设。客户端只需要两件事——能加载 Skill、能连
+> MCP；对**本方案**的认证（部署权限、站点访问、控制台）全部走方案自带的
+> Cognito，联邦到你在部署时接入的飞书或标准 IdP。
 
 > **当前状态**：已在真实 AWS 账号完整部署并端到端验证——自助管理控制台、
 > API Key 交换层、访问统计聚合、以及站点更新的 blue/green 原子切换都已上线并通过
@@ -29,9 +35,9 @@ Agent 客户端）里用自然语言开发简易全栈站点，说一句"部署"
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │ ① 建站 Skill（Agent Skills 开放标准，"部署合同"）             │  site-builder/skills/
-│    Quick Desktop / Claude Code / Kiro 通用                    │
+│    Claude Code / Codex / Amazon Quick / Kiro 等通用           │
 └──────────────────────────┬──────────────────────────────────┘
-                           │ MCP 调用（OAuth 携带飞书身份）
+                           │ MCP 调用（OAuth 携带平台身份）
 ┌──────────────────────────▼──────────────────────────────────┐
 │ ② 部署 MCP（AgentCore Runtime，薄壳，工具全部秒级返回）       │  site-builder/mcp/
 │    deploy_site / confirm_upload / get_deploy_status /         │
@@ -49,13 +55,13 @@ Agent 客户端）里用自然语言开发简易全栈站点，说一句"部署"
                            │ 路由表（subdomain → 目标 + auth 策略）
 ┌──────────────────────────▼──────────────────────────────────┐
 │ ④ 路由 + 鉴权层（CloudFront *.<域名> + Lambda@Edge）           │  router/
-│    查路由 → 验飞书会话 JWT → 注入 x-user-email →              │
+│    查路由 → 验会话 JWT → 注入 x-user-email →                  │
 │    /api/*→站点Lambda(SigV4) / 其余→S3（全站禁缓存）           │
 └──────────────────────────┬──────────────────────────────────┘
                            │ 未登录 302 → auth.<域名>/login
 ┌──────────────────────────▼──────────────────────────────────┐
-│ ⑤ 飞书身份层（Cognito + 飞书 OIDC 适配器，复用官方样例）       │  site-builder/auth/
-│    一套 Cognito 三处消费：Quick SSO / 站点访问 / MCP 部署权限   │
+│ ⑤ 身份层（Cognito 联邦到飞书适配器或任意 OIDC/SAML IdP）      │  site-builder/auth/
+│    一套 Cognito 三处消费：站点访问 / 控制台 / MCP 部署权限     │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -63,7 +69,7 @@ Agent 客户端）里用自然语言开发简易全栈站点，说一句"部署"
 
 ### 关键设计决策
 
-- **不做代码生成**——那是 Quick 的价值；本方案只做 Quick 做不了的"部署到 AWS"。
+- **不做代码生成**——那是 Agent 客户端的事；本方案只做客户端做不了的"部署到 AWS"。
 - **部署合同**（`site.json` + 目录约定 + 代码红线）是锚点：哪个 agent 生成的代码都行，
   执行器只认合同。校验器 + 红线扫描器把不合规产物在部署前拦下。
 - **站点代码按不可信代码对待**：每站点独立 IAM 角色（PermissionsBoundary 封顶）、
@@ -111,9 +117,11 @@ Agent 客户端）里用自然语言开发简易全栈站点，说一句"部署"
 
 ## 部署前置要求
 
-部署到你自己的 AWS 账号需要先准备：**us-east-1 区域**（Lambda@Edge/ACM/Quick
-身份区域共同强制）、一个可改 DNS 的域名 + 该域名的 `*.<域名>` ACM 通配符证书、
-飞书企业自建应用（需用户邮箱权限）、SSM 里的会话签名密钥、本机 Docker。
+本方案面向**在你自己的 AWS 账号里从零部署**。需要先准备：**us-east-1 区域**
+（Lambda@Edge 与 CloudFront 用的 ACM 证书强制）、一个可改 DNS 的域名 + 该域名的
+`*.<域名>` ACM 通配符证书、一个身份源——飞书企业自建应用（需用户邮箱权限）**或**
+任意能提供 email claim 的标准 OIDC/SAML IdP——以及 SSM 里的会话签名密钥、本机
+Docker。
 
 逐项要求与命令见 **[site-builder/DEPLOY.md](site-builder/DEPLOY.md) §0 前置要求**
 （含就绪检查清单与成本预期）。
@@ -127,7 +135,7 @@ Agent 客户端）里用自然语言开发简易全栈站点，说一句"部署"
 1. **备齐前置**：照 [site-builder/DEPLOY.md](site-builder/DEPLOY.md) §0 的就绪清单
    逐项确认，并从两份 `config.ini.example` 复制出自己的配置。
 2. **部署**：照同文档七个阶段执行
-   （①SSO → ②路由 → ③DSQL → ④执行器 → ⑤MCP → ⑥客户端 → ⑦彩排）；
+   （①身份层 → ②路由 → ③DSQL → ④执行器 → ⑤MCP → ⑥客户端 → ⑦彩排）；
    每阶段产出的 ARN/ID 按手册回填 `site-builder/config.ini`。
 3. **演示**：⑦ 的 E2E 通过后，演示叙事见实施计划 Task 23。
 4. **仍未交付的候选**：Python 站点 runtime（当前仅 Node.js 后端）、精细缓存

@@ -193,7 +193,7 @@ python3 site-builder/scripts/gen_onboarding.py
 - DSQL：API 不返回 endpoint（自拼 `{id}.dsql.{region}.on.aws`）；清理顺序必须先
   `AWS IAM REVOKE` 再 `DROP ROLE`（否则 2BP01）。
 - git push 用 `--no-verify`（用户全局约定）；us-east-1 是硬约束
-  （Lambda@Edge/ACM/Quick 身份区域），换区要改代码。
+  （Lambda@Edge 与 CloudFront 的 ACM 证书），换区要改代码。
 - **路由表的 `static_prefix` 不带尾斜杠**。Edge 的静态改写是
   `f"/{static_prefix}{path}"` 且 `path` 已以 `/` 开头——带尾斜杠会拼出双斜杠，
   与上传的 key 不是同一个对象，整站 403（两侧单测各自都会绿）。

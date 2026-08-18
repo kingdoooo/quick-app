@@ -728,6 +728,76 @@ def run_mcp_and_route() -> None:
         check(False, f"console 首页对象存在（{index_key}）",
               f"{type(exc).__name__} —— 前端没上传，或 key 与 Edge 取的不一致")
 
+    _check_frontend_bucket_has_no_expiry(bucket, region)
+
+
+def _check_frontend_bucket_has_no_expiry(bucket: str, region: str) -> None:
+    """前端桶上**不许**有覆盖 `sites/` 的 Enabled 过期规则。
+
+    2026-08-17 实测的 P0：桶上曾有一条 `expire-old-site-versions`
+    （`Filter.Prefix=sites/`、`Expiration.Days=30`）。站点**线上正在服务**的那一份
+    前端也住在 `sites/{site_id}/{job_id}/` 下，这个前缀写一次之后永不重写
+    （每次部署换新前缀），桶又没开版本控制 ⇒ 任何 30 天没重新部署过的站点会被它
+    把线上前端删掉；桶是私有的，症状是**整站 403 而不是 404**，极易误判成权限故障。
+    当时最老的存量前缀已 19 天，离触发只剩约 11 天。
+
+    **规则删掉了不等于这件事被闭合**：它不由 CDK 管理（手工建桶那一步配的），
+    所以只写进 DEPLOY.md 的话，下一个新环境漏删、或有人"顺手补上兜底"，
+    现有闸门照样 72/72。这条断言就是它唯一的可执行守卫。
+
+    存储上界由 `mark_job._cleanup_old_versions` 提供（保留当前 + 上一版 + 30 分钟内
+    新上传的），站点下线时 `undeploy.py` 整个前缀删除。生命周期规则表达不了
+    "除了每个站点最新的那一份"，所以这里的判据是"**不许有**"，而不是"要配对"。
+    """
+    import boto3
+    s3 = boto3.client("s3", region_name=region)
+    try:
+        rules = s3.get_bucket_lifecycle_configuration(
+            Bucket=bucket).get("Rules", [])
+    except Exception as exc:
+        # NoSuchLifecycleConfiguration = 没有任何规则 = 正是期望状态。
+        if "NoSuchLifecycleConfiguration" in str(type(exc)) + str(exc):
+            check(True, "前端桶无 sites/ 过期规则（会删掉存活站点的前端）",
+                  "整桶无生命周期配置")
+            return
+        check(False, "前端桶无 sites/ 过期规则（会删掉存活站点的前端）",
+              f"读生命周期配置失败：{type(exc).__name__} {exc}")
+        return
+    # 判据要覆盖"**会命中** sites/ 前缀"的每一种写法，不是只认前缀恰好等于
+    # "sites/" 的那一条：空前缀（整桶）同样命中，而它更容易被当成"无害的兜底"。
+    # Filter 可以是 {"Prefix": ...}、{"And": {"Prefix": ...}}，也可以整个缺失。
+    def _prefixes(rule) -> list:
+        f = rule.get("Filter") or {}
+        if "And" in f:
+            f = f["And"]
+        # 两种写法都要看：`Filter.Prefix`（V2）与顶层 `Prefix`（V1，旧桶上仍有）。
+        return [p for p in (f.get("Prefix"), rule.get("Prefix")) if p is not None]
+
+    def _hits_sites(prefix: str) -> bool:
+        """这个规则前缀会不会命中 `sites/…` 下的对象。
+
+        **两个方向都算命中**，写成一个方向就漏掉更常见的那种：
+          · `prefix` 是 `sites/` 的前缀（含 `""` = 整桶）⇒ 命中；空前缀最容易被
+            当成"无害的整桶兜底"，而它照样删线上前端；
+          · `prefix` 落在 `sites/` 之内（如 `sites/notes-01d147/`）⇒ 也命中。
+        """
+        return "sites/".startswith(prefix) or prefix.startswith("sites/")
+
+    offenders = []
+    for r in rules:
+        if r.get("Status") != "Enabled":
+            continue
+        if not (r.get("Expiration") or r.get("NoncurrentVersionExpiration")):
+            continue
+        for p in _prefixes(r) or [""]:      # 没有任何 Prefix 字段 = 整桶
+            if _hits_sites(p):
+                offenders.append(f"{r.get('ID', '?')}(prefix={p!r})")
+                break
+    check(not offenders,
+          "前端桶无 sites/ 过期规则（会删掉存活站点的前端）",
+          f"命中的规则：{offenders}" if offenders
+          else f"{len(rules)} 条规则，均不覆盖 sites/")
+
 
 def _edge_deployed_source() -> str:
     """CloudFront **当前关联的那个版本**的 Edge 产物 → `index.py` 文本。

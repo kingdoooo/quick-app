@@ -423,7 +423,11 @@ def test_undeploy_invoke_failure_does_not_leave_pending_job(aws, secret,
             return getattr(self._i, k)
 
         def invoke(self, **kw):
-            raise RuntimeError("invoke 失败（注入）")
+            import botocore.exceptions
+            # **确定拒绝**（ClientError）才就地收敛；网络类错误保持 RUNNING
+            # 交给 sweeper（见 test_uncertain_invoke_error_keeps_running_and_lease）
+            raise botocore.exceptions.ClientError(
+                {"Error": {"Code": "ResourceNotFoundException"}}, "Invoke")
 
     monkeypatch.setattr(boto3, "client",
                         lambda *a, **k: Boom(real_client(*a, **k))
@@ -877,3 +881,78 @@ def test_dispatch_branch_scan_is_not_vacuous():
         f"ROUTES 里少了这些锚点: {sorted(missing)}——"
         "上面那条 test_every_route_still_has_a_dispatch_branch 会因此少扫甚至"
         "空转（集合为空时它是恒真的）。要么补回路由，要么先读它的 docstring")
+
+
+def test_undeploy_is_rejected_while_a_deploy_holds_the_lease(aws, secret,
+                                                            monkeypatch):
+    """部署 RUNNING 期间从控制台下线 ⇒ 409 且**零副作用**（不发 invoke）。
+
+    这是 Codex 2026-08-18 P1-2 在 panel 这条入口上的那一半（MCP 侧另有同型用例）：
+    不拒的话 undeploy 删掉路由/函数/前端，而那次部署的状态机还在跑，后续步骤会把
+    刚下线的站点重新建出来（复活）。互斥逻辑在 common.plan_deploy_lease（唯一
+    定义），本用例锁的是 **panel 的 do_undeploy 确实接上了它**——忘了接的话
+    这里就是 200。
+    """
+    import common
+    _seed()
+    # 一次正在跑的部署：RUNNING job + 它持有的租约（与 confirm_upload 同构）
+    deploy_job = common.create_job("owner@x.com", "s-1")
+    common.update_job(deploy_job, status="RUNNING")
+    boto3.client("dynamodb").transact_write_items(
+        TransactItems=common.plan_deploy_lease("s-1", deploy_job))
+
+    invoked = _undeploy_spy(monkeypatch)
+    r = handler.handler(_write_ev("/api/sites/s-1/undeploy", method="POST",
+                                  body={"purge_data": False}), None)
+    assert r["statusCode"] == 409, \
+        f"部署进行中下线没有被拒：{r['statusCode']} {r.get('body', '')[:200]}"
+    assert not invoked, "已经触发了下线 invoke——拒绝必须发生在副作用之前"
+
+
+def test_undeploy_acquires_the_lease_and_blocks_deploys(aws, secret, monkeypatch):
+    """panel 发起的下线要**持有**租约（holder = undeploy job，RUNNING）。"""
+    import common
+    _seed()
+    invoked = _undeploy_spy(monkeypatch)
+    r = handler.handler(_write_ev("/api/sites/s-1/undeploy", method="POST",
+                                  body={"purge_data": False}), None)
+    assert r["statusCode"] == 200 and invoked
+    job_id = json.loads(r["body"])["job_id"]
+    assert common.read_deploy_lease("s-1") == job_id
+    job = common.get_job(job_id)
+    assert job["status"] == "RUNNING" and job.get("kind") == "undeploy"
+
+
+def test_uncertain_invoke_error_keeps_running_and_lease(aws, secret, monkeypatch):
+    """invoke **网络错误（结果不确定）** ⇒ job 保持 RUNNING、租约不放、409。
+
+    事件可能已被 Lambda 受理、下线正在后台删资源；此刻写 FAILED 就是把租约
+    放给新部署，让它与进行中的下线并行（Codex 2026-08-18 R4 P1-2）。
+    "确实没起来"那一侧由 sweeper 的 20 分钟 undeploy 阈值收敛。
+    """
+    import common
+    _seed()
+    real_client = boto3.client
+
+    class Boom:
+        def __init__(self, inner):
+            self._i = inner
+
+        def __getattr__(self, k):
+            return getattr(self._i, k)
+
+        def invoke(self, **kw):
+            raise RuntimeError("网络中断（注入）")
+
+    monkeypatch.setattr(boto3, "client",
+                        lambda *a, **k: Boom(real_client(*a, **k))
+                        if a and a[0] == "lambda" else real_client(*a, **k))
+    r = handler.handler(_write_ev("/api/sites/s-1/undeploy", method="POST",
+                                  body={"purge_data": False}), None)
+    assert r["statusCode"] == 409, r
+    assert "结果不确定" in json.loads(r["body"])["error"]
+    jobs = api.do_list_jobs("owner@x.com", "s-1")
+    assert jobs and jobs[0]["status"] == "RUNNING", (
+        f"job 是 {jobs[0]['status'] if jobs else '缺失'}——不确定时写终态"
+        "就是把租约放给新部署")
+    assert common.read_deploy_lease("s-1") == jobs[0]["job_id"]

@@ -242,3 +242,51 @@ def test_job_marked_undeploy_kind_for_sweeper(aws):
     with patch.object(undeploy, "_lambda", return_value=_lam_mock()):
         undeploy.handler({"job_id": jid, "site_id": "hello-x1"}, None)
     assert common.get_job(jid).get("kind") == "undeploy"
+
+
+def test_lease_is_cleared_only_after_the_job_reaches_a_terminal_state(aws,
+                                                                     monkeypatch):
+    """租约行只能在 job 写完**终态**之后收走（独立评审 2026-08-18 Critical-1）。
+
+    提前清（比如在删完路由/函数那一步）会打开这样的窗口：一个手里还有 PENDING
+    job 的用户立刻 confirm_upload 开始新部署，而本函数下面还在 purge 数据、写
+    site=DELETED——那次部署刚建出来的表/schema 会被当场删掉（purge_data=True 时
+    窗口有几十秒），最后 mark_job 把一个数据已被清空的站点标成 ACTIVE。
+
+    按**调用顺序**断言，不是只断言"最终清掉了"：顺序错误时终态照样都发生，
+    只看终值的用例对这个缺陷完全不敏感。
+    """
+    import undeploy, common
+    jid = _seed(common, boto3)
+    order = []
+    real_update = common.update_job
+    real_clear = common.clear_deploy_lease
+
+    def _spy_update(job_id, **kw):
+        if kw.get("status") in ("DELETED", "PURGE_FAILED", "FAILED"):
+            order.append(("terminal", kw["status"]))
+        return real_update(job_id, **kw)
+
+    def _spy_clear(site_id, holder):
+        order.append(("clear_lease", holder))
+        return real_clear(site_id, holder)
+
+    monkeypatch.setattr(undeploy.common, "update_job", _spy_update)
+    monkeypatch.setattr(undeploy.common, "clear_deploy_lease", _spy_clear)
+    with patch.object(undeploy, "_lambda", return_value=_lam_mock()):
+        undeploy.handler({"job_id": jid, "site_id": "hello-x1"}, None)
+
+    kinds = [k for k, _ in order]
+    assert "clear_lease" in kinds and "terminal" in kinds
+    assert kinds.index("terminal") < kinds.index("clear_lease"), (
+        f"租约在 job 终态之前就被清了——purge 窗口里新部署能开跑：{order}")
+
+
+def test_lease_clear_is_conditional_on_the_holder(aws):
+    """清租约必须带"持有者还是本 job"的条件——别人的租约不许动。"""
+    import common
+    boto3.client("dynamodb").transact_write_items(
+        TransactItems=common.plan_deploy_lease("hello-x1", "job-someone-else"))
+    common.clear_deploy_lease("hello-x1", "job-mine")     # 不是持有者
+    assert common.read_deploy_lease("hello-x1") == "job-someone-else", \
+        "把别人正持有的租约清掉了"

@@ -23,6 +23,9 @@ my-site/
 
 - `run.sh` 是 Lambda Web Adapter 的启动脚本（内容固定 `exec node server.js`）。
   打包器强制检查 zip 根存在 `run.sh`，缺失即部署失败（static tier 不需要）。
+- **`frontend/index.html` 必须存在且非空**（所有 tier，校验器强制）：站点首页由
+  路由层固定取该文件，缺失时首页会永久 403。纯 API 场景也要放一个最小页面
+  （例如一句用途说明），不能只放 assets。
 - 打包为 `site.zip` 时 `site.json` 必须位于 zip 根（不要多套一层目录）。
 - zip 上限：压缩后 ≤50MB；解压后 ≤200MB、≤2000 个文件、压缩比 ≤100:1；
   路径禁止绝对路径与 `..`。

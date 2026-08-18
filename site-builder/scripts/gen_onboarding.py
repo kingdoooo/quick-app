@@ -97,7 +97,7 @@ token 报 `invalid_grant`，状态卡在 `! Needs authentication`（2026-08-06 �
 mkdir -p ~/.claude/skills
 cp -r site-builder/skills/site-builder ~/.claude/skills/
 
-# 2) 授权一次（浏览器飞书登录，token 落盘 ~/.site-builder-deploy-token.json）
+# 2) 授权一次（浏览器完成平台身份登录——飞书场景即飞书授权页，token 落盘 ~/.site-builder-deploy-token.json）
 #    **从仓库根执行**（下面是仓库相对路径）
 node {proxy_rel}/auth.js \\
   "{endpoint}" \\
@@ -127,7 +127,7 @@ Quick Desktop 的 Remote MCP 不支持 OAuth，需用仓库自带的本地 stdio
 
 1. 导入 Skill：把 `site-builder/skills/site-builder/` 整个目录复制到你的
    Quick profile 的 skills 目录（如 `~/.quickwork/profiles/{{profile}}/skills/`）。
-2. 首次 OAuth（浏览器飞书登录，token 落盘后代理自动续期）：
+2. 首次 OAuth（浏览器完成平台身份登录，token 落盘后代理自动续期）：
    ```bash
    cd site-builder/clients/quick-desktop-proxy
    node auth.js "{endpoint}" "{client_id}"
@@ -172,7 +172,7 @@ Agent 会走完：需求澄清 → 生成代码 → 本地预览 → 部署 → 
 
 ## 控制台（可选，点着看的那个入口）
 
-`https://console.{base}/`——用同一个飞书账号登录，能干的事和上面那些工具是
+`https://console.{base}/`——用同一个身份登录，能干的事和上面那些工具是
 同一套后端：改访问权限、加减协作者、转移所有权、看部署历史、下线站点，以及
 **访问统计页**（页面访问量 / 独立访客 / 被拒次数，与最近的访问明细）。
 建站与更新代码仍然只在 Agent 里做。

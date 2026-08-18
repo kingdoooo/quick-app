@@ -267,22 +267,43 @@ def do_undeploy(email: str, site_id: str, *, purge_data: bool = False) -> dict:
             "TableName": os.environ["ADMINS_TABLE"],
             "Key": {"email": {"S": email}},
             "ConditionExpression": "attribute_exists(email)"}})
+    # CancellationReasons 与 TransactItems 同序，**下标由构造处算出、不能写死**
+    # （MCP 侧同一形态；往中间插一项时硬编码的下标会把文案对到错误的原因上）。
+    _why = ["job-created", "permissions-changed"]
+    if is_adm:
+        _why.append("admin-revoked")
+    # **下线也要拿同一把 per-site 租约**（Codex 2026-08-18 P1-2，与 MCP 的
+    # do_undeploy 同路径同语义）：部署还在跑时下线会被它的后续步骤"复活"，
+    # 下线进行中新部署也不该开跑。holder = 本 undeploy job（RUNNING 期间独占，
+    # 终态后自动可抢）。
+    job_id = common.new_job_id()
     try:
-        job_id = common.create_job(email, site_id, guard_items=guards)
+        lease_items = common.plan_deploy_lease(site_id, job_id)
+    except common.DeployInProgress as e:
+        raise permissions.PermissionConflict(str(e)) from e
+    guards += lease_items
+    _why += ["deploy-in-progress"] * len(lease_items)
+    try:
+        # RUNNING + kind="undeploy" 的理由见 MCP do_undeploy / common.create_job。
+        common.create_job(email, site_id, guard_items=guards, job_id=job_id,
+                          status="RUNNING", kind="undeploy")
     except botocore.exceptions.ClientError as e:
         if e.response["Error"]["Code"] != "TransactionCanceledException":
             raise
-        # CancellationReasons 与 TransactItems 同序：[0] 建 job 的 Put、
-        # [1] 权限快照守卫、[2] admin 守卫（若有）。**按下标分辨**而不是笼统
-        # 报一句：管理员权限被撤销与站点权限被改动是两种处置。
         reasons = [r.get("Code", "") for r in
                    e.response.get("CancellationReasons", [])]
-        if len(reasons) > 2 and reasons[2] == "ConditionalCheckFailed":
-            raise permissions.PermissionDenied("你的管理员权限已被撤销") from e
-        if len(reasons) > 1 and reasons[1] == "ConditionalCheckFailed":
+        failed = {why for why, code in zip(_why, reasons)
+                  if code == "ConditionalCheckFailed"}
+        if "permissions-changed" in failed:
             raise permissions.PermissionConflict(
                 "站点权限在你提交期间被修改（协作者/所有权变更），本次下线已取消"
                 "——请重新确认权限后再试") from e
+        if "admin-revoked" in failed:
+            raise permissions.PermissionDenied("你的管理员权限已被撤销") from e
+        if "deploy-in-progress" in failed:
+            raise permissions.PermissionConflict(
+                f"站点 {site_id} 有另一次部署/下线刚刚开始，本次下线已取消——"
+                "请等它结束后重试") from e
         raise
     payload = {"job_id": job_id, "site_id": site_id}
     if purge_data:
@@ -292,11 +313,10 @@ def do_undeploy(email: str, site_id: str, *, purge_data: bool = False) -> dict:
             "AWS_DEFAULT_REGION", "us-east-1")).invoke(
                 FunctionName=os.environ["UNDEPLOY_FN"],
                 InvocationType="Event", Payload=json.dumps(payload).encode())
-    except Exception as e:
-        # **job 已经建好了（PENDING），invoke 失败必须就地收敛**
-        # （Codex 审查 2026-08-10 P1-4）：sweeper 只扫 RUNNING，一个停在
-        # PENDING 的 job 谁都不会再碰，用户看到"排队中"到永远。
-        # 收敛失败也不能盖掉原始异常（那才是根因）。
+    except botocore.exceptions.ClientError as e:
+        # **确定被拒**（服务端收到并拒绝）⇒ 事件确实没被受理，就地收敛放开租约。
+        # 不收敛的话要等 sweeper 的 20 分钟 undeploy 阈值，这 20 分钟里租约一直判
+        # "持有者在跑"。收敛失败也不能盖掉原始异常（那才是根因）。
         try:
             common.update_job(job_id, status="FAILED",
                               error="下线任务提交失败（未开始执行），站点未做任何"
@@ -304,7 +324,16 @@ def do_undeploy(email: str, site_id: str, *, purge_data: bool = False) -> dict:
         except Exception:
             pass
         raise e
-    return {"job_id": job_id, "status": "PENDING",
+    except Exception as e:
+        # **结果不确定**（网络错误——非 ClientError）⇒ 不写 FAILED（Codex
+        # 2026-08-18 R4 P1-2，与 MCP 的 do_undeploy 同一处置）：异步事件可能已被
+        # 受理、下线正在后台删资源，此刻放开租约就是让新部署与它并行。保持
+        # RUNNING：真在跑 ⇒ undeploy 自己写终态；没起来 ⇒ sweeper 20 分钟收敛。
+        raise permissions.PermissionConflict(
+            f"下线请求已受理（任务 {job_id}），但提交执行时网络错误、结果不确定"
+            "。请稍后刷新部署历史：若下线已在跑会正常推进；若确实没启动，"
+            "系统会在约 20 分钟内自动判定失败，届时重新发起下线即可。") from e
+    return {"job_id": job_id, "status": "RUNNING",
             "note": "下线已提交，请轮询该站点的部署历史查看进度"}
 
 

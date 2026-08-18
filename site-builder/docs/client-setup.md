@@ -3,6 +3,11 @@
 把 `site-builder` Skill 与部署 MCP 接到各 Agent 客户端。Skill 是同一份
 （Agent Skills 开放标准），不做每客户端派生；差异只在 MCP 的挂载方式。
 
+**与客户端自身的账号体系无关**：Claude Code / Codex / Quick 各自怎么登录是
+客户端自己的事，本方案不做任何假设。这里的"认证"全部指**对本平台**的身份
+（部署权限、站点访问、控制台），走平台自带的 Cognito——联邦到部署时接入的
+飞书或标准 IdP。下文"飞书登录/授权页"在标准 IdP 场景对应你的 IdP 登录页。
+
 **前置**：DEPLOY.md ①–⑤ 全部完成，`config.ini [MCP] endpoint_url` 已回填。
 
 MCP endpoint 形如：
@@ -84,7 +89,7 @@ print(d['projects']['$PWD']['mcpServers']['site-builder-deploy']['args'])"
 `confirm_upload` → 轮询 `get_deploy_status` 播报 phase → 返回
 `https://app-xxx.{base_domain}`。浏览器打开该 URL 应跳飞书登录，登录后可加书。
 
-## Quick Desktop（核心演示通道，人工配置；2026-07-29 已真机走通）
+## Amazon Quick Desktop（人工配置；2026-07-29 已真机走通）
 
 1. **导入 Skill**：把 `site-builder/skills/site-builder/` 整个目录按 Quick Desktop
    当期的 Skill 导入入口加载（SKILL.md + references/ + templates/ 一并带上，
@@ -113,10 +118,6 @@ print(d['projects']['$PWD']['mcpServers']['site-builder-deploy']['args'])"
    均可；UI 亦有 env 区域，可改用 `SITE_BUILDER_MCP_ENDPOINT` /
    `SITE_BUILDER_MCP_CLIENT_ID`（代理 argv 与 env 都认）。
    代理自动注入并续期 Bearer token；坑清单见该目录 README。
-3. **身份区域必须 us-east-1**（Quick Desktop preview 限制，与本方案全栈一致）。
-4. **与 Quick 的登录方式无关**：Quick 本体用什么登录（飞书/企业 internal/Okta）
-   不影响本步骤——MCP 的身份走上面的独立 OAuth。
-
 ## Quick Desktop Remote MCP + API Key（二期 M4，**仅在平台启用了该组件时可用**）
 
 上面那条 stdio 代理是**兼容方案**——它存在的唯一原因是 Remote MCP 不支持 OAuth。
@@ -186,5 +187,6 @@ npx @modelcontextprotocol/inspector
 | Skill 导入 | `cp -r` 到 `~/.claude/skills/` | profile 的 skills 目录（如 `~/.quickwork/profiles/{profile}/skills/`） |
 | 免代理方案 | 无（`resource` 参数问题绕不开） | **Remote MCP + `X-API-Key`**（需平台启用 `[ApiKey]` 组件，见上一节） |
 
-Quick MCP 工具调用 60 秒超时是本方案异步化的原因——所有工具秒级返回，
-长任务在 Step Functions 里跑，不受此限（真机部署实测未触发超时）。
+不少客户端对 MCP 工具调用有几十秒级超时（Quick 实测为 60 秒），这是本方案
+异步化的原因——所有工具秒级返回，长任务在 Step Functions 里跑，不受此限
+（真机部署实测未触发超时）。

@@ -85,9 +85,13 @@ def _lam_mock(exists: bool, colors=()):
     def _get_url(FunctionName, Qualifier=None):
         _require_qualifier("get_function_url_config", Qualifier)
         if Qualifier in colors:
-            return {"FunctionUrl": _color_url(Qualifier)}
+            # AuthType 默认给对的值：验"漂移成 NONE 要被改回"的用例自己覆写。
+            return {"FunctionUrl": _color_url(Qualifier), "AuthType": "AWS_IAM"}
         raise lam.exceptions.ResourceNotFoundException()
     lam.get_function_url_config.side_effect = _get_url
+
+    # resource policy 默认不存在（URL 是刚建的）；验"额外语句要被清掉"的用例覆写。
+    lam.get_policy.side_effect = lam.exceptions.ResourceNotFoundException()
 
     def _create_url(**kw):
         _require_qualifier("create_function_url_config", kw.get("Qualifier"))
@@ -407,3 +411,199 @@ def test_brand_new_site_starts_on_blue(aws, monkeypatch):
     lam.create_alias.assert_called_once()
     assert lam.create_alias.call_args.kwargs["Name"] == "blue"
     assert lam.create_alias.call_args.kwargs["FunctionVersion"] == "7"
+
+
+def test_half_migrated_site_fails_closed(aws, monkeypatch):
+    """**半迁移**（blue alias + blue URL 都建好了，但路由还指着无 qualifier 的旧
+    URL）⇒ 同样必须拒绝，且必须在动任何字节**之前**。
+
+    这是 Codex 2026-08-17 P1-3。可达性不是纸面的：迁移脚本
+    (`migrate_sites_to_blue_green.migrate_one`) 的健康门失败时正好留下这个状态
+    ——它建完 alias / URL / 授权才跑健康门，不过就返回 `skipped:unhealthy` 并
+    **故意不切路由**。
+
+    旧判据 `live is None and not urls` 的那个 AND 漏掉这一态：`urls` 非空 ⇒ 闸门
+    放行 ⇒ `update_function_code` 推 $LATEST，而路由此刻正指着 $LATEST 的 URL ⇒
+    未经健康门的新代码当场对外服务。健康门随后即使失败也已经太晚了。
+
+    所以断言的重点是"**$LATEST 一个字节都没动**"，不只是"抛了异常"。
+    """
+    import pytest
+
+    import deploy_lambda_site as d, common
+    monkeypatch.setenv("EDGE_ROLE_ARN", "arn:aws:iam::1:role/edge-role")
+    common.create_job("a@x.com", "s-1")
+    _route_item("https://old.lambda-url.us-east-1.on.aws")   # 路由仍在 $LATEST
+    lam = _lam_mock(exists=True, colors=("blue",))           # 但 blue 已经建好了
+    with patch.object(d, "_lambda", return_value=lam):
+        with pytest.raises(d.UnmigratedSite, match="migrate_sites_to_blue_green"):
+            d.handler(dict(EVENT), None)
+    lam.update_function_code.assert_not_called()      # ← 这条才是 P1-3 的要害
+    lam.publish_version.assert_not_called()
+    lam.update_alias.assert_not_called()
+    lam.invoke.assert_not_called()
+    assert _route_target() == "https://old.lambda-url.us-east-1.on.aws"
+
+
+def test_existing_function_without_any_route_is_treated_as_a_first_deploy(
+        aws, monkeypatch):
+    """函数与 blue alias/URL 都在、但**路由根本不存在** ⇒ 不是未迁移，照常部署。
+
+    可达性：首次部署在 deploy_lambda_site 之后、register_route 提交之前失败
+    （健康门过了但写路由那步炸了，或 SFN 超时），重试就落在这个状态。
+
+    这一条是把 P1-3 的闸门收成 `if live is None: raise` 会踩的坑：那样这个站点
+    将**永远**无法再部署，且报的是"去跑迁移脚本"——一条根本不适用的指引。区分点
+    是路由**在不在**，不是有没有颜色 URL：M7 建的站点从不给 $LATEST 挂 URL，
+    所以没有路由时推 $LATEST 对外零暴露。
+    """
+    import deploy_lambda_site as d, common
+    monkeypatch.setenv("EDGE_ROLE_ARN", "arn:aws:iam::1:role/edge-role")
+    common.create_job("a@x.com", "s-1")
+    assert _route_target() is None                       # 路由不存在
+    lam = _lam_mock(exists=True, colors=("blue",))
+    with patch.object(d, "_lambda", return_value=lam):
+        out = d.handler(dict(EVENT), None)
+    # live 认不出（没有路由）⇒ _idle_color(None) ⇒ COLORS[0]
+    assert out["deploy_color"] == "blue"
+    lam.update_function_code.assert_called_once()
+
+
+def test_route_pointing_at_an_unrecognised_target_fails_closed(aws, monkeypatch):
+    """路由指着一个既不是任何颜色、也不是本站点函数的目标 ⇒ fail-closed。
+
+    旧判据在 `urls` 非空时会放行这一态（等于"认不出线上在服务什么，但还是照推
+    $LATEST"）。认不出时唯一安全的动作是停下来让人核对。
+    """
+    import pytest
+
+    import deploy_lambda_site as d, common
+    monkeypatch.setenv("EDGE_ROLE_ARN", "arn:aws:iam::1:role/edge-role")
+    common.create_job("a@x.com", "s-1")
+    _route_item("https://someone-elses-endpoint.example.com")
+    lam = _lam_mock(exists=True, colors=("blue", "green"))
+    with patch.object(d, "_lambda", return_value=lam):
+        with pytest.raises(d.UnmigratedSite):
+            d.handler(dict(EVENT), None)
+    lam.update_function_code.assert_not_called()
+
+
+def test_conflicting_permission_statement_is_replaced_not_ignored(aws, monkeypatch):
+    """同名 StatementId 已存在时必须**替换**，不能忽略（Codex 2026-08-17 P1-5）。
+
+    同名只说明"有一条语句叫这个名字"，不说明它的内容是对的。一条内容错误的同名
+    语句（principal 不对、少了 Qualifier、少了 InvokedViaFunctionUrl）会让 Edge 调用
+    403，而这条路径上没有任何东西能发现它：健康门是 `lambda:invoke` 直调、压根不经过
+    Function URL 的授权；提交点之后的 smoke 又可能命中 Edge 的旧路由缓存而对**旧**
+    目标返回 200。于是缓存过期之后整站才开始 403。
+
+    红的条件：`remove_permission` 没被调用（= 那条错语句被留下了）。
+    """
+    import deploy_lambda_site as d, common
+    monkeypatch.setenv("EDGE_ROLE_ARN", "arn:aws:iam::1:role/edge-role")
+    common.create_job("a@x.com", "s-1")
+    lam = _lam_mock(exists=False)
+    # 两条语句都已存在（内容未知/可能是错的）：**每个 sid 的第一次** add 冲突，
+    # 删掉再加才成功。按 sid 计数而不是按总调用次数——后者会让第二个 sid 的
+    # 两次尝试都落在"冲突"上，测到的就是另一条分支（第二次仍冲突 ⇒ 抛）。
+    seen = set()
+
+    def _add(**kw):
+        sid = kw["StatementId"]
+        if sid not in seen:
+            seen.add(sid)
+            raise lam.exceptions.ResourceConflictException()
+        return {}
+    lam.add_permission.side_effect = _add
+
+    with patch.object(d, "_lambda", return_value=lam):
+        d.handler(dict(EVENT), None)
+
+    removed = {c.kwargs["StatementId"] for c in lam.remove_permission.call_args_list}
+    assert removed == {"edge-invoke", "edge-invoke-function"}, \
+        f"冲突的语句没被替换，被静默忽略了：removed={removed}"
+    for c in lam.remove_permission.call_args_list:
+        assert c.kwargs["Qualifier"] == "blue", \
+            "remove_permission 没带 Qualifier——删的不是挂在颜色上的那条"
+    # 替换之后两条都必须真的加上去了
+    added = {c.kwargs["StatementId"] for c in lam.add_permission.call_args_list}
+    assert added == {"edge-invoke", "edge-invoke-function"}
+
+
+def test_a_permission_that_conflicts_twice_is_not_swallowed(aws, monkeypatch):
+    """删了再加还冲突 ⇒ 让它抛出去，不许静默继续。
+
+    那说明有别的东西在同时写这条资源策略，此时"授权可能是错的"必须响亮失败——
+    静默继续会得到一个健康门全绿、缓存过期后整站 403 的部署。
+    """
+    import pytest
+
+    import deploy_lambda_site as d, common
+    monkeypatch.setenv("EDGE_ROLE_ARN", "arn:aws:iam::1:role/edge-role")
+    common.create_job("a@x.com", "s-1")
+    lam = _lam_mock(exists=False)
+    lam.add_permission.side_effect = lam.exceptions.ResourceConflictException()
+
+    with patch.object(d, "_lambda", return_value=lam):
+        with pytest.raises(lam.exceptions.ResourceConflictException):
+            d.handler(dict(EVENT), None)
+
+
+def test_existing_url_with_authtype_none_is_forced_back_to_aws_iam(aws,
+                                                                  monkeypatch):
+    """已有候选色 URL 被漂移成 AuthType=NONE ⇒ 提交前必须改回 AWS_IAM。
+
+    这是 Codex 2026-08-18 P1-5A：create 报 Conflict、get 照样给出 URL，语句替换
+    又只管我们自己那两条 sid——于是一个**公开可达**的候选色会被原样提交，新后端
+    绕过 Edge 的全部鉴权直接暴露公网。健康门是 `lambda:invoke` 直调发现不了；
+    smoke 打 Edge 域名也发现不了。
+
+    红的条件：`update_function_url_config` 没被调用（旧行为——存在即当对）。
+    """
+    import deploy_lambda_site as d, common
+    monkeypatch.setenv("EDGE_ROLE_ARN", "arn:aws:iam::1:role/edge-role")
+    common.create_job("a@x.com", "s-1")
+    lam = _lam_mock(exists=False)
+    # 首次 create 冲突（URL 已存在），get 返回一个 **NONE** 的配置
+    lam.create_function_url_config.side_effect = \
+        lam.exceptions.ResourceConflictException()
+    lam.get_function_url_config.side_effect = lambda **kw: {
+        "FunctionUrl": _color_url(kw["Qualifier"]), "AuthType": "NONE"}
+
+    with patch.object(d, "_lambda", return_value=lam):
+        d.handler(dict(EVENT), None)
+
+    fix = [c.kwargs for c in lam.update_function_url_config.call_args_list]
+    assert fix and fix[0]["AuthType"] == "AWS_IAM" \
+        and fix[0]["Qualifier"] == "blue", \
+        f"AuthType=NONE 的候选色 URL 被原样接受了：{fix}"
+
+
+def test_stray_policy_statements_on_the_candidate_color_are_removed(aws,
+                                                                   monkeypatch):
+    """候选色 resource policy 里**非预期 sid** 的语句必须被清掉。
+
+    只替换自己那两条 sid 清不掉别的 sid 下塞进来的 Principal:* 之类的额外授权
+    ——那同样让新后端绕过 Edge 公网可达（P1-5A 的另一半）。
+    """
+    import json as _json
+
+    import deploy_lambda_site as d, common
+    monkeypatch.setenv("EDGE_ROLE_ARN", "arn:aws:iam::1:role/edge-role")
+    common.create_job("a@x.com", "s-1")
+    lam = _lam_mock(exists=False)
+    lam.get_policy.side_effect = None
+    lam.get_policy.return_value = {"Policy": _json.dumps({"Statement": [
+        {"Sid": "edge-invoke", "Principal": {"AWS": "edge"}},
+        {"Sid": "totally-legit-public-access", "Principal": "*"},
+    ]})}
+
+    with patch.object(d, "_lambda", return_value=lam):
+        d.handler(dict(EVENT), None)
+
+    removed = {c.kwargs["StatementId"]
+               for c in lam.remove_permission.call_args_list}
+    assert "totally-legit-public-access" in removed, \
+        "非预期 sid 下的额外授权（Principal:*）没被清掉——新后端公网可达"
+    assert removed - {"totally-legit-public-access"} <= \
+        {"edge-invoke", "edge-invoke-function"}

@@ -8,7 +8,7 @@ blue/green 原子更新）**：照 ①→⑦ 走一遍即可（⑤b 控制台、
 无需先部旧版本再升级。
 已在运行旧版本的环境见[从一期环境升级](#从一期环境升级本仓库自己的环境走过这条路)。
 
-- **区域**：`us-east-1`（Lambda@Edge、ACM、Quick Desktop 身份区域共同强制）
+- **区域**：`us-east-1`（Lambda@Edge 与 CloudFront 用的 ACM 证书共同强制）
 - 下文 `{account_id}`、`{base_domain}` 等**花括号占位符需手工替换成你的实际值**
   （与 config.ini 中对应字段一致）。注意与 `config.ini` 里的
   `frontend_bucket = site-frontend-{account_id}` 区分——那处是脚本读取时自动插值的，
@@ -27,7 +27,7 @@ blue/green 原子更新）**：照 ①→⑦ 走一遍即可（⑤b 控制台、
 Step Functions / CodeBuild / Aurora DSQL 的权限。
 
 区域**必须 `us-east-1`**：Lambda@Edge 函数与 CloudFront 用的 ACM 证书强制在
-us-east-1，Quick Desktop 身份区域当前也要求 us-east-1。这不是偏好而是硬约束——
+us-east-1。这不是偏好而是硬约束——
 换区需要改代码（见文末 Minor 里 region 硬编码的两处）。
 
 ### 域名与通配符证书
@@ -90,10 +90,19 @@ aws acm describe-certificate --region us-east-1 \
 | email 来源 | 飞书通讯录（两个坑见下节） | IdP 的 email attribute mapping |
 | 本手册验证状态 | **全流程真机验证过** | 架构兼容（平台代码不感知 IdP），未真机验证 |
 
-> 与"用什么登录 Quick"解耦：Quick Desktop/Web 的登录方式（飞书/Okta/IdC）
-> 和本平台的 IdP 是两个独立的认证上下文，互不影响。用户即使用 Okta 登录 Quick，
-> 添加部署 MCP 时走的仍是本平台 Cognito 的 OAuth。两者可同源可不同源；
-> 建议同源，避免 allowed_users 名单里的邮箱与用户实际登录身份的邮箱错配。
+> **"org" 的边界 = 你联邦的 IdP 的用户集合，不是邮箱域名**。
+> `allowed_users: "org"` 的判定链是"会话有效 + 来自 trusted_idps 里的 provider
+> 即放行"——代码里没有任何按 `@域名` 过滤的逻辑，邮箱只是标识符（owner/名单里
+> 的键）。飞书场景：org = 创建企业自建应用的那个租户（成员邮箱可以是任意域，
+> 含个人 Gmail）；标准 IdP 场景：org = 该目录里能对此应用完成 SSO 的用户（受
+> IdP 侧 app assignment 约束）。想要"仅限本公司员工"，联邦你自己的企业 IdP 就
+> 自动得到；IdP 里有外部账号时在 IdP 侧收窄，不要指望按邮箱域名筛。
+
+> **与 Agent 客户端的账号体系无关**：Claude Code / Codex / Quick 各自怎么登录
+> 是客户端自己的事，本方案对此不做任何假设、也无任何依赖。用户在客户端里添加
+> 部署 MCP 时，走的是**本平台** Cognito 的 OAuth（联邦到你在这一步接入的 IdP）；
+> 站点访问与控制台同理。唯一的实务建议：IdP 给出的邮箱要与你日常用于
+> allowed_users 名单的邮箱一致，否则名单对不上人。
 
 ### 【飞书】企业自建应用
 
@@ -120,7 +129,7 @@ aws cognito-idp describe-identity-provider --user-pool-id {user_pool_id} \
 # → 在飞书后台注册 https://xxxx.execute-api.us-east-1.amazonaws.com/prod/callback
 ```
 
-站点登录、部署 MCP OAuth、Quick Desktop 三条通道共用这一条注册。
+站点登录与部署 MCP OAuth 两条通道共用这一条注册。
 
 邮箱权限不可省：`owner`（谁部署的、谁能改/删站点）与访问名单 `allowed_users`
 都以飞书邮箱为标识，拿不到邮箱则整个权限模型不成立。
@@ -698,8 +707,8 @@ pre-token 触发器、managed login branding。命令与实测基线见前面
 下面步骤 1 是**准备 IdP**（按 §0 选定的场景二选一），步骤 2 起是拿到 pool 之后
 的通用核对（把命令里的 IdP 名 `Feishu` 换成你实际的 provider name）。
 
-1. **【飞书】** 克隆并按其 README 部署上游方案（提供 OIDC 适配器 + Quick Desktop
-   代理；平台把这个适配器当成一个普通 OIDC IdP 来联邦）：
+1. **【飞书】** 克隆并按其 README 部署上游方案（把飞书 OAuth 包装成标准 OIDC
+   的适配器；平台把它当成一个普通 OIDC IdP 来联邦）：
   ```bash
    git clone https://github.com/aws-samples/sample-for-amazon-quick-sso-with-feishu /tmp/feishu-sso
    cd /tmp/feishu-sso && cat README.md
@@ -717,9 +726,7 @@ pre-token 触发器、managed login branding。命令与实测基线见前面
    `https://{hosted-ui-domain}/oauth2/idpresponse`（脚本跑完会打印这个地址）。
    SAML IdP 目前脚本未覆盖，需按下面官方文档手工加 provider，其余步骤相同——
    **attribute mapping 里把 IdP 的 email 映射到 pool 的 email 属性是硬要求**，
-   漏了整个权限模型不成立。若还需要 Quick Desktop
-   走同一个 pool 登录，另需 offline_access 剥离代理，参考
-   [aws-samples Quick Desktop Cognito 方案](https://aws-samples.github.io/sample-amazon-quick-suite-knowledge-hub/amazon-quick-on-desktop/)。
+   漏了整个权限模型不成立。
 
    逐步操作的 AWS 官方文档：
    - **Okta（SAML，逐步截图版，含 Okta 侧配置）**：
@@ -784,10 +791,11 @@ pre-token 触发器、managed login branding。命令与实测基线见前面
    > Cognito 的 `/logout` **不登出上游 IdP**（飞书会话仍在），所以 UI 文案不能
    > 承诺"已完全退出"。
 
-7. **验证点（人工门禁）**：在 Quick Web/Desktop 配置该 IdP，用上游身份
-   （飞书账号 / Okta 账号等）登录成功。Desktop 身份区域须 us-east-1。
-   （此步只关乎 Quick 登录通道；若组织的 Quick 用别的方式登录、只用本平台
-   建站功能，可跳过。）
+7. **验证点**：`deploy_pool.py` 结束时打印的核对项全部通过 + 上面步骤里的
+   describe 核对全部符合，即可进入 ②。**端到端的真人登录验证不在这一步**：
+   完整链路（Hosted UI → IdP → 回调 → 会话）要等 ② 路由层与登录服务都在线
+   才存在，放在 ⑥ 客户端接入（auth.js 首次 OAuth 能拿到含 email 的 access
+   token）与 ⑦ 彩排里做。
 
 > **MCP 的 token 形态已钉死**（2026-07-29 真机）：AgentCore 网关只接受
 > **access token**（id_token 会被 401 `Claim 'client_id' value mismatch`），
@@ -813,19 +821,38 @@ name**；值必须是裸 `true`/`false`——configparser 会把行内注释并�
 `true  # 注释` 会被当成 false，防线静默关闭。已有存量会话的环境见文末升级一节。
 
 1. 建私有前端桶（若不存在）。**注意此桶不由 CDK 管理**，需手工建并配好
-   public-access-block 与生命周期规则：
+   public-access-block：
   ```bash
    # us-east-1 不要带 --create-bucket-configuration LocationConstraint
    aws s3api create-bucket --bucket site-frontend-{account_id} --region us-east-1
    aws s3api put-public-access-block --bucket site-frontend-{account_id} \
      --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
-   # 旧版本前端清理：upload_frontend 只写新前缀不删旧的（发布期间线上仍用旧前缀），
-   # mark_job 成功后清理当前站点旧版本；这条规则是兜底，防残留无限累积。
-   aws s3api put-bucket-lifecycle-configuration --bucket site-frontend-{account_id} \
-     --lifecycle-configuration '{"Rules":[{"ID":"expire-old-site-versions","Status":"Enabled","Filter":{"Prefix":"sites/"},"Expiration":{"Days":30}}]}'
   ```
    桶必须保持私有：Edge 函数用 SigV4 签名读它（见 `_add_s3_sigv4_auth`），
    不依赖公开访问。
+
+   > **这个桶上不要配 `sites/` 前缀的生命周期规则。** 2026-08-17 之前这里教的是
+   > 加一条 `expire-old-site-versions`（`Filter.Prefix=sites/`、`Expiration.Days=30`）
+   > 当作旧版本清理的兜底。**那条规则是错的，已从文档与生产桶上移除**：
+   >
+   > 站点**线上正在服务**的那一份前端也住在 `sites/{site_id}/{job_id}/` 下，
+   > 而这个前缀写一次之后**永不重写**（每次部署换一个新前缀）。桶又没开版本控制。
+   > 于是任何 **30 天没有重新部署过**的站点会被这条规则把线上前端删掉，
+   > 而且因为桶是私有的，症状是**整站 403 而不是 404**——很容易被当成权限故障去查。
+   > 实测：规则移除时生产上最老的存量前缀已 19 天（`team-kudos-wall-1d5lpc`，
+   > 2026-07-29 上传），离触发只剩约 11 天，还没有站点被删过。
+   >
+   > 存储上界由 `mark_job._cleanup_old_versions` 提供：它每次成功部署后清掉本站点
+   > 的陈旧前缀，只保留当前那一份、上一份（Edge 路由缓存 60s 内仍会引用它）、
+   > 以及 30 分钟内新上传的（可能是另一次正在跑的部署）。站点下线时
+   > `undeploy.py` 整个 `sites/{site_id}/` 前缀删除。
+   > **口径的边界**：清理只在**成功**分支跑，所以"上界"只对持续有成功部署的
+   > 站点成立——一个再也没成功部署过的站点，其失败部署留下的前缀会一直躺到
+   > 下一次成功部署或下线。这是接受的代价（几 MB 级），不要为它把生命周期
+   > 规则加回来。
+   >
+   > 生命周期规则表达不了"除了每个站点最新的那一份"，所以这里没有"改窄"的写法，
+   > 只能不配。
 2. 部署栈（首次需先 bootstrap）：
   ```bash
    cd router/infrastructure
@@ -1880,11 +1907,11 @@ claude mcp add --transport http site-builder-deploy {mcp_endpoint_url} \
   --client-id {mcp_client_id} --callback-port 18765
 ```
 
-配好后在会话里 `/mcp` → site-builder-deploy → Authenticate 走飞书 OAuth。
+配好后在会话里 `/mcp` → site-builder-deploy → Authenticate 走平台 IdP 的 OAuth（飞书场景即飞书授权页）。
 新会话提示："用 site-builder 技能给我做一个团队读书清单站点，能加书标记读完，全组织可看，做完部署" → 应走完 Skill 工作流 → MCP 部署 → 返回 URL → 浏览器飞书登录 + 加书验证。
 （已实测走通：真实站点部署成功，validate→smoke-test 一次过。）
 
-**Quick Desktop（人工，核心演示通道）**：导入 site-builder Skill + Capabilities→MCP 添加 endpoint（OAuth 走飞书登录）。
+**Amazon Quick Desktop（人工）**：导入 site-builder Skill；它的 Remote MCP 不支持 OAuth——走本地 stdio 代理，或启用 API Key 组件后用 Remote MCP + `X-API-Key`。
 
 完整步骤、逐客户端冒烟清单与 email claim 排查办法见 [**docs/client-setup.md**](docs/client-setup.md)。
 
@@ -1944,9 +1971,35 @@ RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/tes
 
 SSM 参数：`/site-builder/jwt-secret`（§0 手工建）、`/site-builder/site-client-secret`（① 的 `deploy_pool.py` 写入）。
 
+## per-site 部署租约（M7 加固；排障必读）
+
+同一站点同时只允许**一次**部署或下线。实现是 jobs 表里一条 `site-lease#<site_id>`
+行（不是 job；故意不带 site_id/owner/status，所以不进任何 GSI、也不被 sweeper
+扫到），由 `confirm_upload` / 下线的建 job 事务原子获取。**没有释放动作**：
+判据是"持有者那条 job 还是 RUNNING 吗"，job 一到终态租约自动可抢。
+
+排障口径：
+
+- 用户报"站点 X 已有一次部署/下线正在进行" ⇒ 读 `site-lease#X` 行拿 holder
+  job_id，看那条 job：RUNNING 且真在跑 ⇒ 等它；RUNNING 但卡住 ⇒ reconciler
+  两层收敛（EventBridge 实时 + sweeper ≤45 分钟）会把它推成 FAILED，随即可重试。
+- **不要手工删租约行**去"解锁"：那正是它要挡的第三次并发操作。真要人工介入，
+  先把 holder job 收敛到终态（查明它确实没有活着的 execution），租约自然放开。
+- **这是跨组件协议**：deployer 栈、MCP、panel 三方都要跑到带租约的版本，
+  只升级一部分 = 互斥只对一部分入口生效（另一部分是后门）。升级窗口内避免
+  并发部署同一站点。
+
+## 合同收紧（2026-08-18）：frontend/index.html 必须存在且非空
+
+`contract/redlines.py` 新增要求：任何 tier 的站点包必须带非空的
+`frontend/index.html`（Edge 把 `/` 固定改写为 `/{prefix}/index.html`，缺它则
+首页**永久 403**，而健康门/冒烟都发现不了）。**升级后的行为变化**：此前能部署
+成功（但首页 403）的包，现在在 validate 一步就被拒，错误信息点名 index.html。
+存量六个真实站点都带 index.html，不受影响；若有用户报"以前能部署现在不行"，
+先看是不是这一条。
+
 ## 已知限制与延后项（向客户声明）
 
-- Quick Desktop 为 preview、身份区域须 us-east-1
 - 顶域 cookie 使所有 `app-*.{base_domain}` 站点共享一次登录（PoC 可接受，产品化需按站点隔离会话）
 - PoC 仅 Node.js 后端（Python 3.13 延后）
 - MCP 接入有 OAuth 与 **API Key** 两条路（API Key 走可选组件 key-proxy，二期 M4 已交付；

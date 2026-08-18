@@ -24,7 +24,7 @@
  *    不是 SFN 状态机节点名。SUCCEEDED 的 job 停在 `smoke-test`
  *    （mark_job.py 只改 status，不再推进 phase），所以"成功"不靠 phase 判断。
  *
- * ⑤ undeploy 是**异步**的：POST 只返回 {job_id, status: "PENDING"}，真正的
+ * ⑤ undeploy 是**异步**的：POST 只返回 {job_id, status: "RUNNING"}，真正的
  *    删除由 site-deployer-undeploy 异步做。原型当同步处理，会让用户在"已下线"
  *    的提示后刷新看到站点仍在，以为失败。这里改成提交后轮询该站点的 job。
  *
@@ -76,6 +76,7 @@ const ROLE_LABEL = {
  * 顺序即部署阶段顺序，进度条按它算。 */
 const PHASE_LABEL = {
   'submitted': '已提交',
+  'compensating': '回滚中',
   'queued': '排队中',
   'validate': '校验合同',
   'provision-db': '准备数据库',
@@ -1365,7 +1366,7 @@ function bindDangerZone(site) {
       btn.disabled = true;
       btn.textContent = '提交中…';
       try {
-        /* **异步**：只拿到 job_id + PENDING，真正的删除在后台。
+        /* **异步**：只拿到 job_id + RUNNING，真正的删除在后台。
          * 立刻显示"已下线"是错的——刷新会看到站点还在，用户以为失败。 */
         const res = await api('POST', '/api/sites/' + encodeURIComponent(site.site_id) +
           '/undeploy', { purge_data: !!purge });

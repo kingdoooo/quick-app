@@ -623,3 +623,48 @@ def test_migration_file_naming_matches_the_executor(tmp_path):
     # 符合约定 → 两边都要认
     (mig / "002_real.sql").write_text("CREATE INDEX idx_y ON t (c);")
     assert any("ASYNC" in x for x in scan_redlines(d, m))
+
+
+def test_missing_index_html_is_a_violation(tmp_path):
+    """frontend/index.html 缺失必须被合同拦下（Codex 2026-08-18 P1-5B）。
+
+    Edge 把页面请求固定改写为 /{static_prefix}{path}、对 / 补 index.html——
+    缺它则首页**永久** 403（前端桶私有），而下游没有任何一步能发现：健康门只测
+    后端，require_auth 站点的冒烟只断言 302。合同层（部署链最早、还没动任何
+    资源的一步）是唯一正确的拦截点。
+    """
+    _, manifest = make_site(tmp_path)
+    (tmp_path / "frontend/index.html").unlink()
+    # 只放一个 CSS：非空目录 + 无 index.html，正是当时被放过的形态
+    (tmp_path / "frontend/style.css").write_text("body{}")
+    violations = scan_redlines(tmp_path, manifest)
+    assert any("index.html" in v for v in violations), \
+        f"只有 CSS、没有 index.html 的前端被放行了：{violations}"
+
+
+def test_empty_index_html_is_a_violation(tmp_path):
+    """空的 index.html 同样拦下：0 字节的首页与缺失只差一个状态码。"""
+    _, manifest = make_site(tmp_path)
+    (tmp_path / "frontend/index.html").write_text("")
+    violations = scan_redlines(tmp_path, manifest)
+    assert any("index.html" in v for v in violations)
+
+
+def test_static_tier_also_requires_index_html(tmp_path):
+    """static tier 一样要求：它更依赖 index.html（除了静态文件什么都没有）。"""
+    _, manifest = make_site(tmp_path, tier="static")
+    (tmp_path / "frontend/index.html").unlink()
+    violations = scan_redlines(tmp_path, manifest)
+    assert any("index.html" in v for v in violations)
+
+
+def test_index_html_requirement_is_documented_in_the_agent_facing_contract():
+    """校验器拦了、而给生成方 Agent 的合同文档没写 ⇒ Agent 只能靠报错自解释。
+
+    改合同要同步三处（CLAUDE.md）：校验器（本包）、references/contract.md、
+    fixtures（三个黄金样例本来就带 index.html）。本条锁文档那一处。
+    """
+    doc = (Path(__file__).parents[2] / "skills" / "site-builder" / "references"
+           / "contract.md").read_text(encoding="utf-8")
+    assert "frontend/index.html" in doc and "必须存在且非空" in doc, \
+        "index.html 的合同要求没写进给 Agent 的 contract.md"

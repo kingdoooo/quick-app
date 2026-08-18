@@ -8,9 +8,16 @@ URL，也就是指向 `$LATEST`。于是任何 `update_function_code` 都当场�
 
 `deploy_lambda_site.handler` 对未迁移站点 fail-closed（抛 `UnmigratedSite`），所以本
 脚本产出的状态就是「让它不再抛」的那个状态。判据必须与它对得上：它判的是
-`_live_color(...) is None and not _color_urls(...)`，而**只满足 `urls` 非空那半是不够
-的**——那种半套状态下路由还指着 `$LATEST` 的旧 URL，正是 v1 被驳回的 P1-1。所以本脚本
-的完成判据是**路由的 api_target 等于某个颜色的 URL，且无 qualifier 的 URL 已删除**。
+**「路由存在、但它指向的不是任何一个颜色的 URL」**（`_live_color(...) is None and
+target`）。所以本脚本的完成判据是**路由的 api_target 等于某个颜色的 URL，且无
+qualifier 的 URL 已删除**——只把 alias/URL 建出来是不够的。
+
+那条闸门的判据曾经写成 `live is None and **not urls**`（AND），于是本脚本第 4 步
+健康门失败留下的**半迁移**状态（blue alias + blue URL 已建、路由仍在 `$LATEST`）
+恰好被放行：`urls` 非空 ⇒ 不抛 ⇒ `update_function_code` 推 `$LATEST` ⇒ 未经健康门的
+代码当场对外服务，正是 v1 被驳回的 P1-1 同一形态（Codex 2026-08-17 P1-3 复现）。
+现在改成按**路由**判，所以本脚本留下半套状态是安全的（下次部署会被拦住并指回这里），
+但**不要把闸门改回按 `urls` 判**。
 
 每个站点七步（顺序是死的）：
 

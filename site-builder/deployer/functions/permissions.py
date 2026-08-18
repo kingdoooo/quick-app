@@ -126,6 +126,46 @@ def snapshot_condition(*, rev: int, had_rev: bool, actor: str = "",
             {":me": {"S": actor}}, {"#o": "owner"} if "#o = :me" in clauses else {})
 
 
+def committed_route_condition(*, static_prefix: str,
+                              rev: int) -> tuple[str, dict]:
+    """→ (ConditionExpression, ExpressionAttributeValues)：**路由 item 还是我这次
+    部署提交进去的那一份吗**。
+
+    与 `snapshot_condition` 的区别是锚点选在哪一端，这个区别就是它存在的理由：
+
+      · `snapshot_condition` 锚"我**读到**的世界"（快照 rev）——用于提交之前的
+        守卫（register_route 的事务）。
+      · 本函数锚"我**写出去**的那份"（本次的 static_prefix + 本次写入的 rev）——
+        用于提交之后的补偿（mark_job 的失败分支）。
+
+    补偿必须用后者，两条实测缺陷各对应一半：
+
+      ① **同站点并发部署**：两个 job 可以同时在跑（部署租约挡的是新执行的
+         **创建**——common.plan_deploy_lease；存量在跑的执行仍可能交错）。期间没人
+         改权限时两个 job 看到的 rev 相同，于是"线上 rev 还等于我的快照 rev"对
+         **旧** job 同样成立 —— 旧 job 的 smoke 失败后会把**新** job 刚提交成功
+         的路由整条覆盖回更早的版本（而新 job 的成功分支已经在清理旧前缀了，
+         于是覆盖出来的那条指向一个可能已不存在的前缀）。
+         `static_prefix` 带 job_id ⇒ 天然唯一 ⇒ 旧 job 的条件必然失败 ⇒ 放弃。
+      ② **存量路由没有 rev**（M3 之前写入的：实测生产 6 条站点路由里 5 条如此）。
+         锚快照时"快照里没有 rev"就无从比较，只能放弃恢复 —— 那 5 个站点第一次
+         更新若 smoke 失败便无法回滚。而锚提交端不受影响：register_route **总会**
+         写 rev，所以"我写出去的那份"永远有 rev 可比，rev-less 的快照照样能整值
+         写回。
+
+    仍然带 rev 这一项、不能只比 static_prefix：在线改权限
+    （`write_permissions` 的两表事务）**不动** static_prefix，只推进 rev 并改权限
+    字段。只比前缀会让"smoke 期间有人收紧权限"通过条件，于是把收紧**之前**的
+    allowed_users 写回去 = 静默扩权。两项都要。
+
+    不需要另加 `attribute_exists`：item 不存在时属性比较一律为假，条件自动失败
+    ——已下线站点的路由不会被复活（`test_restore_does_not_resurrect_a_route_
+    deleted_during_smoke` 钉住）。
+    """
+    return ("static_prefix = :csp AND permissions_rev = :crev",
+            {":csp": {"S": static_prefix}, ":crev": {"N": str(int(rev))}})
+
+
 def sites_snapshot_guard(site_id: str, **kw) -> dict:
     """把 snapshot_condition 包成 sites 表上的 TransactItems ConditionCheck。"""
     expr, vals, names = snapshot_condition(**kw)
@@ -243,7 +283,10 @@ def add_admin(email: str, added_by: str) -> None:
             if e.response["Error"]["Code"] != "TransactionCanceledException":
                 raise
             reasons = _cancel_reasons(e)
-            put_reason = reasons[0] if reasons else ""
+            # 下标与 items 的构造绑定（本文件的 AST 守卫禁止整数字面量下标）：
+            # 关心的是 Put（items 里唯一带 attribute_not_exists 的那项）。
+            put_idx = next(i for i, it in enumerate(items) if "Put" in it)
+            put_reason = reasons[put_idx] if len(reasons) > put_idx else ""
             if put_reason == "ConditionalCheckFailed":
                 # 该邮箱已是管理员：幂等成功，计数不动。**仍然落审计**，
                 # 但 result 区分开——"谁在什么时候尝试提权"本身就是审计线索，
@@ -299,17 +342,22 @@ def remove_admin(email: str, removed_by: str = "") -> None:
         raise ValueError(f"非法邮箱: {email!r}")
     ddb = _ddb_client()   # 同 add_admin：走 hook，冲突分支才可注入测试
     table = os.environ["ADMINS_TABLE"]
+    items = [
+        {"Delete": {"TableName": table,
+                    "Key": {"email": {"S": email}},
+                    "ConditionExpression": "attribute_exists(email)"}},
+        # sentinel 记录当前管理员数；条件保证递减后仍 ≥1
+        {"Update": {"TableName": table,
+                    "Key": {"email": {"S": "__count__"}},
+                    "UpdateExpression": "SET n = n - :one",
+                    "ConditionExpression": "n > :one",
+                    "ExpressionAttributeValues": {":one": {"N": "1"}}}}]
+    # 下标与构造绑定（AST 守卫禁止整数字面量下标读 reasons）
+    delete_idx = next(i for i, it in enumerate(items) if "Delete" in it)
+    sentinel_idx = next(i for i, it in enumerate(items)
+                        if "Update" in it and "__count__" in str(it))
     try:
-        ddb.transact_write_items(TransactItems=[
-            {"Delete": {"TableName": table,
-                        "Key": {"email": {"S": email}},
-                        "ConditionExpression": "attribute_exists(email)"}},
-            # sentinel 记录当前管理员数；条件保证递减后仍 ≥1
-            {"Update": {"TableName": table,
-                        "Key": {"email": {"S": "__count__"}},
-                        "UpdateExpression": "SET n = n - :one",
-                        "ConditionExpression": "n > :one",
-                        "ExpressionAttributeValues": {":one": {"N": "1"}}}}])
+        ddb.transact_write_items(TransactItems=items)
     except botocore.exceptions.ClientError as e:
         if e.response["Error"]["Code"] != "TransactionCanceledException":
             raise
@@ -325,13 +373,15 @@ def remove_admin(email: str, removed_by: str = "") -> None:
         # ['ConditionalCheckFailed', 'ConditionalCheckFailed']）。
         # 先看 sentinel 就会把"目标不存在"误报成"不能删除最后一个管理员"，
         # 与本函数承诺的幂等语义相反。所以先判 Delete 项。
-        if reasons and reasons[0] == "ConditionalCheckFailed":
+        if (len(reasons) > delete_idx
+                and reasons[delete_idx] == "ConditionalCheckFailed"):
             # 该邮箱本就不是管理员：幂等成功（无论剩几个）。
             # 仍落审计但 result=noop，理由同 add_admin 的幂等分支。
             ops_log.record(actor=removed_by, action="remove_admin",
                            target=f"admins:{email}", result="noop")
             return
-        if len(reasons) > 1 and reasons[1] == "ConditionalCheckFailed":
+        if (len(reasons) > sentinel_idx
+                and reasons[sentinel_idx] == "ConditionalCheckFailed"):
             # 目标确实存在，只是它是最后一个
             ops_log.record(actor=removed_by, action="remove_admin",
                            target=f"admins:{email}", result="denied")
@@ -530,7 +580,12 @@ def write_permissions(site_id: str, *, actor: str, action: str,
     }
 
     items = [{"Update": site_update}, {"Update": route_update}]
+    # 下标与构造绑定（AST 守卫禁止整数字面量下标读 reasons）：admin 项是条件
+    # 追加的，写死 [2] 的话"非 admin 且有人往中间插项"时会把原因对错。
+    site_idx, route_idx = 0, 1
+    admin_idx = None
     if role == ROLE_ADMIN:
+        admin_idx = len(items)
         # admin 代管路径：把"调用者此刻仍是管理员"也放进同一事务。
         # 否则 admin 被移出名单与本次写入之间同样有 TOCTOU 窗口。
         items.append({"ConditionCheck": {
@@ -559,9 +614,12 @@ def write_permissions(site_id: str, *, actor: str, action: str,
         if e.response["Error"]["Code"] != "TransactionCanceledException":
             raise
         reasons = _cancel_reasons(e)
-        site_failed = len(reasons) > 0 and reasons[0] == "ConditionalCheckFailed"
-        route_failed = len(reasons) > 1 and reasons[1] == "ConditionalCheckFailed"
-        admin_failed = len(reasons) > 2 and reasons[2] == "ConditionalCheckFailed"
+        def _failed(idx):
+            return (idx is not None and len(reasons) > idx
+                    and reasons[idx] == "ConditionalCheckFailed")
+        site_failed = _failed(site_idx)
+        route_failed = _failed(route_idx)
+        admin_failed = _failed(admin_idx)
         if admin_failed:
             # 管理员身份在鉴权与提交之间被撤销
             raise PermissionDenied("你的管理员权限已被撤销") from e

@@ -325,6 +325,16 @@ def do_confirm_upload(owner: str, job_id: str) -> dict:
     #   · 与 PENDING→RUNNING **同一笔**：第二次点击（AlreadyStarted）因此既不推进
     #     状态也改不到 etag，否则重放能把已经开跑的 job 钉到新字节上。
     import botocore.exceptions
+    # per-site 部署租约（M7 加固，Codex 2026-08-17 P1-3）。**必须与
+    # PENDING→RUNNING 同一笔**：分开发就有一个窗口，窗口里第二次部署也能拿到租约。
+    # 判定与条件项都来自 common（唯一定义），这里只负责把"拿不到"翻译成用户可读的
+    # 拒绝。为什么需要它：两次并发部署会算出**同一个空闲色**，各自把那个 alias 指向
+    # 自己的版本、各自过健康门，线上可能变成"前端来自 A、后端来自 B"——而两个 job
+    # 都不会触发补偿。详见 common.deploy_lease_key 那一段。
+    try:
+        lease_items = common.plan_deploy_lease(job["site_id"], job_id)
+    except common.DeployInProgress as e:
+        raise AlreadyStarted(str(e)) from e
     items = [
         {"Update": {
             "TableName": os.environ["JOBS_TABLE"],
@@ -339,9 +349,19 @@ def do_confirm_upload(owner: str, job_id: str) -> dict:
                                           ":etag": {"S": head["ETag"]},
                                           ":len": {"N": str(head["ContentLength"])}}}},
         _rev_condition_check(authz, job["site_id"], "deploy"),
+        *lease_items,
     ]
+    # **取消原因是按下标对位的，所以下标必须由构造处算出、不能写死字面量。**
+    # 原来三条检查各自硬编码 0/1/2；本轮往中间插一项时，非 admin 路径的
+    # `reasons[2]` 会从"admin 被撤权"悄悄变成租约冲突——报错文案对不上真实原因，
+    # 而两边单测各自都会绿。所以这里把每一项的下标与它的含义绑在一起。
+    # 租约可能是 1-2 项（顶替陈旧持有者时多一条对持有者的 ConditionCheck），
+    # 两项失败对用户是同一件事：另一次操作抢先了。
+    _WHY = (["already-started", "permissions-changed"]
+            + ["deploy-in-progress"] * len(lease_items))
     if authz.role == permissions.ROLE_ADMIN:
         items.append(_admin_condition_check(owner))
+        _WHY.append("admin-revoked")
     try:
         boto3.client("dynamodb", region_name="us-east-1").transact_write_items(
             TransactItems=items)
@@ -351,15 +371,24 @@ def do_confirm_upload(owner: str, job_id: str) -> dict:
         # 逐项分辨取消原因：整个异常当"已启动过"会把撤权报成重复点击
         reasons = [r.get("Code", "") for r in
                    e.response.get("CancellationReasons", [])]
-        if reasons and reasons[0] == "ConditionalCheckFailed":
+        failed = {why for why, code in zip(_WHY, reasons)
+                  if code == "ConditionalCheckFailed"}
+        # 判定顺序 = 告知优先级：先说"这次请求本身是重放"，再说权限变更，
+        # 最后才说并发部署——前两者是调用方能自己处理的，后者要等别人。
+        if "already-started" in failed:
             raise AlreadyStarted(
                 f"任务 {job_id} 已启动过，请用 get_deploy_status 查询进度") from e
-        if len(reasons) > 1 and reasons[1] == "ConditionalCheckFailed":
+        if "permissions-changed" in failed:
             raise NotOwner(
                 "站点权限在你提交期间被修改（协作者/所有权变更），本次部署已取消"
                 "——请重新确认权限后再试") from e
-        if len(reasons) > 2 and reasons[2] == "ConditionalCheckFailed":
+        if "admin-revoked" in failed:
             raise NotOwner("你的管理员权限已被撤销") from e
+        if "deploy-in-progress" in failed:
+            # 两个请求同时读到"租约空闲"时只有一个的条件成立，另一个落在这里。
+            raise AlreadyStarted(
+                f"站点 {job['site_id']} 有另一次部署刚刚开始，本次已取消——"
+                "请等它结束后重试") from e
         raise
     # 事务已提交（= 请求已被接受），但 SFN 还没起。这两步之间失败的话，
     # job 会永久停在 RUNNING 而没有任何 execution 在跑：重试因 status 已非
@@ -434,11 +463,26 @@ def do_confirm_upload(owner: str, job_id: str) -> dict:
                 "请重新发起部署（会生成新任务）") from start_err
         _rollback_job_to_pending(job_id)
         raise
-    except Exception:
-        # 非 ClientError（网络中断、连接超时等）同样要回滚——这类失败最可能
-        # 根本没到达 SFN，不回滚就是永久卡死。
-        _rollback_job_to_pending(job_id)
-        raise
+    except Exception as e:
+        # **非 ClientError（网络中断、读超时等）不回滚**（Codex 2026-08-18 R4
+        # P1-2）：这类错误的含义是"结果不确定"——请求可能根本没到 SFN，也可能
+        # 到了、执行已经在跑、只是响应丢了。回滚成 PENDING 的话，租约把 PENDING
+        # 持有者当陈旧放行，第二次部署与那条**可能活着**的执行并行——正是租约
+        # 要消灭的交错。ClientError 则相反：服务端**收到并拒绝**了请求，
+        # "确定没启动"，回滚是安全的（上面那个分支）。
+        #
+        # 保持 RUNNING 的两条出路都收敛，不会永久卡死：
+        #   · 执行真的在跑 ⇒ 它自己推进 job 到终态（与正常部署无异）；
+        #   · 执行没起来 ⇒ job 无对应 execution，sweeper 按确定性 name
+        #     （execution name == job_id）DescribeExecution 查证
+        #     ExecutionDoesNotExist 后收敛成 FAILED（reconcile_job 的
+        #     ORPHANED 分支），租约随之放开。代价：这条罕见路径上站点最长
+        #     被挡 ~45 分钟——比"两次部署并行"便宜得多。
+        raise RuntimeError(
+            f"部署请求已受理（任务 {job_id}），但启动执行时网络错误、结果不确定"
+            "。请用 get_deploy_status 轮询：若执行已在跑会正常推进；若确实没"
+            "启动，系统会在最多 45 分钟内自动判定失败，届时重新发起部署即可。"
+            f"（原始错误：{type(e).__name__}: {str(e)[:120]}）") from e
 
     return {"status": "RUNNING"}
 
@@ -502,21 +546,46 @@ def do_undeploy(owner: str, site_id: str, purge_data: bool = False) -> dict:
     # 存量站点的守卫只会断言 "owner 仍是我"——旧 owner 被 transfer_owner 降级为
     # collaborator 后，这条会正确拒绝（Codex 复审 2026-08-08 P1）。
     guards = [_rev_condition_check(authz, site_id, "undeploy")]
+    _why = ["job-created", "permissions-changed"]      # [0] 是建 job 的 Put
     if authz.role == permissions.ROLE_ADMIN:
         guards.append(_admin_condition_check(owner))
+        _why.append("admin-revoked")
+    # **下线也要拿同一把 per-site 租约**（Codex 2026-08-18 P1-2）：不拿的话，
+    # 部署 A 还在跑时 undeploy 可以照常删路由/函数/前端，而 A 的后续步骤会把
+    # 刚下线的站点**重新建出来**（复活）；反过来下线进行中新部署也能开跑。
+    # 租约与建 job 同一笔事务；holder = 本 undeploy job，它 RUNNING 期间部署
+    # 会被 plan_deploy_lease 拒绝，结束（DELETED/FAILED/PURGE_FAILED）后自动可抢。
+    job_id = common.new_job_id()
     try:
-        job_id = common.create_job(owner, site_id, guard_items=guards)
+        lease_items = common.plan_deploy_lease(site_id, job_id)
+    except common.DeployInProgress as e:
+        raise AlreadyStarted(str(e)) from e
+    guards += lease_items
+    _why += ["deploy-in-progress"] * len(lease_items)
+    try:
+        # **RUNNING + kind="undeploy"，不是 PENDING**：租约判"持有者还在跑吗"看的
+        # 是 RUNNING（建成 PENDING 就留出一个租约形同虚设的窗口）；kind 建库时就写，
+        # 异步 invoke 的事件被丢弃时 sweeper 才能按 20 分钟阈值收敛它（原先 kind 由
+        # undeploy Lambda 运行时才写，事件丢了 job 就永远没有 kind）。
+        common.create_job(owner, site_id, guard_items=guards, job_id=job_id,
+                          status="RUNNING", kind="undeploy")
     except botocore.exceptions.ClientError as e:
         if e.response["Error"]["Code"] != "TransactionCanceledException":
             raise
         reasons = [r.get("Code", "") for r in
                    e.response.get("CancellationReasons", [])]
-        if len(reasons) > 2 and reasons[2] == "ConditionalCheckFailed":
-            raise NotOwner("你的管理员权限已被撤销") from e
-        if len(reasons) > 1 and reasons[1] == "ConditionalCheckFailed":
+        failed = {why for why, code in zip(_why, reasons)
+                  if code == "ConditionalCheckFailed"}
+        if "permissions-changed" in failed:
             raise NotOwner(
                 "站点权限在你提交期间被修改（协作者/所有权变更），本次下线已取消"
                 "——请重新确认权限后再试") from e
+        if "admin-revoked" in failed:
+            raise NotOwner("你的管理员权限已被撤销") from e
+        if "deploy-in-progress" in failed:
+            raise AlreadyStarted(
+                f"站点 {site_id} 有另一次部署/下线刚刚开始，本次下线已取消——"
+                "请等它结束后重试") from e
         raise
     payload = {"job_id": job_id, "site_id": site_id}
     if purge_data:
@@ -531,11 +600,12 @@ def do_undeploy(owner: str, site_id: str, purge_data: bool = False) -> dict:
         _lambda().invoke(FunctionName="site-deployer-undeploy",
                          InvocationType="Event",
                          Payload=json.dumps(payload))
-    except Exception:
-        # **job 已建好（PENDING），invoke 失败必须就地收敛**
-        # （Codex 审查 2026-08-10 P1-4）：sweeper 只扫 RUNNING，停在 PENDING
-        # 的 job 谁都不会再碰。panel 的 api.do_undeploy 有同样的处理——
-        # 两个 writer 都要，不能只修一处（M3-FINDINGS「别打地鼠，修那一类」）。
+    except botocore.exceptions.ClientError:
+        # **确定被拒**（服务端收到并拒绝：ResourceNotFound / AccessDenied /
+        # 4xx）⇒ 事件确实没被受理，就地收敛。不收敛就要等 sweeper 的 20 分钟
+        # undeploy 阈值，这 20 分钟里租约一直判"持有者在跑"，整个站点部署/下线
+        # 全被挡住；就地写 FAILED 立刻放开租约。panel 的 api.do_undeploy 有同样
+        # 的处理——两个 writer 都要，不能只修一处（M3-FINDINGS「别打地鼠」）。
         try:
             common.update_job(job_id, status="FAILED",
                               error="下线任务提交失败（未开始执行），站点未做任何"
@@ -543,6 +613,18 @@ def do_undeploy(owner: str, site_id: str, purge_data: bool = False) -> dict:
         except Exception:
             pass
         raise
+    except Exception as e:
+        # **结果不确定**（网络中断、读超时——非 ClientError）⇒ **不写 FAILED**
+        # （Codex 2026-08-18 R4 P1-2）：异步事件可能已被 Lambda 受理，后台正在
+        # 删路由/函数/数据；此刻写 FAILED 就是把租约放给新部署，让它与一场进行中
+        # 的下线并行。保持 RUNNING：真在跑 ⇒ undeploy 自己写终态；没起来 ⇒
+        # sweeper 按 20 分钟 undeploy 阈值收敛（kind 建库时已写，收敛必达）。
+        # 原先那句"站点未做任何改动"在这一态是**说不准的**，不能写。
+        raise RuntimeError(
+            f"下线请求已受理（任务 {job_id}），但提交执行时网络错误、结果不确定"
+            "。请稍后查看该站点的部署历史：若下线已在跑会正常推进；若确实没"
+            "启动，系统会在约 20 分钟内自动判定失败，届时重新发起下线即可。"
+            f"（原始错误：{type(e).__name__}: {str(e)[:120]}）") from e
     return {"job_id": job_id, "purge_data": bool(purge_data)}
 
 

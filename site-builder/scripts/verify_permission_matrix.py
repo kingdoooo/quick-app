@@ -301,7 +301,7 @@ def cleanup(region: str, keep: bool) -> int:
             ddb.delete_item(TableName=os.environ["SITES_TABLE"],
                             Key={"site_id": {"S": s}})
         except Exception as exc:        # noqa: BLE001
-            print(f"  ⚠️  删除 sites/{s} 失败: {exc}")
+            print(f"  ⚠️  删除 sites 表的 {s} 失败: {exc}")
     for sub in sorted(created_routes):
         try:
             ddb.delete_item(TableName=os.environ["ROUTING_TABLE"],
@@ -313,7 +313,7 @@ def cleanup(region: str, keep: bool) -> int:
         got = ddb.get_item(TableName=os.environ["SITES_TABLE"],
                            Key={"site_id": {"S": s}}, ConsistentRead=True)
         if "Item" in got:
-            print(f"  ⚠️  sites/{s} 仍存在 —— 手工删除")
+            print(f"  ⚠️  sites 表的 {s} 仍存在 —— 手工删除")
             leftover += 1
     for sub in sorted(created_routes):
         got = ddb.get_item(TableName=os.environ["ROUTING_TABLE"],

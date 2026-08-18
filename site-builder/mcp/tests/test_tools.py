@@ -564,12 +564,15 @@ def test_legacy_collaborator_can_still_deploy(aws, monkeypatch):
 
 
 def test_confirm_upload_rolls_back_when_start_execution_fails(aws, monkeypatch):
-    """StartExecution 失败 → job 必须退回 PENDING，用户可重试。
+    """StartExecution **被服务端确定拒绝**（ClientError）→ job 退回 PENDING，可重试。
 
+    只有确定拒绝才允许回滚：ClientError 意味着 SFN 收到并拒绝了请求，执行确定
+    没起来。（网络类错误走另一条：见 test_uncertain_start_error_keeps_running。）
     不回滚的话 job 永久停在 RUNNING 而没有 execution 在跑，重试被判
     AlreadyStarted，用户只能轮询一个永不推进的任务。
     """
     import boto3 as _b3
+    import botocore.exceptions
     import common
     import server
     monkeypatch.setenv("STATE_MACHINE_ARN",
@@ -580,9 +583,10 @@ def test_confirm_upload_rolls_back_when_start_execution_fails(aws, monkeypatch):
     _b3.client("s3").put_object(Bucket="site-artifacts-1",
                                 Key=f"uploads/{jid}.zip", Body=b"zip")
     boom = MagicMock()
-    boom.start_execution.side_effect = RuntimeError("SFN 挂了")
+    boom.start_execution.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "ExecutionLimitExceeded"}}, "StartExecution")
     with patch.object(server, "_sfn", return_value=boom):
-        with pytest.raises(RuntimeError):
+        with pytest.raises(botocore.exceptions.ClientError):
             server.do_confirm_upload("o@x.com", jid)
     assert common.get_job(jid)["status"] == "PENDING", "没回滚 → 永久卡死"
     # 重试必须能真正跑通（这才是回滚的目的）
@@ -778,15 +782,19 @@ def test_undeploy_invoke_failure_does_not_leave_pending_job(aws):
     import server, common
     server.common.upsert_site("demo-abc123", owner="o@x.com", status="ACTIVE",
                               tier="fullstack-nosql")
+    import botocore.exceptions
     lam = MagicMock()
-    lam.invoke.side_effect = RuntimeError("invoke 失败（注入）")
+    # **确定拒绝**（ClientError）才就地收敛成 FAILED；网络类错误保持 RUNNING
+    # 交给 sweeper（见 test_uncertain_undeploy_invoke_error_keeps_running）。
+    lam.invoke.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "ResourceNotFoundException"}}, "Invoke")
     with patch.object(server, "_lambda", return_value=lam):
-        with pytest.raises(RuntimeError):
+        with pytest.raises(botocore.exceptions.ClientError):
             server.do_undeploy("o@x.com", "demo-abc123")
     jobs = common.list_jobs_by_site("demo-abc123")
     assert jobs, "没有 job 记录"
     assert jobs[0]["status"] == "FAILED", (
-        f"job 停在 {jobs[0]['status']}——sweeper 只扫 RUNNING，永远不会被收敛")
+        f"job 停在 {jobs[0]['status']}——确定被拒时应立即放开租约")
 
 
 # ================= on-behalf 信任规则（二期 M4，spec §5.3）=================
@@ -1124,3 +1132,305 @@ def test_double_confirm_does_not_repin(aws, monkeypatch):
             server.do_confirm_upload("a@x.com", jid)
     assert _job_item(jid)["upload_etag"]["S"] == first, (
         "第二次确认改掉了 etag——重放能把已经开跑的 job 钉到新字节上")
+
+
+# ---------------------------------------------------------------------------
+# per-site 部署租约（M7 加固，Codex 2026-08-17 P1-3）
+# ---------------------------------------------------------------------------
+
+def _ready_job(owner="a@x.com", site_id="demo-abc123"):
+    """建站点 + job + 上传对象，返回 job_id。confirm_upload 的前置条件。"""
+    import boto3 as b3
+    import common
+    common.upsert_site(site_id, owner=owner, status="ACTIVE")
+    jid = common.create_job(owner, site_id)
+    b3.client("s3").put_object(Bucket="site-artifacts-1",
+                              Key=f"uploads/{jid}.zip", Body=b"zip")
+    return jid
+
+
+def test_second_concurrent_deploy_of_the_same_site_is_rejected(aws, monkeypatch):
+    """同一站点第二次并发部署必须被拒。
+
+    这是 Codex 2026-08-17 P1-3。不拒的话两次部署会**算出同一个空闲色**，各自把那个
+    alias 指向自己的版本、各自过健康门，线上可能变成"前端来自 A、后端来自 B"——
+    M7 的"前后端在同一个提交点切换"这条不变量被破坏，而两个 job 都不会触发补偿
+    （一个成功、一个在提交点之前就失败）。
+
+    红的条件：第二次也拿到了 RUNNING（旧行为）。
+    """
+    import server
+    monkeypatch.setenv("STATE_MACHINE_ARN",
+                       "arn:aws:states:us-east-1:1:stateMachine:sm")
+    first, second = _ready_job(), _ready_job()
+    with patch.object(server, "_sfn", return_value=MagicMock()):
+        assert server.do_confirm_upload("a@x.com", first)["status"] == "RUNNING"
+        with pytest.raises(server.AlreadyStarted, match="另一次部署|正在进行"):
+            server.do_confirm_upload("a@x.com", second)
+
+
+def test_lease_is_released_when_the_holder_reaches_a_terminal_state(aws,
+                                                                   monkeypatch):
+    """持有者一旦终态，下一次部署就能拿到租约。
+
+    **租约没有显式释放路径**，判据是推导出来的（"忙 ⟺ 持有者非终态"），所以这条
+    用例同时是那个设计的验收：把持有者置成 SUCCEEDED 就够了，不需要任何人去"释放"。
+    红的条件：站点在一次成功部署之后再也部署不了（那才是加锁最危险的失败模式）。
+    """
+    import common
+    import server
+    monkeypatch.setenv("STATE_MACHINE_ARN",
+                       "arn:aws:states:us-east-1:1:stateMachine:sm")
+    first, second = _ready_job(), _ready_job()
+    with patch.object(server, "_sfn", return_value=MagicMock()):
+        server.do_confirm_upload("a@x.com", first)
+        common.update_job(first, status="SUCCEEDED")          # mark_job 干的事
+        assert server.do_confirm_upload("a@x.com", second)["status"] == "RUNNING"
+
+
+def test_lease_does_not_block_a_different_site(aws, monkeypatch):
+    """租约是 per-site 的，不许把别的站点一起挡住。"""
+    import server
+    monkeypatch.setenv("STATE_MACHINE_ARN",
+                       "arn:aws:states:us-east-1:1:stateMachine:sm")
+    a = _ready_job(site_id="demo-abc123")
+    b = _ready_job(site_id="other-def456")
+    with patch.object(server, "_sfn", return_value=MagicMock()):
+        server.do_confirm_upload("a@x.com", a)
+        assert server.do_confirm_upload("a@x.com", b)["status"] == "RUNNING"
+
+
+def test_lease_row_stays_out_of_both_job_indexes(aws, monkeypatch):
+    """租约行**不许**带 site_id / owner / status。
+
+    带 site_id 或 owner 就会进 jobs 表的两个 GSI（稀疏索引），于是控制台的
+    "部署历史"（site-index 的 Query）与 list_jobs_by_owner 里会多出一条不是 job
+    的东西；带 status 就会被 reconcile 的 sweeper 按 `#s = :running` 捞去当成
+    一条卡住的 job 反复收敛。
+    """
+    import boto3 as b3
+    import common
+    import server
+    monkeypatch.setenv("STATE_MACHINE_ARN",
+                       "arn:aws:states:us-east-1:1:stateMachine:sm")
+    jid = _ready_job()
+    with patch.object(server, "_sfn", return_value=MagicMock()):
+        server.do_confirm_upload("a@x.com", jid)
+
+    row = b3.client("dynamodb").get_item(
+        TableName="site-deploy-jobs",
+        Key={"job_id": {"S": common.deploy_lease_key("demo-abc123")}})["Item"]
+    assert row["holder_job_id"]["S"] == jid
+    for forbidden in ("site_id", "owner", "status", "created_at"):
+        assert forbidden not in row, (
+            f"租约行带了 {forbidden}——它会进 GSI/被 sweeper 当成 job")
+    # 控制台的部署历史查的是 site-index：那里不该出现租约行
+    hist = b3.resource("dynamodb").Table("site-deploy-jobs").query(
+        IndexName="site-index",
+        KeyConditionExpression=b3.dynamodb.conditions.Key("site_id").eq(
+            "demo-abc123"))
+    assert [i["job_id"] for i in hist["Items"]] == [jid]
+
+
+def test_lease_does_not_lock_the_site_when_start_execution_failed(aws, monkeypatch):
+    """`start_execution` 失败 ⇒ job 退回 PENDING ⇒ 租约必须**不再**挡住这个站点。
+
+    这是我给租约设计自己挖的坑，必须钉住：`_rollback_job_to_pending` 把 job 退回
+    PENDING 是为了让用户重试，而 PENDING 既不是终态、也不会被 reconcile 的 sweeper
+    收敛（它只扫 RUNNING）。如果租约的判据写成"非终态即忙"，这个 job 就会**永远**
+    持有租约 ⇒ 该站点再也无法部署。
+
+    所以判据是"持有者还是 RUNNING 吗"。红的条件：换回按终态判之后这条必红。
+    """
+    import common
+    import server
+    monkeypatch.setenv("STATE_MACHINE_ARN",
+                       "arn:aws:states:us-east-1:1:stateMachine:sm")
+    doomed, retry = _ready_job(), _ready_job()
+
+    import botocore.exceptions
+    sfn = MagicMock()
+    sfn.start_execution.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "ExecutionLimitExceeded"}}, "StartExecution")
+    with patch.object(server, "_sfn", return_value=sfn):
+        with pytest.raises(botocore.exceptions.ClientError):
+            server.do_confirm_upload("a@x.com", doomed)
+    assert common.get_job(doomed)["status"] == "PENDING", "前提不成立：没退回 PENDING"
+
+    # 换一个 job 重新部署这个站点：不该被那份陈旧租约挡住
+    with patch.object(server, "_sfn", return_value=MagicMock()):
+        assert server.do_confirm_upload("a@x.com", retry)["status"] == "RUNNING"
+
+
+def test_same_job_can_retry_confirm_after_a_failed_start(aws, monkeypatch):
+    """同一个 job 重试 confirm_upload 时，自己那份租约不能挡住自己。"""
+    import server
+    monkeypatch.setenv("STATE_MACHINE_ARN",
+                       "arn:aws:states:us-east-1:1:stateMachine:sm")
+    import botocore.exceptions
+    jid = _ready_job()
+    sfn = MagicMock()
+    sfn.start_execution.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "ExecutionLimitExceeded"}}, "StartExecution")
+    with patch.object(server, "_sfn", return_value=sfn):
+        with pytest.raises(botocore.exceptions.ClientError):
+            server.do_confirm_upload("a@x.com", jid)
+    with patch.object(server, "_sfn", return_value=MagicMock()):
+        assert server.do_confirm_upload("a@x.com", jid)["status"] == "RUNNING"
+
+
+def test_takeover_plan_is_rejected_if_the_holder_becomes_running(aws, monkeypatch):
+    """"我读到持有者是陈旧的"必须**进最终事务**，读一下是不够的。
+
+    这是 Codex 2026-08-18 P1-1（check-then-act TOCTOU，实测复现）：
+    contender B 读到持有者 H 是 PENDING、判它陈旧；在 B 提交之前 H 重试成功
+    （自己变回 RUNNING 并续上租约）。只按 `holder_job_id = H` 判的顶替此刻照样
+    成立——从一个**已经 RUNNING** 的持有者手里把租约抢走，两次部署并行。
+
+    修法是顶替时附一条对 H 的 ConditionCheck（`#s <> RUNNING`），与租约切换
+    同一笔提交。本用例按同一交错执行：B 的计划先生成、H 后变 RUNNING、
+    B 再提交 ⇒ 必须被取消。
+    """
+    import boto3 as b3
+    import common
+    import server
+    monkeypatch.setenv("STATE_MACHINE_ARN",
+                       "arn:aws:states:us-east-1:1:stateMachine:sm")
+    h, b = _ready_job(), _ready_job()
+
+    # H 拿到租约后 start_execution 失败 ⇒ 回滚到 PENDING（持有租约的陈旧持有者）
+    import botocore.exceptions
+    sfn = MagicMock()
+    # 确定拒绝（ClientError）才会回滚成 PENDING——本用例要的就是 PENDING 持有者
+    sfn.start_execution.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "ExecutionLimitExceeded"}}, "StartExecution")
+    with patch.object(server, "_sfn", return_value=sfn):
+        with pytest.raises(botocore.exceptions.ClientError):
+            server.do_confirm_upload("a@x.com", h)
+    assert common.get_job(h)["status"] == "PENDING"
+
+    # B 读租约并生成计划：此刻 H 是 PENDING ⇒ 被判为陈旧持有者
+    plan_b = common.plan_deploy_lease("demo-abc123", b)
+    assert len(plan_b) == 2, "顶替陈旧持有者时必须附持有者状态的 ConditionCheck"
+
+    # H 在 B 提交之前重试成功：自己变回 RUNNING 并续上租约
+    with patch.object(server, "_sfn", return_value=MagicMock()):
+        assert server.do_confirm_upload("a@x.com", h)["status"] == "RUNNING"
+    assert common.read_deploy_lease("demo-abc123") == h
+
+    # B 现在才提交它早已生成的计划 ⇒ 必须被取消，租约仍归 H
+    ddb = b3.client("dynamodb")
+    with pytest.raises(Exception) as ei:
+        ddb.transact_write_items(TransactItems=plan_b)
+    assert "TransactionCanceled" in str(type(ei.value)) + str(ei.value)
+    assert common.read_deploy_lease("demo-abc123") == h, \
+        "从一个已经 RUNNING 的持有者手里把租约抢走了——两次部署会并行"
+
+
+def test_undeploy_is_rejected_while_a_deploy_is_running(aws, monkeypatch):
+    """部署 RUNNING 期间下线必须被拒（Codex 2026-08-18 P1-2）。
+
+    不拒的话：undeploy 删掉路由/函数/前端并清掉租约，而那次部署的状态机还在跑，
+    后续步骤会把刚下线的站点**重新建出来**（复活）——且租约一清，第三次部署也能
+    开跑。
+    """
+    import server
+    monkeypatch.setenv("STATE_MACHINE_ARN",
+                       "arn:aws:states:us-east-1:1:stateMachine:sm")
+    jid = _ready_job()
+    with patch.object(server, "_sfn", return_value=MagicMock()):
+        server.do_confirm_upload("a@x.com", jid)          # 部署 RUNNING，持有租约
+
+    with pytest.raises(server.AlreadyStarted, match="正在进行|刚刚开始"):
+        server.do_undeploy("a@x.com", "demo-abc123")
+
+
+def test_deploy_is_rejected_while_an_undeploy_is_running(aws, monkeypatch):
+    """反方向同样成立：下线进行中，新部署必须被拒。"""
+    import common
+    import server
+    monkeypatch.setenv("STATE_MACHINE_ARN",
+                       "arn:aws:states:us-east-1:1:stateMachine:sm")
+    common.upsert_site("demo-abc123", owner="a@x.com", status="ACTIVE")
+    with patch.object(server, "_lambda", return_value=MagicMock()):
+        out = server.do_undeploy("a@x.com", "demo-abc123")
+    jid = _ready_job()
+    with pytest.raises(server.AlreadyStarted, match="正在进行"):
+        with patch.object(server, "_sfn", return_value=MagicMock()):
+            server.do_confirm_upload("a@x.com", jid)
+    # 下线 job 终态后（undeploy Lambda 写 DELETED），部署恢复可用
+    import common
+    common.update_job(out["job_id"], status="DELETED")
+    with patch.object(server, "_sfn", return_value=MagicMock()):
+        assert server.do_confirm_upload("a@x.com", jid)["status"] == "RUNNING"
+
+
+def test_undeploy_job_is_running_with_kind_from_creation(aws, monkeypatch):
+    """undeploy 的 job 必须以 RUNNING + kind=undeploy **落库**，不是等 Lambda 运行时补。
+
+    RUNNING：租约判"持有者还在跑吗"看的是它——建成 PENDING 就留出一个租约形同
+    虚设的窗口。kind：异步 invoke 的事件被丢弃时 Lambda 根本没跑，job 没有 kind
+    ⇒ sweeper 把它当 deploy 去 DescribeExecution ⇒ 永远 orphan、永远不收敛。
+    """
+    import common
+    import server
+    common.upsert_site("demo-abc123", owner="a@x.com", status="ACTIVE")
+    with patch.object(server, "_lambda", return_value=MagicMock()):
+        out = server.do_undeploy("a@x.com", "demo-abc123")
+    job = common.get_job(out["job_id"])
+    assert job["status"] == "RUNNING"
+    assert job.get("kind") == "undeploy"
+    assert common.read_deploy_lease("demo-abc123") == out["job_id"], \
+        "undeploy 没有持有租约——它与部署的互斥就不存在"
+
+
+def test_uncertain_start_error_keeps_running_and_holds_the_lease(aws, monkeypatch):
+    """StartExecution **网络错误（结果不确定）** ⇒ 不回滚、保持 RUNNING、租约继续
+    挡住第二次部署（Codex 2026-08-18 R4 P1-2）。
+
+    "不确定"的含义：请求可能已到 SFN、执行在跑、只是响应丢了。此时回滚成
+    PENDING，租约会把持有者当陈旧放行 ⇒ 第二次部署与那条**可能活着**的执行并行
+    ——正是租约要消灭的交错。收敛交给 sweeper：按确定性 name 查证
+    ExecutionDoesNotExist 后判 FAILED（≤45 分钟），届时租约自动放开。
+
+    红的条件：job 被回滚成 PENDING、或第二次部署被放行。
+    """
+    import common
+    import server
+    monkeypatch.setenv("STATE_MACHINE_ARN",
+                       "arn:aws:states:us-east-1:1:stateMachine:sm")
+    first, second = _ready_job(), _ready_job()
+    sfn = MagicMock()
+    sfn.start_execution.side_effect = ConnectionError("网络中断（注入）")
+    with patch.object(server, "_sfn", return_value=sfn):
+        with pytest.raises(RuntimeError, match="结果不确定"):
+            server.do_confirm_upload("a@x.com", first)
+
+    assert common.get_job(first)["status"] == "RUNNING", \
+        "结果不确定却回滚了——执行可能活着，租约不该放"
+    with pytest.raises(server.AlreadyStarted, match="正在进行"):
+        with patch.object(server, "_sfn", return_value=MagicMock()):
+            server.do_confirm_upload("a@x.com", second)
+
+
+def test_uncertain_undeploy_invoke_error_keeps_running(aws):
+    """异步 undeploy invoke 网络错误（结果不确定）⇒ 不写 FAILED、租约不放。
+
+    事件可能已被 Lambda 受理、后台正在删路由/函数/数据；此刻写 FAILED 就是把
+    租约放给新部署，让它与一场进行中的下线并行。sweeper 的 20 分钟 undeploy
+    阈值负责"确实没起来"那一侧的收敛（kind 建库时已写，收敛必达）。
+    """
+    import common
+    import server
+    server.common.upsert_site("demo-abc123", owner="o@x.com", status="ACTIVE",
+                              tier="fullstack-nosql")
+    lam = MagicMock()
+    lam.invoke.side_effect = ConnectionError("网络中断（注入）")
+    with patch.object(server, "_lambda", return_value=lam):
+        with pytest.raises(RuntimeError, match="结果不确定"):
+            server.do_undeploy("o@x.com", "demo-abc123")
+    jobs = common.list_jobs_by_site("demo-abc123")
+    assert jobs and jobs[0]["status"] == "RUNNING", (
+        f"job 是 {jobs[0]['status'] if jobs else '缺失'}——不确定时写终态"
+        "就是把租约放给新部署，与进行中的下线并行")
+    assert common.read_deploy_lease("demo-abc123") == jobs[0]["job_id"]

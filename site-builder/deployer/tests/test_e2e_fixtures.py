@@ -872,3 +872,87 @@ def test_smoke_failure_after_the_commit_point_restores_the_whole_route_item(
     time.sleep(ROUTE_CACHE_WAIT)
     body = _health_body(url)
     assert m1 in body, f"恢复后公网不是 v1 的字节：{body[:300]}"
+
+
+def test_rev_less_legacy_route_can_still_roll_back_after_a_smoke_failure(
+        cfg, tmp_path):
+    """spec §5.5 的**存量形态**：路由上没有 `permissions_rev` 时同样能回滚。
+
+    这是 Codex 2026-08-17 P1-4。为什么原来那条 §5.5 用例证明不了它：它验的路由是
+    一次 M7 部署刚写出来的，`register_route` 必写 rev。而**生产上 6 条站点路由里
+    有 5 条没有 rev**（M3 之前写入的；实测只有 app-notes-01d147 有），
+    `_degrade_to_legacy` 退化的是 URL 与 alias，**没有**动 rev —— 于是那 8/8 全绿
+    与"真实存量路由能不能回滚"完全无关。
+
+    所以这里显式把 rev 从路由上 REMOVE 掉，做出真实存量形状，再走同一条
+    提交点之后失败的路径。
+
+    红的条件：路由没被写回（旧实现必红——它锚快照 rev，快照没有 rev 就一律放弃，
+    只留一条"需人工介入"）、或写回的不是整值。
+    """
+    site_id = _new_site_id()
+    m1 = _marker("revless")
+    url = _deploy(_variant(tmp_path / "pub", require_login=False),
+                  site_id=site_id, marker=m1)
+
+    # ── 退化成真实存量形状：路由上没有 permissions_rev ──────────────────
+    # 只 REMOVE 这一个属性，别的字段一律不动：这条用例要证明的是"缺 rev 不妨碍
+    # 回滚"，多改一个字段就分不清是哪一处起的作用。
+    _ddb().update_item(TableName=cfg["Platform"]["routing_table"],
+                       Key={"subdomain": {"S": f"app-{site_id}"}},
+                       UpdateExpression="REMOVE permissions_rev")
+    route_before = _route_item(cfg, site_id)
+    assert "permissions_rev" not in route_before, "退化没做干净，rev 还在"
+    live = _live_color(cfg, site_id)
+
+    job = _deploy_expected_to_fail(
+        _variant(tmp_path / "poison", server_js=_SMOKE_POISON_SERVER,
+                 require_login=False), site_id)
+    err = job.get("error", "")
+    assert "SmokeFailure" in err, f"失败不是冒烟阶段的，验不到恢复路径：{err}"
+    # 回滚成功 ⇒ 不该再有"需人工介入"那条提示
+    assert "人工" not in err, f"存量路由被判定为无法回滚：{err}"
+
+    after = _route_item(cfg, site_id)
+    assert after == route_before, (
+        "无 rev 的存量路由没被整值恢复——生产上 5/6 条站点路由是这个形状\n"
+        f"  切换前: {route_before}\n  失败后: {after}")
+    assert _live_color(cfg, site_id) == live, "恢复后线上颜色不是原来那一色"
+
+    time.sleep(ROUTE_CACHE_WAIT)
+    body = _health_body(url)
+    assert m1 in body, f"恢复后公网不是 v1 的字节：{body[:300]}"
+
+
+def test_successful_update_keeps_the_previous_frontend_prefix(cfg, tmp_path):
+    """spec §5.1 的补充：成功之后**上一版前缀还在桶里**。
+
+    这是 Codex 2026-08-17 P1-1。Edge 每个实例把整条路由缓存 60s，提交之后仍有
+    warm 实例按旧 `static_prefix` 改写请求；旧前缀被立刻删掉 ⇒ 那些实例打到不存在
+    的对象上，而前端桶是私有的 ⇒ **403 而不是 404**，最长约 60s。
+
+    原来那条 §5.1 用例证明不了这件事：它在 job 结束后先 `sleep(ROUTE_CACHE_WAIT)`
+    才验证，正好跳过整个故障窗口。
+
+    这里**不等**缓存收敛，直接看桶：判据是对象在不在，与缓存竞态无关，所以既稳定
+    又正好落在那个窗口上。旧实现必红（它删掉除当前 job 外的一切前缀）。
+    """
+    site_id = _new_site_id()
+    url = _deploy("nosql-notes", site_id=site_id, marker=_marker("p1"))
+    prefix_a = _route_item(cfg, site_id)["static_prefix"]["S"]
+
+    assert _deploy("nosql-notes", site_id=site_id, marker=_marker("p2")) == url
+    prefix_b = _route_item(cfg, site_id)["static_prefix"]["S"]
+    assert prefix_b != prefix_a, "前提不成立：两次部署的前缀相同"
+
+    bucket = f"site-frontend-{cfg['Platform']['account_id']}"
+    s3 = boto3.client("s3")
+
+    def _has(prefix):
+        return bool(s3.list_objects_v2(Bucket=bucket, Prefix=prefix + "/",
+                                       MaxKeys=1).get("KeyCount"))
+
+    assert _has(prefix_b), "线上正在服务的前缀不在桶里"
+    assert _has(prefix_a), (
+        f"上一版前缀 {prefix_a} 在成功之后就被删了——仍持有旧路由缓存的 Edge 实例"
+        "会 403，最长约 60s（M7 宣称的『更新原子化』在这一段不成立）")

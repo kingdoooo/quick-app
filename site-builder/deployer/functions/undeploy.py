@@ -158,8 +158,10 @@ def _undeploy(event, context):
     except iam.exceptions.NoSuchEntityException:
         pass
 
+    # 前缀格式的唯一定义在 common：整站删除与"按版本前缀清理"（mark_job）必须对
+    # 同一段路径达成一致，各写一份 f-string 的话，一边改了另一边就变成漏删或错删。
     _delete_prefix(boto3.client("s3"), os.environ["FRONTEND_BUCKET"],
-                   f"sites/{site_id}/")
+                   common.site_prefix_for(site_id))
 
     # 日志组随站点走（不属于"数据"，不受 purge_data 开关控制）：
     # 留着既是成本泄漏也把已下线站点的运行痕迹无限期保留。
@@ -210,6 +212,17 @@ def _undeploy(event, context):
                                 f"请联系平台管理员确认残留数据。")
     else:
         common.update_job(event["job_id"], status="DELETED")
+    # 部署租约行只能在**这里**（job 已写终态）之后收走，绝不能提前到删资源那段
+    # （独立评审 2026-08-18 Critical-1，交错已逐步核实）：租约一清，一个手里还有
+    # PENDING job 的用户就能立刻 confirm_upload 开始新部署——而本函数下面还在
+    # purge 数据、写 site=DELETED，会把那次部署刚建出来的表/schema 当场删掉
+    # （purge_data=True 时这个窗口有几十秒）。放在终态之后则纯属清理：终态一写，
+    # 租约按"持有者非 RUNNING"本来就已可抢，删行只是不留孤儿。
+    # 条件（持有者还是本 job）仍然要带：期间若有新 job 合法接管，删除自动放弃。
+    #
+    # **这不是"释放"**（正常结束靠"持有者已终态"自动让租约可抢，见 common 里
+    # 那段）；无条件删除会把别人正持有的租约顺手清掉（Codex 2026-08-18 P1-2）。
+    common.clear_deploy_lease(site_id, event["job_id"])
     # 审计（spec §5.5）：下线是不可恢复动作，purge_data 更是——必须留痕。
     # actor 取 job 的发起者（jobs.owner = requested_by），SFN 侧没有别的身份。
     # 落在最后：审计的是"确实完成了"，中途失败会走异常路径不落 ok。

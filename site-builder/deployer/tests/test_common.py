@@ -212,3 +212,136 @@ def test_get_job_consistent_read_is_opt_in(aws):
     assert "ConsistentRead" not in seen[0], f"默认调用带上了强一致读：{seen[0]}"
     assert seen[1].get("ConsistentRead") is True, (
         f"consistent=True 没有传到 get_item：{seen[1]}")
+
+
+def test_static_prefix_format_has_a_single_definition():
+    """前端版本前缀 `sites/{site_id}/{job_id}` 的格式**只允许在 common.py 里出现**。
+
+    这个不变量被四方共同依赖，而它们各自的失败模式互不相同、都很难从症状反推：
+
+      · `register_route` 写进路由表的 `static_prefix` —— Edge 按它改写 URI；
+        **尾斜杠多一个就整站 403**（拼出双斜杠，与上传的 key 不是同一个对象），
+        而两侧单测各自都会绿（CLAUDE.md 记的实测坑）；
+      · `upload_frontend` 按它拼 S3 key —— 与上面不一致就是"上传到了没人读的位置"；
+      · `mark_job._cleanup_old_versions` 按它决定保留谁 —— 不一致就是**删掉线上
+        正在服务的前端**；
+      · `mark_job._restore_route` 按它做补偿的条件 —— 不一致就是恢复静默停摆
+        （条件永远不成立）。
+
+    曾经这四处各手写一份 f-string，没有任何东西保证它们同义。本用例按源码钉死。
+    """
+    import ast
+    import re
+    from pathlib import Path
+    root = Path(__file__).parents[3]
+    canonical = (root / "site-builder" / "deployer" / "functions"
+                 / "common.py").resolve()
+    # `sites/` 后面紧跟一个 f-string 占位 = 在手搓这个 S3 键前缀。
+    #
+    # 两类**不算**，各有理由，所以判据不能只是 `sites/\{`：
+    #   · 裸字面量 `"sites/"`（不带占位）—— CDK 的 IAM 资源 ARN 里有
+    #     `.../sites/*`，那是同一段路径的**授权**表达，不是键的构造；
+    #   · 前面紧贴斜杠的 `/api/sites/{site_id}/...` —— panel 的 HTTP 路由与
+    #     verify 脚本调的接口路径，与 S3 键毫无关系。所以要求 `sites` 前面**不是**
+    #     路径分隔符或标识符字符，即它必须是字符串的开头那一段。
+    handmade = re.compile(r"(?<![\w/])sites/\{")
+    offenders = []
+    for py in (root / "site-builder").rglob("*.py"):
+        if any(part in py.parts for part in
+               (".venv", "cdk.out", "__pycache__", "tests")):
+            continue
+        if py.resolve() == canonical:
+            continue
+        try:
+            tree = ast.parse(py.read_text())
+        except SyntaxError:
+            continue
+        # 只看代码，不看注释与 docstring：解释这个格式为什么危险是允许的，
+        # 也是必要的。ast.unparse 已经把注释全部丢掉，再清掉 docstring 即可。
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.ClassDef)):
+                body = node.body
+                if (body and isinstance(body[0], ast.Expr)
+                        and isinstance(body[0].value, ast.Constant)
+                        and isinstance(body[0].value.value, str)):
+                    body[0].value.value = ""
+        if handmade.search(ast.unparse(tree)):
+            offenders.append(str(py.relative_to(root)))
+    assert not offenders, (
+        "这些文件手写了前端版本前缀的格式，必须改用 common.static_prefix_for / "
+        f"common.site_prefix_for：{offenders}")
+
+
+def test_static_prefix_carries_no_trailing_slash():
+    """路由表里的 `static_prefix` **不带**尾斜杠——Edge 的改写是
+    `f"/{static_prefix}{path}"` 且 `path` 已以 `/` 开头。"""
+    import common
+    assert common.static_prefix_for("s-1", "job-9") == "sites/s-1/job-9"
+    assert common.site_prefix_for("s-1") == "sites/s-1/"
+
+
+def test_route_api_target_reads_strongly_consistent(aws, monkeypatch):
+    """`route_api_target` 必须强一致读（Codex 2026-08-17 P1-4）。
+
+    它的返回值不是拿来展示的：`deploy_lambda_site` 用它推导 live color，进而决定
+    **哪个 alias 可以安全地改**。读到上一次切换之前的旧副本 ⇒ 把正在服务的那一色
+    当成空闲色 ⇒ `update_alias` 直接把未经健康门的新版本推到线上流量上。
+
+    按**发出去的参数**断言，不按返回值：最终一致读在 moto 上同样返回最新值，
+    只看返回值的用例对这个缺陷完全不敏感。
+    """
+    import boto3
+    import botocore.client
+    import common
+    seen = []
+    real = botocore.client.BaseClient._make_api_call
+
+    def _spy(self, op, params):
+        if op == "GetItem" and params.get("TableName") == "routing":
+            seen.append(params.get("ConsistentRead"))
+        return real(self, op, params)
+
+    monkeypatch.setattr(botocore.client.BaseClient, "_make_api_call", _spy)
+    boto3.client("dynamodb").put_item(TableName="routing", Item={
+        "subdomain": {"S": "app-s-1"},
+        "api_target": {"S": "https://g.lambda-url.us-east-1.on.aws"}})
+    common.route_api_target("s-1")
+    assert seen == [True], \
+        f"live color 的真源读不是强一致（ConsistentRead={seen}）"
+
+
+def test_no_literal_index_into_cancellation_reasons():
+    """事务取消原因列表**不许用整数字面量下标**——下标必须由构造处算出。
+
+    这一类已经出过三次同型写法（mcp.do_confirm_upload / mcp.do_undeploy /
+    register_route），前两处改成 `zip(labels, reasons)` 后第三处仍留着 `reasons[2]`
+    ——正是"修实例不修类"的形态。往 TransactItems 中间插一项时，写死的下标把
+    文案对到错误的原因上；在 register_route 那一处更糟：把"这是重放"误读成
+    "权限被并发修改"，一次**已经提交**的部署被报成 FAILED。
+
+    判据：任何名为 `reasons` 的变量不得被整数字面量下标（`reasons[0]` 这种）。
+    合法写法是 `zip(labels, reasons)` 或 `reasons[computed_idx]`。
+    """
+    import ast
+    from pathlib import Path
+    root = Path(__file__).parents[3]
+    offenders = []
+    for py in (root / "site-builder").rglob("*.py"):
+        if any(part in py.parts for part in
+               (".venv", "cdk.out", "__pycache__", "tests")):
+            continue
+        try:
+            tree = ast.parse(py.read_text())
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Subscript)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "reasons"
+                    and isinstance(node.slice, ast.Constant)
+                    and isinstance(node.slice.value, int)):
+                offenders.append(f"{py.relative_to(root)}:{node.lineno}")
+    assert not offenders, (
+        f"这些位置用整数字面量下标读 CancellationReasons：{offenders}——"
+        "改成 zip(labels, reasons) 或由构造处算出的下标")

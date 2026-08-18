@@ -63,10 +63,19 @@ class _FakeAWS:
                                                      "phase": "done"}}
         self.ddb = MagicMock()
         self.ddb.Table.return_value = self.table
+        # 低层 dynamodb client：部署租约走它（读租约行 + 事务拿租约）。
+        # **get_item 必须返回真的空 dict**，不能留 MagicMock：
+        # `read_deploy_lease` 判的是 `.get("Item")`，MagicMock 一律为真 ⇒ 会被当成
+        # "租约已被别人持有"，于是每条用例都在测一条与本意无关的分支。
+        self.ddb_client = MagicMock()
+        self.ddb_client.get_item.return_value = {}
+        self.ddb_client.exceptions.TransactionCanceledException = type(
+            "TransactionCanceledException", (Exception,), {})
         self.sfn = MagicMock()
         self.boto3 = MagicMock()
         self.boto3.client.side_effect = lambda name, **kw: {
-            "s3": self.s3, "stepfunctions": self.sfn}[name]
+            "s3": self.s3, "stepfunctions": self.sfn,
+            "dynamodb": self.ddb_client}[name]
         self.boto3.resource.side_effect = lambda name, **kw: self.ddb
 
     # ---- 断言用的取值口 ----
@@ -74,7 +83,19 @@ class _FakeAWS:
         return self.s3.put_object.call_args.kwargs["Body"]
 
     def job_item(self) -> dict:
-        return self.table.put_item.call_args.kwargs["Item"]
+        """job 记录（**反序列化成普通 dict**，调用方的断言不用关心 AttributeValue）。
+
+        job 的 Put 现在在"建 job + 拿租约"的**同一笔事务**里（P1-3：分开写的话，
+        租约被拒时会留下一条 RUNNING 却永远没有 execution 的 job），所以从
+        transact_write_items 的调用参数里取，而不是 resource Table 的 put_item。
+        """
+        for call in self.ddb_client.transact_write_items.call_args_list:
+            for it in call.kwargs["TransactItems"]:
+                item = it.get("Put", {}).get("Item")
+                if item and item.get("job_id"):
+                    return {k: (v.get("S") if "S" in v else int(v["N"]))
+                            for k, v in item.items()}
+        raise AssertionError("没有任何事务包含建 job 的 Put")
 
     def sites_key(self) -> dict:
         return self.table.update_item.call_args.kwargs["Key"]
@@ -87,6 +108,9 @@ class _FakeAWS:
 def aws(monkeypatch):
     fake = _FakeAWS()
     monkeypatch.setattr(df, "boto3", fake.boto3)
+    # common 用的是**它自己模块里**那个 boto3 名字：只 patch df.boto3 的话，
+    # 部署租约那两次调用会打到真 AWS（凭真凭据、真表名）。
+    monkeypatch.setattr(df.sb_common, "boto3", fake.boto3)
     monkeypatch.setattr(df, "_CFG", _fake_cfg())
     return fake
 
@@ -687,3 +711,75 @@ def test_job_record_pins_the_upload_etag_from_the_same_put(aws):
     _run(NOSQL)
     assert aws.job_item()["upload_etag"] == aws.s3.put_object.return_value["ETag"]
     assert aws.job_item()["upload_bytes"] == len(aws.zip_bytes())
+
+
+# ---------------------------------------------------------------------------
+# 部署租约 / execution 命名 / 起动失败收敛（Codex 2026-08-18 P1-3）
+# ---------------------------------------------------------------------------
+
+def test_fixture_names_the_execution_after_the_job(aws):
+    """start_execution 必须带 `name=job_id`。
+
+    sweeper 按 `{sm_arn}:{job_id}` 构造 execution ARN 去 DescribeExecution；
+    不传 name 时 AWS 自己起名，这个 job 卡住后 sweeper 查的永远是一个不存在的
+    ARN ⇒ 只记 orphan、不收敛 ⇒ 租约持有者永远 RUNNING，站点再也无法部署。
+    """
+    _run(NOSQL)
+    kw = aws.sfn.start_execution.call_args.kwargs
+    assert kw.get("name") == aws.job_item()["job_id"], \
+        f"execution 没有按 job_id 命名：{kw.get('name')!r}"
+
+
+def test_fixture_creates_job_and_lease_in_one_transaction(aws):
+    """建 job 与拿租约必须是**同一笔**事务。
+
+    分开写的话，租约被拒时已经留下一条 RUNNING 却永远没有 execution 的 job——
+    污染部署历史，sweeper 只会把它记成 orphan。
+    """
+    _run(NOSQL)
+    tx = [c.kwargs["TransactItems"]
+          for c in aws.ddb_client.transact_write_items.call_args_list]
+    with_job = [items for items in tx
+                if any("job_id" in it.get("Put", {}).get("Item", {})
+                       for it in items)]
+    assert len(with_job) == 1, "建 job 的事务不止一笔或不存在"
+    ops = with_job[0]
+    has_lease = any("holder_job_id" in str(it.get("Update", {}))
+                    for it in ops)
+    assert has_lease, "建 job 的那笔事务里没有租约——两者不是原子的"
+
+
+def test_fixture_rolls_the_job_back_when_start_execution_fails(aws):
+    """start_execution 失败 ⇒ 条件回滚到 PENDING（与 MCP 同语义）。
+
+    不回滚的话 job 停在 RUNNING 且没有 execution：sweeper 只记 orphan，
+    租约判"持有者 RUNNING"永远为真 ⇒ **站点永久锁死**——这正是"无释放租约"
+    设计里唯一不能容忍的失败模式。
+    """
+    import botocore.exceptions
+    aws.sfn.start_execution.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "ExecutionLimitExceeded"}}, "StartExecution")
+    with pytest.raises(botocore.exceptions.ClientError):
+        df.main(str(NOSQL))
+    rollbacks = [c.kwargs for c in aws.ddb_client.update_item.call_args_list
+                 if ":pending" in str(c.kwargs.get("ExpressionAttributeValues"))]
+    assert rollbacks, "确定被拒后没有回滚 job——用户无法重试"
+    cond = rollbacks[0].get("ConditionExpression", "")
+    assert ":running" in str(rollbacks[0]["ExpressionAttributeValues"]) \
+        and "phase" in cond, \
+        "回滚没带『还没有任何步骤跑过』的条件——会踩掉真在跑的任务"
+
+
+def test_fixture_keeps_running_on_an_uncertain_start_error(aws):
+    """网络类错误（结果不确定）⇒ **不回滚**（Codex 2026-08-18 R4 P1-2）。
+
+    请求可能已到 SFN、执行在跑；回滚成 PENDING 会让租约把它当陈旧持有者放行 ⇒
+    两条执行并行。保持 RUNNING，收敛交给 sweeper 按确定性 name 查证。
+    """
+    aws.sfn.start_execution.side_effect = RuntimeError("网络中断（注入）")
+    with pytest.raises(RuntimeError):
+        df.main(str(NOSQL))
+    rollbacks = [c.kwargs for c in aws.ddb_client.update_item.call_args_list
+                 if ":pending" in str(c.kwargs.get("ExpressionAttributeValues"))]
+    assert not rollbacks, \
+        "结果不确定却回滚了——执行可能活着，第二次部署会与它并行"

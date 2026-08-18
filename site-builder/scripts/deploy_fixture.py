@@ -29,6 +29,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import boto3
+import botocore.exceptions
+
+# common.py：per-site 部署租约的唯一定义。本脚本**绕过 MCP 直接 start_execution**，
+# 所以"同一站点同时只有一次部署"这条闸门必须在这里也走一遍——只在 MCP 那侧拿租约
+# 的话，这个脚本就是那道闸门的一个后门，而它正是 E2E 用来反复部署同一站点的工具。
+sys.path.insert(0, str(Path(__file__).parents[1] / "deployer" / "functions"))
+import common as sb_common      # noqa: E402
 
 CFG_PATH = Path(__file__).parents[1] / "config.ini"
 _CFG: configparser.ConfigParser | None = None
@@ -166,15 +173,75 @@ def main(fixture_dir: str, owner: str = "fixture@test", *,
     # ETag 取**上面那次 put_object 的返回**，不为此再 HEAD 一次：第二次 HEAD 可能
     # 已经看到另一个对象（与 mcp/server.py 里同一条理由）。
     # upload_bytes 只是审计字段，真正的校验是 validate 对 ContentLength 那一次。
-    boto3.resource("dynamodb", region_name="us-east-1").Table(
-        conf["Deployer"]["jobs_table"]).put_item(Item={
-            "job_id": job_id, "site_id": site_id, "owner": owner,
-            "status": "PENDING", "phase": "submitted", "error": "", "url": "",
-            "upload_etag": put["ETag"], "upload_bytes": len(body),
-            "created_at": now, "updated_at": now})
-    boto3.client("stepfunctions", region_name="us-east-1").start_execution(
-        stateMachineArn=conf["Deployer"]["state_machine_arn"],
-        input=json.dumps({"job_id": job_id, "site_id": site_id}))
+    # per-site 部署租约。**在 start_execution 之前**：拿不到就一个 execution 都不起。
+    # 判定与条件都来自 common（唯一定义）；这里只把拒绝翻成一句人能读的话。
+    # 走 os.environ 是因为 common 从环境变量取表名（它本来是 Lambda 里的模块）。
+    import os
+    os.environ["JOBS_TABLE"] = conf["Deployer"]["jobs_table"]
+    try:
+        lease_items = sb_common.plan_deploy_lease(site_id, job_id)
+    except sb_common.DeployInProgress as e:
+        raise SystemExit(f"拒绝部署：{e}") from e
+    ddb = boto3.client("dynamodb", region_name="us-east-1")
+    try:
+        # **建 job 与拿租约同一笔事务**（Codex 2026-08-18 P1-3）：先 put 后拿租约
+        # 的话，租约被拒时已经留下一条 RUNNING 却永远没有 execution 的 job——
+        # 污染部署历史，且 sweeper 只会把它记成 orphan。
+        # **RUNNING，不是 PENDING**：本脚本紧接着就 start_execution。租约判
+        # "持有者还在跑吗"看的是 RUNNING；sweeper 也只扫 RUNNING。
+        ddb.transact_write_items(TransactItems=[
+            {"Put": {"TableName": conf["Deployer"]["jobs_table"],
+                     "Item": {"job_id": {"S": job_id}, "site_id": {"S": site_id},
+                              "owner": {"S": owner},
+                              "status": {"S": "RUNNING"}, "phase": {"S": "queued"},
+                              "error": {"S": ""}, "url": {"S": ""},
+                              "upload_etag": {"S": put["ETag"]},
+                              "upload_bytes": {"N": str(len(body))},
+                              "created_at": {"S": now}, "updated_at": {"S": now}}}},
+            *lease_items])
+    except ddb.exceptions.TransactionCanceledException as e:
+        # 两个请求同时读到"空闲"时只有一个的条件成立。job 的 Put 在同一笔里，
+        # 所以被拒时**什么都没写下**。
+        raise SystemExit(
+            f"拒绝部署：站点 {site_id} 有另一次部署刚刚开始") from e
+    try:
+        # **name=job_id 不可省**（Codex 2026-08-18 P1-3）：sweeper 按
+        # `{sm_arn}:{job_id}` 构造 execution ARN 去 DescribeExecution。不传 name
+        # 时 AWS 自己生成名字，这个 job 卡住后 sweeper 查的永远是一个不存在的
+        # ARN ⇒ 只记 orphan、不收敛 ⇒ 租约永远 busy，站点再也无法部署。
+        # 顺带获得与 MCP 相同的幂等语义（同 name 同 input 的重复调用是安全的）。
+        boto3.client("stepfunctions", region_name="us-east-1").start_execution(
+            stateMachineArn=conf["Deployer"]["state_machine_arn"],
+            name=job_id,
+            input=json.dumps({"job_id": job_id, "site_id": site_id}))
+    except botocore.exceptions.ClientError:
+        # **确定被拒**（SFN 收到并拒绝）⇒ 条件回滚到 PENDING（与 MCP 的
+        # `_rollback_job_to_pending` 同语义：只有"还没有任何步骤跑过"才回滚）。
+        # 回滚成 PENDING 后持有者不再是 RUNNING，下一次部署可按"陈旧持有者"
+        # 顶掉租约。
+        try:
+            ddb.update_item(
+                TableName=conf["Deployer"]["jobs_table"],
+                Key={"job_id": {"S": job_id}},
+                UpdateExpression="SET #s = :pending, phase = :p",
+                ConditionExpression="#s = :running AND phase = :queued",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={
+                    ":pending": {"S": "PENDING"}, ":p": {"S": "submitted"},
+                    ":running": {"S": "RUNNING"}, ":queued": {"S": "queued"}})
+        except Exception:
+            pass    # 回滚失败不能盖掉 start_execution 的原始错误（那才是根因）
+        raise
+    except Exception:
+        # **结果不确定**（网络错误——非 ClientError）⇒ **不回滚**（Codex
+        # 2026-08-18 R4 P1-2，与 MCP 同一处置）：请求可能已到 SFN、执行在跑。
+        # 回滚成 PENDING 会让租约把它当陈旧持有者放行 ⇒ 两条执行并行。保持
+        # RUNNING：真在跑 ⇒ 正常推进；没起来 ⇒ sweeper 按确定性 name 查证
+        # ExecutionDoesNotExist 后收敛（≤45 分钟），租约随之放开。
+        print(f"  ⚠️  start_execution 网络错误、结果不确定：job {job_id} 保持 "
+              "RUNNING。若执行已在跑会正常推进；否则 sweeper 会在 ≤45 分钟内"
+              "判定失败。", file=sys.stderr)
+        raise
 
     jobs = boto3.resource("dynamodb", region_name="us-east-1").Table(
         conf["Deployer"]["jobs_table"])

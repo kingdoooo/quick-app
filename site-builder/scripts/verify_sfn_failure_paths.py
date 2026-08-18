@@ -105,7 +105,14 @@ def main() -> int:
     jobs_t = os.environ["JOBS_TABLE"]
 
     def new_probe_job(site_id: str) -> str:
-        """建一条探针 job（不起真实部署）。"""
+        """建一条探针 job（不起真实部署）。
+
+        **故意不拿部署租约**（deploy_fixture.py 拿，本脚本不拿）：探针的
+        site_id 是本脚本自造的 `sfnprobe-*`，没有任何真实部署/下线会与它
+        竞争同一把租约；探针 execution 的 input 也不带 job_id，起来即被
+        stop 或在第一步失败，不会碰任何站点资源。给它接租约只会让这个
+        只读闸门多两次写。若将来探针改用真实 site_id，这个豁免就不成立。
+        """
         jid = f"job-sfnprobe-{SUFFIX}-{uuid.uuid4().hex[:6]}"
         probe_jobs.add(jid)
         now = common._now()

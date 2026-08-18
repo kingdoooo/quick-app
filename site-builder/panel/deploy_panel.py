@@ -194,8 +194,17 @@ def role_statements() -> list[dict]:
          "Action": ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:Scan",
                     "dynamodb:UpdateItem", "dynamodb:ConditionCheckItem"],
          "Resource": [f"{tbl}/site-sites", f"{tbl}/site-sites/index/*"]},
+        # UpdateItem + ConditionCheckItem 各堵一个真机才可见的洞（moto 不校验
+        # IAM，单测发现不了）：
+        #   · UpdateItem —— ①部署租约（jobs 表里的 site-lease#* 行，undeploy 的
+        #     建 job 事务要 Update 它）；②invoke 失败时的就地收敛
+        #     `update_job(status=FAILED)`——**这条一直需要而一直没给**，真机上
+        #     invoke 失败的 job 会因 AccessDenied 收敛不了，永远显示进行中；
+        #   · ConditionCheckItem —— 顶替陈旧租约持有者时对持有者 job 的状态
+        #     ConditionCheck（common.plan_deploy_lease）。
         {"Sid": "JobsReadAndCreate", "Effect": "Allow",
-         "Action": ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:PutItem"],
+         "Action": ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:PutItem",
+                    "dynamodb:UpdateItem", "dynamodb:ConditionCheckItem"],
          "Resource": [f"{tbl}/site-deploy-jobs",
                       f"{tbl}/site-deploy-jobs/index/*"]},
         {"Sid": "AdminsViaPermissionsModule", "Effect": "Allow",

@@ -1,12 +1,15 @@
 """SFN 步骤 4：per-site 执行角色 + 站点 Lambda——zip + LWA Layer（禁止镜像模式）。
 站点代码不可信：角色带 PermissionsBoundary，inline policy 精确到本站点资源。"""
 import json
+import logging
 import os
 import time
 
 import boto3
 
 import common
+
+logger = logging.getLogger()
 
 LWA_LAYER = "arn:aws:lambda:us-east-1:753240598075:layer:LambdaAdapterLayerX86:28"
 
@@ -176,11 +179,35 @@ def handler(event, context):
         # 未经健康门的代码留在 $LATEST 上，而未迁移站点的 Function URL 正挂在
         # $LATEST，等于当场上线。
         urls = _color_urls(lam, fn)
-        live = _live_color(common.route_api_target(event["site_id"]), urls)
-        if live is None and not urls:
+        target = common.route_api_target(event["site_id"])
+        live = _live_color(target, urls)
+        # **判据是"路由指着的东西认不认得"，不是"有没有颜色 URL"。**
+        #
+        # 原来写的是 `live is None and not urls`，那个 AND 漏掉了**半迁移**状态：
+        # 迁移脚本的健康门失败时（migrate_sites_to_blue_green 的
+        # `skipped:unhealthy` 分支）会留下 blue alias + blue URL 而**故意不切
+        # 路由**，于是 `urls` 非空、`live` 仍是 None ⇒ 闸门放行 ⇒ 下面
+        # `update_function_code` 推 $LATEST，而路由此刻正指着无 qualifier 的
+        # URL（= $LATEST）⇒ 未经健康门的新代码当场上线。那正是本闸门要挡的事
+        # （M7-SPEC §4.3，v1 被驳回的 P1-1 同一形态；Codex 2026-08-17 P1-3
+        # 复现）。
+        #
+        # **不能收成 `if live is None: raise`**：那会把一个合法状态也拒死——
+        # 首次部署在 deploy_lambda_site 之后、register_route 提交之前失败时，
+        # 函数与 blue alias/URL 都已存在而路由**根本不存在**，此时 target 是
+        # `""`、live 是 None，但线上没有任何入口指向 $LATEST（M7 建的站点从不给
+        # $LATEST 挂 URL），重试是安全且必要的。收成那样这个站点将永远无法再
+        # 部署，且报的是"去跑迁移脚本"——一条根本不适用的指引。
+        #
+        # 所以条件是"**有**路由、但它指向的不是任何一个颜色"：既盖住未迁移
+        # （指向 $LATEST 的 URL）、半迁移（同上，只是多了个 blue URL），也盖住
+        # 认不出的第三方 target；而"没有路由"落在首次部署那一支。
+        if live is None and target:
             raise UnmigratedSite(
-                f"{fn} 还没进 blue/green 模型（路由指向无 qualifier 的 Function "
-                "URL）。先跑 scripts/migrate_sites_to_blue_green.py，再重试部署。")
+                f"{fn} 的路由指向 {target}，它不是 blue/green 任何一色的 Function "
+                "URL（未迁移，或上次迁移只做了一半：alias/URL 已建但路由还在 "
+                "$LATEST）。先跑 scripts/migrate_sites_to_blue_green.py 把路由切到"
+                "某个颜色，再重试部署。")
         color = _idle_color(live)
         lam.update_function_code(FunctionName=fn, **code)
         lam.get_waiter("function_updated").wait(FunctionName=fn)
@@ -224,22 +251,71 @@ def handler(event, context):
         url = lam.create_function_url_config(FunctionName=fn, Qualifier=color,
                                              AuthType="AWS_IAM")["FunctionUrl"]
     except lam.exceptions.ResourceConflictException:
-        url = lam.get_function_url_config(FunctionName=fn,
-                                          Qualifier=color)["FunctionUrl"]
+        cfg = lam.get_function_url_config(FunctionName=fn, Qualifier=color)
+        url = cfg["FunctionUrl"]
+        # **AuthType 必须读回核对，不能"存在即当对"**（Codex 2026-08-18 P1-5A）：
+        # 已有 URL 被漂移成 NONE 时，create 报 Conflict、get 照样给出 URL，
+        # 下面的语句替换又只管我们自己那两条 sid——于是一个**公开可达**的候选色
+        # 会被原样提交，新后端绕过 Edge 的全部鉴权直接暴露公网。健康门是
+        # `lambda:invoke` 直调，发现不了；smoke 打的是 Edge 域名，也发现不了。
+        # 改回来而不是抛错：AWS_IAM 就是本平台的唯一合法值，自愈是安全方向。
+        if cfg.get("AuthType") != "AWS_IAM":
+            logger.warning(f"{fn}:{color} 的 Function URL AuthType 是 "
+                           f"{cfg.get('AuthType')!r}（漂移），改回 AWS_IAM")
+            lam.update_function_url_config(FunctionName=fn, Qualifier=color,
+                                           AuthType="AWS_IAM")
+
+    # **清掉这一色 resource policy 里所有非预期语句**（同一条 P1-5A 的另一半）：
+    # 我们只维护两条 sid，但漂移/篡改可以用**别的** sid 塞进 Principal:* 之类的
+    # 额外授权，只替换自己那两条清不掉它们。候选色此刻不在路由上（挂 URL 与授权
+    # 都在健康门之后、提交点之前），删语句对线上零影响；删失败让它抛——
+    # 这是提交点之前，fail-closed 是安全方向。
+    _EXPECTED_SIDS = ("edge-invoke", "edge-invoke-function")
+    try:
+        policy = json.loads(lam.get_policy(FunctionName=fn,
+                                           Qualifier=color)["Policy"])
+        # 只收**有 Sid** 的语句：Lambda 的 add_permission 必然写 Sid，所以
+        # Sid 缺失今天不可达；但真出现时 remove_permission(StatementId=None)
+        # 是一个难读的 ParamValidationError，而不是这段 fail-closed 的本意。
+        stray = [s["Sid"] for s in policy.get("Statement", [])
+                 if s.get("Sid") and s["Sid"] not in _EXPECTED_SIDS]
+    except lam.exceptions.ResourceNotFoundException:
+        stray = []          # 还没有任何 policy（URL 是刚建的）
+    for sid in stray:
+        logger.warning(f"{fn}:{color} 的 resource policy 有非预期语句 {sid!r}"
+                       "（漂移/篡改），删除")
+        lam.remove_permission(FunctionName=fn, Qualifier=color, StatementId=sid)
     # 2025-10 起新建 Function URL 需要 InvokeFunctionUrl + InvokeFunction 两个权限
     # （AWS 官方文档 urls-auth）；只给前者会让 Edge 调用返回 403。
     # InvokedViaFunctionUrl 把 InvokeFunction 限定为仅经 Function URL 调用。
     # **权限也要带 Qualifier**：不带就授在函数上，与"URL 只挂在颜色上"不一致。
+    # **冲突时替换，不是忽略**（Codex 2026-08-17 P1-5）：同名 StatementId 已存在只
+    # 说明"有一条语句叫这个名字"，不说明**它的内容是对的**。一条内容错误的同名语句
+    # （principal 不对、少了 Qualifier、少了 InvokedViaFunctionUrl）会让 Edge 调用
+    # 403，而这条路径上没有任何东西能发现它：健康门是 `lambda:invoke` 直调，压根
+    # 不经过 Function URL 的授权；提交点之后的 smoke 又可能命中 Edge 的旧路由缓存
+    # 而对**旧**目标返回 200。于是缓存过期之后整站才开始 403。
+    # remove→add 期间这一色还没有任何路由指向它（挂 URL 与授权都在健康门之后、
+    # 提交点之前），所以那个瞬间对线上零影响。
     for sid, action, extra in (
             ("edge-invoke", "lambda:InvokeFunctionUrl",
              {"FunctionUrlAuthType": "AWS_IAM"}),
             ("edge-invoke-function", "lambda:InvokeFunction",
              {"InvokedViaFunctionUrl": True})):
-        try:
-            lam.add_permission(FunctionName=fn, Qualifier=color, StatementId=sid,
-                               Action=action, Principal=edge_role_arn, **extra)
-        except lam.exceptions.ResourceConflictException:
-            pass
+        for attempt in range(2):
+            try:
+                lam.add_permission(FunctionName=fn, Qualifier=color,
+                                   StatementId=sid, Action=action,
+                                   Principal=edge_role_arn, **extra)
+                break
+            except lam.exceptions.ResourceConflictException:
+                # **最后一轮还冲突就抛出去**，不要让循环自然结束：自然结束等于把
+                # "授权可能是错的"静默咽下，而那正是本改动要消除的形态。
+                if attempt == 1:
+                    raise
+                # 删掉那条同名语句再重加一次。
+                lam.remove_permission(FunctionName=fn, Qualifier=color,
+                                      StatementId=sid)
 
     # **只是候选**：真正上线由 register_route 那一次 put_item 完成（唯一提交点）。
     # 本步骤到此为止没有写过路由表——失败对线上零影响就是靠这条。

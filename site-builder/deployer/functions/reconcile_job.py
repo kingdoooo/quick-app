@@ -27,6 +27,12 @@ logger.setLevel(logging.INFO)
 # 终态：这些状态的 job 不得被覆盖。
 # PURGE_FAILED（M3 修复引入）："站点已下线但数据没清干净"——它是终态，
 # 不能被 sweeper 再收敛成 FAILED（那会把"URL 已失效"说成"下线失败"）。
+#
+# **它是文档与用例的登记表，不是运行时判据**：收敛的真正闸门是
+# `converge_job_to_failed` 的 `#s = :running` 条件（任何非 RUNNING 都不动），
+# 部署租约判"持有者还在跑吗"用的也是 RUNNING（common.plan_deploy_lease，
+# 那里解释了为什么**不能**改成"非终态即忙"——PENDING 会把站点永久锁死）。
+# 新增终态仍要登记到这里：test_purge_failed_is_registered_terminal 按它断言。
 TERMINAL = ("SUCCEEDED", "FAILED", "DELETED", "PURGE_FAILED")
 
 # undeploy job 的超龄阈值。比 STALE_MINUTES 短得多：undeploy 是单个异步
@@ -48,11 +54,86 @@ STALE_MINUTES = 45
 TIMEOUT_ERROR = ("部署执行超时已被系统终止（超过 30 分钟上限）。"
                  "请重新发起一次部署（会生成新任务）。")
 ABORT_ERROR = ("部署执行已被中止。请重新发起一次部署（会生成新任务）。")
+# 部署 job 超龄且**没有对应 execution**（按确定性 name 查证）：start 从未发生。
+# 措辞要点出"没有任何改动"——这一态与 TIMED_OUT（跑了一半）的处置完全不同。
+ORPHANED_ERROR = ("部署执行未能启动（未找到对应的执行记录，站点未做任何改动）。"
+                  "请重新发起一次部署（会生成新任务）。")
+
 _REASON_ERROR = {"TIMED_OUT": TIMEOUT_ERROR, "ABORTED": ABORT_ERROR,
                  "FAILED": ABORT_ERROR,
+                 "ORPHANED": ORPHANED_ERROR,
                  "UNDEPLOY_ORPHAN": UNDEPLOY_ORPHAN_ERROR}
 
 _sfn_client = None
+
+
+def _compensate_committed_route(job_id: str) -> str | None:
+    """**收敛之前**：这条 job 若已提交过路由，先做与 MarkFailed 相同的幂等补偿，
+    返回被放弃时的说明（成功/无事可做返回 None）。
+
+    这是收敛闭环缺的另一半（Codex 2026-08-18 P1-4）：TIMED_OUT / ABORTED、以及
+    "MarkFailed 自己重试耗尽后 SFN FAILED"都**不执行任何 State**，于是路由补偿
+    没人做。
+
+    **必须先补偿、后写终态**（Codex 2026-08-18 R4 P1-1）：部署租约判"忙"看的是
+    holder 的 RUNNING，converge 一写 FAILED 租约即可被抢——补偿还没跑时新部署
+    就会在"已提交但未回滚"的路由上开跑，随后补偿再把路由写回它正在改的那个色。
+    job 还是 RUNNING 时补偿是安全的：补偿条件锚的是"线上还是这条 job 提交的
+    那份"，与 job 状态无关。
+
+    补偿函数与 MarkFailed **同一份**（`mark_job._restore_route`，自带全部幂等与
+    放弃判定；M/NULL 解码也只活在它那一处的回落里）。`route_commit` 缺席 =
+    从未提交或不是 deploy job ⇒ 路由一个字不动。job 已非 RUNNING ⇒ 别的写入者
+    （MarkFailed）已经处理过，这里不重复。
+
+    自身失败只告警不外溢：让补偿的异常打断 sweeper 的整轮扫描，会把一个站点的
+    问题放大成所有站点都不收敛；converge 仍会执行（宁可"终态但没补偿+响亮日志"
+    也不要"永远 RUNNING 卡死整站"——那才是把可用性押给一次读失败）。
+    """
+    import mark_job     # 同目录同产物；函数级 import 免得拖累无关调用的冷启
+    try:
+        item = _ddb().get_item(TableName=os.environ["JOBS_TABLE"],
+                               Key={"job_id": {"S": job_id}},
+                               ConsistentRead=True).get("Item") or {}
+        if item.get("status", {}).get("S") != "RUNNING":
+            return None     # 已被 MarkFailed/上一轮收敛处理，不重复
+        # **不按 route_commit 的有无提前返回**：有没有提交、要不要恢复、以及
+        # "升级窗口老代码 execution 没有 route_commit 但确实提交过"的启发式
+        # 判定，全部在 _restore_route 里（唯一定义）。这里多判一次就是那套
+        # 判定的第二份手抄。
+        note = mark_job._restore_route(
+            {"job_id": job_id, "site_id": item["site_id"]["S"]})
+        logger.info(f'{{"event":"route_compensated","job_id":"{job_id}",'
+                    f'"abandoned":{"true" if note else "false"}}}')
+        return note
+    except Exception:       # noqa: BLE001
+        # **读失败 ≠ 无需补偿**（Codex 2026-08-18 R5 P1）：返回 None 会让
+        # _compensate_then_converge 把它当"没有补偿问题"，job 收敛成 FAILED 而
+        # error 里没有任何人工处置提示——操作者完全不知道要去查路由。
+        # 这里是**最后一环**，仍然收敛（不收敛 = 站点永久锁死），但必须把
+        # "路由状态未知"如实写进 job。
+        logger.exception("收敛前的路由补偿失败 job_id=%s——路由可能仍停在该次"
+                         "部署的新目标上，需人工核对", job_id)
+        return mark_job.ROUTE_RESTORE_FAILED
+
+
+def _compensate_then_converge(job_id: str, reason: str) -> str:
+    """补偿 → **一次写**收敛（终态与最终错误文案同一个 UpdateItem）。
+
+    **不许先写终态、再补一笔 error**（Codex 2026-08-19 R6 P2）：两笔写之间
+    第二笔可以暂时失败，而重试进来时 job 已经 FAILED——补偿因非 RUNNING 跳过、
+    converge 是 noop，**那条"路由可能没回滚、需人工核对"的提示再也没有机会
+    写回**。操作者最终只看到普通的"执行超时"，一个已知"路由状态未知"的场景
+    静默退化成 false-green 运维信号。合成最终文案再一次写入，窗口不存在。
+
+    截断纪律与 mark_job.handler 相同：砍原因、不砍提示。
+    """
+    note = _compensate_committed_route(job_id)
+    error = None
+    if note:
+        base = _REASON_ERROR.get(reason, ABORT_ERROR)
+        error = f"{base[:max(0, 500 - len(note) - 3)]} | {note}"
+    return converge_job_to_failed(job_id, reason=reason, error=error)
 
 
 def _state_machine_arn() -> str:
@@ -80,8 +161,13 @@ def _ddb():
         "dynamodb", region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
 
 
-def converge_job_to_failed(job_id: str, *, reason: str) -> str:
+def converge_job_to_failed(job_id: str, *, reason: str,
+                           error: str | None = None) -> str:
     """把停在 RUNNING 的 job 条件收敛为 FAILED。返回 converged/noop/absent。
+
+    `error`：**最终**错误文案（缺省按 reason 查 `_REASON_ERROR`）。带补偿提示的
+    调用方（_compensate_then_converge）必须把合成好的文案从这里**一次写入**——
+    终态与文案分两笔写的话，第二笔失败 + 重试 = 提示永久丢失（R6 P2）。
 
     条件三条，缺一不可：
       · attribute_exists(job_id) —— UpdateItem 默认是 upsert，缺这条会给一个
@@ -92,7 +178,7 @@ def converge_job_to_failed(job_id: str, *, reason: str) -> str:
 
     保留最后 phase（诊断用），只改 status / error / updated_at。
     """
-    error = _REASON_ERROR.get(reason, ABORT_ERROR)
+    error = error or _REASON_ERROR.get(reason, ABORT_ERROR)
     try:
         _ddb().update_item(
             TableName=os.environ["JOBS_TABLE"],
@@ -149,8 +235,10 @@ def handler(event, context):
     if not job_id:
         logger.error('{"event":"missing_execution_arn"}')
         return {"job_id": "", "outcome": "ignored"}
-    return {"job_id": job_id, "outcome": converge_job_to_failed(job_id,
-                                                                reason=status)}
+    # 补偿在 converge **之前**（_compensate_committed_route 的 docstring）：
+    # 它自带"非 RUNNING 即跳过"，所以早已终态的 job 不会被白惊动。
+    return {"job_id": job_id,
+            "outcome": _compensate_then_converge(job_id, status)}
 
 
 def sweeper_handler(event, context):
@@ -211,14 +299,38 @@ def sweeper_handler(event, context):
                     executionArn=arn)["status"]
             except botocore.exceptions.ClientError as e:
                 code = e.response["Error"]["Code"]
-                if code in ("ExecutionDoesNotExist", "ValidationException"):
+                if code == "ExecutionDoesNotExist":
+                    # **收敛，不再只记 orphan**（Codex 2026-08-18 R4 P1-2 的
+                    # 配套）。这不是猜：execution name == job_id 是两个入口
+                    # （MCP 与 deploy_fixture）都钉死的约定，且 execution 结束后
+                    # 记录保留 90 天——"这个 name 不存在"就是"start 从未发生"的
+                    # 权威证词。而且这一态现在是**合法可达**的：StartExecution
+                    # 网络错误但结果不确定时，入口保持 RUNNING（不回滚），把
+                    # 核实交给这里——不收敛的话租约永远 busy，站点永久锁死。
+                    logger.error(f'{{"event":"job_running_without_execution",'
+                                 f'"job_id":"{job_id}","action":"converge"}}')
+                    # **直接收敛，不走补偿**：execution 从未存在 ⇒ register_route
+                    # 从未运行 ⇒ route_commit 不可能存在（它是 execution 内部与
+                    # 路由提交同一笔写下的）。走补偿路径只会多两次读，且读一旦
+                    # 抖动还会把"路由可能没回滚"的 note 粘到"站点未做任何改动"
+                    # 的文案上——自相矛盾。
+                    if converge_job_to_failed(
+                            job_id, reason="ORPHANED") == "converged":
+                        converged += 1
+                    continue
+                if code == "ValidationException":
+                    # ARN 拼不出来（job_id 形态异常？）——**这才是不能猜的那种**：
+                    # 无法核实 execution 状态，收敛可能杀掉一个活着的执行。
                     orphans += 1
                     logger.error(f'{{"event":"job_running_without_execution",'
-                                 f'"job_id":"{job_id}"}}')
+                                 f'"job_id":"{job_id}","action":"skip"}}')
                     continue
                 raise
             if ex_status in ("TIMED_OUT", "ABORTED", "FAILED"):
-                if converge_job_to_failed(job_id, reason=ex_status) == "converged":
+                # FAILED 也要补偿：execution FAILED 而 job 还停在 RUNNING 意味着
+                # MarkFailed 自己重试耗尽都没跑成——路由补偿没人做过。
+                # 补偿在 converge 之前（P1-1 的同一条顺序纪律）。
+                if _compensate_then_converge(job_id, ex_status) == "converged":
                     converged += 1
         start_key = resp.get("LastEvaluatedKey")
         if not start_key:

@@ -351,10 +351,15 @@ class SiteDeployerStack(Stack):
                 # `test_deployer_cannot_touch_platform_functions` 会从本列表推导
                 # 动作集、要求同一条 Deny 全覆盖 ⇒ 这里加动作而 Deny 没跟上就红。
                 # InvokeFunction 尤其要靠那条 Deny：否则部署器能直调 site-panel。
+                # UpdateFunctionUrlConfig + GetPolicy 是**授权自愈**的（Codex
+                # 2026-08-18 P1-5A）：候选色的 URL 若被漂移成 AuthType=NONE、或
+                # resource policy 里混进了额外语句（如 Principal:*），提交前要
+                # 改回 AWS_IAM 并清掉非预期语句——不然新后端绕过 Edge 公网可达。
                 actions=["lambda:CreateFunction", "lambda:UpdateFunctionCode",
                          "lambda:UpdateFunctionConfiguration", "lambda:GetFunction",
                          "lambda:GetFunctionConfiguration",
                          "lambda:CreateFunctionUrlConfig", "lambda:GetFunctionUrlConfig",
+                         "lambda:UpdateFunctionUrlConfig", "lambda:GetPolicy",
                          "lambda:AddPermission", "lambda:RemovePermission",
                          "lambda:DeleteFunction",
                          "lambda:DeleteFunctionUrlConfig", "lambda:GetLayerVersion",
@@ -654,9 +659,22 @@ class SiteDeployerStack(Stack):
             actions=["states:DescribeExecution"],
             resources=[f"arn:aws:states:{REGION}:{ACCOUNT}:execution:"
                        f"{sm.state_machine_name}:*"]))
+        recon_role.add_to_policy(iam.PolicyStatement(
+            # 收敛后的路由补偿（Codex 2026-08-18 P1-4）：TIMED_OUT/ABORTED 不执行
+            # 任何 State，MarkFailed 的补偿没人做，reconciler 按 job 里持久化的
+            # route_commit 走**同一个**补偿函数（mark_job._restore_route）。
+            # 它需要：GetItem（读回核对幂等终态）+ PutItem（整值写回）+
+            # DeleteItem（首次部署撤路由）。**moto 不校验 IAM**（CLAUDE.md 点名的
+            # 陷阱）——漏这条时单测全绿、真机上补偿静默失败只剩 CloudWatch 一行。
+            actions=["dynamodb:GetItem", "dynamodb:PutItem",
+                     "dynamodb:DeleteItem"],
+            resources=[f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/"
+                       f"{CFG['Platform']['routing_table']}"]))
 
         recon_env = {"JOBS_TABLE": jobs.table_name,
-                     "STATE_MACHINE_ARN": sm.state_machine_arn}
+                     "STATE_MACHINE_ARN": sm.state_machine_arn,
+                     # 路由补偿的写入目标；BASE_DOMAIN 不需要（补偿只拼 subdomain）
+                     "ROUTING_TABLE": CFG["Platform"]["routing_table"]}
 
         def recon_fn(cid: str, fn_name: str, handler: str) -> lam_.Function:
             # 与 step_fn 不同：不需要 psycopg/contract，纯标准库 + boto3。

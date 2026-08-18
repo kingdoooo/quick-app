@@ -84,7 +84,11 @@ ROUTER_CFG_PATH = ROOT / "router" / "config.ini"
 
 sys.path.insert(0, str(HERE.parent / "auth"))   # session.py：签发算法唯一实现
 sys.path.insert(0, str(HERE))                   # _mcp_client.py（scripts/ 不是包）
+# common.py：前端版本前缀格式的唯一定义（尾斜杠是实测红线）。这个闸门要造一条
+# 真路由，手抄一份格式就等于让闸门用一份可能已经漂移的路径去验生产。
+sys.path.insert(0, str(HERE.parent / "deployer" / "functions"))
 
+import common as sb_common                      # noqa: E402
 import session as sess                          # noqa: E402
 from _mcp_client import (Mcp, claims as token_claims,  # noqa: E402
                          http, load_user_token, mcp_endpoint)
@@ -319,9 +323,11 @@ def main() -> int:                                      # noqa: C901
     suf = secrets.token_hex(4)
     site_id = f"m5e2e-{suf}"          # panel 的 _SITE 正则要求首字符是小写字母
     subdomain = f"app-{site_id}"
-    # **不带尾斜杠**：Edge 拼的是 f"/{static_prefix}{path}"，带尾斜杠会拼出
-    # 双斜杠、与上传的 key 不是同一个对象，整站 403（CLAUDE.md 高频坑）。
-    static_prefix = f"sites/{site_id}/m5e2e"
+    # 格式走 common 的唯一定义（**不带尾斜杠**：Edge 拼的是
+    # f"/{static_prefix}{path}"，带尾斜杠会拼出双斜杠、与上传的 key 不是同一个
+    # 对象，整站 403 —— CLAUDE.md 高频坑）。这里的"job_id"位置放的是固定串
+    # `m5e2e`，因为这条 fixture 路由不是由某次真实部署写出来的。
+    static_prefix = sb_common.static_prefix_for(site_id, "m5e2e")
     owner = f"m5e2e-owner-{suf}@example.com"
     visitor = f"m5e2e-visitor-{suf}@example.com"
     visitor2 = f"m5e2e-visitor2-{suf}@example.com"

@@ -120,7 +120,11 @@ def _route_item(event, site: dict, owner: str, subdomain: str) -> dict:
     return {"subdomain": {"S": subdomain},
             "site_id": {"S": event["site_id"]},
             "route_mode": {"S": "split"},
-            "static_prefix": {"S": f"sites/{event['site_id']}/{event['job_id']}"},
+            # 格式的唯一定义在 common（尾斜杠是一条实测红线，见该函数 docstring）。
+            # mark_job 的补偿要按**同一个**值做条件，两处各手写一份就没有任何东西
+            # 保证它们同义。
+            "static_prefix": {"S": common.static_prefix_for(event["site_id"],
+                                                           event["job_id"])},
             "api_target": {"S": event.get("api_target", "")},
             "require_auth": {"BOOL": bool(site.get("require_login", True))},
             "allowed_users": permissions.allowed_users_av(allowed),
@@ -128,6 +132,28 @@ def _route_item(event, site: dict, owner: str, subdomain: str) -> dict:
                                     (site.get("collaborators") or [])]},
             "owner": {"S": owner},
             "permissions_rev": {"N": str(int(site.get("permissions_rev", 0)))}}
+
+
+def _finish(event, committed_route: dict, previous_route, subdomain: str) -> dict:
+    """把"提交之后"的那几个 event 字段填好。
+
+    **提交路径与重放路径共用这一个函数**：两条路径各填一份的话，重试时 smoke 的
+    判据（`effective_auth`）就可能与真正写进路由的那条不一致——而那正是
+    spec §3.3.2 要消除的"按 manifest 断言"的同一类错误。
+    所以这里的值一律**从 `committed_route` 这个 item 反推**，不从 sites 表再读一次：
+    重试发生在提交之后，此刻 sites 表可能已经被在线改权限动过，再读一次就会用
+    新策略去断言一条按旧策略写下的路由。
+    """
+    event["previous_route"] = previous_route
+    event["committed_permissions_rev"] = int(
+        committed_route["permissions_rev"]["N"])
+    allowed = committed_route["allowed_users"]
+    event["effective_auth"] = {
+        "require_login": bool(committed_route["require_auth"]["BOOL"]),
+        "allowed_users": (allowed["S"] if "S" in allowed
+                          else [e["S"] for e in allowed["L"]])}
+    event["url"] = f"https://{subdomain}.{os.environ['BASE_DOMAIN']}"
+    return event
 
 
 def handler(event, context):
@@ -140,14 +166,31 @@ def handler(event, context):
     之前的普通读与之后的普通写合成一个业务事务。见 spec §3.2。
 
     做法：对 sites 表做 ConditionCheck（permissions_rev 仍是我读到的值）+
-    对路由表 Put 整条，同一事务提交。冲突则重读重试（≤3 次）；仍冲突就让
-    本步骤失败——部署 FAILED 比留下错误的公开状态好。
+    对路由表 Put 整条 + 把补偿状态写进 job 记录，同一事务提交。冲突则重读重试
+    （≤3 次）；仍冲突就让本步骤失败——部署 FAILED 比留下错误的公开状态好。
+
+    **本步骤对 Task 重试必须幂等**（Codex 2026-08-17 P1-1）。Step Functions 给每个
+    Task 都配了默认重试，四种触发错误都属于"函数可能已经执行完，只是响应没回来"，
+    而重试用的是**原始输入** ⇒ 第一次放进返回值里的 `previous_route` 就此丢失，
+    第二次拍到的"切换前快照"其实是自己刚写进去的新路由。于是补偿变成 no-op
+    却日志报"已恢复"，并且 mark_job 会把真正的上一版前缀当成当前前缀删掉。
+    所以补偿状态与路由提交**同一笔事务**落进 job 记录（`route_commit`），
+    重试时认出"我已经提交过"，回放那份记录、**一次路由写都不再发**。
     """
     import botocore.exceptions
 
     common.update_job(event["job_id"], phase="register-route")
     subdomain = common.subdomain_for(event["site_id"])
     ddb = boto3.client("dynamodb")
+
+    # ---- 幂等入口：这条 job 已经提交过路由了吗 ----
+    # 放在**任何写之前**。重试时再走一遍 seed / 事务不只是浪费：seed 之后的
+    # 强一致读会拿到"提交后"的世界，快照就成了自己写的那条新路由。
+    replay = common.read_route_commit(event["job_id"])
+    if replay is not None:
+        prev = (None if "NULL" in replay["previous_route"]
+                else replay["previous_route"]["M"])
+        return _finish(event, replay["committed_route"]["M"], prev, subdomain)
 
     site = common.get_site_consistent(event["site_id"]) or {}
     owner = site.get("owner") or common.get_job(event["job_id"])["owner"]
@@ -189,10 +232,11 @@ def handler(event, context):
         # 这次读失败一律上抛：失败在提交之前，对线上零影响；吞掉的话路由照切而
         # 快照缺席，冒烟失败时无从还原。恢复完备还要求旧色 alias、旧色 URL、旧
         # 前端前缀都还在，所以清理只在成功分支做（见 mark_job 的版本清理）。
-        event["previous_route"] = ddb.get_item(
+        previous_route = ddb.get_item(
             TableName=os.environ["ROUTING_TABLE"],
             Key={"subdomain": {"S": subdomain}},
             ConsistentRead=True).get("Item")
+        route_item = _route_item(event, site, owner, subdomain)
         try:
             # 守卫走 permissions.sites_snapshot_guard（全仓库唯一定义）。
             # **had_rev 传 site 里的真实情况**，不要写死 True：
@@ -205,16 +249,49 @@ def handler(event, context):
             # 在"站点被同 site_id 重建且无 rev"时成立：旧 job 会把新站点的路由
             # 覆盖成旧 static_prefix / 旧 owner / 旧权限（实测复现，
             # Codex 复审 2026-08-08 P1）。
-            ddb.transact_write_items(TransactItems=[
+            # 第三条：把补偿状态与路由提交绑成**同一笔**。分开写就有一个窗口，
+            # 窗口里挂掉 = 路由已切而补偿状态缺席（就是 P1-1 的形态）。
+            #
+            # **route_commit 的下标由构造处算出，不写死字面量**（与 mcp/panel 的
+            # _WHY 同一条纪律）：往这个列表中间插一项时，硬编码的下标会把"这是
+            # 重放"误读成"权限被并发修改"——重试 3 次后 raise，一次**已经提交**的
+            # 部署被报成 FAILED，且 MarkFailed 收到的输入里没有 previous_route。
+            tx_items = [
                 permissions.sites_snapshot_guard(
                     event["site_id"], rev=rev,
                     had_rev=("permissions_rev" in site)),
                 {"Put": {"TableName": os.environ["ROUTING_TABLE"],
-                         "Item": _route_item(event, site, owner, subdomain)}}])
-            break
+                         "Item": route_item}},
+                common.route_commit_item(event["job_id"], previous_route,
+                                         route_item)]
+            commit_idx = len(tx_items) - 1
+            ddb.transact_write_items(TransactItems=tx_items)
+            # ---- 提交端的锚点（mark_job 的补偿按它做条件）----
+            # 从**刚写进去的那个 item** 反推，与重放路径共用 `_finish`：
+            # 两条路径各填一份的话，重试时 smoke 的判据会与真正写进路由的那条不一致。
+            #
+            # **不要在 mark_job 那边改成"读一次现在的路由再比"**：那是 read →
+            # conditional-write 的 TOCTOU，而且读到的就是要判定的对象本身，
+            # 条件永远成立，等于没有条件。
+            return _finish(event, route_item, previous_route, subdomain)
         except botocore.exceptions.ClientError as e:
             if e.response["Error"]["Code"] != "TransactionCanceledException":
                 raise
+            # **先分辨是哪一项被取消**：第三项（route_commit 的
+            # attribute_not_exists）失败意味着"这条 job 已经提交过路由了"——
+            # 也就是上面那个幂等入口的读没看到、但事务看到了（重试与第一次调用
+            # 几乎同时发生时可达）。这不是冲突，是重放，必须走幂等路径而不是
+            # 被下面当成"权限被并发修改"最终把一次成功的部署报成 FAILED。
+            reasons = [r.get("Code", "") for r in
+                       e.response.get("CancellationReasons", [])]
+            if (len(reasons) > commit_idx
+                    and reasons[commit_idx] == "ConditionalCheckFailed"):
+                replay = common.read_route_commit(event["job_id"])
+                if replay is not None:
+                    prev = (None if "NULL" in replay["previous_route"]
+                            else replay["previous_route"]["M"])
+                    return _finish(event, replay["committed_route"]["M"], prev,
+                                   subdomain)
             if attempt == MAX_ROUTE_ATTEMPTS - 1:
                 raise RuntimeError(
                     "写路由时站点权限被并发修改，已重试 "
@@ -222,10 +299,9 @@ def handler(event, context):
                 ) from e
             # 重读循环顶部会拿到新 rev 与新策略
 
-    # smoke_test 必须按本次实际写入路由的策略断言，不能按 manifest
-    # （在线翻转过 require_login 时两者不一致，会把成功的部署判成 FAILED，
-    #  而路由切换已经发生）。见 spec §3.3.2。
-    event["effective_auth"] = {"require_login": bool(site.get("require_login", True)),
-                               "allowed_users": site.get("allowed_users", "org")}
-    event["url"] = f"https://{subdomain}.{os.environ['BASE_DOMAIN']}"
-    return event
+    # 循环的每条出路都是 return 或 raise（成功即 `_finish`，见 spec §3.3.2：
+    # smoke 的判据必须来自**实际写入路由的那条 item**，不是 manifest 也不是
+    # 事后再读一次 sites 表）。只有 MAX_ROUTE_ATTEMPTS <= 0 才会落到这里，
+    # 那是配置错——响亮失败，否则症状会是"路由没写但部署报成功"。
+    raise RuntimeError(
+        f"MAX_ROUTE_ATTEMPTS={MAX_ROUTE_ATTEMPTS} 不合法（须 ≥ 1）")

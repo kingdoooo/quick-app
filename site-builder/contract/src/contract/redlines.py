@@ -283,6 +283,20 @@ def scan_redlines(site_dir: Path, manifest: dict) -> list[str]:
     violations: list[str] = []
     tier = manifest.get("tier")
 
+    # **frontend/index.html 必须存在且非空**（Codex 2026-08-18 P1-5B）。
+    # 这不是风格约定：Edge 把页面请求固定改写为 `/{static_prefix}{path}`、
+    # 对 `/` 补 `index.html`，缺它则站点首页**永久** 403（前端桶私有，
+    # "没这个对象"就是 403 而不是 404）。而这一缺陷没有任何下游能拦：
+    # 健康门只测后端、require_auth 站点的冒烟只断言 302——部署会被标成
+    # SUCCEEDED，等 Edge 缓存过期整站才坏。所以在合同层拦下（部署链最早、
+    # 还没动任何资源的一步）。三处同步：本校验器、references/contract.md、
+    # fixtures（三个黄金样例本来就都带 index.html）。
+    index = site_dir / "frontend" / "index.html"
+    if not index.is_file() or index.stat().st_size == 0:
+        violations.append(
+            "frontend/index.html 缺失或为空：站点首页由 Edge 固定取"
+            "该文件（/ → /{prefix}/index.html），没有它首页永久 403")
+
     for p, text in _read_all(site_dir / "frontend"):
         rel = p.relative_to(site_dir)
         if LOCALHOST_RE.search(text):

@@ -531,9 +531,11 @@ def test_decision_label_matches_what_the_edge_writes():
 
 # ── ④ PHASE_LABEL 用真实小写 phase 词表 ────────────────────────────────
 
+# compensating：MarkFailed 在补偿路由期间的过渡 phase（R4 P1-1 之后终态在
+# 补偿完成后才写——这段时间用户在部署历史里看到的就是它）。
 REAL_PHASES = {"submitted", "queued", "validate", "provision-db", "package",
                "deploy-backend", "upload-frontend", "register-route",
-               "smoke-test", "undeploy"}
+               "smoke-test", "compensating", "undeploy"}
 
 
 def _phase_label_keys() -> set[str]:
