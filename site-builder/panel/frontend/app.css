@@ -126,7 +126,36 @@
   .btn-sm { height: 27px; padding: 0 9px; font-size: 12.5px; }
   .btn-danger-quiet { border-color: transparent; background: transparent; box-shadow: none; color: var(--danger); }
   .btn-danger-quiet:hover { background: var(--danger-soft); border-color: transparent; }
+  /* 危险区域的两个入口按钮：同款描边。实心 btn-danger 留给确认弹窗里的最终按钮。 */
+  .btn-danger-outline { background: transparent; color: var(--danger);
+               border-color: color-mix(in oklch, var(--danger) 42%, var(--border)); }
+  .btn-danger-outline:hover { background: var(--danger-soft);
+               border-color: color-mix(in oklch, var(--danger) 60%, var(--border)); }
   .btn[disabled] { opacity: .45; cursor: not-allowed; pointer-events: none; }
+
+  /* ── 分段切换（访问趋势的档位/视图）───────────────────────────────── */
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius);
+         overflow: hidden; background: var(--surface); }
+  .seg button { border: 0; background: transparent; padding: 3px 10px; font: inherit;
+         font-size: 12.5px; color: var(--fg-dim); cursor: pointer; }
+  .seg button + button { border-left: 1px solid var(--border); }
+  .seg button:hover { background: var(--fg-soft); }
+  .seg button[aria-pressed="true"] { background: var(--fg-soft); color: var(--fg); font-weight: 500; }
+
+  /* ── 趋势折线图 ──────────────────────────────────────────────────── */
+  .trend-chart { position: relative; padding: 8px 16px 10px; }
+  .trend-legend { display: flex; gap: 18px; padding: 6px 4px 10px; font-size: 12px; color: var(--fg-dim); }
+  .trend-key i { display: inline-block; width: 14px; height: 3px; border-radius: 2px;
+         vertical-align: middle; margin-right: 6px; }
+  .trend-tip { position: absolute; pointer-events: none; display: none; z-index: 5;
+         background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+         box-shadow: var(--shadow-md); padding: 8px 11px; font-size: 12px; min-width: 118px; }
+  .trend-tip-date { font-family: var(--font-mono); color: var(--muted); margin-bottom: 5px; }
+  /* tooltip 的层级与图例相反：读的人已经知道序列、要的是数——数用 strong，名用弱色 */
+  .trend-tip div:not(.trend-tip-date) { display: flex; align-items: center; gap: 7px; padding: 1.5px 0; }
+  .trend-tip i { width: 10px; height: 2.5px; border-radius: 2px; flex: none; }
+  .trend-tip strong { font-variant-numeric: tabular-nums; min-width: 44px; }
+  .trend-tip span { color: var(--fg-dim); }
 
   /* ─── badges / tags ────────────────────────────────────────────────── */
   .badge { display: inline-flex; align-items: center; gap: 5px; height: 21px; padding: 0 8px;

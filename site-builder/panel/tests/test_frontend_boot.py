@@ -477,6 +477,90 @@ def test_visitor_supplied_path_is_escaped_at_render_time():
         "渲染结果里找不到转义后的路径 —— 明细表可能根本没渲染（用例空转）")
 
 
+def test_danger_zone_stays_off_non_overview_tabs():
+    """危险区域只属于概览：访问统计页的**任何一次**渲染都不得带下线按钮。
+
+    回归背景：它原先拼在 tab 外壳上（tabpanel 外面），四个 tab 每屏都拖着
+    两个破坏性按钮。绝对断言配正向对照——dangerZone 必须仍在 overview 的
+    渲染路径里，否则"到处都没有"也能让本用例假绿。
+    """
+    out, _ = _last_write("analytics-live")
+    for html in out["html_writes"]:
+        assert "危险区域" not in html and "purge-btn" not in html, (
+            "危险区域渲染到了访问统计页 —— 它挂回 tab 外壳上了")
+    src = APP.read_text(encoding="utf-8")
+    m = re.search(r"function renderOverviewTab[\s\S]*?\n\}", src)
+    assert m and "dangerZone(site)" in m.group(0), (
+        "正向对照失败：renderOverviewTab 里找不到 dangerZone —— "
+        "上面的绝对断言可能因功能整体消失而假绿")
+
+
+def test_analytics_defaults_to_a_chart_and_keeps_the_table_view():
+    """趋势卡默认渲染 SVG 折线图，同时**表格仍在 DOM 里**（默认 hidden）。
+
+    表格不是装饰：aqua series 对白底 2.82:1（<3:1），色彩规范要求的缓解通道
+    就是"可达的表格视图"。图表替代表格 = 把缓解通道一起删掉。
+    三条序列各自的 polyline 带 data-series，图例文字与色标分离（文字不穿
+    序列色，身份靠旁边的色块线）。
+    """
+    _, last = _last_write("analytics-live")
+    assert "<svg" in last, f"默认视图不是图表: {last[:300]!r}"
+    for s in ("pv", "uv", "denied"):
+        assert f'data-series="{s}"' in last, f"缺 {s} 序列的折线"
+    for label in ("PV", "独立访客", "被拒"):
+        assert label in last, f"图例缺 {label}（≥2 序列必须有图例）"
+    assert "<table" in last, "表格视图从 DOM 里消失了 —— 低对比序列失去缓解通道"
+    assert "折线图" in last and "表格" in last, "找不到 折线图/表格 视图切换"
+
+
+def test_analytics_trend_table_is_newest_first():
+    """趋势表格倒序：最近的日期在最前面（图表仍按时间轴正序画）。
+
+    只在**趋势表**范围内断言——访问明细的 ts 也含 2026-08-14，整页 find
+    会两处都命中，表格没倒序时用例照样绿（字样碰撞假绿，与 ERR_SENTINEL
+    的教训同族）。
+    """
+    _, last = _last_write("analytics-live")
+    m = re.search(r'trend-table[\s\S]*?</table>', last)
+    assert m, "找不到趋势表容器（trend-table）"
+    tbl = m.group(0)
+    assert tbl.find("2026-08-14") < tbl.find("2026-08-12") != -1, (
+        "趋势表不是倒序 —— 最近的日期应该在最前面")
+
+
+def test_analytics_uv_gap_is_a_break_not_a_zero():
+    """uv 为 null 的桶在折线图上是**断线**，不是画成 0。
+
+    表格里那格是「—」标注（uvCell），图上等价的语义是缺口：夹具 3 个桶里
+    uv 只有 2 个非空值 → uv 恰好 2 个数据点，pv 3 个。null 被 Number()
+    成 0 或 NaN 进坐标的话，点数会是 3 或者产物里出现 NaN。
+    """
+    _, last = _last_write("analytics-live")
+    assert "NaN" not in last, "SVG 坐标里出现 NaN —— null 进了数值管道"
+    uv_dots = len(re.findall(r'class="trend-dot[^"]*" data-series="uv"', last))
+    pv_dots = len(re.findall(r'class="trend-dot[^"]*" data-series="pv"', last))
+    assert pv_dots == 3, f"pv 应有 3 个数据点，实际 {pv_dots}"
+    assert uv_dots == 2, (
+        f"uv 应恰好 2 个数据点（null 桶断线），实际 {uv_dots} —— "
+        "3 说明 null 被画成了 0")
+
+
+def test_analytics_range_presets_pin_their_query_params():
+    """时间档位以 data-q 携带**真实查询参数**，点击处理器只读这个属性。
+
+    渲染出的 data-q 就是发出去的参数（单一真源）——断言它等于断言换档后
+    的请求形态，harness 不用真点按钮。默认档（近 30 天）要有选中态。
+    """
+    _, last = _last_write("analytics-live")
+    for q, label in (("period=day&n=7", "近 7 天"), ("period=day&n=30", "近 30 天"),
+                     ("period=day&n=90", "近 90 天"), ("period=month&n=12", "近 12 个月")):
+        assert f'data-q="{q}"' in last, f"缺时间档位 {label}（data-q={q}）"
+        assert label in last, f"缺时间档位文字 {label}"
+    m = re.search(r'<button[^>]*data-q="period=day&n=30"[^>]*>', last)
+    assert m and 'aria-pressed="true"' in m.group(0), (
+        "默认档「近 30 天」没有选中态（aria-pressed）")
+
+
 # ── 反向验证：把三条路径各自的实现改坏，必须变红 ──────────────────────
 #
 # 用 `_mutated`（写一份改坏的 app.js 到 tmp_path）而不是改仓库里的 app.js：

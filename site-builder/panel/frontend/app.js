@@ -721,7 +721,7 @@ async function pageSite() {
     '<div class="tabs" role="tablist">' + tabs.map((t) =>
       '<button class="tab" role="tab" data-tab="' + t[0] + '" aria-selected="' +
       (t[0] === tab) + '">' + esc(t[1]) + '</button>').join('') +
-    '</div></section><div id="tabpanel"></div>' + dangerZone(site);
+    '</div></section><div id="tabpanel"></div>';
 
   $('#copy-url').addEventListener('click', () => {
     if (navigator.clipboard) navigator.clipboard.writeText(site.url);
@@ -729,13 +729,17 @@ async function pageSite() {
   });
   $$('.tab').forEach((b) => b.addEventListener('click', () =>
     go('#/sites/' + siteId + '/' + b.dataset.tab)));
-  bindDangerZone(site, latestJob);
 
   const panel = $('#tabpanel');
   if (tab === 'access') renderAccessTab(panel, site);
   else if (tab === 'deploys') renderDeploysTab(panel, site);
   else if (tab === 'analytics') renderAnalyticsTab(panel, site);
-  else renderOverviewTab(panel, site, dstate);
+  else {
+    /* 危险区域只属于概览：它不是 tab 外壳的一部分——挂在外壳上会让
+     * 权限/部署历史/访问统计每一屏都拖着两个破坏性按钮。 */
+    renderOverviewTab(panel, site, dstate);
+    bindDangerZone(site, latestJob);
+  }
 }
 
 /* `site.status === 'DEPLOYING'` 有**两种**完全不同的含义，必须区分，
@@ -895,7 +899,7 @@ function renderOverviewTab(panel, site, st) {
               (job.error ? '<div class="callout danger" style="margin-top:12px">' + ICON.err +
                 '<span>' + esc(job.error) + '</span></div>' : '')
             : '<p class="meta">暂无部署记录。</p>') +
-        '</div></div></div></section>';
+        '</div></div></div></section>' + dangerZone(site);
 }
 
 /* ── 权限页 ─────────────────────────────────────────────────────────── */
@@ -1249,6 +1253,17 @@ function uvCell(row) {
   return esc(fmt(row.uv));
 }
 
+/* 时间档位：**data-q 就是发出去的查询串**（点击处理器只读 dataset.q）——
+ * 按钮上渲染的参数与实际请求是同一个字符串，锁其一即锁其二
+ * （boot 测试断言的正是渲染出的 data-q）。后端 series() 接受
+ * period ∈ day|week|month、n ∈ 1..400；这里只暴露 day 与 month：
+ * month 才够到聚合表 400 天的留存，week 与 month 语义重叠、不值一个按钮。 */
+const TREND_RANGES = [
+  ['period=day&n=7', '近 7 天'], ['period=day&n=30', '近 30 天'],
+  ['period=day&n=90', '近 90 天'], ['period=month&n=12', '近 12 个月']];
+/* 模块级：换 tab / 换站点仍记得选过的档位与视图（刷新回默认，不落存储）。 */
+const trendPref = { q: 'period=day&n=30', view: 'chart' };
+
 function renderAnalyticsTab(panel, site) {
   panel.innerHTML = '<section class="card"><div class="card-body">' +
     '<p class="meta">正在加载访问统计…</p></div></section>';
@@ -1256,19 +1271,36 @@ function renderAnalyticsTab(panel, site) {
   /* 两个请求并发：趋势与明细互不依赖，串起来会让这一屏等两个 RTT。
    * 任一失败都进 catch —— 只画半屏并且不说原因，比整屏报错更难排查。 */
   Promise.all([
-    apiGet('/api/sites/' + id + '/analytics?period=day&n=30'),
+    apiGet('/api/sites/' + id + '/analytics?' + trendPref.q),
     apiGet('/api/sites/' + id + '/visitors?days=7&limit=50')
   ]).then((res) => {
     const series = (res[0] && res[0].series) || [];
     const rows = (res[1] && res[1].rows) || [];
+    const range = TREND_RANGES.find((r) => r[0] === trendPref.q) || TREND_RANGES[1];
+    const monthly = trendPref.q.indexOf('period=month') === 0;
+    /* 图表宽度按容器实测（panel 已在 DOM 里）：SVG 用真实像素坐标，文字不被
+     * viewBox 拉伸，悬浮层的命中运算也不用换算。拿不到宽度（测试 harness 的
+     * DOM stub）就用 860 兜底。 */
+    const chartW = Math.max(560, Math.min(1400, (panel.clientWidth || 908) - 48));
     panel.innerHTML =
-      '<section class="card"><div class="card-head"><h2>访问趋势（近 30 天）</h2>' +
-        '<span class="meta">按自然日聚合（UTC）</span></div>' +
-        '<div class="card-body tight">' + trendTable(series) + '</div></section>' +
+      '<section class="card"><div class="card-head"><h2>访问趋势（' + range[1] + '）</h2>' +
+        '<div class="row" style="gap:12px">' +
+          '<div class="seg" id="trend-range">' + TREND_RANGES.map((r) =>
+            '<button type="button" data-q="' + r[0] + '" aria-pressed="' +
+            (r[0] === trendPref.q) + '">' + r[1] + '</button>').join('') + '</div>' +
+          '<div class="seg" id="trend-view">' +
+            '<button type="button" data-view="chart" aria-pressed="' +
+              (trendPref.view === 'chart') + '">折线图</button>' +
+            '<button type="button" data-view="table" aria-pressed="' +
+              (trendPref.view === 'table') + '">表格</button></div>' +
+          '<span class="meta">按自然' + (monthly ? '月' : '日') + '聚合（UTC）</span>' +
+        '</div></div>' +
+        '<div class="card-body tight">' + trendBody(series, chartW) + '</div></section>' +
       '<section class="card" style="margin-top:28px">' +
         '<div class="card-head"><h2>访问明细（近 7 天）</h2>' +
         '<span class="tag">含被拒记录</span></div>' +
         '<div class="card-body tight">' + visitorTable(rows) + '</div></section>';
+    bindTrendControls(panel, site, series);
   }).catch((err) => {
     panel.innerHTML = '<section class="card"><div class="card-body">' +
       '<p class="meta">访问统计读取失败：' +
@@ -1276,11 +1308,26 @@ function renderAnalyticsTab(panel, site) {
   });
 }
 
-function trendTable(series) {
+/* 图与表**同时**在 DOM 里，切换只翻 hidden：
+ *   · aqua 序列对白底 2.82:1（<3:1），色彩校验器要求的缓解通道就是可达的
+ *     表格视图——图表只是默认形态，不是表格的替代；
+ *   · 超出 90 天窗口的 uv 在表里是「—」标注（uvCell），在图上是断线，
+ *     两种形态表达同一个"我们不知道"，谁都不画 0。 */
+function trendBody(series, chartW) {
   if (!series.length) {
     return '<p class="meta" style="padding:18px">这段时间没有访问记录。</p>';
   }
-  const body = series.map((row) =>
+  const tableFirst = trendPref.view === 'table';
+  return '<div class="trend-chart"' + (tableFirst ? ' hidden' : '') + '>' +
+      trendChart(series, chartW) + '</div>' +
+    '<div class="trend-table"' + (tableFirst ? '' : ' hidden') + '>' +
+      trendTable(series) + '</div>';
+}
+
+/* 表格倒序：查精确值的人找的是"昨天"，不该滚 30 行去底部。
+ * （图表仍按时间轴正序画——趋势的阅读方向和查数的阅读方向相反。） */
+function trendTable(series) {
+  const body = series.slice().reverse().map((row) =>
     '<tr><td class="mono">' + esc(row.bucket) + '</td>' +
       '<td class="num-col">' + esc(fmt(row.pv)) + '</td>' +
       '<td class="num-col">' + uvCell(row) + '</td>' +
@@ -1288,6 +1335,168 @@ function trendTable(series) {
   return '<table class="tbl"><thead><tr><th>日期</th>' +
     '<th class="num-col">PV</th><th class="num-col">独立访客</th>' +
     '<th class="num-col">被拒</th></tr></thead><tbody>' + body + '</tbody></table>';
+}
+
+/* ── 趋势折线图（手写 SVG，无依赖）────────────────────────────────────
+ *
+ * 三条序列的取值与配色（配色跑过 dataviz 校验器：CVD 最差对 ΔE 13.3，
+ * 正常视觉 28.5，全部 PASS；aqua 的对比 WARN 由表格视图缓解）：
+ *   pv     accent 蓝    —— 身份色 1
+ *   uv     #1baf7a 青   —— 身份色 2（主题没有第二个达标身份色，取自校验过的
+ *                          默认色板 slot-3；--viz-2 是灰的，色度不够做身份）
+ *   denied danger 红    —— 这条序列的语义就是"被拒"，按规范穿状态色
+ * uv 取值走与 uvCell 同一判据：null = 窗口外，折线**断开**（单点段画成孤点），
+ * 绝不 || 0——0 是错误的事实陈述。 */
+const TREND_SERIES = [
+  ['pv', 'PV', 'var(--accent)', (r) => r.pv || 0],
+  ['uv', '独立访客', '#1baf7a',
+    (r) => (r.uv_exact === false || r.uv === null || r.uv === undefined) ? null : r.uv],
+  ['denied', '被拒', 'var(--danger)', (r) => r.pv_denied || 0]];
+
+function trendGeom(series, w) {
+  const H = 240, padL = 52, padR = 18, padT = 14, padB = 30;
+  let maxV = 1;
+  series.forEach((r) => TREND_SERIES.forEach((s) => {
+    const v = s[3](r);
+    if (v !== null && v > maxV) maxV = v;
+  }));
+  /* 刻度取 1/2/5×10^k 的整数步长，≤5 格——轴上出现 733 这种数等于没有轴。 */
+  const pow = Math.pow(10, Math.floor(Math.log10(Math.max(1, maxV / 4))));
+  const step = Math.max(1, [1, 2, 5, 10].map((m) => m * pow)
+    .find((s) => s * 4 >= maxV));
+  const top = Math.ceil(maxV / step) * step;
+  const ticks = [];
+  for (let v = 0; v <= top; v += step) ticks.push(v);
+  const x = (i) => series.length === 1 ? (padL + (w - padL - padR) / 2)
+    : padL + i * (w - padL - padR) / (series.length - 1);
+  const y = (v) => H - padB - (v / top) * (H - padB - padT);
+  return { w, H, padL, padR, padT, padB, top, ticks, x, y };
+}
+
+function trendChart(series, w) {
+  const g = trendGeom(series, w);
+  const n = series.length;
+  const r1 = (v) => String(Math.round(v * 10) / 10);
+  let out = '';
+  g.ticks.forEach((t) => {
+    out += '<line x1="' + g.padL + '" x2="' + (w - g.padR) + '" y1="' + r1(g.y(t)) +
+      '" y2="' + r1(g.y(t)) + '" stroke="var(--border)" stroke-width="1"></line>' +
+      '<text x="' + (g.padL - 8) + '" y="' + r1(g.y(t) + 3.5) +
+      '" text-anchor="end" font-size="11" fill="var(--muted)">' + fmt(t) + '</text>';
+  });
+  /* x 轴标注抽样 ≤6 个，最后一格必标（月桶 7 位原样，日桶只留 MM-DD）。 */
+  const lstep = Math.max(1, Math.ceil(n / 6));
+  series.forEach((row, i) => {
+    const isLast = i === n - 1;
+    if (i % lstep !== 0 && !isLast) return;
+    if (!isLast && n - 1 - i < lstep / 2) return;   // 给末标让位，别叠字
+    const label = row.bucket.length > 7 ? row.bucket.slice(5) : row.bucket;
+    out += '<text x="' + r1(g.x(i)) + '" y="' + (g.H - 8) +
+      '" text-anchor="middle" font-size="11" fill="var(--muted)">' + esc(label) + '</text>';
+  });
+  TREND_SERIES.forEach((s) => {
+    const pts = series.map((row, i) => {
+      const v = s[3](row);
+      return v === null ? null : [g.x(i), g.y(v)];
+    });
+    /* null 切段：连续非空为一段，≥2 点画折线，孤点必须画圆——否则整段消失。 */
+    let seg = [];
+    const flush = () => {
+      if (seg.length >= 2) {
+        out += '<polyline class="trend-line" data-series="' + s[0] + '" points="' +
+          seg.map((p) => r1(p[0]) + ',' + r1(p[1])).join(' ') +
+          '" fill="none" stroke="' + s[2] +
+          '" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"></polyline>';
+      }
+      seg = [];
+    };
+    pts.forEach((p) => { if (p === null) flush(); else seg.push(p); });
+    flush();
+    /* 数据点：桶少时全画（带 2px 底色环，压线也认得出）；桶多只画孤点。 */
+    pts.forEach((p, i) => {
+      if (p === null) return;
+      const lone = (i === 0 || pts[i - 1] === null) && (i === n - 1 || pts[i + 1] === null);
+      if (n > 31 && !lone) return;
+      out += '<circle class="trend-dot" data-series="' + s[0] + '" cx="' + r1(p[0]) +
+        '" cy="' + r1(p[1]) + '" r="4" fill="' + s[2] +
+        '" stroke="var(--surface)" stroke-width="2"></circle>';
+    });
+  });
+  out += '<line class="trend-cross" y1="' + g.padT + '" y2="' + (g.H - g.padB) +
+    '" stroke="var(--border)" stroke-width="1" visibility="hidden"></line>' +
+    '<rect class="trend-hit" x="' + g.padL + '" y="' + g.padT + '" width="' +
+    (w - g.padL - g.padR) + '" height="' + (g.H - g.padT - g.padB) +
+    '" fill="transparent"></rect>';
+  return '<div class="trend-legend">' + TREND_SERIES.map((s) =>
+      '<span class="trend-key"><i style="background:' + s[2] + '"></i>' + s[1] +
+      '</span>').join('') + '</div>' +
+    '<svg width="' + w + '" height="' + g.H + '" viewBox="0 0 ' + w + ' ' + g.H +
+    '" role="img" aria-label="访问趋势折线图（数据见表格视图）">' + out + '</svg>';
+}
+
+function bindTrendControls(panel, site, series) {
+  $$('#trend-range button', panel).forEach((b) => b.addEventListener('click', () => {
+    if (b.dataset.q === trendPref.q) return;
+    trendPref.q = b.dataset.q;
+    renderAnalyticsTab(panel, site);          // 换档要换数据，整 tab 重渲染
+  }));
+  $$('#trend-view button', panel).forEach((b) => b.addEventListener('click', () => {
+    trendPref.view = b.dataset.view;
+    const chart = $('.trend-chart', panel), table = $('.trend-table', panel);
+    if (chart) chart.hidden = trendPref.view === 'table';
+    if (table) table.hidden = trendPref.view !== 'table';
+    $$('#trend-view button', panel).forEach((x) =>
+      x.setAttribute('aria-pressed', String(x.dataset.view === trendPref.view)));
+  }));
+  bindTrendHover(panel, series);
+}
+
+/* 悬浮层：竖准线找 X + 一个 tooltip 列**全部**序列——指针对准日期而不是
+ * 2px 的线。tooltip 用 textContent 组装（bucket 来自后端，仍按不可信处理）。 */
+function bindTrendHover(panel, series) {
+  const host = $('.trend-chart', panel);
+  const svg = host && $('svg', host);
+  const hit = svg && $('.trend-hit', svg);
+  if (!hit || !series.length) return;
+  const g = trendGeom(series, Number(svg.getAttribute('width')));
+  const cross = $('.trend-cross', svg);
+  const tip = document.createElement('div');
+  tip.className = 'trend-tip';
+  host.appendChild(tip);
+  hit.addEventListener('pointermove', (ev) => {
+    const box = svg.getBoundingClientRect();
+    const px = ev.clientX - box.left;
+    const span = series.length === 1 ? 1 : (g.w - g.padL - g.padR) / (series.length - 1);
+    const i = Math.max(0, Math.min(series.length - 1, Math.round((px - g.padL) / span)));
+    cross.setAttribute('x1', g.x(i)); cross.setAttribute('x2', g.x(i));
+    cross.setAttribute('visibility', 'visible');
+    tip.textContent = '';
+    const head = document.createElement('div');
+    head.className = 'trend-tip-date';
+    head.textContent = series[i].bucket;
+    tip.appendChild(head);
+    TREND_SERIES.forEach((s) => {
+      const v = s[3](series[i]);
+      const row = document.createElement('div');
+      const key = document.createElement('i');
+      key.style.background = s[2];
+      const val = document.createElement('strong');
+      val.textContent = v === null ? '—' : fmt(v);
+      const name = document.createElement('span');
+      name.textContent = s[1];
+      row.appendChild(key); row.appendChild(val); row.appendChild(name);
+      tip.appendChild(row);
+    });
+    tip.style.display = 'block';
+    const flip = g.x(i) > g.w * 0.72;   // 靠右时翻到左侧，别被卡片裁掉
+    tip.style.left = flip ? '' : (g.x(i) + 14) + 'px';
+    tip.style.right = flip ? (g.w - g.x(i) + 14) + 'px' : '';
+    tip.style.top = (ev.clientY - box.top - 12) + 'px';
+  });
+  hit.addEventListener('pointerleave', () => {
+    cross.setAttribute('visibility', 'hidden');
+    tip.style.display = 'none';
+  });
 }
 
 /* 未登录访问者的 email 是**空串**（Edge 的 redirect_login 契约：302 那一刻还
@@ -1320,7 +1529,7 @@ function dangerZone(site) {
         '<div><div style="font-size:13.5px;font-weight:500">下线站点</div>' +
           '<p class="meta" style="max-width:56ch">删除路由、Lambda 与前端文件，URL 立即不可访问。' +
           '数据库与存储保留，可以重新部署恢复。</p></div>' +
-        '<button class="btn btn-danger-quiet" id="undeploy-btn" type="button"' +
+        '<button class="btn btn-danger-outline" id="undeploy-btn" type="button"' +
           (may && !gone ? '' : ' disabled') + '>' + (gone ? '已下线' : '下线站点…') + '</button>' +
       '</div>' +
       '<hr style="border:0;border-top:1px solid var(--border);margin:0" />' +
@@ -1328,7 +1537,9 @@ function dangerZone(site) {
         '<div><div style="font-size:13.5px;font-weight:500">下线并清除数据</div>' +
           '<p class="meta" style="max-width:56ch">除上述内容外，同时删除站点的数据库内容与' +
           '已上传的文件。<strong>不可恢复。</strong></p></div>' +
-        '<button class="btn btn-danger" id="purge-btn" type="button"' +
+        // 与 undeploy-btn 同款描边：最危险的操作不该是全页最醒目的按钮，
+        // 严重性由文案与确认弹窗（那里才是实心 btn-danger）承担。
+        '<button class="btn btn-danger-outline" id="purge-btn" type="button"' +
           (may && !gone ? '' : ' disabled') + '>下线并清除数据…</button>' +
       '</div></div></section>';
 }
