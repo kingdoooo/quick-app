@@ -1,0 +1,342 @@
+# S1 · 隔离与鉴权加固 设计文档
+
+> 输入来源：`docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md`（Claude + Codex
+> 两轮独立对抗性审查合并版，v3）。本文只覆盖该文档拆出的 **S1** 包：M01、M02、M05、M06。
+> 其余包（S2 迁移可重放性 / S3 部署期正确性 / S4 守卫化 / S5 账号边界）各自独立成 spec。
+>
+> **红线**：本文不含真实账号 ID / 域名 / site_id / 邮箱 / 角色名，一律用占位符。
+
+## 1. 背景与目标
+
+四条 finding 共享同一个失效形态：**不变量的检查存在，但绕过它的东西到达了检查点。**
+
+| ID | 一句话 | 严重度 |
+|---|---|---|
+| M01 | per-site IAM 资源用 `site-data-{site_id}-*` 前缀匹配，而 site_id 可嵌套 ⇒ 跨站点读写 | P1 |
+| M02 | 权限写入层把坏数据洗成合法的 `BOOL False` / `"org"`，反转 Edge 的 fail-closed | P1 |
+| M05 | 会话 verifier 不查 `typ`，升级码可当会话用且可无限续期 | P2 |
+| M06 | `_get_cookie` 只取第一条同名 cookie ⇒ 路径遮蔽造成全平台 `/api/*` 持久 DoS | P2 |
+
+**目标**：把这四条不变量各收敛到**一处定义**，并给每处配一条**先会红**的守卫，
+使同一类缺陷不能靠"再抄一份"回来。
+
+**非目标**：不追求把这四条背后的架构问题一次改完（见 §2 与 §8）。
+
+## 2. 范围
+
+### 2.1 做
+
+- M02：新增严格解析函数，**四个** writer 全部改为调用它。
+- M01：表名格式提成唯一定义；per-site IAM 策略改为精确 ARN；收窄日志组资源。
+- M05：会话 token 加 `typ`，verifier 增加**必填** `expected_typ`；auth 与 Edge 内嵌两份同步。
+- M06：`_get_cookie` 改为返回全部同名值并逐个验签，带候选上限。
+
+### 2.2 明确不做（防范围膨胀）
+
+| 不做 | 理由 | 归属 |
+|---|---|---|
+| host-only 会话重设计 | 会话不能再跨子域共享，而"登录一次访问所有站点"正是靠顶域 cookie 成立；需要重新设计站点级会话交换，属产品级改动 | 独立成包 |
+| M01 存量迁移脚本 | 已决定靠下次部署自然收敛（`ensure_site_role` 每次部署刷新 inline policy） | 见 §8 残留 |
+| 读取侧统一严格解析（`get_site` 包一层） | 会让只读路径（panel 展示、analytics 授权）也在坏数据上抛错，把写入侧问题扩散成站点级不可用，破坏"坏数据 fail-closed 但站点仍可服务"这个既有性质 | 已否决 |
+| 部署合同变更 | 强制 `IF NOT EXISTS` 要同步 contract / skills / fixtures 三处，影响所有生成方 | S2 |
+| 通配策略残留的可观测性 | 「N/M 个站点仍带通配」的审计断言 | S4 |
+| `PolicyDataInvalid` 告警 | 当前 0 例，且这是"数据脏了"而非"正在被攻击"，告警不成比例 | S4（按需） |
+
+## 3. 总体设计
+
+S1 不新增组件。它落地为 **5 个「唯一定义」**：
+
+| # | 唯一定义 | 现状 | 服务 |
+|---|---|---|---|
+| 1 | `permissions.effective_policy(site)` → 干净 dict 或抛 `PolicyDataInvalid` | 不存在；坏数据处理散在 4 个 writer | M02 |
+| 2 | `common.site_table_name(site_id, logical)` | **手写在 3 处** | M01 |
+| 3 | `common.site_policy(site_id, engine, *, tables)` | 现签名两参，资源用通配 | M01 |
+| 4 | `session.verify_session_jwt(..., *, expected_typ)` | 无 typ 概念 | M05 |
+| 5 | `origin_request._get_cookies(request, name)`（复数）+ 上限 | 只返回第一条 | M06 |
+
+第 2 项是实施期发现的：表名格式 `site-data-{site_id}-{logical}` 被手抄在
+`common.py:592`（授权）、`provision_dynamodb.py:12`（建表）、`undeploy.py:43`（删表）
+三处，而 M01 的修复恰好要求这三处对同一格式达成一致。不抽出来就等于在三处各写一遍新格式。
+
+### 3.1 唯一的跨组件顺序约束
+
+**M05 必须 auth 先、Edge 后。** Edge 全球复制需 10–20 分钟；窗口内 auth 已签发带 `typ`
+的 token 而 Edge 尚未要求它——这是安全方向。反过来（Edge 先要求）会让所有既有会话
+与新签发会话同时失效 ⇒ 全站锁死。
+
+## 4. 组件设计
+
+### 4.1 M02 · `effective_policy(site)`
+
+新增异常 `PolicyDataInvalid`。解析用**一条统一判据**而非逐字段特判：
+
+> 每个字段**要么类型明确，要么它的「缺失」有唯一安全解释**；两者都不成立即抛错。
+
+| 字段 | 合法形态 | 缺失时 | 理由 |
+|---|---|---|---|
+| `require_login` | 真 `bool` | **抛错** | 缺失无唯一解释（True 还是 False？） |
+| `allowed_users` | `"org"` 或 `list[str]`（邮箱过 `EMAIL_RE`） | **抛错** | 缺失无唯一解释（org 还是空名单？） |
+| `collaborators` | `list[str]` | `[]` | 唯一安全解释：没有协作者 |
+| `owner` | 非空 `str` | **抛错** | 站点必须有 owner |
+
+返回 `{"require_login": bool, "allowed_users": "org" | list[str], "collaborators": list[str], "owner": str}`。
+
+**四个 writer 全部改为调用它**：
+
+1. `permissions.write_permissions`（`permissions.py:507-511`）
+2. `permissions.resync_route`（`permissions.py:760-788`）
+3. `register_route._route_item`（`register_route.py:119,129`）—— **部署路径，两轮审查都漏了这一个**
+4. `scripts/migrate_permissions._parse_allowed`（`migrate_permissions.py:55-82`）
+
+第 3 个是实施期发现的：`_seed_permissions` 用 `if_not_exists(...)`，**只补缺失字段、
+不碰错类型字段**，所以 `require_login = Decimal(0)` 会穿过种子逻辑，在 `:129` 被
+`bool()` 洗成字面 `BOOL False` 写进路由——**每次部署都重洗一遍**。
+
+第 4 个当前是**反例**（它已显式抛错），但它保留的「属性整体缺失 ⇒ `"org"`」回落，
+理由引用的是 Edge 的旧默认（`route.get("allowed_users", "org")`）。**Edge 已改成
+缺失即空名单**，该推导已过时，注释与实现一并改正。
+
+#### 两个诚实的代价
+
+1. **`resync_route` 的 docstring 论证要重写。** 它现在明写「让一个修复工具在最需要它
+   的脏数据上抛异常，等于没有这个工具」——统一拒绝后这句不再成立。新论证：
+   **修复投影漂移 ≠ 修复源数据损坏**，后者必须由人判定意图。
+2. **坏数据行会让站点既不能改权限、也不能部署**，直到人修那一行。这是选定的方向
+   （四个 writer 统一拒绝），代价可接受的前提是错误文案**直接给出修法**——
+   否则这条就变成第二个 M03（见 §5）。
+
+### 4.2 M01 · 精确 ARN
+
+- `common.site_table_name(site_id, logical) -> str`：格式唯一定义，替换手写的三处。
+- `common.site_policy(site_id, engine, *, tables: list[str]) -> str`：
+  `engine == "dynamodb"` 时**每张表发一条精确 Resource**，不用任何通配。
+
+  `tables` 的接口约定（写明以免实现时各自猜）：
+  - **必填关键字参数**，即使 engine 不是 dynamodb 也要传——迫使调用方表态，
+    而不是靠默认值悄悄跳过；
+  - `engine` 为 `"dsql"` 或 `"none"` 时**忽略**它（这两种没有 DynamoDB 表）；
+  - `engine == "dynamodb"` 且 `tables` 为空 ⇒ **抛错**（schema 要求至少一张表，
+    且空 Resource 列表本身是非法 IAM）。
+- `common.ensure_site_role(site_id, engine, *, tables)` 透传。两个调用点：
+  - `deploy_lambda_site.py:164` —— 从 `event["manifest"]["database"]["tables"]` 取
+    （已确认 manifest 在该处可用，`:163` 就在读它）；
+  - `provision_dsql.py:109` —— 传 `tables=[]`（DSQL 站点没有 DynamoDB 表）。
+- **日志组收窄**：函数名就是 `site-{site_id}`，日志组是精确的
+  `/aws/lambda/site-{site_id}`。收窄成该精确名 **加** `:*` 两条——
+  `CreateLogStream` / `PutLogEvents` 作用在 stream 层，只给 group ARN 会 403。
+
+#### 为什么不用「拒绝像 site_id 的站点名」
+
+审查 v1 曾提议在 `validate_site_name` 拒绝 fullmatch `SITE_ID_RE` 的名字。**不充分**，
+已实测：名字 `foo-k3d9x1-longname` 合法、**不** fullmatch `SITE_ID_RE`，
+而它产生的 id `foo-k3d9x1-longname-{6位}` 仍被 `site-data-foo-k3d9x1-*` 匹配。
+该正则规则**只作为纵深防御可选保留**，不算修复。
+
+#### GSI
+
+当前**不需要** `table/<name>/index/*`：`provision_dynamodb` 不建任何 GSI，
+contract schema 也不允许声明索引（两处均已核）。但守卫要写成**将来加 GSI 会变红**，
+而不是默默漏掉索引 ARN。
+
+### 4.3 M05 · 必填 `expected_typ`
+
+`session.py`：
+- `mint_session_jwt` 加 `typ: "session"` claim；
+- `verify_session_jwt(token, secret, now=None, *, expected_typ)` —— **必填关键字参数**；
+- `mint_upgrade_code` / `verify_upgrade_code` 不动（已有并已检查 `typ`）。
+
+调用方（全部显式传）：
+- `login_handler.py:491`（`/console-session` 读 sb_session）→ `expected_typ="session"`。
+  **这一行就是链式续期的修复点**：当前它用不查 typ 的 verifier，
+  于是把升级码当 sb_session 递进来即可换出**新的**升级码，无限续期，
+  「60 秒 + 一次性」两个属性同时失效。
+- `console_session.py:131`（`verify_console_cookie`）→ `expected_typ="session"`。
+  面板 cookie 是带 `scope="console"` 的会话 JWT，因此也带 `typ="session"`；
+  两道检查正交、互不替代。
+- Edge 内嵌 `_verify_session_jwt`（`origin_request.py:452-470`）→ 要求
+  `claims.get("typ") == "session"`。
+
+三个 `verify_*_e2e.py` 通过 `mint_session_jwt` 造会话，自动带上 typ，无需改。
+
+#### 「全员重登一次」分两波发生
+
+已确认**不设宽限期**（理由：本项目已有多次"迁移宽限开关没人翻回来"的教训，
+再加一个临时放行开关正是那个形态）。后果分两波：
+
+1. **auth 部署完成的那一刻**——`/console-session` 开始拒绝老 sb_session，
+   控制台用户先被弹一次；
+2. **Edge 全球复制生效的那一刻**——站点访问的老会话失效，第二波。
+
+必须写进运维说明，否则第一波会被当成 bug 去查。
+
+### 4.4 M06 · `_get_cookies` + 上限
+
+`_get_cookie` → `_get_cookies(request, name) -> list[str]`，按 header 顺序返回全部
+同名值；`_check_auth` 逐个验签，**第一个通过的胜出**，全不通过则 302。
+
+**上限取 8**：每次验签是一次 SHA256 HMAC（微秒级），且单条 Cookie 头受浏览器/
+CloudFront 约 8KB 限制、N 天然有界——但显式上限便宜且能把意图写进代码。
+正常 1 条、病态 2 条，8 留足余量又不给放大空间。
+
+`_strip_reserved_cookies`（`origin_request.py:543-548`）已按段过滤、会剥掉**全部**
+同名保留 cookie，转发给站点那侧**不用改**（已核，写在此处免得评审重查）。
+
+## 5. 数据流与错误处理
+
+### 5.1 只有两条数据流改变形状
+
+1. **权限写入流**（panel/MCP → `write_permissions` → 事务）：多一步
+   `effective_policy(site)`，位置在**读到 site 行之后、构造事务之前**。
+   抛错则事务根本不发起 ⇒ 零副作用。**这个位置是硬要求**，不能放进事务里。
+2. **部署流**（`register_route`）：`_seed_permissions`（补缺失）→
+   `effective_policy`（校验类型）→ `_route_item`。**顺序不能换**——
+   种子先跑，"缺失"才不会成为常态错误。
+
+M01 / M05 / M06 只改步骤内部的取值与判定，不改流形状。
+
+### 5.2 错误处理
+
+| 出口 | 映射 | 理由 |
+|---|---|---|
+| panel | **409** + 点名 site_id 与坏字段 + **直接给出修法** | 确实是"资源当前状态阻止本次操作"；panel 里 409 已用于 `PermissionConflict`，语义相邻，运维不用学新东西。**必须给专门分支**——否则会被 `handler.py` 的兜底吞成 500「服务内部错误」，这条修复的"响亮失败"就白做了 |
+| MCP | 可读工具错误（同 `NotOwner` 形态） | 与既有口径一致 |
+| `resync_route` | 异常文案直接透出 | admin 工具 |
+| 审计 | 每次拒绝写 `ops_log.record(action="reject_policy_projection", result="rejected")` | 通道现成，`permissions.py:496/603` 已在用 |
+
+其余三条的失败方向：
+- `register_route` 抛错发生在**提交点之前** ⇒ 线上零影响（同 `upload_frontend`
+  空产物拒绝的模式）；
+- `site_policy` 的空 `tables` 抛错同样在部署早期；
+- Edge 侧 `typ` 不匹配走既有 **302** 分支而非 403——与 idp/auth_via 检查口径一致：
+  引导去登录，而不是让用户以为"没权限"；
+- M06 候选全不通过仍是 302。
+
+## 6. 测试策略
+
+**每条修复先写一条会红的用例。** 本仓库已记过这条教训：安全闸门的测试若没反向
+验证过，"加了守卫"与"守卫不生效"在 CI 上长得一模一样。
+
+### 6.1 M02（deployer 包）
+
+1. **核心红用例**：sites 行 `require_login = Decimal(0)`，跑一次**无关**修改
+   （加协作者）→ 断言路由 `require_auth` 仍为 `True`。当前实现下是 `False`。
+2. 部署路径同形：同一坏行跑 `register_route` → 断言拒绝且路由未被写。
+3. **结构断言**：用 AST 锁定四个 writer 体内不再出现 `bool(site.get(` /
+   `site.get("allowed_users"` 这类直接取值。仓库已有此手法
+   （`test_keys_api.py` 用 ast 锁定返回路径都经过 `_shape_key`）。**这条防的是
+   "将来的第五个 writer"。**
+4. `collaborators` 缺失 → `[]`；其余三字段缺失 → 抛错。
+
+### 6.2 M01（deployer 包）
+
+5. **红用例用 `foo-k3d9x1` / `foo-k3d9x1-longname-abc123` 这一对**——不用
+   `-ab12cd`，因为长名字那一对能证明修的是 ARN 本身而不是名字形态。
+6. 表名格式单一定义：断言三处调用方都走 `site_table_name`。
+7. `engine=="dynamodb"` 且 `tables` 为空 → 抛错。
+8. 日志组资源集合"不多不少"恰好两条（group 与 `group:*`），仿
+   `test_stack_edge_iam.py` 的既有口径。
+
+### 6.3 M05（auth + router 包）
+
+9. **红用例**：`verify_session_jwt(mint_upgrade_code(...), secret, expected_typ="session")` → `None`。
+10. 链式续期被切断：升级码当 sb_session 打 `/console-session` → 拿不到新码。
+11. Edge 侧缺 `typ` → 302。借既有占位符替换机制（`test_edge_auth.py` 读
+    `origin_request.py` 现替换），Edge 改动**自动流入**，不需要手工同步测试副本。
+12. `expected_typ` 漏传即 `TypeError`——必填参数本身也要有守卫。
+
+### 6.4 M06（router 包）
+
+13. **红用例**：两条 `sb_session`，第一条垃圾 → 断言放行。
+14. 上限：第 9 条之后不再尝试。
+15. 回归：`_strip_reserved_cookies` 仍剥掉全部同名（防改 `_get_cookies` 时顺手动坏）。
+
+### 6.5 三条影响任务排序的跨包耦合
+
+- **`session.py` 改签名 ⇒ panel 侧会红。** panel 测试期是从 `auth/` 直接 import
+  `session.py`（部署时才由 `deploy_panel.py` 复制），所以改 auth 的**同一个任务**里
+  必须一起改 `console_session.py:131` 的调用，**不能拆成两个任务**。
+- **`permissions.py` 被复制进三个产物** ⇒ 改完 panel / key-proxy / MCP **都要重部**，
+  S1 验收必须包含 `verify_deployed_components.py`。
+- Edge 改动跑 router 那套：
+  `cd router/infrastructure/lambda && ../../../site-builder/deployer/.venv/bin/pytest . -q`
+
+## 7. 部署与回滚
+
+### 7.1 顺序
+
+```
+1. deployer 栈（M01 + M02 的 permissions.py / register_route.py / common.py）
+2. panel / key-proxy / MCP 重部（permissions.py 被复制进这三个产物）
+3. auth（M05 上半：签发 typ + 自身 verifier 要求 typ）   ← 第一波重登
+4. 等 Edge 全球复制                                      ← 不并行
+5. router（M05 下半 + M06）                              ← 第二波重登
+```
+
+### 7.2 真机验收
+
+- `verify_deployed_components.py` —— 唯一能发现"产物陈旧"的闸门（第 2 步之后必跑）
+- `verify_permission_matrix.py` —— M02 改完后唯一覆盖权限矩阵端到端的闸门
+- `verify_console_e2e.py` —— 跑之前要**重新登录一次**（两波重登会让 token 失效）
+- 部署前**重跑一次 §8.1 的只读体检**（行形态可能已变）
+
+### 7.3 回滚
+
+- 第 1–2 步：代码回滚 + 重部，无数据迁移，可逆。
+- 第 3–5 步：**Edge 回滚要 10–20 分钟全球复制**。
+
+**回滚必须严格逆序：先 router，再 auth。**
+- 回滚 router（Edge 不再要求 typ）后，auth 签发的带 typ token 仍被老 Edge 接受
+  ——老 Edge 只查签名 / exp / email，忽略未知 claim ⇒ 兼容。这是"auth 先"的另一个好处。
+- **反过来会锁死**：若先回滚 auth（重新签发不带 typ 的 token）而 Edge 仍要求 typ，
+  则新签发的会话一律被 302，用户陷入登录循环。
+
+## 8. 已接受的残留与风险
+
+### 8.1 上线前体检结果（2026-08-22 实测，只读）
+
+对 sites 表全量 Scan，7 个 ACTIVE 行的字段形态：
+
+| 字段 | 形态 |
+|---|---|
+| `require_login` | `BOOL` × 7 |
+| `allowed_users` | `S` × 7（值均为 `"org"`） |
+| `collaborators` | `L` × 7 |
+| `owner` | `S` × 7，均非空 |
+
+**严格解析会拒绝的 ACTIVE 行：0** ⇒ S1 上线不会卡住任何现有站点。
+（另有 70 个 `DELETED` 行不参与投影。）
+
+**衍生风险**：7 个站点的 `allowed_users` 全是 `"org"`，即
+`allowed_users` 的 `list[str]` 分支**在生产中从未被使用**，只有测试覆盖。
+实现时要保证该分支的用例够厚。
+
+### 8.2 残留
+
+| 残留 | 说明 | 出路 |
+|---|---|---|
+| 休眠站点保留通配策略 | 已决定靠下次部署收敛；"何时真正修完"不可知 | 可零写入地变可见（验收脚本报 N/M），归 S4 |
+| M06 只关 DoS、**不关身份混淆** | 攻击者若持有另一个**合法** session token，注入到 `path=/api` 后仍会先被取到并验签通过，受害者在 `/api/*` 上被当成攻击者 | 根治是 host-only 会话，独立成包 |
+| M01 的正则纵深防御未加 | 已论证不充分，故不作为修复 | 可选 |
+| 坏数据行会卡住站点 | 四个 writer 统一拒绝的既定代价 | 靠错误文案给出修法（§5.2）缓解 |
+
+### 8.3 与 M09 的关系
+
+M09（同账号 `lambda:InvokeFunction` 可伪造 `x-user-email`）**不在 S1 内**，
+且 S1 的四条修复**都不依赖账号边界** ⇒ 迁不迁账号，S1 都照此实现。
+但需知：M09 未修时，M02 保护的权限投影仍可被直接 invoke 绕过——
+S1 收紧的是**数据面的正确性**，不是**身份来源的可信性**。
+
+## 9. 实施模块划分（供 writing-plans 参考）
+
+| 任务 | 内容 | 依赖 |
+|---|---|---|
+| T1 | 把 §8.1 的**行形态**只读体检固化为可重跑脚本（判断严格解析会不会拒绝现有行）。**注意与 S4 的"通配策略残留"审计不是同一件事**——那个查的是 IAM policy，这个查的是 sites 行 | — |
+| T2 | `common.site_table_name` + 三处调用方切换（含红用例 6） | — |
+| T3 | `common.site_policy` 精确 ARN + 日志组收窄 + `ensure_site_role` 透传（红用例 5/7/8） | T2 |
+| T4 | `permissions.effective_policy` + `PolicyDataInvalid`（红用例 1/4） | — |
+| T5 | 四个 writer 切换到 `effective_policy` + AST 结构断言（红用例 2/3） | T4 |
+| T6 | panel 409 分支 + MCP 错误映射 + ops_log 审计 | T5 |
+| T7 | `session.py` 加 `typ` + `expected_typ` **并同步改 `console_session.py:131`**（同一任务，红用例 9/10/12） | — |
+| T8 | Edge `_verify_session_jwt` 要求 typ（红用例 11） | T7 |
+| T9 | Edge `_get_cookies` + 上限（红用例 13/14/15） | — |
+| T10 | 全量单测 + 按 §7.1 顺序部署 + §7.2 真机验收 | 全部 |
