@@ -6,6 +6,40 @@
 >
 > **红线**：本文不含真实账号 ID / 域名 / site_id / 邮箱 / 角色名，一律用占位符。
 
+## 0.5 v2 修订（Codex 复核 No-Go 后，2026-08-22 +08:00）
+
+Codex 复核 v1 给出 No-Go，其中一条 P1 成立且是**设计错误**，已改：
+
+**v1 选了「M01 靠下次部署自然收敛，不写迁移脚本」，理由是残留只有
+「休眠站点保留通配、何时修完不可知」。那个理由是错的。** 通配是**向前看的**：
+`table/site-data-{A}-*` 覆盖的是所有以 A 的 id 为前缀的 site_id，
+**包括 S1 上线之后才创建的**。所以懒收敛不是"旧风险留在原地"，
+而是把每个存量站点都留成**对未来任意嵌套站点生效的陷阱**——
+M01 的修复对现存站点等于没生效。已实测该匹配为 True。
+
+**实测存量（只读，2026-08-22 +08:00）**：
+
+| 项 | 数 |
+|---|---|
+| 存量 `site-rt-*` 角色 | **7** |
+| 其中带通配的 | **7（全部）** |
+| 带 DynamoDB 通配 `table/site-data-{id}-*` | 2（即 2 个 `fullstack-nosql` 站点） |
+| 带日志组裸前缀 `/aws/lambda/site-{id}*` | **7（全部）** |
+| 已是精确 ARN 的 | 0 |
+| DELETED 站点遗留的孤儿角色 | 0 |
+
+**⇒ 存量角色 backfill 纳入 S1**（见 §4.2.1），并以「带通配的角色数 == 0」
+作为**硬发布闸门**。backfill 零人工：2 个 nosql 站点的 sites 行有 `data_tables`
+（`provision_dynamodb` 为让 undeploy 精确删除而持久化），5 个 sql 站点是 DSQL、
+本就没有 DynamoDB 语句。
+
+其余同轮接受的修订（细节见 plan 的对应任务）：体检脚本改为复用同一份严格解析
+而不是手抄第二套；AST 守卫的声称范围收敛到实际覆盖；补真正的 GSI 触发器；
+ops_log 覆盖三个投影 writer 而不只是写路径；部署顺序里的 Edge 等待点从
+「router 之前」移到「router 之后并等 CloudFront `Status == Deployed`」。
+
+---
+
 ## 1. 背景与目标
 
 四条 finding 共享同一个失效形态：**不变量的检查存在，但绕过它的东西到达了检查点。**
@@ -27,7 +61,8 @@
 ### 2.1 做
 
 - M02：新增严格解析函数，**四个** writer 全部改为调用它。
-- M01：表名格式提成唯一定义；per-site IAM 策略改为精确 ARN；收窄日志组资源。
+- M01：表名格式提成唯一定义；per-site IAM 策略改为精确 ARN；收窄日志组资源；
+  **存量角色 backfill + 「通配角色数 == 0」硬闸门**（v2 纳入，见 §4.2.1）。
 - M05：会话 token 加 `typ`，verifier 增加**必填** `expected_typ`；auth 与 Edge 内嵌两份同步。
 - M06：`_get_cookie` 改为返回全部同名值并逐个验签，带候选上限。
 
@@ -36,10 +71,10 @@
 | 不做 | 理由 | 归属 |
 |---|---|---|
 | host-only 会话重设计 | 会话不能再跨子域共享，而"登录一次访问所有站点"正是靠顶域 cookie 成立；需要重新设计站点级会话交换，属产品级改动 | 独立成包 |
-| M01 存量迁移脚本 | 已决定靠下次部署自然收敛（`ensure_site_role` 每次部署刷新 inline policy） | 见 §8 残留 |
+| ~~M01 存量迁移脚本~~ | **v2 已纳入**（见 §0.5 与 §4.2.1）——懒收敛会让每个存量站点成为对未来嵌套站点生效的陷阱 | S1 内 |
 | 读取侧统一严格解析（`get_site` 包一层） | 会让只读路径（panel 展示、analytics 授权）也在坏数据上抛错，把写入侧问题扩散成站点级不可用，破坏"坏数据 fail-closed 但站点仍可服务"这个既有性质 | 已否决 |
 | 部署合同变更 | 强制 `IF NOT EXISTS` 要同步 contract / skills / fixtures 三处，影响所有生成方 | S2 |
-| 通配策略残留的可观测性 | 「N/M 个站点仍带通配」的审计断言 | S4 |
+| ~~通配策略残留的可观测性~~ | **v2 已纳入**：不再是"可观测性"，而是 §7.2 的**硬发布闸门**（通配角色数必须为 0） | S1 内 |
 | `PolicyDataInvalid` 告警 | 当前 0 例，且这是"数据脏了"而非"正在被攻击"，告警不成比例 | S4（按需） |
 
 ## 3. 总体设计
@@ -81,12 +116,25 @@ S1 不新增组件。它落地为 **5 个「唯一定义」**：
 
 返回 `{"require_login": bool, "allowed_users": "org" | list[str], "collaborators": list[str], "owner": str}`。
 
-**四个 writer 全部改为调用它**：
+**三个投影 writer 改为调用它**（v2 更正了 v1 "四个 writer 全部调用它"的说法
+——第 4 个形态不同，见下）：
 
 1. `permissions.write_permissions`（`permissions.py:507-511`）
 2. `permissions.resync_route`（`permissions.py:760-788`）
 3. `register_route._route_item`（`register_route.py:119,129`）—— **部署路径，两轮审查都漏了这一个**
-4. `scripts/migrate_permissions._parse_allowed`（`migrate_permissions.py:55-82`）
+
+第 4 个 writer `scripts/migrate_permissions._parse_allowed`（`migrate_permissions.py:55-82`）
+**不能调 `effective_policy`**：它的输入是路由表的原始 AttributeValue，
+不是一行 sites 记录，签名根本不匹配。它的收紧方式是
+**把 allowed_users 的规则委托给同一个底层原语 `normalize_allowed_users`**，
+并删掉那条基于过时 Edge 默认的 `"org"` 回落。规则仍然只有一处定义，
+只是入口不同。
+
+**守卫也相应分两条**（v1 只有一条，且 docstring 声称"防第五个 writer"是假话
+——它是硬编码名单）：
+- 针对已知三个 writer 的 tripwire（不许直接 `site.get(<权限字段>)`）；
+- **自动发现版**：任何函数体里出现字面量 `require_auth` 的函数都必须调
+  `effective_policy`。新增第 N 个投影 writer 会被它自动抓到。
 
 第 3 个是实施期发现的：`_seed_permissions` 用 `if_not_exists(...)`，**只补缺失字段、
 不碰错类型字段**，所以 `require_login = Decimal(0)` 会穿过种子逻辑，在 `:129` 被
@@ -135,8 +183,37 @@ S1 不新增组件。它落地为 **5 个「唯一定义」**：
 #### GSI
 
 当前**不需要** `table/<name>/index/*`：`provision_dynamodb` 不建任何 GSI，
-contract schema 也不允许声明索引（两处均已核）。但守卫要写成**将来加 GSI 会变红**，
-而不是默默漏掉索引 ARN。
+contract schema 也不允许声明索引（两处均已核）。
+
+**但 v1 把这条记成"T3 的精确 ARN 断言会在加 GSI 时变红"是错的**（Codex 指出）
+——那三条断言压根不看索引 ARN，将来加了 GSI 它们仍会全绿，而运行时访问索引
+会因缺 `table/.../index/*` 而 403。所以要一条**真正的触发器**：断言
+`provision_dynamodb` 不创建 GSI、且 contract schema 不接受索引声明；
+将来谁加了 GSI 支持，这条变红并强制他同步 `site_policy`。
+
+### 4.2.1 存量角色 backfill（v2 纳入）
+
+一次性脚本，枚举**实际存在的 IAM 角色**（`site-rt-*`）而不是遍历 sites 行
+——孤儿角色（下线清理失败留下的）恰恰是最该收的那类。对每个角色调用
+**同一个** `ensure_site_role(site_id, engine, tables=...)` 重写 policy，
+不另写一条策略构造路径。
+
+engine 与 tables 的来源：
+
+| 来源 | 用途 | fail-closed |
+|---|---|---|
+| sites 行的 `tier` | 经 `common.tier_engine(tier)` 得 engine | 未知 tier ⇒ 跳过该角色并计入"需人工"，不猜 |
+| sites 行的 `data_tables` | engine 为 dynamodb 时的表清单 | 缺失而 engine 是 dynamodb ⇒ 跳过并计入"需人工" |
+
+**`tier_engine` 也要提成唯一定义**：真源是 `contract.schema.TIER_ENGINE`
+（`{"static": "none", "fullstack-nosql": "dynamodb", "fullstack-sql": "dsql"}`），
+而 `undeploy.py:180` 已经手抄了第二份（`"dsql" if tier == "fullstack-sql" else
+"dynamodb"`）。加 `common.tier_engine()` 并让 `undeploy.py:180` 也用它，
+配一条守卫断言它与 `contract.schema.TIER_ENGINE` 逐项一致。
+（这是本轮发现的第 6 个"手抄多份"，与 §3 那五个同类。）
+
+**硬闸门**：脚本跑完后断言"带通配的角色数 == 0"。这条同时进 §7.2 的真机验收
+——通配角色数非 0 就不算 S1 交付完成。
 
 ### 4.3 M05 · 必填 `expected_typ`
 
@@ -201,7 +278,7 @@ M01 / M05 / M06 只改步骤内部的取值与判定，不改流形状。
 | panel | **409** + 点名 site_id 与坏字段 + **直接给出修法** | 确实是"资源当前状态阻止本次操作"；panel 里 409 已用于 `PermissionConflict`，语义相邻，运维不用学新东西。**必须给专门分支**——否则会被 `handler.py` 的兜底吞成 500「服务内部错误」，这条修复的"响亮失败"就白做了 |
 | MCP | 可读工具错误（同 `NotOwner` 形态） | 与既有口径一致 |
 | `resync_route` | 异常文案直接透出 | admin 工具 |
-| 审计 | 每次拒绝写 `ops_log.record(action="reject_policy_projection", result="rejected")` | 通道现成，`permissions.py:496/603` 已在用 |
+| 审计 | 每次拒绝写 `ops_log.record(action="reject_policy_projection", result="rejected")`。**三个投影 writer 都要写**（`write_permissions` / `resync_route` / `register_route`），不是只包写路径——v1 只包了写路径，另两个的拒绝路径没有记录（Codex 指出） | 通道现成，`permissions.py:496/603` 已在用 |
 
 其余三条的失败方向：
 - `register_route` 抛错发生在**提交点之前** ⇒ 线上零影响（同 `upload_frontend`
@@ -267,13 +344,25 @@ M01 / M05 / M06 只改步骤内部的取值与判定，不改流形状。
 ```
 1. deployer 栈（M01 + M02 的 permissions.py / register_route.py / common.py）
 2. panel / key-proxy / MCP 重部（permissions.py 被复制进这三个产物）
-3. auth（M05 上半：签发 typ + 自身 verifier 要求 typ）   ← 第一波重登
-4. 等 Edge 全球复制                                      ← 不并行
-5. router（M05 下半 + M06）                              ← 第二波重登
+3. 存量角色 backfill（§4.2.1）+ 断言通配角色数 == 0     ← v2 新增，必须在 ① 之后
+4. auth（M05 上半：签发 typ + 自身 verifier 要求 typ）   ← 第一波重登
+5. router（M05 下半 + M06）
+6. 等 CloudFront `Status == Deployed`                    ← 第二波重登在此期间发生
+7. 跑 §7.2 的真机验收
 ```
+
+**第 6 步的位置是 v2 修正的**：v1 把"等 Edge 全球复制"放在 router 部署**之前**
+（当时的第 4 步），那时压根还没有新的 Edge 版本要传播，纯属无意义等待
+（Codex 指出）。真正触发传播的是 router 部署本身，所以等待必须在它**之后**，
+而且判据用 CloudFront 分发的 `Status`（传播中是 `InProgress`，完成是 `Deployed`），
+不用盲等 10–20 分钟。
+
+**第 3 步必须在第 1 步之后**：backfill 调的是新版 `ensure_site_role`/`site_policy`。
 
 ### 7.2 真机验收
 
+- **通配角色数 == 0** —— **硬闸门**（v2）。非 0 就不算 S1 交付完成：M01 的修复
+  对那些站点等于没生效，而它们仍是对未来嵌套站点生效的陷阱
 - `verify_deployed_components.py` —— 唯一能发现"产物陈旧"的闸门（第 2 步之后必跑）
 - `verify_permission_matrix.py` —— M02 改完后唯一覆盖权限矩阵端到端的闸门
 - `verify_console_e2e.py` —— 跑之前要**重新登录一次**（两波重登会让 token 失效）
@@ -292,7 +381,10 @@ M01 / M05 / M06 只改步骤内部的取值与判定，不改流形状。
 
 ## 8. 已接受的残留与风险
 
-### 8.1 上线前体检结果（2026-08-22 实测，只读）
+### 8.1 上线前体检结果（2026-08-22 +08:00 实测，只读）
+
+> 时区写明是因为 Codex 复核时按 UTC 读成了"未来日期"：
+> `2026-08-22T01:30+08:00` == `2026-08-21T17:30Z`，是同一时刻。
 
 对 sites 表全量 Scan，7 个 ACTIVE 行的字段形态：
 
@@ -314,7 +406,7 @@ M01 / M05 / M06 只改步骤内部的取值与判定，不改流形状。
 
 | 残留 | 说明 | 出路 |
 |---|---|---|
-| 休眠站点保留通配策略 | 已决定靠下次部署收敛；"何时真正修完"不可知 | 可零写入地变可见（验收脚本报 N/M），归 S4 |
+| ~~休眠站点保留通配策略~~ | **v2 已消除**：backfill 纳入 S1，且以通配角色数 == 0 为硬闸门。v1 把这条当"可观测性残留"是**错的**——通配向前看，等于给未来的嵌套站点留门（§0.5） | 已闭环 |
 | M06 只关 DoS、**不关身份混淆** | 攻击者若持有另一个**合法** session token，注入到 `path=/api` 后仍会先被取到并验签通过，受害者在 `/api/*` 上被当成攻击者 | 根治是 host-only 会话，独立成包 |
 | M01 的正则纵深防御未加 | 已论证不充分，故不作为修复 | 可选 |
 | 坏数据行会卡住站点 | 四个 writer 统一拒绝的既定代价 | 靠错误文案给出修法（§5.2）缓解 |
@@ -332,7 +424,9 @@ S1 收紧的是**数据面的正确性**，不是**身份来源的可信性**。
 |---|---|---|
 | T1 | 把 §8.1 的**行形态**只读体检固化为可重跑脚本（判断严格解析会不会拒绝现有行）。**注意与 S4 的"通配策略残留"审计不是同一件事**——那个查的是 IAM policy，这个查的是 sites 行 | — |
 | T2 | `common.site_table_name` + 三处调用方切换（含红用例 6） | — |
-| T3 | `common.site_policy` 精确 ARN + 日志组收窄 + `ensure_site_role` 透传（红用例 5/7/8） | T2 |
+| T3 | `common.site_policy` 精确 ARN + 日志组收窄 + `ensure_site_role` 透传 + GSI 触发器（红用例 5/7/8） | T2 |
+| T3b | `common.tier_engine()` + `undeploy.py:180` 切过去 + 与 `contract.TIER_ENGINE` 一致性守卫 | — |
+| T3c | 存量角色 backfill 脚本 + 「通配角色数 == 0」硬闸门（§4.2.1） | T3、T3b |
 | T4 | `permissions.effective_policy` + `PolicyDataInvalid`（红用例 1/4） | — |
 | T5 | 四个 writer 切换到 `effective_policy` + AST 结构断言（红用例 2/3） | T4 |
 | T6 | panel 409 分支 + MCP 错误映射 + ops_log 审计 | T5 |
