@@ -20,6 +20,7 @@ import json
 import os
 import pathlib
 import sys
+import time
 import urllib.parse
 
 import boto3
@@ -36,6 +37,20 @@ BACKUP_PATH = ROOT / "site-builder" / "scripts" / "backfill-old-policies.json"
 # "判不出就不猜"）
 EXTRA_POLICY_REASON = "site-scope 之外还有别的 policy（需人工移除，不自动删）"
 MISSING_ROLE_REASON = "ACTIVE 站点的角色缺失（sites 行在、IAM 角色不在，需人工查根因）"
+
+# 裸 dry-run 打印计划、**退出码恒为 0**（除需人工项），所以把这条最顺手的命令
+# 接进发布检查就得到一条恒绿的假闸门——正是 S1 要消灭的形态。
+# 退出码不能改：Task 10 Step 3 在 `set -euo pipefail` 块里先跑裸 dry-run 再
+# `--apply`，而 backfill 之前 targets 必然非空（那正是要跑它的理由），退非 0
+# 会让那个块每次都在 `--apply` 之前中止，部署序列不可跑。于是用一行显式警告顶上。
+DRY_RUN_NOT_A_GATE = ("  >> 以上只是计划预览（这不是闸门；闸门命令是 --check）"
+                      "——dry-run 即使有待收敛角色也退 0，别把它接进发布检查")
+
+# 写后复核的重试退避（秒）：首次尝试之外再试 3 次，共 4 次读，最坏多等 14 秒。
+# IAM 是最终一致的，策略模拟器尤其会滞后一次写入若干秒——不重试的话，一次
+# **完全正确**的 --apply 会把传播延迟记成"落地的 policy 与期望不一致"并退 1，
+# 操作者会合理地读成"迁移把生产 IAM 改坏了"。上限是硬的：不做无限等待。
+_VERIFY_RETRY_BACKOFF = (2, 4, 8)
 
 
 class NeedsManualReview(Exception):
@@ -294,9 +309,14 @@ def _persist_backup(iam, role_names) -> None:
 
     v2 在这里犯过错（Codex 指出）：备份攒在内存字典、循环结束才写文件——
     第 2 个角色写入抛异常（IAM 限流最常见）时，第 1 个已被改而备份文件
-    不存在，承诺的回滚材料落空。所以四条纪律：
+    不存在，承诺的回滚材料落空。所以六条纪律：
     - **先备份后写**：本函数必须在任何 put_role_policy 之前完成；
     - **临时文件 + os.replace**：崩溃不会留下半个 JSON；
+    - **fsync 内容、再 fsync 父目录**：replace 的原子性是文件系统层面的，不等于
+      持久性——replace 返回后内容可能只在 page cache 里，此时掉电就是"IAM 已改、
+      回滚文件 0 字节"。见写盘那段注释；
+    - **临时文件用 O_EXCL 兼作跨进程并发闸**：无锁的 read-modify-write 会让两个
+      并发跑互相覆盖快照，而两边都已改过 IAM。残留 .tmp 需人工处理，不自动删；
     - **合并、绝不覆盖已有快照**：重跑时已收敛的角色不再是 target，
       无条件覆盖会丢掉它们的原始通配 policy——回滚要的恰是第一份快照。
       roles 值为 null = 备份时该角色没有 site-scope inline policy
@@ -342,11 +362,66 @@ def _persist_backup(iam, role_names) -> None:
                             "此时一笔 IAM 写入都没发生。查明根因后重跑。")
                     raise
             roles[name] = policy
+    payload = json.dumps({**meta, "roles": roles}, ensure_ascii=False, indent=2)
     tmp = BACKUP_PATH.parent / (BACKUP_PATH.name + ".tmp")
-    tmp.write_text(json.dumps({**meta, "roles": roles},
-                              ensure_ascii=False, indent=2))
+    # **O_EXCL 兼作并发闸**：备份的 read-modify-write 没有锁，两个操作者（或前一次
+    # 还没退出就重跑）会各自看到"备份文件不存在"、各自只攒自己那批 target，后写的
+    # replace 胜出 ⇒ 另一批角色的原始 policy 永久丢失，而两边**都已经改过 IAM**。
+    # 「合并、绝不覆盖」只在单进程内成立，这里把它扩到跨进程。
+    # 残留的 .tmp 一律当"有别的跑在进行中"处理，**绝不自动删**——自动清理会把
+    # 真正的并发跑重新变成静默互相覆盖。
+    try:
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        raise SystemExit(
+            f"临时备份文件 {tmp} 已存在——判为另一个 backfill 正在运行，中止，"
+            "此时一笔 IAM 写入都没发生。若确认没有别的进程在跑（上一次崩溃留下的"
+            "残留），人工确认内容后删掉它再重跑；本脚本不自动删。")
+    # **fsync 两次**：`os.replace` 只给文件系统层面的原子性，不给持久性——replace
+    # 返回后目标内容仍可能只在 page cache 里。要命的窗口是：replace 成功 →
+    # put_role_policy 全部成功 → 机器掉电 → 生产 IAM 已改而回滚文件是 0 字节。
+    # 第一次 fsync 让**内容**落盘；replace 之后 fsync **父目录**让**改名**落盘。
+    # 两次都必需，少哪一次都留下一个"IAM 已改、回滚材料没了"的窗口。
+    with os.fdopen(fd, "w") as f:
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, BACKUP_PATH)
+    dir_fd = os.open(BACKUP_PATH.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
     print(f"旧 policy 已备份到 {BACKUP_PATH.name}（回滚用；**它不进 git**）")
+
+
+def _verify_landed(iam, role_name, site_id, engine, tables):
+    """写后复核（读回 + 功能模拟），**带上限重试**。→ 失败原因；全绿返回 None。
+
+    **为什么要重试**：IAM 是最终一致的，策略模拟器尤其会滞后一次写入若干秒。
+    不重试的话，一次**完全正确**的 --apply 会把传播延迟记成"落地的 policy 与
+    期望不一致"（或模拟器拒绝）并退 1 —— 一次好跑却报红闸门，操作者会合理地
+    读成"迁移把生产 IAM 改坏了"。
+
+    **只重试读侧，绝不重发 `put_role_policy`**：它本来就幂等，重发只会把画面
+    搅浑（分不清"传播慢"还是"写没生效"）。上限是硬的（`_VERIFY_RETRY_BACKOFF`），
+    不做无限等待；用尽后按**原文**记失败，真正的不一致仍以同样方式报出来。
+    """
+    import common
+    expected = json.loads(common.site_policy(site_id, engine, tables=tables))
+    reason = None
+    for delay in (None,) + _VERIFY_RETRY_BACKOFF:
+        if delay is not None:
+            time.sleep(delay)
+        if _norm(_actual_policy(iam, role_name) or {}) != _norm(expected):
+            reason = "落地的 policy 与期望不一致"
+            continue
+        problems = verify_access(iam, site_id, tables) if engine == "dynamodb" else []
+        if problems:
+            reason = f"{problems}"
+            continue
+        return None
+    return reason
 
 
 def apply_plans(iam, todo) -> list:
@@ -372,13 +447,11 @@ def apply_plans(iam, todo) -> list:
             print(f"  站点 {site_id} 在写入期间被改动过，按新值重写：{tables2}")
             common.ensure_site_role(site_id, engine2, tables=tables2)
             engine, tables = engine2, tables2
-        expected = json.loads(common.site_policy(site_id, engine, tables=tables))
-        if _norm(_actual_policy(iam, name) or {}) != _norm(expected):
-            failed.append(f"{site_id}: 落地的 policy 与期望不一致")
-            continue
-        problems = verify_access(iam, site_id, tables) if engine == "dynamodb" else []
-        if problems:
-            failed.append(f"{site_id}: {problems}")
+        # 读回与功能模拟都带上限重试（IAM 最终一致，见 _verify_landed）。
+        # 失败文案与加重试之前逐字一致。
+        reason = _verify_landed(iam, name, site_id, engine, tables)
+        if reason:
+            failed.append(f"{site_id}: {reason}")
             continue
         print(f"  已重写并验证 {site_id}: engine={engine} tables={tables}")
     return failed
@@ -430,6 +503,10 @@ def main() -> int:
 
     targets = check_roles(iam)
     print(f"待收敛的角色：{len(targets)}")
+    if not args.apply:
+        # 紧跟计数打印，读到数字的人不可能漏掉。只在 dry-run 打：`--apply`
+        # 结尾自己会跑一遍闸门并按结果决定退出码，那时这句话是错的。
+        print(DRY_RUN_NOT_A_GATE)
     todo, manual = [], []
     for name, reason in targets:
         if reason.startswith((EXTRA_POLICY_REASON, MISSING_ROLE_REASON)):

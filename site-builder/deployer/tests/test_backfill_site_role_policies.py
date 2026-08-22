@@ -7,6 +7,7 @@
 import json
 import os
 import pathlib
+import stat
 import sys
 
 import pytest
@@ -370,3 +371,179 @@ def test_dynamodb_site_without_data_tables_is_skipped_not_guessed():
 def test_unknown_tier_is_skipped_not_guessed():
     with pytest.raises(bf.NeedsManualReview, match="tier"):
         bf.plan_for("a-abc123", {"tier": "fullstack-graph"})
+
+
+# ---------------------------------------------------------------------------
+# fix round 1：复核提的四项 Important
+# ---------------------------------------------------------------------------
+
+
+def test_backup_is_fsynced_before_and_after_the_atomic_replace(env, tmp_path):
+    """`os.replace` 只给**文件系统层面的原子性**，不给持久性。
+
+    replace 返回后目标内容仍可能只在 page cache 里。要命的窗口：replace 成功 →
+    7 个 put_role_policy 成功 → 机器掉电 → 生产 IAM 已改而回滚文件是 0 字节。
+    两次 fsync 都必需且顺序固定：先 fsync 临时文件的 fd（让**内容**落盘），
+    replace 之后再 fsync **父目录**的 fd（让**改名**本身落盘）。
+    """
+    events = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def _spy_fsync(fd):
+        kind = "dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
+        events.append(("fsync", kind))
+        return real_fsync(fd)
+
+    def _spy_replace(src, dst):
+        events.append(("replace", None))
+        return real_replace(src, dst)
+
+    env.setattr(os, "fsync", _spy_fsync)
+    env.setattr(os, "replace", _spy_replace)
+    env.setattr(bf, "BACKUP_PATH", tmp_path / "backup.json")
+    bf._persist_backup(_FakeIam({"site-rt-a-abc123": {"orig": 1}}),
+                       ["site-rt-a-abc123"])
+    assert events == [("fsync", "file"), ("replace", None), ("fsync", "dir")]
+    assert json.loads((tmp_path / "backup.json").read_text())["roles"] == {
+        "site-rt-a-abc123": {"orig": 1}}
+
+
+def test_a_leftover_temp_file_aborts_before_any_iam_mutation(env, tmp_path):
+    """备份的 read-modify-write 没有锁 ⇒ 用 O_EXCL 把并发跑挡在写 IAM 之前。
+
+    两个操作者（或前一次还没退出就重跑）会各自看到"备份文件不存在"、各自只
+    攒自己那批 target、后写的 `os.replace` 胜出 ⇒ 另一批角色的原始 policy
+    永久丢失，而两边**都已经改过 IAM**。「合并、绝不覆盖」只在单进程内成立。
+    残留的 .tmp 必须由人工判断后删除，脚本绝不自动清。
+    """
+    import common
+    calls = []
+    env.setattr(common, "ensure_site_role", lambda *a, **k: calls.append(a))
+    # 写后复核也打桩：这条用例唯一该失败的理由是"没有中止"，
+    # 不该被后续步骤缺环境变量的 KeyError 顶掉。
+    env.setattr(common, "get_site_consistent", lambda sid: _nosql_site("notes"))
+    env.setattr(bf, "verify_access", lambda *a, **k: [])
+    env.setattr(bf, "BACKUP_PATH", tmp_path / "backup.json")
+    leftover = tmp_path / "backup.json.tmp"
+    leftover.write_text('{"half": ')          # 上一次崩溃留下的半个 JSON
+    with pytest.raises(SystemExit, match="另一个 backfill"):
+        bf.apply_plans(_FakeIam({"site-rt-a-abc123": {"orig": 1}}),
+                       [("site-rt-a-abc123", "a-abc123", "dynamodb", ["notes"])])
+    assert calls == []                        # 零 IAM 写入
+    assert leftover.read_text() == '{"half": '  # 残留原封不动，等人工处理
+    assert not (tmp_path / "backup.json").exists()
+
+
+def _run_main(env, argv, iam):
+    """跑 main()：`_load_env` 与 `boto3.client` 都打桩，不碰真实 config / AWS。"""
+    env.setattr(sys, "argv", ["backfill"] + argv)
+    env.setattr(bf, "_load_env", lambda *a, **k: None)
+    env.setattr(bf.boto3, "client", lambda name, **kw: iam)
+    return bf.main()
+
+
+def test_only_the_dry_run_warns_that_it_is_not_the_gate(env, capsys):
+    """裸跑必须自己声明"我不是闸门"，`--check` 不该带这句。
+
+    裸跑打印计划、退 0，于是把这条最顺手的命令接进发布检查就得到一条恒绿的
+    假闸门——正是整个 S1 要消灭的形态。退出码不能改（理由见下一条），所以用
+    一行显式警告顶上。
+    """
+    import common
+    env.setattr(common, "get_site_consistent", lambda sid: _nosql_site("notes"))
+    good = json.loads(common.site_policy("a-abc123", "dynamodb", tables=["notes"]))
+    iam = _FakeIam({"site-rt-a-abc123": good})
+
+    assert _run_main(env, [], iam) == 0
+    assert bf.DRY_RUN_NOT_A_GATE in capsys.readouterr().out
+
+    assert _run_main(env, ["--check"], iam) == 0
+    assert bf.DRY_RUN_NOT_A_GATE not in capsys.readouterr().out
+
+    # `--apply` 也不该带这句：它结尾自己跑一遍闸门并按结果定退出码，
+    # 那时"这不是闸门"是错的。（这里 targets 为空 ⇒ 不写任何东西。）
+    assert _run_main(env, ["--apply"], iam) == 0
+    assert bf.DRY_RUN_NOT_A_GATE not in capsys.readouterr().out
+
+
+def test_dry_run_still_exits_zero_with_targets_so_apply_can_be_chained(env, capsys):
+    """**退出码不能改成非 0。** Task 10 Step 3 在 `set -euo pipefail` 块里先跑
+    裸 dry-run 再 `--apply`，而 backfill 之前 targets 必然非空（那正是要跑它的
+    理由）——dry-run 退非 0 会让那个块每次都在 `--apply` 之前中止，部署序列
+    根本不可跑。所以"待收敛 N 个"不计入退出码，只靠警告行提示。
+    """
+    import common
+    env.setattr(common, "get_site_consistent",
+                lambda sid: _nosql_site("notes", "tags"))
+    stale = json.loads(common.site_policy("a-abc123", "dynamodb", tables=["notes"]))
+    assert _run_main(env, [], _FakeIam({"site-rt-a-abc123": stale})) == 0
+    out = capsys.readouterr().out
+    assert "待收敛的角色：1" in out and bf.DRY_RUN_NOT_A_GATE in out
+
+
+class _LaggyIam(_FakeIam):
+    """读回时先给 `stale_reads` 次旧文档，之后给正确的——模拟 IAM 传播滞后。
+
+    第 1 次读是 `_persist_backup` 的备份读，所以计数从它开始。
+    """
+
+    def __init__(self, doc, *, stale_doc, stale_reads):
+        super().__init__({"site-rt-a-abc123": doc})
+        self._stale_doc, self._stale_reads, self.reads = stale_doc, stale_reads, 0
+
+    def get_role_policy(self, RoleName, PolicyName):
+        self.reads += 1
+        doc = (self._stale_doc if self.reads <= self._stale_reads
+               else self._policies[RoleName])
+        return {"PolicyDocument": doc}
+
+
+def _laggy_setup(env, tmp_path, stale_reads):
+    """共享夹具：IAM 写入打桩、sleep 打桩、verify_access 恒绿。
+
+    `verify_access` 打桩是有意的：它靠 IAM 策略模拟器，用 fake 去模拟模拟器只能
+    测出"我怎么调它"。这里要证的是**读回滞后被重试**，所以把模拟段固定成绿。
+    """
+    import common
+    slept, wrote = [], []
+    env.setattr(bf.time, "sleep", lambda s: slept.append(s))
+    env.setattr(common, "ensure_site_role", lambda *a, **k: wrote.append(a))
+    env.setattr(common, "get_site_consistent", lambda sid: _nosql_site("notes"))
+    env.setattr(bf, "verify_access", lambda *a, **k: [])
+    env.setattr(bf, "BACKUP_PATH", tmp_path / "backup.json")
+    good = json.loads(common.site_policy("a-abc123", "dynamodb", tables=["notes"]))
+    stale = json.loads(common.site_policy("a-abc123", "dynamodb", tables=["old"]))
+    iam = _LaggyIam(good, stale_doc=stale, stale_reads=stale_reads)
+    return iam, slept, wrote
+
+
+def test_a_lagging_iam_read_is_retried_instead_of_reported_as_failure(env, tmp_path):
+    """IAM 是最终一致的，策略模拟器尤其会滞后一次写入若干秒。
+
+    不重试的话，一次**完全正确**的 --apply 会把传播延迟记成"落地的 policy 与
+    期望不一致"并退 1——操作者会合理地读成"迁移把生产 IAM 改坏了"。
+    重试只包读侧：`put_role_policy` 幂等，重发它只会搅浑画面，所以断言
+    `ensure_site_role` **恰好被调一次**。
+    """
+    # 备份读(1) + 读回第 1、2 次滞后(2,3)，第 3 次(4) 才对
+    iam, slept, wrote = _laggy_setup(env, tmp_path, stale_reads=3)
+    failed = bf.apply_plans(
+        iam, [("site-rt-a-abc123", "a-abc123", "dynamodb", ["notes"])])
+    assert failed == []
+    assert len(wrote) == 1          # 写只发生一次，重试不重发 put_role_policy
+    assert slept == [2, 4]          # 只睡到成功为止，没有把预算用完
+
+
+def test_the_verify_retry_is_bounded_and_keeps_the_original_failure_message(
+        env, tmp_path):
+    """重试有硬上限：一直不一致 ⇒ 用完 2/4/8 秒退避后仍按**原文**记失败。
+
+    上限是硬要求（不做无限等待），而失败文案必须与加重试之前逐字一致，
+    这样真正的不一致仍然以同样的方式报出来。
+    """
+    iam, slept, wrote = _laggy_setup(env, tmp_path, stale_reads=99)
+    failed = bf.apply_plans(
+        iam, [("site-rt-a-abc123", "a-abc123", "dynamodb", ["notes"])])
+    assert failed == ["a-abc123: 落地的 policy 与期望不一致"]
+    assert slept == [2, 4, 8]       # 有界：退避序列用完就停
+    assert len(wrote) == 1
