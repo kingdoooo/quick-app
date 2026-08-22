@@ -969,12 +969,18 @@ def test_harness_catches_the_hint_being_appended_to_bad_data_again(tmp_path):
 # 而不是"toast 上有某句关于修法的话"。前者做不到时只能去改后端文案（唯一真源），
 # 后者会诱使人在 app.js 里补一句自己的建议——那就是第五份拷贝。
 
-def _real_policy_messages() -> dict[str, str]:
-    """从**真源**取两段文案（不手抄）：effective_policy 自己抛出来的那两句。"""
+def _permissions():
+    """本文件不靠 conftest 的 sys.path（它跑的是 node，不需要 AWS 夹具）。"""
     import sys
     sys.path.insert(0, str(PANEL))
     sys.path.insert(0, str(PANEL.parent / "deployer" / "functions"))
     import permissions
+    return permissions
+
+
+def _real_policy_messages() -> dict[str, str]:
+    """从**真源**取两段文案（不手抄）：effective_policy 自己抛出来的那两句。"""
+    permissions = _permissions()
 
     ok = {"site_id": "s-1", "owner": "o@example.test", "require_login": True,
           "allowed_users": "org", "collaborators": []}
@@ -1008,18 +1014,20 @@ def _render_real_messages(tmp_path: Path, app: Path | None = None) -> dict:
 
 
 def test_absent_branch_reaches_the_toast_telling_the_user_to_deploy_once(tmp_path):
+    # 措辞从 permissions 的常量取，**不手抄片段**（S1 fix round 2）。
+    perm = _permissions()
     rendered = _render_real_messages(tmp_path)["absent"]
-    assert "尚未成功部署过" in rendered, rendered
-    assert "不需要手改库" in rendered, rendered
-    assert "请把 sites 表该行修正为正确类型后重试" not in rendered, rendered
+    assert perm.REPAIR_ABSENT in rendered, rendered
+    assert perm.REPAIR_WRONG_TYPE not in rendered, rendered
     assert RETRY_HINT not in rendered, (
         f"UI 在「去部署一次」后面又追加了「刷新后重试即可」: {rendered}")
 
 
 def test_wrong_typed_branch_reaches_the_toast_telling_the_user_to_fix_the_row(tmp_path):
+    perm = _permissions()
     rendered = _render_real_messages(tmp_path)["wrong-typed"]
-    assert "请把 sites 表该行修正为正确类型后重试" in rendered, rendered
-    assert "尚未成功部署过" not in rendered, rendered
+    assert perm.REPAIR_WRONG_TYPE in rendered, rendered
+    assert perm.REPAIR_ABSENT not in rendered, rendered
     assert RETRY_HINT not in rendered, rendered
 
 

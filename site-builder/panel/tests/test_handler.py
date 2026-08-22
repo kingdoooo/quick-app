@@ -239,8 +239,11 @@ def test_absent_field_over_http_tells_the_user_to_deploy_once(aws, secret):
     assert r["statusCode"] == 409, r
     msg = json.loads(r["body"])["error"]
     assert "require_login" in msg and "字段缺失" in msg, msg
-    assert "尚未成功部署过" in msg, f"没告诉用户「部署一次就好」: {msg}"
-    assert "请把 sites 表该行修正为正确类型后重试" not in msg, (
+    # 措辞从 permissions 的常量取，**不手抄片段**（S1 fix round 2）：抄进来的
+    # 片段是第二份措辞真源，改文案的人得同步 3 个测试文件、2 个包。
+    assert permissions.REPAIR_ABSENT in msg, (
+        f"没告诉用户「部署一次就好」: {msg}")
+    assert permissions.REPAIR_WRONG_TYPE not in msg, (
         f"对一行没有坏值的记录说去手改库——用户找不到要改的东西: {msg}")
 
 
@@ -257,8 +260,8 @@ def test_wrong_typed_field_over_http_tells_the_user_to_fix_the_row(aws, secret):
     assert r["statusCode"] == 409, r
     msg = json.loads(r["body"])["error"]
     assert "require_login" in msg, msg
-    assert "请把 sites 表该行修正为正确类型后重试" in msg, msg
-    assert "尚未成功部署过" not in msg, (
+    assert permissions.REPAIR_WRONG_TYPE in msg, msg
+    assert permissions.REPAIR_ABSENT not in msg, (
         f"建议去部署一次——而部署不会改好一个坏值: {msg}")
 
 

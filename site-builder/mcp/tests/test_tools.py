@@ -379,6 +379,7 @@ def test_bad_policy_data_becomes_a_readable_tool_error(aws, call):
     `do_manage_collaborators` 里 transfer_owner 与 add/remove 是**两个分支**，
     所以两条都单独走一遍——只测其中一条时，把 except 加在错误的层级照样绿。
     """
+    import permissions
     import server
     _seed_site_and_route()
     _break_require_login()
@@ -386,7 +387,8 @@ def test_bad_policy_data_becomes_a_readable_tool_error(aws, call):
         call(server)
     msg = str(excinfo.value)
     assert "require_login" in msg, f"没点名坏字段: {msg}"
-    assert "请把 sites 表该行修正为正确类型后重试" in msg, (
+    # 措辞从 permissions 的常量取，**不手抄片段**（S1 fix round 2）
+    assert permissions.REPAIR_WRONG_TYPE in msg, (
         f"修法文案没到达 Agent——它是这条拒绝唯一的价值: {msg}")
 
 
@@ -398,6 +400,7 @@ def test_absent_policy_field_keeps_the_deploy_once_wording(aws):
     那一行没有任何坏值，他会去找一个不存在的东西。
     """
     import common
+    import permissions
     import server
     common.upsert_site("nodeploy-abc123", owner="o@x.com", name="d",
                        status="DEPLOYING", permissions_rev=1)
@@ -405,8 +408,8 @@ def test_absent_policy_field_keeps_the_deploy_once_wording(aws):
         server.do_update_permissions("o@x.com", "nodeploy-abc123",
                                      require_login=False)
     msg = str(excinfo.value)
-    assert "尚未成功部署过" in msg, f"没告诉用户「部署一次就好」: {msg}"
-    assert "请把 sites 表该行修正为正确类型后重试" not in msg, msg
+    assert permissions.REPAIR_ABSENT in msg, f"没告诉用户「部署一次就好」: {msg}"
+    assert permissions.REPAIR_WRONG_TYPE not in msg, msg
 
 
 def test_update_permissions_works_before_first_deploy(aws):

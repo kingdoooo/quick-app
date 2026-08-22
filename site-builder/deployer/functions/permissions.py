@@ -422,6 +422,42 @@ def normalize_allowed_users(value):
 _ABSENT = object()
 
 
+# ---- 两段补救文案：**全仓库唯一定义**，测试也从这里取 ----
+#
+# 补救文案必须覆盖**能拒的每个字段**（由
+# test_repair_hint_covers_every_field_it_can_reject 钉住）：拒绝的代价是站点
+# 在人工修好之前既不能改权限也不能部署，换来的只有"人照着文案能把那一行改
+# 回来"这一样东西。少一个字段的形态，那个字段的拒绝就是一张工单。
+#
+# **文案分两种，因为两种坏法的修法完全不同**（spec §4.1 把"拒绝"这个代价的
+# 可接受前提写成「错误文案直接给出修法」）：
+#   · 类型不对 ⇒ 那一行存着一个用不了的值，只能人工改对。再部署一百次也
+#     不会把它改好。
+#   · 字段缺失 ⇒ 绝大多数是"这个站点还没成功部署过"：create_site_record
+#     只写 owner/name/status，权限字段由首次部署的
+#     register_route._seed_permissions_if_absent 补齐。对这种行说"请修正为
+#     正确类型"是**不可执行的**——那一行没有任何坏数据，用户会被指去手改
+#     DynamoDB。
+# 两条都带类型清单：缺失的另一种可能是**已部署行被人为删过字段**，那种确实
+# 要照类型补。
+#
+# **为什么是模块级常量而不是 `effective_policy` 的局部变量**（S1 fix round 2）：
+# 三个包的测试要断言"这条消息带的是**哪一支**修法"（panel 的 409、MCP 的工具
+# 错误、控制台 toast 各一套）。局部变量拿不到，于是那些断言只能把措辞片段
+# **手抄进测试**——实测抄了 12 处、跨 3 个测试文件、2 个包。那正是本轮
+# （Task 2 / 3b / 5）一直在消除的形态：同一个不变量被抄成多份，改措辞的人
+# 会倾向于删掉其中一处，而不是想清楚新措辞还能不能区分两支。
+# 提到模块级之后测试写 `assert permissions.REPAIR_ABSENT in msg`，
+# 措辞变成**派生**的：改这里，测试跟着变，不需要同步任何副本。
+_TYPES = ('require_login: BOOL；allowed_users: S="org" 或 L=邮箱数组；'
+          'collaborators: L=邮箱数组（可缺省）；owner: 非空 S')
+REPAIR_WRONG_TYPE = f'请把 sites 表该行修正为正确类型后重试（{_TYPES}）。'
+REPAIR_ABSENT = (
+    '这通常表示该站点**尚未成功部署过**——权限字段由首次成功部署自动初始化，'
+    '所以成功部署一次之后就能正常改权限，不需要手改库。'
+    f'若该站点确实已成功部署过，则是这一行被人为删过字段，请按类型补齐（{_TYPES}）。')
+
+
 def effective_policy(site: dict) -> dict:
     """从 sites 行解出可投影的策略。**三个投影 writer 的唯一入口。**
 
@@ -441,33 +477,11 @@ def effective_policy(site: dict) -> dict:
     ——两侧对坏数据的语义相反，Edge 的加固被写入侧抵消（M02）。
 
     异常文案分两种（**类型不对**要人工改那一行，**字段缺失**通常只是还没成功
-    部署过、部署一次就会初始化）——见 `reject` 上方注释。拒绝的语义与拒绝的
-    输入集合两者都不因此改变。
+    部署过、部署一次就会初始化）——两段文案是模块级常量
+    `REPAIR_WRONG_TYPE` / `REPAIR_ABSENT`，理由与措辞都写在它们上方。
+    拒绝的语义与拒绝的输入集合两者都不因此改变。
     """
     site_id = site.get("site_id", "<unknown>")
-    # 补救文案必须覆盖**能拒的每个字段**（由
-    # test_repair_hint_covers_every_field_it_can_reject 钉住）：拒绝的代价是站点
-    # 在人工修好之前既不能改权限也不能部署，换来的只有"人照着文案能把那一行改
-    # 回来"这一样东西。少一个字段的形态，那个字段的拒绝就是一张工单。
-    #
-    # **文案分两种，因为两种坏法的修法完全不同**（spec §4.1 把"拒绝"这个代价的
-    # 可接受前提写成「错误文案直接给出修法」）：
-    #   · 类型不对 ⇒ 那一行存着一个用不了的值，只能人工改对。再部署一百次也
-    #     不会把它改好。
-    #   · 字段缺失 ⇒ 绝大多数是"这个站点还没成功部署过"：create_site_record
-    #     只写 owner/name/status，权限字段由首次部署的
-    #     register_route._seed_permissions_if_absent 补齐。对这种行说"请修正为
-    #     正确类型"是**不可执行的**——那一行没有任何坏数据，用户会被指去手改
-    #     DynamoDB。
-    # 两条都带类型清单：缺失的另一种可能是**已部署行被人为删过字段**，那种确实
-    # 要照类型补。
-    _types = ('require_login: BOOL；allowed_users: S="org" 或 L=邮箱数组；'
-              'collaborators: L=邮箱数组（可缺省）；owner: 非空 S')
-    repair_wrong_type = f'请把 sites 表该行修正为正确类型后重试（{_types}）。'
-    repair_absent = (
-        '这通常表示该站点**尚未成功部署过**——权限字段由首次成功部署自动初始化，'
-        '所以成功部署一次之后就能正常改权限，不需要手改库。'
-        f'若该站点确实已成功部署过，则是这一行被人为删过字段，请按类型补齐（{_types}）。')
 
     def reject(field, value):
         absent = value is _ABSENT
@@ -475,7 +489,7 @@ def effective_policy(site: dict) -> dict:
         raise PolicyDataInvalid(
             f"站点 {site_id} 的 {field} 形态不合法"
             f"（{found}），已拒绝投影权限。"
-            f"{repair_absent if absent else repair_wrong_type}")
+            f"{REPAIR_ABSENT if absent else REPAIR_WRONG_TYPE}")
 
     # 四个字段一律用 `site.get(key, _ABSENT)` 这**同一个**写法探"缺失"。
     # 不混用 `key not in site` 与 `site.get(key, 默认值)`：三种写法并存时，
@@ -499,7 +513,7 @@ def effective_policy(site: dict) -> dict:
             f"（读到 {type(allowed_users).__name__}：{exc}），"
             # 走到这里字段一定**在**（_ABSENT 已在上面被 reject 掉），所以是
             # "类型不对"那条文案——不能建议去部署，部署不会改好一个坏值。
-            f"已拒绝投影权限。{repair_wrong_type}") from exc
+            f"已拒绝投影权限。{REPAIR_WRONG_TYPE}") from exc
 
     # **全函数唯一一处「缺失有默认值」**——其余三个字段的缺失一律 reject。
     # 这个例外只在这一个字段上站得住：没有 collaborators 键，唯一的读法就是
