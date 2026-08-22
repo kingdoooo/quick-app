@@ -50,6 +50,47 @@ def _plain(item: dict) -> dict:
     return {k: _DESER.deserialize(v) for k, v in item.items()}
 
 
+def _raw_status_label(raw: dict) -> str:
+    """原始行的 status → 报数用的标签。
+
+    非 `S` 类型的 status 不能与「压根没有 status 字段」压成同一个标签：前者要人
+    去修那一行的类型，后者要补一个字段，两者的修法不同。平台今天的三个写入点
+    （建站 DEPLOYING、mark_job ACTIVE、undeploy DELETED）都只写 `{"S": ...}`，
+    但本脚本是专门用来查畸形行的仪器——它不该是最后一个在畸形行上说不清话的地方。
+    """
+    av = raw.get("status")
+    if av is None:
+        return "<无 status>"
+    if isinstance(av, dict) and "S" in av:
+        return av["S"]
+    return f"<非字符串 status: {av!r}>"
+
+
+def _status_text(value) -> str:
+    """反序列化后的 status → 字符串，用于分组、排序与打印。
+
+    非 `S` 类型的 status 反序列化后可能是 Decimal（`{"N":"1"}`）、None
+    （`{"NULL":true}`）或 list（`{"L":[]}`）。**拿这些值本身去分组会炸**：
+    `Counter` 哈希不了 list/dict，`sorted` 在两个不同类型之间 TypeError。
+    两种炸法的后果一样，而且都与本脚本的契约相反——
+    ACTIVE 行一条不坏，脚本却以未捕获异常非零退出（Task 10 Step 2 在
+    `set -euo pipefail` 里跑它，等于用一行不被服务的历史垃圾拦住整个发布），
+    且异常发生在逐行打印之前，操作员**恰好**拿不到这段警告本身。
+    """
+    return value if isinstance(value, str) else repr(value)
+
+
+def _fmt_counts(counter) -> str:
+    """`Counter` → `"A 1、B 2"`，**排序只比较字符串**。
+
+    两个调用点的键都已过 `_raw_status_label` / `_status_text`，所以键本来就是
+    字符串；这里的 `key` 是第二层保险。"排序时直接比较 status 值"这个错误上一轮
+    就在这里犯过一次，代价是一行畸形的 DELETED 行把整个闸门带成非零退出。
+    """
+    return "、".join(f"{k} {n}" for k, n in
+                    sorted(counter.items(), key=lambda kv: str(kv[0])))
+
+
 def _refusals(rows: list) -> list:
     """→ [(site_id, status, 拒绝原因)]。**全脚本唯一的判定处。**
 
@@ -101,14 +142,12 @@ def main() -> int:
             break
         kw["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
     n_active, bad = audit(rows)
-    by_status = collections.Counter(
-        r.get("status", {}).get("S", "<无 status>") for r in rows)
+    by_status = collections.Counter(_raw_status_label(r) for r in rows)
     print(f"sites 表共 {len(rows)} 行，其中 ACTIVE {n_active} 行")
     # 按 status 全量报数，而不是只挑几个类名硬编码：sites 行的 status 只有三个
     # 写入点（建站 DEPLOYING、mark_job 成功 ACTIVE、undeploy DELETED），
     # 但把类名写死在这里的话，将来多一个 status 就会静默漏报。
-    print("各 status 行数：" + "、".join(
-        f"{s} {n}" for s, n in sorted(by_status.items())))
+    print("各 status 行数：" + _fmt_counts(by_status))
     # DEPLOYING 这一类值得单独点出来：这些行还没被 register_route 的
     # `_seed_permissions_if_absent` 补过权限字段（建站只写 owner/name/status/
     # created_at），所以**形态上必然**会被严格解析拒绝。它为 0 只说明此刻没有
@@ -135,8 +174,9 @@ def main() -> int:
     # 没有这段的话，他不可能知道有 15 行没被评价过。
     others = audit_non_active(rows)
     if others:
-        per_status = collections.Counter(st for _sid, st, _why in others)
-        detail = "、".join(f"{s} {n}" for s, n in sorted(per_status.items()))
+        per_status = collections.Counter(
+            _status_text(st) for _sid, st, _why in others)
+        detail = _fmt_counts(per_status)
         print(f"\n非 ACTIVE 行中会被拒绝的：{len(others)}（{detail}）")
         print("  这些行当前**不被服务**（没有路由），所以现在没有任何东西是坏的。"
               "它们只在被**重新部署**时才相关，而一次成功的重新部署会把该行写回"
@@ -147,7 +187,7 @@ def main() -> int:
         print("  「类型写错」这类 seed 补不了（if_not_exists 不覆盖已有值），"
               "那种拒绝是故意的，必须人工修那一行。逐行原因如下：")
         for site_id, status, reason in others:
-            print(f"  -- {site_id} ({status}): {reason}")
+            print(f"  -- {site_id} ({_status_text(status)}): {reason}")
 
     # **退出码只看 ACTIVE**（`others` 故意不参与）：把已下线的历史行算进闸门，
     # 就是用一堆不被服务的行去拦发布。判定集中在这一处，不散在上面的分支里。
