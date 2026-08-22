@@ -315,8 +315,11 @@ def _persist_backup(iam, role_names) -> None:
     - **fsync 内容、再 fsync 父目录**：replace 的原子性是文件系统层面的，不等于
       持久性——replace 返回后内容可能只在 page cache 里，此时掉电就是"IAM 已改、
       回滚文件 0 字节"。见写盘那段注释；
-    - **临时文件用 O_EXCL 兼作跨进程并发闸**：无锁的 read-modify-write 会让两个
-      并发跑互相覆盖快照，而两边都已改过 IAM。残留 .tmp 需人工处理，不自动删；
+    - **O_EXCL 临时文件兼作跨进程锁，且必须在读之前拿到**：无锁的
+      read-modify-write 会让两个并发跑互相覆盖快照，而两边都已改过 IAM。
+      锁盖住读-改-写全程，由 `os.replace`（成功）或 finally 的 unlink（失败）
+      释放；只有崩在写窗口里才会留下 .tmp，那种残留需人工确认，不自动删。
+      放晚一步就等于没有锁——见下面拿锁那段注释里复现出的形态；
     - **合并、绝不覆盖已有快照**：重跑时已收敛的角色不再是 target，
       无条件覆盖会丢掉它们的原始通配 policy——回滚要的恰是第一份快照。
       roles 值为 null = 备份时该角色没有 site-scope inline policy
@@ -331,67 +334,92 @@ def _persist_backup(iam, role_names) -> None:
       A 账号同名 role 的旧快照保留成 B 账号的回滚材料（Codex 指出）——
       不一致就拒绝执行，提示把旧文件移走，绝不静默合并。
     """
-    meta = {"schema_version": 1,
-            "account_id": os.environ["ACCOUNT_ID"],
-            "region": os.environ["AWS_DEFAULT_REGION"]}
-    roles = {}
-    if BACKUP_PATH.exists():
-        saved = json.loads(BACKUP_PATH.read_text())
-        for key, want in meta.items():
-            if saved.get(key) != want:
-                raise SystemExit(
-                    f"已有备份 {BACKUP_PATH.name} 的 {key}={saved.get(key)!r} "
-                    f"与当前 {want!r} 不一致——拒绝合并（它可能属于另一个账号的"
-                    "同名角色）。把旧文件移走后重试。")
-        roles = saved["roles"]
-    for name in role_names:
-        if name not in roles:
-            policy = _actual_policy(iam, name)
-            if policy is None:
-                # null 的语义必须唯一：「角色在、site-scope 不在」。角色在
-                # check_roles 枚举之后被带外删除（TOCTOU 窗口）时，
-                # GetRolePolicy 的 NoSuchEntity 与"只缺 policy"分不出来——
-                # 这里补一次 GetRole，把「角色存在」从运维假设变成技术保证
-                # （Codex 签核附带项）。角色没了 ⇒ 在第一笔 IAM 写入前中止。
-                try:
-                    iam.get_role(RoleName=name)
-                except ClientError as e:
-                    if e.response["Error"]["Code"] == "NoSuchEntity":
-                        raise SystemExit(
-                            f"{name} 在枚举后消失（并发删除？）——中止 backfill，"
-                            "此时一笔 IAM 写入都没发生。查明根因后重跑。")
-                    raise
-            roles[name] = policy
-    payload = json.dumps({**meta, "roles": roles}, ensure_ascii=False, indent=2)
+    # **锁必须在读之前拿到**：O_EXCL 创建临时文件，兼作跨进程互斥锁。
+    # 第一版把它放在读-改-写**之后**，而 `os.replace` 会 unlink tmp、即**释放**锁
+    # ——于是锁只活微秒级，既没盖住别人的读阶段也没盖住自己写 IAM 的阶段。
+    # 复核用单线程 fake 确定性复现过：A 的整个 _persist_backup 在 B 的读循环中间
+    # 跑完，A 的原始 policy 就从回滚文件里消失，而 A 的 O_EXCL 从未撞上——此时 A
+    # 已经在 put_role_policy 循环里，等于"原始不可恢复 + 还要继续改"。
+    # 放到最前面之后：读-改-写对其他跑是原子的；持锁期间来的跑中止，
+    # 在赢家 replace 之后来的跑读到已合并的文件再往上合并，谁都不丢。
     tmp = BACKUP_PATH.parent / (BACKUP_PATH.name + ".tmp")
-    # **O_EXCL 兼作并发闸**：备份的 read-modify-write 没有锁，两个操作者（或前一次
-    # 还没退出就重跑）会各自看到"备份文件不存在"、各自只攒自己那批 target，后写的
-    # replace 胜出 ⇒ 另一批角色的原始 policy 永久丢失，而两边**都已经改过 IAM**。
-    # 「合并、绝不覆盖」只在单进程内成立，这里把它扩到跨进程。
-    # 残留的 .tmp 一律当"有别的跑在进行中"处理，**绝不自动删**——自动清理会把
-    # 真正的并发跑重新变成静默互相覆盖。
     try:
         fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
+        # 注意：这条出口在 try/finally **之外**——不能顺手删掉别人的锁文件，
+        # 也不能删掉上一次崩在写窗口里留下的那个（它要人工确认内容后再删）。
         raise SystemExit(
             f"临时备份文件 {tmp} 已存在——判为另一个 backfill 正在运行，中止，"
             "此时一笔 IAM 写入都没发生。若确认没有别的进程在跑（上一次崩溃留下的"
             "残留），人工确认内容后删掉它再重跑；本脚本不自动删。")
-    # **fsync 两次**：`os.replace` 只给文件系统层面的原子性，不给持久性——replace
-    # 返回后目标内容仍可能只在 page cache 里。要命的窗口是：replace 成功 →
-    # put_role_policy 全部成功 → 机器掉电 → 生产 IAM 已改而回滚文件是 0 字节。
-    # 第一次 fsync 让**内容**落盘；replace 之后 fsync **父目录**让**改名**落盘。
-    # 两次都必需，少哪一次都留下一个"IAM 已改、回滚材料没了"的窗口。
-    with os.fdopen(fd, "w") as f:
-        f.write(payload)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, BACKUP_PATH)
-    dir_fd = os.open(BACKUP_PATH.parent, os.O_RDONLY)
+    handle, replaced = os.fdopen(fd, "w"), False
     try:
-        os.fsync(dir_fd)
+        meta = {"schema_version": 1,
+                "account_id": os.environ["ACCOUNT_ID"],
+                "region": os.environ["AWS_DEFAULT_REGION"]}
+        roles = {}
+        if BACKUP_PATH.exists():
+            saved = json.loads(BACKUP_PATH.read_text())
+            for key, want in meta.items():
+                if saved.get(key) != want:
+                    raise SystemExit(
+                        f"已有备份 {BACKUP_PATH.name} 的 {key}={saved.get(key)!r} "
+                        f"与当前 {want!r} 不一致——拒绝合并（它可能属于另一个账号的"
+                        "同名角色）。把旧文件移走后重试。")
+            roles = saved["roles"]
+        for name in role_names:
+            if name not in roles:
+                policy = _actual_policy(iam, name)
+                if policy is None:
+                    # null 的语义必须唯一：「角色在、site-scope 不在」。角色在
+                    # check_roles 枚举之后被带外删除（TOCTOU 窗口）时，
+                    # GetRolePolicy 的 NoSuchEntity 与"只缺 policy"分不出来——
+                    # 这里补一次 GetRole，把「角色存在」从运维假设变成技术保证
+                    # （Codex 签核附带项）。角色没了 ⇒ 在第一笔 IAM 写入前中止。
+                    try:
+                        iam.get_role(RoleName=name)
+                    except ClientError as e:
+                        if e.response["Error"]["Code"] == "NoSuchEntity":
+                            raise SystemExit(
+                                f"{name} 在枚举后消失（并发删除？）——中止 backfill，"
+                                "此时一笔 IAM 写入都没发生。查明根因后重跑。")
+                        raise
+                roles[name] = policy
+        payload = json.dumps({**meta, "roles": roles},
+                             ensure_ascii=False, indent=2)
+        # **fsync 两次**：`os.replace` 只给文件系统层面的原子性，不给持久性——
+        # replace 返回后目标内容仍可能只在 page cache 里。要命的窗口是：replace
+        # 成功 → put_role_policy 全部成功 → 机器掉电 → 生产 IAM 已改而回滚文件
+        # 是 0 字节。第一次 fsync 让**内容**落盘；replace 之后 fsync **父目录**
+        # 让**改名**落盘。两次都必需，少哪一次都留下"IAM 已改、回滚材料没了"的窗口。
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+        os.replace(tmp, BACKUP_PATH)
+        replaced = True
+        dir_fd = os.open(BACKUP_PATH.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     finally:
-        os.close(dir_fd)
+        # close 也要包起来：它若抛（缓冲区刷盘失败）会既盖掉原始异常、又让下面的
+        # unlink 根本执行不到，于是锁文件留下而真正的错因不见了。
+        try:
+            handle.close()      # 幂等；成功路径上已经关过
+        except OSError:
+            pass
+        if not replaced:
+            # **锁必须释放**，否则循环里的两个中止出口（限流重抛、"枚举后消失"）
+            # 会把锁文件留在原地 ⇒ 一次瞬时限流就让之后每次重跑都被挡住，
+            # 直到人工删文件——把自愈故障变成阻塞运维的故障。
+            # replace 成功后 tmp 已经不存在，所以用标志判断而不是 exists()。
+            # unlink 自身的异常必须吞掉：绝不能盖掉正在传播的原始异常。
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
     print(f"旧 policy 已备份到 {BACKUP_PATH.name}（回滚用；**它不进 git**）")
 
 

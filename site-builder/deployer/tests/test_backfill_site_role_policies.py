@@ -409,12 +409,13 @@ def test_backup_is_fsynced_before_and_after_the_atomic_replace(env, tmp_path):
 
 
 def test_a_leftover_temp_file_aborts_before_any_iam_mutation(env, tmp_path):
-    """备份的 read-modify-write 没有锁 ⇒ 用 O_EXCL 把并发跑挡在写 IAM 之前。
+    """**只测"残留锁文件"这一条**：崩在写窗口里的上一次跑留下 .tmp ⇒ 下一次跑
+    在任何 IAM 写入之前中止，且**不自动删**那个文件（要人工确认内容后再删）。
 
-    两个操作者（或前一次还没退出就重跑）会各自看到"备份文件不存在"、各自只
-    攒自己那批 target、后写的 `os.replace` 胜出 ⇒ 另一批角色的原始 policy
-    永久丢失，而两边**都已经改过 IAM**。「合并、绝不覆盖」只在单进程内成立。
-    残留的 .tmp 必须由人工判断后删除，脚本绝不自动清。
+    并发互相覆盖那条不变量由
+    `test_a_concurrent_run_cannot_clobber_another_runs_snapshot` 覆盖——它需要
+    真正把另一次跑交错进来才测得到，本用例只预置一个文件，测不出那件事
+    （这条 docstring 原先声称测的是并发，名不副实，复核指出）。
     """
     import common
     calls = []
@@ -432,6 +433,94 @@ def test_a_leftover_temp_file_aborts_before_any_iam_mutation(env, tmp_path):
     assert calls == []                        # 零 IAM 写入
     assert leftover.read_text() == '{"half": '  # 残留原封不动，等人工处理
     assert not (tmp_path / "backup.json").exists()
+
+
+def test_a_concurrent_run_cannot_clobber_another_runs_snapshot(env, tmp_path):
+    """锁必须罩住**读-改-写全程**，不是只罩住写盘那一瞬。
+
+    第一版把 O_EXCL 放在读-改-写**之后**，而 `os.replace` 会 unlink 掉 tmp、
+    即**释放**它——于是锁只存在微秒级，既没盖住别人的读阶段也没盖住自己的
+    写 IAM 阶段。复核用单线程 + fake 确定性地复现了原缺陷：让 A 的整个
+    `_persist_backup` 在 B 的逐角色读循环中间跑完，A 的原始 policy 就从回滚
+    文件里消失了，而 A 的 O_EXCL 从未撞上——此时 A 已经在 put_role_policy 循环里。
+
+    本用例把那个交错固定下来：B 持锁期间 A 必须**中止**（而不是悄悄写出一份
+    只含自己的快照再被 B 覆盖）；A 事后重跑时读到的是已合并的文件，
+    于是两份原始 policy 都在——「谁都不丢」。
+    """
+    path = tmp_path / "backup.json"
+    env.setattr(bf, "BACKUP_PATH", path)
+    iam = _FakeIam({"site-rt-a-abc123": {"orig": "A"},
+                    "site-rt-b-abc123": {"orig": "B"}})
+    real_actual = bf._actual_policy
+    run_a = {"started": False, "error": None}
+
+    def _actual_with_run_a_interleaved(iam_, role_name):
+        # 此刻 B 已经读过 BACKUP_PATH（不存在）、正在逐角色读 policy——
+        # 正是原缺陷需要的那个时刻。让 A 完整跑一遍。
+        if not run_a["started"]:
+            run_a["started"] = True
+            try:
+                bf._persist_backup(iam_, ["site-rt-a-abc123"])
+            except SystemExit as exc:
+                run_a["error"] = str(exc)
+        return real_actual(iam_, role_name)
+
+    env.setattr(bf, "_actual_policy", _actual_with_run_a_interleaved)
+    bf._persist_backup(iam, ["site-rt-b-abc123"])          # 这一次是 B
+    assert run_a["started"], "交错没发生，这条用例什么都没测到"
+    assert run_a["error"] and "另一个 backfill" in run_a["error"], \
+        "B 持锁期间 A 必须中止；A 跑完就意味着它的快照会被 B 覆盖掉"
+    assert json.loads(path.read_text())["roles"] == {
+        "site-rt-b-abc123": {"orig": "B"}}
+
+    # A 事后重跑（操作者看到"另一个 backfill 正在运行"后该做的事）：
+    # 读到 B 已合并的文件并在其上合并，两份原始都在 ⇒ 谁都没丢。
+    bf._persist_backup(iam, ["site-rt-a-abc123"])
+    assert json.loads(path.read_text())["roles"] == {
+        "site-rt-a-abc123": {"orig": "A"},
+        "site-rt-b-abc123": {"orig": "B"}}
+
+
+def test_a_transient_read_failure_leaves_no_lock_file_behind(env, tmp_path):
+    """限流是**瞬时、自愈**的故障，绝不能因此留下锁文件。
+
+    把 O_EXCL 移到读-改-写之前会带来这个陷阱：循环里既有的两个中止出口
+    （`_actual_policy` 的非 NoSuchEntity 重抛、以及"枚举后消失"的 SystemExit）
+    会把锁文件留在原地 ⇒ **一次 IAM 限流就让之后每一次重跑都被挡住**，
+    直到人工删文件——把临时故障变成阻塞运维的故障。
+
+    既有的 `test_a_transient_read_error_during_backup_stops_before_any_mutation`
+    只断言 `backup.json` 不存在、对 `.tmp` 一字未提，所以锁泄漏时它照样绿
+    （复核指出）。这条专门盯 `.tmp`，并验证限流过去后重跑能正常成功。
+    """
+    path = tmp_path / "backup.json"
+    env.setattr(bf, "BACKUP_PATH", path)
+
+    class _ThrottledOnce(_FakeIam):
+        def __init__(self, policies):
+            super().__init__(policies)
+            self.throttling = True
+
+        def get_role_policy(self, RoleName, PolicyName):
+            if self.throttling:
+                raise ClientError(
+                    {"Error": {"Code": "Throttling", "Message": "rate exceeded"}},
+                    "GetRolePolicy")
+            return super().get_role_policy(RoleName, PolicyName)
+
+    iam = _ThrottledOnce({"site-rt-a-abc123": {"orig": "A"}})
+    with pytest.raises(ClientError):
+        bf._persist_backup(iam, ["site-rt-a-abc123"])
+    assert not (tmp_path / "backup.json.tmp").exists(), \
+        "限流留下了锁文件——下一次重跑会被自己上一次的残留挡住"
+    assert not path.exists()
+
+    # 限流过去，重跑必须正常成功（而不是报"另一个 backfill 正在运行"）
+    iam.throttling = False
+    bf._persist_backup(iam, ["site-rt-a-abc123"])
+    assert json.loads(path.read_text())["roles"] == {
+        "site-rt-a-abc123": {"orig": "A"}}
 
 
 def _run_main(env, argv, iam):
