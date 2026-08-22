@@ -106,7 +106,7 @@ def handler(event, context):
     applied = list(site.get("migrations_applied", []))
 
     # AWS IAM GRANT 要求 IAM 角色已存在（官方流程：IAM role → DB role → GRANT）
-    common.ensure_site_role(site_id, "dsql")
+    common.ensure_site_role(site_id, "dsql", tables=[])
 
     # 阶段一：admin 身份只做引导——建 schema、建两个 per-site role、授权。
     # 不在此连接上执行任何站点提交的 SQL。

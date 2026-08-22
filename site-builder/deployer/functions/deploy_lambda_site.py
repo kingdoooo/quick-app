@@ -161,7 +161,9 @@ def handler(event, context):
     fn = f"site-{event['site_id']}"
     _ensure_log_group(fn)
     engine = event["manifest"].get("database", {}).get("engine", "none")
-    role_arn = _ensure_site_role(event["site_id"], engine)
+    tables = [t["name"] for t in
+              event["manifest"].get("database", {}).get("tables", [])]
+    role_arn = _ensure_site_role(event["site_id"], engine, tables=tables)
     env = {"AWS_LAMBDA_EXEC_WRAPPER": "/opt/bootstrap", "PORT": "8080",
            "AWS_LWA_INVOKE_MODE": "BUFFERED", **event.get("env_vars", {})}
     code = {"S3Bucket": os.environ["ARTIFACTS_BUCKET"], "S3Key": event["backend_zip_key"]}

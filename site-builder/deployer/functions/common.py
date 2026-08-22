@@ -591,27 +591,51 @@ def site_role_arn(site_id: str) -> str:
     return f"arn:aws:iam::{os.environ['ACCOUNT_ID']}:role/{site_role_name(site_id)}"
 
 
-def site_policy(site_id: str, engine: str) -> str:
+def site_policy(site_id: str, engine: str, *, tables: list[str]) -> str:
+    """per-site 运行时角色的 inline policy。
+
+    **DynamoDB 资源逐表枚举精确 ARN，不得用 `site-data-{site_id}-*` 通配**（M01）：
+    site_id 自身可含 `-`，所以站点 A（id `foo-k3d9x1`）的通配会匹配站点 B
+    （id `foo-k3d9x1-…`）的全部表 ⇒ 跨租户读写。PermissionsBoundary 放开的是
+    整个 `site-data-*`（它只封顶最坏能力面），**per-tenant 隔离完全依赖本函数**。
+
+    `tables` 是**必填关键字参数**——迫使调用方表态，而不是靠默认值悄悄退回通配。
+    engine 为 `dsql` / `none` 时忽略它；engine 为 `dynamodb` 而它为空则抛错。
+    """
     import json
     region, acct = os.environ.get("AWS_DEFAULT_REGION", "us-east-1"), os.environ["ACCOUNT_ID"]
+    fn = f"site-{site_id}"
     statements = [{
         "Effect": "Allow",
         "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
-        "Resource": f"arn:aws:logs:{region}:{acct}:log-group:/aws/lambda/site-{site_id}*"}]
+        # 精确日志组名（函数名就是 site-{site_id}）+ stream 层两条。
+        # 原来是裸前缀 `…/site-{site_id}*`，会匹配到 id 以本站点为前缀的其他站点。
+        "Resource": [f"arn:aws:logs:{region}:{acct}:log-group:/aws/lambda/{fn}",
+                     f"arn:aws:logs:{region}:{acct}:log-group:/aws/lambda/{fn}:*"]}]
     if engine == "dynamodb":
+        if not tables:
+            raise ValueError(
+                f"站点 {site_id} 的 engine 是 dynamodb 但没有声明表——"
+                "空 Resource 列表是非法 IAM，且合同要求至少一张表")
         statements.append({
             "Effect": "Allow",
             "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem",
                        "dynamodb:DeleteItem", "dynamodb:Query", "dynamodb:Scan"],
-            "Resource": f"arn:aws:dynamodb:{region}:{acct}:table/{site_table_name(site_id, '')}*"})
+            "Resource": [
+                f"arn:aws:dynamodb:{region}:{acct}:table/{site_table_name(site_id, t)}"
+                for t in tables]})
     elif engine == "dsql":
         statements.append({"Effect": "Allow", "Action": "dsql:DbConnect",
                            "Resource": "*"})  # 数据隔离由 per-site PG role 保证
     return json.dumps({"Version": "2012-10-17", "Statement": statements})
 
 
-def ensure_site_role(site_id: str, engine: str) -> str:
-    """幂等创建 per-site 运行时角色（带 PermissionsBoundary）并刷新 inline policy。"""
+def ensure_site_role(site_id: str, engine: str, *, tables: list[str]) -> str:
+    """幂等创建 per-site 运行时角色（带 PermissionsBoundary）并刷新 inline policy。
+
+    `tables` 透传给 site_policy（必填，理由见那里）。**每次部署都刷新 policy**
+    ——这也是 M01 存量收敛的机制：站点下一次部署时自动换成精确 ARN。
+    """
     iam = boto3.client("iam")
     name = site_role_name(site_id)
     try:
@@ -623,5 +647,5 @@ def ensure_site_role(site_id: str, engine: str) -> str:
             Tags=[{"Key": "project", "Value": "site-builder"},
                   {"Key": "site_id", "Value": site_id}])["Role"]["Arn"]
     iam.put_role_policy(RoleName=name, PolicyName="site-scope",
-                        PolicyDocument=site_policy(site_id, engine))
+                        PolicyDocument=site_policy(site_id, engine, tables=tables))
     return arn

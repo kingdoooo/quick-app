@@ -419,3 +419,77 @@ def test_site_table_name_is_the_canonical_format():
     """
     import common
     assert common.site_table_name("foo-k3d9x1", "notes") == "site-data-foo-k3d9x1-notes"
+
+
+def test_site_policy_never_matches_a_nested_sites_tables(monkeypatch):
+    """A 的策略绝不能匹配 B 的表——即使 B 的 site_id 以 A 的 site_id 开头。
+
+    这一对是关键（Codex 复审给出的绕过变体，已实测）：B 的**名字**
+    `foo-k3d9x1-longname` 是合法站点名、且**不** fullmatch SITE_ID_RE，
+    所以"拒绝像 site_id 的名字"那类修法拦不住它——只有精确 ARN 能。
+    用这一对而不是 `foo-k3d9x1-ab12cd`，正是为了证明修的是 ARN 本身。
+    """
+    import fnmatch
+    import json
+    monkeypatch.setenv("ACCOUNT_ID", "111111111111")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    a, b = "foo-k3d9x1", "foo-k3d9x1-longname-abc123"
+    doc = json.loads(common.site_policy(a, "dynamodb", tables=["notes"]))
+    resources = []
+    for stmt in doc["Statement"]:
+        res = stmt["Resource"]
+        resources += res if isinstance(res, list) else [res]
+    b_table = ("arn:aws:dynamodb:us-east-1:111111111111:table/"
+               + common.site_table_name(b, "notes"))
+    assert not any(fnmatch.fnmatchcase(b_table, r) for r in resources), (
+        f"站点 {a} 的策略匹配到了站点 {b} 的表；资源集合: {resources}")
+
+
+def test_log_group_resources_are_exact_not_a_bare_prefix(monkeypatch):
+    """日志组资源必须是精确名 + stream 层两条，不多不少。
+
+    裸前缀 `/aws/lambda/site-{site_id}*` 同样会匹配到 site_id 以本站点为前缀的
+    其他站点的日志组（可写别人的日志流 = 审计伪造）。给两条是因为
+    CreateLogStream / PutLogEvents 作用在 stream 层，只给 group ARN 会 403。
+    """
+    import json
+    monkeypatch.setenv("ACCOUNT_ID", "111111111111")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    doc = json.loads(common.site_policy("s-1", "none", tables=[]))
+    logs = [s for s in doc["Statement"]
+            if any(a.startswith("logs:") for a in s["Action"])]
+    assert len(logs) == 1
+    assert logs[0]["Resource"] == [
+        "arn:aws:logs:us-east-1:111111111111:log-group:/aws/lambda/site-s-1",
+        "arn:aws:logs:us-east-1:111111111111:log-group:/aws/lambda/site-s-1:*"]
+
+
+def test_dynamodb_engine_without_tables_is_rejected(monkeypatch):
+    """engine=dynamodb 但没声明表 ⇒ 抛错，不许退回通配。
+
+    空 Resource 列表本身是非法 IAM，而合同要求 dynamodb 站点至少一张表。
+    """
+    import pytest
+    monkeypatch.setenv("ACCOUNT_ID", "111111111111")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    with pytest.raises(ValueError, match="没有声明表"):
+        common.site_policy("s-1", "dynamodb", tables=[])
+
+
+def test_no_gsi_support_yet_so_index_arns_are_not_needed():
+    """GSI 触发器：当前站点表没有 GSI，所以 policy 不含 index ARN。
+
+    **这条是真的触发器，不是"精确 ARN 断言顺带覆盖"**（v1 的覆盖表那么写是错的
+    ——那三条断言压根不看索引 ARN，将来加了 GSI 它们仍会全绿，而运行时访问索引
+    会因缺 `table/.../index/*` 而 403）。谁将来给站点表加 GSI 支持，这条会红，
+    强制他同步 `site_policy`。
+    """
+    import pathlib
+    root = pathlib.Path(__file__).parents[1]
+    provisioner = (root / "functions" / "provision_dynamodb.py").read_text()
+    assert "GlobalSecondaryIndex" not in provisioner, (
+        "provision_dynamodb 开始建 GSI 了 —— site_policy 必须同步加 "
+        "table/<name>/index/* 资源，否则站点访问索引会 403")
+    schema = (root.parents[0] / "contract" / "src" / "contract" / "schema.py").read_text()
+    assert "index" not in schema.lower(), (
+        "contract schema 开始接受索引声明了 —— 同上，site_policy 要同步")
