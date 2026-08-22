@@ -479,10 +479,27 @@ def _verify_session_jwt(token: str) -> dict | None:
         return None
 
 
-# 同名 sb_session 的候选上限。正常 1 条、病态 2 条，8 留足余量又不给放大空间。
-# 每次验签是一次 SHA256 HMAC（微秒级），且单条 Cookie 头受浏览器/CloudFront
-# 约 8KB 限制、N 本就有界——显式上限便宜，且把意图写进代码。
-MAX_SESSION_COOKIE_CANDIDATES = 8
+# 同名 sb_session 的候选上限。
+#
+# **真正的界是 Cookie 头的体积限制**（浏览器/CloudFront 约 8KB ⇒ 最多约 630 条），
+# 而验签是纯 CPU 的 SHA256 HMAC：实测把 630 条全验完只花 0.407ms。所以这个常量
+# 不是性能保护，而是**把意图写进代码**的文档，取值必须设在任何可达值之上。
+#
+# **为什么不是 8**（fix 轮 1，8 会让 M06 在最要紧的端点上原样复活，已复算）：
+# RFC 6265 §5.1.4 让请求路径的**每个 `/` 边界前缀**都是合法 cookie-path，
+# §5.4.2 又让路径长的先发，于是可遮蔽条数 ≈ 路径前缀数 × 可设域名数。
+# 对 console 的 `/api/sites/{id}/analytics`：比 `/` 更长的合法 path 有 7 条
+# （`/api` `/api/` `/api/sites` `/api/sites/` `/api/sites/{id}`
+#   `/api/sites/{id}/` `/api/sites/{id}/analytics`），站点 JS 能给**两个**父域
+# 设 cookie 且都会送到 console 这个兄弟 host ⇒ 7 × 2 = **14 条**，全部排在
+# `Path=/` 的真会话前面 ⇒ 上限 8 时真 token（第 15 位）压根不被尝试。
+# 而 4 段路径正是 site-detail / permissions / collaborators / owner / undeploy /
+# analytics / visitors 这些**用来排查和自救**的 console 接口。
+#
+# 64 要被打满需要每个域约 32 条路径前缀（每段贡献 `/dir` 与 `/dir/` 两条
+# ⇒ 约 16 段的 URL），本平台不存在这种路径。**别往下调**：调到某个"看起来够用"
+# 的小值，就是把 M06 放回来换 0.35ms 的最坏 CPU。
+MAX_SESSION_COOKIE_CANDIDATES = 64
 
 
 def _get_cookies(request, name: str) -> list:

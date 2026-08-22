@@ -697,17 +697,51 @@ def test_a_garbage_cookie_in_front_does_not_lock_the_user_out():
 
 
 def test_only_the_first_candidates_are_tried():
-    """上限是**行为**约束而不是一个常量断言——第 9 条之后不再尝试。
+    """上限是**行为**约束而不是一个常量断言——第 cap+1 条之后不再尝试。
 
-    防的是"注入 N 条 cookie 压 HMAC"这种放大。把好 token 放在第 9 位，
-    断言它**不**被放行；这样上限被调大或调没了，这条都会红。
+    防的是"注入 N 条 cookie 压 HMAC"这种放大。把好 token 放在第 cap+1 位，
+    断言它**不**被放行；这样上限被调没了，这条会红。
+
+    **条数从常量派生，不写死 8/9**（fix 轮 1）：写死的话上限一改，这条用例就在
+    悄悄测一个**错误的边界**——而且它照样是绿的，等于守卫失效却无人知道。
+    """
+    cap = orq.MAX_SESSION_COOKIE_CANDIDATES
+    good = _jwt(email="v@example.test")
+    garbage = "; ".join(f"sb_session=x{i}" for i in range(cap))
+    request = _req(cookie=f"{garbage}; sb_session={good}")
+    assert len(orq._get_cookies(request, "sb_session")) == cap + 1
+    assert orq._check_auth(request, ROUTE_AUTH, "app-x.example.test") is not None, \
+        f"第 {cap + 1} 条候选不应被尝试（上限失效了）"
+
+
+def test_a_real_world_shadowing_burst_still_authenticates():
+    """14 条遮蔽候选压在合法会话前面仍须放行——**M06 真正关闭的判据**。
+
+    14 不是随手取的数（fix 轮 1 把上限从 8 提到 64 的理由，已独立复算）：
+    RFC 6265 §5.1.4 让请求路径的**每个 `/` 边界前缀**都是合法 cookie-path，
+    §5.4.2 又让路径长的先发。对 console 的 `/api/sites/{id}/analytics`，
+    比 `/` 更长的可设路径正好 7 条（`/api`、`/api/`、`/api/sites`、
+    `/api/sites/`、`/api/sites/{id}`、`/api/sites/{id}/`、
+    `/api/sites/{id}/analytics`）；站点 JS 能给**两个**父域设 cookie，
+    两者都会送到 console 这个兄弟 host ⇒ 7 × 2 = 14 条，全部排在 `Path=/`
+    的真会话前面，真 token 落在**第 15 位**。
+
+    上限为 8 时它压根不被尝试，受害者拿到的正是 M06 描述的持久 302——而失效的
+    恰好是 site-detail / permissions / collaborators / owner / undeploy /
+    analytics / visitors 这些他**用来排查和自救**的 console 接口（都是 4 段路径）。
+    所以"上限 8"下 M06 只是被收窄、没有被关掉。
     """
     good = _jwt(email="v@example.test")
-    garbage = "; ".join(f"sb_session=x{i}" for i in range(8))
-    request = _req(cookie=f"{garbage}; sb_session={good}")
-    assert len(orq._get_cookies(request, "sb_session")) == 9
-    assert orq._check_auth(request, ROUTE_AUTH, "app-x.example.test") is not None, \
-        "第 9 条候选不应被尝试（上限失效了）"
+    # 14 个各不相同的值：现实里它们来自 14 个不同的 (domain, path) scope
+    shadow = "; ".join(f"sb_session=shadow{i}" for i in range(14))
+    request = _req(uri="/api/sites/abc/analytics",
+                   cookie=f"{shadow}; sb_session={good}")
+    assert len(orq._get_cookies(request, "sb_session")) == 15
+    assert orq._check_auth(request, ROUTE_AUTH, "app-x.example.test") is None, \
+        "14 条遮蔽 cookie 仍能锁死用户——上限太小，M06 只被收窄而没关掉"
+    # 放行时用的必须是**真身份**，不是任何遮蔽项
+    assert request["headers"]["x-user-email"][0]["value"] == "v@example.test"
+    assert request["headers"]["x-user-name"][0]["value"] == "Alice"
 
 
 def test_reserved_cookies_are_still_stripped_in_full():
