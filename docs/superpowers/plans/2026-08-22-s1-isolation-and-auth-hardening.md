@@ -674,7 +674,7 @@ git commit -m "refactor(s1/m01): tier→engine 提成 common.tier_engine 唯一�
 
 **Interfaces:**
 - Consumes: `common.ensure_site_role(site_id, engine, *, tables)`（Task 3）、`common.tier_engine(tier)`（Task 3b）
-- Produces: `check_roles(iam) -> list[(role, reason)]`（闸门用，判据四层：site-scope 完整文档等值、角色上**只许有 site-scope 一条 policy**、ACTIVE 站点角色反向存在、功能模拟另见 simulate_active_sites）、`verify_access(iam, site_id, tables)`（IAM 模拟器验收，动作清单从期望 policy 现取——**全部** DynamoDB 数据动作，读写都验）、`simulate_active_sites(iam)`（--check 对全部 dynamodb 站点跑功能模拟）、`plan_for(site_id, site)`、`_load_env(config_path=None)`（含 STS 账号核对；path 可注入是给单测的，生产不传参）、`apply_plans(iam, todo)`（先备份后写）、`_persist_backup(iam, role_names)`（第一笔 IAM 写入前原子落盘、合并不覆盖、带账号元数据且不一致拒绝合并）、`active_fullstack_site_ids()`、命令行 `--apply` / `--check`
+- Produces: `check_roles(iam) -> list[(role, reason)]`（闸门用，判据四层：site-scope 完整文档等值、角色上**只许有 site-scope 一条 policy**、ACTIVE 站点角色反向存在、功能模拟另见 simulate_active_sites；多余 policy 与缺失角色都按 reason 前缀分流**需人工**，不自动修）、`verify_access(iam, site_id, tables)`（IAM 模拟器验收，动作清单从期望 policy 现取——**全部** DynamoDB 数据动作，读写都验）、`simulate_active_sites(iam)`（--check 对全部 dynamodb 站点跑功能模拟）、`plan_for(site_id, site)`、`_load_env(config_path=None)`（含 STS 账号核对；path 可注入是给单测的，生产不传参）、`apply_plans(iam, todo)`（先备份后写）、`_persist_backup(iam, role_names)`（第一笔 IAM 写入前原子落盘、合并不覆盖、带账号元数据且不一致拒绝合并）、`active_fullstack_site_ids()`、命令行 `--apply` / `--check`
 
 > **为什么必须做而不是等下次部署**（这是 v1 的设计错误，Codex 复核指出）：
 > `table/site-data-{A}-*` 是**向前看的**通配——它覆盖所有以 A 的 id 为前缀的
@@ -807,7 +807,19 @@ def test_check_roles_flags_a_wrong_account_policy_that_has_no_wildcard(env):
     env.setenv("ACCOUNT_ID", "999999999999")            # 先用错账号造"实际"
     actual = json.loads(common.site_policy("a-abc123", "dynamodb", tables=["notes"]))
     env.setenv("ACCOUNT_ID", "111111111111")            # 期望按正确账号算
-    assert "*" not in json.dumps(actual), "这条用例的前提是它不含通配"
+    # 前提断言**只看 DynamoDB 表 ARN**：日志资源按设计带 stream 层通配
+    # `log-group:…:*`，那不是 M01 的危险表前缀——对整文档查 `*` 会让这条
+    # 用例在 policy 形态完全正确时也必然失败（Codex 指出的确定性 Blocker：
+    # v4 就是整文档断言，Step 4 永远不能全绿）。
+    ddb_resources = [
+        r for stmt in actual["Statement"]
+        if any(str(a).startswith("dynamodb:") for a in
+               (stmt["Action"] if isinstance(stmt["Action"], list)
+                else [stmt["Action"]]))
+        for r in (stmt["Resource"] if isinstance(stmt["Resource"], list)
+                  else [stmt["Resource"]])]
+    assert ddb_resources and all("*" not in r for r in ddb_resources), \
+        "这条用例的前提：DynamoDB 表 ARN 精确、不含通配"
     bad = bf.check_roles(_FakeIam({"site-rt-a-abc123": actual}))
     assert len(bad) == 1 and "不一致" in bad[0][1]
 
@@ -865,11 +877,13 @@ def test_check_roles_flags_an_active_site_whose_role_is_missing(env):
 
     v2 只从现存 site-rt-* 角色出发反查 sites 行——"角色整个缺失"
     （误删/清理脚本写错）完全不可见，IAM 里一个角色都没有时闸门反而
-    全绿（Codex 指出）。
+    全绿（Codex 指出）。理由必须是 MISSING_ROLE_REASON 原文——main 按
+    这个前缀把它分流到需人工（不自动重建：异常要先查根因，且这保证了
+    备份里 null 不会混入"角色本身不存在"态，见 _persist_backup docstring）。
     """
     env.setattr(bf, "active_fullstack_site_ids", lambda: ["a-abc123"])
     bad = bf.check_roles(_FakeIam({}))
-    assert len(bad) == 1 and "缺失" in bad[0][1]
+    assert bad == [("site-rt-a-abc123", bf.MISSING_ROLE_REASON)]
 
 
 def _min_config(tmp_path, account="111111111111"):
@@ -1049,9 +1063,11 @@ sys.path.insert(0, str(ROOT / "site-builder" / "deployer" / "functions"))
 ROLE_PREFIX = "site-rt-"
 POLICY_NAME = "site-scope"
 BACKUP_PATH = ROOT / "site-builder" / "scripts" / "backfill-old-policies.json"
-# check_roles 用这个前缀标记"闸门红但不能自动修"的角色；main 据此分流到
-# 需人工清单而不是 todo（自动删未知 policy 违反"判不出就不猜"）
+# check_roles 用这两个前缀标记"闸门红但不能自动修"的角色；main 据此分流到
+# 需人工清单而不是 todo（自动删未知 policy、自动重建消失的角色，都违反
+# "判不出就不猜"）
 EXTRA_POLICY_REASON = "site-scope 之外还有别的 policy（需人工移除，不自动删）"
+MISSING_ROLE_REASON = "ACTIVE 站点的角色缺失（sites 行在、IAM 角色不在，需人工查根因）"
 
 
 class NeedsManualReview(Exception):
@@ -1171,7 +1187,8 @@ def check_roles(iam) -> list:
     2. **角色上只许有 site-scope 这一条 policy**：多余 inline / 任何
        attached 都不合格。site-scope 全对时残留的调试 policy 与 boundary
        取交集仍是有效跨租户权限（Codex 指出的 P1），只比 site-scope 对它失明。
-    3. **反向存在性**：ACTIVE 非 static 站点的角色必须存在。
+    3. **反向存在性**：ACTIVE 非 static 站点的角色必须存在
+       （缺失分流需人工，不自动重建——见下面反向段的注释）。
     4. 功能模拟在 `simulate_active_sites`（--check 专属，全动作）。
     """
     import common
@@ -1200,13 +1217,18 @@ def check_roles(iam) -> list:
             bad.append((name, f"policy 与期望不一致（engine={engine} tables={tables}）"))
     # 反向：ACTIVE 非 static 站点的角色必须**存在**。只从现存 site-rt-* 出发
     # 是单向的——"角色整个缺失"（误删/清理脚本写错）完全不可见，IAM 里一个
-    # 角色都没有时闸门反而全绿（Codex 指出）。缺失的角色进 targets 后由
-    # ensure_site_role 重建，正好是对的补救。
+    # 角色都没有时闸门反而全绿（Codex 指出）。
+    # 缺失**不自动重建**（v5 曾写"进 targets 由 ensure_site_role 重建"，撤回）：
+    # ① ACTIVE 站点的角色凭空消失本身是异常，自动重建会盖掉根因；
+    # ② 自动建会让备份出现"角色原本不存在"这一态——GetRolePolicy 的
+    #    NoSuchEntity 分不出它和"角色在、只缺 policy"，回滚就得会删整个角色
+    #    （Codex 指出的 null 歧义）。分流需人工后，todo 里的角色只能来自
+    #    list_roles 枚举 ⇒ 备份里 null 的语义唯一：角色在、site-scope 不在。
     have = set(site_role_names(iam))
     for site_id in active_fullstack_site_ids():
         name = ROLE_PREFIX + site_id
         if name not in have:
-            bad.append((name, "ACTIVE 站点的角色缺失（sites 行在、IAM 角色不在）"))
+            bad.append((name, MISSING_ROLE_REASON))
     return bad
 
 
@@ -1311,7 +1333,10 @@ def _persist_backup(iam, role_names) -> None:
       无条件覆盖会丢掉它们的原始通配 policy——回滚要的恰是第一份快照。
       roles 值为 null = 备份时该角色没有 site-scope inline policy
       （`_actual_policy` 只把 NoSuchEntity 判为不存在，其他读错误直接
-      抛出 ⇒ 此时零 IAM 写入，null 的语义才可靠）；
+      抛出 ⇒ 此时零 IAM 写入；且缺失角色分流需人工、不进 todo ⇒
+      本函数只会收到 list_roles 枚举出的**真实存在**的角色，null 不会
+      再混入"角色本身不存在"这一态，回滚动作唯一：`delete_role_policy`
+      删掉新写的 site-scope）；
     - **带账号元数据，合并前核对**：格式 {schema_version, account_id,
       region, roles}。没有元数据时，切到另一个账号后"绝不覆盖"会把
       A 账号同名 role 的旧快照保留成 B 账号的回滚材料（Codex 指出）——
@@ -1423,9 +1448,10 @@ def main() -> int:
     print(f"待收敛的角色：{len(targets)}")
     todo, manual = [], []
     for name, reason in targets:
-        if reason.startswith(EXTRA_POLICY_REASON):
-            # 重写 site-scope 修不掉多余 policy，自动删未知 policy 又违反
-            # "判不出就不猜"——只能人工移除后重跑
+        if reason.startswith((EXTRA_POLICY_REASON, MISSING_ROLE_REASON)):
+            # 多余 policy：重写 site-scope 修不掉，自动删未知 policy 违反
+            # "判不出就不猜"。角色缺失：先查为什么没了，不自动重建
+            # （也保证 todo 里只有真实存在的角色，备份 null 语义唯一）。
             manual.append(f"{name}: {reason}")
             print(f"  跳过（需人工） {name}: {reason}")
             continue
@@ -2908,8 +2934,9 @@ Expected: 闸门打印 `不合格的 site-rt-* 角色：0` 且退出码 0；其�
 - 部署后 `python3 site-builder/scripts/backfill_site_role_policies.py --check` ——
   **不合格的 per-site 角色数必须为 0**（判据四层：site-scope 与期望**完整
   等值**、角色上**只许有 site-scope 一条 policy**（多余 inline / attached
-  都不合格，需人工移除）、ACTIVE 站点的角色反向存在、且全部 dynamodb 站点
-  通过 IAM 模拟器**全动作**功能验证——只测 GetItem 验不出"邻居表可写"）。
+  都不合格，需人工移除）、ACTIVE 站点的角色反向存在（缺失需人工查根因，
+  不自动重建）、且全部 dynamodb 站点通过 IAM 模拟器**全动作**功能验证
+  ——只测 GetItem 验不出"邻居表可写"）。
   非 0 意味着 M01 对那些站点等于没生效，而带通配的仍是对未来嵌套 site_id
   生效的陷阱（通配是向前看的）。
   `--apply` 会先把全部旧 policy 备份到
