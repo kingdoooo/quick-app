@@ -54,6 +54,10 @@
   于是「M01 闸门失败」与「S1 全绿」在执行记录上无法区分（Codex 指出的 P1
   假绿）。**测试块、部署块、验收块、commit 块全部适用**；backfill 的
   dry-run / `--apply` / `--check` 是硬停止点，失败必须立即中断整块。
+  - **唯一例外是 Step 5 的 `--check`**：它的退出码存进变量、在块末 `exit` 生效
+    （理由写在那里——否则一个与 M02/M05/M06 无关的数据条件会吃掉那三条的全部
+    验收证据）。例外的边界是"**仍然让整块失败**"，不是"降级成警告"：块末必须
+    `exit "$m01_rc"`，不能只 echo。
 
 ---
 
@@ -2949,15 +2953,35 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 # 硬闸门：不合格角色数 == 0（site-scope 完整等值 + 角色上唯一 policy +
 # 反向存在 + 全动作功能模拟）。非 0 就不算 S1 交付完成。
-# set -e 保证它失败时后面的验收一条都不会跑。
+#
+# **退出码先存下来、闸门在本块末尾才生效——这个写法和这个顺序都不要"整理"掉**
+# （S1 最终复核指出）。两个方向各有一条理由：
+#   · 直接让它在 `set -e` 下中止整块 ⇒ 一个与 M02/M05/M06 **毫无关系**的数据条件
+#     （runbook 4：某个 ACTIVE 行没有 tier，脚本自己修不到 0、必须人工处理）
+#     会把后面四条验收全部吃掉，那次部署就在**没有任何 M02/M05/M06 证据**的情况下
+#     收尾——而这三条与 M01 相互独立。
+#   · 反过来把 `--check` 挪到最后也不行：它是唯一对**全部** ACTIVE dynamodb 站点跑
+#     功能模拟（`verify_access`，闸门第 4 层）的地方——`--apply` 结尾只跑
+#     `check_roles`——所以它必须留在执行记录最显眼的位置，而不是排在四条真机验收
+#     后面。
+# 于是：照旧第一个跑、输出照旧在最前面，只把它的退出码推迟到末尾。
+set +e
 python3 site-builder/scripts/backfill_site_role_policies.py --check
+m01_rc=$?
+set -e
+echo "M01 闸门退出码：$m01_rc（非 0 会在本块末尾让这一步失败）"
 
 python3 site-builder/scripts/verify_deployed_components.py   # ② 之后必跑：唯一能发现产物陈旧的闸门
 python3 site-builder/scripts/verify_permission_matrix.py     # M02 之后唯一覆盖权限矩阵端到端的闸门
 python3 site-builder/scripts/verify_console_e2e.py           # 跑之前先在浏览器登录一次（两波重登让 token 失效）
 bash    site-builder/scripts/smoke_router.sh                 # 路由层冒烟（含 65s 等 Edge 缓存）
+
+# 闸门在这里生效：四条验收的证据都已留下，而 M01 不合格仍然让这一步失败。
+exit "$m01_rc"
 ```
-Expected: 闸门打印 `不合格的 site-rt-* 角色：0` 且退出码 0；其余全部通过。
+Expected: 闸门打印 `不合格的 site-rt-* 角色：0`、`M01 闸门退出码：0`，四条验收全部通过，
+整块退 0。若打印的是非 0：M01 未闭环（这一步失败，且**四条验收的输出仍在记录里**
+——照 runbook 4 人工修好那一行再重跑整块）。
 `verify_console_e2e.py` 若报 token 过期，先 `node site-builder/clients/quick-desktop-proxy/auth.js` 重新登录
 
 - [ ] **Step 6: 补 DEPLOY.md**
