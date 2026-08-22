@@ -445,6 +445,44 @@ def test_site_policy_never_matches_a_nested_sites_tables(monkeypatch):
         f"站点 {a} 的策略匹配到了站点 {b} 的表；资源集合: {resources}")
 
 
+def test_dynamodb_resources_are_exactly_this_sites_tables(monkeypatch):
+    """正向钉死：dynamodb 资源逐表精确枚举，等值、不多不少。
+
+    上面那条负向用例只断言"匹配不到 B 的表"，它**拦不住两类回归**：
+
+    · **更窄的通配**——写成 `table/{site_table_name(site_id, t)}*` 时，A 的
+      `…-foo-k3d9x1-notes*` 并不 fnmatch B 的 `…-foo-k3d9x1-longname-abc123-notes`，
+      负向用例照绿；可它按**同一机制**放开了 id 以 `foo-k3d9x1-notes-` 开头的
+      任何站点的全部表。负向用例只对"被删掉的那一种通配形态"会红，不覆盖这一类。
+    · **过窄**——整段 dynamodb 语句删掉、或只发第一张表，负向用例同样照绿
+      （在此之前，全套测试没有任何一条断言"站点必须拿到自己的表"）。
+
+    所以这里断言**等值**（与日志组那条同一形状），且用**两张**表——一张分不出
+    "逐表枚举"和"只发第一张"。期望值写成字面量而不是调 `site_table_name`：
+    钉的是产物，不能从被测的同一个 helper 推导出来。
+    """
+    import json
+    monkeypatch.setenv("ACCOUNT_ID", "111111111111")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    doc = json.loads(common.site_policy("foo-k3d9x1", "dynamodb",
+                                        tables=["notes", "tags"]))
+    ddb = [s for s in doc["Statement"]
+           if any(a.startswith("dynamodb:") for a in s["Action"])]
+    assert len(ddb) == 1
+    assert ddb[0]["Resource"] == [
+        "arn:aws:dynamodb:us-east-1:111111111111:table/site-data-foo-k3d9x1-notes",
+        "arn:aws:dynamodb:us-east-1:111111111111:table/site-data-foo-k3d9x1-tags"]
+    # 非 logs 语句里一律不许出现通配。**这条只对 dynamodb 引擎的产物成立**，
+    # 别顺手推广：logs 的 stream 层那条 `…:*` 是必须的（见 sibling 用例），
+    # dsql 的 `Resource: "*"` 也另有理由（隔离由 per-site PG role 保证）。
+    for stmt in doc["Statement"]:
+        if any(a.startswith("logs:") for a in stmt["Action"]):
+            continue
+        res = stmt["Resource"]
+        for r in (res if isinstance(res, list) else [res]):
+            assert "*" not in r, f"dynamodb 站点的资源里出现通配: {r}"
+
+
 def test_log_group_resources_are_exact_not_a_bare_prefix(monkeypatch):
     """日志组资源必须是精确名 + stream 层两条，不多不少。
 
