@@ -624,3 +624,53 @@ def test_a_real_auth_token_verifies_at_the_edge():
     claims = orq._verify_session_jwt(token)
     assert claims is not None, "auth 签的 token 在 Edge 侧被拒——两处 typ 漂移了"
     assert claims["email"] == "v@example.test"
+
+
+def test_edge_expected_typ_is_not_caller_supplied():
+    """期望的 typ 是**硬编码字面量**，不是入参——钉住这个形状本身。
+
+    auth 侧的 `verify_session_jwt(..., expected_typ=...)` 有一个假值洞：
+    显式传 `expected_typ=None` 时，缺 typ 的旧 token 走到 `None != None` ——
+    为假，于是**被接受**，正好退回 M05 要消灭的那个行为。Edge 这份不收这个参数，
+    所以那个洞在这里不可达（没有任何调用方能影响期望值），因此这里**不加**
+    "假值一律拒"的守卫——那道守卫在本形状下守不住任何东西。
+
+    这条用例是那个判断的保险：谁把 Edge 改成收 `expected_typ`（例如为了向
+    auth/session.py 的签名靠拢），本用例立刻红，提醒他这一刻必须把
+    `if not expected_typ or not isinstance(expected_typ, str): return None`
+    一起抄过来。
+    """
+    import inspect
+    params = list(inspect.signature(orq._verify_session_jwt).parameters)
+    assert params == ["token"], (
+        f"_verify_session_jwt 现在收 {params}——期望 typ 一旦可由调用方传入，"
+        "就必须同时加上'缺失/非字符串一律拒'的守卫，否则 expected_typ=None "
+        "会让缺 typ 的旧 token 通过")
+
+
+@pytest.mark.parametrize("bad_typ", [
+    pytest.param(None, id="typ-null"),
+    pytest.param("", id="typ-空串"),
+    pytest.param(0, id="typ-0"),
+    pytest.param(False, id="typ-false"),
+    pytest.param([], id="typ-空数组"),
+])
+def test_edge_rejects_falsy_typ_claims(bad_typ):
+    """载荷侧的假值同样一律拒——"假值兜底"在鉴权路径上是本仓库的记录在案的陷阱。
+
+    这是上面那个洞在**claim 方向**的镜像：判据一旦被写成
+    `if claims.get("typ") and claims.get("typ") != "session"`（看起来像"给存量
+    会话留个兼容"的软化），这五种形态连同"完全没有 typ"就全部通过了。
+    现在的 `!= "session"` 对它们都成立，本用例把这件事钉住。
+    """
+    def b64(raw):
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+    header = b64(json.dumps({"alg": "HS256", "typ": "JWT"},
+                            separators=(",", ":")).encode())
+    payload = b64(json.dumps(
+        {"typ": bad_typ, "email": "v@example.test", "name": "V",
+         "exp": int(time.time()) + 600}, separators=(",", ":")).encode())
+    sig = b64(hmac.new(b"test-secret", f"{header}.{payload}".encode(),
+                       hashlib.sha256).digest())
+    assert orq._verify_session_jwt(f"{header}.{payload}.{sig}") is None, (
+        f"typ={bad_typ!r} 被当成有效会话——假值不等于'不用查'")
