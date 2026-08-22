@@ -491,7 +491,8 @@ def handler(event, context):
         claims = verify_session_jwt(session_token, _secret("JWT_SECRET"),
                                     expected_typ=SESSION_TYP)
         if not claims:
-            # 无有效会话（缺失/过期/签名不过）：走完整登录，登录后**回到本
+            # 无有效会话（缺失/过期/签名不过/typ 不符——例如把升级码当会话递
+            # 进来，这一条是安全信号而非日常）：走完整登录，登录后**回到本
             # 入口**再换 code。redirect 指回 console 首页是错的——那样用户
             # 登录完了却仍没有面板会话，面板继续 401。
             back = urllib.parse.quote(f"https://auth.{base}/console-session",

@@ -32,7 +32,9 @@ def mint_session_jwt(email: str, name: str, secret: str, ttl_seconds: int = 8640
     # （两者同密钥、同线格式，见 verify_session_jwt）。
     claims = {"typ": SESSION_TYP, "email": email, "name": name,
               "exp": int(time.time()) + ttl_seconds}
-    # 只在非空时写入：保持与一期已签发 token 的形态兼容，Edge 侧无需改验签。
+    # （下面三个可选 claim）只在非空时写入：保持与一期已签发 token 的形态兼容，
+    # Edge 侧无需改验签。**这句只管这三个**——上面的 typ 是无条件写入的，
+    # 且 Edge 侧正要为它加检查（Task 8）。
     if idp:
         claims["idp"] = idp        # spec §3.5：Edge 据此确认身份来自企业 IdP
     if scope:
@@ -55,6 +57,13 @@ def verify_session_jwt(token: str, secret: str, now: int | None = None, *,
     **改这里必须同步 `router/infrastructure/lambda/origin_request.py` 的
     `_verify_session_jwt`**：两处算法必须字节等价。
     """
+    # 必填只挡住"忘记传"，挡不住"显式传假值"：`claims.get("typ")` 对缺失
+    # typ 的旧 token 返回 None，于是 expected_typ=None 会让下面的比较写成
+    # `None != None` 为假、直接放行——正好退回修复前的行为。
+    # 放在 try **之外**：这是对可信入参的前置条件检查，不是解析不可信输入；
+    # 混进 try 会与下面的 `except Exception` 纠缠，让形态在克隆到 Edge 时走样。
+    if not expected_typ or not isinstance(expected_typ, str):
+        return None
     try:
         header_b64, payload_b64, sig = token.split(".")
         expected = _sign(f"{header_b64}.{payload_b64}".encode(), secret)

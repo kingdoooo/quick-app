@@ -133,6 +133,30 @@ def test_verify_session_jwt_requires_expected_typ():
         session.verify_session_jwt(token, "secret")
 
 
+def test_falsy_expected_typ_does_not_restore_the_unchecked_behaviour():
+    """显式传假值也不行——必填关键字只挡住"忘记传"。
+
+    `claims.get("typ")` 对**缺失** typ 的旧 token 返回 None，于是
+    `expected_typ=None` 时比较写成 `None != None` 为假，检查直接放过
+    ——正好退回本次修复之前的行为（M05）。
+
+    None 是唯一会这样撞上的假值（`""` / `0` 与缺失 claim 不相等，本就会被拒），
+    但守卫按"非空 str"整体收口，不去依赖这个巧合。
+    **返回 None 而不是抛异常**：与本文件既有的 fail-closed 约定一致
+    （见 verify_upgrade_code 的 docstring 与 test_verify_never_raises_on_garbage）。
+    """
+    import json
+    legacy_claims = {"email": "legacy@example.test", "name": "L",
+                     "exp": int(time.time()) + 3600}      # 一期形态：没有 typ
+    h = session._b64url(json.dumps({"alg": "HS256", "typ": "JWT"},
+                                   separators=(",", ":")).encode())
+    p = session._b64url(json.dumps(legacy_claims, separators=(",", ":")).encode())
+    legacy = f"{h}.{p}.{session._sign(f'{h}.{p}'.encode(), SECRET)}"
+    for bad in (None, "", 0):
+        assert session.verify_session_jwt(legacy, SECRET, expected_typ=bad) is None, (
+            f"expected_typ={bad!r} 放过了不带 typ 的旧 token——typ 检查形同虚设")
+
+
 @pytest.mark.parametrize("name,mutate,expect_reject", MUTATIONS)
 def test_mutation_vectors(name, mutate, expect_reject):
     code = mutate(session.mint_upgrade_code("u@x.com", SECRET))
