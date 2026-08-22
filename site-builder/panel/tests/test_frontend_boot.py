@@ -30,10 +30,12 @@ pytestmark = pytest.mark.skipif(shutil.which("node") is None,
                                 reason="环境里没有 node —— 本用例未执行（不是通过）")
 
 
-def run_boot(scenario: str, app: Path | None = None) -> tuple[int, dict]:
-    proc = subprocess.run(
-        ["node", str(HARNESS), str(app or APP), scenario],
-        capture_output=True, text=True, timeout=60)
+def run_boot(scenario: str, app: Path | None = None,
+             cases: Path | None = None) -> tuple[int, dict]:
+    argv = ["node", str(HARNESS), str(app or APP), scenario]
+    if cases is not None:
+        argv.append(str(cases))     # 只有 report-error 场景认这个参数
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=60)
     line = (proc.stdout or "").strip().splitlines()
     assert line, f"harness 没有输出 JSON（stderr: {proc.stderr[:400]}）"
     return proc.returncode, json.loads(line[-1])
@@ -953,3 +955,97 @@ def test_harness_catches_the_hint_being_appended_to_bad_data_again(tmp_path):
     cases = {c["name"]: c["toast"] for c in res["cases"]}
     assert RETRY_HINT in cases["policy-409"], (
         f"注入了原缺陷但 harness 仍然绿——它什么都没盯: {cases}")
+
+
+# ── 跨层绑定：后端**真正生成的**两段文案，逐字渲染到 toast 上 ─────────────
+#
+# 上面那三条用哨兵串，证明的是"追加的那句在不在"。这一条不同：它把
+# `permissions.effective_policy` 真正抛出的文案灌进前端，断言用户读到的就是
+# 那段**能照着做**的字。两个分支的修法相反（缺字段 ⇒ 部署一次；类型不对 ⇒
+# 改那一行），所以各断言"有自己那句"且"没有另一句"——把两句合成一句大杂烩、
+# 或者把 UI 的建议盖在上面，都会在这里红。
+#
+# **前端不许自己拥有"修法"的措辞**：断言方向是"后端那段字原样出现在 toast 上"，
+# 而不是"toast 上有某句关于修法的话"。前者做不到时只能去改后端文案（唯一真源），
+# 后者会诱使人在 app.js 里补一句自己的建议——那就是第五份拷贝。
+
+def _real_policy_messages() -> dict[str, str]:
+    """从**真源**取两段文案（不手抄）：effective_policy 自己抛出来的那两句。"""
+    import sys
+    sys.path.insert(0, str(PANEL))
+    sys.path.insert(0, str(PANEL.parent / "deployer" / "functions"))
+    import permissions
+
+    ok = {"site_id": "s-1", "owner": "o@example.test", "require_login": True,
+          "allowed_users": "org", "collaborators": []}
+    out = {}
+    for name, site in (("absent", {**ok}), ("wrong-typed", {**ok})):
+        if name == "absent":
+            del site["require_login"]           # 从没成功部署过的行
+        else:
+            site["require_login"] = 0           # 那一行存着个用不了的值
+        try:
+            permissions.effective_policy(site)
+        except permissions.PolicyDataInvalid as e:
+            out[name] = str(e)
+    assert set(out) == {"absent", "wrong-typed"}, out
+    return out
+
+
+def _render_real_messages(tmp_path: Path, app: Path | None = None) -> dict:
+    import html
+    msgs = _real_policy_messages()
+    cases = [{"name": n, "status": 409,
+              "payload": {"error": m, "code": "policy_data_invalid"}}
+             for n, m in msgs.items()]
+    f = tmp_path / "cases.json"
+    f.write_text(json.dumps(cases, ensure_ascii=False))
+    code, out = run_boot("report-error", app, cases=f)
+    assert code == 0, out
+    # esc() 会把 `"` 变成 `&quot;`（allowed_users 的 `S="org"`）。浏览器解析 HTML
+    # 时又变回来，所以断言前要 unescape——否则断言的是渲染管线的中间态。
+    return {c["name"]: html.unescape(c["toast"]) for c in out["cases"]}
+
+
+def test_absent_branch_reaches_the_toast_telling_the_user_to_deploy_once(tmp_path):
+    rendered = _render_real_messages(tmp_path)["absent"]
+    assert "尚未成功部署过" in rendered, rendered
+    assert "不需要手改库" in rendered, rendered
+    assert "请把 sites 表该行修正为正确类型后重试" not in rendered, rendered
+    assert RETRY_HINT not in rendered, (
+        f"UI 在「去部署一次」后面又追加了「刷新后重试即可」: {rendered}")
+
+
+def test_wrong_typed_branch_reaches_the_toast_telling_the_user_to_fix_the_row(tmp_path):
+    rendered = _render_real_messages(tmp_path)["wrong-typed"]
+    assert "请把 sites 表该行修正为正确类型后重试" in rendered, rendered
+    assert "尚未成功部署过" not in rendered, rendered
+    assert RETRY_HINT not in rendered, rendered
+
+
+def test_both_real_messages_survive_verbatim(tmp_path):
+    """整段逐字到达，不只是几个关键词——中间任何截断/改写都在这里红。
+
+    **断言方向刻意是"后端那段字出现在 toast 上"**，不是"toast 上有某句关于修法
+    的话"。后者会诱使人在 app.js 里补一句自己的建议来让用例变绿，而"修法"的措辞
+    只能有一份、在后端（`effective_policy` 的 `repair_*`）。这里做不到时该改的是
+    那一份，不是往前端加第二份。
+    """
+    msgs = _real_policy_messages()
+    rendered = _render_real_messages(tmp_path)
+    for name, msg in msgs.items():
+        assert msg in rendered[name], (
+            f"{name} 的后端文案没有逐字到达 toast\n后端: {msg}\n"
+            f"页面: {rendered[name]}")
+
+
+def test_harness_catches_the_real_message_getting_the_hint_appended(tmp_path):
+    """反向验证：判据失效时，**真文案**这一路也必须红。"""
+    old = "err.payload.code === POLICY_DATA_INVALID_CODE"
+    src = APP.read_text()
+    assert old in src, f"注入点找不到（代码改过？）: {old}"
+    app = tmp_path / "mutated.js"
+    app.write_text(src.replace(old, "err.payload.code === 'never-matches'", 1))
+    rendered = _render_real_messages(tmp_path, app)
+    assert RETRY_HINT in rendered["absent"], (
+        f"注入了原缺陷但真文案这一路仍然绿——它什么都没盯: {rendered['absent']}")

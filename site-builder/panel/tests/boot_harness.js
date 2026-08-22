@@ -359,11 +359,19 @@ eval(fs.readFileSync(APP, 'utf8'));
  * （而不是只对坏数据跳过）时它必须变红，否则这条修复会静默地把该重试的
  * 提示也一起删掉。 */
 if (SCENARIO === 'report-error') {
-  const CASES = [
-    ['policy-409', 409, { error: 'BAD-DATA-SENTINEL', code: 'policy_data_invalid' }],
-    ['conflict-409', 409, { error: 'CONFLICT-SENTINEL' }],
-    ['denied-403', 403, { error: 'DENIED-SENTINEL' }],
-  ];
+  /* 默认三格用哨兵串（只关心"追加的那句在不在"，哨兵不含任何会被断言的其它
+   * 字样）。**第 4 个参数**可以传一个 JSON 文件路径覆盖它——用来把后端
+   * `effective_policy` **真正生成的那两段文案**灌进来，断言它们逐字渲染到
+   * toast 上。那件事静态断言与哨兵串都证不了：哨兵证明"没被追加"，
+   * 真文案才证明"用户读到的是那段能照着做的字"。 */
+  const CASES = process.argv[4]
+    ? JSON.parse(fs.readFileSync(process.argv[4], 'utf8'))
+      .map((c) => [c.name, c.status, c.payload])
+    : [
+      ['policy-409', 409, { error: 'BAD-DATA-SENTINEL', code: 'policy_data_invalid' }],
+      ['conflict-409', 409, { error: 'CONFLICT-SENTINEL' }],
+      ['denied-403', 403, { error: 'DENIED-SENTINEL' }],
+    ];
   /* ApiError 走**真实的 api() 那条路**造出来，不在这里 new。
    * 两个理由：① `class` 声明不会从 eval 的作用域泄漏到 global（`function`
    * 会），所以这里根本拿不到那个构造器；② 更重要的是，页面上显示的
