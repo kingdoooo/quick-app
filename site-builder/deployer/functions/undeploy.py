@@ -40,7 +40,7 @@ def _purge_dynamodb(site_id: str, tables: list[str]) -> list[str]:
     ddb = boto3.client("dynamodb")
     deleted = []
     for t in tables:
-        name = f"site-data-{site_id}-{t}"
+        name = common.site_table_name(site_id, t)
         try:
             ddb.delete_table(TableName=name)
             deleted.append(name)

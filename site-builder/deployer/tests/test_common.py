@@ -345,3 +345,30 @@ def test_no_literal_index_into_cancellation_reasons():
     assert not offenders, (
         f"这些位置用整数字面量下标读 CancellationReasons：{offenders}——"
         "改成 zip(labels, reasons) 或由构造处算出的下标")
+
+
+def test_table_name_format_has_a_single_definition():
+    """`site-data-…` 这个格式只允许在 common.site_table_name 里出现一次。
+
+    用 AST 取 f-string 的字面量片段，所以**文档字符串与注释不参与**——
+    它们提及格式是好事，代码里手写格式才是问题。
+
+    为什么值得一条守卫：M01 的修复要求建表 / 授权 / 删表三处对同一格式达成一致，
+    而它现在被手抄了三份（provision_dynamodb 建、common.site_policy 授权、
+    undeploy 删）。不收敛就等于在三处各写一遍新格式。
+    """
+    import ast
+    import pathlib
+    root = pathlib.Path(__file__).parents[1] / "functions"
+    offenders = []
+    for path in sorted(root.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, ast.JoinedStr):
+                continue
+            literal = "".join(
+                v.value for v in node.values
+                if isinstance(v, ast.Constant) and isinstance(v.value, str))
+            if "site-data-" in literal:
+                offenders.append(f"{path.name}:{node.lineno}")
+    assert len(offenders) == 1 and offenders[0].startswith("common.py"), (
+        f"表名格式应只在 common.site_table_name 出现一次，实际出现在: {offenders}")

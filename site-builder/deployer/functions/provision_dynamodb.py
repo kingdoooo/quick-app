@@ -9,7 +9,7 @@ def handler(event, context):
     ddb = boto3.client("dynamodb")
     env_vars = event.get("env_vars", {})
     for spec in event["manifest"]["database"].get("tables", []):
-        table_name = f"site-data-{event['site_id']}-{spec['name']}"
+        table_name = common.site_table_name(event["site_id"], spec["name"])
         try:
             ddb.create_table(
                 TableName=table_name,

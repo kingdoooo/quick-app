@@ -511,6 +511,20 @@ def route_commit_item(job_id: str, previous_route: dict | None,
             "committed_route": {"M": committed_route}}}}}}
 
 
+def site_table_name(site_id: str, logical: str) -> str:
+    """站点数据表名的**唯一定义**。三处共用：建表（provision_dynamodb）、
+    授权（site_policy）、删除（undeploy._purge_dynamodb）。
+
+    **分隔符是 `-`，而 site_id 自身可以含 `-`**（形态 `<name>-<6位随机>`，
+    且 name 允许内部连字符）⇒ 这个格式对**前缀匹配**是有歧义的：站点 A
+    （id `foo-k3d9x1`）的 `site-data-foo-k3d9x1-*` 会匹配站点 B
+    （id `foo-k3d9x1-…`）的表。正因如此 `site_policy` 必须逐表枚举精确 ARN，
+    不得用通配（M01）。改这个格式要同时改三处调用方——
+    `test_table_name_format_has_a_single_definition` 会在漂移时变红。
+    """
+    return f"site-data-{site_id}-{logical}"
+
+
 def site_prefix_for(site_id: str) -> str:
     """这个站点在前端桶里的根前缀，**带**尾斜杠（列举/整站删除用）。"""
     return f"sites/{site_id}/"
@@ -589,7 +603,7 @@ def site_policy(site_id: str, engine: str) -> str:
             "Effect": "Allow",
             "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem",
                        "dynamodb:DeleteItem", "dynamodb:Query", "dynamodb:Scan"],
-            "Resource": f"arn:aws:dynamodb:{region}:{acct}:table/site-data-{site_id}-*"})
+            "Resource": f"arn:aws:dynamodb:{region}:{acct}:table/{site_table_name(site_id, '')}*"})
     elif engine == "dsql":
         statements.append({"Effect": "Allow", "Action": "dsql:DbConnect",
                            "Resource": "*"})  # 数据隔离由 per-site PG role 保证
