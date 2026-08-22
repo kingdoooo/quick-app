@@ -525,6 +525,25 @@ def site_table_name(site_id: str, logical: str) -> str:
     return f"site-data-{site_id}-{logical}"
 
 
+# tier → 数据引擎。**真源是 `contract.schema.TIER_ENGINE`**，本函数是 deployer 侧
+# 的唯一派生实现（运行时不 import contract 包：那是 validate 步骤才装的依赖）。
+# 两处一致性由 test_tier_engine_agrees_with_the_contract 锁死。
+_TIER_ENGINE = {"static": "none", "fullstack-nosql": "dynamodb",
+                "fullstack-sql": "dsql"}
+
+
+def tier_engine(tier: str) -> str:
+    """tier → engine。未知 tier **抛错，不猜**。
+
+    猜错的代价不对称：把 DSQL 站点算成 dynamodb 会让重写 policy 时丢掉
+    `dsql:DbConnect`，站点当场连不上库。调用方（backfill）应把抛错的站点
+    计入"需人工"并跳过。
+    """
+    if tier not in _TIER_ENGINE:
+        raise ValueError(f"未知 tier {tier!r}（已知：{sorted(_TIER_ENGINE)}）")
+    return _TIER_ENGINE[tier]
+
+
 def site_prefix_for(site_id: str) -> str:
     """这个站点在前端桶里的根前缀，**带**尾斜杠（列举/整站删除用）。"""
     return f"sites/{site_id}/"

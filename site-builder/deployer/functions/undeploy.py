@@ -176,8 +176,7 @@ def _undeploy(event, context):
     purged: dict = {}
     if event.get("purge_data"):
         site = common.get_site(site_id) or {}
-        engine = (event.get("engine")
-                  or ("dsql" if site.get("tier") == "fullstack-sql" else "dynamodb"))
+        engine = event.get("engine") or common.tier_engine(site.get("tier", "static"))
         # 表名取自 provision_dynamodb 写入 sites 表的 data_tables；
         # 允许 event 覆盖，便于清理历史站点（该字段是本次新增的）
         tables = event.get("data_tables") or list(site.get("data_tables", []))

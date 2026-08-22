@@ -531,3 +531,89 @@ def test_no_gsi_support_yet_so_index_arns_are_not_needed():
     schema = (root.parents[0] / "contract" / "src" / "contract" / "schema.py").read_text()
     assert "index" not in schema.lower(), (
         "contract schema 开始接受索引声明了 —— 同上，site_policy 要同步")
+
+
+def test_dsql_policy_is_exactly_dbconnect_plus_the_two_log_groups(monkeypatch):
+    """dsql 分支的产物整份钉死——全套用例此前**一次都没调过它**。
+
+    为什么它值得单独一条：`site_policy` 的每一处调用都传 dynamodb 或 none，
+    于是 M01 刚重写过的 dsql 分支从没被执行过，而它管的是存量站点里的多数
+    （7 个里有 5 个是 DSQL）。Task 3c 的 backfill 闸门也兜不住这里的错——
+    它的 check_roles 把实际策略与 `site_policy` 的输出比，**两侧同源**，
+    错的文档与自己相等照样绿；它的 IAM 模拟器功能检查只对
+    engine == "dynamodb" 跑。
+
+    期望值是写死的整份文档，不调 `site_table_name`、也不从返回值反推：
+    从被测对象推出来的期望只是同义反复。
+    """
+    import json
+    monkeypatch.setenv("ACCOUNT_ID", "111111111111")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    doc = json.loads(common.site_policy("foo-k3d9x1", "dsql", tables=[]))
+    assert doc == {"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow",
+         "Action": ["logs:CreateLogGroup", "logs:CreateLogStream",
+                    "logs:PutLogEvents"],
+         "Resource": [
+             "arn:aws:logs:us-east-1:111111111111:log-group:"
+             "/aws/lambda/site-foo-k3d9x1",
+             "arn:aws:logs:us-east-1:111111111111:log-group:"
+             "/aws/lambda/site-foo-k3d9x1:*"]},
+        # 隔离由 per-site PG role 保证，所以这里的 `*` 是有意的（见 site_policy）。
+        {"Effect": "Allow", "Action": "dsql:DbConnect", "Resource": "*"}]}
+
+
+def test_dsql_ignores_tables_and_never_grants_dynamodb(monkeypatch):
+    """dsql 站点即使被传入非空 tables，也不许长出 dynamodb 语句。
+
+    `site_policy` 的 docstring 写着"engine 为 dsql / none 时忽略它"，但没有
+    任何用例钉住这句话。会红的形态很具体：把 `if engine == "dynamodb"` 写成
+    `if tables:`（"有表就授权"读起来很顺）⇒ DSQL 站点白拿一批 DynamoDB 表的
+    读写权。上面那条传 tables=[] 的用例对这个形态照绿，所以两条都要有。
+    """
+    import json
+    monkeypatch.setenv("ACCOUNT_ID", "111111111111")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    raw = common.site_policy("foo-k3d9x1", "dsql", tables=["notes", "tags"])
+    assert "dynamodb" not in raw, f"dsql 站点的策略里出现了 dynamodb 授权：{raw}"
+    assert "site-data-" not in raw, f"dsql 站点的策略里出现了站点数据表 ARN：{raw}"
+    doc = json.loads(raw)
+    assert {"Effect": "Allow", "Action": "dsql:DbConnect",
+            "Resource": "*"} in doc["Statement"]
+    assert len(doc["Statement"]) == 2, "dsql 站点应当只有日志组与 DbConnect 两条"
+
+
+def test_tier_engine_agrees_with_the_contract():
+    """`common.tier_engine` 必须与 contract 的 TIER_ENGINE 逐项一致。
+
+    真源是合同（tier→engine 是合同语义），deployer 侧只能有一个派生实现。
+    两处漂移的症状：backfill 给 DSQL 站点算出 engine="dynamodb"，
+    于是重写 policy 时丢掉 `dsql:DbConnect` —— **站点当场连不上库**。
+    """
+    from contract.schema import TIER_ENGINE
+    for tier, engine in TIER_ENGINE.items():
+        assert common.tier_engine(tier) == engine, tier
+    # 反向也要锁：上面那个循环只走合同里的 tier，deployer 侧**多**一个键它照绿
+    # （sibling 用例只否掉 "fullstack-graph" 这一个具体值）。多出来的键意味着
+    # deployer 接受一个合同会拒的 tier，"唯一派生实现"就名不副实了。
+    assert set(common._TIER_ENGINE) == set(TIER_ENGINE), (
+        "deployer 侧的 tier 集合与合同不一致："
+        f"{sorted(set(common._TIER_ENGINE) ^ set(TIER_ENGINE))}")
+
+
+def test_tier_engine_rejects_an_unknown_tier():
+    """未知 tier 必须抛错，不许猜。
+
+    backfill 会因此跳过该角色并计入"需人工"，而不是给它算出一个可能错的 engine。
+    """
+    import pytest
+    with pytest.raises(ValueError, match="未知 tier"):
+        common.tier_engine("fullstack-graph")
+
+
+def test_undeploy_does_not_hand_roll_the_tier_mapping():
+    """undeploy 不许再内联 tier→engine（它现在有第二份）。"""
+    import pathlib
+    src = (pathlib.Path(__file__).parents[1] / "functions" / "undeploy.py").read_text()
+    assert "fullstack-sql" not in src, (
+        "undeploy 仍在内联 tier→engine，应改调 common.tier_engine")
