@@ -19,7 +19,7 @@ def _jwt(email="a@x.com", name="Alice", exp_delta=3600, secret="test-secret",
          idp="Feishu", auth_via="TokenGeneration_HostedAuth"):
     b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
     h = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
-    payload = {"name": name, "exp": int(time.time()) + exp_delta}
+    payload = {"typ": "session", "name": name, "exp": int(time.time()) + exp_delta}
     if email is not None:  # email=None -> payload 完全省略 email 字段
         payload["email"] = email
     if idp:
@@ -257,7 +257,7 @@ def _jwt_idp(email="a@x.com", idp="Feishu", exp_delta=3600, secret="test-secret"
     """带 idp + auth_via 的会话 JWT（Task 13 起 auth 服务签的就是这种）。"""
     b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
     h = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
-    payload = {"email": email, "name": "Alice",
+    payload = {"typ": "session", "email": email, "name": "Alice",
                "exp": int(time.time()) + exp_delta}
     if idp:
         payload["idp"] = idp
@@ -537,3 +537,90 @@ def test_pkce_cookie_is_also_stripped_from_site_requests():
     orq._strip_reserved_cookies(request)
     kept = request["headers"]["cookie"][0]["value"]
     assert "__Host-sb_pkce" not in kept and "keep=1" in kept
+
+
+# ---- S1/M05: Edge 内嵌 verifier 必须查 typ ----
+# 会话 token 与 console 一次性升级码用**同一个密钥**签名、线格式也相同，
+# 唯一的区别是载荷里的 typ。Edge 不查 typ 时，一个 60s 的升级码就是一个
+# 有效站点会话（而它还能在 auth 的 /console-session 无限续期）。
+#
+# 下面两条"不带 typ"的用例**故意不用 `_jwt`**：那个辅助已经带上了 typ
+# （Step 4），用它就测不到"缺 typ"这件事本身。手搓是为了让用例不会因为
+# 别人改辅助而静默失效。
+
+# auth 包（site-builder/auth）不在 Edge 的运行时路径里，只有测试期为了跑
+# 跨组件向量才需要它。按 __file__ 定位而不是相对 cwd——本文件顶部就是这个
+# 约定（`Path(__file__).parent`），且 cwd 漂移导致的静默读空在本仓库有先例。
+_AUTH_PKG = str(Path(__file__).resolve().parents[3] / "site-builder" / "auth")
+
+
+def test_edge_rejects_a_token_without_typ():
+    """缺 typ 的旧会话被拒（走 302，不是 403）。
+
+    302 而非 403 的理由与既有的 idp/auth_via 检查一致：引导用户去登录，
+    而不是让他以为"没权限"去找站点 owner 加名单。
+    这一条也是"全员重登一次"的技术表现。
+    """
+    claims = {"email": "v@example.test", "name": "V",
+              "exp": int(time.time()) + 600}          # 故意不带 typ
+    def b64(raw):
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+    header = b64(json.dumps({"alg": "HS256", "typ": "JWT"},
+                            separators=(",", ":")).encode())
+    payload = b64(json.dumps(claims, separators=(",", ":")).encode())
+    sig = b64(hmac.new(b"test-secret", f"{header}.{payload}".encode(),
+                       hashlib.sha256).digest())
+    assert orq._verify_session_jwt(f"{header}.{payload}.{sig}") is None
+
+
+def test_edge_rejects_a_console_upgrade_code_as_a_site_session():
+    """console 升级码不得当站点会话用（M05 在 Edge 侧的那一半）。"""
+    sys.path.insert(0, _AUTH_PKG)
+    from session import mint_upgrade_code
+    code = mint_upgrade_code("v@example.test", "test-secret")
+    assert orq._verify_session_jwt(code) is None
+
+
+def test_check_auth_redirects_a_typeless_token_to_login():
+    """缺 typ 走到 `_check_auth` 是 **302 到登录端点**，不是 403。
+
+    口径与既有的 idp / auth_via 检查一致：引导用户去登录，
+    而不是让他以为"没权限"去找站点 owner 加名单。
+
+    手搓 token 而不用 `_jwt`：那个辅助现在会带 typ，用它这条用例就变成
+    "带 typ 的合法会话被 302"——恒绿且测的是别的东西。
+    """
+    def b64(raw):
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+    header = b64(json.dumps({"alg": "HS256", "typ": "JWT"},
+                            separators=(",", ":")).encode())
+    payload = b64(json.dumps(
+        {"email": "v@example.test", "name": "V", "idp": "Feishu",
+         "auth_via": "TokenGeneration_HostedAuth",
+         "exp": int(time.time()) + 600},              # 故意不带 typ
+        separators=(",", ":")).encode())
+    sig = b64(hmac.new(b"test-secret", f"{header}.{payload}".encode(),
+                       hashlib.sha256).digest())
+    token = f"{header}.{payload}.{sig}"
+    request = _req(cookie=f"sb_session={token}")
+    denied = orq._check_auth(request, ROUTE_AUTH, "app-x.example.test")
+    assert denied is not None and denied["status"] == "302"
+    assert "/login?redirect=" in denied["headers"]["location"][0]["value"]
+
+
+def test_a_real_auth_token_verifies_at_the_edge():
+    """**跨组件正向向量**：auth 真签出来的 token 必须能过 Edge 的 verifier。
+
+    这是唯一能发现 `auth/session.py` 的 `SESSION_TYP` 与 Edge 里硬编码的
+    `"session"` 漂移的东西——两处按设计必须字节等价，但 Edge 拿不到那个常量
+    （Lambda@Edge 不能 import auth 包）。只有负向用例的话，把 auth 改成
+    `typ="sess"` 而 Edge 仍查 `"session"`，全部负向用例照样绿，
+    而线上所有会话失效。
+    """
+    sys.path.insert(0, _AUTH_PKG)
+    from session import mint_session_jwt
+    token = mint_session_jwt("v@example.test", "V", "test-secret",
+                             idp="Feishu", auth_via="TokenGeneration_HostedAuth")
+    claims = orq._verify_session_jwt(token)
+    assert claims is not None, "auth 签的 token 在 Edge 侧被拒——两处 typ 漂移了"
+    assert claims["email"] == "v@example.test"

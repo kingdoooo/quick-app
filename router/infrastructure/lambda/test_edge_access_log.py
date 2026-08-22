@@ -325,8 +325,11 @@ def test_unauthenticated_denial_writes_an_empty_email(monkeypatch):
 def test_sink_carries_email_even_when_access_is_forbidden():
     """被拒记录的价值在于"谁被拒了"，所以 403 分支也要有邮箱。"""
     import base64, hashlib, hmac, time
+    # typ 是必需的（S1/M05）：Edge 的 verifier 先查它，缺了就在 403 分支之前
+    # 变成 302，本用例要测的"被拒者的邮箱"根本走不到。
     payload = base64.urlsafe_b64encode(json.dumps(
-        {"email": "out@b.co", "exp": int(time.time()) + 600}).encode()).rstrip(b"=").decode()
+        {"typ": "session", "email": "out@b.co",
+         "exp": int(time.time()) + 600}).encode()).rstrip(b"=").decode()
     head = base64.urlsafe_b64encode(b'{"alg":"HS256"}').rstrip(b"=").decode()
     sig = base64.urlsafe_b64encode(hmac.new(
         b"test-secret", f"{head}.{payload}".encode(), hashlib.sha256).digest()
@@ -360,8 +363,11 @@ def test_untrusted_idp_session_yields_302_without_an_email():
     mod = importlib.import_module("_edge_access_idp_testable")
     import base64, hashlib, hmac, time
     head = base64.urlsafe_b64encode(b'{"alg":"HS256"}').rstrip(b"=").decode()
+    # typ 必须带上（S1/M05）：缺 typ 的 token 死在 verifier 里，同样得到 302 +
+    # 空 sink，本用例会**为了错误的原因通过**——它要钉的是"验签成功但来源不可信"
+    # 那条分支，不是"验签失败"。
     payload = base64.urlsafe_b64encode(json.dumps(
-        {"email": "linked@b.co", "exp": int(time.time()) + 600,
+        {"typ": "session", "email": "linked@b.co", "exp": int(time.time()) + 600,
          "idp": "Cognito",
          "auth_via": "TokenGeneration_Authentication"}).encode()).rstrip(b"=").decode()
     sig = base64.urlsafe_b64encode(hmac.new(

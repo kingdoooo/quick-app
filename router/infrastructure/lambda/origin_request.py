@@ -450,7 +450,12 @@ def _b64url_decode(s: str) -> bytes:
 
 
 def _verify_session_jwt(token: str) -> dict | None:
-    """与 site-builder/auth/session.py 同算法（HS256），改动须两处同步。"""
+    """与 site-builder/auth/session.py 同算法（HS256），改动须两处同步。
+
+    **必须查 `typ`**（M05）：会话 token 与 console 一次性升级码用**同一个密钥**
+    签名、线格式也相同。不查 typ 时一个 60s 的升级码就是一个有效站点会话，
+    而它还能在 auth 的 `/console-session` 无限续期。
+    """
     import base64, hashlib, hmac as _hmac, time as _t
     try:
         h, p, sig = token.split(".")
@@ -460,6 +465,10 @@ def _verify_session_jwt(token: str) -> dict | None:
         if not _hmac.compare_digest(sig, expected):
             return None
         claims = json.loads(_b64url_decode(p))
+        # typ 先查：这是"不能跨上下文复用"的唯一技术保证。字面量与
+        # auth/session.py 的 SESSION_TYP 必须一致（Edge 拿不到那个常量）。
+        if claims.get("typ") != "session":
+            return None
         if int(claims.get("exp", 0)) <= int(_t.time()):
             return None
         email = claims.get("email")
