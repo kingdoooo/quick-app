@@ -1,0 +1,372 @@
+"""backfill 的单测。
+
+闸门的判据是「实际 policy == 从当前 sites 行推导的期望 policy」，
+所以这里的重点用例是那些**不含通配却依然不可用**的形态
+（错账号、漏表、孤儿角色）——只查 `*` 的闸门会放过它们。
+"""
+import json
+import os
+import pathlib
+import sys
+
+import pytest
+from botocore.exceptions import ClientError
+
+sys.path.insert(0, str(pathlib.Path(__file__).parents[2] / "scripts"))
+import backfill_site_role_policies as bf  # noqa: E402
+
+
+class _FakeIam:
+    """只实现 backfill 用到的调用。
+
+    get_role_policy 缺失时抛真形态的 NoSuchEntity ClientError——
+    `_actual_policy` 只把这一种判为"policy 不存在"，其他错误原样抛出。
+    """
+
+    def __init__(self, policies, extra_inline=None, attached=None,
+                 roles_without_policy=None):
+        self._policies = policies                  # {role_name: site-scope 文档}
+        self._extra_inline = extra_inline or {}    # {role_name: [policy 名…]}
+        self._attached = attached or {}            # {role_name: [policy ARN…]}
+        # 存在、但没有 site-scope 的角色：get_role 认识它，
+        # get_role_policy 对它抛 NoSuchEntity（TOCTOU 用例需要这个态）
+        self._roles_without_policy = set(roles_without_policy or ())
+
+    def _known_roles(self):
+        return list(self._policies) + sorted(self._roles_without_policy)
+
+    def get_role(self, RoleName):
+        if RoleName in self._known_roles():
+            return {"Role": {"RoleName": RoleName}}
+        raise ClientError(
+            {"Error": {"Code": "NoSuchEntity", "Message": "not found"}},
+            "GetRole")
+
+    def get_paginator(self, name):
+        if name == "list_roles":
+            pages = [{"Roles": [{"RoleName": r} for r in self._known_roles()]}]
+            return type("P", (), {"paginate": lambda _s, **_k: pages})()
+        if name == "list_role_policies":
+            def _pg(_s, *, RoleName, **_k):
+                names = ["site-scope"] if RoleName in self._policies else []
+                return [{"PolicyNames":
+                         names + self._extra_inline.get(RoleName, [])}]
+            return type("P", (), {"paginate": _pg})()
+        if name == "list_attached_role_policies":
+            def _pg(_s, *, RoleName, **_k):
+                return [{"AttachedPolicies": [
+                    {"PolicyArn": a}
+                    for a in self._attached.get(RoleName, [])]}]
+            return type("P", (), {"paginate": _pg})()
+        raise AssertionError(f"_FakeIam 不认识 paginator {name}")
+
+    def get_role_policy(self, RoleName, PolicyName):
+        if RoleName not in self._policies:
+            raise ClientError(
+                {"Error": {"Code": "NoSuchEntity", "Message": "not found"}},
+                "GetRolePolicy")
+        return {"PolicyDocument": self._policies[RoleName]}
+
+
+@pytest.fixture
+def env(monkeypatch):
+    monkeypatch.setenv("ACCOUNT_ID", "111111111111")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    # 反向存在性检查默认打空桩——check_roles 的每条用例只关心手上那个角色，
+    # 不该顺带去扫真实 sites 表。要测反向缺失的用例自己覆盖它。
+    monkeypatch.setattr(bf, "active_fullstack_site_ids", lambda: [])
+    return monkeypatch
+
+
+def _nosql_site(*tables):
+    return {"tier": "fullstack-nosql", "data_tables": list(tables)}
+
+
+def test_norm_is_insensitive_to_iam_normalization():
+    """IAM 会把单元素列表回成字符串、也不保证语句顺序 ⇒ 不能比 JSON 字符串。"""
+    a = {"Statement": [{"Effect": "Allow", "Action": "s3:GetObject",
+                        "Resource": "arn:1"},
+                       {"Effect": "Allow", "Action": ["logs:Put"],
+                        "Resource": ["arn:2", "arn:3"]}]}
+    b = {"Statement": [{"Effect": "Allow", "Action": ["logs:Put"],
+                        "Resource": ["arn:3", "arn:2"]},
+                       {"Effect": "Allow", "Action": ["s3:GetObject"],
+                        "Resource": ["arn:1"]}]}
+    assert bf._norm(a) == bf._norm(b)
+
+
+def test_norm_keeps_condition_and_other_statement_fields():
+    """「精确 ARN + 额外 Condition」不能被判成合格（Codex 指出）。
+
+    v2 的 `_norm` 只比 (Effect, Action, Resource) 三元组——Condition /
+    NotAction / NotResource 被静默丢弃。带限区 Condition 的角色文本上
+    "逐项相等"，于是不进 targets、不跑功能模拟，--check 绿而站点不可用。
+    """
+    base = {"Statement": [{"Effect": "Allow",
+                           "Action": ["dynamodb:GetItem"],
+                           "Resource": ["arn:aws:dynamodb:r:1:table/x"]}]}
+    conditioned = {"Statement": [{
+        **base["Statement"][0],
+        "Condition": {"StringEquals": {"aws:RequestedRegion": "eu-west-1"}}}]}
+    assert bf._norm(base) != bf._norm(conditioned)
+
+
+def test_check_roles_passes_when_actual_equals_expected(env):
+    import common
+    env.setattr(common, "get_site_consistent", lambda sid: _nosql_site("notes"))
+    good = json.loads(common.site_policy("a-abc123", "dynamodb", tables=["notes"]))
+    assert bf.check_roles(_FakeIam({"site-rt-a-abc123": good})) == []
+
+
+def test_check_roles_flags_a_wrong_account_policy_that_has_no_wildcard(env):
+    """**闸门判的是"等于期望"，不是"没有 `*`"。**
+
+    这条构造一个**除了账号号码全对、且没有任何通配**的 policy——它正是 v2 那版
+    只查 `*` 的闸门会放过、而站点访问自己的表会全部 AccessDenied 的形态
+    （Codex 复核指出）。错 region、漏表同理。
+    """
+    import common
+    env.setattr(common, "get_site_consistent", lambda sid: _nosql_site("notes"))
+    env.setenv("ACCOUNT_ID", "999999999999")            # 先用错账号造"实际"
+    actual = json.loads(common.site_policy("a-abc123", "dynamodb", tables=["notes"]))
+    env.setenv("ACCOUNT_ID", "111111111111")            # 期望按正确账号算
+    # 前提断言**只看 DynamoDB 表 ARN**：日志资源按设计带 stream 层通配
+    # `log-group:…:*`，那不是 M01 的危险表前缀——对整文档查 `*` 会让这条
+    # 用例在 policy 形态完全正确时也必然失败（Codex 指出的确定性 Blocker：
+    # v4 就是整文档断言，Step 4 永远不能全绿）。
+    ddb_resources = [
+        r for stmt in actual["Statement"]
+        if any(str(a).startswith("dynamodb:") for a in
+               (stmt["Action"] if isinstance(stmt["Action"], list)
+                else [stmt["Action"]]))
+        for r in (stmt["Resource"] if isinstance(stmt["Resource"], list)
+                  else [stmt["Resource"]])]
+    assert ddb_resources and all("*" not in r for r in ddb_resources), \
+        "这条用例的前提：DynamoDB 表 ARN 精确、不含通配"
+    bad = bf.check_roles(_FakeIam({"site-rt-a-abc123": actual}))
+    assert len(bad) == 1 and "不一致" in bad[0][1]
+
+
+def test_check_roles_flags_a_missing_table(env):
+    """漏表同样不合格——新加的表会 AccessDenied，而 policy 里没有通配。"""
+    import common
+    env.setattr(common, "get_site_consistent",
+                lambda sid: _nosql_site("notes", "tags"))
+    stale = json.loads(common.site_policy("a-abc123", "dynamodb", tables=["notes"]))
+    bad = bf.check_roles(_FakeIam({"site-rt-a-abc123": stale}))
+    assert len(bad) == 1
+
+
+def test_check_roles_flags_an_extra_inline_policy(env):
+    """site-scope 完全等于期望、但角色上还挂着第二条 inline ⇒ 不合格且需人工。
+
+    boundary 对全部 DynamoDB 数据动作放行整个 site-data-*（infra/app.py 的
+    SiteRuntimeBoundary），残留的"PutItem on site-data-*"调试 policy 与它
+    取交集就是有效跨租户写权限——只比 site-scope 的闸门对它失明，只模拟
+    GetItem 的功能验收也测不出（Codex 指出的 P1）。
+    """
+    import common
+    env.setattr(common, "get_site_consistent", lambda sid: _nosql_site("notes"))
+    good = json.loads(common.site_policy("a-abc123", "dynamodb", tables=["notes"]))
+    bad = bf.check_roles(_FakeIam(
+        {"site-rt-a-abc123": good},
+        extra_inline={"site-rt-a-abc123": ["debug-put"]}))
+    assert len(bad) == 1 and bad[0][1].startswith(bf.EXTRA_POLICY_REASON)
+
+
+def test_check_roles_flags_an_attached_managed_policy(env):
+    """attached managed policy 同理——角色上只许有 site-scope 这一条。"""
+    import common
+    env.setattr(common, "get_site_consistent", lambda sid: _nosql_site("notes"))
+    good = json.loads(common.site_policy("a-abc123", "dynamodb", tables=["notes"]))
+    bad = bf.check_roles(_FakeIam(
+        {"site-rt-a-abc123": good},
+        attached={"site-rt-a-abc123":
+                  ["arn:aws:iam::111111111111:policy/debug"]}))
+    assert len(bad) == 1 and bad[0][1].startswith(bf.EXTRA_POLICY_REASON)
+
+
+def test_check_roles_flags_an_orphan_role(env):
+    """sites 表里没有对应行的角色（下线清理失败留下的）也要报出来。"""
+    import common
+    env.setattr(common, "get_site_consistent", lambda sid: None)
+    iam = _FakeIam({"site-rt-gone-abc123": {"Statement": []}})
+    bad = bf.check_roles(iam)
+    assert len(bad) == 1 and "孤儿" in bad[0][1]
+
+
+def test_check_roles_flags_an_active_site_whose_role_is_missing(env):
+    """反向也要查：ACTIVE fullstack 站点的角色**不存在**同样不合格。
+
+    v2 只从现存 site-rt-* 角色出发反查 sites 行——"角色整个缺失"
+    （误删/清理脚本写错）完全不可见，IAM 里一个角色都没有时闸门反而
+    全绿（Codex 指出）。理由必须是 MISSING_ROLE_REASON 原文——main 按
+    这个前缀把它分流到需人工（不自动重建：异常要先查根因，且这保证了
+    备份里 null 不会混入"角色本身不存在"态，见 _persist_backup docstring）。
+    """
+    env.setattr(bf, "active_fullstack_site_ids", lambda: ["a-abc123"])
+    bad = bf.check_roles(_FakeIam({}))
+    assert bad == [("site-rt-a-abc123", bf.MISSING_ROLE_REASON)]
+
+
+def _min_config(tmp_path, account="111111111111"):
+    """最小可用 config。**不读真实 config.ini**：它是 gitignored 的，干净
+    clone / CI 里不存在——依赖它的测试会以"读不到 config"失败，与被测行为
+    无关（Codex 指出，与上一轮 parents[3] 同型的"本机能过、clone 必挂"）。"""
+    p = tmp_path / "config.ini"
+    p.write_text(f"[Platform]\naccount_id = {account}\nregion = us-east-1\n"
+                 "[Deployer]\nsites_table = sb-sites-test\n")
+    return p
+
+
+def test_load_env_refuses_a_mismatched_account(monkeypatch, tmp_path):
+    """**凭证账号 ≠ config 目标账号 ⇒ 拒绝执行。**
+
+    不核对的话：凭证指向别的账号 ⇒ 那里没有 site-rt-* ⇒ 闸门看到"0 个不合格"
+    ⇒ dry-run/--apply/--check 全退 0，而目标账号里的旧通配角色一个都没动，
+    发布记录却显示 M01 已闭环（Codex 复核指出的 P1）。
+    """
+    class _Sts:
+        def get_caller_identity(self):
+            return {"Account": "999999999999"}
+    monkeypatch.setattr(bf.boto3, "client", lambda name, **kw: _Sts())
+    with pytest.raises(SystemExit, match="拒绝执行"):
+        bf._load_env(_min_config(tmp_path))
+
+
+def test_load_env_overrides_stale_shell_values(monkeypatch, tmp_path):
+    """config 值必须**直接覆盖**，不能让 shell 残留胜出（不用 setdefault）。
+
+    仓库既有的两个迁移脚本 docstring 都明写了这条理由。
+    """
+    class _Sts:
+        def get_caller_identity(self):
+            return {"Account": "111111111111"}
+    monkeypatch.setattr(bf.boto3, "client", lambda name, **kw: _Sts())
+    monkeypatch.setenv("SITES_TABLE", "wrong-sites-table")
+    bf._load_env(_min_config(tmp_path))
+    assert os.environ["SITES_TABLE"] == "sb-sites-test"
+
+
+def test_no_iam_mutation_happens_if_the_backup_cannot_be_persisted(env, tmp_path):
+    """**先留档，后动生产**：备份写失败 ⇒ `ensure_site_role` 一次都没调。
+
+    v2 把备份攒在内存字典、循环结束才写文件——第 2 个角色写入抛异常
+    （IAM 限流最常见）时，第 1 个已被改而备份文件不存在，spec §7.3 承诺的
+    回滚材料落空（Codex 用窄复现证实过）。
+    """
+    import common
+    calls = []
+    env.setattr(common, "ensure_site_role",
+                lambda *a, **k: calls.append((a, k)))
+    env.setattr(bf, "BACKUP_PATH", tmp_path / "no-such-dir" / "backup.json")
+    iam = _FakeIam({"site-rt-a-abc123": {"Statement": []}})
+    with pytest.raises(FileNotFoundError):
+        bf.apply_plans(iam, [("site-rt-a-abc123", "a-abc123",
+                              "dynamodb", ["notes"])])
+    assert calls == []
+
+
+def _backup_doc(roles, account="111111111111", region="us-east-1"):
+    return {"schema_version": 1, "account_id": account,
+            "region": region, "roles": roles}
+
+
+def test_backup_never_overwrites_an_existing_snapshot(env, tmp_path):
+    """重跑合并、绝不覆盖：已收敛的角色不再是 target，无条件覆盖备份文件会
+    丢掉它们的原始通配 policy——回滚要的恰是**第一份**快照（Codex 指出）。"""
+    path = tmp_path / "backup.json"
+    path.write_text(json.dumps(_backup_doc({"site-rt-done-abc123": {"orig": 1},
+                                            "site-rt-a-abc123": {"orig": 1}})))
+    env.setattr(bf, "BACKUP_PATH", path)
+    bf._persist_backup(_FakeIam({"site-rt-a-abc123": {"now": 2}}),
+                       ["site-rt-a-abc123"])
+    roles = json.loads(path.read_text())["roles"]
+    assert roles["site-rt-done-abc123"] == {"orig": 1}   # 不在本次 targets，不丢
+    assert roles["site-rt-a-abc123"] == {"orig": 1}      # 在本次 targets，不覆盖
+
+
+def test_backup_refuses_to_merge_a_snapshot_from_another_account(env, tmp_path):
+    """备份带账号元数据，合并前核对：A 账号的旧快照不能被"绝不覆盖"保留成
+    B 账号同名 role 的回滚材料——回滚时会把 A 的资源 ARN 写进 B
+    （Codex 指出）。不一致就拒绝执行，绝不静默合并。"""
+    path = tmp_path / "backup.json"
+    path.write_text(json.dumps(_backup_doc(
+        {"site-rt-a-abc123": {"orig": 1}}, account="999999999999")))
+    env.setattr(bf, "BACKUP_PATH", path)
+    with pytest.raises(SystemExit, match="拒绝合并"):
+        bf._persist_backup(_FakeIam({"site-rt-a-abc123": {"now": 2}}),
+                           ["site-rt-a-abc123"])
+    # 文件必须原封不动
+    assert json.loads(path.read_text())["account_id"] == "999999999999"
+
+
+def test_a_transient_read_error_during_backup_stops_before_any_mutation(env, tmp_path):
+    """备份阶段读 policy 限流 ⇒ 原样抛出且零 IAM 写入。
+
+    v3 的 `_actual_policy` 裸吞一切异常返回 None，`_persist_backup` 把它
+    落盘成"原本没有 policy"且永不覆盖——一次限流就把回滚材料**永久**记成
+    null（Codex 复现过）。只有 NoSuchEntity 才是"不存在"。
+    """
+    import common
+    calls = []
+    env.setattr(common, "ensure_site_role", lambda *a, **k: calls.append(a))
+    env.setattr(bf, "BACKUP_PATH", tmp_path / "backup.json")
+
+    class _ThrottledIam(_FakeIam):
+        def get_role_policy(self, RoleName, PolicyName):
+            raise ClientError(
+                {"Error": {"Code": "Throttling", "Message": "rate exceeded"}},
+                "GetRolePolicy")
+
+    with pytest.raises(ClientError):
+        bf.apply_plans(_ThrottledIam({"site-rt-a-abc123": {}}),
+                       [("site-rt-a-abc123", "a-abc123", "dynamodb", ["notes"])])
+    assert calls == []
+    assert not (tmp_path / "backup.json").exists()
+
+
+def test_a_role_that_vanishes_after_enumeration_aborts_before_any_write(env, tmp_path):
+    """TOCTOU 兜底：枚举时在、备份前被带外删除的角色 ⇒ 中止且零 IAM 写入。
+
+    GetRolePolicy 的 NoSuchEntity 分不出"角色没了"和"角色在、只缺
+    site-scope"——不复核 GetRole 的话，消失的角色会被备份成 null、再被
+    ensure_site_role 整建，回滚歧义（删整个角色还是只删 policy）原样回来。
+    「缺失角色分流需人工」只保证枚举时刻的缺失；这条守卫把「null ⇒ 角色
+    存在」从运维假设变成技术保证（Codex 签核附带项）。
+    """
+    import common
+    calls = []
+    env.setattr(common, "ensure_site_role", lambda *a, **k: calls.append(a))
+    env.setattr(bf, "BACKUP_PATH", tmp_path / "backup.json")
+    with pytest.raises(SystemExit, match="枚举后消失"):
+        bf.apply_plans(_FakeIam({}),
+                       [("site-rt-a-abc123", "a-abc123", "dynamodb", ["notes"])])
+    assert calls == []
+    assert not (tmp_path / "backup.json").exists()
+
+
+def test_backup_null_requires_the_role_to_still_exist(env, tmp_path):
+    """null 只允许在「角色在、site-scope 不在」时落盘（GetRole 复核通过）。"""
+    env.setattr(bf, "BACKUP_PATH", tmp_path / "backup.json")
+    iam = _FakeIam({}, roles_without_policy={"site-rt-a-abc123"})
+    bf._persist_backup(iam, ["site-rt-a-abc123"])
+    saved = json.loads((tmp_path / "backup.json").read_text())
+    assert saved["roles"] == {"site-rt-a-abc123": None}
+
+
+def test_engine_and_tables_come_from_the_site_row():
+    site = {"tier": "fullstack-nosql", "data_tables": ["notes", "tags"]}
+    assert bf.plan_for("a-abc123", site) == ("dynamodb", ["notes", "tags"])
+    assert bf.plan_for("b-abc123", {"tier": "fullstack-sql"}) == ("dsql", [])
+
+
+def test_dynamodb_site_without_data_tables_is_skipped_not_guessed():
+    """缺 data_tables 而 engine 是 dynamodb ⇒ 需人工，不猜表清单。"""
+    with pytest.raises(bf.NeedsManualReview, match="data_tables"):
+        bf.plan_for("a-abc123", {"tier": "fullstack-nosql"})
+
+
+def test_unknown_tier_is_skipped_not_guessed():
+    with pytest.raises(bf.NeedsManualReview, match="tier"):
+        bf.plan_for("a-abc123", {"tier": "fullstack-graph"})

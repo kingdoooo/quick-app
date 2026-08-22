@@ -14,3 +14,6 @@ site-builder/ONBOARDING.md
 
 # 临时设计草稿与给外部审查的上下文（可能含真实资源 ID，不入库）
 docs/design/
+
+# backfill 的旧 policy 快照（回滚材料，含账号 ARN，不入库）
+site-builder/scripts/backfill-old-policies.json*
