@@ -231,20 +231,33 @@ def test_unknown_tier_skips_dsql_purge_instead_of_failing_the_undeploy(aws):
         f"未知 tier 把整次下线打成了 FAILED：{job.get('error')}")
     assert job["status"] == "PURGE_FAILED", job
     # 异常必须留痕：只落在返回值里等于没落（异步调用没人读返回值）
-    assert "未知 tier" in out["purged"]["engine_unknown_error"], out
-    assert "未知 tier" in job["error"], job["error"]
+    msg = out["purged"]["engine_unknown_error"]
+    assert "无法判定数据引擎" in msg, msg
+    assert "未尝试 DSQL 清理" in msg, msg
+    # **只说知道的事**：判不出引擎 ⇒ 有没有残留数据我们不知道，不许断言"数据还在"
+    assert "是否有残留数据未知" in msg, msg
+    assert msg in job["error"], job["error"]
 
 
 def test_empty_tier_is_an_anomaly_not_a_static_site(aws):
     """`tier` 是空串/None（键**在**但值是假值）：算异常并留痕，不许悄悄回落。
 
-    这里曾经写成 `site.get("tier") or "static"`，也就是把"这行数据坏了"洗成
-    "这是个静态站点"——**那是一次猜**，而且是本段注释明令禁止的那一种猜。
-    真正的静态站点由 `create_site_record` 写着 `tier="static"`；值缺失的行是
-    异常，不是静态站点（M02 那类"把坏数据洗成合法值"的形状）。
+    这里曾经写成 `site.get("tier") or "static"`——把"这行没有可用的 tier"猜成
+    "这是个静态站点"，而这正是 M02 那类"把坏数据洗成合法值"。
 
-    洗掉的后果具体而恶劣：DSQL 清理被跳过，用户勾的却是"永久删除数据"，
-    而**任何地方都不记录跳过了**——他看到的是"已下线"，数据还在。
+    **本用例先前的 docstring 断言过一条假事实**（"真正的静态站点由
+    `create_site_record` 写着 tier=static"），已核实并纠正：
+    `create_site_record` 只写 owner/name/status/created_at（`common.py:194-199`），
+    `tier` 的**唯一** writer 是 `mark_job.py:441`，且只在**成功**路径上
+    （紧随 `update_job(status="SUCCEEDED")`，第 10/10 步）。没有任何地方删 sites 行
+    （三处 `delete_item` 打的是 JOBS_TABLE 的租约行与 ROUTING_TABLE）。
+    所以"没有 tier 的行"= **首次部署没走到最后一步的站点**（外加存量老行），
+    是正常可达且永久留存的一类，不是"坏数据"。
+
+    这让猜**更**危险而不是更安全：`data_tables`（`provision_dynamodb.py:30`，第 2 步）
+    与 DSQL schema（`provision_dsql.py:116`）都在 `tier` **之前**落盘，所以一个失败的
+    fullstack-sql 部署完全可能已经有真实的 DSQL schema 却没有 tier。猜成 static ⇒
+    静默跳过那个真实存在的 schema，而用户勾的是"永久删除数据"。
     问题在"静默"，不在"跳过"。
 
     注：`site.get("tier", "static")` 那个写法连这一步都到不了——它只在**键不存在**
@@ -268,11 +281,17 @@ def test_empty_tier_is_an_anomaly_not_a_static_site(aws):
 
 
 def test_missing_tier_key_is_an_anomaly_too(aws):
-    """`tier` 键**完全不存在**的存量稀疏行：同样算异常并留痕。
+    """`tier` 键**完全不存在**的行（= 首次部署没成功过的站点）：同样留痕并跳过。
 
     与 sibling 的区别是这条走的是 `get` 返回 None 的分支（那条走假值分支），
     两条都必须落到同一个出口——把它们合成一条就分不出"默认值生效了"
-    和"值是假值"这两种情况。
+    和"值是假值"这两种情况。真实账号里这一类**不罕见**：`tier` 只在
+    `mark_job.py:441`（成功路径末步）才写，而 sites 行永不删除。
+
+    这条**按整句钉死文案**（sibling 只查关键短语）：文案本身是这次修正的产物，
+    "判不出引擎"必须不能读成"数据还在"——一个失败过的 static 部署本来就没有数据，
+    对它警告残留数据是虚假警报。写成字面量而不是从被测代码拼出来，
+    否则改坏文案时期望值跟着一起变、用例照绿。
     """
     import undeploy, common
     jid = common.create_job("a@x.com", "sparse-x7")
@@ -287,7 +306,9 @@ def test_missing_tier_key_is_an_anomaly_too(aws):
     job = common.get_job(jid)
     assert job["status"] != "FAILED", (
         f"缺 tier 键把整次下线打成了 FAILED：{job.get('error')}")
-    assert out["purged"]["engine_unknown_error"], out
+    assert out["purged"]["engine_unknown_error"] == (
+        "无法判定数据引擎（sites 行的 tier=None 不是已知取值），因此未尝试 "
+        "DSQL 清理；是否有残留数据未知。DynamoDB 侧仍按 data_tables=[] 处理"), out
     assert job["status"] == "PURGE_FAILED", job
 
 

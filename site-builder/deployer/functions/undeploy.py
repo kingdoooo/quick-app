@@ -181,12 +181,25 @@ def _undeploy(event, context):
         tables = event.get("data_tables") or list(site.get("data_tables", []))
         try:
             # **不给 tier 兜默认值**。`or ""` 只是把"值不可用"（键缺失取到 None、
-            # 或写成 NULL / 空串）统一送进下面的抛错分支——曾经这里兜的是
-            # `or "static"`，那等于把"这行数据坏了"洗成"这是个静态站点"：真正的
-            # 静态站点由 create_site_record 写着 tier="static"，没有 tier 的行是
-            # **异常**。（`tier_engine("")` 与 `tier_engine(None)` 都会抛，所以
-            # `or ""` 是双保险而非必需；`test_tier_engine_rejects_an_unknown_tier`
-            # 把这两个出口钉住了。）
+            # 或写成 NULL / 空串）统一送进下面的抛错分支。曾经这里兜的是
+            # `or "static"`，即把"没有可用 tier"猜成"这是个静态站点"。
+            #
+            # 这里原先的理由是"真正的静态站点由 create_site_record 写着 tier=static"
+            # ——**那条事实是错的**，已核实：`create_site_record` 只写
+            # owner/name/status/created_at（common.py:194-199）；`tier` 的**唯一**
+            # writer 是 `mark_job.py:441`，且只在**成功**路径上（紧随
+            # `update_job(status="SUCCEEDED")`，第 10/10 步）。也没有任何地方删 sites
+            # 行（三处 delete_item 打的是 JOBS_TABLE 的租约行与 ROUTING_TABLE）。
+            # 所以"没有 tier 的行"= **首次部署没走到最后一步的站点**（外加存量老行），
+            # 是正常可达、且会永久留存的一类，不是坏数据。
+            #
+            # 这让猜**更**危险而不是更安全：`data_tables`（provision_dynamodb.py:30，
+            # 第 2 步）与 DSQL schema（provision_dsql.py:116）都在 `tier` **之前**落盘，
+            # 所以一个失败的 fullstack-sql 部署完全可能已经有真实的 DSQL schema 却
+            # 没有 tier。猜成 static ⇒ 静默跳过那个真实存在的 schema。
+            #
+            # （`tier_engine("")` 与 `tier_engine(None)` 都会抛，所以 `or ""` 是双保险
+            # 而非必需；两个出口由 test_tier_engine_rejects_an_unknown_tier 钉住。）
             engine = (event.get("engine")
                       or common.tier_engine(site.get("tier") or ""))
         except ValueError as e:
@@ -195,12 +208,25 @@ def _undeploy(event, context):
             # 一次**可选**的数据清理没能定型，不该把干净成功的下线报成
             # "可能处于部分删除状态"——那与本段开头的契约相反。
             # 键带 `_error` ⇒ 计入 purge_errors ⇒ job 落 PURGE_FAILED 而非 DELETED：
-            # DSQL 清理被跳过了，它若本是 DSQL 站点则数据还在，而用户刚勾的是
-            # "永久删除数据"；异步调用的返回值没人看得到，只有 job.error 到得了
-            # 用户眼前（与 dynamodb_error / dsql_error 同一口径）。**静默才是问题
-            # 所在，跳过本身不是。**
+            # 用户勾的是"永久删除数据"而 DSQL 侧一步没做，异步调用的返回值没人看得到，
+            # 只有 job.error 到得了用户眼前（与 dynamodb_error / dsql_error 同一口径）。
+            # **静默才是问题所在，跳过本身不是。**
+            #
+            # 文案**只说我们确实知道的事**：判不出引擎、所以没动 DSQL；有没有残留数据
+            # 我们**不知道**（tier-less 行既可能是失败的 static 部署——本来就没有数据，
+            # 也可能是失败的 fullstack-sql 部署——schema 真的在）。断言"数据还在"会让
+            # 每一个失败过的 static 站点都收到一条虚假警报，而那是个常规流程
+            # （"部署炸了，我勾上清数据再下线"）。
+            # 回显 `site.get("tier")` 的原值而不是异常文本：异常里 `or ""` 之后一律
+            # 是 `''`，分不出"这一列没写过"和"写成了空串"，而那正是运维要判的。
+            # DynamoDB 侧不受影响——`_purge_dynamodb` 在下面**无条件**执行，
+            # 所以不能说成"未尝试数据清理"。
             logger.warning(f"tier 不可用，跳过 DSQL 清理: {e}")
-            engine, purged["engine_unknown_error"] = "none", str(e)[:200]
+            engine = "none"
+            purged["engine_unknown_error"] = (
+                f"无法判定数据引擎（sites 行的 tier={site.get('tier')!r} 不是已知"
+                f"取值），因此未尝试 DSQL 清理；是否有残留数据未知。"
+                f"DynamoDB 侧仍按 data_tables={tables} 处理")[:200]
         try:
             purged["dynamodb"] = _purge_dynamodb(site_id, tables)
         except Exception as e:
