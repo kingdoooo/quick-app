@@ -47,6 +47,13 @@
   且会被上面那个扫描拦下。
 - **多条 `cd` 必须各自套子 shell**：`(cd X && …)`。连写
   `cd a && …` 换行 `cd b && …` 时，第二条已经在 `a` 里执行，必然找不到 `b`。
+- **所有多命令 bash 块一律以 `set -euo pipefail` 开头。** 不加的话，块里任何
+  一条命令失败都不会阻止后面的命令，且块的退出码取**最后一条**——v2 的
+  Task 10 正是这个形态：`backfill --apply` 退 1 后 auth/router 照常部署，
+  Step 3 整块退 0；`--check` 退 1 后 `smoke_router.sh` 成功，Step 5 又是 0，
+  于是「M01 闸门失败」与「S1 全绿」在执行记录上无法区分（Codex 指出的 P1
+  假绿）。**测试块、部署块、验收块、commit 块全部适用**；backfill 的
+  dry-run / `--apply` / `--check` 是硬停止点，失败必须立即中断整块。
 
 ---
 
@@ -228,6 +235,7 @@ Expected: 退出码 0，打印 `无 —— S1 上线不会卡住任何现有站�
 - [ ] **Step 5: 扫描 + Commit**
 
 ```bash
+set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 bash site-builder/scripts/scan_staged_secrets.sh \
      --files site-builder/scripts/audit_policy_rows.py \
@@ -338,6 +346,7 @@ Expected: PASS，`offenders` 只剩 `common.py` 那一处
 - [ ] **Step 6: Commit**
 
 ```bash
+set -euo pipefail
 git add site-builder/deployer/functions/common.py \
         site-builder/deployer/functions/provision_dynamodb.py \
         site-builder/deployer/functions/undeploy.py \
@@ -536,6 +545,7 @@ Expected: PASS（三条新用例转绿，既有用例不回归）
 - [ ] **Step 6: Commit**
 
 ```bash
+set -euo pipefail
 git add site-builder/deployer/functions/common.py \
         site-builder/deployer/functions/deploy_lambda_site.py \
         site-builder/deployer/functions/provision_dsql.py \
@@ -646,6 +656,7 @@ Expected: PASS
 - [ ] **Step 6: 扫描 + Commit**
 
 ```bash
+set -euo pipefail
 git add site-builder/deployer/functions/common.py \
         site-builder/deployer/functions/undeploy.py \
         site-builder/deployer/tests/test_common.py
@@ -663,7 +674,7 @@ git commit -m "refactor(s1/m01): tier→engine 提成 common.tier_engine 唯一�
 
 **Interfaces:**
 - Consumes: `common.ensure_site_role(site_id, engine, *, tables)`（Task 3）、`common.tier_engine(tier)`（Task 3b）
-- Produces: `check_roles(iam) -> list[(role, reason)]`（闸门用，判据是「实际 == 期望」）、`verify_access(iam, site_id, tables)`（用 IAM 模拟器做功能验收）、`plan_for(site_id, site)`、`_load_env()`（含 STS 账号核对）、命令行 `--apply` / `--check`
+- Produces: `check_roles(iam) -> list[(role, reason)]`（闸门用，判据四层：site-scope 完整文档等值、角色上**只许有 site-scope 一条 policy**、ACTIVE 站点角色反向存在、功能模拟另见 simulate_active_sites）、`verify_access(iam, site_id, tables)`（IAM 模拟器验收，动作清单从期望 policy 现取——**全部** DynamoDB 数据动作，读写都验）、`simulate_active_sites(iam)`（--check 对全部 dynamodb 站点跑功能模拟）、`plan_for(site_id, site)`、`_load_env(config_path=None)`（含 STS 账号核对；path 可注入是给单测的，生产不传参）、`apply_plans(iam, todo)`（先备份后写）、`_persist_backup(iam, role_names)`（第一笔 IAM 写入前原子落盘、合并不覆盖、带账号元数据且不一致拒绝合并）、`active_fullstack_site_ids()`、命令行 `--apply` / `--check`
 
 > **为什么必须做而不是等下次部署**（这是 v1 的设计错误，Codex 复核指出）：
 > `table/site-data-{A}-*` 是**向前看的**通配——它覆盖所有以 A 的 id 为前缀的
@@ -690,22 +701,47 @@ import pathlib
 import sys
 
 import pytest
+from botocore.exceptions import ClientError
 
 sys.path.insert(0, str(pathlib.Path(__file__).parents[2] / "scripts"))
 import backfill_site_role_policies as bf  # noqa: E402
 
 
 class _FakeIam:
-    """只实现 backfill 用到的三个调用。"""
+    """只实现 backfill 用到的调用。
 
-    def __init__(self, policies):
-        self._policies = policies          # {role_name: policy_doc}
+    get_role_policy 缺失时抛真形态的 NoSuchEntity ClientError——
+    `_actual_policy` 只把这一种判为"policy 不存在"，其他错误原样抛出。
+    """
 
-    def get_paginator(self, _name):
-        roles = [{"RoleName": r} for r in self._policies]
-        return type("P", (), {"paginate": lambda _s, **_k: [{"Roles": roles}]})()
+    def __init__(self, policies, extra_inline=None, attached=None):
+        self._policies = policies                  # {role_name: site-scope 文档}
+        self._extra_inline = extra_inline or {}    # {role_name: [policy 名…]}
+        self._attached = attached or {}            # {role_name: [policy ARN…]}
+
+    def get_paginator(self, name):
+        if name == "list_roles":
+            pages = [{"Roles": [{"RoleName": r} for r in self._policies]}]
+            return type("P", (), {"paginate": lambda _s, **_k: pages})()
+        if name == "list_role_policies":
+            def _pg(_s, *, RoleName, **_k):
+                names = ["site-scope"] if RoleName in self._policies else []
+                return [{"PolicyNames":
+                         names + self._extra_inline.get(RoleName, [])}]
+            return type("P", (), {"paginate": _pg})()
+        if name == "list_attached_role_policies":
+            def _pg(_s, *, RoleName, **_k):
+                return [{"AttachedPolicies": [
+                    {"PolicyArn": a}
+                    for a in self._attached.get(RoleName, [])]}]
+            return type("P", (), {"paginate": _pg})()
+        raise AssertionError(f"_FakeIam 不认识 paginator {name}")
 
     def get_role_policy(self, RoleName, PolicyName):
+        if RoleName not in self._policies:
+            raise ClientError(
+                {"Error": {"Code": "NoSuchEntity", "Message": "not found"}},
+                "GetRolePolicy")
         return {"PolicyDocument": self._policies[RoleName]}
 
 
@@ -713,6 +749,9 @@ class _FakeIam:
 def env(monkeypatch):
     monkeypatch.setenv("ACCOUNT_ID", "111111111111")
     monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    # 反向存在性检查默认打空桩——check_roles 的每条用例只关心手上那个角色，
+    # 不该顺带去扫真实 sites 表。要测反向缺失的用例自己覆盖它。
+    monkeypatch.setattr(bf, "active_fullstack_site_ids", lambda: [])
     return monkeypatch
 
 
@@ -731,6 +770,22 @@ def test_norm_is_insensitive_to_iam_normalization():
                        {"Effect": "Allow", "Action": ["s3:GetObject"],
                         "Resource": ["arn:1"]}]}
     assert bf._norm(a) == bf._norm(b)
+
+
+def test_norm_keeps_condition_and_other_statement_fields():
+    """「精确 ARN + 额外 Condition」不能被判成合格（Codex 指出）。
+
+    v2 的 `_norm` 只比 (Effect, Action, Resource) 三元组——Condition /
+    NotAction / NotResource 被静默丢弃。带限区 Condition 的角色文本上
+    "逐项相等"，于是不进 targets、不跑功能模拟，--check 绿而站点不可用。
+    """
+    base = {"Statement": [{"Effect": "Allow",
+                           "Action": ["dynamodb:GetItem"],
+                           "Resource": ["arn:aws:dynamodb:r:1:table/x"]}]}
+    conditioned = {"Statement": [{
+        **base["Statement"][0],
+        "Condition": {"StringEquals": {"aws:RequestedRegion": "eu-west-1"}}}]}
+    assert bf._norm(base) != bf._norm(conditioned)
 
 
 def test_check_roles_passes_when_actual_equals_expected(env):
@@ -767,6 +822,35 @@ def test_check_roles_flags_a_missing_table(env):
     assert len(bad) == 1
 
 
+def test_check_roles_flags_an_extra_inline_policy(env):
+    """site-scope 完全等于期望、但角色上还挂着第二条 inline ⇒ 不合格且需人工。
+
+    boundary 对全部 DynamoDB 数据动作放行整个 site-data-*（infra/app.py 的
+    SiteRuntimeBoundary），残留的"PutItem on site-data-*"调试 policy 与它
+    取交集就是有效跨租户写权限——只比 site-scope 的闸门对它失明，只模拟
+    GetItem 的功能验收也测不出（Codex 指出的 P1）。
+    """
+    import common
+    env.setattr(common, "get_site_consistent", lambda sid: _nosql_site("notes"))
+    good = json.loads(common.site_policy("a-abc123", "dynamodb", tables=["notes"]))
+    bad = bf.check_roles(_FakeIam(
+        {"site-rt-a-abc123": good},
+        extra_inline={"site-rt-a-abc123": ["debug-put"]}))
+    assert len(bad) == 1 and bad[0][1].startswith(bf.EXTRA_POLICY_REASON)
+
+
+def test_check_roles_flags_an_attached_managed_policy(env):
+    """attached managed policy 同理——角色上只许有 site-scope 这一条。"""
+    import common
+    env.setattr(common, "get_site_consistent", lambda sid: _nosql_site("notes"))
+    good = json.loads(common.site_policy("a-abc123", "dynamodb", tables=["notes"]))
+    bad = bf.check_roles(_FakeIam(
+        {"site-rt-a-abc123": good},
+        attached={"site-rt-a-abc123":
+                  ["arn:aws:iam::111111111111:policy/debug"]}))
+    assert len(bad) == 1 and bad[0][1].startswith(bf.EXTRA_POLICY_REASON)
+
+
 def test_check_roles_flags_an_orphan_role(env):
     """sites 表里没有对应行的角色（下线清理失败留下的）也要报出来。"""
     import common
@@ -776,7 +860,29 @@ def test_check_roles_flags_an_orphan_role(env):
     assert len(bad) == 1 and "孤儿" in bad[0][1]
 
 
-def test_load_env_refuses_a_mismatched_account(monkeypatch):
+def test_check_roles_flags_an_active_site_whose_role_is_missing(env):
+    """反向也要查：ACTIVE fullstack 站点的角色**不存在**同样不合格。
+
+    v2 只从现存 site-rt-* 角色出发反查 sites 行——"角色整个缺失"
+    （误删/清理脚本写错）完全不可见，IAM 里一个角色都没有时闸门反而
+    全绿（Codex 指出）。
+    """
+    env.setattr(bf, "active_fullstack_site_ids", lambda: ["a-abc123"])
+    bad = bf.check_roles(_FakeIam({}))
+    assert len(bad) == 1 and "缺失" in bad[0][1]
+
+
+def _min_config(tmp_path, account="111111111111"):
+    """最小可用 config。**不读真实 config.ini**：它是 gitignored 的，干净
+    clone / CI 里不存在——依赖它的测试会以"读不到 config"失败，与被测行为
+    无关（Codex 指出，与上一轮 parents[3] 同型的"本机能过、clone 必挂"）。"""
+    p = tmp_path / "config.ini"
+    p.write_text(f"[Platform]\naccount_id = {account}\nregion = us-east-1\n"
+                 "[Deployer]\nsites_table = sb-sites-test\n")
+    return p
+
+
+def test_load_env_refuses_a_mismatched_account(monkeypatch, tmp_path):
     """**凭证账号 ≠ config 目标账号 ⇒ 拒绝执行。**
 
     不核对的话：凭证指向别的账号 ⇒ 那里没有 site-rt-* ⇒ 闸门看到"0 个不合格"
@@ -788,26 +894,99 @@ def test_load_env_refuses_a_mismatched_account(monkeypatch):
             return {"Account": "999999999999"}
     monkeypatch.setattr(bf.boto3, "client", lambda name, **kw: _Sts())
     with pytest.raises(SystemExit, match="拒绝执行"):
-        bf._load_env()
+        bf._load_env(_min_config(tmp_path))
 
 
-def test_load_env_overrides_stale_shell_values(monkeypatch):
+def test_load_env_overrides_stale_shell_values(monkeypatch, tmp_path):
     """config 值必须**直接覆盖**，不能让 shell 残留胜出（不用 setdefault）。
 
     仓库既有的两个迁移脚本 docstring 都明写了这条理由。
     """
-    import configparser
-    cfg = configparser.ConfigParser(interpolation=None)
-    cfg.read(bf.ROOT / "site-builder" / "config.ini")
-    real_account = cfg["Platform"]["account_id"].strip()
-
     class _Sts:
         def get_caller_identity(self):
-            return {"Account": real_account}
+            return {"Account": "111111111111"}
     monkeypatch.setattr(bf.boto3, "client", lambda name, **kw: _Sts())
     monkeypatch.setenv("SITES_TABLE", "wrong-sites-table")
-    bf._load_env()
-    assert os.environ["SITES_TABLE"] != "wrong-sites-table"
+    bf._load_env(_min_config(tmp_path))
+    assert os.environ["SITES_TABLE"] == "sb-sites-test"
+
+
+def test_no_iam_mutation_happens_if_the_backup_cannot_be_persisted(env, tmp_path):
+    """**先留档，后动生产**：备份写失败 ⇒ `ensure_site_role` 一次都没调。
+
+    v2 把备份攒在内存字典、循环结束才写文件——第 2 个角色写入抛异常
+    （IAM 限流最常见）时，第 1 个已被改而备份文件不存在，spec §7.3 承诺的
+    回滚材料落空（Codex 用窄复现证实过）。
+    """
+    import common
+    calls = []
+    env.setattr(common, "ensure_site_role",
+                lambda *a, **k: calls.append((a, k)))
+    env.setattr(bf, "BACKUP_PATH", tmp_path / "no-such-dir" / "backup.json")
+    iam = _FakeIam({"site-rt-a-abc123": {"Statement": []}})
+    with pytest.raises(FileNotFoundError):
+        bf.apply_plans(iam, [("site-rt-a-abc123", "a-abc123",
+                              "dynamodb", ["notes"])])
+    assert calls == []
+
+
+def _backup_doc(roles, account="111111111111", region="us-east-1"):
+    return {"schema_version": 1, "account_id": account,
+            "region": region, "roles": roles}
+
+
+def test_backup_never_overwrites_an_existing_snapshot(env, tmp_path):
+    """重跑合并、绝不覆盖：已收敛的角色不再是 target，无条件覆盖备份文件会
+    丢掉它们的原始通配 policy——回滚要的恰是**第一份**快照（Codex 指出）。"""
+    path = tmp_path / "backup.json"
+    path.write_text(json.dumps(_backup_doc({"site-rt-done-abc123": {"orig": 1},
+                                            "site-rt-a-abc123": {"orig": 1}})))
+    env.setattr(bf, "BACKUP_PATH", path)
+    bf._persist_backup(_FakeIam({"site-rt-a-abc123": {"now": 2}}),
+                       ["site-rt-a-abc123"])
+    roles = json.loads(path.read_text())["roles"]
+    assert roles["site-rt-done-abc123"] == {"orig": 1}   # 不在本次 targets，不丢
+    assert roles["site-rt-a-abc123"] == {"orig": 1}      # 在本次 targets，不覆盖
+
+
+def test_backup_refuses_to_merge_a_snapshot_from_another_account(env, tmp_path):
+    """备份带账号元数据，合并前核对：A 账号的旧快照不能被"绝不覆盖"保留成
+    B 账号同名 role 的回滚材料——回滚时会把 A 的资源 ARN 写进 B
+    （Codex 指出）。不一致就拒绝执行，绝不静默合并。"""
+    path = tmp_path / "backup.json"
+    path.write_text(json.dumps(_backup_doc(
+        {"site-rt-a-abc123": {"orig": 1}}, account="999999999999")))
+    env.setattr(bf, "BACKUP_PATH", path)
+    with pytest.raises(SystemExit, match="拒绝合并"):
+        bf._persist_backup(_FakeIam({"site-rt-a-abc123": {"now": 2}}),
+                           ["site-rt-a-abc123"])
+    # 文件必须原封不动
+    assert json.loads(path.read_text())["account_id"] == "999999999999"
+
+
+def test_a_transient_read_error_during_backup_stops_before_any_mutation(env, tmp_path):
+    """备份阶段读 policy 限流 ⇒ 原样抛出且零 IAM 写入。
+
+    v3 的 `_actual_policy` 裸吞一切异常返回 None，`_persist_backup` 把它
+    落盘成"原本没有 policy"且永不覆盖——一次限流就把回滚材料**永久**记成
+    null（Codex 复现过）。只有 NoSuchEntity 才是"不存在"。
+    """
+    import common
+    calls = []
+    env.setattr(common, "ensure_site_role", lambda *a, **k: calls.append(a))
+    env.setattr(bf, "BACKUP_PATH", tmp_path / "backup.json")
+
+    class _ThrottledIam(_FakeIam):
+        def get_role_policy(self, RoleName, PolicyName):
+            raise ClientError(
+                {"Error": {"Code": "Throttling", "Message": "rate exceeded"}},
+                "GetRolePolicy")
+
+    with pytest.raises(ClientError):
+        bf.apply_plans(_ThrottledIam({"site-rt-a-abc123": {}}),
+                       [("site-rt-a-abc123", "a-abc123", "dynamodb", ["notes"])])
+    assert calls == []
+    assert not (tmp_path / "backup.json").exists()
 
 
 def test_engine_and_tables_come_from_the_site_row():
@@ -862,20 +1041,30 @@ import sys
 import urllib.parse
 
 import boto3
+from botocore.exceptions import ClientError
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "site-builder" / "deployer" / "functions"))
 
 ROLE_PREFIX = "site-rt-"
 POLICY_NAME = "site-scope"
+BACKUP_PATH = ROOT / "site-builder" / "scripts" / "backfill-old-policies.json"
+# check_roles 用这个前缀标记"闸门红但不能自动修"的角色；main 据此分流到
+# 需人工清单而不是 todo（自动删未知 policy 违反"判不出就不猜"）
+EXTRA_POLICY_REASON = "site-scope 之外还有别的 policy（需人工移除，不自动删）"
 
 
 class NeedsManualReview(Exception):
     """这个角色的 engine / 表清单判不出来——跳过并计数，绝不猜。"""
 
 
-def _load_env():
+def _load_env(config_path=None):
     """从 config.ini 下发环境变量，并**核对当前凭证就是目标账号**。
+
+    **`config_path` 可注入是给单测用的**：真实 config.ini 是 gitignored 的，
+    干净 clone / CI 里不存在——读它的测试会以"读不到 config"失败，与被测行为
+    无关（Codex 指出）。生产调用不传参，仍以仓库根的 config.ini 为唯一取值
+    来源（CLAUDE.md 口径不变）。
 
     **直接赋值，不用 setdefault**：config.ini 是部署脚本的唯一取值来源
     （CLAUDE.md），setdefault 会让 shell 里残留的旧值静默改写写入目标。
@@ -889,7 +1078,7 @@ def _load_env():
     没有任何 `*`、闸门照样绿，而站点访问自己的表全部 AccessDenied。
     """
     cfg = configparser.ConfigParser(interpolation=None)
-    if not cfg.read(ROOT / "site-builder" / "config.ini"):
+    if not cfg.read(config_path or ROOT / "site-builder" / "config.ini"):
         raise SystemExit("读不到 site-builder/config.ini")
     acct = cfg["Platform"]["account_id"].strip()
     actual = boto3.client("sts").get_caller_identity()["Account"]
@@ -905,29 +1094,64 @@ def _load_env():
     return cfg
 
 
-def _norm(doc: dict) -> list:
-    """policy 文档 → 可比较形态。
+def _norm(doc: dict):
+    """policy 文档 → 可比较形态。**完整递归等值，不丢任何字段**。
 
-    **不能直接比 JSON 字符串**：IAM 会做自己的归一（单元素 Resource 列表可能
-    回来变成字符串，语句顺序不保证）。
+    **不能直接比 JSON 字符串**：IAM 会做自己的归一（单元素列表可能回来变成
+    字符串，语句顺序不保证）。**也不能只比 (Effect, Action, Resource)**——
+    v2 那样会丢掉 Condition / NotAction / NotResource：「精确 ARN + 额外限区
+    Condition」的角色被判合格、不进 targets、不跑功能模拟，--check 绿而站点
+    不可用（Codex 指出）。所以递归规范化整个文档：dict 保留全部键、标量与
+    单元素列表同形、多元素列表按规范 JSON 串排序。
     """
-    out = []
-    for stmt in doc.get("Statement", []):
-        def _lst(key):
-            val = stmt.get(key, [])
-            return tuple(sorted(val if isinstance(val, list) else [val]))
-        out.append((stmt.get("Effect"), _lst("Action"), _lst("Resource")))
-    return sorted(out)
+    def _c(v):
+        if isinstance(v, dict):
+            return {k: _c(x) for k, x in v.items()}
+        if isinstance(v, list):
+            out = [_c(x) for x in v]
+            if len(out) == 1:
+                return out[0]
+            return sorted(out, key=lambda x: json.dumps(
+                x, sort_keys=True, ensure_ascii=False))
+        return v
+    return _c(doc)
 
 
 def _actual_policy(iam, role_name: str):
-    """角色当前的 inline policy（读不到返回 None）。"""
+    """角色的 site-scope inline policy。**只有 NoSuchEntity 返回 None**。
+
+    v3 是裸 `except Exception: return None`——限流/断网/AccessDenied 都被
+    解释成"原本没有 policy"，`_persist_backup` 把这个 None 落盘且"绝不覆盖
+    已有快照"，于是一次限流就把回滚材料**永久**记成 null（Codex 复现过）。
+    其他错误必须原样抛出：抛在备份阶段 ⇒ 零 IAM 写入（先备份后写保证的）；
+    抛在 --check ⇒ 退非 0，本来就是 fail-closed。
+    """
     try:
         raw = iam.get_role_policy(
             RoleName=role_name, PolicyName=POLICY_NAME)["PolicyDocument"]
-    except Exception:
-        return None
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "NoSuchEntity":
+            return None
+        raise
     return raw if isinstance(raw, dict) else json.loads(urllib.parse.unquote(raw))
+
+
+def _extra_policies(iam, role_name: str) -> list:
+    """site-scope 之外的一切 policy：多余的 inline + 全部 attached。
+
+    只比 site-scope 那一条是不够的（Codex 指出的 P1）：boundary 对全部
+    DynamoDB 数据动作放行整个 site-data-*，角色上任何一条残留 identity
+    policy（比如调试期的 PutItem on site-data-*）与 boundary 取交集就是
+    有效的跨租户写权限——而 site-scope 本身可以完全等于期望。
+    """
+    extra = []
+    for page in iam.get_paginator("list_role_policies").paginate(
+            RoleName=role_name):
+        extra += [p for p in page["PolicyNames"] if p != POLICY_NAME]
+    for page in iam.get_paginator("list_attached_role_policies").paginate(
+            RoleName=role_name):
+        extra += [p["PolicyArn"] for p in page["AttachedPolicies"]]
+    return extra
 
 
 def site_role_names(iam) -> list:
@@ -939,13 +1163,16 @@ def site_role_names(iam) -> list:
 
 
 def check_roles(iam) -> list:
-    """→ [(role_name, 原因)]。**S1 的硬发布闸门**：必须为空。
+    """→ [(role_name, 原因)]。**S1 的硬发布闸门**：必须为空。判据四层：
 
-    判据是**实际 policy 逐项等于「从当前 sites 行推导出的期望 policy」**，
-    而不是"没有 `*`"。只查通配是不够的（Codex 复核指出）：指向**错误账号**、
-    **错误 region**、或**漏了某张表**的 policy 都没有 `*`，却同样不可用——
-    前两者会让站点访问自己的表 AccessDenied，后者会让新加的表 AccessDenied。
-    期望值由 `common.site_policy` 现算，所以这条闸门与运行时用的是同一份定义。
+    1. **实际 site-scope 与期望 policy 完整文档等值**，不是"没有 `*`"
+       （错账号/错 region/漏表都不含通配，却同样不可用；Codex 复核指出）。
+       期望值由 `common.site_policy` 现算——与运行时同一份定义。
+    2. **角色上只许有 site-scope 这一条 policy**：多余 inline / 任何
+       attached 都不合格。site-scope 全对时残留的调试 policy 与 boundary
+       取交集仍是有效跨租户权限（Codex 指出的 P1），只比 site-scope 对它失明。
+    3. **反向存在性**：ACTIVE 非 static 站点的角色必须存在。
+    4. 功能模拟在 `simulate_active_sites`（--check 专属，全动作）。
     """
     import common
     bad = []
@@ -953,7 +1180,7 @@ def check_roles(iam) -> list:
         site_id = name[len(ROLE_PREFIX):]
         actual = _actual_policy(iam, name)
         if actual is None:
-            bad.append((name, "读不到 inline policy（fail-closed 计为不合格）"))
+            bad.append((name, "没有 site-scope inline policy（不合格）"))
             continue
         site = common.get_site_consistent(site_id) or {}
         if not site:
@@ -964,40 +1191,91 @@ def check_roles(iam) -> list:
         except NeedsManualReview as exc:
             bad.append((name, f"算不出期望 policy：{exc}"))
             continue
+        extra = _extra_policies(iam, name)
+        if extra:
+            bad.append((name, f"{EXTRA_POLICY_REASON}：{extra}"))
+            continue
         expected = json.loads(common.site_policy(site_id, engine, tables=tables))
         if _norm(actual) != _norm(expected):
             bad.append((name, f"policy 与期望不一致（engine={engine} tables={tables}）"))
+    # 反向：ACTIVE 非 static 站点的角色必须**存在**。只从现存 site-rt-* 出发
+    # 是单向的——"角色整个缺失"（误删/清理脚本写错）完全不可见，IAM 里一个
+    # 角色都没有时闸门反而全绿（Codex 指出）。缺失的角色进 targets 后由
+    # ensure_site_role 重建，正好是对的补救。
+    have = set(site_role_names(iam))
+    for site_id in active_fullstack_site_ids():
+        name = ROLE_PREFIX + site_id
+        if name not in have:
+            bad.append((name, "ACTIVE 站点的角色缺失（sites 行在、IAM 角色不在）"))
     return bad
+
+
+def active_fullstack_site_ids() -> list:
+    """ACTIVE 且需要运行时角色（engine != none）的 site_id。扫 sites 表，只读。
+
+    未知 tier 不猜、也不跳过——按"需要角色"对待：角色若在，per-role 检查会以
+    NeedsManualReview 报它；角色若缺，反向检查报缺失。两边都 fail-closed。
+    """
+    import common
+    out = []
+    for row in common._paginate(common._table("SITES_TABLE").scan):
+        if row.get("status") != "ACTIVE":
+            continue
+        try:
+            if common.tier_engine(row.get("tier", "")) == "none":
+                continue                      # static 站点没有运行时角色
+        except ValueError:
+            pass
+        out.append(row["site_id"])
+    return sorted(out)
 
 
 def verify_access(iam, site_id: str, tables: list) -> list:
     """用 IAM 策略模拟器做功能验收 → [问题…]。只读。
 
-    比"policy 文本对不对"更直接：断言该站点的角色**能**访问自己的每张表、
-    且**不能**访问一个构造出来的嵌套邻居站点的表。模拟器会算 permissions
-    boundary，所以它反映的是真实判定而不是文本比较。
+    比"policy 文本对不对"更直接：断言该站点的角色对**每个数据动作**都能
+    访问自己的每张表、且对邻居表**每个动作都被拒**。模拟器会算 permissions
+    boundary 与角色上的**全部** identity policy——所以它连 check_roles 的
+    结构检查漏掉的形态都能兜住。
+
+    **动作清单从期望 policy 现取，不手抄第二份**（Codex 指出的 P1：只模拟
+    GetItem 时，一条残留的"PutItem on site-data-*"调试 policy 在读模拟下
+    照样"拒绝"，闸门绿而跨租户**写**仍然可行——M01 的修复等于只验了读）。
     """
     import common
     problems = []
     arn = common.site_role_arn(site_id)
     region = os.environ["AWS_DEFAULT_REGION"]
     acct = os.environ["ACCOUNT_ID"]
+    expected = json.loads(common.site_policy(site_id, "dynamodb", tables=tables))
+    actions = sorted({a for stmt in expected["Statement"]
+                      for a in (stmt["Action"] if isinstance(stmt["Action"], list)
+                                else [stmt["Action"]])
+                      if a.startswith("dynamodb:")})
+    assert actions, "期望 policy 里没有任何 dynamodb 动作——动作清单推导坏了"
 
-    def _decide(table_name):
+    def _decisions(table_name):
         res = f"arn:aws:dynamodb:{region}:{acct}:table/{table_name}"
         out = iam.simulate_principal_policy(
-            PolicySourceArn=arn, ActionNames=["dynamodb:GetItem"],
-            ResourceArns=[res])
-        return out["EvaluationResults"][0]["ResourceSpecificResults"][0][
-            "EvalResourceDecision"]
+            PolicySourceArn=arn, ActionNames=actions, ResourceArns=[res])
+        return {r["EvalActionName"]:
+                r["ResourceSpecificResults"][0]["EvalResourceDecision"]
+                for r in out["EvaluationResults"]}
 
     for logical in tables:
-        if _decide(common.site_table_name(site_id, logical)) != "allowed":
-            problems.append(f"访问自己的表 {logical} 被拒——backfill 写坏了")
-    # 构造一个"以本 site_id 为前缀"的邻居，它必须被拒（这正是 M01 的形态）
+        got = _decisions(common.site_table_name(site_id, logical))
+        denied = sorted(a for a, d in got.items() if d != "allowed")
+        if denied:
+            problems.append(
+                f"访问自己的表 {logical} 被拒（{denied}）——backfill 写坏了")
+    # 构造一个"以本 site_id 为前缀"的邻居：**任何一个动作** allowed 都算
+    # 失败（这正是 M01 的形态，读写都算）
     neighbour = common.site_table_name(f"{site_id}-probe-abc123", "notes")
-    if _decide(neighbour) == "allowed":
-        problems.append(f"仍能访问嵌套邻居的表 {neighbour}——通配没收干净")
+    got = _decisions(neighbour)
+    leaked = sorted(a for a, d in got.items() if d == "allowed")
+    if leaked:
+        problems.append(
+            f"仍能访问嵌套邻居的表 {neighbour}（{leaked}）——残留权限没收干净")
     return problems
 
 
@@ -1021,49 +1299,66 @@ def plan_for(site_id: str, site: dict) -> tuple:
     return engine, tables
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--apply", action="store_true", help="真写（默认 dry-run）")
-    parser.add_argument("--check", action="store_true", help="只跑闸门，不改任何东西")
-    args = parser.parse_args()
-    _load_env()
+def _persist_backup(iam, role_names) -> None:
+    """把全部 target 的旧 policy **原子落盘**（spec §7.3 的"覆盖前留档"）。
+
+    v2 在这里犯过错（Codex 指出）：备份攒在内存字典、循环结束才写文件——
+    第 2 个角色写入抛异常（IAM 限流最常见）时，第 1 个已被改而备份文件
+    不存在，承诺的回滚材料落空。所以四条纪律：
+    - **先备份后写**：本函数必须在任何 put_role_policy 之前完成；
+    - **临时文件 + os.replace**：崩溃不会留下半个 JSON；
+    - **合并、绝不覆盖已有快照**：重跑时已收敛的角色不再是 target，
+      无条件覆盖会丢掉它们的原始通配 policy——回滚要的恰是第一份快照。
+      roles 值为 null = 备份时该角色没有 site-scope inline policy
+      （`_actual_policy` 只把 NoSuchEntity 判为不存在，其他读错误直接
+      抛出 ⇒ 此时零 IAM 写入，null 的语义才可靠）；
+    - **带账号元数据，合并前核对**：格式 {schema_version, account_id,
+      region, roles}。没有元数据时，切到另一个账号后"绝不覆盖"会把
+      A 账号同名 role 的旧快照保留成 B 账号的回滚材料（Codex 指出）——
+      不一致就拒绝执行，提示把旧文件移走，绝不静默合并。
+    """
+    meta = {"schema_version": 1,
+            "account_id": os.environ["ACCOUNT_ID"],
+            "region": os.environ["AWS_DEFAULT_REGION"]}
+    roles = {}
+    if BACKUP_PATH.exists():
+        saved = json.loads(BACKUP_PATH.read_text())
+        for key, want in meta.items():
+            if saved.get(key) != want:
+                raise SystemExit(
+                    f"已有备份 {BACKUP_PATH.name} 的 {key}={saved.get(key)!r} "
+                    f"与当前 {want!r} 不一致——拒绝合并（它可能属于另一个账号的"
+                    "同名角色）。把旧文件移走后重试。")
+        roles = saved["roles"]
+    for name in role_names:
+        if name not in roles:
+            roles[name] = _actual_policy(iam, name)
+    tmp = BACKUP_PATH.parent / (BACKUP_PATH.name + ".tmp")
+    tmp.write_text(json.dumps({**meta, "roles": roles},
+                              ensure_ascii=False, indent=2))
+    os.replace(tmp, BACKUP_PATH)
+    print(f"旧 policy 已备份到 {BACKUP_PATH.name}（回滚用；**它不进 git**）")
+
+
+def apply_plans(iam, todo) -> list:
+    """真写。→ [失败原因…]。**备份未落盘前，一笔 IAM 修改都不会发生。**"""
+    if not todo:
+        return []
     import common
-    iam = boto3.client("iam")
-
-    if args.check:
-        bad = check_roles(iam)
-        print(f"不合格的 site-rt-* 角色：{len(bad)}")
-        for name, reason in bad:
-            print(f"  !! {name}: {reason}")
-        return 1 if bad else 0
-
-    targets = check_roles(iam)
-    print(f"待收敛的角色：{len(targets)}")
-    manual, failed = [], []
-    backup = {}
-    for name, reason in targets:
-        site_id = name[len(ROLE_PREFIX):]
-        # **强一致读**：授权判定与 read-modify-write 都基于它
-        site = common.get_site_consistent(site_id) or {}
-        try:
-            engine, tables = plan_for(site_id, site)
-        except NeedsManualReview as exc:
-            manual.append(str(exc))
-            print(f"  跳过（需人工） {site_id}: {exc}")
-            continue
-        if not args.apply:
-            print(f"  计划 {site_id}: engine={engine} tables={tables}（当前：{reason}）")
-            continue
-
-        # 覆盖前留一份旧 policy，供回滚（spec §7.3）
-        backup[name] = _actual_policy(iam, name)
+    _persist_backup(iam, [name for name, _sid, _e, _t in todo])
+    failed = []
+    for name, site_id, engine, tables in todo:
         common.ensure_site_role(site_id, engine, tables=tables)
 
         # **写后复核**：backfill 与在线部署之间存在"读完→写入"的竞态
         # （用户并发部署新增了一张表，我们会把它覆盖掉）。这里重读一次 sites 行，
         # 若期间变过就按新值重算重写一次，然后逐项比对落地结果。
         fresh = common.get_site_consistent(site_id) or {}
-        engine2, tables2 = plan_for(site_id, fresh)
+        try:
+            engine2, tables2 = plan_for(site_id, fresh)
+        except NeedsManualReview as exc:
+            failed.append(f"{site_id}: 写入期间 sites 行变得判不出来：{exc}")
+            continue
         if (engine2, tables2) != (engine, tables):
             print(f"  站点 {site_id} 在写入期间被改动过，按新值重写：{tables2}")
             common.ensure_site_role(site_id, engine2, tables=tables2)
@@ -1077,11 +1372,78 @@ def main() -> int:
             failed.append(f"{site_id}: {problems}")
             continue
         print(f"  已重写并验证 {site_id}: engine={engine} tables={tables}")
+    return failed
 
-    if backup:
-        path = ROOT / "site-builder" / "scripts" / "backfill-old-policies.json"
-        path.write_text(json.dumps(backup, ensure_ascii=False, indent=2))
-        print(f"\n旧 policy 已备份到 {path.name}（回滚用；**它不进 git**）")
+
+def simulate_active_sites(iam) -> list:
+    """--check 的功能模拟段：对**全部** ACTIVE dynamodb 站点跑 verify_access。
+
+    文本等值（check_roles）之外的第二层：模拟器会算 permissions boundary，
+    反映真实判定而不是文本比较。v2 只对本次被重写的 targets 跑模拟——
+    判成"合格"的角色一次功能验证都没有（Codex 指出）。只读，站点个位数。
+    """
+    import common
+    problems = []
+    for site_id in active_fullstack_site_ids():
+        site = common.get_site_consistent(site_id) or {}
+        try:
+            engine, tables = plan_for(site_id, site)
+        except NeedsManualReview as exc:
+            problems.append((ROLE_PREFIX + site_id, f"算不出期望 policy：{exc}"))
+            continue
+        if engine != "dynamodb":
+            continue
+        found = verify_access(iam, site_id, tables)
+        if found:
+            problems.append((ROLE_PREFIX + site_id, f"功能模拟失败：{found}"))
+    return problems
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--apply", action="store_true", help="真写（默认 dry-run）")
+    parser.add_argument("--check", action="store_true", help="只跑闸门，不改任何东西")
+    args = parser.parse_args()
+    _load_env()
+    import common
+    iam = boto3.client("iam")
+
+    if args.check:
+        bad = check_roles(iam)
+        # 文本已不一致时不叠加模拟结果（那些角色本来就要重写）；
+        # 文本全绿才值得追问"真实判定也对吗"。
+        if not bad:
+            bad = simulate_active_sites(iam)
+        print(f"不合格的 site-rt-* 角色：{len(bad)}")
+        for name, reason in bad:
+            print(f"  !! {name}: {reason}")
+        return 1 if bad else 0
+
+    targets = check_roles(iam)
+    print(f"待收敛的角色：{len(targets)}")
+    todo, manual = [], []
+    for name, reason in targets:
+        if reason.startswith(EXTRA_POLICY_REASON):
+            # 重写 site-scope 修不掉多余 policy，自动删未知 policy 又违反
+            # "判不出就不猜"——只能人工移除后重跑
+            manual.append(f"{name}: {reason}")
+            print(f"  跳过（需人工） {name}: {reason}")
+            continue
+        site_id = name[len(ROLE_PREFIX):]
+        # **强一致读**：授权判定与 read-modify-write 都基于它
+        site = common.get_site_consistent(site_id) or {}
+        try:
+            engine, tables = plan_for(site_id, site)
+        except NeedsManualReview as exc:
+            manual.append(str(exc))
+            print(f"  跳过（需人工） {site_id}: {exc}")
+            continue
+        if not args.apply:
+            print(f"  计划 {site_id}: engine={engine} tables={tables}（当前：{reason}）")
+            continue
+        todo.append((name, site_id, engine, tables))
+
+    failed = apply_plans(iam, todo) if args.apply else []
 
     if manual:
         print(f"\n需人工处理 {len(manual)} 个：")
@@ -1115,7 +1477,8 @@ Expected: PASS
 
 > **一处覆盖边界说明白**：`verify_access` 没有单测——它靠 IAM 策略模拟器，
 > 用 fake 去模拟模拟器只能测出"我怎么调它"，测不出"判定对不对"。
-> 它在 Task 10 Step 3 的 `--apply` 里被真机执行，那才是它有意义的地方。
+> 它在 Task 10 Step 3 的 `--apply` 与 Step 5 的 `--check`（对**全部** dynamodb
+> 站点的功能模拟段）里被真机执行，那才是它有意义的地方。
 > 这是有意的取舍，不是遗漏。
 
 - [ ] **Step 5: dry-run 真机**
@@ -1135,8 +1498,10 @@ Expected: 先通过 STS 账号核对（账号不符会直接 `SystemExit`），�
 `site-builder/scripts/backfill-old-policies.json` 供回滚，它含账号 ARN，**不能进 git**）：
 
 ```bash
+set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
-printf 'site-builder/scripts/backfill-old-policies.json\n' >> .gitignore
+# 带 * 是为了连 os.replace 之前的 .json.tmp 一起忽略
+printf 'site-builder/scripts/backfill-old-policies.json*\n' >> .gitignore
 
 bash site-builder/scripts/scan_staged_secrets.sh \
      --files site-builder/scripts/backfill_site_role_policies.py \
@@ -1326,6 +1691,7 @@ Expected: PASS
 - [ ] **Step 5: Commit**
 
 ```bash
+set -euo pipefail
 git add site-builder/deployer/functions/permissions.py \
         site-builder/deployer/tests/test_permissions.py
 bash site-builder/scripts/scan_staged_secrets.sh || exit 1
@@ -1406,13 +1772,59 @@ def test_known_projection_writers_do_not_read_policy_fields_directly():
         f"permissions.effective_policy: {offenders}")
 
 
-def test_every_route_permission_writer_calls_effective_policy():
-    """**自动发现版**：任何往路由写 `require_auth` 的函数都必须调 effective_policy。
+def _docstring_ids(tree) -> set:
+    """module/class/function 的 docstring Constant 节点 id 集合。
 
-    判据不是函数名单，而是行为特征——函数体里出现字面量 `require_auth`
-    （无论在 UpdateExpression 字符串里还是 item dict 的键里）就说明它在投影
-    权限，那它必须走严格解析。**新增第 N 个 writer 会自动被这条抓到**，
-    这才是 v1 声称、但当时并不存在的那道守卫。
+    docstring 也是 AST 字符串常量——不排除它，"文档里提到 require_auth"与
+    "代码在投影 require_auth"就分不开。当前仓库有三处这种纯说明
+    （api_key_config:101 / deploy_lambda_site:92 / mark_job:85 的 docstring），
+    按"任意字符串常量"扫会把三个全报成 offender 且永远修不绿（Codex 指出）。
+    """
+    import ast
+    out = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef,
+                             ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = getattr(node, "body", [])
+            if (body and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                out.add(id(body[0].value))
+    return out
+
+
+def _projects_require_auth(fn_node, doc_ids) -> bool:
+    """写投影的**行为特征**，不是"出现过字面量"。
+
+    投影只有两种真实形态（三个 writer 实测）：item dict 里的键
+    `"require_auth": {...}`，或 UpdateExpression 里的赋值目标
+    `SET require_auth = :a`。只出现字面量不算——`_finish` 从
+    committed_route **读** `require_auth` 反推 effective_auth，是这两个文件里
+    第四个含字面量的函数，但它不投影；按"出现即投影"判会让守卫在三个真
+    writer 修完后**永远红**（这一处 Codex 也没抓到，与 docstring 假阳性同类：
+    把"字面量出现"当成了"写行为"）。
+    """
+    import ast
+    import re
+    for sub in ast.walk(fn_node):
+        if isinstance(sub, ast.Dict):
+            if any(isinstance(k, ast.Constant) and k.value == "require_auth"
+                   for k in sub.keys):
+                return True
+        if (isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+                and id(sub) not in doc_ids
+                and re.search(r"require_auth\s*=", sub.value)):
+            return True
+    return False
+
+
+def test_every_route_permission_writer_calls_effective_policy():
+    """**自动发现版**：任何往路由投影 `require_auth` 的函数都必须调
+    effective_policy_audited。
+
+    判据不是函数名单，而是写行为特征（见 `_projects_require_auth`）
+    ——**新增第 N 个 writer 会自动被这条抓到**，这才是 v1 声称、但当时并
+    不存在的那道守卫。
 
     只扫这两个文件：mark_job（整条恢复上一版路由）与 undeploy（删路由）
     不投影权限字段，不该被这条约束。
@@ -1423,13 +1835,11 @@ def test_every_route_permission_writer_calls_effective_policy():
     offenders = []
     for rel in ("functions/permissions.py", "functions/register_route.py"):
         tree = ast.parse((root / rel).read_text())
+        doc_ids = _docstring_ids(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.FunctionDef):
                 continue
-            projects = any(
-                isinstance(s, ast.Constant) and isinstance(s.value, str)
-                and "require_auth" in s.value for s in ast.walk(node))
-            if not projects:
+            if not _projects_require_auth(node, doc_ids):
                 continue
             # **只接受带审计的那个入口。** 接受纯 effective_policy 会让
             # "某个 writer 绕过审计包装"照样通过守卫（Codex 复核指出）。
@@ -1451,28 +1861,63 @@ def test_no_other_module_projects_require_auth():
     上一条的扫描边界是 permissions.py + register_route.py（路由权限投影的
     两个归属地）。若有人把新的投影 writer 放进第三个模块，上一条不会发现它
     （Codex 复核指出的边界问题）。所以这里断言 `functions/` 下**只有**这两个
-    文件（外加 smoke_test 的白名单例外）出现 `require_auth` 字面量：
-    谁在别处引入它，这条就红，逼他要么挪位置、要么把上一条的边界一起扩。
+    文件（外加 smoke_test 的白名单例外）出现**非 docstring** 的 `require_auth`
+    字面量：谁在别处引入它，这条就红，逼他要么挪位置、要么把上一条的边界
+    一起扩。
+
+    **docstring 不算，但也不给那三个文件开整文件白名单**——整文件豁免会让
+    第三模块的新 writer 藏进被豁免的文件里（Codex 明确反对那种修法）。
+    这条故意比上一条**宽**（读取也报），错在"多咬"而不是"漏咬"：
+    第三模块合法读取该字段的场景要显式进白名单并说明理由。
 
     smoke_test.py 是显式例外：它那里的 `require_auth` 是个**局部变量名**，
     用来决定冒烟该断言 302 还是 200，不是往路由写投影。
     """
-    import ast
     import pathlib
     allowed = {"permissions.py", "register_route.py", "smoke_test.py"}
     root = pathlib.Path(__file__).parents[1] / "functions"
+    offenders = _require_auth_offenders(root, allowed)
+    assert not offenders, (
+        f"这些模块出现了 require_auth 字面量（docstring 除外）：{offenders}。"
+        "若它们在投影路由权限，必须走 effective_policy_audited 并把上一条守卫的"
+        "扫描边界一起扩；若只是读取，请加进本用例的白名单并说明理由")
+
+
+def _require_auth_offenders(root, allowed=frozenset()) -> list:
+    """root 下所有 .py 里非 docstring 的 `require_auth` 字面量 → [file:line…]。
+
+    提成 helper 是为了让"守卫会咬"能用 tmp 目录里的探针文件**常驻**验证
+    （下一条 meta-test）——不是往真实 tracked 文件注入再 `git checkout --`
+    还原：那会把文件上未提交的修改一并丢掉，执行中断时探针还会残留在
+    仓库里（Codex 指出）。
+    """
+    import ast
     offenders = []
     for path in sorted(root.glob("*.py")):
         if path.name in allowed:
             continue
-        for node in ast.walk(ast.parse(path.read_text())):
+        tree = ast.parse(path.read_text())
+        doc_ids = _docstring_ids(tree)
+        for node in ast.walk(tree):
             if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                    and id(node) not in doc_ids
                     and "require_auth" in node.value):
                 offenders.append(f"{path.name}:{node.lineno}")
-    assert not offenders, (
-        f"这些模块出现了 require_auth 字面量：{offenders}。"
-        "若它们在投影路由权限，必须走 effective_policy_audited 并把上一条守卫的"
-        "扫描边界一起扩；若只是读取，请加进本用例的白名单并说明理由")
+    return offenders
+
+
+def test_sentinel_scan_bites_a_probe_file(tmp_path):
+    """哨兵的反向验证，**常驻**：守卫在当前代码上是绿的，而绿的守卫必须
+    持续证明它能红——否则"加了守卫"与"守卫不生效"在 CI 上长得一模一样
+    （Global Constraints 第 1 条对 pass-now 守卫的形态）。
+
+    探针写进 tmp_path，同一份扫描逻辑（`_require_auth_offenders`），
+    一条用例同时验两个方向：第 1 行 docstring 不误伤、第 2 行字面量必须咬住。
+    """
+    (tmp_path / "probe.py").write_text(
+        '"""docstring 里提到 require_auth 不算数。"""\n'
+        '_PROBE = {"require_auth": True}\n')
+    assert _require_auth_offenders(tmp_path) == ["probe.py:2"]
 ```
 
 加到 `site-builder/deployer/tests/test_permissions.py`（**spec §6.1 第 1 条**，
@@ -1510,12 +1955,25 @@ def test_an_unrelated_permission_change_does_not_flip_a_wrong_typed_row_public(a
 - [ ] **Step 2: 运行确认它们红**
 
 Run: `(cd site-builder/deployer && .venv/bin/pytest tests/test_seed_permissions.py tests/test_permissions.py -k "refuses_to_launder or do_not_read_policy_fields_directly or calls_effective_policy or unrelated_permission_change or no_other_module_projects" -q)`
-Expected: 前四条 FAIL——两条行为用例因为当前不抛错而是洗成 False；两条 AST 用例因为三个 writer 都还在直接取值/都没调 `effective_policy_audited`。
-**第五条（第三模块边界哨兵）现在就应该 PASS**——它防的是将来，不是本次要修的缺陷
+Expected: 前四条 FAIL——两条行为用例因为当前不抛错而是洗成 False；两条 AST 用例因为三个 writer 都还在直接取值/都没调 `effective_policy_audited`（自动发现版的 offender 应恰好是 `write_permissions` / `resync_route` / `_route_item` 三个——`_finish` 不该在册，它是读取；已在当前代码上实测过这个判据）。
+**第五条（第三模块边界哨兵）现在就应该 PASS**——它防的是将来，不是本次要修的缺陷。
+v2 的哨兵在这里就红（三个既有 docstring 被当成 offender），且三个 writer 修完后**仍然红**——若见到这种形态，说明用的还是"任意字符串常量"旧判据。
 
 > **每次改了测试名就回来核一遍 `-k`。** v1 在这里、Task 8 与 Task 9 都留下了
 > 选不中新测试的过滤器（Task 9 那个还是改了测试名忘了改过滤器的陈旧串），
 > 于是"确认会红"这一步实际上一条都没跑到——违反本 plan 自己的 Global Constraint。
+
+- [ ] **Step 2b: 反向验证哨兵真的会咬（常驻 meta-test，不碰仓库文件）**
+
+哨兵在当前代码上是绿的——绿的守卫必须证明它**能**红。验证方式是
+`test_sentinel_scan_bites_a_probe_file`：往 **tmp_path** 写探针文件、调用
+同一个扫描 helper。**v3 的做法（往 mark_job.py 追加再 `git checkout --`
+还原）是错的**：该文件如有未提交修改会被一并丢弃，执行中断时探针还会
+永久残留（Codex 指出）。meta-test 常驻后，"守卫会咬"每次全量回归都在验，
+而不是一次性人工动作。
+
+Run: `(cd site-builder/deployer && .venv/bin/pytest tests/test_permissions.py -k sentinel_scan_bites -q)`
+Expected: PASS（探针第 2 行被咬住、第 1 行 docstring 不误伤——两个方向一条用例全验）
 
 - [ ] **Step 3: 改 `write_permissions`**
 
@@ -1613,6 +2071,7 @@ Expected: PASS
 - [ ] **Step 9: Commit**
 
 ```bash
+set -euo pipefail
 git add site-builder/deployer/functions/permissions.py \
         site-builder/deployer/functions/register_route.py \
         site-builder/scripts/migrate_permissions.py \
@@ -1765,6 +2224,7 @@ Expected: 三个都 PASS
 - [ ] **Step 7: Commit**
 
 ```bash
+set -euo pipefail
 git add site-builder/panel/handler.py site-builder/mcp/server.py \
         site-builder/deployer/functions/permissions.py \
         site-builder/deployer/tests/test_permissions.py \
@@ -1972,6 +2432,7 @@ def test_upgrade_code_is_not_accepted_as_a_console_session():
 
 Run:
 ```bash
+set -euo pipefail
 (cd site-builder/auth  && ../contract/.venv/bin/pytest tests -q)
 (cd site-builder/panel && ../deployer/.venv/bin/pytest tests -q)
 ```
@@ -1981,6 +2442,7 @@ Expected: 两个都 PASS。**若 panel 侧还冒出 `TypeError`，说明那里�
 - [ ] **Step 7: 扫描 + Commit**
 
 ```bash
+set -euo pipefail
 git add site-builder/auth/session.py site-builder/auth/login_handler.py \
         site-builder/panel/console_session.py \
         site-builder/auth/tests/test_session.py \
@@ -2154,6 +2616,7 @@ Expected: PASS
 - [ ] **Step 6: Commit**
 
 ```bash
+set -euo pipefail
 git add router/infrastructure/lambda/origin_request.py \
         router/infrastructure/lambda/test_edge_auth.py
 bash site-builder/scripts/scan_staged_secrets.sh || exit 1
@@ -2285,6 +2748,7 @@ Expected: PASS
 - [ ] **Step 6: Commit**
 
 ```bash
+set -euo pipefail
 git add router/infrastructure/lambda/origin_request.py \
         router/infrastructure/lambda/test_edge_auth.py
 bash site-builder/scripts/scan_staged_secrets.sh || exit 1
@@ -2307,6 +2771,7 @@ git commit -m "fix(s1/m06): Edge 取全部同名 sb_session 逐个验签 + 候�
 每条各自套子 shell，否则第二条起工作目录已经不在仓库根：
 
 ```bash
+set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 (cd site-builder/contract  && .venv/bin/pytest tests -q)
 (cd site-builder/auth      && ../contract/.venv/bin/pytest tests -q)
@@ -2321,6 +2786,7 @@ Expected: 全部 PASS，0 failed。基线是 1881 passed / 54 skipped / 1935 col
 - [ ] **Step 2: 部署前重跑行形态体检**
 
 ```bash
+set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 python3 site-builder/scripts/audit_policy_rows.py
 ```
@@ -2329,6 +2795,7 @@ Expected: 退出码 0。**若非 0 就停下**——先修那些行，否则 S1 
 - [ ] **Step 3: 按序部署（顺序不可变）**
 
 ```bash
+set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 # ① deployer 栈（M01 + M02）
@@ -2353,6 +2820,7 @@ python3 site-builder/scripts/backfill_site_role_policies.py --apply    # 真写 
 - [ ] **Step 4: 等 CloudFront 传播完成（在 ⑤ 之后，不是之前）**
 
 ```bash
+set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 python3 - <<'PY'
 """等分发状态回到 Deployed。第二波重登在这期间发生。
@@ -2390,8 +2858,11 @@ Expected: 最终打印 `status=Deployed`
 - [ ] **Step 5: 硬闸门 + 真机验收**
 
 ```bash
+set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
-# 硬闸门：不合格角色数 == 0（实际 policy 必须逐项等于期望）。非 0 就不算 S1 交付完成
+# 硬闸门：不合格角色数 == 0（site-scope 完整等值 + 角色上唯一 policy +
+# 反向存在 + 全动作功能模拟）。非 0 就不算 S1 交付完成。
+# set -e 保证它失败时后面的验收一条都不会跑。
 python3 site-builder/scripts/backfill_site_role_policies.py --check
 
 python3 site-builder/scripts/verify_deployed_components.py   # ② 之后必跑：唯一能发现产物陈旧的闸门
@@ -2399,7 +2870,7 @@ python3 site-builder/scripts/verify_permission_matrix.py     # M02 之后唯一�
 python3 site-builder/scripts/verify_console_e2e.py           # 跑之前先在浏览器登录一次（两波重登让 token 失效）
 bash    site-builder/scripts/smoke_router.sh                 # 路由层冒烟（含 65s 等 Edge 缓存）
 ```
-Expected: 闸门打印 `带通配的 site-rt-* 角色：0` 且退出码 0；其余全部通过。
+Expected: 闸门打印 `不合格的 site-rt-* 角色：0` 且退出码 0；其余全部通过。
 `verify_console_e2e.py` 若报 token 过期，先 `node site-builder/clients/quick-desktop-proxy/auth.js` 重新登录
 
 - [ ] **Step 6: 补 DEPLOY.md**
@@ -2435,13 +2906,22 @@ Expected: 闸门打印 `带通配的 site-rt-* 角色：0` 且退出码 0；其�
 - 部署前 `python3 site-builder/scripts/audit_policy_rows.py` —— sites 表里有没有会被
   严格解析拒绝的行。非 0 就先修那些行，否则上线后对应站点既不能改权限也不能部署。
 - 部署后 `python3 site-builder/scripts/backfill_site_role_policies.py --check` ——
-  **带通配的 per-site 角色数必须为 0**。非 0 意味着 M01 对那些站点等于没生效，
-  而它们仍是对未来嵌套 site_id 生效的陷阱（通配是向前看的）。
+  **不合格的 per-site 角色数必须为 0**（判据四层：site-scope 与期望**完整
+  等值**、角色上**只许有 site-scope 一条 policy**（多余 inline / attached
+  都不合格，需人工移除）、ACTIVE 站点的角色反向存在、且全部 dynamodb 站点
+  通过 IAM 模拟器**全动作**功能验证——只测 GetItem 验不出"邻居表可写"）。
+  非 0 意味着 M01 对那些站点等于没生效，而带通配的仍是对未来嵌套 site_id
+  生效的陷阱（通配是向前看的）。
+  `--apply` 会先把全部旧 policy 备份到
+  `site-builder/scripts/backfill-old-policies.json`（**第一笔 IAM 写入之前**
+  原子落盘；带 account_id/region 元数据，不一致拒绝合并；重跑合并、不覆盖
+  已有快照），回滚方式见 spec §7.3。
 ```
 
 - [ ] **Step 7: 扫描 + Commit**
 
 ```bash
+set -euo pipefail
 git add site-builder/DEPLOY.md
 bash site-builder/scripts/scan_staged_secrets.sh || exit 1
 git commit -m "docs(s1): 部署顺序、两波重登、回滚逆序、两个硬闸门"

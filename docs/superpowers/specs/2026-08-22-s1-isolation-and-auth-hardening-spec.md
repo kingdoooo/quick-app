@@ -217,8 +217,30 @@ engine 与 tables 的来源：
 配一条守卫断言它与 `contract.schema.TIER_ENGINE` 逐项一致。
 （这是本轮发现的第 6 个"手抄多份"，与 §3 那五个同类。）
 
-**硬闸门**：脚本跑完后断言 不合格角色数 == 0——判据是**实际 policy 逐项等于「从当前 sites 行推导的期望 policy」**，而不是「没有通配」：指向错误账号、错误 region、或漏了某张表的 policy 都不含通配，却同样不可用。这条同时进 §7.2 的真机验收
-——通配角色数非 0 就不算 S1 交付完成。
+**硬闸门**：脚本跑完后断言 不合格角色数 == 0。判据四层，缺一不可：
+
+1. **实际 site-scope 与「从当前 sites 行推导的期望 policy」完整文档等值**，
+   而不是「没有通配」：指向错误账号、错误 region、或漏了某张表的 policy 都
+   不含通配，却同样不可用。**等值必须是递归规范化后的整文档比较**（只对
+   无序列表排序，不丢字段）——只比 (Effect, Action, Resource) 会把「精确
+   ARN + 额外限区 Condition」判成合格，--check 绿而站点不可用（Codex 指出）。
+2. **角色上只许有 site-scope 这一条 policy**：inline 除 site-scope 外必须
+   为空、attached 必须为空。只比 site-scope 会对"多出来的调试 policy"失明
+   ——boundary 对全部 DynamoDB 数据动作放行整个 `site-data-*`，残留的
+   identity policy 与它取交集仍是有效跨租户权限（Codex 指出：IAM 的评估
+   规则是 identity policies 的并集与 boundary 取交集）。多余 policy 计
+   "需人工移除"，**不自动删**——自动删未知 policy 违反"判不出就不猜"。
+3. **反向存在性**：从 ACTIVE 非 static 的 sites 行反推，期望角色必须全部
+   存在。只从现存 site-rt-* 角色出发是单向的——"角色整个缺失"不可见，
+   IAM 里一个角色都没有时闸门反而全绿。
+4. **功能模拟**：`--check` 在前三层全绿后，对**全部** dynamodb 站点跑
+   IAM 策略模拟器验收，动作为期望 policy 里的**全部** DynamoDB 数据动作
+   （从期望现取，不手抄第二份）：自己的表每个动作都 allowed、嵌套邻居的表
+   **任何一个动作** allowed 都算失败——只模拟 GetItem 验不出"邻居表可写"，
+   M01 的读写修复就只验了读（Codex 指出）。模拟器会算 permissions
+   boundary 与角色全部 identity policy，反映真实判定。
+
+这条同时进 §7.2 的真机验收——非 0 就不算 S1 交付完成。
 
 ### 4.3 M05 · 必填 `expected_typ`
 
@@ -307,11 +329,19 @@ M01 / M05 / M06 只改步骤内部的取值与判定，不改流形状。
    `site.get("allowed_users"` 这类直接取值。仓库已有此手法
    （`test_keys_api.py` 用 ast 锁定返回路径都经过 `_shape_key`）。
    **它是硬编码名单，不会自动发现新 writer**；
-   ② **自动发现版**：函数体出现字面量 `require_auth` 的函数必须调
-   `effective_policy_audited`（**只接受带审计的那个**——接受纯函数会让
-   "绕过审计包装"照样通过）；③ **边界哨兵**：`functions/` 下除
-   permissions / register_route / smoke_test 之外的模块不得出现该字面量，
-   否则第三个模块里的新 writer 仍会逃过 ②。
+   ② **自动发现版**：按**写投影的行为特征**（item dict 里的
+   `"require_auth"` 键，或 UpdateExpression 里的 `require_auth =` 赋值）
+   识别 writer，命中者必须调 `effective_policy_audited`（**只接受带审计的
+   那个**——接受纯函数会让"绕过审计包装"照样通过）。**判据不能是"出现过
+   字面量"**：docstring 与只读取的函数（`_finish` 从 committed_route 反推
+   effective_auth）都会被误伤，且误伤在三个真 writer 修完后**永远红**；
+   ③ **边界哨兵**：`functions/` 下除 permissions / register_route /
+   smoke_test 之外的模块不得出现**非 docstring** 的该字面量，否则第三个
+   模块里的新 writer 仍会逃过 ②。docstring 排除（当前有三处纯说明），但
+   不给文件开整文件白名单——那会让新 writer 藏进被豁免的文件；哨兵故意比
+   ② 宽（读取也报，白名单需说明理由）。"守卫会咬"由**常驻 meta-test**
+   验证：tmp 目录写探针文件、调用同一个扫描 helper——不往真实 tracked
+   文件注入（`git checkout --` 还原会丢掉未提交修改，中断时探针残留）。
 4. `collaborators` 缺失 → `[]`；其余三字段缺失 → 抛错。
 
 ### 6.2 M01（deployer 包）
@@ -371,8 +401,9 @@ M01 / M05 / M06 只改步骤内部的取值与判定，不改流形状。
 
 ### 7.2 真机验收
 
-- **不合格角色数 == 0** —— **硬闸门**（v2，判据见 §4.2.1）。非 0 就不算 S1 交付完成：M01 的修复
-  对那些站点等于没生效，而它们仍是对未来嵌套站点生效的陷阱
+- **不合格角色数 == 0** —— **硬闸门**（判据见 §4.2.1 的四层：完整文档等值 +
+  角色上唯一 policy + 反向存在性 + 全站点全动作功能模拟）。非 0 就不算 S1
+  交付完成：M01 的修复对那些站点等于没生效，而它们仍是对未来嵌套站点生效的陷阱
 - `verify_deployed_components.py` —— 唯一能发现"产物陈旧"的闸门（第 2 步之后必跑）
 - `verify_permission_matrix.py` —— M02 改完后唯一覆盖权限矩阵端到端的闸门
 - `verify_console_e2e.py` —— 跑之前要**重新登录一次**（两波重登会让 token 失效）
@@ -388,8 +419,23 @@ M01 / M05 / M06 只改步骤内部的取值与判定，不改流形状。
 v1 的本节只写了"前面几步是代码回滚、无数据迁移"，那在 backfill 纳入之后不成立
 了（Codex 指出）——第 3 步会**批量重写 7 个角色的 IAM inline policy**。
 
-- **覆盖前留档**：`--apply` 把每个角色的旧 policy 写到
-  `site-builder/scripts/backfill-old-policies.json`（**gitignored**，含账号 ARN）。
+- **覆盖前留档，且留档先于第一笔写入**：`--apply` 把**全部** target 的旧
+  policy 写到 `site-builder/scripts/backfill-old-policies.json`
+  （**gitignored**，含账号 ARN），**必须在任何 put_role_policy 之前原子落盘**
+  （临时文件 + `os.replace`）。攒在内存、循环结束才写文件的实现是错的：
+  第 2 个角色写入抛异常（IAM 限流最常见）时第 1 个已被改而备份不存在，
+  本节承诺的回滚材料落空（Codex 复现过）。重跑时**合并、绝不覆盖已有
+  快照**——已收敛的角色不再是 target，无条件覆盖会丢掉它们的原始通配
+  policy，而回滚要的恰是第一份。配调用顺序守卫用例：备份写失败 ⇒
+  `ensure_site_role` 零调用。
+- **备份格式带账号元数据**：`{schema_version, account_id, region, roles}`，
+  合并前逐项核对、不一致就拒绝执行并提示把旧文件移走——没有元数据时，
+  切到另一个账号后"绝不覆盖"会把 A 账号同名 role 的旧快照保留成 B 账号的
+  回滚材料，回滚时把 A 的资源 ARN 写进 B（Codex 指出）。
+- **读快照只认 NoSuchEntity 为"不存在"**：其他读错误（限流/断网/
+  AccessDenied）必须原样抛出且零 IAM 写入。裸吞异常返回 None 会把一次
+  限流**永久**落盘成"原本没有 policy"（合并策略不覆盖已有条目），
+  真要回滚时原 policy 已不可恢复（Codex 复现过）。
 - **回滚方式**：拿那份备份逐个 `put_role_policy` 还原。因为 backfill 排在
   auth/router **之前**，回滚它不受 CloudFront 传播窗口影响，是即时的。
 - **但回滚 backfill 会重新引入 M01**。所以只在"backfill 本身写坏了"时才回滚
