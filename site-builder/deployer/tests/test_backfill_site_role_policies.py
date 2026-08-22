@@ -685,6 +685,33 @@ def test_dry_run_still_exits_zero_with_targets_so_apply_can_be_chained(env, caps
     assert "待收敛的角色：1" in out and bf.DRY_RUN_NOT_A_GATE in out
 
 
+def test_check_exits_nonzero_on_a_non_conforming_role_and_bare_run_does_not(
+        env, capsys):
+    """`--check` 的**退出码**是发布闸门的契约——它此前只有真机 dry-run 见证过。
+
+    Task 10 Step 5 现在把整块的退出码绑在它身上（`m01_rc=$?` … `exit "$m01_rc"`），
+    而运维口径又写着"automation 只看退出码与计数、绝不 grep 输出文本"
+    （文案来自运行时 `permissions.py`，本轮又改过一次）。那条口径依赖的东西
+    不能只有真机见证过：`--check` 全绿退 0 由
+    `test_only_the_dry_run_warns_that_it_is_not_the_gate` 覆盖，退 1 这一半在这里。
+
+    第二个断言是**对比**，不是重复：同一份不合格数据裸跑仍然退 0。那正是
+    "裸跑不是闸门、别接进发布检查"这条口径的技术根据——两条命令的差别只在
+    退出码上，读输出是读不出来的。
+    """
+    import common
+    env.setattr(common, "get_site_consistent",
+                lambda sid: _nosql_site("notes", "tags"))
+    stale = json.loads(common.site_policy("a-abc123", "dynamodb", tables=["notes"]))
+    iam = _FakeIam({"site-rt-a-abc123": stale})
+
+    assert _run_main(env, ["--check"], iam) == 1
+    assert "不合格的 site-rt-* 角色：1" in capsys.readouterr().out
+
+    assert _run_main(env, [], iam) == 0, \
+        "裸跑对同一份不合格数据退了非 0——那会让 Step 3 的部署序列在 --apply 之前中止"
+
+
 class _LaggyIam(_FakeIam):
     """读回时先给 `stale_reads` 次旧文档，之后给正确的——模拟 IAM 传播滞后。
 

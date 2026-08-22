@@ -316,6 +316,50 @@ def test_claude_md_test_commands_carry_the_two_measured_traps():
         "没写明「只设 SSL_CERT_FILE 不够」——这条不写就会有人按环境变量绕"
 
 
+S1_SECTION = "## S1 加固（M01/M02/M05/M06）：存量环境的升级、闸门与回滚"
+
+
+def test_deploy_md_s1_section_carries_the_facts_that_cost_most_to_lose():
+    """S1 升级那一节里，这几条**丢了就会造成真实损失**，逐条钉住。
+
+    这一节是给"没读过 spec、正在压力下照做"的人写的，所以判据只挑那些
+    "写漏了会让操作者做错事"的事实，不管措辞：
+
+    · 闸门命令是 `--check`，裸跑不是闸门（裸跑对"policy 与期望不一致"退 0
+      ——把它接进发布检查就得到一条恒绿的假闸门）；
+    · automation 只看退出码与计数、不 grep 输出文本（那段文案来自运行时
+      `permissions.py`，本轮又改过一次，两次真机跑就因此输出不同）；
+    · panel **不带** `--skip-frontend`（S1 改了 panel 前端，带上就是"代码对、
+      线上没换"）；
+    · 三个产物都要重部 + `verify_deployed_components.py`（漏一个的症状是
+      产物陈旧而部署脚本全程正常，那个脚本是唯一能发现它的闸门）；
+    · "0 个不合格角色"**不是**完整证明（不看信任策略、不看 boundary 还挂着没有）；
+    · 回滚时 `null` 条目要 `delete_role_policy` 而不是 `put_role_policy`
+      ——这一条写错，回滚会在 IAM 上抛错并停在半途；
+    · 三波重登（spec 只写了两波）。
+
+    **这一节内的代码块里有第 0 列的 `#` 注释**，所以本条同时是 `_section`
+    围栏跟踪的真文档回归：解析器一退化，这里立刻红。
+    """
+    sec = _section(_read(DEPLOY), S1_SECTION)
+    assert "--check" in sec and "裸跑不是闸门" in sec, \
+        "没写清闸门命令是 --check、裸跑不是闸门"
+    assert "退出码" in sec and ("grep" in sec or "计数" in sec), \
+        "没写「automation 只看退出码与计数，别 grep 输出文本」"
+    assert re.search(r"不许加\s*--skip-frontend|不[许准要]?加?\s*--skip-frontend", sec), \
+        "没写明 panel 不能带 --skip-frontend"
+    for needed in ("deploy_panel.py", "deploy_key_proxy.py", "deploy_agentcore.py",
+                   "verify_deployed_components.py"):
+        assert needed in sec, f"重部/验证清单里少了 {needed}"
+    assert "不看信任策略" in sec and "boundary" in sec, \
+        "没写明闸门不覆盖信任策略与 boundary 是否还挂着"
+    assert "delete_role_policy" in sec and "put_role_policy" in sec, \
+        "回滚段没写清两种条目对应两种动作（null ⇒ delete_role_policy）"
+    assert sec.count("重新登录") or "重登" in sec, "没写强制重登"
+    for wave in ("panel 部署完成", "auth 部署完成", "CloudFront 传播完成"):
+        assert wave in sec, f"三波重登里少了「{wave}」那一波"
+
+
 def test_deploy_md_calls_the_scp_template_unverified():
     """SCP 那份制品**未经真机验证**（`aws:PrincipalArn` 对 assumed-role 会话的取值
     没实测过），文档不许把它描述成"已验证的配置"。

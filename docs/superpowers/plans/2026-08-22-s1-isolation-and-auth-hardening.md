@@ -2984,9 +2984,18 @@ Expected: 闸门打印 `不合格的 site-rt-* 角色：0`、`M01 闸门退出�
 ——照 runbook 4 人工修好那一行再重跑整块）。
 `verify_console_e2e.py` 若报 token 过期，先 `node site-builder/clients/quick-desktop-proxy/auth.js` 重新登录
 
-- [ ] **Step 6: 补 DEPLOY.md**
+- [x] **Step 6: 补 DEPLOY.md** —— **已交付，不必再写**。
 
-在 `site-builder/DEPLOY.md` 里加一节：
+落在 `site-builder/DEPLOY.md` 的
+`## S1 加固（M01/M02/M05/M06）：存量环境的升级、闸门与回滚` 一节（紧接
+「存量站点迁移到 blue/green」之后）。它**超出**下面这份骨架：另外带了
+三个硬闸门"证明什么 / 不证明什么"的对照表、失败处置速查、**三**波重登
+（骨架只写了两波）、以及 spec §7.3 那个回滚循环的**可运行**版本
+（`null` 条目走 `delete_role_policy`，逐条元数据核对，幂等，从不删角色）。
+`test_delivery_docs_current.py::test_deploy_md_s1_section_carries_the_facts_that_cost_most_to_lose`
+按最贵的那几条事实钉住它，所以骨架里的措辞不再是唯一真源——改文档时看那条用例。
+
+骨架（保留作对照，**不要照它重写已交付的那一节**）：
 
 ```markdown
 ### S1 加固（M01/M02/M05/M06）的部署顺序
@@ -3032,13 +3041,14 @@ Expected: 闸门打印 `不合格的 site-rt-* 角色：0`、`M01 闸门退出�
   兜底），但别去踩这个窗口。
 ```
 
-- [ ] **Step 7: 扫描 + Commit**
+- [x] **Step 7: 扫描 + Commit** —— **已随 Step 6 一起提交**（连同守卫用例与
+      `--check` 退出码那条单测）。
 
 ```bash
 set -euo pipefail
 git add site-builder/DEPLOY.md
 bash site-builder/scripts/scan_staged_secrets.sh || exit 1
-git commit -m "docs(s1): 部署顺序、两波重登、回滚逆序、两个硬闸门"
+git commit -m "docs(s1): 部署顺序、三波重登、回滚逆序与可运行回滚循环、三个硬闸门"
 ```
 
 ---

@@ -365,6 +365,235 @@ python3 site-builder/scripts/migrate_sites_to_blue_green.py --apply --site-id <s
 
 ---
 
+## S1 加固（M01/M02/M05/M06）：存量环境的升级、闸门与回滚
+
+**全新账号不需要这一节**：照 ①→⑦ 走一遍装出来的就已经是 S1 之后的版本。
+这一节是给**已经在跑的环境**升级用的，写成可以在压力下从上往下照做，
+不需要先读 spec（四条加固各自的道理在 `docs/superpowers/specs/`，这里只讲
+怎么部、每个闸门证明了什么、失败怎么办）。
+
+### 顺序不可变，且每一步停下都是安全的
+
+| # | 动作 | 为什么必须在这个位置 |
+|---|---|---|
+| 0 | 部署前体检 `audit_policy_rows.py` | 非 0 就**先停**：那些 ACTIVE 行上线后既不能改权限也不能部署 |
+| 1 | deployer 栈 | 提供新版 `ensure_site_role` / `site_policy`，第 3 步要调它 |
+| 2 | panel + key-proxy + MCP **三个都重部** | `permissions.py` 被复制进这三个产物，漏一个就是产物陈旧而部署脚本一切正常。**第一波**强制重登从这一刻开始（见下面「三波重登」） |
+| 3 | `backfill_site_role_policies.py --apply` | **必须在 1 之后**（它调新版 `ensure_site_role`）。全流程唯一不可逆的一步 |
+| 4 | auth | **第二波**重登从这一刻开始 |
+| 5 | router（Edge） | 必须在 auth 之后：反过来会让新签发的会话被 Edge 拒（登录循环） |
+| 6 | 等 CloudFront `Status == Deployed` | **放在 5 之后而不是之前**：触发 Lambda@Edge 全球传播的是 router 部署本身，在它之前等待不会等到任何新版本。判据用 `Status`，不要盲等固定分钟数。**第三波**重登在这期间发生 |
+| 7 | 真机验收（4 条 + 硬闸门） | 见下面「三个硬闸门」 |
+
+**中途停下是安全且可重跑的**：若在第 3 步失败中止，此时是"deployer + 三个产物
+已更新、auth/router 还是旧版"。这个中间态自洽——旧 auth 签发不带 `typ` 的会话，
+旧 Edge 也不检查 `typ`，M05/M06 只是**还没生效**，不会互相打架。修掉原因后从
+第 3 步继续即可。
+
+```bash
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+# 0 部署前体检（非 0 就停下先修行，别继续）
+python3 site-builder/scripts/audit_policy_rows.py
+
+# 1 deployer 栈（M01 + M02）
+(cd site-builder/deployer/infra && rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never)
+
+# 2 三个产物都带 permissions.py 的副本 —— 三个都要重部
+#   **panel 不许加 --skip-frontend**：S1 改了 panel 前端（错误提示的渲染），
+#   带上这个开关等于代码改对了而线上没换，界面与后端互相矛盾。
+(cd site-builder/panel     && python3 deploy_panel.py)
+(cd site-builder/key-proxy && python3 deploy_key_proxy.py)
+(cd site-builder/mcp       && python3 deploy_agentcore.py)
+
+# 3 存量角色 backfill（唯一不可逆的一步）
+#   期间不要人工改/删 site-rt-* 角色。
+python3 site-builder/scripts/backfill_site_role_policies.py            # 先看计划（不写任何东西）
+python3 site-builder/scripts/backfill_site_role_policies.py --apply    # 真写 + 自带闸门
+
+# 4 auth（第二波重登从这里开始）
+(cd site-builder/auth && python3 deploy_auth.py)
+
+# 5 router / Edge
+(cd router/infrastructure && rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never)
+```
+
+**第 6 步**（等 CloudFront 分发 `Status` 回到 `Deployed`，第三波重登在这期间发生）
+用计划 Task 10 Step 4 里那段 python：
+`docs/superpowers/plans/2026-08-22-s1-isolation-and-auth-hardening.md`。
+判据是分发的 `Status`（传播中 `InProgress`），不要盲等固定分钟数，也不要用 aws CLI
+的退出码判断（它不可靠）。
+
+**第 7 步**验收：
+
+```bash
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+# **M01 闸门的退出码先存起来、在块末才生效——这个写法不要"整理"成直接中止。**
+# 直接中止的话，一个与 M02/M05/M06 完全无关的数据条件（下面那条没有 tier 的
+# ACTIVE 行，必须人工修）会把另外四条验收全部吃掉，那次部署就在**没有任何
+# M02/M05/M06 证据**的情况下收尾。反过来把闸门挪到最后也不行：`--check` 是唯一
+# 对全部 ACTIVE dynamodb 站点跑功能模拟的地方（`--apply` 结尾只做结构检查），
+# 它必须留在执行记录最前面。
+set +e
+python3 site-builder/scripts/backfill_site_role_policies.py --check
+m01_rc=$?
+set -e
+echo "M01 闸门退出码：$m01_rc（非 0 会在本块末尾让这一步失败）"
+
+python3 site-builder/scripts/verify_deployed_components.py   # 第 2 步之后必跑：唯一能发现产物陈旧的闸门
+python3 site-builder/scripts/verify_permission_matrix.py     # M02 之后唯一覆盖权限矩阵端到端的闸门
+python3 site-builder/scripts/verify_console_e2e.py           # 跑之前先在浏览器登录一次（重登让 token 失效了）
+bash    site-builder/scripts/smoke_router.sh                 # 路由层冒烟（含 65s 等 Edge 缓存）
+
+exit "$m01_rc"
+```
+
+期望：`不合格的 site-rt-* 角色：0`、`M01 闸门退出码：0`，四条验收全部通过，整块退 0。
+`verify_console_e2e.py` 报 token 过期时先 `node site-builder/clients/quick-desktop-proxy/auth.js`
+重新登录一次。
+
+### 三个硬闸门：各自证明什么，以及**不**证明什么
+
+| 闸门 | 什么时候跑 | 它证明 | 它**不**证明 |
+|---|---|---|---|
+| `audit_policy_rows.py` | 第 0 步（部署前） | 没有 ACTIVE 行会被新的严格解析拒绝。退出码**只由 ACTIVE 行驱动** | 非 ACTIVE 行的问题只报成警告、不进退出码；畸形 `status`（`N`/`NULL`/`L`/缺失）四种形态只有夹具覆盖过，真表里从未出现过这种行 |
+| `backfill_site_role_policies.py --check` | 第 7 步 | 四层：site-scope 与期望**完整等值**、角色上只有 site-scope 一条 policy、ACTIVE 站点的角色反向存在、全部 dynamodb 站点过 IAM 模拟器**全部六个数据动作** | **不看信任策略**（`AssumeRolePolicyDocument` 被放宽的角色四层全过）、**不看 `site-runtime-boundary` 还挂着没有**——而 `ensure_site_role` 只在**新建**角色时挂 boundary，所以 `--apply` 不会把被摘掉的 boundary 挂回去。DSQL 站点只有文本等值，没有功能模拟 |
+| `verify_deployed_components.py` | 第 7 步，且**必须在第 2 步之后** | 线上产物里的 `permissions.py` / `common.py` / `session.py` 与仓库逐字节一致 | 这是**唯一**能发现"某个产物漏部了"的闸门。三个组件里漏一个的症状是产物陈旧而部署脚本全程正常 |
+
+另两条：`verify_permission_matrix.py`（权限矩阵端到端，M02 之后唯一覆盖它的）、
+`verify_console_e2e.py` + `smoke_router.sh`（控制台与路由层）。
+
+**闸门命令是 `--check`。裸跑不是闸门，绝不要接进任何发布检查**：裸跑打印计划，
+"policy 与期望不一致"这类**不计入退出码**（它退 0，这是故意的——第 3 步要在
+`set -e` 下先裸跑再 `--apply`），只有"需人工"的几类（多余 policy、角色缺失、
+判不出 engine）才让它退 1。两条命令对同一份不合格数据的差别**只在退出码上**，
+读输出读不出来。
+
+**automation 只许看退出码与计数，绝不要 grep 输出文本。** 那些补救文案来自运行时
+的 `permissions.py`，不是稳定契约：两次真机跑就因为中途改过那段措辞而输出不同，
+S1 收尾又改了一次（给"缺 owner"单独一支）。契约是退出码，以及
+`严格解析会拒绝的 ACTIVE 行：N` / `不合格的 site-rt-* 角色：N` 这两个计数。
+
+### 三波强制重新登录，都是预期行为
+
+按发生顺序：
+
+1. **第 2 步 panel 部署完成那一刻**——控制台的 `__Host-sb_console` cookie 全部失效
+   （新 panel 要求 `typ`，旧 cookie 没有）。**只影响写操作**：GET 读接口不要面板
+   会话，所以控制台看起来是正常的，直到用户第一次改权限/加协作者，前端收到
+   `401 {"need":"console-session"}` 后**自动**整页跳一次 `auth.{base_domain}/console-session`
+   再回来。**它自愈，不需要运维介入**：此刻 auth 还是旧版，会照常接受不带 `typ`
+   的顶域会话并发一次性 code，新 panel 用它签出带 `typ` 的新面板 cookie。
+   （前端对一次浏览器会话只自动重试一次；若用户看到"面板会话无法建立"，
+   让他关掉标签页重开——那个标记在 sessionStorage 里。）
+2. **第 4 步 auth 部署完成那一刻**——`/console-session` 开始拒绝不带 `typ` 的旧
+   顶域会话，控制台用户被要求重新登录。
+3. **第 6 步 CloudFront 传播完成那一刻**——站点访问的旧会话失效，第三波。
+
+spec 里只写了后两波。第一波是最终复核发现的，症状是"刚部完 panel，改权限的人被
+弹去登录"——**别当成故障去查**。
+
+### 失败处置速查
+
+| 你看到 | 怎么办 |
+|---|---|
+| `--apply` 报「验证失败」 | **先重跑 `--check` 再下结论**。IAM 与策略模拟器是最终一致的，脚本内建 2/4/8 秒退避只能减少、不能消除一次**完全正确**的跑被记成红 |
+| `--check` 报某行「sites 行没有 tier，判不出 engine」 | **脚本永远修不到 0，必须人工修那一行**（`tier` 只在部署成功路径写，所以这是可达状态，不是假设）。修好再重跑；这一条不影响另外四条验收（那就是 Step 5 把退出码延后生效的原因） |
+| `--check` 报「site-scope 之外还有别的 policy」 | 需人工移除那条多余的 inline/attached policy。脚本**不自动删未知 policy** |
+| `--check` 报「ACTIVE 站点的角色缺失」 | 先查为什么没了。脚本**不自动重建**（自动建会盖掉根因，也会让备份里的 `null` 出现第二种含义） |
+| 「临时备份文件已存在——判为另一个 backfill 正在运行」 | **等一下再重跑，绝不要删那个 `.tmp`**。它同时是跨进程锁；此刻一笔 IAM 写入都没发生。若确认是上一次崩溃的残留，人工看过内容再删 |
+| 想让两个人同时跑 backfill | 别。锁只罩住快照文件的读-改-写，罩不住之后的 IAM 写入循环——两个人可以并发改 IAM（快照不会丢，但没人说得清最终状态由谁决定） |
+| 控制台/站点大面积 302 | 先确认第 5、6 步的顺序没颠倒：Edge 要求 `typ` 而 auth 还在签不带 `typ` 的会话 ⇒ 登录循环。回滚见下 |
+
+还有一条与部署无关但会浪费时间的：**MCP/panel/key-proxy 正在部署时不要跑 deployer
+测试套件**。三个部署脚本都会把 `deployer/functions/common.py` 之类的共享模块复制进
+自己的包目录、打完包在 `finally` 删掉，MCP 那次的窗口覆盖整个 buildx+push（分钟级）。
+S1 已经把那几条"唯一定义"守卫的豁免改成**按内容**判定，所以逐字节相同的副本不再
+让它们变红；但复制被中断/替换到一半时副本就不再逐字节相同，那时守卫会红，而那个红
+是真的（文件确实不一样），排查会指向完全错误的方向。
+
+### 回滚
+
+**先 router，再 auth，严格逆序。** 反过来（先回滚 auth 让它重新签发不带 `typ` 的
+token，而 Edge 仍要求 `typ`）会让**所有**新签发的会话被 302，用户陷入登录循环。
+panel 不需要参与任何方向：旧 panel 带着自己那份旧 `session.py`，新 panel 只验它
+自己签的 cookie。
+
+**M01 的角色 policy 单独回滚**，用 `--apply` 留下的快照。它是第一笔 IAM 写入
+**之前**就原子落盘并 fsync 过的（内容与目录各一次），所以"IAM 已改而回滚材料没了"
+这个窗口不存在；重跑只合并、不覆盖已有快照，所以第一份原始 policy 一直在。
+
+```bash
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+python3 - <<'PY'
+"""把 per-site 角色的 site-scope policy 回滚成 backfill 之前的样子。
+
+**先看清代价**：快照里存的多半是带 `site-data-{site_id}-*` 通配的旧 policy，
+写回去就等于把 M01 重新打开（通配是**向前看**的，会覆盖将来创建的嵌套 site_id）。
+所以这是可用性措施，不是终态：查明 backfill 为什么写坏之后要重新 `--apply`。
+
+**两种条目两种动作**：
+  · 有 policy 文档 ⇒ put_role_policy 写回；
+  · `null` ⇒ 备份时那个角色**存在、但没有 site-scope**（脚本用 GetRole 复核过，
+    所以 null 不可能是"角色不存在"）⇒ 正确动作是 delete_role_policy，
+    删掉 backfill 新写的那条，而不是写回一个不存在的文档。
+**本循环从不删除角色**，也不碰信任策略、boundary、别的 policy。
+整个循环幂等：中断后原样重跑即可。
+"""
+import configparser
+import json
+import pathlib
+
+import boto3
+from botocore.exceptions import ClientError
+
+SNAP = pathlib.Path("site-builder/scripts/backfill-old-policies.json")
+POLICY_NAME = "site-scope"
+
+snap = json.loads(SNAP.read_text())
+cfg = configparser.ConfigParser(interpolation=None)
+cfg.read("site-builder/config.ini")
+acct_now = boto3.client("sts").get_caller_identity()["Account"]
+
+# 动手之前先核对元数据：快照、config、当前凭证三者必须是同一个账号/区域。
+# 不核对的话，切错 profile 就会把 A 账号的资源 ARN 写进 B 账号的同名角色。
+assert snap.get("schema_version") == 1, f"未知快照格式：{snap.get('schema_version')}"
+assert snap["account_id"] == cfg["Platform"]["account_id"].strip() == acct_now, (
+    f"账号不一致：快照 {snap['account_id']} / config "
+    f"{cfg['Platform']['account_id'].strip()} / 当前凭证 {acct_now}——拒绝执行")
+assert snap["region"] == cfg["Platform"]["region"].strip(), (
+    f"区域不一致：快照 {snap['region']} / config {cfg['Platform']['region'].strip()}")
+
+iam = boto3.client("iam")
+restored = deleted = already = 0
+for name, doc in sorted(snap["roles"].items()):
+    if doc is None:
+        try:
+            iam.delete_role_policy(RoleName=name, PolicyName=POLICY_NAME)
+            deleted += 1
+            print(f"  {name}: 删掉了 backfill 新写的 site-scope（快照里是 null）")
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "NoSuchEntity":
+                raise
+            already += 1          # 已经回滚过；幂等重跑走到这里
+            print(f"  {name}: 已无 site-scope，无需动作")
+    else:
+        iam.put_role_policy(RoleName=name, PolicyName=POLICY_NAME,
+                            PolicyDocument=json.dumps(doc))
+        restored += 1
+        print(f"  {name}: 写回快照里的旧 policy")
+print(f"\n回滚完成：写回 {restored}，删除 {deleted}，本来就没有 {already}。"
+      "**没有删除任何角色**。")
+print("提醒：写回的旧 policy 多半带通配 ⇒ M01 对这些站点重新打开，"
+      "查明原因后要重新跑 --apply。")
+PY
+```
+
+---
+
 ## 决定安全边界的几项配置（先读这节）
 
 这几项**没做完，安全边界就没生效**，而代码里全绿的测试覆盖不到它们
