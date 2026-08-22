@@ -979,7 +979,12 @@ def _permissions():
 
 
 def _real_policy_messages() -> dict[str, str]:
-    """从**真源**取两段文案（不手抄）：effective_policy 自己抛出来的那两句。"""
+    """从**真源**取文案（不手抄）：`effective_policy` 自己抛出来的两句。
+
+    取的是它三支里的前两支（缺失/类型不对）——第三支「缺 owner 这类部署不会
+    初始化的字段」的文案由 `deployer/tests/test_permissions.py` 直接盯，
+    这里要证的是"后端那段字逐字到达 toast"，两支足够。
+    """
     permissions = _permissions()
 
     ok = {"site_id": "s-1", "owner": "o@example.test", "require_login": True,

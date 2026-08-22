@@ -383,12 +383,35 @@ def test_every_route_permission_writer_calls_effective_policy():
 # 允许出现 `require_auth` 字面量的位置，**按相对 `site-builder/` 的路径写**。
 # 不能按文件名写：按名字豁免 `permissions.py` 会连带豁免 `panel/permissions.py`
 # ——那恰恰是本轮要盯住的那一个（部署期副本，或者一份真的手抄）。
+# 每一条都要写清**这一个文件**为什么允许，别按形态批量豁免：本条最初写的是
+# "跳过所有 `deploy_*.py`"，那条按名字的规则顺手把
+# `deployer/functions/deploy_lambda_site.py` 也豁免掉了——它是 SFN 的步骤 Lambda、
+# 环境里带着 `ROUTING_TABLE`（infra/app.py:498 的 common_env 下发给每个 step_fn，
+# `deploy_lambda_site` 是 :579），正是这条守卫最该盯的那类文件，而且它在改成
+# 名字规则**之前**本来是被扫到的（它唯一那处 `require_auth` 在 `_health_check`
+# 的函数 docstring 里，被 `_docstring_ids` 排除，所以绿得有理由）。
+# 名字规则还会让将来任何一个 `functions/deploy_*.py` 自动免检。
 _REQUIRE_AUTH_ALLOWED = {
     "deployer/functions/permissions.py",
     "deployer/functions/register_route.py",
     # smoke_test.py：那里的 `require_auth` 是个**局部变量名**，用来决定冒烟该
     # 断言 302 还是 200，不是往路由写投影。
     "deployer/functions/smoke_test.py",
+    # 下面三条各有各的理由，**不是"因为叫 deploy_*"**：
+    #
+    # 写**平台**路由 item（console 子域 `require_auth: True`、mcp 子域
+    # `require_auth: False`）。那两条路由没有 sites 行，根本不能过
+    # `effective_policy`（它要的 owner / allowed_users 对平台子域不存在），
+    # 所以它们必须留在外面——收进来只会得到两个永远修不掉的假阳性，
+    # 而假阳性的下一步是有人给守卫加**目录级**豁免，那才是真把洞开出来。
+    "panel/deploy_panel.py",
+    "key-proxy/deploy_key_proxy.py",
+    # deploy_agentcore.py 的理由**不同**：它不写任何路由 item。那里的
+    # `require_auth` 在 `ROUTE_PROJECTION_ATTRIBUTES` 这个元组里——MCP runtime
+    # 的 IAM `dynamodb:Attributes` 条件键白名单，逐字段镜像
+    # `permissions.write_permissions` 的 route_update。它是**授权面**的声明，
+    # 不是投影。（把它误记成"平台路由 writer"是个假事实，别传下去。）
+    "mcp/deploy_agentcore.py",
 }
 
 
@@ -409,12 +432,12 @@ def test_no_other_module_projects_require_auth():
     `permissions.resync_route` 的 docstring 里，没有任何守卫。M01 的表名守卫与
     tier 守卫都已按同一理由扫整个 `site-builder/`，M02 这一条漏了。
 
-    **`deploy_*.py` 与 `tests/` 的排除是判据的一部分，不是图省事，别"顺手收紧"**：
-    `deploy_panel.py` 与 `deploy_key_proxy.py` 合法地写**平台**路由 item
-    （console / mcp 子域的 `require_auth: True/False`）。那两条路由**没有 sites
-    行**，根本不能过 `effective_policy`（它要的 owner / allowed_users 那几个字段
-    对平台子域不存在）。把它们收进来只会得到两个永远修不掉的假阳性，
-    而假阳性的下一步是有人给守卫加路径豁免——那才是真的把洞开出来。
+    **豁免只有一处、且逐文件按路径写**（`_REQUIRE_AUTH_ALLOWED`，每条附理由）。
+    `tests/` 按目录跳过（测试里出现这个字面量是正常的）。
+    **不许再按文件名形态批量豁免**：那样做过一次，"跳过所有 `deploy_*.py`"顺手
+    把 `deployer/functions/deploy_lambda_site.py` 一起免检了——同一个目录里
+    最该盯的那类文件（SFN 步骤 Lambda，环境里有 `ROUTING_TABLE`），而它本来是
+    被扫到且绿得有理由的。理由写在 `_REQUIRE_AUTH_ALLOWED` 上方。
 
     **docstring 不算，但也不给白名单里的文件开整文件豁免**（白名单是路径级、
     逐文件的）——整目录豁免会让新 writer 藏进被豁免的目录里。
@@ -444,8 +467,9 @@ def _require_auth_offenders(*roots, allowed=frozenset(), base=None) -> list:
     · **递归**（rglob）：`glob("*.py")` 只看目录第一层，`panel/lib/x.py` 这种写法
       对它等于不存在——扩了扫描范围却仍只看一层，等于把新洞留在子目录里；
     · `allowed` 与返回值都是**相对 `base`**（默认第一个 root）的路径，理由见
-      `_REQUIRE_AUTH_ALLOWED` 上方；
-    · `deploy_*.py` 跳过（写的是平台路由，见调用处 docstring）；
+      `_REQUIRE_AUTH_ALLOWED` 上方。**豁免只认这份路径清单**——这里曾额外按
+      `path.name.startswith("deploy_")` 跳过，那条按名字的规则把
+      `deployer/functions/deploy_lambda_site.py` 一起免检掉了；
     · 部署窗口里逐字节相同的副本按**内容**豁免（`is_transient_deploy_copy`）：
       三个部署脚本会把共享模块复制进自己的包目录再在 finally 删掉，MCP 那次的
       窗口是分钟级的。**不按路径豁免**——理由写在那个 helper 上方。
@@ -464,7 +488,7 @@ def _require_auth_offenders(*roots, allowed=frozenset(), base=None) -> list:
             rel = path.relative_to(base).as_posix()
             if any(part in _SCAN_SKIP_DIRS for part in path.parts):
                 continue
-            if rel in allowed or path.name.startswith("deploy_"):
+            if rel in allowed:
                 continue
             if is_transient_deploy_copy(path):
                 continue
@@ -494,9 +518,16 @@ def test_sentinel_scan_bites_a_probe_file(tmp_path):
 def test_sentinel_scan_reaches_the_other_three_packages(tmp_path):
     """扩了范围的那条守卫的**反向验证**，常驻：探针放进 panel/mcp 也要被咬住。
 
-    一次把五件事一起钉住，因为它们各自失效的样子都是"守卫还在、但不咬了"：
+    一次把七件事一起钉住，因为它们各自失效的样子都是"守卫还在、但不咬了"：
       · `panel/api.py` 里的投影字面量被发现——这条守卫此前完全看不到它；
       · `mcp/lib/nested.py` 被发现 ⇒ 扫描是**递归**的（`glob("*.py")` 会漏掉它）；
+      · **`deployer/functions/deploy_lambda_site.py` 被发现** ⇒ 豁免不是按文件名
+        形态给的。这一条是回归：曾经有一版按 `deploy_*` 前缀跳过，把这个真实存在
+        的 SFN 步骤 Lambda（环境里带 `ROUTING_TABLE`）一起免检了，而它在那之前
+        本来是被扫到的。删掉这一条断言，那个洞就会静默回来；
+      · **同一个文件只有 docstring 提到时不被发现** ⇒ 上一条不是靠"名字里带
+        deploy 就报"生效的，而真实文件正是靠这一点绿的（`_health_check` 的函数
+        docstring）。两条一起才说明"它被扫到、且绿得有理由"；
       · `panel/deploy_panel.py` **不**被发现 ⇒ 平台路由那两处合法写入不会变成
         修不掉的假阳性（它是"别顺手收紧"的那一半）；
       · `panel/tests/` 下的不被发现 ⇒ 测试里出现这个字面量是正常的；
@@ -510,15 +541,27 @@ def test_sentinel_scan_reaches_the_other_three_packages(tmp_path):
     literal = '_X = {"require_auth": True}\n'
     for rel in ("deployer/functions/permissions.py", "panel/api.py",
                 "panel/deploy_panel.py", "panel/tests/test_x.py",
-                "mcp/lib/nested.py"):
+                "mcp/lib/nested.py", "deployer/functions/deploy_lambda_site.py"):
         p = tmp_path / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(literal)
     copy = tmp_path / "panel" / "permissions.py"
     copy.write_bytes(real.read_bytes())          # 部署窗口里的那一份
+    roots = (tmp_path / "deployer" / "functions", tmp_path / "panel",
+             tmp_path / "mcp")
     assert _require_auth_offenders(
-        tmp_path / "deployer" / "functions", tmp_path / "panel", tmp_path / "mcp",
-        allowed=_REQUIRE_AUTH_ALLOWED, base=tmp_path) == [
+        *roots, allowed=_REQUIRE_AUTH_ALLOWED, base=tmp_path) == [
+            "deployer/functions/deploy_lambda_site.py:1",
+            "mcp/lib/nested.py:1", "panel/api.py:1"]
+
+    # 同一个文件，把字面量换成**函数 docstring**里的一句（真实文件的形态）
+    # ⇒ 不再报它，但另外两个照旧被报：这才叫"扫到了而且判据对"。
+    (tmp_path / "deployer/functions/deploy_lambda_site.py").write_text(
+        'def _health_check(lam):\n'
+        '    """过去 smoke 对 require_auth 站点只断言 Edge 的 302。"""\n'
+        '    return None\n')
+    assert _require_auth_offenders(
+        *roots, allowed=_REQUIRE_AUTH_ALLOWED, base=tmp_path) == [
             "mcp/lib/nested.py:1", "panel/api.py:1"]
 
 
