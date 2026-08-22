@@ -176,10 +176,25 @@ def _undeploy(event, context):
     purged: dict = {}
     if event.get("purge_data"):
         site = common.get_site(site_id) or {}
-        engine = event.get("engine") or common.tier_engine(site.get("tier", "static"))
         # 表名取自 provision_dynamodb 写入 sites 表的 data_tables；
         # 允许 event 覆盖，便于清理历史站点（该字段是本次新增的）
         tables = event.get("data_tables") or list(site.get("data_tables", []))
+        try:
+            # `or "static"` 而不是 get 的第二参数：写成 NULL / 空串的稀疏行取到的是
+            # None / ""，**键是存在的**，默认值根本不会生效。
+            engine = (event.get("engine")
+                      or common.tier_engine(site.get("tier") or "static"))
+        except ValueError as e:
+            # 不许猜（猜成 dsql 就会去删一个不确定属于谁的 schema），但也不能让它
+            # 冒到顶层 try：走到这里站点**已经**下线完了（路由/Lambda/角色都删了），
+            # 一次**可选**的数据清理没能定型，不该把干净成功的下线报成
+            # "可能处于部分删除状态"——那与本段开头的契约相反。
+            # 键带 `_error` ⇒ 计入 purge_errors ⇒ job 落 PURGE_FAILED 而非 DELETED：
+            # DSQL 清理被跳过了，它若本是 DSQL 站点则数据还在，而用户刚勾的是
+            # "永久删除数据"；异步调用的返回值没人看得到，只有 job.error 到得了
+            # 用户眼前（与 dynamodb_error / dsql_error 同一口径）。
+            logger.warning(f"未知 tier，跳过 DSQL 清理: {e}")
+            engine, purged["engine_unknown_error"] = "none", str(e)[:200]
         try:
             purged["dynamodb"] = _purge_dynamodb(site_id, tables)
         except Exception as e:

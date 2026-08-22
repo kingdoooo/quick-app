@@ -590,9 +590,11 @@ def do_undeploy(owner: str, site_id: str, purge_data: bool = False) -> dict:
     payload = {"job_id": job_id, "site_id": site_id}
     if purge_data:
         payload["purge_data"] = True
-        # tier 决定该清 DynamoDB 表还是 DSQL schema/role
-        payload["engine"] = ("dsql" if (site or {}).get("tier") == "fullstack-sql"
-                            else "dynamodb")
+        # **不传 engine**：tier→engine 的唯一派生实现是 `common.tier_engine`，
+        # undeploy 会自己从 sites 行推（`event.get("engine") or …`）。这里曾内联
+        # 第三份手抄，而且它是生产上真正说话的那一份——它把 engine 塞进 payload，
+        # 短路掉 undeploy 已经改对的派生，于是 static 站点仍被算成 "dynamodb"。
+        # `test_common.py::test_no_module_hand_rolls_the_tier_engine_mapping` 按 AST 钉死。
         tables = list((site or {}).get("data_tables", []))
         if tables:
             payload["data_tables"] = tables

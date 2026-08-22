@@ -198,6 +198,63 @@ def test_dsql_purge_failure_also_reports_purge_failed(aws):
     assert "dsql" in job["error"].lower(), job["error"]
 
 
+def test_unknown_tier_skips_dsql_purge_instead_of_failing_the_undeploy(aws):
+    """tier 认不出来时：**跳过** DSQL 清理，不许把整次下线打成 FAILED。
+
+    `common.tier_engine` 抛错是对的（不许猜——猜成 dynamodb 会让 backfill 丢掉
+    `dsql:DbConnect`），但这个抛错必须在**调用点**接住：走到这一段时路由
+    （:142）、Lambda（:146）、per-site 角色（:152）、日志组都已经删了，站点
+    **确实已经完全下线**。让 ValueError 冒到 handler 的顶层 try 就会写
+    `job=FAILED, error="下线中途失败，站点可能处于部分删除状态"` 并重抛去触发
+    OnFailure 告警——为一次**可选**的数据清理没能定型，把一个干净成功的下线
+    报成"可能部分删除"。本段开头的注释写的正是相反的契约：
+    「清理失败不改变下线结果」，两个 sibling（dynamodb / dsql 清理）都各自
+    try/except 守住了它。
+
+    汇报口径跟 sibling 一致（`test_purge_failure_keeps_site_deleted_but_job_reports_purge_failed`）：
+    站点 DELETED，job 报 PURGE_FAILED 且摘要落到 `job.error`。**不能报 DELETED**
+    ——DSQL 清理被跳过了，如果它本来是个 DSQL 站点，数据还在，而用户刚勾的是
+    "永久删除数据"；异步调用的返回值（`out["purged"]`）没有任何人看得到。
+    """
+    import undeploy, common
+    jid = _seed(common, boto3, site_id="odd-x9", tier="fullstack-graph")
+    with patch.object(undeploy, "_lambda", return_value=_lam_mock()), \
+         patch.object(undeploy, "_purge_dsql") as purge_dsql:
+        out = undeploy.handler({"job_id": jid, "site_id": "odd-x9",
+                                "purge_data": True}, None)
+    # 跳过，而不是猜一个 engine 然后照着清
+    purge_dsql.assert_not_called()
+    # 站点侧：下线本身完整成功
+    assert common.get_site("odd-x9")["status"] == "DELETED"
+    job = common.get_job(jid)
+    assert job["status"] != "FAILED", (
+        f"未知 tier 把整次下线打成了 FAILED：{job.get('error')}")
+    assert job["status"] == "PURGE_FAILED", job
+    # 异常必须留痕：只落在返回值里等于没落（异步调用没人读返回值）
+    assert "未知 tier" in out["purged"]["engine_unknown_error"], out
+    assert "未知 tier" in job["error"], job["error"]
+
+
+def test_empty_tier_falls_back_instead_of_raising(aws):
+    """`tier` 是空串/None（不是"键不存在"）时也要回落，不能抛错。
+
+    `site.get("tier", "static")` 只在**键不存在**时给默认值：DynamoDB 里
+    写成 NULL 或空串的稀疏行会取到 `None` / `""` 并被 `tier_engine` 拒掉。
+    判据用 `site.get("tier") or "static"`。回落到 static（engine="none"）是
+    下线场景最保守的方向——什么都不删。
+    """
+    import undeploy, common
+    jid = common.create_job("a@x.com", "blank-x8")
+    common.upsert_site("blank-x8", owner="a@x.com", status="ACTIVE", tier="")
+    with patch.object(undeploy, "_lambda", return_value=_lam_mock()), \
+         patch.object(undeploy, "_purge_dsql") as purge_dsql:
+        out = undeploy.handler({"job_id": jid, "site_id": "blank-x8",
+                                "purge_data": True}, None)
+    purge_dsql.assert_not_called()
+    assert common.get_job(jid)["status"] == "DELETED", "空 tier 不该算异常"
+    assert "engine_unknown_error" not in out.get("purged", {}), out
+
+
 # ── 中途失败必须收敛到终态（Codex 审查 2026-08-10 P1-4）────────────────
 # 实测复现过：注入 IAM 永久失败后
 #   job_status=RUNNING / job_phase=undeploy / route=已删除 / site=ACTIVE

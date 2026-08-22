@@ -611,9 +611,53 @@ def test_tier_engine_rejects_an_unknown_tier():
         common.tier_engine("fullstack-graph")
 
 
-def test_undeploy_does_not_hand_roll_the_tier_mapping():
-    """undeploy 不许再内联 tier→engine（它现在有第二份）。"""
-    import pathlib
-    src = (pathlib.Path(__file__).parents[1] / "functions" / "undeploy.py").read_text()
-    assert "fullstack-sql" not in src, (
-        "undeploy 仍在内联 tier→engine，应改调 common.tier_engine")
+def test_no_module_hand_rolls_the_tier_engine_mapping():
+    """tier→engine 不许在**任何**模块里再内联一份。
+
+    （原名 `test_undeploy_does_not_hand_roll_the_tier_mapping`，只读
+    `functions/undeploy.py` 一个文件——而那正是 `mcp/server.py:594` 的第三份手抄
+    能在它眼皮底下活下来的原因：那份还是生产上真正说话的那一份，它把 engine 塞进
+    undeploy 的 payload，短路掉 undeploy 自己的派生。所以判据连同扫描范围一起换掉，
+    沿用 Task 2 表名守卫的结构：扫整个 `site-builder/`。）
+
+    **判据是"同一个表达式里同时出现 tier 名与引擎名"，不是"提到了 fullstack-sql"。**
+    为什么必须这么窄——裸字面量扫描会把三类完全正当的写法误判成违规：
+      · `contract/src/contract/redlines.py` 的错误文案
+        （"backend/schema.sql: fullstack-sql 必须提供建表 SQL"）；
+      · 合同自己的校验分支 `if tier == "fullstack-sql" and db.get("tables")`
+        ——它按 tier 分流，但并**不**产出 engine，不是这个映射；
+      · 满地的测试夹具 `tier="fullstack-sql"`。
+    而真正的手抄一定把两侧写进**一个**表达式：
+    `"dsql" if tier == "fullstack-sql" else "dynamodb"`（IfExp）、
+    `{"fullstack-sql": "dsql", ...}`（Dict）、或 Compare 兜住的变体。
+    豁免两个文件：真源 `contract.schema`（那份 Dict 就是定义）与唯一派生
+    `deployer/functions/common.py`。
+    """
+    import ast
+    from pathlib import Path
+    root = Path(__file__).parents[3]
+    exempt = {
+        # 真源：tier→engine 是合同语义，这份 Dict 就是定义本身
+        (root / "site-builder/contract/src/contract/schema.py").resolve(),
+        # deployer 侧的唯一派生实现（一致性由 sibling 用例与合同对齐）
+        (root / "site-builder/deployer/functions/common.py").resolve()}
+    offenders = []
+    for py in (root / "site-builder").rglob("*.py"):
+        if any(part in py.parts for part in
+               (".venv", "cdk.out", "__pycache__", "build", "node_modules",
+                "tests")):
+            continue
+        if py.resolve() in exempt:
+            continue
+        try:
+            tree = ast.parse(py.read_text())
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.IfExp, ast.Compare, ast.Dict)):
+                continue
+            src = ast.unparse(node)
+            if "fullstack-sql" in src and ("dsql" in src or "dynamodb" in src):
+                offenders.append(f"{py.relative_to(root)}:{node.lineno}")
+    assert not offenders, (
+        f"这些表达式内联了 tier→engine，必须改调 common.tier_engine：{offenders}")
