@@ -348,27 +348,74 @@ def test_no_literal_index_into_cancellation_reasons():
 
 
 def test_table_name_format_has_a_single_definition():
-    """`site-data-…` 这个格式只允许在 common.site_table_name 里出现一次。
-
-    用 AST 取 f-string 的字面量片段，所以**文档字符串与注释不参与**——
-    它们提及格式是好事，代码里手写格式才是问题。
+    """站点数据表名 `site-data-{site_id}-{logical}` 的格式**只允许在 common.py 里出现**。
 
     为什么值得一条守卫：M01 的修复要求建表 / 授权 / 删表三处对同一格式达成一致，
-    而它现在被手抄了三份（provision_dynamodb 建、common.site_policy 授权、
-    undeploy 删）。不收敛就等于在三处各写一遍新格式。
+    而它曾被手抄三份（provision_dynamodb 建、common.site_policy 授权、undeploy 删）。
+    它们各自的失败模式互不相同、都很难从症状反推：
+
+      · 建表与授权不一致 —— 表建出来了但站点角色没有它的权限，站点运行时
+        AccessDeniedException；
+      · 授权与删表不一致 —— 下线时漏删，遗留表继续计费，且**下一个同名站点可能
+        直接读到上一个站点的残留数据**；
+      · 三者都用通配前缀 —— 因为分隔符是 `-` 而 site_id 自身可含 `-`，
+        `site-data-foo-k3d9x1-*` 会命中 site_id 为 `foo-k3d9x1-…` 的**另一个站点**的表。
+        这正是 M01 要求逐表枚举精确 ARN 的原因。
+
+    **扫描范围是整个 `site-builder` 而不只是 deployer/functions**：panel、mcp、
+    key-proxy 各自把 deployer 的共享模块打进自己的产物，第四份手抄同样可能出现在
+    那些目录里；只看一个目录的守卫不能保证"这类缺陷不会再回来"。
+    与 `test_static_prefix_format_has_a_single_definition` 同一套判据结构。
     """
     import ast
-    import pathlib
-    root = pathlib.Path(__file__).parents[1] / "functions"
+    import re
+    from pathlib import Path
+    root = Path(__file__).parents[3]
+    canonical = (root / "site-builder" / "deployer" / "functions"
+                 / "common.py").resolve()
+    # `site-data-` 后面紧跟一个 f-string 占位 = 在手搓**某一个站点**的表名。
+    #
+    # 要求这个占位，是为了把"构造表名"与"授权整类表名"分开——后者**不算**违规：
+    #   · `deployer/infra/app.py` 的 `f"...table/site-data-*"` 是执行器角色对
+    #     全部站点表的账号级授权，它没有 site_id 可传（也 import 不到本模块），
+    #     必须保持原样。它的下一个字符是 `*` 而非 `{`，因此天然被排除，
+    #     不需要按文件名特例。
+    # 与 sibling 守卫里"CDK 的 ARN vs S3 的键"是同一个区分。
+    handmade = re.compile(r"site-data-\{")
     offenders = []
-    for path in sorted(root.glob("*.py")):
-        for node in ast.walk(ast.parse(path.read_text())):
-            if not isinstance(node, ast.JoinedStr):
-                continue
-            literal = "".join(
-                v.value for v in node.values
-                if isinstance(v, ast.Constant) and isinstance(v.value, str))
-            if "site-data-" in literal:
-                offenders.append(f"{path.name}:{node.lineno}")
-    assert len(offenders) == 1 and offenders[0].startswith("common.py"), (
-        f"表名格式应只在 common.site_table_name 出现一次，实际出现在: {offenders}")
+    for py in (root / "site-builder").rglob("*.py"):
+        if any(part in py.parts for part in
+               (".venv", "cdk.out", "__pycache__", "tests")):
+            continue
+        if py.resolve() == canonical:
+            continue
+        try:
+            tree = ast.parse(py.read_text())
+        except SyntaxError:
+            continue
+        # 只看代码，不看注释与 docstring：解释这个格式为什么危险是允许的，
+        # 也是必要的（undeploy.py 的模块与函数 docstring 都提到它）。
+        # ast.unparse 已经把注释全部丢掉，再清掉 docstring 即可。
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.ClassDef)):
+                body = node.body
+                if (body and isinstance(body[0], ast.Expr)
+                        and isinstance(body[0].value, ast.Constant)
+                        and isinstance(body[0].value.value, str)):
+                    body[0].value.value = ""
+        if handmade.search(ast.unparse(tree)):
+            offenders.append(str(py.relative_to(root)))
+    assert not offenders, (
+        "这些文件手写了站点数据表名的格式，必须改用 common.site_table_name："
+        f"{offenders}")
+
+
+def test_site_table_name_is_the_canonical_format():
+    """钉死唯一定义**自己**的产出。
+
+    上面那条守卫排除了 canonical 文件，因此它只能说"别处没有手写"，
+    不能说"这里还写着"——把定义删掉或搬走，它照样绿。这条补上另一半。
+    """
+    import common
+    assert common.site_table_name("foo-k3d9x1", "notes") == "site-data-foo-k3d9x1-notes"
