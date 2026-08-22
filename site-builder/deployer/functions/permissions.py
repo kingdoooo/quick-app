@@ -439,22 +439,43 @@ def effective_policy(site: dict) -> dict:
     `site.get("allowed_users", "org")`：读路径（Edge）对坏数据 fail-closed，
     而这两个默认值让**写路径**把坏数据洗成合法的 `{"BOOL": false}` / `"org"`
     ——两侧对坏数据的语义相反，Edge 的加固被写入侧抵消（M02）。
+
+    异常文案分两种（**类型不对**要人工改那一行，**字段缺失**通常只是还没成功
+    部署过、部署一次就会初始化）——见 `reject` 上方注释。拒绝的语义与拒绝的
+    输入集合两者都不因此改变。
     """
     site_id = site.get("site_id", "<unknown>")
     # 补救文案必须覆盖**能拒的每个字段**（由
     # test_repair_hint_covers_every_field_it_can_reject 钉住）：拒绝的代价是站点
     # 在人工修好之前既不能改权限也不能部署，换来的只有"人照着文案能把那一行改
     # 回来"这一样东西。少一个字段的形态，那个字段的拒绝就是一张工单。
-    repair = ('请把 sites 表该行修正为正确类型后重试（require_login: BOOL；'
-              'allowed_users: S="org" 或 L=邮箱数组；'
-              'collaborators: L=邮箱数组（可缺省）；owner: 非空 S）。')
+    #
+    # **文案分两种，因为两种坏法的修法完全不同**（spec §4.1 把"拒绝"这个代价的
+    # 可接受前提写成「错误文案直接给出修法」）：
+    #   · 类型不对 ⇒ 那一行存着一个用不了的值，只能人工改对。再部署一百次也
+    #     不会把它改好。
+    #   · 字段缺失 ⇒ 绝大多数是"这个站点还没成功部署过"：create_site_record
+    #     只写 owner/name/status，权限字段由首次部署的
+    #     register_route._seed_permissions_if_absent 补齐。对这种行说"请修正为
+    #     正确类型"是**不可执行的**——那一行没有任何坏数据，用户会被指去手改
+    #     DynamoDB。
+    # 两条都带类型清单：缺失的另一种可能是**已部署行被人为删过字段**，那种确实
+    # 要照类型补。
+    _types = ('require_login: BOOL；allowed_users: S="org" 或 L=邮箱数组；'
+              'collaborators: L=邮箱数组（可缺省）；owner: 非空 S')
+    repair_wrong_type = f'请把 sites 表该行修正为正确类型后重试（{_types}）。'
+    repair_absent = (
+        '这通常表示该站点**尚未成功部署过**——权限字段由首次成功部署自动初始化，'
+        '所以成功部署一次之后就能正常改权限，不需要手改库。'
+        f'若该站点确实已成功部署过，则是这一行被人为删过字段，请按类型补齐（{_types}）。')
 
     def reject(field, value):
-        found = ("字段缺失" if value is _ABSENT
-                 else f"{type(value).__name__}={value!r}")
+        absent = value is _ABSENT
+        found = "字段缺失" if absent else f"{type(value).__name__}={value!r}"
         raise PolicyDataInvalid(
             f"站点 {site_id} 的 {field} 形态不合法"
-            f"（{found}），已拒绝投影权限。{repair}")
+            f"（{found}），已拒绝投影权限。"
+            f"{repair_absent if absent else repair_wrong_type}")
 
     # 四个字段一律用 `site.get(key, _ABSENT)` 这**同一个**写法探"缺失"。
     # 不混用 `key not in site` 与 `site.get(key, 默认值)`：三种写法并存时，
@@ -476,7 +497,9 @@ def effective_policy(site: dict) -> dict:
         raise PolicyDataInvalid(
             f"站点 {site_id} 的 allowed_users 形态不合法"
             f"（读到 {type(allowed_users).__name__}：{exc}），"
-            f"已拒绝投影权限。{repair}") from exc
+            # 走到这里字段一定**在**（_ABSENT 已在上面被 reject 掉），所以是
+            # "类型不对"那条文案——不能建议去部署，部署不会改好一个坏值。
+            f"已拒绝投影权限。{repair_wrong_type}") from exc
 
     # **全函数唯一一处「缺失有默认值」**——其余三个字段的缺失一律 reject。
     # 这个例外只在这一个字段上站得住：没有 collaborators 键，唯一的读法就是

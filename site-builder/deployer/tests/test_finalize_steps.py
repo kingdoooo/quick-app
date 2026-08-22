@@ -290,6 +290,8 @@ def test_missing_require_login_is_refused_not_defaulted(aws, monkeypatch):
     import register_route
     common.upsert_site("s-1", owner="o@x.com")
     job_id = common.create_job("o@x.com", "s-1")
+    # get_site 没被 patch（只 patch 了强一致那个），所以它读的是**真实行**
+    before = common.get_site("s-1")
     anomalous = {"site_id": "s-1", "owner": "o@x.com", "permissions_rev": 1,
                  "allowed_users": ["a@x.com"], "collaborators": []}
     monkeypatch.setattr(register_route.common, "get_site_consistent",
@@ -300,9 +302,18 @@ def test_missing_require_login_is_refused_not_defaulted(aws, monkeypatch):
              # manifest 给 False：拒绝必须压过 manifest 的诱导，而不是投影它
              "manifest": {"auth": {"require_login": False,
                                    "allowed_users": ["a@x.com"]}}}, None)
-    # 拒绝发生在提交点之前 ⇒ 路由表里根本不该出现这条 item（线上零影响）
+    # 拒绝发生在提交点之前 ⇒ 路由表里根本不该出现这条 item（线上零影响）。
+    # 这是本用例里**安全相关**的那半：投影一个字都没写出去。
     assert "Item" not in boto3.client("dynamodb").get_item(
-        TableName="routing", Key={"subdomain": {"S": "app-s-1"}})
+        TableName="routing", Key={"subdomain": {"S": "app-s-1"}}), (
+        "拒绝路径仍然写了路由投影")
+    # sites 行这半**不能断言"完全没动"**：`_seed_permissions_if_absent` 按设计
+    # 排在拒绝之前，会往真实行补 require_login/collaborators/rev。要断言的是它
+    # 只**补缺失**、没改任何已有值（if_not_exists 的全部承诺）——这样"拒绝之前
+    # 有一次半套覆盖写"仍然会被抓住。
+    after = common.get_site("s-1")
+    assert all(after.get(k) == v for k, v in before.items()), (
+        f"seed 改了已有字段的值（应只补缺失）：before={before} after={after}")
 
 
 def test_register_route_seed_does_not_overwrite_concurrent_online_change(aws):

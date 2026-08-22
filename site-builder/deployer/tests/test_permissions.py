@@ -1000,6 +1000,50 @@ def test_rejection_says_missing_when_the_field_is_missing(field):
     assert "NoneType" not in msg, f"缺失被报成了 null：{msg}"
 
 
+@pytest.mark.parametrize("field", ["require_login", "allowed_users", "owner"])
+def test_absent_field_message_gives_an_actionable_fix_not_hand_editing(field):
+    """**字段缺失**的文案必须给出可执行的修法：成功部署一次就会初始化。
+
+    spec §4.1 把"拒绝"这个代价的可接受前提写成「错误文案直接给出修法」。
+    对**从未成功部署过**的站点，"请把该行修正为正确类型"不是可执行的修法：
+    `create_site_record` 只写 owner/name/status，权限字段由首次部署的
+    `_seed_permissions_if_absent` 补齐——那一行**没有任何坏数据**，
+    而旧文案会把用户指去手改 DynamoDB。这是这条用例存在的全部理由。
+    """
+    site = {"site_id": "s-1", "owner": "o@example.test", "require_login": True,
+            "allowed_users": "org", "collaborators": []}
+    del site[field]
+    with pytest.raises(perm.PolicyDataInvalid) as excinfo:
+        perm.effective_policy(site)
+    msg = str(excinfo.value)
+    assert "尚未成功部署" in msg, (
+        f"缺失文案没说清“这个站点还没部署过”，用户只会去手改库：{msg}")
+    assert "成功部署一次" in msg, f"缺失文案没给出“部署一次即可”这个修法：{msg}"
+
+
+@pytest.mark.parametrize("field,bad", [
+    ("require_login", "true"),
+    ("allowed_users", 7),
+    ("owner", ""),
+])
+def test_wrong_typed_field_message_does_not_claim_the_site_is_undeployed(field, bad):
+    """**类型不对**的那条不许跟着变成"部署一次就好"。
+
+    与上一条互为边界：两种坏法的修法完全不同——存着一个用不了的值时，
+    再部署一百次也不会把它改对，只能人工改那一行。把两条文案合并成一句，
+    就会让"人为改坏了类型"的行收到一条指错方向的建议。
+    """
+    site = {"site_id": "s-1", "owner": "o@example.test", "require_login": True,
+            "allowed_users": "org", "collaborators": []}
+    site[field] = bad
+    with pytest.raises(perm.PolicyDataInvalid) as excinfo:
+        perm.effective_policy(site)
+    msg = str(excinfo.value)
+    assert "尚未成功部署" not in msg, (
+        f"类型不对却建议去部署——部署不会修好一个错类型的值：{msg}")
+    assert "修正为正确类型" in msg, f"类型不对的文案丢了“人工改对”这个修法：{msg}"
+
+
 @pytest.mark.parametrize("field,bad", [
     ("require_login", "true"),          # 字符串 "true"，不是 BOOL
     ("allowed_users", 7),               # 既不是 "org" 也不是名单
@@ -1074,6 +1118,7 @@ def test_an_unrelated_permission_change_does_not_flip_a_wrong_typed_row_public(a
     """
     import os
 
+    import boto3
     import common
     common.upsert_site("s-1", owner="o@example.test", name="s",
                        status="ACTIVE", allowed_users="org",
@@ -1085,6 +1130,16 @@ def test_an_unrelated_permission_change_does_not_flip_a_wrong_typed_row_public(a
         Key={"site_id": {"S": "s-1"}},
         UpdateExpression="SET require_login = :bad",
         ExpressionAttributeValues={":bad": {"N": "0"}})
+    before = common.get_site_consistent("s-1")
     with pytest.raises(perm.PolicyDataInvalid, match="require_login"):
         perm.set_collaborators("s-1", actor="o@example.test",
                                add=["c@example.test"])
+    # **"抛了异常"不等于"什么都没发生"**：带部分写入的异常照样是一次洗数据。
+    # 所以除了拒绝，还要断言两张表都没动——整行相等，含 permissions_rev
+    # （rev 被推进过就说明事务已经落过一半）。
+    assert common.get_site_consistent("s-1") == before, (
+        "拒绝路径动了 sites 行——effective_policy 必须在构造事务之前抛错")
+    assert "Item" not in boto3.client("dynamodb").get_item(
+        TableName="routing",
+        Key={"subdomain": {"S": common.subdomain_for("s-1")}}), (
+        "拒绝路径往路由表写了投影——这正是 M02 要消除的那次洗数据")

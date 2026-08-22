@@ -138,10 +138,33 @@ def test_absent_allowed_users_attribute_is_rejected_not_widened_to_org(aws):
     现行 Edge 是 `route.get("allowed_users") if "allowed_users" in route else []`，
     缺失即空名单（fail-closed）。继续回落 org 就是静默扩权，
     而且是在一次"数据修复"动作里扩权。判不出原意就报错，让人来定。
+
+    两段断言：先是 `_parse_allowed` 本身抛错，然后**整条 migrate 什么都不写**
+    ——"抛了异常"不等于"什么都没发生"，半套写入照样会把下游默认放大成 org。
+    旧版本这里跑的是整条 migrate（断言 migrated==["s-old"] 且写出 org），
+    所以端到端这一段必须保留，不能只留一个单元断言。
     """
+    import boto3
+    import common
     import migrate_permissions
+    import migrate_permissions as mig
     with pytest.raises(migrate_permissions.UnparsableAllowlist, match="缺失"):
         migrate_permissions._parse_allowed({})
+
+    common.upsert_site("s-old", owner="o@x.com")
+    before = common.get_site("s-old")
+    boto3.client("dynamodb").put_item(TableName="routing", Item={
+        "subdomain": {"S": "app-s-old"}, "site_id": {"S": "s-old"},
+        "route_mode": {"S": "split"}, "static_prefix": {"S": "sites/s-old/j"},
+        "api_target": {"S": ""}, "require_auth": {"BOOL": True},
+        "owner": {"S": "o@x.com"}})   # 无 allowed_users 属性
+    out = mig.migrate("routing", dry_run=False)
+    assert out["migrated"] == [], "缺失属性的行不该被算作已迁移"
+    assert out["errors"] and "s-old" in out["errors"][0], (
+        f"必须把这一行报进 errors 让人来判，实际 {out}")
+    # 一个权限字段都不许写（半套写入 = 下游按缺失字段回落 = 静默扩权）
+    assert common.get_site("s-old") == before, "拒绝路径写了 sites 行"
+    assert not (PERMISSION_FIELDS & set(common.get_site("s-old")))
 
 
 def test_dry_run_writes_no_permission_field_at_all(aws):

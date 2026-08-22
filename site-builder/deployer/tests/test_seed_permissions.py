@@ -18,6 +18,12 @@ def test_seed_does_not_widen_allowlist_on_sparse_row(aws):
     再生产出这个形态。它的来源变成"存量遗留行"（M02 之前的在线写只持久化
     调用方显式传入的字段）。要守的性质没变——seed 遇到这种行只补缺失字段、
     绝不用 manifest 的值盖掉已设的名单，所以照原样造出该形态即可。
+
+    **绕开在线写入口在这里是正当的，请不要"顺手改回" `set_access_policy`**：
+    本用例的被测对象是 **seed 路径**，在线写只是原来用来把行造成稀疏的手段。
+    改回去的后果是用例在 setup 阶段就抛 `PolicyDataInvalid`，于是这条 P0 回归
+    （seed 不得把在线设的名单放大成 org）**根本跑不到**——守卫看着还在，实际
+    已经不再守任何东西。
     """
     import common
     import register_route
@@ -56,7 +62,9 @@ def test_seed_fills_missing_allowed_users_when_require_login_present(aws):
     M02 之前这里是回落 "org" 的静默扩权；方向变了，但"seed 必须补上这个字段"
     这个结论没变——补不上，站点就部署不了。
 
-    稀疏行直接造，理由同上一条用例（M02 起在线接口不再产出该形态）。
+    稀疏行直接造，理由同上一条用例（M02 起在线接口不再产出该形态；被测对象是
+    seed 路径而不是在线写路径，所以绕开它是正当的——**别改回
+    `set_access_policy`**，改回去这条 P0 回归会在 setup 就抛错、等于失效）。
     """
     import common
     import register_route
@@ -119,6 +127,12 @@ def test_deploy_path_refuses_to_launder_a_wrong_typed_row(monkeypatch):
     `if_not_exists(...)` **只补缺失字段、不碰错类型字段**，所以
     `require_login = Decimal(0)` 会穿过种子逻辑，在 `_route_item` 被 bool()
     洗成字面 `BOOL False` 写进路由——**每次部署都重洗一遍**。
+
+    这里只断言"抛错"、没有"什么都没写"那一半：`_route_item` 是个**纯构造函数**，
+    它不持有任何 client、不发任何请求（本用例连 `aws` 夹具都不需要），
+    没有东西可动。端到端的"拒绝且路由未被写"由
+    `test_finalize_steps.py::test_missing_require_login_is_refused_not_defaulted`
+    覆盖。
     """
     from decimal import Decimal
 
