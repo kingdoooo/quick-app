@@ -20,15 +20,28 @@
   - `cd site-builder/panel && ../deployer/.venv/bin/pytest tests -q`（panel 无自己的 venv，借 deployer 的）
 - **`permissions.py` 被复制进三个产物**（panel / key-proxy / MCP）⇒ 改它之后这三个都要重部，验收必须包含 `verify_deployed_components.py`。
 - **`site-builder/auth/session.py` 与 `router/infrastructure/lambda/origin_request.py` 里的 HS256 实现必须保持算法字节等价**；改一处必须同步另一处。
-- **部署顺序不可变**：deployer 栈 → panel/key-proxy/MCP 重部 → auth → 等 Edge 全球复制（10–20 分钟）→ router。
-- **回滚严格逆序：先 router，再 auth。** 反过来（先回滚 auth 使其重新签发不带 `typ` 的 token，而 Edge 仍要求 `typt`）会让所有新会话被 302，用户陷入登录循环。
+- **部署顺序不可变**：deployer 栈 → panel/key-proxy/MCP 重部 → **存量角色 backfill**
+  → auth → router → **等 CloudFront `Status == Deployed`** → 真机验收。
+  **等待在 router 之后，不是之前**：真正触发 Lambda@Edge 传播的是 router 部署本身，
+  在它之前等待不会等到任何新版本。完整序列见 Task 10 Step 3–5。
+- **回滚严格逆序：先 router，再 auth。** 反过来（先回滚 auth 使其重新签发不带 `typ`
+  的 token，而 Edge 仍要求 `typ`）会让所有新会话被 302，用户陷入登录循环。
+  **backfill 不是纯代码部署**，它的恢复方式见 spec §7.3。
 - **不把真实账号 ID / 域名 / site_id / 邮箱写进任何被跟踪的文件。** 测试固定用 `111111111111`、`example.test`、`foo-k3d9x1` 这类占位值。
 - `router/infrastructure/lambda/_*_testable.py` 是测试期由测试文件从 `origin_request.py` 现生成的副本（gitignored），**不要手工编辑它们**。
-- **每个 commit step 在 `git add` 之后、`git commit` 之前必须跑**
-  `bash site-builder/scripts/scan_staged_secrets.sh`（`~/AGENTS.md` 的全局提交纪律）。
-  它命中即**退非 0 并阻断**——不要退回 `git diff --cached | grep && echo` 那种写法，
-  该脚本的文件头就是为了取代它而写的（`&&` 后面只是 echo，命中也不阻断）。
-  它的模式里包含 `/Users/<name>/` 与 `/home/<name>/`，所以下一条不是可选项。
+- **secret scan 的调用形态有三条硬要求**（`~/AGENTS.md` 的全局提交纪律；
+  脚本支持 `--files` / `--range` / `--allow-hits`，已核）：
+  1. **新文件在 `git add` 之前**先单独扫：
+     `bash site-builder/scripts/scan_staged_secrets.sh --files <新文件…> || exit 1`；
+  2. `git add` 之后、`git commit` 之前再扫一次 staged diff：
+     `bash site-builder/scripts/scan_staged_secrets.sh || exit 1`；
+  3. **两处都必须带 `|| exit 1`**。裸写一行 `bash …scan…` 换行 `git commit` 时，
+     扫描退非 0 **不会阻断** 后面的 commit——那正是这个脚本的文件头批评的形态
+     （原先内联的 `git diff --cached | grep && echo` 命中也只 echo）。
+     我在 v2 里恰好又犯了一次。
+  - 命中时**不要自动清洗**：逐条确认是故意的 fixture/占位符/公开值，
+    展示给人确认后再显式 `--allow-hits` 放行。
+  - 它的模式里包含 `/Users/<name>/` 与 `/home/<name>/`，所以下一条不是可选项。
 - **命令块里不写绝对主机路径。** 需要回仓库根用
   `cd "$(git rev-parse --show-toplevel)"`。绝对家目录路径对别人无意义，
   且会被上面那个扫描拦下。
@@ -154,7 +167,7 @@ import sys
 
 import pytest
 
-sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "scripts"))
+sys.path.insert(0, str(pathlib.Path(__file__).parents[2] / "scripts"))
 import audit_policy_rows as apr  # noqa: E402
 
 
@@ -215,9 +228,13 @@ Expected: 退出码 0，打印 `无 —— S1 上线不会卡住任何现有站�
 - [ ] **Step 5: 扫描 + Commit**
 
 ```bash
+cd "$(git rev-parse --show-toplevel)"
+bash site-builder/scripts/scan_staged_secrets.sh \
+     --files site-builder/scripts/audit_policy_rows.py \
+             site-builder/deployer/tests/test_audit_policy_rows.py || exit 1
 git add site-builder/scripts/audit_policy_rows.py \
         site-builder/deployer/tests/test_audit_policy_rows.py
-bash site-builder/scripts/scan_staged_secrets.sh
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1
 git commit -m "chore(s1): sites 行形态体检——判据委托给 effective_policy，不手抄第二套"
 ```
 
@@ -325,7 +342,7 @@ git add site-builder/deployer/functions/common.py \
         site-builder/deployer/functions/provision_dynamodb.py \
         site-builder/deployer/functions/undeploy.py \
         site-builder/deployer/tests/test_common.py
-bash site-builder/scripts/scan_staged_secrets.sh
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1
 git commit -m "refactor(s1/m01): 表名格式提成 common.site_table_name 唯一定义 + AST 守卫"
 ```
 
@@ -523,7 +540,7 @@ git add site-builder/deployer/functions/common.py \
         site-builder/deployer/functions/deploy_lambda_site.py \
         site-builder/deployer/functions/provision_dsql.py \
         site-builder/deployer/tests/test_common.py
-bash site-builder/scripts/scan_staged_secrets.sh
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1
 git commit -m "fix(s1/m01): per-site IAM 改逐表精确 ARN + 日志组收窄——通配会匹配到嵌套 site_id 的其他站点"
 ```
 
@@ -632,13 +649,13 @@ Expected: PASS
 git add site-builder/deployer/functions/common.py \
         site-builder/deployer/functions/undeploy.py \
         site-builder/deployer/tests/test_common.py
-bash site-builder/scripts/scan_staged_secrets.sh
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1
 git commit -m "refactor(s1/m01): tier→engine 提成 common.tier_engine 唯一定义 + 与合同一致性守卫"
 ```
 
 ---
 
-### Task 3c: 存量角色 backfill + 「通配角色数 == 0」硬闸门
+### Task 3c: 存量角色 backfill + 「不合格角色数 == 0」硬闸门
 
 **Files:**
 - Create: `site-builder/scripts/backfill_site_role_policies.py`
@@ -646,7 +663,7 @@ git commit -m "refactor(s1/m01): tier→engine 提成 common.tier_engine 唯一�
 
 **Interfaces:**
 - Consumes: `common.ensure_site_role(site_id, engine, *, tables)`（Task 3）、`common.tier_engine(tier)`（Task 3b）
-- Produces: `wildcard_roles(iam) -> list[str]`（闸门用）、命令行 `--apply` / `--check`
+- Produces: `check_roles(iam) -> list[(role, reason)]`（闸门用，判据是「实际 == 期望」）、`verify_access(iam, site_id, tables)`（用 IAM 模拟器做功能验收）、`plan_for(site_id, site)`、`_load_env()`（含 STS 账号核对）、命令行 `--apply` / `--check`
 
 > **为什么必须做而不是等下次部署**（这是 v1 的设计错误，Codex 复核指出）：
 > `table/site-data-{A}-*` 是**向前看的**通配——它覆盖所有以 A 的 id 为前缀的
@@ -661,14 +678,20 @@ git commit -m "refactor(s1/m01): tier→engine 提成 common.tier_engine 唯一�
 Create `site-builder/deployer/tests/test_backfill_site_role_policies.py`：
 
 ```python
-"""backfill 的单测。闸门函数必须能认出通配，否则"通配数为 0"是假绿。"""
+"""backfill 的单测。
+
+闸门的判据是「实际 policy == 从当前 sites 行推导的期望 policy」，
+所以这里的重点用例是那些**不含通配却依然不可用**的形态
+（错账号、漏表、孤儿角色）——只查 `*` 的闸门会放过它们。
+"""
 import json
+import os
 import pathlib
 import sys
 
 import pytest
 
-sys.path.insert(0, str(pathlib.Path(__file__).parents[3] / "scripts"))
+sys.path.insert(0, str(pathlib.Path(__file__).parents[2] / "scripts"))
 import backfill_site_role_policies as bf  # noqa: E402
 
 
@@ -686,32 +709,105 @@ class _FakeIam:
         return {"PolicyDocument": self._policies[RoleName]}
 
 
-def _doc(*resources):
-    return {"Version": "2012-10-17",
-            "Statement": [{"Effect": "Allow", "Action": ["dynamodb:GetItem"],
-                           "Resource": list(resources)}]}
+@pytest.fixture
+def env(monkeypatch):
+    monkeypatch.setenv("ACCOUNT_ID", "111111111111")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    return monkeypatch
 
 
-def test_dynamodb_wildcard_is_detected():
-    iam = _FakeIam({"site-rt-a-abc123":
-                    _doc("arn:aws:dynamodb:r:a:table/site-data-a-abc123-*")})
-    assert bf.wildcard_roles(iam) == ["site-rt-a-abc123"]
+def _nosql_site(*tables):
+    return {"tier": "fullstack-nosql", "data_tables": list(tables)}
 
 
-def test_bare_prefix_log_group_is_detected():
-    """裸前缀日志组同样算通配——它会匹配到嵌套 site_id 的日志流（审计伪造）。"""
-    iam = _FakeIam({"site-rt-a-abc123":
-                    _doc("arn:aws:logs:r:a:log-group:/aws/lambda/site-a-abc123*")})
-    assert bf.wildcard_roles(iam) == ["site-rt-a-abc123"]
+def test_norm_is_insensitive_to_iam_normalization():
+    """IAM 会把单元素列表回成字符串、也不保证语句顺序 ⇒ 不能比 JSON 字符串。"""
+    a = {"Statement": [{"Effect": "Allow", "Action": "s3:GetObject",
+                        "Resource": "arn:1"},
+                       {"Effect": "Allow", "Action": ["logs:Put"],
+                        "Resource": ["arn:2", "arn:3"]}]}
+    b = {"Statement": [{"Effect": "Allow", "Action": ["logs:Put"],
+                        "Resource": ["arn:3", "arn:2"]},
+                       {"Effect": "Allow", "Action": ["s3:GetObject"],
+                        "Resource": ["arn:1"]}]}
+    assert bf._norm(a) == bf._norm(b)
 
 
-def test_exact_arns_are_not_flagged():
-    """精确 ARN 与日志组的 `:*`（stream 层）都不算通配。"""
-    iam = _FakeIam({"site-rt-a-abc123": _doc(
-        "arn:aws:dynamodb:r:a:table/site-data-a-abc123-notes",
-        "arn:aws:logs:r:a:log-group:/aws/lambda/site-a-abc123",
-        "arn:aws:logs:r:a:log-group:/aws/lambda/site-a-abc123:*")})
-    assert bf.wildcard_roles(iam) == []
+def test_check_roles_passes_when_actual_equals_expected(env):
+    import common
+    env.setattr(common, "get_site_consistent", lambda sid: _nosql_site("notes"))
+    good = json.loads(common.site_policy("a-abc123", "dynamodb", tables=["notes"]))
+    assert bf.check_roles(_FakeIam({"site-rt-a-abc123": good})) == []
+
+
+def test_check_roles_flags_a_wrong_account_policy_that_has_no_wildcard(env):
+    """**闸门判的是"等于期望"，不是"没有 `*`"。**
+
+    这条构造一个**除了账号号码全对、且没有任何通配**的 policy——它正是 v2 那版
+    只查 `*` 的闸门会放过、而站点访问自己的表会全部 AccessDenied 的形态
+    （Codex 复核指出）。错 region、漏表同理。
+    """
+    import common
+    env.setattr(common, "get_site_consistent", lambda sid: _nosql_site("notes"))
+    env.setenv("ACCOUNT_ID", "999999999999")            # 先用错账号造"实际"
+    actual = json.loads(common.site_policy("a-abc123", "dynamodb", tables=["notes"]))
+    env.setenv("ACCOUNT_ID", "111111111111")            # 期望按正确账号算
+    assert "*" not in json.dumps(actual), "这条用例的前提是它不含通配"
+    bad = bf.check_roles(_FakeIam({"site-rt-a-abc123": actual}))
+    assert len(bad) == 1 and "不一致" in bad[0][1]
+
+
+def test_check_roles_flags_a_missing_table(env):
+    """漏表同样不合格——新加的表会 AccessDenied，而 policy 里没有通配。"""
+    import common
+    env.setattr(common, "get_site_consistent",
+                lambda sid: _nosql_site("notes", "tags"))
+    stale = json.loads(common.site_policy("a-abc123", "dynamodb", tables=["notes"]))
+    bad = bf.check_roles(_FakeIam({"site-rt-a-abc123": stale}))
+    assert len(bad) == 1
+
+
+def test_check_roles_flags_an_orphan_role(env):
+    """sites 表里没有对应行的角色（下线清理失败留下的）也要报出来。"""
+    import common
+    env.setattr(common, "get_site_consistent", lambda sid: None)
+    iam = _FakeIam({"site-rt-gone-abc123": {"Statement": []}})
+    bad = bf.check_roles(iam)
+    assert len(bad) == 1 and "孤儿" in bad[0][1]
+
+
+def test_load_env_refuses_a_mismatched_account(monkeypatch):
+    """**凭证账号 ≠ config 目标账号 ⇒ 拒绝执行。**
+
+    不核对的话：凭证指向别的账号 ⇒ 那里没有 site-rt-* ⇒ 闸门看到"0 个不合格"
+    ⇒ dry-run/--apply/--check 全退 0，而目标账号里的旧通配角色一个都没动，
+    发布记录却显示 M01 已闭环（Codex 复核指出的 P1）。
+    """
+    class _Sts:
+        def get_caller_identity(self):
+            return {"Account": "999999999999"}
+    monkeypatch.setattr(bf.boto3, "client", lambda name, **kw: _Sts())
+    with pytest.raises(SystemExit, match="拒绝执行"):
+        bf._load_env()
+
+
+def test_load_env_overrides_stale_shell_values(monkeypatch):
+    """config 值必须**直接覆盖**，不能让 shell 残留胜出（不用 setdefault）。
+
+    仓库既有的两个迁移脚本 docstring 都明写了这条理由。
+    """
+    import configparser
+    cfg = configparser.ConfigParser(interpolation=None)
+    cfg.read(bf.ROOT / "site-builder" / "config.ini")
+    real_account = cfg["Platform"]["account_id"].strip()
+
+    class _Sts:
+        def get_caller_identity(self):
+            return {"Account": real_account}
+    monkeypatch.setattr(bf.boto3, "client", lambda name, **kw: _Sts())
+    monkeypatch.setenv("SITES_TABLE", "wrong-sites-table")
+    bf._load_env()
+    assert os.environ["SITES_TABLE"] != "wrong-sites-table"
 
 
 def test_engine_and_tables_come_from_the_site_row():
@@ -779,55 +875,130 @@ class NeedsManualReview(Exception):
 
 
 def _load_env():
-    """从 config.ini 下发 common.py 需要的环境变量（同 migrate_sites_to_blue_green）。"""
+    """从 config.ini 下发环境变量，并**核对当前凭证就是目标账号**。
+
+    **直接赋值，不用 setdefault**：config.ini 是部署脚本的唯一取值来源
+    （CLAUDE.md），setdefault 会让 shell 里残留的旧值静默改写写入目标。
+    `migrate_permissions._load_config` 与 `migrate_sites_to_blue_green._load_config`
+    的 docstring 都明写了这条，本脚本必须一致。
+
+    **STS 账号核对是硬要求**：若操作者的 AWS_PROFILE / 临时凭证指向另一个账号，
+    那里没有 `site-rt-*` 角色 ⇒ 闸门看到"0 个不合格"⇒ dry-run / --apply / --check
+    全部退 0，而**目标账号里的旧通配角色一个都没动**，发布记录却显示 M01 已闭环。
+    仅 ACCOUNT_ID 残留错误时更隐蔽：policy 会被写成指向错误账号的精确 ARN，
+    没有任何 `*`、闸门照样绿，而站点访问自己的表全部 AccessDenied。
+    """
     cfg = configparser.ConfigParser(interpolation=None)
-    cfg.read(ROOT / "site-builder" / "config.ini")
+    if not cfg.read(ROOT / "site-builder" / "config.ini"):
+        raise SystemExit("读不到 site-builder/config.ini")
     acct = cfg["Platform"]["account_id"].strip()
-    os.environ.setdefault("ACCOUNT_ID", acct)
-    os.environ.setdefault("AWS_DEFAULT_REGION", cfg["Platform"]["region"].strip())
-    os.environ.setdefault("SITES_TABLE", cfg["Deployer"]["sites_table"].strip())
-    os.environ.setdefault(
-        "RUNTIME_BOUNDARY_ARN", f"arn:aws:iam::{acct}:policy/site-runtime-boundary")
+    actual = boto3.client("sts").get_caller_identity()["Account"]
+    if actual != acct:
+        raise SystemExit(
+            f"当前凭证属于账号 {actual}，而 config.ini 的目标账号是 {acct}——"
+            "拒绝执行。切换 AWS_PROFILE / 凭证后重试。")
+    os.environ["ACCOUNT_ID"] = acct
+    os.environ["AWS_DEFAULT_REGION"] = cfg["Platform"]["region"].strip()
+    os.environ["SITES_TABLE"] = cfg["Deployer"]["sites_table"].strip()
+    os.environ["RUNTIME_BOUNDARY_ARN"] = (
+        f"arn:aws:iam::{acct}:policy/site-runtime-boundary")
     return cfg
 
 
-def _resources(doc: dict) -> list:
+def _norm(doc: dict) -> list:
+    """policy 文档 → 可比较形态。
+
+    **不能直接比 JSON 字符串**：IAM 会做自己的归一（单元素 Resource 列表可能
+    回来变成字符串，语句顺序不保证）。
+    """
     out = []
     for stmt in doc.get("Statement", []):
-        res = stmt.get("Resource", [])
-        out += res if isinstance(res, list) else [res]
-    return out
+        def _lst(key):
+            val = stmt.get(key, [])
+            return tuple(sorted(val if isinstance(val, list) else [val]))
+        out.append((stmt.get("Effect"), _lst("Action"), _lst("Resource")))
+    return sorted(out)
 
 
-def wildcard_roles(iam) -> list:
-    """带通配的 `site-rt-*` 角色名。**这是 S1 的硬发布闸门**：必须为空。
+def _actual_policy(iam, role_name: str):
+    """角色当前的 inline policy（读不到返回 None）。"""
+    try:
+        raw = iam.get_role_policy(
+            RoleName=role_name, PolicyName=POLICY_NAME)["PolicyDocument"]
+    except Exception:
+        return None
+    return raw if isinstance(raw, dict) else json.loads(urllib.parse.unquote(raw))
 
-    两类都算通配：
-      · DynamoDB 表 ARN 以 `*` 结尾 —— 会匹配嵌套 site_id 的其他站点的表；
-      · 日志组 ARN 以 `*` 结尾**但不是** `:*` —— 裸前缀，会匹配别的站点的
-        日志组（可写别人的日志流 = 审计伪造）。`:*` 是 stream 层，是对的。
-    """
-    bad = []
+
+def site_role_names(iam) -> list:
+    names = []
     for page in iam.get_paginator("list_roles").paginate():
-        for role in page["Roles"]:
-            name = role["RoleName"]
-            if not name.startswith(ROLE_PREFIX):
-                continue
-            try:
-                raw = iam.get_role_policy(
-                    RoleName=name, PolicyName=POLICY_NAME)["PolicyDocument"]
-            except Exception:
-                bad.append(name)        # 读不到就当不合格（fail-closed）
-                continue
-            doc = raw if isinstance(raw, dict) else json.loads(urllib.parse.unquote(raw))
-            for arn in _resources(doc):
-                if ":table/" in arn and arn.endswith("*"):
-                    bad.append(name)
-                    break
-                if "log-group:" in arn and arn.endswith("*") and not arn.endswith(":*"):
-                    bad.append(name)
-                    break
+        names += [r["RoleName"] for r in page["Roles"]
+                  if r["RoleName"].startswith(ROLE_PREFIX)]
+    return sorted(names)
+
+
+def check_roles(iam) -> list:
+    """→ [(role_name, 原因)]。**S1 的硬发布闸门**：必须为空。
+
+    判据是**实际 policy 逐项等于「从当前 sites 行推导出的期望 policy」**，
+    而不是"没有 `*`"。只查通配是不够的（Codex 复核指出）：指向**错误账号**、
+    **错误 region**、或**漏了某张表**的 policy 都没有 `*`，却同样不可用——
+    前两者会让站点访问自己的表 AccessDenied，后者会让新加的表 AccessDenied。
+    期望值由 `common.site_policy` 现算，所以这条闸门与运行时用的是同一份定义。
+    """
+    import common
+    bad = []
+    for name in site_role_names(iam):
+        site_id = name[len(ROLE_PREFIX):]
+        actual = _actual_policy(iam, name)
+        if actual is None:
+            bad.append((name, "读不到 inline policy（fail-closed 计为不合格）"))
+            continue
+        site = common.get_site_consistent(site_id) or {}
+        if not site:
+            bad.append((name, "sites 表里没有对应行（孤儿角色，需人工确认后删除）"))
+            continue
+        try:
+            engine, tables = plan_for(site_id, site)
+        except NeedsManualReview as exc:
+            bad.append((name, f"算不出期望 policy：{exc}"))
+            continue
+        expected = json.loads(common.site_policy(site_id, engine, tables=tables))
+        if _norm(actual) != _norm(expected):
+            bad.append((name, f"policy 与期望不一致（engine={engine} tables={tables}）"))
     return bad
+
+
+def verify_access(iam, site_id: str, tables: list) -> list:
+    """用 IAM 策略模拟器做功能验收 → [问题…]。只读。
+
+    比"policy 文本对不对"更直接：断言该站点的角色**能**访问自己的每张表、
+    且**不能**访问一个构造出来的嵌套邻居站点的表。模拟器会算 permissions
+    boundary，所以它反映的是真实判定而不是文本比较。
+    """
+    import common
+    problems = []
+    arn = common.site_role_arn(site_id)
+    region = os.environ["AWS_DEFAULT_REGION"]
+    acct = os.environ["ACCOUNT_ID"]
+
+    def _decide(table_name):
+        res = f"arn:aws:dynamodb:{region}:{acct}:table/{table_name}"
+        out = iam.simulate_principal_policy(
+            PolicySourceArn=arn, ActionNames=["dynamodb:GetItem"],
+            ResourceArns=[res])
+        return out["EvaluationResults"][0]["ResourceSpecificResults"][0][
+            "EvalResourceDecision"]
+
+    for logical in tables:
+        if _decide(common.site_table_name(site_id, logical)) != "allowed":
+            problems.append(f"访问自己的表 {logical} 被拒——backfill 写坏了")
+    # 构造一个"以本 site_id 为前缀"的邻居，它必须被拒（这正是 M01 的形态）
+    neighbour = common.site_table_name(f"{site_id}-probe-abc123", "notes")
+    if _decide(neighbour) == "allowed":
+        problems.append(f"仍能访问嵌套邻居的表 {neighbour}——通配没收干净")
+    return problems
 
 
 def plan_for(site_id: str, site: dict) -> tuple:
@@ -860,43 +1031,77 @@ def main() -> int:
     iam = boto3.client("iam")
 
     if args.check:
-        bad = wildcard_roles(iam)
-        print(f"带通配的 site-rt-* 角色：{len(bad)}")
-        for name in bad:
-            print(f"  !! {name}")
+        bad = check_roles(iam)
+        print(f"不合格的 site-rt-* 角色：{len(bad)}")
+        for name, reason in bad:
+            print(f"  !! {name}: {reason}")
         return 1 if bad else 0
 
-    targets = wildcard_roles(iam)
+    targets = check_roles(iam)
     print(f"待收敛的角色：{len(targets)}")
-    manual = []
-    for name in targets:
+    manual, failed = [], []
+    backup = {}
+    for name, reason in targets:
         site_id = name[len(ROLE_PREFIX):]
-        site = common.get_site(site_id) or {}
+        # **强一致读**：授权判定与 read-modify-write 都基于它
+        site = common.get_site_consistent(site_id) or {}
         try:
             engine, tables = plan_for(site_id, site)
         except NeedsManualReview as exc:
             manual.append(str(exc))
-            print(f"  跳过（需人工） {site_id}")
+            print(f"  跳过（需人工） {site_id}: {exc}")
             continue
         if not args.apply:
-            print(f"  计划 {site_id}: engine={engine} tables={tables}")
+            print(f"  计划 {site_id}: engine={engine} tables={tables}（当前：{reason}）")
             continue
+
+        # 覆盖前留一份旧 policy，供回滚（spec §7.3）
+        backup[name] = _actual_policy(iam, name)
         common.ensure_site_role(site_id, engine, tables=tables)
-        print(f"  已重写 {site_id}: engine={engine} tables={tables}")
+
+        # **写后复核**：backfill 与在线部署之间存在"读完→写入"的竞态
+        # （用户并发部署新增了一张表，我们会把它覆盖掉）。这里重读一次 sites 行，
+        # 若期间变过就按新值重算重写一次，然后逐项比对落地结果。
+        fresh = common.get_site_consistent(site_id) or {}
+        engine2, tables2 = plan_for(site_id, fresh)
+        if (engine2, tables2) != (engine, tables):
+            print(f"  站点 {site_id} 在写入期间被改动过，按新值重写：{tables2}")
+            common.ensure_site_role(site_id, engine2, tables=tables2)
+            engine, tables = engine2, tables2
+        expected = json.loads(common.site_policy(site_id, engine, tables=tables))
+        if _norm(_actual_policy(iam, name) or {}) != _norm(expected):
+            failed.append(f"{site_id}: 落地的 policy 与期望不一致")
+            continue
+        problems = verify_access(iam, site_id, tables) if engine == "dynamodb" else []
+        if problems:
+            failed.append(f"{site_id}: {problems}")
+            continue
+        print(f"  已重写并验证 {site_id}: engine={engine} tables={tables}")
+
+    if backup:
+        path = ROOT / "site-builder" / "scripts" / "backfill-old-policies.json"
+        path.write_text(json.dumps(backup, ensure_ascii=False, indent=2))
+        print(f"\n旧 policy 已备份到 {path.name}（回滚用；**它不进 git**）")
 
     if manual:
         print(f"\n需人工处理 {len(manual)} 个：")
         for line in manual:
             print(f"  - {line}")
+    if failed:
+        print(f"\n验证失败 {len(failed)} 个：")
+        for line in failed:
+            print(f"  - {line}")
 
     if args.apply:
-        left = wildcard_roles(iam)
-        print(f"\n闸门：仍带通配的角色 {len(left)}")
+        left = check_roles(iam)
+        print(f"\n闸门：不合格的角色 {len(left)}")
         if left:
-            print("  未收敛完，S1 不算交付完成：", left)
+            for name, reason in left:
+                print(f"  !! {name}: {reason}")
+            print("  未收敛完，S1 不算交付完成")
             return 1
-        print("  0 —— 已全部收敛")
-    return 1 if manual else 0
+        print("  0 —— 已全部收敛并通过功能验收")
+    return 1 if (manual or failed) else 0
 
 
 if __name__ == "__main__":
@@ -908,18 +1113,39 @@ if __name__ == "__main__":
 Run: `(cd site-builder/deployer && .venv/bin/pytest tests/test_backfill_site_role_policies.py -q)`
 Expected: PASS
 
+> **一处覆盖边界说明白**：`verify_access` 没有单测——它靠 IAM 策略模拟器，
+> 用 fake 去模拟模拟器只能测出"我怎么调它"，测不出"判定对不对"。
+> 它在 Task 10 Step 3 的 `--apply` 里被真机执行，那才是它有意义的地方。
+> 这是有意的取舍，不是遗漏。
+
 - [ ] **Step 5: dry-run 真机**
 
 Run: `cd "$(git rev-parse --show-toplevel)" && python3 site-builder/scripts/backfill_site_role_policies.py`
-Expected: 打印 `待收敛的角色：7`，7 行"计划"，`需人工处理 0 个`。**不要在这一步加 `--apply`**——真写属于 Task 10 的部署序列（必须在 deployer 栈部署之后）
+Expected: 先通过 STS 账号核对（账号不符会直接 `SystemExit`），然后打印
+`待收敛的角色：7` 与 7 行"计划"，且**没有**"需人工处理"。
+**不要在这一步加 `--apply`**——真写属于 Task 10 的部署序列（必须在 deployer 栈部署之后）。
+
+> 若这一步打印的待收敛数不是 7，先停下核对：实测基线是 7 个角色全部不合格
+> （2 个 DynamoDB 通配 + 7 个日志组裸前缀）。数字变小可能意味着凭证指向了别的账号
+> ——但 STS 核对应该已经先拦住那种情况。
 
 - [ ] **Step 6: 扫描 + Commit**
 
+先把备份文件加进 `.gitignore`（`--apply` 会把旧 policy 写到
+`site-builder/scripts/backfill-old-policies.json` 供回滚，它含账号 ARN，**不能进 git**）：
+
 ```bash
-git add site-builder/scripts/backfill_site_role_policies.py \
+cd "$(git rev-parse --show-toplevel)"
+printf 'site-builder/scripts/backfill-old-policies.json\n' >> .gitignore
+
+bash site-builder/scripts/scan_staged_secrets.sh \
+     --files site-builder/scripts/backfill_site_role_policies.py \
+             site-builder/deployer/tests/test_backfill_site_role_policies.py || exit 1
+git add .gitignore \
+        site-builder/scripts/backfill_site_role_policies.py \
         site-builder/deployer/tests/test_backfill_site_role_policies.py
-bash site-builder/scripts/scan_staged_secrets.sh
-git commit -m "feat(s1/m01): 存量角色 backfill + 通配角色数为 0 的硬闸门——通配向前看，懒收敛等于给未来站点留门"
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1
+git commit -m "feat(s1/m01): 存量角色 backfill + 「实际==期望」硬闸门 + STS 账号核对"
 ```
 
 ---
@@ -931,11 +1157,13 @@ git commit -m "feat(s1/m01): 存量角色 backfill + 通配角色数为 0 的硬
 - Test: `site-builder/deployer/tests/test_permissions.py`
 
 **Interfaces:**
-- Produces: `permissions.PolicyDataInvalid`（异常）；`permissions.effective_policy(site: dict) -> dict`，返回 `{"require_login": bool, "allowed_users": "org" | list[str], "collaborators": list[str], "owner": str}`。Task 5 的四个 writer、Task 6 的错误映射都依赖这两个名字。
+- Produces: `permissions.PolicyDataInvalid`（异常）；`permissions.effective_policy(site: dict) -> dict`，返回 `{"require_login": bool, "allowed_users": "org" | list[str], "collaborators": list[str], "owner": str}`。Task 5 的三个投影 writer、Task 6 的错误映射都依赖这两个名字。
 
 - [ ] **Step 1: 写四条会红的用例**
 
-加到 `site-builder/deployer/tests/test_permissions.py`：
+加到 `site-builder/deployer/tests/test_permissions.py`。
+**注意该文件把模块 import 成 `perm`**（`import permissions as perm`，见其首行），
+所以下面一律用 `perm.` 而不是 `permissions.`：
 
 ```python
 def test_wrong_typed_require_login_is_rejected_not_laundered():
@@ -951,15 +1179,15 @@ def test_wrong_typed_require_login_is_rejected_not_laundered():
     site = {"site_id": "s-1", "owner": "o@example.test",
             "require_login": Decimal(0), "allowed_users": "org",
             "collaborators": []}
-    with pytest.raises(permissions.PolicyDataInvalid, match="require_login"):
-        permissions.effective_policy(site)
+    with pytest.raises(perm.PolicyDataInvalid, match="require_login"):
+        perm.effective_policy(site)
 
 
 def test_missing_collaborators_means_empty_list():
     """collaborators 是**唯一**允许缺失的字段：缺失有唯一安全解释（没有协作者）。"""
     site = {"site_id": "s-1", "owner": "o@example.test",
             "require_login": True, "allowed_users": "org"}
-    assert permissions.effective_policy(site)["collaborators"] == []
+    assert perm.effective_policy(site)["collaborators"] == []
 
 
 @pytest.mark.parametrize("field", ["require_login", "allowed_users", "owner"])
@@ -973,8 +1201,8 @@ def test_missing_ambiguous_field_is_rejected(field):
     site = {"site_id": "s-1", "owner": "o@example.test", "require_login": True,
             "allowed_users": "org", "collaborators": []}
     del site[field]
-    with pytest.raises(permissions.PolicyDataInvalid, match=field):
-        permissions.effective_policy(site)
+    with pytest.raises(perm.PolicyDataInvalid, match=field):
+        perm.effective_policy(site)
 
 
 def test_rejection_message_names_the_site_and_the_repair():
@@ -989,8 +1217,8 @@ def test_rejection_message_names_the_site_and_the_repair():
     site = {"site_id": "s-abc", "owner": "o@example.test",
             "require_login": Decimal(0), "allowed_users": "org",
             "collaborators": []}
-    with pytest.raises(permissions.PolicyDataInvalid) as excinfo:
-        permissions.effective_policy(site)
+    with pytest.raises(perm.PolicyDataInvalid) as excinfo:
+        perm.effective_policy(site)
     msg = str(excinfo.value)
     assert "s-abc" in msg, "文案没点名 site_id"
     assert "require_login" in msg, "文案没点名坏字段"
@@ -1020,7 +1248,7 @@ class PolicyDataInvalid(Exception):
 
 ```python
 def effective_policy(site: dict) -> dict:
-    """从 sites 行解出可投影的策略。**四个 writer 的唯一入口。**
+    """从 sites 行解出可投影的策略。**三个投影 writer 的唯一入口。**
 
     判据只有一条：**每个字段要么类型明确，要么它的「缺失」有唯一安全解释**；
     两者都不成立即抛 PolicyDataInvalid。
@@ -1100,13 +1328,13 @@ Expected: PASS
 ```bash
 git add site-builder/deployer/functions/permissions.py \
         site-builder/deployer/tests/test_permissions.py
-bash site-builder/scripts/scan_staged_secrets.sh
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1
 git commit -m "feat(s1/m02): 新增 effective_policy 严格解析 + 带审计的包装——坏数据一律拒绝投影，不猜方向"
 ```
 
 ---
 
-### Task 5: 四个 writer 切到 `effective_policy` + AST 守卫
+### Task 5: 三个投影 writer 切到 `effective_policy_audited` + AST 守卫
 
 **Files:**
 - Modify: `site-builder/deployer/functions/permissions.py:507-511`（`write_permissions`）
@@ -1203,17 +1431,48 @@ def test_every_route_permission_writer_calls_effective_policy():
                 and "require_auth" in s.value for s in ast.walk(node))
             if not projects:
                 continue
-            ok_names = {"effective_policy", "effective_policy_audited"}
+            # **只接受带审计的那个入口。** 接受纯 effective_policy 会让
+            # "某个 writer 绕过审计包装"照样通过守卫（Codex 复核指出）。
             calls_it = any(
                 isinstance(c, ast.Call)
-                and (getattr(c.func, "id", None) in ok_names
-                     or getattr(c.func, "attr", None) in ok_names)
+                and (getattr(c.func, "id", None) == "effective_policy_audited"
+                     or getattr(c.func, "attr", None) == "effective_policy_audited")
                 for c in ast.walk(node))
             if not calls_it:
                 offenders.append(f"{rel}::{node.name}:{node.lineno}")
     assert not offenders, (
-        "这些函数在投影 require_auth 但没走 effective_policy："
-        f"{offenders}。新增路由权限 writer 必须调它")
+        "这些函数在投影 require_auth 但没走 effective_policy_audited："
+        f"{offenders}。新增路由权限 writer 必须调它（带审计的那个）")
+
+
+def test_no_other_module_projects_require_auth():
+    """上一条只扫两个文件 —— 这一条保证不会有**第三个模块**偷偷开始投影。
+
+    上一条的扫描边界是 permissions.py + register_route.py（路由权限投影的
+    两个归属地）。若有人把新的投影 writer 放进第三个模块，上一条不会发现它
+    （Codex 复核指出的边界问题）。所以这里断言 `functions/` 下**只有**这两个
+    文件（外加 smoke_test 的白名单例外）出现 `require_auth` 字面量：
+    谁在别处引入它，这条就红，逼他要么挪位置、要么把上一条的边界一起扩。
+
+    smoke_test.py 是显式例外：它那里的 `require_auth` 是个**局部变量名**，
+    用来决定冒烟该断言 302 还是 200，不是往路由写投影。
+    """
+    import ast
+    import pathlib
+    allowed = {"permissions.py", "register_route.py", "smoke_test.py"}
+    root = pathlib.Path(__file__).parents[1] / "functions"
+    offenders = []
+    for path in sorted(root.glob("*.py")):
+        if path.name in allowed:
+            continue
+        for node in ast.walk(ast.parse(path.read_text())):
+            if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                    and "require_auth" in node.value):
+                offenders.append(f"{path.name}:{node.lineno}")
+    assert not offenders, (
+        f"这些模块出现了 require_auth 字面量：{offenders}。"
+        "若它们在投影路由权限，必须走 effective_policy_audited 并把上一条守卫的"
+        "扫描边界一起扩；若只是读取，请加进本用例的白名单并说明理由")
 ```
 
 加到 `site-builder/deployer/tests/test_permissions.py`（**spec §6.1 第 1 条**，
@@ -1227,21 +1486,22 @@ def test_an_unrelated_permission_change_does_not_flip_a_wrong_typed_row_public(a
     ——所以"只加了个协作者"会顺带把 require_auth 重投影一遍。这是 M02 触发面
     比想象大的原因，也是这条端到端用例存在的理由（上一条只覆盖部署路径）。
     """
-    from decimal import Decimal
+    import os
     import pytest
     import common
     common.upsert_site("s-1", owner="o@example.test", name="s",
                        status="ACTIVE", allowed_users="org",
                        collaborators=[], permissions_rev=1)
-    # 直接把行改坏（模拟迁移脚本 / 人工修库 / 旧 writer 留下的形态）
-    common._ddb().update_item(
+    # 直接把行改坏（模拟迁移脚本 / 人工修库 / 旧 writer 留下的形态）。
+    # 低层 client 走 perm._ddb_client()——common 没有 _ddb()。
+    perm._ddb_client().update_item(
         TableName=os.environ["SITES_TABLE"],
         Key={"site_id": {"S": "s-1"}},
         UpdateExpression="SET require_login = :bad",
         ExpressionAttributeValues={":bad": {"N": "0"}})
-    with pytest.raises(permissions.PolicyDataInvalid, match="require_login"):
-        permissions.set_collaborators("s-1", actor="o@example.test",
-                                      add=["c@example.test"])
+    with pytest.raises(perm.PolicyDataInvalid, match="require_login"):
+        perm.set_collaborators("s-1", actor="o@example.test",
+                               add=["c@example.test"])
 ```
 
 > `aws` 是 deployer 测试里既有的 moto fixture（`test_permissions.py` 已在用）。
@@ -1249,8 +1509,9 @@ def test_an_unrelated_permission_change_does_not_flip_a_wrong_typed_row_public(a
 
 - [ ] **Step 2: 运行确认它们红**
 
-Run: `(cd site-builder/deployer && .venv/bin/pytest tests/test_seed_permissions.py tests/test_permissions.py -k "refuses_to_launder or do_not_read_policy_fields_directly or calls_effective_policy or unrelated_permission_change" -q)`
-Expected: 四条都 FAIL——两条行为用例因为当前不抛错而是洗成 False；两条 AST 用例因为三个 writer 都还在直接取值/都没调 `effective_policy`
+Run: `(cd site-builder/deployer && .venv/bin/pytest tests/test_seed_permissions.py tests/test_permissions.py -k "refuses_to_launder or do_not_read_policy_fields_directly or calls_effective_policy or unrelated_permission_change or no_other_module_projects" -q)`
+Expected: 前四条 FAIL——两条行为用例因为当前不抛错而是洗成 False；两条 AST 用例因为三个 writer 都还在直接取值/都没调 `effective_policy_audited`。
+**第五条（第三模块边界哨兵）现在就应该 PASS**——它防的是将来，不是本次要修的缺陷
 
 > **每次改了测试名就回来核一遍 `-k`。** v1 在这里、Task 8 与 Task 9 都留下了
 > 选不中新测试的过滤器（Task 9 那个还是改了测试名忘了改过滤器的陈旧串），
@@ -1283,7 +1544,7 @@ Expected: 四条都 FAIL——两条行为用例因为当前不抛错而是洗�
 
 ```python
 def _route_item(event, site: dict, owner: str, subdomain: str) -> dict:
-    # 坏数据一律拒绝（M02 的第四个 writer）。抛错发生在**提交点之前**
+    # 坏数据一律拒绝（M02 的部署路径 writer）。抛错发生在**提交点之前**
     # ⇒ 线上零影响，同 upload_frontend 空产物即拒的模式。
     pol = permissions.effective_policy_audited(site, actor=owner)
     return {"subdomain": {"S": subdomain},
@@ -1355,9 +1616,10 @@ Expected: PASS
 git add site-builder/deployer/functions/permissions.py \
         site-builder/deployer/functions/register_route.py \
         site-builder/scripts/migrate_permissions.py \
+        site-builder/deployer/tests/test_permissions.py \
         site-builder/deployer/tests/test_seed_permissions.py \
         site-builder/deployer/tests/test_migrate_permissions.py
-bash site-builder/scripts/scan_staged_secrets.sh
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1
 git commit -m "fix(s1/m02): 三个投影 writer 统一走 effective_policy + 自动发现新 writer 的守卫"
 ```
 
@@ -1438,26 +1700,56 @@ Expected: FAIL，实际 `statusCode` 是 500
 加到 `site-builder/deployer/tests/test_permissions.py`：
 
 ```python
-def test_every_projection_writer_audits_its_rejection(aws, monkeypatch):
-    """三个投影 writer 的拒绝路径都要留下 reject_policy_projection。
+def test_write_path_rejection_is_audited_and_writes_nothing(aws, monkeypatch):
+    """走**真实 writer**（写路径）：拒绝时落一条审计，且零写副作用。
 
-    v1 只在 write_permissions 包了 try/except，resync_route 与 register_route
-    直接调 effective_policy ⇒ 它们的拒绝无记录。现在审计在**一处包装**里，
-    这条断言的是"三个 writer 都用了那个包装"的可观测后果。
+    v1 这条只调 `effective_policy_audited` 自己 ⇒ 是循环论证，
+    "某个 writer 绕过包装"时照样绿（Codex 复核指出）。现在它通过
+    `set_collaborators` 走完整写路径。
     """
+    import os
+    import common
     import ops_log
-    calls = []
-    monkeypatch.setattr(ops_log, "record",
-                        lambda **kw: calls.append(kw["action"]))
+    import pytest
+    common.upsert_site("s-1", owner="o@example.test", name="s", status="ACTIVE",
+                       allowed_users="org", collaborators=[], permissions_rev=1)
+    perm._ddb_client().update_item(
+        TableName=os.environ["SITES_TABLE"], Key={"site_id": {"S": "s-1"}},
+        UpdateExpression="SET require_login = :bad",
+        ExpressionAttributeValues={":bad": {"N": "0"}})
+    before = common.get_site_consistent("s-1")["permissions_rev"]
+
+    actions = []
+    monkeypatch.setattr(ops_log, "record", lambda **kw: actions.append(kw["action"]))
+    with pytest.raises(perm.PolicyDataInvalid):
+        perm.set_collaborators("s-1", actor="o@example.test",
+                               add=["c@example.test"])
+    assert actions == ["reject_policy_projection"], "拒绝没有留下审计"
+    assert common.get_site_consistent("s-1")["permissions_rev"] == before, \
+        "拒绝之后 rev 变了 —— 说明拒绝发生在写入之后，位置错了"
+
+
+def test_deploy_path_rejection_is_audited(aws, monkeypatch):
+    """走**真实 writer**（部署路径）：`_route_item` 的拒绝也要落审计。"""
+    from decimal import Decimal
+    import ops_log
+    import pytest
+    import register_route
+    actions = []
+    monkeypatch.setattr(ops_log, "record", lambda **kw: actions.append(kw["action"]))
     bad = {"site_id": "s-1", "owner": "o@example.test",
-           "require_login": 0, "allowed_users": "org", "collaborators": []}
-    for fn in (lambda: permissions.effective_policy_audited(bad, actor="a@example.test"),):
-        try:
-            fn()
-        except permissions.PolicyDataInvalid:
-            pass
-    assert calls == ["reject_policy_projection"]
+           "require_login": Decimal(0), "allowed_users": "org", "collaborators": []}
+    with pytest.raises(perm.PolicyDataInvalid):
+        register_route._route_item({"site_id": "s-1", "job_id": "job-1",
+                                    "api_target": ""},
+                                   bad, "o@example.test", "app-s-1")
+    assert actions == ["reject_policy_projection"]
 ```
+
+> **覆盖边界说清楚**：这两条端到端覆盖写路径与部署路径。第三个 writer
+> `resync_route` 的"走了带审计的入口"由 Task 5 的 AST 守卫保证
+> （它现在**只接受** `effective_policy_audited`，调纯函数会红），
+> 不再为它单独搭一套 admin 夹具。这是有意的取舍，不是遗漏。
 
 - [ ] **Step 6: 运行三个包**
 
@@ -1475,8 +1767,9 @@ Expected: 三个都 PASS
 ```bash
 git add site-builder/panel/handler.py site-builder/mcp/server.py \
         site-builder/deployer/functions/permissions.py \
+        site-builder/deployer/tests/test_permissions.py \
         site-builder/panel/tests/test_handler.py
-bash site-builder/scripts/scan_staged_secrets.sh
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1
 git commit -m "fix(s1/m02): PolicyDataInvalid → panel 409 / MCP 可读错误 + 三个 writer 的拒绝审计断言"
 ```
 
@@ -1693,7 +1986,7 @@ git add site-builder/auth/session.py site-builder/auth/login_handler.py \
         site-builder/auth/tests/test_session.py \
         site-builder/auth/tests/test_upgrade_code.py \
         site-builder/auth/tests/test_login_handler.py
-bash site-builder/scripts/scan_staged_secrets.sh
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1
 git commit -m "fix(s1/m05): 会话 token 加 typ + verify 必填 expected_typ——切断升级码当会话用与无限续期"
 ```
 
@@ -1863,7 +2156,7 @@ Expected: PASS
 ```bash
 git add router/infrastructure/lambda/origin_request.py \
         router/infrastructure/lambda/test_edge_auth.py
-bash site-builder/scripts/scan_staged_secrets.sh
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1
 git commit -m "fix(s1/m05): Edge verifier 要求 typ=session + 跨组件正向向量——与 auth/session.py 同步"
 ```
 
@@ -1994,7 +2287,7 @@ Expected: PASS
 ```bash
 git add router/infrastructure/lambda/origin_request.py \
         router/infrastructure/lambda/test_edge_auth.py
-bash site-builder/scripts/scan_staged_secrets.sh
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1
 git commit -m "fix(s1/m06): Edge 取全部同名 sb_session 逐个验签 + 候选上限——关掉 cookie 遮蔽 DoS"
 ```
 
@@ -2098,7 +2391,7 @@ Expected: 最终打印 `status=Deployed`
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"
-# 硬闸门：通配角色数必须为 0。非 0 就不算 S1 交付完成
+# 硬闸门：不合格角色数 == 0（实际 policy 必须逐项等于期望）。非 0 就不算 S1 交付完成
 python3 site-builder/scripts/backfill_site_role_policies.py --check
 
 python3 site-builder/scripts/verify_deployed_components.py   # ② 之后必跑：唯一能发现产物陈旧的闸门
@@ -2150,7 +2443,7 @@ Expected: 闸门打印 `带通配的 site-rt-* 角色：0` 且退出码 0；其�
 
 ```bash
 git add site-builder/DEPLOY.md
-bash site-builder/scripts/scan_staged_secrets.sh
+bash site-builder/scripts/scan_staged_secrets.sh || exit 1
 git commit -m "docs(s1): 部署顺序、两波重登、回滚逆序、两个硬闸门"
 ```
 
@@ -2161,14 +2454,14 @@ git commit -m "docs(s1): 部署顺序、两波重登、回滚逆序、两个硬�
 | spec 章节 | 覆盖任务 |
 |---|---|
 | §4.1 M02 `effective_policy` 判据表 | T4 Step 3 |
-| §4.1 四个 writer | T5 Step 3–6 |
+| §4.1 三个投影 writer + 一个迁移入口 | T5 Step 3–6（迁移入口见 Step 6，它不调 effective_policy） |
 | §4.1 `resync_route` docstring 论证重写 | T5 Step 4 |
 | §4.2 `site_table_name` | T2 |
 | §4.2 `site_policy` 精确 ARN / `tables` 接口约定 / 日志组 | T3 |
 | §4.2 GSI 触发器 | T3 Step 1 的 `test_no_gsi_support_yet_so_index_arns_are_not_needed`。**v1 把这条记成"精确 ARN 断言顺带覆盖"是错的**——那三条压根不看索引 ARN |
 | §4.2.1 存量角色 backfill | T3c |
 | §4.2.1 `tier_engine` 唯一定义 | T3b |
-| §7.2 「通配角色数 == 0」硬闸门 | T3c（脚本自带）+ T10 Step 5（`--check`） |
+| §7.2 「不合格角色数 == 0」硬闸门 | T3c（脚本自带）+ T10 Step 5（`--check`） |
 | §7.1 CloudFront 传播等待（在 router 之后） | T10 Step 4 |
 | §4.3 `expected_typ` 必填 + 两个调用方 | T7 |
 | §4.3 Edge 侧 | T8 |
