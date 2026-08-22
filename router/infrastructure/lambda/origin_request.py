@@ -479,13 +479,32 @@ def _verify_session_jwt(token: str) -> dict | None:
         return None
 
 
-def _get_cookie(request, name: str) -> str | None:
+# 同名 sb_session 的候选上限。正常 1 条、病态 2 条，8 留足余量又不给放大空间。
+# 每次验签是一次 SHA256 HMAC（微秒级），且单条 Cookie 头受浏览器/CloudFront
+# 约 8KB 限制、N 本就有界——显式上限便宜，且把意图写进代码。
+MAX_SESSION_COOKIE_CANDIDATES = 8
+
+
+def _get_cookies(request, name: str) -> list:
+    """同名 cookie 的**全部**值，按 header 顺序。
+
+    **为什么不能只取第一条**（M06，已本地复现）：`sb_session` 是顶域 cookie
+    （`Domain=.{base}`），HttpOnly 只阻止 `document.cookie` 覆盖
+    **同 (name, domain, path)** 的那一条。站点页面 JS 写
+    `sb_session=garbage; domain=.{base}; path=/api` 是**新建第二条**，浏览器不拦；
+    RFC 6265 §5.4.2 规定路径更长的先发 ⇒ 只取第一条就会取到垃圾值 ⇒
+    全平台（含 console）的 /api/* 持久 302，且重新登录不会清掉遮蔽项。
+
+    **这只关掉 DoS，不关身份混淆**：攻击者若持有另一个**合法** token，
+    注入后它仍会先被取到并验签通过。根治是 host-only 会话（独立成包）。
+    """
+    out = []
     for header in request.get("headers", {}).get("cookie", []):
         for part in header["value"].split(";"):
             k, _, v = part.strip().partition("=")
             if k == name:
-                return v
-    return None
+                out.append(v)
+    return out
 
 
 # 平台保留 cookie：只有 auth-service 能签发，绝不能到达站点代码。
@@ -603,8 +622,12 @@ def _check_auth(request, route, host, sink=None):
         print(f"[WARN] route {route.get('subdomain')!r} 的 require_auth 不是布尔"
               f"（{type(require_auth).__name__}={require_auth!r}），按需要登录处理")
 
-    token = _get_cookie(request, "sb_session")
-    claims = _verify_session_jwt(token) if token else None
+    # 逐个尝试同名候选，任一验签通过即放行（M06）。取上限防放大。
+    claims = None
+    for token in _get_cookies(request, "sb_session")[:MAX_SESSION_COOKIE_CANDIDATES]:
+        claims = _verify_session_jwt(token)
+        if claims:
+            break
     if not claims:
         return _redirect_login(host, request.get("uri", "/"),
                                request.get("querystring", ""))

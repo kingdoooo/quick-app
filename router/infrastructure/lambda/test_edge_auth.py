@@ -674,3 +674,44 @@ def test_edge_rejects_falsy_typ_claims(bad_typ):
                        hashlib.sha256).digest())
     assert orq._verify_session_jwt(f"{header}.{payload}.{sig}") is None, (
         f"typ={bad_typ!r} 被当成有效会话——假值不等于'不用查'")
+
+
+# ---- S1/M06: 同名 cookie 全取并逐个验签 ----
+
+
+def test_a_garbage_cookie_in_front_does_not_lock_the_user_out():
+    """两条同名 sb_session、第一条是垃圾 ⇒ 仍放行。
+
+    M06：`sb_session` 是顶域 cookie（`Domain=.{base}`），而 HttpOnly 只阻止
+    `document.cookie` 覆盖**同 (name, domain, path)** 的那一条。站点页面 JS 写
+    `sb_session=garbage; domain=.{base}; path=/api` 是**新建第二条**，浏览器不拦；
+    RFC 6265 §5.4.2 规定路径更长的先发 ⇒ 垃圾值先被取到 ⇒ 全平台 /api/* 持久 302，
+    且重新登录（写 path=/）不会清掉遮蔽项。已本地复现。
+    """
+    good = _jwt(email="v@example.test")
+    request = _req(cookie=f"sb_session=garbage; sb_session={good}")
+    assert orq._get_cookies(request, "sb_session") == ["garbage", good]
+    # 放行 = _check_auth 返回 None，并注入了真身份
+    assert orq._check_auth(request, ROUTE_AUTH, "app-x.example.test") is None
+    assert request["headers"]["x-user-email"][0]["value"] == "v@example.test"
+
+
+def test_only_the_first_candidates_are_tried():
+    """上限是**行为**约束而不是一个常量断言——第 9 条之后不再尝试。
+
+    防的是"注入 N 条 cookie 压 HMAC"这种放大。把好 token 放在第 9 位，
+    断言它**不**被放行；这样上限被调大或调没了，这条都会红。
+    """
+    good = _jwt(email="v@example.test")
+    garbage = "; ".join(f"sb_session=x{i}" for i in range(8))
+    request = _req(cookie=f"{garbage}; sb_session={good}")
+    assert len(orq._get_cookies(request, "sb_session")) == 9
+    assert orq._check_auth(request, ROUTE_AUTH, "app-x.example.test") is not None, \
+        "第 9 条候选不应被尝试（上限失效了）"
+
+
+def test_reserved_cookies_are_still_stripped_in_full():
+    """回归：改 _get_cookies 时不要顺手动坏"剥掉全部同名保留 cookie"。"""
+    request = _req(cookie="sb_session=a; sb_session=b; site_own=keep")
+    orq._strip_reserved_cookies(request)
+    assert request["headers"]["cookie"][0]["value"] == "site_own=keep"
