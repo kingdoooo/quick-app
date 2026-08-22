@@ -120,6 +120,39 @@ def test_seed_is_noop_when_both_fields_present(aws):
     assert after.get("permissions_rev") == before.get("permissions_rev")
 
 
+def test_seeded_fields_match_the_deploy_path():
+    """`permissions._SEEDED_BY_FIRST_DEPLOY` 必须等于 seed **真正**写的那几个字段。
+
+    "字段缺失 ⇒ 成功部署一次就会补上"这条建议的真假只由本文件下面那段
+    UpdateExpression 决定，而给出建议的代码在另一个模块里。两处漂移的后果是
+    用户收到一条**不可执行**的指引：照它去部署，`_route_item` 撞上同一条拒绝，
+    没有出口（S1 最终复核抓到的就是 `owner` 这一处——文案说部署会补，
+    seed 的 if_not_exists 里根本没有它）。
+    所以名单按 `_seed_permissions_if_absent` 的源码现取，不在文案侧手抄第二份。
+    """
+    import ast
+    import pathlib
+    import re
+
+    import permissions
+    src = (pathlib.Path(__file__).parents[1] / "functions"
+           / "register_route.py").read_text()
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef)
+              and n.name == "_seed_permissions_if_absent")
+    seeded = set(re.findall(r"if_not_exists\((\w+),",
+                            ast.get_source_segment(src, fn)))
+    assert seeded, ("取不到 seed 的 if_not_exists 字段清单——判据跟不上代码，"
+                    "本条正在空转。**先修判据**，不要改下面的期望集合")
+    assert seeded == set(permissions._SEEDED_BY_FIRST_DEPLOY), (
+        f"seed 实际初始化 {sorted(seeded)}，而 permissions 的文案按 "
+        f"{sorted(permissions._SEEDED_BY_FIRST_DEPLOY)} 给建议——"
+        "两边不一致就意味着某个字段的缺失会收到一条错的修法")
+    assert "owner" not in seeded, (
+        "seed 开始写 owner 了：缺 owner 的行现在**确实**能靠部署一次修好，"
+        "于是 REPAIR_ABSENT_UNSEEDED 那一支该跟着改（把 owner 移进 seed 名单）")
+
+
 def test_deploy_path_refuses_to_launder_a_wrong_typed_row(monkeypatch):
     """部署路径（register_route）遇到错类型行必须拒绝，不能洗成公开。
 
@@ -347,54 +380,102 @@ def test_every_route_permission_writer_calls_effective_policy():
         "这一步故意需要人点头：新增一个能改站点访问策略的写入点，值得有人看一眼。")
 
 
+# 允许出现 `require_auth` 字面量的位置，**按相对 `site-builder/` 的路径写**。
+# 不能按文件名写：按名字豁免 `permissions.py` 会连带豁免 `panel/permissions.py`
+# ——那恰恰是本轮要盯住的那一个（部署期副本，或者一份真的手抄）。
+_REQUIRE_AUTH_ALLOWED = {
+    "deployer/functions/permissions.py",
+    "deployer/functions/register_route.py",
+    # smoke_test.py：那里的 `require_auth` 是个**局部变量名**，用来决定冒烟该
+    # 断言 302 还是 200，不是往路由写投影。
+    "deployer/functions/smoke_test.py",
+}
+
+
 def test_no_other_module_projects_require_auth():
     """上一条只扫两个文件 —— 这一条保证不会有**第三个模块**偷偷开始投影。
 
     上一条的扫描边界是 permissions.py + register_route.py（路由权限投影的
     两个归属地）。若有人把新的投影 writer 放进第三个模块，上一条不会发现它。
-    所以这里断言 `functions/` 下**只有**这两个文件（外加 smoke_test 的白名单
-    例外）出现**非 docstring** 的 `require_auth` 字面量：谁在别处引入它，这条
-    就红，逼他要么挪位置、要么把上一条的边界一起扩。
+    所以这里断言那两个文件（外加 smoke_test 的白名单例外）之外**没有**
+    **非 docstring** 的 `require_auth` 字面量：谁在别处引入它，这条就红，
+    逼他要么挪位置、要么把上一条的边界一起扩。
 
-    **docstring 不算，但也不给那三个文件开整文件白名单**——整文件豁免会让
-    第三模块的新 writer 藏进被豁免的文件里。
+    **扫描范围是 `deployer/functions` + `panel` + `mcp` + `key-proxy`，不是只有
+    `functions/`**（S1 最终复核指出）：`permissions.py` 被复制进那三个包的产物，
+    而 panel 与 MCP 的 Lambda 环境里**已经**有 `ROUTING_TABLE`
+    （deploy_panel.py / deploy_agentcore.py），所以往 `panel/api.py` 加一个投影
+    writer 是真的能跑通的——而"panel 不许自己手写投影"此前只以散文形式写在
+    `permissions.resync_route` 的 docstring 里，没有任何守卫。M01 的表名守卫与
+    tier 守卫都已按同一理由扫整个 `site-builder/`，M02 这一条漏了。
+
+    **`deploy_*.py` 与 `tests/` 的排除是判据的一部分，不是图省事，别"顺手收紧"**：
+    `deploy_panel.py` 与 `deploy_key_proxy.py` 合法地写**平台**路由 item
+    （console / mcp 子域的 `require_auth: True/False`）。那两条路由**没有 sites
+    行**，根本不能过 `effective_policy`（它要的 owner / allowed_users 那几个字段
+    对平台子域不存在）。把它们收进来只会得到两个永远修不掉的假阳性，
+    而假阳性的下一步是有人给守卫加路径豁免——那才是真的把洞开出来。
+
+    **docstring 不算，但也不给白名单里的文件开整文件豁免**（白名单是路径级、
+    逐文件的）——整目录豁免会让新 writer 藏进被豁免的目录里。
     这条故意比上一条**宽**（读取也报），错在"多咬"而不是"漏咬"：
-    第三模块合法读取该字段的场景要显式进白名单并说明理由。
-
-    smoke_test.py 是显式例外：它那里的 `require_auth` 是个**局部变量名**，
-    用来决定冒烟该断言 302 还是 200，不是往路由写投影。
+    合法读取该字段的场景要显式进 `_REQUIRE_AUTH_ALLOWED` 并说明理由。
     """
     import pathlib
-    allowed = {"permissions.py", "register_route.py", "smoke_test.py"}
-    root = pathlib.Path(__file__).parents[1] / "functions"
-    offenders = _require_auth_offenders(root, allowed)
+    sb = pathlib.Path(__file__).parents[2]           # site-builder/
+    offenders = _require_auth_offenders(
+        sb / "deployer" / "functions", sb / "panel", sb / "mcp", sb / "key-proxy",
+        allowed=_REQUIRE_AUTH_ALLOWED, base=sb)
     assert not offenders, (
         f"这些模块出现了 require_auth 字面量（docstring 除外）：{offenders}。"
         "若它们在投影路由权限，必须走 effective_policy_audited 并把上一条守卫的"
-        "扫描边界一起扩；若只是读取，请加进本用例的白名单并说明理由")
+        "扫描边界一起扩；若只是读取，请加进 _REQUIRE_AUTH_ALLOWED 并说明理由")
 
 
-def _require_auth_offenders(root, allowed=frozenset()) -> list:
-    """root 下所有 .py 里非 docstring 的 `require_auth` 字面量 → [file:line…]。
+# 扫描时一律跳过的目录名。`tests` 在内：测试里出现这个字面量是正常的
+# （断言路由 item 长什么样），它们不是投影 writer。
+_SCAN_SKIP_DIRS = (".venv", "cdk.out", "__pycache__", "build", "node_modules",
+                   "tests")
+
+
+def _require_auth_offenders(*roots, allowed=frozenset(), base=None) -> list:
+    """roots 下所有 .py 里非 docstring 的 `require_auth` 字面量 → [路径:行…]。
+
+    · **递归**（rglob）：`glob("*.py")` 只看目录第一层，`panel/lib/x.py` 这种写法
+      对它等于不存在——扩了扫描范围却仍只看一层，等于把新洞留在子目录里；
+    · `allowed` 与返回值都是**相对 `base`**（默认第一个 root）的路径，理由见
+      `_REQUIRE_AUTH_ALLOWED` 上方；
+    · `deploy_*.py` 跳过（写的是平台路由，见调用处 docstring）；
+    · 部署窗口里逐字节相同的副本按**内容**豁免（`is_transient_deploy_copy`）：
+      三个部署脚本会把共享模块复制进自己的包目录再在 finally 删掉，MCP 那次的
+      窗口是分钟级的。**不按路径豁免**——理由写在那个 helper 上方。
 
     提成 helper 是为了让"守卫会咬"能用 tmp 目录里的探针文件**常驻**验证
-    （下一条 meta-test）——不是往真实 tracked 文件注入再 `git checkout --`
+    （下面两条 meta-test）——不是往真实 tracked 文件注入再 `git checkout --`
     还原：那会把文件上未提交的修改一并丢掉，执行中断时探针还会残留在
     仓库里。
     """
     import ast
+    from conftest import is_transient_deploy_copy
+    base = base or roots[0]
     offenders = []
-    for path in sorted(root.glob("*.py")):
-        if path.name in allowed:
-            continue
-        tree = ast.parse(path.read_text())
-        doc_ids = _docstring_ids(tree)
-        for node in ast.walk(tree):
-            if (isinstance(node, ast.Constant) and isinstance(node.value, str)
-                    and id(node) not in doc_ids
-                    and "require_auth" in node.value):
-                offenders.append(f"{path.name}:{node.lineno}")
-    return offenders
+    for root in roots:
+        for path in sorted(root.rglob("*.py")):
+            rel = path.relative_to(base).as_posix()
+            if any(part in _SCAN_SKIP_DIRS for part in path.parts):
+                continue
+            if rel in allowed or path.name.startswith("deploy_"):
+                continue
+            if is_transient_deploy_copy(path):
+                continue
+            tree = ast.parse(path.read_text())
+            doc_ids = _docstring_ids(tree)
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                        and id(node) not in doc_ids
+                        and "require_auth" in node.value):
+                    offenders.append(f"{rel}:{node.lineno}")
+    return sorted(offenders)
 
 
 def test_sentinel_scan_bites_a_probe_file(tmp_path):
@@ -408,6 +489,37 @@ def test_sentinel_scan_bites_a_probe_file(tmp_path):
         '"""docstring 里提到 require_auth 不算数。"""\n'
         '_PROBE = {"require_auth": True}\n')
     assert _require_auth_offenders(tmp_path) == ["probe.py:2"]
+
+
+def test_sentinel_scan_reaches_the_other_three_packages(tmp_path):
+    """扩了范围的那条守卫的**反向验证**，常驻：探针放进 panel/mcp 也要被咬住。
+
+    一次把五件事一起钉住，因为它们各自失效的样子都是"守卫还在、但不咬了"：
+      · `panel/api.py` 里的投影字面量被发现——这条守卫此前完全看不到它；
+      · `mcp/lib/nested.py` 被发现 ⇒ 扫描是**递归**的（`glob("*.py")` 会漏掉它）；
+      · `panel/deploy_panel.py` **不**被发现 ⇒ 平台路由那两处合法写入不会变成
+        修不掉的假阳性（它是"别顺手收紧"的那一半）；
+      · `panel/tests/` 下的不被发现 ⇒ 测试里出现这个字面量是正常的；
+      · `panel/permissions.py` 若与 `deployer/functions/permissions.py` **逐字节
+        相同**则不被发现 ⇒ 部署窗口里的临时副本不会把守卫变成假红。
+        这里刻意用**真实**的那份文件做副本，所以它验的是默认豁免源，
+        而不是一个测试自己编出来的形态。
+    """
+    import pathlib
+    real = (pathlib.Path(__file__).parents[1] / "functions" / "permissions.py")
+    literal = '_X = {"require_auth": True}\n'
+    for rel in ("deployer/functions/permissions.py", "panel/api.py",
+                "panel/deploy_panel.py", "panel/tests/test_x.py",
+                "mcp/lib/nested.py"):
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(literal)
+    copy = tmp_path / "panel" / "permissions.py"
+    copy.write_bytes(real.read_bytes())          # 部署窗口里的那一份
+    assert _require_auth_offenders(
+        tmp_path / "deployer" / "functions", tmp_path / "panel", tmp_path / "mcp",
+        allowed=_REQUIRE_AUTH_ALLOWED, base=tmp_path) == [
+            "mcp/lib/nested.py:1", "panel/api.py:1"]
 
 
 def test_projection_writer_scan_bites_probe_modules(tmp_path):

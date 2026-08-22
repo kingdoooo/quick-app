@@ -9,6 +9,44 @@ from moto import mock_aws
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "functions"))
 
+
+# ---- 扫全仓库的"唯一定义"守卫共用的一条豁免：部署窗口里的逐字节副本 ----
+#
+# panel / mcp / key-proxy 的部署脚本会把 `deployer/functions/` 下的共享模块
+# （`common.py` / `permissions.py` / `ops_log.py` …；panel 另从 `auth/` 取
+# `session.py`）**复制进自己的包目录**，打完包在 finally 里删掉
+# （deploy_panel.py `_build_zip` / deploy_key_proxy.py / deploy_agentcore.py）。
+# MCP 那一次的窗口覆盖整个 buildx + push，是分钟级的。
+# 那期间，任何扫描整个 `site-builder/` 的守卫都会把副本报成"第四份手抄"。
+#
+# **必须按内容豁免，不能按路径豁免。** 一条 `panel/common.py 不算` 的路径豁免会把
+# 一份**真的**手抄一起放过——而"手抄不会再回来"正是这些守卫存在的全部理由，
+# 给它们加路径豁免等于把洞开在守卫自己身上。逐字节相同的副本里不可能藏着第二个
+# 实现；有人动它一个字节（手抄的意义就在于要改），守卫立刻恢复。
+#
+# 如实记下残留缺口：一份**从未改动**的副本被提交进仓库时，本豁免看不见它——
+# 它与部署窗口里的临时文件在文件系统上完全不可区分。它一旦被改动就会被咬住，
+# 而产物层面另有 `verify_deployed_components.py` 逐字节比对已部署的那一份。
+_COPY_SOURCE_DIRS = (Path(__file__).parents[1] / "functions",
+                     Path(__file__).parents[2] / "auth")
+
+
+def is_transient_deploy_copy(path, *, sources=_COPY_SOURCE_DIRS) -> bool:
+    """`path` 是不是某个共享模块**逐字节相同**的副本（部署脚本的临时产物）。
+
+    真源自己返回 False：它们不是副本，而"唯一定义在哪"必须由各守卫按路径点名，
+    不能靠这条内容比较悄悄替代掉。
+    """
+    path = Path(path)
+    if path.parent.resolve() in {d.resolve() for d in sources if d.exists()}:
+        return False
+    for d in sources:
+        src = d / path.name
+        if src.exists() and src.read_bytes() == path.read_bytes():
+            return True
+    return False
+
+
 ENV = {"JOBS_TABLE": "site-deploy-jobs", "SITES_TABLE": "site-sites",
        "ARTIFACTS_BUCKET": "site-artifacts-1", "FRONTEND_BUCKET": "site-frontend-1",
        "ROUTING_TABLE": "routing", "BASE_DOMAIN": "example.com",

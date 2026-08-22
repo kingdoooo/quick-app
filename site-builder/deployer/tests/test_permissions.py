@@ -664,12 +664,16 @@ def test_no_handwritten_rev_guard_outside_permissions_module():
     canonical = (root / "site-builder" / "deployer" / "functions"
                  / "permissions.py").resolve()
     offenders = []
+    from conftest import is_transient_deploy_copy
     for py in list((root / "site-builder").rglob("*.py")) + \
             list((root / "router").rglob("*.py")):
         if any(part in py.parts for part in
                (".venv", "cdk.out", "__pycache__", "tests")):
             continue
         if py.resolve() == canonical:
+            continue
+        # 部署窗口里的逐字节副本不算手抄（按内容豁免，理由在那个 helper 上方）
+        if is_transient_deploy_copy(py):
             continue
         text = py.read_text()
         # 只看代码，不看注释与 docstring：解释这个表达式为什么危险是允许的
@@ -1000,15 +1004,18 @@ def test_rejection_says_missing_when_the_field_is_missing(field):
     assert "NoneType" not in msg, f"缺失被报成了 null：{msg}"
 
 
-@pytest.mark.parametrize("field", ["require_login", "allowed_users", "owner"])
+@pytest.mark.parametrize("field", ["require_login", "allowed_users"])
 def test_absent_field_message_gives_an_actionable_fix_not_hand_editing(field):
-    """**字段缺失**的文案必须给出可执行的修法：成功部署一次就会初始化。
+    """**会被部署初始化的字段**缺失时，文案必须给出"成功部署一次"这个修法。
 
     spec §4.1 把"拒绝"这个代价的可接受前提写成「错误文案直接给出修法」。
     对**从未成功部署过**的站点，"请把该行修正为正确类型"不是可执行的修法：
-    `create_site_record` 只写 owner/name/status，权限字段由首次部署的
+    `create_site_record` 只写 owner/name/status，这两个字段由首次部署的
     `_seed_permissions_if_absent` 补齐——那一行**没有任何坏数据**，
     而旧文案会把用户指去手改 DynamoDB。这是这条用例存在的全部理由。
+
+    **`owner` 不在参数里**（S1 最终复核）：seed 的 if_not_exists 不写 owner，
+    所以对缺 owner 的行给这条建议是把人指进死路。它由下一条用例反向盯住。
     """
     site = {"site_id": "s-1", "owner": "o@example.test", "require_login": True,
             "allowed_users": "org", "collaborators": []}
@@ -1019,6 +1026,38 @@ def test_absent_field_message_gives_an_actionable_fix_not_hand_editing(field):
     assert "尚未成功部署" in msg, (
         f"缺失文案没说清“这个站点还没部署过”，用户只会去手改库：{msg}")
     assert "成功部署一次" in msg, f"缺失文案没给出“部署一次即可”这个修法：{msg}"
+
+
+def test_absent_owner_is_not_told_to_deploy_because_deploy_will_not_seed_it():
+    """缺 `owner` 的行**不许**收到"部署一次就好"——那是一条死路。
+
+    `_seed_permissions_if_absent` 的 if_not_exists 只写 require_login /
+    allowed_users / collaborators / permissions_rev，**没有 owner**
+    （`register_route.py`，由 `test_seed_permissions.py` 的
+    `test_seeded_fields_match_the_deploy_path` 按源码钉住）。所以照旧文案去部署，
+    会在 `_route_item` 撞上**同一条**拒绝、再回到起点：站点既不能改权限也不能
+    部署，而文案给的唯一出口是不存在的。
+
+    这不是措辞洁癖：spec §4.1 是拿"文案给出真实修法"来换"坏行让站点全面卡住"
+    这个代价的，owner 是唯一一个那个前提不成立的字段——前提不成立时，
+    这条拒绝就退化成一张没有解法的工单。
+
+    实际可达性很低（owner 建站时写入、之后没有任何代码删它），所以修的是文案
+    而不是拒绝本身；但拿"反正到不了"当理由留一条错的指引，正是本轮在消除的形态。
+    """
+    site = {"site_id": "s-1", "owner": "o@example.test", "require_login": True,
+            "allowed_users": "org", "collaborators": []}
+    del site["owner"]
+    with pytest.raises(perm.PolicyDataInvalid) as excinfo:
+        perm.effective_policy(site)
+    msg = str(excinfo.value)
+    assert perm.REPAIR_ABSENT not in msg, (
+        f"对缺 owner 的行说“部署一次就好”——部署补不上它，用户没有出口：{msg}")
+    assert "成功部署一次" not in msg, msg
+    assert perm.REPAIR_ABSENT_UNSEEDED in msg, (
+        f"没给出真实修法（人工补这一行）：{msg}")
+    # 修法必须是**可执行**的：说清部署补不了、以及该补成什么类型
+    assert "不会被部署初始化" in msg and "owner: 非空 S" in msg, msg
 
 
 @pytest.mark.parametrize("field,bad", [

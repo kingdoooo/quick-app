@@ -422,23 +422,25 @@ def normalize_allowed_users(value):
 _ABSENT = object()
 
 
-# ---- 两段补救文案：**全仓库唯一定义**，测试也从这里取 ----
+# ---- 三段补救文案：**全仓库唯一定义**，测试也从这里取 ----
 #
 # 补救文案必须覆盖**能拒的每个字段**（由
 # test_repair_hint_covers_every_field_it_can_reject 钉住）：拒绝的代价是站点
 # 在人工修好之前既不能改权限也不能部署，换来的只有"人照着文案能把那一行改
 # 回来"这一样东西。少一个字段的形态，那个字段的拒绝就是一张工单。
 #
-# **文案分两种，因为两种坏法的修法完全不同**（spec §4.1 把"拒绝"这个代价的
+# **文案分三种，因为三种坏法的修法完全不同**（spec §4.1 把"拒绝"这个代价的
 # 可接受前提写成「错误文案直接给出修法」）：
 #   · 类型不对 ⇒ 那一行存着一个用不了的值，只能人工改对。再部署一百次也
 #     不会把它改好。
-#   · 字段缺失 ⇒ 绝大多数是"这个站点还没成功部署过"：create_site_record
-#     只写 owner/name/status，权限字段由首次部署的
+#   · **会被部署初始化的字段**缺失 ⇒ 绝大多数是"这个站点还没成功部署过"：
+#     create_site_record 只写 owner/name/status，权限字段由首次部署的
 #     register_route._seed_permissions_if_absent 补齐。对这种行说"请修正为
 #     正确类型"是**不可执行的**——那一行没有任何坏数据，用户会被指去手改
 #     DynamoDB。
-# 两条都带类型清单：缺失的另一种可能是**已部署行被人为删过字段**，那种确实
+#   · **不会被部署初始化的字段**（当前只有 owner）缺失 ⇒ 只能人工补。见下面
+#     `_SEEDED_BY_FIRST_DEPLOY` 上方那段。
+# 三条都带类型清单：缺失的另一种可能是**已部署行被人为删过字段**，那种确实
 # 要照类型补。
 #
 # **为什么是模块级常量而不是 `effective_policy` 的局部变量**（S1 fix round 2）：
@@ -449,6 +451,19 @@ _ABSENT = object()
 # 会倾向于删掉其中一处，而不是想清楚新措辞还能不能区分两支。
 # 提到模块级之后测试写 `assert permissions.REPAIR_ABSENT in msg`，
 # 措辞变成**派生**的：改这里，测试跟着变，不需要同步任何副本。
+#
+# **"部署一次就好"只对首次部署真的会初始化的那几个字段成立**（S1 最终复核）：
+# `register_route._seed_permissions_if_absent` 的 if_not_exists 写的是下面这四个，
+# **`owner` 不在其中**。对缺 owner 的行说"部署一次就好"是把人指进一条死路——
+# 部署走到 `_route_item` 会撞上同一条拒绝，没有出口。而 spec §4.1 接受"坏行让站点
+# 既不能改权限也不能部署"这个代价的前提**只有一条**：文案给出真实的修法。
+# 所以缺失分两支，判据是"这个字段会不会被部署初始化"而不是"它是不是 owner"：
+# 将来加第五个字段时，默认走"人工补"那一支（准确），要走"部署会补"那一支得先
+# 真的把它加进 seed —— 这个方向的默认值不会再产出一条不可执行的建议。
+# 名单与文案共用同一个元组，`test_seeded_fields_match_the_deploy_path` 按
+# register_route 的源码钉住它。
+_SEEDED_BY_FIRST_DEPLOY = ("require_login", "allowed_users", "collaborators",
+                           "permissions_rev")
 _TYPES = ('require_login: BOOL；allowed_users: S="org" 或 L=邮箱数组；'
           'collaborators: L=邮箱数组（可缺省）；owner: 非空 S')
 REPAIR_WRONG_TYPE = f'请把 sites 表该行修正为正确类型后重试（{_TYPES}）。'
@@ -456,6 +471,14 @@ REPAIR_ABSENT = (
     '这通常表示该站点**尚未成功部署过**——权限字段由首次成功部署自动初始化，'
     '所以成功部署一次之后就能正常改权限，不需要手改库。'
     f'若该站点确实已成功部署过，则是这一行被人为删过字段，请按类型补齐（{_TYPES}）。')
+REPAIR_ABSENT_UNSEEDED = (
+    '**这个字段不会被部署初始化**（首次部署只补 '
+    f'{" / ".join(_SEEDED_BY_FIRST_DEPLOY)}），所以再部署一次也不会有出口——'
+    f'请人工把 sites 表该行缺的字段按类型补齐（{_TYPES}）。'
+    # 括号里的话**只对 owner 成立**，所以显式写出字段名：将来多出第五个不被
+    # seed 的字段时，这句话对它不会变成一条假事实。
+    '（`owner` 在建站时就已写入、之后没有任何代码会删它，所以它缺失意味着'
+    '这一行被人为改过。）')
 
 
 def effective_policy(site: dict) -> dict:
@@ -476,20 +499,27 @@ def effective_policy(site: dict) -> dict:
     而这两个默认值让**写路径**把坏数据洗成合法的 `{"BOOL": false}` / `"org"`
     ——两侧对坏数据的语义相反，Edge 的加固被写入侧抵消（M02）。
 
-    异常文案分两种（**类型不对**要人工改那一行，**字段缺失**通常只是还没成功
-    部署过、部署一次就会初始化）——两段文案是模块级常量
-    `REPAIR_WRONG_TYPE` / `REPAIR_ABSENT`，理由与措辞都写在它们上方。
-    拒绝的语义与拒绝的输入集合两者都不因此改变。
+    异常文案分三种（**类型不对**要人工改那一行；**会被部署初始化的字段缺失**
+    通常只是还没成功部署过、部署一次就会初始化；**owner 这类部署不初始化的字段
+    缺失**只能人工补）——三段文案是模块级常量 `REPAIR_WRONG_TYPE` /
+    `REPAIR_ABSENT` / `REPAIR_ABSENT_UNSEEDED`，理由与措辞都写在它们上方。
+    拒绝的语义与拒绝的输入集合三者都不因此改变。
     """
     site_id = site.get("site_id", "<unknown>")
 
     def reject(field, value):
         absent = value is _ABSENT
         found = "字段缺失" if absent else f"{type(value).__name__}={value!r}"
+        if not absent:
+            repair = REPAIR_WRONG_TYPE
+        elif field in _SEEDED_BY_FIRST_DEPLOY:
+            repair = REPAIR_ABSENT
+        else:
+            # owner 这一支：部署补不了它，说"部署一次就好"就是一条死路
+            repair = REPAIR_ABSENT_UNSEEDED
         raise PolicyDataInvalid(
             f"站点 {site_id} 的 {field} 形态不合法"
-            f"（{found}），已拒绝投影权限。"
-            f"{REPAIR_ABSENT if absent else REPAIR_WRONG_TYPE}")
+            f"（{found}），已拒绝投影权限。{repair}")
 
     # 四个字段一律用 `site.get(key, _ABSENT)` 这**同一个**写法探"缺失"。
     # 不混用 `key not in site` 与 `site.get(key, 默认值)`：三种写法并存时，

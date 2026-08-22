@@ -246,11 +246,15 @@ def test_static_prefix_format_has_a_single_definition():
     #     路径分隔符或标识符字符，即它必须是字符串的开头那一段。
     handmade = re.compile(r"(?<![\w/])sites/\{")
     offenders = []
+    from conftest import is_transient_deploy_copy
     for py in (root / "site-builder").rglob("*.py"):
         if any(part in py.parts for part in
                (".venv", "cdk.out", "__pycache__", "tests")):
             continue
         if py.resolve() == canonical:
+            continue
+        # 部署窗口里的逐字节副本不算手抄（按内容豁免，理由在那个 helper 上方）
+        if is_transient_deploy_copy(py):
             continue
         try:
             tree = ast.parse(py.read_text())
@@ -383,11 +387,15 @@ def test_table_name_format_has_a_single_definition():
     # 与 sibling 守卫里"CDK 的 ARN vs S3 的键"是同一个区分。
     handmade = re.compile(r"site-data-\{")
     offenders = []
+    from conftest import is_transient_deploy_copy
     for py in (root / "site-builder").rglob("*.py"):
         if any(part in py.parts for part in
                (".venv", "cdk.out", "__pycache__", "tests")):
             continue
         if py.resolve() == canonical:
+            continue
+        # 部署窗口里的逐字节副本不算手抄（按内容豁免，理由在那个 helper 上方）
+        if is_transient_deploy_copy(py):
             continue
         try:
             tree = ast.parse(py.read_text())
@@ -419,6 +427,34 @@ def test_site_table_name_is_the_canonical_format():
     """
     import common
     assert common.site_table_name("foo-k3d9x1", "notes") == "site-data-foo-k3d9x1-notes"
+
+
+def test_the_deploy_copy_exemption_only_covers_byte_identical_files(tmp_path):
+    """"按内容豁免"的**反向验证**，常驻（探针一律在 tmp_path）。
+
+    上面几条守卫扫的是整个 `site-builder/`，而 panel / mcp / key-proxy 的部署
+    脚本会把这些共享模块复制进自己的包目录、打完包在 finally 删掉（MCP 那一次的
+    窗口覆盖整个 buildx+push，分钟级）。不豁免就会在部署期变成假红，而假红的
+    下一步是有人给守卫加一条**路径**豁免——那会把一份真的手抄一起放过，等于把
+    洞开在守卫自己身上。所以三个方向都钉死：
+    逐字节相同 ⇒ 豁免；改过一个字节 ⇒ 仍被咬住；真源自己 ⇒ 不由这条豁免负责
+    （"唯一定义在哪"必须由各守卫按路径点名）。
+    """
+    from conftest import is_transient_deploy_copy
+    src_dir, pkg = tmp_path / "functions", tmp_path / "panel"
+    src_dir.mkdir()
+    pkg.mkdir()
+    (src_dir / "common.py").write_text("A = 1\n")
+    copy = pkg / "common.py"
+    copy.write_text("A = 1\n")
+    assert is_transient_deploy_copy(copy, sources=(src_dir,)) is True
+    copy.write_text("A = 1\nB = 2   # 手抄之后改了它\n")
+    assert is_transient_deploy_copy(copy, sources=(src_dir,)) is False
+    assert is_transient_deploy_copy(src_dir / "common.py",
+                                    sources=(src_dir,)) is False
+    (pkg / "only_here.py").write_text("A = 1\n")      # 真源里没有同名文件
+    assert is_transient_deploy_copy(pkg / "only_here.py",
+                                    sources=(src_dir,)) is False
 
 
 def test_site_policy_never_matches_a_nested_sites_tables(monkeypatch):
@@ -648,12 +684,16 @@ def test_no_module_hand_rolls_the_tier_engine_mapping():
         # deployer 侧的唯一派生实现（一致性由 sibling 用例与合同对齐）
         (root / "site-builder/deployer/functions/common.py").resolve()}
     offenders = []
+    from conftest import is_transient_deploy_copy
     for py in (root / "site-builder").rglob("*.py"):
         if any(part in py.parts for part in
                (".venv", "cdk.out", "__pycache__", "build", "node_modules",
                 "tests")):
             continue
         if py.resolve() in exempt:
+            continue
+        # 部署窗口里的逐字节副本不算手抄（按内容豁免，理由在那个 helper 上方）
+        if is_transient_deploy_copy(py):
             continue
         try:
             tree = ast.parse(py.read_text())
