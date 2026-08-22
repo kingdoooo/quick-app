@@ -128,11 +128,13 @@ def verify_console_cookie(cookie_header: str, *, x_user_email: str) -> str:
             break
     if not token:
         raise UpgradeRejected("缺少面板会话")
-    claims = session.verify_session_jwt(token, _secret())
+    claims = session.verify_session_jwt(token, _secret(),
+                                        expected_typ=session.SESSION_TYP)
     if not claims:
         raise UpgradeRejected("面板会话无效或已过期")
     if claims.get("scope") != CONSOLE_SCOPE:
-        # 站点会话（无 scope）与 upgrade code 都会落在这里
+        # 只有站点会话（typ=session 但无 scope）会落在这里；upgrade code
+        # 早在上面的 typ 检查就被拒了（M05 之前它是靠这一行兜住的）。
         raise UpgradeRejected("该会话不是面板会话")
     # **空值不得视为相等**：两边都空时 `==` 成立，等于放行一个无身份请求
     if not x_user_email or claims.get("email") != x_user_email:

@@ -21,10 +21,17 @@ def _sign(msg: bytes, secret: str) -> str:
     return _b64url(hmac.new(secret.encode(), msg, hashlib.sha256).digest())
 
 
+SESSION_TYP = "session"
+
+
 def mint_session_jwt(email: str, name: str, secret: str, ttl_seconds: int = 86400,
                      idp: str = "", scope: str = "", auth_via: str = "") -> str:
     header = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
-    claims = {"email": email, "name": name, "exp": int(time.time()) + ttl_seconds}
+    # 载荷里的 `typ` 与 JOSE 头里的 `typ: JWT` 是两回事：前者是**用途**标记，
+    # 用来断开会话 token 与 console 一次性升级码之间的跨上下文复用
+    # （两者同密钥、同线格式，见 verify_session_jwt）。
+    claims = {"typ": SESSION_TYP, "email": email, "name": name,
+              "exp": int(time.time()) + ttl_seconds}
     # 只在非空时写入：保持与一期已签发 token 的形态兼容，Edge 侧无需改验签。
     if idp:
         claims["idp"] = idp        # spec §3.5：Edge 据此确认身份来自企业 IdP
@@ -37,13 +44,26 @@ def mint_session_jwt(email: str, name: str, secret: str, ttl_seconds: int = 8640
     return f"{header}.{payload}.{_sign(signing_input, secret)}"
 
 
-def verify_session_jwt(token: str, secret: str, now: int | None = None) -> dict | None:
+def verify_session_jwt(token: str, secret: str, now: int | None = None, *,
+                       expected_typ: str) -> dict | None:
+    """→ claims 或 None。`expected_typ` 是**必填关键字参数**。
+
+    为什么必填而不给默认值 `SESSION_TYP`：给默认值等于允许调用方忘记传，
+    而"忘记传"恰好退化成本次修复之前的行为（不查 typ）——那时一个 60s 的
+    console 升级码就是一个有效会话，且能在 `/console-session` 无限续期（M05）。
+
+    **改这里必须同步 `router/infrastructure/lambda/origin_request.py` 的
+    `_verify_session_jwt`**：两处算法必须字节等价。
+    """
     try:
         header_b64, payload_b64, sig = token.split(".")
         expected = _sign(f"{header_b64}.{payload_b64}".encode(), secret)
         if not hmac.compare_digest(sig, expected):
             return None
         claims = json.loads(_b64url_decode(payload_b64))
+        # typ 先查：这是"不能跨上下文复用"的唯一技术保证
+        if claims.get("typ") != expected_typ:
+            return None
         if int(claims.get("exp", 0)) <= (now if now is not None else int(time.time())):
             return None
         return claims

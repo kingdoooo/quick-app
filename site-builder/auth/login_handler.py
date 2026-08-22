@@ -23,7 +23,7 @@ import urllib.request
 import jwt as pyjwt
 from jwt import PyJWKClient
 
-from session import mint_session_jwt, mint_upgrade_code, verify_session_jwt
+from session import SESSION_TYP, mint_session_jwt, mint_upgrade_code, verify_session_jwt
 
 _jwks_client = None  # 模块级缓存，Lambda 容器复用
 # (值, 读取时刻) —— 带 TTL，见 _secret 的说明
@@ -488,7 +488,8 @@ def handler(event, context):
             if name_.strip() == "sb_session":
                 session_token = value_
                 break
-        claims = verify_session_jwt(session_token, _secret("JWT_SECRET"))
+        claims = verify_session_jwt(session_token, _secret("JWT_SECRET"),
+                                    expected_typ=SESSION_TYP)
         if not claims:
             # 无有效会话（缺失/过期/签名不过）：走完整登录，登录后**回到本
             # 入口**再换 code。redirect 指回 console 首页是错的——那样用户

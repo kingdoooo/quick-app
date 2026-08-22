@@ -147,3 +147,25 @@ def test_console_session_login_redirect_passes_its_own_safety_check():
     target = urllib.parse.unquote(
         r["headers"]["Location"].split("redirect=", 1)[1])
     assert lh._is_safe_redirect(target), f"{target} 会被 /login 判为非法"
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_console_session_refuses_an_upgrade_code_as_the_cookie():
+    """把升级码当 sb_session 递进 /console-session 不得换出新码。
+
+    这是链式续期的修复点（M05）：`/console-session` 用的就是通用 verifier，
+    不查 typ 时递一个升级码进去即可换出**新的** 60s 升级码，无限续期
+    ——「60 秒 + 一次性」两个属性同时失效。已实测连续续期成功 3 轮。
+
+    注意这一半**与 `require_idp_claim` 无关**：`auth` 子域注册为
+    `require_auth=False`，Edge 根本不 gate 这个端点，是 auth 服务自己验 cookie。
+
+    密钥必须用 ENV["JWT_SECRET"]：换个密钥的话签名检查就先拦下了，
+    这条用例即便在缺陷仍在时也会绿——那是假绿，证明不了 typ 检查生效。
+    """
+    import session
+    code = session.mint_upgrade_code("v@example.test", ENV["JWT_SECRET"])
+    r = lh.handler(_event("/console-session", cookies=[f"sb_session={code}"]), None)
+    assert r["statusCode"] == 302
+    assert "/login?redirect=" in r["headers"]["Location"], (
+        "应被当成无有效会话、引导去登录，而不是换出新的升级码")

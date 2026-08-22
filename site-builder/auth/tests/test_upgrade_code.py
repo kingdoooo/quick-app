@@ -93,12 +93,44 @@ def test_wrong_typ_value_is_rejected():
 
 
 def test_upgrade_code_is_not_accepted_as_a_console_session():
-    """反向也不行——否则 60 秒 code 能当 4 小时面板会话用。"""
+    """反向也不行——否则 60 秒 code 能当 4 小时面板会话用。
+
+    **M05 之后这条比原来强**：原来只能断言"它没有 scope=console"
+    （因为同密钥同算法、签名确实会过，注释也这么写的）；
+    现在 typ 检查先拒，所以可以直接断言 None。
+    """
     code = session.mint_upgrade_code("u@x.com", SECRET)
-    claims = session.verify_session_jwt(code, SECRET)
-    # 同密钥同算法，所以签名会过；但它没有 scope=console，
-    # panel 的 verify_console_cookie 据此拒绝（见 panel 侧同名用例）。
-    assert claims is None or claims.get("scope") != "console"
+    assert session.verify_session_jwt(
+        code, SECRET, expected_typ=session.SESSION_TYP) is None
+
+
+def test_upgrade_code_is_not_accepted_as_a_session():
+    """一次性升级码不得当普通会话用。
+
+    两者用**同一个密钥**签名、线格式相同，而升级码的 claims 是
+    {typ, email, jti, exp}——旧的 verify_session_jwt 只查签名与 exp，
+    于是一个 60s 的升级码就是一个有效会话（M05）。
+    """
+    code = session.mint_upgrade_code("v@example.test", "secret")
+    assert session.verify_session_jwt(
+        code, "secret", expected_typ=session.SESSION_TYP) is None
+
+
+def test_session_token_is_not_accepted_as_an_upgrade_code():
+    """反方向也要挡住（这一半原本就已生效，加用例锁死）。"""
+    token = session.mint_session_jwt("v@example.test", "V", "secret")
+    assert session.verify_upgrade_code(token, "secret") is None
+
+
+def test_verify_session_jwt_requires_expected_typ():
+    """`expected_typ` 必须是必填参数。
+
+    给默认值等于允许调用方忘记传，而"忘记传"恰好退化成本次修复之前的行为
+    ——本仓库已记过这个形态（console_session.consume_code 的 expected_email 同理）。
+    """
+    token = session.mint_session_jwt("v@example.test", "V", "secret")
+    with pytest.raises(TypeError):
+        session.verify_session_jwt(token, "secret")
 
 
 @pytest.mark.parametrize("name,mutate,expect_reject", MUTATIONS)

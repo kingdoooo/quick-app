@@ -1,35 +1,37 @@
 import time
 import session
-from session import mint_session_jwt, verify_session_jwt
+from session import SESSION_TYP, mint_session_jwt, verify_session_jwt
 
 SECRET = "test-secret-0123456789abcdef"
 
 
 def test_roundtrip():
     tok = mint_session_jwt("a@x.com", "Alice", SECRET)
-    claims = verify_session_jwt(tok, SECRET)
+    claims = verify_session_jwt(tok, SECRET, expected_typ=SESSION_TYP)
     assert claims["email"] == "a@x.com" and claims["name"] == "Alice"
 
 
 def test_wrong_secret_rejected():
     tok = mint_session_jwt("a@x.com", "Alice", SECRET)
-    assert verify_session_jwt(tok, "other-secret") is None
+    assert verify_session_jwt(tok, "other-secret", expected_typ=SESSION_TYP) is None
 
 
 def test_expired_rejected():
     tok = mint_session_jwt("a@x.com", "Alice", SECRET, ttl_seconds=10)
-    assert verify_session_jwt(tok, SECRET, now=int(time.time()) + 11) is None
+    assert verify_session_jwt(tok, SECRET, now=int(time.time()) + 11,
+                              expected_typ=SESSION_TYP) is None
 
 
 def test_tampered_payload_rejected():
     tok = mint_session_jwt("a@x.com", "Alice", SECRET)
     h, p, s = tok.split(".")
-    assert verify_session_jwt(f"{h}.{p}x.{s}", SECRET) is None
+    assert verify_session_jwt(f"{h}.{p}x.{s}", SECRET,
+                              expected_typ=SESSION_TYP) is None
 
 
 def test_garbage_rejected():
-    assert verify_session_jwt("not-a-jwt", SECRET) is None
-    assert verify_session_jwt("", SECRET) is None
+    assert verify_session_jwt("not-a-jwt", SECRET, expected_typ=SESSION_TYP) is None
+    assert verify_session_jwt("", SECRET, expected_typ=SESSION_TYP) is None
 
 
 def test_mint_includes_idp_when_given():
@@ -62,5 +64,6 @@ def test_mint_includes_scope_for_console_session():
 
 def test_verify_still_accepts_token_with_extra_claims():
     tok = session.mint_session_jwt("a@x.com", "Alice", "s3cret", idp="Okta")
-    claims = session.verify_session_jwt(tok, "s3cret")
+    claims = session.verify_session_jwt(tok, "s3cret",
+                                        expected_typ=session.SESSION_TYP)
     assert claims["idp"] == "Okta"
