@@ -37,15 +37,32 @@ def _section(text: str, heading: str) -> str:
 
     找不到标题就让调用处红：标题被改名时本条会**自报空转**，而不是静默把覆盖面
     缩到零（同 `test_platform_function_name_list_...` 的处理）。
+
+    **必须跟踪围栏代码块**：纯文本上，```bash 块里第 0 列的 `# 注释` 与 markdown
+    的 H1 标题长得一模一样，不跟踪围栏就会把前者当成标题、在那里把小节切断。
+    实测形态（CLAUDE.md 的「测试命令」那一节把每条命令的解释写成 shell 注释）：
+    小节缩到只剩第一条命令，`test_claude_md_test_commands_carry_the_two_measured_traps`
+    的四条断言**全部假红**——而文档一个字都没写错。
+    替代方案"别在文档的代码块里写 # 注释"是对文档作者的约束，而本文件的存在
+    理由正是文档会变；所以修的是解析器。围栏状态先整篇算一次，
+    **两个循环都用它**：找标题的那一层同样不能在围栏里认标题。
     """
     lines = text.splitlines()
+    fenced, inside = [], False
+    for ln in lines:
+        if ln.lstrip().startswith("```"):
+            fenced.append(True)      # 围栏标记行本身：它不可能是标题
+            inside = not inside
+        else:
+            fenced.append(inside)
     for i, ln in enumerate(lines):
-        if ln.strip() != heading:
+        if fenced[i] or ln.strip() != heading:
             continue
         level = len(ln) - len(ln.lstrip("#"))
         for j in range(i + 1, len(lines)):
             nxt = lines[j]
-            if nxt.startswith("#") and (len(nxt) - len(nxt.lstrip("#"))) <= level:
+            if (not fenced[j] and nxt.startswith("#")
+                    and (len(nxt) - len(nxt.lstrip("#"))) <= level):
                 return "\n".join(lines[i:j])
         return "\n".join(lines[i:])
     raise AssertionError(f"找不到小节 {heading!r}——本条空转（标题被改过？）")
@@ -100,6 +117,31 @@ def _row(text: str, needle: str) -> str:
     hits = [ln for ln in text.splitlines() if needle in ln]
     assert len(hits) == 1, f"{needle!r} 命中 {len(hits)} 行，无法定位——本条空转"
     return hits[0]
+
+
+# ── 切片器自身的守卫 ──────────────────────────────────────────────────────
+
+def test_section_does_not_end_at_a_comment_inside_a_fenced_block():
+    """`_section` 的**反向验证**：围栏里的 `#` 注释不许被当成标题。
+
+    这条缺陷的危险之处是它**只会假绿或假红，不会报错**：把小节静默缩到第一条
+    命令为止，于是这一整套"文档还准不准"的断言要么全部空转、要么在文档完全正确
+    时集体变红。两个方向都测——第一行注释不许截断（跟踪围栏），围栏**之后**的
+    真标题必须仍然截断（别为了修前者把后者一起关掉）。
+    """
+    doc = "\n".join([
+        "## 目标小节",
+        "```bash",
+        "# 这是 shell 注释，不是 H1",
+        "pytest -q   # 第二条命令",
+        "```",
+        "尾部散文。",
+        "## 下一节",
+        "不该被收进来。"])
+    sec = _section(doc, "## 目标小节")
+    assert "第二条命令" in sec, f"围栏里的 # 注释把小节截断了：{sec!r}"
+    assert "尾部散文" in sec, f"围栏闭合后的正文丢了：{sec!r}"
+    assert "不该被收进来" not in sec, f"围栏之后的真标题没有截断小节：{sec!r}"
 
 
 # ── 过时口径：否定断言，覆盖整个文件 ─────────────────────────────────────
