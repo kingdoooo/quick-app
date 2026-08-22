@@ -161,6 +161,19 @@ def test_status_breakdown_line_carries_the_real_counts(monkeypatch, capsys):
         _row(), _row(site_id={"S": "s-2"}), deploying, _bad_deleted()])
     assert "各 status 行数：ACTIVE 2、DELETED 1、DEPLOYING 1" in out
     assert "（其中 DEPLOYING 1 行" in out, "DEPLOYING 提示没带上真实计数"
+    assert "为 0 只代表" not in out, "有 DEPLOYING 行时还在说「为 0 只代表……」"
+
+
+def test_deploying_zero_still_says_dont_read_the_zero_as_a_promise(
+        monkeypatch, capsys):
+    """0 行 DEPLOYING 时那句免责必须在——它是这条提示存在的理由。
+
+    与上一个用例合起来钉住两个分支：无条件写"为 0 只代表……"会让有 DEPLOYING
+    行时那句自相矛盾，而按计数分支之后，0 的那支不能顺手丢掉免责。
+    """
+    _code, out = _run_main(monkeypatch, capsys, [_row()])
+    assert "（其中 DEPLOYING 0 行" in out
+    assert "为 0 只代表此刻没有在途首次部署" in out
 
 
 # ---- 畸形 status 既不许带红闸门、也不许吞掉警告（fix round 2）----

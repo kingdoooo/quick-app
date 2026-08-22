@@ -152,8 +152,14 @@ def main() -> int:
     # `_seed_permissions_if_absent` 补过权限字段（建站只写 owner/name/status/
     # created_at），所以**形态上必然**会被严格解析拒绝。它为 0 只说明此刻没有
     # 在途的首次部署，不是"这一类不会出现"——绿字不能被读成对这个窗口的承诺。
-    print(f"  （其中 DEPLOYING {by_status.get('DEPLOYING', 0)} 行：尚未 seed 过"
-          "权限字段，形态上必然被拒；为 0 只代表此刻没有在途首次部署）")
+    # 结尾那句分两种：原先无条件写"为 0 只代表……"，于是真有 DEPLOYING 行时
+    # 这一句自相矛盾（"其中 DEPLOYING 2 行……为 0 只代表此刻没有在途首次部署"）。
+    # 闸门是在部署前跑的，那正是别人也在建站的时刻，这一类并不罕见。
+    n_deploying = by_status.get("DEPLOYING", 0)
+    tail = ("为 0 只代表此刻没有在途首次部署" if n_deploying == 0 else
+            "这几行正处在首次部署途中，register_route 会先 seed 再投影")
+    print(f"  （其中 DEPLOYING {n_deploying} 行：尚未 seed 过权限字段，"
+          f"形态上必然被拒；{tail}）")
 
     # ACTIVE 段的结论紧跟自己的计数打印，**不要挪到警告块之后**：那样操作员
     # 会在十几行非 ACTIVE 明细之后读到一句缩进的"无 ——"，看起来像是在给那些
