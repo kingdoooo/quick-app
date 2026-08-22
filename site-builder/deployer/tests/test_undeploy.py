@@ -235,13 +235,20 @@ def test_unknown_tier_skips_dsql_purge_instead_of_failing_the_undeploy(aws):
     assert "未知 tier" in job["error"], job["error"]
 
 
-def test_empty_tier_falls_back_instead_of_raising(aws):
-    """`tier` 是空串/None（不是"键不存在"）时也要回落，不能抛错。
+def test_empty_tier_is_an_anomaly_not_a_static_site(aws):
+    """`tier` 是空串/None（键**在**但值是假值）：算异常并留痕，不许悄悄回落。
 
-    `site.get("tier", "static")` 只在**键不存在**时给默认值：DynamoDB 里
-    写成 NULL 或空串的稀疏行会取到 `None` / `""` 并被 `tier_engine` 拒掉。
-    判据用 `site.get("tier") or "static"`。回落到 static（engine="none"）是
-    下线场景最保守的方向——什么都不删。
+    这里曾经写成 `site.get("tier") or "static"`，也就是把"这行数据坏了"洗成
+    "这是个静态站点"——**那是一次猜**，而且是本段注释明令禁止的那一种猜。
+    真正的静态站点由 `create_site_record` 写着 `tier="static"`；值缺失的行是
+    异常，不是静态站点（M02 那类"把坏数据洗成合法值"的形状）。
+
+    洗掉的后果具体而恶劣：DSQL 清理被跳过，用户勾的却是"永久删除数据"，
+    而**任何地方都不记录跳过了**——他看到的是"已下线"，数据还在。
+    问题在"静默"，不在"跳过"。
+
+    注：`site.get("tier", "static")` 那个写法连这一步都到不了——它只在**键不存在**
+    时给默认值，空串/NULL 的行会取到 `""` / `None` 然后直接把整次下线打成 FAILED。
     """
     import undeploy, common
     jid = common.create_job("a@x.com", "blank-x8")
@@ -251,7 +258,54 @@ def test_empty_tier_falls_back_instead_of_raising(aws):
         out = undeploy.handler({"job_id": jid, "site_id": "blank-x8",
                                 "purge_data": True}, None)
     purge_dsql.assert_not_called()
-    assert common.get_job(jid)["status"] == "DELETED", "空 tier 不该算异常"
+    assert common.get_site("blank-x8")["status"] == "DELETED"
+    job = common.get_job(jid)
+    assert job["status"] != "FAILED", (
+        f"空 tier 把整次下线打成了 FAILED：{job.get('error')}")
+    # 断言在**记下来的键**上，而不是日志上——日志不是断言
+    assert out["purged"]["engine_unknown_error"], out
+    assert job["status"] == "PURGE_FAILED", job
+
+
+def test_missing_tier_key_is_an_anomaly_too(aws):
+    """`tier` 键**完全不存在**的存量稀疏行：同样算异常并留痕。
+
+    与 sibling 的区别是这条走的是 `get` 返回 None 的分支（那条走假值分支），
+    两条都必须落到同一个出口——把它们合成一条就分不出"默认值生效了"
+    和"值是假值"这两种情况。
+    """
+    import undeploy, common
+    jid = common.create_job("a@x.com", "sparse-x7")
+    # 注意：不传 tier，模拟 tier 这一列压根没写过的存量行
+    common.upsert_site("sparse-x7", owner="a@x.com", status="ACTIVE")
+    with patch.object(undeploy, "_lambda", return_value=_lam_mock()), \
+         patch.object(undeploy, "_purge_dsql") as purge_dsql:
+        out = undeploy.handler({"job_id": jid, "site_id": "sparse-x7",
+                                "purge_data": True}, None)
+    purge_dsql.assert_not_called()
+    assert common.get_site("sparse-x7")["status"] == "DELETED"
+    job = common.get_job(jid)
+    assert job["status"] != "FAILED", (
+        f"缺 tier 键把整次下线打成了 FAILED：{job.get('error')}")
+    assert out["purged"]["engine_unknown_error"], out
+    assert job["status"] == "PURGE_FAILED", job
+
+
+def test_real_static_site_purges_cleanly_without_an_anomaly(aws):
+    """对照组：**真正的** static 站点（tier 写着 "static"）一切正常，不留异常。
+
+    删掉 `or "static"` 兜底的回归风险全在这条上——判据若写歪，全部静态站点的
+    下线都会报 PURGE_FAILED。static → engine="none"，不清 DSQL 是**正常**结果，
+    不是异常（与上面两条"值不可用"区分开）。
+    """
+    import undeploy, common
+    jid = _seed(common, boto3, site_id="flat-x6", tier="static")
+    with patch.object(undeploy, "_lambda", return_value=_lam_mock()), \
+         patch.object(undeploy, "_purge_dsql") as purge_dsql:
+        out = undeploy.handler({"job_id": jid, "site_id": "flat-x6",
+                                "purge_data": True}, None)
+    purge_dsql.assert_not_called()
+    assert common.get_job(jid)["status"] == "DELETED", "真 static 站点不该算异常"
     assert "engine_unknown_error" not in out.get("purged", {}), out
 
 

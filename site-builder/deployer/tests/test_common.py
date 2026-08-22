@@ -609,6 +609,12 @@ def test_tier_engine_rejects_an_unknown_tier():
     import pytest
     with pytest.raises(ValueError, match="未知 tier"):
         common.tier_engine("fullstack-graph")
+    # 空串与 None 也必须被拒：undeploy 把"值不可用"的稀疏行直接交给本函数
+    # （`site.get("tier") or ""`）来判定，靠的就是这两个都走抛错出口。
+    # 谁将来给 _TIER_ENGINE 加个假值键、或让本函数对空值宽容，这条会红。
+    for falsy in ("", None):
+        with pytest.raises(ValueError, match="未知 tier"):
+            common.tier_engine(falsy)
 
 
 def test_no_module_hand_rolls_the_tier_engine_mapping():

@@ -180,10 +180,15 @@ def _undeploy(event, context):
         # 允许 event 覆盖，便于清理历史站点（该字段是本次新增的）
         tables = event.get("data_tables") or list(site.get("data_tables", []))
         try:
-            # `or "static"` 而不是 get 的第二参数：写成 NULL / 空串的稀疏行取到的是
-            # None / ""，**键是存在的**，默认值根本不会生效。
+            # **不给 tier 兜默认值**。`or ""` 只是把"值不可用"（键缺失取到 None、
+            # 或写成 NULL / 空串）统一送进下面的抛错分支——曾经这里兜的是
+            # `or "static"`，那等于把"这行数据坏了"洗成"这是个静态站点"：真正的
+            # 静态站点由 create_site_record 写着 tier="static"，没有 tier 的行是
+            # **异常**。（`tier_engine("")` 与 `tier_engine(None)` 都会抛，所以
+            # `or ""` 是双保险而非必需；`test_tier_engine_rejects_an_unknown_tier`
+            # 把这两个出口钉住了。）
             engine = (event.get("engine")
-                      or common.tier_engine(site.get("tier") or "static"))
+                      or common.tier_engine(site.get("tier") or ""))
         except ValueError as e:
             # 不许猜（猜成 dsql 就会去删一个不确定属于谁的 schema），但也不能让它
             # 冒到顶层 try：走到这里站点**已经**下线完了（路由/Lambda/角色都删了），
@@ -192,8 +197,9 @@ def _undeploy(event, context):
             # 键带 `_error` ⇒ 计入 purge_errors ⇒ job 落 PURGE_FAILED 而非 DELETED：
             # DSQL 清理被跳过了，它若本是 DSQL 站点则数据还在，而用户刚勾的是
             # "永久删除数据"；异步调用的返回值没人看得到，只有 job.error 到得了
-            # 用户眼前（与 dynamodb_error / dsql_error 同一口径）。
-            logger.warning(f"未知 tier，跳过 DSQL 清理: {e}")
+            # 用户眼前（与 dynamodb_error / dsql_error 同一口径）。**静默才是问题
+            # 所在，跳过本身不是。**
+            logger.warning(f"tier 不可用，跳过 DSQL 清理: {e}")
             engine, purged["engine_unknown_error"] = "none", str(e)[:200]
         try:
             purged["dynamodb"] = _purge_dynamodb(site_id, tables)
