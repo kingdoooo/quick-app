@@ -239,8 +239,11 @@ def test_seed_reraises_non_conditional_errors(aws, monkeypatch):
     """seed 的 except 只放过 ConditionalCheckFailed；其余错误必须如实上抛。
 
     把这个分支放宽成裸 pass 的后果：seed 静默失败 → site 行没有权限字段 →
-    _route_item 回落 allowed_users="org"——指定名单被放大成全体可信 IdP 用户
-    （fail-open）。本测试锁死"其他 ClientError 不被吞"。
+    `_route_item` **拒绝投影**（`PolicyDataInvalid`），本次部署失败，而真正的
+    错误原因（限流/校验……）已经被吞掉，排查时只看到一句"策略数据不合法"。
+    M02 之前的后果是另一种：回落 allowed_users="org"，指定名单被放大成全体
+    可信 IdP 用户（fail-open）。两种后果都要求这里如实上抛。
+    本测试锁死"其他 ClientError 不被吞"。
     """
     import botocore.exceptions
     import common
@@ -320,13 +323,17 @@ def test_register_route_seed_does_not_overwrite_concurrent_online_change(aws):
 
 
 def test_register_route_uses_consistent_read_after_seed(aws, monkeypatch):
-    """seed 刚写完就用最终一致读 → 可能读不到，名单被放大成 org。
+    """seed 刚写完就用最终一致读 → 可能读不到刚写的权限字段。
+
+    读不到的后果（M02 起）：`_route_item` 拿到一行缺字段的记录、**拒绝投影**，
+    本次部署失败。M02 之前是另一种：回落默认值，名单被放大成 org。
+    两种后果都要求这里强一致——**结论没变，只是失败方向从静默扩权变成响亮失败。**
 
     moto 的读默认就是强一致，所以无法真的制造出"副本滞后"。这里换一个
     **不会让正确实现失败**的等价断言：把最终一致的 get_site 打成陷阱
     （一调用即 fail），强一致的 get_site_consistent 保持真实。
     若实现退回 get_site，测试立刻失败；用 get_site_consistent 则读到 seed
-    后的真值，名单不会回落成 org。
+    后的真值，投影出 manifest 指定的名单。
 
     **不要**把 get_site_consistent 本身 patch 成陈旧快照：seed 已经把真实
     行的 permissions_rev 写成 1，而陈旧快照算出的 rev=0 会让
@@ -343,7 +350,8 @@ def test_register_route_uses_consistent_read_after_seed(aws, monkeypatch):
     def _trap(site_id):
         raise AssertionError(
             "register_route 必须用 get_site_consistent（最终一致读会在 seed "
-            "之后拿到旧值，_route_item 回落 allowed_users=\"org\"，"
+            "之后拿到旧值 ⇒ _route_item 看到缺字段的行 ⇒ 拒绝投影、"
+            "本次部署失败；M02 之前是回落 allowed_users=\"org\"，"
             "把指定名单放大成全体可信 IdP 用户）")
 
     # 只打陷阱，不动 get_site_consistent——让它照常读到 seed 后的真值。
@@ -360,7 +368,8 @@ def test_register_route_uses_consistent_read_after_seed(aws, monkeypatch):
 
     item = boto3.client("dynamodb").get_item(
         TableName="routing", Key={"subdomain": {"S": "app-s-1"}})["Item"]
-    # 必须是 manifest 指定的名单，不能回落成 org
+    # 必须是 manifest 指定的名单（强一致读确实拿到了 seed 写下的值）。
+    # 第二条断言排掉 S 型：M02 之前的失败形态是回落成字面量 "org"。
     assert item["allowed_users"]["L"] == [{"S": "a@x.com"}]
     assert item["allowed_users"].get("S") is None
     assert int(item["permissions_rev"]["N"]) == 1

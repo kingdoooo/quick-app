@@ -37,7 +37,10 @@ def _seed_permissions_if_absent(site_id: str, manifest_auth: dict,
     "org"，私有站点变成全组织可见。
 
     反向稀疏同样有坑：只改过 require_login 的行 sentinel 存在 → 整个 seed
-    被跳过 → allowed_users 一直缺失 → _route_item 回落 "org"，也是扩权。
+    被跳过 → allowed_users 一直缺失 → `_route_item` **拒绝投影**
+    （`PolicyDataInvalid`，M02 起它不再回落 "org"）→ 本次部署在提交点之前失败。
+    失败方向变了（以前是静默扩权，现在是响亮失败），但**结论没变**：
+    这个字段必须由 seed 补上，否则站点根本部署不了。
 
     因此：每个字段独立 if_not_exists 补缺；只要有一个字段缺就写一次
     （条件表达式保证两个都在时是真正的 no-op，不白推进 updated_at）。
@@ -105,7 +108,10 @@ def _seed_permissions_if_absent(site_id: str, manifest_auth: dict,
         #     "写路由时站点权限被并发修改"——把"站点不存在"说成并发冲突，排查时
         #     会往完全错误的方向查。所以显式判定并给出准确原因。
         # 其余错误（限流、校验……）一律如实上抛——放宽成裸 pass 会让 seed
-        # 静默失败，_route_item 回落 allowed_users="org"（fail-open 扩权）。
+        # 静默失败，于是 _route_item 拿到一行缺字段的记录、**拒绝投影**
+        # （`PolicyDataInvalid`；M02 之前是回落 allowed_users="org" 的 fail-open
+        # 扩权）。结论不变：吞掉这里的真实错误，只会把"限流/校验失败"伪装成
+        # 下游一句"策略数据不合法"，排查时看不到真正的原因。
         if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
             raise
         if not site_exists:
@@ -206,10 +212,13 @@ def handler(event, context):
 
     for attempt in range(MAX_ROUTE_ATTEMPTS):
         # **必须强一致读**：紧接在 _seed_permissions_if_absent 之后，
-        # 最终一致读可能拿不到刚写入的权限，_route_item 就会回落默认值
-        # （require_login=True / allowed_users="org"）——把指定邮箱名单
-        # 错误地放大成"全体可信 IdP 用户"。且 seed 把 rev 明确写成 1，
-        # 与"未初始化"的 0 区分开，否则条件检查察觉不到这次状态变更。
+        # 最终一致读可能拿不到刚写入的权限，于是 _route_item 看到的是一行缺字段
+        # 的记录 → **拒绝投影并让本次部署失败**（`PolicyDataInvalid`）。
+        # M02 之前的后果是另一种：回落默认值（require_login=True /
+        # allowed_users="org"），把指定邮箱名单错误地放大成"全体可信 IdP 用户"。
+        # **两种后果都要求这里强一致**——现在是一次本可避免的部署失败，
+        # 以前是一次静默扩权。且 seed 把 rev 明确写成 1，与"未初始化"的 0
+        # 区分开，否则条件检查察觉不到这次状态变更。
         site = common.get_site_consistent(event["site_id"]) or {}
         owner = site.get("owner") or owner
         rev = int(site.get("permissions_rev", 0))

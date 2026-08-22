@@ -51,8 +51,10 @@ def test_seed_fills_missing_allowed_users_when_require_login_present(aws):
     """反向稀疏：只改过 require_login 的行，allowed_users 必须被 manifest 补上。
 
     旧实现在这里是另一种失败：sentinel 存在 → 整个 seed 被跳过 →
-    allowed_users 一直缺失 → _route_item 回落 "org"，同样是扩权，
-    且真源与投影都停在"缺字段"状态。
+    allowed_users 一直缺失 → `_route_item` **拒绝投影**（`PolicyDataInvalid`），
+    本次部署在提交点之前失败，真源与投影都停在"缺字段"状态。
+    M02 之前这里是回落 "org" 的静默扩权；方向变了，但"seed 必须补上这个字段"
+    这个结论没变——补不上，站点就部署不了。
 
     稀疏行直接造，理由同上一条用例（M02 起在线接口不再产出该形态）。
     """
@@ -196,12 +198,48 @@ def _docstring_ids(tree) -> set:
     return out
 
 
-def _projects_require_auth(fn_node, doc_ids) -> bool:
+# 投影赋值的形态判据，**全文件唯一一处定义**：`_hoisted_projection_names` 与
+# `_projects_require_auth` 都用它。各写一份正则就是本轮在修的那个毛病。
+_PROJECTION_ASSIGN_RE = r"require_auth\s*="
+
+
+def _hoisted_projection_names(tree) -> set:
+    """模块级常量里含 `require_auth =` 的**名字**集合。
+
+    为什么需要：把那条 UpdateExpression 提成模块级常量是一次**自然的重构**
+    ——`write_permissions` 与 `resync_route` 现在各持一份逐字节相同的副本，
+    合并它们是任何人都会做的清理。可一旦提走，函数体里就不再有字面量，
+    `_projects_require_auth` 会对**所有**函数返回 False，于是 offenders 恒为空、
+    守卫静默变成一条什么都不约束的绿灯。所以把"引用了这类常量"也算成投影特征：
+    **这是把那个重构直接封住，而不是只在事后报警**。
+
+    只看模块顶层赋值（`X = "..."` 与 `X: str = "..."`）。拼接、f-string、
+    从别的模块 import 进来的常量都跟不到——那部分残留缺口由
+    `test_every_route_permission_writer_calls_effective_policy` 里的
+    "三个已知 writer 必须仍被发现"断言兜住（它会红并指出判据需要更新）。
+    """
+    import ast
+    import re
+    out = set()
+    for node in tree.body:
+        targets, value = [], None
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets, value = [node.target], node.value
+        if (isinstance(value, ast.Constant) and isinstance(value.value, str)
+                and re.search(_PROJECTION_ASSIGN_RE, value.value)):
+            out.update(t.id for t in targets if isinstance(t, ast.Name))
+    return out
+
+
+def _projects_require_auth(fn_node, doc_ids, hoisted=frozenset()) -> bool:
     """写投影的**行为特征**，不是"出现过字面量"。
 
-    投影只有两种真实形态（三个 writer 实测）：item dict 里的键
+    投影的真实形态（三个 writer 实测）：item dict 里的键
     `"require_auth": {...}`，或 UpdateExpression 里的赋值目标
-    `SET require_auth = :a`。只出现字面量不算——`_finish` 从
+    `SET require_auth = :a`——后者既算内联字面量，也算引用了
+    `hoisted` 里那种模块级常量。只出现字面量不算——`_finish` 从
     committed_route **读** `require_auth` 反推 effective_auth，是这两个文件里
     第四个含字面量的函数，但它不投影；按"出现即投影"判会让守卫在三个真
     writer 修完后**永远红**（与 docstring 假阳性同类：把"字面量出现"当成了
@@ -216,9 +254,43 @@ def _projects_require_auth(fn_node, doc_ids) -> bool:
                 return True
         if (isinstance(sub, ast.Constant) and isinstance(sub.value, str)
                 and id(sub) not in doc_ids
-                and re.search(r"require_auth\s*=", sub.value)):
+                and re.search(_PROJECTION_ASSIGN_RE, sub.value)):
+            return True
+        if isinstance(sub, ast.Name) and sub.id in hoisted:
             return True
     return False
+
+
+def _projection_writers(path) -> dict:
+    """扫一个模块 → `{函数名: 是否调了 effective_policy_audited}`。
+
+    提成 helper 的理由与 `_require_auth_offenders` 相同：让"守卫会咬"能用
+    tmp_path 探针**常驻**验证，而不是靠人偶尔手工试一次。
+    """
+    import ast
+    import pathlib
+    tree = ast.parse(pathlib.Path(path).read_text())
+    doc_ids = _docstring_ids(tree)
+    hoisted = _hoisted_projection_names(tree)
+    out = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        if not _projects_require_auth(node, doc_ids, hoisted):
+            continue
+        # **只接受带审计的那个入口。** 接受纯 effective_policy 会让
+        # "某个 writer 绕过审计包装"照样通过守卫。
+        out[node.name] = any(
+            isinstance(c, ast.Call)
+            and (getattr(c.func, "id", None) == "effective_policy_audited"
+                 or getattr(c.func, "attr", None) == "effective_policy_audited")
+            for c in ast.walk(node))
+    return out
+
+
+# 已知的三个投影 writer。**这个集合是断言的一部分，不是文档**：见下面用例里
+# 「发现集必须恰好等于它」那条。
+_KNOWN_PROJECTION_WRITERS = {"write_permissions", "resync_route", "_route_item"}
 
 
 def test_every_route_permission_writer_calls_effective_policy():
@@ -226,35 +298,39 @@ def test_every_route_permission_writer_calls_effective_policy():
     effective_policy_audited。
 
     判据不是函数名单，而是写行为特征（见 `_projects_require_auth`）
-    ——**新增第 N 个 writer 会自动被这条抓到**。
+    ——新增第 N 个 writer 会被自动发现，前提是它的投影形态在判据覆盖范围内。
 
     只扫这两个文件：mark_job（整条恢复上一版路由）与 undeploy（删路由）
     不投影权限字段，不该被这条约束。第三个模块偷偷开始投影由下一条负责。
+
+    **第二条断言（发现集恰好等于已知三个）是防"静默变空"的**：
+    第一条断言 `not offenders` 在发现集为空时**恒真**——判据一旦跟不上代码
+    （投影串被提成常量、被拼接、字段改名），守卫就从"约束三个 writer"退化成
+    一条永远绿的空转，而这与"守卫生效"在 CI 上长得一模一样。这正是 Step 2b
+    给哨兵配反向验证的同一个理由，那条守卫也是"当前就绿"。
     """
-    import ast
     import pathlib
     root = pathlib.Path(__file__).parents[1]
-    offenders = []
+    found = {}
     for rel in ("functions/permissions.py", "functions/register_route.py"):
-        tree = ast.parse((root / rel).read_text())
-        doc_ids = _docstring_ids(tree)
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.FunctionDef):
-                continue
-            if not _projects_require_auth(node, doc_ids):
-                continue
-            # **只接受带审计的那个入口。** 接受纯 effective_policy 会让
-            # "某个 writer 绕过审计包装"照样通过守卫。
-            calls_it = any(
-                isinstance(c, ast.Call)
-                and (getattr(c.func, "id", None) == "effective_policy_audited"
-                     or getattr(c.func, "attr", None) == "effective_policy_audited")
-                for c in ast.walk(node))
-            if not calls_it:
-                offenders.append(f"{rel}::{node.name}:{node.lineno}")
+        for name, calls_audited in _projection_writers(root / rel).items():
+            found[f"{rel}::{name}"] = calls_audited
+    offenders = sorted(k for k, calls in found.items() if not calls)
     assert not offenders, (
         "这些函数在投影 require_auth 但没走 effective_policy_audited："
         f"{offenders}。新增路由权限 writer 必须调它（带审计的那个）")
+
+    discovered = {k.split("::", 1)[1] for k in found}
+    assert discovered == _KNOWN_PROJECTION_WRITERS, (
+        f"自动发现的投影 writer 集合变了：发现 {sorted(discovered)}，"
+        f"期望 {sorted(_KNOWN_PROJECTION_WRITERS)}。\n"
+        "· **少了**（尤其是空集）⇒ 判据已经跟不上代码，本守卫正在空转："
+        "最可能是那条 `SET require_auth = ...` 被提成了模块级常量之外的形式"
+        "（拼接/f-string/跨模块 import），或字段被改名。**先修判据**"
+        "（`_projects_require_auth` / `_hoisted_projection_names`），不要改这个集合。\n"
+        "· **多了** ⇒ 真的新增了投影 writer。确认它调了 effective_policy_audited"
+        "（上一条断言已经在管），然后把它加进 _KNOWN_PROJECTION_WRITERS。"
+        "这一步故意需要人点头：新增一个能改站点访问策略的写入点，值得有人看一眼。")
 
 
 def test_no_other_module_projects_require_auth():
@@ -318,3 +394,48 @@ def test_sentinel_scan_bites_a_probe_file(tmp_path):
         '"""docstring 里提到 require_auth 不算数。"""\n'
         '_PROBE = {"require_auth": True}\n')
     assert _require_auth_offenders(tmp_path) == ["probe.py:2"]
+
+
+def test_projection_writer_scan_bites_probe_modules(tmp_path):
+    """自动发现守卫的反向验证，**常驻**（与上面哨兵那条同一形态、同一理由）。
+
+    上面那条用例保证的是"发现集不为空"，这条保证的是**扫描本身真的会咬**：
+    发现一个不调审计入口的投影函数、并且不误伤只读函数。探针一律写进
+    tmp_path，绝不往被跟踪的文件里注入、也绝不 `git checkout --` 还原
+    （那会把该文件上未提交的修改一并丢掉，中断时探针还会残留在仓库里）。
+    """
+    inline = tmp_path / "inline.py"
+    inline.write_text(
+        '"""模块 docstring 里的 require_auth = :a 不算投影。"""\n'
+        'def _writes_without_audit(site):\n'
+        '    return {"require_auth": {"BOOL": site.get("require_login")}}\n'
+        'def _only_reads(committed_route):\n'
+        '    return bool(committed_route["require_auth"]["BOOL"])\n')
+    # 只有 _writes_without_audit 被发现，且被记成"没调审计入口"（False）；
+    # `_only_reads` 是 `_finish` 的形态——**读**不是投影，不该进结果。
+    assert _projection_writers(inline) == {"_writes_without_audit": False}
+
+    # 提成模块级常量的那次重构：两个函数体里都没有字面量了。
+    # 判据仍然认得出它们（`_hoisted_projection_names` 跟到了那个名字），
+    # 所以"守卫静默变空"这条路被封住，而不是只在事后报警。
+    hoisted = tmp_path / "hoisted.py"
+    hoisted.write_text(
+        '_EXPR = "SET require_auth = :a, allowed_users = :u"\n'
+        'def _good(site):\n'
+        '    pol = permissions.effective_policy_audited(site, actor="x")\n'
+        '    return _upd(UpdateExpression=_EXPR, v=pol)\n'
+        'def _bad(site):\n'
+        '    return _upd(UpdateExpression=_EXPR,\n'
+        '                v=bool(site.get("require_login", True)))\n')
+    assert _projection_writers(hoisted) == {"_good": True, "_bad": False}
+
+    # **判据跟不到的形态**（如实记录当前限制，不假装覆盖）：字符串拼出来的
+    # UpdateExpression，AST 里没有任何一个常量含 `require_auth =`。
+    # 这条留在这里当文档：它是为什么上一条用例还需要那句"发现集必须恰好等于
+    # 已知三个"——真出现这种重构时，是那句断言把它拦下来，不是这里。
+    concatenated = tmp_path / "concatenated.py"
+    concatenated.write_text(
+        'def _writes(site):\n'
+        '    expr = "SET require_auth" + " = :a"\n'
+        '    return _upd(UpdateExpression=expr, v=site)\n')
+    assert _projection_writers(concatenated) == {}
