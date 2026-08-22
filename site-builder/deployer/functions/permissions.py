@@ -456,20 +456,36 @@ def effective_policy(site: dict) -> dict:
             f"站点 {site_id} 的 {field} 形态不合法"
             f"（{found}），已拒绝投影权限。{repair}")
 
+    # 四个字段一律用 `site.get(key, _ABSENT)` 这**同一个**写法探"缺失"。
+    # 不混用 `key not in site` 与 `site.get(key, 默认值)`：三种写法并存时，
+    # 加第五个字段的人有三个样板可抄、却没有任何信号指出哪个才是安全的那个。
+    # 统一之后"缺失可以有默认值"只在下面 collaborators 那一处出现，是显式的例外。
     require_login = site.get("require_login", _ABSENT)
     if not isinstance(require_login, bool):
         reject("require_login", require_login)
 
-    if "allowed_users" not in site:
+    allowed_users = site.get("allowed_users", _ABSENT)
+    if allowed_users is _ABSENT:
         reject("allowed_users", _ABSENT)
     try:
-        allowed = normalize_allowed_users(site["allowed_users"])
+        allowed = normalize_allowed_users(allowed_users)
     except ValueError as exc:
+        # 带上读到的**类型**：`必须为 "org" 或非空邮箱数组` 这一句对 `7`、`"ORG"`、
+        # `[]` 三种坏值一模一样，而三者的修法各不相同。只带类型不带整值——名单可能
+        # 很长，而"含非法邮箱"那条 ValueError 本身已经点出坏的是哪一个。
         raise PolicyDataInvalid(
-            f"站点 {site_id} 的 allowed_users 形态不合法（{exc}），"
+            f"站点 {site_id} 的 allowed_users 形态不合法"
+            f"（读到 {type(allowed_users).__name__}：{exc}），"
             f"已拒绝投影权限。{repair}") from exc
 
-    collaborators = site.get("collaborators", [])
+    # **全函数唯一一处「缺失有默认值」**——其余三个字段的缺失一律 reject。
+    # 这个例外只在这一个字段上站得住：没有 collaborators 键，唯一的读法就是
+    # "没有协作者"。而 require_login 缺失是 True 还是 False、allowed_users 缺失是
+    # "org" 还是空名单，都答不出来——往任一方向兜底都是替站主做一次静默的安全决定
+    # （猜 "org" 是静默扩权，猜空名单是静默收紧）。
+    collaborators = site.get("collaborators", _ABSENT)
+    if collaborators is _ABSENT:
+        collaborators = []
     if not isinstance(collaborators, list) or not all(
             isinstance(e, str) for e in collaborators):
         reject("collaborators", collaborators)

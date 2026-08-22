@@ -890,6 +890,29 @@ def test_wrong_typed_require_login_is_rejected_not_laundered():
         perm.effective_policy(site)
 
 
+def test_effective_policy_returns_the_projection_shape_verbatim():
+    """返回的**形态**本身是契约：Task 5 的三个投影 writer 与 Task 6 都按它取值。
+
+    **整字典相等**而不是四条独立断言：这样多一个键、少一个键、改一个键名都会红。
+    只断言单个字段时，把 `owner` 从返回值里删掉、或把 `allowed_users` 改名成
+    `allowed`、或返回未规范化的原值——三种都能让全部拒绝类用例照样绿，而投影出去
+    的路由表是错的。
+
+    顺带覆盖两处别处没有的东西：`allowed_users` 的**名单分支**（去重排序正是
+    Task 5 要投影进路由表的那个值，之前每个 happy-path 夹具都用 "org"，
+    这条分支从没被 effective_policy 驱动过），以及 `require_login: False`
+    作为**站主显式声明的合法值**——它必须能正常通过，M02 拒的是坏类型，
+    不是"公开"这个决定本身。
+    """
+    site = {"site_id": "s-1", "owner": "o@example.test", "require_login": False,
+            "allowed_users": ["b@example.test", "a@example.test", "a@example.test"],
+            "collaborators": ["c@example.test"]}
+    assert perm.effective_policy(site) == {
+        "require_login": False, "owner": "o@example.test",
+        "allowed_users": ["a@example.test", "b@example.test"],   # 去重排序后
+        "collaborators": ["c@example.test"]}
+
+
 def test_missing_collaborators_means_empty_list():
     """collaborators 是**唯一**允许缺失的字段：缺失有唯一安全解释（没有协作者）。"""
     site = {"site_id": "s-1", "owner": "o@example.test",
