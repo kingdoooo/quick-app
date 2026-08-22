@@ -1,11 +1,13 @@
 """handler 层：路由、错误码、以及**副作用前置顺序**。"""
 import json
+import os
 from unittest.mock import patch
 
 import boto3
 import pytest
 
 import api
+import common
 import handler
 import permissions
 import session
@@ -191,6 +193,99 @@ def test_value_error_is_400(aws, secret):
     r = handler.handler(_write_ev("/api/sites/s-1/collaborators",
                                   body={"add": ["not-an-email"]}), None)
     assert r["statusCode"] == 400
+
+
+def test_policy_data_invalid_maps_to_409_not_a_generic_500(aws, secret,
+                                                           monkeypatch):
+    """坏数据必须给 409 + 可判读文案，不能被兜底吞成 500「服务内部错误」。
+
+    不给专门分支的话，这条修复的"响亮失败"就变成一个查不出原因的 500
+    ——运维会往平台故障方向查，而实际是某一行数据脏了。
+    409 的选择理由：它确实是"资源当前状态阻止本次操作"，
+    且 panel 里 409 已用于 PermissionConflict，语义相邻。
+    """
+    monkeypatch.setattr(
+        api, "do_set_collaborators",
+        lambda *a, **k: (_ for _ in ()).throw(
+            permissions.PolicyDataInvalid("站点 s-1 的 require_login 形态不合法")))
+    resp = handler.handler(_write_ev("/api/sites/s-1/collaborators",
+                                     method="PUT",
+                                     body={"add": ["x@example.test"]}), None)
+    assert resp["statusCode"] == 409
+    assert "require_login" in resp["body"]
+
+
+# 两条坏法的文案必须**分别**活着走到 HTTP 响应里。上面那条用的是手写字符串，
+# 只能证明"某个字符串没被吞掉"；这两条走**真实 writer**（api → permissions →
+# effective_policy），证明的是用户真正会看到的那段字。
+#
+# 为什么要按分支各来一条：spec §4.1 接受"坏数据行让站点既不能改权限也不能部署"
+# 这个代价，前提**只有一条**——错误文案直接给出修法。而两种坏法的修法相反：
+#   · 字段缺失 ⇒ 绝大多数是"还没成功部署过"，修法是**部署一次**；
+#   · 类型不对 ⇒ 那一行存着个用不了的值，修法是人工改库。
+# 把前者的文案换成后者，用户会被指去手改 DynamoDB 找一个并不存在的坏值；
+# 反过来则是让他一遍遍重新部署去修一个部署改不好的值。所以两条各断言
+# "有自己那句"且"没有另一句"——只断言前半截时，把两句合并成一句大杂烩照样绿。
+
+def test_absent_field_over_http_tells_the_user_to_deploy_once(aws, secret):
+    """字段缺失（从没成功部署过）：文案要说"部署一次"，不能说"去改库"。"""
+    common._table("SITES_TABLE").put_item(Item={
+        # 只有 create_site_record 写的那几个字段：权限字段由首次成功部署的
+        # register_route._seed_permissions_if_absent 初始化，此刻还没有。
+        "site_id": "s-fresh", "owner": "owner@x.com", "name": "s",
+        "status": "DEPLOYING", "permissions_rev": 1})
+    r = handler.handler(_write_ev("/api/sites/s-fresh/permissions",
+                                  body={"require_login": False}), None)
+    assert r["statusCode"] == 409, r
+    msg = json.loads(r["body"])["error"]
+    assert "require_login" in msg and "字段缺失" in msg, msg
+    assert "尚未成功部署过" in msg, f"没告诉用户「部署一次就好」: {msg}"
+    assert "请把 sites 表该行修正为正确类型后重试" not in msg, (
+        f"对一行没有坏值的记录说去手改库——用户找不到要改的东西: {msg}")
+
+
+def test_wrong_typed_field_over_http_tells_the_user_to_fix_the_row(aws, secret):
+    """类型不对：文案要说"改那一行"，且**不能**建议再部署一次（部署改不好它）。"""
+    _seed()
+    permissions._ddb_client().update_item(
+        TableName=os.environ["SITES_TABLE"],
+        Key={"site_id": {"S": "s-1"}},
+        UpdateExpression="SET require_login = :bad",
+        ExpressionAttributeValues={":bad": {"N": "0"}})
+    r = handler.handler(_write_ev("/api/sites/s-1/permissions",
+                                  body={"require_login": False}), None)
+    assert r["statusCode"] == 409, r
+    msg = json.loads(r["body"])["error"]
+    assert "require_login" in msg, msg
+    assert "请把 sites 表该行修正为正确类型后重试" in msg, msg
+    assert "尚未成功部署过" not in msg, (
+        f"建议去部署一次——而部署不会改好一个坏值: {msg}")
+
+
+def test_policy_data_invalid_409_carries_a_machine_readable_code(aws, secret):
+    """409 要带 `code`，前端才能把"刷新后重试即可"那句**不加**上去。
+
+    reportError 对**所有** 409 追加"（刷新后重试即可）"——对并发冲突是对的
+    （重试确实能成），对坏数据是错的：刷新一万次都不会变。文案是这条修复
+    唯一的价值（spec §4.1），被 UI 追加一句相反的指示等于把它抵消掉。
+    状态码不能换（409 语义正确且已被 PermissionConflict 占用），所以让前端
+    有一个**判据**去区分，而不是让它去猜错误正文里的字。
+    """
+    _seed()
+    permissions._ddb_client().update_item(
+        TableName=os.environ["SITES_TABLE"],
+        Key={"site_id": {"S": "s-1"}},
+        UpdateExpression="SET require_login = :bad",
+        ExpressionAttributeValues={":bad": {"N": "0"}})
+    r = handler.handler(_write_ev("/api/sites/s-1/permissions",
+                                  body={"require_login": False}), None)
+    assert json.loads(r["body"])["code"] == handler.POLICY_DATA_INVALID_CODE
+    # 并发冲突那条**不能**带它：带上就等于让前端对真该重试的错误也隐去提示
+    with patch.object(permissions, "set_access_policy",
+                      side_effect=permissions.PermissionConflict("并发")):
+        c = handler.handler(_write_ev("/api/sites/s-1/permissions",
+                                      body={"require_login": False}), None)
+    assert "code" not in json.loads(c["body"]), c
 
 
 def test_unknown_route_is_404(aws, secret):

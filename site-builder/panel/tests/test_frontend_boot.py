@@ -890,3 +890,66 @@ def test_harness_catches_the_tab_not_being_handed_the_site(tmp_path):
     code, out = run_boot("analytics-live", app)
     assert out["errors"] and code != 0, (
         f"不传 site 也没崩 —— 说明统计页压根没被渲染（用例空转）: {out}")
+
+
+# ── 409 的下一步提示必须按错误类型分开（S1 / M02）─────────────────────
+#
+# reportError 原来对**所有** 409 追加"（刷新后重试即可）"。坏策略数据
+# （PolicyDataInvalid → 409）刷新一万次都不会变，而"字段缺失"那支要的动作是
+# **部署一次**——后端把修法写进文案是 spec §4.1 接受"拒绝"这个代价的唯一前提，
+# UI 追加一句反向指示等于把它抵消掉。判据用后端给的 `code`，不去猜正文里的字。
+
+RETRY_HINT = "刷新后重试即可"          # reportError 追加的那句（唯一特征串）
+
+
+def _report_error_cases() -> dict:
+    code, out = run_boot("report-error")
+    assert code == 0, f"report-error 场景自身抛异常: {out}"
+    return {c["name"]: c["toast"] for c in out["cases"]}
+
+
+def test_policy_data_409_does_not_tell_the_user_to_refresh_and_retry():
+    """坏数据 409：文案原样显示，**不**追加"刷新后重试即可"。"""
+    cases = _report_error_cases()
+    assert "BAD-DATA-SENTINEL" in cases["policy-409"], (
+        f"后端文案没到页面上——那是这条修复唯一的价值: {cases['policy-409']}")
+    assert RETRY_HINT not in cases["policy-409"], (
+        f"对坏数据说「刷新后重试即可」——刷新永远修不好它: {cases['policy-409']}")
+
+
+def test_a_real_conflict_409_still_tells_the_user_to_retry():
+    """**对照**：并发冲突那条必须还留着提示。
+
+    没有这条时，"整段追加逻辑被删掉"与"只对坏数据跳过"无法区分——而前者会把
+    一个该重试的提示也一起删掉（那才是 409 最常见的那一类）。
+    """
+    cases = _report_error_cases()
+    assert RETRY_HINT in cases["conflict-409"], (
+        f"并发冲突不再提示重试，追加逻辑被整段删了: {cases['conflict-409']}")
+    assert "CONFLICT-SENTINEL" in cases["conflict-409"]
+
+
+def test_403_is_untouched_by_the_code_branch():
+    cases = _report_error_cases()
+    assert cases["denied-403"].count("DENIED-SENTINEL") == 1
+    assert RETRY_HINT not in cases["denied-403"]
+
+
+def test_harness_catches_the_hint_being_appended_to_bad_data_again(tmp_path):
+    """反向验证：把判据去掉（退回"所有 409 都追加"）必须变红。
+
+    没有这条，上面那两条可能只是因为 harness 压根没跑到 reportError。
+    """
+    # 只改**比较那一处**，不改常量声明（连声明一起换会造出
+    # `const 'x' = …` 的语法错，那时红的是解析而不是被测行为——假红）
+    old = "err.payload.code === POLICY_DATA_INVALID_CODE"
+    src = APP.read_text()
+    assert old in src, f"注入点找不到（代码改过？）: {old}"
+    out = tmp_path / "app.js"
+    # 让判据恒不成立 ⇒ 坏数据又落回"追加提示"那一支
+    out.write_text(src.replace(old, "err.payload.code === 'never-matches'", 1))
+    code, res = run_boot("report-error", out)
+    assert code == 0, res
+    cases = {c["name"]: c["toast"] for c in res["cases"]}
+    assert RETRY_HINT in cases["policy-409"], (
+        f"注入了原缺陷但 harness 仍然绿——它什么都没盯: {cases}")

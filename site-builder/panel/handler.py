@@ -79,6 +79,12 @@ KEY_REVOKE = r"^/api/keys/revoke$"
 ADMIN_REMOVE = r"^/api/admins/remove$"
 KEY_SWITCH = r"^/api/settings/api-key$"
 
+# 409 响应体里的 `code`：区分"坏数据（重试无用）"与"并发冲突（重试即可）"。
+# **两端各自 import 不了对方**（一个是 Python Lambda、一个是浏览器 JS），
+# 所以这个字面量在 frontend/app.js 里有一份镜像，由
+# test_frontend_contract 的 real-value 断言绑定，漂了当场红。
+POLICY_DATA_INVALID_CODE = "policy_data_invalid"
+
 # **这条链路上的写请求一律不用"DELETE + 请求体"**（2026-08-13 真机隔离出来的）。
 #
 # CloudFront 把 DELETE 的请求体交给了 Lambda@Edge（分发配了 `include_body=True`，
@@ -198,6 +204,21 @@ def handler(event, context):
         return _json(403, {"error": str(e)})
     except permissions.PermissionConflict as e:
         return _json(409, {"error": str(e)})
+    except permissions.PolicyDataInvalid as e:
+        # 坏源数据阻止了投影。**必须有独立分支**：落到下面的兜底会变成
+        # 500「服务内部错误」，而这既不是平台故障、也让运维查不到原因。
+        # 文案原样透出——它已经点名 site_id、坏字段与修法（见 effective_policy）。
+        #
+        # **分支位置是承重的**：PolicyDataInvalid 故意不继承 ValueError，所以
+        # 它不会被下面那条 400 抢走；但顺序仍写在 ValueError 之前，这样将来有人
+        # 改了继承关系时行为不变（permissions.py 那个类的 docstring 记着理由）。
+        #
+        # `code` 不是装饰：前端的 reportError 对**所有** 409 追加一句
+        # "（刷新后重试即可）"——对并发冲突正确，对坏数据是**相反**的指示
+        # （刷新一万次都不会变，缺字段那支要的是"部署一次"）。而文案给出修法
+        # 正是 spec §4.1 接受"拒绝"这个代价的唯一前提，被 UI 追加一句反向指示
+        # 就等于把它抵消掉。让前端有个判据，而不是让它去猜错误正文里的字。
+        return _json(409, {"error": str(e), "code": POLICY_DATA_INVALID_CODE})
     except ValueError as e:
         # 入口校验类（非法邮箱、owner 不能同时是协作者、allowed_users 形态
         # 不对等）——用户可以纠正，不是服务故障

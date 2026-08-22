@@ -648,6 +648,13 @@ def do_update_permissions(caller: str, site_id: str, require_login=None,
         raise NotOwner(str(e)) from e
     except permissions.PermissionConflict as e:
         raise PermissionConflict(str(e)) from e
+    except permissions.PolicyDataInvalid as e:
+        # 与 panel 的 409 同义，转成 Agent 可读的文案（同 NotOwner 的处理形态）。
+        # **不用本模块的 PermissionConflict**：它的语义是"重试即可"（见其
+        # docstring），而坏数据重试一万次都不会变——那会让 Agent 去建议一件
+        # 确定无效的事。文案 `str(e)` 原样带上：它已经点名 site_id、坏字段与
+        # 修法，而"文案给出修法"是 spec §4.1 接受"拒绝"这个代价的唯一前提。
+        raise NotOwner(str(e)) from e
     out["note"] = "已生效，边缘缓存最多 1 分钟后全网一致"
     return out
 
@@ -675,6 +682,11 @@ def do_manage_collaborators(caller: str, site_id: str, add=None, remove=None,
         raise NotOwner(str(e)) from e
     except permissions.PermissionConflict as e:
         raise PermissionConflict(str(e)) from e
+    except permissions.PolicyDataInvalid as e:
+        # 同 do_update_permissions 上面那条（理由写在那里）。这里必须**也**有：
+        # 本函数的 add/remove 与 transfer_owner 是两个分支、两个 writer，
+        # 只映射一处的症状是另一处独自漏成裸异常。
+        raise NotOwner(str(e)) from e
 
 
 def do_get_permissions(caller: str, site_id: str) -> dict:

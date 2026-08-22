@@ -1522,3 +1522,20 @@ def test_globally_disabled_banner_text_exists_and_is_not_a_gate():
 def test_sparkline_handles_all_zero_without_dividing_by_zero():
     blob = _js()
     assert "max === 0" in blob, "sparkline 没处理全 0（会产出 NaN 坐标）"
+
+
+# ── ⑭ 409 的两类（S1 / M02）───────────────────────────────────────────
+#
+# `code` 是唯一横跨两端的判据，而两端 import 不了对方（Python Lambda / 浏览器
+# JS）。所以字面量必然有两份——这一条把它们绑在一起，漂了当场红。
+# 行为本身（追加的那句到底还在不在）由 test_frontend_boot 的 report-error 场景
+# 真跑一遍；这里只锁"两份是同一个值"。
+
+def test_policy_data_invalid_code_matches_the_backend_literal():
+    import handler
+    blob = _js()
+    m = re.search(r"const\s+POLICY_DATA_INVALID_CODE\s*=\s*'([^']*)'", blob)
+    assert m, "前端没有 POLICY_DATA_INVALID_CODE 常量"
+    assert m.group(1) == handler.POLICY_DATA_INVALID_CODE, (
+        f"前后端的 code 漂了：前端 {m.group(1)!r} / "
+        f"后端 {handler.POLICY_DATA_INVALID_CODE!r}")

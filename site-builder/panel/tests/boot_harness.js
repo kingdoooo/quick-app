@@ -346,6 +346,49 @@ process.on('unhandledRejection', (e) => {
 
 eval(fs.readFileSync(APP, 'utf8'));
 
+/* 场景 report-error：把 reportError() 真正跑一遍，录下 toast 正文。
+ *
+ * 为什么必须真跑而不是静态查：reportError 对**所有** 409 追加一句
+ * "（刷新后重试即可）"。对并发冲突那是对的；对坏策略数据（S1/M02 的
+ * PolicyDataInvalid → 409）恰好相反——刷新一万次都不会变，而"字段缺失"那支
+ * 要的动作是**部署一次**。后端把修法写进文案是 spec §4.1 接受"拒绝"这个
+ * 代价的唯一前提，UI 追加一句反向指示就把它抵消掉了。
+ * 静态断言只能证明源码里"提到了"那个 code，证不出追加的那句到底还在不在。
+ *
+ * 三格：坏数据 409 / 并发 409 / 403。第二格是**对照**——去掉整段追加逻辑
+ * （而不是只对坏数据跳过）时它必须变红，否则这条修复会静默地把该重试的
+ * 提示也一起删掉。 */
+if (SCENARIO === 'report-error') {
+  const CASES = [
+    ['policy-409', 409, { error: 'BAD-DATA-SENTINEL', code: 'policy_data_invalid' }],
+    ['conflict-409', 409, { error: 'CONFLICT-SENTINEL' }],
+    ['denied-403', 403, { error: 'DENIED-SENTINEL' }],
+  ];
+  /* ApiError 走**真实的 api() 那条路**造出来，不在这里 new。
+   * 两个理由：① `class` 声明不会从 eval 的作用域泄漏到 global（`function`
+   * 会），所以这里根本拿不到那个构造器；② 更重要的是，页面上显示的
+   * `err.message` 是 api() 组装的（payload.error → super(...)），自己 new 一个
+   * 就绕过了那段组装——那正是要断言的东西之一。 */
+  (async () => {
+    const out = [];
+    for (const [name, status, payload] of CASES) {
+      global.fetch = async () => ({ ok: false, status,
+                                    json: async () => payload });
+      htmlWrites.length = 0;
+      try {
+        await api('PUT', '/api/probe', {});
+        out.push({ name, toast: '<api() 没有抛——夹具失效>' });
+        continue;
+      } catch (e) {
+        reportError('保存失败', e);
+      }
+      out.push({ name, toast: htmlWrites.join('\n').replace(/<[^>]*>/g, '') });
+    }
+    console.log(JSON.stringify({ scenario: 'report-error', cases: out, errors }));
+    process.exit(errors.length === 0 ? 0 : 3);
+  })();
+}
+
 /* 场景 probe：不看启动流程，只把纯判定函数的**判定表**打出来。
  * 为什么复用本 harness 而不另写一个更小的 stub：app.js 顶层就绑了
  * DOM 事件（$('#logout-btn').addEventListener…），任何"更薄"的 stub 都会在

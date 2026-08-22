@@ -377,10 +377,25 @@ function openModal(opts) {
 
 document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape') closeModal(); });
 
+/* panel handler.py 的 POLICY_DATA_INVALID_CODE 的镜像（两端 import 不了对方：
+ * 一个是 Python Lambda、一个是浏览器 JS）。由 test_frontend_contract 的
+ * real-value 断言与那一侧绑定，漂了当场红。 */
+const POLICY_DATA_INVALID_CODE = 'policy_data_invalid';
+
 /* 统一的错误提示：把后端的中文错误原样给用户（它们是写给用户看的），
- * 并对两个特殊码补充"下一步怎么办"。 */
+ * 并对两个特殊码补充"下一步怎么办"。
+ *
+ * **409 分两类，追加的那句只对其中一类成立**：并发冲突刷新后重试确实能成，
+ * 而坏策略数据（PolicyDataInvalid，后端带 code）刷新一万次都不会变——它那两支
+ * 的修法一个是"成功部署一次"、一个是"人工改那一行"，都写在 err.message 里了。
+ * 追加一句相反的指示等于把后端那段文案抵消掉，而"文案直接给出修法"正是
+ * spec §4.1 接受"坏数据行让站点既不能改权限也不能部署"这个代价的唯一前提。
+ * 判据用后端给的 code，**不去猜正文里的字**（文案会改，判据不该跟着漂）。 */
 function reportError(what, err) {
-  if (err instanceof ApiError && err.status === 409) {
+  if (err instanceof ApiError && err.status === 409
+      && err.payload.code === POLICY_DATA_INVALID_CODE) {
+    toast(what, err.message, 'err');
+  } else if (err instanceof ApiError && err.status === 409) {
     toast(what, err.message + '（刷新后重试即可）', 'err');
   } else if (err instanceof ApiError && err.status === 403) {
     toast(what, err.message, 'err');

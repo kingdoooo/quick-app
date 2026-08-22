@@ -344,6 +344,71 @@ def test_update_permissions_surfaces_conflict(aws, monkeypatch):
         server.do_update_permissions("o@x.com", SITE_ID, require_login=False)
 
 
+# ---- 坏策略数据（S1 / M02）：拒绝要变成 Agent 读得懂的错误 ----
+#
+# 与 panel 的 409 同义。**选 NotOwner 而不是本模块的 PermissionConflict**：
+# 后者的 docstring 写的是"并发修改，让 Agent 提示用户重试"，而坏数据重试一万次
+# 都不会变——把它塞进那个类型就是让 Agent 去建议一件确定无效的事。NotOwner 的
+# 语义是"这次动作做不了"，不含重试暗示，是既有两个类型里对的那个。
+#
+# 断言到**文案原文**而不只是异常类型：spec §4.1 接受"坏数据行让站点既不能改
+# 权限也不能部署"这个代价，前提只有一条——错误文案直接给出修法。丢了文案，
+# 类型再对也只是把 500 换成一句"你不是 owner"（而调用者恰恰**是** owner）。
+
+def _break_require_login(site_id=SITE_ID):
+    """把行改坏（模拟迁移脚本 / 人工修库 / M02 之前的 writer 留下的形态）。"""
+    import os
+
+    import permissions
+    permissions._ddb_client().update_item(
+        TableName=os.environ["SITES_TABLE"],
+        Key={"site_id": {"S": site_id}},
+        UpdateExpression="SET require_login = :bad",
+        ExpressionAttributeValues={":bad": {"N": "0"}})
+
+
+@pytest.mark.parametrize("call", [
+    lambda s: s.do_update_permissions("o@x.com", SITE_ID, require_login=False),
+    lambda s: s.do_manage_collaborators("o@x.com", SITE_ID, add=["c@x.com"]),
+    lambda s: s.do_manage_collaborators("o@x.com", SITE_ID,
+                                        transfer_owner="new@x.com"),
+])
+def test_bad_policy_data_becomes_a_readable_tool_error(aws, call):
+    """三条写路径都要映射：漏一条的症状是那条路径独自漏成裸异常。
+
+    `do_manage_collaborators` 里 transfer_owner 与 add/remove 是**两个分支**，
+    所以两条都单独走一遍——只测其中一条时，把 except 加在错误的层级照样绿。
+    """
+    import server
+    _seed_site_and_route()
+    _break_require_login()
+    with pytest.raises(server.NotOwner) as excinfo:
+        call(server)
+    msg = str(excinfo.value)
+    assert "require_login" in msg, f"没点名坏字段: {msg}"
+    assert "请把 sites 表该行修正为正确类型后重试" in msg, (
+        f"修法文案没到达 Agent——它是这条拒绝唯一的价值: {msg}")
+
+
+def test_absent_policy_field_keeps_the_deploy_once_wording(aws):
+    """字段缺失那支的修法是"部署一次"，映射不能把它换成"去改库"。
+
+    这条路径**是真实常态**：站点建出来但首次部署没成功过，用户第一件想做的事
+    往往就是改权限。对他说"请把 sites 表该行修正为正确类型"是不可执行的——
+    那一行没有任何坏值，他会去找一个不存在的东西。
+    """
+    import common
+    import server
+    common.upsert_site("nodeploy-abc123", owner="o@x.com", name="d",
+                       status="DEPLOYING", permissions_rev=1)
+    with pytest.raises(server.NotOwner) as excinfo:
+        server.do_update_permissions("o@x.com", "nodeploy-abc123",
+                                     require_login=False)
+    msg = str(excinfo.value)
+    assert "尚未成功部署过" in msg, f"没告诉用户「部署一次就好」: {msg}"
+    assert "请把 sites 表该行修正为正确类型后重试" not in msg, msg
+
+
 def test_update_permissions_works_before_first_deploy(aws):
     """站点还没部署成功（无路由 item）时改权限不能炸——只更新真源即可。"""
     import common

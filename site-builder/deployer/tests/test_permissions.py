@@ -1143,3 +1143,81 @@ def test_an_unrelated_permission_change_does_not_flip_a_wrong_typed_row_public(a
         TableName="routing",
         Key={"subdomain": {"S": common.subdomain_for("s-1")}}), (
         "拒绝路径往路由表写了投影——这正是 M02 要消除的那次洗数据")
+
+
+# ---- 三个 writer 的拒绝都要留下审计（S1 / M02）----
+#
+# 审计本身在 `effective_policy_audited` 里（唯一一处包装），三个 writer 都走它。
+# 下面两条是**端到端**的：走真实 writer，而不是直接调那个包装——只调包装自己是
+# 循环论证，"某个 writer 绕过包装"时照样绿。
+# 第三个 writer `resync_route` 的"走了带审计的入口"由本文件的 AST 守卫保证
+# （它**只接受** `effective_policy_audited`，调纯函数会红），不再为它单独搭一套
+# admin 夹具。这是有意的取舍，不是遗漏。
+
+def test_write_path_rejection_is_audited_and_writes_nothing(aws, monkeypatch):
+    """走**真实 writer**（写路径）：拒绝时落一条审计，且零写副作用。"""
+    import os
+
+    import common
+    import ops_log
+    common.upsert_site("s-1", owner="o@example.test", name="s", status="ACTIVE",
+                       allowed_users="org", collaborators=[], permissions_rev=1)
+    perm._ddb_client().update_item(
+        TableName=os.environ["SITES_TABLE"], Key={"site_id": {"S": "s-1"}},
+        UpdateExpression="SET require_login = :bad",
+        ExpressionAttributeValues={":bad": {"N": "0"}})
+    before = common.get_site_consistent("s-1")["permissions_rev"]
+
+    actions = []
+    monkeypatch.setattr(ops_log, "record", lambda **kw: actions.append(kw["action"]))
+    with pytest.raises(perm.PolicyDataInvalid):
+        perm.set_collaborators("s-1", actor="o@example.test",
+                               add=["c@example.test"])
+    assert actions == ["reject_policy_projection"], "拒绝没有留下审计"
+    assert common.get_site_consistent("s-1")["permissions_rev"] == before, \
+        "拒绝之后 rev 变了 —— 说明拒绝发生在写入之后，位置错了"
+
+
+def test_deploy_path_rejection_is_audited(aws, monkeypatch):
+    """走**真实 writer**（部署路径）：`_route_item` 的拒绝也要落审计。"""
+    from decimal import Decimal
+
+    import ops_log
+    import register_route
+    actions = []
+    monkeypatch.setattr(ops_log, "record", lambda **kw: actions.append(kw["action"]))
+    bad = {"site_id": "s-1", "owner": "o@example.test",
+           "require_login": Decimal(0), "allowed_users": "org",
+           "collaborators": []}
+    with pytest.raises(perm.PolicyDataInvalid):
+        register_route._route_item({"site_id": "s-1", "job_id": "job-1",
+                                    "api_target": ""},
+                                   bad, "o@example.test", "app-s-1")
+    assert actions == ["reject_policy_projection"]
+
+
+def test_a_broken_audit_table_cannot_mask_the_refusal(aws, monkeypatch):
+    """审计表挂了**不得**改变拒绝这个结果，也不得改变抛出来的异常类型。
+
+    **注入点是 `ops_log._put` 而不是 `record`**，这个选择本身是断言的一部分：
+    真机的失败面在那次 PutItem（表没建、AccessDenied、限流），而 `record` 的
+    契约就是"任何异常都吞掉"（ops_log 模块 docstring 第 ② 条）。patch `record`
+    只能证明一件按契约不会发生的事，而且会把"审计失败不影响业务"这个不变量
+    在调用点抄成第二份——正是本轮要消除的形态。它只有一处定义（在 ops_log
+    里），所以这里注入**真实**的失败面，让那一处定义证明自己在起作用。
+
+    为什么这条必须存在：拒绝的异常若被审计的异常顶替，panel 的 409 与 MCP 的
+    NotOwner 映射会同时失配、退回 500——那就是这一轮要消灭的形态本身，而且
+    触发条件（审计表故障）与坏数据毫不相干，排查时没人会往这儿看。
+    """
+    import ops_log
+
+    def _boom(**item):
+        raise RuntimeError("ops-log 表不可用")
+
+    monkeypatch.setattr(ops_log, "_put", _boom)
+    site = {"site_id": "s-1", "owner": "o@example.test",
+            "require_login": "yes", "allowed_users": "org", "collaborators": []}
+    # 异常类型必须还是 PolicyDataInvalid（不是 RuntimeError），文案也还在
+    with pytest.raises(perm.PolicyDataInvalid, match="require_login"):
+        perm.effective_policy_audited(site, actor="o@example.test")
