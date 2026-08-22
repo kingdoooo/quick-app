@@ -853,3 +853,184 @@ def test_unregistered_analytics_typo_is_denied_to_everyone():
     """未登记动作对所有人拒绝（fail-closed）——拼错动作名不会变成放行。"""
     from permissions import ROLE_OWNER, can
     assert not can(ROLE_OWNER, "view_analytic")
+
+
+# ---- effective_policy：坏数据一律拒绝投影，不猜方向（S1 / M02）----
+# 读路径（Edge）对坏数据 fail-closed，而**写路径**原来用
+# `bool(site.get("require_login", True))` + `site.get("allowed_users", "org")`
+# 把坏数据洗成合法的 `{"BOOL": false}` / `"org"` 再投影给 Edge——两侧对坏数据的
+# 语义相反，于是 Edge 的加固被写入侧整个抵消。判据只有一条：**每个字段要么类型
+# 明确，要么它的「缺失」有唯一安全解释**，两者都不成立即拒绝。
+
+def test_policy_data_invalid_is_not_a_valueerror():
+    """基类是有承载力的：**不能**继承 ValueError。
+
+    panel/handler.py 的 `except ValueError` 分支返回 400，且排在通用 500 之前；
+    继承 ValueError 会让专门给这条路径的 409 分支变成永远到不了的死代码，
+    而两侧用例照样全绿——线上答 400、"刷新重试"的提示不出现。
+    """
+    assert issubclass(perm.PolicyDataInvalid, Exception)
+    assert not issubclass(perm.PolicyDataInvalid, ValueError), (
+        "PolicyDataInvalid 不得继承 ValueError（panel 的 400 分支会抢先命中）")
+
+
+def test_wrong_typed_require_login_is_rejected_not_laundered():
+    """`Decimal(0)` 不得被 bool() 洗成 False。
+
+    这是 M02 的核心：`bool(Decimal(0))` 是 False，于是它被写成字面
+    `{"BOOL": false}`，而 Edge 的判定正是 "require_auth is False ⇒ 公开"
+    ——坏数据被洗成"站主显式声明公开"，Edge 2026-08-06 加的 fail-closed
+    哨兵被整个抵消。私有站点变成全公网可读。
+    """
+    from decimal import Decimal
+    site = {"site_id": "s-1", "owner": "o@example.test",
+            "require_login": Decimal(0), "allowed_users": "org",
+            "collaborators": []}
+    with pytest.raises(perm.PolicyDataInvalid, match="require_login"):
+        perm.effective_policy(site)
+
+
+def test_missing_collaborators_means_empty_list():
+    """collaborators 是**唯一**允许缺失的字段：缺失有唯一安全解释（没有协作者）。"""
+    site = {"site_id": "s-1", "owner": "o@example.test",
+            "require_login": True, "allowed_users": "org"}
+    assert perm.effective_policy(site)["collaborators"] == []
+
+
+@pytest.mark.parametrize("field", ["require_login", "allowed_users", "owner"])
+def test_missing_ambiguous_field_is_rejected(field):
+    """这三个字段缺失都没有唯一安全解释，所以一律拒绝、不猜方向。
+
+    require_login 缺失：True 还是 False？allowed_users 缺失：org 还是空名单？
+    改 "org" 是静默扩权，改 [] 是静默收紧——两者都在猜历史意图。
+    """
+    site = {"site_id": "s-1", "owner": "o@example.test", "require_login": True,
+            "allowed_users": "org", "collaborators": []}
+    del site[field]
+    with pytest.raises(perm.PolicyDataInvalid, match=field):
+        perm.effective_policy(site)
+
+
+def test_rejection_message_names_the_site_and_the_repair():
+    """文案必须点名 site_id 与坏字段并给出修法。
+
+    否则这条"响亮失败"会变成一个查不出原因的 409，等于第二个 M03
+    （那条的教训正是：只抛原始 SQLSTATE 而不给补救办法，
+    "理论上可恢复"就不等于"实际上可恢复"）。
+    """
+    from decimal import Decimal
+    site = {"site_id": "s-abc", "owner": "o@example.test",
+            "require_login": Decimal(0), "allowed_users": "org",
+            "collaborators": []}
+    with pytest.raises(perm.PolicyDataInvalid) as excinfo:
+        perm.effective_policy(site)
+    msg = str(excinfo.value)
+    assert "s-abc" in msg, "文案没点名 site_id"
+    assert "require_login" in msg, "文案没给出坏字段"
+    assert "BOOL" in msg, "文案没给出修法（正确类型）"
+
+
+@pytest.mark.parametrize("field", ["require_login", "allowed_users", "owner"])
+def test_rejection_names_the_field_that_is_actually_broken(field):
+    """点名的必须是**真正坏掉的那个**字段。
+
+    上面 `match=field` 那三条参数化用例单独还不够：补救文案里本来就列着全部
+    三个字段名（"require_login: BOOL；allowed_users: …；owner: 非空 S"），
+    所以一个"永远只报 owner"的实现照样能让它们三条全绿。这里按句式断言——
+    坏字段那句在，另两个字段的同句式不在。点错字段的代价是让人去修没坏的
+    那一行，而这条路径的全部价值就在"人照着文案能修好"。
+    """
+    site = {"site_id": "s-1", "owner": "o@example.test", "require_login": True,
+            "allowed_users": "org", "collaborators": []}
+    del site[field]
+    with pytest.raises(perm.PolicyDataInvalid) as excinfo:
+        perm.effective_policy(site)
+    msg = str(excinfo.value)
+    assert f"的 {field} 形态不合法" in msg, f"没点名坏字段 {field}：{msg}"
+    for other in ("require_login", "allowed_users", "owner"):
+        if other != field:
+            assert f"的 {other} 形态不合法" not in msg, (
+                f"坏的是 {field}，文案却点名了 {other}：{msg}")
+
+
+@pytest.mark.parametrize("field", ["require_login", "allowed_users", "owner"])
+def test_rejection_says_missing_when_the_field_is_missing(field):
+    """缺失要报成"字段缺失"，不能报成 `NoneType=None`。
+
+    DynamoDB 有真正的 NULL 型（`{"NULL": true}` 读出来就是 None），两者是**两种
+    不同的行**。把缺失也写成 `NoneType=None` 会让人拿着这句话去表里找一个根本
+    不存在的 null 值——而"先认出那一行到底哪里坏了"这一步全靠这句话。
+    """
+    site = {"site_id": "s-1", "owner": "o@example.test", "require_login": True,
+            "allowed_users": "org", "collaborators": []}
+    del site[field]
+    with pytest.raises(perm.PolicyDataInvalid) as excinfo:
+        perm.effective_policy(site)
+    msg = str(excinfo.value)
+    assert "字段缺失" in msg, f"缺失没被报成缺失：{msg}"
+    assert "NoneType" not in msg, f"缺失被报成了 null：{msg}"
+
+
+@pytest.mark.parametrize("field,bad", [
+    ("require_login", "true"),          # 字符串 "true"，不是 BOOL
+    ("allowed_users", 7),               # 既不是 "org" 也不是名单
+    ("collaborators", "c@example.test"),  # 单个字符串而非 L
+    ("owner", ""),                      # 空字符串
+])
+def test_repair_hint_covers_every_field_it_can_reject(field, bad):
+    """**能拒的每个字段都要给出它自己的合法形态**，否则这条路径就没有价值。
+
+    整个"响亮失败"的代价是站点在人工修好之前既不能改权限也不能部署；
+    换来的东西只有一样——文案让人知道该把哪一行改成什么。少写一个字段的
+    形态（collaborators 原来就漏了）时，那个字段的拒绝就是一个不可行动的
+    409，等于把数据问题变成一张工单。
+    """
+    site = {"site_id": "s-1", "owner": "o@example.test", "require_login": True,
+            "allowed_users": "org", "collaborators": []}
+    site[field] = bad
+    with pytest.raises(perm.PolicyDataInvalid) as excinfo:
+        perm.effective_policy(site)
+    msg = str(excinfo.value)
+    assert f"的 {field} 形态不合法" in msg, f"没点名坏字段 {field}：{msg}"
+    assert f"{field}: " in msg, (
+        f"补救文案没给出 {field} 的合法形态，用户无法照着修：{msg}")
+
+
+def test_effective_policy_audited_records_the_rejection(aws):
+    """拒绝要留下可查的一行，且**审计只有这一处包装**。
+
+    三个投影 writer 各写一份 try/except 就是本轮要消除的形态（同一段处理抄
+    多份，漏一处即静默拒绝）。所以纯解析留在 effective_policy（体检脚本要调
+    它，而那条路径不该写任何东西），落审计的包装只此一份。
+    """
+    from decimal import Decimal
+
+    import boto3
+    site = {"site_id": "s-abc", "owner": "o@example.test",
+            "require_login": Decimal(0), "allowed_users": "org",
+            "collaborators": []}
+    with pytest.raises(perm.PolicyDataInvalid):
+        perm.effective_policy_audited(site, actor="who@example.test")
+    items = boto3.client("dynamodb").scan(TableName="site-ops-log")["Items"]
+    assert len(items) == 1, f"应恰好落一条审计，实际 {items}"
+    row = items[0]
+    assert row["target"]["S"] == "site:s-abc"
+    assert row["actor"]["S"] == "who@example.test"
+    assert row["action"]["S"] == "reject_policy_projection"
+    assert row["result"]["S"] == "rejected"
+
+
+def test_effective_policy_audited_is_silent_on_success(aws):
+    """解析成功不落审计。
+
+    三个 writer 的每次部署与每次改权限都会过这里，成功也记就是把审计表变成
+    流水日志——真正要查的那几行拒绝会被埋掉，而权限变更本身已由
+    write_permissions 的 _audit 记过了。
+    """
+    import boto3
+    site = {"site_id": "s-ok", "owner": "o@example.test", "require_login": True,
+            "allowed_users": "org", "collaborators": []}
+    out = perm.effective_policy_audited(site, actor="who@example.test")
+    assert out["require_login"] is True
+    assert boto3.client("dynamodb").scan(
+        TableName="site-ops-log")["Items"] == [], "成功路径不该写审计"

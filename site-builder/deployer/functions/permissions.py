@@ -42,6 +42,19 @@ class PermissionConflict(Exception):
     pass
 
 
+class PolicyDataInvalid(Exception):
+    """sites 行的权限字段形态不合法，拒绝投影到路由表。
+
+    **不猜方向**：把未知值当 "org" 是静默扩权，当空名单是静默收紧，
+    两者都在猜历史意图。判不出就拒绝，让人去修那一行。
+    调用方转 409（panel）或可读工具错误（MCP）。
+
+    **不继承 ValueError**：panel/handler.py 的 `except ValueError` 分支返回 400
+    且排在通用 500 之前，继承它会让专门的 409 分支变成死代码——两侧用例照样
+    全绿，而线上永远答 400。
+    """
+
+
 def role_of(email: str, site: dict | None, is_admin: bool = False) -> str:
     """判定顺序 owner → admin → collaborator。
 
@@ -401,6 +414,90 @@ def normalize_allowed_users(value):
         if not isinstance(e, str) or not EMAIL_RE.fullmatch(e):
             raise ValueError(f"allowed_users 含非法邮箱: {e!r}")
     return sorted(set(value))
+
+
+# "该字段不在这一行里"的哨兵。**不能用 None 代替**：DynamoDB 有真正的 NULL 型
+# （`{"NULL": true}` 读出来就是 None），把缺失也报成 `NoneType=None` 会让人拿着
+# 文案去表里找一个不存在的 null 值。两种行的修法相同，但认出坏在哪靠的是文案。
+_ABSENT = object()
+
+
+def effective_policy(site: dict) -> dict:
+    """从 sites 行解出可投影的策略。**三个投影 writer 的唯一入口。**
+
+    判据只有一条：**每个字段要么类型明确，要么它的「缺失」有唯一安全解释**；
+    两者都不成立即抛 PolicyDataInvalid。
+
+    | 字段          | 合法形态                    | 缺失时 |
+    |---------------|-----------------------------|--------|
+    | require_login | 真 bool                     | 抛错   |
+    | allowed_users | "org" 或非空邮箱 list       | 抛错   |
+    | collaborators | list[str]                   | []     |
+    | owner         | 非空 str                    | 抛错   |
+
+    为什么不能沿用 `bool(site.get("require_login", True))` 与
+    `site.get("allowed_users", "org")`：读路径（Edge）对坏数据 fail-closed，
+    而这两个默认值让**写路径**把坏数据洗成合法的 `{"BOOL": false}` / `"org"`
+    ——两侧对坏数据的语义相反，Edge 的加固被写入侧抵消（M02）。
+    """
+    site_id = site.get("site_id", "<unknown>")
+    # 补救文案必须覆盖**能拒的每个字段**（由
+    # test_repair_hint_covers_every_field_it_can_reject 钉住）：拒绝的代价是站点
+    # 在人工修好之前既不能改权限也不能部署，换来的只有"人照着文案能把那一行改
+    # 回来"这一样东西。少一个字段的形态，那个字段的拒绝就是一张工单。
+    repair = ('请把 sites 表该行修正为正确类型后重试（require_login: BOOL；'
+              'allowed_users: S="org" 或 L=邮箱数组；'
+              'collaborators: L=邮箱数组（可缺省）；owner: 非空 S）。')
+
+    def reject(field, value):
+        found = ("字段缺失" if value is _ABSENT
+                 else f"{type(value).__name__}={value!r}")
+        raise PolicyDataInvalid(
+            f"站点 {site_id} 的 {field} 形态不合法"
+            f"（{found}），已拒绝投影权限。{repair}")
+
+    require_login = site.get("require_login", _ABSENT)
+    if not isinstance(require_login, bool):
+        reject("require_login", require_login)
+
+    if "allowed_users" not in site:
+        reject("allowed_users", _ABSENT)
+    try:
+        allowed = normalize_allowed_users(site["allowed_users"])
+    except ValueError as exc:
+        raise PolicyDataInvalid(
+            f"站点 {site_id} 的 allowed_users 形态不合法（{exc}），"
+            f"已拒绝投影权限。{repair}") from exc
+
+    collaborators = site.get("collaborators", [])
+    if not isinstance(collaborators, list) or not all(
+            isinstance(e, str) for e in collaborators):
+        reject("collaborators", collaborators)
+
+    owner = site.get("owner", _ABSENT)
+    if not isinstance(owner, str) or not owner:
+        reject("owner", owner)
+
+    return {"require_login": require_login, "allowed_users": allowed,
+            "collaborators": list(collaborators), "owner": owner}
+
+
+def effective_policy_audited(site: dict, *, actor: str) -> dict:
+    """`effective_policy` + 拒绝时落一条审计。**三个投影 writer 都调这个。**
+
+    审计做成**一处包装**而不是在三个 writer 各写一份 try/except：后者就是本轮
+    要消除的形态（同一段处理抄多份）。纯解析留在 `effective_policy` 里，
+    因为体检脚本也要调它，而那条路径没有 ops_log 表、也不该写任何东西。
+
+    **不加告警**：这是"数据脏了"而不是"正在被攻击"，当前 0 例，
+    拿告警叫醒人不成比例（要告警归 S4）。
+    """
+    try:
+        return effective_policy(site)
+    except PolicyDataInvalid:
+        ops_log.record(actor=actor, action="reject_policy_projection",
+                       target=f"site:{site.get('site_id', '')}", result="rejected")
+        raise
 
 
 def _site_or_raise(site_id: str, *, consistent: bool = False) -> dict:
