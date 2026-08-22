@@ -523,6 +523,121 @@ def test_a_transient_read_failure_leaves_no_lock_file_behind(env, tmp_path):
         "site-rt-a-abc123": {"orig": "A"}}
 
 
+# ---------------------------------------------------------------------------
+# 闸门第 4 层（`verify_access`：IAM 策略模拟器）的正反两向
+#
+# 这一层是四层判据里**唯一反映真实 IAM 判定**而不是文本比较的一层，也是唯一能
+# 证明 M01 的**写**侧被关掉的一层（spec §4.2.1：只模拟 GetItem 验不出"邻居表
+# 可写"）。此前它在每一条用例里都被打桩（`_laggy_setup` 与残留锁那条各一处，
+# 它们要证的是别的事，故意保留），于是**从未执行过**——第一次执行会发生在
+# `--apply` 对生产 IAM 的那一刻，而那是不可逆动作的闸门。
+# 「没被证明会咬的守卫等于没有守卫」是这一整轮的方法，这里把它补齐。
+#
+# 用 fake 模拟"策略模拟器"能证的只有两件事，但恰好就是要证的两件：
+#   ① 判定被正确解读（allowed 的邻居 ⇒ 报泄漏；被拒的自己表 ⇒ 报不可用）；
+#   ② **发给模拟器的动作清单是全部六个数据动作**，不是只有 GetItem。
+# 它证不了 AWS 的判定本身对不对——那由真机 `--check` 覆盖。
+
+# 期望 policy 里的六个 DynamoDB 数据动作（`common.site_policy`）。
+# **在测试里写成字面量是有意的第二份**：从被测代码现取会让"只模拟 GetItem"
+# 这一缺陷自证为对（它同样"等于自己推导的清单"）。
+_ALL_DDB_ACTIONS = {"dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem",
+                    "dynamodb:DeleteItem", "dynamodb:Query", "dynamodb:Scan"}
+
+
+class _SimIam(_FakeIam):
+    """带策略模拟器的 fake。`decide(action, resource) -> 判定字符串`。
+
+    返回形态照 IAM 的 `SimulatePrincipalPolicy`：每个动作一条
+    `EvaluationResults`，资源级判定在 `ResourceSpecificResults[0]`
+    的 `EvalResourceDecision` 里——被测代码读的正是这两层。
+    """
+
+    def __init__(self, decide, policies=None):
+        super().__init__(policies or {})
+        self._decide = decide
+        self.calls = []          # [(PolicySourceArn, (动作…), 资源 ARN)]
+
+    def simulate_principal_policy(self, *, PolicySourceArn, ActionNames,
+                                  ResourceArns):
+        assert len(ResourceArns) == 1, \
+            f"被测代码一次只该模拟一个资源，实际 {ResourceArns}"
+        res = ResourceArns[0]
+        self.calls.append((PolicySourceArn, tuple(ActionNames), res))
+        return {"EvaluationResults": [
+            {"EvalActionName": a,
+             "ResourceSpecificResults": [
+                 {"EvalResourceName": res,
+                  "EvalResourceDecision": self._decide(a, res)}]}
+            for a in ActionNames]}
+
+
+def test_verify_access_reports_a_still_reachable_nested_neighbour(env):
+    """邻居表**任何一个动作** allowed ⇒ 必须报泄漏，且报出是哪些动作。
+
+    这正是 M01 的形态：邻居的 site_id 以本站点的 site_id 为前缀，旧通配
+    `table/site-data-{A}-*` 会把它一并放进去。这里让写动作 allowed、读动作被拒，
+    因为"只模拟 GetItem 时残留的写权限照样闸门绿"是加这一层的**全部**理由——
+    所以文案必须点出**多于一个**动作，否则报出来的东西不足以判断泄漏范围。
+    """
+    def decide(action, resource):
+        if "probe" in resource:                     # 嵌套邻居
+            return "allowed" if action in ("dynamodb:PutItem",
+                                           "dynamodb:DeleteItem") else "implicitDeny"
+        return "allowed"                            # 自己的表：全通
+    iam = _SimIam(decide)
+    problems = bf.verify_access(iam, "a-abc123", ["notes"])
+    assert len(problems) == 1, problems
+    assert "仍能访问嵌套邻居的表" in problems[0], problems[0]
+    # 邻居必须真的是"以本 site_id 为前缀"的那种表名，否则这一层测的不是 M01
+    assert "site-data-a-abc123-probe" in problems[0], problems[0]
+    named = [a for a in _ALL_DDB_ACTIONS if a in problems[0]]
+    assert len(named) > 1, (
+        f"只报出 {named}——只点一个动作时，操作者无法判断泄漏是读还是写: "
+        f"{problems[0]}")
+
+
+def test_verify_access_reports_its_own_table_being_denied(env):
+    """反方向：自己的表被拒 ⇒ 必须报出来（backfill 把 policy 写窄了/写错了）。
+
+    没有这一向，一次把 policy 写成"什么都不许"的 backfill 会通过第 4 层：
+    邻居确实访问不了了，而站点自己也访问不了——文本等值那一层若同时被
+    同一个错误的 `site_policy` 满足（它与自己相等），这就是最后一道判据。
+    """
+    iam = _SimIam(lambda action, resource: "implicitDeny")
+    problems = bf.verify_access(iam, "a-abc123", ["notes"])
+    assert len(problems) == 1, problems
+    assert "访问自己的表 notes 被拒" in problems[0], problems[0]
+    assert "backfill 写坏了" in problems[0], problems[0]
+
+
+def test_verify_access_simulates_every_data_action_not_just_reads(env):
+    """动作清单必须是**六个数据动作全部**，且每个资源都按全部动作模拟一次。
+
+    这是这一层被加进来的确切原因（Codex 指出的 P1）：只模拟 `GetItem` 时，
+    角色上残留的一条"PutItem on site-data-*"调试 policy 在读模拟下同样"被拒"，
+    闸门绿而跨租户**写**仍然可行——M01 的修复等于只验了读。
+
+    **清单相等而不是包含**：多出一个动作也要有人看一眼（`site_policy` 加动作
+    时先确认模拟这一层也跟着覆盖了它，再更新这里的字面量）；少一个动作就是
+    上面那个缺陷回来了。
+    """
+    import common
+    iam = _SimIam(lambda action, resource:
+                  "implicitDeny" if "probe" in resource else "allowed")
+    assert bf.verify_access(iam, "a-abc123", ["notes", "tags"]) == []
+    assert iam.calls, "一次模拟都没发生——这条用例什么都没测到"
+    for source, actions, res in iam.calls:
+        assert source == common.site_role_arn("a-abc123"), source
+        assert set(actions) == _ALL_DDB_ACTIONS, (
+            f"模拟 {res} 时的动作清单是 {sorted(actions)}，"
+            f"期望 {sorted(_ALL_DDB_ACTIONS)}")
+    # 覆盖面：每张自己的表各一次 + 嵌套邻居一次
+    assert [res.rsplit("/", 1)[1] for _s, _a, res in iam.calls] == [
+        "site-data-a-abc123-notes", "site-data-a-abc123-tags",
+        "site-data-a-abc123-probe-abc123-notes"]
+
+
 def _run_main(env, argv, iam):
     """跑 main()：`_load_env` 与 `boto3.client` 都打桩，不碰真实 config / AWS。"""
     env.setattr(sys, "argv", ["backfill"] + argv)
