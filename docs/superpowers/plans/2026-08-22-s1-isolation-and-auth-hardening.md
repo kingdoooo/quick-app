@@ -714,14 +714,28 @@ class _FakeIam:
     `_actual_policy` 只把这一种判为"policy 不存在"，其他错误原样抛出。
     """
 
-    def __init__(self, policies, extra_inline=None, attached=None):
+    def __init__(self, policies, extra_inline=None, attached=None,
+                 roles_without_policy=None):
         self._policies = policies                  # {role_name: site-scope 文档}
         self._extra_inline = extra_inline or {}    # {role_name: [policy 名…]}
         self._attached = attached or {}            # {role_name: [policy ARN…]}
+        # 存在、但没有 site-scope 的角色：get_role 认识它，
+        # get_role_policy 对它抛 NoSuchEntity（TOCTOU 用例需要这个态）
+        self._roles_without_policy = set(roles_without_policy or ())
+
+    def _known_roles(self):
+        return list(self._policies) + sorted(self._roles_without_policy)
+
+    def get_role(self, RoleName):
+        if RoleName in self._known_roles():
+            return {"Role": {"RoleName": RoleName}}
+        raise ClientError(
+            {"Error": {"Code": "NoSuchEntity", "Message": "not found"}},
+            "GetRole")
 
     def get_paginator(self, name):
         if name == "list_roles":
-            pages = [{"Roles": [{"RoleName": r} for r in self._policies]}]
+            pages = [{"Roles": [{"RoleName": r} for r in self._known_roles()]}]
             return type("P", (), {"paginate": lambda _s, **_k: pages})()
         if name == "list_role_policies":
             def _pg(_s, *, RoleName, **_k):
@@ -1001,6 +1015,35 @@ def test_a_transient_read_error_during_backup_stops_before_any_mutation(env, tmp
                        [("site-rt-a-abc123", "a-abc123", "dynamodb", ["notes"])])
     assert calls == []
     assert not (tmp_path / "backup.json").exists()
+
+
+def test_a_role_that_vanishes_after_enumeration_aborts_before_any_write(env, tmp_path):
+    """TOCTOU 兜底：枚举时在、备份前被带外删除的角色 ⇒ 中止且零 IAM 写入。
+
+    GetRolePolicy 的 NoSuchEntity 分不出"角色没了"和"角色在、只缺
+    site-scope"——不复核 GetRole 的话，消失的角色会被备份成 null、再被
+    ensure_site_role 整建，回滚歧义（删整个角色还是只删 policy）原样回来。
+    「缺失角色分流需人工」只保证枚举时刻的缺失；这条守卫把「null ⇒ 角色
+    存在」从运维假设变成技术保证（Codex 签核附带项）。
+    """
+    import common
+    calls = []
+    env.setattr(common, "ensure_site_role", lambda *a, **k: calls.append(a))
+    env.setattr(bf, "BACKUP_PATH", tmp_path / "backup.json")
+    with pytest.raises(SystemExit, match="枚举后消失"):
+        bf.apply_plans(_FakeIam({}),
+                       [("site-rt-a-abc123", "a-abc123", "dynamodb", ["notes"])])
+    assert calls == []
+    assert not (tmp_path / "backup.json").exists()
+
+
+def test_backup_null_requires_the_role_to_still_exist(env, tmp_path):
+    """null 只允许在「角色在、site-scope 不在」时落盘（GetRole 复核通过）。"""
+    env.setattr(bf, "BACKUP_PATH", tmp_path / "backup.json")
+    iam = _FakeIam({}, roles_without_policy={"site-rt-a-abc123"})
+    bf._persist_backup(iam, ["site-rt-a-abc123"])
+    saved = json.loads((tmp_path / "backup.json").read_text())
+    assert saved["roles"] == {"site-rt-a-abc123": None}
 
 
 def test_engine_and_tables_come_from_the_site_row():
@@ -1336,7 +1379,8 @@ def _persist_backup(iam, role_names) -> None:
       抛出 ⇒ 此时零 IAM 写入；且缺失角色分流需人工、不进 todo ⇒
       本函数只会收到 list_roles 枚举出的**真实存在**的角色，null 不会
       再混入"角色本身不存在"这一态，回滚动作唯一：`delete_role_policy`
-      删掉新写的 site-scope）；
+      删掉新写的 site-scope。「角色存在」不止靠分流保证——枚举后被带外
+      删除的 TOCTOU 由循环内的 GetRole 复核兜住，见那段注释）；
     - **带账号元数据，合并前核对**：格式 {schema_version, account_id,
       region, roles}。没有元数据时，切到另一个账号后"绝不覆盖"会把
       A 账号同名 role 的旧快照保留成 B 账号的回滚材料（Codex 指出）——
@@ -1357,7 +1401,22 @@ def _persist_backup(iam, role_names) -> None:
         roles = saved["roles"]
     for name in role_names:
         if name not in roles:
-            roles[name] = _actual_policy(iam, name)
+            policy = _actual_policy(iam, name)
+            if policy is None:
+                # null 的语义必须唯一：「角色在、site-scope 不在」。角色在
+                # check_roles 枚举之后被带外删除（TOCTOU 窗口）时，
+                # GetRolePolicy 的 NoSuchEntity 与"只缺 policy"分不出来——
+                # 这里补一次 GetRole，把「角色存在」从运维假设变成技术保证
+                # （Codex 签核附带项）。角色没了 ⇒ 在第一笔 IAM 写入前中止。
+                try:
+                    iam.get_role(RoleName=name)
+                except ClientError as e:
+                    if e.response["Error"]["Code"] == "NoSuchEntity":
+                        raise SystemExit(
+                            f"{name} 在枚举后消失（并发删除？）——中止 backfill，"
+                            "此时一笔 IAM 写入都没发生。查明根因后重跑。")
+                    raise
+            roles[name] = policy
     tmp = BACKUP_PATH.parent / (BACKUP_PATH.name + ".tmp")
     tmp.write_text(json.dumps({**meta, "roles": roles},
                               ensure_ascii=False, indent=2))
@@ -2833,6 +2892,8 @@ cd "$(git rev-parse --show-toplevel)"
 (cd site-builder/mcp       && python3 deploy_agentcore.py)
 
 # ③ 存量角色 backfill —— 必须在 ① 之后（它调的是新版 ensure_site_role/site_policy）
+# 期间不要人工修改/删除 site-rt-* 角色（枚举后消失的 TOCTOU 有 GetRole 兜底
+# 会中止，但别去踩）
 python3 site-builder/scripts/backfill_site_role_policies.py            # 先看计划
 python3 site-builder/scripts/backfill_site_role_policies.py --apply    # 真写 + 自带闸门
 
@@ -2942,7 +3003,9 @@ Expected: 闸门打印 `不合格的 site-rt-* 角色：0` 且退出码 0；其�
   `--apply` 会先把全部旧 policy 备份到
   `site-builder/scripts/backfill-old-policies.json`（**第一笔 IAM 写入之前**
   原子落盘；带 account_id/region 元数据，不一致拒绝合并；重跑合并、不覆盖
-  已有快照），回滚方式见 spec §7.3。
+  已有快照），回滚方式见 spec §7.3。**backfill 期间不要人工修改/删除
+  `site-rt-*` 角色**——枚举后消失的角色会让脚本在第一笔写入前中止（GetRole
+  兜底），但别去踩这个窗口。
 ```
 
 - [ ] **Step 7: 扫描 + Commit**
