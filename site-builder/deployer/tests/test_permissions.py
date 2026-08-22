@@ -292,7 +292,11 @@ def test_set_access_policy_partial_update_keeps_other_field(aws):
 
 def test_set_collaborators_add_and_remove(aws):
     import common
-    common.upsert_site("s-1", owner="o@x.com", collaborators=[])
+    # 夹具要给全 require_login + allowed_users：写路径每次都从存量行重算
+    # effective（M02 起用 effective_policy 严格解析），缺字段的行会被拒绝而
+    # 不是按默认值兜底。这不是本用例要测的东西，所以把行造成完整的。
+    common.upsert_site("s-1", owner="o@x.com", collaborators=[],
+                       require_login=True, allowed_users="org")
     assert perm.set_collaborators("s-1", actor="o@x.com",
                                   add=["c@x.com", "d@x.com"]) == ["c@x.com", "d@x.com"]
     assert perm.set_collaborators("s-1", actor="o@x.com", remove=["c@x.com"]) == ["d@x.com"]
@@ -307,7 +311,8 @@ def test_set_collaborators_refuses_owner_as_collaborator(aws):
 
 def test_transfer_owner_demotes_previous_owner(aws):
     import common
-    common.upsert_site("s-1", owner="o@x.com", collaborators=["c@x.com"])
+    common.upsert_site("s-1", owner="o@x.com", collaborators=["c@x.com"],
+                       require_login=True, allowed_users="org")
     out = perm.transfer_owner("s-1", actor="o@x.com", new_owner="new@x.com")
     assert out["owner"] == "new@x.com"
     site = common.get_site("s-1")
@@ -319,7 +324,8 @@ def test_transfer_owner_demotes_previous_owner(aws):
 
 def test_transfer_owner_from_collaborator_position(aws):
     import common
-    common.upsert_site("s-1", owner="o@x.com", collaborators=["c@x.com"])
+    common.upsert_site("s-1", owner="o@x.com", collaborators=["c@x.com"],
+                       require_login=True, allowed_users="org")
     perm.transfer_owner("s-1", actor="o@x.com", new_owner="c@x.com")
     site = common.get_site("s-1")
     assert site["owner"] == "c@x.com"
@@ -1057,3 +1063,28 @@ def test_effective_policy_audited_is_silent_on_success(aws):
     assert out["require_login"] is True
     assert boto3.client("dynamodb").scan(
         TableName="site-ops-log")["Items"] == [], "成功路径不该写审计"
+
+
+def test_an_unrelated_permission_change_does_not_flip_a_wrong_typed_row_public(aws):
+    """改协作者这种**无关**操作，不得把错类型的 require_login 洗成"公开"。
+
+    `effective` 在每次权限写入时都从存量行**重算**，与本次改的是哪个字段无关
+    ——所以"只加了个协作者"会顺带把 require_auth 重投影一遍。这是 M02 触发面
+    比想象大的原因，也是这条端到端用例存在的理由（另一条只覆盖部署路径）。
+    """
+    import os
+
+    import common
+    common.upsert_site("s-1", owner="o@example.test", name="s",
+                       status="ACTIVE", allowed_users="org",
+                       collaborators=[], permissions_rev=1)
+    # 直接把行改坏（模拟迁移脚本 / 人工修库 / 旧 writer 留下的形态）。
+    # 低层 client 走 perm._ddb_client()——common 没有 _ddb()。
+    perm._ddb_client().update_item(
+        TableName=os.environ["SITES_TABLE"],
+        Key={"site_id": {"S": "s-1"}},
+        UpdateExpression="SET require_login = :bad",
+        ExpressionAttributeValues={":bad": {"N": "0"}})
+    with pytest.raises(perm.PolicyDataInvalid, match="require_login"):
+        perm.set_collaborators("s-1", actor="o@example.test",
+                               add=["c@example.test"])

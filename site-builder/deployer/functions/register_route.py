@@ -116,7 +116,11 @@ def _seed_permissions_if_absent(site_id: str, manifest_auth: dict,
 
 
 def _route_item(event, site: dict, owner: str, subdomain: str) -> dict:
-    allowed = site.get("allowed_users", "org")
+    # 坏数据一律拒绝（M02 的部署路径 writer）。抛错发生在**提交点之前**
+    # ⇒ 线上零影响，同 upload_frontend 空产物即拒的模式。
+    # 顺序不能换：`_seed_permissions_if_absent`（补缺失）必须先跑，
+    # 否则"字段缺失"会成为首次部署的常态错误。
+    pol = permissions.effective_policy_audited(site, actor=owner)
     return {"subdomain": {"S": subdomain},
             "site_id": {"S": event["site_id"]},
             "route_mode": {"S": "split"},
@@ -126,10 +130,11 @@ def _route_item(event, site: dict, owner: str, subdomain: str) -> dict:
             "static_prefix": {"S": common.static_prefix_for(event["site_id"],
                                                            event["job_id"])},
             "api_target": {"S": event.get("api_target", "")},
-            "require_auth": {"BOOL": bool(site.get("require_login", True))},
-            "allowed_users": permissions.allowed_users_av(allowed),
-            "collaborators": {"L": [{"S": e} for e in
-                                    (site.get("collaborators") or [])]},
+            "require_auth": {"BOOL": pol["require_login"]},
+            "allowed_users": permissions.allowed_users_av(pol["allowed_users"]),
+            "collaborators": {"L": [{"S": e} for e in pol["collaborators"]]},
+            # owner 仍用传入的参数（不改成 pol["owner"]）：调用点传的是本次生效
+            # 的 owner，与 site 行里的值在转移场景下可能不同。有意保留的现状。
             "owner": {"S": owner},
             "permissions_rev": {"N": str(int(site.get("permissions_rev", 0)))}}
 

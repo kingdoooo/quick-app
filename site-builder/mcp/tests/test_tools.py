@@ -651,8 +651,14 @@ def test_legacy_undeploy_rejected_after_owner_downgraded_to_collaborator(aws):
     import common
     import permissions
     import server
+    # **不给 permissions_rev**——本用例要的正是"存量无 rev"那条守卫分支。
+    # 但 require_login / allowed_users 要给：M02 起写路径（这里是 setup 用的
+    # transfer_owner）走 effective_policy 严格解析，缺这两个字段的行会被拒绝，
+    # 用例就走不到它真正要证明的角色判定上。"有 auth 字段、缺 rev"是真实的
+    # 存量形态（见 migrate_permissions.py 对这类稀疏行的说明）。
     common.upsert_site("legacy-abc123", owner="old@x.com", status="ACTIVE",
-                       collaborators=[], tier="fullstack-sql")
+                       collaborators=[], tier="fullstack-sql",
+                       require_login=True, allowed_users="org")
     _b3.client("dynamodb").put_item(TableName="routing", Item={
         "subdomain": {"S": "app-legacy-abc123"},
         "site_id": {"S": "legacy-abc123"}, "owner": {"S": "old@x.com"}})
@@ -688,8 +694,10 @@ def test_legacy_collaborator_deploy_still_allowed_after_downgrade(aws, monkeypat
     import server
     monkeypatch.setenv("STATE_MACHINE_ARN",
                        "arn:aws:states:us-east-1:1:stateMachine:sm")
+    # 同上一条用例：留住"无 rev"，补齐两个 auth 字段
     common.upsert_site("legacy-abc123", owner="old@x.com", status="ACTIVE",
-                       collaborators=[])
+                       collaborators=[], require_login=True,
+                       allowed_users="org")
     jid = common.create_job("old@x.com", "legacy-abc123")
     _b3.client("s3").put_object(Bucket="site-artifacts-1",
                                 Key=f"uploads/{jid}.zip", Body=b"zip")

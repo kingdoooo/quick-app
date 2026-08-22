@@ -267,18 +267,22 @@ def test_seed_reraises_non_conditional_errors(aws, monkeypatch):
                                    "allowed_users": ["a@x.com"]}}}, None)
 
 
-def test_missing_require_login_defaults_closed(aws, monkeypatch):
-    """sites 快照意外缺 require_login 时按"需要登录"投影（fail-closed）。
+def test_missing_require_login_is_refused_not_defaulted(aws, monkeypatch):
+    """sites 快照缺 require_login 时**拒绝部署**，不再按 True 兜底（M02）。
 
-    这一行默认值是数据异常与"站点全公开"之间唯一的闸门——把
-    site.get("require_login", True) 的默认改成 False，本测试必须失败。
-    正常路径下 seed 会补齐该字段、moto 强一致读立即可见，默认分支跑不到，
-    所以直接注入"缺字段的快照"（模拟真实 DynamoDB 的异常数据/延迟形态）。
-    **快照必须带 permissions_rev=1**：seed 在真实行上执行并把 rev 推到 1，
-    快照 rev 与之不符会让 ConditionCheck 三连败抛 RuntimeError，测试测不到
-    目标（moto 实测：rev 缺失/0 都 RuntimeError，rev=1 才走到投影）。
+    **这条用例是反过来的**：旧版本断言"缺字段 ⇒ 投影 True"，理由是那行默认值
+    是数据异常与"站点全公开"之间唯一的闸门。M02 换掉了那道闸门——按 True 兜底
+    仍然是在猜（缺失读不出 True 还是 False），现在由 `effective_policy` 直接拒绝，
+    比猜一个方向更强。所以断言从"投影了什么"变成"拒绝且**一个字都没写进路由**"
+    （spec §6.1 第 2 条：断言拒绝且路由未被写）。
+
+    正常路径下 seed 会补齐该字段、moto 强一致读立即可见，所以这个形态只能靠
+    注入"缺字段的快照"来造（模拟真实 DynamoDB 的异常数据/延迟形态）。
+    **快照仍要带 permissions_rev=1**：与旧版同理，rev 不符会让 ConditionCheck
+    三连败抛 RuntimeError，测不到目标。这里它还保证拒绝**不是**被 rev 挡下的。
     """
     import boto3
+    import permissions
     import common
     import register_route
     common.upsert_site("s-1", owner="o@x.com")
@@ -287,15 +291,15 @@ def test_missing_require_login_defaults_closed(aws, monkeypatch):
                  "allowed_users": ["a@x.com"], "collaborators": []}
     monkeypatch.setattr(register_route.common, "get_site_consistent",
                         lambda sid: dict(anomalous))
-    out = register_route.handler(
-        {"job_id": job_id, "site_id": "s-1", "api_target": "",
-         "manifest": {"auth": {"require_login": False,   # 故意给 False：
-                               "allowed_users": ["a@x.com"]}}}, None)
-    # manifest 是 False 而快照缺字段——默认必须压过 manifest 的诱导，投影 True
-    item = boto3.client("dynamodb").get_item(
-        TableName="routing", Key={"subdomain": {"S": "app-s-1"}})["Item"]
-    assert item["require_auth"]["BOOL"] is True
-    assert out["effective_auth"]["require_login"] is True
+    with pytest.raises(permissions.PolicyDataInvalid, match="require_login"):
+        register_route.handler(
+            {"job_id": job_id, "site_id": "s-1", "api_target": "",
+             # manifest 给 False：拒绝必须压过 manifest 的诱导，而不是投影它
+             "manifest": {"auth": {"require_login": False,
+                                   "allowed_users": ["a@x.com"]}}}, None)
+    # 拒绝发生在提交点之前 ⇒ 路由表里根本不该出现这条 item（线上零影响）
+    assert "Item" not in boto3.client("dynamodb").get_item(
+        TableName="routing", Key={"subdomain": {"S": "app-s-1"}})
 
 
 def test_register_route_seed_does_not_overwrite_concurrent_online_change(aws):

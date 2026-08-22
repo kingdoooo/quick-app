@@ -66,8 +66,12 @@ def _parse_allowed(raw) -> str | list[str]:
     SS/NULL/N/BOOL 会双双错过 S 和 L 分支、静默落成 "org"（moto 探针实锤过）。
     这不是理论场景：spec §3.4 的救济流程就是"人工判断原意后手工修"，而人在
     DynamoDB 控制台给字符串列表选的类型就是 String Set——修完一重跑，owner-only
-    变全组织放行。只有"属性整体缺失"才回落 "org"（Edge 的默认正是如此：
-    route.get("allowed_users", "org")）。
+    变全组织放行。
+
+    **属性整体缺失同样抛错**（M02）：这里不调 `permissions.effective_policy`
+    ——输入是路由表的原始 AttributeValue，不是一行 sites 记录，签名不匹配。
+    收紧方式是把 allowed_users 的规则**委托给同一个底层原语
+    `normalize_allowed_users`**：规则仍只有一处定义，只是入口不同。
     """
     if "L" in raw:                       # 已是二期形态
         members = raw["L"]
@@ -75,8 +79,13 @@ def _parse_allowed(raw) -> str | list[str]:
             raise UnparsableAllowlist(
                 f"allowed_users 的 L 含非字符串成员: {members!r}")
         return [e["S"] for e in members]
-    if not raw:                          # 属性缺失：与 Edge 的默认一致
-        return "org"
+    if not raw:                          # 属性整体缺失
+        raise UnparsableAllowlist(
+            "allowed_users 属性整体缺失——**不回落 \"org\"**。"
+            "旧注释说 Edge 的默认就是 org，那个推导已过时："
+            "现行 Edge 是 `route.get(\"allowed_users\") if \"allowed_users\" in route "
+            "else []`，缺失即空名单。此处回落 org 会是静默扩权。"
+            "请人工判定原意后手工修该行。")
     if "S" not in raw:
         raise UnparsableAllowlist(
             f"allowed_users 类型不支持（应为 S/L）: {sorted(raw)}")

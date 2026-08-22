@@ -617,12 +617,9 @@ def write_permissions(site_id: str, *, actor: str, action: str,
         collaborators = overrides.get("collaborators", collaborators)
         new_owner = overrides.get("new_owner", new_owner)
 
-    effective = {
-        "require_login": bool(site.get("require_login", True)),
-        "allowed_users": site.get("allowed_users", "org"),
-        "collaborators": list(site.get("collaborators") or []),
-        "owner": site.get("owner", ""),
-    }
+    # 坏数据一律拒绝投影，不猜方向（M02）。位置是硬要求：**读到 site 行之后、
+    # 构造事务之前** ⇒ 抛错时事务根本不发起，零副作用。
+    effective = effective_policy_audited(site, actor=actor)
     sets = ["permissions_updated_at = :t", "permissions_updated_by = :by",
             "permissions_rev = :nrev"]
     vals = {":t": {"S": now_iso()}, ":by": {"S": actor},
@@ -859,6 +856,9 @@ def resync_route(site_id: str, *, actor: str) -> dict:
     test_resync_projects_exactly_the_same_route_fields_as_write_permissions
     从两处的 UpdateExpression 解析比对锁定，不靠人记得同步。
 
+    **真源坏了它就拒绝**（M02）：修复投影漂移 ≠ 修复源数据损坏。后者要人判定
+    意图，工具替他选方向（扩权还是收紧）都是猜。
+
     rev 用 sites 表当前值**原样**投影（不 +1）：register_route 用 route.rev 与
     sites.rev 比对判断"我读到的策略是否最新"，这里若虚增会让下一次**合法**
     部署误判成"权限被并发修改"。
@@ -870,19 +870,12 @@ def resync_route(site_id: str, *, actor: str) -> dict:
         raise PermissionDenied("仅平台管理员可重投影路由")
     site = _site_or_raise(site_id, consistent=True)
     rev = int(site.get("permissions_rev", 0))
-    # require_login 缺失时取 True（fail-closed：判不出策略时按需要登录处理）。
-    # allowed_users 缺失/为空时退回 "org"——**不能直接调
-    # normalize_allowed_users**，它对空值抛 ValueError，而稀疏存量行确实可能
-    # 没有这个字段（upsert_site 建站只写 owner/name/status）。让一个修复工具
-    # 在最需要它的脏数据上抛异常，等于没有这个工具。
-    raw_allowed = site.get("allowed_users")
-    allowed = normalize_allowed_users(raw_allowed) if raw_allowed else "org"
-    effective = {
-        "require_login": bool(site.get("require_login", True)),
-        "allowed_users": allowed,
-        "collaborators": list(site.get("collaborators") or []),
-        "owner": site.get("owner", ""),
-    }
+    # 坏数据一律拒绝投影，不猜方向（M02）。**注意与旧注释的差别**：
+    # 这里曾用 `normalize_allowed_users(raw) if raw else "org"` 并论证
+    # 「让一个修复工具在最需要它的脏数据上抛异常，等于没有这个工具」。
+    # 那个论证已被推翻——修复**投影漂移** ≠ 修复**源数据损坏**，
+    # 后者必须由人判定意图，工具替他选方向（扩权或收紧）都是错的。
+    effective = effective_policy_audited(site, actor=actor)
     _ddb_client().update_item(
         TableName=os.environ["ROUTING_TABLE"],
         Key={"subdomain": {"S": common.subdomain_for(site_id)}},

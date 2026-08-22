@@ -131,23 +131,17 @@ def test_unknown_attribute_type_errors_and_does_not_widen(aws, av):
     assert not (PERMISSION_FIELDS & set(common.get_site("s-odd")))
 
 
-def test_absent_allowed_users_attribute_falls_back_to_org(aws):
-    """属性整体缺失（极老的路由 item）回落 "org"——与 Edge 的默认一致。
+def test_absent_allowed_users_attribute_is_rejected_not_widened_to_org(aws):
+    """属性整体缺失**不再**回落 "org"。
 
-    这与"present 但类型不对"是两回事：后者必须报错（上一测试）。
+    旧版本回落 org，理由是"与 Edge 的默认一致"——**那个理由已过时**：
+    现行 Edge 是 `route.get("allowed_users") if "allowed_users" in route else []`，
+    缺失即空名单（fail-closed）。继续回落 org 就是静默扩权，
+    而且是在一次"数据修复"动作里扩权。判不出原意就报错，让人来定。
     """
-    import boto3
-    import common
-    import migrate_permissions as mig
-    common.upsert_site("s-old", owner="o@x.com")
-    boto3.client("dynamodb").put_item(TableName="routing", Item={
-        "subdomain": {"S": "app-s-old"}, "site_id": {"S": "s-old"},
-        "route_mode": {"S": "split"}, "static_prefix": {"S": "sites/s-old/j"},
-        "api_target": {"S": ""}, "require_auth": {"BOOL": True},
-        "owner": {"S": "o@x.com"}})   # 无 allowed_users 属性
-    out = mig.migrate("routing", dry_run=False)
-    assert out["migrated"] == ["s-old"]
-    assert common.get_site("s-old")["allowed_users"] == "org"
+    import migrate_permissions
+    with pytest.raises(migrate_permissions.UnparsableAllowlist, match="缺失"):
+        migrate_permissions._parse_allowed({})
 
 
 def test_dry_run_writes_no_permission_field_at_all(aws):
@@ -235,14 +229,16 @@ def test_sparse_row_keeps_online_allowlist(aws):
     旧实现只看 require_login 当 sentinel，判成"未迁移"后无条件 SET 两个字段，
     把在线设的私有名单盖回路由表里的 "org"——而报告显示为 migrated 成功
     （moto 实证）。这是数据修复动作变成静默扩权。
+
+    **稀疏行直接造，不再用 `set_access_policy` 造**（M02，本文件三条同理）：
+    写路径改走 `effective_policy` 严格解析后会拒绝缺字段的行，在线接口不再
+    产出该形态；而迁移脚本要处理的恰恰是**存量遗留**的这种行，所以照原样造。
     """
     import common
-    import permissions
     import migrate_permissions as mig
 
-    common.upsert_site("s-sparse", owner="o@x.com", name="n")
-    permissions.set_access_policy("s-sparse", actor="o@x.com",
-                                  allowed_users=["only@example.com"])
+    common.upsert_site("s-sparse", owner="o@x.com", name="n",
+                       allowed_users=["only@example.com"], permissions_rev=1)
     assert "require_login" not in common.get_site_consistent("s-sparse")
     _put_route("app-s-sparse", "s-sparse", require_auth=True, allowed="org")
 
@@ -258,11 +254,10 @@ def test_sparse_row_keeps_online_allowlist(aws):
 def test_sparse_row_keeps_online_require_login(aws):
     """反向稀疏：只改过 require_login 的行，allowed_users 由路由表补上。"""
     import common
-    import permissions
     import migrate_permissions as mig
 
-    common.upsert_site("s-sparse2", owner="o@x.com", name="n")
-    permissions.set_access_policy("s-sparse2", actor="o@x.com", require_login=False)
+    common.upsert_site("s-sparse2", owner="o@x.com", name="n",
+                       require_login=False, permissions_rev=1)
     assert "allowed_users" not in common.get_site_consistent("s-sparse2")
     _put_route("app-s-sparse2", "s-sparse2", require_auth=True,
                allowed='["from-route@x.com"]')
@@ -276,12 +271,10 @@ def test_sparse_row_keeps_online_require_login(aws):
 def test_dry_run_report_renders_for_sparse_rows(aws, capsys):
     """main() 的打印不得假定 planned 两个键都在（稀疏行只有一个）。"""
     import common
-    import permissions
     import migrate_permissions as mig
 
-    common.upsert_site("s-sparse3", owner="o@x.com", name="n")
-    permissions.set_access_policy("s-sparse3", actor="o@x.com",
-                                  allowed_users=["x@example.com"])
+    common.upsert_site("s-sparse3", owner="o@x.com", name="n",
+                       allowed_users=["x@example.com"], permissions_rev=1)
     _put_route("app-s-sparse3", "s-sparse3")
     report = mig.migrate("routing", dry_run=True)
     # 复用 main 的渲染逻辑：planned 缺键时不能 KeyError
