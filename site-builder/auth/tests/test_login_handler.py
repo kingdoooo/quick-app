@@ -497,6 +497,11 @@ def test_console_session_candidates_are_not_truncated_anywhere():
 
     与 Edge 的 `test_candidates_are_not_truncated_anywhere` 对称。行为断言只能
     证明"上限不低于当前造得出的量级"；这条与规模无关，且直接说出截断在哪。
+
+    **它证明语法，不证明语义。** 能力白名单管的是"`out` 怎么被使用"，管不到"每个
+    匹配元素是否都执行了 append"——在 append 的**准入谓词**里按 rawPath 或按候选内容
+    过滤就能绕过它（复审在 Edge 那半边实测过，auth 这边同构）。补它的是本文件末尾
+    那三条**变形测试**（请求无关性 / 逐元素完整性 / 追加单调性），不是再加 AST 规则。
     """
     import inspect
 
@@ -580,3 +585,67 @@ def test_auth_truncation_detector_bites_each_known_bypass():
         assert old in src, f"变异锚点找不到（{name}）——本条空转"
         assert _auth_truncation_offenders(src.replace(old, new, 1)), \
             f"auth 侧检测器没咬住这种绕过：{name}"
+
+
+# ── 候选收集的**语义**性质（变形测试，与 Edge 侧对称）───────────────────────
+#
+# 理由与 Edge 那组完全相同：能力白名单限制的是"`out` 怎么用"，证明不了"每个匹配元素
+# 都会执行 append"。复审用一条 append 准入谓词打穿过 Edge 那半边，auth 这半边同构。
+# 三条性质各杀一类过滤：按请求属性 / 按候选内容 / 按位置。
+
+_PROP_VALUES = [
+    "eyJhbGciOiJIUzI1NiJ9.eyJhIjoxfQ.sig",
+    "",
+    "x",
+    "A" * 300,
+    "has-dash_and.dot~tilde",
+    "eyJ",
+]
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_auth_candidate_collection_ignores_every_event_attribute():
+    """性质①：同一组 cookies，换 rawPath / 查询串 / 方法 / 其他字段，结果必须逐字相同。"""
+    cookies = [f"sb_session={_PROP_VALUES[0]}", "other=keep",
+               f"sb_session={_PROP_VALUES[1]}", f"sb_session={_PROP_VALUES[3]}"]
+    baseline = lh._session_cookie_candidates({"cookies": cookies})
+    assert baseline == [_PROP_VALUES[0], _PROP_VALUES[1], _PROP_VALUES[3]], \
+        f"基线本身就不对：{baseline}"
+
+    variants = {
+        "rawPath=/console-session": {"rawPath": "/console-session"},
+        "rawPath=/callback": {"rawPath": "/callback"},
+        "rawPath 很深": {"rawPath": "/" + "/".join(f"s{i}" for i in range(25))},
+        "带查询串": {"queryStringParameters": {"code": "x", "private": "1"}},
+        "POST": {"requestContext": {"http": {"method": "POST"}}},
+        "带 headers": {"headers": {"user-agent": "probe", "host": "auth.example.com"}},
+    }
+    for label, extra in variants.items():
+        got = lh._session_cookie_candidates({"cookies": cookies, **extra})
+        assert got == baseline, (
+            f"候选列表随 event 属性变化了（{label}）：{got} != {baseline}"
+            " —— 收集候选不得看 rawPath/查询串/方法/任何其他字段")
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_auth_every_name_matching_cookie_becomes_a_candidate():
+    """性质②：结果必须恰好等于每一枚同名 cookie 的值、顺序一致，一枚都不许少。"""
+    cookies, expected = [], []
+    for i, v in enumerate(_PROP_VALUES):
+        cookies.append(f"noise{i}=n")
+        cookies.append(f"sb_session={v}")
+        expected.append(v)
+    cookies += ["sb_sessionx=不该算同名", "xsb_session=同理"]
+    got = lh._session_cookie_candidates({"cookies": cookies})
+    assert got == expected, f"候选不是全集或顺序变了\n  得到 {got}\n  期望 {expected}"
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_auth_appending_one_candidate_appends_exactly_one():
+    """性质③：再追加一枚 `sb_session=X`，结果必须只在末尾多出 X。"""
+    base = ["sb_session=a", "other=o", "sb_session=b"]
+    before = lh._session_cookie_candidates({"cookies": base})
+    for extra in _PROP_VALUES:
+        after = lh._session_cookie_candidates({"cookies": base + [f"sb_session={extra}"]})
+        assert after == before + [extra], (
+            f"追加 {extra[:16]!r} 后结果不是「原样 + 新值」：{after} 期望 {before + [extra]}")

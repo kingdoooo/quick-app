@@ -1034,7 +1034,24 @@ def test_candidates_are_not_truncated_anywhere():
     判据是**累积变量的能力白名单**（只允许"初始化一次 / .append() 的接收者 /
     最终裸 return"三种用法），而不是一张"截断长什么样"的黑名单——前五版都是黑名单，
     每一版都被下一种拼写绕过。清单见下一条 meta-test（当前 17 种，其中 5 种是
-    原地变异、3 种切的是解析源）。它**不**覆盖"在解析之前先把原始
+    原地变异、3 种切的是解析源）。
+
+    **它证明的是语法，不是语义，这条边界要说清楚。** 白名单限制的是"`out` 怎么被
+    使用"，**证明不了"每个匹配元素都会执行 append"**——在 append 的**准入谓词**里
+    过滤就能绕过它，而那不违反任何一条能力白名单：
+
+        if (k == name
+                and not (request.get("uri", "").startswith("/api/private")
+                         and v.startswith("eyJ"))):
+            out.append(v)
+
+    复审用这条打穿过本检测器（实测检测器返回空、两条规模用例也都绿）。补它的**不是**
+    再加一条 AST 规则（黑名单已被绕过六次，这条路不收敛），而是本文件末尾那三条
+    **变形测试**：请求无关性 / 逐元素完整性 / 追加单调性。它们直接钉"每一枚同名段都
+    原样进入结果"这个语义，按请求属性、按内容、按位置过滤都会红。
+    改这里之前先读那三条——本条与它们**证的不是同一件事**。
+
+    它**不**覆盖"在解析之前先把原始
     Cookie 头截短"这个插入点——已实测检测器对它返回空。那一种只被**无条件**的
     大规模行为用例挡住（真 token 在第 2000+ 位，截到 20 条必红），按请求属性
     条件化之后两边都可能全绿。之所以没把它也结构化：`_check_auth` 本来就**合法地**
@@ -1203,3 +1220,124 @@ def test_reserved_cookies_are_still_stripped_in_full():
     request = _req(cookie="sb_session=a; sb_session=b; site_own=keep")
     orq._strip_reserved_cookies(request)
     assert request["headers"]["cookie"][0]["value"] == "site_own=keep"
+
+
+# ── 候选收集的**语义**性质（变形测试）─────────────────────────────────────
+#
+# 前面那一串 AST 断言证明的是**语法**：没有切片、没有 len、没有 +=、累积变量只用于
+# append 和 return……但要证的性质是**语义**：
+#
+#     每一枚名字匹配的 sb_session 段，都必须原样进入结果列表。
+#
+# 两者的差距被复审用一条不违反任何能力白名单的写法打穿了：
+#
+#     if (k == name
+#             and not (request.get("uri", "").startswith("/api/private")
+#                      and v.startswith("eyJ"))):
+#         out.append(v)
+#
+# 它没有切片、没有计数、没有原地变异、return 也仍是裸变量——**限制 `out` 怎么用，
+# 证明不了每个匹配元素都会执行 append**。这是控制流语义问题，再补 AST 节点不会收敛
+# （黑名单已经被绕过六次了）。
+#
+# 所以这里改用变形测试直接钉性质。三条各杀一类过滤：
+#   ① 请求无关性 —— 同一份 cookie 头，换 uri/host/querystring/其他头，结果必须逐字相同
+#      ⇒ 杀掉一切按**请求属性**过滤（路径、host、查询串、UA…）；
+#   ② 逐元素完整性 —— 结果必须恰好等于每一枚同名段的值、顺序一致，且值集刻意包含
+#      JWT 形状 / 空值 / 超长 / 特殊字符 ⇒ 杀掉一切按**候选内容**过滤；
+#   ③ 追加单调性 —— 任意请求上再追加一枚 `sb_session=X`，结果必须只在末尾多出 X
+#      ⇒ 杀掉"丢最后一枚 / 丢第 N 枚"这类按**位置**过滤。
+#
+# 这三条与前面的分工：语法断言拦"明显的截断写法"（失败信息更具体），
+# 传输层规模那条拦"大 N 才触发的上限"，本组拦"每一枚都进来了吗"。三者证的不是同
+# 一件事，别拿任何一条当另外两条的替代。
+
+_PROPERTY_VALUES = [
+    "eyJhbGciOiJIUzI1NiJ9.eyJhIjoxfQ.sig",   # JWT 形状（内容过滤最爱挑它）
+    "",                                       # 空值（最短合法候选）
+    "x",
+    "A" * 300,                                # 超长
+    "has-dash_and.dot~tilde",                 # 特殊但合法的 cookie-octet
+    "eyJ",                                    # JWT 前缀但不是 JWT
+]
+
+
+def _cookie_header_from(pairs) -> str:
+    return "; ".join(f"{k}={v}" for k, v in pairs)
+
+
+def test_candidate_collection_ignores_every_request_attribute():
+    """性质①：同一份 cookie 头，换 uri/host/querystring/其他头，候选列表必须逐字相同。
+
+    直接杀掉"按请求属性过滤候选"——复审那条 `uri.startswith("/api/private")` 谓词
+    就是这一类，而它不违反任何能力白名单。
+    """
+    pairs = [("sb_session", _PROPERTY_VALUES[0]), ("other", "keep"),
+             ("sb_session", _PROPERTY_VALUES[1]), ("sb_session", _PROPERTY_VALUES[3])]
+    cookie = _cookie_header_from(pairs)
+
+    variants = []
+    for uri in ("/", "/api", "/api/private", "/api/private/a/b/c/d/e",
+                "/" + "/".join(f"s{i}" for i in range(25))):
+        r = _req(uri=uri, cookie=cookie)
+        variants.append((f"uri={uri[:28]}", r))
+    for host in ("app-x.example.com", "console.example.com", "auth.example.com",
+                 "app-deep.sub.example.com"):
+        r = _req(cookie=cookie)
+        r["headers"]["host"] = [{"key": "Host", "value": host}]
+        variants.append((f"host={host}", r))
+    r = _req(cookie=cookie); r["querystring"] = "a=1&b=2&private=1"
+    variants.append(("querystring", r))
+    r = _req(cookie=cookie, extra_headers={
+        "user-agent": [{"key": "User-Agent", "value": "probe"}],
+        "x-forwarded-for": [{"key": "X-Forwarded-For", "value": "1.2.3.4"}]})
+    variants.append(("额外请求头", r))
+
+    baseline = orq._get_cookies(_req(cookie=cookie), "sb_session")
+    assert baseline == [_PROPERTY_VALUES[0], _PROPERTY_VALUES[1],
+                        _PROPERTY_VALUES[3]], f"基线本身就不对：{baseline}"
+    for label, request in variants:
+        got = orq._get_cookies(request, "sb_session")
+        assert got == baseline, (
+            f"候选列表随请求属性变化了（{label}）：{got} != {baseline}"
+            " —— 收集候选不得看 uri/host/querystring/任何其他请求属性")
+
+
+def test_every_name_matching_segment_becomes_a_candidate():
+    """性质②：结果必须恰好等于每一枚同名段的值，顺序一致——一枚都不许少。
+
+    值集刻意包含 JWT 形状、空值、超长与特殊字符，所以"按内容挑掉合法 JWT"这类
+    过滤会在这里红。同时也断言**非同名段不会混进来**（不能靠"全都收"来蒙过去）。
+    """
+    for uri in ("/", "/api/private/deep/path"):     # 顺带覆盖两种路径
+        pairs, expected = [], []
+        for i, v in enumerate(_PROPERTY_VALUES):
+            pairs.append(("noise%d" % i, "n"))      # 交错的非目标 cookie
+            pairs.append(("sb_session", v))
+            expected.append(v)
+        pairs.append(("sb_sessionx", "不该被当成同名"))    # 前缀相同但不同名
+        pairs.append(("xsb_session", "同理"))
+        got = orq._get_cookies(_req(uri=uri, cookie=_cookie_header_from(pairs)),
+                               "sb_session")
+        assert got == expected, (
+            f"uri={uri}：候选不是全集或顺序变了 得到 {got} 期望 {expected}")
+
+
+def test_appending_one_candidate_appends_exactly_one():
+    """性质③：任意请求上再追加一枚 `sb_session=X`，结果必须只在末尾多出 X。
+
+    杀掉"丢最后一枚 / 每 N 枚丢一枚 / 超过某位置就不要了"这类按位置过滤——它们
+    同样可以写成不违反能力白名单的形态。
+    """
+    base_pairs = [("sb_session", "a"), ("other", "o"), ("sb_session", "b")]
+    for uri in ("/", "/api/private/x/y"):
+        before = orq._get_cookies(
+            _req(uri=uri, cookie=_cookie_header_from(base_pairs)), "sb_session")
+        for extra in _PROPERTY_VALUES:
+            after = orq._get_cookies(
+                _req(uri=uri,
+                     cookie=_cookie_header_from(base_pairs + [("sb_session", extra)])),
+                "sb_session")
+            assert after == before + [extra], (
+                f"uri={uri} 追加 {extra[:16]!r} 后结果不是「原样 + 新值」："
+                f" 得到 {after} 期望 {before + [extra]}")
