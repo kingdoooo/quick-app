@@ -247,7 +247,14 @@ def _docstring_ids(tree) -> set:
 
 # 投影赋值的形态判据，**全文件唯一一处定义**：`_hoisted_projection_names` 与
 # `_projects_require_auth` 都用它。各写一份正则就是本轮在修的那个毛病。
-_PROJECTION_ASSIGN_RE = r"require_auth\s*="
+#
+# **必须带上 `:` 占位符**（Codex 复审这轮收紧）：原来是 `require_auth\s*=`，它会命中
+# 任何**散文**里的 `require_auth=...`。真实案例：`verify_deployed_components.py` 的
+# 断言文案 `'console require_auth=True（面板必须登录）'` 被判成"这个函数在写投影"。
+# 在原来只扫两个文件的范围里这没暴露，一旦把 writer 检测扩到全域就是个假阳性——
+# 而假阳性会逼下一个人给守卫加豁免。DynamoDB 的 UpdateExpression 一定是
+# `SET require_auth = :a` 这种占位符形态（两个真 writer 都是），散文不是。
+_PROJECTION_ASSIGN_RE = r"require_auth\s*=\s*:"
 
 
 def _hoisted_projection_names(tree) -> set:
@@ -537,6 +544,127 @@ def _require_auth_offenders(*roots, allowed=frozenset(), base=None) -> list:
                         and "require_auth" in node.value):
                     offenders.append(f"{rel}:{node.lineno}")
     return sorted(offenders)
+
+
+# ── writer 检测扩到全域（Codex 复审 F2）────────────────────────────────────
+#
+# 修的是一个**整文件豁免**造成的失明：`_require_auth_offenders`（字面量哨兵，下称
+# 守卫 B）在解析 AST **之前**就 `if rel in allowed: continue` 跳过整个文件，而真正
+# 认 writer 并要求走 `effective_policy_audited` 的 `_projection_writers`（守卫 A）
+# 原先只扫 `functions/permissions.py` + `functions/register_route.py`。
+# 于是把一个裸 writer 放进任何一个"因为当前只读/只写自己夹具"而进白名单的文件里，
+# 两个守卫都看不见——Codex 实测往 `scripts/migrate_permissions.py` 追加一个裸投影
+# 函数，11 条用例全绿。
+#
+# 分工改成：**守卫 B 的整文件豁免只压制"字面量出现"，守卫 A 在全域按函数判"有没有
+# 绕过审计入口"**。豁免因此下沉到函数级——文件级豁免再也不会顺带豁免一个 writer。
+
+_WRITER_SCAN_ROOTS = ("deployer/functions", "panel", "mcp", "key-proxy", "scripts")
+
+# 允许"写路由 item 里的 require_auth 但不调 effective_policy_audited"的**函数**，
+# 按 `相对路径::函数名` 写，每条附理由。**不许按文件写**——那正是本轮在修的毛病。
+_UNAUDITED_WRITERS_ALLOWED = {
+    # 平台路由（console / mcp 子域）没有 sites 行，过不了 effective_policy
+    # （它要的 owner / allowed_users 对平台子域不存在）。这两条是 §"平台路由不是
+    # 站点权限投影"的既定例外，与 _REQUIRE_AUTH_ALLOWED 里同名文件的理由一致。
+    "panel/deploy_panel.py::console_route_item",
+    "key-proxy/deploy_key_proxy.py::mcp_route_item",
+    # 真机验收夹具：各自 put 一条**自己的**临时路由再删掉，不碰存量行。
+    # 逐个函数列，不是"因为文件叫 verify_*"——哪天某个 verify_* 开始改存量行的
+    # 权限字段，它会以一个**新函数名**出现在发现集里，下面那条"发现集必须恰好
+    # 等于它"就会红，需要有人点头。
+    "scripts/verify_permission_matrix.py::main",
+    "scripts/verify_permission_matrix.py::put_route",
+    "scripts/verify_console_e2e.py::main",
+    "scripts/verify_analytics_e2e.py::main",
+}
+
+
+def _unaudited_writers(*roots, base=None) -> dict:
+    """roots 下所有 .py → `{相对路径::函数名: 是否调了 effective_policy_audited}`。
+
+    与守卫 B 不同，这里**不接受整文件豁免**：豁免由调用处按函数名做。
+    """
+    base = base or roots[0]
+    found = {}
+    for root in roots:
+        for path in sorted(root.rglob("*.py")):
+            if any(part in _SCAN_SKIP_DIRS for part in path.parts):
+                continue
+            from conftest import is_transient_deploy_copy
+            if is_transient_deploy_copy(path):
+                continue
+            rel = path.relative_to(base).as_posix()
+            for fn, audited in _projection_writers(path).items():
+                found[f"{rel}::{fn}"] = audited
+    return found
+
+
+def test_no_unaudited_projection_writer_anywhere():
+    """**全域**：任何往路由投影 require_auth 的函数，要么调 effective_policy_audited，
+    要么显式进 `_UNAUDITED_WRITERS_ALLOWED`（按函数、附理由）。
+
+    这条补的是"整文件豁免让守卫 A 也一起失明"那个洞：`scripts/` 里几个脚本因为
+    当前只读/只写自己的夹具而进了守卫 B 的白名单，而在此之前守卫 A 根本不扫它们。
+    """
+    import pathlib
+
+    sb = pathlib.Path(__file__).parents[2]
+    roots = [sb / r for r in _WRITER_SCAN_ROOTS]
+    found = _unaudited_writers(*roots, base=sb)
+
+    offenders = sorted(k for k, audited in found.items()
+                       if not audited and k not in _UNAUDITED_WRITERS_ALLOWED)
+    assert not offenders, (
+        f"这些函数在投影 require_auth 但没走 effective_policy_audited：{offenders}。"
+        "要么改成调它，要么按函数加进 _UNAUDITED_WRITERS_ALLOWED 并写清理由"
+        "（**不要**改成整文件豁免）")
+
+    # **发现集必须恰好等于"已审计的 + 已豁免的"**，多一个都要人点头。
+    # 少了同样要红：那说明判据已经跟不上代码（`_projects_require_auth` /
+    # `_PROJECTION_ASSIGN_RE` 被改窄），守卫正在空转。
+    expected = _UNAUDITED_WRITERS_ALLOWED | {
+        k for k, audited in found.items() if audited}
+    assert set(found) == expected, (
+        f"发现的投影 writer 集合变了：多了 {sorted(set(found) - expected)}，"
+        f"少了 {sorted(expected - set(found))}。"
+        "多了 ⇒ 真的新增了 writer，确认它调了审计入口再登记；"
+        "少了 ⇒ **先修判据**，不要改这个集合。")
+    # 正对照：三个真 writer 必须仍在发现集里，否则上面那条会因为"两边一起变空"
+    # 而假绿（判据写坏时 found 与 expected 同时收缩成空集）。
+    for core in ("deployer/functions/permissions.py::write_permissions",
+                 "deployer/functions/permissions.py::resync_route",
+                 "deployer/functions/register_route.py::_route_item"):
+        assert found.get(core) is True, (
+            f"{core} 不在发现集里或未被判为已审计——判据已经失效，本条正在空转")
+
+
+def test_writer_scan_bites_a_naked_writer_inside_a_file_exempted_from_the_literal_guard(
+        tmp_path):
+    """反向验证，**常驻**：守卫 B 整文件豁免的文件，守卫 A 仍须咬住里面的裸 writer。
+
+    这正是 Codex 复审复现的那条路径——往 `scripts/migrate_permissions.py`
+    （已在 `_REQUIRE_AUTH_ALLOWED` 里）追加一个裸投影函数，改之前 11 条用例全绿。
+    探针写进 tmp_path，不往 tracked 文件注入。
+    """
+    probe = tmp_path / "already_exempt.py"
+    probe.write_text(
+        '"""这个文件在守卫 B 的白名单里（模拟只读脚本）。"""\n'
+        'def unsafe_projection(site, ddb, table):\n'
+        '    return ddb.update_item(\n'
+        '        TableName=table, Key={"subdomain": {"S": site["subdomain"]}},\n'
+        '        UpdateExpression="SET require_auth = :a",\n'
+        '        ExpressionAttributeValues={":a": {"BOOL": True}})\n')
+
+    # ① 守卫 B 确实对它失明（整文件豁免）——这是缺陷的前提，必须真的成立
+    assert _require_auth_offenders(
+        tmp_path, allowed={"already_exempt.py"}, base=tmp_path) == [], (
+        "守卫 B 竟然咬住了被整文件豁免的文件——那本条的前提不成立，请重读")
+
+    # ② 守卫 A 必须咬住它
+    found = _unaudited_writers(tmp_path, base=tmp_path)
+    assert found == {"already_exempt.py::unsafe_projection": False}, (
+        f"守卫 A 没咬住白名单文件里的裸 writer：{found}")
 
 
 def test_sentinel_scan_bites_a_probe_file(tmp_path):
