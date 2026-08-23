@@ -431,6 +431,109 @@ def test_readme_marks_the_phase_one_docs_as_snapshots():
             f"这一行没标明是一期快照：{row.strip()[:110]}")
 
 
+# ── 活动文档不许再教「已被删除的实现」（Codex 复审 F1）────────────────────────
+#
+# S1 的候选条数上限已经删掉（任何有限值都会按路径深度让 M06 复活），spec 与代码都
+# 改了，但**实施计划的 Task 9 仍在逐行规定** `MAX_SESSION_COOKIE_CANDIDATES = 8` 与
+# 切片式截断，而 CLAUDE.md 的文档地图把那份 plan 与 spec 并列标为「S1 的设计与实施」。
+# 也就是说新接手的人按文档地图进去，读到的是一份**会把漏洞重新实现出来**的可执行
+# 指令。这条守卫要求：这类"已被取代的实现"只能出现在明确标了 superseded 的段落里。
+
+# 已被取代、不许在无标记的活动段落里出现的实现符号。**每条都要写清它为什么被删**
+# ——否则下一个人只知道"不许提"，不知道"提了会怎样"，于是会把标记加上了事。
+_SUPERSEDED_SYMBOLS = {
+    # 候选条数上限：可遮蔽条数上界 4n−2、n（路径段数）无界 ⇒ 不存在够大的有限值。
+    # 8 在 4 段路径上被打满，64 在 17 段上被打满，M06 在那些路径上原样复活。
+    "MAX_SESSION_COOKIE_CANDIDATES": "候选条数上限已删除（spec §4.4）",
+}
+
+# 认可的"这段已经不算指令了"标记
+_SUPERSEDED_MARKERS = ("superseded", "已被取代", "已废弃", "历史记录")
+
+
+def _fenced_mask(lines: list) -> list:
+    """逐行「这一行在围栏代码块里吗」。与 `_section` 里那份同法。"""
+    mask, inside = [], False
+    for ln in lines:
+        if ln.lstrip().startswith("```"):
+            mask.append(True)        # 围栏标记行本身不可能是标题
+            inside = not inside
+        else:
+            mask.append(inside)
+    return mask
+
+
+def _enclosing_section(lines: list, idx: int) -> str:
+    """含第 idx 行的那个 markdown 小节（往上找最近的标题，往下到下一个同级或更高级）。
+
+    **必须跟踪围栏**，理由与本文件 `_section` 的 docstring 同一条：围栏里第 0 列的
+    `# 注释` 与 H1 标题在纯文本上长得一模一样。我第一版没跟踪，于是 plan 里那段
+    Python 代码块的注释 `# 约 8KB 限制…` 被当成标题，小节从它开始算 ⇒ 上面那条
+    superseded 横幅被切在小节外 ⇒ 守卫在文档**已经标好**的情况下假红。
+    （同一个坑本文件警告过一次，我还是踩了；所以这里把解析器修对，而不是去改文档。）
+    """
+    fenced = _fenced_mask(lines)
+
+    def is_heading(i: int) -> bool:
+        return lines[i].startswith("#") and not fenced[i]
+
+    start, level = 0, 99
+    for i in range(idx, -1, -1):
+        if is_heading(i):
+            start = i
+            level = len(lines[i]) - len(lines[i].lstrip("#"))
+            break
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if is_heading(j) and (len(lines[j]) - len(lines[j].lstrip("#"))) <= level:
+            end = j
+            break
+    return "\n".join(lines[start:end])
+
+
+def test_no_tracked_doc_prescribes_a_superseded_implementation():
+    """任何**被跟踪**的 .md 里，已被取代的实现符号只能出现在标了 superseded 的小节里。
+
+    Codex 复审 F1：代码与 spec 都改成"不设条数上限"之后，plan 的 Task 9 仍在规定
+    `MAX_SESSION_COOKIE_CANDIDATES = 8` + 切片截断，而 CLAUDE.md 把那份 plan 标为
+    「S1 的设计与实施」——活动的实施真源在教人把已修掉的漏洞重新写回来。
+
+    扫**全部 tracked .md**而不是一张文档清单：换个文件名、把内容搬进另一份文档，
+    这条都还在。
+    """
+    import subprocess
+
+    r = subprocess.run(["git", "ls-files", "-z", "*.md"], cwd=ROOT,
+                       capture_output=True, text=True)
+    assert r.returncode == 0, f"git ls-files 失败（本条空转）：{r.stderr.strip()}"
+    docs = [d for d in r.stdout.split("\0") if d]
+    assert len(docs) > 5, f"只找到 {len(docs)} 份 tracked .md——本条空转"
+
+    checked, offenders = 0, []
+    for rel in docs:
+        lines = (ROOT / rel).read_text(encoding="utf-8").splitlines()
+        for sym, why in _SUPERSEDED_SYMBOLS.items():
+            for i, line in enumerate(lines):
+                if sym not in line:
+                    continue
+                checked += 1
+                sec = _enclosing_section(lines, i)
+                if not any(m in sec for m in _SUPERSEDED_MARKERS):
+                    offenders.append(f"{rel}:{i + 1} [{sym}] {why}")
+
+    assert not offenders, (
+        "这些位置在**没有 superseded 标记**的小节里规定了已被取代的实现：\n  "
+        + "\n  ".join(offenders)
+        + "\n要么改成最终实现，要么在该小节开头加一段"
+        f"{_SUPERSEDED_MARKERS[1]!r} 横幅并指向真源。")
+
+    # 正对照：plan 的 Task 9 现在确实还留着那些字样（在 superseded 横幅之下）。
+    # 归零意味着判据或文档结构变了，此时这条在空转。
+    assert checked >= 4, (
+        f"只在 tracked .md 里找到 {checked} 处已取代符号——判据多半跟不上文档了"
+        "（符号被改名／文档被移出跟踪？），本条正在空转")
+
+
 # ── 不许把"新 clone 里没有的文档"当真源（类级守卫）───────────────────────────
 #
 # README 早有一条同向的守卫（`test_readme_status_has_no_stale_numbers_or_date` 末尾
@@ -538,6 +641,80 @@ def _doc_blocks(text: str) -> list:
 NOT_DISTRIBUTED_MARKERS = ("gitignored", "不随仓库分发", "新 clone 里不存在")
 
 
+def _pointers_in(block: str) -> set:
+    """一块文本里所有「像是指向文档」的引用。
+
+    反引号路径 **+ Markdown 链接目标**（`[文字](路径)`）。只取反引号会漏掉链接
+    形态——Codex 复审指出的同一类失明（提取规则决定守卫的射程，而它当时只认一种
+    写法）。裸文档名那一类由 `test_..._by_bare_name` 单独管，不在这里。
+    """
+    toks = set(re.findall(r"`([^`\n]+)`", block))
+    toks |= set(re.findall(r"\]\(([^)\s]+)\)", block))
+    return {t.strip() for t in toks if _is_doc_pointer(t.strip())}
+
+
+def _bare_name_stems(prose: str, doc, tracked: set) -> set:
+    """从这份文档**自己标出的**非分发指针里推出「文档词干」。
+
+    自推导，不是硬编码黑名单：文档里出现 `docs/design/HANDOFF-2026-08-07.md`
+    就得到词干 `HANDOFF`，于是同一份文档里任何**裸写** HANDOFF 的地方都要按
+    同一标准要求标记。这样新加一份 gitignored 的 `docs/design/XXXX-2027.md`
+    会自动带出词干 `XXXX`，不用有人回来补名单。
+
+    只取长度 ≥5 的**全大写**片段：这是本仓库过程记录的命名习惯
+    （HANDOFF / FINDINGS / SPIKE / SPEC），而全大写足以避开普通散文词。
+    """
+    stems = set()
+    for tok in _pointers_in(prose):
+        if _distributed(tok, tracked, doc):
+            continue
+        base = tok.rstrip("/").split("/")[-1]
+        for part in re.split(r"[-_.{}0-9,/]+", base):
+            if len(part) >= 5 and part.isupper():
+                stems.add(part)
+    return stems
+
+
+def test_delivery_docs_do_not_reference_undistributed_docs_by_bare_name():
+    """裸写的文档名（不加反引号、不写路径）也要标明它不随仓库分发。
+
+    这是 Codex 复审抓到的一处**当前 HEAD 的直接矛盾**，不是未来的假想：
+    CLAUDE.md 一边写"HANDOFF / FINDINGS 是 gitignored、不要当状态真源"，一边在
+    E2E 那一节写"数量与最新结果**见 HANDOFF 的最新一节**"——新 clone 的读者照它
+    去找一个不存在的文件。上一条守卫看不见它，因为它只从反引号里提路径，而
+    `见 HANDOFF 的最新一节` 既没有反引号也没有路径。
+
+    词干是**从文档自己标出的非分发指针里推的**（见 `_bare_name_stems`），
+    所以这条不是"HANDOFF 黑名单"，新增一份过程记录会自动进入射程。
+    """
+    tracked = _tracked_paths()
+    checked, offenders = 0, []
+    for doc in (README, CLAUDE_MD, DEPLOY):
+        prose = re.sub(r"```.*?```", "", _read(doc), flags=re.S)
+        stems = _bare_name_stems(prose, doc, tracked)
+        if not stems:
+            continue
+        checked += len(stems)
+        # **先把反引号跨度整段抹掉再找裸出现**：`docs/design/M{3,4,5}-FINDINGS.md`
+        # 里面也含 FINDINGS，不抹掉就会把"规范写法"当成"裸写"报出来。
+        masked = re.sub(r"`[^`\n]*`", " ", prose)
+        raw = prose.splitlines()
+        for i, line in enumerate(masked.splitlines(), 1):
+            for stem in sorted(stems):
+                if stem in line and not any(m in line
+                                            for m in NOT_DISTRIBUTED_MARKERS):
+                    offenders.append(f"{doc.name}:L{i} 裸写 {stem}：{raw[i - 1].strip()[:70]}")
+
+    # 正对照：CLAUDE.md 现在确实标着 HANDOFF / FINDINGS / SPIKE 三个词干
+    assert checked >= 3, (
+        f"只推出 {checked} 个文档词干——`_bare_name_stems` 多半跟不上文档写法了，"
+        "本条正在空转。先修它，不要放宽这个数字。")
+    assert not offenders, (
+        "这些地方**裸写**了一份新 clone 里没有的文档名：\n  "
+        + "\n  ".join(sorted(set(offenders)))
+        + "\n同一行里标明它不随仓库分发，或者改成一条可执行命令／一份被跟踪的文档。")
+
+
 def test_delivery_docs_mark_every_undistributed_doc_pointer():
     """三份交付文档里每一处指向「新 clone 里没有的文档」的指针，都必须当场标明。
 
@@ -555,8 +732,7 @@ def test_delivery_docs_mark_every_undistributed_doc_pointer():
         # 围栏里是命令不是指针，先剥掉（`_section` 那套按标题切，这里要的是全文）
         prose = re.sub(r"```.*?```", "", _read(doc), flags=re.S)
         for line_no, block in _doc_blocks(prose):
-            pointers = {t.strip() for t in re.findall(r"`([^`\n]+)`", block)}
-            undistributed = sorted(p for p in pointers
+            undistributed = sorted(p for p in _pointers_in(block)
                                    if _is_doc_pointer(p)
                                    and not _distributed(p, tracked, doc))
             scanned += len(undistributed)
@@ -595,8 +771,19 @@ def test_claude_md_status_section_points_at_a_tracked_truth_source():
 
     # 「还剩什么」的真源必须是被跟踪的文件。**按被跟踪判定，不写死文件名**：
     # 换一份 review 文档时这条应该继续成立，而不是要跟着改。
-    truth = [p for p in re.findall(r"`([^`\n]+)`", status)
+    #
+    # **绑到那一**句**，不是那一段**（Codex 复审指出"段里随便找到一个 tracked .md
+    # 就算过"太松；我第一次只收紧到"块"，仍然不够——实测把这句改指 HANDOFF 之后
+    # 守卫照样全绿，因为同一段里还有 `docs/phase2-requirements.md` 这些被跟踪的
+    # 指针替它满足了断言）。判据必须是"**这句话**指向的那份文档被跟踪"。
+    assert status.count("**待办与优先级**") == 1, (
+        "状态段里「**待办与优先级**」不是恰好一处，定位不了那句声明"
+        "——本条空转（措辞被改过？）")
+    tail = status.split("**待办与优先级**", 1)[1]
+    sentence = tail.split("。", 1)[0]          # 到第一个句号为止
+    cited = sorted(_pointers_in(sentence))
+    truth = [p for p in cited
              if p.endswith(".md") and _distributed(p, tracked, CLAUDE_MD)]
     assert truth, (
-        "状态段里没有任何**被跟踪**的 .md 指针——读者拿不到一份新 clone 里真的存在的"
-        "「还剩什么」清单")
+        "「待办与优先级」**这一句**指向的不是一份被跟踪的文档——读者拿不到一份新 "
+        f"clone 里真的存在的「还剩什么」清单。这句引用的是：{cited}")

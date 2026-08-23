@@ -98,8 +98,8 @@ python3 site-builder/scripts/verify_console_e2e.py      # 控制台端到端
 python3 site-builder/scripts/verify_analytics_e2e.py    # 统计端到端（二期 M5）
 ```
 
-`site-builder/scripts/verify_*` 是真机闸门（部署后跑，不是单测）。数量与最新结果
-见 HANDOFF 的最新一节——本文件不记数字（会过时）。
+`site-builder/scripts/verify_*` 是真机闸门（部署后跑，不是单测）。**本文件不记数量与
+最新结果**（都会过时）：闸门清单就是上面那段命令，跑一遍即是最新结果。
 
 **这些脚本一律用系统 `python3` 跑，不要借 `deployer/.venv/bin/python3`**：那个解释器的
 CA 信任库是空的（`ssl.create_default_context().cert_store_stats()` 全 0），于是每一次

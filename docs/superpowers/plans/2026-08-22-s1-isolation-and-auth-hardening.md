@@ -2716,6 +2716,28 @@ git commit -m "fix(s1/m05): Edge verifier 要求 typ=session + 跨组件正向�
 
 ### Task 9: Edge 取全部同名 cookie 并逐个验签
 
+> ## ⛔ 本任务已被取代（superseded），**不要照下面的代码块实施**
+>
+> 下面保留的是**执行时的原始计划**（历史记录）。它规定的
+> `MAX_SESSION_COOKIE_CANDIDATES = 8` 与
+> `_get_cookies(...)[:MAX_SESSION_COOKIE_CANDIDATES]` 已经被证明**会让 M06 原样
+> 复活**：可遮蔽条数的上界是 `4n − 2`（n = 请求路径段数），站点的 URL 空间由站点
+> 作者决定、平台不约束 ⇒ n 无界 ⇒ 不存在"够大"的有限上限。8 在 4 段路径上就被
+> 打满（14 条遮蔽 cookie），64 在 17 段上被打满。
+>
+> **最终实现与本节的三处差异**（真源是 spec §4.4，代码见
+> `router/infrastructure/lambda/origin_request.py` 里 `_get_cookies` 上方那段）：
+>
+> 1. **不设条数上限**——常量删除，循环遍历**全部**候选。界由 Cookie 头体积给
+>    （传输层强制、与路径深度无关）。
+> 2. **auth 侧还有一半**：`login_handler.py` 的 `/console-session` 同样要逐个验
+>    （`_session_cookie_candidates`）。那个端点**不在 Edge 的 gate 后面**
+>    （`auth` 子域 `require_auth=False`），所以 Edge 的修复覆盖不到它。本节
+>    完全没有这一项。
+> 3. **边界用例换形状**：原计划的"第 cap+1 条不应被尝试"是把残留面写成需求，
+>    已删除。现在是一条行为断言（按 Cookie 头体积生成候选、真 token 排最后仍须
+>    放行）＋一条 AST 结构断言（遍历候选的迭代对象不得被切片／islice 截断）。
+
 **Files:**
 - Modify: `router/infrastructure/lambda/origin_request.py:473-479`（`_get_cookie` → `_get_cookies`）
 - Modify: `router/infrastructure/lambda/origin_request.py:597-601`（`_check_auth` 的取 token 段）
