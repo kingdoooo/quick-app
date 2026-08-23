@@ -306,3 +306,113 @@ def test_dry_run_report_renders_for_sparse_rows(aws, capsys):
         kept = p.pop("kept_from_online", [])
         assert kept == ["allowed_users"]
         assert "require_login" in p
+
+
+# ---- require_auth 的推导：与 Edge 当下实际执行的策略逐形态对齐 ----
+#
+# Codex 复审提出把缺失 / NULL / N / S / L 型 `require_auth` 全部报进 errors、
+# 不进 migrated（按 `_parse_allowed` 的严格口径）。**这条被否了**，理由是那样会
+# 让迁移比线上更严：Edge 对这些行的判定是明确且 fail-closed 的（"需登录"），
+# 把它们报成"数据损坏"等于拦下一批策略清楚的行，并要求人去"修"一个没坏的值。
+#
+# 两条口径不同不是松紧不一，而是**数据模型不同**：`allowed_users` 的 Edge
+# fail-closed 值是**空名单**，而 `normalize_allowed_users` 拒绝空名单
+# （permissions.py:410），所以迁移根本表示不出那个值 —— 只剩 "org"（扩权）
+# 与报错两条路，于是必须报错。`require_auth` 的 Edge fail-closed 值是 `True`，
+# 迁移表示得出来，所以能忠实记录而不必猜。
+#
+# 下面这条把"忠实记录"从散文变成可执行断言：任何一侧改了 fail-closed 方向，
+# 它就红。**不在测试里手抄 Edge 的规则**（那就是一份会漂的副本），而是导入
+# 真的 Edge 模块来问它。
+
+def _edge_requires_login(raw_require_auth: dict) -> bool:
+    """Edge 对这一行**实际**会不会要求登录。用真的 origin_request.py 回答。
+
+    Edge 的判定是 `_deser` 整行后 `require_auth is False ⇒ 公开`，未识别类型
+    落到 `_UNKNOWN`（`__bool__` 为真，倒向更严）。手抄这条规则就等于维护一份
+    简化副本，所以这里做占位符替换后直接 import 那个文件。
+    """
+    import importlib.util
+    import tempfile
+
+    root = Path(__file__).parents[3]
+    src = (root / "router" / "infrastructure" / "lambda"
+           / "origin_request.py").read_text()
+    for k, v in {"{{DYNAMODB_TABLE_NAME}}": "t", "{{DYNAMODB_REGION}}": "us-east-1",
+                 "{{FRONTEND_BUCKET_DOMAIN}}": "b.s3.us-east-1.amazonaws.com",
+                 "{{JWT_SECRET}}": "test-secret", "{{BASE_DOMAIN}}": "example.com",
+                 "{{REQUIRE_IDP_CLAIM}}": "true",
+                 "{{TRUSTED_IDPS}}": "Feishu"}.items():
+        src = src.replace(k, v)
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "_edge_for_parity.py"
+        p.write_text(src)
+        spec = importlib.util.spec_from_file_location("_edge_for_parity", p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    item = {"require_auth": raw_require_auth} if raw_require_auth else {}
+    return mod._deser(item).get("require_auth") is not False
+
+
+# 九种形态：一个合法 True、一个合法 False，其余七种是人工修表能产出的坏类型。
+REQUIRE_AUTH_FORMS = [
+    ({"BOOL": True}, True),
+    ({"BOOL": False}, False),
+    ({}, True),                 # 属性整体缺失
+    ({"NULL": True}, True),
+    ({"N": "0"}, True),
+    ({"S": "false"}, True),
+    ({"L": []}, True),
+    ({"M": {}}, True),
+    ({"SS": ["a"]}, True),
+]
+
+
+@pytest.mark.parametrize("raw,expected", REQUIRE_AUTH_FORMS)
+def test_require_auth_derivation_matches_edge(aws, raw, expected):
+    """迁移推出的 require_login 必须 == Edge 此刻对同一行实际执行的策略。
+
+    这条同时是"不要把坏类型报成 errors"这个裁定的依据：报错的前提是"判不出
+    原意"，而这里每一种形态 Edge 都判得出、且判得一致。
+    """
+    import common
+    import migrate_permissions as mig
+
+    site_id = "s-parity"
+    common.upsert_site(site_id, owner="o@x.com")
+    item = {"subdomain": {"S": "app-" + site_id}, "site_id": {"S": site_id},
+            "route_mode": {"S": "split"},
+            "static_prefix": {"S": f"sites/{site_id}/j"},
+            "api_target": {"S": ""}, "allowed_users": {"S": "org"},
+            "owner": {"S": "o@x.com"}}
+    if raw:
+        item["require_auth"] = raw
+    boto3.client("dynamodb").put_item(TableName="routing", Item=item)
+
+    out = mig.migrate("routing", dry_run=True)
+    assert out["errors"] == [], "坏类型的 require_auth 不该报错——Edge 判得出来"
+    assert out["migrated"] == [site_id]
+    derived = out["planned"][site_id]["require_login"]
+    assert derived is expected
+    assert derived == _edge_requires_login(raw), (
+        f"迁移推出 {derived}，而 Edge 对 require_auth={raw!r} 实际执行的是 "
+        f"{_edge_requires_login(raw)} —— 两侧 fail-closed 方向漂了")
+
+
+def test_public_route_migrates_to_require_login_false(aws):
+    """`require_auth={"BOOL": False}` 必须迁成 `require_login=False`。
+
+    补的是一个真空洞：原有 17 条用例**全部**用 require_auth=True，于是一个
+    "把 require_login 恒定写成 True"的实现能让它们全绿——那会把存量公开站点
+    静默改成要登录（可用性事故，且报告里看不出来）。
+    """
+    import common
+    import migrate_permissions as mig
+
+    common.upsert_site("s-pub", owner="o@x.com")
+    _put_route("app-s-pub", "s-pub", require_auth=False)
+
+    out = mig.migrate("routing", dry_run=False)
+    assert out["migrated"] == ["s-pub"]
+    assert out["planned"]["s-pub"]["require_login"] is False
+    assert common.get_site("s-pub")["require_login"] is False

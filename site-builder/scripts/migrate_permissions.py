@@ -148,6 +148,27 @@ def migrate(routing_table: str, *, dry_run: bool = True) -> dict:
                     report["errors"].append(
                         f"{site_id}: allowed_users 无法规范化（{e}）")
                     continue
+                # **坏类型的 require_auth 刻意不报错**（与上面 allowed_users 的
+                # 严格口径不同，这不是松紧不一，是数据模型不同）：
+                # Edge 的判定是 `require_auth is False ⇒ 公开`，于是缺失 / NULL /
+                # N / S / L / M / SS 全部落在"需登录"，判定明确且 fail-closed。
+                # 这一行推出的值对**九种形态**都与 Edge 此刻实际执行的策略相同
+                # （`test_require_auth_derivation_matches_edge` 用真的 Edge 模块
+                # 逐形态钉住），所以它是在**记录线上正在执行什么**，不是猜原意。
+                # 报成"数据损坏"会把一批策略清楚的行拦在迁移外，并要求人去"修"
+                # 一个没坏的值。
+                # 反过来 allowed_users 必须报错：它的 Edge fail-closed 值是**空
+                # 名单**，而 `normalize_allowed_users` 拒绝空名单，迁移根本表示
+                # 不出来——只剩 "org"（扩权）与报错两条路。
+                #
+                # `bool()` 在这里是**无操作包装**，不是 merged review §262 禁的那种
+                # 洗白：DynamoDB 的 BOOL 槽位在客户端就被 botocore 校验
+                # （`{"BOOL": 0}` / `{"BOOL": "false"}` 直接 ParamValidationError，
+                # 已实测），所以 `.get("BOOL", True)` 只可能得到真 bool 或字面
+                # `True`，落不出 `bool(假值非布尔) → False` 那条 fail-open 路径。
+                # 那条禁令针对的是 sites 表的 `bool(site.get("require_login", True))`
+                # ——那里的假值非布尔会被洗成 `False` 再以字面 BOOL False 写进路由，
+                # 被 Edge 当成"站主显式声明公开"。此处不存在那个通路。
                 require_login = bool(item.get("require_auth", {}).get("BOOL", True))
                 report["migrated"].append(site_id)
                 # planned：给 dry-run 报告看"将写什么值"。没有它，SS→org 这类

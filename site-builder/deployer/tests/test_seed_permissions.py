@@ -412,6 +412,39 @@ _REQUIRE_AUTH_ALLOWED = {
     # `permissions.write_permissions` 的 route_update。它是**授权面**的声明，
     # 不是投影。（把它误记成"平台路由 writer"是个假事实，别传下去。）
     "mcp/deploy_agentcore.py",
+    # ---- scripts/：**读**路由投影的一次性运维脚本，不是 writer ----
+    # 收进扫描范围的理由与 panel/mcp 同类，只是更强：这些脚本带着**生产凭证**
+    # 直接打真表，环境里当然有 ROUTING_TABLE，往这儿加一个投影 writer 一样能跑通。
+    #
+    # migrate_permissions.py：把路由表现值回填进 sites 表（方向是 route → sites，
+    # 不是投影）。它读 `require_auth` 的那一行推出的 `require_login`，对
+    # **全部**九种 AttributeValue 形态都与 Edge 当下实际执行的策略逐一相同
+    # （`{"BOOL": False}` → 公开；缺失 / NULL / N / S / L / M / SS → 需登录），
+    # 见 `test_migrate_permissions.py::test_require_auth_derivation_matches_edge`。
+    # 也就是说它是在**记录线上正在执行什么**，不是在猜历史意图——所以它不该像
+    # `_parse_allowed` 那样把坏类型报成错误：Edge 对那些行的判定是明确的
+    # （fail-closed 需登录），报成"数据损坏"会把一批策略清楚的行拦在迁移之外。
+    "scripts/migrate_permissions.py",
+    # migrate_sites_to_blue_green.py：只 `SET api_target`（带
+    # attribute_exists(subdomain)，造不出半行）。它读 `require_auth` 是为了在
+    # 计划输出里标注"这条是公开站点"，同一个 fail-closed 推导。
+    "scripts/migrate_sites_to_blue_green.py",
+    # check_permissions_state.py：只读诊断。`require_auth` 出现在
+    # `ENFORCING_PAIRS`（真源字段 ↔ 投影字段的对照表，用来报"真源说私有、Edge
+    # 仍按公开放行"）和一个打印字段清单里。它一行都不写。
+    "scripts/check_permissions_state.py",
+    # verify_deployed_components.py：闸门，**断言**已部署的两条平台路由形态正确
+    # （console `is True`、mcp `is False`，都按"是布尔而不是字符串"断言——
+    # 字符串会落进 Edge 的"按需要登录处理"分支）。只读。
+    "scripts/verify_deployed_components.py",
+    # 下面三个是**真机测试夹具**，同 `tests/` 目录整体跳过的理由：各自 put 一条
+    # 自己的 fixture 路由再删掉，不是生产投影路径。它们必须写全 route item
+    # （含 require_auth），否则造不出被测场景。
+    # **不因为叫 `verify_*` 就豁免**——逐个列，且理由是"写自己的临时夹具行"；
+    # 哪天某个 verify_* 开始改**存量**行的权限字段，它就该在这里红。
+    "scripts/verify_permission_matrix.py",
+    "scripts/verify_console_e2e.py",
+    "scripts/verify_analytics_e2e.py",
 }
 
 
@@ -424,8 +457,11 @@ def test_no_other_module_projects_require_auth():
     **非 docstring** 的 `require_auth` 字面量：谁在别处引入它，这条就红，
     逼他要么挪位置、要么把上一条的边界一起扩。
 
-    **扫描范围是 `deployer/functions` + `panel` + `mcp` + `key-proxy`，不是只有
-    `functions/`**（S1 最终复核指出）：`permissions.py` 被复制进那三个包的产物，
+    **扫描范围是 `deployer/functions` + `panel` + `mcp` + `key-proxy` + `scripts`，
+    不是只有 `functions/`**（S1 最终复核指出前四个，`scripts/` 是 Codex 复审那轮
+    追加的——它当时提的是另一件事，但顺着查下去发现整个 `scripts/` 目录在 M02
+    的三条守卫之外，而那里的脚本是带**生产凭证**直接打真表的，比 panel 更该盯）：
+    `permissions.py` 被复制进那三个包的产物，
     而 panel 与 MCP 的 Lambda 环境里**已经**有 `ROUTING_TABLE`
     （deploy_panel.py / deploy_agentcore.py），所以往 `panel/api.py` 加一个投影
     writer 是真的能跑通的——而"panel 不许自己手写投影"此前只以散文形式写在
@@ -448,6 +484,7 @@ def test_no_other_module_projects_require_auth():
     sb = pathlib.Path(__file__).parents[2]           # site-builder/
     offenders = _require_auth_offenders(
         sb / "deployer" / "functions", sb / "panel", sb / "mcp", sb / "key-proxy",
+        sb / "scripts",
         allowed=_REQUIRE_AUTH_ALLOWED, base=sb)
     assert not offenders, (
         f"这些模块出现了 require_auth 字面量（docstring 除外）：{offenders}。"
