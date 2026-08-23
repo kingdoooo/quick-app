@@ -951,6 +951,15 @@ def test_candidates_are_not_truncated_anywhere():
       · 只查循环迭代对象 → 把 `if len(out) >= 2000: return out` 藏进
         `_get_cookies` 内部，四条守卫全绿而 M06 已复活。
 
+    **已知边界（不要当成"全覆盖"）**：本检测器管的是"**候选列表**有没有被截断"，
+    覆盖 9 种形态（见下一条 meta-test 的清单）。它**不**覆盖"在解析之前先把原始
+    Cookie 头截短"这个插入点——已实测检测器对它返回空。那一种只被**无条件**的
+    大规模行为用例挡住（真 token 在第 2000+ 位，截到 20 条必红），按请求属性
+    条件化之后两边都可能全绿。之所以没把它也结构化：`_check_auth` 本来就**合法地**
+    改写请求头（剥保留 cookie、注入 `x-user-*`），一条"不许写 request headers"的
+    规则会大面积假阳性。要收这一条，正确做法是给"剥离/注入"划出唯一入口再断言
+    其余位置不碰 cookie 头，那是独立的一块改动。
+
     **这条不变量有两份实现，改一边必须同时看另一边**：auth 的
     `/console-session` 走 `_session_cookie_candidates`，对称守卫在
     `site-builder/auth/tests/test_login_handler.py::
