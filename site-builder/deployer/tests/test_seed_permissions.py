@@ -467,6 +467,11 @@ _REQUIRE_AUTH_ALLOWED = {
     "scripts/verify_permission_matrix.py",
     "scripts/verify_console_e2e.py",
     "scripts/verify_analytics_e2e.py",
+    # verify_session_token_semantics.py：**只发 GET**的真机闸门。它读
+    # `require_auth` 只为从路由表里挑一个"需要登录"的站点当探针目标
+    # （`it.get("require_auth") is True`），不 put 也不 update 任何行，更不建夹具。
+    # 这条豁免是本轮扩域后哨兵咬住的**第一个新文件**，属于它按设计工作。
+    "scripts/verify_session_token_semantics.py",
 }
 
 

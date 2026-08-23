@@ -9,19 +9,21 @@ Quick 自动化建站平台（Site Builder）：业务人员在任意支持 Skil
 `https://app-{site_id}.{base_domain}` 的可分享 URL。站点访问与管理权限绑定飞书账号
 （身份源可换成任意能给 email claim 的 Cognito 联邦 IdP）。
 
-**当前状态**分两层，别混：
+**当前状态：一期、二期与加固包都已在真实 AWS 部署。** 二期含
+`console.{base_domain}` 自助管理控制台、API Key 交换层、访问统计聚合；站点更新走
+blue/green 原子切换（M7）。加固包（跨租户 IAM 隔离 / 权限数据洗白 / token 用途混用 /
+同名 cookie 遮蔽 DoS，即 merged review §9 优先级表里的 M01/M02/M05/M06 四条）已按
+`site-builder/DEPLOY.md` 的「S1 加固」一节部署并过全部闸门，**含真机行为探针**
+（`verify_session_token_semantics.py`）。**§9 表里其余各条还没做。**
 
-- **已部署**：一期与二期（含 `console.{base_domain}` 自助管理控制台、API Key 交换层、
-  访问统计聚合）都已在真实 AWS 部署并端到端验证；站点更新走 blue/green 原子切换（M7）。
-- **已实现、尚未部署**：加固包 **S1**（M01 跨租户 IAM 隔离 / M02 权限数据洗白 /
-  M05 token 用途混用 / M06 cookie 遮蔽 DoS），在分支
-  `s1-isolation-and-auth-hardening` 上已实现并过审。它是 merged review §9 那张优先级表
-  里的 M01/M02/M05/M06 四条；表里其余各条还没做。
+**所以本文件的架构描述与线上是一致的**（包括下面「站点代码按不可信对待」那条写的
+「禁止 `site-data-{site_id}-*` 前缀通配」——存量 per-site 角色已全部收敛成精确表
+ARN，通配已清零）。不再需要"读文档时减去一层"。
 
-**⚠️ 本文件的架构描述已经是 S1 之后的口径**（例如下面「站点代码按不可信对待」那条写的
-「禁止 `site-data-{site_id}-*` 前缀通配」）。**线上此刻仍是通配**——读这份文档判断
-"生产现在是什么样"的时候，凡涉及 S1 那四条的，都要减去这一层。部署顺序与闸门见
-`site-builder/DEPLOY.md` 的「S1 加固」一节。
+> **两条仍然成立的边界，别当成已解决**：per-site IAM 的 `dsql:DbConnect` 仍是
+> `Resource: *`（DSQL 的租户隔离在 PG 层——per-site schema + 非 admin role，不在 IAM
+> 层，这是既定设计而非残留）；同名 cookie 遮蔽只关掉了 DoS，**没关身份混淆**
+> （攻击者持有另一个**合法** token 时仍会先被取到，根治是 host-only 会话，独立成包）。
 
 **具体进度与闸门数字不写在本文件**（会过时）：确切数字靠下面的测试命令自己跑；
 **待办与优先级**见 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9

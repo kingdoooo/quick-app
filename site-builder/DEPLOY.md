@@ -383,7 +383,7 @@ python3 site-builder/scripts/migrate_sites_to_blue_green.py --apply --site-id <s
 | 4 | auth | **第二波**重登从这一刻开始 |
 | 5 | router（Edge） | 必须在 auth 之后：反过来会让新签发的会话被 Edge 拒（登录循环） |
 | 6 | 等 CloudFront `Status == Deployed` | **放在 5 之后而不是之前**：触发 Lambda@Edge 全球传播的是 router 部署本身，在它之前等待不会等到任何新版本。判据用 `Status`，不要盲等固定分钟数。**第三波**重登在这期间发生 |
-| 7 | 真机验收（5 条 + 硬闸门） | 见下面「四个硬闸门」 |
+| 7 | 真机验收（6 条 + 硬闸门） | 见下面「五个硬闸门」 |
 
 **中途停下是安全且可重跑的**：若在第 3 步失败中止，此时是"deployer + 三个产物
 已更新、auth/router 还是旧版"。这个中间态自洽——旧 auth 签发不带 `typ` 的会话，
@@ -432,7 +432,7 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 # **M01 闸门的退出码先存起来、在块末才生效——这个写法不要"整理"成直接中止。**
 # 直接中止的话，一个与 M02/M05/M06 完全无关的数据条件（下面那条没有 tier 的
-# ACTIVE 行，必须人工修）会把另外五条验收全部吃掉，那次部署就在**没有任何
+# ACTIVE 行，必须人工修）会把另外六条验收全部吃掉，那次部署就在**没有任何
 # M02/M05/M06 证据**的情况下收尾。反过来把闸门挪到最后也不行：`--check` 是唯一
 # 对全部 ACTIVE dynamodb 站点跑功能模拟的地方（`--apply` 结尾只做结构检查），
 # 它必须留在执行记录最前面。
@@ -449,6 +449,7 @@ echo "M01 闸门退出码：$m01_rc（非 0 会在本块末尾让这一步失败
 # Edge 是旧的时候，后面几条的结果没有解读价值。
 bash    site-builder/scripts/verify_deployed_edge.sh         # 逐行比对分发关联版本的产物 == 本地源码 + S1 哨兵
 
+python3 site-builder/scripts/verify_session_token_semantics.py  # M05/M06 的**行为**证据（只发 GET）
 python3 site-builder/scripts/verify_deployed_components.py   # 第 2 步之后必跑：唯一能发现**三个 Lambda 产物**陈旧的闸门（不含 Edge，见上）
 python3 site-builder/scripts/verify_permission_matrix.py     # M02 之后唯一覆盖权限矩阵端到端的闸门
 python3 site-builder/scripts/verify_console_e2e.py           # 跑之前先在浏览器登录一次（重登让 token 失效了）
@@ -457,18 +458,19 @@ bash    site-builder/scripts/smoke_router.sh                 # 路由层冒烟�
 exit "$m01_rc"
 ```
 
-期望：`不合格的 site-rt-* 角色：0`、`M01 闸门退出码：0`，五条验收全部通过，整块退 0。
+期望：`不合格的 site-rt-* 角色：0`、`M01 闸门退出码：0`，六条验收全部通过，整块退 0。
 `verify_console_e2e.py` 报 token 过期时先 `node site-builder/clients/quick-desktop-proxy/auth.js`
 重新登录一次。
 
-### 四个硬闸门：各自证明什么，以及**不**证明什么
+### 五个硬闸门：各自证明什么，以及**不**证明什么
 
 | 闸门 | 什么时候跑 | 它证明 | 它**不**证明 |
 |---|---|---|---|
 | `audit_policy_rows.py` | 第 0 步（部署前） | 没有 ACTIVE 行会被新的严格解析拒绝。退出码**只由 ACTIVE 行驱动** | 非 ACTIVE 行的问题只报成警告、不进退出码；畸形 `status`（`N`/`NULL`/`L`/缺失）四种形态只有夹具覆盖过，真表里从未出现过这种行 |
 | `backfill_site_role_policies.py --check` | 第 7 步 | 四层：site-scope 与期望**完整等值**、角色上只有 site-scope 一条 policy、ACTIVE 站点的角色反向存在、全部 dynamodb 站点过 IAM 模拟器**全部六个数据动作** | **不看信任策略**（`AssumeRolePolicyDocument` 被放宽的角色四层全过）、**不看 `site-runtime-boundary` 还挂着没有**——而 `ensure_site_role` 只在**新建**角色时挂 boundary，所以 `--apply` 不会把被摘掉的 boundary 挂回去。DSQL 站点只有文本等值，没有功能模拟 |
 | `verify_deployed_components.py` | 第 7 步，且**必须在第 2 步之后** | 线上产物里的 `permissions.py` / `common.py` / `session.py` / `login_handler.py` 与仓库逐字节一致 | 这是**唯一**能发现"某个 **Lambda** 产物漏部了"的闸门。三个组件里漏一个的症状是产物陈旧而部署脚本全程正常。**它不覆盖 Edge**：它下载 Edge 产物，但只问一个问题（`mcp` 有没有进 `PLATFORM_SUBDOMAINS`），M05/M06 的 Edge 半边它一个字都没看 |
-| `verify_deployed_edge.sh` | 第 7 步，**在业务验收之前**（第 6 步等到 `Deployed` 之后） | CloudFront **当前关联的那个版本**的产物与本地 `origin_request.py` 逐行相同（只允许占位符行有差异）、占位符全部替换、安全开关是收紧值，外加 M05（查 `typ`）与 M06（逐个验、不截断）两条哨兵 | **证据等级是静态产物比对，不是行为探针**：它证明"跑在线上的就是这份源码"，M05/M06 的**行为**正确性由单测提供。两者合起来才是完整链条，但没有任何一条真机请求验证过 Edge 的 M05/M06 分支。也不看非默认 cache behavior 上的关联 |
+| `verify_deployed_edge.sh` | 第 7 步，**在业务验收之前**（第 6 步等到 `Deployed` 之后） | CloudFront **当前关联的那个版本**的产物与本地 `origin_request.py` 逐行相同（只允许占位符行有差异）、占位符全部替换、安全开关是收紧值，外加 M05（查 `typ`）与 M06（逐个验、不截断）两条哨兵 | **证据等级是静态产物比对，不是行为探针**：它证明"跑在线上的就是这份源码"，M05/M06 的**行为**由下面那条闸门单独证。也不看非默认 cache behavior 上的关联 |
+| `verify_session_token_semantics.py` | 第 7 步，紧跟上一条 | M05/M06 的**真机行为**：遮蔽 cookie 排在合法会话之前时 `/console-session` 仍换出升级码、Edge 侧仍放行（含 14 条遮蔽的量级）、console 升级码当站点会话被拒；含正对照（单枚合法会话能进）与负对照（无 cookie 仍 302）。**只发 GET，不写数据** | 它只挑路由表里第一个 `require_auth=True` 的站点，不遍历全部站点；候选条数上限那一类**回归**残留由单测的结构守卫管，不在这里 |
 
 另两条：`verify_permission_matrix.py`（权限矩阵端到端，M02 之后唯一覆盖它的）、
 `verify_console_e2e.py` + `smoke_router.sh`（控制台与路由层）。
@@ -514,7 +516,7 @@ spec 里只写了后两波。第一波是最终复核发现的，症状是"刚�
 | 你看到 | 怎么办 |
 |---|---|
 | `--apply` 报「验证失败」 | **先重跑 `--check` 再下结论**。IAM 与策略模拟器是最终一致的，脚本内建 2/4/8 秒退避只能减少、不能消除一次**完全正确**的跑被记成红 |
-| `--check` 报某行「sites 行没有 tier，判不出 engine」 | **脚本永远修不到 0，必须人工修那一行**（`tier` 只在部署成功路径写，所以这是可达状态，不是假设）。修好再重跑；这一条不影响另外五条验收（那就是 Step 5 把退出码延后生效的原因） |
+| `--check` 报某行「sites 行没有 tier，判不出 engine」 | **脚本永远修不到 0，必须人工修那一行**（`tier` 只在部署成功路径写，所以这是可达状态，不是假设）。修好再重跑；这一条不影响另外六条验收（那就是 Step 5 把退出码延后生效的原因） |
 | `--check` 报「site-scope 之外还有别的 policy」 | 需人工移除那条多余的 inline/attached policy。脚本**不自动删未知 policy** |
 | `--check` 报「ACTIVE 站点的角色缺失」 | 先查为什么没了。脚本**不自动重建**（自动建会盖掉根因，也会让备份里的 `null` 出现第二种含义） |
 | 「临时备份文件已存在——判为另一个 backfill 正在运行」 | **等一下再重跑，绝不要删那个 `.tmp`**。它同时是跨进程锁；此刻一笔 IAM 写入都没发生。若确认是上一次崩溃的残留，人工看过内容再删 |
