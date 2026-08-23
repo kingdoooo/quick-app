@@ -286,7 +286,7 @@ python3 site-builder/scripts/gen_onboarding.py
 | 加固包 S1 的设计与实施 | `docs/superpowers/specs/2026-08-22-s1-isolation-and-auth-hardening-spec.md` + `docs/superpowers/plans/2026-08-22-s1-isolation-and-auth-hardening.md`；升级/闸门/回滚见 `site-builder/DEPLOY.md` 的「S1 加固」一节 |
 | 一期设计决策与范围 | `docs/superpowers/specs/2026-07-21-quick-site-builder-design.md`（已实现快照，勿改） |
 | 二期设计与需求 | `docs/superpowers/specs/2026-07-30-quick-site-builder-phase2-design.md`；需求清单 `docs/phase2-requirements.md` |
-| 任务级实现/审查证据链 | `.superpowers/sdd/<计划日期>-<计划名>/progress.md`（每个 plan 一个目录；`.superpowers/sdd/progress.md` 那个扁平路径是一期的旧布局） |
+| 任务级实现/审查证据链 | `.superpowers/sdd/<计划日期>-<计划名>/progress.md`（**gitignored**、每个 plan 一个目录；`.superpowers/sdd/progress.md` 那个扁平路径是一期的旧布局） |
 | 各里程碑实测发现 | `docs/design/M{3,4,5}-FINDINGS.md`、`M4-SPIKE-2026-08-10.md`、`M7-SPEC-2026-08-16.md`（**gitignored**；含可复用的断言自查清单，已验证过的别再跑一遍） |
 | 历史过程记录 | `docs/design/HANDOFF-2026-08-07.md`（**gitignored**；写到二期为止、**不含 S1**——**不是**状态真源，见上面「当前状态」） |
 

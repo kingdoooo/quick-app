@@ -429,3 +429,174 @@ def test_readme_marks_the_phase_one_docs_as_snapshots():
         row = _row(sec, row_needle)
         assert "一期" in row and ("快照" in row or "勿改" in row), (
             f"这一行没标明是一期快照：{row.strip()[:110]}")
+
+
+# ── 不许把"新 clone 里没有的文档"当真源（类级守卫）───────────────────────────
+#
+# README 早有一条同向的守卫（`test_readme_status_has_no_stale_numbers_or_date` 末尾
+# 那三行：状态段必须说明 `docs/design` 不随仓库分发、且不许以 HANDOFF 为真源），
+# **CLAUDE.md 一直没有**——S1 那次"文档地图/状态段把 gitignored 的 HANDOFF 写成状态
+# 真源"就是从这个缺口漂回来的。
+#
+# 这里刻意**不**照抄那种逐个点名的写法（`"HANDOFF" not in ...`）：那是打地鼠，换个
+# 文件名就绿。判据改成从 **git 自己**问"新 clone 里到底有没有这个文件"，于是新加一份
+# gitignored 的过程记录、或把某份文档移出跟踪，守卫都会自己发现。
+
+
+def _tracked_paths() -> set:
+    """仓库里**被跟踪**的全部路径。「这是不是新 clone 里有的东西」的唯一判据。
+
+    用 `git ls-files` 而不是 `git check-ignore`：真正要问的是"新 clone 里有没有"，
+    而"没被 .gitignore 匹配"并不等于"被跟踪"（未跟踪且未忽略的文件同样不在 clone 里）。
+    结果为空一定是环境问题（不在 git 仓库里／没有 git），**必须红而不是静默放过**——
+    否则每个指针都会被判成"非分发"，这条会以假红的形式空转。
+    """
+    import subprocess
+
+    r = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT,
+                       capture_output=True, text=True)
+    assert r.returncode == 0, f"git ls-files 失败（本条空转）：{r.stderr.strip()}"
+    paths = {p for p in r.stdout.split("\0") if p}
+    assert len(paths) > 100, f"git ls-files 只返回 {len(paths)} 条——本条空转"
+    return paths
+
+
+def _is_doc_pointer(tok: str) -> bool:
+    """这个反引号内容是不是「指向一份文档」的路径。
+
+    范围刻意收窄到**文档**：本守卫管的是"别拿一份新 clone 里没有的文档当真源"，
+    不管 venv、config.ini、URL 路径。放宽到"所有路径"实测会咬出一堆
+    `deployer/.venv`、`/api/keys/revoke`、`f"/{static_prefix}{path}"` 这类噪音——
+    而假阳性的下一步是有人给守卫加目录级豁免，那才是真把洞开出来。
+    """
+    if tok.startswith(("/", "http", ".venv")) or any(c in tok for c in ' ":()=$'):
+        return False
+    if "/" not in tok and not tok.endswith(".md"):
+        return False
+    return tok.endswith(".md") or tok.startswith(("docs/", ".superpowers/"))
+
+
+def _distributed(path: str, tracked: set, doc: Path) -> bool:
+    """新 clone 里有没有它。
+
+    **先按"相对这份文档所在目录"解析，再按仓库根**——这不是为了少报几条，而是
+    读者就是这样解析的：`DEPLOY.md` 住在 `site-builder/`，它写的
+    `docs/client-setup.md` 指的是 `site-builder/docs/client-setup.md`（实测该文件
+    确实只存在于那里）。只按仓库根解析会把 DEPLOY.md 里 5 处**完全正常**的
+    包内相对路径报成违规，而带着 5 条假阳性的守卫活不过下一轮。
+    对 README/CLAUDE.md 两者等价（它们就在仓库根）。
+
+    目录形态与 `<占位符>`／`{a,b}` 形态按字面前缀判。
+    """
+    rel = doc.parent.relative_to(ROOT).as_posix()
+    for cand in ([f"{rel}/{path}", path] if rel != "." else [path]):
+        if cand in tracked:
+            return True
+        prefix = re.split(r"[{<*]", cand)[0]
+        if not prefix:
+            return True                  # 整体是占位符，判不出，不当违规
+        if any(t.startswith(prefix) for t in tracked):
+            return True
+    return False
+
+
+def _doc_blocks(text: str) -> list:
+    """`(行号, 块文本)`。**表格行自成一块，散文按空行分段。**
+
+    granularity 是这条守卫的关键，两个极端都试过、都不对：
+      · 按**小节**切太松——「文档地图」那张表只要任意一行写过 gitignored，新加的
+        那一行就免检了，而新加的那一行正是会漂的那一行；
+      · 按**单行**切会假红——引用块里的散文是折行的，指针在一行、`gitignored`
+        在下一行（实测 CLAUDE.md 那段引用块就是这样）。
+    表格行是读者单独消费的单元，散文段落才是。围栏代码块在调用处已剥掉：
+    那里是命令（`.venv/bin/pytest` 之类），不是指向文档的真源指针。
+    """
+    out, buf, start = [], [], 0
+    for i, ln in enumerate(text.splitlines(), 1):
+        if ln.lstrip().startswith("|"):
+            if buf:
+                out.append((start, "\n".join(buf)))
+                buf = []
+            out.append((i, ln))
+        elif not ln.strip():
+            if buf:
+                out.append((start, "\n".join(buf)))
+                buf = []
+        else:
+            if not buf:
+                start = i
+            buf.append(ln)
+    if buf:
+        out.append((start, "\n".join(buf)))
+    return out
+
+
+# 认可的「这东西不在你的 clone 里」标记。给三种写法而不是只认一个词：只认
+# `gitignored` 会让"**不随仓库分发**"这种同义表述假红，而这三个都是三份文档已在用的
+# 措辞。**不要往里加"仅本地"之类含糊的词**——标记的作用是让读者当场知道照这个路径
+# 找不到文件。
+NOT_DISTRIBUTED_MARKERS = ("gitignored", "不随仓库分发", "新 clone 里不存在")
+
+
+def test_delivery_docs_mark_every_undistributed_doc_pointer():
+    """三份交付文档里每一处指向「新 clone 里没有的文档」的指针，都必须当场标明。
+
+    S1 那次漂移的形状：文档地图把 gitignored 的 `docs/design/HANDOFF-*.md` 列成
+    "接手时读哪里"，于是新 clone 的接手人按图去找一个不存在的文件，并且**以为自己
+    读到的是状态真源**。这三份是"换个人／换个账号照着做"的入口，这一行的代价是对方
+    拿着缺失的口径去判断生产现在是什么样。
+
+    判据不是一张文件名黑名单，而是 `git ls-files`：**新加一份 gitignored 的过程记录、
+    或把某份文档移出跟踪，这条都会自己发现。**
+    """
+    tracked = _tracked_paths()
+    scanned, offenders = 0, []
+    for doc in (README, CLAUDE_MD, DEPLOY):
+        # 围栏里是命令不是指针，先剥掉（`_section` 那套按标题切，这里要的是全文）
+        prose = re.sub(r"```.*?```", "", _read(doc), flags=re.S)
+        for line_no, block in _doc_blocks(prose):
+            pointers = {t.strip() for t in re.findall(r"`([^`\n]+)`", block)}
+            undistributed = sorted(p for p in pointers
+                                   if _is_doc_pointer(p)
+                                   and not _distributed(p, tracked, doc))
+            scanned += len(undistributed)
+            if undistributed and not any(m in block
+                                         for m in NOT_DISTRIBUTED_MARKERS):
+                offenders.append(f"{doc.name}:L{line_no} {undistributed}")
+
+    # **正对照：本条不许空转。** 提取规则收窄过（只认文档路径），写错一个字符就会一个
+    # 指针都扫不到，而那时它照样是绿的——守卫失效却无人知道。三份文档现在确实引用着
+    # gitignored 的 `docs/design/` 与 `.superpowers/`，所以这个数必须远大于 0。
+    assert scanned >= 8, (
+        f"只扫到 {scanned} 处非分发文档指针——提取规则多半已经跟不上文档的写法，"
+        "本条正在空转。先修 _is_doc_pointer/_doc_blocks，不要放宽这个数字。")
+
+    assert not offenders, (
+        "这些位置指向了**新 clone 里没有**的文档，却没标明：\n  "
+        + "\n  ".join(offenders)
+        + f"\n在同一块里加上 {NOT_DISTRIBUTED_MARKERS[0]!r} 之类的标记，或者改指一份"
+        "被跟踪的文档。gitignored 的过程记录**不能**充当状态真源。")
+
+
+def test_claude_md_status_section_points_at_a_tracked_truth_source():
+    """CLAUDE.md 状态段必须把「还剩什么」指向一份**被跟踪**的文档。
+
+    上一条只保证"非分发的指针都标了"，它**不**保证真源本身是分发的——把状态段整段
+    改成"见 HANDOFF（gitignored）"能同时满足上一条。这条补的正是那个方向，也是 S1
+    漂移的实际形状。
+    """
+    tracked = _tracked_paths()
+    status = _section(_read(CLAUDE_MD), "## 项目是什么")
+
+    assert any(m in status for m in NOT_DISTRIBUTED_MARKERS), (
+        "状态段没说明 docs/design 那批过程记录不随仓库分发")
+    assert "不要把它们当状态真源" in status, (
+        "状态段少了「不要把它们当状态真源」这句——这是 S1 漂移的直接成因")
+
+    # 「还剩什么」的真源必须是被跟踪的文件。**按被跟踪判定，不写死文件名**：
+    # 换一份 review 文档时这条应该继续成立，而不是要跟着改。
+    truth = [p for p in re.findall(r"`([^`\n]+)`", status)
+             if p.endswith(".md") and _distributed(p, tracked, CLAUDE_MD)]
+    assert truth, (
+        "状态段里没有任何**被跟踪**的 .md 指针——读者拿不到一份新 clone 里真的存在的"
+        "「还剩什么」清单")
