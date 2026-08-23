@@ -314,6 +314,77 @@ def test_console_session_tries_every_candidate_that_can_physically_arrive():
         f"第 {n + 1} 枚候选没被尝试——有人在 auth 侧引入了条数上限，M06 复活了")
 
 
+def _accumulator_offenders(fn, label: str) -> list:
+    """累积变量的**能力白名单**：只允许三种用法，其余一律是截断嫌疑。
+
+    这是判据的第六版，也是第一次不再枚举"截断长什么样"。前五版都在拉黑具体写法
+    （切片 → islice → 整数比较 → return 的位置 → `len`/`+=`/重绑），每一版都被下一种
+    拼写绕过；最后一轮漏的是**原地变异**：
+
+        if request.get("uri", "").startswith("/api/private"):
+            del out[20:]
+        return out
+
+    它没有 `len`、没有 `+=`、没有 break、累积变量只赋值一次、return 恰好一个且在末尾、
+    返回的还是裸 `out` —— 上一版六条检查一条都不命中，而 `/api/private/...` + 30 条
+    同名 cookie 已经恢复 302。同族还有 `out[:] = out[:20]`、`out.clear()`、`out.pop()`、
+    `_cap(out)`（把 out 交给别人去截）。
+
+    所以反过来写：**列出允许的三件事，其余全红**。
+      ① 作为初始化赋值的目标（`out = []`），且全函数只赋值这一次；
+      ② 作为 `.append(...)` 的接收者；
+      ③ 作为**最终那个** return 的值（裸变量，不带任何包装）。
+    读长度、取下标、删元素、就地赋值、传给别的函数、参与条件表达式……全部不在白名单
+    里。要新增一种合法用法，得先证明它保持全集，再往白名单里加一条并说明理由。
+    """
+    import ast
+
+    accumulators = {n.func.value.id for n in ast.walk(fn)
+                    if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute) and n.func.attr == "append"
+                    and isinstance(n.func.value, ast.Name)}
+    assert accumulators, (f"在 {label} 里找不到任何 `X.append(...)` —— 本条空转"
+                          "（累积方式被改写了？）")
+
+    parents = {}
+    for node in ast.walk(fn):
+        for child in ast.iter_child_nodes(node):
+            parents[id(child)] = node
+    returns = [n for n in ast.walk(fn) if isinstance(n, ast.Return)]
+    final_ret = returns[0] if len(returns) == 1 else None
+
+    bad = []
+    for acc in sorted(accumulators):
+        inits = [n for n in ast.walk(fn) if isinstance(n, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id == acc for t in n.targets)]
+        if len(inits) != 1:
+            bad.append(f"{label} 的累积变量 `{acc}` 被赋值 {len(inits)} 次"
+                       "（应只有初始化那一次）—— 重绑同名变量同样是截断")
+        for node in ast.walk(fn):
+            if not (isinstance(node, ast.Name) and node.id == acc):
+                continue
+            parent = parents.get(id(node))
+            # ① 初始化赋值的目标
+            if (isinstance(parent, ast.Assign) and parent in inits
+                    and any(t is node for t in parent.targets)):
+                continue
+            # ② `.append(...)` 的接收者
+            if (isinstance(parent, ast.Attribute) and parent.attr == "append"
+                    and parent.value is node
+                    and isinstance(parents.get(id(parent)), ast.Call)
+                    and parents[id(parent)].func is parent):
+                continue
+            # ③ 最终 return 的值（必须是裸变量）
+            if final_ret is not None and parent is final_ret and final_ret.value is node:
+                continue
+            bad.append(
+                f"{label} 的累积变量 `{acc}` 出现在白名单之外的位置："
+                f"{ast.unparse(parent)[:70]} —— 只允许"
+                "「初始化一次 / .append() 的接收者 / 最终裸 return」三种用法，"
+                "其余都可能丢掉候选")
+    return bad
+
+
 def _auth_truncation_offenders(src: str) -> list:
     """auth 侧候选被截断的全部形态 → 原因列表；空列表 = 没有截断。
 
@@ -383,13 +454,8 @@ def _auth_truncation_offenders(src: str) -> list:
     assert accumulators, (f"在 {label} 里找不到任何 `X.append(...)` —— 本条空转"
                           "（累积方式被改写了？）")
 
-    # 累积变量只能被赋值一次（`out = out[:N]` 这种重绑同样是截断）
-    for acc in sorted(accumulators):
-        binds = [n for n in ast.walk(src_fn) if isinstance(n, ast.Assign)
-                 and any(isinstance(x, ast.Name) and x.id == acc for x in n.targets)]
-        if len(binds) != 1:
-            bad.append(f"{label} 的累积变量 `{acc}` 被赋值 {len(binds)} 次"
-                       "（应只有初始化那一次）—— 重绑同名变量同样是截断")
+    # 累积变量的能力白名单（与 Edge 侧 `_accumulator_offenders` 同法）
+    bad += _accumulator_offenders(src_fn, label)
 
     returns = [n for n in ast.walk(src_fn) if isinstance(n, ast.Return)]
     if len(returns) != 1:
@@ -470,6 +536,24 @@ def test_auth_truncation_detector_bites_each_known_bypass():
         "返回前重绑同名累积变量": (
             "            out.append(value)\n    return out",
             "            out.append(value)\n    out = out[:_LIMIT]\n    return out"),
+        # 五种原地变异（Edge 侧同一批）：无 len / += / break / 重绑，return 仍是裸变量
+        "条件化 del out[20:]": (
+            "            out.append(value)\n    return out",
+            "            out.append(value)\n"
+            '    if event.get("rawPath", "").startswith("/console"):\n'
+            "        del out[20:]\n    return out"),
+        "out[:] = out[:20]": (
+            "            out.append(value)\n    return out",
+            "            out.append(value)\n    out[:] = out[:20]\n    return out"),
+        "out.clear()": (
+            "            out.append(value)\n    return out",
+            "            out.append(value)\n    out.clear()\n    return out"),
+        "out.pop()": (
+            "            out.append(value)\n    return out",
+            "            out.append(value)\n    out.pop()\n    return out"),
+        "把累积变量交给别的函数去截": (
+            "            out.append(value)\n    return out",
+            "            out.append(value)\n    _cap(out)\n    return out"),
     }
     for name, (old, new) in bypasses.items():
         assert old in src, f"变异锚点找不到（{name}）——本条空转"
