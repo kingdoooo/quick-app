@@ -188,6 +188,28 @@ else
   fi
 fi
 
+# ---- S1：M05（token 用途混用）与 M06（同名 cookie 遮蔽）----
+# ③ 的逐行比对已经能发现"产物不是这份源码"，这里再点名两条**语义**：核对旧版本
+# （`$0 <version>`）时 ③ 只会说"行数/内容不一致"，而这两行会直接说出缺的是哪条
+# 安全属性。同样按代码行断言，不用裸 grep——两个名字在注释里都出现。
+if grep -qE '^\s+if claims\.get\("typ"\) != "session":' "$TMP/index.py"; then
+  echo "PASS  会话验签查 typ（M05：60s 升级码不能当站点会话用）"
+else
+  fail "产物的 _verify_session_jwt 没有 typ 检查 —— M05 未生效：一个 60 秒的 console 升级码就是一个有效站点会话，且能在 /console-session 无限续期"
+fi
+# 同名 sb_session 必须**逐个**验，且**不得截断**：条数上限会按路径深度让 M06 复活
+# （可遮蔽条数上界 4n−2，n 是路径段数，站点 URL 空间不受平台约束 ⇒ n 无界）。
+if grep -qE '^\s+for token in _get_cookies\(request, "sb_session"\):' "$TMP/index.py"; then
+  echo "PASS  同名 sb_session 逐个验且未截断（M06）"
+else
+  fail "产物没有『逐个验全部同名 sb_session』那一行 —— M06 未生效或候选被截断：$(grep -nE 'for token in _get_cookies' "$TMP/index.py" || echo '未找到该循环')"
+fi
+if grep -qE '^MAX_SESSION_COOKIE_CANDIDATES *=' "$TMP/index.py"; then
+  fail "产物里又有候选条数上限（MAX_SESSION_COOKIE_CANDIDATES）—— 任何有限上限都会让 M06 在深路径上复活，见 origin_request.py 里 _get_cookies 上方的推导"
+else
+  echo "PASS  产物无候选条数上限常量"
+fi
+
 echo
 if [ "$FAILURES" -gt 0 ]; then
   echo "结果：$FAILURES 项未达预期 —— 线上 Edge 与预期不一致，先排查再继续"

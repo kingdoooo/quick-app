@@ -999,4 +999,3 @@ currentAnalyticsController = new AbortController();
 | P2-1 | 缺 lock 拒绝；`npm ci`；同一输入连续构建 hash 一致 |
 | P2-2 | 逆序 resolve 与跨 tab/site 导航时旧响应零 DOM 写入 |
 | 全量 | 七包回归、CDK 断言、locked MCP、部署一致性闸门全部重新运行 |
-
