@@ -334,6 +334,14 @@ def _auth_truncation_offenders(src: str) -> list:
     aliases = {t.id for node in ast.walk(handler) if isinstance(node, ast.Assign)
                and is_source_call(node.value)
                for t in node.targets if isinstance(t, ast.Name)}
+    # 候选别名在任何地方被下标/切片都算截断（`del cands[20:]` 这一族发生在调用与
+    # 循环**之间**，只查迭代对象时看不见）。与 Edge 的 `_candidate_alias_subscripts`
+    # 对称。
+    for node in ast.walk(handler):
+        if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
+                and node.value.id in aliases):
+            bad.append(f"候选别名被下标/切片：{ast.unparse(node)[:60]}")
+
     loops = [n for n in ast.walk(handler) if isinstance(n, ast.For)
              and any(is_source_call(x) or (isinstance(x, ast.Name) and x.id in aliases)
                      for x in ast.walk(n.iter))]
@@ -351,21 +359,49 @@ def _auth_truncation_offenders(src: str) -> list:
                     and not isinstance(c.value, bool) for c in sub.comparators):
                 bad.append(f"循环体里按计数提前退出：{ast.unparse(sub)[:60]}")
 
+    # 来源函数四条，与 Edge 的 `_source_fn_offenders` 一一对应。第 ③ ④ 条是第四轮
+    # 复审的绕过：`return out[:N] if ... else out` 与 `if k == name and len(out) < N`
+    # 都满足"无 break、单 return、在末尾"，前两条全过。
+    label = "_session_cookie_candidates"
     src_fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
-                  and n.name == "_session_cookie_candidates")
-    if any(isinstance(n, ast.Break) for n in ast.walk(src_fn)):
-        bad.append("_session_cookie_candidates 内部有 break —— 截断藏在来源函数里")
+                  and n.name == label)
+    for sub in ast.walk(src_fn):
+        if isinstance(sub, ast.Break):
+            bad.append(f"{label} 内部有 break —— 截断藏在来源函数里")
+        if isinstance(sub, ast.Compare) and any(
+                isinstance(c, ast.Constant) and isinstance(c.value, int)
+                and not isinstance(c.value, bool) for c in sub.comparators):
+            bad.append(f"{label} 内部按计数判断：{ast.unparse(sub)[:60]}"
+                       " —— 计数守卫就是截断")
+
+    # 累积变量名**推导**，不写死 `out`（写死会在改名后静默失效）
+    accumulators = {n.func.value.id for n in ast.walk(src_fn)
+                    if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute) and n.func.attr == "append"
+                    and isinstance(n.func.value, ast.Name)}
+    assert accumulators, (f"在 {label} 里找不到任何 `X.append(...)` —— 本条空转"
+                          "（累积方式被改写了？）")
+
     returns = [n for n in ast.walk(src_fn) if isinstance(n, ast.Return)]
     if len(returns) != 1:
-        bad.append(f"_session_cookie_candidates 有 {len(returns)} 个 return"
-                   "（应恰好 1 个、在末尾）")
-    elif src_fn.body[-1] is not returns[0]:
-        bad.append("_session_cookie_candidates 的 return 不在末尾 —— 提前 return 即截断")
+        bad.append(f"{label} 有 {len(returns)} 个 return（应恰好 1 个、在末尾）")
+        return bad
+    ret = returns[0]
+    if src_fn.body[-1] is not ret:
+        bad.append(f"{label} 的 return 不在末尾 —— 提前 return 即截断")
+    if not isinstance(ret.value, ast.Name):
+        bad.append(
+            f"{label} 的返回表达式不是裸的累积变量，而是 "
+            f"{ast.unparse(ret.value)[:70]} —— 切片/条件表达式/包装一层都可能丢掉"
+            "候选。要改返回表达式，先证明它保持全集，别放宽这条断言。")
+    elif ret.value.id not in accumulators:
+        bad.append(f"{label} 返回的 `{ret.value.id}` 不是 append 的接收者"
+                   f"（累积变量是 {sorted(accumulators)}）—— 中间变量可能已被截断")
     return bad
 
 
 def test_console_session_candidates_are_not_truncated_anywhere():
-    """结构断言：auth 侧候选在三个位置都不得被截断。
+    """结构断言：auth 侧候选在消费侧与来源侧都不得被截断。
 
     与 Edge 的 `test_candidates_are_not_truncated_anywhere` 对称。行为断言只能
     证明"上限不低于当前造得出的量级"；这条与规模无关，且直接说出截断在哪。
@@ -398,6 +434,19 @@ def test_auth_truncation_detector_bites_each_known_bypass():
             "        if name.strip() == \"sb_session\":\n            out.append(value)",
             "        if name.strip() == \"sb_session\":\n            out.append(value)\n"
             "            if len(out) >= 2000:\n                return out"),
+        # 下面两种是第四轮复审的绕过：都满足"无 break、单 return、在末尾"
+        "来源函数末尾切片 return": (
+            "            out.append(value)\n    return out",
+            "            out.append(value)\n    return out[:2400]"),
+        "计数守卫挪到 append 处": (
+            "        if name.strip() == \"sb_session\":\n            out.append(value)",
+            "        if name.strip() == \"sb_session\" and len(out) < 20:\n"
+            "            out.append(value)"),
+        "del 别名切片": (
+            "        claims = None\n"
+            "        for candidate in _session_cookie_candidates(event):",
+            "        cands = _session_cookie_candidates(event)\n        del cands[20:]\n"
+            "        claims = None\n        for candidate in cands:"),
     }
     for name, (old, new) in bypasses.items():
         assert old in src, f"变异锚点找不到（{name}）——本条空转"

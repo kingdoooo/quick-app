@@ -735,7 +735,9 @@ def test_every_candidate_that_can_physically_arrive_is_tried():
     **最短**候选形态 `sb_session=` 塞满。
     """
     good = _jwt(email="v@example.test")
-    uri = "/" + "/".join(f"seg{i}" for i in range(20))
+    # **uri 以 `/api/` 开头**：按路径条件截断（`out[:20] if uri.startswith("/api")`）
+    # 是复审用过的绕过，而 `/seg0/seg1/...` 这种 uri 压根不触发它。
+    uri = "/api/" + "/".join(f"seg{i}" for i in range(20))
     host = "app-x.example.com"
     cookie, n = _max_shadow_burst(good, uri, host)
 
@@ -799,20 +801,110 @@ def _candidate_loop_iterables(src: str) -> list:
     return out
 
 
-def _truncation_offenders(src: str) -> list:
-    """候选被截断的**全部**形态 → 人可读的原因列表；空列表 = 没有截断。
+def _source_fn_offenders(fn, label: str) -> list:
+    """候选**来源函数**（累积并返回全部同名值）内部的截断形态 → 原因列表。
 
-    三个位置都要查，缺一个就是一条现成的绕过路径：
-      ① `_check_auth` 循环的迭代对象被切片／被别的调用包一层；
-      ② 循环体里按**计数**提前 break（与 `if claims: break` 区分：后者不含
-         整数字面量比较）；
-      ③ **`_get_cookies` 本体内部**提前 break/return —— 这一条是 Codex 第三轮
-         实测的绕过：把 `if len(out) >= 2000: return out` 藏进来，四条守卫全绿，
-         而一个 28,883 字节（远低于上限）的请求已经把真 token 截掉了。
+    四条，缺任何一条都是一条现成的绕过路径（前三条都是复审真的用过的）：
+      ① 有 `break`；
+      ② 不是"恰好一个 return 且在函数末尾"（提前 return 即截断）；
+      ③ **返回表达式不是裸的累积变量**——这是 Codex 第四轮的绕过：
+             return out[:20] if request.get("uri", "").startswith("/api") else out
+         它恰好一个 return、在末尾、没有 break，于是前两条全过；而一个深
+         `/api/...` 路径 + 30 条同名 cookie 已经重新登录循环（实测 302），
+         两条行为用例也都看不见它——大规模那条用的 uri 不以 `/api` 开头，
+         "真实路径"那条只有 14 条 shadow、低于 20。
+      ④ 函数体里出现**与整数字面量的比较**——盖住"计数守卫挪到 append 处"
+         这一变体（`if len(out) < 20: out.append(v)`：无 break、单 return、
+         返回裸变量，前三条全过）。
+
+    **累积变量名是推导出来的，不写死 `out`**：写死会在改名后静默失效。
+    `x = out[:20]; return x` 同样会被咬住——`x` 不是 append 的接收者。
     """
     import ast
 
     bad = []
+    for sub in ast.walk(fn):
+        if isinstance(sub, ast.Break):
+            bad.append(f"{label} 内部有 break —— 截断藏在来源函数里")
+        if isinstance(sub, ast.Compare) and any(
+                isinstance(c, ast.Constant) and isinstance(c.value, int)
+                and not isinstance(c.value, bool) for c in sub.comparators):
+            bad.append(f"{label} 内部按计数判断：{ast.unparse(sub)[:60]}"
+                       " —— 计数守卫就是截断")
+
+    accumulators = {n.func.value.id for n in ast.walk(fn)
+                    if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute) and n.func.attr == "append"
+                    and isinstance(n.func.value, ast.Name)}
+    assert accumulators, (f"在 {label} 里找不到任何 `X.append(...)` —— 本条空转"
+                          "（累积方式被改写了？）")
+
+    returns = [n for n in ast.walk(fn) if isinstance(n, ast.Return)]
+    if len(returns) != 1:
+        bad.append(f"{label} 有 {len(returns)} 个 return（应恰好 1 个、在末尾）"
+                   " —— 提前 return 就是截断")
+        return bad
+    ret = returns[0]
+    if fn.body[-1] is not ret:
+        bad.append(f"{label} 的 return 不在函数末尾 —— 提前 return 就是截断")
+    if not isinstance(ret.value, ast.Name):
+        bad.append(
+            f"{label} 的返回表达式不是裸的累积变量，而是 "
+            f"{ast.unparse(ret.value)[:70]} —— 切片/条件表达式/包装一层都可能"
+            "丢掉候选。要改返回表达式，先证明它保持全集，别放宽这条断言。")
+    elif ret.value.id not in accumulators:
+        bad.append(
+            f"{label} 返回的 `{ret.value.id}` 不是 append 的接收者"
+            f"（累积变量是 {sorted(accumulators)}）—— 中间变量可能已被截断")
+    return bad
+
+
+def _candidate_alias_subscripts(src: str) -> list:
+    """`_check_auth` 里对"候选来源别名"做的全部下标/切片 → 人可读片段列表。
+
+    `cands = _get_cookies(...)` 之后，`del cands[20:]` / `cands = cands[:20]` /
+    `cands[:] = cands[:20]` 都能在循环之前把候选截掉，而只检查 for 的迭代对象
+    对它们一概看不见。
+    """
+    import ast
+
+    tree = ast.parse(src)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "_check_auth")
+
+    def is_source_call(node) -> bool:
+        return (isinstance(node, ast.Call)
+                and getattr(node.func, "id", None) == "_get_cookies"
+                and any(isinstance(a, ast.Constant) and a.value == "sb_session"
+                        for a in node.args))
+
+    aliases = {t.id for node in ast.walk(fn) if isinstance(node, ast.Assign)
+               and is_source_call(node.value)
+               for t in node.targets if isinstance(t, ast.Name)}
+    out = []
+    for node in ast.walk(fn):
+        if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
+                and node.value.id in aliases):
+            out.append(ast.unparse(node)[:60])
+    return out
+
+
+def _truncation_offenders(src: str) -> list:
+    """候选被截断的**全部**形态 → 人可读的原因列表；空列表 = 没有截断。
+
+    两个位置：`_check_auth` 的消费侧（迭代对象被切片/包一层、循环体里按计数
+    提前退出），以及 `_get_cookies` 来源侧（见 `_source_fn_offenders` 的四条）。
+    """
+    import ast
+
+    bad = []
+    # **消费侧：候选别名在任何地方被下标/切片都算截断**，不只是在 for 的迭代对象上。
+    # 盖住 `del cands[20:]`、`cands = cands[:20]`、`cands[:] = cands[:20]` 这一族
+    # ——它们都发生在调用与循环**之间**，只查迭代对象时全部看不见（实测 `del` 版
+    # 结构检测返回空，仅靠一条无条件的行为用例才红；换成按路径条件 del 就全绿）。
+    for alias_use in _candidate_alias_subscripts(src):
+        bad.append(f"候选别名被下标/切片：{alias_use} —— 那就是一个匿名的条数上限")
+
     for loop in _candidate_loop_iterables(src):
         it = loop.iter
         if isinstance(it, ast.Subscript):
@@ -821,7 +913,8 @@ def _truncation_offenders(src: str) -> list:
                   or (isinstance(it, ast.Call)
                       and getattr(it.func, "id", None) == "_get_cookies")):
             bad.append(f"循环迭代对象被包了一层：{ast.unparse(it)[:60]}")
-        # ② 计数式提前退出：循环体里出现"与整数字面量比较"
+        # 计数式提前退出：循环体里出现"与整数字面量比较"
+        # （与 `if claims: break` 区分——后者不含整数字面量比较）
         for sub in ast.walk(loop):
             if isinstance(sub, ast.Compare) and any(
                     isinstance(c, ast.Constant) and isinstance(c.value, int)
@@ -829,16 +922,7 @@ def _truncation_offenders(src: str) -> list:
                     for c in sub.comparators):
                 bad.append(f"循环体里按计数提前退出：{ast.unparse(sub)[:60]}")
 
-    src_fn = _candidate_source_fn(src)
-    for sub in ast.walk(src_fn):
-        if isinstance(sub, ast.Break):
-            bad.append("_get_cookies 内部有 break —— 截断藏在来源函数里")
-    returns = [n for n in ast.walk(src_fn) if isinstance(n, ast.Return)]
-    if len(returns) != 1:
-        bad.append(f"_get_cookies 有 {len(returns)} 个 return"
-                   "（应恰好 1 个、在末尾）—— 提前 return 就是截断")
-    elif src_fn.body[-1] is not returns[0]:
-        bad.append("_get_cookies 的 return 不在函数末尾 —— 提前 return 就是截断")
+    bad += _source_fn_offenders(_candidate_source_fn(src), "_get_cookies")
     return bad
 
 
@@ -909,6 +993,20 @@ def test_truncation_detector_bites_each_known_bypass():
             "            if k == name:\n                out.append(v)",
             "            if k == name:\n                out.append(v)\n"
             "                if len(out) >= 2000:\n                    return out"),
+        # 下面两种是第四轮复审的绕过：都满足"无 break、单 return、在末尾"
+        "来源函数末尾条件切片 return": (
+            "                out.append(v)\n    return out",
+            "                out.append(v)\n    return (\n        out[:20]\n"
+            "        if request.get(\"uri\", \"\").startswith(\"/api\")\n"
+            "        else out\n    )"),
+        "计数守卫挪到 append 处": (
+            "            if k == name:\n                out.append(v)",
+            "            if k == name and len(out) < 20:\n                out.append(v)"),
+        # 在调用与循环**之间**截断别名：只查迭代对象时结构检测返回空
+        "del 别名切片": (
+            '    claims = None\n    for token in _get_cookies(request, "sb_session"):',
+            '    cands = _get_cookies(request, "sb_session")\n    del cands[20:]\n'
+            '    claims = None\n    for token in cands:'),
     }
     for name, (old, new) in bypasses.items():
         assert old in src, f"变异锚点找不到（{name}）——本条空转"
