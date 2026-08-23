@@ -265,3 +265,141 @@ def test_session_cookie_candidates_returns_every_same_name_value():
                          "sb_session=second", " sb_session=third"])
     assert lh._session_cookie_candidates(ev) == [SHADOW, "second", "third"]
     assert lh._session_cookie_candidates(_event("/console-session")) == []
+
+# ---- auth 侧也不许截断候选（与 Edge 那半边同一条不变量）----
+#
+# Codex 复审第二轮就提过这一半，我上一轮**只修了 Edge**：给 Edge 加了 AST 截断
+# 守卫和按传输层预算生成的行为用例，auth 这边仍然只有三枚候选的用例。实测在
+# `/console-session` 的循环上加 `[:8]`，155 条 auth 用例**全绿**。
+# 这恰好又犯了 M06 本身那个毛病——同一条不变量存在两份实现，只修了一份。
+#
+# **为什么不共用 Edge 那份检测器**：Edge 是 Lambda@Edge 的**单文件注入产物**
+# （不支持环境变量、配置靠 CDK 字符串替换），它没法 import 任何共享模块——这也
+# 正是会话验签在两边各写一份、并靠"必须字节级同步"的注释约束的原因。所以这里
+# 是刻意的第二份**检测器**，两边的失败信息都点名对侧，避免只改一边。
+
+# CloudFront 对整个请求（请求行 + 全部 header）的上限，AWS 文档给的是 32,768 字节。
+_MAX_REQUEST_BYTES = 32 * 1024
+_HEADROOM_BYTES = 2048
+
+
+def _max_candidate_burst(good: str) -> tuple:
+    """总请求不超限的前提下塞进最多枚遮蔽候选 → (cookies 列表, 遮蔽条数)。
+
+    **用最短合法形态 `sb_session=`**（空值）：换成带值的形态只塞得下一半多，
+    于是一个 2000 的上限能从底下溜过去（Edge 那半边实测过）。
+    """
+    fixed = len("GET /console-session HTTP/1.1\r\nHost: auth.example.com\r\n"
+                "Cookie: ") + len(f"; sb_session={good}") + _HEADROOM_BYTES
+    n = (_MAX_REQUEST_BYTES - fixed) // (len("sb_session=") + 2)
+    return ["sb_session="] * n + [f"sb_session={good}"], n
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_console_session_tries_every_candidate_that_can_physically_arrive():
+    """真会话排在**能到达的最后一枚**时仍须换出 code（auth 侧的无上限行为断言）。
+
+    规模按传输层预算推、不写魔数：任何低于它的有限上限都会让这条红。
+    """
+    import session
+    good = session.mint_session_jwt("u@x.com", "U", ENV["JWT_SECRET"])
+    cookies, n = _max_candidate_burst(good)
+    assert n > 2000, f"只造出 {n} 枚遮蔽候选，压不过一个 2000 的上限"
+
+    assert len(lh._session_cookie_candidates(_event("/console-session", cookies=cookies))) \
+        == n + 1, "_session_cookie_candidates 没返回全部候选——截断可能藏在它内部"
+    r = _console_session(cookies)
+    claims = session.verify_upgrade_code(_issued_code(r), ENV["JWT_SECRET"])
+    assert claims and claims["email"] == "u@x.com", (
+        f"第 {n + 1} 枚候选没被尝试——有人在 auth 侧引入了条数上限，M06 复活了")
+
+
+def _auth_truncation_offenders(src: str) -> list:
+    """auth 侧候选被截断的全部形态 → 原因列表；空列表 = 没有截断。
+
+    三个位置与 Edge 那份一一对应：`/console-session` 的循环迭代对象、循环体里的
+    计数式提前退出、以及 `_session_cookie_candidates` 本体内部的 break/提前 return。
+    """
+    import ast
+
+    tree = ast.parse(src)
+    bad = []
+
+    def is_source_call(node) -> bool:
+        return (isinstance(node, ast.Call)
+                and getattr(node.func, "id", None) == "_session_cookie_candidates")
+
+    handler = next(n for n in ast.walk(tree)
+                   if isinstance(n, ast.FunctionDef) and n.name == "handler")
+    aliases = {t.id for node in ast.walk(handler) if isinstance(node, ast.Assign)
+               and is_source_call(node.value)
+               for t in node.targets if isinstance(t, ast.Name)}
+    loops = [n for n in ast.walk(handler) if isinstance(n, ast.For)
+             and any(is_source_call(x) or (isinstance(x, ast.Name) and x.id in aliases)
+                     for x in ast.walk(n.iter))]
+    assert loops, ("在 handler 里找不到遍历 sb_session 候选的 for 循环"
+                   "——本条空转（循环被改写成别的形态了？）")
+    for loop in loops:
+        it = loop.iter
+        if isinstance(it, ast.Subscript):
+            bad.append(f"循环迭代对象被切片：{ast.unparse(it)[:60]}")
+        elif not (isinstance(it, ast.Name) or is_source_call(it)):
+            bad.append(f"循环迭代对象被包了一层：{ast.unparse(it)[:60]}")
+        for sub in ast.walk(loop):
+            if isinstance(sub, ast.Compare) and any(
+                    isinstance(c, ast.Constant) and isinstance(c.value, int)
+                    and not isinstance(c.value, bool) for c in sub.comparators):
+                bad.append(f"循环体里按计数提前退出：{ast.unparse(sub)[:60]}")
+
+    src_fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                  and n.name == "_session_cookie_candidates")
+    if any(isinstance(n, ast.Break) for n in ast.walk(src_fn)):
+        bad.append("_session_cookie_candidates 内部有 break —— 截断藏在来源函数里")
+    returns = [n for n in ast.walk(src_fn) if isinstance(n, ast.Return)]
+    if len(returns) != 1:
+        bad.append(f"_session_cookie_candidates 有 {len(returns)} 个 return"
+                   "（应恰好 1 个、在末尾）")
+    elif src_fn.body[-1] is not returns[0]:
+        bad.append("_session_cookie_candidates 的 return 不在末尾 —— 提前 return 即截断")
+    return bad
+
+
+def test_console_session_candidates_are_not_truncated_anywhere():
+    """结构断言：auth 侧候选在三个位置都不得被截断。
+
+    与 Edge 的 `test_candidates_are_not_truncated_anywhere` 对称。行为断言只能
+    证明"上限不低于当前造得出的量级"；这条与规模无关，且直接说出截断在哪。
+    """
+    import inspect
+
+    offenders = _auth_truncation_offenders(inspect.getsource(lh))
+    assert not offenders, (
+        "auth 侧候选被截断了：\n  " + "\n  ".join(offenders)
+        + "\n界应由 Cookie 头体积给，不由条数常量给；Edge 那半边有一条对称的守卫。")
+
+
+def test_auth_truncation_detector_bites_each_known_bypass():
+    """**常驻反向验证**：三种绕过形态，auth 侧检测器必须逐个咬住。"""
+    import inspect
+
+    src = inspect.getsource(lh)
+    assert not _auth_truncation_offenders(src), "当前源码本该干净——本条前提不成立"
+
+    bypasses = {
+        "直接切片": (
+            "        for candidate in _session_cookie_candidates(event):",
+            "        for candidate in _session_cookie_candidates(event)[:8]:"),
+        "中间变量切片": (
+            "        claims = None\n"
+            "        for candidate in _session_cookie_candidates(event):",
+            "        cands = _session_cookie_candidates(event)\n"
+            "        claims = None\n        for candidate in cands[:64]:"),
+        "来源函数内部计数 return": (
+            "        if name.strip() == \"sb_session\":\n            out.append(value)",
+            "        if name.strip() == \"sb_session\":\n            out.append(value)\n"
+            "            if len(out) >= 2000:\n                return out"),
+    }
+    for name, (old, new) in bypasses.items():
+        assert old in src, f"变异锚点找不到（{name}）——本条空转"
+        assert _auth_truncation_offenders(src.replace(old, new, 1)), \
+            f"auth 侧检测器没咬住这种绕过：{name}"
