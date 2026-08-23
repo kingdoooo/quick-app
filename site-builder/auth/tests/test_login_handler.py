@@ -169,3 +169,99 @@ def test_console_session_refuses_an_upgrade_code_as_the_cookie():
     assert r["statusCode"] == 302
     assert "/login?redirect=" in r["headers"]["Location"], (
         "应被当成无有效会话、引导去登录，而不是换出新的升级码")
+
+
+# ---- M06 的 auth 侧一半：同名 sb_session 遮蔽（/console-session）----
+#
+# Edge 的 `_get_cookies` 逐个验，但 `auth` 子域注册为 `require_auth=False`，
+# Edge 根本不 gate `/console-session`——那一侧的修复覆盖不到这里。
+# 缺陷形态：站点 JS 写 `sb_session=garbage; domain=.{base}; path=/console-session`
+# 新建第二条 cookie（HttpOnly 只护住同 path 的那条），RFC 6265 §5.4.2 让它先发。
+# 只取第一条 ⇒ 控制台写操作持久 302 登录循环（重新登录只重写 Path=/ 那条）。
+
+SHADOW = "garbage.garbage.garbage"
+
+
+def _console_session(cookies):
+    return lh.handler(_event("/console-session", cookies=cookies), None)
+
+
+def _issued_code(r) -> str:
+    """→ Location 里的升级码；不是"换出了 code"的响应则返回 ""。"""
+    loc = r["headers"]["Location"]
+    if "/api/session-callback?code=" not in loc:
+        return ""
+    import urllib.parse
+    return urllib.parse.unquote(loc.split("code=", 1)[1])
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_console_session_survives_a_shadowing_cookie_sent_first():
+    """垃圾值排在合法会话**之前**时仍须换出 code（M06 回归）。
+
+    这是本用例组的核心：修复前 handler 取到第一条就 break，于是 302 去登录，
+    而登录回调只重写 `Path=/` 的那条 ⇒ 回到本入口继续失败，死循环。
+    """
+    import session
+    good = session.mint_session_jwt("u@x.com", "U", ENV["JWT_SECRET"])
+    r = _console_session([f"sb_session={SHADOW}", f"sb_session={good}"])
+    claims = session.verify_upgrade_code(_issued_code(r), ENV["JWT_SECRET"])
+    assert claims and claims["email"] == "u@x.com", (
+        "遮蔽 cookie 排在前面就换不出 code —— 控制台写操作会陷入登录循环")
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_console_session_still_works_when_shadow_is_sent_last():
+    """正序（合法在前）的正对照：证明上一条不是靠"顺序反了"才绿的。"""
+    import session
+    good = session.mint_session_jwt("u@x.com", "U", ENV["JWT_SECRET"])
+    r = _console_session([f"sb_session={good}", f"sb_session={SHADOW}"])
+    claims = session.verify_upgrade_code(_issued_code(r), ENV["JWT_SECRET"])
+    assert claims and claims["email"] == "u@x.com"
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_console_session_rejects_when_every_candidate_is_invalid():
+    """负对照：逐个验不等于放宽——全部无效时仍须去登录。
+
+    没有这一条，"把所有候选都当通过"的实现也会让上面两条绿。
+    """
+    import session
+    wrong_secret = session.mint_session_jwt("u@x.com", "U", "wrong-secret")
+    r = _console_session([f"sb_session={SHADOW}",
+                          f"sb_session={wrong_secret}",
+                          "sb_session="])
+    assert r["statusCode"] == 302
+    assert "/login?redirect=" in r["headers"]["Location"]
+    assert not _issued_code(r)
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_console_session_shadowed_by_an_upgrade_code_picks_the_real_session():
+    """M05 + M06 合起来：遮蔽项是**验签通过的升级码**时，胜出者必须是真会话。
+
+    升级码与会话用同一密钥、同一线格式，所以它是"签名合法但 typ 不对"的候选。
+    逐个验的判据若写成"第一个验签通过的"（漏了 typ），这里会拿升级码的身份
+    换出新码 —— 正是 M05 那条无限续期。
+    """
+    import session
+    good = session.mint_session_jwt("owner@x.com", "O", ENV["JWT_SECRET"])
+    code = session.mint_upgrade_code("attacker@x.com", ENV["JWT_SECRET"])
+    r = _console_session([f"sb_session={code}", f"sb_session={good}"])
+    claims = session.verify_upgrade_code(_issued_code(r), ENV["JWT_SECRET"])
+    assert claims and claims["email"] == "owner@x.com", (
+        "升级码被当成会话了 —— typ 检查没生效")
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_session_cookie_candidates_returns_every_same_name_value():
+    """机制层断言：helper 必须返回**全部**同名值，且保持 header 顺序。
+
+    调用方的正确性依赖"拿到的是全集"；只断言端点行为的话，一个"取最后一条"
+    的实现也能让上面几条绿，而按位置挑仍然是把缺陷换个方向。
+    """
+    ev = _event("/console-session",
+                cookies=[f"sb_session={SHADOW}", "other=x",
+                         "sb_session=second", " sb_session=third"])
+    assert lh._session_cookie_candidates(ev) == [SHADOW, "second", "third"]
+    assert lh._session_cookie_candidates(_event("/console-session")) == []

@@ -158,6 +158,39 @@ def _pkce_cookie(verifier: str, nonce: str) -> str:
             f"Secure; HttpOnly; SameSite=Lax")
 
 
+def _session_cookie_candidates(event) -> list[str]:
+    """请求里**全部**同名 `sb_session` 的值，按 header 顺序。
+
+    **不能只取第一条**（M06 在 auth 侧的另一半）：`sb_session` 是顶域 cookie
+    （`Domain=.{base}`），HttpOnly 只阻止 `document.cookie` 覆盖**同
+    (name, domain, path)** 的那一条。站点页面 JS 写
+    `sb_session=garbage; domain=.{base}; path=/console-session` 是**新建第二条**，
+    浏览器不拦；RFC 6265 §5.4.2 让路径更长的先发，而 CloudFront 的
+    `OriginRequestCookieBehavior.all()` 原样转发全部 cookie，于是只取第一条
+    就会取到垃圾值。后果不是"再登录一次"就能解决的：`/callback` 只重写
+    `Path=/` 的那一条，遮蔽项清不掉，控制台的**写操作**（改权限 / 协作者 /
+    所有权 / 下线 / Key 管理，也就是自救用的那些）陷入持久登录循环。
+
+    Edge 的 `_get_cookies` 已经这样做了，但**本端点 Edge 不 gate**
+    （`auth` 子域注册为 `require_auth=False`，是 auth 服务自己验 cookie），
+    所以那一侧的修复覆盖不到这里，必须在这里逐个验。
+
+    **顺序不是安全契约**：不要"改成取最后一条"——RFC 6265 明示服务端不得依赖
+    同名 cookie 的顺序，按位置挑只是把同一个缺陷换个方向。判据只能是
+    "哪一条验签通过"。
+
+    **不设条数上限**：真正的界是 Cookie 头体积（浏览器/CloudFront 约 8KB），
+    而候选筛除是纯 CPU 的 SHA256 HMAC。设一个"看起来够用"的小值等于把 M06
+    按路径深度放回来。
+    """
+    out = []
+    for raw in (event.get("cookies") or []):
+        name, _, value = raw.partition("=")
+        if name.strip() == "sb_session":
+            out.append(value)
+    return out
+
+
 def _read_pkce_cookie(event) -> dict | None:
     """从 callback 请求里取回 verifier/nonce；验签失败、缺失或内容不完整返回 None。
 
@@ -172,6 +205,10 @@ def _read_pkce_cookie(event) -> dict | None:
     正是"静默降级成无 PKCE 交换"（现在只靠 Cognito 拒空 verifier 兜着，
     不是本地约束）。同时给 payload 打类型标记，彻底断开两种上下文的签名复用。
     """
+    # 只取第一条在这里是安全的，与 sb_session 不同（见
+    # `_session_cookie_candidates`）：`__Host-` 前缀由浏览器强制"无 Domain=
+    # 且 Path=/"，因此同名项最多存在一条、且只能是本 host 自己的，站点代码
+    # 设不出第二条送到 auth.{base} 的 `__Host-sb_pkce`。
     for raw in (event.get("cookies") or []):
         name, _, value = raw.partition("=")
         if name.strip() != PKCE_COOKIE:
@@ -482,14 +519,18 @@ def handler(event, context):
         #
         # code 只出现在 Location：不设 cookie、不进 body，且 no-store。
         # 它 60 秒过期且由 panel 侧原子消费一次（session-codes 表条件写）。
-        session_token = ""
-        for raw in (event.get("cookies") or []):
-            name_, _, value_ = raw.partition("=")
-            if name_.strip() == "sb_session":
-                session_token = value_
+        #
+        # 同名 `sb_session` 必须**逐个**验：胜出者是"第一个验签通过且
+        # typ=session 的候选"，不是"header 里的第一条"。理由见
+        # `_session_cookie_candidates`（站点 JS 能在更长的 Path 上新建一条
+        # 遮蔽项，只取第一条会让控制台写操作持久 302）。
+        jwt_secret = _secret("JWT_SECRET")
+        claims = None
+        for candidate in _session_cookie_candidates(event):
+            claims = verify_session_jwt(candidate, jwt_secret,
+                                        expected_typ=SESSION_TYP)
+            if claims:
                 break
-        claims = verify_session_jwt(session_token, _secret("JWT_SECRET"),
-                                    expected_typ=SESSION_TYP)
         if not claims:
             # 无有效会话（缺失/过期/签名不过/typ 不符——例如把升级码当会话递
             # 进来，这一条是安全信号而非日常）：走完整登录，登录后**回到本
