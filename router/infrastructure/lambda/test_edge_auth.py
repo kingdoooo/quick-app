@@ -903,6 +903,23 @@ def _source_fn_offenders(fn, label: str) -> list:
         if isinstance(sub, ast.Call) and getattr(sub.func, "id", None) == "len":
             bad.append(f"{label} 内部调用了 len()：{ast.unparse(sub)[:60]}"
                        " —— 收集函数不需要数自己收了多少，这是计数截断的入口")
+        # **来源函数内不得出现任何切片**。丢元素这件事在机制上只有三条路：切片、
+        # 计数、按位置跳过（也要计数）。计数已经被上面两条禁掉，这里补上切片——
+        # 而且**不只是切累积变量**：切"解析源"一样丢候选，且完全不碰累积变量，
+        # 因此能整块绕过累积变量白名单（自查实测三种）：
+        #     for part in header["value"].split(";")[:20]:        # 切 split 结果
+        #     for header in request.get(...).get("cookie", [])[:1]:  # 切外层头列表
+        #     header["value"] = ";".join(header["value"].split(";")[:20])
+        # 这个函数的职责是"逐个取出并累积"，它没有任何理由切任何东西。
+        # `header["value"]` 这类**常量下标**不是切片，不受影响。
+        if isinstance(sub, ast.Slice):
+            bad.append(f"{label} 内出现切片 —— 收集函数不需要切任何东西"
+                       "（切解析源与切累积变量同样丢候选）")
+        # 就地改写入参结构（`header["value"] = ...`）同样是在源头丢候选
+        if (isinstance(sub, ast.Subscript)
+                and isinstance(sub.ctx, (ast.Store, ast.Del))):
+            bad.append(f"{label} 内通过下标赋值/删除：{ast.unparse(sub)[:60]}"
+                       " —— 就地改写解析源就是在源头截断")
 
     accumulators = {n.func.value.id for n in ast.walk(fn)
                     if isinstance(n, ast.Call)
@@ -1016,8 +1033,8 @@ def test_candidates_are_not_truncated_anywhere():
     **已知边界（不要当成"全覆盖"）**：本检测器管的是"**候选列表**有没有被截断"，
     判据是**累积变量的能力白名单**（只允许"初始化一次 / .append() 的接收者 /
     最终裸 return"三种用法），而不是一张"截断长什么样"的黑名单——前五版都是黑名单，
-    每一版都被下一种拼写绕过。清单见下一条 meta-test（当前 14 种，其中 5 种是
-    原地变异）。它**不**覆盖"在解析之前先把原始
+    每一版都被下一种拼写绕过。清单见下一条 meta-test（当前 17 种，其中 5 种是
+    原地变异、3 种切的是解析源）。它**不**覆盖"在解析之前先把原始
     Cookie 头截短"这个插入点——已实测检测器对它返回空。那一种只被**无条件**的
     大规模行为用例挡住（真 token 在第 2000+ 位，截到 20 条必红），按请求属性
     条件化之后两边都可能全绿。之所以没把它也结构化：`_check_auth` 本来就**合法地**
@@ -1132,6 +1149,18 @@ def test_truncation_detector_bites_each_known_bypass():
         "把累积变量交给别的函数去截": (
             "                out.append(v)\n    return out",
             "                out.append(v)\n    _cap(out)\n    return out"),
+        # 下面三种切的是**解析源**而不是累积变量，因此完全绕过累积变量白名单
+        # （自查实测）。靠"来源函数内不得出现切片/下标写入"那两条兜住。
+        "切 split 的结果": (
+            '        for part in header["value"].split(";"):',
+            '        for part in header["value"].split(";")[:20]:'),
+        "切外层 header 列表": (
+            '    for header in request.get("headers", {}).get("cookie", []):',
+            '    for header in request.get("headers", {}).get("cookie", [])[:1]:'),
+        "就地改写 header 值": (
+            '        for part in header["value"].split(";"):',
+            '        header["value"] = ";".join(header["value"].split(";")[:20])\n'
+            '        for part in header["value"].split(";"):'),
     }
     for name, (old, new) in bypasses.items():
         assert old in src, f"变异锚点找不到（{name}）——本条空转"

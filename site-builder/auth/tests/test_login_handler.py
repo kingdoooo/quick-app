@@ -445,6 +445,23 @@ def _auth_truncation_offenders(src: str) -> list:
         if isinstance(sub, ast.Call) and getattr(sub.func, "id", None) == "len":
             bad.append(f"{label} 内部调用了 len()：{ast.unparse(sub)[:60]}"
                        " —— 收集函数不需要数自己收了多少")
+        # **来源函数内不得出现任何切片**。丢元素这件事在机制上只有三条路：切片、
+        # 计数、按位置跳过（也要计数）。计数已经被上面两条禁掉，这里补上切片——
+        # 而且**不只是切累积变量**：切"解析源"一样丢候选，且完全不碰累积变量，
+        # 因此能整块绕过累积变量白名单（自查实测三种）：
+        #     for part in header["value"].split(";")[:20]:        # 切 split 结果
+        #     for header in request.get(...).get("cookie", [])[:1]:  # 切外层头列表
+        #     header["value"] = ";".join(header["value"].split(";")[:20])
+        # 这个函数的职责是"逐个取出并累积"，它没有任何理由切任何东西。
+        # `header["value"]` 这类**常量下标**不是切片，不受影响。
+        if isinstance(sub, ast.Slice):
+            bad.append(f"{label} 内出现切片 —— 收集函数不需要切任何东西"
+                       "（切解析源与切累积变量同样丢候选）")
+        # 就地改写入参结构（`header["value"] = ...`）同样是在源头丢候选
+        if (isinstance(sub, ast.Subscript)
+                and isinstance(sub.ctx, (ast.Store, ast.Del))):
+            bad.append(f"{label} 内通过下标赋值/删除：{ast.unparse(sub)[:60]}"
+                       " —— 就地改写解析源就是在源头截断")
 
     # 累积变量名**推导**，不写死 `out`（写死会在改名后静默失效）
     accumulators = {n.func.value.id for n in ast.walk(src_fn)
@@ -554,6 +571,10 @@ def test_auth_truncation_detector_bites_each_known_bypass():
         "把累积变量交给别的函数去截": (
             "            out.append(value)\n    return out",
             "            out.append(value)\n    _cap(out)\n    return out"),
+        # 切**解析源**：完全不碰累积变量，绕过白名单（Edge 侧同一批）
+        "切 cookies 列表": (
+            '    for raw in (event.get("cookies") or []):',
+            '    for raw in (event.get("cookies") or [])[:20]:'),
     }
     for name, (old, new) in bypasses.items():
         assert old in src, f"变异锚点找不到（{name}）——本条空转"
