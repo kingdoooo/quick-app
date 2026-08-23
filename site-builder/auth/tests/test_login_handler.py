@@ -353,11 +353,13 @@ def _auth_truncation_offenders(src: str) -> list:
             bad.append(f"循环迭代对象被切片：{ast.unparse(it)[:60]}")
         elif not (isinstance(it, ast.Name) or is_source_call(it)):
             bad.append(f"循环迭代对象被包了一层：{ast.unparse(it)[:60]}")
+        # 禁"计数"本身（`+=` 与 `len()`），不是"与整数字面量比较"——后者用
+        # 命名常量就绕过去了。与 Edge 侧同法。
         for sub in ast.walk(loop):
-            if isinstance(sub, ast.Compare) and any(
-                    isinstance(c, ast.Constant) and isinstance(c.value, int)
-                    and not isinstance(c.value, bool) for c in sub.comparators):
-                bad.append(f"循环体里按计数提前退出：{ast.unparse(sub)[:60]}")
+            if isinstance(sub, ast.AugAssign):
+                bad.append(f"循环体里有计数器自增：{ast.unparse(sub)[:60]}")
+            if isinstance(sub, ast.Call) and getattr(sub.func, "id", None) == "len":
+                bad.append(f"循环体里调用了 len()：{ast.unparse(sub)[:60]}")
 
     # 来源函数四条，与 Edge 的 `_source_fn_offenders` 一一对应。第 ③ ④ 条是第四轮
     # 复审的绕过：`return out[:N] if ... else out` 与 `if k == name and len(out) < N`
@@ -368,11 +370,10 @@ def _auth_truncation_offenders(src: str) -> list:
     for sub in ast.walk(src_fn):
         if isinstance(sub, ast.Break):
             bad.append(f"{label} 内部有 break —— 截断藏在来源函数里")
-        if isinstance(sub, ast.Compare) and any(
-                isinstance(c, ast.Constant) and isinstance(c.value, int)
-                and not isinstance(c.value, bool) for c in sub.comparators):
-            bad.append(f"{label} 内部按计数判断：{ast.unparse(sub)[:60]}"
-                       " —— 计数守卫就是截断")
+        # 禁 `len(...)` 本身（命名常量上限会绕过"整数字面量比较"那种写法）
+        if isinstance(sub, ast.Call) and getattr(sub.func, "id", None) == "len":
+            bad.append(f"{label} 内部调用了 len()：{ast.unparse(sub)[:60]}"
+                       " —— 收集函数不需要数自己收了多少")
 
     # 累积变量名**推导**，不写死 `out`（写死会在改名后静默失效）
     accumulators = {n.func.value.id for n in ast.walk(src_fn)
@@ -381,6 +382,14 @@ def _auth_truncation_offenders(src: str) -> list:
                     and isinstance(n.func.value, ast.Name)}
     assert accumulators, (f"在 {label} 里找不到任何 `X.append(...)` —— 本条空转"
                           "（累积方式被改写了？）")
+
+    # 累积变量只能被赋值一次（`out = out[:N]` 这种重绑同样是截断）
+    for acc in sorted(accumulators):
+        binds = [n for n in ast.walk(src_fn) if isinstance(n, ast.Assign)
+                 and any(isinstance(x, ast.Name) and x.id == acc for x in n.targets)]
+        if len(binds) != 1:
+            bad.append(f"{label} 的累积变量 `{acc}` 被赋值 {len(binds)} 次"
+                       "（应只有初始化那一次）—— 重绑同名变量同样是截断")
 
     returns = [n for n in ast.walk(src_fn) if isinstance(n, ast.Return)]
     if len(returns) != 1:
@@ -447,6 +456,20 @@ def test_auth_truncation_detector_bites_each_known_bypass():
             "        for candidate in _session_cookie_candidates(event):",
             "        cands = _session_cookie_candidates(event)\n        del cands[20:]\n"
             "        claims = None\n        for candidate in cands:"),
+        # 三种用**命名常量**而非整数字面量的形态（Edge 侧同步补的同一批）
+        "命名常量上限": (
+            "        if name.strip() == \"sb_session\":\n            out.append(value)",
+            "        if name.strip() == \"sb_session\" and len(out) < _LIMIT:\n"
+            "            out.append(value)"),
+        "循环体手写计数器 + 命名常量": (
+            "        claims = None\n"
+            "        for candidate in _session_cookie_candidates(event):",
+            "        claims = None\n        _n = 0\n"
+            "        for candidate in _session_cookie_candidates(event):\n"
+            "            _n += 1\n            if _n > _LIMIT:\n                break"),
+        "返回前重绑同名累积变量": (
+            "            out.append(value)\n    return out",
+            "            out.append(value)\n    out = out[:_LIMIT]\n    return out"),
     }
     for name, (old, new) in bypasses.items():
         assert old in src, f"变异锚点找不到（{name}）——本条空转"

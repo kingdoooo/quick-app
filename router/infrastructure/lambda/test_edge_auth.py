@@ -826,11 +826,12 @@ def _source_fn_offenders(fn, label: str) -> list:
     for sub in ast.walk(fn):
         if isinstance(sub, ast.Break):
             bad.append(f"{label} 内部有 break —— 截断藏在来源函数里")
-        if isinstance(sub, ast.Compare) and any(
-                isinstance(c, ast.Constant) and isinstance(c.value, int)
-                and not isinstance(c.value, bool) for c in sub.comparators):
-            bad.append(f"{label} 内部按计数判断：{ast.unparse(sub)[:60]}"
-                       " —— 计数守卫就是截断")
+        # **禁掉 `len(...)` 本身，而不是"与整数字面量比较"**：后者太窄，
+        # `len(out) < _LIMIT`（命名常量）就从底下过去了（我自己探出来的绕过）。
+        # 来源函数的职责是"收集全部"，它**没有任何理由**去数自己收了多少。
+        if isinstance(sub, ast.Call) and getattr(sub.func, "id", None) == "len":
+            bad.append(f"{label} 内部调用了 len()：{ast.unparse(sub)[:60]}"
+                       " —— 收集函数不需要数自己收了多少，这是计数截断的入口")
 
     accumulators = {n.func.value.id for n in ast.walk(fn)
                     if isinstance(n, ast.Call)
@@ -838,6 +839,18 @@ def _source_fn_offenders(fn, label: str) -> list:
                     and isinstance(n.func.value, ast.Name)}
     assert accumulators, (f"在 {label} 里找不到任何 `X.append(...)` —— 本条空转"
                           "（累积方式被改写了？）")
+
+    # **累积变量只能被赋值一次**（`out = []`）。`out = out[:_LIMIT]` 这种"返回前
+    # 重绑同名变量"能同时满足"返回裸变量"与"无 len 比较"，是我自己探出来的第三种绕过。
+    for acc in sorted(accumulators):
+        binds = [n for n in ast.walk(fn) if isinstance(n, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id == acc
+                         for t in n.targets)]
+        if len(binds) != 1:
+            bad.append(
+                f"{label} 的累积变量 `{acc}` 被赋值 {len(binds)} 次"
+                f"（应只有初始化那一次）：{[ast.unparse(b)[:40] for b in binds]}"
+                " —— 返回前重绑同名变量同样是截断")
 
     returns = [n for n in ast.walk(fn) if isinstance(n, ast.Return)]
     if len(returns) != 1:
@@ -913,14 +926,17 @@ def _truncation_offenders(src: str) -> list:
                   or (isinstance(it, ast.Call)
                       and getattr(it.func, "id", None) == "_get_cookies")):
             bad.append(f"循环迭代对象被包了一层：{ast.unparse(it)[:60]}")
-        # 计数式提前退出：循环体里出现"与整数字面量比较"
-        # （与 `if claims: break` 区分——后者不含整数字面量比较）
+        # 计数式提前退出。**禁的是"计数"这件事本身**（`+=` 与 `len()`），
+        # 不是"与整数字面量比较"——后者太窄，`if _n > _LIMIT: break` 用命名常量
+        # 就绕过去了（我自己探出来的绕过）。`if claims: break` 不含这两者，
+        # 所以正常的"验签通过即停"不受影响。
         for sub in ast.walk(loop):
-            if isinstance(sub, ast.Compare) and any(
-                    isinstance(c, ast.Constant) and isinstance(c.value, int)
-                    and not isinstance(c.value, bool)
-                    for c in sub.comparators):
-                bad.append(f"循环体里按计数提前退出：{ast.unparse(sub)[:60]}")
+            if isinstance(sub, ast.AugAssign):
+                bad.append(f"循环体里有计数器自增：{ast.unparse(sub)[:60]}"
+                           " —— 计数 + break 就是条数上限")
+            if isinstance(sub, ast.Call) and getattr(sub.func, "id", None) == "len":
+                bad.append(f"循环体里调用了 len()：{ast.unparse(sub)[:60]}"
+                           " —— 验签循环不需要数条数")
 
     bad += _source_fn_offenders(_candidate_source_fn(src), "_get_cookies")
     return bad
@@ -1007,6 +1023,22 @@ def test_truncation_detector_bites_each_known_bypass():
             '    claims = None\n    for token in _get_cookies(request, "sb_session"):',
             '    cands = _get_cookies(request, "sb_session")\n    del cands[20:]\n'
             '    claims = None\n    for token in cands:'),
+        # 下面三种是我自己对着检测器探出来的（不是复审给的）：它们都用**命名常量**
+        # 而不是整数字面量，因此绕过了"与整数字面量比较"那版判据。检测器已改成
+        # 禁"计数"本身（`len()` / `+=`）与"累积变量重绑"。
+        "命名常量上限": (
+            "            if k == name:\n                out.append(v)",
+            "            if k == name and len(out) < _LIMIT:\n                out.append(v)"),
+        "循环体手写计数器 + 命名常量": (
+            '    claims = None\n    for token in _get_cookies(request, "sb_session"):\n'
+            '        claims = _verify_session_jwt(token)',
+            '    claims = None\n    _n = 0\n'
+            '    for token in _get_cookies(request, "sb_session"):\n'
+            '        _n += 1\n        if _n > _LIMIT:\n            break\n'
+            '        claims = _verify_session_jwt(token)'),
+        "返回前重绑同名累积变量": (
+            "                out.append(v)\n    return out",
+            "                out.append(v)\n    out = out[:_LIMIT]\n    return out"),
     }
     for name, (old, new) in bypasses.items():
         assert old in src, f"变异锚点找不到（{name}）——本条空转"
