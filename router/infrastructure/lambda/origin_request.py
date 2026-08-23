@@ -479,37 +479,32 @@ def _verify_session_jwt(token: str) -> dict | None:
         return None
 
 
-# 同名 sb_session 的候选上限。
+# **同名 sb_session 候选不设条数上限**——界由 Cookie 头体积给，不由常量给。
 #
-# **真正的界是 Cookie 头的体积限制**（浏览器/CloudFront 约 8KB ⇒ 最多约 630 条），
-# 而验签是纯 CPU 的 SHA256 HMAC：实测把 630 条全验完只花 0.407ms。所以这个常量
-# 不是性能保护，而是**把意图写进代码**的文档，取值必须设在任何可达值之上。
+# 这里曾有个 `MAX_SESSION_COOKIE_CANDIDATES`（8 → 64 → 删）。删掉的理由不是
+# "64 不够大"，而是**任何有限值都满足不了它自己声称的性质**：
 #
-# **为什么不是 8**（fix 轮 1，8 会让 M06 在最要紧的端点上原样复活，已复算）：
 # RFC 6265 §5.1.4 让请求路径的**每个 `/` 边界前缀**都是合法 cookie-path，
-# §5.4.2 又让路径长的先发，于是可遮蔽条数 ≈ 路径前缀数 × 可设域名数。
-# 对 console 的 `/api/sites/{id}/analytics`：比 `/` 更长的合法 path 有 7 条
-# （`/api` `/api/` `/api/sites` `/api/sites/` `/api/sites/{id}`
-#   `/api/sites/{id}/` `/api/sites/{id}/analytics`），站点 JS 能给**两个**父域
-# 设 cookie 且都会送到 console 这个兄弟 host ⇒ 7 × 2 = **14 条**，全部排在
-# `Path=/` 的真会话前面 ⇒ 上限 8 时真 token（第 15 位）压根不被尝试。
-# 而 4 段路径正是 site-detail / permissions / collaborators / owner / undeploy /
-# analytics / visitors 这些**用来排查和自救**的 console 接口。
+# §5.4.2 又让路径长的先发。n 段的请求路径有 `2n − 1` 条比 `/` 更长的合法
+# cookie-path（每段贡献 `/a` 与 `/a/`，最后一段只贡献它自己），站点 JS 能设的
+# 父域有 2 个（`{base}` 与它的上一级；再往上是公共后缀，浏览器拒绝），所以
+# 可遮蔽条数的上界是 `4n − 2`，全部排在 `Path=/` 的真会话**前面**。
+# 平台最深的路由是 4 段（⇒ 14 条，这是 8 曾经失效的原因），但 `_check_auth`
+# 同样跑在**站点**请求上，而站点的 URL 空间由站点作者决定、平台不约束：
+# **n 无界 ⇒ 可遮蔽条数无界 ⇒ 不存在"设在任何可达值之外"的有限常量**。
+# 上限设成 C，站点作者写出 `n ≥ (C + 2) / 4` 段的路径，M06 就在那些路径上回来
+# （方向是 fail-closed：真 token 落在被截掉的那段里 ⇒ 无一验签通过 ⇒ 302，
+# 但用户被挡在登录循环里，且重新登录清不掉遮蔽项）。
 #
-# **公式**（写出来是为了让下一个人能自己重算，而不是重新争论）：n 段的请求路径有
-# `2n − 1` 条比 `/` 更长的合法 cookie-path（每段贡献 `/a` 与 `/a/`，最后一段只贡献
-# 它自己），站点 JS 能设的父域有 2 个（`{base}` 与它的上一级；再往上是公共后缀，
-# 浏览器拒绝），所以可遮蔽条数的上界是 `4n − 2`。代进 n=4 就是上面那 14 条；
-# **64 在 n ≥ 17 段时被打满**。
+# 而放大是**不可能**的，因为总 HMAC 输入字节数由 Cookie 头体积封顶，与候选条数
+# 无关：单条 Cookie 头受浏览器/CloudFront 约 8KB 限制（**这个数字是本仓库的
+# 自述、没有对应到 AWS 配额文档**，但它是不是正好 8KB 不影响结论——存在一个由
+# 传输层强制的上界就够了）。实测（in-process，非真机）：8182B 头 / 248 候选
+# = 0.076ms，32734B 头 / 992 候选 = 0.185ms。也就是说"防放大"这个理由从来
+# 没有数字支撑，而它换来的是一个按路径深度复活的 DoS。
 #
-# **"打不满"这个判断只对平台路由成立**：平台最深的路由是 4 段
-# （panel/handler.py 那一组），离界还很远。但 `_check_auth` 同样跑在**站点**请求上，
-# 而站点的 URL 空间由站点作者决定、平台不约束——17 段以上的站点路径会打满上限，
-# M06 在那些路径上回来。**溢出的方向是 fail-closed**：真 token 排在被截掉的那一段里
-# ⇒ 没有任何 cookie 验签通过 ⇒ 302 去登录，绝不会变成放行或身份混淆；代价是那些
-# 超深路径上的用户被挡在登录循环里。这是本常量已知的残留面，不是"不存在的路径"。
-# **别往下调**：调到某个"看起来够用"的小值，就是把 M06 放回来换 0.35ms 的最坏 CPU。
-MAX_SESSION_COOKIE_CANDIDATES = 64
+# **不要重新引入一个条数上限。** 要加限制的话，限的应该是 Cookie 头体积
+# （那才是真正的界，且与路径深度无关），而不是候选条数。
 
 
 def _get_cookies(request, name: str) -> list:
@@ -649,9 +644,11 @@ def _check_auth(request, route, host, sink=None):
         print(f"[WARN] route {route.get('subdomain')!r} 的 require_auth 不是布尔"
               f"（{type(require_auth).__name__}={require_auth!r}），按需要登录处理")
 
-    # 逐个尝试同名候选，任一验签通过即放行（M06）。取上限防放大。
+    # 逐个尝试**全部**同名候选，任一验签通过即放行（M06）。
+    # 不截断：见 `_get_cookies` 上方那段——条数上限会按路径深度让 M06 复活，
+    # 而总 HMAC 工作量本就由 Cookie 头体积封顶。
     claims = None
-    for token in _get_cookies(request, "sb_session")[:MAX_SESSION_COOKIE_CANDIDATES]:
+    for token in _get_cookies(request, "sb_session"):
         claims = _verify_session_jwt(token)
         if claims:
             break

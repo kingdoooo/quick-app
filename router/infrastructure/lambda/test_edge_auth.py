@@ -696,22 +696,52 @@ def test_a_garbage_cookie_in_front_does_not_lock_the_user_out():
     assert request["headers"]["x-user-email"][0]["value"] == "v@example.test"
 
 
-def test_only_the_first_candidates_are_tried():
-    """上限是**行为**约束而不是一个常量断言——第 cap+1 条之后不再尝试。
+def test_candidate_count_is_not_capped_at_any_depth():
+    """候选条数**不设上限**：真 token 排在多深都必须被尝试。
 
-    防的是"注入 N 条 cookie 压 HMAC"这种放大。把好 token 放在第 cap+1 位，
-    断言它**不**被放行；这样上限被调没了，这条会红。
+    这条取代了原来的 `test_only_the_first_candidates_are_tried`（它断言第
+    cap+1 条**不**被尝试）。那条用例把残留面写成了需求：可遮蔽条数的上界是
+    `4n − 2`，n 是请求路径的段数，而站点的 URL 空间由站点作者决定、平台不约束
+    ⇒ n 无界 ⇒ **不存在"设在任何可达值之外"的有限上限**。上限设成 C，站点作者
+    写出 `n ≥ (C + 2) / 4` 段的路径，M06 就在那些路径上原样复活。
 
-    **条数从常量派生，不写死 8/9**（fix 轮 1）：写死的话上限一改，这条用例就在
-    悄悄测一个**错误的边界**——而且它照样是绿的，等于守卫失效却无人知道。
+    **写死 300 而不是从常量派生**：常量已经删了，而这条用例要防的正是"有人又
+    加回一个上限"。派生自常量的用例对任何有限上限都是绿的（那是它原本的语义），
+    所以这里必须是一个硬编码的、比任何"看起来够用"的值都大的数——它同时也
+    远超旧上限 64。
     """
-    cap = orq.MAX_SESSION_COOKIE_CANDIDATES
     good = _jwt(email="v@example.test")
-    garbage = "; ".join(f"sb_session=x{i}" for i in range(cap))
-    request = _req(cookie=f"{garbage}; sb_session={good}")
-    assert len(orq._get_cookies(request, "sb_session")) == cap + 1
-    assert orq._check_auth(request, ROUTE_AUTH, "app-x.example.test") is not None, \
-        f"第 {cap + 1} 条候选不应被尝试（上限失效了）"
+    shadow = "; ".join(f"sb_session=x{i}" for i in range(300))
+    # 300 条 ≈ 17 段以上的站点路径能造出来的量级，用 uri 一并把场景写实
+    request = _req(uri="/" + "/".join(f"seg{i}" for i in range(20)),
+                   cookie=f"{shadow}; sb_session={good}")
+    assert len(orq._get_cookies(request, "sb_session")) == 301
+    assert orq._check_auth(request, ROUTE_AUTH, "app-x.example.test") is None, \
+        "第 301 条候选没被尝试——有人重新引入了条数上限，M06 在深路径上复活了"
+    assert request["headers"]["x-user-email"][0]["value"] == "v@example.test"
+
+
+def test_no_candidate_count_cap_constant_is_reintroduced():
+    """结构断言：模块里不得再出现"候选条数上限"这类常量。
+
+    上一条是行为断言，但它只证明"上限不小于 300"。有人加一个 500 的上限时它
+    仍然绿，而 M06 在 n ≥ 126 段的路径上就回来了。这条从结构上钉死：真正的界
+    是 Cookie 头体积（由传输层强制、与路径深度无关），要限就限体积，不限条数。
+    """
+    import inspect
+
+    # **必须先剥掉注释再断言**：解释"为什么删掉这个上限"的那段注释里就写着常量名，
+    # 裸 `in src` 会被自己的文档绊倒（本仓库反复栽过的"断言的字样只活在注释里"，
+    # 这次是同一个坑的反方向：字样活在注释里就让守卫**假红**）。
+    code = "\n".join(line for line in inspect.getsource(orq).splitlines()
+                     if not line.lstrip().startswith("#"))
+    assert "MAX_SESSION_COOKIE_CANDIDATES" not in code, (
+        "候选条数上限被加回来了——任何有限条数上限都会按路径深度让 M06 复活，"
+        "见 _get_cookies 上方那段推导")
+    # 切片 / islice 式截断同样是上限，只是换个写法
+    assert '_get_cookies(request, "sb_session")[' not in code, (
+        "_get_cookies 的结果被切片了——那就是一个匿名的条数上限")
+    assert "islice" not in code, "用 islice 截断候选同样是条数上限"
 
 
 def test_a_real_world_shadowing_burst_still_authenticates():
