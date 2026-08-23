@@ -696,37 +696,108 @@ def test_a_garbage_cookie_in_front_does_not_lock_the_user_out():
     assert request["headers"]["x-user-email"][0]["value"] == "v@example.test"
 
 
-def test_candidate_count_is_not_capped_at_any_depth():
-    """候选条数**不设上限**：真 token 排在多深都必须被尝试。
+def test_every_candidate_that_can_physically_arrive_is_tried():
+    """凡是**能真的到达**的候选都必须被尝试——判据绑在传输层的界上。
 
-    这条取代了原来的 `test_only_the_first_candidates_are_tried`（它断言第
-    cap+1 条**不**被尝试）。那条用例把残留面写成了需求：可遮蔽条数的上界是
-    `4n − 2`，n 是请求路径的段数，而站点的 URL 空间由站点作者决定、平台不约束
-    ⇒ n 无界 ⇒ **不存在"设在任何可达值之外"的有限上限**。上限设成 C，站点作者
-    写出 `n ≥ (C + 2) / 4` 段的路径，M06 就在那些路径上原样复活。
+    这条取代了原来的 `test_only_the_first_candidates_are_tried`（它断言第 cap+1
+    条**不**被尝试，等于把残留面写成了需求）。可遮蔽条数的上界是 `4n − 2`，
+    n 是请求路径段数，而站点的 URL 空间由站点作者决定、平台不约束 ⇒ n 无界 ⇒
+    不存在"设在任何可达值之外"的有限上限。
 
-    **写死 300 而不是从常量派生**：常量已经删了，而这条用例要防的正是"有人又
-    加回一个上限"。派生自常量的用例对任何有限上限都是绿的（那是它原本的语义），
-    所以这里必须是一个硬编码的、比任何"看起来够用"的值都大的数——它同时也
-    远超旧上限 64。
+    **规模不写一个"看起来够大"的魔数**（Codex 复审指出 300 太小：加一个 500 的
+    上限时这条仍然绿）。改成按 Cookie 头体积生成——32KB 是"约 8KB 限制"的 4 倍，
+    塞得下的候选条数就是物理上能到达的量级。任何低于它的有限上限都会让这条红。
     """
     good = _jwt(email="v@example.test")
-    shadow = "; ".join(f"sb_session=x{i}" for i in range(300))
-    # 300 条 ≈ 17 段以上的站点路径能造出来的量级，用 uri 一并把场景写实
+    shadow, n = [], 0
+    while sum(len(x) + 2 for x in shadow) < 32 * 1024:
+        shadow.append(f"sb_session=x{n}")
+        n += 1
+    # 真 token 排在**最后**：前面每一条都必须被验过才轮得到它
     request = _req(uri="/" + "/".join(f"seg{i}" for i in range(20)),
-                   cookie=f"{shadow}; sb_session={good}")
-    assert len(orq._get_cookies(request, "sb_session")) == 301
+                   cookie="; ".join(shadow + [f"sb_session={good}"]))
+    assert len(orq._get_cookies(request, "sb_session")) == n + 1
+    assert n > 900, f"只造出 {n} 条候选，规模不足以压过任何合理上限"
     assert orq._check_auth(request, ROUTE_AUTH, "app-x.example.test") is None, \
-        "第 301 条候选没被尝试——有人重新引入了条数上限，M06 在深路径上复活了"
+        f"第 {n + 1} 条候选没被尝试——有人重新引入了条数上限，M06 在深路径上复活了"
     assert request["headers"]["x-user-email"][0]["value"] == "v@example.test"
 
 
-def test_no_candidate_count_cap_constant_is_reintroduced():
-    """结构断言：模块里不得再出现"候选条数上限"这类常量。
+def _candidate_loop_iterables(src: str) -> list:
+    """`_check_auth` 里遍历 sb_session 候选的那些 for 循环的**迭代对象** AST。
 
-    上一条是行为断言，但它只证明"上限不小于 300"。有人加一个 500 的上限时它
-    仍然绿，而 M06 在 n ≥ 126 段的路径上就回来了。这条从结构上钉死：真正的界
-    是 Cookie 头体积（由传输层强制、与路径深度无关），要限就限体积，不限条数。
+    按数据流找，不按字面量找：先认出 `_get_cookies(..., "sb_session")` 这个调用，
+    再把"直接绑定它的局部名字"一起算作候选来源，最后收集以两者之一为迭代对象的
+    for 循环。这样 `candidates = _get_cookies(...)` + `for t in candidates[:500]`
+    这种最自然的重构也在射程内——纯文本断言看不见它（Codex 复审实测）。
+    """
+    import ast
+
+    tree = ast.parse(src)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "_check_auth")
+
+    def is_source_call(node) -> bool:
+        return (isinstance(node, ast.Call)
+                and getattr(node.func, "id", None) == "_get_cookies"
+                and any(isinstance(a, ast.Constant) and a.value == "sb_session"
+                        for a in node.args))
+
+    aliases = {t.id for node in ast.walk(fn) if isinstance(node, ast.Assign)
+               and is_source_call(node.value)
+               for t in node.targets if isinstance(t, ast.Name)}
+    out = []
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.For):
+            continue
+        # 迭代对象里只要**提到**候选来源（裸用、切片、islice 包一层都算），
+        # 这个循环就是"遍历候选"的那个循环，交给调用处判它有没有被截断
+        if any(is_source_call(s) or (isinstance(s, ast.Name) and s.id in aliases)
+               for s in ast.walk(node.iter)):
+            out.append(node.iter)
+    assert out, ("在 _check_auth 里找不到遍历 sb_session 候选的 for 循环"
+                 "——本条空转（循环被改写成了别的形态？）")
+    return out
+
+
+def test_candidate_loop_is_not_truncated_structurally():
+    """结构断言：遍历候选的循环，迭代对象必须是**未截断**的候选来源。
+
+    上一条是行为断言，它只能证明"上限不低于能到达的量级"。这条从结构上钉死，
+    补的是两件上一条给不了的事：判据与规模无关，且失败信息直接说出"这里被截断了"。
+
+    **按 AST 数据流判，不按文本**（Codex 复审实测原版可绕）：原来断言的是
+    `'_get_cookies(request, "sb_session")[' not in code`，于是
+
+        candidates = _get_cookies(request, "sb_session")
+        for token in candidates[:500]:
+
+    三条文本断言一条都不命中、235 条 router 用例全绿，而 500 条上限已经回来了。
+    """
+    import ast
+    import inspect
+
+    # 只有两种合法形态：**裸的**候选来源调用，或直接绑定它的那个名字。
+    # 其余一律是截断——切片是显式上限，任何别的调用（islice / list(...)[:N] /
+    # 自己写的 take()）都是把上限藏进一层包装。
+    for iterable in _candidate_loop_iterables(inspect.getsource(orq)):
+        if isinstance(iterable, ast.Name):
+            continue
+        if (isinstance(iterable, ast.Call)
+                and getattr(iterable.func, "id", None) == "_get_cookies"):
+            continue
+        raise AssertionError(
+            f"遍历候选的迭代对象是 {type(iterable).__name__}"
+            f"（{ast.unparse(iterable)[:70]}），不是未截断的候选来源。"
+            "切片、islice、list(...)[:N] 这类都是匿名的条数上限，"
+            "任何有限值都会按路径深度让 M06 复活。")
+
+
+def test_no_candidate_count_cap_constant_is_reintroduced():
+    """结构断言（另一半）：模块里不得再出现"候选条数上限"这类常量。
+
+    与上一条互补：上一条管"循环有没有被截断"，这条管"有没有人又定义了一个上限
+    常量"（哪怕暂时还没接上循环，它也会成为下一个人接上去的邀请）。
     """
     import inspect
 
@@ -738,9 +809,6 @@ def test_no_candidate_count_cap_constant_is_reintroduced():
     assert "MAX_SESSION_COOKIE_CANDIDATES" not in code, (
         "候选条数上限被加回来了——任何有限条数上限都会按路径深度让 M06 复活，"
         "见 _get_cookies 上方那段推导")
-    # 切片 / islice 式截断同样是上限，只是换个写法
-    assert '_get_cookies(request, "sb_session")[' not in code, (
-        "_get_cookies 的结果被切片了——那就是一个匿名的条数上限")
     assert "islice" not in code, "用 islice 截断候选同样是条数上限"
 
 
