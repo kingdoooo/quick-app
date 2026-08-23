@@ -9,14 +9,26 @@ Quick 自动化建站平台（Site Builder）：业务人员在任意支持 Skil
 `https://app-{site_id}.{base_domain}` 的可分享 URL。站点访问与管理权限绑定飞书账号
 （身份源可换成任意能给 email claim 的 Cognito 联邦 IdP）。
 
-**当前状态**：一期与二期（含 `console.{base_domain}` 自助管理控制台、API Key 交换层、
-访问统计聚合）都已在真实 AWS 部署并端到端验证；站点更新走 blue/green 原子切换
-（M7）。**具体进度与闸门数字不写在本文件**（会过时）——见
-`docs/design/HANDOFF-2026-08-07.md` 的最新一节，那里是状态真源。
-**注意那个文件是 git-ignored 的**：新 clone 里不存在，此时口径以本文件 + `README.md` +
-`site-builder/DEPLOY.md` 为准，确切数字靠下面的测试命令自己跑。
-二期需求清单在 `docs/phase2-requirements.md`；部署手册
-`site-builder/DEPLOY.md` 含全部实测坑。
+**当前状态**分两层，别混：
+
+- **已部署**：一期与二期（含 `console.{base_domain}` 自助管理控制台、API Key 交换层、
+  访问统计聚合）都已在真实 AWS 部署并端到端验证；站点更新走 blue/green 原子切换（M7）。
+- **已实现、尚未部署**：加固包 **S1**（M01 跨租户 IAM 隔离 / M02 权限数据洗白 /
+  M05 token 用途混用 / M06 cookie 遮蔽 DoS），在分支
+  `s1-isolation-and-auth-hardening` 上已实现并过审。它是 merged review §9 那张优先级表
+  里的 M01/M02/M05/M06 四条；表里其余各条还没做。
+
+**⚠️ 本文件的架构描述已经是 S1 之后的口径**（例如下面「站点代码按不可信对待」那条写的
+「禁止 `site-data-{site_id}-*` 前缀通配」）。**线上此刻仍是通配**——读这份文档判断
+"生产现在是什么样"的时候，凡涉及 S1 那四条的，都要减去这一层。部署顺序与闸门见
+`site-builder/DEPLOY.md` 的「S1 加固」一节。
+
+**具体进度与闸门数字不写在本文件**（会过时）：确切数字靠下面的测试命令自己跑；
+**待办与优先级**见 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9
+（**随仓库分发**，是"还剩什么"的真源）。二期需求清单在
+`docs/phase2-requirements.md`；部署手册 `site-builder/DEPLOY.md` 含全部实测坑。
+`docs/design/` 下的 HANDOFF / FINDINGS 是当时的过程记录，**gitignored、不随仓库分发**，
+新 clone 里不存在——**不要把它们当状态真源**。
 
 ## 测试命令（有坑，别猜）
 
@@ -270,14 +282,19 @@ python3 site-builder/scripts/gen_onboarding.py
 | 部署到新账号 / 排查部署问题 | `site-builder/DEPLOY.md`（①→⑦ + ⑤b 控制台 + ⑤c API Key + 全部实测坑） |
 | 客户端接入（人/Agent） | `site-builder/docs/client-setup.md`；含真实值版本跑 `gen_onboarding.py` |
 | 合同细节（给站点生成方） | `site-builder/skills/site-builder/references/{contract,redlines}.md` |
+| **还剩什么没做 / 优先级** | `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9（**tracked**；两轮独立对抗性审查的合并版。S1 取的是表里 M01/M02/M05/M06 四条，其余各条还没做） |
+| 加固包 S1 的设计与实施 | `docs/superpowers/specs/2026-08-22-s1-isolation-and-auth-hardening-spec.md` + `docs/superpowers/plans/2026-08-22-s1-isolation-and-auth-hardening.md`；升级/闸门/回滚见 `site-builder/DEPLOY.md` 的「S1 加固」一节 |
 | 一期设计决策与范围 | `docs/superpowers/specs/2026-07-21-quick-site-builder-design.md`（已实现快照，勿改） |
-| 二期需求 | `docs/phase2-requirements.md` |
-| 任务级实现/审查历史（一期） | `.superpowers/sdd/progress.md` |
-| 二期进度 / 当前在做什么 | `docs/design/HANDOFF-2026-08-07.md` 的**最新一节**（状态真源，gitignored） |
-| 二期实测发现与结论 | `docs/design/M3-FINDINGS.md` 与 `M4-FINDINGS.md`（gitignored；含可复用的断言自查清单） |
-| M4 前置 spike 结论 | `docs/design/M4-SPIKE-2026-08-10.md`（gitignored；已验证过的别再跑一遍） |
-| 二期任务级证据链 | `.superpowers/sdd/<计划日期>-<计划名>/progress.md` |
+| 二期设计与需求 | `docs/superpowers/specs/2026-07-30-quick-site-builder-phase2-design.md`；需求清单 `docs/phase2-requirements.md` |
+| 任务级实现/审查证据链 | `.superpowers/sdd/<计划日期>-<计划名>/progress.md`（每个 plan 一个目录；`.superpowers/sdd/progress.md` 那个扁平路径是一期的旧布局） |
+| 各里程碑实测发现 | `docs/design/M{3,4,5}-FINDINGS.md`、`M4-SPIKE-2026-08-10.md`、`M7-SPEC-2026-08-16.md`（**gitignored**；含可复用的断言自查清单，已验证过的别再跑一遍） |
+| 历史过程记录 | `docs/design/HANDOFF-2026-08-07.md`（**gitignored**；写到二期为止、**不含 S1**——**不是**状态真源，见上面「当前状态」） |
 
-> **接手二期先读 HANDOFF 的最新一节**——进度、部署状态、闸门数字都在那里，
-> 本文件不重复（会过时）。`docs/design/` 与 `.superpowers/` 都 gitignored
-> （含真实账号/资源值），**不要 `git add -f`**。
+> **接手时的读法**：要知道"生产现在是什么样"，读本文件 + `README.md` +
+> `site-builder/DEPLOY.md`，数字自己跑测试；要知道"还剩什么"，读上面那份 merged
+> review 的 §9。**不要**依赖 `docs/design/` 里的任何一份——它们和 `.superpowers/`
+> 都 gitignored（含真实账号/资源值），新 clone 里根本不存在，**也不要 `git add -f`**。
+>
+> **加固包的编号别用 `S1`/`S2`…写进代码或文档正文**：`S3` 会和 Amazon S3 撞车（本仓库
+> 到处在说 S3 桶），grep 出来全是噪音。用 merged review 里的 `M` 编号
+> （`M03+M16`、`M07/M08/M10/M12`…）或主题名指代。
