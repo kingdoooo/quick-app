@@ -306,6 +306,21 @@ def _projects_require_auth(fn_node, doc_ids, hoisted=frozenset()) -> bool:
             if any(isinstance(k, ast.Constant) and k.value == "require_auth"
                    for k in sub.keys):
                 return True
+            # **ExpressionAttributeNames 别名**（Codex 第三轮实测的绕过）：
+            #     UpdateExpression="SET #ra = :a",
+            #     ExpressionAttributeNames={"#ra": "require_auth"}
+            # 这里 `require_auth` 是 dict 的**值**，不是键，SET 串里也不含它。
+            # 按值判会不会误伤只读代码？不会：读取方写的是
+            # `item.get("require_auth", {})`——那是 Call 的实参，不是 dict 的值。
+            # （`check_permissions_state.ENFORCING_PAIRS` 是 list of tuple，也不是 dict。）
+            if any(isinstance(v, ast.Constant) and v.value == "require_auth"
+                   for v in sub.values):
+                return True
+        # **`dict(require_auth=...)` 关键字参数形态**（同上一轮，且这一种连
+        # 字面量哨兵也看不见——`keyword.arg` 是 AST 上的裸 str 属性，不是
+        # Constant 节点，所以它此前在**全仓库**都不可见，不只是白名单文件里）。
+        if isinstance(sub, ast.keyword) and sub.arg == "require_auth":
+            return True
         if (isinstance(sub, ast.Constant) and isinstance(sub.value, str)
                 and id(sub) not in doc_ids
                 and re.search(_PROJECTION_ASSIGN_RE, sub.value)):
@@ -543,6 +558,12 @@ def _require_auth_offenders(*roots, allowed=frozenset(), base=None) -> list:
                         and id(node) not in doc_ids
                         and "require_auth" in node.value):
                     offenders.append(f"{rel}:{node.lineno}")
+                # **关键字参数形态也算**（Codex 第三轮）：`dict(require_auth=...)`
+                # 里的 `require_auth` 是 `ast.keyword.arg`——AST 上的裸 str 属性，
+                # 不是 Constant 节点。只扫 Constant 时它在**整个仓库**都不可见，
+                # 不只是白名单文件里，所以这是两条守卫共同的盲区。
+                if isinstance(node, ast.keyword) and node.arg == "require_auth":
+                    offenders.append(f"{rel}:{node.value.lineno}")
     return sorted(offenders)
 
 
@@ -639,32 +660,76 @@ def test_no_unaudited_projection_writer_anywhere():
             f"{core} 不在发现集里或未被判为已审计——判据已经失效，本条正在空转")
 
 
-def test_writer_scan_bites_a_naked_writer_inside_a_file_exempted_from_the_literal_guard(
-        tmp_path):
-    """反向验证，**常驻**：守卫 B 整文件豁免的文件，守卫 A 仍须咬住里面的裸 writer。
-
-    这正是 Codex 复审复现的那条路径——往 `scripts/migrate_permissions.py`
-    （已在 `_REQUIRE_AUTH_ALLOWED` 里）追加一个裸投影函数，改之前 11 条用例全绿。
-    探针写进 tmp_path，不往 tracked 文件注入。
-    """
-    probe = tmp_path / "already_exempt.py"
-    probe.write_text(
-        '"""这个文件在守卫 B 的白名单里（模拟只读脚本）。"""\n'
-        'def unsafe_projection(site, ddb, table):\n'
-        '    return ddb.update_item(\n'
-        '        TableName=table, Key={"subdomain": {"S": site["subdomain"]}},\n'
+# 三种**真实的 DynamoDB 写法**，都会把 require_auth 投影进路由，且都被复审当作
+# 绕过用过。第四条是只读形态的负对照——判据不能宽到把读取也算成 writer。
+_WRITER_SHAPE_PROBES = {
+    "裸 SET require_auth = :a": (
+        'def w(ddb, t, site):\n'
+        '    return ddb.update_item(TableName=t, Key={"subdomain": {"S": "x"}},\n'
         '        UpdateExpression="SET require_auth = :a",\n'
-        '        ExpressionAttributeValues={":a": {"BOOL": True}})\n')
+        '        ExpressionAttributeValues={":a": {"BOOL": True}})\n'),
+    # `require_auth` 是 ast.keyword.arg —— AST 上的裸 str 属性，不是 Constant。
+    # 这一种此前连字面量哨兵也看不见，**在整个仓库都不可见**。
+    "dict(require_auth=...) 关键字参数": (
+        'def w(ddb, t, site):\n'
+        '    return ddb.put_item(TableName=t,\n'
+        '        Item=dict(subdomain={"S": "x"}, require_auth={"BOOL": False}))\n'),
+    # 字段名藏进 ExpressionAttributeNames 的**值**里，SET 串里只有别名 `#ra`。
+    "ExpressionAttributeNames 别名": (
+        'def w(ddb, t, site):\n'
+        '    return ddb.update_item(TableName=t, Key={"subdomain": {"S": "x"}},\n'
+        '        UpdateExpression="SET #ra = :a",\n'
+        '        ExpressionAttributeNames={"#ra": "require_auth"},\n'
+        '        ExpressionAttributeValues={":a": {"BOOL": False}})\n'),
+}
+_READER_SHAPE_PROBE = (
+    'def r(item):\n'
+    '    return bool(item.get("require_auth", {}).get("BOOL", True))\n')
 
-    # ① 守卫 B 确实对它失明（整文件豁免）——这是缺陷的前提，必须真的成立
-    assert _require_auth_offenders(
-        tmp_path, allowed={"already_exempt.py"}, base=tmp_path) == [], (
-        "守卫 B 竟然咬住了被整文件豁免的文件——那本条的前提不成立，请重读")
 
-    # ② 守卫 A 必须咬住它
-    found = _unaudited_writers(tmp_path, base=tmp_path)
-    assert found == {"already_exempt.py::unsafe_projection": False}, (
-        f"守卫 A 没咬住白名单文件里的裸 writer：{found}")
+def test_writer_scan_bites_every_known_shape_even_inside_an_exempted_file(tmp_path):
+    """反向验证，**常驻**：守卫 B 整文件豁免的文件，守卫 A 仍须咬住里面的每种 writer。
+
+    两轮复审各打穿过一版：
+      · 第一版守卫 A 只扫两个文件 ⇒ 往 `scripts/migrate_permissions.py`
+        （已在 `_REQUIRE_AUTH_ALLOWED` 里）追加一个裸 writer，11 条用例全绿；
+      · 第二版扫了全域但判据只认 dict 的**键**与 `SET ... = :` 串 ⇒
+        `dict(require_auth=...)` 与 ExpressionAttributeNames 别名两种自然写法
+        仍然全绿。
+    所以这条按**形态**逐个验，探针写进 tmp_path，不往 tracked 文件注入。
+
+    **判据仍是"字段名怎么拼"，所以它不是完备的**：f-string 拼接、跨局部变量组装
+    的字段名、或把整个 UpdateExpression 从外部传进来，都仍能逃过。真正完备的做法
+    是扫"对路由表的全部写调用"而不是找某个字段的拼写——那是更大的改动，尚未做。
+    这里不声称完备，只声称覆盖上面这三种**已知会用**的形态。
+    """
+    for name, src in _WRITER_SHAPE_PROBES.items():
+        probe_dir = tmp_path / name.split()[0]
+        probe_dir.mkdir()
+        (probe_dir / "already_exempt.py").write_text(
+            '"""这个文件在守卫 B 的白名单里（模拟只读脚本）。"""\n' + src)
+
+        # ① 守卫 B 对它失明（整文件豁免）——这是缺陷的前提，必须真的成立
+        assert _require_auth_offenders(
+            probe_dir, allowed={"already_exempt.py"}, base=probe_dir) == [], (
+            f"守卫 B 竟然咬住了被整文件豁免的文件（{name}）——本条前提不成立")
+
+        # ② 守卫 A 必须咬住它
+        found = _unaudited_writers(probe_dir, base=probe_dir)
+        assert found == {"already_exempt.py::w": False}, (
+            f"守卫 A 没咬住这种 writer 形态：{name} → {found}")
+
+
+def test_writer_scan_does_not_mistake_a_reader_for_a_writer(tmp_path):
+    """负对照：只读形态不得被判成 writer。
+
+    没有这一条，把判据放宽成"出现过 require_auth 字样就算 writer"也能让上一条
+    全绿——而那会让守卫在 `migrate_permissions` 这类**正当读取**上永远红，
+    下一步就是有人给它加整文件豁免，洞就是这么开出来的。
+    """
+    (tmp_path / "reader.py").write_text(_READER_SHAPE_PROBE)
+    assert _unaudited_writers(tmp_path, base=tmp_path) == {}, (
+        "只读代码被判成了投影 writer——判据太宽")
 
 
 def test_sentinel_scan_bites_a_probe_file(tmp_path):

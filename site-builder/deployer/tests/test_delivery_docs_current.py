@@ -684,17 +684,25 @@ def test_delivery_docs_do_not_reference_undistributed_docs_by_bare_name():
     去找一个不存在的文件。上一条守卫看不见它，因为它只从反引号里提路径，而
     `见 HANDOFF 的最新一节` 既没有反引号也没有路径。
 
-    词干是**从文档自己标出的非分发指针里推的**（见 `_bare_name_stems`），
-    所以这条不是"HANDOFF 黑名单"，新增一份过程记录会自动进入射程。
+    词干是**从三份文档共同推导的一个全局集合**（见 `_bare_name_stems`），不是
+    "HANDOFF 黑名单"，所以新增一份过程记录会自动进入射程。
+
+    **必须全局推、不能每份文档各推一份**（Codex 第三轮实测）：按单份推时
+    DEPLOY.md 自己一条完整的非分发路径都没有 ⇒ 它的词干集合是空的 ⇒
+    `DEPLOY.md:1979` 那句裸写的 `M5-FINDINGS §4.26` 压根不在射程内。
+    也就是说"新增一份过程记录会自动进入射程"这个说法在单份推导下是**假的**——
+    只有当同一份文档里还留着一条完整且已标记的路径时才成立。
     """
     tracked = _tracked_paths()
-    checked, offenders = 0, []
+    # 先合并出全局词干集合，再逐份扫描
+    stems = set()
     for doc in (README, CLAUDE_MD, DEPLOY):
         prose = re.sub(r"```.*?```", "", _read(doc), flags=re.S)
-        stems = _bare_name_stems(prose, doc, tracked)
-        if not stems:
-            continue
-        checked += len(stems)
+        stems |= _bare_name_stems(prose, doc, tracked)
+
+    checked, offenders = len(stems), []
+    for doc in (README, CLAUDE_MD, DEPLOY):
+        prose = re.sub(r"```.*?```", "", _read(doc), flags=re.S)
         # **先把反引号跨度整段抹掉再找裸出现**：`docs/design/M{3,4,5}-FINDINGS.md`
         # 里面也含 FINDINGS，不抹掉就会把"规范写法"当成"裸写"报出来。
         masked = re.sub(r"`[^`\n]*`", " ", prose)
@@ -705,10 +713,13 @@ def test_delivery_docs_do_not_reference_undistributed_docs_by_bare_name():
                                             for m in NOT_DISTRIBUTED_MARKERS):
                     offenders.append(f"{doc.name}:L{i} 裸写 {stem}：{raw[i - 1].strip()[:70]}")
 
-    # 正对照：CLAUDE.md 现在确实标着 HANDOFF / FINDINGS / SPIKE 三个词干
+    # 正对照：全局集合现在确实含 HANDOFF / FINDINGS / SPIKE
     assert checked >= 3, (
         f"只推出 {checked} 个文档词干——`_bare_name_stems` 多半跟不上文档写法了，"
         "本条正在空转。先修它，不要放宽这个数字。")
+    assert {"HANDOFF", "FINDINGS"} <= stems, (
+        f"全局词干集合少了 HANDOFF/FINDINGS：{sorted(stems)}——"
+        "推导规则失效了，本条正在空转")
     assert not offenders, (
         "这些地方**裸写**了一份新 clone 里没有的文档名：\n  "
         + "\n  ".join(sorted(set(offenders)))

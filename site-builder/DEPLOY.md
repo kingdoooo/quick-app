@@ -1976,7 +1976,9 @@ cd site-builder/deployer/infra && rm -rf cdk.out && PATH=.venv/bin:$PATH \
 >   `[INFO] m5-region` 这行是 `8a8fb20` 才随路由层部署上线的（`git log -S` 只有那
 >   一个提交动过它），而查询用的是 7 天窗口——**18 条跨不了 7 天，它们只跨了探针
 >   上线以来的那几小时**。分母改用探针**寿命**而不是查询窗口之后，与
->   `analytics.py` 里独立写着的「全平台日均 124 行」（M5-FINDINGS §4.26）对得上。
+>   `analytics.py` 里独立写着的「全平台日均 124 行」对得上（那个数字的出处是
+>   `docs/design/M5-FINDINGS.md` §4.26，**gitignored、新 clone 里没有**；能核对的
+>   tracked 依据是 `analytics.py` 自己那行注释）。
 >
 >   > **这个错法很容易再犯**：刚部署一行新日志就去 CloudWatch 拉「N 条 / 7 天」，
 >   > 拿到的一定是被稀释过的速率。查之前先问一句「这行日志存在多久了」，
