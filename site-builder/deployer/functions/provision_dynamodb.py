@@ -39,9 +39,13 @@ def _env_key(logical: str) -> str:
 def _wait_active(ddb, table_name: str) -> None:
     """有界地等一张**已存在**的表到 ACTIVE。等不到就抛（fail-closed）。
 
-    上限约 2 分钟/表：本步骤的 Lambda 超时是 300s（infra/app.py 的 step_fn），
-    正常路径（表早已 ACTIVE）首次 describe 即返回，只有 CREATING/DELETING
-    这类罕见形态才会真的等。
+    预算是**每表**约 2 分钟，不是 handler 全局的（Codex 复审 e208839 指出）：
+    合同最多允许 10 张表，多张同时非 ACTIVE 时最坏总时长会先撞上本步骤 Lambda
+    的 300s 超时——后果是整个 step 失败重试，**不是**把未就绪的表放行，方向
+    仍然 fail-closed。正常路径最多只有上一轮中断留下的一张 CREATING 表，其余
+    ACTIVE 表首次 describe 即返回。要消除这个理论窗口得引入 handler 级
+    deadline（context.get_remaining_time_in_millis），那是新的设计面，当前
+    不做。
     """
     ddb.get_waiter("table_exists").wait(
         TableName=table_name, WaiterConfig={"Delay": 5, "MaxAttempts": 24})

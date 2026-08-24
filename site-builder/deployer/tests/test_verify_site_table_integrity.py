@@ -82,6 +82,45 @@ def test_a_static_site_with_leftover_table_arns_is_caught():
     assert problems and "不该有" in " ".join(problems), problems
 
 
+# ── 账号锚定：严格等值，不是"出现在 config.ini 任意位置"───────────────────────
+#
+# 跑错账号的两种症状里，**全绿**比一串 FAIL 更危险：空账号里零个站点、零个角色，
+# 集合相等平凡成立。substring 版曾让"错误账号号恰好出现在别的 ARN/注释里"也放行。
+
+
+class _StsStub:
+    def __init__(self, account):
+        self._account = account
+
+    def get_caller_identity(self):
+        return {"Account": self._account}
+
+
+class _Boto3Stub:
+    def __init__(self, account):
+        self._account = account
+
+    def client(self, name, region_name=None):
+        assert name == "sts", f"账号核验只该调 sts，调了 {name}"
+        return _StsStub(self._account)
+
+
+def test_matching_account_passes(monkeypatch):
+    g = _gate()
+    monkeypatch.setattr(g, "boto3", _Boto3Stub("111111111111"))
+    assert g._assert_target_account("us-east-1", "111111111111") \
+        == "111111111111"
+
+
+def test_mismatched_account_aborts(monkeypatch):
+    """凭证账号 ≠ [Platform] account_id ⇒ SystemExit，一个检查项都不许跑。"""
+    import pytest
+    g = _gate()
+    monkeypatch.setattr(g, "boto3", _Boto3Stub("111111111111"))
+    with pytest.raises(SystemExit, match="不是 config.ini"):
+        g._assert_target_account("us-east-1", "222222222222")
+
+
 def test_a_role_pointing_at_another_sites_table_is_caught():
     """**要害**：A 的角色指向 B 的表 ⇒ 必须红，且报文要点出"属于别的站点"。
 
