@@ -42,3 +42,31 @@ def test_logical_a_is_exactly_what_the_contract_forbids():
     from contract.schema import TABLE_NAME_RE
     assert not TABLE_NAME_RE.fullmatch(pair.logical_a), \
         "A 的逻辑表名竟然合法——探针测不到拒绝路径"
+
+
+def test_snapshot_tags_go_through_the_paginated_helper(monkeypatch):
+    """tag 快照必须走 `common.table_tags`（分页 + 读不到即抛），不许裸调
+    `list_tags_of_resource`——裸 API 不翻页，tag 多于一页时快照拿到不完整集合，
+    "前后一致"的比较就退化成"前后同样不完整"。
+
+    分页算法本身由 test_common.py::test_table_tags_paginates 钉住；这条钉的是
+    **接线**：改动前 helper 测试本来就绿、真机只有 2 个 tag 一页返回——没有这条，
+    调用点换回裸 API 时所有测试与真机闸门照样全绿（Codex 复审本计划时指出）。
+    """
+    g = _gate()
+    calls = {}
+
+    def _fake_table_tags(ddb, arn, *, read_attempts=3):
+        calls["args"] = (arn, read_attempts)
+        return {"b": "2", "a": "1"}          # 乱序，顺带断言排序行为
+
+    class _NoRawApi:
+        def list_tags_of_resource(self, **kw):
+            raise AssertionError("裸 list_tags_of_resource 被调用——没走分页 helper")
+
+    monkeypatch.setattr(g.sb_common, "table_tags", _fake_table_tags)
+    out = g.snapshot_table_tags(_NoRawApi(),
+                                "arn:aws:dynamodb:us-east-1:1:table/x")
+    assert calls["args"] == ("arn:aws:dynamodb:us-east-1:1:table/x", 1), \
+        f"helper 没被调用或 read_attempts 不是 1：{calls}"
+    assert out == [("a", "1"), ("b", "2")], out

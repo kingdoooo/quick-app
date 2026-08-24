@@ -120,6 +120,15 @@ def _role_policies(iam, role: str) -> dict:
     return pols
 
 
+def snapshot_table_tags(ddb, table_arn: str) -> list:
+    """B 侧快照的 tag 读取。必须走 `common.table_tags`（分页 + 读不到即抛）——
+    裸 `list_tags_of_resource` 不翻页，tag 多于一页时快照会拿到不完整集合，
+    "前后一致"的比较就退化成"前后同样不完整"。read_attempts=1：这张表不是
+    刚建的，没有 tag 可见性延迟可等。接线由
+    `deployer/tests/test_verify_table_collision_e2e.py` 钉住。"""
+    return sorted(sb_common.table_tags(ddb, table_arn, read_attempts=1).items())
+
+
 def main() -> int:
     import boto3
 
@@ -211,8 +220,7 @@ def main() -> int:
 
     def snapshot_b() -> dict:
         t = ddb.describe_table(TableName=pair.physical)["Table"]
-        tags = sorted((x["Key"], x["Value"]) for x in ddb.list_tags_of_resource(
-            ResourceArn=t["TableArn"])["Tags"])
+        tags = snapshot_table_tags(ddb, t["TableArn"])
         row = res.Table(sites_t).get_item(Key={"site_id": pair.site_b},
                                           ConsistentRead=True)["Item"]
         return {"key_schema": t["KeySchema"], "attrs": t["AttributeDefinitions"],

@@ -75,7 +75,7 @@ results: list[tuple[bool, str, str]] = []
 # **只数不可 SKIP 的项**：非 Edge 直连那条在当前身份无 InvokeFunctionUrl 权限时
 # 合法地 SKIP（那时的 403 来自 IAM 而不是 handler，算 PASS 就是假绿）。
 MIN_LOCAL_CHECKS = 15       # ① 合规 8 + ② 违规 7
-MIN_DEPLOYED_CHECKS = 21    # ③ 3（redlines + schema + 守卫/handler 聚合）+ ④ 2 + ⑤ 7 + ⑥ 3 + ⑦ 6
+MIN_DEPLOYED_CHECKS = 22    # ③ 4（redlines + schema + 函数集合等值 + 守卫/handler 聚合）+ ④ 2 + ⑤ 7 + ⑥ 3 + ⑦ 6
 # ⑧ 只在 [ApiKey] 段存在（组件启用）时计入：产物 1 + 环境变量 2 + scope 1 +
 # Function URL 3 + EDGE_ROLE_ID 1 + 环境变量整体 1 + route 6 + Edge 白名单 1 +
 # runtime 3 + 哨兵行 2 + role 2 = 23
@@ -139,6 +139,54 @@ def contract_mismatches(zip_hashes: dict, local_hashes: dict) -> list:
             problems.append(f"contract/{base}(包里缺失)")
         elif zh != lh:
             problems.append(f"contract/{base}")
+    return problems
+
+
+def expected_deployer_functions() -> set:
+    """预期的 `site-deployer-*` 函数集合：`infra/app.py` 的 `PLATFORM_FUNCTION_NAMES`
+    里带该前缀的那部分（AST 抽取，不 import——app.py 顶层 import aws_cdk，只在
+    infra/.venv 里有；抽取形态同 `deployer/tests/test_edge_caller.py`）。
+
+    拿它当期望**不是手抄第二份清单**：该常量自身的新鲜度由
+    `test_platform_function_name_list_matches_what_creates_them` 从 CDK 模板与
+    三个部署脚本双向核对，任一侧改名/增删都会先在那里红。
+
+    找不到该赋值 ⇒ SystemExit（fail-closed）：静默跳过集合核对等于把"函数整个
+    消失"的假绿重新放回来。
+    """
+    import ast
+
+    src = (ROOT / "site-builder/deployer/infra/app.py").read_text(encoding="utf-8")
+    for node in ast.parse(src).body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and getattr(node.targets[0], "id", None)
+                == "PLATFORM_FUNCTION_NAMES"):
+            names = tuple(e.value for e in node.value.elts
+                          if str(e.value).startswith("site-deployer-"))
+            # 转 set 之前查重：set 会吞掉重复项，之后查恒真
+            if not names or len(names) != len(set(names)):
+                raise SystemExit(
+                    f"PLATFORM_FUNCTION_NAMES 的 site-deployer-* 部分为空或含"
+                    f"重复项：{names}——期望集合不可信，中止")
+            return set(names)
+    raise SystemExit("app.py 里找不到 PLATFORM_FUNCTION_NAMES——"
+                     "闸门无法核对函数集合，中止")
+
+
+def deployer_fleet_problems(expected: set, discovered: set) -> list:
+    """线上 `site-deployer-*` 函数集合 vs 预期集合 → 问题清单（空 = 相等）。
+
+    逐包核验只看**已发现**的函数——某个函数整个消失时它根本不进循环，
+    "N 个函数逐包一致"对着 N-1 个函数照样成立（Codex deployed-state 复审
+    指出的平凡假绿）。反方向的"多出"是控制面异物，同样要红。
+    """
+    problems = []
+    missing = sorted(expected - discovered)
+    extra = sorted(discovered - expected)
+    if missing:
+        problems.append(f"预期存在但线上没有：{missing}")
+    if extra:
+        problems.append(f"线上多出预期外的函数：{extra}")
     return problems
 
 
@@ -524,6 +572,13 @@ def run_deployed() -> None:
     for page in lam.get_paginator("list_functions").paginate():
         fns.extend(f for f in page["Functions"]
                    if f["FunctionName"].startswith("site-deployer-"))
+    # 集合等值先于逐包核验：集合都不对时逐包结果没有解读价值（消失的函数
+    # 根本不进循环）。判定在 deployer_fleet_problems（纯函数、可反向验证）。
+    fleet = deployer_fleet_problems(expected_deployer_functions(),
+                                    {f["FunctionName"] for f in fns})
+    check(not fleet,
+          "线上 site-deployer-* 函数集合 == app.py 的 PLATFORM_FUNCTION_NAMES",
+          "；".join(fleet) if fleet else f"{len(fns)} 个，精确相等")
     mismatched: list[str] = []
     for f in sorted(fns, key=lambda x: x["FunctionName"]):
         fname = f["FunctionName"]

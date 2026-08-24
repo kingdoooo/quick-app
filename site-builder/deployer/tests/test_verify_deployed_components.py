@@ -116,3 +116,52 @@ def test_schema_missing_from_package_is_caught():
     problems = g.contract_mismatches(
         {"redlines.py": "a"}, {"redlines.py": "a", "schema.py": "b"})
     assert any("schema.py" in p and "缺失" in p for p in problems), problems
+
+
+# ── 函数集合等值（Codex deployed-state 复审的后续 P3）────────────────────────
+#
+# 逐包核验只看**已发现**的函数——某个函数整个消失时它根本不进循环，聚合检查
+# 平凡全绿。期望集合来自 infra/app.py 的 PLATFORM_FUNCTION_NAMES（它自身的
+# 新鲜度由 test_platform_function_name_list_matches_what_creates_them 从 CDK
+# 模板与部署脚本双向核对，不是手抄第二份）。
+
+
+FLEET = {"site-deployer-validate", "site-deployer-undeploy",
+         "site-deployer-provision_dynamodb"}
+
+
+def test_fleet_all_present_is_green():
+    """正对照：集合相等 ⇒ 零问题。"""
+    g = _gate()
+    assert g.deployer_fleet_problems(set(FLEET), set(FLEET)) == []
+
+
+def test_a_vanished_function_is_caught():
+    """**Codex 点名的形态**：函数整个消失 ⇒ 必须红。
+
+    之前它连逐包循环都进不去——"12 个函数逐包一致"对着 11 个函数照样成立。
+    """
+    g = _gate()
+    problems = g.deployer_fleet_problems(
+        set(FLEET), FLEET - {"site-deployer-undeploy"})
+    assert problems and "site-deployer-undeploy" in " ".join(problems), problems
+    assert any("没有" in p for p in problems), problems
+
+
+def test_a_rogue_function_is_caught():
+    """线上多出预期外的 site-deployer-* ⇒ 也红——控制面异物。"""
+    g = _gate()
+    problems = g.deployer_fleet_problems(
+        set(FLEET), FLEET | {"site-deployer-backdoor"})
+    assert problems and "多出" in " ".join(problems), problems
+    assert "site-deployer-backdoor" in " ".join(problems), problems
+
+
+def test_expected_set_comes_from_the_cdk_app_constant():
+    """对真实 app.py 的抽取：已知成员在、全员带前缀、非 deployer 平台函数被滤掉。"""
+    g = _gate()
+    exp = g.expected_deployer_functions()
+    assert {"site-deployer-undeploy",
+            "site-deployer-provision_dynamodb"} <= exp, exp
+    assert all(n.startswith("site-deployer-") for n in exp), exp
+    assert "site-panel" not in exp, "过滤方向反了——平台函数混进了 deployer 集合"
