@@ -511,6 +511,10 @@ def route_commit_item(job_id: str, previous_route: dict | None,
             "committed_route": {"M": committed_route}}}}}}
 
 
+class InvalidTableName(ValueError):
+    pass
+
+
 def site_table_name(site_id: str, logical: str) -> str:
     """站点数据表名的**唯一定义**。三处共用：建表（provision_dynamodb）、
     授权（site_policy）、删除（undeploy._purge_dynamodb）。
@@ -521,8 +525,144 @@ def site_table_name(site_id: str, logical: str) -> str:
     （id `foo-k3d9x1-…`）的表。正因如此 `site_policy` 必须逐表枚举精确 ARN，
     不得用通配（M01）。改这个格式要同时改三处调用方——
     `test_table_name_format_has_a_single_definition` 会在漂移时变红。
+
+    **但"不用通配"还不够，本函数必须对 `logical` 单射**（这是 M01 的残留半边）：
+    去掉通配之后，那个"精确 ARN"仍然是**拼**出来的，而 logical 由 manifest 提供、
+    攻击者可控。logical 也允许 `-` 时，A（id `aa-en3d3a`）声明
+    `b-rd8fhn-notes` 与 B（id `aa-en3d3a-b-rd8fhn`）声明 `notes` **拼出同一张表**，
+    于是 A 的精确 ARN 就是 B 的数据表，且 A 的 `data_tables` 也会记下那个名字
+    ⇒ 对 A 执行 `purge_data` 会删掉 B 的表。已端到端复现。
+
+    所以 logical 含 `-` 一律**抛错**，不是"上游应该已经拦住了"：
+    `scripts/backfill_site_role_policies.py` 的 `tables` 是从 sites 行的
+    `data_tables` 推导的、**不过 manifest 校验**，任何被污染的行都会让它重新生成
+    碰撞 ARN，而 M01 闸门因为期望值与实际值同源仍然全绿。判据必须钉在这里。
+
+    **刻意不 import `contract.schema` 复用 `TABLE_NAME_RE`**：本模块被复制进
+    deployer / MCP / panel / key-proxy 四个产物，而只有 deployer 的 step Lambda 带
+    contract 包（`infra/app.py` 的 `cp -r /asset-contract/contract`）——为"唯一定义"
+    引入 ImportError 会是一次与安全无关的部署回归。这里只拒**安全性质**需要的那部分
+    （类型 / 空 / `-`），完整字符集仍由 validator 把关，两者由
+    `test_runtime_guard_matches_the_contract_table_name_rule` 绑在一起。
     """
+    if not isinstance(site_id, str) or not site_id:
+        raise InvalidTableName(f"site_id 必须为非空字符串，得到 {site_id!r}")
+    if not isinstance(logical, str) or not logical:
+        raise InvalidTableName(f"逻辑表名必须为非空字符串，得到 {logical!r}")
+    if "-" in logical:
+        raise InvalidTableName(
+            f"逻辑表名不得含连字符：{logical!r}。分隔符是 `-` 且 site_id 自身可含 `-`，"
+            "允许表名带 `-` 就能让两个不同站点拼出同一个物理表名（跨租户读写 + 误删）。"
+            "合同侧已禁止（contract.schema.TABLE_NAME_RE），这里是 runtime 兜底："
+            "若这个名字来自 sites 行的 data_tables，说明那一行是脏数据，需人工修。")
     return f"site-data-{site_id}-{logical}"
+
+
+class TableOwnershipUnconfirmed(Exception):
+    """无法确认某张已存在的 DynamoDB 表属于本站点。**一律当作"不属于"处理。**"""
+
+
+# 站点资源的两个 tag，由建表（provision_dynamodb）与建角色（ensure_site_role）写入。
+# **在本次改动之前它们是只写从不回读的**，所以下面这个函数是仓库里第一个"归属核验"。
+SITE_TAG_PROJECT = "site-builder"
+
+
+def table_tags(ddb, table_arn: str, *, read_attempts: int = 3) -> dict:
+    """读一张表的全部 tag（**分页**）。读不到就抛 `TableOwnershipUnconfirmed`。
+
+    **必须分页**：`ListTagsOfResource` 带 `NextToken`（moto 每页 10 条），不分页时
+    tag 多了会读到不完整的集合，而"缺 site_id tag"与"不属于本站"在调用方那里是同一
+    个结论 ⇒ 会把自家表误判成外站表。
+
+    **有界重试只针对读侧**：刚 `CreateTable` 完立刻重试部署时，tag 可能有短暂的可见性
+    延迟。重试上限内读不到就抛错——**绝不允许降级成"那就当它是我的表"**，那正是本次
+    要修的那类假设。
+    """
+    import time
+
+    last = None
+    for attempt in range(read_attempts):
+        try:
+            tags, token = {}, None
+            while True:
+                kw = {"ResourceArn": table_arn}
+                if token:
+                    kw["NextToken"] = token
+                page = ddb.list_tags_of_resource(**kw)
+                tags.update({t["Key"]: t["Value"] for t in page.get("Tags", [])})
+                token = page.get("NextToken")
+                if not token:
+                    break
+            if tags:
+                return tags
+            last = "tag 集合为空"
+        except Exception as exc:              # noqa: BLE001 读失败与读到空同样 fail-closed
+            last = f"{type(exc).__name__}: {exc}"
+        if attempt + 1 < read_attempts:
+            time.sleep(0.5 * (attempt + 1))
+    raise TableOwnershipUnconfirmed(
+        f"读不到 {table_arn} 的 tag（{read_attempts} 次尝试，最后一次：{last}）"
+        "——归属未确认，按不属于本站处理")
+
+
+def assert_table_owned_by_site(ddb, site_id: str, logical: str, *,
+                               expect_key_schema=None,
+                               expect_attribute_definitions=None,
+                               read_attempts: int = 3) -> str:
+    """确认**已存在**的 `site-data-{site_id}-{logical}` 真的属于 `site_id`。→ 表 ARN。
+
+    不属于、形态不符、或核不出来，一律抛 `TableOwnershipUnconfirmed`。两个调用方都要
+    fail-closed：
+      · `provision_dynamodb` 撞到 `ResourceInUseException` 时——"表已经存在"**不等于**
+        "这是我上次建的"。不核就等于把别人的表接管进本站的 `data_tables` 与 IAM 策略。
+      · `undeploy._purge_dynamodb` 删表前——`data_tables` 有两个来源（sites 行与 event
+        覆盖），任何一条被污染都会让下线动作删掉别人的表。
+
+    `expect_*` 只有 provision 会传：**"是本站旧表但 schema 不同"也必须失败**，否则会被
+    静默当成一次成功的幂等重试，而站点代码按新 schema 读写一张旧结构的表。
+
+    表名走 `site_table_name`（那里同时会拒掉含 `-` 的 logical），所以本函数不重复
+    实现名字格式——`test_table_name_format_has_a_single_definition` 也不允许。
+
+    `read_attempts` 只对"表刚被创建、tag 可能还没可见"的场景有意义（provision 的并发
+    分支）。**下线路径应传 1**：那张表不是刚建的，没有可见性延迟可等，重试只会让一次
+    注定失败的核验多花几秒。
+    """
+    name = site_table_name(site_id, logical)
+    try:
+        desc = ddb.describe_table(TableName=name)["Table"]
+    except Exception as exc:                  # noqa: BLE001 含 ResourceNotFoundException
+        raise TableOwnershipUnconfirmed(
+            f"describe_table({name}) 失败：{type(exc).__name__}: {exc}") from exc
+
+    tags = table_tags(ddb, desc["TableArn"], read_attempts=read_attempts)
+    if tags.get("project") != SITE_TAG_PROJECT:
+        raise TableOwnershipUnconfirmed(
+            f"表 {name} 的 project tag 是 {tags.get('project')!r}，"
+            f"不是 {SITE_TAG_PROJECT!r}——不是本平台管理的表")
+    if tags.get("site_id") != site_id:
+        raise TableOwnershipUnconfirmed(
+            f"表 {name} 的 site_id tag 是 {tags.get('site_id')!r}，而当前站点是 "
+            f"{site_id!r}——**这是另一个站点的数据表**，拒绝接管或删除")
+
+    def _norm(rows, keys):
+        return sorted(tuple(r[k] for k in keys) for r in rows or [])
+
+    if expect_key_schema is not None:
+        want = _norm(expect_key_schema, ("AttributeName", "KeyType"))
+        got = _norm(desc.get("KeySchema"), ("AttributeName", "KeyType"))
+        if want != got:
+            raise TableOwnershipUnconfirmed(
+                f"表 {name} 是本站的，但 KeySchema 与声明不符：现有 {got}，声明 {want}"
+                "——按新 schema 读写一张旧结构的表会静默出错，拒绝当成幂等重试")
+    if expect_attribute_definitions is not None:
+        want = _norm(expect_attribute_definitions, ("AttributeName", "AttributeType"))
+        got = _norm(desc.get("AttributeDefinitions"),
+                    ("AttributeName", "AttributeType"))
+        if want != got:
+            raise TableOwnershipUnconfirmed(
+                f"表 {name} 是本站的，但属性定义与声明不符：现有 {got}，声明 {want}")
+    return desc["TableArn"]
 
 
 # tier → 数据引擎。**真源是 `contract.schema.TIER_ENGINE`**，本函数是 deployer 侧

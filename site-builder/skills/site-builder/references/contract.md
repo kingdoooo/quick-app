@@ -42,9 +42,9 @@ my-site/
 | `backend.port` | number | fullstack 必填 | 必须为 `8080`（Lambda Web Adapter 约定） | `8080` |
 | `database` | object | 必填 | `engine` 必须与 tier 匹配（见下） | — |
 | `database.engine` | string（枚举） | 必填 | 由 tier 唯一确定：`static`→`"none"`、`fullstack-nosql`→`"dynamodb"`、`fullstack-sql`→`"dsql"`，不匹配即校验失败 | `"dsql"` |
-| `database.tables` | array | 仅 `engine=dynamodb` 必填（≥1 项） | dynamodb：1–10 张表，表名不得重复；**dsql 禁止声明 tables**（填 `[]` 或省略，schema 全写 `backend/schema.sql`）；static 省略 | `[{"name": "notes", "pk": "id"}]` |
-| `database.tables[].name` | string | dynamodb 每项必填 | 正则 `[a-z][a-z0-9_-]{0,29}`（小写开头，长度 1–30） | `"notes"` |
-| `database.tables[].pk` | string | dynamodb 每项必填 | 分区键属性名，正则 `[a-z][a-z0-9_-]{0,29}`；类型固定为字符串（S） | `"id"` |
+| `database.tables` | array | 仅 `engine=dynamodb` 必填（≥1 项） | dynamodb：1–10 张表，表名不得重复、**不得含连字符**（用 `_`）；**dsql 禁止声明 tables**（填 `[]` 或省略，schema 全写 `backend/schema.sql`）；static 省略 | `[{"name": "notes", "pk": "id"}]` |
+| `database.tables[].name` | string | dynamodb 每项必填 | 正则 `[a-z][a-z0-9_]{0,29}`（小写开头，长度 1–30）——**不得含连字符**，见下方「表名与属性名的字符集为什么不同」 | `"notes"` |
+| `database.tables[].pk` | string | dynamodb 每项必填 | 分区键属性名，正则 `[a-z][a-z0-9_-]{0,29}`——**允许连字符**（与表名不同，属性名不参与资源命名）；类型固定为字符串（S） | `"id"` |
 | `auth` | object | 必填 | 见下两行 | — |
 | `auth.require_login` | boolean | 必填 | `true`：访问者必须飞书登录；`false`：匿名可访问 | `true` |
 | `auth.allowed_users` | string 或 array | 必填 | `"org"`（全组织飞书用户）或非空邮箱数组（每项须为合法邮箱） | `"org"` 或 `["a@corp.com", "b@corp.com"]` |
@@ -59,6 +59,22 @@ my-site/
 三档完整样例见 `templates/site.json.static.example`、
 `templates/site.json.nosql.example`、`templates/site.json.sql.example`——直接以
 对应样例为底稿改 `name` / `tables` / `auth`，不要凭记忆手写。
+
+## 表名与属性名的字符集为什么不同
+
+`database.tables[].name` 的正则是 `[a-z][a-z0-9_]{0,29}`——**不含连字符**；
+而 `database.tables[].pk` 的正则是 `[a-z][a-z0-9_-]{0,29}`，**允许连字符**。
+两者刻意不同，不要"顺手统一"：
+
+- **表名会成为物理资源名的一段**：真实的 DynamoDB 表名是
+  `site-data-{site_id}-{表名}`，而 `site_id` 自身可以含连字符。表名也允许连字符时，
+  两个**不同**站点能拼出同一个物理表名，于是一个站点的 IAM 策略会精确指向另一个
+  站点的数据表（跨租户读写，且下线清理会删错表）。禁掉表名里的连字符就让这种碰撞
+  在构造上不可能。
+- 表名还会转成大写作为 Lambda 环境变量名 `TABLE_<NAME>`，而环境变量名不接受连字符。
+- **属性名（pk）不参与任何资源命名**，DynamoDB 本身也接受连字符，所以不跟着收紧。
+
+**写法**：把 `daily-log` 改成 `daily_log`（读 `process.env.TABLE_DAILY_LOG`）。
 
 ## 站点名的保留前缀
 
@@ -83,7 +99,7 @@ my-site/
 | tier | 前端 | 后端 | 数据库 | 典型场景 |
 |---|---|---|---|---|
 | `static` | 纯 HTML/JS/CSS | 无（禁止 backend 字段与 backend/ 目录） | 无（`engine: "none"`） | 展示页、报表页 |
-| `fullstack-nosql` | 静态 + fetch `/api/*` | Express（Node 22） | DynamoDB；每张声明的表以环境变量 `TABLE_<NAME>`（表名转大写）注入真实表名 | 记录型小工具 |
+| `fullstack-nosql` | 静态 + fetch `/api/*` | Express（Node 22） | DynamoDB；每张声明的表以环境变量 `TABLE_<NAME>`（表名转大写）注入真实表名——**这也是表名不得含连字符的原因之一**（Lambda 的环境变量名不接受 `-`） | 记录型小工具 |
 | `fullstack-sql` | 静态 + fetch `/api/*` | Express（Node 22） | Aurora DSQL；平台注入 `DSQL_ENDPOINT` / `DSQL_SCHEMA` / `DSQL_USER`，只被模板 `db.js` 读取 | 关系型业务 |
 
 后端通用约定（fullstack 两档）：
@@ -91,6 +107,7 @@ my-site/
 - 监听端口读 `process.env.PORT`（部署时为 8080，本地演示可任意）。
 - DynamoDB 表名不要硬编码：读 `process.env.TABLE_<NAME>`，如声明了
   `{"name": "notes", ...}` 就读 `process.env.TABLE_NOTES`。
+  表名里用下划线而不是连字符：`daily_log` → `TABLE_DAILY_LOG`；`daily-log` 会被校验拒绝。
 - DSQL 连接只通过 `db.js` 的 `makePool()`；`DSQL_*` 环境变量由平台注入，
   站点代码不读不写。业务代码不需要（也不应该）指定 schema——`makePool()`
   已 `SET search_path` 到站点专属 schema。

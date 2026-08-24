@@ -668,3 +668,41 @@ def test_index_html_requirement_is_documented_in_the_agent_facing_contract():
            / "contract.md").read_text(encoding="utf-8")
     assert "frontend/index.html" in doc and "必须存在且非空" in doc, \
         "index.html 的合同要求没写进给 Agent 的 contract.md"
+
+
+def test_table_name_charsets_are_documented_in_the_agent_facing_contract():
+    """两个字符集必须写进给 Agent 的合同文档，且**期望值从代码真源推导**。
+
+    改合同要同步三处（CLAUDE.md 的改动矩阵）：校验器（本包）、
+    `references/contract.md`、fixtures。这条锁文档那一处——在此之前表名规则的文档
+    同步纯属约定，没有任何守卫，改了正则而忘了改文档不会有人发现。
+
+    **为什么必须从 `TABLE_NAME_RE.pattern` 推导而不是在测试里抄一份正则**：抄一份
+    就失去了"改代码忘改文档会红"这个唯一有价值的性质（同
+    `deployer/tests/test_common.py::test_reserved_prefixes_are_documented_…` 的理由）。
+
+    **为什么切到具名小节内判、不做全文 substring**：全文判时 `[a-z][a-z0-9_-]{0,29}`
+    会被 pk 那一行满足，于是"表名的正则文档漏了"照样绿——那正是同族守卫记录过的
+    实测坑（多项凭空变绿）。
+
+    Skill 文档是用户 `cp -r` 出去的快照、没有更新机制，所以它写错的代价不是"文档不
+    好看"，而是 Agent 按旧规则生成、用户只能靠校验器报错自解释。
+    """
+    from pathlib import Path
+
+    from contract.schema import ATTRIBUTE_NAME_RE, TABLE_NAME_RE
+
+    doc = (Path(__file__).parents[2] / "skills" / "site-builder" / "references"
+           / "contract.md").read_text(encoding="utf-8")
+    anchor = "## 表名与属性名的字符集为什么不同"
+    assert anchor in doc, f"合同文档里找不到 {anchor!r} 这一节——本条已空转"
+    section = doc.split(anchor, 1)[1].split("\n## ", 1)[0]
+
+    assert f"`{TABLE_NAME_RE.pattern}`" in section, (
+        f"表名正则 {TABLE_NAME_RE.pattern!r} 没写进合同文档的那一节——"
+        "改了校验器就要同步这里")
+    assert f"`{ATTRIBUTE_NAME_RE.pattern}`" in section, (
+        f"属性名正则 {ATTRIBUTE_NAME_RE.pattern!r} 没写进合同文档的那一节")
+    # 光贴两个正则不够：Agent 需要知道**怎么改**，而它拿到的报错只有校验器那一条
+    assert "_" in section and "连字符" in section, \
+        "那一节没写清「用下划线代替连字符」这个可执行的修法"

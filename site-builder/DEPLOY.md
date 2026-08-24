@@ -383,7 +383,18 @@ python3 site-builder/scripts/migrate_sites_to_blue_green.py --apply --site-id <s
 | 4 | auth | **第二波**重登从这一刻开始 |
 | 5 | router（Edge） | 必须在 auth 之后：反过来会让新签发的会话被 Edge 拒（登录循环） |
 | 6 | 等 CloudFront `Status == Deployed` | **放在 5 之后而不是之前**：触发 Lambda@Edge 全球传播的是 router 部署本身，在它之前等待不会等到任何新版本。判据用 `Status`，不要盲等固定分钟数。**第三波**重登在这期间发生 |
-| 7 | 真机验收（6 条 + 硬闸门） | 见下面「五个硬闸门」 |
+| 7 | 真机验收（7 条 + 硬闸门） | 见下面「六个硬闸门」 |
+
+> ⚠️ **本节的顺序假定部署窗口内没有并发业务**（本仓库当前是测试开发环境）。把同一套
+> 代码升级到**已有用户流量**的环境时，只在部署前扫一次 jobs 表**是不够的**，必须先冻结
+> 准入再 drain：`do_confirm_upload` 会事务性把 PENDING 改成 RUNNING 并
+> `StartExecution`，`do_undeploy` 是对 undeploy Lambda 的异步调用——两条入口都能在
+> "扫描 job=0"之后立刻被 MCP/panel 触发，而 CloudFormation 更新一组 Lambda **不是**
+> 瞬时切换，于是旧 Validate / Provision / Undeploy 会在混合版本窗口里跑。
+> 冻结方式二选一：① MCP/panel 两条入口共用一个维护开关，拒绝 deploy/confirm/undeploy；
+> ② 临时 IAM deny（对发起者拒 `states:StartExecution` 与对 undeploy 函数的
+> `lambda:InvokeFunction`）。冻结后要确认：jobs 表无 deploy/undeploy 处于 RUNNING、
+> Step Functions 无 RUNNING execution、无活跃 site lease，**再**部署，跑完闸门才解冻。
 
 **中途停下是安全且可重跑的**：若在第 3 步失败中止，此时是"deployer + 三个产物
 已更新、auth/router 还是旧版"。这个中间态自洽——旧 auth 签发不带 `typ` 的会话，
@@ -432,7 +443,7 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 # **M01 闸门的退出码先存起来、在块末才生效——这个写法不要"整理"成直接中止。**
 # 直接中止的话，一个与 M02/M05/M06 完全无关的数据条件（下面那条没有 tier 的
-# ACTIVE 行，必须人工修）会把另外六条验收全部吃掉，那次部署就在**没有任何
+# ACTIVE 行，必须人工修）会把另外七条验收全部吃掉，那次部署就在**没有任何
 # M02/M05/M06 证据**的情况下收尾。反过来把闸门挪到最后也不行：`--check` 是唯一
 # 对全部 ACTIVE dynamodb 站点跑功能模拟的地方（`--apply` 结尾只做结构检查），
 # 它必须留在执行记录最前面。
@@ -441,6 +452,13 @@ python3 site-builder/scripts/backfill_site_role_policies.py --check
 m01_rc=$?
 set -e
 echo "M01 闸门退出码：$m01_rc（非 0 会在本块末尾让这一步失败）"
+
+# per-site 数据表的归属完整性。**与 M01 闸门不冗余**：那条比的是"实际 policy
+# == 按代码推导的期望 policy"，而期望值是从 sites 行的 data_tables 推出来的
+# ——两边**同源**，data_tables 被污染时两边一致、闸门照样全绿。这条引入
+# 「表自己的 tag」作为独立信源，并要求 role 的表 ARN 集合与**同一个站点**
+# 自己的表精确相等（不多、不少、不含通配、不含别站的表）。
+python3 site-builder/scripts/verify_site_table_integrity.py
 
 # **必须在业务验收之前**：唯一能证明"CloudFront 现在关联的 Edge 就是这份源码"的闸门。
 # 少了它，M05 的 Edge 半边与 M06 整条可以**完全没生效而四条业务验收全绿**——
@@ -458,11 +476,11 @@ bash    site-builder/scripts/smoke_router.sh                 # 路由层冒烟�
 exit "$m01_rc"
 ```
 
-期望：`不合格的 site-rt-* 角色：0`、`M01 闸门退出码：0`，六条验收全部通过，整块退 0。
+期望：`不合格的 site-rt-* 角色：0`、`M01 闸门退出码：0`，七条验收全部通过，整块退 0。
 `verify_console_e2e.py` 报 token 过期时先 `node site-builder/clients/quick-desktop-proxy/auth.js`
 重新登录一次。
 
-### 五个硬闸门：各自证明什么，以及**不**证明什么
+### 六个硬闸门：各自证明什么，以及**不**证明什么
 
 | 闸门 | 什么时候跑 | 它证明 | 它**不**证明 |
 |---|---|---|---|
@@ -470,6 +488,7 @@ exit "$m01_rc"
 | `backfill_site_role_policies.py --check` | 第 7 步 | 四层：site-scope 与期望**完整等值**、角色上只有 site-scope 一条 policy、ACTIVE 站点的角色反向存在、全部 dynamodb 站点过 IAM 模拟器**全部六个数据动作** | **不看信任策略**（`AssumeRolePolicyDocument` 被放宽的角色四层全过）、**不看 `site-runtime-boundary` 还挂着没有**——而 `ensure_site_role` 只在**新建**角色时挂 boundary，所以 `--apply` 不会把被摘掉的 boundary 挂回去。DSQL 站点只有文本等值，没有功能模拟 |
 | `verify_deployed_components.py` | 第 7 步，且**必须在第 2 步之后** | 线上产物里的 `permissions.py` / `common.py` / `session.py` / `login_handler.py` 与仓库逐字节一致 | 这是**唯一**能发现"某个 **Lambda** 产物漏部了"的闸门。三个组件里漏一个的症状是产物陈旧而部署脚本全程正常。**它不覆盖 Edge**：它下载 Edge 产物，但只问一个问题（`mcp` 有没有进 `PLATFORM_SUBDOMAINS`），M05/M06 的 Edge 半边它一个字都没看 |
 | `verify_deployed_edge.sh` | 第 7 步，**在业务验收之前**（第 6 步等到 `Deployed` 之后） | CloudFront **当前关联的那个版本**的产物与本地 `origin_request.py` 逐行相同（只允许占位符行有差异）、占位符全部替换、安全开关是收紧值，外加 M05（查 `typ`）与 M06（逐个验、不截断）两条哨兵 | **证据等级是静态产物比对，不是行为探针**：它证明"跑在线上的就是这份源码"，M05/M06 的**行为**由下面那条闸门单独证。也不看非默认 cache behavior 上的关联 |
+| `verify_site_table_integrity.py` | 第 7 步（部署后自检，也可随时跑） | per-site 数据表的归属：ACTIVE NoSQL 站点的表存在且 tag `project`/`site_id` 正确；**每个 `site-rt-{site_id}` 角色的 DynamoDB 表 ARN 集合与同一站点自己的表精确相等**（不多、不少、无通配、不含别站的表）；DSQL 角色没有任何表 ARN；全部 `data_tables` 逻辑名符合 `TABLE_NAME_RE` | 只看**当前 ACTIVE** 站点——历史/DELETED 行不做全量对账（表可能已删），但它们含连字符的 `data_tables` 仍会被报出来。不核 DSQL 侧的 schema/role 隔离（那在 PG 层）。要害判定抽成了纯函数 `role_arn_problems`，反向验证在 `deployer/tests/test_verify_site_table_integrity.py` |
 | `verify_session_token_semantics.py` | 第 7 步，紧跟上一条 | M05/M06 的**真机行为**：遮蔽 cookie 排在合法会话之前时 `/console-session` 仍换出升级码、Edge 侧仍放行（含 14 条遮蔽的量级）、console 升级码当站点会话被拒；含正对照（单枚合法会话能进）与负对照（无 cookie 仍 302）。**只发 GET，不写数据** | 它只挑路由表里第一个 `require_auth=True` 的站点，不遍历全部站点；候选条数上限那一类**回归**残留由单测的结构守卫管，不在这里 |
 
 另两条：`verify_permission_matrix.py`（权限矩阵端到端，M02 之后唯一覆盖它的）、
@@ -516,7 +535,7 @@ spec 里只写了后两波。第一波是最终复核发现的，症状是"刚�
 | 你看到 | 怎么办 |
 |---|---|
 | `--apply` 报「验证失败」 | **先重跑 `--check` 再下结论**。IAM 与策略模拟器是最终一致的，脚本内建 2/4/8 秒退避只能减少、不能消除一次**完全正确**的跑被记成红 |
-| `--check` 报某行「sites 行没有 tier，判不出 engine」 | **脚本永远修不到 0，必须人工修那一行**（`tier` 只在部署成功路径写，所以这是可达状态，不是假设）。修好再重跑；这一条不影响另外六条验收（那就是 Step 5 把退出码延后生效的原因） |
+| `--check` 报某行「sites 行没有 tier，判不出 engine」 | **脚本永远修不到 0，必须人工修那一行**（`tier` 只在部署成功路径写，所以这是可达状态，不是假设）。修好再重跑；这一条不影响另外七条验收（那就是 Step 5 把退出码延后生效的原因） |
 | `--check` 报「site-scope 之外还有别的 policy」 | 需人工移除那条多余的 inline/attached policy。脚本**不自动删未知 policy** |
 | `--check` 报「ACTIVE 站点的角色缺失」 | 先查为什么没了。脚本**不自动重建**（自动建会盖掉根因，也会让备份里的 `null` 出现第二种含义） |
 | 「临时备份文件已存在——判为另一个 backfill 正在运行」 | **等一下再重跑，绝不要删那个 `.tmp`**。它同时是跨进程锁；此刻一笔 IAM 写入都没发生。若确认是上一次崩溃的残留，人工看过内容再删 |
@@ -1126,6 +1145,13 @@ name**；值必须是裸 `true`/`false`——configparser 会把行内注释并�
    > 源目录，不含挂载卷里的清单内容**——实测过两份不同的 lockfile 算出同一个
    > `asset.<同一串>`。于是"只改清单、不改 `app.py`"时 CDK 会复用旧 asset，
    > 新清单当次**根本没生效**，而部署脚本一切正常。
+   >
+   > **改过 `site-builder/contract/` 同样必须 `rm -rf cdk.out`**，原因与上一条**完全
+   > 相同**：合同包也是**挂载卷**（`infra/app.py` 的 `/asset-contract` → `contract/src`，
+   > 用 `cp -r` 进产物），不进 asset hash。而它被打进**全部 10 个 `site-deployer-*`
+   > step Lambda**（`step_fn` 的 bundling 命令是统一的），所以漏清的后果是"部署全绿
+   > 而 10 个函数继续跑旧的校验器字节"——校验规则改严了却完全没生效，是最难发现的
+   > 那一类。这条以前不在本清单里（只列了 config.ini 与依赖清单），补上。
    >
    > **`default_origin` 必须是可解析域名**。origin-request 事件在 CloudFront 解析
    > origin **之后**才触发，填不可解析的值（如 `.invalid` 保留 TLD）会让所有请求

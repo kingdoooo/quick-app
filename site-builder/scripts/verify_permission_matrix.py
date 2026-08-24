@@ -49,6 +49,7 @@ results: list[tuple[bool, str, str]] = []
 created_sites: set[str] = set()
 created_routes: set[str] = set()
 TMP_ADMINS = f"site-admins-permprobe-{SUFFIX}"
+TMP_OPS_LOG = f"site-ops-log-permprobe-{SUFFIX}"
 
 
 def check(ok: bool, name: str, detail: str = "") -> None:
@@ -67,6 +68,12 @@ def main() -> int:
     os.environ["SITES_TABLE"] = read_cfg("Deployer", "sites_table")
     os.environ["ROUTING_TABLE"] = read_cfg("Platform", "routing_table")
     os.environ["ADMINS_TABLE"] = TMP_ADMINS      # 临时表，见模块 docstring
+    # **OPS_LOG_TABLE 从前没设**：`ops_log.record()` 于是每次抛 KeyError，
+    # 被它刻意的 `except Exception` 吞掉，而本脚本仍报 21/21 全过——也就是说
+    # 它证明了条件表达式/rev/快照/TOCTOU 正确，却**没有**证明审计写入成功。
+    # 真出审计回归它看不见。同样用临时表：往生产 ops-log 里插探针行即便随后
+    # 删掉，中途失败就污染了审计流水。
+    os.environ["OPS_LOG_TABLE"] = TMP_OPS_LOG
     os.environ["BASE_DOMAIN"] = read_cfg("Platform", "base_domain")
 
     import boto3
@@ -100,7 +107,7 @@ def main() -> int:
     sites_t, route_t = os.environ["SITES_TABLE"], os.environ["ROUTING_TABLE"]
 
     print(f"探针后缀 {SUFFIX}；sites={sites_t} routing={route_t} "
-          f"admins={TMP_ADMINS}(临时)")
+          f"admins={TMP_ADMINS}(临时) ops-log={TMP_OPS_LOG}(临时)")
 
     # ---- 临时 admins 表 ----
     ddb.create_table(TableName=TMP_ADMINS,
@@ -109,6 +116,25 @@ def main() -> int:
                                             "AttributeType": "S"}],
                      BillingMode="PAY_PER_REQUEST")
     ddb.get_waiter("table_exists").wait(TableName=TMP_ADMINS)
+
+    # ---- 临时 ops-log 表 ----
+    # **schema 必须与真表同构**（PK `target`、SK `ts_actor`、TTL `expires_at`），
+    # 否则写入会因主键不匹配失败，而那种失败与"审计逻辑没调用"长得一样。
+    ddb.create_table(TableName=TMP_OPS_LOG,
+                     KeySchema=[{"AttributeName": "target", "KeyType": "HASH"},
+                                {"AttributeName": "ts_actor", "KeyType": "RANGE"}],
+                     AttributeDefinitions=[
+                         {"AttributeName": "target", "AttributeType": "S"},
+                         {"AttributeName": "ts_actor", "AttributeType": "S"}],
+                     BillingMode="PAY_PER_REQUEST")
+    ddb.get_waiter("table_exists").wait(TableName=TMP_OPS_LOG)
+    try:
+        ddb.update_time_to_live(
+            TableName=TMP_OPS_LOG,
+            TimeToLiveSpecification={"Enabled": True,
+                                     "AttributeName": "expires_at"})
+    except Exception as exc:            # noqa: BLE001 TTL 不是被验语义，失败只记一声
+        print(f"  （临时 ops-log 表未开 TTL：{exc}——不影响本轮断言）")
 
     def sid(tag: str) -> str:
         s = f"permprobe{tag}-{SUFFIX}"
@@ -284,6 +310,52 @@ def main() -> int:
     except Exception as exc:            # noqa: BLE001 清理尽力而为
         print(f"  ⚠️  探针 job {job_id} 未删除: {exc}")
 
+    print("\n── G 坏数据行拒绝投影（M02），并留下审计 ───────────")
+    # 这条路径此前**没有任何真机验证**：`effective_policy_audited` 只在
+    # `PolicyDataInvalid` 时落 `reject_policy_projection`，而 A–F 的场景都用的是
+    # 类型正确的行。用 `resync_route`（admin-only，docstring 明写"真源坏了它就拒绝"）
+    # 作为触发点：它不改 sites 表、不推进 rev，副作用最小。
+    g = sid("g")
+    # require_login 写成数字 —— 正是 M02 要拒的"坏类型"形态（moto 侧的同类用例用
+    # Decimal(0)；这里直接写 0，DynamoDB 存成 N）
+    put_site(g, owner=OWNER, name="probe", status="ACTIVE",
+             require_login=0, allowed_users="org", collaborators=[])
+    perm.add_admin(ADMIN, added_by="permprobe")     # D 节把它删了，这里重新加回
+    try:
+        perm.resync_route(g, actor=ADMIN)
+        check(False, "坏类型的 require_login 竟然被投影了",
+              "M02 的核心不变量失效")
+    except perm.PolicyDataInvalid as exc:
+        check(True, "坏类型的 require_login → 拒绝投影", str(exc)[:60])
+    except Exception as exc:                        # noqa: BLE001
+        check(False, "拒绝投影时抛的不是 PolicyDataInvalid",
+              f"{type(exc).__name__}: {str(exc)[:50]}")
+
+    print("\n── H 审计写入真的落库了 ────────────────────────────")
+    # 为什么这一节非有不可：`ops_log.record()` 刻意吞掉一切异常
+    # （"业务动作已经成功，审计失败不能改变它的结果"），所以**审计完全写不进去**时
+    # 上面 A–F 全部照样 PASS。本脚本从前就是这样：没设 `OPS_LOG_TABLE`，每次
+    # `KeyError` 被吞，21/21 全过。断言"有没有落库"是唯一能关掉这个证据缺口的方式。
+    #
+    # 三类分别对应三条不同的代码路径，缺任一条都说明那条路径的审计没接上：
+    #   ok       —— 成功的权限写入
+    #   denied   —— 鉴权失败被拒
+    #   rejected —— 坏数据行拒绝投影（reject_policy_projection）
+    rows = ddb.scan(TableName=TMP_OPS_LOG)["Items"]
+    by_action: dict[str, set] = {}
+    for it in rows:
+        by_action.setdefault(it.get("action", {}).get("S", "?"), set()).add(
+            it.get("result", {}).get("S", "?"))
+    check(bool(rows), "临时 ops-log 表里有审计行",
+          f"{len(rows)} 行，actions={sorted(by_action)}")
+    check(any("ok" in v for v in by_action.values()),
+          "成功的权限写入留下了 result=ok 的审计行", str(by_action)[:90])
+    check(any("denied" in v for v in by_action.values()),
+          "被拒的操作留下了 result=denied 的审计行", str(by_action)[:90])
+    check("reject_policy_projection" in by_action,
+          "坏数据行拒绝投影留下了 reject_policy_projection 审计行",
+          str(sorted(by_action))[:90])
+
     return 0
 
 
@@ -321,12 +393,13 @@ def cleanup(region: str, keep: bool) -> int:
         if "Item" in got:
             print(f"  ⚠️  routing/{sub} 仍存在 —— 手工删除")
             leftover += 1
-    try:
-        ddb.delete_table(TableName=TMP_ADMINS)
-        ddb.get_waiter("table_not_exists").wait(TableName=TMP_ADMINS)
-    except Exception as exc:            # noqa: BLE001
-        print(f"  ⚠️  临时表 {TMP_ADMINS} 未删除: {exc} —— 手工删除")
-        leftover += 1
+    for tmp in (TMP_ADMINS, TMP_OPS_LOG):
+        try:
+            ddb.delete_table(TableName=tmp)
+            ddb.get_waiter("table_not_exists").wait(TableName=tmp)
+        except Exception as exc:        # noqa: BLE001
+            print(f"  ⚠️  临时表 {tmp} 未删除: {exc} —— 手工删除")
+            leftover += 1
     print("  探针数据已清理并核对" if not leftover
           else f"  {leftover} 项残留，见上面的 ⚠️")
     return leftover

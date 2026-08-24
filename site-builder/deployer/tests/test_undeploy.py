@@ -38,14 +38,30 @@ def _lam_mock():
     return lam
 
 
+def _make_site_table(ddb, name: str, site_id: str, *, tags: bool = True):
+    """按 provision_dynamodb 的真实形态建一张站点数据表（**含 tag**）。
+
+    夹具从前不打 tag，而 `provision_dynamodb` 建表时一直是打的
+    （`project` + `site_id`）。归属核验开始回读 tag 之后，不打 tag 的夹具会让
+    自家表被判成"归属未确认"——那是夹具与生产不一致，不是被测行为变了。
+    `tags=False` 用来**故意**造出无 tag 的表，验证 fail-closed。
+    """
+    kw = dict(TableName=name,
+              KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+              AttributeDefinitions=[{"AttributeName": "id",
+                                     "AttributeType": "S"}],
+              BillingMode="PAY_PER_REQUEST")
+    if tags:
+        kw["Tags"] = [{"Key": "project", "Value": "site-builder"},
+                      {"Key": "site_id", "Value": site_id}]
+    ddb.create_table(**kw)
+
+
 def test_data_preserved_by_default(aws):
     """默认不删数据——误删不可恢复，必须显式 opt-in。"""
     import undeploy, common
     ddb = boto3.client("dynamodb")
-    ddb.create_table(TableName="site-data-hello-x1-notes",
-                     KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
-                     AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
-                     BillingMode="PAY_PER_REQUEST")
+    _make_site_table(ddb, "site-data-hello-x1-notes", "hello-x1")
     jid = _seed(common, boto3)
     with patch.object(undeploy, "_lambda", return_value=_lam_mock()):
         out = undeploy.handler({"job_id": jid, "site_id": "hello-x1"}, None)
@@ -57,11 +73,8 @@ def test_purge_data_deletes_only_this_site_tables(aws):
     """purge_data=True 删本站点表，不得碰其他站点的。"""
     import undeploy, common
     ddb = boto3.client("dynamodb")
-    for t in ("site-data-hello-x1-notes", "site-data-other-x2-notes"):
-        ddb.create_table(TableName=t,
-                         KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
-                         AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
-                         BillingMode="PAY_PER_REQUEST")
+    _make_site_table(ddb, "site-data-hello-x1-notes", "hello-x1")
+    _make_site_table(ddb, "site-data-other-x2-notes", "other-x2")
     jid = _seed(common, boto3)
     common.upsert_site("hello-x1", data_tables=["notes"])
     with patch.object(undeploy, "_lambda", return_value=_lam_mock()):
@@ -422,3 +435,117 @@ def test_lease_clear_is_conditional_on_the_holder(aws):
     common.clear_deploy_lease("hello-x1", "job-mine")     # 不是持有者
     assert common.read_deploy_lease("hello-x1") == "job-someone-else", \
         "把别人正持有的租约清掉了"
+
+
+# ── purge 前核归属：算出名字就删的年代结束了 ─────────────────────────────────
+#
+# `tables` 有两个来源（sites 行的 `data_tables`，以及 event 覆盖值——MCP 会传、
+# panel 不传），任何一条被污染都会让一次下线删掉**别人的**数据表。表在创建时就打了
+# `site_id` tag，从前只是从不回读。
+
+def _spy_dynamodb(monkeypatch):
+    """记下所有 DynamoDB API 调用。断言"压根没发出 DeleteTable"用它。
+
+    patch 在 `botocore.client.BaseClient._make_api_call`——所有 client 的唯一出口，
+    所以不管代码用哪个 client 实例、怎么拿到它，都逃不掉（与
+    test_finalize_steps.py 的同名 helper 同法）。
+    """
+    import botocore.client
+    calls = []
+    orig = botocore.client.BaseClient._make_api_call
+
+    def _spy(self, operation_name, api_params):
+        if self.meta.service_model.service_name == "dynamodb":
+            calls.append((operation_name, api_params))
+        return orig(self, operation_name, api_params)
+
+    monkeypatch.setattr(botocore.client.BaseClient, "_make_api_call", _spy)
+    return calls
+
+
+def test_purge_refuses_to_delete_a_table_tagged_for_another_site(aws, monkeypatch):
+    """`data_tables` 指向一张 tag 属于别站的表 ⇒ **不删**，job 落 PURGE_FAILED。
+
+    这是碰撞被利用时的删表那一半：A 的 data_tables 里记着一个能指到 B 的表名。
+    """
+    import undeploy, common
+    ddb = boto3.client("dynamodb")
+    # 表名算作 hello-x1 的，但 tag 上写着别的站点
+    _make_site_table(ddb, "site-data-hello-x1-notes", "somebody-else-x9")
+    jid = _seed(common, boto3)
+    common.upsert_site("hello-x1", data_tables=["notes"])
+
+    calls = _spy_dynamodb(monkeypatch)
+    with patch.object(undeploy, "_lambda", return_value=_lam_mock()):
+        out = undeploy.handler({"job_id": jid, "site_id": "hello-x1",
+                                "purge_data": True}, None)
+
+    assert "site-data-hello-x1-notes" in ddb.list_tables()["TableNames"], \
+        "外站 tag 的表被删了"
+    assert not [c for c in calls if c[0] == "DeleteTable"], \
+        f"压根不该发出 DeleteTable，实际发了：{[c[1] for c in calls if c[0] == 'DeleteTable']}"
+    assert "dynamodb_error" in out["purged"], f"错误没上报：{out['purged']}"
+    job = common.get_job(jid)
+    assert job["status"] == "PURGE_FAILED", \
+        f"下线被报成了 {job['status']}——残留数据无人知晓"
+    assert common.get_site("hello-x1")["status"] == "DELETED", \
+        "站点确实已下线，这一半不该被清理失败带偏"
+
+
+def test_purge_refuses_a_table_without_ownership_tags(aws, monkeypatch):
+    """没有 tag ⇒ 归属未确认 ⇒ 不删。**不许降级成"那就当它是我的"**。"""
+    import undeploy, common
+    ddb = boto3.client("dynamodb")
+    _make_site_table(ddb, "site-data-hello-x1-notes", "hello-x1", tags=False)
+    jid = _seed(common, boto3)
+    common.upsert_site("hello-x1", data_tables=["notes"])
+
+    calls = _spy_dynamodb(monkeypatch)
+    with patch.object(undeploy, "_lambda", return_value=_lam_mock()):
+        out = undeploy.handler({"job_id": jid, "site_id": "hello-x1",
+                                "purge_data": True}, None)
+    assert "site-data-hello-x1-notes" in ddb.list_tables()["TableNames"]
+    assert not [c for c in calls if c[0] == "DeleteTable"]
+    assert common.get_job(jid)["status"] == "PURGE_FAILED"
+
+
+def test_purge_checks_ownership_for_event_supplied_table_names_too(aws, monkeypatch):
+    """event 覆盖的 `data_tables` 走**同一条**核验。
+
+    `undeploy` 的表名来源是 `event.get("data_tables") or site.data_tables`，
+    event 优先（MCP 会传）。只在 sites 行那条路上核归属等于留了一半的门。
+    """
+    import undeploy, common
+    ddb = boto3.client("dynamodb")
+    _make_site_table(ddb, "site-data-hello-x1-notes", "somebody-else-x9")
+    jid = _seed(common, boto3)
+    # sites 行里**没有** data_tables，名字完全由 event 提供
+    calls = _spy_dynamodb(monkeypatch)
+    with patch.object(undeploy, "_lambda", return_value=_lam_mock()):
+        out = undeploy.handler({"job_id": jid, "site_id": "hello-x1",
+                                "purge_data": True,
+                                "data_tables": ["notes"]}, None)
+    assert "site-data-hello-x1-notes" in ddb.list_tables()["TableNames"]
+    assert not [c for c in calls if c[0] == "DeleteTable"]
+    assert common.get_job(jid)["status"] == "PURGE_FAILED"
+
+
+def test_purge_refuses_a_hyphenated_table_name_from_a_poisoned_row(aws, monkeypatch):
+    """`data_tables` 里若留着含连字符的历史值 ⇒ fail-closed，不删任何东西。
+
+    那种值正是跨站点碰撞的载体。`site_table_name` 在唯一定义处就拒掉它，所以
+    这条路径连"算出名字"都做不到——而不是算出来再去比对。
+    """
+    import undeploy, common
+    ddb = boto3.client("dynamodb")
+    _make_site_table(ddb, "site-data-hello-x1-notes", "hello-x1")
+    jid = _seed(common, boto3)
+    common.upsert_site("hello-x1", data_tables=["b-654321-notes"])
+
+    calls = _spy_dynamodb(monkeypatch)
+    with patch.object(undeploy, "_lambda", return_value=_lam_mock()):
+        out = undeploy.handler({"job_id": jid, "site_id": "hello-x1",
+                                "purge_data": True}, None)
+    assert not [c for c in calls if c[0] == "DeleteTable"]
+    assert common.get_job(jid)["status"] == "PURGE_FAILED"
+    assert "site-data-hello-x1-notes" in ddb.list_tables()["TableNames"]

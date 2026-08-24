@@ -36,10 +36,28 @@ def _purge_dynamodb(site_id: str, tables: list[str]) -> list[str]:
     表名由 manifest 的 database.tables 推导，不用 ListTables 枚举——
     ListTables 不支持资源级限定，给它权限等于允许列举账号内所有表，
     而执行器角色的其他 DynamoDB 权限都严格限定在 site-* 前缀内。
+
+    **删之前必须核归属**（`common.assert_table_owned_by_site`：project + site_id tag）。
+    从前这里只捕 `ResourceNotFoundException`，算出名字就直接 `DeleteTable`——而
+    `tables` 有两个来源（sites 行的 `data_tables`，以及 event 的覆盖值，见调用处），
+    任何一条被污染都会让一次下线删掉**别人的**数据表。表在创建时就打了
+    `site_id` tag，从前只是从不回读。
+
+    核不出来（tag 缺失/不匹配/读失败）一律**不删**并抛错：调用方把它落成
+    `purged["dynamodb_error"]` → job 状态 `PURGE_FAILED`，用户看到的是"站点已下线，
+    但数据清理未全部完成"，而不是把残留报成完全成功。
+
+    **已知边界**：读 tag 与 `DeleteTable` 之间有 TOCTOU 窗口。按本仓库既有约定，
+    这类校验失败一律 fail-closed 并记录原因，不做乐观删除。
     """
     ddb = boto3.client("dynamodb")
     deleted = []
     for t in tables:
+        # **让 TableOwnershipUnconfirmed 直接冒出去，不要 continue**：静默跳过会让
+        # "没删掉别人的表"与"本站本来就没有这张表"长得一样，用户拿到的下线报告仍是
+        # "完全成功"，而残留数据无人知晓。
+        # read_attempts=1：这张表不是刚建的，没有 tag 可见性延迟可等
+        common.assert_table_owned_by_site(ddb, site_id, t, read_attempts=1)
         name = common.site_table_name(site_id, t)
         try:
             ddb.delete_table(TableName=name)

@@ -707,3 +707,212 @@ def test_no_module_hand_rolls_the_tier_engine_mapping():
                 offenders.append(f"{py.relative_to(root)}:{node.lineno}")
     assert not offenders, (
         f"这些表达式内联了 tier→engine，必须改调 common.tier_engine：{offenders}")
+
+
+# ── 物理表名对 logical 必须单射（M01 的残留半边）─────────────────────────────
+#
+# 去掉通配之后，那个"精确 ARN"仍然是**拼**出来的，而 logical 由 manifest 提供、
+# 攻击者可控。logical 也允许 `-` 时：
+#   A（id `aa-en3d3a`）声明 `b-rd8fhn-notes`  ⎫ 拼出同一张表
+#   B（id `aa-en3d3a-b-rd8fhn`）声明 `notes`  ⎭ site-data-aa-en3d3a-b-rd8fhn-notes
+# ⇒ A 的精确 ARN 就是 B 的数据表，且 A 的 data_tables 也会记下它 ⇒ 对 A 执行
+# purge_data 会删掉 B 的表。已端到端复现。
+#
+# **断言形式要注意**：修好之后 `site_table_name(A, "b-rd8fhn-notes")` 应该**抛错**，
+# 而不是"返回一个与 B 不同的名字"。所以下面拆成四条，不把"两个名字不相等"当唯一
+# 判据——那种写法在 runtime guard 被删、只剩 validator 时仍会绿。
+
+_COLLIDE_A = "aa-en3d3a"
+_COLLIDE_B = "aa-en3d3a-b-rd8fhn"
+_COLLIDE_LOGICAL = "b-rd8fhn-notes"      # A 声明它就会指到 B 的表
+
+
+def test_site_table_name_refuses_a_logical_name_with_a_hyphen():
+    """判据一：唯一定义处 fail-closed。"""
+    import common
+    import pytest
+    with pytest.raises(common.InvalidTableName, match="连字符"):
+        common.site_table_name(_COLLIDE_A, _COLLIDE_LOGICAL)
+
+
+def test_site_table_name_refuses_malformed_logical_names():
+    import common
+    import pytest
+    for bad in (None, "", 123, []):
+        with pytest.raises(common.InvalidTableName):
+            common.site_table_name(_COLLIDE_A, bad)
+    for bad_site in (None, "", 123):
+        with pytest.raises(common.InvalidTableName):
+            common.site_table_name(bad_site, "notes")
+
+
+def test_site_policy_cannot_be_made_to_point_at_another_site_table(monkeypatch):
+    """判据三：`site_policy` 压根生成不出 B 的表 ARN。
+
+    这条比"policy 里没有 B 的 ARN"强：它证明的是**造不出来**，而不是"这次恰好
+    没造出来"。当年 merged review 要求的回归用例只覆盖 A 老实声明自己表名的场景。
+    """
+    import common
+    import pytest
+    monkeypatch.setenv("ACCOUNT_ID", "111122223333")
+    with pytest.raises(common.InvalidTableName):
+        common.site_policy(_COLLIDE_A, "dynamodb", tables=[_COLLIDE_LOGICAL])
+
+
+def test_site_policy_still_grants_exact_arns_for_legal_names(monkeypatch):
+    """判据四：**正对照**——合法 logical 名下仍是逐表精确 ARN、无通配。
+
+    没有这一条，把 site_policy 改成"永远抛错"也能让上面几条绿；而"表名不再含
+    连字符"更不能变成重新引入 `site-data-{id}-*` 通配的理由（那就是 M01 本身）。
+    """
+    import json
+
+    import common
+    monkeypatch.setenv("ACCOUNT_ID", "111122223333")
+    pol = json.loads(common.site_policy("notes-01d147", "dynamodb",
+                                        tables=["notes", "books"]))
+    ddb_res = [r for st in pol["Statement"]
+               for r in (st["Resource"] if isinstance(st["Resource"], list)
+                         else [st["Resource"]])
+               if ":table/" in r]
+    assert len(ddb_res) == 2, f"应逐表枚举，得到 {ddb_res}"
+    assert not any("*" in r for r in ddb_res), f"出现通配：{ddb_res}"
+    assert {r.split(":table/")[-1] for r in ddb_res} == {
+        "site-data-notes-01d147-notes", "site-data-notes-01d147-books"}
+
+
+def test_runtime_guard_matches_the_contract_table_name_rule():
+    """runtime 的拒绝条件必须与合同的 `TABLE_NAME_RE` 对齐——**两边都不许单独放宽**。
+
+    `common.py` 刻意**不** import `contract.schema`：它被复制进 deployer / MCP /
+    panel / key-proxy 四个产物，而只有 deployer 的 step Lambda 带 contract 包，为
+    "唯一定义"引入 ImportError 会是一次与安全无关的部署回归。代价是两处判据可能
+    漂移，所以由这条测试把它们绑起来（测试环境两个包都在）。
+
+    只断言**安全性质**的那一半（含 `-` 必拒 / 合法名必过），不要求 runtime 复制完整
+    字符集——完整校验是 validator 的职责。
+    """
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parents[3] / "site-builder/contract/src"))
+    from contract.schema import TABLE_NAME_RE
+
+    import common
+    import pytest
+
+    # 合同放行的名字，runtime 必须都能拼
+    for good in ("notes", "my_notes", "n", "t0"):
+        assert TABLE_NAME_RE.fullmatch(good), f"样例 {good!r} 选错了"
+        assert common.site_table_name("s-abc123", good) == f"site-data-s-abc123-{good}"
+
+    # 合同因**连字符**而拒的名字，runtime 也必须拒（这是单射所需的那一半）
+    for bad in ("my-notes", _COLLIDE_LOGICAL, "-notes", "notes-"):
+        assert TABLE_NAME_RE.fullmatch(bad) is None, f"样例 {bad!r} 选错了"
+        with pytest.raises(common.InvalidTableName):
+            common.site_table_name("s-abc123", bad)
+
+
+# ── 归属核验（tag 从只写变成会回读）───────────────────────────────────────
+
+def _mk_table(ddb, site_id, logical, *, tags=True, owner=None, pk="id"):
+    import common
+    name = common.site_table_name(site_id, logical)
+    kw = dict(TableName=name,
+              KeySchema=[{"AttributeName": pk, "KeyType": "HASH"}],
+              AttributeDefinitions=[{"AttributeName": pk, "AttributeType": "S"}],
+              BillingMode="PAY_PER_REQUEST")
+    if tags:
+        kw["Tags"] = [{"Key": "project", "Value": "site-builder"},
+                      {"Key": "site_id", "Value": owner or site_id}]
+    ddb.create_table(**kw)
+    return name
+
+
+def test_assert_table_owned_by_site_accepts_our_own_table(aws):
+    import boto3
+    import common
+    ddb = boto3.client("dynamodb")
+    _mk_table(ddb, "notes-01d147", "notes")
+    arn = common.assert_table_owned_by_site(
+        ddb, "notes-01d147", "notes",
+        expect_key_schema=[{"AttributeName": "id", "KeyType": "HASH"}],
+        expect_attribute_definitions=[{"AttributeName": "id",
+                                       "AttributeType": "S"}])
+    assert arn.endswith("table/site-data-notes-01d147-notes")
+
+
+def test_assert_table_owned_by_site_rejects_a_foreign_site_tag(aws):
+    """tag 说它属于别的站点 ⇒ 拒。这是碰撞被利用时的最后一道门。"""
+    import boto3
+    import common
+    import pytest
+    ddb = boto3.client("dynamodb")
+    # 表名算作 A 的，但 tag 上写着 B —— 正是碰撞落地后的形态
+    _mk_table(ddb, "aa-en3d3a", "notes", owner="somebody-else-x1")
+    with pytest.raises(common.TableOwnershipUnconfirmed, match="另一个站点"):
+        common.assert_table_owned_by_site(ddb, "aa-en3d3a", "notes",
+                                          read_attempts=1)
+
+
+def test_assert_table_owned_by_site_rejects_a_table_without_tags(aws):
+    """没有 tag ⇒ 归属未确认 ⇒ 拒。**不许降级成"那就当它是我的"**。"""
+    import boto3
+    import common
+    import pytest
+    ddb = boto3.client("dynamodb")
+    _mk_table(ddb, "notes-01d147", "notes", tags=False)
+    with pytest.raises(common.TableOwnershipUnconfirmed, match="归属未确认"):
+        common.assert_table_owned_by_site(ddb, "notes-01d147", "notes",
+                                          read_attempts=1)
+
+
+def test_assert_table_owned_by_site_rejects_our_own_table_with_a_different_schema(aws):
+    """是本站的表、但 schema 与本次声明不符 ⇒ 也要拒。
+
+    否则会被静默当成一次成功的幂等重试，而站点代码按新 schema 读写一张旧结构的表。
+    """
+    import boto3
+    import common
+    import pytest
+    ddb = boto3.client("dynamodb")
+    _mk_table(ddb, "notes-01d147", "notes", pk="id")
+    with pytest.raises(common.TableOwnershipUnconfirmed, match="KeySchema"):
+        common.assert_table_owned_by_site(
+            ddb, "notes-01d147", "notes",
+            expect_key_schema=[{"AttributeName": "note_id", "KeyType": "HASH"}])
+
+
+def test_assert_table_owned_by_site_rejects_a_missing_table(aws):
+    import boto3
+    import common
+    import pytest
+    ddb = boto3.client("dynamodb")
+    with pytest.raises(common.TableOwnershipUnconfirmed, match="describe_table"):
+        common.assert_table_owned_by_site(ddb, "notes-01d147", "nosuch")
+
+
+def test_table_tags_paginates(aws, monkeypatch):
+    """`ListTagsOfResource` 带 NextToken，不分页会读到不完整的 tag 集合。
+
+    不完整与"缺 site_id tag"在调用方那里是同一个结论 ⇒ 会把自家表误判成外站表。
+    这里用一个分两页的假客户端锁住分页行为（moto 每页 10 条，真实 tag 只有 2 个，
+    所以行为差异在真机上要等 tag 变多才暴露——那时就太晚了）。
+    """
+    import common
+
+    class _Paged:
+        def __init__(self):
+            self.calls = []
+
+        def list_tags_of_resource(self, **kw):
+            self.calls.append(kw.get("NextToken"))
+            if not kw.get("NextToken"):
+                return {"Tags": [{"Key": "project", "Value": "site-builder"}],
+                        "NextToken": "page2"}
+            return {"Tags": [{"Key": "site_id", "Value": "notes-01d147"}]}
+
+    fake = _Paged()
+    tags = common.table_tags(fake, "arn:aws:dynamodb:us-east-1:1:table/x")
+    assert tags == {"project": "site-builder", "site_id": "notes-01d147"}, \
+        f"没把两页合起来：{tags}"
+    assert fake.calls == [None, "page2"], f"分页调用序列不对：{fake.calls}"

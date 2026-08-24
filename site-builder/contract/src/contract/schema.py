@@ -8,7 +8,26 @@ TIER_ENGINE = {"static": "none", "fullstack-nosql": "dynamodb", "fullstack-sql":
 # site-*，见 M7-SPEC §2.1），它由入口的 `common.validate_site_name` 单点拦下——
 # 不在这里复制一份：规则抄成两处就迟早对不上。
 NAME_RE = re.compile(r"[a-z][a-z0-9-]{1,29}")
-TABLE_RE = re.compile(r"[a-z][a-z0-9_-]{0,29}")
+# **表名与属性名的字符集刻意不同，不要再合成一条。**
+#
+# 表名会成为物理资源名的一段：`site-data-{site_id}-{表名}`
+# （`common.site_table_name`，那里是该格式的唯一定义）。而 site_id 自身可含 `-`，
+# 所以只要表名也允许 `-`，两个**不同**站点就能拼出同一个物理表名——站点 A
+# （id `aa-en3d3a`）声明表名 `b-rd8fhn-notes`，与站点 B（id `aa-en3d3a-b-rd8fhn`）
+# 声明表名 `notes` 得到同一张表，于是 A 的 per-site IAM 精确 ARN 就是 B 的数据表。
+#
+# 禁掉表名里的 `-` 是**构造性**消除，不是缓解：若 `A + "-" + la == B + "-" + lb`
+# 且 A≠B，不妨 |A|<|B|，则该串在下标 |A| 与 |B| 处都是 `-`，而 |B| ≥ |A|+1 意味着
+# 下标 |B| 落在 `la` 内部 ⇒ `la` 必含 `-`。所以表名无 `-` ⇒ 碰撞不可能
+# （证明只用到表名的字符集，与 site_id 的字符集无关）。
+#
+# 表名还会变成 Lambda 环境变量名 `TABLE_<NAME>`（`provision_dynamodb`），而 Lambda
+# 的键不接受 `-`——从前那种表名会一路走到部署后段才失败。
+#
+# 属性名（pk）**不参与**任何资源名，DynamoDB 本身也接受 `-`，所以不跟着收紧：
+# 那属于与本条安全性质无关的合同收窄。
+TABLE_NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,29}")
+ATTRIBUTE_NAME_RE = re.compile(r"[a-z][a-z0-9_-]{0,29}")
 EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 
 
@@ -65,9 +84,19 @@ def validate_manifest(manifest: dict) -> list[str]:
                     errors.append(f"database.tables: 每项必须为对象: {t!r}")
                     continue
                 tname, tpk = t.get("name"), t.get("pk")
-                if (not isinstance(tname, str) or not TABLE_RE.fullmatch(tname)
-                        or not isinstance(tpk, str) or not TABLE_RE.fullmatch(tpk)):
-                    errors.append(f"database.tables: 表名/主键须匹配 {TABLE_RE.pattern}: {t}")
+                # **两个字段各出一条信息**：合成一条时，一个误伤 pk 的回归会与"表名
+                # 不合法"长得一模一样，用例也分辨不出来（原来就是合成的）。
+                bad = []
+                if not isinstance(tname, str) or not TABLE_NAME_RE.fullmatch(tname):
+                    bad.append(
+                        f"表名须匹配 {TABLE_NAME_RE.pattern}"
+                        "——**不得含连字符 `-`**（表名会成为物理表名与环境变量名"
+                        " TABLE_<NAME> 的一段），请改用下划线 `_`")
+                if not isinstance(tpk, str) or not ATTRIBUTE_NAME_RE.fullmatch(tpk):
+                    bad.append(f"主键属性名须匹配 {ATTRIBUTE_NAME_RE.pattern}"
+                               "（属性名允许 `-`）")
+                if bad:
+                    errors.append(f"database.tables: {'；'.join(bad)}: {t}")
                 else:
                     names.append(tname)
             if len(names) != len(set(names)):
