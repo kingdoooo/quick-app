@@ -1,0 +1,344 @@
+{
+  "schema": 1,
+  "note": "account trust boundary baseline — 只存 ARN 指纹（仓库红线：真实账号值/角色名不进被跟踪文件）。见 docs/security/account-trust-boundary.md 与 scripts/verify_account_trust_boundary.py。",
+  "categories": [
+    "platform",
+    "admin",
+    "break-glass",
+    "cdk-admin",
+    "cdk-readonly",
+    "unrelated-workload",
+    "unclassified"
+  ],
+  "principals": {
+    "0863eab89de0f66a": {
+      "category": "cdk-readonly",
+      "capabilities": [
+        "read-edge-code",
+        "read-jwt-param"
+      ]
+    },
+    "0875135080ce3cb7": {
+      "category": "platform",
+      "capabilities": [
+        "invoke-platform"
+      ]
+    },
+    "0e8a6e3411481013": {
+      "category": "cdk-admin",
+      "capabilities": [
+        "invoke-platform",
+        "invoke-site",
+        "read-edge-code",
+        "read-jwt-param",
+        "replace-platform-code",
+        "self-escalate"
+      ]
+    },
+    "0fd48891e33162db": {
+      "category": "break-glass",
+      "capabilities": [
+        "read-edge-code",
+        "self-escalate"
+      ]
+    },
+    "1091eab7f6277939": {
+      "category": "admin",
+      "capabilities": [
+        "invoke-platform",
+        "invoke-site",
+        "read-edge-code",
+        "read-jwt-param",
+        "replace-platform-code",
+        "self-escalate"
+      ]
+    },
+    "2cfbdf6853f97163": {
+      "category": "admin",
+      "capabilities": [
+        "invoke-platform",
+        "invoke-site",
+        "read-edge-code",
+        "read-jwt-param",
+        "replace-platform-code",
+        "self-escalate"
+      ]
+    },
+    "2dc504b7c6417514": {
+      "category": "cdk-admin",
+      "capabilities": [
+        "invoke-platform",
+        "invoke-site",
+        "read-edge-code",
+        "read-jwt-param",
+        "replace-platform-code",
+        "self-escalate"
+      ]
+    },
+    "300567b73cf732d8": {
+      "category": "unrelated-workload",
+      "capabilities": [
+        "read-jwt-param"
+      ]
+    },
+    "33b8feb078a137f2": {
+      "category": "break-glass",
+      "capabilities": [
+        "read-edge-code"
+      ]
+    },
+    "40c489d594ba9d38": {
+      "category": "unrelated-workload",
+      "capabilities": [
+        "read-jwt-param"
+      ]
+    },
+    "4d8c9dc187870e23": {
+      "category": "unrelated-workload",
+      "capabilities": [
+        "read-jwt-param"
+      ]
+    },
+    "58c971a64a37bcdd": {
+      "category": "admin",
+      "capabilities": [
+        "invoke-platform",
+        "invoke-site",
+        "read-edge-code",
+        "replace-platform-code"
+      ]
+    },
+    "5950c48656c00a04": {
+      "category": "break-glass",
+      "capabilities": [
+        "read-edge-code"
+      ]
+    },
+    "5f641c7384700267": {
+      "category": "unrelated-workload",
+      "capabilities": [
+        "read-jwt-param"
+      ]
+    },
+    "6335054bf140e1fd": {
+      "category": "unrelated-workload",
+      "capabilities": [
+        "invoke-platform",
+        "invoke-site",
+        "read-edge-code",
+        "replace-platform-code",
+        "self-escalate"
+      ]
+    },
+    "67a80d2cdbe6eb6d": {
+      "category": "unrelated-workload",
+      "capabilities": [
+        "invoke-platform",
+        "invoke-site",
+        "read-edge-code",
+        "read-jwt-param",
+        "replace-platform-code",
+        "self-escalate"
+      ]
+    },
+    "6fe6b342933ba57c": {
+      "category": "unrelated-workload",
+      "capabilities": [
+        "invoke-platform",
+        "invoke-site"
+      ]
+    },
+    "7271c80ac2362862": {
+      "category": "platform",
+      "capabilities": [
+        "invoke-platform",
+        "invoke-site"
+      ]
+    },
+    "73b22dbb9b87b16c": {
+      "category": "unrelated-workload",
+      "capabilities": [
+        "read-jwt-param"
+      ]
+    },
+    "7f04d93173400133": {
+      "category": "break-glass",
+      "capabilities": [
+        "self-escalate"
+      ]
+    },
+    "88270238fbb14df9": {
+      "category": "platform",
+      "capabilities": [
+        "invoke-platform",
+        "read-jwt-param"
+      ]
+    },
+    "8ab5b6dfaac81782": {
+      "category": "unrelated-workload",
+      "capabilities": [
+        "invoke-platform",
+        "invoke-site",
+        "read-edge-code",
+        "read-jwt-param",
+        "replace-platform-code",
+        "self-escalate"
+      ]
+    },
+    "8c51d1804c6203de": {
+      "category": "unrelated-workload",
+      "capabilities": [
+        "invoke-platform",
+        "invoke-site",
+        "read-edge-code",
+        "read-jwt-param",
+        "replace-platform-code",
+        "self-escalate"
+      ]
+    },
+    "8c896bef767ffc09": {
+      "category": "platform",
+      "capabilities": [
+        "invoke-site"
+      ]
+    },
+    "91d96686394fdb55": {
+      "category": "unrelated-workload",
+      "capabilities": [
+        "invoke-platform",
+        "invoke-site",
+        "read-edge-code"
+      ]
+    },
+    "9a35c6f7f991d306": {
+      "category": "cdk-admin",
+      "capabilities": [
+        "invoke-platform",
+        "invoke-site",
+        "read-edge-code",
+        "read-jwt-param",
+        "replace-platform-code",
+        "self-escalate"
+      ]
+    },
+    "a4475b6b18cfc500": {
+      "category": "unrelated-workload",
+      "capabilities": [
+        "read-jwt-param"
+      ]
+    },
+    "a7a1342e4772b933": {
+      "category": "break-glass",
+      "capabilities": [
+        "read-edge-code",
+        "self-escalate"
+      ]
+    },
+    "a8f14466bd8e5de7": {
+      "category": "unrelated-workload",
+      "capabilities": [
+        "invoke-platform",
+        "invoke-site",
+        "read-edge-code",
+        "read-jwt-param"
+      ]
+    },
+    "ac117e605f156f3d": {
+      "category": "unrelated-workload",
+      "capabilities": [
+        "read-jwt-param"
+      ]
+    },
+    "b0c2807383c10c17": {
+      "category": "unrelated-workload",
+      "capabilities": [
+        "invoke-platform",
+        "invoke-site",
+        "read-edge-code",
+        "read-jwt-param",
+        "replace-platform-code",
+        "self-escalate"
+      ]
+    },
+    "b93008fbd8ac8638": {
+      "category": "cdk-readonly",
+      "capabilities": [
+        "read-edge-code",
+        "read-jwt-param"
+      ]
+    },
+    "be357d7084efdfee": {
+      "category": "unrelated-workload",
+      "capabilities": [
+        "read-jwt-param"
+      ]
+    },
+    "c0701e84e2b03b1c": {
+      "category": "platform",
+      "capabilities": [
+        "read-jwt-param"
+      ]
+    },
+    "c2e3212e60d6d13c": {
+      "category": "unrelated-workload",
+      "capabilities": [
+        "invoke-platform",
+        "invoke-site",
+        "read-edge-code",
+        "read-jwt-param",
+        "replace-platform-code",
+        "self-escalate"
+      ]
+    },
+    "c2fb773a0b912d7e": {
+      "category": "break-glass",
+      "capabilities": [
+        "invoke-platform",
+        "invoke-site",
+        "read-edge-code",
+        "read-jwt-param",
+        "replace-platform-code",
+        "self-escalate"
+      ]
+    },
+    "c6a290294b5a3033": {
+      "category": "unrelated-workload",
+      "capabilities": [
+        "invoke-platform",
+        "invoke-site",
+        "read-edge-code",
+        "read-jwt-param",
+        "replace-platform-code",
+        "self-escalate"
+      ]
+    },
+    "cc42876bbddc8427": {
+      "category": "platform",
+      "capabilities": [
+        "invoke-platform"
+      ]
+    },
+    "d43b071211e17b96": {
+      "category": "unrelated-workload",
+      "capabilities": [
+        "invoke-platform",
+        "invoke-site",
+        "read-edge-code",
+        "read-jwt-param"
+      ]
+    },
+    "f5ddaf88f2bfe8e0": {
+      "category": "cdk-readonly",
+      "capabilities": [
+        "read-edge-code",
+        "read-jwt-param"
+      ]
+    },
+    "ffb8d400f4f64cf0": {
+      "category": "break-glass",
+      "capabilities": [
+        "read-edge-code"
+      ]
+    }
+  }
+}
