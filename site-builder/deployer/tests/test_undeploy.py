@@ -549,3 +549,61 @@ def test_purge_refuses_a_hyphenated_table_name_from_a_poisoned_row(aws, monkeypa
     assert not [c for c in calls if c[0] == "DeleteTable"]
     assert common.get_job(jid)["status"] == "PURGE_FAILED"
     assert "site-data-hello-x1-notes" in ddb.list_tables()["TableNames"]
+
+
+# ── purge 的幂等性：表不存在 = 该表清理已完成，不是"归属未确认" ──────────────
+#
+# Codex 复审 8f8b0c6 的 P2-1：归属核验把 describe 的 ResourceNotFoundException
+# 一律包成 TableOwnershipUnconfirmed，于是"上一次 purge 已删掉的表"在重试里被
+# 判成失败，而且循环在第一张就中断——多表站点部分失败后**永远收敛不到**后面的表。
+# 三态才是对的：不存在→完成；存在且本站→删；存在但归属不明→拒（上面那几条）。
+
+
+def test_purge_succeeds_when_the_table_is_already_gone(aws):
+    """单表已不存在（上次删过 / 从未建成）⇒ purge 幂等成功，job DELETED。"""
+    import undeploy, common
+    jid = _seed(common, boto3)
+    common.upsert_site("hello-x1", data_tables=["notes"])   # 表并不存在
+    with patch.object(undeploy, "_lambda", return_value=_lam_mock()):
+        out = undeploy.handler({"job_id": jid, "site_id": "hello-x1",
+                                "purge_data": True}, None)
+    job = common.get_job(jid)
+    assert job["status"] == "DELETED", \
+        f"已完成的清理被报成 {job['status']}：{job.get('error')}"
+    assert out["purged"]["dynamodb"] == []
+
+
+def test_purge_retry_converges_past_an_already_deleted_table(aws):
+    """两表 [已删, 还在]：重试必须跳过前者、**真的删掉**后者。
+
+    没有三态时流程在第一张就中断，第二张永远轮不到——这正是"永久无法收敛"。
+    第二张按 describe 抛 NotFound 断言，不只看 job 终态。
+    """
+    import undeploy, common
+    ddb = boto3.client("dynamodb")
+    _make_site_table(ddb, "site-data-hello-x1-b", "hello-x1")
+    jid = _seed(common, boto3)
+    common.upsert_site("hello-x1", data_tables=["a", "b"])  # a 已被上一次删掉
+    with patch.object(undeploy, "_lambda", return_value=_lam_mock()):
+        out = undeploy.handler({"job_id": jid, "site_id": "hello-x1",
+                                "purge_data": True}, None)
+    assert common.get_job(jid)["status"] == "DELETED"
+    assert out["purged"]["dynamodb"] == ["site-data-hello-x1-b"]
+    assert "site-data-hello-x1-b" not in ddb.list_tables()["TableNames"], \
+        "第二张表没有真的被删——收敛只停留在 job 状态上"
+
+
+def test_absent_tables_do_not_relax_ownership_checks_for_the_rest(aws, monkeypatch):
+    """两表 [已删, 外站 tag]：跳过前者**不等于**放宽后者的归属核验。"""
+    import undeploy, common
+    ddb = boto3.client("dynamodb")
+    _make_site_table(ddb, "site-data-hello-x1-theirs", "somebody-else-x9")
+    jid = _seed(common, boto3)
+    common.upsert_site("hello-x1", data_tables=["gone", "theirs"])
+    calls = _spy_dynamodb(monkeypatch)
+    with patch.object(undeploy, "_lambda", return_value=_lam_mock()):
+        undeploy.handler({"job_id": jid, "site_id": "hello-x1",
+                          "purge_data": True}, None)
+    assert common.get_job(jid)["status"] == "PURGE_FAILED"
+    assert not [c for c in calls if c[0] == "DeleteTable"]
+    assert "site-data-hello-x1-theirs" in ddb.list_tables()["TableNames"]

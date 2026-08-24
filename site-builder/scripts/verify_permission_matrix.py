@@ -46,6 +46,11 @@ ADMIN = f"probe-admin-{SUFFIX}@example.invalid"
 NEW_OWNER = f"probe-newowner-{SUFFIX}@example.invalid"
 
 results: list[tuple[bool, str, str]] = []
+# **一项都没跑完 ≠ 通过**：曾在连接异常中断时打印"0/0 项通过"，读起来像验收成功。
+# 下限必须跟上实际检查项数（当前 26，含 G/H 两节）：停在旧值 20 的话，把 G/H
+# 整段误删后旧的 21 项照样 >= 20，闸门重新报绿（Codex 复审 8f8b0c6 的 P3-1）。
+# `tests/test_verify_permission_matrix.py` 锁住 >= 26。
+MIN_CHECKS = 26
 created_sites: set[str] = set()
 created_routes: set[str] = set()
 TMP_ADMINS = f"site-admins-permprobe-{SUFFIX}"
@@ -352,8 +357,10 @@ def main() -> int:
           "成功的权限写入留下了 result=ok 的审计行", str(by_action)[:90])
     check(any("denied" in v for v in by_action.values()),
           "被拒的操作留下了 result=denied 的审计行", str(by_action)[:90])
-    check("reject_policy_projection" in by_action,
-          "坏数据行拒绝投影留下了 reject_policy_projection 审计行",
+    # 断言到 result 一级，不止 action 键存在：G 节真拒了投影时 result 必须是
+    # rejected——只查键存在的话，一条 result 写错的行也能让闸门绿。
+    check("rejected" in by_action.get("reject_policy_projection", set()),
+          "坏数据行拒绝投影留下了 result=rejected 的审计行",
           str(sorted(by_action))[:90])
 
     return 0
@@ -419,9 +426,7 @@ if __name__ == "__main__":
         failed = sum(1 for ok, _, _ in results if not ok)
         left = cleanup(_region, _keep and failed > 0)
         print()
-        # **一项都没跑完 ≠ 通过**：上一版在连接异常中断时打印"0/0 项通过"，
-        # 读起来像验收成功。断言脚本必须有下限——少于预期项数一律不可信。
-        MIN_CHECKS = 20
+        # 下限常量在模块顶部（单测锁住 >= 26）——少于预期项数一律不可信。
         if len(results) < MIN_CHECKS:
             print(f"结果：只跑了 {len(results)} 项（预期 ≥{MIN_CHECKS}）—— "
                   "验收**未完成**，状态不可信，不要当成通过")

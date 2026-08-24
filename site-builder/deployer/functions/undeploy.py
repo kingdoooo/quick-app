@@ -53,17 +53,29 @@ def _purge_dynamodb(site_id: str, tables: list[str]) -> list[str]:
     ddb = boto3.client("dynamodb")
     deleted = []
     for t in tables:
-        # **让 TableOwnershipUnconfirmed 直接冒出去，不要 continue**：静默跳过会让
-        # "没删掉别人的表"与"本站本来就没有这张表"长得一样，用户拿到的下线报告仍是
-        # "完全成功"，而残留数据无人知晓。
+        # 归属核验是**三态**的（Codex 复审 8f8b0c6 的 P2-1）：
+        #   · 表不存在（仅 ResourceNotFoundException）⇒ 该表清理已完成——上一次
+        #     purge 删过或从未建成。这是**完成态不是未知态**，必须 continue，否则
+        #     多表站点部分失败后的重试会在第一张已删表就中断、永远收敛不到后面的表；
+        #   · 表存在且 tag 属本站 ⇒ 删；
+        #   · 归属不明（外站 tag / 无 tag / describe 或读 tag 失败）⇒ **让
+        #     TableOwnershipUnconfirmed 直接冒出去，不要 continue**：静默跳过会让
+        #     "没删掉别人的表"与"本站本来就没有这张表"长得一样，用户拿到的下线
+        #     报告仍是"完全成功"，而残留数据无人知晓。
         # read_attempts=1：这张表不是刚建的，没有 tag 可见性延迟可等
-        common.assert_table_owned_by_site(ddb, site_id, t, read_attempts=1)
+        arn = common.assert_table_owned_by_site(ddb, site_id, t,
+                                                read_attempts=1,
+                                                allow_absent=True)
+        if arn is None:
+            logger.info("表 %s 已不存在，视为清理完成（幂等重试）",
+                        common.site_table_name(site_id, t))
+            continue
         name = common.site_table_name(site_id, t)
         try:
             ddb.delete_table(TableName=name)
             deleted.append(name)
         except ddb.exceptions.ResourceNotFoundException:
-            pass
+            pass                    # assert 与 delete 之间被并发删掉：同样是完成态
     return deleted
 
 

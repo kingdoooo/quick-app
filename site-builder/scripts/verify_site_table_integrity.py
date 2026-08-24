@@ -42,9 +42,9 @@ def check(ok: bool, name: str, detail: str = "") -> None:
     print(f"  {'PASS' if ok else 'FAIL'}  {name}" + (f"  [{detail}]" if detail else ""))
 
 
-def _load_config() -> tuple[str, str]:
-    """→ (region, sites_table)。**直接赋值不用 setdefault**：config.ini 是唯一取值来源，
-    setdefault 会让 shell 里残留的旧 SITES_TABLE 静默改掉核对目标。"""
+def _load_config() -> tuple[str, str, str]:
+    """→ (region, sites_table, account_id)。**直接赋值不用 setdefault**：config.ini 是
+    唯一取值来源，setdefault 会让 shell 里残留的旧 SITES_TABLE 静默改掉核对目标。"""
     path = HERE.parent / "config.ini"
     if not path.exists():
         raise SystemExit(f"找不到 {path}——从 config.ini.example 复制并填好再跑")
@@ -52,27 +52,32 @@ def _load_config() -> tuple[str, str]:
     cfg.read(path)
     try:
         region = cfg["Platform"]["region"].split("#")[0].strip()
+        account_id = cfg["Platform"]["account_id"].split("#")[0].strip()
         sites_table = cfg["Deployer"]["sites_table"].split("#")[0].strip()
     except KeyError as e:
         raise SystemExit(f"config.ini 缺少 {e}") from e
     os.environ["AWS_DEFAULT_REGION"] = region
     os.environ["SITES_TABLE"] = sites_table
-    return region, sites_table
+    return region, sites_table, account_id
 
 
-def _assert_target_account(region: str) -> str:
-    """当前凭证必须指向 config.ini 描述的那个账号。
+def _assert_target_account(region: str, expected_account_id: str) -> str:
+    """当前凭证必须**严格等于** `[Platform] account_id`（backfill 同款读法）。
 
     没有这一条时，把闸门跑在另一个账号上会得到一串"表不存在"的 FAIL，读起来像
     生产故障；更糟的是**全绿**——空账号里零个站点、零个角色，集合相等平凡成立。
+
+    不许用"账号号出现在 config.ini 任意位置"的全文 substring（Codex 复审指出）：
+    文件里任何位置恰好出现另一个账号号（ARN/注释/历史值）都会让闸门在错误账号上
+    继续跑，而那正是上面要防的假绿。
     """
     ident = boto3.client("sts", region_name=region).get_caller_identity()
     acct = ident["Account"]
-    cfg_text = (HERE.parent / "config.ini").read_text(encoding="utf-8")
-    if acct not in cfg_text:
+    if acct != expected_account_id:
         raise SystemExit(
-            f"当前凭证的账号（…{acct[-4:]}）没有出现在 config.ini 里——"
-            "本闸门会核错对象，中止。先确认 AWS_PROFILE / 凭证。")
+            f"当前凭证的账号（…{acct[-4:]}）不是 config.ini 的 [Platform] "
+            f"account_id（…{expected_account_id[-4:]}）——本闸门会核错对象，中止。"
+            "先确认 AWS_PROFILE / 凭证。")
     return acct
 
 
@@ -110,7 +115,7 @@ def _role_table_arns(iam, role_name: str) -> set:
     return arns
 
 
-def role_arn_problems(site_id: str, engine: str, role_arns: set,
+def role_arn_problems(site_id: str, engine: str, role_arns,
                       owned_by_site: dict) -> list:
     """判定一个 per-site 角色的表 ARN 集合是否合规 → 问题描述列表（空 = 合规）。
 
@@ -119,6 +124,12 @@ def role_arn_problems(site_id: str, engine: str, role_arns: set,
     所以判定逻辑不能只活在读 AWS 的 `main()` 里——
     `deployer/tests/test_verify_site_table_integrity.py` 喂三种坏形态给它。
 
+    `role_arns=None` 表示**角色不存在**。角色存在性按 engine 分流（决策收在这里，
+    不散在 main()）：static（engine=`none`）契约上就没有 `site-rt-*` 运行时角色
+    （`ensure_site_role` 只被 deploy_lambda_site / provision_dsql 调用，backfill
+    也按此跳过），角色缺失是合法态；dynamodb / dsql 站点角色缺失则是故障。
+    角色**存在**的 static 站点不豁免：表 ARN 集合必须为空（tier 变迁残留的能力面）。
+
     `owned_by_site`: `{site_id: 经表 tag 验证过的表 ARN 集合}`。**必须整个传进来**，
     不能只传本站那一份：判"多出来的 ARN 是不是属于别的站点"需要看全局，而那正是
     本闸门要抓的越权形态。
@@ -126,6 +137,11 @@ def role_arn_problems(site_id: str, engine: str, role_arns: set,
     判据是**同一个 site_id 的精确集合相等**，不是"每个 ARN 都指向某张有效的表"——
     后者会把 A 的角色指向 B 的表判成绿（别站的表当然也"有效"）。
     """
+    if role_arns is None:
+        if engine == "none":
+            return []                # static 无运行时角色，符合契约
+        return [f"ACTIVE 站点没有 per-site 角色（engine={engine} 必须有）"]
+
     problems = []
     wild = [a for a in sorted(role_arns) if "*" in a.split(":table/", 1)[-1]]
     if wild:
@@ -161,8 +177,8 @@ def main() -> int:
     sys.path.insert(0, str(HERE.parent / "contract" / "src"))
     from contract.schema import TABLE_NAME_RE
 
-    region, sites_table = _load_config()
-    acct = _assert_target_account(region)
+    region, sites_table, account_id = _load_config()
+    acct = _assert_target_account(region, account_id)
     ddb = boto3.client("dynamodb", region_name=region)
     ddb_res = boto3.resource("dynamodb", region_name=region)
     iam = boto3.client("iam")
@@ -229,13 +245,13 @@ def main() -> int:
         try:
             role_arns = _role_table_arns(iam, role)
         except iam.exceptions.NoSuchEntityException:
-            check(False, f"{role} 存在", "ACTIVE 站点没有 per-site 角色")
-            continue
+            role_arns = None         # 角色不存在——是否合法由纯函数按 engine 判
         problems = role_arn_problems(site_id, engine, role_arns, owned_arns)
         check(not problems,
               f"{role}（engine={engine}）的表 ARN 集合与本站点自己的表精确相等",
               "；".join(problems) if problems
-              else f"{len(owned_arns.get(site_id, ()))} 张")
+              else ("static 站点无运行时角色（符合契约）" if role_arns is None
+                    else f"{len(owned_arns.get(site_id, ()))} 张"))
 
     print()
     if FAILURES:

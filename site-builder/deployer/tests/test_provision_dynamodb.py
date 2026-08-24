@@ -141,6 +141,131 @@ def test_env_key_guard_catches_names_that_would_break_lambda(aws):
     assert provision_dynamodb._env_key("my_notes") == "TABLE_MY_NOTES"
 
 
+# ── 已存在的表还要**就绪**（TableStatus=ACTIVE），归属正确不等于可以进 Lambda 部署 ──
+#
+# Codex 复审 8f8b0c6 的 P3-2（存量缺口，不是该提交引入的回归——旧代码的 waiter 在
+# try 内，create 抛 ResourceInUseException 时同样不执行）：上一次运行在 create 成功后、
+# waiter 处中断 ⇒ 重试看到的是 CREATING 的表；把它当完成会直落 data_tables 并进
+# Lambda 部署，站点上线即报错。DELETING 的表则该经有界 waiter 超时 fail-closed。
+
+
+def _never_ready(monkeypatch):
+    """把 table_exists waiter 钉死为"永远等不到 ACTIVE"。
+
+    botocore 动态生成的 waiter 子类把 wait 委托给 `Waiter.wait`，patch 基类即可。
+    """
+    import botocore.exceptions
+    import botocore.waiter
+
+    def _raise(self, **kw):
+        raise botocore.exceptions.WaiterError(
+            name="TableExists", reason="Max attempts exceeded",
+            last_response={})
+
+    monkeypatch.setattr(botocore.waiter.Waiter, "wait", _raise)
+
+
+def test_an_existing_table_still_creating_is_not_treated_as_done(aws, monkeypatch):
+    """阶段一：本站的表已存在（tag/schema 都对）但还是 CREATING ⇒ 不许当完成。"""
+    import botocore.client
+    import botocore.exceptions
+    import common
+    import provision_dynamodb
+    ddb = boto3.client("dynamodb")
+    common.create_job("a@x.com", "notes-a1b2c3")
+    _foreign_table(ddb, "site-data-notes-a1b2c3-notes", "notes-a1b2c3")  # 本站 tag
+
+    orig = botocore.client.BaseClient._make_api_call
+
+    def _still_creating(self, op, params):
+        out = orig(self, op, params)
+        if op == "DescribeTable":
+            out["Table"]["TableStatus"] = "CREATING"
+        return out
+
+    monkeypatch.setattr(botocore.client.BaseClient, "_make_api_call",
+                        _still_creating)
+    _never_ready(monkeypatch)
+
+    with pytest.raises(botocore.exceptions.WaiterError):
+        provision_dynamodb.handler(dict(EVENT), None)
+    assert "data_tables" not in (common.get_site("notes-a1b2c3") or {}), \
+        "CREATING 的表被当成完成写进了 data_tables"
+
+
+def test_a_concurrently_created_table_must_also_reach_active(aws, monkeypatch):
+    """阶段二：create 与并发方相撞、归属核验通过 ⇒ 仍要等它 ACTIVE。"""
+    import botocore.client
+    import botocore.exceptions
+    import common
+    import provision_dynamodb
+    ddb = boto3.client("dynamodb")
+    common.create_job("a@x.com", "notes-a1b2c3")
+    # 并发方已建出本站的表；预检时把它藏起来（第一次 DescribeTable 报不存在），
+    # 于是本方走 create → 撞 ResourceInUseException → 归属核验通过
+    _foreign_table(ddb, "site-data-notes-a1b2c3-notes", "notes-a1b2c3")
+
+    orig = botocore.client.BaseClient._make_api_call
+    hidden = {"done": False}
+
+    def _hide_once(self, op, params):
+        if (op == "DescribeTable"
+                and params.get("TableName") == "site-data-notes-a1b2c3-notes"
+                and not hidden["done"]):
+            hidden["done"] = True
+            raise ddb.exceptions.ResourceNotFoundException(
+                {"Error": {"Code": "ResourceNotFoundException",
+                           "Message": "gone"}}, "DescribeTable")
+        return orig(self, op, params)
+
+    monkeypatch.setattr(botocore.client.BaseClient, "_make_api_call",
+                        _hide_once)
+    _never_ready(monkeypatch)
+
+    with pytest.raises((botocore.exceptions.WaiterError, RuntimeError)):
+        provision_dynamodb.handler(dict(EVENT), None)
+    assert "data_tables" not in (common.get_site("notes-a1b2c3") or {})
+
+
+def test_concurrent_create_racing_with_a_foreign_table_is_refused(aws, monkeypatch):
+    """预检时不存在 → create 时撞外站表 ⇒ 拒（Codex 复审点名必补的竞态分支）。
+
+    这是原 P1 在"预检与创建之间"的竞态版本：现有的阶段一外站用例只盖 describe
+    分支，把 `except ResourceInUseException` 改回 `pass` 时它仍然绿——只有这条
+    能咬住那个回退。
+    """
+    import botocore.client
+    import common
+    import provision_dynamodb
+    ddb = boto3.client("dynamodb")
+    common.create_job("a@x.com", "notes-a1b2c3")
+    _foreign_table(ddb, "site-data-notes-a1b2c3-notes", "somebody-else-x1")
+
+    orig = botocore.client.BaseClient._make_api_call
+    hidden = {"done": False}
+
+    def _hide_once(self, op, params):
+        if (op == "DescribeTable"
+                and params.get("TableName") == "site-data-notes-a1b2c3-notes"
+                and not hidden["done"]):
+            hidden["done"] = True
+            raise ddb.exceptions.ResourceNotFoundException(
+                {"Error": {"Code": "ResourceNotFoundException",
+                           "Message": "gone"}}, "DescribeTable")
+        return orig(self, op, params)
+
+    monkeypatch.setattr(botocore.client.BaseClient, "_make_api_call",
+                        _hide_once)
+
+    with pytest.raises(common.TableOwnershipUnconfirmed, match="另一个站点"):
+        provision_dynamodb.handler(dict(EVENT), None)
+    assert "data_tables" not in (common.get_site("notes-a1b2c3") or {}), \
+        "竞态撞上外站表后仍把表名写进了 data_tables"
+    assert [t for t in ddb.list_tables()["TableNames"]
+            if t.startswith("site-data-notes-a1b2c3")] == \
+        ["site-data-notes-a1b2c3-notes"], "不该有任何新表被建出来"
+
+
 def test_tables_are_created_with_ownership_tags(aws):
     """建表必须打 tag——归属核验全靠它，而从前没有任何用例断言过 tag 存在。"""
     import provision_dynamodb, common

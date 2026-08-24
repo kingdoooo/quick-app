@@ -36,6 +36,17 @@ def _env_key(logical: str) -> str:
     return key
 
 
+def _wait_active(ddb, table_name: str) -> None:
+    """有界地等一张**已存在**的表到 ACTIVE。等不到就抛（fail-closed）。
+
+    上限约 2 分钟/表：本步骤的 Lambda 超时是 300s（infra/app.py 的 step_fn），
+    正常路径（表早已 ACTIVE）首次 describe 即返回，只有 CREATING/DELETING
+    这类罕见形态才会真的等。
+    """
+    ddb.get_waiter("table_exists").wait(
+        TableName=table_name, WaiterConfig={"Delay": 5, "MaxAttempts": 24})
+
+
 def handler(event, context):
     common.update_job(event["job_id"], phase="provision-db")
     ddb = boto3.client("dynamodb")
@@ -63,6 +74,12 @@ def handler(event, context):
             ddb, site_id, logical,
             expect_key_schema=key_schema,
             expect_attribute_definitions=attr_defs)
+        # 归属正确 ≠ 就绪：上一次运行可能在 create 成功后、waiter 处中断，重试
+        # 看到的是 CREATING 的表；不等就会把它当完成、直落 data_tables 并进
+        # Lambda 部署（存量缺口，非 8f8b0c6 回归——旧代码撞 ResourceInUse 时
+        # 同样不跑 waiter）。DELETING 的表则在这里有界超时、fail-closed。
+        # waiter 仍是只读，不破坏"阶段一零写入"。
+        _wait_active(ddb, table_name)
         plan.append((logical, table_name, env_key, False, key_schema, attr_defs))
 
     # ── 阶段二：预检全过，才开始建表 ────────────────────────────────────
@@ -87,6 +104,8 @@ def handler(event, context):
                 ddb, site_id, logical,
                 expect_key_schema=key_schema,
                 expect_attribute_definitions=attr_defs)
+            # 并发方的表同样要等到 ACTIVE（与阶段一的已存在路径同一条理由）
+            _wait_active(ddb, table_name)
         except Exception as exc:              # noqa: BLE001 中途失败要报出已建的表
             raise RuntimeError(
                 f"建表 {table_name} 失败（{type(exc).__name__}: {exc}）。"

@@ -883,12 +883,56 @@ def test_assert_table_owned_by_site_rejects_our_own_table_with_a_different_schem
 
 
 def test_assert_table_owned_by_site_rejects_a_missing_table(aws):
+    """默认（allow_absent=False）"表不存在"仍是失败——这是 provision 的语义：
+    预检点看到过的表在 assert 时消失 = 并发删除，必须 fail-closed。"""
     import boto3
     import common
     import pytest
     ddb = boto3.client("dynamodb")
     with pytest.raises(common.TableOwnershipUnconfirmed, match="describe_table"):
         common.assert_table_owned_by_site(ddb, "notes-01d147", "nosuch")
+
+
+def test_allow_absent_returns_none_for_a_missing_table(aws):
+    """purge 的幂等重试靠它：表已删/从未建成 = 该表清理已完成 ⇒ 返回 None。"""
+    import boto3
+    import common
+    ddb = boto3.client("dynamodb")
+    assert common.assert_table_owned_by_site(
+        ddb, "notes-01d147", "nosuch", read_attempts=1, allow_absent=True) is None
+
+
+def test_allow_absent_only_covers_resource_not_found(aws):
+    """describe 抛的**不是** NotFound（限流/权限）⇒ allow_absent 下仍 fail-closed。
+
+    放宽这条，"跳过"就成了新的静默放行：一次可注入的读失败会让 purge 把
+    "没能确认"当成"已经删完"，残留数据无人知晓。
+    """
+    import common
+    import pytest
+
+    class _Broken:
+        class exceptions:
+            ResourceNotFoundException = type("NF", (Exception,), {})
+
+        def describe_table(self, **kw):
+            raise RuntimeError("throttled")
+
+    with pytest.raises(common.TableOwnershipUnconfirmed, match="describe_table"):
+        common.assert_table_owned_by_site(_Broken(), "notes-01d147", "notes",
+                                          read_attempts=1, allow_absent=True)
+
+
+def test_allow_absent_does_not_relax_the_ownership_check_itself(aws):
+    """表**存在**但 tag 属外站 ⇒ allow_absent=True 也必须拒。"""
+    import boto3
+    import common
+    import pytest
+    ddb = boto3.client("dynamodb")
+    _mk_table(ddb, "aa-en3d3a", "notes", owner="somebody-else-x1")
+    with pytest.raises(common.TableOwnershipUnconfirmed, match="另一个站点"):
+        common.assert_table_owned_by_site(ddb, "aa-en3d3a", "notes",
+                                          read_attempts=1, allow_absent=True)
 
 
 def test_table_tags_paginates(aws, monkeypatch):

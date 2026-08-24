@@ -38,6 +38,48 @@ def test_correct_state_is_green():
     assert g.role_arn_problems(A, "dynamodb", {ARN_A}, OWNED) == []
     assert g.role_arn_problems(B, "dynamodb", {ARN_B}, OWNED) == []
     assert g.role_arn_problems("dsql-site-x1", "dsql", set(), OWNED) == []
+    # static 的合法形态：没有运行时角色（role_arns=None 表示角色不存在）
+    assert g.role_arn_problems("static-x1", "none", None, OWNED) == []
+
+
+# ── 角色存在性按 engine 分流（Codex 复审 8f8b0c6 的 P2-2）────────────────────
+#
+# 契约：static（engine=none）站点没有 site-rt-* 运行时角色——`ensure_site_role`
+# 只被 deploy_lambda_site 与 provision_dsql 调用，backfill 也按此跳过。闸门对
+# static 也要求角色存在的话，第一个 ACTIVE static 站点就会把它打红（假红）。
+# `role_arns=None` 表示"角色不存在"，决策收在纯函数里，不散在 main()。
+#
+#   engine      角色不存在    角色存在但有 DynamoDB 表 ARN
+#   none        绿            红
+#   dynamodb    红            （继续做集合相等）
+#   dsql        红            红
+
+
+def test_a_static_site_without_a_role_is_green():
+    """Codex 点名的反向用例：ACTIVE static 行没有 site-rt-* 角色 ⇒ 闸门仍绿。"""
+    g = _gate()
+    assert g.role_arn_problems("static-x1", "none", None, OWNED) == []
+
+
+def test_a_nosql_site_with_no_role_at_all_is_caught():
+    """ACTIVE NoSQL 站点角色整个缺失 ⇒ 红（误删/清理脚本写错的形态）。"""
+    g = _gate()
+    problems = g.role_arn_problems(A, "dynamodb", None, OWNED)
+    assert problems and "没有 per-site 角色" in " ".join(problems), problems
+
+
+def test_a_dsql_site_with_no_role_at_all_is_caught():
+    """DSQL 站点同样必须有角色（dsql:DbConnect 挂在它上面）。"""
+    g = _gate()
+    problems = g.role_arn_problems("dsql-x1", "dsql", None, OWNED)
+    assert problems and "没有 per-site 角色" in " ".join(problems), problems
+
+
+def test_a_static_site_with_leftover_table_arns_is_caught():
+    """角色**存在**且带表 ARN 的 static 站点不豁免——tier 变迁残留的能力面。"""
+    g = _gate()
+    problems = g.role_arn_problems("static-x1", "none", {ARN_B}, OWNED)
+    assert problems and "不该有" in " ".join(problems), problems
 
 
 def test_a_role_pointing_at_another_sites_table_is_caught():

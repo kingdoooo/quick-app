@@ -608,7 +608,8 @@ def table_tags(ddb, table_arn: str, *, read_attempts: int = 3) -> dict:
 def assert_table_owned_by_site(ddb, site_id: str, logical: str, *,
                                expect_key_schema=None,
                                expect_attribute_definitions=None,
-                               read_attempts: int = 3) -> str:
+                               read_attempts: int = 3,
+                               allow_absent: bool = False):
     """确认**已存在**的 `site-data-{site_id}-{logical}` 真的属于 `site_id`。→ 表 ARN。
 
     不属于、形态不符、或核不出来，一律抛 `TableOwnershipUnconfirmed`。两个调用方都要
@@ -617,6 +618,13 @@ def assert_table_owned_by_site(ddb, site_id: str, logical: str, *,
         "这是我上次建的"。不核就等于把别人的表接管进本站的 `data_tables` 与 IAM 策略。
       · `undeploy._purge_dynamodb` 删表前——`data_tables` 有两个来源（sites 行与 event
         覆盖），任何一条被污染都会让下线动作删掉别人的表。
+
+    `allow_absent=True`（**只给 purge 用**）：表不存在 ⇒ 返回 `None` 而不是抛错——
+    对删除方而言"表已不存在"是**完成态**（上一次 purge 删过 / 从未建成），当失败处理
+    会让多表站点部分失败后的重试在第一张已删表就中断、永远收敛不到后面的表
+    （Codex 复审 8f8b0c6 的 P2-1）。**只有 `ResourceNotFoundException` 算不存在**：
+    describe 的其他失败（限流/权限）仍然抛——那是"没能确认"，不是"已经删完"。
+    provision 不许传它：预检点看到过的表在 assert 时消失 = 并发删除，必须失败。
 
     `expect_*` 只有 provision 会传：**"是本站旧表但 schema 不同"也必须失败**，否则会被
     静默当成一次成功的幂等重试，而站点代码按新 schema 读写一张旧结构的表。
@@ -631,7 +639,12 @@ def assert_table_owned_by_site(ddb, site_id: str, logical: str, *,
     name = site_table_name(site_id, logical)
     try:
         desc = ddb.describe_table(TableName=name)["Table"]
-    except Exception as exc:                  # noqa: BLE001 含 ResourceNotFoundException
+    except ddb.exceptions.ResourceNotFoundException as exc:
+        if allow_absent:
+            return None
+        raise TableOwnershipUnconfirmed(
+            f"describe_table({name}) 失败：{type(exc).__name__}: {exc}") from exc
+    except Exception as exc:                  # noqa: BLE001 读失败 ≠ 不存在，一律 fail-closed
         raise TableOwnershipUnconfirmed(
             f"describe_table({name}) 失败：{type(exc).__name__}: {exc}") from exc
 
