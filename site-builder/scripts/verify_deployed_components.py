@@ -75,7 +75,7 @@ results: list[tuple[bool, str, str]] = []
 # **只数不可 SKIP 的项**：非 Edge 直连那条在当前身份无 InvokeFunctionUrl 权限时
 # 合法地 SKIP（那时的 403 来自 IAM 而不是 handler，算 PASS 就是假绿）。
 MIN_LOCAL_CHECKS = 15       # ① 合规 8 + ② 违规 7
-MIN_DEPLOYED_CHECKS = 20    # ③ 2 + ④ 2 + ⑤ 7 + ⑥ 3 + ⑦ 6
+MIN_DEPLOYED_CHECKS = 21    # ③ 3（redlines + schema + 守卫/handler 聚合）+ ④ 2 + ⑤ 7 + ⑥ 3 + ⑦ 6
 # ⑧ 只在 [ApiKey] 段存在（组件启用）时计入：产物 1 + 环境变量 2 + scope 1 +
 # Function URL 3 + EDGE_ROLE_ID 1 + 环境变量整体 1 + route 6 + Edge 白名单 1 +
 # runtime 3 + 哨兵行 2 + role 2 = 23
@@ -95,6 +95,51 @@ min_expected = MIN_LOCAL_CHECKS
 def check(ok: bool, name: str, detail: str = "") -> None:
     results.append((ok, name, detail))
     print(f"  {'PASS' if ok else 'FAIL'}  {name}" + (f"  [{detail}]" if detail else ""))
+
+
+# 共享守卫模块：不在某个函数包里是正常打包差异；在包里就必须与本地一致。
+GUARDED_SHARED = ("common.py", "permissions.py", "register_route.py")
+# validate 包必须带且必须一致的 contract 文件：redlines（红线扫描）+ schema
+# （表名字符集——碰撞 manifest 的拒绝规则住在这里，只比 redlines 等于没验主体）。
+CONTRACT_GUARDED = ("redlines.py", "schema.py")
+
+
+def deployer_fn_mismatches(fname: str, handler_file: str,
+                           zip_hashes: dict, local_hashes: dict) -> list:
+    """一个 site-deployer-* 函数包的比对判定 → 不一致清单（空 = 一致）。
+
+    值是内容哈希；键缺失 = 该文件不存在。与共享模块不同，**函数自己的 handler
+    是必核项**：包里缺失、本地缺失、哈希不同都算问题——本轮的安全行为（归属
+    核验 / purge 三态 / waiter）全在 handler 里，只比三件套会把"common 新、
+    handler 旧"的半量部署判成全绿（Codex deployed-state 复审 2026-08-24）。
+    反向验证在 `deployer/tests/test_verify_deployed_components.py`。
+    """
+    problems = []
+    zh, lh = zip_hashes.get(handler_file), local_hashes.get(handler_file)
+    if zh is None:
+        problems.append(f"{fname}:{handler_file}(包里缺失)")
+    elif lh is None:
+        problems.append(f"{fname}:{handler_file}(本地缺失——handler 改名/删除？)")
+    elif zh != lh:
+        problems.append(f"{fname}:{handler_file}")
+    for base in GUARDED_SHARED:
+        zh, lh = zip_hashes.get(base), local_hashes.get(base)
+        if zh is not None and lh is not None and zh != lh:
+            problems.append(f"{fname}:{base}")
+    return problems
+
+
+def contract_mismatches(zip_hashes: dict, local_hashes: dict) -> list:
+    """validate 包的 contract 文件判定：**缺失或不一致都红**——contract 文件
+    只存在于 validate 包，"不在包里"不是可豁免的打包差异，而是校验器整个没上。"""
+    problems = []
+    for base in CONTRACT_GUARDED:
+        zh, lh = zip_hashes.get(base), local_hashes.get(base)
+        if zh is None:
+            problems.append(f"contract/{base}(包里缺失)")
+        elif zh != lh:
+            problems.append(f"contract/{base}")
+    return problems
 
 
 # ---- 真实项目风格：合规，必须放行 ----
@@ -438,52 +483,64 @@ def run_deployed() -> None:
     print(f"  {fn}  LastModified="
           f"{lam.get_function_configuration(FunctionName=fn)['LastModified']}")
     zf = _fetch_package(lam, fn)
-    names = [n for n in zf.namelist() if n.endswith("contract/redlines.py")]
-    if not names:
-        check(False, "部署包里找不到 contract/redlines.py",
-              "打包方式变了？先核对 CDK bundling")
-        return
-    deployed = zf.read(names[0]).decode()
-    local = (ROOT / "site-builder/contract/src/contract/redlines.py").read_text()
-    d_sha = hashlib.sha256(deployed.encode()).hexdigest()[:12]
-    l_sha = hashlib.sha256(local.encode()).hexdigest()[:12]
-    check(d_sha == l_sha,
-          "线上 redlines.py == 本地 redlines.py",
-          f"线上 {d_sha} / 本地 {l_sha}"
-          + ("" if d_sha == l_sha
-             else " —— **线上仍是旧 scanner**，需重新部署 SiteDeployerStack"))
-    # 即便 sha 不同也给出具体差异，便于判断"差的是不是本轮修复"
-    if d_sha != l_sha:
+    # contract 文件逐个比（redlines + schema）：判定在 contract_mismatches
+    # （纯函数、可反向验证），这里逐文件出一条 check 便于定位。
+    zip_hashes: dict = {}
+    deployed_texts: dict = {}
+    for base in CONTRACT_GUARDED:
+        names = [n for n in zf.namelist() if n.endswith(f"contract/{base}")]
+        if names:
+            blob = zf.read(names[0])
+            zip_hashes[base] = hashlib.sha256(blob).hexdigest()
+            deployed_texts[base] = blob.decode()
+    local_hashes = {
+        base: hashlib.sha256(
+            (ROOT / "site-builder/contract/src/contract" / base).read_bytes()
+        ).hexdigest()
+        for base in CONTRACT_GUARDED}
+    problems = contract_mismatches(zip_hashes, local_hashes)
+    for base in CONTRACT_GUARDED:
+        bad = [p for p in problems if f"contract/{base}" in p]
+        check(not bad, f"线上 contract/{base} == 本地",
+              bad[0] + " —— **线上仍是旧校验器**，需重新部署 SiteDeployerStack"
+              if bad else zip_hashes[base][:12])
+    # redlines 不一致时给出具体差异，便于判断"差的是不是本轮修复"
+    if any("redlines" in p for p in problems) and "redlines.py" in deployed_texts:
+        deployed = deployed_texts["redlines.py"]
         for marker, why in (
                 ("_header_holder_names", "关联判定（解码必须对应这个头）"),
                 ("_balanced_arg", "括号配平（支持嵌套调用）"),
                 ("keep_header", "头名保留（注释里的假解码仍被抹）")):
             check(marker in deployed, f"线上含 {marker} —— {why}")
 
-    # **守卫本体也要核**（2026-08-08 独立审查指出的缺口）：几轮修的缺陷绝大多数
-    # 在 permissions.py / register_route.py / common.py 里，只比 redlines.py
-    # 等于漏掉了主体。逐个函数包核对，才抓得住"部分 Lambda 没更新"这种半量部署。
-    guarded = {
-        "permissions.py": ROOT / "site-builder/deployer/functions/permissions.py",
-        "register_route.py": ROOT / "site-builder/deployer/functions/register_route.py",
-        "common.py": ROOT / "site-builder/deployer/functions/common.py",
-    }
-    fns = [f["FunctionName"] for f in lam.list_functions()["Functions"]
-           if f["FunctionName"].startswith("site-deployer-")]
+    # **守卫本体 + 各自 handler 都要核**（2026-08-08 独立审查 + Codex
+    # deployed-state 复审 2026-08-24 两轮指出的缺口）：只比三件套会漏掉
+    # "common 新、handler 旧"的半量部署——而本轮安全行为（归属核验 / purge
+    # 三态 / waiter）全在 provision_dynamodb.py / undeploy.py 这类 handler 里。
+    # handler 模块从**部署定义**派生（Handler 形如 "undeploy.handler"），不手抄
+    # 函数名→文件名映射；list_functions 分页取（默认单页 50，超了会静默截断）。
+    fn_dir = ROOT / "site-builder/deployer/functions"
+    fns = []
+    for page in lam.get_paginator("list_functions").paginate():
+        fns.extend(f for f in page["Functions"]
+                   if f["FunctionName"].startswith("site-deployer-"))
     mismatched: list[str] = []
-    for fname in sorted(fns):
+    for f in sorted(fns, key=lambda x: x["FunctionName"]):
+        fname = f["FunctionName"]
+        handler_file = f["Handler"].rsplit(".", 1)[0] + ".py"
         z = _fetch_package(lam, fname)
         pkg = set(z.namelist())
-        for base, path in guarded.items():
-            if base not in pkg:
-                continue        # 该函数包里没有这个模块，正常（打包差异）
-            if (hashlib.sha256(z.read(base)).hexdigest()
-                    != hashlib.sha256(path.read_bytes()).hexdigest()):
-                mismatched.append(f"{fname}:{base}")
+        candidates = set(GUARDED_SHARED) | {handler_file}
+        fz_hashes = {b: hashlib.sha256(z.read(b)).hexdigest()
+                     for b in candidates if b in pkg}
+        fl_hashes = {b: hashlib.sha256((fn_dir / b).read_bytes()).hexdigest()
+                     for b in candidates if (fn_dir / b).exists()}
+        mismatched += deployer_fn_mismatches(fname, handler_file,
+                                             fz_hashes, fl_hashes)
     check(not mismatched,
-          f"{len(fns)} 个 site-deployer-* 函数里的守卫模块都与本地一致",
+          f"{len(fns)} 个 site-deployer-* 函数的守卫三件套 + 各自 handler 逐包一致",
           "不一致: " + ", ".join(mismatched[:5]) if mismatched
-          else "permissions/register_route/common 三件套逐包核对通过")
+          else "permissions/register_route/common + handler 逐包核对通过")
 
     # **auth 服务也要核**：它此前完全没被任何闸门覆盖，结果 SSM TTL 修复
     # （提交 7238471）在仓库里躺了两天没上线，靠人手查 LastModified 才发现
