@@ -135,7 +135,6 @@ def _targets(g, *, platform=("site-panel", "site-deployer-undeploy"),
         edge_code_arns=(fn("edge"),),
         edge_assets=tuple(assets),
         jwt_parameter="arn:aws:ssm:us-east-1:1:parameter/site-builder/jwt-secret",
-        any_role="arn:aws:iam::1:role/*",
         alias_arns=dict(aliases or {}),
         version_arns=dict(versions or {}))
 
@@ -195,8 +194,9 @@ def test_site_subset_records_the_count_so_widening_reds():
     two = g.grants_from_decisions(
         {f"lambda:InvokeFunction|{fn('site-a')}": "allowed",
          f"lambda:InvokeFunction|{fn('site-b')}": "allowed"}, t)
-    assert one == {"invoke-site:some(1)"}
-    assert two == {"invoke-site:some(2)"}
+    assert len(one) == len(two) == 1
+    assert next(iter(one)).startswith("invoke-site:some(1):")
+    assert next(iter(two)).startswith("invoke-site:some(2):")
     assert one != two
 
 
@@ -293,7 +293,7 @@ def test_site_resource_policies_share_one_fingerprint_after_normalization():
     归一化后必须得到**同一个**指纹，否则规范形态无从建立、每建一个站点都漂移。"""
     g = _gate()
     snap = _snap(g, sites=("site-a", "site-b", "site-c"), qualifier="blue")
-    alias_sets = {tuple(v["alias"]) for v in snap["sites"].values()}
+    alias_sets = {tuple(v["alias"]["blue"]) for v in snap["sites"].values()}
     assert len(alias_sets) == 1, alias_sets
     canon = g.site_shape_canonicals(snap["sites"])
     assert len(canon["site_alias_canonical"]) == 1
@@ -308,7 +308,7 @@ def test_canonical_alias_shape_is_the_mode_not_the_union():
                  extra_on="site-c")
     canon = g.site_shape_canonicals(snap["sites"])
     assert len(canon["site_alias_canonical"]) == 1, canon
-    assert set(canon["site_alias_canonical"]) < set(snap["sites"]["site-c"]["alias"])
+    assert set(canon["site_alias_canonical"]) < set(snap["sites"]["site-c"]["alias"]["blue"])
 
 
 def test_legacy_sites_land_in_the_exempt_list_not_a_global_shape():
@@ -342,7 +342,8 @@ def test_site_missing_its_alias_statement_is_also_flagged():
     这不是安全扩权而是功能损坏，但同属"投影与真源不一致"，要红。"""
     g = _gate()
     clean = _snap(g, sites=("site-a", "site-b"), qualifier="blue")["sites"]
-    stripped = {**clean, "site-b": {"alias": [], "version": [], "unqualified": []}}
+    stripped = {**clean, "site-b": {"alias": {"blue": []}, "version": [],
+                                    "unqualified": []}}
     observed = _with_required(g, {})
     baseline = {**_baseline_of(observed),
                 "resource_policies": {"platform": {}, **g.site_shape_canonicals(clean)}}
@@ -569,6 +570,8 @@ def test_doc_counts_come_from_the_baseline():
         "无关工作负载": count(lambda p: p["category"] == "unrelated-workload"),
         "带活密钥的asset": data["facts"]["edge_assets_carrying_live_key"],
         "带活密钥的Edge代码目标": data["facts"]["edge_code_targets_carrying_live_key"],
+        "持有IAM策略变更动作": count(
+            lambda p: any(x.startswith(g.G_IAM_POLICY_WRITE) for x in p["grants"])),
     }
     doc = _DOC.read_text(encoding="utf-8")
     for label, n in expected.items():
@@ -624,15 +627,22 @@ def test_ssm_read_is_an_action_class_not_one_action():
         assert g.G_READ_JWT_PARAM in grants, f"{action} 单独命中时没产生 grant"
 
 
-def test_self_escalate_is_an_action_class_too():
-    """自助提权同理：`PutRolePolicy` 只是其中一个动作。
-    这条不是 Codex 点的，是同一个错误类型的同类项，一并修掉。"""
+def test_iam_write_is_an_action_class_too():
+    """IAM 策略变更同理：`PutRolePolicy` 只是其中一个动作。
+
+    这条最初不是 Codex 点的（是同一个错误类型的同类项），但第三轮它指出我**资源**
+    那一侧仍然写错——四个动作统统对着字面量 `role/*` 模拟。资源侧的用例在下面。
+    """
     g = _gate()
     t = _targets(g)
-    assert len(g.A_SELF_ESCALATE) >= 3, f"动作等价类太窄：{g.A_SELF_ESCALATE}"
-    for action in g.A_SELF_ESCALATE:
-        grants = g.grants_from_decisions({f"{action}|{t.any_role}": "allowed"}, t)
-        assert g.G_SELF_ESCALATE in grants, f"{action} 单独命中时没产生 grant"
+    assert len(g.IAM_WRITE_ACTIONS) >= 4, f"动作等价类太窄：{g.IAM_WRITE_ACTIONS}"
+    for action in g.IAM_WRITE_ACTIONS:
+        cand = g.iam_write_candidates_from_statements(
+            [{"Effect": "Allow", "Action": action, "Resource": "*"}])
+        assert g.iam_write_grants(cand), f"{action} 单独命中时没产生 grant"
+    # 每个动作都必须有资源类型映射，否则又会拿错类型的 ARN 去问
+    for action in g.IAM_WRITE_ACTIONS:
+        assert g.iam_write_resource_kind(action) in ("role", "user", "policy")
 
 
 def test_every_live_key_asset_is_probed_not_only_the_current_one():
@@ -740,8 +750,9 @@ def test_platform_resource_policy_loss_is_a_failure():
     assert "site-panel" in rep.render()
 
 
-def _site_shape(alias_fps, unqualified_fps=()):
-    return {"alias": sorted(alias_fps), "unqualified": sorted(unqualified_fps)}
+def _site_shape(alias_fps, unqualified_fps=(), color="blue"):
+    return {"alias": {color: sorted(alias_fps)}, "version": [],
+            "unqualified": sorted(unqualified_fps)}
 
 
 def _rp_baseline(observed, *, exempt=()):
@@ -846,3 +857,281 @@ def test_edge_functions_are_in_the_platform_set():
     assert not (set(g.EDGE_FUNCTIONS) & set(from_app_py)), (
         "Edge 函数出现在 app.py 的清单里了——那说明这两处的分工变了，"
         "本条与 measure() 里的拼接都要重新想")
+
+
+# ==========================================================================
+# Codex 第三轮复审（2026-08-25）：三条 finding
+#
+# P1 又是同一个建模错误的第四次现身，只是这次错在**资源**那一侧：
+# `self-escalate` 的四个动作统统只对着 `arn:aws:iam::<acct>:role/*` 这个
+# **字面量**模拟。IAM 里请求资源是具体 ARN，policy 的 `role/ExactRole` 不会匹配
+# 字面量 `role/*` ⇒ 精确授权全部隐形；而 `iam:CreatePolicyVersion` 的资源类型
+# 根本是 **policy** 不是 role，对着 role ARN 模拟等于永远问不到。
+# 实测：22 个 principal 持有这些动作，其中 3 个在基线里缺这条 grant、
+# 3 个完全不在基线里。
+# ==========================================================================
+
+def test_iam_write_action_patterns_expand():
+    """动作通配要展开：`*` / `iam:*` / `iam:Put*` 都能命中。"""
+    g = _gate()
+    assert g.expand_iam_write_actions(["*"]) == set(g.IAM_WRITE_ACTIONS)
+    assert g.expand_iam_write_actions(["iam:*"]) == set(g.IAM_WRITE_ACTIONS)
+    assert g.expand_iam_write_actions(["iam:Put*"]) == {
+        a for a in g.IAM_WRITE_ACTIONS if a.startswith("iam:Put")}
+    assert g.expand_iam_write_actions(["s3:GetObject"]) == set()
+    assert g.expand_iam_write_actions(["iam:AttachRolePolicy"]) == {"iam:AttachRolePolicy"}
+
+
+def test_exact_arn_grant_is_discovered():
+    """**Codex 的核心反例**：`PutRolePolicy` 精确授在一个角色上。
+
+    对着字面量 `role/*` 模拟时它返回 implicitDeny ⇒ 首版完全看不见。
+    静态解析必须把它找出来（再由模拟器对**具体** ARN 确认）。
+    """
+    g = _gate()
+    st = [{"Effect": "Allow", "Action": "iam:PutRolePolicy",
+           "Resource": "arn:aws:iam::000000000000:role/ExactRole"}]
+    cand = g.iam_write_candidates_from_statements(st)
+    assert cand["actions"] == {"iam:PutRolePolicy"}
+    assert cand["targets"] == ["arn:aws:iam::000000000000:role/ExactRole"]
+    assert not cand["unrestricted"]
+
+
+def test_create_policy_version_targets_a_policy_not_a_role():
+    """`iam:CreatePolicyVersion` 的资源类型是 **policy**。
+
+    把它和 `PutRolePolicy` 混在同一个 role ARN 上模拟，是"资源等价类"写错的
+    另一种形态——那个组合永远不会 allowed（除了 `Resource:*`）。
+    """
+    g = _gate()
+    assert g.iam_write_resource_kind("iam:CreatePolicyVersion") == "policy"
+    assert g.iam_write_resource_kind("iam:PutRolePolicy") == "role"
+    assert g.iam_write_resource_kind("iam:PutUserPolicy") == "user"
+
+
+def test_unrestricted_target_is_marked_and_scoped_is_not():
+    g = _gate()
+    wide = g.iam_write_candidates_from_statements(
+        [{"Effect": "Allow", "Action": "iam:AttachRolePolicy", "Resource": "*"}])
+    narrow = g.iam_write_candidates_from_statements(
+        [{"Effect": "Allow", "Action": "iam:AttachRolePolicy",
+          "Resource": "arn:aws:iam::000000000000:role/site-rt-*"}])
+    assert wide["unrestricted"] and not narrow["unrestricted"]
+    assert g.iam_write_grants(wide) == {f"{g.G_IAM_POLICY_WRITE}:any"}
+    assert g.iam_write_grants(narrow) == {f"{g.G_IAM_POLICY_WRITE}:scoped"}
+    assert g.iam_write_grants({"actions": set(), "targets": [], "unrestricted": False}) == set()
+
+
+def test_not_action_allow_counts_as_a_hit():
+    """`Allow` + `NotAction` 基本等于"除了这些之外全给"，必须保守算命中，
+    不能因为解析不出具体动作就当没有。"""
+    g = _gate()
+    cand = g.iam_write_candidates_from_statements(
+        [{"Effect": "Allow", "NotAction": "s3:*", "Resource": "*"}])
+    assert cand["actions"] == set(g.IAM_WRITE_ACTIONS)
+    assert cand["unrestricted"]
+
+
+def test_deny_statements_do_not_create_candidates():
+    g = _gate()
+    cand = g.iam_write_candidates_from_statements(
+        [{"Effect": "Deny", "Action": "iam:*", "Resource": "*"}])
+    assert not cand["actions"]
+
+
+def test_url_encoded_policy_document_is_decoded():
+    """`GetAccountAuthorizationDetails` 有时把文档作为 **URL 编码的字符串**返回
+    （实测踩到过）。不解码就会静默漏掉整份策略。"""
+    g = _gate()
+    import json as _json
+    import urllib.parse
+    doc = {"Statement": [{"Effect": "Allow", "Action": "iam:PutRolePolicy",
+                          "Resource": "*"}]}
+    encoded = urllib.parse.quote(_json.dumps(doc))
+    assert g.policy_statements(encoded) == doc["Statement"]
+    assert g.policy_statements(doc) == doc["Statement"]
+    # 单条语句不是 list 的形态也要吃下
+    assert g.policy_statements({"Statement": doc["Statement"][0]}) == doc["Statement"]
+
+
+def test_concrete_target_makes_a_simulatable_arn():
+    """模拟器要的是**具体** ARN：`role/site-rt-*` 这种模式要落成一个具体名字，
+    否则又变成拿字面量去问。"""
+    g = _gate()
+    got = g.concrete_target("arn:aws:iam::000000000000:role/site-rt-*", "role",
+                            account="000000000000")
+    assert "*" not in got and got.startswith("arn:aws:iam::000000000000:role/site-rt-")
+    wide = g.concrete_target("*", "policy", account="000000000000")
+    assert wide.startswith("arn:aws:iam::000000000000:policy/")
+
+
+# ---- P2a：alias 类内部的成员变化 -----------------------------------------
+
+def _alias_shape(members, version=(), unqualified=()):
+    return {"alias": {k: sorted(v) for k, v in members.items()},
+            "version": sorted(version), "unqualified": sorted(unqualified)}
+
+
+def test_each_alias_member_must_carry_the_canonical_statements():
+    """**Codex 的 P2a 反例**：站点有 blue + green，其中 active 那个丢了授权语句。
+
+    按成员并集比时两者相加仍等于规范集合 ⇒ 绿。必须**逐成员**比。
+    （事实前提已核：blue/green 切换后旧颜色的 alias / Function URL / 两条语句
+    都保留，没有任何代码删它们，所以"每个 alias 都完整"不会误报。）
+    """
+    g = _gate()
+    observed = _with_required(g, {})
+    canon = ["aaaa-bbbb-cccc-dddd", "eeee-ffff-0000-1111"]
+    baseline = {**_baseline_of(observed),
+                "resource_policies": {"platform": {},
+                                      "site_alias_canonical": canon,
+                                      "site_version_canonical": [],
+                                      "site_legacy_canonical": [],
+                                      "site_legacy_exempt": []}}
+    rp = {"platform": {}, "sites": {
+        "site-a": _alias_shape({"blue": [], "green": canon})}}
+    rep = g.compare_to_baseline(observed, baseline, required=REQUIRED,
+                                resource_policies=rp)
+    assert not rep.ok, rep.render()
+    assert "blue" in rep.render()
+
+
+def test_two_complete_colors_do_not_drift():
+    """两个颜色都完整 ⇒ 绿。切一次颜色不该把基线拽红。"""
+    g = _gate()
+    observed = _with_required(g, {})
+    canon = ["aaaa-bbbb-cccc-dddd", "eeee-ffff-0000-1111"]
+    baseline = {**_baseline_of(observed),
+                "resource_policies": {"platform": {},
+                                      "site_alias_canonical": canon,
+                                      "site_version_canonical": [],
+                                      "site_legacy_canonical": [],
+                                      "site_legacy_exempt": []}}
+    rp = {"platform": {}, "sites": {
+        "site-a": _alias_shape({"blue": canon, "green": canon})}}
+    rep = g.compare_to_baseline(observed, baseline, required=REQUIRED,
+                                resource_policies=rp)
+    assert rep.ok, rep.render()
+
+
+def test_version_statements_are_compared_as_a_subset():
+    """版本级语句只做**子集**检查：AWS 的 replicator 语句只出现在当前 Edge 版本上，
+    旧版本合法地没有它——逐成员等值会把 1..8 全报成缺语句。"""
+    g = _gate()
+    observed = _with_required(g, {})
+    baseline = {**_baseline_of(observed),
+                "resource_policies": {"platform": {}, "site_alias_canonical": [],
+                                      "site_version_canonical": ["repl-icat-0000-0000"],
+                                      "site_legacy_canonical": [],
+                                      "site_legacy_exempt": []}}
+    ok_rp = {"platform": {}, "sites": {"site-a": _alias_shape({}, version=[])}}
+    assert g.compare_to_baseline(observed, baseline, required=REQUIRED,
+                                 resource_policies=ok_rp).ok
+    bad_rp = {"platform": {}, "sites": {
+        "site-a": _alias_shape({}, version=["repl-icat-0000-0000", "surp-rise-0000-0000"])}}
+    rep = g.compare_to_baseline(observed, baseline, required=REQUIRED,
+                                resource_policies=bad_rp)
+    assert not rep.ok, rep.render()
+
+
+# ---- P2b：站点子集换租户 --------------------------------------------------
+
+def test_site_subset_records_member_identity_not_just_count():
+    """**Codex 的 P2b 反例**：失去 site-a、新增 site-b，数量仍是 1。
+
+    只记数量时前后都是 `some(1)` ⇒ 受影响租户换了一批而闸门不动。
+    """
+    g = _gate()
+    fn = "arn:aws:lambda:us-east-1:1:function:{}".format
+    t = _targets(g, sites=("site-a", "site-b", "site-c"))
+    only_a = g.grants_from_decisions(
+        {f"lambda:InvokeFunction|{fn('site-a')}": "allowed"}, t)
+    only_b = g.grants_from_decisions(
+        {f"lambda:InvokeFunction|{fn('site-b')}": "allowed"}, t)
+    assert only_a and only_b
+    assert only_a != only_b, "同数量换租户没有产生不同的 grant"
+    # 数量仍要在 grant 里可读
+    assert all("some(1)" in x for x in only_a | only_b)
+
+
+def test_site_all_stays_a_stable_aggregate():
+    """`all` 必须保持稳定聚合——否则每建一个站点都把基线拽红。"""
+    g = _gate()
+    fn = "arn:aws:lambda:us-east-1:1:function:{}".format
+    t2 = _targets(g, sites=("site-a", "site-b"))
+    t3 = _targets(g, sites=("site-a", "site-b", "site-c"))
+    a2 = g.grants_from_decisions(
+        {f"lambda:InvokeFunction|{fn(n)}": "allowed" for n in ("site-a", "site-b")}, t2)
+    a3 = g.grants_from_decisions(
+        {f"lambda:InvokeFunction|{fn(n)}": "allowed"
+         for n in ("site-a", "site-b", "site-c")}, t3)
+    assert a2 == a3 == {"invoke-site:all"}
+
+
+# ---- IAM 写的确认有**三种**结果，不是两种 -------------------------------
+
+def test_iam_write_probe_outcomes_are_three_valued():
+    """确认步骤必须区分「确认有」「判不出」「确认没有」。
+
+    实测现场：一个角色的 `AttachRolePolicy` 被 `iam:PolicyARN` 的 ArnEquals 限定到
+    两个无害的 AWS 托管策略，模拟器返回 `implicitDeny` **且带
+    `MissingContextValues`**——那是"判不出"。首版把它静默当成"没有"，
+    于是这个 principal 连基线都进不去，而它的条件哪天被放宽也没人会看见。
+    """
+    g = _gate()
+    allowed_wide = g.iam_write_grants_from_probes(
+        [{"pattern": "*", "decision": "allowed", "missing_context": False}])
+    allowed_narrow = g.iam_write_grants_from_probes(
+        [{"pattern": "arn:aws:iam::000000000000:role/X", "decision": "allowed",
+          "missing_context": False}])
+    undecided = g.iam_write_grants_from_probes(
+        [{"pattern": "arn:aws:iam::000000000000:role/X", "decision": "implicitDeny",
+          "missing_context": True}])
+    denied = g.iam_write_grants_from_probes(
+        [{"pattern": "arn:aws:iam::000000000000:role/X", "decision": "implicitDeny",
+          "missing_context": False}])
+    assert allowed_wide == {f"{g.G_IAM_POLICY_WRITE}:any"}
+    assert allowed_narrow == {f"{g.G_IAM_POLICY_WRITE}:scoped"}
+    assert undecided == {f"{g.G_IAM_POLICY_WRITE}:condition-gated"}
+    assert denied == set()
+
+
+def test_confirmed_allow_wins_over_undecided():
+    """同一个 principal 既有确认的授权、又有判不出的条件语句时，
+    以**确认**的为准——不能被"判不出"降级。"""
+    g = _gate()
+    got = g.iam_write_grants_from_probes([
+        {"pattern": "arn:aws:iam::000000000000:role/X", "decision": "implicitDeny",
+         "missing_context": True},
+        {"pattern": "*", "decision": "allowed", "missing_context": False}])
+    assert got == {f"{g.G_IAM_POLICY_WRITE}:any"}
+
+
+def test_condition_gated_widening_shows_up_as_a_new_grant():
+    """条件被放宽（`condition-gated` → `scoped`/`any`）必须是**新** grant ⇒ 红。
+    这是"判不出"这个状态存在的全部理由。"""
+    g = _gate()
+    base = _with_required(g, _observed(
+        g, WorkloadA=[f"{g.G_IAM_POLICY_WRITE}:condition-gated"]))
+    now = _with_required(g, _observed(
+        g, WorkloadA=[f"{g.G_IAM_POLICY_WRITE}:any"]))
+    rep = g.compare_to_baseline(now, _baseline_of(base), required=REQUIRED)
+    assert not rep.ok
+    assert f"{g.G_IAM_POLICY_WRITE}:any" in rep.render()
+
+
+def test_concrete_target_normalizes_a_wildcard_account_segment():
+    """跨账号模式（`arn:aws:iam::*:role/datazone*`）的**账号段**也要落成本账号。
+
+    不换的话喂给模拟器的是 `arn:aws:iam::*:role/...`——字面量 `*` 恰好会被模式里的
+    `*` 匹配上，于是答案**碰巧**是对的。碰巧对的判据下一次就可能碰巧错。
+    """
+    g = _gate()
+    got = g.concrete_target("arn:aws:iam::*:role/datazone*", "role",
+                            account="000000000000")
+    assert got.startswith("arn:aws:iam::000000000000:role/datazone")
+    assert "*" not in got
+    pol = g.concrete_target("arn:aws:iam::*:policy/connector-*", "policy",
+                            account="000000000000")
+    assert pol.startswith("arn:aws:iam::000000000000:policy/connector-")
+    assert "*" not in pol

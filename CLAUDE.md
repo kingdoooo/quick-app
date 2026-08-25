@@ -109,7 +109,7 @@ RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/tes
 bash site-builder/scripts/smoke_router.sh    # 路由层冒烟（会写测试数据，跑完清理；含 65s 等 Edge 缓存）
 python3 site-builder/scripts/verify_console_e2e.py      # 控制台端到端
 python3 site-builder/scripts/verify_analytics_e2e.py    # 统计端到端（二期 M5）
-# 账号信任边界的漂移闸门（只读；400 个 principal × 2 次 IAM 模拟 + 扫 bootstrap 桶，约 9 分钟）
+# 账号信任边界的漂移闸门（只读；400 个 principal × 2 次 IAM 模拟 + IAM 写候选确认 + 扫 bootstrap 桶，约 11 分钟）
 python3 site-builder/scripts/verify_account_trust_boundary.py
 ```
 

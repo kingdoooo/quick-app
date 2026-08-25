@@ -501,14 +501,16 @@ exit "$m01_rc"
 `verify_console_e2e.py` + `smoke_router.sh`（控制台与路由层）。
 
 **还有一条不属于任何部署步骤的闸门**：`verify_account_trust_boundary.py`
-（只读；400 个 principal × 2 次 IAM 模拟 + 扫 bootstrap 桶 + 逐版本校验 Edge 代码，约 9 分钟）。它盯的不是
+（只读；400 个 principal × 2 次 IAM 模拟 + IAM 写候选逐个确认 + 扫 bootstrap 桶 + 逐版本校验 Edge 代码，约 11 分钟）。它盯的不是
 "这次部署对不对"，而是**这个 AWS 账号里能冒充任意用户的授权面有没有变大**——该面
 关不掉（管理账号 SCP 无效、Lambda 无 Deny API、对称签名的根就是那把可被只读权限
 取得的 HS256 密钥），所以纪律是"别再长"。它的形状是「一种能力 = 一个**动作等价类** × 一个**资源等价类**」——把它压成单个动作或
 单个资源的错误已经犯过三次（漏 alias、漏历史 asset、漏 `ssm:GetParameters`），每次都
-留下一个当时看不出来的 false-green。测三层：identity 授权（逐资源逐限定符，不压成布尔
-标签）、Lambda resource policy（**含每个 alias 与每个已发布版本**）、以及密钥三处明文
-副本的事实（每次实测比对 SHA-256，根治了闸门自己会知道）。
+留下一个当时看不出来的 false-green。测四层：identity 授权（逐资源逐限定符，不压成布尔
+标签）、**IAM 策略变更**（静态解析发现候选 + 模拟器对具体 ARN 三值确认——
+拿字面量 `role/*` 去问会让精确授权全部隐形）、Lambda resource policy（**含每个 alias
+与每个已发布版本**，站点 alias 逐颜色比）、以及密钥三处明文副本的事实
+（每次实测比对 SHA-256，根治了闸门自己会知道）。
 **触发条件是账号变化而不是本平台变化**：账号里新增任何工作负载（EC2 实例角色、
 SageMaker、EKS、另一套 CDK 栈…）之后跑一次。**改 Edge 之后也要跑**：每次 Edge 部署
 会在 bootstrap 桶里多留一个带活密钥的 asset。背景、实测证据与基线更新办法见

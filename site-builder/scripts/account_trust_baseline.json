@@ -14,12 +14,22 @@
   "facts": {
     "edge_code_targets_carrying_live_key": 10,
     "edge_assets_carrying_live_key": 9,
-    "principals_with_missing_context": 162
+    "principals_with_missing_context": 162,
+    "iam_write_candidates": 22,
+    "iam_write_confirmed": 20,
+    "iam_write_condition_gated": 2
   },
   "principals": {
+    "ec86-780f-f35e-0e72": {
+      "category": "unrelated-workload",
+      "grants": [
+        "iam-policy-write:condition-gated"
+      ]
+    },
     "c2e3-212e-60d6-d13c": {
       "category": "unrelated-workload",
       "grants": [
+        "iam-policy-write:any",
         "invoke-platform:ApplicationWebRouterStack-application-web-router",
         "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
@@ -65,13 +75,13 @@
         "replace-platform-code:site-deployer-upload_frontend",
         "replace-platform-code:site-deployer-validate",
         "replace-platform-code:site-key-proxy",
-        "replace-platform-code:site-panel",
-        "self-escalate"
+        "replace-platform-code:site-panel"
       ]
     },
     "3005-67b7-3cf7-32d8": {
       "category": "unrelated-workload",
       "grants": [
+        "iam-policy-write:condition-gated",
         "read-jwt-param"
       ]
     },
@@ -84,6 +94,7 @@
     "2cfb-df68-53f9-7163": {
       "category": "admin",
       "grants": [
+        "iam-policy-write:any",
         "invoke-platform:ApplicationWebRouterStack-application-web-router",
         "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
@@ -129,8 +140,7 @@
         "replace-platform-code:site-deployer-upload_frontend",
         "replace-platform-code:site-deployer-validate",
         "replace-platform-code:site-key-proxy",
-        "replace-platform-code:site-panel",
-        "self-escalate"
+        "replace-platform-code:site-panel"
       ]
     },
     "4d8c-9dc1-8787-0e23": {
@@ -208,8 +218,8 @@
     "a7a1-342e-4772-b933": {
       "category": "break-glass",
       "grants": [
-        "read-edge-code",
-        "self-escalate"
+        "iam-policy-write:scoped",
+        "read-edge-code"
       ]
     },
     "73b2-2dbb-9b87-b16c": {
@@ -256,6 +266,7 @@
     "91d9-6686-394f-db55": {
       "category": "unrelated-workload",
       "grants": [
+        "iam-policy-write:scoped",
         "invoke-platform:ApplicationWebRouterStack-application-web-router",
         "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
@@ -286,13 +297,14 @@
     "0fd4-8891-e331-62db": {
       "category": "break-glass",
       "grants": [
-        "read-edge-code",
-        "self-escalate"
+        "iam-policy-write:scoped",
+        "read-edge-code"
       ]
     },
     "c2fb-773a-0b91-2d7e": {
       "category": "break-glass",
       "grants": [
+        "iam-policy-write:any",
         "invoke-platform:ApplicationWebRouterStack-application-web-router",
         "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
@@ -338,13 +350,19 @@
         "replace-platform-code:site-deployer-upload_frontend",
         "replace-platform-code:site-deployer-validate",
         "replace-platform-code:site-key-proxy",
-        "replace-platform-code:site-panel",
-        "self-escalate"
+        "replace-platform-code:site-panel"
+      ]
+    },
+    "ece5-c1ff-0061-1c8e": {
+      "category": "break-glass",
+      "grants": [
+        "iam-policy-write:scoped"
       ]
     },
     "8c51-d180-4c62-03de": {
       "category": "unrelated-workload",
       "grants": [
+        "iam-policy-write:any",
         "invoke-platform:ApplicationWebRouterStack-application-web-router",
         "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
@@ -390,8 +408,7 @@
         "replace-platform-code:site-deployer-upload_frontend",
         "replace-platform-code:site-deployer-validate",
         "replace-platform-code:site-key-proxy",
-        "replace-platform-code:site-panel",
-        "self-escalate"
+        "replace-platform-code:site-panel"
       ]
     },
     "d72b-c996-a064-cba4": {
@@ -439,7 +456,7 @@
     "7f04-d931-7340-0133": {
       "category": "break-glass",
       "grants": [
-        "self-escalate"
+        "iam-policy-write:any"
       ]
     },
     "0875-1350-80ce-3cb7": {
@@ -465,6 +482,7 @@
     "c6a2-9029-4b5a-3033": {
       "category": "unrelated-workload",
       "grants": [
+        "iam-policy-write:any",
         "invoke-platform:ApplicationWebRouterStack-application-web-router",
         "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
@@ -510,8 +528,7 @@
         "replace-platform-code:site-deployer-upload_frontend",
         "replace-platform-code:site-deployer-validate",
         "replace-platform-code:site-key-proxy",
-        "replace-platform-code:site-panel",
-        "self-escalate"
+        "replace-platform-code:site-panel"
       ]
     },
     "58c9-71a6-4a37-bcdd": {
@@ -567,6 +584,7 @@
     "0e8a-6e34-1148-1013": {
       "category": "cdk-admin",
       "grants": [
+        "iam-policy-write:any",
         "invoke-platform:ApplicationWebRouterStack-application-web-router",
         "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
@@ -612,13 +630,13 @@
         "replace-platform-code:site-deployer-upload_frontend",
         "replace-platform-code:site-deployer-validate",
         "replace-platform-code:site-key-proxy",
-        "replace-platform-code:site-panel",
-        "self-escalate"
+        "replace-platform-code:site-panel"
       ]
     },
     "9a35-c6f7-f991-d306": {
       "category": "cdk-admin",
       "grants": [
+        "iam-policy-write:any",
         "invoke-platform:ApplicationWebRouterStack-application-web-router",
         "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
@@ -664,13 +682,13 @@
         "replace-platform-code:site-deployer-upload_frontend",
         "replace-platform-code:site-deployer-validate",
         "replace-platform-code:site-key-proxy",
-        "replace-platform-code:site-panel",
-        "self-escalate"
+        "replace-platform-code:site-panel"
       ]
     },
     "2dc5-04b7-c641-7514": {
       "category": "cdk-admin",
       "grants": [
+        "iam-policy-write:any",
         "invoke-platform:ApplicationWebRouterStack-application-web-router",
         "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
@@ -716,8 +734,7 @@
         "replace-platform-code:site-deployer-upload_frontend",
         "replace-platform-code:site-deployer-validate",
         "replace-platform-code:site-key-proxy",
-        "replace-platform-code:site-panel",
-        "self-escalate"
+        "replace-platform-code:site-panel"
       ]
     },
     "a0ca-27d9-899e-72a6": {
@@ -777,6 +794,7 @@
     "6335-054b-f140-e1fd": {
       "category": "unrelated-workload",
       "grants": [
+        "iam-policy-write:any",
         "invoke-platform:ApplicationWebRouterStack-application-web-router",
         "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
@@ -821,13 +839,13 @@
         "replace-platform-code:site-deployer-upload_frontend",
         "replace-platform-code:site-deployer-validate",
         "replace-platform-code:site-key-proxy",
-        "replace-platform-code:site-panel",
-        "self-escalate"
+        "replace-platform-code:site-panel"
       ]
     },
     "8ab5-b6df-aac8-1782": {
       "category": "unrelated-workload",
       "grants": [
+        "iam-policy-write:any",
         "invoke-platform:ApplicationWebRouterStack-application-web-router",
         "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
@@ -873,8 +891,7 @@
         "replace-platform-code:site-deployer-upload_frontend",
         "replace-platform-code:site-deployer-validate",
         "replace-platform-code:site-key-proxy",
-        "replace-platform-code:site-panel",
-        "self-escalate"
+        "replace-platform-code:site-panel"
       ]
     },
     "6924-1196-f8c1-20b8": {
@@ -978,6 +995,7 @@
     "b0c2-8073-83c1-0c17": {
       "category": "unrelated-workload",
       "grants": [
+        "iam-policy-write:any",
         "invoke-platform:ApplicationWebRouterStack-application-web-router",
         "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
@@ -1023,8 +1041,7 @@
         "replace-platform-code:site-deployer-upload_frontend",
         "replace-platform-code:site-deployer-validate",
         "replace-platform-code:site-key-proxy",
-        "replace-platform-code:site-panel",
-        "self-escalate"
+        "replace-platform-code:site-panel"
       ]
     },
     "6ea7-ef5d-60c8-4134": {
@@ -1037,6 +1054,12 @@
       "category": "unrelated-workload",
       "grants": [
         "read-edge-asset"
+      ]
+    },
+    "4a71-cd53-04cd-c5ab": {
+      "category": "unrelated-workload",
+      "grants": [
+        "iam-policy-write:scoped"
       ]
     },
     "4462-e661-a2f7-35f9": {
@@ -1054,6 +1077,7 @@
     "8c89-6bef-767f-fc09": {
       "category": "platform",
       "grants": [
+        "iam-policy-write:scoped",
         "invoke-site:all",
         "invoke-site@alias:all",
         "invoke-site@version:all"
@@ -1075,6 +1099,7 @@
     "67a8-0d2c-dbe6-eb6d": {
       "category": "unrelated-workload",
       "grants": [
+        "iam-policy-write:any",
         "invoke-platform:ApplicationWebRouterStack-application-web-router",
         "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
@@ -1120,13 +1145,13 @@
         "replace-platform-code:site-deployer-upload_frontend",
         "replace-platform-code:site-deployer-validate",
         "replace-platform-code:site-key-proxy",
-        "replace-platform-code:site-panel",
-        "self-escalate"
+        "replace-platform-code:site-panel"
       ]
     },
     "1091-eab7-f627-7939": {
       "category": "admin",
       "grants": [
+        "iam-policy-write:any",
         "invoke-platform:ApplicationWebRouterStack-application-web-router",
         "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
@@ -1172,8 +1197,7 @@
         "replace-platform-code:site-deployer-upload_frontend",
         "replace-platform-code:site-deployer-validate",
         "replace-platform-code:site-key-proxy",
-        "replace-platform-code:site-panel",
-        "self-escalate"
+        "replace-platform-code:site-panel"
       ]
     }
   },

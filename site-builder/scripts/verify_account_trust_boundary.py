@@ -28,6 +28,7 @@ cookie 与 `scope=console` 的 `__Host-sb_console`（同一个 `/site-builder/jw
 | 只探未限定函数 ARN | 挂在 `blue` alias 上的授权（M7 之后站点的 Function URL 全在 alias 上） |
 | 只探当前那一个 CDK asset | 带同一把活密钥的 9 个历史对象 |
 | 只探 `ssm:GetParameter` | 一个**只**被授予 `ssm:GetParameters`（复数）的角色 |
+| IAM 写只对着字面量 `role/*` 模拟 | 6 个精确/窄授权的 principal（IAM 里请求资源是具体 ARN，policy 的 `role/ExactRole` 不匹配字面量 `role/*`；而 `CreatePolicyVersion` 的资源类型根本是 **policy**） |
 
 所以动作与资源都以**类**为单位（见 `A_*` 常量与 `Targets`）。往任一类里加成员时，
 同时加一条**只命中该新成员**的用例。
@@ -38,19 +39,43 @@ cookie 与 `scope=console` 的 `__Host-sb_console`（同一个 `/site-builder/jw
    与 IAM 用户）。授权记成 `grant` 串而**不是布尔标签**：
    `invoke-platform:site-panel` 与 `invoke-platform:site-deployer-undeploy` 是两条
    不同的 grant，`invoke-platform:site-panel` 与 `invoke-platform@alias:site-panel`
-   也是——压平任一维，对应的扩权就会静静地绿。站点函数按类聚合
-   （`:all` / `:some(k)`），否则每建一个站点都会把基线拽红。
+   也是——压平任一维，对应的扩权就会静静地绿。
+   站点全量用稳定聚合 `:all`（否则每建一个站点都会把基线拽红）；**子集带成员指纹**
+   `:some(k):<fp>`——只记数量时「失去 site-a、新增 site-b」前后都是 `some(1)`，
+   受影响的租户换了一批而闸门不动。
 
-② **resource policy**（`lambda:GetPolicy`，**含每个 alias 与每个已发布版本**）。
+   **限定符是"存在性类"，类内部的成员不区分**：blue 与 green 都算 `@alias`。
+   对"能不能冒充任意用户"这个问题，经哪个颜色碰到代码是等价的；而按颜色分开记会
+   在每次 blue/green 切换时产生漂移却不带来任何安全信号。**颜色级完整性不由这一层
+   负责**——它由 ② 的逐成员比对、部署期的健康门与 `smoke_router.sh` 覆盖。
+
+② **IAM 策略变更**（`iam-policy-write`）走**两步**，不和上面一起模拟：
+   先静态解析全部 identity policy 发现候选（`iam:*` / `iam:Put*` 这类通配要展开，
+   `Allow`+`NotAction` 保守算命中），再用模拟器对**具体** ARN 确认——资源按动作的
+   资源类型落（role / user / **policy**）。判定**三值**：确认有（`:any` / `:scoped`）、
+   判不出（`:condition-gated`，模拟器给 implicitDeny 但带 `MissingContextValues`）、
+   确认没有。三值是必需的：实测某角色的 `AttachRolePolicy` 被 `iam:PolicyARN`
+   限定到两个无害的托管策略，把"判不出"当成"没有"会让它连基线都进不去，
+   条件哪天放宽也没人看见。
+
+   **这条 grant 的语义是字面的**："对至少一个真实 IAM 目标持有策略变更动作"，
+   **不是**"存在一条完整提权链"——后者还要看目标策略挂在谁身上、能否
+   AssumeRole/PassRole、boundary 拦不拦，那是可达性分析，本闸门不做。
+
+③ **resource policy**（`lambda:GetPolicy`，**含每个 alias 与每个已发布版本**）。
    `SimulatePrincipalPolicy` **不会**自动纳入 resource policy（AWS 契约：它只能
    为 IAM user 选择性地带一份，对 role 根本不支持）⇒ 只测 ① 会漏掉
    「给某个角色新加一条 `AddPermission`」。版本不能漏——实测 Edge 的 version 9
    上有一条版本级语句。
    平台函数按**集合等值**比（丢一条 Function URL 授权 = 入口断掉，同样要红）；
-   站点函数按限定符类逐类比，**legacy 形态只认基线里的点名豁免**——
+   站点函数的 alias **逐成员**比（每个颜色都必须有规范语句——并起来比的话
+   「active 色丢了授权、inactive 色还留着」会全绿；已核 blue/green 切换后旧颜色的
+   alias/URL/语句都保留，所以逐成员不会误报），版本级做**子集**检查
+   （AWS 的 replicator 语句只在当前版本上，旧版本合法地没有）；
+   **legacy 形态只认基线里的点名豁免**——
    「存量迁移站点要兼容 legacy」不等于「新站点也可以再产生 legacy」。
 
-③ **密钥物化位置的事实**。密钥有三处明文副本，每次都**实测**而不是假设：
+④ **密钥物化位置的事实**。密钥有三处明文副本，每次都**实测**而不是假设：
    Edge 函数产物（含每个仍含活密钥的已发布版本）、**CDK bootstrap S3 asset**
    （全部仍含活密钥的对象；asset 位置从**已部署的 CloudFormation 模板**推导，
    不手抄对象 key）、以及 SSM 参数。都比对 SHA-256；某处不再含活密钥时，
@@ -72,7 +97,8 @@ cookie 与 `scope=console` 的 `__Host-sb_console`（同一个 `/site-builder/jw
 - `SimulatePrincipalPolicy` 对带 Condition 的策略需要调用方补 `ContextEntries`；
   本脚本不补，于是那些 principal 的判定是**下界**。带 `MissingContextValues`
   的 principal 数被记进基线并打印 delta。
-- 动作等价类不是穷尽的（`A_SELF_ESCALATE` 尤其只取了最常见的四个）。
+- 动作等价类不是穷尽的。
+- `iam-policy-write` 只说明持有策略变更动作，**不**证明存在可用的提权链。
 - 它只看 IAM 与 Lambda resource policy 两条通道，不看 KMS grants、
   VPC endpoint policy、以及其它服务的 resource policy。
 - 它不看跨账号 principal，也看不见"临时建了一个角色用完就删"。
@@ -93,6 +119,7 @@ import io
 import json
 import re
 import sys
+import urllib.parse
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -138,7 +165,11 @@ G_REPLACE_CODE = "replace-platform-code"   # + ":<函数名>"
 G_READ_EDGE_CODE = "read-edge-code"
 G_READ_EDGE_ASSET = "read-edge-asset"
 G_READ_JWT_PARAM = "read-jwt-param"
-G_SELF_ESCALATE = "self-escalate"
+# **名字刻意不叫 self-escalate**：持有一个 IAM 策略变更动作**不等于**存在一条完整
+# 提权链——还要看目标策略挂在谁身上、能否 AssumeRole/PassRole、boundary 拦不拦。
+# 那是可达性分析，本闸门不做（写进文档的"不证明什么"）。这条 grant 的语义就是
+# 字面意思：**对至少一个真实 IAM 目标持有策略变更动作**。
+G_IAM_POLICY_WRITE = "iam-policy-write"
 SECRET_GRANTS = (G_READ_EDGE_CODE, G_READ_EDGE_ASSET, G_READ_JWT_PARAM)
 
 # ---- 动作等价类 ----------------------------------------------------------
@@ -163,10 +194,21 @@ A_READ_OBJECT = ("s3:GetObject", "s3:GetObjectVersion")
 # `GetParameterHistory` 在拒绝 `GetParameter` 时仍可能读到当前值。
 A_READ_PARAM = ("ssm:GetParameter", "ssm:GetParameters",
                 "ssm:GetParametersByPath", "ssm:GetParameterHistory")
-# **不是穷尽的**（IAM 的提权面比这大），但把最常见的四个都算上，
-# 而不是只算 PutRolePolicy 一个。
-A_SELF_ESCALATE = ("iam:PutRolePolicy", "iam:AttachRolePolicy",
-                   "iam:CreatePolicyVersion", "iam:UpdateAssumeRolePolicy")
+# IAM 策略变更动作。**不能和上面几类一起丢给模拟器**：IAM 里请求资源是具体 ARN，
+# 而 policy 里的 `role/ExactRole` 不会匹配字面量 `role/*` ⇒ 拿 `role/*` 去问，
+# 精确授权全部隐形（实测漏掉 6 个 principal）。而且 `iam:CreatePolicyVersion`
+# 的资源类型是 **policy** 不是 role，对着 role ARN 问等于永远问不到。
+# 所以这一类走"静态解析发现候选 → 模拟器对**具体** ARN 确认"两步，见
+# `iam_write_candidates_from_statements` / `confirm_iam_write`。
+IAM_WRITE_ACTIONS = ("iam:PutRolePolicy", "iam:AttachRolePolicy",
+                     "iam:UpdateAssumeRolePolicy", "iam:CreatePolicyVersion",
+                     "iam:PutUserPolicy", "iam:AttachUserPolicy")
+IAM_WRITE_RESOURCE_KIND = {
+    "iam:PutRolePolicy": "role", "iam:AttachRolePolicy": "role",
+    "iam:UpdateAssumeRolePolicy": "role",
+    "iam:CreatePolicyVersion": "policy",
+    "iam:PutUserPolicy": "user", "iam:AttachUserPolicy": "user",
+}
 
 # 限定符类：grant 串里用 `@alias` / `@version` 标出来。**不能与未限定合并**
 # ——`function:foo` 与 `function:foo:blue` 在 IAM 里是两个资源，合并之后
@@ -188,7 +230,7 @@ REQUIRED_GRANT_PREFIXES = {
 # 两次 simulate 调用的动作分组：函数类资源一组，其余一组。分开是为了不产生
 # 大量无意义的 (动作, 资源) 组合——一次调用的响应体是资源数 × 动作数。
 ACTIONS_FUNCTION = A_INVOKE + A_REPLACE + A_READ_CODE
-ACTIONS_OTHER = A_READ_OBJECT + A_READ_PARAM + A_SELF_ESCALATE
+ACTIONS_OTHER = A_READ_OBJECT + A_READ_PARAM
 ACTIONS = ACTIONS_FUNCTION + ACTIONS_OTHER
 
 
@@ -277,7 +319,6 @@ class Targets:
     edge_code_arns: tuple[str, ...]
     edge_assets: tuple[str, ...]
     jwt_parameter: str
-    any_role: str
     alias_arns: dict[str, tuple[str, ...]] = field(default_factory=dict)
     version_arns: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
@@ -290,7 +331,7 @@ class Targets:
         return sorted(set(out))
 
     def other_resources(self) -> list[str]:
-        return sorted(set(self.edge_assets) | {self.jwt_parameter, self.any_role})
+        return sorted(set(self.edge_assets) | {self.jwt_parameter})
 
 
 def _fn_name(arn: str) -> str:
@@ -331,12 +372,17 @@ def grants_from_decisions(decisions: dict[str, str], t: Targets) -> set[str]:
                            (Q_VERSION, lambda a: t.version_arns.get(a, ()))):
             n = sum(1 for arn in t.site_functions
                     if pick(arn) and allowed(A_INVOKE, pick(arn)))
-            if n == total:
+            members = sorted(_fn_name(arn) for arn in t.site_functions
+                             if pick(arn) and allowed(A_INVOKE, pick(arn)))
+            if len(members) == total:
+                # `all` 保持稳定聚合：否则每建一个站点都把基线拽红。
                 grants.add(f"{G_INVOKE_SITE}{qual}:all")
-            elif n:
-                # 子集形态记数量：从 1 个涨到 2 个必须红。数量随站点增删变化时
-                # 也会红——那是安全方向的误报，且当前没有 principal 处于子集形态。
-                grants.add(f"{G_INVOKE_SITE}{qual}:some({n})")
+            elif members:
+                # 子集形态**带成员指纹**：只记数量时，「失去 site-a、新增 site-b」
+                # 前后都是 some(1)，受影响的租户换了一批而闸门不动。
+                # 指纹只覆盖被允许的那些站点 ⇒ 新建一个它碰不到的站点不产生漂移。
+                grants.add(f"{G_INVOKE_SITE}{qual}:some({len(members)}):"
+                           f"{principal_fingerprint('sites:' + ','.join(members))}")
 
     if t.edge_code_arns and allowed(A_READ_CODE, t.edge_code_arns):
         grants.add(G_READ_EDGE_CODE)
@@ -344,9 +390,129 @@ def grants_from_decisions(decisions: dict[str, str], t: Targets) -> set[str]:
         grants.add(G_READ_EDGE_ASSET)
     if allowed(A_READ_PARAM, (t.jwt_parameter,)):
         grants.add(G_READ_JWT_PARAM)
-    if allowed(A_SELF_ESCALATE, (t.any_role,)):
-        grants.add(G_SELF_ESCALATE)
     return grants
+
+
+def policy_statements(document) -> list[dict]:
+    """策略文档 → 语句列表。
+
+    `GetAccountAuthorizationDetails` 有时把文档作为 **URL 编码的字符串**返回
+    （实测踩到过，不解码就静默漏掉整份策略）；`Statement` 也可能是单个对象而
+    不是列表。
+    """
+    if isinstance(document, str):
+        document = json.loads(urllib.parse.unquote(document))
+    statements = document.get("Statement", [])
+    return statements if isinstance(statements, list) else [statements]
+
+
+def expand_iam_write_actions(patterns) -> set[str]:
+    """动作模式 → 命中的 IAM 写动作集合。`*` / `iam:*` / `iam:Put*` 都要展开。"""
+    patterns = patterns if isinstance(patterns, list) else [patterns]
+    hit = set()
+    for raw in patterns:
+        pat = raw.lower()
+        if pat in ("*", "iam:*"):
+            return set(IAM_WRITE_ACTIONS)
+        if pat.endswith("*"):
+            prefix = pat[:-1]
+            hit |= {a for a in IAM_WRITE_ACTIONS if a.lower().startswith(prefix)}
+        else:
+            hit |= {a for a in IAM_WRITE_ACTIONS if a.lower() == pat}
+    return hit
+
+
+def iam_write_resource_kind(action: str) -> str:
+    return IAM_WRITE_RESOURCE_KIND[action]
+
+
+def iam_write_candidates_from_statements(statements: list[dict]) -> dict:
+    """一个 principal 的全部语句 → IAM 写候选（动作 + 目标模式 + 是否无限制）。
+
+    **这是"发现"，不是"判定"**：静态解析不评估 Condition，所以会过报；
+    每个候选都要再用模拟器对一个**具体** ARN 确认（`confirm_iam_write`）。
+    反过来它必须是超集——已用正对照核过：模拟器用 `role/*` 找到的 16 个
+    全部落在静态解析的 22 个里。
+    """
+    actions: set[str] = set()
+    targets: list[str] = []
+    unrestricted = False
+    for st in statements:
+        if st.get("Effect") != "Allow":
+            continue
+        if "NotAction" in st:
+            # `Allow` + `NotAction` 约等于"除了这些之外全给"。解析不出具体动作时
+            # 保守算命中——把它当"没有"才是危险方向。
+            hit = set(IAM_WRITE_ACTIONS)
+        else:
+            hit = expand_iam_write_actions(st.get("Action", []))
+        if not hit:
+            continue
+        actions |= hit
+        res = st.get("Resource", "*")
+        res = res if isinstance(res, list) else [res]
+        for r in res:
+            if r == "*":
+                unrestricted = True
+            targets.append(r)
+    return {"actions": actions, "targets": sorted(set(targets)),
+            "unrestricted": unrestricted}
+
+
+def iam_write_grants(candidate: dict) -> set[str]:
+    """静态解析结果 → grant（**只用于单测与文档说明**；真机走
+    `iam_write_grants_from_probes`，因为静态解析不评估 Condition）。"""
+    if not candidate.get("actions"):
+        return set()
+    scope = "any" if candidate.get("unrestricted") else "scoped"
+    return {f"{G_IAM_POLICY_WRITE}:{scope}"}
+
+
+def iam_write_grants_from_probes(probes: list[dict]) -> set[str]:
+    """模拟器对具体 ARN 的确认结果 → grant。**三值，不是两值。**
+
+    `probes` 的每项：`{"pattern", "decision", "missing_context"}`。
+
+    - 有 `allowed` ⇒ `:any`（目标模式是 `*`）或 `:scoped`；
+    - 全不 allowed 但**有** `MissingContextValues` ⇒ `:condition-gated`
+      ——"判不出"不能静默当成"没有"。实测现场：某角色的 `AttachRolePolicy` 被
+      `iam:PolicyARN` 的 ArnEquals 限定到两个无害的 AWS 托管策略，模拟器给
+      `implicitDeny` + 缺 `iam:PolicyARN`。把它当"没有"的话，这个 principal 连基线
+      都进不去，条件哪天被放宽也没人会看见；记成 `condition-gated` 之后，
+      放宽会表现为**新** grant ⇒ 红。
+    - 其余 ⇒ 无 grant。
+    """
+    allowed = [p for p in probes if p.get("decision") == "allowed"]
+    if allowed:
+        scope = "any" if any(p["pattern"] == "*" for p in allowed) else "scoped"
+        return {f"{G_IAM_POLICY_WRITE}:{scope}"}
+    if any(p.get("missing_context") for p in probes):
+        return {f"{G_IAM_POLICY_WRITE}:condition-gated"}
+    return set()
+
+
+# 拿来把模式落成具体 ARN 的固定后缀。**必须是固定值**：随机值会让两次运行的
+# 模拟请求不同，而"这个 principal 能不能改 IAM"的答案不该随探针名字变。
+_PROBE_SUFFIX = "sb-trust-probe"
+
+
+def concrete_target(pattern: str, kind: str, *, account: str) -> str:
+    """目标模式 → 一个可以喂给模拟器的**具体** ARN。
+
+    模拟器要的是具体资源；拿 `role/*` 这种字面量去问，policy 里的
+    `role/ExactRole` 匹配不上 ⇒ 精确授权全部隐形（这正是首版的缺陷）。
+    """
+    if pattern == "*" or ":" not in pattern:
+        return f"arn:aws:iam::{account}:{kind}/{_PROBE_SUFFIX}"
+    _, _, tail = pattern.partition(f":{kind}/")
+    if not tail:
+        # 模式的资源类型与该动作不符（例如把 policy 模式配给 PutRolePolicy）：
+        # 落一个该类型下的探针名，让模拟器给出真实答案而不是靠猜。
+        return f"arn:aws:iam::{account}:{kind}/{_PROBE_SUFFIX}"
+    # **账号段一律落成本账号**：跨账号模式（`arn:aws:iam::*:role/x*`）不换的话，
+    # 喂给模拟器的字面量 `*` 恰好会被模式里的 `*` 匹配上——答案碰巧对，
+    # 而碰巧对的判据下一次就可能碰巧错。名字段里的 `*` 换成固定探针名。
+    return f"arn:aws:iam::{account}:{kind}/{tail.replace('*', _PROBE_SUFFIX)}"
 
 
 def statement_fingerprint(statement: dict, *, account: str, function: str,
@@ -394,13 +560,26 @@ def resource_policy_snapshot(policies: dict[str, list[tuple[str | None, dict]]],
 
     flat = {fn: sorted({fp(fn, q, st) for q, st in policies.get(fn, [])})
             for fn in platform}
-    grouped: dict[str, dict[str, list[str]]] = {}
+    grouped: dict[str, dict] = {}
     for fn in sites:
-        buckets: dict[str, set[str]] = {"unqualified": set(), "alias": set(),
-                                        "version": set()}
+        # **alias 逐成员记**（`{颜色: [指纹…]}`）：并起来记的话，
+        # 「blue 丢了授权、green 还留着」两者相加仍等于规范集合 ⇒ 全绿。
+        # M7 切换后旧颜色的 alias / Function URL / 两条语句都保留（代码里没有任何
+        # 地方删它们），所以"每个颜色都完整"不会误报。
+        alias_members: dict[str, set[str]] = {a: set() for a in aliases.get(fn, ())}
+        version_fps: set[str] = set()
+        unqualified: set[str] = set()
         for q, st in policies.get(fn, []):
-            buckets[qual_class(fn, q)].add(fp(fn, q, st))
-        grouped[fn] = {k: sorted(v) for k, v in buckets.items()}
+            kind = qual_class(fn, q)
+            if kind == "alias":
+                alias_members.setdefault(q, set()).add(fp(fn, q, st))
+            elif kind == "version":
+                version_fps.add(fp(fn, q, st))
+            else:
+                unqualified.add(fp(fn, q, st))
+        grouped[fn] = {"alias": {a: sorted(v) for a, v in alias_members.items()},
+                       "version": sorted(version_fps),
+                       "unqualified": sorted(unqualified)}
     return {"platform": flat, "sites": grouped}
 
 
@@ -418,20 +597,28 @@ def site_shape_canonicals(sites: dict[str, dict[str, list[str]]]) -> dict:
     豁免集合只能缩小——某个 legacy 站点迁成 modern 之后，闸门会把"豁免可以去掉"
     报成改善。
     """
-    def mode(key: str) -> list[str]:
+    def mode(shapes) -> list[str]:
         counts: dict[tuple[str, ...], int] = {}
-        for shape in sites.values():
-            k = tuple(shape.get(key, []))
+        for shape in shapes:
+            k = tuple(sorted(shape))
             if k:
                 counts[k] = counts.get(k, 0) + 1
         if not counts:
             return []
         return list(max(counts.items(), key=lambda kv: (kv[1], kv[0]))[0])
 
+    # alias 的规范形态取**逐成员**的众数（每个颜色一票），不是每个站点一票。
+    alias_shapes = [fps for shape in sites.values()
+                    for fps in (shape.get("alias") or {}).values()]
+    # 版本级语句做**子集**检查，所以规范形态取并集：AWS 的 replicator 语句只出现在
+    # 当前 Edge 版本上，旧版本合法地没有它——逐成员等值会把 1..8 全报成缺语句。
+    version_union = sorted({fp for shape in sites.values()
+                            for fp in shape.get("version", [])})
     legacy = sorted(fn for fn, shape in sites.items() if shape.get("unqualified"))
-    return {"site_alias_canonical": mode("alias"),
-            "site_version_canonical": mode("version"),
-            "site_legacy_canonical": mode("unqualified"),
+    return {"site_alias_canonical": mode(alias_shapes),
+            "site_version_canonical": version_union,
+            "site_legacy_canonical": mode(
+                [shape.get("unqualified", []) for shape in sites.values()]),
             "site_legacy_exempt": [site_fingerprint(fn) for fn in legacy]}
 
 
@@ -570,17 +757,25 @@ def _compare_resource_policies(rep: Report, base_rp: dict, now_rp: dict) -> None
 
     for fn, shape in sorted((now_rp.get("sites") or {}).items()):
         fp = site_fingerprint(fn)
-        alias, version = set(shape.get("alias", [])), set(shape.get("version", []))
+        version = set(shape.get("version", []))
         unqualified = set(shape.get("unqualified", []))
         problems = []
-        if alias != alias_canon:
-            extra, missing = sorted(alias - alias_canon), sorted(alias_canon - alias)
+        # alias **逐成员**比：每个颜色都必须有规范语句。并起来比的话，
+        # 「active 色丢了授权、inactive 色还留着」会全绿。
+        for color, fps in sorted((shape.get("alias") or {}).items()):
+            member = set(fps)
+            if member == alias_canon:
+                continue
+            extra, missing = sorted(member - alias_canon), sorted(alias_canon - member)
             if extra:
-                problems.append(f"alias 多出语句 {extra}")
+                problems.append(f"alias `{color}` 多出语句 {extra}")
             if missing:
-                problems.append(f"alias 缺语句 {missing}（该站点可能已无法经 Edge 访问）")
-        if version != version_canon:
-            problems.append(f"版本级语句异常 {sorted(version ^ version_canon)}")
+                problems.append(
+                    f"alias `{color}` 缺语句 {missing}"
+                    f"（这一色的入口已断；若它是 active color 则该站点整站 403）")
+        # 版本级只做**子集**检查（见 site_shape_canonicals 里的理由）。
+        if version - version_canon:
+            problems.append(f"版本级出现未知语句 {sorted(version - version_canon)}")
         if unqualified:
             if fp not in exempt:
                 problems.append(
@@ -671,20 +866,73 @@ def _aws_clients(region: str):
 
 
 def list_principals(iam) -> list[dict]:
-    """非 service-linked 角色 + 全部 IAM 用户。
+    """非 service-linked 角色 + 全部 IAM 用户，**连它们的 policy 语句一起收**。
 
     **用户不能漏**：账号 owner 的 IAM 用户同样是一个 principal，只数角色会漏掉它。
+    语句是 IAM 写那一类的**发现**输入——那一类不能靠模拟器猜资源（见
+    `iam_write_candidates_from_statements`），所以要读真实策略。
     """
-    out = []
+    managed: dict[str, object] = {}
+    roles: list[dict] = []
+    users: list[dict] = []
     for page in iam.get_paginator("get_account_authorization_details").paginate(
-            Filter=["User", "Role"]):
-        for r in page.get("RoleDetailList", []):
-            if r["Path"].startswith("/aws-service-role/"):
-                continue
-            out.append({"kind": "role", "name": r["RoleName"], "arn": r["Arn"]})
-        for u in page.get("UserDetailList", []):
-            out.append({"kind": "user", "name": u["UserName"], "arn": u["Arn"]})
+            Filter=["User", "Role", "LocalManagedPolicy", "AWSManagedPolicy"]):
+        roles.extend(page.get("RoleDetailList", []))
+        users.extend(page.get("UserDetailList", []))
+        for pol in page.get("Policies", []):
+            for version in pol.get("PolicyVersionList", []):
+                if version.get("IsDefaultVersion"):
+                    managed[pol["Arn"]] = version["Document"]
+
+    def statements_of(detail: dict, inline_key: str) -> list[dict]:
+        out: list[dict] = []
+        for pol in detail.get(inline_key, []):
+            out.extend(policy_statements(pol["PolicyDocument"]))
+        for att in detail.get("AttachedManagedPolicies", []):
+            doc = managed.get(att["PolicyArn"])
+            if doc is not None:
+                out.extend(policy_statements(doc))
+        return out
+
+    out = []
+    for r in roles:
+        if r["Path"].startswith("/aws-service-role/"):
+            continue
+        out.append({"kind": "role", "name": r["RoleName"], "arn": r["Arn"],
+                    "statements": statements_of(r, "RolePolicyList")})
+    for u in users:
+        out.append({"kind": "user", "name": u["UserName"], "arn": u["Arn"],
+                    "statements": statements_of(u, "UserPolicyList")})
     return out
+
+
+def confirm_iam_write(iam, principal_arn: str, candidate: dict, *,
+                      account: str) -> set[str]:
+    """静态解析出的 IAM 写候选 → 用模拟器对**具体** ARN 确认后的 grant。
+
+    静态解析不评估 Condition ⇒ 会过报，所以每个候选动作都要真问一次。
+    问的资源按动作的**资源类型**（role / user / policy）从它自己的目标模式落成
+    具体 ARN——拿字面量 `role/*` 去问是首版的缺陷，那样精确授权全部隐形。
+    判定三值化在 `iam_write_grants_from_probes` 里。
+    """
+    probes: list[dict] = []
+    for action in sorted(candidate["actions"]):
+        kind = iam_write_resource_kind(action)
+        patterns = candidate["targets"] or ["*"]
+        by_arn = {concrete_target(pat, kind, account=account): pat
+                  for pat in patterns}
+        if not by_arn:
+            continue
+        results = iam.simulate_principal_policy(
+            PolicySourceArn=principal_arn, ActionNames=[action],
+            ResourceArns=sorted(by_arn))["EvaluationResults"]
+        decisions = decisions_from_simulation(results)
+        missing = missing_context_in(results)
+        for arn, pattern in by_arn.items():
+            probes.append({"pattern": pattern,
+                           "decision": decisions.get(f"{action}|{arn}", "unknown"),
+                           "missing_context": missing})
+    return iam_write_grants_from_probes(probes)
 
 
 def site_function_names(lam, platform: tuple[str, ...]) -> tuple[str, ...]:
@@ -903,7 +1151,6 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
         edge_code_arns=edge_code,
         edge_assets=tuple(f"arn:aws:s3:::{asset_bucket}/{k}" for k in asset_keys),
         jwt_parameter=f"arn:aws:ssm:{region}:{account}:parameter{JWT_PARAM_NAME}",
-        any_role=f"arn:aws:iam::{account}:role/*",
         alias_arns={fn_arn(n): tuple(f"{fn_arn(n)}:{a}" for a in al)
                     for n, al in aliases.items()},
         version_arns={fn_arn(n): tuple(f"{fn_arn(n)}:{v}" for v in vs)
@@ -929,6 +1176,9 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
     observed: dict[str, dict] = {}
     failures: list[str] = []
     n_missing = 0
+    iam_candidates: list[str] = []
+    iam_confirmed: list[str] = []
+    iam_gated: list[str] = []
 
     with cf.ThreadPoolExecutor(max_workers=workers) as pool:
         futs = {pool.submit(simulate, iam, p["arn"], targets): p for p in principals}
@@ -941,6 +1191,17 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
                 continue
             n_missing += bool(missing)
             grants = grants_from_decisions(decisions, targets)
+            candidate = iam_write_candidates_from_statements(p["statements"])
+            if candidate["actions"]:
+                iam_candidates.append(p["name"])
+                confirmed = confirm_iam_write(iam, p["arn"], candidate,
+                                              account=account)
+                grants |= confirmed
+                if any(g.endswith(":any") or g.endswith(":scoped")
+                       for g in confirmed):
+                    iam_confirmed.append(p["name"])
+                elif confirmed:
+                    iam_gated.append(p["name"])
             if grants:
                 observed[principal_fingerprint(p["arn"])] = {
                     "name": p["name"], "arn": p["arn"], "kind": p["kind"],
@@ -955,6 +1216,11 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
                          f"{failures[:3]}")
 
     facts["principals_with_missing_context"] = n_missing
+    # 两个数都记：候选是静态解析（不评估 Condition，会过报），确认是模拟器的答案。
+    # 差值变大说明账号里带 Condition 的 IAM 授权变多了，值得看一眼。
+    facts["iam_write_candidates"] = len(iam_candidates)
+    facts["iam_write_confirmed"] = len(iam_confirmed)
+    facts["iam_write_condition_gated"] = len(iam_gated)
     return {"principals": observed, "resource_policies": rp, "facts": facts,
             "required": {"edge": edge_role_name, "deployer": DEPLOYER_EXEC_ROLE}}
 
