@@ -334,6 +334,86 @@ class Targets:
         return sorted(set(self.edge_assets) | {self.jwt_parameter})
 
 
+# 动作 → 动作等价类名。coverage 的成员指纹按**类**记，不按单个动作
+# （否则同一能力的四个 SSM 动作会各记一项，噪音换不来信号）。
+ACTION_CLASS_NAMES = {
+    **{a: "invoke" for a in A_INVOKE},
+    **{a: "replace-code" for a in A_REPLACE},
+    **{a: "read-code" for a in A_READ_CODE},
+    **{a: "read-object" for a in A_READ_OBJECT},
+    **{a: "read-param" for a in A_READ_PARAM},
+}
+
+
+def undecided_pairs(evaluation_results) -> set[tuple[str, str]]:
+    """→ {(动作, 资源)}：该资源**非 allowed**，且它自己或**顶层**带 `MissingContextValues`。
+
+    比 `missing_context_in`（principal 级的一个 bool）细一档，因为那个集合会漏掉这个
+    反例：P 原本只对 site-a 的 Invoke 判不出，后来对 jwt-secret 的 `GetParameters`
+    也判不出——按 principal 集合前后都是 `{P}` ⇒ 绿，而新增的**密钥读取**不确定面
+    没被发现。
+
+    **顶层的 `MissingContextValues` 归给该 action 下每个非 allowed 的资源**（保守归属）：
+    实测里它常常只出现在一侧。只在 `ResourceSpecificResults` 为空时才看顶层的写法，
+    会让「顶层带、逐资源条目自己不带」这一形态返回空集——**那比旧的 bool 判据还弱**。
+
+    `allowed` 的逐资源结果永远不算"判不出"：它已经有答案了。所以顶层带缺失上下文而
+    逐资源全 allowed 时，本函数正确地返回空集（旧 bool 在同一输入上是 True）。
+    """
+    out: set[tuple[str, str]] = set()
+    for res in evaluation_results:
+        action = res.get("EvalActionName", "?")
+        top_missing = bool(res.get("MissingContextValues"))
+        specific = res.get("ResourceSpecificResults") or []
+        if specific:
+            for rr in specific:
+                if rr.get("EvalResourceDecision") == "allowed":
+                    continue
+                if rr.get("MissingContextValues") or top_missing:
+                    name = rr.get("EvalResourceName", "")
+                    out.add((action, "" if "${" in name else name))
+        elif top_missing and res.get("EvalDecision") != "allowed":
+            # 顶层资源名可能是 `${Region}` 这样的模板 ⇒ 归不到具体资源。
+            # 老实记 unattributed，别硬塞一个不存在的 ARN（那会造出一个永远存在的假成员）。
+            name = res.get("EvalResourceName", "")
+            out.add((action, "" if "${" in name else name))
+    return out
+
+
+def undecided_resource_class(resource: str, t: "Targets") -> str:
+    """资源 → **稳定**的资源类名。
+
+    站点函数折叠成 `sites`：逐站点会让每次建站都把基线拽红，而"新增即红"依赖基线稳定。
+    平台函数保留精确名字——那一维正好是安全边界（「对 site-panel 判不出」与
+    「对 site-deployer-undeploy 判不出」不是一回事）。
+    **限定符（alias/version）刻意折叠掉**：版本号每次部署都变，带上它会让 coverage
+    每次部署漂移；同一函数名下的覆盖缺口由函数名这一级体现。
+    """
+    if not resource:
+        return "unattributed"
+    if resource == t.jwt_parameter:
+        return "jwt-param"
+    if resource in t.edge_assets:
+        return "edge-asset"
+    if resource in t.edge_code_arns:
+        return "edge-code"
+    parts = resource.split(":")
+    if len(parts) >= 7 and parts[2] == "lambda":
+        name = parts[6]
+        if any(a.split(":")[6] == name for a in t.site_functions):
+            return "sites"
+        return f"fn:{name}"
+    if resource.startswith("arn:aws:s3:::"):
+        return "s3-other"
+    return "other"
+
+
+def undecided_item_fp(principal_arn: str, action_class: str, resource_class: str) -> str:
+    """成员指纹 = (principal, 动作等价类, 资源类或精确目标)。只存指纹（仓库红线）。"""
+    return principal_fingerprint(
+        f"undecided:{principal_arn}|{action_class}|{resource_class}")
+
+
 def _fn_name(arn: str) -> str:
     return arn.rsplit(":function:", 1)[-1]
 
@@ -694,6 +774,7 @@ RED_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("new_statements",       "新增 resource policy 语句（红）",              "grew"),
     ("site_policy_outliers", "站点函数的 resource policy 偏离规范形态（红）", "grew"),
     ("bucket_policy_drift",  "bootstrap 桶 policy 漂移（红）",                "bucket"),
+    ("new_undecided_items",  "新增判不出的项（红）",                          "undecided"),
 )
 GREEN_FIELDS: tuple[tuple[str, str], ...] = (
     ("unclassified", "基线里未分类（请标注 category）"),
@@ -711,6 +792,10 @@ RED_MESSAGES = {
                "asset，而 SimulatePrincipalPolicy **不看** bucket policy（对 role 更是不支持"
                "模拟 resource policy）⇒ 这条通道只有这份快照能咬住。新增 Allow = 多了能读"
                "签名密钥的人；丢掉那条 TLS Deny 同样是扩权。上面每条都打了归一化语句原文。"),
+    "undecided": ("闸门红：判不出的 (principal, 动作类, 资源) 项变多了。这**不等于**有人拿到"
+                  "了新权限，但**闸门对这一块的答案退化成了下界**——先看新增那几项对应哪条 "
+                  "Condition（`--dump-observed` 看带真实名字的快照），再决定是补 "
+                  "ContextEntries 还是接受并更新基线。"),
 }
 
 
@@ -722,6 +807,7 @@ class Report:
     new_statements: list[str] = field(default_factory=list)
     site_policy_outliers: list[str] = field(default_factory=list)
     bucket_policy_drift: list[str] = field(default_factory=list)
+    new_undecided_items: list[str] = field(default_factory=list)
     improvements: list[str] = field(default_factory=list)
     unclassified: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -745,7 +831,8 @@ class Report:
 def compare_to_baseline(observed: dict[str, dict], baseline: dict, *,
                         required: dict[str, str],
                         resource_policies: dict | None = None,
-                        facts: dict | None = None) -> Report:
+                        facts: dict | None = None,
+                        coverage: dict | None = None) -> Report:
     """observed = {fingerprint: {"name", "arn", "grants"}}。
 
     **红绿口径按类别分两套，这是刻意的不对称**：
@@ -808,8 +895,29 @@ def compare_to_baseline(observed: dict[str, dict], baseline: dict, *,
         _compare_resource_policies(rep, baseline.get("resource_policies") or {},
                                    resource_policies)
 
+    if coverage is not None:
+        _compare_coverage(rep, (baseline.get("coverage") or {}).get("undecided_items"),
+                          coverage.get("undecided_items"))
+
     _compare_facts(rep, baseline.get("facts") or {}, facts)
     return rep
+
+
+def _compare_coverage(rep: Report, base_items, now_items) -> None:
+    """判不出的项按**成员**比：**新成员红、消失算改善、数量只作文档摘要。**
+
+    成员是 `(principal, 动作等价类, 资源类)` 的指纹。按 principal 集合比会漏掉这个
+    反例：P 原本只对 site-a 的 Invoke 判不出，后来对 jwt-secret 的 `GetParameters`
+    也判不出 —— 前后都是 `{P}` ⇒ 绿，而新增的**密钥读取**不确定面没被发现。
+    """
+    was, now = set(base_items or []), set(now_items or [])
+    for fp in sorted(now - was):
+        rep.new_undecided_items.append(
+            f"[{fp}] 新增一项判不出的 (principal, 动作类, 资源)——不确定面变大了；"
+            f"用 --dump-observed 看它对应哪条 Condition")
+    for fp in sorted(was - now):
+        rep.improvements.append(f"[{fp}] 这一项已能判定（可更新基线）")
+    rep.notes.append(f"undecided_items: {len(was)} → {len(now)}（{len(now) - len(was):+d}）")
 
 
 def _compare_resource_policies(rep: Report, base_rp: dict, now_rp: dict) -> None:
@@ -1193,15 +1301,21 @@ def bucket_policy_statements(s3, bucket: str) -> list[dict]:
         return []
 
 
-def simulate(iam, principal_arn: str, t: Targets) -> tuple[dict[str, str], bool]:
+def simulate(iam, principal_arn: str,
+             t: Targets) -> tuple[dict[str, str], bool, set[tuple[str, str]]]:
     """两次调用：函数类资源一组、其余一组。
 
     分组不是为了省钱，是为了不产生大量无意义的 (动作, 资源) 组合——一次调用的
     响应体是 资源数 × 动作数，而 `ssm:*` 对 Lambda ARN、`lambda:*` 对 S3 ARN
     都是纯噪音。
+
+    返回三项：逐资源判定、`missing`（principal 级的 bool，喂 `facts` 那个笼统计数，
+    只报 delta 不参与红绿）、`pairs`（item 级的判不出集合，**新成员即红**）。
+    两者都要：前者是环境事实，后者才是判据。
     """
     out: dict[str, str] = {}
     missing = False
+    pairs: set[tuple[str, str]] = set()
     for actions, resources in ((ACTIONS_FUNCTION, t.function_resources()),
                                (ACTIONS_OTHER, t.other_resources())):
         if not resources:
@@ -1211,7 +1325,8 @@ def simulate(iam, principal_arn: str, t: Targets) -> tuple[dict[str, str], bool]
                 ResourceArns=resources):
             out.update(decisions_from_simulation(page["EvaluationResults"]))
             missing = missing or missing_context_in(page["EvaluationResults"])
-    return out, missing
+            pairs |= undecided_pairs(page["EvaluationResults"])
+    return out, missing, pairs
 
 
 def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
@@ -1304,6 +1419,9 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
     observed: dict[str, dict] = {}
     failures: list[str] = []
     n_missing = 0
+    # item 级的判不出集合：成员是 (principal, 动作等价类, 资源类) 的指纹。
+    # `n_missing` 那个 principal 级计数继续留作环境事实（只报 delta），红绿看这个。
+    undecided: set[str] = set()
     iam_candidates: list[str] = []
     iam_confirmed: list[str] = []
     iam_gated: list[str] = []
@@ -1313,11 +1431,17 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
         for i, fut in enumerate(cf.as_completed(futs), 1):
             p = futs[fut]
             try:
-                decisions, missing = fut.result()
+                decisions, missing, pairs = fut.result()
             except Exception as exc:  # noqa: BLE001
                 failures.append(f"{p['name']}: {type(exc).__name__}: {exc}")
                 continue
             n_missing += bool(missing)
+            # 折成成员指纹。放在下面 `if grants:` 的**外面**——一个 principal 可能一条
+            # grant 都没有却有判不出的项，而那正是最该盯住的那种（条件哪天放宽就是新 grant）。
+            for action, resource in pairs:
+                undecided.add(undecided_item_fp(
+                    p["arn"], ACTION_CLASS_NAMES.get(action, action),
+                    undecided_resource_class(resource, targets)))
             grants = grants_from_decisions(decisions, targets)
             candidate = iam_write_candidates_from_statements(p["statements"])
             if candidate["actions"]:
@@ -1350,6 +1474,7 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
     facts["iam_write_confirmed"] = len(iam_confirmed)
     facts["iam_write_condition_gated"] = len(iam_gated)
     return {"principals": observed, "resource_policies": rp, "facts": facts,
+            "coverage": {"undecided_items": sorted(undecided)},
             "required": {"edge": edge_role_name, "deployer": DEPLOYER_EXEC_ROLE}}
 
 
@@ -1379,6 +1504,9 @@ def write_baseline(bundle: dict, baseline: dict, path: Path) -> None:
                         "cdk-admin", "cdk-readonly", "unrelated-workload",
                         "unclassified"],
          "facts": bundle["facts"],
+         # 判不出的项按**成员**存（新成员即红）。principal 级的那个笼统计数在 facts 里，
+         # 只报 delta——它会随账号里任何一条带 Condition 的新策略变动。
+         "coverage": bundle.get("coverage") or {"undecided_items": []},
          "principals": principals,
          # 站点函数只落**规范形态 + legacy 豁免名单**，不落逐站点条目：
          # 逐站点会让每次建站/下线都改基线，而"新增即红"依赖基线是稳定的。
@@ -1450,7 +1578,8 @@ def main() -> int:
 
     rep = compare_to_baseline(observed, baseline, required=bundle["required"],
                               resource_policies=bundle["resource_policies"],
-                              facts=bundle["facts"])
+                              facts=bundle["facts"],
+                              coverage=bundle.get("coverage"))
     print("\n" + rep.render())
     # 处置文案由 RED_FIELDS 的第三列驱动（`dict.fromkeys` 去重且保序）：
     # 原先这里手抄了一遍字段名单，加红字段时最容易漏的就是这一处。

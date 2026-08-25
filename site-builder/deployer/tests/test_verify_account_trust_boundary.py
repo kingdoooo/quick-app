@@ -1477,3 +1477,211 @@ def test_report_prints_normalized_statement_for_each_diff():
         resource_policies=rp)
     assert "s3:GetObject" in rep.render(), "报文里没有语句原文"
     assert _ACCT not in rep.render(), "报文里出现了当前账号 ID 原值"
+
+
+# ==========================================================================
+# A.3：coverage 从 principal 级降到 **item 级**
+#
+# 反例（必须钉住）：P 原本只对 site-a 的 Invoke 判不出，后来对 jwt-secret 的
+# `GetParameters` 也判不出 —— 按 **principal 集合**前后都是 `{P}` ⇒ 绿，
+# 而**新增的密钥读取不确定面没被发现**。
+#
+# 这**不是** `facts.principals_with_missing_context`（162 那个笼统计数）：那个继续
+# 只报 delta、不参与红绿，因为它会随账号里任何一条带 Condition 的新策略变动。
+# ==========================================================================
+
+def test_undecided_pairs_is_a_superset_of_the_old_boolean():
+    """**正对照（带前提）**：旧 `missing_context_in` 为真、**且存在至少一个非 allowed
+    的结果**时，新的 item 级集合不得为空。
+
+    前提是必需的，不能写成无条件的超集性质：顶层带 `MissingContextValues` 而逐资源
+    **全是 allowed** 时，旧 bool 为真而新集合**正确地**为空（每个资源都已经有答案，
+    不属于"判不出"）。见下面那条反例用例。把性质写得过强，下一位维护者会照它去
+    "修" coverage，把已判定的资源也收进来，于是 coverage 变成纯噪音。
+
+    另一头也踩过：细化成 (动作, 资源) 时若只在 `ResourceSpecificResults` 为空时才看
+    顶层，「顶层带、逐资源条目自己不带」这一形态会返回空集，而旧 bool 返回 True
+    ⇒ 判据相对现状**倒退**。
+    """
+    g = _gate()
+    shapes = [
+        # ① 只有顶层带（无逐资源结果）
+        [{"EvalActionName": "s3:GetObject", "EvalDecision": "implicitDeny",
+          "MissingContextValues": ["aws:SourceVpc"]}],
+        # ② 只有逐资源带
+        [{"EvalActionName": "s3:GetObject", "EvalDecision": "implicitDeny",
+          "ResourceSpecificResults": [
+              {"EvalResourceName": "a", "EvalResourceDecision": "implicitDeny",
+               "MissingContextValues": ["aws:ResourceTag/x"]}]}],
+        # ③ **顶层带 + 有逐资源结果但逐资源自己不带** ← 最容易漏的就是这个
+        [{"EvalActionName": "iam:PutRolePolicy", "EvalDecision": "implicitDeny",
+          "MissingContextValues": ["aws:PrincipalTag/x"],
+          "ResourceSpecificResults": [
+              {"EvalResourceName": "target-a", "EvalResourceDecision": "implicitDeny"}]}],
+    ]
+
+    def has_non_allowed(shape):
+        return any(rr.get("EvalResourceDecision") != "allowed"
+                   for r in shape for rr in (r.get("ResourceSpecificResults") or [])) \
+            or any(not r.get("ResourceSpecificResults")
+                   and r.get("EvalDecision") != "allowed" for r in shape)
+
+    for i, shape in enumerate(shapes, 1):
+        assert g.missing_context_in(shape), f"形态 {i} 的正对照前提不成立（旧 bool 该为真）"
+        assert has_non_allowed(shape), f"形态 {i} 的前提不成立（该有非 allowed 的结果）"
+        assert g.undecided_pairs(shape), \
+            f"形态 {i}：旧 bool 说有不确定、且存在非 allowed 结果，新的 item 级集合却是空 " \
+            f"⇒ 判据相对现状倒退了"
+
+
+def test_all_allowed_resources_are_not_undecided_even_with_top_level_missing_context():
+    """**上一条那个前提的反例**：顶层带 `MissingContextValues`，但逐资源**全是 allowed**
+    ⇒ 新集合正确地为空，而旧 bool 为真。
+
+    这条把"超集性质有前提"钉成可执行的：没有它，有人会照上一条的名字去掉前提，
+    把已判定的资源也收进 coverage，于是每次跑都新增一堆成员、闸门变成纯噪音。
+    """
+    g = _gate()
+    shape = [{"EvalActionName": "s3:GetObject", "EvalDecision": "allowed",
+              "MissingContextValues": ["aws:SourceVpc"],
+              "ResourceSpecificResults": [
+                  {"EvalResourceName": "a", "EvalResourceDecision": "allowed"},
+                  {"EvalResourceName": "b", "EvalResourceDecision": "allowed"}]}]
+    assert g.missing_context_in(shape), "反例的前提是旧 bool 为真"
+    assert g.undecided_pairs(shape) == set(), \
+        "已经 allowed 的资源被算进了「判不出」⇒ coverage 变成噪音"
+
+
+def test_top_level_missing_context_applies_to_non_allowed_resource_specific_results():
+    """顶层缺上下文时，该 action 下每个**非 allowed** 的资源都算"判不出"；
+    allowed 的那些不算（它们已经有答案）。"""
+    g = _gate()
+    pairs = g.undecided_pairs([{
+        "EvalActionName": "iam:PutRolePolicy", "EvalDecision": "implicitDeny",
+        "MissingContextValues": ["aws:PrincipalTag/x"],
+        "ResourceSpecificResults": [
+            {"EvalResourceName": "target-a", "EvalResourceDecision": "implicitDeny"},
+            {"EvalResourceName": "target-b", "EvalResourceDecision": "allowed"},
+            {"EvalResourceName": "target-c", "EvalResourceDecision": "explicitDeny"},
+        ]}])
+    assert pairs == {("iam:PutRolePolicy", "target-a"),
+                     ("iam:PutRolePolicy", "target-c")}, pairs
+
+
+def test_undecided_pairs_ignores_decided_resources():
+    """判据是"非 allowed **且**（自己带 或 顶层带）MissingContextValues"。
+
+    allowed 的项不是"判不出"；两边都不带 MissingContextValues 的 implicitDeny
+    是"确认没有"。把这两类收进来会让 coverage 变成噪音。
+    """
+    g = _gate()
+    pairs = g.undecided_pairs([{
+        "EvalActionName": "ssm:GetParameters", "EvalDecision": "implicitDeny",
+        "EvalResourceName": "arn:aws:ssm:${Region}:${Account}:parameter",
+        "ResourceSpecificResults": [
+            {"EvalResourceName": "p1", "EvalResourceDecision": "implicitDeny",
+             "MissingContextValues": ["aws:PrincipalTag/x"]},
+            {"EvalResourceName": "p2", "EvalResourceDecision": "implicitDeny"},
+            {"EvalResourceName": "p3", "EvalResourceDecision": "allowed",
+             "MissingContextValues": ["aws:PrincipalTag/y"]},
+        ]}])
+    assert pairs == {("ssm:GetParameters", "p1")}, pairs
+
+
+def test_undecided_pairs_never_emits_an_arn_template():
+    """顶层的 `${Region}` 模板归不到具体资源 ⇒ 老实记 unattributed，
+    不要硬塞一个不存在的 ARN（那会造出一个永远存在的假成员）。"""
+    g = _gate()
+    pairs = g.undecided_pairs([{
+        "EvalActionName": "s3:GetObject",
+        "EvalResourceName": "arn:aws:s3:::${BucketName}",
+        "EvalDecision": "implicitDeny",
+        "MissingContextValues": ["aws:SourceVpc"]}])
+    assert pairs == {("s3:GetObject", "")}
+    assert not any("${" in r for _a, r in pairs)
+
+
+def test_same_principal_gaining_a_second_undecided_target_is_a_failure():
+    """同一个 principal 多出一项判不出的目标必须红。
+
+    按 principal 集合比时前后都是 {P} ⇒ 绿，而新增的那项恰好是**密钥读取**。
+    """
+    g = _gate()
+    observed = _with_required(g, {})
+    arn = "arn:aws:iam::1:role/WorkloadA"
+    before = [g.undecided_item_fp(arn, "invoke", "sites")]
+    after = before + [g.undecided_item_fp(arn, "read-param", "jwt-param")]
+    baseline = {**_baseline_of(observed), "coverage": {"undecided_items": sorted(before)}}
+    rep = g.compare_to_baseline(observed, baseline, required=REQUIRED,
+                                coverage={"undecided_items": sorted(after)})
+    assert not rep.ok, rep.render()
+
+
+def test_undecided_item_swap_is_a_failure_even_when_principal_set_is_unchanged():
+    """成员换了但数量与 principal 集合都没变 ⇒ 仍要红。"""
+    g = _gate()
+    observed = _with_required(g, {})
+    arn = "arn:aws:iam::1:role/WorkloadA"
+    before = [g.undecided_item_fp(arn, "invoke", "sites")]
+    after = [g.undecided_item_fp(arn, "read-object", "edge-asset")]
+    assert len(before) == len(after), "这条用例的前提是数量不变"
+    baseline = {**_baseline_of(observed), "coverage": {"undecided_items": before}}
+    rep = g.compare_to_baseline(observed, baseline, required=REQUIRED,
+                                coverage={"undecided_items": after})
+    assert not rep.ok, rep.render()
+
+
+def test_undecided_item_disappearing_is_an_improvement_not_a_failure():
+    g = _gate()
+    observed = _with_required(g, {})
+    arn = "arn:aws:iam::1:role/WorkloadA"
+    baseline = {**_baseline_of(observed),
+                "coverage": {"undecided_items": [g.undecided_item_fp(arn, "invoke", "sites")]}}
+    rep = g.compare_to_baseline(observed, baseline, required=REQUIRED,
+                                coverage={"undecided_items": []})
+    assert rep.ok, rep.render()
+    assert rep.improvements
+
+
+def test_undecided_count_is_only_a_doc_summary():
+    """`principals_with_missing_context`（162 那个）继续只报 delta、不参与红绿。
+
+    它会随账号里任何一条带 Condition 的新策略变动 ⇒ 让它决定退出码就会训练出
+    无脑更新基线。红绿由 item 级集合负责。
+    """
+    g = _gate()
+    observed = _with_required(g, {})
+    baseline = {**_baseline_of(observed),
+                "facts": {"principals_with_missing_context": 162},
+                "coverage": {"undecided_items": []}}
+    rep = g.compare_to_baseline(observed, baseline, required=REQUIRED,
+                                facts={"principals_with_missing_context": 200},
+                                coverage={"undecided_items": []})
+    assert rep.ok, "这个数不该影响退出码"
+    assert "+38" in rep.render()
+
+
+def test_undecided_resource_class_folds_sites_but_not_platform_functions():
+    """站点函数折叠成 `sites`（逐站点会让每次建站都改基线）；
+    平台函数保留精确名字——「对 site-panel 判不出」与「对 undeploy 判不出」不是一回事。
+
+    限定符（alias/version）刻意折叠掉：版本号每次部署都变，带上它会让 coverage
+    每次部署漂移。
+    """
+    g = _gate()
+    t = _targets(g)
+    fn = "arn:aws:lambda:us-east-1:1:function:{}".format
+    assert g.undecided_resource_class(fn("site-a"), t) == "sites"
+    assert g.undecided_resource_class(fn("site-b"), t) == "sites"
+    assert g.undecided_resource_class(fn("site-panel"), t) == "fn:site-panel"
+    assert g.undecided_resource_class(fn("site-panel") + ":blue", t) == "fn:site-panel"
+    assert g.undecided_resource_class(t.jwt_parameter, t) == "jwt-param"
+    assert g.undecided_resource_class(t.edge_assets[0], t) == "edge-asset"
+    assert g.undecided_resource_class("", t) == "unattributed"
+
+
+def test_undecided_item_fp_carries_no_principal_name():
+    g = _gate()
+    fp = g.undecided_item_fp(f"arn:aws:iam::{_ACCT}:role/Secret", "invoke", "sites")
+    assert re.fullmatch(_FP_RE, fp)
+    assert "Secret" not in fp and _ACCT not in fp
