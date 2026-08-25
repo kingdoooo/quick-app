@@ -1324,3 +1324,156 @@ def test_raw_forbidden_pattern_scan_still_covers_free_text_fields():
     assert not list(_non_fingerprint_leaves(leaked)), (
         "结构化检查竟然抓住了 note —— 那这条用例的前提变了，"
         "重新想一遍两层的分工再改")
+
+
+# ==========================================================================
+# A.2：bootstrap 桶的 bucket policy 静态快照
+#
+# 这是唯一影响「62 个 principal / 57 个能拿密钥」可信度的洞：
+# `SimulatePrincipalPolicy` **对 role 不纳入 resource-based policy**，而 S3 bucket
+# policy 单独就能授权读 asset（桶里有 9 个仍带活密钥的对象）。有人往桶上加一条 Allow，
+# A 那一层会全绿而实际多了能读签名密钥的人。**丢掉现有的 TLS Deny 同样要红。**
+# ==========================================================================
+
+# 刻意不写成 12 位数字**字面量**：`scan_staged_secrets.sh` 按 `[0-9]{12}` 找账号 ID，
+# 多一个字面量就多一次要人工解释的"预期命中"，而反复的假阳性会训练出无脑 --allow-hits。
+_ACCT = "0" * 12          # 仓库既有的占位账号
+_OTHER_ACCT = "9" * 12    # 另一个账号，用来证明**外部**账号 ID 不被归一化
+
+_BUCKET_TLS_DENY = {
+    "Sid": "AllowSSLRequestsOnly", "Effect": "Deny", "Principal": "*",
+    "Action": "s3:*",
+    "Resource": [f"arn:aws:s3:::cdk-assets-{_ACCT}-us-east-1",
+                 f"arn:aws:s3:::cdk-assets-{_ACCT}-us-east-1/*"],
+    "Condition": {"Bool": {"aws:SecureTransport": "false"}},
+}
+_BUCKET_ROGUE_ALLOW = {
+    "Sid": "oops", "Effect": "Allow",
+    "Principal": {"AWS": f"arn:aws:iam::{_ACCT}:role/Rogue"},
+    "Action": "s3:GetObject",
+    "Resource": f"arn:aws:s3:::cdk-assets-{_ACCT}-us-east-1/*",
+}
+
+
+def _bucket_baseline(g, observed, statements):
+    fps = sorted({g.canonical_statement_fp(s, account=_ACCT) for s in statements})
+    return {**_baseline_of(observed),
+            "resource_policies": {"platform": {}, "site_alias_canonical": [],
+                                  "site_version_canonical": [], "site_legacy_canonical": [],
+                                  "site_legacy_exempt": [], "bootstrap_bucket": fps}}
+
+
+def _bucket_rp(g, statements, texts=None):
+    return {"platform": {}, "sites": {},
+            "bootstrap_bucket": sorted({g.canonical_statement_fp(s, account=_ACCT)
+                                        for s in statements}),
+            "bootstrap_bucket_texts": texts or {}}
+
+
+def test_bootstrap_bucket_policy_added_allow_is_a_failure():
+    """往 bootstrap 桶上加一条 Allow —— 模拟器这条通道完全看不见（AWS 契约：
+    它不自动纳入 resource policy，对 role 更是不支持模拟），只有这份快照能咬住。"""
+    g = _gate()
+    observed = _with_required(g, {})
+    rep = g.compare_to_baseline(
+        observed, _bucket_baseline(g, observed, [_BUCKET_TLS_DENY]), required=REQUIRED,
+        resource_policies=_bucket_rp(g, [_BUCKET_TLS_DENY, _BUCKET_ROGUE_ALLOW]))
+    assert not rep.ok, rep.render()
+    assert "bootstrap" in rep.render()
+
+
+def test_bootstrap_bucket_policy_losing_the_tls_deny_is_a_failure():
+    """**消失也红**：删掉那条 TLS Deny 是实实在在的扩权。
+
+    只比"新增"的实现会让这条绿——而整条 bucket policy 被删掉时症状也是"少了语句"。
+    """
+    g = _gate()
+    observed = _with_required(g, {})
+    rep = g.compare_to_baseline(
+        observed, _bucket_baseline(g, observed, [_BUCKET_TLS_DENY]), required=REQUIRED,
+        resource_policies=_bucket_rp(g, []))
+    assert not rep.ok, rep.render()
+
+
+def test_bootstrap_bucket_policy_condition_change_is_a_failure():
+    """`Condition` 变了（`SecureTransport false` → `true`，语义整个反过来）必须红。"""
+    g = _gate()
+    observed = _with_required(g, {})
+    flipped = {**_BUCKET_TLS_DENY, "Condition": {"Bool": {"aws:SecureTransport": "true"}}}
+    rep = g.compare_to_baseline(
+        observed, _bucket_baseline(g, observed, [_BUCKET_TLS_DENY]), required=REQUIRED,
+        resource_policies=_bucket_rp(g, [flipped]))
+    assert not rep.ok, rep.render()
+
+
+def test_canonical_statement_fp_ignores_sid_and_array_order():
+    """改个 `Sid` 不是授权变化（留着只制造噪音）；数组顺序也不是。"""
+    g = _gate()
+    a = g.canonical_statement_fp(_BUCKET_TLS_DENY, account=_ACCT)
+    b = g.canonical_statement_fp({**_BUCKET_TLS_DENY, "Sid": "renamed"}, account=_ACCT)
+    c = g.canonical_statement_fp(
+        {**_BUCKET_TLS_DENY, "Resource": list(reversed(_BUCKET_TLS_DENY["Resource"]))},
+        account=_ACCT)
+    assert a == b == c
+    assert re.fullmatch(_FP_RE, a)
+
+
+def test_current_account_id_is_normalized():
+    """**当前**账号 ID 必须归一化掉：否则换个账号跑同一份基线会全量漂移，
+    而且账号原值会进指纹的输入。"""
+    g = _gate()
+    here = g.canonical_statement_fp(_BUCKET_TLS_DENY, account=_ACCT)
+    # 同一条语句整体搬到另一个账号，并以那个账号为"当前账号"归一化 ⇒ 同指纹
+    moved = json.loads(json.dumps(_BUCKET_TLS_DENY).replace(_ACCT, _OTHER_ACCT))
+    there = g.canonical_statement_fp(moved, account=_OTHER_ACCT)
+    assert here == there, "当前账号 ID 没被归一化——换账号跑就会全量漂移"
+    assert _ACCT not in here and _OTHER_ACCT not in here
+
+
+def test_changing_to_an_external_account_changes_the_fingerprint():
+    """**只归一化当前账号**：语句里出现**另一个**账号的 principal 是重要漂移，必须改指纹。
+
+    把所有 12 位数字都替换成 `<acct>` 的写法，会让"授权给外部账号"与"授权给本账号"
+    变成同一个指纹——而跨账号信任被引入的那一刻，正是这道闸门最该红的时候。
+    """
+    g = _gate()
+    here = g.canonical_statement_fp(_BUCKET_ROGUE_ALLOW, account=_ACCT)
+    external = {**_BUCKET_ROGUE_ALLOW,
+                "Principal": {"AWS": f"arn:aws:iam::{_OTHER_ACCT}:role/Rogue"}}
+    assert g.canonical_statement_fp(external, account=_ACCT) != here, \
+        "换成外部账号的 principal 却是同一个指纹——跨账号信任的引入会静静地绿"
+
+
+def test_fingerprint_and_text_share_one_canonicalization():
+    """指纹相同的两条语句，人读原文也必须相同。
+
+    两边各自归一化时，「只排顶层键」的文本会随 AWS 返回的数组顺序变化 ⇒
+    双跑 `--dump-observed` 的 `texts` 出现无意义 diff，而确定性检查会误报
+    「快照不确定」，把人引去查根本不存在的不确定性。
+    """
+    g = _gate()
+    a = {"Effect": "Allow", "Action": ["iam:PutRolePolicy", "iam:AttachRolePolicy"],
+         "Resource": "*"}
+    b = {"Effect": "Allow", "Action": ["iam:AttachRolePolicy", "iam:PutRolePolicy"],
+         "Resource": "*"}
+    assert g.canonical_statement_fp(a, account=_ACCT) \
+        == g.canonical_statement_fp(b, account=_ACCT)
+    assert g.canonical_statement_text(a, account=_ACCT) \
+        == g.canonical_statement_text(b, account=_ACCT), \
+        "指纹相同而文本不同 ⇒ 双跑 dump 的 texts 会漂移，确定性检查会误报"
+
+
+def test_report_prints_normalized_statement_for_each_diff():
+    """报文要打印**归一化后的语句原文**（运行时 stdout，不落仓库），
+    否则人拿到一串指纹无从判断该不该更新基线——那就会训练出无脑更新。"""
+    g = _gate()
+    observed = _with_required(g, {})
+    rogue_fp = g.canonical_statement_fp(_BUCKET_ROGUE_ALLOW, account=_ACCT)
+    rp = _bucket_rp(g, [_BUCKET_TLS_DENY, _BUCKET_ROGUE_ALLOW],
+                    texts={rogue_fp: g.canonical_statement_text(_BUCKET_ROGUE_ALLOW,
+                                                                account=_ACCT)})
+    rep = g.compare_to_baseline(
+        observed, _bucket_baseline(g, observed, [_BUCKET_TLS_DENY]), required=REQUIRED,
+        resource_policies=rp)
+    assert "s3:GetObject" in rep.render(), "报文里没有语句原文"
+    assert _ACCT not in rep.render(), "报文里出现了当前账号 ID 原值"

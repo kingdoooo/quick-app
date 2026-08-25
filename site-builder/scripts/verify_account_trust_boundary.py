@@ -536,6 +536,58 @@ def statement_fingerprint(statement: dict, *, account: str, function: str,
     return _group(hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16])
 
 
+def canonicalize_statement(statement: dict, *, account: str) -> str:
+    """policy 语句 → **唯一**的归一化 JSON 串。指纹与人读原文都由它产出，所以
+    "双跑确定"与"人看到的 diff"用的是同一个 oracle。
+
+    两边各自归一化时，只排顶层键的那一边会随 AWS 返回的数组顺序变化 ⇒ 指纹稳而
+    文本漂移，于是双跑 `--dump-observed` 的确定性检查会**误报**"快照不确定"，
+    把人引去查一个根本不存在的不确定性。
+
+    归一化：丢顶层 `Sid`（改名不是授权变化，留着只制造噪音）、**当前**账号 ID →
+    `<acct>`、**递归**排序字典键与数组元素（`Action: [a,b]` 与 `[b,a]` 是同一条语句）。
+
+    **只归一化当前账号**：语句里出现**另一个**账号的 principal 是重要漂移，必须改指纹。
+    把所有 12 位数字都替换掉会让"授权给外部账号"与"授权给本账号"变成同一个指纹，
+    而跨账号信任被引入的那一刻正是最该红的时候。
+
+    `Condition` / `Resource` / `NotResource` **原样保留**——把它们排除出去，
+    语义反转的改动（`SecureTransport false` → `true`）就会全绿。
+    """
+    def norm(node):
+        if isinstance(node, dict):
+            return {k: norm(v) for k, v in sorted(node.items())}
+        if isinstance(node, list):
+            return sorted((norm(x) for x in node),
+                          key=lambda x: json.dumps(x, sort_keys=True, ensure_ascii=False))
+        return node
+
+    body = {k: norm(v) for k, v in sorted(statement.items()) if k != "Sid"}
+    return json.dumps(body, sort_keys=True, ensure_ascii=False).replace(account, "<acct>")
+
+
+def canonical_statement_fp(statement: dict, *, account: str) -> str:
+    """任意 policy 语句 → 指纹。
+
+    **与 `statement_fingerprint` 是两个函数，刻意不合并**：那个专给 Lambda resource
+    policy（要把函数自身与 alias 名归一化成 `<self>` / `<alias>`，好让不同站点函数的
+    同一条语句得到同一个指纹）。合成一个会改掉 `resource_policies.platform` 里已有的
+    全部指纹，等于把一份能用的基线推平。
+    """
+    raw = canonicalize_statement(statement, account=account)
+    return _group(hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16])
+
+
+def canonical_statement_text(statement: dict, *, account: str) -> str:
+    """给人看的归一化原文。**只进 stdout 与 /tmp 快照，不进基线。**
+
+    与指纹共用 `canonicalize_statement` ⇒ 指纹相同的两条语句，文本也必然相同。
+    外部账号 ID 会原样出现在这里——刻意的：它正是要人看见的那个漂移。所以这个串
+    只进 stdout 与显式写到 /tmp 的产物，不落任何被跟踪文件。
+    """
+    return canonicalize_statement(statement, account=account)
+
+
 def resource_policy_snapshot(policies: dict[str, list[tuple[str | None, dict]]], *,
                              account: str, platform: tuple[str, ...],
                              sites: tuple[str, ...],
@@ -641,6 +693,7 @@ RED_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("missing_required",     "必需授权丢失（红）",                           "lost"),
     ("new_statements",       "新增 resource policy 语句（红）",              "grew"),
     ("site_policy_outliers", "站点函数的 resource policy 偏离规范形态（红）", "grew"),
+    ("bucket_policy_drift",  "bootstrap 桶 policy 漂移（红）",                "bucket"),
 )
 GREEN_FIELDS: tuple[tuple[str, str], ...] = (
     ("unclassified", "基线里未分类（请标注 category）"),
@@ -654,6 +707,10 @@ RED_MESSAGES = {
              "而是既有暴露面扩张。处理方式见 docs/security/account-trust-boundary.md。"),
     "lost": ("闸门红：平台自己的必需 invoke 权限丢了。真机症状是全站 403（Edge）或每次"
              "部署在健康门失败（deployer）——**先确认是不是刚做过一次收窄**，别去查网络。"),
+    "bucket": ("闸门红：CDK bootstrap 桶的 bucket policy 变了。这个桶里有 9 个仍带活密钥的 "
+               "asset，而 SimulatePrincipalPolicy **不看** bucket policy（对 role 更是不支持"
+               "模拟 resource policy）⇒ 这条通道只有这份快照能咬住。新增 Allow = 多了能读"
+               "签名密钥的人；丢掉那条 TLS Deny 同样是扩权。上面每条都打了归一化语句原文。"),
 }
 
 
@@ -664,6 +721,7 @@ class Report:
     missing_required: list[str] = field(default_factory=list)
     new_statements: list[str] = field(default_factory=list)
     site_policy_outliers: list[str] = field(default_factory=list)
+    bucket_policy_drift: list[str] = field(default_factory=list)
     improvements: list[str] = field(default_factory=list)
     unclassified: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -812,6 +870,29 @@ def _compare_resource_policies(rep: Report, base_rp: dict, now_rp: dict) -> None
         rep.improvements.append(
             f"[{fp}] 这个 legacy 站点已不再有未限定 policy（迁成 alias-only 或已下线）"
             f"——可以把它从 site_legacy_exempt 豁免名单里去掉")
+
+    _compare_bucket_policy(rep, base_rp.get("bootstrap_bucket"),
+                           now_rp.get("bootstrap_bucket"),
+                           texts=now_rp.get("bootstrap_bucket_texts") or {})
+
+
+def _compare_bucket_policy(rep: Report, base_fps, now_fps, *, texts: dict) -> None:
+    """CDK bootstrap 桶的 bucket policy：**任何 added / removed / changed 都红，不判改善。**
+
+    为什么单独有这一层：`SimulatePrincipalPolicy` 不纳入 resource-based policy（对 role
+    根本不支持模拟它），而 S3 bucket policy 单独就能授权读 asset——桶里有 9 个仍带活
+    密钥的对象。今天这个桶只有一条 `AllowSSLRequestsOnly`（Deny 非 TLS）。
+
+    **消失也红**：丢掉那条 TLS Deny 是实实在在的扩权；整条 policy 被删也走这一支。
+    **不证明什么**：不看 S3 access point（另一条命名空间，本闸门不覆盖）。
+    """
+    was, now = set(base_fps or []), set(now_fps or [])
+    for fp in sorted(now - was):
+        rep.bucket_policy_drift.append(
+            f"bootstrap 桶新增语句 [{fp}]\n      {texts.get(fp, '（原文不在本次快照里）')}")
+    for fp in sorted(was - now):
+        rep.bucket_policy_drift.append(
+            f"bootstrap 桶少了语句 [{fp}]——**消失也红**：丢掉现有的 TLS Deny 是扩权")
 
 
 def _compare_facts(rep: Report, base_facts: dict, now_facts: dict | None) -> None:
@@ -1095,6 +1176,23 @@ def function_policy_statements(lam, name: str,
     return out
 
 
+def bucket_policy_statements(s3, bucket: str) -> list[dict]:
+    """CDK bootstrap 桶的 bucket policy → 语句列表；无策略时 `[]`。
+
+    **为什么必须单独有这一层**：`SimulatePrincipalPolicy` 不纳入 resource-based policy
+    （对 role 根本不支持模拟它），而 S3 bucket policy 单独就能授权读 asset ⇒ 有人往这个
+    桶上加一条 Allow，A 那一层会全绿而实际多了能读签名密钥的人（桶里有 9 个仍带活密钥
+    的对象）。返回 `[]` 时随后会被比成"少了语句" ⇒ 红，所以整条 policy 被删也咬得住。
+    """
+    from botocore.exceptions import ClientError
+    try:
+        return policy_statements(s3.get_bucket_policy(Bucket=bucket)["Policy"])
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "NoSuchBucketPolicy":
+            raise
+        return []
+
+
 def simulate(iam, principal_arn: str, t: Targets) -> tuple[dict[str, str], bool]:
     """两次调用：函数类资源一组、其余一组。
 
@@ -1183,6 +1281,16 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
                 for name in all_functions}
     rp = resource_policy_snapshot(policies, account=account, platform=platform,
                                  sites=sites, aliases=aliases)
+
+    # bootstrap 桶的 bucket policy：模拟器看不见这条通道，而桶里有带活密钥的 asset。
+    bucket_stmts = bucket_policy_statements(clients["s3"], asset_bucket)
+    rp["bootstrap_bucket"] = sorted({canonical_statement_fp(s, account=account)
+                                    for s in bucket_stmts})
+    # 原文只进 stdout 与 /tmp 快照，**不进基线**（Principal 是带账号 ID 的角色 ARN）。
+    rp["bootstrap_bucket_texts"] = {canonical_statement_fp(s, account=account):
+                                    canonical_statement_text(s, account=account)
+                                    for s in bucket_stmts}
+    print(f"bootstrap 桶 {len(bucket_stmts)} 条 bucket policy 语句", file=sys.stderr)
 
     principals = list_principals(iam)
     print(f"账号 {account} / 区 {region}：平台函数 {len(platform)}、站点函数 "
@@ -1277,6 +1385,8 @@ def write_baseline(bundle: dict, baseline: dict, path: Path) -> None:
          "resource_policies": {
              "platform": bundle["resource_policies"]["platform"],
              **site_shape_canonicals(bundle["resource_policies"]["sites"]),
+             # 只落指纹；`bootstrap_bucket_texts` 刻意**不写**（语句原文含账号内标识）。
+             "bootstrap_bucket": bundle["resource_policies"].get("bootstrap_bucket", []),
          }},
         ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
