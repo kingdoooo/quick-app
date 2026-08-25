@@ -647,8 +647,12 @@ def test_doc_counts_come_from_the_baseline():
         "无关工作负载": count(lambda p: p["category"] == "unrelated-workload"),
         "带活密钥的asset": data["facts"]["edge_assets_carrying_live_key"],
         "带活密钥的Edge代码目标": data["facts"]["edge_code_targets_carrying_live_key"],
+        # IAM 写已移交 B 的静态快照，A 的 grant 词表里不再有它。这里仍从**旧基线的
+        # grants** 数（用 legacy 前缀），因为基线还没重写；schema 3 落地时这一项换成
+        # 从 `iam_write_statements` 数。
         "持有IAM策略变更动作": count(
-            lambda p: any(x.startswith(g.G_IAM_POLICY_WRITE) for x in p["grants"])),
+            lambda p: any(x.startswith(g.LEGACY_IAM_POLICY_WRITE_PREFIX)
+                          for x in p["grants"])),
     }
     doc = _DOC.read_text(encoding="utf-8")
     for label, n in expected.items():
@@ -702,24 +706,6 @@ def test_ssm_read_is_an_action_class_not_one_action():
     for action in g.A_READ_PARAM:
         grants = g.grants_from_decisions({f"{action}|{t.jwt_parameter}": "allowed"}, t)
         assert g.G_READ_JWT_PARAM in grants, f"{action} 单独命中时没产生 grant"
-
-
-def test_iam_write_is_an_action_class_too():
-    """IAM 策略变更同理：`PutRolePolicy` 只是其中一个动作。
-
-    这条最初不是 Codex 点的（是同一个错误类型的同类项），但第三轮它指出我**资源**
-    那一侧仍然写错——四个动作统统对着字面量 `role/*` 模拟。资源侧的用例在下面。
-    """
-    g = _gate()
-    t = _targets(g)
-    assert len(g.IAM_WRITE_ACTIONS) >= 4, f"动作等价类太窄：{g.IAM_WRITE_ACTIONS}"
-    for action in g.IAM_WRITE_ACTIONS:
-        cand = g.iam_write_candidates_from_statements(
-            [{"Effect": "Allow", "Action": action, "Resource": "*"}])
-        assert g.iam_write_grants(cand), f"{action} 单独命中时没产生 grant"
-    # 每个动作都必须有资源类型映射，否则又会拿错类型的 ARN 去问
-    for action in g.IAM_WRITE_ACTIONS:
-        assert g.iam_write_resource_kind(action) in ("role", "user", "policy")
 
 
 def test_every_live_key_asset_is_probed_not_only_the_current_one():
@@ -948,74 +934,6 @@ def test_edge_functions_are_in_the_platform_set():
 # 3 个完全不在基线里。
 # ==========================================================================
 
-def test_iam_write_action_patterns_expand():
-    """动作通配要展开：`*` / `iam:*` / `iam:Put*` 都能命中。"""
-    g = _gate()
-    assert g.expand_iam_write_actions(["*"]) == set(g.IAM_WRITE_ACTIONS)
-    assert g.expand_iam_write_actions(["iam:*"]) == set(g.IAM_WRITE_ACTIONS)
-    assert g.expand_iam_write_actions(["iam:Put*"]) == {
-        a for a in g.IAM_WRITE_ACTIONS if a.startswith("iam:Put")}
-    assert g.expand_iam_write_actions(["s3:GetObject"]) == set()
-    assert g.expand_iam_write_actions(["iam:AttachRolePolicy"]) == {"iam:AttachRolePolicy"}
-
-
-def test_exact_arn_grant_is_discovered():
-    """**Codex 的核心反例**：`PutRolePolicy` 精确授在一个角色上。
-
-    对着字面量 `role/*` 模拟时它返回 implicitDeny ⇒ 首版完全看不见。
-    静态解析必须把它找出来（再由模拟器对**具体** ARN 确认）。
-    """
-    g = _gate()
-    st = [{"Effect": "Allow", "Action": "iam:PutRolePolicy",
-           "Resource": "arn:aws:iam::000000000000:role/ExactRole"}]
-    cand = g.iam_write_candidates_from_statements(st)
-    assert cand["actions"] == {"iam:PutRolePolicy"}
-    assert cand["targets"] == ["arn:aws:iam::000000000000:role/ExactRole"]
-    assert not cand["unrestricted"]
-
-
-def test_create_policy_version_targets_a_policy_not_a_role():
-    """`iam:CreatePolicyVersion` 的资源类型是 **policy**。
-
-    把它和 `PutRolePolicy` 混在同一个 role ARN 上模拟，是"资源等价类"写错的
-    另一种形态——那个组合永远不会 allowed（除了 `Resource:*`）。
-    """
-    g = _gate()
-    assert g.iam_write_resource_kind("iam:CreatePolicyVersion") == "policy"
-    assert g.iam_write_resource_kind("iam:PutRolePolicy") == "role"
-    assert g.iam_write_resource_kind("iam:PutUserPolicy") == "user"
-
-
-def test_unrestricted_target_is_marked_and_scoped_is_not():
-    g = _gate()
-    wide = g.iam_write_candidates_from_statements(
-        [{"Effect": "Allow", "Action": "iam:AttachRolePolicy", "Resource": "*"}])
-    narrow = g.iam_write_candidates_from_statements(
-        [{"Effect": "Allow", "Action": "iam:AttachRolePolicy",
-          "Resource": "arn:aws:iam::000000000000:role/site-rt-*"}])
-    assert wide["unrestricted"] and not narrow["unrestricted"]
-    assert g.iam_write_grants(wide) == {f"{g.G_IAM_POLICY_WRITE}:any"}
-    assert g.iam_write_grants(narrow) == {f"{g.G_IAM_POLICY_WRITE}:scoped"}
-    assert g.iam_write_grants({"actions": set(), "targets": [], "unrestricted": False}) == set()
-
-
-def test_not_action_allow_counts_as_a_hit():
-    """`Allow` + `NotAction` 基本等于"除了这些之外全给"，必须保守算命中，
-    不能因为解析不出具体动作就当没有。"""
-    g = _gate()
-    cand = g.iam_write_candidates_from_statements(
-        [{"Effect": "Allow", "NotAction": "s3:*", "Resource": "*"}])
-    assert cand["actions"] == set(g.IAM_WRITE_ACTIONS)
-    assert cand["unrestricted"]
-
-
-def test_deny_statements_do_not_create_candidates():
-    g = _gate()
-    cand = g.iam_write_candidates_from_statements(
-        [{"Effect": "Deny", "Action": "iam:*", "Resource": "*"}])
-    assert not cand["actions"]
-
-
 def test_url_encoded_policy_document_is_decoded():
     """`GetAccountAuthorizationDetails` 有时把文档作为 **URL 编码的字符串**返回
     （实测踩到过）。不解码就会静默漏掉整份策略。"""
@@ -1029,17 +947,6 @@ def test_url_encoded_policy_document_is_decoded():
     assert g.policy_statements(doc) == doc["Statement"]
     # 单条语句不是 list 的形态也要吃下
     assert g.policy_statements({"Statement": doc["Statement"][0]}) == doc["Statement"]
-
-
-def test_concrete_target_makes_a_simulatable_arn():
-    """模拟器要的是**具体** ARN：`role/site-rt-*` 这种模式要落成一个具体名字，
-    否则又变成拿字面量去问。"""
-    g = _gate()
-    got = g.concrete_target("arn:aws:iam::000000000000:role/site-rt-*", "role",
-                            account="000000000000")
-    assert "*" not in got and got.startswith("arn:aws:iam::000000000000:role/site-rt-")
-    wide = g.concrete_target("*", "policy", account="000000000000")
-    assert wide.startswith("arn:aws:iam::000000000000:policy/")
 
 
 # ---- P2a：alias 类内部的成员变化 -----------------------------------------
@@ -1146,73 +1053,6 @@ def test_site_all_stays_a_stable_aggregate():
 
 
 # ---- IAM 写的确认有**三种**结果，不是两种 -------------------------------
-
-def test_iam_write_probe_outcomes_are_three_valued():
-    """确认步骤必须区分「确认有」「判不出」「确认没有」。
-
-    实测现场：一个角色的 `AttachRolePolicy` 被 `iam:PolicyARN` 的 ArnEquals 限定到
-    两个无害的 AWS 托管策略，模拟器返回 `implicitDeny` **且带
-    `MissingContextValues`**——那是"判不出"。首版把它静默当成"没有"，
-    于是这个 principal 连基线都进不去，而它的条件哪天被放宽也没人会看见。
-    """
-    g = _gate()
-    allowed_wide = g.iam_write_grants_from_probes(
-        [{"pattern": "*", "decision": "allowed", "missing_context": False}])
-    allowed_narrow = g.iam_write_grants_from_probes(
-        [{"pattern": "arn:aws:iam::000000000000:role/X", "decision": "allowed",
-          "missing_context": False}])
-    undecided = g.iam_write_grants_from_probes(
-        [{"pattern": "arn:aws:iam::000000000000:role/X", "decision": "implicitDeny",
-          "missing_context": True}])
-    denied = g.iam_write_grants_from_probes(
-        [{"pattern": "arn:aws:iam::000000000000:role/X", "decision": "implicitDeny",
-          "missing_context": False}])
-    assert allowed_wide == {f"{g.G_IAM_POLICY_WRITE}:any"}
-    assert allowed_narrow == {f"{g.G_IAM_POLICY_WRITE}:scoped"}
-    assert undecided == {f"{g.G_IAM_POLICY_WRITE}:condition-gated"}
-    assert denied == set()
-
-
-def test_confirmed_allow_wins_over_undecided():
-    """同一个 principal 既有确认的授权、又有判不出的条件语句时，
-    以**确认**的为准——不能被"判不出"降级。"""
-    g = _gate()
-    got = g.iam_write_grants_from_probes([
-        {"pattern": "arn:aws:iam::000000000000:role/X", "decision": "implicitDeny",
-         "missing_context": True},
-        {"pattern": "*", "decision": "allowed", "missing_context": False}])
-    assert got == {f"{g.G_IAM_POLICY_WRITE}:any"}
-
-
-def test_condition_gated_widening_shows_up_as_a_new_grant():
-    """条件被放宽（`condition-gated` → `scoped`/`any`）必须是**新** grant ⇒ 红。
-    这是"判不出"这个状态存在的全部理由。"""
-    g = _gate()
-    base = _with_required(g, _observed(
-        g, WorkloadA=[f"{g.G_IAM_POLICY_WRITE}:condition-gated"]))
-    now = _with_required(g, _observed(
-        g, WorkloadA=[f"{g.G_IAM_POLICY_WRITE}:any"]))
-    rep = g.compare_to_baseline(now, _baseline_of(base), required=REQUIRED)
-    assert not rep.ok
-    assert f"{g.G_IAM_POLICY_WRITE}:any" in rep.render()
-
-
-def test_concrete_target_normalizes_a_wildcard_account_segment():
-    """跨账号模式（`arn:aws:iam::*:role/datazone*`）的**账号段**也要落成本账号。
-
-    不换的话喂给模拟器的是 `arn:aws:iam::*:role/...`——字面量 `*` 恰好会被模式里的
-    `*` 匹配上，于是答案**碰巧**是对的。碰巧对的判据下一次就可能碰巧错。
-    """
-    g = _gate()
-    got = g.concrete_target("arn:aws:iam::*:role/datazone*", "role",
-                            account="000000000000")
-    assert got.startswith("arn:aws:iam::000000000000:role/datazone")
-    assert "*" not in got
-    pol = g.concrete_target("arn:aws:iam::*:policy/connector-*", "policy",
-                            account="000000000000")
-    assert pol.startswith("arn:aws:iam::000000000000:policy/connector-")
-    assert "*" not in pol
-
 
 # ==========================================================================
 # 步 0（闸门收缩轮）：红判据与基线红线的**元守卫**
@@ -1685,3 +1525,364 @@ def test_undecided_item_fp_carries_no_principal_name():
     fp = g.undecided_item_fp(f"arn:aws:iam::{_ACCT}:role/Secret", "invoke", "sites")
     assert re.fullmatch(_FP_RE, fp)
     assert "Secret" not in fp and _ACCT not in fp
+
+
+# ==========================================================================
+# A.1 + B（**一个原子提交**）
+#
+# A.1：`iam-policy-write` 从 A 的 grant 词表移除。
+# B：IAM 写改成**纯静态文本快照**——收 role/user/group 的 inline + attached 托管 +
+#    permissions boundary，Allow 与 Deny 都收，任何 added/removed/changed 都红。
+#
+# 为什么必须同一个提交：移除 grant 而 B 还没上线 = 静默丢掉 22 个 principal 的覆盖，
+# 那是一个自己造出来的 false-green。
+#
+# B **明确不声称**：某条语句是否生效、是否构成提权链、变化方向是收紧还是放宽。
+# 原先那套「静态发现候选 → 模拟器对具体 ARN 确认 → 三值分类」已删除：它要求闸门回答
+# "谁能提权"，而那等于要造一个 IAM 权限分析器（statement 归因、Condition 语义、
+# NotResource 集合代数、policy variable、SourcePolicyType 碰撞——每修一维下一维才暴露），
+# 这是这道闸门被复审五轮的根因。
+# ==========================================================================
+
+def test_no_grant_path_produces_iam_policy_write():
+    """**行为断言**（不是 grep）：把所有探测资源都设成 allowed，
+    grant 生成路径的最大输出里也不许出现 `iam-policy-write`。"""
+    g = _gate()
+    t = _targets(g)
+    everything = {f"{a}|{r}": "allowed" for a in g.ACTIONS
+                  for r in (t.function_resources() + t.other_resources())}
+    grants = g.grants_from_decisions(everything, t)
+    assert grants, "正对照失效：全 allowed 却没产生任何 grant"
+    assert not any(x.startswith("iam-policy-write") for x in grants), sorted(grants)
+    assert not hasattr(g, "G_IAM_POLICY_WRITE"), "A 的 grant 常量还在"
+
+
+def test_the_legacy_grant_string_exists_only_for_migration():
+    """迁移代码**必须**能识别旧 grant 串，所以不能断言全文不含它——
+    但这个字面量只许出现在那一个 legacy 常量上。
+
+    用 AST 而不是 grep：注释与"提到它"的 docstring 不该让这条红。
+    """
+    import ast
+    tree = ast.parse(_SCRIPT.read_text(encoding="utf-8"))
+    holders = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+                and node.value.value == "iam-policy-write"):
+            holders |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+    assert holders == {"LEGACY_IAM_POLICY_WRITE_PREFIX"}, holders
+    exact = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Constant) and n.value == "iam-policy-write"]
+    assert len(exact) == 1, f"这个字面量出现了 {len(exact)} 次，只许在 legacy 常量上"
+
+
+# ---- B 的红绿：任何 added / removed / changed 都红 ------------------------
+
+def _iam_stmt(effect="Allow", action="iam:PutRolePolicy", resource="*", **extra):
+    return {"Effect": effect, "Action": action, "Resource": resource, **extra}
+
+
+def _fps(g, statements):
+    return sorted({g.canonical_statement_fp(s, account=_ACCT) for s in statements})
+
+
+def _b_baseline(g, observed, per_principal, *, boundaries=None, versions=None):
+    return {**_baseline_of(observed),
+            "iam_write_statements": {fp: sorted(v) for fp, v in per_principal.items()},
+            "permissions_boundaries": boundaries or {},
+            "managed_policy_versions": versions or {}}
+
+
+def _b_now(statements=None, boundaries=None, versions=None, texts=None):
+    return {"statements": statements or {}, "boundaries": boundaries or {},
+            "managed_versions": versions or {}, "texts": texts or {}}
+
+
+def test_new_iam_write_statement_is_a_failure():
+    g = _gate()
+    observed = _with_required(g, {})
+    base = {"aaaa-bbbb-cccc-dddd": _fps(g, [_iam_stmt()])}
+    now = {"aaaa-bbbb-cccc-dddd": _fps(g, [_iam_stmt(),
+                                           _iam_stmt(action="iam:AttachUserPolicy")])}
+    rep = g.compare_to_baseline(observed, _b_baseline(g, observed, base),
+                                required=REQUIRED, iam_write=_b_now(now))
+    assert not rep.ok, rep.render()
+
+
+def test_removing_a_relevant_deny_statement_is_a_failure():
+    """**这条是 B 存在的核心理由**：`Allow iam:* on *` + `Deny PutRolePolicy on EdgeRole`，
+    删掉那条 Deny 之后 **Allow 集合完全没变** ⇒ 只收 Allow 的旧设计全绿，
+    而那是实实在在的扩权。"""
+    g = _gate()
+    observed = _with_required(g, {})
+    allow = _iam_stmt(action="iam:*")
+    deny = _iam_stmt(effect="Deny", resource=f"arn:aws:iam::{_ACCT}:role/EdgeRole")
+    rep = g.compare_to_baseline(
+        observed, _b_baseline(g, observed, {"aaaa-bbbb-cccc-dddd": _fps(g, [allow, deny])}),
+        required=REQUIRED,
+        iam_write=_b_now({"aaaa-bbbb-cccc-dddd": _fps(g, [allow])}))
+    assert not rep.ok, rep.render()
+
+
+def test_removing_an_allow_statement_is_also_a_failure_not_an_improvement():
+    """Allow **消失**也红。它不等于收紧：语句可能被拆成两条更宽的、可能从 inline 挪到
+    另一份 policy，也可能是**解析器漏收了**。把"旧指纹消失"自动判成改善，
+    正好会把解析器退化显示成好消息。"""
+    g = _gate()
+    observed = _with_required(g, {})
+    base = {"aaaa-bbbb-cccc-dddd": _fps(g, [_iam_stmt(),
+                                            _iam_stmt(action="iam:AttachRolePolicy")])}
+    rep = g.compare_to_baseline(
+        observed, _b_baseline(g, observed, base), required=REQUIRED,
+        iam_write=_b_now({"aaaa-bbbb-cccc-dddd": _fps(g, [_iam_stmt()])}))
+    assert not rep.ok, rep.render()
+    assert not rep.improvements, "语句消失被判成了改善"
+
+
+def test_new_deny_statement_is_visible_in_snapshot():
+    g = _gate()
+    deny = _iam_stmt(effect="Deny", action="iam:PutRolePolicy")
+    assert g.relevant_iam_statements([deny]) == [deny], "Deny 没进快照"
+
+
+def test_changing_a_deny_condition_is_a_failure():
+    g = _gate()
+    observed = _with_required(g, {})
+    d1 = _iam_stmt(effect="Deny", Condition={"StringEquals": {"aws:PrincipalTag/env": "prod"}})
+    d2 = _iam_stmt(effect="Deny", Condition={"StringEquals": {"aws:PrincipalTag/env": "dev"}})
+    rep = g.compare_to_baseline(
+        observed, _b_baseline(g, observed, {"aaaa-bbbb-cccc-dddd": _fps(g, [d1])}),
+        required=REQUIRED, iam_write=_b_now({"aaaa-bbbb-cccc-dddd": _fps(g, [d2])}))
+    assert not rep.ok, rep.render()
+
+
+def test_statement_fingerprint_is_sensitive_to_not_resource_membership():
+    """`NotResource` 成员**增或减都是新指纹 ⇒ 都红**。
+
+    不做方向推断（"NotResource 变少 = 收紧"这类判断需要集合代数 + Condition 语义，
+    正是本轮删掉的那套）。宁可两个方向都红。
+    """
+    g = _gate()
+    base = {"Effect": "Allow", "Action": "iam:*"}          # 刻意不带 Resource
+    one = {**base, "NotResource": [f"arn:aws:iam::{_ACCT}:role/A"]}
+    two = {**base, "NotResource": [f"arn:aws:iam::{_ACCT}:role/A",
+                                   f"arn:aws:iam::{_ACCT}:role/B"]}
+    assert g.canonical_statement_fp(one, account=_ACCT) \
+        != g.canonical_statement_fp(two, account=_ACCT), \
+        "NotResource 成员被排除出指纹 ⇒ 增删都不会红"
+
+
+def test_boundary_removal_is_a_failure():
+    """**per-site 隔离整个建立在 boundary 上** ⇒ boundary 消失必须红，不是收紧。"""
+    g = _gate()
+    observed = _with_required(g, {})
+    b = {"aaaa-bbbb-cccc-dddd": {"policy_fp": "eeee-ffff-0000-1111",
+                                 "stmt_fps": ["1111-2222-3333-4444"]}}
+    rep = g.compare_to_baseline(observed, _b_baseline(g, observed, {}, boundaries=b),
+                                required=REQUIRED, iam_write=_b_now())
+    assert not rep.ok, rep.render()
+
+
+def test_boundary_statement_change_is_a_failure():
+    g = _gate()
+    observed = _with_required(g, {})
+    b = {"aaaa-bbbb-cccc-dddd": {"policy_fp": "eeee-ffff-0000-1111",
+                                 "stmt_fps": ["1111-2222-3333-4444"]}}
+    now = {"aaaa-bbbb-cccc-dddd": {"policy_fp": "eeee-ffff-0000-1111",
+                                   "stmt_fps": ["1111-2222-3333-5555"]}}
+    rep = g.compare_to_baseline(observed, _b_baseline(g, observed, {}, boundaries=b),
+                                required=REQUIRED, iam_write=_b_now(boundaries=now))
+    assert not rep.ok, rep.render()
+
+
+def test_managed_policy_version_change_is_reported_with_the_version_id():
+    """AWS 更新托管策略这类红要**自解释**，否则人只看到一串指纹变了就会无脑更新基线。"""
+    g = _gate()
+    observed = _with_required(g, {})
+    base = _b_baseline(g, observed, {"aaaa-bbbb-cccc-dddd": ["1111-2222-3333-4444"]},
+                       versions={"eeee-ffff-0000-1111": "v3"})
+    rep = g.compare_to_baseline(
+        observed, base, required=REQUIRED,
+        iam_write=_b_now({"aaaa-bbbb-cccc-dddd": ["1111-2222-3333-5555"]},
+                         versions={"eeee-ffff-0000-1111": "v4"}))
+    assert not rep.ok
+    assert "v3" in rep.render() and "v4" in rep.render(), "版本变化没被打出来，红不自解释"
+
+
+def test_iam_write_snapshot_does_not_call_the_simulator():
+    """守住"B 是纯静态"：任何人日后把模拟器塞回来，归因/三态那一整套问题就回来了。"""
+    g = _gate()
+    src = _SCRIPT.read_text(encoding="utf-8")
+    for gone in ("confirm_iam_write", "iam_write_grants_from_probes", "concrete_target",
+                 "_PROBE_SUFFIX", "IAM_WRITE_RESOURCE_KIND",
+                 "iam_write_candidates_from_statements"):
+        assert gone not in src, f"{gone} 还在——B 应该是纯静态的"
+    # 按**调用点**计数，不按字符串出现次数（注释里提一句不该让这条红）。
+    # 实测：改动前这个 regex 命中 2 处（confirm_iam_write 的直调 + simulate() 的分页器），
+    # 删掉前者之后只剩 A 的 simulate() 那一处。
+    calls = re.findall(r'(?:get_paginator\("|\.)simulate_principal_policy', src)
+    assert len(calls) == 1, f"模拟器调用点有 {len(calls)} 处 —— B 里塞回模拟器了？"
+
+
+# ---- fail-closed：托管策略文档/版本不许静默跳过 --------------------------
+
+def test_missing_attached_managed_policy_document_hard_fails():
+    """attached 托管策略的文档缺席时**必须硬失败**。
+
+    静默跳过整份 policy 的输出，与"这份 policy 里没有相关 IAM 写语句"**一模一样**
+    ⇒ B 的快照 false-green。boundary 已经按这条规则办，普通 attached 不能两套宽严。
+    """
+    g = _gate()
+    arn = f"arn:aws:iam::{_ACCT}:policy/Gone"
+    detail = {"RoleName": "R", "Arn": f"arn:aws:iam::{_ACCT}:role/R", "Path": "/",
+              "RolePolicyList": [], "AttachedManagedPolicies": [{"PolicyArn": arn}]}
+    with pytest.raises(SystemExit) as exc:
+        g.statements_for_entity(detail, "RolePolicyList", managed={}, versions={})
+    assert arn in str(exc.value)
+
+
+def test_missing_managed_policy_version_hard_fails():
+    """版本未知时不许拿 "?" 兜底写进基线——那等于把"不知道"记成一个值。"""
+    g = _gate()
+    arn = f"arn:aws:iam::{_ACCT}:policy/NoVersion"
+    detail = {"RoleName": "R", "Arn": f"arn:aws:iam::{_ACCT}:role/R", "Path": "/",
+              "RolePolicyList": [], "AttachedManagedPolicies": [{"PolicyArn": arn}]}
+    with pytest.raises(SystemExit):
+        g.statements_for_entity(detail, "RolePolicyList",
+                                managed={arn: {"Statement": []}}, versions={})
+
+
+def test_statements_carry_their_source_policy_arn():
+    """语句必须带来源，`managed_policy_versions` 才能只记**贡献了相关语句**的那几份。
+
+    账号里实测有 300 份托管策略；全记进基线的话，AWS 每更新任意一份都会红一次，
+    而那种噪音会训练出无脑更新基线。
+    """
+    g = _gate()
+    arn = f"arn:aws:iam::{_ACCT}:policy/Contributing"
+    other = f"arn:aws:iam::{_ACCT}:policy/Irrelevant"
+    detail = {"RoleName": "R", "Arn": f"arn:aws:iam::{_ACCT}:role/R", "Path": "/",
+              "RolePolicyList": [{"PolicyName": "p",
+                                  "PolicyDocument": {"Statement": [_iam_stmt()]}}],
+              "AttachedManagedPolicies": [{"PolicyArn": arn}, {"PolicyArn": other}]}
+    managed = {arn: {"Statement": [_iam_stmt(action="iam:AttachRolePolicy")]},
+               other: {"Statement": [_iam_stmt(action="s3:GetObject")]}}
+    versions = {arn: "v2", other: "v1"}
+    got = g.statements_for_entity(detail, "RolePolicyList", managed=managed,
+                                  versions=versions)
+    contributing = {src for src, st in got if g.is_relevant_iam_statement(st)}
+    assert contributing == {None, arn}, f"贡献者应只有 inline 与 {arn}，实际 {contributing}"
+
+
+# ---- F4：动作 glob（B 唯一的漏报入口）------------------------------------
+
+def test_middle_wildcard_action_expands():
+    """**实测**：旧实现只处理尾部 `*`，`iam:*RolePolicy` 返回**空集**
+    ⇒ 那条语句整个漏不进快照，闸门跑绿。"""
+    g = _gate()
+    assert g.expand_relevant_actions(["iam:*RolePolicy"]) == {
+        a for a in g.IAM_WRITE_ACTIONS if a.endswith("RolePolicy")}
+    assert g.expand_relevant_actions(["iam:*PolicyVersion"]) == {
+        a for a in g.IAM_WRITE_ACTIONS if a.endswith("PolicyVersion")}
+    assert g.expand_relevant_actions(["iam:Attach?olePolicy"]) == {"iam:AttachRolePolicy"}
+
+
+def test_action_glob_is_case_insensitive_both_ways():
+    """模式与动作名的大小写都不该影响匹配（IAM 的动作名是大小写不敏感的）。
+
+    期望值**从动作类推导**而不是写死：`iam:putrole*` 现在同时命中 `PutRolePolicy` 与
+    `PutRolePermissionsBoundary`，写死一个就会在往类里加成员时红在无关的地方。
+    """
+    g = _gate()
+    assert g.expand_relevant_actions(["IAM:PUTROLEPOLICY"]) == {"iam:PutRolePolicy"}
+    assert g.expand_relevant_actions(["iam:putrole*"]) == {
+        a for a in g.IAM_WRITE_ACTIONS if a.lower().startswith("iam:putrole")}
+    assert len(g.expand_relevant_actions(["iam:putrole*"])) >= 2, \
+        "前缀通配只命中一个？动作类里该有 PutRolePolicy 与 PutRolePermissionsBoundary"
+
+
+def test_action_expansion_is_a_superset_of_an_independent_oracle():
+    """**独立 oracle**：历史上测试复刻了实现的假设，于是实现和测试一起绿。
+
+    这条不复用 fnmatch——它把 IAM 的通配语义直接翻成正则（`*`→`.*`、`?`→`.`），
+    再断言实现是它的**超集**。欠匹配（= 语句漏进快照 = false-green）会被抓住；
+    过匹配（fnmatch 把 `[seq]` 当字符类）是安全方向，允许。
+    """
+    g = _gate()
+
+    def oracle(pattern):
+        rx = "".join(".*" if c == "*" else "." if c == "?" else re.escape(c)
+                     for c in pattern)
+        return {a for a in g.IAM_WRITE_ACTIONS
+                if re.fullmatch(rx, a, flags=re.IGNORECASE)}
+
+    for pattern in ("*", "iam:*", "iam:Put*", "iam:*RolePolicy", "iam:*PolicyVersion",
+                    "iam:*PermissionsBoundary", "iam:Set*", "*Policy", "iam:?ut*",
+                    "IAM:*ROLE*", "s3:GetObject", "iam:PutRolePolicy"):
+        got, want = g.expand_relevant_actions([pattern]), oracle(pattern)
+        assert got >= want, f"{pattern!r} 欠匹配：漏了 {sorted(want - got)}"
+
+
+def test_not_action_excluding_iam_write_yields_nothing():
+    """`Allow NotAction iam:*` 明确排除了全部 IAM 写动作 ⇒ 不该进快照。
+
+    旧实现对任何 `NotAction` 一律保守算全命中，把"明确排除了 iam:*"也拖进来——
+    噪音换不来信号。补集算得出来时就算准的。
+    """
+    g = _gate()
+    assert g.relevant_iam_statements(
+        [{"Effect": "Allow", "NotAction": "iam:*", "Resource": "*"}]) == []
+    wide = {"Effect": "Allow", "NotAction": "s3:*", "Resource": "*"}
+    assert g.relevant_iam_statements([wide]) == [wide], "NotAction s3:* 命中全部 IAM 写动作"
+
+
+# ---- F6：group 策略 -------------------------------------------------------
+
+def test_group_inline_policy_enters_the_snapshot():
+    """用户经 group 拿到的 IAM 写语句必须进 B 的快照。
+
+    **只影响 B**：A 走 `SimulatePrincipalPolicy(PolicySourceArn=user)`，
+    模拟器本来就评估 group 策略。**实测账号内 0 个 group ⇒ 基线不变**，
+    但缺了这一层，哪天建了 group 就是一个静默的漏报口。
+    """
+    g = _gate()
+    detail = {"UserName": "U", "Arn": f"arn:aws:iam::{_ACCT}:user/U",
+              "GroupList": ["Admins"], "UserPolicyList": [], "AttachedManagedPolicies": []}
+    groups = {"Admins": {"GroupName": "Admins",
+                         "GroupPolicyList": [{"PolicyName": "p",
+                                              "PolicyDocument": {"Statement": [_iam_stmt()]}}],
+                         "AttachedManagedPolicies": []}}
+    got = g.statements_for_user(detail, groups=groups, managed={}, versions={})
+    assert (None, _iam_stmt()) in got, "group 的 inline 策略没被并进用户语句"
+
+
+def test_group_managed_policy_enters_the_snapshot():
+    g = _gate()
+    arn = f"arn:aws:iam::{_ACCT}:policy/GroupManaged"
+    detail = {"UserName": "U", "Arn": f"arn:aws:iam::{_ACCT}:user/U",
+              "GroupList": ["Admins"], "UserPolicyList": [], "AttachedManagedPolicies": []}
+    groups = {"Admins": {"GroupName": "Admins", "GroupPolicyList": [],
+                         "AttachedManagedPolicies": [{"PolicyArn": arn}]}}
+    got = g.statements_for_user(detail, groups=groups,
+                                managed={arn: {"Statement": [_iam_stmt()]}},
+                                versions={arn: "v1"})
+    assert (arn, _iam_stmt()) in got, "group 附加的托管策略没被并进用户语句"
+
+
+# ---- 三个新动作各一条只命中该新成员的用例 --------------------------------
+
+@pytest.mark.parametrize("action", ["iam:SetDefaultPolicyVersion",
+                                    "iam:PutRolePermissionsBoundary",
+                                    "iam:DeleteRolePermissionsBoundary"])
+def test_new_iam_write_action_is_in_the_class(action):
+    """往动作等价类里加成员时，同时加一条**只命中该新成员**的用例。
+
+    `SetDefaultPolicyVersion`：不改任何语句就能把托管策略切到另一个版本。
+    `Put/DeleteRolePermissionsBoundary`：**per-site 隔离整个建立在 boundary 上**，
+    能改 boundary 就等于能拆掉那道隔离。
+    """
+    g = _gate()
+    assert action in g.IAM_WRITE_ACTIONS
+    assert g.expand_relevant_actions([action]) == {action}
+    st = _iam_stmt(action=action)
+    assert g.relevant_iam_statements([st]) == [st]

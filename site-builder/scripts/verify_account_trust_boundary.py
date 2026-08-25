@@ -49,18 +49,27 @@ cookie 与 `scope=console` 的 `__Host-sb_console`（同一个 `/site-builder/jw
    在每次 blue/green 切换时产生漂移却不带来任何安全信号。**颜色级完整性不由这一层
    负责**——它由 ② 的逐成员比对、部署期的健康门与 `smoke_router.sh` 覆盖。
 
-② **IAM 策略变更**（`iam-policy-write`）走**两步**，不和上面一起模拟：
-   先静态解析全部 identity policy 发现候选（`iam:*` / `iam:Put*` 这类通配要展开，
-   `Allow`+`NotAction` 保守算命中），再用模拟器对**具体** ARN 确认——资源按动作的
-   资源类型落（role / user / **policy**）。判定**三值**：确认有（`:any` / `:scoped`）、
-   判不出（`:condition-gated`，模拟器给 implicitDeny 但带 `MissingContextValues`）、
-   确认没有。三值是必需的：实测某角色的 `AttachRolePolicy` 被 `iam:PolicyARN`
-   限定到两个无害的托管策略，把"判不出"当成"没有"会让它连基线都进不去，
-   条件哪天放宽也没人看见。
+② **IAM 策略变更**——**纯静态文本快照，不做权限分析，不进模拟器**（层 B）。
+   收 role / user / **group** 的 inline + attached 托管 + **permissions boundary**，
+   用**全 glob**（`fnmatch`）判语句是否与 IAM 策略变更动作相关，**Allow 与 Deny 都收**，
+   逐条归一化（丢 `Sid`、**当前**账号 ID → `<acct>`、递归排序）后只存指纹。
+   **任何 added / removed / changed 都红，不判改善。**
 
-   **这条 grant 的语义是字面的**："对至少一个真实 IAM 目标持有策略变更动作"，
-   **不是**"存在一条完整提权链"——后者还要看目标策略挂在谁身上、能否
-   AssumeRole/PassRole、boundary 拦不拦，那是可达性分析，本闸门不做。
+   **为什么"消失"也红**：Allow 消失不等于收紧——语句可能被拆成两条更宽的、可能从
+   inline 挪到另一份 policy，也可能是**解析器漏收了**；把"旧指纹消失"自动判成改善，
+   正好会把解析器退化显示成好消息。而 **Deny 消失是实实在在的扩权**
+   （`Allow iam:* on *` + `Deny PutRolePolicy on EdgeRole`，删掉 Deny 则 Allow 集合
+   完全没变 ⇒ 只收 Allow 的设计全绿）。
+
+   托管策略文档/版本解析不到时**硬失败**，不静默跳过：跳过整份 policy 的输出与
+   "这份策略没有相关语句"一模一样。`managed_policy_versions` 只记**贡献了相关语句**
+   的那几份（账号里实测有 300 份托管策略，全记会让 AWS 每更新任意一份都红一次）。
+
+   **原先那套两步（静态发现候选 → 模拟器对具体 ARN 确认 → 三值分类）已删除。**
+   它要求闸门回答"谁能提权"，而那等于要造一个 IAM 权限分析器：statement 归因、
+   Condition 语义、NotResource 集合代数、policy variable、`SourcePolicyType` 碰撞
+   ——每修一维下一维才暴露，这是这道闸门被复审五轮的根因。所以 B 的承诺刻意收窄成
+   **"可能影响这些动作的语句集合没有变化"**，仅此而已。
 
 ③ **resource policy**（`lambda:GetPolicy`，**含每个 alias 与每个已发布版本**）。
    `SimulatePrincipalPolicy` **不会**自动纳入 resource policy（AWS 契约：它只能
@@ -94,14 +103,29 @@ cookie 与 `scope=console` 的 `__Host-sb_console`（同一个 `/site-builder/jw
 
 ## 它**不**证明什么（别把它当"暴露面已穷尽"）
 
+**A（直接失守）**
+
 - `SimulatePrincipalPolicy` 对带 Condition 的策略需要调用方补 `ContextEntries`；
-  本脚本不补，于是那些 principal 的判定是**下界**。带 `MissingContextValues`
-  的 principal 数被记进基线并打印 delta。
+  本脚本不补，于是那些判定是**下界**。逐项的不确定面记在 `coverage.undecided_items`
+  （成员级：同一个 principal 多出一项判不出的目标也会红；顶层的 `MissingContextValues`
+  保守地归给该动作下每个非 allowed 的资源）。`principals_with_missing_context`
+  那个笼统计数只报 delta、不参与红绿。
 - 动作等价类不是穷尽的。
-- `iam-policy-write` 只说明持有策略变更动作，**不**证明存在可用的提权链。
-- 它只看 IAM 与 Lambda resource policy 两条通道，不看 KMS grants、
-  VPC endpoint policy、以及其它服务的 resource policy。
-- 它不看跨账号 principal，也看不见"临时建了一个角色用完就删"。
+- 它只看 IAM、Lambda resource policy、以及 bootstrap 桶的 bucket policy，
+  不看 KMS grants、VPC endpoint policy、其它服务的 resource policy，
+  **也不看 S3 access point**。
+- 它不看跨账号 principal（但语句里出现**外部账号**的 principal 会改变指纹 ⇒ 会红）。
+- 它看不见"临时建了一个角色用完就删"。
+
+**B（IAM 写观察）**
+
+- **不判断某条语句是否生效**（Condition 没求值，boundary 与 SCP 没参与评估）。
+- **不判断是否构成提权链**——那要看目标策略挂在谁身上、能否 AssumeRole/PassRole、
+  boundary 拦不拦。B 的语义就是字面意思：**存在一条可能影响 IAM 策略变更动作的语句**。
+- **不判断变化方向**是收紧还是放宽。刻意的：判方向需要的正是上面那套分析器。
+
+**C（站点 route/alias 可达性）——不由本闸门保证**，归部署验收
+（见 merged review §9）；含 **idle 颜色被整个删除检测不到**。
 
 用法（**用系统 python3 跑**，deployer/.venv 的 CA 信任库是空的）：
 
@@ -114,6 +138,7 @@ import argparse
 import ast
 import concurrent.futures as cf
 import configparser
+import fnmatch
 import hashlib
 import io
 import json
@@ -165,12 +190,13 @@ G_REPLACE_CODE = "replace-platform-code"   # + ":<函数名>"
 G_READ_EDGE_CODE = "read-edge-code"
 G_READ_EDGE_ASSET = "read-edge-asset"
 G_READ_JWT_PARAM = "read-jwt-param"
-# **名字刻意不叫 self-escalate**：持有一个 IAM 策略变更动作**不等于**存在一条完整
-# 提权链——还要看目标策略挂在谁身上、能否 AssumeRole/PassRole、boundary 拦不拦。
-# 那是可达性分析，本闸门不做（写进文档的"不证明什么"）。这条 grant 的语义就是
-# 字面意思：**对至少一个真实 IAM 目标持有策略变更动作**。
-G_IAM_POLICY_WRITE = "iam-policy-write"
 SECRET_GRANTS = (G_READ_EDGE_CODE, G_READ_EDGE_ASSET, G_READ_JWT_PARAM)
+
+# **IAM 写不再是 A 的一条 grant。** 它移到 B——那一层是纯静态文本快照，明确不声称
+# 提权链。这个前缀只为 schema 2→3 迁移保留：旧基线里 22 个 principal 带着
+# `iam-policy-write:{any,scoped,condition-gated}`，迁移要能识别并剥掉它们。
+# A 的 grant 生成路径不再产生它（`test_no_grant_path_produces_iam_policy_write`）。
+LEGACY_IAM_POLICY_WRITE_PREFIX = "iam-policy-write"
 
 # ---- 动作等价类 ----------------------------------------------------------
 # **一种能力 = 一个动作等价类 × 一个资源等价类。** 这个形状是本文件最重要的
@@ -194,22 +220,22 @@ A_READ_OBJECT = ("s3:GetObject", "s3:GetObjectVersion")
 # `GetParameterHistory` 在拒绝 `GetParameter` 时仍可能读到当前值。
 A_READ_PARAM = ("ssm:GetParameter", "ssm:GetParameters",
                 "ssm:GetParametersByPath", "ssm:GetParameterHistory")
-# IAM 策略变更动作。**不能和上面几类一起丢给模拟器**：IAM 里请求资源是具体 ARN，
-# 而 policy 里的 `role/ExactRole` 不会匹配字面量 `role/*` ⇒ 拿 `role/*` 去问，
-# 精确授权全部隐形（实测漏掉 6 个 principal）。而且 `iam:CreatePolicyVersion`
-# 的资源类型是 **policy** 不是 role，对着 role ARN 问等于永远问不到。
-# 所以这一类走"静态解析发现候选 → 模拟器对**具体** ARN 确认"两步，见
-# `iam_write_candidates_from_statements` / `confirm_iam_write`。
-IAM_WRITE_ACTIONS = ("iam:PutRolePolicy", "iam:AttachRolePolicy",
+# IAM 策略变更动作。**这一类不进模拟器**——它只用来判"哪些语句进 B 的静态快照"。
+#
+# 原先这里走的是"静态解析发现候选 → 模拟器对具体 ARN 确认 → 三值分类"两步。已删除：
+# 它要求闸门回答"谁能提权"，而那等于要造一个 IAM 权限分析器（statement 归因、
+# Condition 语义、NotResource 集合代数、policy variable、SourcePolicyType 碰撞
+# ——每修一维下一维才暴露）。B 现在只做一件窄而可签字的事：**把可能影响这些动作的
+# 语句（Allow 与 Deny）逐条指纹化，任何变化都红**，不判生效、不判提权链、不判方向。
+IAM_WRITE_ACTIONS: tuple[str, ...] = (
+                     "iam:PutRolePolicy", "iam:AttachRolePolicy",
                      "iam:UpdateAssumeRolePolicy", "iam:CreatePolicyVersion",
-                     "iam:PutUserPolicy", "iam:AttachUserPolicy")
-IAM_WRITE_RESOURCE_KIND = {
-    "iam:PutRolePolicy": "role", "iam:AttachRolePolicy": "role",
-    "iam:UpdateAssumeRolePolicy": "role",
-    "iam:CreatePolicyVersion": "policy",
-    "iam:PutUserPolicy": "user", "iam:AttachUserPolicy": "user",
-}
-
+                     "iam:PutUserPolicy", "iam:AttachUserPolicy",
+                     # 不改任何语句就能把托管策略切到另一个版本。
+                     "iam:SetDefaultPolicyVersion",
+                     # **per-site 隔离整个建立在 boundary 上** ⇒ 能改它就能拆掉那道隔离。
+                     "iam:PutRolePermissionsBoundary",
+                     "iam:DeleteRolePermissionsBoundary")
 # 限定符类：grant 串里用 `@alias` / `@version` 标出来。**不能与未限定合并**
 # ——`function:foo` 与 `function:foo:blue` 在 IAM 里是两个资源，合并之后
 # 「原来只能调 :blue、现在还能调未限定」这种扩权会静静地绿。
@@ -486,113 +512,86 @@ def policy_statements(document) -> list[dict]:
     return statements if isinstance(statements, list) else [statements]
 
 
-def expand_iam_write_actions(patterns) -> set[str]:
-    """动作模式 → 命中的 IAM 写动作集合。`*` / `iam:*` / `iam:Put*` 都要展开。"""
-    patterns = patterns if isinstance(patterns, list) else [patterns]
-    hit = set()
-    for raw in patterns:
-        pat = raw.lower()
-        if pat in ("*", "iam:*"):
-            return set(IAM_WRITE_ACTIONS)
-        if pat.endswith("*"):
-            prefix = pat[:-1]
-            hit |= {a for a in IAM_WRITE_ACTIONS if a.lower().startswith(prefix)}
-        else:
-            hit |= {a for a in IAM_WRITE_ACTIONS if a.lower() == pat}
-    return hit
+def expand_relevant_actions(patterns) -> set[str]:
+    """动作模式 → 命中的 IAM 策略变更动作。**B 唯一的漏报入口，所以用全 glob。**
 
+    用 `fnmatch.fnmatchcase` 对**小写串**匹配，不是 `endswith("*")`：实测旧写法下
+    `iam:*RolePolicy` / `iam:*PolicyVersion` / `iam:Attach?olePolicy` 都返回**空集**
+    ⇒ 这些语句整个漏不进快照，而闸门跑绿。
 
-def iam_write_resource_kind(action: str) -> str:
-    return IAM_WRITE_RESOURCE_KIND[action]
-
-
-def iam_write_candidates_from_statements(statements: list[dict]) -> dict:
-    """一个 principal 的全部语句 → IAM 写候选（动作 + 目标模式 + 是否无限制）。
-
-    **这是"发现"，不是"判定"**：静态解析不评估 Condition，所以会过报；
-    每个候选都要再用模拟器对一个**具体** ARN 确认（`confirm_iam_write`）。
-    反过来它必须是超集——已用正对照核过：模拟器用 `role/*` 找到的 16 个
-    全部落在静态解析的 22 个里。
+    用 `fnmatchcase` + 手工小写而不是 `fnmatch.fnmatch`：后者的大小写行为随文件系统变。
+    `[seq]` 在 IAM 里不是通配而 fnmatch 把它当字符类 ⇒ 那是**过报**方向（安全）。
     """
-    actions: set[str] = set()
-    targets: list[str] = []
-    unrestricted = False
-    for st in statements:
-        if st.get("Effect") != "Allow":
-            continue
-        if "NotAction" in st:
-            # `Allow` + `NotAction` 约等于"除了这些之外全给"。解析不出具体动作时
-            # 保守算命中——把它当"没有"才是危险方向。
-            hit = set(IAM_WRITE_ACTIONS)
-        else:
-            hit = expand_iam_write_actions(st.get("Action", []))
-        if not hit:
-            continue
-        actions |= hit
-        res = st.get("Resource", "*")
-        res = res if isinstance(res, list) else [res]
-        for r in res:
-            if r == "*":
-                unrestricted = True
-            targets.append(r)
-    return {"actions": actions, "targets": sorted(set(targets)),
-            "unrestricted": unrestricted}
+    pats = patterns if isinstance(patterns, list) else [patterns]
+    return {a for a in IAM_WRITE_ACTIONS for p in pats
+            if fnmatch.fnmatchcase(a.lower(), str(p).lower())}
 
 
-def iam_write_grants(candidate: dict) -> set[str]:
-    """静态解析结果 → grant（**只用于单测与文档说明**；真机走
-    `iam_write_grants_from_probes`，因为静态解析不评估 Condition）。"""
-    if not candidate.get("actions"):
-        return set()
-    scope = "any" if candidate.get("unrestricted") else "scoped"
-    return {f"{G_IAM_POLICY_WRITE}:{scope}"}
+def is_relevant_iam_statement(st: dict) -> bool:
+    """这条语句是否**可能影响 IAM 策略变更动作**。**Allow 与 Deny 都算相关。**
 
-
-def iam_write_grants_from_probes(probes: list[dict]) -> set[str]:
-    """模拟器对具体 ARN 的确认结果 → grant。**三值，不是两值。**
-
-    `probes` 的每项：`{"pattern", "decision", "missing_context"}`。
-
-    - 有 `allowed` ⇒ `:any`（目标模式是 `*`）或 `:scoped`；
-    - 全不 allowed 但**有** `MissingContextValues` ⇒ `:condition-gated`
-      ——"判不出"不能静默当成"没有"。实测现场：某角色的 `AttachRolePolicy` 被
-      `iam:PolicyARN` 的 ArnEquals 限定到两个无害的 AWS 托管策略，模拟器给
-      `implicitDeny` + 缺 `iam:PolicyARN`。把它当"没有"的话，这个 principal 连基线
-      都进不去，条件哪天被放宽也没人会看见；记成 `condition-gated` 之后，
-      放宽会表现为**新** grant ⇒ 红。
-    - 其余 ⇒ 无 grant。
+    为什么 Deny 也收：`Allow iam:* on *` + `Deny PutRolePolicy on EdgeRole`，删掉那条
+    Deny 之后 **Allow 集合完全没变** ⇒ 只收 Allow 的设计全绿，而那是实实在在的扩权。
     """
-    allowed = [p for p in probes if p.get("decision") == "allowed"]
-    if allowed:
-        scope = "any" if any(p["pattern"] == "*" for p in allowed) else "scoped"
-        return {f"{G_IAM_POLICY_WRITE}:{scope}"}
-    if any(p.get("missing_context") for p in probes):
-        return {f"{G_IAM_POLICY_WRITE}:condition-gated"}
-    return set()
+    if st.get("Effect") not in ("Allow", "Deny"):
+        return False
+    if "NotAction" in st:
+        # `NotAction` 是**补集**，算得准就算准：`NotAction: s3:*` 命中全部 IAM 写动作，
+        # `NotAction: iam:*` 一个都不命中。一律保守算全命中会把"明确排除了 iam:*"
+        # 也拖进快照，噪音换不来信号。
+        return bool(set(IAM_WRITE_ACTIONS) - expand_relevant_actions(st["NotAction"]))
+    return bool(expand_relevant_actions(st.get("Action", [])))
 
 
-# 拿来把模式落成具体 ARN 的固定后缀。**必须是固定值**：随机值会让两次运行的
-# 模拟请求不同，而"这个 principal 能不能改 IAM"的答案不该随探针名字变。
-_PROBE_SUFFIX = "sb-trust-probe"
+def relevant_iam_statements(statements: list[dict]) -> list[dict]:
+    return [st for st in statements if is_relevant_iam_statement(st)]
 
 
-def concrete_target(pattern: str, kind: str, *, account: str) -> str:
-    """目标模式 → 一个可以喂给模拟器的**具体** ARN。
+def statements_for_entity(detail: dict, inline_key: str, *, managed: dict,
+                          versions: dict) -> list[tuple[str | None, dict]]:
+    """→ `[(来源托管策略 ARN | None, 语句)]`。inline 的来源是 `None`。
 
-    模拟器要的是具体资源；拿 `role/*` 这种字面量去问，policy 里的
-    `role/ExactRole` 匹配不上 ⇒ 精确授权全部隐形（这正是首版的缺陷）。
+    语句**带来源**是为了让 `managed_policy_versions` 只记真正贡献了相关语句的那几份：
+    账号里实测有 300 份托管策略，全记进基线会让 AWS 每更新任意一份都红一次，
+    而那种噪音会训练出无脑更新基线。
+
+    **纯函数**，不发网络调用：attached 托管策略的文档与版本必须由调用方预先解析进
+    `managed` / `versions`（见 `list_principals`）。缺了就**硬失败**——静默跳过整份
+    policy 的输出与"这份 policy 里没有相关 IAM 写语句"**一模一样**，那是 false-green。
     """
-    if pattern == "*" or ":" not in pattern:
-        return f"arn:aws:iam::{account}:{kind}/{_PROBE_SUFFIX}"
-    _, _, tail = pattern.partition(f":{kind}/")
-    if not tail:
-        # 模式的资源类型与该动作不符（例如把 policy 模式配给 PutRolePolicy）：
-        # 落一个该类型下的探针名，让模拟器给出真实答案而不是靠猜。
-        return f"arn:aws:iam::{account}:{kind}/{_PROBE_SUFFIX}"
-    # **账号段一律落成本账号**：跨账号模式（`arn:aws:iam::*:role/x*`）不换的话，
-    # 喂给模拟器的字面量 `*` 恰好会被模式里的 `*` 匹配上——答案碰巧对，
-    # 而碰巧对的判据下一次就可能碰巧错。名字段里的 `*` 换成固定探针名。
-    return f"arn:aws:iam::{account}:{kind}/{tail.replace('*', _PROBE_SUFFIX)}"
+    out: list[tuple[str | None, dict]] = []
+    for pol in detail.get(inline_key, []):
+        out.extend((None, st) for st in policy_statements(pol["PolicyDocument"]))
+    for att in detail.get("AttachedManagedPolicies", []):
+        arn = att["PolicyArn"]
+        if arn not in managed:
+            raise SystemExit(
+                f"attached 托管策略 {arn} 的文档没解析到——静默跳过它与「这份策略没有"
+                f"相关 IAM 写语句」在输出上一模一样，那是 false-green")
+        if arn not in versions:
+            raise SystemExit(
+                f"attached 托管策略 {arn} 的 DefaultVersionId 未知——不能拿占位值兜底"
+                f"写进基线，那等于把「不知道」记成一个值")
+        out.extend((arn, st) for st in policy_statements(managed[arn]))
+    return out
+
+
+def statements_for_user(detail: dict, *, groups: dict, managed: dict,
+                        versions: dict) -> list[tuple[str | None, dict]]:
+    """用户自己的语句 + 它所在 **group** 的语句。
+
+    **只影响 B**：A 走 `SimulatePrincipalPolicy(PolicySourceArn=user)`，模拟器本来就
+    评估 group 策略。实测账号内 0 个 group ⇒ 加这一层不改基线，但缺了它，
+    哪天建了 group 就是一个静默的漏报口。
+    """
+    out = statements_for_entity(detail, "UserPolicyList", managed=managed,
+                               versions=versions)
+    for name in detail.get("GroupList", []):
+        gr = groups.get(name)
+        if gr is not None:
+            out.extend(statements_for_entity(gr, "GroupPolicyList",
+                                             managed=managed, versions=versions))
+    return out
 
 
 def statement_fingerprint(statement: dict, *, account: str, function: str,
@@ -775,6 +774,8 @@ RED_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("site_policy_outliers", "站点函数的 resource policy 偏离规范形态（红）", "grew"),
     ("bucket_policy_drift",  "bootstrap 桶 policy 漂移（红）",                "bucket"),
     ("new_undecided_items",  "新增判不出的项（红）",                          "undecided"),
+    ("iam_write_drift",      "IAM 写语句快照漂移（红）",                      "iam"),
+    ("boundary_drift",       "permissions boundary 漂移（红）",               "iam"),
 )
 GREEN_FIELDS: tuple[tuple[str, str], ...] = (
     ("unclassified", "基线里未分类（请标注 category）"),
@@ -796,6 +797,12 @@ RED_MESSAGES = {
                   "了新权限，但**闸门对这一块的答案退化成了下界**——先看新增那几项对应哪条 "
                   "Condition（`--dump-observed` 看带真实名字的快照），再决定是补 "
                   "ContextEntries 还是接受并更新基线。"),
+    "iam": ("闸门红：账号内可能影响 IAM 策略变更的**语句集合**变了（Allow 或 Deny），"
+            "或某个 principal 的 permissions boundary 变了。**这一层刻意只报变化、"
+            "不判方向**：它不声称语句是否生效、是否构成提权链、变化是收紧还是放宽"
+            "（判这些需要一个 IAM 权限分析器，那正是本闸门被复审五轮的根因）。"
+            "上面每条都打了归一化后的语句原文——自己 diff 一遍再决定是否更新基线。"
+            "若同一份策略的 VersionId 也变了，大概是 AWS 更新了托管策略。"),
 }
 
 
@@ -808,6 +815,8 @@ class Report:
     site_policy_outliers: list[str] = field(default_factory=list)
     bucket_policy_drift: list[str] = field(default_factory=list)
     new_undecided_items: list[str] = field(default_factory=list)
+    iam_write_drift: list[str] = field(default_factory=list)
+    boundary_drift: list[str] = field(default_factory=list)
     improvements: list[str] = field(default_factory=list)
     unclassified: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -832,7 +841,8 @@ def compare_to_baseline(observed: dict[str, dict], baseline: dict, *,
                         required: dict[str, str],
                         resource_policies: dict | None = None,
                         facts: dict | None = None,
-                        coverage: dict | None = None) -> Report:
+                        coverage: dict | None = None,
+                        iam_write: dict | None = None) -> Report:
     """observed = {fingerprint: {"name", "arn", "grants"}}。
 
     **红绿口径按类别分两套，这是刻意的不对称**：
@@ -899,8 +909,65 @@ def compare_to_baseline(observed: dict[str, dict], baseline: dict, *,
         _compare_coverage(rep, (baseline.get("coverage") or {}).get("undecided_items"),
                           coverage.get("undecided_items"))
 
+    if iam_write is not None:
+        # 第二个实参是整个 baseline：B 的三个分节都在基线顶层。
+        _compare_iam_write(rep, baseline, iam_write)
+
     _compare_facts(rep, baseline.get("facts") or {}, facts)
     return rep
+
+
+def _compare_iam_write(rep: Report, base: dict, now: dict) -> None:
+    """B：IAM 写的静态文本快照。**任何 added / removed / changed 都红，不判改善。**
+
+    **不声称**语句是否生效、是否构成提权链、变化方向是收紧还是放宽。判这些需要
+    statement 归因 + Condition 语义 + NotResource 集合代数 + policy variable，
+    也就是一个 IAM 权限分析器——那正是这道闸门被复审五轮的根因。
+
+    **为什么"消失"也红**：Allow 消失不等于收紧——语句可能被拆成两条更宽的、可能从
+    inline 挪到另一份 policy，也可能是**解析器漏收了**。把"旧指纹消失"自动判成改善，
+    正好会把解析器退化显示成好消息。而 **Deny 消失是实实在在的扩权**
+    （`Allow iam:* on *` + `Deny PutRolePolicy on EdgeRole`，删掉 Deny 则 Allow 集合
+    完全没变 ⇒ 只收 Allow 的设计全绿）。
+    """
+    texts = now.get("texts") or {}
+    base_v = base.get("managed_policy_versions") or {}
+    now_v = now.get("managed_versions") or {}
+    ver_moved = sorted(f"[{k}] {base_v.get(k)} → {now_v.get(k)}"
+                       for k in set(base_v) | set(now_v) if base_v.get(k) != now_v.get(k))
+
+    base_st, now_st = base.get("iam_write_statements") or {}, now.get("statements") or {}
+    for fp in sorted(set(base_st) | set(now_st)):
+        was, is_ = set(base_st.get(fp, [])), set(now_st.get(fp, []))
+        for s in sorted(is_ - was):
+            rep.iam_write_drift.append(
+                f"[{fp}] +语句 [{s}]\n      {texts.get(s, '（原文不在本次快照里）')}")
+        for s in sorted(was - is_):
+            rep.iam_write_drift.append(
+                f"[{fp}] -语句 [{s}]——**消失也红**：Allow 可能被拆成两条更宽的、"
+                f"可能挪到另一份 policy，也可能是解析器漏收了；Deny 消失是实实在在的扩权")
+    # 让"AWS 更新了托管策略"这类红**自解释**：否则人只看到一串指纹变了就会无脑更新基线。
+    if rep.iam_write_drift and ver_moved:
+        rep.iam_write_drift.append("托管策略版本同时变了：" + "；".join(ver_moved))
+    elif ver_moved:
+        rep.notes.append("托管策略版本变了（语句集合未变）：" + "；".join(ver_moved))
+
+    base_b, now_b = base.get("permissions_boundaries") or {}, now.get("boundaries") or {}
+    for fp in sorted(set(base_b) | set(now_b)):
+        was_b, is_b = base_b.get(fp), now_b.get(fp)
+        if was_b == is_b:
+            continue
+        if is_b is None:
+            rep.boundary_drift.append(
+                f"[{fp}] permissions boundary 整个不见了——**per-site 隔离整个建立在 "
+                f"boundary 上**，这不是收紧")
+        elif was_b is None:
+            rep.boundary_drift.append(
+                f"[{fp}] 新增了 permissions boundary {is_b['policy_fp']}")
+        else:
+            rep.boundary_drift.append(
+                f"[{fp}] boundary 变了：policy {was_b['policy_fp']} → {is_b['policy_fp']}；"
+                f"语句 ±{sorted(set(was_b['stmt_fps']) ^ set(is_b['stmt_fps']))}")
 
 
 def _compare_coverage(rep: Report, base_items, now_items) -> None:
@@ -1074,74 +1141,89 @@ def _aws_clients(region: str):
             for n in ("iam", "lambda", "sts", "s3", "ssm", "cloudformation")}
 
 
-def list_principals(iam) -> list[dict]:
-    """非 service-linked 角色 + 全部 IAM 用户，**连它们的 policy 语句一起收**。
+def resolve_managed_policy(iam, arn: str, *, docs: dict, versions: dict):
+    """托管策略 ARN → `(文档, DefaultVersionId)`。**解析不出就硬失败，绝不 continue。**
+
+    `GetAccountAuthorizationDetails` 只返回它认为"被附加"的托管策略。一旦某份缺席
+    （权限不足、返回形态变化、新的 policy 类型没进 Filter、boundary 不算附加），
+    静默跳过它的输出与"这份策略里没有相关语句"**一模一样** ⇒ B 是 false-green。
+    boundary 与普通 attached 策略走同一条路，就不会再有两套宽严不一的规则。
+    """
+    if arn in docs and arn in versions:
+        return docs[arn], versions[arn]
+    try:
+        ver = iam.get_policy(PolicyArn=arn)["Policy"]["DefaultVersionId"]
+        doc = iam.get_policy_version(PolicyArn=arn,
+                                     VersionId=ver)["PolicyVersion"]["Document"]
+    except Exception as exc:  # noqa: BLE001
+        raise SystemExit(
+            f"解析不出托管策略 {arn}：{type(exc).__name__}: {exc} —— 静默跳过它与"
+            f"「这份策略没有相关语句」在输出上一模一样，那正是 false-green") from exc
+    if doc is None:
+        raise SystemExit(f"托管策略 {arn} 的文档为空——不能当成「没有相关语句」")
+    docs[arn], versions[arn] = doc, ver
+    return doc, ver
+
+
+def list_principals(iam) -> dict:
+    """非 service-linked 角色 + 全部 IAM 用户，**连语句、boundary、托管策略版本一起收**。
+
+    → `{"principals": [{kind,name,arn,statements,boundary_arn}],
+         "policy_docs": {arn: doc}, "managed_versions": {arn: VersionId}}`
 
     **用户不能漏**：账号 owner 的 IAM 用户同样是一个 principal，只数角色会漏掉它。
-    语句是 IAM 写那一类的**发现**输入——那一类不能靠模拟器猜资源（见
-    `iam_write_candidates_from_statements`），所以要读真实策略。
+    **Group 也不能漏**：用户经 group 拿到的 IAM 写语句否则整个不可见（只影响 B——
+    A 走模拟器，它本来就评估 group 策略）。实测账号内 0 个 group，但缺了这一层，
+    哪天建了 group 就是一个静默的漏报口。
+
+    语句是 B 的输入（纯静态文本快照）。先把**全部**被引用的托管策略解析齐，
+    再交给纯函数 `statements_for_entity` —— 网络回退集中在一处，纯函数保持可单测。
     """
-    managed: dict[str, object] = {}
+    docs: dict[str, object] = {}
+    versions: dict[str, str] = {}
     roles: list[dict] = []
     users: list[dict] = []
+    groups: dict[str, dict] = {}
     for page in iam.get_paginator("get_account_authorization_details").paginate(
-            Filter=["User", "Role", "LocalManagedPolicy", "AWSManagedPolicy"]):
+            Filter=["User", "Role", "Group", "LocalManagedPolicy", "AWSManagedPolicy"]):
         roles.extend(page.get("RoleDetailList", []))
         users.extend(page.get("UserDetailList", []))
+        for gr in page.get("GroupDetailList", []):
+            groups[gr["GroupName"]] = gr
         for pol in page.get("Policies", []):
             for version in pol.get("PolicyVersionList", []):
                 if version.get("IsDefaultVersion"):
-                    managed[pol["Arn"]] = version["Document"]
+                    docs[pol["Arn"]] = version["Document"]
+                    versions[pol["Arn"]] = version["VersionId"]
 
-    def statements_of(detail: dict, inline_key: str) -> list[dict]:
-        out: list[dict] = []
-        for pol in detail.get(inline_key, []):
-            out.extend(policy_statements(pol["PolicyDocument"]))
-        for att in detail.get("AttachedManagedPolicies", []):
-            doc = managed.get(att["PolicyArn"])
-            if doc is not None:
-                out.extend(policy_statements(doc))
-        return out
+    roles = [r for r in roles if not r["Path"].startswith("/aws-service-role/")]
+
+    # 预解析：任何被引用但没出现在上面那份 map 里的托管策略都单独取（取不到就硬失败）。
+    # permissions boundary 尤其要走这一步——它**不算"被附加"**，所以可能整个缺席，
+    # 而 per-site 隔离整个建立在 boundary 上。
+    referenced: set[str] = set()
+    for detail in list(roles) + list(users) + list(groups.values()):
+        referenced |= {a["PolicyArn"] for a in detail.get("AttachedManagedPolicies", [])}
+        boundary = (detail.get("PermissionsBoundary") or {}).get("PermissionsBoundaryArn")
+        if boundary:
+            referenced.add(boundary)
+    for arn in sorted(referenced):
+        resolve_managed_policy(iam, arn, docs=docs, versions=versions)
 
     out = []
     for r in roles:
-        if r["Path"].startswith("/aws-service-role/"):
-            continue
         out.append({"kind": "role", "name": r["RoleName"], "arn": r["Arn"],
-                    "statements": statements_of(r, "RolePolicyList")})
+                    "statements": statements_for_entity(r, "RolePolicyList",
+                                                        managed=docs, versions=versions),
+                    "boundary_arn": (r.get("PermissionsBoundary") or {})
+                                    .get("PermissionsBoundaryArn")})
     for u in users:
         out.append({"kind": "user", "name": u["UserName"], "arn": u["Arn"],
-                    "statements": statements_of(u, "UserPolicyList")})
-    return out
-
-
-def confirm_iam_write(iam, principal_arn: str, candidate: dict, *,
-                      account: str) -> set[str]:
-    """静态解析出的 IAM 写候选 → 用模拟器对**具体** ARN 确认后的 grant。
-
-    静态解析不评估 Condition ⇒ 会过报，所以每个候选动作都要真问一次。
-    问的资源按动作的**资源类型**（role / user / policy）从它自己的目标模式落成
-    具体 ARN——拿字面量 `role/*` 去问是首版的缺陷，那样精确授权全部隐形。
-    判定三值化在 `iam_write_grants_from_probes` 里。
-    """
-    probes: list[dict] = []
-    for action in sorted(candidate["actions"]):
-        kind = iam_write_resource_kind(action)
-        patterns = candidate["targets"] or ["*"]
-        by_arn = {concrete_target(pat, kind, account=account): pat
-                  for pat in patterns}
-        if not by_arn:
-            continue
-        results = iam.simulate_principal_policy(
-            PolicySourceArn=principal_arn, ActionNames=[action],
-            ResourceArns=sorted(by_arn))["EvaluationResults"]
-        decisions = decisions_from_simulation(results)
-        missing = missing_context_in(results)
-        for arn, pattern in by_arn.items():
-            probes.append({"pattern": pattern,
-                           "decision": decisions.get(f"{action}|{arn}", "unknown"),
-                           "missing_context": missing})
-    return iam_write_grants_from_probes(probes)
+                    "statements": statements_for_user(u, groups=groups, managed=docs,
+                                                      versions=versions),
+                    "boundary_arn": (u.get("PermissionsBoundary") or {})
+                                    .get("PermissionsBoundaryArn")})
+    return {"principals": out, "policy_docs": docs, "managed_versions": versions}
 
 
 def site_function_names(lam, platform: tuple[str, ...]) -> tuple[str, ...]:
@@ -1407,7 +1489,49 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
                                     for s in bucket_stmts}
     print(f"bootstrap 桶 {len(bucket_stmts)} 条 bucket policy 语句", file=sys.stderr)
 
-    principals = list_principals(iam)
+    listing = list_principals(iam)
+    principals = listing["principals"]
+    policy_docs, managed_versions = listing["policy_docs"], listing["managed_versions"]
+
+    # ---- B：IAM 写的**纯静态文本快照**（不进模拟器）--------------------------
+    # 只记真正贡献了相关语句的托管策略版本：账号里实测有 300 份，全记进基线会让 AWS
+    # 每更新任意一份都红一次，而那种噪音会训练出无脑更新基线。
+    iam_stmts: dict[str, list[str]] = {}
+    boundaries: dict[str, dict] = {}
+    stmt_texts: dict[str, str] = {}
+    used_policies: dict[str, str] = {}
+
+    def _record(st: dict) -> str:
+        sfp = canonical_statement_fp(st, account=account)
+        stmt_texts[sfp] = canonical_statement_text(st, account=account)
+        return sfp
+
+    for p in principals:
+        fp = principal_fingerprint(p["arn"])
+        fps = set()
+        for src_arn, st in p["statements"]:
+            if not is_relevant_iam_statement(st):
+                continue
+            fps.add(_record(st))
+            if src_arn is not None:
+                used_policies[principal_fingerprint("policy:" + src_arn)] = \
+                    managed_versions[src_arn]
+        if fps:
+            iam_stmts[fp] = sorted(fps)
+        if p["boundary_arn"]:
+            doc, ver = resolve_managed_policy(iam, p["boundary_arn"],
+                                              docs=policy_docs, versions=managed_versions)
+            pol_fp = principal_fingerprint("policy:" + p["boundary_arn"])
+            boundaries[fp] = {"policy_fp": pol_fp,
+                              "stmt_fps": sorted({_record(st)
+                                                  for st in policy_statements(doc)})}
+            # boundary 本身也是一份托管策略 ⇒ 它的版本同样要能解释红。
+            used_policies[pol_fp] = ver
+    print(f"IAM 写静态快照：{len(iam_stmts)} 个 principal / "
+          f"{sum(len(v) for v in iam_stmts.values())} 条语句；"
+          f"{len(boundaries)} 个 principal 有 permissions boundary；"
+          f"记了版本的托管策略 {len(used_policies)} 份", file=sys.stderr)
+
     print(f"账号 {account} / 区 {region}：平台函数 {len(platform)}、站点函数 "
           f"{len(sites)}、待模拟 principal {len(principals)}；"
           f"探测资源 {len(targets.function_resources()) + len(targets.other_resources())} 个"
@@ -1422,9 +1546,6 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
     # item 级的判不出集合：成员是 (principal, 动作等价类, 资源类) 的指纹。
     # `n_missing` 那个 principal 级计数继续留作环境事实（只报 delta），红绿看这个。
     undecided: set[str] = set()
-    iam_candidates: list[str] = []
-    iam_confirmed: list[str] = []
-    iam_gated: list[str] = []
 
     with cf.ThreadPoolExecutor(max_workers=workers) as pool:
         futs = {pool.submit(simulate, iam, p["arn"], targets): p for p in principals}
@@ -1443,17 +1564,6 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
                     p["arn"], ACTION_CLASS_NAMES.get(action, action),
                     undecided_resource_class(resource, targets)))
             grants = grants_from_decisions(decisions, targets)
-            candidate = iam_write_candidates_from_statements(p["statements"])
-            if candidate["actions"]:
-                iam_candidates.append(p["name"])
-                confirmed = confirm_iam_write(iam, p["arn"], candidate,
-                                              account=account)
-                grants |= confirmed
-                if any(g.endswith(":any") or g.endswith(":scoped")
-                       for g in confirmed):
-                    iam_confirmed.append(p["name"])
-                elif confirmed:
-                    iam_gated.append(p["name"])
             if grants:
                 observed[principal_fingerprint(p["arn"])] = {
                     "name": p["name"], "arn": p["arn"], "kind": p["kind"],
@@ -1468,13 +1578,11 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
                          f"{failures[:3]}")
 
     facts["principals_with_missing_context"] = n_missing
-    # 两个数都记：候选是静态解析（不评估 Condition，会过报），确认是模拟器的答案。
-    # 差值变大说明账号里带 Condition 的 IAM 授权变多了，值得看一眼。
-    facts["iam_write_candidates"] = len(iam_candidates)
-    facts["iam_write_confirmed"] = len(iam_confirmed)
-    facts["iam_write_condition_gated"] = len(iam_gated)
     return {"principals": observed, "resource_policies": rp, "facts": facts,
             "coverage": {"undecided_items": sorted(undecided)},
+            # `texts` 只进 stdout 与 --dump-observed 的产物，**不进基线**。
+            "iam_write": {"statements": iam_stmts, "boundaries": boundaries,
+                          "managed_versions": used_policies, "texts": stmt_texts},
             "required": {"edge": edge_role_name, "deployer": DEPLOYER_EXEC_ROLE}}
 
 
@@ -1508,6 +1616,12 @@ def write_baseline(bundle: dict, baseline: dict, path: Path) -> None:
          # 只报 delta——它会随账号里任何一条带 Condition 的新策略变动。
          "coverage": bundle.get("coverage") or {"undecided_items": []},
          "principals": principals,
+         # B：IAM 写的纯静态文本快照。**只落指纹**——语句原文（`texts`）刻意不写，
+         # 它含账号内标识（Principal 是带账号 ID 的角色 ARN）。
+         "iam_write_statements": (bundle.get("iam_write") or {}).get("statements", {}),
+         "permissions_boundaries": (bundle.get("iam_write") or {}).get("boundaries", {}),
+         "managed_policy_versions": (bundle.get("iam_write") or {})
+                                    .get("managed_versions", {}),
          # 站点函数只落**规范形态 + legacy 豁免名单**，不落逐站点条目：
          # 逐站点会让每次建站/下线都改基线，而"新增即红"依赖基线是稳定的。
          "resource_policies": {
@@ -1579,7 +1693,8 @@ def main() -> int:
     rep = compare_to_baseline(observed, baseline, required=bundle["required"],
                               resource_policies=bundle["resource_policies"],
                               facts=bundle["facts"],
-                              coverage=bundle.get("coverage"))
+                              coverage=bundle.get("coverage"),
+                              iam_write=bundle.get("iam_write"))
     print("\n" + rep.render())
     # 处置文案由 RED_FIELDS 的第三列驱动（`dict.fromkeys` 去重且保序）：
     # 原先这里手抄了一遍字段名单，加红字段时最容易漏的就是这一处。
