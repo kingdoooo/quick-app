@@ -501,12 +501,16 @@ exit "$m01_rc"
 `verify_console_e2e.py` + `smoke_router.sh`（控制台与路由层）。
 
 **还有一条不属于任何部署步骤的闸门**：`verify_account_trust_boundary.py`
-（只读 IAM 模拟，约 400 个 principal，两三分钟）。它盯的不是"这次部署对不对"，而是
-**这个 AWS 账号里能冒充任意用户的身份集合有没有变大**——该集合关不掉（管理账号 SCP
-无效、Lambda 无 Deny API、应用层签名的根就是那把可被只读权限取得的 HS256 密钥），
-所以纪律是"别再长"。**触发条件是账号变化而不是本平台变化**：账号里新增任何工作负载
-（EC2 实例角色、SageMaker、EKS、另一套 CDK 栈…）之后跑一次。背景、实测证据与基线
-更新办法见 `docs/security/account-trust-boundary.md`。
+（只读；400 个 principal 逐个 IAM 模拟 + 扫 bootstrap 桶，约 5 分钟）。它盯的不是
+"这次部署对不对"，而是**这个 AWS 账号里能冒充任意用户的授权面有没有变大**——该面
+关不掉（管理账号 SCP 无效、Lambda 无 Deny API、对称签名的根就是那把可被只读权限
+取得的 HS256 密钥），所以纪律是"别再长"。它测三层：identity 授权（逐资源，不压成
+布尔标签）、Lambda resource policy（**含 alias**——M7 之后站点的 Function URL 都挂在
+`blue` 上）、以及密钥三处明文副本的事实（每次实测比对 SHA-256，根治了闸门自己会知道）。
+**触发条件是账号变化而不是本平台变化**：账号里新增任何工作负载（EC2 实例角色、
+SageMaker、EKS、另一套 CDK 栈…）之后跑一次。**改 Edge 之后也要跑**：每次 Edge 部署
+会在 bootstrap 桶里多留一个带活密钥的 asset。背景、实测证据与基线更新办法见
+`docs/security/account-trust-boundary.md`。
 
 **为什么必须有 `verify_deployed_edge.sh` 这一条**（否则整套 S1 验收对 M05/M06
 可以全绿而 Edge 根本没换）：新会话多带一个 `typ` claim，**旧 Edge 只是忽略这个

@@ -25,11 +25,15 @@ ARN，通配已清零）。不再需要"读文档时减去一层"。
 > 层，这是既定设计而非残留）；同名 cookie 遮蔽只关掉了 DoS，**没关身份混淆**
 > （攻击者持有另一个**合法** token 时仍会先被取到，根治是 host-only 会话，独立成包）；
 > **平台的安全边界就是这个 AWS 账号**——账号内任何具备只读级权限的 principal 都能取得
-> HS256 会话密钥（Edge 产物里是明文 + SSM 参数的 KMS 那道是虚的），从而以任意用户身份
-> 访问任意站点**与控制台写接口**。这条**关不掉**（管理账号 SCP 无效、Lambda 无 Deny API、
-> 应用层签名的根就是那把密钥），唯一真修复是迁独立成员账号。实测证据、为什么各种修法
-> 都不成立、以及盯住暴露面别再变大的闸门，见 `docs/security/account-trust-boundary.md`
-> ——**别按 merged review 里 M09 第 2 步的原话去收窄 invoke，那是假修复**。
+> HS256 会话密钥（**三条路**：Edge 产物里是明文、同一份产物在 CDK bootstrap S3 桶里
+> 还有 9 个带活密钥的 asset、SSM 参数的 KMS 那道是虚的），从而以任意用户身份访问任意
+> 站点**与控制台写接口**。**别按 merged review 里 M09 第 2 步的原话去收窄 invoke，
+> 那是假修复**（同一批身份还握着密钥读取与自助提权）。两条真修复都未排期：账号内改
+> **非对称签名**（Edge 只放公钥）能关掉只读那批；迁**独立成员账号**才能移出管理身份。
+> 实测数字、为什么 SCP/resource policy/对称签名都不成立、以及盯住暴露面别再变大的
+> 闸门，见 `docs/security/account-trust-boundary.md`。**那份文档里还有一条值得单独记住**：
+> 跑不可信站点依赖安装的 CodeBuild 角色能读到那把密钥（CDK 自动授的整桶读），
+> 当前唯一的隔断是 `buildspec-package.yml` 里的 `npm install --ignore-scripts`。
 
 **具体进度与闸门数字不写在本文件**（会过时）：确切数字靠下面的测试命令自己跑；
 **待办与优先级**见 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9
@@ -104,7 +108,7 @@ RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/tes
 bash site-builder/scripts/smoke_router.sh    # 路由层冒烟（会写测试数据，跑完清理；含 65s 等 Edge 缓存）
 python3 site-builder/scripts/verify_console_e2e.py      # 控制台端到端
 python3 site-builder/scripts/verify_analytics_e2e.py    # 统计端到端（二期 M5）
-# 账号信任边界的漂移闸门（只读 IAM 模拟，约 400 个 principal，两三分钟）
+# 账号信任边界的漂移闸门（只读；400 个 principal 逐个 IAM 模拟 + 扫 bootstrap 桶，约 5 分钟）
 python3 site-builder/scripts/verify_account_trust_boundary.py
 ```
 

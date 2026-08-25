@@ -48,7 +48,7 @@ Codex 复核 v2 后认可它可作为 fix plan 的事实基线，并提了 3 处
 | **M09 暴露面** | 从「panel 全部接口」收窄为「读面失守 / 写面仍被一道 HMAC 挡住 / 站点数据面失守」三分 | Codex 指出 v2 那句会被误读 |
 | **M09 写面（我对 Codex 的修正）** | Codex 把 Origin 匹配与 Content-Type 也算作写面保护——**在 direct Invoke 上这两条不提供任何保护**（合成 event 里两个头都由攻击者填）。唯一承重的是 `__Host-sb_console` 的 HMAC 验签 ⇒ **M09 写面与 M05 耦合** | 已核 `console_session.py:143-164` 与 `:131-140` |
 | **M09 验收身份** | direct Invoke 负向闸门必须用**专用低权限 role**，不能用管理员自己；且「owner 自己 invoke 仍成功」不算修复失败 | Codex 的关键提醒 |
-| **↑ 上面三行已被 v5 推翻（2026-08-25）** | 写面**没有**被挡住（密钥 35 个 principal 可读，可自签 `scope=console`）；负向探针**不做**（断言的命题不成立）。以 §4 的 M09 v5 与 `docs/security/account-trust-boundary.md` 为准 | 只读实测，见 v5 |
+| **↑ 上面三行已被 v5 推翻（2026-08-25）** | 写面**没有**被挡住（密钥 **56** 个 principal 可读，可自签 `scope=console`）；负向探针**不做**（断言的命题不成立）。以 §4 的 M09 v5 + 「v5 的自我更正」与 `docs/security/account-trust-boundary.md` 为准 | 只读实测 |
 | **M14 实现约束** | 持久化 lock 必须绑定 package.json hash / Node / npm / registry / lockfile hash，存在只有构建控制面可写的不可变位置 | Codex 补 |
 
 ---
@@ -87,7 +87,7 @@ Codex 复核 v2 后认可它可作为 fix plan 的事实基线，并提了 3 处
 |---|---|---|---|---|
 | M01 | **P1** | Claude（Codex 未发现） | 成立，当前线上未触发 | per-site IAM 资源用 `site-data-{site_id}-*` 前缀匹配，site_id 可嵌套 ⇒ 跨站点读写 |
 | M02 | **P1** | **Codex P1-2**（Claude 漏） | 成立，当前线上无坏数据 | 权限写入层把坏数据洗成合法的 `BOOL False` / `"org"`，反转 Edge 的 fail-closed |
-| M09 | **P1（条件型）** | **Codex P1-1** | **成立，三次实测；2026-08-25 的 v5 把它扩大了，结论移交 `docs/security/account-trust-boundary.md`** | 同账号 `lambda:InvokeFunction` 可对 **panel 与站点**伪造 `x-user-email`；**且冒充根本不需要 invoke**——只读级权限即可取得 HS256 会话密钥（35 个 principal 能读到），读面与**写面**一起失守。应用层结构上挡不住，唯一真修复是迁独立账号 |
+| M09 | **P1（条件型）** | **Codex P1-1** | **成立；2026-08-25 的 v5 + 自我更正把它扩大了，结论移交 `docs/security/account-trust-boundary.md`** | 同账号 `lambda:InvokeFunction` 可对 **panel 与站点**伪造 `x-user-email`；**且冒充根本不需要 invoke**——只读级权限即可取得 HS256 会话密钥（**三条**路：Edge 产物 / **CDK bootstrap asset** / SSM；**56** 个 principal 能读到），读面与**写面**一起失守。应用层对称签名结构上挡不住；账号内可用非对称签名关掉只读那批，迁独立账号才能移出管理身份 |
 | M03 | P2 | Claude（Codex 未发现） | 成立，可被普通 typo 触发 | DSQL 迁移半途失败后同输入重试不幂等，需改 SQL 或人工介入才能恢复 |
 | M05 | P2 | **双方**（Codex P1-3 / Claude F8） | 成立，两半各有条件 | 升级码可当会话用，且可**无限续期** |
 | M06 | P2 | Claude | 成立，已本地复现 | cookie 路径遮蔽 ⇒ 全平台 `/api/*` 持久性拒绝服务 |
@@ -671,6 +671,53 @@ Codex 复核 v2 后认可它可作为 fix plan 的事实基线，并提了 3 处
     跑绿也只证明「一个本来就没权限的 role 没有权限」。漂移闸门覆盖的是真问题。
   - **唯一真修复**：把平台迁到独立的 Organizations 成员账号（独立设计包，未排期）。
 
+- **v5 的自我更正（同日，Codex 对首版实现复审后。v5 的数字是错的，"唯一"也过绝对）**
+
+  Codex 复审首版闸门（commit `e79a230`）报了两条 P1 与一条 P2，**三条都成立**，
+  已逐条实测复现。更正后的完整结论在 `docs/security/account-trust-boundary.md`
+  （那份是真源，本节只记差异）。
+
+  | v5 说 | 更正后（实测） |
+  |---|---|
+  | 密钥有**两条**路可得 | **三条。** 漏掉的是 **CDK bootstrap S3 asset** |
+  | 41 个 principal 具备敏感授权、35 个能拿到密钥 | **62 / 56**（漏掉的 21 个只在 asset 那条路上） |
+  | 「唯一真修复是迁独立账号」 | 太绝对。迁账号是唯一能移出**管理身份**的办法，但「只读级工作负载能窃取密钥」这条在**现账号内**可以用**非对称签名**关掉（KMS `kms:Sign` + Edge 只放公钥）；代价见那份文档 |
+
+  **漏掉的第三条路**（`router/infrastructure/stack.py` 先把明文替换进 `index.py`，
+  随后把该目录交给 `lambda.Code.from_asset()`）：产物同时是一个 CDK file asset，
+  被上传到 `cdk-hnb659fds-assets-*` 桶。实测（asset 位置从**已部署的
+  CloudFormation 模板**取，不手抄对象 key）：
+
+  - 对象里的密钥与 SSM 值**逐字节相同**（比对 SHA-256）；
+  - 桶策略只有一条 Deny 非 TLS，没有任何限制读取的语句；
+  - 对象用 `alias/aws/s3`，该托管键 key policy 是 `Principal:*` + `ViaService=s3`
+    的**直接授权** ⇒ identity policy 里不需要任何 `kms:*`；
+  - 旧 asset 不删、密钥从未轮转 ⇒ 桶里 **9 个**对象仍带着当前有效密钥
+    （最早 2026-07-28）。轮转密钥必须连带清理它们。
+
+  **一条新的、比 M09 更贴近核心威胁模型的发现**：跑**不可信站点依赖安装**的
+  CodeBuild 角色（`site-package`）拿到了整个 bootstrap 桶的读权限——不是本仓库写的，
+  是 CDK 给 `BuildSpec.from_asset()` 自动加的（buildspec 本身也是 asset）。于是
+  「站点作者」与「平台签名密钥」之间当前只隔着 `buildspec-package.yml` 里的
+  `npm install --ignore-scripts`（外加先删站点自带 `.npmrc`）。今天不可达，
+  但那条 flag 是唯一的隔断，而站点 `package.json` 由 AI 生成、owner 可任意改。
+  **这条可以单独收窄，不必等账号迁移。**
+
+  **闸门实现的三处修正（Codex P1-2 成立）**：
+  - 授权原先压成布尔标签（`invoke-platform`），于是「某角色原来只能调
+    `site-deployer-undeploy`、现在还能调 `site-panel`」这种资源扩权**全绿**。
+    改成 grant 串（`invoke-platform:<函数名>`）后该变形立刻红（已端到端验过）。
+  - 原先没看 **Lambda resource policy**（`SimulatePrincipalPolicy` 不自动纳入它，
+    对 role 更是不支持模拟），也没看 **alias**——而 M7 之后站点的 Function URL 与
+    授权语句都挂在 `blue` 上，M7 后新建的站点未限定 policy 根本不存在。都补上了。
+  - `MissingContextValues`（实测 162 个 principal）不再被静默压成"无权限"：
+    计数进基线并打印，同时在文档里写明这道闸门**不是** fail-closed 的。
+
+  修正后的闸门对生产跑绿（约 5 分钟），并用四种变形验过该红/该绿：资源扩权、
+  平台 resource policy 新语句、站点 policy 偏离，以及「asset 不再含活密钥」时
+  **21 个 principal 退出暴露面并报成改善**（即：单独修 asset 这一条路，
+  暴露面就从 62 降到 41）。
+
 ### M10 · [P2] `--mcp-callback` 文档零出现，且裸重跑会吊销它
 
 - **代码位置**：`site-builder/scripts/deploy_pool.py:686`
@@ -1012,7 +1059,7 @@ ap-northeast-1 侧 97/97、us-east-1 侧 62/62 全部同区解析，
 | 0 | ~~**M09 的第 1 步**（只写文档）~~ **已做（2026-08-25）** | 产物 `docs/security/account-trust-boundary.md`。写的时候实测出比原判更坏的事实：冒充**不需要** invoke，只读级权限即可取得会话密钥，写面同样失守。见 §4 的 M09 v5 |
 | 1 | **M01** | 唯一一条真正的跨租户数据读写。改为精确 ARN 枚举（**不是** v1 说的一行正则） |
 | 2 | **M02** | 抵消了已经付过成本的 Edge 加固；三个 writer 统一为「判不出就拒绝投影」 |
-| 3 | **M09 的第 2 步**（2026-08-25 重定义并落地） | ~~收窄人/CI 身份策略 + direct Invoke 负向闸门~~ → 实测后判定为**假修复**（同一批身份还握着密钥读取与自助提权），负向探针也断言了一个不成立的命题。**实际落地**：漂移闸门 `scripts/verify_account_trust_boundary.py` + 仓库内基线（只存指纹），新 principal/新能力即红、平台必需 invoke 丢失也红。已对生产跑绿并做过变形测试。**唯一真修复是迁独立成员账号，未排期** |
+| 3 | **M09 的第 2 步**（2026-08-25 重定义并落地，同日按 Codex 复审重建） | ~~收窄人/CI 身份策略 + direct Invoke 负向闸门~~ → 实测后判定为**假修复**（同一批身份还握着密钥读取与自助提权），负向探针也断言了一个不成立的命题。**实际落地**：漂移闸门 `scripts/verify_account_trust_boundary.py` + 仓库内基线（只存指纹），覆盖 identity 授权（逐资源，不压布尔）/ Lambda resource policy（含 alias）/ 密钥三处副本的事实；四种变形验过能红。**两条真修复都未排期**：非对称签名（现账号内可做，关掉只读那批）与迁独立成员账号（关掉管理身份） |
 | 4 | **M05** | 给两处 verifier（`auth/session.py` 与 Edge 内嵌那份）加必填 `expected_typ`，顺带处理 `.example` 出厂开关 |
 | 5 | **M06** | 短期缓解（逐个尝试同名 cookie）门槛低、收益大；host-only 根治列入长期 |
 | 6 | M07（含闸门缺口）、M08、M10、M12 | 部署期正确性；都是小改 |
