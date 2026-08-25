@@ -2125,3 +2125,35 @@ def test_bucket_policy_statement_fingerprints_are_in_the_baseline():
     assert fps, "基线里 bootstrap_bucket 是空的——那一层没落地"
     for fp in fps:
         assert re.fullmatch(_FP_RE, fp), f"{fp!r} 不是指纹形态"
+
+
+def test_authorization_details_filter_includes_group():
+    """`GetAccountAuthorizationDetails` 的 `Filter` 必须含 `Group`。
+
+    漏掉它的后果**只在真机可见**（实测账号内 0 个 group，所以基线不变），而症状是
+    "用户经 group 拿到的 IAM 写语句整个不可见"——与"这些用户没有相关语句"在输出上
+    一模一样。所以这里用桩把那次调用的实参钉死，而不是等真机哪天建了 group 才发现。
+
+    只影响 B：A 走 `SimulatePrincipalPolicy(PolicySourceArn=user)`，模拟器本来就
+    评估 group 策略。
+    """
+    g = _gate()
+    seen = {}
+
+    class _Paginator:
+        def paginate(self, **kw):
+            seen.update(kw)
+            return [{"RoleDetailList": [], "UserDetailList": [],
+                     "GroupDetailList": [], "Policies": []}]
+
+    class _Iam:
+        def get_paginator(self, name):
+            assert name == "get_account_authorization_details", name
+            return _Paginator()
+
+    out = g.list_principals(_Iam())
+    assert out == {"principals": [], "policy_docs": {}, "managed_versions": {}}
+    assert "Group" in seen.get("Filter", []), \
+        f"Filter 里没有 Group ⇒ 经 group 的 IAM 写语句整个不可见：{seen.get('Filter')}"
+    for required in ("User", "Role", "LocalManagedPolicy", "AWSManagedPolicy"):
+        assert required in seen["Filter"], f"Filter 里少了 {required}"
