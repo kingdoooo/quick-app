@@ -113,7 +113,7 @@ bash site-builder/scripts/smoke_router.sh    # 路由层冒烟（会写测试数
 python3 site-builder/scripts/verify_console_e2e.py      # 控制台端到端
 python3 site-builder/scripts/verify_analytics_e2e.py    # 统计端到端（二期 M5）
 # 账号信任边界的漂移闸门（只读；A 直接失守 + B IAM 写静态快照两层；400 个 principal × 2 次
-# IAM 模拟 + 一次 GetAccountAuthorizationDetails + 扫 bootstrap 桶，实测约 10.5 分钟）
+# IAM 模拟 + 一次 GetAccountAuthorizationDetails + 扫 bootstrap 桶，实测约 10 分钟）
 python3 site-builder/scripts/verify_account_trust_boundary.py
 ```
 
