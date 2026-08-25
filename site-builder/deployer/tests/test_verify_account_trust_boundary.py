@@ -125,15 +125,19 @@ def test_missing_context_is_surfaced_not_swallowed():
 # --------------------------------------------------------------------------
 
 def _targets(g, *, platform=("site-panel", "site-deployer-undeploy"),
-             sites=("site-a", "site-b"), asset="arn:aws:s3:::assets/edge.zip"):
+             sites=("site-a", "site-b"),
+             assets=("arn:aws:s3:::assets/edge.zip",),
+             aliases=None, versions=None):
     fn = "arn:aws:lambda:us-east-1:1:function:{}".format
     return g.Targets(
         platform_functions=tuple(fn(n) for n in platform),
         site_functions=tuple(fn(n) for n in sites),
-        edge_function=fn("edge"),
-        edge_asset=asset,
+        edge_code_arns=(fn("edge"),),
+        edge_assets=tuple(assets),
         jwt_parameter="arn:aws:ssm:us-east-1:1:parameter/site-builder/jwt-secret",
-        any_role="arn:aws:iam::1:role/*")
+        any_role="arn:aws:iam::1:role/*",
+        alias_arns=dict(aliases or {}),
+        version_arns=dict(versions or {}))
 
 
 def test_invoke_grants_name_the_platform_function():
@@ -203,9 +207,9 @@ def test_three_secret_paths_are_separate_grants():
     g = _gate()
     t = _targets(g)
     only_code = g.grants_from_decisions(
-        {f"lambda:GetFunction|{t.edge_function}": "allowed"}, t)
+        {f"lambda:GetFunction|{t.edge_code_arns[0]}": "allowed"}, t)
     only_asset = g.grants_from_decisions(
-        {f"s3:GetObject|{t.edge_asset}": "allowed"}, t)
+        {f"s3:GetObject|{t.edge_assets[0]}": "allowed"}, t)
     only_param = g.grants_from_decisions(
         {f"ssm:GetParameter|{t.jwt_parameter}": "allowed"}, t)
     assert only_code == {g.G_READ_EDGE_CODE}
@@ -221,7 +225,7 @@ def test_asset_grant_disappears_when_the_asset_no_longer_carries_the_key():
     这条保证闸门是在**测事实**而不是复读一个写死的假设。
     """
     g = _gate()
-    t = _targets(g, asset=None)
+    t = _targets(g, assets=())
     grants = g.grants_from_decisions({"s3:GetObject|arn:aws:s3:::assets/edge.zip": "allowed"}, t)
     assert g.G_READ_EDGE_ASSET not in grants
 
@@ -276,109 +280,89 @@ def _policies(fns, extra_on=None, qualifier=None):
 
 
 def _snap(g, sites=(), platform=(), extra_on=None, qualifier=None):
+    fns = tuple(sites) + tuple(platform)
+    aliases = {fn: (qualifier,) for fn in fns} if qualifier else {}
     return g.resource_policy_snapshot(
-        _policies(tuple(sites) + tuple(platform), extra_on=extra_on,
-                  qualifier=qualifier),
-        account="000000000000", platform=tuple(platform), sites=tuple(sites))
+        _policies(fns, extra_on=extra_on, qualifier=qualifier),
+        account="000000000000", platform=tuple(platform), sites=tuple(sites),
+        aliases=aliases)
 
 
-def test_site_resource_policies_share_one_canonical_fingerprint():
+def test_site_resource_policies_share_one_fingerprint_after_normalization():
     """每个站点函数的 `edge-invoke` 语句只在"函数自己的 ARN"上不同 ⇒
     归一化后必须得到**同一个**指纹，否则规范形态无从建立、每建一个站点都漂移。"""
     g = _gate()
-    sites = ("site-a", "site-b", "site-c")
-    snap = _snap(g, sites=sites)
-    assert len({tuple(v) for v in snap["sites"].values()}) == 1
-    assert len(g.site_policy_shapes(snap["sites"])) == 1
+    snap = _snap(g, sites=("site-a", "site-b", "site-c"), qualifier="blue")
+    alias_sets = {tuple(v["alias"]) for v in snap["sites"].values()}
+    assert len(alias_sets) == 1, alias_sets
+    canon = g.site_shape_canonicals(snap["sites"])
+    assert len(canon["site_alias_canonical"]) == 1
+    assert canon["site_legacy_exempt"] == [], "alias-only 站点不该进 legacy 豁免名单"
 
 
-def test_shapes_are_enumerated_not_unioned():
-    """形态是**枚举**出来的，不是并起来的。
-
-    并集会把最宽松的那个站点当成"规范"（于是规矩的站点被报成偏离——早先版本的
-    真实缺陷）。这里三个站点里有一个多一条语句 ⇒ 必须得到**两种**形态，
-    且干净那种排在前面（出现次数多）。
-    """
+def test_canonical_alias_shape_is_the_mode_not_the_union():
+    """规范形态取**众数**：并集会把最宽松的那个站点当成规范（于是规矩的站点
+    被报成偏离——首版的真实缺陷）。"""
     g = _gate()
-    snap = _snap(g, sites=("site-a", "site-b", "site-c"), extra_on="site-c")
-    shapes = g.site_policy_shapes(snap["sites"])
-    assert len(shapes) == 2, f"形态没被分开：{shapes}"
-    assert len(shapes[0]) == 1 and len(shapes[1]) == 2, shapes
-    assert set(shapes[0]) < set(shapes[1]), "干净形态不是脏形态的子集，归一化有问题"
+    snap = _snap(g, sites=("site-a", "site-b", "site-c"), qualifier="blue",
+                 extra_on="site-c")
+    canon = g.site_shape_canonicals(snap["sites"])
+    assert len(canon["site_alias_canonical"]) == 1, canon
+    assert set(canon["site_alias_canonical"]) < set(snap["sites"]["site-c"]["alias"])
 
 
-def test_both_deployment_shapes_are_accepted_together():
-    """M7 之后两种站点形态都合法：迁移来的站点有未限定 policy，新建的只有 alias。
-    基线记下两种形态，两类站点都不该被报成偏离——否则闸门首跑就红在架构差异上。"""
+def test_legacy_sites_land_in_the_exempt_list_not_a_global_shape():
+    """有未限定 policy 的站点（M7 迁移来的）应当进**点名豁免名单**，
+    而不是把 legacy 变成人人可用的合法形态。"""
     g = _gate()
-    legacy = _snap(g, sites=("site-old",))["sites"]
+    legacy = _snap(g, sites=("site-old",))["sites"]          # 只有未限定语句
     modern = _snap(g, sites=("site-new",), qualifier="blue")["sites"]
-    both = {**legacy, **modern}
-    shapes = g.site_policy_shapes(both)
-    assert len(shapes) == 2, f"两种部署形态没被分别记下：{shapes}"
+    canon = g.site_shape_canonicals({**legacy, **modern})
+    assert canon["site_legacy_exempt"] == [g.site_fingerprint("site-old")]
+    assert canon["site_legacy_canonical"], "legacy 的未限定语句形态没被记下来"
+
+
+def test_extra_alias_statement_on_one_site_is_flagged():
+    """某个站点函数 alias 上多出一条语句（有人手工 `AddPermission`）→ 红并点名。"""
+    g = _gate()
+    clean = _snap(g, sites=("site-a", "site-b"), qualifier="blue")["sites"]
+    dirty = _snap(g, sites=("site-a", "site-b"), qualifier="blue",
+                  extra_on="site-b")["sites"]
     observed = _with_required(g, {})
     baseline = {**_baseline_of(observed),
-                "resource_policies": {"platform": {}, "site_shapes": shapes}}
+                "resource_policies": {"platform": {}, **g.site_shape_canonicals(clean)}}
     rep = g.compare_to_baseline(observed, baseline, required=REQUIRED,
-                                resource_policies={"platform": {}, "sites": both})
-    assert rep.ok, rep.render()
-
-
-def test_alias_scoped_statement_is_not_the_same_as_unqualified():
-    """挂在 `blue` 上与挂在未限定函数上是两种**不同宽度**的授权，
-    指纹必须不同——归一化时把 alias 名抹掉就会把它们混成一个。"""
-    g = _gate()
-    unqualified = _snap(g, sites=("site-a",))["sites"]["site-a"]
-    on_alias = _snap(g, sites=("site-a",), qualifier="blue")["sites"]["site-a"]
-    assert unqualified != on_alias
-
-
-def test_extra_statement_on_one_site_function_is_an_outlier():
-    """某个站点函数多出一条语句（有人手工 `AddPermission`）→ 必须红并点名它。"""
-    g = _gate()
-    clean = _snap(g, sites=("site-a", "site-b"))
-    dirty = _snap(g, sites=("site-a", "site-b"), extra_on="site-b")
-    observed = _with_required(g, {})
-    baseline = {**_baseline_of(observed),
-                "resource_policies": {
-                    "platform": {},
-                    "site_shapes": g.site_policy_shapes(clean["sites"])}}
-    rep = g.compare_to_baseline(observed, baseline, required=REQUIRED,
-                                resource_policies=dirty)
+                                resource_policies={"platform": {}, "sites": dirty})
     assert not rep.ok
     assert "site-b" in rep.render() and "多出语句" in rep.render()
 
 
-def test_site_missing_a_known_statement_is_also_flagged():
-    """反方向：某个站点函数**少**了规范语句——它已经无法经 Edge 访问了。
-    这条不是安全扩权而是功能损坏，但同样属于"投影与真源不一致"，要红。"""
+def test_site_missing_its_alias_statement_is_also_flagged():
+    """反方向：某个站点函数**少**了 alias 语句——它已无法经 Edge 访问。
+    这不是安全扩权而是功能损坏，但同属"投影与真源不一致"，要红。"""
     g = _gate()
-    clean = _snap(g, sites=("site-a", "site-b"))
-    stripped = {"platform": {}, "sites": {**clean["sites"], "site-b": []}}
+    clean = _snap(g, sites=("site-a", "site-b"), qualifier="blue")["sites"]
+    stripped = {**clean, "site-b": {"alias": [], "version": [], "unqualified": []}}
     observed = _with_required(g, {})
     baseline = {**_baseline_of(observed),
-                "resource_policies": {
-                    "platform": {},
-                    "site_shapes": g.site_policy_shapes(clean["sites"])}}
+                "resource_policies": {"platform": {}, **g.site_shape_canonicals(clean)}}
     rep = g.compare_to_baseline(observed, baseline, required=REQUIRED,
-                                resource_policies=stripped)
+                                resource_policies={"platform": {}, "sites": stripped})
     assert not rep.ok
     assert "缺语句" in rep.render()
 
 
-def test_new_site_with_the_standard_policy_does_not_drift():
-    """新建站点若是标准形态，必须**不**红——否则每次建站都要改基线，
-    而"新增即红"这条就被迫失效了。"""
+def test_new_alias_only_site_does_not_drift():
+    """新建站点若是 modern（alias-only）形态，必须**不**红——否则每次建站都要
+    改基线，而"新增即红"这条就被迫失效了。"""
     g = _gate()
-    clean = _snap(g, sites=("site-a", "site-b"))
-    grown = _snap(g, sites=("site-a", "site-b", "site-c"))
+    clean = _snap(g, sites=("site-a", "site-b"), qualifier="blue")["sites"]
+    grown = _snap(g, sites=("site-a", "site-b", "site-c"), qualifier="blue")["sites"]
     observed = _with_required(g, {})
     baseline = {**_baseline_of(observed),
-                "resource_policies": {
-                    "platform": {},
-                    "site_shapes": g.site_policy_shapes(clean["sites"])}}
+                "resource_policies": {"platform": {}, **g.site_shape_canonicals(clean)}}
     rep = g.compare_to_baseline(observed, baseline, required=REQUIRED,
-                                resource_policies=grown)
+                                resource_policies={"platform": {}, "sites": grown})
     assert rep.ok, rep.render()
 
 
@@ -428,7 +412,7 @@ def _with_required(g, observed):
     """把两条正向控制补进 observed，让用例只测想测的那一条。"""
     return {**observed,
             **_observed(g, EdgeRole=["invoke-platform:site-panel", "invoke-site:all"]),
-            **_observed(g, **{"site-deployer-exec-role": ["invoke-site:all"]})}
+            **_observed(g, **{"site-deployer-exec-role": ["invoke-site@alias:all"]})}
 
 
 def test_new_principal_is_a_failure():
@@ -484,7 +468,7 @@ def test_required_principal_present_but_without_invoke_is_a_failure():
     g = _gate()
     base = _with_required(g, {})
     now = {**_observed(g, EdgeRole=[g.G_READ_JWT_PARAM]),
-           **_observed(g, **{"site-deployer-exec-role": ["invoke-site:all"]})}
+           **_observed(g, **{"site-deployer-exec-role": ["invoke-site@alias:all"]})}
     rep = g.compare_to_baseline(now, _baseline_of(base), required=REQUIRED)
     assert not rep.ok
     assert "EdgeRole" in rep.render()
@@ -509,7 +493,10 @@ def test_baseline_carries_no_account_values():
     for fp in data["principals"]:
         assert re.fullmatch(_FP_RE, fp), f"{fp!r} 不是指纹形态"
     rp = data["resource_policies"]
-    for fps in list(rp["platform"].values()) + list(rp["site_shapes"]):
+    fp_lists = (list(rp["platform"].values())
+                + [rp["site_alias_canonical"], rp["site_version_canonical"],
+                   rp["site_legacy_canonical"], rp["site_legacy_exempt"]])
+    for fps in fp_lists:
         for fp in fps:
             assert re.fullmatch(_FP_RE, fp), f"{fp!r} 不是指纹形态"
 
@@ -555,7 +542,8 @@ def test_doc_counts_come_from_the_baseline():
     """风险模型文档里的数字必须与基线文件算出来的一致。
 
     这条防的是文档腐烂：基线更新了而文档还写着旧数字时，读文档的人会以为
-    集合没变——而"集合别再长"正是这个闸门存在的唯一理由。
+    集合没变——而"集合别再长"正是这个闸门存在的唯一理由。这一轮它就抓住了
+    两次：41→62（补上 CDK asset 那条路）、62→63（补上 `ssm:GetParameters`）。
 
     断言的形态是 `<数字> <!-- baseline:标签=<数字> -->`：**正文里显示的那个数字
     必须紧挨着标记**。只校验标记的话，标记与正文可以各写一个数，那就白防了。
@@ -580,6 +568,7 @@ def test_doc_counts_come_from_the_baseline():
                  or has_prefix(p, f"{g.G_INVOKE_SITE}:"))),
         "无关工作负载": count(lambda p: p["category"] == "unrelated-workload"),
         "带活密钥的asset": data["facts"]["edge_assets_carrying_live_key"],
+        "带活密钥的Edge代码目标": data["facts"]["edge_code_targets_carrying_live_key"],
     }
     doc = _DOC.read_text(encoding="utf-8")
     for label, n in expected.items():
@@ -605,3 +594,255 @@ def test_baseline_schema_is_current():
     data = json.loads(_BASELINE.read_text(encoding="utf-8"))
     assert data["schema"] == g.BASELINE_SCHEMA
     assert "resource_policies" in data and "facts" in data
+    for key in ("platform", "site_alias_canonical", "site_version_canonical",
+                "site_legacy_canonical", "site_legacy_exempt"):
+        assert key in data["resource_policies"], f"基线缺 {key}"
+
+
+# ==========================================================================
+# Codex 第二轮复审（2026-08-25）：五条 finding 各自的会红用例
+#
+# 五条的**共同根因**是同一个建模错误犯了第三次：把一种「能力」写成**单个 API
+# 动作 / 单个资源**，于是等价的其它动作、限定符、历史对象全部落在视野外。
+# 所以下面这些用例不只钉住五条修复，也钉住「能力 = 动作等价类 × 资源等价类」
+# 这个形状本身——任何把它压回单个动作/单个资源的改动都会红。
+# ==========================================================================
+
+def test_ssm_read_is_an_action_class_not_one_action():
+    """`ssm:GetParameter` 之外还有三个动作能读到同一个明文值。
+
+    实测（2026-08-25）：账号里有一个角色**只**被授予 `ssm:GetParameters`
+    （复数）on `Resource:*`、没有单数那个，于是首版闸门把它整个漏掉了。
+    AWS 另外明确警告 `GetParameterHistory` 即使在拒绝 `GetParameter` 时也可能
+    读到当前值。四个动作**任一**命中都必须产生 read-jwt-param。
+    """
+    g = _gate()
+    t = _targets(g)
+    assert len(g.A_READ_PARAM) >= 4, f"动作等价类被缩回去了：{g.A_READ_PARAM}"
+    for action in g.A_READ_PARAM:
+        grants = g.grants_from_decisions({f"{action}|{t.jwt_parameter}": "allowed"}, t)
+        assert g.G_READ_JWT_PARAM in grants, f"{action} 单独命中时没产生 grant"
+
+
+def test_self_escalate_is_an_action_class_too():
+    """自助提权同理：`PutRolePolicy` 只是其中一个动作。
+    这条不是 Codex 点的，是同一个错误类型的同类项，一并修掉。"""
+    g = _gate()
+    t = _targets(g)
+    assert len(g.A_SELF_ESCALATE) >= 3, f"动作等价类太窄：{g.A_SELF_ESCALATE}"
+    for action in g.A_SELF_ESCALATE:
+        grants = g.grants_from_decisions({f"{action}|{t.any_role}": "allowed"}, t)
+        assert g.G_SELF_ESCALATE in grants, f"{action} 单独命中时没产生 grant"
+
+
+def test_every_live_key_asset_is_probed_not_only_the_current_one():
+    """历史 asset 也带着**当前有效**的密钥（实测 9 个，因为旧 asset 不删、
+    密钥从未轮转）。只探"当前 CloudFormation 模板指向的那一个"时，
+    「只能读旧对象」的 principal 完全不可见。"""
+    g = _gate()
+    t = _targets(g, assets=("arn:aws:s3:::b/new.zip", "arn:aws:s3:::b/old.zip"))
+    only_old = g.grants_from_decisions({"s3:GetObject|arn:aws:s3:::b/old.zip": "allowed"}, t)
+    assert g.G_READ_EDGE_ASSET in only_old, "只能读旧 asset 的 principal 被漏掉了"
+
+
+def test_object_version_read_is_in_the_same_class():
+    """桶开着版本控制（noncurrent 保留 30 天），而 `s3:GetObjectVersion` 是
+    **另一个** IAM 动作 ⇒ 删掉对象之后仍可按 version ID 读到旧版本。"""
+    g = _gate()
+    t = _targets(g, assets=("arn:aws:s3:::b/new.zip",))
+    assert "s3:GetObjectVersion" in g.A_READ_OBJECT
+    grants = g.grants_from_decisions(
+        {"s3:GetObjectVersion|arn:aws:s3:::b/new.zip": "allowed"}, t)
+    assert g.G_READ_EDGE_ASSET in grants
+
+
+def test_alias_and_unqualified_invoke_are_distinct_grants():
+    """`function:foo` 与 `function:foo:blue` 在 IAM 里是两个资源。
+
+    首版把它们并成一个 `invoke-platform:<fn>`，于是「原来只能调 `:blue`、
+    现在还能调未限定」这种扩权全绿——文档里写着两者是两个资源，代码却在
+    落基线前把区别抹掉了（Codex 复审 P1-3）。
+    """
+    g = _gate()
+    fn = "arn:aws:lambda:us-east-1:1:function:site-panel"
+    t = _targets(g, aliases={fn: (f"{fn}:blue",)})
+    alias_only = g.grants_from_decisions({f"lambda:InvokeFunction|{fn}:blue": "allowed"}, t)
+    unqualified = g.grants_from_decisions({f"lambda:InvokeFunction|{fn}": "allowed"}, t)
+    assert alias_only and unqualified
+    assert alias_only != unqualified, "限定符维度被压平了"
+    both = g.grants_from_decisions(
+        {f"lambda:InvokeFunction|{fn}": "allowed",
+         f"lambda:InvokeFunction|{fn}:blue": "allowed"}, t)
+    assert both == alias_only | unqualified
+
+
+def test_version_scoped_invoke_is_visible():
+    """版本级授权同样要能看见：AWS 支持把 permission 限定到具体 version。"""
+    g = _gate()
+    fn = "arn:aws:lambda:us-east-1:1:function:site-panel"
+    t = _targets(g, versions={fn: (f"{fn}:9",)})
+    grants = g.grants_from_decisions({f"lambda:InvokeFunction|{fn}:9": "allowed"}, t)
+    assert grants, "版本级 invoke 授权完全不可见"
+    assert any("@version" in x for x in grants), grants
+
+
+def test_platform_principal_losing_a_grant_is_a_failure():
+    """**Codex 的最小反例**：Edge 丢掉 `invoke-platform:site-panel`、保留
+    key-proxy，前缀检查照样过 ⇒ 首版绿。平台角色的授权是精确且必需的，
+    必须按**集合等值**比，任一方向的差异都红。"""
+    g = _gate()
+    base = _observed(g, EdgeRole=["invoke-platform:site-panel",
+                                  "invoke-platform:site-key-proxy", "invoke-site:all"],
+                     **{"site-deployer-exec-role": ["invoke-site@alias:all"]})
+    baseline = {"schema": 2,
+                "principals": {fp: {"category": "platform", "grants": p["grants"]}
+                               for fp, p in base.items()}}
+    now = _observed(g, EdgeRole=["invoke-platform:site-key-proxy", "invoke-site:all"],
+                    **{"site-deployer-exec-role": ["invoke-site@alias:all"]})
+    rep = g.compare_to_baseline(now, baseline, required=REQUIRED)
+    assert not rep.ok, rep.render()
+    assert "site-panel" in rep.render()
+
+
+def test_overbroad_platform_grant_shrinking_is_still_an_improvement():
+    """反向的正对照：`platform-overbroad` 这一类**就是**要缩小的，
+    它丢掉授权必须算改善而不是红。否则"集合等值"会把我们想要的修复判成故障。"""
+    g = _gate()
+    base = _observed(g, BuildRole=[g.G_READ_EDGE_ASSET])
+    baseline = {"schema": 2,
+                "principals": {fp: {"category": "platform-overbroad",
+                                    "grants": p["grants"]}
+                               for fp, p in base.items()}}
+    baseline["principals"].update(
+        {fp: {"category": "platform", "grants": p["grants"]}
+         for fp, p in _with_required(g, {}).items()})
+    now = _with_required(g, {})
+    rep = g.compare_to_baseline(now, baseline, required=REQUIRED)
+    assert rep.ok, rep.render()
+    assert rep.improvements
+
+
+def test_platform_resource_policy_loss_is_a_failure():
+    """平台函数少一条 resource policy 语句 = 控制台/站点入口断掉，
+    首版把它写成"改善"（Codex 复审 P1-4）。必须红。"""
+    g = _gate()
+    observed = _with_required(g, {})
+    baseline = {**_baseline_of(observed),
+                "resource_policies": {
+                    "platform": {"site-panel": ["aaaa-bbbb-cccc-dddd",
+                                                "eeee-ffff-0000-1111"]},
+                    "site_alias_canonical": [], "site_legacy_exempt": [],
+                    "site_legacy_canonical": []}}
+    now_rp = {"platform": {"site-panel": ["aaaa-bbbb-cccc-dddd"]}, "sites": {}}
+    rep = g.compare_to_baseline(observed, baseline, required=REQUIRED,
+                                resource_policies=now_rp)
+    assert not rep.ok, rep.render()
+    assert "site-panel" in rep.render()
+
+
+def _site_shape(alias_fps, unqualified_fps=()):
+    return {"alias": sorted(alias_fps), "unqualified": sorted(unqualified_fps)}
+
+
+def _rp_baseline(observed, *, exempt=()):
+    return {**_baseline_of(observed),
+            "resource_policies": {"platform": {},
+                                  "site_alias_canonical": ["alias-fp00-0000-0000"],
+                                  "site_legacy_canonical": ["unqu-alfp-0000-0000"],
+                                  "site_legacy_exempt": list(exempt)}}
+
+
+def test_new_site_may_not_regress_to_legacy_shape():
+    """「存量迁移站点需要兼容 legacy」不等于「今后新站点也可以再产生 legacy」。
+
+    首版把两种形态都设成全局白名单，于是一个**全新**站点带着未限定 policy
+    也全绿（Codex 复审 P1-3③）。legacy 只能是**点名豁免**，且集合只能缩小。
+    """
+    g = _gate()
+    observed = _with_required(g, {})
+    legacy_fp = g.principal_fingerprint("site:site-old")
+    baseline = _rp_baseline(observed, exempt=[legacy_fp])
+    rp = {"platform": {}, "sites": {
+        "site-old": _site_shape(["alias-fp00-0000-0000"], ["unqu-alfp-0000-0000"]),
+        "site-new": _site_shape(["alias-fp00-0000-0000"], ["unqu-alfp-0000-0000"])}}
+    rep = g.compare_to_baseline(observed, baseline, required=REQUIRED,
+                                resource_policies=rp)
+    assert not rep.ok, rep.render()
+    assert "site-new" in rep.render()
+    assert "site-old" not in rep.render(), "被豁免的存量站点不该被报出来"
+
+
+def test_modern_alias_only_site_is_compliant():
+    g = _gate()
+    observed = _with_required(g, {})
+    baseline = _rp_baseline(observed)
+    rp = {"platform": {}, "sites": {
+        "site-new": _site_shape(["alias-fp00-0000-0000"])}}
+    rep = g.compare_to_baseline(observed, baseline, required=REQUIRED,
+                                resource_policies=rp)
+    assert rep.ok, rep.render()
+
+
+def test_migrated_legacy_site_reports_as_improvement():
+    """豁免名单里的站点改成 modern 形态 ⇒ 绿，且把"豁免可以去掉"报出来。
+    没有这条，豁免名单只会越来越长。"""
+    g = _gate()
+    observed = _with_required(g, {})
+    legacy_fp = g.principal_fingerprint("site:site-old")
+    baseline = _rp_baseline(observed, exempt=[legacy_fp])
+    rp = {"platform": {}, "sites": {
+        "site-old": _site_shape(["alias-fp00-0000-0000"])}}
+    rep = g.compare_to_baseline(observed, baseline, required=REQUIRED,
+                                resource_policies=rp)
+    assert rep.ok, rep.render()
+    assert any("豁免" in x for x in rep.improvements), rep.improvements
+
+
+def test_missing_context_is_read_from_resource_specific_results():
+    """真实响应里 `MissingContextValues` 会**只**出现在
+    `ResourceSpecificResults` 的条目上；只看顶层会把它读成"没有不确定"
+    （Codex 复审 P2）。"""
+    g = _gate()
+    nested = [{"EvalActionName": "s3:GetObject", "EvalDecision": "implicitDeny",
+               "ResourceSpecificResults": [
+                   {"EvalResourceName": "x", "EvalResourceDecision": "implicitDeny",
+                    "MissingContextValues": ["aws:ResourceTag/Allow"]}]}]
+    assert g.missing_context_in(nested)
+
+
+def test_missing_context_growth_is_reported_with_a_delta():
+    """不确定的部分变多时要有**明确的 delta**。
+
+    刻意**不**红：这个数会随账号里任何一条带 Condition 的新策略变动，
+    让它决定退出码就会训练出无脑更新基线。但它必须被算出来并打印。
+    """
+    g = _gate()
+    observed = _with_required(g, {})
+    baseline = {**_baseline_of(observed),
+                "facts": {"principals_with_missing_context": 162,
+                          "edge_assets_carrying_live_key": 9}}
+    rep = g.compare_to_baseline(
+        observed, baseline, required=REQUIRED,
+        facts={"principals_with_missing_context": 200,
+               "edge_assets_carrying_live_key": 9})
+    assert rep.ok, "这条不该影响退出码"
+    joined = rep.render()
+    assert "162" in joined and "200" in joined and "+38" in joined, joined
+
+
+def test_edge_functions_are_in_the_platform_set():
+    """两个 Edge 函数必须进平台集合。
+
+    它们属于 **router 栈**，而 `platform_function_names()` 读的是 deployer 栈
+    `infra/app.py` 的 `PLATFORM_FUNCTION_NAMES` ⇒ 结构上不可能含它们。
+    漏掉一次的实测后果：Edge 的 9 个已发布版本一个都没被枚举，于是
+    「谁能读旧版本 Edge 代码（里面是明文密钥）」与「谁能 UpdateFunctionCode
+    换掉 Edge」两条完全在视野外。
+    """
+    g = _gate()
+    assert g.EDGE_ORIGIN_REQUEST_FN in g.EDGE_FUNCTIONS
+    assert g.EDGE_ORIGIN_RESPONSE_FN in g.EDGE_FUNCTIONS
+    from_app_py = g.platform_function_names()
+    assert not (set(g.EDGE_FUNCTIONS) & set(from_app_py)), (
+        "Edge 函数出现在 app.py 的清单里了——那说明这两处的分工变了，"
+        "本条与 measure() 里的拼接都要重新想")

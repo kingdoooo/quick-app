@@ -12,6 +12,7 @@
     "unclassified"
   ],
   "facts": {
+    "edge_code_targets_carrying_live_key": 10,
     "edge_assets_carrying_live_key": 9,
     "principals_with_missing_context": 162
   },
@@ -19,6 +20,8 @@
     "c2e3-212e-60d6-d13c": {
       "category": "unrelated-workload",
       "grants": [
+        "invoke-platform:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
         "invoke-platform:site-auth-pre-token",
         "invoke-platform:site-auth-service",
@@ -36,10 +39,16 @@
         "invoke-platform:site-deployer-validate",
         "invoke-platform:site-key-proxy",
         "invoke-platform:site-panel",
+        "invoke-platform@version:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform@version:ApplicationWebRouterStack-origin-response",
         "invoke-site:all",
+        "invoke-site@alias:all",
+        "invoke-site@version:all",
         "read-edge-asset",
         "read-edge-code",
         "read-jwt-param",
+        "replace-platform-code:ApplicationWebRouterStack-application-web-router",
+        "replace-platform-code:ApplicationWebRouterStack-origin-response",
         "replace-platform-code:site-access-rollup",
         "replace-platform-code:site-auth-pre-token",
         "replace-platform-code:site-auth-service",
@@ -75,6 +84,8 @@
     "2cfb-df68-53f9-7163": {
       "category": "admin",
       "grants": [
+        "invoke-platform:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
         "invoke-platform:site-auth-pre-token",
         "invoke-platform:site-auth-service",
@@ -92,10 +103,16 @@
         "invoke-platform:site-deployer-validate",
         "invoke-platform:site-key-proxy",
         "invoke-platform:site-panel",
+        "invoke-platform@version:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform@version:ApplicationWebRouterStack-origin-response",
         "invoke-site:all",
+        "invoke-site@alias:all",
+        "invoke-site@version:all",
         "read-edge-asset",
         "read-edge-code",
         "read-jwt-param",
+        "replace-platform-code:ApplicationWebRouterStack-application-web-router",
+        "replace-platform-code:ApplicationWebRouterStack-origin-response",
         "replace-platform-code:site-access-rollup",
         "replace-platform-code:site-auth-pre-token",
         "replace-platform-code:site-auth-service",
@@ -131,6 +148,8 @@
     "7271-c80a-c236-2862": {
       "category": "platform",
       "grants": [
+        "invoke-platform:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
         "invoke-platform:site-auth-pre-token",
         "invoke-platform:site-auth-service",
@@ -148,7 +167,11 @@
         "invoke-platform:site-deployer-validate",
         "invoke-platform:site-key-proxy",
         "invoke-platform:site-panel",
-        "invoke-site:all"
+        "invoke-platform@version:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform@version:ApplicationWebRouterStack-origin-response",
+        "invoke-site:all",
+        "invoke-site@alias:all",
+        "invoke-site@version:all"
       ]
     },
     "c42f-b8e8-83a5-a666": {
@@ -204,6 +227,8 @@
     "6fe6-b342-933b-a57c": {
       "category": "unrelated-workload",
       "grants": [
+        "invoke-platform:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
         "invoke-platform:site-auth-pre-token",
         "invoke-platform:site-auth-service",
@@ -221,12 +246,18 @@
         "invoke-platform:site-deployer-validate",
         "invoke-platform:site-key-proxy",
         "invoke-platform:site-panel",
-        "invoke-site:all"
+        "invoke-platform@version:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform@version:ApplicationWebRouterStack-origin-response",
+        "invoke-site:all",
+        "invoke-site@alias:all",
+        "invoke-site@version:all"
       ]
     },
     "91d9-6686-394f-db55": {
       "category": "unrelated-workload",
       "grants": [
+        "invoke-platform:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
         "invoke-platform:site-auth-pre-token",
         "invoke-platform:site-auth-service",
@@ -244,7 +275,11 @@
         "invoke-platform:site-deployer-validate",
         "invoke-platform:site-key-proxy",
         "invoke-platform:site-panel",
+        "invoke-platform@version:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform@version:ApplicationWebRouterStack-origin-response",
         "invoke-site:all",
+        "invoke-site@alias:all",
+        "invoke-site@version:all",
         "read-edge-code"
       ]
     },
@@ -258,6 +293,8 @@
     "c2fb-773a-0b91-2d7e": {
       "category": "break-glass",
       "grants": [
+        "invoke-platform:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
         "invoke-platform:site-auth-pre-token",
         "invoke-platform:site-auth-service",
@@ -275,10 +312,16 @@
         "invoke-platform:site-deployer-validate",
         "invoke-platform:site-key-proxy",
         "invoke-platform:site-panel",
+        "invoke-platform@version:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform@version:ApplicationWebRouterStack-origin-response",
         "invoke-site:all",
+        "invoke-site@alias:all",
+        "invoke-site@version:all",
         "read-edge-asset",
         "read-edge-code",
         "read-jwt-param",
+        "replace-platform-code:ApplicationWebRouterStack-application-web-router",
+        "replace-platform-code:ApplicationWebRouterStack-origin-response",
         "replace-platform-code:site-access-rollup",
         "replace-platform-code:site-auth-pre-token",
         "replace-platform-code:site-auth-service",
@@ -302,6 +345,8 @@
     "8c51-d180-4c62-03de": {
       "category": "unrelated-workload",
       "grants": [
+        "invoke-platform:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
         "invoke-platform:site-auth-pre-token",
         "invoke-platform:site-auth-service",
@@ -319,10 +364,16 @@
         "invoke-platform:site-deployer-validate",
         "invoke-platform:site-key-proxy",
         "invoke-platform:site-panel",
+        "invoke-platform@version:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform@version:ApplicationWebRouterStack-origin-response",
         "invoke-site:all",
+        "invoke-site@alias:all",
+        "invoke-site@version:all",
         "read-edge-asset",
         "read-edge-code",
         "read-jwt-param",
+        "replace-platform-code:ApplicationWebRouterStack-application-web-router",
+        "replace-platform-code:ApplicationWebRouterStack-origin-response",
         "replace-platform-code:site-access-rollup",
         "replace-platform-code:site-auth-pre-token",
         "replace-platform-code:site-auth-service",
@@ -414,6 +465,8 @@
     "c6a2-9029-4b5a-3033": {
       "category": "unrelated-workload",
       "grants": [
+        "invoke-platform:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
         "invoke-platform:site-auth-pre-token",
         "invoke-platform:site-auth-service",
@@ -431,10 +484,16 @@
         "invoke-platform:site-deployer-validate",
         "invoke-platform:site-key-proxy",
         "invoke-platform:site-panel",
+        "invoke-platform@version:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform@version:ApplicationWebRouterStack-origin-response",
         "invoke-site:all",
+        "invoke-site@alias:all",
+        "invoke-site@version:all",
         "read-edge-asset",
         "read-edge-code",
         "read-jwt-param",
+        "replace-platform-code:ApplicationWebRouterStack-application-web-router",
+        "replace-platform-code:ApplicationWebRouterStack-origin-response",
         "replace-platform-code:site-access-rollup",
         "replace-platform-code:site-auth-pre-token",
         "replace-platform-code:site-auth-service",
@@ -458,6 +517,8 @@
     "58c9-71a6-4a37-bcdd": {
       "category": "admin",
       "grants": [
+        "invoke-platform:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
         "invoke-platform:site-auth-pre-token",
         "invoke-platform:site-auth-service",
@@ -475,9 +536,15 @@
         "invoke-platform:site-deployer-validate",
         "invoke-platform:site-key-proxy",
         "invoke-platform:site-panel",
+        "invoke-platform@version:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform@version:ApplicationWebRouterStack-origin-response",
         "invoke-site:all",
+        "invoke-site@alias:all",
+        "invoke-site@version:all",
         "read-edge-asset",
         "read-edge-code",
+        "replace-platform-code:ApplicationWebRouterStack-application-web-router",
+        "replace-platform-code:ApplicationWebRouterStack-origin-response",
         "replace-platform-code:site-access-rollup",
         "replace-platform-code:site-auth-pre-token",
         "replace-platform-code:site-auth-service",
@@ -500,6 +567,8 @@
     "0e8a-6e34-1148-1013": {
       "category": "cdk-admin",
       "grants": [
+        "invoke-platform:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
         "invoke-platform:site-auth-pre-token",
         "invoke-platform:site-auth-service",
@@ -517,10 +586,16 @@
         "invoke-platform:site-deployer-validate",
         "invoke-platform:site-key-proxy",
         "invoke-platform:site-panel",
+        "invoke-platform@version:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform@version:ApplicationWebRouterStack-origin-response",
         "invoke-site:all",
+        "invoke-site@alias:all",
+        "invoke-site@version:all",
         "read-edge-asset",
         "read-edge-code",
         "read-jwt-param",
+        "replace-platform-code:ApplicationWebRouterStack-application-web-router",
+        "replace-platform-code:ApplicationWebRouterStack-origin-response",
         "replace-platform-code:site-access-rollup",
         "replace-platform-code:site-auth-pre-token",
         "replace-platform-code:site-auth-service",
@@ -544,6 +619,8 @@
     "9a35-c6f7-f991-d306": {
       "category": "cdk-admin",
       "grants": [
+        "invoke-platform:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
         "invoke-platform:site-auth-pre-token",
         "invoke-platform:site-auth-service",
@@ -561,10 +638,16 @@
         "invoke-platform:site-deployer-validate",
         "invoke-platform:site-key-proxy",
         "invoke-platform:site-panel",
+        "invoke-platform@version:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform@version:ApplicationWebRouterStack-origin-response",
         "invoke-site:all",
+        "invoke-site@alias:all",
+        "invoke-site@version:all",
         "read-edge-asset",
         "read-edge-code",
         "read-jwt-param",
+        "replace-platform-code:ApplicationWebRouterStack-application-web-router",
+        "replace-platform-code:ApplicationWebRouterStack-origin-response",
         "replace-platform-code:site-access-rollup",
         "replace-platform-code:site-auth-pre-token",
         "replace-platform-code:site-auth-service",
@@ -588,6 +671,8 @@
     "2dc5-04b7-c641-7514": {
       "category": "cdk-admin",
       "grants": [
+        "invoke-platform:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
         "invoke-platform:site-auth-pre-token",
         "invoke-platform:site-auth-service",
@@ -605,10 +690,16 @@
         "invoke-platform:site-deployer-validate",
         "invoke-platform:site-key-proxy",
         "invoke-platform:site-panel",
+        "invoke-platform@version:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform@version:ApplicationWebRouterStack-origin-response",
         "invoke-site:all",
+        "invoke-site@alias:all",
+        "invoke-site@version:all",
         "read-edge-asset",
         "read-edge-code",
         "read-jwt-param",
+        "replace-platform-code:ApplicationWebRouterStack-application-web-router",
+        "replace-platform-code:ApplicationWebRouterStack-origin-response",
         "replace-platform-code:site-access-rollup",
         "replace-platform-code:site-auth-pre-token",
         "replace-platform-code:site-auth-service",
@@ -686,6 +777,8 @@
     "6335-054b-f140-e1fd": {
       "category": "unrelated-workload",
       "grants": [
+        "invoke-platform:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
         "invoke-platform:site-auth-pre-token",
         "invoke-platform:site-auth-service",
@@ -703,9 +796,15 @@
         "invoke-platform:site-deployer-validate",
         "invoke-platform:site-key-proxy",
         "invoke-platform:site-panel",
+        "invoke-platform@version:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform@version:ApplicationWebRouterStack-origin-response",
         "invoke-site:all",
+        "invoke-site@alias:all",
+        "invoke-site@version:all",
         "read-edge-asset",
         "read-edge-code",
+        "replace-platform-code:ApplicationWebRouterStack-application-web-router",
+        "replace-platform-code:ApplicationWebRouterStack-origin-response",
         "replace-platform-code:site-access-rollup",
         "replace-platform-code:site-auth-pre-token",
         "replace-platform-code:site-auth-service",
@@ -729,6 +828,8 @@
     "8ab5-b6df-aac8-1782": {
       "category": "unrelated-workload",
       "grants": [
+        "invoke-platform:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
         "invoke-platform:site-auth-pre-token",
         "invoke-platform:site-auth-service",
@@ -746,10 +847,16 @@
         "invoke-platform:site-deployer-validate",
         "invoke-platform:site-key-proxy",
         "invoke-platform:site-panel",
+        "invoke-platform@version:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform@version:ApplicationWebRouterStack-origin-response",
         "invoke-site:all",
+        "invoke-site@alias:all",
+        "invoke-site@version:all",
         "read-edge-asset",
         "read-edge-code",
         "read-jwt-param",
+        "replace-platform-code:ApplicationWebRouterStack-application-web-router",
+        "replace-platform-code:ApplicationWebRouterStack-origin-response",
         "replace-platform-code:site-access-rollup",
         "replace-platform-code:site-auth-pre-token",
         "replace-platform-code:site-auth-service",
@@ -779,6 +886,8 @@
     "d43b-0712-11e1-7b96": {
       "category": "unrelated-workload",
       "grants": [
+        "invoke-platform:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
         "invoke-platform:site-auth-pre-token",
         "invoke-platform:site-auth-service",
@@ -796,7 +905,11 @@
         "invoke-platform:site-deployer-validate",
         "invoke-platform:site-key-proxy",
         "invoke-platform:site-panel",
+        "invoke-platform@version:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform@version:ApplicationWebRouterStack-origin-response",
         "invoke-site:all",
+        "invoke-site@alias:all",
+        "invoke-site@version:all",
         "read-edge-code",
         "read-jwt-param"
       ]
@@ -804,6 +917,8 @@
     "a8f1-4466-bd8e-5de7": {
       "category": "unrelated-workload",
       "grants": [
+        "invoke-platform:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
         "invoke-platform:site-auth-pre-token",
         "invoke-platform:site-auth-service",
@@ -821,7 +936,11 @@
         "invoke-platform:site-deployer-validate",
         "invoke-platform:site-key-proxy",
         "invoke-platform:site-panel",
+        "invoke-platform@version:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform@version:ApplicationWebRouterStack-origin-response",
         "invoke-site:all",
+        "invoke-site@alias:all",
+        "invoke-site@version:all",
         "read-edge-code",
         "read-jwt-param"
       ]
@@ -859,6 +978,8 @@
     "b0c2-8073-83c1-0c17": {
       "category": "unrelated-workload",
       "grants": [
+        "invoke-platform:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
         "invoke-platform:site-auth-pre-token",
         "invoke-platform:site-auth-service",
@@ -876,10 +997,16 @@
         "invoke-platform:site-deployer-validate",
         "invoke-platform:site-key-proxy",
         "invoke-platform:site-panel",
+        "invoke-platform@version:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform@version:ApplicationWebRouterStack-origin-response",
         "invoke-site:all",
+        "invoke-site@alias:all",
+        "invoke-site@version:all",
         "read-edge-asset",
         "read-edge-code",
         "read-jwt-param",
+        "replace-platform-code:ApplicationWebRouterStack-application-web-router",
+        "replace-platform-code:ApplicationWebRouterStack-origin-response",
         "replace-platform-code:site-access-rollup",
         "replace-platform-code:site-auth-pre-token",
         "replace-platform-code:site-auth-service",
@@ -912,6 +1039,12 @@
         "read-edge-asset"
       ]
     },
+    "4462-e661-a2f7-35f9": {
+      "category": "unrelated-workload",
+      "grants": [
+        "read-jwt-param"
+      ]
+    },
     "c070-1e84-e2b0-3b1c": {
       "category": "platform",
       "grants": [
@@ -921,7 +1054,9 @@
     "8c89-6bef-767f-fc09": {
       "category": "platform",
       "grants": [
-        "invoke-site:all"
+        "invoke-site:all",
+        "invoke-site@alias:all",
+        "invoke-site@version:all"
       ]
     },
     "cc42-876b-bddc-8427": {
@@ -940,6 +1075,8 @@
     "67a8-0d2c-dbe6-eb6d": {
       "category": "unrelated-workload",
       "grants": [
+        "invoke-platform:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
         "invoke-platform:site-auth-pre-token",
         "invoke-platform:site-auth-service",
@@ -957,10 +1094,16 @@
         "invoke-platform:site-deployer-validate",
         "invoke-platform:site-key-proxy",
         "invoke-platform:site-panel",
+        "invoke-platform@version:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform@version:ApplicationWebRouterStack-origin-response",
         "invoke-site:all",
+        "invoke-site@alias:all",
+        "invoke-site@version:all",
         "read-edge-asset",
         "read-edge-code",
         "read-jwt-param",
+        "replace-platform-code:ApplicationWebRouterStack-application-web-router",
+        "replace-platform-code:ApplicationWebRouterStack-origin-response",
         "replace-platform-code:site-access-rollup",
         "replace-platform-code:site-auth-pre-token",
         "replace-platform-code:site-auth-service",
@@ -984,6 +1127,8 @@
     "1091-eab7-f627-7939": {
       "category": "admin",
       "grants": [
+        "invoke-platform:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform:ApplicationWebRouterStack-origin-response",
         "invoke-platform:site-access-rollup",
         "invoke-platform:site-auth-pre-token",
         "invoke-platform:site-auth-service",
@@ -1001,10 +1146,16 @@
         "invoke-platform:site-deployer-validate",
         "invoke-platform:site-key-proxy",
         "invoke-platform:site-panel",
+        "invoke-platform@version:ApplicationWebRouterStack-application-web-router",
+        "invoke-platform@version:ApplicationWebRouterStack-origin-response",
         "invoke-site:all",
+        "invoke-site@alias:all",
+        "invoke-site@version:all",
         "read-edge-asset",
         "read-edge-code",
         "read-jwt-param",
+        "replace-platform-code:ApplicationWebRouterStack-application-web-router",
+        "replace-platform-code:ApplicationWebRouterStack-origin-response",
         "replace-platform-code:site-access-rollup",
         "replace-platform-code:site-auth-pre-token",
         "replace-platform-code:site-auth-service",
@@ -1062,19 +1213,30 @@
       ],
       "site-deployer-sweep-jobs": [
         "9d92-e0b8-0626-95d1"
+      ],
+      "ApplicationWebRouterStack-application-web-router": [
+        "9c5f-c067-3001-fd9b"
+      ],
+      "ApplicationWebRouterStack-origin-response": [
+        "9c5f-c067-3001-fd9b"
       ]
     },
-    "site_shapes": [
-      [
-        "0051-913f-ca05-2119",
-        "3131-c9ea-75ac-533b",
-        "741e-a473-267f-829a",
-        "ba92-f7b8-c4fb-a038"
-      ],
-      [
-        "0051-913f-ca05-2119",
-        "ba92-f7b8-c4fb-a038"
-      ]
+    "site_alias_canonical": [
+      "0051-913f-ca05-2119",
+      "ba92-f7b8-c4fb-a038"
+    ],
+    "site_version_canonical": [],
+    "site_legacy_canonical": [
+      "3131-c9ea-75ac-533b",
+      "741e-a473-267f-829a"
+    ],
+    "site_legacy_exempt": [
+      "c9a9-9b2e-83d6-d133",
+      "2d8a-0335-6c3f-b882",
+      "d1ff-27de-7108-b91e",
+      "a84d-dc42-0e7d-4fb2",
+      "4b22-873f-4d56-c3bd",
+      "a7b4-c962-5660-9d8e"
     ]
   }
 }

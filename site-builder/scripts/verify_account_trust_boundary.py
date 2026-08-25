@@ -18,43 +18,64 @@ cookie 与 `scope=console` 的 `__Host-sb_console`（同一个 `/site-builder/jw
 
 在那之前，本脚本承担唯一还能自动化的职责：**这个集合别再长**。
 
-## 它测三层，每层的粒度都是刻意选的
+## 形状：一种能力 = 一个动作等价类 × 一个资源等价类
+
+这句话是本文件最重要的不变量，因为把它压成"单个动作 / 单个资源"这个错误
+**已经犯过三次**，每次都产生一个当时看不出来的 false-green：
+
+| 压成什么 | 漏掉了谁 |
+|---|---|
+| 只探未限定函数 ARN | 挂在 `blue` alias 上的授权（M7 之后站点的 Function URL 全在 alias 上） |
+| 只探当前那一个 CDK asset | 带同一把活密钥的 9 个历史对象 |
+| 只探 `ssm:GetParameter` | 一个**只**被授予 `ssm:GetParameters`（复数）的角色 |
+
+所以动作与资源都以**类**为单位（见 `A_*` 常量与 `Targets`）。往任一类里加成员时，
+同时加一条**只命中该新成员**的用例。
+
+## 它测三层
 
 ① **identity 授权**（`iam:SimulatePrincipalPolicy`，枚举全部非 service-linked 角色
-   与 IAM 用户）。授权记成 `grant` 字符串而**不是布尔标签**：
+   与 IAM 用户）。授权记成 `grant` 串而**不是布尔标签**：
    `invoke-platform:site-panel` 与 `invoke-platform:site-deployer-undeploy` 是两条
-   不同的 grant。压成一个 `invoke-platform` 布尔时，「某角色原来只能调 undeploy，
-   现在还能调 panel」这种**安全相关的资源扩权**会静静地绿——那正是 panel 读面
-   失守与否的分界。站点函数按类聚合（`invoke-site:all` / `invoke-site:some(k)`），
-   否则每建一个站点都会把基线拽红。
+   不同的 grant，`invoke-platform:site-panel` 与 `invoke-platform@alias:site-panel`
+   也是——压平任一维，对应的扩权就会静静地绿。站点函数按类聚合
+   （`:all` / `:some(k)`），否则每建一个站点都会把基线拽红。
 
-② **resource policy**（`lambda:GetPolicy`，**含每个 alias**）。
+② **resource policy**（`lambda:GetPolicy`，**含每个 alias 与每个已发布版本**）。
    `SimulatePrincipalPolicy` **不会**自动纳入 resource policy（AWS 契约：它只能
-   为 IAM user 选择性地带一份，对 role 根本不支持），而同账号 resource-based
-   Allow 单独即可授权 ⇒ 只测 ① 会漏掉「给某个角色新加一条 `AddPermission`」。
-   平台函数逐个记；站点函数记下**全部合法形态**（M7 之后两种都合法：迁移来的
-   站点残留一份未限定 policy，新建的只有 alias 那一份），匹配任一形态即合规，
-   于是新建站点不产生漂移、而多一条或少一条语句的站点被点名。
+   为 IAM user 选择性地带一份，对 role 根本不支持）⇒ 只测 ① 会漏掉
+   「给某个角色新加一条 `AddPermission`」。版本不能漏——实测 Edge 的 version 9
+   上有一条版本级语句。
+   平台函数按**集合等值**比（丢一条 Function URL 授权 = 入口断掉，同样要红）；
+   站点函数按限定符类逐类比，**legacy 形态只认基线里的点名豁免**——
+   「存量迁移站点要兼容 legacy」不等于「新站点也可以再产生 legacy」。
 
-   **alias 不能漏**：M7 之后站点的 Function URL 与其授权语句都挂在 `blue` 上，
-   只读未限定那份会把整条 invoke 授权面看漏——实测 M7 后新建的站点未限定
-   policy 根本不存在。identity 侧同理：`function:foo` 与 `function:foo:blue`
-   在 IAM 里是两个资源，所以 ① 也把 alias ARN 一起探。
+③ **密钥物化位置的事实**。密钥有三处明文副本，每次都**实测**而不是假设：
+   Edge 函数产物（含每个仍含活密钥的已发布版本）、**CDK bootstrap S3 asset**
+   （全部仍含活密钥的对象；asset 位置从**已部署的 CloudFormation 模板**推导，
+   不手抄对象 key）、以及 SSM 参数。都比对 SHA-256；某处不再含活密钥时，
+   对应资源自动掉出集合、grant 随之消失并报成改善——根治了它，闸门自己就知道。
 
-③ **密钥物化位置的事实**。密钥有三处明文副本，本脚本每次都**实测**而不是假设：
-   Edge 函数产物（`lambda:GetFunction`）、**CDK bootstrap S3 asset**
-   （`s3:GetObject`；asset ARN 从**已部署的 CloudFormation 模板**推导，不手抄
-   对象 key）、以及 SSM 参数本身。三处都比对 SHA-256；某处不再含活密钥时，
-   对应的 grant 会自动消失并报成改善——根治了它，闸门自己就知道。
+## 红绿口径（两套，刻意不对称）
+
+- `platform` 类 principal 的授权是"精确且必需"的 ⇒ 按**集合等值**比，
+  任一方向的差异都红。只比"新增"时，「Edge 丢掉 `invoke-platform:site-panel`
+  但保留 key-proxy」会照样过前缀检查并退出 0。
+- 其它类别（含 `platform-overbroad`）：新增红、缩小是改善。
+  `platform-overbroad` **就是**要缩小的那一类。
+- 事实类数字（`principals_with_missing_context` 等）只报 delta，**不参与红绿**：
+  它们随账号里任何一条带 Condition 的新策略变动，让它们决定退出码就会频繁红在
+  无关变更上，进而训练出"红了就更新基线"。
 
 ## 它**不**证明什么（别把它当"暴露面已穷尽"）
 
 - `SimulatePrincipalPolicy` 对带 Condition 的策略需要调用方补 `ContextEntries`；
   本脚本不补，于是那些 principal 的判定是**下界**。带 `MissingContextValues`
-  的响应数被记进基线并打印，涨了就说明"不确定的部分变多了"。
+  的 principal 数被记进基线并打印 delta。
+- 动作等价类不是穷尽的（`A_SELF_ESCALATE` 尤其只取了最常见的四个）。
 - 它只看 IAM 与 Lambda resource policy 两条通道，不看 KMS grants、
   VPC endpoint policy、以及其它服务的 resource policy。
-- 它不看跨账号 principal（本账号内的暴露面已经足够大）。
+- 它不看跨账号 principal，也看不见"临时建了一个角色用完就删"。
 
 用法（**用系统 python3 跑**，deployer/.venv 的 CA 信任库是空的）：
 
@@ -89,6 +110,12 @@ DEPLOYER_EXEC_ROLE = "site-deployer-exec-role"
 # Edge 函数名：router 栈的两个 Lambda@Edge 里，**origin-request 那个**才内联着
 # 会话密钥（`stack.py` 把 `{{JWT_SECRET}}` 替换进它）。origin-response 不验签。
 EDGE_ORIGIN_REQUEST_FN = "ApplicationWebRouterStack-application-web-router"
+EDGE_ORIGIN_RESPONSE_FN = "ApplicationWebRouterStack-origin-response"
+# **这两个必须手写**：它们属于 router 栈，而 `PLATFORM_FUNCTION_NAMES` 是
+# deployer 栈 `infra/app.py` 里的清单，结构上不可能含它们。漏掉的后果实测过一次
+# ——Edge 的 9 个已发布版本一个都没被枚举，于是「谁能读某个旧版本的 Edge 代码
+# （里面就是明文密钥）」「谁能 UpdateFunctionCode 换掉 Edge」两条完全在视野外。
+EDGE_FUNCTIONS = (EDGE_ORIGIN_REQUEST_FN, EDGE_ORIGIN_RESPONSE_FN)
 # 产物里密钥的形态：`JWT_SECRET = "<64 hex>"`。只用来**定位**，不打印取到的值。
 _SECRET_ASSIGN_RE = re.compile(r"""JWT_SECRET\s*=\s*["']([^"']*)["']""")
 
@@ -114,17 +141,55 @@ G_READ_JWT_PARAM = "read-jwt-param"
 G_SELF_ESCALATE = "self-escalate"
 SECRET_GRANTS = (G_READ_EDGE_CODE, G_READ_EDGE_ASSET, G_READ_JWT_PARAM)
 
+# ---- 动作等价类 ----------------------------------------------------------
+# **一种能力 = 一个动作等价类 × 一个资源等价类。** 这个形状是本文件最重要的
+# 不变量，因为把它压成"单个动作/单个资源"这个错误已经犯过三次：
+#   · 首版只探未限定函数 ARN ⇒ 挂在 blue alias 上的授权全看不见（M7 之后站点
+#     的 Function URL 都在 alias 上）；
+#   · 首版只探当前那一个 CDK asset ⇒ 带同一把活密钥的 9 个历史对象看不见；
+#   · 首版只探 `ssm:GetParameter` ⇒ 一个**只**被授予 `ssm:GetParameters`
+#     （复数）的角色被整个漏掉（2026-08-25 实测，它没有 boundary，
+#     `WithDecryption=true` 即可读出当前密钥）。
+# 往任一类里加动作/资源时，同时加一条只命中该新成员的用例。
+A_INVOKE = ("lambda:InvokeFunction",)
+A_REPLACE = ("lambda:UpdateFunctionCode",)
+# 下载产物：`GetFunction` 返回代码的预签名 URL。`GetFunctionConfiguration`
+# 不返回代码，所以不在类里。
+A_READ_CODE = ("lambda:GetFunction",)
+# 桶开着版本控制（noncurrent 保留 30 天），而 `GetObjectVersion` 是**另一个**
+# 动作 ⇒ 对象被删之后旧版本仍可按 version ID 读到。
+A_READ_OBJECT = ("s3:GetObject", "s3:GetObjectVersion")
+# 四个动作都能读出同一个 SecureString 的明文；AWS 明确警告
+# `GetParameterHistory` 在拒绝 `GetParameter` 时仍可能读到当前值。
+A_READ_PARAM = ("ssm:GetParameter", "ssm:GetParameters",
+                "ssm:GetParametersByPath", "ssm:GetParameterHistory")
+# **不是穷尽的**（IAM 的提权面比这大），但把最常见的四个都算上，
+# 而不是只算 PutRolePolicy 一个。
+A_SELF_ESCALATE = ("iam:PutRolePolicy", "iam:AttachRolePolicy",
+                   "iam:CreatePolicyVersion", "iam:UpdateAssumeRolePolicy")
+
+# 限定符类：grant 串里用 `@alias` / `@version` 标出来。**不能与未限定合并**
+# ——`function:foo` 与 `function:foo:blue` 在 IAM 里是两个资源，合并之后
+# 「原来只能调 :blue、现在还能调未限定」这种扩权会静静地绿。
+Q_UNQUALIFIED = ""
+Q_ALIAS = "@alias"
+Q_VERSION = "@version"
+
 # 两条正向控制：这两个 principal **必须**保留下列 grant（按前缀命中即可）。
 # 丢了的真机症状分别是「全站 403」与「每次部署在健康门失败」，两者都不会在
 # 任何单测里出现——所以收窄动作把平台自己锁死时，只有这条会红。
 REQUIRED_GRANT_PREFIXES = {
-    "edge": (f"{G_INVOKE_PLATFORM}:", f"{G_INVOKE_SITE}:"),
-    "deployer": (f"{G_INVOKE_SITE}:",),
+    "edge": (f"{G_INVOKE_PLATFORM}:", f"{G_INVOKE_SITE}",),
+    # blue/green 健康门是**带 Qualifier** 的直调，所以这里锁 alias 那一类，
+    # 不是"任意 invoke-site"——收窄只砍掉 alias 授权时前者才会红。
+    "deployer": (f"{G_INVOKE_SITE}{Q_ALIAS}:",),
 }
 
-ACTIONS = ("lambda:InvokeFunction", "lambda:UpdateFunctionCode",
-           "lambda:GetFunction", "ssm:GetParameter", "iam:PutRolePolicy",
-           "s3:GetObject")
+# 两次 simulate 调用的动作分组：函数类资源一组，其余一组。分开是为了不产生
+# 大量无意义的 (动作, 资源) 组合——一次调用的响应体是资源数 × 动作数。
+ACTIONS_FUNCTION = A_INVOKE + A_REPLACE + A_READ_CODE
+ACTIONS_OTHER = A_READ_OBJECT + A_READ_PARAM + A_SELF_ESCALATE
+ACTIONS = ACTIONS_FUNCTION + ACTIONS_OTHER
 
 
 # ---------------------------------------------------------------- 纯函数部分
@@ -176,38 +241,56 @@ def decisions_from_simulation(evaluation_results: list[dict]) -> dict[str, str]:
 def missing_context_in(evaluation_results: list[dict]) -> bool:
     """这批判定里有没有"因为缺 Condition 上下文而不确定"的部分。
 
-    有的话，该 principal 的 grant 集合只是**下界**。本脚本不补
-    `ContextEntries`（补不全），但必须把"不确定"这件事记下来，
-    不能把未知静默压成"没有权限"。
+    **必须同时看顶层与每个 `ResourceSpecificResults` 条目**：真实响应里
+    `MissingContextValues` 常常**只**出现在逐资源那一层，只看顶层会把它读成
+    "没有不确定"（Codex 复审 P2 指出，已复现）。
+
+    有不确定就说明该 principal 的 grant 集合只是**下界**。本脚本不补
+    `ContextEntries`（补不全），但必须把这件事记下来，不能把未知静默压成
+    "没有权限"。
     """
-    return any(res.get("MissingContextValues") for res in evaluation_results)
+    for res in evaluation_results:
+        if res.get("MissingContextValues"):
+            return True
+        for rr in res.get("ResourceSpecificResults") or []:
+            if rr.get("MissingContextValues"):
+                return True
+    return False
 
 
 @dataclass(frozen=True)
 class Targets:
     """模拟的目标资源（ARN 形态，由调用方按真实账号拼好）。
 
-    `edge_asset` 可以为 None——那表示已部署的 asset 里**不再**含活密钥
-    （根治之后的正常状态），此时不产生 `read-edge-asset` grant。
+    每一项都是一个**资源等价类**，不是单个资源：
 
-    `alias_arns` 把未限定 ARN 映射到它的 alias ARN。**必须有这一层**：M7 之后
-    站点的 Function URL 与 resource policy 都挂在 `blue`/`green` alias 上，而
-    IAM 里 `function:foo` 与 `function:foo:blue` 是两个不同的资源。只探未限定
-    ARN 时，「只在 alias 上被授权」的 principal 会被读成"没有权限"。
+    - `alias_arns` / `version_arns`：未限定 ARN → 它的 alias / 版本 ARN。
+      M7 之后站点的 Function URL 与授权语句都挂在 `blue` 上，且 AWS 支持把
+      permission 限定到具体 version ⇒ 只探未限定 ARN 等于看一个空集。
+    - `edge_code_arns`：Edge 函数**及其每个仍含活密钥的已发布版本**。
+    - `edge_assets`：CDK bootstrap 桶里**全部**仍含活密钥的对象（实测 9 个，
+      因为旧 asset 不删而密钥从未轮转）。空元组表示已根治，此时不产生
+      `read-edge-asset`——闸门因此是在测事实，不是复读写死的假设。
     """
     platform_functions: tuple[str, ...]
     site_functions: tuple[str, ...]
-    edge_function: str | None
-    edge_asset: str | None
+    edge_code_arns: tuple[str, ...]
+    edge_assets: tuple[str, ...]
     jwt_parameter: str
     any_role: str
     alias_arns: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    version_arns: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
-    def all_invoke_resources(self) -> list[str]:
+    def function_resources(self) -> list[str]:
         out = list(self.platform_functions) + list(self.site_functions)
-        for arns in self.alias_arns.values():
-            out.extend(arns)
-        return out
+        out.extend(self.edge_code_arns)
+        for mapping in (self.alias_arns, self.version_arns):
+            for arns in mapping.values():
+                out.extend(arns)
+        return sorted(set(out))
+
+    def other_resources(self) -> list[str]:
+        return sorted(set(self.edge_assets) | {self.jwt_parameter, self.any_role})
 
 
 def _fn_name(arn: str) -> str:
@@ -217,45 +300,51 @@ def _fn_name(arn: str) -> str:
 def grants_from_decisions(decisions: dict[str, str], t: Targets) -> set[str]:
     """逐资源判定 → grant 集合。
 
-    **平台函数逐个记名字**：`invoke-platform` 压成一个布尔时，
-    「只能调 undeploy」与「还能调 panel」在基线里长得一样，而后者才是
-    panel 读面失守的入口。
-    **站点函数按类聚合**：逐个记名字会让每次建站/下线都把基线拽红。
-    **invoke 取未限定 ARN 与 alias ARN 的并**：能碰到这份代码就算能碰到，
-    走 `foo` 还是 `foo:blue` 不改变后果。
-    """
-    def allowed(action: str, resource: str) -> bool:
-        return decisions.get(f"{action}|{resource}") == "allowed"
+    形状是 `种类[@限定符类][:资源]`。三条刻意的选择：
 
-    def can_invoke(arn: str) -> bool:
-        return allowed("lambda:InvokeFunction", arn) or any(
-            allowed("lambda:InvokeFunction", a)
-            for a in t.alias_arns.get(arn, ()))
+    - **平台函数逐个记名字**：压成一个布尔时，「只能调 undeploy」与
+      「还能调 panel」在基线里长得一样，而后者才是 panel 读面失守的入口。
+    - **站点函数按类聚合**（`:all` / `:some(k)`）：逐个记名字会让每次建站/下线
+      都把基线拽红，于是基线被迫频繁重写，"新增即红"随之失效。
+    - **限定符不并入未限定**：`function:foo` 与 `function:foo:blue` 是两个资源。
+    """
+    def allowed(actions, resources) -> bool:
+        return any(decisions.get(f"{a}|{r}") == "allowed"
+                   for a in actions for r in resources)
 
     grants = set()
     for arn in t.platform_functions:
-        if can_invoke(arn):
-            grants.add(f"{G_INVOKE_PLATFORM}:{_fn_name(arn)}")
-        # UpdateFunctionCode 只作用于未限定函数（alias 没有自己的代码）。
-        if allowed("lambda:UpdateFunctionCode", arn):
-            grants.add(f"{G_REPLACE_CODE}:{_fn_name(arn)}")
+        name = _fn_name(arn)
+        for qual, resources in ((Q_UNQUALIFIED, (arn,)),
+                                (Q_ALIAS, t.alias_arns.get(arn, ())),
+                                (Q_VERSION, t.version_arns.get(arn, ()))):
+            if resources and allowed(A_INVOKE, resources):
+                grants.add(f"{G_INVOKE_PLATFORM}{qual}:{name}")
+        # UpdateFunctionCode 只作用于未限定函数（alias/version 没有自己的代码）。
+        if allowed(A_REPLACE, (arn,)):
+            grants.add(f"{G_REPLACE_CODE}:{name}")
 
     if t.site_functions:
-        n = sum(1 for arn in t.site_functions if can_invoke(arn))
-        if n == len(t.site_functions):
-            grants.add(f"{G_INVOKE_SITE}:all")
-        elif n:
-            # 子集形态记数量：从 1 个涨到 2 个必须红。数量随站点增删变化时也会红
-            # ——那是安全方向的误报，且当前没有任何 principal 处于子集形态。
-            grants.add(f"{G_INVOKE_SITE}:some({n})")
+        total = len(t.site_functions)
+        for qual, pick in ((Q_UNQUALIFIED, lambda a: (a,)),
+                           (Q_ALIAS, lambda a: t.alias_arns.get(a, ())),
+                           (Q_VERSION, lambda a: t.version_arns.get(a, ()))):
+            n = sum(1 for arn in t.site_functions
+                    if pick(arn) and allowed(A_INVOKE, pick(arn)))
+            if n == total:
+                grants.add(f"{G_INVOKE_SITE}{qual}:all")
+            elif n:
+                # 子集形态记数量：从 1 个涨到 2 个必须红。数量随站点增删变化时
+                # 也会红——那是安全方向的误报，且当前没有 principal 处于子集形态。
+                grants.add(f"{G_INVOKE_SITE}{qual}:some({n})")
 
-    if t.edge_function and allowed("lambda:GetFunction", t.edge_function):
+    if t.edge_code_arns and allowed(A_READ_CODE, t.edge_code_arns):
         grants.add(G_READ_EDGE_CODE)
-    if t.edge_asset and allowed("s3:GetObject", t.edge_asset):
+    if t.edge_assets and allowed(A_READ_OBJECT, t.edge_assets):
         grants.add(G_READ_EDGE_ASSET)
-    if allowed("ssm:GetParameter", t.jwt_parameter):
+    if allowed(A_READ_PARAM, (t.jwt_parameter,)):
         grants.add(G_READ_JWT_PARAM)
-    if allowed("iam:PutRolePolicy", t.any_role):
+    if allowed(A_SELF_ESCALATE, (t.any_role,)):
         grants.add(G_SELF_ESCALATE)
     return grants
 
@@ -283,36 +372,72 @@ def statement_fingerprint(statement: dict, *, account: str, function: str,
 
 def resource_policy_snapshot(policies: dict[str, list[tuple[str | None, dict]]], *,
                              account: str, platform: tuple[str, ...],
-                             sites: tuple[str, ...]) -> dict:
-    """`{函数名: [(qualifier, 语句)…]}` → 逐函数的指纹快照。**这里不做任何判断。**
+                             sites: tuple[str, ...],
+                             aliases: dict[str, tuple[str, ...]]) -> dict:
+    """`{函数名: [(qualifier, 语句)…]}` → 快照。**这里不做任何判断。**
 
-    形态由基线定（见 `site_policy_shapes` 与 `compare_to_baseline`）。
-    早先版本在这里用**并集**算规范形态，结果最宽松的那个站点函数反而成了规范、
-    规矩的那个被报成偏离——判断和观测混在一处就会这样。
+    平台函数记成一个扁平指纹集合（名字稳定，逐个比）；站点函数**按限定符类
+    分组**（`unqualified` / `alias` / `version`），因为"有没有未限定语句"正是
+    legacy 与 modern 两种部署形态的判据，压平之后就没法只允许 modern。
+
+    合法性判据在基线里（见 `compare_to_baseline`）。早先版本在这里用**并集**
+    算规范形态，结果最宽松的那个站点函数反而成了规范、规矩的那个被报成偏离
+    ——判断和观测混在一处就会这样。
     """
-    def fps(fn: str) -> list[str]:
-        return sorted({statement_fingerprint(s, account=account, function=fn,
-                                             qualifier=q)
-                       for q, s in policies.get(fn, [])})
+    def fp(fn: str, q: str | None, st: dict) -> str:
+        return statement_fingerprint(st, account=account, function=fn, qualifier=q)
 
-    return {"platform": {fn: fps(fn) for fn in platform},
-            "sites": {fn: fps(fn) for fn in sites}}
+    def qual_class(fn: str, q: str | None) -> str:
+        if q is None:
+            return "unqualified"
+        return "alias" if q in aliases.get(fn, ()) else "version"
+
+    flat = {fn: sorted({fp(fn, q, st) for q, st in policies.get(fn, [])})
+            for fn in platform}
+    grouped: dict[str, dict[str, list[str]]] = {}
+    for fn in sites:
+        buckets: dict[str, set[str]] = {"unqualified": set(), "alias": set(),
+                                        "version": set()}
+        for q, st in policies.get(fn, []):
+            buckets[qual_class(fn, q)].add(fp(fn, q, st))
+        grouped[fn] = {k: sorted(v) for k, v in buckets.items()}
+    return {"platform": flat, "sites": grouped}
 
 
-def site_policy_shapes(sites: dict[str, list[str]]) -> list[list[str]]:
-    """站点函数 resource policy 的**全部形态**（去重后按出现次数降序）。
+def site_shape_canonicals(sites: dict[str, dict[str, list[str]]]) -> dict:
+    """写基线时从实测推出四件事：
 
-    为什么是"一组形态"而不是"一份规范"：M7 之后两种形态都合法——
-    从旧结构迁移过来的站点残留一份未限定 policy（其未限定 Function URL 已删），
-    而 M7 之后新建的站点只有 alias 上那一份。用众数会把其中一类整体报成偏离；
-    用并集会把最宽松的当规范。所以基线记下所有形态，比对时"匹配任一形态即合规"。
+    - `site_alias_canonical` —— alias 上那份语句的规范形态（众数）；
+    - `site_version_canonical` —— 版本级语句的规范形态（当前站点函数上为空）；
+    - `site_legacy_canonical` —— legacy 站点残留的未限定语句形态；
+    - `site_legacy_exempt` —— **点名豁免**的 legacy 站点（存站点名指纹）。
+
+    为什么 legacy 必须是点名豁免而不是全局合法形态：「存量迁移站点需要兼容
+    legacy」不等于「今后新建站点也可以再产生 legacy」。把两种形态都设成全局
+    白名单时，一个**全新**站点带着未限定 policy 也会全绿（Codex 复审 P1-3③）。
+    豁免集合只能缩小——某个 legacy 站点迁成 modern 之后，闸门会把"豁免可以去掉"
+    报成改善。
     """
-    counts: dict[tuple[str, ...], int] = {}
-    for fps in sites.values():
-        key = tuple(sorted(fps))
-        counts[key] = counts.get(key, 0) + 1
-    return [list(k) for k, _ in sorted(counts.items(),
-                                       key=lambda kv: (-kv[1], kv[0]))]
+    def mode(key: str) -> list[str]:
+        counts: dict[tuple[str, ...], int] = {}
+        for shape in sites.values():
+            k = tuple(shape.get(key, []))
+            if k:
+                counts[k] = counts.get(k, 0) + 1
+        if not counts:
+            return []
+        return list(max(counts.items(), key=lambda kv: (kv[1], kv[0]))[0])
+
+    legacy = sorted(fn for fn, shape in sites.items() if shape.get("unqualified"))
+    return {"site_alias_canonical": mode("alias"),
+            "site_version_canonical": mode("version"),
+            "site_legacy_canonical": mode("unqualified"),
+            "site_legacy_exempt": [site_fingerprint(fn) for fn in legacy]}
+
+
+def site_fingerprint(function_name: str) -> str:
+    """站点函数名 → 指纹（豁免名单只存指纹，与 principal 同一套编码规则）。"""
+    return principal_fingerprint(f"site:{function_name}")
 
 
 @dataclass
@@ -354,12 +479,19 @@ class Report:
 
 def compare_to_baseline(observed: dict[str, dict], baseline: dict, *,
                         required: dict[str, str],
-                        resource_policies: dict | None = None) -> Report:
+                        resource_policies: dict | None = None,
+                        facts: dict | None = None) -> Report:
     """observed = {fingerprint: {"name", "arn", "grants"}}。
 
-    `required` 把标签映射到**角色名**（Edge 的角色名来自 config.ini，
-    所以不能写死在这里）；每个标签要求哪些 grant 前缀由
-    `REQUIRED_GRANT_PREFIXES` 定。
+    **红绿口径按类别分两套，这是刻意的不对称**：
+
+    - `platform` 类的授权是"精确且必需"的 ⇒ 按**集合等值**比，
+      任一方向的差异都红。首版只比 `gained`，于是「Edge 丢掉
+      `invoke-platform:site-panel` 但保留 key-proxy」照样过前缀检查、
+      退出 0（Codex 复审 P1-4 的最小反例）。
+    - 其它类别（含 `platform-overbroad`）保持不对称：新增红、缩小是改善。
+      `platform-overbroad` **就是**要缩小的那一类，把它的缩小判成红会
+      把我们想要的修复报成故障。
     """
     base = baseline.get("principals", {})
     rep = Report()
@@ -369,17 +501,30 @@ def compare_to_baseline(observed: dict[str, dict], baseline: dict, *,
         if fp not in base:
             rep.new_principals.append(f"{p['name']}  [{fp}]  {sorted(grants)}")
             continue
-        gained = grants - set(base[fp].get("grants", []))
+        was = set(base[fp].get("grants", []))
+        category = base[fp].get("category")
+        gained, lost = grants - was, was - grants
         if gained:
             rep.new_grants.append(f"{p['name']}  [{fp}]  +{sorted(gained)}")
-        if base[fp].get("category") in (None, "", "unclassified"):
+        if lost:
+            if category == "platform":
+                rep.missing_required.append(
+                    f"{p['name']}（platform）丢了 {sorted(lost)}——平台授权是精确且"
+                    f"必需的，丢失同样要红")
+            else:
+                rep.improvements.append(f"{p['name']}  [{fp}]  -{sorted(lost)}")
+        if category in (None, "", "unclassified"):
             rep.unclassified.append(f"{p['name']}  [{fp}]")
 
     for fp, b in sorted(base.items()):
         if fp not in observed:
-            rep.improvements.append(
-                f"[{fp}] 不再具备任何敏感授权（原 {b.get('category', '?')}："
-                f"{sorted(b.get('grants', []))}）")
+            entry = (f"[{fp}] 不再具备任何敏感授权（原 {b.get('category', '?')}："
+                     f"{sorted(b.get('grants', []))}）")
+            if b.get("category") == "platform":
+                rep.missing_required.append(
+                    f"[{fp}] 是 platform 角色却整个消失了：{entry}")
+            else:
+                rep.improvements.append(entry)
 
     by_name = {p["name"]: set(p["grants"]) for p in observed.values()}
     for label, role_name in required.items():
@@ -395,40 +540,88 @@ def compare_to_baseline(observed: dict[str, dict], baseline: dict, *,
                     f"{role_name}（{label}）缺 {prefix}*（现有 {sorted(have)}）")
 
     if resource_policies is not None:
-        base_rp = baseline.get("resource_policies") or {}
-        base_platform = base_rp.get("platform", {})
-        for fn, fps in sorted(resource_policies.get("platform", {}).items()):
-            gained = set(fps) - set(base_platform.get(fn, []))
-            if gained:
-                rep.new_statements.append(f"{fn}: +{sorted(gained)}")
-            lost = set(base_platform.get(fn, [])) - set(fps)
-            if lost:
-                rep.improvements.append(f"{fn} 少了 resource policy 语句 {sorted(lost)}")
-        # 站点函数：逐个与**基线里记下的那几种形态**对齐。新建站点只要落在已知
-        # 形态里就不产生漂移；多一条或少一条语句的站点匹配不上任何形态，被点名。
-        shapes = [set(s) for s in base_rp.get("site_shapes", [])]
-        for fn, fps in sorted((resource_policies.get("sites") or {}).items()):
-            if any(set(fps) == s for s in shapes):
-                continue
-            nearest = min(shapes, key=lambda s: len(s ^ set(fps)), default=set())
-            extra = sorted(set(fps) - nearest)
-            missing = sorted(nearest - set(fps))
-            detail = []
-            if extra:
-                detail.append(f"多出语句 {extra}")
-            if missing:
-                detail.append(f"缺语句 {missing}（该站点可能已无法经 Edge 访问）")
-            rep.site_policy_outliers.append(
-                f"{fn}: " + "；".join(detail or [f"形态 {sorted(fps)} 不在基线里"]))
+        _compare_resource_policies(rep, baseline.get("resource_policies") or {},
+                                   resource_policies)
 
-    facts = baseline.get("facts") or {}
-    if facts:
-        rep.notes.append(
-            f"基线记录的事实：带 MissingContextValues 的 principal "
-            f"{facts.get('principals_with_missing_context', '?')} 个"
-            f"（他们的 grant 只是下界）；bootstrap 桶里带当前有效密钥的 asset "
-            f"{facts.get('edge_assets_carrying_live_key', '?')} 个")
+    _compare_facts(rep, baseline.get("facts") or {}, facts)
     return rep
+
+
+def _compare_resource_policies(rep: Report, base_rp: dict, now_rp: dict) -> None:
+    """平台函数按**集合等值**比（丢失一条 Function URL 授权语句 = 控制台或站点
+    入口断掉，首版把它写成"改善"）；站点函数按限定符类逐类比，legacy 只认
+    点名豁免。"""
+    base_platform = base_rp.get("platform", {})
+    for fn in sorted(set(base_platform) | set(now_rp.get("platform", {}))):
+        was = set(base_platform.get(fn, []))
+        now = set(now_rp.get("platform", {}).get(fn, []))
+        if now - was:
+            rep.new_statements.append(f"{fn}: +{sorted(now - was)}")
+        if was - now:
+            rep.new_statements.append(
+                f"{fn}: 少了 {sorted(was - now)}——平台函数的 resource policy 是"
+                f"精确且必需的，丢失同样要红")
+
+    alias_canon = set(base_rp.get("site_alias_canonical", []))
+    version_canon = set(base_rp.get("site_version_canonical", []))
+    legacy_canon = set(base_rp.get("site_legacy_canonical", []))
+    exempt = set(base_rp.get("site_legacy_exempt", []))
+    seen_exempt = set()
+
+    for fn, shape in sorted((now_rp.get("sites") or {}).items()):
+        fp = site_fingerprint(fn)
+        alias, version = set(shape.get("alias", [])), set(shape.get("version", []))
+        unqualified = set(shape.get("unqualified", []))
+        problems = []
+        if alias != alias_canon:
+            extra, missing = sorted(alias - alias_canon), sorted(alias_canon - alias)
+            if extra:
+                problems.append(f"alias 多出语句 {extra}")
+            if missing:
+                problems.append(f"alias 缺语句 {missing}（该站点可能已无法经 Edge 访问）")
+        if version != version_canon:
+            problems.append(f"版本级语句异常 {sorted(version ^ version_canon)}")
+        if unqualified:
+            if fp not in exempt:
+                problems.append(
+                    f"出现未限定 policy {sorted(unqualified)}——只有基线点名豁免的"
+                    f"存量 legacy 站点允许有它，新站点必须是 alias-only")
+            elif unqualified != legacy_canon:
+                problems.append(f"legacy 未限定语句偏离 {sorted(unqualified ^ legacy_canon)}")
+            else:
+                seen_exempt.add(fp)
+        if problems:
+            rep.site_policy_outliers.append(f"{fn}: " + "；".join(problems))
+
+    for fp in sorted(exempt - seen_exempt):
+        rep.improvements.append(
+            f"[{fp}] 这个 legacy 站点已不再有未限定 policy（迁成 alias-only 或已下线）"
+            f"——可以把它从 site_legacy_exempt 豁免名单里去掉")
+
+
+def _compare_facts(rep: Report, base_facts: dict, now_facts: dict | None) -> None:
+    """事实类数字只报 delta，**不参与红绿**——理由写在这里，因为它是个刻意的选择。
+
+    `principals_with_missing_context` 会随账号里任何一条带 Condition 的新策略
+    变动，跟本平台无关；让它决定退出码就会频繁红在无关变更上，
+    进而训练出"红了就更新基线"。所以：算出来、打印出来、不影响退出码。
+    带活密钥的 asset 数同理（每次 Edge 部署就多一个）。
+    """
+    if not base_facts and not now_facts:
+        return
+    if now_facts is None:
+        rep.notes.append(
+            f"基线记录的事实：{json.dumps(base_facts, ensure_ascii=False)}"
+            f"（本次未重新测量）")
+        return
+    for key in sorted(set(base_facts) | set(now_facts)):
+        was, now = base_facts.get(key), now_facts.get(key)
+        if isinstance(was, int) and isinstance(now, int) and was != now:
+            rep.notes.append(f"{key}: {was} → {now}（{now - was:+d}）")
+        elif was != now:
+            rep.notes.append(f"{key}: {was!r} → {now!r}")
+        else:
+            rep.notes.append(f"{key}: {now}（与基线一致）")
 
 
 def platform_function_names(app_py: Path = APP_PY) -> tuple[str, ...]:
@@ -531,23 +724,73 @@ def edge_asset_location(clients, function_name: str) -> tuple[str, str]:
                      f"它可能改成了内联代码，这条路要重新判定")
 
 
-def count_assets_carrying_key(clients, bucket: str, secret: str,
-                              max_size: int = 200 * 1024) -> int:
-    """bootstrap 桶里有多少个 asset 仍带着**当前有效**的密钥。
+def assets_carrying_key(clients, bucket: str, live_key: str,
+                        max_size: int = 200 * 1024) -> list[str]:
+    """bootstrap 桶里**全部**仍带着当前有效密钥的对象键。
 
-    每次 Edge 部署留一个新对象、旧对象不删 ⇒ 这个数只会涨。它是"轮转密钥
-    需要连带清理什么"的度量，也是"根治没做完"的度量。不参与红绿。
+    返回的是键的列表而**不是计数**：只探"当前 CloudFormation 模板指向的那一个"
+    时，「只能读旧对象」的 principal 完全不可见（Codex 复审 P1-2）。
+    每次 Edge 部署留一个新对象、旧对象不删 ⇒ 这个集合只会涨。
+
+    **连历史版本一起扫**：桶开着版本控制（noncurrent 保留 30 天），
+    对象被删之后旧版本仍可按 version ID 读到，而 `s3:GetObjectVersion`
+    是另一个动作（已进 `A_READ_OBJECT`）。IAM 里两者的资源 ARN 相同，
+    所以这里只需要键去重。
     """
-    n = 0
-    for page in clients["s3"].get_paginator("list_objects_v2").paginate(Bucket=bucket):
-        for obj in page.get("Contents", []):
-            if not obj["Key"].endswith(".zip") or obj["Size"] > max_size:
+    keys: set[str] = set()
+    paginator = clients["s3"].get_paginator("list_object_versions")
+    for page in paginator.paginate(Bucket=bucket):
+        for obj in page.get("Versions", []):
+            key = obj["Key"]
+            if key in keys or not key.endswith(".zip") or obj["Size"] > max_size:
                 continue
             blob = clients["s3"].get_object(
-                Bucket=bucket, Key=obj["Key"])["Body"].read()
-            if secret_in_zip_bytes(blob, secret):
-                n += 1
-    return n
+                Bucket=bucket, Key=key, VersionId=obj["VersionId"])["Body"].read()
+            if secret_in_zip_bytes(blob, live_key):
+                keys.add(key)
+    return sorted(keys)
+
+
+def function_versions(lam, names) -> dict[str, tuple[str, ...]]:
+    """`{函数名: (已发布版本号…)}`（不含 `$LATEST`）。
+
+    AWS 支持把 permission 限定到具体 version，且实测 Edge 的 version 9 上确实
+    存在版本级 resource policy ⇒ 不枚举版本就有一整条授权通道看不见。
+    """
+    out = {}
+    for name in names:
+        versions = []
+        for page in lam.get_paginator("list_versions_by_function").paginate(
+                FunctionName=name):
+            versions.extend(v["Version"] for v in page["Versions"]
+                            if v["Version"] != "$LATEST")
+        if versions:
+            out[name] = tuple(sorted(versions, key=lambda v: int(v)))
+    return out
+
+
+def edge_code_arns_carrying_key(clients, function_name: str, fn_arn: str,
+                                versions: tuple[str, ...], live_key: str) -> tuple[str, ...]:
+    """Edge 函数**及其每个仍含活密钥的已发布版本**的 ARN。
+
+    与 asset 那条同理：密钥没轮转过，所以历史版本的代码里也是这把密钥，
+    只探未限定 ARN 会漏掉「只能读某个旧版本」的 principal。逐个实测，
+    某个版本不再含活密钥时它自己就掉出集合。
+    """
+    import urllib.request
+    out = []
+    for qualifier in (None, *versions):
+        kw = {"FunctionName": function_name}
+        if qualifier:
+            kw["Qualifier"] = qualifier
+        try:
+            url = clients["lambda"].get_function(**kw)["Code"]["Location"]
+        except clients["lambda"].exceptions.ResourceNotFoundException:
+            continue
+        with urllib.request.urlopen(url) as fh:      # noqa: S310 (AWS 预签名 URL)
+            if secret_in_zip_bytes(fh.read(), live_key):
+                out.append(fn_arn if qualifier is None else f"{fn_arn}:{qualifier}")
+    return tuple(out)
 
 
 def function_aliases(lam, names) -> dict[str, tuple[str, ...]]:
@@ -563,15 +806,16 @@ def function_aliases(lam, names) -> dict[str, tuple[str, ...]]:
 
 
 def function_policy_statements(lam, name: str,
-                              aliases: tuple[str, ...]) -> list[tuple[str | None, dict]]:
+                              qualifiers: tuple[str, ...]) -> list[tuple[str | None, dict]]:
     """未限定函数 + 每个 alias 的 resource policy 语句。
 
     **不能只读未限定的那份**：M7 之后站点的 Function URL 与它的授权语句都挂在
     alias 上，只读未限定会把整条 invoke 授权面看漏（实测：M7 之后新建的站点
-    未限定 policy 根本不存在）。
+    未限定 policy 根本不存在）。**版本也要读**——实测 Edge 的 version 9 上有一条
+    版本级语句（`replicator.lambda.GetFunction`）。
     """
     out: list[tuple[str | None, dict]] = []
-    for qualifier in (None, *aliases):
+    for qualifier in (None, *qualifiers):
         kw = {"FunctionName": name}
         if qualifier:
             kw["Qualifier"] = qualifier
@@ -584,16 +828,23 @@ def function_policy_statements(lam, name: str,
 
 
 def simulate(iam, principal_arn: str, t: Targets) -> tuple[dict[str, str], bool]:
-    resources = [r for r in (t.all_invoke_resources()
-                             + [t.edge_function, t.edge_asset, t.jwt_parameter,
-                                t.any_role]) if r]
+    """两次调用：函数类资源一组、其余一组。
+
+    分组不是为了省钱，是为了不产生大量无意义的 (动作, 资源) 组合——一次调用的
+    响应体是 资源数 × 动作数，而 `ssm:*` 对 Lambda ARN、`lambda:*` 对 S3 ARN
+    都是纯噪音。
+    """
     out: dict[str, str] = {}
     missing = False
-    for page in iam.get_paginator("simulate_principal_policy").paginate(
-            PolicySourceArn=principal_arn, ActionNames=list(ACTIONS),
-            ResourceArns=resources):
-        out.update(decisions_from_simulation(page["EvaluationResults"]))
-        missing = missing or missing_context_in(page["EvaluationResults"])
+    for actions, resources in ((ACTIONS_FUNCTION, t.function_resources()),
+                               (ACTIONS_OTHER, t.other_resources())):
+        if not resources:
+            continue
+        for page in iam.get_paginator("simulate_principal_policy").paginate(
+                PolicySourceArn=principal_arn, ActionNames=list(actions),
+                ResourceArns=resources):
+            out.update(decisions_from_simulation(page["EvaluationResults"]))
+            missing = missing or missing_context_in(page["EvaluationResults"])
     return out, missing
 
 
@@ -611,61 +862,68 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
             f"{cfg_account}。闸门会对着另一个账号出结论——先切凭证或改 config。")
     edge_role_name = edge_role_arn.rsplit("/", 1)[-1]
 
-    platform = platform_function_names()
+    # 平台函数 = deployer 栈的清单（AST 取，不手抄）+ router 栈的两个 Edge 函数。
+    platform = platform_function_names() + EDGE_FUNCTIONS
     sites = site_function_names(lam, platform)
+    all_functions = list(platform) + list(sites)
 
     def fn_arn(n: str) -> str:
         return f"arn:aws:lambda:{region}:{account}:function:{n}"
 
-    # ---- 密钥的三处副本：**实测**它们现在是否还含活密钥 ----
     live_key = clients["ssm"].get_parameter(
         Name=JWT_PARAM_NAME, WithDecryption=True)["Parameter"]["Value"]
     facts: dict[str, object] = {}
 
-    edge_code_arn = fn_arn(EDGE_ORIGIN_REQUEST_FN)
-    import urllib.request
-    code_url = lam.get_function(
-        FunctionName=EDGE_ORIGIN_REQUEST_FN)["Code"]["Location"]
-    with urllib.request.urlopen(code_url) as fh:      # noqa: S310 (AWS 预签名 URL)
-        code_has_key = secret_in_zip_bytes(fh.read(), live_key)
-    if not code_has_key:
-        edge_code_arn = None  # type: ignore[assignment]
-        facts["edge_code_carries_live_key"] = False
+    aliases = function_aliases(lam, all_functions)
+    versions = function_versions(lam, all_functions)
+
+    # ---- 密钥的物化位置：**实测**，不假设 ----
+    edge_versions = versions.get(EDGE_ORIGIN_REQUEST_FN, ())
+    edge_code = edge_code_arns_carrying_key(
+        clients, EDGE_ORIGIN_REQUEST_FN, fn_arn(EDGE_ORIGIN_REQUEST_FN),
+        edge_versions, live_key)
+    facts["edge_code_targets_carrying_live_key"] = len(edge_code)
 
     asset_bucket, asset_key = edge_asset_location(clients, EDGE_ORIGIN_REQUEST_FN)
-    asset_blob = clients["s3"].get_object(
-        Bucket=asset_bucket, Key=asset_key)["Body"].read()
-    asset_arn: str | None = f"arn:aws:s3:::{asset_bucket}/{asset_key}"
-    if not secret_in_zip_bytes(asset_blob, live_key):
-        asset_arn = None
-        facts["edge_asset_carries_live_key"] = False
-    facts["edge_assets_carrying_live_key"] = (
-        count_assets_carrying_key(clients, asset_bucket, live_key)
-        if scan_assets else "未扫描（--no-asset-scan）")
+    if scan_assets:
+        asset_keys = assets_carrying_key(clients, asset_bucket, live_key)
+    else:
+        blob = clients["s3"].get_object(Bucket=asset_bucket, Key=asset_key)["Body"].read()
+        asset_keys = [asset_key] if secret_in_zip_bytes(blob, live_key) else []
+        print("（--no-asset-scan：只看当前 asset，历史对象未扫）", file=sys.stderr)
+    if asset_key not in asset_keys and scan_assets:
+        # 当前部署的 asset 不含活密钥 = 根治已生效（或密钥刚轮转）。这是好消息，
+        # 但要说出来——它会让 read-edge-asset 的资源集合变小。
+        print("注意：当前部署的 asset 已不含活密钥", file=sys.stderr)
+    facts["edge_assets_carrying_live_key"] = len(asset_keys)
 
-    aliases = function_aliases(lam, list(platform) + list(sites))
     targets = Targets(
         platform_functions=tuple(fn_arn(n) for n in platform),
         site_functions=tuple(fn_arn(n) for n in sites),
-        edge_function=edge_code_arn,
-        edge_asset=asset_arn,
+        edge_code_arns=edge_code,
+        edge_assets=tuple(f"arn:aws:s3:::{asset_bucket}/{k}" for k in asset_keys),
         jwt_parameter=f"arn:aws:ssm:{region}:{account}:parameter{JWT_PARAM_NAME}",
         any_role=f"arn:aws:iam::{account}:role/*",
         alias_arns={fn_arn(n): tuple(f"{fn_arn(n)}:{a}" for a in al)
                     for n, al in aliases.items()},
+        version_arns={fn_arn(n): tuple(f"{fn_arn(n)}:{v}" for v in vs)
+                      for n, vs in versions.items()},
     )
 
     # ---- resource policy 快照（SimulatePrincipalPolicy 不覆盖这条通道）----
-    policies = {name: function_policy_statements(lam, name, aliases.get(name, ()))
-                for name in list(platform) + list(sites)}
-    rp = resource_policy_snapshot(policies, account=account,
-                                 platform=platform, sites=sites)
+    policies = {name: function_policy_statements(
+                    lam, name, aliases.get(name, ()) + versions.get(name, ()))
+                for name in all_functions}
+    rp = resource_policy_snapshot(policies, account=account, platform=platform,
+                                 sites=sites, aliases=aliases)
 
     principals = list_principals(iam)
     print(f"账号 {account} / 区 {region}：平台函数 {len(platform)}、站点函数 "
-          f"{len(sites)}（带 alias 的 {len(aliases)} 个）、"
-          f"待模拟 principal {len(principals)}；"
-          f"Edge 产物含活密钥={code_has_key}、asset 含活密钥={asset_arn is not None}",
+          f"{len(sites)}、待模拟 principal {len(principals)}；"
+          f"探测资源 {len(targets.function_resources()) + len(targets.other_resources())} 个"
+          f"（含 alias {sum(len(v) for v in targets.alias_arns.values())}、"
+          f"版本 {sum(len(v) for v in targets.version_arns.values())}）；"
+          f"含活密钥的 Edge 代码目标 {len(edge_code)} 个、asset {len(asset_keys)} 个",
           file=sys.stderr)
 
     observed: dict[str, dict] = {}
@@ -728,12 +986,11 @@ def write_baseline(bundle: dict, baseline: dict, path: Path) -> None:
                         "unclassified"],
          "facts": bundle["facts"],
          "principals": principals,
-         # 站点函数只落**形态集合**，不落逐站点条目：逐站点会让每次建站/下线
-         # 都改基线，而"新增即红"依赖基线是稳定的。
+         # 站点函数只落**规范形态 + legacy 豁免名单**，不落逐站点条目：
+         # 逐站点会让每次建站/下线都改基线，而"新增即红"依赖基线是稳定的。
          "resource_policies": {
              "platform": bundle["resource_policies"]["platform"],
-             "site_shapes": site_policy_shapes(
-                 bundle["resource_policies"]["sites"]),
+             **site_shape_canonicals(bundle["resource_policies"]["sites"]),
          }},
         ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -796,7 +1053,8 @@ def main() -> int:
         return 0
 
     rep = compare_to_baseline(observed, baseline, required=bundle["required"],
-                              resource_policies=bundle["resource_policies"])
+                              resource_policies=bundle["resource_policies"],
+                              facts=bundle["facts"])
     print("\n" + rep.render())
     if rep.new_principals or rep.new_grants or rep.new_statements \
             or rep.site_policy_outliers:

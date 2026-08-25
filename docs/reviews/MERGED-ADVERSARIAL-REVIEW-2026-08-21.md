@@ -680,7 +680,7 @@ Codex 复核 v2 后认可它可作为 fix plan 的事实基线，并提了 3 处
   | v5 说 | 更正后（实测） |
   |---|---|
   | 密钥有**两条**路可得 | **三条。** 漏掉的是 **CDK bootstrap S3 asset** |
-  | 41 个 principal 具备敏感授权、35 个能拿到密钥 | **62 / 56**（漏掉的 21 个只在 asset 那条路上） |
+  | 41 个 principal 具备敏感授权、35 个能拿到密钥 | **62 / 56**（漏掉的 21 个只在 asset 那条路上）；**第二次复审又更正为 63 / 57**（漏了 `ssm:GetParameters`） |
   | 「唯一真修复是迁独立账号」 | 太绝对。迁账号是唯一能移出**管理身份**的办法，但「只读级工作负载能窃取密钥」这条在**现账号内**可以用**非对称签名**关掉（KMS `kms:Sign` + Edge 只放公钥）；代价见那份文档 |
 
   **漏掉的第三条路**（`router/infrastructure/stack.py` 先把明文替换进 `index.py`，
@@ -717,6 +717,51 @@ Codex 复核 v2 后认可它可作为 fix plan 的事实基线，并提了 3 处
   平台 resource policy 新语句、站点 policy 偏离，以及「asset 不再含活密钥」时
   **21 个 principal 退出暴露面并报成改善**（即：单独修 asset 这一条路，
   暴露面就从 62 降到 41）。
+
+- **第二次自我更正（同日，Codex 对重建版复审后。数字又错了一次，41→62→63）**
+
+  Codex 复审 `f4c3fd1` 报了四条 P1 与一条 P2，**五条全部成立**，已逐条实测复现。
+  真源仍是 `docs/security/account-trust-boundary.md`；本节只记差异与根因。
+
+  **根因是同一个建模错误犯了第三次**：把一种「能力」写成**单个 API 动作 / 单个
+  资源**。三次的形状完全一样，只是压平的那一维不同：
+
+  | 压成了什么 | 漏掉了谁 | 发现于 |
+  |---|---|---|
+  | 只探未限定函数 ARN | 挂在 `blue` alias 上的授权 | 第一次复审 |
+  | 只探当前那一个 CDK asset | 带同一把活密钥的 9 个历史对象 | 第一次复审 |
+  | 只探 `ssm:GetParameter` | 一个**只**被授予 `ssm:GetParameters`（复数）的角色 | 第二次复审 |
+
+  逐条：
+
+  1. **SSM 读是一个动作类，不是一个动作**（当前就在触发）。实测四个动作在这个
+     参数上的 allowed 数：`GetParameter` 27 / `GetParameters` 26 /
+     `GetParametersByPath` 18 / `GetParameterHistory` 18，**并集 28**。其中一个角色
+     只有复数那个（`Resource:*` 显式 Allow、无 boundary、`WithDecryption=true` 即可
+     读出明文），首版把它整个漏掉 ⇒ 数字从 62/56 更正为 **63/57**。
+  2. **9 个历史 asset 只被计数、没被模拟**。现在全部进 `Targets`，并把
+     `s3:GetObjectVersion` 加进动作类——桶开着版本控制（noncurrent 保留 30 天），
+     对象删掉之后旧版本仍可按 version ID 读到。
+  3. **限定符与版本被压平**。`invoke-platform:foo` / `@alias:foo` / `@version:foo`
+     现在是三条不同的 grant。另外发现一个我自己的残留盲区：两个 Edge 函数属于
+     **router 栈**，不在 deployer 栈的 `PLATFORM_FUNCTION_NAMES` 里，所以首版
+     **完全没看它们**——Edge 的 9 个已发布版本一个没枚举，「谁能读旧版本 Edge 代码
+     （里面就是明文密钥）」与「谁能 `UpdateFunctionCode` 换掉 Edge」都在视野外。
+     现在两者纳入，含 version 9 上那条版本级 resource policy。
+  4. **站点 legacy 形态被全局白名单化**：一个**全新**站点退回 legacy 也全绿。
+     改成**点名豁免**（当前 6 个存量站点），豁免只能缩小。
+  5. **平台侧的授权丢失被判成绿/改善**。`platform` 类现在按**集合等值**比——
+     Codex 的最小反例（Edge 丢掉 `invoke-platform:site-panel` 但保留 key-proxy）
+     和「平台函数少一条 Function URL 授权语句」现在都红。
+     `platform-overbroad` 保持不对称（它就是要缩小的那一类）。
+  6. **P2**：`MissingContextValues` 现在同时读顶层与 `ResourceSpecificResults`
+     （真实响应里常常只出现在后者），且 facts 出 delta。
+     **仍不影响退出码**——这个数随账号里任何一条带 Condition 的新策略变动，
+     让它决定红绿会训练出"红了就更新基线"。Codex 明确允许这个取舍。
+
+  重建后：45 条守卫（每条 finding 各有只命中新成员的用例）；生产实跑绿、退出码 0、
+  约 9 分钟；五种变形端到端验过该红/该绿。**可量化的中间修复**：只把 CDK asset
+  那条路修掉，21 个 principal 整个退出暴露面（63 → 42），可读密钥 57 → 36。
 
 ### M10 · [P2] `--mcp-callback` 文档零出现，且裸重跑会吊销它
 
