@@ -25,6 +25,7 @@
    基线只存指纹，所以 CDK bootstrap 那几个**名字里嵌着账号 ID**的角色
    也能被盯住而不泄值。
 """
+import fnmatch
 import importlib.util
 import json
 import re
@@ -50,6 +51,82 @@ def _gate():
     sys.modules["_vatb"] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+# --------------------------------------------------------------------------
+# 基线红线的**第二层**：结构化递归类型检查。
+#
+# 第一层是 `test_baseline_carries_no_account_values` 里的整文件 raw 禁用模式扫描
+# （12 位账号 ID / `arn:aws:` / `role/` / …）——它管"值本身不泄密"。
+# 这一层管"值出现在正确的结构位置、且是正确的类型"。**两层都要保留**：
+# `note` / `categories[]` / `category` 是自由文本，这一层刻意不校验它们的形态，
+# 若有人把真实账号 ID 或内部角色名写进 `note`，只有第一层会抓。
+#
+# 旧版把形态检查写成"硬编码 resource_policies 下的四个列表键"⇒ 新加任何子键都自动
+# 绕过。这一层反过来：**默认拒绝**，没有专门类型校验的位置一律必须是指纹形态。
+# --------------------------------------------------------------------------
+
+def _is_version_id(value: str) -> bool:
+    return bool(re.fullmatch(r"v[0-9]+", value))
+
+
+# 值的**类型分流**：路径模式 → 校验函数。命中这里的位置不做指纹形态检查，
+# 而是按它自己的类型校验 —— **这不是放行**。
+_TYPED_VALUE_PATHS = (
+    # VersionId 形如 v1/v2/…：既不是指纹，也不能是任意字符串（写成角色名或占位
+    # "?" 都必须红）。放成"任意字符串"就等于不检查；要求它是指纹又会把合法的 v3 报红。
+    ("managed_policy_versions.*", _is_version_id),
+)
+# **自由文本**：说明性字段，这一层不校验形态；泄密由第一层的整文件 raw 扫描兜。
+_FREE_TEXT_PATHS = (
+    "note", "categories[]",                 # 说明文字与类别词表
+    "principals.*.category",                # 类别名
+    # grant 串：等基线不再含 legacy `iam-policy-write:*` 之后，移进
+    # `_TYPED_VALUE_PATHS` 并按 grant 文法校验。
+    "principals.*.grants[]",
+)
+# 字典**键**里允许非指纹的位置（结构键名、以及平台函数名）。
+_NON_FP_KEY_PATHS = (
+    "",                                     # 顶层结构键（schema/note/facts/…）
+    "facts",                                # fact 名
+    "principals.*",                         # 每个 principal 条目内的 category/grants
+    "resource_policies",                    # 结构键（platform/site_*/bootstrap_bucket）
+    "resource_policies.platform",           # 键是平台函数名（app.py 里就有，不是账号值）
+    "coverage",                             # 结构键（undecided_items）
+    "permissions_boundaries.*",             # 结构键（policy_fp/stmt_fps）
+)
+
+
+def _walk_baseline(node, path=""):
+    """产出 (path, kind, value)，kind ∈ {"key", "value"}；只产出字符串。"""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            yield path, "key", k
+            yield from _walk_baseline(v, f"{path}.{k}" if path else k)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _walk_baseline(item, f"{path}[]")
+    elif isinstance(node, str):
+        yield path, "value", node
+
+
+def _non_fingerprint_leaves(data):
+    """基线树里所有"形态不对"的位置：默认必须是指纹，除非有专门的类型校验。"""
+    for path, kind, value in _walk_baseline(data):
+        if kind == "key":
+            if any(fnmatch.fnmatchcase(path, p) for p in _NON_FP_KEY_PATHS):
+                continue
+        else:
+            typed = [ok for pat, ok in _TYPED_VALUE_PATHS
+                     if fnmatch.fnmatchcase(path, pat)]
+            if typed:
+                if not all(ok(value) for ok in typed):
+                    yield f"{path}/类型不符={value!r}"
+                continue
+            if any(fnmatch.fnmatchcase(path, p) for p in _FREE_TEXT_PATHS):
+                continue
+        if not re.fullmatch(_FP_RE, value):
+            yield f"{path or '<root>'}/{kind}={value!r}"
 
 
 # --------------------------------------------------------------------------
@@ -1135,3 +1212,115 @@ def test_concrete_target_normalizes_a_wildcard_account_segment():
                             account="000000000000")
     assert pol.startswith("arn:aws:iam::000000000000:policy/connector-")
     assert "*" not in pol
+
+
+# ==========================================================================
+# 步 0（闸门收缩轮）：红判据与基线红线的**元守卫**
+#
+# 这一节测的不是"账号里有谁"，而是"闸门自己会不会漏红"。加它的理由：红判据原先散在
+# `Report.ok` / `render()` / `main()` **三处**，加字段忘改 `ok` 就是一个新的
+# false-green，而当时 62 条用例**没有一条会红**。
+# ==========================================================================
+
+def test_every_red_field_alone_flips_report_ok():
+    """每个红字段**单独**出现时都必须让 ok 变 False 且在 render() 里露出标签。
+
+    这条防的是"加了红字段但忘了接进 ok"——那种缺陷跑起来是绿的，
+    和"确实没有漂移"在输出上一模一样。
+    """
+    g = _gate()
+    for name, label, _key in g.RED_FIELDS:
+        rep = g.Report(**{name: ["造出来的一行"]})
+        assert not rep.ok, f"{name} 单独出现时 Report.ok 仍是 True——这是一个新的 false-green"
+        assert label in rep.render(), f"{name} 有内容，但 render() 里没有它的标签"
+
+
+def test_report_fields_are_all_classified():
+    """`Report` 的每个字段都必须被 RED_FIELDS 或 GREEN_FIELDS 声明。
+
+    不然新字段既不参与退出码也不打印——写进去了却完全没有作用。
+    """
+    import dataclasses
+    g = _gate()
+    declared = {n for n, _, _ in g.RED_FIELDS} | {n for n, _ in g.GREEN_FIELDS}
+    actual = {f.name for f in dataclasses.fields(g.Report)}
+    assert actual == declared, f"未被分类的 Report 字段：{actual ^ declared}"
+
+
+def test_main_red_message_covers_every_red_field():
+    """每个红字段都要有一条处置文案，否则闸门红了但不告诉人该怎么办。"""
+    g = _gate()
+    for name, _label, key in g.RED_FIELDS:
+        assert key in g.RED_MESSAGES, f"{name} 的处置提示 key {key!r} 没有对应文案"
+
+
+def test_baseline_redline_scan_walks_unknown_keys():
+    """红线检查必须**递归走整棵树**，不能只看写死的几个键。
+
+    旧版硬编码 resource_policies 下的四个列表键；收缩轮要加四个新分节
+    （bootstrap_bucket / coverage / iam_write_statements / permissions_boundaries），
+    照旧写法它们全部自动绕过"必须是指纹形态"这条。
+    """
+    data = json.loads(_BASELINE.read_text(encoding="utf-8"))
+    bad = list(_non_fingerprint_leaves(data))
+    assert not bad, f"这些位置出现了形态不对的字符串：{bad}"
+
+
+def test_all_facts_are_integers():
+    """`facts` 的每个值都必须是整数。
+
+    留成"任意字符串"的话，哪天某个 fact 改成资源名/ARN，递归红线会自动放行
+    （`_walk_baseline` 只产出字符串，整数走不到检查）。
+    """
+    facts = json.loads(_BASELINE.read_text(encoding="utf-8"))["facts"]
+    for k, v in facts.items():
+        assert isinstance(v, int), f"facts.{k} 不是整数而是 {type(v).__name__}: {v!r}"
+
+
+def test_baseline_redline_scan_catches_an_injected_new_subkey():
+    """**元用例**：往基线树里注入新子键，必须被抓到。
+
+    没有这条的话，上面那条在"递归实现其实没递归"时同样是绿的。
+    """
+    raw = _BASELINE.read_text(encoding="utf-8")
+    data = json.loads(raw)
+    data["resource_policies"]["brand_new_subkey"] = ["arn:aws:iam::000000000000:role/Sneaky"]
+    assert list(_non_fingerprint_leaves(data)), \
+        "注入了一个含 ARN 的新子键却没被抓到——递归红线检查是假的"
+    data2 = json.loads(raw)
+    data2["coverage"] = {"undecided_items": ["not-a-fingerprint"]}
+    assert list(_non_fingerprint_leaves(data2)), "非指纹形态的新分节没被抓到"
+    data3 = json.loads(raw)
+    data3["principals"]["not-a-fingerprint-key"] = {"category": "admin", "grants": []}
+    assert list(_non_fingerprint_leaves(data3)), "非指纹形态的 principal **键**没被抓到"
+
+
+def test_version_id_position_is_type_checked_not_waved_through():
+    """`managed_policy_versions` 的值按 **VersionId 形态**校验，不是"任意字符串放行"。
+
+    放行的话，这个位置写成角色名或占位 `"?"` 都过——而它正是用来解释红的那个字段。
+    反过来，合法的 `v3` 也必须**不**被当成"非指纹"报红（不装类型分支时它会）。
+    """
+    ok = {"managed_policy_versions": {"aaaa-bbbb-cccc-dddd": "v3"}}
+    assert not list(_non_fingerprint_leaves(ok)), "合法 VersionId 被误报了"
+    for bad in ("site-deployer-exec-role", "?", "", "3", "latest"):
+        tree = {"managed_policy_versions": {"aaaa-bbbb-cccc-dddd": bad}}
+        assert list(_non_fingerprint_leaves(tree)), f"VersionId 位置写成 {bad!r} 却没被抓到"
+
+
+def test_raw_forbidden_pattern_scan_still_covers_free_text_fields():
+    """**两层缺一不可**：`note` / `categories[]` / `category` 是自由文本，
+    结构化递归检查刻意不校验它们的形态 ⇒ 只有整文件 raw 扫描能抓住写进 `note` 的
+    真实账号 ID 或内部角色名。这条钉住"raw 那层没被递归检查替换掉"。
+    """
+    raw = _BASELINE.read_text(encoding="utf-8")
+    # 第一层：整文件（与 test_baseline_carries_no_account_values 同一组判据）
+    for forbidden in ("arn:aws:", "role/", "cdk-hnb659fds", "Isengard"):
+        assert forbidden not in raw, f"基线里出现了 {forbidden!r}"
+    assert not re.search(r"\b\d{12}\b", raw), "基线里出现了 12 位账号 ID"
+    # 第二层对自由文本确实放行 —— 所以第一层不能省
+    leaked = json.loads(raw)
+    leaked["note"] = "note 里塞一个 arn:aws:iam::000000000000:role/Leak"
+    assert not list(_non_fingerprint_leaves(leaked)), (
+        "结构化检查竟然抓住了 note —— 那这条用例的前提变了，"
+        "重新想一遍两层的分工再改")

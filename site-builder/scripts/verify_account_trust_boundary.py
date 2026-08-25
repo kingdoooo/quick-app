@@ -627,6 +627,36 @@ def site_fingerprint(function_name: str) -> str:
     return principal_fingerprint(f"site:{function_name}")
 
 
+# 红字段的**唯一真源**：(字段名, render 的标签, main() 的处置文案 key)。
+#
+# 为什么要有这张表：红判据原先散在**三处**——`Report.ok`、`render()` 里带「（红）」的
+# 标签、以及 `main()` 里两条处置文案的条件。加一个红字段而忘了改 `ok`，闸门就跑绿，
+# 而"跑绿"与"确实没有漂移"在输出上一模一样；当时 62 条用例没有一条会红。
+#
+# 加字段必须同时进这张表或 `GREEN_FIELDS`，否则
+# `test_report_fields_are_all_classified` 会红（它按 dataclass 字段全集比对）。
+RED_FIELDS: tuple[tuple[str, str, str], ...] = (
+    ("new_principals",       "新增 principal（红）",                         "grew"),
+    ("new_grants",           "已知 principal 长出新授权（红）",              "grew"),
+    ("missing_required",     "必需授权丢失（红）",                           "lost"),
+    ("new_statements",       "新增 resource policy 语句（红）",              "grew"),
+    ("site_policy_outliers", "站点函数的 resource policy 偏离规范形态（红）", "grew"),
+)
+GREEN_FIELDS: tuple[tuple[str, str], ...] = (
+    ("unclassified", "基线里未分类（请标注 category）"),
+    ("improvements", "集合缩小（绿；可更新基线）"),
+    ("notes",        "事实与口径（不参与红绿）"),
+)
+# 每个红字段都要有一条**处置**文案：闸门红了但不说该怎么办，等于把判断推给下一个人，
+# 而最省力的"处置"永远是更新基线。
+RED_MESSAGES = {
+    "grew": ("闸门红：账号里能冒充任意用户的授权面**变大了**。这不是又出了一个新缺陷，"
+             "而是既有暴露面扩张。处理方式见 docs/security/account-trust-boundary.md。"),
+    "lost": ("闸门红：平台自己的必需 invoke 权限丢了。真机症状是全站 403（Edge）或每次"
+             "部署在健康门失败（deployer）——**先确认是不是刚做过一次收窄**，别去查网络。"),
+}
+
+
 @dataclass
 class Report:
     new_principals: list[str] = field(default_factory=list)
@@ -640,22 +670,12 @@ class Report:
 
     @property
     def ok(self) -> bool:
-        return not (self.new_principals or self.new_grants
-                    or self.missing_required or self.new_statements
-                    or self.site_policy_outliers)
+        return not any(getattr(self, name) for name, _, _ in RED_FIELDS)
 
     def render(self) -> str:
         lines = []
-        for label, rows in (
-                ("新增 principal（红）", self.new_principals),
-                ("已知 principal 长出新授权（红）", self.new_grants),
-                ("必需授权丢失（红）", self.missing_required),
-                ("新增 resource policy 语句（红）", self.new_statements),
-                ("站点函数的 resource policy 偏离规范形态（红）",
-                 self.site_policy_outliers),
-                ("基线里未分类（请标注 category）", self.unclassified),
-                ("集合缩小（绿；可更新基线）", self.improvements),
-                ("事实与口径（不参与红绿）", self.notes)):
+        for name, label in ([(n, l) for n, l, _ in RED_FIELDS] + list(GREEN_FIELDS)):
+            rows = getattr(self, name)
             if rows:
                 lines.append(f"{label}：")
                 lines.extend(f"  - {r}" for r in rows)
@@ -1322,15 +1342,10 @@ def main() -> int:
                               resource_policies=bundle["resource_policies"],
                               facts=bundle["facts"])
     print("\n" + rep.render())
-    if rep.new_principals or rep.new_grants or rep.new_statements \
-            or rep.site_policy_outliers:
-        print("\n闸门红：账号里能冒充任意用户的授权面**变大了**。这不是"
-              "又出了一个新缺陷，而是既有暴露面扩张。"
-              "处理方式见 docs/security/account-trust-boundary.md。")
-    if rep.missing_required:
-        print("\n闸门红：平台自己的必需 invoke 权限丢了。"
-              "真机症状是全站 403（Edge）或每次部署在健康门失败（deployer）——"
-              "**先确认是不是刚做过一次收窄**，别去查网络。")
+    # 处置文案由 RED_FIELDS 的第三列驱动（`dict.fromkeys` 去重且保序）：
+    # 原先这里手抄了一遍字段名单，加红字段时最容易漏的就是这一处。
+    for key in dict.fromkeys(k for name, _, k in RED_FIELDS if getattr(rep, name)):
+        print("\n" + RED_MESSAGES[key])
     return 0 if rep.ok else 1
 
 
