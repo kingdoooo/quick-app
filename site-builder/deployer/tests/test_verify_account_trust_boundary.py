@@ -70,20 +70,37 @@ def _is_version_id(value: str) -> bool:
     return bool(re.fullmatch(r"v[0-9]+", value))
 
 
+# grant 的**文法**。`principals.*.grants[]` 不整体放行——放行的话，grant 构造失误把
+# 完整 ARN / 角色名 / 账号值拼进串里，这一层不会抓。
+# `invoke-*` / `replace-*` 后面是平台函数名（`app.py` 里就有，不是账号值）；
+# 站点子集带成员指纹 `some(k):<fp>`。
+#
+# **`some(k)` 那一支本账号当前没有实例**（所有能调站点函数的都是 `:all`），它只由
+# `test_site_subset_records_the_count_so_widening_reds` 覆盖——**别因为"基线里没见过"
+# 就把它从文法里删掉**，删了之后第一个子集授权出现时会被报成"grant 不合文法"
+# 而不是"新增授权"。
+_GRANT_RE = re.compile(
+    r"(?:invoke-platform|replace-platform-code)(?:@alias|@version)?:[A-Za-z0-9._-]+"
+    r"|invoke-site(?:@alias|@version)?:(?:all|some\(\d+\):" + _FP_RE + r")"
+    r"|read-edge-code|read-edge-asset|read-jwt-param")
+
+
+def _is_grant(value: str) -> bool:
+    return bool(_GRANT_RE.fullmatch(value))
+
+
 # 值的**类型分流**：路径模式 → 校验函数。命中这里的位置不做指纹形态检查，
 # 而是按它自己的类型校验 —— **这不是放行**。
 _TYPED_VALUE_PATHS = (
     # VersionId 形如 v1/v2/…：既不是指纹，也不能是任意字符串（写成角色名或占位
     # "?" 都必须红）。放成"任意字符串"就等于不检查；要求它是指纹又会把合法的 v3 报红。
     ("managed_policy_versions.*", _is_version_id),
+    ("principals.*.grants[]", _is_grant),
 )
 # **自由文本**：说明性字段，这一层不校验形态；泄密由第一层的整文件 raw 扫描兜。
 _FREE_TEXT_PATHS = (
     "note", "categories[]",                 # 说明文字与类别词表
     "principals.*.category",                # 类别名
-    # grant 串：等基线不再含 legacy `iam-policy-write:*` 之后，移进
-    # `_TYPED_VALUE_PATHS` 并按 grant 文法校验。
-    "principals.*.grants[]",
 )
 # 字典**键**里允许非指纹的位置（结构键名、以及平台函数名）。
 _NON_FP_KEY_PATHS = (
@@ -637,22 +654,29 @@ def test_doc_counts_come_from_the_baseline():
     def has_prefix(p, prefix):
         return any(x.startswith(prefix) for x in p["grants"])
 
+    # 类别名 → 标记里的 slug（标记名不能带连字符以外的怪字符，统一成下划线）
+    category_slugs = {"platform": "platform", "platform-overbroad": "platform_overbroad",
+                      "admin": "admin", "break-glass": "break_glass",
+                      "cdk-admin": "cdk_admin", "cdk-readonly": "cdk_readonly",
+                      "unrelated-workload": "unrelated"}
     expected = {
-        "总数": len(principals),
+        # ---- A：直接失守（headline）----
+        "A总数": len(principals),
         "可读密钥": count(lambda p: secret_grants & set(p["grants"])),
         "非平台可直调": count(
             lambda p: p["category"] != "platform"
             and (has_prefix(p, f"{g.G_INVOKE_PLATFORM}:")
                  or has_prefix(p, f"{g.G_INVOKE_SITE}:"))),
-        "无关工作负载": count(lambda p: p["category"] == "unrelated-workload"),
         "带活密钥的asset": data["facts"]["edge_assets_carrying_live_key"],
         "带活密钥的Edge代码目标": data["facts"]["edge_code_targets_carrying_live_key"],
-        # IAM 写已移交 B 的静态快照，A 的 grant 词表里不再有它。这里仍从**旧基线的
-        # grants** 数（用 legacy 前缀），因为基线还没重写；schema 3 落地时这一项换成
-        # 从 `iam_write_statements` 数。
-        "持有IAM策略变更动作": count(
-            lambda p: any(x.startswith(g.LEGACY_IAM_POLICY_WRITE_PREFIX)
-                          for x in p["grants"])),
+        # ---- B：IAM 写观察。**不进 A 的人数**——"持有一条未证明可提权的 IAM 写语句"
+        #      与"现在就能拿密钥"是两种风险，相加当成一个数字正是这一轮要消掉的错误。
+        "B持有IAM写语句": len(data["iam_write_statements"]),
+        "仅IAM写": len(set(data["iam_write_statements"]) - set(principals)),
+        # ---- 按类别：原先是**裸数字**（`无关工作负载` 那个曾经是 38，A 收缩后成了 36），
+        #      这一轮全部加上标记，让文档腐烂测得出来。
+        **{f"类别_{slug}": count(lambda p, c=cat: p["category"] == c)
+           for cat, slug in category_slugs.items()},
     }
     doc = _DOC.read_text(encoding="utf-8")
     for label, n in expected.items():
@@ -672,15 +696,22 @@ def test_no_unclassified_principal_in_baseline():
 
 
 def test_baseline_schema_is_current():
-    """基线 schema 与脚本必须同版本：schema 1 只有布尔能力标签，
-    拿它当基线跑 schema 2 的脚本会把每个 principal 都报成"新增"。"""
+    """基线 schema 与脚本必须同版本：schema 1 只有布尔能力标签、schema 2 把 IAM 写
+    混在 A 的 grant 里，拿它们当基线跑 schema 3 的脚本会把每个 principal 都报成"新增"。
+
+    分节清单也在这里钉死：**少任何一节都等于那一层的检查静默消失**。
+    """
     g = _gate()
     data = json.loads(_BASELINE.read_text(encoding="utf-8"))
     assert data["schema"] == g.BASELINE_SCHEMA
-    assert "resource_policies" in data and "facts" in data
+    for key in ("resource_policies", "facts", "coverage", "principals",
+                "iam_write_statements", "permissions_boundaries",
+                "managed_policy_versions"):
+        assert key in data, f"基线缺顶层分节 {key}"
     for key in ("platform", "site_alias_canonical", "site_version_canonical",
-                "site_legacy_canonical", "site_legacy_exempt"):
-        assert key in data["resource_policies"], f"基线缺 {key}"
+                "site_legacy_canonical", "site_legacy_exempt", "bootstrap_bucket"):
+        assert key in data["resource_policies"], f"基线缺 resource_policies.{key}"
+    assert "undecided_items" in data["coverage"], "基线缺 coverage.undecided_items"
 
 
 # ==========================================================================
@@ -1392,20 +1423,63 @@ def test_all_allowed_resources_are_not_undecided_even_with_top_level_missing_con
         "已经 allowed 的资源被算进了「判不出」⇒ coverage 变成噪音"
 
 
-def test_top_level_missing_context_applies_to_non_allowed_resource_specific_results():
-    """顶层缺上下文时，该 action 下每个**非 allowed** 的资源都算"判不出"；
-    allowed 的那些不算（它们已经有答案）。"""
+def test_uniform_missing_keys_collapse_the_resource_dimension():
+    """所有非 allowed 资源缺的是**同一组**键时，资源那一维零信息量 ⇒ 折叠成 unattributed。
+
+    **实测依据**（40 个 principal / 78 条 EvaluationResults）：AWS 把顶层缺的键机械地
+    复制进每一个逐资源条目，键集完全相同，而缺的是 `aws:ResourceAccount` /
+    `aws:CalledViaLast` / `iam:PassedToService` 这类**请求上下文**键——与具体资源无关。
+    照"每个非 allowed 资源各记一项"扇开，实测产生 **9985** 条成员（基线涨 10 倍），
+    而新增一个带 Condition 的 principal 会一次冒出几十条 ⇒ 红被噪音淹没。
+    """
     g = _gate()
     pairs = g.undecided_pairs([{
         "EvalActionName": "iam:PutRolePolicy", "EvalDecision": "implicitDeny",
-        "MissingContextValues": ["aws:PrincipalTag/x"],
+        "MissingContextValues": ["aws:ResourceAccount"],
         "ResourceSpecificResults": [
-            {"EvalResourceName": "target-a", "EvalResourceDecision": "implicitDeny"},
+            {"EvalResourceName": "target-a", "EvalResourceDecision": "implicitDeny",
+             "MissingContextValues": ["aws:ResourceAccount"]},
             {"EvalResourceName": "target-b", "EvalResourceDecision": "allowed"},
-            {"EvalResourceName": "target-c", "EvalResourceDecision": "explicitDeny"},
+            {"EvalResourceName": "target-c", "EvalResourceDecision": "explicitDeny",
+             "MissingContextValues": ["aws:ResourceAccount"]},
         ]}])
-    assert pairs == {("iam:PutRolePolicy", "target-a"),
-                     ("iam:PutRolePolicy", "target-c")}, pairs
+    assert pairs == {("iam:PutRolePolicy", "")}, pairs
+
+
+def test_differing_missing_keys_keep_the_resource_dimension():
+    """键集在资源之间**不同**时，资源维度确实带信息 ⇒ 逐资源记。
+
+    例如 `aws:ResourceTag/x` 这种真正按资源取值的条件键：只有某个资源缺它，
+    折叠掉就会把"只对这一个资源判不出"与"对全部资源判不出"混成一件事。
+    """
+    g = _gate()
+    pairs = g.undecided_pairs([{
+        "EvalActionName": "lambda:InvokeFunction", "EvalDecision": "implicitDeny",
+        "ResourceSpecificResults": [
+            {"EvalResourceName": "target-a", "EvalResourceDecision": "implicitDeny",
+             "MissingContextValues": ["aws:ResourceTag/env"]},
+            {"EvalResourceName": "target-b", "EvalResourceDecision": "implicitDeny",
+             "MissingContextValues": ["aws:ResourceTag/env", "aws:ResourceTag/tier"]},
+        ]}])
+    assert pairs == {("lambda:InvokeFunction", "target-a"),
+                     ("lambda:InvokeFunction", "target-b")}, pairs
+
+
+def test_allowed_resources_never_enter_even_when_others_are_undecided():
+    """allowed 的资源不算"判不出"，哪怕同一 action 下别的资源判不出。"""
+    g = _gate()
+    pairs = g.undecided_pairs([{
+        "EvalActionName": "lambda:InvokeFunction", "EvalDecision": "implicitDeny",
+        "ResourceSpecificResults": [
+            {"EvalResourceName": "yes", "EvalResourceDecision": "allowed",
+             "MissingContextValues": ["aws:ResourceTag/env"]},
+            {"EvalResourceName": "no-a", "EvalResourceDecision": "implicitDeny",
+             "MissingContextValues": ["aws:ResourceTag/env"]},
+            {"EvalResourceName": "no-b", "EvalResourceDecision": "implicitDeny",
+             "MissingContextValues": ["aws:ResourceTag/env", "x:y"]},
+        ]}])
+    assert ("lambda:InvokeFunction", "yes") not in pairs, "allowed 的资源被算成判不出"
+    assert pairs == {("lambda:InvokeFunction", "no-a"), ("lambda:InvokeFunction", "no-b")}
 
 
 def test_undecided_pairs_ignores_decided_resources():
@@ -1886,3 +1960,168 @@ def test_new_iam_write_action_is_in_the_class(action):
     assert g.expand_relevant_actions([action]) == {action}
     st = _iam_stmt(action=action)
     assert g.relevant_iam_statements([st]) == [st]
+
+
+# ==========================================================================
+# schema 3：loader / 一次性迁移 / dump 纯观测，以及红线的收紧
+#
+# **时序是这一步最容易搞错的地方**（第 1 版计划就死在这里）：
+# 新版本校验 + 旧数据 + 用旧数据生成新数据，三者同时在场。所以
+# `--dump-observed` 必须是**纯观测**——不读基线、不比较，否则迁移期第一次跑它就会被
+# 自己的 schema 校验挡死，**而那次 dump 正是迁移的输入**。
+# ==========================================================================
+
+def test_dump_mode_does_not_require_an_existing_current_schema_baseline():
+    """`--dump-observed` 单独用时是**纯观测**：不读基线。
+
+    迁移期第一次跑它时，仓库里的基线还是旧 schema；若在发 AWS 调用前就硬校验，
+    dump 根本产不出来——而 dump 正是迁移的输入。这是第 1 版计划里的死锁。
+    """
+    import argparse
+    g = _gate()
+    pure_dump = argparse.Namespace(dump_observed="/tmp/x.json", update_baseline=False)
+    assert not g.wants_baseline(pure_dump), \
+        "纯 dump 模式仍去读基线 ⇒ 迁移期第一次 dump 会被旧 schema 挡死"
+    assert g.wants_baseline(argparse.Namespace(dump_observed=None, update_baseline=False)), \
+        "出闸门结论时必须读基线"
+    assert g.wants_baseline(argparse.Namespace(dump_observed="/tmp/x.json",
+                                              update_baseline=True)), \
+        "要写基线时必须先读（category 要沿用）"
+
+
+def test_old_baseline_schema_hard_fails(tmp_path):
+    """拿 schema 2 的基线跑 schema 3 的脚本必须**硬失败**，不能开跑。
+
+    没有运行时校验时，版本不对的症状是"每个 principal 都报成新增"——一屏红，
+    而真因只是版本不匹配。
+    """
+    g = _gate()
+    p = tmp_path / "b.json"
+    p.write_text(json.dumps({"schema": 2, "principals": {}}), encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        g.load_baseline(p)
+    assert "--migrate-from-schema" in str(exc.value)
+
+
+def test_migration_only_accepts_schema_2_to_3(tmp_path):
+    g = _gate()
+    assert g.BASELINE_SCHEMA == 3, "这条用例的前提是脚本已经是 schema 3"
+    p = tmp_path / "b.json"
+    p.write_text(json.dumps({"schema": 1, "principals": {}}), encoding="utf-8")
+    with pytest.raises(SystemExit):
+        g.load_baseline(p, migrate_from=1)          # 1→3 不支持
+    p.write_text(json.dumps({"schema": 2, "principals": {}}), encoding="utf-8")
+    with pytest.raises(SystemExit):
+        g.load_baseline(p, migrate_from=3)          # 声明的版本与文件里的不一致
+    assert g.load_baseline(p, migrate_from=2)["schema"] == 3
+
+
+def test_migration_strips_iam_policy_write_and_drops_empty_entries():
+    """迁移必须剥掉 `iam-policy-write:*`，并删掉只剩空 grants 的条目。
+
+    **实测前提**：旧基线里有 1 个 `platform` 类 principal 持有 `iam-policy-write:scoped`。
+    不剥的话它"丢了一条 grant"，而 platform 类按集合等值比 ⇒ `missing_required` 红。
+    另有恰好 4 个 principal 只有这条 grant，它们整条退出 A。
+    """
+    g = _gate()
+    old = {"schema": 2,
+           "facts": {"principals_with_missing_context": 162, "iam_write_candidates": 22},
+           "principals": {
+               "aaaa-bbbb-cccc-dddd": {"category": "platform",
+                                       "grants": ["iam-policy-write:scoped",
+                                                  "invoke-site:all"]},
+               "eeee-ffff-0000-1111": {"category": "break-glass",
+                                       "grants": ["iam-policy-write:any"]}}}
+    new = g.migrate_baseline_2_to_3(old)
+    assert new["schema"] == 3
+    assert new["principals"]["aaaa-bbbb-cccc-dddd"]["grants"] == ["invoke-site:all"]
+    assert new["principals"]["aaaa-bbbb-cccc-dddd"]["category"] == "platform", "category 要保留"
+    assert "eeee-ffff-0000-1111" not in new["principals"], \
+        "只有 IAM 写那条 grant 的条目该整条退出 A"
+    assert not any(k.startswith("iam_write_") for k in new["facts"]), "旧 iam_write_* facts 没清"
+    assert new["facts"]["principals_with_missing_context"] == 162, "环境事实要留着"
+
+
+def test_from_dump_rejects_a_stale_schema(tmp_path):
+    """`--from-dump` 的快照也带 schema：旧快照缺新分节，
+    拿它当闸门结果会把"这些分节都空"当成"没有漂移"。"""
+    g = _gate()
+    p = tmp_path / "dump.json"
+    p.write_text(json.dumps({"schema": 2, "principals": {}}), encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        g.load_dump(p)
+    assert "schema" in str(exc.value)
+
+
+# ---- 红线收紧：grant 文法 / VersionId 形态 -------------------------------
+
+def test_grant_strings_follow_the_grant_grammar():
+    """grant 串按**文法**校验，不是"任意字符串放行"。
+
+    放行的话，grant 构造失误把完整 ARN / 角色名 / 账号值拼进串里，递归红线不会抓。
+    """
+    grants = [x for p in json.loads(_BASELINE.read_text(encoding="utf-8"))["principals"]
+              .values() for x in p["grants"]]
+    assert grants, "基线里一条 grant 都没有？"
+    for x in grants:
+        assert _GRANT_RE.fullmatch(x), f"grant {x!r} 不符合文法"
+
+
+def test_a_grant_carrying_an_arn_is_caught():
+    """**元用例**：往 grant 里注入 ARN / 拼接垃圾 / legacy 串，都必须被文法拒绝。"""
+    for bad in (f"invoke-platform:arn:aws:iam::{_ACCT}:role/X",
+                "read-jwt-param-and-then-some",
+                "iam-policy-write:any",
+                "invoke-site:some(1):notafingerprint",
+                "invoke-site:some(1)"):
+        assert not _GRANT_RE.fullmatch(bad), f"文法放过了 {bad!r}"
+    # 正对照：真实形态必须过
+    for ok in ("invoke-platform:site-panel", "invoke-platform@version:site-access-rollup",
+               "invoke-site:all", "invoke-site@alias:all", "read-edge-asset",
+               "invoke-site:some(2):aaaa-bbbb-cccc-dddd"):
+        assert _GRANT_RE.fullmatch(ok), f"文法误拒了 {ok!r}"
+
+
+def test_a_grant_carrying_an_arn_is_caught_by_the_tree_scan():
+    """注入到基线树里也要被递归红线抓到（不只是文法函数本身能判）。"""
+    data = json.loads(_BASELINE.read_text(encoding="utf-8"))
+    fp = next(iter(data["principals"]))
+    data["principals"][fp]["grants"] = [f"invoke-platform:arn:aws:iam::{_ACCT}:role/X"]
+    assert list(_non_fingerprint_leaves(data)), "grant 里的 ARN 没被递归红线抓到"
+
+
+def test_managed_policy_versions_are_version_ids():
+    versions = json.loads(_BASELINE.read_text(encoding="utf-8"))["managed_policy_versions"]
+    for fp, ver in versions.items():
+        assert re.fullmatch(r"v[0-9]+", ver), f"{fp} 的版本 {ver!r} 不是 VersionId 形态"
+
+
+def test_baseline_has_no_iam_policy_write_grants():
+    """A 的基线不许再带 `iam-policy-write:*`——那会把 B 的观察算进 A 的人数。"""
+    data = json.loads(_BASELINE.read_text(encoding="utf-8"))
+    for fp, p in data["principals"].items():
+        assert not any(x.startswith("iam-policy-write") for x in p["grants"]), \
+            f"基线 {fp} 还带着 iam-policy-write"
+
+
+def test_statement_text_never_enters_the_baseline():
+    """B 的三个分节只许存指纹：语句原文里 Principal 是带账号 ID 的角色 ARN。"""
+    data = json.loads(_BASELINE.read_text(encoding="utf-8"))
+    assert "texts" not in json.dumps(data), "语句原文（texts）漏进基线了"
+    for fp, fps in data["iam_write_statements"].items():
+        assert re.fullmatch(_FP_RE, fp)
+        for s in fps:
+            assert re.fullmatch(_FP_RE, s), f"{s!r} 不是指纹形态"
+    for fp, b in data["permissions_boundaries"].items():
+        assert re.fullmatch(_FP_RE, fp)
+        assert re.fullmatch(_FP_RE, b["policy_fp"])
+        for s in b["stmt_fps"]:
+            assert re.fullmatch(_FP_RE, s)
+
+
+def test_bucket_policy_statement_fingerprints_are_in_the_baseline():
+    """bootstrap 桶的快照必须真的落进基线（否则那一层等于没有）。"""
+    fps = json.loads(_BASELINE.read_text(encoding="utf-8"))["resource_policies"]["bootstrap_bucket"]
+    assert fps, "基线里 bootstrap_bucket 是空的——那一层没落地"
+    for fp in fps:
+        assert re.fullmatch(_FP_RE, fp), f"{fp!r} 不是指纹形态"

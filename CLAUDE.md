@@ -32,7 +32,10 @@ ARN，通配已清零）。不再需要"读文档时减去一层"。
 > 那是假修复**（同一批身份还握着密钥读取与自助提权）。两条真修复都未排期：账号内改
 > **非对称签名**（Edge 只放公钥）能关掉只读那批；迁**独立成员账号**才能移出管理身份。
 > 实测数字、为什么 SCP/resource policy/对称签名都不成立、以及盯住暴露面别再变大的
-> 闸门，见 `docs/security/account-trust-boundary.md`。**那份文档里还有一条值得单独记住**：
+> 闸门（**已收缩成 A 直接失守 + B IAM 写静态快照两层，C 站点 route/alias 可达性移出归
+> 部署验收**；真修复顺序：收窄 CodeBuild 对 bootstrap 桶的读权限 → 非对称签名 →
+> 迁独立账号，见 merged review §9 的 3b/3c/3d），
+> 见 `docs/security/account-trust-boundary.md`。**那份文档里还有一条值得单独记住**：
 > 跑不可信站点依赖安装的 CodeBuild 角色能读到那把密钥（CDK 自动授的整桶读），
 > 当前唯一的隔断是 `buildspec-package.yml` 里的 `npm install --ignore-scripts`。
 
@@ -109,7 +112,8 @@ RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/tes
 bash site-builder/scripts/smoke_router.sh    # 路由层冒烟（会写测试数据，跑完清理；含 65s 等 Edge 缓存）
 python3 site-builder/scripts/verify_console_e2e.py      # 控制台端到端
 python3 site-builder/scripts/verify_analytics_e2e.py    # 统计端到端（二期 M5）
-# 账号信任边界的漂移闸门（只读；400 个 principal × 2 次 IAM 模拟 + IAM 写候选确认 + 扫 bootstrap 桶，约 11 分钟）
+# 账号信任边界的漂移闸门（只读；A 直接失守 + B IAM 写静态快照两层；400 个 principal × 2 次
+# IAM 模拟 + 一次 GetAccountAuthorizationDetails + 扫 bootstrap 桶，实测约 10.5 分钟）
 python3 site-builder/scripts/verify_account_trust_boundary.py
 ```
 
@@ -298,7 +302,7 @@ python3 site-builder/scripts/gen_onboarding.py
 | 客户端接入（人/Agent） | `site-builder/docs/client-setup.md`；含真实值版本跑 `gen_onboarding.py` |
 | 合同细节（给站点生成方） | `site-builder/skills/site-builder/references/{contract,redlines}.md` |
 | **还剩什么没做 / 优先级** | `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9（**tracked**；两轮独立对抗性审查的合并版。S1 取的是表里 M01/M02/M05/M06 四条；M09 已按 v5 重定义并落地，其余各条还没做） |
-| **平台防谁 / 不防谁（账号信任边界）** | `docs/security/account-trust-boundary.md`（**tracked**；M09 的结论真源。含只读实测方法、四个由基线断言的数字、为什么 SCP/resource policy/应用层签名/收窄 invoke 都不成立） |
+| **平台防谁 / 不防谁（账号信任边界）** | `docs/security/account-trust-boundary.md`（**tracked**；M09 的结论真源。含只读实测方法、**14 个由基线断言的数字**（A/B 两组 + 按类别）、为什么 SCP/resource policy/应用层签名/收窄 invoke 都不成立） |
 | 加固包 S1 的设计与实施 | `docs/superpowers/specs/2026-08-22-s1-isolation-and-auth-hardening-spec.md` + `docs/superpowers/plans/2026-08-22-s1-isolation-and-auth-hardening.md`；升级/闸门/回滚见 `site-builder/DEPLOY.md` 的「S1 加固」一节 |
 | 一期设计决策与范围 | `docs/superpowers/specs/2026-07-21-quick-site-builder-design.md`（已实现快照，勿改） |
 | 二期设计与需求 | `docs/superpowers/specs/2026-07-30-quick-site-builder-phase2-design.md`；需求清单 `docs/phase2-requirements.md` |

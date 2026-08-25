@@ -11,7 +11,7 @@
 都可以取得会话签名密钥，从而以任意用户身份访问任意站点与控制台（读与写都算）。
 应用层的任何一道检查都挡不住这件事，因为它们全都以那把密钥为根。
 
-> **这份文档的数字被推翻过三次，每次都是同一个建模错误**：把一种「能力」写成
+> **这份文档的数字被推翻过四次，每次都是同一个建模错误**：把一种「能力」写成
 > **单个 API 动作 / 单个资源**。① 漏了 CDK bootstrap asset 这条路（41→62）；
 > ② 漏了 `ssm:GetParameters`（复数，62→63）；③ IAM 策略变更只对着字面量
 > `role/*` 模拟，漏了 6 个精确/窄授权的 principal（63→66）。
@@ -45,28 +45,43 @@ boundary；本账号是 Organizations 管理账号，SCP 对它无效）。
 python3 site-builder/scripts/verify_account_trust_boundary.py
 ```
 
-| 项 | 数 |
-|---|---|
-| 具备至少一项敏感授权的 principal | 66 <!-- baseline:总数=66 --> |
-| 其中**能取得会话签名密钥**的 | 57 <!-- baseline:可读密钥=57 --> |
-| 其中**非平台**身份可直接 `lambda:InvokeFunction` 平台或站点函数的 | 18 <!-- baseline:非平台可直调=18 --> |
-| 其中与本平台**完全无关**的工作负载角色 | 38 <!-- baseline:无关工作负载=38 --> |
-| CDK bootstrap 桶里仍带着**当前有效**密钥的 asset 对象 | 9 <!-- baseline:带活密钥的asset=9 --> |
-| Edge 函数里仍带着当前有效密钥的**代码目标**（未限定 + 已发布版本） | 10 <!-- baseline:带活密钥的Edge代码目标=10 --> |
-| 持有 IAM 策略变更动作的 principal（`:any` 14 / `:scoped` 6 / `:condition-gated` 2） | 22 <!-- baseline:持有IAM策略变更动作=22 --> |
+闸门分**两层**，承诺宽度不同，所以数字也分两组（见「这道闸门不证明什么」）：
 
-按类别（**不写角色原名**：其中若干名字内嵌账号 ID，另有一批是企业内部托管角色，
-写进被跟踪文件既违反仓库红线也没有必要）：
+| 组 | 项 | 数 |
+|---|---|---|
+| **A 直接失守** | 具备非 IAM-write 敏感授权的 principal | 62 <!-- baseline:A总数=62 --> |
+| | 其中**能取得会话签名密钥**的 | 57 <!-- baseline:可读密钥=57 --> |
+| | 其中**非平台**身份可直接 `lambda:InvokeFunction` 平台或站点函数的 | 18 <!-- baseline:非平台可直调=18 --> |
+| | Edge 函数里仍带着当前有效密钥的**代码目标**（未限定 + 已发布版本） | 10 <!-- baseline:带活密钥的Edge代码目标=10 --> |
+| | CDK bootstrap 桶里仍带着**当前有效**密钥的 asset 对象 | 9 <!-- baseline:带活密钥的asset=9 --> |
+| **B IAM 写观察** | 持有相关 IAM 策略变更语句的 principal | 22 <!-- baseline:B持有IAM写语句=22 --> |
+| | 其中**不在 A 里**（只有 IAM 写、**未证明可提权**） | 4 <!-- baseline:仅IAM写=4 --> |
+
+> **A + B 的并集是 66，但那个数不是 headline。** A 是"现在就能拿到密钥或直接调用平台
+> 函数"；B 只是"持有一条可能影响 IAM 策略的语句"，本闸门**明确不证明**它构成提权链
+> （判那个需要一个 IAM 权限分析器——那正是这道闸门被复审五轮的根因）。
+> 把两者相加当成一个风险数字，是这一轮收缩要消掉的那个错误。
+>
+> **B 里那 4 个不在 A 里的 principal 没有类别分布可写**：schema 3 的 `principals`
+> 只保留 A 的 62 个，那 4 个的 `category` 不在基线里 ⇒ 任何按类别的拆分都没有真源，
+> 只能靠人记，下次 B 的成员变了就会静默腐烂。要看它们是谁，跑
+> `--dump-observed` 看带真实名字的快照（产物含账号内标识，勿提交）。
+
+**A 组**按类别（**不写角色原名**：其中若干名字内嵌账号 ID，另有一批是企业内部托管
+角色，写进被跟踪文件既违反仓库红线也没有必要）：
 
 | 类别 | 数 | 说明 |
 |---|---|---|
-| `platform` | 6 | 平台自己的角色，授权都是**必需且精确**的，见下节 |
-| `platform-overbroad` | 1 | 平台自己的角色，但这条授权它**不需要**：见「平台侧唯一的过宽授权」 |
-| `admin` | 3 | 账号管理身份（含账号 owner 的 IAM 用户）。属既定信任模型 |
-| `break-glass` | 8 | 企业内部托管的管理/审计角色。不由本项目控制 |
-| `cdk-admin` | 6 | CDK bootstrap 的 CloudFormation 执行角色与部署角色（各 3 个区），按约定是 `AdministratorAccess`。**任何能在本账号跑 `cdk deploy` 的人都能用** |
-| `cdk-readonly` | 4 | CDK bootstrap 的 lookup 与 file-publishing 角色。它们**足以拿到密钥** |
-| `unrelated-workload` | 38 | 与本平台无关的工作负载：EC2/ECS/EMR/EKS 实例角色、多个 SageMaker 与 Personalize 执行角色、Glue、Batch、SSM 自动化与 QuickSetup、另一套 GenAI Agent 栈、若干应用与 CDK BucketDeployment 角色 |
+| `platform` | 6 <!-- baseline:类别_platform=6 --> | 平台自己的角色，授权都是**必需且精确**的，见下节 |
+| `platform-overbroad` | 1 <!-- baseline:类别_platform_overbroad=1 --> | 平台自己的角色，但这条授权它**不需要**：见「平台侧唯一的过宽授权」 |
+| `admin` | 3 <!-- baseline:类别_admin=3 --> | 账号管理身份（含账号 owner 的 IAM 用户）。属既定信任模型 |
+| `break-glass` | 6 <!-- baseline:类别_break_glass=6 --> | 企业内部托管的管理/审计角色。不由本项目控制 |
+| `cdk-admin` | 6 <!-- baseline:类别_cdk_admin=6 --> | CDK bootstrap 的 CloudFormation 执行角色与部署角色（各 3 个区），按约定是 `AdministratorAccess`。**任何能在本账号跑 `cdk deploy` 的人都能用** |
+| `cdk-readonly` | 4 <!-- baseline:类别_cdk_readonly=4 --> | CDK bootstrap 的 lookup 与 file-publishing 角色。它们**足以拿到密钥** |
+| `unrelated-workload` | 36 <!-- baseline:类别_unrelated=36 --> | 与本平台无关的工作负载：EC2/ECS/EMR/EKS 实例角色、多个 SageMaker 与 Personalize 执行角色、Glue、Batch、SSM 自动化与 QuickSetup、另一套 GenAI Agent 栈、若干应用与 CDK BucketDeployment 角色 |
+
+合计 62 = A 组总数。**这一轮把这张表的裸数字也加上了校验标记**：`unrelated-workload`
+那个曾经写着 38，而 A 收缩后是 36——裸数字正是文档腐烂的入口。
 
 ⇒ 这不是「只有我一个人有权限」的个人账号，而是一个**多工作负载共享账号**。
 任何一个上述工作负载被拿下（含任何能在本账号里跑 notebook / EC2 / `cdk deploy`
@@ -146,10 +161,11 @@ EC2/ECS/EMR/EKS 实例角色与 SSM 自动化角色的托管策略里。
 | MCP runtime 角色 | **只有** `site-deployer-undeploy` | MCP 的下线工具 |
 | auth 服务角色 | 不能 invoke；只读 jwt 参数 | 签会话 |
 
-deployer exec 角色另有一条 `iam-policy-write:scoped`（`role/site-rt-*` 上的
-`PutRolePolicy`/`AttachRolePolicy`）——那是 per-site 运行时角色拿到自己那份精确表
-ARN 策略的唯一途径，属设计内。它同时意味着**部署器有能力放宽任意 per-site 角色**，
-所以 `platform` 类的授权按集合等值盯死（多一条少一条都红）。
+deployer exec 角色另有 `role/site-rt-*` 上的 `PutRolePolicy` / `AttachRolePolicy`
+——那是 per-site 运行时角色拿到自己那份精确表 ARN 策略的唯一途径，属设计内。
+它同时意味着**部署器有能力放宽任意 per-site 角色**，所以 `platform` 类的授权按
+集合等值盯死（多一条少一条都红）。**这条授权现在由层 B 的静态语句快照盯着**，
+不再是 A 的一条 grant——A 只回答"现在就能拿密钥/直接调用平台函数"。
 
 **一个顺带的观察**（不是缺陷，但读代码的人常会误判）：blue/green 切换之后
 **旧颜色的 alias、Function URL 与两条 Edge 授权语句都保留**，没有任何代码删它们。
@@ -204,7 +220,7 @@ ARN 策略的唯一途径，属设计内。它同时意味着**部署器有能�
 
 - SCP 才真正生效（`site-builder/policies/scp-site-invoke-only-edge.json` 从
   「纸面制品」变成可执行控制）；
-- 暴露面从「66 个具备敏感授权的 principal」一次性收敛到「平台自己的 6 个 + 该账号的
+- 暴露面从「62 个具备敏感授权的 principal」一次性收敛到「平台自己的 6 个 + 该账号的
   管理身份」，且不再随别人的工作负载漂移；
 - 迁移后本文档的数字表与漂移闸门的基线应当**重置**，而不是继续沿用。
 
@@ -234,7 +250,7 @@ ARN 策略的唯一途径，属设计内。它同时意味着**部署器有能�
 
 **一个可量化的中间步骤**：只把 CDK asset 那条路修掉（不物化密钥进 asset，
 或清理带活密钥的对象），实测会让 **21** 个 principal 整个退出暴露面
-（66 → 45），可读密钥从 57 降到 36。这是用闸门的变形测试算出来的，不是估计。
+（**A 组 62 → 41**），可读密钥从 57 降到 36。这是用闸门的变形测试算出来的，不是估计。
 
 ## 在那之前的运行纪律
 
@@ -277,21 +293,32 @@ policy 里的 `role/ExactRole` 不会匹配字面量 `role/*` ⇒ 精确授权�
    负责**——它由第 3 层的逐成员比对、部署期的 blue/green 健康门与
    `smoke_router.sh` 覆盖。
 
-2. **IAM 策略变更**（`iam-policy-write`）——走**两步**，不和上面一起模拟：
-   先静态解析全部 identity policy 发现候选（`iam:*` / `iam:Put*` 这类通配要展开，
-   `Allow`+`NotAction` 保守算命中；已用正对照核过它是模拟器结果的超集），
-   再用模拟器对**具体** ARN 确认，资源按动作的资源类型落（role / user / **policy**）。
-   判定**三值**：确认有（`:any` / `:scoped`）、**判不出**（`:condition-gated`
-   ——模拟器给 implicitDeny 但带 `MissingContextValues`）、确认没有。
-   三值是必需的：实测某角色的 `AttachRolePolicy` 被 `iam:PolicyARN` 限定到两个无害的
-   AWS 托管策略，把"判不出"当成"没有"会让它连基线都进不去，条件哪天被放宽也没人
-   看见；记成 `condition-gated` 之后，放宽会表现为**新** grant ⇒ 红。
+2. **IAM 策略变更（层 B）——纯静态文本快照，不做权限分析，不进模拟器。**
+   收 role / user / **group** 的 inline + attached 托管 + **permissions boundary**，
+   用**全 glob**（`fnmatch`）判语句是否与那九个 IAM 策略变更动作相关，
+   **Allow 与 Deny 都收**，逐条归一化（丢 `Sid`、**当前**账号 ID → `<acct>`、
+   递归排序键与数组）后只存指纹。**任何 added / removed / changed 都红，不判改善。**
+   实测规模：22 个 principal / 43 条语句（21 条来自 AWS 托管策略、22 条 inline）。
 
-   **这条 grant 的语义是字面的**：「对至少一个真实 IAM 目标持有策略变更动作」，
-   **不是**「存在一条完整提权链」。后者还要看目标策略挂在谁身上、能否
-   AssumeRole/PassRole、boundary 拦不拦——那是可达性分析，本闸门不做。
-   所以这 22 个里有一部分（例如只能给一个 SSM 实例角色附两个指定托管策略的那个）
-   并不构成实际提权。
+   **为什么"消失"也红**：Allow 消失不等于收紧——语句可能被拆成两条更宽的、可能从
+   inline 挪到另一份 policy，也可能是**解析器漏收了**；把"旧指纹消失"自动判成改善，
+   正好会把解析器退化显示成好消息。而 **Deny 消失是实实在在的扩权**
+   （`Allow iam:* on *` + `Deny PutRolePolicy on EdgeRole`，删掉 Deny 则 Allow 集合
+   完全没变 ⇒ 只收 Allow 的设计全绿）。
+
+   托管策略文档 / 版本解析不到时**硬失败**，不静默跳过：跳过整份 policy 的输出与
+   「这份策略没有相关语句」一模一样。`managed_policy_versions` 只记**贡献了相关语句**
+   的那几份（账号里实测 300 份托管策略，全记会让 AWS 每更新任意一份都红一次）。
+
+   **原先那套两步（静态发现候选 → 模拟器对具体 ARN 确认 → 三值分类 `:any` /
+   `:scoped` / `:condition-gated`）已删除。** 它要求闸门回答「谁能提权」，而那等于
+   要造一个 IAM 权限分析器：statement 归因、Condition 语义、NotResource 集合代数、
+   policy variable、`SourcePolicyType` 碰撞——每修一维下一维才暴露。
+   **这是这道闸门被外部复审五轮的根因。** 所以 B 的承诺刻意收窄成一句：
+   **「可能影响这些动作的语句集合没有变化」**，仅此而已；它**不**声称某条语句是否
+   生效、是否构成提权链、变化方向是收紧还是放宽。
+   （所以这 22 个里有一部分——例如只能给一个 SSM 实例角色附两个指定托管策略的那个
+   ——并不构成实际提权，而闸门也不再假装能分辨。）
 3. **Lambda resource policy（含每个 alias 与每个已发布版本）**——
    `SimulatePrincipalPolicy` **不**自动纳入 resource policy（AWS 契约：它只能为
    IAM user 选择性地带一份，对 role 根本不支持），而同账号 resource-based Allow
@@ -324,8 +351,13 @@ policy 里的 `role/ExactRole` 不会匹配字面量 `role/*` ⇒ 精确授权�
   它们随账号里任何一条带 Condition 的新策略变动，让它们决定退出码就会频繁红在无关
   变更上，进而训练出"红了就更新基线"。
 
-一次完整运行约 **11 分钟**（400 个 principal × 2 次 IAM 模拟 + IAM 写候选逐个确认
-+ 扫 bootstrap 桶 + 逐版本校验 Edge 代码）。
+一次完整运行实测约 **10.5 分钟**（400 个 principal × 2 次 IAM 模拟 + 一次
+`GetAccountAuthorizationDetails` 静态收语句 + 扫 bootstrap 桶 + 逐版本校验 Edge 代码）。
+去掉 IAM 写的逐个模拟确认之后省下的时间不多——主要成本一直是那 800 次模拟。
+
+**`--dump-observed` 是纯观测模式**：它不读基线、不比较，退出码不代表闸门结论。
+分开是刻意的——把「产出用于分类/迁移的快照」与「出闸门结论」混在一条命令里，
+迁移期就会因为基线还是旧 schema 而根本产不出快照，而那份快照正是迁移的输入。
 
 基线在 `site-builder/scripts/account_trust_baseline.json`，**只存指纹**
 （`sha256[:16]`，每 4 位分组）与类别，不含任何账号值——账号内有若干角色名内嵌账号
@@ -344,33 +376,58 @@ python3 site-builder/scripts/verify_account_trust_boundary.py \
 python3 site-builder/scripts/verify_account_trust_boundary.py \
     --from-dump /tmp/trust-observed.json --classify /tmp/trust-classify.json \
     --update-baseline
-# ③ 同步本文档的七个数字（deployer/tests/test_verify_account_trust_boundary.py 会校验）
+# ③ 同步本文档的 14 个带标记数字（deployer/tests/test_verify_account_trust_boundary.py 会校验）
 ```
 
 `docs/security/` 下的这份文档、基线文件与闸门脚本三者互相咬着：
-文档的七个数字由基线算出并由单测断言（**正文里显示的数字必须紧挨着校验标记**，
+文档的 14 个带标记数字由基线算出并由单测断言（**正文里显示的数字必须紧挨着校验标记**，
 否则标记与正文可以各写一个数），基线由闸门写入，闸门的纯函数由单测覆盖。
 改任何一个都会把另外两个拽红。
 
 ### 这道闸门**不**证明什么
 
-写在这里，因为把它当成「暴露面已穷尽」是最容易犯的错：
+写在这里，因为把它当成「暴露面已穷尽」是最容易犯的错。
+**按层分开说**——三层的承诺宽度不同，混着读就会把窄的当宽的。
+
+**A（直接失守）**
 
 - `SimulatePrincipalPolicy` 对带 Condition 的策略需要调用方补 `ContextEntries`，
-  本脚本不补 ⇒ 那些 principal 的判定是**下界**。最近一次实测有 **162** 个
-  principal 的响应带 `MissingContextValues`。这个数被记进基线并打印，涨了就说明
-  「不确定的部分变多了」。**它不是 fail-closed 的**：真要 fail-closed 就得把这 162
-  个全判成有权限，那样闸门永远红、也就没有信号。
-- **动作等价类不是穷尽的。** `A_SELF_ESCALATE` 只取了最常见的四个 IAM 动作，
-  而 IAM 的提权面比这大。往任一类里加成员时，同时加一条只命中该新成员的用例
-  ——这个纪律是三次 false-green 换来的。
-- 它只看 IAM 与 Lambda resource policy 两条通道，不看 KMS grants、
-  VPC endpoint policy、其它服务的 resource policy。
-- 它不看跨账号 principal。
+  本脚本不补 ⇒ 那些判定是**下界**。逐项的不确定面记在 `coverage.undecided_items`
+  里（**成员级**：同一个 principal 多出一项判不出的目标也会红——按 principal 集合比
+  的话，「原本只对站点函数判不出、后来对 jwt-secret 也判不出」前后都是同一个集合）。
+  最近一次实测 **774** 项，覆盖 **162** 个 principal。
+  笼统计数 `principals_with_missing_context`（同样是 162）只报 delta、不参与红绿：
+  它随账号里任何一条带 Condition 的新策略变动。
+  **它不是 fail-closed 的**：真要 fail-closed 就得把这些全判成有权限，
+  那样闸门永远红、也就没有信号。
+- **动作等价类不是穷尽的。** `IAM_WRITE_ACTIONS` 手工列了九个 IAM 动作，
+  而 IAM 的提权面比这大；`A_READ_PARAM` 等同理。往任一类里加成员时，同时加一条
+  只命中该新成员的用例——这个纪律是**四次** false-green 换来的。
+- 它只看 IAM、Lambda resource policy、以及 **bootstrap 桶的 bucket policy**
+  （模拟器不纳入 resource-based policy，对 role 更是不支持模拟它），
+  不看 KMS grants、VPC endpoint policy、其它服务的 resource policy，
+  **也不看 S3 access point**。
+- 它不看跨账号 principal。但语句里出现**外部账号**的 principal 会改变指纹 ⇒ 会红
+  （账号归一化只归**当前**账号，就是为了留住这个信号）。
 - 它统计的是**当前**存在的 principal 与资源；某人临时建一个角色用完删掉，
   两次运行之间看不见。
-- 它给出的是**下界**，不是上界。这份文档的数字被推翻过两次，都是因为
+- 它给出的是**下界**，不是上界。这份文档的数字被推翻过**四次**，每次都是因为
   漏掉了一个等价动作或一类等价资源。
+
+**B（IAM 写观察）**
+
+- **不判断某条语句是否生效**（Condition 没求值，boundary 与 SCP 没参与评估）。
+- **不判断是否构成提权链**——那要看目标策略挂在谁身上、能否 AssumeRole/PassRole、
+  boundary 拦不拦。B 的语义就是字面意思：**存在一条可能影响 IAM 策略变更动作的语句**。
+- **不判断变化方向**是收紧还是放宽。这是刻意的：判方向需要的正是上面那套分析器。
+  **宁可多红**——报文里打了归一化后的语句原文，自己 diff 一遍再决定。
+
+**C（站点 route / alias 可达性）——已移出本闸门**
+
+- 站点的 route 活性、alias 存在性、alias 上的 Function URL **不由本闸门保证**，
+  归**部署验收**（已记进 merged review §9）。含：**idle 颜色被整个删除检测不到**。
+- 被否掉的思路：从 jobs 表推导「该有几个颜色」不成立——有站点有 2 次成功部署却只有
+  blue，因为其中一次在 M7 之前。
 
 ## M09 的框架不够大
 
@@ -382,7 +439,7 @@ merged review 的 M09 记的是「同账号 `lambda:InvokeFunction` 可对 panel
    `s3:GetObject`/`GetObjectVersion`（CDK asset）或四个 `ssm:GetParameter*`
    动作里的任一个就够——直接签一个真的会话
    cookie，走正常 HTTPS 进来。M09 描述的 invoke 路径是这件事的一个子集
-   （66 个里 18 个非平台身份能走 invoke，而 57 个能拿到密钥）。
+   （62 个里 18 个非平台身份能走 invoke，而 57 个能拿到密钥）。
 2. **写面并没有被挡住。** 那道 HMAC 的密钥，57 个 principal 能读到。
    review 里「写面唯一承重的是 `__Host-sb_console` 的 HMAC 验签」这句在**机制上**
    是对的，但它承重的前提（密钥不可得）不成立。

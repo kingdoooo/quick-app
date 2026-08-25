@@ -155,7 +155,7 @@ BASELINE_PATH = _HERE / "account_trust_baseline.json"
 CONFIG_PATH = _SITE_BUILDER / "config.ini"
 APP_PY = _SITE_BUILDER / "deployer" / "infra" / "app.py"
 
-BASELINE_SCHEMA = 2
+BASELINE_SCHEMA = 3
 JWT_PARAM_NAME = "/site-builder/jwt-secret"
 DEPLOYER_EXEC_ROLE = "site-deployer-exec-role"
 
@@ -379,26 +379,52 @@ def undecided_pairs(evaluation_results) -> set[tuple[str, str]]:
     也判不出——按 principal 集合前后都是 `{P}` ⇒ 绿，而新增的**密钥读取**不确定面
     没被发现。
 
-    **顶层的 `MissingContextValues` 归给该 action 下每个非 allowed 的资源**（保守归属）：
-    实测里它常常只出现在一侧。只在 `ResourceSpecificResults` 为空时才看顶层的写法，
-    会让「顶层带、逐资源条目自己不带」这一形态返回空集——**那比旧的 bool 判据还弱**。
+    **顶层的 `MissingContextValues` 也算**（并进每个非 allowed 资源的键集）：只在
+    `ResourceSpecificResults` 为空时才看顶层的写法，会让「顶层带、逐资源条目自己不带」
+    这一形态返回空集——**那比旧的 bool 判据还弱**，是相对现状的倒退。
 
     `allowed` 的逐资源结果永远不算"判不出"：它已经有答案了。所以顶层带缺失上下文而
     逐资源全 allowed 时，本函数正确地返回空集（旧 bool 在同一输入上是 True）。
+
+    **资源那一维只在它真的携带信息时才保留。** 实测（40 个 principal / 78 条
+    EvaluationResults）：AWS 把顶层缺的键**机械地复制进每一个逐资源条目**，键集完全
+    相同（逐资源计数恰好是顶层计数 × 资源数），而缺的是 `aws:ResourceAccount` /
+    `aws:CalledViaLast` / `iam:PassedToService` / `aws:TagKeys` 这类**请求上下文**键
+    ——它们与具体资源无关。照"每个非 allowed 资源各记一项"扇开，实测产生 **9985** 条
+    成员（基线涨 10 倍），而那一维**零信息量**：新增一个带 Condition 的 principal 会
+    一次冒出几十条，红被噪音淹没，正是"红了就更新基线"的训练场。
+
+    折叠的判据是**"不确定是均匀的"**，两个条件都要满足：
+    ① 该 action 下**每一个**非 allowed 资源都判不出（不是只有一部分）；
+    ② 它们缺的是**同一组**键。
+    只要有一个非 allowed 资源是"确认没有"（键集为空），或键集在资源之间不同，
+    就**逐资源记**——那时资源维度确实带信息（"只对 p1 判不出"与"对全部判不出"
+    不是一回事；`aws:ResourceTag/x` 这种按资源取值的条件键就属于后者）。
     """
     out: set[tuple[str, str]] = set()
     for res in evaluation_results:
         action = res.get("EvalActionName", "?")
-        top_missing = bool(res.get("MissingContextValues"))
+        top = frozenset(res.get("MissingContextValues") or ())
         specific = res.get("ResourceSpecificResults") or []
         if specific:
+            non_allowed, undecided_keys = 0, {}
             for rr in specific:
                 if rr.get("EvalResourceDecision") == "allowed":
-                    continue
-                if rr.get("MissingContextValues") or top_missing:
+                    continue        # 已经有答案了，不是"判不出"
+                non_allowed += 1
+                keys = frozenset(rr.get("MissingContextValues") or ()) | top
+                if keys:
                     name = rr.get("EvalResourceName", "")
-                    out.add((action, "" if "${" in name else name))
-        elif top_missing and res.get("EvalDecision") != "allowed":
+                    undecided_keys["" if "${" in name else name] = keys
+            if not undecided_keys:
+                continue
+            uniform = (len(undecided_keys) == non_allowed
+                       and len(set(undecided_keys.values())) == 1)
+            if uniform:
+                out.add((action, ""))           # 资源维度不带信息 ⇒ 折叠
+            else:
+                out.update((action, r) for r in undecided_keys)
+        elif top and res.get("EvalDecision") != "allowed":
             # 顶层资源名可能是 `${Region}` 这样的模板 ⇒ 归不到具体资源。
             # 老实记 unattributed，别硬塞一个不存在的 ARN（那会造出一个永远存在的假成员）。
             name = res.get("EvalResourceName", "")
@@ -1578,12 +1604,84 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
                          f"{failures[:3]}")
 
     facts["principals_with_missing_context"] = n_missing
-    return {"principals": observed, "resource_policies": rp, "facts": facts,
+    return {# 快照也带 schema：`--from-dump` 要能拒绝旧形态的快照（旧的缺新分节，
+            # 拿它当闸门结果会把"这些分节都空"当成"没有漂移"）。
+            "schema": BASELINE_SCHEMA,
+            "principals": observed, "resource_policies": rp, "facts": facts,
             "coverage": {"undecided_items": sorted(undecided)},
             # `texts` 只进 stdout 与 --dump-observed 的产物，**不进基线**。
             "iam_write": {"statements": iam_stmts, "boundaries": boundaries,
                           "managed_versions": used_policies, "texts": stmt_texts},
             "required": {"edge": edge_role_name, "deployer": DEPLOYER_EXEC_ROLE}}
+
+
+def migrate_baseline_2_to_3(data: dict) -> dict:
+    """schema 2 → 3 的**一次性**结构迁移。新分节由随后的实测填，这里不造数据。
+
+    唯一有语义的一步是**剥掉 `iam-policy-write:*` grant**——IAM 写移出 A 了（归 B 的
+    静态快照）。不剥的话那 22 个 principal 会各自"丢一条 grant"，而**实测其中 1 个是
+    `platform` 类**，platform 按集合等值比 ⇒ 判成 `missing_required` 红。
+    只剩空 grants 的条目（实测恰好 4 个）整条退出 A。
+    旧的 `iam_write_*` facts 一并清掉：B 不再有那套三值分类。
+    """
+    principals = {}
+    for fp, p in (data.get("principals") or {}).items():
+        kept = [g for g in p.get("grants", [])
+                if not g.startswith(LEGACY_IAM_POLICY_WRITE_PREFIX)]
+        if kept:
+            principals[fp] = {"category": p.get("category", "unclassified"), "grants": kept}
+    facts = {k: v for k, v in (data.get("facts") or {}).items()
+             if not k.startswith("iam_write_")}
+    return {**data, "schema": BASELINE_SCHEMA, "principals": principals, "facts": facts}
+
+
+def load_baseline(path: Path, *, migrate_from: int | None = None) -> dict:
+    """读基线并**硬校验 schema**。
+
+    没有运行时校验时，版本不对的症状是"每个 principal 都报成新增"——一屏红，
+    而真因只是版本不匹配。那种红会训练出"红了就更新基线"。
+    """
+    if not path.exists():
+        return {"schema": BASELINE_SCHEMA, "principals": {}}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    got = data.get("schema")
+    if got == BASELINE_SCHEMA:
+        return data
+    if migrate_from is None:
+        raise SystemExit(
+            f"基线 schema 是 {got}，脚本要 {BASELINE_SCHEMA}。直接比会把每个 principal 都"
+            f"报成新增。一次性迁移：--update-baseline --migrate-from-schema {got}")
+    if migrate_from != got or (got, BASELINE_SCHEMA) != (2, 3):
+        raise SystemExit(
+            f"只支持 schema 2→3 的一次性迁移（--migrate-from-schema {migrate_from}，"
+            f"文件里是 {got}，脚本是 {BASELINE_SCHEMA}）")
+    print(f"（一次性迁移基线 schema {got} → {BASELINE_SCHEMA}）", file=sys.stderr)
+    return migrate_baseline_2_to_3(data)
+
+
+def load_dump(path: Path) -> dict:
+    """`--from-dump` 的快照。**它也带 schema**。
+
+    旧快照缺新分节（bootstrap_bucket / coverage / iam_write），拿它当闸门结果会把
+    "这些分节都空"当成"没有漂移"——那是最坏的一种 false-green。
+    """
+    data = json.loads(path.read_text(encoding="utf-8"))
+    got = data.get("schema")
+    if got != BASELINE_SCHEMA:
+        raise SystemExit(
+            f"快照 {path} 的 schema 是 {got}，脚本要 {BASELINE_SCHEMA}——"
+            f"重新跑一次 --dump-observed，不要拿旧快照当闸门结果")
+    return data
+
+
+def wants_baseline(args) -> bool:
+    """只有"要出闸门结论"或"要写基线"时才需要读基线。
+
+    `--dump-observed` 单独用时是**纯观测**：迁移期第一次跑它的时候，仓库里的基线还是
+    旧 schema，若在发 AWS 调用前就硬校验，dump 根本产不出来——**而那次 dump 正是
+    迁移的输入**。这是一个真实踩过的死锁。
+    """
+    return not (args.dump_observed and not args.update_baseline)
 
 
 def write_baseline(bundle: dict, baseline: dict, path: Path) -> None:
@@ -1652,16 +1750,21 @@ def main() -> int:
                     help="从 PATH 读 {角色名: category} 映射，据此标注基线的 "
                          "category（配合 --update-baseline）。映射文件同样"
                          "含真实名字，**不要提交**。")
+    ap.add_argument("--migrate-from-schema", type=int, metavar="N",
+                    help="一次性通道：允许读入 schema N 的旧基线并迁移（当前只支持 2→3）。"
+                         "配合 --update-baseline 用；平时不要带。")
     ap.add_argument("--no-asset-scan", action="store_true",
                     help="跳过「bootstrap 桶里有多少 asset 带活密钥」那一遍扫描"
                          "（默认做；它要读几十个小对象）")
     args = ap.parse_args()
 
-    baseline = json.loads(BASELINE_PATH.read_text(encoding="utf-8")) \
-        if BASELINE_PATH.exists() else {"schema": BASELINE_SCHEMA, "principals": {}}
+    # **纯 dump 模式不读基线**：迁移期第一次跑 `--dump-observed` 时仓库里的基线还是
+    # 旧 schema，在这里硬校验就会把 dump 挡死——而那次 dump 正是迁移的输入。
+    baseline = load_baseline(BASELINE_PATH, migrate_from=args.migrate_from_schema) \
+        if wants_baseline(args) else {}
 
     if args.from_dump:
-        bundle = json.loads(Path(args.from_dump).read_text(encoding="utf-8"))
+        bundle = load_dump(Path(args.from_dump))
         print(f"（--from-dump：读的是快照 {args.from_dump}，未发 AWS 调用）",
               file=sys.stderr)
     else:
@@ -1678,6 +1781,14 @@ def main() -> int:
         Path(args.dump_observed).write_text(
             json.dumps(bundle, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print(f"\n实测清单（含真实名字，勿提交）已写入 {args.dump_observed}")
+        if not args.update_baseline:
+            # **纯观测**：不与基线比较，退出码不代表闸门结论。分开是刻意的——
+            # 把"产出用于分类/迁移的快照"与"出闸门结论"混在一条命令里，迁移期就会
+            # 因为基线还是旧 schema 而根本产不出快照。
+            print("\n（--dump-observed：**纯观测模式**，未与基线比较；"
+                  "退出码不代表闸门结论。要出结论请不带 --dump-observed 再跑一次。）",
+                  file=sys.stderr)
+            return 0
 
     if args.update_baseline:
         classify = json.loads(Path(args.classify).read_text(encoding="utf-8")) \
