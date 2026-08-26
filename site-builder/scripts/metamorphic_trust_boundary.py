@@ -20,10 +20,29 @@ manifest/result artifact，无法独立认证"。那条成立：**验证证据�
 
 **它会临时改工作树里的文件**，跑完（含异常与 Ctrl-C）都会还原；开跑前要求工作树对这
 两个文件是干净的，避免把你未提交的改动一起还原掉。
+
+## 判据为什么不能只看"退出码非 0"（Codex 第六轮 P2）
+
+`ok = code != 0` 会把三类**根本没跑到测试**的情形认证成"守卫红了"：
+
+| 实测情形 | rc | 末行 |
+|---|---|---|
+| 用例被改名、`-k` 选不到任何用例 | **5** | `… deselected`（一条都没选中） |
+| 测试文件语法错误 | **2** | `1 error` |
+| **闸门脚本**语法错误 | **1** | `1 failed` ← 与"守卫真的红了"逐字同形 |
+
+最后一行是关键：变形是机械字符串替换，缩进错一格就产出语法错误的脚本，而
+`_gate()` 在测试函数体内 `exec_module`，于是 pytest 把它记成 **failed** 而不是 error。
+所以"rc==1 且有实际 failed"**仍然不足**——还要另外证明变形后的文件是可导入的。
+
+现在每条变形要过四关：① 变形前这批用例必须 rc==0 且至少选中一条；② 变形后文件
+必须仍可编译/导入；③ 变形后必须 rc==1；④ 且末行有实际的 `N failed`。任何一关不过
+都报成**变形本身坏了**（BROKEN），不算"守卫红了"。
 """
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -158,20 +177,27 @@ MUTATIONS: list[tuple] = [
      '    warnings.simplefilter("error", InsecureRequestWarning)',
      '    warnings.simplefilter("always", InsecureRequestWarning)',
      "insecure_tls_warning_is_fatal"),
-    (23, "所有线程共享一个 IAM client", SCRIPT,
-     '    if not hasattr(_TLS_LOCAL, "iam"):',
-     '    if not hasattr(thread_iam_client, "_shared"):',
+    # **三处一起改**才真的造出"共享一个 client"。只改第一处的话，条件恒真 ⇒ 每次调用
+    # 都新建一个 client 并写进本线程的 thread-local，失败原因是"同线程没复用"，而
+    # 跨线程共享（真正触发未校验 TLS 的那个形态）根本没被造出来（Codex 第六轮 P2）。
+    (23, "所有线程共享同一个 IAM client（真·共享）", SCRIPT,
+     ('    if not hasattr(_TLS_LOCAL, "iam"):',
+      '            _TLS_LOCAL.iam = boto3.client(',
+      '    return _TLS_LOCAL.iam'),
+     ('    if not hasattr(thread_iam_client, "_shared"):',
+      '            thread_iam_client._shared = boto3.client(',
+      '    return thread_iam_client._shared'),
      "own_iam_client"),
     (24, "--no-asset-scan 不再限制用途", SCRIPT,
      '    if not getattr(args, "no_asset_scan", False):\n        return',
      '    return\n    if not getattr(args, "no_asset_scan", False):\n        return',
      "no_asset_scan_may_not_produce_a_verdict"),
     (25, "bundle 缺分节不再硬失败", SCRIPT,
-     '    missing = [k for k in BUNDLE_SECTIONS if k not in bundle]',
+     '    missing = [k for k in BUNDLE_SHAPE if k not in bundle]',
      '    missing = []',
      "bundle_missing_a_section or from_dump_rejects_a_bundle_missing"),
     (26, "不完整的 asset 扫描可以当权威结果", SCRIPT,
-     '    if not bundle.get("asset_scan_complete"):',
+     '    if bundle.get("asset_scan_complete") is not True:',
      '    if False:',
      "incomplete_asset_scan_cannot_be_replayed"),
     (27, "平台 resource policy 压回扁平集合（qualifier 类丢失）", SCRIPT,
@@ -179,9 +205,10 @@ MUTATIONS: list[tuple] = [
      '        raw = raw.replace(f"{function}:{qualifier}", "<self>:<alias>")',
      "separates_alias_from_version"),
     (28, "平台快照不按 qualifier 分桶", SCRIPT,
-     '    flat = {fn: bucketed(fn) for fn in platform}',
-     '    flat = {fn: sorted({fp(fn, q, st) for q, st in policies.get(fn, [])})\n'
-     '            for fn in platform}',
+     '    return {"platform": {fn: bucketed(fn) for fn in platform},',
+     '    return {"platform": {fn: sorted({fp(fn, q, st)\n'
+     '                                     for q, st in policies.get(fn, [])})\n'
+     '                         for fn in platform},',
      "platform_policy_keeps_qualifier_buckets or platform_alias_losing_a_statement "
      "or baseline_platform_shape_matches"),
     (29, "基线红线检查回退成硬编码键", TESTS,
@@ -202,15 +229,92 @@ MUTATIONS: list[tuple] = [
      '    ("managed_policy_versions.*", _is_version_id),',
      '',
      "version_id_position_is_type_checked"),
+    # ---- Codex 第六轮：合同只封顶层，内层缺失仍是权威绿 ----
+    (32, "完整性合同不查内层（只看顶层分节在不在）", SCRIPT,
+     '        for key, sub in spec.items():\n            if key not in value:',
+     '        for key, sub in list(spec.items())[:0]:\n            if key not in value:',
+     "bundle_missing_an_inner_key"),
+    (33, "coverage 只要求是 dict（内层 undecided_items 可缺）", SCRIPT,
+     '    "coverage": {"undecided_items": _list_of_str},',
+     '    "coverage": dict,',
+     "coverage_items_are_required"),
+    (34, "resource_policies 不要求 sites（整层站点检查可缺）", SCRIPT,
+     '                          "sites": {"*": _POLICY_SHAPE},\n',
+     '',
+     "sites_section_is_required"),
+    (37, "sites 只要求是 dict（**单个站点**的 shape 可截断）", SCRIPT,
+     '                          "sites": {"*": _POLICY_SHAPE},',
+     '                          "sites": dict,',
+     "a_truncated_per_site_shape_hard_fails"),
+    (35, "asset_scan_complete 退回 truthiness 判断", SCRIPT,
+     '    if bundle.get("asset_scan_complete") is not True:',
+     '    if not bundle.get("asset_scan_complete"):',
+     "asset_scan_complete_must_be_a_true_bool"),
+    # 两处一起改：默认拒绝在嵌套层与顶层各有一处，只改一处另一处照样红。
+    (36, "规格外的新分节放行（删默认拒绝）", SCRIPT,
+     ('        unknown = sorted(set(value) - set(spec))',
+      '    unknown = sorted(set(bundle) - set(BUNDLE_SHAPE) - {"asset_scan_complete"})'),
+     ('        unknown = []',
+      '    unknown = []'),
+     "an_unknown_bundle_section_hard_fails"),
 ]
 
 
-def run_tests(k: str) -> tuple[int, str]:
+PY = PYTEST.parent / "python3"
+_COUNT_RE = re.compile(r"(\d+) (passed|failed|error|errors|deselected|skipped)")
+
+
+def run_tests(k: str) -> tuple[int, str, dict[str, int]]:
     r = subprocess.run(
         [str(PYTEST), "tests/test_verify_account_trust_boundary.py", "-q", "-k", k,
          "--no-header", "-p", "no:cacheprovider"],
         cwd=ROOT / "site-builder/deployer", capture_output=True, text=True)
-    return r.returncode, (r.stdout.strip().splitlines() or [""])[-1]
+    tail = (r.stdout.strip().splitlines() or [""])[-1]
+    counts = {kind.rstrip("s") if kind == "errors" else kind: int(n)
+              for n, kind in _COUNT_RE.findall(tail)}
+    return r.returncode, tail, counts
+
+
+def why_not_green(rc: int, tail: str, counts: dict[str, int]) -> str | None:
+    """变形**之前**这批用例必须真的全绿。None = 合格，否则给出不合格的原因。
+
+    没有这一关时：`-k` 因为用例改名而选不到任何用例（实测 rc=5），或那批用例本来
+    就在失败，变形后"继续失败"都会被认证成"守卫成功红了"。
+    """
+    if counts.get("passed", 0) == 0:
+        return (f"`-k` 选不到任何用例（rc={rc}：{tail}）——用例被改名了？"
+                f"变形清单要同步更新")
+    if rc != 0 or counts.get("failed") or counts.get("error"):
+        return f"变形之前这批用例就不是全绿（rc={rc}：{tail}）"
+    return None
+
+
+def why_not_red(rc: int, tail: str, counts: dict[str, int]) -> str | None:
+    """变形**之后**必须是"有实际用例失败"，不是 error / 选不到 / 内部错误。"""
+    if rc == 1 and counts.get("failed", 0) >= 1:
+        return None
+    return f"不是「有实际用例失败」（rc={rc}：{tail}）"
+
+
+def why_not_loadable(path: Path) -> str | None:
+    """变形后的文件还能编译（测试文件）/ 导入（闸门脚本）吗？
+
+    **闸门脚本语法错误在 pytest 里记成 `1 failed`（实测 rc=1）**，与守卫真的红了
+    逐字同形。所以必须单独证一次，否则"把文件改坏"会被当成证据。
+    """
+    if path == SCRIPT:
+        code = ("import importlib.util,sys;"
+                "s=importlib.util.spec_from_file_location('_m',r'%s');"
+                "m=importlib.util.module_from_spec(s);sys.modules['_m']=m;"
+                "s.loader.exec_module(m)" % path)
+    else:
+        code = ("import pathlib,sys;p=r'%s';"
+                "compile(pathlib.Path(p).read_text(),p,'exec')" % path)
+    r = subprocess.run([str(PY), "-c", code], capture_output=True, text=True)
+    if r.returncode == 0:
+        return None
+    last = (r.stderr.strip().splitlines() or [""])[-1]
+    return f"变形后的文件已经不能{'导入' if path == SCRIPT else '编译'}了：{last[:70]}"
 
 
 def main() -> int:
@@ -235,8 +339,17 @@ def main() -> int:
 
     print(f"共 {len(todo)} 条变形。每条都必须让对应守卫**红**——不红即守卫是假的。\n")
     fails = []
+    green_cache: dict[str, str | None] = {}     # -k 表达式 → 基准是否合格
     for num, desc, path, old, new, k in todo:
         src = path.read_text(encoding="utf-8")
+        # 关①：变形**之前**这批用例必须真的全绿（同一个 -k 只测一次）。
+        if k not in green_cache:
+            green_cache[k] = why_not_green(*run_tests(k))
+        not_green = green_cache[k]
+        if not_green is not None:
+            print(f"  {num:>3}  {desc:46} **基准不合格** {not_green[:46]}")
+            fails.append((num, desc, f"基准不合格：{not_green}"))
+            continue
         # 一条变形可能需要**改两处**才真正削弱守卫。例如"grant 串回到整体放行"：
         # 只从类型分流里删掉它的话，grant 会落回"必须是指纹形态"那条默认规则 ——
         # 那是**变得更严**，不是放行，于是守卫照样红、变形什么也没证明。
@@ -253,21 +366,29 @@ def main() -> int:
             continue
         path.write_text(mutated, encoding="utf-8")
         try:
-            code, last = run_tests(k)
+            # 关②：变形后文件必须仍可编译/导入（否则"把文件改坏"会被当成证据）。
+            verdict = why_not_loadable(path)
+            detail = ""
+            if verdict is None:
+                # 关③④：必须 rc==1 且末行有实际的 `N failed`。
+                rc, detail, counts = run_tests(k)
+                verdict = why_not_red(rc, detail, counts)
         finally:
             path.write_text(src, encoding="utf-8")
-        ok = code != 0
-        print(f"  {num:>3}  {desc:46} {'红' if ok else '**仍然绿**'}   {last[:44]}")
-        if not ok:
-            fails.append((num, desc, last))
+        label = "红" if verdict is None else "**没红**"
+        print(f"  {num:>3}  {desc:46} {label:8} {(verdict or detail)[:46]}")
+        if verdict is not None:
+            fails.append((num, desc, verdict))
 
     print()
     if fails:
-        print(f"{len(fails)} 条变形没让守卫红——那些守卫证明不了它声称的东西：")
+        print(f"{len(fails)} 条变形没能证明守卫是真的——要么守卫是假的、要么变形本身坏了。"
+              f"两者都必须查清是哪一种：")
         for num, desc, why in fails:
             print(f"   {num}: {desc}  ({why})")
         return 1
-    print(f"全部 {len(todo)} 条变形都让对应守卫红了。")
+    print(f"全部 {len(todo)} 条变形都让对应守卫红了"
+          f"（每条都过了①基准全绿 ②变形后可导入 ③rc==1 ④有实际失败用例）。")
     return 0
 
 

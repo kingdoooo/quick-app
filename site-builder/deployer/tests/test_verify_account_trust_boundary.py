@@ -25,6 +25,7 @@
    基线只存指纹，所以 CDK bootstrap 那几个**名字里嵌着账号 ID**的角色
    也能被盯住而不泄值。
 """
+import copy
 import fnmatch
 import importlib.util
 import json
@@ -2150,6 +2151,36 @@ def test_authorization_details_filter_includes_group():
 # 不是理论风险。共同教训：**"不完整的观测"必须硬失败，不能变成一个权威的绿。**
 # ==========================================================================
 
+def _complete_bundle(g) -> dict:
+    """一份**形状完整**的观测，值取最小合法值。
+
+    刻意**手写**而不是从 `BUNDLE_SHAPE` 生成：从规格生成的样例必然满足规格，
+    拿它当正向控制是同义反复。代价是 `measure()` 新增分节时这里会红——那正是要的
+    （逼一次自觉更新，而不是让新分节悄悄地没人校验）。
+    """
+    return {
+        "schema": g.BASELINE_SCHEMA,
+        "asset_scan_complete": True,
+        "principals": {"0000-1111-2222-3333": {
+            "name": "SomeRole", "arn": "arn:aws:iam::1:role/SomeRole",
+            "kind": "role", "grants": ["invoke-platform:site-panel"]}},
+        # platform / sites 各带**一个成员**：`*` 通配层的内层规格只有在样例里真的
+        # 有成员时才会被 `_required_paths` 展开到，空 dict 下那一层等于没验。
+        "resource_policies": {
+            "platform": {"site-panel": {"alias": {"live": []}, "version": [],
+                                        "unqualified": []}},
+            "sites": {"site-fn": {"alias": {"blue": []}, "version": [],
+                                  "unqualified": []}},
+            "bootstrap_bucket": [], "bootstrap_bucket_texts": {}},
+        "facts": {"edge_code_targets_carrying_live_key": 0,
+                  "edge_assets_carrying_live_key": 0,
+                  "principals_with_missing_context": 0},
+        "coverage": {"undecided_items": []},
+        "iam_write": {"statements": {}, "boundaries": {},
+                      "managed_versions": {}, "texts": {}},
+        "required": {"edge": "EdgeRole", "deployer": "DeployerRole"},
+    }
+
 def test_insecure_tls_warning_is_fatal():
     """"这次请求没校验服务端证书"必须是**致命错误**，不许只打印后继续退出 0。
 
@@ -2212,10 +2243,10 @@ def test_incomplete_asset_scan_cannot_be_replayed_as_a_verdict(tmp_path):
     """
     g = _gate()
     p = tmp_path / "partial.json"
-    p.write_text(json.dumps({"schema": g.BASELINE_SCHEMA, "principals": {},
-                             "resource_policies": {}, "facts": {}, "coverage": {},
-                             "iam_write": {}, "required": {},
-                             "asset_scan_complete": False}), encoding="utf-8")
+    # 除 `asset_scan_complete` 外一切完整——好让这条用例只验扫描完整性这一维，
+    # 不会因为别的分节缺失而"因为另一个原因红"。
+    p.write_text(json.dumps({**_complete_bundle(g), "asset_scan_complete": False}),
+                 encoding="utf-8")
     with pytest.raises(SystemExit) as exc:
         g.load_dump(p)
     assert "asset" in str(exc.value)
@@ -2230,9 +2261,7 @@ def test_bundle_missing_a_section_hard_fails(tmp_path):
     缺一节的症状与「那一层没有漂移」**一模一样**，这是最坏的一种 false-green。
     """
     g = _gate()
-    full = {"schema": g.BASELINE_SCHEMA, "principals": {}, "resource_policies": {},
-            "facts": {}, "coverage": {}, "iam_write": {}, "required": {},
-            "asset_scan_complete": True}
+    full = _complete_bundle(g)
     g.check_bundle_complete(full, where="test")          # 完整：放行
     for drop in ("coverage", "iam_write", "resource_policies", "principals", "facts"):
         partial = {k: v for k, v in full.items() if k != drop}
@@ -2247,12 +2276,200 @@ def test_bundle_missing_a_section_hard_fails(tmp_path):
 def test_from_dump_rejects_a_bundle_missing_sections(tmp_path):
     g = _gate()
     p = tmp_path / "d.json"
-    p.write_text(json.dumps({"schema": g.BASELINE_SCHEMA, "principals": {},
-                             "resource_policies": {}, "facts": {}, "required": {},
-                             "asset_scan_complete": True}), encoding="utf-8")
+    bundle = {k: v for k, v in _complete_bundle(g).items()
+              if k not in ("coverage", "iam_write")}
+    p.write_text(json.dumps(bundle), encoding="utf-8")
     with pytest.raises(SystemExit) as exc:
         g.load_dump(p)
     assert "coverage" in str(exc.value) or "iam_write" in str(exc.value)
+
+
+# ==========================================================================
+# Codex 第六轮复审（2026-08-26）：顶层合同只封住了顶层，**内层缺失照样权威绿**
+#
+# 上一轮把"缺分节"封成硬失败，但合同只要求 `coverage` / `resource_policies` /
+# `iam_write` **是 dict**，不要求它们内部有东西。实测两个 false-green：
+#
+#   ① `coverage = {}`        → `coverage.get("undecided_items")` 是 None ⇒ 基线里
+#      774 项判不出的全被当成"已能判定"记进 improvements，`rep.ok == True`。
+#   ② `resource_policies` 缺 `sites` → 逐站点那一层**一个站点都没检查**，
+#      `red={}` 且**连一条 note 都没有** —— 输出与"真的没漂移"逐字相同。
+#
+# 为什么恰好是这两层：它们的比较器是**单向**的（消失=改善）。双向的那些
+# （B 的语句、boundary、bucket policy：消失也红）内层缺失会自己红出来——实测
+# `iam_write = {}` 是 44+7 条红、`principals = {}` 是 missing_required 红。
+# **所以规律是：单向比较器的层必须由合同兜住下限。** 合同做成递归默认拒绝，
+# 就不必逐层去记哪个方向了。
+# ==========================================================================
+
+def _required_paths(spec: dict, value: dict, prefix: tuple = ()):
+    """（规格, 样例）→ 所有必需路径。`*` 通配层按样例里的实际成员展开。"""
+    for key, sub in spec.items():
+        if key == "*":
+            for member, mv in value.items():
+                if isinstance(mv, dict):
+                    yield from _required_paths(sub, mv, prefix + (member,))
+            continue
+        yield prefix + (key,)
+        if isinstance(sub, dict) and isinstance(value.get(key), dict):
+            yield from _required_paths(sub, value[key], prefix + (key,))
+
+
+def _drop_path(bundle: dict, path: tuple) -> dict:
+    out = copy.deepcopy(bundle)
+    node = out
+    for key in path[:-1]:
+        node = node[key]
+    del node[path[-1]]
+    return out
+
+
+def test_bundle_missing_an_inner_key_hard_fails():
+    """顶层齐了但**内层**缺键，同样不许变成一个权威的绿。
+
+    走 `BUNDLE_SHAPE` 枚举每条必需路径：规格声明"必需"，这条用例验证**检查器真的
+    执行了**它。枚举规格证明不了规格自己没被削弱——那由下面 coverage / sites
+    两条**点名**用例守（删掉规格里那一项，它们就红）。
+    """
+    g = _gate()
+    full = _complete_bundle(g)
+    paths = list(_required_paths(g.BUNDLE_SHAPE, full))
+    assert len(paths) > len(g.BUNDLE_SHAPE), \
+        f"只枚举到顶层 {len(paths)} 条路径——递归规格没生效，这条用例什么也没验"
+    for path in paths:
+        with pytest.raises(SystemExit) as exc:
+            g.check_bundle_complete(_drop_path(full, path), where="test")
+        assert ".".join(path) in str(exc.value), \
+            f"缺 {'.'.join(path)} 时报文里没点出是哪条路径：{exc.value}"
+
+
+def test_coverage_items_are_required_because_losing_them_reads_as_all_clear():
+    """`coverage` 在、内层 `undecided_items` 没了 ⇒ 每一项判不出的都变成"改善"。"""
+    g = _gate()
+    items = ["1111-1111-1111-1111", "2222-2222-2222-2222"]
+    baseline = {"schema": g.BASELINE_SCHEMA, "principals": {},
+                "coverage": {"undecided_items": items}}
+    rep = g.compare_to_baseline({}, baseline, required={}, resource_policies=None,
+                                facts=None, coverage={}, iam_write=None)
+    assert rep.ok and len(rep.improvements) == len(items), (
+        "前提变了：coverage 内层缺失现在会自己红了 ⇒ 这条用例要按新形态重写，"
+        "别直接删——它是合同存在的理由")
+    with pytest.raises(SystemExit) as exc:
+        g.check_bundle_complete({**_complete_bundle(g), "coverage": {}}, where="test")
+    assert "coverage.undecided_items" in str(exc.value)
+
+
+def test_sites_section_is_required_because_losing_it_disables_the_whole_layer():
+    """`resource_policies` 缺 `sites` ⇒ 逐站点 resource policy **一个都不检查**。
+
+    三段：① 正向控制（这一层平时真的会红）② 删掉 sites 后全绿且无 note
+    ③ 所以合同必须在比较器之前就拒掉它。
+    """
+    g = _gate()
+    canon = ["1111-1111-1111-1111", "2222-2222-2222-2222"]
+    baseline = {"schema": g.BASELINE_SCHEMA, "principals": {},
+                "resource_policies": {"platform": {}, "bootstrap_bucket": [],
+                                      "site_alias_canonical": canon,
+                                      "site_version_canonical": [],
+                                      "site_legacy_canonical": [],
+                                      "site_legacy_exempt": []}}
+    base_rp = {"platform": {}, "bootstrap_bucket": [], "bootstrap_bucket_texts": {}}
+    # ① active 色少一条规范语句 = 该站点整站 403，必须红
+    bad = {"site-x": {"alias": {"blue": canon[1:]}, "version": [], "unqualified": []}}
+    rep = g.compare_to_baseline({}, baseline, required={},
+                                resource_policies={**base_rp, "sites": bad},
+                                facts=None, coverage=None, iam_write=None)
+    assert rep.site_policy_outliers and not rep.ok, "正向控制失效：这一层已经不会红了"
+    # ② 同一份观测删掉 sites ⇒ 全绿，且没有任何提及站点的 note
+    rep2 = g.compare_to_baseline({}, baseline, required={}, resource_policies=base_rp,
+                                 facts=None, coverage=None, iam_write=None)
+    assert rep2.ok, ("前提变了：sites 缺失现在会自己红了 ⇒ 按新形态重写这条用例")
+    # ③ 合同拒
+    rp = {k: v for k, v in _complete_bundle(g)["resource_policies"].items()
+          if k != "sites"}
+    with pytest.raises(SystemExit) as exc:
+        g.check_bundle_complete({**_complete_bundle(g), "resource_policies": rp},
+                                where="test")
+    assert "resource_policies.sites" in str(exc.value)
+
+
+def test_a_truncated_per_site_shape_hard_fails():
+    """同一个洞往下一层：`sites` 键在，但**某个站点**的 shape 截断成 `{}`。
+
+    比较器逐站点取 `shape.get("alias") or {}`，于是那个站点一条 alias 都不比、
+    `version` / `unqualified` 也都当空 ⇒ 该站点整个不参与检查。实测（本用例第②段）
+    `ok=True`、`site_policy_outliers=[]`、**零 note**——与"这个站点没问题"逐字相同。
+    所以 `sites` 不能只声明"是 dict"，逐成员的三个桶也要在合同里。
+
+    这条的存在理由与上一条同源，但**不是同一个检查**：上一条守的是 `sites` 这个键，
+    删掉 `_POLICY_SHAPE` 时它照样绿。
+    """
+    g = _gate()
+    canon = ["1111-1111-1111-1111", "2222-2222-2222-2222"]
+    baseline = {"schema": g.BASELINE_SCHEMA, "principals": {},
+                "resource_policies": {"platform": {}, "bootstrap_bucket": [],
+                                      "site_alias_canonical": canon,
+                                      "site_version_canonical": [],
+                                      "site_legacy_canonical": [],
+                                      "site_legacy_exempt": []}}
+    base_rp = {"platform": {}, "bootstrap_bucket": [], "bootstrap_bucket_texts": {}}
+    # ① 正向控制：形状完整、blue 缺一条规范语句 ⇒ 红
+    full_shape = {"site-x": {"alias": {"blue": canon[1:]}, "version": [],
+                             "unqualified": []}}
+    rep = g.compare_to_baseline({}, baseline, required={},
+                                resource_policies={**base_rp, "sites": full_shape},
+                                facts=None, coverage=None, iam_write=None)
+    assert rep.site_policy_outliers and not rep.ok, "正向控制失效：这一层已经不会红了"
+    # ② 同一个站点的 shape 截断成 {} ⇒ 全绿、零 outlier
+    rep2 = g.compare_to_baseline({}, baseline, required={},
+                                 resource_policies={**base_rp, "sites": {"site-x": {}}},
+                                 facts=None, coverage=None, iam_write=None)
+    assert rep2.ok and not rep2.site_policy_outliers, (
+        "前提变了：per-site shape 截断现在会自己红了 ⇒ 按新形态重写这条用例，"
+        "别直接删——它是 _POLICY_SHAPE 存在的理由")
+    # ③ 合同在比较器之前就拒：三个桶逐个删一次都要红，且报文点出是哪条路径
+    full = _complete_bundle(g)
+    for bucket in ("alias", "version", "unqualified"):
+        shape = {k: v for k, v in full["resource_policies"]["sites"]["site-fn"].items()
+                 if k != bucket}
+        rp = {**full["resource_policies"], "sites": {"site-fn": shape}}
+        with pytest.raises(SystemExit) as exc:
+            g.check_bundle_complete({**full, "resource_policies": rp}, where="test")
+        assert f"resource_policies.sites.site-fn.{bucket}" in str(exc.value)
+    # ④ 桶的类型也要判：alias 是 `{颜色: [指纹…]}`，压成一个扁平 list 就丢了颜色维
+    rp = {**full["resource_policies"],
+          "sites": {"site-fn": {"alias": [], "version": [], "unqualified": []}}}
+    with pytest.raises(SystemExit) as exc:
+        g.check_bundle_complete({**full, "resource_policies": rp}, where="test")
+    assert "resource_policies.sites.site-fn.alias" in str(exc.value)
+
+
+def test_asset_scan_complete_must_be_a_true_bool():
+    """`if not bundle.get(...)` 下字符串 `"false"` 是 truthy ⇒ 不完整观测照样出结论。"""
+    g = _gate()
+    full = _complete_bundle(g)
+    for bad in ("false", "true", "yes", 1, 0, None, [], {}):
+        with pytest.raises(SystemExit) as exc:
+            g.check_bundle_complete({**full, "asset_scan_complete": bad}, where="test")
+        assert "asset" in str(exc.value), f"{bad!r} 被拒了但报文没说是扫描完整性"
+    with pytest.raises(SystemExit):
+        g.check_bundle_complete(
+            {k: v for k, v in full.items() if k != "asset_scan_complete"}, where="test")
+
+
+def test_an_unknown_bundle_section_hard_fails():
+    """`measure()` 新增分节必须同时进 `BUNDLE_SHAPE`。
+
+    默认拒绝的理由和这一整节一样：新分节要是没人校验，它就是下一个"截断了也看不出"
+    的层。放行未知键 = 把同一个 bug 类留给下一轮。
+    """
+    g = _gate()
+    for extra in ({"brand_new_layer": {}},
+                  {"resource_policies": {**_complete_bundle(g)["resource_policies"],
+                                         "brand_new_layer": {}}}):
+        with pytest.raises(SystemExit) as exc:
+            g.check_bundle_complete({**_complete_bundle(g), **extra}, where="test")
+        assert "brand_new_layer" in str(exc.value)
 
 
 def test_gaining_a_second_undecided_platform_function_is_a_failure():

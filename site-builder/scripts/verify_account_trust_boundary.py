@@ -725,9 +725,10 @@ def resource_policy_snapshot(policies: dict[str, list[tuple[str | None, dict]]],
                              aliases: dict[str, tuple[str, ...]]) -> dict:
     """`{函数名: [(qualifier, 语句)…]}` → 快照。**这里不做任何判断。**
 
-    平台函数记成一个扁平指纹集合（名字稳定，逐个比）；站点函数**按限定符类
-    分组**（`unqualified` / `alias` / `version`），因为"有没有未限定语句"正是
-    legacy 与 modern 两种部署形态的判据，压平之后就没法只允许 modern。
+    平台与站点函数**都按限定符类分组**（`unqualified` / `alias` / `version`，
+    且 `alias` 逐成员），因为"有没有未限定语句"正是 legacy 与 modern 两种部署形态
+    的判据，压平之后就没法只允许 modern；平台那半边压平还会丢掉 alias↔version
+    的移动与"两个 alias 语句相同、删掉其中一个"（见 `bucketed`）。
 
     合法性判据在基线里（见 `compare_to_baseline`）。早先版本在这里用**并集**
     算规范形态，结果最宽松的那个站点函数反而成了规范、规矩的那个被报成偏离
@@ -743,12 +744,17 @@ def resource_policy_snapshot(policies: dict[str, list[tuple[str | None, dict]]],
                                      qualifier_class=qual_class(fn, q))
 
     def bucketed(fn: str) -> dict:
-        """按限定符类分桶，alias **逐成员**。
+        """按限定符类分桶，alias **逐成员**（`{颜色: [指纹…]}`）。
 
         平台函数原先压成一个扁平集合，于是两种 false-green：① 语句从 alias 挪到
         version 指纹不变（见 `statement_fingerprint`）；② 两个 alias 有相同语句时，
         删掉其中一个而另一个还在，集合不变 ⇒ 绿。后者正是站点 alias 已经修过的
         「成员并集」问题，平台这条路当时留着没改。
+
+        **alias 必须逐成员记**的站点侧理由同源：并起来记的话，「blue 丢了授权、
+        green 还留着」两者相加仍等于规范集合 ⇒ 全绿。M7 切换后旧颜色的 alias /
+        Function URL / 两条语句都保留（代码里没有任何地方删它们），所以"每个颜色
+        都完整"不会误报。
         """
         alias_members: dict[str, set[str]] = {a: set() for a in aliases.get(fn, ())}
         version_fps: set[str] = set()
@@ -765,28 +771,10 @@ def resource_policy_snapshot(policies: dict[str, list[tuple[str | None, dict]]],
                 "version": sorted(version_fps),
                 "unqualified": sorted(unqualified)}
 
-    flat = {fn: bucketed(fn) for fn in platform}
-    grouped: dict[str, dict] = {}
-    for fn in sites:
-        # **alias 逐成员记**（`{颜色: [指纹…]}`）：并起来记的话，
-        # 「blue 丢了授权、green 还留着」两者相加仍等于规范集合 ⇒ 全绿。
-        # M7 切换后旧颜色的 alias / Function URL / 两条语句都保留（代码里没有任何
-        # 地方删它们），所以"每个颜色都完整"不会误报。
-        alias_members: dict[str, set[str]] = {a: set() for a in aliases.get(fn, ())}
-        version_fps: set[str] = set()
-        unqualified: set[str] = set()
-        for q, st in policies.get(fn, []):
-            kind = qual_class(fn, q)
-            if kind == "alias":
-                alias_members.setdefault(q, set()).add(fp(fn, q, st))
-            elif kind == "version":
-                version_fps.add(fp(fn, q, st))
-            else:
-                unqualified.add(fp(fn, q, st))
-        grouped[fn] = {"alias": {a: sorted(v) for a, v in alias_members.items()},
-                       "version": sorted(version_fps),
-                       "unqualified": sorted(unqualified)}
-    return {"platform": flat, "sites": grouped}
+    # 两边**同一个分桶函数**：早先平台与站点各有一份逐字相同的循环，于是第五轮的
+    # 「平台压平了」是只改一边留下的。同体之后不会再出现"修了一边"。
+    return {"platform": {fn: bucketed(fn) for fn in platform},
+            "sites": {fn: bucketed(fn) for fn in sites}}
 
 
 def site_shape_canonicals(sites: dict[str, dict[str, list[str]]]) -> dict:
@@ -1768,14 +1756,98 @@ def load_baseline(path: Path, *, migrate_from: int | None = None) -> dict:
     return migrate_baseline_2_to_3(data)
 
 
-# 一份**权威**观测必须有的分节与类型。缺一节的症状与「那一层没有漂移」一模一样：
-# `main()` 把它 `.get()` 给比较器，比较器拿到 None 就整层跳过。实测构造过一个只缺
-# `coverage` 与 `iam_write` 的 schema-3 dump —— 基线里明明有 B 语句与 undecided items，
-# 闸门仍输出「与基线一致」、退出码 0。
-BUNDLE_SECTIONS: dict[str, type] = {
-    "schema": int, "principals": dict, "resource_policies": dict, "facts": dict,
-    "coverage": dict, "iam_write": dict, "required": dict,
+def _nonempty_str(v) -> bool:
+    return isinstance(v, str) and bool(v.strip())
+
+
+def _plain_int(v) -> bool:
+    # bool 是 int 的子类；facts 里放个 True 当计数要拒。
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _list_of_str(v) -> bool:
+    return isinstance(v, list) and all(isinstance(x, str) for x in v)
+
+
+# 一份**权威**观测必须有的分节、**内层键**与类型。**递归默认拒绝**：
+# 规格里没写的键一律不放行。
+#
+# 为什么必须递归到内层（Codex 第六轮 blocker）：上一版只要求 `coverage` /
+# `resource_policies` 是 dict，于是两个实测 false-green——
+#   ① `coverage = {}`         ⇒ `.get("undecided_items")` 是 None ⇒ 基线里 774 项
+#      判不出的全被记成 improvements，`rep.ok == True`；
+#   ② `resource_policies` 缺 `sites` ⇒ 逐站点那层一个都不检查，`red={}` 且**零 note**，
+#      输出与「真的没漂移」逐字相同。
+#   ③ 同一个洞往下一层还有一次：`sites` 键在、但**某个站点**的 shape 截断成 `{}`
+#      ⇒ 比较器 `shape.get("alias") or {}` 走空路径，那个站点一条 alias 都不比
+#      （实测 `ok=True`、`site_policy_outliers=[]`、零 note）。所以 `platform`/`sites`
+#      不能只声明「是 dict」，逐成员的三个桶也要在合同里。
+# 恰好是这几层的原因：它们的比较器是**单向**的（消失=改善，或只遍历本次观测）。双向
+# 的那些（B 的语句、boundary、bucket policy、platform 逐桶——消失也红）内层缺失会自己
+# 红出来（实测 `iam_write = {}` 是 44+7 条红）。**规律：单向比较器的层必须由合同兜住
+# 下限**；做成递归默认拒绝就不必逐层去记哪层是哪个方向，加新层时也不会漏。
+#
+# **不声称**的一件事：本合同只封「键缺失 / 类型不对」。`"sites": {}`（键在、一个成员
+# 都没有）与「这个账号真的没有站点」在数据上无法区分，闸门不猜——那条要靠比较器的
+# canonical 集合与部署验收（§9 的 3e）覆盖。
+_POLICY_SHAPE: dict = {"alias": {"*": _list_of_str}, "version": _list_of_str,
+                       "unqualified": _list_of_str}
+
+BUNDLE_SHAPE: dict = {
+    "schema": int,
+    "principals": {"*": {"name": _nonempty_str, "arn": _nonempty_str,
+                         "kind": _nonempty_str, "grants": _list_of_str}},
+    "resource_policies": {"platform": {"*": _POLICY_SHAPE},
+                          "sites": {"*": _POLICY_SHAPE},
+                          "bootstrap_bucket": _list_of_str,
+                          "bootstrap_bucket_texts": dict},
+    "facts": {"edge_code_targets_carrying_live_key": _plain_int,
+              "edge_assets_carrying_live_key": _plain_int,
+              "principals_with_missing_context": _plain_int},
+    "coverage": {"undecided_items": _list_of_str},
+    "iam_write": {"statements": dict, "boundaries": dict,
+                  "managed_versions": dict, "texts": dict},
+    "required": {"edge": _nonempty_str, "deployer": _nonempty_str},
 }
+
+
+def _spec_label(spec) -> str:
+    return getattr(spec, "__name__", str(spec))
+
+
+def _check_shape(value, spec, *, path: str, where: str) -> None:
+    """按 `spec` 递归校验 `value`。**规格里没写的键一律拒**。"""
+    if isinstance(spec, dict):
+        if not isinstance(value, dict):
+            raise SystemExit(f"{where}：{path} 应该是 dict，实际是 "
+                             f"{type(value).__name__}——空列表冒充空字典这类会让"
+                             f"比较器静默走空路径")
+        if "*" in spec:          # 通配层：键是指纹，逐成员按同一份子规格校验
+            for member, mv in value.items():
+                _check_shape(mv, spec["*"], path=f"{path}.{member}", where=where)
+            return
+        for key, sub in spec.items():
+            if key not in value:
+                raise SystemExit(
+                    f"{where}：观测缺 {path}.{key} —— 缺一层的症状与「那一层没有漂移」"
+                    f"一模一样（比较器拿到 None 就整层跳过，单向比较器还会把它记成"
+                    f"改善）。不许拿它出闸门结论或改写基线；重新跑一次完整的 "
+                    f"--dump-observed。")
+            _check_shape(value[key], sub, path=f"{path}.{key}", where=where)
+        unknown = sorted(set(value) - set(spec))
+        if unknown:
+            raise SystemExit(
+                f"{where}：{path} 出现规格外的键 {unknown}——新分节必须同时进 "
+                f"BUNDLE_SHAPE，否则它就是下一个「截断了也看不出」的层（默认拒绝）")
+        return
+    if isinstance(spec, type):
+        if not isinstance(value, spec):
+            raise SystemExit(f"{where}：{path} 应该是 {spec.__name__}，实际是 "
+                             f"{type(value).__name__}")
+        return
+    if not spec(value):         # 谓词（_nonempty_str / _plain_int / _list_of_str）
+        raise SystemExit(f"{where}：{path} 不满足 {_spec_label(spec)}"
+                         f"（实际 {type(value).__name__}: {str(value)[:40]!r}）")
 
 
 def check_bundle_complete(bundle: dict, *, where: str) -> None:
@@ -1783,22 +1855,28 @@ def check_bundle_complete(bundle: dict, *, where: str) -> None:
 
     这是一条 fail-closed 合同：**不完整的观测不许变成一个权威的绿。**
     """
-    missing = [k for k in BUNDLE_SECTIONS if k not in bundle]
+    # `asset_scan_complete` 先单独判，好让报文说清是"扫描不完整"而不是"少个键"。
+    # **必须按类型判**：`if not bundle.get(...)` 下字符串 `"false"` 是 truthy。
+    if bundle.get("asset_scan_complete") is not True:
+        raise SystemExit(
+            f"{where}：这份观测的 asset_scan_complete 不是 True（实际 "
+            f"{bundle.get('asset_scan_complete')!r}）——它是 --no-asset-scan 产出的"
+            f"（只看了当前 asset）。带活密钥的**历史对象**整个不在目标集合里 ⇒ 只能读到"
+            f"那批对象的 principal 会从结果里消失，而比较器会把它报成「集合缩小（绿）」。"
+            f"不许拿它出结论或写基线。")
+    missing = [k for k in BUNDLE_SHAPE if k not in bundle]
     if missing:
         raise SystemExit(
             f"{where}：观测缺分节 {missing} —— 缺一节的症状与「那一层没有漂移」一模一样"
             f"（比较器拿到 None 就整层跳过），不许拿它出闸门结论或改写基线。"
             f"重新跑一次完整的 --dump-observed。")
-    wrong = [f"{k}: {type(bundle[k]).__name__}≠{t.__name__}"
-             for k, t in BUNDLE_SECTIONS.items() if not isinstance(bundle[k], t)]
-    if wrong:
-        raise SystemExit(f"{where}：观测分节类型不对 {wrong}——空列表冒充空字典这类"
-                         f"会让比较器静默走空路径")
-    if not bundle.get("asset_scan_complete"):
+    for key, spec in BUNDLE_SHAPE.items():
+        _check_shape(bundle[key], spec, path=key, where=where)
+    unknown = sorted(set(bundle) - set(BUNDLE_SHAPE) - {"asset_scan_complete"})
+    if unknown:
         raise SystemExit(
-            f"{where}：这份观测是 --no-asset-scan 产出的（只看了当前 asset）。"
-            f"带活密钥的**历史对象**整个不在目标集合里 ⇒ 只能读到那批对象的 principal 会"
-            f"从结果里消失，而比较器会把它报成「集合缩小（绿）」。不许拿它出结论或写基线。")
+            f"{where}：观测里出现规格外的分节 {unknown}——新分节必须同时进 BUNDLE_SHAPE，"
+            f"否则它就是下一个「截断了也看不出」的层（默认拒绝）")
 
 
 def load_dump(path: Path) -> dict:
