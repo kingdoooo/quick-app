@@ -351,7 +351,8 @@ policy 里的 `role/ExactRole` 不会匹配字面量 `role/*` ⇒ 精确授权�
   它们随账号里任何一条带 Condition 的新策略变动，让它们决定退出码就会频繁红在无关
   变更上，进而训练出"红了就更新基线"。
 
-一次完整运行实测 **9.5–10.5 分钟**（三次实测 9:36 / 9:49 / 10:32）（400 个 principal × 2 次 IAM 模拟 + 一次
+一次完整运行实测 **8.5–10.5 分钟**（四次实测 10:32 / 9:49 / 9:36 / 8:47；
+最后那次是每线程独立 IAM client 之后的——共享 client 的连接池争用同时也拖慢了它）（400 个 principal × 2 次 IAM 模拟 + 一次
 `GetAccountAuthorizationDetails` 静态收语句 + 扫 bootstrap 桶 + 逐版本校验 Edge 代码）。
 去掉 IAM 写的逐个模拟确认之后省下的时间不多——主要成本一直是那 800 次模拟。
 
@@ -393,9 +394,13 @@ python3 site-builder/scripts/verify_account_trust_boundary.py \
 
 - `SimulatePrincipalPolicy` 对带 Condition 的策略需要调用方补 `ContextEntries`，
   本脚本不补 ⇒ 那些判定是**下界**。逐项的不确定面记在 `coverage.undecided_items`
-  里（**成员级**：同一个 principal 多出一项判不出的目标也会红——按 principal 集合比
-  的话，「原本只对站点函数判不出、后来对 jwt-secret 也判不出」前后都是同一个集合）。
-  最近一次实测 **774** 项，覆盖 **162** 个 principal。
+  里，成员 = `(principal, 动作等价类, **判不出的资源类集合**)`。三种写法都试过：
+  按 principal 记（「原本只对站点函数判不出、后来对 jwt-secret 也判不出」前后同一个
+  集合 ⇒ 漏）、逐资源各记一项（实测 **9985** 条，基线涨 10 倍，一个新 principal 一次
+  冒出几十条红 ⇒ 噪音）、按动作类全局折叠成 `unattributed`（`{site-panel}` 与
+  `{site-panel, undeploy}` 同一个成员 ⇒ 又漏）。**资源类集合整体进指纹**同时满足两边：
+  上界 5 条/principal，而集合一变指纹就变。最近一次实测 **774** 项，覆盖 **162** 个
+  principal（与 `principals_with_missing_context` 吻合）。
   笼统计数 `principals_with_missing_context`（同样是 162）只报 delta、不参与红绿：
   它随账号里任何一条带 Condition 的新策略变动。
   **它不是 fail-closed 的**：真要 fail-closed 就得把这些全判成有权限，
@@ -413,6 +418,21 @@ python3 site-builder/scripts/verify_account_trust_boundary.py \
   两次运行之间看不见。
 - 它给出的是**下界**，不是上界。这份文档的数字被推翻过**四次**，每次都是因为
   漏掉了一个等价动作或一类等价资源。
+
+**闸门自己的 fail-closed（这些都不会"打印一条警告然后退出 0"）**
+
+- **未校验服务端证书的请求是致命错误**。实测过一次真实现场：共享一个 IAM client 给 4 个
+  worker 并发用，800 次模拟里有十几次跳过了证书校验（顺序执行 0 次、每线程独立 client
+  0 次）。闸门的答案能被主动 MITM 伪造的话，那次"绿"就不能当安全证据。
+  现在每线程一个独立 client，且 `InsecureRequestWarning` 直接抛。
+- **不完整的观测不会变成一个权威的绿**：`--no-asset-scan` 只能用于纯
+  `--dump-observed`（它不扫历史 asset ⇒ 只能读那批对象的 principal 会消失，而比较器
+  会把它报成「集合缩小（绿）」）；产出的快照带 `asset_scan_complete: false`，
+  `--from-dump` 拒绝它；缺分节的快照同样硬失败（缺一节的症状与「那一层没有漂移」
+  逐字相同）。
+- **解析不出来的东西一律硬失败**，不静默跳过：attached 托管策略的文档与
+  `DefaultVersionId`、permissions boundary 的文档、`GroupList` 里的 group。
+  静默跳过它们的输出与「那里没有相关语句」一模一样。
 
 **B（IAM 写观察）**
 
