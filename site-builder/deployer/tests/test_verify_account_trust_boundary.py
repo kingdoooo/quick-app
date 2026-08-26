@@ -1600,7 +1600,7 @@ def test_undecided_item_fp_carries_no_principal_name():
 # 原先那套「静态发现候选 → 模拟器对具体 ARN 确认 → 三值分类」已删除：它要求闸门回答
 # "谁能提权"，而那等于要造一个 IAM 权限分析器（statement 归因、Condition 语义、
 # NotResource 集合代数、policy variable、SourcePolicyType 碰撞——每修一维下一维才暴露），
-# 这是这道闸门被复审五轮的根因。
+# 这是这道闸门被前五轮复审反复点名的根因。
 # ==========================================================================
 
 def test_no_grant_path_produces_iam_policy_write():

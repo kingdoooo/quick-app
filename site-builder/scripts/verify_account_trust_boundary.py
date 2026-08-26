@@ -68,7 +68,7 @@ cookie 与 `scope=console` 的 `__Host-sb_console`（同一个 `/site-builder/jw
    **原先那套两步（静态发现候选 → 模拟器对具体 ARN 确认 → 三值分类）已删除。**
    它要求闸门回答"谁能提权"，而那等于要造一个 IAM 权限分析器：statement 归因、
    Condition 语义、NotResource 集合代数、policy variable、`SourcePolicyType` 碰撞
-   ——每修一维下一维才暴露，这是这道闸门被复审五轮的根因。所以 B 的承诺刻意收窄成
+   ——每修一维下一维才暴露，这是这道闸门被前五轮复审反复点名的根因。所以 B 的承诺刻意收窄成
    **"可能影响这些动作的语句集合没有变化"**，仅此而已。
 
 ③ **resource policy**（`lambda:GetPolicy`，**含每个 alias 与每个已发布版本**）。
@@ -863,7 +863,7 @@ RED_MESSAGES = {
     "iam": ("闸门红：账号内可能影响 IAM 策略变更的**语句集合**变了（Allow 或 Deny），"
             "或某个 principal 的 permissions boundary 变了。**这一层刻意只报变化、"
             "不判方向**：它不声称语句是否生效、是否构成提权链、变化是收紧还是放宽"
-            "（判这些需要一个 IAM 权限分析器，那正是本闸门被复审五轮的根因）。"
+            "（判这些需要一个 IAM 权限分析器，那正是本闸门被前五轮复审反复点名的根因）。"
             "上面每条都打了归一化后的语句原文——自己 diff 一遍再决定是否更新基线。"
             "若同一份策略的 VersionId 也变了，大概是 AWS 更新了托管策略。"),
 }
@@ -985,7 +985,7 @@ def _compare_iam_write(rep: Report, base: dict, now: dict) -> None:
 
     **不声称**语句是否生效、是否构成提权链、变化方向是收紧还是放宽。判这些需要
     statement 归因 + Condition 语义 + NotResource 集合代数 + policy variable，
-    也就是一个 IAM 权限分析器——那正是这道闸门被复审五轮的根因。
+    也就是一个 IAM 权限分析器——那正是这道闸门被前五轮复审反复点名的根因。
 
     **为什么"消失"也红**：Allow 消失不等于收紧——语句可能被拆成两条更宽的、可能从
     inline 挪到另一份 policy，也可能是**解析器漏收了**。把"旧指纹消失"自动判成改善，
