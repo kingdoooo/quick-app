@@ -507,11 +507,26 @@ exit "$m01_rc"
 关不掉（管理账号 SCP 无效、Lambda 无 Deny API、对称签名的根就是那把可被只读权限
 取得的 HS256 密钥），所以纪律是"别再长"。它的形状是「一种能力 = 一个**动作等价类** × 一个**资源等价类**」——把它压成单个动作或
 单个资源的错误已经犯过三次（漏 alias、漏历史 asset、漏 `ssm:GetParameters`），每次都
-留下一个当时看不出来的 false-green。测四层：identity 授权（逐资源逐限定符，不压成布尔
-标签）、**IAM 策略变更**（静态解析发现候选 + 模拟器对具体 ARN 三值确认——
-拿字面量 `role/*` 去问会让精确授权全部隐形）、Lambda resource policy（**含每个 alias
-与每个已发布版本**，站点 alias 逐颜色比）、以及密钥三处明文副本的事实
-（每次实测比对 SHA-256，根治了闸门自己会知道）。
+留下一个当时看不出来的 false-green。
+
+它分**两层**，承诺宽度不同：
+
+- **A（直接失守，headline）**：identity 授权（逐资源逐限定符，不压成布尔标签）、
+  Lambda resource policy（**含每个 alias 与每个已发布版本**，平台与站点都按限定符
+  分桶、alias 逐成员比）、**bootstrap 桶的 bucket policy**（模拟器不纳入
+  resource-based policy，对 role 更是不支持模拟它）、以及密钥三处明文副本的事实
+  （每次实测比对 SHA-256，根治了闸门自己会知道）。
+- **B（IAM 写观察）**：**纯静态文本快照**——收 role/user/group 的 inline + attached
+  托管 + permissions boundary，Allow 与 Deny 都收，逐条归一化后只存指纹，
+  任何 added/removed/changed 都红。**它不声称语句是否生效、是否构成提权链、
+  变化方向是收紧还是放宽**；那需要一个 IAM 权限分析器，而那正是这道闸门被复审
+  五轮的根因。**不要**把「静态发现候选 + 模拟器对具体 ARN 确认」那套重新引进来。
+
+**C（站点 route/alias 可达性）不由它保证**，归部署验收（见 merged review §9 的 3e）。
+
+**不完整的观测不会变成绿**：`--no-asset-scan` 只能用于纯 `--dump-observed`
+（它不扫历史 asset，拿来出结论会把漏测报成"集合缩小"）；缺分节的快照、以及
+未校验 TLS 的请求都是硬失败。
 **触发条件是账号变化而不是本平台变化**：账号里新增任何工作负载（EC2 实例角色、
 SageMaker、EKS、另一套 CDK 栈…）之后跑一次。**改 Edge 之后也要跑**：每次 Edge 部署
 会在 bootstrap 桶里多留一个带活密钥的 asset。背景、实测证据与基线更新办法见

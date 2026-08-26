@@ -846,8 +846,11 @@ Codex 复核 v2 后认可它可作为 fix plan 的事实基线，并提了 3 处
   **闸门本身不降低任何风险**——它只保证暴露面别再静默变大。所以这一轮之后立刻转
   真修复，顺序见 §9：收窄 CodeBuild 对 bootstrap 桶的读权限 → 非对称签名 → 独立账号。
 
-  验证：115 条守卫；双跑 `--dump-observed` 逐分节一致（确定性）；schema 2→3 一次性
-  迁移后生产实跑退出码 0、实测 10.5 分钟；文档 14 个带标记数字全部由基线断言。
+  验证：双跑 `--dump-observed` 逐分节一致（确定性）；schema 2→3 一次性迁移后生产实跑
+  退出码 0、实测 9.5–10.5 分钟；文档 14 个带标记数字全部由基线断言。
+  **守卫条数与变形结果不写在这里**（会过时）：跑
+  `site-builder/deployer/.venv/bin/pytest tests/test_verify_account_trust_boundary.py -q`
+  与 `site-builder/scripts/metamorphic_trust_boundary.py` 即是最新结果。
 
 ### M10 · [P2] `--mcp-callback` 文档零出现，且裸重跑会吊销它
 

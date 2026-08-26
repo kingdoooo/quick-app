@@ -109,6 +109,10 @@ _NON_FP_KEY_PATHS = (
     "principals.*",                         # 每个 principal 条目内的 category/grants
     "resource_policies",                    # 结构键（platform/site_*/bootstrap_bucket）
     "resource_policies.platform",           # 键是平台函数名（app.py 里就有，不是账号值）
+    # 平台函数按 qualifier 分桶存（扁平集合会让"语句从 alias 挪到 version"与
+    # "两个 alias 有相同语句、删掉一个"都不可见）⇒ 多两层结构键。
+    "resource_policies.platform.*",         # 结构键（unqualified/alias/version）
+    "resource_policies.platform.*.alias",   # 键是 alias 名（blue/green，不是账号值）
     "coverage",                             # 结构键（undecided_items）
     "permissions_boundaries.*",             # 结构键（policy_fp/stmt_fps）
 )
@@ -574,26 +578,24 @@ def test_required_principal_present_but_without_invoke_is_a_failure():
 # --------------------------------------------------------------------------
 
 def test_baseline_carries_no_account_values():
-    """仓库红线：真实账号 ID / 角色名不进被跟踪文件。
+    """仓库红线**第一层**：整文件 raw 禁用模式扫描——真实账号 ID / 角色名 / ARN
+    不进被跟踪文件。
 
-    基线里 CDK bootstrap 那几个角色的名字**内嵌账号 ID**，所以这条不是形式主义:
+    基线里 CDK bootstrap 那几个角色的名字**内嵌账号 ID**，所以这条不是形式主义：
     照抄角色名就会把账号值提交进仓库。resource policy 的 Principal 同理
     （它是带账号 ID 的角色 ARN），所以那边也只存指纹。
+
+    **只管"值本身不泄密"**。"值出现在正确的结构位置、且是正确的类型"由第二层
+    （`_non_fingerprint_leaves`，见 `test_baseline_redline_scan_walks_unknown_keys`）
+    负责——原先那半在这里硬编码了 `resource_policies` 的四个列表键，于是新加任何
+    子键都自动绕过形态检查，而收缩轮加了四个新分节、平台还改成了按 qualifier 分桶。
+    **两层缺一不可**：`note` / `category` 是自由文本，第二层刻意放行，只有这一层能抓
+    住写进 `note` 的账号值。
     """
     raw = _BASELINE.read_text(encoding="utf-8")
     assert not re.search(r"\b\d{12}\b", raw), "基线里出现了 12 位账号 ID"
     for forbidden in ("arn:aws:", "role/", "cdk-hnb659fds", "Isengard"):
         assert forbidden not in raw, f"基线里出现了 {forbidden!r}——那是账号内的真实标识"
-    data = json.loads(raw)
-    for fp in data["principals"]:
-        assert re.fullmatch(_FP_RE, fp), f"{fp!r} 不是指纹形态"
-    rp = data["resource_policies"]
-    fp_lists = (list(rp["platform"].values())
-                + [rp["site_alias_canonical"], rp["site_version_canonical"],
-                   rp["site_legacy_canonical"], rp["site_legacy_exempt"]])
-    for fps in fp_lists:
-        for fp in fps:
-            assert re.fullmatch(_FP_RE, fp), f"{fp!r} 不是指纹形态"
 
 
 def test_fingerprint_is_one_way_and_stable():
@@ -831,13 +833,18 @@ def test_platform_resource_policy_loss_is_a_failure():
     首版把它写成"改善"（Codex 复审 P1-4）。必须红。"""
     g = _gate()
     observed = _with_required(g, {})
+    # 平台形状按 qualifier 分桶（unqualified / alias 逐成员 / version）——
+    # 扁平集合下"语句从 alias 挪到 version"与"两个 alias 有相同语句、删掉一个"都不变。
     baseline = {**_baseline_of(observed),
                 "resource_policies": {
-                    "platform": {"site-panel": ["aaaa-bbbb-cccc-dddd",
-                                                "eeee-ffff-0000-1111"]},
+                    "platform": {"site-panel": {
+                        "unqualified": ["aaaa-bbbb-cccc-dddd", "eeee-ffff-0000-1111"],
+                        "alias": {}, "version": []}},
                     "site_alias_canonical": [], "site_legacy_exempt": [],
                     "site_legacy_canonical": []}}
-    now_rp = {"platform": {"site-panel": ["aaaa-bbbb-cccc-dddd"]}, "sites": {}}
+    now_rp = {"platform": {"site-panel": {"unqualified": ["aaaa-bbbb-cccc-dddd"],
+                                          "alias": {}, "version": []}},
+              "sites": {}}
     rep = g.compare_to_baseline(observed, baseline, required=REQUIRED,
                                 resource_policies=now_rp)
     assert not rep.ok, rep.render()
@@ -1421,29 +1428,6 @@ def test_all_allowed_resources_are_not_undecided_even_with_top_level_missing_con
     assert g.missing_context_in(shape), "反例的前提是旧 bool 为真"
     assert g.undecided_pairs(shape) == set(), \
         "已经 allowed 的资源被算进了「判不出」⇒ coverage 变成噪音"
-
-
-def test_uniform_missing_keys_collapse_the_resource_dimension():
-    """所有非 allowed 资源缺的是**同一组**键时，资源那一维零信息量 ⇒ 折叠成 unattributed。
-
-    **实测依据**（40 个 principal / 78 条 EvaluationResults）：AWS 把顶层缺的键机械地
-    复制进每一个逐资源条目，键集完全相同，而缺的是 `aws:ResourceAccount` /
-    `aws:CalledViaLast` / `iam:PassedToService` 这类**请求上下文**键——与具体资源无关。
-    照"每个非 allowed 资源各记一项"扇开，实测产生 **9985** 条成员（基线涨 10 倍），
-    而新增一个带 Condition 的 principal 会一次冒出几十条 ⇒ 红被噪音淹没。
-    """
-    g = _gate()
-    pairs = g.undecided_pairs([{
-        "EvalActionName": "iam:PutRolePolicy", "EvalDecision": "implicitDeny",
-        "MissingContextValues": ["aws:ResourceAccount"],
-        "ResourceSpecificResults": [
-            {"EvalResourceName": "target-a", "EvalResourceDecision": "implicitDeny",
-             "MissingContextValues": ["aws:ResourceAccount"]},
-            {"EvalResourceName": "target-b", "EvalResourceDecision": "allowed"},
-            {"EvalResourceName": "target-c", "EvalResourceDecision": "explicitDeny",
-             "MissingContextValues": ["aws:ResourceAccount"]},
-        ]}])
-    assert pairs == {("iam:PutRolePolicy", "")}, pairs
 
 
 def test_differing_missing_keys_keep_the_resource_dimension():
@@ -2157,3 +2141,293 @@ def test_authorization_details_filter_includes_group():
         f"Filter 里没有 Group ⇒ 经 group 的 IAM 写语句整个不可见：{seen.get('Filter')}"
     for required in ("User", "Role", "LocalManagedPolicy", "AWSManagedPolicy"):
         assert required in seen["Filter"], f"Filter 里少了 {required}"
+
+
+# ==========================================================================
+# Codex 第五轮复审（2026-08-26，闸门收缩轮的 No-Go）：六条 finding 各自的会红用例
+#
+# 六条**全部实测复现过**，所以这一节的每条用例都对应一个已发生的 false-green，
+# 不是理论风险。共同教训：**"不完整的观测"必须硬失败，不能变成一个权威的绿。**
+# ==========================================================================
+
+def test_insecure_tls_warning_is_fatal():
+    """"这次请求没校验服务端证书"必须是**致命错误**，不许只打印后继续退出 0。
+
+    实测现场：`measure()` 把**同一个** IAM client 交给 4 个 worker 并发用，于是 400 个
+    principal 的模拟里有十几次是在未校验证书的连接上完成的（同一批请求顺序执行 0 次、
+    每线程独立 client 0 次——是共享 client 的并发形态触发的）。
+    闸门的答案要是能被 MITM 伪造，那次"绿"就不能当安全证据。
+    """
+    import warnings as _w
+    from urllib3.exceptions import InsecureRequestWarning
+    g = _gate()
+    with _w.catch_warnings():
+        g.harden_tls_warnings()
+        with pytest.raises(InsecureRequestWarning):
+            _w.warn("unverified", InsecureRequestWarning)
+
+
+def test_each_worker_gets_its_own_iam_client():
+    """每个 worker 一个独立 IAM client：共享 client + 并发会让一部分请求跳过证书校验。"""
+    import threading
+    g = _gate()
+    got = {}
+
+    def grab(tag):
+        got[tag] = id(g.thread_iam_client("us-east-1"))
+
+    t1, t2 = threading.Thread(target=grab, args=("a",)), threading.Thread(target=grab, args=("b",))
+    t1.start(); t1.join(); t2.start(); t2.join()
+    assert got["a"] != got["b"], "两个线程拿到了同一个 client —— 那正是触发未校验 TLS 的形态"
+    # 同一线程内要复用，否则 400 个 principal 会建 400 个 client
+    assert id(g.thread_iam_client("us-east-1")) == id(g.thread_iam_client("us-east-1"))
+
+
+def test_no_asset_scan_may_not_produce_a_verdict_or_rewrite_the_baseline():
+    """`--no-asset-scan` 只看当前 asset，带活密钥的**历史对象**整个不进目标集合
+    ⇒ 只能读到那批对象的 principal 会从 observed 消失，而比较器把它报成
+    「集合缩小（绿）」，asset 数 9→1 只是一条不影响退出码的 note。实测 rep.ok = True。
+
+    所以它最多只能用于**纯观测**，不得出闸门结论、更不得改写基线。
+    """
+    import argparse
+    g = _gate()
+    ok = argparse.Namespace(no_asset_scan=True, dump_observed="/tmp/x.json",
+                            update_baseline=False)
+    g.check_flag_combination(ok)          # 纯观测：允许
+    for bad in (
+        argparse.Namespace(no_asset_scan=True, dump_observed=None, update_baseline=False),
+        argparse.Namespace(no_asset_scan=True, dump_observed="/tmp/x.json",
+                           update_baseline=True),
+    ):
+        with pytest.raises(SystemExit) as exc:
+            g.check_flag_combination(bad)
+        assert "no-asset-scan" in str(exc.value)
+
+
+def test_incomplete_asset_scan_cannot_be_replayed_as_a_verdict(tmp_path):
+    """`--no-asset-scan` 产出的快照要带标记，`--from-dump` 必须拒绝它。
+
+    否则绕一步就回到权威绿：先用 --no-asset-scan 产出快照（允许），再 --from-dump 它。
+    """
+    g = _gate()
+    p = tmp_path / "partial.json"
+    p.write_text(json.dumps({"schema": g.BASELINE_SCHEMA, "principals": {},
+                             "resource_policies": {}, "facts": {}, "coverage": {},
+                             "iam_write": {}, "required": {},
+                             "asset_scan_complete": False}), encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        g.load_dump(p)
+    assert "asset" in str(exc.value)
+
+
+def test_bundle_missing_a_section_hard_fails(tmp_path):
+    """同 schema 但**缺分节**的快照必须硬失败。
+
+    实测：一个只缺 `coverage` 与 `iam_write` 的 schema-3 dump 被 load_dump 接受，
+    而 `main()` 用 `.get()` 传给比较器 ⇒ 那两层整个跳过。基线里明明有 B 语句与
+    undecided items，闸门仍输出「与基线一致」、退出码 0。
+    缺一节的症状与「那一层没有漂移」**一模一样**，这是最坏的一种 false-green。
+    """
+    g = _gate()
+    full = {"schema": g.BASELINE_SCHEMA, "principals": {}, "resource_policies": {},
+            "facts": {}, "coverage": {}, "iam_write": {}, "required": {},
+            "asset_scan_complete": True}
+    g.check_bundle_complete(full, where="test")          # 完整：放行
+    for drop in ("coverage", "iam_write", "resource_policies", "principals", "facts"):
+        partial = {k: v for k, v in full.items() if k != drop}
+        with pytest.raises(SystemExit) as exc:
+            g.check_bundle_complete(partial, where="test")
+        assert drop in str(exc.value), f"报文里没点出缺的是 {drop}"
+    # 类型不对也要拒（空列表冒充空字典这类）
+    with pytest.raises(SystemExit):
+        g.check_bundle_complete({**full, "iam_write": []}, where="test")
+
+
+def test_from_dump_rejects_a_bundle_missing_sections(tmp_path):
+    g = _gate()
+    p = tmp_path / "d.json"
+    p.write_text(json.dumps({"schema": g.BASELINE_SCHEMA, "principals": {},
+                             "resource_policies": {}, "facts": {}, "required": {},
+                             "asset_scan_complete": True}), encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        g.load_dump(p)
+    assert "coverage" in str(exc.value) or "iam_write" in str(exc.value)
+
+
+def test_gaining_a_second_undecided_platform_function_is_a_failure():
+    """**Codex 第五轮的核心反例**：某 principal 原本只对 site-panel 判不出，
+    后来对 site-deployer-undeploy 也判不出——两者缺的是同一个键。
+
+    上一版按 action 全局折叠成 `(action, unattributed)` ⇒ 前后同一个成员、闸门全绿。
+    缺失键相同只说明**不确定的成因**与资源无关，**不说明后果与资源无关**——
+    后果就是"还有哪些资源没被排除"，那正是安全边界。
+    """
+    g = _gate()
+    t = _targets(g, platform=("site-panel", "site-deployer-undeploy"))
+    fn = "arn:aws:lambda:us-east-1:1:function:{}".format
+    arn = "arn:aws:iam::1:role/WorkloadA"
+
+    def members(names):
+        pairs = {("lambda:InvokeFunction", fn(n)) for n in names}
+        return g.undecided_members(arn, pairs, t)
+
+    one, two = members(["site-panel"]), members(["site-panel", "site-deployer-undeploy"])
+    assert one and two
+    assert one != two, "多出一个精确平台函数却是同一批成员 —— 扩大不可见"
+
+
+def test_undecided_members_are_bounded_by_action_class():
+    """成员数按「principal × 动作等价类」封顶，不随资源数膨胀。
+
+    逐资源各记一项实测是 **9985** 条（基线涨 10 倍），而"新增一个带 Condition 的
+    principal 一次冒出几十条红"会训练出无脑更新基线。摘要把上界压回 5 条/principal，
+    同时集合一变摘要就变 ⇒ 扩大照样红（见上一条）。
+    """
+    g = _gate()
+    t = _targets(g, platform=tuple(f"p{i}" for i in range(19)))
+    fn = "arn:aws:lambda:us-east-1:1:function:{}".format
+    pairs = {(a, fn(f"p{i}")) for i in range(19)
+             for a in ("lambda:InvokeFunction", "lambda:UpdateFunctionCode",
+                       "lambda:GetFunction")}
+    members = g.undecided_members("arn:aws:iam::1:role/W", pairs, t)
+    assert len(members) == 3, f"19 个资源 × 3 个动作类应折成 3 条成员，实际 {len(members)}"
+
+
+def test_platform_statement_fingerprint_separates_alias_from_version():
+    """平台函数的 resource policy 也要保留 **qualifier 类**。
+
+    实测：挂在 `site-panel:blue` 与挂在 `site-panel:9` 的同一条语句指纹**完全相同**
+    （都被归一化成 `<self>:<alias>`）⇒ 语句从 alias 挪到 version、或反过来，
+    比较结果是"与基线一致"。站点那边已经按颜色逐成员比修过，平台这条路还留着。
+    """
+    g = _gate()
+    A = "0" * 12
+    base = f"arn:aws:lambda:us-east-1:{A}:function:site-panel"
+    st = lambda res: {"Sid": "x", "Effect": "Allow",
+                      "Principal": {"AWS": f"arn:aws:iam::{A}:role/Edge"},
+                      "Action": "lambda:InvokeFunctionUrl", "Resource": res}
+    u = g.statement_fingerprint(st(base), account=A, function="site-panel", qualifier=None)
+    b = g.statement_fingerprint(st(base + ":blue"), account=A, function="site-panel",
+                                qualifier="blue", qualifier_class="alias")
+    gr = g.statement_fingerprint(st(base + ":green"), account=A, function="site-panel",
+                                 qualifier="green", qualifier_class="alias")
+    v = g.statement_fingerprint(st(base + ":9"), account=A, function="site-panel",
+                                qualifier="9", qualifier_class="version")
+    assert b != v, "alias 与 version 同指纹 —— 语句在两者之间搬家不可见"
+    assert u != v and u != b
+    assert b == gr, "blue 与 green 必须同指纹：颜色不该产生漂移（站点那边的既定选择）"
+
+
+def test_platform_policy_keeps_qualifier_buckets():
+    """平台快照按 qualifier 分桶存，不再压成一个扁平集合。
+
+    扁平集合的第二个 false-green：两个 alias 有相同语句时，删掉其中一个而另一个还在，
+    集合不变 ⇒ 绿。这正是站点 alias 已经修过的"成员并集"问题。
+    """
+    g = _gate()
+    A = "0" * 12
+    st = lambda res: {"Sid": "x", "Effect": "Allow",
+                      "Principal": {"AWS": f"arn:aws:iam::{A}:role/Edge"},
+                      "Action": "lambda:InvokeFunctionUrl", "Resource": res}
+    base = f"arn:aws:lambda:us-east-1:{A}:function:site-panel"
+    policies = {"site-panel": [(None, st(base)), ("blue", st(base + ":blue")),
+                               ("green", st(base + ":green")), ("9", st(base + ":9"))]}
+    snap = g.resource_policy_snapshot(policies, account=A, platform=("site-panel",),
+                                      sites=(), aliases={"site-panel": ("blue", "green")})
+    shape = snap["platform"]["site-panel"]
+    assert set(shape) == {"unqualified", "alias", "version"}, shape
+    assert set(shape["alias"]) == {"blue", "green"}, "alias 没有逐成员存"
+    assert shape["unqualified"] and shape["version"]
+
+
+def test_platform_alias_losing_a_statement_is_a_failure():
+    """某个 alias 上的语句消失、相同语句仍存在于另一个 alias ⇒ 必须红。"""
+    g = _gate()
+    observed = _with_required(g, {})
+    canon = ["aaaa-bbbb-cccc-dddd"]
+    baseline = {**_baseline_of(observed),
+                "resource_policies": {
+                    "platform": {"site-panel": {"unqualified": [], "version": [],
+                                                "alias": {"blue": canon, "green": canon}}},
+                    "site_alias_canonical": [], "site_version_canonical": [],
+                    "site_legacy_canonical": [], "site_legacy_exempt": [],
+                    "bootstrap_bucket": []}}
+    now = {"platform": {"site-panel": {"unqualified": [], "version": [],
+                                       "alias": {"blue": [], "green": canon}}},
+           "sites": {}, "bootstrap_bucket": [], "bootstrap_bucket_texts": {}}
+    rep = g.compare_to_baseline(observed, baseline, required=REQUIRED, resource_policies=now)
+    assert not rep.ok, rep.render()
+    assert "blue" in rep.render()
+
+
+def test_unresolvable_group_hard_fails():
+    """`GroupList` 引用了一个不在 `GroupDetailList` 里的 group ⇒ **硬失败**。
+
+    实测静默返回 `[]`：那个 group 里的 IAM 写语句从 B 快照消失，而输出与
+    "该 group 没有相关语句"一模一样。这与 attached 托管策略"文档缺失必须硬失败"
+    是同一条原则；IAM 的最终一致性窗口或并发变更都可能撞上。
+    """
+    g = _gate()
+    A = "0" * 12
+    detail = {"UserName": "U", "Arn": f"arn:aws:iam::{A}:user/U", "GroupList": ["Ghost"],
+              "UserPolicyList": [], "AttachedManagedPolicies": []}
+    with pytest.raises(SystemExit) as exc:
+        g.statements_for_user(detail, groups={}, managed={}, versions={})
+    assert "Ghost" in str(exc.value)
+
+
+def test_deploy_doc_does_not_describe_the_deleted_two_step_model():
+    """部署手册是运维真源，不能还把已删除的「模拟器三值确认」当成现状描述——
+    否则后续维护者会照它把被否掉的模型重新引进来。
+
+    判据分两半：① 旧模型**专有**的词不许出现；② 必须写着现在的口径。
+    `发现候选 + 模拟器` 这类词组**允许**出现在明确的禁止句里（"不要重新引进来"），
+    所以不能只做黑名单 grep —— 那会把警告本身也判成违规。
+    """
+    doc = (_ROOT / "site-builder" / "DEPLOY.md").read_text(encoding="utf-8")
+    for gone in ("三值", "测四层"):
+        assert gone not in doc, f"DEPLOY.md 里还留着已删除模型的专有说法：{gone!r}"
+    for required in ("纯静态文本快照", "两层"):
+        assert required in doc, f"DEPLOY.md 没写现在的口径：{required!r}"
+    # 旧模型只许以"别再引进来"的形式出现
+    idx = doc.find("发现候选")
+    if idx != -1:
+        window = doc[max(0, idx - 200):idx + 200]
+        assert "不要" in window or "已删除" in window, \
+            "DEPLOY.md 提到了旧模型，但没写明它是被删掉的/不要重新引入"
+
+
+def test_baseline_platform_shape_matches_what_the_snapshot_produces():
+    """基线里 `resource_policies.platform` 的**形状**必须与 `resource_policy_snapshot()`
+    现在产出的形状一致。
+
+    这条补的是一个实测出来的盲区：改了平台快照的形状（扁平集合 → 按 qualifier 分桶）
+    而**忘记重写基线**时，全部单测仍然绿——形状不匹配只在真机跑那一次才暴露（表现为
+    一屏红）。逐提交回归验证时就撞到过这个：那个提交代码已是新形状、基线还是旧形状，
+    992 条全绿。
+
+    只比形状不比内容：内容变化本来就该由闸门自己报红。
+    """
+    g = _gate()
+    A = "0" * 12
+    fn = "probe-fn"
+    st = {"Sid": "x", "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{A}:role/E"},
+          "Action": "lambda:InvokeFunctionUrl",
+          "Resource": f"arn:aws:lambda:us-east-1:{A}:function:{fn}"}
+    produced = g.resource_policy_snapshot({fn: [(None, st)]}, account=A,
+                                          platform=(fn,), sites=(), aliases={})
+    want_keys = set(produced["platform"][fn])
+
+    platform = json.loads(_BASELINE.read_text(encoding="utf-8"))["resource_policies"]["platform"]
+    assert platform, "基线里 platform 是空的"
+    for name, shape in platform.items():
+        assert isinstance(shape, dict), (
+            f"{name} 的形状是 {type(shape).__name__}，而快照现在产出 dict"
+            f"——改了快照形状但没重写基线？")
+        assert set(shape) == want_keys, (
+            f"{name} 的桶是 {sorted(shape)}，快照产出的是 {sorted(want_keys)}"
+            f"——两者必须一致，否则形状不匹配只在真机那一次才暴露")
+        assert isinstance(shape["alias"], dict)
+        for bucket in ("unqualified", "version"):
+            assert isinstance(shape[bucket], list)

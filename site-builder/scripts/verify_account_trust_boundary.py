@@ -33,7 +33,7 @@ cookie 与 `scope=console` 的 `__Host-sb_console`（同一个 `/site-builder/jw
 所以动作与资源都以**类**为单位（见 `A_*` 常量与 `Targets`）。往任一类里加成员时，
 同时加一条**只命中该新成员**的用例。
 
-## 它测三层
+## 它测什么（A 两组观测 + B 一层快照；C 不在本闸门）
 
 ① **identity 授权**（`iam:SimulatePrincipalPolicy`，枚举全部非 service-linked 角色
    与 IAM 用户）。授权记成 `grant` 串而**不是布尔标签**：
@@ -144,7 +144,9 @@ import io
 import json
 import re
 import sys
+import threading
 import urllib.parse
+import warnings
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -394,12 +396,12 @@ def undecided_pairs(evaluation_results) -> set[tuple[str, str]]:
     成员（基线涨 10 倍），而那一维**零信息量**：新增一个带 Condition 的 principal 会
     一次冒出几十条，红被噪音淹没，正是"红了就更新基线"的训练场。
 
-    折叠的判据是**"不确定是均匀的"**，两个条件都要满足：
-    ① 该 action 下**每一个**非 allowed 资源都判不出（不是只有一部分）；
-    ② 它们缺的是**同一组**键。
-    只要有一个非 allowed 资源是"确认没有"（键集为空），或键集在资源之间不同，
-    就**逐资源记**——那时资源维度确实带信息（"只对 p1 判不出"与"对全部判不出"
-    不是一回事；`aws:ResourceTag/x` 这种按资源取值的条件键就属于后者）。
+    **本函数逐资源产出，不做任何折叠。** 上一版按 action 全局折叠成 `(action, "")`，
+    于是 `{site-panel}` 与 `{site-panel, site-deployer-undeploy}` 变成同一个成员
+    ——一个 principal 对第二个精确平台函数变成"判不出"时闸门仍绿（Codex 第五轮 P2）。
+    缺失键相同只说明**不确定的成因**与资源无关，**不说明后果与资源无关**：
+    后果就是"还有哪些资源没被排除"，那正是安全边界。
+    数量的封顶交给 `undecided_members()`——它按「动作类 × 资源类集合」折，不丢资源维度。
     """
     out: set[tuple[str, str]] = set()
     for res in evaluation_results:
@@ -407,29 +409,40 @@ def undecided_pairs(evaluation_results) -> set[tuple[str, str]]:
         top = frozenset(res.get("MissingContextValues") or ())
         specific = res.get("ResourceSpecificResults") or []
         if specific:
-            non_allowed, undecided_keys = 0, {}
             for rr in specific:
                 if rr.get("EvalResourceDecision") == "allowed":
                     continue        # 已经有答案了，不是"判不出"
-                non_allowed += 1
-                keys = frozenset(rr.get("MissingContextValues") or ()) | top
-                if keys:
+                if frozenset(rr.get("MissingContextValues") or ()) | top:
                     name = rr.get("EvalResourceName", "")
-                    undecided_keys["" if "${" in name else name] = keys
-            if not undecided_keys:
-                continue
-            uniform = (len(undecided_keys) == non_allowed
-                       and len(set(undecided_keys.values())) == 1)
-            if uniform:
-                out.add((action, ""))           # 资源维度不带信息 ⇒ 折叠
-            else:
-                out.update((action, r) for r in undecided_keys)
+                    out.add((action, "" if "${" in name else name))
         elif top and res.get("EvalDecision") != "allowed":
             # 顶层资源名可能是 `${Region}` 这样的模板 ⇒ 归不到具体资源。
             # 老实记 unattributed，别硬塞一个不存在的 ARN（那会造出一个永远存在的假成员）。
             name = res.get("EvalResourceName", "")
             out.add((action, "" if "${" in name else name))
     return out
+
+
+def undecided_members(principal_arn: str, pairs, t: "Targets") -> set[str]:
+    """(动作, 资源) 集合 → 该 principal 的 coverage **成员指纹**集合。
+
+    成员 = `(principal, 动作等价类, 该动作下判不出的**资源类集合**)`。
+
+    两头都踩过坑，所以形状是这样：
+    - **逐资源各记一项**：实测 **9985** 条（基线涨 10 倍），而"新增一个带 Condition 的
+      principal 一次冒出几十条红"会训练出无脑更新基线。
+    - **按 action 全局折叠成 unattributed**：`{site-panel}` 与
+      `{site-panel, undeploy}` 成为同一个成员 ⇒ 扩大不可见（Codex 第五轮 P2）。
+
+    取中间：**资源类集合整体进指纹**。上界回到「principal × 动作类」= 5 条/principal，
+    而集合一变指纹就变 ⇒ 多出一个精确平台函数照样红。
+    """
+    by_action: dict[str, set[str]] = {}
+    for action, resource in pairs:
+        cls = ACTION_CLASS_NAMES.get(action, action)
+        by_action.setdefault(cls, set()).add(undecided_resource_class(resource, t))
+    return {undecided_item_fp(principal_arn, cls, "|".join(sorted(classes)))
+            for cls, classes in by_action.items()}
 
 
 def undecided_resource_class(resource: str, t: "Targets") -> str:
@@ -614,29 +627,42 @@ def statements_for_user(detail: dict, *, groups: dict, managed: dict,
                                versions=versions)
     for name in detail.get("GroupList", []):
         gr = groups.get(name)
-        if gr is not None:
-            out.extend(statements_for_entity(gr, "GroupPolicyList",
-                                             managed=managed, versions=versions))
+        if gr is None:
+            # **硬失败，不静默跳过**：那个 group 里的 IAM 写语句会从 B 快照消失，
+            # 而输出与"该 group 没有相关语句"一模一样。IAM 的最终一致性窗口或并发
+            # 变更都可能撞上。这与 attached 托管策略"文档缺失必须硬失败"同一条原则。
+            raise SystemExit(
+                f"用户 {detail.get('UserName')} 属于 group {name!r}，但它不在 "
+                f"GetAccountAuthorizationDetails 返回的 GroupDetailList 里——"
+                f"静默跳过它与「该 group 没有相关语句」在输出上一模一样，那是 false-green")
+        out.extend(statements_for_entity(gr, "GroupPolicyList",
+                                         managed=managed, versions=versions))
     return out
 
 
 def statement_fingerprint(statement: dict, *, account: str, function: str,
-                          qualifier: str | None = None) -> str:
+                          qualifier: str | None = None,
+                          qualifier_class: str = "alias") -> str:
     """Lambda resource policy 的单条语句 → 指纹。
 
     归一化掉账号 ID、**函数自身**的名字、以及 alias 名，这样不同站点函数的
     `edge-invoke` 语句会得到同一个指纹 ⇒ 可以用少数几份"形态"覆盖全部站点函数，
     新建站点不产生漂移，而多出一条语句的站点会被咬住。
 
-    **alias 名归一化成 `<alias>` 而不是抹掉**：挂在 `blue` 上与挂在未限定函数上
-    是两种不同宽度的授权（后者更宽），抹掉会让两者变成同一个指纹。
+    **限定符归一化成它的「类」而不是抹掉，且 alias 与 version 必须是两个类**：
+    - 挂在 `blue` 上与挂在未限定函数上是两种不同宽度的授权（后者更宽）；
+    - 挂在 `blue`（alias）上与挂在 `9`（version）上也是两回事。原先一律替换成
+      `<alias>`，于是同一条语句从 alias 挪到 version（或反过来）指纹不变、比较结果
+      是"与基线一致"（Codex 第五轮 P2；实测 `blue` 与 `9` 指纹逐字相同）。
+    - **同类内部的成员仍然合并**：`blue` 与 `green` 同指纹是刻意的——颜色不该产生
+      漂移，颜色级完整性由逐成员比对负责，不由指纹负责。
 
     只存指纹：语句里的 Principal 是带账号 ID 的角色 ARN（仓库红线）。
     """
     raw = json.dumps(statement, sort_keys=True, ensure_ascii=False)
     raw = raw.replace(account, "<acct>")
     if qualifier:
-        raw = raw.replace(f"{function}:{qualifier}", "<self>:<alias>")
+        raw = raw.replace(f"{function}:{qualifier}", f"<self>:<{qualifier_class}>")
     raw = raw.replace(function, "<self>")
     return _group(hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16])
 
@@ -707,16 +733,39 @@ def resource_policy_snapshot(policies: dict[str, list[tuple[str | None, dict]]],
     算规范形态，结果最宽松的那个站点函数反而成了规范、规矩的那个被报成偏离
     ——判断和观测混在一处就会这样。
     """
-    def fp(fn: str, q: str | None, st: dict) -> str:
-        return statement_fingerprint(st, account=account, function=fn, qualifier=q)
-
     def qual_class(fn: str, q: str | None) -> str:
         if q is None:
             return "unqualified"
         return "alias" if q in aliases.get(fn, ()) else "version"
 
-    flat = {fn: sorted({fp(fn, q, st) for q, st in policies.get(fn, [])})
-            for fn in platform}
+    def fp(fn: str, q: str | None, st: dict) -> str:
+        return statement_fingerprint(st, account=account, function=fn, qualifier=q,
+                                     qualifier_class=qual_class(fn, q))
+
+    def bucketed(fn: str) -> dict:
+        """按限定符类分桶，alias **逐成员**。
+
+        平台函数原先压成一个扁平集合，于是两种 false-green：① 语句从 alias 挪到
+        version 指纹不变（见 `statement_fingerprint`）；② 两个 alias 有相同语句时，
+        删掉其中一个而另一个还在，集合不变 ⇒ 绿。后者正是站点 alias 已经修过的
+        「成员并集」问题，平台这条路当时留着没改。
+        """
+        alias_members: dict[str, set[str]] = {a: set() for a in aliases.get(fn, ())}
+        version_fps: set[str] = set()
+        unqualified: set[str] = set()
+        for q, st in policies.get(fn, []):
+            kind = qual_class(fn, q)
+            if kind == "alias":
+                alias_members.setdefault(q, set()).add(fp(fn, q, st))
+            elif kind == "version":
+                version_fps.add(fp(fn, q, st))
+            else:
+                unqualified.add(fp(fn, q, st))
+        return {"alias": {a: sorted(v) for a, v in alias_members.items()},
+                "version": sorted(version_fps),
+                "unqualified": sorted(unqualified)}
+
+    flat = {fn: bucketed(fn) for fn in platform}
     grouped: dict[str, dict] = {}
     for fn in sites:
         # **alias 逐成员记**（`{颜色: [指纹…]}`）：并起来记的话，
@@ -1013,20 +1062,41 @@ def _compare_coverage(rep: Report, base_items, now_items) -> None:
     rep.notes.append(f"undecided_items: {len(was)} → {len(now)}（{len(now) - len(was):+d}）")
 
 
+def _platform_buckets(was_shape, now_shape):
+    """产出 `(桶名, 基线集合, 本次集合)`，覆盖两边出现过的每个桶与每个 alias 成员。
+
+    `None` 当空处理（函数新增或消失时另一边没有形状）。
+    """
+    was_shape = was_shape or {}
+    now_shape = now_shape or {}
+    for bucket in ("unqualified", "version"):
+        yield bucket, set(was_shape.get(bucket) or []), set(now_shape.get(bucket) or [])
+    was_alias = was_shape.get("alias") or {}
+    now_alias = now_shape.get("alias") or {}
+    for name in sorted(set(was_alias) | set(now_alias)):
+        yield (f"alias {name}", set(was_alias.get(name) or []),
+               set(now_alias.get(name) or []))
+
+
 def _compare_resource_policies(rep: Report, base_rp: dict, now_rp: dict) -> None:
     """平台函数按**集合等值**比（丢失一条 Function URL 授权语句 = 控制台或站点
     入口断掉，首版把它写成"改善"）；站点函数按限定符类逐类比，legacy 只认
     点名豁免。"""
     base_platform = base_rp.get("platform", {})
-    for fn in sorted(set(base_platform) | set(now_rp.get("platform", {}))):
-        was = set(base_platform.get(fn, []))
-        now = set(now_rp.get("platform", {}).get(fn, []))
-        if now - was:
-            rep.new_statements.append(f"{fn}: +{sorted(now - was)}")
-        if was - now:
-            rep.new_statements.append(
-                f"{fn}: 少了 {sorted(was - now)}——平台函数的 resource policy 是"
-                f"精确且必需的，丢失同样要红")
+    now_platform = now_rp.get("platform", {})
+    for fn in sorted(set(base_platform) | set(now_platform)):
+        # **逐桶比**（unqualified / 每个 alias / version），不是压成一个扁平集合：
+        # 扁平集合下「语句从 alias 挪到 version」与「两个 alias 有相同语句、删掉其中
+        # 一个」都不变 ⇒ 绿（Codex 第五轮 P2）。平台授权是精确且必需的，所以每个桶
+        # 按**集合等值**比，任一方向的差异都红。
+        for bucket, was, now in _platform_buckets(base_platform.get(fn),
+                                                  now_platform.get(fn)):
+            if now - was:
+                rep.new_statements.append(f"{fn} [{bucket}]: +{sorted(now - was)}")
+            if was - now:
+                rep.new_statements.append(
+                    f"{fn} [{bucket}]: 少了 {sorted(was - now)}——平台函数的 resource "
+                    f"policy 是精确且必需的，丢失同样要红")
 
     alias_canon = set(base_rp.get("site_alias_canonical", []))
     version_canon = set(base_rp.get("site_version_canonical", []))
@@ -1159,9 +1229,46 @@ def secret_in_zip_bytes(blob: bytes, secret: str) -> bool:
 
 # ---------------------------------------------------------------- 真机部分
 
+def harden_tls_warnings() -> None:
+    """把「这次请求没校验服务端证书」升成**致命错误**，不许只打印后继续退出 0。
+
+    实测现场（2026-08-26）：`measure()` 原先把**同一个** IAM client 交给 4 个 worker
+    并发用，于是 400 个 principal 的模拟里有十几次是在**未校验证书**的连接上完成的。
+    对照实验：同一批请求顺序执行 **0** 次、每线程独立 client **0** 次 —— 是共享 client
+    的并发形态触发的，不是机器环境的背景噪音。
+
+    为什么必须致命：闸门的答案要是能被主动 MITM 伪造，那次"绿"就不能当安全证据，
+    而"打印一条 warning 然后退出 0"与"一切正常"在 CI 上长得一模一样。
+    """
+    from urllib3.exceptions import InsecureRequestWarning
+    warnings.simplefilter("error", InsecureRequestWarning)
+
+
+_TLS_LOCAL = threading.local()
+# botocore 的 session/client 构造不保证线程安全，所以建的时候上锁；建好之后每线程各用自己的。
+_CLIENT_LOCK = threading.Lock()
+
+
+def thread_iam_client(region: str):
+    """**每线程一个** IAM client。
+
+    共享一个 client 并发用会让一部分请求跳过证书校验（见 `harden_tls_warnings`）。
+    同一线程内复用——否则 400 个 principal 会建 400 个 client。
+    """
+    if not hasattr(_TLS_LOCAL, "iam"):
+        import boto3
+        from botocore.config import Config
+        with _CLIENT_LOCK:
+            _TLS_LOCAL.iam = boto3.client(
+                "iam", region_name=region,
+                config=Config(retries={"max_attempts": 12, "mode": "adaptive"}))
+    return _TLS_LOCAL.iam
+
+
 def _aws_clients(region: str):
     import boto3
     from botocore.config import Config
+    harden_tls_warnings()
     cfg = Config(retries={"max_attempts": 12, "mode": "adaptive"})
     return {n: boto3.client(n, region_name=region, config=cfg)
             for n in ("iam", "lambda", "sts", "s3", "ssm", "cloudformation")}
@@ -1574,7 +1681,10 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
     undecided: set[str] = set()
 
     with cf.ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = {pool.submit(simulate, iam, p["arn"], targets): p for p in principals}
+        # **每线程独立 client**：共享一个 client 并发用会让一部分请求跳过证书校验
+        # （实测 12/40 次未校验；顺序执行与每线程独立都是 0）。
+        futs = {pool.submit(lambda a: simulate(thread_iam_client(region), a, targets),
+                            p["arn"]): p for p in principals}
         for i, fut in enumerate(cf.as_completed(futs), 1):
             p = futs[fut]
             try:
@@ -1585,10 +1695,7 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
             n_missing += bool(missing)
             # 折成成员指纹。放在下面 `if grants:` 的**外面**——一个 principal 可能一条
             # grant 都没有却有判不出的项，而那正是最该盯住的那种（条件哪天放宽就是新 grant）。
-            for action, resource in pairs:
-                undecided.add(undecided_item_fp(
-                    p["arn"], ACTION_CLASS_NAMES.get(action, action),
-                    undecided_resource_class(resource, targets)))
+            undecided |= undecided_members(p["arn"], pairs, targets)
             grants = grants_from_decisions(decisions, targets)
             if grants:
                 observed[principal_fingerprint(p["arn"])] = {
@@ -1604,9 +1711,11 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
                          f"{failures[:3]}")
 
     facts["principals_with_missing_context"] = n_missing
-    return {# 快照也带 schema：`--from-dump` 要能拒绝旧形态的快照（旧的缺新分节，
-            # 拿它当闸门结果会把"这些分节都空"当成"没有漂移"）。
+    return {# 快照带 schema 与完整性标记：`--from-dump` 要能拒绝旧形态与不完整的快照
+            # （缺分节时比较器整层跳过，输出与"真的没漂移"逐字相同）。
             "schema": BASELINE_SCHEMA,
+            # --no-asset-scan 只看当前 asset ⇒ 这份观测不完整，不许出结论/写基线。
+            "asset_scan_complete": scan_assets,
             "principals": observed, "resource_policies": rp, "facts": facts,
             "coverage": {"undecided_items": sorted(undecided)},
             # `texts` 只进 stdout 与 --dump-observed 的产物，**不进基线**。
@@ -1659,11 +1768,44 @@ def load_baseline(path: Path, *, migrate_from: int | None = None) -> dict:
     return migrate_baseline_2_to_3(data)
 
 
-def load_dump(path: Path) -> dict:
-    """`--from-dump` 的快照。**它也带 schema**。
+# 一份**权威**观测必须有的分节与类型。缺一节的症状与「那一层没有漂移」一模一样：
+# `main()` 把它 `.get()` 给比较器，比较器拿到 None 就整层跳过。实测构造过一个只缺
+# `coverage` 与 `iam_write` 的 schema-3 dump —— 基线里明明有 B 语句与 undecided items，
+# 闸门仍输出「与基线一致」、退出码 0。
+BUNDLE_SECTIONS: dict[str, type] = {
+    "schema": int, "principals": dict, "resource_policies": dict, "facts": dict,
+    "coverage": dict, "iam_write": dict, "required": dict,
+}
 
-    旧快照缺新分节（bootstrap_bucket / coverage / iam_write），拿它当闸门结果会把
-    "这些分节都空"当成"没有漂移"——那是最坏的一种 false-green。
+
+def check_bundle_complete(bundle: dict, *, where: str) -> None:
+    """出闸门结论 / 写基线之前，校验观测是**完整**的。
+
+    这是一条 fail-closed 合同：**不完整的观测不许变成一个权威的绿。**
+    """
+    missing = [k for k in BUNDLE_SECTIONS if k not in bundle]
+    if missing:
+        raise SystemExit(
+            f"{where}：观测缺分节 {missing} —— 缺一节的症状与「那一层没有漂移」一模一样"
+            f"（比较器拿到 None 就整层跳过），不许拿它出闸门结论或改写基线。"
+            f"重新跑一次完整的 --dump-observed。")
+    wrong = [f"{k}: {type(bundle[k]).__name__}≠{t.__name__}"
+             for k, t in BUNDLE_SECTIONS.items() if not isinstance(bundle[k], t)]
+    if wrong:
+        raise SystemExit(f"{where}：观测分节类型不对 {wrong}——空列表冒充空字典这类"
+                         f"会让比较器静默走空路径")
+    if not bundle.get("asset_scan_complete"):
+        raise SystemExit(
+            f"{where}：这份观测是 --no-asset-scan 产出的（只看了当前 asset）。"
+            f"带活密钥的**历史对象**整个不在目标集合里 ⇒ 只能读到那批对象的 principal 会"
+            f"从结果里消失，而比较器会把它报成「集合缩小（绿）」。不许拿它出结论或写基线。")
+
+
+def load_dump(path: Path) -> dict:
+    """`--from-dump` 的快照。**schema 与完整性都要校验。**
+
+    旧快照缺新分节（coverage / iam_write），拿它当闸门结果会把"这些分节都空"当成
+    "没有漂移"——那是最坏的一种 false-green，因为输出与真的没漂移逐字相同。
     """
     data = json.loads(path.read_text(encoding="utf-8"))
     got = data.get("schema")
@@ -1671,7 +1813,27 @@ def load_dump(path: Path) -> dict:
         raise SystemExit(
             f"快照 {path} 的 schema 是 {got}，脚本要 {BASELINE_SCHEMA}——"
             f"重新跑一次 --dump-observed，不要拿旧快照当闸门结果")
+    check_bundle_complete(data, where=f"快照 {path}")
     return data
+
+
+def check_flag_combination(args) -> None:
+    """`--no-asset-scan` 只许用于**纯观测**，不得出闸门结论、更不得改写基线。
+
+    实测：它只看当前 asset，历史对象不进目标集合 ⇒ 只能读历史对象的 principal 从
+    observed 里消失，比较器把它报成 `improvements`（绿），而 asset 数 9→1 只是一条
+    不影响退出码的 note。`rep.ok` 为 True——漏测被解释成了改善。
+    """
+    if not getattr(args, "no_asset_scan", False):
+        return
+    if args.update_baseline:
+        raise SystemExit(
+            "--no-asset-scan 不能与 --update-baseline 同用：那会用一次不完整的扫描"
+            "改写基线，把历史 asset 上的暴露面从基线里抹掉。")
+    if not args.dump_observed:
+        raise SystemExit(
+            "--no-asset-scan 只能与「纯 --dump-observed」一起用：它的观测不完整，"
+            "拿来出闸门结论会把漏测报成「集合缩小（绿）」。")
 
 
 def wants_baseline(args) -> bool:
@@ -1712,21 +1874,20 @@ def write_baseline(bundle: dict, baseline: dict, path: Path) -> None:
          "facts": bundle["facts"],
          # 判不出的项按**成员**存（新成员即红）。principal 级的那个笼统计数在 facts 里，
          # 只报 delta——它会随账号里任何一条带 Condition 的新策略变动。
-         "coverage": bundle.get("coverage") or {"undecided_items": []},
+         "coverage": bundle["coverage"],
          "principals": principals,
          # B：IAM 写的纯静态文本快照。**只落指纹**——语句原文（`texts`）刻意不写，
          # 它含账号内标识（Principal 是带账号 ID 的角色 ARN）。
-         "iam_write_statements": (bundle.get("iam_write") or {}).get("statements", {}),
-         "permissions_boundaries": (bundle.get("iam_write") or {}).get("boundaries", {}),
-         "managed_policy_versions": (bundle.get("iam_write") or {})
-                                    .get("managed_versions", {}),
+         "iam_write_statements": bundle["iam_write"]["statements"],
+         "permissions_boundaries": bundle["iam_write"]["boundaries"],
+         "managed_policy_versions": bundle["iam_write"]["managed_versions"],
          # 站点函数只落**规范形态 + legacy 豁免名单**，不落逐站点条目：
          # 逐站点会让每次建站/下线都改基线，而"新增即红"依赖基线是稳定的。
          "resource_policies": {
              "platform": bundle["resource_policies"]["platform"],
              **site_shape_canonicals(bundle["resource_policies"]["sites"]),
              # 只落指纹；`bootstrap_bucket_texts` 刻意**不写**（语句原文含账号内标识）。
-             "bootstrap_bucket": bundle["resource_policies"].get("bootstrap_bucket", []),
+             "bootstrap_bucket": bundle["resource_policies"]["bootstrap_bucket"],
          }},
         ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -1757,6 +1918,7 @@ def main() -> int:
                     help="跳过「bootstrap 桶里有多少 asset 带活密钥」那一遍扫描"
                          "（默认做；它要读几十个小对象）")
     args = ap.parse_args()
+    check_flag_combination(args)
 
     # **纯 dump 模式不读基线**：迁移期第一次跑 `--dump-observed` 时仓库里的基线还是
     # 旧 schema，在这里硬校验就会把 dump 挡死——而那次 dump 正是迁移的输入。
@@ -1791,6 +1953,7 @@ def main() -> int:
             return 0
 
     if args.update_baseline:
+        check_bundle_complete(bundle, where="--update-baseline")
         classify = json.loads(Path(args.classify).read_text(encoding="utf-8")) \
             if args.classify else {}
         if classify:
@@ -1801,11 +1964,12 @@ def main() -> int:
         print(f"\n已写入 {BASELINE_PATH}（新条目 category=unclassified，请人工标注）")
         return 0
 
+    check_bundle_complete(bundle, where="出闸门结论")
     rep = compare_to_baseline(observed, baseline, required=bundle["required"],
                               resource_policies=bundle["resource_policies"],
                               facts=bundle["facts"],
-                              coverage=bundle.get("coverage"),
-                              iam_write=bundle.get("iam_write"))
+                              coverage=bundle["coverage"],
+                              iam_write=bundle["iam_write"])
     print("\n" + rep.render())
     # 处置文案由 RED_FIELDS 的第三列驱动（`dict.fromkeys` 去重且保序）：
     # 原先这里手抄了一遍字段名单，加红字段时最容易漏的就是这一处。
