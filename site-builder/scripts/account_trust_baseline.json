@@ -1222,12 +1222,6 @@
         "invoke-platform:site-deployer-validate"
       ]
     },
-    "f945-c236-733b-c427": {
-      "category": "platform-overbroad",
-      "grants": [
-        "read-edge-asset"
-      ]
-    },
     "c6a2-9029-4b5a-3033": {
       "category": "unrelated-workload",
       "grants": [

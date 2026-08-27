@@ -33,11 +33,17 @@ ARN，通配已清零）。不再需要"读文档时减去一层"。
 > **非对称签名**（Edge 只放公钥）能关掉只读那批；迁**独立成员账号**才能移出管理身份。
 > 实测数字、为什么 SCP/resource policy/对称签名都不成立、以及盯住暴露面别再变大的
 > 闸门（**已收缩成 A 直接失守 + B IAM 写静态快照两层，C 站点 route/alias 可达性移出归
-> 部署验收**；真修复顺序：收窄 CodeBuild 对 bootstrap 桶的读权限 → 非对称签名 →
-> 迁独立账号，见 merged review §9 的 3b/3c/3d），
+> 部署验收**；真修复顺序：收窄 CodeBuild 对 bootstrap 桶的读权限（**§9 的 3b，
+> 2026-08-27 已部署**：那条整桶读整条消失，A 62→61、可读密钥 57→56、
+> `platform-overbroad` 清零）→ 非对称签名 → 迁独立账号，见 merged review §9 的
+> 3b/3c/3d），
 > 见 `docs/security/account-trust-boundary.md`。**那份文档里还有一条值得单独记住**：
-> 跑不可信站点依赖安装的 CodeBuild 角色能读到那把密钥（CDK 自动授的整桶读）。
-> **隔断分两层，别记成"只有一条 flag"**：站点**自己的** `package.json` 生命周期脚本与
+> 跑不可信站点依赖安装的 CodeBuild 角色**曾经**能读到那把密钥（CDK 给
+> `BuildSpec.from_asset()` 自动授的整桶读）——**2026-08-27 已收窄，它现在对 bootstrap 桶
+> 零权限**，S3 权限全集由检查器按等值断言（`deployer/tests/security_contracts.py`）。
+> 但 **`--ignore-scripts` 仍然必须留着**，因为构建容器里任意代码执行仍能读
+> `validated/*`、写 `artifacts/*`。
+> **那条隔断分两层，别记成"只有一条 flag"**：站点**自己的** `package.json` 生命周期脚本与
 > `backend/.npmrc` 由合同校验器在 CodeBuild **之前**就拒（`contract/redlines.py` 的
 > `NPM_LIFECYCLE_KEYS`）；但**依赖里**的生命周期脚本**只有** `buildspec-package.yml` 的
 > `npm install --ignore-scripts` 一道——`_scan_package_json` 从不检查 `dependencies`，

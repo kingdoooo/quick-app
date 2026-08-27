@@ -1,6 +1,7 @@
 # 账号信任边界：平台能防谁，不能防谁
 
-> **状态：已知未修（不是已接受）。** 最近一次实测 2026-08-25，方法与原始数据见下。
+> **状态：已知未修（不是已接受）。** 最近一次实测 2026-08-27（收窄 CodeBuild 的
+> bootstrap 桶读权限之后），方法与原始数据见下。
 > 这份文档是 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9 里
 > **M09 第 1 步**的产物，并且**扩大了 M09 的结论**——见「M09 的框架不够大」一节。
 
@@ -17,6 +18,8 @@
 > `role/*` 模拟，漏了 6 个精确/窄授权的 principal（63→66）。
 > **读这份文档时把数字当下界看，不要当上界。** 产生它们的闸门现在按
 > 「动作等价类 × 资源等价类」建模，但仍不是穷尽的（见最后一节「这道闸门不证明什么」）。
+> **2026-08-27 起数字第一次因为"真的修了东西"而变小**（66→65、A 62→61、可读密钥
+> 57→56）：收窄了 CodeBuild 对 bootstrap 桶的读权限，见下面 `platform-overbroad` 那节。
 
 对**不具备**账号级权限的一切东西——站点代码、per-site IAM 角色、公网访问者——
 「身份只能来自 Edge」这条不变量是成立的，而那正是这套设计要防的威胁。
@@ -31,12 +34,12 @@
 它**不**回答「怎么把账号里那 38 个无关工作负载清理干净」——那是账号治理，
 不是本仓库能提交的改动。
 
-## 实测（2026-08-25，全部只读）
+## 实测（2026-08-27，全部只读）
 
 方法：`iam:GetAccountAuthorizationDetails` 枚举账号内**全部**非 service-linked
 角色与 IAM 用户，逐个 `iam:SimulatePrincipalPolicy`（模拟器会算 permissions
 boundary；本账号是 Organizations 管理账号，SCP 对它无效）。
-400 个 principal 全部**收到**模拟结果、无一因限流丢失——丢一个与「它没有权限」在
+枚举到的 principal 全部**收到**模拟结果、无一因限流丢失（本次 401 个）——丢一个与「它没有权限」在
 输出上一模一样，所以脚本对模拟失败是硬失败。
 
 复跑（这就是最新结果的取得方式，本文不承诺数字长期有效）：
@@ -49,21 +52,21 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 
 | 组 | 项 | 数 |
 |---|---|---|
-| **A 直接失守** | 具备非 IAM-write 敏感授权的 principal | 62 <!-- baseline:A总数=62 --> |
-| | 其中**能取得会话签名密钥**的 | 57 <!-- baseline:可读密钥=57 --> |
+| **A 直接失守** | 具备非 IAM-write 敏感授权的 principal | 61 <!-- baseline:A总数=61 --> |
+| | 其中**能取得会话签名密钥**的 | 56 <!-- baseline:可读密钥=56 --> |
 | | 其中**非平台**身份可直接 `lambda:InvokeFunction` 平台或站点函数的 | 18 <!-- baseline:非平台可直调=18 --> |
 | | Edge 函数里仍带着当前有效密钥的**代码目标**（未限定 + 已发布版本） | 10 <!-- baseline:带活密钥的Edge代码目标=10 --> |
 | | CDK bootstrap 桶里仍带着**当前有效**密钥的 asset 对象 | 9 <!-- baseline:带活密钥的asset=9 --> |
 | **B IAM 写观察** | 持有相关 IAM 策略变更语句的 principal | 22 <!-- baseline:B持有IAM写语句=22 --> |
 | | 其中**不在 A 里**（只有 IAM 写、**未证明可提权**） | 4 <!-- baseline:仅IAM写=4 --> |
 
-> **A + B 的并集是 66，但那个数不是 headline。** A 是"现在就能拿到密钥或直接调用平台
+> **A + B 的并集是 65，但那个数不是 headline。** A 是"现在就能拿到密钥或直接调用平台
 > 函数"；B 只是"持有一条可能影响 IAM 策略的语句"，本闸门**明确不证明**它构成提权链
 > （判那个需要一个 IAM 权限分析器——那正是这道闸门被前五轮复审反复点名的根因）。
 > 把两者相加当成一个风险数字，是这一轮收缩要消掉的那个错误。
 >
 > **B 里那 4 个不在 A 里的 principal 没有类别分布可写**：schema 3 的 `principals`
-> 只保留 A 的 62 个，那 4 个的 `category` 不在基线里 ⇒ 任何按类别的拆分都没有真源，
+> 只保留 A 的 61 个，那 4 个的 `category` 不在基线里 ⇒ 任何按类别的拆分都没有真源，
 > 只能靠人记，下次 B 的成员变了就会静默腐烂。要看它们是谁，跑
 > `--dump-observed` 看带真实名字的快照（产物含账号内标识，勿提交）。
 
@@ -73,14 +76,14 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 | 类别 | 数 | 说明 |
 |---|---|---|
 | `platform` | 6 <!-- baseline:类别_platform=6 --> | 平台自己的角色，授权都是**必需且精确**的，见下节 |
-| `platform-overbroad` | 1 <!-- baseline:类别_platform_overbroad=1 --> | 平台自己的角色，但这条授权它**不需要**：见「平台侧唯一的过宽授权」 |
+| `platform-overbroad` | 0 <!-- baseline:类别_platform_overbroad=0 --> | **已清零**（2026-08-27 收窄 CodeBuild 的 bootstrap 桶读权限）。这一行不能删——文档数字守卫对每个类别都要求正文出现对应标记 |
 | `admin` | 3 <!-- baseline:类别_admin=3 --> | 账号管理身份（含账号 owner 的 IAM 用户）。属既定信任模型 |
 | `break-glass` | 6 <!-- baseline:类别_break_glass=6 --> | 企业内部托管的管理/审计角色。不由本项目控制 |
 | `cdk-admin` | 6 <!-- baseline:类别_cdk_admin=6 --> | CDK bootstrap 的 CloudFormation 执行角色与部署角色（各 3 个区），按约定是 `AdministratorAccess`。**任何能在本账号跑 `cdk deploy` 的人都能用** |
 | `cdk-readonly` | 4 <!-- baseline:类别_cdk_readonly=4 --> | CDK bootstrap 的 lookup 与 file-publishing 角色。它们**足以拿到密钥** |
 | `unrelated-workload` | 36 <!-- baseline:类别_unrelated=36 --> | 与本平台无关的工作负载：EC2/ECS/EMR/EKS 实例角色、多个 SageMaker 与 Personalize 执行角色、Glue、Batch、SSM 自动化与 QuickSetup、另一套 GenAI Agent 栈、若干应用与 CDK BucketDeployment 角色 |
 
-合计 62 = A 组总数。**这一轮把这张表的裸数字也加上了校验标记**：`unrelated-workload`
+合计 61 = A 组总数。**这一轮把这张表的裸数字也加上了校验标记**：`unrelated-workload`
 那个曾经写着 38，而 A 收缩后是 36——裸数字正是文档腐烂的入口。
 
 ⇒ 这不是「只有我一个人有权限」的个人账号，而是一个**多工作负载共享账号**。
@@ -148,7 +151,7 @@ EC2/ECS/EMR/EKS 实例角色与 SSM 自动化角色的托管策略里。
 - `Origin` 逐字符匹配与 `Content-Type` 检查在这条路上**不提供任何保护**：
   direct invoke 的合成 event 里这两个头由攻击者填；走真实 HTTP 时它们也不是身份。
 
-## 平台自己这一侧：6 个精确，1 个过宽
+## 平台自己这一侧：6 个精确，过宽的那一个已收窄
 
 6 个 `platform` 角色的 invoke 权限都**精确到单个函数**，实测逐一确认：
 
@@ -172,15 +175,34 @@ deployer exec 角色另有 `role/site-rt-*` 上的 `PutRolePolicy` / `AttachRole
 所以"上一个版本的代码"仍然可经它自己的 Function URL 被 Edge 角色调用。
 这不扩大身份边界（仍只有 Edge 能调），但"我以为已经换掉的代码"其实还在。
 
-### 平台侧唯一的过宽授权（`platform-overbroad`）
+### 曾经唯一的过宽授权（`platform-overbroad`）——**已于 2026-08-27 收窄**
 
-跑**不可信站点依赖安装**的 CodeBuild 角色（`site-package` 项目）拿到了
-`s3:GetObject*`/`GetBucket*`/`List*` on **整个** `cdk-hnb659fds-assets-*` 桶。
-这不是本仓库写的策略——它是 CDK 给 `BuildSpec.from_asset()` 自动加的
-（buildspec 本身也是一个 asset）。后果：**那个构建容器能读到 Edge asset 里的
-明文签名密钥**。
+> **现状（2026-08-27 起）**：跑不可信站点依赖安装的 CodeBuild 角色（`site-package`
+> 项目）对 CDK bootstrap 桶**零权限**。它的 S3 权限全集精确等于两条——
+> `s3:GetObject` on `site-artifacts-<acct>/validated/*`、`s3:PutObject` on
+> `.../artifacts/*`——没有 `ListBucket`、没有 `DeleteObject`、没有通配动作、
+> 没有 `Resource: "*"`、没有任何 managed policy attachment。**这条不变量现在由检查器按
+> 等值断言**（`deployer/tests/security_contracts.py` 的 `package_project_s3_violations`，
+> 覆盖 identity policy 的四种来源**加** `AWS::S3::BucketPolicy`），部署后的真机验收调
+> 同一个函数。
+>
+> **改法**：那条整桶读是 `cb.BuildSpec.from_asset()` 让 CDK 自动加的
+> （`Asset.grantRead()` 授的是**桶**，不是那一个对象），而它的唯一用途是取项目自己那
+> 25 行 buildspec。把 buildspec **逐字节内联**进 CloudFormation 模板之后这条权限整条
+> 消失（不是收窄）。设计与实施见
+> `docs/superpowers/specs/2026-08-27-codebuild-bootstrap-read-narrowing-spec.md`。
+>
+> **`--ignore-scripts` 仍然必须留着**：它挡的不只是这一条路——构建容器里任意代码执行
+> 仍能读 `validated/*`、写 `artifacts/*`。
 
-它今天**不可达**。但隔断**不是"只有一条 flag"**——早先版本这么写过，那不准确。按攻击
+以下是这条缺陷**收窄之前**的记录，保留是因为**它得出的结论仍然成立**（见本节末尾）。
+
+原状：那个角色拿到了 `s3:GetObject*`/`GetBucket*`/`List*` on **整个**
+`cdk-hnb659fds-assets-*` 桶。这不是本仓库写的策略——它是 CDK 给
+`BuildSpec.from_asset()` 自动加的（buildspec 本身也是一个 asset）。后果：**那个构建
+容器能读到 Edge asset 里的明文签名密钥**。
+
+它当时**不可达**。但隔断**不是"只有一条 flag"**——早先版本这么写过，那不准确。按攻击
 路径分层（都是实测）：
 
 | 攻击路径 | 控制点 |
@@ -201,9 +223,11 @@ deployer exec 角色另有 `role/site-rt-*` 上的 `PutRolePolicy` / `AttachRole
 Python 后端而用 `pip install` 装 sdist），这条链就从「账号内部暴露」变成
 **「不可信站点作者可窃取平台签名密钥」**——而后者正是整套设计声称要防的威胁。
 
-⇒ 这条不需要等账号迁移，可以单独收窄（把 buildspec 改成不走 asset，
-或给该角色加显式 Deny 到 Edge asset 前缀）。**它也是"别把可签名的对称密钥
-物化进部署资产"这条结论最直接的证据。**
+⇒ 这条不需要等账号迁移，可以单独收窄——**已按第一种做法完成**（把 buildspec 改成
+不走 asset）。**而它得出的结论不因为收窄而失效**："别把可签名的对称密钥物化进部署
+资产"仍然是这份文档最直接的证据链，因为 Edge asset 里**照旧**有 9 个带活密钥的对象
+（见「密钥有三条路能拿到」的路 ②），只是不再有一个跑不可信代码的角色能读到它们。
+真正让那 9 个对象不再危险的是**非对称签名**（真修复②），不是这一条。
 
 ### 两个 Edge 函数也在监控范围里（补的是另一个盲区）
 
