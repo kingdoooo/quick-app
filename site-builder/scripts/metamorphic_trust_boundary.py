@@ -257,6 +257,39 @@ MUTATIONS: list[tuple] = [
      ('        unknown = []',
       '    unknown = []'),
      "an_unknown_bundle_section_hard_fails"),
+    # ---- 观测的原子性（Codex 第七轮）：枚举 → 模拟窗口内的 churn -------------
+    (38, "原子性摘要退化成只比 uid（丢掉 boundary 与语句）", SCRIPT,
+     '    payload = json.dumps(\n'
+     '        {"kind": p["kind"], "uid": p["uid"], "boundary": p["boundary_arn"],\n'
+     '         "statements": sorted(json.dumps([src, st], sort_keys=True, default=str)\n'
+     '                              for src, st in p["statements"])},\n'
+     '        sort_keys=True, default=str)',
+     '    payload = json.dumps({"uid": p["uid"]}, sort_keys=True, default=str)',
+     "policy_mutated_on_existing_principal or generation_id_alone "
+     "or boundary_change_is_refused or statement_source_is_part_of_the_digest"),
+    (39, "枚举后新建的 principal 不算漂移", SCRIPT,
+     '           "appeared": sorted(a[arn]["name"] for arn in set(a) - set(b)),',
+     '           "appeared": [],',
+     "principal_created_after_enumeration_is_refused"),
+    (40, "模拟后消失的 principal 不算漂移（\"缩小是安全的\"那个口子）", SCRIPT,
+     '           "vanished": sorted(b[arn]["name"] for arn in set(b) - set(a))}',
+     '           "vanished": []}',
+     "principal_vanishing_after_simulation_is_refused"),
+    (41, "检测到漂移只打印警告、不抛（fail-open）", SCRIPT,
+     '        raise SystemExit(\n            f"本轮观测不是原子的',
+     '        print(\n            f"本轮观测不是原子的',
+     "measure_refuses_a_non_atomic_round"),
+    (42, "摘要里的语句不排序（顺序抖动会被误报成漂移）", SCRIPT,
+     '         "statements": sorted(json.dumps([src, st], sort_keys=True, default=str)\n'
+     '                              for src, st in p["statements"])},',
+     '         "statements": [json.dumps([src, st], sort_keys=True, default=str)\n'
+     '                        for src, st in p["statements"]]},',
+     "digest_ignores_statement_order"),
+    (43, "list_principals 不收 uid（换代检测静默失效）", SCRIPT,
+     ('                    "uid": r["RoleId"],\n',
+      '                    "uid": u["UserId"],\n'),
+     ('', ''),
+     "list_principals_records_uid"),
 ]
 
 
