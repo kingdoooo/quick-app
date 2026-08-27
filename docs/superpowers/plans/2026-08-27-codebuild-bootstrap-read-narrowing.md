@@ -23,9 +23,11 @@
 - **`verify_*` 脚本一律用系统 `python3`**，不要用 `site-builder/deployer/.venv/bin/python3`：
   那个解释器的 CA 信任库是空的，每次 HTTPS 都 `CERTIFICATE_VERIFY_FAILED`。
 - **每个提交都必须是绿的、可运行的 checkout。** 不许提交红着的测试。
-- **`deployer/.venv` 没有 `aws_cdk`**（实测 `ModuleNotFoundError`），且 `import app` 会
-  synth 整个栈（`app.py` 顶层就 `App()/synth()`）⇒ 需要 Docker。因此所有**语义反例**都
-  跑在手写模板 fixture 上（always-on、无 Docker），真模板只在 opt-in 层跑一次。
+- **`deployer/.venv` 没有 `aws_cdk`**（实测 `ModuleNotFoundError`）。因此所有**语义反例**
+  都跑在手写模板 fixture 上（always-on、无 Docker、无 aws_cdk），真 synth 出来的模板只在
+  opt-in 层跑一次。
+  （Task 2 之前 `import app` 还会 synth 整个栈 ⇒ 需要 Docker；Task 2 加上 `__main__`
+  守卫之后 `import app` 无副作用，实测 2.4 秒、不起 Docker。）
 - **测试命令照抄**：默认套件 `cd site-builder/deployer && .venv/bin/pytest tests -q`
   （**必须带 `tests/`**，裸 `pytest` 会误收集 `infra/cdk.out` 里的 asset 副本）。
 - **不更新 memory。** memory 是控制侧的东西、不是仓库产物，不进本计划的任何任务。
@@ -39,8 +41,10 @@
 ④ 每条反例的报文点名的是目标控制点；⑤ 构造反例时其余部分保持合格，失败不能由更早的
 检查顺带造成。
 
-**本计划的全部代码块都在最终目录形态下跑过**（`deployer/tests/` 布局，21 passed），
-不是"看着能跑"。
+**本计划的全部代码块都在最终目录形态下跑过**（`deployer/tests/` 布局），不是"看着能跑"。
+Task 1/2 已实施：检查器用例 **65 passed**、默认套件 **1084 passed / 52 skipped**、
+opt-in 真模板 **35 passed**；且 Task 4 Step 3 那段部署后验收代码**已在部署前对着生产
+只读跑过一次**，红绿与"尚未部署"逐项吻合（两红一绿）。
 
 ---
 
@@ -98,11 +102,17 @@ stack（需 Docker）。新建文件要么复制那段 fixture（会 synth 两�
 ——而"策略里没有 bootstrap 桶"那种断言照样通过。这与 `_package_project_resources()`
 只看见"手写的那一半"是同一个错误。
 
-**这个错误在本轮被外部复审抓到过三轮，每轮都是"枚举范围比声称的主语窄"**：
-① 只看源码手写的语句，漏 CDK 自动加的；② 只看"含某个子串"，漏 `--ignore-scripts=false`
-之类语义翻转；③ 只看首 token 是 `npm` 的命令，漏 `env npm rebuild` / `sh -c '…'`；
-④ 只看 identity policy，漏 `AWS::S3::BucketPolicy`。所以现在的写法一律是
-**把完整集合与精确期望比等值**，而不是逐个排除已知坏形态。
+**这个错误在这一条改动上被外部复审抓到过 13 次，每次都是"枚举范围比声称的主语窄"**：
+只看源码手写的语句（漏 CDK 自动加的）；只看"含某个子串"（漏 `--ignore-scripts=false`
+这类语义翻转）；只看首 token 是 `npm` 的命令（漏 `env npm rebuild` / `sh -c '…'`）；
+只看 identity policy（漏 `AWS::S3::BucketPolicy`）；桶策略只比 `Principal.AWS` 字面量
+（漏账号 root + `aws:PrincipalArn` 条件）；Action 用 `fnmatchcase`（漏 `CODEBUILD:*`
+——IAM 动作**不区分大小写**）；import-time 遍历跳过类体与 annotation（而**类的体在
+import 时会执行**、3.12 的 annotation 立即求值）。
+
+所以现在的写法一律是**把完整集合与精确期望比等值**，而不是逐个排除已知坏形态；
+每个检查器都配一组**由复审方提出、逐字纳入**的反例，以及正向控制（否则"把一切都判红"
+也能让反例全过）。
 """
 import fnmatch
 import json

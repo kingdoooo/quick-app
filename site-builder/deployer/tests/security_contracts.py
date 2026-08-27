@@ -8,11 +8,17 @@
 ——而"策略里没有 bootstrap 桶"那种断言照样通过。这与 `_package_project_resources()`
 只看见"手写的那一半"是同一个错误。
 
-**这个错误在本轮被外部复审抓到过三轮，每轮都是"枚举范围比声称的主语窄"**：
-① 只看源码手写的语句，漏 CDK 自动加的；② 只看"含某个子串"，漏 `--ignore-scripts=false`
-之类语义翻转；③ 只看首 token 是 `npm` 的命令，漏 `env npm rebuild` / `sh -c '…'`；
-④ 只看 identity policy，漏 `AWS::S3::BucketPolicy`。所以现在的写法一律是
-**把完整集合与精确期望比等值**，而不是逐个排除已知坏形态。
+**这个错误在这一条改动上被外部复审抓到过 13 次，每次都是"枚举范围比声称的主语窄"**：
+只看源码手写的语句（漏 CDK 自动加的）；只看"含某个子串"（漏 `--ignore-scripts=false`
+这类语义翻转）；只看首 token 是 `npm` 的命令（漏 `env npm rebuild` / `sh -c '…'`）；
+只看 identity policy（漏 `AWS::S3::BucketPolicy`）；桶策略只比 `Principal.AWS` 字面量
+（漏账号 root + `aws:PrincipalArn` 条件）；Action 用 `fnmatchcase`（漏 `CODEBUILD:*`
+——IAM 动作**不区分大小写**）；import-time 遍历跳过类体与 annotation（而**类的体在
+import 时会执行**、3.12 的 annotation 立即求值）。
+
+所以现在的写法一律是**把完整集合与精确期望比等值**，而不是逐个排除已知坏形态；
+每个检查器都配一组**由复审方提出、逐字纳入**的反例，以及正向控制（否则"把一切都判红"
+也能让反例全过）。
 """
 import fnmatch
 import json
