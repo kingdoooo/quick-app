@@ -53,6 +53,8 @@ TESTS = ROOT / "site-builder/deployer/tests/test_verify_account_trust_boundary.p
 # 口径守卫管的是 tracked 文档，所以变形也要能改文档——否则那道守卫的反向验证只能靠
 # 一次性 shell，而"验证证据不可复跑就等于没有证据"是这个仓库自己的规矩。
 DEPLOY_MD = ROOT / "site-builder/DEPLOY.md"
+# 收集清单那道守卫依赖 conftest 的 tryfirst 钩子，所以钩子被删也要有一条变形。
+CONFTEST = ROOT / "site-builder/deployer/tests/conftest.py"
 PYTEST = ROOT / "site-builder/deployer/.venv/bin/pytest"
 
 # (编号, 说明, 目标文件, 原文, 改成, 期望红的用例 -k 表达式)
@@ -331,6 +333,18 @@ MUTATIONS: list[tuple] = [
      "def test_pagination_window_is_a_known_blind_spot():",
      "@pytest.mark.skip(reason=\"变形\")\n"
      "def test_pagination_window_is_a_known_blind_spot():",
+     "blind_spot_tests_exist"),
+    (51, "给盲区用例设 __test__ = False（pytest 原生的关闭收集方式）", TESTS,
+     '_BLIND_SPOT_TESTS = ("test_change_then_revert_is_a_known_blind_spot",',
+     'test_pagination_window_is_a_known_blind_spot.__test__ = False\n\n'
+     '_BLIND_SPOT_TESTS = ("test_change_then_revert_is_a_known_blind_spot",',
+     "blind_spot_tests_exist"),
+    (52, "conftest 里那个 tryfirst 钩子被删（守卫只剩过滤后的列表）", CONFTEST,
+     "@pytest.hookimpl(tryfirst=True)\n"
+     "def pytest_collection_modifyitems(session, config, items):\n"
+     "    session._unfiltered_collected_items = list(items)",
+     "def _removed_pytest_collection_modifyitems(session, config, items):\n"
+     "    session._unfiltered_collected_items = list(items)",
      "blind_spot_tests_exist"),
 ]
 

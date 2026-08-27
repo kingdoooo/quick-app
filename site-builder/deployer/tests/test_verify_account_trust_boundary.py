@@ -3159,34 +3159,61 @@ def test_docs_do_not_claim_atomic_observation():
         assert "两端" in docs[rel], f"{rel} 没写这道复查的口径是「两端一致」"
 
 
-def test_blind_spot_tests_exist_and_will_actually_run():
-    """三个盲区各有一条**真的会跑**的用例。
+def test_blind_spot_tests_exist_and_will_actually_run(request):
+    """三个盲区各有一条**真的会被 pytest 跑到**的用例。
 
-    上一版按源码正则数 `def test_..._is_a_known_blind_spot(` 的条数——那是**在数文本**。
-    复审实测的绕法：把用例改名，再补一行注释
-    `# def test_pagination_window_is_a_known_blind_spot(`
-    ⇒ 计数仍是 3、守卫仍然过，而 `--collect-only` 只列出 2 条。**同一个形状第四次**：
-    判据（源码文本）比主语（真的会跑的用例）弱。
+    这道守卫被绕过**三次**，每次都是判据停在比"会跑"更浅的一层：
 
-    所以这里不看文本，看**运行时的模块对象**：
-      ① 三个名字都必须在模块全局里且可调用——注释掉的 `def` 不在 globals 里、
-         改了名的在期望名字下找不到、嵌在别的函数里的也不在 globals 里；
-      ② 按**名字集合等值**比，不只数个数（数量对而名字换了照样是漏了一个盲区）；
-      ③ 不许带 skip / skipif / xfail——被收集但不执行等于没有断言；
-      ④ 反向再查一次：没有名单外的第四条盲区用例游离着。
+    | 版本 | 判据 | 绕法（都实测复现过） |
+    |---|---|---|
+    | v1 | 源码正则数 `def test_..._is_a_known_blind_spot(` 的条数 | 改名 + 补一行注释形态的假 `def` |
+    | v2 | `globals()` 里有这个名字、callable、无 skip/xfail 标记 | `test_x.__test__ = False`（pytest 原生的关闭收集方式） |
+    | v3（现在） | **pytest 自己收集出来的 item** | —— |
+
+    v3 不再枚举 Python 对象的属性，而是直接问 pytest：`request.session.items` 就是这次
+    会话真的收集到的东西。这一层同时盖住了改名、注释掉、`__test__ = False`
+    以及往后别的关闭收集方式——**不必再逐个去猜有几种关法**，这正是前两版反复失手的原因。
+
+    **收集到 ≠ 会执行**，所以第二半仍要看标记：skip / skipif / xfail 的用例照样被收集。
+    标记从 **collected item** 上读（`iter_markers()`），而不是从函数对象读——前者连
+    模块级与类级的 `pytestmark` 一起看见，后者只看得见挂在函数上的那一个。
+
+    **一个诚实的边界**：如果整份文件被关掉（模块级 `pytestmark = pytest.mark.skip`、
+    conftest 里 `collect_ignore`），这道守卫自己也不会跑，因此无法自我检测。那一类由
+    别处兜：变形 harness 的第①关要求"变形前这批用例 rc==0 且至少选中一条"，
+    以及七包的总通过数。
+
+    **`-k` 这一层踩过一个坑**：`request.session.items` 是过滤**之后**的列表
+    （`-k` 的 deselect 就在 `pytest_collection_modifyitems` 里就地删元素），而变形 harness
+    每条变形都用 `-k` ⇒ 直接用它会让这道守卫假红。完整清单由 conftest 里一个 `tryfirst`
+    的同名钩子在过滤前留下。（当初我用一个**文件名里含关键词**的探针验这件事，`-k` 连模块名
+    一起匹配、三条全被选中，于是误以为它没被过滤——探针的文件名不能含关键词。）
     """
     assert len(_BLIND_SPOT_TESTS) == len(_BLIND_SPOTS), \
         "盲区名单与用例名单不同长——两者必须同时改"
-    g = globals()
-    found = {n for n in _BLIND_SPOT_TESTS if callable(g.get(n))}
-    assert found == set(_BLIND_SPOT_TESTS), (
-        f"盲区用例缺失或被改名：少了 {sorted(set(_BLIND_SPOT_TESTS) - found)}"
-        f"——文档写着{len(_BLIND_SPOTS)}个盲区各有一条用例")
-    stray = {n for n, v in g.items()
+    # **不能用 `request.session.items`**：那是 `-k` / `-m` 过滤**之后**的列表
+    # （实测 3 条用例的文件带 `-k` 跑时它只剩 1 条），而变形 harness 每条变形都用 `-k`
+    # ⇒ 判据会假红。完整清单由 conftest 里那个 `tryfirst` 钩子在过滤前留下。
+    items = getattr(request.session, "_unfiltered_collected_items", None)
+    assert items, (
+        "拿不到过滤前的收集清单——conftest 里那个 tryfirst 的 "
+        "`pytest_collection_modifyitems` 钩子不在了？没有它这道守卫只能看到 `-k` 过滤后的"
+        "列表，会假红/假绿。拒绝放行")
+    by_name: dict[str, list] = {}
+    for it in items:
+        base = getattr(it, "originalname", None) or it.name.split("[", 1)[0]
+        by_name.setdefault(base, []).append(it)
+    missing = [n for n in _BLIND_SPOT_TESTS if n not in by_name]
+    assert not missing, (
+        f"pytest 没有收集这些盲区用例：{missing}"
+        f"——被改名 / 注释掉 / 设了 `__test__ = False`？"
+        f"文档写着{len(_BLIND_SPOTS)}个盲区各有一条用例")
+    stray = {n for n in by_name
              if n.startswith("test_") and n.endswith("_is_a_known_blind_spot")
-             and callable(v)} - set(_BLIND_SPOT_TESTS)
+             } - set(_BLIND_SPOT_TESTS)
     assert not stray, f"有盲区用例不在名单里：{sorted(stray)}——名单与文档要同时更新"
     for n in _BLIND_SPOT_TESTS:
-        bad = [m.name for m in getattr(g[n], "pytestmark", [])
-               if m.name in ("skip", "skipif", "xfail")]
-        assert not bad, f"{n} 带着 {bad} 标记——被收集但不执行，等于没有断言"
+        for it in by_name[n]:
+            bad = sorted({m.name for m in it.iter_markers()
+                          if m.name in ("skip", "skipif", "xfail")})
+            assert not bad, f"{n} 带着 {bad} 标记——被收集但不执行，等于没有断言"
