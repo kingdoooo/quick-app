@@ -171,12 +171,17 @@ package_project = cb.Project(
 - `app.py` 里不许出现 `BuildSpec.from_asset`（AST 或整份文本断言，二者都可——
   这是一条纯文本事实，文本守卫能证明它）；
 - `app.py` 里 buildspec 必须经 `read_bytes().decode(` 读取，不许退回 `read_text(`；
-- **顺带补两条本来就该有的**：buildspec 里必须出现 `--ignore-scripts`，且必须有
-  删除 `.npmrc` 的那一步。实测**今天没有任何测试断言这两行**——`--ignore-scripts`
-  只在 `contract/redlines.py` 的一句注释里被提到，而 `.npmrc` 那条红线是**合同校验器
-  拒绝站点自带 `backend/.npmrc`**（另一个控制点，不是 buildspec 这一步）。
-  本 spec 的「不变量」一节声称这两行仍在，而无守卫的声称在这个仓库里等于没有声称。
-  这两条与本改动同文件同威胁，属直接相邻面，不算扩范围。
+- **顺带补两条本来就该有的**：`npm install` 那条**命令行上**必须带 `--ignore-scripts`，
+  且必须有删除 `.npmrc` 的那条命令。实测**今天没有任何测试断言这两行**——
+  `--ignore-scripts` 只在 `contract/redlines.py` 的一句注释里被提到，而 `.npmrc` 那条
+  红线是**合同校验器拒绝站点自带 `backend/.npmrc`**（另一个控制点，不是 buildspec
+  这一步）。本 spec 的「不变量」一节声称这两行仍在，而无守卫的声称在这个仓库里等于
+  没有声称。这两条与本改动同文件同威胁，属直接相邻面，不算扩范围。
+
+  **必须钉在命令行上，不能写成"文件里出现过这个字符串"**：buildspec 的注释里也写着
+  `--ignore-scripts`（那段解释它为什么必需），所以子串检查在"只删命令、留注释"时会
+  照样绿。这与本 spec 上面那条「守卫只看见了一半」是同一个错误：守卫的主语
+  （装依赖时带没带这个 flag）比它的证据（文件里有没有这几个字）宽。
 
 **这一层证明不了 `Source.BuildSpec` 等于文件字节**——那是语义。见
 `syntax-guards-cannot-prove-semantics` 那条教训，以及上面「守卫只看见了一半」那节：
@@ -203,10 +208,23 @@ package_project = cb.Project(
 这才是这条安全属性的真回归守卫：权限回来了就是"既有 principal 新增 grant" ⇒ **红**。
 它不是单测，跑一次要真凭证。
 
-**反向验证**：上面每条新守卫都要在 `metamorphic_trust_boundary.py` 里配一条变形
-（把 `_InlineBuildSpec` 换回 `from_asset`、把 `read_bytes().decode(` 换回
-`read_text(`、把模板断言的资源集合放宽），并过那四关（变形前基准全绿且选中≥1 条 /
-变形后可编译导入 / rc==1 / 末行有实际 `N failed`）。
+**反向验证**：上面每条新守卫都必须证明它会红——它们在写下的那一刻就是绿的
+（pass-now），不证明能红等于什么都没加。
+
+做法是**在测试文件内的负向 meta-test**，不走 `metamorphic_trust_boundary.py`：把源码
+文本读进来、在**内存里**造出退化（`_InlineBuildSpec` 换回 `from_asset`、
+`read_bytes().decode(` 换回 `read_text(`、只从 `npm install` 命令上摘掉 flag 而注释
+原样留着……）、断言守卫函数报出对应违规。所以守卫一律写成**纯函数吃源码文本、
+吐违规列表**——`_package_project_resources()` 已经是这个形态。
+
+两条理由：① 那个 harness 会**临时改工作树里的文件再还原**，把 `infra/app.py`
+（生产 CDK 源码）与 `buildspec-package.yml`（安全隔断所在处）加进它的目标集合，
+意味着进程被 SIGKILL 时工作树里会留下一份被改坏的生产基础设施源码；② 负向 meta-test
+给出**同等强度**的证据，却完全不碰工作树，而且跑在**默认套件**里、不是一个要手工跑的
+脚本里。`metamorphic_trust_boundary.py` 因此在本条改动中**不改**。
+
+模板断言那层是例外：它在实现落地后才写得出来，所以要**手工**把 `build_spec=` 临时改回
+`from_asset` 跑一次、看它红、再改回来并 `git diff` 确认工作树干净。这一步不入仓。
 
 ## 实施与验收顺序
 
