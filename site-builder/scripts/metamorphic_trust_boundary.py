@@ -258,15 +258,20 @@ MUTATIONS: list[tuple] = [
       '    unknown = []'),
      "an_unknown_bundle_section_hard_fails"),
     # ---- 观测的原子性（Codex 第七轮）：枚举 → 模拟窗口内的 churn -------------
-    (38, "原子性摘要退化成只比 uid（丢掉 boundary 与语句）", SCRIPT,
+    (38, "摘要退化成只比 uid（丢掉 boundary/版本/语句）", SCRIPT,
      '    payload = json.dumps(\n'
      '        {"kind": p["kind"], "uid": p["uid"], "boundary": p["boundary_arn"],\n'
+     '         "boundary_statements": sorted(json.dumps(st, sort_keys=True, default=str)\n'
+     '                                       for st in p["boundary_statements"]),\n'
+     '         "policy_versions": {k: p["policy_versions"][k]\n'
+     '                             for k in sorted(p["policy_versions"])},\n'
      '         "statements": sorted(json.dumps([src, st], sort_keys=True, default=str)\n'
      '                              for src, st in p["statements"])},\n'
      '        sort_keys=True, default=str)',
      '    payload = json.dumps({"uid": p["uid"]}, sort_keys=True, default=str)',
      "policy_mutated_on_existing_principal or generation_id_alone "
-     "or boundary_change_is_refused or statement_source_is_part_of_the_digest"),
+     "or boundary_change_is_refused or statement_source_is_part_of_the_digest "
+     "or boundary_document_change_with_same_arn or boundary_default_version_change"),
     (39, "枚举后新建的 principal 不算漂移", SCRIPT,
      '           "appeared": sorted(a[arn]["name"] for arn in set(a) - set(b)),',
      '           "appeared": [],',
@@ -276,8 +281,8 @@ MUTATIONS: list[tuple] = [
      '           "vanished": []}',
      "principal_vanishing_after_simulation_is_refused"),
     (41, "检测到漂移只打印警告、不抛（fail-open）", SCRIPT,
-     '        raise SystemExit(\n            f"本轮观测不是原子的',
-     '        print(\n            f"本轮观测不是原子的',
+     '        raise SystemExit(\n            f"本轮观测作废',
+     '        print(\n            f"本轮观测作废',
      "measure_refuses_a_non_atomic_round"),
     (42, "摘要里的语句不排序（顺序抖动会被误报成漂移）", SCRIPT,
      '         "statements": sorted(json.dumps([src, st], sort_keys=True, default=str)\n'
