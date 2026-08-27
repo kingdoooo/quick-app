@@ -25,6 +25,7 @@
    基线只存指纹，所以 CDK bootstrap 那几个**名字里嵌着账号 ID**的角色
    也能被盯住而不泄值。
 """
+import ast
 import copy
 import fnmatch
 import importlib.util
@@ -2648,3 +2649,247 @@ def test_baseline_platform_shape_matches_what_the_snapshot_produces():
         assert isinstance(shape["alias"], dict)
         for bucket in ("unqualified", "version"):
             assert isinstance(shape[bucket], list)
+
+
+# ==========================================================================
+# Codex 第七轮复审（2026-08-27，3b 推送前的 No-Go）：观测的**原子性**
+#
+# 闸门先 `GetAccountAuthorizationDetails` 拿全量名单（T1），再逐个
+# `SimulatePrincipalPolicy`（T2），两者之间约 10 分钟。B 组的语句抄自 T1、A 组的判定
+# 来自 T2 ⇒ 窗口内 IAM 变过的话，一份快照同时描述两个时刻的账号。
+#
+# 旧文档把这个窗口定性成"硬失败，所以只是可用性问题"。那句话是错的：`NoSuchEntity`
+# 只咬住"模拟时角色已经不在了"这一种 churn，下面四类它一种都咬不住。
+#
+# **三条实测事实**（都从生产 CloudTrail 查得，不是构造的场景）：
+#   ① 同名重建在本账号是常态：2026-08-27 有两个**固定名字**的角色各被重建 4 次，
+#      拿到 4 个不同的 RoleId、同一个 ARN ⇒ "同 ARN 不同代"不是理论情形。
+#   ② 那次写基线的运行（枚举 14:38:44–14:40:12、产物 14:47:05）窗口内有两条
+#      `PutRolePolicy` ⇒ 那一份快照**确实**混了两个时刻。只是恰好落在既不进 A
+#      也不进 B 的角色上，所以值没错——闸门当时无从知道这一点。
+#   ③ 7 天里 96.6% 的 10 分钟窗口是干净的 ⇒ 作废本轮不会把闸门变成永远红。
+# ==========================================================================
+
+def _principal(name, *, uid, statements=(), boundary=None, kind="role"):
+    """一个 `list_principals()` 形态的 principal。`statements` 是 `(来源, 语句)` 对。
+
+    假 `uid` **刻意不长得像真的 IAM 唯一 ID**（真的形如 `AROA…` / `AIDA…` 加 16 位大写
+    字母数字）。两道闸门都会咬住那种形态，而且咬得有道理：提交钩子的密钥检测按
+    `(AKIA|ASIA|AROA|AIDA)+16` 判成 AWS access key（实测 23 条 blocking finding），
+    `scan_staged_secrets.sh` 按 `[0-9]{12}` 找账号 ID。给测试 fixture 去放行这两道
+    （`secrets.allowed` / `--allow-hits`）是拿真闸门换一点像真度——不值得，而且
+    `uid` 是纯字符串比较，形态对判据毫无影响。真值也永远不会进仓库：它不进快照、
+    不进基线，只在进程内当判据。
+    """
+    return {"kind": kind, "name": name, "arn": f"arn:aws:iam::{_ACCT}:role/{name}",
+            "uid": uid, "statements": list(statements), "boundary_arn": boundary}
+
+
+def test_identical_listings_are_atomic():
+    """正向控制：两次枚举一模一样 ⇒ 零漂移。
+
+    少了这条，下面几条"应该红"的用例无法区分"检查器有效"与"检查器无条件红"。
+    """
+    g = _gate()
+    listing = [_principal("EdgeRole", uid="uid-edge-1",
+                          statements=[(None, _iam_stmt())]),
+               _principal("Kent", uid="uid-user-1", kind="user")]
+    assert g.enumeration_drift(listing, copy.deepcopy(listing)) == {}
+
+
+def test_same_arn_new_generation_is_refused():
+    """**Codex 反例①**：同 ARN、不同 RoleId，新一代还多一条 B-only 的 IAM 写语句。
+
+    这一类的危险在于 A 与 B 各自都"正常"：A 模拟的是新一代（模拟器按 ARN 找，
+    找到的就是新角色），B 抄的是旧一代的语句 ⇒ 新加的 IAM 写权限归 B 管而 B 没看见，
+    闸门可以退出 0。
+    """
+    g = _gate()
+    before = [_principal("Patrol", uid="uid-patrol-gen1",
+                         statements=[(None, _iam_stmt(action="logs:PutLogEvents"))])]
+    after = [_principal("Patrol", uid="uid-patrol-gen2",
+                        statements=[(None, _iam_stmt(action="logs:PutLogEvents")),
+                                    (None, _iam_stmt(action="iam:PutRolePolicy"))])]
+    drift = g.enumeration_drift(before, after)
+    assert "changed" in drift, drift
+    assert "Patrol" in drift["changed"][0]
+    assert "换代" in drift["changed"][0], f"没说清是换代：{drift['changed']}"
+
+
+def test_policy_mutated_on_existing_principal_is_refused():
+    """**这一类是 2026-08-27 真实发生的那一类**：uid 一字未变，只是窗口内被
+    `PutRolePolicy` 改了 inline 策略。
+
+    生产实据：14:41:28 与 14:43:17 两条 `PutRolePolicy` 落在那次运行的窗口内，
+    而这两个角色从头到尾没被删过 ⇒ 只比 uid 的检查器对这一类完全失明。
+    """
+    g = _gate()
+    before = [_principal("Logger", uid="uid-logger-unchanged",
+                         statements=[(None, _iam_stmt(action="s3:PutObject",
+                                                      resource="arn:aws:s3:::old/*"))])]
+    after = [_principal("Logger", uid="uid-logger-unchanged",
+                        statements=[(None, _iam_stmt(action="s3:PutObject",
+                                                     resource="arn:aws:s3:::new/*"))])]
+    drift = g.enumeration_drift(before, after)
+    assert "changed" in drift, drift
+    assert "Logger" in drift["changed"][0]
+
+
+def test_generation_id_alone_would_not_catch_the_policy_mutation():
+    """元测试：钉住"为什么摘要必须含语句，而不是只比 uid"。
+
+    这条是对上面那条的**反向**断言——两侧 uid 相等，所以任何只看 uid 的实现都会
+    判成"没变"。它会在有人把 `principal_auth_digest` 简化成"只比 uid"时变红。
+    """
+    g = _gate()
+    before = [_principal("Logger", uid="uid-logger-unchanged",
+                         statements=[(None, _iam_stmt(action="s3:PutObject"))])]
+    after = [_principal("Logger", uid="uid-logger-unchanged",
+                        statements=[(None, _iam_stmt(action="s3:PutObject")),
+                                    (None, _iam_stmt(action="iam:PutRolePolicy"))])]
+    assert before[0]["uid"] == after[0]["uid"], "前提搞错了：这条要的是 uid 相同"
+    assert g.enumeration_drift(before, after), "只比 uid 会漏掉这一类"
+
+
+def test_boundary_change_is_refused():
+    """boundary 换了也算授权输入变了——per-site 隔离整个建立在 boundary 上。"""
+    g = _gate()
+    before = [_principal("SiteRole", uid="uid-generic",
+                         boundary=f"arn:aws:iam::{_ACCT}:policy/Boundary")]
+    after = [_principal("SiteRole", uid="uid-generic", boundary=None)]
+    assert "changed" in g.enumeration_drift(before, after)
+
+
+def test_principal_created_after_enumeration_is_refused():
+    """**Codex 反例②**：T1 之后新建的 principal 整轮没被模拟 ⇒ 覆盖不全。
+
+    它可能带着新 grant，而"没模拟过"与"模拟过、没有权限"在输出上一模一样。
+    """
+    g = _gate()
+    before = [_principal("EdgeRole", uid="uid-edge-1")]
+    after = before + [_principal("site-rt-notes-abc123", uid="uid-site-rt-new")]
+    drift = g.enumeration_drift(before, copy.deepcopy(after))
+    assert drift.get("appeared") == ["site-rt-notes-abc123"], drift
+
+
+def test_principal_vanishing_after_simulation_is_refused():
+    """模拟完成后才消失的 principal 也作废本轮。
+
+    方向上这是**多报**（快照里留着一个已经不存在的 principal，藏不住新权限），
+    但仍然不放行：一轮观测要么描述一个时刻，要么不算权威。给"缩小是安全的"开口子
+    正是历次 false-green 的共同形状。
+    """
+    g = _gate()
+    before = [_principal("EdgeRole", uid="uid-edge-1"),
+              _principal("site-rt-gone-1", uid="uid-site-rt-gone")]
+    after = [_principal("EdgeRole", uid="uid-edge-1")]
+    assert g.enumeration_drift(before, after).get("vanished") == ["site-rt-gone-1"]
+
+
+def test_digest_ignores_statement_order():
+    """语句顺序抖动**不算**漂移。
+
+    AWS 不保证两次返回同一份策略的语句顺序一致。把顺序判成漂移会让闸门随机红，
+    而反复的假红会训练出"红了就重跑到绿为止"——那时真漂移也会被重跑掉。
+    """
+    g = _gate()
+    a = _iam_stmt(action="iam:PutRolePolicy")
+    b = _iam_stmt(action="s3:GetObject")
+    p1 = _principal("R", uid="uid-generic", statements=[(None, a), (None, b)])
+    p2 = _principal("R", uid="uid-generic", statements=[(None, b), (None, a)])
+    assert g.principal_auth_digest(p1) == g.principal_auth_digest(p2)
+    assert g.enumeration_drift([p1], [p2]) == {}
+
+
+def test_statement_source_is_part_of_the_digest():
+    """同一条语句从 inline 挪进托管策略（或反之）也算变化——来源决定它由哪份
+    policy 的版本解释，B 的 `managed_versions` 会跟着变。"""
+    g = _gate()
+    st = _iam_stmt()
+    inline = _principal("R", uid="uid-generic", statements=[(None, st)])
+    managed = _principal("R", uid="uid-generic",
+                         statements=[(f"arn:aws:iam::{_ACCT}:policy/P", st)])
+    assert g.principal_auth_digest(inline) != g.principal_auth_digest(managed)
+
+
+def test_list_principals_records_uid_for_roles_and_users():
+    """`uid` 必须真的被填上。
+
+    漏填的后果是**静默的**：两侧都是 `None`（或都缺键）时换代检测永远说"没变"，
+    而输出与"账号真的很安静"一模一样。所以这里钉住 `list_principals` 的产出。
+    """
+    g = _gate()
+
+    class _Paginator:
+        def paginate(self, **kw):
+            return [{"RoleDetailList": [
+                        {"RoleName": "R", "RoleId": "uid-role-1",
+                         "Arn": f"arn:aws:iam::{_ACCT}:role/R", "Path": "/",
+                         "RolePolicyList": [], "AttachedManagedPolicies": []}],
+                     "UserDetailList": [
+                        {"UserName": "U", "UserId": "uid-user-2",
+                         "Arn": f"arn:aws:iam::{_ACCT}:user/U", "Path": "/",
+                         "UserPolicyList": [], "AttachedManagedPolicies": [],
+                         "GroupList": []}],
+                     "GroupDetailList": [], "Policies": []}]
+
+    class _Iam:
+        def get_paginator(self, name):
+            return _Paginator()
+
+    out = g.list_principals(_Iam())
+    uids = {p["name"]: p["uid"] for p in out["principals"]}
+    assert uids == {"R": "uid-role-1", "U": "uid-user-2"}
+
+
+def test_uid_never_reaches_the_baseline():
+    """`uid` 是**进程内**的判据，不进快照也不进基线。
+
+    合法重建每天都发生（实测两个角色名当天各 4 次），把 uid 写进基线等于每天红一次
+    而没有任何安全含义——那种噪音会训练出无脑 `--update-baseline`。
+    两条断言：① 基线文件里没有 `uid` 这个键；② 快照合同 `BUNDLE_SHAPE` 也不接受它
+    （递归默认拒绝，所以只要没写进合同就一定进不去）。
+    """
+    g = _gate()
+    raw = _BASELINE.read_text(encoding="utf-8")
+    assert '"uid"' not in raw, "基线里出现了 uid ——它会随合法重建每天变一次"
+    assert "uid" not in g.BUNDLE_SHAPE["principals"]["*"], \
+        "uid 进了快照合同——那条路会把它带进基线"
+
+
+def test_measure_refuses_a_non_atomic_round():
+    """**接线测试**：纯函数存在但没人调用，是这类闸门最经典的 false-green。
+
+    按 AST 钉住 `measure()` 里三件事：① 复查真的又枚举了一次（`list_principals`
+    出现 ≥2 次）；② 调了 `enumeration_drift`；③ 它的返回值为真时**抛 SystemExit**，
+    而不是打印一条警告继续走。
+
+    这条只证明**接线**，不证明语义——语义由上面那些用例证明。两层都要。
+    """
+    g = _gate()
+    tree = ast.parse(_SCRIPT.read_text(encoding="utf-8"))
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "measure")
+    calls = [c.func.id for c in ast.walk(fn)
+             if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)]
+    assert calls.count("list_principals") >= 2, \
+        f"measure() 只枚举了 {calls.count('list_principals')} 次——没有复查这一次"
+    assert "enumeration_drift" in calls, "measure() 没调 enumeration_drift"
+
+    # 找 `<名字> = enumeration_drift(...)`，再确认 `if <名字>:` 的分支里有 raise
+    target = None
+    for node in ast.walk(fn):
+        if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id == "enumeration_drift"
+                and isinstance(node.targets[0], ast.Name)):
+            target = node.targets[0].id
+    assert target, "enumeration_drift 的返回值没被赋给任何变量（结果被丢掉了？）"
+    guarded = [n for n in ast.walk(fn)
+               if isinstance(n, ast.If) and isinstance(n.test, ast.Name)
+               and n.test.id == target]
+    assert guarded, f"没有 `if {target}:` 分支——漂移检测的结果没被判断"
+    raises = [r for n in guarded for r in ast.walk(n)
+              if isinstance(r, ast.Raise) and isinstance(r.exc, ast.Call)
+              and isinstance(r.exc.func, ast.Name) and r.exc.func.id == "SystemExit"]
+    assert raises, "检测到漂移后没有 raise SystemExit——那是 fail-open"

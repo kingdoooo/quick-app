@@ -501,8 +501,10 @@ exit "$m01_rc"
 `verify_console_e2e.py` + `smoke_router.sh`（控制台与路由层）。
 
 **还有一条不属于任何部署步骤的闸门**：`verify_account_trust_boundary.py`
-（只读；**A 直接失守 + B IAM 写静态快照**两层；400 个 principal × 2 次 IAM 模拟 + 一次
-`GetAccountAuthorizationDetails` 静态收语句 + 扫 bootstrap 桶 + 逐版本校验 Edge 代码，实测 9±1 分钟）。它盯的不是
+（只读；**A 直接失守 + B IAM 写静态快照**两层；400 个 principal × 2 次 IAM 模拟 + **两次**
+`GetAccountAuthorizationDetails`（第一次静态收语句，第二次是模拟后的**原子性复查**——枚举与模拟
+之间约 10 分钟，窗口内 IAM 变过就作废本轮、不出结论也不写基线）+ 扫 bootstrap 桶 + 逐版本校验
+Edge 代码，实测 11m33s）。它盯的不是
 "这次部署对不对"，而是**这个 AWS 账号里能冒充任意用户的授权面有没有变大**——该面
 关不掉（管理账号 SCP 无效、Lambda 无 Deny API、对称签名的根就是那把可被只读权限
 取得的 HS256 密钥），所以纪律是"别再长"。它的形状是「一种能力 = 一个**动作等价类** × 一个**资源等价类**」——把它压成单个动作或

@@ -1286,6 +1286,61 @@ def resolve_managed_policy(iam, arn: str, *, docs: dict, versions: dict):
     return doc, ver
 
 
+def principal_auth_digest(p: dict) -> str:
+    """一个 principal 在本轮里被用到的**全部授权输入** → 稳定摘要。
+
+    覆盖 `uid`、boundary ARN、以及**带来源的全部语句**。为什么是"全部语句"而不是
+    "`is_relevant_iam_statement` 挑出来的那些"：A 组是模拟器在 T2 对**完整**策略
+    求值的结果，B 组是 T1 抄下来的相关语句。只要任何一条语句在窗口内变过，这两组
+    就来自两个不同的账号状态——那条语句本身相不相关，不改变"这份快照混了两个时刻"
+    这个事实。按"相关"过滤会把判据缩得比主语窄，而这份文档的数字已经被同一个形状的
+    错误推翻过四次。
+
+    语句先各自序列化再**排序**：AWS 两次返回同一份策略的语句顺序不保证一致，不排序
+    会把顺序抖动误报成漂移，而反复的假红会训练出"红了就重跑到绿为止"。
+
+    **一件不声称的事**：托管策略的 `DefaultVersionId` 本身不在摘要里。语句是从默认
+    版本解析出来的，所以"换版本且语句变了"照样会红；只有"换了版本、语句逐字相同"
+    这一种会被判成没变——那种情况下快照里记的版本号会陈旧一轮，下一轮自己会红出来，
+    而权限面确实没动过。写在这里是为了别让人把这道复查读成"托管策略版本也锁住了"。
+    """
+    payload = json.dumps(
+        {"kind": p["kind"], "uid": p["uid"], "boundary": p["boundary_arn"],
+         "statements": sorted(json.dumps([src, st], sort_keys=True, default=str)
+                              for src, st in p["statements"])},
+        sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def enumeration_drift(before: list[dict], after: list[dict]) -> dict[str, list[str]]:
+    """模拟前后两次枚举 → **分类**后的漂移原因。空 dict = principal 层窗口内没变过。
+
+    三类分开报，是因为操作者要能一眼分辨是哪种 churn：站点部署/下线会造出与销毁
+    `site-rt-*`（平台自己的行为），另一套 workload 会同名重建。只说一句"本轮作废"
+    会让人以为闸门坏了。
+
+    **三类都作废本轮**，包括看起来"安全"的那两类：
+    - `changed`：同一个 principal 的 A 与 B 来自两代 ⇒ 直接的 false-negative。
+    - `appeared`：T1 之后新建的 principal 整个没被模拟 ⇒ 覆盖不全，它可能带新 grant。
+    - `vanished`：模拟完成后才消失 ⇒ 快照里报着一个已经不存在的 principal。这一类
+      方向上是**多报**（不会藏住新权限），但仍作废：一轮观测要么描述一个时刻，
+      要么不算权威。给"缩小是安全的"这类单独放行开一个口子，正是历次 false-green
+      的共同形状。
+    """
+    b = {p["arn"]: p for p in before}
+    a = {p["arn"]: p for p in after}
+    changed = []
+    for arn in sorted(set(b) & set(a)):
+        if b[arn]["uid"] != a[arn]["uid"]:
+            changed.append(f"{b[arn]['name']}（同 ARN 换代：uid 变了）")
+        elif principal_auth_digest(b[arn]) != principal_auth_digest(a[arn]):
+            changed.append(f"{b[arn]['name']}（策略/boundary 在窗口内被改）")
+    out = {"changed": changed,
+           "appeared": sorted(a[arn]["name"] for arn in set(a) - set(b)),
+           "vanished": sorted(b[arn]["name"] for arn in set(b) - set(a))}
+    return {k: v for k, v in out.items() if v}
+
+
 def list_principals(iam) -> dict:
     """非 service-linked 角色 + 全部 IAM 用户，**连语句、boundary、托管策略版本一起收**。
 
@@ -1331,15 +1386,23 @@ def list_principals(iam) -> dict:
     for arn in sorted(referenced):
         resolve_managed_policy(iam, arn, docs=docs, versions=versions)
 
+    # `uid`（RoleId / UserId）是**换代检测**的唯一依据：同名同路径的角色被删了重建，
+    # ARN 一模一样而 uid 必然是新的。本账号里这不是理论情形——实测 2026-08-27 有两个
+    # 固定名字的角色各被重建 4 次、拿到 4 个不同的 RoleId。只比 ARN 的话，
+    # 「T1 抄的语句」与「T2 模拟的那个角色」可能属于两代，见 `enumeration_drift`。
+    # uid **只在进程内用**、不进快照也不进基线：合法重建每天都发生，把它写进基线
+    # 等于每天红一次而没有任何安全含义，那种噪音会训练出无脑更新基线。
     out = []
     for r in roles:
         out.append({"kind": "role", "name": r["RoleName"], "arn": r["Arn"],
+                    "uid": r["RoleId"],
                     "statements": statements_for_entity(r, "RolePolicyList",
                                                         managed=docs, versions=versions),
                     "boundary_arn": (r.get("PermissionsBoundary") or {})
                                     .get("PermissionsBoundaryArn")})
     for u in users:
         out.append({"kind": "user", "name": u["UserName"], "arn": u["Arn"],
+                    "uid": u["UserId"],
                     "statements": statements_for_user(u, groups=groups, managed=docs,
                                                       versions=versions),
                     "boundary_arn": (u.get("PermissionsBoundary") or {})
@@ -1697,6 +1760,34 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
         # 一模一样。这里必须硬失败。
         raise SystemExit(f"{len(failures)} 个 principal 模拟失败，结果不完整："
                          f"{failures[:3]}")
+
+    # ---- 观测的原子性：枚举(T1) → 逐个模拟(T2) 之间有约 10 分钟窗口 ----
+    # B 组是 T1 抄下来的静态语句，A 组是 T2 模拟出来的判定。窗口内有人改了某个
+    # principal 的策略、或把同名角色删了重建，这一份快照就同时描述两个时刻，而
+    # 「B 里没有这条 IAM 写语句」与「这条语句是 T1 之后才加的」在输出上一模一样。
+    # 上一个 `failures` 只咬住"模拟时角色已经不在了"这一种 churn，咬不住这一类。
+    #
+    # **这不是理论风险，实测发生过**：2026-08-27 那次写基线的运行，窗口内有两条
+    # `PutRolePolicy`（CloudTrail 可查），只是恰好落在既不进 A 也不进 B 的角色上
+    # ⇒ 值没错，但"这是一个时刻的快照"这句话当时是假的。
+    #
+    # 复查的代价是再做一次 `GetAccountAuthorizationDetails`（实测约 1.5 分钟）。
+    # 它**只覆盖 principal 层**：函数清单、alias、resource policy、asset 各自在自己
+    # 的时刻测得，跨层不保证原子——别把这道复查读成"整轮都原子了"。
+    drift = enumeration_drift(principals, list_principals(iam)["principals"])
+    if drift:
+        detail = "；".join(f"{k}: {', '.join(v[:5])}"
+                          + (f" 等 {len(v)} 个" if len(v) > 5 else "")
+                          for k, v in drift.items())
+        raise SystemExit(
+            f"本轮观测不是原子的——枚举与模拟之间 principal 层发生了变化，"
+            f"这份快照会同时描述两个时刻的账号，不能出结论也不能写基线。"
+            f"漂移：{detail}。"
+            f"（站点部署/下线会产生 `site-rt-*` 的增减；账号里另一套 workload 会同名"
+            f"重建角色。等账号静默下来重跑即可——实测 7 天里 96.6% 的 10 分钟窗口是"
+            f"干净的。）")
+    print(f"复查枚举：principal 层的授权投影与模拟前一致（{len(principals)} 个）",
+          file=sys.stderr)
 
     facts["principals_with_missing_context"] = n_missing
     return {# 快照带 schema 与完整性标记：`--from-dump` 要能拒绝旧形态与不完整的快照
