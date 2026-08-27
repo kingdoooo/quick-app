@@ -189,7 +189,10 @@ def test_preprocessor_failure_refuses_to_pass(tmp_path, mode):
     assert "提取失败" in r.stderr
 
 
-# ── --range 路径（原来一条测试都没有）──────────────────────────────────────
+# ── --range 路径（diff 来源）─────────────────────────────────────────────
+# 这个小标题从前写着「原来一条测试都没有」。**别再照抄那句**：它说的是更早一轮的
+# 状态，而它自己下面就有 3 条用例——我照抄它写进过一条提交信息，被外部复审逐字纠正。
+# commit message 那个来源的用例在下一节。
 def test_range_mode_decorator_is_not_a_hit(tmp_path):
     repo = _repo(tmp_path)
     _stage(repo, "t.py", '@pytest.mark.parametrize("l", ["a"])\n')
