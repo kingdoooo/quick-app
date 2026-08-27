@@ -50,6 +50,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "site-builder/scripts/verify_account_trust_boundary.py"
 TESTS = ROOT / "site-builder/deployer/tests/test_verify_account_trust_boundary.py"
+# 口径守卫管的是 tracked 文档，所以变形也要能改文档——否则那道守卫的反向验证只能靠
+# 一次性 shell，而"验证证据不可复跑就等于没有证据"是这个仓库自己的规矩。
+DEPLOY_MD = ROOT / "site-builder/DEPLOY.md"
 PYTEST = ROOT / "site-builder/deployer/.venv/bin/pytest"
 
 # (编号, 说明, 目标文件, 原文, 改成, 期望红的用例 -k 表达式)
@@ -314,6 +317,21 @@ MUTATIONS: list[tuple] = [
      '        srcs = {src for src, _ in entry["statements"] if src is not None}',
      '        srcs = set()',
      "list_principals_records_boundary_statements"),
+    # ---- Codex 第十轮：两个守卫旁路 -----------------------------------------
+    (48, "DEPLOY.md 的口径写回「原子性复查」（守卫原先只读三份，漏了它）", DEPLOY_MD,
+     "**窗口两端一致性复查**",
+     "**原子性复查**",
+     "docs_do_not_claim_atomic_observation"),
+    (49, "盲区用例改名，只留一行注释形态的假 def（旧守卫在数文本，会被这招骗过）", TESTS,
+     "def test_pagination_window_is_a_known_blind_spot():",
+     "# def test_pagination_window_is_a_known_blind_spot(\n"
+     "def _disabled_pagination_blind_spot():",
+     "blind_spot_tests_exist"),
+    (50, "给盲区用例挂 @pytest.mark.skip（被收集但不执行 = 没有断言）", TESTS,
+     "def test_pagination_window_is_a_known_blind_spot():",
+     "@pytest.mark.skip(reason=\"变形\")\n"
+     "def test_pagination_window_is_a_known_blind_spot():",
+     "blind_spot_tests_exist"),
 ]
 
 
@@ -358,7 +376,12 @@ def why_not_loadable(path: Path) -> str | None:
 
     **闸门脚本语法错误在 pytest 里记成 `1 failed`（实测 rc=1）**，与守卫真的红了
     逐字同形。所以必须单独证一次，否则"把文件改坏"会被当成证据。
+
+    Markdown 之类的非 Python 目标没有这个问题（没人 import 它们，改坏了只会让读它的
+    那条断言红——而那正是被验证的守卫本身），所以这一关对它们不适用，直接放行。
     """
+    if path.suffix != ".py":
+        return None
     if path == SCRIPT:
         code = ("import importlib.util,sys;"
                 "s=importlib.util.spec_from_file_location('_m',r'%s');"
@@ -387,12 +410,15 @@ def main() -> int:
             print(f"  {num:>3}  [{path.name:38}] {desc}")
         return 0
 
-    dirty = subprocess.run(["git", "status", "--porcelain", "--", str(SCRIPT), str(TESTS)],
+    # 清洁检查的文件集合**从 MUTATIONS 派生**，不硬编码。硬编码时新增一个目标文件
+    # （比如 DEPLOY.md）会让它带着未提交改动被变形又还原，等于悄悄丢掉你的改动。
+    targets = sorted({str(m[2]) for m in MUTATIONS})
+    dirty = subprocess.run(["git", "status", "--porcelain", "--", *targets],
                            cwd=ROOT, capture_output=True, text=True).stdout.strip()
     if dirty:
-        # 变形会临时改这两个文件再还原；带着未提交改动跑，一旦中途被杀就分不清
+        # 变形会临时改这些文件再还原；带着未提交改动跑，一旦中途被杀就分不清
         # 哪些是你的改动、哪些是变形残留。
-        raise SystemExit(f"这两个文件有未提交改动，先提交或 stash：\n{dirty}")
+        raise SystemExit(f"这些文件有未提交改动，先提交或 stash：\n{dirty}")
 
     print(f"共 {len(todo)} 条变形。每条都必须让对应守卫**红**——不红即守卫是假的。\n")
     fails = []

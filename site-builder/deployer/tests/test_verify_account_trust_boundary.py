@@ -31,6 +31,7 @@ import fnmatch
 import importlib.util
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -3087,56 +3088,105 @@ def test_pagination_window_is_a_known_blind_spot():
     assert before_change not in [st for _, st in principal["statements"]]
 
 
-# 三份文档的口径守卫 + 数量自查。**判据为什么要覆盖三份**（Codex 第八轮）：
-# 上一版只读 `account-trust-boundary.md`，于是 `CLAUDE.md` 里残留的「原子性复查」
-# 整整过了一轮没被抓到——而 CLAUDE.md 恰恰是 Agent 的操作入口，那句话会让后续执行者
-# 把「窗口两端一致」重新读成原子保证。**守卫的主语必须与声明出现的范围一样宽。**
+# 口径守卫。**判据的主语必须与声明出现的范围一样宽**——这一条被绕过两次了：
+#   第一次：守卫只读风险文档，`CLAUDE.md` 里残留的「原子性复查」过了一整轮；
+#   第二次：守卫读三份，而 `site-builder/DEPLOY.md` 同样写着这道复查的操作口径
+#           ⇒ 复审把它改回「原子性复查」，守卫照样 1 passed。
+# 所以不再手写文件名单：**从 git 派生**——凡是 tracked 的 `*.md` 里提到这道闸门的，
+# 都在范围内。手写名单必然滞后于文档增长，而派生集合会自动跟上（实测这一改把范围从
+# 3 份扩到 6 份，其中两份是我从没列过的：merged review 与 3b 的 plan）。
 _ATOMIC_OVERCLAIMS = ("原子性复查", "观测原子性", "本轮观测是原子的",
                       "整轮都原子", "原子快照", "原子性检查")
-# 三个盲区各自的点名判据。**逐个列出**而不是只查"盲区"两个字：实测把盲区②整段删掉，
-# 只查"改回 / 分页"的旧守卫仍然 1 passed。
+# 派生用的锚点。用**闸门自己的名字**当锚，而不是用"两端"这种收窄后的措辞——后者会让
+# 一份把口径改回原子、同时删掉"两端"的文档**掉出范围**，那正好是要抓的那种改动。
+_GATE_DOC_ANCHORS = ("verify_account_trust_boundary", "信任边界闸门", "账号信任边界")
+# 派生集合的**下限**：这四份是操作入口，必须始终在范围里。没有这道下限，`git ls-files`
+# 哪天返回空（不在仓库里跑、路径变了）会让整层静默变成空循环 ⇒ 全绿。
+# 这是本仓库反复吃到的那一类：**单向/派生的判据必须由一份显式下限兜住。**
+_GATE_DOC_FLOOR = ("CLAUDE.md", "site-builder/DEPLOY.md",
+                   "docs/security/account-trust-boundary.md",
+                   "docs/superpowers/specs/"
+                   "2026-08-27-codebuild-bootstrap-read-narrowing-spec.md")
 # 判据取每个盲区**独有的机制描述**，不取单个词。实测教训：第一版用的是「改回」与
 # 「分页」这种短词，而文档别处也在说这两件事（boundary 那段就写着"不需要'改了又改回来'
 # 那种巧合"）⇒ 把盲区①整段删掉，守卫照样 2 passed。**判据比主语弱和比主语窄一样危险。**
 _BLIND_SPOTS = (("恢复成与 T1 逐字相同", "①改了又改回来（ABA）"),
                 ("复查前删除", "②枚举后新建、复查前删除"),
                 ("翻页期间的变化不可见", "③单次枚举自己不是一个时刻"))
+# 三个盲区对应的用例名。**与 `_BLIND_SPOTS` 同长**，由下面那条守卫按运行时对象核对。
+_BLIND_SPOT_TESTS = ("test_change_then_revert_is_a_known_blind_spot",
+                     "test_created_then_deleted_between_enumerations_is_a_known_blind_spot",
+                     "test_pagination_window_is_a_known_blind_spot")
+
+
+def _tracked_docs_mentioning_the_gate() -> dict[str, str]:
+    """→ `{仓库相对路径: 正文}`，取全部 tracked `*.md` 里提到这道闸门的那些。
+
+    用 `git ls-files` 而不是 `rglob`：只有被跟踪的文件会随仓库分发，而 `docs/design/`
+    那些 gitignored 的过程记录不该被这道守卫管（新 clone 里根本没有）。
+    """
+    out = subprocess.run(["git", "ls-files", "*.md"], cwd=_ROOT,
+                         capture_output=True, text=True, check=True)
+    docs = {}
+    for rel in out.stdout.split():
+        text = (_ROOT / rel).read_text(encoding="utf-8")
+        if any(anchor in text for anchor in _GATE_DOC_ANCHORS):
+            docs[rel] = text
+    return docs
 
 
 def test_docs_do_not_claim_atomic_observation():
-    """三份 tracked 文档都不许把这道复查说成"原子"；结论真源必须点名全部三个盲区。
+    """凡是提到这道闸门的 tracked 文档，都不许把它说成"原子"；结论真源必须点名三个盲区。
 
     判据是**成对的**：既不许出现过宽说法，也必须写着收窄后的口径与三个盲区——
     只做黑名单 grep 的话，把整段删掉也能过。
     """
-    claude_md = (_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
-    truth = _DOC.read_text(encoding="utf-8")
-    spec = (_ROOT / "docs" / "superpowers" / "specs"
-            / "2026-08-27-codebuild-bootstrap-read-narrowing-spec.md"
-            ).read_text(encoding="utf-8")
-    for label, text in (("CLAUDE.md", claude_md),
-                        ("account-trust-boundary.md", truth),
-                        ("3b spec", spec)):
+    docs = _tracked_docs_mentioning_the_gate()
+    for must in _GATE_DOC_FLOOR:
+        assert must in docs, (
+            f"{must} 掉出了守卫范围（派生集合只有 {sorted(docs)}）"
+            f"——是锚点没命中，还是 git ls-files 没跑起来？")
+    for rel, text in sorted(docs.items()):
         for overclaim in _ATOMIC_OVERCLAIMS:
             assert overclaim not in text, \
-                f"{label} 里还留着过宽的说法：{overclaim!r}"
-    # 结论真源要写清收窄后的口径，并逐个点名三个盲区
+                f"{rel} 里还留着过宽的说法：{overclaim!r}"
+    truth = docs["docs/security/account-trust-boundary.md"]
     assert "两端" in truth, "风险文档没写收窄后的口径（窗口两端一致）"
     for needle, what in _BLIND_SPOTS:
         assert needle in truth, f"风险文档没点名这个盲区：{what}（找不到 {needle!r}）"
-    # CLAUDE.md 是操作入口：至少要让读者知道这道复查的口径是"两端"，而不是原子
-    assert "两端" in claude_md, "CLAUDE.md 没写这道复查的口径是「两端一致」"
+    # 两个操作入口至少要让读者知道这道复查的口径是"两端"，而不是原子
+    for rel in ("CLAUDE.md", "site-builder/DEPLOY.md"):
+        assert "两端" in docs[rel], f"{rel} 没写这道复查的口径是「两端一致」"
 
 
-def test_blind_spot_test_count_matches_the_documented_claim():
-    """文档写"三个盲区各有一条用例"——这里数一遍实际有几条。
+def test_blind_spot_tests_exist_and_will_actually_run():
+    """三个盲区各有一条**真的会跑**的用例。
 
-    上一轮这句话与现实差了一条（只有两条，缺分页那个）而没人抓到。
-    **数量声明本身也要有守卫**：它和"14 个由基线断言的数字"是同一类，
-    写下一个计数就等于开了一张需要兑现的支票。
+    上一版按源码正则数 `def test_..._is_a_known_blind_spot(` 的条数——那是**在数文本**。
+    复审实测的绕法：把用例改名，再补一行注释
+    `# def test_pagination_window_is_a_known_blind_spot(`
+    ⇒ 计数仍是 3、守卫仍然过，而 `--collect-only` 只列出 2 条。**同一个形状第四次**：
+    判据（源码文本）比主语（真的会跑的用例）弱。
+
+    所以这里不看文本，看**运行时的模块对象**：
+      ① 三个名字都必须在模块全局里且可调用——注释掉的 `def` 不在 globals 里、
+         改了名的在期望名字下找不到、嵌在别的函数里的也不在 globals 里；
+      ② 按**名字集合等值**比，不只数个数（数量对而名字换了照样是漏了一个盲区）；
+      ③ 不许带 skip / skipif / xfail——被收集但不执行等于没有断言；
+      ④ 反向再查一次：没有名单外的第四条盲区用例游离着。
     """
-    src = Path(__file__).read_text(encoding="utf-8")
-    n = len(re.findall(r"def test_\w+_is_a_known_blind_spot\(", src))
-    assert n == len(_BLIND_SPOTS), (
-        f"盲区用例实际 {n} 条，而 `_BLIND_SPOTS` 与文档都写着 {len(_BLIND_SPOTS)} 个盲区"
-        f"——两者必须同时改")
+    assert len(_BLIND_SPOT_TESTS) == len(_BLIND_SPOTS), \
+        "盲区名单与用例名单不同长——两者必须同时改"
+    g = globals()
+    found = {n for n in _BLIND_SPOT_TESTS if callable(g.get(n))}
+    assert found == set(_BLIND_SPOT_TESTS), (
+        f"盲区用例缺失或被改名：少了 {sorted(set(_BLIND_SPOT_TESTS) - found)}"
+        f"——文档写着{len(_BLIND_SPOTS)}个盲区各有一条用例")
+    stray = {n for n, v in g.items()
+             if n.startswith("test_") and n.endswith("_is_a_known_blind_spot")
+             and callable(v)} - set(_BLIND_SPOT_TESTS)
+    assert not stray, f"有盲区用例不在名单里：{sorted(stray)}——名单与文档要同时更新"
+    for n in _BLIND_SPOT_TESTS:
+        bad = [m.name for m in getattr(g[n], "pytestmark", [])
+               if m.name in ("skip", "skipif", "xfail")]
+        assert not bad, f"{n} 带着 {bad} 标记——被收集但不执行，等于没有断言"
