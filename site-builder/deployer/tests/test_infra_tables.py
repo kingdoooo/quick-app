@@ -1,4 +1,10 @@
-"""CDK 模板断言：二期新增的表与索引必须存在，且 step Lambda 拿到 ADMINS_TABLE。
+"""CDK 模板断言：二期新增的表与索引、以及 CodeBuild buildspec 的交付方式与
+PackageProject 角色的**全部** IAM 语句。
+
+**本文件是仓库里唯一看"真 synth 出来的模板"的地方**，所以凡是"源码 AST 看不见"的断言都
+归这里（CDK 自动生成的 IAM 语句就属于这一类）。语义反例**不在**这里——它们跑在
+`test_security_contracts.py` 的手写 fixture 上（always-on、无 Docker、内存注入）；
+本文件的职责是证明**真模板**也满足同样那几个检查器，也就是替手写 fixture 兜住"与现实漂移"。
 
 **opt-in（默认 skip）**：本文件要 synth 整个 stack，而 step Lambda 用
 Code.from_asset(bundling=...) —— synth 阶段就会起 Docker 装 psycopg。
@@ -22,6 +28,7 @@ import pytest
 
 INFRA = Path(__file__).parents[1] / "infra"
 CONFIG = Path(__file__).parents[2] / "config.ini"
+BUILDSPEC = Path(__file__).parents[1] / "buildspec-package.yml"
 
 pytestmark = [
     pytest.mark.skipif(os.environ.get("SB_CDK_TESTS") != "1",
@@ -1340,3 +1347,19 @@ def test_rollup_runs_daily_and_has_a_dlq(template):
     assert props["State"] == "ENABLED"
     target = props["Targets"][0]
     assert "DeadLetterConfig" in target, "rollup 的 target 没有 DLQ"
+
+
+# ── 真模板必须满足与手写 fixture 同样的检查器 ────────────────────────────
+# **这里不再自己写判据**：判据与反例都在 security_contracts.py / test_security_contracts.py，
+# 本文件只负责把它们指向真 synth 出来的模板。上一版让人"手工把 app.py 改回 from_asset 跑
+# 一次"来证明断言能红——那既不可复跑，又违反了"不改工作树"这条它自己给出的理由；现在
+# 能红由内存反例证明（含 test_pre_change_template_is_rejected 那条负向控制）。
+def test_real_template_package_project_s3_is_exactly_two_permissions(template):
+    from security_contracts import package_project_s3_violations
+    assert package_project_s3_violations(template.to_json()) == []
+
+
+def test_real_template_buildspec_is_inlined_byte_for_byte(template):
+    from security_contracts import buildspec_template_violations
+    assert buildspec_template_violations(
+        template.to_json(), BUILDSPEC.read_bytes()) == []

@@ -186,3 +186,24 @@ def test_buildspec_template_rejects_each_counterexample(label):
         t["Resources"][PRJ]["Properties"]["Source"]["BuildSpec"] = \
             want.decode("utf-8")[:-1]
     assert buildspec_template_violations(t, want), f"**没红**：{label}"
+
+
+# ── `app.py` 的 import 必须无副作用 ──────────────────────────────────────
+# **放在 always-on 这边而不是 opt-in 那边**（与计划原文的一处修正）：它是纯 AST 判据、
+# 不需要 aws_cdk 也不需要 Docker，而计划里把它写成了要 `template` fixture 的用例，
+# 那会为一条不需要 synth 的断言白起一次 Docker synth。
+def test_importing_app_has_no_side_effects():
+    """`app.py` 顶层的 `App()/synth()` 必须在 `__main__` 守卫之下。
+
+    没有这条守卫时 `import app` 就 synth 整个栈并触发 Lambda bundling，于是任何想 import
+    本模块的单测都被迫依赖 Docker，而 `test_infra_tables.py` 的 fixture 更是 import 时
+    synth 一次、自己再建 App synth 一次。判据取**源码结构**——真去 import 一次反而会把
+    这条守卫变成需要 Docker 的用例。
+    """
+    import ast
+    src = (Path(__file__).parents[1] / "infra" / "app.py").read_text(encoding="utf-8")
+    bad = [n.lineno for n in ast.parse(src).body
+           if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
+           and getattr(getattr(n.value.func, "value", None), "id", None) == "app"]
+    assert not bad, f"app.py 顶层仍有 app.<...>() 调用（第 {bad} 行）——import 会 synth"
+

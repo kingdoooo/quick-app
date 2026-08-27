@@ -79,6 +79,12 @@ VALIDATE_EPHEMERAL_MB = 1024
 # （更糟）Deny 落空而没人知道。绑在一个常量上让这一类错在**结构上**不成立。
 VALIDATED_PREFIX = _validate_const("VALIDATED_PREFIX")
 
+# CodeBuild 的 buildspec：**逐字节内联**进模板，不走 CDK asset（理由见 _InlineBuildSpec）。
+# `read_bytes().decode("utf-8")` 而不是 `read_text()`：后者走文本模式会做换行归一化，
+# 那样"模板里的字符串重新编码后等于文件原始字节"这条断言就不再在任何平台成立。
+# （实测本文件今天是纯 LF，两种读法结果相同——这是稳健性措施，不是在修现存 bug。）
+BUILDSPEC_PATH = Path(__file__).parents[1] / "buildspec-package.yml"
+
 EDGE_LOG_GROUP_PREFIX = _rollup_const("EDGE_LOG_GROUP_PREFIX")
 ROLLUP_METRIC_NAMESPACE = _rollup_const("METRIC_NAMESPACE")
 ROLLUP_METRIC_NAME = _rollup_const("METRIC_NAME")
@@ -142,6 +148,36 @@ PLATFORM_FUNCTION_NAMES = (
     "site-deployer-provision_dynamodb", "site-deployer-undeploy",
     "site-deployer-reconcile-job", "site-deployer-sweep-jobs",
 )
+
+
+class _InlineBuildSpec(cb.BuildSpec):
+    """把仓库里的 buildspec 原文**逐字节**内联进 CodeBuild Project。
+
+    **为什么不用 `cb.BuildSpec.from_asset()`**：CDK 会给项目角色授**整桶**读
+    （`Asset.grantRead()` 授的是桶，不是那一个对象），而同一个 CDK bootstrap 桶里有
+    9 个仍带明文会话签名密钥的 Edge asset —— 而本项目跑的正是不可信站点的依赖安装。
+    那条权限的唯一用途是取这份 buildspec 自己，内联之后它整条消失。
+
+    **为什么不先解析成 dict**（`from_object` / `from_object_to_yaml`）：那会把文件
+    重新序列化，注释全丢 —— 而 `--ignore-scripts` 为什么必需、`.npmrc` 为什么要先删，
+    理由就写在注释里。重新序列化还让 `version: 0.2`（YAML float）往返一次，等价性
+    只能靠真跑一次构建来证明；一条纯收权的改动不该承担那个风险。
+
+    `is_immediate` 与 `to_build_spec()` 都是 `BuildSpec` 的**公开** abstract 成员
+    （aws-cdk-lib 2.262.1 实测），不是私有接口。`is_immediate` 必须为 True，
+    否则 CDK 不会把它渲染成内联字符串。
+    """
+
+    def __init__(self, text: str) -> None:
+        super().__init__()
+        self._text = text
+
+    @property
+    def is_immediate(self) -> bool:
+        return True
+
+    def to_build_spec(self, scope=None) -> str:
+        return self._text
 
 
 class SiteDeployerStack(Stack):
@@ -310,8 +346,7 @@ class SiteDeployerStack(Stack):
 
         package_project = cb.Project(
             self, "PackageProject", project_name="site-package",
-            build_spec=cb.BuildSpec.from_asset(
-                str(Path(__file__).parents[1] / "buildspec-package.yml")),
+            build_spec=_InlineBuildSpec(BUILDSPEC_PATH.read_bytes().decode("utf-8")),
             environment=cb.BuildEnvironment(
                 build_image=cb.LinuxBuildImage.STANDARD_7_0,
                 compute_type=cb.ComputeType.SMALL),
@@ -902,7 +937,12 @@ class SiteDeployerStack(Stack):
         CfnOutput(self, "ReconcileDlqUrl", value=dlq.queue_url)
 
 
-app = App()
-SiteDeployerStack(app, "SiteDeployerStack",
-                  env=Environment(account=ACCOUNT, region=REGION))
-app.synth()
+# **必须在 `__main__` 守卫之下**：不加时 `import app` 就 synth 整个栈并触发 Lambda
+# bundling（要起 Docker），于是任何想 import 本模块做单测的地方都被迫依赖 Docker，
+# 而 `test_infra_tables.py` 的 fixture 更是 import 时 synth 一次、自己再建 App synth
+# 一次。`cdk.json` 是 `{"app": "python3 app.py"}`，所以对 `cdk` 完全无影响。
+if __name__ == "__main__":
+    app = App()
+    SiteDeployerStack(app, "SiteDeployerStack",
+                      env=Environment(account=ACCOUNT, region=REGION))
+    app.synth()
