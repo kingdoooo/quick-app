@@ -8,6 +8,7 @@ import pytest
 
 from security_contracts import (action_resource_violations,
                                 bucket_policy_statements,
+                                grants_to_principal,
                                 build_container_interlock_violations,
                                 buildspec_template_violations,
                                 module_toplevel_side_effect_violations,
@@ -434,3 +435,42 @@ def test_action_resource_rejects_each_counterexample(label, st):
     docs = [_EXACT, {"Statement": [st]}]
     assert action_resource_violations(docs, "codebuild:StartBuild",
                                       {PROJECT_ARN}), f"**没红**：{label}"
+
+
+# ── `aws:PrincipalArn` 条件要按**算子各自的语义**比 ──────────────────────
+# 外部复审的最后一条：把算子丢掉、统一用 `v in principal_ids` 比，就是大小写敏感的，
+# 而 AWS 的 `StringEqualsIgnoreCase` 不敏感 ⇒ `ARN:AWS:IAM::…:ROLE/MYROLE` 明明命中
+# 本角色却被当成"明确指向其它身份"跳过（实测 hit=False，一条 false-green）。
+# 同一分支还有 policy variable：`${aws:PrincipalArn}` 既不含通配也不等于角色 ARN，
+# 于是也被当成"明确不匹配"——任何 `${…}` 都必须 fail-closed。
+_ME = "arn:aws:iam::000000000000:role/MyRole"
+
+
+def _cond_stmt(op: str, val: str) -> dict:
+    return {"Effect": "Allow",
+            "Principal": {"AWS": "arn:aws:iam::000000000000:root"},
+            "Action": "s3:GetObject", "Resource": "*",
+            "Condition": {op: {"aws:PrincipalArn": val}}}
+
+
+@pytest.mark.parametrize("label,op,val,want_hit,want_note", [
+    # 外部复审点名的四条
+    ("IgnoreCase 大小写不同但指向本角色", "StringEqualsIgnoreCase",
+     "ARN:AWS:IAM::000000000000:ROLE/MYROLE", True, False),
+    ("IgnoreCase 明确指向别的角色（不该误红）", "StringEqualsIgnoreCase",
+     "arn:aws:iam::000000000000:role/OTHER", False, False),
+    ("policy variable 必须 fail-closed", "StringEquals",
+     "${aws:PrincipalArn}", True, True),
+    ("ArnEquals 精确指向本角色（回归）", "ArnEquals", _ME, True, False),
+    # 顺带钉住其余算子分支
+    ("ArnEquals 指向别的角色", "ArnEquals",
+     "arn:aws:iam::000000000000:role/Other", False, False),
+    ("ArnLike 带通配 → fail-closed", "ArnLike",
+     "arn:aws:iam::000000000000:role/*", True, True),
+    ("ArnLike 无通配指向本角色 → 精确比", "ArnLike", _ME, True, False),
+])
+def test_principal_arn_condition_is_compared_per_operator(label, op, val,
+                                                          want_hit, want_note):
+    hit, notes = grants_to_principal(_cond_stmt(op, val), {_ME})
+    assert hit is want_hit, f"{label}: hit={hit}，期望 {want_hit}"
+    assert bool(notes) is want_note, f"{label}: notes={notes}，期望有 note={want_note}"

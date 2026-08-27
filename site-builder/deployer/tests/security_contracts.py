@@ -322,20 +322,28 @@ def s3_permission_violations(docs: list[dict], expected: set[tuple[str, str]], *
 _ACCOUNT_ROOT_RE = re.compile(r"^(?:\d{12}|arn:aws[\w-]*:iam::\d{12}:root)$")
 # 只有这些**正向**算子能把账号级 principal 收窄到具体身份；Not* 与不认识的算子一律
 # fail-closed（当成可能授给本角色并报违规）。
-_PRINCIPAL_ARN_OPS = ("ArnEquals", "ArnLike", "StringEquals", "StringLike",
-                      "StringEqualsIgnoreCase")
+#
+# **必须按算子分别比较，不能只留下取值**：`StringEqualsIgnoreCase` 在 AWS 那边是
+# 大小写不敏感的，而统一用 `v in principal_ids` 比就是大小写敏感的 ⇒
+# `ARN:AWS:IAM::…:ROLE/MYROLE` 明明命中本角色，却被当成"明确指向其它身份"而跳过
+# （实测 `hit=False`，一条 false-green）。
+_ARN_OPS_EXACT = ("ArnEquals", "StringEquals")
+_ARN_OPS_CASEFOLD = ("StringEqualsIgnoreCase",)
+_ARN_OPS_LIKE = ("ArnLike", "StringLike")            # 带通配时 fail-closed
+_PRINCIPAL_ARN_OPS = _ARN_OPS_EXACT + _ARN_OPS_CASEFOLD + _ARN_OPS_LIKE
 
 
-def _principal_arn_condition(st: dict) -> tuple[list[str] | None, list[str]]:
-    """从 Condition 里取 `aws:PrincipalArn` 的取值集合。
+def _principal_arn_condition(st: dict) -> tuple[list[tuple[str, str]] | None, list[str]]:
+    """从 Condition 里取 `aws:PrincipalArn` 的 `(算子, 取值)` 对。
 
-    返回 `(值列表 或 None, 说明)`。`None` = 没有可用于收窄的条件（调用方按最坏情况处理）。
+    返回 `(对列表 或 None, 说明)`。`None` = 没有可用于收窄的条件（调用方按最坏情况处理）。
+    **算子必须一起带出来**：不同算子的比较语义不同（见 `_ARN_OPS_*`）。
     """
     cond = st.get("Condition")
     if not isinstance(cond, dict):
         return None, []
     notes: list[str] = []
-    vals: list[str] = []
+    pairs: list[tuple[str, str]] = []
     for op, kv in cond.items():
         if not isinstance(kv, dict):
             return None, [f"Condition 的 {op} 不是对象，无法判定"]
@@ -347,10 +355,10 @@ def _principal_arn_condition(st: dict) -> tuple[list[str] | None, list[str]]:
                               f"守卫不求值，按最坏情况处理"]
             for x in _as_list(raw):
                 try:
-                    vals.append(render_token(x))
+                    pairs.append((op, render_token(x)))
                 except Unrenderable as exc:
                     return None, [f"aws:PrincipalArn 的值形态不认识：{exc}"]
-    return (vals or None), notes
+    return (pairs or None), notes
 
 
 def grants_to_principal(st: dict, principal_ids: set[str]) -> tuple[bool, list[str]]:
@@ -386,15 +394,26 @@ def grants_to_principal(st: dict, principal_ids: set[str]) -> tuple[bool, list[s
             account_level = True
     if not account_level:
         return False, []
-    # 账号级 principal：由 `aws:PrincipalArn` 条件决定它实际指向谁
-    vals, notes = _principal_arn_condition(st)
-    if vals is None:
+    # 账号级 principal：由 `aws:PrincipalArn` 条件决定它实际指向谁。
+    # **逐个算子按各自的语义比**，任何静态判不了的形态都 fail-closed。
+    pairs, notes = _principal_arn_condition(st)
+    if pairs is None:
         return True, notes or ["Principal 是账号级（裸账号 ID / `:root`）且没有可判定的 "
                                "`aws:PrincipalArn` 条件——按最坏情况当成授给了本角色"]
-    if any(("*" in v or "?" in v) for v in vals):
-        return True, notes + [f"`aws:PrincipalArn` 条件含通配 {vals}，无法判定是否命中"
-                              f"本角色——按最坏情况处理"]
-    return (any(v in principal_ids for v in vals)), notes
+    folded = {x.casefold() for x in principal_ids}
+    for op, v in pairs:
+        if "${" in v:
+            return True, notes + [f"`aws:PrincipalArn` 的值含 policy variable {v!r}"
+                                  f"——静态判不了它展开成谁，按最坏情况处理"]
+        if op in _ARN_OPS_LIKE and ("*" in v or "?" in v):
+            return True, notes + [f"`aws:PrincipalArn` 用 {op} 且值含通配 {v!r}"
+                                  f"——无法判定是否命中本角色，按最坏情况处理"]
+        if op in _ARN_OPS_CASEFOLD:
+            if v.casefold() in folded:      # AWS 这个算子大小写不敏感
+                return True, notes
+        elif v in principal_ids:            # Equals / 无通配的 Like：精确比
+            return True, notes
+    return False, notes
 
 
 def package_project_s3_violations(tpl: dict) -> list[str]:

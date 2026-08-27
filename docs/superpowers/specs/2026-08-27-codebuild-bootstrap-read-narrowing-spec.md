@@ -314,7 +314,7 @@ artifacts 桶的逻辑 ID 由"`BucketName` 以 `site-artifacts-` 开头的那个
 | 层 | 反例 |
 |---|---|
 | buildspec | `--ignore-scripts=false`；flag 只留在 shell 注释里；删 `.npmrc` 挪到 install 之后；删错目录；install 后追加 `npm rebuild`；`--no-ignore-scripts`；**`env npm rebuild`**；**`sh -c 'npm rebuild'`**；**`/usr/bin/npm rebuild`**；多一条 `node -e`；两条命令换序 |
-| IAM | `s3:GetObject` on `*`；`s3:ListBucket`；另一个桶；`s3:GetObject*` 通配动作；`NotResource`；`Fn::ImportValue` 之类不认识的 token；挂 `AmazonS3ReadOnlyAccess`；角色自身 `Policies` 里的宽语句；经 `AWS::IAM::ManagedPolicy.Roles`；桶策略把 `s3:*` on `*` 授给本角色；桶策略 Principal 是 `*`；桶策略 Principal 形态不认识；**账号 root + `ArnEquals: aws:PrincipalArn` 指向本角色**；**账号 root 且无条件**；**账号 root + `ArnLike` 通配** |
+| IAM | `s3:GetObject` on `*`；`s3:ListBucket`；另一个桶；`s3:GetObject*` 通配动作；`NotResource`；`Fn::ImportValue` 之类不认识的 token；挂 `AmazonS3ReadOnlyAccess`；角色自身 `Policies` 里的宽语句；经 `AWS::IAM::ManagedPolicy.Roles`；桶策略把 `s3:*` on `*` 授给本角色；桶策略 Principal 是 `*`；桶策略 Principal 形态不认识；**账号 root + `ArnEquals: aws:PrincipalArn` 指向本角色**；**账号 root 且无条件**；**账号 root + `ArnLike` 通配**；**`StringEqualsIgnoreCase` 大小写不同但指向本角色**；**条件值是 `${aws:PrincipalArn}`** |
 | BuildSpec 形态 | S3-ARN 的 `Fn::Join` 形态；字节被改动一个字符 |
 | StartBuild（真机） | `codebuild:*` on `*`；裸 `*` on `*`；`codebuild:Start*` 通配；`Allow`+`NotAction`；换成别的项目 ARN；**`CODEBUILD:*`**；**`CodeBuild:StartBuild`**；**`codebuild:startbuild`** |
 | 桶策略读取（真机） | `AccessDenied` / `Throttling` / `InternalError` / `PermanentRedirect` 都必须**原样抛**，只有 `NoSuchBucketPolicy` 才算"没有策略" |
@@ -329,8 +329,13 @@ artifacts 桶的逻辑 ID 由"`BucketName` 以 `site-artifacts-` 开头的那个
 **账号级 principal 的处理是 fail-closed 的**：`Principal: {"AWS": "<acct>:root"}` 加
 `Condition: {ArnEquals: {aws:PrincipalArn: <role>}}` 是常见写法，只比对 `Principal.AWS`
 是否字面等于角色 ARN 会整条漏掉。所以账号级 principal 一律去看 `aws:PrincipalArn`
-条件：指向本角色 ⇒ 计入；**没有条件、用 Not\* 算子、条件值带通配、或形态不认识 ⇒ 按最坏
-情况计入并报违规**；只有条件明确指向别的身份才跳过。
+条件，并**按算子各自的语义比**：`ArnEquals`/`StringEquals` 精确比、
+`StringEqualsIgnoreCase` 双方 `casefold()` 后比（AWS 那边就是大小写不敏感的——只留取值、
+统一用精确比会把 `ARN:AWS:IAM::…:ROLE/MYROLE` 当成"指向其它身份"而跳过，实测是一条
+false-green）、`ArnLike`/`StringLike` 无通配时精确比。
+指向本角色 ⇒ 计入；**没有条件、用 Not\* 或不认识的算子、Like 算子带通配、值里含
+policy variable（`${…}`）、或形态不认识 ⇒ 按最坏情况计入并报违规**；
+只有条件明确指向别的身份才跳过。
 
 **两条容易写错的语义，都由反例钉住**：
 
