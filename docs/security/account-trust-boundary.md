@@ -490,7 +490,8 @@ python3 site-builder/scripts/verify_account_trust_boundary.py \
   要真正关掉这三个需要一条独立的**单调事件源**（变更审计屏障），而 CloudTrail
   **不能**直接充当它：投递有分钟级且无上界保证的延迟，拿它做同步屏障要么阻塞不确定的
   时间，要么给出虚假保证。所以它只声称：**持久性的漂移会被咬住**。
-  三个盲区各有一条钉住它们的用例（`test_*_is_a_known_blind_spot`）——哪天实现了事件屏障，
+  三个盲区各有一条钉住它们的用例（`test_*_is_a_known_blind_spot`；**条数本身也有守卫**，
+  因为上一版这句话与现实差了一条而没被抓到）——哪天实现了事件屏障，
   那几条会变红，提醒同时改这里的口径。
   **另外它只覆盖 principal 层。** 函数清单、alias、resource policy、Edge 代码与
   asset 各自在自己的时刻测得，跨层没有任何一致性保证。

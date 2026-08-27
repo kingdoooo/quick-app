@@ -81,7 +81,12 @@ cd "$(git rev-parse --show-toplevel)"
 
 单测跑法：`.venv/bin/pytest tests/test_xxx.py::test_name -q`。
 
-**两条实测坑（都花过时间，别重踩）**：
+**三条实测坑（都花过时间，别重踩）**：
+
+- **最终闸门别把七个包并行跑**。`contract/tests/test_redlines.py` 里有一条**墙钟**哨兵
+  （3000 组 decode 调用必须 10 秒内跑完，防 `_check_user_name_decoded` 退化回 O(n²)）。
+  它对机器争用敏感：并行跑多套件时实测被拖到 **13.6 秒**假红，重负载散去后单独重跑
+  **5.2 秒**。看到这条红先重跑一次再判断，别去"优化"那段解析。
 
 - **改了 `deployer/infra/app.py` 的 bundling 段，要跑 auth 那套才会红**。那段的守卫
   （每条 pip install 都必须带 `--require-hashes`、合同包必须 cp 不 pip）住在
@@ -126,8 +131,10 @@ bash site-builder/scripts/smoke_router.sh    # 路由层冒烟（会写测试数
 python3 site-builder/scripts/verify_console_e2e.py      # 控制台端到端
 python3 site-builder/scripts/verify_analytics_e2e.py    # 统计端到端（二期 M5）
 # 账号信任边界的漂移闸门（只读；A 直接失守 + B IAM 写静态快照两层；400 个 principal × 2 次
-# IAM 模拟 + **两次** GetAccountAuthorizationDetails（第二次是模拟后的原子性复查，
-# 窗口两端不一致就作废本轮）+ 扫 bootstrap 桶，实测 11±1 分钟：11m33s / 10m57s 两次）
+# IAM 模拟 + **两次** GetAccountAuthorizationDetails（第二次是模拟后的**窗口两端一致性
+# 复查**——两端不一致就作废本轮、不出结论也不写基线。它**不保证原子**：只覆盖 principal
+# 层，且只证明两端相等，三个已接受盲区见 docs/security/account-trust-boundary.md）
+# + 扫 bootstrap 桶，实测 11±1 分钟：11m33s / 10m57s 两次）
 python3 site-builder/scripts/verify_account_trust_boundary.py
 ```
 

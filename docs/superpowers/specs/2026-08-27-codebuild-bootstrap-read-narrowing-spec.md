@@ -574,7 +574,7 @@ asset 对象留着无害（它本来也不会被删）。若已经走到写基�
 |---|---|
 | 静态（部署前） | `cdk diff` 只引入 3 处资源变更，`IAM Statement Changes` 恰好一条删除、零新增；13 个 Lambda 的 `Code.S3Key` churn 是**既有现象**（把 `app.py` 换回上一版再 diff 一次，13 个照样变） |
 | 静态（不触发替换） | CFN 资源 schema 的 `createOnlyProperties` 只有 `/properties/Name` ⇒ 改 `Source` 不替换；部署后项目 `created` 仍是 7-29，实测确认 |
-| 单测 / opt-in | 检查器 92 passed；deployer 1091 passed / 52 skipped；opt-in 真 synth 模板 35 passed；七包 **2372 passed**；变形 **37/37 全红**。**这一行是 3b 那次的计数，别当成当前值**：同日的闸门原子性修复之后是 deployer 1113 / 七包 **2394** / 变形 **43/43** |
+| 单测 / opt-in | **3b 部署验收当时（2026-08-27）的计数**：检查器 92 passed；deployer 1091 passed / 52 skipped；opt-in 真 synth 模板 35 passed；七包 **2372 passed**；变形 **37/37 全红**。**这一格是那个时刻的历史值；这里不维护「当前值」**——上一版在这里补了一句「现在是 1113 / 2394 / 43」，几小时后就又过时了，而那正是本轮复审咬住的同一个毛病。当前值跑一遍测试就有（命令见 `CLAUDE.md`）；同日后续两轮闸门修复各自的计数写在**对应提交的信息里**（窗口两端复查那一轮、boundary 文档进摘要那一轮）|
 | **部署前的真机预演** | 那段部署后验收代码在**部署之前**就对着生产只读跑过一次，红绿与"尚未部署"逐项吻合（两红一绿）——这证明验收脚本能识别旧状态，而不是"无论部署前后都绿" |
 | 部署后静态 | `source.type=NO_SOURCE`、buildspec 与仓库文件**逐字节相同**、S3 权限全集精确等于两条（无 managed attachment、桶策略授给它 0 条）、`site-deployer-exec-role` 的 `codebuild:StartBuild` 资源仍精确等于那一个项目 ARN |
 | **行为** | 完整 E2E **10 passed，实测 37 分 21 秒**；**当天 20 次 `site-package` 构建（13:30–14:17，截至 14:17）全部 SUCCEEDED，20/20 都是 `NO_SOURCE` + 内联 buildspec**（1721 字节，与仓库文件逐字节相同；`sha256[:12]=50bad5712a17`）——这才是"CodeBuild 真的接受并执行了它"的证据，模板层字节相等只证明结构。**别按"4 次"记**：那是 13:36 前的计数，写进提交信息时（14:53）已经过时，外部复审按生产实况纠正为 20 次 |

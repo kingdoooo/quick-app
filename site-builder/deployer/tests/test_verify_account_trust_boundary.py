@@ -3044,17 +3044,99 @@ def test_created_then_deleted_between_enumerations_is_a_known_blind_spot():
     assert g.enumeration_drift(t1, t3) == {}
 
 
-def test_docs_do_not_claim_atomic_observation():
-    """文档不许再把这道复查叫"原子"。
+def test_pagination_window_is_a_known_blind_spot():
+    """**单次枚举自己也不是一个时刻**：角色详情与它 attached 托管策略的**文档**可以来自
+    不同的分页。
 
-    判据是**成对的**：既不许出现过宽的说法，也必须写着收窄后的口径与盲区——
+    `GetAccountAuthorizationDetails` 的 `RoleDetailList` 与 `Policies` 是同一趟分页遍历
+    里的两个分节，整趟实测跨约 90 秒。策略在翻页之间被改，组装出来的 principal 就把
+    「先到那页的角色」与「后到那页的策略文档」拼在一起——这两个状态**从未同时存在过**，
+    而 `list_principals` 不做跨页一致性检查（拿到的分页里也没有能做的信息）。
+
+    这条断言的是**限制本身**：拼出来的语句取自后到的那一页，而且整个过程无声。
+    """
+    g = _gate()
+    attached = f"arn:aws:iam::{_ACCT}:policy/Attached"
+    before_change = {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}
+    after_change = {"Effect": "Allow", "Action": "iam:PutRolePolicy", "Resource": "*"}
+
+    class _Paginator:
+        def paginate(self, **kw):
+            # 第 1 页：角色（此刻 attached 策略还是 before_change）
+            yield {"RoleDetailList": [
+                       {"RoleName": "R", "RoleId": "uid-role-1",
+                        "Arn": f"arn:aws:iam::{_ACCT}:role/R", "Path": "/",
+                        "RolePolicyList": [],
+                        "AttachedManagedPolicies": [{"PolicyArn": attached}]}],
+                   "UserDetailList": [], "GroupDetailList": [], "Policies": []}
+            # 第 2 页：翻页期间那份策略被改了，于是文档分节带回来的是新版本
+            yield {"RoleDetailList": [], "UserDetailList": [], "GroupDetailList": [],
+                   "Policies": [{"Arn": attached, "PolicyVersionList": [
+                       {"IsDefaultVersion": True, "VersionId": "v2",
+                        "Document": {"Version": "2012-10-17",
+                                     "Statement": [after_change]}}]}]}
+
+    class _Iam:
+        def get_paginator(self, name):
+            return _Paginator()
+
+    (principal,) = g.list_principals(_Iam())["principals"]
+    assert principal["statements"] == [(attached, after_change)], (
+        "如果这条红了，说明枚举已经能识别跨页不一致——"
+        "去改 enumeration_drift 的 docstring 与文档口径")
+    assert before_change not in [st for _, st in principal["statements"]]
+
+
+# 三份文档的口径守卫 + 数量自查。**判据为什么要覆盖三份**（Codex 第八轮）：
+# 上一版只读 `account-trust-boundary.md`，于是 `CLAUDE.md` 里残留的「原子性复查」
+# 整整过了一轮没被抓到——而 CLAUDE.md 恰恰是 Agent 的操作入口，那句话会让后续执行者
+# 把「窗口两端一致」重新读成原子保证。**守卫的主语必须与声明出现的范围一样宽。**
+_ATOMIC_OVERCLAIMS = ("原子性复查", "观测原子性", "本轮观测是原子的",
+                      "整轮都原子", "原子快照", "原子性检查")
+# 三个盲区各自的点名判据。**逐个列出**而不是只查"盲区"两个字：实测把盲区②整段删掉，
+# 只查"改回 / 分页"的旧守卫仍然 1 passed。
+# 判据取每个盲区**独有的机制描述**，不取单个词。实测教训：第一版用的是「改回」与
+# 「分页」这种短词，而文档别处也在说这两件事（boundary 那段就写着"不需要'改了又改回来'
+# 那种巧合"）⇒ 把盲区①整段删掉，守卫照样 2 passed。**判据比主语弱和比主语窄一样危险。**
+_BLIND_SPOTS = (("恢复成与 T1 逐字相同", "①改了又改回来（ABA）"),
+                ("复查前删除", "②枚举后新建、复查前删除"),
+                ("翻页期间的变化不可见", "③单次枚举自己不是一个时刻"))
+
+
+def test_docs_do_not_claim_atomic_observation():
+    """三份 tracked 文档都不许把这道复查说成"原子"；结论真源必须点名全部三个盲区。
+
+    判据是**成对的**：既不许出现过宽说法，也必须写着收窄后的口径与三个盲区——
     只做黑名单 grep 的话，把整段删掉也能过。
     """
-    doc = _DOC.read_text(encoding="utf-8")
-    for overclaim in ("观测原子性", "本轮观测是原子的", "整轮都原子"):
-        assert overclaim not in doc, f"文档里还留着过宽的说法：{overclaim!r}"
-    for required in ("两端", "盲区"):
-        assert required in doc, f"文档没写收窄后的口径：{required!r}"
-    # 三个盲区都要点名，否则"盲区"两个字可以只是句空话
-    for blind in ("改回", "分页"):
-        assert blind in doc, f"文档没点名这个盲区：{blind!r}"
+    claude_md = (_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+    truth = _DOC.read_text(encoding="utf-8")
+    spec = (_ROOT / "docs" / "superpowers" / "specs"
+            / "2026-08-27-codebuild-bootstrap-read-narrowing-spec.md"
+            ).read_text(encoding="utf-8")
+    for label, text in (("CLAUDE.md", claude_md),
+                        ("account-trust-boundary.md", truth),
+                        ("3b spec", spec)):
+        for overclaim in _ATOMIC_OVERCLAIMS:
+            assert overclaim not in text, \
+                f"{label} 里还留着过宽的说法：{overclaim!r}"
+    # 结论真源要写清收窄后的口径，并逐个点名三个盲区
+    assert "两端" in truth, "风险文档没写收窄后的口径（窗口两端一致）"
+    for needle, what in _BLIND_SPOTS:
+        assert needle in truth, f"风险文档没点名这个盲区：{what}（找不到 {needle!r}）"
+    # CLAUDE.md 是操作入口：至少要让读者知道这道复查的口径是"两端"，而不是原子
+    assert "两端" in claude_md, "CLAUDE.md 没写这道复查的口径是「两端一致」"
+
+
+def test_blind_spot_test_count_matches_the_documented_claim():
+    """文档写"三个盲区各有一条用例"——这里数一遍实际有几条。
+
+    上一轮这句话与现实差了一条（只有两条，缺分页那个）而没人抓到。
+    **数量声明本身也要有守卫**：它和"14 个由基线断言的数字"是同一类，
+    写下一个计数就等于开了一张需要兑现的支票。
+    """
+    src = Path(__file__).read_text(encoding="utf-8")
+    n = len(re.findall(r"def test_\w+_is_a_known_blind_spot\(", src))
+    assert n == len(_BLIND_SPOTS), (
+        f"盲区用例实际 {n} 条，而 `_BLIND_SPOTS` 与文档都写着 {len(_BLIND_SPOTS)} 个盲区"
+        f"——两者必须同时改")
