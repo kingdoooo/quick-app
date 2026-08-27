@@ -1137,13 +1137,26 @@ MSG
 
 ---
 
-## Task 3: opt-in 真机行为探针（tracked，默认不跑）
+## Task 3: opt-in 真机行为探针 —— **已移出本次生产收权的关键路径，不阻塞部署**
 
-静态检查器证明**结构**，探针证明**真实 npm/CodeBuild 行为**。做成制品而不是一次操作，
-否则又回到"不可复跑的证据等于没有证据"。**本任务只创建它（默认 skip ⇒ 提交是绿的）**，
-真正跑它在 Task 4。
+> **裁决（第三轮复审，我同意）：这个探针验证的是一个既有安全不变量，不是 BuildSpec
+> 内联改动自身的功能正确性，所以不该成为 Task 4/5 的前置。** 因果关系上：本次真正变化的
+> 是 buildspec 的**交付方式**而非**内容**（真 synth 已证明内联字符串与文件逐字节一致），
+> 而完整 E2E 部署后会真实多次经过 CodeBuild，足以证明它能接受并执行内联内容；
+> `--ignore-scripts` 的行为差异已由本机 npm 10.9.8 实测，"`.tgz` 依赖能穿过静态扫描、
+> 普通子目录会被拦"已由**生产校验器本体**实测。
+>
+> **所以本任务现在不做**，也**不**先提交一份只能 skip、从未在真实环境跑过的测试
+> （那正是"看起来做完了其实没验证过"）。它独立成一个后续的 opt-in 安全证据任务，
+> 设计照下面这份不变。**例外**：若要求"3b 本身必须同时补齐依赖脚本的行为证据"，
+> 才把它拉回生产放行的前置。
+
+以下是留给那个后续任务的设计（本次不执行）。静态检查器证明**结构**，探针证明**真实
+npm/CodeBuild 行为**；做成制品而不是一次操作，否则又回到"不可复跑的证据等于没有证据"。
 
 **Files:** Create `site-builder/deployer/tests/test_codebuild_security_probe.py`
+
+**（下面的 Step 本次不执行，留给后续任务。）**
 
 - [ ] **Step 1: 写探针**
 
@@ -1396,9 +1409,11 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 RUN_E2E=1 site-builder/deployer/.venv/bin/pytest \
   site-builder/deployer/tests/test_e2e_fixtures.py -q
-RUN_CODEBUILD_SECURITY_PROBE=1 site-builder/deployer/.venv/bin/pytest \
-  site-builder/deployer/tests/test_codebuild_security_probe.py -q
 ```
+
+**不跑** Task 3 的恶意 `.tgz` 探针（见 Task 3 顶部的裁决）：它验证的是一个既有安全不变量，
+与本次"交付方式"改动没有因果关系。完整 E2E 本身就会多次经过 CodeBuild，那才是本改动
+需要的功能证据。
 
 E2E 文件**机械核实过是 10 条**（不是 4 条 fixture；`约 6 分钟` 那个旧数字别再引用，
 按实测重新记）。多条用例会重复部署 `nosql-notes`，所以 `package_backend → CodeBuild`
