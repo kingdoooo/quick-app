@@ -180,11 +180,25 @@ deployer exec 角色另有 `role/site-rt-*` 上的 `PutRolePolicy` / `AttachRole
 （buildspec 本身也是一个 asset）。后果：**那个构建容器能读到 Edge asset 里的
 明文签名密钥**。
 
-它今天**不可达**，隔断只有一条：`buildspec-package.yml` 里
-`npm install --ignore-scripts`（外加先删掉站点自带的 `.npmrc`）。
-站点的 `package.json` 由 AI 生成、owner 可任意改，所以一旦那条 flag 被去掉、
-或出现任何其它在构建期执行站点代码的路径（例如将来支持 Python 后端而用
-`pip install` 装 sdist），这条链就从「账号内部暴露」变成
+它今天**不可达**。但隔断**不是"只有一条 flag"**——早先版本这么写过，那不准确。按攻击
+路径分层（都是实测）：
+
+| 攻击路径 | 控制点 |
+|---|---|
+| 站点**自己的** `package.json` 里写 `preinstall`/`postinstall` 等 | **两道**：合同校验器在 CodeBuild **之前**就拒（`contract/redlines.py` 的 `NPM_LIFECYCLE_KEYS`；`_scan_package_json` 对 `backend/` 下**任何** `package.json` 生效）＋ `--ignore-scripts` |
+| 站点**自己的** `backend/.npmrc` | **两道**：合同校验器直接拒＋ buildspec 的 `find /tmp/site -name .npmrc -delete` |
+| **依赖**（transitive）里的生命周期脚本 | **只有 `--ignore-scripts` 一道** |
+
+第三行才是要紧的那一行：`_scan_package_json` **只看站点自己的 `scripts` 段，从不检查
+`dependencies`**（registry、版本范围、`git+`、`file:` 规格一概不限），而扫描器只读
+`TEXT_EXT` 里的后缀 ⇒ **`.tgz` 依赖根本不被打开**。实测（npm 10.9.8 / node 22）：把一个
+带 `preinstall` 的包 `npm pack` 成本地 `.tgz`、以 `"file:./dep.tgz"` 作依赖，
+`npm install` **会执行**那个 `preinstall`，而加上 `--ignore-scripts` **不会**。
+也就是说对"依赖投毒"这条最现实的路径，那条 flag 确实是唯一控制点，且它对合同校验器
+完全不可见。
+
+所以一旦那条 flag 被去掉、或出现任何其它在构建期执行站点代码的路径（例如将来支持
+Python 后端而用 `pip install` 装 sdist），这条链就从「账号内部暴露」变成
 **「不可信站点作者可窃取平台签名密钥」**——而后者正是整套设计声称要防的威胁。
 
 ⇒ 这条不需要等账号迁移，可以单独收窄（把 buildspec 改成不走 asset，

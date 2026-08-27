@@ -36,8 +36,13 @@ ARN，通配已清零）。不再需要"读文档时减去一层"。
 > 部署验收**；真修复顺序：收窄 CodeBuild 对 bootstrap 桶的读权限 → 非对称签名 →
 > 迁独立账号，见 merged review §9 的 3b/3c/3d），
 > 见 `docs/security/account-trust-boundary.md`。**那份文档里还有一条值得单独记住**：
-> 跑不可信站点依赖安装的 CodeBuild 角色能读到那把密钥（CDK 自动授的整桶读），
-> 当前唯一的隔断是 `buildspec-package.yml` 里的 `npm install --ignore-scripts`。
+> 跑不可信站点依赖安装的 CodeBuild 角色能读到那把密钥（CDK 自动授的整桶读）。
+> **隔断分两层，别记成"只有一条 flag"**：站点**自己的** `package.json` 生命周期脚本与
+> `backend/.npmrc` 由合同校验器在 CodeBuild **之前**就拒（`contract/redlines.py` 的
+> `NPM_LIFECYCLE_KEYS`）；但**依赖里**的生命周期脚本**只有** `buildspec-package.yml` 的
+> `npm install --ignore-scripts` 一道——`_scan_package_json` 从不检查 `dependencies`，
+> 而 `.tgz` 依赖根本不在扫描后缀里（实测：带 `preinstall` 的包打成本地 `.tgz` 作依赖，
+> `npm install` 会执行它，加上 `--ignore-scripts` 不会）。
 
 **具体进度与闸门数字不写在本文件**（会过时）：确切数字靠下面的测试命令自己跑；
 **待办与优先级**见 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9
