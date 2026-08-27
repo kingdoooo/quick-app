@@ -119,7 +119,9 @@ E2E（需要真实 AWS 部署 + config.ini 已回填）：
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/test_e2e_fixtures.py -q   # 4 个 fixture，约 6 分钟
+RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/test_e2e_fixtures.py -q   # **10 条**，实测约 37 分钟
+# ↑ 别按「4 个 fixture / 约 6 分钟」记（那是旧数字）。它超过很多工具的单次超时上限，
+#   中途被杀会让 autouse 的清理 fixture 跑不完 ⇒ 留下真站点。要后台跑或调大超时。
 bash site-builder/scripts/smoke_router.sh    # 路由层冒烟（会写测试数据，跑完清理；含 65s 等 Edge 缓存）
 python3 site-builder/scripts/verify_console_e2e.py      # 控制台端到端
 python3 site-builder/scripts/verify_analytics_e2e.py    # 统计端到端（二期 M5）

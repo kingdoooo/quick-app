@@ -454,6 +454,13 @@ python3 site-builder/scripts/verify_account_trust_boundary.py \
   （账号归一化只归**当前**账号，就是为了留住这个信号）。
 - 它统计的是**当前**存在的 principal 与资源；某人临时建一个角色用完删掉，
   两次运行之间看不见。
+- **枚举与逐个模拟之间有一个约 10 分钟的窗口（TOCTOU）。** 先
+  `GetAccountAuthorizationDetails` 拿全量名单，再逐个 `SimulatePrincipalPolicy`；
+  账号里有别的 workload 在 churn 时，名单里的角色可能在被模拟之前就已删除
+  ⇒ `NoSuchEntity` ⇒ 闸门**硬失败**（不产出残缺快照）。2026-08-27 实测撞到一次：
+  两个 `bedrock-*` 角色在窗口内被删、第三个被删后又重建（`created` 时间在枚举之后）。
+  **方向是安全的**（硬失败而非静默丢 principal），所以这是可用性问题不是正确性问题——
+  重跑即可。但它意味着这道闸门在 churn 活跃的账号里可能需要跑两次。
 - 它给出的是**下界**，不是上界。这份文档的数字被推翻过**四次**，每次都是因为
   漏掉了一个等价动作或一类等价资源。
 

@@ -1,8 +1,13 @@
 # M09 真修复①：收窄 CodeBuild 对 CDK bootstrap 桶的读权限
 
-> **状态：设计已定稿，未实施。** 这是 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md`
-> §9 的 **3b**。风险模型的真源是 `docs/security/account-trust-boundary.md`，本文不重复它，
-> 只写这一条改动。**它是一次生产 IAM 改动**，实施前需要人工放行。
+> **状态：✅ 2026-08-27 已实施并部署生产，基线与文档已同步。** 这是
+> `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9 的 **3b**。风险模型的真源是
+> `docs/security/account-trust-boundary.md`，本文不重复它，只写这一条改动。
+> **下一条是 3c（非对称签名），建议先 spike。**
+>
+> **接手这一条时的读法**：正文（设计与守卫）+ 末尾的「实施记录与验收证据」一节就是全部
+> 状态；实施计划在 `docs/superpowers/plans/2026-08-27-codebuild-bootstrap-read-narrowing.md`
+> （Task 1/2 已完成、Task 3 的探针**已裁决移出关键路径**、Task 4/5 已执行）。
 
 ## 一句话
 
@@ -532,3 +537,70 @@ asset 对象留着无害（它本来也不会被删）。若已经走到写基�
 减少带活密钥的 asset 数（仍是 9）。下一条是**非对称签名**（KMS `kms:Sign` + Edge 只放
 公钥），它才会让"只能经 asset 读到密钥"的那批（约 21 个）整个退出暴露面。顺序不能反：
 先把跨越威胁边界的这条掐断（改动小、可回滚、不动签名链），再动签名链本身。
+
+---
+
+## 实施记录与验收证据（2026-08-27）
+
+**这一节是这条改动的状态真源**，写在 spec 里而不是另建 handover 文件——本仓库的
+`docs/design/` HANDOFF 都是 gitignored 的，CLAUDE.md 明确说那类文件不能当状态真源。
+
+### 提交链
+
+| 提交 | 内容 |
+|---|---|
+| `c15eef9` | 三个结构化检查器 + 外部反例；改正「唯一的隔断是 `--ignore-scripts`」这个说法 |
+| `4fdec89` | **生产代码**：buildspec 逐字节内联，删掉整桶读；`__main__` 守卫；opt-in 模板断言 |
+| `6760179` / `867e867` / `2eb6944` | 把实跑发现写回计划；探针前提改成实测；探针移出关键路径 |
+| `79bf1e4` / `efd244d` / `a118db4` / `ed2d1ee` | 四轮外部复审的守卫修复（共 14 条，形态见下） |
+| `34b87c5` / `8365a9c` | secret scan 的两处修复（假阳性 + 预处理 fail-open）＋ 它第一套回归测试 |
+| `d3167d6` | **原子提交**：基线 + 14 个 marker 数字 + 风险文档 + CLAUDE.md |
+| `18c01fa` | §9 的 3b 标成完成 |
+
+### 落地数字（都由基线断言）
+
+**A 62 → 61、可读密钥 57 → 56、`platform-overbroad` 1 → 0。**
+**没有变的**：带活密钥的 asset 仍 **9**、Edge 代码目标仍 **10**、
+`undecided_items` **774 → 774**、B 的 **22 holder / 43 语句**一字未动、
+`resource_policies.platform` 与 bootstrap 桶策略不变。
+
+写基线**之前**逐条核过 17 项条件（恰好 1 个 principal 退出、0 新增、被删条目的
+`category`/`grants` 精确匹配、其余 61 条未动、facts/coverage/B/resource policies 全等），
+写完再做一次结构化 delta 断言——**不用带截断的文本 diff**（"不在前 40 行"不等于"不存在"）。
+
+### 验收证据（分层，别把一层当另一层）
+
+| 层 | 证据 |
+|---|---|
+| 静态（部署前） | `cdk diff` 只引入 3 处资源变更，`IAM Statement Changes` 恰好一条删除、零新增；13 个 Lambda 的 `Code.S3Key` churn 是**既有现象**（把 `app.py` 换回上一版再 diff 一次，13 个照样变） |
+| 静态（不触发替换） | CFN 资源 schema 的 `createOnlyProperties` 只有 `/properties/Name` ⇒ 改 `Source` 不替换；部署后项目 `created` 仍是 7-29，实测确认 |
+| 单测 / opt-in | 检查器 92 passed；deployer 1091 passed / 52 skipped；opt-in 真 synth 模板 35 passed；七包 **2372 passed**；变形 **37/37 全红** |
+| **部署前的真机预演** | 那段部署后验收代码在**部署之前**就对着生产只读跑过一次，红绿与"尚未部署"逐项吻合（两红一绿）——这证明验收脚本能识别旧状态，而不是"无论部署前后都绿" |
+| 部署后静态 | `source.type=NO_SOURCE`、buildspec 与仓库文件**逐字节相同**、S3 权限全集精确等于两条（无 managed attachment、桶策略授给它 0 条）、`site-deployer-exec-role` 的 `codebuild:StartBuild` 资源仍精确等于那一个项目 ARN |
+| **行为** | 完整 E2E **10 passed，实测 37 分 21 秒**；当天 **4 次 `site-package` 构建全部 SUCCEEDED、4 次用的都是内联 buildspec**（与仓库文件逐字节相同）——这才是"CodeBuild 真的接受并执行了它"的证据，模板层字节相等只证明结构 |
+
+### 三条实施期的坑（都花过时间）
+
+1. **完整 E2E 现在要 37 分 21 秒**，超过很多工具的单次超时上限。被 SIGTERM 掉时 autouse
+   的清理 fixture 跑不完 ⇒ 留下真站点。要后台跑。
+2. **"按残留 Lambda 找泄漏"会漏掉 static 站点**——static 没有后端 Lambda，只有路由表条目、
+   前端 S3 前缀与 sites 行。第一轮清理就漏了一个。查泄漏要同时看
+   `site-sites` 里 `status != DELETED` 的行。清理一律走平台自己的 undeploy 路径
+   （`purge_data=True` + 强一致读回确认 `DELETED`），别手工删资源。
+3. **信任边界闸门有一个约 10 分钟的 TOCTOU**（枚举 → 逐个模拟）。账号里别的 workload
+   在 churn 时会 `NoSuchEntity` 硬失败、不产出快照，重跑即可。已记进
+   `account-trust-boundary.md` 的闸门 caveat 一节。
+
+### 这条改动被外部复审抓出 14 次同一个错误
+
+全部形如**「枚举范围比声称的主语窄」**：只看源码手写的语句（漏 CDK 自动加的）；只看"含某个
+子串"（漏 `--ignore-scripts=false`）；只看首 token 是 `npm` 的命令（漏 `env npm rebuild`）；
+只看 identity policy（漏 `AWS::S3::BucketPolicy`）；桶策略只比 `Principal.AWS` 字面量
+（漏账号 root + `aws:PrincipalArn` 条件）；Action 用 `fnmatchcase`（IAM 动作**不区分大小写**）；
+import-time 遍历跳过类体与 annotation（**类的体在 import 时会执行**）；
+`StringEqualsIgnoreCase` 写进了支持列表却没实现它的语义。
+
+**统一解法**：把完整集合与精确期望比**等值**，而不是逐个排除已知坏形态；判据抽成纯函数让
+**所有调用点共用**（包括真机验收——否则真机侧必然长出一套更弱的字符串 grep）；
+每组反例必须**含一批由复审方提出、逐字纳入的**，并且配正向控制（否则"把一切都判红"也能
+让反例全过）。
