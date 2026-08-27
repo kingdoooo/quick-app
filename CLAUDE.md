@@ -127,7 +127,7 @@ python3 site-builder/scripts/verify_console_e2e.py      # 控制台端到端
 python3 site-builder/scripts/verify_analytics_e2e.py    # 统计端到端（二期 M5）
 # 账号信任边界的漂移闸门（只读；A 直接失守 + B IAM 写静态快照两层；400 个 principal × 2 次
 # IAM 模拟 + **两次** GetAccountAuthorizationDetails（第二次是模拟后的原子性复查，
-# 窗口内 IAM 变过就作废本轮）+ 扫 bootstrap 桶，实测 11m33s）
+# 窗口两端不一致就作废本轮）+ 扫 bootstrap 桶，实测 11±1 分钟：11m33s / 10m57s 两次）
 python3 site-builder/scripts/verify_account_trust_boundary.py
 ```
 
