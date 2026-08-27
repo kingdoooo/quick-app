@@ -30,6 +30,10 @@
 # 本仓库可预期的故意命中：*@x.com 假邮箱、000000000000 占位账号、
 # ProbeOnly!2026x 探测口令、botocore Stubber 的 aws_access_key_id="t"、
 # config.ini.example 里的空 client_secret =。
+# 还有一类天然会整片命中：**本脚本自己的回归测试**
+# （`deployer/tests/test_scan_staged_secrets.py`）——它必须写进 AKIAIOSFODNN7EXAMPLE、
+# `user+tag@example.com`、`123456789012`、`/Users/someone/`、私钥头这些 fixture，
+# 否则"真命中还在"根本证明不了。改那个文件时用 --allow-hits 是预期的。
 set -uo pipefail
 
 # 覆盖 ~/AGENTS.md 列出的全部类别（凭证/令牌、个人标识、本机信息、基础设施内部）
@@ -63,6 +67,22 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# diff 模式下**只扫新增行，并先剥掉行首那个 `+`**。
+#
+# 为什么必须剥：email 规则的 local-part 字符类含 `+`，于是 diff 里的
+#   +@pytest.mark.parametrize("label", ...)
+# 会被 `+` 与后面的 `pytest.mark.parametrize` 拼成"邮箱"而命中——**任何**新增的
+# `@pytest.mark.*` 装饰器都复现（实测）。这类反复出现的假阳性最大的害处不是噪音，
+# 而是把人训练成无脑加 `--allow-hits`，那时真命中也会被一起放行。
+#
+# 顺带缩小范围：不再扫 context 行与 `-` 行。本脚本的主语是"这次**新增**了什么"，
+# 而 context/removed 里的内容都是已经在仓库里的——把它们算成"新增泄漏"只会产生
+# 与本次改动无关的命中。**这是一次刻意的范围收窄，写在这里以免被当成 bug。**
+# `+++ b/path` 是文件头不是内容，也排除（仓库内路径本来就是相对路径）。
+strip_added_lines() {
+  awk '/^\+\+\+ /{next} /^\+/{print substr($0, 2)}'
+}
+
 # 取待扫文本。**必须与 grep 分开做并检查 git 的退出码**：
 # 早期版本写成 hits="$(git diff --cached | grep -nE ...)"，git 失败时（不在 git
 # 仓库里、--range 给了不存在的 ref）hits 为空 → 报 "clean" → exit 0。
@@ -77,15 +97,17 @@ case "$mode" in
       exit 2
     fi
     subject="staged diff"
-    text="$(git diff --cached)" || {
-      echo "🛑 git diff --cached 失败——无法扫描，拒绝放行" >&2; exit 2; } ;;
+    raw="$(git diff --cached)" || {
+      echo "🛑 git diff --cached 失败——无法扫描，拒绝放行" >&2; exit 2; }
+    text="$(printf '%s\n' "$raw" | strip_added_lines)" ;;
   range)
     git rev-parse --git-dir >/dev/null 2>&1 || {
       echo "🛑 当前目录不是 git 仓库——无法扫描，拒绝放行" >&2; exit 2; }
     subject="range $range"
-    text="$(git diff "$range")" || {
+    raw="$(git diff "$range")" || {
       echo "🛑 git diff $range 失败（ref 不存在？）——无法扫描，拒绝放行" >&2
-      exit 2; } ;;
+      exit 2; }
+    text="$(printf '%s\n' "$raw" | strip_added_lines)" ;;
   files)
     if [ "${#files[@]}" -eq 0 ]; then echo "--files 需要至少一个路径" >&2; exit 2; fi
     for f in "${files[@]}"; do
