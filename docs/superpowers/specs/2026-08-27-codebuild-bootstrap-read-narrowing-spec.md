@@ -577,7 +577,7 @@ asset 对象留着无害（它本来也不会被删）。若已经走到写基�
 | 单测 / opt-in | 检查器 92 passed；deployer 1091 passed / 52 skipped；opt-in 真 synth 模板 35 passed；七包 **2372 passed**；变形 **37/37 全红** |
 | **部署前的真机预演** | 那段部署后验收代码在**部署之前**就对着生产只读跑过一次，红绿与"尚未部署"逐项吻合（两红一绿）——这证明验收脚本能识别旧状态，而不是"无论部署前后都绿" |
 | 部署后静态 | `source.type=NO_SOURCE`、buildspec 与仓库文件**逐字节相同**、S3 权限全集精确等于两条（无 managed attachment、桶策略授给它 0 条）、`site-deployer-exec-role` 的 `codebuild:StartBuild` 资源仍精确等于那一个项目 ARN |
-| **行为** | 完整 E2E **10 passed，实测 37 分 21 秒**；当天 **4 次 `site-package` 构建全部 SUCCEEDED、4 次用的都是内联 buildspec**（与仓库文件逐字节相同）——这才是"CodeBuild 真的接受并执行了它"的证据，模板层字节相等只证明结构 |
+| **行为** | 完整 E2E **10 passed，实测 37 分 21 秒**；**当天 20 次 `site-package` 构建（13:30–14:17，截至 14:17）全部 SUCCEEDED，20/20 都是 `NO_SOURCE` + 内联 buildspec**（1721 字节，与仓库文件逐字节相同；`sha256[:12]=50bad5712a17`）——这才是"CodeBuild 真的接受并执行了它"的证据，模板层字节相等只证明结构。**别按"4 次"记**：那是 13:36 前的计数，写进提交信息时（14:53）已经过时，外部复审按生产实况纠正为 20 次 |
 
 ### 三条实施期的坑（都花过时间）
 
@@ -587,8 +587,14 @@ asset 对象留着无害（它本来也不会被删）。若已经走到写基�
    前端 S3 前缀与 sites 行。第一轮清理就漏了一个。查泄漏要同时看
    `site-sites` 里 `status != DELETED` 的行。清理一律走平台自己的 undeploy 路径
    （`purge_data=True` + 强一致读回确认 `DELETED`），别手工删资源。
-3. **信任边界闸门有一个约 10 分钟的 TOCTOU**（枚举 → 逐个模拟）。账号里别的 workload
-   在 churn 时会 `NoSuchEntity` 硬失败、不产出快照，重跑即可。已记进
+3. **信任边界闸门有一个约 10 分钟的 TOCTOU**（枚举 → 逐个模拟），而
+   **它不只是可用性问题——这里原先的定性是错的**。`NoSuchEntity` 硬失败只覆盖
+   "模拟时角色已经不在了"这一种 churn；同名重建（ARN 不变、RoleId 变）、窗口内改策略、
+   T1 之后新建 principal 这三类都会**静默**产出混了两个时刻的快照。
+   **实测**：写下当前基线的那次运行本身窗口内就有两条 `PutRolePolicy`（CloudTrail），
+   只是恰好落在既不进 A 也不进 B 的角色上 ⇒ 值没错，"一个时刻的快照"这句话是假的。
+   已修：模拟后再枚举一次并逐个比对 `uid`/boundary/全部语句，任一类漂移即作废本轮
+   （`enumeration_drift` + 10 条用例 + 5 个变异验证）。详见
    `account-trust-boundary.md` 的闸门 caveat 一节。
 
 ### 这条改动被外部复审抓出 14 次同一个错误
