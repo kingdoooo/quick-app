@@ -146,3 +146,61 @@ def test_allow_hits_still_exits_zero_but_prints_the_hits(tmp_path):
     r = _scan(repo, "--allow-hits")
     assert r.returncode == 0
     assert "123456789012" in r.stderr, "放行时也必须把命中打出来给人看"
+
+
+# ── 预处理失败必须 fail-closed ────────────────────────────────────────────
+# 本脚本只 `set -uo pipefail`、**没有** `set -e`，所以
+# `text="$(… | strip_added_lines)"` 失败时赋值只是把 text 置空、脚本继续往下走 →
+# grep 扫空串 → 报 clean → exit 0。这是外部复审用一个返回 2 的假 awk 实测出来的
+# fail-open：staged diff 里带真 AKIA fixture 也报 clean。
+def _fake_awk_path(tmp_path: Path) -> str:
+    d = tmp_path / "fakebin"
+    d.mkdir()
+    (d / "awk").write_text("#!/bin/sh\nexit 2\n", encoding="utf-8")
+    (d / "awk").chmod(0o755)
+    import os
+    return f"{d}:{os.environ['PATH']}"
+
+
+@pytest.mark.parametrize("mode", ["staged", "range"])
+def test_preprocessor_failure_refuses_to_pass(tmp_path, mode):
+    import os
+    repo = _repo(tmp_path)
+    _stage(repo, "t.txt", "AKIAIOSFODNN7EXAMPLE\n")
+    if mode == "range":
+        subprocess.run(["git", "commit", "-q", "-m", "x"], cwd=repo, check=True,
+                       capture_output=True)
+        args = ["--range", "HEAD~1...HEAD"]
+    else:
+        args = []
+    env = dict(os.environ, PATH=_fake_awk_path(tmp_path))
+    r = subprocess.run(["bash", str(SCRIPT), *args], cwd=repo,
+                       capture_output=True, text=True, env=env)
+    assert r.returncode == 2, (
+        f"预处理失败却放行了（rc={r.returncode}）——那是 fail-open\n{r.stdout}{r.stderr}")
+    assert "提取失败" in r.stderr
+
+
+# ── --range 路径（原来一条测试都没有）──────────────────────────────────────
+def test_range_mode_decorator_is_not_a_hit(tmp_path):
+    repo = _repo(tmp_path)
+    _stage(repo, "t.py", '@pytest.mark.parametrize("l", ["a"])\n')
+    subprocess.run(["git", "commit", "-q", "-m", "add test"], cwd=repo, check=True,
+                   capture_output=True)
+    r = _scan(repo, "--range", "HEAD~1...HEAD")
+    assert r.returncode == 0, f"range 模式误报：\n{r.stderr}"
+
+
+def test_range_mode_real_secret_is_a_hit(tmp_path):
+    repo = _repo(tmp_path)
+    _stage(repo, "t.txt", "AKIAIOSFODNN7EXAMPLE\n")
+    subprocess.run(["git", "commit", "-q", "-m", "add secret"], cwd=repo, check=True,
+                   capture_output=True)
+    r = _scan(repo, "--range", "HEAD~1...HEAD")
+    assert r.returncode == 1, f"range 模式漏了真 secret：{r.stdout}{r.stderr}"
+
+
+def test_range_mode_with_bad_ref_is_refused(tmp_path):
+    repo = _repo(tmp_path)
+    r = _scan(repo, "--range", "no-such-ref...HEAD")
+    assert r.returncode == 2, "不存在的 ref 必须拒绝放行，不许 fail-open"

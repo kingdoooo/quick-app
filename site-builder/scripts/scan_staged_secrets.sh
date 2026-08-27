@@ -79,6 +79,10 @@ done
 # 而 context/removed 里的内容都是已经在仓库里的——把它们算成"新增泄漏"只会产生
 # 与本次改动无关的命中。**这是一次刻意的范围收窄，写在这里以免被当成 bug。**
 # `+++ b/path` 是文件头不是内容，也排除（仓库内路径本来就是相对路径）。
+# **调用处必须显式判它的退出码**：本脚本只 `set -uo pipefail`、**没有** `set -e`，
+# 所以 `text="$(… | strip_added_lines)"` 失败时赋值只是把 text 置空、脚本继续往下走
+# → grep 扫空串 → 报 clean → exit 0。那是 fail-open，正是本脚本存在的理由要消灭的
+# （实测：把 awk 换成一个返回 2 的假货，staged diff 里带真 AKIA fixture 仍报 clean/rc=0）。
 strip_added_lines() {
   awk '/^\+\+\+ /{next} /^\+/{print substr($0, 2)}'
 }
@@ -99,7 +103,8 @@ case "$mode" in
     subject="staged diff"
     raw="$(git diff --cached)" || {
       echo "🛑 git diff --cached 失败——无法扫描，拒绝放行" >&2; exit 2; }
-    text="$(printf '%s\n' "$raw" | strip_added_lines)" ;;
+    text="$(printf '%s\n' "$raw" | strip_added_lines)" || {
+      echo "🛑 新增行提取失败——无法扫描，拒绝放行" >&2; exit 2; } ;;
   range)
     git rev-parse --git-dir >/dev/null 2>&1 || {
       echo "🛑 当前目录不是 git 仓库——无法扫描，拒绝放行" >&2; exit 2; }
@@ -107,7 +112,8 @@ case "$mode" in
     raw="$(git diff "$range")" || {
       echo "🛑 git diff $range 失败（ref 不存在？）——无法扫描，拒绝放行" >&2
       exit 2; }
-    text="$(printf '%s\n' "$raw" | strip_added_lines)" ;;
+    text="$(printf '%s\n' "$raw" | strip_added_lines)" || {
+      echo "🛑 新增行提取失败——无法扫描，拒绝放行" >&2; exit 2; } ;;
   files)
     if [ "${#files[@]}" -eq 0 ]; then echo "--files 需要至少一个路径" >&2; exit 2; fi
     for f in "${files[@]}"; do
