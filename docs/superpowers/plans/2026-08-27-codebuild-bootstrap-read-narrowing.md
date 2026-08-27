@@ -88,7 +88,7 @@ stack（需 Docker）。新建文件要么复制那段 fixture（会 synth 两�
 已在最终目录形态下验证过）：
 
 ```python
-"""安全合同的结构化检查器——**只依赖标准库**，被 always-on 与 opt-in 两套测试共用。
+"""安全合同的结构化检查器——**只依赖标准库**，被 always-on、opt-in 与部署后验收共用。
 
 每个检查器都是「吃结构化输入、吐违规列表」的纯函数，于是反例可以在**内存里**注入：
 不改工作树、不需要另一个 harness、跑在默认套件里。
@@ -97,6 +97,12 @@ stack（需 Docker）。新建文件要么复制那段 fixture（会 synth 两�
 宽。实测过一份策略——两条精确授权都在、另加 `s3:GetObject` + `s3:ListBucket` on `*`
 ——而"策略里没有 bootstrap 桶"那种断言照样通过。这与 `_package_project_resources()`
 只看见"手写的那一半"是同一个错误。
+
+**这个错误在本轮被外部复审抓到过三轮，每轮都是"枚举范围比声称的主语窄"**：
+① 只看源码手写的语句，漏 CDK 自动加的；② 只看"含某个子串"，漏 `--ignore-scripts=false`
+之类语义翻转；③ 只看首 token 是 `npm` 的命令，漏 `env npm rebuild` / `sh -c '…'`；
+④ 只看 identity policy，漏 `AWS::S3::BucketPolicy`。所以现在的写法一律是
+**把完整集合与精确期望比等值**，而不是逐个排除已知坏形态。
 """
 import json
 import shlex
@@ -108,6 +114,31 @@ _SEPARATORS = ("&&", "||", ";", "|")
 EXPECT_NPM_INSTALL = ["npm", "install", "--omit=dev", "--no-audit", "--no-fund",
                       "--ignore-scripts"]
 EXPECT_NPMRC_DELETE = ["find", "/tmp/site", "-name", ".npmrc", "-delete"]
+
+# **整条命令序列的 allowlist。** 只判"有没有别的 npm 子命令"是不够的——实测
+# `env npm rebuild`、`sh -c 'npm rebuild'`、`/usr/bin/npm rebuild` 三种写法的首 token
+# 都不是 `npm`，于是那条判据全部放行。枚举 wrapper 是打地鼠（还有 `npx`、`node -e`、
+# `bash -lc`…），所以改成整体等值：buildspec 只有 12 条固定命令，任何新增/改写/换序
+# 都必须显式更新本清单并重新过一次 review。
+#
+# 两条隔断（`EXPECT_NPMRC_DELETE` 在 `EXPECT_NPM_INSTALL` **之前**）由这份清单的
+# 顺序本身保证；单独那几条判据留着只是为了报文能点名是哪条隔断坏了。
+EXPECTED_COMMANDS: list[list[str]] = [
+    ["aws", "s3", "cp",
+     "s3://$ARTIFACTS_BUCKET/validated/$JOB_ID/backend-src.zip", "/tmp/site.zip"],
+    ["mkdir", "-p", "/tmp/site"],
+    ["cd", "/tmp/site"],
+    ["unzip", "-q", "/tmp/site.zip"],
+    ["test", "-f", "/tmp/site/run.sh"],
+    EXPECT_NPMRC_DELETE,
+    ["cd", "/tmp/site/backend"],
+    EXPECT_NPM_INSTALL,
+    ["cp", "/tmp/site/run.sh", "./run.sh"],
+    ["chmod", "+x", "./run.sh"],
+    ["zip", "-qr", "/tmp/backend.zip", "."],
+    ["aws", "s3", "cp", "/tmp/backend.zip",
+     "s3://$ARTIFACTS_BUCKET/artifacts/$JOB_ID/backend.zip"],
+]
 
 
 def _buildspec_commands(src: str) -> tuple[list[list[str]], list[str]]:
@@ -162,32 +193,83 @@ def _buildspec_commands(src: str) -> tuple[list[list[str]], list[str]]:
 
 
 def build_container_interlock_violations(src: str) -> list[str]:
-    """构建容器的两条隔断：`--ignore-scripts` 与"装依赖前删掉 .npmrc"。"""
+    """构建容器的两条隔断 + **整条命令序列**必须与 `EXPECTED_COMMANDS` 等值。"""
     cmds, out = _buildspec_commands(src)
     if out:
         return out
-    npm = [(i, c) for i, c in enumerate(cmds) if c[0] == "npm"]
-    installs = [(i, c) for i, c in npm if len(c) > 1 and c[1] == "install"]
+    # ① 先给两条隔断单独的报文（整体等值也能抓到，但报文说不出坏的是哪条隔断）
+    installs = [(i, c) for i, c in enumerate(cmds)
+                if c[:2] == ["npm", "install"]]
     if len(installs) != 1:
-        return [f"buildspec 里有 {len(installs)} 条 `npm install`（必须恰好 1 条）"]
-    i_npm, install = installs[0]
-    others = [c for i, c in npm if i != i_npm]
-    if others:
-        out.append(f"除 `npm install` 外还有 npm 子命令 {[c[:2] for c in others]}"
-                   f"——`npm rebuild` / `npm run` 会重新执行生命周期脚本")
-    if install != EXPECT_NPM_INSTALL:
-        out.append(f"`npm install` 的 token 不是预期的精确列表。\n"
-                   f"      期望: {EXPECT_NPM_INSTALL}\n      实际: {install}\n"
-                   f"      （精确比对是刻意的：`--ignore-scripts=false` 与 "
-                   f"`--no-ignore-scripts` 都能把语义翻过来，而「含这个子串」照样绿）")
-    finds = [i for i, c in enumerate(cmds) if c == EXPECT_NPMRC_DELETE]
-    if not finds:
-        got = [c for c in cmds if c and c[0] == "find" and ".npmrc" in c]
-        out.append(f"找不到精确的删 .npmrc 命令 {EXPECT_NPMRC_DELETE}"
-                   f"（近似的有 {got or '无'}——删错目录等于没删）")
-    elif min(finds) > i_npm:
-        out.append(f"删 .npmrc 发生在 `npm install` **之后**（第 {min(finds)} 条 vs "
-                   f"第 {i_npm} 条）——装依赖时 registry 已经被它改过了")
+        out.append(f"buildspec 里有 {len(installs)} 条 `npm install`（必须恰好 1 条）")
+    else:
+        i_npm, install = installs[0]
+        if install != EXPECT_NPM_INSTALL:
+            out.append(f"`npm install` 的 token 不是预期的精确列表。\n"
+                       f"      期望: {EXPECT_NPM_INSTALL}\n      实际: {install}\n"
+                       f"      （精确比对是刻意的：`--ignore-scripts=false` 与 "
+                       f"`--no-ignore-scripts` 都能把语义翻过来，而「含这个子串」照样绿）")
+        finds = [i for i, c in enumerate(cmds) if c == EXPECT_NPMRC_DELETE]
+        if not finds:
+            got = [c for c in cmds if c and c[0] == "find" and ".npmrc" in c]
+            out.append(f"找不到精确的删 .npmrc 命令 {EXPECT_NPMRC_DELETE}"
+                       f"（近似的有 {got or '无'}——删错目录等于没删）")
+        elif min(finds) > i_npm:
+            out.append(f"删 .npmrc 发生在 `npm install` **之后**（第 {min(finds)} 条 vs "
+                       f"第 {i_npm} 条）——装依赖时 registry 已经被它改过了")
+    # ② 整体等值：任何新增命令（含 `env npm rebuild` / `sh -c '…'` / `npx` / `node -e`
+    #    这类绕过首 token 判据的 wrapper）都在这里红
+    if cmds != EXPECTED_COMMANDS:
+        extra = [c for c in cmds if c not in EXPECTED_COMMANDS]
+        missing = [c for c in EXPECTED_COMMANDS if c not in cmds]
+        out.append(f"命令序列与安全合同不等值（共 {len(cmds)} 条，期望 "
+                   f"{len(EXPECTED_COMMANDS)} 条）。\n      多出: {extra}\n"
+                   f"      缺少: {missing}\n"
+                   f"      （整体等值是刻意的：只判「有没有别的 npm 子命令」时，"
+                   f"`env npm rebuild` / `sh -c 'npm rebuild'` / `/usr/bin/npm rebuild` "
+                   f"全部放行——枚举 wrapper 是打地鼠。合法改动请显式更新 "
+                   f"EXPECTED_COMMANDS 并重新过 review。）")
+    return out
+
+
+# ── `app.py` 的 import 必须无副作用 ───────────────────────────────────────
+# 只找 `app.synth()` 是不够的：把 `app = App()` 与 `SiteDeployerStack(...)` 放回顶层、
+# 只把 `synth()` 留在守卫里，import 一样会建栈（实测那种写法下旧判据 bad=[]）。
+_FORBIDDEN_TOPLEVEL_CALLS = ("App", "SiteDeployerStack", "synth")
+
+
+def _is_main_guard(node) -> bool:
+    import ast
+    if not isinstance(node, ast.If) or not isinstance(node.test, ast.Compare):
+        return False
+    left, ops, comps = node.test.left, node.test.ops, node.test.comparators
+    return (isinstance(left, ast.Name) and left.id == "__name__"
+            and len(ops) == 1 and isinstance(ops[0], ast.Eq)
+            and isinstance(comps[0], ast.Constant) and comps[0].value == "__main__")
+
+
+def module_toplevel_side_effect_violations(src: str) -> list[str]:
+    """模块顶层（`if __name__ == "__main__":` 之外）不许建栈或 synth。
+
+    没有这条守卫时 `import app` 就 synth 整个栈并触发 Lambda bundling，于是任何想
+    import 该模块的单测都被迫依赖 Docker。判据取**源码结构**——真去 import 一次反而
+    会把这条守卫本身变成需要 Docker 的用例。
+    """
+    import ast
+    out = []
+    for node in ast.parse(src).body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue                       # 函数体不在 import 时执行
+        if _is_main_guard(node):
+            continue                       # 守卫之内是允许的
+        for sub in ast.walk(node):
+            if not isinstance(sub, ast.Call):
+                continue
+            name = getattr(sub.func, "id", None) or getattr(sub.func, "attr", None)
+            if name in _FORBIDDEN_TOPLEVEL_CALLS:
+                out.append(f"模块顶层第 {sub.lineno} 行调用了 {name}(...)"
+                           f"——`import` 时就会建栈/synth，必须挪进 "
+                           f'`if __name__ == "__main__":`')
     return out
 
 
@@ -217,12 +299,94 @@ def _as_list(v):
     return v if isinstance(v, list) else [v]
 
 
+def s3_permission_violations(docs: list[dict], expected: set[tuple[str, str]], *,
+                            where: str = "策略") -> list[str]:
+    """一组策略文档里 `Effect=Allow` 的 S3 `(action, resource)` 全集必须**等于** `expected`。
+
+    **共享给三个调用点**：手写模板 fixture、真 synth 模板、以及部署后的真机文档
+    （后者的 Resource 是已解析的 ARN 字符串，`render_token` 原样返回）。三处用同一个
+    规范化与比较逻辑，是因为上一版的部署后确认自己拼了一套字符串 grep，而那套判据
+    已经被"两条精确授权都在 + `s3:GetObject` on `*`"证明可绕过。
+
+    以下形态**直接判违规、不求值**：`NotAction`/`NotResource`、`Resource:"*"`、
+    任何带 `*` 的 S3 动作（含 `s3:*` / `s3:GetObject*` / 裸 `*`）、`render_token`
+    不认识的 CloudFormation 形态。
+    """
+    out: list[str] = []
+    got: set[tuple[str, str]] = set()
+    for doc in docs:
+        for st in doc.get("Statement") or []:
+            if "NotAction" in st or "NotResource" in st:
+                out.append(f"{where}里有语句用了 NotAction/NotResource（不做集合求补）："
+                           f"{json.dumps(st, ensure_ascii=False)[:90]}")
+                continue
+            if st.get("Effect") != "Allow":
+                continue
+            acts = [a for a in _as_list(st.get("Action") or []) if isinstance(a, str)]
+            s3 = [a for a in acts if a == "*" or a.lower().startswith("s3:")]
+            if not s3:
+                continue
+            wild = [a for a in s3 if "*" in a]
+            if wild:
+                out.append(f"{where}里 S3 动作有通配 {wild}——精确 allowlist 不接受通配动作")
+            try:
+                rs = [render_token(x) for x in _as_list(st.get("Resource"))]
+            except Unrenderable as exc:
+                out.append(f"{where}里 Resource 有不认识的 CloudFormation 形态：{exc}")
+                continue
+            if any(r == "*" for r in rs):
+                out.append(f"{where}里有 S3 语句的 Resource 是 `*`（动作 {s3}）")
+            for a in s3:
+                for r in rs:
+                    got.add((a, r))
+    if got != expected:
+        out.append(f"{where}的 S3 权限全集与精确 allowlist 不符。\n"
+                   f"      多出: {sorted(got - expected)}\n"
+                   f"      缺少: {sorted(expected - got)}")
+    return out
+
+
+def grants_to_principal(st: dict, principal_ids: set[str]) -> tuple[bool, list[str]]:
+    """这条 resource-policy 语句是否授给了 `principal_ids` 里的某个身份（或所有人）。
+
+    **公开**（不带下划线）是因为部署后的真机验收也要用它：那时 `principal_ids` 传的是
+    已解析的角色 ARN，而模板检查器传的是 `<GetAtt:…>` / `<Ref:…>` 形态。两处共用同一个
+    判据，才不会像上一版那样在真机侧又长出一套更弱的字符串 grep。
+
+    **不认识的 Principal 形态 fail-closed**（当成"授给了"并报违规）：猜错的方向
+    永远是"看起来合格"。
+    """
+    p = st.get("Principal")
+    if p == "*":
+        return True, []
+    if not isinstance(p, dict):
+        return True, [f"Principal 形态不认识（{json.dumps(p, ensure_ascii=False)[:60]}），"
+                      f"守卫按最坏情况当成授给了本角色"]
+    unknown = sorted(set(p) - {"AWS", "Service", "Federated", "CanonicalUser"})
+    if unknown:
+        return True, [f"Principal 里有不认识的键 {unknown}，按最坏情况处理"]
+    for raw in _as_list(p.get("AWS") or []):
+        if raw == "*":
+            return True, []
+        try:
+            if render_token(raw) in principal_ids:
+                return True, []
+        except Unrenderable as exc:
+            return True, [f"Principal.AWS 里有不认识的形态：{exc}，按最坏情况处理"]
+    return False, []
+
+
 def package_project_s3_violations(tpl: dict) -> list[str]:
     """`site-package` 角色的 **S3 权限全集**必须精确等于两条。
 
-    覆盖角色的**全部**模板内权限来源（inline `Policies`、`AWS::IAM::Policy`、
-    `AWS::IAM::ManagedPolicy`、`ManagedPolicyArns`）——只收其中一种，就是
-    `_package_project_resources()` 那个"只看见手写一半"的错误换到模板层重演。
+    覆盖角色的**全部**模板内权限来源：inline `Policies`、`AWS::IAM::Policy`、
+    `AWS::IAM::ManagedPolicy`、`ManagedPolicyArns`，**以及 `AWS::S3::BucketPolicy`**
+    ——只收 identity policy 时，一条把 `s3:*` on `*` 授给本角色的桶策略能让整个断言
+    照样绿（实测）。这与 `_package_project_resources()` 只看见"手写的那一半"同源。
+
+    **不覆盖**：本 stack 之外的 resource policy，尤其是 **CDK bootstrap 桶自己的桶策略**
+    （它不在这份模板里）。那条通道由 `verify_account_trust_boundary.py` 的
+    bucket-policy 快照负责——本检查器不假装覆盖它。
     """
     res = tpl["Resources"]
     projs = [(lid, r) for lid, r in res.items()
@@ -253,7 +417,22 @@ def package_project_s3_violations(tpl: dict) -> list[str]:
                 and ref in (r["Properties"].get("Roles") or []):
             docs.append(r["Properties"]["PolicyDocument"])
     if not docs:
-        return out + ["没找到该角色的任何策略文档——定位逻辑失效了"]
+        return out + ["没找到该角色的任何 identity policy——定位逻辑失效了"]
+
+    # 桶策略：只把**授给本角色（或所有人）**的语句纳入权限集合。
+    # 本 stack 里今天有一条 `ArtifactsPolicy`，Principal 是 auto-delete 自定义资源的
+    # 角色 ⇒ 与本角色无关、正确地被跳过（若把"任何桶策略"都算进来会立刻误红）。
+    me = {f"<GetAtt:{lid}.Arn>", f"<Ref:{lid}>"}
+    for r in res.values():
+        if r["Type"] != "AWS::S3::BucketPolicy":
+            continue
+        for st in r["Properties"]["PolicyDocument"].get("Statement") or []:
+            if st.get("Effect") != "Allow":
+                continue
+            hit, notes = grants_to_principal(st, me)
+            out += notes
+            if hit:
+                docs.append({"Statement": [st]})
 
     buckets = [b for b, r in res.items()
                if r["Type"] == "AWS::S3::Bucket"
@@ -264,39 +443,7 @@ def package_project_s3_violations(tpl: dict) -> list[str]:
     art = buckets[0]
     expected = {("s3:GetObject", f"<GetAtt:{art}.Arn>/validated/*"),
                 ("s3:PutObject", f"<GetAtt:{art}.Arn>/artifacts/*")}
-
-    got: set[tuple[str, str]] = set()
-    for doc in docs:
-        for st in doc["Statement"]:
-            if "NotAction" in st or "NotResource" in st:
-                out.append(f"语句用了 NotAction/NotResource（守卫不做集合求补）："
-                           f"{json.dumps(st, ensure_ascii=False)[:90]}")
-                continue
-            if st.get("Effect") != "Allow":
-                continue
-            acts = [a for a in _as_list(st.get("Action") or [])]
-            s3 = [a for a in acts if isinstance(a, str)
-                  and (a == "*" or a.lower().startswith("s3:"))]
-            if not s3:
-                continue
-            wild = [a for a in s3 if "*" in a]
-            if wild:
-                out.append(f"S3 动作里有通配 {wild}——精确 allowlist 不接受通配动作")
-            try:
-                rs = [render_token(x) for x in _as_list(st.get("Resource"))]
-            except Unrenderable as exc:
-                out.append(f"Resource 里有不认识的 CloudFormation 形态：{exc}")
-                continue
-            if any(r == "*" for r in rs):
-                out.append(f"S3 语句的 Resource 是 `*`（动作 {s3}）")
-            for a in s3:
-                for r in rs:
-                    got.add((a, r))
-    if got != expected:
-        extra, missing = sorted(got - expected), sorted(expected - got)
-        out.append(f"S3 权限全集与精确 allowlist 不符。\n      多出: {extra}\n"
-                   f"      缺少: {missing}")
-    return out
+    return out + s3_permission_violations(docs, expected, where="PackageProject 角色")
 
 
 # ── BuildSpec 交付形态 ────────────────────────────────────────────────────
@@ -338,6 +485,7 @@ import pytest
 
 from security_contracts import (build_container_interlock_violations,
                                 buildspec_template_violations,
+                                module_toplevel_side_effect_violations,
                                 package_project_s3_violations)
 
 BUILDSPEC = Path(__file__).parents[1] / "buildspec-package.yml"
@@ -409,6 +557,15 @@ def _find_line(src):
     return next(l for l in src.splitlines() if ".npmrc" in l and "-delete" in l)
 
 
+def _swap_lines(src: str, needle_a: str, needle_b: str) -> str:
+    """按**内容**定位两行并交换（不按行号偏移——那样容易换到注释上）。"""
+    lines = src.splitlines()
+    ia = next(i for i, l in enumerate(lines) if needle_a in l and l.strip().startswith("-"))
+    ib = next(i for i, l in enumerate(lines) if needle_b in l and l.strip().startswith("-"))
+    lines[ia], lines[ib] = lines[ib], lines[ia]
+    return "\n".join(lines) + "\n"
+
+
 def _buildspec_counterexamples() -> dict[str, str]:
     """**外部复审提出的**反例（前五条）+ 本轮补的一条。逐字保留，别精简。"""
     good = BUILDSPEC.read_text(encoding="utf-8")
@@ -431,6 +588,20 @@ def _buildspec_counterexamples() -> dict[str, str]:
             "\n".join(lines[:i_n + 1] + ["      - npm rebuild"] + lines[i_n + 1:]) + "\n",
         "追加 --no-ignore-scripts 反转语义": good.replace(
             "--ignore-scripts", "--ignore-scripts --no-ignore-scripts"),
+        # 下面三条是**外部复审提出的**：首 token 不是 `npm`，旧判据全部放行
+        "env npm rebuild（wrapper）":
+            "\n".join(lines[:i_n + 1] + ["      - env npm rebuild"] + lines[i_n + 1:]) + "\n",
+        "sh -c 'npm rebuild'（wrapper）":
+            "\n".join(lines[:i_n + 1] + ["      - sh -c 'npm rebuild'"] + lines[i_n + 1:]) + "\n",
+        "/usr/bin/npm rebuild（绝对路径）":
+            "\n".join(lines[:i_n + 1] + ["      - /usr/bin/npm rebuild"] + lines[i_n + 1:]) + "\n",
+        # 整体等值顺带盖住的两类：多一条无关命令、把两条命令换序
+        "多一条无关命令（node -e）":
+            "\n".join(lines[:i_n + 1] + ['      - node -e "1"'] + lines[i_n + 1:]) + "\n",
+        # **按内容定位**换序，不按行号偏移：第一版按 i_n-2/i_n-3 换，结果换到了两行
+        # **注释**上、命令序列没变，于是检查器正确地没红——反例自己写错了。
+        "删 .npmrc 与 cd backend 换序": _swap_lines(
+            good, "-name .npmrc -delete", "cd /tmp/site/backend"),
     }
 
 
@@ -491,7 +662,36 @@ def _iam_counterexamples() -> dict[str, dict]:
             {"PolicyName": "extra", "PolicyDocument": {"Statement": [
                 {"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]}}]),
         "经 AWS::IAM::ManagedPolicy.Roles": mp,
+        # 下面三条是**外部复审提出的**：只收 identity policy 时全部放行
+        "桶策略把 s3:* on * 授给本角色": _bucket_policy(
+            {"AWS": {"Fn::GetAtt": [ROLE, "Arn"]}},
+            ["s3:GetObject", "s3:ListBucket"], "*"),
+        "桶策略 Principal 是 *": _bucket_policy(
+            "*", ["s3:GetObject"], "*"),
+        "桶策略 Principal 形态不认识（fail-closed）": _bucket_policy(
+            {"Weird": "x"}, ["s3:GetObject"], "*"),
     }
+
+
+def _bucket_policy(principal, actions, resource) -> dict:
+    t = _template(inlined=True)
+    t["Resources"]["InjectedBucketPolicy"] = {
+        "Type": "AWS::S3::BucketPolicy",
+        "Properties": {"Bucket": {"Ref": ART}, "PolicyDocument": {"Statement": [
+            {"Effect": "Allow", "Principal": principal,
+             "Action": actions, "Resource": resource}]}}}
+    return t
+
+
+def test_bucket_policy_for_another_principal_is_not_counted():
+    """正向控制：授给**别的**身份的桶策略不该误红。
+
+    真模板里就有一条 `ArtifactsPolicy`，Principal 是 auto-delete 自定义资源的角色；
+    把"任何桶策略"都算进本角色的权限集合会让 opt-in 那层立刻误红。
+    """
+    t = _bucket_policy({"AWS": {"Fn::GetAtt": ["SomeOtherRoleABC123", "Arn"]}},
+                       ["s3:PutBucketPolicy", "s3:GetBucket*"], "*")
+    assert package_project_s3_violations(t) == []
 
 
 @pytest.mark.parametrize("label", list(_iam_counterexamples()))
@@ -516,6 +716,50 @@ def test_buildspec_template_rejects_each_counterexample(label):
         t["Resources"][PRJ]["Properties"]["Source"]["BuildSpec"] = \
             want.decode("utf-8")[:-1]
     assert buildspec_template_violations(t, want), f"**没红**：{label}"
+
+
+# ── `app.py` 的 import 必须无副作用 ──────────────────────────────────────
+# **放在 always-on 这边而不是 opt-in 那边**：它是纯 AST 判据、不需要 aws_cdk 也不需要
+# Docker，写成要 `template` fixture 的用例会为一条不需要 synth 的断言白起一次 synth。
+PRE_CHANGE_TOPLEVEL = """
+app = App()
+SiteDeployerStack(app, "SiteDeployerStack",
+                  env=Environment(account=ACCOUNT, region=REGION))
+app.synth()
+"""
+
+# 只把 `synth()` 挪进守卫、把建栈留在顶层——旧判据（只找 `app.synth()`）对它 bad=[]，
+# 而 import 一样会建栈。这条是外部复审提出的反例。
+SYNTH_ONLY_GUARDED = """
+app = App()
+SiteDeployerStack(app, "SiteDeployerStack")
+if __name__ == "__main__":
+    app.synth()
+"""
+
+
+def test_real_app_py_has_no_toplevel_side_effects():
+    src = (Path(__file__).parents[1] / "infra" / "app.py").read_text(encoding="utf-8")
+    assert module_toplevel_side_effect_violations(src) == []
+
+
+@pytest.mark.parametrize("label,src", [
+    ("改动前的完整三行", PRE_CHANGE_TOPLEVEL),
+    ("只把 synth 挪进守卫、建栈留在顶层", SYNTH_ONLY_GUARDED),
+    ("顶层只有一个裸 App()", "app = App()\n"),
+    ("顶层只有一个 SiteDeployerStack(...)", 'SiteDeployerStack(app, "S")\n'),
+])
+def test_toplevel_side_effect_guard_rejects_each_counterexample(label, src):
+    assert module_toplevel_side_effect_violations(src), f"**没红**：{label}"
+
+
+def test_guard_allows_everything_inside_the_main_guard():
+    """正向控制：守卫之内的同样三行必须放行，否则这条守卫会把正确写法也判红。"""
+    ok = ('if __name__ == "__main__":\n'
+          "    app = App()\n"
+          '    SiteDeployerStack(app, "S")\n'
+          "    app.synth()\n")
+    assert module_toplevel_side_effect_violations(ok) == []
 ```
 
 - [ ] **Step 3: 跑它，确认正反两向都成立**
@@ -1058,47 +1302,92 @@ rm -rf cdk.out
 PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never
 ```
 
-- [ ] **Step 3: 部署后静态确认（只读，全部 `assert`）**
+- [ ] **Step 3: 部署后静态确认（只读，全部 `assert`，**复用同一个精确检查器**）**
+
+**不许在这里另写一套字符串 grep。** 上一版这一步是
+`assert "cdk-hnb659fds-assets" not in allp` + `assert "s3:List" not in allp` ——那正是
+已被证明可被「两条精确授权都在 + `s3:GetObject` on `*`」绕过的旧判据。模板层变强了而真机
+侧又复制了一套弱逻辑，等于白改。现在两处调**同一个** `s3_permission_violations()`。
 
 ```bash
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 python3 - <<'PY'
-import boto3, configparser, json
+import boto3, configparser, json, sys
 from pathlib import Path
+sys.path.insert(0, "site-builder/deployer/tests")
+from security_contracts import (grants_to_principal, s3_permission_violations)
+
 REGION = "us-east-1"
 s = boto3.Session(region_name=REGION)
 cfg = configparser.ConfigParser(); cfg.read(Path("site-builder/config.ini"))
-want = cfg["Platform"]["account_id"]
-assert s.client("sts").get_caller_identity()["Account"] == want, "账号不匹配"
+acct = cfg["Platform"]["account_id"]
+assert s.client("sts").get_caller_identity()["Account"] == acct, "凭证账号与 config 不符"
 
+# ① buildspec 交付形态
 BS = Path("site-builder/deployer/buildspec-package.yml").read_bytes()
-p = s.client("codebuild").batch_get_projects(names=["site-package"])["projects"][0]
+cb = s.client("codebuild")
+p = cb.batch_get_projects(names=["site-package"])["projects"][0]
 src = p["source"]
 assert src["type"] == "NO_SOURCE", src["type"]
 inline = src.get("buildspec", "")
 assert not inline.startswith("arn:"), "buildspec 还是 S3 ARN"
 assert inline.encode("utf-8") == BS, "内联的 buildspec 与仓库文件不逐字节相同"
 
-iam = s.client("iam")
-role = p["serviceRole"].rsplit("/", 1)[-1]
-blob = []
+# ② 该角色的 S3 权限全集 —— 与模板层同一个检查器、同一套规范化
+iam, s3c = s.client("iam"), s.client("s3")
+role_arn = p["serviceRole"]
+role = role_arn.rsplit("/", 1)[-1]
+docs = []
 for page in iam.get_paginator("list_role_policies").paginate(RoleName=role):
     for name in page["PolicyNames"]:
-        blob.append(json.dumps(iam.get_role_policy(
-            RoleName=role, PolicyName=name)["PolicyDocument"]))
+        docs.append(iam.get_role_policy(RoleName=role, PolicyName=name)["PolicyDocument"])
+attached = []
 for page in iam.get_paginator("list_attached_role_policies").paginate(RoleName=role):
-    for att in page["AttachedPolicies"]:
-        v = iam.get_policy(PolicyArn=att["PolicyArn"])["Policy"]["DefaultVersionId"]
-        blob.append(json.dumps(iam.get_policy_version(
-            PolicyArn=att["PolicyArn"], VersionId=v)["PolicyVersion"]["Document"]))
-allp = "\n".join(blob)
-assert "cdk-hnb659fds-assets" not in allp, "bootstrap 桶权限还在"
-assert "/validated/*" in allp and "/artifacts/*" in allp, "两条精确授权丢了"
-assert "s3:List" not in allp, "还有 s3:List*"
-print("部署后静态确认全部通过")
+    attached += page["AttachedPolicies"]
+assert not attached, f"该角色不该有 managed policy attachment，实际有 {attached}"
+# 与模板检查器同样覆盖 resource policy：artifacts 桶的桶策略里授给本角色的语句也算
+bucket = f"site-artifacts-{acct}"
+try:
+    bp = json.loads(s3c.get_bucket_policy(Bucket=bucket)["Policy"])
+except s3c.exceptions.from_code("NoSuchBucketPolicy"):
+    bp = {"Statement": []}
+for st in bp.get("Statement") or []:
+    if st.get("Effect") != "Allow":
+        continue
+    hit, notes = grants_to_principal(st, {role_arn})
+    assert not notes, f"桶策略的 Principal 形态不认识：{notes}"
+    if hit:
+        docs.append({"Statement": [st]})
+expected = {("s3:GetObject", f"arn:aws:s3:::{bucket}/validated/*"),
+            ("s3:PutObject", f"arn:aws:s3:::{bucket}/artifacts/*")}
+v = s3_permission_violations(docs, expected, where="部署后的 PackageProject 角色")
+assert not v, "\n".join(v)
+
+# ③ DeployerExecRole 的 codebuild:StartBuild 资源必须仍是那个精确项目 ARN
+#    （cdk diff 里该策略的指纹变过——那是 Project「may be replaced」的渲染后果，
+#     这条断言才是它的闭环：验证部署后语义没变，而不是只解释了变化）
+want = {f"arn:aws:codebuild:{REGION}:{acct}:project/site-package"}
+got = set()
+for page in iam.get_paginator("list_role_policies").paginate(
+        RoleName="site-deployer-exec-role"):
+    for name in page["PolicyNames"]:
+        doc = iam.get_role_policy(RoleName="site-deployer-exec-role",
+                                  PolicyName=name)["PolicyDocument"]
+        for st in doc["Statement"]:
+            acts = st.get("Action")
+            acts = [acts] if isinstance(acts, str) else (acts or [])
+            if "codebuild:StartBuild" in acts and st.get("Effect") == "Allow":
+                r = st.get("Resource")
+                got |= set(r if isinstance(r, list) else [r])
+assert got == want, f"StartBuild 的资源集合变了：期望 {want}，实际 {got}"
+print("部署后静态确认全部通过（S3 权限全集用的是与模板层同一个精确检查器）")
 PY
 ```
+
+**为什么这一步能用 `tests/` 里的模块**：`security_contracts.py` 只 import `json` 与
+`shlex`，没有 pytest/aws_cdk 依赖，就是为了能被真机验收直接复用——这也是它不叫
+`test_*.py` 的原因。
 
 - [ ] **Step 4: 行为确认**
 

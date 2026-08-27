@@ -203,18 +203,19 @@ scalar / 行尾续行 / 无法 `shlex` 分词的条目（**fail-closed，不猜*
 `&&` `||` `;` `|` 切成逐条命令的 token 列表。`shlex.split(..., comments=True)` 同时
 解决 shell 注释与引号。
 
-判据是**精确 token 列表**，不是"含某个子串"：
+判据是**整条命令序列与 `EXPECTED_COMMANDS` 等值**（12 条固定命令），另外给两条隔断
+单独的报文（`npm install` 的 token 精确列表、删 `.npmrc` 的精确命令、以及它必须**严格
+早于** install）——单独那几条只是为了报文能点名坏的是哪条隔断，检测靠整体等值。
 
-- 恰好一条 `npm install`，其 token 必须逐个等于
-  `["npm","install","--omit=dev","--no-audit","--no-fund","--ignore-scripts"]`；
-- 除它之外**不允许任何其它 npm 子命令**（`npm rebuild` / `npm run` 会重新执行生命周期
-  脚本）；
-- 必须存在精确命令 `["find","/tmp/site","-name",".npmrc","-delete"]`；
-- 它的位置必须**严格早于** `npm install`。
+**为什么必须整体等值，而不是"除 install 外不许有别的 npm 子命令"**：那条判据只看首
+token 是不是 `npm`，实测 `env npm rebuild`、`sh -c 'npm rebuild'`、`/usr/bin/npm rebuild`
+**全部放行**。而 wrapper 是枚举不完的（还有 `npx`、`node -e`、`bash -lc`…）——枚举它们
+就是打地鼠。既然这份 buildspec 只有 12 条固定命令，把整条序列设成 allowlist 才是与
+IAM 那层同一个形状：**任何**新增/改写/换序都红，合法改动必须显式更新安全合同并重新
+过一次 review。
 
-精确比对是刻意的：`--ignore-scripts=false` 与 `--no-ignore-scripts` 都能把语义翻过来，
-而"含 `--ignore-scripts`"照样绿。代价是往那条命令上加任何合法 flag 都会红一次，逼一次
-自觉更新——与基线纪律同一个取舍。
+精确比对的代价是往命令上加任何合法 flag 都会红一次，逼一次自觉更新——与基线纪律同
+一个取舍。
 
 ### 检查器 ②：IAM 的精确 allowlist（不是 IAM evaluator）
 
@@ -223,14 +224,29 @@ scalar / 行尾续行 / 无法 `shlex` 分词的条目（**fail-closed，不猜*
 1. 从 `AWS::CodeBuild::Project`（`Name == "site-package"`）的 `ServiceRole` **反查**
    角色逻辑 ID（要求是 `Fn::GetAtt` 形态，否则拒绝猜）——不靠 logical-ID 前缀；
 2. 收集该角色的**全部**模板内权限来源：inline `Policies`、`AWS::IAM::Policy`、
-   `AWS::IAM::ManagedPolicy`（两者按 `Roles` 含 `{"Ref": lid}` 匹配），并把非空的
-   `ManagedPolicyArns` 直接判违规；
+   `AWS::IAM::ManagedPolicy`（两者按 `Roles` 含 `{"Ref": lid}` 匹配）、非空的
+   `ManagedPolicyArns` 直接判违规，**以及 `AWS::S3::BucketPolicy`**——只收 identity
+   policy 时，一条把 `s3:GetObject`+`s3:ListBucket` on `*` 授给本角色的桶策略能让整个
+   断言照样绿（实测）。桶策略按 Principal 匹配：只把授给**本角色或 `*`** 的语句纳入，
+   不认识的 Principal 形态按最坏情况处理并报违规。（本 stack 里今天就有一条
+   `ArtifactsPolicy`，Principal 是 auto-delete 自定义资源的角色 ⇒ 正确地被跳过；
+   把"任何桶策略"都算进来会立刻误红。）
 3. 把 `Effect=Allow` 的 S3 `(action, resource)` 规范化成集合，与精确期望比**等值**：
 
 ```
 s3:GetObject → <GetAtt:{artifacts 桶逻辑 ID}.Arn>/validated/*
 s3:PutObject → <GetAtt:{artifacts 桶逻辑 ID}.Arn>/artifacts/*
 ```
+
+比较逻辑抽成**共享纯函数** `s3_permission_violations(docs, expected, where=…)`，
+被三处调用：手写模板 fixture、真 synth 模板、**以及部署后的真机验收**（那时 Resource 是
+已解析的 ARN 字符串，同一个 `render_token` 原样返回）。三处共用是刻意的：上一版的部署后
+确认自己拼了一套字符串 grep，而那套判据正是被"两条精确授权都在 + `s3:GetObject` on `*`"
+绕过的那种——模板层变强而真机侧复制一套弱逻辑等于白改。
+
+**不覆盖**：本 stack 之外的 resource policy，尤其是 **CDK bootstrap 桶自己的桶策略**
+（不在这份模板里）。那条通道由 `verify_account_trust_boundary.py` 的 bucket-policy 快照
+负责，检查器的 docstring 里写明了这条边界。
 
 artifacts 桶的逻辑 ID 由"`BucketName` 以 `site-artifacts-` 开头的那个 `AWS::S3::Bucket`"
 解析出来，**不硬编码 CDK 的哈希后缀**。以下形态**直接判违规、不求值**：
@@ -258,6 +274,13 @@ artifacts 桶的逻辑 ID 由"`BucketName` 以 `site-artifacts-` 开头的那个
 - **opt-in**（`SB_CDK_TESTS=1` + PYTHONPATH 桥接，**需要 Docker**）：
   `tests/test_infra_tables.py` 把**同样三个检查器**跑在真正 synth 出来的模板上。
   手写 fixture 会不会与现实漂移，就由这一层兜住。
+
+`import app` 无副作用这条由一个**独立的纯函数**
+`module_toplevel_side_effect_violations(src)` 守：遍历模块顶层、跳过
+`if __name__ == "__main__":` 子树与函数/类体，拒绝任何 `App(...)` / `SiteDeployerStack(...)`
+/ `*.synth()` 调用。**只找 `app.synth()` 是不够的**——把建栈两行放回顶层、只把 `synth()`
+留在守卫里，import 一样会建栈而旧判据 `bad=[]`（实测）。负向控制用**改动前的完整三行**，
+不是只放回 `synth()` 那一行。
 
 **上一版那句"只 import app.py 不实例化栈、所以不需要 Docker"是错的**：`app.py`
 第 905-908 行在**模块顶层**就 `App()` / `SiteDeployerStack(...)` / `app.synth()`，
@@ -290,9 +313,14 @@ artifacts 桶的逻辑 ID 由"`BucketName` 以 `site-artifacts-` 开头的那个
 
 | 层 | 反例 |
 |---|---|
-| buildspec | `--ignore-scripts=false`；flag 只留在 shell 注释里；删 `.npmrc` 挪到 install 之后；删错目录；install 后追加 `npm rebuild`；`--no-ignore-scripts` |
-| IAM | `s3:GetObject` on `*`；`s3:ListBucket`；另一个桶；`s3:GetObject*` 通配动作；`NotResource`；`Fn::ImportValue` 之类不认识的 token；挂 `AmazonS3ReadOnlyAccess`；角色自身 `Policies` 里的宽语句；经 `AWS::IAM::ManagedPolicy.Roles` |
+| buildspec | `--ignore-scripts=false`；flag 只留在 shell 注释里；删 `.npmrc` 挪到 install 之后；删错目录；install 后追加 `npm rebuild`；`--no-ignore-scripts`；**`env npm rebuild`**；**`sh -c 'npm rebuild'`**；**`/usr/bin/npm rebuild`**；多一条 `node -e`；两条命令换序 |
+| IAM | `s3:GetObject` on `*`；`s3:ListBucket`；另一个桶；`s3:GetObject*` 通配动作；`NotResource`；`Fn::ImportValue` 之类不认识的 token；挂 `AmazonS3ReadOnlyAccess`；角色自身 `Policies` 里的宽语句；经 `AWS::IAM::ManagedPolicy.Roles`；**桶策略把 `s3:*` on `*` 授给本角色**；**桶策略 Principal 是 `*`**；**桶策略 Principal 形态不认识** |
 | BuildSpec 形态 | S3-ARN 的 `Fn::Join` 形态；字节被改动一个字符 |
+| `import` 无副作用 | 改动前的完整三行；**只把 `synth()` 挪进守卫、建栈留在顶层**；顶层裸 `App()`；顶层 `SiteDeployerStack(...)` |
+
+正向控制（同样必须有，否则守卫可能"因为把一切都判红"而通过）：真实 buildspec 合格；
+"改完之后"的模板合格；**授给别的身份的桶策略不该误红**；守卫之内的三行必须放行；
+以及"改动之前"的模板形态**必须红**。
 
 ### 真机行为探针（opt-in、tracked、默认不跑）
 

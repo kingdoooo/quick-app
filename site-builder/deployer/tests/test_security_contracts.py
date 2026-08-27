@@ -8,6 +8,7 @@ import pytest
 
 from security_contracts import (build_container_interlock_violations,
                                 buildspec_template_violations,
+                                module_toplevel_side_effect_violations,
                                 package_project_s3_violations)
 
 BUILDSPEC = Path(__file__).parents[1] / "buildspec-package.yml"
@@ -79,6 +80,15 @@ def _find_line(src):
     return next(l for l in src.splitlines() if ".npmrc" in l and "-delete" in l)
 
 
+def _swap_lines(src: str, needle_a: str, needle_b: str) -> str:
+    """按**内容**定位两行并交换（不按行号偏移——那样容易换到注释上）。"""
+    lines = src.splitlines()
+    ia = next(i for i, l in enumerate(lines) if needle_a in l and l.strip().startswith("-"))
+    ib = next(i for i, l in enumerate(lines) if needle_b in l and l.strip().startswith("-"))
+    lines[ia], lines[ib] = lines[ib], lines[ia]
+    return "\n".join(lines) + "\n"
+
+
 def _buildspec_counterexamples() -> dict[str, str]:
     """**外部复审提出的**反例（前五条）+ 本轮补的一条。逐字保留，别精简。"""
     good = BUILDSPEC.read_text(encoding="utf-8")
@@ -101,6 +111,20 @@ def _buildspec_counterexamples() -> dict[str, str]:
             "\n".join(lines[:i_n + 1] + ["      - npm rebuild"] + lines[i_n + 1:]) + "\n",
         "追加 --no-ignore-scripts 反转语义": good.replace(
             "--ignore-scripts", "--ignore-scripts --no-ignore-scripts"),
+        # 下面三条是**外部复审提出的**：首 token 不是 `npm`，旧判据全部放行
+        "env npm rebuild（wrapper）":
+            "\n".join(lines[:i_n + 1] + ["      - env npm rebuild"] + lines[i_n + 1:]) + "\n",
+        "sh -c 'npm rebuild'（wrapper）":
+            "\n".join(lines[:i_n + 1] + ["      - sh -c 'npm rebuild'"] + lines[i_n + 1:]) + "\n",
+        "/usr/bin/npm rebuild（绝对路径）":
+            "\n".join(lines[:i_n + 1] + ["      - /usr/bin/npm rebuild"] + lines[i_n + 1:]) + "\n",
+        # 整体等值顺带盖住的两类：多一条无关命令、把两条命令换序
+        "多一条无关命令（node -e）":
+            "\n".join(lines[:i_n + 1] + ['      - node -e "1"'] + lines[i_n + 1:]) + "\n",
+        # **按内容定位**换序，不按行号偏移：第一版按 i_n-2/i_n-3 换，结果换到了两行
+        # **注释**上、命令序列没变，于是检查器正确地没红——反例自己写错了。
+        "删 .npmrc 与 cd backend 换序": _swap_lines(
+            good, "-name .npmrc -delete", "cd /tmp/site/backend"),
     }
 
 
@@ -161,7 +185,36 @@ def _iam_counterexamples() -> dict[str, dict]:
             {"PolicyName": "extra", "PolicyDocument": {"Statement": [
                 {"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]}}]),
         "经 AWS::IAM::ManagedPolicy.Roles": mp,
+        # 下面三条是**外部复审提出的**：只收 identity policy 时全部放行
+        "桶策略把 s3:* on * 授给本角色": _bucket_policy(
+            {"AWS": {"Fn::GetAtt": [ROLE, "Arn"]}},
+            ["s3:GetObject", "s3:ListBucket"], "*"),
+        "桶策略 Principal 是 *": _bucket_policy(
+            "*", ["s3:GetObject"], "*"),
+        "桶策略 Principal 形态不认识（fail-closed）": _bucket_policy(
+            {"Weird": "x"}, ["s3:GetObject"], "*"),
     }
+
+
+def _bucket_policy(principal, actions, resource) -> dict:
+    t = _template(inlined=True)
+    t["Resources"]["InjectedBucketPolicy"] = {
+        "Type": "AWS::S3::BucketPolicy",
+        "Properties": {"Bucket": {"Ref": ART}, "PolicyDocument": {"Statement": [
+            {"Effect": "Allow", "Principal": principal,
+             "Action": actions, "Resource": resource}]}}}
+    return t
+
+
+def test_bucket_policy_for_another_principal_is_not_counted():
+    """正向控制：授给**别的**身份的桶策略不该误红。
+
+    真模板里就有一条 `ArtifactsPolicy`，Principal 是 auto-delete 自定义资源的角色；
+    把"任何桶策略"都算进本角色的权限集合会让 opt-in 那层立刻误红。
+    """
+    t = _bucket_policy({"AWS": {"Fn::GetAtt": ["SomeOtherRoleABC123", "Arn"]}},
+                       ["s3:PutBucketPolicy", "s3:GetBucket*"], "*")
+    assert package_project_s3_violations(t) == []
 
 
 @pytest.mark.parametrize("label", list(_iam_counterexamples()))
@@ -189,21 +242,44 @@ def test_buildspec_template_rejects_each_counterexample(label):
 
 
 # ── `app.py` 的 import 必须无副作用 ──────────────────────────────────────
-# **放在 always-on 这边而不是 opt-in 那边**（与计划原文的一处修正）：它是纯 AST 判据、
-# 不需要 aws_cdk 也不需要 Docker，而计划里把它写成了要 `template` fixture 的用例，
-# 那会为一条不需要 synth 的断言白起一次 Docker synth。
-def test_importing_app_has_no_side_effects():
-    """`app.py` 顶层的 `App()/synth()` 必须在 `__main__` 守卫之下。
+# **放在 always-on 这边而不是 opt-in 那边**：它是纯 AST 判据、不需要 aws_cdk 也不需要
+# Docker，写成要 `template` fixture 的用例会为一条不需要 synth 的断言白起一次 synth。
+PRE_CHANGE_TOPLEVEL = """
+app = App()
+SiteDeployerStack(app, "SiteDeployerStack",
+                  env=Environment(account=ACCOUNT, region=REGION))
+app.synth()
+"""
 
-    没有这条守卫时 `import app` 就 synth 整个栈并触发 Lambda bundling，于是任何想 import
-    本模块的单测都被迫依赖 Docker，而 `test_infra_tables.py` 的 fixture 更是 import 时
-    synth 一次、自己再建 App synth 一次。判据取**源码结构**——真去 import 一次反而会把
-    这条守卫变成需要 Docker 的用例。
-    """
-    import ast
+# 只把 `synth()` 挪进守卫、把建栈留在顶层——旧判据（只找 `app.synth()`）对它 bad=[]，
+# 而 import 一样会建栈。这条是外部复审提出的反例。
+SYNTH_ONLY_GUARDED = """
+app = App()
+SiteDeployerStack(app, "SiteDeployerStack")
+if __name__ == "__main__":
+    app.synth()
+"""
+
+
+def test_real_app_py_has_no_toplevel_side_effects():
     src = (Path(__file__).parents[1] / "infra" / "app.py").read_text(encoding="utf-8")
-    bad = [n.lineno for n in ast.parse(src).body
-           if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
-           and getattr(getattr(n.value.func, "value", None), "id", None) == "app"]
-    assert not bad, f"app.py 顶层仍有 app.<...>() 调用（第 {bad} 行）——import 会 synth"
+    assert module_toplevel_side_effect_violations(src) == []
 
+
+@pytest.mark.parametrize("label,src", [
+    ("改动前的完整三行", PRE_CHANGE_TOPLEVEL),
+    ("只把 synth 挪进守卫、建栈留在顶层", SYNTH_ONLY_GUARDED),
+    ("顶层只有一个裸 App()", "app = App()\n"),
+    ("顶层只有一个 SiteDeployerStack(...)", 'SiteDeployerStack(app, "S")\n'),
+])
+def test_toplevel_side_effect_guard_rejects_each_counterexample(label, src):
+    assert module_toplevel_side_effect_violations(src), f"**没红**：{label}"
+
+
+def test_guard_allows_everything_inside_the_main_guard():
+    """正向控制：守卫之内的同样三行必须放行，否则这条守卫会把正确写法也判红。"""
+    ok = ('if __name__ == "__main__":\n'
+          "    app = App()\n"
+          '    SiteDeployerStack(app, "S")\n'
+          "    app.synth()\n")
+    assert module_toplevel_side_effect_violations(ok) == []
