@@ -314,13 +314,31 @@ artifacts 桶的逻辑 ID 由"`BucketName` 以 `site-artifacts-` 开头的那个
 | 层 | 反例 |
 |---|---|
 | buildspec | `--ignore-scripts=false`；flag 只留在 shell 注释里；删 `.npmrc` 挪到 install 之后；删错目录；install 后追加 `npm rebuild`；`--no-ignore-scripts`；**`env npm rebuild`**；**`sh -c 'npm rebuild'`**；**`/usr/bin/npm rebuild`**；多一条 `node -e`；两条命令换序 |
-| IAM | `s3:GetObject` on `*`；`s3:ListBucket`；另一个桶；`s3:GetObject*` 通配动作；`NotResource`；`Fn::ImportValue` 之类不认识的 token；挂 `AmazonS3ReadOnlyAccess`；角色自身 `Policies` 里的宽语句；经 `AWS::IAM::ManagedPolicy.Roles`；**桶策略把 `s3:*` on `*` 授给本角色**；**桶策略 Principal 是 `*`**；**桶策略 Principal 形态不认识** |
+| IAM | `s3:GetObject` on `*`；`s3:ListBucket`；另一个桶；`s3:GetObject*` 通配动作；`NotResource`；`Fn::ImportValue` 之类不认识的 token；挂 `AmazonS3ReadOnlyAccess`；角色自身 `Policies` 里的宽语句；经 `AWS::IAM::ManagedPolicy.Roles`；桶策略把 `s3:*` on `*` 授给本角色；桶策略 Principal 是 `*`；桶策略 Principal 形态不认识；**账号 root + `ArnEquals: aws:PrincipalArn` 指向本角色**；**账号 root 且无条件**；**账号 root + `ArnLike` 通配** |
 | BuildSpec 形态 | S3-ARN 的 `Fn::Join` 形态；字节被改动一个字符 |
-| `import` 无副作用 | 改动前的完整三行；**只把 `synth()` 挪进守卫、建栈留在顶层**；顶层裸 `App()`；顶层 `SiteDeployerStack(...)` |
+| StartBuild（真机） | `codebuild:*` on `*`；裸 `*` on `*`；`codebuild:Start*` 通配；`Allow`+`NotAction`；换成别的项目 ARN |
+| 桶策略读取（真机） | `AccessDenied` / `Throttling` / `InternalError` / `PermanentRedirect` 都必须**原样抛**，只有 `NoSuchBucketPolicy` 才算"没有策略" |
+| `import` 无副作用 | 改动前的完整三行；只把 `synth()` 挪进守卫、建栈留在顶层；顶层裸 `App()`；顶层 `SiteDeployerStack(...)`；**`@App()` decorator**；**`def f(x=SiteDeployerStack(...))` 默认值**；**`class C(App())` 基类** |
 
 正向控制（同样必须有，否则守卫可能"因为把一切都判红"而通过）：真实 buildspec 合格；
-"改完之后"的模板合格；**授给别的身份的桶策略不该误红**；守卫之内的三行必须放行；
+"改完之后"的模板合格；**授给别的身份的桶策略不该误红**；**账号 root + 条件明确指向别的
+角色也不该误红**；**与该动作无关的 `Resource: "*"` 语句（如 logs）不该误报**；
+**函数体/类体里的调用不该被判成顶层副作用**；守卫之内的三行必须放行；
 以及"改动之前"的模板形态**必须红**。
+
+**账号级 principal 的处理是 fail-closed 的**：`Principal: {"AWS": "<acct>:root"}` 加
+`Condition: {ArnEquals: {aws:PrincipalArn: <role>}}` 是常见写法，只比对 `Principal.AWS`
+是否字面等于角色 ARN 会整条漏掉。所以账号级 principal 一律去看 `aws:PrincipalArn`
+条件：指向本角色 ⇒ 计入；**没有条件、用 Not\* 算子、条件值带通配、或形态不认识 ⇒ 按最坏
+情况计入并报违规**；只有条件明确指向别的身份才跳过。
+
+**真机侧的两个共享纯函数也在这份反例矩阵里**（它们住在 `security_contracts.py` 而不是
+只写在计划的 shell heredoc 里，就是为了能被单测钉住）：`bucket_policy_statements()`
+——**不许**用 `except s3.exceptions.from_code("NoSuchBucketPolicy")`，boto3 没建模这个异常、
+`from_code` 实测返回的就是通用 `ClientError`，那条 except 会把 `AccessDenied`/限流全部
+静默解释成"桶没有策略"；`action_resource_violations()` —— 按 **glob 判覆盖**而不是"Action
+列表里字面含这个字符串"，否则 `codebuild:*` / 裸 `*` / `NotAction` 三种形态里的危险授权
+根本不会进入被比较的集合。
 
 ### 真机行为探针（opt-in、tracked、默认不跑）
 

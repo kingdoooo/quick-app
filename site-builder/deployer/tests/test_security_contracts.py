@@ -6,7 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from security_contracts import (build_container_interlock_violations,
+from security_contracts import (action_resource_violations,
+                                bucket_policy_statements,
+                                build_container_interlock_violations,
                                 buildspec_template_violations,
                                 module_toplevel_side_effect_violations,
                                 package_project_s3_violations)
@@ -193,17 +195,42 @@ def _iam_counterexamples() -> dict[str, dict]:
             "*", ["s3:GetObject"], "*"),
         "桶策略 Principal 形态不认识（fail-closed）": _bucket_policy(
             {"Weird": "x"}, ["s3:GetObject"], "*"),
+        # 下面三条是**外部复审提出的**：账号级 principal + aws:PrincipalArn 条件是常见
+        # 写法，只比对 Principal.AWS 是否等于角色 ARN 会整条漏掉
+        "账号 root + ArnEquals 指向本角色": _bucket_policy(
+            {"AWS": f"arn:aws:iam::{ACCT}:root"}, ["s3:GetObject"], "*",
+            condition={"ArnEquals": {"aws:PrincipalArn": {"Fn::GetAtt": [ROLE, "Arn"]}}}),
+        "账号 root 且没有任何条件（fail-closed）": _bucket_policy(
+            {"AWS": f"arn:aws:iam::{ACCT}:root"}, ["s3:GetObject"], "*"),
+        "账号 root + ArnLike 通配（无法判定，fail-closed）": _bucket_policy(
+            {"AWS": ACCT}, ["s3:GetObject"], "*",
+            condition={"ArnLike": {"aws:PrincipalArn": f"arn:aws:iam::{ACCT}:role/*"}}),
     }
 
 
-def _bucket_policy(principal, actions, resource) -> dict:
+def _bucket_policy(principal, actions, resource, *, condition=None) -> dict:
     t = _template(inlined=True)
+    st = {"Effect": "Allow", "Principal": principal,
+          "Action": actions, "Resource": resource}
+    if condition is not None:
+        st["Condition"] = condition
     t["Resources"]["InjectedBucketPolicy"] = {
         "Type": "AWS::S3::BucketPolicy",
-        "Properties": {"Bucket": {"Ref": ART}, "PolicyDocument": {"Statement": [
-            {"Effect": "Allow", "Principal": principal,
-             "Action": actions, "Resource": resource}]}}}
+        "Properties": {"Bucket": {"Ref": ART}, "PolicyDocument": {"Statement": [st]}}}
     return t
+
+
+def test_account_root_condition_pointing_at_another_role_is_not_counted():
+    """正向控制：账号级 principal + 条件**明确指向别的角色** ⇒ 不算授给本角色。
+
+    没有这条，上面那三条反例可以由"把所有账号级 principal 都判红"来满足——那会让任何
+    带 `aws:PrincipalArn` 收窄的正常桶策略都误红。
+    """
+    t = _bucket_policy(
+        {"AWS": f"arn:aws:iam::{ACCT}:root"}, ["s3:GetObject"], "*",
+        condition={"ArnEquals": {"aws:PrincipalArn":
+                                 f"arn:aws:iam::{ACCT}:role/SomeoneElse"}})
+    assert package_project_s3_violations(t) == []
 
 
 def test_bucket_policy_for_another_principal_is_not_counted():
@@ -271,9 +298,30 @@ def test_real_app_py_has_no_toplevel_side_effects():
     ("只把 synth 挪进守卫、建栈留在顶层", SYNTH_ONLY_GUARDED),
     ("顶层只有一个裸 App()", "app = App()\n"),
     ("顶层只有一个 SiteDeployerStack(...)", 'SiteDeployerStack(app, "S")\n'),
+    # 下面三条是**外部复审提出的**：这些都在 import 时求值，而上一版对
+    # FunctionDef/ClassDef 整体跳过，于是全部放行
+    ("decorator 里建栈", "@App()\ndef f():\n    pass\n"),
+    ("默认参数里建栈", 'def f(x=SiteDeployerStack(None, "S")):\n    pass\n'),
+    ("基类里建栈", "class C(App()):\n    pass\n"),
 ])
 def test_toplevel_side_effect_guard_rejects_each_counterexample(label, src):
     assert module_toplevel_side_effect_violations(src), f"**没红**：{label}"
+
+
+def test_guard_still_allows_normal_functions_and_classes():
+    """正向控制：函数**体**与类**体**里的调用不在 import 时执行，不该被判红。
+
+    没有这条，"把 FunctionDef/ClassDef 整体都walk一遍"这种过度收紧也能让上面那三条
+    反例全过——而它会把 app.py 里 `SiteDeployerStack.__init__` 内部的每个
+    `cb.Project(...)` 都报成顶层副作用。
+    """
+    src = ("class SiteDeployerStack:\n"
+           "    def __init__(self):\n"
+           "        self.p = App()\n"
+           "        App().synth()\n"
+           "def g():\n"
+           "    return SiteDeployerStack()\n")
+    assert module_toplevel_side_effect_violations(src) == []
 
 
 def test_guard_allows_everything_inside_the_main_guard():
@@ -283,3 +331,80 @@ def test_guard_allows_everything_inside_the_main_guard():
           '    SiteDeployerStack(app, "S")\n'
           "    app.synth()\n")
     assert module_toplevel_side_effect_violations(ok) == []
+
+
+# ── 部署后真机验收共用的两个纯函数 ────────────────────────────────────────
+# 它们住在 security_contracts.py（而不是只写在计划的 shell heredoc 里），就是为了能在
+# 这里被单测钉住。上一版那两处判据只存在于计划正文，于是"boto3 没建模
+# NoSuchBucketPolicy"与"字面比对 Action"这两个 fail-open 一直没人测到。
+class _FakeS3:
+    def __init__(self, *, policy=None, error_code=None):
+        self._policy, self._code = policy, error_code
+
+    def get_bucket_policy(self, Bucket):                    # noqa: N803
+        if self._code:
+            exc = Exception(f"boom {self._code}")
+            exc.response = {"Error": {"Code": self._code}}
+            raise exc
+        return {"Policy": json.dumps(self._policy)}
+
+
+def test_bucket_policy_absent_means_empty_statements():
+    c = _FakeS3(error_code="NoSuchBucketPolicy")
+    assert bucket_policy_statements(c, "b") == []
+
+
+@pytest.mark.parametrize("code", ["AccessDenied", "Throttling", "InternalError",
+                                  "PermanentRedirect"])
+def test_bucket_policy_other_errors_are_raised_not_swallowed(code):
+    """**这是本轮的一个实测 fail-open**：`s3.exceptions.from_code("NoSuchBucketPolicy")`
+
+    在当前 boto3 里返回的就是通用 `ClientError`，于是那种 except 会把 AccessDenied、
+    限流等全部解释成"桶没有策略"，验收继续绿。
+    """
+    c = _FakeS3(error_code=code)
+    with pytest.raises(Exception) as ei:
+        bucket_policy_statements(c, "b")
+    assert code in str(ei.value)
+
+
+def test_bucket_policy_returns_statements():
+    c = _FakeS3(policy={"Statement": [{"Effect": "Allow"}]})
+    assert bucket_policy_statements(c, "b") == [{"Effect": "Allow"}]
+
+
+PROJECT_ARN = f"arn:aws:codebuild:us-east-1:{ACCT}:project/site-package"
+_EXACT = {"Statement": [{"Effect": "Allow",
+                         "Action": ["codebuild:StartBuild", "codebuild:BatchGetBuilds"],
+                         "Resource": PROJECT_ARN}]}
+
+
+def test_action_resource_exact_set_passes():
+    assert action_resource_violations([_EXACT], "codebuild:StartBuild",
+                                      {PROJECT_ARN}) == []
+
+
+def test_unrelated_wildcard_resource_statement_is_not_flagged():
+    """正向控制：与该动作无关的 `Resource: "*"` 语句（例如 logs）不该被误报。"""
+    docs = [_EXACT, {"Statement": [{"Effect": "Allow", "Action": "logs:PutLogEvents",
+                                    "Resource": "*"}]}]
+    assert action_resource_violations(docs, "codebuild:StartBuild", {PROJECT_ARN}) == []
+
+
+@pytest.mark.parametrize("label,st", [
+    ("codebuild:* on *", {"Effect": "Allow", "Action": "codebuild:*", "Resource": "*"}),
+    ("裸 * on *", {"Effect": "Allow", "Action": "*", "Resource": "*"}),
+    ("codebuild:Start* 通配", {"Effect": "Allow", "Action": "codebuild:Start*",
+                               "Resource": PROJECT_ARN}),
+    ("Allow + NotAction", {"Effect": "Allow", "NotAction": "s3:*", "Resource": "*"}),
+    ("换成别的项目 ARN", {"Effect": "Allow", "Action": "codebuild:StartBuild",
+                          "Resource": "arn:aws:codebuild:us-east-1:1:project/other"}),
+])
+def test_action_resource_rejects_each_counterexample(label, st):
+    """外部复审提出的三条（`codebuild:*` / 裸 `*` / `NotAction`）逐字纳入。
+
+    字面比对 Action 时它们全部漏掉——因为危险授权根本没进入被比较的集合。
+    """
+    docs = [_EXACT, {"Statement": [st]}]
+    assert action_resource_violations(docs, "codebuild:StartBuild",
+                                      {PROJECT_ARN}), f"**没红**：{label}"

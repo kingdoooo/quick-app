@@ -14,7 +14,9 @@
 ④ 只看 identity policy，漏 `AWS::S3::BucketPolicy`。所以现在的写法一律是
 **把完整集合与精确期望比等值**，而不是逐个排除已知坏形态。
 """
+import fnmatch
 import json
+import re
 import shlex
 
 # ── buildspec：命令合同 ────────────────────────────────────────────────────
@@ -168,18 +170,29 @@ def module_toplevel_side_effect_violations(src: str) -> list[str]:
     import ast
     out = []
     for node in ast.parse(src).body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            continue                       # 函数体不在 import 时执行
         if _is_main_guard(node):
             continue                       # 守卫之内是允许的
-        for sub in ast.walk(node):
-            if not isinstance(sub, ast.Call):
-                continue
-            name = getattr(sub.func, "id", None) or getattr(sub.func, "attr", None)
-            if name in _FORBIDDEN_TOPLEVEL_CALLS:
-                out.append(f"模块顶层第 {sub.lineno} 行调用了 {name}(...)"
-                           f"——`import` 时就会建栈/synth，必须挪进 "
-                           f'`if __name__ == "__main__":`')
+        # 函数/类的**体**不在 import 时执行，但 decorator、默认值、基类**会**。
+        # 上一版对 FunctionDef/ClassDef 整体 `continue`，于是 `@App()`、
+        # `def f(x=SiteDeployerStack(...))`、`class C(App())` 全部放行——又是一次
+        # "主语（import 时会不会建栈）比枚举范围宽"（外部复审第四条）。
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            roots = (list(node.decorator_list) + list(node.args.defaults)
+                     + [d for d in node.args.kw_defaults if d is not None])
+        elif isinstance(node, ast.ClassDef):
+            roots = (list(node.decorator_list) + list(node.bases)
+                     + [k.value for k in node.keywords])
+        else:
+            roots = [node]
+        for root in roots:
+            for sub in ast.walk(root):
+                if not isinstance(sub, ast.Call):
+                    continue
+                name = getattr(sub.func, "id", None) or getattr(sub.func, "attr", None)
+                if name in _FORBIDDEN_TOPLEVEL_CALLS:
+                    out.append(f"模块顶层第 {sub.lineno} 行（import 时求值）调用了 "
+                               f"{name}(...)——会建栈/synth，必须挪进 "
+                               f'`if __name__ == "__main__":`')
     return out
 
 
@@ -256,6 +269,43 @@ def s3_permission_violations(docs: list[dict], expected: set[tuple[str, str]], *
     return out
 
 
+# 账号级 principal（裸账号 ID 或 `…:root`）**不等于"与本角色无关"**：常见写法是
+# `Principal: {"AWS": "<acct>:root"}` + `Condition: {ArnEquals: {aws:PrincipalArn: <role>}}`,
+# 它实际就指向那个角色。只比对 Principal.AWS 是否字面等于角色 ARN 会整条漏掉。
+_ACCOUNT_ROOT_RE = re.compile(r"^(?:\d{12}|arn:aws[\w-]*:iam::\d{12}:root)$")
+# 只有这些**正向**算子能把账号级 principal 收窄到具体身份；Not* 与不认识的算子一律
+# fail-closed（当成可能授给本角色并报违规）。
+_PRINCIPAL_ARN_OPS = ("ArnEquals", "ArnLike", "StringEquals", "StringLike",
+                      "StringEqualsIgnoreCase")
+
+
+def _principal_arn_condition(st: dict) -> tuple[list[str] | None, list[str]]:
+    """从 Condition 里取 `aws:PrincipalArn` 的取值集合。
+
+    返回 `(值列表 或 None, 说明)`。`None` = 没有可用于收窄的条件（调用方按最坏情况处理）。
+    """
+    cond = st.get("Condition")
+    if not isinstance(cond, dict):
+        return None, []
+    notes: list[str] = []
+    vals: list[str] = []
+    for op, kv in cond.items():
+        if not isinstance(kv, dict):
+            return None, [f"Condition 的 {op} 不是对象，无法判定"]
+        for key, raw in kv.items():
+            if key.lower() != "aws:principalarn":
+                continue
+            if op not in _PRINCIPAL_ARN_OPS:
+                return None, [f"aws:PrincipalArn 用了 {op}（Not* 或不认识的算子），"
+                              f"守卫不求值，按最坏情况处理"]
+            for x in _as_list(raw):
+                try:
+                    vals.append(render_token(x))
+                except Unrenderable as exc:
+                    return None, [f"aws:PrincipalArn 的值形态不认识：{exc}"]
+    return (vals or None), notes
+
+
 def grants_to_principal(st: dict, principal_ids: set[str]) -> tuple[bool, list[str]]:
     """这条 resource-policy 语句是否授给了 `principal_ids` 里的某个身份（或所有人）。
 
@@ -275,15 +325,29 @@ def grants_to_principal(st: dict, principal_ids: set[str]) -> tuple[bool, list[s
     unknown = sorted(set(p) - {"AWS", "Service", "Federated", "CanonicalUser"})
     if unknown:
         return True, [f"Principal 里有不认识的键 {unknown}，按最坏情况处理"]
+    account_level = False
     for raw in _as_list(p.get("AWS") or []):
         if raw == "*":
             return True, []
         try:
-            if render_token(raw) in principal_ids:
-                return True, []
+            rendered = render_token(raw)
         except Unrenderable as exc:
             return True, [f"Principal.AWS 里有不认识的形态：{exc}，按最坏情况处理"]
-    return False, []
+        if rendered in principal_ids:
+            return True, []
+        if _ACCOUNT_ROOT_RE.match(rendered):
+            account_level = True
+    if not account_level:
+        return False, []
+    # 账号级 principal：由 `aws:PrincipalArn` 条件决定它实际指向谁
+    vals, notes = _principal_arn_condition(st)
+    if vals is None:
+        return True, notes or ["Principal 是账号级（裸账号 ID / `:root`）且没有可判定的 "
+                               "`aws:PrincipalArn` 条件——按最坏情况当成授给了本角色"]
+    if any(("*" in v or "?" in v) for v in vals):
+        return True, notes + [f"`aws:PrincipalArn` 条件含通配 {vals}，无法判定是否命中"
+                              f"本角色——按最坏情况处理"]
+    return (any(v in principal_ids for v in vals)), notes
 
 
 def package_project_s3_violations(tpl: dict) -> list[str]:
@@ -377,4 +441,72 @@ def buildspec_template_violations(tpl: dict, want: bytes) -> list[str]:
     for bad in ("arn:", "cdk-hnb659fds-assets", "AssetParameters"):
         if bad in bs:
             out.append(f"BuildSpec 里出现 {bad!r}")
+    return out
+
+
+# ── 部署后真机验收共用的两个纯函数 ────────────────────────────────────────
+def bucket_policy_statements(s3_client, bucket: str) -> list[dict]:
+    """读桶策略。**只有 `NoSuchBucketPolicy` 才算"没有策略"**，其它错误原样抛。
+
+    **不要写 `except s3.exceptions.from_code("NoSuchBucketPolicy")`**：boto3 的 S3
+    service model 没有建模这个异常，`from_code` 实测返回的就是通用
+    `botocore.exceptions.ClientError` ⇒ 那条 except 会把 `AccessDenied`、限流、
+    错账号等**全部**静默解释成"桶没有策略"，验收随后继续绿。这是 fail-open。
+
+    这里刻意不 import botocore：按 `response["Error"]["Code"]` 判，任何形态不符的异常
+    都往外抛（fail-closed）。
+    """
+    try:
+        return json.loads(s3_client.get_bucket_policy(Bucket=bucket)["Policy"]) \
+            .get("Statement") or []
+    except Exception as exc:                                        # noqa: BLE001
+        code = getattr(exc, "response", None)
+        code = (code or {}).get("Error", {}).get("Code") if isinstance(code, dict) else None
+        if code == "NoSuchBucketPolicy":
+            return []
+        raise
+
+
+def action_resource_violations(docs: list[dict], action: str,
+                              expected_resources: set[str], *,
+                              where: str = "策略") -> list[str]:
+    """"能对 `action` 做事的资源集合"必须精确等于 `expected_resources`。
+
+    **按 glob 判覆盖**（`fnmatch`），不是"Action 列表里字面含这个字符串"：
+    `codebuild:*`、裸 `*`、`codebuild:Start*` 都覆盖 `codebuild:StartBuild`，而字面
+    比对会把它们整条漏掉——那正是上一版这条真机断言的缺陷。`NotAction` 与
+    `Resource: "*"` 一律判违规而不求值。
+
+    只看**覆盖该动作**的语句，所以角色上与该动作无关的 `Resource: "*"` 语句
+    （例如 logs）不会被误报。
+    """
+    out: list[str] = []
+    got: set[str] = set()
+    for doc in docs:
+        for st in doc.get("Statement") or []:
+            if st.get("Effect") != "Allow":
+                continue
+            if "NotAction" in st:
+                out.append(f"{where}里有 Allow + NotAction 语句（守卫不做集合求补）："
+                           f"{json.dumps(st, ensure_ascii=False)[:90]}")
+                continue
+            acts = [a for a in _as_list(st.get("Action") or []) if isinstance(a, str)]
+            if not any(fnmatch.fnmatchcase(action, a) for a in acts):
+                continue
+            wild = [a for a in acts if "*" in a and fnmatch.fnmatchcase(action, a)]
+            if wild:
+                out.append(f"{where}里用通配动作 {wild} 覆盖了 {action}"
+                           f"——精确 allowlist 不接受通配动作")
+            try:
+                rs = [render_token(x) for x in _as_list(st.get("Resource"))]
+            except Unrenderable as exc:
+                out.append(f"{where}里 Resource 形态不认识：{exc}")
+                continue
+            if any(r == "*" for r in rs):
+                out.append(f"{where}里覆盖 {action} 的语句 Resource 是 `*`")
+            got |= set(rs)
+    if got != expected_resources:
+        out.append(f"{where}里能做 {action} 的资源集合不符。\n"
+                   f"      多出: {sorted(got - expected_resources)}\n"
+                   f"      缺少: {sorted(expected_resources - got)}")
     return out
