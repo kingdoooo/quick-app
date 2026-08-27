@@ -303,6 +303,13 @@ def test_real_app_py_has_no_toplevel_side_effects():
     ("decorator 里建栈", "@App()\ndef f():\n    pass\n"),
     ("默认参数里建栈", 'def f(x=SiteDeployerStack(None, "S")):\n    pass\n'),
     ("基类里建栈", "class C(App()):\n    pass\n"),
+    # 下面四条是**外部复审提出的**：上一版把"类的体不在 import 时执行"写进了注释，
+    # 那是**错的事实**；而 app.py 没有 `from __future__ import annotations`，3.12 下
+    # annotation 是立即求值的（实测：定义 `def f(x: probe())` 就会调用 probe()）
+    ("class body 里直接建栈", "class C:\n    App()\n"),
+    ("class body 里赋值建栈", 'class C:\n    s = SiteDeployerStack(None, "S")\n'),
+    ("参数 annotation 里建栈", "def f(x: App()):\n    pass\n"),
+    ("返回 annotation 里建栈", 'def f() -> SiteDeployerStack(None, "S"):\n    pass\n'),
 ])
 def test_toplevel_side_effect_guard_rejects_each_counterexample(label, src):
     assert module_toplevel_side_effect_violations(src), f"**没红**：{label}"
@@ -322,6 +329,14 @@ def test_guard_still_allows_normal_functions_and_classes():
            "def g():\n"
            "    return SiteDeployerStack()\n")
     assert module_toplevel_side_effect_violations(src) == []
+
+
+def test_guard_allows_lambda_bodies():
+    """正向控制：lambda 的**体**在创建时不求值，不该被判红。
+
+    （它的默认值/annotation 会求值，那部分按函数规则查——见反例清单。）
+    """
+    assert module_toplevel_side_effect_violations("factory = lambda: App()\n") == []
 
 
 def test_guard_allows_everything_inside_the_main_guard():
@@ -399,6 +414,17 @@ def test_unrelated_wildcard_resource_statement_is_not_flagged():
     ("Allow + NotAction", {"Effect": "Allow", "NotAction": "s3:*", "Resource": "*"}),
     ("换成别的项目 ARN", {"Effect": "Allow", "Action": "codebuild:StartBuild",
                           "Resource": "arn:aws:codebuild:us-east-1:1:project/other"}),
+    # 下面三条是**外部复审提出的**：AWS 的 IAM 合同规定服务前缀与动作名都**不区分
+    # 大小写**（`iam:ListAccessKeys` == `IAM:listaccesskeys`），而 `fnmatchcase`
+    # 会把它们整条漏掉
+    ("CODEBUILD:* 全大写前缀", {"Effect": "Allow", "Action": "CODEBUILD:*",
+                                "Resource": "*"}),
+    ("CodeBuild:StartBuild 驼峰前缀", {"Effect": "Allow",
+                                       "Action": "CodeBuild:StartBuild",
+                                       "Resource": "*"}),
+    ("codebuild:startbuild 全小写", {"Effect": "Allow",
+                                     "Action": "codebuild:startbuild",
+                                     "Resource": "*"}),
 ])
 def test_action_resource_rejects_each_counterexample(label, st):
     """外部复审提出的三条（`codebuild:*` / 裸 `*` / `NotAction`）逐字纳入。

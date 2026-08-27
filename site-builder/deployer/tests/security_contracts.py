@@ -160,39 +160,79 @@ def _is_main_guard(node) -> bool:
             and isinstance(comps[0], ast.Constant) and comps[0].value == "__main__")
 
 
+def _arg_roots(a) -> list:
+    """函数/lambda 的参数里**在定义时求值**的那些表达式：默认值 + 全部 annotation。
+
+    `app.py` 没有 `from __future__ import annotations`，而 3.12 下 annotation 是**立即
+    求值**的（实测：定义 `def f(x: probe())` 就会调用 `probe()`）。所以 annotation 里
+    建栈同样是 import 时副作用。
+    """
+    out = list(a.defaults) + [d for d in a.kw_defaults if d is not None]
+    for grp in (a.posonlyargs, a.args, a.kwonlyargs):
+        out += [x.annotation for x in grp if x.annotation is not None]
+    for v in (a.vararg, a.kwarg):
+        if v is not None and v.annotation is not None:
+            out.append(v.annotation)
+    return out
+
+
+def _import_time_calls(node):
+    """产出 `node` 在 **import 时**会被求值到的所有 `Call`。
+
+    真实的 Python import 语义，逐条对应：
+
+    - 函数：decorator、默认值、**全部 annotation**（含返回）会求值；**体不会**。
+    - **类：体会求值**（`class C: App()` 立即执行）——上一版把"类的体不在 import 时
+      执行"写进了注释，那是**错的事实**。类体里的方法定义按函数规则处理。
+    - lambda：**体不求值**（创建时只绑定），但它的默认值/annotation 求值。
+    """
+    import ast
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        roots = list(node.decorator_list) + _arg_roots(node.args)
+        if node.returns is not None:
+            roots.append(node.returns)
+        for r in roots:
+            yield from _import_time_calls(r)
+        return
+    if isinstance(node, ast.Lambda):
+        for r in _arg_roots(node.args):
+            yield from _import_time_calls(r)
+        return
+    if isinstance(node, ast.ClassDef):
+        roots = (list(node.decorator_list) + list(node.bases)
+                 + [k.value for k in node.keywords])
+        for r in roots:
+            yield from _import_time_calls(r)
+        for st in node.body:                    # **类体会执行**
+            yield from _import_time_calls(st)
+        return
+    if isinstance(node, ast.Call):
+        yield node
+    for child in ast.iter_child_nodes(node):
+        yield from _import_time_calls(child)
+
+
 def module_toplevel_side_effect_violations(src: str) -> list[str]:
     """模块顶层（`if __name__ == "__main__":` 之外）不许建栈或 synth。
 
     没有这条守卫时 `import app` 就 synth 整个栈并触发 Lambda bundling，于是任何想
     import 该模块的单测都被迫依赖 Docker。判据取**源码结构**——真去 import 一次反而
     会把这条守卫本身变成需要 Docker 的用例。
+
+    枚举范围就是**真实的 import 时求值语义**（见 `_import_time_calls`），不是"顶层直接
+    调用"。这条选择是刻意的：收窄声称正是这一轮反复出问题的形状。
     """
     import ast
     out = []
     for node in ast.parse(src).body:
         if _is_main_guard(node):
-            continue                       # 守卫之内是允许的
-        # 函数/类的**体**不在 import 时执行，但 decorator、默认值、基类**会**。
-        # 上一版对 FunctionDef/ClassDef 整体 `continue`，于是 `@App()`、
-        # `def f(x=SiteDeployerStack(...))`、`class C(App())` 全部放行——又是一次
-        # "主语（import 时会不会建栈）比枚举范围宽"（外部复审第四条）。
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            roots = (list(node.decorator_list) + list(node.args.defaults)
-                     + [d for d in node.args.kw_defaults if d is not None])
-        elif isinstance(node, ast.ClassDef):
-            roots = (list(node.decorator_list) + list(node.bases)
-                     + [k.value for k in node.keywords])
-        else:
-            roots = [node]
-        for root in roots:
-            for sub in ast.walk(root):
-                if not isinstance(sub, ast.Call):
-                    continue
-                name = getattr(sub.func, "id", None) or getattr(sub.func, "attr", None)
-                if name in _FORBIDDEN_TOPLEVEL_CALLS:
-                    out.append(f"模块顶层第 {sub.lineno} 行（import 时求值）调用了 "
-                               f"{name}(...)——会建栈/synth，必须挪进 "
-                               f'`if __name__ == "__main__":`')
+            continue                           # 守卫之内是允许的
+        for sub in _import_time_calls(node):
+            name = getattr(sub.func, "id", None) or getattr(sub.func, "attr", None)
+            if name in _FORBIDDEN_TOPLEVEL_CALLS:
+                out.append(f"第 {sub.lineno} 行在 import 时求值并调用了 {name}(...)"
+                           f"——会建栈/synth，必须挪进 "
+                           f'`if __name__ == "__main__":`')
     return out
 
 
@@ -261,7 +301,8 @@ def s3_permission_violations(docs: list[dict], expected: set[tuple[str, str]], *
                 out.append(f"{where}里有 S3 语句的 Resource 是 `*`（动作 {s3}）")
             for a in s3:
                 for r in rs:
-                    got.add((a, r))
+                    got.add((a.lower(), r))     # IAM 动作大小写不敏感
+    expected = {(a.lower(), r) for a, r in expected}
     if got != expected:
         out.append(f"{where}的 S3 权限全集与精确 allowlist 不符。\n"
                    f"      多出: {sorted(got - expected)}\n"
@@ -477,11 +518,17 @@ def action_resource_violations(docs: list[dict], action: str,
     比对会把它们整条漏掉——那正是上一版这条真机断言的缺陷。`NotAction` 与
     `Resource: "*"` 一律判违规而不求值。
 
+    **匹配前统一小写**：AWS 的 IAM 合同规定服务前缀与动作名**都不区分大小写**
+    （`iam:ListAccessKeys` == `IAM:listaccesskeys`），所以 `CODEBUILD:*` /
+    `CodeBuild:StartBuild` / `codebuild:startbuild` 在真实 IAM 里全都覆盖目标动作，
+    而 `fnmatchcase` 会把它们整条漏掉（实测三条都返回零违规）。报文里保留原始大小写。
+
     只看**覆盖该动作**的语句，所以角色上与该动作无关的 `Resource: "*"` 语句
     （例如 logs）不会被误报。
     """
     out: list[str] = []
     got: set[str] = set()
+    target = action.lower()
     for doc in docs:
         for st in doc.get("Statement") or []:
             if st.get("Effect") != "Allow":
@@ -491,9 +538,10 @@ def action_resource_violations(docs: list[dict], action: str,
                            f"{json.dumps(st, ensure_ascii=False)[:90]}")
                 continue
             acts = [a for a in _as_list(st.get("Action") or []) if isinstance(a, str)]
-            if not any(fnmatch.fnmatchcase(action, a) for a in acts):
+            if not any(fnmatch.fnmatchcase(target, a.lower()) for a in acts):
                 continue
-            wild = [a for a in acts if "*" in a and fnmatch.fnmatchcase(action, a)]
+            wild = [a for a in acts
+                    if "*" in a and fnmatch.fnmatchcase(target, a.lower())]
             if wild:
                 out.append(f"{where}里用通配动作 {wild} 覆盖了 {action}"
                            f"——精确 allowlist 不接受通配动作")
