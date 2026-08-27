@@ -917,7 +917,13 @@ MSG
   - **必须用 `.tgz`，不能用普通子目录**：合同校验器会扫 `backend/` 下**任何**
     `package.json` 并拒绝生命周期脚本（`redlines.py` 的 `_scan_package_json`），
     普通子目录形态在 validate 就被拦下、根本到不了 CodeBuild；而 `.tgz` 不在 `TEXT_EXT`
-    里、不会被打开。**这同时就是"依赖这条路只有 flag 一道"的可执行证据。**
+    里、不会被打开。
+
+    **这一条已用生产校验器本体实测过**（`contract.scan_redlines`，拿 `fixtures/nosql-notes`
+    加一个带 `preinstall` 的依赖）：`.tgz` 形态 **0 违规**；普通子目录形态 **1 违规**，
+    报文点名 `backend/probe-dep/package.json: 禁止 npm 生命周期脚本 ['preinstall']`。
+    所以"依赖这条路只有 `--ignore-scripts` 一道"不是推理——**打成 `.tgz` 就能把生命周期
+    脚本完整带过合同校验**，这就是那句话的可执行证据，探针只是再把 npm 那半边也测一次。
 - 用 `site-builder/scripts/deploy_fixture.py <dir> --site-id <probe-id>` 部署
   （与 E2E 同一条路径，别另写一套提交逻辑）；
 - **清理必须复用 `tests/test_e2e_fixtures.py` 里那套 undeploy/清理 helper**，不许写一份
