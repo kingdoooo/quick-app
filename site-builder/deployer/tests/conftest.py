@@ -143,21 +143,3 @@ def aws(monkeypatch):
             PolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": [
                 {"Effect": "Allow", "Action": "*", "Resource": "*"}]}))
         yield
-
-
-# ---------------------------------------------------------------------------
-# 把**过滤之前**的完整收集清单留一份给守卫用。
-#
-# `-k` / `-m` 的 deselect 就发生在 `pytest_collection_modifyitems` 里（pytest 自己的实现
-# 就地删 `items`），所以 `request.session.items` 拿到的是**过滤之后**的列表——实测：
-# 一个 3 条用例的文件带 `-k alpha` 跑，`session.items` 只剩 1 条。
-# （**别用文件名里含关键词的文件去验这件事**：`-k` 也匹配模块名，那样三条会全被选中，
-#   看起来像"没被过滤"。我就是这么误判过一次。）
-#
-# 有守卫要断言"pytest 到底会不会收集某几条用例"（见
-# `test_verify_account_trust_boundary.py::test_blind_spot_tests_exist_and_will_actually_run`），
-# 而变形 harness 每条变形都用 `-k` 跑。没有这份完整清单，那道守卫在带 `-k` 时必然假红。
-# `tryfirst=True` 是必须的：要抢在 pytest 自己那个删元素的实现之前。
-@pytest.hookimpl(tryfirst=True)
-def pytest_collection_modifyitems(session, config, items):
-    session._unfiltered_collected_items = list(items)

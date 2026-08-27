@@ -328,24 +328,24 @@ MUTATIONS: list[tuple] = [
      "def test_pagination_window_is_a_known_blind_spot():",
      "# def test_pagination_window_is_a_known_blind_spot(\n"
      "def _disabled_pagination_blind_spot():",
-     "blind_spot_tests_exist"),
+     "blind_spot_tests_are_collected or blind_spot_tests_actually_execute"),
     (50, "给盲区用例挂 @pytest.mark.skip（被收集但不执行 = 没有断言）", TESTS,
      "def test_pagination_window_is_a_known_blind_spot():",
      "@pytest.mark.skip(reason=\"变形\")\n"
      "def test_pagination_window_is_a_known_blind_spot():",
-     "blind_spot_tests_exist"),
+     "blind_spot_tests_are_collected or blind_spot_tests_actually_execute"),
     (51, "给盲区用例设 __test__ = False（pytest 原生的关闭收集方式）", TESTS,
-     '_BLIND_SPOT_TESTS = ("test_change_then_revert_is_a_known_blind_spot",',
-     'test_pagination_window_is_a_known_blind_spot.__test__ = False\n\n'
-     '_BLIND_SPOT_TESTS = ("test_change_then_revert_is_a_known_blind_spot",',
-     "blind_spot_tests_exist"),
-    (52, "conftest 里那个 tryfirst 钩子被删（守卫只剩过滤后的列表）", CONFTEST,
-     "@pytest.hookimpl(tryfirst=True)\n"
+     "# 口径守卫。**判据的主语必须与声明出现的范围一样宽**",
+     "test_pagination_window_is_a_known_blind_spot.__test__ = False\n\n\n"
+     "# 口径守卫。**判据的主语必须与声明出现的范围一样宽**",
+     "blind_spot_tests_are_collected or blind_spot_tests_actually_execute"),
+    (52, "conftest 里加一个 hook 在收集阶段把分页 item 删掉（v3 的漏洞场景）", CONFTEST,
+     "from moto import mock_aws",
+     "from moto import mock_aws\n\n\n"
      "def pytest_collection_modifyitems(session, config, items):\n"
-     "    session._unfiltered_collected_items = list(items)",
-     "def _removed_pytest_collection_modifyitems(session, config, items):\n"
-     "    session._unfiltered_collected_items = list(items)",
-     "blind_spot_tests_exist"),
+     "    items[:] = [i for i in items\n"
+     "                if i.name != 'test_pagination_window_is_a_known_blind_spot']",
+     "blind_spot_tests_are_collected or blind_spot_tests_actually_execute"),
 ]
 
 
@@ -355,7 +355,8 @@ _COUNT_RE = re.compile(r"(\d+) (passed|failed|error|errors|deselected|skipped)")
 
 def run_tests(k: str) -> tuple[int, str, dict[str, int]]:
     r = subprocess.run(
-        [str(PYTEST), "tests/test_verify_account_trust_boundary.py", "-q", "-k", k,
+        [str(PYTEST), "tests/test_verify_account_trust_boundary.py",
+         "tests/test_blind_spot_coverage.py", "-q", "-k", k,
          "--no-header", "-p", "no:cacheprovider"],
         cwd=ROOT / "site-builder/deployer", capture_output=True, text=True)
     tail = (r.stdout.strip().splitlines() or [""])[-1]
