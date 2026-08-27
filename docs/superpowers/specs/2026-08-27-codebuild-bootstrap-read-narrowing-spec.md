@@ -58,12 +58,36 @@ CDK 从 `from_asset()` 自动加进 `PackageProjectRoleDefaultPolicy` 的那条�
 
 ### 为什么这条比"账号内暴露"更要紧
 
-`site-package` 是整个平台里**唯一**以站点作者可控的输入（`package.json`）驱动、
-且在容器内执行第三方代码安装流程的地方。今天唯一的隔断是 buildspec 第 22 行的
-`npm install --ignore-scripts`（外加第 18 行先删站点自带的 `.npmrc`）。那条 flag
-一旦被去掉、或将来支持 Python 后端而用 `pip install` 装 sdist，这条链就从
+`site-package` 是整个平台里**唯一**以站点作者可控的输入（`package.json` 与
+`dependencies`）驱动、且在容器内执行第三方代码安装流程的地方。这条链一旦通，就从
 「账号内部暴露」变成**「不可信站点作者可窃取平台签名密钥」**——而后者正是整套设计
 声称要防的威胁。
+
+**先纠正一个在本仓库多处流传的说法。** `CLAUDE.md`、
+`docs/security/account-trust-boundary.md` 与 merged review 都写着「当前唯一的隔断是
+`buildspec-package.yml` 里的 `npm install --ignore-scripts`」。**那句话不准确**，
+按实测的控制点分布应该是：
+
+| 攻击路径 | 控制点 |
+|---|---|
+| 站点**自己的** `package.json` 里写 `preinstall`/`postinstall` 等 | **两道**：合同校验器在 CodeBuild **之前**就拒（`contract/redlines.py` 的 `NPM_LIFECYCLE_KEYS`，`_scan_package_json` 对 `backend/` 下**任何** `package.json` 生效）＋ `--ignore-scripts` |
+| 站点**自己的** `backend/.npmrc` | **两道**：合同校验器直接拒（`redlines.py:326`）＋ buildspec 的 `find /tmp/site -name .npmrc -delete` |
+| **依赖**（transitive）里的生命周期脚本 | **只有 `--ignore-scripts` 一道** |
+
+第三行是要紧的那一行，而它恰好是原说法唯一说对的部分。理由：`_scan_package_json`
+**只看站点自己的 `scripts` 段，从不检查 `dependencies`**——registry、版本范围、
+`git+`、`file:` 规格一概不限；而扫描器只读 `TEXT_EXT` 里的后缀，**`.tgz` 根本不被打开**。
+实测（本机 npm 10.9.8 / node 22）：把一个带 `preinstall` 的包 `npm pack` 成本地 `.tgz`、
+以 `"file:./dep.tgz"` 作依赖，`npm install` **会执行**那个 `preinstall`，而加上
+`--ignore-scripts` **不会**。也就是说，对"依赖投毒"这条最现实的路径，那条 flag 确实
+是唯一的控制点，且它对合同校验器完全不可见。
+
+所以这条改动的理由不是"flag 可能被误删"，而是**平台不该把一条 flag 放在
+「不可信第三方代码」与「平台签名密钥」之间**。改完之后 flag 仍然必须留着——它挡的
+不只是这条路（构建容器里任意代码执行仍能读 `validated/*`、写 `artifacts/*`）。
+
+> 上表的三处文档措辞不在本 spec 的改动范围之外：它们与守卫同属"声称与证据"这一件事，
+> 由计划的 Task 1 一并改正（纯文档，不碰生产）。
 
 ## 这条改动买到什么、买不到什么
 
@@ -160,80 +184,158 @@ package_project = cb.Project(
   bootstrap、改 router 配置，且旧桶里那 9 个对象仍然存在。blast radius 大得多，
   收益与本条相同。
 
-## 守卫：三层，各自能证明什么
+## 守卫：三个结构化检查器 + 一个真机行为探针
 
-`deployer/.venv` **没有 `aws_cdk`**（实测 `ModuleNotFoundError`）。所以"断言
-`is_immediate is True` / `to_build_spec()` 与文件字节相等"这类**语义**断言进不了默认
-测试套件——它们必须 import 生产代码。三层如下，各层的承诺**不许互相冒充**：
+**总原则：每个守卫都是「吃结构化输入、吐违规列表」的纯函数，反例一律在内存里注入。**
+不改工作树、不需要另一个 harness、跑在默认套件里。上一版把这件事做成"文本子串黑名单
+＋人工把 app.py 改回去跑一次"，那既证明不了语义、又违反了它自己给出的理由。
 
-**第一层：always-on 文本/AST 守卫**（默认 `deployer` 套件，不需要 aws_cdk）
+**为什么必须是精确 allowlist 而不是黑名单**：本 spec 前面那节「守卫只看见了一半」讲的
+是同一件事的另一半。黑名单守卫的主语总是比证据宽——「策略里没出现 bootstrap 桶」不等于
+「这个角色只能读 validated/、只能写 artifacts/」。实测过一份策略：两条精确授权都在、
+另加 `s3:GetObject` + `s3:ListBucket` on `*`，上一版的两条模板断言**都通过**。
 
-- `app.py` 里不许出现 `BuildSpec.from_asset`（AST 或整份文本断言，二者都可——
-  这是一条纯文本事实，文本守卫能证明它）；
-- `app.py` 里 buildspec 必须经 `read_bytes().decode(` 读取，不许退回 `read_text(`；
-- **顺带补两条本来就该有的**：`npm install` 那条**命令行上**必须带 `--ignore-scripts`，
-  且必须有删除 `.npmrc` 的那条命令。实测**今天没有任何测试断言这两行**——
-  `--ignore-scripts` 只在 `contract/redlines.py` 的一句注释里被提到，而 `.npmrc` 那条
-  红线是**合同校验器拒绝站点自带 `backend/.npmrc`**（另一个控制点，不是 buildspec
-  这一步）。本 spec 的「不变量」一节声称这两行仍在，而无守卫的声称在这个仓库里等于
-  没有声称。这两条与本改动同文件同威胁，属直接相邻面，不算扩范围。
+### 检查器 ①：buildspec 的命令合同（不是 YAML 解释器）
 
-  **必须钉在命令行上，不能写成"文件里出现过这个字符串"**：buildspec 的注释里也写着
-  `--ignore-scripts`（那段解释它为什么必需），所以子串检查在"只删命令、留注释"时会
-  照样绿。这与本 spec 上面那条「守卫只看见了一半」是同一个错误：守卫的主语
-  （装依赖时带没带这个 flag）比它的证据（文件里有没有这几个字）宽。
+`build_container_interlock_violations(src) -> list[str]`，基于
+`_buildspec_commands(src)`：定位唯一的 `commands:` 段、跳过 YAML 注释、拒绝 block
+scalar / 行尾续行 / 无法 `shlex` 分词的条目（**fail-closed，不猜**），再按
+`&&` `||` `;` `|` 切成逐条命令的 token 列表。`shlex.split(..., comments=True)` 同时
+解决 shell 注释与引号。
 
-**这一层证明不了 `Source.BuildSpec` 等于文件字节**——那是语义。见
-`syntax-guards-cannot-prove-semantics` 那条教训，以及上面「守卫只看见了一半」那节：
-语法/AST 黑名单挡不住语义倒退，也看不见 CDK 自动生成的那半边策略。
-所以它只承担"`from_asset` 别回来 / 读法别退化 / 两条隔断别消失"这三件纯文本的事。
+判据是**精确 token 列表**，不是"含某个子串"：
 
-**第二层：opt-in synth/模板断言**（`SB_CDK_TESTS=1` + PYTHONPATH 桥接）
+- 恰好一条 `npm install`，其 token 必须逐个等于
+  `["npm","install","--omit=dev","--no-audit","--no-fund","--ignore-scripts"]`；
+- 除它之外**不允许任何其它 npm 子命令**（`npm rebuild` / `npm run` 会重新执行生命周期
+  脚本）；
+- 必须存在精确命令 `["find","/tmp/site","-name",".npmrc","-delete"]`；
+- 它的位置必须**严格早于** `npm install`。
 
-按仓库既有形态（缺 `aws_cdk` 时**报错而非静默 skip**）：
+精确比对是刻意的：`--ignore-scripts=false` 与 `--no-ignore-scripts` 都能把语义翻过来，
+而"含 `--ignore-scripts`"照样绿。代价是往那条命令上加任何合法 flag 都会红一次，逼一次
+自觉更新——与基线纪律同一个取舍。
 
-- 直接 import `app.py` 拿 `_InlineBuildSpec`（只 import 不实例化栈 ⇒ **不需要
-  Docker**）：`is_immediate is True`；`to_build_spec().encode("utf-8")` 等于
-  `buildspec-package.yml` 的 `read_bytes()`；
-- 对整个 `SiteDeployerStack` synth（**需要 Docker**，Lambda bundling）后断言：
-  - `Source.Type == "NO_SOURCE"`；
-  - `Source.BuildSpec.encode("utf-8") == BUILDSPEC_PATH.read_bytes()`，且它**不是**
-    `Fn::Join` / 不含 `arn:` / 不含 `cdk-hnb659fds-assets`；
-  - `PackageProject` 角色的策略里**不出现任何 bootstrap 桶 ARN**；
-  - 该角色**仍保留** `validated/*` 的精确 `s3:GetObject` 与 `artifacts/*` 的精确
-    `s3:PutObject`（正向控制：证明这条断言不是因为整个策略都没了才通过的）。
+### 检查器 ②：IAM 的精确 allowlist（不是 IAM evaluator）
 
-**第三层：真机闸门**（`verify_account_trust_boundary.py`，约 9±1 分钟）
+`package_project_s3_violations(template) -> list[str]`。三步，全部不求值：
 
-这才是这条安全属性的真回归守卫：权限回来了就是"既有 principal 新增 grant" ⇒ **红**。
-它不是单测，跑一次要真凭证。
+1. 从 `AWS::CodeBuild::Project`（`Name == "site-package"`）的 `ServiceRole` **反查**
+   角色逻辑 ID（要求是 `Fn::GetAtt` 形态，否则拒绝猜）——不靠 logical-ID 前缀；
+2. 收集该角色的**全部**模板内权限来源：inline `Policies`、`AWS::IAM::Policy`、
+   `AWS::IAM::ManagedPolicy`（两者按 `Roles` 含 `{"Ref": lid}` 匹配），并把非空的
+   `ManagedPolicyArns` 直接判违规；
+3. 把 `Effect=Allow` 的 S3 `(action, resource)` 规范化成集合，与精确期望比**等值**：
 
-**反向验证**：上面每条新守卫都必须证明它会红——它们在写下的那一刻就是绿的
-（pass-now），不证明能红等于什么都没加。
+```
+s3:GetObject → <GetAtt:{artifacts 桶逻辑 ID}.Arn>/validated/*
+s3:PutObject → <GetAtt:{artifacts 桶逻辑 ID}.Arn>/artifacts/*
+```
 
-做法是**在测试文件内的负向 meta-test**，不走 `metamorphic_trust_boundary.py`：把源码
-文本读进来、在**内存里**造出退化（`_InlineBuildSpec` 换回 `from_asset`、
-`read_bytes().decode(` 换回 `read_text(`、只从 `npm install` 命令上摘掉 flag 而注释
-原样留着……）、断言守卫函数报出对应违规。所以守卫一律写成**纯函数吃源码文本、
-吐违规列表**——`_package_project_resources()` 已经是这个形态。
+artifacts 桶的逻辑 ID 由"`BucketName` 以 `site-artifacts-` 开头的那个 `AWS::S3::Bucket`"
+解析出来，**不硬编码 CDK 的哈希后缀**。以下形态**直接判违规、不求值**：
+`NotAction` / `NotResource`、`Resource: "*"`、任何带 `*` 的 S3 动作（含 `s3:*`、
+`s3:GetObject*`、`s3:List*`、裸 `*`）、任何 managed policy attachment、
+以及 `render_token()` 不认识的 CloudFormation 形态（`Fn::ImportValue` 之类）。
 
-两条理由：① 那个 harness 会**临时改工作树里的文件再还原**，把 `infra/app.py`
-（生产 CDK 源码）与 `buildspec-package.yml`（安全隔断所在处）加进它的目标集合，
-意味着进程被 SIGKILL 时工作树里会留下一份被改坏的生产基础设施源码；② 负向 meta-test
-给出**同等强度**的证据，却完全不碰工作树，而且跑在**默认套件**里、不是一个要手工跑的
-脚本里。`metamorphic_trust_boundary.py` 因此在本条改动中**不改**。
+### 检查器 ③：BuildSpec 的交付形态
 
-模板断言那层是例外：它在实现落地后才写得出来，所以要**手工**把 `build_spec=` 临时改回
-`from_asset` 跑一次、看它红、再改回来并 `git diff` 确认工作树干净。这一步不入仓。
+`buildspec_template_violations(template, want_bytes) -> list[str]`：
+`Source.Type == "NO_SOURCE"`；`Source.BuildSpec` 必须是 `str`（`Fn::Join` 形态即说明
+它又变回了 asset 的 S3 ARN）；`.encode("utf-8")` 必须等于仓库文件的 `read_bytes()`；
+且串里不许出现 `arn:` / `cdk-hnb659fds-assets` / `AssetParameters`。
+
+### 三个检查器住在哪、由谁跑
+
+放一个**只依赖标准库**（`json` + `shlex`）的模块
+`site-builder/deployer/tests/security_contracts.py`，于是：
+
+- **always-on**（默认 `deployer` 套件，**不需要 aws_cdk、不需要 Docker**）：
+  `tests/test_security_contracts.py` 用真实 buildspec 文件与一份**手写的最小模板
+  fixture**做正向输入，把全部反例在内存里注入做负向输入。手写 fixture 的形态是对着
+  **已部署的 processed 模板**核过的（`Action` 可为 str 或 list、`Resource` 为
+  `Fn::Join` + `Ref: AWS::Partition` / `Fn::GetAtt`），账号 ID 用 `000000000000`。
+- **opt-in**（`SB_CDK_TESTS=1` + PYTHONPATH 桥接，**需要 Docker**）：
+  `tests/test_infra_tables.py` 把**同样三个检查器**跑在真正 synth 出来的模板上。
+  手写 fixture 会不会与现实漂移，就由这一层兜住。
+
+**上一版那句"只 import app.py 不实例化栈、所以不需要 Docker"是错的**：`app.py`
+第 905-908 行在**模块顶层**就 `App()` / `SiteDeployerStack(...)` / `app.synth()`，
+`import app` 本身就 synth 整个栈并触发 Lambda bundling。所以本改动**顺带把那三行挪进
+`if __name__ == "__main__":`**——`cdk.json` 是 `{"app": "python3 app.py"}`，加守卫对
+`cdk` 完全无影响，而 `import app` 从此无副作用（现有 `test_infra_tables.py` 的 fixture
+目前是 import 时 synth 一次、自己再建 App synth 一次，这一步也顺手消掉那次重复）。
+
+### 第四层：真机闸门
+
+`verify_account_trust_boundary.py`（约 9±1 分钟）。它才是这条安全属性的真回归守卫：
+权限回来了就是"既有 principal 新增 grant" ⇒ 红。不是单测，跑一次要真凭证。
+
+### 反例的有效性标准（这一轮最贵的教训）
+
+上一版我声称"计划里的代码块机械验证过 16 项全过"。那 16 项是**我自己挑的退化**，而我
+挑的正好是我的正则能抓住的那些；外部复审另挑四个，**全部绿**。所以：
+
+> **自己写反例验自己的守卫，证明的是守卫对得上作者的想象力，不是对得上威胁。**
+
+因此本 spec 规定，新增或修改任何安全守卫时，反例集合必须满足五条：
+
+1. **tracked**（进仓库，不是一次性 /tmp 脚本）；
+2. **可重复执行**（默认套件里就跑）；
+3. **oracle 不由同一条实现路径产生**——至少包含一组**由复审方提出**的反例，逐字纳入；
+4. 每条反例都确认命中**目标控制点**（报文点名的是那一条，不是别的）；
+5. 失败不能由更早的检查顺带造成（构造反例时其余部分必须保持合格）。
+
+本轮纳入的反例（③④⑤ 全部来自外部复审，已逐条实测会红）：
+
+| 层 | 反例 |
+|---|---|
+| buildspec | `--ignore-scripts=false`；flag 只留在 shell 注释里；删 `.npmrc` 挪到 install 之后；删错目录；install 后追加 `npm rebuild`；`--no-ignore-scripts` |
+| IAM | `s3:GetObject` on `*`；`s3:ListBucket`；另一个桶；`s3:GetObject*` 通配动作；`NotResource`；`Fn::ImportValue` 之类不认识的 token；挂 `AmazonS3ReadOnlyAccess`；角色自身 `Policies` 里的宽语句；经 `AWS::IAM::ManagedPolicy.Roles` |
+| BuildSpec 形态 | S3-ARN 的 `Fn::Join` 形态；字节被改动一个字符 |
+
+### 真机行为探针（opt-in、tracked、默认不跑）
+
+静态检查器证明**结构**，探针证明**真实 npm/CodeBuild 行为**。只跑一次然后把结论写成文字
+会退回"不可复跑的证据等于没有证据"，所以它是一件**制品**而不是一次操作：
+
+- 由 `RUN_CODEBUILD_SECURITY_PROBE=1` 单独开启，日常七包不跑；
+- fixture 在 `tmp_path` **动态生成**，不进 `fixtures/`；
+- 只在实施本改动时、以及构建镜像/npm 大版本变更时跑。
+
+**观察对象**：站点的 `backend/` 带一个本地 `.tgz` 依赖，该依赖的 `preinstall` 往
+自己目录里写一个唯一 sentinel 文件名。生产路径必须满足：构建**成功**，且产出的
+`backend.zip` 里**搜不到那个 sentinel 文件名**。
+
+用 `.tgz` 而不是普通子目录是必须的：合同校验器会扫 `backend/` 下**任何** `package.json`
+并拒绝生命周期脚本，普通子目录形态的 fixture 在 validate 就被拦下、根本到不了 CodeBuild；
+而 `.tgz` 不在 `TEXT_EXT` 里、不会被打开。**这同时就是上面那张表第三行的可执行证据。**
+
+**正向控制是必需的**（否则"sentinel 不存在"可能只是探针根本没走到 `npm install`）：
+用同一个 CodeBuild 项目、同一份输入，`StartBuild` 时带 `buildspecOverride` —— 只把
+`--ignore-scripts` 去掉 —— sentinel **必须**出现。此时角色已经收权（只能读 `validated/*`、
+写 `artifacts/*`），所以 override 的风险面很小。
+
+**探针不证明什么**（写下来，别让它冒充更大的结论）：它**不覆盖 `.npmrc` 那条**。
+把 registry 改成一个可观察目标需要么引入外部 registry、么依赖 npm 某个配置项的行为
+细节，两者都会造出一个不稳定的 E2E。`.npmrc` 那条以检查器 ① 的精确结构与顺序判据为
+权威，本 spec 明确接受这个边界。
 
 ## 实施与验收顺序
 
+**所有 shell 块一律 `set -euo pipefail`。** 这不是排版习惯：本环境的 shell 是 **zsh**，
+而 zsh 里 `${PIPESTATUS[0]}` 展开成**空字符串**（zsh 用 `$pipestatus`，还是 1-indexed），
+且不带 `pipefail` 时 `cmd | tee` 的退出码是 **tee 的 0**。上一版用
+`… | tee … ; echo "退出码: ${PIPESTATUS[0]}"` 读闸门结果——实测那会打印一个空退出码，
+于是闸门真发现扩权（退出 1）时流程照样往下走进 `--update-baseline`，把真实漂移吸进基线。
+**任何"跑一个命令然后判它成败"的步骤都必须让非零退出直接终止，而不是打印出来给人看。**
+
 ### A. 部署前（不碰生产）
 
-1. 第一层守卫 + `deployer` 全量；第二层 opt-in CDK 测试（带 PYTHONPATH 桥接）。
+1. always-on 全量（含三个检查器的正反用例）＋ opt-in 模板断言（PYTHONPATH 桥接、需 Docker）。
 2. `cd site-builder/deployer/infra && rm -rf cdk.out && cdk diff`。
    **预期有两类变化，不是一类**：
-   - `AWS::CodeBuild::Project` 的 `Source.BuildSpec`：S3 ARN → 内联 YAML 字符串；
+   - `AWS::CodeBuild::Project` 的 `Source.BuildSpec`：`Fn::Join` 出的 S3 ARN → 内联字符串；
    - `AWS::IAM::Policy`（PackageProject 角色）：删掉 bootstrap 整桶读那一条。
 
    把预期写成"diff 只少一条 IAM 语句"是错的——属性本身也必须变。
@@ -241,85 +343,125 @@ package_project = cb.Project(
    logical ID 变化；其它 IAM 变化；`site-artifacts` 精确权限的任何变化。
    （少一个 CDK asset 是预期的，那是 buildspec 不再上传。）
 
-### B. 部署窗口
+### B. 部署窗口：**操作员承诺的独占窗口**，不是技术上关掉了入口
 
-CloudFormation **不保证** `Project` 的属性更新与 `IAM::Policy` 更新的先后。若策略先
-掉而项目属性后切，那几十秒内**启动的构建会取不到 buildspec 而失败**。失败是干净的
-（部署 job 进 FAILED，重试即可），所以：
+CloudFormation **不保证** `Project` 的属性更新与 `IAM::Policy` 更新的先后。若策略先掉而
+项目属性后切，那几十秒内**启动的**构建会取不到 buildspec 而失败（干净失败：部署 job 进
+FAILED、可重试）。
 
-1. 暂停新的站点 deploy / confirm 入口；
-2. 确认 `site-package` 没有 `IN_PROGRESS` 的 build；
-3. 确认没有 RUNNING 的站点部署 job；
-4. 等 CloudFormation 到 `UPDATE_COMPLETE` 再恢复入口。
+**措辞要准**：本仓库没有维护开关，也没有能暂停 MCP/panel 写入口的机制。所以这一步的
+真实内容是**单人环境下操作员承诺独占**：改动窗口内不自己发起部署，并在部署前确认此刻
+没有在途工作。检查脚本的要求：
 
-这是个人测试/开发环境，**不为这个干净失败窗口设计两阶段迁移**。若将来要求零失败窗口，
-才考虑"先内联并临时保留显式读权限、再单独删权限"两次部署——此处收益不值得那个复杂度。
+- 四个枚举（`list_builds_for_project`、`batch_get_builds`、`list_role_policies`、
+  `list_attached_role_policies`）与 `site-deploy-jobs` 的 `scan` **全部用 paginator**；
+  `batch_get_builds` 按 API 上限分批。实测该项目已有 **102** 个历史构建，取前 20 个
+  必然漏掉更早仍在跑的那种；`scan` 的 `FilterExpression` 是每页 1MB 扫完才应用，
+  只读第一页会漏掉后续分页里的 RUNNING job。
+- 发现任何在途项就 **`raise SystemExit`**，不是打印 `True/False` 让人看——
+  "打印了但没人拦"与"没有在途项"在自动执行下一模一样。
+- **部署前立刻再查一次**（第一次查完到 CFN 开始更新之间仍可能进新任务）。
+- 多用户环境下这一节不成立，需要真实的维护开关或暂停写入口——本 spec 明确只覆盖单人环境。
 
-### C. 部署后静态确认（只读）
+不为这个干净失败窗口设计两阶段迁移（"先内联并临时保留读权限、再单独删权限"）——
+收益不值得那个复杂度。
 
-1. `codebuild batch-get-projects`：`source.type == NO_SOURCE`，且
-   `source.buildspec` 与仓库文件原文逐字节相同（**不是** S3 ARN）；
-2. 沿该项目的 `serviceRole` 读 inline + attached policy：bootstrap 桶 ARN
-   **完全消失**；`validated/*` 的 `GetObject` 与 `artifacts/*` 的 `PutObject`
-   **仍在**；
-3. 确认没有任何残留的 `s3:List*` / `s3:GetObject*` 指向 bootstrap 桶。
+### C. 部署后静态确认（只读，**用 assert 不用 print**）
+
+1. **账号锚定**：`sts:GetCallerIdentity` 的账号必须等于 `config.ini` 里的账号
+   （闸门脚本自己就这么做；这里少了它就可能对着另一个账号断言"已经收权了"）。
+2. `codebuild batch-get-projects`：`source.type == "NO_SOURCE"`，且 `source.buildspec`
+   **逐字节等于**仓库文件（**不是** S3 ARN）。
+3. 沿该项目的 `serviceRole`、用 paginator 读 inline + attached policy，断言：
+   bootstrap 桶 ARN **完全消失**；`validated/*` 的 `GetObject` 与 `artifacts/*` 的
+   `PutObject` **仍在**；没有任何残留的 `s3:List*` / `s3:GetObject*`。
+4. 三条全部 `assert`，任何一条不成立即终止。
 
 ### D. 行为确认
 
-4. 跑当前完整 E2E 文件：
+5. 跑当前完整 E2E 文件：
 
    ```bash
+   set -euo pipefail
+   cd "$(git rev-parse --show-toplevel)"
    RUN_E2E=1 site-builder/deployer/.venv/bin/pytest \
      site-builder/deployer/tests/test_e2e_fixtures.py -q
    ```
 
    **机械核实过：这个文件现在收集 10 条**（不是 4 条 fixture）。多条用例会重复部署
-   `nosql-notes`，所以 `package_backend → CodeBuild` 会被**多次**经过，而不是只在
-   首次创建时验证一次。它覆盖到的与本改动相关的四件事：首次构建证明内联 buildspec
-   能被 CodeBuild 取用；更新构建证明不是只在创建时有效；失败恢复路径证明构建失败后
-   项目仍可继续使用；NoSQL 与 DSQL 两类后端证明打包输出没有意外变化。
-   **`约 6 分钟` 这个旧数字不要再引用**——条数已经变了，耗时按实测重新记。
+   `nosql-notes`，所以 `package_backend → CodeBuild` 会被**多次**经过。它覆盖到的与本
+   改动相关的四件事：首次构建证明内联 buildspec 能被 CodeBuild 取用；更新构建证明不是
+   只在创建时有效；失败恢复路径证明构建失败后项目仍可继续使用；NoSQL 与 DSQL 两类后端
+   证明打包输出没有意外变化。**`约 6 分钟` 这个旧数字不要再引用**——按实测重新记。
 
-5. **不跑** `smoke_router.sh`：本改动不碰 CloudFront / Edge / route 注册 / 会话鉴权 /
-   Function URL，而完整 E2E 本身已经通过公网路由访问生成的站点。多出来的时间买不到
-   与本改动相关的信号。
+6. 跑一次 opt-in 的真机行为探针（`RUN_CODEBUILD_SECURITY_PROBE=1`），含正向控制。
 
-### E. 闸门与基线（**先不更新基线**）
+7. **不跑** `smoke_router.sh`：本改动不碰 CloudFront / Edge / route 注册 / 会话鉴权 /
+   Function URL，而完整 E2E 本身已经通过公网路由访问生成的站点。
 
-6. 跑 `python3 site-builder/scripts/verify_account_trust_boundary.py`，预期：
-   - 退出码 0；
-   - 只有预期的 improvement（那个 fp「不再具备任何敏感授权（原 platform-overbroad）」）；
-   - A 62 → 61；可读密钥 57 → 56；`platform-overbroad` 1 → 0；
-   - **B、resource policy、coverage、asset facts 都不应变化**（`edge_assets_carrying_live_key`
-     仍是 9、`edge_code_targets_carrying_live_key` 仍是 10、`undecided_items` 774→774）。
-     任何一项动了都要先查清原因再往下走。
-7. **人工核对上述 delta**，确认与预期逐项一致，再 `--update-baseline`。
-8. **一个原子提交**里同时更新：基线 JSON、文档里那 14 个带标记的数字、
-   `account-trust-boundary.md` 里「平台侧唯一的过宽授权」那一节（改成"已收窄"并保留
-   历史结论）、以及新增/调整的守卫。
-   文档数字测试会强制这个同提交耦合——分开提交必红。
-9. 最后跑 `metamorphic_trust_boundary.py` 全量与七个包的全量测试。
+### E. 闸门与基线：**一次观测，三次使用**
+
+上一版让 Task 3 实时跑一次闸门给人核对、Task 4 再实时跑一次 `--update-baseline`。那是
+**TOCTOU**：两次观测各约 9.5 分钟，其间或第二次运行期间的任何 IAM 变化都会进新基线，
+而人批准的并不是最终写进去的那一份。改成只观测一次、重复使用同一份字节
+（`--from-dump` 与 `--update-baseline` 可同用，已核过 `main()` 的分支）：
+
+```bash
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+# ① 唯一一次 AWS 观测（约 9.5 分钟）。产物含真实角色名，**只许留在 /tmp，不得提交**。
+python3 site-builder/scripts/verify_account_trust_boundary.py \
+  --dump-observed /tmp/m09-3b-observed.json
+# ② 用同一份字节与旧基线比较，出闸门结论（不发 AWS 调用）
+python3 site-builder/scripts/verify_account_trust_boundary.py \
+  --from-dump /tmp/m09-3b-observed.json
+# ③ 人工核对 ② 的 delta 之后，从**同一份字节**写基线
+python3 site-builder/scripts/verify_account_trust_boundary.py \
+  --from-dump /tmp/m09-3b-observed.json --update-baseline
+```
+
+② 的预期：退出码 0；只有**一条** improvement（那个 fp「不再具备任何敏感授权
+（原 platform-overbroad）」）；A 62 → 61；可读密钥 57 → 56；`platform-overbroad` 1 → 0；
+而 **B、resource policy、coverage、asset facts 全都不变**
+（`edge_assets_carrying_live_key` 仍 9、`edge_code_targets_carrying_live_key` 仍 10、
+`undecided_items` 774 → 774）。任何一项不符先查清原因再往下走。
+
+③ 之后的基线 delta 必须用**结构化比较**硬断言，不许用 `git diff | grep | head -40`
+那种**带截断的**读法（"不在前 40 行"不等于"不存在"）：把 `HEAD` 里的旧基线与工作树
+里的新基线都 `json.load`，逐项断言 —— `principals` 恰好少一个**预期指纹**、被删条目的
+`category`/`grants` 精确匹配、`facts` / `coverage` / `iam_write_statements` /
+`permissions_boundaries` / `managed_policy_versions` / `resource_policies` / `schema`
+**逐字节相同**、其余 61 条的 category 一个都没动。
+
+最后：基线 JSON、文档里那 14 个带标记的数字、`account-trust-boundary.md` 的
+「平台侧唯一的过宽授权」一节（改成"已收窄"并保留历史结论）必须进**同一个提交**——
+文档数字测试会强制这个耦合，分开提交必红。收尾跑
+`metamorphic_trust_boundary.py` 全量与七个包的全量测试。
 
 ## 回滚
 
 revert `app.py` 那处改动并重新部署 deployer 栈。bootstrap 桶里那个孤儿 buildspec
-asset 对象留着无害（它本来也不会被删）。**没有迁移、没有回填、没有补偿、没有状态**——
-这是一条属性 + 一条 IAM 语句的改动，回滚就是反向的同一次部署。
+asset 对象留着无害（它本来也不会被删）。若已经走到写基线那一步，则**一并 revert 基线与
+文档那个提交**——否则闸门会把"权限回来了"报成红，而那正是它该做的；不要为了让闸门变绿
+而保留新基线。**没有迁移、没有回填、没有补偿、没有状态**。
 
 ## 不变量（改完必须仍然成立）
 
-- `site-package` 的构建容器**只能**读 `site-artifacts-<acct>/validated/*`、
-  **只能**写 `site-artifacts-<acct>/artifacts/*`，且没有 `ListBucket`、没有
-  `DeleteObject`（`app.py` 现有注释里的理由不变：`aws s3 cp --recursive` 需要
-  `ListObjectsV2` = `ListBucket` = 让构建容器能枚举所有 job）。
+- `site-package` 角色的 **S3 权限全集**精确等于两条：`s3:GetObject` on
+  `site-artifacts-<acct>/validated/*`、`s3:PutObject` on
+  `site-artifacts-<acct>/artifacts/*`。没有 `ListBucket`、没有 `DeleteObject`、
+  没有通配动作、没有 `Resource: "*"`、没有任何 managed policy attachment
+  （`app.py` 现有注释里的理由不变：`aws s3 cp --recursive` 需要 `ListObjectsV2`
+  = `ListBucket` = 让构建容器能枚举所有 job）。**这条现在由检查器 ② 按等值断言**，
+  不再是"没出现某个已知坏值"。
 - buildspec 的**唯一真源**是 `site-builder/deployer/buildspec-package.yml`；
-  部署出去的内容与它逐字节相同（含注释）。
-- `--ignore-scripts` 与"先删 `.npmrc`"两条仍在。**注意：今天这两行没有任何测试守着**
-  （`test_validate.py` 断言的是 `validated_key($JOB_ID)` 在、`uploads/$JOB_ID` 不在，
-  以及 app.py 里那个角色手写的资源集合），所以本改动顺带给它们补上第一层文本守卫。
+  部署出去的内容与它**逐字节**相同（含注释）。
+- `npm install` 的 token 精确等于预期列表（含 `--ignore-scripts`），删 `.npmrc` 的命令
+  精确存在且**严格早于**它，且除该 install 外没有其它 npm 子命令。由检查器 ① 断言。
 - `test_validate.py` 现有的那条 AST 断言（`package_project` 手写资源集恰好是
-  `{validated/*, artifacts/*}`）继续成立且**不放宽**；本改动只是在它旁边补上一层
-  看合成后模板的断言，因为那条 AST 断言结构上看不见 CDK 自动生成的语句。
+  `{validated/*, artifacts/*}`）继续成立且**不放宽**——它仍然有价值（它守的是"源码里
+  别手写多余前缀"），只是它证明不了角色权限的全貌，那由检查器 ② 补上。
+- `import app` **无副作用**（`App()/synth()` 在 `__main__` 守卫之下）。
 
 ## 与下一条真修复的关系
 
