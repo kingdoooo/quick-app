@@ -18,11 +18,16 @@
 #
 #     bash site-builder/scripts/scan_staged_secrets.sh --files path/a.py path/b.py
 #
-# push 前对待推送的 commit 再扫一次：
+# push 前对待推送的 commit 再扫一次。**diff 与 commit message 都扫**：
+# 早期版本只跑 `git diff <range>`，于是 commit message 一个字都没看——实测漏过一条把
+# 内部角色名前缀写在提交信息里的提交，而这个模式正是推公开 remote 前的最后一道闸门
+# （message 会随 commit 一起推出去，和文件内容一样公开）。
 #
 #     bash site-builder/scripts/scan_staged_secrets.sh --range origin/master...HEAD
 #
-# 命中不等于必须改——公开 URL、测试 fixture、co-author trailer 都会命中。
+# 命中不等于必须改——公开 URL、测试 fixture、co-author trailer 都会命中
+# （commit message 里机器人的 `<...noreply@...>` co-author 地址是**唯一**的例外，
+#   见下面 elide_noreply_coauthor_addresses 的注释）。
 # 脚本只负责**停下来**；判断交给人。确认是故意的之后用 --allow-hits 放行：
 #
 #     bash site-builder/scripts/scan_staged_secrets.sh --allow-hits && git commit ...
@@ -87,11 +92,57 @@ strip_added_lines() {
   awk '/^\+\+\+ /{next} /^\+/{print substr($0, 2)}'
 }
 
+# commit message 扫描的**唯一**豁免。
+#
+# 本仓库每个提交都以 `Co-Authored-By: … <noreply@anthropic.com>` 结尾（全局提交约定），
+# 而 PATTERN 里有通用 email 规则 → 不豁免的话 --range **每跑必中**。那种保证命中会把
+# 操作者训练成无脑加 --allow-hits，真命中也就跟着一起放行了——正是本脚本头注释警告的
+# 失效模式，也是它存在的理由要消灭的东西。
+#
+# 豁免范围刻意压到最窄，两个条件必须同时成立才抹：
+#   ① 整行是 co-author trailer（`Co-Authored-By:` 开头；大小写按 git trailer 的惯例放宽，
+#      GitHub 写的是 `Co-authored-by:`）；
+#   ② 只抹 `<…noreply@…>` 这个尖括号地址本身。
+# 于是行上其余内容（作者名，以及万一同一行还塞了别的东西）照旧参与扫描；**非** noreply
+# 的 co-author 邮箱照旧命中——全局约定豁免的只有机器人的 noreply@ 地址，不含真人邮箱。
+elide_noreply_coauthor_addresses() {
+  awk '/^[[:space:]]*[Cc]o-[Aa]uthored-[Bb]y:/ {
+         sub(/<[^<>]*noreply@[^<>]*>/, "<noreply-address-elided>")
+       }
+       { print }'
+}
+
+# 逐个"主语"扫，命中带着主语一起攒起来。
+#
+# 为什么要带主语：--range 有两个来源（新增行 / commit message），而命中要由人逐条判断
+# ——不说清是哪来的，人得自己去猜该改文件还是该改提交信息。
+#
+# grep 的退出码：0=有命中，1=无命中，≥2=出错。**只有 1 才是真正的 clean**。
+# **本函数绝不能在子 shell 里调用**（`$(scan …)`、`scan … | …`）：里面的 exit 2 那时只
+# 杀得掉子 shell，主流程会带着"没命中"继续走完 → fail-open。
+found=0
+all_hits=""
+scan() {
+  local subject="$1" body="$2"
+  local h st
+  # 分两步写、不写成 local h="$(…)"：那种写法的 $? 是 local 的返回值（恒 0），
+  # grep 的退出码会被吃掉，≥2 的出错就检查不到了。
+  h="$(printf '%s\n' "$body" | grep -nE "$PATTERN")"
+  st=$?
+  if [ "$st" -ge 2 ]; then
+    echo "🛑 grep 执行出错（status=${st}，扫的是 ${subject}）——无法确认，拒绝放行" >&2
+    exit 2
+  fi
+  if [ -n "$h" ]; then
+    found=1
+    all_hits="${all_hits}【${subject}】"$'\n'"${h}"$'\n'
+  fi
+}
+
 # 取待扫文本。**必须与 grep 分开做并检查 git 的退出码**：
 # 早期版本写成 hits="$(git diff --cached | grep -nE ...)"，git 失败时（不在 git
 # 仓库里、--range 给了不存在的 ref）hits 为空 → 报 "clean" → exit 0。
 # 那是 fail-open，正是本脚本要消灭的故障模式（实测：仓库外跑 exit=0 "clean"）。
-text=""
 case "$mode" in
   staged)
     git rev-parse --git-dir >/dev/null 2>&1 || {
@@ -104,16 +155,43 @@ case "$mode" in
     raw="$(git diff --cached)" || {
       echo "🛑 git diff --cached 失败——无法扫描，拒绝放行" >&2; exit 2; }
     text="$(printf '%s\n' "$raw" | strip_added_lines)" || {
-      echo "🛑 新增行提取失败——无法扫描，拒绝放行" >&2; exit 2; } ;;
+      echo "🛑 新增行提取失败——无法扫描，拒绝放行" >&2; exit 2; }
+    scan "$subject" "$text" ;;
   range)
     git rev-parse --git-dir >/dev/null 2>&1 || {
       echo "🛑 当前目录不是 git 仓库——无法扫描，拒绝放行" >&2; exit 2; }
-    subject="range $range"
+    # message 扫描要用的 range 形态与 diff 的**不一样**，必须显式换算：
+    #   git diff A...B = merge-base(A,B)→B 的内容差异，正是"这次要推的改动"；
+    #   git log  A...B = **对称差**，会把只在 A 上、这次根本不会被 push 的提交也列出来
+    #                    （本地落后或分叉时就发生）。那些 message 早就在远端了，报出来是
+    #                    与本次 push 无关的噪音——保证命中的噪音就是 --allow-hits 跑步机；
+    #   git log  A..B  = 可从 B 到达、A 不可达的提交 = **正是这次 push 会带过去的那批**。
+    # 所以 diff 保持调用方给的形态，log 一律换成两点。
+    case "$range" in
+      *...*) log_range="${range%%...*}..${range#*...}" ;;
+      *..*)  log_range="$range" ;;
+      *)
+        # 没有 `..` 就不是提交区间（`git log <单个 ref>` 会把整条历史都列出来，
+        # 那不是"这次要推的东西"）。这里**不能静默跳过 message 扫描**——"某个来源根本
+        # 没被扫却报 clean"正是本次要修的那个洞，再犯一次只是换了个入口。
+        echo "🛑 --range 需要提交区间（A..B 或 A...B），收到 ${range}——无法确定要扫哪些 commit message，拒绝放行" >&2
+        exit 2 ;;
+    esac
+    subject="range ${range}（diff + commit message）"
     raw="$(git diff "$range")" || {
-      echo "🛑 git diff $range 失败（ref 不存在？）——无法扫描，拒绝放行" >&2
+      echo "🛑 git diff ${range} 失败（ref 不存在？）——无法扫描，拒绝放行" >&2
       exit 2; }
     text="$(printf '%s\n' "$raw" | strip_added_lines)" || {
-      echo "🛑 新增行提取失败——无法扫描，拒绝放行" >&2; exit 2; } ;;
+      echo "🛑 新增行提取失败——无法扫描，拒绝放行" >&2; exit 2; }
+    msg_raw="$(git log --format='%B' "$log_range" --)" || {
+      echo "🛑 git log ${log_range} 失败——无法扫描 commit message，拒绝放行" >&2
+      exit 2; }
+    # **不许**把 strip_added_lines 套到 message 上：那个函数只留以 `+` 开头的行并剥掉首
+    # 字符，而 message 没有 diff 前缀 → 正文会被整片丢掉，扫的是个空串（又一条 fail-open）。
+    msg_text="$(printf '%s\n' "$msg_raw" | elide_noreply_coauthor_addresses)" || {
+      echo "🛑 commit message 预处理失败——无法扫描，拒绝放行" >&2; exit 2; }
+    scan "range ${range} 的新增行" "$text"
+    scan "range ${log_range} 的 commit message" "$msg_text" ;;
   files)
     if [ "${#files[@]}" -eq 0 ]; then echo "--files 需要至少一个路径" >&2; exit 2; fi
     for f in "${files[@]}"; do
@@ -124,18 +202,11 @@ case "$mode" in
     done
     subject="files ${files[*]}"
     text="$(cat -- "${files[@]}")" || {
-      echo "🛑 读取文件失败——拒绝放行" >&2; exit 2; } ;;
+      echo "🛑 读取文件失败——拒绝放行" >&2; exit 2; }
+    scan "$subject" "$text" ;;
 esac
 
-# grep 的退出码：0=有命中，1=无命中，≥2=出错。只有 1 才是真正的 clean。
-hits="$(printf '%s\n' "$text" | grep -nE "$PATTERN")"
-grep_status=$?
-if [ "$grep_status" -ge 2 ]; then
-  echo "🛑 grep 执行出错（status=${grep_status}）——无法确认，拒绝放行" >&2
-  exit 2
-fi
-
-if [ -z "$hits" ]; then
+if [ "$found" -eq 0 ]; then
   echo "secret scan: clean (${subject})"
   exit 0
 fi
@@ -143,8 +214,7 @@ fi
 # 注意 ${subject} 的花括号：紧跟中文全角括号时，裸 $subject 会被 bash 把多字节
 # 字符并进变量名，set -u 下直接 "unbound variable" 退出——命中信息根本不打印。
 echo "🛑 secret scan 命中（${subject}）——**已阻断，未提交**：" >&2
-echo "$hits" >&2
-echo >&2
+echo "$all_hits" >&2
 echo "逐条确认是否为故意的 fixture/占位符/公开 URL。" >&2
 echo "确认无误后加 --allow-hits 重跑本脚本再提交；不要自动清洗。" >&2
 if [ "$allow_hits" -eq 1 ]; then

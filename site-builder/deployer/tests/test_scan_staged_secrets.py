@@ -8,7 +8,15 @@
 
 所以这里既要证明"那条假阳性没了"，也要证明"真命中还在"——**只测前者会把一个什么都不
 报的扫描器判成修好了**。
+
+第二轮加的是 `--range` 的 **commit message** 覆盖：那个模式（推公开 remote 前的最后一道
+闸门）原来只跑 `git diff <range>`，commit message 一个字都没看，实测漏过一条把内部角色名
+前缀写在提交信息里的提交而报 clean。同一条"某个来源根本没被扫却报 clean"的形状在这里出现
+过两次（先是空 stage，再是 message），所以下面的用例既钉住"message 里的 secret 会被拦"，
+也钉住"这条新路径的每个失败出口都 fail-closed"。
 """
+import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -204,3 +212,154 @@ def test_range_mode_with_bad_ref_is_refused(tmp_path):
     repo = _repo(tmp_path)
     r = _scan(repo, "--range", "no-such-ref...HEAD")
     assert r.returncode == 2, "不存在的 ref 必须拒绝放行，不许 fail-open"
+
+
+# ── --range 的 commit message（外部复审报的洞：原来只跑 git diff）─────────────
+# 提交信息和文件内容一样会被 push 出去，公开 remote 上一样能读。
+NOREPLY_TRAILER = "Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+
+
+def _commit(repo: Path, message: str, *, name: str = "t.txt",
+            body: str = "nothing here\n") -> None:
+    """提交一次。**文件内容默认无害**——这样命中只可能来自 message。"""
+    (repo / name).write_text(body, encoding="utf-8")
+    subprocess.run(["git", "add", name], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-q", "-m", message], cwd=repo, check=True,
+                   capture_output=True, text=True)
+
+
+def test_range_mode_catches_secret_only_in_commit_message(tmp_path):
+    """本轮的回归主体：secret **只**在提交信息里，文件内容干净。"""
+    repo = _repo(tmp_path)
+    _commit(repo, "chore: rotate the key\n\nAKIAIOSFODNN7EXAMPLE\n")
+    r = _scan(repo, "--range", "HEAD~1...HEAD")
+    assert r.returncode == 1, f"message 里的 secret 没被拦：rc={r.returncode}\n{r.stdout}{r.stderr}"
+    assert "AKIAIOSFODNN7EXAMPLE" in r.stderr, "命中内容必须打出来给人判断"
+    assert "commit message" in r.stderr, "必须说清命中来自 commit message 而不是 diff"
+
+
+def test_range_mode_diff_hit_is_labelled_as_added_lines(tmp_path):
+    """两个来源要能区分开——人得知道该改文件还是改提交信息。"""
+    repo = _repo(tmp_path)
+    _commit(repo, "chore: harmless subject\n", body="AKIAIOSFODNN7EXAMPLE\n")
+    r = _scan(repo, "--range", "HEAD~1...HEAD")
+    assert r.returncode == 1, f"{r.stdout}{r.stderr}"
+    assert "新增行" in r.stderr, f"没标出命中来自 diff 的新增行：\n{r.stderr}"
+
+
+def test_range_mode_noreply_coauthor_trailer_alone_is_not_a_hit(tmp_path):
+    """本仓库**每个**提交都带这条 trailer。它每跑必中的话，操作者会被训练成无脑加
+    `--allow-hits`，真命中跟着一起放行——那正是本脚本头注释警告的失效模式。
+    """
+    repo = _repo(tmp_path)
+    _commit(repo, f"docs: tidy up\n\n{NOREPLY_TRAILER}\n")
+    r = _scan(repo, "--range", "HEAD~1...HEAD")
+    assert r.returncode == 0, f"机器人 noreply co-author trailer 被报成命中：\n{r.stderr}"
+    assert "clean" in r.stdout
+
+
+@pytest.mark.parametrize("label,message", [
+    # 正文里的真人邮箱：豁免不能顺手把 message 里的 email 规则整条关掉
+    ("正文里的真人邮箱", "fix: reported by someone@example.com\n"),
+    # 同样是 co-author trailer，只是地址不是 noreply@ ——豁免的键是地址，不是 trailer 名
+    ("非 noreply 的 co-author", "docs: x\n\nCo-Authored-By: A Human <human@example.com>\n"),
+    # noreply trailer 行上**除地址以外**的部分照旧参与扫描（这里是宿主机家目录）
+    ("noreply 行的其余部分", "docs: x\n\nCo-Authored-By: /Users/someone/ <noreply@anthropic.com>\n"),
+])
+def test_range_mode_message_exclusion_stays_narrow(tmp_path, label, message):
+    repo = _repo(tmp_path)
+    _commit(repo, message)
+    r = _scan(repo, "--range", "HEAD~1...HEAD")
+    assert r.returncode == 1, f"{label} 被豁免误伤了：rc={r.returncode}\n{r.stdout}{r.stderr}"
+
+
+def test_range_mode_message_scan_uses_two_dot_semantics(tmp_path):
+    """`git log A...B` 是**对称差**，会把只在 A 上、这次根本不会被 push 的提交也扫进来。
+
+    那些 message 早就在远端了，报出来是与本次 push 无关的噪音——保证命中的噪音就是
+    `--allow-hits` 跑步机。所以 message 必须按两点（`A..B` = 这次真会推过去的那批）扫。
+    带 positive control：先证明对称差里**确实**有那个 secret，clean 才有意义。
+    """
+    repo = _repo(tmp_path)
+    base = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo,
+                          check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(["git", "checkout", "-q", "-b", "other"], cwd=repo, check=True,
+                   capture_output=True)
+    _commit(repo, "wip: AKIAIOSFODNN7EXAMPLE\n", name="other.txt", body="x\n")
+    subprocess.run(["git", "checkout", "-q", base], cwd=repo, check=True,
+                   capture_output=True)
+    _commit(repo, "feat: harmless\n", body="hello\n")
+
+    symmetric = subprocess.run(["git", "log", "--format=%B", "other...HEAD", "--"],
+                               cwd=repo, check=True, capture_output=True, text=True).stdout
+    assert "AKIAIOSFODNN7EXAMPLE" in symmetric, "positive control 失效：对称差里没有那条提交"
+
+    r = _scan(repo, "--range", "other...HEAD")
+    assert r.returncode == 0, (
+        "扫到了只在 other 分支上、这次不会被 push 的提交信息（log 用成三点了）：\n"
+        f"{r.stderr}")
+
+
+def test_range_mode_rejects_a_non_range_ref(tmp_path):
+    """`--range HEAD` 这种单个 ref 不是提交区间（`git log <ref>` 会列出整条历史）。
+
+    **必须显式拒绝、不能静默跳过 message 扫描**——"某个来源根本没被扫却报 clean"就是
+    本轮要修的那个洞，换个入口再犯一次一样是洞。
+    """
+    repo = _repo(tmp_path)
+    r = _scan(repo, "--range", "HEAD")
+    assert r.returncode == 2, f"非区间的 --range 必须拒绝放行：rc={r.returncode}\n{r.stdout}{r.stderr}"
+    assert "提交区间" in r.stderr
+
+
+# message 预处理也必须 fail-closed。上面那个"永远失败"的假 awk 只打得中第一步
+# （strip_added_lines），证明不了第二步（noreply 豁免那道 awk）失败时会不会 fail-open。
+def _fake_awk_failing_on_nth(tmp_path: Path, n: int) -> str:
+    real = shutil.which("awk")
+    assert real, "环境里没有 awk"
+    d = tmp_path / "fakebin-nth"
+    d.mkdir()
+    counter = d / "count"
+    (d / "awk").write_text(
+        "#!/bin/sh\n"
+        f'c="{counter}"\n'
+        'n=$(cat "$c" 2>/dev/null || echo 0)\n'
+        'n=$((n+1))\n'
+        'printf %s "$n" > "$c"\n'
+        f'[ "$n" -ne {n} ] || exit 2\n'
+        f'exec {real} "$@"\n',
+        encoding="utf-8")
+    (d / "awk").chmod(0o755)
+    return f"{d}:{os.environ['PATH']}"
+
+
+def test_commit_message_preprocessor_failure_refuses_to_pass(tmp_path):
+    repo = _repo(tmp_path)
+    _commit(repo, "chore: AKIAIOSFODNN7EXAMPLE\n")
+    env = dict(os.environ, PATH=_fake_awk_failing_on_nth(tmp_path, 2))
+    r = subprocess.run(["bash", str(SCRIPT), "--range", "HEAD~1...HEAD"], cwd=repo,
+                       capture_output=True, text=True, env=env)
+    assert r.returncode == 2, (
+        f"message 预处理失败却放行了（rc={r.returncode}）——那是 fail-open\n{r.stdout}{r.stderr}")
+    assert "commit message 预处理失败" in r.stderr
+
+
+def test_grep_error_still_refuses_to_pass_from_inside_the_scan_helper(tmp_path):
+    """grep 的"≥2 是出错、不是无命中"那道检查现在住在 `scan` 函数里。
+
+    **这条不是本轮的回归用例**（改动前那道检查是内联的，一样 exit 2），它守的是重构本身：
+    哪天有人把 `scan` 写成 `$(scan …)` 或 `scan … | …`，里面的 `exit 2` 就只杀得掉子 shell，
+    主流程会带着"没命中"走完 → 报 clean。已用"把 scan 挪进子 shell"的变异确认这条会红。
+    """
+    repo = _repo(tmp_path)
+    _commit(repo, "chore: AKIAIOSFODNN7EXAMPLE\n")
+    d = tmp_path / "fakegrep"
+    d.mkdir()
+    (d / "grep").write_text("#!/bin/sh\nexit 2\n", encoding="utf-8")
+    (d / "grep").chmod(0o755)
+    env = dict(os.environ, PATH=f"{d}:{os.environ['PATH']}")
+    r = subprocess.run(["bash", str(SCRIPT), "--range", "HEAD~1...HEAD"], cwd=repo,
+                       capture_output=True, text=True, env=env)
+    assert r.returncode == 2, f"grep 出错却放行了（rc={r.returncode}）\n{r.stdout}{r.stderr}"
+    assert "clean" not in r.stdout
+    assert "grep 执行出错" in r.stderr
