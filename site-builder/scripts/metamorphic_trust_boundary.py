@@ -286,10 +286,29 @@ MUTATIONS: list[tuple] = [
      '                        for src, st in p["statements"]]},',
      "digest_ignores_statement_order"),
     (43, "list_principals 不收 uid（换代检测静默失效）", SCRIPT,
-     ('                    "uid": r["RoleId"],\n',
-      '                    "uid": u["UserId"],\n'),
+     ('            "uid": r["RoleId"],\n',
+      '            "uid": u["UserId"],\n'),
      ('', ''),
      "list_principals_records_uid"),
+    # ---- Codex 第八轮：boundary 的文档内容原先不在摘要里 ---------------------
+    (44, "摘要丢掉 boundary 的文档语句（只剩 boundary ARN）", SCRIPT,
+     '         "boundary_statements": sorted(json.dumps(st, sort_keys=True, default=str)\n'
+     '                                       for st in p["boundary_statements"]),',
+     '',
+     "boundary_document_change_with_same_arn"),
+    (45, "摘要丢掉托管策略的默认版本号", SCRIPT,
+     '         "policy_versions": {k: p["policy_versions"][k]\n'
+     '                             for k in sorted(p["policy_versions"])},',
+     '',
+     "boundary_default_version_change or attached_managed_policy_version_change"),
+    (46, "list_principals 不收 boundary 的语句（两端恒为空 ⇒ 摘要恒等）", SCRIPT,
+     '        entry["boundary_statements"] = policy_statements(docs[b_arn]) if b_arn else []',
+     '        entry["boundary_statements"] = []',
+     "list_principals_records_boundary_statements"),
+    (47, "list_principals 的策略版本只收 boundary、漏掉 attached", SCRIPT,
+     '        srcs = {src for src, _ in entry["statements"] if src is not None}',
+     '        srcs = set()',
+     "list_principals_records_boundary_statements"),
 ]
 
 

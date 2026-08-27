@@ -2670,7 +2670,8 @@ def test_baseline_platform_shape_matches_what_the_snapshot_produces():
 #   ③ 7 天里 96.6% 的 10 分钟窗口是干净的 ⇒ 作废本轮不会把闸门变成永远红。
 # ==========================================================================
 
-def _principal(name, *, uid, statements=(), boundary=None, kind="role"):
+def _principal(name, *, uid, statements=(), boundary=None, kind="role",
+               boundary_statements=(), policy_versions=None):
     """一个 `list_principals()` 形态的 principal。`statements` 是 `(来源, 语句)` 对。
 
     假 `uid` **刻意不长得像真的 IAM 唯一 ID**（真的形如 `AROA…` / `AIDA…` 加 16 位大写
@@ -2682,7 +2683,9 @@ def _principal(name, *, uid, statements=(), boundary=None, kind="role"):
     不进基线，只在进程内当判据。
     """
     return {"kind": kind, "name": name, "arn": f"arn:aws:iam::{_ACCT}:role/{name}",
-            "uid": uid, "statements": list(statements), "boundary_arn": boundary}
+            "uid": uid, "statements": list(statements), "boundary_arn": boundary,
+            "boundary_statements": list(boundary_statements),
+            "policy_versions": dict(policy_versions or {})}
 
 
 def test_identical_listings_are_atomic():
@@ -2893,3 +2896,165 @@ def test_measure_refuses_a_non_atomic_round():
               if isinstance(r, ast.Raise) and isinstance(r.exc, ast.Call)
               and isinstance(r.exc.func, ast.Name) and r.exc.func.id == "SystemExit"]
     assert raises, "检测到漂移后没有 raise SystemExit——那是 fail-open"
+
+
+# --------------------------------------------------------------------------
+# Codex 第八轮：**boundary 的文档内容原先不在原子性摘要里**（同一个"枚举范围比声称的
+# 主语窄"）。摘要的 docstring 写着"全部授权输入"，而 principal dict 里只有
+# `boundary_arn` —— boundary 那份托管策略换了默认版本、ARN 不变时，摘要的输入一个字
+# 都不变 ⇒ 复查看不见，**而且这个变化是持久的**（不需要 ABA 那种巧合）。
+#
+# 两层都受影响，不只是 B：
+#   - B 的 `boundaries[fp].stmt_fps` 是 T1 抄的 boundary 语句；
+#   - A 走 `SimulatePrincipalPolicy(PolicySourceArn=...)`，而 AWS 文档明确
+#     `permissionsBoundaryPolicyInputList` 是**覆盖**"已附加到实体上的 boundary"
+#     ⇒ 不传它时用的就是实体当前那份 ⇒ T2 的判定按新 boundary 算。
+# 于是 A 与 B 各自都"正常"，拼出来的快照描述两个时刻。
+# --------------------------------------------------------------------------
+
+_BOUNDARY = f"arn:aws:iam::{_ACCT}:policy/Boundary"
+
+
+def test_boundary_document_change_with_same_arn_is_refused():
+    """boundary ARN 不变、**文档内容**变了 ⇒ 必须作废本轮。
+
+    这是复审给的反例①，实测复现过：修复前 `enumeration_drift` 返回 `{}`。
+    """
+    g = _gate()
+    before = [_principal("SiteRole", uid="uid-site-1", boundary=_BOUNDARY,
+                         boundary_statements=[_iam_stmt(effect="Deny", action="iam:*")],
+                         policy_versions={_BOUNDARY: "v3"})]
+    after = [_principal("SiteRole", uid="uid-site-1", boundary=_BOUNDARY,
+                        boundary_statements=[_iam_stmt(effect="Deny",
+                                                       action="iam:PutRolePolicy")],
+                        policy_versions={_BOUNDARY: "v3"})]
+    drift = g.enumeration_drift(before, after)
+    assert "changed" in drift, f"boundary 文档变化没被咬住：{drift}"
+    assert "SiteRole" in drift["changed"][0]
+
+
+def test_boundary_default_version_change_is_refused():
+    """boundary ARN 与语句都不变、只有 `DefaultVersionId` 变了 ⇒ 也作废本轮。
+
+    这是复审给的反例②。为什么连"语句逐字相同"也要红：B 把 boundary 的版本号
+    **持久化进基线**（`iam_write.managed_versions`），T1 记的版本与 T3 的现实不一致时，
+    快照里那个值就是错的——而"版本号错一轮"与"权限面没动"是两件事。
+    """
+    g = _gate()
+    st = [_iam_stmt(effect="Deny", action="iam:*")]
+    before = [_principal("SiteRole", uid="uid-site-1", boundary=_BOUNDARY,
+                         boundary_statements=st, policy_versions={_BOUNDARY: "v3"})]
+    after = [_principal("SiteRole", uid="uid-site-1", boundary=_BOUNDARY,
+                        boundary_statements=st, policy_versions={_BOUNDARY: "v4"})]
+    assert "changed" in g.enumeration_drift(before, after)
+
+
+def test_attached_managed_policy_version_change_is_refused():
+    """attached 托管策略换默认版本（语句相同）**也**红。
+
+    这条刻意与上一条同构：早先的实现把"只换版本号不换语句"写成一条**不声称**
+    （"下一轮自己会红"）。那是个carve-out，而这个仓库被推翻的历次都是carve-out——
+    `managed_versions` 同样进基线，同样的staleness，没有理由两套宽严。
+    实测代价为零：7 天 CloudTrail 里 `CreatePolicyVersion` / `SetDefaultPolicyVersion`
+    都是 **0** 次。
+    """
+    g = _gate()
+    pol = f"arn:aws:iam::{_ACCT}:policy/Attached"
+    st = [(pol, _iam_stmt())]
+    before = [_principal("R", uid="uid-r-1", statements=st,
+                         policy_versions={pol: "v1"})]
+    after = [_principal("R", uid="uid-r-1", statements=st,
+                        policy_versions={pol: "v2"})]
+    assert "changed" in g.enumeration_drift(before, after)
+
+
+def test_list_principals_records_boundary_statements_and_versions():
+    """`list_principals` 必须真的把 boundary 语句与版本收进 principal。
+
+    漏收的后果是**静默的**：两侧都是空 list / 空 dict ⇒ 摘要恒等 ⇒ 复查永远说"没变"，
+    输出与"账号真的很安静"逐字相同。所以钉住产出，而不是只钉住摘要函数。
+    """
+    g = _gate()
+    boundary_doc = {"Version": "2012-10-17",
+                    "Statement": [{"Effect": "Deny", "Action": "iam:*",
+                                   "Resource": "*"}]}
+    attached = f"arn:aws:iam::{_ACCT}:policy/Attached"
+
+    class _Paginator:
+        def paginate(self, **kw):
+            return [{"RoleDetailList": [
+                        {"RoleName": "R", "RoleId": "uid-role-1",
+                         "Arn": f"arn:aws:iam::{_ACCT}:role/R", "Path": "/",
+                         "RolePolicyList": [],
+                         "AttachedManagedPolicies": [{"PolicyArn": attached}],
+                         "PermissionsBoundary": {
+                             "PermissionsBoundaryArn": _BOUNDARY}}],
+                     "UserDetailList": [], "GroupDetailList": [],
+                     "Policies": [
+                        {"Arn": _BOUNDARY, "PolicyVersionList": [
+                            {"IsDefaultVersion": True, "VersionId": "v7",
+                             "Document": boundary_doc}]},
+                        {"Arn": attached, "PolicyVersionList": [
+                            {"IsDefaultVersion": True, "VersionId": "v2",
+                             "Document": {"Version": "2012-10-17",
+                                          "Statement": [{"Effect": "Allow",
+                                                         "Action": "s3:GetObject",
+                                                         "Resource": "*"}]}}]}]}]
+
+    class _Iam:
+        def get_paginator(self, name):
+            return _Paginator()
+
+    (p,) = g.list_principals(_Iam())["principals"]
+    assert p["boundary_arn"] == _BOUNDARY
+    assert p["boundary_statements"] == boundary_doc["Statement"], \
+        f"boundary 语句没收进来：{p.get('boundary_statements')}"
+    assert p["policy_versions"] == {_BOUNDARY: "v7", attached: "v2"}, \
+        f"策略版本没收全：{p.get('policy_versions')}"
+
+
+# --------------------------------------------------------------------------
+# 已接受的三个盲区（Codex 第八轮：原先"窗口内 IAM 变过就作废本轮 / 观测原子性"过宽）
+#
+# 下面这几条**断言的是限制本身**，不是能力。它们的作用有两个：
+#   ① 把"这道复查只保证窗口两端相等"钉住，防止文档措辞再次悄悄放大成"原子";
+#   ② 哪天真的实现了事件屏障，这几条会**变红**——那正是要的信号：能力变了，
+#      `enumeration_drift` 的 docstring 与 `account-trust-boundary.md` 的口径必须同时改。
+# --------------------------------------------------------------------------
+
+def test_change_then_revert_is_a_known_blind_spot():
+    """ABA：T1 有授权 → 窗口内撤掉（A 的模拟看到的是这个）→ T3 恢复成与 T1 逐字相同。
+
+    两点比较必然报无漂移。要关掉它需要独立的单调事件源，而 CloudTrail 有投递延迟
+    （分钟级、无上界保证），拿它当同步屏障要么阻塞不确定的时间、要么给虚假保证。
+    """
+    g = _gate()
+    t1 = [_principal("R", uid="uid-r-1", statements=[(None, _iam_stmt())])]
+    t3 = copy.deepcopy(t1)
+    assert g.enumeration_drift(t1, t3) == {}, \
+        "如果这条红了，说明复查已经不只是两端比较——去改 docstring 与文档口径"
+
+
+def test_created_then_deleted_between_enumerations_is_a_known_blind_spot():
+    """枚举后新建、复查前删除：两端都不存在 ⇒ 整轮不知道它来过。"""
+    g = _gate()
+    t1 = [_principal("R", uid="uid-r-1")]
+    t3 = [_principal("R", uid="uid-r-1")]
+    # 中间那个 `site-rt-ephemeral` 在 t1 与 t3 里都没有身影
+    assert g.enumeration_drift(t1, t3) == {}
+
+
+def test_docs_do_not_claim_atomic_observation():
+    """文档不许再把这道复查叫"原子"。
+
+    判据是**成对的**：既不许出现过宽的说法，也必须写着收窄后的口径与盲区——
+    只做黑名单 grep 的话，把整段删掉也能过。
+    """
+    doc = _DOC.read_text(encoding="utf-8")
+    for overclaim in ("观测原子性", "本轮观测是原子的", "整轮都原子"):
+        assert overclaim not in doc, f"文档里还留着过宽的说法：{overclaim!r}"
+    for required in ("两端", "盲区"):
+        assert required in doc, f"文档没写收窄后的口径：{required!r}"
+    # 三个盲区都要点名，否则"盲区"两个字可以只是句空话
+    for blind in ("改回", "分页"):
+        assert blind in doc, f"文档没点名这个盲区：{blind!r}"

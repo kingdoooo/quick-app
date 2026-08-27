@@ -1289,23 +1289,38 @@ def resolve_managed_policy(iam, arn: str, *, docs: dict, versions: dict):
 def principal_auth_digest(p: dict) -> str:
     """一个 principal 在本轮里被用到的**全部授权输入** → 稳定摘要。
 
-    覆盖 `uid`、boundary ARN、以及**带来源的全部语句**。为什么是"全部语句"而不是
-    "`is_relevant_iam_statement` 挑出来的那些"：A 组是模拟器在 T2 对**完整**策略
-    求值的结果，B 组是 T1 抄下来的相关语句。只要任何一条语句在窗口内变过，这两组
-    就来自两个不同的账号状态——那条语句本身相不相关，不改变"这份快照混了两个时刻"
-    这个事实。按"相关"过滤会把判据缩得比主语窄，而这份文档的数字已经被同一个形状的
-    错误推翻过四次。
+    覆盖 `uid`、boundary（ARN **与它那份文档的语句**）、**带来源的全部语句**、以及
+    每份贡献策略的 `DefaultVersionId`。
+
+    为什么是"全部语句"而不是"`is_relevant_iam_statement` 挑出来的那些"：A 组是模拟器在
+    T2 对**完整**策略求值的结果，B 组是 T1 抄下来的相关语句。只要任何一条语句在窗口内
+    变过，这两组就来自两个不同的账号状态——那条语句本身相不相关，不改变"这份快照混了
+    两个时刻"这个事实。按"相关"过滤会把判据缩得比主语窄。
+
+    **为什么 boundary 的文档必须单独收**（Codex 第八轮的 blocker，实测复现）：
+    boundary **不算"被附加"**，所以它的语句根本不在 `statements` 里（见
+    `list_principals`）。早先的摘要只放了 `boundary_arn` ⇒ boundary 那份托管策略换了
+    默认版本、ARN 不变时，摘要的输入一个字都不变 ⇒ 复查看不见，**而且这个变化是持久的**
+    （不是 ABA 那种巧合）。两层都受影响：B 的 `boundaries[fp].stmt_fps` 是 T1 抄的；
+    而 `SimulatePrincipalPolicy` 不传 `PermissionsBoundaryPolicyInputList` 时用的就是
+    实体**当前**那份 boundary（该参数的语义是**覆盖**已附加的那份，AWS 文档明确），
+    所以 A 的判定按 T2 的 boundary 算。
+
+    **版本号也进摘要，包括"只换版本、语句逐字相同"那一种。** 早先这里写着一条不声称
+    （"下一轮自己会红，权限面确实没动"）。那是个 carve-out，而这份文档被推翻的历次都是
+    carve-out：`managed_versions` 同样**持久化进基线**，T1 记的版本与 T3 的现实不一致时
+    快照里那个值就是错的。实测代价为零——7 天 CloudTrail 里 `CreatePolicyVersion` 与
+    `SetDefaultPolicyVersion` 都是 0 次。
 
     语句先各自序列化再**排序**：AWS 两次返回同一份策略的语句顺序不保证一致，不排序
     会把顺序抖动误报成漂移，而反复的假红会训练出"红了就重跑到绿为止"。
-
-    **一件不声称的事**：托管策略的 `DefaultVersionId` 本身不在摘要里。语句是从默认
-    版本解析出来的，所以"换版本且语句变了"照样会红；只有"换了版本、语句逐字相同"
-    这一种会被判成没变——那种情况下快照里记的版本号会陈旧一轮，下一轮自己会红出来，
-    而权限面确实没动过。写在这里是为了别让人把这道复查读成"托管策略版本也锁住了"。
     """
     payload = json.dumps(
         {"kind": p["kind"], "uid": p["uid"], "boundary": p["boundary_arn"],
+         "boundary_statements": sorted(json.dumps(st, sort_keys=True, default=str)
+                                       for st in p["boundary_statements"]),
+         "policy_versions": {k: p["policy_versions"][k]
+                             for k in sorted(p["policy_versions"])},
          "statements": sorted(json.dumps([src, st], sort_keys=True, default=str)
                               for src, st in p["statements"])},
         sort_keys=True, default=str)
@@ -1313,7 +1328,21 @@ def principal_auth_digest(p: dict) -> str:
 
 
 def enumeration_drift(before: list[dict], after: list[dict]) -> dict[str, list[str]]:
-    """模拟前后两次枚举 → **分类**后的漂移原因。空 dict = principal 层窗口内没变过。
+    """模拟前后两次枚举 → **分类**后的漂移原因。空 dict = principal 层**窗口两端一致**。
+
+    **注意这不是"原子性"，别这么叫**（Codex 第八轮把原先那个说法判成过宽，成立）。
+    两点比较只能证明 T1 与 T3 相等，证明不了中间没变过。**已接受的三个盲区**：
+
+    1. **改了又改回来（ABA）**：T1 有授权 → T2 前撤掉 → T3 恢复成与 T1 逐字相同。
+       复查报无漂移，而 A 那次模拟看到的是撤掉后的状态（可能报成 improvement）。
+    2. **枚举后新建、复查前删除**：两端都不存在，整轮不知道它来过。
+    3. **单次枚举自己也不是一个时刻**：`GetAccountAuthorizationDetails` 分页实测跨约
+       90 秒，翻页期间的变化对本函数不可见。
+
+    要真正关掉这三个，需要一条独立的**单调事件源**（变更审计屏障），而不是靠两端状态
+    相等。CloudTrail 不能直接当那个屏障——它有投递延迟（分钟级且无上界保证），
+    拿它做同步屏障要么阻塞不确定的时间，要么给出虚假保证。所以这里**只声称**：
+    **窗口两端不一致就作废本轮**，即持久性的漂移会被咬住。
 
     三类分开报，是因为操作者要能一眼分辨是哪种 churn：站点部署/下线会造出与销毁
     `site-rt-*`（平台自己的行为），另一套 workload 会同名重建。只说一句"本轮作废"
@@ -1392,21 +1421,40 @@ def list_principals(iam) -> dict:
     # 「T1 抄的语句」与「T2 模拟的那个角色」可能属于两代，见 `enumeration_drift`。
     # uid **只在进程内用**、不进快照也不进基线：合法重建每天都发生，把它写进基线
     # 等于每天红一次而没有任何安全含义，那种噪音会训练出无脑更新基线。
+    # boundary 的**文档内容**与每份贡献策略的**默认版本号**也要随 principal 带出来，
+    # 否则 `principal_auth_digest` 看不见它们（boundary 不算"被附加"⇒ 它的语句不在
+    # `statements` 里）。这两项与 `uid` 一样**只在进程内用**：boundary 语句已经由 B 以
+    # 指纹形态进基线，版本号也已经在 `iam_write.managed_versions` 里，这里再存一份原文
+    # 只为了做窗口两端的等值比较。
+    def _decorate(entry: dict) -> dict:
+        b_arn = entry["boundary_arn"]
+        # `docs` / `versions` 里必须已经有它——上面对全部 referenced 策略（含 boundary）
+        # 预解析过，解析不出会硬失败。**故意用直接索引**：`.get()` 兜出 None/空 list 时，
+        # 两端都是空 ⇒ 摘要恒等 ⇒ 复查永远说"没变"，与"账号很安静"逐字相同。
+        entry["boundary_statements"] = policy_statements(docs[b_arn]) if b_arn else []
+        srcs = {src for src, _ in entry["statements"] if src is not None}
+        if b_arn:
+            srcs.add(b_arn)
+        entry["policy_versions"] = {a: versions[a] for a in sorted(srcs)}
+        return entry
+
     out = []
     for r in roles:
-        out.append({"kind": "role", "name": r["RoleName"], "arn": r["Arn"],
-                    "uid": r["RoleId"],
-                    "statements": statements_for_entity(r, "RolePolicyList",
-                                                        managed=docs, versions=versions),
-                    "boundary_arn": (r.get("PermissionsBoundary") or {})
-                                    .get("PermissionsBoundaryArn")})
+        out.append(_decorate({
+            "kind": "role", "name": r["RoleName"], "arn": r["Arn"],
+            "uid": r["RoleId"],
+            "statements": statements_for_entity(r, "RolePolicyList",
+                                                managed=docs, versions=versions),
+            "boundary_arn": (r.get("PermissionsBoundary") or {})
+                            .get("PermissionsBoundaryArn")}))
     for u in users:
-        out.append({"kind": "user", "name": u["UserName"], "arn": u["Arn"],
-                    "uid": u["UserId"],
-                    "statements": statements_for_user(u, groups=groups, managed=docs,
-                                                      versions=versions),
-                    "boundary_arn": (u.get("PermissionsBoundary") or {})
-                                    .get("PermissionsBoundaryArn")})
+        out.append(_decorate({
+            "kind": "user", "name": u["UserName"], "arn": u["Arn"],
+            "uid": u["UserId"],
+            "statements": statements_for_user(u, groups=groups, managed=docs,
+                                              versions=versions),
+            "boundary_arn": (u.get("PermissionsBoundary") or {})
+                            .get("PermissionsBoundaryArn")}))
     return {"principals": out, "policy_docs": docs, "managed_versions": versions}
 
 
@@ -1761,7 +1809,7 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
         raise SystemExit(f"{len(failures)} 个 principal 模拟失败，结果不完整："
                          f"{failures[:3]}")
 
-    # ---- 观测的原子性：枚举(T1) → 逐个模拟(T2) 之间有约 10 分钟窗口 ----
+    # ---- 窗口两端一致性复查：枚举(T1) → 逐个模拟(T2) → 复查(T3)，窗口约 10 分钟 ----
     # B 组是 T1 抄下来的静态语句，A 组是 T2 模拟出来的判定。窗口内有人改了某个
     # principal 的策略、或把同名角色删了重建，这一份快照就同时描述两个时刻，而
     # 「B 里没有这条 IAM 写语句」与「这条语句是 T1 之后才加的」在输出上一模一样。
@@ -1772,21 +1820,28 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
     # ⇒ 值没错，但"这是一个时刻的快照"这句话当时是假的。
     #
     # 复查的代价是再做一次 `GetAccountAuthorizationDetails`（实测约 1.5 分钟）。
-    # 它**只覆盖 principal 层**：函数清单、alias、resource policy、asset 各自在自己
-    # 的时刻测得，跨层不保证原子——别把这道复查读成"整轮都原子了"。
+    #
+    # **它声称的东西比"原子"窄，两处都别读过头**（Codex 第八轮）：
+    #   ① 只覆盖 **principal 层**——函数清单、alias、resource policy、asset 各自在自己
+    #      的时刻测得，跨层没有任何一致性保证；
+    #   ② 只能证明**窗口两端相等**，证明不了中间没变过：改了又改回来、枚举后新建又在
+    #      复查前删除、以及单次枚举自己分页那 ~90 秒内的变化，都不可见（见
+    #      `enumeration_drift` 的 docstring，三个盲区各有一条钉住它们的用例）。
+    # 所以它是一道**持久漂移**闸门，不是原子快照的证明。
     drift = enumeration_drift(principals, list_principals(iam)["principals"])
     if drift:
         detail = "；".join(f"{k}: {', '.join(v[:5])}"
                           + (f" 等 {len(v)} 个" if len(v) > 5 else "")
                           for k, v in drift.items())
         raise SystemExit(
-            f"本轮观测不是原子的——枚举与模拟之间 principal 层发生了变化，"
+            f"本轮观测作废——枚举与模拟之间 principal 层发生了持久变化，"
             f"这份快照会同时描述两个时刻的账号，不能出结论也不能写基线。"
             f"漂移：{detail}。"
             f"（站点部署/下线会产生 `site-rt-*` 的增减；账号里另一套 workload 会同名"
             f"重建角色。等账号静默下来重跑即可——实测 7 天里 96.6% 的 10 分钟窗口是"
             f"干净的。）")
-    print(f"复查枚举：principal 层的授权投影与模拟前一致（{len(principals)} 个）",
+    print(f"复查枚举：principal 层的授权投影**两端一致**（{len(principals)} 个；"
+          f"只覆盖 principal 层、只保证两端相等，见 enumeration_drift 的三个盲区）",
           file=sys.stderr)
 
     facts["principals_with_missing_context"] = n_missing
