@@ -781,20 +781,16 @@ def test_real_template_buildspec_is_inlined_byte_for_byte(template):
         template.to_json(), BUILDSPEC.read_bytes()) == []
 
 
-def test_importing_app_does_not_synth(template):
-    """`app.py` 顶层的 `App()/synth()` 必须在 `__main__` 守卫之下。
-
-    这条守的是"import 无副作用"这个前提本身：没有它，任何想 import 本模块的单测都被迫
-    依赖 Docker，而本文件的 fixture 会 synth 两次。判据取 AST——`import app` 已经由
-    fixture 做过了，这里要断言的是**源码结构**。
-    """
-    import ast
-    src = (INFRA / "app.py").read_text(encoding="utf-8")
-    tops = [n for n in ast.parse(src).body
-            if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)]
-    bad = [n for n in tops
-           if getattr(getattr(n.value.func, "value", None), "id", None) == "app"]
-    assert not bad, f"app.py 顶层仍有 app.<...>() 调用（第 {[n.lineno for n in bad]} 行）"
+# `__main__` 守卫那条**不放在这里**（执行时的一处自我修正）：它是纯 AST 判据、不需要
+# aws_cdk 也不需要 Docker，写成要 `template` fixture 的用例会为一条不需要 synth 的断言白
+# 起一次 Docker synth。它加在 always-on 的 `test_security_contracts.py` 里，函数名
+# `test_importing_app_has_no_side_effects`，判据同下（负向控制：对 HEAD 版本的 app.py
+# 会红在第 908 行，已实测）：
+#
+#     bad = [n.lineno for n in ast.parse(src).body
+#            if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
+#            and getattr(getattr(n.value.func, "value", None), "id", None) == "app"]
+#     assert not bad
 ```
 
 - [ ] **Step 7: 跑 opt-in 断言（需 PYTHONPATH 桥接 + Docker）**
@@ -827,9 +823,36 @@ PATH=.venv/bin:$PATH npx -y aws-cdk@latest diff | tee /tmp/m09-3b-cdkdiff.txt
 2. `AWS::IAM::Policy`（`PackageProjectRoleDefaultPolicy79E436B4`）：删掉
    `s3:GetObject*`/`GetBucket*`/`List*` on bootstrap 桶那一条。
 
-逐项确认 diff 里**没有**：CodeBuild Project replacement、Role replacement、
-logical ID 变化、其它 IAM 变化、`site-artifacts` 精确权限的任何变化。
-（少一个 CDK asset 是预期的。）
+**实跑之后把预期钉成实测到的样子**（原文只写"确认没有 replacement"，没说怎么确认，
+而实跑冒出三件它没预料到的事）：
+
+`IAM Statement Changes` 必须恰好是**一条删除、零新增**（那条 bootstrap 整桶读），
+`site-artifacts` 的两条精确授权不出现在增删里。
+
+diff 里另外三件事**都是预期的**，别当红旗，但每一条都要按下面的方式确认：
+
+1. **13 个 Lambda 的 `Code.S3Key` 变化是既有现象**，与本改动无关。确认方式：把 `app.py`
+   临时换回 HEAD 版本（`cp` 备份 + `git checkout --`，**不要用 `git stash`**）再 diff 一次
+   ——13 个照样变（bundling 产物不可复现）。逐资源对账后，本改动只该引入下面第 2、3 条与
+   `PackageProjectRoleDefaultPolicy` 这三处。
+2. **`PackageProject … may be replaced` 是 CDK 的保守渲染，不是真替换。** 权威判据是
+   CloudFormation 自己的资源 schema，**只读**即可确认：
+
+   ```bash
+   set -euo pipefail
+   python3 -c "
+   import boto3, json
+   s = json.loads(boto3.client('cloudformation', region_name='us-east-1').describe_type(
+       Type='RESOURCE', TypeName='AWS::CodeBuild::Project')['Schema'])
+   print(s.get('createOnlyProperties'))"
+   ```
+
+   实测输出 `['/properties/Name']` —— `Source` **不在** create-only 里 ⇒ 改
+   `Source.BuildSpec` 不触发替换，而 `Name` 本次未变。**这点要紧**：项目名是固定的
+   `site-package`，真替换会撞名让整次更新失败回滚。
+3. **`DeployerExecRoleDefaultPolicy` 的文档指纹变化是第 2 点的渲染后果**：项目 Ref 在
+   changeset 里被标成 `KNOWN_AFTER_APPLY`，而该角色有一条 `codebuild:StartBuild` 指向这个
+   项目。不是语义变化，但**部署后要复核它确实没变**（Task 4 Step 3 加一条断言）。
 
 - [ ] **Step 9: 跑 auth（证明没碰 bundling 段）并提交**
 
