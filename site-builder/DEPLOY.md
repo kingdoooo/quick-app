@@ -245,11 +245,23 @@ cookie 后移除旧值），**必须改这三处**——少改任何一处方案
 | `router/infrastructure/lambda/origin_request.py` | `_verify_session_jwt()` 改成依次试两个 key |
 | `site-builder/auth/session.py` + `login_handler.py` | 签发侧始终只用 active key，配合切换顺序 |
 
-> ⚠️ 别只照"`origin_request.py` 与 `auth/session.py` 两处同步"去改：
-> `session.py` 里的 `verify_session_jwt()` **只有测试在用**，不是生产验签
-> 消费方（生产验签是 Edge 里的 `_verify_session_jwt`）。真正卡住双密钥部署的
-> 是 `stack.py` 那一行——它不改的话，CDK 仍然只注入一个 secret，Edge 代码改了
-> 也拿不到第二个值。
+> ⚠️ **生产验签有三处，不是一处。** 这条注记从前把 `session.py` 的
+> `verify_session_jwt()` 说成**只有测试会调用它**——**那是错的**（大概写在
+> M3/M05 之前，之后没跟上）。实测非测试调用点：
+>
+> | 验签点 | 位置 | 验的是什么 |
+> |---|---|---|
+> | Edge | `router/infrastructure/lambda/origin_request.py:452` | 站点访问的 `sb_session` |
+> | auth | `site-builder/auth/login_handler.py:530` | `/console-session` 换升级码时的 `sb_session` |
+> | panel | `site-builder/panel/console_session.py:131` | 每个控制台写请求的 `__Host-sb_console` |
+>
+> （panel 还在 `:82` 消费一次性升级码，`login_handler.py:102` 另有一处用**同一把
+> 密钥**的裸 HMAC 签 OAuth state——不是 JWT，但同样属于"读到密钥就能伪造"的面。）
+> 按"只改 Edge 一处"去估算改动范围会漏掉两个生产消费方；非对称化时尤其致命，
+> 因为 panel 现在**没有 requirements.txt**、产物里只有 `.py`。
+>
+> 真正卡住双密钥部署的仍然是 `stack.py` 那一行——它不改的话，CDK 仍然只注入一个
+> secret，Edge 代码改了也拿不到第二个值。
 
 这是代码改动，不在一期/二期范围内。
 

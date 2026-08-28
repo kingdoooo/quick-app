@@ -18,6 +18,7 @@
 """
 import ast
 import re
+import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).parents[3]
@@ -798,3 +799,61 @@ def test_claude_md_status_section_points_at_a_tracked_truth_source():
     assert truth, (
         "「待办与优先级」**这一句**指向的不是一份被跟踪的文档——读者拿不到一份新 "
         f"clone 里真的存在的「还剩什么」清单。这句引用的是：{cited}")
+
+
+def test_deploy_md_lists_every_production_session_verifier():
+    """DEPLOY.md 不许再说 `verify_session_jwt()` "只有测试在用"，且必须点名全部
+    生产验签点。
+
+    这条是 3c spike 抓出来的：那句话是 M3/M05 之前写的，之后 auth 的
+    `/console-session` 与 panel 的每个写请求都成了生产消费方，而注记没跟上。
+    它的害处很具体——按"只改 Edge 一处"去估非对称化的改动范围，会漏掉两个生产
+    验签点（而 panel 现在连 requirements.txt 都没有）。
+
+    **判据从源码派生**，不是硬编码三个路径：扫全仓非测试 Python 里
+    `verify_session_jwt(` 的调用点，要求每个**拥有它的组件**都在文档里被点到。
+    手写名单会随第四个验签点出现而滞后——这一轮已经被"手写名单必然滞后"咬过两次。
+    """
+    doc = _read(DEPLOY)
+    assert "只有测试在用" not in doc, (
+        "DEPLOY.md 又出现了「verify_session_jwt 只有测试在用」——"
+        "实测有两个生产调用方")
+
+    # **只看 git 跟踪的文件**，不用 rglob 扫工作树。第一版用 rglob + "名字不以
+    # test_ 开头"当判据，立刻误判了 `_edge_access_idp_testable.py`——那是
+    # `test_edge_access_log.py:362` 在测试里**写出来**的 origin_request.py 副本
+    # （`lambda/.gitignore` 里 `_*_testable.py` 一条就是为它），既不进产物也不进仓库。
+    # 判据换成 `git ls-files` 之后这类构建残留自然落在范围外，而且与"随仓库分发的
+    # 才算生产代码"这个定义一致。
+    tracked = subprocess.run(["git", "ls-files", "*.py"], cwd=ROOT,
+                             capture_output=True, text=True, check=True).stdout.split()
+    callers: set[str] = set()
+    for rel in tracked:
+        path = ROOT / rel
+        name = path.name
+        if "/tests/" in rel or name.startswith("test_") or "cdk.out" in rel:
+            continue
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("#", '"', "'")):
+                continue
+            # 只算**调用**，不算 def / import / 注释里的提及
+            if "verify_session_jwt(" in stripped and not stripped.startswith("def "):
+                callers.add(rel)
+                break
+    # 下限：派生集合空了（rglob 没跑起来 / 判据写错）不能变成一个空循环的绿
+    assert len(callers) >= 2, (
+        f"只找到 {sorted(callers)} —— 判据失效？实测应有 auth 与 panel 两处生产调用方")
+
+    owners = {"site-builder/auth/": "auth", "site-builder/panel/": "panel",
+              "router/infrastructure/lambda/": "Edge"}
+    for rel in sorted(callers):
+        prefix = next((p for p in owners if rel.startswith(p)), None)
+        if prefix is None:
+            continue
+        assert rel in doc, (
+            f"{rel} 是 `verify_session_jwt` 的生产调用方，但 DEPLOY.md 没点到它"
+            f"——按文档估改动范围会漏掉这个组件")
