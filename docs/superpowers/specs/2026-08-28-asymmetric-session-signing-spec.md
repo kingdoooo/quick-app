@@ -1,6 +1,8 @@
 # 3c：会话签名迁到非对称（设计 spec）
 
-日期 **2026-08-28**。状态：**待修订的设计草案，未实施**（外部复审第十三轮的三个 P1 已按下文吸收；**它不构成 3c-0/3c-1 的实施授权**）。对应 merged review §9 的 **3c**
+日期 **2026-08-28**（末次修订 **2026-08-31**）。状态：**待修订的设计草案，未实施**
+（外部复审第十三、十四轮的 P1 已按下文吸收；**它不构成 3c-0/3c-1 的实施授权**）。
+对应 merged review §9 的 **3c**
 （M09 真修复 ②）。前一条 3b（收窄 CodeBuild 对 bootstrap 桶的读权限）已于 2026-08-27
 部署，见 `2026-08-27-codebuild-bootstrap-read-narrowing-spec.md`。
 
@@ -31,53 +33,106 @@
 ## 1. 为什么做，以及收益的**准确边界**
 
 3c 的论点是"Edge 只放公钥 ⇒ 只读那批 principal 拿不到签名能力"。这个论点**成立**。
-下面的数字来自两次生产只读模拟（401 个 principal = 399 个非 service-linked 角色 + 2 个
-用户，与闸门基线那次的 400 口径一致）：
+
+下面的数字来自生产只读模拟（401 个 principal = 399 个非 service-linked 角色 + 2 个用户，
+与闸门基线那次的 400 口径一致）。探针、脱敏聚合证据与已知盲区清单见 §12.1；
+**它是可复跑的 tracked 产物，不是本文档里的手抄数字。**
 
 | | 数量 |
 |---|---|
 | 今天能拿到 HS256 明文密钥 ⇒ 能签任意人的会话 | **56** |
-| 迁 KMS 后能签会话（`kms:Sign` 12，∪ 能改 key policy / 发 grant 自助授权 13） | **13** |
-| 能替换**CloudFront 正在执行的** Edge 验签版本 | **17** |
-| **⇒ 3c 之后的冒充面上界（两者并集）** | **18** |
+| 3c 后能签会话（`can_sign`） | **15** |
+| 3c 后能替换**CloudFront 正在执行的** Edge 验签代码（`can_replace_edge_verifier`） | **17** |
+| **⇒ 3c 之后的冒充面（两者并集）** | **19** |
 
-### 一处我推错、被外部复审纠正的地方（务必别照抄旧说法）
+> **这个 19 是「已知下界」，不是上界。** 它是"按下面九条已建模路径量出来的并集"，
+> 而聚合证据里带着一份 `known_gaps`（KMS key policy 未纳入、IAM 自助提权归闸门 B 组、
+> `UpdateFunctionConfiguration` 取上界口径、Cognito pre-token 那条不在 3c 范围……）。
+> **口径必须写成下界**——把它写成"上界"是上一稿被连续两轮复审咬住的同一个错误：
+> 每次都是"我建模的路径的并集"被当成了"全部路径的并集"。
 
-草案第一版写的是"残留那 12 个 **12/12 都持 `replace-platform-code`**，所以不给
-`kms:Sign` 也能直接换掉 Edge 验签代码"。**那条推导不成立**（复审 P1-2，成立）：
+九条已建模路径各自的持有者数：
 
-- M09 闸门的 `replace-platform-code` **只模拟 `lambda:UpdateFunctionCode`**；
-- `UpdateFunctionCode` 改的是**未发布的 `$LATEST`**，已发布的编号版本代码不可变；
-- 而 Lambda@Edge **必须**关联编号版本（CFN 文档原文："You must specify the ARN of a
-  function version; you can't specify an alias or `$LATEST`"）。
-
-⇒ **只有 `UpdateFunctionCode` 不会改变 CloudFront 当前执行的代码。** 于是按完整链重测：
-
-| 链 | 持有者 |
+| 能力路径 | 持有者 |
 |---|---|
-| 路径 A：`UpdateFunctionCode` + `PublishVersion` + `cloudfront:UpdateDistribution` | 12 |
-| 路径 B：`cloudformation:UpdateStack`（router 栈） | **17** |
-| A ∪ B | **17** |
+| `sign:kms-direct`（`kms:Sign`） | 12 |
+| `sign:kms-self-authorize`（`PutKeyPolicy` / `CreateGrant` 自助授权） | 13 |
+| **`sign:hijack-auth-signer`**（换 `site-auth-service` 的代码/配置） | **14** |
+| **`sign:hijack-panel-signer`**（换 `site-panel` 的代码/配置） | **14** |
+| `edge:code+publish+associate` | 12 |
+| **`edge:code(Publish=True)+associate`**（一次调用即改码即发版本） | 12 |
+| `edge:new-function+associate`（新建函数 + `PassRole` edge 执行角色） | 12 |
+| `edge:cfn-update-stack`（router 栈） | **17** |
+| **`edge:cfn-change-set`**（`CreateChangeSet`+`ExecuteChangeSet`） | 16 |
 
-**结论方向不变，但理由换了、数字也变了**：
+### 被外部复审连续纠正过两次的地方（务必别照抄任何旧说法）
 
-- 能签会话的 13 个里，**12 个同时能替换正在执行的 Edge**，**只有 1 个不能**
-  （一个 PoC 角色）。⇒ **限制性 key policy 最多把冒充面从 18 降到 17**，
-  换来的是自锁风险 + 一个必须纳入闸门枚举的破窗 principal。**不值得**——
-  但这次是"量出来只差 1 个"，不是原先那条错推导。
-- **3c 之后的冒充面是 18，不是 13。** 有 **5 个 principal 能替换 Edge 却不能签名**，
-  它们在原先的口径里根本没被算进去。§1 的旧表把这一栏漏了。
-- 一句话仍然成立：**3c 把边界从「账号内任何只读身份」压到「能改写平台代码或能签名的
-  身份」**，从 56 压到 18。它**不**声称防住管理员。
+**第一次**（第十三轮）：草案说"残留那 12 个 12/12 都持 `replace-platform-code`，
+所以不给 `kms:Sign` 也能直接换掉 Edge"。不成立——闸门的 `replace-platform-code`
+只模拟 `lambda:UpdateFunctionCode`，而它改的是**未发布的 `$LATEST`**，
+Lambda@Edge **必须**关联编号版本（CFN 文档原文："You must specify the ARN of a
+function version; you can't specify an alias or `$LATEST`"）。**已实测**：本
+distribution 上 origin-request 的 association 限定符就是一个编号版本
+（探针每次跑都重新验这条前提，不成立就响亮失败）。
+
+**第二次**（第十四轮，就是把 18 改成 19 的这次）：上一稿把冒充面定义成
+"能签名 ∪ 能替换 Edge"，但**漏了「能劫持 signer 本身」这一整类**。3c 之后 auth 的执行
+角色持两把 key 的 `kms:Sign`、panel 持 console key 的 `kms:Sign`；而**实测**：
+
+- `site-auth-service` 与 `site-panel` 的 Function URL **都没有 qualifier**，
+  两个部署脚本用的都是裸 `update_function_code`（不带 `Publish`）
+  ⇒ **它们服务的是 `$LATEST`**；
+- 于是 `lambda:UpdateFunctionCode` **一个动作**就是"在那个执行角色下跑任意代码"，
+  **既不需要攻击者自己有 `kms:Sign`，也不需要碰 Edge、不需要发版本**。
+
+⇒ `can_sign` 从 13 涨到 **15**，冒充面从 18 涨到 **19**。
+
+**另外两条第十四轮要求补测的等价路径，量出来没有改变总数**（但模型现在是对的，
+以后账号形状变了就会体现）：`UpdateFunctionCode(Publish=True)` 与
+`CreateChangeSet`+`ExecuteChangeSet` 的持有者分别是 12 与 16，都落在既有集合里。
+**"提出来的路径实测没加人"与"不必建模"是两回事**——不建模的话，哪天某个角色只拿到
+change-set 那两条就整个漏掉。
+
+一句话仍然成立：**3c 把边界从「账号内任何只读身份」压到「能改写平台代码或能签名的
+身份」**，从 56 压到 19。它**不**声称防住管理员。
+
+### 各候选缓解措施的**边际收益**（这一栏推翻了上一稿的 key policy 论证）
+
+判据不是"某条路有几个人"，而是**关掉这一组路径之后有多少 principal 完全离开冒充面**：
+
+| 措施 | 冒充面 | 离开的 principal |
+|---|---|---|
+| **给 router 栈加 stack policy**（今天**没有**，实测） | 19 → **15** | **−4** |
+| 限制性 KMS key policy | 19 → 18 | −1 |
+| 收窄谁能改 auth/panel 的代码与配置 | 19 → 18 | −1 |
+| 锁住 Edge 的换码/association 直接链 | 19 → 19 | **−0** |
+
+三条结论，都与上一稿不同：
+
+1. **`kms:Sign` 的限制性 key policy 只值 1 个 principal，而且它结构上收不掉劫持
+   signer 那条路**——恶意代码是**以 signer 角色的身份**调 KMS 的，key policy 必须放行
+   它。上一稿拿"能签名但不能替换 Edge"（当时 1 个）当收益判据，**那个判据本身是错的**，
+   不只是数字小。结论仍是**不值得**（换来自锁风险 + 一个必须纳入闸门枚举的破窗
+   principal），但这次的理由经得起复核。
+2. **"锁住 Edge 的换码/association 直接链"边际收益是 0。** 持有那条直接链的人**全部**
+   同时持有 CFN 那条路 ⇒ 只收窄 Lambda+CloudFront 而不管 CloudFormation 是**假修复**，
+   与 merged review 里 M09 第 2 步"收窄 invoke"那条假修复是同一个形状。
+3. **反过来，router 栈的 stack policy 是这四条里唯一一次能减 4 的**，而且它与 3c 正交、
+   便宜、可单独做。**它不在本 spec 的范围里**，应当作为独立项进 merged review §9。
 
 ### 顺带发现：闸门的 `replace-platform-code` 是个坏代理，两个方向都错
 
-- **过度声称**：它只有 `UpdateFunctionCode`，证明不了能替换**正在运行**的 Edge；
+- **过度声称**：它只有 `UpdateFunctionCode`。对 **Edge** 证明不了能替换正在运行的代码
+  （必须关联编号版本）；对**站点函数**同样不成立——M7 之后站点 Function URL 挂在
+  blue/green alias 上，而 alias 指向的是 `publish_version` 出来的编号版本，改 `$LATEST`
+  改不动它。**但对 `site-auth-service` / `site-panel` 它恰好是对的**（那两个服务
+  `$LATEST`）⇒ 同一个标签在不同函数上强度不同，这本身就是"把能力压成单个动作"的代价。
 - **同时少算**：`cloudformation:UpdateStack`（17）比 Lambda+CloudFront 那条直接链（12）
-  **更宽**，而闸门完全没看 CFN 这条路。
+  **更宽**，而闸门完全没看 CFN 这条路；change-set 那条（16）也没看。
 
 ⇒ 闸门应当把"能替换正在运行的平台代码"建模成**完整链**（动作等价类 × 资源等价类），
-而不是一个动作。这条归 §10 的闸门改动，且**它本身就是当前基线的一处低估**。
+判据与探针的 `classify()` 一致。这条归 §10，且**它本身就是当前基线的一处低估**，
+与 3c 是否做无关。
 
 **顺带一个今天没有、3c 之后自动获得的性质**：Lambda@Edge 必须关联**已发布的编号版本**，
 所以每次 Edge 部署都留下一个版本，今天那 10 个代码目标每一个都带着**当前有效**的对称密钥
@@ -271,34 +326,45 @@ DigestInfo——那是 Bleichenbacher 2006 那一类伪造的唯一入口）；�
 
 ## 6. 分包与顺序
 
-**3c-0（spec + spike） → 3c-1（HS256 双 key-ring 轮转协议） → 3c-2（KMS 非对称）→
+**3c-0（spec + spike） → 3c-1A（verifier 认新形态） → 3c-1B（HS signer 切 `kid`
+＋轮转演练） → 3c-2A（闸门与验收先认 KMS） → 3c-2B（signer 切 `kms:Sign`） →
 3c-3（HS 退役与清理）。**
 
 **闸门与验收必须前移到它们要观察的那次变化之前**（外部复审 P1-1，成立）。生产 signing
-surface 在 3c-1/3c-2 就已经变了，把闸门改动堆到 3c-3 意味着整个迁移期间闸门看不全新面：
+surface 在 3c-1/3c-2 就已经变了，把闸门改动堆到 3c-3 意味着整个迁移期间闸门看不全新面。
 
-| 门槛 | 必须在什么之前完成 |
-|---|---|
-| 闸门认识**两个 HS key ring** 与 legacy/current/previous（今天它只认识一个 `JWT_PARAM_NAME`、一套 Edge/asset 密钥定位） | **3c-1A 之前** |
-| 闸门认识 **KMS**：`kms:Sign` 持有者、key policy 快照、grants、自助授权、公钥指纹 | **3c-2 切 signer 之前** |
-| 五个验收入口拿到**真实登录态**（不再靠读 SSM 明文本地 mint），且先验过红绿 | **3c-2 切 signer 之前** |
+### 6.1 change-impact matrix（**时序的唯一真源**）
+
+**这张表是本 spec 里时序的唯一真源。** 下面 §6.2 的分包说明、§10 的闸门清单都只能
+**引用**它，不得各写一套——第十三轮修复只追加了正确段落而没删掉旧段落，于是 §3c-3 与
+§10 里同时留着"KMS 闸门放到 3c-3""基线全部重置"两条已被否掉的结论，照着实施仍会踩原
+blocker（外部复审第十四轮 P1-2，成立）。
+
+| 包 | 交付什么 | **进这个包之前**闸门/验收必须已完成 |
+|---|---|---|
+| **3c-0** | 本 spec 定稿 + Edge crypto spike 裁决（§11） | 冒充面探针与脱敏聚合证据 tracked 且可复跑 |
+| **3c-1A** | 全部 verifier 认 `kid`→{family, alg, key} 固定 allowlist、每 family `current`+`previous`、legacy 第三入口（状态机 L1）。**signer 不动** | 闸门认识**两个 HS key ring** 与 legacy/current/previous（今天它只认识一个 `JWT_PARAM_NAME`、一套 Edge/asset 密钥定位）；§9 全部 verifier 反例齐备并验过红绿 |
+| **3c-1B** | signer 开始发 family-specific `kid` + 新 `token_use`/`aud`（状态机 L2）；一次真实 HS 轮转演练 R1/R2 | 四个 `verify_*` 与 10 条 E2E 的登录态工具能 mint **带新 `kid` 的 HS token**（否则 signer 一切就全红，读起来像功能坏了） |
+| **3c-2A** | **只改闸门与验收，不动生产签名**：KMS 探测（`kms:Sign` 持有者、key policy 快照、grants、自助授权、公钥指纹）+ 验收入口改造 | 上一格全绿；本包**自己**先验过红绿（新探测要能真的红） |
+| **3c-2B** | 两把 KMS 非对称 CMK；signer 切 `kms:Sign`；verifier 双接受；key policy 宽严裁定 | **3c-2A 已上线**；五个验收入口拿到**真实登录态**（不再靠读 SSM 明文本地 mint），且验过红绿 |
+| **3c-3** | 退役 HS256、删旧 SSM secret、删 legacy 入口（状态机 L3）、基线**精确 delta** | `accepted_legacy == 0` 且总量非 0 持续超过最长 TTL（§8） |
 
 > **为什么不能反**：若先切 `kms:Sign` 再补 KMS 闸门，3c-2 可以部署成功，而旧闸门只看到
 > HS 暴露面大幅"改善"，**根本没观察新的 signing surface**——那正是这一整轮复审反复咬住的
 > false-green 形状。同理，验收入口在 signer 切换的那一刻立即失效，留到清理包就等于
-> 迁移期间没有真机验收。
-
-于是实际次序是：**闸门(HS 两 ring) → 3c-1A → 3c-1B+演练 → 闸门(KMS)+验收重构 →
-3c-2 切 signer → 3c-3 退役清理 + 精确 baseline delta**。
+> 迁移期间没有真机验收。**这就是把 3c-2 拆成 2A/2B 的唯一原因**：闸门与验收自己要有一个
+> 能独立上线、独立验红绿的发布单元，而不是挂在密码学切换那一包的前置条款里。
 
 不做"整包一次上"：那会把安全闸门修复、生产收权与密码学迁移混成一个更难复核、更难回滚的
 发布单元。
 
+### 6.2 各包的内容
+
 ### 3c-0：spec + Edge crypto spike
 
-已完成的部分（2026-08-28，产物在 `/tmp`，仓库零改动）：
+已完成的部分：
 
-- 生产只读量测 §1 的 56 → 12/13 与 12/12 的 `replace-platform-code` 重叠；
+- 生产只读量测 §1 的冒充面（**探针与脱敏聚合证据现在都是 tracked 的**，见 §12）；
 - 签/验点全图（§2）；
 - Lambda@Edge 与 KMS 的硬约束（§3）；
 - 纯 Python RS256 验签的可行性原型：**0.24 ms/次**（2048-bit），32 项对抗性断言
@@ -354,7 +420,7 @@ surface 在 3c-1/3c-2 就已经变了，把闸门改动堆到 3c-3 意味着整�
 |---|---|---|---|
 | **L0** | 只有 legacy（无 `kid`，旧共享 secret，旧 `typ`/`scope` 合同） | legacy | 现状 |
 | **L1** | legacy **＋** `site-hs-v1` **＋** `console-hs-v1` | **仍发 legacy**（signer 不动） | Edge 全球关联版本已确认生效 |
-| **L2** | 同 L1 | 全部改发 family-specific `v1`（带 `kid`、新 `token_use`+`aud`） | 观测到 `accepted_legacy == 0` 且总量非 0，持续 > 最长 TTS |
+| **L2** | 同 L1 | 全部改发 family-specific `v1`（带 `kid`、新 `token_use`+`aud`） | 观测到 `accepted_legacy == 0` 且总量非 0，持续 > 最长 TTL |
 | **L3** | 只有两个 family 的 `v1` | family `v1` | legacy 入口删除完成 |
 | **R1/R2** | family 内 `current`+`previous`（`v1`→`v2`） | 切 `v2`，可回滚回 `v1` | 真正的轮转演练，见下 |
 
@@ -380,19 +446,29 @@ surface 在 3c-1/3c-2 就已经变了，把闸门改动堆到 3c-3 意味着整�
    再做 family 内部的 `v1`→`v2` 轮转演练。**两件事分开**，否则 3c-1 把"拆 family"与
    "常规轮转"压成一次演练，实施者会有多种合理但互不兼容的解释。
 
-### 3c-2：两把 KMS 非对称 CMK
+### 3c-2A：闸门与验收先认 KMS（**不动生产签名**）
+
+这一包**只改观测方**：闸门加 KMS 探测（`kms:Sign` / `kms:PutKeyPolicy` /
+`kms:CreateGrant` 的持有者、key policy 快照、grants、公钥指纹），四个 `verify_*` 与
+E2E 的登录态获取方式按 §11 未决项 7 裁定的那条路改造。**本包自己要先验过红绿**——
+新探测必须能真的红，否则 3c-2B 上线后基线只会显示一个很大的"改善"，而真正要盯的那一面
+根本没被测量（闸门今天明确"不看 KMS grants"）。
+
+`replace-platform-code` 重建成完整链（§1 的顺带发现）也在这一包，理由见 §10。
+
+### 3c-2B：两把 KMS 非对称 CMK
 
 把新的 asymmetric `kid` 加为 `current`、旧 HS256 作为 `previous`；signer 切 `kms:Sign`；
-verifier 双接受。key policy 的宽严（§1 的决策点）在这一包裁定。
+verifier 双接受。key policy 的宽严（§1 的决策点）在这一包裁定。**前置条件是 3c-2A 已
+上线**，见 §6.1。
 
 ### 3c-3：清理与闸门
 
-- 退役 HS256；删除旧 SSM secret；
+**这一包只做清理与结算，不新增观测能力**——闸门的 KMS 探测、`replace-platform-code`
+重建、验收入口改造全部在 **3c-2A**（§6.1）。放到这里就等于整个迁移期间没有新观测。
+
+- 退役 HS256；删除旧 SSM secret；删除 legacy 入口（状态机 L3）；
 - 确认 Edge asset 不再含活的对称签名密钥；
-- **把 `replace-platform-code` 重建成完整链**（§1 的顺带发现）：现在它只模拟
-  `lambda:UpdateFunctionCode`，既证明不了能替换正在运行的 Edge，又漏掉了更宽的
-  `cloudformation:UpdateStack` 那条路（17 > 12）。这是当前基线的一处**低估**，
-  与 3c 是否做无关，应当尽早单独修。
 - **基线做 schema 迁移 + 精确 delta，不是"全部重置"**（外部复审 P1-1，成立）。
   我原先引 `account-trust-boundary.md` 那句"迁移后基线应当重置"来支持全量重置——
   **引错了节**：那句在 **A（迁独立成员账号）= §9 的 3d** 一节里，不在 B（非对称签名）。
@@ -400,10 +476,6 @@ verifier 双接受。key policy 的宽严（§1 的决策点）在这一包裁�
   层**；**精确断言** HS 读取类 grant 与 facts 的退出；**精确吸收**新增的 KMS policy /
   grant / 公钥指纹 facts；**任何无关变化继续红**。
   全量重置会把同一窗口里无关的 IAM 漂移一起合法化——那等于用一次迁移把闸门清零。
-- **闸门加 KMS 探测**：`kms:Sign` / `kms:PutKeyPolicy` / `kms:CreateGrant` 的持有者、
-  key policy 快照、公钥指纹。**不加这一层，基线会显示一个很大的改善而真正要盯的那一面
-  根本没被测量**——闸门今天明确"不看 KMS grants"。这是 3c 的一部分，不是后续项。
-- 重设全部真机验收（§10）。
 
 ---
 
@@ -486,17 +558,22 @@ wrong_token_use    bad_signature       expired
 
 ## 10. 闸门与守卫要改什么
 
-**不一起改就会假绿或部署不出去**：
+**不一起改就会假绿或部署不出去。** **每一行的"什么时候改"一律以 §6.1 的
+change-impact matrix 为准**，本节只说"改什么"，不重复时序（上一轮就是因为这里另写了
+一套时序而与 §6 矛盾）。
 
-| 对象 | 要改什么 |
-|---|---|
-| `verify_account_trust_boundary.py` | `JWT_PARAM_NAME`、产物里定位密钥的正则、A/B 两组基线**全部重置**；**新增 KMS 探测**（§3c-3） |
-| `verify_deployed_edge.sh` | 它按源码字面量 grep 产物里的 `typ` 检查；验签函数重写后那条 regex 必失配 |
-| `verify_console_e2e.py` / `verify_api_key_e2e.py` / `verify_analytics_e2e.py` / `verify_session_token_semantics.py` | **四个都靠"读 SSM 明文 → 本地 mint 会话"免掉人工登录**。非对称化后本地拿不到私钥 ⇒ **这四个闸门的登录态获取方式要重新设计**（给验收角色一条受限的 `kms:Sign`，或走真实登录）。这条影响的正是"我们用来验证一切的东西" |
-| `deployer/tests/test_e2e_fixtures.py` | 同上（10 条 E2E 的登录态全靠它） |
-| `test_edge_auth.py` / `test_origin_request.py` / `test_edge_access_log.py` | 占位符替换表、手搓 HMAC 的用例、跨组件向量、签名形状断言 |
-| auth / panel 的测试 | `test_session.py`、`test_upgrade_code.py`、`test_console_session.py`、`test_deploy_panel_contract.py`（"SSM 资源必须是精确 jwt-secret ARN"）等 |
-| `verify_deployed_components.py` | "环境变量不得有明文密钥"那两处检查 |
+| 对象 | 要改什么 | 属于哪个包（§6.1） |
+|---|---|---|
+| `verify_account_trust_boundary.py`（HS 侧） | `JWT_PARAM_NAME` 变成**两个 HS key ring** + legacy/current/previous；产物里定位密钥的正则要能同时找多把 | 3c-1A |
+| `verify_account_trust_boundary.py`（KMS 侧） | **新增 KMS 探测**：`kms:Sign` / `kms:PutKeyPolicy` / `kms:CreateGrant` 持有者、key policy 快照、grants、公钥指纹 | 3c-2A |
+| `verify_account_trust_boundary.py`（`replace-platform-code`） | 重建成**完整链**（动作等价类 × 资源等价类），判据与 `scripts/probe_impersonation_surface.py` 的 `classify()` 一致 | 3c-2A（**但它是当前基线的一处低估，与 3c 是否做无关，可提前单独修**） |
+| `verify_account_trust_boundary.py`（基线） | **schema 迁移 + 精确 delta，不是全部重置**——理由见 §6.2 的 3c-3 一节 | 3c-3 |
+| `verify_deployed_edge.sh` | 它按源码字面量 grep 产物里的 `typ` 检查；验签函数重写后那条 regex 必失配 | 3c-1A |
+| `verify_console_e2e.py` / `verify_api_key_e2e.py` / `verify_analytics_e2e.py` / `verify_session_token_semantics.py` | **四个都靠"读 SSM 明文 → 本地 mint 会话"免掉人工登录**。非对称化后本地拿不到私钥 ⇒ **这四个闸门的登录态获取方式要重新设计**，按 **§11 未决项 7** 裁定的那条路改（①真实登录 / ②新增一个 signer principal 并精确纳入 A 组枚举 / ③固定身份的受控签发服务）。**不要写成"给验收角色一条受限的 `kms:Sign`"——`kms:Sign` 不限制 claims，那本身就是一个新的冒充 principal。** 这条影响的正是"我们用来验证一切的东西" | 3c-2A |
+| `deployer/tests/test_e2e_fixtures.py` | 同上（10 条 E2E 的登录态全靠它） | 3c-2A |
+| `test_edge_auth.py` / `test_origin_request.py` / `test_edge_access_log.py` | 占位符替换表、手搓 HMAC 的用例、跨组件向量、签名形状断言 | 3c-1A（HS 形态）→ 3c-2B（RS 形态） |
+| auth / panel 的测试 | `test_session.py`、`test_upgrade_code.py`、`test_console_session.py`、`test_deploy_panel_contract.py`（"SSM 资源必须是精确 jwt-secret ARN"）等 | 3c-1A/1B → 3c-2B |
+| `verify_deployed_components.py` | "环境变量不得有明文密钥"那两处检查 | 3c-2B |
 
 **文档**（都是状态真源）：`CLAUDE.md`（不变量 §"auth/session 与 Edge verifier 是同一契约"
 + 开头"三条仍然成立的边界"）、`site-builder/DEPLOY.md`（轮转整节 + 依赖关系 + §7 那条
@@ -540,9 +617,12 @@ wrong_token_use    bad_signature       expired
 
 | 事实 | 来源 |
 |---|---|
-| 56 能读明文密钥；迁 KMS 后能签会话 13、能替换运行中 Edge 17、并集 **18** | 生产只读 `SimulatePrincipalPolicy`，401 个 principal，2026-08-28～29 两次 |
-| 能签名但**不能**替换 Edge 的只有 **1** 个 ⇒ 限制性 key policy 只值 1 个 principal | 同上，完整链交叉 |
-| `cloudformation:UpdateStack`(17) 比 Lambda+CloudFront 直接链(12) 更宽 | 同上 |
+| 56 能读明文密钥；3c 后 `can_sign` **15**、能替换运行中 Edge **17**、并集 **19**（**已知下界**） | `docs/security/3c-impersonation-surface.json`（tracked，只读 `SimulatePrincipalPolicy`，401 个 principal，2026-08-30） |
+| 九条能力路径各自的持有者数、四个候选措施的边际收益 | 同上（`aggregate.per_label` / `aggregate.marginal_value_if_closed`） |
+| **router 栈已关联 CFN service role 且无 stack policy** ⇒ CFN 那条路的调用方自己不需要 `iam:PassRole` | `cloudformation:DescribeStacks` + `GetStackPolicy`（只读） |
+| **`site-auth-service` / `site-panel` 的 Function URL 无 qualifier、服务 `$LATEST`** ⇒ 换码即劫持 signer | `lambda:GetFunctionUrlConfig` + `GetFunction`（只读）+ 两个部署脚本的裸 `update_function_code` |
+| **Edge 的 association 限定符是编号版本** ⇒ 单动作证明不了能替换运行中的代码 | `cloudfront:GetDistributionConfig`（只读，探针每次跑都重验这条前提） |
+| 站点函数的 alias 指向 `publish_version` 出来的编号版本 ⇒ 改 `$LATEST` 改不动线上 | `deployer/functions/deploy_lambda_site.py:243-253` |
 | 账号内已有一把客户自管 `RSA_2048 SIGN_VERIFY` CMK，其 key policy 是全开默认形态 | `kms:DescribeKey` + `GetKeyPolicy`（只读） |
 | `alias/aws/ssm` 的 key policy 是 `Principal:*` + `ViaService` ⇒ 今天那道 KMS 是虚的 | 同上 |
 | Lambda@Edge 50 MB / 30 s / 无 env / 无 Layers / 无 arm64 | CloudFront 开发者指南 *Quotas on Lambda@Edge*、*Restrictions on Lambda@Edge* |
@@ -553,11 +633,31 @@ wrong_token_use    bad_signature       expired
 | 纯 Python RS256 验签 0.24 ms、ES256 4.5 ms | 本机实测，1000 次取平均 |
 | Edge 跨区调用 热 229 ms / 冷 719 ms | 本仓库既有实测（CLAUDE.md 埋点预算） |
 
-**产物位置**：探针与结果在 `docs/design/3c-spike/`（gitignored）。
+### 12.1 产物位置：**分三层，前两层 tracked**
+
+| 层 | 位置 | 内容 |
+|---|---|---|
+| 探针本体 | `site-builder/scripts/probe_impersonation_surface.py`（**tracked**） | 资源全靠发现（不硬编码 distribution ID / 账号 / 角色名 / 绝对路径）；`--self-test` 是 18 条反例 + 2 条聚合断言，不碰 AWS |
+| 聚合证据 | `docs/security/3c-impersonation-surface.json`（**tracked**） | commit SHA、探测时间、区、动作/资源等价类、各集合计数与交集、每个候选措施的边际收益、原始输出的 sha256、**已知盲区清单** |
+| 原始名字 | `docs/design/3c-spike/observed-*.json`（**gitignored**） | principal 名字。探针在发第一个请求**之前**用 `git check-ignore` 挡住写进 tracked 路径 |
+
+> **证据里的 `commit` 字段写的是 `bd615de…+dirty`**，这是诚实的：那一跑发生在引入探针
+> 本身的那次提交**之前**（工作树里已有探针）。**数字与仓库状态无关**（量的是账号里的 IAM
+> 形状），所以 `+dirty` 不影响结论；但要复跑对照时，请以本 spec 定稿那个提交为基准重跑一次
+> 再比。**不要手工编辑那个 JSON 去"修好"这个字段**——它的价值来自"由脚本生成"。
+
+**为什么必须是三层而不是两层**（外部复审第十四轮 P1-3，成立）：上一轮把产物从 `/tmp`
+搬到 `docs/design/3c-spike/` **只解决了"系统清理 /tmp"，没解决可复现**——那个目录被
+`.gitignore` 排除，新 clone、外部复审、下一台机器都拿不到探针代码、聚合结果与 headline
+的计算逻辑，而 tracked 的 spec 却把它当证据引用。本仓库自己的 `CLAUDE.md` 已经规定
+gitignored 的 `docs/design/` 不能当状态真源。原始输出确实含真实账号与内部角色名、不能
+直接提交 ⇒ 拆层：**代码与聚合脱敏后 tracked，名字留在 gitignored**。
+
 **一条流程教训**：spike 第一轮的探针输出、人工核对过的 `m09-3b-observed.json`、
 以及 RS256 原型全放在 `/tmp`，**隔天被系统清理掉**，spec 引的实测数字一度失去可复跑的
 依据（基线本体是 tracked 的、只存指纹，没受影响）。**spec 依赖的 spike 产物不能只活在
-`/tmp`。** 另一条：给探针加超时是对的，但 `read_timeout` 取 30 秒会把
+`/tmp`，也不能只活在 gitignored 目录里。** 另一条：给探针加超时是对的，但
+`read_timeout` 取 30 秒会把
 `GetAccountAuthorizationDetails`（要传账号里 ~300 份托管策略的完整文档、单页实测最慢
 94 秒）变成超时→重试的死循环——**"加超时防挂死"与"超时取太小造成假挂死"是同一枚硬币
 的两面**。本探针改用 `ListRoles`/`ListUsers` 只取 ARN，枚举从分钟级降到秒级。

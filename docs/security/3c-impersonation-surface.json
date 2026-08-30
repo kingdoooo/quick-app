@@ -1,0 +1,101 @@
+{
+  "_what": "3c（会话签名迁非对称）之后的冒充面量测。**不是闸门**，没有基线，不会红。产生者：site-builder/scripts/probe_impersonation_surface.py",
+  "_privacy": "只存计数与指纹；principal 名字在 --dump-observed 的 gitignored 产物里，其 sha256 记在 raw_observed_sha256。",
+  "commit": "bd615de9c43d9955144609dcbd6c5a47dcc25bab+dirty",
+  "probed_at_utc": "2026-08-30T17:38:54+00:00",
+  "region": "us-east-1",
+  "action_equivalence_classes": {
+    "kms_sign": [
+      "kms:Sign"
+    ],
+    "kms_self_authorize": [
+      "kms:PutKeyPolicy",
+      "kms:CreateGrant"
+    ],
+    "lambda_code_exec": [
+      "lambda:UpdateFunctionCode",
+      "lambda:UpdateFunctionConfiguration"
+    ],
+    "lambda_publish": [
+      "lambda:PublishVersion"
+    ],
+    "lambda_create": [
+      "lambda:CreateFunction"
+    ],
+    "cloudfront_write": [
+      "cloudfront:UpdateDistribution"
+    ],
+    "cfn_update": [
+      "cloudformation:UpdateStack"
+    ],
+    "cfn_change_set": [
+      "cloudformation:CreateChangeSet",
+      "cloudformation:ExecuteChangeSet"
+    ],
+    "iam_passrole": [
+      "iam:PassRole"
+    ]
+  },
+  "resource_equivalence_classes": [
+    "kms:placeholder-key(3c 的 CMK 还不存在，量的是对本账号任意 key 的上界)",
+    "lambda:edge-origin-request",
+    "lambda:site-auth-service",
+    "lambda:site-panel",
+    "lambda:placeholder-new-function",
+    "cloudfront:wildcard-distribution",
+    "cloudformation:router-stack",
+    "iam:edge-execution-role(PassRole)"
+  ],
+  "edge_association_qualifier_is_numbered_version": true,
+  "aggregate": {
+    "principals_simulated": 401,
+    "per_label": {
+      "sign:kms-direct": 12,
+      "sign:kms-self-authorize": 13,
+      "sign:hijack-auth-signer": 14,
+      "sign:hijack-panel-signer": 14,
+      "edge:code+publish+associate": 12,
+      "edge:code(Publish=True)+associate": 12,
+      "edge:new-function+associate": 12,
+      "edge:cfn-update-stack": 17,
+      "edge:cfn-change-set": 16
+    },
+    "can_sign": 15,
+    "can_replace_edge_verifier": 17,
+    "impersonation_surface_union": 19,
+    "both": 13,
+    "sign_only": 2,
+    "edge_only": 4,
+    "marginal_value_if_closed": {
+      "restrictive-kms-key-policy": {
+        "closes_paths": 2,
+        "surface_after": 18,
+        "principals_removed": 1
+      },
+      "harden-signer-code-update": {
+        "closes_paths": 2,
+        "surface_after": 18,
+        "principals_removed": 1
+      },
+      "router-stack-policy": {
+        "closes_paths": 2,
+        "surface_after": 15,
+        "principals_removed": 4
+      },
+      "lock-edge-association": {
+        "closes_paths": 3,
+        "surface_after": 19,
+        "principals_removed": 0
+      }
+    }
+  },
+  "raw_observed_sha256": "d11fdf6bef92a4b3b664ac6500207b33e6a5b6256aa748c261c3766191cf571b",
+  "known_gaps": [
+    "IAM 自助提权（iam:PutRolePolicy 等）没有折进 can_sign：默认 key policy 委派给账号 root 时，任何能给自己加 kms:Sign 的 principal 都进冒充面。那一层由闸门 B 组（IAM 写的静态文本快照）单独覆盖，口径不同不合并。",
+    "kms:Sign 的真实集合还要 ∩ key policy；本探针只量 identity policy 上界。",
+    "lambda:UpdateFunctionConfiguration 计为代码执行是**上界口径**：还需要能发布/读到一个 Layer，本探针不追那一步。",
+    "UpdateFunctionCode(Publish=True) 是否在 IAM 上额外要求 lambda:PublishVersion，AWS 文档未明确说明；本探针按**不要求**建模（取上界）。要证实只能做写调用，超出只读范围。",
+    "只覆盖会话签名这一族。Cognito 的 site-auth-pre-token（注入 email claim）是另一条 MCP 侧冒充路径，不在 3c 范围。",
+    "site-deployer-* 等平台角色是否在 3c 后持 kms:Sign 取决于实现；本探针按 spec §4.1 只算 auth 与 panel。"
+  ]
+}
