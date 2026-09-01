@@ -348,11 +348,25 @@ python3 site-builder/scripts/gen_onboarding.py
    回填真实账号/域名/证书 ARN）。**它们是所有部署脚本与 CDK 栈的唯一取值来源。**
    `configparser` 对缺失文件是**静默的** ⇒ 不回填不会报"缺配置"，而是拿空值往下跑并
    拼出假结论（本仓库为此在闸门里专门加了"读不到任何段就硬失败"）。
-2. **五个 venv 全部重建**：`router/infrastructure`、`site-builder/{contract,deployer,mcp}`、
-   `site-builder/deployer/infra`。**必须带 `--clear`**（`python3 -m venv --clear .venv`）
-   ——shebang 是绝对路径，不带 `--clear` 不重写，一直报 bad interpreter。
-   `auth` / `panel` / `key-proxy` 没有自己的 venv，借别人的，组合见上面「测试命令」。
-   重建 `contract/.venv` 后 **pyjwt 与 boto3 要手工重装**（auth 的测试靠它）。
+2. **五个 venv 全部重建**。**必须带 `--clear`**（`python3 -m venv --clear .venv`）——
+   shebang 是绝对路径，不带 `--clear` 不重写，一直报 bad interpreter。
+   本机这五个都是 **Python 3.12**（`mcp/run_locked_tests.sh` 另建一个钉 3.13 的，与
+   基础镜像一致，不要拿它替换 `mcp/.venv`）。每个 venv 装哪份清单：
+
+   | venv | 依赖清单 | 备注 |
+   |---|---|---|
+   | `router/infrastructure/.venv` | `requirements.txt` | 只有 CDK 依赖，**没有 pytest**（router 的测试借 deployer 的 venv） |
+   | `site-builder/contract/.venv` | `requirements-dev.txt` | 含 `-e .`，一条 `pip install -r` 装完 |
+   | `site-builder/deployer/.venv` | `requirements-dev.txt` | 含 `-e ../contract`，同上 |
+   | `site-builder/deployer/infra/.venv` | `requirements.txt` | aws_cdk **只在这个** venv 里 |
+   | `site-builder/mcp/.venv` | `requirements.txt` | — |
+
+   **那两份 `requirements-dev.txt` 必须在各自目录下 `pip install`**：里面 `-e` 的相对
+   路径按**进程 cwd** 解析，不是按文件位置。`auth` / `panel` / `key-proxy` 没有自己的
+   venv，借别人的，组合见上面「测试命令」。**`contract/requirements-dev.txt` 是新加的**
+   （此前只有 deployer 那份，而 contract 的 venv 还被 auth 借用 ⇒ 新 clone 只知道"要
+   重建"、不知道装什么）；deployer 那份从宽松钉改成精确钉死，直接依赖的原始声明留在
+   文件头注释里。两份都实测过：空 venv 一条命令装完，六个借用它们的套件全绿。
 3. **MCP 的 OAuth token**：`node site-builder/clients/quick-desktop-proxy/auth.js`
    登录一次。token 过期时 MCP server 会以 `-32603 token 过期且刷新失败` 连不上，
    **那是认证过期，不是没配置**。

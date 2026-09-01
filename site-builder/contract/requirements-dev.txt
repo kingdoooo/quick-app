@@ -1,11 +1,6 @@
-# `deployer/.venv` 的依赖清单。**这个 venv 被四个包共用**：deployer 自己的测试，
-# 以及 router 的 Edge 测试、panel 的测试、key-proxy 的测试（那三个没有自己的 venv，
-# 借这个）。注意它与 `infra/.venv` 是两个：`aws_cdk` **只在** `infra/.venv` 里。
-#
-# **这份文件原本是手工维护的宽松钉**，2026-08-31 换机器时改成精确钉死。
-# 原始的**直接依赖**声明保留在这里，因为精确清单看不出哪些是直接依赖：
-#     pytest>=8 / moto[dynamodb,s3]>=5 / boto3 / sqlparse>=0.5 / -e ../contract
-# 加 / 换依赖时改这一行的意图，再重新 freeze，别只往下面的 pin 里插一行。
+# `contract/.venv` 的依赖清单。**这个 venv 被两个包共用**：contract 自己的测试，
+# 以及 auth 的测试（auth 没有自己的 venv，借这个 —— `PyJWT` 与 `boto3` 就是为它
+# 装的，CLAUDE.md「测试命令」那一节记着这条借用关系）。
 #
 # **只用于跑测试**，不进任何部署产物。
 #
@@ -13,7 +8,7 @@
 # **必须在本目录下跑**——下面那条 `-e` 的相对路径是按**进程 cwd** 解析的，
 # 不是按本文件的位置）：
 #
-#     cd site-builder/deployer
+#     cd site-builder/contract
 #     python3 -m venv --clear .venv
 #     .venv/bin/pip install -r requirements-dev.txt
 #
@@ -23,32 +18,20 @@
 # **不写 git remote 形态的可编辑安装行**（`pip freeze` 会输出它）——那会把仓库地址
 # 钉进来；本地相对路径不依赖任何远端。
 # Python: Python 3.12.2
--e ../contract
-MarkupSafe==3.0.3
-PyYAML==6.0.3
+-e .
+PyJWT==2.13.0
 Pygments==2.20.0
-Werkzeug==3.1.8
-boto3==1.43.53
-botocore==1.43.53
-certifi==2026.7.22
+boto3==1.43.67
+botocore==1.43.67
 cffi==2.1.0
-charset-normalizer==3.4.9
 cryptography==49.0.0
-docker==7.2.0
-idna==3.18
 iniconfig==2.3.0
 jmespath==1.1.0
-moto==5.2.2
 packaging==26.2
 pluggy==1.6.0
-py-partiql-parser==0.6.3
 pycparser==3.0
 pytest==9.1.1
 python-dateutil==2.9.0.post0
-requests==2.34.2
-responses==0.26.2
-s3transfer==0.19.1
+s3transfer==0.19.2
 six==1.17.0
-sqlparse==0.5.5
 urllib3==2.7.0
-xmltodict==1.0.4
