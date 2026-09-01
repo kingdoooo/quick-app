@@ -338,6 +338,37 @@ python3 site-builder/scripts/gen_onboarding.py
 > `site-builder/DEPLOY.md`，数字自己跑测试；要知道"还剩什么"，读上面那份 merged
 > review 的 §9。**不要**依赖 `docs/design/` 里的任何一份——它们和 `.superpowers/`
 > 都 gitignored（含真实账号/资源值），新 clone 里根本不存在，**也不要 `git add -f`**。
+
+### 换机器 / 新 clone 之后怎么恢复开发
+
+**`git clone` 拿不到能跑的环境**——下面四样都在仓库外，缺任何一样症状都不像"没配置"。
+按这个顺序做：
+
+1. **两份 `config.ini`**（`site-builder/` 与 `router/`，各从同目录 `.example` 复制并
+   回填真实账号/域名/证书 ARN）。**它们是所有部署脚本与 CDK 栈的唯一取值来源。**
+   `configparser` 对缺失文件是**静默的** ⇒ 不回填不会报"缺配置"，而是拿空值往下跑并
+   拼出假结论（本仓库为此在闸门里专门加了"读不到任何段就硬失败"）。
+2. **五个 venv 全部重建**：`router/infrastructure`、`site-builder/{contract,deployer,mcp}`、
+   `site-builder/deployer/infra`。**必须带 `--clear`**（`python3 -m venv --clear .venv`）
+   ——shebang 是绝对路径，不带 `--clear` 不重写，一直报 bad interpreter。
+   `auth` / `panel` / `key-proxy` 没有自己的 venv，借别人的，组合见上面「测试命令」。
+   重建 `contract/.venv` 后 **pyjwt 与 boto3 要手工重装**（auth 的测试靠它）。
+3. **MCP 的 OAuth token**：`node site-builder/clients/quick-desktop-proxy/auth.js`
+   登录一次。token 过期时 MCP server 会以 `-32603 token 过期且刷新失败` 连不上，
+   **那是认证过期，不是没配置**。
+4. **两个远端各自的凭据**：`github` 走普通 SSH key；`origin`（gitlab.aws.dev）走公司
+   内网凭据，**会话中途会过期**，症状是 `Permission denied (publickey)`。
+   从 GitHub clone 之后 `origin` 指的是 GitHub，要手工把内网那个加回来。
+
+**拿不回来、也不用拿回来的**：`docs/design/` 与 `.superpowers/sdd/` 下的全部过程记录
+（每个 plan 的 progress、task brief/report、review diff）——**gitignored** 且含真实
+资源值，新 clone 里不存在。**它们不是状态真源**，别为了"补齐上下文"去找它们。
+真源是本文件 + `README.md` + `site-builder/DEPLOY.md` + merged review §9；
+数字靠跑测试与闸门。3c 冒充面那份名字 dump 同理——**重跑探针即可重生成**
+（`probe_impersonation_surface.py --dump-observed …`，只读约 20 分钟）。
+
+**本地 `backup/*` 分支只在原机器上**（都是已完成的历史重写的安全锚点，两个远端上都没有）。
+换机器等于放弃它们；确认不再需要就在旧机器上删掉，别推到公开仓。
 >
 > **加固包的编号别用 `S1`/`S2`…写进代码或文档正文**：`S3` 会和 Amazon S3 撞车（本仓库
 > 到处在说 S3 桶），grep 出来全是噪音。用 merged review 里的 `M` 编号
