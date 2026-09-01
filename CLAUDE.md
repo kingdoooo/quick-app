@@ -144,7 +144,11 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 **这些脚本一律用系统 `python3` 跑，不要借 `deployer/.venv/bin/python3`**：那个解释器的
 CA 信任库是空的（`ssl.create_default_context().cert_store_stats()` 全 0），于是每一次
 HTTPS 都 `CERTIFICATE_VERIFY_FAILED`——症状读起来像网络/代理故障，其实不是。
-系统 `python3` 走 pip 装的 `truststore`（读 macOS keychain），且同样有 boto3。
+系统 `python3` 能走 HTTPS 是靠 **`pip-system-certs`**（装完会在 site-packages 放一个
+`pip_system_certs.pth`，import 期把 `ssl` 的默认上下文换成读 macOS keychain 的那个；
+它内部用 truststore，所以**直接 `import truststore` 是失败的、`cert_store_stats()` 会抛
+`NotImplementedError`——这两个现象都正常，不是坏了**），且系统 `python3` 同样有 boto3。
+**换机器要把这两个包装到系统 `python3` 上**，见下面「换机器 / 新 clone」那一节。
 
 `verify_analytics_e2e.py` 会自建 fixture 站点、发真实请求、跑一次 rollup 再清理，
 其中 MCP 那一段要求**用户 OAuth token 是新鲜的**（二期把 refresh TTL 收到 1 天）；
@@ -341,7 +345,7 @@ python3 site-builder/scripts/gen_onboarding.py
 
 ### 换机器 / 新 clone 之后怎么恢复开发
 
-**`git clone` 拿不到能跑的环境**——下面四样都在仓库外，缺任何一样症状都不像"没配置"。
+**`git clone` 拿不到能跑的环境**——下面五样都在仓库外，缺任何一样症状都不像"没配置"。
 按这个顺序做：
 
 1. **两份 `config.ini`**（`site-builder/` 与 `router/`，各从同目录 `.example` 复制并
@@ -367,10 +371,15 @@ python3 site-builder/scripts/gen_onboarding.py
    （此前只有 deployer 那份，而 contract 的 venv 还被 auth 借用 ⇒ 新 clone 只知道"要
    重建"、不知道装什么）；deployer 那份从宽松钉改成精确钉死，直接依赖的原始声明留在
    文件头注释里。两份都实测过：空 venv 一条命令装完，六个借用它们的套件全绿。
-3. **MCP 的 OAuth token**：`node site-builder/clients/quick-desktop-proxy/auth.js`
-   登录一次。token 过期时 MCP server 会以 `-32603 token 过期且刷新失败` 连不上，
+3. **系统 `python3` 上装两个包**：`python3 -m pip install boto3 pip-system-certs`。
+   **五个 `verify_*` 真机闸门与所有 `scripts/*.py` 都用系统 `python3` 跑**（venv 里那些
+   的 CA 信任库是空的），缺 `pip-system-certs` 的症状是每一次 HTTPS 都
+   `CERTIFICATE_VERIFY_FAILED`——**读起来像公司代理/防火墙问题，其实不是**，别去查网络。
+4. **MCP 的 OAuth token**：`node site-builder/clients/quick-desktop-proxy/auth.js`
+   登录一次（那两个 `.js` 只用 Node 内置模块，**不需要 `npm install`**）。
+   token 过期时 MCP server 会以 `-32603 token 过期且刷新失败` 连不上，
    **那是认证过期，不是没配置**。
-4. **两个远端各自的凭据**：`github` 走普通 SSH key；`origin`（gitlab.aws.dev）走公司
+5. **两个远端各自的凭据**：`github` 走普通 SSH key；`origin`（gitlab.aws.dev）走公司
    内网凭据，**会话中途会过期**，症状是 `Permission denied (publickey)`。
    从 GitHub clone 之后 `origin` 指的是 GitHub，要手工把内网那个加回来。
 
