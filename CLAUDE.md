@@ -92,12 +92,17 @@ cd "$(git rev-parse --show-toplevel)"
   （每条 pip install 都必须带 `--require-hashes`、合同包必须 cp 不 pip）住在
   `auth/tests/test_requirements_locked.py` 里——AST 解析器在那边。只跑 deployer 全绿
   不代表 bundling 改对了。这是一条跨包耦合：deployer 的源码，auth 的守卫。
-- **E2E 的 CA 陷阱**：`deployer/.venv` 的**默认** SSL 上下文信任库是空的
-  （`ssl.create_default_context().cert_store_stats()` 全 0），而 E2E 会**在进程内调用
-  发起 HTTPS 的生产代码**——那条路径用的是默认上下文，不是测试自己造的那个。
-  **只设 `SSL_CERT_FILE` 不够**：`HTTPSHandler` 在构造时就把上下文定格了。现在由
-  fixture 自动修好，但看到 `CERTIFICATE_VERIFY_FAILED` 时**别当成网络/证书故障**去查
-  代理和防火墙——先确认是不是又碰到了这个上下文。
+- **E2E 的 CA 陷阱**：E2E 会**在进程内调用发起 HTTPS 的生产代码**，那条路径用的是
+  **默认** SSL 上下文，不是测试自己造的那个（测试自己那条走显式 certifi，一直是好的
+  ——所以缺陷在"测试能访问站点"上完全看不出来）。**venv 的默认信任库是不是空的取决于
+  母解释器**：python.org 那种构建下是 0 个 CA（原始事故现场，跑了 21 分钟才炸），
+  Homebrew 的 `python@3.12` 指向 `/opt/homebrew/etc/openssl@3/cert.pem`，venv 里有
+  198 个（2026-09-01 换机器实测）。**只设 `SSL_CERT_FILE` 不够**：`HTTPSHandler`
+  在构造时就把上下文定格了。现在由 fixture 自动修好，守卫
+  （`test_deploy_fixture_flags.py` 里那三条 `*ssl*`）**自己把"空信任库下 import"这个
+  前提造出来**，所以在两种解释器上验的都是同一个缺陷。看到
+  `CERTIFICATE_VERIFY_FAILED` 时**别当成网络/证书故障**去查代理和防火墙——先确认是不是
+  又碰到了这个上下文。
 
 **MCP 的上面那条用宿主机依赖，不等于容器里的依赖**（实测宿主 mcp 1.26.0 /
 boto3 1.43.25，而 `mcp/requirements.txt` 锁的是 1.29.0 / 1.43.64）。
@@ -141,14 +146,22 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 `site-builder/scripts/verify_*` 是真机闸门（部署后跑，不是单测）。**本文件不记数量与
 最新结果**（都会过时）：闸门清单就是上面那段命令，跑一遍即是最新结果。
 
-**这些脚本一律用系统 `python3` 跑，不要借 `deployer/.venv/bin/python3`**：那个解释器的
-CA 信任库是空的（`ssl.create_default_context().cert_store_stats()` 全 0），于是每一次
-HTTPS 都 `CERTIFICATE_VERIFY_FAILED`——症状读起来像网络/代理故障，其实不是。
-系统 `python3` 能走 HTTPS 是靠 **`pip-system-certs`**（装完会在 site-packages 放一个
-`pip_system_certs.pth`，import 期把 `ssl` 的默认上下文换成读 macOS keychain 的那个；
-它内部用 truststore，所以**直接 `import truststore` 是失败的、`cert_store_stats()` 会抛
-`NotImplementedError`——这两个现象都正常，不是坏了**），且系统 `python3` 同样有 boto3。
-**换机器要把这两个包装到系统 `python3` 上**，见下面「换机器 / 新 clone」那一节。
+**这些脚本一律用 `python3` 跑（不带路径的那个），不要借 `deployer/.venv/bin/python3`。**
+两个前提，缺任一都不是"配置没写对"的症状：
+
+- **`python3` 必须 ≥ 3.10。** 26 个 `scripts/*.py` 里有 10 个（含 5 个 `verify_*` 闸门与
+  `deploy_pool.py`）用了 `X | None` 标注却没写 `from __future__ import annotations`，
+  在 3.9 上**函数定义那一刻**就 `TypeError: unsupported operand type(s) for |`。
+  macOS 自带的 `/usr/bin/python3` 是 3.9 ⇒ 直接跑不了，见下面「换机器 / 新 clone」。
+- **CA 信任库要能用。** 靠 **`pip-system-certs`**（装完会在 site-packages 放一个
+  `pip_system_certs.pth`，import 期把 `ssl` 的默认上下文换成读 macOS keychain 的那个；
+  它内部用 truststore，所以**直接 `import truststore` 是失败的、`cert_store_stats()` 会抛
+  `NotImplementedError`——这两个现象都正常，不是坏了**），缺它的症状是每一次 HTTPS 都
+  `CERTIFICATE_VERIFY_FAILED`，读起来像网络/代理故障。
+
+**"借 venv 的解释器"为什么仍然不推荐**：能不能 HTTPS 取决于母解释器（Homebrew
+`python@3.12` 建的 venv 有 198 个 CA、能跑；python.org 那种构建是 0 个、每条 HTTPS 全红），
+而闸门脚本不该依赖这个差异。`python3` 那条路是确定的。
 
 `verify_analytics_e2e.py` 会自建 fixture 站点、发真实请求、跑一次 rollup 再清理，
 其中 MCP 那一段要求**用户 OAuth token 是新鲜的**（二期把 refresh TTL 收到 1 天）；
@@ -343,17 +356,34 @@ python3 site-builder/scripts/gen_onboarding.py
 > review 的 §9。**不要**依赖 `docs/design/` 里的任何一份——它们和 `.superpowers/`
 > 都 gitignored（含真实账号/资源值），新 clone 里根本不存在，**也不要 `git add -f`**。
 
-### 换机器 / 新 clone 之后怎么恢复开发
+### 仓库外的六样东西（= 本机现在装了什么 / 换机器时按这个顺序恢复）
 
-**`git clone` 拿不到能跑的环境**——下面五样都在仓库外，缺任何一样症状都不像"没配置"。
-按这个顺序做：
+**`git clone` 拿不到能跑的环境**——下面六样都在仓库外，缺任何一样症状都不像"没配置"。
+这一节既是**本机当前环境的记录**（读它就知道 `python3` 指哪、凭据怎么来），也是换机器
+或新 clone 时的恢复顺序。**2026-09-01 在一台新机器上整条走过一遍**，第 0 步与第 5 步的
+两个坑就是那次踩出来的。按这个顺序做：
 
+0. **两个 Python 解释器**：`brew install python@3.12 python@3.13`。3.12 是五个 venv 的
+   母解释器；3.13 只给 `mcp/run_locked_tests.sh`（与容器基础镜像一致，找不到它时那个
+   脚本会明确报出来）。**macOS 自带的 `/usr/bin/python3` 是 3.9，跑不了本仓库的脚本**
+   （见上面「系统 `python3`」那段的 `X | None`）。
+   **坑：`brew install python@3.12` 不提供 `python3` 这个名字**——未版本化的
+   `python3`/`pip3` 只在 `/opt/homebrew/opt/python@3.12/libexec/bin` 里，`brew link`
+   也不吐到 `/opt/homebrew/bin`。于是 `python3` 仍是 3.9，症状是那条 `TypeError` 而
+   不是"版本不对"。本机做了两层（2026-09-01）：
+   `~/.zshenv` 里把那个 `libexec/bin` 前置（**必须是 `.zshenv` 不是 `.zshrc`**：非交互
+   shell——脚本、编辑器/Agent 起的子进程——只读前者），外加
+   `/opt/homebrew/bin/{python3,pip3}` 两个符号链接指向它（这层与 shell 无关；将来若
+   `brew install python` 会报 symlink 冲突，删掉这两个软链即可）。
 1. **两份 `config.ini`**（`site-builder/` 与 `router/`，各从同目录 `.example` 复制并
    回填真实账号/域名/证书 ARN）。**它们是所有部署脚本与 CDK 栈的唯一取值来源。**
    `configparser` 对缺失文件是**静默的** ⇒ 不回填不会报"缺配置"，而是拿空值往下跑并
    拼出假结论（本仓库为此在闸门里专门加了"读不到任何段就硬失败"）。
-2. **五个 venv 全部重建**。**必须带 `--clear`**（`python3 -m venv --clear .venv`）——
+2. **五个 venv 全部重建**。**必须带 `--clear`**（`python3.12 -m venv --clear .venv`）——
    shebang 是绝对路径，不带 `--clear` 不重写，一直报 bad interpreter。
+   **venv 不能从旧机器拷**：`pyvenv.cfg` 的 `home =` 与 `bin/*` 的 shebang 都是旧机器上
+   的绝对路径，编译扩展按 CPU 架构 + Python ABI 装，而 contract/deployer 那两份是
+   editable 安装（site-packages 里写死源码树路径）。
    本机这五个都是 **Python 3.12**（`mcp/run_locked_tests.sh` 另建一个钉 3.13 的，与
    基础镜像一致，不要拿它替换 `mcp/.venv`）。每个 venv 装哪份清单：
 
@@ -371,17 +401,32 @@ python3 site-builder/scripts/gen_onboarding.py
    （此前只有 deployer 那份，而 contract 的 venv 还被 auth 借用 ⇒ 新 clone 只知道"要
    重建"、不知道装什么）；deployer 那份从宽松钉改成精确钉死，直接依赖的原始声明留在
    文件头注释里。两份都实测过：空 venv 一条命令装完，六个借用它们的套件全绿。
-3. **系统 `python3` 上装两个包**：`python3 -m pip install boto3 pip-system-certs`。
-   **五个 `verify_*` 真机闸门与所有 `scripts/*.py` 都用系统 `python3` 跑**（venv 里那些
-   的 CA 信任库是空的），缺 `pip-system-certs` 的症状是每一次 HTTPS 都
-   `CERTIFICATE_VERIFY_FAILED`——**读起来像公司代理/防火墙问题，其实不是**，别去查网络。
+3. **`python3`（第 0 步那个 3.12）上装两个包**：
+   `python3 -m pip install --user --break-system-packages boto3 pip-system-certs`。
+   **五个 `verify_*` 真机闸门与所有 `scripts/*.py` 都用它跑。**
+   两个开关缺一不可：Homebrew 的 python 带 PEP 668 标记，不加
+   `--break-system-packages` 直接被拒；加 `--user` 是为了只写 user site
+   （`~/Library/Python/3.12/...`）而不动 brew 自己的 site-packages。
+   缺 `pip-system-certs` 的症状是每一次 HTTPS 都 `CERTIFICATE_VERIFY_FAILED`——**读起来
+   像公司代理/防火墙问题，其实不是**，别去查网络。
 4. **MCP 的 OAuth token**：`node site-builder/clients/quick-desktop-proxy/auth.js`
    登录一次（那两个 `.js` 只用 Node 内置模块，**不需要 `npm install`**）。
    token 过期时 MCP server 会以 `-32603 token 过期且刷新失败` 连不上，
    **那是认证过期，不是没配置**。
-5. **两个远端各自的凭据**：`github` 走普通 SSH key；`origin`（gitlab.aws.dev）走公司
-   内网凭据，**会话中途会过期**，症状是 `Permission denied (publickey)`。
-   从 GitHub clone 之后 `origin` 指的是 GitHub，要手工把内网那个加回来。
+5. **两个远端各自的凭据**（约定：`origin` = 内网 gitlab.aws.dev，`github` = GitHub）。
+   从 GitHub clone 之后 `origin` 指的是 GitHub，要手工改名并把内网那个加回来。
+   - **内网走 Midway 签的 SSH 证书**，`mwinit -f` 每天一次（证书实测 12 小时）。
+     **`mwinit` 只签一个已经存在的 `~/.ssh/id_ecdsa.pub`**：没有密钥对时它照样成功、
+     只发 web cookie 不发证书，仅在输出里留一行 Warning ⇒ 之后所有内网 SSH 都
+     `Permission denied (publickey)`，读起来像"凭据过期"。新机器先
+     `ssh-keygen -t ecdsa -b 521 -f ~/.ssh/id_ecdsa` 再 `mwinit -f`，确认输出里有
+     `Successfully signed SSH public key`，并且 `~/.ssh/id_ecdsa-cert.pub` 存在。
+     `~/.ssh/known_hosts` 同样要重建：`ssh-keyscan ssh.gitlab.aws.dev` 取到的三条指纹
+     要与内部 wiki 公布的核对后再写进去，别盲信首连（clone 地址形如
+     `git@ssh.gitlab.aws.dev:<group>/<project>.git`）。
+   - **GitHub 这边走 `gh` 的 HTTPS 凭据**（`gh auth status` 看；remote 用
+     `https://github.com/...`）。`~/.ssh` 没有 key 时 SSH 形式的地址必然
+     `Host key verification failed` / `Permission denied`，别以为是仓库权限问题。
 
 **拿不回来、也不用拿回来的**：`docs/design/` 与 `.superpowers/sdd/` 下的全部过程记录
 （每个 plan 的 progress、task brief/report、review diff）——**gitignored** 且含真实
