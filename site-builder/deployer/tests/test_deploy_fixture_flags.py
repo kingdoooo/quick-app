@@ -556,17 +556,42 @@ def test_e2e_smoke_poison_backend_passes_the_gate_but_fails_public(tmp_path):
     assert got["empty"].get("__status") == 500, got["empty"]
 
 
-# 子进程脚本：**忠实复现**真机那次失败的形态——先 import smoke_test（此刻信任库还是
-# 空的，它的 opener 就地定格），再跑修复，然后看那个**同一个** opener 的上下文。
+# 子进程脚本：**忠实复现**真机那次失败的形态——先在空信任库下 import smoke_test
+# （它的 opener 就地定格），再跑修复，然后看那个**同一个** opener 的上下文。
 # 必须用子进程：同一个 pytest 进程里 smoke_test 早就被别的用例 import 过（而且可能
 # 已经修好了），在里面无法复现"带着空信任库 import"这个前提。
 # 全程不发网络请求——判据是那个 opener 手里的上下文有没有 CA。
+#
+# **前提必须由探针自己造，不能靠解释器碰巧是空的**（2026-09-01 换机器实测）：旧机器上
+# `deployer/.venv` 的默认信任库确实是 0 个 CA，但 Homebrew 的 python@3.12 默认指向
+# `/opt/homebrew/etc/openssl@3/cert.pem`，venv 里有 198 个 ⇒ 前提不复现，这条守卫
+# 只能报"我验的不是那个缺陷"而假红。改成显式把 import 期的 HTTPS 上下文换成无 CA 的，
+# 于是 before 恒为 0，与解释器自带什么信任库无关。
+#
+# 要拦的是 `http.client._create_https_context()` 那一层：`build_opener()` 不传 context，
+# `HTTPSHandler.__init__` 就去调它，而它取的是 **`ssl._create_default_https_context`**
+# 这个模块级别名（3.12 实测），不是 `ssl.create_default_context` 本身——只换后者拦不住。
 _SSL_PROBE = """\
 import json, os, ssl, sys, urllib.request
 os.environ.pop("SSL_CERT_FILE", None)
 sys.path.insert(0, sys.argv[1])          # deployer/functions
 sys.path.insert(0, sys.argv[2])          # deployer/tests
-import smoke_test                        # opener 在这一刻定格
+
+
+def _ca_less_context(*a, **kw):
+    # PROTOCOL_TLS_CLIENT 默认 check_hostname=True / verify_mode=CERT_REQUIRED，
+    # 且**不加载**任何 CA —— 正是真机那次 CERTIFICATE_VERIFY_FAILED 的形态。
+    return ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+
+_saved = (ssl._create_default_https_context, ssl.create_default_context)
+ssl._create_default_https_context = _ca_less_context
+ssl.create_default_context = _ca_less_context
+try:
+    import smoke_test                    # opener 在这一刻带着空信任库定格
+finally:
+    ssl._create_default_https_context, ssl.create_default_context = _saved
+
 import test_e2e_fixtures as e2e
 
 
@@ -591,6 +616,22 @@ print(json.dumps({"before": before, "after": after, "note": note,
                   "default_after": cas(ssl.create_default_context())}))
 """
 
+# 同一个探针，但**不调**修复函数——用来证明上面那条守卫真的能失败（positive control）：
+# 空信任库下定格的 opener 若无人修，就一直是 0 个 CA。
+_SSL_PROBE_NO_REPAIR = _SSL_PROBE.replace(
+    "note = e2e._ensure_default_ssl_trust()", 'note = "（本轮故意不修）"')
+
+
+def _run_ssl_probe(script: str, *extra: str) -> dict:
+    """在子进程里跑一个 SSL 探针，返回它最后一行 JSON。"""
+    tests_dir = Path(__file__).parent
+    out = subprocess.run(
+        [sys.executable, "-c", script,
+         str(tests_dir.parent / "functions"), str(tests_dir), *extra],
+        capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, f"探针跑不起来：{out.stderr}"
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
 
 def test_e2e_fixture_repairs_the_ssl_trust_of_in_process_production_code():
     """E2E 的 `_platform_env` 必须让**进程内被调用的生产代码**也能验证证书。
@@ -608,25 +649,52 @@ def test_e2e_fixture_repairs_the_ssl_trust_of_in_process_production_code():
 
     这条守卫**不需要 RUN_E2E**，普通套件里就能拦住回归——同样的缺陷下次不必再花
     21 分钟真机跑才发现。
+
+    前提由探针**自己造**（见 `_SSL_PROBE` 上面那段），所以 `before == 0` 是无条件断言：
+    它不再依赖"本机解释器的默认信任库恰好是空的"。换到 Homebrew python@3.12（默认 198
+    个 CA）上这条守卫仍然验的是同一个缺陷。
     """
-    tests_dir = Path(__file__).parent
-    out = subprocess.run(
-        [sys.executable, "-c", _SSL_PROBE,
-         str(tests_dir.parent / "functions"), str(tests_dir)],
-        capture_output=True, text=True, timeout=60)
-    assert out.returncode == 0, f"探针跑不起来：{out.stderr}"
-    got = json.loads(out.stdout.strip().splitlines()[-1])
+    got = _run_ssl_probe(_SSL_PROBE)
+    # 前提：opener 是带着空信任库定格的（探针强制造出来的，与本机无关）
+    assert got["before"] == 0, (
+        f"没造出「带空信任库 import」的前提（before={got['before']}）——"
+        f"探针对 ssl._create_default_https_context 的替换没生效，"
+        f"这条守卫此刻验的不是真机那个缺陷。{got}")
     # 核心不变量：修完之后，生产模块那个 opener 手里的上下文能验证证书。
     # -1 = truststore（系统 python3），也算可用。
     assert got["after"] > 0 or got["after"] == -1, got
     assert got["default_after"] > 0 or got["default_after"] == -1, got
-    # 顺带把"当初到底坏不坏"记下来：venv 上 before 必须是 0（否则这条守卫没在
-    # 复现真机那个前提，等于换了个题目在验）
-    if got["after"] > 0:
-        assert got["before"] == 0, (
-            f"没复现出「带空信任库 import」的前提（before={got['before']}）——"
-            f"这条守卫此刻验的不是真机那个缺陷。{got}")
-        assert "smoke_test._opener" in got["note"], got["note"]
+    assert "smoke_test._opener" in got["note"], got["note"]
+
+
+def test_e2e_ssl_guard_fails_when_nobody_repairs_the_frozen_opener():
+    """positive control：不调修复函数，上面那条守卫必须是红的。
+
+    否则"绿"可能只是因为本机解释器自带 CA（换机器时就是这么假绿/假红过的），
+    而不是因为 `_ensure_default_ssl_trust` 真的换掉了那个定格上下文。
+    """
+    got = _run_ssl_probe(_SSL_PROBE_NO_REPAIR)
+    assert got["before"] == 0, got
+    assert got["after"] == 0, (
+        f"没人修，那个定格的上下文却自己有了 CA（after={got['after']}）——"
+        f"说明前提不是靠替换造出来的，这条 control 失去意义。{got}")
+
+
+def test_e2e_ssl_guard_fails_when_the_repair_is_silently_skipped():
+    """positive control 之二：修复函数**跑了但什么都没修**时，`after > 0` 那条要红。
+
+    上面那条走的是"根本不调修复函数"；这条把扫描结果清空（模拟"以为已经可用就跳过"
+    的回归），确认核心断言自己就能抓住，而不是靠修复函数自己 raise 让探针非零退出。
+    """
+    silent = _SSL_PROBE.replace(
+        "note = e2e._ensure_default_ssl_trust()",
+        "e2e._frozen_https_contexts = lambda: []\n"
+        "note = e2e._ensure_default_ssl_trust()")
+    got = _run_ssl_probe(silent)
+    assert got["before"] == 0, got
+    assert got["after"] == 0, (
+        f"扫不到定格 opener 却仍然被修好了（after={got['after']}）——"
+        f"说明 after 反映的不是那个定格上下文。{got}")
 
 
 def test_e2e_frozen_opener_scan_skips_vendored_packages():
@@ -653,17 +721,32 @@ def test_e2e_ssl_helper_does_not_override_an_explicit_cert_file(monkeypatch, tmp
     覆盖的后果不是"更安全"，而是**静默换掉操作者选定的信任集合**——那种改动在
     连不上内网 HTTPS 时最难查。
     """
+    import ssl
+
     import test_e2e_fixtures as e2e
     bundle = tmp_path / "corp-ca.pem"
     bundle.write_text("")            # 空文件：有它就一定不是 certifi 那份
     monkeypatch.setenv("SSL_CERT_FILE", str(bundle))
+    # 本解释器的默认上下文有没有静态信任库计数：注入了 truststore 时（系统 python3）
+    # 校验委托给 OS，SSL_CERT_FILE 根本不参与判定 ⇒ 不该要求它抛错。
+    try:
+        ssl.create_default_context().cert_store_stats()
+        stats_reported = True
+    except NotImplementedError:
+        stats_reported = False
+    raised = ""
     try:
         e2e._ensure_default_ssl_trust()
     except RuntimeError as exc:
         # 空 bundle ⇒ 默认上下文仍无 CA ⇒ 按设计如实报错而不是偷偷换掉它
         assert "已设置" in str(exc), exc
+        raised = str(exc)
     assert os.environ["SSL_CERT_FILE"] == str(bundle), \
         "外部显式设置的 SSL_CERT_FILE 被覆盖了"
+    # 静默通过同样是缺陷：空 bundle 下"没抛错"意味着操作者的配置错误被吞掉了。
+    if stats_reported:
+        assert raised, ("空 SSL_CERT_FILE 之下既没抛错也没报出问题——"
+                        "配置错误被静默吞掉了")
 
 
 def test_e2e_poison_user_agent_matches_the_real_health_gate(monkeypatch):
