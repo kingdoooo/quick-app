@@ -239,10 +239,29 @@ auth 的执行角色因此需要 `ssm:GetParameter`（限定 `/site-builder/*`�
 - `login-flow-secret`（3c-1B 起）：**这一把可以就地改值**，是三者里唯一一把。
 
   ```bash
+  set -euo pipefail
+  # ① 先核对账号，再动线上密钥。`--overwrite` 在参数**不存在**时会创建它，
+  #    所以贴错账号不会失败，而是在错的账号里种下一把无人使用的密钥。
+  WANT=$(python3 - <<'PY'
+import configparser, pathlib
+c = configparser.ConfigParser(); c.read(pathlib.Path("site-builder/config.ini"))
+print(c["Platform"]["account_id"].split("#")[0].strip())
+PY
+)
+  GOT=$(aws sts get-caller-identity --query Account --output text)
+  [ "$WANT" = "$GOT" ] || { echo "账号不符：凭据在 $GOT，config.ini 写的是 $WANT——中止"; exit 1; }
+  # ② 参数必须**已存在**：这是轮转，不是创建。创建走 ensure_session_keys.py。
+  aws ssm get-parameter --region us-east-1 --name /site-builder/login-flow-secret >/dev/null
+
   aws ssm put-parameter --region us-east-1 --overwrite \
     --name /site-builder/login-flow-secret --type SecureString \
     --value "$(openssl rand -hex 32)"
   ```
+
+  **旧值不需要另存**：SSM 参数自带版本历史，回退用
+  `aws ssm get-parameter-history --name /site-builder/login-flow-secret --with-decryption
+  --query 'Parameters[-2].Value' --output text` 取上一版再 `put-parameter` 写回
+  （与上面 `site-client-secret` 那条回退路径同一机制）。
 
   它只有 auth **一个**消费方（panel 与 Edge 永不持有它），所以没有"两个消费方
   更新速度不同"这个问题——没有 Edge 那 10–20 分钟的全球复制窗口要等。

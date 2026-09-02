@@ -28,10 +28,26 @@ def precheck_parameters(names, *, ssm, hint: str = "") -> None:
 
 
 def ensure_secret(name: str, generate, *, ssm=None, region: str = "us-east-1") -> str:
+    """参数不存在时生成并写入，存在则原样返回。**创建时打一行（只有参数名，没有值）。**
+
+    为什么创建必须有声音（3c-1B 复审）：本函数创建的那几把密钥都**不在**部署前核对清单里
+    （它们由本脚本自己创建，核对它们等于让创建永远走不到；见
+    `docs/adr/0004-login-flow-secret-outside-the-pre-write-precheck.md`）。于是"参数被删了、
+    脚本默默重造一把"没有任何信号——事后只看到一轮失败的登录，无从判断发生过什么。
+
+    对 legacy 的 `jwt-secret` 这一行更要紧：它有**第二个**消费方（Edge 那份是 CDK 部署时
+    字符串替换注入的）。成熟部署里它被删之后，auth 造一把新的而 Edge 还拿着旧的 ⇒ 正是
+    全员登录循环。在成熟部署上看到它被 created，就该停下来查，而不是继续部署。
+
+    存在时保持安静：幂等重跑是常态，每次刷一行会把"创建"这个信号淹掉。
+    """
     ssm = ssm or boto3.client("ssm", region_name=region)
     try:
         return ssm.get_parameter(Name=name, WithDecryption=True)["Parameter"]["Value"]
     except ssm.exceptions.ParameterNotFound:
         val = generate()
         ssm.put_parameter(Name=name, Value=val, Type="SecureString")
+        # 只有名字。值绝不进 stdout/日志（本仓库的闸门也按"不打印值"断言）。
+        print(f"  已**新建** SecureString {name}"
+              "（若这是成熟部署而非首次部署，先停下来查为什么它不存在）")
         return val

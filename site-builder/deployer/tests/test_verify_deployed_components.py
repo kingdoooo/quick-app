@@ -10,6 +10,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 _SCRIPT = (Path(__file__).parents[2] / "scripts"
            / "verify_deployed_components.py")
 
@@ -228,16 +230,21 @@ def test_login_flow_param_holding_a_value_instead_of_a_path_is_caught():
     assert any(not ok for ok, _, _ in _env_check(bad, AUTH_PARAM_KEYS))
 
 
-def _auth_plaintext_check_param_keys() -> set:
+def _auth_plaintext_check_param_keys(src: str | None = None) -> set:
     """闸门里 auth 那处 `_check_env_has_no_plaintext_secret(...)` **实参**里的键名集合。
 
     **必须按 AST 读实参，不能在源码文本里 grep 字面量**：本文件第一版就是 grep 一段源码里有没有
     `"LOGIN_FLOW_SECRET_PARAM"`，而它在**同一段的注释里**也出现——实测把调用改回单键之后，
     这条守卫照样绿。那正是本仓库栽过的"断言的字样只活在注释里"（闸门自己对 SSM TTL 就写着
     要按行首赋值断言，理由相同）。`ast` 不解析注释，所以这条只能被真实实参满足。
+
+    `src` 只给自测用（默认读线上那份闸门源码）。**自测必须喂给这个函数本身，不许另抄一个
+    简化版抽取器**：抄出来的那份只走 `node.args`、只认 `ast.Constant`，缺 `ast.Tuple` 与
+    keyword 两个分支——于是"自测绿"证明的是那个副本不看注释，而不是**真正跑的这一份**不看注释
+    （用户全局 CLAUDE.md：测试里优先用生产助手，不维护未验证平价的简化副本）。
     """
     import ast
-    tree = ast.parse(_SCRIPT.read_text())
+    tree = ast.parse(_SCRIPT.read_text() if src is None else src)
     found = set()
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Call)
@@ -266,21 +273,45 @@ def test_the_gate_passes_both_auth_param_keys_not_just_jwt():
         "LOGIN_FLOW_SECRET_PARAM 漏下发时它不会红")
 
 
-def test_that_structural_guard_is_not_satisfied_by_a_comment():
-    """自测：证明上一条读的是实参而不是注释。
+# 自测的语料：每条都喂给**真正那个**抽取器（不是简化副本），故意覆盖它的三个分支。
+_EXTRACTOR_CASES = {
+    # 第一版守卫的假绿形态：字面量只活在注释里
+    "注释里有、实参里没有": (
+        '# 3c-1B：两个 *_PARAM 都核（LOGIN_FLOW_SECRET_PARAM 漏下发会 500）\n'
+        '_check_env_has_no_plaintext_secret(got_env, "site-auth-service", ("JWT_SECRET_PARAM",))\n',
+        {"JWT_SECRET_PARAM"}),
+    # 元组分支（线上就是这一种）
+    "元组实参": (
+        '_check_env_has_no_plaintext_secret(e, "site-auth-service",\n'
+        '                                   ("JWT_SECRET_PARAM", "LOGIN_FLOW_SECRET_PARAM"))\n',
+        {"JWT_SECRET_PARAM", "LOGIN_FLOW_SECRET_PARAM"}),
+    # keyword 分支：改成关键字传参不能让抽取器瞎掉
+    "keyword 实参": (
+        '_check_env_has_no_plaintext_secret(e, "site-auth-service",\n'
+        '                                   param_keys=("JWT_SECRET_PARAM", "LOGIN_FLOW_SECRET_PARAM"))\n',
+        {"JWT_SECRET_PARAM", "LOGIN_FLOW_SECRET_PARAM"}),
+    # 别的 label 那两处调用（panel / key-proxy）不能被算进 auth 的集合
+    "只认 auth 那一处": (
+        '_check_env_has_no_plaintext_secret(e, "panel", ("JWT_SECRET_PARAM",))\n'
+        '_check_env_has_no_plaintext_secret(e, "site-auth-service", ("LOGIN_FLOW_SECRET_PARAM",))\n',
+        {"LOGIN_FLOW_SECRET_PARAM"}),
+}
 
-    喂一段"注释里有、实参里没有"的源码给同一个抽取器（这正是第一版守卫的假绿形态）。
+
+@pytest.mark.parametrize("label", sorted(_EXTRACTOR_CASES))
+def test_the_structural_guards_extractor_reads_arguments_not_comments(label):
+    """自测：上一条守卫读的是实参而不是注释，且三个分支都真的在工作。
+
+    **喂给 `_auth_plaintext_check_param_keys` 本身**，不另抄一个简化版——否则证明的是副本的行为
+    （用户全局 CLAUDE.md 的"不维护未验证平价的简化副本"，以及"pass-now 的守卫必须有证明它会红的
+    用例"两条）。
     """
-    import ast
-    src = ('# 3c-1B：两个 *_PARAM 都核（LOGIN_FLOW_SECRET_PARAM 漏下发会 500）\n'
-           '_check_env_has_no_plaintext_secret(got_env, "site-auth-service", "JWT_SECRET_PARAM")\n')
-    found = set()
-    for node in ast.walk(ast.parse(src)):
-        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == \
-                "_check_env_has_no_plaintext_secret":
-            for a in node.args:
-                if isinstance(a, ast.Constant) and isinstance(a.value, str) \
-                        and a.value.endswith("_PARAM"):
-                    found.add(a.value)
-    assert found == {"JWT_SECRET_PARAM"}, found
-    assert "LOGIN_FLOW_SECRET_PARAM" in src, "本条的前提是注释里确实有那个字面量"
+    src, expected = _EXTRACTOR_CASES[label]
+    assert _auth_plaintext_check_param_keys(src) == expected, label
+
+
+def test_extractor_self_test_corpus_really_contains_the_comment_trap():
+    """前提自查：第一条语料的注释里确实有那个字面量，否则那条用例是空转。"""
+    src, expected = _EXTRACTOR_CASES["注释里有、实参里没有"]
+    assert "LOGIN_FLOW_SECRET_PARAM" in src.splitlines()[0], "注释里没有那个字面量"
+    assert "LOGIN_FLOW_SECRET_PARAM" not in expected

@@ -267,3 +267,32 @@ def test_config_first_then_code_still_holds_with_the_new_variable(cfg_files, mon
     lam, _, _ = _run_main(monkeypatch, ssm)
     assert lam.calls.index("update_function_configuration") < lam.calls.index("update_function_code")
     assert "LOGIN_FLOW_SECRET_PARAM" in lam.kwargs["update_function_configuration"]["Environment"]["Variables"]
+
+
+# ── ensure_secret 创建时必须**说出来**（3c-1B 第二轮复审）─────────────────────
+#
+# 这是"login-flow 不进写前核对清单"（ADR 0004）的**残余代价**：既然缺参不再被拒绝，
+# 那么"参数被删了、脚本默默重造一把"就没有任何信号——症状只是一轮进行中的登录失败，
+# 事后无从判断发生过什么。创建分支打一行（**只有参数名，没有值**）把这个信号补回来。
+#
+# 它同时是 legacy 参数那条更危险的同形缺口的唯一现场信号：jwt-secret 有**第二个**消费方
+# （Edge 的那份是 CDK 部署时字符串替换注入的），成熟部署里被删之后 auth 造一把新的而 Edge
+# 还拿着旧的 ⇒ 正是 precheck 本要防的全员登录循环。看到它被 created 就该立刻停下。
+
+
+def _ensure_secret_output(present, capsys):
+    from secrets_util import ensure_secret
+    ssm = FakeSSM(present=present)
+    ensure_secret("/site-builder/login-flow-secret", lambda: "x" * 64, ssm=ssm)
+    return capsys.readouterr().out
+
+
+def test_ensure_secret_announces_a_create_with_the_name_only(capsys):
+    out = _ensure_secret_output(set(), capsys)
+    assert "/site-builder/login-flow-secret" in out
+    assert "x" * 64 not in out, "打印了密钥明文"
+
+
+def test_ensure_secret_is_silent_when_the_parameter_already_exists(capsys):
+    """幂等重跑是常态，不能每次都刷一行——那样"创建"这个信号就淹了。"""
+    assert _ensure_secret_output({"/site-builder/login-flow-secret"}, capsys).strip() == ""
