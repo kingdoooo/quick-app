@@ -42,7 +42,9 @@ CFG = configparser.ConfigParser(interpolation=None)
 CFG.read(HERE.parent / "config.ini")
 # 3c-1A：[SessionKeys] 的唯一定义在 auth/session_keys.py（构建期 import，不进包——运行时只读环境变量）
 sys.path.insert(0, str(HERE.parent / "auth"))
-from session_keys import env_json, legacy_entry, load_session_keys, ssm_parameter_arns  # noqa: E402
+from secrets_util import precheck_parameters  # noqa: E402
+from session_keys import (env_json, legacy_entry, load_session_keys,  # noqa: E402
+                          ssm_parameter_arns, ssm_parameter_names)
 
 
 def _cfg(section: str, key: str, default: str | None = None) -> str:
@@ -409,16 +411,28 @@ def ensure_role() -> str:
     return arn
 
 
+def required_parameters() -> list:
+    """部署前必须已存在的 SSM 参数：legacy + console family 的 HS 行（panel 不读 site family）。
+    与 role_statements 的精确 ARN 清单同一上游（ssm_parameter_names），两处不会分叉。"""
+    return ssm_parameter_names(load_session_keys(HERE.parent / "config.ini"), ("console",))
+
+
+def precheck() -> None:
+    """spec §11.8.12：第一次写之前核对（只读、不解密、不打印值）。缺任一参数即 SystemExit。"""
+    precheck_parameters(required_parameters(), ssm=boto3.client("ssm", region_name=_region()))
+
+
 def ensure_function(role_arn: str, code: bytes, edge_role_id_value: str) -> str:
     lam = boto3.client("lambda", region_name=_region())
     env = {"Variables": lambda_environment(edge_role_id_value)}
     try:
         lam.get_function(FunctionName=FN_NAME)
-        lam.update_function_code(FunctionName=FN_NAME, ZipFile=code)
-        lam.get_waiter("function_updated").wait(FunctionName=FN_NAME)
+        # **先配置、后代码**（spec §11.8.3）：新增环境变量时旧代码忽略它无害，新代码缺它会 500 几秒。
         lam.update_function_configuration(
             FunctionName=FN_NAME, Role=role_arn, Handler="handler.handler",
             Runtime=RUNTIME, Timeout=30, MemorySize=512, Environment=env)
+        lam.get_waiter("function_updated").wait(FunctionName=FN_NAME)
+        lam.update_function_code(FunctionName=FN_NAME, ZipFile=code)
         lam.get_waiter("function_updated").wait(FunctionName=FN_NAME)
     except lam.exceptions.ResourceNotFoundException:
         for attempt in range(6):
@@ -527,6 +541,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--skip-frontend", action="store_true")
     args = ap.parse_args()
+
+    print("⓪ 部署前核对：本函数要读的 SSM 参数都在（缺参 = 运行时全部 500 而脚本 exit 0）")
+    precheck()
 
     print("① 校验 Function URL 授权配置（缺 edge_role_arn 即中止）")
     edge_arn = _cfg("Deployer", "edge_role_arn", "")

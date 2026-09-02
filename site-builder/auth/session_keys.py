@@ -136,15 +136,22 @@ def legacy_entry(keys: SessionKeys) -> str:
     return "on" if keys.legacy_param else "off"
 
 
-def ssm_parameter_arns(keys: SessionKeys, families: tuple, *, region: str, account: str,
-                       extra: tuple = ()) -> list:
-    """某个执行角色能读的 SSM 参数**精确清单**（legacy → extra → 各 family 的 HS 行；去重保序）。
-    deploy_auth / deploy_panel 共用，不各拼一份；前缀通配 `parameter/site-builder/*` 会把 session-keys
-    下未来的一切一并交出去。"""
+def ssm_parameter_names(keys: SessionKeys, families: tuple, *, extra: tuple = ()) -> list:
+    """某个执行角色要读的 SSM 参数**名**的精确清单（legacy → extra → 各 family 的 HS 行；去重保序）。
+    role 的 ARN 清单（ssm_parameter_arns）与部署前核对（secrets_util.precheck_parameters）都从它推导，
+    两处不会分叉。"""
     params = [keys.legacy_param, *extra]
     for fam in families:
         params += [r.ssm_param for r in keys.allowlist(fam) if r.alg == "HS256"]
-    return [f"arn:aws:ssm:{region}:{account}:parameter{p}" for p in dict.fromkeys(params)]
+    return list(dict.fromkeys(p for p in params if p))
+
+
+def ssm_parameter_arns(keys: SessionKeys, families: tuple, *, region: str, account: str,
+                       extra: tuple = ()) -> list:
+    """某个执行角色能读的 SSM 参数**精确 ARN 清单**。deploy_auth / deploy_panel 共用，不各拼一份；
+    前缀通配 `parameter/site-builder/*` 会把 session-keys 下未来的一切一并交出去。"""
+    return [f"arn:aws:ssm:{region}:{account}:parameter{p}"
+            for p in ssm_parameter_names(keys, families, extra=extra)]
 
 
 # stack.py 在 SSM 读不到时注入它：**合法 JSON**（Edge import 不炸）、带 SYNTH-ONLY 标记

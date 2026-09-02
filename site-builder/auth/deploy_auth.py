@@ -18,8 +18,9 @@ import boto3
 
 sys.path.insert(0, str(Path(__file__).parent))   # 被 verify_deployed_components 按路径加载时也能找到同目录模块
 from alarm_pipeline import ensure_alarm_pipeline
-from secrets_util import ensure_secret as _ensure_secret
-from session_keys import env_json, legacy_entry, load_session_keys, ssm_parameter_arns
+from secrets_util import ensure_secret as _ensure_secret, precheck_parameters
+from session_keys import (env_json, legacy_entry, load_session_keys, ssm_parameter_arns,
+                          ssm_parameter_names)
 
 FN = "site-auth-service"
 CFG_PATH = Path(__file__).parent.parent / "config.ini"
@@ -149,7 +150,42 @@ def lambda_env() -> dict:
         "LEGACY_ENTRY": legacy_entry(keys)}}
 
 
+def required_parameters() -> list:
+    """部署前必须已存在的 SSM 参数：本函数要读、但**不是本脚本创建**的那些——两个 family 的 HS 行
+    （scripts/ensure_session_keys.py 建）与 site client secret（deploy_pool 建）。legacy 参数是本脚本自己
+    ensure 的（首次部署它本来就不存在），不在清单里。与 role 的 ARN 清单同一上游（ssm_parameter_names）。"""
+    keys = load_session_keys(CFG_PATH)
+    owned = {keys.legacy_param}
+    return [p for p in ssm_parameter_names(keys, ("site", "console"), extra=(CLIENT_SECRET_PARAM,))
+            if p not in owned]
+
+
+def precheck() -> None:
+    """spec §11.8.12：第一次写之前核对（只读、不解密、不打印值）。缺任一参数即 SystemExit。"""
+    precheck_parameters(required_parameters(), ssm=_ssm())
+
+
+def deploy_function(lam, *, role_arn: str, env: dict, code: bytes) -> None:
+    """**先配置、后代码**（spec §11.8.3）：1B 的 env 变化都是新增变量——旧代码忽略新变量无害，而新代码
+    缺新变量会 500 几秒（1A 那次 502 的同一窗口形状）。L3 删 JWT_SECRET_PARAM 时旧代码在那几秒里也不会
+    碰它（signer 已是 current、legacy 分支只在无 kid token 上走）。两步各自等 function_updated。"""
+    try:
+        lam.get_function(FunctionName=FN)
+        lam.update_function_configuration(FunctionName=FN, Environment=env)
+        lam.get_waiter("function_updated").wait(FunctionName=FN)
+        lam.update_function_code(FunctionName=FN, ZipFile=code)
+        lam.get_waiter("function_updated").wait(FunctionName=FN)
+    except lam.exceptions.ResourceNotFoundException:
+        lam.create_function(FunctionName=FN, Runtime="python3.13",
+                            Handler="login_handler.handler", Role=role_arn,
+                            Code={"ZipFile": code}, Timeout=15, MemorySize=256,
+                            Environment=env)
+        lam.get_waiter("function_active").wait(FunctionName=FN)
+
+
 def main():
+    # ⓪ 任何写之前：本函数要读的外部参数都得在（缺参 = 运行时全部登录 500 而脚本 exit 0）
+    precheck()
     # 密钥仍在这里**确保存在**（首次部署要生成 JWT secret），但只写进 SSM，
     # 不进环境变量——运行时由 login_handler._secret() 去读。
     ensure_secret(load_session_keys(CFG_PATH).legacy_param, lambda: secrets.token_hex(32))
@@ -157,17 +193,7 @@ def main():
     env = lambda_env()
     code = build_zip()
     lam = _lam()
-    try:
-        lam.get_function(FunctionName=FN)
-        lam.update_function_code(FunctionName=FN, ZipFile=code)
-        lam.get_waiter("function_updated").wait(FunctionName=FN)
-        lam.update_function_configuration(FunctionName=FN, Environment=env)
-    except lam.exceptions.ResourceNotFoundException:
-        lam.create_function(FunctionName=FN, Runtime="python3.13",
-                            Handler="login_handler.handler", Role=role_arn,
-                            Code={"ZipFile": code}, Timeout=15, MemorySize=256,
-                            Environment=env)
-        lam.get_waiter("function_active").wait(FunctionName=FN)
+    deploy_function(lam, role_arn=role_arn, env=env, code=code)
     # AWS_IAM 而非 NONE：NONE + Principal:* 是 world-accessible，会触发安全扫描
     # 告警甚至自动处置（实际发生过：resource policy 被整个删除，连 Edge 路径一起 403）。
     # Edge 的 _route_to_lambda 对所有 Lambda URL 路由（含 api-only）都签 SigV4，
