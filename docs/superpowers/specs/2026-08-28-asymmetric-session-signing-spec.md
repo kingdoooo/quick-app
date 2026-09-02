@@ -361,7 +361,7 @@ blocker（外部复审第十四轮 P1-2，成立）。
 |---|---|---|
 | **3c-0** | 本 spec 定稿 + Edge crypto spike 裁决（§11） | 冒充面探针与脱敏聚合证据 tracked 且可复跑 |
 | **3c-1A** | 全部 verifier 认 `kid`→{family, alg, key} 固定 allowlist、每 family `current`+`previous`、legacy 第三入口（状态机 L1）；`[SessionKeys]` 按 §11.6 的 schema 落地（此时只有 HS 行）。**signer 不动** | 闸门认识**两个 HS key family** 与 legacy/current/previous（今天它只认识一个 `JWT_PARAM_NAME`、一套 Edge/asset 密钥定位）；§9 全部 verifier 反例齐备并验过红绿 **已实施并部署 2026-09-02**（plan `2026-09-02-3c-1a-verifier-kid-allowlist.md`） |
-| **3c-1B** | signer 开始发 family-specific `kid` + 新 `token_use`/`aud`（状态机 L2）；两把新 HS secret `/site-builder/session-keys/<kid>` + login-flow secret（§11.3）；一次真实 HS 轮转演练 R1/R2 | 四个 `verify_*` 与 10 条 E2E 的登录态工具能 mint **带新 `kid` 的 HS token**（否则 signer 一切就全红，读起来像功能坏了） |
+| **3c-1B** | signer 开始发 family-specific `kid` + 新 `token_use`/`aud`（状态机 L2）；两把新 HS secret `/site-builder/session-keys/<kid>` + login-flow secret（§11.3）；观察归零后**关闭** legacy 入口（进入 L3，删除仍归 3c-3）；一次真实 HS 轮转演练 R1/R2。**逐条裁定见 §11.8** | 四个 `verify_*` 与 10 条 E2E 的登录态工具能 mint **带新 `kid` 的 HS token**（否则 signer 一切就全红，读起来像功能坏了）；且必须在 signer 切换**之前**改完，否则它们自己就是 `accepted_legacy` 的来源（§11.8.2） |
 | **3c-2A** | **只改闸门与验收，不动生产签名**：KMS 探测（`kms:Sign` 持有者、key policy 快照、grants、自助授权、公钥指纹）+ 验收入口改造（auth `/fixture-session`、`site-builder-verifier` 角色、**Edge 与 panel 的夹具会话边界规则先于签发器上线**、`ensure_fixture_site.py` 常驻夹具站点、探针 `sign:fixture-issuer` 两个入口，§11.7） | 上一格全绿；本包**自己**先验过红绿（新探测要能真的红） |
 | **3c-2B** | 两把 KMS 非对称 CMK（deployer CDK 栈创建，默认 key policy + IAM 条件，§11.2）；signer 切 `kms:Sign`（`RAW`，§11.5；identity policy 同时授 `kms:GetPublicKey`，§11.2）；三层 kid 绑定校验（§11.6）；verifier 双接受 | **3c-2A 已上线**；五个验收入口拿到**真实登录态**（不再靠读 SSM 明文本地 mint），且验过红绿 |
 | **3c-3** | 退役 HS256、删旧 SSM secret、删 legacy 入口（状态机 L3）、基线**精确 delta** | `accepted_legacy == 0` 且总量非 0 持续超过最长 TTL（§8） |
@@ -438,7 +438,7 @@ blocker（外部复审第十四轮 P1-2，成立）。
 | **L0** | 只有 legacy（无 `kid`，旧共享 secret，旧 `typ`/`scope` 合同） | legacy | 现状 |
 | **L1** | legacy **＋** `site-hs-v1` **＋** `console-hs-v1` | **仍发 legacy**（signer 不动） | Edge 全球关联版本已确认生效 |
 | **L2** | 同 L1 | 全部改发 family-specific `v1`（带 `kid`、新 `token_use`+`aud`） | 观测到 `accepted_legacy == 0` 且总量非 0，持续 > 最长 TTL |
-| **L3** | 只有两个 family 的 `v1` | family `v1` | legacy 入口删除完成 |
+| **L3** | 只有两个 family 的 `v1` | family `v1` | **进入** = legacy 入口**关闭**（三处 verifier `LEGACY_ENTRY=off` 且 Edge 已 Deployed，1B 内，§11.8.1）；**退出** = 3c-3 完成代码路径与旧参数的**删除** |
 | **R1/R2** | family 内 `current`+`previous`（`v1`→`v2`） | 切 `v2`，可回滚回 `v1` | 真正的轮转演练，见下 |
 
 **关键定义，逐条回答那六个点**：
@@ -526,8 +526,9 @@ Edge 要重新部署并等 10–20 分钟全球复制。signer 先切的话，�
 > 就会把顺序做反。
 >
 > **3c-2B 另有一条新建依赖**：CMK 在 deployer 的 CDK 栈里（§11.2），所以那一包里 deployer 栈
-> 先于 auth 的 signer 切换；3c-3 删掉 deployer 栈对 jwt-secret 的 SSM 读取后，今天"auth 先于
-> deployer"那条依赖消失。
+> 先于 auth 的 signer 切换。（2026-09-02 grill 核对：deployer 栈与 `deployer/functions` 今天
+> **不读** jwt-secret，此前写的"3c-3 删掉 deployer 栈对 jwt-secret 的 SSM 读取"一句作废；legacy
+> 密钥的消费方只有三处 verifier 与验收工具，见 §11.8.1。）
 
 ---
 
@@ -587,7 +588,13 @@ change-impact matrix 为准**，本节只说"改什么"，不重复时序（上�
 | 对象 | 要改什么 | 属于哪个包（§6.1） |
 |---|---|---|
 | `verify_account_trust_boundary.py`（HS 侧） | `JWT_PARAM_NAME` 变成**两个 HS key family** + legacy/current/previous；产物里定位密钥的正则要能同时找多把 | 3c-1A |
-| `verify_account_trust_boundary.py`（login-flow secret） | 把 `/site-builder/login-flow-secret` 列为可读密钥事实，但**归类为非会话签名**（§11.3） | 3c-1B |
+| `verify_account_trust_boundary.py`（login-flow secret） | 读取者记为 grant `read-login-flow-secret`，**不进** `is_secret_grant()`（不算冒充面）；Edge 产物含其值即红（硬断言，不落 facts）；**schema 留 4**（§11.8.7） | 3c-1B |
+| `verify_account_trust_boundary.py`（迁移桶） | `--new-kid` 泛化为 `--new-key LABEL` / `--retire-key LABEL`，LABEL ∈ kid ∪ {legacy, login-flow}；平台角色**丢**被声明的 grant 算迁移不算红；`legacy_param` 为空时仍按 `JWT_PARAM_NAME` 追踪 legacy 参数直到 3c-3（§11.8.7） | 3c-1B |
+| `router/infrastructure/stack.py`（legacy 注入） | `load_jwt_secret()` 改从 `[SessionKeys] legacy_param` 取路径，不再硬编码；为空时 `{{JWT_SECRET}}` 注入空串、`LEGACY_ENTRY=off`（§11.8.1） | 3c-1B |
+| `deploy_auth.py` / `deploy_panel.py`（signer 开关） | 下发 `SESSION_SIGNER`；先 `update_function_configuration` 再 `update_function_code`；第一次写之前 `GetParameter` 核对本组件每个 HS 参数存在（§11.8.3、§11.8.12） | 3c-1B |
+| `scripts/_session_mint.py`（新）+ 四个 `verify_*` + `verify_kid_entry_live.py` + `test_e2e_fixtures.py` | 六处本地 mint 收成一个模块、改用 `session.mint_token` 发新形态；`verify_kid_entry_live.py` 加 `--role` / `--retired-token`（§11.8.4、§11.8.11） | 3c-1B（2A 换成夹具签发器） |
+| `auth/tests/test_signer_untouched_in_1a.py` | 删除；替换为"handler 只经 signer 助手签发、legacy mint 只在开关=legacy 分支"的 AST 守卫 + auth→Edge **新形态**正向向量（§9 今天只有 legacy 形态那条） | 3c-1B |
+| `site-builder/DEPLOY.md`「轮转 jwt-secret」节 | 改写成 §11.8.9 的十步 runbook（本次演练即首次执行） | 3c-1B |
 | `verify_account_trust_boundary.py`（KMS 侧） | **新增 KMS 探测**：`kms:Sign` / `kms:PutKeyPolicy` / `kms:CreateGrant` 持有者、key policy 快照、grants、公钥指纹 | 3c-2A |
 | `verify_account_trust_boundary.py`（`replace-platform-code`） | 重建成**完整链**（动作等价类 × 资源等价类），判据与 `scripts/probe_impersonation_surface.py` 的 `classify()` 一致 | 3c-2A（**但它是当前基线的一处低估，与 3c 是否做无关，可提前单独修**） |
 | `verify_account_trust_boundary.py`（基线） | **schema 迁移 + 精确 delta，不是全部重置**——理由见 §6.2 的 3c-3 一节 | 3c-3 |
@@ -616,7 +623,8 @@ change-impact matrix 为准**，本节只说"改什么"，不重复时序（上�
 ## 11. 3c-0 裁定（原"未决项"，2026-09-02 逐条定稿）
 
 七条全部裁定，含 §11.1 的冷启动实测。术语按根 `CONTEXT.md`；
-§11.2、§11.7、§11.1 另立 ADR（`docs/adr/0001`、`0002`、`0003`）。**判据与被否决的选项都留在这里**，
+§11.2、§11.7、§11.1 另立 ADR（`docs/adr/0001`、`0002`、`0003`）。**§11.8 是 3c-1B 的裁定**
+（2026-09-02 grill，同一形态：判据 + 被否决项）。**判据与被否决的选项都留在这里**，
 以后有人想"顺手改回去"时先读这一节。
 
 ### 11.1 Edge 的 RS256 验签：vendored `cryptography`，以冷启动 spike 为闸
@@ -690,8 +698,8 @@ Edge 这一个部署单元成立；而 §5 RSA 原语层那一整套陷阱是**�
 `RSA_2048` / `SIGN_VERIFY` / `enable_key_rotation=False` / `RemovalPolicy.RETAIN`，
 `CfnOutput` 输出 ARN，由人回填 `[SessionKeys]`（§11.6）；轮转到 v2 = 加一个新 construct。
 SPKI 指纹 CFN 给不出，由 `deploy_auth.py` 部署时 `GetPublicKey` 算出并与配置比对。
-**部署依赖随之变化**：3c-2B 里 deployer 栈先于 auth 的 signer 切换；3c-3 删掉 deployer 栈
-对 jwt-secret 的 SSM 读取后，今天"auth 先于 deployer"那条依赖消失。两条都写进 DEPLOY.md。
+**部署依赖随之变化**：3c-2B 里 deployer 栈先于 auth 的 signer 切换，写进 DEPLOY.md。（原文
+"3c-3 删掉 deployer 栈对 jwt-secret 的读取"一句已作废，deployer 今天不读它，见 §7 注与 §11.8.1。）
 
 ### 11.3 登录流程 HMAC 密钥（state 与 PKCE cookie）：独立的 login-flow secret，归 3c-1B
 
@@ -829,6 +837,228 @@ ADR：`docs/adr/0002-fixture-session-issuer-for-acceptance.md`。
 
 **不能写成"给验收角色一条受限的 `kms:Sign`"**：`kms:Sign` 不限制 claims，那本身就是一个
 新的冒充 principal。这句保留，防止以后有人把 ③ 又简化回 ②。
+
+### 11.8 3c-1B 裁定（2026-09-02 grill 定稿）
+
+范围：signer 切 `kid`、login-flow secret、观察归零后**关闭** legacy 入口（L3）、一次真实 HS 轮转
+演练 R1/R2。术语按根 `CONTEXT.md`，本轮新增六条（legacy 入口的"关闭 vs 删除"、signer 开关、
+观察窗口、就位、退役、`current`/`previous` 的槽位语义）。**不立 ADR**：十二条裁定都能靠改配置或
+小回退撤回，三条判据都不满足。§6.1 的 1B 行、§6.2 的 L3 行、§7 注、§10 表已按本节做了最小交叉
+引用修改，正文没有重写。
+
+#### 11.8.1 1B 的终点是 L3（关闭），删除归 3c-3
+
+**矛盾**：§6.1 把 L3 归 3c-3；状态机第 6 条要求 L3 之后才许 R1；§6.1/§6.2 又把 R1/R2 放进 1B。
+
+**裁定**：把 L3 重定义为"三处 verifier 的 `LEGACY_ENTRY=off` 且 Edge 已 Deployed"，即 legacy 入口
+**关闭**；代码路径与旧 SSM 参数的**删除**留 3c-3。实现形态就是清空 `[SessionKeys] legacy_param`：
+`session_keys.py` 放开"3c-3 之前必填"；`deploy_auth`/`deploy_panel` 不再下发 `JWT_SECRET_PARAM`、
+角色 SSM 精确清单不再含它；`stack.py` 的 `load_jwt_secret()` 改从 `legacy_param` 取路径（今天硬编码
+`/site-builder/jwt-secret`，与唯一真源分叉），为空时给 `{{JWT_SECRET}}` 注入空串并下发
+`LEGACY_ENTRY=off`。L3 因此有三个可量的闸门 delta：auth/panel 丢 `read-jwt-param`、Edge 产物的
+legacy 计数归零、56 个宽读者对 jwt-secret 的读权限**不变**（参数到 3c-3 才删）。3c-3 只剩：删
+`mint_session_jwt`/`verify_session_jwt`/`verify_with_legacy` 的 legacy 分支/Edge
+`_verify_legacy_site_session`/`{{JWT_SECRET}}` 占位/`LEGACY_ENTRY` 变量、删参数、基线精确 delta。
+
+**否决**：(b) 把 R1/R2 挪到 3c-3——2B 的 HS→RS 本身就是一次轮转，在它之前从未演练过 HS 轮转，
+正是 §6.2 说的"verifier-only 不证明签发链能安全切换"那类假信心；(c) legacy 开着就演练——第 6 条
+的理由（别把"拆 family"和"常规轮转"压成一次）仍成立。
+
+**代价**：1B 的日历跨度 ≥ 3 天（切换 → 26 h+ 观察 → L3 → 演练含 24 h+ 排空）。
+**核对过的事实**：deployer 栈、`deployer/functions`、key-proxy、MCP、`smoke_router.sh` 都不读
+jwt-secret；legacy 密钥的消费方只有三处 verifier 与验收工具，切 L3 不影响部署链。
+
+#### 11.8.2 观察窗口：不定固定天数，用 §8 的字面判据
+
+legacy token 只在 T0（**两个** signer 都切完的时刻，取较晚者）之前签出，24 h 后全部过期；Edge 复制
+与 auth 缓存与排空无关（verifier 早已双接受）。
+
+**裁定**：不早于 T0+26 h 跑 `session_verify_counts.py --hours 26 --require-total`，三条同时成立才过：
+三列 `accepted_legacy` 全 0；三列 `accepted_current` 全 > 0（新形态在流动）；每个 verifier 总量
+> 0（`--require-total`）。实际落点在 26–52 h 之间，取决于最后一枚 legacy cookie 何时被用。两条
+配套：判断前先把四个 `verify_*` 跑一遍，否则 panel 列可能因 26 h 无人用控制台而总量为 0；验收
+工具必须在 T0 之前就改发新形态（§11.8.4），否则它们自己就是 `accepted_legacy` 的来源。L3 之后
+零星的 `unknown_kid` 是过期 legacy cookie（无 `kid` ⇒ 不在 allowlist），属预期。
+
+**否决**：固定 48 h——它只是 26 h 窗口的一个特例，且说不出"为什么是 48"。
+
+#### 11.8.3 signer 切换是配置项：`[SessionKeys] signer = legacy | current`
+
+**裁定**：一个全局开关，两个 family 同步；下发为 auth/panel 的环境变量 `SESSION_SIGNER`。校验住在
+`session_keys.py`：`legacy` 要求 `legacy_param` 非空；`legacy_param` 为空（L3）要求 `current`。
+取签发 key 的逻辑加在 `verifier_env.py`（`signing_key(family)` 返回 role=current 的 kid + secret；
+**不改文件名**，避免同时动 `AUTH_PACKAGE_MODULES` 与 `COPY_FILES`）。回滚 = 改一行配置重跑两个部署
+脚本，代码不变，不与同批的其它改动纠缠；`verify_deployed_components.py` 已按"env 整体 == 本地
+推导"比对，开关自动入闸。3c-3 删 legacy 时连开关一起删。
+
+**顺序**：panel 先、auth 后。面板会话只有 panel 自己验、TTL 4 h，是最小爆炸半径的先行指标；auth 一切
+同时影响 Edge（站点会话）与 panel（升级码）。
+
+**login-flow secret 单独一次部署，在 signer 切换之前**：它只影响 /login 的进行中登录（5 分钟窗口失败
+一次），signer 只影响会话有效性；混在一次部署里会让 signer 回滚连带回滚它。
+
+**部署脚本改成先 `update_function_configuration` 再 `update_function_code`**：1B 的两处 env 变化都是
+新增变量（`LOGIN_FLOW_SECRET_PARAM`、`SESSION_SIGNER`），旧代码忽略新变量无害，而新代码缺新变量会
+500 几秒；L3 删 `JWT_SECRET_PARAM` 时旧代码在那几秒里也不会碰它（signer 已是 current、legacy 分支只在
+无 `kid` token 上走，届时都已过期）。
+
+**不在生产演示 legacy 回滚**：回滚目标就是十分钟前还在跑的配置，同一个脚本同一条路；演示只会多签一批
+legacy token、把观察窗口推后 24 小时。
+
+**否决**：用 git 回退代替开关——回退会把同批的 login-flow 改动一起带回去。
+
+#### 11.8.4 验收工具的过渡形态：一个共享 mint 模块
+
+今天 6 处各自读 SSM 明文再 `mint_session_jwt`（四个 `verify_*`、`verify_kid_entry_live.py`、E2E 的
+`session_cookie`）。
+
+**裁定**：新增 `scripts/_session_mint.py`：用 `session_keys.load_session_keys` 读 `[SessionKeys]`，按
+family 取 `current`（默认）或 `previous`/`legacy` 的 SSM 值，调用生产 `session.mint_token`；六处全部改
+import 它，2A 只换这一个模块为夹具签发器（§11.7）。所有工具从 1B 第一票起默认发新形态。
+`verify_session_token_semantics.py` 里按 legacy 语义写的那条（"升级码被 Edge 拒绝（typ != session）"）
+改成新形态两条：console kid 的升级码投给 Edge 必拒（`unknown_kid`）、console-session token 投给 Edge
+必拒；遮蔽 cookie 与正负对照不变。冒充真实 owner 与 `e2e@test.com` 沿用到 2A（已记录的偏差）。
+
+**否决**：每个脚本各改各的——2A 要改六处。
+
+#### 11.8.5 新 token 的 claim 集合：不另裁定，§11.4 就是真源
+
+`mint_token` 已按 §11.4 实现：`name` 截 256、`iat` 三类无条件写、升级码 `min(ttl, 60)`。TTL 沿用现值
+（站点 86400、面板 `CONSOLE_TTL_SECONDS`、升级码 60）。补一条事实：panel 今天不读面板会话里的 `name`
+（用 Edge 注入的 `x-user-name`），`name` 留着是为与 §11.4 一致，成本为零。1B 不改任何 claim 集合。
+
+#### 11.8.6 login-flow secret：按 §11.3 字面命名
+
+**词表冲突**：讨论中出现过 `IN_FLOW_SECRET_PARAM` 一名，与 §11.3/§11.6 与 `CONTEXT.md` 的
+**login-flow secret** 冲突。**裁定按 spec 字面**：参数 `/site-builder/login-flow-secret`、config 键
+`[SessionKeys] login_flow_secret_param`、env `LOGIN_FLOW_SECRET_PARAM`（正好套 `_secret(name)` 的
+`{name}_PARAM` 约定，`_state_sig` 只改一个字符串）。`ensure_session_keys.py` 扩到也创建它（部署序列第
+①步一次建齐所有 config 声明的密钥），`deploy_auth.py` 的 `ensure_secret` 保留为兜底；只进 auth 角色的
+SSM 精确清单，panel/Edge 永不持有。轮转 = `put-parameter --overwrite`，5 分钟窗口进行中登录失败一次，
+写进 DEPLOY.md，1B 不演练它。闸门归类见 §11.8.7。
+
+#### 11.8.7 闸门：`--new-key` / `--retire-key` 两个桶，schema 留 4
+
+**事实**：`compare_to_baseline` 对 category=platform 的 principal **丢**任何 grant 判红
+（`missing_required`）；今天只有 `--new-kid` 这个"新增"桶。L3 与演练第 ⑩ 步都会让平台角色丢 grant。
+`facts` 只报 delta、不参与红绿；`BUNDLE_SHAPE` 拒绝规格外的键。
+
+**裁定**：`--new-kid` 泛化为 `--new-key LABEL` / `--retire-key LABEL`，LABEL ∈ kid ∪ {legacy,
+login-flow}，`--new-kid` 留作别名。退役桶与新增桶镜像：只有被声明的那一条 grant 在平台角色上消失
+才算迁移，其它丢失照样红。login-flow 的读取者记为 grant `read-login-flow-secret`（首次出现用
+`--new-key login-flow` 声明），**不进** `is_secret_grant()`（读到只值一个登录 CSRF，不算冒充面）；
+Edge 产物含其值即红——**硬断言，不落 facts**，与 console-in-Edge 同款。**schema 留 4**：grant 是
+字串列表，加新字串不改 schema；不新增 facts 就不需要迁移。今天硬校验 `legacy_param == JWT_PARAM_NAME`
+那条改成"`JWT_PARAM_NAME` 常量是追踪 legacy 参数的真源直到 3c-3 删参数；`legacy_param` 非空时必须
+等于它，为空时照常追踪"，否则 L3 会把闸门炸掉。L3 时 Edge 产物 legacy 计数归零只是 facts 的 delta，
+不需声明。
+
+**否决**：用 `--update-baseline` 人工放行——1A 首跑就是这么放的，进 progress 而不进代码，下次没人知道
+当时为什么绿；schema 5——为一个不参与红绿的数字做一次基线迁移是纯 churn。
+
+#### 11.8.8 新 key 经 `previous` 槽位就位
+
+每 family 只有 `current` + `previous` 两个槽位，演练有三个阶段（就位、切签发、排空），就位期 v2 必须
+占一个槽位而 v1 仍在签发。
+
+**裁定**：v2 先进 `previous`，切换时两槽互换。槽位语义定死（已进 `CONTEXT.md`）：`current` = signer
+开关为 current 时签发用的那把；`previous` = 另一把被接受的 key，**要么是排空中的旧 key，要么是就位中
+的新 key**。就位期 `accepted_previous` 应只来自我们自己的探针（探针之外出现 = 有人拿就位中的 key 签了
+token，红）；切换后 `accepted_previous` 就是排空曲线。2B 的 RS 就位沿用同一套。
+
+**否决**：(B) 独立的 `site_signer = <kid>` 指针——它可以指向 `previous`，回滚态下 auth/panel 的标签同样
+错乱，还多一个可配错的键；(C) 第三个角色 `next`——要改 §8 词表（`accepted_next`）、三处 verifier、读数
+工具与闸门，而它给的红旗（就位 key 被提前使用）(A) 用"就位期 previous 计数 = 探针数"同样能给。
+
+#### 11.8.9 演练十步（两个 family 同步；这是 DEPLOY.md runbook 的首次执行）
+
+每个 Edge 部署都 `rm -rf cdk.out`、等 CloudFront Deployed、跑 `verify_deployed_edge.sh`；每步的闸门
+delta 都用 §11.8.7 的桶声明；T0/T1/T2 与每步证据记进 progress（gitignored），tracked 文件只放规则。
+
+```
+① 前置代码一次上齐：signer 开关（=legacy）、login-flow、_session_mint、工具改新形态、
+   闸门 --new-key/--retire-key、stack.py 改读 legacy_param、部署脚本 config 先于 code、
+   部署前参数核对（§11.8.12）、删 test_signer_untouched_in_1a + 新守卫 + auth→Edge 新形态向量
+② ensure_session_keys（含 login-flow）→ 闸门 --new-key login-flow
+   → deploy_auth（开关仍 legacy）→ GET /login 必 302 且带 __Host-sb_pkce → 操作者人工登录一次
+   （顺带刷新 MCP token）→ 闸门复跑（auth role +read-login-flow-secret，已声明）
+③ 开关 = current：deploy_panel --skip-frontend → deploy_auth（= T0）
+   → 四个 verify_* 全跑 + verify_kid_entry_live + smoke_router
+   → session_verify_counts --hours 1：三列 accepted_current > 0 → E2E 后台跑一次（约 37 min）
+   → 用 _session_mint --role legacy --save 预存 legacy 探针 token（⑤ 用；届时已过期，
+     但 §5 合同 kid 先于 exp ⇒ 结果仍是 unknown_kid，与过期无关）
+④ 观察窗口（§11.8.2）
+⑤ L3：legacy_param 清空 → deploy_auth → deploy_panel → Edge → 闸门 --retire-key legacy
+   → 负向：预存 legacy token 打 Edge 必 302、panel 必 401；日志 unknown_kid
+⑥ 就位：加 [SessionKey:site-hs-v2]/[SessionKey:console-hs-v2]，*_previous = *-hs-v2
+   → ensure_session_keys → 闸门 --new-key site-hs-v2 --new-key console-hs-v2
+   → deploy_auth → deploy_panel → Edge → 探针 --role previous 必 200 → 闸门复跑
+⑦ 切换：两槽互换 → deploy_panel → deploy_auth（= T1）→ 探针 current/previous 都 200
+   → Edge 重部一次（只为标签正确，§11.8.10）
+⑧ 回滚演示：互换回去 → deploy_panel → deploy_auth → 探针 → 再换回来 → deploy_panel → deploy_auth（= T2）
+⑨ 排空：T2 + 26 h 起 --hours 26 --require-total：三列 accepted_previous 全 0、accepted_current 全 > 0
+⑩ 退役 v1：先 _session_mint --role previous --save 预存 v1 token → *_previous 清空、删 [SessionKey:*-hs-v1]
+   → deploy_auth → deploy_panel → Edge → 负向：预存 token 必拒（unknown_kid）
+   → 闸门 --retire-key site-hs-v1 --retire-key console-hs-v1 → 删两把 v1 SSM 参数（不可逆，跑时单独确认）
+```
+
+**四条已嵌在序列里的裁定**：L3（⑤）与就位（⑥）**不合并**成一次 Edge 部署——第 6 条要 L3 在 R1 之前，合并
+会让失败无法归因，代价只是 20 分钟；**排空时钟从 T2 起算**——回滚演示又签了几分钟 v1，最后一枚 v1 的
+出生时刻在 T2；**⑩ 包含删 SSM 参数**——否则一把无人接受的密钥留给 56 个宽读者、闸门还要为不在 config
+里的 kid 记账；**③ 的 legacy 回滚不在生产演示**（§11.8.3）。Edge 部署共 4 次（⑤⑥⑦⑩）。演练结束后
+config 是 `current = *-hs-v2`、`previous` 空，2B 的 RS key 从这里经 `previous` 就位。
+
+#### 11.8.10 Edge 的标签倒置：切换后重部一次
+
+⑦ 切换后到 Edge 重部之前，Edge 仍把 v1 标 current、v2 标 previous，与 auth/panel 相反。
+
+**裁定**：⑦ 之后立刻重部 Edge 一次把标签摆正。站点会话的绝大多数验签发生在 Edge，排空曲线本来就该在
+Edge 列上读；代价 20 分钟且不在关键路径（Edge 早已双接受）。⑧ 回滚演示那几分钟 Edge 标签再次倒置，
+不处理，⑧ 结束后 Edge 配置（current=v2）与 signer 重新一致。
+
+**否决**：排空判据只看 auth/panel 两列——等于放弃主要观测点。
+
+#### 11.8.11 runbook，不写编排器；探针只扩两个既有脚本
+
+**裁定**：十步写进 `DEPLOY.md`，替换今天那节"当前实现下不能就地改值"；每步 = 现成脚本 + 一处 config
+修改 + 硬停止点。探针侧：`verify_kid_entry_live.py` 加 `--role current|previous`（正向）与
+`--retired-token FILE`（负向，用 ⑤/⑩ 之前预存的 token）；`_session_mint.py` 带 `--save FILE` 供预存，
+文件放 `.scratch/`（gitignored）。
+
+**否决**：编排脚本——会把硬停止点藏进一个进程里，1A 那次 502 正是"脚本说 exit 0"掩盖的。
+
+#### 11.8.12 部署前核对 HS 参数存在
+
+auth/panel 的密钥值在运行时才按参数名读，参数缺失的症状是全部登录 500，与 1A 那次 502 同一形状
+（部署脚本 exit 0、线上全红）；⑥ 若忘跑 `ensure_session_keys.py` 就会撞上。stack.py 缺值会落 SYNTH
+占位符、`verify_deployed_edge.sh` 事后能抓，但 auth/panel 没有事前防线。
+
+**裁定**：两个部署脚本在第一次写之前对各自 family 集合里的每个 HS `ssm_param`（auth 另加 login-flow 与
+非空的 legacy）做一次 `GetParameter`，任一缺失即拒绝部署。只读、幂等、不打印值；与 §11.6 第 1 层
+"RS kid 的部署前校验"是同一位置，2B 在同一个钩子里加四项 KMS 校验。守卫：单测断言这个核对发生在任何
+Lambda/IAM 写调用之前。
+
+#### 11.8.13 实施纪律（1A 的教训，供 /to-tickets 逐票引用）
+
+- **auth 的进包清单是 `deploy_auth.AUTH_PACKAGE_MODULES`，由 `auth/tests/test_deploy_auth_package.py`
+  按 login_handler 的 import 闭包核对**；panel 那边叫 `COPY_FILES`。给 handler 新加同目录 import 却
+  没进包 ⇒ `Runtime.ImportModuleError` ⇒ 整个 auth 502（2026-09-02 实测约 4 分钟，单测与
+  `verify_deployed_components` 当时都绿）。1B 不新增 auth 模块（`signing_key` 进 `verifier_env.py`），
+  但每一票合并前都跑这两条守卫。
+- **别用 `publish_version` 做回滚锚点**：闸门会多出每个 principal 一条 `@version` invoke grant（1A 实测
+  19 条噪音）。回滚 = 改配置重部（signer 开关）或 git 重部（代码）。
+- **变形测试用 `git stash` 或临时副本，别对含未提交修改的文件 `git checkout --`**（1A 把未提交的
+  `AUTH_PACKAGE_MODULES` 修复冲掉过一次）。
+- **每个有时间闸的阶段是独立的一票**，进入条件 = 上一阶段的证据（T0/T1/T2、闸门报告、探针输出），证据
+  按 static / fake-unit / integration / production 标注，进 progress（gitignored）。
+- **七个包的单测串行跑**（`test_redlines.py` 的墙钟哨兵）。
+- **已知要改的既有测试**：`panel/tests/test_deploy_panel_contract.py` 里 `JWT_SECRET_PARAM` 必存在那条
+  在 L3 变成条件断言；`auth/tests/test_secret_loading.py::test_jwt_secret_rotation_hazard_is_documented`
+  盯的 docstring 要随 signer 切换改写；`panel/tests/upgrade_code_vectors.py` 加新形态向量；
+  `router/infrastructure/lambda/test_edge_auth.py` 今天**没有**用 `mint_token` 的 auth→Edge 正向向量
+  （§9 要求的那条只有 legacy 形态），1B 补上。
+- **真实账号/域名/角色名不进任何被跟踪的文件**；预存 token 与 T0/T1/T2 记录放 `.scratch/` 或 progress。
+- **最终签字用 commit SHA + 干净工作树**；/code-review 的固定点是 `e4e8d97`。
 
 ---
 
