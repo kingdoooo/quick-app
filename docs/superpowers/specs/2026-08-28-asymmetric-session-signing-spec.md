@@ -5,6 +5,7 @@
 判读作废）；外部复审第十三、十四轮的 P1 与 Codex 对 3c-0 的 6 条阻断项已按下文吸收；**它不构成
 3c-1 及之后各包的实施授权**）。
 术语以根 `CONTEXT.md` 为准；三条随裁决立下的 ADR 在 `docs/adr/0001` 到 `0003`。
+3c-1A 的实施计划：`docs/superpowers/plans/2026-09-02-3c-1a-verifier-kid-allowlist.md`（批准即为 1A 的授权）。
 对应 merged review §9 的 **3c**
 （M09 真修复 ②）。前一条 3b（收窄 CodeBuild 对 bootstrap 桶的读权限）已于 2026-08-27
 部署，见 `2026-08-27-codebuild-bootstrap-read-narrowing-spec.md`。
