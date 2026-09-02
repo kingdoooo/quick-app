@@ -235,15 +235,26 @@ auth 的执行角色因此需要 `ssm:GetParameter`（限定 `/site-builder/*`�
   旧 Edge 节点上有效**，于是同一时刻不同用户、不同地区表现不一致。
   症状（无限登录跳转）与"密钥读取失败"完全一样，极难定位到密钥版本。
 
-**当前实现不支持安全轮转**：Edge 只用单个 `{{JWT_SECRET}}` 占位符验签。真要
-做双密钥（Edge 同时接受 `{新, 旧}`、复制完成后 auth 再切到新值签发、确认无旧
-cookie 后移除旧值），**必须改这三处**——少改任何一处方案都部署不出去：
+**3c-1A（2026-09-02 已部署）之后：verifier 侧已支持轮转，signer 侧还没切。** 五个验签点
+按 spec §5 的合同验：每个 verifier 只认自己那份 `kid → {alg, key}` allowlist（每 family
+`current` + `previous`）加一条 legacy 入口（无 `kid` 的今天形态）。清单在
+`site-builder/config.ini` 的 `[SessionKeys]`（唯一取值来源，`auth/session_keys.py` 校验），
+两把 HS 密钥 `/site-builder/session-keys/{site,console}-hs-v1` 由
+`scripts/ensure_session_keys.py` 幂等创建。**线上所有 token 仍是 legacy 形态**——signer 改发
+`kid` 与真正的轮转演练是 3c-1B（另立计划）。3c-1A 期间的三处改动：
 
-| 文件 | 改什么 |
+| 文件 | 改了什么 |
 |---|---|
-| `router/infrastructure/stack.py:199` | 注入的地方。现在只 `.replace("{{JWT_SECRET}}", jwt_secret)`，要改成读并注入两个版本 |
-| `router/infrastructure/lambda/origin_request.py` | `_verify_session_jwt()` 改成依次试两个 key |
-| `site-builder/auth/session.py` + `login_handler.py` | 签发侧始终只用 active key，配合切换顺序 |
+| `router/infrastructure/stack.py` | `load_site_allowlist()`：只取 **site** family，注入 `{{SITE_ALLOWLIST_JSON}}` 与 `{{LEGACY_ENTRY}}`；`{{JWT_SECRET}}` 从此只是 legacy 入口的密钥 |
+| `router/infrastructure/lambda/origin_request.py` | `_verify_session_jwt()` = `verify_with_legacy(site-session)` 的字节等价副本：有 `kid` 不在 allowlist 直接拒、不回落；legacy 入口拒 `scope=console` |
+| `site-builder/auth/session.py` + `login_handler.py` / `panel/console_session.py` | `verify_with_legacy` 是 handler 调的入口；auth 读两个 family、panel 只读 console；环境变量 `SESSION_KEYS_JSON`（只有参数名）+ `LEGACY_ENTRY` |
+
+**3c-1A 的部署顺序（实测）**：`ensure_session_keys.py` → 闸门先认两个 family（基线 schema 4）
+→ `deploy_auth.py` → `deploy_panel.py --skip-frontend` → `verify_deployed_components.py` →
+router CDK（`rm -rf cdk.out`）→ CloudFront `Deployed` → `verify_deployed_edge.sh` →
+`verify_kid_entry_live.py` / `verify_session_token_semantics.py` / console E2E / `smoke_router.sh`
+→ `session_verify_counts.py` → 闸门复跑。**signer 没变，所以任一 verifier 单独回滚到上一版都
+安全**（旧代码只认 legacy，而线上 token 全是 legacy）；SSM 里的两把新 secret 不删。
 
 > ⚠️ **生产验签有三处，不是一处。** 这条注记从前把 `session.py` 的
 > `verify_session_jwt()` 说成**只有测试会调用它**——**那是错的**（大概写在
@@ -251,9 +262,9 @@ cookie 后移除旧值），**必须改这三处**——少改任何一处方案
 >
 > | 验签点 | 位置 | 验的是什么 |
 > |---|---|---|
-> | Edge | `router/infrastructure/lambda/origin_request.py:452` | 站点访问的 `sb_session` |
-> | auth | `site-builder/auth/login_handler.py:530` | `/console-session` 换升级码时的 `sb_session` |
-> | panel | `site-builder/panel/console_session.py:131` | 每个控制台写请求的 `__Host-sb_console` |
+> | Edge | `router/infrastructure/lambda/origin_request.py` `_verify_session_jwt()` | 站点访问的 `sb_session` |
+> | auth | `site-builder/auth/login_handler.py` `/console-session`（`verify_with_legacy`） | 换升级码时的 `sb_session` |
+> | panel | `site-builder/panel/console_session.py` `verify_console_cookie()` / `consume_code()` | 面板会话 `__Host-sb_console` / 一次性升级码 |
 >
 > （panel 还在 `:82` 消费一次性升级码，`login_handler.py:102` 另有一处用**同一把
 > 密钥**的裸 HMAC 签 OAuth state——不是 JWT，但同样属于"读到密钥就能伪造"的面。）

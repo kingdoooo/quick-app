@@ -221,7 +221,7 @@ print(",".join(sorted(json.loads(m.group(1)))), le.group(1))
 PY
 )"
 if [ "$SK_DEPLOYED" = "$SK_EXPECTED" ]; then
-  echo "PASS  Edge allowlist 的 kid 集合与 legacy 开关 == config（$SK_EXPECTED）"
+  echo "PASS  Edge allowlist 的 kid 集合与 legacy 开关 == config（${SK_EXPECTED}）"
 else
   fail "Edge allowlist/legacy 开关与 config 不一致：产物=[$SK_DEPLOYED] 期望=[$SK_EXPECTED]"
 fi

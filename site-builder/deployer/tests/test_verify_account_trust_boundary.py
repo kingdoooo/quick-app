@@ -115,6 +115,8 @@ _FREE_TEXT_PATHS = (
 _NON_FP_KEY_PATHS = (
     "",                                     # 顶层结构键（schema/note/facts/…）
     "facts",                                # fact 名
+    "facts.session_keys",                   # 3c-1A：键是 kid（{family}-{alg}-v{n}，不是账号值），形态由下面的用例钉死
+    "facts.session_keys.*",                 # 3c-1A：结构键（两个计数名）
     "principals.*",                         # 每个 principal 条目内的 category/grants
     "resource_policies",                    # 结构键（platform/site_*/bootstrap_bucket）
     "resource_policies.platform",           # 键是平台函数名（app.py 里就有，不是账号值）
@@ -1167,6 +1169,12 @@ def test_all_facts_are_integers():
             assert isinstance(node, int) and not isinstance(node, bool), \
                 f"{path} 不是整数而是 {type(node).__name__}: {node!r}"
     walk(facts, "facts")
+    # 3c-1A：session_keys 的键只能是合法 kid，内层只能是两个计数名——键被 _NON_FP_KEY_PATHS 放行了，
+    # 形态就由这里钉住，否则一个账号值可以伪装成"kid"进基线。
+    import re as _re
+    for kid, row in facts.get("session_keys", {}).items():
+        assert _re.fullmatch(r"(site|console)-(hs|rs)-v\d+", kid), f"facts.session_keys 的键不是合法 kid: {kid!r}"
+        assert set(row) == {"edge_code_targets_carrying_key", "edge_assets_carrying_key"}, sorted(row)
 
 
 def test_baseline_redline_scan_catches_an_injected_new_subkey():

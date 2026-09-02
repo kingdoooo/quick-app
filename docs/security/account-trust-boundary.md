@@ -55,8 +55,8 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 | **A 直接失守** | 具备非 IAM-write 敏感授权的 principal | 61 <!-- baseline:A总数=61 --> |
 | | 其中**能取得会话签名密钥**的 | 56 <!-- baseline:可读密钥=56 --> |
 | | 其中**非平台**身份可直接 `lambda:InvokeFunction` 平台或站点函数的 | 18 <!-- baseline:非平台可直调=18 --> |
-| | Edge 函数里仍带着当前有效密钥的**代码目标**（未限定 + 已发布版本） | 10 <!-- baseline:带活密钥的Edge代码目标=10 --> |
-| | CDK bootstrap 桶里仍带着**当前有效**密钥的 asset 对象 | 9 <!-- baseline:带活密钥的asset=9 --> |
+| | Edge 函数里仍带着当前有效密钥的**代码目标**（未限定 + 已发布版本） | 11 <!-- baseline:带活密钥的Edge代码目标=11 --> |
+| | CDK bootstrap 桶里仍带着**当前有效**密钥的 asset 对象 | 10 <!-- baseline:带活密钥的asset=10 --> |
 | **B IAM 写观察** | 持有相关 IAM 策略变更语句的 principal | 22 <!-- baseline:B持有IAM写语句=22 --> |
 | | 其中**不在 A 里**（只有 IAM 写、**未证明可提权**） | 4 <!-- baseline:仅IAM写=4 --> |
 
@@ -316,6 +316,20 @@ Python 后端而用 `pip install` 装 sdist），这条链就从「账号内部�
 ```bash
 python3 site-builder/scripts/verify_account_trust_boundary.py
 ```
+
+> **2026-09-02（3c-1A）基线口径变化**：基线 schema 3 → 4。会话密钥从一把变成三把（legacy
+> `jwt-secret` + `site-hs-v1` + `console-hs-v1`），每把各自一条 grant：legacy 三条路名字不变，
+> 新增 `read-session-key:<kid>`（**不与 legacy 合并**——「谁能读 site 的 key」与「谁能读
+> console 的 key」分得开是 spec §4.1 两个 family 的全部意义）；`facts.session_keys.<kid>` 记
+> 每把 key 在 Edge 代码版本 / bootstrap asset 里的出现次数；**console family 的 key 出现在
+> Edge 产物里是新的红字段**，不是事实类 note。首跑 delta：27 个 principal 长出两条新 grant，
+> 全部已持 `read-jwt-param`（同一批 SSM 前缀/通配授权）；另接受了一条**与 3c 无关**的 IAM 写
+> 漂移——`break-glass` 类的 AWS 内部访问角色于 2026-08-28 被其自动化删除重建、inline 策略
+> 重写（8 → 4 条语句），由账号所有者裁定接受。**判不出的项**因资源类清单加入 `session-key:*`
+> 而整批换了指纹（305 消失 / 305 新增，`principals_with_missing_context` 不变）。
+> 3c-1A 部署后（同日第三次观测）：Edge 版本 10 与其 asset 仍带 legacy 密钥（signer 未切，3c-3 才退役），
+> 所以带活密钥的代码目标 10 → 11、asset 9 → 10；`site-hs-v1` 在 2 个代码目标 / 1 个 asset 里；console 0 / 0；
+> 唯一的授权 delta 是 panel 角色多了 `read-session-key:console-hs-v1`（auth 角色原前缀授权已覆盖两把新 key，收窄成精确清单后集合不变）。
 
 它的形状是**一种能力 = 一个动作等价类 × 一个资源等价类**。这句话是这道闸门最
 重要的不变量，因为把它压成"单个动作 / 单个资源"这个错误已经犯过三次，每次都留下
@@ -608,6 +622,7 @@ merged review 的 M09 记的是「同账号 `lambda:InvokeFunction` 可对 panel
 - `site-builder/deployer/buildspec-package.yml` —— `--ignore-scripts` 那一行；
   它是「不可信站点依赖」与「平台签名密钥」之间当前唯一的隔断（见上文过宽授权一节）
 - `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §4 的 `M09` 与 §9 优先级表
-- `site-builder/DEPLOY.md` 「轮转 `jwt-secret`」一节 —— 当前实现不支持安全轮转。
+- `site-builder/DEPLOY.md` 「轮转 `jwt-secret`」一节 —— 3c-1A（2026-09-02）起 verifier 已认
+  `current`/`previous`/legacy，但 signer 仍发 legacy 形态，轮转演练在 3c-1B；密钥被读的应急仍如下。
   这与本文档直接相关：密钥一旦被读，换掉它既需要一个全员重新登录的窗口，
   **也要连带清理 bootstrap 桶里那 9 个仍带旧密钥的 asset 对象**
