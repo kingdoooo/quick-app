@@ -93,17 +93,16 @@ def load_site_allowlist() -> tuple:
     secret 值按每行的 ssm_param 从 SSM 取；**只取 site family，console 的 key 不进 Edge**。
     legacy 开关：legacy_param 非空即 "on"（3c-3 清空它即 "off"）。
 
-    SSM 读失败沿用 load_jwt_secret 的 synth-only 语义：注入空 allowlist 并在 stderr 警告，
-    这样 `cdk synth` 离线能跑，但该模板**绝不能部署**（空 allowlist = 所有新形态会话全拒）。
+    SSM 读失败沿用 load_jwt_secret 的 synth-only 语义：注入带 SYNTH-ONLY 标记的占位 allowlist 并在
+    stderr 警告，这样 `cdk synth` 离线能跑，但该模板**绝不能部署**（verify_deployed_edge.sh 会抓到标记）。
     """
     root = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(root / "site-builder" / "auth"))
-    from session_keys import load_session_keys
+    from session_keys import SYNTH_PLACEHOLDER_ALLOWLIST_JSON, legacy_entry, load_session_keys
     keys = load_session_keys(root / "site-builder" / "config.ini")
-    legacy_entry = "on" if keys.legacy_param else "off"
-    env_json = os.getenv("APP_SITE_ALLOWLIST_JSON")
-    if env_json:
-        text = env_json
+    override = os.getenv("APP_SITE_ALLOWLIST_JSON")   # 与 APP_JWT_SECRET 同款的显式覆盖（离线 synth / 测试）
+    if override:
+        text = override
     else:
         try:
             import boto3
@@ -117,12 +116,13 @@ def load_site_allowlist() -> tuple:
             text = json.dumps(allow, separators=(",", ":"))
         except Exception as exc:  # noqa: BLE001 - deliberate synth-time fallback
             print(f"WARNING: could not build the site allowlist from SSM ({exc}); "
-                  "injecting an EMPTY allowlist. DO NOT deploy this template.", file=sys.stderr)
-            text = "{}"
+                  "injecting the SYNTH-ONLY placeholder allowlist. DO NOT deploy this template.",
+                  file=sys.stderr)
+            text = SYNTH_PLACEHOLDER_ALLOWLIST_JSON   # 合法 JSON、带标记、kid 永不匹配（session_keys 里有说明）
     if "\'\'\'" in text or "\\" in text:
         raise ValueError("allowlist JSON 含三引号或反斜杠，注进三引号字符串会破坏 Edge 源码")
     json.loads(text)   # 注入前保证是合法 JSON，否则 Edge 在 import 时就炸
-    return text, legacy_entry
+    return text, legacy_entry(keys)
 
 
 class WebRouterStack(Stack):

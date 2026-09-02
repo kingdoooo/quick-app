@@ -42,7 +42,7 @@ CFG = configparser.ConfigParser(interpolation=None)
 CFG.read(HERE.parent / "config.ini")
 # 3c-1A：[SessionKeys] 的唯一定义在 auth/session_keys.py（构建期 import，不进包——运行时只读环境变量）
 sys.path.insert(0, str(HERE.parent / "auth"))
-from session_keys import env_json, legacy_entry, load_session_keys  # noqa: E402
+from session_keys import env_json, legacy_entry, load_session_keys, ssm_parameter_arns  # noqa: E402
 
 
 def _cfg(section: str, key: str, default: str | None = None) -> str:
@@ -64,6 +64,7 @@ RUNTIME = "python3.13"
 #   common.py / permissions.py —— 授权与表访问的单一真源
 #   ops_log.py                 —— permissions.py import 它（M3 审计落点）
 #   session.py                 —— upgrade code 与会话 JWT 的单一编解码实现
+#   verifier_env.py            —— allowlist 装配 / legacy 开关 / 观测日志（3c-1A，与 auth 共用一份）
 #   edge_caller.py             —— "调用者真是 Edge"的单一判定（handler 的第 ⓪ 步，
 #                                 与 key-proxy 共用同一份，见该模块 docstring）
 #   keystore.py                —— `site-api-keys` 的唯一访问层（api.py 只经它
@@ -79,7 +80,7 @@ RUNTIME = "python3.13"
 # 漏任何一个都是"单测全绿、部署后 ImportError"，由
 # test_copy_files_covers_every_local_module_panel_imports 按传递闭包核对——
 # **清单以那条断言为准**，不要照着记性加减（本清单曾经漏过 keystore.py）。
-COPY_FILES = ("common.py", "permissions.py", "ops_log.py", "session.py",
+COPY_FILES = ("common.py", "permissions.py", "ops_log.py", "session.py", "verifier_env.py",
               "edge_caller.py", "keystore.py", "keygen.py",
               "analytics.py", "access_rollup.py")
 
@@ -173,12 +174,6 @@ def function_url_statements(edge_role_arn: str) -> list[dict]:
     ]
 
 
-def _panel_ssm_parameter_arns(region: str, acct: str) -> list[str]:
-    keys = load_session_keys(HERE.parent / "config.ini")
-    params = [keys.legacy_param] + [r.ssm_param for r in keys.allowlist("console") if r.alg == "HS256"]
-    return [f"arn:aws:ssm:{region}:{acct}:parameter{p}" for p in dict.fromkeys(params)]
-
-
 def role_statements() -> list[dict]:
     """panel 执行角色的 inline policy。
 
@@ -265,7 +260,8 @@ def role_statements() -> list[dict]:
         # （spec §4.3：panel 只持 console 的 allowlist；拿到 site 的 key = 被攻破时能伪造站点会话）
         {"Sid": "ReadSessionKeysConsoleOnly", "Effect": "Allow",
          "Action": "ssm:GetParameter",
-         "Resource": _panel_ssm_parameter_arns(region, acct)},
+         "Resource": ssm_parameter_arns(load_session_keys(HERE.parent / "config.ini"), ("console",),
+                                        region=region, account=acct)},
         {"Sid": "DecryptViaSSM", "Effect": "Allow",
          "Action": "kms:Decrypt", "Resource": "*",
          "Condition": {"StringEquals": {
@@ -310,6 +306,7 @@ def lambda_environment(edge_role_id_value: str = "") -> dict:
     但**缺了它 handler 会拒绝所有请求**——见 edge_caller.caller_is_edge：
     "配置缺失就不检查"恰好是这个缺陷的原始形态，所以宁可整站拒绝。
     """
+    keys = load_session_keys(HERE.parent / "config.ini")
     return {
         "EDGE_ROLE_ID": edge_role_id_value,
         "JOBS_TABLE": "site-deploy-jobs",
@@ -332,10 +329,11 @@ def lambda_environment(edge_role_id_value: str = "") -> dict:
         "BASE_DOMAIN": _base_domain(),
         "CONSOLE_HOST": console_host(),
         "UNDEPLOY_FN": "site-deployer-undeploy",
-        "JWT_SECRET_PARAM": "/site-builder/jwt-secret",
-        # 3c-1A：console family 的 kid 清单（只有参数名）与 legacy 入口开关；形态由 auth/session_keys.py 定义
-        "SESSION_KEYS_JSON": env_json(load_session_keys(HERE.parent / "config.ini"), ("console",)),
-        "LEGACY_ENTRY": legacy_entry(load_session_keys(HERE.parent / "config.ini")),
+        # 3c-1A：legacy 参数名与 console family 的 kid 清单（只有参数名）、legacy 入口开关，
+        # 全部来自 [SessionKeys]（唯一真源；role 的精确 ARN 清单也从它推导）
+        "JWT_SECRET_PARAM": keys.legacy_param,
+        "SESSION_KEYS_JSON": env_json(keys, ("console",)),
+        "LEGACY_ENTRY": legacy_entry(keys),
     }
 
 

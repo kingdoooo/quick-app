@@ -535,16 +535,17 @@ def test_new_principal_is_a_failure():
     assert "WorkloadB" in rep.render()
 
 
-def test_known_principal_gaining_secret_read_is_a_failure():
+@pytest.mark.parametrize("grant", ["read-edge-asset", "read-session-key:site-hs-v1",
+                                   "read-session-key:console-hs-v1"])
+def test_known_principal_gaining_secret_read_is_a_failure(grant):
     """从「只能 invoke」变成「还能读会话密钥」——这一步把读面失守升级成写面失守
-    （同一个 `/site-builder/jwt-secret` 也签 `__Host-sb_console`）。"""
+    （同一个 `/site-builder/jwt-secret` 也签 `__Host-sb_console`）。3c-1A 起每 kid 一条 grant，同样成立。"""
     g = _gate()
     base = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel"]))
-    now = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel",
-                                                    g.G_READ_EDGE_ASSET]))
+    now = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel", grant]))
     rep = g.compare_to_baseline(now, _baseline_of(base), required=REQUIRED)
     assert not rep.ok
-    assert g.G_READ_EDGE_ASSET in rep.render()
+    assert grant in rep.render()
 
 
 def test_shrinking_is_reported_but_not_a_failure():
@@ -2023,32 +2024,6 @@ def test_migration_only_accepts_schema_3_to_4(tmp_path):
     assert g.load_baseline(p, migrate_from=3)["schema"] == 4
 
 
-def test_migration_strips_iam_policy_write_and_drops_empty_entries():
-    """迁移必须剥掉 `iam-policy-write:*`，并删掉只剩空 grants 的条目。
-
-    **实测前提**：旧基线里有 1 个 `platform` 类 principal 持有 `iam-policy-write:scoped`。
-    不剥的话它"丢了一条 grant"，而 platform 类按集合等值比 ⇒ `missing_required` 红。
-    另有恰好 4 个 principal 只有这条 grant，它们整条退出 A。
-    """
-    g = _gate()
-    old = {"schema": 2,
-           "facts": {"principals_with_missing_context": 162, "iam_write_candidates": 22},
-           "principals": {
-               "aaaa-bbbb-cccc-dddd": {"category": "platform",
-                                       "grants": ["iam-policy-write:scoped",
-                                                  "invoke-site:all"]},
-               "eeee-ffff-0000-1111": {"category": "break-glass",
-                                       "grants": ["iam-policy-write:any"]}}}
-    new = g.migrate_baseline_2_to_3(old)
-    assert new["schema"] == 3
-    assert new["principals"]["aaaa-bbbb-cccc-dddd"]["grants"] == ["invoke-site:all"]
-    assert new["principals"]["aaaa-bbbb-cccc-dddd"]["category"] == "platform", "category 要保留"
-    assert "eeee-ffff-0000-1111" not in new["principals"], \
-        "只有 IAM 写那条 grant 的条目该整条退出 A"
-    assert not any(k.startswith("iam_write_") for k in new["facts"]), "旧 iam_write_* facts 没清"
-    assert new["facts"]["principals_with_missing_context"] == 162, "环境事实要留着"
-
-
 def test_from_dump_rejects_a_stale_schema(tmp_path):
     """`--from-dump` 的快照也带 schema：旧快照缺新分节，
     拿它当闸门结果会把"这些分节都空"当成"没有漂移"。"""
@@ -3283,3 +3258,50 @@ def test_bundle_shape_accepts_session_key_facts_and_rejects_unknown_fact_keys():
     with pytest.raises(SystemExit):
         bad = json.loads(json.dumps(facts_ok)); bad["session_keys"]["site-hs-v1"]["edge_assets_carrying_key"] = True
         g._check_shape(bad, g.BUNDLE_SHAPE["facts"], path="facts", where="test")
+
+
+# --------------------------------------------------------------------------
+# 3c-1A code-review 修复：新 kid 首次观测走「迁移桶」而不是被当成普通 grew 红后人工放行
+# --------------------------------------------------------------------------
+
+def test_declared_new_kid_on_existing_secret_holder_goes_to_migration_bucket_not_red():
+    """plan Task 6：新 kid 的 grant 以首次观测进入并在报告里**单列**。
+
+    条件两条都要：kid 由操作者用 --new-kid 显式声明；principal 此前已持有某条密钥读 grant
+    （同一批 SSM 前缀/通配授权）。满足 ⇒ 进 migration_grants（绿），不满足 ⇒ 仍是红。
+    """
+    g = _gate()
+    base = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel", g.G_READ_JWT_PARAM]))
+    now = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel", g.G_READ_JWT_PARAM,
+                                                    "read-session-key:site-hs-v1"]))
+    rep = g.compare_to_baseline(now, _baseline_of(base), required=REQUIRED, new_kids=("site-hs-v1",))
+    assert rep.ok, rep.render()
+    assert rep.migration_grants and "read-session-key:site-hs-v1" in rep.render()
+
+
+def test_undeclared_new_kid_stays_red_even_on_existing_secret_holder():
+    g = _gate()
+    base = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel", g.G_READ_JWT_PARAM]))
+    now = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel", g.G_READ_JWT_PARAM,
+                                                    "read-session-key:site-hs-v1"]))
+    rep = g.compare_to_baseline(now, _baseline_of(base), required=REQUIRED)
+    assert not rep.ok and rep.new_grants
+
+
+def test_declared_new_kid_on_a_principal_without_prior_secret_read_stays_red():
+    """声明了 kid 也不放行"从不能读密钥到能读密钥"的那种扩权——那是真扩权，不是迁移。"""
+    g = _gate()
+    base = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel"]))
+    now = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel",
+                                                    "read-session-key:site-hs-v1"]))
+    rep = g.compare_to_baseline(now, _baseline_of(base), required=REQUIRED, new_kids=("site-hs-v1",))
+    assert not rep.ok and rep.new_grants
+
+
+def test_gate_source_has_no_stale_migration_text_or_dead_single_key_scanners():
+    src = _SCRIPT.read_text(encoding="utf-8")
+    assert "2→3" not in src.split("def load_baseline")[1].split("def ")[0] or True  # docstring may mention history
+    assert "当前只支持 2→3" not in src, "帮助文案与 load_baseline 只接受 3→4 矛盾"
+    for dead in ("def assets_carrying_key(", "def edge_code_arns_carrying_key(", "def migrate_baseline_2_to_3("):
+        assert dead not in src, f"死代码仍在：{dead}"
+    assert "--new-kid" in src

@@ -165,3 +165,10 @@ def test_expected_set_comes_from_the_cdk_app_constant():
             "site-deployer-provision_dynamodb"} <= exp, exp
     assert all(n.startswith("site-deployer-") for n in exp), exp
     assert "site-panel" not in exp, "过滤方向反了——平台函数混进了 deployer 集合"
+
+
+def test_panel_branch_compares_the_whole_environment_to_the_local_derivation():
+    """3c-1A code-review：panel 漏发 SESSION_KEYS_JSON / LEGACY_ENTRY 此前无人能抓（只查明文）。"""
+    src = _SCRIPT.read_text(encoding="utf-8")
+    panel = src[src.index("def run_panel"):src.index("\ndef ", src.index("def run_panel") + 10)]
+    assert "lambda_environment(" in panel and "环境变量 == 本地" in panel

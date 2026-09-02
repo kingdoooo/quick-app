@@ -156,3 +156,21 @@ def test_env_json_carries_only_requested_families_and_no_values(tmp_path):
     with pytest.raises(sk.SessionKeysError):
         sk.env_json(keys, ("edge",))
     assert sk.legacy_entry(keys) == "on"
+
+
+def test_ssm_parameter_arns_is_the_single_builder_for_both_deploy_scripts(tmp_path):
+    keys = _load(tmp_path, MINIMAL)
+    arns = sk.ssm_parameter_arns(keys, ("console",), region="us-east-1", account="111111111111")
+    assert arns == ["arn:aws:ssm:us-east-1:111111111111:parameter/site-builder/jwt-secret",
+                    "arn:aws:ssm:us-east-1:111111111111:parameter/site-builder/session-keys/console-hs-v1"]
+    both = sk.ssm_parameter_arns(keys, ("site", "console"), region="us-east-1", account="111111111111",
+                                 extra=("/site-builder/site-client-secret",))
+    assert len(both) == 4 and both[1].endswith("site-client-secret")
+    assert len(set(both)) == len(both), "去重且保序"
+
+
+def test_synth_placeholder_allowlist_is_valid_json_but_can_never_match_a_kid():
+    import json
+    al = json.loads(sk.SYNTH_PLACEHOLDER_ALLOWLIST_JSON)
+    assert "SYNTH-ONLY-PLACEHOLDER" in sk.SYNTH_PLACEHOLDER_ALLOWLIST_JSON
+    assert al and all(sk.KID_RE.match(k) is None for k in al), "占位 kid 绝不能长得像真 kid"

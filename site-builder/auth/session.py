@@ -175,11 +175,10 @@ def _aud_matches(got, want: str) -> bool:
     return isinstance(got, str) and got == want
 
 
-def _has_kid(header: dict, allowlist: dict) -> bool:
+def _has_kid(header: dict) -> bool:
     """legacy 入口的进入条件是 header **根本没有 kid 键**（状态机第 5 条）。
     不是"kid 不在 allowlist"——那样一个乱写的 kid 就能把验证降级到旧合同。
-    单独成函数同样是给 meta 用例钉行用的；allowlist 参数只为让错误形态可被替换进来。"""
-    del allowlist
+    单独成函数是给 meta 用例钉行用的（用例把它换成"kid 在 allowlist 里"的错误语义）。"""
     return "kid" in header
 
 
@@ -261,7 +260,7 @@ def verify_with_legacy(token: str, *, allowlist: dict, token_use: str,
         header = _strict_json(_b64url_decode(token.split(".")[0]))
     except Exception:
         return None, "bad_signature"
-    if _has_kid(header, allowlist) or legacy_secret is None:
+    if _has_kid(header) or legacy_secret is None:
         return verify_token(token, allowlist=allowlist, token_use=token_use, now=now)
     if token_use == "console-upgrade":
         claims = verify_upgrade_code(token, legacy_secret, now)

@@ -19,7 +19,7 @@ import boto3
 sys.path.insert(0, str(Path(__file__).parent))   # 被 verify_deployed_components 按路径加载时也能找到同目录模块
 from alarm_pipeline import ensure_alarm_pipeline
 from secrets_util import ensure_secret as _ensure_secret
-from session_keys import env_json, legacy_entry, load_session_keys
+from session_keys import env_json, legacy_entry, load_session_keys, ssm_parameter_arns
 
 FN = "site-auth-service"
 CFG_PATH = Path(__file__).parent.parent / "config.ini"
@@ -122,8 +122,11 @@ def lambda_env() -> dict:
     collaborators 全部判定。运行时由 login_handler._secret() 从 SSM
     SecureString 读并在容器内缓存。
     """
+    keys = load_session_keys(CFG_PATH)
     return {"Variables": {
-        "JWT_SECRET_PARAM": JWT_SECRET_PARAM,
+        # legacy 参数名的唯一真源是 [SessionKeys] legacy_param（role 的精确 ARN 清单也从它推导；
+        # 两处分叉的症状是运行时 AccessDenied）
+        "JWT_SECRET_PARAM": keys.legacy_param,
         "CLIENT_SECRET_PARAM": CLIENT_SECRET_PARAM,
         "COGNITO_DOMAIN": cfg()["Cognito"]["domain"],
         "CLIENT_ID": cfg()["Cognito"]["site_client_id"],
@@ -137,24 +140,14 @@ def lambda_env() -> dict:
         "REQUIRE_EMAIL_VERIFIED": _require_email_verified_cfg(),
         # 3c-1A：两个 family 的 kid 清单（**只有参数名**，值运行时按参数名读 SSM）与 legacy 入口开关。
         # 形态由 auth/session_keys.py 唯一定义；panel 的那份只含 console（各自 verifier 各自的 allowlist）。
-        "SESSION_KEYS_JSON": env_json(load_session_keys(CFG_PATH), ("site", "console")),
-        "LEGACY_ENTRY": legacy_entry(load_session_keys(CFG_PATH))}}
-
-
-def ssm_parameter_arns() -> list:
-    """auth 执行角色能读的 SSM 参数：**精确清单**，不再用 parameter/site-builder/* 前缀
-    （前缀会把 session-keys 下未来的一切一并交出去）。清单从 [SessionKeys] 推导，不手抄。"""
-    keys = load_session_keys(CFG_PATH)
-    params = [keys.legacy_param, CLIENT_SECRET_PARAM]
-    params += [r.ssm_param for fam in ("site", "console") for r in keys.allowlist(fam) if r.alg == "HS256"]
-    acct = cfg()["Platform"]["account_id"]
-    return [f"arn:aws:ssm:{region()}:{acct}:parameter{p}" for p in dict.fromkeys(params)]
+        "SESSION_KEYS_JSON": env_json(keys, ("site", "console")),
+        "LEGACY_ENTRY": legacy_entry(keys)}}
 
 
 def main():
     # 密钥仍在这里**确保存在**（首次部署要生成 JWT secret），但只写进 SSM，
     # 不进环境变量——运行时由 login_handler._secret() 去读。
-    ensure_secret(JWT_SECRET_PARAM, lambda: secrets.token_hex(32))
+    ensure_secret(load_session_keys(CFG_PATH).legacy_param, lambda: secrets.token_hex(32))
     role_arn = ensure_lambda_role()
     env = lambda_env()
     code = build_zip()
@@ -401,7 +394,9 @@ def ensure_lambda_role() -> str:
         PolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": [
             {"Sid": "ReadPlatformSecrets", "Effect": "Allow",
              "Action": "ssm:GetParameter",
-             "Resource": ssm_parameter_arns()},
+             "Resource": ssm_parameter_arns(load_session_keys(CFG_PATH), ("site", "console"),
+                                            region=region(), account=cfg()["Platform"]["account_id"],
+                                            extra=(CLIENT_SECRET_PARAM,))},
             # SecureString 用账号默认的 aws/ssm key 加密；解密走 SSM 服务，
             # 故用 ViaService 限定，避免这个角色能直接拿 KMS key 干别的。
             {"Sid": "DecryptViaSSM", "Effect": "Allow",

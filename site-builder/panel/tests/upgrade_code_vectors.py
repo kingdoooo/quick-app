@@ -40,5 +40,3 @@ CONSOLE_KID_SECRET = "console-secret-v1-not-a-real-one"
 CONSOLE_ALLOWLIST = {CONSOLE_KID: {"alg": "HS256", "secret": CONSOLE_KID_SECRET, "role": "current"}}
 SITE_KID = "site-hs-v1"
 SITE_KID_SECRET = "site-secret-v1-not-a-real-one"
-CONSOLE_KEYS_JSON = '{"console": [{"kid": "console-hs-v1", "alg": "HS256", "role": "current", ' \
-                    '"ssm_param": "/site-builder/session-keys/console-hs-v1"}]}'

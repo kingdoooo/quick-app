@@ -667,6 +667,12 @@ def run_panel() -> None:
 
     env = conf.get("Environment", {}).get("Variables", {})
     _check_env_has_no_plaintext_secret(env, "panel", "JWT_SECRET_PARAM")
+    # 环境变量**整体** == 本地 lambda_environment() 推导值（SESSION_KEYS_JSON / LEGACY_ENTRY 也在其中）。
+    # EDGE_ROLE_ID 是部署时从线上取的值，比对时以线上值为准喂给推导函数。
+    want_env = dp.lambda_environment(env.get("EDGE_ROLE_ID", ""))
+    diff = sorted(k for k in set(env) | set(want_env) if env.get(k) != want_env.get(k))
+    check(not diff, "panel 环境变量 == 本地 lambda_environment() 推导值",
+          f"不一致的键: {diff}" if diff else f"{len(want_env)} 个键一致（只有参数名，无明文）")
 
     edge_role = read_cfg("Deployer", "edge_role_arn")
     _check_function_url_authz(lam, fn, "panel", edge_role)

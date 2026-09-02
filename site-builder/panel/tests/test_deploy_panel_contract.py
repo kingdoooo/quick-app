@@ -44,12 +44,15 @@ def test_build_copies_session_py_too():
     另写一份）。**位置是 `deployer/functions/` 而不是 `panel/`**，正是为了让
     这条与隔壁的闭包断言能看见它们。
 
+    verifier_env.py（3c-1A）：console_session 顶层 import 它（allowlist 装配 / legacy 开关 /
+    观测日志的唯一实现，auth 拥有）。漏它 = 面板会话全部 500。
+
     这条是**恒定集合**的快照，隔壁那条按传递闭包推导——两条一起才既挡住
     "改了代码忘了改清单"，也挡住"往清单里塞了不存在的文件"（后者会让
     `_build_zip` 在真机上 `sys.exit`，而闭包断言不看这个方向）。
     """
     assert set(dp.COPY_FILES) == {"common.py", "permissions.py", "ops_log.py",
-                                  "session.py", "edge_caller.py",
+                                  "session.py", "verifier_env.py", "edge_caller.py",
                                   "keystore.py", "keygen.py",
                                   "analytics.py", "access_rollup.py"}
 
@@ -971,3 +974,13 @@ def test_skip_frontend_must_not_move_route_to_an_unuploaded_prefix():
         boto3.resource = real
     assert captured["static_prefix"] == "platform/console/OLD", (
         f"传了 static_prefix 却没生效: {captured.get('static_prefix')}")
+
+
+def test_panel_legacy_param_env_comes_from_session_keys_not_a_literal():
+    sys.path.insert(0, str(PANEL.parent / "auth"))
+    from session_keys import load_session_keys
+    keys = load_session_keys(PANEL.parent / "config.ini")
+    assert dp.lambda_environment()["JWT_SECRET_PARAM"] == keys.legacy_param
+    src = (PANEL / "deploy_panel.py").read_text()
+    assert '"JWT_SECRET_PARAM": "/site-builder/jwt-secret"' not in src, "legacy 参数名硬编码，与 [SessionKeys] 分叉"
+    assert "def _panel_ssm_parameter_arns" not in src, "ARN 清单应由 session_keys.ssm_parameter_arns 生成"

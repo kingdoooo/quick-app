@@ -10,7 +10,6 @@
 TTL 缓存（照抄 auth 的 _secret 模式）。**明文严禁进环境变量**——
 GetFunctionConfiguration 会原样回显，拿到 JWT_SECRET 即可伪造任意用户会话。
 """
-import json
 import os
 import time
 from datetime import datetime, timezone
@@ -18,6 +17,7 @@ from datetime import datetime, timezone
 import boto3
 
 import session
+import verifier_env
 
 CONSOLE_COOKIE = "__Host-sb_console"
 CONSOLE_SCOPE = "console"
@@ -61,34 +61,18 @@ def _secret() -> str:
 
 
 def _console_allowlist() -> dict:
-    """panel 自己那份 allowlist：**只有 console family**（spec §4.3）。
-
-    SESSION_KEYS_JSON 里出现别的 family 就是部署配置错了，直接拒：panel 拿到 site 的
-    key 等于 panel 被攻破 ⇒ 伪造站点会话。缺配置同样直接抛，不静默成空 allowlist。
-    """
-    try:
-        keys = json.loads(os.environ["SESSION_KEYS_JSON"])
-    except (KeyError, ValueError) as exc:
-        raise RuntimeError("SESSION_KEYS_JSON 缺失或不是 JSON——部署脚本没下发") from exc
-    if set(keys) != {"console"}:
-        raise RuntimeError(f"panel 的 SESSION_KEYS_JSON 只能含 console family，现在是 {sorted(keys)}")
-    return {r["kid"]: {"alg": r["alg"], "secret": _secret_by_param(r["ssm_param"]), "role": r["role"]}
-            for r in keys["console"]}
+    """panel 自己那份 allowlist：**只有 console family**（spec §4.3）。装配逻辑在 verifier_env
+    （auth 拥有、构建时复制进包），SESSION_KEYS_JSON 里出现别的 family 就直接拒。"""
+    return verifier_env.load_allowlist(os.environ.get("SESSION_KEYS_JSON"), "console", _secret_by_param,
+                                       allowed_families=("console",))
 
 
 def _legacy_secret():
-    flag = os.environ.get("LEGACY_ENTRY")
-    if flag not in ("on", "off"):
-        raise RuntimeError("LEGACY_ENTRY 必须是 on/off——部署脚本没下发")
-    return _secret() if flag == "on" else None
+    return verifier_env.legacy_secret(os.environ.get("LEGACY_ENTRY"), _secret)
 
 
 def _log_verify(outcome: str) -> None:
-    """spec §8：固定低基数词表，**不记 token**；埋点异常一律吞掉。"""
-    try:
-        print(json.dumps({"event": "session_verify", "verifier": "panel", "outcome": outcome}))
-    except Exception:
-        pass
+    verifier_env.log_verify("panel", outcome)
 
 
 def _codes_table():

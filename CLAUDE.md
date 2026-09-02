@@ -135,6 +135,8 @@ RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/tes
 bash site-builder/scripts/smoke_router.sh    # 路由层冒烟（会写测试数据，跑完清理；含 65s 等 Edge 缓存）
 python3 site-builder/scripts/verify_console_e2e.py      # 控制台端到端
 python3 site-builder/scripts/verify_analytics_e2e.py    # 统计端到端（二期 M5）
+python3 site-builder/scripts/verify_kid_entry_live.py   # 3c-1A 新入口真机正/负向（只发 GET；--self-test 不碰 AWS）
+python3 site-builder/scripts/session_verify_counts.py --hours 1 --require-total   # 三处 session_verify 埋点读数（只读；任一 verifier 为 0 即退 1）
 # 账号信任边界的漂移闸门（只读；A 直接失守 + B IAM 写静态快照两层；400 个 principal × 2 次
 # IAM 模拟 + **两次** GetAccountAuthorizationDetails（第二次是模拟后的**窗口两端一致性
 # 复查**——两端不一致就作废本轮、不出结论也不写基线。它**不保证原子**：只覆盖 principal
@@ -181,6 +183,9 @@ cd "$(git rev-parse --show-toplevel)"
 
 # 执行器（bundling 需要 Docker）
 (cd site-builder/deployer/infra && rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never)
+
+# 3c-1A：两把 HS 会话密钥先存在（幂等、只创建；路径来自 site-builder/config.ini 的 [SessionKeys]）
+python3 site-builder/scripts/ensure_session_keys.py
 
 # auth 服务（Lambda + Function URL + pre-token 触发器，幂等）
 (cd site-builder/auth && python3 deploy_auth.py)
@@ -287,6 +292,7 @@ python3 site-builder/scripts/gen_onboarding.py
 | `origin_request.py` | router tests、origin-response 对称契约、CDK asset、Edge 部署 |
 | 路由权限字段 | permissions、register/resync、补偿恢复、Edge 反序列化 |
 | DynamoDB/DSQL 资源 | runtime inline policy、boundary、undeploy、backfill、IAM 模拟 |
+| `[SessionKeys]`（`auth/session_keys.py`） | `config.ini.example`、`ensure_session_keys.py`、`deploy_auth`/`deploy_panel` 的 env 与 role SSM 清单、`router/infrastructure/stack.py` 注入、闸门 `session_key_params`、`verify_deployed_edge.sh`、`verifier_env.py`（auth 拥有、panel 复制） |
 
 ## 高频坑（都是真机踩过的）
 

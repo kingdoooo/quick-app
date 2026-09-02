@@ -472,6 +472,9 @@ _REQUIRE_AUTH_ALLOWED = {
     # （`it.get("require_auth") is True`），不 put 也不 update 任何行，更不建夹具。
     # 这条豁免是本轮扩域后哨兵咬住的**第一个新文件**，属于它按设计工作。
     "scripts/verify_session_token_semantics.py",
+    # verify_kid_entry_live.py（3c-1A）：与上一条完全同形——只**读**路由表挑一个 require_auth=True 的
+    # 站点当探针靶子，只发 GET，不写任何投影。2A 常驻夹具站点就位后改打夹具站点。
+    "scripts/verify_kid_entry_live.py",
 }
 
 

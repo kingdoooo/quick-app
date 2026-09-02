@@ -527,3 +527,12 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 | §7 verifier-first、独立证据、回滚只回 signer | Task 7 ③④⑤ 与回滚段（本包无 signer 变化，故任何 verifier 可单独回滚） |
 
 **明确不在本包**：signer 发 `kid`（1B）、login-flow secret（1B）、轮转演练 R1/R2（1B，且状态机要求 L3 之后）、KMS 任何东西（2A/2B）、`/fixture-session`（2A）、删 legacy 入口（3c-3）。
+
+## 实施记录与偏差（2026-09-02，实施后 /code-review 两轴复审已吸收）
+
+- **未按计划改名 `read-jwt-param → read-session-key:legacy`**（Task 6）。理由：28 个 principal 的 grant、文档标记与历史用例都挂着旧名，改名是一次纯结构性 churn；`is_secret_grant()` 已把 legacy 三条路与每 kid 一条统一成"可读密钥"判据。迁移桶按计划落地为 `--new-kid`（已声明的新 kid 在此前已能读密钥的 principal 上单列为迁移、不算扩权；未声明或此前不能读密钥仍红）。首跑（observed-1）是在该功能之前用人工审查 + `--update-baseline` 放行的，审查记录在 progress。
+- **新增 `--migrate-baseline-only`**（零 AWS 调用的结构迁移）：为了在"脚本已是 schema 4、真机观测还没跑"的窗口里让 `test_baseline_schema_is_current` 保持有意义，而不是把测试放宽。
+- **`APP_SITE_ALLOWLIST_JSON` 覆盖**：与既有 `APP_JWT_SECRET` 同款的离线 synth 开关；SSM 读失败注入的是带 `SYNTH-ONLY` 标记的占位 allowlist（不是空 `{}`），`verify_deployed_edge.sh` 的既有断言会抓。
+- **`verify_kid_entry_live.py` 冒充目标站点的真实 owner**（与 `verify_session_token_semantics.py` 相同做法），是 3c-2A 常驻夹具站点（ADR-0002）就位前的过渡；放行断言是 `== 200`，`--self-test` 不碰 AWS。
+- **COPY_FILES 加的是 `verifier_env.py`**（allowlist 装配 / legacy 开关 / 观测日志，auth 拥有、panel 复制），不是 `session_keys.py`（panel 运行时不读 config，只读环境变量）。
+- 回滚锚点：部署前给 auth/panel `publish_version` 会让闸门多出 19 条 `@version` invoke grant（版本 ARN 是资源等价类成员）；验收后已删，**下次别用 publish_version 做锚点**，用 git 重部。

@@ -191,3 +191,13 @@ def test_deploy_auth_ships_session_keys_json_and_legacy_switch_without_values():
     env_block = src[src.index("def lambda_env"):src.index("def main()")]
     assert '"SESSION_KEYS_JSON"' in env_block and '"LEGACY_ENTRY"' in env_block
     assert '"secret"' not in env_block and "token_hex" not in env_block, "环境变量里只能有参数名"
+
+
+def test_deploy_auth_legacy_param_has_one_source_of_truth():
+    """env 里的 JWT_SECRET_PARAM 与 role 精确 ARN 清单必须都来自 [SessionKeys] legacy_param，
+    不能一个硬编码一个推导——分叉的症状是运行时 AccessDenied。"""
+    src = (Path(__file__).parents[1] / "deploy_auth.py").read_text()
+    env_block = src[src.index("def lambda_env"):src.index("def main()")]
+    assert '"JWT_SECRET_PARAM": JWT_SECRET_PARAM' not in env_block, "env 值仍是硬编码常量"
+    assert "legacy_param" in env_block
+    assert "ssm_parameter_arns(" in src and "def ssm_parameter_arns" not in src, "ARN 清单应由 session_keys.ssm_parameter_arns 生成"

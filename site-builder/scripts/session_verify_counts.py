@@ -14,7 +14,7 @@ Edge 的组名前缀 `us-east-1.` 是 Lambda@Edge 的固定形态；区清单用
 
 用法（用不带路径的 python3，见 CLAUDE.md）：
     python3 site-builder/scripts/session_verify_counts.py --hours 1
-    python3 site-builder/scripts/session_verify_counts.py --hours 24 --require-total   # 总量 0 即退 1
+    python3 site-builder/scripts/session_verify_counts.py --hours 24 --require-total   # 任一 verifier 为 0 即退 1
 """
 from __future__ import annotations
 
@@ -25,9 +25,11 @@ from collections import defaultdict
 
 import boto3
 
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
+from verify_account_trust_boundary import EDGE_ORIGIN_REQUEST_FN as EDGE_FN  # noqa: E402  平台函数名的唯一定义处
+
 AUTH_FN = "site-auth-service"
 PANEL_FN = "site-panel"
-EDGE_FN = "ApplicationWebRouterStack-application-web-router"
 OUTCOMES = ("accepted_current", "accepted_previous", "accepted_legacy", "unknown_kid",
             "alg_mismatch", "wrong_audience", "wrong_token_use", "bad_signature", "expired")
 QUERY = ('fields @message | filter @message like /"event": "session_verify"/ '
@@ -49,6 +51,18 @@ def edge_log_groups(session) -> list[tuple[str, str]]:
         if any(g["logGroupName"] == name for g in groups):
             out.append((region, name))
     return out
+
+
+def require_edge_groups(groups: list) -> list:
+    """Edge 至少要在一个区留下日志组；一个都没有 = 名字/区找错了，不是"没流量"。"""
+    if not groups:
+        raise SystemExit(f"任何区都找不到 Edge 日志组 /aws/lambda/us-east-1.{EDGE_FN}——函数名或区枚举错了")
+    return groups
+
+
+def silent_verifiers(by_verifier: dict) -> list:
+    """总量为 0 的 verifier。§8 的退役判据要求**每处**埋点都在工作，不能被别处的总量遮住。"""
+    return [v for v in ("auth", "panel", "edge") if sum(by_verifier.get(v, {}).values()) == 0]
 
 
 def run_query(logs, group: str, start: int, end: int, timeout_s: int = 120) -> dict[str, int]:
@@ -85,7 +99,7 @@ def collect(session, hours: float) -> dict[str, dict[str, int]]:
     for label, fn in (("auth", AUTH_FN), ("panel", PANEL_FN)):
         by_verifier[label] = run_query(logs_east, f"/aws/lambda/{fn}", start, end)
     merged: dict[str, int] = defaultdict(int)
-    for region, group in edge_log_groups(session):
+    for region, group in require_edge_groups(edge_log_groups(session)):
         for k, v in run_query(session.client("logs", region_name=region), group, start, end).items():
             merged[k] += v
     by_verifier["edge"] = dict(merged)
@@ -109,12 +123,15 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--hours", type=float, default=1.0)
     ap.add_argument("--require-total", action="store_true",
-                    help="总量为 0 时退 1（证明埋点在工作；退役判据的另一半）")
+                    help="任一 verifier 的总量为 0 即退 1（按 auth / panel / edge 分别看：证明每处埋点都在工作，"
+                         "这是退役判据的另一半；Edge 列为 0 不能被 auth/panel 的总量遮住）")
     args = ap.parse_args(argv)
-    text, total, _legacy = render(collect(boto3.Session(), args.hours))
+    by_verifier = collect(boto3.Session(), args.hours)
+    text, _total, _legacy = render(by_verifier)
     print(text)
-    if args.require_total and total == 0:
-        print("总量为 0：三处埋点没有任何一条 session_verify——埋点没在工作，或窗口里没有请求", file=sys.stderr)
+    silent = silent_verifiers(by_verifier)
+    if args.require_total and silent:
+        print(f"这些 verifier 在窗口里没有任何 session_verify：{silent}——埋点没在工作，或窗口里没有请求", file=sys.stderr)
         return 1
     return 0
 

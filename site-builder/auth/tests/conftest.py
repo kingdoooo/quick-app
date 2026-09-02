@@ -4,6 +4,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest
 
+SITE_KID_SECRET = "site-secret-v1"          # 两把 family 假密钥的唯一定义（test_login_handler 从这里 import）
+CONSOLE_KID_SECRET = "console-secret-v1"
+
 
 @pytest.fixture(autouse=True)
 def _fake_session_key_params(monkeypatch):
@@ -15,8 +18,8 @@ def _fake_session_key_params(monkeypatch):
     自己再 monkeypatch `_ssm`，后设的覆盖本夹具。
     """
     import login_handler as lh
-    values = {"/site-builder/session-keys/site-hs-v1": "site-secret-v1",
-              "/site-builder/session-keys/console-hs-v1": "console-secret-v1"}
+    values = {"/site-builder/session-keys/site-hs-v1": SITE_KID_SECRET,
+              "/site-builder/session-keys/console-hs-v1": CONSOLE_KID_SECRET}
 
     class _SSM:
         @staticmethod

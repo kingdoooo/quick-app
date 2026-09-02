@@ -308,7 +308,7 @@ def test_meta_aud_list_case_is_anchored_on_exact_string_compare(monkeypatch):
 
 def test_meta_no_fallback_case_is_anchored_on_kid_presence(monkeypatch):
     """把"有 kid"判定换成"kid 在 allowlist 里"，未知 kid 就会回落 legacy 并被接受——那条反例必须因此转绿。"""
-    monkeypatch.setattr(session, "_has_kid", lambda header, allowlist: header.get("kid") in allowlist)
+    monkeypatch.setattr(session, "_has_kid", lambda header: header.get("kid") in SITE_AL)
     tok = resign(site_token(), LEGACY, header={"alg": "HS256", "typ": "JWT", "kid": "site-hs-v7"})
     # legacy 合同要求 typ=session；给它一个旧合同 payload 才能证明"回落后会被接受"
     tok = resign(tok, LEGACY, payload={"typ": "session", "email": "v@example.test",

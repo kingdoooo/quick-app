@@ -25,6 +25,7 @@ from jwt import PyJWKClient
 
 from session import (SESSION_TYP, mint_session_jwt, mint_upgrade_code,  # noqa: F401
                      verify_session_jwt, verify_with_legacy)
+import verifier_env
 
 _jwks_client = None  # 模块级缓存，Lambda 容器复用
 # (值, 读取时刻) —— 带 TTL，见 _secret 的说明
@@ -102,31 +103,17 @@ def _secret_by_param(param: str) -> str:
 
 
 def _allowlist(family: str) -> dict:
-    """verifier 自己那份 allowlist：kid -> {alg, secret, role}。清单来自 SESSION_KEYS_JSON
-    （只有参数名），值按参数名从 SSM 取。**缺配置直接抛**：静默空 allowlist 会把新形态
-    会话全拒而看起来像"用户没登录"。"""
-    try:
-        rows = json.loads(os.environ["SESSION_KEYS_JSON"])[family]
-    except (KeyError, ValueError) as exc:
-        raise RuntimeError(f"SESSION_KEYS_JSON 缺失或没有 {family} family——部署脚本没下发") from exc
-    return {r["kid"]: {"alg": r["alg"], "secret": _secret_by_param(r["ssm_param"]), "role": r["role"]}
-            for r in rows}
+    """本 verifier 那份 allowlist（auth 持两个 family），装配逻辑在 verifier_env（与 panel 共用一份）。"""
+    return verifier_env.load_allowlist(os.environ.get("SESSION_KEYS_JSON"), family, _secret_by_param,
+                                       allowed_families=("site", "console"))
 
 
 def _legacy_secret():
-    """legacy 入口的密钥；LEGACY_ENTRY=off（3c-3）时返回 None = 入口已删。缺配置直接抛。"""
-    flag = os.environ.get("LEGACY_ENTRY")
-    if flag not in ("on", "off"):
-        raise RuntimeError("LEGACY_ENTRY 必须是 on/off——部署脚本没下发")
-    return _secret("JWT_SECRET") if flag == "on" else None
+    return verifier_env.legacy_secret(os.environ.get("LEGACY_ENTRY"), lambda: _secret("JWT_SECRET"))
 
 
 def _log_verify_outcome(outcome: str) -> None:
-    """spec §8：固定低基数词表，**不记 token**；埋点异常一律吞掉。"""
-    try:
-        print(json.dumps({"event": "session_verify", "verifier": "auth", "outcome": outcome}))
-    except Exception:
-        pass
+    verifier_env.log_verify("auth", outcome)
 
 
 def _get_jwks_client() -> PyJWKClient:

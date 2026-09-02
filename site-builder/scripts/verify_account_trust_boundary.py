@@ -863,6 +863,7 @@ RED_FIELDS: tuple[tuple[str, str, str], ...] = (
 )
 GREEN_FIELDS: tuple[tuple[str, str], ...] = (
     ("unclassified", "基线里未分类（请标注 category）"),
+    ("migration_grants", "新 kid 的首次观测（--new-kid 已声明，且持有者此前已能读密钥；绿，可更新基线）"),
     ("improvements", "集合缩小（绿；可更新基线）"),
     ("notes",        "事实与口径（不参与红绿）"),
 )
@@ -905,6 +906,7 @@ class Report:
     iam_write_drift: list[str] = field(default_factory=list)
     boundary_drift: list[str] = field(default_factory=list)
     console_key_in_edge: list[str] = field(default_factory=list)
+    migration_grants: list[str] = field(default_factory=list)
     improvements: list[str] = field(default_factory=list)
     unclassified: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -930,8 +932,15 @@ def compare_to_baseline(observed: dict[str, dict], baseline: dict, *,
                         resource_policies: dict | None = None,
                         facts: dict | None = None,
                         coverage: dict | None = None,
-                        iam_write: dict | None = None) -> Report:
+                        iam_write: dict | None = None,
+                        new_kids: tuple = ()) -> Report:
     """observed = {fingerprint: {"name", "arn", "grants"}}。
+
+    `new_kids`：操作者用 `--new-kid` 显式声明的、**本轮首次出现**的 kid。它们的
+    `read-session-key:<kid>` 在**此前已能读某把密钥**的 principal 上不算扩权（同一批 SSM
+    前缀/通配授权自然覆盖新参数），单列进 migration_grants；在此前**不能**读密钥的 principal
+    上仍是红——那是真扩权。未声明的 kid 一律红。这是 3c 每加一把 key 都要走的迁移桶，
+    替代"看到 grew 红后人工 --update-baseline"。
 
     **红绿口径按类别分两套，这是刻意的不对称**：
 
@@ -955,7 +964,12 @@ def compare_to_baseline(observed: dict[str, dict], baseline: dict, *,
         category = base[fp].get("category")
         gained, lost = grants - was, was - grants
         if gained:
-            rep.new_grants.append(f"{p['name']}  [{fp}]  +{sorted(gained)}")
+            migr = ({x for x in gained if _is_declared_new_kid_grant(x, new_kids)}
+                    if any(is_secret_grant(x) for x in was) else set())
+            if migr:
+                rep.migration_grants.append(f"{p['name']}  [{fp}]  +{sorted(migr)}")
+            if gained - migr:
+                rep.new_grants.append(f"{p['name']}  [{fp}]  +{sorted(gained - migr)}")
         if lost:
             if category == "platform":
                 rep.missing_required.append(
@@ -1178,6 +1192,11 @@ def _compare_bucket_policy(rep: Report, base_fps, now_fps, *, texts: dict) -> No
     for fp in sorted(was - now):
         rep.bucket_policy_drift.append(
             f"bootstrap 桶少了语句 [{fp}]——**消失也红**：丢掉现有的 TLS Deny 是扩权")
+
+
+def _is_declared_new_kid_grant(grant: str, new_kids: tuple) -> bool:
+    prefix = G_READ_SESSION_KEY + ":"
+    return grant.startswith(prefix) and grant[len(prefix):] in set(new_kids)
 
 
 def _check_console_key_not_in_edge(rep: Report, facts: dict | None) -> None:
@@ -1554,33 +1573,6 @@ def assets_carrying_keys(clients, bucket: str, keys: dict[str, str],
     return {label: sorted(v) for label, v in found.items()}
 
 
-def assets_carrying_key(clients, bucket: str, live_key: str,
-                        max_size: int = 200 * 1024) -> list[str]:
-    """bootstrap 桶里**全部**仍带着当前有效密钥的对象键。
-
-    返回的是键的列表而**不是计数**：只探"当前 CloudFormation 模板指向的那一个"
-    时，「只能读旧对象」的 principal 完全不可见（Codex 复审 P1-2）。
-    每次 Edge 部署留一个新对象、旧对象不删 ⇒ 这个集合只会涨。
-
-    **连历史版本一起扫**：桶开着版本控制（noncurrent 保留 30 天），
-    对象被删之后旧版本仍可按 version ID 读到，而 `s3:GetObjectVersion`
-    是另一个动作（已进 `A_READ_OBJECT`）。IAM 里两者的资源 ARN 相同，
-    所以这里只需要键去重。
-    """
-    keys: set[str] = set()
-    paginator = clients["s3"].get_paginator("list_object_versions")
-    for page in paginator.paginate(Bucket=bucket):
-        for obj in page.get("Versions", []):
-            key = obj["Key"]
-            if key in keys or not key.endswith(".zip") or obj["Size"] > max_size:
-                continue
-            blob = clients["s3"].get_object(
-                Bucket=bucket, Key=key, VersionId=obj["VersionId"])["Body"].read()
-            if secret_in_zip_bytes(blob, live_key):
-                keys.add(key)
-    return sorted(keys)
-
-
 def function_versions(lam, names) -> dict[str, tuple[str, ...]]:
     """`{函数名: (已发布版本号…)}`（不含 `$LATEST`）。
 
@@ -1619,30 +1611,6 @@ def edge_code_arns_carrying_keys(clients, function_name: str, fn_arn: str,
             if secret_in_zip_bytes(blob, value):
                 out[label].append(arn)
     return {label: tuple(v) for label, v in out.items()}
-
-
-def edge_code_arns_carrying_key(clients, function_name: str, fn_arn: str,
-                                versions: tuple[str, ...], live_key: str) -> tuple[str, ...]:
-    """Edge 函数**及其每个仍含活密钥的已发布版本**的 ARN。
-
-    与 asset 那条同理：密钥没轮转过，所以历史版本的代码里也是这把密钥，
-    只探未限定 ARN 会漏掉「只能读某个旧版本」的 principal。逐个实测，
-    某个版本不再含活密钥时它自己就掉出集合。
-    """
-    import urllib.request
-    out = []
-    for qualifier in (None, *versions):
-        kw = {"FunctionName": function_name}
-        if qualifier:
-            kw["Qualifier"] = qualifier
-        try:
-            url = clients["lambda"].get_function(**kw)["Code"]["Location"]
-        except clients["lambda"].exceptions.ResourceNotFoundException:
-            continue
-        with urllib.request.urlopen(url) as fh:      # noqa: S310 (AWS 预签名 URL)
-            if secret_in_zip_bytes(fh.read(), live_key):
-                out.append(fn_arn if qualifier is None else f"{fn_arn}:{qualifier}")
-    return tuple(out)
 
 
 def function_aliases(lam, names) -> dict[str, tuple[str, ...]]:
@@ -1967,27 +1935,6 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
             "required": {"edge": edge_role_name, "deployer": DEPLOYER_EXEC_ROLE}}
 
 
-def migrate_baseline_2_to_3(data: dict) -> dict:
-    """schema 2 → 3 的**一次性**结构迁移。新分节由随后的实测填，这里不造数据。
-
-    唯一有语义的一步是**剥掉 `iam-policy-write:*` grant**——IAM 写移出 A 了（归 B 的
-    静态快照）。不剥的话那 22 个 principal 会各自"丢一条 grant"，而**实测其中 1 个是
-    `platform` 类**，platform 按集合等值比 ⇒ 判成 `missing_required` 红。
-    只剩空 grants 的条目（实测恰好 4 个）整条退出 A。
-    旧的 `iam_write_*` facts 一并清掉：B 不再有那套三值分类。
-    """
-    principals = {}
-    for fp, p in (data.get("principals") or {}).items():
-        kept = [g for g in p.get("grants", [])
-                if not g.startswith(LEGACY_IAM_POLICY_WRITE_PREFIX)]
-        if kept:
-            principals[fp] = {"category": p.get("category", "unclassified"), "grants": kept}
-    facts = {k: v for k, v in (data.get("facts") or {}).items()
-             if not k.startswith("iam_write_")}
-    # 历史迁移：产出的是 schema 3（再往上由 migrate_baseline_3_to_4 接手），不跟着 BASELINE_SCHEMA 走
-    return {**data, "schema": 3, "principals": principals, "facts": facts}
-
-
 def migrate_baseline_3_to_4(data: dict) -> dict:
     """schema 3 → 4 的**一次性结构迁移**（3c-1A）：只新增空的 `facts.session_keys`，
     principal / grants / 其它分节原样保留。**不是重置**：每 kid 的 grant 与事实由随后的实测
@@ -2258,8 +2205,11 @@ def main() -> int:
                          "category（配合 --update-baseline）。映射文件同样"
                          "含真实名字，**不要提交**。")
     ap.add_argument("--migrate-from-schema", type=int, metavar="N",
-                    help="一次性通道：允许读入 schema N 的旧基线并迁移（当前只支持 2→3）。"
+                    help="一次性通道：允许读入 schema N 的旧基线并迁移（当前只支持 3→4）。"
                          "配合 --update-baseline 用；平时不要带。")
+    ap.add_argument("--new-kid", action="append", metavar="KID",
+                    help="本轮首次出现的 kid（可重复）。其 read-session-key:<kid> 在此前已能读密钥的 "
+                         "principal 上单列为迁移，不算扩权；未声明的 kid 一律红。3c 每加一把 key 用一次。")
     ap.add_argument("--migrate-baseline-only", action="store_true",
                     help="不发 AWS 调用：按 --migrate-from-schema 做基线的结构迁移并写回，然后退出。"
                          "3c-1A 用它把 schema 3 的基线升到 4（只加空的 facts.session_keys）。")
@@ -2326,7 +2276,8 @@ def main() -> int:
                               resource_policies=bundle["resource_policies"],
                               facts=bundle["facts"],
                               coverage=bundle["coverage"],
-                              iam_write=bundle["iam_write"])
+                              iam_write=bundle["iam_write"],
+                              new_kids=tuple(args.new_kid or ()))
     print("\n" + rep.render())
     # 处置文案由 RED_FIELDS 的第三列驱动（`dict.fromkeys` 去重且保序）：
     # 原先这里手抄了一遍字段名单，加红字段时最容易漏的就是这一处。

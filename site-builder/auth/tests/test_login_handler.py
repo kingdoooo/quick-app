@@ -8,21 +8,13 @@ ENV = {"JWT_SECRET": "s3cret", "COGNITO_DOMAIN": "https://sso.auth.us-east-1.ama
        # 3c-1A：两个 family 的 kid 清单（只有参数名）与 legacy 入口开关；值由 _ssm 的假件按参数名给
        "SESSION_KEYS_JSON": '{"site": [{"kid": "site-hs-v1", "alg": "HS256", "role": "current", "ssm_param": "/site-builder/session-keys/site-hs-v1"}], "console": [{"kid": "console-hs-v1", "alg": "HS256", "role": "current", "ssm_param": "/site-builder/session-keys/console-hs-v1"}]}',
        "LEGACY_ENTRY": "on"}
-SITE_KID_SECRET = "site-secret-v1"
-CONSOLE_KID_SECRET = "console-secret-v1"
-PARAM_VALUES = {"/site-builder/session-keys/site-hs-v1": SITE_KID_SECRET,
-                "/site-builder/session-keys/console-hs-v1": CONSOLE_KID_SECRET}
-
-
-class _FakeSSM:
-    @staticmethod
-    def get_parameter(Name, WithDecryption=False):
-        return {"Parameter": {"Value": PARAM_VALUES[Name]}}
+from conftest import CONSOLE_KID_SECRET, SITE_KID_SECRET  # 假 SSM 在 conftest 的 autouse 夹具里，值只定义一处
 
 
 def _use_fake_ssm(monkeypatch):
+    """autouse 夹具已经装好假 SSM；这里只清缓存，保留调用点以示意图。"""
+    del monkeypatch
     lh._secret_cache.clear()
-    monkeypatch.setattr(lh, "_ssm", lambda: _FakeSSM())
 
 
 def _kid_session(email="u@x.com", **kw):
