@@ -197,6 +197,39 @@ if grep -qE '^\s+if claims\.get\("typ"\) != "session":' "$TMP/index.py"; then
 else
   fail "产物的 _verify_session_jwt 没有 typ 检查 —— M05 未生效：一个 60 秒的 console 升级码就是一个有效站点会话，且能在 /console-session 无限续期"
 fi
+# ---- 3c-1A：site family 的 kid allowlist + legacy 入口开关（spec §4.3 / §11.6）----
+# 产物里的 allowlist 必须**恰好**是 site-builder/config.ini [SessionKeys] 的 site family（不多不少、
+# 不含 console），legacy 开关必须与 legacy_param 是否非空一致，且新入口的"未知 kid 直接拒"分支在。
+# 比对只取 kid，**不打印 secret**。
+SK_EXPECTED="$(python3 - "$ROOT" <<'PY'
+import sys
+from pathlib import Path
+root = Path(sys.argv[1]); sys.path.insert(0, str(root / "site-builder" / "auth"))
+from session_keys import load_session_keys
+k = load_session_keys(root / "site-builder" / "config.ini")
+print(",".join(sorted(r.kid for r in k.allowlist("site"))), "on" if k.legacy_param else "off")
+PY
+)"
+SK_DEPLOYED="$(python3 - "$TMP/index.py" <<'PY'
+import json, re, sys
+src = open(sys.argv[1]).read()
+m = re.search(r"^SITE_ALLOWLIST_JSON = \'\'\'(.*?)\'\'\'$", src, re.S | re.M)
+le = re.search(r'^LEGACY_ENTRY = "(on|off)"', src, re.M)   # 行尾有注释，不锚 $
+if not m or not le:
+    print("MISSING"); sys.exit(0)
+print(",".join(sorted(json.loads(m.group(1)))), le.group(1))
+PY
+)"
+if [ "$SK_DEPLOYED" = "$SK_EXPECTED" ]; then
+  echo "PASS  Edge allowlist 的 kid 集合与 legacy 开关 == config（$SK_EXPECTED）"
+else
+  fail "Edge allowlist/legacy 开关与 config 不一致：产物=[$SK_DEPLOYED] 期望=[$SK_EXPECTED]"
+fi
+if grep -qE '^\s+return None, "unknown_kid"' "$TMP/index.py"; then
+  echo "PASS  未知 kid 直接拒、不回落 legacy（状态机第 5 条）"
+else
+  fail "产物的 verifier 没有 unknown_kid 分支 —— 部署的是 3c-1A 之前的代码"
+fi
 # 同名 sb_session 必须**逐个**验，且**不得截断**：条数上限会按路径深度让 M06 复活
 # （可遮蔽条数上界 4n−2，n 是路径段数，站点 URL 空间不受平台约束 ⇒ n 无界）。
 if grep -qE '^\s+for token in _get_cookies\(request, "sb_session"\):' "$TMP/index.py"; then

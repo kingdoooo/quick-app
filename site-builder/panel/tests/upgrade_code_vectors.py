@@ -30,3 +30,15 @@ MUTATIONS = [
     ("段数不足", lambda c: c.rsplit(".", 1)[0], True),
     ("空串", lambda c: "", True),
 ]
+
+
+# ---- 3c-1A：新形态（带 kid）的 console family 向量，两侧各跑一遍 ----
+# auth 侧用 session.verify_with_legacy 验，panel 侧经 console_session.consume_code 验：
+# 同一组 MUTATIONS 施加在 mint_token 签出的升级码上，接受/拒绝结果两侧必须一致。
+CONSOLE_KID = "console-hs-v1"
+CONSOLE_KID_SECRET = "console-secret-v1-not-a-real-one"
+CONSOLE_ALLOWLIST = {CONSOLE_KID: {"alg": "HS256", "secret": CONSOLE_KID_SECRET, "role": "current"}}
+SITE_KID = "site-hs-v1"
+SITE_KID_SECRET = "site-secret-v1-not-a-real-one"
+CONSOLE_KEYS_JSON = '{"console": [{"kid": "console-hs-v1", "alg": "HS256", "role": "current", ' \
+                    '"ssm_param": "/site-builder/session-keys/console-hs-v1"}]}'

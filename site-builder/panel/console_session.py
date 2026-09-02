@@ -10,6 +10,7 @@
 TTL 缓存（照抄 auth 的 _secret 模式）。**明文严禁进环境变量**——
 GetFunctionConfiguration 会原样回显，拿到 JWT_SECRET 即可伪造任意用户会话。
 """
+import json
 import os
 import time
 from datetime import datetime, timezone
@@ -38,13 +39,12 @@ class CsrfRejected(Exception):
     """前置校验未过。handler 转 403，且**此时尚未发生任何副作用**。"""
 
 
-def _secret() -> str:
-    """从 SSM 读 JWT 密钥，带 TTL 缓存。
+def _secret_by_param(name: str) -> str:
+    """按 SSM 参数名读密钥，带 TTL 缓存。
 
     TTL 不可省：无 TTL 时轮转密钥后 warm 容器会永久用旧值，表现为
     "部分请求验签失败"这种极难查的间歇故障（auth 的既有教训）。
     """
-    name = os.environ["JWT_SECRET_PARAM"]
     hit = _secret_cache.get(name)
     if hit is not None and time.monotonic() - hit[1] < SECRET_TTL_SECONDS:
         return hit[0]
@@ -53,6 +53,42 @@ def _secret() -> str:
             Name=name, WithDecryption=True)["Parameter"]["Value"]
     _secret_cache[name] = (value, time.monotonic())
     return value
+
+
+def _secret() -> str:
+    """legacy 入口的密钥（拆 family 之前的共享 jwt-secret）。"""
+    return _secret_by_param(os.environ["JWT_SECRET_PARAM"])
+
+
+def _console_allowlist() -> dict:
+    """panel 自己那份 allowlist：**只有 console family**（spec §4.3）。
+
+    SESSION_KEYS_JSON 里出现别的 family 就是部署配置错了，直接拒：panel 拿到 site 的
+    key 等于 panel 被攻破 ⇒ 伪造站点会话。缺配置同样直接抛，不静默成空 allowlist。
+    """
+    try:
+        keys = json.loads(os.environ["SESSION_KEYS_JSON"])
+    except (KeyError, ValueError) as exc:
+        raise RuntimeError("SESSION_KEYS_JSON 缺失或不是 JSON——部署脚本没下发") from exc
+    if set(keys) != {"console"}:
+        raise RuntimeError(f"panel 的 SESSION_KEYS_JSON 只能含 console family，现在是 {sorted(keys)}")
+    return {r["kid"]: {"alg": r["alg"], "secret": _secret_by_param(r["ssm_param"]), "role": r["role"]}
+            for r in keys["console"]}
+
+
+def _legacy_secret():
+    flag = os.environ.get("LEGACY_ENTRY")
+    if flag not in ("on", "off"):
+        raise RuntimeError("LEGACY_ENTRY 必须是 on/off——部署脚本没下发")
+    return _secret() if flag == "on" else None
+
+
+def _log_verify(outcome: str) -> None:
+    """spec §8：固定低基数词表，**不记 token**；埋点异常一律吞掉。"""
+    try:
+        print(json.dumps({"event": "session_verify", "verifier": "panel", "outcome": outcome}))
+    except Exception:
+        pass
 
 
 def _codes_table():
@@ -79,7 +115,10 @@ def consume_code(code: str, *, expected_email: str) -> str:
     而"忘记传"恰好退化成原来那个缺陷。
     """
     import botocore.exceptions
-    claims = session.verify_upgrade_code(code or "", _secret())
+    claims, outcome = session.verify_with_legacy(code or "", allowlist=_console_allowlist(),
+                                                 token_use="console-upgrade",
+                                                 legacy_secret=_legacy_secret())
+    _log_verify(outcome)
     if not claims:
         raise UpgradeRejected("升级码无效或已过期")
     # **空值不得视为相等**（同 verify_console_cookie 的理由）：两边都空时
@@ -128,14 +167,14 @@ def verify_console_cookie(cookie_header: str, *, x_user_email: str) -> str:
             break
     if not token:
         raise UpgradeRejected("缺少面板会话")
-    claims = session.verify_session_jwt(token, _secret(),
-                                        expected_typ=session.SESSION_TYP)
+    # 3c-1A：新形态按 token_use=console-session + aud 验；legacy 形态按旧合同
+    # （typ=session + scope=console）验——两条都在 verify_with_legacy 里，这里不再手查 scope。
+    claims, outcome = session.verify_with_legacy(token, allowlist=_console_allowlist(),
+                                                 token_use="console-session",
+                                                 legacy_secret=_legacy_secret())
+    _log_verify(outcome)
     if not claims:
         raise UpgradeRejected("面板会话无效或已过期")
-    if claims.get("scope") != CONSOLE_SCOPE:
-        # 只有站点会话（typ=session 但无 scope）会落在这里；upgrade code
-        # 早在上面的 typ 检查就被拒了（M05 之前它是靠这一行兜住的）。
-        raise UpgradeRejected("该会话不是面板会话")
     # **空值不得视为相等**：两边都空时 `==` 成立，等于放行一个无身份请求
     if not x_user_email or claims.get("email") != x_user_email:
         raise UpgradeRejected("面板会话与当前登录身份不一致")

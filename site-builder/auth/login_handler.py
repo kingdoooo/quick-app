@@ -23,7 +23,8 @@ import urllib.request
 import jwt as pyjwt
 from jwt import PyJWKClient
 
-from session import SESSION_TYP, mint_session_jwt, mint_upgrade_code, verify_session_jwt
+from session import (SESSION_TYP, mint_session_jwt, mint_upgrade_code,  # noqa: F401
+                     verify_session_jwt, verify_with_legacy)
 
 _jwks_client = None  # 模块级缓存，Lambda 容器复用
 # (值, 读取时刻) —— 带 TTL，见 _secret 的说明
@@ -88,6 +89,44 @@ def _secret(name: str) -> str:
         "Parameter"]["Value"]
     _secret_cache[name] = (value, time.monotonic())
     return value
+
+
+def _secret_by_param(param: str) -> str:
+    """按 SSM 参数名取密钥，TTL 缓存与 _secret 同一套（3c-1A：一个 family 一把 HS 密钥）。"""
+    hit = _secret_cache.get(param)
+    if hit is not None and time.monotonic() - hit[1] < SECRET_TTL_SECONDS:
+        return hit[0]
+    value = _ssm().get_parameter(Name=param, WithDecryption=True)["Parameter"]["Value"]
+    _secret_cache[param] = (value, time.monotonic())
+    return value
+
+
+def _allowlist(family: str) -> dict:
+    """verifier 自己那份 allowlist：kid -> {alg, secret, role}。清单来自 SESSION_KEYS_JSON
+    （只有参数名），值按参数名从 SSM 取。**缺配置直接抛**：静默空 allowlist 会把新形态
+    会话全拒而看起来像"用户没登录"。"""
+    try:
+        rows = json.loads(os.environ["SESSION_KEYS_JSON"])[family]
+    except (KeyError, ValueError) as exc:
+        raise RuntimeError(f"SESSION_KEYS_JSON 缺失或没有 {family} family——部署脚本没下发") from exc
+    return {r["kid"]: {"alg": r["alg"], "secret": _secret_by_param(r["ssm_param"]), "role": r["role"]}
+            for r in rows}
+
+
+def _legacy_secret():
+    """legacy 入口的密钥；LEGACY_ENTRY=off（3c-3）时返回 None = 入口已删。缺配置直接抛。"""
+    flag = os.environ.get("LEGACY_ENTRY")
+    if flag not in ("on", "off"):
+        raise RuntimeError("LEGACY_ENTRY 必须是 on/off——部署脚本没下发")
+    return _secret("JWT_SECRET") if flag == "on" else None
+
+
+def _log_verify_outcome(outcome: str) -> None:
+    """spec §8：固定低基数词表，**不记 token**；埋点异常一律吞掉。"""
+    try:
+        print(json.dumps({"event": "session_verify", "verifier": "auth", "outcome": outcome}))
+    except Exception:
+        pass
 
 
 def _get_jwks_client() -> PyJWKClient:
@@ -524,13 +563,18 @@ def handler(event, context):
         # typ=session 的候选"，不是"header 里的第一条"。理由见
         # `_session_cookie_candidates`（站点 JS 能在更长的 Path 上新建一条
         # 遮蔽项，只取第一条会让控制台写操作持久 302）。
-        jwt_secret = _secret("JWT_SECRET")
-        claims = None
+        # 3c-1A：「2 + 1」入口——site family 的 kid allowlist + legacy 入口（状态机 L1）。
+        # 有 kid 但不在 allowlist 直接拒、不回落；没有 kid 且 legacy 开着才按旧合同验。
+        site_allowlist = _allowlist("site")
+        legacy_secret = _legacy_secret()
+        claims, outcome = None, "bad_signature"
         for candidate in _session_cookie_candidates(event):
-            claims = verify_session_jwt(candidate, jwt_secret,
-                                        expected_typ=SESSION_TYP)
+            claims, outcome = verify_with_legacy(candidate, allowlist=site_allowlist,
+                                                 token_use="site-session",
+                                                 legacy_secret=legacy_secret)
             if claims:
                 break
+        _log_verify_outcome(outcome)
         if not claims:
             # 无有效会话（缺失/过期/签名不过/typ 不符——例如把升级码当会话递
             # 进来，这一条是安全信号而非日常）：走完整登录，登录后**回到本

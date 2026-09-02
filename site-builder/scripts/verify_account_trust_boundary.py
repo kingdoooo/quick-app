@@ -157,9 +157,12 @@ BASELINE_PATH = _HERE / "account_trust_baseline.json"
 CONFIG_PATH = _SITE_BUILDER / "config.ini"
 APP_PY = _SITE_BUILDER / "deployer" / "infra" / "app.py"
 
-BASELINE_SCHEMA = 3
+BASELINE_SCHEMA = 4      # 3c-1A：facts.session_keys（每 kid 的 Edge 产物计数）
 JWT_PARAM_NAME = "/site-builder/jwt-secret"
 DEPLOYER_EXEC_ROLE = "site-deployer-exec-role"
+# 3c-1A：[SessionKeys] 的唯一定义在 auth/session_keys.py；闸门按它枚举两把 HS family 密钥的参数名
+sys.path.insert(0, str(_SITE_BUILDER / "auth"))
+from session_keys import load_session_keys  # noqa: E402
 
 # Edge 函数名：router 栈的两个 Lambda@Edge 里，**origin-request 那个**才内联着
 # 会话密钥（`stack.py` 把 `{{JWT_SECRET}}` 替换进它）。origin-response 不验签。
@@ -193,6 +196,14 @@ G_READ_EDGE_CODE = "read-edge-code"
 G_READ_EDGE_ASSET = "read-edge-asset"
 G_READ_JWT_PARAM = "read-jwt-param"
 SECRET_GRANTS = (G_READ_EDGE_CODE, G_READ_EDGE_ASSET, G_READ_JWT_PARAM)
+# 3c-1A：两把 HS family 密钥各自一条 grant `read-session-key:<kid>`，**不与 legacy 合并**——
+# 「谁能读 site 的 key」与「谁能读 console 的 key」分得开，是 spec §4.1 两个 family 的全部意义。
+G_READ_SESSION_KEY = "read-session-key"
+
+
+def is_secret_grant(grant: str) -> bool:
+    """能直接取得某把会话签名密钥的 grant（legacy 三条路 + 每 kid 一条）。"""
+    return grant in SECRET_GRANTS or grant.startswith(G_READ_SESSION_KEY + ":")
 
 # **IAM 写不再是 A 的一条 grant。** 它移到 B——那一层是纯静态文本快照，明确不声称
 # 提权链。这个前缀只为 schema 2→3 迁移保留：旧基线里 22 个 principal 带着
@@ -349,6 +360,8 @@ class Targets:
     jwt_parameter: str
     alias_arns: dict[str, tuple[str, ...]] = field(default_factory=dict)
     version_arns: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    # 3c-1A：kid → 该 family HS 密钥的 SSM 参数 ARN（legacy 仍在 jwt_parameter）
+    session_key_parameters: dict[str, str] = field(default_factory=dict)
 
     def function_resources(self) -> list[str]:
         out = list(self.platform_functions) + list(self.site_functions)
@@ -359,7 +372,8 @@ class Targets:
         return sorted(set(out))
 
     def other_resources(self) -> list[str]:
-        return sorted(set(self.edge_assets) | {self.jwt_parameter})
+        return sorted(set(self.edge_assets) | {self.jwt_parameter}
+                      | set(self.session_key_parameters.values()))
 
 
 # 动作 → 动作等价类名。coverage 的成员指纹按**类**记，不按单个动作
@@ -458,6 +472,9 @@ def undecided_resource_class(resource: str, t: "Targets") -> str:
         return "unattributed"
     if resource == t.jwt_parameter:
         return "jwt-param"
+    for kid, arn in t.session_key_parameters.items():
+        if resource == arn:
+            return f"session-key:{kid}"
     if resource in t.edge_assets:
         return "edge-asset"
     if resource in t.edge_code_arns:
@@ -535,6 +552,9 @@ def grants_from_decisions(decisions: dict[str, str], t: Targets) -> set[str]:
         grants.add(G_READ_EDGE_ASSET)
     if allowed(A_READ_PARAM, (t.jwt_parameter,)):
         grants.add(G_READ_JWT_PARAM)
+    for kid, arn in t.session_key_parameters.items():
+        if allowed(A_READ_PARAM, (arn,)):
+            grants.add(f"{G_READ_SESSION_KEY}:{kid}")
     return grants
 
 
@@ -839,6 +859,7 @@ RED_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("new_undecided_items",  "新增判不出的项（红）",                          "undecided"),
     ("iam_write_drift",      "IAM 写语句快照漂移（红）",                      "iam"),
     ("boundary_drift",       "permissions boundary 漂移（红）",               "iam"),
+    ("console_key_in_edge",  "Edge 产物含 console family 的密钥（红）",       "console-in-edge"),
 )
 GREEN_FIELDS: tuple[tuple[str, str], ...] = (
     ("unclassified", "基线里未分类（请标注 category）"),
@@ -848,6 +869,9 @@ GREEN_FIELDS: tuple[tuple[str, str], ...] = (
 # 每个红字段都要有一条**处置**文案：闸门红了但不说该怎么办，等于把判断推给下一个人，
 # 而最省力的"处置"永远是更新基线。
 RED_MESSAGES = {
+    "console-in-edge": ("闸门红：Edge 的产物（代码版本或 bootstrap asset）里测到了 console family 的密钥。"
+                        "spec §4.1：Edge 的 allowlist 里不出现 console 的 key，否则 panel signer 被攻破 ⇒ "
+                        "伪造站点会话。先查 router/infrastructure/stack.py 的 load_site_allowlist 只取 site family。"),
     "grew": ("闸门红：账号里能冒充任意用户的授权面**变大了**。这不是又出了一个新缺陷，"
              "而是既有暴露面扩张。处理方式见 docs/security/account-trust-boundary.md。"),
     "lost": ("闸门红：平台自己的必需 invoke 权限丢了。真机症状是全站 403（Edge）或每次"
@@ -880,6 +904,7 @@ class Report:
     new_undecided_items: list[str] = field(default_factory=list)
     iam_write_drift: list[str] = field(default_factory=list)
     boundary_drift: list[str] = field(default_factory=list)
+    console_key_in_edge: list[str] = field(default_factory=list)
     improvements: list[str] = field(default_factory=list)
     unclassified: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -977,6 +1002,7 @@ def compare_to_baseline(observed: dict[str, dict], baseline: dict, *,
         _compare_iam_write(rep, baseline, iam_write)
 
     _compare_facts(rep, baseline.get("facts") or {}, facts)
+    _check_console_key_not_in_edge(rep, facts)
     return rep
 
 
@@ -1152,6 +1178,18 @@ def _compare_bucket_policy(rep: Report, base_fps, now_fps, *, texts: dict) -> No
     for fp in sorted(was - now):
         rep.bucket_policy_drift.append(
             f"bootstrap 桶少了语句 [{fp}]——**消失也红**：丢掉现有的 TLS Deny 是扩权")
+
+
+def _check_console_key_not_in_edge(rep: Report, facts: dict | None) -> None:
+    """spec §4.1 的闸门形态：console family 的密钥在 Edge 产物里出现即**红**，不是事实类 note。"""
+    for kid, row in ((facts or {}).get("session_keys") or {}).items():
+        if not kid.startswith("console-"):       # kid 格式 {family}-{alg}-v{n}，由 session_keys.KID_RE 保证
+            continue
+        n = int(row.get("edge_code_targets_carrying_key", 0)) + int(row.get("edge_assets_carrying_key", 0))
+        if n:
+            rep.console_key_in_edge.append(
+                f"{kid}：{row.get('edge_code_targets_carrying_key', 0)} 个 Edge 代码目标 + "
+                f"{row.get('edge_assets_carrying_key', 0)} 个 asset 带着它")
 
 
 def _compare_facts(rep: Report, base_facts: dict, now_facts: dict | None) -> None:
@@ -1495,6 +1533,27 @@ def edge_asset_location(clients, function_name: str) -> tuple[str, str]:
                      f"它可能改成了内联代码，这条路要重新判定")
 
 
+def assets_carrying_keys(clients, bucket: str, keys: dict[str, str],
+                         max_size: int = 200 * 1024) -> dict[str, list[str]]:
+    """`assets_carrying_key` 的多密钥形态（3c-1A）：每个对象只下载一次，对每把密钥各判一次。
+    返回 {label: [key…]}，label 是 "legacy" 或 kid。"""
+    found: dict[str, set[str]] = {label: set() for label in keys}
+    seen: set[str] = set()
+    paginator = clients["s3"].get_paginator("list_object_versions")
+    for page in paginator.paginate(Bucket=bucket):
+        for obj in page.get("Versions", []):
+            key = obj["Key"]
+            if key in seen or not key.endswith(".zip") or obj["Size"] > max_size:
+                continue
+            seen.add(key)
+            blob = clients["s3"].get_object(
+                Bucket=bucket, Key=key, VersionId=obj["VersionId"])["Body"].read()
+            for label, value in keys.items():
+                if secret_in_zip_bytes(blob, value):
+                    found[label].add(key)
+    return {label: sorted(v) for label, v in found.items()}
+
+
 def assets_carrying_key(clients, bucket: str, live_key: str,
                         max_size: int = 200 * 1024) -> list[str]:
     """bootstrap 桶里**全部**仍带着当前有效密钥的对象键。
@@ -1538,6 +1597,28 @@ def function_versions(lam, names) -> dict[str, tuple[str, ...]]:
         if versions:
             out[name] = tuple(sorted(versions, key=lambda v: int(v)))
     return out
+
+
+def edge_code_arns_carrying_keys(clients, function_name: str, fn_arn: str,
+                                 versions: tuple[str, ...], keys: dict[str, str]) -> dict[str, tuple]:
+    """`edge_code_arns_carrying_key` 的多密钥形态（3c-1A）：每个版本只下载一次。"""
+    import urllib.request
+    out: dict[str, list[str]] = {label: [] for label in keys}
+    for qualifier in (None, *versions):
+        kw = {"FunctionName": function_name}
+        if qualifier:
+            kw["Qualifier"] = qualifier
+        try:
+            url = clients["lambda"].get_function(**kw)["Code"]["Location"]
+        except clients["lambda"].exceptions.ResourceNotFoundException:
+            continue
+        with urllib.request.urlopen(url) as fh:      # noqa: S310 (AWS 预签名 URL)
+            blob = fh.read()
+        arn = fn_arn if qualifier is None else f"{fn_arn}:{qualifier}"
+        for label, value in keys.items():
+            if secret_in_zip_bytes(blob, value):
+                out[label].append(arn)
+    return {label: tuple(v) for label, v in out.items()}
 
 
 def edge_code_arns_carrying_key(clients, function_name: str, fn_arn: str,
@@ -1667,6 +1748,22 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
 
     live_key = clients["ssm"].get_parameter(
         Name=JWT_PARAM_NAME, WithDecryption=True)["Parameter"]["Value"]
+    # 3c-1A：两个 HS key family 的密钥也是"读到即能签"的目标；legacy 仍单列。
+    session_keys = load_session_keys(CONFIG_PATH)
+    if session_keys.legacy_param != JWT_PARAM_NAME:
+        raise SystemExit(f"[SessionKeys] legacy_param={session_keys.legacy_param!r} 与闸门的 "
+                         f"JWT_PARAM_NAME={JWT_PARAM_NAME!r} 不一致——两处必须指同一把 legacy 密钥")
+    key_values: dict[str, str] = {"legacy": live_key}
+    kid_family: dict[str, str] = {}
+    kid_param: dict[str, str] = {}
+    for fam in ("site", "console"):
+        for ref in session_keys.allowlist(fam):
+            if ref.alg != "HS256":
+                continue
+            key_values[ref.kid] = clients["ssm"].get_parameter(
+                Name=ref.ssm_param, WithDecryption=True)["Parameter"]["Value"]
+            kid_family[ref.kid] = fam
+            kid_param[ref.kid] = ref.ssm_param
     facts: dict[str, object] = {}
 
     aliases = function_aliases(lam, all_functions)
@@ -1674,18 +1771,28 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
 
     # ---- 密钥的物化位置：**实测**，不假设 ----
     edge_versions = versions.get(EDGE_ORIGIN_REQUEST_FN, ())
-    edge_code = edge_code_arns_carrying_key(
+    edge_code_by = edge_code_arns_carrying_keys(
         clients, EDGE_ORIGIN_REQUEST_FN, fn_arn(EDGE_ORIGIN_REQUEST_FN),
-        edge_versions, live_key)
-    facts["edge_code_targets_carrying_live_key"] = len(edge_code)
+        edge_versions, key_values)
+    facts["edge_code_targets_carrying_live_key"] = len(edge_code_by["legacy"])
 
     asset_bucket, asset_key = edge_asset_location(clients, EDGE_ORIGIN_REQUEST_FN)
     if scan_assets:
-        asset_keys = assets_carrying_key(clients, asset_bucket, live_key)
+        asset_by = assets_carrying_keys(clients, asset_bucket, key_values)
     else:
         blob = clients["s3"].get_object(Bucket=asset_bucket, Key=asset_key)["Body"].read()
-        asset_keys = [asset_key] if secret_in_zip_bytes(blob, live_key) else []
+        asset_by = {label: ([asset_key] if secret_in_zip_bytes(blob, v) else [])
+                    for label, v in key_values.items()}
         print("（--no-asset-scan：只看当前 asset，历史对象未扫）", file=sys.stderr)
+    # 每 kid 一组事实；console family 在 Edge 产物里出现由 compare_to_baseline 判红
+    # 只放整数（基线红线要求 facts 的叶子全是整数）；family 由 kid 前缀决定（session_keys.KID_RE 保证格式）
+    facts["session_keys"] = {
+        kid: {"edge_code_targets_carrying_key": len(edge_code_by[kid]),
+              "edge_assets_carrying_key": len(asset_by[kid])}
+        for kid in kid_family}
+    # 读到**任一**把密钥都等于能签 ⇒ 目标集合取并集；legacy 那两个计数单列在上面
+    edge_code = tuple(sorted(set().union(*(set(v) for v in edge_code_by.values()))))
+    asset_keys = sorted(set().union(*(set(v) for v in asset_by.values())))
     if asset_key not in asset_keys and scan_assets:
         # 当前部署的 asset 不含活密钥 = 根治已生效（或密钥刚轮转）。这是好消息，
         # 但要说出来——它会让 read-edge-asset 的资源集合变小。
@@ -1698,6 +1805,8 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
         edge_code_arns=edge_code,
         edge_assets=tuple(f"arn:aws:s3:::{asset_bucket}/{k}" for k in asset_keys),
         jwt_parameter=f"arn:aws:ssm:{region}:{account}:parameter{JWT_PARAM_NAME}",
+        session_key_parameters={kid: f"arn:aws:ssm:{region}:{account}:parameter{p}"
+                                for kid, p in kid_param.items()},
         alias_arns={fn_arn(n): tuple(f"{fn_arn(n)}:{a}" for a in al)
                     for n, al in aliases.items()},
         version_arns={fn_arn(n): tuple(f"{fn_arn(n)}:{v}" for v in vs)
@@ -1875,7 +1984,17 @@ def migrate_baseline_2_to_3(data: dict) -> dict:
             principals[fp] = {"category": p.get("category", "unclassified"), "grants": kept}
     facts = {k: v for k, v in (data.get("facts") or {}).items()
              if not k.startswith("iam_write_")}
-    return {**data, "schema": BASELINE_SCHEMA, "principals": principals, "facts": facts}
+    # 历史迁移：产出的是 schema 3（再往上由 migrate_baseline_3_to_4 接手），不跟着 BASELINE_SCHEMA 走
+    return {**data, "schema": 3, "principals": principals, "facts": facts}
+
+
+def migrate_baseline_3_to_4(data: dict) -> dict:
+    """schema 3 → 4 的**一次性结构迁移**（3c-1A）：只新增空的 `facts.session_keys`，
+    principal / grants / 其它分节原样保留。**不是重置**：每 kid 的 grant 与事实由随后的实测
+    填进来并按"新增即红"审过再写基线（spec §6.2 3c-3 一节反对全量重置的理由同样适用）。"""
+    facts = dict(data.get("facts") or {})
+    facts.setdefault("session_keys", {})
+    return {**data, "schema": BASELINE_SCHEMA, "facts": facts}
 
 
 def load_baseline(path: Path, *, migrate_from: int | None = None) -> dict:
@@ -1894,12 +2013,12 @@ def load_baseline(path: Path, *, migrate_from: int | None = None) -> dict:
         raise SystemExit(
             f"基线 schema 是 {got}，脚本要 {BASELINE_SCHEMA}。直接比会把每个 principal 都"
             f"报成新增。一次性迁移：--update-baseline --migrate-from-schema {got}")
-    if migrate_from != got or (got, BASELINE_SCHEMA) != (2, 3):
+    if migrate_from != got or (got, BASELINE_SCHEMA) != (3, 4):
         raise SystemExit(
-            f"只支持 schema 2→3 的一次性迁移（--migrate-from-schema {migrate_from}，"
+            f"只支持 schema 3→4 的一次性迁移（--migrate-from-schema {migrate_from}，"
             f"文件里是 {got}，脚本是 {BASELINE_SCHEMA}）")
     print(f"（一次性迁移基线 schema {got} → {BASELINE_SCHEMA}）", file=sys.stderr)
-    return migrate_baseline_2_to_3(data)
+    return migrate_baseline_3_to_4(data)
 
 
 def _nonempty_str(v) -> bool:
@@ -1949,7 +2068,10 @@ BUNDLE_SHAPE: dict = {
                           "bootstrap_bucket_texts": dict},
     "facts": {"edge_code_targets_carrying_live_key": _plain_int,
               "edge_assets_carrying_live_key": _plain_int,
-              "principals_with_missing_context": _plain_int},
+              "principals_with_missing_context": _plain_int,
+              # 3c-1A：每 kid 一组；键是 kid（不是账号值），成员按同一份子规格校验
+              "session_keys": {"*": {"edge_code_targets_carrying_key": _plain_int,
+                                     "edge_assets_carrying_key": _plain_int}}},
     "coverage": {"undecided_items": _list_of_str},
     "iam_write": {"statements": dict, "boundaries": dict,
                   "managed_versions": dict, "texts": dict},
@@ -2138,10 +2260,21 @@ def main() -> int:
     ap.add_argument("--migrate-from-schema", type=int, metavar="N",
                     help="一次性通道：允许读入 schema N 的旧基线并迁移（当前只支持 2→3）。"
                          "配合 --update-baseline 用；平时不要带。")
+    ap.add_argument("--migrate-baseline-only", action="store_true",
+                    help="不发 AWS 调用：按 --migrate-from-schema 做基线的结构迁移并写回，然后退出。"
+                         "3c-1A 用它把 schema 3 的基线升到 4（只加空的 facts.session_keys）。")
     ap.add_argument("--no-asset-scan", action="store_true",
                     help="跳过「bootstrap 桶里有多少 asset 带活密钥」那一遍扫描"
                          "（默认做；它要读几十个小对象）")
     args = ap.parse_args()
+    if args.migrate_baseline_only:
+        if args.migrate_from_schema is None:
+            raise SystemExit("--migrate-baseline-only 需要 --migrate-from-schema N")
+        migrated = load_baseline(BASELINE_PATH, migrate_from=args.migrate_from_schema)
+        BASELINE_PATH.write_text(json.dumps(migrated, ensure_ascii=False, indent=2) + "\n",
+                                 encoding="utf-8")
+        print(f"已把 {BASELINE_PATH} 结构迁移到 schema {migrated['schema']}（未发任何 AWS 调用）")
+        return 0
     check_flag_combination(args)
 
     # **纯 dump 模式不读基线**：迁移期第一次跑 `--dump-observed` 时仓库里的基线还是

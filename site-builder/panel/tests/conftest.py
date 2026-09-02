@@ -30,6 +30,11 @@ ENV = {"JOBS_TABLE": "site-deploy-jobs", "SITES_TABLE": "site-sites",
        "ACCESS_EVENTS_TABLE": "site-access-events",
        "ACCESS_DAILY_TABLE": "site-access-daily",
        "JWT_SECRET_PARAM": "/site-builder/jwt-secret",
+       # 3c-1A：console family 的 kid 清单（只有参数名，没有值）与 legacy 入口开关。
+       # 形态与 deploy_panel.lambda_environment() 一致；**不含 site family**（panel 不得持它）。
+       "SESSION_KEYS_JSON": '{"console": [{"kid": "console-hs-v1", "alg": "HS256", "role": "current", '
+                            '"ssm_param": "/site-builder/session-keys/console-hs-v1"}]}',
+       "LEGACY_ENTRY": "on",
        "CONSOLE_HOST": "console.example.com",
        # Edge 执行角色的 RoleId：handler 用它确认调用者真是 Edge（P1-1）。
        # 与 test_handler.EDGE_ROLE_ID 必须一致。
@@ -152,6 +157,9 @@ def secret(monkeypatch):
     _secret 自身的行为（读 SSM、TTL 缓存）另有专门用例覆盖。
     """
     import console_session
-    from upgrade_code_vectors import SECRET
-    monkeypatch.setattr(console_session, "_secret", lambda: SECRET)
+    from upgrade_code_vectors import SECRET, CONSOLE_KID_SECRET
+    values = {"/site-builder/jwt-secret": SECRET,
+              "/site-builder/session-keys/console-hs-v1": CONSOLE_KID_SECRET}
+    # 3c-1A：密钥按 SSM 参数名取（legacy 与 console family 各一把），patch 的是同一个入口
+    monkeypatch.setattr(console_session, "_secret_by_param", lambda name: values[name])
     return SECRET

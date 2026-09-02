@@ -19,6 +19,7 @@ _SUBS = {
     "{{TRUSTED_IDPS}}": "Feishu",
     "{{ACCESS_TABLE}}": "site-access-events",
     "{{ACCESS_REPLICA_REGIONS}}": "us-east-1,ap-southeast-1,ap-northeast-1",
+    "{{SITE_ALLOWLIST_JSON}}": '{"site-hs-v1": {"alg": "HS256", "secret": "site-secret-v1", "role": "current"}}', "{{LEGACY_ENTRY}}": "on",
 }
 for _k, _v in _SUBS.items():
     _SRC = _SRC.replace(_k, _v)

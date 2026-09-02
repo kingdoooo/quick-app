@@ -40,6 +40,9 @@ import boto3
 HERE = Path(__file__).parent
 CFG = configparser.ConfigParser(interpolation=None)
 CFG.read(HERE.parent / "config.ini")
+# 3c-1A：[SessionKeys] 的唯一定义在 auth/session_keys.py（构建期 import，不进包——运行时只读环境变量）
+sys.path.insert(0, str(HERE.parent / "auth"))
+from session_keys import env_json, legacy_entry, load_session_keys  # noqa: E402
 
 
 def _cfg(section: str, key: str, default: str | None = None) -> str:
@@ -170,6 +173,12 @@ def function_url_statements(edge_role_arn: str) -> list[dict]:
     ]
 
 
+def _panel_ssm_parameter_arns(region: str, acct: str) -> list[str]:
+    keys = load_session_keys(HERE.parent / "config.ini")
+    params = [keys.legacy_param] + [r.ssm_param for r in keys.allowlist("console") if r.alg == "HS256"]
+    return [f"arn:aws:ssm:{region}:{acct}:parameter{p}" for p in dict.fromkeys(params)]
+
+
 def role_statements() -> list[dict]:
     """panel 执行角色的 inline policy。
 
@@ -252,9 +261,11 @@ def role_statements() -> list[dict]:
         {"Sid": "AccessTablesQueryOnly", "Effect": "Allow",
          "Action": "dynamodb:Query",
          "Resource": [f"{tbl}/site-access-events", f"{tbl}/site-access-daily"]},
-        {"Sid": "ReadJwtSecretOnly", "Effect": "Allow",
+        # 3c-1A：legacy jwt-secret + console family 的 HS 行，**精确 ARN 清单、不含 site family**
+        # （spec §4.3：panel 只持 console 的 allowlist；拿到 site 的 key = 被攻破时能伪造站点会话）
+        {"Sid": "ReadSessionKeysConsoleOnly", "Effect": "Allow",
          "Action": "ssm:GetParameter",
-         "Resource": f"arn:aws:ssm:{region}:{acct}:parameter/site-builder/jwt-secret"},
+         "Resource": _panel_ssm_parameter_arns(region, acct)},
         {"Sid": "DecryptViaSSM", "Effect": "Allow",
          "Action": "kms:Decrypt", "Resource": "*",
          "Condition": {"StringEquals": {
@@ -322,6 +333,9 @@ def lambda_environment(edge_role_id_value: str = "") -> dict:
         "CONSOLE_HOST": console_host(),
         "UNDEPLOY_FN": "site-deployer-undeploy",
         "JWT_SECRET_PARAM": "/site-builder/jwt-secret",
+        # 3c-1A：console family 的 kid 清单（只有参数名）与 legacy 入口开关；形态由 auth/session_keys.py 定义
+        "SESSION_KEYS_JSON": env_json(load_session_keys(HERE.parent / "config.ini"), ("console",)),
+        "LEGACY_ENTRY": legacy_entry(load_session_keys(HERE.parent / "config.ini")),
     }
 
 

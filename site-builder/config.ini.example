@@ -129,3 +129,26 @@ console_version =
 #
 # 首次部署时哨兵行建成**关**（fail-closed）——部署完要去控制台开一次。
 # 控制台自己不可用时的应急旁路（aws CLI 直改该行）见 DEPLOY.md「⑤c」。
+
+# ============================================================================
+# 会话签名密钥（3c，spec §11.6）。**HS 与 RS 两阶段共用这一个 schema**。
+# ============================================================================
+[SessionKeys]
+# 3c-1A：每 family 一把 current（HS256），previous 留空；legacy_param 是拆 family 之前
+# 的共享密钥（今天的 /site-builder/jwt-secret），3c-3 删 legacy 入口时一并清空。
+# 值就是固定的 SSM 参数路径：ensure_session_keys.py 按这里的 HS 行幂等创建 SecureString，
+# router 栈 synth 时只取 site family、panel 只取 console family、auth 两个都取。
+# RS 行（key_arn 带 :key/<uuid> 的完整 ARN，永不写 alias；spki_sha256 64 位 hex）3c-2B 起才出现。
+site_current = site-hs-v1
+site_previous =
+console_current = console-hs-v1
+console_previous =
+legacy_param = /site-builder/jwt-secret
+
+[SessionKey:site-hs-v1]
+alg = HS256
+ssm_param = /site-builder/session-keys/site-hs-v1
+
+[SessionKey:console-hs-v1]
+alg = HS256
+ssm_param = /site-builder/session-keys/console-hs-v1

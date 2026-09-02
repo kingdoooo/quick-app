@@ -225,3 +225,87 @@ def test_handler_callback_rejects_mismatch_without_burning_code(aws, secret):
     r2 = handler.handler(ev, None)
     assert r2["statusCode"] == 302, r2
     assert any(console_session.CONSOLE_COOKIE in c for c in r2.get("cookies", []))
+
+
+# ---- 3c-1A：新入口（带 kid）与 legacy 入口并存（状态机 L1）----
+from upgrade_code_vectors import (CONSOLE_KID, CONSOLE_KID_SECRET, SITE_KID,  # noqa: E402
+                                  SITE_KID_SECRET)
+
+
+def _kid_code(email="u@x.com", **kw):
+    return session.mint_token(kid=CONSOLE_KID, secret=CONSOLE_KID_SECRET, token_use="console-upgrade",
+                              email=email, ttl_seconds=60, **kw)
+
+
+def _kid_console_cookie(email="u@x.com"):
+    tok = session.mint_token(kid=CONSOLE_KID, secret=CONSOLE_KID_SECRET, token_use="console-session",
+                             email=email, ttl_seconds=3600, name="U")
+    return f"{console_session.CONSOLE_COOKIE}={tok}"
+
+
+def test_kid_form_upgrade_code_is_consumed_once(aws, secret):
+    code = _kid_code()
+    assert console_session.consume_code(code, expected_email="u@x.com") == "u@x.com"
+    with pytest.raises(console_session.UpgradeRejected):
+        console_session.consume_code(code, expected_email="u@x.com")
+
+
+def test_kid_form_console_cookie_is_verified(aws, secret):
+    assert console_session.verify_console_cookie(_kid_console_cookie(), x_user_email="u@x.com") == "u@x.com"
+
+
+def test_site_kid_token_is_not_a_console_cookie(aws, secret):
+    """panel 的 allowlist 里没有 site family 的 kid（spec §4.3）。"""
+    tok = session.mint_token(kid=SITE_KID, secret=SITE_KID_SECRET, token_use="console-session",
+                             email="u@x.com", ttl_seconds=3600, name="U")
+    with pytest.raises(console_session.UpgradeRejected):
+        console_session.verify_console_cookie(f"{console_session.CONSOLE_COOKIE}={tok}", x_user_email="u@x.com")
+
+
+def test_kid_form_site_session_is_not_a_console_cookie(aws, secret):
+    tok = session.mint_token(kid=CONSOLE_KID, secret=CONSOLE_KID_SECRET, token_use="site-session",
+                             email="u@x.com", ttl_seconds=3600, name="U", idp="Feishu", auth_via="x")
+    with pytest.raises(console_session.UpgradeRejected):
+        console_session.verify_console_cookie(f"{console_session.CONSOLE_COOKIE}={tok}", x_user_email="u@x.com")
+
+
+def test_kid_form_console_cookie_is_not_an_upgrade_code(aws, secret):
+    tok = _kid_console_cookie().split("=", 1)[1]
+    with pytest.raises(console_session.UpgradeRejected):
+        console_session.consume_code(tok, expected_email="u@x.com")
+
+
+@pytest.mark.parametrize("name,mutate,expect_reject", MUTATIONS)
+def test_same_vectors_as_auth_side_for_kid_form(aws, secret, name, mutate, expect_reject):
+    code = mutate(_kid_code())
+    if expect_reject:
+        with pytest.raises(console_session.UpgradeRejected):
+            console_session.consume_code(code, expected_email="u@x.com")
+    else:
+        assert console_session.consume_code(code, expected_email="u@x.com") == "u@x.com"
+
+
+def test_legacy_entry_off_rejects_legacy_code_but_not_kid_form(aws, secret, monkeypatch):
+    monkeypatch.setenv("LEGACY_ENTRY", "off")
+    with pytest.raises(console_session.UpgradeRejected):
+        console_session.consume_code(session.mint_upgrade_code("u@x.com", SECRET), expected_email="u@x.com")
+    assert console_session.consume_code(_kid_code(), expected_email="u@x.com") == "u@x.com"
+
+
+def test_panel_refuses_a_session_keys_json_that_carries_the_site_family(aws, secret, monkeypatch):
+    """每个 verifier 只持自己那份 allowlist：panel 拿到 site family 就是部署配置错了，直接拒。"""
+    monkeypatch.setenv("SESSION_KEYS_JSON",
+                       '{"console": [], "site": [{"kid": "site-hs-v1", "alg": "HS256", "role": "current", '
+                       '"ssm_param": "/site-builder/session-keys/site-hs-v1"}]}')
+    with pytest.raises(RuntimeError):
+        console_session.verify_console_cookie(_kid_console_cookie(), x_user_email="u@x.com")
+
+
+def test_verify_outcome_is_logged_without_the_token(aws, secret, capsys):
+    cookie = _kid_console_cookie()
+    console_session.verify_console_cookie(cookie, x_user_email="u@x.com")
+    out = capsys.readouterr().out
+    import json as _json
+    lines = [_json.loads(l) for l in out.splitlines() if l.startswith("{") and "session_verify" in l]
+    assert lines and lines[-1]["outcome"] == "accepted_current" and lines[-1]["verifier"] == "panel"
+    assert cookie.split("=", 1)[1].split(".")[1] not in out

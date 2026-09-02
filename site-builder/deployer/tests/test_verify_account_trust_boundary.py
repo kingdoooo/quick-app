@@ -90,7 +90,8 @@ def _is_version_id(value: str) -> bool:
 _GRANT_RE = re.compile(
     r"(?:invoke-platform|replace-platform-code)(?:@alias|@version)?:[A-Za-z0-9._-]+"
     r"|invoke-site(?:@alias|@version)?:(?:all|some\(\d+\):" + _FP_RE + r")"
-    r"|read-edge-code|read-edge-asset|read-jwt-param")
+    r"|read-edge-code|read-edge-asset|read-jwt-param"
+    r"|read-session-key:(?:site|console)-(?:hs|rs)-v\d+")   # 3c-1A：每 kid 一条
 
 
 def _is_grant(value: str) -> bool:
@@ -656,8 +657,6 @@ def test_doc_counts_come_from_the_baseline():
     g = _gate()
     data = json.loads(_BASELINE.read_text(encoding="utf-8"))
     principals = data["principals"]
-    secret_grants = set(g.SECRET_GRANTS)
-
     def count(pred):
         return sum(1 for p in principals.values() if pred(p))
 
@@ -672,7 +671,7 @@ def test_doc_counts_come_from_the_baseline():
     expected = {
         # ---- A：直接失守（headline）----
         "A总数": len(principals),
-        "可读密钥": count(lambda p: secret_grants & set(p["grants"])),
+        "可读密钥": count(lambda p: any(g.is_secret_grant(x) for x in p["grants"])),
         "非平台可直调": count(
             lambda p: p["category"] != "platform"
             and (has_prefix(p, f"{g.G_INVOKE_PLATFORM}:")
@@ -1159,8 +1158,15 @@ def test_all_facts_are_integers():
     （`_walk_baseline` 只产出字符串，整数走不到检查）。
     """
     facts = json.loads(_BASELINE.read_text(encoding="utf-8"))["facts"]
-    for k, v in facts.items():
-        assert isinstance(v, int), f"facts.{k} 不是整数而是 {type(v).__name__}: {v!r}"
+
+    def walk(node, path):
+        if isinstance(node, dict):          # 3c-1A：facts.session_keys.<kid>.<计数> 是嵌套整数
+            for k, v in node.items():
+                walk(v, f"{path}.{k}")
+        else:
+            assert isinstance(node, int) and not isinstance(node, bool), \
+                f"{path} 不是整数而是 {type(node).__name__}: {node!r}"
+    walk(facts, "facts")
 
 
 def test_baseline_redline_scan_catches_an_injected_new_subkey():
@@ -1995,17 +2001,18 @@ def test_old_baseline_schema_hard_fails(tmp_path):
     assert "--migrate-from-schema" in str(exc.value)
 
 
-def test_migration_only_accepts_schema_2_to_3(tmp_path):
+def test_migration_only_accepts_schema_3_to_4(tmp_path):
+    """3c-1A：只接受 3→4 的一次性迁移；2→3 那条路留着函数但不再从 CLI 可达。"""
     g = _gate()
-    assert g.BASELINE_SCHEMA == 3, "这条用例的前提是脚本已经是 schema 3"
+    assert g.BASELINE_SCHEMA == 4, "这条用例的前提是脚本已经是 schema 4"
     p = tmp_path / "b.json"
-    p.write_text(json.dumps({"schema": 1, "principals": {}}), encoding="utf-8")
+    p.write_text(json.dumps({"schema": 2, "principals": {}, "facts": {}}), encoding="utf-8")
     with pytest.raises(SystemExit):
-        g.load_baseline(p, migrate_from=1)          # 1→3 不支持
-    p.write_text(json.dumps({"schema": 2, "principals": {}}), encoding="utf-8")
+        g.load_baseline(p, migrate_from=2)          # 2→4 不支持
+    p.write_text(json.dumps({"schema": 3, "principals": {}, "facts": {}}), encoding="utf-8")
     with pytest.raises(SystemExit):
-        g.load_baseline(p, migrate_from=3)          # 声明的版本与文件里的不一致
-    assert g.load_baseline(p, migrate_from=2)["schema"] == 3
+        g.load_baseline(p, migrate_from=4)          # 声明的版本与文件里的不一致
+    assert g.load_baseline(p, migrate_from=3)["schema"] == 4
 
 
 def test_migration_strips_iam_policy_write_and_drops_empty_entries():
@@ -2181,7 +2188,7 @@ def _complete_bundle(g) -> dict:
             "bootstrap_bucket": [], "bootstrap_bucket_texts": {}},
         "facts": {"edge_code_targets_carrying_live_key": 0,
                   "edge_assets_carrying_live_key": 0,
-                  "principals_with_missing_context": 0},
+                  "principals_with_missing_context": 0, "session_keys": {}},
         "coverage": {"undecided_items": []},
         "iam_write": {"statements": {}, "boundaries": {},
                       "managed_versions": {}, "texts": {}},
@@ -3150,3 +3157,121 @@ def test_docs_do_not_claim_atomic_observation():
     # 两个操作入口至少要让读者知道这道复查的口径是"两端"，而不是原子
     for rel in ("CLAUDE.md", "site-builder/DEPLOY.md"):
         assert "两端" in docs[rel], f"{rel} 没写这道复查的口径是「两端一致」"
+
+
+# --------------------------------------------------------------------------
+# 3c-1A：两个 HS key family（plan Task 6）——每 kid 一条 grant、Edge 不得含 console key、
+# 基线 schema 3→4 只做结构迁移
+# --------------------------------------------------------------------------
+
+_SK_ARNS = {"site-hs-v1": "arn:aws:ssm:us-east-1:1:parameter/site-builder/session-keys/site-hs-v1",
+            "console-hs-v1": "arn:aws:ssm:us-east-1:1:parameter/site-builder/session-keys/console-hs-v1"}
+
+
+def _targets_sk(g):
+    t = _targets(g)
+    return g.Targets(**{**t.__dict__, "session_key_parameters": dict(_SK_ARNS)})
+
+
+def test_session_key_grants_are_per_kid_and_separate_from_legacy():
+    """「谁能读 site 的 key」与「谁能读 console 的 key」必须分得开——spec §4.1 的整个论点就是
+    这两者要分开；合成一条就看不出 panel 被攻破能不能伪造站点会话。"""
+    g = _gate()
+    t = _targets_sk(g)
+    only_site = g.grants_from_decisions({f"ssm:GetParameter|{_SK_ARNS['site-hs-v1']}": "allowed"}, t)
+    only_console = g.grants_from_decisions({f"ssm:GetParameter|{_SK_ARNS['console-hs-v1']}": "allowed"}, t)
+    only_legacy = g.grants_from_decisions({f"ssm:GetParameter|{t.jwt_parameter}": "allowed"}, t)
+    assert only_site == {"read-session-key:site-hs-v1"}
+    assert only_console == {"read-session-key:console-hs-v1"}
+    assert only_legacy == {g.G_READ_JWT_PARAM}
+    assert all(g.is_secret_grant(x) for x in only_site | only_console | only_legacy)
+    assert not g.is_secret_grant("invoke-platform:site-panel")
+
+
+def test_session_key_params_are_simulated_and_classified_by_kid():
+    g = _gate()
+    t = _targets_sk(g)
+    assert set(_SK_ARNS.values()) <= set(t.other_resources())
+    assert g.undecided_resource_class(_SK_ARNS["site-hs-v1"], t) == "session-key:site-hs-v1"
+    assert g.undecided_resource_class(t.jwt_parameter, t) == "jwt-param"
+
+
+def test_console_key_inside_edge_artifacts_is_red():
+    """Edge 的 allowlist 里不出现 console 的 key（spec §4.1）：产物里测到就是红，不是事实类 note。"""
+    g = _gate()
+    base = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel"]))
+    clean = {"edge_code_targets_carrying_live_key": 1, "edge_assets_carrying_live_key": 1,
+             "principals_with_missing_context": 0, "session_keys": {},
+             "session_keys": {"site-hs-v1": {"edge_code_targets_carrying_key": 1,
+                                             "edge_assets_carrying_key": 1},
+                              "console-hs-v1": {"edge_code_targets_carrying_key": 0,
+                                                "edge_assets_carrying_key": 0}}}
+    ok = g.compare_to_baseline(base, _baseline_of(base), required=REQUIRED, facts=clean)
+    assert ok.ok, ok.render()
+    leaked = json.loads(json.dumps(clean))
+    leaked["session_keys"]["console-hs-v1"]["edge_assets_carrying_key"] = 1
+    bad = g.compare_to_baseline(base, _baseline_of(base), required=REQUIRED, facts=leaked)
+    assert not bad.ok
+    assert "console-hs-v1" in bad.render()
+
+
+def test_multi_key_scan_downloads_each_artifact_once_and_reports_per_key():
+    import io
+    import zipfile
+    g = _gate()
+
+    def zbytes(src: str) -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("index.py", src)
+        return buf.getvalue()
+
+    legacy, site, console = "L" * 64, "S" * 64, "C" * 64
+    objects = {"a.zip": zbytes(f'JWT_SECRET = "{legacy}"'),
+               "b.zip": zbytes(f'JWT_SECRET = "{legacy}"\nSITE_ALLOWLIST_JSON = \'\'\'{{"site-hs-v1": {{"secret": "{site}"}}}}\'\'\''),
+               "c.zip": zbytes("nothing here")}
+    downloads = []
+
+    class _S3:
+        def get_paginator(self, name):
+            assert name == "list_object_versions"
+            class _P:
+                def paginate(self, Bucket):
+                    yield {"Versions": [{"Key": k, "VersionId": "v", "Size": len(b)} for k, b in objects.items()]}
+            return _P()
+
+        def get_object(self, Bucket, Key, VersionId=None):
+            downloads.append(Key)
+            return {"Body": io.BytesIO(objects[Key])}
+
+    found = g.assets_carrying_keys({"s3": _S3()}, "bucket",
+                                   {"legacy": legacy, "site-hs-v1": site, "console-hs-v1": console})
+    assert found == {"legacy": ["a.zip", "b.zip"], "site-hs-v1": ["b.zip"], "console-hs-v1": []}
+    assert sorted(downloads) == ["a.zip", "b.zip", "c.zip"], "每个对象只该下载一次"
+
+
+def test_migrate_3_to_4_is_structural_only():
+    """精确迁移，不是重置：principal / grants / 其它分节原样保留，只新增空的 facts.session_keys。"""
+    g = _gate()
+    old = {"schema": 3, "principals": {"fp": {"category": "admin", "grants": ["read-jwt-param"]}},
+           "facts": {"edge_code_targets_carrying_live_key": 10, "edge_assets_carrying_live_key": 9,
+                     "principals_with_missing_context": 162, "session_keys": {}},
+           "coverage": {"undecided_items": []}, "iam_write_statements": {"x": 1}}
+    new = g.migrate_baseline_3_to_4(json.loads(json.dumps(old)))
+    assert new["schema"] == 4
+    assert new["principals"] == old["principals"] and new["iam_write_statements"] == old["iam_write_statements"]
+    assert new["facts"] == {**old["facts"], "session_keys": {}}
+
+
+def test_bundle_shape_accepts_session_key_facts_and_rejects_unknown_fact_keys():
+    g = _gate()
+    facts_ok = {"edge_code_targets_carrying_live_key": 1, "edge_assets_carrying_live_key": 1,
+                "principals_with_missing_context": 0, "session_keys": {},
+                "session_keys": {"site-hs-v1": {"edge_code_targets_carrying_key": 1,
+                                                "edge_assets_carrying_key": 1}}}
+    g._check_shape(facts_ok, g.BUNDLE_SHAPE["facts"], path="facts", where="test")
+    with pytest.raises(SystemExit):
+        g._check_shape({**facts_ok, "bogus": 1}, g.BUNDLE_SHAPE["facts"], path="facts", where="test")
+    with pytest.raises(SystemExit):
+        bad = json.loads(json.dumps(facts_ok)); bad["session_keys"]["site-hs-v1"]["edge_assets_carrying_key"] = True
+        g._check_shape(bad, g.BUNDLE_SHAPE["facts"], path="facts", where="test")

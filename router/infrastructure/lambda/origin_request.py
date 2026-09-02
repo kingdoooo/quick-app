@@ -28,6 +28,13 @@ DYNAMODB_TABLE_NAME = "{{DYNAMODB_TABLE_NAME}}"
 DYNAMODB_REGION = "{{DYNAMODB_REGION}}"
 FRONTEND_BUCKET_DOMAIN = "{{FRONTEND_BUCKET_DOMAIN}}"
 JWT_SECRET = "{{JWT_SECRET}}"  # Task 7 使用
+# 3c-1A（spec §4.3 / §11.6）：site family 的 kid allowlist 与 legacy 入口开关。
+# JSON 形态 kid -> {"alg","secret","role"}；只含 site family（Edge 的 allowlist 里**不出现**
+# console 的 key，spec §4.1）。用三引号是因为注入的是含双引号的 JSON；stack.py 在注入前断言
+# 文本里没有 ''' 与反斜杠。JWT_SECRET 从此只是 **legacy 入口**的密钥，3c-3 一并删。
+SITE_ALLOWLIST_JSON = '''{{SITE_ALLOWLIST_JSON}}'''
+LEGACY_ENTRY = "{{LEGACY_ENTRY}}"        # "on" | "off"（[SessionKeys] legacy_param 非空即 on）
+_SITE_ALLOWLIST = json.loads(SITE_ALLOWLIST_JSON)
 _ROUTE_CACHE: dict = {}  # subdomain -> (expires_epoch, item)
 ROUTE_CACHE_TTL = 60
 DEFAULT_PROTOCOL = "https"
@@ -449,12 +456,88 @@ def _b64url_decode(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
 
-def _verify_session_jwt(token: str) -> dict | None:
-    """与 site-builder/auth/session.py 同算法（HS256），改动须两处同步。
+def _strict_json(raw: bytes) -> dict:
+    """拒绝重复键（两个 kid 让不同实现看到不同值）。与 auth/session.py 同名函数字节等价。"""
+    def no_dupes(pairs):
+        d = {}
+        for k, v in pairs:
+            if k in d:
+                raise ValueError("duplicate key")
+            d[k] = v
+        return d
+    obj = json.loads(raw, object_pairs_hook=no_dupes)
+    if not isinstance(obj, dict):
+        raise ValueError("not an object")
+    return obj
 
-    **必须查 `typ`**（M05）：会话 token 与 console 一次性升级码用**同一个密钥**
-    签名、线格式也相同。不查 typ 时一个 60s 的升级码就是一个有效站点会话，
-    而它还能在 auth 的 `/console-session` 无限续期。
+
+def _log_verify_outcome(outcome: str) -> None:
+    """spec §8：只记固定低基数词表，**不记 token**；埋点异常一律吞掉。"""
+    try:
+        logger.info(json.dumps({"event": "session_verify", "verifier": "edge", "outcome": outcome}))
+    except Exception:
+        pass
+
+
+def _verify_session_jwt(token: str) -> dict | None:
+    """与 site-builder/auth/session.py 的 `verify_with_legacy(token_use="site-session")` 字节等价，
+    改动须两处同步（CLAUDE.md 不变量）。`_check_auth` 只认"claims 或 None"，outcome 只进日志。
+
+    「2 + 1」入口（状态机 L1）：header 有 kid ⇒ 查 allowlist，**不在就拒、不回落**；
+    header 没有 kid 且 LEGACY_ENTRY == "on" ⇒ legacy 入口按旧合同验（typ=session 且无 scope）。
+    `kid` 是攻击者控制的输入：只拿它查表，不拼任何资源。
+    """
+    claims, outcome = _verify_site_session(token)
+    _log_verify_outcome(outcome)
+    return claims
+
+
+def _verify_site_session(token: str) -> tuple:
+    import base64, hashlib, hmac as _hmac, time as _t
+    try:
+        header_b64, payload_b64, sig = token.split(".")
+        header = _strict_json(_b64url_decode(header_b64))
+    except Exception:
+        return None, "bad_signature"
+    if "kid" not in header and LEGACY_ENTRY == "on":
+        return _verify_legacy_site_session(token)
+    kid = header.get("kid")
+    if not isinstance(kid, str) or kid not in _SITE_ALLOWLIST:
+        return None, "unknown_kid"
+    entry = _SITE_ALLOWLIST[kid]
+    if header.get("alg") != entry["alg"]:
+        return None, "alg_mismatch"
+    try:
+        expected = base64.urlsafe_b64encode(
+            _hmac.new(entry["secret"].encode(), f"{header_b64}.{payload_b64}".encode(),
+                      hashlib.sha256).digest()).rstrip(b"=").decode()
+        if not _hmac.compare_digest(sig, expected):
+            return None, "bad_signature"
+        claims = _strict_json(_b64url_decode(payload_b64))
+    except Exception:
+        return None, "bad_signature"
+    if claims.get("token_use") != "site-session":
+        return None, "wrong_token_use"
+    aud = claims.get("aud")
+    if not isinstance(aud, str) or aud != "site-edge":      # 字符串精确相等，数组必拒
+        return None, "wrong_audience"
+    try:
+        if int(claims.get("exp", 0)) <= int(_t.time()):
+            return None, "expired"
+    except Exception:
+        return None, "bad_signature"
+    email = claims.get("email")
+    if not isinstance(email, str) or not email:
+        return None, "bad_signature"
+    return claims, "accepted_" + entry["role"]
+
+
+def _verify_legacy_site_session(token: str) -> tuple:
+    """legacy 入口：拆 family 之前的共享密钥 + 旧合同。**只在 header 没有 kid 时到这里。**
+
+    **必须查 `typ`**（M05）：会话 token 与 console 一次性升级码用**同一个密钥**签名、线格式也相同。
+    旧合同里 site 会话是 typ=session 且**无 scope**；scope=console 的是面板会话，不是站点会话
+    （spec §6.2 状态机第 3 条；今天之前 Edge 不查 scope，这是相对现状的收紧）。
     """
     import base64, hashlib, hmac as _hmac, time as _t
     try:
@@ -463,20 +546,22 @@ def _verify_session_jwt(token: str) -> dict | None:
             _hmac.new(JWT_SECRET.encode(), f"{h}.{p}".encode(), hashlib.sha256).digest()
         ).rstrip(b"=").decode()
         if not _hmac.compare_digest(sig, expected):
-            return None
+            return None, "bad_signature"
         claims = json.loads(_b64url_decode(p))
         # typ 先查：这是"不能跨上下文复用"的唯一技术保证。字面量与
         # auth/session.py 的 SESSION_TYP 必须一致（Edge 拿不到那个常量）。
         if claims.get("typ") != "session":
-            return None
+            return None, "bad_signature"
+        if claims.get("scope") == "console":
+            return None, "wrong_token_use"
         if int(claims.get("exp", 0)) <= int(_t.time()):
-            return None
+            return None, "expired"
         email = claims.get("email")
         if not isinstance(email, str) or not email:
-            return None  # 缺 email 的 token 视为无效，_check_auth 依赖 claims["email"]
-        return claims
+            return None, "bad_signature"  # 缺 email 的 token 视为无效，_check_auth 依赖 claims["email"]
+        return claims, "accepted_legacy"
     except Exception:
-        return None
+        return None, "bad_signature"
 
 
 # **同名 sb_session 候选不设条数上限**——界由 Cookie 头体积给，不由常量给。

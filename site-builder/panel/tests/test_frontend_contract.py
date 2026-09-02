@@ -744,7 +744,7 @@ def _edge_module():
            / "origin_request.py").read_text()
     for k, v in {"{{DYNAMODB_TABLE_NAME}}": "t", "{{DYNAMODB_REGION}}": "us-east-1",
                  "{{FRONTEND_BUCKET_DOMAIN}}": "b.s3.us-east-1.amazonaws.com",
-                 "{{JWT_SECRET}}": "s", "{{BASE_DOMAIN}}": "example.com",
+                 "{{JWT_SECRET}}": "s", "{{SITE_ALLOWLIST_JSON}}": '{"site-hs-v1": {"alg": "HS256", "secret": "test-secret", "role": "current"}}', "{{LEGACY_ENTRY}}": "on", "{{BASE_DOMAIN}}": "example.com",
                  "{{REQUIRE_IDP_CLAIM}}": "true",
                  "{{TRUSTED_IDPS}}": "Feishu"}.items():
         src = src.replace(k, v)

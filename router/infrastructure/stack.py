@@ -5,6 +5,8 @@ CloudFront-based dynamic subdomain routing system using Lambda@Edge and DynamoDB
 """
 import os
 import configparser
+import json
+import sys
 import tempfile
 import shutil
 from pathlib import Path
@@ -81,6 +83,46 @@ def load_jwt_secret() -> str:
             file=sys.stderr,
         )
         return "SYNTH-ONLY-PLACEHOLDER-DO-NOT-DEPLOY"
+
+
+def load_site_allowlist() -> tuple:
+    """3c-1A：Edge 只认 site family 的 kid allowlist（spec §4.1 / §11.6）。
+
+    → (allowlist_json, legacy_entry)。kid 清单来自 `site-builder/config.ini` 的 [SessionKeys]
+    （唯一取值来源，经 site-builder/auth/session_keys.py 校验，缺段/写错即 synth 失败），
+    secret 值按每行的 ssm_param 从 SSM 取；**只取 site family，console 的 key 不进 Edge**。
+    legacy 开关：legacy_param 非空即 "on"（3c-3 清空它即 "off"）。
+
+    SSM 读失败沿用 load_jwt_secret 的 synth-only 语义：注入空 allowlist 并在 stderr 警告，
+    这样 `cdk synth` 离线能跑，但该模板**绝不能部署**（空 allowlist = 所有新形态会话全拒）。
+    """
+    root = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(root / "site-builder" / "auth"))
+    from session_keys import load_session_keys
+    keys = load_session_keys(root / "site-builder" / "config.ini")
+    legacy_entry = "on" if keys.legacy_param else "off"
+    env_json = os.getenv("APP_SITE_ALLOWLIST_JSON")
+    if env_json:
+        text = env_json
+    else:
+        try:
+            import boto3
+            ssm = boto3.client("ssm", region_name="us-east-1")
+            allow = {}
+            for ref in keys.allowlist("site"):
+                if ref.alg != "HS256":
+                    raise ValueError(f"{ref.kid}: 3c-1A 的 Edge 只支持 HS256 行（RS 行是 3c-2B）")
+                val = ssm.get_parameter(Name=ref.ssm_param, WithDecryption=True)["Parameter"]["Value"]
+                allow[ref.kid] = {"alg": ref.alg, "secret": val, "role": ref.role}
+            text = json.dumps(allow, separators=(",", ":"))
+        except Exception as exc:  # noqa: BLE001 - deliberate synth-time fallback
+            print(f"WARNING: could not build the site allowlist from SSM ({exc}); "
+                  "injecting an EMPTY allowlist. DO NOT deploy this template.", file=sys.stderr)
+            text = "{}"
+    if "\'\'\'" in text or "\\" in text:
+        raise ValueError("allowlist JSON 含三引号或反斜杠，注进三引号字符串会破坏 Edge 源码")
+    json.loads(text)   # 注入前保证是合法 JSON，否则 Edge 在 import 时就炸
+    return text, legacy_entry
 
 
 class WebRouterStack(Stack):
@@ -196,6 +238,7 @@ class WebRouterStack(Stack):
         # deploy time (see load_jwt_secret); the bucket lives in us-east-1
         # (Lambda@Edge SigV4 in origin_request.py signs for us-east-1).
         jwt_secret = load_jwt_secret()
+        site_allowlist_json, legacy_entry = load_site_allowlist()
         # 两个值都要在 synth 时验证——它们控制的是 org 语义在请求路径上的
         # 唯一执行点，配错的代价不对称：
         # ① configparser 默认**保留行内注释**（inline_comment_prefixes=()）：
@@ -233,6 +276,8 @@ class WebRouterStack(Stack):
             .replace("{{FRONTEND_BUCKET_DOMAIN}}",
                      f"{frontend_bucket}.s3.us-east-1.amazonaws.com")
             .replace("{{JWT_SECRET}}", jwt_secret)
+            .replace("{{SITE_ALLOWLIST_JSON}}", site_allowlist_json)
+            .replace("{{LEGACY_ENTRY}}", legacy_entry)
             .replace("{{BASE_DOMAIN}}", base_domain)
             .replace("{{REQUIRE_IDP_CLAIM}}", require_idp_claim)
             .replace("{{TRUSTED_IDPS}}", trusted_idps)

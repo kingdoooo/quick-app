@@ -1,5 +1,5 @@
 {
-  "schema": 3,
+  "schema": 4,
   "note": "account trust boundary baseline —— 只存 ARN 与策略语句的指纹（仓库红线：真实账号值/角色名不进被跟踪文件）。见 docs/security/account-trust-boundary.md 与 scripts/verify_account_trust_boundary.py。",
   "categories": [
     "platform",
@@ -14,7 +14,8 @@
   "facts": {
     "edge_code_targets_carrying_live_key": 10,
     "edge_assets_carrying_live_key": 9,
-    "principals_with_missing_context": 162
+    "principals_with_missing_context": 162,
+    "session_keys": {}
   },
   "coverage": {
     "undecided_items": [

@@ -1,6 +1,7 @@
 """deploy_panel.py 的部署契约——不实际部署，断言它会构造出什么。"""
 import ast
 import json
+import sys
 import re
 from pathlib import Path
 
@@ -143,20 +144,41 @@ def test_missing_or_wildcard_edge_role_aborts_instead_of_widening(bad):
         dp.function_url_statements(bad)
 
 
-def test_panel_role_ssm_resource_is_exact_jwt_secret_arn():
-    """**不照抄 auth 的 parameter/site-builder/* 前缀**。
+def _expected_panel_ssm_suffixes():
+    """panel 该读的 SSM 参数 = legacy + console family 的 HS 行（来自 [SessionKeys]），**没有 site**。"""
+    sys.path.insert(0, str(PANEL.parent / "auth"))
+    from session_keys import load_session_keys
+    keys = load_session_keys(PANEL.parent / "config.ini")
+    params = {keys.legacy_param} | {r.ssm_param for r in keys.allowlist("console") if r.alg == "HS256"}
+    return {f"parameter{p}" for p in params}
 
-    auth 用前缀是它自己还要读 site-client-secret；panel 拿前缀等于被攻破时
-    顺带交出 Cognito client secret 与该前缀下未来的一切秘密。
+
+def test_panel_role_ssm_resources_are_exact_arns_for_legacy_and_console_family_only():
+    """**不照抄 auth 的前缀**，且 3c-1A 起也**不含 site family**（spec §4.3：panel 只持 console）。
+
+    panel 拿前缀等于被攻破时顺带交出 Cognito client secret 与该前缀下未来的一切秘密；
+    拿到 site 的 key 等于 panel 被攻破 ⇒ 伪造站点会话。
     """
     ssm = [s for s in dp.role_statements()
            if any(a.startswith("ssm:") for a in _actions(s))]
     assert ssm, "panel role 缺 SSM 读取权限"
+    got = set()
     for s in ssm:
         for res in _resources(s):
-            assert res.endswith("parameter/site-builder/jwt-secret"), (
-                f"SSM 资源不是精确 jwt-secret ARN: {res}")
             assert not res.endswith("*"), "出现通配前缀——会顺带拿到别的秘密"
+            assert "session-keys/site-" not in res, f"panel 拿到了 site family 的密钥：{res}"
+            got.add(res.split(":", 5)[-1])
+    assert got == _expected_panel_ssm_suffixes(), got
+
+
+def test_environment_session_keys_json_has_only_the_console_family():
+    env = dp.lambda_environment()
+    keys = json.loads(env["SESSION_KEYS_JSON"])
+    assert set(keys) == {"console"}, "panel 的 SESSION_KEYS_JSON 只能有 console family"
+    for row in keys["console"]:
+        assert set(row) == {"kid", "alg", "role", "ssm_param"}, "只下发参数名，不下发值"
+        assert row["kid"].startswith("console-")
+    assert env["LEGACY_ENTRY"] in ("on", "off")
 
 
 def test_kms_decrypt_is_scoped_via_ssm():

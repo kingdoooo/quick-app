@@ -827,7 +827,9 @@ def test_deploy_md_lists_every_production_session_verifier():
 
     # 两个名字都算：auth/panel 用 `verify_session_jwt`，Edge 里那份叫 `_verify_session_jwt`
     # （Lambda@Edge 不能 import auth 包，所以它是内嵌的另一份实现）。
-    wanted = {"verify_session_jwt", "_verify_session_jwt"}
+    # 3c-1A 起 handler 调的是 verify_with_legacy（「2 + 1」入口），verify_token 是新入口本体；
+    # 旧名字保留是因为 legacy 入口仍经它们，且 Edge 那份仍叫 _verify_session_jwt。
+    wanted = {"verify_session_jwt", "_verify_session_jwt", "verify_with_legacy", "verify_token"}
     tracked = subprocess.run(["git", "ls-files", "*.py"], cwd=ROOT,
                              capture_output=True, text=True, check=True).stdout.split()
     callers: set[str] = set()

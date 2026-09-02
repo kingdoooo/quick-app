@@ -9,13 +9,17 @@ import os
 import re
 import secrets
 import subprocess
+import sys
 import tempfile
 import zipfile
 from pathlib import Path
 
 import boto3
 
+sys.path.insert(0, str(Path(__file__).parent))   # 被 verify_deployed_components 按路径加载时也能找到同目录模块
 from alarm_pipeline import ensure_alarm_pipeline
+from secrets_util import ensure_secret as _ensure_secret
+from session_keys import env_json, legacy_entry, load_session_keys
 
 FN = "site-auth-service"
 CFG_PATH = Path(__file__).parent.parent / "config.ini"
@@ -80,13 +84,8 @@ def _iam():
 
 
 def ensure_secret(name: str, generate) -> str:
-    ssm = _ssm()
-    try:
-        return ssm.get_parameter(Name=name, WithDecryption=True)["Parameter"]["Value"]
-    except ssm.exceptions.ParameterNotFound:
-        val = generate()
-        ssm.put_parameter(Name=name, Value=val, Type="SecureString")
-        return val
+    # 单一实现在 secrets_util.py（scripts/ensure_session_keys.py 也用它）；这里只是绑定本脚本的 client
+    return _ensure_secret(name, generate, ssm=_ssm())
 
 
 def build_zip() -> bytes:
@@ -135,7 +134,21 @@ def lambda_env() -> dict:
         # 才在 config.ini 里设 false。**必须显式下发**：漏了这一项时 Lambda
         # 环境变量缺失、代码回落默认值（true），行为仍然安全，但配置里写的
         # false 不生效——运维会以为关掉了却没关。
-        "REQUIRE_EMAIL_VERIFIED": _require_email_verified_cfg()}}
+        "REQUIRE_EMAIL_VERIFIED": _require_email_verified_cfg(),
+        # 3c-1A：两个 family 的 kid 清单（**只有参数名**，值运行时按参数名读 SSM）与 legacy 入口开关。
+        # 形态由 auth/session_keys.py 唯一定义；panel 的那份只含 console（各自 verifier 各自的 allowlist）。
+        "SESSION_KEYS_JSON": env_json(load_session_keys(CFG_PATH), ("site", "console")),
+        "LEGACY_ENTRY": legacy_entry(load_session_keys(CFG_PATH))}}
+
+
+def ssm_parameter_arns() -> list:
+    """auth 执行角色能读的 SSM 参数：**精确清单**，不再用 parameter/site-builder/* 前缀
+    （前缀会把 session-keys 下未来的一切一并交出去）。清单从 [SessionKeys] 推导，不手抄。"""
+    keys = load_session_keys(CFG_PATH)
+    params = [keys.legacy_param, CLIENT_SECRET_PARAM]
+    params += [r.ssm_param for fam in ("site", "console") for r in keys.allowlist(fam) if r.alg == "HS256"]
+    acct = cfg()["Platform"]["account_id"]
+    return [f"arn:aws:ssm:{region()}:{acct}:parameter{p}" for p in dict.fromkeys(params)]
 
 
 def main():
@@ -388,9 +401,7 @@ def ensure_lambda_role() -> str:
         PolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": [
             {"Sid": "ReadPlatformSecrets", "Effect": "Allow",
              "Action": "ssm:GetParameter",
-             "Resource": f"arn:aws:ssm:{region()}:"
-                         f"{cfg()['Platform']['account_id']}"
-                         ":parameter/site-builder/*"},
+             "Resource": ssm_parameter_arns()},
             # SecureString 用账号默认的 aws/ssm key 加密；解密走 SSM 服务，
             # 故用 ViaService 限定，避免这个角色能直接拿 KMS key 干别的。
             {"Sid": "DecryptViaSSM", "Effect": "Allow",

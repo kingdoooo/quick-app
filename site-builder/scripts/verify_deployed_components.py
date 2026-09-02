@@ -626,6 +626,16 @@ def run_deployed() -> None:
               and "time.monotonic() - hit[1] < SECRET_TTL_SECONDS" in body,
               "SSM 密钥缓存的 TTL 在产物中生效（赋值 + 判定都在）",
               "无 TTL 时轮转密钥后 warm 容器会永久用旧值")
+    # 3c-1A：环境变量**整体** == 本地 lambda_env() 推导值（SESSION_KEYS_JSON / LEGACY_ENTRY 也在其中），
+    # 且无明文密钥。漏下发的症状是 /console-session 全部 500，而单测有 ENV 兜着看不出来。
+    da = _load_deploy_module("deploy_auth", ROOT / "site-builder/auth/deploy_auth.py")
+    got_env = lam.get_function_configuration(FunctionName="site-auth-service").get(
+        "Environment", {}).get("Variables", {})
+    want_env = da.lambda_env()["Variables"]
+    diff = sorted(k for k in set(got_env) | set(want_env) if got_env.get(k) != want_env.get(k))
+    check(not diff, "site-auth-service 环境变量 == 本地 lambda_env() 推导值",
+          f"不一致的键: {diff}" if diff else f"{len(want_env)} 个键一致（只有参数名，无明文）")
+    _check_env_has_no_plaintext_secret(got_env, "site-auth-service", "JWT_SECRET_PARAM")
 
 
 def run_panel() -> None:

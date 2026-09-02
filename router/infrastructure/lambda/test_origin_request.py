@@ -14,7 +14,10 @@ _SRC = (_SRC.replace("{{DYNAMODB_TABLE_NAME}}", "test-table")
             .replace("{{JWT_SECRET}}", "test-secret")
             .replace("{{ACCESS_TABLE}}", "site-access-events")
             .replace("{{ACCESS_REPLICA_REGIONS}}",
-                     "us-east-1,ap-southeast-1,ap-northeast-1"))
+                     "us-east-1,ap-southeast-1,ap-northeast-1")
+            .replace("{{SITE_ALLOWLIST_JSON}}",
+                     '{"site-hs-v1": {"alg": "HS256", "secret": "site-secret-v1", "role": "current"}}')
+            .replace("{{LEGACY_ENTRY}}", "on"))
 _mod_path = Path(__file__).parent / "_origin_request_testable.py"
 _mod_path.write_text(_SRC)
 import _origin_request_testable as orq

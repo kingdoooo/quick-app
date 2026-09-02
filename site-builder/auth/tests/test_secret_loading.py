@@ -175,3 +175,19 @@ def test_deploy_auth_does_not_ship_plaintext_secrets():
     assert '"JWT_SECRET":' not in env_block, "JWT_SECRET 明文不得进环境变量"
     assert '"CLIENT_SECRET":' not in env_block, "CLIENT_SECRET 明文不得进环境变量"
     assert "JWT_SECRET_PARAM" in src and "CLIENT_SECRET_PARAM" in src
+
+
+# ---- 3c-1A：auth 的 SSM 权限收成精确清单；环境变量多两项（都不是明文）----
+
+def test_deploy_auth_ssm_resources_are_exact_not_prefixed():
+    """前缀 `parameter/site-builder/*` 会把 session-keys 下未来的一切一并交出去。"""
+    src = (Path(__file__).parents[1] / "deploy_auth.py").read_text()
+    assert ":parameter/site-builder/*" not in src, "auth role 仍在用 SSM 前缀通配"
+    assert "load_session_keys" in src, "SSM 资源清单必须从 [SessionKeys] 推导，不手抄"
+
+
+def test_deploy_auth_ships_session_keys_json_and_legacy_switch_without_values():
+    src = (Path(__file__).parents[1] / "deploy_auth.py").read_text()
+    env_block = src[src.index("def lambda_env"):src.index("def main()")]
+    assert '"SESSION_KEYS_JSON"' in env_block and '"LEGACY_ENTRY"' in env_block
+    assert '"secret"' not in env_block and "token_hex" not in env_block, "环境变量里只能有参数名"

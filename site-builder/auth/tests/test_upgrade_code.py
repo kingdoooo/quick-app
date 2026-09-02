@@ -171,3 +171,16 @@ def test_verify_never_raises_on_garbage():
     """
     for junk in (None, "", "...", "a.b", "a.b.c.d", "😀.😀.😀", "x" * 10000):
         assert session.verify_upgrade_code(junk, SECRET) is None
+
+
+# ---- 3c-1A：新形态（带 kid）的升级码，与 panel 侧共用同一组 MUTATIONS ----
+from upgrade_code_vectors import CONSOLE_KID, CONSOLE_KID_SECRET, CONSOLE_ALLOWLIST  # noqa: E402
+
+
+@pytest.mark.parametrize("name,mutate,expect_reject", MUTATIONS)
+def test_kid_form_mutation_vectors(name, mutate, expect_reject):
+    code = mutate(session.mint_token(kid=CONSOLE_KID, secret=CONSOLE_KID_SECRET,
+                                     token_use="console-upgrade", email="u@x.com", ttl_seconds=60))
+    claims, _ = session.verify_with_legacy(code, allowlist=CONSOLE_ALLOWLIST, token_use="console-upgrade",
+                                           legacy_secret=SECRET)
+    assert (claims is None) == expect_reject, name

@@ -9,7 +9,8 @@ for k, v in {"{{DYNAMODB_TABLE_NAME}}": "t", "{{DYNAMODB_REGION}}": "us-east-1",
              "{{FRONTEND_BUCKET_DOMAIN}}": "b.s3.us-east-1.amazonaws.com",
              "{{JWT_SECRET}}": "test-secret", "{{BASE_DOMAIN}}": "example.com",
              "{{REQUIRE_IDP_CLAIM}}": "true",
-             "{{TRUSTED_IDPS}}": "Feishu,Okta"}.items():
+             "{{TRUSTED_IDPS}}": "Feishu,Okta",
+             "{{SITE_ALLOWLIST_JSON}}": '{"site-hs-v1": {"alg": "HS256", "secret": "site-secret-v1", "role": "current"}}', "{{LEGACY_ENTRY}}": "on"}.items():
     _SRC = _SRC.replace(k, v)
 (Path(__file__).parent / "_edge_auth_testable.py").write_text(_SRC)
 import _edge_auth_testable as orq
@@ -345,7 +346,8 @@ def test_idp_check_disabled_by_switch():
                  "{{FRONTEND_BUCKET_DOMAIN}}": "b.s3.us-east-1.amazonaws.com",
                  "{{JWT_SECRET}}": "test-secret", "{{BASE_DOMAIN}}": "example.com",
                  "{{REQUIRE_IDP_CLAIM}}": "false",
-                 "{{TRUSTED_IDPS}}": "Feishu"}.items():
+                 "{{TRUSTED_IDPS}}": "Feishu",
+                 "{{SITE_ALLOWLIST_JSON}}": '{"site-hs-v1": {"alg": "HS256", "secret": "site-secret-v1", "role": "current"}}', "{{LEGACY_ENTRY}}": "on"}.items():
         src = src.replace(k, v)
     (Path(__file__).parent / "_edge_noidp_testable.py").write_text(src)
     sys.path.insert(0, str(Path(__file__).parent))

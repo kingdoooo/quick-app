@@ -93,6 +93,8 @@ frontend_bucket = site-frontend-123456789012
 # e.g. domain_name = *.example.com -> base_domain = example.com).
 # auth.<base_domain> hosts the login service.
 base_domain = example.com
+# 3c-1A: the Edge session allowlist (site family kids + legacy switch) comes from
+# site-builder/config.ini [SessionKeys]; stack.py reads it at synth time. Nothing to set here.
 # JWT secret is NOT stored here: it is read at deploy time from the SSM
 # SecureString parameter /site-builder/jwt-secret (us-east-1). Create it with:
 #   aws ssm put-parameter --name /site-builder/jwt-secret --type SecureString \

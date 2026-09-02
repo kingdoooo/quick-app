@@ -4,7 +4,33 @@ import login_handler as lh
 
 ENV = {"JWT_SECRET": "s3cret", "COGNITO_DOMAIN": "https://sso.auth.us-east-1.amazoncognito.com",
        "CLIENT_ID": "cid", "CLIENT_SECRET": "csec", "BASE_DOMAIN": "example.com",
-       "USER_POOL_ID": "us-east-1_test"}
+       "USER_POOL_ID": "us-east-1_test",
+       # 3c-1A：两个 family 的 kid 清单（只有参数名）与 legacy 入口开关；值由 _ssm 的假件按参数名给
+       "SESSION_KEYS_JSON": '{"site": [{"kid": "site-hs-v1", "alg": "HS256", "role": "current", "ssm_param": "/site-builder/session-keys/site-hs-v1"}], "console": [{"kid": "console-hs-v1", "alg": "HS256", "role": "current", "ssm_param": "/site-builder/session-keys/console-hs-v1"}]}',
+       "LEGACY_ENTRY": "on"}
+SITE_KID_SECRET = "site-secret-v1"
+CONSOLE_KID_SECRET = "console-secret-v1"
+PARAM_VALUES = {"/site-builder/session-keys/site-hs-v1": SITE_KID_SECRET,
+                "/site-builder/session-keys/console-hs-v1": CONSOLE_KID_SECRET}
+
+
+class _FakeSSM:
+    @staticmethod
+    def get_parameter(Name, WithDecryption=False):
+        return {"Parameter": {"Value": PARAM_VALUES[Name]}}
+
+
+def _use_fake_ssm(monkeypatch):
+    lh._secret_cache.clear()
+    monkeypatch.setattr(lh, "_ssm", lambda: _FakeSSM())
+
+
+def _kid_session(email="u@x.com", **kw):
+    import session
+    args = dict(kid="site-hs-v1", secret=SITE_KID_SECRET, token_use="site-session", email=email,
+                ttl_seconds=600, name="U", idp="Feishu", auth_via="TokenGeneration_HostedAuth")
+    args.update(kw)
+    return session.mint_token(**args)
 
 
 def _event(path, qs=None, cookies=None):
@@ -523,10 +549,10 @@ def test_auth_truncation_detector_bites_each_known_bypass():
             "        for candidate in _session_cookie_candidates(event):",
             "        for candidate in _session_cookie_candidates(event)[:8]:"),
         "中间变量切片": (
-            "        claims = None\n"
+            "        claims, outcome = None, \"bad_signature\"\n"
             "        for candidate in _session_cookie_candidates(event):",
             "        cands = _session_cookie_candidates(event)\n"
-            "        claims = None\n        for candidate in cands[:64]:"),
+            "        claims, outcome = None, \"bad_signature\"\n        for candidate in cands[:64]:"),
         "来源函数内部计数 return": (
             "        if name.strip() == \"sb_session\":\n            out.append(value)",
             "        if name.strip() == \"sb_session\":\n            out.append(value)\n"
@@ -540,19 +566,19 @@ def test_auth_truncation_detector_bites_each_known_bypass():
             "        if name.strip() == \"sb_session\" and len(out) < 20:\n"
             "            out.append(value)"),
         "del 别名切片": (
-            "        claims = None\n"
+            "        claims, outcome = None, \"bad_signature\"\n"
             "        for candidate in _session_cookie_candidates(event):",
             "        cands = _session_cookie_candidates(event)\n        del cands[20:]\n"
-            "        claims = None\n        for candidate in cands:"),
+            "        claims, outcome = None, \"bad_signature\"\n        for candidate in cands:"),
         # 三种用**命名常量**而非整数字面量的形态（Edge 侧同步补的同一批）
         "命名常量上限": (
             "        if name.strip() == \"sb_session\":\n            out.append(value)",
             "        if name.strip() == \"sb_session\" and len(out) < _LIMIT:\n"
             "            out.append(value)"),
         "循环体手写计数器 + 命名常量": (
-            "        claims = None\n"
+            "        claims, outcome = None, \"bad_signature\"\n"
             "        for candidate in _session_cookie_candidates(event):",
-            "        claims = None\n        _n = 0\n"
+            "        claims, outcome = None, \"bad_signature\"\n        _n = 0\n"
             "        for candidate in _session_cookie_candidates(event):\n"
             "            _n += 1\n            if _n > _LIMIT:\n                break"),
         "返回前重绑同名累积变量": (
@@ -649,3 +675,71 @@ def test_auth_appending_one_candidate_appends_exactly_one():
         after = lh._session_cookie_candidates({"cookies": base + [f"sb_session={extra}"]})
         assert after == before + [extra], (
             f"追加 {extra[:16]!r} 后结果不是「原样 + 新值」：{after} 期望 {before + [extra]}")
+
+
+# ---- 3c-1A：/console-session 的「2 + 1」入口（新形态 kid + legacy）----
+
+@patch.dict(lh.os.environ, ENV)
+def test_console_session_accepts_kid_form_site_session(monkeypatch):
+    import session, urllib.parse
+    _use_fake_ssm(monkeypatch)
+    r = lh.handler(_event("/console-session", cookies=[f"sb_session={_kid_session()}"]), None)
+    assert r["statusCode"] == 302, r
+    loc = r["headers"]["Location"]
+    assert loc.startswith("https://console.example.com/api/session-callback?code=")
+    code = urllib.parse.unquote(loc.split("code=", 1)[1])
+    # 1A：signer 不动，换出来的升级码仍是 legacy 形态
+    assert session.verify_upgrade_code(code, ENV["JWT_SECRET"])["email"] == "u@x.com"
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_console_session_rejects_console_kid_token_as_site_session(monkeypatch):
+    import session
+    _use_fake_ssm(monkeypatch)
+    tok = session.mint_token(kid="console-hs-v1", secret=CONSOLE_KID_SECRET, token_use="site-session",
+                             email="u@x.com", ttl_seconds=600, name="U", idp="Feishu", auth_via="x")
+    r = lh.handler(_event("/console-session", cookies=[f"sb_session={tok}"]), None)
+    assert "/login" in r["headers"]["Location"]
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_console_session_unknown_kid_does_not_fall_back_to_legacy(monkeypatch):
+    import base64, hashlib, hmac, json as _json, time
+    _use_fake_ssm(monkeypatch)
+    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+    h = b64(_json.dumps({"alg": "HS256", "typ": "JWT", "kid": "site-hs-v9"}).encode())
+    p = b64(_json.dumps({"typ": "session", "email": "u@x.com", "exp": int(time.time()) + 600}).encode())
+    sig = b64(hmac.new(ENV["JWT_SECRET"].encode(), f"{h}.{p}".encode(), hashlib.sha256).digest())
+    r = lh.handler(_event("/console-session", cookies=[f"sb_session={h}.{p}.{sig}"]), None)
+    assert "/login" in r["headers"]["Location"], "未知 kid 回落到了 legacy 入口"
+
+
+@patch.dict(lh.os.environ, dict(ENV, LEGACY_ENTRY="off"))
+def test_console_session_legacy_entry_off(monkeypatch):
+    import session
+    _use_fake_ssm(monkeypatch)
+    legacy = session.mint_session_jwt("u@x.com", "U", ENV["JWT_SECRET"])
+    r = lh.handler(_event("/console-session", cookies=[f"sb_session={legacy}"]), None)
+    assert "/login" in r["headers"]["Location"]
+    r = lh.handler(_event("/console-session", cookies=[f"sb_session={_kid_session()}"]), None)
+    assert "session-callback?code=" in r["headers"]["Location"]
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_console_session_shadow_cookie_before_kid_form_session_still_exchanges(monkeypatch):
+    """M06 不退化：遮蔽项排在前面时仍逐个验。"""
+    _use_fake_ssm(monkeypatch)
+    r = lh.handler(_event("/console-session",
+                          cookies=["sb_session=garbage.garbage.garbage", f"sb_session={_kid_session()}"]), None)
+    assert "session-callback?code=" in r["headers"]["Location"]
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_console_session_logs_verify_outcome_without_token(monkeypatch, capsys):
+    _use_fake_ssm(monkeypatch)
+    tok = _kid_session()
+    lh.handler(_event("/console-session", cookies=[f"sb_session={tok}"]), None)
+    out = capsys.readouterr().out
+    rows = [json.loads(l) for l in out.splitlines() if l.startswith("{") and "session_verify" in l]
+    assert rows and rows[-1]["outcome"] == "accepted_current" and rows[-1]["verifier"] == "auth"
+    assert tok.split(".")[1] not in out
