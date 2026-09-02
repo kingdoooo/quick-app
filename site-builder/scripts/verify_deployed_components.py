@@ -604,8 +604,11 @@ def run_deployed() -> None:
     print("\n── ④ 线上 auth 服务是否加载了这份代码 ──────────────")
     z = _fetch_package(lam, "site-auth-service")
     pkg = set(z.namelist())
+    # 清单从 deploy_auth.AUTH_PACKAGE_MODULES 推导，不在这里手抄第二份（2026-09-02 漏 verifier_env.py
+    # 让 auth 全部 502，而这里只核对被点名的两个文件 ⇒ 绿）。
+    da = _load_deploy_module("deploy_auth", ROOT / "site-builder/auth/deploy_auth.py")
     auth_mismatch: list[str] = []
-    for base in ("login_handler.py", "session.py"):
+    for base in da.AUTH_PACKAGE_MODULES:
         local = ROOT / "site-builder/auth" / base
         if base not in pkg:
             auth_mismatch.append(f"{base}(包里缺失)")
@@ -614,7 +617,7 @@ def run_deployed() -> None:
                 != hashlib.sha256(local.read_bytes()).hexdigest()):
             auth_mismatch.append(base)
     check(not auth_mismatch,
-          "site-auth-service 的 login_handler.py / session.py 与本地一致",
+          f"site-auth-service 的 {len(da.AUTH_PACKAGE_MODULES)} 个本地模块（AUTH_PACKAGE_MODULES）都在包里且与本地一致",
           "不一致: " + ", ".join(auth_mismatch) if auth_mismatch
           else "含 session.py（与 Edge 验签同算法，必须同步）")
     # TTL 必须是**赋值语句**而不是只出现在注释里（前几轮栽过"断言的字样只活在
@@ -628,7 +631,6 @@ def run_deployed() -> None:
               "无 TTL 时轮转密钥后 warm 容器会永久用旧值")
     # 3c-1A：环境变量**整体** == 本地 lambda_env() 推导值（SESSION_KEYS_JSON / LEGACY_ENTRY 也在其中），
     # 且无明文密钥。漏下发的症状是 /console-session 全部 500，而单测有 ENV 兜着看不出来。
-    da = _load_deploy_module("deploy_auth", ROOT / "site-builder/auth/deploy_auth.py")
     got_env = lam.get_function_configuration(FunctionName="site-auth-service").get(
         "Environment", {}).get("Variables", {})
     want_env = da.lambda_env()["Variables"]

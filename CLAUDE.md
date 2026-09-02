@@ -334,6 +334,7 @@ python3 site-builder/scripts/gen_onboarding.py
 - **统计埋点的超时预算不能按同区算**：Edge 写本区副本是 6ms（冷 58ms），但回落路径是
   跨区 229ms（冷 **719ms**，实测）。预算的下限由回落决定；收紧到「够本区用」就等于让
   回落路径静默丢行。埋点异常一律吞掉（统计不是安全控制），所以丢行是**无声的**。
+- **auth 的部署包清单是 `deploy_auth.AUTH_PACKAGE_MODULES`，由 `auth/tests/test_deploy_auth_package.py` 按 login_handler 的 import 闭包核对**。2026-09-02 实测：给 login_handler 新加一个同目录 import（`verifier_env`）却没进包 ⇒ `Runtime.ImportModuleError` ⇒ **整个 auth 502 约 4 分钟**，而单测全绿、`verify_deployed_components` 也绿（它当时只核对两个点名文件）。同一条纪律 panel 那边叫 `COPY_FILES`。
 - **改了 `permissions.py` 这类共享模块，要重部的是三个组件**：panel、key-proxy、MCP
   各自把它打进自己的产物（key-proxy 也带，虽然它只用 `EMAIL_RE`）。漏一个的症状是
   产物陈旧而部署脚本一切正常——`verify_deployed_components.py` 是唯一会点出来的地方。

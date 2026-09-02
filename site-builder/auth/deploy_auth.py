@@ -104,12 +104,17 @@ def build_zip() -> bytes:
             for p in Path(td).rglob("*"):
                 if p.is_file():
                     z.write(p, p.relative_to(td))
-            z.write(src / "session.py", "session.py")
-            z.write(src / "login_handler.py", "login_handler.py")
+            # login_handler 的本地依赖闭包：漏任一个 = Runtime.ImportModuleError = **整个 auth 502**
+            # （2026-09-02 实测：verifier_env.py 漏进包，登录与 /console-session 全部 502）。
+            # 清单由 tests/test_deploy_auth_package.py 按 AST 传递闭包核对，别照记性加减。
+            for name in AUTH_PACKAGE_MODULES:
+                z.write(src / name, name)
         return buf.getvalue()
 
 
 JWT_SECRET_PARAM = "/site-builder/jwt-secret"
+# 进包的本地模块（handler + 它 import 的同目录模块）；与 panel 的 COPY_FILES 同一种"清单以闭包断言为准"的纪律
+AUTH_PACKAGE_MODULES = ("login_handler.py", "session.py", "verifier_env.py")
 CLIENT_SECRET_PARAM = "/site-builder/site-client-secret"
 
 

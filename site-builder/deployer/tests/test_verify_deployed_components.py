@@ -172,3 +172,11 @@ def test_panel_branch_compares_the_whole_environment_to_the_local_derivation():
     src = _SCRIPT.read_text(encoding="utf-8")
     panel = src[src.index("def run_panel"):src.index("\ndef ", src.index("def run_panel") + 10)]
     assert "lambda_environment(" in panel and "环境变量 == 本地" in panel
+
+
+def test_auth_branch_checks_every_declared_package_module_not_two_hand_picked_files():
+    """2026-09-02：漏 verifier_env.py 时这里仍绿，因为只核对 login_handler/session 两个点名文件。"""
+    src = _SCRIPT.read_text(encoding="utf-8")
+    auth = src[src.index("线上 auth 服务是否加载了这份代码"):src.index("def run_panel")]
+    assert "AUTH_PACKAGE_MODULES" in auth
+    assert 'for base in ("login_handler.py", "session.py")' not in auth
