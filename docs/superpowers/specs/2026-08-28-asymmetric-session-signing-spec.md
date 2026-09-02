@@ -1,7 +1,10 @@
 # 3c：会话签名迁到非对称（设计 spec）
 
-日期 **2026-08-28**（末次修订 **2026-08-31**）。状态：**待修订的设计草案，未实施**
-（外部复审第十三、十四轮的 P1 已按下文吸收；**它不构成 3c-0/3c-1 的实施授权**）。
+日期 **2026-08-28**（末次修订 **2026-09-02**）。状态：**3c-0 裁决完成，未实施**
+（§11 七个未决项已于 2026-09-02 逐条定稿；§11.1 的冷启动数字已按最终实现形态复测通过（第一轮
+判读作废）；外部复审第十三、十四轮的 P1 与 Codex 对 3c-0 的 6 条阻断项已按下文吸收；**它不构成
+3c-1 及之后各包的实施授权**）。
+术语以根 `CONTEXT.md` 为准；三条随裁决立下的 ADR 在 `docs/adr/0001` 到 `0003`。
 对应 merged review §9 的 **3c**
 （M09 真修复 ②）。前一条 3b（收窄 CodeBuild 对 bootstrap 桶的读权限）已于 2026-08-27
 部署，见 `2026-08-27-codebuild-bootstrap-read-narrowing-spec.md`。
@@ -23,7 +26,7 @@
 - signer / verifier 的部署与回滚次序；
 - RSA 验签用 vendored 库还是纯 Python。
 
-**最后一条刻意留空**，由 3c-0 的 spike 裁决，见 §11。本文档不预先承诺手写 RSA 验签。
+**这七件事在 §11 都已裁定**；最后一条以冷启动 spike 的实测为闸，最终形态复测已通过（§11.1）。
 
 **明确不在本文档范围**：账号迁移（§9 的 3d）、`dsql:DbConnect` 的 `Resource: *`、
 同名 cookie 的身份混淆（host-only 会话，独立成包）。
@@ -64,6 +67,13 @@
 | `edge:new-function+associate`（新建函数 + `PassRole` edge 执行角色） | 12 |
 | `edge:cfn-update-stack`（router 栈） | **17** |
 | **`edge:cfn-change-set`**（`CreateChangeSet`+`ExecuteChangeSet`） | 16 |
+
+> **3c-2A 之后多一条已建模路径**：`sign:fixture-issuer`，即 `site-builder-verifier` 角色经 auth 的
+> `/fixture-session` 签**夹具域**站点会话（§11.7）。它是**受限**冒充（只签 `e2e.invalid` 域、只签
+> `site-session`，且 Edge 只在夹具站点上认它，§11.7），仍精确纳入 A 组枚举，单列标签、不与
+> `sign:kms-direct` 合并。**这条路径有两个入口**：经 Function URL 的 `site-builder-verifier` 角色，以及对
+> `site-auth-service` 的直接 `lambda:InvokeFunction`（调用方自己构造整个事件，`userArn` 字段随手伪造，
+> `edge_caller.py` 的 Path A 实测过）。探针两个都要建模。
 
 ### 被外部复审连续纠正过两次的地方（务必别照抄任何旧说法）
 
@@ -241,7 +251,7 @@ KMS 开发者指南 *Key policies*：
 
 ## 4. 目标模型
 
-### 4.1 两个独立 key ring
+### 4.1 两个独立 key family
 
 | key family | 签发者 | 验证者 | token |
 |---|---|---|---|
@@ -257,8 +267,8 @@ KMS 开发者指南 *Key policies*：
   就是授权边界**——这一条让"panel signer 被攻破 ⇒ 伪造站点会话"和"site key 暴露 ⇒
   升级成 console 写权限"两条路在密码学层断开。
 
-**两个 key ring 从第一包（3c-1，仍是 HS256）的数据模型就开始**，不是等到 3c-2 才拆。
-否则 3c-1 建出来的 registry 形状要重做。
+**两个 key family 从第一包（3c-1，仍是 HS256）的数据模型就开始**，不是等到 3c-2 才拆。
+否则 3c-1 建出来的 allowlist 形状要重做。
 
 ### 4.2 三类 token 各自的用途与受众
 
@@ -273,6 +283,8 @@ KMS 开发者指南 *Key policies*：
 > 现有的 `typ` claim 与 `SESSION_TYP` / `UPGRADE_TYP` 常量是 M05 的产物，语义上就是
 > `token_use`。迁移时**改名要连 legacy 兼容一起设计**（§7 的 legacy 入口），不能直接换名
 > 把存量 cookie 全判死。
+>
+> 字面量、`aud` 的类型（单个字符串）、新 token 的 claim 集合与 `kid` 格式在 §11.4 定稿。
 
 ### 4.3 每个 verifier 的 allowlist
 
@@ -285,7 +297,7 @@ KMS 开发者指南 *Key policies*：
 | panel（面板会话） | console | `console-session` |
 | panel（升级码） | console | `console-upgrade` |
 
-### 4.4 kid registry 的形态
+### 4.4 verifier allowlist 的形态
 
 `kid → {key family, alg, key material}`，**固定 allowlist**，每个 family 最多两把：
 `current` + `previous`。
@@ -294,7 +306,7 @@ KMS 开发者指南 *Key policies*：
 
 - **按不可信的 `kid` 动态拼** SSM path / KMS ARN / 文件名。`kid` 来自 token，是攻击者
   控制的输入；用它去拼资源标识就是把资源选择权交出去。
-- **相信 JWT header 自带的 `alg`**。`alg` 只用来**比对** registry 里该 `kid` 绑定的算法，
+- **相信 JWT header 自带的 `alg`**。`alg` 只用来**比对** allowlist 里该 `kid` 绑定的算法，
   不能用来分派实现。
 - **一个全局 key registry 被 Edge / auth / panel 全部共享**。
 - **只靠 cookie 名、`__Host-` 前缀或 `scope` 做用途隔离**。
@@ -306,7 +318,7 @@ KMS 开发者指南 *Key policies*：
 每个 verifier 在**验签通过之后**、按此顺序检查：
 
 1. `kid` 存在，且在**本 verifier 自己的** allowlist 里；
-2. header 的 `alg` 与 registry 中该 `kid` 绑定的算法**精确一致**；
+2. header 的 `alg` 与 allowlist 中该 `kid` 绑定的算法**精确一致**；
 3. 签名用该 `kid` 对应的 key material 验过；
 4. `token_use` **精确一致**；
 5. `aud` **精确一致**；
@@ -314,13 +326,17 @@ KMS 开发者指南 *Key policies*：
 
 **顺序不能反**：先验签、再解析并信任 payload。反了就是在未验签数据上做逻辑判断。
 
-**RS256 阶段（3c-2）额外必须做到的**，若最终选纯 Python 实现（3c-0 裁决）：
-重建完整 EMSA-PKCS1-v1_5 编码后**整块定时比较**（绝不在解出的 EM 里查找/`endswith`
-DigestInfo——那是 Bleichenbacher 2006 那一类伪造的唯一入口）；签名长度**严格等于模长**；
-签名整数 `s < n`；公钥侧校验 SPKI 是 `rsaEncryption`、DER 最小形式、模长 ∈ {2048,3072,4096}、
-**指数等于 65537**；base64url 必须规范形式（拒 `=` 填充、拒标准字母表、拒非规范尾比特）；
-拒 `crit` 头；定时安全比较。**这一整套连同它们的反例用例是 3c-2 的交付物之一**，
-并且要有变形测试证明它们真会红（把整块比较改成 `endswith` 时，EMSA 那组必须全部转红）。
+**RS256 阶段（3c-2B）额外必须做到的，分两层，别混**（Codex 复审：上一稿把 JOSE 层的检查错归到
+纯 Python 分支）：
+
+- **JOSE 层，与用哪个 RSA 实现无关，一律必须**：base64url 必须规范形式（拒 `=` 填充、拒标准
+  字母表、拒非规范尾比特）；拒 `crit` 头；`alg` 只与 allowlist 比对（§4.4）；签名长度**严格等于
+  模长**；公钥侧在部署时校验 SPKI 是 `rsaEncryption`、DER 最小形式、模长 ∈ {2048,3072,4096}、
+  **指数等于 65537**。这一层的反例用例是 3c-2B 的交付物，选 vendored `cryptography`（§11.1）也逃不掉。
+- **RSA 原语层，只在选纯 Python 实现时才由我们负责**（§11.1 已否决，条款保留为唯一可接受的替代
+  实现）：重建完整 EMSA-PKCS1-v1_5 编码后**整块定时比较**（绝不在解出的 EM 里查找/`endswith`
+  DigestInfo——那是 Bleichenbacher 2006 那一类伪造的唯一入口）；签名整数 `s < n`；定时安全比较；
+  并有变形测试证明它们真会红（把整块比较改成 `endswith` 时，EMSA 那组必须全部转红）。
 
 ---
 
@@ -343,10 +359,10 @@ blocker（外部复审第十四轮 P1-2，成立）。
 | 包 | 交付什么 | **进这个包之前**闸门/验收必须已完成 |
 |---|---|---|
 | **3c-0** | 本 spec 定稿 + Edge crypto spike 裁决（§11） | 冒充面探针与脱敏聚合证据 tracked 且可复跑 |
-| **3c-1A** | 全部 verifier 认 `kid`→{family, alg, key} 固定 allowlist、每 family `current`+`previous`、legacy 第三入口（状态机 L1）。**signer 不动** | 闸门认识**两个 HS key ring** 与 legacy/current/previous（今天它只认识一个 `JWT_PARAM_NAME`、一套 Edge/asset 密钥定位）；§9 全部 verifier 反例齐备并验过红绿 |
-| **3c-1B** | signer 开始发 family-specific `kid` + 新 `token_use`/`aud`（状态机 L2）；一次真实 HS 轮转演练 R1/R2 | 四个 `verify_*` 与 10 条 E2E 的登录态工具能 mint **带新 `kid` 的 HS token**（否则 signer 一切就全红，读起来像功能坏了） |
-| **3c-2A** | **只改闸门与验收，不动生产签名**：KMS 探测（`kms:Sign` 持有者、key policy 快照、grants、自助授权、公钥指纹）+ 验收入口改造 | 上一格全绿；本包**自己**先验过红绿（新探测要能真的红） |
-| **3c-2B** | 两把 KMS 非对称 CMK；signer 切 `kms:Sign`；verifier 双接受；key policy 宽严裁定 | **3c-2A 已上线**；五个验收入口拿到**真实登录态**（不再靠读 SSM 明文本地 mint），且验过红绿 |
+| **3c-1A** | 全部 verifier 认 `kid`→{family, alg, key} 固定 allowlist、每 family `current`+`previous`、legacy 第三入口（状态机 L1）；`[SessionKeys]` 按 §11.6 的 schema 落地（此时只有 HS 行）。**signer 不动** | 闸门认识**两个 HS key family** 与 legacy/current/previous（今天它只认识一个 `JWT_PARAM_NAME`、一套 Edge/asset 密钥定位）；§9 全部 verifier 反例齐备并验过红绿 |
+| **3c-1B** | signer 开始发 family-specific `kid` + 新 `token_use`/`aud`（状态机 L2）；两把新 HS secret `/site-builder/session-keys/<kid>` + login-flow secret（§11.3）；一次真实 HS 轮转演练 R1/R2 | 四个 `verify_*` 与 10 条 E2E 的登录态工具能 mint **带新 `kid` 的 HS token**（否则 signer 一切就全红，读起来像功能坏了） |
+| **3c-2A** | **只改闸门与验收，不动生产签名**：KMS 探测（`kms:Sign` 持有者、key policy 快照、grants、自助授权、公钥指纹）+ 验收入口改造（auth `/fixture-session`、`site-builder-verifier` 角色、**Edge 与 panel 的夹具会话边界规则先于签发器上线**、`ensure_fixture_site.py` 常驻夹具站点、探针 `sign:fixture-issuer` 两个入口，§11.7） | 上一格全绿；本包**自己**先验过红绿（新探测要能真的红） |
+| **3c-2B** | 两把 KMS 非对称 CMK（deployer CDK 栈创建，默认 key policy + IAM 条件，§11.2）；signer 切 `kms:Sign`（`RAW`，§11.5；identity policy 同时授 `kms:GetPublicKey`，§11.2）；三层 kid 绑定校验（§11.6）；verifier 双接受 | **3c-2A 已上线**；五个验收入口拿到**真实登录态**（不再靠读 SSM 明文本地 mint），且验过红绿 |
 | **3c-3** | 退役 HS256、删旧 SSM secret、删 legacy 入口（状态机 L3）、基线**精确 delta** | `accepted_legacy == 0` 且总量非 0 持续超过最长 TTL（§8） |
 
 > **为什么不能反**：若先切 `kms:Sign` 再补 KMS 闸门，3c-2 可以部署成功，而旧闸门只看到
@@ -372,9 +388,9 @@ blocker（外部复审第十四轮 P1-2，成立）。
   base64url 规范化）＋一条刻意会红的正向控制。ES256 纯 Python **4.5 ms**（20 倍），
   且 KMS 请求贵 5 倍 ⇒ **排除 ES256**。
 
-**仍未回答、3c-0 收尾必须给出的**（见 §11）：vendored `cryptography` 在 Lambda@Edge 的
-真实 zip 大小、构建平台与**冷启动实测**，对比"受审计的纯 Python RSA verify"的审计成本。
-**在这个实测之前不承诺自己手写 RSA 验签。**
+**§11 七条已全部裁定（2026-09-02），含 §11.1 的最终形态复测**：vendored `cryptography`，冷路径总差
+128 MB 下中位数 +143.3 ms / p95 +147.1 ms（闸 300 / 600），Edge 维持 128 MB；第一轮按 Init 差判读、
+总差 300.14 ms 压在闸上的那次已作废。脚本与数字见 §11.1、§12。
 
 ### 3c-1：HS256 双 key-ring 轮转协议
 
@@ -450,7 +466,8 @@ blocker（外部复审第十四轮 P1-2，成立）。
 
 这一包**只改观测方**：闸门加 KMS 探测（`kms:Sign` / `kms:PutKeyPolicy` /
 `kms:CreateGrant` 的持有者、key policy 快照、grants、公钥指纹），四个 `verify_*` 与
-E2E 的登录态获取方式按 §11 未决项 7 裁定的那条路改造。**本包自己要先验过红绿**——
+E2E 的登录态获取方式按 §11.7 改造（auth 的 `/fixture-session` + `site-builder-verifier` 角色 +
+常驻夹具站点）。**本包自己要先验过红绿**——
 新探测必须能真的红，否则 3c-2B 上线后基线只会显示一个很大的"改善"，而真正要盯的那一面
 根本没被测量（闸门今天明确"不看 KMS grants"）。
 
@@ -459,8 +476,8 @@ E2E 的登录态获取方式按 §11 未决项 7 裁定的那条路改造。**�
 ### 3c-2B：两把 KMS 非对称 CMK
 
 把新的 asymmetric `kid` 加为 `current`、旧 HS256 作为 `previous`；signer 切 `kms:Sign`；
-verifier 双接受。key policy 的宽严（§1 的决策点）在这一包裁定。**前置条件是 3c-2A 已
-上线**，见 §6.1。
+verifier 双接受。key policy 按 §11.2（默认策略 + IAM 条件），CMK 由 deployer 的 CDK 栈创建；
+`kms:Sign` 输入按 §11.5；kid 绑定按 §11.6。**前置条件是 3c-2A 已上线**，见 §6.1。
 
 ### 3c-3：清理与闸门
 
@@ -506,6 +523,10 @@ Edge 要重新部署并等 10–20 分钟全球复制。signer 先切的话，�
 > 的依赖（② 的栈部署时要从 SSM 读 jwt-secret）；而**切换**必须 verifier 先行。
 > 两条都对，适用阶段不同——实现时必须在 DEPLOY.md 里把这个区别写清楚，否则照抄不变量
 > 就会把顺序做反。
+>
+> **3c-2B 另有一条新建依赖**：CMK 在 deployer 的 CDK 栈里（§11.2），所以那一包里 deployer 栈
+> 先于 auth 的 signer 切换；3c-3 删掉 deployer 栈对 jwt-secret 的 SSM 读取后，今天"auth 先于
+> deployer"那条依赖消失。
 
 ---
 
@@ -520,7 +541,7 @@ wrong_token_use    bad_signature       expired
 ```
 
 **退役条件是可观测的、不是估计的**：只有 `accepted_legacy == 0` 持续超过最长 TTL，
-才允许删除 legacy fallback。
+才允许删除 legacy 入口。
 
 （埋点异常一律吞掉——统计不是安全控制。但这意味着丢行是无声的，所以退役判据不能只看
 "计数是 0"，还要看**总量非 0**，即那条埋点确实在工作。）
@@ -539,7 +560,7 @@ wrong_token_use    bad_signature       expired
 - **site 的 `kid` 投给 panel**；
 - **console 的 `kid` 投给 Edge**；
 - `current` / `previous` 之外的第三把 key；
-- **legacy fallback 在截止时间之后仍被接受**。
+- **legacy 入口在截止时间之后仍被接受**。
 
 ### 用途与受众
 
@@ -564,16 +585,25 @@ change-impact matrix 为准**，本节只说"改什么"，不重复时序（上�
 
 | 对象 | 要改什么 | 属于哪个包（§6.1） |
 |---|---|---|
-| `verify_account_trust_boundary.py`（HS 侧） | `JWT_PARAM_NAME` 变成**两个 HS key ring** + legacy/current/previous；产物里定位密钥的正则要能同时找多把 | 3c-1A |
+| `verify_account_trust_boundary.py`（HS 侧） | `JWT_PARAM_NAME` 变成**两个 HS key family** + legacy/current/previous；产物里定位密钥的正则要能同时找多把 | 3c-1A |
+| `verify_account_trust_boundary.py`（login-flow secret） | 把 `/site-builder/login-flow-secret` 列为可读密钥事实，但**归类为非会话签名**（§11.3） | 3c-1B |
 | `verify_account_trust_boundary.py`（KMS 侧） | **新增 KMS 探测**：`kms:Sign` / `kms:PutKeyPolicy` / `kms:CreateGrant` 持有者、key policy 快照、grants、公钥指纹 | 3c-2A |
 | `verify_account_trust_boundary.py`（`replace-platform-code`） | 重建成**完整链**（动作等价类 × 资源等价类），判据与 `scripts/probe_impersonation_surface.py` 的 `classify()` 一致 | 3c-2A（**但它是当前基线的一处低估，与 3c 是否做无关，可提前单独修**） |
 | `verify_account_trust_boundary.py`（基线） | **schema 迁移 + 精确 delta，不是全部重置**——理由见 §6.2 的 3c-3 一节 | 3c-3 |
 | `verify_deployed_edge.sh` | 它按源码字面量 grep 产物里的 `typ` 检查；验签函数重写后那条 regex 必失配 | 3c-1A |
-| `verify_console_e2e.py` / `verify_api_key_e2e.py` / `verify_analytics_e2e.py` / `verify_session_token_semantics.py` | **四个都靠"读 SSM 明文 → 本地 mint 会话"免掉人工登录**。非对称化后本地拿不到私钥 ⇒ **这四个闸门的登录态获取方式要重新设计**，按 **§11 未决项 7** 裁定的那条路改（①真实登录 / ②新增一个 signer principal 并精确纳入 A 组枚举 / ③固定身份的受控签发服务）。**不要写成"给验收角色一条受限的 `kms:Sign`"——`kms:Sign` 不限制 claims，那本身就是一个新的冒充 principal。** 这条影响的正是"我们用来验证一切的东西" | 3c-2A |
+| `verify_console_e2e.py` / `verify_api_key_e2e.py` / `verify_analytics_e2e.py` / `verify_session_token_semantics.py` | **四个都靠"读 SSM 明文 → 本地 mint 会话"免掉人工登录**。非对称化后本地拿不到私钥 ⇒ **这四个闸门的登录态获取方式按 §11.7 重做**：assume `site-builder-verifier` → auth `/fixture-session` 取夹具域 `sb_session` → 其余 token 走真实换取链路；`verify_session_token_semantics.py` 改打常驻夹具站点。**不要写成"给验收角色一条受限的 `kms:Sign`"——`kms:Sign` 不限制 claims，那本身就是一个新的冒充 principal。** 这条影响的正是"我们用来验证一切的东西" | 3c-2A |
 | `deployer/tests/test_e2e_fixtures.py` | 同上（10 条 E2E 的登录态全靠它） | 3c-2A |
 | `test_edge_auth.py` / `test_origin_request.py` / `test_edge_access_log.py` | 占位符替换表、手搓 HMAC 的用例、跨组件向量、签名形状断言 | 3c-1A（HS 形态）→ 3c-2B（RS 形态） |
 | auth / panel 的测试 | `test_session.py`、`test_upgrade_code.py`、`test_console_session.py`、`test_deploy_panel_contract.py`（"SSM 资源必须是精确 jwt-secret ARN"）等 | 3c-1A/1B → 3c-2B |
-| `verify_deployed_components.py` | "环境变量不得有明文密钥"那两处检查 | 3c-2B |
+| `verify_deployed_components.py` | "环境变量不得有明文密钥"那两处检查；新增线上产物 / `config.ini` / KMS 的三方指纹对账（§11.6） | 3c-2B |
+| `deploy_auth.py` | `/fixture-session` 与 verifier 的**两条** Function URL 语句（受 `[Verification]` 开关）、login-flow secret 的 `ensure_secret`、RS `kid` 的部署前四项校验、identity policy 的 `kms:Sign` 条件 + `kms:GetPublicKey` | 3c-1B（secret）→ 3c-2A（fixture）→ 3c-2B（校验） |
+| `deploy_panel.py` / `router/infrastructure/stack.py` | 各自 family 的 `[SessionKeys]` 读取与部署前校验；stack.py 另加 Edge 的 pip 交叉装法与 `requirements-edge.txt`（§11.1） | 3c-1A → 3c-2B |
+| `deployer/infra/app.py` | 两个 `kms.Key`（`RSA_2048` / `SIGN_VERIFY` / RETAIN）+ `CfnOutput`；`test_infra_tables.py` 断言 KeySpec / KeyUsage / RETAIN | 3c-2B |
+| `scripts/ensure_fixture_site.py`（新） | 幂等创建常驻夹具站点（static、`require_auth=True`、只允许 `probe@e2e.invalid`） | 3c-2A |
+| `scripts/probe_impersonation_surface.py` | 新标签 `sign:fixture-issuer`，**两个入口**（verifier 角色经 URL；对 auth 函数的直接 `lambda:InvokeFunction`），`--self-test` 加对应反例 | 3c-2A |
+| `origin_request.py`（夹具分支） | `auth_via = fixture-issuer` 的会话只在 owner 属夹具域的路由上判定，其它路由 302；反例：夹具会话投给真实 org 站点必须 302 | 3c-2A（**先于**签发器上线） |
+| `permissions.py` / `deploy_panel.py` | 拒绝把夹具域邮箱写进非夹具站点的权限字段；admin 名单排除夹具域（三个产物重部，见跨组件矩阵） | 3c-2A |
+| `site-builder/config.ini.example` / `router/config.ini.example` | `[SessionKeys]` + `[SessionKey:<kid>]` + `[Verification]` 的占位形态 | 3c-1A |
 
 **文档**（都是状态真源）：`CLAUDE.md`（不变量 §"auth/session 与 Edge verifier 是同一契约"
 + 开头"三条仍然成立的边界"）、`site-builder/DEPLOY.md`（轮转整节 + 依赖关系 + §7 那条
@@ -582,34 +612,222 @@ change-impact matrix 为准**，本节只说"改什么"，不重复时序（上�
 
 ---
 
-## 11. 未决项（3c-0 收尾必须回答）
+## 11. 3c-0 裁定（原"未决项"，2026-09-02 逐条定稿）
 
-1. **Edge 的 RSA 验签用 vendored `cryptography` 还是纯 Python？**
-   已知：包大小**不是**约束（50 MB 上限，wheel 压缩 4.5 MiB / 解压 14.2 MiB）；
-   真正的代价是 Lambda@Edge **不支持 arm64** ⇒ 必须交叉构建 manylinux x86_64
-   （本仓库在 psycopg 上踩过同一类，deployer bundling 钉死 `platform: linux/amd64`
-   就是为此），且给鉴权关键路径新增一个供应链依赖。
-   **判据**：真机冷启动实测 + 审计成本。**在此之前不承诺手写实现。**
-2. **key policy 的宽严**（§1 的决策点）：默认 root 委派，还是限制性 policy + 破窗
-   principal。判据是可检测性收益是否值得自锁风险与新增暴露面。
-3. **OAuth state 的 `_state_sig`** 用同一把密钥做裸 HMAC。它是 auth 内部自签自验，
-   可以留对称，但**必须换一把独立密钥**——否则旧对称密钥必须留着，"读到就能签"这条路
-   对 state 仍然成立（CSRF 面）。这一项归 3c-1 还是 3c-2 待定。
-4. `token_use` / `aud` 的具体字面量是否就用 §4.2 那六个值（一旦签发就进存量 cookie，
-   改名要付 legacy 兼容的代价）。
-5. **`kms:Sign` 的输入合同**（外部复审要求，不能留到实现里猜——它改变跨组件测试向量）：
-   选 `MessageType=DIGEST` + `Message=SHA-256(JWS signing input)` +
-   `SigningAlgorithm=RSASSA_PKCS1_V1_5_SHA_256`，还是选 `RAW`。`DIGEST` 可规避 `RAW` 的
-   4096 字节上限，但**必须保证只哈希一次**（哈希两次是这条路的经典错法）。
-6. **`kid` 与 KMS key 的不可变绑定**：每个非对称 `kid` 必须绑定不可变的 key ARN/KeyId、
-   SPKI 指纹、`KeySpec`/`KeyUsage`、`SigningAlgorithm`。**不要让 signer 只引用一个可被
-   重新指向别的 key 的 alias 却继续发同一个 `kid`**。若确实用 `current` alias，则
-   `kms:Sign` 返回的 `KeyId` 必须与该 `kid` 期望的 key ID 一致，否则**硬失败**。
-7. **验收身份怎么拿**（这条我原先写成"给验收角色一条受限的 `kms:Sign`"，**那个说法是错的**）：
-   `kms:Sign` **不限制签什么 claims**——拥有该权限就能为任意身份产生合法签名，
-   **它本身就是一个新的 impersonation principal**。三条路里必须选一条并写清：
-   ① 走真实登录；② 接受新增一个 signer principal，并把它**精确纳入 M09 的 A 组枚举**；
-   ③ 设计一个固定身份/固定用途的受控签发服务。**不能把裸 `kms:Sign` 描述成"内容受限"。**
+七条全部裁定，含 §11.1 的冷启动实测。术语按根 `CONTEXT.md`；
+§11.2、§11.7、§11.1 另立 ADR（`docs/adr/0001`、`0002`、`0003`）。**判据与被否决的选项都留在这里**，
+以后有人想"顺手改回去"时先读这一节。
+
+### 11.1 Edge 的 RS256 验签：vendored `cryptography`，以冷启动 spike 为闸
+
+**裁定（2026-09-02 最终形态复测后定稿）：vendored `cryptography`（与 auth / MCP 锁定清单里同一个
+`cryptography==50.0.0`，hash 钉死）；Edge 内存维持 128 MB。**
+
+**判据（Codex 复审后重述）**：在与 Edge 相同的 python3.11 / x86_64 上，vendored 版相对 stdlib-only 版
+**新增的冷路径总时延**（`Init Duration` 差 **加** 冷调用 handler `Duration` 差）中位数 ≤ 300 ms 且
+p95 ≤ 600 ms；**被测函数必须是最终实现形态**：公钥在模块顶层加载并在 import 时预热一次验签，
+handler 里只做验签。128 MB 不达标而 256 MB 达标时接受上调 `router/config.ini` 的 `memory_size`
+（7 个活跃站点的流量下成本可忽略）；256 MB 仍不达标才转纯 Python（§5 RSA 原语层的条款随之成为
+交付物）。
+
+**第一轮 spike 的判读作废**：那一轮只按 `Init` 差判、且 PEM 解析放在 handler 里。按总时延重算，
+128 MB 的中位数差是 **300.14 ms**（Init +130.6 加 handler +169.4），正压在闸上，"4 倍余量"不成立；
+256 MB 约 205 ms。数字保留在 §12 作对照。复测的假设：Init 阶段有 CPU 加速而 handler 阶段按内存
+配比 CPU（同一份 vendored 代码 Init 在两档内存下都是 211 ms，handler 却是 170 对 75 ms），所以把
+解析与预热搬进模块顶层应当让 128 MB 的总差明显下降。**复测证实了这个假设，见下面的数字。**
+
+**为什么不是纯 Python 优先**：平台的 signer（auth）已经信任 `cryptography`，"新增供应链依赖"只对
+Edge 这一个部署单元成立；而 §5 RSA 原语层那一整套陷阱是**我们自己永久背的审计面**。真正未知的
+只有冷启动，所以只让冷启动来裁。ADR：`docs/adr/0003-edge-verifier-vendored-cryptography.md`。
+
+**打包方式**：不引 Docker。复用 `deploy_auth.py` 那条
+`pip install --require-hashes --platform manylinux2014_x86_64 --only-binary :all:` 交叉装法
+（改 `--python-version 3.11`），在 CDK synth 时装进 Edge 的 temp_dir；锁定清单
+`router/infrastructure/lambda/requirements-edge.txt`；`auth/tests/test_requirements_locked.py`
+的 AST 守卫扩到 `router/infrastructure/stack.py`。3c-2B 的 Edge 单测另断言 handler 路径里没有
+`load_pem_public_key` 调用（解析必须在模块顶层）。
+
+**复测要求**（脚本 `site-builder/scripts/spike_edge_crypto_coldstart.py`，按 Codex P2 修过：不复用
+已存在的函数、依赖用带 hash 的锁定清单装、cleanup 失败非零退出）：stdlib / vendored 两臂 ×
+128 / 256 MB，每配置 20 次冷启动，每次冷启动后再 3 次热调用；报告 Init 差、首次调用差、总差、
+热调用验签中位数。原始输出在 gitignored 的 `docs/design/3c-spike/`。
+
+**复测结果（2026-09-02，最终形态；每配置 20 次冷启动 + 60 次热调用；原始输出
+`docs/design/3c-spike/edge-crypto-coldstart-20260902T102034Z.json`）**：
+
+| 配置 | Init 中位数 | Init p95 | 首次调用中位数 | 冷路径总计中位数 | 总计 p95 | 热调用中位数 | Max Memory |
+|---|---|---|---|---|---|---|---|
+| stdlib @ 128 MB | 81.3 ms | 86.7 ms | 1.3 ms | 82.6 ms | 88.1 ms | 1.06 ms | 38 MB |
+| vendored @ 128 MB | 224.6 ms | 233.6 ms | 1.4 ms | 225.9 ms | 235.2 ms | 1.18 ms | 55 MB |
+| stdlib @ 256 MB | 81.3 ms | 85.0 ms | 1.3 ms | 82.6 ms | 86.4 ms | 1.06 ms | 38 MB |
+| vendored @ 256 MB | 227.0 ms | 235.2 ms | 1.4 ms | 228.3 ms | 236.7 ms | 1.19 ms | 55 MB |
+
+冷路径总差（vendored 减 stdlib）：**128 MB 中位数 +143.3 ms / p95 +147.1 ms**（配对差 +143.0 / +153.3）；
+256 MB +145.7 / +150.3。闸 300 / 600 ⇒ **两档都通过，中位数约 2 倍余量、p95 约 4 倍**；内存对结果无
+影响，所以 Edge 维持 128 MB。首次调用差归零（0.0 / 0.1 ms）：把解析与预热搬进模块顶层后，第一轮里
+那 170 ms 的 handler 开销消失，总差从 300 降到 143，证实了上面的 Init 阶段 CPU 假设。**热调用验签
+增量 0.12 ms**（359 字节 signing input 的 RSA-2048 PKCS1 v1.5 验签），每请求预算可以忽略。包：压缩
+4.93 MB / 解压 15.8 MB / 172 个文件；wheel cryptography 50.0.0、cffi 2.1.1、pycparser 3.0，锁定清单
+`site-builder/scripts/spike_edge_crypto_requirements.txt`（带 sha256；装的时候不加 `--no-deps`，
+所以 pip 同时证明依赖闭包完整）。资源全部删除并二次核实。
+
+### 11.2 KMS key policy：默认（root 委派），不做限制性策略
+
+**裁定**：两把 CMK 用默认 key policy；`kms:Sign` 只经 IAM identity policy 授给 auth role
+（两把）与 panel role（console 一把），并带两个条件：
+`kms:SigningAlgorithm = RSASSA_PKCS1_V1_5_SHA_256`、`kms:MessageType = RAW`（把 §11.5 的
+合同钉进 IAM，零自锁风险）；**同一条 identity policy 还要授 `kms:GetPublicKey`**（§11.6 的运行时指纹
+自检要用；公钥不是秘密，但漏了就是冷启动 AccessDenied，Codex 复审指出上一稿只写了 `kms:Sign`），
+`deploy_auth.py` / `deploy_panel.py` 的合同测试按精确 key ARN 断言这两个动作。不设破窗 principal。闸门（3c-2A）把 `kms:Sign` /
+`kms:PutKeyPolicy` / `kms:CreateGrant` 持有者与 key policy 快照记成静态基线。
+
+**判据**：§1 量出限制性 key policy 只减 1 个 principal，且结构上收不掉"劫持 signer"那条路
+（恶意代码以 signer 角色身份调 KMS，key policy 必须放行它）；换来的是自锁风险加一个必须
+纳入 A 组枚举的破窗 principal。ADR：`docs/adr/0001-session-key-default-kms-key-policy.md`。
+
+**CMK 由谁创建**：deployer 的 CDK 栈（`deployer/infra/app.py`），`kms.Key`
+`RSA_2048` / `SIGN_VERIFY` / `enable_key_rotation=False` / `RemovalPolicy.RETAIN`，
+`CfnOutput` 输出 ARN，由人回填 `[SessionKeys]`（§11.6）；轮转到 v2 = 加一个新 construct。
+SPKI 指纹 CFN 给不出，由 `deploy_auth.py` 部署时 `GetPublicKey` 算出并与配置比对。
+**部署依赖随之变化**：3c-2B 里 deployer 栈先于 auth 的 signer 切换；3c-3 删掉 deployer 栈
+对 jwt-secret 的 SSM 读取后，今天"auth 先于 deployer"那条依赖消失。两条都写进 DEPLOY.md。
+
+### 11.3 登录流程 HMAC 密钥（state 与 PKCE cookie）：独立的 login-flow secret，归 3c-1B
+
+**实况**：`_state_sig` 不只签 OAuth state，也签 `__Host-sb_pkce` cookie
+（`login_handler.py:142-157`，带 `"t":"pkce"` 类型标记），两者 TTL 都是 300 s。
+
+**裁定**：3c-1B 起（signer 离开共享密钥的同一刻）改用一把 **auth 私有**的 SSM SecureString
+`/site-builder/login-flow-secret`（env `LOGIN_FLOW_SECRET_PARAM`，`deploy_auth.py` 的
+`ensure_secret` 生成）。它**不属于任何 key family、没有 `kid`**；轮转就是覆盖参数值，代价
+是 auth 5 分钟缓存窗口内进行中的登录失败一次。闸门把它列为"可读密钥"事实但**归类为非会话
+签名**（读到只值一个登录 CSRF）。
+
+**否决**：借 `site-hs-v1` 到 3c-3 再迁（二次迁移）；去掉 HMAC 改随机 state 存 cookie
+（丢掉 pkce cookie 的类型标记防线，改动面反而更大）。
+
+### 11.4 `token_use` / `aud` / `kid` 字面量：按 §4.2 定稿
+
+- `token_use` 三个值与 `aud` 三个值就是 §4.2 表里那六个；`aud` 是**单个字符串**，数组直接拒。
+- 新 token 的 header 带 `kid`；payload 的 claim 集合**按三类 token 分别定义**（Codex 复审：上一稿
+  一句"只带……"漏了升级码的 `jti`，那会拆掉 panel 的原子消费与并发重放保护）：
+
+  | token | payload claims |
+  |---|---|
+  | 站点会话 | `token_use`、`aud`、`email`、`name`、`idp`、`auth_via`、`exp`、`iat` |
+  | 升级码 | `token_use`、`aud`、`email`、**`jti`**（panel 条件写 session-codes 表原子消费，今天就有）、`exp`、`iat` |
+  | 面板会话 | `token_use`、`aud`、`email`、`name`、`exp`、`iat` |
+
+  三类都**不再写 `typ`（payload）与 `scope`**。新入口忽略未知 claim，但反例必须证明只带
+  `typ=session` 过不了新入口，且缺 `jti` 的升级码必须被拒。
+- `kid` 格式 `{family}-{alg}-v{n}`：`site-hs-v1` / `console-hs-v1` / `site-rs-v1` /
+  `console-rs-v1`。verifier 把它当不透明字符串查 allowlist，**不解析**。
+- `name` 在 mint 时截到 256 字符（`name` 来自 IdP、今天不限长，配合 §11.5 的长度闸）。
+- `token_use` 与同一个 handler 里 Cognito token 的 `token_use`（`id` / `access`）同名：两类
+  token 由不同的 allowlist 验，不会互相通过；保留同名是因为它就是 Cognito 的约定叫法。
+
+### 11.5 `kms:Sign` 输入合同：`RAW`
+
+**裁定**：`MessageType=RAW`，`Message` = JWS signing input 的 ASCII 字节，
+`SigningAlgorithm=RSASSA_PKCS1_V1_5_SHA_256`；signer 侧**任何地方不做本地哈希**；mint 前
+硬检查 `len(signing_input) ≤ 4096`，不满足直接拒（今天约 350 字节，只有 `name` 失控才会碰到）。
+
+**为什么**：PKCS1 v1.5 是确定性签名，`RAW` 与正确实现的 `DIGEST` 产出**同一个**签名，
+跨组件测试向量不受影响；选 `RAW` 是为了把"双哈希"这一类错误从结构上消灭（KMS 文档原话：
+拿摘要走 `RAW` 会被再哈希一次，验签方按单哈希算就失败）。
+
+**测试向量**：用本地一次性 RSA 密钥生成 tracked 的黄金三元组（signing input、SPKI、
+signature）给各 verifier 单测；"KMS 输出 == 本地 `cryptography` 输出"这条 parity 放 3c-2A
+的真机验收。
+
+### 11.6 `kid` 与 KMS key 的绑定：住在 `config.ini`，三个部署脚本校验，signer 每次断言
+
+**裁定**：指纹是每个部署账号各自的值，写进 tracked 代码会把仓库绑死到一个账号；所以绑定
+住在 `site-builder/config.ini`（新增段，HS 与 RS 两阶段共用，**3c-1A 就按此 schema 落地**）：
+
+```ini
+[SessionKeys]
+site_current = site-rs-v1
+site_previous = site-hs-v1
+console_current = console-rs-v1
+console_previous = console-hs-v1
+login_flow_secret_param = /site-builder/login-flow-secret
+
+[SessionKey:site-hs-v1]
+alg = HS256
+ssm_param = /site-builder/session-keys/site-hs-v1
+
+[SessionKey:site-rs-v1]
+alg = RS256
+key_arn = arn:aws:kms:us-east-1:<acct>:key/<uuid>
+spki_sha256 = <hex>
+```
+
+router 只读 site family、panel 只读 console family、auth 读两个 family 加 login-flow；
+`previous` 可以为空；`config.ini.example` 同步占位形态。
+
+**校验分三层**：
+1. **部署前**：auth / panel / router 三个部署脚本对每个 RS `kid` 做 `DescribeKey` +
+   `GetPublicKey`，`KeySpec=RSA_2048`、`KeyUsage=SIGN_VERIFY`、`SigningAlgorithms` 含
+   `RSASSA_PKCS1_V1_5_SHA_256`、SHA-256(SPKI) 等于 `spki_sha256`，四项任一不符**拒绝部署**。
+   Edge asset 内嵌的就是这次拉取到的 PEM + kid + alg。
+2. **运行时**：signer 每次 `Sign` 断言响应 `KeyId` 等于配置的 `key_arn`；容器冷启动做一次
+   `GetPublicKey` 指纹自检，不符则拒签（fail closed）。
+3. **事后**：`verify_deployed_components.py` 把线上产物、`config.ini`、KMS 三方对账。
+
+`key_arn` 必须是带 UUID 的完整 ARN，**代码永不引用 alias**（可以给 key 建人读 alias，只为
+控制台可读）。否决"kid = JWK thumbprint"：日志里不可读，且状态机已经用标签。
+
+### 11.7 验收身份：auth 内的受控签发（方案 ③）
+
+**实况**：四个 `verify_*` 与 10 条 E2E 今天全靠"读 SSM 明文 → 本地 mint"，身份是随机后缀的
+`@example.com`（两个例外：`verify_session_token_semantics.py` 冒充生产站点的**真实 owner**；
+E2E 用 `e2e@test.com`，`test.com` 是真域名）。Cognito 原生登录流被 `deploy_pool.py` 设计性
+禁用、Edge 拒 `TokenGeneration_Authentication`，所以方案 ①"真实登录"在本仓库等于每次人工
+飞书扫码，无人值守闸门全部报废。方案 ② 给验收角色 `kms:Sign` 是一个**不受限**的新冒充
+principal。
+
+**裁定**：方案 ③，实现为 auth 上的 `POST /fixture-session`：
+- 走现有 Function URL（AWS_IAM）。resource policy 只多**一个** principal：新建
+  `site-builder-verifier` 角色，信任策略只列 `[Verification] verifier_trusted_principals`
+  里的显式 ARN，会话上限 1 小时；给它的是**两条**语句（`lambda:InvokeFunctionUrl`，以及
+  `lambda:InvokeFunction` 带 `InvokedViaFunctionUrl=true`，与 edge role 今天那两条同形，**缺一即 403**，
+  CLAUDE.md 高频坑），只在 `[Verification] fixture_issuer = true` 时存在。**无该配置 = 路径 404、
+  语句不存在**，与 ApiKey 组件同款"不存在"。
+- auth 在应用层核对 `requestContext.authorizer.iam.userArn` 匹配
+  `assumed-role/site-builder-verifier/*`，否则 403：Edge role 能调同一个 URL，必须在这里
+  也拒掉它。**这道检查只挡经 Function URL 的调用**：直接 `lambda:InvokeFunction` 的调用方自己构造
+  整个事件，`userArn` 可以伪造（`edge_caller.py` 的 Path A 实测过）。所以持 auth 函数
+  `lambda:InvokeFunction` 的 principal 也能取得夹具会话，探针把这个入口一并建模进
+  `sign:fixture-issuer`；它的危害上限由下面那条边界规则决定，不由这道检查决定。
+- 只签 `token_use=site-session`；email 必须匹配夹具域 `e2e.invalid`（RFC 2606 保留域，
+  `EMAIL_RE` 接受），该域是 **auth 代码里的常量**而不是配置项（授权边界该进 git review），
+  闸门与 E2E 从 auth 导入同一个常量；TTL ≤ 30 分钟；`idp` 打 `fixture`、`auth_via` 打
+  `fixture-issuer`，**不打真实 IdP 的值**。
+- **夹具会话的边界由 Edge 与 panel 强制，不靠"只签夹具域"这句话**（Codex 复审：
+  `allowed_users = "org"` 的站点放行任何 `idp` / `auth_via` 可信的邮箱，上一稿的夹具会话能进所有
+  组织级站点）：Edge 在 idp / auth_via 检查处加一条分支，`auth_via = fixture-issuer` 的会话**只在
+  owner 属于夹具域的路由上**按 allowed_users 正常判定（含 `org`），其它路由一律 302；真实的
+  `TRUSTED_AUTH_SOURCES` 不变。panel 对夹具身份照常（它只能动自己拥有的夹具站点），但
+  `deploy_panel.py` 断言 admin 名单里没有夹具域邮箱，`permissions.write_permissions` 拒绝把夹具域
+  邮箱写进非夹具站点的 owner / collaborators / allowed_users。**夹具站点的标记就是 owner 的域**，
+  `ensure_fixture_site.py` 与闸门"站点形状"层用同一条规则。反例：夹具会话投给真实 org 站点必须 302。
+- **升级码与面板会话不另签**：拿夹具 `sb_session` 走真实的 `/console-session` →
+  `/api/session-callback` 链路换取。于是带外签发的只有一种 token、一个域。
+- 约束写在代码里，所以谁能改 auth 的代码谁就在面里，这正是把它挂在**已经是 signer** 的
+  组件上而不新建组件的理由。探针加 `sign:fixture-issuer` 标签，A 组精确枚举
+  `site-builder-verifier` 并注明"限夹具域"。
+
+**代价两条**：`verify_session_token_semantics.py` 不能再冒充真实 owner，改打一个**常驻**
+夹具站点（static、`require_auth=True`、`allowed_users` 只有 `probe@e2e.invalid`，由新脚本
+`scripts/ensure_fixture_site.py` 幂等创建，作为部署验收的一步；探针保持只发 GET）；E2E 的
+`e2e@test.com` 改成夹具域。sites 表里今天没有活着的夹具站点（107 条 DELETED 墓碑、7 条
+ACTIVE 全是真实 owner）。那 107 条墓碑**不在 3c-0 处理**，另开数据卫生变更；闸门"站点形状"层
+只统计 ACTIVE 行、按 owner 域识别夹具站点、不依赖总行数，为常驻夹具站点做一次精确 delta。
+ADR：`docs/adr/0002-fixture-session-issuer-for-acceptance.md`。
+
+**不能写成"给验收角色一条受限的 `kms:Sign`"**：`kms:Sign` 不限制 claims，那本身就是一个
+新的冒充 principal。这句保留，防止以后有人把 ③ 又简化回 ②。
 
 ---
 
@@ -631,6 +849,7 @@ change-impact matrix 为准**，本节只说"改什么"，不重复时序（上�
 | key policy 权威性与自锁警告 | KMS 开发者指南 *Key policies* / *Default key policy* / `PutKeyPolicy` API |
 | `RSA_2048` 非对称请求与对称同价、ECC 贵 5 倍、非对称不含免费额度 | AWS Pricing API（只读）+ KMS pricing 页 |
 | 纯 Python RS256 验签 0.24 ms、ES256 4.5 ms | 本机实测，1000 次取平均 |
+| Edge vendored `cryptography`：最终形态复测 128 MB 冷路径总差中位数 **+143.3 ms** / p95 **+147.1 ms**（闸 300 / 600），热调用验签 +0.12 ms；第一轮（PEM 解析在 handler 里、只看 Init 差）总差 300.14 ms 的判读已作废 | `site-builder/scripts/spike_edge_crypto_coldstart.py` + `spike_edge_crypto_requirements.txt`（tracked，一次性 Lambda、跑完自删；2026-09-02 两轮各 80 次冷启动）→ 原始输出 `docs/design/3c-spike/edge-crypto-coldstart-20260902T{093211,102034}Z.json`（gitignored） | `site-builder/scripts/spike_edge_crypto_coldstart.py`（tracked，一次性 Lambda、跑完自删；2026-09-02，80 次冷启动）→ 原始输出 `docs/design/3c-spike/edge-crypto-coldstart-20260902T093211Z.json`（gitignored） |
 | Edge 跨区调用 热 229 ms / 冷 719 ms | 本仓库既有实测（CLAUDE.md 埋点预算） |
 
 ### 12.1 产物位置：**分三层，前两层 tracked**

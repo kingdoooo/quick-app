@@ -342,7 +342,7 @@ python3 site-builder/scripts/gen_onboarding.py
 | **还剩什么没做 / 优先级** | `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9（**tracked**；两轮独立对抗性审查的合并版。S1 取的是表里 M01/M02/M05/M06 四条；M09 已按 v5 重定义并落地，其余各条还没做） |
 | **平台防谁 / 不防谁（账号信任边界）** | `docs/security/account-trust-boundary.md`（**tracked**；M09 的结论真源。含只读实测方法、**14 个由基线断言的数字**（A/B 两组 + 按类别）、为什么 SCP/resource policy/应用层签名/收窄 invoke 都不成立） |
 | **M09 真修复①的设计与实施记录（2026-08-27 已部署）** | `docs/superpowers/specs/2026-08-27-codebuild-bootstrap-read-narrowing-spec.md`（**tracked**；收窄 CodeBuild 对 CDK bootstrap 桶的读权限＝§9 的 3b。含为什么已有那条 AST 守卫看不见这个洞、三层守卫各自能证明什么、部署窗口的干净失败面；末尾「实施记录与验收证据」一节是 handover）|
-| **M09 真修复②的设计（3c，未实施）** | `docs/superpowers/specs/2026-08-28-asymmetric-session-signing-spec.md`（**tracked**；会话签名迁非对称。**状态是待修订草案，不构成实施授权**。含量测过的收益边界（56 → **冒充面 19，这是已知下界不是上界**）、两个 key ring 的模型、分包顺序 3c-0/1A/1B/**2A**/2B/3（2A 是"闸门与验收先认 KMS"的独立发布单元）、部署与回滚协议、以及「四个 verify_* 闸门靠读 SSM 明文本地 mint 会话，非对称化后要重新设计」这条容易漏的代价）|
+| **M09 真修复②的设计（3c，3c-0 裁决完成，未实施）** | `docs/superpowers/specs/2026-08-28-asymmetric-session-signing-spec.md`（**tracked**；会话签名迁非对称。**状态：§11 七个未决项已于 2026-09-02 全部裁定（含 Edge 冷启动最终形态复测：vendored `cryptography` 过闸、128 MB 不动），不构成实施授权**；裁定原文与被否决项都在 §11，三条 ADR 在 `docs/adr/`。含量测过的收益边界（56 → **冒充面 19，这是已知下界不是上界**）、两个 key family 的模型、分包顺序 3c-0/1A/1B/**2A**/2B/3（2A 是"闸门与验收先认 KMS"的独立发布单元）、部署与回滚协议、以及「四个 verify_* 闸门靠读 SSM 明文本地 mint 会话，非对称化后要重新设计」这条容易漏的代价）|
 | **3c 冒充面的可复跑证据** | `site-builder/scripts/probe_impersonation_surface.py`（**tracked**，只读，实测约 20 分钟）→ `docs/security/3c-impersonation-surface.json`（**tracked**，只有计数/等价类/边际收益/盲区清单，名字只进 gitignored dump）。**`--self-test` 不碰 AWS**，18 条反例 + 变形测试在 `deployer/tests/test_probe_impersonation_surface.py`。**别再引用 56→13 / 并集 18 那两组旧数字** |
 | 加固包 S1 的设计与实施 | `docs/superpowers/specs/2026-08-22-s1-isolation-and-auth-hardening-spec.md` + `docs/superpowers/plans/2026-08-22-s1-isolation-and-auth-hardening.md`；升级/闸门/回滚见 `site-builder/DEPLOY.md` 的「S1 加固」一节 |
 | 一期设计决策与范围 | `docs/superpowers/specs/2026-07-21-quick-site-builder-design.md`（已实现快照，勿改） |
@@ -462,5 +462,6 @@ issue 与 spec 存成本地 markdown（`.scratch/<feature>/`，**gitignored、�
 
 ### Domain docs
 
-single-context：根 `CONTEXT.md` + `docs/adr/`。**两者现在都还不存在**，缺了就静默继续
-（由 `/domain-modeling` 在术语或决策真的定下来时才创建）。See `docs/agents/domain.md`.
+single-context：根 `CONTEXT.md` + `docs/adr/`。**两者已于 2026-09-02 随 3c-0 裁决创建**（词表
+11 条，全是会话签名与验收夹具的术语；ADR 0001 到 0003）。之后仍由 `/domain-modeling` 在术语或
+决策真的定下来时才追加，不预先占位。See `docs/agents/domain.md`.
