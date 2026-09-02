@@ -149,8 +149,10 @@ email/enterprise_email 字段。
 
 | 参数名                                | 何时创建               | 用途                                   |
 | ---------------------------------- | ------------------ | ------------------------------------ |
-| `/site-builder/jwt-secret`         | **部署 ② 之前手工创建**    | 站点会话 JWT 的 HS256 签名密钥，Edge 函数与登录服务共用 |
+| `/site-builder/jwt-secret`         | **部署 ② 之前手工创建**    | 站点会话 JWT 的 HS256 签名密钥，Edge 函数与登录服务共用（3c-1A 起它只是 legacy 入口那一把） |
 | `/site-builder/site-client-secret` | ① 阶段建完 Cognito 后写入 | 站点登录 App Client 的 secret             |
+| `/site-builder/session-keys/{site,console}-hs-v1` | `scripts/ensure_session_keys.py`（幂等，路径来自 `[SessionKeys]`） | 两个 key family 各一把 HS256 会话签名密钥（3c-1A）。Edge 只持 site、panel 只持 console、auth 两个都持 |
+| `/site-builder/login-flow-secret`  | 同上（`ensure_session_keys.py`；`deploy_auth.py` 另有一条 `ensure_secret` 缺省补建） | **登录流程**（OAuth state 与 `__Host-sb_pkce` cookie）的 HMAC 密钥，3c-1B 起启用。**auth 私有**：不是 `kid`、不属于任何 family、不签发也不验证会话，panel 与 Edge 永不持有它 |
 
 
 ```bash
@@ -174,7 +176,7 @@ auth 的执行角色因此需要 `ssm:GetParameter`（限定 `/site-builder/*`�
 
 #### ⚠️ 轮转 `jwt-secret`：当前实现下**不能就地改值**
 
-两个密钥的轮转代价完全不同，别按同一套做：
+三把密钥的轮转代价完全不同，别按同一套做：
 
 - `site-client-secret`：**不能只改 SSM**。这个值不是我们自己定的——它必须是
   Cognito 那个 app client 认可的 secret。直接写一个新随机值进 SSM，5 分钟后
@@ -234,6 +236,27 @@ auth 的执行角色因此需要 `ssm:GetParameter`（限定 `/site-builder/*`�
   用户登录后立刻被踢回登录页；而**已登录用户的旧 cookie 在 auth 切换后仍在
   旧 Edge 节点上有效**，于是同一时刻不同用户、不同地区表现不一致。
   症状（无限登录跳转）与"密钥读取失败"完全一样，极难定位到密钥版本。
+- `login-flow-secret`（3c-1B 起）：**这一把可以就地改值**，是三者里唯一一把。
+
+  ```bash
+  aws ssm put-parameter --region us-east-1 --overwrite \
+    --name /site-builder/login-flow-secret --type SecureString \
+    --value "$(openssl rand -hex 32)"
+  ```
+
+  它只有 auth **一个**消费方（panel 与 Edge 永不持有它），所以没有"两个消费方
+  更新速度不同"这个问题——没有 Edge 那 10–20 分钟的全球复制窗口要等。
+  代价是 auth 的 5 分钟缓存窗口（`SECRET_TTL_SECONDS`）内**进行中**的登录失败
+  一次：那期间已经拿到旧密钥签的 state / pkce cookie 的用户，回到 `/callback` 时
+  会撞上"登录状态已过期，请重新登录"的 400，**重试一次即可**。
+  **已签发的会话完全不受影响**——会话由会话密钥签（signer 切换前是 legacy 那把、
+  切换后是各 family 的 current），这把密钥碰不到它们。所以覆盖它既不需要重部署
+  任何组件，也不需要等任何复制窗口。
+
+  > 别把它与会话密钥混在一起做。读到这把密钥只值一个登录 CSRF（state 与
+  > cookie 都只活 300 秒）；读到会话密钥等于能伪造任意用户的会话。它在 3c-1B
+  > 从共享会话密钥里分出来正是为了不让后者的暴露面白白多摊一处
+  > （spec §11.3，`login_handler._state_sig` 的 docstring 有完整理由）。
 
 **3c-1A（2026-09-02 已部署）之后：verifier 侧已支持轮转，signer 侧还没切。** 五个验签点
 按 spec §5 的合同验：每个 verifier 只认自己那份 `kid → {alg, key}` allowlist（每 family
@@ -381,6 +404,8 @@ python3 site-builder/scripts/migrate_sites_to_blue_green.py --apply --site-id <s
 - [ ] `*.{base_domain}` ACM 证书 ISSUED（us-east-1）
 - [ ] `{base_domain}` DNS 可修改（Route53 hosted zone 或等价）
 - [ ] SSM `/site-builder/jwt-secret` 已创建（SecureString）
+- [ ] `python3 site-builder/scripts/ensure_session_keys.py` 已跑过：两把 family HS 密钥
+      与 `/site-builder/login-flow-secret` 都在（幂等、只创建不覆盖）
 - [ ] 身份源就绪：【飞书】企业自建应用（App ID/Secret，含用户 userid + 邮箱权限）
       / 【标准 IdP】OIDC/SAML 应用已建、email attribute 可映射
 - [ ] Docker 运行中；`npx` 可用

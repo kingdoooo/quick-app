@@ -2,7 +2,8 @@
 /login → Cognito Hosted UI（后接飞书 OIDC）；/callback → 验 state、验 PKCE、
 验 id_token、种顶域会话 cookie；/logout。
 安全：OAuth 授权码 + PKCE(S256) + nonce；state HMAC 签名 + 5 分钟过期
-（防 login CSRF/redirect 篡改）；id_token 走 Cognito JWKS 验签 +
+（防 login CSRF/redirect 篡改，密钥是 auth 私有的 login-flow secret，
+**不是会话密钥**——见 _state_sig）；id_token 走 Cognito JWKS 验签 +
 iss/aud/exp/token_use 校验，并核对 nonce（防 id_token 重放）。
 **code_verifier 与 nonce 放 `__Host-sb_pkce` host-only cookie，不放 state**
 ——state 随 authorize URL 明文传输（只有签名、没有加密），把 verifier 放进去
@@ -85,7 +86,9 @@ def _secret(name: str) -> str:
     if not param:
         raise RuntimeError(
             f"{name} 无来源：既没有环境变量 {name}，也没有 {name}_PARAM 指向 "
-            "SSM 参数。拒绝继续——空密钥签出的会话任何人都能伪造。")
+            "SSM 参数。拒绝继续——空密钥签出的 HMAC 任何人都能伪造（会话密钥如此，"
+            "3c-1B 起走这条路的 LOGIN_FLOW_SECRET 也如此：它保护 OAuth state 与 "
+            "PKCE cookie，缺它等于关掉 login CSRF 防护）。")
     value = _ssm().get_parameter(Name=param, WithDecryption=True)[
         "Parameter"]["Value"]
     _secret_cache[name] = (value, time.monotonic())
@@ -126,8 +129,24 @@ def _get_jwks_client() -> PyJWKClient:
 
 
 def _state_sig(body: str) -> str:
+    """OAuth state 与 `__Host-sb_pkce` cookie 的 HMAC（两者共用本函数与同一线格式）。
+
+    3c-1B 起用 **auth 私有的 login-flow secret**，不再用会话密钥（spec §11.3 / §11.8.6）。
+    两个理由：① signer 切到 family kid 之后，登录流程会变成那把共享会话密钥**唯一**的活用途，
+    3c-3 删 legacy 时被迫二次迁移；② 两者的价值差一个数量级——读到本密钥只值一个登录 CSRF
+    （state 与 cookie 都只活 300 秒），读到会话密钥等于能伪造任意用户的会话。混用等于把后者的
+    暴露面白白多摊一处。
+
+    **它不属于任何 key family、没有 `kid`**，所以不进 `SESSION_KEYS_JSON`、不进 allowlist，
+    panel 与 Edge 永不持有它。取值经 `_secret()` 的 `{name}_PARAM` 约定读
+    `LOGIN_FLOW_SECRET_PARAM`（deploy_auth 下发参数名），因此它也吃到同一套 TTL 缓存。
+
+    轮转就是 `put-parameter --overwrite`：代价是 auth 的 5 分钟缓存窗口内**进行中**的登录
+    失败一次（用户重试即可），已签发的会话完全不受影响——与轮转会话密钥不是一回事，
+    别按那套十步 runbook 做。见 DEPLOY.md「轮转」一节。
+    """
     return base64.urlsafe_b64encode(hmac.new(
-        _secret("JWT_SECRET").encode(), body.encode(),
+        _secret("LOGIN_FLOW_SECRET").encode(), body.encode(),
         hashlib.sha256).digest()).rstrip(b"=").decode()
 
 

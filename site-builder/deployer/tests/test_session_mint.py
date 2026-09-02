@@ -31,6 +31,7 @@ CFG = textwrap.dedent("""
     console_current = console-hs-v1
     console_previous =
     legacy_param = /site-builder/jwt-secret
+    login_flow_secret_param = /site-builder/login-flow-secret
 
     [SessionKey:site-hs-v1]
     alg = HS256

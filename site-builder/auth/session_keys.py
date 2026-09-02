@@ -11,12 +11,20 @@ schema 见 spec §11.6，HS 与 RS 两阶段共用：
     site_current = site-hs-v1        console_current = console-hs-v1
     site_previous =                  console_previous =
     legacy_param = /site-builder/jwt-secret
+    login_flow_secret_param = /site-builder/login-flow-secret
 
     [SessionKey:<kid>]   alg = HS256 + ssm_param=/site-builder/session-keys/<kid>
                          或 alg = RS256 + key_arn（带 :key/）+ spki_sha256（64 位 hex）
 
 kid 格式 `{family}-{hs|rs}-v{n}`：family 前缀必须与所属 family 一致，算法段必须与 alg
 一致。verifier 把 kid 当不透明字符串查表，**这里的解析只用于校验配置，不用于运行时分派**。
+
+`login_flow_secret_param`（3c-1B，spec §11.3 / §11.8.6）是第三种参数：auth 私有的 HMAC 密钥，
+只签 OAuth state 与 `__Host-sb_pkce` cookie，**不属于任何 family、没有 kid、不签发也不验证会话**。
+所以它不进 `allowlist()`、不进 `env_json()`，只在 `ssm_parameter_names(login_flow=True)` 时出现
+——那个开关只有 deploy_auth 打开，panel 与 Edge 永不持有它。它不许落在 session-keys 前缀下
+（长得像一把 family 密钥会误导闸门与读代码的人），也不许与 legacy / 任何 HS 行同一参数：
+拿会话密钥签登录流程数据正是 1B 要消灭的那条耦合。
 """
 from __future__ import annotations
 
@@ -50,6 +58,7 @@ class KeyRef:
 class SessionKeys:
     families: dict            # family -> {"current": KeyRef, "previous": KeyRef | None}
     legacy_param: str
+    login_flow_secret_param: str   # auth 私有；不是 kid、不属于任何 family（见模块 docstring）
 
     def allowlist(self, family: str) -> tuple[KeyRef, ...]:
         """该 family 的接受集合，current 在前。**不含 legacy**：legacy 是 family 外的第三入口。"""
@@ -115,7 +124,26 @@ def load_session_keys(config_path: Path) -> SessionKeys:
     legacy = _strip(cfg.get("SessionKeys", "legacy_param", fallback=""))
     if not legacy:
         raise SessionKeysError("[SessionKeys] 缺 legacy_param（3c-3 之前必填）")
-    return SessionKeys(families=families, legacy_param=legacy)
+    login_flow = _strip(cfg.get("SessionKeys", "login_flow_secret_param", fallback=""))
+    if not login_flow:
+        raise SessionKeysError(
+            "[SessionKeys] 缺 login_flow_secret_param（3c-1B 起必填；spec §11.3 的字面路径是 "
+            "/site-builder/login-flow-secret）")
+    if not login_flow.startswith("/"):
+        raise SessionKeysError(
+            f"[SessionKeys] login_flow_secret_param={login_flow!r} 不是绝对 SSM 路径")
+    if login_flow.startswith(HS_PARAM_PREFIX):
+        raise SessionKeysError(
+            f"[SessionKeys] login_flow_secret_param={login_flow!r} 落在 {HS_PARAM_PREFIX} 下"
+            "——它不是 kid，不许长得像一把 family 密钥")
+    hs_params = {r.ssm_param for fam in families.values() for r in fam.values()
+                 if r is not None and r.ssm_param}
+    if login_flow == legacy or login_flow in hs_params:
+        raise SessionKeysError(
+            f"[SessionKeys] login_flow_secret_param={login_flow!r} 与一把会话密钥同一参数"
+            "——登录流程的 HMAC 不得复用会话密钥（spec §11.3）")
+    return SessionKeys(families=families, legacy_param=legacy,
+                       login_flow_secret_param=login_flow)
 
 
 def env_json(keys: SessionKeys, families: tuple) -> str:
@@ -136,22 +164,30 @@ def legacy_entry(keys: SessionKeys) -> str:
     return "on" if keys.legacy_param else "off"
 
 
-def ssm_parameter_names(keys: SessionKeys, families: tuple, *, extra: tuple = ()) -> list:
-    """某个执行角色要读的 SSM 参数**名**的精确清单（legacy → extra → 各 family 的 HS 行；去重保序）。
-    role 的 ARN 清单（ssm_parameter_arns）与部署前核对（secrets_util.precheck_parameters）都从它推导，
-    两处不会分叉。"""
-    params = [keys.legacy_param, *extra]
+def ssm_parameter_names(keys: SessionKeys, families: tuple, *, login_flow: bool = False,
+                        extra: tuple = ()) -> list:
+    """某个执行角色要读的 SSM 参数**名**的精确清单（legacy → login-flow（仅 auth）→ extra →
+    各 family 的 HS 行；去重保序）。role 的 ARN 清单（ssm_parameter_arns）与部署前核对
+    （secrets_util.precheck_parameters）都从它推导，两处不会分叉。
+
+    `login_flow=True` **只有 deploy_auth 传**：那把密钥是 auth 私有的（spec §11.3），
+    panel 与 Edge 永不持有它。默认关，漏传的后果是 auth 运行时 AccessDenied（响亮），
+    而误传的后果是把一把密钥交给不需要它的组件（静默扩权）——所以默认取安全的那一侧。"""
+    params = [keys.legacy_param]
+    if login_flow:
+        params.append(keys.login_flow_secret_param)
+    params += list(extra)
     for fam in families:
         params += [r.ssm_param for r in keys.allowlist(fam) if r.alg == "HS256"]
     return list(dict.fromkeys(p for p in params if p))
 
 
 def ssm_parameter_arns(keys: SessionKeys, families: tuple, *, region: str, account: str,
-                       extra: tuple = ()) -> list:
+                       login_flow: bool = False, extra: tuple = ()) -> list:
     """某个执行角色能读的 SSM 参数**精确 ARN 清单**。deploy_auth / deploy_panel 共用，不各拼一份；
     前缀通配 `parameter/site-builder/*` 会把 session-keys 下未来的一切一并交出去。"""
     return [f"arn:aws:ssm:{region}:{account}:parameter{p}"
-            for p in ssm_parameter_names(keys, families, extra=extra)]
+            for p in ssm_parameter_names(keys, families, login_flow=login_flow, extra=extra)]
 
 
 # stack.py 在 SSM 读不到时注入它：**合法 JSON**（Edge import 不炸）、带 SYNTH-ONLY 标记

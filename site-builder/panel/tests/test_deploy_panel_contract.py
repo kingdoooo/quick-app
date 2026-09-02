@@ -984,3 +984,36 @@ def test_panel_legacy_param_env_comes_from_session_keys_not_a_literal():
     src = (PANEL / "deploy_panel.py").read_text()
     assert '"JWT_SECRET_PARAM": "/site-builder/jwt-secret"' not in src, "legacy 参数名硬编码，与 [SessionKeys] 分叉"
     assert "def _panel_ssm_parameter_arns" not in src, "ARN 清单应由 session_keys.ssm_parameter_arns 生成"
+
+
+# ── 3c-1B：login-flow secret 是 auth 私有的，panel 永不持有（spec §11.3）──────
+#
+# 这是一条**负向**不变量，形态与"panel 不得持 site family 的密钥"完全相同：panel 是公网可达
+# 组件，多给它一把密钥就多一处被攻破时能拿到的东西。login-flow 只值一个登录 CSRF，但 panel
+# 压根不参与登录流程——它连"需要"这一条理由都没有。默认关（ssm_parameter_names 的 login_flow
+# 默认 False）意味着漏改这里不会静默扩权，但仍要把它钉死，免得有人"顺手补齐"。
+
+def _login_flow_param():
+    sys.path.insert(0, str(PANEL.parent / "auth"))
+    from session_keys import load_session_keys
+    return load_session_keys(PANEL.parent / "config.ini").login_flow_secret_param
+
+
+def test_panel_environment_has_no_login_flow_secret_param():
+    env = dp.lambda_environment()
+    assert "LOGIN_FLOW_SECRET_PARAM" not in env, "panel 拿到了 auth 私有的 login-flow 参数名"
+    assert not any("login-flow" in str(v) for v in env.values()), \
+        f"panel 的环境变量里出现了 login-flow 参数路径：{env}"
+
+
+def test_panel_role_cannot_read_the_login_flow_secret():
+    param = _login_flow_param()
+    for st in dp.role_statements():
+        for res in _resources(st):
+            assert param not in res, f"panel role 能读 login-flow secret：{res}"
+
+
+def test_panel_deploy_script_does_not_pass_login_flow_to_the_ssm_helper():
+    """结构守卫：`login_flow=True` 只许出现在 deploy_auth 里。"""
+    src = (PANEL / "deploy_panel.py").read_text()
+    assert "login_flow" not in src, "deploy_panel 引用了 login_flow 开关"

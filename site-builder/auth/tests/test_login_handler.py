@@ -5,6 +5,8 @@ import login_handler as lh
 ENV = {"JWT_SECRET": "s3cret", "COGNITO_DOMAIN": "https://sso.auth.us-east-1.amazoncognito.com",
        "CLIENT_ID": "cid", "CLIENT_SECRET": "csec", "BASE_DOMAIN": "example.com",
        "USER_POOL_ID": "us-east-1_test",
+       # 3c-1B：state 与 pkce cookie 的 HMAC 改用 login-flow secret（只下发参数名，值在 conftest 的假 SSM）
+       "LOGIN_FLOW_SECRET_PARAM": "/site-builder/login-flow-secret",
        # 3c-1A：两个 family 的 kid 清单（只有参数名）与 legacy 入口开关；值由 _ssm 的假件按参数名给
        "SESSION_KEYS_JSON": '{"site": [{"kid": "site-hs-v1", "alg": "HS256", "role": "current", "ssm_param": "/site-builder/session-keys/site-hs-v1"}], "console": [{"kid": "console-hs-v1", "alg": "HS256", "role": "current", "ssm_param": "/site-builder/session-keys/console-hs-v1"}]}',
        "LEGACY_ENTRY": "on"}

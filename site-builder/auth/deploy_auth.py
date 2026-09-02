@@ -123,7 +123,8 @@ def lambda_env() -> dict:
     """Lambda 环境变量：**只下发参数名，不下发密钥明文**。
 
     `lambda:GetFunctionConfiguration` 会原样回显环境变量（部署时实测确认），
-    而那是个常见的只读权限。JWT_SECRET 泄漏尤其致命——Edge 只验 HS256 签名，
+    而那是个常见的只读权限。三个 `*_PARAM` 都只是参数名，值运行时才读。
+    JWT_SECRET 泄漏尤其致命——Edge 只验 HS256 签名，
     拿到它即可伪造任意用户的会话 cookie，绕过 owner / allowed_users /
     collaborators 全部判定。运行时由 login_handler._secret() 从 SSM
     SecureString 读并在容器内缓存。
@@ -133,6 +134,10 @@ def lambda_env() -> dict:
         # legacy 参数名的唯一真源是 [SessionKeys] legacy_param（role 的精确 ARN 清单也从它推导；
         # 两处分叉的症状是运行时 AccessDenied）
         "JWT_SECRET_PARAM": keys.legacy_param,
+        # 3c-1B：登录流程（OAuth state 与 __Host-sb_pkce cookie）的 HMAC 密钥参数名。
+        # 键名照 `_secret(name)` 的 `{name}_PARAM` 约定，所以 login_handler._state_sig 只改了
+        # 一个字符串就换了密钥。**auth 私有**——panel 与 Edge 都不下发它（spec §11.3）。
+        "LOGIN_FLOW_SECRET_PARAM": keys.login_flow_secret_param,
         "CLIENT_SECRET_PARAM": CLIENT_SECRET_PARAM,
         "COGNITO_DOMAIN": cfg()["Cognito"]["domain"],
         "CLIENT_ID": cfg()["Cognito"]["site_client_id"],
@@ -152,11 +157,21 @@ def lambda_env() -> dict:
 
 def required_parameters() -> list:
     """部署前必须已存在的 SSM 参数：本函数要读、但**不是本脚本创建**的那些——两个 family 的 HS 行
-    （scripts/ensure_session_keys.py 建）与 site client secret（deploy_pool 建）。legacy 参数是本脚本自己
-    ensure 的（首次部署它本来就不存在），不在清单里。与 role 的 ARN 清单同一上游（ssm_parameter_names）。"""
+    （scripts/ensure_session_keys.py 建）与 site client secret（deploy_pool 建）。与 role 的 ARN 清单
+    同一上游（ssm_parameter_names）。
+
+    `owned` 里那两个由本脚本自己 `ensure_secret`，核对它们等于让这条缺省补建永远走不到（首次部署必然被
+    自己拒掉）。核对的意义是"**多个**消费方必须就同一个值达成一致，所以不能由本脚本随手造一把"：
+    - legacy 参数：Edge 也持有它，但本脚本在首次部署时才生成它，故不核对（3c-1A 的既定取舍）；
+    - login-flow：只有 auth 一个消费方（panel 与 Edge 永不持有），auth 自己造一把随机值完全正确。
+      **这一条与 spec §11.8.12 的字面清单有意不同**，裁定真源是
+      `docs/adr/0004-login-flow-secret-outside-the-pre-write-precheck.md`
+      （照 §11.8.12 原话把它加回清单会让首次部署失败）。
+    """
     keys = load_session_keys(CFG_PATH)
-    owned = {keys.legacy_param}
-    return [p for p in ssm_parameter_names(keys, ("site", "console"), extra=(CLIENT_SECRET_PARAM,))
+    owned = {keys.legacy_param, keys.login_flow_secret_param}
+    return [p for p in ssm_parameter_names(keys, ("site", "console"), login_flow=True,
+                                           extra=(CLIENT_SECRET_PARAM,))
             if p not in owned]
 
 
@@ -188,7 +203,13 @@ def main():
     precheck()
     # 密钥仍在这里**确保存在**（首次部署要生成 JWT secret），但只写进 SSM，
     # 不进环境变量——运行时由 login_handler._secret() 去读。
-    ensure_secret(load_session_keys(CFG_PATH).legacy_param, lambda: secrets.token_hex(32))
+    keys = load_session_keys(CFG_PATH)
+    ensure_secret(keys.legacy_param, lambda: secrets.token_hex(32))
+    # login-flow secret（3c-1B）：主创建点是 scripts/ensure_session_keys.py（部署序列第①步一次
+    # 建齐 config 声明的所有密钥），这里是**缺省补建**（spec §11.8.6 把它叫「兜底」）——
+    # 两处都只创建不覆盖，先跑哪个都一样。
+    # 覆盖它的后果是所有**进行中**的登录失败一次（已签发的会话不受影响），见 _state_sig 的说明。
+    ensure_secret(keys.login_flow_secret_param, lambda: secrets.token_hex(32))
     role_arn = ensure_lambda_role()
     env = lambda_env()
     code = build_zip()
@@ -425,9 +446,10 @@ def ensure_lambda_role() -> str:
         PolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": [
             {"Sid": "ReadPlatformSecrets", "Effect": "Allow",
              "Action": "ssm:GetParameter",
+             # login_flow=True 只有 auth 传：那把密钥 panel 与 Edge 永不持有（spec §11.3）
              "Resource": ssm_parameter_arns(load_session_keys(CFG_PATH), ("site", "console"),
                                             region=region(), account=cfg()["Platform"]["account_id"],
-                                            extra=(CLIENT_SECRET_PARAM,))},
+                                            login_flow=True, extra=(CLIENT_SECRET_PARAM,))},
             # SecureString 用账号默认的 aws/ssm key 加密；解密走 SSM 服务，
             # 故用 ViaService 限定，避免这个角色能直接拿 KMS key 干别的。
             {"Sid": "DecryptViaSSM", "Effect": "Allow",

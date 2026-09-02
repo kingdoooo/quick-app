@@ -75,7 +75,12 @@ results: list[tuple[bool, str, str]] = []
 # **只数不可 SKIP 的项**：非 Edge 直连那条在当前身份无 InvokeFunctionUrl 权限时
 # 合法地 SKIP（那时的 403 来自 IAM 而不是 handler，算 PASS 就是假绿）。
 MIN_LOCAL_CHECKS = 15       # ① 合规 8 + ② 违规 7
-MIN_DEPLOYED_CHECKS = 22    # ③ 4（redlines + schema + 函数集合等值 + 守卫/handler 聚合）+ ④ 2 + ⑤ 7 + ⑥ 3 + ⑦ 6
+# ④ 里 `*_PARAM` 现在**逐个**出一条 check（3c-1B 起是 JWT_SECRET_PARAM 与
+# LOGIN_FLOW_SECRET_PARAM 两个，理由见 _check_env_has_no_plaintext_secret 的 docstring），
+# 所以这个下限比上一版 +1。**它一直是个保守下限、不是等值**：④ 段实际会出 5–6 条
+# （进包清单 / SSM TTL（带 if）/ 环境变量整体等值 / 无明文密钥 / 两个 *_PARAM），
+# 这里只记与上一版同样保守的那部分，不趁机重算其它段。
+MIN_DEPLOYED_CHECKS = 23    # ③ 4 + ④ 3（原 2 + 第二个 *_PARAM）+ ⑤ 7 + ⑥ 3 + ⑦ 6 = 23
 # ⑧ 只在 [ApiKey] 段存在（组件启用）时计入：产物 1 + 环境变量 2 + scope 1 +
 # Function URL 3 + EDGE_ROLE_ID 1 + 环境变量整体 1 + route 6 + Edge 白名单 1 +
 # runtime 3 + 哨兵行 2 + role 2 = 23
@@ -415,23 +420,33 @@ def _looks_high_entropy(v: str) -> bool:
 
 
 def _check_env_has_no_plaintext_secret(env: dict, label: str,
-                                       param_key: str) -> None:
-    """① 键名像密钥（`*_PARAM` 除外——那只是参数名）；② 值像高熵串。
+                                       param_keys: tuple) -> None:
+    """① 键名像密钥（`*_PARAM` 除外——那只是参数名）；② 值像高熵串；
+    ③ 点名的每个 `*_PARAM` 都存在且是 SSM 路径。
 
     `lambda:GetFunctionConfiguration` 会**原样回显**环境变量，而它是个常见的
     只读权限：拿到 JWT_SECRET 即可伪造任意用户会话，拿到 machine client secret
     即可自己换机器 token。
+
+    `param_keys` **一律是元组**，单个键也写成 1-元组（3c-1B：auth 有
+    `JWT_SECRET_PARAM` 与 `LOGIN_FLOW_SECRET_PARAM` 两个，panel/key-proxy 各一个）。
+    不接受裸字符串：`isinstance` 归一化会让同一个形参在三个调用点有两种形状，而
+    字符串本身可迭代——传错时不报错，而是按字符逐个去查环境变量，静默全红。
+    **逐个键单独出一条 check**：合成一条时某个键缺失只会让 detail 里多一个"缺失"
+    字样，闸门总数不变，读报告的人看不出少了哪一个。
     """
+    assert isinstance(param_keys, tuple), f"param_keys 必须是元组，得到 {type(param_keys).__name__}"
     leaked = [k for k, v in env.items()
               if (any(s in k.upper() for s in SECRETISH)
                   and not k.upper().endswith("_PARAM"))
               or _looks_high_entropy(str(v))]
     check(not leaked, f"{label} 环境变量无明文密钥",
           f"疑似明文: {leaked}" if leaked
-          else f"只有参数名 {param_key}={env.get(param_key, '缺失')}")
-    check(env.get(param_key, "").startswith("/"),
-          f"{label} 下发的是 SSM 参数名（不是 secret 本体）",
-          env.get(param_key, "缺失"))
+          else "只有参数名 " + ", ".join(f"{k}={env.get(k, '缺失')}" for k in param_keys))
+    for k in param_keys:
+        check(env.get(k, "").startswith("/"),
+              f"{label} 的 {k} 下发的是 SSM 参数名（不是 secret 本体）",
+              env.get(k, "缺失"))
 
 
 def _check_function_url_authz(lam, fn: str, label: str, edge_role: str) -> None:
@@ -637,7 +652,10 @@ def run_deployed() -> None:
     diff = sorted(k for k in set(got_env) | set(want_env) if got_env.get(k) != want_env.get(k))
     check(not diff, "site-auth-service 环境变量 == 本地 lambda_env() 推导值",
           f"不一致的键: {diff}" if diff else f"{len(want_env)} 个键一致（只有参数名，无明文）")
-    _check_env_has_no_plaintext_secret(got_env, "site-auth-service", "JWT_SECRET_PARAM")
+    # 3c-1B：两个 *_PARAM 都核（LOGIN_FLOW_SECRET_PARAM 漏下发的症状是**所有 /login 500**，
+    # 因为 _state_sig 经 _secret("LOGIN_FLOW_SECRET") 取值、无来源时响亮抛错）
+    _check_env_has_no_plaintext_secret(got_env, "site-auth-service",
+                                       ("JWT_SECRET_PARAM", "LOGIN_FLOW_SECRET_PARAM"))
 
 
 def run_panel() -> None:
@@ -668,7 +686,7 @@ def run_panel() -> None:
                                dp, ROOT / "site-builder/panel"))
 
     env = conf.get("Environment", {}).get("Variables", {})
-    _check_env_has_no_plaintext_secret(env, "panel", "JWT_SECRET_PARAM")
+    _check_env_has_no_plaintext_secret(env, "panel", ("JWT_SECRET_PARAM",))
     # 环境变量**整体** == 本地 lambda_environment() 推导值（SESSION_KEYS_JSON / LEGACY_ENTRY 也在其中）。
     # EDGE_ROLE_ID 是部署时从线上取的值，比对时以线上值为准喂给推导函数。
     want_env = dp.lambda_environment(env.get("EDGE_ROLE_ID", ""))
@@ -1195,7 +1213,7 @@ def run_key_proxy() -> int:
                                dkp, ROOT / "site-builder/key-proxy"))
 
     env = conf.get("Environment", {}).get("Variables", {})
-    _check_env_has_no_plaintext_secret(env, "key-proxy", "MACHINE_SECRET_PARAM")
+    _check_env_has_no_plaintext_secret(env, "key-proxy", ("MACHINE_SECRET_PARAM",))
 
     # MACHINE_SCOPE 必须是 **config 派生**值（Codex 审查 2026-08-11 P1-2a）：
     # 硬编码 `site-builder-mcp/invoke` 绕开了"config.ini 是唯一取值来源"，而

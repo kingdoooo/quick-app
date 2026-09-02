@@ -180,3 +180,107 @@ def test_auth_branch_checks_every_declared_package_module_not_two_hand_picked_fi
     auth = src[src.index("线上 auth 服务是否加载了这份代码"):src.index("def run_panel")]
     assert "AUTH_PACKAGE_MODULES" in auth
     assert 'for base in ("login_handler.py", "session.py")' not in auth
+
+
+# ── 3c-1B：环境变量的"无明文密钥"判据必须覆盖新变量名（spec §11.3 的部署侧后果）──
+#
+# 闸门对 auth 的环境变量做两件事：整体 == 本地 lambda_env() 推导值（新变量自动入闸），
+# 以及这条"无明文密钥"。第二条是唯一能抓住"有人把值而不是参数名下发了"的地方，而它按
+# **键名**判断——所以新加一个 `*_SECRET` 家族的变量时必须确认它被覆盖，而不是假定。
+
+def _env_check(env, param_key):
+    """跑一次 _check_env_has_no_plaintext_secret，返回 [(ok, name, detail), ...]。"""
+    g = _gate()
+    g.results.clear()
+    g._check_env_has_no_plaintext_secret(env, "site-auth-service", param_key)
+    return g.results
+
+
+AUTH_PARAM_KEYS = ("JWT_SECRET_PARAM", "LOGIN_FLOW_SECRET_PARAM")
+GOOD_ENV = {"JWT_SECRET_PARAM": "/site-builder/jwt-secret",
+            "LOGIN_FLOW_SECRET_PARAM": "/site-builder/login-flow-secret",
+            "CLIENT_SECRET_PARAM": "/site-builder/site-client-secret",
+            "BASE_DOMAIN": "example.test"}
+
+
+def test_param_name_only_env_is_green_for_both_secret_params():
+    """正对照：两个参数名都在、都是路径 ⇒ 全绿（否则下面的红证明不了什么）。"""
+    assert all(ok for ok, _, _ in _env_check(GOOD_ENV, AUTH_PARAM_KEYS))
+
+
+def test_plaintext_login_flow_secret_in_env_is_caught():
+    """把值下发成 `LOGIN_FLOW_SECRET` 而不是 `LOGIN_FLOW_SECRET_PARAM` ⇒ 必须红。"""
+    bad = dict(GOOD_ENV, LOGIN_FLOW_SECRET="0123456789abcdef0123456789abcdef")
+    del bad["LOGIN_FLOW_SECRET_PARAM"]
+    assert any(not ok for ok, _, _ in _env_check(bad, AUTH_PARAM_KEYS))
+
+
+def test_missing_login_flow_param_is_caught():
+    """整个变量漏下发 ⇒ 必须红。漏它的症状是**所有 /login 500**（_secret 抛 RuntimeError），
+    与 1A 那次 502 同形，而单测有 ENV 兜着看不出来。"""
+    bad = {k: v for k, v in GOOD_ENV.items() if k != "LOGIN_FLOW_SECRET_PARAM"}
+    assert any(not ok for ok, _, _ in _env_check(bad, AUTH_PARAM_KEYS))
+
+
+def test_login_flow_param_holding_a_value_instead_of_a_path_is_caught():
+    """名字对但值不是 SSM 路径（有人把明文塞进 `*_PARAM` 里绕过键名判据）⇒ 必须红。"""
+    bad = dict(GOOD_ENV, LOGIN_FLOW_SECRET_PARAM="0123456789abcdef0123456789abcdef")
+    assert any(not ok for ok, _, _ in _env_check(bad, AUTH_PARAM_KEYS))
+
+
+def _auth_plaintext_check_param_keys() -> set:
+    """闸门里 auth 那处 `_check_env_has_no_plaintext_secret(...)` **实参**里的键名集合。
+
+    **必须按 AST 读实参，不能在源码文本里 grep 字面量**：本文件第一版就是 grep 一段源码里有没有
+    `"LOGIN_FLOW_SECRET_PARAM"`，而它在**同一段的注释里**也出现——实测把调用改回单键之后，
+    这条守卫照样绿。那正是本仓库栽过的"断言的字样只活在注释里"（闸门自己对 SSM TTL 就写着
+    要按行首赋值断言，理由相同）。`ast` 不解析注释，所以这条只能被真实实参满足。
+    """
+    import ast
+    tree = ast.parse(_SCRIPT.read_text())
+    found = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call)
+                and getattr(node.func, "id", None) == "_check_env_has_no_plaintext_secret"):
+            continue
+        args = list(node.args) + [kw.value for kw in node.keywords]
+        # 第二个实参是 label；只认 auth 那一处调用
+        labels = [a.value for a in args if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+        if "site-auth-service" not in labels:
+            continue
+        for a in args:
+            if isinstance(a, (ast.Tuple, ast.List)):
+                found |= {e.value for e in a.elts
+                          if isinstance(e, ast.Constant) and isinstance(e.value, str)}
+            elif isinstance(a, ast.Constant) and isinstance(a.value, str) \
+                    and a.value.endswith("_PARAM"):
+                found.add(a.value)
+    return found
+
+
+def test_the_gate_passes_both_auth_param_keys_not_just_jwt():
+    """结构守卫：auth 那处必须把两个键都**当实参**交给这条检查，否则上面几条只是理论上有效。"""
+    keys = _auth_plaintext_check_param_keys()
+    assert keys == {"JWT_SECRET_PARAM", "LOGIN_FLOW_SECRET_PARAM"}, (
+        f"闸门实际交给「无明文密钥」判据的键是 {sorted(keys)}——"
+        "LOGIN_FLOW_SECRET_PARAM 漏下发时它不会红")
+
+
+def test_that_structural_guard_is_not_satisfied_by_a_comment():
+    """自测：证明上一条读的是实参而不是注释。
+
+    喂一段"注释里有、实参里没有"的源码给同一个抽取器（这正是第一版守卫的假绿形态）。
+    """
+    import ast
+    src = ('# 3c-1B：两个 *_PARAM 都核（LOGIN_FLOW_SECRET_PARAM 漏下发会 500）\n'
+           '_check_env_has_no_plaintext_secret(got_env, "site-auth-service", "JWT_SECRET_PARAM")\n')
+    found = set()
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == \
+                "_check_env_has_no_plaintext_secret":
+            for a in node.args:
+                if isinstance(a, ast.Constant) and isinstance(a.value, str) \
+                        and a.value.endswith("_PARAM"):
+                    found.add(a.value)
+    assert found == {"JWT_SECRET_PARAM"}, found
+    assert "LOGIN_FLOW_SECRET_PARAM" in src, "本条的前提是注释里确实有那个字面量"

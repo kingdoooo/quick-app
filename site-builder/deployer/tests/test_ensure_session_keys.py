@@ -24,6 +24,7 @@ CFG = textwrap.dedent("""
     console_current = console-hs-v1
     console_previous =
     legacy_param = /site-builder/jwt-secret
+    login_flow_secret_param = /site-builder/login-flow-secret
 
     [SessionKey:site-hs-v1]
     alg = HS256
@@ -40,6 +41,10 @@ RS_PREVIOUS = CFG.replace("site_previous =", "site_previous = site-rs-v1") + tex
     spki_sha256 = 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 """)
 PARAMS = ("/site-builder/session-keys/site-hs-v1", "/site-builder/session-keys/console-hs-v1")
+# 3c-1B：login-flow secret 也由本脚本幂等创建（spec §11.8.6：第①步一次建齐 config 声明的所有密钥）。
+# 它不是 kid，所以在结果字典里用闸门的那个 LABEL（`--new-key login-flow`），永不与 KID_RE 撞。
+LOGIN_FLOW_PARAM = "/site-builder/login-flow-secret"
+LOGIN_FLOW_LABEL = "login-flow"
 
 
 def _cfg(tmp_path, text=CFG):
@@ -55,21 +60,26 @@ def _value(name):
 
 def test_creates_two_distinct_secure_strings_and_prints_no_values(aws, tmp_path, capsys):
     result = esk.ensure_session_keys(_cfg(tmp_path))
-    assert result == {"site-hs-v1": "created", "console-hs-v1": "created"}
-    vals = [_value(p) for p in PARAMS]
+    assert result == {"site-hs-v1": "created", "console-hs-v1": "created",
+                      LOGIN_FLOW_LABEL: "created"}
+    vals = [_value(p) for p in PARAMS + (LOGIN_FLOW_PARAM,)]
     assert all(v["Type"] == "SecureString" for v in vals)
-    assert vals[0]["Value"] != vals[1]["Value"] and len(vals[0]["Value"]) == 64
+    assert len({v["Value"] for v in vals}) == len(vals), "三把密钥必须各自独立"
+    assert all(len(v["Value"]) == 64 for v in vals)
     out = capsys.readouterr().out + capsys.readouterr().err
     for v in vals:
         assert v["Value"] not in out
 
 
 def test_second_run_is_idempotent_and_does_not_overwrite(aws, tmp_path):
+    """覆盖 = 换密钥 = 全员会话失效（login-flow 那把则是所有进行中的登录失败）。"""
     cfg = _cfg(tmp_path)
     esk.ensure_session_keys(cfg)
-    before = [_value(p)["Value"] for p in PARAMS]
-    assert esk.ensure_session_keys(cfg) == {"site-hs-v1": "exists", "console-hs-v1": "exists"}
-    assert [_value(p)["Value"] for p in PARAMS] == before
+    every = PARAMS + (LOGIN_FLOW_PARAM,)
+    before = [_value(p)["Value"] for p in every]
+    assert esk.ensure_session_keys(cfg) == {"site-hs-v1": "exists", "console-hs-v1": "exists",
+                                            LOGIN_FLOW_LABEL: "exists"}
+    assert [_value(p)["Value"] for p in every] == before
 
 
 def test_legacy_param_is_not_its_business(aws, tmp_path):
@@ -81,7 +91,7 @@ def test_legacy_param_is_not_its_business(aws, tmp_path):
 
 def test_rs_rows_are_skipped_only_hs_rows_are_ssm_secrets(aws, tmp_path):
     result = esk.ensure_session_keys(_cfg(tmp_path, RS_PREVIOUS))
-    assert set(result) == {"site-hs-v1", "console-hs-v1"}
+    assert set(result) == {"site-hs-v1", "console-hs-v1", LOGIN_FLOW_LABEL}
 
 
 def test_cli_takes_no_path_argument():
@@ -97,3 +107,29 @@ def test_misconfiguration_aborts_before_any_write(aws, tmp_path):
         esk.ensure_session_keys(_cfg(tmp_path, bad))
     ssm = boto3.client("ssm", region_name="us-east-1")
     assert ssm.describe_parameters()["Parameters"] == []
+
+
+# ---- 3c-1B：login-flow secret（spec §11.3 / §11.8.6）----
+
+def test_login_flow_secret_is_created_at_the_path_config_declares(aws, tmp_path):
+    """路径只来自 config，与两把 family 密钥同一条纪律；它**不在** session-keys 前缀下。"""
+    esk.ensure_session_keys(_cfg(tmp_path))
+    v = _value(LOGIN_FLOW_PARAM)
+    assert v["Type"] == "SecureString" and len(v["Value"]) == 64
+    assert not LOGIN_FLOW_PARAM.startswith("/site-builder/session-keys/"), \
+        "它不是 kid，路径不该长得像一把 family 密钥"
+
+
+def test_login_flow_secret_value_differs_from_every_session_key(aws, tmp_path):
+    """同值等于没迁移：登录流程与会话共用一把密钥正是 1B 要消灭的形态。"""
+    esk.ensure_session_keys(_cfg(tmp_path))
+    session_values = {_value(p)["Value"] for p in PARAMS}
+    assert _value(LOGIN_FLOW_PARAM)["Value"] not in session_values
+
+
+def test_login_flow_secret_is_not_printed(aws, tmp_path, capsys):
+    esk.ensure_session_keys(_cfg(tmp_path))
+    esk.main([])
+    out = capsys.readouterr()
+    assert LOGIN_FLOW_LABEL in out.out, "结果里应报告它的状态"
+    assert _value(LOGIN_FLOW_PARAM)["Value"] not in out.out + out.err

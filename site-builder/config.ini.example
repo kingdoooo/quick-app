@@ -144,6 +144,11 @@ site_previous =
 console_current = console-hs-v1
 console_previous =
 legacy_param = /site-builder/jwt-secret
+# 3c-1B：登录流程（OAuth state 与 __Host-sb_pkce cookie）的 HMAC 密钥，**auth 私有**。
+# 不是 kid、不属于任何 family、不签发也不验证会话；panel 与 Edge 永不持有它。
+# ensure_session_keys.py 一并幂等创建；轮转 = put-parameter --overwrite（见 DEPLOY.md「轮转」节：
+# auth 5 分钟缓存窗口内进行中的登录失败一次，无会话影响）。
+login_flow_secret_param = /site-builder/login-flow-secret
 
 [SessionKey:site-hs-v1]
 alg = HS256

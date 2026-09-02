@@ -20,6 +20,7 @@ MINIMAL = textwrap.dedent("""
     console_current = console-hs-v1
     console_previous =
     legacy_param = /site-builder/jwt-secret
+    login_flow_secret_param = /site-builder/login-flow-secret
 
     [SessionKey:site-hs-v1]
     alg = HS256
@@ -91,6 +92,13 @@ def test_rs_row_schema_is_accepted_now_so_2b_does_not_change_the_schema(tmp_path
     (lambda t: t.replace("console_current = console-hs-v1\n", ""), "缺 console_current"),
     (lambda t: t.replace("legacy_param = /site-builder/jwt-secret\n", ""), "3c-3 之前 legacy_param 必填"),
     (lambda t: t.replace("legacy_param = /site-builder/jwt-secret", "legacy_param ="), "legacy_param 为空"),
+    # 3c-1B：login-flow secret 是 [SessionKeys] 声明的第三种参数——不是 kid、不进 family、只给 auth
+    (lambda t: t.replace("login_flow_secret_param = /site-builder/login-flow-secret\n", ""), "缺 login_flow_secret_param（1B 起必填）"),
+    (lambda t: t.replace("login_flow_secret_param = /site-builder/login-flow-secret", "login_flow_secret_param ="), "login_flow_secret_param 为空"),
+    (lambda t: t.replace("login_flow_secret_param = /site-builder/login-flow-secret", "login_flow_secret_param = site-builder/login-flow-secret"), "login_flow_secret_param 不是绝对 SSM 路径"),
+    (lambda t: t.replace("login_flow_secret_param = /site-builder/login-flow-secret", "login_flow_secret_param = /site-builder/session-keys/login-flow"), "login_flow_secret_param 落在 session-keys 前缀下（它不是 kid，不许长得像一把 family 密钥）"),
+    (lambda t: t.replace("login_flow_secret_param = /site-builder/login-flow-secret", "login_flow_secret_param = /site-builder/jwt-secret"), "login_flow_secret_param 与 legacy_param 同一参数（登录 CSRF 密钥不得复用会话密钥）"),
+    (lambda t: t.replace("login_flow_secret_param = /site-builder/login-flow-secret", "login_flow_secret_param = /site-builder/session-keys/site-hs-v1"), "login_flow_secret_param 与某个 HS 行同一参数"),
     (lambda t: t.replace("site_current = site-hs-v1", "site_current = console-hs-v1"), "kid 的 family 前缀与所属 family 不一致"),
     (lambda t: t.replace("site_current = site-hs-v1", "site_current = site-hs-1"), "kid 格式不合法"),
     (lambda t: t.replace("site_current = site-hs-v1", "site_current = Site-HS-v1"), "kid 大小写变形"),
@@ -142,6 +150,7 @@ def test_example_config_in_repo_loads():
     keys = sk.load_session_keys(example)
     assert {k.kid for k in keys.allowlist("site")} == {"site-hs-v1"}
     assert {k.kid for k in keys.allowlist("console")} == {"console-hs-v1"}
+    assert keys.login_flow_secret_param == "/site-builder/login-flow-secret", "spec §11.3 字面路径"
 
 
 def test_env_json_carries_only_requested_families_and_no_values(tmp_path):
@@ -174,3 +183,38 @@ def test_synth_placeholder_allowlist_is_valid_json_but_can_never_match_a_kid():
     al = json.loads(sk.SYNTH_PLACEHOLDER_ALLOWLIST_JSON)
     assert "SYNTH-ONLY-PLACEHOLDER" in sk.SYNTH_PLACEHOLDER_ALLOWLIST_JSON
     assert al and all(sk.KID_RE.match(k) is None for k in al), "占位 kid 绝不能长得像真 kid"
+
+
+# ---- 3c-1B：login-flow secret（spec §11.3 / §11.8.6）——不属于任何 family、没有 kid、只给 auth ----
+
+def test_login_flow_secret_is_loaded_but_belongs_to_no_family(tmp_path):
+    keys = _load(tmp_path, MINIMAL)
+    assert keys.login_flow_secret_param == "/site-builder/login-flow-secret"
+    for fam in sk.FAMILIES:
+        assert all(r.ssm_param != keys.login_flow_secret_param for r in keys.allowlist(fam)), \
+            "login-flow 出现在 family allowlist 里——它不是会话密钥"
+
+
+def test_login_flow_secret_never_enters_env_json(tmp_path):
+    """SESSION_KEYS_JSON 是 verifier 的 allowlist 形态；login-flow 不签发也不验证会话，写进去就是把
+    一把无关密钥的参数名下发给 panel/Edge。"""
+    keys = _load(tmp_path, MINIMAL)
+    assert "login-flow" not in sk.env_json(keys, ("site", "console"))
+    assert "login-flow" not in sk.env_json(keys, ("console",))
+
+
+def test_ssm_parameter_names_includes_login_flow_only_when_asked(tmp_path):
+    """auth 的清单 = login-flow + legacy + 两 family 的 HS 行；panel 默认不带 login-flow（永不持有）。"""
+    keys = _load(tmp_path, MINIMAL)
+    panel = sk.ssm_parameter_names(keys, ("console",))
+    assert "/site-builder/login-flow-secret" not in panel
+    auth = sk.ssm_parameter_names(keys, ("site", "console"), login_flow=True,
+                                  extra=("/site-builder/site-client-secret",))
+    assert auth == ["/site-builder/jwt-secret", "/site-builder/login-flow-secret",
+                    "/site-builder/site-client-secret",
+                    "/site-builder/session-keys/site-hs-v1", "/site-builder/session-keys/console-hs-v1"]
+    arns = sk.ssm_parameter_arns(keys, ("site", "console"), region="us-east-1", account="111111111111",
+                                 login_flow=True)
+    assert "arn:aws:ssm:us-east-1:111111111111:parameter/site-builder/login-flow-secret" in arns
+    assert not any("login-flow" in a for a in
+                   sk.ssm_parameter_arns(keys, ("console",), region="us-east-1", account="111111111111"))

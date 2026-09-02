@@ -7,6 +7,7 @@
 """
 import ast
 import configparser
+import json
 import textwrap
 from pathlib import Path
 
@@ -21,12 +22,24 @@ CFG = textwrap.dedent("""
     account_id = 111111111111
     routing_table = site-routes
 
+    [Cognito]
+    user_pool_id = us-east-1_test
+    domain = https://sso.auth.us-east-1.amazoncognito.com
+    site_client_id = cid
+
+    [Deployer]
+    edge_role_arn = arn:aws:iam::111111111111:role/site-edge-role
+
+    [Alerting]
+    email = ops@example.test
+
     [SessionKeys]
     site_current = site-hs-v1
     site_previous =
     console_current = console-hs-v1
     console_previous =
     legacy_param = /site-builder/jwt-secret
+    login_flow_secret_param = /site-builder/login-flow-secret
 
     [SessionKey:site-hs-v1]
     alg = HS256
@@ -62,6 +75,7 @@ class Recorder:
     """任何方法调用都记下来；get_function 可按需抛 ResourceNotFound。"""
     def __init__(self, missing_function=False):
         self.calls = []
+        self.kwargs = {}          # 方法名 -> 最后一次调用的 kwargs（3c-1B：要看策略文档内容）
         self.missing_function = missing_function
         self.exceptions = type("E", (), {"ResourceNotFoundException": _NotFound,
                                           "ResourceConflictException": type("C", (Exception,), {}),
@@ -70,6 +84,7 @@ class Recorder:
     def __getattr__(self, name):
         def call(*a, **kw):
             self.calls.append(name)
+            self.kwargs[name] = kw
             if name == "get_function" and self.missing_function:
                 raise _NotFound()
             if name == "get_waiter":
@@ -147,3 +162,108 @@ def test_main_source_calls_precheck_before_every_write_helper():
     assert "precheck" in names
     first_write = min(names.index(n) for n in ("ensure_secret", "ensure_lambda_role", "build_zip", "deploy_function") if n in names)
     assert names.index("precheck") < first_write, names
+
+
+# ── 3c-1B：login-flow secret（spec §11.3 / §11.8.6）──────────────────────────
+#
+# 三条不变量：① 环境变量下发的是**参数名**（`{name}_PARAM` 约定，`_state_sig` 因此不改取值代码）；
+# ② 它进 auth 角色的 SSM 精确清单（否则运行时 AccessDenied ⇒ 所有 /login 500）；
+# ③ 它**不进** panel（见 panel 那边的对称用例）。
+
+# 路径字面量在本包里只定义一处（conftest），免得"单一真源"这条断言自己有两份拷贝
+from conftest import LOGIN_FLOW_PARAM        # noqa: E402
+
+
+def test_lambda_env_ships_the_login_flow_param_name_never_the_value(cfg_files):
+    env = da.lambda_env()["Variables"]
+    assert env["LOGIN_FLOW_SECRET_PARAM"] == LOGIN_FLOW_PARAM
+    # 单一真源：值来自 [SessionKeys]，不是脚本里另抄一个字面量
+    from session_keys import load_session_keys
+    assert env["LOGIN_FLOW_SECRET_PARAM"] == load_session_keys(da.CFG_PATH).login_flow_secret_param
+    src = Path(da.__file__).read_text()
+    block = src[src.index("def lambda_env"):src.index("def required_parameters")]
+    assert '"LOGIN_FLOW_SECRET_PARAM": LOGIN_FLOW' not in block, "参数名硬编码，与 [SessionKeys] 分叉"
+    # `_secret("LOGIN_FLOW_SECRET")` 走 {name}_PARAM 约定，所以**不得**有同名的明文变量
+    assert "LOGIN_FLOW_SECRET" not in set(env), "环境变量里出现了明文密钥的键名"
+
+
+def test_login_flow_secret_is_not_in_session_keys_json(cfg_files):
+    """SESSION_KEYS_JSON 是 verifier 的 allowlist；login-flow 不签发也不验证会话。"""
+    env = da.lambda_env()["Variables"]
+    assert "login-flow" not in env["SESSION_KEYS_JSON"]
+
+
+def test_auth_role_ssm_list_includes_the_login_flow_param_exactly(cfg_files, monkeypatch):
+    iam = Recorder()
+    monkeypatch.setitem(da._CLIENTS, "iam", iam)
+    da.ensure_lambda_role()          # get_role 命中 ⇒ created=False ⇒ 不会 sleep(10)
+    doc = json.loads(iam.kwargs["put_role_policy"]["PolicyDocument"])
+    ssm_res = [r for st in doc["Statement"] if "ssm:GetParameter" in json.dumps(st.get("Action"))
+               for r in (st["Resource"] if isinstance(st["Resource"], list) else [st["Resource"]])]
+    assert f"arn:aws:ssm:us-east-1:111111111111:parameter{LOGIN_FLOW_PARAM}" in ssm_res
+    assert not any(r.endswith("*") for r in ssm_res), "出现通配前缀——会顺带交出别的秘密"
+
+
+def test_required_parameters_excludes_login_flow_because_this_script_creates_it(cfg_files):
+    """**与 spec §11.8.12 的字面清单有意不同**，理由与 legacy 那条完全相同。
+
+    裁定真源：`docs/adr/0004-login-flow-secret-outside-the-pre-write-precheck.md`。
+
+    §11.8.12 把 login-flow 列进 auth 的写前核对清单，但 D5/§11.8.6 同时要求 `deploy_auth` 对它
+    保留一条 `ensure_secret` 缺省补建。两者不能同时成立：precheck 在任何写之前，核对它就等于让它
+    永远走不到（首次部署必然被自己拒掉）。
+
+    保留缺省补建、不核对它，是因为 precheck 防的那个具体失败在这把密钥上**不存在**：
+    核对的意义是"多个消费方必须就同一个值达成一致，所以不能由本脚本随手造一个"。
+    login-flow 只有 auth 一个消费方（panel 与 Edge 永不持有），auth 自己造一把随机值完全正确；
+    而 §11.8.12 的原始动机（"⑥ 忘跑 ensure_session_keys 就会撞上"）说的是轮转期新增的会话密钥，
+    login-flow 在 1B 里只创建一次、不参与轮转演练。
+    """
+    assert LOGIN_FLOW_PARAM not in da.required_parameters()
+    assert set(da.required_parameters()) == {"/site-builder/session-keys/site-hs-v1",
+                                             "/site-builder/session-keys/console-hs-v1",
+                                             da.CLIENT_SECRET_PARAM}
+
+
+def _run_main(monkeypatch, ssm):
+    lam, iam, ddb = Recorder(), Recorder(), Recorder()
+    for k, v in (("ssm", ssm), ("lambda", lam), ("iam", iam), ("dynamodb", ddb)):
+        monkeypatch.setitem(da._CLIENTS, k, v)
+    monkeypatch.setattr(da, "build_zip", lambda: b"zip")
+    monkeypatch.setattr(da, "ensure_pre_token_trigger", lambda *a, **k: None)
+    monkeypatch.setattr(da, "ensure_alarm_pipeline",
+                        lambda **kw: {"changed": [], "subscription_state": "confirmed"})
+    monkeypatch.setattr(da, "_alert_email", lambda: "ops@example.test")
+    da.main()
+    return lam, iam, ddb
+
+
+def test_main_creates_the_login_flow_secret_when_it_is_absent(cfg_files, monkeypatch):
+    """缺省补建的**正对照**：没有这一条，那条补建就是死代码，而上一条用例正是靠它才成立。"""
+    ssm = FakeSSM(present={da.CLIENT_SECRET_PARAM, "/site-builder/session-keys/site-hs-v1",
+                           "/site-builder/session-keys/console-hs-v1"})
+    _run_main(monkeypatch, ssm)
+    written = [kw["Name"] for name, kw in ssm.calls if name == "put_parameter"]
+    assert LOGIN_FLOW_PARAM in written, "deploy_auth 没有为 login-flow 缺省补建"
+    for name, kw in ssm.calls:
+        if name == "put_parameter":
+            assert kw.get("Type") == "SecureString"
+
+
+def test_main_never_overwrites_an_existing_login_flow_secret(cfg_files, monkeypatch):
+    """覆盖它 = 所有进行中的登录失败一次。幂等重跑必须什么都不写。"""
+    ssm = FakeSSM(present={da.CLIENT_SECRET_PARAM, "/site-builder/session-keys/site-hs-v1",
+                           "/site-builder/session-keys/console-hs-v1",
+                           LOGIN_FLOW_PARAM, "/site-builder/jwt-secret"})
+    _run_main(monkeypatch, ssm)
+    assert [kw["Name"] for name, kw in ssm.calls if name == "put_parameter"] == []
+
+
+def test_config_first_then_code_still_holds_with_the_new_variable(cfg_files, monkeypatch):
+    """1B 的 env 新增变量正是"先配置后代码"要保护的场景：旧代码忽略它无害，新代码缺它必 500。"""
+    ssm = FakeSSM(present={da.CLIENT_SECRET_PARAM, "/site-builder/session-keys/site-hs-v1",
+                           "/site-builder/session-keys/console-hs-v1", LOGIN_FLOW_PARAM,
+                           "/site-builder/jwt-secret"})
+    lam, _, _ = _run_main(monkeypatch, ssm)
+    assert lam.calls.index("update_function_configuration") < lam.calls.index("update_function_code")
+    assert "LOGIN_FLOW_SECRET_PARAM" in lam.kwargs["update_function_configuration"]["Environment"]["Variables"]
