@@ -441,3 +441,26 @@ python3 site-builder/scripts/gen_onboarding.py
 > **加固包的编号别用 `S1`/`S2`…写进代码或文档正文**：`S3` 会和 Amazon S3 撞车（本仓库
 > 到处在说 S3 桶），grep 出来全是噪音。用 merged review 里的 `M` 编号
 > （`M03+M16`、`M07/M08/M10/M12`…）或主题名指代。
+
+## Agent skills
+
+mattpocock 那套 engineering skill（`to-tickets` / `to-spec` / `triage` / `wayfinder` /
+`code-review` / `domain-modeling` …）需要知道"issue 存哪、标签叫什么、术语表在哪"。
+下面三行就是把它们指到 `docs/agents/` 的那份配置，2026-09-02 由
+`/setup-matt-pocock-skills` 生成；换 tracker 直接改那边的文件，不必重跑该 skill。
+
+### Issue tracker
+
+issue 与 spec 存成本地 markdown（`.scratch/<feature>/`，**gitignored、不进任何远端**，
+因为 GitHub 那个远端是公开的）。See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+五个默认角色，标签串与角色同名（`needs-triage` / `needs-info` / `ready-for-agent` /
+`ready-for-human` / `wontfix`）。本地 markdown 下它们体现为每个 issue 文件顶部的
+`Status:` 行，不是真的标签。See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+single-context：根 `CONTEXT.md` + `docs/adr/`。**两者现在都还不存在**，缺了就静默继续
+（由 `/domain-modeling` 在术语或决策真的定下来时才创建）。See `docs/agents/domain.md`.

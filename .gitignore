@@ -17,3 +17,6 @@ docs/design/
 
 # backfill 的旧 policy 快照（回滚材料，含账号 ARN，不入库）
 site-builder/scripts/backfill-old-policies.json*
+
+# mattpocock skills 的本地 issue/spec（可能含真实资源 ID，不入库；见 docs/agents/issue-tracker.md）
+.scratch/
