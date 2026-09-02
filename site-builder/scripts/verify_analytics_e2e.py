@@ -89,7 +89,7 @@ sys.path.insert(0, str(HERE))                   # _mcp_client.py（scripts/ 不�
 sys.path.insert(0, str(HERE.parent / "deployer" / "functions"))
 
 import common as sb_common                      # noqa: E402
-import session as sess                          # noqa: E402
+import _session_mint as sm                      # noqa: E402  验收工具唯一的本地 mint 入口
 from _mcp_client import (Mcp, claims as token_claims,  # noqa: E402
                          http, load_user_token, mcp_endpoint)
 
@@ -300,24 +300,9 @@ def main() -> int:                                      # noqa: C901
     lam = boto3.client("lambda", region_name=region,
                        config=BotoConfig(read_timeout=310, retries={"max_attempts": 0}))
     s3 = boto3.client("s3", region_name=region)
-    secret = boto3.client("ssm", region_name=region).get_parameter(
-        Name="/site-builder/jwt-secret", WithDecryption=True)["Parameter"]["Value"]
-    if not secret:
-        raise Abort("取不到 JWT_SECRET —— 无法签发会话，验收不可信")
-
-    # idp 必须取 **Edge 实际信任的那个值**（router/config.ini 的 trusted_idps，
-    # CDK synth 时注入 Edge 的 TRUSTED_IDPS）。写死 "Feishu" 会让脚本在换 IdP
-    # 的环境上全红，而红的原因与被测代码无关。
-    trusted_idp = ""
-    for sec in rc.sections():
-        if rc.has_option(sec, "trusted_idps"):
-            trusted_idp = rc.get(sec, "trusted_idps").split("#")[0].split(",")[0].strip()
-            if trusted_idp:
-                break
-    require_idp = val(rc, "SiteBuilder", "require_idp_claim").lower() == "true"
-    if require_idp and not trusted_idp:
-        raise Abort("router/config.ini 里 require_idp_claim=true 却没有 "
-                    "trusted_idps —— 签出来的会话 Edge 一律不认，结果不可信")
+    # 会话由 _session_mint 统一签发（新形态、带 kid；idp 取 router/config.ini 的 trusted_idps 第一项，
+    # 写死 "Feishu" 会让脚本在换 IdP 的环境上全红）。取不到密钥/idp 它自己 exit——验收不可信就不往下走。
+    minter = sm.Minter.from_config(ROOT / "site-builder" / "config.ini", ROOT / "router" / "config.ini")
 
     # ── fixture 身份与命名（一次性后缀）────────────────────────────────
     suf = secrets.token_hex(4)
@@ -336,10 +321,8 @@ def main() -> int:                                      # noqa: C901
     css_mark = f"m5e2e-asset-{suf}"
 
     def mint(email: str, scope: str = "") -> str:
-        return sess.mint_session_jwt(email, email.split("@")[0], secret,
-                                     ttl_seconds=3600, idp=trusted_idp,
-                                     scope=scope,
-                                     auth_via="TokenGeneration_HostedAuth")
+        return minter.mint("console-session" if scope == "console" else "site-session",
+                           email, ttl_seconds=3600)
 
     def ck(email: str) -> dict:
         return {"cookie": f"sb_session={mint(email)}"}

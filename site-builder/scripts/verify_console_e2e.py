@@ -6,9 +6,10 @@
 数据是否真被改）。用 HTTP 层做可以无人值守、可重复、失败点精确。真浏览器那两项
 在本脚本末尾列出来交给人工（同 `verify_auth_alarm.sh` 的 ② 段既有设计）。
 
-**会话怎么来**：用 SSM 里的真实 `JWT_SECRET` 签一个与托管登录**同形态**的
-会话 JWT（含 idp/auth_via，Edge 的 REQUIRE_IDP_CLAIM 要求它们）。这不是绕过
-鉴权——签名密钥就是唯一的信任根，Edge 验的就是这个。它验证的是 Edge→panel
+**会话怎么来**：经 `_session_mint`（验收工具唯一的本地 mint 入口）用 site/console family
+的 current 密钥签出与托管登录**同形态**的带 kid 会话（含 idp/auth_via，Edge 的 REQUIRE_IDP_CLAIM
+要求它们）。这不是绕过鉴权——签名密钥就是唯一的信任根，verifier 验的就是这个；3c-2A 把那个模块
+换成夹具签发器，本脚本不动。它验证的是 Edge→panel
 的完整链路：CloudFront → origin-request 验签 → 注入 x-user-email →
 Function URL(AWS_IAM) → handler 五步前置。
 
@@ -39,8 +40,9 @@ HERE = Path(__file__).resolve().parent
 CFG_PATH = HERE.parent / "config.ini"
 sys.path.insert(0, str(HERE.parent / "auth"))
 sys.path.insert(0, str(HERE.parent / "deployer" / "functions"))
+sys.path.insert(0, str(HERE))       # _session_mint.py（scripts/ 不是包）
 
-import session as sess          # noqa: E402  (auth/session.py，签发算法单一实现)
+import _session_mint as sm      # noqa: E402  (验收工具唯一的本地 mint 入口；2A 换夹具签发器)
 
 CHECKS = 0
 FAILURES = 0
@@ -140,11 +142,6 @@ def main() -> int:
     routing_table = cfg("Platform", "routing_table")
 
     ddb = boto3.resource("dynamodb", region_name=region)
-    secret = boto3.client("ssm", region_name=region).get_parameter(
-        Name="/site-builder/jwt-secret", WithDecryption=True)["Parameter"]["Value"]
-    if not secret:
-        sys.exit("取不到 JWT_SECRET —— 无法签发会话，验收不可信")
-
     # ── fixture：本次专用的站点 + 两个探针身份 ──────────────────────────
     suf = secrets.token_hex(4)
     site_id = f"conse2e-{suf}"
@@ -153,30 +150,15 @@ def main() -> int:
     collaborator = f"conse2e-collab-{suf}@example.com"
     created: list[tuple[str, dict]] = []
 
-    # idp 必须取 **Edge 实际信任的那个值**（router/config.ini 的 trusted_idps，
-    # CDK synth 时注入 Edge 的 TRUSTED_IDPS）。在这里写死 "Feishu" 会让脚本在
-    # 换 IdP 的环境上全红，而红的原因与被测代码无关。
-    router_cfg = configparser.ConfigParser(interpolation=None)
-    router_cfg.read(HERE.parents[1] / "router" / "config.ini")
-    trusted_idp = (router_cfg.get("Edge", "trusted_idps", fallback="")
-                   or router_cfg.get("CloudFront", "trusted_idps", fallback=""))
-    if not trusted_idp:
-        # 段名可能不同，退化成全文件扫这一个键
-        for sec in router_cfg.sections():
-            if router_cfg.has_option(sec, "trusted_idps"):
-                trusted_idp = router_cfg.get(sec, "trusted_idps")
-                break
-    trusted_idp = trusted_idp.split("#")[0].split(",")[0].strip()
-    if not trusted_idp:
-        sys.exit("router/config.ini 里找不到 trusted_idps —— "
-                 "签出来的会话 Edge 不会认，验收结果不可信")
+    # 会话由 _session_mint 统一签发（新形态、带 kid；idp 取 router/config.ini 的 trusted_idps 第一项，
+    # 写死 "Feishu" 会让脚本在换 IdP 的环境上全红，而红的原因与被测代码无关）。取不到密钥/idp 时它
+    # 自己会 exit，验收不可信就不往下走。
+    minter = sm.Minter.from_config(CFG_PATH, HERE.parents[1] / "router" / "config.ini")
 
     def mint(email: str, *, scope: str = "") -> str:
-        """与托管登录同形态的会话 JWT（Edge 的 REQUIRE_IDP_CLAIM 要 idp+auth_via）。"""
-        return sess.mint_session_jwt(
-            email, email.split("@")[0], secret, ttl_seconds=1800,
-            idp=trusted_idp, scope=scope,
-            auth_via="TokenGeneration_HostedAuth")
+        """站点会话；scope="console" 是面板会话（token_use=console-session，console family 的 kid）。"""
+        return minter.mint("console-session" if scope == "console" else "site-session",
+                           email, ttl_seconds=1800)
 
     def cookies_for(email: str, *, console_session: bool) -> dict:
         out = {"sb_session": mint(email)}
@@ -483,13 +465,13 @@ def main() -> int:
                               headers={"origin": origin})
         check(st == 401 and as_json(text).get("need") == "console-session",
               "面板会话与站点会话身份不一致 → 401（不是放行）", f"实际 {st}")
-        # 站点会话（无 scope）冒充面板会话
+        # 站点会话冒充面板会话：site kid 不在 panel 的 console allowlist 里（unknown_kid）
         fake = {"sb_session": mint(collaborator),
-                "__Host-sb_console": mint(collaborator)}     # 无 scope
+                "__Host-sb_console": mint(collaborator)}     # 站点会话，不是面板会话
         st, _, _ = request("PUT", origin + f"/api/sites/{site_id}/permissions",
                            cookies=fake, body={"require_login": True},
                            headers={"origin": origin})
-        check(st == 401, "无 scope 的会话冒充面板会话 → 401", f"实际 {st}")
+        check(st == 401, "站点会话冒充面板会话 → 401（site kid 不在 console allowlist）", f"实际 {st}")
 
         print("\n── ⑬ 正常双表事务路径（站点**有** route item）──────")
         # 上面的 fixture 站点没有 route item，走的是 write_permissions 的**降级**

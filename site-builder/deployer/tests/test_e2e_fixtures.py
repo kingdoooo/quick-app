@@ -1,6 +1,7 @@
 """真实 AWS 端到端：RUN_E2E=1 .venv/bin/pytest tests/test_e2e_fixtures.py -q
-断言真实 HTTP 行为，不只看部署退出码。登录态用平台 JWT_SECRET 直接 mint
-测试会话 cookie（SSM 读密钥）——无需人工飞书扫码即可自动化验证 CRUD。
+断言真实 HTTP 行为，不只看部署退出码。登录态经 `scripts/_session_mint`（验收工具唯一的本地
+mint 入口）用 site family 的 current 密钥签出带 kid 的会话 cookie——无需人工飞书扫码即可自动化
+验证 CRUD；3c-2A 把那个模块换成夹具签发器，本文件不动。
 
 **M7 的五条（spec §5）在本文件的后半段**。它们与前面几条的区别在于：前面几条验
 "部署一次能用"，后面五条验**更新的原子性**——同一个 site_id 连着部两次、每次带
@@ -284,19 +285,11 @@ def session_cookie(cfg):
     真机实测过 Cognito 签出的就是 `Feishu` 与 `TokenGeneration_HostedAuth`。
     idp 从 router/config.ini 读，避免这里和部署配置漂移。
     """
-    from session import mint_session_jwt
-    secret = boto3.client("ssm", region_name="us-east-1").get_parameter(
-        Name="/site-builder/jwt-secret", WithDecryption=True)["Parameter"]["Value"]
-    import configparser
-    rc = configparser.ConfigParser(interpolation=None)
-    rc.read(ROOT / "router/config.ini")
-    trusted = rc["SiteBuilder"].get("trusted_idps", "").split("#")[0].strip()
-    idp = trusted.split(",")[0].strip()
-    assert idp, ("router/config.ini 的 trusted_idps 为空——Edge 开关为 true 时"
-                 "任何会话都会被拦，E2E 必然失败")
-    return "sb_session=" + mint_session_jwt(
-        "e2e@test.com", "E2E Bot", secret,
-        idp=idp, auth_via="TokenGeneration_HostedAuth")
+    sys.path.insert(0, str(ROOT / "site-builder/scripts"))
+    import _session_mint as sm
+    # idp 取 router/config.ini 的 trusted_idps 第一项；取不到时 from_config 自己 exit（E2E 必然失败，早停）
+    minter = sm.Minter.from_config(ROOT / "site-builder/config.ini", ROOT / "router/config.ini")
+    return "sb_session=" + minter.mint("site-session", "e2e@test.com", name="E2E Bot", ttl_seconds=86400)
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):

@@ -41,8 +41,8 @@ application/x-www-form-urlencoded`——用 urllib 上传必 403，且错误文�
 - `MIN_CHECKS` 下限 + 非零退出。
 
 **开关为什么不经控制台的 admin HTTP 接口翻**（`PUT /api/settings/api-key`）：
-那条路径要一个**管理员**的面板会话，而本脚本能造出的只有"用真实 JWT_SECRET 签一个
-任意 email 的会话"。拿真实管理员的邮箱去签，等于在 `ops_log` 里留下一条
+那条路径要一个**管理员**的面板会话，而本脚本能造出的只有"用会话密钥本地签一个
+任意 email 的会话"（经 `_session_mint`）。拿真实管理员的邮箱去签，等于在 `ops_log` 里留下一条
 "某位管理员关掉了全平台 Key 通道"的假审计——审计可信度的代价远大于多覆盖一条
 HTTP 路径。这里直接调 `keystore.set_switch`（**同一个写入实现**）并把 `actor`
 标成本脚本名（沿用 `deploy_key_proxy.py` 写哨兵行时的既有约定），再断言
@@ -170,7 +170,7 @@ def main() -> int:
     import api_key_config
     import keygen
     import keystore
-    import session as sess
+    import _session_mint as sm
 
     if not api_key_config.api_key_enabled(c):
         sys.exit("config.ini 无 [ApiKey] 段 = API Key 组件未启用，本验收无对象。"
@@ -180,31 +180,16 @@ def main() -> int:
 
     ddb = boto3.resource("dynamodb", region_name=region)
     keys_tbl = ddb.Table("site-api-keys")
-    secret = boto3.client("ssm", region_name=region).get_parameter(
-        Name="/site-builder/jwt-secret", WithDecryption=True)["Parameter"]["Value"]
-    if not secret:
-        sys.exit("取不到 JWT_SECRET —— 无法签发控制台会话，验收不可信")
-
-    # Edge 实际信任的 idp 值（router 那侧的配置注入了 Edge 的 TRUSTED_IDPS）。
-    # 在这里写死 "Feishu" 会让脚本在换 IdP 的环境上全红，而红的原因与被测代码无关。
-    rcfg = _cfg_obj(ROOT / "router" / "config.ini")
-    trusted_idp = ""
-    for sec in rcfg.sections():
-        if rcfg.has_option(sec, "trusted_idps"):
-            trusted_idp = rcfg.get(sec, "trusted_idps").split("#")[0].split(",")[0].strip()
-            if trusted_idp:
-                break
-    if not trusted_idp:
-        sys.exit("router/config.ini 里找不到 trusted_idps —— 签出来的会话 Edge 不认")
+    # 会话由 _session_mint 统一签发（新形态、带 kid；idp 取 router/config.ini 的 trusted_idps 第一项）。
+    minter = sm.Minter.from_config(CFG_PATH, ROOT / "router" / "config.ini")
 
     suf = secrets.token_hex(4)
     owner = f"apikeye2e-{suf}@example.com"
     started_at = datetime.now(timezone.utc)
 
     def mint(scope: str = "") -> str:
-        return sess.mint_session_jwt(
-            owner, owner.split("@")[0], secret, ttl_seconds=1800,
-            idp=trusted_idp, scope=scope, auth_via="TokenGeneration_HostedAuth")
+        return minter.mint("console-session" if scope == "console" else "site-session",
+                           owner, ttl_seconds=1800)
 
     console_ck = f"sb_session={mint()}; __Host-sb_console={mint('console')}"
     console_headers = {"cookie": console_ck, "origin": console_origin}

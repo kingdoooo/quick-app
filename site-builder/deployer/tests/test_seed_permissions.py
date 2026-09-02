@@ -467,14 +467,13 @@ _REQUIRE_AUTH_ALLOWED = {
     "scripts/verify_permission_matrix.py",
     "scripts/verify_console_e2e.py",
     "scripts/verify_analytics_e2e.py",
-    # verify_session_token_semantics.py：**只发 GET**的真机闸门。它读
+    # _session_mint.py（3c-1B ticket 01）：验收工具共用的本地 mint 模块，`live_target()` 读
     # `require_auth` 只为从路由表里挑一个"需要登录"的站点当探针目标
     # （`it.get("require_auth") is True`），不 put 也不 update 任何行，更不建夹具。
-    # 这条豁免是本轮扩域后哨兵咬住的**第一个新文件**，属于它按设计工作。
-    "scripts/verify_session_token_semantics.py",
-    # verify_kid_entry_live.py（3c-1A）：与上一条完全同形——只**读**路由表挑一个 require_auth=True 的
-    # 站点当探针靶子，只发 GET，不写任何投影。2A 常驻夹具站点就位后改打夹具站点。
-    "scripts/verify_kid_entry_live.py",
+    # 这段读取原先分别住在 verify_session_token_semantics.py 与 verify_kid_entry_live.py（1A 起两条
+    # 同形豁免），收成一处后那两个脚本里不再有非 docstring 的字面量，豁免跟着搬过来。
+    # 2A 常驻夹具站点（ADR-0002）就位后这里改成返回夹具站点，六个调用方不动。
+    "scripts/_session_mint.py",
 }
 
 
