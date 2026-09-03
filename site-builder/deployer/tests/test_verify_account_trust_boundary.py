@@ -3358,6 +3358,48 @@ def test_known_kids_and_the_two_non_kid_labels_pass_validation():
                             known_kids=["site-hs-v1", "console-hs-v1"])
 
 
+def test_baseline_kids_are_a_second_source_of_known_kids():
+    """**退役那一步的前提**：到能声明 `--retire-key <kid>` 的时刻，config 已经不含那个 kid 了。
+
+    退役的动作就是"把 kid 从 config 删掉再重部"，而 grant 的丢失只有重部之后才出现。所以
+    `configured_kids()` 是唯一来源时，DEPLOY.md 十步 runbook 的第 ⑩ 步**根本无法执行**——
+    标签校验会先硬退出。基线是那把 key 曾经存在过的唯一记录。
+    """
+    g = _gate()
+    baseline = {"facts": {"session_keys": {"site-hs-v1": {"edge_code_targets_carrying_key": 0,
+                                                          "edge_assets_carrying_key": 0},
+                                           "console-hs-v1": {"edge_code_targets_carrying_key": 0,
+                                                             "edge_assets_carrying_key": 0}}}}
+    assert g.baseline_kids(baseline) == ["console-hs-v1", "site-hs-v1"]
+    # config 只剩 v2（v1 两节已删）时，v1 仍然是合法的退役标签
+    g.check_migration_labels(["site-hs-v1", "console-hs-v1"],
+                             known_kids=["site-hs-v2"] + g.baseline_kids(baseline))
+
+
+def test_baseline_kids_tolerates_a_missing_or_empty_facts_block():
+    """迁移期与首次建基线时这一块可能不存在——校验不该因此炸掉。"""
+    g = _gate()
+    for empty in ({}, {"facts": {}}, {"facts": {"session_keys": {}}}, {"facts": None}):
+        assert g.baseline_kids(empty) == []
+
+
+def test_the_second_source_does_not_relax_the_typo_guard():
+    """正对照：多一个来源不等于放松校验——两处都不在的标签照样硬失败。"""
+    g = _gate()
+    baseline = {"facts": {"session_keys": {"site-hs-v1": {}}}}
+    with pytest.raises(SystemExit):
+        g.check_migration_labels(["site-hs-v9"],
+                                 known_kids=["site-hs-v2"] + g.baseline_kids(baseline))
+
+
+def test_cli_reads_the_baseline_for_known_kids_not_only_the_config():
+    """守卫住 main 里那处接线：只拿 configured_kids 校验就等于第 ⑩ 步不可执行。"""
+    body = _SCRIPT.read_text(encoding="utf-8").split("def main(")[1]
+    assert "baseline_kids(" in body, "main 没把基线里的 kid 算进 known_kids——退役步骤会硬退出"
+    assert "configured_kids(cfg_keys) + baseline_kids(" in body, \
+        "known_kids 不是 config ∪ 基线两个来源的并集"
+
+
 # ---- 退役桶 -------------------------------------------------------------------
 
 def test_declared_retire_key_lets_a_platform_role_lose_that_grant_without_red():

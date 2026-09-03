@@ -248,8 +248,23 @@ def configured_kids(session_keys) -> list:
     return [r.kid for fam in KEY_FAMILIES for r in session_keys.allowlist(fam)]
 
 
+def baseline_kids(baseline: dict) -> list:
+    """**基线**里记过的 kid（`facts.session_keys` 的键）。
+
+    `--retire-key <kid>` 必须认这一处，否则退役那一步无法执行：退役的动作正是"把 kid 从
+    config 里删掉再重部"，而 grant 的丢失只有重部之后才出现 ⇒ 到能声明的时刻，
+    `configured_kids()` 已经不含它了（DEPLOY.md 十步 runbook 的第 ⑩ 步）。基线是那把 key
+    "曾经存在过"的唯一记录，且它同样是被版本控制的、不能随手编，所以拿它当第二个来源
+    不会放松"标签打错一个字就硬失败"这条守卫——`site-hs-v9` 两处都不在，照样退出。
+    """
+    return sorted((baseline.get("facts") or {}).get("session_keys") or {})
+
+
 def check_migration_labels(labels, *, known_kids) -> None:
-    """LABEL 必须是已配置的 kid 或两个非 kid 标签之一，否则**硬失败**。
+    """LABEL 必须是 `known_kids` 里的 kid 或两个非 kid 标签之一，否则**硬失败**。
+
+    `known_kids` = config 里配置着的 kid **∪** 基线里记过的 kid（`baseline_kids`）。后半个
+    并集是退役那一步必需的，理由见 `baseline_kids` 的 docstring。
 
     不校验的后果很隐蔽：`--retire-key site-hs-v9`（打错一个字）会被静默接受，
     生成一条永不匹配的 grant，于是操作者以为已经声明、闸门照样红，或者更糟——
@@ -258,8 +273,8 @@ def check_migration_labels(labels, *, known_kids) -> None:
     unknown = [x for x in labels if x not in set(known_kids) | set(NON_KID_LABELS)]
     if unknown:
         raise SystemExit(
-            f"--new-key/--retire-key 的标签 {unknown} 不是已配置的 kid，也不是 "
-            f"{list(NON_KID_LABELS)}。可用 kid：{sorted(known_kids)}")
+            f"--new-key/--retire-key 的标签 {unknown} 不是已配置的 kid（config ∪ 基线两处都没有），"
+            f"也不是 {list(NON_KID_LABELS)}。可用 kid：{sorted(set(known_kids))}")
 
 # **IAM 写不再是 A 的一条 grant。** 它移到 B——那一层是纯静态文本快照，明确不声称
 # 提权链。这个前缀只为 schema 2→3 迁移保留：旧基线里 22 个 principal 带着
@@ -2348,9 +2363,11 @@ def main() -> int:
                          "principal 上单列为迁移，不算扩权；此前不能读密钥的 principal 上仍红；"
                          "未声明的一律红。`--new-kid` 是本参数的别名（3c-1A 的旧名）。")
     ap.add_argument("--retire-key", action="append", metavar="LABEL", dest="retire_key",
-                    help="本轮**退役**的密钥标签（可重复），LABEL 同上。platform 类 principal "
+                    help="本轮**退役**的密钥标签（可重复）。platform 类 principal "
                          "丢掉它对应的 grant 计入迁移不红；同一轮丢的其它 grant 照样红。"
-                         "L3（--retire-key legacy）与演练第 ⑩ 步（--retire-key site-hs-v1 …）用它。")
+                         "L3（--retire-key legacy）与演练第 ⑩ 步（--retire-key site-hs-v1 …）用它。"
+                         "**kid 的合法来源是 config ∪ 基线**——退役时 config 已经不含它了，"
+                         "基线是它曾经存在过的记录。")
     ap.add_argument("--migrate-baseline-only", action="store_true",
                     help="不发 AWS 调用：按 --migrate-from-schema 做基线的结构迁移并写回，然后退出。"
                          "3c-1A 用它把 schema 3 的基线升到 4（只加空的 facts.session_keys）。")
@@ -2364,7 +2381,14 @@ def main() -> int:
     declared_labels = tuple(args.new_key or ()) + tuple(args.retire_key or ())
     if declared_labels:
         cfg_keys = load_session_keys(CONFIG_PATH)
-        check_migration_labels(declared_labels, known_kids=configured_kids(cfg_keys))
+        # 基线只在这里读一次原始 JSON（不走 load_baseline 的 schema 硬校验：那条在迁移期会
+        # 把本校验挡死，而这里只需要"这个 kid 曾经存在过"这一个事实）。读不到就只认 config。
+        try:
+            raw_baseline = json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raw_baseline = {}
+        check_migration_labels(declared_labels,
+                               known_kids=configured_kids(cfg_keys) + baseline_kids(raw_baseline))
     if args.migrate_baseline_only:
         if args.migrate_from_schema is None:
             raise SystemExit("--migrate-baseline-only 需要 --migrate-from-schema N")

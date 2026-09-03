@@ -1039,8 +1039,10 @@ auth/panel 的密钥值在运行时才按参数名读，参数缺失的症状是
 Lambda/IAM 写调用之前。
 
 > **上面这条裁定原先写的是"auth 另加 login-flow 与非空的 legacy"，实施时按
-> `docs/adr/0004-login-flow-secret-outside-the-pre-write-precheck.md` 排除了这两条**，正文已按 ADR
-> 改口。理由：核对发生在任何写之前，把 login-flow 列进清单就让 §11.8.6 要求保留的 `ensure_secret`
+> `docs/adr/0004-login-flow-secret-outside-the-pre-write-precheck.md` 在 **auth 一侧**排除了这两条**，
+> 正文已按 ADR 改口。**panel 一侧没有这条排除**：`deploy_panel.required_parameters()` 就是
+> `ssm_parameter_names(keys, ("console",))`，其首项**是** `legacy_param` ⇒ legacy 参数被删时
+> panel 部署会被拦住、auth 不会。（auth 的清单另含 site client secret，不只是 family HS 行。）理由：核对发生在任何写之前，把 login-flow 列进清单就让 §11.8.6 要求保留的 `ensure_secret`
 > 缺省补建永远走不到——而它存在的唯一理由正是首次部署，于是首次部署必然被自己拒掉。判据是"核对到底在
 > 防什么"：它防的是**多个消费方必须就同一个值达成一致**，而 login-flow 只有 auth 一个消费方，所以这条
 > 排除是**安全**的。**照本条原话把 login-flow 加回清单会让首次部署自我拒绝。**

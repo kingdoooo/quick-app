@@ -199,9 +199,11 @@ cd "$(git rev-parse --show-toplevel)"
 
 # 两把 HS 会话密钥 + login-flow secret 先存在（幂等、只创建不覆盖、不打印值；
 # 路径全来自 site-builder/config.ini 的 [SessionKeys]）。忘跑它不会静默：
-# deploy_auth / deploy_panel 在第一次写之前 GetParameter 核对本组件的每个 **family HS 参数**，
-# 缺一即拒绝部署。**清单里没有 legacy 与 login-flow**（两者由脚本自己 ensure_secret 创建，列进去
-# 会让首次部署自我拒绝，见 docs/adr/0004-*.md；legacy 那条排除是已知缺口，不是安全结论）。
+# deploy_auth / deploy_panel 在第一次写之前 GetParameter 核对自己需要的参数，缺一即拒绝部署。
+# **两个清单不一样**：panel 含非空的 legacy_param；auth 把 legacy 与 login-flow 减掉（`owned`，
+# 列进去会让 ensure_secret 的缺省补建走不到、首次部署自我拒绝，见 docs/adr/0004-*.md）
+# ⇒ **legacy 参数被删时 panel 会被拦住、auth 不会**。login-flow 只有 auth 一个消费方，排除它
+# 是安全的；legacy 那条排除是已知缺口，不是安全结论。
 python3 site-builder/scripts/ensure_session_keys.py
 
 # auth 服务（Lambda + Function URL + pre-token 触发器，幂等）
