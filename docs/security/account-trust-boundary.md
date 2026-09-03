@@ -331,6 +331,31 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 > 所以带活密钥的代码目标 10 → 11、asset 9 → 10；`site-hs-v1` 在 2 个代码目标 / 1 个 asset 里；console 0 / 0；
 > 唯一的授权 delta 是 panel 角色多了 `read-session-key:console-hs-v1`（auth 角色原前缀授权已覆盖两把新 key，收窄成精确清单后集合不变）。
 
+> **2026-09-03（3c-1B）闸门口径变化，基线 schema 仍是 4**（尚未真机跑；首次真机使用见
+> 3c-1B 的部署序列第 ②/⑤/⑥/⑩ 步）：
+>
+> - **第四个被模拟的 SSM 目标：`read-login-flow-secret`**（auth 私有的 login-flow secret，
+>   spec §11.3）。它被**记录**但**刻意不算冒充面**——`is_secret_grant()` 对它返回 False，
+>   它也不进 `SECRET_GRANTS`，更不进 `measure()` 里那份 `key_values` 密钥枚举（只进扫描输入
+>   `scan_values`）。**理由**：读到它只能伪造一次登录 CSRF（OAuth state 与 `__Host-sb_pkce`
+>   cookie 都只活 300 秒），**签不出任何会话**。把它算进来会稀释本文档里"冒充面"的含义
+>   （= 能以任意用户身份访问任意站点与控制台写接口），也会让 `read-edge-code` /
+>   `read-edge-asset` 的资源并集虚增。这条刻意的排除由单测正向断言，不靠记性。
+> - **Edge 产物含 login-flow 的值 ⇒ 硬失败**（`SystemExit`，不是红字段、不落 facts）。
+>   与"console key 不进 Edge"同一类不变量，但处置更硬：它必须连 `--update-baseline`
+>   一起挡住，而 Edge 产物有 9 个历史版本且全球复制，写进去等于永久泄漏。
+>   两条已知代价（`--from-dump` 覆盖不到；抛点在 IAM 模拟之前所以本次运行无报告/无快照）
+>   写在 `assert_login_flow_not_in_edge` 的 docstring 里。
+> - **迁移声明泛化成两个桶**：`--new-kid` → `--new-key LABEL`（旧名保留为别名）
+>   ＋新增 `--retire-key LABEL`，LABEL ∈ 已配置 kid ∪ {`legacy`, `login-flow`}。
+>   退役桶与新增桶镜像：platform 类 principal **丢掉**被声明的那一条 grant 计入迁移分节
+>   而不红，同一轮丢的其它 grant 照样红；非 platform 类的丢失仍归"改善"。
+>   这替代了 1A 首跑那次"看到红之后人工 `--update-baseline`"——那样"当时为什么绿"
+>   只存在于 progress 里。标签打错一个字是硬失败（否则"以为声明了、其实没有"是静默的）。
+> - **`legacy_param` 允许为空**：`JWT_PARAM_NAME` 常量是"追踪 legacy 参数"的真源，
+>   直到 3c-3 真的删掉那个参数。非空时两处必须一致；L3 清空它之后照常追踪、照常记 grant
+>   ——那把密钥仍然存在、仍能被宽读者读到，只是不再有 verifier 接受它签的 token。
+
 它的形状是**一种能力 = 一个动作等价类 × 一个资源等价类**。这句话是这道闸门最
 重要的不变量，因为把它压成"单个动作 / 单个资源"这个错误已经犯过三次，每次都留下
 一个当时看不出来的 false-green：

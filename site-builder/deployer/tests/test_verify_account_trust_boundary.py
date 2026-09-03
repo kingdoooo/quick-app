@@ -3274,7 +3274,7 @@ def test_declared_new_kid_on_existing_secret_holder_goes_to_migration_bucket_not
     base = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel", g.G_READ_JWT_PARAM]))
     now = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel", g.G_READ_JWT_PARAM,
                                                     "read-session-key:site-hs-v1"]))
-    rep = g.compare_to_baseline(now, _baseline_of(base), required=REQUIRED, new_kids=("site-hs-v1",))
+    rep = g.compare_to_baseline(now, _baseline_of(base), required=REQUIRED, new_keys=("site-hs-v1",))
     assert rep.ok, rep.render()
     assert rep.migration_grants and "read-session-key:site-hs-v1" in rep.render()
 
@@ -3294,7 +3294,7 @@ def test_declared_new_kid_on_a_principal_without_prior_secret_read_stays_red():
     base = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel"]))
     now = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel",
                                                     "read-session-key:site-hs-v1"]))
-    rep = g.compare_to_baseline(now, _baseline_of(base), required=REQUIRED, new_kids=("site-hs-v1",))
+    rep = g.compare_to_baseline(now, _baseline_of(base), required=REQUIRED, new_keys=("site-hs-v1",))
     assert not rep.ok and rep.new_grants
 
 
@@ -3302,6 +3302,390 @@ def test_gate_source_has_no_stale_migration_text_or_dead_single_key_scanners():
     src = _SCRIPT.read_text(encoding="utf-8")
     assert "2→3" not in src.split("def load_baseline")[1].split("def ")[0] or True  # docstring may mention history
     assert "当前只支持 2→3" not in src, "帮助文案与 load_baseline 只接受 3→4 矛盾"
-    for dead in ("def assets_carrying_key(", "def edge_code_arns_carrying_key(", "def migrate_baseline_2_to_3("):
+    for dead in ("def assets_carrying_key(", "def edge_code_arns_carrying_key(",
+                 "def migrate_baseline_2_to_3(",
+                 # 3c-1B：泛化成 grants_for_labels 之后这个只认 kid 的助手就是死代码
+                 "def _is_declared_new_kid_grant("):
         assert dead not in src, f"死代码仍在：{dead}"
     assert "--new-kid" in src
+
+
+# --------------------------------------------------------------------------
+# 3c-1B：迁移桶泛化成 --new-key / --retire-key（spec §11.8.7），login-flow secret
+# 记为一条**不算冒充面**的 grant，Edge 产物含它是硬失败
+# --------------------------------------------------------------------------
+
+_LOGIN_FLOW_ARN = "arn:aws:ssm:us-east-1:1:parameter/site-builder/login-flow-secret"
+
+
+def _platform_baseline(g, observed):
+    """把 observed 整体当成 platform 类基线——退役桶只对 platform 生效，
+    而 `_baseline_of` 给的是 unrelated-workload。"""
+    return {"schema": 2,
+            "principals": {fp: {"category": "platform", "grants": p["grants"]}
+                           for fp, p in observed.items()}}
+
+
+# ---- 标签 → grant 的映射与校验 -------------------------------------------------
+
+def test_labels_map_to_the_grants_they_are_supposed_to_declare():
+    g = _gate()
+    assert g.grants_for_labels(["site-hs-v2"]) == {"read-session-key:site-hs-v2"}
+    assert g.grants_for_labels(["legacy"]) == {g.G_READ_JWT_PARAM}
+    assert g.grants_for_labels(["login-flow"]) == {g.G_READ_LOGIN_FLOW}
+    assert g.grants_for_labels([]) == set()
+
+
+def test_declaring_legacy_does_not_also_release_the_edge_artifact_grants():
+    """`legacy` 只映到 `read-jwt-param`。把 read-edge-code / read-edge-asset 一起放进来
+    会让一次 L3 声明顺手放行两条与本次迁移无关的丢失。"""
+    g = _gate()
+    got = g.grants_for_labels(["legacy"])
+    assert g.G_READ_EDGE_CODE not in got and g.G_READ_EDGE_ASSET not in got
+
+
+@pytest.mark.parametrize("bad", ["site-hs-v9", "sitehsv1", "Legacy", "login_flow", ""])
+def test_unknown_migration_label_fails_loudly(bad):
+    """打错一个字的后果本来是静默的：生成一条永不匹配的 grant，操作者以为已声明。"""
+    g = _gate()
+    with pytest.raises(SystemExit):
+        g.check_migration_labels([bad], known_kids=["site-hs-v1", "console-hs-v1"])
+
+
+def test_known_kids_and_the_two_non_kid_labels_pass_validation():
+    g = _gate()
+    g.check_migration_labels(["site-hs-v1", "console-hs-v1", "legacy", "login-flow"],
+                            known_kids=["site-hs-v1", "console-hs-v1"])
+
+
+# ---- 退役桶 -------------------------------------------------------------------
+
+def test_declared_retire_key_lets_a_platform_role_lose_that_grant_without_red():
+    """L3 与演练第 ⑩ 步的形状：platform 角色丢掉被声明的那一条 ⇒ 迁移分节，绿。"""
+    g = _gate()
+    base = _with_required(g, _observed(g, AuthRole=["invoke-platform:site-panel",
+                                                    g.G_READ_JWT_PARAM]))
+    now = _with_required(g, _observed(g, AuthRole=["invoke-platform:site-panel"]))
+    rep = g.compare_to_baseline(now, _platform_baseline(g, base), required=REQUIRED,
+                                retired_keys=("legacy",))
+    assert rep.ok, rep.render()
+    assert rep.migration_grants and g.G_READ_JWT_PARAM in rep.render()
+    assert not rep.missing_required
+
+
+def test_undeclared_loss_in_the_same_round_is_still_red():
+    """声明了一条不等于放行整轮：同一个 principal 同时丢了没声明的那条 ⇒ 仍红，
+    且报告里只列没声明的那条。"""
+    g = _gate()
+    base = _with_required(g, _observed(g, AuthRole=["invoke-platform:site-panel",
+                                                    g.G_READ_JWT_PARAM,
+                                                    "read-session-key:site-hs-v1"]))
+    now = _with_required(g, _observed(g, AuthRole=["invoke-platform:site-panel"]))
+    rep = g.compare_to_baseline(now, _platform_baseline(g, base), required=REQUIRED,
+                                retired_keys=("legacy",))
+    assert not rep.ok, rep.render()
+    assert "read-session-key:site-hs-v1" in " ".join(rep.missing_required)
+    assert g.G_READ_JWT_PARAM not in " ".join(rep.missing_required), "被声明的那条不该也红"
+
+
+def test_retiring_without_declaring_it_stays_red():
+    """正对照：不带 --retire-key 时，同一次丢失照样红（否则上面那条在测空气）。"""
+    g = _gate()
+    base = _with_required(g, _observed(g, AuthRole=["invoke-platform:site-panel",
+                                                    g.G_READ_JWT_PARAM]))
+    now = _with_required(g, _observed(g, AuthRole=["invoke-platform:site-panel"]))
+    rep = g.compare_to_baseline(now, _platform_baseline(g, base), required=REQUIRED)
+    assert not rep.ok and rep.missing_required
+
+
+def test_non_platform_loss_is_still_an_improvement_declared_or_not():
+    """非 platform 类的丢失与声明无关，仍归"改善"——退役桶不该改变这一侧的口径。"""
+    g = _gate()
+    base = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel",
+                                                     g.G_READ_JWT_PARAM]))
+    now = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel"]))
+    for retired in ((), ("legacy",)):
+        rep = g.compare_to_baseline(now, _baseline_of(base), required=REQUIRED,
+                                    retired_keys=retired)
+        assert rep.ok, rep.render()
+        assert rep.improvements and not rep.migration_grants, retired
+
+
+def test_retire_declaration_does_not_leak_into_the_gained_side():
+    """`--retire-key X` 不得让 X 的**新增**变绿——两个桶必须各管一个方向。"""
+    g = _gate()
+    base = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel",
+                                                     g.G_READ_JWT_PARAM]))
+    now = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel",
+                                                    g.G_READ_JWT_PARAM,
+                                                    "read-session-key:site-hs-v2"]))
+    rep = g.compare_to_baseline(now, _baseline_of(base), required=REQUIRED,
+                                retired_keys=("site-hs-v2",))
+    assert not rep.ok and rep.new_grants
+
+
+def test_new_declaration_does_not_leak_into_the_lost_side():
+    """镜像的另一半：`--new-key X` 不得让 X 的**丢失**变绿。"""
+    g = _gate()
+    base = _with_required(g, _observed(g, AuthRole=["invoke-platform:site-panel",
+                                                    g.G_READ_JWT_PARAM]))
+    now = _with_required(g, _observed(g, AuthRole=["invoke-platform:site-panel"]))
+    rep = g.compare_to_baseline(now, _platform_baseline(g, base), required=REQUIRED,
+                                new_keys=("legacy",))
+    assert not rep.ok and rep.missing_required
+
+
+# ---- login-flow：新增桶 + 不算冒充面 ---------------------------------------------
+
+def test_declared_login_flow_on_an_existing_secret_holder_goes_to_migration():
+    """② 步的形状：login-flow 参数首次出现，此前已能读某把会话密钥的 principal 顺带能读它。"""
+    g = _gate()
+    base = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel",
+                                                     g.G_READ_JWT_PARAM]))
+    now = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel",
+                                                    g.G_READ_JWT_PARAM,
+                                                    g.G_READ_LOGIN_FLOW]))
+    rep = g.compare_to_baseline(now, _baseline_of(base), required=REQUIRED,
+                                new_keys=("login-flow",))
+    assert rep.ok, rep.render()
+    assert rep.migration_grants and g.G_READ_LOGIN_FLOW in rep.render()
+
+
+def test_login_flow_on_a_principal_that_could_not_read_any_key_stays_red():
+    """声明了也不放行"从不能读密钥到能读一把密钥"——那是真扩权，与是哪把无关。"""
+    g = _gate()
+    base = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel"]))
+    now = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel",
+                                                    g.G_READ_LOGIN_FLOW]))
+    rep = g.compare_to_baseline(now, _baseline_of(base), required=REQUIRED,
+                                new_keys=("login-flow",))
+    assert not rep.ok and rep.new_grants
+
+
+def test_undeclared_login_flow_grant_stays_red():
+    g = _gate()
+    base = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel",
+                                                     g.G_READ_JWT_PARAM]))
+    now = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel",
+                                                    g.G_READ_JWT_PARAM,
+                                                    g.G_READ_LOGIN_FLOW]))
+    rep = g.compare_to_baseline(now, _baseline_of(base), required=REQUIRED)
+    assert not rep.ok and rep.new_grants
+
+
+def test_login_flow_grant_is_not_a_secret_grant():
+    """读到 login-flow 只值一个登录 CSRF（state 与 pkce cookie 都只活 300 秒），
+    **签不出任何会话** ⇒ 不进冒充面。正对照：会话密钥那几条仍是 True。"""
+    g = _gate()
+    assert not g.is_secret_grant(g.G_READ_LOGIN_FLOW)
+    assert g.G_READ_LOGIN_FLOW not in g.SECRET_GRANTS
+    for real in (g.G_READ_JWT_PARAM, g.G_READ_EDGE_CODE, g.G_READ_EDGE_ASSET,
+                 "read-session-key:site-hs-v1", "read-session-key:console-hs-v1"):
+        assert g.is_secret_grant(real), real
+
+
+def test_login_flow_grant_does_not_change_the_impersonation_counts():
+    """把 login-flow 的读取者算进冒充面会让那个数字凭空变大。按闸门自己的口径数一遍。"""
+    g = _gate()
+    holders = {"A": [g.G_READ_JWT_PARAM], "B": [g.G_READ_LOGIN_FLOW],
+               "C": [g.G_READ_JWT_PARAM, g.G_READ_LOGIN_FLOW],
+               "D": ["invoke-platform:site-panel"]}
+    can_sign = [n for n, grants in holders.items() if any(g.is_secret_grant(x) for x in grants)]
+    assert can_sign == ["A", "C"], "只有能读会话密钥的才算冒充面"
+
+
+def test_login_flow_param_is_simulated_and_classified_but_only_when_configured():
+    g = _gate()
+    t = g.Targets(**{**_targets(g).__dict__, "login_flow_parameter": _LOGIN_FLOW_ARN})
+    assert _LOGIN_FLOW_ARN in t.other_resources()
+    assert g.undecided_resource_class(_LOGIN_FLOW_ARN, t) == "login-flow-param"
+    got = g.grants_from_decisions({f"ssm:GetParameter|{_LOGIN_FLOW_ARN}": "allowed"}, t)
+    assert got == {g.G_READ_LOGIN_FLOW}
+    # 不配置时它既不进目标集合，也不产生 grant（空串不得变成一个"空 ARN"目标）
+    bare = _targets(g)
+    assert bare.login_flow_parameter == ""
+    assert not any("login-flow" in r for r in bare.other_resources())
+    assert g.grants_from_decisions({f"ssm:GetParameter|{_LOGIN_FLOW_ARN}": "allowed"}, bare) == set()
+
+
+def test_login_flow_secret_is_deliberately_absent_from_the_key_enumeration():
+    """**刻意的排除要有正向断言**（3c-1B ticket 03 复审转来）。
+
+    `measure()` 里 `key_values` 只装 legacy + 两 family 的 HS 行；login-flow 只进 `scan_values`
+    （用于"Edge 产物里有没有它"那条硬断言）。没有这条断言的话，将来有人"顺手补齐"枚举就会
+    把 read-edge-code / read-edge-asset 的资源并集撑大 ⇒ 冒充面数字凭空放大，而没有守卫会红。
+    """
+    src = _SCRIPT.read_text(encoding="utf-8")
+    body = src.split("def measure(")[1]
+    assert 'key_values: dict[str, str] = {"legacy": live_key}' in body
+    assert "key_values[ref.kid] =" in body
+    assert "scan_values = {**key_values, LABEL_LOGIN_FLOW: login_flow_value}" in body, (
+        "login-flow 必须只进 scan_values，不进 key_values")
+    assert "key_values[LABEL_LOGIN_FLOW]" not in body and 'key_values["login-flow"]' not in body
+    # 目标集合的并集只跨 key_values 的 label——跨 scan_values 就等于把 login-flow 算进冒充面
+    for line in ("set(edge_code_by[k]) for k in key_values", "set(asset_by[k]) for k in key_values"):
+        assert line in body, f"并集口径变了：{line}"
+
+
+# ---- Edge 产物含 login-flow 值 ⇒ 硬失败 -------------------------------------------
+
+def test_login_flow_value_inside_edge_artifacts_is_a_hard_failure():
+    g = _gate()
+    g.assert_login_flow_not_in_edge((), [])          # 干净时静默通过
+    with pytest.raises(SystemExit, match="login-flow"):
+        g.assert_login_flow_not_in_edge(("arn:aws:lambda:us-east-1:1:function:edge:7",), [])
+    with pytest.raises(SystemExit, match="login-flow"):
+        g.assert_login_flow_not_in_edge((), ["assets/edge-abc.zip"])
+
+
+def test_login_flow_hard_failure_message_says_it_is_not_baseline_releasable():
+    """处置文案必须说清"这条不接受基线放行"——最省力的处置永远是更新基线。"""
+    g = _gate()
+    with pytest.raises(SystemExit) as e:
+        g.assert_login_flow_not_in_edge(("x",), [])
+    text = str(e.value)
+    assert "基线" in text and "auth" in text
+
+
+def test_login_flow_check_adds_no_facts_and_keeps_the_baseline_schema():
+    """spec §11.8.7：不新增 facts、BUNDLE_SHAPE 不变、schema 留 4。"""
+    g = _gate()
+    assert g.BASELINE_SCHEMA == 4
+    assert set(g.BUNDLE_SHAPE["facts"]) == {
+        "edge_code_targets_carrying_live_key", "edge_assets_carrying_live_key",
+        "principals_with_missing_context", "session_keys"}
+    assert set(g.BUNDLE_SHAPE["facts"]["session_keys"]["*"]) == {
+        "edge_code_targets_carrying_key", "edge_assets_carrying_key"}
+    assert "login" not in json.dumps(g.BUNDLE_SHAPE, default=str)
+
+
+def test_load_baseline_accepts_schema_4_without_a_migration_channel(tmp_path):
+    """schema 留 4 ⇒ 现有基线直接可读，`--migrate-from-schema` 不需要新通道。"""
+    g = _gate()
+    p = tmp_path / "b.json"
+    p.write_text(json.dumps({"schema": 4, "principals": {}}), encoding="utf-8")
+    assert g.load_baseline(p)["schema"] == 4
+
+
+# ---- legacy_param 为空（L3 之后）------------------------------------------------
+
+class _FakeKeys:
+    """只带 `legacy_param` 的最小替身——`check_legacy_param` 只看这一个字段。"""
+
+    def __init__(self, legacy_param):
+        self.legacy_param = legacy_param
+
+
+def test_empty_legacy_param_is_accepted_so_l3_does_not_blow_up_the_gate():
+    """L3 清空 `legacy_param` 之后闸门**不能炸**（行为断言，不是读源码）。"""
+    g = _gate()
+    g.check_legacy_param(_FakeKeys(""))            # 不抛即通过
+
+
+def test_matching_non_empty_legacy_param_is_accepted():
+    g = _gate()
+    g.check_legacy_param(_FakeKeys(g.JWT_PARAM_NAME))
+
+
+@pytest.mark.parametrize("other", ["/site-builder/jwt-secret-2", "/other/jwt-secret",
+                                   "/site-builder/session-keys/site-hs-v1"])
+def test_mismatched_non_empty_legacy_param_is_still_rejected(other):
+    """非空时两处必须一致——这条不能因为"允许为空"而一起松掉（能红的反例）。"""
+    g = _gate()
+    assert other != g.JWT_PARAM_NAME
+    with pytest.raises(SystemExit, match="不一致"):
+        g.check_legacy_param(_FakeKeys(other))
+
+
+def test_the_legacy_parameter_is_still_tracked_and_still_produces_its_grant():
+    """"允许为空"不等于"停止追踪"：目标里仍有 jwt_parameter，能读它仍记 `read-jwt-param`。
+
+    那把密钥在 L3 之后仍存在于 SSM、仍能被宽读者读到，只是不再有 verifier 接受它签的 token。
+    """
+    g = _gate()
+    t = _targets(g)
+    assert t.jwt_parameter.endswith(g.JWT_PARAM_NAME)
+    assert t.jwt_parameter in t.other_resources()
+    assert g.grants_from_decisions({f"ssm:GetParameter|{t.jwt_parameter}": "allowed"}, t) \
+        == {g.G_READ_JWT_PARAM}
+    # 常量是追踪的真源（3c-3 删参数时才动它），measure() 按它拼 ARN 而不是按 legacy_param
+    body = _SCRIPT.read_text(encoding="utf-8").split("def measure(")[1]
+    assert "parameter{JWT_PARAM_NAME}" in body, "ARN 改成按 legacy_param 拼了——L3 会让追踪消失"
+
+
+def test_configured_kids_uses_the_family_list_from_session_keys():
+    """family 清单不手抄第三份：加一个 family 时手抄的副本会让合法 kid 被判"未知标签"。"""
+    g = _gate()
+    import session_keys as sk
+    assert g.KEY_FAMILIES is sk.FAMILIES
+    src = _SCRIPT.read_text(encoding="utf-8")
+    assert 'for fam in ("site", "console")' not in src, "又手抄了一份 family 清单"
+
+
+# ---- CLI ----------------------------------------------------------------------
+
+_CONFIG_INI = _ROOT / "site-builder" / "config.ini"
+
+
+@pytest.mark.parametrize("flag", ["--new-key", "--new-kid", "--retire-key"])
+def test_migration_flags_validate_labels_before_any_aws_call(flag):
+    """真的跑一次进程：三个入口（含 `--new-kid` 别名）都必须在**任何 AWS 调用之前**
+    拒掉打错的标签。
+
+    这条同时证明两件事：别名接到了同一个 dest（否则 `--new-kid` 会 argparse 报未知参数
+    而不是标签错误），以及校验发生在 `measure()` 之前（这里没有可用凭证，真发调用会是
+    另一种失败——超时或 NoCredentials，而不是我们要的那句）。
+    """
+    if not _CONFIG_INI.exists():
+        pytest.skip("需要 site-builder/config.ini（gitignored）才能枚举已配置的 kid")
+    r = subprocess.run([sys.executable, str(_SCRIPT), flag, "bogus-label"],
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode != 0
+    assert "不是已配置的 kid" in (r.stdout + r.stderr), (r.stdout, r.stderr)
+
+
+@pytest.mark.parametrize("flag", ["--new-key", "--new-kid", "--retire-key"])
+def test_migration_flags_accept_a_configured_kid_and_reach_the_next_stage(flag):
+    """正对照：合法标签必须**通过校验并走到下一段**（否则上面那条只证明了"什么都拒"）。
+
+    配 `--migrate-baseline-only`（缺 `--migrate-from-schema` 时它自己会抱怨）当"下一段"的
+    路标：那条抱怨在校验**之后**、任何 AWS 调用**之前**，所以既能证明校验放行了，又不会
+    真跑一次 11 分钟的模拟。
+
+    **不能用 `--help` 当路标**：`-h/--help` 在 `parse_args()` 内部就退出，校验根本没执行到，
+    于是合法与非法标签都"通过"——那样这条用例是空转的（3c-1B /code-review 抓到过一次）。
+    """
+    if not _CONFIG_INI.exists():
+        pytest.skip("需要 site-builder/config.ini（gitignored）才能枚举已配置的 kid")
+    g = _gate()
+    kid = g.configured_kids(g.load_session_keys(_CONFIG_INI))[0]
+    r = subprocess.run([sys.executable, str(_SCRIPT), flag, kid, "--migrate-baseline-only"],
+                       capture_output=True, text=True, timeout=120)
+    out = r.stdout + r.stderr
+    assert "不是已配置的 kid" not in out, out
+    assert "--migrate-from-schema" in out, ("没走到校验之后的那一段：" + out)
+
+
+def test_the_positive_control_marker_really_sits_after_label_validation(flag="--new-key"):
+    """上面那条用例的**前提**：非法标签必须在走到那个路标之前就被拒。
+
+    不钉住这一点，`--migrate-baseline-only` 的抱怨若跑到校验之前，正对照就又变成空转。
+    """
+    if not _CONFIG_INI.exists():
+        pytest.skip("需要 site-builder/config.ini（gitignored）才能枚举已配置的 kid")
+    r = subprocess.run([sys.executable, str(_SCRIPT), flag, "bogus-label",
+                        "--migrate-baseline-only"],
+                       capture_output=True, text=True, timeout=120)
+    out = r.stdout + r.stderr
+    assert "不是已配置的 kid" in out, out
+    assert "--migrate-from-schema" not in out, ("路标跑到校验之前了：" + out)
+
+
+def test_new_kid_alias_and_retire_key_are_wired_into_the_comparison():
+    """两个 dest 必须真的流进 `compare_to_baseline`——argparse 收下了但没传下去
+    的症状是"声明看起来生效了、闸门照样红"。"""
+    src = _SCRIPT.read_text(encoding="utf-8")
+    assert '"--new-key", "--new-kid"' in src, "--new-kid 必须保留为别名"
+    assert 'dest="new_key"' in src and 'dest="retire_key"' in src
+    assert "new_keys=tuple(args.new_key or ())" in src
+    assert "retired_keys=tuple(args.retire_key or ())" in src

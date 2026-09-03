@@ -162,7 +162,7 @@ JWT_PARAM_NAME = "/site-builder/jwt-secret"
 DEPLOYER_EXEC_ROLE = "site-deployer-exec-role"
 # 3c-1A：[SessionKeys] 的唯一定义在 auth/session_keys.py；闸门按它枚举两把 HS family 密钥的参数名
 sys.path.insert(0, str(_SITE_BUILDER / "auth"))
-from session_keys import load_session_keys  # noqa: E402
+from session_keys import FAMILIES as KEY_FAMILIES, load_session_keys  # noqa: E402
 
 # Edge 函数名：router 栈的两个 Lambda@Edge 里，**origin-request 那个**才内联着
 # 会话密钥（`stack.py` 把 `{{JWT_SECRET}}` 替换进它）。origin-response 不验签。
@@ -199,11 +199,67 @@ SECRET_GRANTS = (G_READ_EDGE_CODE, G_READ_EDGE_ASSET, G_READ_JWT_PARAM)
 # 3c-1A：两把 HS family 密钥各自一条 grant `read-session-key:<kid>`，**不与 legacy 合并**——
 # 「谁能读 site 的 key」与「谁能读 console 的 key」分得开，是 spec §4.1 两个 family 的全部意义。
 G_READ_SESSION_KEY = "read-session-key"
+# 3c-1B：登录流程的 HMAC 密钥（auth 私有，签 OAuth state 与 __Host-sb_pkce cookie）。
+# **刻意不是 SECRET_GRANTS 的成员、is_secret_grant() 对它返回 False**：读到它只能伪造
+# 一次登录 CSRF（state 与 cookie 都只活 300 秒），**签不出任何会话**——把它算进冒充面
+# 会让那个数字凭空变大，而"冒充面"这个词在 docs/security/account-trust-boundary.md 里
+# 有精确含义（能以任意用户身份访问任意站点与控制台写接口）。分类错的代价是双向的：
+# 算进去会稀释真正的靶子，漏掉一条真能签会话的路才是漏报。
+G_READ_LOGIN_FLOW = "read-login-flow-secret"
 
 
 def is_secret_grant(grant: str) -> bool:
-    """能直接取得某把会话签名密钥的 grant（legacy 三条路 + 每 kid 一条）。"""
+    """能直接取得某把**会话签名**密钥的 grant（legacy 三条路 + 每 kid 一条）。
+
+    `read-login-flow-secret` **不在其中**，理由见 G_READ_LOGIN_FLOW 的注释。
+    """
     return grant in SECRET_GRANTS or grant.startswith(G_READ_SESSION_KEY + ":")
+
+
+# ---- 迁移声明的标签 ----------------------------------------------------------
+# `--new-key LABEL` / `--retire-key LABEL` 的 LABEL ∈ 已配置 kid ∪ {legacy, login-flow}。
+LABEL_LEGACY = "legacy"
+LABEL_LOGIN_FLOW = "login-flow"
+NON_KID_LABELS = (LABEL_LEGACY, LABEL_LOGIN_FLOW)
+
+
+def grants_for_labels(labels) -> set:
+    """LABEL 集合 → 它们对应的 grant 字符串集合。
+
+    `legacy` 映到 `read-jwt-param` 一条而**不含** `read-edge-code` / `read-edge-asset`：
+    后两条说的是"谁能读 Edge 产物"，L3（清空 legacy_param）不改变那件事——它只让
+    auth/panel 的角色 SSM 清单不再含 legacy 参数。把三条一起放进来会让一次声明顺手
+    放行两条与本次迁移无关的丢失。
+    """
+    out: set = set()
+    for label in labels:
+        if label == LABEL_LEGACY:
+            out.add(G_READ_JWT_PARAM)
+        elif label == LABEL_LOGIN_FLOW:
+            out.add(G_READ_LOGIN_FLOW)
+        else:
+            out.add(f"{G_READ_SESSION_KEY}:{label}")
+    return out
+
+
+def configured_kids(session_keys) -> list:
+    """config 里声明过的全部 kid。family 清单取 `session_keys.FAMILIES`，**不手抄**——
+    手抄的第三份副本在加 family 时会让一个合法 kid 被判成"未知标签"并硬退出。"""
+    return [r.kid for fam in KEY_FAMILIES for r in session_keys.allowlist(fam)]
+
+
+def check_migration_labels(labels, *, known_kids) -> None:
+    """LABEL 必须是已配置的 kid 或两个非 kid 标签之一，否则**硬失败**。
+
+    不校验的后果很隐蔽：`--retire-key site-hs-v9`（打错一个字）会被静默接受，
+    生成一条永不匹配的 grant，于是操作者以为已经声明、闸门照样红，或者更糟——
+    以为声明生效而实际红的是别的东西。
+    """
+    unknown = [x for x in labels if x not in set(known_kids) | set(NON_KID_LABELS)]
+    if unknown:
+        raise SystemExit(
+            f"--new-key/--retire-key 的标签 {unknown} 不是已配置的 kid，也不是 "
+            f"{list(NON_KID_LABELS)}。可用 kid：{sorted(known_kids)}")
 
 # **IAM 写不再是 A 的一条 grant。** 它移到 B——那一层是纯静态文本快照，明确不声称
 # 提权链。这个前缀只为 schema 2→3 迁移保留：旧基线里 22 个 principal 带着
@@ -362,6 +418,9 @@ class Targets:
     version_arns: dict[str, tuple[str, ...]] = field(default_factory=dict)
     # 3c-1A：kid → 该 family HS 密钥的 SSM 参数 ARN（legacy 仍在 jwt_parameter）
     session_key_parameters: dict[str, str] = field(default_factory=dict)
+    # 3c-1B：auth 私有的 login-flow secret 的 SSM 参数 ARN。空串 = 不追踪。
+    # 它进模拟目标（"谁能读它"是要记的事实），但它的 grant **不算冒充面**——见 G_READ_LOGIN_FLOW。
+    login_flow_parameter: str = ""
 
     def function_resources(self) -> list[str]:
         out = list(self.platform_functions) + list(self.site_functions)
@@ -372,8 +431,9 @@ class Targets:
         return sorted(set(out))
 
     def other_resources(self) -> list[str]:
+        extra = {self.login_flow_parameter} if self.login_flow_parameter else set()
         return sorted(set(self.edge_assets) | {self.jwt_parameter}
-                      | set(self.session_key_parameters.values()))
+                      | set(self.session_key_parameters.values()) | extra)
 
 
 # 动作 → 动作等价类名。coverage 的成员指纹按**类**记，不按单个动作
@@ -472,6 +532,8 @@ def undecided_resource_class(resource: str, t: "Targets") -> str:
         return "unattributed"
     if resource == t.jwt_parameter:
         return "jwt-param"
+    if t.login_flow_parameter and resource == t.login_flow_parameter:
+        return "login-flow-param"
     for kid, arn in t.session_key_parameters.items():
         if resource == arn:
             return f"session-key:{kid}"
@@ -555,6 +617,8 @@ def grants_from_decisions(decisions: dict[str, str], t: Targets) -> set[str]:
     for kid, arn in t.session_key_parameters.items():
         if allowed(A_READ_PARAM, (arn,)):
             grants.add(f"{G_READ_SESSION_KEY}:{kid}")
+    if t.login_flow_parameter and allowed(A_READ_PARAM, (t.login_flow_parameter,)):
+        grants.add(G_READ_LOGIN_FLOW)
     return grants
 
 
@@ -863,7 +927,7 @@ RED_FIELDS: tuple[tuple[str, str, str], ...] = (
 )
 GREEN_FIELDS: tuple[tuple[str, str], ...] = (
     ("unclassified", "基线里未分类（请标注 category）"),
-    ("migration_grants", "新 kid 的首次观测（--new-kid 已声明，且持有者此前已能读密钥；绿，可更新基线）"),
+    ("migration_grants", "声明过的密钥增减（--new-key / --retire-key；绿，可更新基线）"),
     ("improvements", "集合缩小（绿；可更新基线）"),
     ("notes",        "事实与口径（不参与红绿）"),
 )
@@ -933,14 +997,23 @@ def compare_to_baseline(observed: dict[str, dict], baseline: dict, *,
                         facts: dict | None = None,
                         coverage: dict | None = None,
                         iam_write: dict | None = None,
-                        new_kids: tuple = ()) -> Report:
+                        new_keys: tuple = (),
+                        retired_keys: tuple = ()) -> Report:
     """observed = {fingerprint: {"name", "arn", "grants"}}。
 
-    `new_kids`：操作者用 `--new-kid` 显式声明的、**本轮首次出现**的 kid。它们的
-    `read-session-key:<kid>` 在**此前已能读某把密钥**的 principal 上不算扩权（同一批 SSM
-    前缀/通配授权自然覆盖新参数），单列进 migration_grants；在此前**不能**读密钥的 principal
-    上仍是红——那是真扩权。未声明的 kid 一律红。这是 3c 每加一把 key 都要走的迁移桶，
-    替代"看到 grew 红后人工 --update-baseline"。
+    `new_keys` / `retired_keys`：操作者用 `--new-key` / `--retire-key` 显式声明的标签
+    （LABEL ∈ 已配置 kid ∪ {legacy, login-flow}，`--new-kid` 是 `--new-key` 的别名）。
+    两个桶**互为镜像**，替代"看到红之后人工 --update-baseline"（1A 首跑就是那么放的，
+    于是"当时为什么绿"只存在于 progress 里）：
+
+    - **新增桶**：被声明的那条 grant 在**此前已能读某把会话密钥**的 principal 上不算扩权
+      （同一批 SSM 前缀/通配授权自然覆盖新参数），单列进 migration_grants；在此前**不能**
+      读密钥的 principal 上仍是红——那是真扩权。未声明的一律红。
+    - **退役桶**：platform 类 principal **丢掉**被声明的那条 grant 计入 migration_grants
+      而不红；同一轮丢的其它 grant 照样红（`missing_required`）。非 platform 类的丢失
+      仍按"改善"处理，与声明无关。
+      退役桶**没有**新增桶那条"此前已能读密钥"的前置条件：丢一条 grant 不可能是扩权，
+      唯一要挡的是"顺手放行了别的丢失"，而"只有被声明的那条"已经挡住了。
 
     **红绿口径按类别分两套，这是刻意的不对称**：
 
@@ -954,6 +1027,8 @@ def compare_to_baseline(observed: dict[str, dict], baseline: dict, *,
     """
     base = baseline.get("principals", {})
     rep = Report()
+    declared_new = grants_for_labels(new_keys)
+    declared_retired = grants_for_labels(retired_keys)
 
     for fp, p in sorted(observed.items(), key=lambda kv: kv[1]["name"]):
         grants = set(p["grants"])
@@ -964,17 +1039,23 @@ def compare_to_baseline(observed: dict[str, dict], baseline: dict, *,
         category = base[fp].get("category")
         gained, lost = grants - was, was - grants
         if gained:
-            migr = ({x for x in gained if _is_declared_new_kid_grant(x, new_kids)}
+            migr = ((gained & declared_new)
                     if any(is_secret_grant(x) for x in was) else set())
             if migr:
-                rep.migration_grants.append(f"{p['name']}  [{fp}]  +{sorted(migr)}")
+                rep.migration_grants.append(
+                    f"{p['name']}  [{fp}]  +{sorted(migr)}（--new-key 已声明）")
             if gained - migr:
                 rep.new_grants.append(f"{p['name']}  [{fp}]  +{sorted(gained - migr)}")
         if lost:
             if category == "platform":
-                rep.missing_required.append(
-                    f"{p['name']}（platform）丢了 {sorted(lost)}——平台授权是精确且"
-                    f"必需的，丢失同样要红")
+                retired = lost & declared_retired
+                if retired:
+                    rep.migration_grants.append(
+                        f"{p['name']}  [{fp}]  -{sorted(retired)}（--retire-key 已声明）")
+                if lost - retired:
+                    rep.missing_required.append(
+                        f"{p['name']}（platform）丢了 {sorted(lost - retired)}——平台授权是精确且"
+                        f"必需的，丢失同样要红")
             else:
                 rep.improvements.append(f"{p['name']}  [{fp}]  -{sorted(lost)}")
         if category in (None, "", "unclassified"):
@@ -1194,9 +1275,48 @@ def _compare_bucket_policy(rep: Report, base_fps, now_fps, *, texts: dict) -> No
             f"bootstrap 桶少了语句 [{fp}]——**消失也红**：丢掉现有的 TLS Deny 是扩权")
 
 
-def _is_declared_new_kid_grant(grant: str, new_kids: tuple) -> bool:
-    prefix = G_READ_SESSION_KEY + ":"
-    return grant.startswith(prefix) and grant[len(prefix):] in set(new_kids)
+def check_legacy_param(session_keys) -> None:
+    """`[SessionKeys] legacy_param` 与闸门常量的关系（3c-1B，spec §11.8.7）。
+
+    **`JWT_PARAM_NAME` 常量是"追踪 legacy 参数"的真源，直到 3c-3 真的删掉那个参数。**
+    非空时两处必须指同一把（分叉的症状是闸门盯着一把没人用的密钥）；L3 清空它之后照常
+    按常量追踪、照常记 grant——那把密钥仍然存在、仍能被宽读者读到，只是不再有 verifier
+    接受它签的 token。**这条不能改成"为空就不追踪"**：那等于在 L3 到 3c-3 之间把一把
+    活密钥从闸门视野里摘掉。
+
+    单独成函数是为了能不发 AWS 调用就测两个方向（1A 起本仓库的纪律：新判据要有能红的反例，
+    而 `measure()` 里的分支只能靠读源码断言——那是 static 证据，不是行为证据）。
+    """
+    if session_keys.legacy_param and session_keys.legacy_param != JWT_PARAM_NAME:
+        raise SystemExit(f"[SessionKeys] legacy_param={session_keys.legacy_param!r} 与闸门的 "
+                         f"JWT_PARAM_NAME={JWT_PARAM_NAME!r} 不一致——两处必须指同一把 legacy 密钥")
+
+
+def assert_login_flow_not_in_edge(code_targets, asset_keys) -> None:
+    """login-flow secret 出现在 Edge 产物里 ⇒ 立即 SystemExit（spec §11.8.7 的"直接断言"）。
+
+    与 `console_key_in_edge` 是同一类不变量（"这把密钥不该在这个组件里"），但处置形态不同：
+    console 那条是红字段（走基线比较、有 delta 可读），这条是硬失败。三个理由：
+    ① 它不落 facts ⇒ 没有可比较的基线数字；② 它必须连 `--update-baseline` 一起挡住——
+    红字段挡不住那条路，而"把一把 auth 私有密钥写进全球复制的 Edge 产物"没有任何
+    可以接受的基线；③ spec §11.8.7 明写"实现为直接断言、不新增 facts"。
+
+    **两条已知代价，写下来免得下次当成 bug 重新发现**（3c-1B /code-review 转来）：
+    · `--from-dump` 覆盖不到这条——快照里没有 login-flow 的信息（它刻意不落 facts），
+      所以拿快照出结论时这条不成立。`main()` 的 `--from-dump` 提示里已明说。
+    · 它在 `measure()` 中途抛，本次运行不会产出报告或 `--dump-observed` 快照。代价比看起来
+      小：抛点在 Edge/asset 扫描之后、400 个 principal 的 IAM 模拟（本文件最慢的一段）**之前**，
+      而快照本来就要等模拟结束才完整 ⇒ 任何保留 BUNDLE_SHAPE 的实现都拿不到那份快照。
+    """
+    hits = list(code_targets) + list(asset_keys)
+    if not hits:
+        return
+    raise SystemExit(
+        f"闸门硬失败：Edge 产物里测到了 **login-flow secret**（{len(code_targets)} 个代码目标 + "
+        f"{len(asset_keys)} 个 bootstrap asset）。它是 auth 私有的（spec §11.3）：只签 OAuth state "
+        f"与 __Host-sb_pkce cookie，Edge 与 panel 永不持有。出现在这里说明注入路径把它当成了"
+        f"会话密钥——先查 router/infrastructure/stack.py 往 Edge 注入了哪些值。"
+        f"\n这条不接受基线放行：Edge 产物有 9 个历史版本且全球复制，写进去就等于永久泄漏。")
 
 
 def _check_console_key_not_in_edge(rep: Report, facts: dict | None) -> None:
@@ -1718,13 +1838,11 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
         Name=JWT_PARAM_NAME, WithDecryption=True)["Parameter"]["Value"]
     # 3c-1A：两个 HS key family 的密钥也是"读到即能签"的目标；legacy 仍单列。
     session_keys = load_session_keys(CONFIG_PATH)
-    if session_keys.legacy_param != JWT_PARAM_NAME:
-        raise SystemExit(f"[SessionKeys] legacy_param={session_keys.legacy_param!r} 与闸门的 "
-                         f"JWT_PARAM_NAME={JWT_PARAM_NAME!r} 不一致——两处必须指同一把 legacy 密钥")
+    check_legacy_param(session_keys)
     key_values: dict[str, str] = {"legacy": live_key}
     kid_family: dict[str, str] = {}
     kid_param: dict[str, str] = {}
-    for fam in ("site", "console"):
+    for fam in KEY_FAMILIES:
         for ref in session_keys.allowlist(fam):
             if ref.alg != "HS256":
                 continue
@@ -1732,6 +1850,13 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
                 Name=ref.ssm_param, WithDecryption=True)["Parameter"]["Value"]
             kid_family[ref.kid] = fam
             kid_param[ref.kid] = ref.ssm_param
+    # 3c-1B：login-flow 的值**只进扫描输入、不进 key_values**。key_values 是"读到它就能签
+    # 会话"的密钥枚举，冒充面的目标集合（read-edge-code / read-edge-asset 的资源并集）由它
+    # 决定；把 login-flow 塞进去会让那个数字凭空变大。这条刻意的排除由
+    # test_login_flow_secret_is_deliberately_absent_from_the_key_enumeration 正向断言。
+    login_flow_value = clients["ssm"].get_parameter(
+        Name=session_keys.login_flow_secret_param, WithDecryption=True)["Parameter"]["Value"]
+    scan_values = {**key_values, LABEL_LOGIN_FLOW: login_flow_value}
     facts: dict[str, object] = {}
 
     aliases = function_aliases(lam, all_functions)
@@ -1741,26 +1866,34 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
     edge_versions = versions.get(EDGE_ORIGIN_REQUEST_FN, ())
     edge_code_by = edge_code_arns_carrying_keys(
         clients, EDGE_ORIGIN_REQUEST_FN, fn_arn(EDGE_ORIGIN_REQUEST_FN),
-        edge_versions, key_values)
+        edge_versions, scan_values)
     facts["edge_code_targets_carrying_live_key"] = len(edge_code_by["legacy"])
 
     asset_bucket, asset_key = edge_asset_location(clients, EDGE_ORIGIN_REQUEST_FN)
     if scan_assets:
-        asset_by = assets_carrying_keys(clients, asset_bucket, key_values)
+        asset_by = assets_carrying_keys(clients, asset_bucket, scan_values)
     else:
         blob = clients["s3"].get_object(Bucket=asset_bucket, Key=asset_key)["Body"].read()
         asset_by = {label: ([asset_key] if secret_in_zip_bytes(blob, v) else [])
-                    for label, v in key_values.items()}
+                    for label, v in scan_values.items()}
         print("（--no-asset-scan：只看当前 asset，历史对象未扫）", file=sys.stderr)
+    # 3c-1B：**硬断言**，不落 facts（spec §11.8.7）。login-flow 是 auth 私有的，Edge 与 panel
+    # 永不持有它；它出现在 Edge 产物里意味着注入路径把它当成了会话密钥，那是配置错而不是漂移。
+    # 做成 SystemExit 而不是红字段：它必须连 `--update-baseline` 一起挡住（红字段挡不住那条路），
+    # 而 facts 与 BUNDLE_SHAPE 不为一个不参与红绿的数字做基线迁移。
+    assert_login_flow_not_in_edge(edge_code_by[LABEL_LOGIN_FLOW], asset_by[LABEL_LOGIN_FLOW])
     # 每 kid 一组事实；console family 在 Edge 产物里出现由 compare_to_baseline 判红
     # 只放整数（基线红线要求 facts 的叶子全是整数）；family 由 kid 前缀决定（session_keys.KID_RE 保证格式）
     facts["session_keys"] = {
         kid: {"edge_code_targets_carrying_key": len(edge_code_by[kid]),
               "edge_assets_carrying_key": len(asset_by[kid])}
         for kid in kid_family}
-    # 读到**任一**把密钥都等于能签 ⇒ 目标集合取并集；legacy 那两个计数单列在上面
-    edge_code = tuple(sorted(set().union(*(set(v) for v in edge_code_by.values()))))
-    asset_keys = sorted(set().union(*(set(v) for v in asset_by.values())))
+    # 读到**任一**把密钥都等于能签 ⇒ 目标集合取并集；legacy 那两个计数单列在上面。
+    # **并集只跨 key_values 的 label**，不跨 scan_values：只带 login-flow 值的产物不是
+    # 冒充面的目标（读到它签不出会话），混进来会让 read-edge-code / read-edge-asset 的
+    # 资源集合虚增，从而放大 A 组的数字。
+    edge_code = tuple(sorted(set().union(*(set(edge_code_by[k]) for k in key_values))))
+    asset_keys = sorted(set().union(*(set(asset_by[k]) for k in key_values)))
     if asset_key not in asset_keys and scan_assets:
         # 当前部署的 asset 不含活密钥 = 根治已生效（或密钥刚轮转）。这是好消息，
         # 但要说出来——它会让 read-edge-asset 的资源集合变小。
@@ -1775,6 +1908,8 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
         jwt_parameter=f"arn:aws:ssm:{region}:{account}:parameter{JWT_PARAM_NAME}",
         session_key_parameters={kid: f"arn:aws:ssm:{region}:{account}:parameter{p}"
                                 for kid, p in kid_param.items()},
+        login_flow_parameter=(f"arn:aws:ssm:{region}:{account}:parameter"
+                              f"{session_keys.login_flow_secret_param}"),
         alias_arns={fn_arn(n): tuple(f"{fn_arn(n)}:{a}" for a in al)
                     for n, al in aliases.items()},
         version_arns={fn_arn(n): tuple(f"{fn_arn(n)}:{v}" for v in vs)
@@ -2207,9 +2342,15 @@ def main() -> int:
     ap.add_argument("--migrate-from-schema", type=int, metavar="N",
                     help="一次性通道：允许读入 schema N 的旧基线并迁移（当前只支持 3→4）。"
                          "配合 --update-baseline 用；平时不要带。")
-    ap.add_argument("--new-kid", action="append", metavar="KID",
-                    help="本轮首次出现的 kid（可重复）。其 read-session-key:<kid> 在此前已能读密钥的 "
-                         "principal 上单列为迁移，不算扩权；未声明的 kid 一律红。3c 每加一把 key 用一次。")
+    ap.add_argument("--new-key", "--new-kid", action="append", metavar="LABEL", dest="new_key",
+                    help="本轮**首次出现**的密钥标签（可重复）。LABEL ∈ 已配置 kid ∪ "
+                         "{legacy, login-flow}。它对应的 grant 在此前已能读某把会话密钥的 "
+                         "principal 上单列为迁移，不算扩权；此前不能读密钥的 principal 上仍红；"
+                         "未声明的一律红。`--new-kid` 是本参数的别名（3c-1A 的旧名）。")
+    ap.add_argument("--retire-key", action="append", metavar="LABEL", dest="retire_key",
+                    help="本轮**退役**的密钥标签（可重复），LABEL 同上。platform 类 principal "
+                         "丢掉它对应的 grant 计入迁移不红；同一轮丢的其它 grant 照样红。"
+                         "L3（--retire-key legacy）与演练第 ⑩ 步（--retire-key site-hs-v1 …）用它。")
     ap.add_argument("--migrate-baseline-only", action="store_true",
                     help="不发 AWS 调用：按 --migrate-from-schema 做基线的结构迁移并写回，然后退出。"
                          "3c-1A 用它把 schema 3 的基线升到 4（只加空的 facts.session_keys）。")
@@ -2217,6 +2358,13 @@ def main() -> int:
                     help="跳过「bootstrap 桶里有多少 asset 带活密钥」那一遍扫描"
                          "（默认做；它要读几十个小对象）")
     args = ap.parse_args()
+    # 标签打错一个字的后果是"以为声明了、其实没有"——静默的，所以在任何比较之前就校验。
+    # 位置在所有分支**之上**，只读 config、不发 AWS 调用 ⇒ `--from-dump` 与
+    # `--migrate-baseline-only` 这两条也一样覆盖。
+    declared_labels = tuple(args.new_key or ()) + tuple(args.retire_key or ())
+    if declared_labels:
+        cfg_keys = load_session_keys(CONFIG_PATH)
+        check_migration_labels(declared_labels, known_kids=configured_kids(cfg_keys))
     if args.migrate_baseline_only:
         if args.migrate_from_schema is None:
             raise SystemExit("--migrate-baseline-only 需要 --migrate-from-schema N")
@@ -2234,8 +2382,10 @@ def main() -> int:
 
     if args.from_dump:
         bundle = load_dump(Path(args.from_dump))
-        print(f"（--from-dump：读的是快照 {args.from_dump}，未发 AWS 调用）",
-              file=sys.stderr)
+        print(f"（--from-dump：读的是快照 {args.from_dump}，未发 AWS 调用。"
+              f"**快照里没有 login-flow 的信息**（它刻意不进 facts / BUNDLE_SHAPE），"
+              f"所以「Edge 产物含 login-flow 值」那条硬断言在本次运行里不成立——"
+              f"它只在实测路径上评估。）", file=sys.stderr)
     else:
         bundle = measure(args.region, workers=args.workers,
                         scan_assets=not args.no_asset_scan)
@@ -2277,7 +2427,8 @@ def main() -> int:
                               facts=bundle["facts"],
                               coverage=bundle["coverage"],
                               iam_write=bundle["iam_write"],
-                              new_kids=tuple(args.new_kid or ()))
+                              new_keys=tuple(args.new_key or ()),
+                              retired_keys=tuple(args.retire_key or ()))
     print("\n" + rep.render())
     # 处置文案由 RED_FIELDS 的第三列驱动（`dict.fromkeys` 去重且保序）：
     # 原先这里手抄了一遍字段名单，加红字段时最容易漏的就是这一处。
