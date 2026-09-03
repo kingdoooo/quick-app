@@ -2053,6 +2053,49 @@ def test_grant_strings_follow_the_grant_grammar():
         assert _GRANT_RE.fullmatch(x), f"grant {x!r} 不符合文法"
 
 
+def test_every_grant_constant_in_the_gate_is_covered_by_the_grammar():
+    """**闸门的 grant 常量集合 ⊆ 本文件的文法。** 两处分家一次就够疼了。
+
+    2026-09-03 真机踩过：3c-1B 给闸门加了 `G_READ_LOGIN_FLOW = "read-login-flow-secret"` 常量，
+    却没往 `_GRANT_RE` 里加那一支。而文法守卫（`test_grant_strings_follow_the_grant_grammar`）
+    读的是**真实基线**，只有当基线里第一次出现该 grant 时才会红——所以在第一次真机写基线之前
+    单测全绿是**必然的、不是巧合**（合成基线里没有这条）。代价是演练当场三条红。
+
+    本条把两处钉在一起：闸门里每个 `G_*` 常量都必须能被文法认出来。有些常量本身就是完整
+    grant（`read-jwt-param`），有些是需要后缀的前缀（`invoke-platform` → `:<函数名>`），
+    所以下面给出每种前缀的**代表性实例**；**新增一种 grant 而不在这里登记就会红**。
+    """
+    g = _gate()
+    # 前缀 → 一个代表性的完整实例。新增 G_* 常量时必须在这里登记（否则下面的断言会报"未登记"）。
+    samples = {
+        g.G_INVOKE_PLATFORM: f"{g.G_INVOKE_PLATFORM}:site-panel",
+        g.G_INVOKE_SITE: f"{g.G_INVOKE_SITE}:all",
+        g.G_REPLACE_CODE: f"{g.G_REPLACE_CODE}:site-panel",
+        g.G_READ_SESSION_KEY: f"{g.G_READ_SESSION_KEY}:site-hs-v1",
+    }
+    constants = {name: getattr(g, name) for name in dir(g)
+                 if name.startswith("G_") and isinstance(getattr(g, name), str)}
+    assert constants, "一个 G_* 常量都没找到——本条空转了"
+    unregistered = []
+    for name, value in sorted(constants.items()):
+        concrete = samples.get(value, value)
+        if not _GRANT_RE.fullmatch(concrete):
+            unregistered.append(f"{name}={value!r}（试的实例 {concrete!r}）")
+    assert not unregistered, (
+        "这些闸门常量文法认不出来——要么往 _GRANT_RE 加一支，要么（若它是需要后缀的前缀）"
+        "在本用例的 samples 里登记一个代表性实例：\n  " + "\n  ".join(unregistered))
+
+
+def test_that_coverage_guard_would_have_caught_the_1b_regression():
+    """**变形**：把 login-flow 那一支从文法里去掉，上一条必须红（证明它不是装饰）。"""
+    import re as _re
+    weakened = _re.compile(_GRANT_RE.pattern.replace("|read-login-flow-secret", ""))
+    g = _gate()
+    assert _GRANT_RE.fullmatch(g.G_READ_LOGIN_FLOW), "当前文法本该认得它——本条前提不成立"
+    assert not weakened.fullmatch(g.G_READ_LOGIN_FLOW), \
+        "去掉那一支之后文法还认得它？说明 pattern 里的锚点找错了，本条空转"
+
+
 def test_a_grant_carrying_an_arn_is_caught():
     """**元用例**：往 grant 里注入 ARN / 拼接垃圾 / legacy 串，都必须被文法拒绝。"""
     for bad in (f"invoke-platform:arn:aws:iam::{_ACCT}:role/X",

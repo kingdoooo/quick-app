@@ -343,6 +343,18 @@ router CDK（`rm -rf cdk.out`）→ CloudFront `Deployed` → `verify_deployed_e
 - **⑥–⑩ 是每次轮转照抄的五步**（就位 → 切换 → 回滚演示 → 排空 → 退役）。3c-2B 的 RS key
   也从 ⑥ 经 `previous` 槽位就位，只是多四项 KMS 校验。
 
+##### 开始之前：先把剩余各步的 config 状态干跑一遍
+
+```bash
+python3 site-builder/scripts/preflight_config_states.py     # 只读 config、不碰 AWS，约 10 分钟
+```
+
+它把 ⑤⑥⑦⑩ 的 `[SessionKeys]` 状态逐个写进 `config.ini`、跑六个包的单测、再逐字节还原。
+**目的是把"把配置当前值写死"的假红提前挖出来**：那类用例会在**改完配置、部署之后**才转红，
+于是你在演练中途面对一片红，而它们要守的性质一条都没变。2026-09-03 首跑实测：panel 在
+⑤⑥⑦ 各 3 条、⑩ 6 条，其余六包全绿；改成从加载器推导之后四个状态全绿。
+**跑它的时候不要并行跑任何读 config 的东西**（部署脚本与 `verify_*` 闸门都读它）。
+
 ##### 开始之前：三条 1A 的教训（每次动 auth/panel 之前过一遍）
 
 - [ ] **auth 的进包清单是 `deploy_auth.AUTH_PACKAGE_MODULES`**（panel 那边叫 `COPY_FILES`），

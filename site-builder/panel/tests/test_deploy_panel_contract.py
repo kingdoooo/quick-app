@@ -147,12 +147,25 @@ def test_missing_or_wildcard_edge_role_aborts_instead_of_widening(bad):
         dp.function_url_statements(bad)
 
 
-def _expected_panel_ssm_suffixes():
-    """panel 该读的 SSM 参数 = legacy + console family 的 HS 行（来自 [SessionKeys]），**没有 site**。"""
+def _live_keys():
+    """线上 `config.ini` 的 `[SessionKeys]`，**按加载器解析**。
+
+    2026-09-03 预演踩过：本组用例原先把 config 的**当前值**写死（legacy 非空、console kid 是
+    `console-hs-v1`）。而演练的每一步都在改这份配置——⑤ 清空 `legacy_param`、⑦ 把 console
+    current 换成 `console-hs-v2`、⑩ 删掉 v1 两节——于是它们会在**改完配置、部署之后**才成片转红，
+    而它们要守的性质其实一条都没变。**一律从加载器推导，别写死值。**
+    """
     sys.path.insert(0, str(PANEL.parent / "auth"))
     from session_keys import load_session_keys
-    keys = load_session_keys(PANEL.parent / "config.ini")
-    params = {keys.legacy_param} | {r.ssm_param for r in keys.allowlist("console") if r.alg == "HS256"}
+    return load_session_keys(PANEL.parent / "config.ini")
+
+
+def _expected_panel_ssm_suffixes():
+    """panel 该读的 SSM 参数 = 非空的 legacy + console family 的 HS 行，**永远没有 site**。"""
+    keys = _live_keys()
+    params = {r.ssm_param for r in keys.allowlist("console") if r.alg == "HS256"}
+    if keys.legacy_param:                     # L3 之后为空：那时它本来就不该在清单里
+        params.add(keys.legacy_param)
     return {f"parameter{p}" for p in params}
 
 
@@ -768,8 +781,32 @@ def test_environment_covers_every_env_var_the_code_reads():
     read, _ = _reachable_env_reads()
     # AWS 运行时自带的
     read -= {"AWS_DEFAULT_REGION", "AWS_REGION", "AWS_LAMBDA_FUNCTION_NAME"}
+    # `JWT_SECRET_PARAM` 是**条件必需**：`console_session._secret()` 确实无条件 `os.environ[...]`，
+    # 但它是作为 callable 传进 `verifier_env.legacy_secret(flag, get_legacy)` 的，那里
+    # `return get_legacy() if flag == "on" else None` ⇒ **LEGACY_ENTRY=off 时这个读根本不发生**。
+    # 静态扫描看不见这道守卫，所以 L3（legacy_param 清空）之后本条会假红。下面那条用例是配套的
+    # 正对照：legacy **开着**的时候少下发它必须仍然被抓，否则这里就是把覆盖检查整个放水了。
+    if not _live_keys().legacy_param:
+        read -= {"JWT_SECRET_PARAM"}
     missing = read - env
     assert not missing, f"代码会读但部署没下发的环境变量: {sorted(missing)}"
+
+
+def test_env_coverage_still_catches_a_missing_var_while_legacy_is_on():
+    """**正对照**：上一条对 `JWT_SECRET_PARAM` 的豁免只在 legacy 关掉时成立。
+
+    legacy 开着时把它从 env 里拿掉，覆盖检查必须红——否则那条豁免就等于把检查放水了。
+    """
+    read, _ = _reachable_env_reads()
+    read -= {"AWS_DEFAULT_REGION", "AWS_REGION", "AWS_LAMBDA_FUNCTION_NAME"}
+    assert "JWT_SECRET_PARAM" in read, "锚点失效：代码已经不读 JWT_SECRET_PARAM 了"
+
+    class _KeysLegacyOn:
+        legacy_param = "/site-builder/jwt-secret"
+    env_without_it = set(dp.lambda_environment()) - {"JWT_SECRET_PARAM"}
+    exempt = set() if _KeysLegacyOn.legacy_param else {"JWT_SECRET_PARAM"}
+    assert (read - exempt) - env_without_it == {"JWT_SECRET_PARAM"}, \
+        "legacy 开着时漏下发 JWT_SECRET_PARAM 竟然没被抓到"
 
 
 def test_console_route_is_split_mode_with_platform_prefix():
@@ -1063,8 +1100,8 @@ def test_l3_panel_env_drops_the_jwt_secret_param_key_entirely(monkeypatch, tmp_p
     assert "JWT_SECRET_PARAM" not in env
     assert env["LEGACY_ENTRY"] == "off"
     assert env["SESSION_SIGNER"] == "current"
-    # console family 的清单不受影响
-    assert "console-hs-v1" in env["SESSION_KEYS_JSON"]
+    # console family 的清单不受影响（**取加载器给的 current kid**，别写死 v1——⑦ 之后它是 v2）
+    assert _live_keys().families["console"]["current"].kid in env["SESSION_KEYS_JSON"]
 
 
 def test_before_l3_panel_env_still_ships_it(monkeypatch, tmp_path):
@@ -1087,7 +1124,8 @@ def test_l3_panel_role_ssm_list_no_longer_carries_the_legacy_arn(monkeypatch, tm
     assert not any(r.endswith("parameter/site-builder/jwt-secret") for r in ssm), ssm
     assert not any(r.endswith(":parameter") or r.endswith(":parameter/") for r in ssm), \
         "空参数名拼出了一个畸形 ARN"
-    assert any(r.endswith("/session-keys/console-hs-v1") for r in ssm), "console family 的 key 不该被一起收掉"
+    console_current = _live_keys().families["console"]["current"].ssm_param
+    assert any(r.endswith(console_current) for r in ssm), "console family 的 key 不该被一起收掉"
 
 
 # ── 3c-1B：login-flow secret 是 auth 私有的，panel 永不持有（spec §11.3）──────

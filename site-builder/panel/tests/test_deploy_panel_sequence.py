@@ -1,5 +1,6 @@
 """deploy_panel 的部署顺序合同（3c-1B ticket 02；spec §11.8.3、§11.8.12）——与 auth 那份同一对纪律。"""
 import ast
+import re
 import sys
 from pathlib import Path
 
@@ -45,10 +46,25 @@ class Recorder:
         return call
 
 
+def _live_keys():
+    """线上 `config.ini` 的 `[SessionKeys]`，按加载器解析。
+
+    别把配置的**当前值**写死：演练每一步都在改它（⑤ 清空 legacy、⑦ 换 console current 到 v2、
+    ⑩ 删 v1 两节），写死会让这些用例在部署之后成片假红，而它们要守的性质一条都没变。
+    """
+    sys.path.insert(0, str(Path(dp.__file__).parents[1] / "auth"))
+    from session_keys import load_session_keys
+    return load_session_keys(Path(dp.__file__).parents[1] / "config.ini")
+
+
 def test_required_parameters_are_legacy_plus_console_family_only():
+    keys = _live_keys()
     names = dp.required_parameters()
-    assert "/site-builder/jwt-secret" in names
-    assert any(n.endswith("/console-hs-v1") for n in names)
+    # legacy **iff 配置里非空**：L3 之后它不该在清单里（那时它已被清空）
+    assert ("/site-builder/jwt-secret" in names) == bool(keys.legacy_param), \
+        f"legacy 该出现 iff legacy_param 非空；legacy_param={keys.legacy_param!r} names={names}"
+    console_current = keys.families["console"]["current"].ssm_param
+    assert any(n.endswith(console_current) for n in names), (console_current, names)
     assert not any("/session-keys/site-" in n for n in names), "panel 不得读 site family 的密钥"
 
 
@@ -62,7 +78,10 @@ def test_ensure_function_updates_configuration_before_code(monkeypatch):
 
 
 def test_main_aborts_before_any_write_when_a_parameter_is_missing(monkeypatch):
-    ssm = FakeSSM(present={"/site-builder/jwt-secret"})       # console-hs-v1 缺
+    # 缺的那个是 console family 的 current（名字从加载器取：⑦ 之后它是 v2）
+    console_current = _live_keys().families["console"]["current"].ssm_param
+    present = set(dp.required_parameters()) - {console_current}
+    ssm = FakeSSM(present=present)
     iam, lam = Recorder(), Recorder()
     made = []
 
@@ -74,7 +93,7 @@ def test_main_aborts_before_any_write_when_a_parameter_is_missing(monkeypatch):
     monkeypatch.setattr(dp.boto3, "resource", lambda *a, **k: (_ for _ in ()).throw(AssertionError("不该碰路由表")))
     monkeypatch.setattr(dp, "_build_zip", lambda: (_ for _ in ()).throw(AssertionError("不该打包")))
     monkeypatch.setattr(sys, "argv", ["deploy_panel.py", "--skip-frontend"])
-    with pytest.raises(SystemExit, match="console-hs-v1"):
+    with pytest.raises(SystemExit, match=re.escape(console_current)):
         dp.main()
     assert iam.calls == [] and lam.calls == []
 
