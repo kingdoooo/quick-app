@@ -610,7 +610,7 @@ python3 site-builder/scripts/_session_mint.py --token-use console-upgrade \
 |---|---|
 | **配置** | 无 |
 | **动作** | 先跑四个 `verify_*`（证明埋点在工作），再 `session_verify_counts.py --hours 26 --require-total` |
-| **硬停止点** | 三列 `accepted_legacy` **全 0**、三列 `accepted_current` **全 > 0**、每处总量 > 0。**任一条不满足就不许进 ⑤**——继续观察或先查是谁还在发 legacy |
+| **硬停止点** | 三列 `accepted_legacy` **全 0**、三列 `accepted_current` **全 > 0**、每处总量 > 0。**任一条不满足就不许进 ⑤**——继续观察或先查是谁还在发 legacy。**第一次判定失败是常态，不是故障**（见下面的窗口算术）|
 | **闸门** | 不跑 |
 | **回滚** | 无（只读一步）|
 
@@ -626,6 +626,20 @@ python3 site-builder/scripts/verify_session_token_semantics.py
 
 python3 site-builder/scripts/session_verify_counts.py --hours 26 --require-total
 ```
+
+> **窗口算术：`≥ T0+26 h` 是最早**可以**尝试**的时刻，不是能过的时刻。** spec §11.8.2 写明
+> **实际落点在 T0+26 h 到 T0+52 h 之间**，取决于**最后一枚 legacy cookie 何时被用**。原因是
+> 判据跑在**滑动窗口** `[X-26h, X]` 上：legacy cookie 在 T0 之前签出、还能活 24 h，所以只要
+> 有人在 T0+23 h 用了一枚，能干净的窗口就得等到 T0+49 h。**算法**：
+> `最早可过时刻 = 最后一次 accepted_legacy 的时刻 + 26 h`，每次判定失败就按新的"最后一次"重算。
+> 判定失败时**不要**缩短 `--hours`、也不要去掉 `--require-total` 凑绿（那是把判据换掉，不是通过判据）。
+>
+> ⚠️ **观察窗口期间不要跑 `verify_kid_entry_live.py`。** 它有一条**故意**的正对照
+> 「legacy 会话仍 200 放行」——`_session_mint --role legacy` 现签一枚 legacy token 打到 Edge。
+> 那会给 `accepted_legacy` 记上一笔、把上面那个"最后一次"推到当下，**等于把 26 h 时钟按回零**。
+> 四个 `verify_*` 都不发 legacy（`_session_mint` 默认 current），所以 ④ 只跑那四个是刻意的。
+> 2026-09-03 实测：③ 里跑的那次 kid 探针就在 13:56 记了一笔 `accepted_legacy`，于是
+> T0+26 h 那一刻的窗口 `[T0, T0+26h]` 必然包含它 ⇒ 第一次判定注定失败，差的就是那几分钟。
 
 ##### ⑤ L3：关闭 legacy 入口
 
