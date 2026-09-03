@@ -132,7 +132,7 @@ def lambda_env() -> dict:
     keys = load_session_keys(CFG_PATH)
     env = {
         # 3c-1B：登录流程（OAuth state 与 __Host-sb_pkce cookie）的 HMAC 密钥参数名。
-        # 键名照 `_secret(name)` 的 `{name}_PARAM` 约定，所以 login_handler._state_sig 只改了
+        # 键名照 `_secret(name)` 的 `{name}_PARAM` 约定，所以 login_handler._login_flow_sig 只改了
         # 一个字符串就换了密钥。**auth 私有**——panel 与 Edge 都不下发它（spec §11.3）。
         "LOGIN_FLOW_SECRET_PARAM": keys.login_flow_secret_param,
         "CLIENT_SECRET_PARAM": CLIENT_SECRET_PARAM,
@@ -226,7 +226,7 @@ def main():
     # login-flow secret（3c-1B）：主创建点是 scripts/ensure_session_keys.py（部署序列第①步一次
     # 建齐 config 声明的所有密钥），这里是**缺省补建**（spec §11.8.6 把它叫「兜底」）——
     # 两处都只创建不覆盖，先跑哪个都一样。
-    # 覆盖它的后果是所有**进行中**的登录失败一次（已签发的会话不受影响），见 _state_sig 的说明。
+    # 覆盖它的后果是所有**进行中**的登录失败一次（已签发的会话不受影响），见 _login_flow_sig 的说明。
     ensure_secret(keys.login_flow_secret_param, lambda: secrets.token_hex(32))
     role_arn = ensure_lambda_role()
     env = lambda_env()

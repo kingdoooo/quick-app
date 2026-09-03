@@ -695,7 +695,7 @@ def run_deployed() -> None:
     check(not diff, "site-auth-service 环境变量 == 本地 lambda_env() 推导值",
           f"不一致的键: {diff}" if diff else f"{len(want_env)} 个键一致（只有参数名，无明文）")
     # 3c-1B：`*_PARAM` 逐个核（LOGIN_FLOW_SECRET_PARAM 漏下发的症状是**所有 /login 500**，
-    # 因为 _state_sig 经 _secret("LOGIN_FLOW_SECRET") 取值、无来源时响亮抛错）。
+    # 因为 _login_flow_sig 经 _secret("LOGIN_FLOW_SECRET") 取值、无来源时响亮抛错）。
     # **点名清单从本地推导值来**，不写死：L3（清空 legacy_param）之后 `JWT_SECRET_PARAM`
     # 整个键不下发，写死会让那条核对在一个不该存在的键上永久失败。上面那条"env 整体 =="
     # 已经保证 got_env 与 want_env 同集合，所以按 want_env 点名等价于按线上点名，

@@ -3,7 +3,7 @@
 验 id_token、种顶域会话 cookie；/logout。
 安全：OAuth 授权码 + PKCE(S256) + nonce；state HMAC 签名 + 5 分钟过期
 （防 login CSRF/redirect 篡改，密钥是 auth 私有的 login-flow secret，
-**不是会话密钥**——见 _state_sig）；id_token 走 Cognito JWKS 验签 +
+**不是会话密钥**——见 _login_flow_sig）；id_token 走 Cognito JWKS 验签 +
 iss/aud/exp/token_use 校验，并核对 nonce（防 id_token 重放）。
 **code_verifier 与 nonce 放 `__Host-sb_pkce` host-only cookie，不放 state**
 ——state 随 authorize URL 明文传输（只有签名、没有加密），把 verifier 放进去
@@ -151,7 +151,7 @@ def _get_jwks_client() -> PyJWKClient:
     return _jwks_client
 
 
-def _state_sig(body: str) -> str:
+def _login_flow_sig(body: str) -> str:
     """OAuth state 与 `__Host-sb_pkce` cookie 的 HMAC（两者共用本函数与同一线格式）。
 
     3c-1B 起用 **auth 私有的 login-flow secret**，不再用会话密钥（spec §11.3 / §11.8.6）。
@@ -190,14 +190,14 @@ def _encode_state(redirect: str) -> str:
     """
     body = base64.urlsafe_b64encode(json.dumps(
         {"r": redirect, "exp": int(time.time()) + 300}).encode()).decode().rstrip("=")
-    return f"{body}.{_state_sig(body)}"
+    return f"{body}.{_login_flow_sig(body)}"
 
 
 def _decode_state(state: str) -> str | None:
     """验签 + 验期，失败返回 None；成功返回 redirect。"""
     try:
         body, _, sig = state.rpartition(".")
-        if not hmac.compare_digest(sig, _state_sig(body)):
+        if not hmac.compare_digest(sig, _login_flow_sig(body)):
             return None
         payload = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
         if int(payload.get("exp", 0)) <= int(time.time()):
@@ -216,12 +216,12 @@ def _pkce_cookie(verifier: str, nonce: str) -> str:
 
     **不要给本函数加 base/domain 参数**：`__Host-` 前缀下任何 `Domain=` 都会让
     浏览器直接丢弃该 cookie，于是每次登录都走 callback 的 400 分支。
-    `"t": "pkce"` 是类型标记——state 与本 cookie 共用 `_state_sig`，没有它
+    `"t": "pkce"` 是类型标记——state 与本 cookie 共用 `_login_flow_sig`，没有它
     一个合法 state 值就能充当"签名合法"的 pkce cookie（见 _read_pkce_cookie）。
     """
     payload = base64.urlsafe_b64encode(
         json.dumps({"t": "pkce", "v": verifier, "n": nonce}).encode()).decode().rstrip("=")
-    sig = _state_sig(payload)
+    sig = _login_flow_sig(payload)
     return (f"{PKCE_COOKIE}={payload}.{sig}; Path=/; Max-Age=300; "
             f"Secure; HttpOnly; SameSite=Lax")
 
@@ -267,7 +267,7 @@ def _read_pkce_cookie(event) -> dict | None:
     时一个 `__Host-sb_pkce=YWJj.ü` 就能让 handler 抛出 500 + 堆栈，而不是约定的
     400。`_decode_state` 本来就是整段包的，这里必须一致。
 
-    **v/n 必须非空**：`_state_sig` 同时给 state 与本 cookie 签名、且线格式相同，
+    **v/n 必须非空**：`_login_flow_sig` 同时给 state 与本 cookie 签名、且线格式相同，
     所以一个合法 state 值就是一个"签名合法"的 pkce cookie——它解出来
     `{"v": "", "n": ""}`，若不检查就会带着空 verifier 去 `_post_token`，
     正是"静默降级成无 PKCE 交换"（现在只靠 Cognito 拒空 verifier 兜着，
@@ -283,7 +283,7 @@ def _read_pkce_cookie(event) -> dict | None:
             continue
         try:
             body, _, sig = value.rpartition(".")
-            if not hmac.compare_digest(sig, _state_sig(body)):
+            if not hmac.compare_digest(sig, _login_flow_sig(body)):
                 return None
             data = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
             if data.get("t") != "pkce":      # state 值不能当 pkce cookie 用

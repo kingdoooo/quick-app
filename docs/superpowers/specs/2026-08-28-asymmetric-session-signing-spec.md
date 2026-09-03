@@ -159,7 +159,7 @@ change-set 那两条就整个漏掉。
 | 1 | 站点会话 `sb_session` | `auth/login_handler.py:503` → `session.mint_session_jwt` | `typ=session`，24h |
 | 2 | console 一次性升级码 | `auth/login_handler.py:545` → `session.mint_upgrade_code` | `typ=console-upgrade`，≤60s |
 | 3 | 面板会话 `__Host-sb_console` | `panel/console_session.py:109` → `session.mint_session_jwt(scope="console")` | `typ=session` + `scope=console`，4h |
-| 4 | OAuth state | `auth/login_handler.py:102` `_state_sig` | **裸 HMAC，不是 JWT** |
+| 4 | OAuth state | `auth/login_handler.py:102` `_login_flow_sig` | **裸 HMAC，不是 JWT** |
 
 | # | 验签点 | 位置 | 验的是什么 |
 |---|---|---|---|
@@ -703,7 +703,7 @@ SPKI 指纹 CFN 给不出，由 `deploy_auth.py` 部署时 `GetPublicKey` 算出
 
 ### 11.3 登录流程 HMAC 密钥（state 与 PKCE cookie）：独立的 login-flow secret，归 3c-1B
 
-**实况**：`_state_sig` 不只签 OAuth state，也签 `__Host-sb_pkce` cookie
+**实况**：`_login_flow_sig` 不只签 OAuth state，也签 `__Host-sb_pkce` cookie
 （`login_handler.py:142-157`，带 `"t":"pkce"` 类型标记），两者 TTL 都是 300 s。
 
 **裁定**：3c-1B 起（signer 离开共享密钥的同一刻）改用一把 **auth 私有**的 SSM SecureString
@@ -932,7 +932,7 @@ import 它，2A 只换这一个模块为夹具签发器（§11.7）。所有工�
 **词表冲突**：讨论中出现过 `IN_FLOW_SECRET_PARAM` 一名，与 §11.3/§11.6 与 `CONTEXT.md` 的
 **login-flow secret** 冲突。**裁定按 spec 字面**：参数 `/site-builder/login-flow-secret`、config 键
 `[SessionKeys] login_flow_secret_param`、env `LOGIN_FLOW_SECRET_PARAM`（正好套 `_secret(name)` 的
-`{name}_PARAM` 约定，`_state_sig` 只改一个字符串）。`ensure_session_keys.py` 扩到也创建它（部署序列第
+`{name}_PARAM` 约定，`_login_flow_sig` 只改一个字符串）。`ensure_session_keys.py` 扩到也创建它（部署序列第
 ①步一次建齐所有 config 声明的密钥），`deploy_auth.py` 的 `ensure_secret` 保留为兜底；只进 auth 角色的
 SSM 精确清单，panel/Edge 永不持有。轮转 = `put-parameter --overwrite`，5 分钟窗口进行中登录失败一次，
 写进 DEPLOY.md，1B 不演练它。闸门归类见 §11.8.7。
@@ -1033,10 +1033,23 @@ auth/panel 的密钥值在运行时才按参数名读，参数缺失的症状是
 （部署脚本 exit 0、线上全红）；⑥ 若忘跑 `ensure_session_keys.py` 就会撞上。stack.py 缺值会落 SYNTH
 占位符、`verify_deployed_edge.sh` 事后能抓，但 auth/panel 没有事前防线。
 
-**裁定**：两个部署脚本在第一次写之前对各自 family 集合里的每个 HS `ssm_param`（auth 另加 login-flow 与
-非空的 legacy）做一次 `GetParameter`，任一缺失即拒绝部署。只读、幂等、不打印值；与 §11.6 第 1 层
+**裁定**：两个部署脚本在第一次写之前对各自 family 集合里的每个 HS `ssm_param` 做一次
+`GetParameter`，任一缺失即拒绝部署。只读、幂等、不打印值；与 §11.6 第 1 层
 "RS kid 的部署前校验"是同一位置，2B 在同一个钩子里加四项 KMS 校验。守卫：单测断言这个核对发生在任何
 Lambda/IAM 写调用之前。
+
+> **上面这条裁定原先写的是"auth 另加 login-flow 与非空的 legacy"，实施时按
+> `docs/adr/0004-login-flow-secret-outside-the-pre-write-precheck.md` 排除了这两条**，正文已按 ADR
+> 改口。理由：核对发生在任何写之前，把 login-flow 列进清单就让 §11.8.6 要求保留的 `ensure_secret`
+> 缺省补建永远走不到——而它存在的唯一理由正是首次部署，于是首次部署必然被自己拒掉。判据是"核对到底在
+> 防什么"：它防的是**多个消费方必须就同一个值达成一致**，而 login-flow 只有 auth 一个消费方，所以这条
+> 排除是**安全**的。**照本条原话把 login-flow 加回清单会让首次部署自我拒绝。**
+>
+> **legacy 参数走同一条排除，但那一条并不安全，是一个已知缺口**（3c-1A 的既定取舍，非 1B 引入）：它的
+> 第二个消费方是 Edge，那份值是 CDK 部署时字符串替换注入的。成熟部署上参数若被删，auth 会静默重造一把
+> 而 Edge 仍拿着旧的 ⇒ 正是 precheck 本要防的全员登录循环。今天唯一的现场信号是 `ensure_secret` 创建时
+> 打的那一行。**ADR 0004 的"安全"结论只覆盖 login-flow 一把，不要把它读成对 legacy 的背书**；真正的修复
+> 要能区分"首次部署"与"这个参数不该不存在"，那是独立的设计面（1B 不做）。
 
 #### 11.8.13 实施纪律（1A 的教训，供 /to-tickets 逐票引用）
 

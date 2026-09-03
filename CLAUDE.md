@@ -72,6 +72,10 @@ cd "$(git rev-parse --show-toplevel)"
 (cd router/infrastructure/lambda && ../../../site-builder/deployer/.venv/bin/pytest . -q)
 # 必须指定 tests/——裸 pytest 会误收集 infra/cdk.out 里的 asset 副本
 (cd site-builder/deployer && .venv/bin/pytest tests -q)
+# mcp 的 .venv 里**没有 pytest**（只装运行期依赖），所以这条借的是宿主机的 python3。
+# 宿主 python3 没装 pytest 时它会报 `No module named pytest`——那不是代码红，
+# 改用下面的 run_locked_tests.sh（自建 py3.13 venv，不依赖宿主 pytest）。
+# **别借 deployer 的 venv**：那里没有 `mcp` 包，实测 148 条假红。
 (cd site-builder/mcp && python3 -m pytest tests -q)
 # panel 无自己的 venv，借 deployer 的；测试期从 auth/ 直接 import session.py，部署时复制
 (cd site-builder/panel && ../deployer/.venv/bin/pytest tests -q)
@@ -135,14 +139,23 @@ RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/tes
 bash site-builder/scripts/smoke_router.sh    # 路由层冒烟（会写测试数据，跑完清理；含 65s 等 Edge 缓存）
 python3 site-builder/scripts/verify_console_e2e.py      # 控制台端到端
 python3 site-builder/scripts/verify_analytics_e2e.py    # 统计端到端（二期 M5）
-python3 site-builder/scripts/verify_kid_entry_live.py   # 3c-1A 新入口真机正/负向（只发 GET；--self-test 不碰 AWS）
+python3 site-builder/scripts/verify_kid_entry_live.py   # 新入口真机正/负向（只发 GET；--self-test 不碰 AWS）
+# ↑ 3c-1B 起还有两个旗标，轮转时用：`--role current|previous`（正向，会消费一枚升级码）、
+#   `--retired-token FILE`（负向，期望 Edge 302 / panel 401 且 outcome=unknown_kid）。
+#   FILE 由 `_session_mint.py --save` 预存，**只许写进 .scratch/**（gitignored，token 是活凭证）。
 python3 site-builder/scripts/session_verify_counts.py --hours 1 --require-total   # 三处 session_verify 埋点读数（只读；任一 verifier 为 0 即退 1）
+# ↑ 轮转的两道 26h 时间闸就是它：`--hours 26 --require-total`，判据见 DEPLOY.md 的十步 runbook
 # 账号信任边界的漂移闸门（只读；A 直接失守 + B IAM 写静态快照两层；400 个 principal × 2 次
 # IAM 模拟 + **两次** GetAccountAuthorizationDetails（第二次是模拟后的**窗口两端一致性
 # 复查**——两端不一致就作废本轮、不出结论也不写基线。它**不保证原子**：只覆盖 principal
 # 层，且只证明两端相等，三个已接受盲区见 docs/security/account-trust-boundary.md）
 # + 扫 bootstrap 桶，实测 11±1 分钟：11m33s / 10m57s 两次）
 python3 site-builder/scripts/verify_account_trust_boundary.py
+# 密钥增减必须**声明**，否则一律红：`--new-key LABEL` / `--retire-key LABEL`
+# （LABEL ∈ 已配置 kid ∪ {legacy, login-flow}；声明过的落 migration_grants 分节，绿）。
+# **声明与 --update-baseline 是两条命令、顺序不能反**（后者不做比较）；用
+# `--dump-observed` 一次扫描 + 两条 `--from-dump` 省掉第二个 11 分钟，**但 login-flow
+# 那条硬断言只在实测路径上评估**，涉及它的那一轮不要用 --from-dump 出结论。
 ```
 
 `site-builder/scripts/verify_*` 是真机闸门（部署后跑，不是单测）。**本文件不记数量与
@@ -184,7 +197,11 @@ cd "$(git rev-parse --show-toplevel)"
 # 执行器（bundling 需要 Docker）
 (cd site-builder/deployer/infra && rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never)
 
-# 3c-1A：两把 HS 会话密钥先存在（幂等、只创建；路径来自 site-builder/config.ini 的 [SessionKeys]）
+# 两把 HS 会话密钥 + login-flow secret 先存在（幂等、只创建不覆盖、不打印值；
+# 路径全来自 site-builder/config.ini 的 [SessionKeys]）。忘跑它不会静默：
+# deploy_auth / deploy_panel 在第一次写之前 GetParameter 核对本组件的每个 **family HS 参数**，
+# 缺一即拒绝部署。**清单里没有 legacy 与 login-flow**（两者由脚本自己 ensure_secret 创建，列进去
+# 会让首次部署自我拒绝，见 docs/adr/0004-*.md；legacy 那条排除是已知缺口，不是安全结论）。
 python3 site-builder/scripts/ensure_session_keys.py
 
 # auth 服务（Lambda + Function URL + pre-token 触发器，幂等）
@@ -278,7 +295,12 @@ python3 site-builder/scripts/gen_onboarding.py
 - **站点 origin 不可信。** 平台 cookie、`x-user-*` 与平台标记在到达站点前必须剥除；
   可信身份头只能由 Edge 验签后重新注入。
 - **auth/session 与 Edge verifier 是跨部署单元的同一契约**（3c-1A 起含 `[SessionKeys]` 的 allowlist：`session.verify_with_legacy` 与 Edge 的 `_verify_session_jwt` 字节等价，Edge 只持 site family、panel 只持 console）。claim、算法或密钥形态变化
-  必须同步 auth、panel、Edge、跨组件测试和部署顺序；auth 先于 router。
+  必须同步 auth、panel、Edge、跨组件测试和部署顺序。
+  **顺序有两个方向，别照抄错**：**新建部署**是 `auth 先于 router`（依赖——router 栈 synth 时
+  要从 SSM 读密钥字符串替换注入 Edge）；**切换/轮转**必须 **verifier 先行**（速度差——auth/panel
+  读 SSM 5 分钟就切，Edge 要重部 + 10–20 分钟全球复制；signer 先切 = 新 cookie 在旧边缘节点
+  验签失败，症状与"密钥读取失败"一模一样）。切换的完整协议是 `site-builder/DEPLOY.md`
+  「轮转会话密钥：十步 runbook」。
 - **异步调用结果未知时保留恢复状态。** 网络超时不等于请求未受理；不得在结果不确定时
   释放租约、回滚为可重试状态或允许新的部署/下线并发进入。
 
@@ -293,6 +315,10 @@ python3 site-builder/scripts/gen_onboarding.py
 | 路由权限字段 | permissions、register/resync、补偿恢复、Edge 反序列化 |
 | DynamoDB/DSQL 资源 | runtime inline policy、boundary、undeploy、backfill、IAM 模拟 |
 | `[SessionKeys]`（`auth/session_keys.py`） | `config.ini.example`、`ensure_session_keys.py`、`deploy_auth`/`deploy_panel` 的 env 与 role SSM 清单、`router/infrastructure/stack.py` 注入、闸门 `session_key_params`、`verify_deployed_edge.sh`、`verifier_env.py`（auth 拥有、panel 复制） |
+| `[SessionKeys] signer`（`legacy`\|`current`） | auth 与 panel 的 `SESSION_SIGNER`（两个组件各自部署 ⇒ 切换有先后：**panel 先、auth 后**）、`verifier_env.signer_mode()`、两个 handler 的签发分支与 AST 守卫。**验签侧与它无关**（verifier 全程双接受）⇒ 回滚 = 改这一行重部 auth+panel，不动 Edge、不回退代码 |
+| `[SessionKeys] legacy_param` 清空（L3） | `legacy_entry()` 变 off、auth/panel 不再下发 `JWT_SECRET_PARAM` 且角色 SSM 清单不含它、`stack.py` 给 Edge 注入空串（**空串不是 SYNTH 占位符**）、闸门 `--retire-key legacy`。清空前 `signer` 必须已是 `current`（加载器硬拒该组合） |
+| `[SessionKeys] login_flow_secret_param` | 只进 auth（`LOGIN_FLOW_SECRET_PARAM` + 角色清单），`login_handler._login_flow_sig` 是唯一读取点；`ensure_session_keys.py` 创建、`deploy_auth.ensure_secret` 兜底（**不进写前核对清单**，见 `docs/adr/0004-*.md`）；panel 有三条负向断言锁死它永不持有；闸门记成 grant `read-login-flow-secret` 且**不算冒充面** |
+| 验收工具的本地 mint（`scripts/_session_mint.py`） | 六处调用方（四个 `verify_*`、`verify_kid_entry_live.py`、E2E 的会话 cookie fixture）。改它等于同时改六个验收面；3c-2A 会把它整体换成夹具签发器，所以**本地 mint 只许存在于这一个模块里** |
 
 ## 高频坑（都是真机踩过的）
 

@@ -167,7 +167,7 @@ def test_main_source_calls_precheck_before_every_write_helper():
 
 # ── 3c-1B：login-flow secret（spec §11.3 / §11.8.6）──────────────────────────
 #
-# 三条不变量：① 环境变量下发的是**参数名**（`{name}_PARAM` 约定，`_state_sig` 因此不改取值代码）；
+# 三条不变量：① 环境变量下发的是**参数名**（`{name}_PARAM` 约定，`_login_flow_sig` 因此不改取值代码）；
 # ② 它进 auth 角色的 SSM 精确清单（否则运行时 AccessDenied ⇒ 所有 /login 500）；
 # ③ 它**不进** panel（见 panel 那边的对称用例）。
 

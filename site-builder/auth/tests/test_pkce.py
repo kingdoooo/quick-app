@@ -122,7 +122,7 @@ def test_callback_rejects_forged_pkce_cookie():
 
 @patch.dict(lh.os.environ, ENV)
 def test_pkce_cookie_with_valid_sig_but_no_verifier_is_rejected():
-    """state 与 pkce cookie 共用 _state_sig、线格式相同——一个合法 state 值就是
+    """state 与 pkce cookie 共用 _login_flow_sig、线格式相同——一个合法 state 值就是
     "签名合法"的 pkce cookie。它解不出 v/n，若不拦就会带空 verifier 去换 token
     （静默降级成无 PKCE 交换，只剩 Cognito 兜着）。"""
     forged = lh._encode_state("https://app-x.example.com/")   # 合法签名，但没有 v/n
@@ -713,7 +713,7 @@ def _sig_with(secret: str, body: str) -> str:
 
 
 @patch.dict(lh.os.environ, ENV)
-def test_state_signature_is_the_login_flow_secret_not_any_session_key():
+def test_login_flow_signature_is_the_login_flow_secret_not_any_session_key():
     """正向 + 负向同时断言：只有 login-flow secret 能复算出 state 的签名。"""
     state = lh._encode_state("https://app-x.example.com/")
     body, _, sig = state.rpartition(".")
@@ -733,10 +733,10 @@ def test_pkce_cookie_signature_is_the_login_flow_secret_too():
 
 
 @patch.dict(lh.os.environ, ENV)
-def test_state_signed_with_the_session_key_is_rejected_by_callback():
+def test_login_flow_signed_with_the_session_key_is_rejected_by_callback():
     """拿会话密钥签一个格式完全正确的 state 投进 /callback，必须 400。
 
-    这条是迁移**真的发生了**的判据：只改注释或只加一把新密钥而 `_state_sig` 仍读 JWT_SECRET 时，
+    这条是迁移**真的发生了**的判据：只改注释或只加一把新密钥而 `_login_flow_sig` 仍读 JWT_SECRET 时，
     它会绿——所以必须配上面那两条正向签名断言一起看。
     """
     import json as _json
@@ -797,7 +797,7 @@ def test_missing_login_flow_secret_fails_loudly_instead_of_reusing_jwt_secret():
 # 上面几条是行为断言，管的是"当前实现签对了"。这一条管的是"以后不会有人再把会话密钥
 # 拿回来签登录数据"——包括新加第二个签名函数这种形态。自测证明它真会红。
 
-_LOGIN_FLOW_FUNCS = ("_state_sig", "_encode_state", "_decode_state",
+_LOGIN_FLOW_FUNCS = ("_login_flow_sig", "_encode_state", "_decode_state",
                      "_pkce_cookie", "_read_pkce_cookie")
 
 
@@ -828,7 +828,7 @@ def test_login_flow_signing_never_touches_a_session_key():
 
 
 def test_login_flow_guard_bites_a_regression():
-    """变形：把 `_state_sig` 改回读 JWT_SECRET，守卫必须红（证明上一条不是装饰）。"""
+    """变形：把 `_login_flow_sig` 改回读 JWT_SECRET，守卫必须红（证明上一条不是装饰）。"""
     import inspect
     src = inspect.getsource(lh)
     assert not _session_key_in_login_flow(src), "当前源码本该干净——本条前提不成立"
@@ -845,4 +845,4 @@ def test_login_flow_secret_is_read_in_exactly_one_place():
     """单一取值点：多处各读一次时，将来换算法/换来源会漏改其中一处。"""
     src = (Path(lh.__file__)).read_text()
     assert src.count('_secret("LOGIN_FLOW_SECRET")') == 1, \
-        "LOGIN_FLOW_SECRET 的读取点不止一个——应只在 _state_sig 里"
+        "LOGIN_FLOW_SECRET 的读取点不止一个——应只在 _login_flow_sig 里"

@@ -140,6 +140,12 @@ console_version =
 # 值就是固定的 SSM 参数路径：ensure_session_keys.py 按这里的 HS 行幂等创建 SecureString，
 # router 栈 synth 时只取 site family、panel 只取 console family、auth 两个都取。
 # RS 行（key_arn 带 :key/<uuid> 的完整 ARN，永不写 alias；spki_sha256 64 位 hex）3c-2B 起才出现。
+# 槽位语义（术语真源是根 CONTEXT.md 的 Key family / 就位 两条；DEPLOY.md 的十步 runbook 同源）：
+#   *_current  = signer 开关为 current 时**签发**用的那把；
+#   *_previous = 另一把**被接受**的 key——要么是排空中的旧 key，要么是就位中的新 key。
+# 新 key 一律**经 previous 就位**（runbook ⑥），切换 = 两槽互换（⑦），排空后清空 previous
+# 并删掉那一节（⑩，含删 SSM 参数、不可逆）。**不要就地覆盖任何一把 key 的值**：那会造成一段
+# 全员登录循环（auth/panel 5 分钟切换 vs Edge 重部 + 10–20 分钟全球复制）。
 site_current = site-hs-v1
 site_previous =
 console_current = console-hs-v1
