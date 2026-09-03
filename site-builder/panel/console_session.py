@@ -3,7 +3,7 @@
 **本模块不实现 code 的编解码**——单一实现在 auth/session.py，deploy_panel.py
 打包时复制过来（同 common.py / permissions.py 模式）。这里只做三件事：
 ① 用 verify_upgrade_code 验签后**原子消费 jti**（条件写 session-codes）；
-② 构造/校验 __Host-sb_console（scope=console 的会话 JWT，TTL 4h）；
+② 构造/校验 __Host-sb_console（TTL 4h；线格式由 SESSION_SIGNER 决定，见 console_cookie）；
 ③ CSRF 校验，且必须**前置于**一切业务副作用（spec §5.4，顺序在 handler.py）。
 
 密钥：环境变量只有参数名 JWT_SECRET_PARAM，运行时从 SSM SecureString 读 +
@@ -71,6 +71,31 @@ def _legacy_secret():
     return verifier_env.legacy_secret(os.environ.get("LEGACY_ENTRY"), _secret)
 
 
+def _signer_mode() -> str:
+    """面板会话的签发形态（3c-1B，spec §11.8.3）：`legacy` | `current`，来自 SESSION_SIGNER。
+
+    **与 auth 是同一个开关、同一份配置真源**（`[SessionKeys] signer`），但两个组件各自部署，
+    所以切换有先后：runbook 是 panel 先、auth 后——面板会话只有 panel 自己验、TTL 4 h，
+    是爆炸半径最小的先行指标。验签侧不受影响（verifier 全程双接受），所以先切 panel
+    不会让任何已签发的 cookie 失效。
+
+    **改动本函数或 `console_cookie` 会让 auth 的测试套件变红**，不是 panel 的：签发面的 AST
+    守卫住在 `auth/tests/test_signer_switch_guard.py`（它按路径读本文件）。这是一条有意的
+    跨包耦合——守卫要同时看住两个组件的签发点才有意义——但方向容易反着猜，所以写在这里。
+    """
+    return verifier_env.signer_mode(os.environ.get("SESSION_SIGNER"))
+
+
+def _signing_key() -> tuple[str, str]:
+    """→ console family 的 (current kid, secret)。**panel 只签面板会话，只碰 console family。**
+
+    `allowed_families=("console",)` 与验签那边同一个口径：SESSION_KEYS_JSON 里出现 site
+    就是部署配置错，直接拒——panel 是公网可达组件，拿到 site 的 key 等于能伪造站点会话。
+    """
+    return verifier_env.signing_key(os.environ.get("SESSION_KEYS_JSON"), "console",
+                                    _secret_by_param, allowed_families=("console",))
+
+
 def _log_verify(outcome: str) -> None:
     verifier_env.log_verify("panel", outcome)
 
@@ -128,10 +153,20 @@ def console_cookie(email: str, name: str) -> str:
     __Host- 前缀是浏览器强制的：必须 Secure、必须 Path=/、**必须无 Domain**。
     不要给本函数加 domain 参数——任何 Domain= 都会让浏览器整条丢弃 cookie，
     表现为"登录成功但面板一直 401"（auth 的 PKCE cookie 有同样的注释）。
+
+    3c-1B：线格式由 SESSION_SIGNER 决定——`current` 用 console family 的 current kid +
+    `mint_token(console-session)`（§11.4 的面板会话表：token_use/aud/email/name/exp/iat，
+    **不再写 typ 与 scope**）；`legacy` 字节级沿用旧形态（typ=session + scope=console）。
+    cookie 的 `__Host-` 三要素与 TTL 两侧完全相同，本票只换签名密钥与 claim 集合。
     """
-    token = session.mint_session_jwt(email, name, _secret(),
-                                     ttl_seconds=CONSOLE_TTL_SECONDS,
-                                     scope=CONSOLE_SCOPE)
+    if _signer_mode() == "current":
+        kid, secret = _signing_key()
+        token = session.mint_token(kid=kid, secret=secret, token_use="console-session",
+                                   email=email, ttl_seconds=CONSOLE_TTL_SECONDS, name=name)
+    else:
+        token = session.mint_session_jwt(email, name, _secret(),
+                                         ttl_seconds=CONSOLE_TTL_SECONDS,
+                                         scope=CONSOLE_SCOPE)
     return (f"{CONSOLE_COOKIE}={token}; Secure; HttpOnly; "
             f"SameSite=Lax; Path=/; Max-Age={CONSOLE_TTL_SECONDS}")
 

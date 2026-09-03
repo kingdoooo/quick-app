@@ -23,7 +23,9 @@ from pathlib import Path
 import pytest
 
 import login_handler as lh
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "panel" / "tests"))
 from conftest import SITE_KID_SECRET
+from module_mutation import mutate_module_segment  # noqa: E402
 # 复用 /login → /callback 的完整走法（真 state、真 PKCE cookie，只 patch code 交换），
 # 免得这里再写第二份"怎么拿到一枚会话 cookie"——那正是复制品漂移的形状。
 from test_login_handler import ENV, ENV_CURRENT, _b64d, _do_callback, _session_cookie
@@ -130,14 +132,9 @@ CALLBACK_REGION = ('if path == "/callback"', 'if path == "/console-session"')
 
 
 def _handler_variant(tmp_path, old: str, new: str, *, region=CALLBACK_REGION):
-    """在**临时副本**上改一个字面量再加载（不动仓库里的文件，不 git checkout --）。"""
-    src = (AUTH / "login_handler.py").read_text()
-    start, end = src.index(region[0]), src.index(region[1])
-    assert start < end, "段落锚点顺序反了——login_handler 的路由顺序变了？"
-    seg = src[start:end]
-    assert seg.count(old) == 1, f"锚点 {old!r} 在 /callback 段里出现 {seg.count(old)} 次，变形测试失效"
-    mutated = src[:start] + seg.replace(old, new) + src[end:]
-    mod = _load_from_source("_login_handler_mutant", mutated, tmp_path)
+    """在**临时副本**上改一个字面量再加载（助手与 panel 侧共用，见 module_mutation）。"""
+    mod = mutate_module_segment(AUTH / "login_handler.py", region=region, old=old, new=new,
+                               tmp_path=tmp_path, module_name="_login_handler_mutant")
     # 假 SSM 只装在真模块上（conftest 的 autouse 夹具）；副本自带一份干净的缓存与 client
     mod._ssm = lh._ssm
     return mod

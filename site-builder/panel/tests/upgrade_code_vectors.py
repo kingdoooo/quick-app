@@ -40,3 +40,25 @@ CONSOLE_KID_SECRET = "console-secret-v1-not-a-real-one"
 CONSOLE_ALLOWLIST = {CONSOLE_KID: {"alg": "HS256", "secret": CONSOLE_KID_SECRET, "role": "current"}}
 SITE_KID = "site-hs-v1"
 SITE_KID_SECRET = "site-secret-v1-not-a-real-one"
+
+
+# ---- 3c-1B：**面板会话 cookie** 的新形态向量，两侧各跑一遍 ----
+#
+# 1A 加的是升级码（auth 签、panel 验）。1B 让 panel 自己也开始签——`console_cookie` 从
+# `mint_session_jwt(scope=console)` 换成 `mint_token(console-session)`。于是又多了一个
+# "auth 与 panel 各持一份 session.py"的等价性要求，方向和升级码正好相反：**panel 签、
+# auth（那份 session.py）验**。同一组 MUTATIONS 施加在它上面，两侧接受/拒绝必须一致。
+#
+# 为什么值得共用而不是各写一份：panel 的副本是构建时 `shutil.copyfile` 来的，两边漂移
+# 的症状是"面板自己验得过、别的组件验不过"——这正好是复制品漂移最难发现的形状。
+CONSOLE_SESSION_TTL = 4 * 3600
+
+
+def console_session_token(mint_token, *, email="u@x.com", name="U",
+                          kid=CONSOLE_KID, secret=CONSOLE_KID_SECRET, **kw) -> str:
+    """新形态面板会话 token。`mint_token` 由调用方传入**自己那份** session.py 的实现——
+    两侧各传各的，正是这一点让向量能抓到复制品漂移。"""
+    args = dict(kid=kid, secret=secret, token_use="console-session", email=email,
+                ttl_seconds=CONSOLE_SESSION_TTL, name=name)
+    args.update(kw)
+    return mint_token(**args)

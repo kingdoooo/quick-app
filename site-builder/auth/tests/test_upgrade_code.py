@@ -184,3 +184,34 @@ def test_kid_form_mutation_vectors(name, mutate, expect_reject):
     claims, _ = session.verify_with_legacy(code, allowlist=CONSOLE_ALLOWLIST, token_use="console-upgrade",
                                            legacy_secret=SECRET)
     assert (claims is None) == expect_reject, name
+
+
+# ---- 3c-1B：**面板会话 cookie** 的新形态向量（panel 签、auth 这份 session.py 验）----
+#
+# 与 panel/tests/test_console_session.py 的 test_console_session_cookie_vectors_match_the_auth_side
+# 配对，同一个 mint 助手、同一组 MUTATIONS。方向和升级码相反：1B 起 panel 自己也签
+# （console_cookie 从 mint_session_jwt(scope=console) 换成 mint_token(console-session)），
+# 于是"两份 session.py 必须等价"多了一条要求。
+from upgrade_code_vectors import console_session_token  # noqa: E402
+
+
+@pytest.mark.parametrize("name,mutate,expect_reject", MUTATIONS)
+def test_console_session_cookie_vectors_match_the_panel_side(name, mutate, expect_reject):
+    token = mutate(console_session_token(session.mint_token))
+    claims, _ = session.verify_with_legacy(token, allowlist=CONSOLE_ALLOWLIST,
+                                           token_use="console-session", legacy_secret=SECRET)
+    assert (claims is None) == expect_reject, name
+
+
+def test_console_session_token_is_rejected_when_verified_as_a_site_session():
+    """负向对照（**fake-unit，不涉及 Edge**）：panel 签的面板会话按 site-session 验必拒。
+
+    只证明 `token_use` 这一道：即使 allowlist 里就有这个 kid，用途不符也拒。
+    "console kid 不在 Edge 的 allowlist"是**另一条**性质，由 Edge 自己的用例
+    （router/infrastructure/lambda/test_edge_kid_allowlist.py 的
+    test_console_session_new_form_is_rejected_at_the_edge）与真机闸门覆盖，不在本文件。
+    """
+    token = console_session_token(session.mint_token)
+    claims, outcome = session.verify_with_legacy(token, allowlist=CONSOLE_ALLOWLIST,
+                                                 token_use="site-session", legacy_secret=SECRET)
+    assert claims is None and outcome == "wrong_token_use"

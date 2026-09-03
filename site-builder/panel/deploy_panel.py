@@ -336,6 +336,11 @@ def lambda_environment(edge_role_id_value: str = "") -> dict:
         "JWT_SECRET_PARAM": keys.legacy_param,
         "SESSION_KEYS_JSON": env_json(keys, ("console",)),
         "LEGACY_ENTRY": legacy_entry(keys),
+        # 3c-1B：面板会话的签发形态开关（spec §11.8.3），与 auth 同一个配置真源
+        # （[SessionKeys] signer）。runbook 里 panel **先**切、auth 后切：面板会话只有
+        # panel 自己验、TTL 4 h，是爆炸半径最小的先行指标。漏下发的症状是 console_cookie
+        # 抛 → /api/session-callback 500（响亮，有意的）。
+        "SESSION_SIGNER": keys.signer,
     }
 
 

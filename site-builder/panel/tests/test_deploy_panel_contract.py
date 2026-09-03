@@ -788,6 +788,19 @@ def test_frontend_prefix_is_versioned():
 
 # ── EDGE_ROLE_ID 必须下发（Codex 审查 2026-08-10 P1-1）──────────────────
 
+def test_lambda_environment_ships_the_signer_switch_from_config_not_a_literal():
+    """3c-1B：`SESSION_SIGNER` 必须下发，且值来自 [SessionKeys] signer（与 auth 同一真源）。
+
+    漏下发的症状是 `console_cookie` 抛 → `/api/session-callback` 500（响亮，有意的）；
+    写成字面量的症状是"改 config 重部却没变"——而回滚协议整个建立在"改一行配置重部"上，
+    且 panel 是 runbook 里**先切**的那个，分叉在这里会让先行信号是假的。
+    """
+    src = (PANEL / "deploy_panel.py").read_text()
+    env_block = src[src.index("def lambda_environment"):src.index("def console_route_item")]
+    assert '"SESSION_SIGNER": keys.signer' in env_block, "signer 不是从 [SessionKeys] 取的"
+    assert dp.lambda_environment()["SESSION_SIGNER"] in ("legacy", "current")
+
+
 def test_lambda_environment_carries_edge_role_id():
     """handler 靠它确认调用者是 Edge；不下发 = 线上拒绝所有请求。"""
     env = dp.lambda_environment("AROAEXAMPLE")

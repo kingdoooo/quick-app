@@ -15,9 +15,9 @@ mint_token"，1B 的第一步就是让它失效）。现在锁的是两条更强
 自测（`test_guard_catches_*`）证明检查器本身会红，且两种调用形态（`mint_token(...)` 与
 `session.mint_token(...)`）都抓得住——pass-now 的守卫不算守卫。
 
-**panel 不在本文件的清单里**：05 号任务把 panel 的面板会话切到同一个开关，那一票再把
-`panel/console_session.py` 加进 `SIGNER_FILES`。今天 panel 仍无条件用 legacy mint，
-现在就加进来会红。
+清单分两类，缺一类就有洞：`SIGNER_FILES` 是**真的签发**的文件（两侧形态都必须在、且各在
+自己的分支里）；`NON_SIGNER_FILES` 是进包但**一次都不该签**的 handler（1A 那条守卫覆盖过它们，
+换守卫时不能把这层覆盖丢掉——在 `api.py` 里顺手加一次签发同样是多开一条签发路径）。
 """
 import ast
 from pathlib import Path
@@ -25,8 +25,11 @@ from pathlib import Path
 import pytest
 
 AUTH = Path(__file__).resolve().parents[1]
-# 05 号任务在这里加 (AUTH.parent / "panel" / "console_session.py",)
-SIGNER_FILES = (AUTH / "login_handler.py",)
+PANEL = AUTH.parent / "panel"
+# 会签发的两处：auth 的站点会话 + 升级码；panel 的面板会话。
+SIGNER_FILES = (AUTH / "login_handler.py", PANEL / "console_session.py")
+# 进包但绝不该签发的 handler（1A 的守卫覆盖过它们，这一层不能丢）
+NON_SIGNER_FILES = (PANEL / "handler.py", PANEL / "api.py")
 
 LEGACY_MINTS = ("mint_session_jwt", "mint_upgrade_code")
 CURRENT_MINTS = ("mint_token",)
@@ -157,6 +160,18 @@ def test_both_forms_are_actually_present_so_the_guard_has_something_to_guard(pat
     names = {name for name, _ in mint_calls(path.read_text())}
     assert names & set(CURRENT_MINTS), f"{path.name} 没有任何新形态签发——signer 切换没落地？"
     assert names & set(LEGACY_MINTS), f"{path.name} 没有 legacy 分支（3c-3 之前不删）"
+
+
+@pytest.mark.parametrize("path", NON_SIGNER_FILES, ids=lambda p: p.name)
+def test_files_that_must_never_sign_contain_no_mint_at_all(path):
+    """这些文件里出现**任何**签发调用都是错的——不管在哪个分支里。
+
+    `console_cookie` 是 panel 唯一的签发点，`handler.py` 只该调它。在 handler/api 里
+    直接 mint 会绕过那个单一入口（也绕过 `_signer_mode()`），且 `api.py` 是业务接口面。
+    """
+    assert path.exists(), f"{path} 不存在——清单过期了"
+    names = {name for name, _ in mint_calls(path.read_text())}
+    assert not names, f"{path.name} 里出现了签发调用 {sorted(names)}：签发只许在 SIGNER_FILES 里"
 
 
 @pytest.mark.parametrize("path", SIGNER_FILES, ids=lambda p: p.name)

@@ -35,6 +35,9 @@ ENV = {"JOBS_TABLE": "site-deploy-jobs", "SITES_TABLE": "site-sites",
        "SESSION_KEYS_JSON": '{"console": [{"kid": "console-hs-v1", "alg": "HS256", "role": "current", '
                             '"ssm_param": "/site-builder/session-keys/console-hs-v1"}]}',
        "LEGACY_ENTRY": "on",
+       # 3c-1B：面板会话的签发形态开关。**基线是 legacy**，所以既有用例全部是"1A 前的字节级
+       # 形态"这一侧；新形态用例自己 monkeypatch.setenv("SESSION_SIGNER", "current")。
+       "SESSION_SIGNER": "legacy",
        "CONSOLE_HOST": "console.example.com",
        # Edge 执行角色的 RoleId：handler 用它确认调用者真是 Edge（P1-1）。
        # 与 test_handler.EDGE_ROLE_ID 必须一致。

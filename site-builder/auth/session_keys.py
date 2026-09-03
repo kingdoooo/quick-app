@@ -29,8 +29,8 @@ kid 格式 `{family}-{hs|rs}-v{n}`：family 前缀必须与所属 family 一致�
 
 `signer`（3c-1B，spec §11.8.3）决定 **签发**形态：`legacy` = 拆 family 之前那把共享密钥 + 旧
 合同；`current` = 各 family 的 role=current 那把 + `mint_token` 新合同。它下发为 auth 与 panel 的
-`SESSION_SIGNER` 环境变量（**panel 侧随 3c-1B 的 05 号任务落地**；在那之前 deploy_panel 不下发它、
-panel 无条件签 legacy 形态），**回滚就是改这一行重跑两个部署脚本**（不回退代码，免得连带回滚同批的
+`SESSION_SIGNER` 环境变量（两个组件各自部署，所以切换有先后：panel 先、auth 后——面板会话只有
+panel 自己验、TTL 4 h，是爆炸半径最小的先行指标），**回滚就是改这一行重跑两个部署脚本**（不回退代码，免得连带回滚同批的
 其它改动）。验签侧与它无关：verifier 全程双接受，所以切换与回滚都不需要动 Edge。
 缺键或写别的值是配置错，硬失败——给默认值等于让"没写 signer"静默变成某一种签发形态。
 """
