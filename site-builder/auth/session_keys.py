@@ -11,7 +11,7 @@ schema 见 spec §11.6，HS 与 RS 两阶段共用：
     site_current = site-hs-v1        console_current = console-hs-v1
     site_previous =                  console_previous =
     signer = legacy | current
-    legacy_param = /site-builder/jwt-secret
+    legacy_param = /site-builder/jwt-secret   # 空 = legacy 入口已关闭（L3）
     login_flow_secret_param = /site-builder/login-flow-secret
 
     [SessionKey:<kid>]   alg = HS256 + ssm_param=/site-builder/session-keys/<kid>
@@ -33,6 +33,17 @@ kid 格式 `{family}-{hs|rs}-v{n}`：family 前缀必须与所属 family 一致�
 panel 自己验、TTL 4 h，是爆炸半径最小的先行指标），**回滚就是改这一行重跑两个部署脚本**（不回退代码，免得连带回滚同批的
 其它改动）。验签侧与它无关：verifier 全程双接受，所以切换与回滚都不需要动 Edge。
 缺键或写别的值是配置错，硬失败——给默认值等于让"没写 signer"静默变成某一种签发形态。
+
+`legacy_param` **允许为空**（3c-1B，spec §11.8.1）：空即 legacy 入口**关闭**（状态机 L3）。
+清空这**一处**配置，三处后果同步发生，没有第二个开关：
+① `legacy_entry()` 返回 `off` ⇒ 三处 verifier 的「2 + 1」入口退化成只认 kid；
+② `ssm_parameter_names()` 不再产出 legacy 参数 ⇒ auth/panel 的角色 SSM 精确清单与部署前核对
+   同步收敛，两个部署脚本也不再下发 `JWT_SECRET_PARAM`；
+③ router 栈给 Edge 的 `{{JWT_SECRET}}` 注入空串（**空串不是 SYNTH 占位符**——那两条产物核对
+   断言看的是 `SYNTH-ONLY-PLACEHOLDER` 字样与未替换的 `{{…}}`，都不会误报）。
+`signer = legacy` 与空 `legacy_param` 的组合被拒：那等于签一批没人接受的 token。
+**代码路径与旧 SSM 参数的删除不在这里**（3c-3）——那把密钥仍存在、仍能被宽读者读到，
+所以闸门按常量继续追踪它。
 """
 from __future__ import annotations
 
@@ -141,10 +152,6 @@ def load_session_keys(config_path: Path) -> SessionKeys:
         raise SessionKeysError(
             "[SessionKeys] signer=legacy 要求 legacy_param 非空——legacy 入口关闭后再签 legacy 形态"
             "等于签一批没人接受的 token（全员登录循环）")
-    if not legacy:
-        # 3c-1B 的 07 号任务把这条放开为「legacy_param 为空即要求 signer=current」（L3）；
-        # 在那之前清空它会让 Edge/panel 的 legacy 入口与角色 SSM 清单一起变，属于另一票的范围。
-        raise SessionKeysError("[SessionKeys] 缺 legacy_param（3c-3 之前必填）")
     login_flow = _strip(cfg.get("SessionKeys", "login_flow_secret_param", fallback=""))
     if not login_flow:
         raise SessionKeysError(
@@ -181,7 +188,10 @@ def env_json(keys: SessionKeys, families: tuple) -> str:
 
 
 def legacy_entry(keys: SessionKeys) -> str:
-    """legacy 入口开关的下发值：legacy_param 非空即 "on"（3c-3 清空它即 "off"）。"""
+    """legacy 入口开关的下发值：legacy_param 非空即 "on"，**为空即 "off"**。
+
+    清空 `legacy_param` 是 3c-1B 的 L3（关闭入口）；3c-3 才删参数与代码分支。
+    """
     return "on" if keys.legacy_param else "off"
 
 

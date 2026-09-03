@@ -80,7 +80,12 @@ MIN_LOCAL_CHECKS = 15       # ① 合规 8 + ② 违规 7
 # 所以这个下限比上一版 +1。**它一直是个保守下限、不是等值**：④ 段实际会出 5–6 条
 # （进包清单 / SSM TTL（带 if）/ 环境变量整体等值 / 无明文密钥 / 两个 *_PARAM），
 # 这里只记与上一版同样保守的那部分，不趁机重算其它段。
-MIN_DEPLOYED_CHECKS = 23    # ③ 4 + ④ 3（原 2 + 第二个 *_PARAM）+ ⑤ 7 + ⑥ 3 + ⑦ 6 = 23
+# ④ 段的 `*_PARAM` 条数**随状态变**：L2 是两个（JWT_SECRET_PARAM + LOGIN_FLOW_SECRET_PARAM），
+# L3 清空 legacy_param 之后只剩一个。所以这里只记**恒定**的那部分，`*_PARAM` 那几条由
+# `_min_param_checks()` 在运行时按本地推导值补上——写死 2 会让 L3 的每次核对都差一条而红。
+MIN_DEPLOYED_CHECKS = 20    # ③ 4 + ④ 1 + ⑤ 6 + ⑥ 3 + ⑦ 6 = 20（④⑤ 都已扣掉 `*_PARAM` 那几条）
+# L2 下 20 + 3 = 23，与 3c-1B 之前的常量一致（本次拆分不改变已部署状态的下限）；
+# L3 下 20 + 1 = 21，正好少掉 auth 与 panel 各一条 legacy 的 `*_PARAM`。
 # ⑧ 只在 [ApiKey] 段存在（组件启用）时计入：产物 1 + 环境变量 2 + scope 1 +
 # Function URL 3 + EDGE_ROLE_ID 1 + 环境变量整体 1 + route 6 + Edge 白名单 1 +
 # runtime 3 + 哨兵行 2 + role 2 = 23
@@ -419,6 +424,43 @@ def _looks_high_entropy(v: str) -> bool:
             and any(c.isdigit() for c in v))
 
 
+# auth 的会话相关 `*_PARAM`：④ 段对**每一个**单独出一条 check。
+# 只列这两个（不含 `CLIENT_SECRET_PARAM`——那是 Cognito client secret，与会话签名无关，
+# 本节的题目是"会话密钥有没有变成明文"）。**`JWT_SECRET_PARAM` 在 L3 之后整个键不下发**，
+# 所以点名前先按本地推导值取交集，见 `_present`。
+AUTH_SESSION_PARAM_KEYS = ("JWT_SECRET_PARAM", "LOGIN_FLOW_SECRET_PARAM")
+# panel 只有 legacy 那一个会话相关的 `*_PARAM`（它不参与登录流程，永不持 login-flow）。
+# 同样在 L3 之后整个键消失。
+PANEL_SESSION_PARAM_KEYS = ("JWT_SECRET_PARAM",)
+
+
+def _present(env: dict, names: tuple) -> tuple:
+    """`names` 里在 `env` 中确实存在的那些（保序）。
+
+    用本地推导值取交集而不是写死清单：3c-1B 的 L3 清空 `legacy_param` 之后
+    `JWT_SECRET_PARAM` 整个键消失，写死会让那条核对在一个不该存在的键上永久失败。
+    这样做**不会漏核**——上面那条"env 整体 == 本地推导值"已经保证线上与本地同集合，
+    线上少一个键的话那条先红。
+    """
+    return tuple(n for n in names if n in env)
+
+
+def _min_param_checks() -> int:
+    """"逐个 `*_PARAM`"在 ④（auth）与 ⑤（panel）两段一共会出多少条 check。
+
+    L2 = 3（auth 两个 + panel 一个）；L3 清空 `legacy_param` 之后 = 1（只剩 auth 的
+    login-flow）。与 `MIN_DEPLOYED_CHECKS` 分开是因为它随状态变；合进常量的后果是
+    L3 之后每次核对都差两条、判成"没跑完"。
+
+    两段都按各自的**本地推导** env 数——与真正传给检查的那个清单同一个来源，
+    所以"下限"与"实际条数"不可能分叉。
+    """
+    da = _load_deploy_module("deploy_auth", ROOT / "site-builder/auth/deploy_auth.py")
+    dp = _load_deploy_module("deploy_panel", ROOT / "site-builder/panel/deploy_panel.py")
+    return (len(_present(da.lambda_env()["Variables"], AUTH_SESSION_PARAM_KEYS))
+            + len(_present(dp.lambda_environment(""), PANEL_SESSION_PARAM_KEYS)))
+
+
 def _check_env_has_no_plaintext_secret(env: dict, label: str,
                                        param_keys: tuple) -> None:
     """① 键名像密钥（`*_PARAM` 除外——那只是参数名）；② 值像高熵串；
@@ -652,10 +694,14 @@ def run_deployed() -> None:
     diff = sorted(k for k in set(got_env) | set(want_env) if got_env.get(k) != want_env.get(k))
     check(not diff, "site-auth-service 环境变量 == 本地 lambda_env() 推导值",
           f"不一致的键: {diff}" if diff else f"{len(want_env)} 个键一致（只有参数名，无明文）")
-    # 3c-1B：两个 *_PARAM 都核（LOGIN_FLOW_SECRET_PARAM 漏下发的症状是**所有 /login 500**，
-    # 因为 _state_sig 经 _secret("LOGIN_FLOW_SECRET") 取值、无来源时响亮抛错）
+    # 3c-1B：`*_PARAM` 逐个核（LOGIN_FLOW_SECRET_PARAM 漏下发的症状是**所有 /login 500**，
+    # 因为 _state_sig 经 _secret("LOGIN_FLOW_SECRET") 取值、无来源时响亮抛错）。
+    # **点名清单从本地推导值来**，不写死：L3（清空 legacy_param）之后 `JWT_SECRET_PARAM`
+    # 整个键不下发，写死会让那条核对在一个不该存在的键上永久失败。上面那条"env 整体 =="
+    # 已经保证 got_env 与 want_env 同集合，所以按 want_env 点名等价于按线上点名，
+    # 且**不会因为线上少了一个键而少核一条**（少了的话整体等值那条先红）。
     _check_env_has_no_plaintext_secret(got_env, "site-auth-service",
-                                       ("JWT_SECRET_PARAM", "LOGIN_FLOW_SECRET_PARAM"))
+                                       _present(want_env, AUTH_SESSION_PARAM_KEYS))
 
 
 def run_panel() -> None:
@@ -686,10 +732,13 @@ def run_panel() -> None:
                                dp, ROOT / "site-builder/panel"))
 
     env = conf.get("Environment", {}).get("Variables", {})
-    _check_env_has_no_plaintext_secret(env, "panel", ("JWT_SECRET_PARAM",))
     # 环境变量**整体** == 本地 lambda_environment() 推导值（SESSION_KEYS_JSON / LEGACY_ENTRY 也在其中）。
     # EDGE_ROLE_ID 是部署时从线上取的值，比对时以线上值为准喂给推导函数。
     want_env = dp.lambda_environment(env.get("EDGE_ROLE_ID", ""))
+    # 3c-1B/L3：与 auth 那处同一条纪律——点名清单按**本地推导值**取交集。写死
+    # `("JWT_SECRET_PARAM",)` 的后果是 legacy 入口关闭之后这条核对在一个不该存在的键上
+    # 永久失败（runbook 第 ⑤ 步就会撞上）。
+    _check_env_has_no_plaintext_secret(env, "panel", _present(want_env, PANEL_SESSION_PARAM_KEYS))
     diff = sorted(k for k in set(env) | set(want_env) if env.get(k) != want_env.get(k))
     check(not diff, "panel 环境变量 == 本地 lambda_environment() 推导值",
           f"不一致的键: {diff}" if diff else f"{len(want_env)} 个键一致（只有参数名，无明文）")
@@ -1562,7 +1611,7 @@ def main() -> int:
         run_deployed()
         run_panel()
         run_mcp_and_route()
-        min_expected += MIN_DEPLOYED_CHECKS
+        min_expected += MIN_DEPLOYED_CHECKS + _min_param_checks()
         # ⑧ 只在组件启用时计入下限（返回值就是它承诺的最小项数）
         min_expected += run_key_proxy()
         # ⑨ 无条件计入：M5 统计管道不是可选组件

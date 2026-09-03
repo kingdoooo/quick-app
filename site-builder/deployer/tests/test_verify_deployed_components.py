@@ -266,11 +266,63 @@ def _auth_plaintext_check_param_keys(src: str | None = None) -> set:
 
 
 def test_the_gate_passes_both_auth_param_keys_not_just_jwt():
-    """结构守卫：auth 那处必须把两个键都**当实参**交给这条检查，否则上面几条只是理论上有效。"""
-    keys = _auth_plaintext_check_param_keys()
-    assert keys == {"JWT_SECRET_PARAM", "LOGIN_FLOW_SECRET_PARAM"}, (
-        f"闸门实际交给「无明文密钥」判据的键是 {sorted(keys)}——"
+    """结构守卫：auth 那处必须把两个键都交给这条检查，否则上面几条只是理论上有效。
+
+    **3c-1B ticket 07 起清单不再是调用点的字面元组**：L3（清空 `legacy_param`）之后
+    `JWT_SECRET_PARAM` 整个键不下发，写死的元组会让那条核对在一个不该存在的键上永久失败。
+    所以意图清单搬到常量 `AUTH_SESSION_PARAM_KEYS`，调用点用 `_present(want_env, …)` 按
+    本地推导值取交集。守卫随之分两半：① 常量里两个键都在；② 调用点确实经 `_present`
+    把那个常量传进去（不是另抄一份或退回单键）。
+    """
+    g = _gate()
+    assert set(g.AUTH_SESSION_PARAM_KEYS) == {"JWT_SECRET_PARAM", "LOGIN_FLOW_SECRET_PARAM"}, (
+        f"意图清单是 {list(g.AUTH_SESSION_PARAM_KEYS)}——"
         "LOGIN_FLOW_SECRET_PARAM 漏下发时它不会红")
+    names = _auth_plaintext_check_call_names()
+    assert {"_present", "AUTH_SESSION_PARAM_KEYS"} <= names, (
+        f"auth 那处没有经 _present 传那个常量：{sorted(names)}")
+    assert "want_env" in names, "取交集用的不是**本地推导**值（用线上值会让漏下发变成少核一条）"
+
+
+def _auth_plaintext_check_call_names(src: str | None = None) -> set:
+    """auth 那处调用的第三个实参里出现的**名字**（函数名 + 参数名），按 AST 读。
+
+    与 `_auth_plaintext_check_param_keys` 同一条纪律（不 grep 文本、注释不算），只是现在
+    要证明的是"经 `_present` 传那个常量"而不是"字面元组里有哪两个键"。
+    """
+    import ast
+    tree = ast.parse(_SCRIPT.read_text() if src is None else src)
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call)
+                and getattr(node.func, "id", None) == "_check_env_has_no_plaintext_secret"):
+            continue
+        args = list(node.args) + [kw.value for kw in node.keywords]
+        labels = [a.value for a in args if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+        if "site-auth-service" not in labels:
+            continue
+        names = set()
+        for a in args:
+            for leaf in ast.walk(a):
+                if isinstance(leaf, ast.Name):
+                    names.add(leaf.id)
+        return names
+    return set()
+
+
+def test_present_narrows_the_intent_list_by_what_is_actually_shipped():
+    """`_present` 的两个方向：L2 两个都在、L3 少了 JWT 那个。"""
+    g = _gate()
+    l2 = {"JWT_SECRET_PARAM": "/a", "LOGIN_FLOW_SECRET_PARAM": "/b", "SESSION_SIGNER": "legacy"}
+    l3 = {"LOGIN_FLOW_SECRET_PARAM": "/b", "SESSION_SIGNER": "current"}
+    assert g._present(l2, g.AUTH_SESSION_PARAM_KEYS) == ("JWT_SECRET_PARAM", "LOGIN_FLOW_SECRET_PARAM")
+    assert g._present(l3, g.AUTH_SESSION_PARAM_KEYS) == ("LOGIN_FLOW_SECRET_PARAM",)
+
+
+def test_the_floor_is_derived_at_runtime_not_a_constant():
+    """下限必须真的按 `*_PARAM` 条数补——写死会让 L3 每次核对都差两条而红。
+    具体的 L2/L3 数字在 test_the_floor_tracks_state_instead_of_being_a_constant。"""
+    src = _SCRIPT.read_text()
+    assert "MIN_DEPLOYED_CHECKS + _min_param_checks()" in src
 
 
 # 自测的语料：每条都喂给**真正那个**抽取器（不是简化副本），故意覆盖它的三个分支。
@@ -315,3 +367,64 @@ def test_extractor_self_test_corpus_really_contains_the_comment_trap():
     src, expected = _EXTRACTOR_CASES["注释里有、实参里没有"]
     assert "LOGIN_FLOW_SECRET_PARAM" in src.splitlines()[0], "注释里没有那个字面量"
     assert "LOGIN_FLOW_SECRET_PARAM" not in expected
+
+
+# ---- 3c-1B ticket 07：panel 那处也要按状态取交集，下限随状态走 -----------------------------
+
+def test_the_panel_plaintext_check_also_intersects_with_the_local_env():
+    """**这条是复审抓到的真缺陷的回归**：panel 那处原先写死 `("JWT_SECRET_PARAM",)`，
+    L3 之后那个键整个不下发 ⇒ 核对在一个不该存在的键上永久失败，runbook 第 ⑤ 步就撞上。"""
+    g = _gate()
+    assert tuple(g.PANEL_SESSION_PARAM_KEYS) == ("JWT_SECRET_PARAM",)
+    src = _SCRIPT.read_text()
+    assert '_check_env_has_no_plaintext_secret(env, "panel", ("JWT_SECRET_PARAM",))' not in src, \
+        "panel 那处仍写死清单"
+    names = _plaintext_check_call_names(src, label="panel")
+    assert {"_present", "PANEL_SESSION_PARAM_KEYS", "want_env"} <= names, sorted(names)
+
+
+def _plaintext_check_call_names(src: str, *, label: str) -> set:
+    """某个 label 那处 `_check_env_has_no_plaintext_secret(...)` 实参里出现的名字（按 AST）。"""
+    import ast
+    for node in ast.walk(ast.parse(src)):
+        if not (isinstance(node, ast.Call)
+                and getattr(node.func, "id", None) == "_check_env_has_no_plaintext_secret"):
+            continue
+        args = list(node.args) + [kw.value for kw in node.keywords]
+        labels = [a.value for a in args if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+        if label not in labels:
+            continue
+        return {leaf.id for a in args for leaf in ast.walk(a) if isinstance(leaf, ast.Name)}
+    return set()
+
+
+def test_the_floor_tracks_state_instead_of_being_a_constant():
+    """下限必须**随状态**走：L2 三条 `*_PARAM`（auth 两 + panel 一）、L3 只剩一条。
+
+    写死的后果是 L3 每次核对都差两条、被判成"没跑完"——而"没跑完"与"真的漂移了"在
+    退出码上一模一样。这里按 `_present` 的两个方向算一遍，证明公式跟着状态动。
+    """
+    g = _gate()
+    l2_auth = {"JWT_SECRET_PARAM": "/a", "LOGIN_FLOW_SECRET_PARAM": "/b"}
+    l3_auth = {"LOGIN_FLOW_SECRET_PARAM": "/b"}
+    l2_panel = {"JWT_SECRET_PARAM": "/a"}
+    l3_panel: dict = {}
+    l2 = (len(g._present(l2_auth, g.AUTH_SESSION_PARAM_KEYS))
+          + len(g._present(l2_panel, g.PANEL_SESSION_PARAM_KEYS)))
+    l3 = (len(g._present(l3_auth, g.AUTH_SESSION_PARAM_KEYS))
+          + len(g._present(l3_panel, g.PANEL_SESSION_PARAM_KEYS)))
+    assert (l2, l3) == (3, 1), (l2, l3)
+    # L2 的总下限必须与 3c-1B 之前那个常量一致（本次拆分不改变已部署状态）
+    assert g.MIN_DEPLOYED_CHECKS + l2 == 23
+    # 且 L3 恰好少两条，不是"少一条"或"不变"
+    assert g.MIN_DEPLOYED_CHECKS + l3 == 21
+
+
+def test_min_param_checks_counts_both_sections_from_the_same_source_as_the_checks():
+    """下限的来源必须与真正传给检查的清单同一个（否则两者会分叉，差值成了噪音）。"""
+    src = _SCRIPT.read_text()
+    body = src[src.index("def _min_param_checks"):src.index("def _check_env_has_no_plaintext")]
+    assert "AUTH_SESSION_PARAM_KEYS" in body and "PANEL_SESSION_PARAM_KEYS" in body, \
+        "下限只数了一段——另一段的 *_PARAM 条数不会被补上"
+    assert "lambda_env()" in body and "lambda_environment(" in body, \
+        "下限没按**本地推导**值数（用线上值会让漏下发变成少核一条而不是红）"

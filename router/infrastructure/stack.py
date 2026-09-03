@@ -52,20 +52,37 @@ class ConfigLoader:
         return {}
 
 
-def load_jwt_secret() -> str:
-    """Deploy-time JWT secret injection for the edge function.
+def load_jwt_secret(legacy_param: str) -> str:
+    """Deploy-time **legacy-entry** secret injection for the edge function.
+
+    3c-1B（spec §11.8.1）：参数路径来自 `[SessionKeys] legacy_param`（唯一真源），
+    **不再硬编码** `/site-builder/jwt-secret`——硬编码与真源分叉时，闸门盯着一把密钥而
+    Edge 注入的是另一把，两边都不报错。**路径必须由调用方传入**（不给默认值，也不在这里
+    自己读一次 config）：调用方已经加载过 `SessionKeys`，多一条"自己读"的路就多一份可能
+    与它不一致的取值，而"两个注入值来自同一份解析"正是这次要保证的性质。
 
     Resolution order:
-    1. APP_JWT_SECRET environment variable (explicit override)
-    2. SSM SecureString parameter /site-builder/jwt-secret (us-east-1)
-    3. Synth-only placeholder (SSM unreachable / parameter missing /
+    1. `legacy_param` 为**空**（L3：legacy 入口已关闭）→ 空串，且**不打警告**。
+       空串**不是** SYNTH 占位符：`verify_deployed_edge.sh` 的两条占位符断言看的是
+       `SYNTH-ONLY-PLACEHOLDER` 字样与未替换的 `{{…}}`，空替换不会误报。
+       Edge 在 `LEGACY_ENTRY=off` 下根本不读这个常量（1A 已按开关分支）。
+    2. `APP_JWT_SECRET` environment variable (explicit override)
+    3. SSM SecureString parameter at `legacy_param` (us-east-1)
+    4. Synth-only placeholder (SSM unreachable / parameter missing /
        boto3 not installed) — allows `cdk synth` to run offline, but the
        resulting template MUST NOT be deployed: with a wrong secret every
-       session token fails verification (fail-closed, endless login
+       legacy session token fails verification (fail-closed, endless login
        redirect). Real deployments must have the SSM parameter in place
-       (aws ssm put-parameter --name /site-builder/jwt-secret
+       (aws ssm put-parameter --name <legacy_param>
         --type SecureString --value <secret> --region us-east-1).
+
+    **第 1 条与第 4 条必须分得开**：两者都让 Edge 拒绝 legacy token，但一个是刻意的
+    （入口已关闭，无 legacy token 还在流通），另一个是故障（SSM 读不到，线上现存的
+    legacy cookie 全部失效）。把"刻意为空"也走占位符路径会让 L3 的每次部署都被
+    产物核对判红，而真故障反而被当成日常。
     """
+    if not legacy_param:
+        return ""
     env_secret = os.getenv("APP_JWT_SECRET")
     if env_secret:
         return env_secret
@@ -73,33 +90,53 @@ def load_jwt_secret() -> str:
         import boto3
         ssm = boto3.client("ssm", region_name="us-east-1")
         return ssm.get_parameter(
-            Name="/site-builder/jwt-secret", WithDecryption=True
+            Name=legacy_param, WithDecryption=True
         )["Parameter"]["Value"]
     except Exception as exc:  # noqa: BLE001 - deliberate synth-time fallback
         import sys
         print(
-            f"WARNING: could not read SSM /site-builder/jwt-secret ({exc}); "
+            f"WARNING: could not read SSM {legacy_param} ({exc}); "
             "using a synth-only placeholder. DO NOT deploy this template.",
             file=sys.stderr,
         )
         return "SYNTH-ONLY-PLACEHOLDER-DO-NOT-DEPLOY"
 
 
-def load_site_allowlist() -> tuple:
+def _session_keys_on_path() -> Path:
+    """把 `site-builder/auth` 放进 `sys.path` 并返回仓库根。
+
+    **单独一个函数、被每个 `from session_keys import …` 的地方各自调用**：早先它藏在
+    `_session_keys()` 里，于是"传了 keys 就不走 `_session_keys()`"的那条路会在 import
+    时炸（latent ImportError，只因为调用顺序恰好对才没现形）。
+    """
+    root = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(root / "site-builder" / "auth"))
+    return root
+
+
+def _session_keys():
+    """`[SessionKeys]` 的唯一定义在 site-builder/auth/session_keys.py（不在本文件复制一份）。"""
+    root = _session_keys_on_path()
+    from session_keys import load_session_keys
+    return load_session_keys(root / "site-builder" / "config.ini")
+
+
+def load_site_allowlist(keys) -> tuple:
     """3c-1A：Edge 只认 site family 的 kid allowlist（spec §4.1 / §11.6）。
+
+    `keys` 是**必填**的已加载 `SessionKeys`（由调用方与 `load_jwt_secret` 共用同一份，
+    见 `WebRouterStack.__init__`）——本函数不自己再读一次 config。
 
     → (allowlist_json, legacy_entry)。kid 清单来自 `site-builder/config.ini` 的 [SessionKeys]
     （唯一取值来源，经 site-builder/auth/session_keys.py 校验，缺段/写错即 synth 失败），
     secret 值按每行的 ssm_param 从 SSM 取；**只取 site family，console 的 key 不进 Edge**。
-    legacy 开关：legacy_param 非空即 "on"（3c-3 清空它即 "off"）。
+    legacy 开关：legacy_param 非空即 "on"，为空即 "off"（清空它 = 3c-1B 的 L3，关闭入口）。
 
     SSM 读失败沿用 load_jwt_secret 的 synth-only 语义：注入带 SYNTH-ONLY 标记的占位 allowlist 并在
     stderr 警告，这样 `cdk synth` 离线能跑，但该模板**绝不能部署**（verify_deployed_edge.sh 会抓到标记）。
     """
-    root = Path(__file__).resolve().parents[2]
-    sys.path.insert(0, str(root / "site-builder" / "auth"))
-    from session_keys import SYNTH_PLACEHOLDER_ALLOWLIST_JSON, legacy_entry, load_session_keys
-    keys = load_session_keys(root / "site-builder" / "config.ini")
+    _session_keys_on_path()          # 无条件放路径：不依赖调用方是否先调过 _session_keys()
+    from session_keys import SYNTH_PLACEHOLDER_ALLOWLIST_JSON, legacy_entry
     override = os.getenv("APP_SITE_ALLOWLIST_JSON")   # 与 APP_JWT_SECRET 同款的显式覆盖（离线 synth / 测试）
     if override:
         text = override
@@ -237,8 +274,11 @@ class WebRouterStack(Stack):
         # Site-builder placeholders (Task 6/7). JWT secret comes from SSM at
         # deploy time (see load_jwt_secret); the bucket lives in us-east-1
         # (Lambda@Edge SigV4 in origin_request.py signs for us-east-1).
-        jwt_secret = load_jwt_secret()
-        site_allowlist_json, legacy_entry = load_site_allowlist()
+        # `[SessionKeys]` 只解析一遍，两个注入值都从同一份取——分开各读一次的话，
+        # 中途改 config 会让 Edge 拿到自相矛盾的 (allowlist, legacy secret) 组合。
+        session_keys = _session_keys()
+        jwt_secret = load_jwt_secret(session_keys.legacy_param)
+        site_allowlist_json, legacy_entry = load_site_allowlist(session_keys)
         # 两个值都要在 synth 时验证——它们控制的是 org 语义在请求路径上的
         # 唯一执行点，配错的代价不对称：
         # ① configparser 默认**保留行内注释**（inline_comment_prefixes=()）：

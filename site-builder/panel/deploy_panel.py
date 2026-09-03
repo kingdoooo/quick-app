@@ -309,7 +309,7 @@ def lambda_environment(edge_role_id_value: str = "") -> dict:
     "配置缺失就不检查"恰好是这个缺陷的原始形态，所以宁可整站拒绝。
     """
     keys = load_session_keys(HERE.parent / "config.ini")
-    return {
+    env = {
         "EDGE_ROLE_ID": edge_role_id_value,
         "JOBS_TABLE": "site-deploy-jobs",
         "SITES_TABLE": "site-sites",
@@ -331,9 +331,8 @@ def lambda_environment(edge_role_id_value: str = "") -> dict:
         "BASE_DOMAIN": _base_domain(),
         "CONSOLE_HOST": console_host(),
         "UNDEPLOY_FN": "site-deployer-undeploy",
-        # 3c-1A：legacy 参数名与 console family 的 kid 清单（只有参数名）、legacy 入口开关，
+        # 3c-1A：console family 的 kid 清单（只有参数名）与 legacy 入口开关，
         # 全部来自 [SessionKeys]（唯一真源；role 的精确 ARN 清单也从它推导）
-        "JWT_SECRET_PARAM": keys.legacy_param,
         "SESSION_KEYS_JSON": env_json(keys, ("console",)),
         "LEGACY_ENTRY": legacy_entry(keys),
         # 3c-1B：面板会话的签发形态开关（spec §11.8.3），与 auth 同一个配置真源
@@ -342,6 +341,13 @@ def lambda_environment(edge_role_id_value: str = "") -> dict:
         # 抛 → /api/session-callback 500（响亮，有意的）。
         "SESSION_SIGNER": keys.signer,
     }
+    # 3c-1B/L3：`legacy_param` 为空即 legacy 入口关闭，整个键**不下发**（不是下发空串）。
+    # 理由与 auth 那边同一条：`console_session._secret()` 直接 `os.environ["JWT_SECRET_PARAM"]`，
+    # 空串会让它去读一个空参数名；键不在时那条路径根本不会被调用
+    # （verifier_env.legacy_secret 在 off 下返回 None）。
+    if keys.legacy_param:
+        env["JWT_SECRET_PARAM"] = keys.legacy_param
+    return env
 
 
 def console_route_item(function_url: str) -> dict:

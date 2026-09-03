@@ -130,10 +130,7 @@ def lambda_env() -> dict:
     SecureString 读并在容器内缓存。
     """
     keys = load_session_keys(CFG_PATH)
-    return {"Variables": {
-        # legacy 参数名的唯一真源是 [SessionKeys] legacy_param（role 的精确 ARN 清单也从它推导；
-        # 两处分叉的症状是运行时 AccessDenied）
-        "JWT_SECRET_PARAM": keys.legacy_param,
+    env = {
         # 3c-1B：登录流程（OAuth state 与 __Host-sb_pkce cookie）的 HMAC 密钥参数名。
         # 键名照 `_secret(name)` 的 `{name}_PARAM` 约定，所以 login_handler._state_sig 只改了
         # 一个字符串就换了密钥。**auth 私有**——panel 与 Edge 都不下发它（spec §11.3）。
@@ -156,7 +153,16 @@ def lambda_env() -> dict:
         # 3c-1B：签发形态开关（spec §11.8.3）。真源是 [SessionKeys] signer；回滚 = 改那一行重跑
         # 本脚本（先 panel 后 auth）。verify_deployed_components 按"env 整体 == lambda_env()"
         # 比对，所以这一项自动入闸，不需要在那边点名。
-        "SESSION_SIGNER": keys.signer}}
+        "SESSION_SIGNER": keys.signer,
+    }
+    # legacy 参数名的唯一真源是 [SessionKeys] legacy_param（role 的精确 ARN 清单也从它推导；
+    # 两处分叉的症状是运行时 AccessDenied）。**L3（清空它）之后整个键不下发**，而不是下发空串：
+    # `_secret("JWT_SECRET")` 走的是 `{name}_PARAM` 约定，键存在但值为空会让它抛"无来源"，
+    # 与"入口已关闭所以谁也不该来取"这个事实对不上；键不在才是 fail-closed 的表达。
+    # 取值路径本身在 LEGACY_ENTRY=off 时根本不会被调用（verifier_env.legacy_secret 返回 None）。
+    if keys.legacy_param:
+        env["JWT_SECRET_PARAM"] = keys.legacy_param
+    return {"Variables": env}
 
 
 def required_parameters() -> list:
@@ -213,7 +219,10 @@ def main():
     # 密钥仍在这里**确保存在**（首次部署要生成 JWT secret），但只写进 SSM，
     # 不进环境变量——运行时由 login_handler._secret() 去读。
     keys = load_session_keys(CFG_PATH)
-    ensure_secret(keys.legacy_param, lambda: secrets.token_hex(32))
+    # L3 之后 legacy_param 为空：**不建、也不碰**那把密钥（参数本体到 3c-3 才删）。
+    # 不加这个判断的话 ensure_secret 会拿空名字去 put_parameter，AWS 侧报一个读不懂的 ValidationException。
+    if keys.legacy_param:
+        ensure_secret(keys.legacy_param, lambda: secrets.token_hex(32))
     # login-flow secret（3c-1B）：主创建点是 scripts/ensure_session_keys.py（部署序列第①步一次
     # 建齐 config 声明的所有密钥），这里是**缺省补建**（spec §11.8.6 把它叫「兜底」）——
     # 两处都只创建不覆盖，先跑哪个都一样。

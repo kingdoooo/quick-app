@@ -297,3 +297,81 @@ def test_ensure_secret_announces_a_create_with_the_name_only(capsys):
 def test_ensure_secret_is_silent_when_the_parameter_already_exists(capsys):
     """幂等重跑是常态，不能每次都刷一行——那样"创建"这个信号就淹了。"""
     assert _ensure_secret_output({"/site-builder/login-flow-secret"}, capsys).strip() == ""
+
+
+# ---- 3c-1B ticket 07：L3（清空 legacy_param）的三处后果 ---------------------------------
+#
+# 清空**一处**配置，auth 侧要同时收敛：env 不再有 `JWT_SECRET_PARAM`、角色 SSM 精确清单不再含
+# legacy ARN、写前核对清单同步、`LEGACY_ENTRY` 变 off。任一处漏改的症状都不一样但都很难查：
+# env 漏改 ⇒ 运行时按空参数名读 SSM；角色清单漏改 ⇒ 多留一条本该收掉的读权限（闸门会红，
+# 但那是事后）；核对清单漏改 ⇒ 拿一个不存在的参数拒绝部署。
+
+CFG_L3 = CFG.replace("signer = legacy", "signer = current").replace(
+    "legacy_param = /site-builder/jwt-secret", "legacy_param =")
+
+
+@pytest.fixture
+def cfg_files_l3(tmp_path, monkeypatch):
+    p = tmp_path / "config.ini"
+    p.write_text(CFG_L3)
+    c = configparser.ConfigParser()
+    c.read(p)
+    monkeypatch.setattr(da, "CFG_PATH", p)
+    monkeypatch.setattr(da, "_CFG", c)
+    return p
+
+
+def test_l3_env_drops_the_jwt_secret_param_key_entirely(cfg_files_l3):
+    """整个键**不下发**，不是下发空串。
+
+    `_secret("JWT_SECRET")` 走 `{name}_PARAM` 约定：键在而值为空会让它抛"无来源"，
+    与"入口已关闭所以谁也不该来取"这个事实对不上；键不在才是 fail-closed 的表达。
+    """
+    env = da.lambda_env()["Variables"]
+    assert "JWT_SECRET_PARAM" not in env
+    assert env["LEGACY_ENTRY"] == "off"
+    assert env["SESSION_SIGNER"] == "current"
+    # 其余键一个不少（L3 只关 legacy，不动别的）
+    for still in ("LOGIN_FLOW_SECRET_PARAM", "SESSION_KEYS_JSON", "CLIENT_SECRET_PARAM"):
+        assert still in env, still
+
+
+def test_before_l3_the_jwt_secret_param_is_still_shipped(cfg_files):
+    """回归：非空时与今天完全相同。"""
+    env = da.lambda_env()["Variables"]
+    assert env["JWT_SECRET_PARAM"] == "/site-builder/jwt-secret"
+    assert env["LEGACY_ENTRY"] == "on"
+
+
+def test_l3_role_ssm_list_no_longer_carries_the_legacy_arn(cfg_files_l3, monkeypatch):
+    iam = Recorder()
+    monkeypatch.setitem(da._CLIENTS, "iam", iam)
+    da.ensure_lambda_role()
+    doc = json.loads(iam.kwargs["put_role_policy"]["PolicyDocument"])
+    ssm_res = [r for st in doc["Statement"] if "ssm:GetParameter" in json.dumps(st.get("Action"))
+               for r in (st["Resource"] if isinstance(st["Resource"], list) else [st["Resource"]])]
+    assert not any(r.endswith("parameter/site-builder/jwt-secret") for r in ssm_res), ssm_res
+    assert not any(r.endswith("parameter") or r.endswith(":parameter/") for r in ssm_res), \
+        "空参数名拼出了一个畸形 ARN"
+    # 该留的还在
+    assert any(r.endswith("/session-keys/site-hs-v1") for r in ssm_res)
+    assert any(r.endswith("/login-flow-secret") for r in ssm_res)
+
+
+def test_l3_precheck_list_is_unchanged_because_legacy_was_never_in_it(cfg_files_l3):
+    """legacy 本来就被排除在写前核对之外（本脚本自己 ensure 它）——L3 不该让它冒出来。"""
+    assert set(da.required_parameters()) == {"/site-builder/session-keys/site-hs-v1",
+                                             "/site-builder/session-keys/console-hs-v1",
+                                             da.CLIENT_SECRET_PARAM}
+    assert "" not in da.required_parameters(), "空参数名混进了核对清单"
+
+
+def test_l3_main_does_not_try_to_create_a_parameter_with_an_empty_name(cfg_files_l3, monkeypatch):
+    """`ensure_secret("")` 会拿空名字去 put_parameter，AWS 侧报一个读不懂的 ValidationException。"""
+    created = []
+    monkeypatch.setattr(da, "ensure_secret", lambda name, gen: created.append(name))
+    ssm = FakeSSM(present=set(da.required_parameters()))
+    _run_main(monkeypatch, ssm)
+    assert "" not in created, created
+    assert "/site-builder/jwt-secret" not in created, "L3 之后不该再碰那把密钥"
+    assert "/site-builder/login-flow-secret" in created, "login-flow 的缺省补建不该被一起关掉"

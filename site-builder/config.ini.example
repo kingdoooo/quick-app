@@ -135,7 +135,8 @@ console_version =
 # ============================================================================
 [SessionKeys]
 # 3c-1A：每 family 一把 current（HS256），previous 留空；legacy_param 是拆 family 之前
-# 的共享密钥（今天的 /site-builder/jwt-secret），3c-3 删 legacy 入口时一并清空。
+# 的共享密钥（今天的 /site-builder/jwt-secret）。**3c-1B/L3：清空它即关闭 legacy 入口**
+# （见下面 legacy_param 那行的说明）；SSM 参数本体与代码里的 legacy 分支到 3c-3 才删。
 # 值就是固定的 SSM 参数路径：ensure_session_keys.py 按这里的 HS 行幂等创建 SecureString，
 # router 栈 synth 时只取 site family、panel 只取 console family、auth 两个都取。
 # RS 行（key_arn 带 :key/<uuid> 的完整 ARN，永不写 alias；spki_sha256 64 位 hex）3c-2B 起才出现。
@@ -151,6 +152,11 @@ console_previous =
 # ⑤ 清空 legacy_param（L3）改的是下一行，不是本行——那一刻起 legacy 也不再是本行的合法取值
 # （加载器会拒 signer=legacy + 空 legacy_param 的组合）。
 signer = legacy
+# **清空本行即关闭 legacy 入口**（3c-1B 的 L3，spec §11.8.1）。一处配置三处后果：
+# legacy_entry() 变 off（三处 verifier 只认 kid）、auth/panel 不再下发 JWT_SECRET_PARAM
+# 且角色 SSM 精确清单不含它、router 栈给 Edge 注入空串（空串**不是** SYNTH 占位符）。
+# 清空前必须先把 signer 切到 current——加载器拒绝 (legacy, 空) 这个组合。
+# 参数本体与代码里的 legacy 分支**不在这一步删**（3c-3）：那把密钥仍存在、仍被闸门追踪。
 legacy_param = /site-builder/jwt-secret
 # 3c-1B：登录流程（OAuth state 与 __Host-sb_pkce cookie）的 HMAC 密钥，**auth 私有**。
 # 不是 kid、不属于任何 family、不签发也不验证会话；panel 与 Edge 永不持有它。

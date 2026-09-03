@@ -76,11 +76,74 @@ def test_signer_current_is_allowed_while_legacy_param_is_still_set(tmp_path):
     assert sk.legacy_entry(keys) == "on"
 
 
+def _with(text: str, *, signer: str, legacy: str) -> str:
+    """把 MINIMAL 改成指定的 (signer, legacy_param) 组合。legacy="" 表示写成空值。"""
+    return (text.replace("signer = legacy", f"signer = {signer}")
+                .replace("legacy_param = /site-builder/jwt-secret",
+                         f"legacy_param = {legacy}".rstrip()))
+
+
+# 3c-1B ticket 07：(signer × legacy_param) 的**六种组合**一次列全。
+# 三种合法、三种必拒；`legacy_param` 为空即 legacy 入口关闭（L3），此时只许 signer=current。
+LEGAL_COMBOS = [
+    ("legacy", "/site-builder/jwt-secret", "L1/L2：入口开着、还在签 legacy 形态"),
+    ("current", "/site-builder/jwt-secret", "L2：已切签发，入口仍开着给存量 cookie"),
+    ("current", "", "L3：入口已关闭，只能签 current"),
+]
+ILLEGAL_COMBOS = [
+    ("legacy", "", "签一批没人接受的 token（全员登录循环）"),
+    ("", "/site-builder/jwt-secret", "缺 signer"),
+    ("bogus", "/site-builder/jwt-secret", "signer 非法值"),
+]
+
+
+@pytest.mark.parametrize("signer,legacy,why", LEGAL_COMBOS,
+                         ids=[f"{s or 'missing'}+{'set' if l else 'empty'}"
+                              for s, l, _ in LEGAL_COMBOS])
+def test_the_three_legal_signer_legacy_combinations_load(tmp_path, signer, legacy, why):
+    keys = _load(tmp_path, _with(MINIMAL, signer=signer, legacy=legacy))
+    assert keys.signer == signer
+    assert keys.legacy_param == legacy
+    assert sk.legacy_entry(keys) == ("on" if legacy else "off")
+    del why
+
+
+@pytest.mark.parametrize("signer,legacy,why", ILLEGAL_COMBOS,
+                         ids=[f"{s or 'missing'}+{'set' if l else 'empty'}"
+                              for s, l, _ in ILLEGAL_COMBOS])
+def test_the_three_illegal_signer_legacy_combinations_are_rejected(tmp_path, signer, legacy, why):
+    with pytest.raises(sk.SessionKeysError):
+        _load(tmp_path, _with(MINIMAL, signer=signer, legacy=legacy))
+    del why
+
+
+def test_l3_config_drops_the_legacy_parameter_from_every_role_list(tmp_path):
+    """L3 的第二处后果：角色 SSM 精确清单不再含 legacy 参数（auth 与 panel 各自的清单）。"""
+    keys = _load(tmp_path, _with(MINIMAL, signer="current", legacy=""))
+    auth = sk.ssm_parameter_names(keys, ("site", "console"), login_flow=True)
+    panel = sk.ssm_parameter_names(keys, ("console",))
+    assert "/site-builder/jwt-secret" not in auth and "/site-builder/jwt-secret" not in panel
+    assert "" not in auth and "" not in panel, "空串不得作为参数名混进清单"
+    # 仍该有的东西一个不少
+    assert "/site-builder/login-flow-secret" in auth
+    assert "/site-builder/session-keys/site-hs-v1" in auth
+    assert "/site-builder/session-keys/console-hs-v1" in panel
+    assert "/site-builder/session-keys/site-hs-v1" not in panel, "panel 不得持 site family"
+
+
+def test_before_l3_every_role_list_still_carries_the_legacy_parameter(tmp_path):
+    """回归：`legacy_param` 非空时一切与今天相同。"""
+    keys = _load(tmp_path, MINIMAL)
+    assert sk.ssm_parameter_names(keys, ("site", "console"), login_flow=True)[0] \
+        == "/site-builder/jwt-secret"
+    assert "/site-builder/jwt-secret" in sk.ssm_parameter_names(keys, ("console",))
+
+
 def test_signer_legacy_with_empty_legacy_param_is_rejected_by_its_own_rule(tmp_path):
     """`signer=legacy` + legacy 入口已关 = 签一批没人接受的 token。
 
-    这条的**报错必须来自 signer 规则本身**，不能靠"legacy_param 3c-3 之前必填"那条兜住——
-    07 号任务会删掉后者（放开 legacy_param 为空），届时本条是唯一的防线。
+    07 号任务放开了"legacy_param 为空"之后，本条是这个组合**唯一**的防线——所以要断言
+    报错来自 signer 规则本身（match），而不是别的检查顺手兜住。
     """
     text = MINIMAL.replace("legacy_param = /site-builder/jwt-secret", "legacy_param =")
     with pytest.raises(sk.SessionKeysError, match="signer=legacy"):
@@ -120,11 +183,6 @@ def test_rs_row_schema_is_accepted_now_so_2b_does_not_change_the_schema(tmp_path
     (lambda t: t.replace("signer = legacy", "signer ="), "signer 为空"),
     (lambda t: t.replace("signer = legacy", "signer = Current"), "signer 大小写变形"),
     (lambda t: t.replace("signer = legacy", "signer = on"), "signer 写成 on/off（与 LEGACY_ENTRY 的取值混淆）"),
-    (lambda t: t.replace("legacy_param = /site-builder/jwt-secret\n", ""), "3c-3 之前 legacy_param 必填"),
-    # signer=current 一并改掉，否则拒它的是上面那条 signer 规则而不是本条（07 号任务删的是本条）
-    (lambda t: t.replace("signer = legacy", "signer = current")
-                .replace("legacy_param = /site-builder/jwt-secret", "legacy_param ="),
-     "legacy_param 为空（3c-1B 的 07 号任务才放开）"),
     # 3c-1B：login-flow secret 是 [SessionKeys] 声明的第三种参数——不是 kid、不进 family、只给 auth
     (lambda t: t.replace("login_flow_secret_param = /site-builder/login-flow-secret\n", ""), "缺 login_flow_secret_param（1B 起必填）"),
     (lambda t: t.replace("login_flow_secret_param = /site-builder/login-flow-secret", "login_flow_secret_param ="), "login_flow_secret_param 为空"),

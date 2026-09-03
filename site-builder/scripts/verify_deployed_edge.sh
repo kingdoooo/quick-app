@@ -230,6 +230,21 @@ if grep -qE '^\s+return None, "unknown_kid"' "$TMP/index.py"; then
 else
   fail "产物的 verifier 没有 unknown_kid 分支 —— 部署的是 3c-1A 之前的代码"
 fi
+# ---- 3c-1B：JWT_SECRET 的**空/非空**必须与 legacy 开关一致（spec §11.8.1）----
+# 这是本文件已经栽过一次的形态（见上面 TRUSTED_IDPS 那段注释）：一个被**空替换**掉的注入值
+# 让本该收紧的配置静默失效，而按"有没有引号里的东西"断言看不出来。两个方向都要判：
+#   · 开关 on 而密钥为空 ⇒ 线上现存的 legacy cookie 全部验签失败（用户被踢回登录页）；
+#   · 开关 off 而密钥非空 ⇒ L3 没做干净，一把本该退场的密钥还留在全球复制的产物里。
+# **按整行断言**，避免注释里的同名字样蒙混过关。
+LEGACY_SWITCH="${SK_DEPLOYED##* }"
+if grep -qE '^JWT_SECRET = ""' "$TMP/index.py"; then JWT_EMPTY=yes; else JWT_EMPTY=no; fi
+case "${LEGACY_SWITCH}:${JWT_EMPTY}" in
+  on:no)   echo "PASS  legacy 开关 on 且 JWT_SECRET 非空（形态一致）" ;;
+  off:yes) echo "PASS  legacy 开关 off 且 JWT_SECRET 为空串（L3 形态一致）" ;;
+  on:yes)  fail "legacy 开关是 on 但 JWT_SECRET 被替换成空串 —— 线上现存的 legacy cookie 会全部验签失败" ;;
+  off:no)  fail "legacy 开关是 off 但 JWT_SECRET 仍非空 —— L3 没做干净，一把该退场的密钥还留在产物里" ;;
+  *)       fail "读不出 legacy 开关（SK_DEPLOYED=[$SK_DEPLOYED]），无法核对 JWT_SECRET 形态" ;;
+esac
 # 同名 sb_session 必须**逐个**验，且**不得截断**：条数上限会按路径深度让 M06 复活
 # （可遮蔽条数上界 4n−2，n 是路径段数，站点 URL 空间不受平台约束 ⇒ n 无界）。
 if grep -qE '^\s+for token in _get_cookies\(request, "sb_session"\):' "$TMP/index.py"; then

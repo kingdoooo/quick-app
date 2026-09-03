@@ -601,7 +601,10 @@ def test_environment_has_no_plaintext_secret():
     任意用户会话（deploy_auth.py 已记录该原因）。
     """
     env = dp.lambda_environment()
-    assert env["JWT_SECRET_PARAM"].startswith("/"), "应是 SSM 参数名"
+    # 3c-1B/L3：`legacy_param` 清空后整个键不下发，所以是**条件**断言——在的时候必须是参数名。
+    # 下面那条"看起来像密钥的键必须以 _PARAM 结尾"是无条件的，两种状态都覆盖。
+    if "JWT_SECRET_PARAM" in env:
+        assert env["JWT_SECRET_PARAM"].startswith("/"), "应是 SSM 参数名"
     for k, v in env.items():
         assert "SECRET" not in k or k.endswith("_PARAM"), (
             f"环境变量 {k} 看起来在下发明文密钥")
@@ -990,13 +993,74 @@ def test_skip_frontend_must_not_move_route_to_an_unuploaded_prefix():
 
 
 def test_panel_legacy_param_env_comes_from_session_keys_not_a_literal():
+    """3c-1B/L3：`legacy_param` 非空时下发它、为空时整个键不下发——两种状态都由本条覆盖。"""
     sys.path.insert(0, str(PANEL.parent / "auth"))
     from session_keys import load_session_keys
     keys = load_session_keys(PANEL.parent / "config.ini")
-    assert dp.lambda_environment()["JWT_SECRET_PARAM"] == keys.legacy_param
+    env = dp.lambda_environment()
+    if keys.legacy_param:
+        assert env["JWT_SECRET_PARAM"] == keys.legacy_param
+    else:
+        assert "JWT_SECRET_PARAM" not in env, "legacy 入口已关闭却仍下发那个键"
     src = (PANEL / "deploy_panel.py").read_text()
     assert '"JWT_SECRET_PARAM": "/site-builder/jwt-secret"' not in src, "legacy 参数名硬编码，与 [SessionKeys] 分叉"
     assert "def _panel_ssm_parameter_arns" not in src, "ARN 清单应由 session_keys.ssm_parameter_arns 生成"
+
+
+# ── 3c-1B ticket 07：L3（清空 legacy_param）的 panel 侧后果 ─────────────────
+#
+# panel 与 auth 是同一处配置的两个消费方，所以两边的用例形状刻意对称
+# （auth 那组在 auth/tests/test_deploy_auth_sequence.py）。
+
+def _panel_env_with(monkeypatch, tmp_path, *, signer, legacy):
+    """用一份临时 config 驱动 `lambda_environment()`。
+
+    `deploy_panel` 从 `HERE.parent / "config.ini"` 读，所以造一个临时目录树并把 `HERE` 指过去
+    ——比 patch `load_session_keys` 更接近真实路径（后者会把"从哪个文件读"这件事也 mock 掉）。
+    """
+    real = (PANEL.parent / "config.ini").read_text()
+    text = (real.replace("signer = legacy", f"signer = {signer}")
+                .replace("legacy_param = /site-builder/jwt-secret",
+                         f"legacy_param = {legacy}".rstrip()))
+    assert f"signer = {signer}" in text, "改 signer 的锚点失效了"
+    (tmp_path / "config.ini").write_text(text)
+    panel_dir = tmp_path / "panel"
+    panel_dir.mkdir()
+    monkeypatch.setattr(dp, "HERE", panel_dir)
+    return dp.lambda_environment("AROATEST")
+
+
+def test_l3_panel_env_drops_the_jwt_secret_param_key_entirely(monkeypatch, tmp_path):
+    env = _panel_env_with(monkeypatch, tmp_path, signer="current", legacy="")
+    assert "JWT_SECRET_PARAM" not in env
+    assert env["LEGACY_ENTRY"] == "off"
+    assert env["SESSION_SIGNER"] == "current"
+    # console family 的清单不受影响
+    assert "console-hs-v1" in env["SESSION_KEYS_JSON"]
+
+
+def test_before_l3_panel_env_still_ships_it(monkeypatch, tmp_path):
+    env = _panel_env_with(monkeypatch, tmp_path, signer="legacy", legacy="/site-builder/jwt-secret")
+    assert env["JWT_SECRET_PARAM"] == "/site-builder/jwt-secret"
+    assert env["LEGACY_ENTRY"] == "on"
+
+
+def test_l3_panel_role_ssm_list_no_longer_carries_the_legacy_arn(monkeypatch, tmp_path):
+    """角色清单与 env 是同一处配置推导出来的两个产物，必须一起收敛。"""
+    real = (PANEL.parent / "config.ini").read_text()
+    (tmp_path / "config.ini").write_text(
+        real.replace("signer = legacy", "signer = current")
+            .replace("legacy_param = /site-builder/jwt-secret", "legacy_param ="))
+    panel_dir = tmp_path / "panel"
+    panel_dir.mkdir()
+    monkeypatch.setattr(dp, "HERE", panel_dir)
+    ssm = [r for st in dp.role_statements() if any(a.startswith("ssm:") for a in _actions(st))
+           for r in _resources(st)]
+    assert ssm, "panel role 缺 SSM 读取权限"
+    assert not any(r.endswith("parameter/site-builder/jwt-secret") for r in ssm), ssm
+    assert not any(r.endswith(":parameter") or r.endswith(":parameter/") for r in ssm), \
+        "空参数名拼出了一个畸形 ARN"
+    assert any(r.endswith("/session-keys/console-hs-v1") for r in ssm), "console family 的 key 不该被一起收掉"
 
 
 # ── 3c-1B：login-flow secret 是 auth 私有的，panel 永不持有（spec §11.3）──────

@@ -209,3 +209,91 @@ def test_source_has_no_kid_derived_resource_paths():
     """kid 不得进 f-string / 拼接去构造路径、参数名、ARN。"""
     for m in re.finditer(r"f\"[^\"]*\{kid\}[^\"]*\"|f'[^']*\{kid\}[^']*'", SRC):
         assert False, f"kid 被拼进字符串：{m.group(0)}"
+
+
+# ---- 3c-1B ticket 07：L3 之后 Edge 的行为（`{{JWT_SECRET}}` 注入空串 + `LEGACY_ENTRY=off`）----
+#
+# 上面 test_legacy_token_is_rejected_when_legacy_entry_is_off 已经覆盖"开关为 off 时 legacy 被拒"，
+# 但它用的 testable 副本注的仍是**非空**的 legacy 密钥。L3 的真实产物是**空串**，所以再造一份
+# 与线上完全同形的副本：空 JWT_SECRET + off。少了这一份的话，"空密钥被当成一把合法密钥"这类
+# 退化（`hmac.new(b"", …)` 照样能算出签名）在测试里看不见。
+def _reload_l3():
+    """把 `{{JWT_SECRET}}` 也换成空串——`_load` 用的是 BASE_SUBS 里的非空值。"""
+    src = SRC
+    subs = dict(BASE_SUBS, **{"{{SITE_ALLOWLIST_JSON}}": json.dumps(ALLOWLIST),
+                              "{{LEGACY_ENTRY}}": "off", "{{JWT_SECRET}}": ""})
+    for k, v in subs.items():
+        src = src.replace(k, v)
+    assert 'JWT_SECRET = ""' in src, "空替换没落到那一行——L3 的产物形态变了"
+    (HERE / "_edge_kid_l3_empty_testable.py").write_text(src)
+    return importlib.import_module("_edge_kid_l3_empty_testable")
+
+
+orq_l3_empty = _reload_l3()
+
+
+def test_l3_artifact_shape_has_an_empty_secret_and_the_switch_off():
+    """产物形态自查：这两条是下面几条断言的前提（前提坏了那些断言就是在测别的东西）。"""
+    assert orq_l3_empty.JWT_SECRET == ""
+    assert orq_l3_empty.LEGACY_ENTRY == "off"
+
+
+def test_kid_form_sessions_still_verify_with_an_empty_legacy_secret():
+    """L3 的正向：新入口完全不依赖那个常量，注空串不影响任何 kid token。"""
+    assert allowed(orq_l3_empty, site_token())
+    assert allowed(orq_l3_empty, site_token(kid="site-hs-v0", secret=SITE_V0))
+
+
+def test_legacy_tokens_are_rejected_after_l3_regardless_of_which_secret_signed_them():
+    """负向：预存的 legacy token（用**真**密钥签的）在 L3 之后必拒。
+
+    契约顺序让这条与过期无关（spec §5：kid 先于 exp）——无 kid ⇒ legacy 入口 ⇒ 入口已关 ⇒ 拒。
+    """
+    assert not allowed(orq_l3_empty, legacy_token())
+    assert not allowed(orq_l3_empty, legacy_token(secret=""))
+
+
+def _load_empty_secret_with_legacy_on():
+    """反事实副本：空 JWT_SECRET 但 `LEGACY_ENTRY=on`（**线上永不会是这个组合**）。
+
+    只用来证明下面那条依赖关系：安全性来自开关，不来自"密钥恰好是空的"。
+    """
+    src = SRC
+    for k, v in dict(BASE_SUBS, **{"{{SITE_ALLOWLIST_JSON}}": json.dumps(ALLOWLIST),
+                                   "{{LEGACY_ENTRY}}": "on", "{{JWT_SECRET}}": ""}).items():
+        src = src.replace(k, v)
+    (HERE / "_edge_empty_secret_legacy_on_testable.py").write_text(src)
+    return importlib.import_module("_edge_empty_secret_legacy_on_testable")
+
+
+def test_the_safety_of_an_empty_secret_comes_from_the_switch_not_from_emptiness():
+    """**空密钥不是一道防线**：`hmac.new(b"", …)` 照样算得出签名。
+
+    左边（开关 on + 空密钥，线上不会出现的反事实组合）：任何人都能用空串签出**被接受**的
+    legacy 会话——这正是"注空串"本身毫无保护作用的证明。
+    右边（开关 off，L3 的真实形态）：同一枚 token 必拒。
+    所以 L3 的安全性完全落在 `LEGACY_ENTRY=off` 那道分支上；把这条依赖写成用例，是为了让
+    将来任何"反正密钥是空的，开关无所谓"的简化当场变红。
+    """
+    forged = legacy_token(secret="")
+    assert allowed(_load_empty_secret_with_legacy_on(), forged), \
+        "空密钥签的 legacy token 在开关 on 下竟然被拒——那这条依赖关系的前提变了"
+    assert not allowed(orq_l3_empty, forged)
+
+
+def test_rejection_reason_after_l3_is_unknown_kid_by_contract_order():
+    """拒绝理由必须是 `unknown_kid`：spec §5 的契约顺序是 kid 先于 exp，所以预存的
+    legacy/v1 token 在退役后一律 `unknown_kid`，**与它是否过期无关**（spec Further Notes）。"""
+    _, outcome = auth_session.verify_with_legacy(
+        legacy_token(secret=""), allowlist=ALLOWLIST, token_use="site-session", legacy_secret=None)
+    assert outcome == "unknown_kid", outcome
+
+
+def test_legacy_outcome_after_l3_is_unknown_kid_not_bad_signature(caplog):
+    """观测词表：L3 之后零星的过期 legacy cookie 应记成 `unknown_kid`（DEPLOY.md 说"属预期"），
+    而 `bad_signature` 才是"有人在伪造"的信号。两者混在一起就读不出区别了。"""
+    with caplog.at_level(logging.INFO):
+        orq_l3_empty._verify_session_jwt(legacy_token())
+    outcomes = [json.loads(r.getMessage())["outcome"] for r in caplog.records
+                if r.getMessage().startswith("{") and '"session_verify"' in r.getMessage()]
+    assert outcomes == ["unknown_kid"], outcomes
