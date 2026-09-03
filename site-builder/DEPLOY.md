@@ -507,13 +507,13 @@ python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump "$DUMP
 | **闸门** | 不跑（没有部署，账号里什么都没变） |
 | **回滚** | git |
 
-##### ② 建 login-flow secret，只部 auth（开关仍 `legacy`）
+##### ② 建 login-flow secret，部 auth **与 panel**（开关仍 `legacy`）
 
 | | |
 |---|---|
 | **配置** | 无（① 已写好 `login_flow_secret_param`） |
-| **动作** | `ensure_session_keys.py` → **闸门第一轮**（出结论，不写基线）→ 片段 A 的 auth → **闸门第二轮 + 写基线**。两轮都走实测路径、都带同样的声明旗标，见下面的命令 |
-| **硬停止点** | (a) `GET https://auth.{base_domain}/login` 必须 302 且带 `Set-Cookie: __Host-sb_pkce=`；(b) 操作者**人工完整登录一次**（证明整条 /login → /callback 在换了 login-flow secret 之后是通的）|
+| **动作** | `ensure_session_keys.py` → **闸门第一轮**（出结论，不写基线）→ 片段 A 的 auth → 片段 A 的 **panel** → **闸门第二轮 + 写基线**。两轮都走实测路径、都带同样的声明旗标，见下面的命令 |
+| **硬停止点** | (a) `GET https://auth.{base_domain}/login` 必须 302 且带 `Set-Cookie: __Host-sb_pkce=`；(b) 操作者**人工完整登录一次**（证明整条 /login → /callback 在换了 login-flow secret 之后是通的）；(c) `verify_deployed_components.py` **80/80 全绿**——本步把两个组件都带到 1B 代码，所以这里就该全绿，不留到 ③ |
 | **闸门** | 两轮都带 `--new-key login-flow`。第一轮（部署前）只多出参数本身带来的宽读者面；**第二轮（部署后）才会出现** auth 执行角色上那条精确 ARN 的 grant `read-login-flow-secret`，落在 `migration_grants`（绿）。**它不进 `is_secret_grant()`——读到它只值一个登录 CSRF，不是冒充面**，所以冒充面数字不变 |
 | **回滚** | 改 `signer` 无关；这一步的风险只在 `/login`。回滚 = git 重部 auth。**SSM 里新建的 secret 不删** |
 
@@ -528,7 +528,15 @@ python3 site-builder/scripts/ensure_session_keys.py
 # **这一轮不写基线**：auth 角色上那条精确 ARN 的 grant 还不存在。
 python3 site-builder/scripts/verify_account_trust_boundary.py --new-key login-flow
 
-# …片段 A 的 auth（部署后 grant 才出现）…
+# …片段 A 的 auth，接着片段 A 的 panel（两者都还是 signer=legacy）…
+
+# ⚠️ **panel 也要在本步部署，别留到 ③。** 本步之前 panel 还是上一包（1A）的代码；如果留到
+#    ③，那一次 deploy_panel 会把「panel 的 1B 代码」与「panel 切 current」并成一次部署，
+#    panel 一出问题就无法归因——而 auth 的这两件事本来就是分在 ②/③ 的。开关仍是 legacy，
+#    所以这一次部署**行为中性**（面板会话仍是旧形态，字节级不变），代价约 1 分钟。
+#    2026-09-03 首次执行时就是按拆开做的：拆开后 verify_deployed_components 当场 80/80。
+
+python3 site-builder/scripts/verify_deployed_components.py   # 本步就该 80/80
 
 # 硬停止点先做（秒级），再跑 11 分钟的闸门：
 BASE=$(python3 - <<'PY'
@@ -558,7 +566,7 @@ python3 site-builder/scripts/verify_account_trust_boundary.py --update-baseline
 | | |
 |---|---|
 | **配置** | `[SessionKeys] signer = current`（**本 runbook 里这一行只改一次**）|
-| **动作** | 片段 A 的 panel **先**，auth **后**（`deploy_auth.py` 返回的时刻 = **T0**，记进 progress）|
+| **动作** | 片段 A 的 panel **先**，auth **后**（`deploy_auth.py` 返回的时刻 = **T0**，记进 progress）。两者的 1B 代码都已在 ② 上线，本步**只**改 `SESSION_SIGNER` 一个变量 |
 | **硬停止点** | 四个 `verify_*` + `verify_kid_entry_live.py` + `smoke_router.sh` 全绿 → `session_verify_counts.py --hours 1 --require-total`：**三列的 `accepted_current` 都 > 0** → E2E 后台跑一次（10 条、约 37 分钟）→ 预存**两枚** legacy 探针 token（⑤ 用）|
 | **闸门** | 无需声明（没有密钥增减）。可复跑一次确认没有夹带漂移 |
 | **回滚** | `signer = legacy` → 重部 panel + auth。**不动 Edge、不回退代码**（verifier 全程双接受）|

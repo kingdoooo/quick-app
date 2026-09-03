@@ -1012,22 +1012,50 @@ def test_panel_legacy_param_env_comes_from_session_keys_not_a_literal():
 # panel 与 auth 是同一处配置的两个消费方，所以两边的用例形状刻意对称
 # （auth 那组在 auth/tests/test_deploy_auth_sequence.py）。
 
+def _rewrite_key(text: str, key: str, value: str) -> str:
+    """把 `[SessionKeys]` 里某个键改成给定值，**按键名匹配、不按当前值匹配**。
+
+    2026-09-03 实测踩过：原先这里是 `text.replace("signer = legacy", ...)`，锚点是那个键
+    **当前的值**。而 `signer` 的值本来就会在演练过程中被改（1B 的 ③ 就是把它改成 `current`），
+    于是真机演练一开始，用例就以「改 signer 的锚点失效了」整片红——它测的东西没坏，是锚点坏了。
+    另一处（角色清单那条）当时**连守卫都没有**，`replace` 静默变成 no-op ⇒ 用例还在绿，
+    但测的已经不是它想测的那份 config。按键名重写 + 断言恰好替换一次，两个毛病一起去掉。
+    """
+    import re
+    out, n = re.subn(rf"(?m)^{re.escape(key)}\s*=.*$", f"{key} = {value}".rstrip(), text)
+    assert n == 1, f"config.ini 里 `{key}` 期望恰好一行，实际 {n} 行——锚点或配置结构变了"
+    return out
+
+
 def _panel_env_with(monkeypatch, tmp_path, *, signer, legacy):
     """用一份临时 config 驱动 `lambda_environment()`。
 
     `deploy_panel` 从 `HERE.parent / "config.ini"` 读，所以造一个临时目录树并把 `HERE` 指过去
     ——比 patch `load_session_keys` 更接近真实路径（后者会把"从哪个文件读"这件事也 mock 掉）。
+    **以真实 config 为底、只重写这两个键**，所以线上把 signer 切到 current 之后本组用例照样成立。
     """
     real = (PANEL.parent / "config.ini").read_text()
-    text = (real.replace("signer = legacy", f"signer = {signer}")
-                .replace("legacy_param = /site-builder/jwt-secret",
-                         f"legacy_param = {legacy}".rstrip()))
-    assert f"signer = {signer}" in text, "改 signer 的锚点失效了"
+    text = _rewrite_key(_rewrite_key(real, "signer", signer), "legacy_param", legacy)
     (tmp_path / "config.ini").write_text(text)
     panel_dir = tmp_path / "panel"
     panel_dir.mkdir()
     monkeypatch.setattr(dp, "HERE", panel_dir)
     return dp.lambda_environment("AROATEST")
+
+
+def test_the_config_rewriter_is_value_independent_and_loud():
+    """**元用例**：本组用例的前提就是"重写与 signer 当前值无关"。
+
+    正向：无论底稿写的是 legacy 还是 current，都能改成目标值；
+    负向：键不存在时必须响亮失败（而不是静默 no-op——那正是旧写法的第二个毛病）。
+    """
+    for cur in ("legacy", "current"):
+        base = f"[SessionKeys]\nsigner = {cur}\nlegacy_param = /site-builder/jwt-secret\n"
+        assert "signer = current" in _rewrite_key(base, "signer", "current")
+        assert "signer = legacy" in _rewrite_key(base, "signer", "legacy")
+        assert "legacy_param =\n" in _rewrite_key(base, "legacy_param", "")
+    with pytest.raises(AssertionError):
+        _rewrite_key("[SessionKeys]\nsomething = else\n", "signer", "current")
 
 
 def test_l3_panel_env_drops_the_jwt_secret_param_key_entirely(monkeypatch, tmp_path):
@@ -1049,8 +1077,7 @@ def test_l3_panel_role_ssm_list_no_longer_carries_the_legacy_arn(monkeypatch, tm
     """角色清单与 env 是同一处配置推导出来的两个产物，必须一起收敛。"""
     real = (PANEL.parent / "config.ini").read_text()
     (tmp_path / "config.ini").write_text(
-        real.replace("signer = legacy", "signer = current")
-            .replace("legacy_param = /site-builder/jwt-secret", "legacy_param ="))
+        _rewrite_key(_rewrite_key(real, "signer", "current"), "legacy_param", ""))
     panel_dir = tmp_path / "panel"
     panel_dir.mkdir()
     monkeypatch.setattr(dp, "HERE", panel_dir)
