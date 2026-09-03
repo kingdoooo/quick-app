@@ -19,6 +19,7 @@ MINIMAL = textwrap.dedent("""
     site_previous =
     console_current = console-hs-v1
     console_previous =
+    signer = legacy
     legacy_param = /site-builder/jwt-secret
     login_flow_secret_param = /site-builder/login-flow-secret
 
@@ -61,6 +62,31 @@ def test_minimal_1a_config_loads_two_families_with_no_previous(tmp_path):
     assert site.key_arn is None and site.spki_sha256 is None
 
 
+def test_both_legal_signer_values_load(tmp_path):
+    """两个合法值都要能加载出来——缺一即开关只能单向（切得过去回不来）。
+    "缺/非法必须硬失败"那一半在下面的 test_misconfiguration_raises_instead_of_falling_back。"""
+    assert _load(tmp_path, MINIMAL).signer == "legacy"
+    assert _load(tmp_path, MINIMAL.replace("signer = legacy", "signer = current")).signer == "current"
+
+
+def test_signer_current_is_allowed_while_legacy_param_is_still_set(tmp_path):
+    """切换期（十步的 ③–④）的实际形态：已按新 kid 签发，legacy 入口仍开着给存量 cookie 用。"""
+    keys = _load(tmp_path, MINIMAL.replace("signer = legacy", "signer = current"))
+    assert (keys.signer, keys.legacy_param) == ("current", "/site-builder/jwt-secret")
+    assert sk.legacy_entry(keys) == "on"
+
+
+def test_signer_legacy_with_empty_legacy_param_is_rejected_by_its_own_rule(tmp_path):
+    """`signer=legacy` + legacy 入口已关 = 签一批没人接受的 token。
+
+    这条的**报错必须来自 signer 规则本身**，不能靠"legacy_param 3c-3 之前必填"那条兜住——
+    07 号任务会删掉后者（放开 legacy_param 为空），届时本条是唯一的防线。
+    """
+    text = MINIMAL.replace("legacy_param = /site-builder/jwt-secret", "legacy_param =")
+    with pytest.raises(sk.SessionKeysError, match="signer=legacy"):
+        _load(tmp_path, text)
+
+
 def test_inline_comments_are_stripped_not_folded_into_values(tmp_path):
     """CLAUDE.md 记过的坑：configparser 默认把行内注释并进值。"""
     text = MINIMAL.replace("site_current = site-hs-v1",
@@ -90,8 +116,15 @@ def test_rs_row_schema_is_accepted_now_so_2b_does_not_change_the_schema(tmp_path
     (lambda t: t.replace("[SessionKeys]", "[SessionKeyz]"), "缺 [SessionKeys] 段"),
     (lambda t: t.replace("site_current = site-hs-v1\n", ""), "缺 site_current"),
     (lambda t: t.replace("console_current = console-hs-v1\n", ""), "缺 console_current"),
+    (lambda t: t.replace("signer = legacy\n", ""), "缺 signer（3c-1B 起必填，不给默认值）"),
+    (lambda t: t.replace("signer = legacy", "signer ="), "signer 为空"),
+    (lambda t: t.replace("signer = legacy", "signer = Current"), "signer 大小写变形"),
+    (lambda t: t.replace("signer = legacy", "signer = on"), "signer 写成 on/off（与 LEGACY_ENTRY 的取值混淆）"),
     (lambda t: t.replace("legacy_param = /site-builder/jwt-secret\n", ""), "3c-3 之前 legacy_param 必填"),
-    (lambda t: t.replace("legacy_param = /site-builder/jwt-secret", "legacy_param ="), "legacy_param 为空"),
+    # signer=current 一并改掉，否则拒它的是上面那条 signer 规则而不是本条（07 号任务删的是本条）
+    (lambda t: t.replace("signer = legacy", "signer = current")
+                .replace("legacy_param = /site-builder/jwt-secret", "legacy_param ="),
+     "legacy_param 为空（3c-1B 的 07 号任务才放开）"),
     # 3c-1B：login-flow secret 是 [SessionKeys] 声明的第三种参数——不是 kid、不进 family、只给 auth
     (lambda t: t.replace("login_flow_secret_param = /site-builder/login-flow-secret\n", ""), "缺 login_flow_secret_param（1B 起必填）"),
     (lambda t: t.replace("login_flow_secret_param = /site-builder/login-flow-secret", "login_flow_secret_param ="), "login_flow_secret_param 为空"),

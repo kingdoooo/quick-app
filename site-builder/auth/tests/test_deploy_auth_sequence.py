@@ -38,6 +38,7 @@ CFG = textwrap.dedent("""
     site_previous =
     console_current = console-hs-v1
     console_previous =
+    signer = legacy
     legacy_param = /site-builder/jwt-secret
     login_flow_secret_param = /site-builder/login-flow-secret
 

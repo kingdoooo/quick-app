@@ -143,6 +143,14 @@ site_current = site-hs-v1
 site_previous =
 console_current = console-hs-v1
 console_previous =
+# 3c-1B（spec §11.8.3）：**签发**形态开关，legacy | current。两个 family 同步，下发为 auth 与
+# panel 的 SESSION_SIGNER（**panel 侧随 05 号任务落地**；在那之前只有 auth 认这个开关）。
+# 验签侧与它无关（verifier 全程同时接受 current/previous/legacy），所以回滚 = 把这一行改回去、
+# 重跑 deploy_panel 与 deploy_auth，**不动 Edge、不回退代码**。
+# 十步 runbook 里本行**只改一次**：③ legacy → current（切签发，panel 先 auth 后）。
+# ⑤ 清空 legacy_param（L3）改的是下一行，不是本行——那一刻起 legacy 也不再是本行的合法取值
+# （加载器会拒 signer=legacy + 空 legacy_param 的组合）。
+signer = legacy
 legacy_param = /site-builder/jwt-secret
 # 3c-1B：登录流程（OAuth state 与 __Host-sb_pkce cookie）的 HMAC 密钥，**auth 私有**。
 # 不是 kid、不属于任何 family、不签发也不验证会话；panel 与 Edge 永不持有它。

@@ -24,8 +24,9 @@ import urllib.request
 import jwt as pyjwt
 from jwt import PyJWKClient
 
-from session import (SESSION_TYP, mint_session_jwt, mint_upgrade_code,  # noqa: F401
-                     verify_session_jwt, verify_with_legacy)
+from session import (SESSION_TYP, UPGRADE_MAX_TTL, mint_session_jwt,  # noqa: F401
+                     mint_token, mint_upgrade_code, verify_session_jwt,
+                     verify_with_legacy)
 import verifier_env
 
 _jwks_client = None  # 模块级缓存，Lambda 容器复用
@@ -38,6 +39,10 @@ _ssm_client = None
 # 300 秒是延迟与新鲜度的折中：每 5 分钟最多一次 SSM 调用（不会撞节流），
 # 轮转后最长 5 分钟收敛。
 SECRET_TTL_SECONDS = 300
+# 站点会话的 TTL：**同时**是 token 的 exp 与 sb_session cookie 的 Max-Age。
+# 收成一个常量是因为两处分叉的症状是"cookie 还在但 Edge 判过期"（302 回登录，看起来像
+# 会话丢失）或"cookie 先没了但 token 还有效"（表现为莫名重登），都很难定位到这个数字。
+SESSION_TTL_SECONDS = 86400
 
 
 def _ssm():
@@ -65,15 +70,17 @@ def _secret(name: str) -> str:
     用旧值（Lambda 执行环境可复用数小时），表现为部分请求成功、部分
     invalid_client，且改配置也不触发刷新。
 
-    ⚠️ **JWT_SECRET 的轮转不能只靠这个 TTL**：Edge 那份是 CDK 部署时字符串
-    替换注入的（Lambda@Edge 不支持环境变量），改一次要 10-20 分钟全球复制。
-    auth 侧读到新值时 Edge 可能还在用旧值验签 → 这期间新签发的会话全部验签
-    失败，用户登录后立刻被踢回登录页（症状极难定位到密钥版本）。轮转它需要
-    版本化/双密钥或"先让 Edge 同时接受新旧值、复制完成后再切签发"的协调顺序，
-    不在当前实现范围内。
-    **动手前先读 DEPLOY.md「轮转 jwt-secret：当前实现下不能就地改值」**——
-    那里写了为什么不能就地改、双密钥要改哪两处，以及密钥已泄漏时那条
-    "可用性换安全性"的应急步骤（含"处置期间不要回滚 Edge"）。
+    ⚠️ **会话密钥的轮转不能靠就地改值，也不能只靠这个 TTL**：Edge 那份是 CDK
+    部署时字符串替换注入的（Lambda@Edge 不支持环境变量），改一次要 10-20 分钟
+    全球复制。auth 侧读到新值时 Edge 可能还在用旧值验签 → 这期间新签发的会话
+    全部验签失败，用户登录后立刻被踢回登录页（症状极难定位到密钥版本）。
+    3c-1A/1B 的解法就是"版本化 + 双接受 + 先 verifier 后 signer"：每把 key 有
+    `kid`，verifier 全程同时接受 current 与 previous，新 key 先经 `previous`
+    槽位随 Edge 复制就位，复制完成后才互换槽位切签发（`SESSION_SIGNER` /
+    `[SessionKeys]` 的 current/previous）。**动手前先读 DEPLOY.md 的十步轮转
+    runbook**——那里有每步的闸门、探针与"排空后才退役、退役最后才删 SSM 参数"。
+    `JWT_SECRET`（legacy 入口那把）不在这套机制里：它没有 `kid`、只被验签用，
+    3c-3 随 legacy 入口一起删，**在那之前不要就地改它的值**。
     """
     hit = _secret_cache.get(name)
     if hit is not None and time.monotonic() - hit[1] < SECRET_TTL_SECONDS:
@@ -113,6 +120,22 @@ def _allowlist(family: str) -> dict:
 
 def _legacy_secret():
     return verifier_env.legacy_secret(os.environ.get("LEGACY_ENTRY"), lambda: _secret("JWT_SECRET"))
+
+
+def _signer_mode() -> str:
+    """签发形态开关（3c-1B，spec §11.8.3）：`legacy` | `current`，来自 SESSION_SIGNER。
+
+    **handler 里唯一的分派点**：`mint_token` 只在 current 分支、`mint_session_jwt` /
+    `mint_upgrade_code` 只在 legacy 分支，由 tests/test_signer_switch_guard.py 的 AST 守卫锁死
+    （多一条不经开关的签发路径 = 多一批没人接受或不该存在的 token）。
+    """
+    return verifier_env.signer_mode(os.environ.get("SESSION_SIGNER"))
+
+
+def _signing_key(family: str) -> tuple:
+    """→ 该 family 的 (current kid, secret)。**handler 取签发 key 的唯一入口。**"""
+    return verifier_env.signing_key(os.environ.get("SESSION_KEYS_JSON"), family, _secret_by_param,
+                                    allowed_families=("site", "console"))
 
 
 def _log_verify_outcome(outcome: str) -> None:
@@ -533,6 +556,9 @@ def handler(event, context):
         if not code:
             return {"statusCode": 400,
                     "body": "授权失败或被取消，请重新登录"}
+        # 开关先读、`_exchange_code` 后调：缺 SESSION_SIGNER 时的响亮失败必须发生在**烧掉这枚
+        # 一次性授权码之前**，否则用户重试还得从 /login 重来一遍（code 不能复用）。
+        signer = _signer_mode()
         try:
             user = _exchange_code(code, pkce["v"], pkce["n"])
         except (ValueError, TokenExchangeRejected, pyjwt.InvalidTokenError):
@@ -545,10 +571,21 @@ def handler(event, context):
             # 上游 5xx / 超时 / JWKS 拉取失败不在此列，照原样上抛成 5xx——
             # 平台故障不能伪装成"请重新登录"。
             return {"statusCode": 400, "body": "登录校验失败，请重新登录"}
-        token = mint_session_jwt(user["email"], user["name"],
-                                 _secret("JWT_SECRET"), idp=user.get("idp", ""),
-                                 auth_via=user.get("auth_via", ""))
-        cookie = (f"sb_session={token}; Domain=.{base}; Path=/; Max-Age=86400; "
+        # 3c-1B：签发形态由 SESSION_SIGNER 决定（spec §11.8.3）。current 用 site family 的
+        # current kid + 新合同（token_use/aud/iat，无 payload typ）；legacy 字节级沿用旧形态。
+        # 两条分支的 TTL 与 cookie 属性完全相同——本票只换签名密钥与 claim 集合。
+        if signer == "current":
+            kid, secret = _signing_key("site")
+            token = mint_token(kid=kid, secret=secret, token_use="site-session",
+                               email=user["email"], ttl_seconds=SESSION_TTL_SECONDS,
+                               name=user["name"], idp=user.get("idp", ""),
+                               auth_via=user.get("auth_via", ""))
+        else:
+            token = mint_session_jwt(user["email"], user["name"],
+                                     _secret("JWT_SECRET"), ttl_seconds=SESSION_TTL_SECONDS,
+                                     idp=user.get("idp", ""),
+                                     auth_via=user.get("auth_via", ""))
+        cookie = (f"sb_session={token}; Domain=.{base}; Path=/; Max-Age={SESSION_TTL_SECONDS}; "
                   f"Secure; HttpOnly; SameSite=Lax")
         clear_pkce = f"{PKCE_COOKIE}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax"
         return {"statusCode": 302, "headers": {"Location": redirect},
@@ -592,7 +629,15 @@ def handler(event, context):
                     "headers": {"Location": f"https://auth.{base}/login?redirect={back}",
                                 "cache-control": "no-store"},
                     "body": ""}
-        code = mint_upgrade_code(claims["email"], _secret("JWT_SECRET"))
+        # 3c-1B：升级码同样按 SESSION_SIGNER 分派，用的是 **console** family 的 current kid
+        # （auth 持两个 family 的读取权；Edge 只持 site，所以升级码投给 Edge 必拒——这正是
+        # 拆 family 想要的性质）。60 秒上限由 mint_token / mint_upgrade_code 各自钳制。
+        if _signer_mode() == "current":
+            kid, secret = _signing_key("console")
+            code = mint_token(kid=kid, secret=secret, token_use="console-upgrade",
+                              email=claims["email"], ttl_seconds=UPGRADE_MAX_TTL)
+        else:
+            code = mint_upgrade_code(claims["email"], _secret("JWT_SECRET"))
         target = (f"https://console.{base}/api/session-callback"
                   f"?code={urllib.parse.quote(code, safe='')}")
         return {"statusCode": 302,

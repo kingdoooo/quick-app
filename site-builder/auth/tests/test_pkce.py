@@ -16,7 +16,10 @@ ENV = {"JWT_SECRET": "s3cret",
        "CLIENT_ID": "cid", "CLIENT_SECRET": "csec", "BASE_DOMAIN": "example.com",
        "USER_POOL_ID": "us-east-1_test",
        # 3c-1B：state 与 pkce cookie 的 HMAC 改用 login-flow secret（只下发参数名，值在 conftest 的假 SSM）
-       "LOGIN_FLOW_SECRET_PARAM": "/site-builder/login-flow-secret"}
+       "LOGIN_FLOW_SECRET_PARAM": "/site-builder/login-flow-secret",
+       # 3c-1B：/callback 会经 _signer_mode() 分派签发形态。本文件只关心 state/PKCE 那一半
+       # （它**与开关无关**），所以固定 legacy；新形态的 cookie 断言在 test_login_handler。
+       "SESSION_SIGNER": "legacy"}
 
 
 def _event(path, qs=None, cookies=None):

@@ -30,6 +30,55 @@ def test_load_allowlist_missing_or_invalid_env_raises_not_empty():
         ve.load_allowlist(json.dumps({"console": []}), "site", SECRETS.__getitem__, allowed_families=("site", "console"))
 
 
+# ---- 3c-1B：signer 侧的两件装配 ---------------------------------------------------------
+
+def test_signing_key_returns_the_current_kid_and_its_secret():
+    assert ve.signing_key(json.dumps(ROWS), "site", SECRETS.__getitem__,
+                          allowed_families=("site", "console")) == ("site-hs-v1", "s")
+    assert ve.signing_key(json.dumps(ROWS), "console", SECRETS.__getitem__,
+                          allowed_families=("site", "console")) == ("console-hs-v1", "c")
+
+
+def test_signing_key_ignores_previous_and_never_signs_with_it():
+    """就位期（十步的 ⑥）两把都在 allowlist 里；签发只能用 current，否则新 key 一就位就开始签。"""
+    rows = {"site": ROWS["site"] + [{"kid": "site-hs-v2", "alg": "HS256", "role": "previous",
+                                     "ssm_param": "/p/site2"}]}
+    kid, secret = ve.signing_key(json.dumps(rows), "site",
+                                 dict(SECRETS, **{"/p/site2": "s2"}).__getitem__,
+                                 allowed_families=("site",))
+    assert (kid, secret) == ("site-hs-v1", "s")
+
+
+def test_signing_key_rejects_families_the_component_must_not_sign_for():
+    """panel 只持 console：拿 site 去签就是配置错（等于 panel 能伪造站点会话）。"""
+    with pytest.raises(RuntimeError):
+        ve.signing_key(json.dumps(ROWS), "site", SECRETS.__getitem__, allowed_families=("console",))
+
+
+@pytest.mark.parametrize("rows, why", [
+    ({"site": []}, "family 里没有任何 kid"),
+    ({"site": [dict(ROWS["site"][0], role="previous")]}, "只有 previous、没有 current"),
+    ({"site": [ROWS["site"][0], {"kid": "site-hs-v2", "alg": "HS256", "role": "current",
+                                 "ssm_param": "/p/site"}]}, "两个 current（签哪把成了字典序的副产品）"),
+])
+def test_signing_key_requires_exactly_one_current(rows, why):
+    with pytest.raises(RuntimeError):
+        ve.signing_key(json.dumps(rows), "site", SECRETS.__getitem__, allowed_families=("site",))
+    del why
+
+
+@pytest.mark.parametrize("flag", ["legacy", "current"])
+def test_signer_mode_passes_through_the_two_legal_values(flag):
+    assert ve.signer_mode(flag) == flag
+
+
+@pytest.mark.parametrize("flag", [None, "", "on", "off", "Current", "LEGACY", "1", "true"])
+def test_signer_mode_rejects_anything_else_and_never_defaults(flag):
+    """缺失/非法都必须是"部署脚本没下发"，不许回落——回落哪一侧都是静默的错签发形态。"""
+    with pytest.raises(RuntimeError, match="SESSION_SIGNER"):
+        ve.signer_mode(flag)
+
+
 @pytest.mark.parametrize("flag,expect", [("on", "l"), ("off", None)])
 def test_legacy_secret_follows_the_switch(flag, expect):
     assert ve.legacy_secret(flag, lambda: "l") == expect

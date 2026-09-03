@@ -101,20 +101,25 @@ def test_ttl_is_bounded_and_documented():
     assert 60 <= lh.SECRET_TTL_SECONDS <= 900, lh.SECRET_TTL_SECONDS
 
 
-def test_jwt_secret_rotation_hazard_is_documented():
-    """JWT_SECRET 的轮转**不能只靠 TTL**，代码里必须写明这一点。
+def test_session_key_rotation_protocol_is_documented_where_the_secret_is_read():
+    """会话密钥的轮转**不能靠就地改值、也不能只靠 TTL**，`_secret` 附近必须写明现在的做法。
 
-    Edge 那份 JWT secret 是 CDK 部署时字符串替换注入的（Lambda@Edge 不支持
-    环境变量），且要 10-20 分钟全球复制。auth 侧即使 TTL 到期读到新值，Edge
-    仍在用旧值验签 → 新签发的会话全部验签失败。所以轮转它需要版本化/双密钥
-    或明确的协调切换顺序，不是把 TTL 调短就能解决的。
-    这条测试锁住"文档提醒不被删掉"，因为踩到时的症状（部分用户登录后立刻被
-    踢回登录页）极难定位到密钥版本不一致。
+    Edge 那份是 CDK 部署时字符串替换注入的（Lambda@Edge 不支持环境变量），改一次要 10-20
+    分钟全球复制。auth 侧即使 TTL 到期读到新值，Edge 仍在用旧值验签 → 新签发的会话全部
+    验签失败（症状是部分用户登录后立刻被踢回登录页，极难定位到密钥版本不一致）。
+
+    **3c-1B 起这条提醒的内容变了**（本票之前写的是"不在当前实现范围内"）：机制已经存在——
+    `kid` + verifier 双接受 + 先 verifier 后 signer，新 key 经 `previous` 槽位随 Edge 复制
+    就位后才互换。所以提醒必须指向那套 runbook，而不是继续说"做不到"；写着"做不到"会让下一
+    个人真的去就地改值。本条锁的就是这三样一直在：Edge 的复制延迟、`kid`/槽位机制、
+    DEPLOY.md 的 runbook 指针。
     """
     src = (Path(__file__).parents[1] / "login_handler.py").read_text()
     seg = src[src.index("def _secret"):src.index("def _get_jwks_client")]
-    assert "Edge" in seg and "轮转" in seg, \
-        "_secret 附近必须写明 JWT_SECRET 轮转需与 Edge 协调"
+    assert "Edge" in seg and "轮转" in seg, "_secret 附近必须写明会话密钥轮转需与 Edge 协调"
+    assert "kid" in seg and "previous" in seg, "必须写明现在靠 kid + previous 槽位轮转"
+    assert "DEPLOY.md" in seg, "必须留下指向十步 runbook 的指针"
+    assert "不在当前实现范围内" not in seg, "3c-1A/1B 之后这句已经不成立，留着会误导下一个人"
 
 
 def test_env_plaintext_still_honored_for_local_tests(monkeypatch):
@@ -191,6 +196,22 @@ def test_deploy_auth_ships_session_keys_json_and_legacy_switch_without_values():
     env_block = src[src.index("def lambda_env"):src.index("def main()")]
     assert '"SESSION_KEYS_JSON"' in env_block and '"LEGACY_ENTRY"' in env_block
     assert '"secret"' not in env_block and "token_hex" not in env_block, "环境变量里只能有参数名"
+
+
+def test_deploy_auth_ships_the_signer_switch_from_config_not_a_literal():
+    """3c-1B：`SESSION_SIGNER` 必须下发，且值来自 [SessionKeys] signer。
+
+    漏下发的后果是 handler 的 `_signer_mode()` 抛 → 每次 /callback 与 /console-session 都 500
+    （响亮，这是有意的）；写成字面量的后果是配置与线上分叉——改 config 重部却没变，
+    而回滚协议整个建立在"改一行配置重部"上。
+    """
+    import sys
+    sys.path.insert(0, str(Path(__file__).parents[1]))
+    import deploy_auth as da
+    src = (Path(__file__).parents[1] / "deploy_auth.py").read_text()
+    env_block = src[src.index("def lambda_env"):src.index("def main()")]
+    assert '"SESSION_SIGNER": keys.signer' in env_block, "signer 不是从 [SessionKeys] 取的"
+    assert da.lambda_env()["Variables"]["SESSION_SIGNER"] in ("legacy", "current")
 
 
 def test_deploy_auth_legacy_param_has_one_source_of_truth():

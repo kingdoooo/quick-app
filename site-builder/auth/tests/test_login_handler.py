@@ -1,5 +1,7 @@
 import json
 from unittest.mock import patch
+
+import pytest
 import login_handler as lh
 
 ENV = {"JWT_SECRET": "s3cret", "COGNITO_DOMAIN": "https://sso.auth.us-east-1.amazoncognito.com",
@@ -9,7 +11,11 @@ ENV = {"JWT_SECRET": "s3cret", "COGNITO_DOMAIN": "https://sso.auth.us-east-1.ama
        "LOGIN_FLOW_SECRET_PARAM": "/site-builder/login-flow-secret",
        # 3c-1A：两个 family 的 kid 清单（只有参数名）与 legacy 入口开关；值由 _ssm 的假件按参数名给
        "SESSION_KEYS_JSON": '{"site": [{"kid": "site-hs-v1", "alg": "HS256", "role": "current", "ssm_param": "/site-builder/session-keys/site-hs-v1"}], "console": [{"kid": "console-hs-v1", "alg": "HS256", "role": "current", "ssm_param": "/site-builder/session-keys/console-hs-v1"}]}',
-       "LEGACY_ENTRY": "on"}
+       "LEGACY_ENTRY": "on",
+       # 3c-1B：签发形态开关。**ENV 里是 legacy**，所以下面既有的用例全部是"1A 前的字节级形态"
+       # 这一侧的基线；新形态用例自己用 ENV_CURRENT（= dict(ENV, SESSION_SIGNER="current")）。
+       "SESSION_SIGNER": "legacy"}
+ENV_CURRENT = dict(ENV, SESSION_SIGNER="current")
 from conftest import CONSOLE_KID_SECRET, SITE_KID_SECRET  # 假 SSM 在 conftest 的 autouse 夹具里，值只定义一处
 
 
@@ -737,3 +743,145 @@ def test_console_session_logs_verify_outcome_without_token(monkeypatch, capsys):
     rows = [json.loads(l) for l in out.splitlines() if l.startswith("{") and "session_verify" in l]
     assert rows and rows[-1]["outcome"] == "accepted_current" and rows[-1]["verifier"] == "auth"
     assert tok.split(".")[1] not in out
+
+
+# ---- 3c-1B：signer 开关（spec §11.8.3 / §11.4）------------------------------------------
+#
+# 断言的是**外部可见形态**：Set-Cookie 里 token 的 JOSE 头与 payload 的**精确 claim 集合**、
+# Location 里升级码的头与 claims。不数内部调用次数。
+# 两侧都测：`current` 是本票要落地的形态，`legacy` 是"1A 前字节级不变"的基线——只测新形态的话，
+# 一个把 legacy 分支顺手改坏的改动会在 ③ 切换前的那次部署（开关仍是 legacy）里把线上全打挂。
+
+def _b64d(seg: str) -> dict:
+    import base64
+    return json.loads(base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)))
+
+
+def _session_cookie(r) -> str:
+    return next(c for c in r["cookies"] if c.startswith("sb_session=")).split(";")[0][len("sb_session="):]
+
+
+def _do_callback(env, *, email="a@x.com", name="Alice", idp="Feishu",
+                 auth_via="TokenGeneration_HostedAuth"):
+    """走真的 /login → /callback（state 与 PKCE cookie 都是真的），只 patch code 交换。"""
+    user = {"email": email, "name": name, "idp": idp, "auth_via": auth_via}
+    with patch.dict(lh.os.environ, env), patch.object(lh, "_exchange_code", return_value=user):
+        r_login = lh.handler(_event("/login", {"redirect": "https://app-x.example.com/"}), None)
+        import urllib.parse as up
+        state = up.unquote(r_login["headers"]["Location"].split("state=")[1].split("&")[0])
+        pkce = next(c for c in r_login["cookies"] if c.startswith(lh.PKCE_COOKIE)).split(";")[0]
+        return lh.handler(_event("/callback", {"code": "abc", "state": state}, cookies=[pkce]), None)
+
+
+def test_callback_signs_the_site_session_with_the_site_current_kid_when_signer_is_current():
+    r = _do_callback(ENV_CURRENT)
+    header, payload, _ = _session_cookie(r).split(".")
+    assert _b64d(header) == {"alg": "HS256", "typ": "JWT", "kid": "site-hs-v1"}
+    claims = _b64d(payload)
+    # §11.4 的站点会话表：**精确**这 8 个键，不多不少（多出 typ/scope 说明混了旧合同）
+    assert set(claims) == {"token_use", "aud", "email", "name", "idp", "auth_via", "exp", "iat"}
+    assert claims["token_use"] == "site-session" and claims["aud"] == "site-edge"
+    assert (claims["email"], claims["name"]) == ("a@x.com", "Alice")
+    assert (claims["idp"], claims["auth_via"]) == ("Feishu", "TokenGeneration_HostedAuth")
+    assert claims["exp"] - claims["iat"] == lh.SESSION_TTL_SECONDS
+
+
+def test_callback_cookie_max_age_matches_the_token_exp_in_both_signer_modes():
+    """cookie 比 token 短会莫名重登，长会 302 回登录看起来像"会话丢了"——同一个常量供两处。"""
+    for env in (ENV, ENV_CURRENT):
+        r = _do_callback(env)
+        cookie = next(c for c in r["cookies"] if c.startswith("sb_session="))
+        assert f"Max-Age={lh.SESSION_TTL_SECONDS}" in cookie
+        payload = _b64d(_session_cookie(r).split(".")[1])
+        assert payload["exp"] - int(payload.get("iat", payload["exp"] - lh.SESSION_TTL_SECONDS)) \
+            == lh.SESSION_TTL_SECONDS
+
+
+def test_callback_signature_is_the_site_family_key_not_the_legacy_one():
+    """负向：新形态必须用 site family 的 key 签。用 legacy 密钥验必不过。"""
+    import session
+    token = _session_cookie(_do_callback(ENV_CURRENT))
+    al = {"site-hs-v1": {"alg": "HS256", "secret": SITE_KID_SECRET, "role": "current"}}
+    claims, outcome = session.verify_token(token, allowlist=al, token_use="site-session")
+    assert claims and outcome == "accepted_current"
+    wrong = {"site-hs-v1": {"alg": "HS256", "secret": ENV["JWT_SECRET"], "role": "current"}}
+    assert session.verify_token(token, allowlist=wrong, token_use="site-session") == (None, "bad_signature")
+
+
+def test_callback_keeps_the_legacy_wire_form_byte_for_byte_when_signer_is_legacy():
+    """1A 前的形态：头里**没有 kid**，payload 是旧合同（typ=session、无 aud/iat/token_use）。"""
+    import session
+    token = _session_cookie(_do_callback(ENV))
+    header, payload, _ = token.split(".")
+    assert _b64d(header) == {"alg": "HS256", "typ": "JWT"}
+    claims = _b64d(payload)
+    assert set(claims) == {"typ", "email", "name", "exp", "idp", "auth_via"}
+    assert claims["typ"] == session.SESSION_TYP
+    assert session.verify_session_jwt(token, ENV["JWT_SECRET"],
+                                      expected_typ=session.SESSION_TYP)["email"] == "a@x.com"
+
+
+def test_console_session_signs_the_upgrade_code_with_the_console_current_kid():
+    with patch.dict(lh.os.environ, ENV_CURRENT):
+        r = _console_session([f"sb_session={_kid_session()}"])
+    code = _issued_code(r)
+    assert code, "有效站点会话竟然没换出升级码"
+    header, payload, _ = code.split(".")
+    # console family——**不是** site：升级码投给 Edge 必拒，这正是拆 family 想要的性质
+    assert _b64d(header) == {"alg": "HS256", "typ": "JWT", "kid": "console-hs-v1"}
+    claims = _b64d(payload)
+    # §11.4 的升级码表：精确这 6 个键；jti 少了就拆掉 panel 的原子消费与并发重放保护
+    assert set(claims) == {"token_use", "aud", "email", "jti", "exp", "iat"}
+    assert claims["token_use"] == "console-upgrade" and claims["aud"] == "console-exchange"
+    assert claims["email"] == "u@x.com" and claims["jti"]
+    assert 0 < claims["exp"] - claims["iat"] <= 60
+
+
+def test_console_session_upgrade_code_verifies_under_the_console_family_key_only():
+    import session
+    with patch.dict(lh.os.environ, ENV_CURRENT):
+        code = _issued_code(_console_session([f"sb_session={_kid_session()}"]))
+    ok = {"console-hs-v1": {"alg": "HS256", "secret": CONSOLE_KID_SECRET, "role": "current"}}
+    claims, outcome = session.verify_token(code, allowlist=ok, token_use="console-upgrade")
+    assert claims and outcome == "accepted_current"
+    site = {"site-hs-v1": {"alg": "HS256", "secret": SITE_KID_SECRET, "role": "current"}}
+    assert session.verify_token(code, allowlist=site, token_use="console-upgrade") == (None, "unknown_kid")
+
+
+def test_console_session_keeps_the_legacy_upgrade_code_form_when_signer_is_legacy():
+    import session
+    with patch.dict(lh.os.environ, ENV):
+        code = _issued_code(_console_session([f"sb_session={_kid_session()}"]))
+    header, payload, _ = code.split(".")
+    assert _b64d(header) == {"alg": "HS256", "typ": "JWT"}
+    assert set(_b64d(payload)) == {"typ", "email", "jti", "exp"}
+    assert session.verify_upgrade_code(code, ENV["JWT_SECRET"])["email"] == "u@x.com"
+
+
+def test_console_session_verification_path_is_unchanged_by_the_signer_switch():
+    """「2 + 1」入口与逐候选验在 current 下一模一样（本票只改签发，不碰验签）。"""
+    import session
+    legacy = session.mint_session_jwt("u@x.com", "U", ENV["JWT_SECRET"])
+    with patch.dict(lh.os.environ, ENV_CURRENT):
+        # ① legacy 入口开着 ⇒ 旧 cookie 仍能换码；② 遮蔽项排在前面仍逐个验；③ 篡改的必拒
+        assert _issued_code(_console_session([f"sb_session={legacy}"]))
+        assert _issued_code(_console_session([f"sb_session={SHADOW}", f"sb_session={_kid_session()}"]))
+        bad = session.mint_session_jwt("u@x.com", "U", "wrong-secret")
+        assert not _issued_code(_console_session([f"sb_session={bad}"]))
+
+
+@pytest.mark.parametrize("bad", [None, "", "on", "Current", "true"],
+                         ids=["missing", "empty", "on", "Current", "true"])
+def test_missing_or_illegal_session_signer_fails_loudly_instead_of_signing(bad):
+    """缺/错开关必须抛（→ 500），不许静默按某一侧签：签错形态是 26 小时后才现形的静默故障。
+
+    `bad=None` 表示变量整个缺失——ENV 只经 `patch.dict` 注入，从 dict 里去掉即等于线上漏下发。
+    """
+    env = {k: v for k, v in ENV.items() if k != "SESSION_SIGNER"}
+    if bad is not None:
+        env["SESSION_SIGNER"] = bad
+    with pytest.raises(RuntimeError, match="SESSION_SIGNER"):
+        _do_callback(env)
+    with patch.dict(lh.os.environ, env):
+        with pytest.raises(RuntimeError, match="SESSION_SIGNER"):
+            _console_session([f"sb_session={_kid_session()}"])

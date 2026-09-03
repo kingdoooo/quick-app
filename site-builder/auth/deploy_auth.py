@@ -152,7 +152,11 @@ def lambda_env() -> dict:
         # 3c-1A：两个 family 的 kid 清单（**只有参数名**，值运行时按参数名读 SSM）与 legacy 入口开关。
         # 形态由 auth/session_keys.py 唯一定义；panel 的那份只含 console（各自 verifier 各自的 allowlist）。
         "SESSION_KEYS_JSON": env_json(keys, ("site", "console")),
-        "LEGACY_ENTRY": legacy_entry(keys)}}
+        "LEGACY_ENTRY": legacy_entry(keys),
+        # 3c-1B：签发形态开关（spec §11.8.3）。真源是 [SessionKeys] signer；回滚 = 改那一行重跑
+        # 本脚本（先 panel 后 auth）。verify_deployed_components 按"env 整体 == lambda_env()"
+        # 比对，所以这一项自动入闸，不需要在那边点名。
+        "SESSION_SIGNER": keys.signer}}
 
 
 def required_parameters() -> list:

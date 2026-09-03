@@ -10,6 +10,7 @@ schema 见 spec §11.6，HS 与 RS 两阶段共用：
     [SessionKeys]
     site_current = site-hs-v1        console_current = console-hs-v1
     site_previous =                  console_previous =
+    signer = legacy | current
     legacy_param = /site-builder/jwt-secret
     login_flow_secret_param = /site-builder/login-flow-secret
 
@@ -25,6 +26,13 @@ kid 格式 `{family}-{hs|rs}-v{n}`：family 前缀必须与所属 family 一致�
 ——那个开关只有 deploy_auth 打开，panel 与 Edge 永不持有它。它不许落在 session-keys 前缀下
 （长得像一把 family 密钥会误导闸门与读代码的人），也不许与 legacy / 任何 HS 行同一参数：
 拿会话密钥签登录流程数据正是 1B 要消灭的那条耦合。
+
+`signer`（3c-1B，spec §11.8.3）决定 **签发**形态：`legacy` = 拆 family 之前那把共享密钥 + 旧
+合同；`current` = 各 family 的 role=current 那把 + `mint_token` 新合同。它下发为 auth 与 panel 的
+`SESSION_SIGNER` 环境变量（**panel 侧随 3c-1B 的 05 号任务落地**；在那之前 deploy_panel 不下发它、
+panel 无条件签 legacy 形态），**回滚就是改这一行重跑两个部署脚本**（不回退代码，免得连带回滚同批的
+其它改动）。验签侧与它无关：verifier 全程双接受，所以切换与回滚都不需要动 Edge。
+缺键或写别的值是配置错，硬失败——给默认值等于让"没写 signer"静默变成某一种签发形态。
 """
 from __future__ import annotations
 
@@ -34,6 +42,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 KID_RE = re.compile(r"^(site|console)-(hs|rs)-v(\d+)$")
+SIGNER_MODES = ("legacy", "current")
 HS_PARAM_PREFIX = "/site-builder/session-keys/"
 ALGS = {"hs": "HS256", "rs": "RS256"}
 FAMILIES = ("site", "console")
@@ -59,6 +68,7 @@ class SessionKeys:
     families: dict            # family -> {"current": KeyRef, "previous": KeyRef | None}
     legacy_param: str
     login_flow_secret_param: str   # auth 私有；不是 kid、不属于任何 family（见模块 docstring）
+    signer: str                    # "legacy" | "current"（见模块 docstring）
 
     def allowlist(self, family: str) -> tuple[KeyRef, ...]:
         """该 family 的接受集合，current 在前。**不含 legacy**：legacy 是 family 外的第三入口。"""
@@ -121,8 +131,19 @@ def load_session_keys(config_path: Path) -> SessionKeys:
                     raise SessionKeysError(f"kid {r.kid} 出现在两个 family")
                 seen.add(r.kid)
         families[fam] = refs
+    signer = _strip(cfg.get("SessionKeys", "signer", fallback=""))
+    if signer not in SIGNER_MODES:
+        raise SessionKeysError(
+            f"[SessionKeys] signer={signer!r} 必须是 {' 或 '.join(SIGNER_MODES)}（3c-1B 起必填）"
+            "——缺键也是配置错，不给默认值：默认哪一侧都会让「忘了写」静默变成一种签发形态")
     legacy = _strip(cfg.get("SessionKeys", "legacy_param", fallback=""))
+    if signer == "legacy" and not legacy:
+        raise SessionKeysError(
+            "[SessionKeys] signer=legacy 要求 legacy_param 非空——legacy 入口关闭后再签 legacy 形态"
+            "等于签一批没人接受的 token（全员登录循环）")
     if not legacy:
+        # 3c-1B 的 07 号任务把这条放开为「legacy_param 为空即要求 signer=current」（L3）；
+        # 在那之前清空它会让 Edge/panel 的 legacy 入口与角色 SSM 清单一起变，属于另一票的范围。
         raise SessionKeysError("[SessionKeys] 缺 legacy_param（3c-3 之前必填）")
     login_flow = _strip(cfg.get("SessionKeys", "login_flow_secret_param", fallback=""))
     if not login_flow:
@@ -143,7 +164,7 @@ def load_session_keys(config_path: Path) -> SessionKeys:
             f"[SessionKeys] login_flow_secret_param={login_flow!r} 与一把会话密钥同一参数"
             "——登录流程的 HMAC 不得复用会话密钥（spec §11.3）")
     return SessionKeys(families=families, legacy_param=legacy,
-                       login_flow_secret_param=login_flow)
+                       login_flow_secret_param=login_flow, signer=signer)
 
 
 def env_json(keys: SessionKeys, families: tuple) -> str:
