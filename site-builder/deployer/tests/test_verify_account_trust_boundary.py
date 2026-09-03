@@ -91,7 +91,11 @@ _GRANT_RE = re.compile(
     r"(?:invoke-platform|replace-platform-code)(?:@alias|@version)?:[A-Za-z0-9._-]+"
     r"|invoke-site(?:@alias|@version)?:(?:all|some\(\d+\):" + _FP_RE + r")"
     r"|read-edge-code|read-edge-asset|read-jwt-param"
-    r"|read-session-key:(?:site|console)-(?:hs|rs)-v\d+")   # 3c-1A：每 kid 一条
+    r"|read-session-key:(?:site|console)-(?:hs|rs)-v\d+"    # 3c-1A：每 kid 一条
+    # 3c-1B：login-flow secret 的读取者。**它刻意不进 `is_secret_grant()`**（读到它只值一个
+    # 登录 CSRF，不是冒充面），但它照样是一条 grant，所以必须在文法里——2026-09-03 首次真机
+    # 执行 runbook ② 时，基线第一次带上它，这条文法守卫就红了（ticket 06 加了常量却没加文法）。
+    r"|read-login-flow-secret")
 
 
 def _is_grant(value: str) -> bool:
@@ -2053,6 +2057,8 @@ def test_a_grant_carrying_an_arn_is_caught():
     """**元用例**：往 grant 里注入 ARN / 拼接垃圾 / legacy 串，都必须被文法拒绝。"""
     for bad in (f"invoke-platform:arn:aws:iam::{_ACCT}:role/X",
                 "read-jwt-param-and-then-some",
+                "read-login-flow-secret-x",          # 3c-1B：新增那一支同样不许前缀匹配放水
+                "read-login-flow",
                 "iam-policy-write:any",
                 "invoke-site:some(1):notafingerprint",
                 "invoke-site:some(1)"):
@@ -2060,6 +2066,7 @@ def test_a_grant_carrying_an_arn_is_caught():
     # 正对照：真实形态必须过
     for ok in ("invoke-platform:site-panel", "invoke-platform@version:site-access-rollup",
                "invoke-site:all", "invoke-site@alias:all", "read-edge-asset",
+               "read-login-flow-secret",             # 3c-1B
                "invoke-site:some(2):aaaa-bbbb-cccc-dddd"):
         assert _GRANT_RE.fullmatch(ok), f"文法误拒了 {ok!r}"
 

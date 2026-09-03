@@ -467,6 +467,28 @@ python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump "$DUMP
 > （"基线里记过的 kid"那一支是 ⑩ 必需的：退役的动作正是把 kid 从 config 删掉再重部，而 grant
 > 的丢失只有重部之后才出现 ⇒ 到能声明的时刻 config 已经不含它了。打错一个字仍然硬失败。）
 >
+> ⚠️ **每一次密钥增减都会让闸门在 `new_undecided_items` 上红，这是结构性的、不是漂移。**
+> 2026-09-03 首次执行 ② 时实测：305 条红「新增判不出的项」，**同时** 305 条绿「这一项已能
+> 判定」，`undecided_items: 774 → 774（+0）`。机制在 `undecided_members()` 的 docstring 里
+> 就是刻意设计——成员指纹 = `(principal, 动作等价类, 判不出的**资源类集合**)`，**集合整体进
+> 指纹**（为的是"多出一个精确平台函数照样红"）。于是新增一个 SSM 参数会让每个 SSM 读被
+> Condition 挡住的 principal 的资源类集合多一项 ⇒ 旧指纹消失、新指纹出现。
+> **`--new-key` / `--retire-key` 只把 `gained` / `lost` 的 grant 送进迁移桶，coverage churn
+> 没有迁移通道**，所以不要按"闸门必须全绿"验收这几步。**良性 churn 的五条判据**（全中才算
+> 良性，任一条不成立就是真漂移，停下来查）：
+>
+> 1. `undecided_items` 的总量 delta 是 `+0`（或 ≤ 本轮声明的 key 数所能解释的量）；
+> 2. 红的条数 == 绿「已能判定」的条数（1:1 置换）；
+> 3. 迁移分节**只**含本轮声明的 label；
+> 4. 其余红字段（`new_grants` / `missing_required` / `new_statements` /
+>    `bucket_policy_drift` / `iam_write_drift` / `boundary_drift` / `console_key_in_edge`）
+>    **一条都没有**；
+> 5. facts 与基线一致（`edge_*_carrying_live_key`、`principals_with_missing_context`、
+>    `session_keys` 各行）。
+>
+> 真修复（让被声明的资源类不参与 coverage 指纹）是独立设计面：它会永久让该资源类在 coverage
+> 维度上失明，需要自己的不变量与用例，**没有排期**。
+>
 > ⚠️ **C2 的时机是这套流程最容易做错的一步。** 被声明的 grant delta 分两批出现：
 > `ensure_session_keys.py` 建出参数**只**改变"通配前缀的宽读者能读到什么"，而 auth/panel 上
 > 那条**精确 ARN** 的 grant 要等各自的部署脚本收敛策略之后才存在。所以 ② 与 ⑥ 的闸门要跑
