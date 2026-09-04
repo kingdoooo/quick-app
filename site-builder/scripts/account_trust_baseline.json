@@ -12,18 +12,18 @@
     "unclassified"
   ],
   "facts": {
-    "edge_code_targets_carrying_live_key": 11,
+    "edge_code_targets_carrying_live_key": 10,
     "session_keys": {
       "site-hs-v1": {
-        "edge_code_targets_carrying_key": 2,
-        "edge_assets_carrying_key": 1
+        "edge_code_targets_carrying_key": 3,
+        "edge_assets_carrying_key": 2
       },
       "console-hs-v1": {
         "edge_code_targets_carrying_key": 0,
         "edge_assets_carrying_key": 0
       }
     },
-    "edge_assets_carrying_live_key": 10,
+    "edge_assets_carrying_live_key": 11,
     "principals_with_missing_context": 162
   },
   "coverage": {
@@ -1883,7 +1883,6 @@
     "c070-1e84-e2b0-3b1c": {
       "category": "platform",
       "grants": [
-        "read-jwt-param",
         "read-login-flow-secret",
         "read-session-key:console-hs-v1",
         "read-session-key:site-hs-v1"
@@ -1907,7 +1906,6 @@
       "category": "platform",
       "grants": [
         "invoke-platform:site-deployer-undeploy",
-        "read-jwt-param",
         "read-session-key:console-hs-v1"
       ]
     },

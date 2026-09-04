@@ -55,10 +55,16 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 | **A 直接失守** | 具备非 IAM-write 敏感授权的 principal | 61 <!-- baseline:A总数=61 --> |
 | | 其中**能取得会话签名密钥**的 | 56 <!-- baseline:可读密钥=56 --> |
 | | 其中**非平台**身份可直接 `lambda:InvokeFunction` 平台或站点函数的 | 18 <!-- baseline:非平台可直调=18 --> |
-| | Edge 函数里仍带着当前有效密钥的**代码目标**（未限定 + 已发布版本） | 11 <!-- baseline:带活密钥的Edge代码目标=11 --> |
-| | CDK bootstrap 桶里仍带着**当前有效**密钥的 asset 对象 | 10 <!-- baseline:带活密钥的asset=10 --> |
+| | Edge 函数里仍带着 **legacy** 密钥的**代码目标**（历史已发布版本；L3 起 `$LATEST` 与新版本不再带） | 10 <!-- baseline:带活密钥的Edge代码目标=10 --> |
+| | CDK bootstrap 桶里仍带着**任一**活密钥（legacy ∪ 各 kid，取并集）的 asset 对象 | 11 <!-- baseline:带活密钥的asset=11 --> |
 | **B IAM 写观察** | 持有相关 IAM 策略变更语句的 principal | 22 <!-- baseline:B持有IAM写语句=22 --> |
 | | 其中**不在 A 里**（只有 IAM 写、**未证明可提权**） | 4 <!-- baseline:仅IAM写=4 --> |
+
+> **两个产物计数的口径不同，且每次 Edge 部署都会动**（2026-09-04 ⑤ L3 实测：代码目标 11→10、asset 10→11）：
+> 代码目标那行只数 **legacy** 密钥（`facts.edge_code_targets_carrying_live_key`），L3 让 `$LATEST` 不再带它，
+> 历史版本仍带 ⇒ 减 1 不归零，真正清零归 3c-3 删参数；asset 那行是**并集**（跨 legacy 与全部 kid），
+> 每次 Edge 部署新出的 asset 都带 current kid 的值 ⇒ 每部一次加 1。每 kid 的单列计数在
+> `facts.session_keys`。两个数都**不参与红绿**（`_compare_facts` 只报 delta），读它们时要能用当次动作解释。
 
 > **A + B 的并集是 65，但那个数不是 headline。** A 是"现在就能拿到密钥或直接调用平台
 > 函数"；B 只是"持有一条可能影响 IAM 策略的语句"，本闸门**明确不证明**它构成提权链

@@ -495,8 +495,12 @@ python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump "$DUMP
 > 4. 其余红字段（`new_grants` / `missing_required` / `new_statements` /
 >    `bucket_policy_drift` / `iam_write_drift` / `boundary_drift` / `console_key_in_edge`）
 >    **一条都没有**；
-> 5. facts 与基线一致（`edge_*_carrying_live_key`、`principals_with_missing_context`、
->    `session_keys` 各行）。
+> 5. facts 的每条 delta 都能被**本步的动作**解释（`principals_with_missing_context` 与基线一致；
+>    含 Edge 部署的步骤里 `edge_assets_carrying_live_key`（**并集**，跨全部活密钥）与
+>    `session_keys.<current kid>` 两项各 **+1**——新版本/新 asset 带着 current kid 的值，这是
+>    `_compare_facts` 的 docstring 写明的"每次 Edge 部署就多一个"；⑤ 另有 legacy 代码目标 **−1**，
+>    因为 `$LATEST` 从此不再带那个值）。对不上的 delta 才是漂移。facts 本身不参与红绿，所以
+>    这一条要**人读**，闸门 exit 0 不代替它。
 >
 > 真修复（让被声明的资源类不参与 coverage 指纹）是独立设计面：它会永久让该资源类在 coverage
 > 维度上失明，需要自己的不变量与用例，**没有排期**。
@@ -660,7 +664,7 @@ python3 site-builder/scripts/session_verify_counts.py --hours 26 --require-total
 | **配置** | `[SessionKeys] legacy_param =`（**清空**。一处配置三处后果：`legacy_entry()` 变 off、auth/panel 不再下发 `JWT_SECRET_PARAM` 且角色 SSM 精确清单不含它、router 栈给 Edge 注入空串）|
 | **动作** | 片段 A 的 auth → 片段 A 的 panel → 片段 B 的 Edge |
 | **硬停止点** | 两枚预存的 legacy token：`site-session` 打站点必 **302**、`console-upgrade` 打 panel 必 **401**，日志 outcome 是 `unknown_kid`（不是 `expired`）|
-| **闸门** | `--retire-key legacy`。预期 delta：auth/panel 的执行角色**丢掉** legacy 参数的读权限（落 `migration_grants`，绿）；**宽读者的数量不变**——他们靠的是通配前缀，L3 不动那件事。⚠️ **别指望任何计数归零**：legacy 的产物计数是 `facts.edge_code_targets_carrying_live_key` / `edge_assets_carrying_live_key`（**不在** `facts.session_keys` 里——那个只按 kid 记，legacy 不是 kid），而 L3 只让**新**部署的 Edge 版本不再带那个值；已存在的历史版本与 bootstrap asset 仍带着它，所以这两个数**不会**变 0。真正的清零归 3c-3 删参数 |
+| **闸门** | `--retire-key legacy`。预期 delta：auth/panel 的执行角色**丢掉** legacy 参数的读权限（落 `migration_grants`，绿）；**宽读者的数量不变**——他们靠的是通配前缀，L3 不动那件事。⚠️ **别指望任何计数归零**：legacy 的产物计数是 `facts.edge_code_targets_carrying_live_key` / `edge_assets_carrying_live_key`（**不在** `facts.session_keys` 里——那个只按 kid 记，legacy 不是 kid），而 L3 只让**新**部署的 Edge 版本不再带那个值；已存在的历史版本与 bootstrap asset 仍带着它，所以这两个数**不会**变 0。真正的清零归 3c-3 删参数。**2026-09-04 实测**：本步**没有** `new_undecided_items` 的 churn（`774 → 774`、红条 0）——churn 来自 SSM 参数的**增删**改变了宽读者的资源类集合，而 L3 只收 grant、参数本体还在；churn 会在 ⑩ 真删参数时才出现。facts 实测：legacy 代码目标 11→10（`$LATEST` 不再带）、asset 并集 10→11、`site-hs-v1` 代码目标 2→3 / asset 1→2（版本 11 与它的 asset） |
 | **回滚** | `legacy_param` 填回去 → 重部 auth + panel + Edge。**参数本体没删，所以这条路是通的**（参数与代码分支由 3c-3 删除）|
 
 ```bash
