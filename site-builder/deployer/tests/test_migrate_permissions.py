@@ -332,24 +332,11 @@ def _edge_requires_login(raw_require_auth: dict) -> bool:
     落到 `_UNKNOWN`（`__bool__` 为真，倒向更严）。手抄这条规则就等于维护一份
     简化副本，所以这里做占位符替换后直接 import 那个文件。
     """
-    import importlib.util
-    import tempfile
-
-    root = Path(__file__).parents[3]
-    src = (root / "router" / "infrastructure" / "lambda"
-           / "origin_request.py").read_text()
-    for k, v in {"{{DYNAMODB_TABLE_NAME}}": "t", "{{DYNAMODB_REGION}}": "us-east-1",
-                 "{{FRONTEND_BUCKET_DOMAIN}}": "b.s3.us-east-1.amazonaws.com",
-                 "{{JWT_SECRET}}": "test-secret", "{{SITE_ALLOWLIST_JSON}}": '{"site-hs-v1": {"alg": "HS256", "secret": "test-secret", "role": "current"}}', "{{LEGACY_ENTRY}}": "on", "{{BASE_DOMAIN}}": "example.com",
-                 "{{REQUIRE_IDP_CLAIM}}": "true",
-                 "{{TRUSTED_IDPS}}": "Feishu"}.items():
-        src = src.replace(k, v)
-    with tempfile.TemporaryDirectory() as d:
-        p = Path(d) / "_edge_for_parity.py"
-        p.write_text(src)
-        spec = importlib.util.spec_from_file_location("_edge_for_parity", p)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
+    # 替换表的唯一定义在 router/…/lambda/edge_substitutions.py（ticket 22）：
+    # 手抄一份的后果是 origin_request.py 新增注入点时，本套件以看不出原因的方式失败。
+    sys.path.insert(0, str(Path(__file__).parents[3] / "router" / "infrastructure" / "lambda"))
+    import edge_substitutions as es
+    mod = es.load_edge_module("_edge_for_parity", TRUSTED_IDPS="Feishu")
     item = {"require_auth": raw_require_auth} if raw_require_auth else {}
     return mod._deser(item).get("require_auth") is not False
 

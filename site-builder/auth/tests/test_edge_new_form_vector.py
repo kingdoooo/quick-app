@@ -36,14 +36,12 @@ EDGE_SRC_PATH = AUTH.parents[1] / "router" / "infrastructure" / "lambda" / "orig
 # Edge 的 allowlist 里**只有 site family**（spec §4.1）；secret 与 conftest 假 SSM 给 auth 的
 # 那把是同一个值——跨组件向量的全部意义就在于两侧对同一把 key 达成一致。
 EDGE_ALLOWLIST = {"site-hs-v1": {"alg": "HS256", "secret": SITE_KID_SECRET, "role": "current"}}
-EDGE_SUBS = {"{{DYNAMODB_TABLE_NAME}}": "t", "{{DYNAMODB_REGION}}": "us-east-1",
-             "{{FRONTEND_BUCKET_DOMAIN}}": "b.s3.us-east-1.amazonaws.com",
-             "{{JWT_SECRET}}": ENV["JWT_SECRET"], "{{BASE_DOMAIN}}": "example.com",
-             "{{REQUIRE_IDP_CLAIM}}": "true", "{{TRUSTED_IDPS}}": "Feishu,Okta",
-             "{{ACCESS_TABLE}}": "site-access-events",
-             "{{ACCESS_REPLICA_REGIONS}}": "us-east-1",
-             "{{SITE_ALLOWLIST_JSON}}": json.dumps(EDGE_ALLOWLIST),
-             "{{LEGACY_ENTRY}}": "on"}
+# 替换表的唯一定义在 router/…/lambda/edge_substitutions.py（ticket 22）；本文件只覆盖
+# 跨组件向量真正关心的两项：与 auth 假 SSM 同一把 site key，以及 legacy 密钥同 ENV。
+sys.path.insert(0, str(EDGE_SRC_PATH.parent))
+import edge_substitutions as es  # noqa: E402
+EDGE_OVERRIDES = {"JWT_SECRET": ENV["JWT_SECRET"], "SITE_ALLOWLIST_JSON": json.dumps(EDGE_ALLOWLIST),
+                  "LEGACY_ENTRY": "on"}
 
 ROUTE = {"subdomain": "app-x", "site_id": "x", "static_prefix": "sites/x", "api_target": "",
          "require_auth": True, "allowed_users": "org", "owner": "o@example.test"}
@@ -62,16 +60,8 @@ def _load_from_source(name: str, src: str, tmp_path: Path):
 
 @pytest.fixture
 def edge(tmp_path):
-    src = EDGE_SRC_PATH.read_text()
-    for k, v in EDGE_SUBS.items():
-        src = src.replace(k, v)
-    import re
-    left = sorted(set(re.findall(r"\{\{[A-Z_]+\}\}", src)))
-    assert not left, (
-        f"Edge 源码里还有没替换的占位符 {left}：origin_request.py 新增了注入项，"
-        "把它加进本文件的 EDGE_SUBS。**不补的后果不是假红而是假绿**——带 {{…}} 的模块照样能 import，"
-        "只有验签相关的那几个才会让向量变红。")
-    return _load_from_source("_edge_new_form_vector_testable", src, tmp_path)
+    """替换与残留断言都在 helper 里（含数字的占位符也能抓，旧正则 `[A-Z_]+` 抓不到）。"""
+    return _load_from_source("_edge_new_form_vector_testable", es.edge_source(**EDGE_OVERRIDES), tmp_path)
 
 
 def _edge_allows(edge_mod, token: str) -> bool:

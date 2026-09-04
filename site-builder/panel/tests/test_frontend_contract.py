@@ -16,7 +16,7 @@ Step 3 的真机 E2E 覆盖，两者互补不重叠。
 import ast
 import configparser
 import re
-import types
+import sys
 from pathlib import Path
 
 import pytest
@@ -740,18 +740,12 @@ def _edge_module():
     记过三处"以为的 vs 实际的"，自己重写等于把假设复制一份，两边一起错时
     断言仍然是绿的。
     """
-    src = (REPO / "router" / "infrastructure" / "lambda"
-           / "origin_request.py").read_text()
-    for k, v in {"{{DYNAMODB_TABLE_NAME}}": "t", "{{DYNAMODB_REGION}}": "us-east-1",
-                 "{{FRONTEND_BUCKET_DOMAIN}}": "b.s3.us-east-1.amazonaws.com",
-                 "{{JWT_SECRET}}": "s", "{{SITE_ALLOWLIST_JSON}}": '{"site-hs-v1": {"alg": "HS256", "secret": "test-secret", "role": "current"}}', "{{LEGACY_ENTRY}}": "on", "{{BASE_DOMAIN}}": "example.com",
-                 "{{REQUIRE_IDP_CLAIM}}": "true",
-                 "{{TRUSTED_IDPS}}": "Feishu"}.items():
-        src = src.replace(k, v)
-    assert "{{" not in src.split("\n# ")[0], "还有未替换的占位符"
-    mod = types.ModuleType("_edge_for_frontend_contract")
-    exec(compile(src, "origin_request.py", "exec"), mod.__dict__)
-    return mod
+    # 替换表 + "无残留占位符"断言都在 router/…/lambda/edge_substitutions.py（ticket 22）。
+    # 原先这里那句 `"{{" not in src.split("\n# ")[0]` 只看第一段注释之前的文本，
+    # 而注入点大多在文件更靠后的位置 —— 等于几乎什么都没查。
+    sys.path.insert(0, str(REPO / "router" / "infrastructure" / "lambda"))
+    import edge_substitutions as es
+    return es.load_edge_module("_edge_for_frontend_contract", JWT_SECRET="s", TRUSTED_IDPS="Feishu")
 
 
 @pytest.mark.parametrize("uri,rel", [("/", "index.html"),

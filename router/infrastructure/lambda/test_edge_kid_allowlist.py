@@ -19,26 +19,18 @@ _AUTH = HERE.parents[2] / "site-builder" / "auth"
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(_AUTH))
 import session as auth_session  # noqa: E402
+import edge_substitutions as es  # noqa: E402
 
 SITE_V1, SITE_V0, CONSOLE_V1, LEGACY = "site-secret-v1", "site-secret-v0", "console-secret-v1", "test-secret"
 ALLOWLIST = {"site-hs-v1": {"alg": "HS256", "secret": SITE_V1, "role": "current"},
              "site-hs-v0": {"alg": "HS256", "secret": SITE_V0, "role": "previous"}}
-BASE_SUBS = {"{{DYNAMODB_TABLE_NAME}}": "t", "{{DYNAMODB_REGION}}": "us-east-1",
-             "{{FRONTEND_BUCKET_DOMAIN}}": "b.s3.us-east-1.amazonaws.com",
-             "{{JWT_SECRET}}": LEGACY, "{{BASE_DOMAIN}}": "example.com",
-             "{{REQUIRE_IDP_CLAIM}}": "true", "{{TRUSTED_IDPS}}": "Feishu,Okta",
-             "{{ACCESS_TABLE}}": "site-access-events",
-             "{{ACCESS_REPLICA_REGIONS}}": "us-east-1"}
-SRC = (HERE / "origin_request.py").read_text()
+# 替换表的唯一定义在 edge_substitutions（ticket 22）；这里只给本文件关心的那几项覆盖。
+SRC = es.EDGE_SRC_PATH.read_text()
 
 
 def _load(name: str, legacy_entry: str):
-    src = SRC
-    for k, v in dict(BASE_SUBS, **{"{{SITE_ALLOWLIST_JSON}}": json.dumps(ALLOWLIST),
-                                   "{{LEGACY_ENTRY}}": legacy_entry}).items():
-        src = src.replace(k, v)
-    (HERE / f"{name}.py").write_text(src)
-    return importlib.import_module(name)
+    return es.load_edge_module(name, write_to=HERE, JWT_SECRET=LEGACY,
+                               SITE_ALLOWLIST_JSON=json.dumps(ALLOWLIST), LEGACY_ENTRY=legacy_entry)
 
 
 orq = _load("_edge_kid_testable", "on")
@@ -218,15 +210,11 @@ def test_source_has_no_kid_derived_resource_paths():
 # 与线上完全同形的副本：空 JWT_SECRET + off。少了这一份的话，"空密钥被当成一把合法密钥"这类
 # 退化（`hmac.new(b"", …)` 照样能算出签名）在测试里看不见。
 def _reload_l3():
-    """把 `{{JWT_SECRET}}` 也换成空串——`_load` 用的是 BASE_SUBS 里的非空值。"""
-    src = SRC
-    subs = dict(BASE_SUBS, **{"{{SITE_ALLOWLIST_JSON}}": json.dumps(ALLOWLIST),
-                              "{{LEGACY_ENTRY}}": "off", "{{JWT_SECRET}}": ""})
-    for k, v in subs.items():
-        src = src.replace(k, v)
+    """把 `{{JWT_SECRET}}` 也换成空串（默认表里是非空值）。"""
+    src = es.edge_source(SITE_ALLOWLIST_JSON=json.dumps(ALLOWLIST), LEGACY_ENTRY="off", JWT_SECRET="")
     assert 'JWT_SECRET = ""' in src, "空替换没落到那一行——L3 的产物形态变了"
-    (HERE / "_edge_kid_l3_empty_testable.py").write_text(src)
-    return importlib.import_module("_edge_kid_l3_empty_testable")
+    return es.load_edge_module("_edge_kid_l3_empty_testable", write_to=HERE,
+                               SITE_ALLOWLIST_JSON=json.dumps(ALLOWLIST), LEGACY_ENTRY="off", JWT_SECRET="")
 
 
 orq_l3_empty = _reload_l3()
@@ -258,12 +246,8 @@ def _load_empty_secret_with_legacy_on():
 
     只用来证明下面那条依赖关系：安全性来自开关，不来自"密钥恰好是空的"。
     """
-    src = SRC
-    for k, v in dict(BASE_SUBS, **{"{{SITE_ALLOWLIST_JSON}}": json.dumps(ALLOWLIST),
-                                   "{{LEGACY_ENTRY}}": "on", "{{JWT_SECRET}}": ""}).items():
-        src = src.replace(k, v)
-    (HERE / "_edge_empty_secret_legacy_on_testable.py").write_text(src)
-    return importlib.import_module("_edge_empty_secret_legacy_on_testable")
+    return es.load_edge_module("_edge_empty_secret_legacy_on_testable", write_to=HERE,
+                               SITE_ALLOWLIST_JSON=json.dumps(ALLOWLIST), LEGACY_ENTRY="on", JWT_SECRET="")
 
 
 def test_the_safety_of_an_empty_secret_comes_from_the_switch_not_from_emptiness():
