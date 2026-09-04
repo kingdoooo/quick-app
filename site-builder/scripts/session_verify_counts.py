@@ -15,6 +15,12 @@ Edge 的组名前缀 `us-east-1.` 是 Lambda@Edge 的固定形态；区清单用
 用法（用不带路径的 python3，见 CLAUDE.md）：
     python3 site-builder/scripts/session_verify_counts.py --hours 1
     python3 site-builder/scripts/session_verify_counts.py --hours 24 --require-total   # 任一 verifier 为 0 即退 1
+    # 3c-1B ticket 18：判据本身也由脚本下，不把三列留给人读——⑨ 用 accepted_previous，④ 用 accepted_legacy
+    python3 site-builder/scripts/session_verify_counts.py --hours 26 --require-total --require-zero accepted_previous
+
+退出码：0 = 所有要求都满足；1 = 任一要求不满足（stderr 说明是哪条）；2 = 用法错误（如 --require-zero 打错词表外的 outcome）。
+**区级失败不静默**：Edge 日志组按 DescribeRegions 返回的（**已启用**）区逐个查，任一区 DescribeLogGroups 失败
+（AccessDenied / 限流 / 网络）即退出——静默跳过 = 少算一区 = `accepted_*` 假 0，而 ⑨ 守的是不可逆的 ⑩。
 """
 from __future__ import annotations
 
@@ -46,8 +52,11 @@ def edge_log_groups(session) -> list[tuple[str, str]]:
         logs = session.client("logs", region_name=region)
         try:
             groups = logs.describe_log_groups(logGroupNamePrefix=name)["logGroups"]
-        except Exception:      # 未启用的区 / 无权限：跳过，不是本脚本要判断的事
-            continue
+        except Exception as exc:  # noqa: BLE001
+            # DescribeRegions 默认只给**已启用**的区，所以到这里的失败都是 AccessDenied / 限流 / 网络，
+            # 不是"该区未启用"。静默跳过 = 这一区的 accepted_* 永远读成 0（3c-1B ticket 18 修）。
+            raise SystemExit(f"区 {region} 的 DescribeLogGroups 失败（{type(exc).__name__}: {exc}）——"
+                             f"少算一区就是 accepted_* 假 0，不出结论") from exc
         if any(g["logGroupName"] == name for g in groups):
             out.append((region, name))
     return out
@@ -58,6 +67,33 @@ def require_edge_groups(groups: list) -> list:
     if not groups:
         raise SystemExit(f"任何区都找不到 Edge 日志组 /aws/lambda/us-east-1.{EDGE_FN}——函数名或区枚举错了")
     return groups
+
+
+def nonzero_outcomes(by_verifier: dict, outcomes: list) -> list:
+    """要求为 0 的 outcome 里，任一 verifier 列 > 0 的那些；每条带三列读数，给 stderr 直接打。
+
+    ④/⑨ 的判据是"三列 accepted_legacy / accepted_previous 全 0"——原来由人读三列，脚本 exit 0 并不代表它。
+    """
+    out = []
+    for o in outcomes:
+        row = {v: by_verifier.get(v, {}).get(o, 0) for v in ("auth", "panel", "edge")}
+        if any(row.values()):
+            out.append(f"{o}: " + " ".join(f"{v}={n}" for v, n in row.items()))
+    return out
+
+
+def missing_outcome_columns(by_verifier: dict, outcomes: list) -> list:
+    """要求 > 0 的 outcome 里，有任一 verifier 列为 0 的那些（只列为 0 的列）。
+
+    "三列 accepted_current 全 > 0" 是判据的正面那半：证明新形态在**每处** verifier 都真的被接受过，
+    不能被别列的读数遮住。
+    """
+    out = []
+    for o in outcomes:
+        zero = [v for v in ("auth", "panel", "edge") if by_verifier.get(v, {}).get(o, 0) == 0]
+        if zero:
+            out.append(f"{o}: " + " ".join(f"{v}=0" for v in zero))
+    return out
 
 
 def silent_verifiers(by_verifier: dict) -> list:
@@ -125,15 +161,32 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--require-total", action="store_true",
                     help="任一 verifier 的总量为 0 即退 1（按 auth / panel / edge 分别看：证明每处埋点都在工作，"
                          "这是退役判据的另一半；Edge 列为 0 不能被 auth/panel 的总量遮住）")
+    ap.add_argument("--require-zero", action="append", default=[], metavar="OUTCOME", choices=OUTCOMES,
+                    help="该 outcome 在任一 verifier 列 > 0 即退 1（可重复）。⑨ 用 accepted_previous、④ 用 accepted_legacy："
+                         "这是退役判据的正面那半，脚本自己判，不留给人读三列")
+    ap.add_argument("--require-nonzero", action="append", default=[], metavar="OUTCOME", choices=OUTCOMES,
+                    help="该 outcome 在**每一**verifier 列都必须 > 0，否则退 1（可重复）。④/⑨ 用 accepted_current：证明新形态"
+                         "在三处都真的被接受过")
     args = ap.parse_args(argv)
     by_verifier = collect(boto3.Session(), args.hours)
     text, _total, _legacy = render(by_verifier)
     print(text)
+    rc = 0
     silent = silent_verifiers(by_verifier)
     if args.require_total and silent:
         print(f"这些 verifier 在窗口里没有任何 session_verify：{silent}——埋点没在工作，或窗口里没有请求", file=sys.stderr)
-        return 1
-    return 0
+        rc = 1
+    missing = missing_outcome_columns(by_verifier, args.require_nonzero)
+    if missing:
+        print("要求 > 0 的 outcome 有 verifier 列为 0：\n  " + "\n  ".join(missing)
+              + "\n——新形态没在这一处被接受过，先跑四个 verify_* 造流量再判", file=sys.stderr)
+        rc = 1
+    nonzero = nonzero_outcomes(by_verifier, args.require_zero)
+    if nonzero:
+        print("要求为 0 的 outcome 仍有读数（按 verifier 列）：\n  " + "\n  ".join(nonzero)
+              + "\n——窗口未排空，不许进下一步；按「最后一次出现 + 26 h」重排时刻", file=sys.stderr)
+        rc = 1
+    return rc
 
 
 if __name__ == "__main__":
