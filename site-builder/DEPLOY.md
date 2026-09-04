@@ -591,7 +591,7 @@ python3 site-builder/scripts/verify_account_trust_boundary.py --update-baseline
 |---|---|
 | **配置** | `[SessionKeys] signer = current`（**本 runbook 里这一行只改一次**）|
 | **动作** | 片段 A 的 panel **先**，auth **后**（`deploy_auth.py` 返回的时刻 = **T0**，记进 progress）。两者的 1B 代码都已在 ② 上线，本步**只**改 `SESSION_SIGNER` 一个变量 |
-| **硬停止点** | 四个 `verify_*` + `verify_kid_entry_live.py` + `smoke_router.sh` 全绿 → `session_verify_counts.py --hours 1 --require-total`：**三列的 `accepted_current` 都 > 0** → E2E 后台跑一次（10 条、约 37 分钟）→ 预存**两枚** legacy 探针 token（⑤ 用）|
+| **硬停止点** | 四个 `verify_*` + `verify_kid_entry_live.py` + `smoke_router.sh` 全绿 → `session_verify_counts.py --hours 1 --require-total --require-nonzero accepted_current`（**三列的 `accepted_current` 都 > 0**，脚本判，exit 0 才算） → E2E 后台跑一次（10 条、约 37 分钟）→ 预存**两枚** legacy 探针 token（⑤ 用）|
 | **闸门** | 无需声明（没有密钥增减）。可复跑一次确认没有夹带漂移 |
 | **回滚** | `signer = legacy` → 重部 panel + auth。**不动 Edge、不回退代码**（verifier 全程双接受）|
 
@@ -605,7 +605,7 @@ python3 site-builder/scripts/verify_api_key_e2e.py            # 无 [ApiKey] 段
 python3 site-builder/scripts/verify_session_token_semantics.py
 python3 site-builder/scripts/verify_kid_entry_live.py
 bash    site-builder/scripts/smoke_router.sh
-python3 site-builder/scripts/session_verify_counts.py --hours 1 --require-total
+python3 site-builder/scripts/session_verify_counts.py --hours 1 --require-total --require-nonzero accepted_current
 
 # ⑤ 的负向探针要 legacy 形态的 token，而 legacy 入口马上就要关：现在预存。
 # **要两枚**：`site-session` 证明 Edge 拒（302），`console-upgrade` 证明 panel 拒（401）。
