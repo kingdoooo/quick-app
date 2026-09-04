@@ -92,3 +92,48 @@ def test_self_test_covers_role_and_retired_branches():
     assert probe.self_test(break_allow_path=True) != 0
     assert probe.self_test(break_role_path=True) != 0
     assert probe.self_test(break_retired_path=True) != 0
+
+
+# ---- ticket 17 第 14 条（/code-review 2026-09-04）---------------------------------------------
+#
+# 三个 break 旗标只覆盖 12 条断言里的 4 条：`CONSOLE` / `UNKNOWN` / `WRONG` 三种 token 在理想
+# 应答器里**永远**落到 `return 302, login`，没有任何配置能让它们变绿 ⇒ 那四条负向断言
+# （console kid 被拒、未知 kid 不回落、wrong token_use 被拒、console kid 换不出升级码）
+# 在自测里**不可能红**。而它们恰好是"新 kid 入口"区别于旧代码的全部性质：一个会在未知 kid 上
+# 回落 legacy、或两个 family 共用一份 allowlist 的 verifier，自测照样全绿。
+
+def test_self_test_can_fail_on_the_kid_entry_negatives(monkeypatch):
+    """`break_family=True` 让三种本该被拒的 token 全被放行，自测必须红。"""
+    assert probe.self_test(break_family=True) != 0
+
+
+def test_break_family_targets_exactly_the_four_kid_entry_assertions():
+    """把红的那几条点出来：必须**恰好**是四条负向断言，不多不少。
+
+    多了说明这个旗标顺手破坏了别的路径（那样它就不能证明这四条了）；少了说明还有断言没覆盖。
+    """
+    site, auth, console = "https://app-x.example.test/", "auth.example.test", "console.example.test"
+    get = probe._ideal_responder(break_family=True)
+    checks = probe.run_checks(get, probe.Tokens(legacy=None, site_kid="SITE.x.y", console_kid="CONSOLE.x.y",
+                                                unknown_kid="UNKNOWN.x.y", wrong_use="WRONG.x.y"),
+                              site_url=site, auth_host=auth)
+    red = [c.name for c in checks if not c.ok]
+    assert len(red) == 4, red
+    assert all(k in " ".join(red) for k in ("console kid", "未知 kid", "token_use")), red
+
+
+def test_every_default_assertion_has_some_break_path_that_makes_it_red():
+    """元用例：`run_checks` 的每一条断言都必须至少被一个 break 旗标打红。
+
+    这条是给"以后再加一条负向断言却忘了给它 break 路径"设的闸——那种断言在自测里是装饰。
+    """
+    site, auth = "https://app-x.example.test/", "auth.example.test"
+    toks = probe.Tokens(legacy=None, site_kid="SITE.x.y", console_kid="CONSOLE.x.y",
+                        unknown_kid="UNKNOWN.x.y", wrong_use="WRONG.x.y")
+    names = [c.name for c in probe.run_checks(probe._ideal_responder(), toks, site_url=site, auth_host=auth)]
+    ever_red = set()
+    for flags in ({"break_allow_path": True}, {"break_family": True}):
+        get = probe._ideal_responder(**flags)
+        ever_red |= {c.name for c in probe.run_checks(get, toks, site_url=site, auth_host=auth) if not c.ok}
+    never = [n for n in names if n not in ever_red and "负对照" not in n]
+    assert not never, f"这些断言没有任何 break 路径能让它们红（自测证明不了它们）: {never}"

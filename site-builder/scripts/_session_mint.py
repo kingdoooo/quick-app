@@ -15,13 +15,14 @@
 调用方不动。用不带路径的 python3 跑（CLAUDE.md）。
 
     python3 site-builder/scripts/_session_mint.py --token-use site-session --email <owner> \
-        --role legacy --ttl 600 --save .scratch/3c-1b/legacy-site.json
+        --role legacy --ttl 600 --save 3c-1b/legacy-site.json   # 相对 .scratch/；写成 .scratch/3c-1b/… 也一样
 """
 from __future__ import annotations
 
 import argparse
 import configparser
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -165,14 +166,31 @@ def live_target(config_path: Path = CONFIG_PATH, *, ddb=None) -> Target:
 # ---- 预存 / 读回（负向探针用）--------------------------------------------------------------
 
 def save_token(path: Path, record: dict, *, scratch_root: Path = SCRATCH_ROOT) -> Path:
-    """只许写进 `.scratch/`（gitignored）：token 是活凭证，不能落进任何可能被跟踪的位置。"""
-    path = Path(path)
+    """只许写进 `.scratch/`（gitignored）：token 是活凭证，不能落进任何可能被跟踪的位置。
+
+    **相对路径按 `scratch_root` 解析，但开头写不写 `.scratch/` 都一样**（3c-1B ticket 17 第 6 条）：
+    仓库文档里两种写法都出现过（本模块 docstring 用 `.scratch/…`、runbook 用 `rotation/…`），
+    而"多嵌一层 `.scratch/.scratch/`"是**静默**的——命令照样成功，只有 ⑤/⑩ 用 `--retired-token`
+    读回（那个旗标按 cwd 解析）时才以"不是 --save 写出的记录"失败；到那一刻配置已改、三处已重部，
+    ⑩ 更是已经把 previous 从 config 删掉、token 无法重签。所以这里把前缀吃掉，而不是让它嵌套。
+    逃逸检查在**吃掉前缀之后**做，`.scratch/../x` 仍然被拒。
+
+    **权限 0600 / 目录 0700**（第 13 条）：记录里是一枚可直接重放的会话 cookie，
+    默认 umask 会落成 0644 ⇒ 同机任何账号都能读它、以目标站点 owner 的身份访问站点。
+    """
     root = Path(scratch_root).resolve()
+    path = Path(path)
+    if not path.is_absolute() and path.parts and path.parts[0] == root.name:
+        path = Path(*path.parts[1:]) if len(path.parts) > 1 else Path()
     target = (root / path).resolve() if not path.is_absolute() else path.resolve()
     if root != target and root not in target.parents:
         raise SystemExit(f"--save 只许写进 {root}（scratch，gitignored），拒绝 {path}")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(record, ensure_ascii=False, indent=1))
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # 先建后改：write_text 不接受 mode，而"先写再 chmod"有一个短暂的 0644 窗口 ⇒ 用 os.open 定死
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False, indent=1))
+    os.chmod(target, 0o600)      # 文件已存在时 O_CREAT 的 mode 不生效，显式收一次
     return target
 
 

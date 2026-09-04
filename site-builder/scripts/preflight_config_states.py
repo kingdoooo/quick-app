@@ -6,18 +6,29 @@
 而它们要守的性质其实一条都没变。本脚本在动生产之前把这些假红全找出来：首跑实测 panel
 在 ⑤⑥⑦ 各 3 条红、⑩ 6 条红，其余六包全绿。
 
-**只读 config、不发任何 AWS 调用**；`try/finally` 保证还原，并逐字节核对。
-跑之前先确认工作树里没有未保存的 config 改动；跑期间不要并行跑任何读 config 的东西
-（部署脚本、verify_* 闸门都读它）。
+**不发任何 AWS 调用**，但**它会就地改写 `site-builder/config.ini`**——那是所有部署脚本与 CDK 栈的
+唯一取值来源。因此有三道保护（3c-1B ticket 17 第 9 条加的；此前只有一个 `finally` + `assert`）：
+
+1. **哨兵文件**。第一次写之前落 `.scratch/preflight-config-mutation.json`（原文 sha256 + 备份路径 +
+   pid + 时刻），还原成功才删。**下次启动看见它就拒绝运行**并打印怎么恢复——进程被硬杀
+   （SIGKILL / 关终端 / OOM / 睡眠后重启）时 `finally` 不会执行，此前的症状是 config 静默留在
+   模拟态、而后续 `deploy_*` 会照着它把 v2 那种"参数还不存在"的状态部出去。
+2. **备份落 `.scratch/`**（gitignored、不被 macOS 清理），不再用 `/tmp` 里那个**可预测**路径——
+   config 里有真实账号/域名/证书 ARN，而还原时又会把那个路径读回来写进 config。
+3. **信号处理 + 真异常**。SIGINT/SIGTERM 先还原再退出；还原核对改成 `raise RuntimeError`
+   而不是 `assert`（`python3 -O` 会把 assert 整条去掉，那正好是"看起来还原了其实没有"）。
+
+跑期间不要并行跑任何读 config 的东西（部署脚本、verify_* 闸门都读它）。**生产处在轮转中途时
+不要跑它**：收益是"预演状态"，而它本身就在改真源。
 
     python3 site-builder/scripts/preflight_config_states.py
 """
-import re, shutil, subprocess, sys
+import hashlib, json, os, re, shutil, signal, subprocess, sys, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CFG = ROOT / "site-builder" / "config.ini"
-BAK = Path("/tmp/config.ini.preflight-backup")   # 只是保险；真源是内存里的 base
+SENTINEL = ROOT / ".scratch" / "preflight-config-mutation.json"
 
 V2 = """
 [SessionKey:site-hs-v2]
@@ -79,25 +90,81 @@ def run_all(tag):
             bad.append((name, fails))
     return bad
 
-shutil.copy2(CFG, BAK)
-report = {}
-try:
-    base = CFG.read_text()
-    for tag, fn in (("⑤L3", state_l3), ("⑥stage", state_stage),
-                    ("⑦switch", state_switch), ("⑩retire", state_retire)):
-        CFG.write_text(fn(base))
-        print(f"\n=== 模拟 {tag} ===")
-        report[tag] = run_all(tag)
-finally:
-    shutil.copy2(BAK, CFG)
-    assert CFG.read_text() == base, "config.ini 未能还原！"
-    print("\nconfig.ini 已还原（逐字节核对通过）")
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
 
-print("\n===== 汇总 =====")
-for tag, bad in report.items():
-    if not bad:
-        print(f"{tag}: 全绿")
-    else:
-        for name, fails in bad:
-            print(f"{tag}: {name} 红 {len(fails)} 条")
-            for f in fails: print(f"    {f}")
+
+def refuse_if_mutation_in_flight() -> None:
+    """上一次跑没能还原（哨兵还在）⇒ 拒绝运行，并说清怎么恢复。
+
+    这条比 `finally` 重要：`finally` 只覆盖"进程还活着"的失败，而这里要防的是它根本没机会跑。
+    """
+    if not SENTINEL.exists():
+        return
+    try:
+        st = json.loads(SENTINEL.read_text())
+    except ValueError:
+        st = {}
+    now = _sha(CFG.read_text())
+    ok = now == st.get("pristine_sha256")
+    raise SystemExit(
+        f"发现上一次运行留下的哨兵 {SENTINEL}\n"
+        f"  上次开始于 {st.get('started_at')}（pid {st.get('pid')}），备份在 {st.get('backup')}\n"
+        f"  当前 config.ini 与原文 " + ("**一致**——大概只是哨兵没删干净，确认后手工删掉它再跑。\n"
+                                        if ok else
+                                        "**不一致 ⇒ config.ini 很可能还停在模拟态**。\n"
+                                        f"  先 `cp {st.get('backup')} {CFG}` 还原并核对，再删哨兵。\n") +
+        "  在还原之前**不要跑任何 deploy_* 或 verify_***（它们会照着模拟态的配置动生产）。")
+
+
+def restore(backup: Path, base: str) -> None:
+    shutil.copy2(backup, CFG)
+    if CFG.read_text() != base:
+        raise RuntimeError(f"config.ini 未能还原！备份在 {backup}，先手工恢复再做别的")
+    SENTINEL.unlink(missing_ok=True)
+    print("\nconfig.ini 已还原（逐字节核对通过），哨兵已清")
+
+
+def main() -> int:
+    refuse_if_mutation_in_flight()
+    base = CFG.read_text()
+    SENTINEL.parent.mkdir(parents=True, exist_ok=True)
+    backup_dir = Path(SENTINEL.parent / f"preflight-backup-{int(time.time())}")
+    backup_dir.mkdir(mode=0o700)
+    backup = backup_dir / "config.ini"
+    shutil.copy2(CFG, backup)
+    SENTINEL.write_text(json.dumps({"pristine_sha256": _sha(base), "backup": str(backup),
+                                    "pid": os.getpid(), "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                                                    time.gmtime())}, indent=1))
+
+    def _on_signal(signum, _frame):
+        print(f"\n收到信号 {signum}——先还原 config.ini 再退出", file=sys.stderr)
+        restore(backup, base)
+        raise SystemExit(128 + signum)
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _on_signal)
+
+    report = {}
+    try:
+        for tag, fn in (("⑤L3", state_l3), ("⑥stage", state_stage),
+                        ("⑦switch", state_switch), ("⑩retire", state_retire)):
+            CFG.write_text(fn(base))
+            print(f"\n=== 模拟 {tag} ===")
+            report[tag] = run_all(tag)
+    finally:
+        restore(backup, base)
+
+    print("\n===== 汇总 =====")
+    for tag, bad in report.items():
+        if not bad:
+            print(f"{tag}: 全绿")
+        else:
+            for name, fails in bad:
+                print(f"{tag}: {name} 红 {len(fails)} 条")
+                for f in fails: print(f"    {f}")
+    return 0
+
+
+if __name__ == "__main__":      # 没有这道 guard 时，`import preflight_config_states` 会把整段跑掉
+    sys.exit(main())

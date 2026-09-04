@@ -5,6 +5,8 @@ import sys
 import re
 from pathlib import Path
 
+import types
+
 import pytest
 from unittest.mock import patch
 
@@ -769,7 +771,7 @@ def test_shipped_env_scan_is_not_vacuous():
         "可达性闭包没走进复制模块的私有函数——解析口径坏了")
 
 
-def test_environment_covers_every_env_var_the_code_reads():
+def _assert_env_covers_every_read(keys=None, env_override=None):
     """代码里 os.environ[...] 读到的键必须都在环境变量里下发。
 
     少一个的症状是运行时 KeyError → 500，而单测有 conftest 兜着看不出来。
@@ -777,7 +779,7 @@ def test_environment_covers_every_env_var_the_code_reads():
     扫描范围是**整个进包清单**（panel 自己的 `*.py` + COPY_FILES 复制进来的），
     按可达性归属——理由见上面那段注释，别改回只 glob `panel/*.py`。
     """
-    env = set(dp.lambda_environment())
+    env = set(dp.lambda_environment()) if env_override is None else set(env_override)
     read, _ = _reachable_env_reads()
     # AWS 运行时自带的
     read -= {"AWS_DEFAULT_REGION", "AWS_REGION", "AWS_LAMBDA_FUNCTION_NAME"}
@@ -786,27 +788,36 @@ def test_environment_covers_every_env_var_the_code_reads():
     # `return get_legacy() if flag == "on" else None` ⇒ **LEGACY_ENTRY=off 时这个读根本不发生**。
     # 静态扫描看不见这道守卫，所以 L3（legacy_param 清空）之后本条会假红。下面那条用例是配套的
     # 正对照：legacy **开着**的时候少下发它必须仍然被抓，否则这里就是把覆盖检查整个放水了。
-    if not _live_keys().legacy_param:
+    if not (keys or _live_keys()).legacy_param:
         read -= {"JWT_SECRET_PARAM"}
     missing = read - env
     assert not missing, f"代码会读但部署没下发的环境变量: {sorted(missing)}"
 
 
-def test_env_coverage_still_catches_a_missing_var_while_legacy_is_on():
-    """**正对照**：上一条对 `JWT_SECRET_PARAM` 的豁免只在 legacy 关掉时成立。
+def test_environment_covers_every_env_var_the_code_reads():
+    """线上配置下的实测（判定体在 `_assert_env_covers_every_read`，正对照复用**同一份**）。"""
+    _assert_env_covers_every_read()
 
-    legacy 开着时把它从 env 里拿掉，覆盖检查必须红——否则那条豁免就等于把检查放水了。
+
+def test_env_coverage_still_catches_a_missing_var_while_legacy_is_on():
+    """**正对照（变形测试）**：上一条对 `JWT_SECRET_PARAM` 的豁免只在 legacy 关掉时成立。
+
+    legacy 开着时把它从 env 里拿掉，上面那条覆盖用例必须**真的抛**——否则那条豁免就等于把检查放水了。
+
+    **实现上必须调用被守护的那个函数本身**（3c-1B ticket 17 第 12 条）：本用例早先自己
+    重算了一遍 `exempt`，而锚点 `legacy_param` 是个非空字面量 ⇒ `exempt` 恒为空集、三元表达式是死代码，
+    于是断言退化成恒真式，在 L2 与 L3 两种状态下都过。把覆盖用例的豁免改成无条件（= 放水），
+    那个版本的"正对照"照样绿。现在改成注入 keys/env 直接驱动它，放水就会让本条红。
     """
     read, _ = _reachable_env_reads()
-    read -= {"AWS_DEFAULT_REGION", "AWS_REGION", "AWS_LAMBDA_FUNCTION_NAME"}
     assert "JWT_SECRET_PARAM" in read, "锚点失效：代码已经不读 JWT_SECRET_PARAM 了"
-
-    class _KeysLegacyOn:
-        legacy_param = "/site-builder/jwt-secret"
+    legacy_on = types.SimpleNamespace(legacy_param="/site-builder/jwt-secret")
     env_without_it = set(dp.lambda_environment()) - {"JWT_SECRET_PARAM"}
-    exempt = set() if _KeysLegacyOn.legacy_param else {"JWT_SECRET_PARAM"}
-    assert (read - exempt) - env_without_it == {"JWT_SECRET_PARAM"}, \
-        "legacy 开着时漏下发 JWT_SECRET_PARAM 竟然没被抓到"
+    with pytest.raises(AssertionError, match="JWT_SECRET_PARAM"):
+        _assert_env_covers_every_read(keys=legacy_on, env_override=env_without_it)
+    # 对称：legacy **关**着时同样少下发它，必须**不**红（那正是被豁免的那一支）
+    legacy_off = types.SimpleNamespace(legacy_param="")
+    _assert_env_covers_every_read(keys=legacy_off, env_override=env_without_it)
 
 
 def test_console_route_is_split_mode_with_platform_prefix():

@@ -141,7 +141,16 @@ def render(checks: list) -> int:
 # ---- 自测：理想应答器 / 坏掉的路径 ------------------------------------------------------------
 
 def _ideal_responder(*, break_allow_path: bool = False, break_role_path: bool = False,
-                     break_retired_path: bool = False):
+                     break_retired_path: bool = False, break_family: bool = False):
+    """理想应答器 + 四条可单独打断的路径。
+
+    `break_allow_path` 覆盖"合法 current 会话可用"那一族（站点 200 + auth 换出升级码）；
+    `break_family` 是 3c-1B ticket 17 第 14 条补的：其余三个旗标都动不了 `CONSOLE` / `UNKNOWN` /
+    `WRONG` 三种 token（它们一律落到最后那个 `302, login`），于是四条**负向**断言在自测里不可能红
+    ——而"console kid 不进 site allowlist""未知 kid 不回落 legacy""token_use 不能混用"正是新入口
+    区别于 3c-1A 之前那份代码的全部性质。这个旗标模拟"verifier 对 family/kid/用途都不挑"，
+    让那四条能被证明真的会红。
+    """
     login = {"location": "https://auth.example.test/login?redirect=x"}
 
     def cookies(header):
@@ -161,7 +170,13 @@ def _ideal_responder(*, break_allow_path: bool = False, break_role_path: bool = 
             return 401, {}
         token = ck.get("sb_session", "")
         if url.endswith("/console-session"):
-            if token.startswith(("SITE", "PREVS")):
+            # break_allow_path 也覆盖这条**正向**断言（合法 site kid 会话必须能换出升级码）：
+            # 否则它在自测里没有任何坏路径能让它红（元用例
+            # test_every_default_assertion_has_some_break_path_that_makes_it_red 抓到过）。
+            if break_allow_path and token.startswith("SITE"):
+                return 302, login
+            # break_family：auth 也不挑 family ⇒ console kid 的会话照样换出升级码
+            if token.startswith(("SITE", "PREVS")) or (break_family and token.startswith("CONSOLE")):
                 return 302, {"location": "https://console.example.test/api/session-callback?code=x"}
             return 302, login
         if token.startswith("RETIRED"):
@@ -170,14 +185,17 @@ def _ideal_responder(*, break_allow_path: bool = False, break_role_path: bool = 
             return (500, {}) if break_role_path else (200, {})
         if token.startswith(("LEGACY", "SITE")):
             return (500, {}) if (break_allow_path and token.startswith("SITE")) else (200, {})
+        # break_family：Edge 对 family/未知 kid/用途都不挑 ⇒ 三种本该被拒的 token 全被放行
+        if break_family and token.startswith(("CONSOLE", "UNKNOWN", "WRONG")):
+            return 200, {}
         return 302, login
     return get
 
 
 def self_test(*, break_allow_path: bool = False, break_role_path: bool = False,
-              break_retired_path: bool = False) -> int:
+              break_retired_path: bool = False, break_family: bool = False) -> int:
     get = _ideal_responder(break_allow_path=break_allow_path, break_role_path=break_role_path,
-                           break_retired_path=break_retired_path)
+                           break_retired_path=break_retired_path, break_family=break_family)
     site, auth, console = "https://app-x.example.test/", "auth.example.test", "console.example.test"
     checks = run_checks(get, Tokens(legacy="LEGACY.x.y", site_kid="SITE.x.y", console_kid="CONSOLE.x.y",
                                     unknown_kid="UNKNOWN.x.y", wrong_use="WRONG.x.y"),
@@ -257,7 +275,7 @@ def _wrong_use_token(minter: sm.Minter, owner: str) -> str:
 
 def main(argv: list | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--self-test", action="store_true", help="不碰 AWS：理想应答器全绿、三种坏路径各自必红")
+    ap.add_argument("--self-test", action="store_true", help="不碰 AWS：理想应答器全绿、**四**种坏路径各自必红")
     ap.add_argument("--role", choices=("current", "previous"),
                     help="就位/切换/回滚：该 role 的站点会话必须 200、升级码经 panel 换出面板 cookie（会消费一枚升级码）")
     ap.add_argument("--retired-token", action="append", default=[], metavar="FILE",
@@ -265,7 +283,8 @@ def main(argv: list | None = None) -> int:
     args = ap.parse_args(argv)
     if args.self_test:
         ok = (self_test() == 0 and self_test(break_allow_path=True) != 0
-              and self_test(break_role_path=True) != 0 and self_test(break_retired_path=True) != 0)
+              and self_test(break_role_path=True) != 0 and self_test(break_retired_path=True) != 0
+              and self_test(break_family=True) != 0)
         print("self-test:", "PASS" if ok else "FAIL")
         return 0 if ok else 1
     return render(_live(args.role, args.retired_token))

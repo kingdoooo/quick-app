@@ -263,3 +263,59 @@ def test_live_target_is_fatal_when_no_site_qualifies(aws, tmp_path):
     _routes([{"subdomain": "console", "owner": "platform", "require_auth": True}])
     with pytest.raises(SystemExit, match="require_auth"):
         sm.live_target(c)
+
+
+# ---- ticket 17 第 6、13 条（/code-review 2026-09-04）------------------------------------------
+#
+# 6：`--save` 的相对路径按 `.scratch/` 解析，于是模块 docstring 自己的例子
+#    `--save .scratch/3c-1b/x.json` 会落进 `.scratch/.scratch/3c-1b/`——命令**成功**，
+#    到 ⑤/⑩ 用 `--retired-token` 读回（按 cwd 解析）时才以"不是 --save 写出的记录"失败，
+#    而那时配置已改、三个组件已重部，且 ⑩ 的 previous 已从 config 删掉、token 无法重签。
+# 13：token 是活凭证，却按默认 umask 落成 0644、目录 0755。
+
+def test_save_token_accepts_a_leading_scratch_prefix_instead_of_nesting_it(tmp_path):
+    """写 `.scratch/a/b.json` 与写 `a/b.json` 必须落在同一个文件上。
+
+    两种写法都出现在仓库文档里（模块 docstring 用前者、runbook 用后者），而"多出一层
+    `.scratch/.scratch/`"是静默的——只有读回那一步才炸。
+    """
+    scratch = tmp_path / ".scratch"
+    rec = {"token_use": "site-session", "token": "t.t.t"}
+    a = sm.save_token(".scratch/3c-1b/v1.json", rec, scratch_root=scratch)
+    b = sm.save_token("3c-1b/v1.json", rec, scratch_root=scratch)
+    assert a == b == (scratch / "3c-1b" / "v1.json").resolve()
+    assert not (scratch / ".scratch").exists(), "又嵌了一层 .scratch/"
+    # 读回那一步（探针按 cwd 解析）必须能拿到它
+    assert sm.load_saved_token(a) == ("site-session", "t.t.t")
+
+
+def test_save_token_still_refuses_paths_outside_scratch(tmp_path):
+    """回归：吃掉 `.scratch/` 前缀不能变成"逃逸检查放水"，也不能变成**前缀模糊匹配**。"""
+    scratch = tmp_path / ".scratch"
+    rec = {"token_use": "site-session", "token": "t.t.t"}
+    # 逃逸仍然硬拒——检查在吃掉前缀**之后**做
+    for bad in ("../escape.json", ".scratch/../escape.json", ".scratch/../../escape.json"):
+        with pytest.raises(SystemExit):
+            sm.save_token(bad, rec, scratch_root=scratch)
+    # 只吃**恰好等于**根目录名的第一段：`.scratchy` 是 scratch 里一个普通子目录，不许被当成前缀削掉
+    out = sm.save_token(".scratchy/x.json", rec, scratch_root=scratch)
+    assert out == (scratch / ".scratchy" / "x.json").resolve()
+
+
+def test_save_token_writes_a_live_credential_with_owner_only_permissions(tmp_path):
+    """0644 的活凭证同机任何账号可读、可重放成目标站点 owner 的会话。"""
+    scratch = tmp_path / ".scratch"
+    out = sm.save_token("rotation/v1.json", {"token_use": "site-session", "token": "t.t.t"},
+                        scratch_root=scratch)
+    assert oct(out.stat().st_mode)[-3:] == "600", oct(out.stat().st_mode)
+    assert oct(out.parent.stat().st_mode)[-3:] == "700", oct(out.parent.stat().st_mode)
+
+
+def test_module_docstring_save_example_is_a_form_that_round_trips(tmp_path):
+    """docstring 里的例子必须是能用的形态——它就是操作者会照抄的那一行。"""
+    import re
+    m = re.search(r"--save (\S*/\S*)", sm.__doc__)   # 取带路径分隔符的那个真例子，不是 `--save FILE` 那行占位
+    assert m, "docstring 里没有带路径的 --save 例子了"
+    scratch = tmp_path / ".scratch"
+    out = sm.save_token(m.group(1), {"token_use": "site-session", "token": "t.t.t"}, scratch_root=scratch)
+    assert out.is_relative_to(scratch) and not (scratch / ".scratch").exists()
