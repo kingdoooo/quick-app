@@ -11,6 +11,9 @@
       PYTHONPATH="$PWD/../.venv/lib/python3.12/site-packages" SB_CDK_TESTS=1 \\
       ../../../site-builder/deployer/.venv/bin/pytest test_stack_edge_iam.py -q
 
+没有 AWS 凭据时再加 `APP_SYNTH_OFFLINE=1`：ticket 19 起 SSM 读失败会让 synth 直接抛（fail-closed），
+本文件只断言 IAM 形状、不看密钥值，所以离线占位符对它无影响。
+
 （python3.x 目录名按实际 venv 调整；桥接不上时本文件会 fail 而不是 skip——
 静默 skip 等于这次运行什么都没验证。）
 """

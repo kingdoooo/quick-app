@@ -96,7 +96,7 @@ Codex 复核 v2 后认可它可作为 fix plan 的事实基线，并提了 3 处
 | ~~M04~~ | — | Claude | **待验证假设，非正式 finding** | 静态资源 SigV4 签的路径 ≠ 转发的路径；是否真的 403 缺真机证据，见 §4 |
 | M10 | P2 | Claude | 成立 | `--mcp-callback` 文档零出现，且裸重跑会**吊销**它 |
 | M11 | P2（潜伏） | Claude | 成立 | 无任何守卫绑定 Edge 的 `{{PLACEHOLDER}}` 集合 |
-| M12 | P2（潜伏） | Claude | 成立 | `SYNTH-ONLY-PLACEHOLDER` 只 warning，模板仍可部署 |
+| M12 | P2（潜伏） | Claude | 成立 | `SYNTH-ONLY-PLACEHOLDER` 只 warning，模板仍可部署。**2026-09-04 已修**（3c-1B ticket 19）：SSM 读失败默认让 synth 抛错，占位符只在显式 `APP_SYNTH_OFFLINE=1` 下保留 |
 | M13 | P2（潜伏） | Claude | 成立，当前两侧一致 | IdP 信任清单在两份 config 里，校验强度不对称 |
 | M14 | P3 | **Codex P2-1** | 成立 | 站点后端依赖未锁定，构建产物不可复现 |
 | M15 | P3 | **Codex P2-2** | 成立 | 访问趋势陈旧响应覆盖（错档位 / 跨站点） |
@@ -880,7 +880,11 @@ Codex 复核 v2 后认可它可作为 fix plan 的事实基线，并提了 3 处
 ⇒ 安全控制静默关闭。当前 9 个都齐，且 `require_idp_claim`/`trusted_idps`
 在 synth 期有硬校验（`stack.py:210-231`），所以是潜伏项。
 
-### M12 · [P2，潜伏] `SYNTH-ONLY-PLACEHOLDER` 仍可部署
+### M12 · [P2，潜伏] `SYNTH-ONLY-PLACEHOLDER` 仍可部署 — **已修（2026-09-04，3c-1B ticket 19）**
+
+> `router/infrastructure/stack.py` 的两个注入函数改成 fail-closed：SSM/凭据失败默认 `RuntimeError` 让 synth 退出、
+> 什么都不部；占位符路径只在显式 `APP_SYNTH_OFFLINE=1` 下保留（且产物仍带标记，`verify_deployed_edge.sh` 纵深不变）；
+> 非 HS256 行是配置错、任何模式都抛。行为测试在 `router/infrastructure/lambda/test_stack_static.py`。下面是原始记录。
 
 `router/infrastructure/stack.py:76-83`：SSM 读失败只打 stderr warning 并返回
 `"SYNTH-ONLY-PLACEHOLDER-DO-NOT-DEPLOY"`，模板照样可部署。部署出去 ⇒

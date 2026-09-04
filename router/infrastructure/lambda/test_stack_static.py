@@ -75,6 +75,9 @@ def _load_jwt_secret_fn():
     end = SRC.index("def _session_keys_on_path(")   # 片段只含 load_jwt_secret 一个函数
     mod = types.ModuleType("_stack_jwt_fragment")
     mod.__dict__.update(os=__import__("os"), sys=_sys)
+    if "def _synth_offline" in SRC:   # ticket 19：两个注入函数共用的离线开关助手，一并切进来
+        hs = SRC.index("def _synth_offline"); he = SRC.index("def ", hs + 1)
+        exec(compile(textwrap.dedent(SRC[hs:he]), "<stack helpers>", "exec"), mod.__dict__)
     exec(compile(textwrap.dedent(SRC[start:end]), "<stack fragment>", "exec"), mod.__dict__)
     return mod
 
@@ -111,9 +114,10 @@ def test_override_is_ignored_once_the_entry_is_closed(monkeypatch):
 
 
 def test_real_ssm_failure_still_falls_back_to_the_synth_placeholder(capsys, monkeypatch):
-    """回归：入口开着而 SSM 真读不到，仍必须落 SYNTH 占位并告警——**这条与"刻意为空"必须分得开**，
-    否则 L3 每次部署都被产物核对判红，而真故障反而被当成日常。"""
+    """回归：入口开着而 SSM 真读不到，**显式离线模式下**仍落 SYNTH 占位并告警——**这条与"刻意为空"必须分得开**，
+    否则 L3 每次部署都被产物核对判红，而真故障反而被当成日常。（不带 APP_SYNTH_OFFLINE 时的行为见 ticket 19 那组：抛。）"""
     monkeypatch.delenv("APP_JWT_SECRET", raising=False)
+    monkeypatch.setenv("APP_SYNTH_OFFLINE", "1")
     mod = _load_jwt_secret_fn()
     # 让 `import boto3` 在片段里失败：注入一个抛异常的假模块
     broken = types.ModuleType("boto3")
@@ -137,3 +141,147 @@ def test_legacy_entry_follows_the_same_single_switch(legacy, expect):
     import session_keys as sk
     keys = types.SimpleNamespace(legacy_param=legacy)
     assert sk.legacy_entry(keys) == expect
+
+
+# ---- 3c-1B ticket 19：synth fail-closed（merged review M12）--------------------------------------
+#
+# 此前两个注入函数整段 `except Exception` ⇒ 非 HS256 的配置错、ParameterNotFound、AccessDenied 都退化成
+# SYNTH 占位符 + 一行 stderr WARNING，而 `cdk deploy` 照样 exit 0、把一个 kid 永不匹配的 allowlist 全球
+# 复制出去（全员登录循环，直到有人读 cdk 日志或跑 verify_deployed_edge.sh）。现在：**默认任何失败都让
+# synth 失败**；占位符路径只在显式 `APP_SYNTH_OFFLINE=1` 下保留（离线 synth / 无凭据的 CI）；配置错误
+# 在任何模式下都抛。
+
+OFFLINE_FLAG = "APP_SYNTH_OFFLINE"
+
+
+def _load_site_allowlist_fn():
+    """把 `load_site_allowlist` 切出来 exec；`_session_keys_on_path` 用一个只放路径的替身。"""
+    start = SRC.index("def load_site_allowlist")
+    end = SRC.index("class WebRouterStack")
+    mod = types.ModuleType("_stack_allowlist_fragment")
+    root = Path(__file__).parents[3]
+
+    def _on_path():
+        _sys.path.insert(0, str(root / "site-builder" / "auth"))
+        return root
+
+    mod.__dict__.update(os=__import__("os"), sys=_sys, json=__import__("json"), _session_keys_on_path=_on_path)
+    # 片段里若引用了 _synth_offline() 这类同文件助手，也一并切进来（以 def 开头、在 load_jwt_secret 之前）
+    helpers_start = SRC.index("def _synth_offline") if "def _synth_offline" in SRC else None
+    if helpers_start is not None:
+        helpers_end = SRC.index("def ", helpers_start + 1)
+        exec(compile(textwrap.dedent(SRC[helpers_start:helpers_end]), "<stack helpers>", "exec"), mod.__dict__)
+    exec(compile(textwrap.dedent(SRC[start:end]), "<stack fragment>", "exec"), mod.__dict__)
+    return mod
+
+
+def _ref(kid, alg="HS256", role="current"):
+    return types.SimpleNamespace(kid=kid, alg=alg, role=role, ssm_param=f"/site-builder/session-keys/{kid}")
+
+
+def _keys(site=(), console=(), legacy_param=""):
+    fams = {"site": list(site), "console": list(console)}
+    return types.SimpleNamespace(legacy_param=legacy_param, allowlist=lambda fam: fams[fam])
+
+
+def _fake_boto3(monkeypatch, values: dict | None = None, error: Exception | None = None):
+    """注入一个假的 boto3：`client("ssm").get_parameter(Name=…)` 按 values 取值，或统一抛 error。"""
+    fake = types.ModuleType("boto3")
+
+    class _SSM:
+        def get_parameter(self, Name, WithDecryption):
+            if error is not None:
+                raise error
+            if Name not in (values or {}):
+                raise RuntimeError(f"ParameterNotFound: {Name}")
+            return {"Parameter": {"Value": values[Name]}}
+
+    fake.client = lambda service, region_name: _SSM()
+    monkeypatch.setitem(_sys.modules, "boto3", fake)
+    return fake
+
+
+@pytest.fixture
+def clean_env(monkeypatch):
+    for k in ("APP_SITE_ALLOWLIST_JSON", "APP_JWT_SECRET", OFFLINE_FLAG):
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_allowlist_takes_only_the_site_family_and_reads_each_secret_from_ssm(clean_env, monkeypatch):
+    """spec §4.1：console 的 key 永不进 Edge；每行的 secret 按它自己的 ssm_param 取。"""
+    _fake_boto3(monkeypatch, {"/site-builder/session-keys/site-hs-v1": "s1", "/site-builder/session-keys/site-hs-v2": "s2",
+                              "/site-builder/session-keys/console-hs-v1": "c1"})
+    mod = _load_site_allowlist_fn()
+    text, entry = mod.load_site_allowlist(_keys(site=[_ref("site-hs-v1"), _ref("site-hs-v2", role="previous")],
+                                                console=[_ref("console-hs-v1")], legacy_param=""))
+    got = __import__("json").loads(text)
+    assert got == {"site-hs-v1": {"alg": "HS256", "secret": "s1", "role": "current"},
+                   "site-hs-v2": {"alg": "HS256", "secret": "s2", "role": "previous"}}
+    assert "c1" not in text and entry == "off"
+
+
+@pytest.mark.parametrize("offline", [False, True])
+def test_non_hs256_row_is_a_config_error_in_every_mode(clean_env, monkeypatch, offline):
+    """配置错不是"SSM 读不到"：无论在线/离线都必须抛，不许被吞成占位符。"""
+    if offline:
+        monkeypatch.setenv(OFFLINE_FLAG, "1")
+    _fake_boto3(monkeypatch, {"/site-builder/session-keys/site-rs-v1": "x"})
+    mod = _load_site_allowlist_fn()
+    with pytest.raises(ValueError, match="HS256"):
+        mod.load_site_allowlist(_keys(site=[_ref("site-rs-v1", alg="RS256")]))
+
+
+def test_ssm_failure_fails_synth_by_default_instead_of_injecting_the_placeholder(clean_env, monkeypatch, capsys):
+    """M12：`cdk deploy` 路径上 ParameterNotFound / AccessDenied 必须让 synth 失败，而不是 exit 0 + 占位符。"""
+    _fake_boto3(monkeypatch, error=RuntimeError("AccessDeniedException: ssm:GetParameter"))
+    mod = _load_site_allowlist_fn()
+    with pytest.raises(Exception) as ei:
+        mod.load_site_allowlist(_keys(site=[_ref("site-hs-v1")]))
+    msg = str(ei.value)
+    assert "AccessDeniedException" in msg and OFFLINE_FLAG in msg, msg
+    assert "SYNTH-ONLY-PLACEHOLDER" not in capsys.readouterr().err
+
+
+def test_ssm_failure_falls_back_to_the_placeholder_only_when_offline_is_explicit(clean_env, monkeypatch, capsys):
+    """离线 synth 仍可用，但必须显式声明；占位符带标记且 kid 永不匹配（verify_deployed_edge.sh 会抓）。"""
+    monkeypatch.setenv(OFFLINE_FLAG, "1")
+    _fake_boto3(monkeypatch, error=RuntimeError("no credentials"))
+    mod = _load_site_allowlist_fn()
+    text, _ = mod.load_site_allowlist(_keys(site=[_ref("site-hs-v1")]))
+    assert "SYNTH-ONLY-PLACEHOLDER-DO-NOT-DEPLOY" in text
+    err = capsys.readouterr().err
+    assert "WARNING" in err and "DO NOT deploy" in err
+
+
+def test_explicit_override_wins_and_is_validated_as_json(clean_env, monkeypatch):
+    monkeypatch.setenv("APP_SITE_ALLOWLIST_JSON", '{"site-hs-v1": {"alg": "HS256", "secret": "o", "role": "current"}}')
+    _fake_boto3(monkeypatch, error=RuntimeError("must not be called"))
+    mod = _load_site_allowlist_fn()
+    text, _ = mod.load_site_allowlist(_keys(site=[_ref("site-hs-v1")]))
+    assert '"secret": "o"' in text
+    monkeypatch.setenv("APP_SITE_ALLOWLIST_JSON", "{not json")
+    with pytest.raises(ValueError):
+        mod.load_site_allowlist(_keys(site=[_ref("site-hs-v1")]))
+
+
+@pytest.mark.parametrize("bad", ["a'''b", "a\\b"])
+def test_secret_that_would_break_the_injected_source_is_rejected(clean_env, monkeypatch, bad):
+    _fake_boto3(monkeypatch, {"/site-builder/session-keys/site-hs-v1": bad})
+    mod = _load_site_allowlist_fn()
+    with pytest.raises(ValueError, match="三引号|反斜杠"):
+        mod.load_site_allowlist(_keys(site=[_ref("site-hs-v1")]))
+
+
+def test_legacy_secret_ssm_failure_fails_synth_by_default_too(clean_env, monkeypatch):
+    """两个注入函数对称：legacy 入口开着而 SSM 读不到，默认也让 synth 失败。"""
+    mod = _load_jwt_secret_fn()
+    broken = types.ModuleType("boto3")
+
+    def _boom(*a, **k):
+        raise RuntimeError("ParameterNotFound")
+
+    broken.client = _boom
+    monkeypatch.setitem(_sys.modules, "boto3", broken)
+    with pytest.raises(Exception) as ei:
+        mod.load_jwt_secret(LIVE_LEGACY)
+    assert "ParameterNotFound" in str(ei.value) and OFFLINE_FLAG in str(ei.value)

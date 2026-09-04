@@ -52,6 +52,18 @@ class ConfigLoader:
         return {}
 
 
+def _synth_offline() -> bool:
+    """3c-1B ticket 19（merged review M12）：SSM/凭据失败时是否允许退化成 SYNTH 占位符。
+
+    **默认不允许**——`cdk deploy` 一定带凭据，走到这里的失败（ParameterNotFound / AccessDenied /
+    限流 / 网络）都是该让部署失败的事，而不是"打一行 WARNING 然后 exit 0 把一个 kid 永不匹配的
+    allowlist 全球复制出去"。离线 synth（无凭据的 CI、本地看模板）显式设 `APP_SYNTH_OFFLINE=1`
+    才走占位符路径，且产物仍带 SYNTH-ONLY 标记（verify_deployed_edge.sh 会抓，纵深保留）。
+    配置错误（如非 HS256 行）在任何模式下都抛：那不是"读不到"，是写错了。
+    """
+    return os.getenv("APP_SYNTH_OFFLINE") == "1"
+
+
 def load_jwt_secret(legacy_param: str) -> str:
     """Deploy-time **legacy-entry** secret injection for the edge function.
 
@@ -68,13 +80,14 @@ def load_jwt_secret(legacy_param: str) -> str:
        Edge 在 `LEGACY_ENTRY=off` 下根本不读这个常量（1A 已按开关分支）。
     2. `APP_JWT_SECRET` environment variable (explicit override)
     3. SSM SecureString parameter at `legacy_param` (us-east-1)
-    4. Synth-only placeholder (SSM unreachable / parameter missing /
-       boto3 not installed) — allows `cdk synth` to run offline, but the
-       resulting template MUST NOT be deployed: with a wrong secret every
-       legacy session token fails verification (fail-closed, endless login
-       redirect). Real deployments must have the SSM parameter in place
-       (aws ssm put-parameter --name <legacy_param>
-        --type SecureString --value <secret> --region us-east-1).
+    4. SSM read failure (unreachable / parameter missing / boto3 not
+       installed): **synth fails** (RuntimeError) — nothing gets deployed
+       (3c-1B ticket 19, merged review M12). Only with an explicit
+       `APP_SYNTH_OFFLINE=1` does it fall back to the synth-only
+       placeholder so `cdk synth` can run offline; that template MUST NOT
+       be deployed (verify_deployed_edge.sh catches the marker). Real
+       deployments must have the SSM parameter in place
+       (ensure_session_keys.py creates it).
 
     **第 1 条与第 4 条必须分得开**：两者都让 Edge 拒绝 legacy token，但一个是刻意的
     （入口已关闭，无 legacy token 还在流通），另一个是故障（SSM 读不到，线上现存的
@@ -92,11 +105,15 @@ def load_jwt_secret(legacy_param: str) -> str:
         return ssm.get_parameter(
             Name=legacy_param, WithDecryption=True
         )["Parameter"]["Value"]
-    except Exception as exc:  # noqa: BLE001 - deliberate synth-time fallback
-        import sys
+    except Exception as exc:  # noqa: BLE001
+        if not _synth_offline():
+            raise RuntimeError(
+                f"读 SSM {legacy_param} 失败（{type(exc).__name__}: {exc}）——synth 拒绝生成模板，什么都不会部署。"
+                "这是 cdk deploy 路径：先修凭据/参数再重跑；离线只看模板请显式设 APP_SYNTH_OFFLINE=1"
+                "（产物会带 SYNTH-ONLY 标记，不可部署）或用 APP_JWT_SECRET 覆盖。") from exc
         print(
             f"WARNING: could not read SSM {legacy_param} ({exc}); "
-            "using a synth-only placeholder. DO NOT deploy this template.",
+            "APP_SYNTH_OFFLINE=1 ⇒ using a synth-only placeholder. DO NOT deploy this template.",
             file=sys.stderr,
         )
         return "SYNTH-ONLY-PLACEHOLDER-DO-NOT-DEPLOY"
@@ -132,8 +149,9 @@ def load_site_allowlist(keys) -> tuple:
     secret 值按每行的 ssm_param 从 SSM 取；**只取 site family，console 的 key 不进 Edge**。
     legacy 开关：legacy_param 非空即 "on"，为空即 "off"（清空它 = 3c-1B 的 L3，关闭入口）。
 
-    SSM 读失败沿用 load_jwt_secret 的 synth-only 语义：注入带 SYNTH-ONLY 标记的占位 allowlist 并在
-    stderr 警告，这样 `cdk synth` 离线能跑，但该模板**绝不能部署**（verify_deployed_edge.sh 会抓到标记）。
+    SSM 读失败沿用 load_jwt_secret 的语义（见 `_synth_offline`）：**默认让 synth 失败**；只有显式
+    `APP_SYNTH_OFFLINE=1` 才注入带 SYNTH-ONLY 标记的占位 allowlist 并在 stderr 警告，该模板**绝不能部署**
+    （verify_deployed_edge.sh 会抓到标记）。非 HS256 行是配置错，任何模式都抛。
     """
     _session_keys_on_path()          # 无条件放路径：不依赖调用方是否先调过 _session_keys()
     from session_keys import SYNTH_PLACEHOLDER_ALLOWLIST_JSON, legacy_entry
@@ -141,18 +159,26 @@ def load_site_allowlist(keys) -> tuple:
     if override:
         text = override
     else:
+        site_refs = list(keys.allowlist("site"))
+        for ref in site_refs:                      # 配置校验在 try 之外：写错不是"读不到"，任何模式都抛
+            if ref.alg != "HS256":
+                raise ValueError(f"{ref.kid}: 3c-1A 的 Edge 只支持 HS256 行（RS 行是 3c-2B）")
         try:
             import boto3
             ssm = boto3.client("ssm", region_name="us-east-1")
             allow = {}
-            for ref in keys.allowlist("site"):
-                if ref.alg != "HS256":
-                    raise ValueError(f"{ref.kid}: 3c-1A 的 Edge 只支持 HS256 行（RS 行是 3c-2B）")
+            for ref in site_refs:
                 val = ssm.get_parameter(Name=ref.ssm_param, WithDecryption=True)["Parameter"]["Value"]
                 allow[ref.kid] = {"alg": ref.alg, "secret": val, "role": ref.role}
             text = json.dumps(allow, separators=(",", ":"))
-        except Exception as exc:  # noqa: BLE001 - deliberate synth-time fallback
-            print(f"WARNING: could not build the site allowlist from SSM ({exc}); "
+        except Exception as exc:  # noqa: BLE001
+            if not _synth_offline():
+                raise RuntimeError(
+                    f"按 [SessionKeys] 从 SSM 组装 site allowlist 失败（{type(exc).__name__}: {exc}）——synth 拒绝生成"
+                    "模板，什么都不会部署。这是 cdk deploy 路径：先确认 ensure_session_keys.py 已建参数、凭据可读；"
+                    "离线只看模板请显式设 APP_SYNTH_OFFLINE=1（产物带 SYNTH-ONLY 标记，不可部署）"
+                    "或用 APP_SITE_ALLOWLIST_JSON 覆盖。") from exc
+            print(f"WARNING: could not build the site allowlist from SSM ({exc}); APP_SYNTH_OFFLINE=1 ⇒ "
                   "injecting the SYNTH-ONLY placeholder allowlist. DO NOT deploy this template.",
                   file=sys.stderr)
             text = SYNTH_PLACEHOLDER_ALLOWLIST_JSON   # 合法 JSON、带标记、kid 永不匹配（session_keys 里有说明）

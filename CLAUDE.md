@@ -282,8 +282,9 @@ python3 site-builder/scripts/gen_onboarding.py
   （`auth/pre_token_email.py`）注入——MCP 网关只收 access token
   （id_token 会 401，不要把 authorizer 改成 allowedAudience）。
 - **Lambda@Edge 不支持环境变量**：Edge 函数的配置（表名、JWT 密钥）由 CDK
-  部署时字符串替换注入（`{{PLACEHOLDER}}` 形态）。看到
-  `SYNTH-ONLY-PLACEHOLDER` 警告说明 SSM 读取失败，此时部署出去所有会话验签失败。
+  部署时字符串替换注入（`{{PLACEHOLDER}}` 形态）。SSM 读取失败时 **synth 直接失败、什么都不部**
+  （3c-1B ticket 19 起；此前只打一行 `SYNTH-ONLY-PLACEHOLDER` 警告而 `cdk deploy` 照样 exit 0）；
+  占位符只在显式 `APP_SYNTH_OFFLINE=1` 下出现，那种模板不可部署，`verify_deployed_edge.sh` 会抓。
 
 ## 不可破坏的系统不变量
 

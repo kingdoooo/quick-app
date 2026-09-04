@@ -101,7 +101,8 @@ base_domain = example.com
 #   * the legacy shared key, from [SessionKeys] legacy_param (3c-1B; the path is NO LONGER
 #     hardcoded here). Clearing legacy_param closes the legacy entry (L3): {{JWT_SECRET}} then
 #     gets an EMPTY STRING and LEGACY_ENTRY=off. An empty string is NOT the SYNTH placeholder --
-#     seeing SYNTH-ONLY-PLACEHOLDER means the SSM read actually failed, do not deploy.
+#     an SSM read failure makes synth FAIL (nothing is deployed); the SYNTH-ONLY-PLACEHOLDER
+#     fallback only exists under an explicit APP_SYNTH_OFFLINE=1 and that template must not be deployed.
 # The login-flow secret is auth-private and never reaches the Edge (a gate asserts this).
 # Create the keys with site-builder/scripts/ensure_session_keys.py (idempotent); rotation follows
 # the ten-step runbook in site-builder/DEPLOY.md -- never overwrite a session key in place.

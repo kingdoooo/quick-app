@@ -162,9 +162,10 @@ aws ssm put-parameter --region us-east-1 \
 ```
 
 `jwt-secret` 必须早于 ② 存在：② 的栈部署时从 SSM 读它并字符串替换注入 Edge
-函数（Lambda@Edge 不支持环境变量）。读取失败时会打印
-`SYNTH-ONLY-PLACEHOLDER-DO-NOT-DEPLOY` 警告，此时**不要继续**——否则每个会话
-token 都验签失败，表现为无限登录跳转。
+函数（Lambda@Edge 不支持环境变量）。读取失败时 **synth 直接报错退出、不生成模板**
+（3c-1B ticket 19 起；此前只打一行 `SYNTH-ONLY-PLACEHOLDER-DO-NOT-DEPLOY` 警告而 deploy 照样
+继续，部出去的每个会话 token 都验签失败、表现为无限登录跳转）。只有显式 `APP_SYNTH_OFFLINE=1`
+才会退化成占位符模板，那种模板**不可部署**。
 
 **两个密钥都不进 Lambda 环境变量**：auth 服务只拿到参数名
 （`JWT_SECRET_PARAM` / `CLIENT_SECRET_PARAM`），运行时读 SSM 并在容器内缓存。
@@ -691,7 +692,9 @@ python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump "$DUMP
 ```
 
 > **空串不是 SYNTH 占位符**：`verify_deployed_edge.sh` 的两条占位符断言不会因为"刻意为空"
-> 而误报。看到 `SYNTH-ONLY-PLACEHOLDER` 才是 SSM 读取真的失败了。
+> 而误报。看到 `SYNTH-ONLY-PLACEHOLDER` 才是 SSM 读取真的失败了——而 ticket 19 起那种失败会让 synth
+> 直接退出，正常 `cdk deploy` 路径上已经到不了产物核对这一步；产物里若仍出现占位符，说明有人带着
+> `APP_SYNTH_OFFLINE=1` 部署了，同样按故障处理。
 >
 > 清空 `legacy_param` **之前** `signer` 必须已经是 `current`：加载器硬拒 `(legacy, 空)` 这个
 > 组合。到这里为止都是一次性的；下面五步是永久的轮转协议。
@@ -1539,7 +1542,8 @@ PY
    grep -c SYNTH-ONLY-PLACEHOLDER /tmp/edge/index.py    # 必须是 0
    ```
 
-   出现 `SYNTH-ONLY-PLACEHOLDER` 说明 synth 时读 SSM 失败，**部署出去的所有
+   出现 `SYNTH-ONLY-PLACEHOLDER` 说明 synth 时读 SSM 失败且有人带着 `APP_SYNTH_OFFLINE=1` 部署
+   （ticket 19 起默认会在 synth 阶段直接失败），**部署出去的所有
    会话验签都会失败**（Lambda@Edge 不支持环境变量，配置靠部署时字符串替换）。
 
 3. **admin 种子**（在 ④ 建出 `site-admins` 表之后跑）：`site-builder/config.ini`
@@ -1814,8 +1818,9 @@ name**；值必须是裸 `true`/`false`——configparser 会把行内注释并�
    PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never
   ```
 
-   stack.py 部署时会从 SSM 读真实 JWT_SECRET 注入 Edge 函数（`load_jwt_secret`）；若打印
-   `SYNTH-ONLY-PLACEHOLDER` 警告说明 SSM 读取失败，**不要继续**——检查凭证与 SSM 参数。
+   stack.py 部署时会从 SSM 读真实密钥注入 Edge 函数（`load_jwt_secret` / `load_site_allowlist`）；
+   读取失败时 synth 直接报 `RuntimeError` 退出、不部署（ticket 19 起）——检查凭证与 SSM 参数后重跑。
+   若看到 `SYNTH-ONLY-PLACEHOLDER` 警告仍继续部署了，说明环境里带着 `APP_SYNTH_OFFLINE=1`，去掉它。
 
    > **`cdk deploy` 会长时间挂在最后一步**（Lambda@Edge 复制到全球边缘节点，可达
    > 10-20 分钟），期间 CloudFormation 可能已是 `UPDATE_COMPLETE`。用
