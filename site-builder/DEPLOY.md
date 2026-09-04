@@ -751,7 +751,7 @@ python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump "$D2" 
 |---|---|
 | **配置** | `site_current = site-hs-v2` / `site_previous = site-hs-v1`；console 同理（**两槽互换**）|
 | **动作** | 片段 A 的 panel **先** → 片段 A 的 auth **后**（返回时刻 = **T1**）→ 探针 → **再部一次 Edge**（片段 B）|
-| **硬停止点** | `--role current` 与 `--role previous` **都必须 200**；Edge 重部并 `Deployed` 之后 `verify_deployed_edge.sh` 绿 |
+| **硬停止点** | `--role current` 与 `--role previous` **都必须 200**；Edge 重部并 `Deployed` 之后 `verify_deployed_edge.sh` 绿；**标签摆正要用读数证明**（见本步末尾）|
 | **闸门** | 无需声明（密钥集合没变，只换了标签）|
 | **回滚** | 互换回去 → 重部 panel + auth。**Edge 不必回滚**（双接受）|
 
@@ -767,6 +767,15 @@ python3 site-builder/scripts/verify_kid_entry_live.py --role previous
 > `accepted_current`、v2 记成 `accepted_previous`，与 auth/panel 正好相反。站点会话的绝大多数
 > 验签发生在 Edge，⑨ 的排空曲线本来就该在 Edge 列上读，所以标签必须摆正。它不在关键路径上
 > （Edge 早已双接受）。
+>
+> **怎么证明标签真的摆正了**（`verify_deployed_edge.sh` 只核对 kid 集合，**不核对 role**）：两条，都便宜。
+> ① 从产物里把 kid→role 解出来（不解 secret）：
+> `aws lambda get-function --function-name <栈名>-<origin_request_function_name> --qualifier <版本> --query Code.Location`
+> → 下载解包 → 从 `SITE_ALLOWLIST_JSON` 读 `{kid: role}`，必须与 config 的槽位一致。
+> ② 行为侧：Edge 重部之后**只**发一次 `--role current` 探针，再读一个窄窗口
+> （`session_verify_counts.py --hours 0.1`，约 6 分钟）——`accepted_previous` 必须三列全 0。
+> 只发一种 role 是关键：两条探针都跑过就分不清哪一列来自哪一枚。2026-09-04 ⑦ 实测两条都过
+> （产物 `{site-hs-v2: current, site-hs-v1: previous}`；窄窗口 `accepted_current` 1/0/1、`accepted_previous` 全 0）。
 
 ##### ⑧ 回滚演示（= T2）
 
