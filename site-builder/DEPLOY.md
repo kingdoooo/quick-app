@@ -497,7 +497,11 @@ python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump "$DUMP
 > 没有迁移通道**，所以不要按"闸门必须全绿"验收这几步。**良性 churn 的五条判据**（全中才算
 > 良性，任一条不成立就是真漂移，停下来查）：
 >
-> 1. `undecided_items` 的总量 delta 是 `+0`（或 ≤ 本轮声明的 key 数所能解释的量）；
+> 1. `undecided_items` 的总量 delta 是 `+0`（或 ≤ 本轮声明的 key 数所能解释的量；**或**能归因到点名的
+>    无关 principal——`aws iam list-roles/list-users` 按 CreateDate 落在两次扫描之间过滤，带 Condition 策略的
+>    每个最多贡献 5 条（成员指纹上界 = principal × 动作类）。2026-09-04 ⑥ 实测：同账号另一工程新建 6 个
+>    `bedrock-*` 角色、2 个带 Condition ⇒ `+10` 与 `principals_with_missing_context +2`，与两把 v2 无关。
+>    共享账号里每一步都可能撞上，归因写进 progress 再接受，不许只凭"数字不大"接受）；
 > 2. 红的条数 == 绿「已能判定」的条数（1:1 置换）；
 > 3. 迁移分节**只**含本轮声明的 label；
 > 4. 其余红字段（`new_grants` / `missing_required` / `new_statements` /
