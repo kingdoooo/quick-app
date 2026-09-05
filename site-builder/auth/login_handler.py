@@ -556,9 +556,19 @@ def handler(event, context):
         if not code:
             return {"statusCode": 400,
                     "body": "授权失败或被取消，请重新登录"}
-        # 开关先读、`_exchange_code` 后调：缺 SESSION_SIGNER 时的响亮失败必须发生在**烧掉这枚
-        # 一次性授权码之前**，否则用户重试还得从 /login 重来一遍（code 不能复用）。
+        # 开关与签发密钥都先读、`_exchange_code` 后调：响亮失败必须发生在**烧掉这枚一次性
+        # 授权码之前**，否则用户重试还得从 /login 重来一遍（code 不能复用），而配置修好之前
+        # 每一次登录都如此。
+        # **真正会失败的是取密钥这步，不是开关**：`_signing_key` → allowlist 解析 →
+        # `ssm:GetParameter`，失败面是 SESSION_KEYS_JSON 缺失/非 JSON/family 缺 current、
+        # AccessDenied、ParameterNotFound（新 kid 的参数还没建）——都比"环境变量字面量漏下发"
+        # 常见得多。提前取零成本：两条路都吃 `_secret_cache` 的 TTL 缓存，签发时命中缓存。
+        # legacy 那条随 3c-3 删 legacy 入口时一起消失，在那之前同样守住。
         signer = _signer_mode()
+        if signer == "current":
+            kid, secret = _signing_key("site")
+        else:
+            legacy_secret = _secret("JWT_SECRET")
         try:
             user = _exchange_code(code, pkce["v"], pkce["n"])
         except (ValueError, TokenExchangeRejected, pyjwt.InvalidTokenError):
@@ -574,15 +584,15 @@ def handler(event, context):
         # 3c-1B：签发形态由 SESSION_SIGNER 决定（spec §11.8.3）。current 用 site family 的
         # current kid + 新合同（token_use/aud/iat，无 payload typ）；legacy 字节级沿用旧形态。
         # 两条分支的 TTL 与 cookie 属性完全相同——本票只换签名密钥与 claim 集合。
+        # 密钥在上面（交换之前）就取好了，这里只用不取。
         if signer == "current":
-            kid, secret = _signing_key("site")
             token = mint_token(kid=kid, secret=secret, token_use="site-session",
                                email=user["email"], ttl_seconds=SESSION_TTL_SECONDS,
                                name=user["name"], idp=user.get("idp", ""),
                                auth_via=user.get("auth_via", ""))
         else:
             token = mint_session_jwt(user["email"], user["name"],
-                                     _secret("JWT_SECRET"), ttl_seconds=SESSION_TTL_SECONDS,
+                                     legacy_secret, ttl_seconds=SESSION_TTL_SECONDS,
                                      idp=user.get("idp", ""),
                                      auth_via=user.get("auth_via", ""))
         cookie = (f"sb_session={token}; Domain=.{base}; Path=/; Max-Age={SESSION_TTL_SECONDS}; "

@@ -885,3 +885,49 @@ def test_missing_or_illegal_session_signer_fails_loudly_instead_of_signing(bad):
     with patch.dict(lh.os.environ, env):
         with pytest.raises(RuntimeError, match="SESSION_SIGNER"):
             _console_session([f"sb_session={_kid_session()}"])
+
+
+# ---- 3c-1B/20：取签发密钥必须发生在烧掉一次性授权码之前 --------------------------------
+#
+# 判据是 **`_exchange_code` 一次都没被调用**，不是状态码：授权码只要递给 Cognito 的 token
+# 端点就已经被消费，之后无论返回 500 还是 400，用户都得从 `/login` 重来一遍。取密钥的失败面
+# （SESSION_KEYS_JSON 缺失/非 JSON/family 缺 current、`ssm:GetParameter` AccessDenied、
+# ParameterNotFound）比"缺 SESSION_SIGNER"常见得多，而配置修好之前**每一次**登录都这样。
+
+# 三种真实配置事故，都不 patch 内部函数（只动环境/参数），所以证明的是生产会走的那条路。
+_KEY_FAILURES = (
+    # SESSION_KEYS_JSON 整个漏下发（current 侧）
+    ({k: v for k, v in ENV_CURRENT.items() if k != "SESSION_KEYS_JSON"},
+     "SESSION_KEYS_JSON", "missing-keys-json"),
+    # 新 kid 的 SSM 参数还没建 ⇒ 取值那一步炸（conftest 的假 SSM 只认已存在的参数名）
+    (dict(ENV_CURRENT, SESSION_KEYS_JSON=json.dumps({
+        "site": [{"kid": "site-hs-v2", "alg": "HS256", "role": "current",
+                  "ssm_param": "/site-builder/session-keys/site-hs-v2"}],
+        "console": [{"kid": "console-hs-v1", "alg": "HS256", "role": "current",
+                     "ssm_param": "/site-builder/session-keys/console-hs-v1"}]})),
+     "site-hs-v2", "parameter-not-found"),
+    # legacy 侧同理：`_secret("JWT_SECRET")` 无来源（L3 之后这就是线上的真实形态）
+    ({k: v for k, v in ENV.items() if k != "JWT_SECRET"},
+     "JWT_SECRET", "legacy-secret-missing"),
+)
+
+
+@pytest.mark.parametrize("env, match, _id", _KEY_FAILURES, ids=[c[2] for c in _KEY_FAILURES])
+def test_callback_fetches_the_signing_key_before_burning_the_authorization_code(env, match, _id):
+    """签发密钥取不到时，那枚一次性授权码必须**还没被交换**（用户重试 callback 即可）。"""
+    del _id
+    with patch.dict(lh.os.environ, env), patch.object(lh, "_exchange_code") as mock_ex:
+        r_login = lh.handler(_event("/login", {"redirect": "https://app-x.example.com/"}), None)
+        import urllib.parse as up
+        state = up.unquote(r_login["headers"]["Location"].split("state=")[1].split("&")[0])
+        pkce = next(c for c in r_login["cookies"] if c.startswith(lh.PKCE_COOKIE)).split(";")[0]
+        with pytest.raises(RuntimeError, match=match):
+            lh.handler(_event("/callback", {"code": "abc", "state": state}, cookies=[pkce]), None)
+        mock_ex.assert_not_called()
+
+
+def test_callback_still_exchanges_and_signs_when_the_signing_key_is_fine():
+    """正对照：上面那条不是靠"永远不交换"通过的——配置正常时两侧都照常签出会话。"""
+    for env in (ENV, ENV_CURRENT):
+        r = _do_callback(env)
+        assert r["statusCode"] == 302 and _session_cookie(r).count(".") == 2
