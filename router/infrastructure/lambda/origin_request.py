@@ -34,7 +34,8 @@ JWT_SECRET = "{{JWT_SECRET}}"  # Task 7 使用
 # 文本里没有 ''' 与反斜杠。JWT_SECRET 从此只是 **legacy 入口**的密钥，3c-3 一并删。
 SITE_ALLOWLIST_JSON = '''{{SITE_ALLOWLIST_JSON}}'''
 LEGACY_ENTRY = "{{LEGACY_ENTRY}}"        # "on" | "off"（[SessionKeys] legacy_param 非空即 on）
-_SITE_ALLOWLIST = json.loads(SITE_ALLOWLIST_JSON)
+# 解析结果的缓存。None = 还没解析过；解析在 `_site_allowlist()` 里**惰性**做（ticket 21）。
+_SITE_ALLOWLIST = None
 _ROUTE_CACHE: dict = {}  # subdomain -> (expires_epoch, item)
 ROUTE_CACHE_TTL = 60
 DEFAULT_PROTOCOL = "https"
@@ -43,8 +44,62 @@ DEFAULT_SSL_PROTOCOLS = ["TLSv1.2"]
 DEFAULT_READ_TIMEOUT = 30
 DEFAULT_KEEPALIVE_TIMEOUT = 5
 
-# 初始化DynamoDB客户端
-dynamodb = boto3.client("dynamodb", region_name=DYNAMODB_REGION)
+# 路由表 client（**惰性**，见 _ddb）
+_ROUTE_TABLE_CLIENT = None
+
+
+def _site_allowlist() -> dict:
+    """site family 的 kid allowlist，**首次使用时才解析**（3c-1B ticket 21）。
+
+    原先这次解析在**模块顶层**（`_SITE_ALLOWLIST = …` 直接调 json 解析，注意别在注释里重复
+    那个调用的字面写法——有一条守卫按出现次数断言"只解析一处"）。那一行在注入值不是
+    合法 JSON 时（stack.py 的替换表漏了这个注入点、或误用 APP_SYNTH_OFFLINE 的产物）会在
+    **import 期**抛 JSONDecodeError ⇒ Lambda@Edge 连 handler 都实例化不了 ⇒ 该分发上**所有**
+    请求 502，含 require_auth=False 的公开站点、静态资源与 console 前端。挪进本函数之后，
+    只有**带 sb_session 的私有路由请求**会 500：`_check_auth` 在 `require_auth is False` 与
+    "没有 cookie"两条路上都到不了这里，legacy 入口那条分支也在取 allowlist 之前就返回了。
+
+    **报文只点名注入点、绝不回显值**：这份 JSON 是 kid -> {alg, secret, role}，即每把会话
+    密钥的明文。也**不 chain 原异常**（`from None`）：`JSONDecodeError` 把整份文本挂在 `.doc`
+    上，当前 CPython 不把它放进 `args`/`str()`，但那不是契约——别给它进日志的机会。
+
+    ⚠️ 讲这些注入点时**用名字、不要写花括号形态**：stack.py 的注入是全文替换，注释里出现
+    一次就会在产物里把值多印一遍（allowlist 那份=多印一次密钥），而逐行比对与残留检查都在
+    替换之后做、两侧一致 ⇒ 看不出来。`test_edge_lazy_config.py` 有一条守卫盯着这点。
+    """
+    global _SITE_ALLOWLIST
+    if _SITE_ALLOWLIST is None:
+        try:
+            parsed = json.loads(SITE_ALLOWLIST_JSON)
+        except ValueError:
+            raise RuntimeError(
+                "SITE_ALLOWLIST_JSON 不是合法 JSON：部署时的字符串替换没落到这个注入点"
+                "（stack.py 的替换表漏了它，或这是 APP_SYNTH_OFFLINE=1 的产物——那种模板"
+                "不可部署）。值不打印：它是每个 kid 的签名密钥。") from None
+        if not isinstance(parsed, dict):
+            raise RuntimeError(
+                f"SITE_ALLOWLIST_JSON 解析出 {type(parsed).__name__}，要的是 kid -> 条目 的对象"
+                "——注错形状时不要留到按 kid 取值那一步才 TypeError。")
+        _SITE_ALLOWLIST = parsed
+    return _SITE_ALLOWLIST
+
+
+def _ddb():
+    """路由表 client，**首次使用时才建**（3c-1B ticket 21）。
+
+    botocore 会校验 region 名的形态，所以 DYNAMODB_REGION 这个注入点没被替换时，原先模块顶层
+    那一行会抛 InvalidRegionError——与上面那个 json.loads 一样是 import 期失败。
+
+    **这一条并不缩小爆炸半径**（每个请求都要查路由表，坏了就是全坏），它买的是另外两样：
+    ① 不做任何替换也能 import 本模块，测试与工具不必维护整张替换表（漏一项的症状原本是
+       "import 期一个与占位符毫无关系的异常"，报文里根本不提注入点）；
+    ② 失败落进 `lambda_handler` 的 except ⇒ 有一行带 exc_info 的日志，且 botocore 的报文里
+       直接带着那个未被替换的注入点名字。
+    """
+    global _ROUTE_TABLE_CLIENT
+    if _ROUTE_TABLE_CLIENT is None:
+        _ROUTE_TABLE_CLIENT = boto3.client("dynamodb", region_name=DYNAMODB_REGION)
+    return _ROUTE_TABLE_CLIENT
 
 # ── 访问埋点（M5）──────────────────────────────────────────────────
 # 只记**页面级**请求，且只记 app- 前缀的用户站点。写本区副本（Global Table）。
@@ -384,9 +439,9 @@ def _lookup_route(subdomain: str):
     if hit and hit[0] > _t.time():
         return hit[1]
     try:
-        resp = dynamodb.get_item(TableName=DYNAMODB_TABLE_NAME,
-                                 Key={"subdomain": {"S": subdomain}},
-                                 ConsistentRead=False)
+        resp = _ddb().get_item(TableName=DYNAMODB_TABLE_NAME,
+                               Key={"subdomain": {"S": subdomain}},
+                               ConsistentRead=False)
         item = _deser(resp["Item"]) if "Item" in resp else None
     except ClientError as e:
         logger.error(f"DynamoDB错误: {e}")
@@ -501,10 +556,13 @@ def _verify_site_session(token: str) -> tuple:
         return None, "bad_signature"
     if "kid" not in header and LEGACY_ENTRY == "on":
         return _verify_legacy_site_session(token)
+    # allowlist 在这里才取（ticket 21）：**位置本身是契约的一部分**——放到函数开头会让
+    # legacy 入口那条分支也依赖它，注入坏掉时连"无 kid 的旧 cookie"都跟着 500。
+    allowlist = _site_allowlist()
     kid = header.get("kid")
-    if not isinstance(kid, str) or kid not in _SITE_ALLOWLIST:
+    if not isinstance(kid, str) or kid not in allowlist:
         return None, "unknown_kid"
-    entry = _SITE_ALLOWLIST[kid]
+    entry = allowlist[kid]
     if header.get("alg") != entry["alg"]:
         return None, "alg_mismatch"
     try:

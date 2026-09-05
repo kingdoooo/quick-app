@@ -107,7 +107,9 @@ dep = open(sys.argv[2]).read().splitlines()
 if len(src) != len(dep):
     sys.exit(f"FAIL  行数不一致：源码 {len(src)} / 产物 {len(dep)}"
              " —— 产物不是这份源码构建的（多半用了陈旧 cdk.out）")
-ph_re = re.compile(r"\{\{[A-Z_]+\}\}")
+# **必须含数字**（ticket 21）：`[A-Z_]+` 抓不到 `ACCESS_TABLE_V2` 这类注入点名字，
+# 而没被替换的那一行在源码与产物里**完全相同** ⇒ 不进 diff、这里也不报，两侧齐齐失明。
+ph_re = re.compile(r"\{\{[A-Z0-9_]+\}\}")
 other = [(i + 1, a, b) for i, (a, b) in enumerate(zip(src, dep))
          if a != b and not ph_re.search(a)]
 if other:
@@ -125,8 +127,8 @@ if grep -q "SYNTH-ONLY-PLACEHOLDER" "$TMP/index.py"; then
 else
   echo "PASS  无 SYNTH-ONLY-PLACEHOLDER"
 fi
-# 占位符一个都不该残留（不只 SYNTH 那个）
-LEFT="$(grep -o '{{[A-Z_]*}}' "$TMP/index.py" | sort -u | tr '\n' ' ' || true)"
+# 占位符一个都不该残留（不只 SYNTH 那个）。字符类**含数字**，理由同 ③ 里那条注释。
+LEFT="$(grep -o '{{[A-Z0-9_]*}}' "$TMP/index.py" | sort -u | tr '\n' ' ' || true)"
 if [ -n "$LEFT" ]; then
   fail "产物里仍有未替换的占位符: $LEFT"
 else

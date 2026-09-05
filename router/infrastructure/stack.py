@@ -6,6 +6,7 @@ CloudFront-based dynamic subdomain routing system using Lambda@Edge and DynamoDB
 import os
 import configparser
 import json
+import re
 import sys
 import tempfile
 import shutil
@@ -62,6 +63,29 @@ def _synth_offline() -> bool:
     配置错误（如非 HS256 行）在任何模式下都抛：那不是"读不到"，是写错了。
     """
     return os.getenv("APP_SYNTH_OFFLINE") == "1"
+
+
+def assert_edge_source_fully_injected(src: str) -> str:
+    """注入完成的 Edge 源码里**不许剩任何 `{{…}}`**，剩了就让 synth 失败（3c-1B ticket 21）。
+
+    要防的不是"值读不到"（ticket 19 已经让那条在 synth 失败），而是**替换表漏项**：给
+    `origin_request.py` 加一个注入点却忘了往下面那条 replace 链里补一行，产物就会带着字面量
+    占位符部署出去，且没有任何一步会拦——`cdk deploy` 照常 exit 0。
+
+    运行期的惰性解析（同一张票的另一半）把这种产物的后果从"整个分发 502"降成"带 cookie 的
+    私有请求 500"，但**坏产物本来就不该被生成**：Edge 改一次要 10-20 分钟全球复制才能回滚。
+
+    正则与 lambda/edge_substitutions.py 同款、**含数字**：`[A-Z_]+` 会让
+    `ACCESS_TABLE_V2` 这类注入点悄悄躲过检查（那正是 ticket 22 修掉的旧缺陷）。
+    """
+    left = sorted(set(re.findall(r"\{\{[A-Z0-9_]+\}\}", src)))
+    if left:
+        raise ValueError(
+            f"Edge 源码注入后仍有未替换的占位符 {left}——`origin_request.py` 新增了注入点，"
+            "但 stack.py 的替换链没跟上。synth 拒绝生成模板（带占位符的产物部署出去会让"
+            "私有站点的已登录请求 500，而 Edge 回滚要 10-20 分钟全球复制）。"
+            "补一行 replace，并同步 lambda/edge_substitutions.py 的 DEFAULTS。")
+    return src
 
 
 def load_jwt_secret(legacy_param: str) -> str:
@@ -349,7 +373,9 @@ class WebRouterStack(Stack):
             .replace("{{TRUSTED_IDPS}}", trusted_idps)
             .replace("{{ACCESS_TABLE}}", access_table)
             .replace("{{ACCESS_REPLICA_REGIONS}}", ",".join(access_regions)))
-        
+        # 全部替换完成之后、写产物之前：漏项即 synth 失败（ticket 21，见函数 docstring）
+        lambda_code = assert_edge_source_fully_injected(lambda_code)
+
         # Write to temporary file
         temp_dir = tempfile.mkdtemp()
         with open(os.path.join(temp_dir, 'index.py'), 'w') as f:

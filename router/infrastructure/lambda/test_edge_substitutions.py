@@ -27,11 +27,17 @@ def test_defaults_cover_every_placeholder_in_the_real_edge_source():
 
 
 def test_the_real_source_substitutes_clean_and_imports():
-    """端到端：真源经默认值替换后无残留、且能 import（模块级 json.loads 会在这里体现）。"""
+    """端到端：真源经默认值替换后无残留、且**替换值真的能被消费**。
+
+    ticket 21 之后 allowlist 是惰性解析的（`_SITE_ALLOWLIST` 在 import 期是 None），所以这里
+    必须调那个取值函数——只断言 import 成功已经不能证明"注入值是合法 JSON"了
+    （不替换也能 import 正是那张票买的东西，见 test_edge_lazy_config.py）。
+    """
     src = es.edge_source()
     assert not es.PLACEHOLDER_RE.findall(src)
     mod = es.load_edge_module("_edge_subs_selftest")
-    assert isinstance(mod._SITE_ALLOWLIST, dict) and "site-hs-v1" in mod._SITE_ALLOWLIST
+    allowlist = mod._site_allowlist()
+    assert isinstance(allowlist, dict) and "site-hs-v1" in allowlist
 
 
 def test_a_missing_substitution_is_a_loud_error_naming_the_placeholder():

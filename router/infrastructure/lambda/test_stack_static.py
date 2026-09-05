@@ -285,3 +285,49 @@ def test_legacy_secret_ssm_failure_fails_synth_by_default_too(clean_env, monkeyp
     with pytest.raises(Exception) as ei:
         mod.load_jwt_secret(LIVE_LEGACY)
     assert "ParameterNotFound" in str(ei.value) and OFFLINE_FLAG in str(ei.value)
+
+
+# ---- 3c-1B ticket 21：注入表漏项必须让 synth 失败（惰性解析只缩小半径，不该让坏产物出得去）----
+#
+# 运行期改成惰性之后，"占位符没被替换"从"整个分发 502"降级成"带 cookie 的私有请求 500"。
+# 但那仍然是故障——根治是**这种产物根本不该被生成**。ticket 19 已经让"SSM 读不到"在 synth
+# 失败，这一组补上另一半：`origin_request.py` 新增注入点而上面那条 replace 链漏改。
+
+def _residue_check_fn():
+    """把残留检查函数单独切出来（片段只含它一个，结束锚点是下一个 def）。"""
+    start = SRC.index("def assert_edge_source_fully_injected")
+    end = SRC.index("def ", start + 1)
+    mod = types.ModuleType("_stack_residue_fragment")
+    mod.__dict__.update(re=__import__("re"))
+    exec(compile(textwrap.dedent(SRC[start:end]), "<stack fragment>", "exec"), mod.__dict__)
+    return mod
+
+
+def test_residue_check_passes_a_fully_injected_source():
+    """正对照：全都替换过的文本必须原样返回（否则下面那条可以靠"永远抛"通过）。"""
+    mod = _residue_check_fn()
+    src = 'A = "us-east-1"\nB = """{"kid": {}}"""\n'
+    assert mod.assert_edge_source_fully_injected(src) == src
+
+
+@pytest.mark.parametrize("left", ["{{NEW_THING}}", "{{ACCESS_TABLE_V2}}"],
+                         ids=["plain", "with-digit"])
+def test_residue_check_fails_and_names_what_was_missed(left):
+    """含数字的占位符也要抓到——旧的 `[A-Z_]+` 会让 `{{ACCESS_TABLE_V2}}` 悄悄躲过去。"""
+    mod = _residue_check_fn()
+    with pytest.raises(ValueError, match=left.strip("{}")):
+        mod.assert_edge_source_fully_injected(f'X = "{left}"\n')
+
+
+def test_residue_check_runs_before_the_asset_is_written():
+    """顺序是全部：检查必须在写 index.py / from_asset **之前**，否则坏产物已经生成了。"""
+    body = SRC[SRC.index("class WebRouterStack"):]
+    checked = body.index("assert_edge_source_fully_injected(lambda_code)")
+    written = body.index("'index.py'")
+    assert checked < written, "残留检查跑在写产物之后 = 什么都没拦住"
+
+
+def test_residue_check_is_not_bypassed_by_a_second_write_path():
+    """产物只许由那一处写出去：多一条 `write(lambda_code)` 就绕过了检查。"""
+    body = SRC[SRC.index("class WebRouterStack"):]
+    assert body.count("f.write(lambda_code)") == 1

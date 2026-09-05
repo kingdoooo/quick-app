@@ -191,8 +191,11 @@ def test_outcome_is_logged_as_fixed_vocabulary_without_the_token(caplog):
 
 def test_source_indexes_allowlist_only_by_kid_and_parses_it_once():
     assert SRC.count("json.loads(SITE_ALLOWLIST_JSON)") == 1
-    indexes = re.findall(r"_SITE_ALLOWLIST\[([^\]]+)\]", SRC)
+    # ticket 21 起解析是惰性的，取值经 `allowlist = _site_allowlist()` 落到一个局部名上；
+    # 本守卫盯的东西没变：**kid 只用来查表**（`\b` 让它不会误匹配 `_site_allowlist[`）。
+    indexes = re.findall(r"\ballowlist\[([^\]]+)\]", SRC)
     assert indexes and set(indexes) == {"kid"}, indexes
+    assert "_site_allowlist()" in SRC, "取值函数没了？那 allowlist 又回到模块级解析了"
     assert "SITE_ALLOWLIST_JSON = '''{{SITE_ALLOWLIST_JSON}}'''" in SRC
     assert 'LEGACY_ENTRY = "{{LEGACY_ENTRY}}"' in SRC
 
