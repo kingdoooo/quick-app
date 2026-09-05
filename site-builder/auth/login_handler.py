@@ -562,13 +562,18 @@ def handler(event, context):
         # **真正会失败的是取密钥这步，不是开关**：`_signing_key` → allowlist 解析 →
         # `ssm:GetParameter`，失败面是 SESSION_KEYS_JSON 缺失/非 JSON/family 缺 current、
         # AccessDenied、ParameterNotFound（新 kid 的参数还没建）——都比"环境变量字面量漏下发"
-        # 常见得多。提前取零成本：两条路都吃 `_secret_cache` 的 TTL 缓存，签发时命中缓存。
+        # 常见得多。提前取不增加成本：**取密钥的总次数不变**（还是一次，只是挪到了前面），
+        # 而 `_secret_cache` 的 TTL 让它在 warm 容器上通常连 SSM 都不打。代价只有一处：
+        # code 无效的那些 callback 现在也会取一次密钥（以前跳过），上界仍是每 300 秒一次。
         # legacy 那条随 3c-3 删 legacy 入口时一起消失，在那之前同样守住。
         signer = _signer_mode()
         if signer == "current":
             kid, secret = _signing_key("site")
         else:
-            legacy_secret = _secret("JWT_SECRET")
+            # 名字带 signing：本函数下面的 /console-session 分支另有一个 `legacy_secret`，
+            # 那是**验签**用的（`_legacy_secret()`，LEGACY_ENTRY 关掉时是 None）。
+            # 同名会让"签发密钥"与"可以是 None 的验签密钥"在同一个作用域里混淆。
+            legacy_signing_secret = _secret("JWT_SECRET")
         try:
             user = _exchange_code(code, pkce["v"], pkce["n"])
         except (ValueError, TokenExchangeRejected, pyjwt.InvalidTokenError):
@@ -592,7 +597,7 @@ def handler(event, context):
                                auth_via=user.get("auth_via", ""))
         else:
             token = mint_session_jwt(user["email"], user["name"],
-                                     legacy_secret, ttl_seconds=SESSION_TTL_SECONDS,
+                                     legacy_signing_secret, ttl_seconds=SESSION_TTL_SECONDS,
                                      idp=user.get("idp", ""),
                                      auth_via=user.get("auth_via", ""))
         cookie = (f"sb_session={token}; Domain=.{base}; Path=/; Max-Age={SESSION_TTL_SECONDS}; "

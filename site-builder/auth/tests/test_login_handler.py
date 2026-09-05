@@ -761,15 +761,22 @@ def _session_cookie(r) -> str:
     return next(c for c in r["cookies"] if c.startswith("sb_session=")).split(";")[0][len("sb_session="):]
 
 
+def _login_leg():
+    """真的走一遍 /login，取回 (state, PKCE cookie)。**必须在目标 env 的 patch 之内调用**
+    ——state 的 HMAC 与 pkce cookie 都由那份 env 里的 login-flow secret 签。"""
+    r_login = lh.handler(_event("/login", {"redirect": "https://app-x.example.com/"}), None)
+    import urllib.parse as up
+    state = up.unquote(r_login["headers"]["Location"].split("state=")[1].split("&")[0])
+    pkce = next(c for c in r_login["cookies"] if c.startswith(lh.PKCE_COOKIE)).split(";")[0]
+    return state, pkce
+
+
 def _do_callback(env, *, email="a@x.com", name="Alice", idp="Feishu",
                  auth_via="TokenGeneration_HostedAuth"):
     """走真的 /login → /callback（state 与 PKCE cookie 都是真的），只 patch code 交换。"""
     user = {"email": email, "name": name, "idp": idp, "auth_via": auth_via}
     with patch.dict(lh.os.environ, env), patch.object(lh, "_exchange_code", return_value=user):
-        r_login = lh.handler(_event("/login", {"redirect": "https://app-x.example.com/"}), None)
-        import urllib.parse as up
-        state = up.unquote(r_login["headers"]["Location"].split("state=")[1].split("&")[0])
-        pkce = next(c for c in r_login["cookies"] if c.startswith(lh.PKCE_COOKIE)).split(";")[0]
+        state, pkce = _login_leg()
         return lh.handler(_event("/callback", {"code": "abc", "state": state}, cookies=[pkce]), None)
 
 
@@ -897,37 +904,42 @@ def test_missing_or_illegal_session_signer_fails_loudly_instead_of_signing(bad):
 # 三种真实配置事故，都不 patch 内部函数（只动环境/参数），所以证明的是生产会走的那条路。
 _KEY_FAILURES = (
     # SESSION_KEYS_JSON 整个漏下发（current 侧）
-    ({k: v for k, v in ENV_CURRENT.items() if k != "SESSION_KEYS_JSON"},
-     "SESSION_KEYS_JSON", "missing-keys-json"),
+    pytest.param({k: v for k, v in ENV_CURRENT.items() if k != "SESSION_KEYS_JSON"},
+                 "SESSION_KEYS_JSON", id="missing-keys-json"),
     # 新 kid 的 SSM 参数还没建 ⇒ 取值那一步炸（conftest 的假 SSM 只认已存在的参数名）
-    (dict(ENV_CURRENT, SESSION_KEYS_JSON=json.dumps({
+    pytest.param(dict(ENV_CURRENT, SESSION_KEYS_JSON=json.dumps({
         "site": [{"kid": "site-hs-v2", "alg": "HS256", "role": "current",
                   "ssm_param": "/site-builder/session-keys/site-hs-v2"}],
         "console": [{"kid": "console-hs-v1", "alg": "HS256", "role": "current",
                      "ssm_param": "/site-builder/session-keys/console-hs-v1"}]})),
-     "site-hs-v2", "parameter-not-found"),
+        "site-hs-v2", id="parameter-not-found"),
     # legacy 侧同理：`_secret("JWT_SECRET")` 无来源（L3 之后这就是线上的真实形态）
-    ({k: v for k, v in ENV.items() if k != "JWT_SECRET"},
-     "JWT_SECRET", "legacy-secret-missing"),
+    pytest.param({k: v for k, v in ENV.items() if k != "JWT_SECRET"},
+                 "JWT_SECRET", id="legacy-secret-missing"),
 )
 
 
-@pytest.mark.parametrize("env, match, _id", _KEY_FAILURES, ids=[c[2] for c in _KEY_FAILURES])
-def test_callback_fetches_the_signing_key_before_burning_the_authorization_code(env, match, _id):
+@pytest.mark.parametrize("env, match", _KEY_FAILURES)
+def test_callback_fetches_the_signing_key_before_burning_the_authorization_code(env, match):
     """签发密钥取不到时，那枚一次性授权码必须**还没被交换**（用户重试 callback 即可）。"""
-    del _id
     with patch.dict(lh.os.environ, env), patch.object(lh, "_exchange_code") as mock_ex:
-        r_login = lh.handler(_event("/login", {"redirect": "https://app-x.example.com/"}), None)
-        import urllib.parse as up
-        state = up.unquote(r_login["headers"]["Location"].split("state=")[1].split("&")[0])
-        pkce = next(c for c in r_login["cookies"] if c.startswith(lh.PKCE_COOKIE)).split(";")[0]
+        state, pkce = _login_leg()
         with pytest.raises(RuntimeError, match=match):
             lh.handler(_event("/callback", {"code": "abc", "state": state}, cookies=[pkce]), None)
         mock_ex.assert_not_called()
 
 
-def test_callback_still_exchanges_and_signs_when_the_signing_key_is_fine():
-    """正对照：上面那条不是靠"永远不交换"通过的——配置正常时两侧都照常签出会话。"""
-    for env in (ENV, ENV_CURRENT):
-        r = _do_callback(env)
-        assert r["statusCode"] == 302 and _session_cookie(r).count(".") == 2
+@pytest.mark.parametrize("env", [ENV, ENV_CURRENT], ids=["legacy", "current"])
+def test_callback_does_exchange_the_code_when_the_signing_key_is_fine(env):
+    """正对照：上面那条不是靠"永远不交换"通过的——同一条装置在配置正常时**必须**交换一次。
+
+    判据与负向严格对称（`assert_called_once` ⇄ `assert_not_called`），所以那条守卫不可能
+    因为"这套装置根本走不到交换"而假绿。形态断言不在这里（见上面按 claim 集合逐字节比对的两条）。
+    """
+    user = {"email": "a@x.com", "name": "Alice", "idp": "Feishu", "auth_via": "x"}
+    with patch.dict(lh.os.environ, env), \
+            patch.object(lh, "_exchange_code", return_value=user) as mock_ex:
+        state, pkce = _login_leg()
+        r = lh.handler(_event("/callback", {"code": "abc", "state": state}, cookies=[pkce]), None)
+    mock_ex.assert_called_once()
+    assert r["statusCode"] == 302 and _session_cookie(r).count(".") == 2
