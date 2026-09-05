@@ -436,6 +436,10 @@ python3 site-builder/scripts/session_verify_counts.py --hours 26 --require-total
   为了演示它而在生产上多签一批 legacy token——那会把 ④ 的观察窗口整个重置。
 - **⑩ 含删两把 v1 的 SSM 参数，且要在运行时单独确认。** 不删的话，一把无人接受的密钥继续
   留给账号里的宽读者，闸门还要为不在 config 里的 kid 记账。**这一步不可逆。**
+  **一个已接受的度量缺口**（2026-09-05 实测）：本节的顺序是「闸门 C1 → C2 → 删参数」，所以 C2 写基线时
+  v1 已经不在 config、基线也就不再跟踪它 ⇒ **删除本身在闸门上不产生任何 delta**，"宽读者少两把可读密钥"
+  这个真实收益记不进闸门。想让它可度量就得把 C2 挪到删参数之后（多一轮约 12 分钟的扫描）。
+  按原顺序做没错，但验收时别期待看到那条 delta。
 
 ##### 每步都要用到的三个片段
 
@@ -471,7 +475,9 @@ bash site-builder/scripts/verify_deployed_edge.sh # 产物逐行核对 + 占位�
 # ── C. 闸门：**出结论**（C1）与**写回基线**（C2）是两件事，顺序不能反
 #      （--update-baseline 不做比较，带着声明跑它等于什么都没声明）
 # C1 出结论：一次扫描 + 一次比较
-DUMP=/tmp/atb-$(date +%s).json      # 含真实角色名，**不要提交**
+# **落 .scratch/ 而不是 /tmp**：dump 含真实角色名（gitignored 目录才安全），而 macOS 会清理 /tmp
+# ——2026-09-05 ⑩ 就是因为 ⑥ 那份 dump 已被清掉，`探测资源 68 → 73` 里有 +2 净增无法做集合差集归因。
+DUMP="$(git rev-parse --show-toplevel)/.scratch/atb-$(date +%s).json"   # 含真实角色名，**不要提交**
 python3 site-builder/scripts/verify_account_trust_boundary.py --dump-observed "$DUMP"
 python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump "$DUMP" <声明旗标>
 # C2 写回基线：**只在被声明的 delta 已经真的出现之后**（见下面的告警），可复用同一份快照
@@ -502,7 +508,10 @@ python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump "$DUMP
 >    每个最多贡献 5 条（成员指纹上界 = principal × 动作类）。2026-09-04 ⑥ 实测：同账号另一工程新建 6 个
 >    `bedrock-*` 角色、2 个带 Condition ⇒ `+10` 与 `principals_with_missing_context +2`，与两把 v2 无关。
 >    共享账号里每一步都可能撞上，归因写进 progress 再接受，不许只凭"数字不大"接受）；
-> 2. 红的条数 == 绿「已能判定」的条数（1:1 置换）；
+> 2. 红的条数 == 绿「已能判定」的条数（1:1 置换）。**用 dump 的集合比对，不要数报告的行数**：
+>    段落里有换行续行，数行数会得出"红 784 / 绿 810"这种假象（2026-09-05 ⑩ 实测踩过）。正确做法：
+>    `python3 -c` 读基线与 dump 的 `coverage.undecided_items`，比 `len(b-n)` / `len(n-b)` / 交集
+>    （⑩ 实测 gone 784 / new 784 / 交集 0，才是真的 1:1）；
 > 3. 迁移分节**只**含本轮声明的 label；
 > 4. 其余红字段（`new_grants` / `missing_required` / `new_statements` /
 >    `bucket_policy_drift` / `iam_write_drift` / `boundary_drift` / `console_key_in_edge`）
