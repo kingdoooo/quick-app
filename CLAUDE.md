@@ -171,10 +171,17 @@ python3 site-builder/scripts/session_verify_counts.py --hours 1 --require-total 
 # + 扫 bootstrap 桶，实测 11±1 分钟：11m33s / 10m57s 两次）
 python3 site-builder/scripts/verify_account_trust_boundary.py
 # 密钥增减必须**声明**，否则一律红：`--new-key LABEL` / `--retire-key LABEL`
-# （LABEL ∈ 已配置 kid ∪ {legacy, login-flow}；声明过的落 migration_grants 分节，绿）。
-# **声明与 --update-baseline 是两条命令、顺序不能反**（后者不做比较）；用
-# `--dump-observed` 一次扫描 + 两条 `--from-dump` 省掉第二个 11 分钟，**但 login-flow
-# 那条硬断言只在实测路径上评估**，涉及它的那一轮不要用 --from-dump 出结论。
+# （LABEL ∈ 已配置 kid ∪ {legacy, login-flow}）。声明现在管**两件**事（3c-1B-G A6）：
+#   ① grant delta → `migration_grants`（绿）。**前置条件是该 principal 原本就能读到某把
+#      会话密钥**——"原先读不到、现在能读"是能力面真的变大，声明不该抹掉它，**这是刻意的**；
+#   ② coverage 指纹迁移 → `migration_undecided`（绿）。判据是**反事实**：把被声明 key 的
+#      资源类剔掉后重算，与基线相等才整批落绿，**有残差照红**。此前声明只管 ①，
+#      于是新增一把 key 会让每个受影响 principal 的 undecided 成员换指纹（实测两轮各 305 条）
+#      而只能人工 --update-baseline——那正是 spec §11.8.7 否决的工作流。
+# `--update-baseline` 现在**会先打印一遍比较报告再写**（原先在比较之前就 return ⇒
+# "接受了什么"不留痕）。用 `--dump-observed` 一次扫描 + 两条 `--from-dump` 省掉第二个
+# 11 分钟，**但两条只在实测路径上评估**：login-flow 那条硬断言，以及 A6 的反事实
+# （快照按哪组声明算的会被记下，声明不匹配即响亮拒绝）。
 ```
 
 `site-builder/scripts/verify_*` 是真机闸门（部署后跑，不是单测）。**本文件不记数量与

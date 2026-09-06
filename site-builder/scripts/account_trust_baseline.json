@@ -15,15 +15,15 @@
     "edge_code_targets_carrying_live_key": 10,
     "session_keys": {
       "site-hs-v2": {
-        "edge_code_targets_carrying_key": 4,
-        "edge_assets_carrying_key": 3
+        "edge_code_targets_carrying_key": 5,
+        "edge_assets_carrying_key": 4
       },
       "console-hs-v2": {
         "edge_code_targets_carrying_key": 0,
         "edge_assets_carrying_key": 0
       }
     },
-    "edge_assets_carrying_live_key": 13,
+    "edge_assets_carrying_live_key": 14,
     "principals_with_missing_context": 164
   },
   "coverage": {

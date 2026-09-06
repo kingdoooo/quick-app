@@ -56,7 +56,7 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 | | 其中**能取得会话签名密钥**的 | 56 <!-- baseline:可读密钥=56 --> |
 | | 其中**非平台**身份可直接 `lambda:InvokeFunction` 平台或站点函数的 | 18 <!-- baseline:非平台可直调=18 --> |
 | | Edge 函数里仍带着 **legacy** 密钥的**代码目标**（历史已发布版本；L3 起 `$LATEST` 与新版本不再带） | 10 <!-- baseline:带活密钥的Edge代码目标=10 --> |
-| | CDK bootstrap 桶里仍带着**任一**活密钥（legacy ∪ 各 kid，取并集）的 asset 对象 | 13 <!-- baseline:带活密钥的asset=13 --> |
+| | CDK bootstrap 桶里仍带着**任一**活密钥（legacy ∪ 各 kid，取并集）的 asset 对象 | 14 <!-- baseline:带活密钥的asset=14 --> |
 | **B IAM 写观察** | 持有相关 IAM 策略变更语句的 principal | 22 <!-- baseline:B持有IAM写语句=22 --> |
 | | 其中**不在 A 里**（只有 IAM 写、**未证明可提权**） | 4 <!-- baseline:仅IAM写=4 --> |
 
@@ -74,12 +74,11 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 > 每次 Edge 部署新出的 asset 都带 current kid 的值 ⇒ 每部一次加 1。每 kid 的单列计数在
 > `facts.session_keys`。两个数都**不参与红绿**（`_compare_facts` 只报 delta），读它们时要能用当次动作解释。
 >
-> ⚠️ **当前基线写在 2026-09-05 ⑩ 的那一轮闸门里，之后又部署过一次 Edge**（2026-09-06 的
-> 3c-1B ticket 21，Edge 版本 15，**生产实测**）。按上面这条规律那次部署会让 asset 行 **+1**，
-> 所以下一轮闸门会报一条 `edge_assets_carrying_live_key` 的 facts delta——**那是预期的、
-> 能被那次部署解释的**，不是新暴露面。上表数字与 `account_trust_baseline.json` 一致
-> （单测按 `<!-- baseline:… -->` 标记核对两者），**跑完下一轮闸门并 `--update-baseline` 之后
-> 两处要一起更新**。
+> **上一次这条规律的实例（留作样板）**：2026-09-06 的 3c-1B ticket 21 部署了 Edge 版本 15，
+> 下一轮闸门果然报出 `edge_assets_carrying_live_key: 13 → 14（+1）`，其余各层无 delta、
+> 闸门 exit 0。按"delta 能被本次动作解释"验收后 `--update-baseline` 吸收，上表随之改成 14。
+> **那一轮也是 `--update-baseline` 第一次先打印比较报告再写**（3c-1B-G A6：原先它在比较之前
+> 就 return，"接受了什么"完全不留痕，而 spec §11.8.7 反对的正是这种人工放行）。
 
 > **A + B 的并集是 65，但那个数不是 headline。** A 是"现在就能拿到密钥或直接调用平台
 > 函数"；B 只是"持有一条可能影响 IAM 策略的语句"，本闸门**明确不证明**它构成提权链
@@ -116,9 +115,9 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 会话 JWT 与控制台会话（`__Host-sb_console`）用**同一把** HS256 密钥，
 真源是 SSM SecureString `/site-builder/jwt-secret`。
 
-**路 ①：`lambda:GetFunction` 下载 Edge 产物，密钥是明文。**（**10 个目标**：
-未限定函数 + 9 个已发布版本，每一个都实测过仍含当前有效密钥——密钥没轮转过，
-所以历史版本的代码里是同一把。`function:foo` 与 `function:foo:9` 在 IAM 里是两个
+**路 ①：`lambda:GetFunction` 下载 Edge 产物，密钥是明文。**（目标数看开头那张表的
+"Edge 代码目标"行：未限定函数 + 每个仍带活密钥的已发布版本，都实测过。
+**那一行数的是 legacy 那把**；每 kid 的单列计数在 `facts.session_keys`。`function:foo` 与 `function:foo:9` 在 IAM 里是两个
 资源，只探未限定 ARN 会漏掉「只能读某个旧版本」的 principal。）
 Lambda@Edge 不支持环境变量，所以密钥由 CDK 在部署时**字符串替换**进 Edge 函数源码
 （`router/infrastructure/stack.py` 的 `{{JWT_SECRET}}`）。实测：下载 origin-request
@@ -137,9 +136,11 @@ CloudFormation 模板**取到当前 Edge 函数的 `S3Bucket`/`S3Key`，下载�
 - 对象用 `alias/aws/s3` 加密，该 AWS 托管键的 key policy 是
   `Principal: {"AWS": "*"}` + `kms:CallerAccount` + `kms:ViaService=s3.*` 的
   **直接授权** ⇒ identity policy 里不需要任何 `kms:*` 动作；
-- **旧对象不会被删**：每次 Edge 部署留一个新 asset。密钥从未轮转过，所以扫描
-  bootstrap 桶发现 **9 个**对象仍带着当前有效的密钥（最早的是 2026-07-28）。
-  ⇒ 只把当前那一个对象删掉不解决问题，而轮转密钥必须连带清理这 9 个。
+- **旧对象不会被删**：每次 Edge 部署留一个新 asset，所以桶里同时存在多个仍带**当前有效**
+  密钥的对象。**具体个数一律看开头那张基线断言表的 asset 行**（有标记、有单测核对），
+  这里**刻意不写死**——它每部署一次 Edge 就 +1，写死过一次就腐烂过一次
+  （2026-08-27 那轮是 9，2026-09-06 已是 14）。
+  ⇒ 只把当前那一个对象删掉不解决问题，轮转密钥必须连带清理**全部**这些对象。
 
 **路 ③：读那个 SecureString——而"读"不止一个动作。**
 看起来还有 KMS 一道，实际没有：参数用的是 AWS 托管密钥 `alias/aws/ssm`，其 key
