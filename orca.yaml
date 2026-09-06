@@ -1,0 +1,11 @@
+# Orca 的仓库级 worktree hook（只在用 Orca 开 worktree 时生效；其它工具忽略本文件）。
+# setup 在**新 worktree 的目录**里跑；$ORCA_ROOT_PATH 是主 checkout 的路径。
+#   · 两份 config.ini 是 gitignored 的、新 worktree 里没有：从主 checkout **复制**过来（不软链——
+#     worker 只读它，复制能挡住误改主 worktree 的配置）；目标已存在就不动。
+#   · 然后建五个 venv（venv 绑死在 worktree 路径上，每个 worktree 都得重建）。不带 --host-deps：
+#     那改的是机器，不归 worktree。
+# 格式约束来自 Orca：只认 scripts / issueCommand 两个顶层键；命令行统一四个空格缩进。
+scripts:
+  setup: |
+    for f in site-builder/config.ini router/config.ini; do if [ ! -e "$f" ] && [ -f "$ORCA_ROOT_PATH/$f" ]; then cp "$ORCA_ROOT_PATH/$f" "$f"; fi; done
+    bash site-builder/scripts/bootstrap_venvs.sh

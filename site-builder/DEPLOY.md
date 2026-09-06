@@ -994,6 +994,12 @@ done
 | Python  | 3.12+                                                              |
 | Node.js | 仅 `npx`（CDK 与 MCP Inspector）                                       |
 
+**本地 Python 环境一条命令建齐**：`bash site-builder/scripts/bootstrap_venvs.sh`——前置检查
+（`python3.12` 必须有；不带路径的 `python3` 必须 ≥ 3.10，否则打印解法并退出）+ 五个 venv 全部
+`--clear` 重建 + 按各自清单安装；`--host-deps` 再给 `python3` 装 `boto3` 与 `pip-system-certs`
+（闸门脚本靠它们发 HTTPS）；`--only <目录>` 单独重建一个。下文 ②、④ 里手工建 venv 的两段是它的
+子集，写在那里是为了把坑说清楚。venv 的路径与清单表见 CLAUDE.md「仓库外的几样东西」第 2 步。
+
 
 ### 成本预期（PoC 量级）
 
@@ -1892,7 +1898,7 @@ name**；值必须是裸 `true`/`false`——configparser 会把行内注释并�
    # --clear：首次创建与已存在时重建都适用。venv 的 shebang 是绝对路径，
    # 仓库被移动或改名后旧 venv 会报 "bad interpreter"，而不带 --clear 的
    # python3 -m venv 对已存在目录不会重写 shebang（重跑也修不了）
-   python3 -m venv --clear .venv
+   python3 -m venv --clear .venv                  # 或一次建齐：bash site-builder/scripts/bootstrap_venvs.sh（见 §0 本机工具链）
    .venv/bin/pip install -r requirements.txt -q
    PATH=.venv/bin:$PATH npx -y aws-cdk@latest bootstrap aws://{account_id}/us-east-1   # 首次
    PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never
@@ -2065,7 +2071,7 @@ migrator role 能在本 schema 建表，但建其他 schema / 建角色 / 改 IA
 
 ```bash
 cd site-builder/deployer/infra
-python3 -m venv --clear .venv                  # 见 ② 的说明：venv 不可跨路径复用
+python3 -m venv --clear .venv                  # 见 ② 的说明：venv 不可跨路径复用；或 bootstrap_venvs.sh --only site-builder/deployer/infra
 .venv/bin/pip install -r requirements.txt -q
 # 部署（bundling 用 Docker 拉 x86_64 镜像，按锁定清单 --require-hashes 装
 #  psycopg[binary]+sqlparse；**合同包是 cp 包目录进去的，不走 pip**——site-contract 是

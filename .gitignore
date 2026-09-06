@@ -1,5 +1,6 @@
 .superpowers/
 .venv/
+.venv-bootstrap.stamp
 __pycache__/
 *.egg-info/
 .pytest_cache/

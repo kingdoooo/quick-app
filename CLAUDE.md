@@ -402,7 +402,13 @@ JWT。别"顺手补齐"这个名单。
    回填真实账号/域名/证书 ARN）。**它们是所有部署脚本与 CDK 栈的唯一取值来源。**
    `configparser` 对缺失文件是**静默的** ⇒ 不回填不会报"缺配置"，而是拿空值往下跑并
    拼出假结论（本仓库为此在闸门里专门加了"读不到任何段就硬失败"）。
-2. **五个 venv 全部重建**。**必须带 `--clear`**（`python3.12 -m venv --clear .venv`）——
+2. **五个 venv 全部重建：`bash site-builder/scripts/bootstrap_venvs.sh`**（幂等；`--only <目录>`
+   只建一个、`--check` 只做前置检查、`--host-deps` 顺带做第 3 步；结束时打印每个 venv 的解释器
+   版本与 pytest 版本作为"能跑"的证据，全量成功后写 gitignored 的 `.venv-bootstrap.stamp`）。
+   它做的就是下面这张表，守卫 `deployer/tests/test_bootstrap_venvs.py` 按这张表核对脚本——
+   **改表必须改脚本**。用 Orca 开 worktree 时由仓库根 `orca.yaml` 的 setup hook 自动跑它，并从主
+   checkout **复制**（不软链）两份 gitignored 的 config.ini。手工建时的三条坑：
+   **必须带 `--clear`**（`python3.12 -m venv --clear .venv`）——
    shebang 是绝对路径，不带 `--clear` 不重写，一直报 bad interpreter。
    **venv 不能从别的机器拷**：`pyvenv.cfg` 的 `home =` 与 `bin/*` 的 shebang 都是绝对路径，
    编译扩展按 CPU 架构 + Python ABI 装，而 contract/deployer 那两份是
@@ -423,7 +429,8 @@ JWT。别"顺手补齐"这个名单。
    venv，借别人的，组合见上面「测试命令」。deployer 那份是精确钉死的，直接依赖的原始声明
    留在文件头注释里。两份都实测过：空 venv 一条命令装完，六个借用它们的套件全绿。
 3. **`python3`（第 0 步那个 3.12）上装两个包**：
-   `python3 -m pip install --user --break-system-packages boto3 pip-system-certs`。
+   `python3 -m pip install --user --break-system-packages boto3 pip-system-certs`
+   （即 `bootstrap_venvs.sh --host-deps`；默认不做，因为它改的是机器不是仓库）。
    **五个 `verify_*` 真机闸门与所有 `scripts/*.py` 都用它跑。**
    两个开关缺一不可：Homebrew 的 python 带 PEP 668 标记，不加
    `--break-system-packages` 直接被拒；加 `--user` 是为了只写 user site
