@@ -361,7 +361,7 @@ blocker（外部复审第十四轮 P1-2，成立）。
 |---|---|---|
 | **3c-0** | 本 spec 定稿 + Edge crypto spike 裁决（§11） | 冒充面探针与脱敏聚合证据 tracked 且可复跑 |
 | **3c-1A** | 全部 verifier 认 `kid`→{family, alg, key} 固定 allowlist、每 family `current`+`previous`、legacy 第三入口（状态机 L1）；`[SessionKeys]` 按 §11.6 的 schema 落地（此时只有 HS 行）。**signer 不动** | 闸门认识**两个 HS key family** 与 legacy/current/previous（今天它只认识一个 `JWT_PARAM_NAME`、一套 Edge/asset 密钥定位）；§9 全部 verifier 反例齐备并验过红绿 **已实施并部署 2026-09-02**（plan `2026-09-02-3c-1a-verifier-kid-allowlist.md`） |
-| **3c-1B** | signer 开始发 family-specific `kid` + 新 `token_use`/`aud`（状态机 L2）；两把新 HS secret `/site-builder/session-keys/<kid>` + login-flow secret（§11.3）；观察归零后**关闭** legacy 入口（进入 L3，删除仍归 3c-3）；一次真实 HS 轮转演练 R1/R2。**逐条裁定见 §11.8** | 四个 `verify_*` 与 10 条 E2E 的登录态工具能 mint **带新 `kid` 的 HS token**（否则 signer 一切就全红，读起来像功能坏了）；且必须在 signer 切换**之前**改完，否则它们自己就是 `accepted_legacy` 的来源（§11.8.2） |
+| **3c-1B** **已实施并部署 2026-09-05**（十步 runbook 首次执行完毕；`cf5db89` = ③ 切 signer/T0、`9245703` = ⑤ 进 L3、`a2dd16a` = ⑦⑧ 切 v2 + 回滚演示、`19c9f7f` = ⑨⑩ 排空判定 + v1 退役含删参数；收尾见本行所在提交。**注意：④ 观察窗口在首次演练中经操作者裁决跳过**——单人开发账号、只读读数已证实 T0 以来 `accepted_legacy` 三列全 0，且**没有**做"缩短窗口版的 ④"；因此**观察窗口机制的真机证明只有 ⑨ 这一次**，它按满 26 h 等待并 exit 0 通过。三个时刻：**T0 = `2026-09-03T13:51:18Z`**、**④ 跳过裁决 = `2026-09-04T01:40:40Z`**、**⑨ 判定 = `2026-09-05T12:31Z`**（T2 + 30h12m，闸下限 T2+26h）。完整时间线与时长在 `site-builder/DEPLOY.md` 的 runbook 首节） | signer 开始发 family-specific `kid` + 新 `token_use`/`aud`（状态机 L2）；两把新 HS secret `/site-builder/session-keys/<kid>` + login-flow secret（§11.3）；观察归零后**关闭** legacy 入口（进入 L3，删除仍归 3c-3）；一次真实 HS 轮转演练 R1/R2。**逐条裁定见 §11.8** | 四个 `verify_*` 与 10 条 E2E 的登录态工具能 mint **带新 `kid` 的 HS token**（否则 signer 一切就全红，读起来像功能坏了）；且必须在 signer 切换**之前**改完，否则它们自己就是 `accepted_legacy` 的来源（§11.8.2） |
 | **3c-2A** | **只改闸门与验收，不动生产签名**：KMS 探测（`kms:Sign` 持有者、key policy 快照、grants、自助授权、公钥指纹）+ 验收入口改造（auth `/fixture-session`、`site-builder-verifier` 角色、**Edge 与 panel 的夹具会话边界规则先于签发器上线**、`ensure_fixture_site.py` 常驻夹具站点、探针 `sign:fixture-issuer` 两个入口，§11.7） | 上一格全绿；本包**自己**先验过红绿（新探测要能真的红） |
 | **3c-2B** | 两把 KMS 非对称 CMK（deployer CDK 栈创建，默认 key policy + IAM 条件，§11.2）；signer 切 `kms:Sign`（`RAW`，§11.5；identity policy 同时授 `kms:GetPublicKey`，§11.2）；三层 kid 绑定校验（§11.6）；verifier 双接受 | **3c-2A 已上线**；五个验收入口拿到**真实登录态**（不再靠读 SSM 明文本地 mint），且验过红绿 |
 | **3c-3** | 退役 HS256、删旧 SSM secret、删 legacy 入口（状态机 L3）、基线**精确 delta** | `accepted_legacy == 0` 且总量非 0 持续超过最长 TTL（§8） |
@@ -441,6 +441,13 @@ blocker（外部复审第十四轮 P1-2，成立）。
 | **L3** | 只有两个 family 的 `v1` | family `v1` | **进入** = legacy 入口**关闭**（三处 verifier `LEGACY_ENTRY=off` 且 Edge 已 Deployed，1B 内，§11.8.1）；**退出** = 3c-3 完成代码路径与旧参数的**删除** |
 | **R1/R2** | family 内 `current`+`previous`（`v1`→`v2`） | 切 `v2`，可回滚回 `v1` | 真正的轮转演练，见下 |
 
+> **1B 之后的现状（2026-09-05，生产实况）**：状态机停在 **L3**，且 R1/R2 已经跑完一轮——
+> 两个 family 的 `current` 都是 `*-hs-v2`，`previous` 两槽**为空**，v1 的两把 SSM 参数已删除
+> （不可逆）。所以今天的接受集合是「每 family 一把 v2」，**既没有 legacy 入口，也没有
+> `previous`**；下一次轮转从 ⑥（新 key 经 `previous` 就位）重新进入这张表。
+> L3 的**退出**仍归 3c-3：legacy 的代码路径、`legacy_param` 那条配置行与旧参数的删除都还没做，
+> 精确清单见 §6.2 的 3c-3 一节。
+
 **关键定义，逐条回答那六个点**：
 
 1. **legacy 是 family 外的第三条入口**，不是任何 family 的 `previous`。理由：它用的是
@@ -494,6 +501,22 @@ verifier 双接受。key policy 按 §11.2（默认策略 + IAM 条件），CMK 
   层**；**精确断言** HS 读取类 grant 与 facts 的退出；**精确吸收**新增的 KMS policy /
   grant / 公钥指纹 facts；**任何无关变化继续红**。
   全量重置会把同一窗口里无关的 IAM 漂移一起合法化——那等于用一次迁移把闸门清零。
+
+#### 3c-1B 留给 3c-3 的精确清单（2026-09-05 按源码点清，收尾时写下）
+
+L3 只**关闭**了入口，下面这些**都还在**。删的时候按这张表逐项核对，删完 legacy 这个词
+应当只出现在历史记录里。**顺序**：先删代码路径与配置行、再跑闸门第二次 `--retire-key legacy`、
+最后删 SSM 参数（与 ⑩ 删 v1 参数同一形状：不可逆，单独确认）。
+
+| 类别 | 精确对象 |
+|---|---|
+| **verifier 的 legacy 分支** | `auth/session.py` 的 `verify_with_legacy` / `verify_session_jwt` / `verify_upgrade_code`；`router/…/origin_request.py` 的 `_verify_legacy_site_session` 与 `LEGACY_ENTRY` 注入点及其分支；`panel/console_session.py` 的 legacy 分支；`auth/verifier_env.py` 的 `legacy_secret()` 与 `legacy_entry` 状态机 |
+| **signer 的 legacy 分支** | `auth/session.py` 的 `mint_session_jwt` / `mint_upgrade_code`；`login_handler.py` 与 `panel/console_session.py` 里 `signer == "legacy"` 那一侧（连同 `test_signer_switch_guard.py` 要求"两侧都在"的那条正对照——删 legacy 侧时这条断言要一起改，否则它会红） |
+| **密钥取值路径** | `login_handler._secret("JWT_SECRET")` 这条 `{name}_PARAM` 用法；`deploy_auth` / `deploy_panel` 下发的 `JWT_SECRET_PARAM` 与角色 SSM 清单里那一项（**panel 的写前核对清单含它、auth 的不含**，见 `docs/adr/0004-*.md`）；`router/infrastructure/stack.py` 的 `load_jwt_secret()` 与 `{{JWT_SECRET}}` 注入点 |
+| **SSM 参数本体** | `/site-builder/jwt-secret`（**删它才让 A 组的"可读密钥"真正少一把**；`facts.edge_code_targets_carrying_live_key` 与 `edge_assets_carrying_live_key` 也要到这一步之后才可能归零——历史 Edge 版本与 bootstrap asset 里的副本随版本过期而消失） |
+| **闸门常量与第二次声明** | `scripts/verify_account_trust_boundary.py` 的 `JWT_PARAM_NAME` 常量、`LABEL_LEGACY` 与它映到的 `read-jwt-param` grant、`jwt_parameter` 那条 fact；**`--retire-key legacy` 的第二次使用**（第一次是 ⑤ 收 grant，这一次是删参数本体）|
+| **配置与文档** | `config.ini.example` 里 `[SessionKeys]` 的 `legacy_param` 键及其上方那段"清空本行即关闭 legacy 入口"的说明（**按键名找，别按行号**——行号会随文件增删漂移）、`signer` 说明里"legacy / current 两个合法取值"的措辞；`site-builder/DEPLOY.md` 十步 runbook 的 ①–⑤ 一段（那是"legacy 入口的一次性收敛"，届时整段成为历史）；根 `CLAUDE.md` 里"legacy 共享密钥待 3c-3 删除"那句 |
+| **验收脚本** | `verify_deployed_components.py` / `verify_deployed_edge.sh` 里断言"legacy 为空串 / 开关 off"的那些格子——它们在参数删除后要改成断言"根本不存在" |
 
 ---
 

@@ -60,7 +60,22 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 | **B IAM 写观察** | 持有相关 IAM 策略变更语句的 principal | 22 <!-- baseline:B持有IAM写语句=22 --> |
 | | 其中**不在 A 里**（只有 IAM 写、**未证明可提权**） | 4 <!-- baseline:仅IAM写=4 --> |
 
-> **两个产物计数的口径不同，且每次 Edge 部署都会动**（2026-09-04/05 实测：⑤ L3 代码目标 11→10、asset 10→11；⑥ v2 就位 asset 11→12；⑦ 切 v2 12→…；⑩ 退役 v1 asset 12→13，且 `facts.session_keys` 从四把 kid 变成只剩两把 v2）：
+> **三个口径必须分开读：legacy / 每把 kid / login-flow。** 前两者进计数，第三者**不进**：
+>
+> | 口径 | 落在哪 | 进不进 A 组的"可读密钥"|
+> |---|---|---|
+> | **legacy**（拆 family 之前的共享密钥）| `facts.edge_code_targets_carrying_live_key` / `edge_assets_carrying_live_key`（**不在** `facts.session_keys` 里——那个只按 kid 记，legacy 不是 kid）| 进（grant `read-jwt-param` 等三条）|
+> | **每把 kid**（`site-hs-v2` / `console-hs-v2`）| `facts.session_keys` 的单列计数；asset 那行是**跨 legacy 与全部 kid 的并集** | 进（grant `read-session-key:<kid>`）|
+> | **login-flow secret**（auth 私有，spec §11.3）| 只记 grant `read-login-flow-secret`；**不进** `facts.session_keys`、不进密钥枚举 | **不进**——读到它只值一次登录 CSRF（state 与 pkce cookie 都活 300 秒），签不出任何会话。另有一条硬断言：Edge 产物里出现它的值即 `SystemExit` |
+>
+> **两个产物计数每次 Edge 部署都会动**（2026-09-04/05 实测：⑤ L3 代码目标 11→10、asset 10→11；⑥ v2 就位 asset 11→12；⑩ 退役 v1 asset 12→13，且 `facts.session_keys` 从四把 kid 变成只剩两把 v2。⑦ 那一步的 asset 增量没有独立记录，别去反推它）：
+>
+> ⚠️ **当前基线写在 2026-09-05 ⑩ 的闸门轮里，之后又部署过一次 Edge**（2026-09-06 的
+> 3c-1B ticket 21，Edge 版本 15）。那次部署按上面这条规律会让 asset 那行 **+1**，所以
+> 下一轮闸门会报一条 `edge_assets_carrying_live_key` 的 facts delta——**那是预期的、
+> 能被那次部署解释的**，不是新暴露面。上表的数字与 `account_trust_baseline.json` 一致
+> （有单测按 `<!-- baseline:… -->` 标记核对两者），**跑完下一轮闸门并 `--update-baseline`
+> 之后，这两处要一起更新**。
 > 代码目标那行只数 **legacy** 密钥（`facts.edge_code_targets_carrying_live_key`），L3 让 `$LATEST` 不再带它，
 > 历史版本仍带 ⇒ 减 1 不归零，真正清零归 3c-3 删参数；asset 那行是**并集**（跨 legacy 与全部 kid），
 > 每次 Edge 部署新出的 asset 都带 current kid 的值 ⇒ 每部一次加 1。每 kid 的单列计数在
@@ -337,8 +352,9 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 > 所以带活密钥的代码目标 10 → 11、asset 9 → 10；`site-hs-v1` 在 2 个代码目标 / 1 个 asset 里；console 0 / 0；
 > 唯一的授权 delta 是 panel 角色多了 `read-session-key:console-hs-v1`（auth 角色原前缀授权已覆盖两把新 key，收窄成精确清单后集合不变）。
 
-> **2026-09-03（3c-1B）闸门口径变化，基线 schema 仍是 4**（尚未真机跑；首次真机使用见
-> 3c-1B 的部署序列第 ②/⑤/⑥/⑩ 步）：
+> **2026-09-03（3c-1B）闸门口径变化，基线 schema 仍是 4**（**已在真机用过四轮**：②
+> 建 login-flow secret、⑤ L3、⑥ v2 就位、⑩ 退役 v1；十步的时间线在
+> `site-builder/DEPLOY.md` 的 runbook 首节）：
 >
 > - **第四个被模拟的 SSM 目标：`read-login-flow-secret`**（auth 私有的 login-flow secret，
 >   spec §11.3）。它被**记录**但**刻意不算冒充面**——`is_secret_grant()` 对它返回 False，

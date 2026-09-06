@@ -14,21 +14,32 @@ Quick 自动化建站平台（Site Builder）：业务人员在任意支持 Skil
 blue/green 原子切换（M7）。加固包（跨租户 IAM 隔离 / 权限数据洗白 / token 用途混用 /
 同名 cookie 遮蔽 DoS，即 merged review §9 优先级表里的 M01/M02/M05/M06 四条）已按
 `site-builder/DEPLOY.md` 的「S1 加固」一节部署并过全部闸门，**含真机行为探针**
-（`verify_session_token_semantics.py`）。**§9 表里其余各条还没做。**
+（`verify_session_token_semantics.py`）。
+
+**会话签名的 3c-1A 与 3c-1B 也已部署**（2026-09-02 / 2026-09-05）：会话 token 现在带 `kid`，
+每个 key family（site / console）一把 `*-hs-v2` 作 `current`、`previous` 空；**legacy 共享密钥
+那条入口已关闭（L3），三处 verifier 都不再接受它**——但它**仍然是 HS256 对称密钥**，
+只是换成了两把、有版本、可轮转（十步 runbook 首次执行完毕，含一次真实 v1→v2 轮转与生产
+回滚演示）。**legacy 的代码路径与 `/site-builder/jwt-secret` 参数还没删，归 3c-3**（精确清单在
+那份 spec 的 §6.2）。**§9 表里其余各条（含真修复 3c-2A/2B）还没做。**
 
 **所以本文件的架构描述与线上是一致的**（包括下面「站点代码按不可信对待」那条写的
 「禁止 `site-data-{site_id}-*` 前缀通配」——存量 per-site 角色已全部收敛成精确表
 ARN，通配已清零）。不再需要"读文档时减去一层"。
 
-> **三条仍然成立的边界，别当成已解决**：per-site IAM 的 `dsql:DbConnect` 仍是
+> **三条仍然成立的边界，别当成已解决**（第三条在 3c-1A/1B 之后**依然成立**，理由见该条末尾）：per-site IAM 的 `dsql:DbConnect` 仍是
 > `Resource: *`（DSQL 的租户隔离在 PG 层——per-site schema + 非 admin role，不在 IAM
 > 层，这是既定设计而非残留）；同名 cookie 遮蔽只关掉了 DoS，**没关身份混淆**
 > （攻击者持有另一个**合法** token 时仍会先被取到，根治是 host-only 会话，独立成包）；
 > **平台的安全边界就是这个 AWS 账号**——账号内任何具备只读级权限的 principal 都能取得
-> HS256 会话密钥（**三条路**：Edge 产物里是明文（含 9 个历史版本）、同一份产物在 CDK
-> bootstrap S3 桶里还有 9 个带活密钥的 asset、SSM 参数有**四个**动作都能读出明文而
+> HS256 会话密钥（**三条路**：Edge 产物里是明文（含历史已发布版本）、同一份产物在 CDK
+> bootstrap S3 桶里还有一批带活密钥的 asset、SSM 参数有**四个**动作都能读出明文而
 > KMS 那道是虚的），从而以任意用户身份访问任意
-> 站点**与控制台写接口**。**别按 merged review 里 M09 第 2 步的原话去收窄 invoke，
+> 站点**与控制台写接口**。**3c-1A/1B 没有改变这一条**：密钥换成了两把带 `kid` 的
+> `*-hs-v2` 且可轮转，但仍是**对称**的 ⇒ 读到就能签。三条路各自的数量由
+> `docs/security/account-trust-boundary.md` 的基线断言表给（**本文件不记那些数字**：
+> asset 那行每部署一次 Edge 就 +1、代码目标那行随历史版本过期而降，写死必过时；
+> 有一条单测按标记核对文档与基线一致）。**别按 merged review 里 M09 第 2 步的原话去收窄 invoke，
 > 那是假修复**（同一批身份还握着密钥读取与自助提权）。两条真修复都未排期：账号内改
 > **非对称签名**（Edge 只放公钥）能关掉只读那批；迁**独立成员账号**才能移出管理身份。
 > 实测数字、为什么 SCP/resource policy/对称签名都不成立、以及盯住暴露面别再变大的
@@ -380,7 +391,8 @@ python3 site-builder/scripts/gen_onboarding.py
 | **还剩什么没做 / 优先级** | `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9（**tracked**；两轮独立对抗性审查的合并版。S1 取的是表里 M01/M02/M05/M06 四条；M09 已按 v5 重定义并落地，其余各条还没做） |
 | **平台防谁 / 不防谁（账号信任边界）** | `docs/security/account-trust-boundary.md`（**tracked**；M09 的结论真源。含只读实测方法、**14 个由基线断言的数字**（A/B 两组 + 按类别）、为什么 SCP/resource policy/应用层签名/收窄 invoke 都不成立） |
 | **M09 真修复①的设计与实施记录（2026-08-27 已部署）** | `docs/superpowers/specs/2026-08-27-codebuild-bootstrap-read-narrowing-spec.md`（**tracked**；收窄 CodeBuild 对 CDK bootstrap 桶的读权限＝§9 的 3b。含为什么已有那条 AST 守卫看不见这个洞、三层守卫各自能证明什么、部署窗口的干净失败面；末尾「实施记录与验收证据」一节是 handover）|
-| **M09 真修复②的设计（3c，3c-0 裁决完成，未实施）** | `docs/superpowers/specs/2026-08-28-asymmetric-session-signing-spec.md`（**tracked**；会话签名迁非对称。**状态：§11 七个未决项已于 2026-09-02 全部裁定（含 Edge 冷启动最终形态复测：vendored `cryptography` 过闸、128 MB 不动），不构成实施授权**；裁定原文与被否决项都在 §11，三条 ADR 在 `docs/adr/`。 **3c-1A 已于 2026-09-02 实施并部署**（verifier 认 kid allowlist、两把 HS secret、闸门 schema 4；signer 仍发 legacy 形态），计划 `docs/superpowers/plans/2026-09-02-3c-1a-verifier-kid-allowlist.md`；3c-1B 另立计划。含量测过的收益边界（56 → **冒充面 19，这是已知下界不是上界**）、两个 key family 的模型、分包顺序 3c-0/1A/1B/**2A**/2B/3（2A 是"闸门与验收先认 KMS"的独立发布单元）、部署与回滚协议、以及「四个 verify_* 闸门靠读 SSM 明文本地 mint 会话，非对称化后要重新设计」这条容易漏的代价）|
+| **3c-1B（signer 切 `kid` + 关 legacy 入口 + 一次真实轮转）** | 十步 runbook 与首次执行的真实时间线：`site-builder/DEPLOY.md`「轮转会话密钥：十步 runbook」（**每次轮转照抄 ⑥–⑩**；①–⑤ 是 legacy 收敛，已一次性用完）。裁定原文在 spec §11.8，状态机现状在 §6.2，留给 3c-3 的精确清单也在 §6.2。**过程记录（票、progress、日志）在 `.scratch/3c-1b/`——gitignored、不随仓库分发，别当状态真源** |
+| **M09 真修复②的设计（3c，3c-0 裁决完成，未实施）** | `docs/superpowers/specs/2026-08-28-asymmetric-session-signing-spec.md`（**tracked**；会话签名迁非对称。**状态：§11 七个未决项已于 2026-09-02 全部裁定（含 Edge 冷启动最终形态复测：vendored `cryptography` 过闸、128 MB 不动），不构成实施授权**；裁定原文与被否决项都在 §11，三条 ADR 在 `docs/adr/`。 **3c-1A 已于 2026-09-02 实施并部署**（verifier 认 kid allowlist、两把 HS secret、闸门 schema 4；signer 仍发 legacy 形态），计划 `docs/superpowers/plans/2026-09-02-3c-1a-verifier-kid-allowlist.md`。**3c-1B 已于 2026-09-05 实施并部署**（signer 切 `kid`、L3 关闭 legacy 入口、v1→v2 真实轮转 + 生产回滚演示、v1 参数已删；④ 观察窗口经裁决跳过、⑨ 是该机制唯一的真机证明——见 §6.1 那一行）。**下一个包是 3c-2A**（闸门与验收先认 KMS，独立发布单元）。含量测过的收益边界（56 → **冒充面 19，这是已知下界不是上界**）、两个 key family 的模型、分包顺序 3c-0/1A/1B/**2A**/2B/3（2A 是"闸门与验收先认 KMS"的独立发布单元）、部署与回滚协议、以及「四个 verify_* 闸门靠读 SSM 明文本地 mint 会话，非对称化后要重新设计」这条容易漏的代价）|
 | **3c 冒充面的可复跑证据** | `site-builder/scripts/probe_impersonation_surface.py`（**tracked**，只读，实测约 20 分钟）→ `docs/security/3c-impersonation-surface.json`（**tracked**，只有计数/等价类/边际收益/盲区清单，名字只进 gitignored dump）。**`--self-test` 不碰 AWS**，18 条反例 + 变形测试在 `deployer/tests/test_probe_impersonation_surface.py`。**别再引用 56→13 / 并集 18 那两组旧数字** |
 | 加固包 S1 的设计与实施 | `docs/superpowers/specs/2026-08-22-s1-isolation-and-auth-hardening-spec.md` + `docs/superpowers/plans/2026-08-22-s1-isolation-and-auth-hardening.md`；升级/闸门/回滚见 `site-builder/DEPLOY.md` 的「S1 加固」一节 |
 | 一期设计决策与范围 | `docs/superpowers/specs/2026-07-21-quick-site-builder-design.md`（已实现快照，勿改） |
