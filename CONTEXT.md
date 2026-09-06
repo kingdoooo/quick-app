@@ -25,7 +25,7 @@ _Avoid_: 预发布、pre-rotation、灰度
 
 **Retire（退役）**：
 把一把 key 或 legacy 入口从所有 verifier 的接受集合中移除，并销毁其密钥材料。只在观察窗口判据满足之后进行；退役后持该 key 的 token 被当作未知 kid 拒绝，与是否过期无关。
-_Avoid_: 删 key、rotate out、下线
+_Avoid_: 删 key、rotate out、下线、把硬切换叫退役
 
 **kid**：
 一把具体密钥在 token header 里的不透明标签。verifier 只拿它查表，从不解析其内容。
@@ -68,3 +68,32 @@ _Avoid_: test user、bot、`@example.com` / `@test.com` 邮箱
 **Fixture session（夹具会话）**：
 由 auth 的受控签发路径为夹具身份签出的站点会话。它是闸门与 E2E 唯一可以带外取得的 token，其余 token 一律走真实换取链路。
 _Avoid_: test token、synthetic session、本地 mint 的 cookie
+
+### 交付与分包
+
+**资产（Asset）**：
+本仓库的交付物：`site-builder/` 与 `router/` 这套任意 AWS 账号都能独立部署的代码、配置模板与手册。资产之外的一切（本仓库作者的账号、其部署历史、迁移步骤）都不是交付物。
+_Avoid_: 项目、平台、线上、把"我们的部署"当成交付物
+
+**采用者（Adopter）**：
+拿到资产、在自己账号里部署并运维的 AWS 用户。与站点作者（在 Agent 里建站的业务人员）和站点访问者是三种不同的人。
+_Avoid_: 用户（三义）、客户、租户
+
+**验证环境（Dev environment）**：
+本仓库作者用来验证资产的那个 AWS 账号与部署。它不是生产：没有必须保护的用户会话，可以硬切换、可以重建；它经历过的中间状态不进资产。
+_Avoid_: 生产、线上、prod（指这个账号时）
+
+**硬切换（Hard cutover）**：
+一次部署同时把 signer 与 verifier 换到新的密钥形态，现存会话全部失效、用户重新登录。与滚动切换（就位 → 切换 → 排空 → 退役）相对；只在验证环境里做。它**不是退役**：整个旧密钥形态一次作废，不进入退役流程，也不评估观察窗口。
+_Avoid_: 迁移、in-place migration、灰度
+
+**v1 冻结（v1 freeze）**：
+资产第一次可分发的状态：出口验收通过后打 tag 的那个提交。冻结之前的所有改动都是"为了让新账号能直接部署到这个状态"。
+_Avoid_: 上线、发布、GA
+
+**出口验收（Exit acceptance）**：
+在一个全新账号里只看手册从零部署资产并跑分发的验收集，作为冻结的唯一判据。它验的是交付物，不是验证环境。
+_Avoid_: E2E（那是开发者回归）、冒烟
+
+分包编号（3c-1A、3c-1B、3c-final …）不是领域词，唯一定义在
+`docs/superpowers/specs/2026-08-28-asymmetric-session-signing-spec.md` §6.1。

@@ -24,7 +24,7 @@ AWS_IAM，resource policy 只多一个 `site-builder-verifier` 角色（两条�
 
 - `verify_session_token_semantics.py` 不再冒充真实 owner，改打常驻夹具站点。
 - E2E 的 `e2e@test.com` 改为夹具域身份。
-- Edge 与 panel 的夹具边界规则必须先于签发器上线（同在 3c-2A）。
+- Edge 与 panel 的夹具边界规则必须与签发器同一次部署上线，不得晚于它（原写"先于、同在 3c-2A"；2026-09-06 起 2A 并入 3c-final，见 ADR 0005）。
 - 谁能改 auth 代码谁就能签夹具域会话。相对今天"谁能改 auth 代码谁能签任意会话"，这是收窄，不是新增。
 
 出处：`docs/superpowers/specs/2026-08-28-asymmetric-session-signing-spec.md` §11.7。

@@ -350,8 +350,9 @@ router CDK（`rm -rf cdk.out`）→ CloudFront `Deployed` → `verify_deployed_e
 **分两段读**：
 
 - **①–⑤ 是 legacy 入口的一次性收敛**（3c-1B 首次也是最后一次执行；进入 L3 之后不再重复）。
-- **⑥–⑩ 是每次轮转照抄的五步**（就位 → 切换 → 回滚演示 → 排空 → 退役）。3c-2B 的 RS key
-  也从 ⑥ 经 `previous` 槽位就位，只是多四项 KMS 校验。
+- **⑥–⑩ 是每次轮转照抄的五步**（就位 → 切换 → 回滚演示 → 排空 → 退役）。（2026-09-06 裁定：
+  HS → KMS **不走**这五步，验证环境硬切换；这五步的形态保留给采用者轮转 KMS 密钥，3c-final
+  会把它改写成 KMS 版并删掉本 HS 版。见 spec §11.9。）
 
 ##### 开始之前：先把剩余各步的 config 状态干跑一遍
 
@@ -968,7 +969,7 @@ done
 3. **SSM 里的新密钥不删**（⑩ 那一步是唯一的例外，且明确不可逆）。
 
 演练结束后 `config.ini` 的状态：`signer = current`、`*_current = *-hs-v2`、`*_previous` 空、
-`legacy_param` 空。3c-2B 的 RS key 从这个状态经 ⑥ 的 `previous` 槽位就位。
+`legacy_param` 空。（原计划 3c-2B 的 RS key 从这个状态经 ⑥ 就位；2026-09-06 起改为硬切换，见 spec §11.9。）
 
 ##### 应急：一把会话密钥已泄漏，必须立刻失效
 

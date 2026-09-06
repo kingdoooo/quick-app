@@ -276,6 +276,10 @@ Python 后端而用 `pip install` 装 sdist），这条链就从「账号内部�
 已接受）：迁账号是唯一能把**管理员/CDK/break-glass** 也移出信任边界的办法，
 但「只读级工作负载能窃取密钥」这条路，在**现账号内**也有技术方案。
 
+> **2026-09-06 归属变化**（ADR 0005）：本项目的交付物是供任意账号部署的资产，采用者的账号
+> 不由我们决定，所以下面的 A 从工程项降为 DEPLOY.md 里的**部署建议**；B 以 KMS-only 的形态
+> 进入资产（3c-final），HS 形态不再是采用者会拿到的东西。本文档的实测数字全部来自验证环境。
+
 **A. 迁到独立的 Organizations 成员账号。** 关掉的是账号级管理信任：
 
 - SCP 才真正生效（`site-builder/policies/scp-site-invoke-only-edge.json` 从

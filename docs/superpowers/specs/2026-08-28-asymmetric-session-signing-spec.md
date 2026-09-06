@@ -360,6 +360,11 @@ KMS 开发者指南 *Key policies*：
 ＋轮转演练） → 3c-2A（闸门与验收先认 KMS） → 3c-2B（signer 切 `kms:Sign`） →
 3c-3（HS 退役与清理）。**
 
+> **2026-09-06 裁定（§11.9，ADR 0005）：2A、2B、3 合并为一个包 3c-final，在验证环境硬切换。**
+> 下面 §6.1 表里这三行与 §6.2 的对应小节保留为设计内容的真源（要做什么没变），但"先后发布、
+> 双接受过渡、26 小时排空"这些**时序**条款不再适用于这次切换——理由是交付物是资产而不是
+> 验证环境，见 §11.9。kid 级 current/previous 与 `--drain-gate` 保留给采用者的 KMS 轮转。
+
 **闸门与验收必须前移到它们要观察的那次变化之前**（外部复审 P1-1，成立）。生产 signing
 surface 在 3c-1/3c-2 就已经变了，把闸门改动堆到 3c-3 意味着整个迁移期间闸门看不全新面。
 
@@ -375,9 +380,9 @@ blocker（外部复审第十四轮 P1-2，成立）。
 | **3c-0** | 本 spec 定稿 + Edge crypto spike 裁决（§11） | 冒充面探针与脱敏聚合证据 tracked 且可复跑 |
 | **3c-1A** | 全部 verifier 认 `kid`→{family, alg, key} 固定 allowlist、每 family `current`+`previous`、legacy 第三入口（状态机 L1）；`[SessionKeys]` 按 §11.6 的 schema 落地（此时只有 HS 行）。**signer 不动** | 闸门认识**两个 HS key family** 与 legacy/current/previous（今天它只认识一个 `JWT_PARAM_NAME`、一套 Edge/asset 密钥定位）；§9 全部 verifier 反例齐备并验过红绿 **已实施并部署 2026-09-02**（plan `2026-09-02-3c-1a-verifier-kid-allowlist.md`） |
 | **3c-1B** | signer 开始发 family-specific `kid` + 新 `token_use`/`aud`（状态机 L2）；两把新 HS secret `/site-builder/session-keys/<kid>` + login-flow secret（§11.3）；观察归零后**关闭** legacy 入口（进入 L3，删除仍归 3c-3）；一次真实 HS 轮转演练 R1/R2。**逐条裁定见 §11.8**。**已实施并部署 2026-09-05**（十步 runbook 首次执行完毕；`cf5db89` = ③ 切 signer/T0、`9245703` = ⑤ 进 L3、`03d2a14` = ⑥ v2 经 `previous` 就位、`a2dd16a` = ⑦⑧ 切 v2 + 生产回滚演示、`19c9f7f` = ⑨⑩ 排空判定 + v1 退役含删参数、`a38fee1` = 本次收尾文档）。**注意：④ 观察窗口在首次演练中经操作者裁决跳过**——单人开发账号、只读读数已证实 T0 以来 `accepted_legacy` 三列全 0，且**没有**做"缩短窗口版的 ④"；因此**观察窗口机制的真机证明只有 ⑨ 这一次**，它按满 26 h 等待并 exit 0 通过。三个时刻（**生产实测**）：**T0 = `2026-09-03T13:51:18Z`**、**④ 跳过裁决 = `2026-09-04T01:40:40Z`**、**⑨ 判定 = `2026-09-05T12:31Z`**（T2 + 30h12m，闸下限 T2+26h）。完整时间线与时长在 `site-builder/DEPLOY.md` 的 runbook 首节 | 四个 `verify_*` 与 10 条 E2E 的登录态工具能 mint **带新 `kid` 的 HS token**（否则 signer 一切就全红，读起来像功能坏了）；且必须在 signer 切换**之前**改完，否则它们自己就是 `accepted_legacy` 的来源（§11.8.2） |
-| **3c-2A** | **只改闸门与验收，不动生产签名**：KMS 探测（`kms:Sign` 持有者、key policy 快照、grants、自助授权、公钥指纹）+ 验收入口改造（auth `/fixture-session`、`site-builder-verifier` 角色、**Edge 与 panel 的夹具会话边界规则先于签发器上线**、`ensure_fixture_site.py` 常驻夹具站点、探针 `sign:fixture-issuer` 两个入口，§11.7） | 上一格全绿；本包**自己**先验过红绿（新探测要能真的红） |
-| **3c-2B** | 两把 KMS 非对称 CMK（deployer CDK 栈创建，默认 key policy + IAM 条件，§11.2）；signer 切 `kms:Sign`（`RAW`，§11.5；identity policy 同时授 `kms:GetPublicKey`，§11.2）；三层 kid 绑定校验（§11.6）；verifier 双接受 | **3c-2A 已上线**；五个验收入口拿到**真实登录态**（不再靠读 SSM 明文本地 mint），且验过红绿 |
-| **3c-3** | 退役 HS256、删旧 SSM secret、删 legacy 入口（状态机 L3）、基线**精确 delta** | `accepted_legacy == 0` 且总量非 0 持续超过最长 TTL（§8） |
+| **3c-2A**（→ 并入 3c-final，§11.9） | **只改闸门与验收，不动生产签名**：KMS 探测（`kms:Sign` 持有者、key policy 快照、grants、自助授权、公钥指纹）+ 验收入口改造（auth `/fixture-session`、`site-builder-verifier` 角色、**Edge 与 panel 的夹具会话边界规则先于签发器上线**、`ensure_fixture_site.py` 常驻夹具站点、探针 `sign:fixture-issuer` 两个入口，§11.7） | 上一格全绿；本包**自己**先验过红绿（新探测要能真的红） |
+| **3c-2B**（→ 并入 3c-final，§11.9） | 两把 KMS 非对称 CMK（deployer CDK 栈创建，默认 key policy + IAM 条件，§11.2）；signer 切 `kms:Sign`（`RAW`，§11.5；identity policy 同时授 `kms:GetPublicKey`，§11.2）；三层 kid 绑定校验（§11.6）；verifier 双接受 | **3c-2A 已上线**；五个验收入口拿到**真实登录态**（不再靠读 SSM 明文本地 mint），且验过红绿 |
+| **3c-3**（→ 并入 3c-final，§11.9） | 退役 HS256、删旧 SSM secret、删 legacy 入口（状态机 L3）、基线**精确 delta** | `accepted_legacy == 0` 且总量非 0 持续超过最长 TTL（§8） |
 
 > **为什么不能反**：若先切 `kms:Sign` 再补 KMS 闸门，3c-2 可以部署成功，而旧闸门只看到
 > HS 暴露面大幅"改善"，**根本没观察新的 signing surface**——那正是这一整轮复审反复咬住的
@@ -1114,6 +1119,34 @@ Lambda/IAM 写调用之前。
 - **最终签字用 commit SHA + 干净工作树**；/code-review 的固定点是 `e4e8d97`。
 
 ---
+
+### 11.9 资产框架裁定（2026-09-06 grill 定稿；ADR 0005 / 0006）
+
+**前提被重述**：本项目的交付物是 `site-builder/` 资产，供任意 AWS 用户在自己账号部署；作者账号
+是验证环境，不是生产。威胁模型按采用者的**共享账号**设计——`ReadOnlyAccess` 就含 `ssm:Get*` 与
+`lambda:GetFunction`。在这个前提下逐条裁定：
+
+| # | 问题 | 裁定 |
+|---|---|---|
+| 1 | 2A 与 2B 是否分开发布 | **合并**。拆分的唯一理由是闸门先于它观察的变化上线、避免验证环境迁移期的盲窗；验证环境可以接受盲窗 |
+| 2 | 验收工具是否随资产分发 | **是**。夹具签发器（§11.7）是资产功能，按生产代码质量做；分发 `verify_deployed_*` + `smoke_router` + 四个 `verify_*`；10 条 E2E 留作开发者回归 |
+| 3 | 最终资产是否保留 HS256 | **不保留**。只有 KMS 非对称；HS 两个 key family 的密钥材料、legacy 入口、跨算法双接受在 3c-final 删除 |
+| 4 | 验证环境如何从 HS 到 KMS | **硬切换**：直接部署 KMS-only 的 signer 与 verifier，现存会话作废、重新登录。因此 2A、2B、3 合为 **3c-final**，§8 的 26 小时排空不用于这次切换 |
+| 5 | 迁移脚手架去向 | v1 冻结前**删除**：legacy 状态机、`--migrate-from-schema` 与 schema 3/4→5 通道、runbook ①–⑩ 的 HS 版本、blue/green 存量迁移脚本（§9 的 M08 改"删"）、各次部署时间线。教训进 spec/ADR，过程记录留 gitignored |
+| 6 | 单账号实测数据是否分发 | **不分发**。`account_trust_baseline.json` 与冒充面探针结果移出 tracked；采用者首跑生成；文档只留方法与边界定义，数字标"单账号实测" |
+| 7 | 3d 迁独立账号 | 从工程包降为 DEPLOY.md 的**部署建议** |
+| 8 | 账号信任边界闸门与探针 | 作为**可选**自检工具分发，闸门的 KMS 探测按此定位做 |
+| 9 | IdP | 通用 OIDC 已是配置驱动。v1 前用 **Google**（外部第三方）与**第二个 Cognito 池**（零外部依赖）各走一遍；资产内置"Cognito 管理员建户"IdP 模式（ADR 0006）；Entra 缺 `email_verified` 只写进手册 |
+| 10 | 文档 | 两层：采用者文档（CLAUDE.md、README、DEPLOY.md、client-setup、skills references、CONTEXT.md、ADR）必须过"新用户新账号"检查；决策记录（spec、plan、review、security）保留 tracked，文件头声明性质 |
+| 11 | v1 的定义与出口 | v1 = 3c-final + 与采用者有关的小项（3h、3f、M03+M16、M07、M19、M14、M17、M22）。出口验收：全新账号只看 DEPLOY.md 从零部署 + 分发的验收集通过；打 `v1.0.0` |
+| 12 | 顺序 | 与签名无关的小项 → IdP 两条 → 3c-final → 配置类小项 → 文档两层 → 出口验收 |
+
+**保留不变的**：kid 级 current/previous 双接受与就位/退役协议（采用者轮转 KMS 密钥要用，
+`--drain-gate previous` 是删旧密钥前的判据）；§11.1–11.7 的技术裁定；§11.7 的夹具签发器设计。
+
+**被否决的**：按原分包在位迁移；HS 作为"简易模式"保留；3d 当工程包；M08 修而不删。
+
+工单与接手点：`.scratch/asset-v1/`（gitignored，不是状态真源）。
 
 ## 12. 附录：spike 的实测数据与出处
 
