@@ -53,6 +53,7 @@ EOF
 }
 
 die() { echo "bootstrap_venvs: $*" >&2; exit 1; }
+add_only() { local d="${1%/}"; ONLY+=("${d%/.venv}"); }   # 接受 dir、dir/ 与 dir/.venv 三种写法
 
 HOST_DEPS=0
 CHECK_ONLY=0
@@ -64,14 +65,17 @@ while [ $# -gt 0 ]; do
     --only)
       shift
       [ $# -gt 0 ] || { echo "bootstrap_venvs: --only 后面要跟目录" >&2; exit 2; }
-      d="${1%/}"; ONLY+=("${d%/.venv}")
+      add_only "$1"
       ;;
-    --only=*) d="${1#--only=}"; d="${d%/}"; ONLY+=("${d%/.venv}") ;;
+    --only=*) add_only "${1#--only=}" ;;
     -h|--help) usage; exit 0 ;;
     *) echo "bootstrap_venvs: 未知参数: $1" >&2; usage >&2; exit 2 ;;
   esac
   shift
 done
+if [ "$CHECK_ONLY" = 1 ] && [ "$HOST_DEPS" = 1 ]; then
+  echo "bootstrap_venvs: --check 与 --host-deps 互斥（--check 什么都不装）" >&2; exit 2
+fi
 
 # ── 前置检查 ────────────────────────────────────────────────────────────────────
 command -v "$PY" >/dev/null 2>&1 \
@@ -136,6 +140,9 @@ build_one() {   # build_one <目录> <清单>
   t1=$(date +%s)
   echo "    完成 $((t1 - t0))s"
 }
+
+# 全量模式先删旧标记：重跑中途失败时，不能让上一次的成功标记继续骗等待它的自动化
+[ "${#ONLY[@]}" -eq 0 ] && rm -f "$STAMP"
 
 T_ALL0=$(date +%s)
 for entry in "${SELECTED[@]}"; do

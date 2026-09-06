@@ -309,6 +309,7 @@ decodeURIComponent）。**CloudFront 全站禁缓存是鉴权正确性前提**
 | `[SessionKeys] signer`（`legacy`\|`current`） | auth 与 panel 的 `SESSION_SIGNER`（两个组件各自部署 ⇒ 切换有先后：**panel 先、auth 后**）、`verifier_env.signer_mode()`、两个 handler 的签发分支与 AST 守卫。**验签侧与它无关**（verifier 全程双接受）⇒ 回滚 = 改这一行重部 auth+panel，不动 Edge、不回退代码 |
 | `[SessionKeys] legacy_param` 清空（状态机 L3） | `legacy_entry()` 变 off、auth/panel 不再下发 `JWT_SECRET_PARAM` 且角色 SSM 清单不含它、`stack.py` 给 Edge 注入空串（**空串不是 SYNTH 占位符**）、闸门 `--retire-key legacy`。清空前 `signer` 必须已是 `current`（加载器硬拒该组合） |
 | `[SessionKeys] login_flow_secret_param` | 只进 auth（`LOGIN_FLOW_SECRET_PARAM` + 角色清单），`login_handler._login_flow_sig` 是唯一读取点；`ensure_session_keys.py` 创建、`deploy_auth.ensure_secret` 兜底（**不进写前核对清单**，见 `docs/adr/0004-*.md`）；panel 有三条负向断言锁死它永不持有；闸门记成 grant `read-login-flow-secret` 且**不算冒充面** |
+| CLAUDE.md「仓库外的几样东西」第 2 步的 venv 表 | `scripts/bootstrap_venvs.sh` 的 `VENVS` 表（守卫 `deployer/tests/test_bootstrap_venvs.py` 按表逐行核对）、DEPLOY.md「本机工具链」 |
 | 验收工具的本地 mint（`scripts/_session_mint.py`） | 六处调用方（四个 `verify_*`、`verify_kid_entry_live.py`、E2E 的会话 cookie fixture）。改它等于同时改六个验收面；非对称化后它整体被夹具签发器（spec §11.7）替代，所以**本地 mint 只许存在于这一个模块里** |
 
 ## 高频坑（都是真机踩过的）

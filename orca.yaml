@@ -5,7 +5,9 @@
 #   · 然后建五个 venv（venv 绑死在 worktree 路径上，每个 worktree 都得重建）。不带 --host-deps：
 #     那改的是机器，不归 worktree。
 # 格式约束来自 Orca：只认 scripts / issueCommand 两个顶层键；命令行统一四个空格缩进。
+# 第一行 set -euo pipefail：cp 失败或 ORCA_ROOT_PATH 没设都要让 setup 红，而不是静默建出没配置的 worktree。
 scripts:
   setup: |
+    set -euo pipefail
     for f in site-builder/config.ini router/config.ini; do if [ ! -e "$f" ] && [ -f "$ORCA_ROOT_PATH/$f" ]; then cp "$ORCA_ROOT_PATH/$f" "$f"; fi; done
     bash site-builder/scripts/bootstrap_venvs.sh
