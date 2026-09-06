@@ -43,9 +43,10 @@ import _session_mint as sm  # noqa: E402
 class Tokens:
     legacy: str | None     # 今天的形态（正对照）；legacy 入口关闭后为 None，该条不出现
     site_kid: str          # site current 签的站点会话（新入口正向）
-    console_kid: str       # console current 签的同形态 token（Edge allowlist 无 console）
+    # 下面两枚**各自只改一个变量**，这是它们能证明东西的全部原因（3c-1B-G A1）：
+    console_kid: str       # console kid + token_use=**site-session** ⇒ 只改 kid family
     unknown_kid: str       # header 带未知 kid（不回落）
-    wrong_use: str         # site kid 签的 token_use=console-session
+    wrong_use: str         # site kid + token_use=console-session ⇒ 只改 token_use
 
 
 @dataclass(frozen=True)
@@ -83,11 +84,13 @@ def run_checks(get, tokens: Tokens, *, site_url: str, auth_host: str) -> list:
     st, hd = get(site_url, f"sb_session={tokens.site_kid}")
     add("新入口：site kid 签的站点会话放行（必须 200，非 302 不算）", st == 200, f"{st}")
     st, hd = get(site_url, f"sb_session={tokens.console_kid}")
-    add("新入口：console kid 的同形态 token 被 Edge 拒（allowlist 无 console）", _is_login_302(st, hd, auth_host), f"{st}")
+    add("新入口：console kid 签的**站点会话形态** token 被 Edge 拒（证明 site allowlist 无 console）",
+        _is_login_302(st, hd, auth_host), f"{st}")
     st, hd = get(site_url, f"sb_session={tokens.unknown_kid}")
     add("新入口：未知 kid 不回落 legacy", _is_login_302(st, hd, auth_host), f"{st}")
     st, hd = get(site_url, f"sb_session={tokens.wrong_use}")
-    add("新入口：token_use=console-session 的 token 被 Edge 拒", st == 302, f"{st}")
+    add("新入口：site kid 签的 token_use=console-session 被 Edge 拒（证明 token_use 比较）",
+        _is_login_302(st, hd, auth_host), f"{st}")
     st, hd = get(f"https://{auth_host}/console-session", f"sb_session={tokens.site_kid}")
     add("auth：kid 形态会话换出升级码", st == 302 and "session-callback?code=" in hd.get("location", ""), f"{st}")
     st, hd = get(f"https://{auth_host}/console-session", f"sb_session={tokens.console_kid}")
@@ -243,13 +246,16 @@ def _live(role: str | None, retired_files: list):
     minter = sm.Minter.from_config()
     target = sm.live_target()
     owner = target.owner
-    mint = lambda use, r="current": minter.mint(use, owner, role=r, ttl_seconds=600)
+    mint = lambda use, r="current", fam=None: minter.mint(use, owner, role=r, ttl_seconds=600,
+                                                          family=fam)
     site_cur = mint("site-session")
     print(f"探针目标：站点 {target.subdomain}.{target.base}（需登录），owner={owner.split('@')[0]}@…；"
           f"site current={minter.keys.families['site']['current'].kid}")
     checks = run_checks(_http_get, Tokens(
         legacy=mint("site-session", "legacy") if minter.keys.legacy_param else None,
-        site_kid=site_cur, console_kid=mint("console-session"),
+        # **跨 family 同形态**：console kid 签的 site-session。只改 kid family 这一个变量，
+        # 所以它的 302 只能来自 allowlist（见 `Tokens` 上的注释与 A1 的 Edge 侧反例用例）。
+        site_kid=site_cur, console_kid=mint("site-session", fam="console"),
         unknown_kid=_unknown_kid_token(minter, owner, sm.trusted_idp()),
         wrong_use=_wrong_use_token(minter, owner)),
         site_url=target.site_url, auth_host=target.auth_host)

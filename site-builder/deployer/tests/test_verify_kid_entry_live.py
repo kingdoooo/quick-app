@@ -1,4 +1,5 @@
 """`scripts/verify_kid_entry_live.py` 的判定逻辑（纯函数）与自测：正向控制必须分得清"放行"与"站点坏了"。"""
+import json
 import sys
 from pathlib import Path
 
@@ -137,3 +138,61 @@ def test_every_default_assertion_has_some_break_path_that_makes_it_red():
         ever_red |= {c.name for c in probe.run_checks(get, toks, site_url=site, auth_host=auth) if not c.ok}
     never = [n for n in names if n not in ever_red and "负对照" not in n]
     assert not never, f"这些断言没有任何 break 路径能让它们红（自测证明不了它们）: {never}"
+
+
+# ---- 3c-1B-G A1：把"探针能红"从断言变成证明 ----------------------------------------------
+#
+# 这两条用**真源 Edge verifier**（占位符替换后 import 的 origin_request.py）回答一个问题：
+# 「如果 console key 真的漏进了 site allowlist，闸门会红吗？」
+#
+# 结论分两半，正是本票要修的东西：
+#   · 跨 family **同形态** token（console kid + token_use=site-session）会被**接受**
+#     ⇒ 探针断言的 302 变成 200 ⇒ 闸门红。**这才是隔离了 allowlist 这一个变量的判据。**
+#   · 旧探针那一枚（console kid + token_use=console-session）仍被拒（`wrong_token_use`）
+#     ⇒ 302 照旧 ⇒ **闸门在真的失守时全绿**。
+# 所以"两个变量一起改"不是风格问题，它让这条闸门失去了证明力。
+
+def _edge_with(allowlist: dict):
+    """真源 Edge 模块，site allowlist 由入参决定（不手抄替换表，见 ticket 22）。"""
+    sys.path.insert(0, str(Path(__file__).parents[3] / "router" / "infrastructure" / "lambda"))
+    import edge_substitutions as es
+    return es.load_edge_module("_edge_for_family_leak", SITE_ALLOWLIST_JSON=json.dumps(allowlist),
+                               LEGACY_ENTRY="off")
+
+
+SITE_KID, CONSOLE_KID = "site-hs-v9", "console-hs-v9"
+SITE_SECRET, CONSOLE_SECRET = "site-secret-9", "console-secret-9"
+_ENTRY = {"alg": "HS256", "role": "current"}
+GOOD_ALLOWLIST = {SITE_KID: {**_ENTRY, "secret": SITE_SECRET}}
+LEAKED_ALLOWLIST = {**GOOD_ALLOWLIST, CONSOLE_KID: {**_ENTRY, "secret": CONSOLE_SECRET}}
+
+
+def _mint(kid, secret, token_use):
+    sys.path.insert(0, str(Path(__file__).parents[2] / "auth"))
+    import session as sess
+    return sess.mint_token(kid=kid, secret=secret, token_use=token_use, email="o@example.test",
+                           ttl_seconds=600, name="O", idp="Feishu",
+                           auth_via="TokenGeneration_HostedAuth")
+
+
+def test_edge_accepts_the_cross_family_token_once_the_console_kid_leaks_in():
+    """漏进 allowlist ⇒ 跨 family 同形态 token 被接受 ⇒ 重建后的探针必然转红。"""
+    leaked = _edge_with(LEAKED_ALLOWLIST)
+    tok = _mint(CONSOLE_KID, CONSOLE_SECRET, "site-session")
+    claims, outcome = leaked._verify_site_session(tok)
+    assert claims and outcome == "accepted_current", outcome
+    # 前提自查：allowlist 正常时同一枚必被拒，否则上面那条什么都没证明
+    ok = _edge_with(GOOD_ALLOWLIST)
+    assert ok._verify_site_session(tok) == (None, "unknown_kid")
+
+
+def test_the_old_two_variable_probe_shape_stays_green_on_the_same_leak():
+    """同一次失守下，旧形态（console kid + console-session）仍被拒 ⇒ 闸门看不见它。
+
+    这条是**反面证明**：它必须一直绿，用来说明"为什么必须换成跨 family 同形态"。
+    拒绝理由是 `wrong_token_use` 而不是 `unknown_kid`——签名已经验过了，
+    也就是说 allowlist 这道门当时已经放行。
+    """
+    leaked = _edge_with(LEAKED_ALLOWLIST)
+    old_shape = _mint(CONSOLE_KID, CONSOLE_SECRET, "console-session")
+    assert leaked._verify_site_session(old_shape) == (None, "wrong_token_use")

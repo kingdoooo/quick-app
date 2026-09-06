@@ -107,6 +107,11 @@ def load_edge_module(name: str, *, write_to: Path | None = None, **overrides: st
     path.write_text(src, encoding="utf-8")
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod          # conftest 的埋点夹具按 sys.modules 找 `_*_testable`
+    # **这条登记是刻意留下的，不是泄漏**（3c-1B-G A5 复核过）：`conftest.py` 的 autouse 夹具
+    # 遍历 `sys.modules` 找 `_*_testable` 来给埋点装会抛的假 client（那是"任何用例都不许写到
+    # 真 DynamoDB"这条不变量的实现方式）。把它清掉，那道护栏就静默失效。
+    # 与 `panel/tests/module_mutation.py` 的取舍相反，理由是那边的副本落在用完即删的
+    # `tmp_path` 下、且没有任何夹具靠它——这里的副本落在测试目录里，是长期存在的。
+    sys.modules[name] = mod
     spec.loader.exec_module(mod)
     return mod

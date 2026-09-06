@@ -477,7 +477,12 @@ def _check_env_has_no_plaintext_secret(env: dict, label: str,
     **逐个键单独出一条 check**：合成一条时某个键缺失只会让 detail 里多一个"缺失"
     字样，闸门总数不变，读报告的人看不出少了哪一个。
     """
-    assert isinstance(param_keys, tuple), f"param_keys 必须是元组，得到 {type(param_keys).__name__}"
+    # **不能是裸 assert**（3c-1B-G A5）：`python3 -O` 会把它整条删掉，而本函数正是靠它
+    # 防住"传进来一个裸字符串被逐字符迭代"——那会产出一堆以单个字符命名的假检查项。
+    # 同一条纪律见 preflight_config_states 的 `PreflightError`。
+    if not isinstance(param_keys, tuple):
+        raise TypeError(f"param_keys 必须是 tuple（得到 {type(param_keys).__name__}）"
+                        "——字符串会被逐字符迭代，产出一堆单字符命名的假检查项")
     leaked = [k for k, v in env.items()
               if (any(s in k.upper() for s in SECRETISH)
                   and not k.upper().endswith("_PARAM"))

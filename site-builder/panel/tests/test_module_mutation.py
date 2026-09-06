@@ -58,7 +58,12 @@ def test_absent_anchor_fails_loudly(src_file, tmp_path):
 
 
 def test_reversed_region_fails_loudly(src_file, tmp_path):
-    with pytest.raises(AssertionError, match="锚点顺序反了"):
+    """锚点给反了要说**锚点给反了**（3c-1B-G A5）。
+
+    原先结束锚点是从 0 开始搜的，于是这种情况算出 end < start，报文说"源文件结构变了？"
+    ——把调用方的锚点选择问题说成了源文件的问题，读的人会去找一次没发生过的重构。
+    """
+    with pytest.raises(AssertionError, match="顺序给反了"):
         mutate_module_segment(src_file, region=("def verify", "def sign"),
                               old='"target"', new='"mutated"',
                               tmp_path=tmp_path, module_name="_subject_mutant_rev")
@@ -69,3 +74,35 @@ def test_missing_region_anchor_is_an_error_not_a_no_op(src_file, tmp_path):
         mutate_module_segment(src_file, region=("def nope", "def verify"),
                               old='"target"', new='"mutated"',
                               tmp_path=tmp_path, module_name="_subject_mutant_noregion")
+
+
+def test_the_mutant_does_not_linger_in_sys_modules(src_file, tmp_path):
+    """副本的 `__file__` 指向用完即删的 tmp_path ⇒ 不能留在 `sys.modules` 里（3c-1B-G A5）。
+
+    留着的话，同一次 pytest 会话里后面任何 `import <name>` / `reload` 都会拿到一个
+    文件已经不存在的陈旧模块——症状是别处一条无关用例以 FileNotFoundError 失败。
+    """
+    import sys
+    name = "_subject_mutant_lifecycle"
+    assert name not in sys.modules
+    mod = mutate_module_segment(src_file, region=("def sign", "def verify"),
+                                old='"target"', new='"mutated"',
+                                tmp_path=tmp_path, module_name=name)
+    assert mod is not None
+    assert name not in sys.modules, "变形副本留在 sys.modules 里了"
+
+
+def test_an_existing_module_of_the_same_name_is_restored(src_file, tmp_path):
+    """同名模块已在 `sys.modules` 时，用完要还原成原来那个，不是删掉。"""
+    import sys
+    import types
+    name = "_subject_mutant_restore"
+    sentinel = types.ModuleType(name)
+    sys.modules[name] = sentinel
+    try:
+        mutate_module_segment(src_file, region=("def sign", "def verify"),
+                             old='"target"', new='"mutated"',
+                             tmp_path=tmp_path, module_name=name)
+        assert sys.modules[name] is sentinel
+    finally:
+        sys.modules.pop(name, None)

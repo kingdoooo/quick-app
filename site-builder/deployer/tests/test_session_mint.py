@@ -319,3 +319,70 @@ def test_module_docstring_save_example_is_a_form_that_round_trips(tmp_path):
     scratch = tmp_path / ".scratch"
     out = sm.save_token(m.group(1), {"token_use": "site-session", "token": "t.t.t"}, scratch_root=scratch)
     assert out.is_relative_to(scratch) and not (scratch / ".scratch").exists()
+
+
+# ---- 3c-1B-G A1：跨 family 同形态 token（family separation 闸门的隔离变量）------------------
+#
+# `mint()` 原先只由 `token_use` 推导 family（`FAMILY_OF`），于是**造不出**"console kid +
+# token_use=site-session"这一种形态——而那正是唯一能单独证明"console kid 不在 site
+# allowlist"的 token。缺了它，探针同时改了两个变量（kid family 与 token_use），
+# 它的 302 可以来自任一条，闸门因此在 allowlist 真的失守时照旧全绿（见下面 Edge 侧那条）。
+
+def test_family_override_mints_a_cross_family_same_shape_token(aws, tmp_path):
+    """`family=` 显式覆盖 ⇒ console kid 签的 **site-session** token（只改 kid family 一个变量）。"""
+    m = _minter(tmp_path)
+    tok = m.mint("site-session", "v@example.test", ttl_seconds=600, family="console")
+    assert _header(tok)["kid"] == "console-hs-v1", _header(tok)
+    p = _payload(tok)
+    assert p["token_use"] == "site-session" and p["aud"] == "site-edge", p
+    # 对照：不给 family 时仍是 site kid（默认行为不变）
+    assert _header(m.mint("site-session", "v@example.test", ttl_seconds=600))["kid"] == "site-hs-v1"
+
+
+def test_family_override_is_validated_not_silently_ignored(aws, tmp_path):
+    m = _minter(tmp_path)
+    with pytest.raises(SystemExit, match="family"):
+        m.mint("site-session", "v@example.test", ttl_seconds=600, family="nope")
+
+
+# ---- 3c-1B-G A5：分页、目录权限、target==root -----------------------------------------------
+
+def test_live_target_pages_through_the_whole_routing_table(tmp_path):
+    """首页只有公开站点/平台行时，合格站点在第二页 —— 不翻页就会以"没有目标"失败。"""
+    pages = [{"Items": [{"subdomain": "console", "owner": "platform", "require_auth": True},
+                        {"subdomain": "app-open", "owner": "o@x.test", "require_auth": False}],
+              "LastEvaluatedKey": {"subdomain": "app-open"}},
+             {"Items": [{"subdomain": "app-deep", "owner": "deep@x.test", "require_auth": True}]}]
+    seen = []
+
+    class _T:
+        def scan(self, **kw):
+            seen.append(kw.get("ExclusiveStartKey"))
+            return pages[len(seen) - 1]
+
+    class _DDB:
+        def Table(self, name):
+            return _T()
+
+    _files(tmp_path)
+    t = sm.live_target(tmp_path / "config.ini", ddb=_DDB())
+    assert t.subdomain == "app-deep" and t.owner == "deep@x.test"
+    assert seen == [None, {"subdomain": "app-open"}], seen
+
+
+def test_save_token_refuses_the_scratch_root_itself(tmp_path):
+    """`--save .scratch` 会被前缀吃成空路径 ⇒ 曾经抛裸 IsADirectoryError。"""
+    root = tmp_path / ".scratch"
+    root.mkdir()
+    for bad in (".scratch", ".", ""):
+        with pytest.raises(SystemExit, match="文件路径"):
+            sm.save_token(Path(bad), {"token_use": "site-session", "token": "a.b.c"}, scratch_root=root)
+
+
+def test_save_token_locks_down_the_scratch_root_it_creates(tmp_path):
+    """`mkdir(mode=…)` 不作用于顺带创建的父目录 ⇒ 新克隆上 `.scratch/` 会是 0755。"""
+    root = tmp_path / ".scratch"          # 故意**不**预先创建
+    sm.save_token(Path("3c-1b/v1.json"), {"token_use": "site-session", "token": "a.b.c"},
+                  scratch_root=root)
+    assert oct(root.stat().st_mode)[-3:] == "700", oct(root.stat().st_mode)
+    assert oct((root / "3c-1b").stat().st_mode)[-3:] == "700"

@@ -1,6 +1,7 @@
 """handler 层：路由、错误码、以及**副作用前置顺序**。"""
 import json
 import os
+from pathlib import Path
 from unittest.mock import patch
 
 import boto3
@@ -1057,3 +1058,58 @@ def test_uncertain_invoke_error_keeps_running_and_lease(aws, secret, monkeypatch
         f"job 是 {jobs[0]['status'] if jobs else '缺失'}——不确定时写终态"
         "就是把租约放给新部署")
     assert common.read_deploy_lease("s-1") == jobs[0]["job_id"]
+
+
+# ---- 3c-1B-G B2（tracked §9 的 3i）：取签名材料必须在消费一次性升级码之前 ------------------
+#
+# `CALLBACK` 分支原先是：`consume_code()`（DynamoDB 条件写，**不可逆**地作废那个 jti）
+# → `console_cookie()`（里面才第一次读 console 签发密钥）。取密钥失败 ⇒ 500，而码已作废，
+# 用户必须重新走一遍 auth→console 的升级跳转。与 ticket 20 的 `/callback` 同一形状，
+# 只是轻一档（重试只需 auth 那一跳，不必整个 Cognito 往返）。
+# 判据与 ticket 20 一致：**断言 `consume_code` 一次都没被调用**，不是只看状态码。
+
+def _callback_event(code="c1", email="o@example.test"):
+    return {"rawPath": "/api/session-callback", "requestContext": {"http": {"method": "GET"}},
+            "queryStringParameters": {"code": code},
+            "headers": {"x-user-email": email, "x-user-name": email.split("@")[0]}}
+
+
+def test_signing_material_is_fetched_before_the_one_time_code_is_burned(monkeypatch):
+    """签名材料取不到时，升级码必须**还没被消费**。"""
+    import console_session as cs
+    calls = []
+    monkeypatch.setattr(handler.console_session, "consume_code",
+                        lambda code, *, expected_email: calls.append(code) or expected_email)
+    monkeypatch.setattr(handler.console_session, "ensure_signing_material",
+                        lambda: (_ for _ in ()).throw(RuntimeError("SESSION_KEYS_JSON 缺失")))
+    monkeypatch.setattr(handler.edge_caller, "caller_is_edge", lambda event: True)
+    with pytest.raises(RuntimeError, match="SESSION_KEYS_JSON"):
+        handler.handler(_callback_event(), None)
+    assert calls == [], f"升级码已被消费：{calls}"
+    del cs
+
+
+def test_the_callback_still_works_when_the_signing_material_is_fine(monkeypatch):
+    """正对照：材料正常时仍消费一次码并种出 `__Host-sb_console`。"""
+    calls = []
+    monkeypatch.setattr(handler.console_session, "consume_code",
+                        lambda code, *, expected_email: calls.append(code) or expected_email)
+    monkeypatch.setattr(handler.console_session, "ensure_signing_material", lambda: None)
+    monkeypatch.setattr(handler.console_session, "console_cookie",
+                        lambda email, name: "__Host-sb_console=t; Path=/")
+    monkeypatch.setattr(handler.edge_caller, "caller_is_edge", lambda event: True)
+    monkeypatch.setenv("CONSOLE_HOST", "console.example.test")   # 302 的 Location 用它
+    r = handler.handler(_callback_event(), None)
+    assert r["statusCode"] == 302 and calls == ["c1"]
+    assert any(c.startswith("__Host-sb_console=") for c in r["cookies"])
+
+
+def test_handler_has_no_mint_call_of_its_own(monkeypatch):
+    """B2 不许把签发搬进 handler——`console_cookie` 仍是 panel 唯一签发点。
+
+    signer 的 AST 守卫（`auth/tests/test_signer_switch_guard.py` 的 NON_SIGNER_FILES）
+    已经盯着这件事；这里再从**行为**侧钉一次：handler 只调"取材料"，不调 mint。
+    """
+    src = (Path(__file__).parents[1] / "handler.py").read_text(encoding="utf-8")
+    assert "ensure_signing_material" in src
+    assert "mint_token" not in src and "mint_session_jwt" not in src

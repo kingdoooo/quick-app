@@ -49,6 +49,45 @@ def test_signing_key_ignores_previous_and_never_signs_with_it():
     assert (kid, secret) == ("site-hs-v1", "s")
 
 
+def test_signing_key_does_not_even_read_the_previous_secret(monkeypatch):
+    """**不只是"不用它签"，而是根本不去取它的值**（3c-1B-G B1）。
+
+    `/callback` 每次登录都调 `signing_key`（ticket 20 把它提前到烧授权码之前）。原先它经
+    `load_allowlist` 把 family 里**每个** kid 的 secret 都 `get_secret` 一遍 ⇒ 签发硬依赖
+    previous 参数可读。两个后果：
+      · 十步的 ⑩ 若先删了退役 key 的 SSM 参数、再重部 auth/panel，**每次登录 500**——
+        而缺的那把是"没人再用它签"的那一把；
+      · 冷缓存下每次登录 2 次 `GetParameter`，而只需要 1 次。
+    """
+    rows = {"site": ROWS["site"] + [{"kid": "site-hs-v2", "alg": "HS256", "role": "previous",
+                                     "ssm_param": "/p/site2"}]}
+    asked = []
+
+    def _get(param):
+        asked.append(param)
+        return dict(SECRETS, **{"/p/site2": "s2"})[param]
+
+    kid, secret = ve.signing_key(json.dumps(rows), "site", _get, allowed_families=("site",))
+    assert (kid, secret) == ("site-hs-v1", "s")
+    assert asked == ["/p/site"], f"取了不该取的参数：{asked}"
+
+
+def test_load_allowlist_still_resolves_every_row_because_verifying_needs_them_all():
+    """验签侧必须拿到**所有** role 的 secret——B1 只收窄签发那条路，不能顺手收窄验签。"""
+    rows = {"site": ROWS["site"] + [{"kid": "site-hs-v2", "alg": "HS256", "role": "previous",
+                                     "ssm_param": "/p/site2"}]}
+    asked = []
+
+    def _get(param):
+        asked.append(param)
+        return dict(SECRETS, **{"/p/site2": "s2"})[param]
+
+    al = ve.load_allowlist(json.dumps(rows), "site", _get, allowed_families=("site",))
+    assert set(al) == {"site-hs-v1", "site-hs-v2"}
+    assert al["site-hs-v2"]["secret"] == "s2"
+    assert sorted(asked) == ["/p/site", "/p/site2"]
+
+
 def test_signing_key_rejects_families_the_component_must_not_sign_for():
     """panel 只持 console：拿 site 去签就是配置错（等于 panel 能伪造站点会话）。"""
     with pytest.raises(RuntimeError):

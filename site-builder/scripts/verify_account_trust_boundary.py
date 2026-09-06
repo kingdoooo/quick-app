@@ -242,6 +242,25 @@ def grants_for_labels(labels) -> set:
     return out
 
 
+def classes_for_labels(labels, t: "Targets") -> frozenset:
+    """被声明的 key label → 它们在 coverage 里对应的**资源类**名（3c-1B-G A6）。
+
+    与 `grants_for_labels` 对偶：那个管 grant delta，这个管 coverage 指纹。
+    资源类名必须与 `undecided_resource_class` 完全一致，否则反事实算出来的集合对不上
+    （对不上的后果是"声明了却仍然红"，与修之前一样，所以下面有一条用例钉住这个对应关系）。
+    """
+    out = set()
+    for label in labels:
+        if label == LABEL_LEGACY:
+            out.add("jwt-param")
+        elif label == LABEL_LOGIN_FLOW:
+            out.add("login-flow-param")
+        else:
+            out.add(f"session-key:{label}")
+    del t          # 目前不需要实例；留参数是为了将来 RS/KMS 类要按 targets 推导
+    return frozenset(out)
+
+
 def configured_kids(session_keys) -> list:
     """config 里声明过的全部 kid。family 清单取 `session_keys.FAMILIES`，**不手抄**——
     手抄的第三份副本在加 family 时会让一个合法 kid 被判成"未知标签"并硬退出。"""
@@ -512,7 +531,8 @@ def undecided_pairs(evaluation_results) -> set[tuple[str, str]]:
     return out
 
 
-def undecided_members(principal_arn: str, pairs, t: "Targets") -> set[str]:
+def undecided_members(principal_arn: str, pairs, t: "Targets", *,
+                      ignore_classes: frozenset = frozenset()) -> set[str]:
     """(动作, 资源) 集合 → 该 principal 的 coverage **成员指纹**集合。
 
     成员 = `(principal, 动作等价类, 该动作下判不出的**资源类集合**)`。
@@ -525,13 +545,23 @@ def undecided_members(principal_arn: str, pairs, t: "Targets") -> set[str]:
 
     取中间：**资源类集合整体进指纹**。上界回到「principal × 动作类」= 5 条/principal，
     而集合一变指纹就变 ⇒ 多出一个精确平台函数照样红。
+
+    `ignore_classes` 用于**反事实**计算（3c-1B-G A6）：把被声明的 key 对应的资源类当作
+    "还不存在"再算一遍指纹。因为资源类集合是**整体**进指纹的，新增一个
+    `session-key:<kid>` 会让该 principal 该动作类的成员**换一个值**（旧的消失、新的出现），
+    对每个受影响的 principal 同时发生——这就是 `--new-key` 声明过却仍然一次冒出几百条
+    `new_undecided_items` 的机制。反事实集合与基线相等 ⇒ 这一轮 churn 完全由被声明的 key
+    解释；有残差 ⇒ 那部分照红。
     """
     by_action: dict[str, set[str]] = {}
     for action, resource in pairs:
         cls = ACTION_CLASS_NAMES.get(action, action)
-        by_action.setdefault(cls, set()).add(undecided_resource_class(resource, t))
+        rcls = undecided_resource_class(resource, t)
+        if rcls in ignore_classes:
+            continue
+        by_action.setdefault(cls, set()).add(rcls)
     return {undecided_item_fp(principal_arn, cls, "|".join(sorted(classes)))
-            for cls, classes in by_action.items()}
+            for cls, classes in by_action.items() if classes}
 
 
 def undecided_resource_class(resource: str, t: "Targets") -> str:
@@ -943,6 +973,7 @@ RED_FIELDS: tuple[tuple[str, str, str], ...] = (
 GREEN_FIELDS: tuple[tuple[str, str], ...] = (
     ("unclassified", "基线里未分类（请标注 category）"),
     ("migration_grants", "声明过的密钥增减（--new-key / --retire-key；绿，可更新基线）"),
+    ("migration_undecided", "声明过的密钥引起的 coverage 指纹迁移（绿；反事实与基线相等才落这里）"),
     ("improvements", "集合缩小（绿；可更新基线）"),
     ("notes",        "事实与口径（不参与红绿）"),
 )
@@ -986,6 +1017,7 @@ class Report:
     boundary_drift: list[str] = field(default_factory=list)
     console_key_in_edge: list[str] = field(default_factory=list)
     migration_grants: list[str] = field(default_factory=list)
+    migration_undecided: list[str] = field(default_factory=list)
     improvements: list[str] = field(default_factory=list)
     unclassified: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -1054,6 +1086,13 @@ def compare_to_baseline(observed: dict[str, dict], baseline: dict, *,
         category = base[fp].get("category")
         gained, lost = grants - was, was - grants
         if gained:
+            # **前置条件"这个 principal 原本就能读到某把会话密钥"是刻意的，别按"改成看被声明的
+            # grant 类"去放宽**（3c-1B-G A6 复核；两轮 review 都提过这条，结论是不改）：
+            # 声明的语义是"我新建了一把 key，能读**同一批**参数的人自然多读到它一把"——
+            # 那是良性的。而一个**原先读不到任何会话密钥**的 principal 现在能读到了，
+            # 那是**能力面真的变大**，不该被一句 `--new-key` 抹掉，必须红、必须人看。
+            # 两条既有用例把这个意图钉住了：`…without_prior_secret_read_stays_red` 与
+            # `…could_not_read_any_key_stays_red`。
             migr = ((gained & declared_new)
                     if any(is_secret_grant(x) for x in was) else set())
             if migr:
@@ -1105,7 +1144,9 @@ def compare_to_baseline(observed: dict[str, dict], baseline: dict, *,
 
     if coverage is not None:
         _compare_coverage(rep, (baseline.get("coverage") or {}).get("undecided_items"),
-                          coverage.get("undecided_items"))
+                          coverage.get("undecided_items"),
+                          counterfactual=coverage.get("counterfactual"),
+                          declared_labels=tuple(new_keys) + tuple(retired_keys))
 
     if iam_write is not None:
         # 第二个实参是整个 baseline：B 的三个分节都在基线顶层。
@@ -1169,7 +1210,8 @@ def _compare_iam_write(rep: Report, base: dict, now: dict) -> None:
                 f"语句 ±{sorted(set(was_b['stmt_fps']) ^ set(is_b['stmt_fps']))}")
 
 
-def _compare_coverage(rep: Report, base_items, now_items) -> None:
+def _compare_coverage(rep: Report, base_items, now_items, *,
+                      counterfactual=None, declared_labels: tuple = ()) -> None:
     """判不出的项按**成员**比：**新成员红、消失算改善、数量只作文档摘要。**
 
     成员是 `(principal, 动作等价类, 资源类)` 的指纹。按 principal 集合比会漏掉这个
@@ -1177,11 +1219,37 @@ def _compare_coverage(rep: Report, base_items, now_items) -> None:
     也判不出 —— 前后都是 `{P}` ⇒ 绿，而新增的**密钥读取**不确定面没被发现。
     """
     was, now = set(base_items or []), set(now_items or [])
-    for fp in sorted(now - was):
+    gained, gone = now - was, was - now
+    # ---- 被声明 key 引起的 churn（3c-1B-G A6）------------------------------------------
+    # 资源类集合**整体**进指纹，所以新增一把 key 会让每个受影响 principal 的成员换一个值
+    # （旧的消失 + 新的出现）。判据是**反事实**：把那把 key 的资源类剔掉之后重算的集合
+    # 若与基线**完全相等**，这一轮 coverage 变化就完全由被声明的 key 解释 ⇒ 整批记进
+    # `migration_undecided`（绿）。**有任何残差就照红**——那才是真的新增不确定面。
+    if declared_labels and gained:
+        cf = set((counterfactual or {}).get("undecided_items") or [])
+        cf_labels = tuple((counterfactual or {}).get("labels") or ())
+        if cf_labels != tuple(sorted(declared_labels)):
+            raise SystemExit(
+                f"声明的 key 是 {sorted(declared_labels)}，而这份观测里的反事实是按 "
+                f"{list(cf_labels)} 算的——不能拿它去吸收 coverage churn。"
+                "重新走实测路径，或 --dump-observed 时带上同样的 --new-key/--retire-key。")
+        residue = cf - was
+        if not residue:
+            rep.migration_undecided.append(
+                f"{len(gained)} 项 coverage 成员因被声明的 key（{sorted(declared_labels)}）改变了"
+                f"资源类集合而换了指纹（同时有 {len(gone)} 项旧成员消失）；剔掉该资源类后重算的集合"
+                "与基线完全相等 ⇒ 这一轮没有新增不确定面（--new-key/--retire-key 已声明）")
+            gained = set()
+            gone = set()
+        else:
+            rep.notes.append(
+                f"声明的 key 解释不了全部 churn：剔掉它之后仍有 {len(residue)} 项新成员，下面照红")
+            gained = residue
+    for fp in sorted(gained):
         rep.new_undecided_items.append(
             f"[{fp}] 新增一项判不出的 (principal, 动作类, 资源)——不确定面变大了；"
             f"用 --dump-observed 看它对应哪条 Condition")
-    for fp in sorted(was - now):
+    for fp in sorted(gone):
         rep.improvements.append(f"[{fp}] 这一项已能判定（可更新基线）")
     rep.notes.append(f"undecided_items: {len(was)} → {len(now)}（{len(now) - len(was):+d}）")
 
@@ -1827,7 +1895,8 @@ def simulate(iam, principal_arn: str,
     return out, missing, pairs
 
 
-def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
+def measure(region: str, *, workers: int = 4, scan_assets: bool = True,
+            declared_labels: tuple = ()) -> dict:
     clients = _aws_clients(region)
     iam, lam = clients["iam"], clients["lambda"]
     cfg = read_config()
@@ -2005,6 +2074,9 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
     # item 级的判不出集合：成员是 (principal, 动作等价类, 资源类) 的指纹。
     # `n_missing` 那个 principal 级计数继续留作环境事实（只报 delta），红绿看这个。
     undecided: set[str] = set()
+    # 反事实（3c-1B-G A6）：把被声明 key 的资源类当作"还不存在"再算一遍。
+    # 声明为空时它与 `undecided` 恒等，比较器也不会用到它。
+    undecided_cf: set[str] = set()
 
     with cf.ThreadPoolExecutor(max_workers=workers) as pool:
         # **每线程独立 client**：共享一个 client 并发用会让一部分请求跳过证书校验
@@ -2022,6 +2094,10 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
             # 折成成员指纹。放在下面 `if grants:` 的**外面**——一个 principal 可能一条
             # grant 都没有却有判不出的项，而那正是最该盯住的那种（条件哪天放宽就是新 grant）。
             undecided |= undecided_members(p["arn"], pairs, targets)
+            if declared_labels:
+                undecided_cf |= undecided_members(
+                    p["arn"], pairs, targets,
+                    ignore_classes=classes_for_labels(declared_labels, targets))
             grants = grants_from_decisions(decisions, targets)
             if grants:
                 observed[principal_fingerprint(p["arn"])] = {
@@ -2078,7 +2154,13 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
             # --no-asset-scan 只看当前 asset ⇒ 这份观测不完整，不许出结论/写基线。
             "asset_scan_complete": scan_assets,
             "principals": observed, "resource_policies": rp, "facts": facts,
-            "coverage": {"undecided_items": sorted(undecided)},
+            "coverage": {"undecided_items": sorted(undecided),
+                         # 反事实分节：**只在本次运行内用于比较，不写进基线**
+                         # （`write_baseline` 只取 undecided_items）。`labels` 记下它是
+                         # 按哪组声明算的——`--from-dump` 时声明与快照不匹配就必须响亮拒绝，
+                         # 否则会拿"按别的 label 算的反事实"去吸收 churn。
+                         "counterfactual": {"labels": sorted(declared_labels),
+                                            "undecided_items": sorted(undecided_cf)}},
             # `texts` 只进 stdout 与 --dump-observed 的产物，**不进基线**。
             "iam_write": {"statements": iam_stmts, "boundaries": boundaries,
                           "managed_versions": used_policies, "texts": stmt_texts},
@@ -2169,7 +2251,8 @@ BUNDLE_SHAPE: dict = {
               # 3c-1A：每 kid 一组；键是 kid（不是账号值），成员按同一份子规格校验
               "session_keys": {"*": {"edge_code_targets_carrying_key": _plain_int,
                                      "edge_assets_carrying_key": _plain_int}}},
-    "coverage": {"undecided_items": _list_of_str},
+    "coverage": {"undecided_items": _list_of_str,
+                 "counterfactual": {"labels": _list_of_str, "undecided_items": _list_of_str}},
     "iam_write": {"statements": dict, "boundaries": dict,
                   "managed_versions": dict, "texts": dict},
     "required": {"edge": _nonempty_str, "deployer": _nonempty_str},
@@ -2317,7 +2400,9 @@ def write_baseline(bundle: dict, baseline: dict, path: Path) -> None:
          "facts": bundle["facts"],
          # 判不出的项按**成员**存（新成员即红）。principal 级的那个笼统计数在 facts 里，
          # 只报 delta——它会随账号里任何一条带 Condition 的新策略变动。
-         "coverage": bundle["coverage"],
+         # **只持久化 undecided_items**：反事实是本次运行的比较用料，写进基线就会
+         # 变成"下一轮拿上一轮的声明去吸收"（A6）。
+         "coverage": {"undecided_items": bundle["coverage"]["undecided_items"]},
          "principals": principals,
          # B：IAM 写的纯静态文本快照。**只落指纹**——语句原文（`texts`）刻意不写，
          # 它含账号内标识（Principal 是带账号 ID 的角色 ARN）。
@@ -2412,7 +2497,10 @@ def main() -> int:
               f"它只在实测路径上评估。）", file=sys.stderr)
     else:
         bundle = measure(args.region, workers=args.workers,
-                        scan_assets=not args.no_asset_scan)
+                        scan_assets=not args.no_asset_scan,
+                        # 反事实按**本次声明**算（A6）；`--from-dump` 那条路用快照里存的那份，
+                        # 声明不匹配时 `_compare_coverage` 会响亮拒绝。
+                        declared_labels=declared_labels)
 
     observed = bundle["principals"]
     print(f"\n具备至少一项敏感授权的 principal：{len(observed)}")
@@ -2441,6 +2529,22 @@ def main() -> int:
             for p in observed.values():
                 if p["name"] in classify:
                     p["category"] = classify[p["name"]]
+        # **先渲染一遍比较报告，再写基线**（3c-1B-G A6）。原先这条分支在
+        # `compare_to_baseline` 之前就 return ⇒ 写基线那条路**什么都不打印**，
+        # "这一次到底接受了什么"只存在于操作者的记忆里。spec §11.8.7 反对人工放行的
+        # 核心理由正是这个：接受的内容必须留痕。报告只打印、不改退出码——这条命令的
+        # 语义仍是"我知道并接受这些变化"。
+        print("\n── 即将被写进基线的变化（先看清再接受）"
+              "──────────────────────────")
+        try:
+            preview = compare_to_baseline(
+                observed, baseline, required=bundle["required"],
+                resource_policies=bundle["resource_policies"], facts=bundle["facts"],
+                coverage=bundle["coverage"], iam_write=bundle["iam_write"],
+                new_keys=tuple(args.new_key or ()), retired_keys=tuple(args.retire_key or ()))
+            print(preview.render())
+        except SystemExit as exc:      # 反事实与声明不匹配之类：说清楚，但不阻止显式的写入
+            print(f"（比较报告未能生成：{exc}）", file=sys.stderr)
         write_baseline(bundle, baseline, BASELINE_PATH)
         print(f"\n已写入 {BASELINE_PATH}（新条目 category=unclassified，请人工标注）")
         return 0

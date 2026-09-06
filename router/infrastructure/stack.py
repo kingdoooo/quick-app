@@ -64,6 +64,22 @@ def _synth_offline() -> bool:
     return os.getenv("APP_SYNTH_OFFLINE") == "1"
 
 
+def _edge_placeholder_re():
+    """取 `lambda/edge_substitutions.py` 里那条正则（唯一定义），**不污染 `sys.path`**。
+
+    3c-1B-G A5：原先是无条件 `sys.path.insert(0, …/lambda)`。它有两个后果——每次调用都
+    多一条重复项；更要紧的是那个目录会**永久**排在 `sys.path[0]`，于是 synth 进程里后续
+    任何裸 `import session` / `import origin_request` 都可能解析到 Edge 那边的同名模块。
+    用 `spec_from_file_location` 按路径加载，作用域只在本函数内。
+    """
+    import importlib.util
+    path = Path(__file__).resolve().parent / "lambda" / "edge_substitutions.py"
+    spec = importlib.util.spec_from_file_location("_edge_substitutions_for_synth", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.PLACEHOLDER_RE
+
+
 def assert_edge_source_fully_injected(src: str) -> str:
     """注入完成的 Edge 源码里**不许剩任何 `{{…}}`**，剩了就让 synth 失败（3c-1B ticket 21）。
 
@@ -81,9 +97,7 @@ def assert_edge_source_fully_injected(src: str) -> str:
     直到 ticket 21 才发现。**唯一还剩的手抄副本就是那个 shell 闸门**（bash 的 grep 没法
     import），改这条正则时必须连它一起改。
     """
-    sys.path.insert(0, str(Path(__file__).resolve().parent / "lambda"))
-    from edge_substitutions import PLACEHOLDER_RE
-    left = sorted(set(PLACEHOLDER_RE.findall(src)))
+    left = sorted(set(_edge_placeholder_re().findall(src)))
     if left:
         raise ValueError(
             f"Edge 源码注入后仍有未替换的占位符 {left}——`origin_request.py` 新增了注入点，"
@@ -156,7 +170,15 @@ def _session_keys_on_path() -> Path:
     时炸（latent ImportError，只因为调用顺序恰好对才没现形）。
     """
     root = Path(__file__).resolve().parents[2]
-    sys.path.insert(0, str(root / "site-builder" / "auth"))
+    # **幂等**（3c-1B-G A5）：原先每次调用都插一条，一次 synth 下来 `sys.path` 里有 3-4 份重复。
+    # 位置仍是 0，**刻意不改成 append**：那会改变解析顺序，而这是 synth 的关键路径。
+    # 已知且**未改变**的残留性质：`site-builder/auth` 会留在 `sys.path[0]`，所以本进程后续
+    # 任何裸 `import session` / `import verifier_env` 会解析到那边。彻底修法是像
+    # `_edge_placeholder_re` 那样按路径加载，但这条路径有三处 `from session_keys import …`
+    # 依赖它，改动面比收益大——先只去重。
+    target = str(root / "site-builder" / "auth")
+    if target not in sys.path:
+        sys.path.insert(0, target)
     return root
 
 

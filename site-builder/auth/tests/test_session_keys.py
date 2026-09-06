@@ -203,6 +203,16 @@ def test_rs_row_schema_is_accepted_now_so_2b_does_not_change_the_schema(tmp_path
     (lambda t: t.replace("site_previous =", "site_previous = site-hs-v1"), "previous 与 current 相同"),
     (lambda t: t.replace("site_previous =", "site_previous = console-hs-v1"), "同一 kid 出现在两个 family（前缀不符先拒）"),
     (lambda t: t.replace("console_current = console-hs-v1", "console_current = console-hs-v1\nconsole_current = console-hs-v1"), "同一节里重复的键（configparser 的 DuplicateOptionError 也要变成本模块的错误）"),
+    # ---- 3c-1B-G A4：key material 的全局唯一性。前两条**实测曾被接受**，正是拆 family 想消掉的东西 ----
+    (lambda t: t.replace("ssm_param = /site-builder/session-keys/console-hs-v1",
+                         "ssm_param = /site-builder/session-keys/site-hs-v1"),
+     "两个 family 的 kid 共用同一个 ssm_param（= 跨 family 又共享了一把密钥）"),
+    (lambda t: t.replace("legacy_param = /site-builder/jwt-secret",
+                         "legacy_param = /site-builder/session-keys/site-hs-v1"),
+     "legacy_param 指向某个 HS 行的参数（legacy 与 current 共享密钥）"),
+    (lambda t: t.replace("ssm_param = /site-builder/session-keys/site-hs-v1",
+                         "ssm_param = /site-builder/session-keys/site-hs-v1-renamed"),
+     "HS 行的 ssm_param 不等于前缀 + kid（只校验前缀挡不住共享/错配）"),
 ])
 def test_misconfiguration_raises_instead_of_falling_back(tmp_path, mutate, why):
     with pytest.raises(sk.SessionKeysError):

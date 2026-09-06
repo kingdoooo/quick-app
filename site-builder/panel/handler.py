@@ -161,6 +161,11 @@ def handler(event, context):
 
     # session-callback 是升级入口本身，不能要求"已有面板会话"
     if pattern == CALLBACK:
+        # **取签名材料在消费之前**（3c-1B-G B2 = tracked §9 的 3i）：`consume_code` 是
+        # 不可逆的条件写，而签发密钥原先直到 `console_cookie()` 里才第一次读。取不到时
+        # 用户白丢一枚码 + 500。抛出去（→ 500）是对的，但要抛在**烧码之前**。
+        # 与 ticket 20 给 auth 的 `/callback` 做的是同一件事。
+        console_session.ensure_signing_material()
         try:
             # 身份比对在 consume_code **内部**、且在原子消费 jti **之前**
             # （Codex 审查 2026-08-10 P2-3）。原来是"先消费再在这里比对"，

@@ -156,3 +156,80 @@ def test_require_nonzero_flag_decides_the_exit_code(monkeypatch, capsys, panel_c
     rc = svc.main(["--require-total", "--require-nonzero", "accepted_current"])
     assert rc == expect_rc
     assert ("panel=0" in capsys.readouterr().err) == (expect_rc == 1)
+
+
+# ---- 3c-1B-G A2：命名排空闸门 -----------------------------------------------------------------
+#
+# 不可逆的 ⑩ 之前那一步判定，原先靠操作者同时输对四个参数
+# （`--hours 26 --require-total --require-zero X --require-nonzero accepted_current`）。
+# 少任何一个都会**静默放宽**，最坏的一种是空窗口：`--require-zero` 只报非零列，
+# 三列全空自然"通过"⇒ exit 0 被读成"已排空"，然后就去删参数了。
+# `--drain-gate` 把这四条锁进脚本，操作者只需要选 previous 还是 legacy。
+
+def _gate(monkeypatch, by, argv):
+    monkeypatch.setattr(svc, "collect", lambda session, hours: by)
+    monkeypatch.setattr(svc.boto3, "Session", lambda: None)
+    return svc.main(argv)
+
+
+FULL = {"auth": {"accepted_current": 2}, "panel": {"accepted_current": 1},
+        "edge": {"accepted_current": 5}}
+
+
+def test_drain_gate_passes_only_when_all_four_conditions_hold(monkeypatch):
+    assert _gate(monkeypatch, FULL, ["--drain-gate", "previous"]) == 0
+
+
+def test_drain_gate_fails_on_an_empty_window_where_require_zero_alone_passes(monkeypatch, capsys):
+    """**本票的核心反例**：空窗口下裸 `--require-zero` 退 0，而 `--drain-gate` 必须退 1。"""
+    empty = {"auth": {}, "panel": {}, "edge": {}}
+    assert _gate(monkeypatch, empty, ["--hours", "26", "--require-zero", "accepted_previous"]) == 0
+    assert _gate(monkeypatch, empty, ["--drain-gate", "previous"]) == 1
+    err = capsys.readouterr().err
+    # 空窗口要被**两条**判据同时抓住：埋点静默 + accepted_current 没有非零列
+    assert "没有任何 session_verify" in err and "accepted_current" in err, err
+
+
+@pytest.mark.parametrize("by,why", [
+    ({"auth": {"accepted_current": 1}, "panel": {"accepted_current": 1},
+      "edge": {"accepted_current": 1, "accepted_previous": 1}}, "previous 列非零"),
+    ({"auth": {"accepted_current": 1}, "panel": {}, "edge": {"accepted_current": 1}}, "panel 总量为 0"),
+    ({"auth": {"unknown_kid": 3}, "panel": {"unknown_kid": 1}, "edge": {"unknown_kid": 9}},
+     "有流量但 accepted_current 三列全 0（signer 其实没在发新形态）"),
+])
+def test_drain_gate_catches_each_way_the_four_conditions_can_break(monkeypatch, by, why):
+    assert _gate(monkeypatch, by, ["--drain-gate", "previous"]) == 1, why
+
+
+def test_drain_gate_refuses_a_window_shorter_than_the_ttl_budget(monkeypatch):
+    """`--hours 2.6`（把 26 打错）必须响亮拒绝，而不是按 2.6 小时给出一个"通过"。"""
+    with pytest.raises(SystemExit) as ei:
+        _gate(monkeypatch, FULL, ["--drain-gate", "previous", "--hours", "2.6"])
+    assert "26" in str(ei.value)
+
+
+def test_drain_gate_defaults_to_the_full_window_without_being_told(monkeypatch):
+    seen = {}
+
+    def _collect(session, hours):
+        seen["hours"] = hours
+        return FULL
+
+    monkeypatch.setattr(svc, "collect", _collect)
+    monkeypatch.setattr(svc.boto3, "Session", lambda: None)
+    assert svc.main(["--drain-gate", "legacy"]) == 0
+    assert seen["hours"] >= 26
+
+
+def test_drain_gate_picks_the_outcome_column_from_its_argument(monkeypatch, capsys):
+    by = {"auth": {"accepted_current": 1}, "panel": {"accepted_current": 1},
+          "edge": {"accepted_current": 1, "accepted_legacy": 4}}
+    assert _gate(monkeypatch, by, ["--drain-gate", "previous"]) == 0    # legacy 列不在本闸门判据里
+    assert _gate(monkeypatch, by, ["--drain-gate", "legacy"]) == 1
+    assert "accepted_legacy" in capsys.readouterr().err
+
+
+def test_drain_gate_rejects_an_unknown_target():
+    with pytest.raises(SystemExit) as ei:
+        svc.main(["--drain-gate", "current"])
+    assert ei.value.code == 2

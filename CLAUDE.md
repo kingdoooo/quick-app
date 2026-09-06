@@ -160,8 +160,10 @@ python3 site-builder/scripts/verify_kid_entry_live.py   # 新入口真机正/负
 #   FILE 由 `_session_mint.py --save` 预存，**只许写进 .scratch/**（gitignored，token 是活凭证）。
 python3 site-builder/scripts/session_verify_counts.py --hours 1 --require-total   # 三处 session_verify 埋点读数（只读；任一 verifier 为 0 即退 1）
 # ↑ 轮转的两道 26h 时间闸就是它，三条判据全由脚本下、exit 0 才算过（3c-1B ticket 18 起）：
-#   `--hours 26 --require-total --require-zero accepted_previous --require-nonzero accepted_current`
-#   （④ 判 legacy 时 --require-zero 换成 accepted_legacy）；判据说明见 DEPLOY.md 的十步 runbook
+#   `--drain-gate previous`（④ 判 legacy 用 `--drain-gate legacy`）。**四条判据锁在脚本里**
+#   （窗口 ≥ 26 h、每处总量 > 0、目标列三列全 0、accepted_current 三列全 > 0），
+#   因为手写那四个旗标少任何一个都是静默放宽——空窗口下裸 `--require-zero` 会退 0，
+#   而下一步是不可逆的删参数。判据说明见 DEPLOY.md 的十步 runbook
 # 账号信任边界的漂移闸门（只读；A 直接失守 + B IAM 写静态快照两层；400 个 principal × 2 次
 # IAM 模拟 + **两次** GetAccountAuthorizationDetails（第二次是模拟后的**窗口两端一致性
 # 复查**——两端不一致就作废本轮、不出结论也不写基线。它**不保证原子**：只覆盖 principal

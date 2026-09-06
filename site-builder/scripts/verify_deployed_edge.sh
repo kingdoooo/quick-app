@@ -194,10 +194,18 @@ fi
 # ③ 的逐行比对已经能发现"产物不是这份源码"，这里再点名两条**语义**：核对旧版本
 # （`$0 <version>`）时 ③ 只会说"行数/内容不一致"，而这两行会直接说出缺的是哪条
 # 安全属性。同样按代码行断言，不用裸 grep——两个名字在注释里都出现。
-if grep -qE '^\s+if claims\.get\("typ"\) != "session":' "$TMP/index.py"; then
-  echo "PASS  会话验签查 typ（M05：60s 升级码不能当站点会话用）"
+# **M05 现在有两条产物断言，不是一条**（3c-1B-G A1）：3c-1B 之后线上 token 全是新形态，
+# 用途比较落在 `token_use` 上；`typ` 那条只管 legacy 入口（L3 已关、3c-3 才删代码）。
+# 只查 `typ` 会在"新入口的 token_use 比较被删掉"时**全绿**——那正是今天的主路径。
+if grep -qE '^\s+if claims\.get\("token_use"\) != "site-session":' "$TMP/index.py"; then
+  echo "PASS  新入口查 token_use（M05 主路径：console 用途的 token 不能当站点会话）"
 else
-  fail "产物的 _verify_session_jwt 没有 typ 检查 —— M05 未生效：一个 60 秒的 console 升级码就是一个有效站点会话，且能在 /console-session 无限续期"
+  fail "产物的 _verify_site_session 没有 token_use 检查 —— M05 在**新形态**上未生效：一个 console 升级码/面板会话就是一个有效站点会话"
+fi
+if grep -qE '^\s+if claims\.get\("typ"\) != "session":' "$TMP/index.py"; then
+  echo "PASS  legacy 入口查 typ（M05 旧路径；L3 后入口已关，3c-3 删代码时这条一起删）"
+else
+  fail "产物的 legacy 验签没有 typ 检查 —— legacy 入口若被重开，60s 升级码就是有效站点会话"
 fi
 # ---- 3c-1A：site family 的 kid allowlist + legacy 入口开关（spec §4.3 / §11.6）----
 # 产物里的 allowlist 必须**恰好**是 site-builder/config.ini [SessionKeys] 的 site family（不多不少、

@@ -36,6 +36,10 @@ from verify_account_trust_boundary import EDGE_ORIGIN_REQUEST_FN as EDGE_FN  # n
 
 AUTH_FN = "site-auth-service"
 PANEL_FN = "site-panel"
+# 排空闸门（3c-1B-G A2）：`--drain-gate <目标>` → 要求为 0 的那一列。
+# 26 h 的来历见 DEPLOY.md：站点会话 TTL 24 h + auth 的 secret 缓存 5 min + Edge 全球复制 10–20 min + 余量。
+DRAIN_TARGETS = {"previous": "accepted_previous", "legacy": "accepted_legacy"}
+DRAIN_MIN_HOURS = 26
 OUTCOMES = ("accepted_current", "accepted_previous", "accepted_legacy", "unknown_kid",
             "alg_mismatch", "wrong_audience", "wrong_token_use", "bad_signature", "expired")
 QUERY = ('fields @message | filter @message like /"event": "session_verify"/ '
@@ -167,7 +171,25 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--require-nonzero", action="append", default=[], metavar="OUTCOME", choices=OUTCOMES,
                     help="该 outcome 在**每一**verifier 列都必须 > 0，否则退 1（可重复）。④/⑨ 用 accepted_current：证明新形态"
                          "在三处都真的被接受过")
+    ap.add_argument("--drain-gate", choices=tuple(DRAIN_TARGETS), metavar="{previous,legacy}",
+                    help="排空闸门（runbook 的 ④ / ⑨ 只用这一个旗标）：把四条判据锁进脚本"
+                         f"——窗口 ≥ {DRAIN_MIN_HOURS} h、每个 verifier 总量 > 0、"
+                         "accepted_{previous,legacy} 三列全 0、accepted_current 三列全 > 0。"
+                         "不可逆的退役步骤只许用它，别用下面那几个自由组合的诊断旗标")
     args = ap.parse_args(argv)
+    if args.drain_gate:
+        # **把四条判据合成一个旗标**（3c-1B-G A2）：原先它们是四个独立参数，少任何一个都
+        # 静默放宽，而最坏的一种不是"少判一条"而是**空窗口**——`--require-zero` 只报非零列，
+        # 三列全空自然通过 ⇒ exit 0 被读成"已排空"，下一步就是删 SSM 参数（不可逆）。
+        if args.hours != ap.get_default("hours") and args.hours < DRAIN_MIN_HOURS:
+            raise SystemExit(
+                f"--drain-gate 的窗口不得短于 {DRAIN_MIN_HOURS} h（给的是 {args.hours}）——"
+                "26 = 站点会话 TTL 24 h + auth 的 secret 缓存 5 min + Edge 全球复制 10–20 min 再加余量。"
+                "想看短窗口读数用不带 --drain-gate 的诊断旗标。")
+        args.hours = max(args.hours, float(DRAIN_MIN_HOURS))
+        args.require_total = True
+        args.require_zero = list(args.require_zero) + [DRAIN_TARGETS[args.drain_gate]]
+        args.require_nonzero = list(args.require_nonzero) + ["accepted_current"]
     by_verifier = collect(boto3.Session(), args.hours)
     text, _total, _legacy = render(by_verifier)
     print(text)

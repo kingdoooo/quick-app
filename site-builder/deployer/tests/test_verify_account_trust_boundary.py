@@ -2222,7 +2222,10 @@ def _complete_bundle(g) -> dict:
         "facts": {"edge_code_targets_carrying_live_key": 0,
                   "edge_assets_carrying_live_key": 0,
                   "principals_with_missing_context": 0, "session_keys": {}},
-        "coverage": {"undecided_items": []},
+        # A6：反事实分节（按声明算的第二份 undecided；无声明时为空）。它是 BUNDLE_SHAPE 的
+        # 一部分 ⇒ 缺它照样硬失败，与其它分节同一条 fail-closed 合同。
+        "coverage": {"undecided_items": [],
+                     "counterfactual": {"labels": [], "undecided_items": []}},
         "iam_write": {"statements": {}, "boundaries": {},
                       "managed_versions": {}, "texts": {}},
         "required": {"edge": "EdgeRole", "deployer": "DeployerRole"},
@@ -3781,3 +3784,142 @@ def test_new_kid_alias_and_retire_key_are_wired_into_the_comparison():
     assert 'dest="new_key"' in src and 'dest="retire_key"' in src
     assert "new_keys=tuple(args.new_key or ())" in src
     assert "retired_keys=tuple(args.retire_key or ())" in src
+
+
+# ---- 3c-1B-G A6：被声明 key 引起的 coverage 指纹迁移 ------------------------------------
+#
+# 机制（实测过两轮、各 305 条）：`undecided_members` 把某 principal 某动作类下的**整个
+# 资源类集合**折成一个指纹，所以新增一把 key 的 SSM 参数会让每个受影响 principal 的成员
+# **换一个值**（旧的消失 + 新的出现）。声明只作用于 grant delta，从不进 coverage
+# ⇒ `--new-key` 声明过仍然 exit 1，最后只能人工 `--update-baseline`，而那正是
+# spec §11.8.7 否决的工作流。判据改成**反事实**：剔掉被声明 key 的资源类重算，
+# 与基线相等才整批落绿。
+
+_A6_ARN = "arn:aws:iam::111111111111:role/reader"
+_A6_KID = "site-hs-v9"
+
+
+def _a6_pairs(with_new_key: bool):
+    """同一个 principal 的 (动作, 资源) 对：新 key 就位后多一个 session-key 资源。"""
+    pairs = {("ssm:GetParameter", _A6_JWT)}
+    if with_new_key:
+        pairs.add(("ssm:GetParameter", _A6_NEW))
+    return pairs
+
+
+_A6_JWT = "arn:aws:ssm:us-east-1:1:parameter/site-builder/jwt-secret"
+_A6_NEW = f"arn:aws:ssm:us-east-1:1:parameter/site-builder/session-keys/{_A6_KID}"
+
+
+def _a6_targets(with_new_key: bool):
+    """复用既有 `_targets` 的字段（**不手写一份 Targets**，字段漂移时会静默变成别的东西）。"""
+    g = _gate()
+    base = _targets(g)
+    return g.Targets(**{**base.__dict__, "jwt_parameter": _A6_JWT,
+                        "session_key_parameters": {_A6_KID: _A6_NEW} if with_new_key else {}})
+
+
+def test_classes_for_labels_matches_the_resource_class_names_actually_emitted():
+    """对应关系必须精确——差一个字的后果是"声明了却仍然红"，与没修一样。"""
+    g = _gate()
+    t = _a6_targets(True)
+    assert g.classes_for_labels((_A6_KID,), t) == frozenset({f"session-key:{_A6_KID}"})
+    assert g.classes_for_labels((g.LABEL_LEGACY,), t) == frozenset({"jwt-param"})
+    assert g.classes_for_labels((g.LABEL_LOGIN_FLOW,), t) == frozenset({"login-flow-param"})
+    # 真的由 undecided_resource_class 产出同名类（不是两处各写一份字面量）
+    emitted = {g.undecided_resource_class(r, t) for _, r in _a6_pairs(True)}
+    assert g.classes_for_labels((_A6_KID, g.LABEL_LEGACY), t) <= emitted
+
+
+def test_the_churn_is_real_the_fingerprint_changes_for_every_affected_principal():
+    """前提自查：不剔掉资源类时，新增一把 key 确实让成员指纹整批换值。"""
+    g = _gate()
+    before = g.undecided_members(_A6_ARN, _a6_pairs(False), _a6_targets(False))
+    after = g.undecided_members(_A6_ARN, _a6_pairs(True), _a6_targets(True))
+    assert before and after and not (before & after), (before, after)
+
+
+def test_ignoring_the_declared_class_reproduces_the_baseline_fingerprints():
+    g = _gate()
+    before = g.undecided_members(_A6_ARN, _a6_pairs(False), _a6_targets(False))
+    cf = g.undecided_members(_A6_ARN, _a6_pairs(True), _a6_targets(True),
+                             ignore_classes=g.classes_for_labels((_A6_KID,), _a6_targets(True)))
+    assert cf == before
+
+
+def _a6_compare(*, declared, extra_now=(), cf_labels=None):
+    """跑一次 `_compare_coverage`：基线 = before，本次 = after(+extra)，反事实 = 剔掉声明的类。"""
+    g = _gate()
+    before = g.undecided_members(_A6_ARN, _a6_pairs(False), _a6_targets(False))
+    after = g.undecided_members(_A6_ARN, _a6_pairs(True), _a6_targets(True)) | set(extra_now)
+    cf = g.undecided_members(_A6_ARN, _a6_pairs(True), _a6_targets(True),
+                             ignore_classes=g.classes_for_labels(declared, _a6_targets(True))
+                             ) | set(extra_now)
+    rep = g.Report()
+    labels = sorted(declared) if cf_labels is None else cf_labels
+    g._compare_coverage(rep, sorted(before), sorted(after),
+                        counterfactual={"labels": labels, "undecided_items": sorted(cf)},
+                        declared_labels=tuple(declared))
+    return rep
+
+
+def test_declared_key_churn_lands_in_the_green_migration_bucket():
+    g = _gate()
+    rep = _a6_compare(declared=(_A6_KID,))
+    assert not rep.new_undecided_items, rep.new_undecided_items
+    assert rep.migration_undecided and _A6_KID in rep.migration_undecided[0]
+    assert rep.ok, [f for f, _, _ in g.RED_FIELDS if getattr(rep, f)]
+
+
+def test_an_unrelated_undecided_item_in_the_same_round_still_goes_red():
+    """**这条是 A6 的安全性**：声明只吸收它能解释的那部分，多一条无关的照红。"""
+    g = _gate()
+    stray = g.undecided_item_fp("arn:aws:iam::111111111111:role/other", "invoke", "sites")
+    rep = _a6_compare(declared=(_A6_KID,), extra_now=(stray,))
+    assert rep.new_undecided_items and stray in rep.new_undecided_items[0]
+    assert not rep.ok
+
+
+def test_without_a_declaration_the_churn_is_still_red():
+    """没声明就没有豁免——否则任何 coverage 变化都能靠"反正有反事实"混过去。"""
+    g = _gate()
+    rep = _a6_compare(declared=())
+    assert rep.new_undecided_items and not rep.migration_undecided
+    assert not rep.ok
+
+
+def test_a_counterfactual_computed_for_other_labels_is_refused_not_used():
+    """`--from-dump` 的快照若是按别的声明算的，必须响亮拒绝——不能拿它吸收 churn。"""
+    g = _gate()
+    with pytest.raises(SystemExit, match="反事实"):
+        _a6_compare(declared=(_A6_KID,), cf_labels=["console-hs-v9"])
+
+
+def test_the_green_bucket_is_not_a_red_field():
+    g = _gate()
+    assert "migration_undecided" in [f for f, _ in g.GREEN_FIELDS]
+    assert "migration_undecided" not in [f for f, _, _ in g.RED_FIELDS]
+
+
+def test_absorption_requires_prior_capability_and_that_is_deliberate():
+    """声明**不能**吸收"原先读不到任何密钥、现在能读了"这种增长（3c-1B-G A6 的结论）。
+
+    两轮 review 都把 `any(is_secret_grant(x) for x in was)` 这个前置条件报成缺陷，
+    结论是**不改**：声明的语义是"新建了一把 key，能读同一批参数的人自然多读到一把"（良性）；
+    而一个原先读不到任何会话密钥的 principal 现在能读到，是**能力面真的变大**，
+    一句 `--new-key` 不该把它抹掉。这条用例存在的目的就是让下一次 review 不必再推一遍——
+    它断言的是**意图**，不是实现细节。
+    """
+    g = _gate()
+    kid = "site-hs-v9"
+    fp = g.principal_fingerprint("arn:aws:iam::1:role/newcomer")
+    observed = {fp: {"name": "newcomer", "arn": "arn:aws:iam::1:role/newcomer", "kind": "role",
+                     "grants": [f"read-session-key:{kid}"]}}
+    # 基线里这个 principal **没有任何**会话密钥 grant（只有一条无关的 invoke）
+    baseline = {"principals": {fp: {"name": "newcomer", "arn": "arn:aws:iam::1:role/newcomer",
+                                   "kind": "role", "grants": ["invoke-platform:site-panel"],
+                                   "category": "unrelated-workload"}}}
+    rep = g.compare_to_baseline(observed, baseline, required={}, new_keys=(kid,))
+    assert rep.new_grants and kid in rep.new_grants[0], rep.new_grants
+    assert not rep.migration_grants
+    assert not rep.ok

@@ -104,11 +104,24 @@ class Minter:
         return ref.kid, self._secret(ref.ssm_param)
 
     def mint(self, token_use: str, email: str, *, role: str = "current", ttl_seconds: int,
-             name: str | None = None, auth_via: str = AUTH_VIA) -> str:
+             name: str | None = None, auth_via: str = AUTH_VIA, family: str | None = None) -> str:
+        """按 `token_use` 签一枚 token；`family` 可**显式覆盖**签名用的 key family。
+
+        缺省（`family=None`）走 `FAMILY_OF[token_use]`，与全部既有调用方一致。
+
+        **`family` 是给 family-separation 探针用的，不是给生产用的**（3c-1B-G A1）：
+        只有"console kid 签的 `token_use=site-session`"这一种**跨 family 同形态** token
+        能单独证明"console kid 不在 site allowlist"。不给这个覆盖的话，探针只能造出
+        "console kid + console-session"，它同时改了 kid family 与 token_use 两个变量
+        ⇒ Edge 的 302 可能来自任一条 ⇒ allowlist 真的失守时闸门照旧全绿
+        （`test_edge_accepts_the_cross_family_token_once_the_console_kid_leaks_in` 是那条反例）。
+        """
         if token_use not in FAMILY_OF:
             raise SystemExit(f"token_use 必须是 {tuple(FAMILY_OF)} 之一，得到 {token_use!r}")
+        if family is not None and family not in self._keys.families:
+            raise SystemExit(f"family 必须是 {tuple(self._keys.families)} 之一，得到 {family!r}")
         name = email.split("@")[0] if name is None else name
-        kid, secret = self.key(FAMILY_OF[token_use], role)
+        kid, secret = self.key(FAMILY_OF[token_use] if family is None else family, role)
         if kid is None:                                   # legacy：旧形态、旧合同
             if token_use == "console-upgrade":
                 return sess.mint_upgrade_code(email, secret, ttl_seconds=ttl_seconds)
@@ -157,10 +170,23 @@ def live_target(config_path: Path = CONFIG_PATH, *, ddb=None) -> Target:
     if ddb is None:
         import boto3
         ddb = boto3.resource("dynamodb", region_name=region)
-    for it in ddb.Table(table).scan()["Items"]:
-        if it.get("require_auth") is True and it.get("owner") != "platform":
-            return Target(subdomain=str(it["subdomain"]), owner=str(it["owner"]), base=base, region=region)
-    raise SystemExit(f"路由表 {table} 里找不到 require_auth=True 的非平台站点——探针没有目标")
+    # **必须翻页**（3c-1B-G A5）：`scan()` 单次最多返回 1 MB，丢掉 `LastEvaluatedKey` 就等于
+    # 只看第一页。路由表每部署一个站点多一行，一旦超过一页而首页恰好只有公开站点与平台行，
+    # 本函数就会以"探针没有目标"失败——报文指向路由表内容，而真因是分页，排查方向全错。
+    t = ddb.Table(table)
+    kwargs: dict = {}
+    while True:
+        page = t.scan(**kwargs)
+        for it in page.get("Items", []):
+            if it.get("require_auth") is True and it.get("owner") != "platform":
+                return Target(subdomain=str(it["subdomain"]), owner=str(it["owner"]),
+                              base=base, region=region)
+        last = page.get("LastEvaluatedKey")
+        if not last:
+            break
+        kwargs["ExclusiveStartKey"] = last
+    raise SystemExit(f"路由表 {table} 里找不到 require_auth=True 的非平台站点——探针没有目标"
+                     "（已翻完所有页）")
 
 
 # ---- 预存 / 读回（负向探针用）--------------------------------------------------------------
@@ -183,9 +209,20 @@ def save_token(path: Path, record: dict, *, scratch_root: Path = SCRATCH_ROOT) -
     if not path.is_absolute() and path.parts and path.parts[0] == root.name:
         path = Path(*path.parts[1:]) if len(path.parts) > 1 else Path()
     target = (root / path).resolve() if not path.is_absolute() else path.resolve()
-    if root != target and root not in target.parents:
+    # `--save .scratch` 会把前缀吃成空路径 ⇒ target == root ⇒ 逃逸检查放行，然后
+    # `os.open` 对着目录抛裸 `IsADirectoryError`（3c-1B-G A5）。显式拒绝，给一句能读的话。
+    if target == root or target.is_dir():
+        raise SystemExit(f"--save 要给一个文件路径（相对 {root}），不能是目录：{path}")
+    if root not in target.parents:
         raise SystemExit(f"--save 只许写进 {root}（scratch，gitignored），拒绝 {path}")
+    # `mkdir(mode=…)` **不作用于它顺带创建的父目录**（CPython 明确：父目录按默认权限建），
+    # 所以新克隆上第一次用会留下 0755 的 `.scratch/`，而 docstring 承诺的是 0700。
+    # 逐层建 + 逐层收权限（3c-1B-G A5）。
+    missing = [d for d in (target.parent, *target.parent.parents) if not d.exists()]
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for d in missing:
+        if root == d or root in d.parents or d == root:
+            os.chmod(d, 0o700)
     # 先建后改：write_text 不接受 mode，而"先写再 chmod"有一个短暂的 0644 窗口 ⇒ 用 os.open 定死
     fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as fh:

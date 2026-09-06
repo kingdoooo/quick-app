@@ -33,11 +33,27 @@ def mutate_module_segment(src_path, *, region: tuple, old: str, new: str,
 
     返回加载好的模块。调用方负责把假 SSM / 假 client 之类挂回副本上——副本自带一份
     干净的模块级缓存，夹具打在真模块上的补丁不会自动生效。
+
+    **副本不会留在 `sys.modules` 里**（3c-1B-G A5）：它的 `__file__` 指向 `tmp_path`，
+    那个目录在用例结束后就被删了。留着的话，本次 pytest 会话里后面任何
+    `import <module_name>` / `importlib.reload` 都会拿到一个文件已经不存在的陈旧模块。
+    exec 期间需要它在 `sys.modules`（模块内的自引用、dataclass 等要能找到自己），
+    所以是"放进去 → exec → 还原"。
     """
     src = Path(src_path).read_text()
-    start, end = src.index(region[0]), src.index(region[1])
-    if start >= end:
-        raise AssertionError(f"段落锚点顺序反了：{region!r} —— 源文件结构变了？")
+    start = src.index(region[0])
+    # **结束锚点从 start 之后找**（3c-1B-G A5）：`src.index(end)` 从 0 开始搜，
+    # 如果结束锚点在文件里更早处也出现（例如 `def _secret` 在 `def console_cookie` 上方），
+    # 就会算出 end < start，然后报"锚点顺序反了：源文件结构变了？"——把调用方的锚点选择
+    # 问题说成了源文件结构问题，读的人会去找一次根本没发生的重构。
+    try:
+        end = src.index(region[1], start + len(region[0]))
+    except ValueError:
+        earlier = region[1] in src
+        raise AssertionError(
+            f"结束锚点 {region[1]!r} 没有出现在起始锚点 {region[0]!r} **之后**"
+            + ("（它只出现在起始锚点之前——两个锚点的顺序给反了）" if earlier
+               else "（它在这个文件里根本不存在）")) from None
     seg = src[start:end]
     if seg.count(old) != 1:
         raise AssertionError(
@@ -47,6 +63,14 @@ def mutate_module_segment(src_path, *, region: tuple, old: str, new: str,
     path.write_text(src[:start] + seg.replace(old, new) + src[end:])
     spec = importlib.util.spec_from_file_location(module_name, path)
     mod = importlib.util.module_from_spec(spec)
+    had = module_name in sys.modules
+    previous = sys.modules.get(module_name)
     sys.modules[module_name] = mod
-    spec.loader.exec_module(mod)
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        if had:
+            sys.modules[module_name] = previous
+        else:
+            sys.modules.pop(module_name, None)
     return mod

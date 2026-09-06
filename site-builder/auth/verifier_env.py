@@ -22,7 +22,13 @@ from __future__ import annotations
 import json
 
 
-def load_allowlist(env_json: str | None, family: str, get_secret, *, allowed_families: tuple) -> dict:
+def _rows(env_json: str | None, family: str, allowed_families: tuple) -> list:
+    """解析并校验 `SESSION_KEYS_JSON`，返回该 family 的行。**不取任何 secret。**
+
+    拆出来是为了让签发侧能"校验全部行、只取 current 的值"（3c-1B-G B1），
+    而验签侧继续取全部行的值。两条路共用同一份解析 ⇒ "签发的 kid 一定在本 verifier 的
+    allowlist 里"仍然是结构保证。
+    """
     if env_json is None:
         raise RuntimeError("SESSION_KEYS_JSON 缺失——部署脚本没下发")
     try:
@@ -33,27 +39,38 @@ def load_allowlist(env_json: str | None, family: str, get_secret, *, allowed_fam
         raise RuntimeError(f"SESSION_KEYS_JSON 含本 verifier 不该持有的 family：{sorted(keys) if isinstance(keys, dict) else keys!r}")
     if family not in keys:
         raise RuntimeError(f"SESSION_KEYS_JSON 没有 {family} family——部署脚本没下发")
+    return keys[family]
+
+
+def load_allowlist(env_json: str | None, family: str, get_secret, *, allowed_families: tuple) -> dict:
+    """验签用的 allowlist：**每一行都取 secret**（current 与 previous 都要能验签）。"""
     return {r["kid"]: {"alg": r["alg"], "secret": get_secret(r["ssm_param"]), "role": r["role"]}
-            for r in keys[family]}
+            for r in _rows(env_json, family, allowed_families)}
 
 
 def signing_key(env_json: str | None, family: str, get_secret, *,
                 allowed_families: tuple) -> tuple[str, str]:
     """→ (kid, secret)：该 family 里 role=current 的那把。签发用，**只有 signer 侧调用**。
 
-    走 load_allowlist 而不是自己解一遍 JSON：那样"签发的 kid 一定在本 verifier 的 allowlist 里"
-    是结构保证而不是巧合；代价是顺带解析 previous 行（值走同一套 TTL 缓存，多一次 SSM 调用）。
+    与 load_allowlist 共用 `_rows` 的解析与校验：那样"签发的 kid 一定在本 verifier 的
+    allowlist 里"是结构保证而不是巧合。
     current 不唯一（0 个或 2 个）时硬失败——env_json 只会给出一个，出现别的数量说明下发的
     JSON 被手改过，静默取第一个会让"签哪把"变成字典序的副产品。
+
+    **只取 current 那一行的 secret**（3c-1B-G B1）。原先它走 `load_allowlist`，于是把
+    family 里每个 kid 的 secret 都取一遍 ⇒ 签发**硬依赖 previous 参数可读**，而
+    `/callback` 每次登录都调本函数（ticket 20 把它提前到烧授权码之前）。后果：十步的 ⑩
+    若先删退役 key 的参数再重部，每次登录 500——缺的还是那把"没人再用它签"的 key；
+    另外冷缓存下每次登录白打一次 `GetParameter`。
     """
-    allowlist = load_allowlist(env_json, family, get_secret, allowed_families=allowed_families)
-    current = [(kid, entry) for kid, entry in allowlist.items() if entry["role"] == "current"]
+    rows = _rows(env_json, family, allowed_families)
+    current = [r for r in rows if r.get("role") == "current"]
     if len(current) != 1:
         raise RuntimeError(
             f"SESSION_KEYS_JSON 的 {family} family 有 {len(current)} 个 role=current 的 kid，"
             "必须恰好 1 个——部署脚本坏了")
-    kid, entry = current[0]
-    return kid, entry["secret"]
+    row = current[0]
+    return row["kid"], get_secret(row["ssm_param"])
 
 
 def signer_mode(flag: str | None) -> str:

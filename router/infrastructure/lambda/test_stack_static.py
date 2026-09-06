@@ -61,8 +61,12 @@ def test_session_keys_path_insert_is_unconditional():
     assert "def _session_keys_on_path()" in SRC
     body = SRC[SRC.index("def load_site_allowlist"):SRC.index("class WebRouterStack")]
     assert "_session_keys_on_path()" in body, "load_site_allowlist 没自己放路径"
-    insert_line = "sys.path.insert(0, str(root / \"site-builder\" / \"auth\"))"
-    assert SRC.count(insert_line) == 1, "路径插入有第二份副本，两处会漂移"
+    # 判据是**只有一处会往 sys.path 放 auth 目录**（两处就会漂移），而不是那一行的字面写法。
+    # 3c-1B-G A5 把它改成幂等（`if target not in sys.path`）——重复插入会让一次 synth 攒下
+    # 3-4 份同样的路径；位置仍是 0，解析顺序没变。
+    fn = SRC[SRC.index("def _session_keys_on_path()"):SRC.index("def _session_keys()")]
+    assert "sys.path.insert(0, target)" in fn and "not in sys.path" in fn, fn
+    assert SRC.count("site-builder\" / \"auth\"") == 1, "放路径的地方有第二份副本，两处会漂移"
 
 
 def _load_jwt_secret_fn():
@@ -306,6 +310,10 @@ def _residue_check_fn():
     mod = types.ModuleType("_stack_residue_fragment")
     mod.__dict__.update(sys=_sys, Path=Path,
                         __file__=str(Path(__file__).parents[1] / "stack.py"))
+    # 正则的取用被抽成 `_edge_placeholder_re()`（A5：不再污染 sys.path），一并切进片段
+    hs = SRC.index("def _edge_placeholder_re")
+    exec(compile(textwrap.dedent(SRC[hs:SRC.index("def ", hs + 1)]), "<stack helpers>", "exec"),
+         mod.__dict__)
     exec(compile(textwrap.dedent(SRC[start:end]), "<stack fragment>", "exec"), mod.__dict__)
     return mod
 
@@ -316,9 +324,21 @@ def test_residue_check_uses_the_single_definition_of_the_regex():
     抄一份的代价已经真实发生过：ticket 22 给 helper 补上了数字，而 verify_deployed_edge.sh
     里那份停在 `[A-Z_]`，漏掉含数字的注入点名字，直到 ticket 21 才发现。
     """
+    helper = SRC[SRC.index("def _edge_placeholder_re"):]
+    helper = helper[:helper.index("def ", 1)]
+    assert "PLACEHOLDER_RE" in helper and "edge_substitutions.py" in helper
+    # **按路径加载**，不是 sys.path 插入（A5）：那个目录会永久占住 sys.path[0]。
+    # 判据只看**代码**——docstring 与注释里都会提到 `sys.path`（它们解释的正是为什么不用它），
+    # 所以按 AST 取函数体、去掉 docstring 之后再看（按行 grep 抓不掉 docstring 的续行）。
+    assert "spec_from_file_location" in helper
+    import ast as _ast
+    node = next(n for n in _ast.walk(_ast.parse(SRC))
+                if isinstance(n, _ast.FunctionDef) and n.name == "_edge_placeholder_re")
+    body = node.body[1:] if _ast.get_docstring(node) else node.body
+    dumped = "\n".join(_ast.dump(st) for st in body)
+    assert "sys" not in dumped, dumped
     body = SRC[SRC.index("def assert_edge_source_fully_injected"):]
     body = body[:body.index("def ", 1)]
-    assert "from edge_substitutions import PLACEHOLDER_RE" in body
     assert "A-Z0-9_" not in body, "又抄了一份正则——改用 edge_substitutions.PLACEHOLDER_RE"
 
 

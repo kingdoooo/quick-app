@@ -106,9 +106,14 @@ def _key_ref(cfg: configparser.ConfigParser, kid: str, family: str, role: str) -
     key_arn = _strip(cfg.get(sect, "key_arn", fallback=""))
     spki = _strip(cfg.get(sect, "spki_sha256", fallback=""))
     if alg == "HS256":
-        if not ssm_param.startswith(HS_PARAM_PREFIX) or key_arn or spki:
+        # 3c-1B-G A4：**严格等于**前缀 + kid，不只是前缀。只校验前缀时两个 kid 可以指向
+        # 同一个参数（实测被接受）⇒ 两个 family 又共享了一把密钥，而"每 family 各自一把"
+        # 正是拆 family 的全部意义。等值约束让这类配置**结构上**不存在，
+        # 也顺带钉住"参数名就是 kid"这条 `ensure_session_keys.py` 一直在遵守的约定。
+        if ssm_param != HS_PARAM_PREFIX + kid or key_arn or spki:
             raise SessionKeysError(
-                f"[{sect}] HS 行必须只有 ssm_param（{HS_PARAM_PREFIX}…），不得带 key_arn/spki_sha256")
+                f"[{sect}] HS 行的 ssm_param 必须**恰好**是 {HS_PARAM_PREFIX}{kid}"
+                f"（当前 {ssm_param!r}），且不得带 key_arn/spki_sha256")
         return KeyRef(kid, family, alg, role, ssm_param=ssm_param)
     if ":key/" not in key_arn or not re.fullmatch(r"[0-9a-f]{64}", spki) or ssm_param:
         raise SessionKeysError(
@@ -164,12 +169,31 @@ def load_session_keys(config_path: Path) -> SessionKeys:
         raise SessionKeysError(
             f"[SessionKeys] login_flow_secret_param={login_flow!r} 落在 {HS_PARAM_PREFIX} 下"
             "——它不是 kid，不许长得像一把 family 密钥")
-    hs_params = {r.ssm_param for fam in families.values() for r in fam.values()
-                 if r is not None and r.ssm_param}
+    # 3c-1B-G A4：**任何两把 key material 都不许指向同一处**。上面的 kid 唯一性
+    # （`kid 出现在两个 family`）与 HS 行的等值约束已经挡掉大部分，这里做兜底的全局判据，
+    # 并把 legacy 也纳进来——原先只校验 login-flow 与别人冲突，legacy 自己没人管。
+    hs_rows = [r for fam in families.values() for r in fam.values() if r is not None]
+    hs_list = [r.ssm_param for r in hs_rows if r.ssm_param]
+    hs_params = set(hs_list)
+    if len(hs_list) != len(hs_params):                    # 等值约束之后应当不可达，留作兜底
+        raise SessionKeysError(
+            f"[SessionKeys] 两个 kid 指向同一个 ssm_param（{sorted(hs_list)}）"
+            "——那等于两把 key 共享一把密钥，family 隔离与轮转都会失效")
+    if legacy and legacy in hs_params:
+        raise SessionKeysError(
+            f"[SessionKeys] legacy_param={legacy!r} 与某把 family 密钥同一参数"
+            "——legacy 入口与新入口共享密钥时，能伪造 legacy cookie 的人也能伪造新形态会话，"
+            "且轮转那把 key 会连带作废全部 legacy cookie")
     if login_flow == legacy or login_flow in hs_params:
         raise SessionKeysError(
             f"[SessionKeys] login_flow_secret_param={login_flow!r} 与一把会话密钥同一参数"
             "——登录流程的 HMAC 不得复用会话密钥（spec §11.3）")
+    # RS 行（2B 用；今天配置里还没有）：同一把 CMK 或同一个公钥指纹出现两次同样是共享。
+    for attr, what in (("key_arn", "KMS key"), ("spki_sha256", "公钥指纹")):
+        vals = [getattr(r, attr) for r in hs_rows if getattr(r, attr)]
+        if len(vals) != len(set(vals)):
+            raise SessionKeysError(
+                f"[SessionKeys] 两个 kid 指向同一个 {what}（{sorted(vals)}）——同上，那不是两把 key")
     return SessionKeys(families=families, legacy_param=legacy,
                        login_flow_secret_param=login_flow, signer=signer)
 

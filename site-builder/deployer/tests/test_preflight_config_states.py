@@ -115,3 +115,111 @@ def test_the_four_simulated_states_still_match_the_runbook_steps():
     assert "site_current = site-hs-v2" in switch and "site_previous = site-hs-v1" in switch
     retire = pf.state_retire(base)
     assert "[SessionKey:site-hs-v1]" not in retire and "site_previous =\n" in retire
+
+
+# ---- 3c-1B-G A3：版本推导、非法状态先拦、RED 必须非零退出 --------------------------------
+
+LIVE_SHAPE = """[Platform]
+account_id = 111111111111
+
+[SessionKeys]
+site_current = site-hs-v2
+site_previous =
+console_current = console-hs-v2
+console_previous =
+signer = current
+legacy_param =
+login_flow_secret_param = /site-builder/login-flow-secret
+
+[SessionKey:site-hs-v2]
+alg = HS256
+ssm_param = /site-builder/session-keys/site-hs-v2
+
+[SessionKey:console-hs-v2]
+alg = HS256
+ssm_param = /site-builder/session-keys/console-hs-v2
+"""
+
+
+def test_next_kid_is_derived_from_the_current_config_not_hardcoded():
+    """轮转过一轮之后 current 就是 v2 —— 写死 v2 会让 ⑥ 追加出重复小节。
+
+    这是本票的现场：v1→v2 之后再跑这个脚本，`configparser` 直接 `DuplicateSectionError`，
+    六个套件全在 collection 期炸，而汇总只打印"红 0 条"。
+    """
+    assert pf.next_kids(LIVE_SHAPE) == {"site": "site-hs-v3", "console": "console-hs-v3"}
+    stage = pf.state_stage(LIVE_SHAPE)
+    assert stage.count("[SessionKey:site-hs-v2]") == 1, "既有小节被复制了"
+    assert "[SessionKey:site-hs-v3]" in stage and "site_previous = site-hs-v3" in stage
+
+
+def test_next_kid_can_be_named_explicitly():
+    nxt = pf.next_kids(LIVE_SHAPE, {"site": "site-hs-v9"})
+    assert nxt == {"site": "site-hs-v9", "console": "console-hs-v3"}
+
+
+def test_the_simulated_states_load_under_the_real_loader():
+    """四个状态都必须是**合法配置**——否则套件红的原因与本脚本要找的东西无关。"""
+    sys.path.insert(0, str(ROOT / "site-builder" / "auth"))
+    import session_keys as sk
+    for tag, fn in (("l3", pf.state_l3), ("stage", pf.state_stage),
+                    ("switch", pf.state_switch), ("retire", pf.state_retire)):
+        text = fn(LIVE_SHAPE)
+        path = Path(__file__).parent / f"_pf_{tag}.ini"
+        path.write_text(text)
+        try:
+            sk.load_session_keys(path)      # 抛即失败
+        finally:
+            path.unlink(missing_ok=True)
+
+
+def test_l3_also_switches_the_signer_because_the_loader_rejects_the_pair():
+    """出厂 `signer = legacy` + 空 `legacy_param` 被加载器硬拒 ⇒ ⑤ 必须一起切 signer。"""
+    example = (ROOT / "site-builder" / "config.ini.example").read_text(encoding="utf-8")
+    assert "signer = legacy" in example, "出厂默认变了，这条用例的前提要更新"
+    l3 = pf.state_l3(example)
+    assert "signer = current" in l3 and "signer = legacy" not in l3
+
+
+def test_state_transforms_raise_instead_of_asserting():
+    """`-O` 会删掉 assert ⇒ 变换静默 no-op ⇒ 拿未改的 config 跑出"四个状态全绿"。"""
+    import ast
+    src = SRC_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    for fn in ("setkey", "drop_section", "current_kids", "next_kids"):
+        node = next(n for n in ast.walk(tree)
+                    if isinstance(n, ast.FunctionDef) and n.name == fn)
+        assert not [n for n in ast.walk(node) if isinstance(n, ast.Assert)], f"{fn} 里还有裸 assert"
+        assert [n for n in ast.walk(node) if isinstance(n, ast.Raise)], f"{fn} 没有真异常"
+
+
+def test_a_transform_that_cannot_find_its_anchor_is_loud():
+    with pytest.raises(pf.PreflightError, match="legacy_param"):
+        pf.setkey("[SessionKeys]\nsigner = current\n", "legacy_param", "")
+    with pytest.raises(pf.PreflightError, match="site_current"):
+        pf.current_kids("[SessionKeys]\nsigner = current\n")
+
+
+def test_red_suites_make_the_script_exit_nonzero(monkeypatch, capsys, tmp_path):
+    """**本票的核心反例**：原先无论多少 RED 都 `return 0`。"""
+    monkeypatch.setattr(pf, "CFG", tmp_path / "config.ini")
+    pf.CFG.write_text(LIVE_SHAPE)
+    monkeypatch.setattr(pf, "SENTINEL", tmp_path / ".scratch" / "sentinel.json")
+    monkeypatch.setattr(pf, "validate", lambda text, tag: None)
+    monkeypatch.setattr(pf, "run_all", lambda tag: [("panel", ["FAILED tests/x.py::y"])])
+    assert pf.main([]) == 1
+    assert "红" in capsys.readouterr().err
+    monkeypatch.setattr(pf, "run_all", lambda tag: [])
+    assert pf.main([]) == 0
+
+
+def test_collection_errors_are_reported_not_counted_as_zero():
+    """pytest 死在 collection 时只有 ERROR 行，没有 FAILED 行——不能报成"红 0 条"。"""
+    stdout = ("ERROR tests/test_x.py - session_keys.SessionKeysError: 缺 site_current\n"
+              "E   session_keys.SessionKeysError: 缺 site_current\n"
+              "!!!! Interrupted: 1 error during collection !!!!\n")
+    lines = pf.suite_failures(stdout, "")
+    assert lines and any("SessionKeysError" in l for l in lines), lines
+    # stdout 一无所有时退到 stderr，绝不返回空列表
+    assert pf.suite_failures("", "bad interpreter: No such file or directory\n")
+    assert pf.suite_failures("", "")

@@ -392,12 +392,16 @@ python3 site-builder/scripts/preflight_config_states.py     # 只读 config、�
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-# ④ 判 legacy：--require-zero accepted_legacy；⑨ 判 v1：--require-zero accepted_previous
-python3 site-builder/scripts/session_verify_counts.py --hours 26 --require-total \
-  --require-zero accepted_previous --require-nonzero accepted_current
+# ④ 判 legacy、⑨ 判 v1（previous）。**只用这一个旗标**，四条判据在脚本里
+python3 site-builder/scripts/session_verify_counts.py --drain-gate previous   # ④ 用 legacy
 ```
 
-**三条判据全由脚本下，exit 0 才算过**（3c-1B ticket 18 起）：`--require-zero X` = 三列 X 全 0；
+**四条判据全由脚本下，exit 0 才算过**（`--drain-gate`，3c-1B-G A2 起）：窗口 ≥ 26 h、
+每个 verifier 总量 > 0、`accepted_{previous,legacy}` 三列全 0、`accepted_current` 三列全 > 0。
+**不要再手写那四个自由组合的旗标**——它们仍在（诊断用），但少任何一个都是**静默放宽**，
+而最坏的一种不是"少判一条"：空窗口下 `--require-zero` 只报非零列，三列全空自然"通过"
+⇒ exit 0 被读成"已排空"，下一步就是删 SSM 参数（不可逆）。`--drain-gate` 还会拒绝
+把 `--hours 26` 打成 `2.6` 这类窗口。旧写法的语义仍是：`--require-zero X` = 三列 X 全 0；
 `--require-nonzero accepted_current` = 三列 accepted_current 全 > 0；`--require-total` = 每处总量 > 0。
 此前脚本只判总量、三列归零靠人读，exit 0 不等于闸门绿。区级 DescribeLogGroups 失败也会直接退出
 （少算一区 = 假 0），不再静默跳过。
@@ -695,7 +699,7 @@ python3 site-builder/scripts/_session_mint.py --token-use console-upgrade \
 | | |
 |---|---|
 | **配置** | 无 |
-| **动作** | 先跑四个 `verify_*`（证明埋点在工作），再 `session_verify_counts.py --hours 26 --require-total --require-zero accepted_legacy --require-nonzero accepted_current` |
+| **动作** | 先跑四个 `verify_*`（证明埋点在工作），再 `session_verify_counts.py --drain-gate legacy`（旧写法 `--hours 26 --require-total --require-zero accepted_legacy --require-nonzero accepted_current` |
 | **硬停止点** | 上一条命令 **exit 0**（= 三列 `accepted_legacy` **全 0**、三列 `accepted_current` **全 > 0**、每处总量 > 0，三条都由脚本判）。**不满足就不许进 ⑤**——继续观察或先查是谁还在发 legacy。**第一次判定失败是常态，不是故障**（见下面的窗口算术）|
 | **闸门** | 不跑 |
 | **回滚** | 无（只读一步）|
@@ -710,8 +714,7 @@ python3 site-builder/scripts/verify_analytics_e2e.py          # 需要新鲜的 
 python3 site-builder/scripts/verify_api_key_e2e.py            # 无 [ApiKey] 段时自行跳过并返回 0
 python3 site-builder/scripts/verify_session_token_semantics.py
 
-python3 site-builder/scripts/session_verify_counts.py --hours 26 --require-total \
-  --require-zero accepted_legacy --require-nonzero accepted_current      # exit 0 才算过
+python3 site-builder/scripts/session_verify_counts.py --drain-gate legacy    # exit 0 才算过
 ```
 
 > **窗口算术：`≥ T0+26 h` 是最早**可以**尝试**的时刻，不是能过的时刻。** spec §11.8.2 写明
@@ -719,7 +722,8 @@ python3 site-builder/scripts/session_verify_counts.py --hours 26 --require-total
 > 判据跑在**滑动窗口** `[X-26h, X]` 上：legacy cookie 在 T0 之前签出、还能活 24 h，所以只要
 > 有人在 T0+23 h 用了一枚，能干净的窗口就得等到 T0+49 h。**算法**：
 > `最早可过时刻 = 最后一次 accepted_legacy 的时刻 + 26 h`，每次判定失败就按新的"最后一次"重算。
-> 判定失败时**不要**缩短 `--hours`、也不要去掉 `--require-total` / `--require-zero` 凑绿（那是把判据换掉，不是通过判据）。
+> 判定失败时**不要**换掉旗标去凑绿（那是把判据换掉，不是通过判据）。`--drain-gate` 正是为此存在：
+> 四条判据锁在脚本里，操作者只选 previous 还是 legacy。
 >
 > ⚠️ **观察窗口期间不要跑 `verify_kid_entry_live.py`。** 它有一条**故意**的正对照
 > 「legacy 会话仍 200 放行」——`_session_mint --role legacy` 现签一枚 legacy token 打到 Edge。
@@ -866,7 +870,7 @@ python3 site-builder/scripts/verify_kid_entry_live.py --role previous
 | | |
 |---|---|
 | **配置** | 无 |
-| **动作** | 先跑四个 `verify_*`，再 `session_verify_counts.py --hours 26 --require-total --require-zero accepted_previous --require-nonzero accepted_current` |
+| **动作** | 先跑四个 `verify_*`，再 `session_verify_counts.py --drain-gate previous`（旧写法 `--hours 26 --require-total --require-zero accepted_previous --require-nonzero accepted_current` |
 | **硬停止点** | 上一条命令 **exit 0**（= 三列 `accepted_previous` **全 0**、三列 `accepted_current` **全 > 0**、每处总量 > 0，三条都由脚本判）。不满足就不许进 ⑩ |
 | **闸门** | 不跑 |
 | **回滚** | 无（只读一步）|
@@ -881,8 +885,7 @@ python3 site-builder/scripts/verify_analytics_e2e.py          # 需要新鲜的 
 python3 site-builder/scripts/verify_api_key_e2e.py            # 无 [ApiKey] 段时自行跳过并返回 0
 python3 site-builder/scripts/verify_session_token_semantics.py
 
-python3 site-builder/scripts/session_verify_counts.py --hours 26 --require-total \
-  --require-zero accepted_previous --require-nonzero accepted_current    # exit 0 才算过
+python3 site-builder/scripts/session_verify_counts.py --drain-gate previous  # exit 0 才算过
 ```
 
 ##### ⑩ 退役旧 key（含删 SSM 参数，**不可逆**）

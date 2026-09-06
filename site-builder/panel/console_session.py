@@ -147,6 +147,27 @@ def consume_code(code: str, *, expected_email: str) -> str:
     return claims["email"]
 
 
+def ensure_signing_material() -> None:
+    """把签发面板会话要用的材料**先取一遍**，取不到就抛（3c-1B-G B2 = tracked §9 的 3i）。
+
+    `handler` 的 `/api/session-callback` 必须在 `consume_code()` **之前**调它：那一步是
+    DynamoDB 条件写，**不可逆**地作废那枚一次性升级码。原先取密钥发生在
+    `console_cookie()` 里、也就是消费之后 ⇒ `SESSION_KEYS_JSON` 缺失/非 JSON/family 缺
+    current、`ssm:GetParameter` AccessDenied、ParameterNotFound 任一发生，用户就丢掉一枚
+    码并拿到 500，必须重走 auth→console 的升级跳转。与 ticket 20 给 `/callback` 做的是
+    同一件事，只是轻一档（那边重来一次要整个 Cognito 往返）。
+
+    **它不签发**，只把 `_signer_mode()` 与密钥读取跑通——`console_cookie` 仍是 panel
+    唯一的签发点（signer 的 AST 守卫要求 `handler.py` 里一次 mint 都不能有）。
+    值走 `_secret_by_param` 的 TTL 缓存，所以 `console_cookie` 随后那次是命中缓存，
+    不多打一次 SSM。
+    """
+    if _signer_mode() == "current":
+        _signing_key()
+    else:
+        _secret()
+
+
 def console_cookie(email: str, name: str) -> str:
     """__Host-sb_console 的 Set-Cookie 值。
 
