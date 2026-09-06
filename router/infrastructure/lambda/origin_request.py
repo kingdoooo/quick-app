@@ -53,11 +53,16 @@ def _site_allowlist() -> dict:
 
     原先这次解析在**模块顶层**（`_SITE_ALLOWLIST = …` 直接调 json 解析，注意别在注释里重复
     那个调用的字面写法——有一条守卫按出现次数断言"只解析一处"）。那一行在注入值不是
-    合法 JSON 时（stack.py 的替换表漏了这个注入点、或误用 APP_SYNTH_OFFLINE 的产物）会在
-    **import 期**抛 JSONDecodeError ⇒ Lambda@Edge 连 handler 都实例化不了 ⇒ 该分发上**所有**
-    请求 502，含 require_auth=False 的公开站点、静态资源与 console 前端。挪进本函数之后，
-    只有**带 sb_session 的私有路由请求**会 500：`_check_auth` 在 `require_auth is False` 与
-    "没有 cookie"两条路上都到不了这里，legacy 入口那条分支也在取 allowlist 之前就返回了。
+    合法 JSON 时会在 **import 期**抛 JSONDecodeError ⇒ Lambda@Edge 连 handler 都实例化不了 ⇒
+    该分发上**所有**请求 502，含 require_auth=False 的公开站点、静态资源与 console 前端。
+    唯一的成因是 stack.py 的替换链漏了这个注入点（**不是** APP_SYNTH_OFFLINE：那条路注的是
+    SYNTH 占位 allowlist，本身是合法 JSON，走不到这里）。
+
+    挪进本函数之后，只有**带 sb_session 的私有路由请求**会 500：`_check_auth` 在
+    `require_auth is False` 与"没有 cookie"两条路上都到不了这里。
+    **别把范围记得比这更窄**：legacy 入口那条分支只在 `LEGACY_ENTRY == "on"` 时先返回，
+    线上 L3 已经把它关了 ⇒ 无 kid 的旧 cookie 同样会走到这里；`require_auth` 是坏类型时
+    也按需要登录处理、一样会走到这里。
 
     **报文只点名注入点、绝不回显值**：这份 JSON 是 kid -> {alg, secret, role}，即每把会话
     密钥的明文。也**不 chain 原异常**（`from None`）：`JSONDecodeError` 把整份文本挂在 `.doc`
@@ -74,8 +79,7 @@ def _site_allowlist() -> dict:
         except ValueError:
             raise RuntimeError(
                 "SITE_ALLOWLIST_JSON 不是合法 JSON：部署时的字符串替换没落到这个注入点"
-                "（stack.py 的替换表漏了它，或这是 APP_SYNTH_OFFLINE=1 的产物——那种模板"
-                "不可部署）。值不打印：它是每个 kid 的签名密钥。") from None
+                "（stack.py 的替换链漏了它）。值不打印：它是每个 kid 的签名密钥。") from None
         if not isinstance(parsed, dict):
             raise RuntimeError(
                 f"SITE_ALLOWLIST_JSON 解析出 {type(parsed).__name__}，要的是 kid -> 条目 的对象"
@@ -144,7 +148,7 @@ def _access_region(context) -> str:
 
 
 def _access_client(region: str):
-    """按区缓存的 client。**不复用模块级 `dynamodb`**——那个钉在主区，
+    """按区缓存的 client。**不复用路由表那个 client（`_ddb()`）**——那个钉在主区，
     而这里要写本区副本，两者不是同一个连接池（spec §2.3 规矩 4 第二版被推翻的
     正是"复用就能蹭到暖连接"这个推论）。"""
     if region not in _ACCESS_CLIENTS:

@@ -6,7 +6,6 @@ CloudFront-based dynamic subdomain routing system using Lambda@Edge and DynamoDB
 import os
 import configparser
 import json
-import re
 import sys
 import tempfile
 import shutil
@@ -75,10 +74,16 @@ def assert_edge_source_fully_injected(src: str) -> str:
     运行期的惰性解析（同一张票的另一半）把这种产物的后果从"整个分发 502"降成"带 cookie 的
     私有请求 500"，但**坏产物本来就不该被生成**：Edge 改一次要 10-20 分钟全球复制才能回滚。
 
-    正则与 lambda/edge_substitutions.py 同款、**含数字**：`[A-Z_]+` 会让
-    `ACCESS_TABLE_V2` 这类注入点悄悄躲过检查（那正是 ticket 22 修掉的旧缺陷）。
+    正则**从 lambda/edge_substitutions.py 取，不在这里抄第二份**：那个模块只用标准库，
+    取它与 `_session_keys_on_path` 取 session_keys 是同一个做法（另有三个包的测试也这样
+    import 它）。抄一份的代价已经真实发生过：ticket 22 给 helper 的正则补上了数字，而
+    verify_deployed_edge.sh 里那份一直停在 `[A-Z_]`、漏掉 `ACCESS_TABLE_V2` 这类名字，
+    直到 ticket 21 才发现。**唯一还剩的手抄副本就是那个 shell 闸门**（bash 的 grep 没法
+    import），改这条正则时必须连它一起改。
     """
-    left = sorted(set(re.findall(r"\{\{[A-Z0-9_]+\}\}", src)))
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "lambda"))
+    from edge_substitutions import PLACEHOLDER_RE
+    left = sorted(set(PLACEHOLDER_RE.findall(src)))
     if left:
         raise ValueError(
             f"Edge 源码注入后仍有未替换的占位符 {left}——`origin_request.py` 新增了注入点，"
@@ -208,7 +213,10 @@ def load_site_allowlist(keys) -> tuple:
             text = SYNTH_PLACEHOLDER_ALLOWLIST_JSON   # 合法 JSON、带标记、kid 永不匹配（session_keys 里有说明）
     if "\'\'\'" in text or "\\" in text:
         raise ValueError("allowlist JSON 含三引号或反斜杠，注进三引号字符串会破坏 Edge 源码")
-    json.loads(text)   # 注入前保证是合法 JSON，否则 Edge 在 import 时就炸
+    # 注入前保证是合法 JSON。ticket 21 之后 Edge 侧是惰性解析（不合法只让"带 cookie 的私有
+    # 请求"500，不再是 import 期整个分发 502），但这条**仍然是最该拦住它的地方**：
+    # 坏值根本不该进产物，Edge 回滚要 10-20 分钟全球复制。
+    json.loads(text)
     return text, legacy_entry(keys)
 
 

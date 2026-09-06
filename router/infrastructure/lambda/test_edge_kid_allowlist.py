@@ -192,10 +192,14 @@ def test_outcome_is_logged_as_fixed_vocabulary_without_the_token(caplog):
 def test_source_indexes_allowlist_only_by_kid_and_parses_it_once():
     assert SRC.count("json.loads(SITE_ALLOWLIST_JSON)") == 1
     # ticket 21 起解析是惰性的，取值经 `allowlist = _site_allowlist()` 落到一个局部名上；
-    # 本守卫盯的东西没变：**kid 只用来查表**（`\b` 让它不会误匹配 `_site_allowlist[`）。
-    indexes = re.findall(r"\ballowlist\[([^\]]+)\]", SRC)
+    # 本守卫盯的东西没变：**kid 只用来查表**。
+    # **必须切到 `_verify_site_session` 这一段再匹配**：`allowlist` 这个名字在
+    # `_check_auth` 里还指 allowed_users 那个**列表**局部变量，全文匹配的话那边将来出现一个
+    # `allowlist[0]` 就会把这条 kid 守卫弄红（读起来像"kid 被拿去拼东西"，方向完全错）。
+    verify = SRC[SRC.index("def _verify_site_session"):SRC.index("def _verify_legacy_site_session")]
+    indexes = re.findall(r"\ballowlist\[([^\]]+)\]", verify)
     assert indexes and set(indexes) == {"kid"}, indexes
-    assert "_site_allowlist()" in SRC, "取值函数没了？那 allowlist 又回到模块级解析了"
+    assert "_site_allowlist()" in verify, "取值函数没了？那 allowlist 又回到模块级解析了"
     assert "SITE_ALLOWLIST_JSON = '''{{SITE_ALLOWLIST_JSON}}'''" in SRC
     assert 'LEGACY_ENTRY = "{{LEGACY_ENTRY}}"' in SRC
 

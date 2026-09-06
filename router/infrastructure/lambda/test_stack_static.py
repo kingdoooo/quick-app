@@ -1,4 +1,5 @@
 """stack.py 的静态守卫（stack.py import aws_cdk，普通解释器里没有，所以按源码文本断言）。"""
+import re
 from pathlib import Path
 
 SRC = (Path(__file__).parents[1] / "stack.py").read_text()
@@ -294,13 +295,31 @@ def test_legacy_secret_ssm_failure_fails_synth_by_default_too(clean_env, monkeyp
 # 失败，这一组补上另一半：`origin_request.py` 新增注入点而上面那条 replace 链漏改。
 
 def _residue_check_fn():
-    """把残留检查函数单独切出来（片段只含它一个，结束锚点是下一个 def）。"""
+    """把残留检查函数单独切出来（片段只含它一个，结束锚点是下一个 def）。
+
+    片段里要 `sys.path.insert(0, Path(__file__).parent / "lambda")` 再 import
+    `edge_substitutions.PLACEHOLDER_RE`（正则的唯一定义），所以 `__file__` 必须注进来
+    ——compile 出来的片段没有它，缺了会 NameError 而不是报出真正的问题。
+    """
     start = SRC.index("def assert_edge_source_fully_injected")
     end = SRC.index("def ", start + 1)
     mod = types.ModuleType("_stack_residue_fragment")
-    mod.__dict__.update(re=__import__("re"))
+    mod.__dict__.update(sys=_sys, Path=Path,
+                        __file__=str(Path(__file__).parents[1] / "stack.py"))
     exec(compile(textwrap.dedent(SRC[start:end]), "<stack fragment>", "exec"), mod.__dict__)
     return mod
+
+
+def test_residue_check_uses_the_single_definition_of_the_regex():
+    """正则只许有一份可执行定义（外加 shell 闸门那份手抄的，bash 没法 import）。
+
+    抄一份的代价已经真实发生过：ticket 22 给 helper 补上了数字，而 verify_deployed_edge.sh
+    里那份停在 `[A-Z_]`，漏掉含数字的注入点名字，直到 ticket 21 才发现。
+    """
+    body = SRC[SRC.index("def assert_edge_source_fully_injected"):]
+    body = body[:body.index("def ", 1)]
+    assert "from edge_substitutions import PLACEHOLDER_RE" in body
+    assert "A-Z0-9_" not in body, "又抄了一份正则——改用 edge_substitutions.PLACEHOLDER_RE"
 
 
 def test_residue_check_passes_a_fully_injected_source():
@@ -328,6 +347,12 @@ def test_residue_check_runs_before_the_asset_is_written():
 
 
 def test_residue_check_is_not_bypassed_by_a_second_write_path():
-    """产物只许由那一处写出去：多一条 `write(lambda_code)` 就绕过了检查。"""
+    """产物只许由那一处写出去：多一条写路径就绕过了检查。
+
+    只数 `f.write(lambda_code)` 是不够的——`Path(...).write_text(lambda_code)` 同样能落盘
+    而那种写法数不到（审查指出）。所以按**所有**把 lambda_code 送去落盘的形态数。
+    """
     body = SRC[SRC.index("class WebRouterStack"):]
-    assert body.count("f.write(lambda_code)") == 1
+    writes = re.findall(r"\.write(?:_text|_bytes)?\(\s*lambda_code", body)
+    assert len(writes) == 1, f"lambda_code 有 {len(writes)} 条落盘路径：{writes}"
+    assert "from_asset(temp_dir)" in body, "产物目录换了名字？这条守卫的前提要跟着改"

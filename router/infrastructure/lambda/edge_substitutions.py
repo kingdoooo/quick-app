@@ -9,7 +9,8 @@ Lambda@Edge 不支持环境变量，所以 `origin_request.py` 的配置由 CDK 
 那条断言的正则还是 `[A-Z_]+`（**漏掉任何含数字的占位符**）。于是给 `origin_request.py` 新增一个
 注入点时，几个**无关**套件会各自以看不出原因的方式失败——3c-1A 加 `{{SITE_ALLOWLIST_JSON}}` 时
 真的发生过：模块级 `json.loads` 让未替换的源码在 **import 期**就 `JSONDecodeError`，
-而唯一能解释原因的那句提示在第三个文件里。
+而唯一能解释原因的那句提示在第三个文件里。（那个 import 期爆炸已由 ticket 21 拆掉——
+顶层不再消费注入值。于是漏项的症状从"难懂的假红"变成了**假绿**，本文件这条断言更重要了。）
 
 **放在这里而不是 `panel/tests/`**（ticket 22 原文写的是后者，理由只是"已有跨包 helper 先例"）：
 这张表描述的就是**同目录**那个 `origin_request.py` 的注入点，加占位符的人改的是它、看到的就是本文件。
@@ -78,8 +79,9 @@ def substitute(src: str, **overrides: str) -> str:
         raise AssertionError(
             f"替换后仍有占位符 {left} —— origin_request.py 新增了注入点，"
             f"把它加进 {Path(__file__).name} 的 DEFAULTS（一处改，四个套件都跟上）。"
-            "**不补的后果可能是假绿也可能是难懂的假红**：模块级 json.loads 会让带 {{…}} 的源码"
-            "在 import 期就 JSONDecodeError，而报文完全不提占位符。")
+            "**不补的后果是假绿**：ticket 21 之后 Edge 顶层不再消费注入值，所以带未替换占位符的"
+            "源码照样 import 得动——症状要等到真正用那个值的那一刻才出现（甚至只在某一类请求上）。"
+            "这条断言现在是最早的一道。")
     return src
 
 
