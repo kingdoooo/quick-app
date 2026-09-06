@@ -283,7 +283,13 @@ def _copy_part(setup: str) -> str:
 
 def test_orca_setup_hook_fails_fast_and_runs_the_bootstrap_without_host_deps(tmp_path):
     setup = _setup_block()
-    assert setup.splitlines()[0].strip() == "set -euo pipefail", "setup 段第一行必须 fail fast"
+    lines = setup.splitlines()
+    assert lines[0].strip() == "set -euo pipefail", "setup 段第一行必须 fail fast"
+    # setup runner 继承 GUI 进程的 PATH（/usr/bin 在 /opt/homebrew/bin 之前）⇒ 不前置就会拿到 3.9 被 bootstrap 拒绝
+    prepend = next((i for i, ln in enumerate(lines) if "python@3.12/libexec/bin" in ln and "PATH=" in ln), None)
+    boot = next(i for i, ln in enumerate(lines) if "bootstrap_venvs.sh" in ln)
+    assert prepend is not None and prepend < boot, "要在跑脚本之前前置 Homebrew python@3.12 的 libexec/bin"
+    assert lines[prepend].lstrip().startswith("[ -d "), "前置要带 -d 守卫，没装 Homebrew 的机器不能因此红"
     assert "site-builder/scripts/bootstrap_venvs.sh" in setup
     assert "--host-deps" not in setup, "hook 不该改机器（--host-deps 归人手跑）"
     f = tmp_path / "setup.sh"

@@ -6,8 +6,12 @@
 #     那改的是机器，不归 worktree。
 # 格式约束来自 Orca：只认 scripts / issueCommand 两个顶层键；命令行统一四个空格缩进。
 # 第一行 set -euo pipefail：cp 失败或 ORCA_ROOT_PATH 没设都要让 setup 红，而不是静默建出没配置的 worktree。
+# 第二行把 Homebrew python@3.12 的 libexec/bin 前置（有才前置）：setup runner 继承的是 GUI 进程的 PATH，
+# /usr/bin 排在 /opt/homebrew/bin 之前，不带路径的 python3 会解析成 macOS 自带的 3.9，bootstrap 会按
+# 设计拒绝（实测：orchestration worker-start 起的 setup 全部退 1，而从终端 CLI 起的 worktree 正常）。
 scripts:
   setup: |
     set -euo pipefail
+    [ -d /opt/homebrew/opt/python@3.12/libexec/bin ] && export PATH="/opt/homebrew/opt/python@3.12/libexec/bin:$PATH"
     for f in site-builder/config.ini router/config.ini; do if [ ! -e "$f" ] && [ -f "$ORCA_ROOT_PATH/$f" ]; then cp "$ORCA_ROOT_PATH/$f" "$f"; fi; done
     bash site-builder/scripts/bootstrap_venvs.sh
