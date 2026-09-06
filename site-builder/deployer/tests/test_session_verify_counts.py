@@ -76,14 +76,14 @@ def test_nonzero_outcomes_names_the_verifier_columns_that_are_not_zero():
 @pytest.mark.parametrize("edge_counts,expect_rc", [({"accepted_current": 4}, 0),
                                                    ({"accepted_current": 4, "accepted_previous": 1}, 1)])
 def test_require_zero_flag_decides_the_exit_code(monkeypatch, capsys, edge_counts, expect_rc):
-    """⑨ 的判定命令要能直接当闸门用：`--require-zero accepted_previous` 在任一列 > 0 时退 1。"""
+    """`--require-zero accepted_previous` 在任一列 > 0 时退 1（诊断旗标；⑨ 的闸门是 --drain-gate，见下）。"""
     by = {"auth": {"accepted_current": 1}, "panel": {"accepted_current": 1}, "edge": edge_counts}
     monkeypatch.setattr(svc, "collect", lambda session, hours: by)
     monkeypatch.setattr(svc.boto3, "Session", lambda: None)
     rc = svc.main(["--hours", "26", "--require-total", "--require-zero", "accepted_previous"])
     assert rc == expect_rc
     err = capsys.readouterr().err
-    assert ("accepted_previous" in err) == (expect_rc == 1)
+    assert ("仍有读数" in err) == (expect_rc == 1)
 
 
 def test_require_zero_rejects_outcomes_outside_the_vocabulary():
@@ -227,6 +227,20 @@ def test_drain_gate_picks_the_outcome_column_from_its_argument(monkeypatch, caps
     assert _gate(monkeypatch, by, ["--drain-gate", "previous"]) == 0    # legacy 列不在本闸门判据里
     assert _gate(monkeypatch, by, ["--drain-gate", "legacy"]) == 1
     assert "accepted_legacy" in capsys.readouterr().err
+
+
+def test_require_zero_on_a_drain_target_without_the_gate_warns_but_still_works(monkeypatch, capsys):
+    """复审低优先级 1：旧组合保留为诊断旗标，但 stderr 必须说明它不是闸门；模块用法示例不再展示它当闸门。"""
+    by = {"auth": {"accepted_current": 1}, "panel": {"accepted_current": 1}, "edge": {"accepted_current": 1}}
+    monkeypatch.setattr(svc, "collect", lambda session, hours: by)
+    monkeypatch.setattr(svc.boto3, "Session", lambda: None)
+    assert svc.main(["--hours", "1", "--require-zero", "accepted_previous"]) == 0
+    assert "不是排空闸门" in capsys.readouterr().err
+    assert svc.main(["--hours", "1", "--require-zero", "unknown_kid"]) == 0
+    assert "不是排空闸门" not in capsys.readouterr().err, "与排空无关的 outcome 不该被提醒"
+    doc = svc.__doc__
+    assert "--drain-gate previous" in doc
+    assert "--hours 26 --require-total --require-zero accepted_previous" not in doc
 
 
 def test_drain_gate_rejects_an_unknown_target():

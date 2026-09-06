@@ -175,6 +175,30 @@ def test_rs_row_schema_is_accepted_now_so_2b_does_not_change_the_schema(tmp_path
     assert rs.spki_sha256.startswith("0123456789abcdef") and rs.ssm_param is None
 
 
+_TWO_RS = (MINIMAL.replace("site_previous =", "site_previous = site-rs-v1")
+                  .replace("console_previous =", "console_previous = console-rs-v1")
+           + RS_ROW
+           + RS_ROW.replace("site-rs-v1", "console-rs-v1")
+                   .replace("key/11111111-2222-3333-4444-555555555555", "key/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+                   .replace("spki_sha256 = 0123456789abcdef", "spki_sha256 = fedcba9876543210"))
+
+
+@pytest.mark.parametrize("mutate,why", [
+    (lambda t: t.replace("key/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "key/11111111-2222-3333-4444-555555555555"),
+     "两个 RS kid 共用同一把 KMS key"),
+    (lambda t: t.replace("spki_sha256 = fedcba9876543210", "spki_sha256 = 0123456789abcdef"),
+     "两个 RS kid 公钥指纹相同（同一把私钥）"),
+])
+def test_rs_key_material_must_be_unique_across_families(tmp_path, mutate, why):
+    """3c-1B-G A4 的 RS 侧兜底（Codex 复审建议补上直接用例）：先证明两行各自不同时能加载，
+    再证明 key_arn / spki 任一重复即拒。"""
+    keys = _load(tmp_path, _TWO_RS)                       # 正向控制
+    assert {r.kid for fam in keys.families.values() for r in fam.values() if r} >= {"site-rs-v1", "console-rs-v1"}
+    with pytest.raises(sk.SessionKeysError, match="同一个"):
+        _load(tmp_path, mutate(_TWO_RS))
+    del why
+
+
 @pytest.mark.parametrize("mutate, why", [
     (lambda t: t.replace("[SessionKeys]", "[SessionKeyz]"), "缺 [SessionKeys] 段"),
     (lambda t: t.replace("site_current = site-hs-v1\n", ""), "缺 site_current"),

@@ -213,6 +213,27 @@ def test_red_suites_make_the_script_exit_nonzero(monkeypatch, capsys, tmp_path):
     assert pf.main([]) == 0
 
 
+def test_a_bad_next_kid_fails_before_any_backup_or_sentinel_exists(tmp_path, monkeypatch):
+    """**复审 P2-1**：`--next-kid site=<current>` 抛 PreflightError 时 config 一个字没改，
+    但第一版已经写下了哨兵 ⇒ 下一次运行被拦、要人手工清"假哨兵"。纯计算失败不得留下任何状态。"""
+    monkeypatch.setattr(pf, "CFG", tmp_path / "config.ini")
+    pf.CFG.write_text(LIVE_SHAPE)
+    scratch = tmp_path / ".scratch"
+    monkeypatch.setattr(pf, "SENTINEL", scratch / "sentinel.json")
+    monkeypatch.setattr(pf, "run_all", lambda tag: pytest.fail("不该跑到套件"))
+    cur = pf.current_kids(LIVE_SHAPE)["site"][0]
+    with pytest.raises(pf.PreflightError, match="相同"):
+        pf.main([f"--next-kid=site={cur}"])
+    assert not pf.SENTINEL.exists(), "假哨兵"
+    assert not scratch.exists() or not list(scratch.iterdir()), "留下了备份目录"
+    assert pf.CFG.read_text() == LIVE_SHAPE
+    # 正向控制：合法的 --next-kid 走到套件（这里让 run_all 立即返回空 = 全绿）
+    monkeypatch.setattr(pf, "validate", lambda text, tag: None)
+    monkeypatch.setattr(pf, "run_all", lambda tag: [])
+    assert pf.main(["--next-kid=site=site-hs-v9"]) == 0
+    assert not pf.SENTINEL.exists() and pf.CFG.read_text() == LIVE_SHAPE
+
+
 def test_collection_errors_are_reported_not_counted_as_zero():
     """pytest 死在 collection 时只有 ERROR 行，没有 FAILED 行——不能报成"红 0 条"。"""
     stdout = ("ERROR tests/test_x.py - session_keys.SessionKeysError: 缺 site_current\n"

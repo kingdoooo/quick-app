@@ -15,8 +15,10 @@ Edge 的组名前缀 `us-east-1.` 是 Lambda@Edge 的固定形态；区清单用
 用法（用不带路径的 python3，见 CLAUDE.md）：
     python3 site-builder/scripts/session_verify_counts.py --hours 1
     python3 site-builder/scripts/session_verify_counts.py --hours 24 --require-total   # 任一 verifier 为 0 即退 1
-    # 3c-1B ticket 18：判据本身也由脚本下，不把三列留给人读——⑨ 用 accepted_previous，④ 用 accepted_legacy
-    python3 site-builder/scripts/session_verify_counts.py --hours 26 --require-total --require-zero accepted_previous
+    # 排空闸门（runbook 的 ④ / ⑨）**只用这一个旗标**：四条判据锁在脚本里（3c-1B-G A2）
+    python3 site-builder/scripts/session_verify_counts.py --drain-gate previous    # ④ 用 --drain-gate legacy
+    # 下面这些是**诊断**旗标，自由组合、可配短窗口；**空窗口下 --require-zero 会退 0**，所以它们不是闸门
+    python3 site-builder/scripts/session_verify_counts.py --hours 1 --require-total --require-zero accepted_previous
 
 退出码：0 = 所有要求都满足；1 = 任一要求不满足（stderr 说明是哪条）；2 = 用法错误（如 --require-zero 打错词表外的 outcome）。
 **区级失败不静默**：Edge 日志组按 DescribeRegions 返回的（**已启用**）区逐个查，任一区 DescribeLogGroups 失败
@@ -190,6 +192,11 @@ def main(argv: list[str] | None = None) -> int:
         args.require_total = True
         args.require_zero = list(args.require_zero) + [DRAIN_TARGETS[args.drain_gate]]
         args.require_nonzero = list(args.require_nonzero) + ["accepted_current"]
+    elif set(args.require_zero) & set(DRAIN_TARGETS.values()):
+        # 复审低优先级 1：旧文档里的那条组合仍然合法（诊断用），但它不是闸门——空窗口照样退 0。
+        # 不拒绝（短窗口看"previous 还有没有人用"是正当需求），只在 stderr 说一句。
+        print("提醒：--require-zero accepted_previous/accepted_legacy 不带 --drain-gate 时**不是排空闸门**"
+              "——空窗口也会退 0。判 ④/⑨ 用 --drain-gate {previous,legacy}。", file=sys.stderr)
     by_verifier = collect(boto3.Session(), args.hours)
     text, _total, _legacy = render(by_verifier)
     print(text)

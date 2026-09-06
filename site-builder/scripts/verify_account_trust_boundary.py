@@ -142,6 +142,7 @@ import fnmatch
 import hashlib
 import io
 import json
+import os
 import re
 import sys
 import threading
@@ -157,12 +158,15 @@ BASELINE_PATH = _HERE / "account_trust_baseline.json"
 CONFIG_PATH = _SITE_BUILDER / "config.ini"
 APP_PY = _SITE_BUILDER / "deployer" / "infra" / "app.py"
 
-BASELINE_SCHEMA = 4      # 3c-1A：facts.session_keys（每 kid 的 Edge 产物计数）
+BASELINE_SCHEMA = 5      # 3c-1B-G A6 复审：coverage 成员改成**可分解**形态（见 undecided_item）；4 = 3c-1A 的 facts.session_keys
 JWT_PARAM_NAME = "/site-builder/jwt-secret"
 DEPLOYER_EXEC_ROLE = "site-deployer-exec-role"
 # 3c-1A：[SessionKeys] 的唯一定义在 auth/session_keys.py；闸门按它枚举两把 HS family 密钥的参数名
 sys.path.insert(0, str(_SITE_BUILDER / "auth"))
 from session_keys import FAMILIES as KEY_FAMILIES, load_session_keys  # noqa: E402
+if str(_HERE) not in sys.path:          # 测试用 spec_from_file_location 加载本文件时，本目录不在 sys.path
+    sys.path.insert(0, str(_HERE))
+from _secure_write import write_private_text  # noqa: E402
 
 # Edge 函数名：router 栈的两个 Lambda@Edge 里，**origin-request 那个**才内联着
 # 会话密钥（`stack.py` 把 `{{JWT_SECRET}}` 替换进它）。origin-response 不验签。
@@ -242,7 +246,7 @@ def grants_for_labels(labels) -> set:
     return out
 
 
-def classes_for_labels(labels, t: "Targets") -> frozenset:
+def classes_for_labels(labels, t: "Targets | None" = None) -> frozenset:
     """被声明的 key label → 它们在 coverage 里对应的**资源类**名（3c-1B-G A6）。
 
     与 `grants_for_labels` 对偶：那个管 grant delta，这个管 coverage 指纹。
@@ -531,11 +535,19 @@ def undecided_pairs(evaluation_results) -> set[tuple[str, str]]:
     return out
 
 
-def undecided_members(principal_arn: str, pairs, t: "Targets", *,
-                      ignore_classes: frozenset = frozenset()) -> set[str]:
-    """(动作, 资源) 集合 → 该 principal 的 coverage **成员指纹**集合。
+def _undecided_by_action(pairs, t: "Targets") -> dict[str, set[str]]:
+    """(动作, 资源) 对 → {动作等价类: {判不出的资源类}}。两种成员形态共用这一步。"""
+    by_action: dict[str, set[str]] = {}
+    for action, resource in pairs:
+        cls = ACTION_CLASS_NAMES.get(action, action)
+        by_action.setdefault(cls, set()).add(undecided_resource_class(resource, t))
+    return by_action
 
-    成员 = `(principal, 动作等价类, 该动作下判不出的**资源类集合**)`。
+
+def undecided_members(principal_arn: str, pairs, t: "Targets") -> set[str]:
+    """(动作, 资源) 集合 → 该 principal 的 coverage **成员**集合（可分解形态，见 `undecided_item`）。
+
+    成员 = `(principal 指纹, 动作等价类, 该动作下判不出的**资源类集合**)`。
 
     两头都踩过坑，所以形状是这样：
     - **逐资源各记一项**：实测 **9985** 条（基线涨 10 倍），而"新增一个带 Condition 的
@@ -543,25 +555,26 @@ def undecided_members(principal_arn: str, pairs, t: "Targets", *,
     - **按 action 全局折叠成 unattributed**：`{site-panel}` 与
       `{site-panel, undeploy}` 成为同一个成员 ⇒ 扩大不可见（Codex 第五轮 P2）。
 
-    取中间：**资源类集合整体进指纹**。上界回到「principal × 动作类」= 5 条/principal，
-    而集合一变指纹就变 ⇒ 多出一个精确平台函数照样红。
+    取中间：**资源类集合整体进成员**。上界回到「principal × 动作类」= 5 条/principal，
+    而集合一变成员就变 ⇒ 多出一个精确平台函数照样红。
 
-    `ignore_classes` 用于**反事实**计算（3c-1B-G A6）：把被声明的 key 对应的资源类当作
-    "还不存在"再算一遍指纹。因为资源类集合是**整体**进指纹的，新增一个
-    `session-key:<kid>` 会让该 principal 该动作类的成员**换一个值**（旧的消失、新的出现），
-    对每个受影响的 principal 同时发生——这就是 `--new-key` 声明过却仍然一次冒出几百条
-    `new_undecided_items` 的机制。反事实集合与基线相等 ⇒ 这一轮 churn 完全由被声明的 key
-    解释；有残差 ⇒ 那部分照红。
+    **形态为什么是可分解的、不再是一个哈希**（3c-1B-G A6 复审 P1-1）：资源类集合整体进成员，
+    所以一把 key 的增减会让每个受影响 principal 的成员换值。要把这种 churn 归因给被声明的
+    key，**两侧**都得能"剔掉那个资源类再比"。基线侧若只存哈希就剔不掉——新增 key 时还能只在
+    本次观测上剔（schema 4 的做法），**退役**时那个类只在基线里有、观测里根本没有，哈希形态下
+    无从归一 ⇒ ⑩ 的 `--retire-key` 声明过照样整批红（用生产比较器构造过反例）。成员里只有
+    指纹与类名、没有账号值（类名来源见 `undecided_resource_class`），仓库红线不变。
     """
-    by_action: dict[str, set[str]] = {}
-    for action, resource in pairs:
-        cls = ACTION_CLASS_NAMES.get(action, action)
-        rcls = undecided_resource_class(resource, t)
-        if rcls in ignore_classes:
-            continue
-        by_action.setdefault(cls, set()).add(rcls)
+    return {undecided_item(principal_arn, cls, classes)
+            for cls, classes in _undecided_by_action(pairs, t).items() if classes}
+
+
+def undecided_members_v4(principal_arn: str, pairs, t: "Targets") -> set[str]:
+    """schema 4 的成员形态（不可分解的哈希）。**只为一次性迁移保留**：基线还是 schema 4 时，
+    比较器拿它与旧基线比，让迁移那一跑仍然看得见 coverage 漂移而不是盲写。基线转成 schema 5
+    后它不再被读，连同 `undecided_item_fp` 与 bundle 里的 `schema4_fingerprints` 归 3c-3 删。"""
     return {undecided_item_fp(principal_arn, cls, "|".join(sorted(classes)))
-            for cls, classes in by_action.items() if classes}
+            for cls, classes in _undecided_by_action(pairs, t).items() if classes}
 
 
 def undecided_resource_class(resource: str, t: "Targets") -> str:
@@ -598,9 +611,62 @@ def undecided_resource_class(resource: str, t: "Targets") -> str:
 
 
 def undecided_item_fp(principal_arn: str, action_class: str, resource_class: str) -> str:
-    """成员指纹 = (principal, 动作等价类, 资源类或精确目标)。只存指纹（仓库红线）。"""
+    """**schema 4** 的成员指纹 = hash(principal, 动作等价类, 资源类集合)。不可分解 ⇒ 退役声明
+    无法归一（见 `undecided_members`）。只在 `undecided_members_v4` 里还用，归 3c-3 删。"""
     return principal_fingerprint(
         f"undecided:{principal_arn}|{action_class}|{resource_class}")
+
+
+_PFP_RE = re.compile(r"[0-9a-f]{4}(?:-[0-9a-f]{4}){3}")
+# 可分解成员：`<principal 指纹>|<动作等价类>|<资源类>[,<资源类>…]`。资源类名里不许有 `|` `,` 与空白
+# （`fn:<函数名>` / `session-key:<kid>` 都满足：Lambda 函数名与 KID_RE 都不含这三种字符）。
+UNDECIDED_ITEM_RE = re.compile(
+    rf"{_PFP_RE.pattern}\|[a-z][a-z-]*\|[^|,\s]+(?:,[^|,\s]+)*")
+
+
+def undecided_item(principal_arn: str, action_class: str, classes) -> str:
+    """成员 = `<principal 指纹>|<动作等价类>|<资源类,资源类,…>`（资源类排序、逗号分隔）。
+
+    三段都不是账号值：principal 只进指纹（与 `principals` 分节同一种指纹）；动作等价类是
+    `ACTION_CLASS_NAMES` 的值；资源类是 `undecided_resource_class` 的输出（`sites` /
+    `jwt-param` / `session-key:<kid>` / `fn:<平台函数名>` …，平台函数名本来就在 app.py 里）。
+    可分解 ⇒ 基线侧也能剔类（A6 的退役反事实非它不可）。
+    """
+    return f"{principal_fingerprint(principal_arn)}|{action_class}|{','.join(sorted(classes))}"
+
+
+def parse_undecided_item(item: str) -> tuple[str, str, frozenset]:
+    pfp, cls, classes = item.split("|", 2)
+    return pfp, cls, frozenset(classes.split(","))
+
+
+def normalize_undecided_items(items, ignore_classes: frozenset) -> set[str]:
+    """把被声明 key 的资源类从每个成员里剔掉再重编（A6 的归一化，**两侧都做**）。
+
+    剔空的成员消失——与 `undecided_members` 的 `if classes` 同一条规则，两侧才可比。
+    """
+    out: set[str] = set()
+    for item in items:
+        pfp, cls, classes = parse_undecided_item(item)
+        rest = classes - ignore_classes
+        if rest:
+            out.add(f"{pfp}|{cls}|{','.join(sorted(rest))}")
+    return out
+
+
+def coverage_form(items) -> str:
+    """基线里 coverage 成员的形态：`"v5"`（可分解）或 `"v4"`（schema 4 的哈希）。**混杂即拒**——
+    半份可分解半份哈希的基线只能是手改或迁移中断的产物，比出来的结论两半口径不同。"""
+    items = list(items or [])
+    v5 = sum(1 for x in items if isinstance(x, str) and UNDECIDED_ITEM_RE.fullmatch(x))
+    v4 = sum(1 for x in items if isinstance(x, str) and _PFP_RE.fullmatch(x))
+    if v5 == len(items):
+        return "v5"
+    if v4 == len(items):
+        return "v4"
+    raise SystemExit(
+        f"基线的 coverage.undecided_items 形态混杂（可分解 {v5} / 哈希 {v4} / 共 {len(items)}）"
+        "——不是任何一次 --update-baseline 会写出的东西，先查基线文件再比。")
 
 
 def _fn_name(arn: str) -> str:
@@ -973,7 +1039,7 @@ RED_FIELDS: tuple[tuple[str, str, str], ...] = (
 GREEN_FIELDS: tuple[tuple[str, str], ...] = (
     ("unclassified", "基线里未分类（请标注 category）"),
     ("migration_grants", "声明过的密钥增减（--new-key / --retire-key；绿，可更新基线）"),
-    ("migration_undecided", "声明过的密钥引起的 coverage 指纹迁移（绿；反事实与基线相等才落这里）"),
+    ("migration_undecided", "声明过的密钥引起的 coverage 成员迁移（绿；两侧剔掉该 key 的资源类后相等才落这里）"),
     ("improvements", "集合缩小（绿；可更新基线）"),
     ("notes",        "事实与口径（不参与红绿）"),
 )
@@ -1145,7 +1211,7 @@ def compare_to_baseline(observed: dict[str, dict], baseline: dict, *,
     if coverage is not None:
         _compare_coverage(rep, (baseline.get("coverage") or {}).get("undecided_items"),
                           coverage.get("undecided_items"),
-                          counterfactual=coverage.get("counterfactual"),
+                          now_v4=coverage.get("schema4_fingerprints"),
                           declared_labels=tuple(new_keys) + tuple(retired_keys))
 
     if iam_write is not None:
@@ -1211,40 +1277,59 @@ def _compare_iam_write(rep: Report, base: dict, now: dict) -> None:
 
 
 def _compare_coverage(rep: Report, base_items, now_items, *,
-                      counterfactual=None, declared_labels: tuple = ()) -> None:
+                      now_v4=None, declared_labels: tuple = ()) -> None:
     """判不出的项按**成员**比：**新成员红、消失算改善、数量只作文档摘要。**
 
-    成员是 `(principal, 动作等价类, 资源类)` 的指纹。按 principal 集合比会漏掉这个
-    反例：P 原本只对 site-a 的 Invoke 判不出，后来对 jwt-secret 的 `GetParameters`
-    也判不出 —— 前后都是 `{P}` ⇒ 绿，而新增的**密钥读取**不确定面没被发现。
+    成员是 `(principal, 动作等价类, 资源类集合)`（可分解形态，`undecided_item`）。按 principal
+    集合比会漏掉这个反例：P 原本只对 site-a 的 Invoke 判不出，后来对 jwt-secret 的
+    `GetParameters` 也判不出 —— 前后都是 `{P}` ⇒ 绿，而新增的**密钥读取**不确定面没被发现。
+
+    **被声明 key 引起的 churn**（3c-1B-G A6；复审 P1-1 改成两侧归一化）：资源类集合整体进成员，
+    所以一把 key 的增减会让每个受影响 principal 的成员换值（旧的消失 + 新的出现）。判据：把被
+    声明 key 的资源类从**基线与本次两侧**的成员里都剔掉再比——相等 ⇒ 这一轮 churn 完全由被声明
+    的 key 解释，整批记进 `migration_undecided`（绿）；**剔掉之后仍多出来的成员照红**。两侧都剔
+    才同时覆盖新增（类只在本次有）、退役（类只在基线有）与二者同轮发生；旧实现只在本次观测上剔
+    （"反事实"快照），退役声明过也照样红。
+
+    基线还是 schema 4 的哈希形态时（一次性迁移那一跑）：与 `now_v4` 比，声明**不吸收**（哈希
+    剔不掉类）。那一跑是 `--update-baseline --migrate-from-schema 4`：churn 在报告里显示出来，
+    然后以可分解形态写进新基线。
     """
     was, now = set(base_items or []), set(now_items or [])
-    gained, gone = now - was, was - now
-    # ---- 被声明 key 引起的 churn（3c-1B-G A6）------------------------------------------
-    # 资源类集合**整体**进指纹，所以新增一把 key 会让每个受影响 principal 的成员换一个值
-    # （旧的消失 + 新的出现）。判据是**反事实**：把那把 key 的资源类剔掉之后重算的集合
-    # 若与基线**完全相等**，这一轮 coverage 变化就完全由被声明的 key 解释 ⇒ 整批记进
-    # `migration_undecided`（绿）。**有任何残差就照红**——那才是真的新增不确定面。
-    if declared_labels and gained:
-        cf = set((counterfactual or {}).get("undecided_items") or [])
-        cf_labels = tuple((counterfactual or {}).get("labels") or ())
-        if cf_labels != tuple(sorted(declared_labels)):
+    if coverage_form(was) == "v4":
+        if now_v4 is None:
             raise SystemExit(
-                f"声明的 key 是 {sorted(declared_labels)}，而这份观测里的反事实是按 "
-                f"{list(cf_labels)} 算的——不能拿它去吸收 coverage churn。"
-                "重新走实测路径，或 --dump-observed 时带上同样的 --new-key/--retire-key。")
-        residue = cf - was
-        if not residue:
-            rep.migration_undecided.append(
-                f"{len(gained)} 项 coverage 成员因被声明的 key（{sorted(declared_labels)}）改变了"
-                f"资源类集合而换了指纹（同时有 {len(gone)} 项旧成员消失）；剔掉该资源类后重算的集合"
-                "与基线完全相等 ⇒ 这一轮没有新增不确定面（--new-key/--retire-key 已声明）")
-            gained = set()
-            gone = set()
-        else:
+                "基线的 coverage 还是 schema 4 的哈希形态，而这份观测没有 schema4_fingerprints"
+                "——两种形态比不了。走实测路径（不要用旧快照）：--update-baseline --migrate-from-schema 4。")
+        now = set(now_v4)
+        rep.notes.append(
+            "coverage：基线是 schema 4 的哈希形态，本次按旧形态比较；--update-baseline 会以"
+            "可分解形态重写，之后 --new-key/--retire-key 才能吸收 coverage churn")
+        if declared_labels:
             rep.notes.append(
-                f"声明的 key 解释不了全部 churn：剔掉它之后仍有 {len(residue)} 项新成员，下面照红")
-            gained = residue
+                f"声明的 key {sorted(declared_labels)} 本次**不吸收** coverage churn"
+                "（哈希形态剔不掉资源类），下面照红")
+        gained, gone = now - was, was - now
+    else:
+        gained, gone = now - was, was - now
+        if declared_labels and (gained or gone):
+            ignore = classes_for_labels(declared_labels, None)
+            was_n = normalize_undecided_items(was, ignore)
+            now_n = normalize_undecided_items(now, ignore)
+            gained_n, gone_n = now_n - was_n, was_n - now_n
+            explained = (len(gained) - len(gained_n), len(gone) - len(gone_n))
+            if explained != (0, 0):
+                # 措辞按事实分两档（复审二轮）：只有归一化后**两个方向都没有**剩余差异才说"相等"；
+                # 否则只说解释了多少，剩余差异按下面的常规红绿处理（新成员红、消失算改善）。
+                tail = ("两侧剔掉其资源类后归一化**相等**" if not (gained_n or gone_n) else
+                        f"归一化后仍有 {len(gained_n)} 项新成员 / {len(gone_n)} 项消失，按常规红绿处理")
+                rep.migration_undecided.append(
+                    f"被声明的 key（{sorted(declared_labels)}）解释了 {explained[0]} 项新成员 / "
+                    f"{explained[1]} 项旧成员的 churn；{tail}（--new-key/--retire-key 已声明）")
+            if gained_n:
+                rep.notes.append(
+                    f"声明的 key 解释不了全部 churn：剔掉其资源类后仍有 {len(gained_n)} 项新成员，下面照红")
+            gained, gone = gained_n, gone_n
     for fp in sorted(gained):
         rep.new_undecided_items.append(
             f"[{fp}] 新增一项判不出的 (principal, 动作类, 资源)——不确定面变大了；"
@@ -1895,8 +1980,7 @@ def simulate(iam, principal_arn: str,
     return out, missing, pairs
 
 
-def measure(region: str, *, workers: int = 4, scan_assets: bool = True,
-            declared_labels: tuple = ()) -> dict:
+def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
     clients = _aws_clients(region)
     iam, lam = clients["iam"], clients["lambda"]
     cfg = read_config()
@@ -2076,7 +2160,7 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True,
     undecided: set[str] = set()
     # 反事实（3c-1B-G A6）：把被声明 key 的资源类当作"还不存在"再算一遍。
     # 声明为空时它与 `undecided` 恒等，比较器也不会用到它。
-    undecided_cf: set[str] = set()
+    undecided_v4: set[str] = set()      # 迁移期比较用，见 undecided_members_v4
 
     with cf.ThreadPoolExecutor(max_workers=workers) as pool:
         # **每线程独立 client**：共享一个 client 并发用会让一部分请求跳过证书校验
@@ -2094,10 +2178,7 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True,
             # 折成成员指纹。放在下面 `if grants:` 的**外面**——一个 principal 可能一条
             # grant 都没有却有判不出的项，而那正是最该盯住的那种（条件哪天放宽就是新 grant）。
             undecided |= undecided_members(p["arn"], pairs, targets)
-            if declared_labels:
-                undecided_cf |= undecided_members(
-                    p["arn"], pairs, targets,
-                    ignore_classes=classes_for_labels(declared_labels, targets))
+            undecided_v4 |= undecided_members_v4(p["arn"], pairs, targets)
             grants = grants_from_decisions(decisions, targets)
             if grants:
                 observed[principal_fingerprint(p["arn"])] = {
@@ -2155,16 +2236,23 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True,
             "asset_scan_complete": scan_assets,
             "principals": observed, "resource_policies": rp, "facts": facts,
             "coverage": {"undecided_items": sorted(undecided),
-                         # 反事实分节：**只在本次运行内用于比较，不写进基线**
-                         # （`write_baseline` 只取 undecided_items）。`labels` 记下它是
-                         # 按哪组声明算的——`--from-dump` 时声明与快照不匹配就必须响亮拒绝，
-                         # 否则会拿"按别的 label 算的反事实"去吸收 churn。
-                         "counterfactual": {"labels": sorted(declared_labels),
-                                            "undecided_items": sorted(undecided_cf)}},
+                         # schema 4 形态的同一批成员：**只给基线还是 schema 4 时的那一次迁移比较用**，
+                         # 不写进基线（`write_baseline` 只取 undecided_items）。归 3c-3 删。
+                         "schema4_fingerprints": sorted(undecided_v4)},
             # `texts` 只进 stdout 与 --dump-observed 的产物，**不进基线**。
             "iam_write": {"statements": iam_stmts, "boundaries": boundaries,
                           "managed_versions": used_policies, "texts": stmt_texts},
             "required": {"edge": edge_role_name, "deployer": DEPLOYER_EXEC_ROLE}}
+
+
+def migrate_baseline_4_to_5(data: dict) -> dict:
+    """schema 4 → 5（3c-1B-G A6 复审）：**只改版本号**。coverage 成员从哈希变成可分解形态这件事
+    没法离线做（哈希不可逆），由随后的实测重算并按旧形态比过之后写入（`_compare_coverage` 的
+    v4 分支）。所以本函数的产物**只能在内存里过渡**——`load_baseline` 对落盘的 schema 5 要求
+    成员已是可分解形态，`--migrate-baseline-only` 对 4→5 被拒。"""
+    out = dict(data)
+    out["schema"] = 5
+    return out
 
 
 def migrate_baseline_3_to_4(data: dict) -> dict:
@@ -2173,7 +2261,7 @@ def migrate_baseline_3_to_4(data: dict) -> dict:
     填进来并按"新增即红"审过再写基线（spec §6.2 3c-3 一节反对全量重置的理由同样适用）。"""
     facts = dict(data.get("facts") or {})
     facts.setdefault("session_keys", {})
-    return {**data, "schema": BASELINE_SCHEMA, "facts": facts}
+    return {**data, "schema": 4, "facts": facts}     # 字面量 4：这一步只到 4，5 由 migrate_baseline_4_to_5 接
 
 
 def load_baseline(path: Path, *, migrate_from: int | None = None) -> dict:
@@ -2187,17 +2275,27 @@ def load_baseline(path: Path, *, migrate_from: int | None = None) -> dict:
     data = json.loads(path.read_text(encoding="utf-8"))
     got = data.get("schema")
     if got == BASELINE_SCHEMA:
+        # schema 5 的基线里 coverage 成员必须是可分解形态：哈希形态混进来（手改、或把
+        # `--migrate-baseline-only` 的产物当成迁移完成）会让退役声明静默失效——照红、
+        # 与没修一样。所以在读入时就拒。
+        if coverage_form((data.get("coverage") or {}).get("undecided_items")) != "v5":
+            raise SystemExit(
+                f"基线 schema 是 {got} 但 coverage.undecided_items 还是 schema 4 的哈希形态"
+                "——4→5 必须经一次实测重算成员：--update-baseline --migrate-from-schema 4 "
+                "（`--migrate-baseline-only` 对 4→5 无效，会被拒）。")
         return data
     if migrate_from is None:
         raise SystemExit(
             f"基线 schema 是 {got}，脚本要 {BASELINE_SCHEMA}。直接比会把每个 principal 都"
             f"报成新增。一次性迁移：--update-baseline --migrate-from-schema {got}")
-    if migrate_from != got or (got, BASELINE_SCHEMA) != (3, 4):
+    if migrate_from != got or got not in (3, 4):
         raise SystemExit(
-            f"只支持 schema 3→4 的一次性迁移（--migrate-from-schema {migrate_from}，"
-            f"文件里是 {got}，脚本是 {BASELINE_SCHEMA}）")
+            f"只支持 schema 3/4 → {BASELINE_SCHEMA} 的一次性迁移（--migrate-from-schema "
+            f"{migrate_from}，文件里是 {got}，脚本是 {BASELINE_SCHEMA}）")
     print(f"（一次性迁移基线 schema {got} → {BASELINE_SCHEMA}）", file=sys.stderr)
-    return migrate_baseline_3_to_4(data)
+    if got == 3:
+        data = migrate_baseline_3_to_4(data)
+    return migrate_baseline_4_to_5(data)
 
 
 def _nonempty_str(v) -> bool:
@@ -2211,6 +2309,16 @@ def _plain_int(v) -> bool:
 
 def _list_of_str(v) -> bool:
     return isinstance(v, list) and all(isinstance(x, str) for x in v)
+
+
+def _list_of_undecided_items(v) -> bool:
+    return isinstance(v, list) and all(isinstance(x, str) and UNDECIDED_ITEM_RE.fullmatch(x)
+                                       for x in v)
+
+
+def _list_of_v4_fingerprints(v) -> bool:
+    # 迁移那一跑拿这一列直接与旧基线比 ⇒ 它也要是"旧口径的真实观测"的形态，不能是任意字符串。
+    return isinstance(v, list) and all(isinstance(x, str) and _PFP_RE.fullmatch(x) for x in v)
 
 
 # 一份**权威**观测必须有的分节、**内层键**与类型。**递归默认拒绝**：
@@ -2251,8 +2359,9 @@ BUNDLE_SHAPE: dict = {
               # 3c-1A：每 kid 一组；键是 kid（不是账号值），成员按同一份子规格校验
               "session_keys": {"*": {"edge_code_targets_carrying_key": _plain_int,
                                      "edge_assets_carrying_key": _plain_int}}},
-    "coverage": {"undecided_items": _list_of_str,
-                 "counterfactual": {"labels": _list_of_str, "undecided_items": _list_of_str}},
+    # 成员必须是可分解形态（不是任意字符串）：写成哈希或带账号值都要在这里被拒。
+    "coverage": {"undecided_items": _list_of_undecided_items,
+                 "schema4_fingerprints": _list_of_v4_fingerprints},
     "iam_write": {"statements": dict, "boundaries": dict,
                   "managed_versions": dict, "texts": dict},
     "required": {"edge": _nonempty_str, "deployer": _nonempty_str},
@@ -2327,6 +2436,16 @@ def check_bundle_complete(bundle: dict, *, where: str) -> None:
             f"否则它就是下一个「截断了也看不出」的层（默认拒绝）")
 
 
+def write_dump(path: Path, bundle: dict) -> None:
+    """`--dump-observed` 的产物**按 0600 原子落盘**（复审二轮 P2-3 + 三轮 P2）。
+
+    它不是密钥，但是完整的账号拓扑：真实 principal 名与 ARN、grant 清单、归一化前的 IAM 语句原文。
+    `write_text` 按 umask 落成 0644；`os.open(..., 0o600)` 对已有文件不生效且跟随 symlink。
+    写法与 `_session_mint.save_token` 共用 `_secure_write.write_private_text`（理由见那个模块）。
+    """
+    write_private_text(Path(path), json.dumps(bundle, ensure_ascii=False, indent=2) + "\n")
+
+
 def load_dump(path: Path) -> dict:
     """`--from-dump` 的快照。**schema 与完整性都要校验。**
 
@@ -2387,8 +2506,10 @@ def write_baseline(bundle: dict, baseline: dict, path: Path) -> None:
         }
     path.write_text(json.dumps(
         {"schema": BASELINE_SCHEMA,
-         "note": ("account trust boundary baseline —— 只存 ARN 与策略语句的指纹"
-                  "（仓库红线：真实账号值/角色名不进被跟踪文件）。见 "
+         "note": ("account trust boundary baseline —— principal 与策略语句只存指纹；coverage 成员是"
+                  "「principal 指纹|动作等价类|资源类,…」，资源类名来自脚本词表（sites / jwt-param / "
+                  "session-key:<kid> / fn:<平台函数名> …），不含账号值"
+                  "（仓库红线：真实账号值/角色名/ARN 不进被跟踪文件）。见 "
                   "docs/security/account-trust-boundary.md 与 "
                   "scripts/verify_account_trust_boundary.py。"),
          # platform-overbroad：平台自己的角色，但这条授权它并不需要
@@ -2400,8 +2521,8 @@ def write_baseline(bundle: dict, baseline: dict, path: Path) -> None:
          "facts": bundle["facts"],
          # 判不出的项按**成员**存（新成员即红）。principal 级的那个笼统计数在 facts 里，
          # 只报 delta——它会随账号里任何一条带 Condition 的新策略变动。
-         # **只持久化 undecided_items**：反事实是本次运行的比较用料，写进基线就会
-         # 变成"下一轮拿上一轮的声明去吸收"（A6）。
+         # **只持久化 undecided_items**（可分解形态）：`schema4_fingerprints` 是迁移期的比较
+         # 用料，写进基线就等于把不可分解的旧形态带进 schema 5（load_baseline 会拒）。
          "coverage": {"undecided_items": bundle["coverage"]["undecided_items"]},
          "principals": principals,
          # B：IAM 写的纯静态文本快照。**只落指纹**——语句原文（`texts`）刻意不写，
@@ -2420,7 +2541,7 @@ def write_baseline(bundle: dict, baseline: dict, path: Path) -> None:
         ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def main() -> int:
+def main(argv: list | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--region", default="us-east-1")
@@ -2430,7 +2551,8 @@ def main() -> int:
                          "unclassified，需人工标注）")
     ap.add_argument("--dump-observed", metavar="PATH",
                     help="把带**真实名字**的实测清单写到 PATH（分类基线时要看名字）。"
-                         "产物含账号内标识，**不要提交进仓库**——写到 /tmp。")
+                         "产物含账号内标识，**不要提交进仓库**——落 .scratch/（gitignored；/tmp 会被 "
+                         "macOS 清理，⑩ 曾因此丢掉 ⑥ 的快照）。文件按 0600 写。")
     ap.add_argument("--from-dump", metavar="PATH",
                     help="不发 AWS 调用，直接读 --dump-observed 的产物。"
                          "用于分类/复核，省掉重跑模拟。"
@@ -2440,8 +2562,8 @@ def main() -> int:
                          "category（配合 --update-baseline）。映射文件同样"
                          "含真实名字，**不要提交**。")
     ap.add_argument("--migrate-from-schema", type=int, metavar="N",
-                    help="一次性通道：允许读入 schema N 的旧基线并迁移（当前只支持 3→4）。"
-                         "配合 --update-baseline 用；平时不要带。")
+                    help="一次性通道：允许读入 schema N 的旧基线并迁移（支持 3/4 → 5；4→5 要"
+                         "实测重算 coverage 成员，只能配 --update-baseline）。平时不要带。")
     ap.add_argument("--new-key", "--new-kid", action="append", metavar="LABEL", dest="new_key",
                     help="本轮**首次出现**的密钥标签（可重复）。LABEL ∈ 已配置 kid ∪ "
                          "{legacy, login-flow}。它对应的 grant 在此前已能读某把会话密钥的 "
@@ -2459,7 +2581,7 @@ def main() -> int:
     ap.add_argument("--no-asset-scan", action="store_true",
                     help="跳过「bootstrap 桶里有多少 asset 带活密钥」那一遍扫描"
                          "（默认做；它要读几十个小对象）")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     # 标签打错一个字的后果是"以为声明了、其实没有"——静默的，所以在任何比较之前就校验。
     # 位置在所有分支**之上**，只读 config、不发 AWS 调用 ⇒ `--from-dump` 与
     # `--migrate-baseline-only` 这两条也一样覆盖。
@@ -2477,6 +2599,14 @@ def main() -> int:
     if args.migrate_baseline_only:
         if args.migrate_from_schema is None:
             raise SystemExit("--migrate-baseline-only 需要 --migrate-from-schema N")
+        if args.migrate_from_schema < BASELINE_SCHEMA:
+            # 3→5 与 4→5 都经过"只改版本号"的 4→5 那一步，coverage 成员仍是哈希 ⇒ 落盘就是一份
+            # 下一次 load 必拒的自相矛盾基线（复审二轮 P2-2 用 schema 3 复现）。到 schema 5 没有任何
+            # 纯结构迁移可做，一律走实测。旗标留着，只为把这句话说出来。
+            raise SystemExit(
+                f"schema {args.migrate_from_schema} → {BASELINE_SCHEMA} 不是纯结构迁移：coverage 成员"
+                "要从哈希重算成可分解形态，必须走一次实测——"
+                f"--update-baseline --migrate-from-schema {args.migrate_from_schema}")
         migrated = load_baseline(BASELINE_PATH, migrate_from=args.migrate_from_schema)
         BASELINE_PATH.write_text(json.dumps(migrated, ensure_ascii=False, indent=2) + "\n",
                                  encoding="utf-8")
@@ -2496,11 +2626,10 @@ def main() -> int:
               f"所以「Edge 产物含 login-flow 值」那条硬断言在本次运行里不成立——"
               f"它只在实测路径上评估。）", file=sys.stderr)
     else:
+        # 声明（--new-key/--retire-key）**不进观测**：A6 的归一化在比较时对两侧做，
+        # 所以同一份快照可以按不同声明重比（复审 P1-1 之前快照里存着按声明算的反事实）。
         bundle = measure(args.region, workers=args.workers,
-                        scan_assets=not args.no_asset_scan,
-                        # 反事实按**本次声明**算（A6）；`--from-dump` 那条路用快照里存的那份，
-                        # 声明不匹配时 `_compare_coverage` 会响亮拒绝。
-                        declared_labels=declared_labels)
+                        scan_assets=not args.no_asset_scan)
 
     observed = bundle["principals"]
     print(f"\n具备至少一项敏感授权的 principal：{len(observed)}")
@@ -2509,9 +2638,8 @@ def main() -> int:
     print(f"\n事实：{json.dumps(bundle['facts'], ensure_ascii=False)}")
 
     if args.dump_observed:
-        Path(args.dump_observed).write_text(
-            json.dumps(bundle, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        print(f"\n实测清单（含真实名字，勿提交）已写入 {args.dump_observed}")
+        write_dump(Path(args.dump_observed), bundle)
+        print(f"\n实测清单（含真实名字，勿提交；已按 0600 落盘）已写入 {args.dump_observed}")
         if not args.update_baseline:
             # **纯观测**：不与基线比较，退出码不代表闸门结论。分开是刻意的——
             # 把"产出用于分类/迁移的快照"与"出闸门结论"混在一条命令里，迁移期就会
@@ -2534,17 +2662,17 @@ def main() -> int:
         # "这一次到底接受了什么"只存在于操作者的记忆里。spec §11.8.7 反对人工放行的
         # 核心理由正是这个：接受的内容必须留痕。报告只打印、不改退出码——这条命令的
         # 语义仍是"我知道并接受这些变化"。
+        # **报告生成失败就不写**（复审 P1-2）：比较器主动拒绝（形态混杂、schema 4 基线配了
+        # 没有 v4 指纹的快照…）意味着"接受了什么"根本没法看清；原先这里 `except SystemExit`
+        # 打一句就照写，等于给普通闸门里的硬失败开了一条 --update-baseline 后门。
         print("\n── 即将被写进基线的变化（先看清再接受）"
               "──────────────────────────")
-        try:
-            preview = compare_to_baseline(
-                observed, baseline, required=bundle["required"],
-                resource_policies=bundle["resource_policies"], facts=bundle["facts"],
-                coverage=bundle["coverage"], iam_write=bundle["iam_write"],
-                new_keys=tuple(args.new_key or ()), retired_keys=tuple(args.retire_key or ()))
-            print(preview.render())
-        except SystemExit as exc:      # 反事实与声明不匹配之类：说清楚，但不阻止显式的写入
-            print(f"（比较报告未能生成：{exc}）", file=sys.stderr)
+        preview = compare_to_baseline(
+            observed, baseline, required=bundle["required"],
+            resource_policies=bundle["resource_policies"], facts=bundle["facts"],
+            coverage=bundle["coverage"], iam_write=bundle["iam_write"],
+            new_keys=tuple(args.new_key or ()), retired_keys=tuple(args.retire_key or ()))
+        print(preview.render())
         write_baseline(bundle, baseline, BASELINE_PATH)
         print(f"\n已写入 {BASELINE_PATH}（新条目 category=unclassified，请人工标注）")
         return 0

@@ -31,6 +31,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "site-builder" / "auth"))
 import session as sess  # noqa: E402
 from session_keys import SessionKeys, load_session_keys  # noqa: E402
+if str(Path(__file__).resolve().parent) not in sys.path:      # 被 tests / E2E 以别的 cwd import 时
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _secure_write import write_private_text  # noqa: E402
 
 CONFIG_PATH = ROOT / "site-builder" / "config.ini"
 ROUTER_CONFIG = ROOT / "router" / "config.ini"
@@ -218,17 +221,16 @@ def save_token(path: Path, record: dict, *, scratch_root: Path = SCRATCH_ROOT) -
     # `mkdir(mode=…)` **不作用于它顺带创建的父目录**（CPython 明确：父目录按默认权限建），
     # 所以新克隆上第一次用会留下 0755 的 `.scratch/`，而 docstring 承诺的是 0700。
     # 逐层建 + 逐层收权限（3c-1B-G A5）。
-    missing = [d for d in (target.parent, *target.parent.parents) if not d.exists()]
+    # **已存在的目录同样收到 0700**（复审低优先级 2）：只改新建的那几层，等于承诺"目录 0700"
+    # 只对新克隆成立——本仓库的 `.scratch/` 与 `.scratch/3c-1b/` 实测就是 0755。范围只到
+    # scratch 根为止（`root in d.parents or d == root`），不碰仓库根以上的任何目录。
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    for d in missing:
-        if root == d or root in d.parents or d == root:
+    for d in (target.parent, *target.parent.parents):
+        if d == root or root in d.parents:
             os.chmod(d, 0o700)
-    # 先建后改：write_text 不接受 mode，而"先写再 chmod"有一个短暂的 0644 窗口 ⇒ 用 os.open 定死
-    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        fh.write(json.dumps(record, ensure_ascii=False, indent=1))
-    os.chmod(target, 0o600)      # 文件已存在时 O_CREAT 的 mode 不生效，显式收一次
-    return target
+    # 同目录 0600 临时文件 + os.replace（`_secure_write`）：`write_text` 有 0644 窗口；此前的
+    # `os.open(..., 0o600)` 对已有文件不生效、且会跟随 symlink 去改写别的文件（复审三轮）。
+    return write_private_text(target, json.dumps(record, ensure_ascii=False, indent=1))
 
 
 def load_saved_token(path: Path) -> tuple[str, str]:

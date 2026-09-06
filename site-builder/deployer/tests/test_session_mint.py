@@ -6,6 +6,7 @@
 """
 import base64
 import json
+import os
 import sys
 import textwrap
 from pathlib import Path
@@ -377,6 +378,45 @@ def test_save_token_refuses_the_scratch_root_itself(tmp_path):
     for bad in (".scratch", ".", ""):
         with pytest.raises(SystemExit, match="文件路径"):
             sm.save_token(Path(bad), {"token_use": "site-session", "token": "a.b.c"}, scratch_root=root)
+
+
+def test_save_token_tightens_directories_that_already_exist(tmp_path):
+    """复审低优先级 2：`.scratch/` 与子目录已经以 0755 存在时也要收到 0700——否则"目录 0700"
+    只对新克隆成立。范围到 scratch 根为止：它的父目录不动。"""
+    root = tmp_path / ".scratch"
+    (root / "3c-1b").mkdir(parents=True)
+    os.chmod(root, 0o755); os.chmod(root / "3c-1b", 0o755)
+    parent_mode = oct(tmp_path.stat().st_mode)[-3:]
+    sm.save_token(Path("3c-1b/v1.json"), {"token_use": "site-session", "token": "a.b.c"},
+                  scratch_root=root)
+    assert oct(root.stat().st_mode)[-3:] == "700"
+    assert oct((root / "3c-1b").stat().st_mode)[-3:] == "700"
+    assert oct(tmp_path.stat().st_mode)[-3:] == parent_mode, "scratch 根以上的目录不该被动"
+
+
+def test_save_token_does_not_follow_a_symlink_out_of_scratch(tmp_path):
+    """复审三轮 P2 的同一个洞在 token 文件上（内容是一枚可重放的 cookie）。这里比 write_dump 更强：
+    `save_token` 先 `resolve()` 再做逃逸检查 ⇒ 指向 .scratch **外**的 symlink 被**拒绝**而不是被跟随，
+    victim 一个字节不动。（.scratch 内部的 symlink 会解析到真实文件——那仍在 0700 目录里，是有意的。）"""
+    root = tmp_path / ".scratch"; (root / "3c-1b").mkdir(parents=True)
+    victim = tmp_path / "victim"; victim.write_text("keep me"); os.chmod(victim, 0o644)
+    link = root / "3c-1b" / "v1.json"; link.symlink_to(victim)
+    with pytest.raises(SystemExit, match="只许写进"):
+        sm.save_token(Path("3c-1b/v1.json"), {"token_use": "site-session", "token": "a.b.c"}, scratch_root=root)
+    assert victim.read_text() == "keep me" and oct(victim.stat().st_mode)[-3:] == "644"
+    assert link.is_symlink(), "拒绝时不该动那个链接"
+
+
+def test_save_token_writes_a_fresh_0600_inode_over_an_existing_0644_file(tmp_path):
+    """覆盖已有 0644 文件：不能在旧 inode 上原地截断（写入期间仍 0644、已打开的读者会读到新 cookie）。"""
+    root = tmp_path / ".scratch"; (root / "3c-1b").mkdir(parents=True)
+    out = root / "3c-1b" / "v1.json"; out.write_text("old"); os.chmod(out, 0o644)
+    old_ino = out.stat().st_ino
+    with open(out) as reader:
+        sm.save_token(Path("3c-1b/v1.json"), {"token_use": "site-session", "token": "a.b.c"}, scratch_root=root)
+        assert reader.read() == "old"
+    assert out.stat().st_ino != old_ino and oct(out.stat().st_mode)[-3:] == "600"
+    assert sm.load_saved_token(out) == ("site-session", "a.b.c")
 
 
 def test_save_token_locks_down_the_scratch_root_it_creates(tmp_path):

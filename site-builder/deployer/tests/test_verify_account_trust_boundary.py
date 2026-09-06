@@ -30,6 +30,7 @@ import copy
 import fnmatch
 import importlib.util
 import json
+import os
 import re
 import subprocess
 import sys
@@ -104,11 +105,21 @@ def _is_grant(value: str) -> bool:
 
 # 值的**类型分流**：路径模式 → 校验函数。命中这里的位置不做指纹形态检查，
 # 而是按它自己的类型校验 —— **这不是放行**。
+_UNDECIDED_ITEM_RE = _gate().UNDECIDED_ITEM_RE
+
+
+def _is_undecided_item(value: str) -> bool:
+    """3c-1B-G A6 复审：coverage 成员是**可分解**形态 `<指纹>|<动作类>|<资源类,…>`——
+    不是指纹（那是 schema 4，退役声明剔不掉类），也不是任意字符串（账号值会从这里漏进来）。"""
+    return bool(_UNDECIDED_ITEM_RE.fullmatch(value))
+
+
 _TYPED_VALUE_PATHS = (
     # VersionId 形如 v1/v2/…：既不是指纹，也不能是任意字符串（写成角色名或占位
     # "?" 都必须红）。放成"任意字符串"就等于不检查；要求它是指纹又会把合法的 v3 报红。
     ("managed_policy_versions.*", _is_version_id),
     ("principals.*.grants[]", _is_grant),
+    ("coverage.undecided_items[]", _is_undecided_item),
 )
 # **自由文本**：说明性字段，这一层不校验形态；泄密由第一层的整文件 raw 扫描兜。
 _FREE_TEXT_PATHS = (
@@ -1534,8 +1545,8 @@ def test_same_principal_gaining_a_second_undecided_target_is_a_failure():
     g = _gate()
     observed = _with_required(g, {})
     arn = "arn:aws:iam::1:role/WorkloadA"
-    before = [g.undecided_item_fp(arn, "invoke", "sites")]
-    after = before + [g.undecided_item_fp(arn, "read-param", "jwt-param")]
+    before = [g.undecided_item(arn, "invoke", {"sites"})]
+    after = before + [g.undecided_item(arn, "read-param", {"jwt-param"})]
     baseline = {**_baseline_of(observed), "coverage": {"undecided_items": sorted(before)}}
     rep = g.compare_to_baseline(observed, baseline, required=REQUIRED,
                                 coverage={"undecided_items": sorted(after)})
@@ -1547,8 +1558,8 @@ def test_undecided_item_swap_is_a_failure_even_when_principal_set_is_unchanged()
     g = _gate()
     observed = _with_required(g, {})
     arn = "arn:aws:iam::1:role/WorkloadA"
-    before = [g.undecided_item_fp(arn, "invoke", "sites")]
-    after = [g.undecided_item_fp(arn, "read-object", "edge-asset")]
+    before = [g.undecided_item(arn, "invoke", {"sites"})]
+    after = [g.undecided_item(arn, "read-object", {"edge-asset"})]
     assert len(before) == len(after), "这条用例的前提是数量不变"
     baseline = {**_baseline_of(observed), "coverage": {"undecided_items": before}}
     rep = g.compare_to_baseline(observed, baseline, required=REQUIRED,
@@ -1561,7 +1572,7 @@ def test_undecided_item_disappearing_is_an_improvement_not_a_failure():
     observed = _with_required(g, {})
     arn = "arn:aws:iam::1:role/WorkloadA"
     baseline = {**_baseline_of(observed),
-                "coverage": {"undecided_items": [g.undecided_item_fp(arn, "invoke", "sites")]}}
+                "coverage": {"undecided_items": [g.undecided_item(arn, "invoke", {"sites"})]}}
     rep = g.compare_to_baseline(observed, baseline, required=REQUIRED,
                                 coverage={"undecided_items": []})
     assert rep.ok, rep.render()
@@ -1610,6 +1621,30 @@ def test_undecided_item_fp_carries_no_principal_name():
     fp = g.undecided_item_fp(f"arn:aws:iam::{_ACCT}:role/Secret", "invoke", "sites")
     assert re.fullmatch(_FP_RE, fp)
     assert "Secret" not in fp and _ACCT not in fp
+
+
+def test_undecided_item_is_decomposable_and_carries_no_account_values():
+    """可分解成员（3c-1B-G A6 复审）：三段能拆回来，principal 段是指纹、其余两段是词表里的类名。"""
+    g = _gate()
+    arn = f"arn:aws:iam::{_ACCT}:role/Secret"
+    item = g.undecided_item(arn, "read-param", {"session-key:site-hs-v2", "jwt-param"})
+    assert "Secret" not in item and _ACCT not in item and "arn:" not in item
+    assert g.UNDECIDED_ITEM_RE.fullmatch(item), item
+    pfp, cls, classes = g.parse_undecided_item(item)
+    assert pfp == g.principal_fingerprint(arn) and cls == "read-param"
+    assert classes == frozenset({"jwt-param", "session-key:site-hs-v2"})
+    # 资源类排序 ⇒ 集合相同就是同一个成员（与 undecided_members 的 `if classes` 一样是可比性前提）
+    assert item == g.undecided_item(arn, "read-param", ["jwt-param", "session-key:site-hs-v2"])
+
+
+def test_coverage_form_tells_hash_from_decomposable_and_refuses_a_mix():
+    g = _gate()
+    v4 = g.undecided_item_fp("arn:aws:iam::1:role/A", "invoke", "sites")
+    v5 = g.undecided_item("arn:aws:iam::1:role/A", "invoke", {"sites"})
+    assert g.coverage_form([]) == "v5" and g.coverage_form(None) == "v5"
+    assert g.coverage_form([v4, v4]) == "v4" and g.coverage_form([v5]) == "v5"
+    with pytest.raises(SystemExit, match="混杂"):
+        g.coverage_form([v4, v5])
 
 
 # ==========================================================================
@@ -2014,18 +2049,107 @@ def test_old_baseline_schema_hard_fails(tmp_path):
     assert "--migrate-from-schema" in str(exc.value)
 
 
-def test_migration_only_accepts_schema_3_to_4(tmp_path):
-    """3c-1A：只接受 3→4 的一次性迁移；2→3 那条路留着函数但不再从 CLI 可达。"""
+def test_migration_only_accepts_schema_3_or_4_to_5(tmp_path):
+    """3c-1A 开的 3→4 通道与 A6 复审开的 4→5 通道串成一条链；2→x 不再从 CLI 可达。"""
     g = _gate()
-    assert g.BASELINE_SCHEMA == 4, "这条用例的前提是脚本已经是 schema 4"
+    assert g.BASELINE_SCHEMA == 5, "这条用例的前提是脚本已经是 schema 5"
     p = tmp_path / "b.json"
     p.write_text(json.dumps({"schema": 2, "principals": {}, "facts": {}}), encoding="utf-8")
     with pytest.raises(SystemExit):
-        g.load_baseline(p, migrate_from=2)          # 2→4 不支持
+        g.load_baseline(p, migrate_from=2)          # 2→5 不支持
     p.write_text(json.dumps({"schema": 3, "principals": {}, "facts": {}}), encoding="utf-8")
     with pytest.raises(SystemExit):
         g.load_baseline(p, migrate_from=4)          # 声明的版本与文件里的不一致
-    assert g.load_baseline(p, migrate_from=3)["schema"] == 4
+    migrated = g.load_baseline(p, migrate_from=3)
+    assert migrated["schema"] == 5 and migrated["facts"]["session_keys"] == {}
+    p.write_text(json.dumps({"schema": 4, "principals": {}, "facts": {"session_keys": {}},
+                             "coverage": {"undecided_items": ["0000-1111-2222-3333"]}}),
+                 encoding="utf-8")
+    migrated = g.load_baseline(p, migrate_from=4)
+    # 4→5 在内存里只改版本号：成员仍是哈希，由 _compare_coverage 的 v4 分支按旧形态比
+    assert migrated["schema"] == 5 and g.coverage_form(migrated["coverage"]["undecided_items"]) == "v4"
+
+
+def test_a_schema_5_baseline_on_disk_must_carry_decomposable_members(tmp_path):
+    """落盘的 schema 5 里混着哈希成员 = 迁移没跑完或手改。读入就拒——放进去的后果是
+    退役声明静默失效（与没修一样）。"""
+    g = _gate()
+    p = tmp_path / "b.json"
+    p.write_text(json.dumps({"schema": 5, "principals": {},
+                             "coverage": {"undecided_items": ["0000-1111-2222-3333"]}}),
+                 encoding="utf-8")
+    with pytest.raises(SystemExit, match="哈希形态"):
+        g.load_baseline(p)
+    ok = g.undecided_item("arn:aws:iam::1:role/A", "invoke", {"sites"})
+    p.write_text(json.dumps({"schema": 5, "principals": {}, "coverage": {"undecided_items": [ok]}}),
+                 encoding="utf-8")
+    assert g.load_baseline(p)["schema"] == 5
+
+
+@pytest.mark.parametrize("old", [3, 4])
+def test_migrate_baseline_only_refuses_every_path_to_5_because_members_need_a_live_run(old, tmp_path, monkeypatch):
+    """`--migrate-baseline-only` 是纯结构迁移；到 5 的每条链都经过"只改版本号"的 4→5，成员仍是哈希
+    ⇒ 落盘就是一份下一次 load 必拒的自相矛盾基线（复审二轮 P2-2 用 schema 3 复现：第一版只挡了 ≥4）。"""
+    g = _gate()
+    p = tmp_path / "b.json"
+    p.write_text(json.dumps({"schema": old, "principals": {}, "facts": {},
+                             "coverage": {"undecided_items": ["0000-1111-2222-3333"]}}), encoding="utf-8")
+    monkeypatch.setattr(g, "BASELINE_PATH", p)
+    with pytest.raises(SystemExit, match="实测"):
+        g.main(["--migrate-baseline-only", "--migrate-from-schema", str(old)])
+    assert json.loads(p.read_text())["schema"] == old, "被拒时不许改文件"
+
+
+def test_schema4_fingerprints_in_a_snapshot_must_be_real_fingerprints():
+    """复审二轮 P2-1：迁移那一跑直接拿这一列与旧基线比，所以它不能是任意字符串——
+    v5 成员、ARN、随便一个词都要在 BUNDLE_SHAPE 这层被拒。"""
+    g = _gate()
+    good = g.undecided_item_fp("arn:aws:iam::1:role/A", "invoke", "sites")
+    bundle = _complete_bundle(g)
+    bundle["coverage"]["schema4_fingerprints"] = [good, good]
+    g.check_bundle_complete(bundle, where="t")                     # 正向控制
+    for bad in ("not-a-fingerprint", g.undecided_item("arn:aws:iam::1:role/A", "invoke", {"sites"}),
+                "arn:aws:iam::1:role/A", ""):
+        bundle["coverage"]["schema4_fingerprints"] = [good, bad]
+        with pytest.raises(SystemExit, match="schema4_fingerprints"):
+            g.check_bundle_complete(bundle, where="t")
+
+
+def test_write_dump_replaces_a_symlink_instead_of_following_it(tmp_path):
+    """复审三轮 P2：`os.open` 跟随 symlink ⇒ `atb.json → victim` 会把 victim 截断改写再 chmod 600。
+    原子替换只换路径本身：victim 内容与权限不变，链接被一个 0600 的普通文件取代。"""
+    g = _gate()
+    victim = tmp_path / "victim"; victim.write_text("keep me"); os.chmod(victim, 0o644)
+    link = tmp_path / "atb.json"; link.symlink_to(victim)
+    g.write_dump(link, {"schema": g.BASELINE_SCHEMA})
+    assert victim.read_text() == "keep me" and oct(victim.stat().st_mode)[-3:] == "644"
+    assert not link.is_symlink() and link.is_file() and oct(link.stat().st_mode)[-3:] == "600"
+    assert json.loads(link.read_text())["schema"] == g.BASELINE_SCHEMA
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith(".atb.json.")], "临时文件没清"
+
+
+def test_write_dump_leaves_holders_of_the_old_inode_with_the_old_bytes(tmp_path):
+    """覆盖已有 0644 文件：不能在旧 inode 上原地截断写入（那样已打开的读者会读到新内容，且写入期间
+    文件仍是 0644）。新内容必须在一个新的、从诞生就是 0600 的 inode 上。"""
+    g = _gate()
+    out = tmp_path / "atb.json"; out.write_text("old"); os.chmod(out, 0o644)
+    old_ino = out.stat().st_ino
+    with open(out) as reader:                       # 别人预先持有的 fd
+        g.write_dump(out, {"schema": g.BASELINE_SCHEMA})
+        assert reader.read() == "old"
+    assert out.stat().st_ino != old_ino and oct(out.stat().st_mode)[-3:] == "600"
+
+
+def test_dump_observed_is_written_0600_even_over_an_existing_0644_file(tmp_path, monkeypatch, capsys):
+    """复审二轮 P2-3：快照含真实 principal 名/ARN/语句原文，`write_text` 按 umask 落成 0644。"""
+    g = _gate()
+    out = tmp_path / "atb.json"
+    out.write_text("{}"); os.chmod(out, 0o644)
+    monkeypatch.setattr(g, "measure", lambda *a, **k: _complete_bundle(g))
+    assert g.main(["--dump-observed", str(out)]) == 0
+    assert oct(out.stat().st_mode)[-3:] == "600", oct(out.stat().st_mode)
+    assert json.loads(out.read_text())["schema"] == g.BASELINE_SCHEMA
+    assert "0600" in capsys.readouterr().out
 
 
 def test_from_dump_rejects_a_stale_schema(tmp_path):
@@ -2222,10 +2346,9 @@ def _complete_bundle(g) -> dict:
         "facts": {"edge_code_targets_carrying_live_key": 0,
                   "edge_assets_carrying_live_key": 0,
                   "principals_with_missing_context": 0, "session_keys": {}},
-        # A6：反事实分节（按声明算的第二份 undecided；无声明时为空）。它是 BUNDLE_SHAPE 的
-        # 一部分 ⇒ 缺它照样硬失败，与其它分节同一条 fail-closed 合同。
-        "coverage": {"undecided_items": [],
-                     "counterfactual": {"labels": [], "undecided_items": []}},
+        # A6 复审：成员是可分解形态；`schema4_fingerprints` 是迁移期的比较用料（归 3c-3 删）。
+        # 两者都是 BUNDLE_SHAPE 的一部分 ⇒ 缺它照样硬失败，与其它分节同一条 fail-closed 合同。
+        "coverage": {"undecided_items": [], "schema4_fingerprints": []},
         "iam_write": {"statements": {}, "boundaries": {},
                       "managed_versions": {}, "texts": {}},
         "required": {"edge": "EdgeRole", "deployer": "DeployerRole"},
@@ -2396,7 +2519,8 @@ def test_bundle_missing_an_inner_key_hard_fails():
 def test_coverage_items_are_required_because_losing_them_reads_as_all_clear():
     """`coverage` 在、内层 `undecided_items` 没了 ⇒ 每一项判不出的都变成"改善"。"""
     g = _gate()
-    items = ["1111-1111-1111-1111", "2222-2222-2222-2222"]
+    items = [g.undecided_item("arn:aws:iam::1:role/A", "invoke", {"sites"}),
+             g.undecided_item("arn:aws:iam::1:role/B", "read-param", {"jwt-param"})]
     baseline = {"schema": g.BASELINE_SCHEMA, "principals": {},
                 "coverage": {"undecided_items": items}}
     rep = g.compare_to_baseline({}, baseline, required={}, resource_policies=None,
@@ -3643,9 +3767,10 @@ def test_login_flow_hard_failure_message_says_it_is_not_baseline_releasable():
 
 
 def test_login_flow_check_adds_no_facts_and_keeps_the_baseline_schema():
-    """spec §11.8.7：不新增 facts、BUNDLE_SHAPE 不变、schema 留 4。"""
+    """spec §11.8.7：不新增 facts、BUNDLE_SHAPE 的 facts 不变。（schema 后来因 A6 复审升到 5，
+    那是 coverage 成员形态的事，与 login-flow 无关——facts 清单仍钉在这里。）"""
     g = _gate()
-    assert g.BASELINE_SCHEMA == 4
+    assert g.BASELINE_SCHEMA == 5
     assert set(g.BUNDLE_SHAPE["facts"]) == {
         "edge_code_targets_carrying_live_key", "edge_assets_carrying_live_key",
         "principals_with_missing_context", "session_keys"}
@@ -3654,12 +3779,13 @@ def test_login_flow_check_adds_no_facts_and_keeps_the_baseline_schema():
     assert "login" not in json.dumps(g.BUNDLE_SHAPE, default=str)
 
 
-def test_load_baseline_accepts_schema_4_without_a_migration_channel(tmp_path):
-    """schema 留 4 ⇒ 现有基线直接可读，`--migrate-from-schema` 不需要新通道。"""
+def test_load_baseline_names_the_migration_channel_for_a_schema_4_file(tmp_path):
+    """schema 4 的基线（3c-1A/1B 时期）现在必须经 4→5 迁移；报文要把那条命令说出来。"""
     g = _gate()
     p = tmp_path / "b.json"
     p.write_text(json.dumps({"schema": 4, "principals": {}}), encoding="utf-8")
-    assert g.load_baseline(p)["schema"] == 4
+    with pytest.raises(SystemExit, match="--migrate-from-schema 4"):
+        g.load_baseline(p)
 
 
 # ---- legacy_param 为空（L3 之后）------------------------------------------------
@@ -3786,113 +3912,218 @@ def test_new_kid_alias_and_retire_key_are_wired_into_the_comparison():
     assert "retired_keys=tuple(args.retire_key or ())" in src
 
 
-# ---- 3c-1B-G A6：被声明 key 引起的 coverage 指纹迁移 ------------------------------------
+# ---- 3c-1B-G A6：被声明 key 引起的 coverage 成员迁移 ------------------------------------
 #
 # 机制（实测过两轮、各 305 条）：`undecided_members` 把某 principal 某动作类下的**整个
-# 资源类集合**折成一个指纹，所以新增一把 key 的 SSM 参数会让每个受影响 principal 的成员
-# **换一个值**（旧的消失 + 新的出现）。声明只作用于 grant delta，从不进 coverage
+# 资源类集合**折成一个成员，所以一把 key 的 SSM 参数增减会让每个受影响 principal 的成员
+# **换一个值**（旧的消失 + 新的出现）。声明只作用于 grant delta、从不进 coverage
 # ⇒ `--new-key` 声明过仍然 exit 1，最后只能人工 `--update-baseline`，而那正是
-# spec §11.8.7 否决的工作流。判据改成**反事实**：剔掉被声明 key 的资源类重算，
-# 与基线相等才整批落绿。
+# spec §11.8.7 否决的工作流。
+#
+# 第一版修法（"反事实"）只在**本次观测**上剔掉被声明 key 的资源类再与基线比。它只对新增
+# 成立：退役时那个类只在基线里有、观测里根本没有，剔了等于没剔 ⇒ ⑩ 的 `--retire-key`
+# 声明过照样整批红（Codex 复审 P1-1，用生产比较器复现）。现在成员是**可分解**形态，
+# 归一化对**两侧**做，新增 / 退役 / 二者同轮全走同一条判据；快照里不再存按声明算的第二份。
 
 _A6_ARN = "arn:aws:iam::111111111111:role/reader"
 _A6_KID = "site-hs-v9"
+_A6_OLD = "console-hs-v1"
 
 
-def _a6_pairs(with_new_key: bool):
-    """同一个 principal 的 (动作, 资源) 对：新 key 就位后多一个 session-key 资源。"""
+def _a6_pairs(*kids):
+    """同一个 principal 的 (动作, 资源) 对：jwt-secret 之外，每把在位的 key 多一个 session-key 资源。"""
     pairs = {("ssm:GetParameter", _A6_JWT)}
-    if with_new_key:
-        pairs.add(("ssm:GetParameter", _A6_NEW))
+    for kid in kids:
+        pairs.add(("ssm:GetParameter", _a6_param(kid)))
     return pairs
 
 
 _A6_JWT = "arn:aws:ssm:us-east-1:1:parameter/site-builder/jwt-secret"
-_A6_NEW = f"arn:aws:ssm:us-east-1:1:parameter/site-builder/session-keys/{_A6_KID}"
 
 
-def _a6_targets(with_new_key: bool):
+def _a6_param(kid):
+    return f"arn:aws:ssm:us-east-1:1:parameter/site-builder/session-keys/{kid}"
+
+
+def _a6_targets(*kids):
     """复用既有 `_targets` 的字段（**不手写一份 Targets**，字段漂移时会静默变成别的东西）。"""
     g = _gate()
     base = _targets(g)
     return g.Targets(**{**base.__dict__, "jwt_parameter": _A6_JWT,
-                        "session_key_parameters": {_A6_KID: _A6_NEW} if with_new_key else {}})
+                        "session_key_parameters": {k: _a6_param(k) for k in kids}})
+
+
+def _a6_members(*kids):
+    g = _gate()
+    return g.undecided_members(_A6_ARN, _a6_pairs(*kids), _a6_targets(*kids))
 
 
 def test_classes_for_labels_matches_the_resource_class_names_actually_emitted():
     """对应关系必须精确——差一个字的后果是"声明了却仍然红"，与没修一样。"""
     g = _gate()
-    t = _a6_targets(True)
+    t = _a6_targets(_A6_KID)
     assert g.classes_for_labels((_A6_KID,), t) == frozenset({f"session-key:{_A6_KID}"})
     assert g.classes_for_labels((g.LABEL_LEGACY,), t) == frozenset({"jwt-param"})
     assert g.classes_for_labels((g.LABEL_LOGIN_FLOW,), t) == frozenset({"login-flow-param"})
+    assert g.classes_for_labels((_A6_KID,)) == frozenset({f"session-key:{_A6_KID}"}), "t 可省"
     # 真的由 undecided_resource_class 产出同名类（不是两处各写一份字面量）
-    emitted = {g.undecided_resource_class(r, t) for _, r in _a6_pairs(True)}
+    emitted = {g.undecided_resource_class(r, t) for _, r in _a6_pairs(_A6_KID)}
     assert g.classes_for_labels((_A6_KID, g.LABEL_LEGACY), t) <= emitted
 
 
-def test_the_churn_is_real_the_fingerprint_changes_for_every_affected_principal():
-    """前提自查：不剔掉资源类时，新增一把 key 确实让成员指纹整批换值。"""
-    g = _gate()
-    before = g.undecided_members(_A6_ARN, _a6_pairs(False), _a6_targets(False))
-    after = g.undecided_members(_A6_ARN, _a6_pairs(True), _a6_targets(True))
+def test_the_churn_is_real_the_member_changes_for_every_affected_principal():
+    """前提自查：不归一化时，新增或退役一把 key 确实让成员整批换值。"""
+    before, after = _a6_members(), _a6_members(_A6_KID)
     assert before and after and not (before & after), (before, after)
 
 
-def test_ignoring_the_declared_class_reproduces_the_baseline_fingerprints():
+def test_normalizing_both_sides_makes_new_and_retired_keys_compare_equal():
     g = _gate()
-    before = g.undecided_members(_A6_ARN, _a6_pairs(False), _a6_targets(False))
-    cf = g.undecided_members(_A6_ARN, _a6_pairs(True), _a6_targets(True),
-                             ignore_classes=g.classes_for_labels((_A6_KID,), _a6_targets(True)))
-    assert cf == before
+    ignore = g.classes_for_labels((_A6_KID, _A6_OLD))
+    # 新增：基线没有 v9、本次有；退役：基线有 console-v1、本次没有；同轮：两者都发生
+    for was, now in ((_a6_members(), _a6_members(_A6_KID)),
+                     (_a6_members(_A6_OLD), _a6_members()),
+                     (_a6_members(_A6_OLD), _a6_members(_A6_KID))):
+        assert g.normalize_undecided_items(was, ignore) == g.normalize_undecided_items(now, ignore)
 
 
-def _a6_compare(*, declared, extra_now=(), cf_labels=None):
-    """跑一次 `_compare_coverage`：基线 = before，本次 = after(+extra)，反事实 = 剔掉声明的类。"""
+def _a6_compare(*, declared, was, now, extra_now=(), now_v4=None):
+    """跑一次 `_compare_coverage`：基线 = was，本次 = now(+extra)。"""
     g = _gate()
-    before = g.undecided_members(_A6_ARN, _a6_pairs(False), _a6_targets(False))
-    after = g.undecided_members(_A6_ARN, _a6_pairs(True), _a6_targets(True)) | set(extra_now)
-    cf = g.undecided_members(_A6_ARN, _a6_pairs(True), _a6_targets(True),
-                             ignore_classes=g.classes_for_labels(declared, _a6_targets(True))
-                             ) | set(extra_now)
     rep = g.Report()
-    labels = sorted(declared) if cf_labels is None else cf_labels
-    g._compare_coverage(rep, sorted(before), sorted(after),
-                        counterfactual={"labels": labels, "undecided_items": sorted(cf)},
-                        declared_labels=tuple(declared))
+    g._compare_coverage(rep, sorted(was), sorted(set(now) | set(extra_now)),
+                        now_v4=now_v4, declared_labels=tuple(declared))
     return rep
 
 
-def test_declared_key_churn_lands_in_the_green_migration_bucket():
+def test_declared_new_key_churn_lands_in_the_green_migration_bucket():
     g = _gate()
-    rep = _a6_compare(declared=(_A6_KID,))
+    rep = _a6_compare(declared=(_A6_KID,), was=_a6_members(), now=_a6_members(_A6_KID))
     assert not rep.new_undecided_items, rep.new_undecided_items
     assert rep.migration_undecided and _A6_KID in rep.migration_undecided[0]
     assert rep.ok, [f for f, _, _ in g.RED_FIELDS if getattr(rep, f)]
 
 
-def test_an_unrelated_undecided_item_in_the_same_round_still_goes_red():
-    """**这条是 A6 的安全性**：声明只吸收它能解释的那部分，多一条无关的照红。"""
+def test_declared_retired_key_churn_lands_in_the_green_migration_bucket():
+    """**Codex 复审 P1-1 的反例**：退役的 key 只在基线里有。第一版对本次观测剔类，剔了等于没剔，
+    `migration_undecided=[]`、`new_undecided_items=[…]`、ok=False——⑩ 声明过照样人工 update。"""
     g = _gate()
-    stray = g.undecided_item_fp("arn:aws:iam::111111111111:role/other", "invoke", "sites")
-    rep = _a6_compare(declared=(_A6_KID,), extra_now=(stray,))
-    assert rep.new_undecided_items and stray in rep.new_undecided_items[0]
-    assert not rep.ok
+    rep = _a6_compare(declared=(_A6_OLD,), was=_a6_members(_A6_OLD), now=_a6_members())
+    assert not rep.new_undecided_items, rep.new_undecided_items
+    assert rep.migration_undecided and _A6_OLD in rep.migration_undecided[0]
+    assert rep.ok, [f for f, _, _ in g.RED_FIELDS if getattr(rep, f)]
+
+
+def test_new_and_retired_keys_declared_in_the_same_round_normalize_together():
+    """⑩ 的真实形态：两把 v1 退役；若与 ⑥ 合并做，还同时有新 key 就位。两边都剔、一次比完。"""
+    g = _gate()
+    rep = _a6_compare(declared=(_A6_KID, _A6_OLD), was=_a6_members(_A6_OLD), now=_a6_members(_A6_KID))
+    assert not rep.new_undecided_items and rep.migration_undecided and rep.ok
+    # 只声明其中一把 ⇒ 另一把引起的 churn 照红（声明是逐 key 的，不是"本轮随便变"）
+    for partial in ((_A6_KID,), (_A6_OLD,)):
+        rep = _a6_compare(declared=partial, was=_a6_members(_A6_OLD), now=_a6_members(_A6_KID))
+        assert rep.new_undecided_items and not rep.ok, partial
+
+
+def test_an_unrelated_undecided_item_in_the_same_round_still_goes_red():
+    """**这条是 A6 的安全性**：声明只吸收它能解释的那部分，多一条无关的照红——新增与退役都一样。"""
+    g = _gate()
+    stray = g.undecided_item("arn:aws:iam::111111111111:role/other", "invoke", {"sites"})
+    for declared, was, now in (((_A6_KID,), _a6_members(), _a6_members(_A6_KID)),
+                               ((_A6_OLD,), _a6_members(_A6_OLD), _a6_members())):
+        rep = _a6_compare(declared=declared, was=was, now=now, extra_now=(stray,))
+        assert rep.new_undecided_items and stray in rep.new_undecided_items[0], declared
+        assert rep.migration_undecided, "能解释的那部分仍然落绿桶"
+        # 复审二轮：只解释了一部分时不许写"归一化相等"——证据文字要与事实一致
+        assert "相等" not in rep.migration_undecided[0] and "仍有 1 项新成员" in rep.migration_undecided[0]
+        assert not rep.ok
+    # 对照：无关的是一条**消失**（改善）时退出码是绿的，但同样不许说"相等"
+    stray_gone = _a6_members(_A6_KID) | {stray}
+    rep = _a6_compare(declared=(_A6_KID,), was=_a6_members() | {stray}, now=_a6_members(_A6_KID))
+    assert rep.ok and rep.improvements and "相等" not in rep.migration_undecided[0]
+    # 全部解释得了才说"相等"
+    rep = _a6_compare(declared=(_A6_KID,), was=_a6_members(), now=_a6_members(_A6_KID))
+    assert "相等" in rep.migration_undecided[0]
+    del stray_gone
 
 
 def test_without_a_declaration_the_churn_is_still_red():
-    """没声明就没有豁免——否则任何 coverage 变化都能靠"反正有反事实"混过去。"""
-    g = _gate()
-    rep = _a6_compare(declared=())
-    assert rep.new_undecided_items and not rep.migration_undecided
-    assert not rep.ok
+    """没声明就没有豁免——否则任何 coverage 变化都能靠"反正可归一"混过去。"""
+    for was, now in ((_a6_members(), _a6_members(_A6_KID)), (_a6_members(_A6_OLD), _a6_members())):
+        rep = _a6_compare(declared=(), was=was, now=now)
+        assert rep.new_undecided_items and not rep.migration_undecided
+        assert not rep.ok
 
 
-def test_a_counterfactual_computed_for_other_labels_is_refused_not_used():
-    """`--from-dump` 的快照若是按别的声明算的，必须响亮拒绝——不能拿它吸收 churn。"""
+def test_a_declaration_that_changes_nothing_writes_no_migration_line():
+    """声明了但 coverage 没变（比如只有 grant 侧的变化）⇒ 绿桶不该出现一条 "0 项"。"""
+    rep = _a6_compare(declared=(_A6_KID,), was=_a6_members(_A6_KID), now=_a6_members(_A6_KID))
+    assert rep.ok and not rep.migration_undecided and not rep.new_undecided_items
+
+
+def test_the_same_snapshot_can_be_compared_under_different_declarations():
+    """快照里不再存"按哪组声明算的反事实"：同一份 coverage 分节，声明不同结论不同。
+    （第一版把反事实存进快照，`--from-dump` 时声明与快照不匹配只能硬拒。）"""
     g = _gate()
-    with pytest.raises(SystemExit, match="反事实"):
-        _a6_compare(declared=(_A6_KID,), cf_labels=["console-hs-v9"])
+    coverage = {"undecided_items": sorted(_a6_members()), "schema4_fingerprints": []}
+    baseline = {"principals": {}, "coverage": {"undecided_items": sorted(_a6_members(_A6_OLD))}}
+    assert "counterfactual" not in json.dumps(g.BUNDLE_SHAPE, default=str)
+    red = g.compare_to_baseline({}, baseline, required={}, coverage=coverage)
+    green = g.compare_to_baseline({}, baseline, required={}, coverage=coverage, retired_keys=(_A6_OLD,))
+    assert not red.ok and green.ok
+
+
+def test_a_schema_4_baseline_is_compared_by_the_old_hashes_and_absorbs_nothing():
+    """迁移那一跑：基线还是哈希 ⇒ 用观测里的 `schema4_fingerprints` 比（漂移仍可见），
+    声明**不吸收**（哈希剔不掉类），照红并说明；没有 v4 指纹的观测直接拒。"""
+    g = _gate()
+    t0, t1 = _a6_targets(), _a6_targets(_A6_KID)
+    was_v4 = g.undecided_members_v4(_A6_ARN, _a6_pairs(), t0)
+    now_v4 = g.undecided_members_v4(_A6_ARN, _a6_pairs(_A6_KID), t1)
+    # 没变：绿，且报告点明按旧形态比
+    rep = _a6_compare(declared=(), was=was_v4, now=_a6_members(), now_v4=sorted(was_v4))
+    assert rep.ok and any("schema 4" in n for n in rep.notes)
+    # 变了且声明了：照红（不吸收），并说清为什么
+    rep = _a6_compare(declared=(_A6_KID,), was=was_v4, now=_a6_members(_A6_KID), now_v4=sorted(now_v4))
+    assert rep.new_undecided_items and not rep.migration_undecided and not rep.ok
+    assert any("不吸收" in n for n in rep.notes)
+    with pytest.raises(SystemExit, match="schema4_fingerprints"):
+        _a6_compare(declared=(), was=was_v4, now=_a6_members(), now_v4=None)
+
+
+def test_bundle_shape_rejects_hash_members_and_account_values_in_coverage():
+    """观测里的成员必须是可分解形态：哈希（旧 dump）与带 ARN 的字符串都在 BUNDLE_SHAPE 这层被拒。"""
+    g = _gate()
+    for bad in (g.undecided_item_fp(_A6_ARN, "invoke", "sites"),
+                f"{_A6_ARN}|invoke|sites", "0000-1111-2222-3333|invoke|"):
+        bundle = _complete_bundle(g)
+        bundle["coverage"]["undecided_items"] = [bad]
+        with pytest.raises(SystemExit):
+            g.check_bundle_complete(bundle, where="t")
+    bundle = _complete_bundle(g)
+    bundle["coverage"]["undecided_items"] = [g.undecided_item(_A6_ARN, "invoke", {"sites", "fn:site-panel"})]
+    g.check_bundle_complete(bundle, where="t")           # 正向控制
+
+
+def test_update_baseline_does_not_write_when_the_preview_cannot_be_rendered(tmp_path, monkeypatch, capsys):
+    """**Codex 复审 P1-2**：预览 = "接受了什么"的唯一留痕。比较器主动拒绝（SystemExit）时第一版
+    只打一句就照写 ⇒ 普通闸门里的硬失败在 --update-baseline 下变成静默放行。现在原样传播、不写。"""
+    g = _gate()
+    bundle = _complete_bundle(g)
+    written = []
+    monkeypatch.setattr(g, "BASELINE_PATH", tmp_path / "b.json")
+    monkeypatch.setattr(g, "load_baseline", lambda *a, **k: {"schema": g.BASELINE_SCHEMA, "principals": {}})
+    monkeypatch.setattr(g, "measure", lambda *a, **k: bundle)
+    monkeypatch.setattr(g, "write_baseline", lambda *a, **k: written.append(a))
+    monkeypatch.setattr(g, "compare_to_baseline",
+                        lambda *a, **k: (_ for _ in ()).throw(SystemExit("形态混杂")))
+    with pytest.raises(SystemExit, match="形态混杂"):
+        g.main(["--update-baseline"])
+    assert not written, "预览失败却写了基线"
+    # 正向控制：预览能生成 ⇒ 先打印再写、退 0
+    monkeypatch.setattr(g, "compare_to_baseline", lambda *a, **k: g.Report())
+    assert g.main(["--update-baseline"]) == 0
+    assert len(written) == 1 and "即将被写进基线" in capsys.readouterr().out
 
 
 def test_the_green_bucket_is_not_a_red_field():

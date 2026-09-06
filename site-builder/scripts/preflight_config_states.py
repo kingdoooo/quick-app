@@ -236,6 +236,12 @@ def main(argv: list | None = None) -> int:
         explicit[fam] = kid
     refuse_if_mutation_in_flight()
     base = CFG.read_text()
+    # **先把所有能失败的纯计算做完，再建备份与哨兵**（3c-1B-G 复审 P2-1）：原先 `next_kids()`
+    # 在哨兵写下之后、try/finally 之前调用，`--next-kid` 给成与 current 相同（或格式不对）时
+    # 它抛 PreflightError ⇒ config 一个字没改、哨兵却留下了 ⇒ 下一次运行被
+    # `refuse_if_mutation_in_flight` 拦住，要人手工清"假哨兵"。
+    nxt = next_kids(base, explicit)
+    print(f"下一轮就位的 kid（从 config 的 current 推导，可用 --next-kid 点名）：{nxt}")
     SENTINEL.parent.mkdir(parents=True, exist_ok=True)
     # `mkdtemp` 而不是"秒级时间戳 + 严格 mkdir"：同一秒内的第二次运行（重试、或紧接着再跑
     # 一次）会撞名，而严格 mkdir 会抛 FileExistsError ⇒ 脚本根本没跑起来。
@@ -254,13 +260,11 @@ def main(argv: list | None = None) -> int:
         restore(backup, base)
         raise SystemExit(128 + signum)
 
-    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, _on_signal)
-
-    nxt = next_kids(base, explicit)
-    print(f"下一轮就位的 kid（从 config 的 current 推导，可用 --next-kid 点名）：{nxt}")
     report = {}
     try:
+        # 信号处理也放进 try：从哨兵写下的那一刻起，任何失败都必须走 finally 的 restore。
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, _on_signal)
         for tag, fn in (("⑤L3", state_l3), ("⑥stage", state_stage),
                         ("⑦switch", state_switch), ("⑩retire", state_retire)):
             text = fn(base, nxt)
