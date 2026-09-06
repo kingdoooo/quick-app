@@ -36,12 +36,16 @@ ARN，通配已清零）。不再需要"读文档时减去一层"。
 > bootstrap S3 桶里还有一批带活密钥的 asset、SSM 参数有**四个**动作都能读出明文而
 > KMS 那道是虚的），从而以任意用户身份访问任意
 > 站点**与控制台写接口**。**3c-1A/1B 没有改变这一条**：密钥换成了两把带 `kid` 的
-> `*-hs-v2` 且可轮转，但仍是**对称**的 ⇒ 读到就能签。三条路各自的数量由
-> `docs/security/account-trust-boundary.md` 的基线断言表给（**本文件不记那些数字**：
+> `*-hs-v2` 且可轮转，但仍是**对称**的 ⇒ 读到就能签。**前两条路（Edge 产物、bootstrap asset）
+> 的数量**由 `docs/security/account-trust-boundary.md` 的基线断言表给（第三条"SSM 的四个动作"
+> 是枚举而非计数，写在那份文档的正文里，不由基线断言）（**本文件不记那些数字**：
 > asset 那行每部署一次 Edge 就 +1、代码目标那行随历史版本过期而降，写死必过时；
 > 有一条单测按标记核对文档与基线一致）。**别按 merged review 里 M09 第 2 步的原话去收窄 invoke，
-> 那是假修复**（同一批身份还握着密钥读取与自助提权）。两条真修复都未排期：账号内改
-> **非对称签名**（Edge 只放公钥）能关掉只读那批；迁**独立成员账号**才能移出管理身份。
+> 那是假修复**（同一批身份还握着密钥读取与自助提权）。两条真修复：账号内改
+> **非对称签名**（Edge 只放公钥）能关掉只读那批——**它已经在做了**，3c-1A/1B 已部署
+> （verifier 认 kid、signer 发 kid、legacy 入口已关、一次真实轮转），但**签名还是对称的**，
+> 真正把只读那批关掉的是 3c-2B，前置的闸门包 3c-2A 尚未获实施授权；
+> 迁**独立成员账号**才能移出管理身份，**那条仍未排期**。
 > 实测数字、为什么 SCP/resource policy/对称签名都不成立、以及盯住暴露面别再变大的
 > 闸门（**已收缩成 A 直接失守 + B IAM 写静态快照两层，C 站点 route/alias 可达性移出归
 > 部署验收**；真修复顺序：收窄 CodeBuild 对 bootstrap 桶的读权限（**§9 的 3b，
@@ -392,7 +396,7 @@ python3 site-builder/scripts/gen_onboarding.py
 | **平台防谁 / 不防谁（账号信任边界）** | `docs/security/account-trust-boundary.md`（**tracked**；M09 的结论真源。含只读实测方法、**14 个由基线断言的数字**（A/B 两组 + 按类别）、为什么 SCP/resource policy/应用层签名/收窄 invoke 都不成立） |
 | **M09 真修复①的设计与实施记录（2026-08-27 已部署）** | `docs/superpowers/specs/2026-08-27-codebuild-bootstrap-read-narrowing-spec.md`（**tracked**；收窄 CodeBuild 对 CDK bootstrap 桶的读权限＝§9 的 3b。含为什么已有那条 AST 守卫看不见这个洞、三层守卫各自能证明什么、部署窗口的干净失败面；末尾「实施记录与验收证据」一节是 handover）|
 | **3c-1B（signer 切 `kid` + 关 legacy 入口 + 一次真实轮转）** | 十步 runbook 与首次执行的真实时间线：`site-builder/DEPLOY.md`「轮转会话密钥：十步 runbook」（**每次轮转照抄 ⑥–⑩**；①–⑤ 是 legacy 收敛，已一次性用完）。裁定原文在 spec §11.8，状态机现状在 §6.2，留给 3c-3 的精确清单也在 §6.2。**过程记录（票、progress、日志）在 `.scratch/3c-1b/`——gitignored、不随仓库分发，别当状态真源** |
-| **M09 真修复②的设计（3c，3c-0 裁决完成，未实施）** | `docs/superpowers/specs/2026-08-28-asymmetric-session-signing-spec.md`（**tracked**；会话签名迁非对称。**状态：§11 七个未决项已于 2026-09-02 全部裁定（含 Edge 冷启动最终形态复测：vendored `cryptography` 过闸、128 MB 不动），不构成实施授权**；裁定原文与被否决项都在 §11，三条 ADR 在 `docs/adr/`。 **3c-1A 已于 2026-09-02 实施并部署**（verifier 认 kid allowlist、两把 HS secret、闸门 schema 4；signer 仍发 legacy 形态），计划 `docs/superpowers/plans/2026-09-02-3c-1a-verifier-kid-allowlist.md`。**3c-1B 已于 2026-09-05 实施并部署**（signer 切 `kid`、L3 关闭 legacy 入口、v1→v2 真实轮转 + 生产回滚演示、v1 参数已删；④ 观察窗口经裁决跳过、⑨ 是该机制唯一的真机证明——见 §6.1 那一行）。**下一个包是 3c-2A**（闸门与验收先认 KMS，独立发布单元）。含量测过的收益边界（56 → **冒充面 19，这是已知下界不是上界**）、两个 key family 的模型、分包顺序 3c-0/1A/1B/**2A**/2B/3（2A 是"闸门与验收先认 KMS"的独立发布单元）、部署与回滚协议、以及「四个 verify_* 闸门靠读 SSM 明文本地 mint 会话，非对称化后要重新设计」这条容易漏的代价）|
+| **M09 真修复②的设计（3c；3c-0 裁决完成、1A/1B 已部署、2A 起未实施）** | `docs/superpowers/specs/2026-08-28-asymmetric-session-signing-spec.md`（**tracked**；会话签名迁非对称。**状态：§11 七个未决项已于 2026-09-02 全部裁定（含 Edge 冷启动最终形态复测：vendored `cryptography` 过闸、128 MB 不动），不构成实施授权**；裁定原文与被否决项都在 §11，三条 ADR 在 `docs/adr/`。 **3c-1A 已于 2026-09-02 实施并部署**（verifier 认 kid allowlist、两把 HS secret、闸门 schema 4；signer 仍发 legacy 形态），计划 `docs/superpowers/plans/2026-09-02-3c-1a-verifier-kid-allowlist.md`。**3c-1B 已于 2026-09-05 实施并部署**（signer 切 `kid`、L3 关闭 legacy 入口、v1→v2 真实轮转 + 生产回滚演示、v1 参数已删；④ 观察窗口经裁决跳过、⑨ 是该机制唯一的真机证明——见 §6.1 那一行）。**下一个包是 3c-2A**（闸门与验收先认 KMS，独立发布单元）。含量测过的收益边界（56 → **冒充面 19，这是已知下界不是上界**）、两个 key family 的模型、分包顺序 3c-0/1A/1B/**2A**/2B/3（2A 是"闸门与验收先认 KMS"的独立发布单元）、部署与回滚协议、以及「四个 verify_* 闸门靠读 SSM 明文本地 mint 会话，非对称化后要重新设计」这条容易漏的代价）|
 | **3c 冒充面的可复跑证据** | `site-builder/scripts/probe_impersonation_surface.py`（**tracked**，只读，实测约 20 分钟）→ `docs/security/3c-impersonation-surface.json`（**tracked**，只有计数/等价类/边际收益/盲区清单，名字只进 gitignored dump）。**`--self-test` 不碰 AWS**，18 条反例 + 变形测试在 `deployer/tests/test_probe_impersonation_surface.py`。**别再引用 56→13 / 并集 18 那两组旧数字** |
 | 加固包 S1 的设计与实施 | `docs/superpowers/specs/2026-08-22-s1-isolation-and-auth-hardening-spec.md` + `docs/superpowers/plans/2026-08-22-s1-isolation-and-auth-hardening.md`；升级/闸门/回滚见 `site-builder/DEPLOY.md` 的「S1 加固」一节 |
 | 一期设计决策与范围 | `docs/superpowers/specs/2026-07-21-quick-site-builder-design.md`（已实现快照，勿改） |

@@ -69,17 +69,17 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 > | **login-flow secret**（auth 私有，spec §11.3）| 只记 grant `read-login-flow-secret`；**不进** `facts.session_keys`、不进密钥枚举 | **不进**——读到它只值一次登录 CSRF（state 与 pkce cookie 都活 300 秒），签不出任何会话。另有一条硬断言：Edge 产物里出现它的值即 `SystemExit` |
 >
 > **两个产物计数每次 Edge 部署都会动**（2026-09-04/05 实测：⑤ L3 代码目标 11→10、asset 10→11；⑥ v2 就位 asset 11→12；⑩ 退役 v1 asset 12→13，且 `facts.session_keys` 从四把 kid 变成只剩两把 v2。⑦ 那一步的 asset 增量没有独立记录，别去反推它）：
->
-> ⚠️ **当前基线写在 2026-09-05 ⑩ 的闸门轮里，之后又部署过一次 Edge**（2026-09-06 的
-> 3c-1B ticket 21，Edge 版本 15）。那次部署按上面这条规律会让 asset 那行 **+1**，所以
-> 下一轮闸门会报一条 `edge_assets_carrying_live_key` 的 facts delta——**那是预期的、
-> 能被那次部署解释的**，不是新暴露面。上表的数字与 `account_trust_baseline.json` 一致
-> （有单测按 `<!-- baseline:… -->` 标记核对两者），**跑完下一轮闸门并 `--update-baseline`
-> 之后，这两处要一起更新**。
 > 代码目标那行只数 **legacy** 密钥（`facts.edge_code_targets_carrying_live_key`），L3 让 `$LATEST` 不再带它，
 > 历史版本仍带 ⇒ 减 1 不归零，真正清零归 3c-3 删参数；asset 那行是**并集**（跨 legacy 与全部 kid），
 > 每次 Edge 部署新出的 asset 都带 current kid 的值 ⇒ 每部一次加 1。每 kid 的单列计数在
 > `facts.session_keys`。两个数都**不参与红绿**（`_compare_facts` 只报 delta），读它们时要能用当次动作解释。
+>
+> ⚠️ **当前基线写在 2026-09-05 ⑩ 的那一轮闸门里，之后又部署过一次 Edge**（2026-09-06 的
+> 3c-1B ticket 21，Edge 版本 15，**生产实测**）。按上面这条规律那次部署会让 asset 行 **+1**，
+> 所以下一轮闸门会报一条 `edge_assets_carrying_live_key` 的 facts delta——**那是预期的、
+> 能被那次部署解释的**，不是新暴露面。上表数字与 `account_trust_baseline.json` 一致
+> （单测按 `<!-- baseline:… -->` 标记核对两者），**跑完下一轮闸门并 `--update-baseline` 之后
+> 两处要一起更新**。
 
 > **A + B 的并集是 65，但那个数不是 headline。** A 是"现在就能拿到密钥或直接调用平台
 > 函数"；B 只是"持有一条可能影响 IAM 策略的语句"，本闸门**明确不证明**它构成提权链
@@ -453,7 +453,8 @@ policy 里的 `role/ExactRole` 不会匹配字面量 `role/*` ⇒ 精确授权�
    闸门会把"可以去掉这条豁免"报成改善。
 4. **密钥物化位置的事实**——三处副本每次都实测（比对 SHA-256），
    某处不再含活密钥时对应资源自动掉出集合、grant 随之消失并报成改善。
-   **根治了它，闸门自己就知道。**（当前：Edge 代码目标 10 个、asset 对象 9 个。）
+   **根治了它，闸门自己就知道。**（两处的当前数量见开头那张基线断言表的对应两行，
+   **此处刻意不复述**——它们每部署一次 Edge 就变，写死过一次就腐烂过一次。）
 
 红绿规则分两套，**刻意不对称**：
 
@@ -669,7 +670,9 @@ merged review 的 M09 记的是「同账号 `lambda:InvokeFunction` 可对 panel
 - `site-builder/deployer/buildspec-package.yml` —— `--ignore-scripts` 那一行；
   它是「不可信站点依赖」与「平台签名密钥」之间当前唯一的隔断（见上文过宽授权一节）
 - `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §4 的 `M09` 与 §9 优先级表
-- `site-builder/DEPLOY.md` 「轮转 `jwt-secret`」一节 —— 3c-1A（2026-09-02）起 verifier 已认
-  `current`/`previous`/legacy，但 signer 仍发 legacy 形态，轮转演练在 3c-1B；密钥被读的应急仍如下。
-  这与本文档直接相关：密钥一旦被读，换掉它既需要一个全员重新登录的窗口，
-  **也要连带清理 bootstrap 桶里那 9 个仍带旧密钥的 asset 对象**
+- `site-builder/DEPLOY.md` 「轮转会话密钥：十步 runbook」一节 —— **3c-1B（2026-09-05）之后
+  这条应急已经有了可执行协议**：verifier 全程双接受、新 key 经 `previous` 就位、切换 = 两槽互换、
+  排空满 26 h 才退役，且**首次执行已在生产跑完一轮**（含把 signer 回滚到旧 key 的演示）。
+  所以"换掉被读的密钥"不再是一个需要临时设计的动作，照 ⑥–⑩ 五步做即可。
+  仍与本文档直接相关的部分：**换掉它要连带清理 bootstrap 桶里那些仍带旧密钥的 asset 对象**
+  （数量见上面那张基线断言表的 asset 行，**别在这里写死**——每部署一次 Edge 就 +1）

@@ -302,8 +302,10 @@ PY
 → `deploy_auth.py` → `deploy_panel.py --skip-frontend` → `verify_deployed_components.py` →
 router CDK（`rm -rf cdk.out`）→ CloudFront `Deployed` → `verify_deployed_edge.sh` →
 `verify_kid_entry_live.py` / `verify_session_token_semantics.py` / console E2E / `smoke_router.sh`
-→ `session_verify_counts.py` → 闸门复跑。**signer 没变，所以任一 verifier 单独回滚到上一版都
-安全**（旧代码只认 legacy，而线上 token 全是 legacy）；SSM 里的两把新 secret 不删。
+→ `session_verify_counts.py` → 闸门复跑。**（以下是 1A 当时的性质，1B 之后已不成立）**
+那一刻 signer 还没变，所以任一 verifier 单独回滚到上一版都安全（旧代码只认 legacy，
+而线上 token 全是 legacy）；SSM 里的两把新 secret 不删。**1B 之后线上 token 全是 v2 形态**，
+回滚 verifier 到 1A 之前的版本会让全部会话验签失败——回滚锚点见 runbook 末尾那张表。
 
 **3c-1B 已于 2026-09-03/05 全部执行完毕**（十步的真实时间线见下面的 runbook 首节；
 ④ 经裁决跳过、⑨ 是观察窗口机制唯一的真机证明）。**生产现在的形态**：`signer = current`、
@@ -314,8 +316,9 @@ router CDK（`rm -rf cdk.out`）→ CloudFront `Deployed` → `verify_deployed_e
 **3c-1B：signer 也切 `kid`、关闭 legacy 入口、并做一次真实轮转演练。** 代码侧已一次上齐
 （`[SessionKeys] signer` 开关、auth 私有的 login-flow secret、`scripts/_session_mint.py`、
 闸门的 `--new-key` / `--retire-key`、`stack.py` 改从 `legacy_param` 取路径、两个部署脚本
-"先配置后代码" + 写前核对 SSM 参数存在），**`signer` 的初值是 `legacy`——代码就位而线上
-形态未变**。切换、观察、关闭 legacy 与 v1→v2 演练全部按下面的十步 runbook 执行。
+"先配置后代码" + 写前核对 SSM 参数存在），**当时 `signer` 的初值是 `legacy`——代码就位而线上
+形态未变**（**这是代码上齐那一刻的状态；今天线上是 `current`**，见上面那段）。切换、观察、
+关闭 legacy 与 v1→v2 演练全部按下面的十步 runbook 执行——首次执行已完成，**下一次轮转从 ⑥ 起**。
 
 > ⚠️ **生产验签有三处，不是一处。** 这条注记从前把 `session.py` 的
 > `verify_session_jwt()` 说成**只有测试会调用它**——**那是错的**（大概写在

@@ -1,9 +1,12 @@
 # 3c：会话签名迁到非对称（设计 spec）
 
-日期 **2026-08-28**（末次修订 **2026-09-02**）。状态：**3c-0 裁决完成，未实施**
+日期 **2026-08-28**（末次修订 **2026-09-06**）。状态：**3c-0 裁决完成；3c-1A 与 3c-1B 已实施并部署
+（2026-09-02 / 2026-09-05）；下一个包是 3c-2A，尚未获实施授权。**
 （§11 七个未决项已于 2026-09-02 逐条定稿；§11.1 的冷启动数字已按最终实现形态复测通过（第一轮
-判读作废）；外部复审第十三、十四轮的 P1 与 Codex 对 3c-0 的 6 条阻断项已按下文吸收；**它不构成
-3c-1 及之后各包的实施授权**）。
+判读作废）；外部复审第十三、十四轮的 P1 与 Codex 对 3c-0 的 6 条阻断项已按下文吸收。
+**1A/1B 的落地情况见 §6.1 那两行**——1B 含 signer 切 family `kid`、L3 关闭 legacy 入口、
+一次真实 v1→v2 轮转与生产回滚演示，其中 **④ 观察窗口经操作者裁决跳过**；
+**签名仍是对称 HS256**，非对称化本身（2B）与它的闸门前置（2A）都还没做。）
 术语以根 `CONTEXT.md` 为准；三条随裁决立下的 ADR 在 `docs/adr/0001` 到 `0003`。
 3c-1A 的实施计划：`docs/superpowers/plans/2026-09-02-3c-1a-verifier-kid-allowlist.md`（批准即为 1A 的授权）。
 对应 merged review §9 的 **3c**
@@ -146,13 +149,23 @@ change-set 那两条就整个漏掉。
 与 3c 是否做无关。
 
 **顺带一个今天没有、3c 之后自动获得的性质**：Lambda@Edge 必须关联**已发布的编号版本**，
-所以每次 Edge 部署都留下一个版本，今天那 10 个代码目标每一个都带着**当前有效**的对称密钥
-（bootstrap 桶里另有 9 个 asset 同理）。换成非对称后，历史版本里留下的只有**公钥**，
-版本累积从此不再是负债。这也是为什么"删掉那 9 个 asset"不是 3c 的替代方案。
+所以每次 Edge 部署都留下一个版本，而每个版本的代码里都带着**当时有效**的对称密钥
+（bootstrap 桶里的 asset 同理）。换成非对称后，历史版本里留下的只有**公钥**，
+版本累积从此不再是负债。这也是为什么"把那些 asset 删掉"不是 3c 的替代方案。
+（**两处的当前数量一律去 `account-trust-boundary.md` 的基线断言表查**，本文件写的日期是
+2026-08-28，那时的数字与今天不同——每部署一次 Edge asset 就 +1。）
 
 ---
 
-## 2. 现状：一把密钥，4 处签、5 处验
+## 2. 起点快照（写于 2026-08-28）：一把密钥，4 处签、5 处验
+
+> ⚠️ **这一节是 3c-1 之前的起点快照，不是今天的线上形态。** 3c-1A/1B（2026-09-02 / 09-05）
+> 之后：签发用**两把带 `kid` 的 family 密钥**（`site-hs-v2` / `console-hs-v2`），OAuth state 与
+> PKCE cookie 用一把 **auth 私有的 login-flow secret**，`/site-builder/jwt-secret` 只剩下
+> **已关闭**的 legacy 入口那一条身份、三处 verifier 都不再接受它（待 3c-3 删）。
+> 下面的行号与"全部用同一把密钥"那句都按当时的代码写的，**读的时候当历史看**；
+> 今天的形态见 §6.1 的 1B 行与 §6.2 的状态机现状。**本节的设计推理不受影响**——
+> 它论证的是"为什么必须迁非对称"，而那个论点 1B 一条都没改（密钥仍是对称的）。
 
 | # | 签名点 | 位置 | 产物 |
 |---|---|---|---|
@@ -361,7 +374,7 @@ blocker（外部复审第十四轮 P1-2，成立）。
 |---|---|---|
 | **3c-0** | 本 spec 定稿 + Edge crypto spike 裁决（§11） | 冒充面探针与脱敏聚合证据 tracked 且可复跑 |
 | **3c-1A** | 全部 verifier 认 `kid`→{family, alg, key} 固定 allowlist、每 family `current`+`previous`、legacy 第三入口（状态机 L1）；`[SessionKeys]` 按 §11.6 的 schema 落地（此时只有 HS 行）。**signer 不动** | 闸门认识**两个 HS key family** 与 legacy/current/previous（今天它只认识一个 `JWT_PARAM_NAME`、一套 Edge/asset 密钥定位）；§9 全部 verifier 反例齐备并验过红绿 **已实施并部署 2026-09-02**（plan `2026-09-02-3c-1a-verifier-kid-allowlist.md`） |
-| **3c-1B** **已实施并部署 2026-09-05**（十步 runbook 首次执行完毕；`cf5db89` = ③ 切 signer/T0、`9245703` = ⑤ 进 L3、`a2dd16a` = ⑦⑧ 切 v2 + 回滚演示、`19c9f7f` = ⑨⑩ 排空判定 + v1 退役含删参数；收尾见本行所在提交。**注意：④ 观察窗口在首次演练中经操作者裁决跳过**——单人开发账号、只读读数已证实 T0 以来 `accepted_legacy` 三列全 0，且**没有**做"缩短窗口版的 ④"；因此**观察窗口机制的真机证明只有 ⑨ 这一次**，它按满 26 h 等待并 exit 0 通过。三个时刻：**T0 = `2026-09-03T13:51:18Z`**、**④ 跳过裁决 = `2026-09-04T01:40:40Z`**、**⑨ 判定 = `2026-09-05T12:31Z`**（T2 + 30h12m，闸下限 T2+26h）。完整时间线与时长在 `site-builder/DEPLOY.md` 的 runbook 首节） | signer 开始发 family-specific `kid` + 新 `token_use`/`aud`（状态机 L2）；两把新 HS secret `/site-builder/session-keys/<kid>` + login-flow secret（§11.3）；观察归零后**关闭** legacy 入口（进入 L3，删除仍归 3c-3）；一次真实 HS 轮转演练 R1/R2。**逐条裁定见 §11.8** | 四个 `verify_*` 与 10 条 E2E 的登录态工具能 mint **带新 `kid` 的 HS token**（否则 signer 一切就全红，读起来像功能坏了）；且必须在 signer 切换**之前**改完，否则它们自己就是 `accepted_legacy` 的来源（§11.8.2） |
+| **3c-1B** | signer 开始发 family-specific `kid` + 新 `token_use`/`aud`（状态机 L2）；两把新 HS secret `/site-builder/session-keys/<kid>` + login-flow secret（§11.3）；观察归零后**关闭** legacy 入口（进入 L3，删除仍归 3c-3）；一次真实 HS 轮转演练 R1/R2。**逐条裁定见 §11.8**。**已实施并部署 2026-09-05**（十步 runbook 首次执行完毕；`cf5db89` = ③ 切 signer/T0、`9245703` = ⑤ 进 L3、`03d2a14` = ⑥ v2 经 `previous` 就位、`a2dd16a` = ⑦⑧ 切 v2 + 生产回滚演示、`19c9f7f` = ⑨⑩ 排空判定 + v1 退役含删参数、`a38fee1` = 本次收尾文档）。**注意：④ 观察窗口在首次演练中经操作者裁决跳过**——单人开发账号、只读读数已证实 T0 以来 `accepted_legacy` 三列全 0，且**没有**做"缩短窗口版的 ④"；因此**观察窗口机制的真机证明只有 ⑨ 这一次**，它按满 26 h 等待并 exit 0 通过。三个时刻（**生产实测**）：**T0 = `2026-09-03T13:51:18Z`**、**④ 跳过裁决 = `2026-09-04T01:40:40Z`**、**⑨ 判定 = `2026-09-05T12:31Z`**（T2 + 30h12m，闸下限 T2+26h）。完整时间线与时长在 `site-builder/DEPLOY.md` 的 runbook 首节 | 四个 `verify_*` 与 10 条 E2E 的登录态工具能 mint **带新 `kid` 的 HS token**（否则 signer 一切就全红，读起来像功能坏了）；且必须在 signer 切换**之前**改完，否则它们自己就是 `accepted_legacy` 的来源（§11.8.2） |
 | **3c-2A** | **只改闸门与验收，不动生产签名**：KMS 探测（`kms:Sign` 持有者、key policy 快照、grants、自助授权、公钥指纹）+ 验收入口改造（auth `/fixture-session`、`site-builder-verifier` 角色、**Edge 与 panel 的夹具会话边界规则先于签发器上线**、`ensure_fixture_site.py` 常驻夹具站点、探针 `sign:fixture-issuer` 两个入口，§11.7） | 上一格全绿；本包**自己**先验过红绿（新探测要能真的红） |
 | **3c-2B** | 两把 KMS 非对称 CMK（deployer CDK 栈创建，默认 key policy + IAM 条件，§11.2）；signer 切 `kms:Sign`（`RAW`，§11.5；identity policy 同时授 `kms:GetPublicKey`，§11.2）；三层 kid 绑定校验（§11.6）；verifier 双接受 | **3c-2A 已上线**；五个验收入口拿到**真实登录态**（不再靠读 SSM 明文本地 mint），且验过红绿 |
 | **3c-3** | 退役 HS256、删旧 SSM secret、删 legacy 入口（状态机 L3）、基线**精确 delta** | `accepted_legacy == 0` 且总量非 0 持续超过最长 TTL（§8） |
@@ -510,7 +523,8 @@ L3 只**关闭**了入口，下面这些**都还在**。删的时候按这张表
 
 | 类别 | 精确对象 |
 |---|---|
-| **verifier 的 legacy 分支** | `auth/session.py` 的 `verify_with_legacy` / `verify_session_jwt` / `verify_upgrade_code`；`router/…/origin_request.py` 的 `_verify_legacy_site_session` 与 `LEGACY_ENTRY` 注入点及其分支；`panel/console_session.py` 的 legacy 分支；`auth/verifier_env.py` 的 `legacy_secret()` 与 `legacy_entry` 状态机 |
+| **verifier 的 legacy 分支** | `auth/session.py` 的 `verify_with_legacy` / `verify_session_jwt` / `verify_upgrade_code`；`router/…/origin_request.py` 的 `_verify_legacy_site_session` 与 `LEGACY_ENTRY` 注入点及其分支；`panel/console_session.py` 的 legacy 分支；`auth/verifier_env.py` 的 `legacy_secret()`（**只有这一个在 verifier_env 里**）|
+| **配置加载器里的 legacy 语义** | `auth/session_keys.py`：`legacy_entry()`（`:190`，三个消费方是 `deploy_auth.py` / `deploy_panel.py` / `router/infrastructure/stack.py`）、`legacy_param` 的解析与"允许为空 = L3"那段语义、`ssm_parameter_names()` 里产出 legacy 参数的分支、以及**硬拒 `signer=legacy` + 空 `legacy_param`** 那条组合校验（删 legacy 之后 `signer` 只剩一个合法值，这条校验与 `signer` 开关本身一起消失）|
 | **signer 的 legacy 分支** | `auth/session.py` 的 `mint_session_jwt` / `mint_upgrade_code`；`login_handler.py` 与 `panel/console_session.py` 里 `signer == "legacy"` 那一侧（连同 `test_signer_switch_guard.py` 要求"两侧都在"的那条正对照——删 legacy 侧时这条断言要一起改，否则它会红） |
 | **密钥取值路径** | `login_handler._secret("JWT_SECRET")` 这条 `{name}_PARAM` 用法；`deploy_auth` / `deploy_panel` 下发的 `JWT_SECRET_PARAM` 与角色 SSM 清单里那一项（**panel 的写前核对清单含它、auth 的不含**，见 `docs/adr/0004-*.md`）；`router/infrastructure/stack.py` 的 `load_jwt_secret()` 与 `{{JWT_SECRET}}` 注入点 |
 | **SSM 参数本体** | `/site-builder/jwt-secret`（**删它才让 A 组的"可读密钥"真正少一把**；`facts.edge_code_targets_carrying_live_key` 与 `edge_assets_carrying_live_key` 也要到这一步之后才可能归零——历史 Edge 版本与 bootstrap asset 里的副本随版本过期而消失） |
@@ -1118,7 +1132,7 @@ Lambda/IAM 写调用之前。
 | key policy 权威性与自锁警告 | KMS 开发者指南 *Key policies* / *Default key policy* / `PutKeyPolicy` API |
 | `RSA_2048` 非对称请求与对称同价、ECC 贵 5 倍、非对称不含免费额度 | AWS Pricing API（只读）+ KMS pricing 页 |
 | 纯 Python RS256 验签 0.24 ms、ES256 4.5 ms | 本机实测，1000 次取平均 |
-| Edge vendored `cryptography`：最终形态复测 128 MB 冷路径总差中位数 **+143.3 ms** / p95 **+147.1 ms**（闸 300 / 600），热调用验签 +0.12 ms；第一轮（PEM 解析在 handler 里、只看 Init 差）总差 300.14 ms 的判读已作废 | `site-builder/scripts/spike_edge_crypto_coldstart.py` + `spike_edge_crypto_requirements.txt`（tracked，一次性 Lambda、跑完自删；2026-09-02 两轮各 80 次冷启动）→ 原始输出 `docs/design/3c-spike/edge-crypto-coldstart-20260902T{093211,102034}Z.json`（gitignored） | `site-builder/scripts/spike_edge_crypto_coldstart.py`（tracked，一次性 Lambda、跑完自删；2026-09-02，80 次冷启动）→ 原始输出 `docs/design/3c-spike/edge-crypto-coldstart-20260902T093211Z.json`（gitignored） |
+| Edge vendored `cryptography`：最终形态复测 128 MB 冷路径总差中位数 **+143.3 ms** / p95 **+147.1 ms**（闸 300 / 600），热调用验签 +0.12 ms；第一轮（PEM 解析在 handler 里、只看 Init 差）总差 300.14 ms 的判读已作废 | `site-builder/scripts/spike_edge_crypto_coldstart.py` + `spike_edge_crypto_requirements.txt`（tracked，一次性 Lambda、跑完自删；2026-09-02 两轮各 80 次冷启动）→ 原始输出 `docs/design/3c-spike/edge-crypto-coldstart-20260902T{093211,102034}Z.json`（gitignored） |
 | Edge 跨区调用 热 229 ms / 冷 719 ms | 本仓库既有实测（CLAUDE.md 埋点预算） |
 
 ### 12.1 产物位置：**分三层，前两层 tracked**
