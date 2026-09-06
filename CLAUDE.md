@@ -4,78 +4,34 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目是什么
 
-Quick 自动化建站平台（Site Builder）：业务人员在任意支持 Skill+MCP 的 Agent 客户端（Claude Code / Quick Desktop）用自然语言开发简易全栈站点，一句"部署"得到 `https://app-{site_id}.{base_domain}` 的可分享 URL。站点访问与管理权限绑定飞书账号（身份源可换成任意能给 email claim 的 Cognito 联邦 IdP）。
+Quick 自动化建站平台（Site Builder）：业务人员在任意支持 Skill+MCP 的 Agent 客户端（Claude Code / Quick Desktop）用自然语言开发简易全栈站点，一句"部署"得到 `https://app-{site_id}.{base_domain}` 的可分享 URL。站点访问与管理权限绑定一个能给 email claim 的 Cognito 联邦 IdP（飞书是参考适配器）。
 
-### 本项目的交付物是可分发资产，不是这个测试环境
+### 本项目的交付物是可分发资产，不是任何一个具体环境
 
-当前 AWS 账号与部署只是**开发验证环境**。最终产物是 `site-builder/` 与 `router/` 这套资产（边界按"部署所需"划，不按目录名；`site-builder/policies/` 的 SCP 样例是可选制品）—— 其它 AWS 用户拿到它后能独立部署和使用。
+本仓库作者用来验证的 AWS 账号与部署只是**验证环境**。交付物是 `site-builder/` 与 `router/` 这套资产（边界按"部署所需"划，不按目录名；`site-builder/policies/` 的 SCP 样例是可选制品）—— 其它 AWS 用户拿到它后能独立部署和使用。词表见 `CONTEXT.md`「交付与分包」，决策见 `docs/adr/0005-*.md`。
 
 **这意味着每次改动要过一道心理检查：**
 
 > "如果一个全新用户在全新账号上 clone 这个仓库，这次改动对他有意义吗？"
 
 - **有意义的**：最终状态的代码、配置模板、部署手册、spec/ADR 里的设计决策与教训。
-- **没意义的**：测试环境的中间迁移步骤、过渡脚本、临时修复路径、"从部署 1 升级到部署 2"的操作记录——最终用户直接到部署 2，中间过程不需要再走。
+- **没意义的**：验证环境的中间迁移步骤、过渡脚本、临时修复路径、"从部署 1 升级到部署 2"的操作记录——最终用户直接到部署 2，中间过程不需要再走。
 
-对后一类，该记的教训提炼进 spec/ADR（标明"单账号实测"的证据强度），其余留在 gitignored 的过程文件里，**不进版本库、不进交付文档**。
+对后一类，该记的教训提炼进 spec/ADR（标明"单账号实测"的证据强度），其余留在 gitignored 的过程文件里，**不进版本库、不进交付文档**。**本文件也在这条规则之内**：验证环境"现在到哪了"（部署日期、当前配置形态、进度）不写在这里，只住 gitignored 的接手点文件（`.scratch/<feature>/NEXT.md`，新 clone 里不存在）与 spec 的状态列。
 
 已有的硬约束继续生效：不硬编码账号值、config.ini 是唯一取值来源、实测数据只进 gitignored 文件或 spec 注释（标明来源与强度）。
 
-**当前状态：一期、二期与加固包都已在真实 AWS 部署。** 二期含
-`console.{base_domain}` 自助管理控制台、API Key 交换层、访问统计聚合；站点更新走
-blue/green 原子切换（M7）。加固包（跨租户 IAM 隔离 / 权限数据洗白 / token 用途混用 /
-同名 cookie 遮蔽 DoS，即 merged review §9 优先级表里的 M01/M02/M05/M06 四条）已按
-`site-builder/DEPLOY.md` 的「S1 加固」一节部署并过全部闸门，**含真机行为探针**
-（`verify_session_token_semantics.py`）。
+### 资产包含什么
 
-**会话签名的 3c-1A 与 3c-1B 也已部署**（2026-09-02 / 2026-09-05）：会话 token 现在带 `kid`，
-每个 key family（site / console）一把 `*-hs-v2` 作 `current`、`previous` 空；**legacy 共享密钥
-那条入口已关闭（L3），三处 verifier 都不再接受它**——但它**仍然是 HS256 对称密钥**，
-只是换成了两把、有版本、可轮转（十步 runbook 首次执行完毕，含一次真实 v1→v2 轮转与生产
-回滚演示）。**legacy 的代码路径与 `/site-builder/jwt-secret` 参数还没删，归 3c-3**（精确清单在
-那份 spec 的 §6.2）。**§9 表里其余各条还没做；2026-09-06 起 2A/2B/3 合为 3c-final、验证环境硬切换、HS 不进资产**（spec §11.9、ADR 0005；工单在 `.scratch/asset-v1/`）。
+一期建站链路、二期的 `console.{base_domain}` 自助控制台、API Key 交换层（可选组件）、访问统计聚合、站点更新的 blue/green 原子切换，以及加固包（merged review §9 里的 M01 跨租户 IAM 精确 ARN 隔离、M02 权限数据 fail-closed、M05 token 用途绑定、M06 同名 cookie 遮蔽的 DoS 关闭）。会话签名带 `kid`，每个 key family（site / console）各有 `current` 与 `previous` 两个槽位，可轮转；legacy 共享密钥入口由 `[SessionKeys] legacy_param` 与 `signer` 控制——**`config.ini.example` 出厂是 `signer = legacy` + legacy 入口开着**（状态机 L1），关闭它要按 DEPLOY.md 的轮转 runbook 走到 L3。**密钥形态是 HS256 对称**，非对称化（KMS）是 spec 里已裁定、编号 3c-final 的包，见文档地图。
 
-**所以本文件的架构描述与线上是一致的**（包括下面「站点代码按不可信对待」那条写的
-「禁止 `site-data-{site_id}-*` 前缀通配」——存量 per-site 角色已全部收敛成精确表
-ARN，通配已清零）。不再需要"读文档时减去一层"。
+### 三条设计边界，别当成已解决
 
-> **三条仍然成立的边界，别当成已解决**（第三条在 3c-1A/1B 之后**依然成立**，理由见该条末尾）：per-site IAM 的 `dsql:DbConnect` 仍是
-> `Resource: *`（DSQL 的租户隔离在 PG 层——per-site schema + 非 admin role，不在 IAM
-> 层，这是既定设计而非残留）；同名 cookie 遮蔽只关掉了 DoS，**没关身份混淆**
-> （攻击者持有另一个**合法** token 时仍会先被取到，根治是 host-only 会话，独立成包）；
-> **平台的安全边界就是这个 AWS 账号**——账号内任何具备只读级权限的 principal 都能取得
-> HS256 会话密钥（**三条路**：Edge 产物里是明文（含历史已发布版本）、同一份产物在 CDK
-> bootstrap S3 桶里还有一批带活密钥的 asset、SSM 参数有**四个**动作都能读出明文而
-> KMS 那道是虚的），从而以任意用户身份访问任意
-> 站点**与控制台写接口**。**3c-1A/1B 没有改变这一条**：密钥换成了两把带 `kid` 的
-> `*-hs-v2` 且可轮转，但仍是**对称**的 ⇒ 读到就能签。**前两条路（Edge 产物、bootstrap asset）
-> 的数量**由 `docs/security/account-trust-boundary.md` 的基线断言表给（第三条"SSM 的四个动作"
-> 是枚举而非计数，写在那份文档的正文里，不由基线断言）（**本文件不记那些数字**：
-> asset 那行每部署一次 Edge 就 +1、代码目标那行随历史版本过期而降，写死必过时；
-> 有一条单测按标记核对文档与基线一致）。**别按 merged review 里 M09 第 2 步的原话去收窄 invoke，
-> 那是假修复**（同一批身份还握着密钥读取与自助提权）。两条真修复：账号内改
-> **非对称签名**（Edge 只放公钥）能关掉只读那批——**它已经在做了**，3c-1A/1B 已部署
-> （verifier 认 kid、signer 发 kid、legacy 入口已关、一次真实轮转），但**签名还是对称的**，
-> 真正把只读那批关掉的是 3c-final（原 2A/2B/3 合一，spec §11.9），已获实施授权、尚未开始；
-> 迁**独立成员账号**移出管理身份那条已降为给采用者的部署建议（ADR 0005）。
-> 实测数字、为什么 SCP/resource policy/对称签名都不成立、以及盯住暴露面别再变大的
-> 闸门（**已收缩成 A 直接失守 + B IAM 写静态快照两层，C 站点 route/alias 可达性移出归
-> 部署验收**；真修复顺序：收窄 CodeBuild 对 bootstrap 桶的读权限（**§9 的 3b，
-> 2026-08-27 已部署**：那条整桶读整条消失，A 62→61、可读密钥 57→56、
-> `platform-overbroad` 清零）→ 非对称签名 → 迁独立账号，见 merged review §9 的
-> 3b/3c/3d），
-> 见 `docs/security/account-trust-boundary.md`。**那份文档里还有一条值得单独记住**：
-> 跑不可信站点依赖安装的 CodeBuild 角色**曾经**能读到那把密钥（CDK 给
-> `BuildSpec.from_asset()` 自动授的整桶读）——**2026-08-27 已收窄，它现在对 bootstrap 桶
-> 零权限**，S3 权限全集由检查器按等值断言（`deployer/tests/security_contracts.py`）。
-> 但 `**--ignore-scripts` 仍然必须留着**，因为构建容器里任意代码执行仍能读
-> `validated/*`、写 `artifacts/*`。
-> **那条隔断分两层，别记成"只有一条 flag"**：站点**自己的** `package.json` 生命周期脚本与
-> `backend/.npmrc` 由合同校验器在 CodeBuild **之前**就拒（`contract/redlines.py` 的
-> `NPM_LIFECYCLE_KEYS`）；但**依赖里**的生命周期脚本**只有** `buildspec-package.yml` 的
-> `npm install --ignore-scripts` 一道——`_scan_package_json` 从不检查 `dependencies`，
-> 而 `.tgz` 依赖根本不在扫描后缀里（实测：带 `preinstall` 的包打成本地 `.tgz` 作依赖，
-> `npm install` 会执行它，加上 `--ignore-scripts` 不会）。
+- per-site IAM 的 `dsql:DbConnect` 是 `Resource: *`。DSQL 的租户隔离在 PG 层（per-site schema + 非 admin role），不在 IAM 层，这是既定设计而非残留。
+- 同名 cookie 遮蔽只关掉了 DoS，**没关身份混淆**：攻击者持有另一个**合法** token 时仍会先被取到。根治是 host-only 会话，独立成包。
+- **在 HS256 形态下，平台的安全边界就是 AWS 账号本身**。账号内任何具备只读级权限的 principal 都能取得会话密钥（三条路：Edge 产物里是明文，含历史已发布版本；同一份产物在 CDK bootstrap S3 桶里还有带活密钥的 asset；SSM 参数有四个动作都能读出明文），从而以任意用户身份访问任意站点**与控制台写接口**。密钥带 `kid`、可轮转都不改变这一条：对称 ⇒ 读到就能签。AWS 托管策略 `ReadOnlyAccess` 就含 `ssm:Get*` 与 `lambda:GetFunction`，所以资产在采用者的共享账号里必须按这个威胁模型设计——这正是 3c-final（KMS 非对称、Edge 只放公钥）存在的理由。**别按 merged review 里 M09 第 2 步的原话去收窄 invoke，那是假修复**（同一批身份还握着密钥读取与自助提权）。实测数字、为什么 SCP / resource policy / 对称签名都不成立、以及盯住暴露面别再变大的闸门（A 直接失守 + B IAM 写静态快照两层；C 站点 route/alias 可达性归部署验收），见 `docs/security/account-trust-boundary.md`。**本文件不记那些数字**：它们每部署一次 Edge 就变，写死必过时；有一条单测按标记核对文档与基线一致。
+
+**CodeBuild 那道隔断分两层，别记成"只有一条 flag"**：跑不可信站点依赖安装的 CodeBuild 角色对 bootstrap 桶零权限（S3 权限全集由 `deployer/tests/security_contracts.py` 按等值断言），但 `--ignore-scripts` 仍然必须留着，因为构建容器里任意代码执行仍能读 `validated/*`、写 `artifacts/*`。站点**自己的** `package.json` 生命周期脚本与 `backend/.npmrc` 由合同校验器在 CodeBuild **之前**就拒（`contract/redlines.py` 的 `NPM_LIFECYCLE_KEYS`）；**依赖里**的生命周期脚本**只有** `buildspec-package.yml` 的 `npm install --ignore-scripts` 一道——`_scan_package_json` 从不检查 `dependencies`，而 `.tgz` 依赖根本不在扫描后缀里（实测：带 `preinstall` 的包打成本地 `.tgz` 作依赖，`npm install` 会执行它，加上 `--ignore-scripts` 不会）。
 
 **具体进度与闸门数字不写在本文件**（会过时）：确切数字靠下面的测试命令自己跑；
 **待办与优先级**见 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9
@@ -127,16 +83,15 @@ cd "$(git rev-parse --show-toplevel)"
 ——所以缺陷在"测试能访问站点"上完全看不出来）。**venv 的默认信任库是不是空的取决于
 母解释器**：python.org 那种构建下是 0 个 CA（原始事故现场，跑了 21 分钟才炸），
 Homebrew 的 `python@3.12` 指向 `/opt/homebrew/etc/openssl@3/cert.pem`，venv 里有
-198 个（2026-09-01 换机器实测）。**只设 `SSL_CERT_FILE` 不够**：`HTTPSHandler`
+198 个（换机器实测）。**只设 `SSL_CERT_FILE` 不够**：`HTTPSHandler`
 在构造时就把上下文定格了。现在由 fixture 自动修好，守卫
 （`test_deploy_fixture_flags.py` 里那三条 `*ssl*`）**自己把"空信任库下 import"这个
 前提造出来**，所以在两种解释器上验的都是同一个缺陷。看到
 `CERTIFICATE_VERIFY_FAILED` 时**别当成网络/证书故障**去查代理和防火墙——先确认是不是
 又碰到了这个上下文。
 
-**MCP 的上面那条用宿主机依赖，不等于容器里的依赖**（实测宿主 mcp 1.26.0 /
-boto3 1.43.25，而 `mcp/requirements.txt` 锁的是 1.29.0 / 1.43.64）。
-改过锁定清单、或要确认"部署出去的那套依赖也全绿"时跑：
+**MCP 的上面那条用宿主机依赖，不等于容器里的依赖**（宿主的 mcp / boto3 版本与
+`mcp/requirements.txt` 锁的通常不同）。改过锁定清单、或要确认"部署出去的那套依赖也全绿"时跑：
 
 ```bash
 site-builder/mcp/run_locked_tests.sh    # 建 py3.13 venv + --require-hashes 装锁定依赖再跑
@@ -153,48 +108,43 @@ venv 的 shebang 是绝对路径：仓库被移动/克隆到新路径后必须
 `python3 -m venv --clear .venv` 重建（不带 `--clear` 不会重写 shebang，一直报
 bad interpreter）。
 
-E2E（需要真实 AWS 部署 + config.ini 已回填）：
+E2E 与真机闸门（需要真实 AWS 部署 + config.ini 已回填）：
 
 ```bash
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/test_e2e_fixtures.py -q   # **10 条**，实测约 37 分钟
-# ↑ 别按「4 个 fixture / 约 6 分钟」记（那是旧数字）。它超过很多工具的单次超时上限，
-#   中途被杀会让 autouse 的清理 fixture 跑不完 ⇒ 留下真站点。要后台跑或调大超时。
+# ↑ 它超过很多工具的单次超时上限，中途被杀会让 autouse 的清理 fixture 跑不完 ⇒ 留下真站点。
+#   要后台跑或调大超时。
 bash site-builder/scripts/smoke_router.sh    # 路由层冒烟（会写测试数据，跑完清理；含 65s 等 Edge 缓存）
 python3 site-builder/scripts/verify_console_e2e.py      # 控制台端到端
-python3 site-builder/scripts/verify_analytics_e2e.py    # 统计端到端（二期 M5）
-python3 site-builder/scripts/verify_kid_entry_live.py   # 新入口真机正/负向（只发 GET；--self-test 不碰 AWS）
-# ↑ 3c-1B 起还有两个旗标，轮转时用：`--role current|previous`（正向，会消费一枚升级码）、
+python3 site-builder/scripts/verify_analytics_e2e.py    # 统计端到端
+python3 site-builder/scripts/verify_kid_entry_live.py   # 会话入口真机正/负向（只发 GET；--self-test 不碰 AWS）
+# ↑ 轮转时用两个旗标：`--role current|previous`（正向，会消费一枚升级码）、
 #   `--retired-token FILE`（负向，期望 Edge 302 / panel 401 且 outcome=unknown_kid）。
 #   FILE 由 `_session_mint.py --save` 预存，**只许写进 .scratch/**（gitignored，token 是活凭证）。
 python3 site-builder/scripts/session_verify_counts.py --hours 1 --require-total   # 三处 session_verify 埋点读数（只读；任一 verifier 为 0 即退 1）
-# ↑ 轮转的两道 26h 时间闸就是它，三条判据全由脚本下、exit 0 才算过（3c-1B ticket 18 起）：
-#   `--drain-gate previous`（④ 判 legacy 用 `--drain-gate legacy`）。**四条判据锁在脚本里**
-#   （窗口 ≥ 26 h、每处总量 > 0、目标列三列全 0、accepted_current 三列全 > 0），
-#   因为手写那四个旗标少任何一个都是静默放宽——空窗口下裸 `--require-zero` 会退 0，
-#   而下一步是不可逆的删参数。判据说明见 DEPLOY.md 的十步 runbook
-# 账号信任边界的漂移闸门（只读；A 直接失守 + B IAM 写静态快照两层；400 个 principal × 2 次
-# IAM 模拟 + **两次** GetAccountAuthorizationDetails（第二次是模拟后的**窗口两端一致性
-# 复查**——两端不一致就作废本轮、不出结论也不写基线。它**不保证原子**：只覆盖 principal
-# 层，且只证明两端相等，三个已接受盲区见 docs/security/account-trust-boundary.md）
-# + 扫 bootstrap 桶，实测 11±1 分钟：11m33s / 10m57s 两次）
+# ↑ 轮转的排空闸门是 `--drain-gate previous`（legacy 用 `--drain-gate legacy`），四条判据锁在脚本里
+#   （窗口 ≥ 26 h、每处总量 > 0、目标列三列全 0、accepted_current 三列全 > 0），exit 0 才算过。
+#   手写那四个旗标少任何一个都是静默放宽——空窗口下裸 `--require-zero` 会退 0，而下一步是不可逆的删参数。
+#   判据说明见 DEPLOY.md 的轮转 runbook
+# 账号信任边界的漂移闸门（只读；A 直接失守 + B IAM 写静态快照两层；几百个 principal × 2 次
+# IAM 模拟 + **两次** GetAccountAuthorizationDetails——第二次是模拟后的**窗口两端一致性复查**，
+# 两端不一致就作废本轮、不出结论也不写基线；它**不保证原子**，只覆盖 principal 层、只证明两端相等，
+# 三个已接受盲区见 docs/security/account-trust-boundary.md）+ 扫 bootstrap 桶，实测约 11 分钟
 python3 site-builder/scripts/verify_account_trust_boundary.py
 # 密钥增减必须**声明**，否则一律红：`--new-key LABEL` / `--retire-key LABEL`
-# （LABEL ∈ 已配置 kid ∪ {legacy, login-flow}）。声明现在管**两件**事（3c-1B-G A6）：
+# （LABEL ∈ 已配置 kid ∪ {legacy, login-flow}）。声明管**两件**事：
 #   ① grant delta → `migration_grants`（绿）。**前置条件是该 principal 原本就能读到某把
 #      会话密钥**——"原先读不到、现在能读"是能力面真的变大，声明不该抹掉它，**这是刻意的**；
 #   ② coverage 成员迁移 → `migration_undecided`（绿）。成员是**可分解**形态
-#      `指纹|动作类|资源类,…`（基线 schema 5），判据是把被声明 key 的资源类从**基线与本次两侧**
-#      剔掉再比：相等才整批落绿，**剔完仍多出来的照红**。两侧都剔才同时覆盖新增（类只在本次有）
-#      与退役（类只在基线有）——第一版只在本次观测上剔，⑩ 的 `--retire-key` 声明过照样 305 条红。
-#      此前声明只管 ①，于是每把 key 的增减都只能人工 --update-baseline——正是 spec §11.8.7 否决的工作流。
-# `--update-baseline` **先打印一遍比较报告再写；报告生成不了就不写**（原先在比较之前就 return
-# ⇒ "接受了什么"不留痕；后来又曾 `except SystemExit` 照写 ⇒ 普通闸门里的硬失败在这条命令下
-# 变成静默放行）。用 `--dump-observed` 一次扫描 + 多条 `--from-dump` 省掉第二个 11 分钟，
-# 声明不进快照、比较时才归一化 ⇒ 同一份快照可按不同声明重比；**只有一条只在实测路径上评估**：
-# login-flow 那条硬断言（快照刻意不含它）。
+#      `指纹|动作类|资源类,…`，判据是把被声明 key 的资源类从**基线与本次两侧**剔掉再比：
+#      相等才整批落绿，**剔完仍多出来的照红**。两侧都剔才同时覆盖新增（类只在本次有）与退役（类只在基线有）。
+# `--update-baseline` **先打印一遍比较报告再写；报告生成不了就不写**——这条命令的语义是
+# "我知道并接受这些变化"，接受了什么必须留痕。用 `--dump-observed` 一次扫描 + 多条 `--from-dump`
+# 省掉第二个 11 分钟（dump 含真实角色名，落 .scratch/，按 0600 写）；声明不进快照、比较时才归一化
+# ⇒ 同一份快照可按不同声明重比；**只有一条只在实测路径上评估**：login-flow 那条硬断言（快照刻意不含它）。
 ```
 
 `site-builder/scripts/verify_*` 是真机闸门（部署后跑，不是单测）。**本文件不记数量与
@@ -203,12 +153,12 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 **这些脚本一律用 `python3` 跑（不带路径的那个），不要借 `deployer/.venv/bin/python3`。**
 两个前提，缺任一都不是"配置没写对"的症状：
 
-- `**python3` 必须 ≥ 3.10。** 26 个 `scripts/*.py` 里有 10 个（含 5 个 `verify_*` 闸门与
-`deploy_pool.py`）用了 `X | None` 标注却没写 `from __future__ import annotations`，
-在 3.9 上**函数定义那一刻**就 `TypeError: unsupported operand type(s) for |`。
-macOS 自带的 `/usr/bin/python3` 是 3.9 ⇒ 直接跑不了，见下面「换机器 / 新 clone」。
-- **CA 信任库要能用。** 靠 `**pip-system-certs**`（装完会在 site-packages 放一个
-`pip_system_certs.pth`，import 期把 `ssl` 的默认上下文换成读 macOS keychain 的那个；
+- **`python3` 必须 ≥ 3.10。** `scripts/*.py` 里有一批（约三分之一，含 `verify_*` 闸门）用了 `X | None` 标注却没写
+`from __future__ import annotations`，在 3.9 上**函数定义那一刻**就
+`TypeError: unsupported operand type(s) for |`。macOS 自带的 `/usr/bin/python3` 是 3.9
+⇒ 直接跑不了，见下面「仓库外的几样东西」。
+- **CA 信任库要能用。** 靠 **`pip-system-certs`**（装完会在 site-packages 放一个
+`pip_system_certs.pth`，import 期把 `ssl` 的默认上下文换成读系统 keychain 的那个；
 它内部用 truststore，所以**直接 `import truststore` 是失败的、`cert_store_stats()` 会抛
 `NotImplementedError`——这两个现象都正常，不是坏了**），缺它的症状是每一次 HTTPS 都
 `CERTIFICATE_VERIFY_FAILED`，读起来像网络/代理故障。
@@ -218,7 +168,7 @@ macOS 自带的 `/usr/bin/python3` 是 3.9 ⇒ 直接跑不了，见下面「换
 而闸门脚本不该依赖这个差异。`python3` 那条路是确定的。
 
 `verify_analytics_e2e.py` 会自建 fixture 站点、发真实请求、跑一次 rollup 再清理，
-其中 MCP 那一段要求**用户 OAuth token 是新鲜的**（二期把 refresh TTL 收到 1 天）；
+其中 MCP 那一段要求**用户 OAuth token 是新鲜的**（refresh TTL 为 1 天）；
 过期时要先在浏览器里登录一次（`node site-builder/clients/quick-desktop-proxy/auth.js`）。
 三个 verify 脚本共用 `site-builder/scripts/_mcp_client.py`（MCP 客户端 + token 读取，
 `verify_analytics_e2e.py` / `verify_api_key_e2e.py` / `verify_oauth_and_impersonation.py`）
@@ -251,7 +201,7 @@ python3 site-builder/scripts/ensure_session_keys.py
 # MCP（buildx ARM64 → ECR → AgentCore runtime；--skip-build 只改配置）
 (cd site-builder/mcp && python3 deploy_agentcore.py)
 
-# API Key 交换层 key-proxy（二期 M4，**可选组件**；无 [ApiKey] 段时打印跳过并返回 0）
+# API Key 交换层 key-proxy（**可选组件**；无 [ApiKey] 段时打印跳过并返回 0）
 # 顺序：deploy_pool → deployer 栈 → deploy_agentcore → 本脚本 → deploy_panel
 (cd site-builder/key-proxy && python3 deploy_key_proxy.py)
 
@@ -259,7 +209,7 @@ python3 site-builder/scripts/ensure_session_keys.py
 # --skip-frontend 只改后端。改前端后必须重跑（不带该开关）才会上传。
 (cd site-builder/panel && python3 deploy_panel.py)
 
-# 存量站点迁移到 blue/green（M7；**只有存量环境需要**，新账号不必跑）
+# 存量站点迁移到 blue/green（**只有存量环境需要**，新账号不必跑）
 # 默认 dry-run 只打印计划，--apply 才写；--site-id 可单点重跑。
 # static 站点会被报成 skipped（没有后端 Lambda，不参与 blue/green）——那不是失败。
 python3 site-builder/scripts/migrate_sites_to_blue_green.py            # 看计划
@@ -277,22 +227,22 @@ python3 site-builder/scripts/gen_onboarding.py
 
 ```
 ① 建站 Skill (site-builder/skills/)  ← Agent 客户端加载的"部署合同"说明书
-        ↓ MCP 调用（OAuth 带飞书身份）
+        ↓ MCP 调用（OAuth 带 IdP 身份）
 ② 部署 MCP (site-builder/mcp/)       ← AgentCore Runtime，9 工具全部秒级返回
         ↓ 条件迁移 PENDING→RUNNING + 启动 SFN
 ③ 异步执行器 (site-builder/deployer/) ← Step Functions 10 步：validate → provision-db
         ↓ 写路由表                       → CodeBuild 打包 → 站点 Lambda → 前端 S3 → 路由 → 冒烟
 ④ 路由+鉴权层 (router/)              ← CloudFront *.{domain} + Lambda@Edge
         ↓ 未登录 302                     查路由表 → 验会话 JWT → 注入 x-user-email → 分流
-                                         顺带写一行访问明细（只页面级、只 `app-` 前缀；二期 M5）
-⑤ 身份层 (site-builder/auth/)        ← Cognito(联邦到飞书) + 登录服务 + pre-token 触发器
+                                         顺带写一行访问明细（只页面级、只 `app-` 前缀）
+⑤ 身份层 (site-builder/auth/)        ← Cognito(联邦到 OIDC IdP) + 登录服务 + pre-token 触发器
 
-交换层 (site-builder/key-proxy/)      ← mcp.{domain}，二期 M4 的**可选**组件
+交换层 (site-builder/key-proxy/)      ← mcp.{domain}，**可选**组件
    给只能配静态 Header 的 MCP 客户端一条路：验 X-API-Key → 换组件自身的机器
    token → 不懂协议地透明转发到 ②，只多一个 X-SB-On-Behalf-Of 头告诉 ② 以谁
    的身份行事。config.ini 无 [ApiKey] 段 = 整个组件不存在（推荐默认）
 
-控制台 (site-builder/panel/)          ← console.{domain}，二期 M3；**建站仍只在 Agent 里**
+控制台 (site-builder/panel/)          ← console.{domain}；**建站仍只在 Agent 里**
    走 ④ 的 split 路由：/api/* → panel Function URL(AWS_IAM 仅 edge role)，其余 → S3
    自助改权限/协作者/所有权/看部署历史/下线；管理员另有全局视图与 admin 名单
    写接口要"面板会话"（__Host-sb_console，由 auth 的 /console-session 发一次性 code 换取）
@@ -321,8 +271,7 @@ decodeURIComponent）。**CloudFront 全站禁缓存是鉴权正确性前提**
 （`auth/pre_token_email.py`）注入——MCP 网关只收 access token
 （id_token 会 401，不要把 authorizer 改成 allowedAudience）。
 - **Lambda@Edge 不支持环境变量**：Edge 函数的配置（表名、JWT 密钥）由 CDK
-部署时字符串替换注入（`{{PLACEHOLDER}}` 形态）。SSM 读取失败时 **synth 直接失败、什么都不部**
-（3c-1B ticket 19 起；此前只打一行 `SYNTH-ONLY-PLACEHOLDER` 警告而 `cdk deploy` 照样 exit 0）；
+部署时字符串替换注入（`{{PLACEHOLDER}}` 形态）。SSM 读取失败时 **synth 直接失败、什么都不部**；
 占位符只在显式 `APP_SYNTH_OFFLINE=1` 下出现，那种模板不可部署，`verify_deployed_edge.sh` 会抓。
 
 ## 不可破坏的系统不变量
@@ -336,37 +285,35 @@ decodeURIComponent）。**CloudFront 全站禁缓存是鉴权正确性前提**
 `PLATFORM_SUBDOMAINS`；不得从 route owner 或其他权限投影字段推导平台身份。
 - **站点 origin 不可信。** 平台 cookie、`x-user-*` 与平台标记在到达站点前必须剥除；
 可信身份头只能由 Edge 验签后重新注入。
-- **auth/session 与 Edge verifier 是跨部署单元的同一契约**（3c-1A 起含 `[SessionKeys]` 的 allowlist：`session.verify_with_legacy` 与 Edge 的 `_verify_session_jwt` 字节等价，Edge 只持 site family、panel 只持 console）。claim、算法或密钥形态变化
+- **auth/session 与 Edge verifier 是跨部署单元的同一契约**（含 `[SessionKeys]` 的 allowlist：`session.verify_with_legacy` 与 Edge 的 `_verify_session_jwt` 字节等价，Edge 只持 site family、panel 只持 console）。claim、算法或密钥形态变化
 必须同步 auth、panel、Edge、跨组件测试和部署顺序。
 **顺序有两个方向，别照抄错**：**新建部署**是 `auth 先于 router`（依赖——router 栈 synth 时
 要从 SSM 读密钥字符串替换注入 Edge）；**切换/轮转**必须 **verifier 先行**（速度差——auth/panel
 读 SSM 5 分钟就切，Edge 要重部 + 10–20 分钟全球复制；signer 先切 = 新 cookie 在旧边缘节点
 验签失败，症状与"密钥读取失败"一模一样）。切换的完整协议是 `site-builder/DEPLOY.md`
-「轮转会话密钥：十步 runbook」。
+「轮转会话密钥」一节。
 - **异步调用结果未知时保留恢复状态。** 网络超时不等于请求未受理；不得在结果不确定时
 释放租约、回滚为可重试状态或允许新的部署/下线并发进入。
 
 ## 跨组件改动矩阵
 
-
-| 改动                                         | 必须同步检查                                                                                                                                                                                                                                               |
-| ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `contract/` schema/redlines                | validator、Skill references、fixtures、生成模板                                                                                                                                                                                                             |
-| `permissions.py`                           | deployer tests、panel、key-proxy、MCP、三个产物重部                                                                                                                                                                                                            |
-| `auth/session.py`                          | auth 调用方、panel copy、Edge verifier、auth→Edge 向量                                                                                                                                                                                                       |
-| `origin_request.py`                        | router tests、origin-response 对称契约、CDK asset、Edge 部署                                                                                                                                                                                                  |
-| 路由权限字段                                     | permissions、register/resync、补偿恢复、Edge 反序列化                                                                                                                                                                                                           |
-| DynamoDB/DSQL 资源                           | runtime inline policy、boundary、undeploy、backfill、IAM 模拟                                                                                                                                                                                              |
-| `[SessionKeys]`（`auth/session_keys.py`）    | `config.ini.example`、`ensure_session_keys.py`、`deploy_auth`/`deploy_panel` 的 env 与 role SSM 清单、`router/infrastructure/stack.py` 注入、闸门 `session_key_params`、`verify_deployed_edge.sh`、`verifier_env.py`（auth 拥有、panel 复制）                             |
-| `[SessionKeys] signer`（`legacy`|`current`） | auth 与 panel 的 `SESSION_SIGNER`（两个组件各自部署 ⇒ 切换有先后：**panel 先、auth 后**）、`verifier_env.signer_mode()`、两个 handler 的签发分支与 AST 守卫。**验签侧与它无关**（verifier 全程双接受）⇒ 回滚 = 改这一行重部 auth+panel，不动 Edge、不回退代码                                                         |
-| `[SessionKeys] legacy_param` 清空（L3）        | `legacy_entry()` 变 off、auth/panel 不再下发 `JWT_SECRET_PARAM` 且角色 SSM 清单不含它、`stack.py` 给 Edge 注入空串（**空串不是 SYNTH 占位符**）、闸门 `--retire-key legacy`。清空前 `signer` 必须已是 `current`（加载器硬拒该组合）                                                                    |
-| `[SessionKeys] login_flow_secret_param`    | 只进 auth（`LOGIN_FLOW_SECRET_PARAM` + 角色清单），`login_handler._login_flow_sig` 是唯一读取点；`ensure_session_keys.py` 创建、`deploy_auth.ensure_secret` 兜底（**不进写前核对清单**，见 `docs/adr/0004-*.md`）；panel 有三条负向断言锁死它永不持有；闸门记成 grant `read-login-flow-secret` 且**不算冒充面** |
-| 验收工具的本地 mint（`scripts/_session_mint.py`）   | 六处调用方（四个 `verify_*`、`verify_kid_entry_live.py`、E2E 的会话 cookie fixture）。改它等于同时改六个验收面；3c-2A 会把它整体换成夹具签发器，所以**本地 mint 只许存在于这一个模块里**                                                                                                                     |
-
+| 改动 | 必须同步检查 |
+|---|---|
+| `contract/` schema/redlines | validator、Skill references、fixtures、生成模板 |
+| `permissions.py` | deployer tests、panel、key-proxy、MCP、三个产物重部 |
+| `auth/session.py` | auth 调用方、panel copy、Edge verifier、auth→Edge 向量 |
+| `origin_request.py` | router tests、origin-response 对称契约、CDK asset、Edge 部署 |
+| 路由权限字段 | permissions、register/resync、补偿恢复、Edge 反序列化 |
+| DynamoDB/DSQL 资源 | runtime inline policy、boundary、undeploy、backfill、IAM 模拟 |
+| `[SessionKeys]`（`auth/session_keys.py`） | `config.ini.example`、`ensure_session_keys.py`、`deploy_auth`/`deploy_panel` 的 env 与 role SSM 清单、`router/infrastructure/stack.py` 注入、闸门 `session_key_params`、`verify_deployed_edge.sh`、`verifier_env.py`（auth 拥有、panel 复制） |
+| `[SessionKeys] signer`（`legacy`\|`current`） | auth 与 panel 的 `SESSION_SIGNER`（两个组件各自部署 ⇒ 切换有先后：**panel 先、auth 后**）、`verifier_env.signer_mode()`、两个 handler 的签发分支与 AST 守卫。**验签侧与它无关**（verifier 全程双接受）⇒ 回滚 = 改这一行重部 auth+panel，不动 Edge、不回退代码 |
+| `[SessionKeys] legacy_param` 清空（状态机 L3） | `legacy_entry()` 变 off、auth/panel 不再下发 `JWT_SECRET_PARAM` 且角色 SSM 清单不含它、`stack.py` 给 Edge 注入空串（**空串不是 SYNTH 占位符**）、闸门 `--retire-key legacy`。清空前 `signer` 必须已是 `current`（加载器硬拒该组合） |
+| `[SessionKeys] login_flow_secret_param` | 只进 auth（`LOGIN_FLOW_SECRET_PARAM` + 角色清单），`login_handler._login_flow_sig` 是唯一读取点；`ensure_session_keys.py` 创建、`deploy_auth.ensure_secret` 兜底（**不进写前核对清单**，见 `docs/adr/0004-*.md`）；panel 有三条负向断言锁死它永不持有；闸门记成 grant `read-login-flow-secret` 且**不算冒充面** |
+| 验收工具的本地 mint（`scripts/_session_mint.py`） | 六处调用方（四个 `verify_*`、`verify_kid_entry_live.py`、E2E 的会话 cookie fixture）。改它等于同时改六个验收面；非对称化后它整体被夹具签发器（spec §11.7）替代，所以**本地 mint 只许存在于这一个模块里** |
 
 ## 高频坑（都是真机踩过的）
 
-- Function URL 一律 `AuthType=AWS_IAM` + 只授权 edge role，且 2025-10 起需要
+- Function URL 一律 `AuthType=AWS_IAM` + 只授权 edge role，且需要
 `InvokeFunctionUrl` + `InvokeFunction`(InvokedViaFunctionUrl) 两条语句，缺一即 403。
 `AuthType=NONE` + `Principal:*` 会被安全扫描自动处置（删光 resource policy）。
 - AgentCore 镜像构建必须 `--provenance=false`（buildx 默认加 attestation
@@ -379,8 +326,7 @@ Quick Desktop Remote MCP 不支持 OAuth，走 `site-builder/clients/quick-deskt
 aarch64 psycopg，Lambda 运行时 import 失败。
 - DSQL：API 不返回 endpoint（自拼 `{id}.dsql.{region}.on.aws`）；清理顺序必须先
 `AWS IAM REVOKE` 再 `DROP ROLE`（否则 2BP01）。
-- git push 用 `--no-verify`（用户全局约定）；us-east-1 是硬约束
-（Lambda@Edge 与 CloudFront 的 ACM 证书），换区要改代码。
+- us-east-1 是硬约束（Lambda@Edge 与 CloudFront 的 ACM 证书），换区要改代码。
 - **路由表的 `static_prefix` 不带尾斜杠**。Edge 的静态改写是
 `f"/{static_prefix}{path}"` 且 `path` 已以 `/` 开头——带尾斜杠会拼出双斜杠，
 与上传的 key 不是同一个对象，整站 403（两侧单测各自都会绿）。
@@ -392,11 +338,11 @@ Edge 拿到 body 并按它算 payload hash 去签 SigV4，而 CloudFront 转发�
 所以删除类接口一律用 POST 子路径（`/api/keys/revoke`、`/api/admins/remove`），
 参数放请求体、**不放查询串**（查询串会进 CloudFront 访问日志）。
 `panel/tests/test_handler.py::test_no_route_uses_delete_with_body` 按路由表锁死。
-这个缺陷在生产上活了整个 M3 周期——单测直接调 handler，不经 CloudFront。
+这个缺陷曾在真机上活了整个控制台开发周期——单测直接调 handler，不经 CloudFront。
 - **API Key 总开关的 `enabled` 必须是 DynamoDB `BOOL`**：`keystore.lookup` 判的是
 `enabled is not True`，字符串 `"true"` 同样被拒。症状是"控制台显示开着但所有
 Key 都 401"，而两侧单测各自都绿。手工改哨兵行时用 `{"BOOL":false}`。
-- `**mcp` 子域故意不在 Edge 的 `PLATFORM_SUBDOMAINS` 里**：key-proxy 只认
+- **`mcp` 子域故意不在 Edge 的 `PLATFORM_SUBDOMAINS` 里**：key-proxy 只认
 `X-API-Key`，不需要平台 cookie；进白名单只会让一个公网组件白拿一个顶域会话
 JWT。别"顺手补齐"这个名单。
 - **moto 不校验 IAM**：事务里的 `ConditionCheck` 需要 `dynamodb:ConditionCheckItem`，
@@ -404,110 +350,92 @@ JWT。别"顺手补齐"这个名单。
 - **统计埋点的超时预算不能按同区算**：Edge 写本区副本是 6ms（冷 58ms），但回落路径是
 跨区 229ms（冷 **719ms**，实测）。预算的下限由回落决定；收紧到「够本区用」就等于让
 回落路径静默丢行。埋点异常一律吞掉（统计不是安全控制），所以丢行是**无声的**。
-- **auth 的部署包清单是 `deploy_auth.AUTH_PACKAGE_MODULES`，由 `auth/tests/test_deploy_auth_package.py` 按 login_handler 的 import 闭包核对**。2026-09-02 实测：给 login_handler 新加一个同目录 import（`verifier_env`）却没进包 ⇒ `Runtime.ImportModuleError` ⇒ **整个 auth 502 约 4 分钟**，而单测全绿、`verify_deployed_components` 也绿（它当时只核对两个点名文件）。同一条纪律 panel 那边叫 `COPY_FILES`。
+- **auth 的部署包清单是 `deploy_auth.AUTH_PACKAGE_MODULES`，由 `auth/tests/test_deploy_auth_package.py` 按 login_handler 的 import 闭包核对**。实测过：给 login_handler 新加一个同目录 import 却没进包 ⇒ `Runtime.ImportModuleError` ⇒ **整个 auth 502 约 4 分钟**，而单测全绿、`verify_deployed_components` 也绿（它当时只核对两个点名文件）。同一条纪律 panel 那边叫 `COPY_FILES`。
 - **改了 `permissions.py` 这类共享模块，要重部的是三个组件**：panel、key-proxy、MCP
 各自把它打进自己的产物（key-proxy 也带，虽然它只用 `EMAIL_RE`）。漏一个的症状是
 产物陈旧而部署脚本一切正常——`verify_deployed_components.py` 是唯一会点出来的地方。
 
 ## 文档地图
 
+| 要做什么 | 看哪里 |
+|---|---|
+| 部署到新账号 / 排查部署问题 | `site-builder/DEPLOY.md`（①→⑦ + ⑤b 控制台 + ⑤c API Key + 全部实测坑） |
+| 客户端接入（人/Agent） | `site-builder/docs/client-setup.md`；含真实值版本跑 `gen_onboarding.py` |
+| 合同细节（给站点生成方） | `site-builder/skills/site-builder/references/{contract,redlines}.md` |
+| **还剩什么没做 / 优先级** | `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9（**tracked**；两轮独立对抗性审查的合并版。做完的行带对勾或删除线；第 11 行起的先后由 spec §11.9 第 12 条与工单给，不由行号给） |
+| **平台防谁 / 不防谁（账号信任边界）** | `docs/security/account-trust-boundary.md`（**tracked**；M09 的结论真源。含只读实测方法、由基线断言的数字、为什么 SCP/resource policy/应用层签名/收窄 invoke 都不成立） |
+| **CodeBuild 对 bootstrap 桶读权限的收窄（§9 的 3b）** | `docs/superpowers/specs/2026-08-27-codebuild-bootstrap-read-narrowing-spec.md`（**tracked**；含为什么已有那条 AST 守卫看不见这个洞、三层守卫各自能证明什么、部署窗口的干净失败面） |
+| **轮转会话密钥** | `site-builder/DEPLOY.md`「轮转会话密钥」一节（就位 → 切换 → 回滚演示 → 排空 → 退役）。裁定原文在 spec §11.8，状态机在 spec §6.2。过程记录在 `.scratch/3c-1b/`——gitignored、不随仓库分发，别当状态真源 |
+| **会话签名非对称化的设计（3c；分包与顺序）** | `docs/superpowers/specs/2026-08-28-asymmetric-session-signing-spec.md`（**tracked**；§6.1 是时序真源，其中 3c-final 那一行是当前定义、2A/2B/3 三行只保留设计内容；§11 是全部裁定与被否决项，§11.9 是"交付物是资产"框架下的收敛：2A/2B/3 合为 3c-final、验证环境硬切换、HS 不进 v1；ADR 在 `docs/adr/`。含量测过的收益边界、两个 key family 的模型、部署与回滚协议、以及「四个 verify_* 闸门靠读 SSM 明文本地 mint 会话，非对称化后由夹具签发器替代」这条容易漏的代价） |
+| **3c 冒充面的可复跑证据** | `site-builder/scripts/probe_impersonation_surface.py`（**tracked**，只读，约 20 分钟）→ `docs/security/3c-impersonation-surface.json`（**tracked**，只有计数/等价类/边际收益/盲区清单，名字只进 gitignored dump）。**`--self-test` 不碰 AWS**，反例与变形测试在 `deployer/tests/test_probe_impersonation_surface.py` |
+| 加固包的设计与实施 | `docs/superpowers/specs/2026-08-22-s1-isolation-and-auth-hardening-spec.md` + `docs/superpowers/plans/2026-08-22-s1-isolation-and-auth-hardening.md`；存量环境的升级/闸门/回滚见 `site-builder/DEPLOY.md` 的「S1 加固」一节 |
+| 一期设计决策与范围 | `docs/superpowers/specs/2026-07-21-quick-site-builder-design.md`（已实现快照，勿改） |
+| 二期设计与需求 | `docs/superpowers/specs/2026-07-30-quick-site-builder-phase2-design.md`；需求清单 `docs/phase2-requirements.md` |
+| 任务级实现/审查证据链 | `.superpowers/sdd/<计划日期>-<计划名>/progress.md`（**gitignored**、每个 plan 一个目录；`.superpowers/sdd/progress.md` 那个扁平路径是一期的旧布局） |
+| 各里程碑实测发现 | `docs/design/M{3,4,5}-FINDINGS.md`、`M4-SPIKE-2026-08-10.md`、`M7-SPEC-2026-08-16.md`（**gitignored**；含可复用的断言自查清单，已验证过的别再跑一遍） |
+| 历史过程记录 | `docs/design/HANDOFF-2026-08-07.md`（**gitignored**；写到二期为止——**不是**状态真源） |
 
-| 要做什么                                             | 看哪里                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 部署到新账号 / 排查部署问题                                  | `site-builder/DEPLOY.md`（①→⑦ + ⑤b 控制台 + ⑤c API Key + 全部实测坑）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| 客户端接入（人/Agent）                                   | `site-builder/docs/client-setup.md`；含真实值版本跑 `gen_onboarding.py`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| 合同细节（给站点生成方）                                     | `site-builder/skills/site-builder/references/{contract,redlines}.md`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| **还剩什么没做 / 优先级**                                 | `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9（**tracked**；两轮独立对抗性审查的合并版。S1 取的是表里 M01/M02/M05/M06 四条；M09 已按 v5 重定义并落地，其余各条还没做）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| **平台防谁 / 不防谁（账号信任边界）**                           | `docs/security/account-trust-boundary.md`（**tracked**；M09 的结论真源。含只读实测方法、**14 个由基线断言的数字**（A/B 两组 + 按类别）、为什么 SCP/resource policy/应用层签名/收窄 invoke 都不成立）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| **M09 真修复①的设计与实施记录（2026-08-27 已部署）**             | `docs/superpowers/specs/2026-08-27-codebuild-bootstrap-read-narrowing-spec.md`（**tracked**；收窄 CodeBuild 对 CDK bootstrap 桶的读权限＝§9 的 3b。含为什么已有那条 AST 守卫看不见这个洞、三层守卫各自能证明什么、部署窗口的干净失败面；末尾「实施记录与验收证据」一节是 handover）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| **3c-1B（signer 切 `kid` + 关 legacy 入口 + 一次真实轮转）** | 十步 runbook 与首次执行的真实时间线：`site-builder/DEPLOY.md`「轮转会话密钥：十步 runbook」（**每次轮转照抄 ⑥–⑩**；①–⑤ 是 legacy 收敛，已一次性用完）。裁定原文在 spec §11.8，状态机现状在 §6.2，留给 3c-3 的精确清单也在 §6.2。**过程记录（票、progress、日志）在 `.scratch/3c-1b/`——gitignored、不随仓库分发，别当状态真源**                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| **M09 真修复②的设计（3c；3c-0 裁决完成、1A/1B 已部署、2A/2B/3 已合为 3c-final 待做）**  | `docs/superpowers/specs/2026-08-28-asymmetric-session-signing-spec.md`（**tracked**；会话签名迁非对称。**状态：§11 七个未决项已于 2026-09-02 全部裁定（含 Edge 冷启动最终形态复测：vendored `cryptography` 过闸、128 MB 不动），不构成实施授权**；裁定原文与被否决项都在 §11，三条 ADR 在 `docs/adr/`。 **3c-1A 已于 2026-09-02 实施并部署**（verifier 认 kid allowlist、两把 HS secret、闸门 schema 4；signer 仍发 legacy 形态），计划 `docs/superpowers/plans/2026-09-02-3c-1a-verifier-kid-allowlist.md`。**3c-1B 已于 2026-09-05 实施并部署**（signer 切 `kid`、L3 关闭 legacy 入口、v1→v2 真实轮转 + 生产回滚演示、v1 参数已删；④ 观察窗口经裁决跳过、⑨ 是该机制唯一的真机证明——见 §6.1 那一行）。**下一个包是 3c-2A**（闸门与验收先认 KMS，独立发布单元）。含量测过的收益边界（56 → **冒充面 19，这是已知下界不是上界**）、两个 key family 的模型、分包顺序 3c-0/1A/1B/**2A**/2B/3（2A 是"闸门与验收先认 KMS"的独立发布单元）、部署与回滚协议、以及「四个 verify_* 闸门靠读 SSM 明文本地 mint 会话，非对称化后要重新设计」这条容易漏的代价） |
-| **3c 冒充面的可复跑证据**                                 | `site-builder/scripts/probe_impersonation_surface.py`（**tracked**，只读，实测约 20 分钟）→ `docs/security/3c-impersonation-surface.json`（**tracked**，只有计数/等价类/边际收益/盲区清单，名字只进 gitignored dump）。`**--self-test` 不碰 AWS**，18 条反例 + 变形测试在 `deployer/tests/test_probe_impersonation_surface.py`。**别再引用 56→13 / 并集 18 那两组旧数字**                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| 加固包 S1 的设计与实施                                    | `docs/superpowers/specs/2026-08-22-s1-isolation-and-auth-hardening-spec.md` + `docs/superpowers/plans/2026-08-22-s1-isolation-and-auth-hardening.md`；升级/闸门/回滚见 `site-builder/DEPLOY.md` 的「S1 加固」一节                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| 一期设计决策与范围                                        | `docs/superpowers/specs/2026-07-21-quick-site-builder-design.md`（已实现快照，勿改）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| 二期设计与需求                                          | `docs/superpowers/specs/2026-07-30-quick-site-builder-phase2-design.md`；需求清单 `docs/phase2-requirements.md`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| 任务级实现/审查证据链                                      | `.superpowers/sdd/<计划日期>-<计划名>/progress.md`（**gitignored**、每个 plan 一个目录；`.superpowers/sdd/progress.md` 那个扁平路径是一期的旧布局）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| 各里程碑实测发现                                         | `docs/design/M{3,4,5}-FINDINGS.md`、`M4-SPIKE-2026-08-10.md`、`M7-SPEC-2026-08-16.md`（**gitignored**；含可复用的断言自查清单，已验证过的别再跑一遍）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| 历史过程记录                                           | `docs/design/HANDOFF-2026-08-07.md`（**gitignored**；写到二期为止、**不含 S1**——**不是**状态真源，见上面「当前状态」）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+> **接手时的读法**：要知道"资产是什么样"，读本文件 + `README.md` + `site-builder/DEPLOY.md`，
+> 数字自己跑测试；要知道"还剩什么"，读上面那份 merged review 的 §9；验证环境"现在到哪了"
+> 只在 gitignored 的 `.scratch/<feature>/NEXT.md` 里，新 clone 里不存在，也不该需要它。
+> **不要**依赖 `docs/design/` 里的任何一份——它们和 `.superpowers/` 都 gitignored
+> （含真实账号/资源值），新 clone 里根本不存在，**也不要 `git add -f`**。
 
+### 仓库外的几样东西（新 clone / 新机器按这个顺序恢复）
 
-> **接手时的读法**：要知道"生产现在是什么样"，读本文件 + `README.md` +
-> `site-builder/DEPLOY.md`，数字自己跑测试；要知道"还剩什么"，读上面那份 merged
-> review 的 §9。**不要**依赖 `docs/design/` 里的任何一份——它们和 `.superpowers/`
-> 都 gitignored（含真实账号/资源值），新 clone 里根本不存在，**也不要 `git add -f`**。
+**`git clone` 拿不到能跑的环境**——下面几样都在仓库外，缺任何一样症状都不像"没配置"。
+按这个顺序做：
 
-### 仓库外的六样东西（= 本机现在装了什么 / 换机器时按这个顺序恢复）
+0. **两个 Python 解释器**：`brew install python@3.12 python@3.13`。3.12 是五个 venv 的
+   母解释器；3.13 只给 `mcp/run_locked_tests.sh`（与容器基础镜像一致，找不到它时那个
+   脚本会明确报出来）。**macOS 自带的 `/usr/bin/python3` 是 3.9，跑不了本仓库的脚本**
+   （见上面「测试命令」里 `X | None` 那段）。
+   **坑：`brew install python@3.12` 不提供 `python3` 这个名字**——未版本化的
+   `python3`/`pip3` 只在 `/opt/homebrew/opt/python@3.12/libexec/bin` 里，`brew link`
+   也不吐到 `/opt/homebrew/bin`。于是 `python3` 仍是 3.9，症状是那条 `TypeError` 而
+   不是"版本不对"。两层解法任选或都做：
+   `~/.zshenv` 里把那个 `libexec/bin` 前置（**必须是 `.zshenv` 不是 `.zshrc`**：非交互
+   shell——脚本、编辑器/Agent 起的子进程——只读前者）；或
+   `/opt/homebrew/bin/{python3,pip3}` 两个符号链接指向它（这层与 shell 无关；将来若
+   `brew install python` 会报 symlink 冲突，删掉这两个软链即可）。
+1. **两份 `config.ini`**（`site-builder/` 与 `router/`，各从同目录 `.example` 复制并
+   回填真实账号/域名/证书 ARN）。**它们是所有部署脚本与 CDK 栈的唯一取值来源。**
+   `configparser` 对缺失文件是**静默的** ⇒ 不回填不会报"缺配置"，而是拿空值往下跑并
+   拼出假结论（本仓库为此在闸门里专门加了"读不到任何段就硬失败"）。
+2. **五个 venv 全部重建**。**必须带 `--clear`**（`python3.12 -m venv --clear .venv`）——
+   shebang 是绝对路径，不带 `--clear` 不重写，一直报 bad interpreter。
+   **venv 不能从别的机器拷**：`pyvenv.cfg` 的 `home =` 与 `bin/*` 的 shebang 都是绝对路径，
+   编译扩展按 CPU 架构 + Python ABI 装，而 contract/deployer 那两份是
+   editable 安装（site-packages 里写死源码树路径）——**同一台机器上另开一个 worktree 也要重建**。
+   五个都用 **Python 3.12**（`mcp/run_locked_tests.sh` 另建一个钉 3.13 的，与
+   基础镜像一致，不要拿它替换 `mcp/.venv`）。每个 venv 装哪份清单：
 
-`**git clone` 拿不到能跑的环境**——下面六样都在仓库外，缺任何一样症状都不像"没配置"。
-这一节既是**本机当前环境的记录**（读它就知道 `python3` 指哪、凭据怎么来），也是换机器
-或新 clone 时的恢复顺序。**2026-09-01 在一台新机器上整条走过一遍**，第 0 步与第 5 步的
-两个坑就是那次踩出来的。按这个顺序做：
-
-1. **两个 Python 解释器**：`brew install python@3.12 python@3.13`。3.12 是五个 venv 的
- 母解释器；3.13 只给 `mcp/run_locked_tests.sh`（与容器基础镜像一致，找不到它时那个
- 脚本会明确报出来）。**macOS 自带的 `/usr/bin/python3` 是 3.9，跑不了本仓库的脚本**
- （见上面「系统 `python3`」那段的 `X | None`）。
- **坑：`brew install python@3.12` 不提供 `python3` 这个名字**——未版本化的
- `python3`/`pip3` 只在 `/opt/homebrew/opt/python@3.12/libexec/bin` 里，`brew link`
- 也不吐到 `/opt/homebrew/bin`。于是 `python3` 仍是 3.9，症状是那条 `TypeError` 而
- 不是"版本不对"。本机做了两层（2026-09-01）：
- `~/.zshenv` 里把那个 `libexec/bin` 前置（**必须是 `.zshenv` 不是 `.zshrc`**：非交互
- shell——脚本、编辑器/Agent 起的子进程——只读前者），外加
- `/opt/homebrew/bin/{python3,pip3}` 两个符号链接指向它（这层与 shell 无关；将来若
- `brew install python` 会报 symlink 冲突，删掉这两个软链即可）。
-2. **两份 `config.ini`**（`site-builder/` 与 `router/`，各从同目录 `.example` 复制并
- 回填真实账号/域名/证书 ARN）。**它们是所有部署脚本与 CDK 栈的唯一取值来源。**
- `configparser` 对缺失文件是**静默的** ⇒ 不回填不会报"缺配置"，而是拿空值往下跑并
- 拼出假结论（本仓库为此在闸门里专门加了"读不到任何段就硬失败"）。
-3. **五个 venv 全部重建**。**必须带 `--clear`**（`python3.12 -m venv --clear .venv`）——
- shebang 是绝对路径，不带 `--clear` 不重写，一直报 bad interpreter。
- **venv 不能从旧机器拷**：`pyvenv.cfg` 的 `home =` 与 `bin/*` 的 shebang 都是旧机器上
- 的绝对路径，编译扩展按 CPU 架构 + Python ABI 装，而 contract/deployer 那两份是
- editable 安装（site-packages 里写死源码树路径）。
- 本机这五个都是 **Python 3.12**（`mcp/run_locked_tests.sh` 另建一个钉 3.13 的，与
- 基础镜像一致，不要拿它替换 `mcp/.venv`）。每个 venv 装哪份清单：
-
-  | venv                                | 依赖清单                   | 备注                                                   |
-  | ----------------------------------- | ---------------------- | ---------------------------------------------------- |
-  | `router/infrastructure/.venv`       | `requirements.txt`     | 只有 CDK 依赖，**没有 pytest**（router 的测试借 deployer 的 venv） |
-  | `site-builder/contract/.venv`       | `requirements-dev.txt` | 含 `-e .`，一条 `pip install -r` 装完                      |
-  | `site-builder/deployer/.venv`       | `requirements-dev.txt` | 含 `-e ../contract`，同上                                |
-  | `site-builder/deployer/infra/.venv` | `requirements.txt`     | aws_cdk **只在这个** venv 里                              |
-  | `site-builder/mcp/.venv`            | `requirements.txt`     | —                                                    |
-
+   | venv | 依赖清单 | 备注 |
+   |---|---|---|
+   | `router/infrastructure/.venv` | `requirements.txt` | 只有 CDK 依赖，**没有 pytest**（router 的测试借 deployer 的 venv） |
+   | `site-builder/contract/.venv` | `requirements-dev.txt` | 含 `-e .`，一条 `pip install -r` 装完 |
+   | `site-builder/deployer/.venv` | `requirements-dev.txt` | 含 `-e ../contract`，同上 |
+   | `site-builder/deployer/infra/.venv` | `requirements.txt` | aws_cdk **只在这个** venv 里 |
+   | `site-builder/mcp/.venv` | `requirements.txt` | — |
 
    **那两份 `requirements-dev.txt` 必须在各自目录下 `pip install`**：里面 `-e` 的相对
    路径按**进程 cwd** 解析，不是按文件位置。`auth` / `panel` / `key-proxy` 没有自己的
-   venv，借别人的，组合见上面「测试命令」。`**contract/requirements-dev.txt` 是新加的**
-   （此前只有 deployer 那份，而 contract 的 venv 还被 auth 借用 ⇒ 新 clone 只知道"要
-   重建"、不知道装什么）；deployer 那份从宽松钉改成精确钉死，直接依赖的原始声明留在
-   文件头注释里。两份都实测过：空 venv 一条命令装完，六个借用它们的套件全绿。
-4. `**python3`（第 0 步那个 3.12）上装两个包**：
- `python3 -m pip install --user --break-system-packages boto3 pip-system-certs`。
- **五个 `verify_*` 真机闸门与所有 `scripts/*.py` 都用它跑。**
- 两个开关缺一不可：Homebrew 的 python 带 PEP 668 标记，不加
- `--break-system-packages` 直接被拒；加 `--user` 是为了只写 user site
- （`~/Library/Python/3.12/...`）而不动 brew 自己的 site-packages。
- 缺 `pip-system-certs` 的症状是每一次 HTTPS 都 `CERTIFICATE_VERIFY_FAILED`——**读起来
- 像公司代理/防火墙问题，其实不是**，别去查网络。
-5. **MCP 的 OAuth token**：`node site-builder/clients/quick-desktop-proxy/auth.js`
- 登录一次（那两个 `.js` 只用 Node 内置模块，**不需要 `npm install`**）。
- token 过期时 MCP server 会以 `-32603 token 过期且刷新失败` 连不上，
- **那是认证过期，不是没配置**。
-6. **两个远端各自的凭据**（约定：`origin` = 内网 gitlab.aws.dev，`github` = GitHub）。
- 从 GitHub clone 之后 `origin` 指的是 GitHub，要手工改名并把内网那个加回来。
-  - **内网走 Midway 签的 SSH 证书**，`mwinit -f` 每天一次（证书实测 12 小时）。
-   `**mwinit` 只签一个已经存在的 `~/.ssh/id_ecdsa.pub`**：没有密钥对时它照样成功、
-   只发 web cookie 不发证书，仅在输出里留一行 Warning ⇒ 之后所有内网 SSH 都
-   `Permission denied (publickey)`，读起来像"凭据过期"。新机器先
-   `ssh-keygen -t ecdsa -b 521 -f ~/.ssh/id_ecdsa` 再 `mwinit -f`，确认输出里有
-   `Successfully signed SSH public key`，并且 `~/.ssh/id_ecdsa-cert.pub` 存在。
-   `~/.ssh/known_hosts` 同样要重建：`ssh-keyscan ssh.gitlab.aws.dev` 取到的三条指纹
-   要与内部 wiki 公布的核对后再写进去，别盲信首连（clone 地址形如
-   `git@ssh.gitlab.aws.dev:<group>/<project>.git`）。
-  - **GitHub 这边走 `gh` 的 HTTPS 凭据**（`gh auth status` 看；remote 用
-  `https://github.com/...`）。`~/.ssh` 没有 key 时 SSH 形式的地址必然
-  `Host key verification failed` / `Permission denied`，别以为是仓库权限问题。
+   venv，借别人的，组合见上面「测试命令」。deployer 那份是精确钉死的，直接依赖的原始声明
+   留在文件头注释里。两份都实测过：空 venv 一条命令装完，六个借用它们的套件全绿。
+3. **`python3`（第 0 步那个 3.12）上装两个包**：
+   `python3 -m pip install --user --break-system-packages boto3 pip-system-certs`。
+   **五个 `verify_*` 真机闸门与所有 `scripts/*.py` 都用它跑。**
+   两个开关缺一不可：Homebrew 的 python 带 PEP 668 标记，不加
+   `--break-system-packages` 直接被拒；加 `--user` 是为了只写 user site
+   （`~/Library/Python/3.12/...`）而不动 brew 自己的 site-packages。
+   缺 `pip-system-certs` 的症状是每一次 HTTPS 都 `CERTIFICATE_VERIFY_FAILED`——**读起来
+   像公司代理/防火墙问题，其实不是**，别去查网络。
+4. **MCP 的 OAuth token**：`node site-builder/clients/quick-desktop-proxy/auth.js`
+   登录一次（那两个 `.js` 只用 Node 内置模块，**不需要 `npm install`**）。
+   token 过期时 MCP server 会以 `-32603 token 过期且刷新失败` 连不上，
+   **那是认证过期，不是没配置**。
+5. **远端凭据**是维护者自己的事，不属于资产：远端名、SSH 证书、known_hosts 的约定写在
+   gitignored 的接手点文件里，新 clone 只需要一个能拉取的远端。
 
 **拿不回来、也不用拿回来的**：`docs/design/` 与 `.superpowers/sdd/` 下的全部过程记录
 （每个 plan 的 progress、task brief/report、review diff）——**gitignored** 且含真实
@@ -516,19 +444,16 @@ JWT。别"顺手补齐"这个名单。
 数字靠跑测试与闸门。3c 冒充面那份名字 dump 同理——**重跑探针即可重生成**
 （`probe_impersonation_surface.py --dump-observed …`，只读约 20 分钟）。
 
-**本地 `backup/*` 分支只在原机器上**（都是已完成的历史重写的安全锚点，两个远端上都没有）。
-换机器等于放弃它们；确认不再需要就在旧机器上删掉，别推到公开仓。
-
 > **加固包的编号别用 `S1`/`S2`…写进代码或文档正文**：`S3` 会和 Amazon S3 撞车（本仓库
 > 到处在说 S3 桶），grep 出来全是噪音。用 merged review 里的 `M` 编号
-> （`M03+M16`、`M07/M08/M10/M12`…）或主题名指代。
+> （`M03+M16`、`M07/M08/M10`…）或主题名指代。
 
 ## Agent skills
 
 mattpocock 那套 engineering skill（`to-tickets` / `to-spec` / `triage` / `wayfinder` /
 `code-review` / `domain-modeling` …）需要知道"issue 存哪、标签叫什么、术语表在哪"。
-下面三行就是把它们指到 `docs/agents/` 的那份配置，2026-09-02 由
-`/setup-matt-pocock-skills` 生成；换 tracker 直接改那边的文件，不必重跑该 skill。
+下面三行就是把它们指到 `docs/agents/` 的那份配置（由 `/setup-matt-pocock-skills` 生成）；
+换 tracker 直接改那边的文件，不必重跑该 skill。
 
 ### Issue tracker
 
@@ -543,6 +468,5 @@ issue 与 spec 存成本地 markdown（`.scratch/<feature>/`，**gitignored、�
 
 ### Domain docs
 
-single-context：根 `CONTEXT.md` + `docs/adr/`。**两者已于 2026-09-02 随 3c-0 裁决创建**（词表
-11 条，全是会话签名与验收夹具的术语；ADR 0001 到 0003）。之后仍由 `/domain-modeling` 在术语或
-决策真的定下来时才追加，不预先占位。See `docs/agents/domain.md`.
+single-context：根 `CONTEXT.md` + `docs/adr/`。由 `/domain-modeling` 在术语或决策真的定下来时
+才追加，不预先占位。See `docs/agents/domain.md`.

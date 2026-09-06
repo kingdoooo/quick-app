@@ -1,7 +1,7 @@
 # 3c：会话签名迁到非对称（设计 spec）
 
 日期 **2026-08-28**（末次修订 **2026-09-06**）。状态：**3c-0 裁决完成；3c-1A 与 3c-1B 已实施并部署
-（2026-09-02 / 2026-09-05）；下一个包是 3c-2A，尚未获实施授权。**
+（2026-09-02 / 2026-09-05）；2A/2B/3 于 2026-09-06 合并为 3c-final（§11.9，已获实施授权、未开始）。**
 （§11 七个未决项已于 2026-09-02 逐条定稿；§11.1 的冷启动数字已按最终实现形态复测通过（第一轮
 判读作废）；外部复审第十三、十四轮的 P1 与 Codex 对 3c-0 的 6 条阻断项已按下文吸收。
 **1A/1B 的落地情况见 §6.1 那两行**——1B 含 signer 切 family `kid`、L3 关闭 legacy 入口、
@@ -380,9 +380,10 @@ blocker（外部复审第十四轮 P1-2，成立）。
 | **3c-0** | 本 spec 定稿 + Edge crypto spike 裁决（§11） | 冒充面探针与脱敏聚合证据 tracked 且可复跑 |
 | **3c-1A** | 全部 verifier 认 `kid`→{family, alg, key} 固定 allowlist、每 family `current`+`previous`、legacy 第三入口（状态机 L1）；`[SessionKeys]` 按 §11.6 的 schema 落地（此时只有 HS 行）。**signer 不动** | 闸门认识**两个 HS key family** 与 legacy/current/previous（今天它只认识一个 `JWT_PARAM_NAME`、一套 Edge/asset 密钥定位）；§9 全部 verifier 反例齐备并验过红绿 **已实施并部署 2026-09-02**（plan `2026-09-02-3c-1a-verifier-kid-allowlist.md`） |
 | **3c-1B** | signer 开始发 family-specific `kid` + 新 `token_use`/`aud`（状态机 L2）；两把新 HS secret `/site-builder/session-keys/<kid>` + login-flow secret（§11.3）；观察归零后**关闭** legacy 入口（进入 L3，删除仍归 3c-3）；一次真实 HS 轮转演练 R1/R2。**逐条裁定见 §11.8**。**已实施并部署 2026-09-05**（十步 runbook 首次执行完毕；`cf5db89` = ③ 切 signer/T0、`9245703` = ⑤ 进 L3、`03d2a14` = ⑥ v2 经 `previous` 就位、`a2dd16a` = ⑦⑧ 切 v2 + 生产回滚演示、`19c9f7f` = ⑨⑩ 排空判定 + v1 退役含删参数、`a38fee1` = 本次收尾文档）。**注意：④ 观察窗口在首次演练中经操作者裁决跳过**——单人开发账号、只读读数已证实 T0 以来 `accepted_legacy` 三列全 0，且**没有**做"缩短窗口版的 ④"；因此**观察窗口机制的真机证明只有 ⑨ 这一次**，它按满 26 h 等待并 exit 0 通过。三个时刻（**生产实测**）：**T0 = `2026-09-03T13:51:18Z`**、**④ 跳过裁决 = `2026-09-04T01:40:40Z`**、**⑨ 判定 = `2026-09-05T12:31Z`**（T2 + 30h12m，闸下限 T2+26h）。完整时间线与时长在 `site-builder/DEPLOY.md` 的 runbook 首节 | 四个 `verify_*` 与 10 条 E2E 的登录态工具能 mint **带新 `kid` 的 HS token**（否则 signer 一切就全红，读起来像功能坏了）；且必须在 signer 切换**之前**改完，否则它们自己就是 `accepted_legacy` 的来源（§11.8.2） |
-| **3c-2A**（→ 并入 3c-final，§11.9） | **只改闸门与验收，不动生产签名**：KMS 探测（`kms:Sign` 持有者、key policy 快照、grants、自助授权、公钥指纹）+ 验收入口改造（auth `/fixture-session`、`site-builder-verifier` 角色、**Edge 与 panel 的夹具会话边界规则先于签发器上线**、`ensure_fixture_site.py` 常驻夹具站点、探针 `sign:fixture-issuer` 两个入口，§11.7） | 上一格全绿；本包**自己**先验过红绿（新探测要能真的红） |
-| **3c-2B**（→ 并入 3c-final，§11.9） | 两把 KMS 非对称 CMK（deployer CDK 栈创建，默认 key policy + IAM 条件，§11.2）；signer 切 `kms:Sign`（`RAW`，§11.5；identity policy 同时授 `kms:GetPublicKey`，§11.2）；三层 kid 绑定校验（§11.6）；verifier 双接受 | **3c-2A 已上线**；五个验收入口拿到**真实登录态**（不再靠读 SSM 明文本地 mint），且验过红绿 |
+| **3c-2A**（→ 并入 3c-final，§11.9） | **只改闸门与验收，不动生产签名**：KMS 探测（`kms:Sign` 持有者、key policy 快照、grants、自助授权、公钥指纹）+ 验收入口改造（auth `/fixture-session`、`site-builder-verifier` 角色、**Edge 与 panel 的夹具会话边界规则与签发器同一次部署上线、不得晚于它**（原写"先于"；并入 3c-final 后没有先后，见 ADR 0002/0005）、`ensure_fixture_site.py` 常驻夹具站点、探针 `sign:fixture-issuer` 两个入口，§11.7） | 上一格全绿；本包**自己**先验过红绿（新探测要能真的红） |
+| **3c-2B**（→ 并入 3c-final，§11.9） | 两把 KMS 非对称 CMK（deployer CDK 栈创建，默认 key policy + IAM 条件，§11.2）；signer 切 `kms:Sign`（`RAW`，§11.5；identity policy 同时授 `kms:GetPublicKey`，§11.2）；三层 kid 绑定校验（§11.6）；verifier 双接受 | ~~**3c-2A 已上线**~~（并入 3c-final 后不再有先后）；五个验收入口拿到**真实登录态**（不再靠读 SSM 明文本地 mint），且验过红绿 |
 | **3c-3**（→ 并入 3c-final，§11.9） | 退役 HS256、删旧 SSM secret、删 legacy 入口（状态机 L3）、基线**精确 delta** | `accepted_legacy == 0` 且总量非 0 持续超过最长 TTL（§8） |
+| **3c-final** | 上面 2A、2B、3 三行的**全部设计内容**合成一个包（§11.9 第 1、4 条）：KMS 非对称 CMK + signer 切 `kms:Sign` + Edge/auth/panel 验 RS256 + 闸门 KMS 探测 + 夹具签发器 + 删除 HS 密钥材料、legacy 入口、跨算法双接受与迁移脚手架。在验证环境**硬切换**（见 CONTEXT.md 词条与 ADR 0005 后果）。kid 级 current/previous 双接受保留 | 3c-1B 全绿；本包自己先验过红绿（KMS 探测要能真的红）；一份 plan、SDD 串行、主会话执行（`.scratch/asset-v1/spec.md`） |
 
 > **为什么不能反**：若先切 `kms:Sign` 再补 KMS 闸门，3c-2 可以部署成功，而旧闸门只看到
 > HS 暴露面大幅"改善"，**根本没观察新的 signing surface**——那正是这一整轮复审反复咬住的
@@ -652,7 +653,7 @@ change-impact matrix 为准**，本节只说"改什么"，不重复时序（上�
 | `deployer/infra/app.py` | 两个 `kms.Key`（`RSA_2048` / `SIGN_VERIFY` / RETAIN）+ `CfnOutput`；`test_infra_tables.py` 断言 KeySpec / KeyUsage / RETAIN | 3c-2B |
 | `scripts/ensure_fixture_site.py`（新） | 幂等创建常驻夹具站点（static、`require_auth=True`、只允许 `probe@e2e.invalid`） | 3c-2A |
 | `scripts/probe_impersonation_surface.py` | 新标签 `sign:fixture-issuer`，**两个入口**（verifier 角色经 URL；对 auth 函数的直接 `lambda:InvokeFunction`），`--self-test` 加对应反例 | 3c-2A |
-| `origin_request.py`（夹具分支） | `auth_via = fixture-issuer` 的会话只在 owner 属夹具域的路由上判定，其它路由 302；反例：夹具会话投给真实 org 站点必须 302 | 3c-2A（**先于**签发器上线） |
+| `origin_request.py`（夹具分支） | `auth_via = fixture-issuer` 的会话只在 owner 属夹具域的路由上判定，其它路由 302；反例：夹具会话投给真实 org 站点必须 302 | 3c-final（与签发器**同一次部署**，不得晚于它；原写"先于、3c-2A"） |
 | `permissions.py` / `deploy_panel.py` | 拒绝把夹具域邮箱写进非夹具站点的权限字段；admin 名单排除夹具域（三个产物重部，见跨组件矩阵） | 3c-2A |
 | `site-builder/config.ini.example` / `router/config.ini.example` | `[SessionKeys]` + `[SessionKey:<kid>]` + `[Verification]` 的占位形态 | 3c-1A |
 

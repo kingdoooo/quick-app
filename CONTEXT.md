@@ -84,7 +84,7 @@ _Avoid_: 用户（三义）、客户、租户
 _Avoid_: 生产、线上、prod（指这个账号时）
 
 **硬切换（Hard cutover）**：
-一次部署同时把 signer 与 verifier 换到新的密钥形态，现存会话全部失效、用户重新登录。与滚动切换（就位 → 切换 → 排空 → 退役）相对；只在验证环境里做。它**不是退役**：整个旧密钥形态一次作废，不进入退役流程，也不评估观察窗口。
+在一个变更窗口内把 verifier 与 signer 先后换到新的密钥形态，**不提供跨形态双接受**：窗口等于 Edge 全球复制期（10 到 20 分钟），窗口内登录会失败，窗口结束后所有用户重新登录一次。与滚动切换（就位 → 切换 → 排空 → 退役）相对；只在验证环境里做。它**不是退役**：整个旧密钥形态一次作废，不进入退役流程，也不评估观察窗口。
 _Avoid_: 迁移、in-place migration、灰度
 
 **v1 冻结（v1 freeze）**：
@@ -96,4 +96,4 @@ _Avoid_: 上线、发布、GA
 _Avoid_: E2E（那是开发者回归）、冒烟
 
 分包编号（3c-1A、3c-1B、3c-final …）不是领域词，唯一定义在
-`docs/superpowers/specs/2026-08-28-asymmetric-session-signing-spec.md` §6.1。
+`docs/superpowers/specs/2026-08-28-asymmetric-session-signing-spec.md` §6.1（3c-final 那一行）与 §11.9。

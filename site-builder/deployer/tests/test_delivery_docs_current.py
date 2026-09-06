@@ -18,6 +18,8 @@
 """
 import ast
 import re
+
+import pytest
 import subprocess
 from pathlib import Path
 
@@ -861,3 +863,94 @@ def test_deploy_md_lists_every_production_session_verifier():
         assert rel in doc, (
             f"{rel} 里有生产验签调用，但 DEPLOY.md 没点到它——"
             f"按文档估改动范围会漏掉这个组件。新组件出现就要更新那张表，没有豁免")
+
+
+# --------------------------------------------------------------------------
+# asset-v1 ticket 15：采用者文档不承载验证环境的状态（ADR 0005）
+# --------------------------------------------------------------------------
+#
+# 目前只对 CLAUDE.md 生效；README / DEPLOY.md / client-setup 还带着大量时间线与"已部署"，
+# 由工单 12 清理后逐份加进 _STATUS_FREE_DOCS。**加进来的那一刻本条就会守住它**，所以清理时
+# 先加再改。
+_STATUS_FREE_DOCS = (CLAUDE_MD,)
+
+# 每条一句"为什么它是状态"。命中就是红，判断交给人——这是启发式，不是语义分析；
+# 所以模式要窄到不误伤协议说明（"尚未更新的边缘节点"是轮转顺序的解释，不是进度）。
+_STATUS_PATTERNS = (
+    (r"已部署|已上线|已落地|已实施|已完成部署", "部署完成态是验证环境的事实，资产没有'已部署'"),
+    (r"尚未(获|开始|部署|实施|实现|排期|做)", "进度句；'尚未更新的边缘节点'这类协议说明不在射程内"),
+    (r"待做|还没做|还剩[^。\n]{0,8}(件|条|个|项)[^。\n]{0,4}没做", "待办只在 §9 与工单里；'还剩什么没做'这个固定短语是文档地图的行名，不在射程内"),
+    (r"已修并|已修（|✅", "闭合标记属于 review 表"),
+    (r"已于", "'X 已于 <日期>' 是时间线的引导词"),
+    (r"首次执行|本机现在|本机做了|本机当前|本机这", "'本机'的环境记录；'本机制'/'本机工具链'不在射程内"),
+    (r"ticket \d+ 起|3c-[0-9A-Za-z-]+ 起", "'某票起'是过程标记，采用者没有这些票"),
+    (r"下一个包", "顺序与进度住在 spec §6.1 / §11.9 与工单；'下一步是不可逆的删参数'是协议说明，所以不收'下一步'"),
+)
+_DATE_RE = re.compile(r"(?<!\d)20\d\d-\d\d-\d\d(?!\d)")        # 不用 \b：CJK 与 'T' 都是 \w
+_SHA_RE = re.compile(r"(?<![0-9A-Za-z])[0-9a-f]{7,40}(?![0-9A-Za-z])")
+_PATH_SPAN_RE = re.compile(r"`([\w./@{}*,+:=<>-]+)`")                # 无空格、像路径/标识符的 inline code
+
+
+def _status_scan_text(txt: str) -> str:
+    """围栏**里的内容保留**（命令注释里的'某票起'同样是状态），只去掉围栏标记行本身；
+    inline code 只抹掉**像路径的**那种（`docs/superpowers/specs/2026-08-28-…` 里的日期不是状态），
+    带空格的 inline code 原样保留——否则反引号就成了写状态的逃生口。"""
+    lines = [l for l in txt.splitlines() if not l.lstrip().startswith("```")]
+    body = "\n".join(lines)
+    return _PATH_SPAN_RE.sub(lambda m: " " if "/" in m.group(1) or m.group(1).endswith(".md") else m.group(0), body)
+
+
+def _status_violations(txt: str) -> list:
+    out = []
+    for no, line in enumerate(_status_scan_text(txt).splitlines(), 1):
+        for d in _DATE_RE.findall(line):
+            out.append((no, "日期", d))
+        for h in _SHA_RE.findall(line):
+            if re.search(r"[a-f]", h) and re.search(r"\d", h):
+                out.append((no, "SHA", h))
+        for pat, _why in _STATUS_PATTERNS:
+            for m in re.finditer(pat, line):
+                out.append((no, "状态词", m.group(0)))
+    return out
+
+
+@pytest.mark.parametrize("doc", _STATUS_FREE_DOCS, ids=lambda p: p.name)
+def test_status_free_docs_carry_no_environment_status(doc):
+    """CLAUDE.md 是采用者的 Agent 第一个读的文件（ADR 0005）。验证环境的"现在到哪了"——部署日期、
+    commit SHA、"已部署 / 尚未 / 待做"——写在这里会牵着后续每个 session 的判断走，而对在自己账号
+    部署资产的采用者毫无意义。状态只住 gitignored 的接手点文件与 spec 的状态列。"""
+    bad = _status_violations(_read(doc))
+    assert not bad, f"{doc.name} 里还有验证环境的状态（行号按去掉围栏标记行后的正文计）：\n  " + \
+        "\n  ".join(f"L{no} {kind}: {hit}" for no, kind, hit in bad)
+
+
+def test_status_guard_matchers_fire_on_each_violation_class():
+    """**正对照**：三类匹配器各自能红。日期紧贴中文、ISO 时间戳、8/40 位 SHA、每个状态词、围栏里的
+    状态、带空格的 inline code 里的状态——`\\b` 版本对前两类全部漏过，反引号整段抹掉会放过最后一类。"""
+    sample = "\n".join([
+        "于2026-09-06起生效；T0 = 2026-09-03T13:51:18Z。",
+        "见提交 8ee96b4a 与 05797af372f2577fafa5e8fd1ae54a3343d475be。",
+        "```bash", "# 3c-1B ticket 18 起还有两个旗标", "```",
+        "真源：`2026-09-05 已部署 auth+panel`，见接手点。",
+    ] + [f"句子里有{re.sub(r'[|()\\\\dw+\[\]^$?.*{}-]', '', p.split('|')[0])}"
+         for p, _ in _STATUS_PATTERNS if not p.startswith("ticket")])
+    kinds = {(k, h) for _, k, h in _status_violations(sample)}
+    assert ("日期", "2026-09-06") in kinds and ("日期", "2026-09-03") in kinds, kinds
+    assert ("SHA", "8ee96b4a") in kinds and any(k == "SHA" and len(h) == 40 for k, h in kinds), kinds
+    assert ("状态词", "ticket 18 起") in kinds, "围栏里的状态没被扫到"
+    assert ("日期", "2026-09-05") in kinds and ("状态词", "已部署") in kinds, "inline code 成了逃生口"
+    for pat, why in _STATUS_PATTERNS:
+        if not pat.startswith("ticket"):
+            assert any(k == "状态词" and re.fullmatch(pat, h) for k, h in kinds), f"模式没在正对照里触发：{pat}（{why}）"
+
+
+def test_status_guard_ignores_protocol_prose_and_paths():
+    """**负对照**：协议说明与路径不能误红——否则改对的文档会被逼着换措辞。"""
+    clean = "\n".join([
+        "新签发的 cookie 在尚未更新的边缘节点验签失败——所以 verifier 先行。",
+        "本机制分两层；### 本机工具链；给 Claude Code 等本机客户端的 OAuth 用。",
+        "见 `docs/superpowers/specs/2026-08-28-asymmetric-session-signing-spec.md` §11.9。",
+        "`site-builder/scripts/verify_*` 是真机闸门；DSQL endpoint 自拼 `{id}.dsql.{region}.on.aws`。",
+        "**待办与优先级**见 §9；还剩什么没做读那张表；而下一步是不可逆的删参数。",
+    ])
+    assert _status_violations(clean) == [], _status_violations(clean)
