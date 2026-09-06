@@ -531,6 +531,7 @@ L3 只**关闭**了入口，下面这些**都还在**。删的时候按这张表
 | **闸门常量与第二次声明** | `scripts/verify_account_trust_boundary.py` 的 `JWT_PARAM_NAME` 常量、`LABEL_LEGACY` 与它映到的 `read-jwt-param` grant、`jwt_parameter` 那条 fact；**`--retire-key legacy` 的第二次使用**（第一次是 ⑤ 收 grant，这一次是删参数本体）|
 | **配置与文档** | `config.ini.example` 里 `[SessionKeys]` 的 `legacy_param` 键及其上方那段"清空本行即关闭 legacy 入口"的说明（**按键名找，别按行号**——行号会随文件增删漂移）、`signer` 说明里"legacy / current 两个合法取值"的措辞；`site-builder/DEPLOY.md` 十步 runbook 的 ①–⑤ 一段（那是"legacy 入口的一次性收敛"，届时整段成为历史）；根 `CLAUDE.md` 里"legacy 共享密钥待 3c-3 删除"那句 |
 | **验收脚本** | `verify_deployed_components.py` / `verify_deployed_edge.sh` 里断言"legacy 为空串 / 开关 off"的那些格子——它们在参数删除后要改成断言"根本不存在" |
+| **3c-1B-G 复审留下的迁移期残留** | `scripts/verify_account_trust_boundary.py`：`undecided_item_fp` / `undecided_members_v4` / bundle 里的 `coverage.schema4_fingerprints` / `_compare_coverage` 的 v4 分支 / `--migrate-from-schema` 的 3、4→5 通道（基线已是 schema 5，这些只为那一次迁移保留；删时连 `BUNDLE_SHAPE` 与 `_complete_bundle` 里的那个键一起删）；`router/infrastructure/stack.py` 的 `_session_keys_on_path()`：`site-builder/auth` 常驻 `sys.path[0]`（3c-1B-G 只做了幂等去重，没改成像 `_edge_placeholder_re` 那样按路径加载——三处 `from session_keys import …` 依赖它） |
 
 ---
 

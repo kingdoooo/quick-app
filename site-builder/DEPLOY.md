@@ -526,7 +526,8 @@ aws cloudfront get-distribution --id {distribution_id} \
 bash site-builder/scripts/verify_deployed_edge.sh # 产物逐行核对 + 占位符全部替换
 
 # ── C. 闸门：**出结论**（C1）与**写回基线**（C2）是两件事，顺序不能反
-#      （--update-baseline 不做比较，带着声明跑它等于什么都没声明）
+#      （--update-baseline 会先渲染一遍比较报告再写、报告生成不了就不写——但它**不改退出码**，
+#       语义仍是"我知道并接受这些变化"，所以先用 C1 出结论，再决定 C2）
 # C1 出结论：一次扫描 + 一次比较
 # **落 .scratch/ 而不是 /tmp**：dump 含真实角色名（gitignored 目录才安全），而 macOS 会清理 /tmp
 # ——2026-09-05 ⑩ 就是因为 ⑥ 那份 dump 已被清掉，`探测资源 68 → 73` 里有 +2 净增无法做集合差集归因。
@@ -552,9 +553,11 @@ python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump "$DUMP
 > 就是刻意设计——成员指纹 = `(principal, 动作等价类, 判不出的**资源类集合**)`，**集合整体进
 > 指纹**（为的是"多出一个精确平台函数照样红"）。于是新增一个 SSM 参数会让每个 SSM 读被
 > Condition 挡住的 principal 的资源类集合多一项 ⇒ 旧指纹消失、新指纹出现。
-> **`--new-key` / `--retire-key` 只把 `gained` / `lost` 的 grant 送进迁移桶，coverage churn
-> 没有迁移通道**，所以不要按"闸门必须全绿"验收这几步。**良性 churn 的五条判据**（全中才算
-> 良性，任一条不成立就是真漂移，停下来查）：
+> **当时** `--new-key` / `--retire-key` 只把 `gained` / `lost` 的 grant 送进迁移桶，coverage churn
+> 没有迁移通道，所以这几步没法按"闸门必须全绿"验收。**3c-1B-G 之后有了**（2026-09-06 复审版）：
+> 成员改成可分解形态、基线 schema 5，被声明 key 的资源类从**两侧**剔掉后相等即整批落绿
+> `migration_undecided`——新增与退役都能吸收，⑥/⑩ 声明过就该全绿。下面**五条判据只在声明解释
+> 不了 churn（报告里仍有红）时才需要人工走**（全中才算良性，任一条不成立就是真漂移，停下来查）：
 >
 > 1. `undecided_items` 的总量 delta 是 `+0`（或 ≤ 本轮声明的 key 数所能解释的量；**或**能归因到点名的
 >    无关 principal——`aws iam list-roles/list-users` 按 CreateDate 落在两次扫描之间过滤，带 Condition 策略的
@@ -576,8 +579,9 @@ python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump "$DUMP
 >    因为 `$LATEST` 从此不再带那个值）。对不上的 delta 才是漂移。facts 本身不参与红绿，所以
 >    这一条要**人读**，闸门 exit 0 不代替它。
 >
-> 真修复（让被声明的资源类不参与 coverage 指纹）是独立设计面：它会永久让该资源类在 coverage
-> 维度上失明，需要自己的不变量与用例，**没有排期**。
+> （历史注：这里原写"真修复没有排期"。它已在 3c-1B-G 及其复审里做掉——但**不是**"让被声明的资源类
+> 永久不参与 coverage"那个方向（那会让该资源类在 coverage 维度上失明），而是成员可分解 + 比较时
+> 对两侧临时剔类，基线里仍完整记着每个资源类。见上面 3c-1B-G 那段。）
 >
 > ⚠️ **C2 的时机是这套流程最容易做错的一步。** 被声明的 grant delta 分两批出现：
 > `ensure_session_keys.py` 建出参数**只**改变"通配前缀的宽读者能读到什么"，而 auth/panel 上
@@ -751,7 +755,7 @@ python3 site-builder/scripts/verify_kid_entry_live.py \
   --retired-token .scratch/rotation/legacy-upgrade.json
 
 # 闸门（部署已完成 ⇒ delta 已经存在，一轮 C1 + 一次 C2 就够）
-DUMP=/tmp/atb-$(date +%s).json      # 含真实角色名，**不要提交**
+DUMP="$(git rev-parse --show-toplevel)/.scratch/atb-$(date +%s).json"   # 含真实角色名，**不要提交**；落 .scratch/ 不落 /tmp（见片段 C）
 python3 site-builder/scripts/verify_account_trust_boundary.py --dump-observed "$DUMP"
 python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump "$DUMP" --retire-key legacy
 python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump "$DUMP" --update-baseline
@@ -784,7 +788,8 @@ KEYS="--new-key site-hs-v2 --new-key console-hs-v2"
 python3 site-builder/scripts/ensure_session_keys.py
 
 # 闸门第一轮（C1）：只有参数本身，**不写基线**
-D1=/tmp/atb-$(date +%s).json        # 含真实角色名，**不要提交**
+ROOT="$(git rev-parse --show-toplevel)"      # dump 落 .scratch/ 不落 /tmp（见片段 C）；后缀区分前后两份
+D1="$ROOT/.scratch/atb-$(date +%s)-stage-before.json"        # 含真实角色名，**不要提交**
 python3 site-builder/scripts/verify_account_trust_boundary.py --dump-observed "$D1"
 python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump "$D1" $KEYS
 
@@ -793,7 +798,7 @@ python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump "$D1" 
 python3 site-builder/scripts/verify_kid_entry_live.py --role previous
 
 # 闸门第二轮（C1）+ 写基线（C2）：精确 ARN 的 grant 到这里才存在
-D2=/tmp/atb-$(date +%s).json
+D2="$ROOT/.scratch/atb-$(date +%s)-stage-after.json"
 python3 site-builder/scripts/verify_account_trust_boundary.py --dump-observed "$D2"
 python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump "$D2" $KEYS
 python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump "$D2" --update-baseline
@@ -915,7 +920,7 @@ python3 site-builder/scripts/verify_kid_entry_live.py \
   --retired-token .scratch/rotation/v1-upgrade.json
 
 # 闸门（部署已完成 ⇒ 丢失已经发生，一轮 C1 + 一次 C2 就够）
-DUMP=/tmp/atb-$(date +%s).json      # 含真实角色名，**不要提交**
+DUMP="$(git rev-parse --show-toplevel)/.scratch/atb-$(date +%s).json"   # 含真实角色名，**不要提交**；落 .scratch/ 不落 /tmp（见片段 C）
 python3 site-builder/scripts/verify_account_trust_boundary.py --dump-observed "$DUMP"
 python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump "$DUMP" \
   --retire-key site-hs-v1 --retire-key console-hs-v1

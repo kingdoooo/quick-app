@@ -174,14 +174,16 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 # （LABEL ∈ 已配置 kid ∪ {legacy, login-flow}）。声明现在管**两件**事（3c-1B-G A6）：
 #   ① grant delta → `migration_grants`（绿）。**前置条件是该 principal 原本就能读到某把
 #      会话密钥**——"原先读不到、现在能读"是能力面真的变大，声明不该抹掉它，**这是刻意的**；
-#   ② coverage 指纹迁移 → `migration_undecided`（绿）。判据是**反事实**：把被声明 key 的
-#      资源类剔掉后重算，与基线相等才整批落绿，**有残差照红**。此前声明只管 ①，
-#      于是新增一把 key 会让每个受影响 principal 的 undecided 成员换指纹（实测两轮各 305 条）
-#      而只能人工 --update-baseline——那正是 spec §11.8.7 否决的工作流。
-# `--update-baseline` 现在**会先打印一遍比较报告再写**（原先在比较之前就 return ⇒
-# "接受了什么"不留痕）。用 `--dump-observed` 一次扫描 + 两条 `--from-dump` 省掉第二个
-# 11 分钟，**但两条只在实测路径上评估**：login-flow 那条硬断言，以及 A6 的反事实
-# （快照按哪组声明算的会被记下，声明不匹配即响亮拒绝）。
+#   ② coverage 成员迁移 → `migration_undecided`（绿）。成员是**可分解**形态
+#      `指纹|动作类|资源类,…`（基线 schema 5），判据是把被声明 key 的资源类从**基线与本次两侧**
+#      剔掉再比：相等才整批落绿，**剔完仍多出来的照红**。两侧都剔才同时覆盖新增（类只在本次有）
+#      与退役（类只在基线有）——第一版只在本次观测上剔，⑩ 的 `--retire-key` 声明过照样 305 条红。
+#      此前声明只管 ①，于是每把 key 的增减都只能人工 --update-baseline——正是 spec §11.8.7 否决的工作流。
+# `--update-baseline` **先打印一遍比较报告再写；报告生成不了就不写**（原先在比较之前就 return
+# ⇒ "接受了什么"不留痕；后来又曾 `except SystemExit` 照写 ⇒ 普通闸门里的硬失败在这条命令下
+# 变成静默放行）。用 `--dump-observed` 一次扫描 + 多条 `--from-dump` 省掉第二个 11 分钟，
+# 声明不进快照、比较时才归一化 ⇒ 同一份快照可按不同声明重比；**只有一条只在实测路径上评估**：
+# login-flow 那条硬断言（快照刻意不含它）。
 ```
 
 `site-builder/scripts/verify_*` 是真机闸门（部署后跑，不是单测）。**本文件不记数量与
