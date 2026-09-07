@@ -15,7 +15,8 @@ my-site/
 │   └── assets/...         # 其余静态资源任意组织
 └── backend/               # 仅 fullstack tier 出现；static 禁止
     ├── server.js          # Express 入口（Node 22）
-    ├── package.json       # 依赖清单（部署时 npm install --omit=dev）
+    ├── package.json       # 依赖清单（只写 registry 依赖：semver 范围 / dist-tag）
+    ├── package-lock.json  # 依赖锁定（必须；本地 npm install 生成后随包上传，部署时 npm ci --omit=dev）
     ├── db.js              # 仅 fullstack-sql；templates/db.js 原样复制
     ├── schema.sql         # 仅 fullstack-sql；全部建表 DDL
     └── migrations/        # 仅 fullstack-sql 迭代时；NNN_描述.sql
@@ -23,6 +24,10 @@ my-site/
 
 - `run.sh` 是 Lambda Web Adapter 的启动脚本（内容固定 `exec node server.js`）。
   打包器强制检查 zip 根存在 `run.sh`，缺失即部署失败（static tier 不需要）。
+- **`backend/package.json` 与 `backend/package-lock.json` 必须同在**（fullstack 两档，
+  校验器强制，见 `references/redlines.md` 红线 8）。lockfile 由本地 `npm install`
+  生成（也是本地预览的前提），打包时**不要排除它**；改过 `package.json` 之后要重新
+  `npm install`，否则校验器会报两者不一致。依赖只能来自公共 npm registry。
 - **`frontend/index.html` 必须存在且非空**（所有 tier，校验器强制）：站点首页由
   路由层固定取该文件，缺失时首页会永久 403。纯 API 场景也要放一个最小页面
   （例如一句用途说明），不能只放 assets。

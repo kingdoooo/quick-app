@@ -22,11 +22,14 @@ description: 开发并一键部署简易 Web 站点到 AWS。当用户想创建/
    - fullstack 后端一律 Express（Node 22）；`templates/run.sh` 原样放项目根
    - fullstack-sql 的数据库访问必须原样复制 `templates/db.js`，只通过
      `makePool()` 连接，schema 全部写进 `backend/schema.sql`
+   - fullstack 后端在 `backend/` 下跑一次 `npm install`（本地预览要它，**生成的
+     `package-lock.json` 是合同要求的一部分**，见 `references/redlines.md` 红线 8）；
+     依赖只写公共 registry 的包，不用 `file:` / git / URL 规格
 4. **本地预览**：static 直接开 index.html；fullstack 跑 `node server.js` 演示。
    用户确认后再部署。
 5. **部署**（MCP: site-builder-deploy）：
-   a. 项目目录打包为 site.zip（site.json 在 zip 根；**排除 node_modules**，
-      依赖由平台按 package.json 安装）
+   a. 项目目录打包为 site.zip（site.json 在 zip 根；**排除 node_modules、保留
+      backend/package-lock.json**——lockfile 缺失或与 package.json 不一致会在 validate 被拒）
    b. 调 `deploy_site(site_name)`（更新已有站点则带 site_id）→ 得 upload_url + job_id
    c. HTTP PUT site.zip 到 upload_url：`curl -X PUT -T site.zip "<upload_url>"`。
       **不要带 Content-Type 头**——预签名 URL 按无该头签名，
@@ -101,6 +104,7 @@ description: 开发并一键部署简易 Web 站点到 AWS。当用户想创建/
 - 站点代码零登录逻辑；当前用户 = 请求头 `x-user-email` / `x-user-name`
   （name 是 URL 编码的，用 `decodeURIComponent` 解码后再用）
 - 后端必须实现 `GET /api/health`
+- 后端依赖必须锁定：`backend/package-lock.json` 随包上传，只用公共 registry 的依赖
 - 不写本地文件；端口读 `process.env.PORT`；API 请求体 ≤1MB
 - 渲染用户输入用 textContent / DOM API，禁止拼 innerHTML（存储型 XSS）
 - DSQL 禁：外键/SERIAL/JSONB 列/触发器/TEMP TABLE → 用 UUID 主键、TEXT 存 JSON

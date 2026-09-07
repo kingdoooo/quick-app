@@ -76,7 +76,7 @@ def test_real_buildspec_satisfies_the_command_contract():
 
 def _npm_line(src):
     return next(l for l in src.splitlines()
-                if "npm install" in l and l.strip().startswith("-"))
+                if "npm ci" in l and l.strip().startswith("-"))
 
 
 def _find_line(src):
@@ -100,7 +100,7 @@ def _buildspec_counterexamples() -> dict[str, str]:
     i_f, i_n = lines.index(fnd), lines.index(npm)
     moved = lines[:i_f] + lines[i_f + 1:]
     j = next(k for k, l in enumerate(moved)
-             if "npm install" in l and l.strip().startswith("-"))
+             if "npm ci" in l and l.strip().startswith("-"))
     return {
         "flag 写成 --ignore-scripts=false": good.replace(
             "--ignore-scripts", "--ignore-scripts=false"),
@@ -128,6 +128,11 @@ def _buildspec_counterexamples() -> dict[str, str]:
         # **注释**上、命令序列没变，于是检查器正确地没红——反例自己写错了。
         "删 .npmrc 与 cd backend 换序": _swap_lines(
             good, "-name .npmrc -delete", "cd /tmp/site/backend"),
+        # 红线 8 的另一半：合同强制 lockfile，构建器就不能再用会**忽略** lockfile 漂移、
+        # 会**改写** lockfile 的 npm install——退回去等于把可复现性交还给 registry 当天的解析
+        "退回 npm install（不认 lockfile）": good.replace("npm ci ", "npm install "),
+        "npm ci 后追加 npm install":
+            "\n".join(lines[:i_n + 1] + ["      - npm install --ignore-scripts"] + lines[i_n + 1:]) + "\n",
     }
 
 

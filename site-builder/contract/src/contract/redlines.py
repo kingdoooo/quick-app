@@ -10,6 +10,27 @@ TEXT_EXT = {".html", ".htm", ".js", ".mjs", ".cjs", ".css", ".py", ".json", ".tx
 # npm 生命周期脚本在 CodeBuild 内以构建角色执行——buildspec 已 --ignore-scripts，
 # 此处再拦一层并给出可读报错（纵深防御，且让违规在部署前就暴露）。
 NPM_LIFECYCLE_KEYS = ("preinstall", "install", "postinstall", "prepare", "prepublish")
+# ── 红线 8：后端依赖锁定 ─────────────────────────────────────────────────
+# buildspec 用 `npm ci`：没有 lockfile、或 lockfile 与 package.json 不一致，它直接失败——
+# 但那发生在 provision-db 之后。合同层在 validate 就要求 backend/package-lock.json 存在、
+# 可解析、且每一个包都钉到 registry + integrity，并把报错写成一行修法。
+#
+# 为什么要看 `resolved` 的主机：它是 npm ci 实际下载的地址，删 `.npmrc` 管不到它——指向任意
+# tarball 的 lockfile 是另一条"改 registry 拉恶意包"的路。allowlist 主机 + 必带 sha512
+# `integrity` 两条一起才构成"这份字节 ⇒ 这棵依赖树"。采用者用私有镜像时改这个常量，并同步
+# `skills/site-builder/references/redlines.md`（有用例按本常量核对文档）。
+NPM_REGISTRY_URL_PREFIXES = ("https://registry.npmjs.org/",)
+# npm 7+ 写的 v2/v3 都带 `packages` 映射（键是 node_modules/… 路径）；v1（npm 6）只有嵌套
+# 的 `dependencies` 树，字段形态不同，不支持——让用户用新 npm 重新生成比再写一套解析器可靠。
+LOCKFILE_VERSIONS = (2, 3)
+_SRI_SHA512_RE = re.compile(r"\bsha512-[A-Za-z0-9+/]+={0,2}")
+# package.json 的依赖规格只许 semver 范围 / dist-tag。`file:` / `git+ssh://` / `github:u/r` /
+# `u/r` / `https://…tgz` / `npm:alias@x` / `link:` 都含 `:` 或 `/`，一条判据全拒：它们要么装
+# 本地字节（lockfile 里是 link，不可复现），要么绕开 registry allowlist。
+_DEP_SECTIONS = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
+LOCKFILE_REGEN_HINT = ("（在 backend/ 下用 npm ≥ 7 跑 "
+                       "`npm install --package-lock-only --registry=https://registry.npmjs.org/`"
+                       " 重新生成）")
 LOCALHOST_RE = re.compile(
     r"localhost|127\.\d+\.\d+\.\d+|127\.1|0\.0\.0\.0|\[::1\]", re.I)
 ABS_API_RE = re.compile(r"""["'`]https?://[^"'`]+/api/""", re.I)
@@ -202,21 +223,95 @@ def _read_all(root: Path) -> list[tuple[Path, str]]:
     return out
 
 
+def _dep_map(pkg: dict, section: str) -> dict:
+    v = pkg.get(section)
+    return v if isinstance(v, dict) else {}
+
+
+def _scan_dependency_specs(pkg: dict, rel: Path) -> list[str]:
+    """package.json 四个依赖段的规格只许 registry 形态（semver 范围 / dist-tag）。"""
+    out: list[str] = []
+    for section in _DEP_SECTIONS:
+        for name, spec in _dep_map(pkg, section).items():
+            if not isinstance(spec, str) or ":" in spec or "/" in spec:
+                out.append(f"{rel}: {section}.{name} 的规格 {spec!r} 不是 registry 依赖"
+                           "（禁止 file:/link:/git/URL/别名规格——它们绕开锁定与 registry 校验）")
+    return out
+
+
 def _scan_package_json(text: str, rel: Path) -> list[str]:
-    """拦 npm 生命周期脚本：它们在构建容器内以 CodeBuild 角色凭证执行。"""
+    """拦 npm 生命周期脚本（在构建容器内以 CodeBuild 角色凭证执行）与非 registry 依赖规格。"""
     try:
         pkg = json.loads(text)
     except ValueError:
         return [f"{rel}: package.json 不是合法 JSON"]
     if not isinstance(pkg, dict):
         return [f"{rel}: package.json 顶层必须为对象"]
+    out: list[str] = []
     scripts = pkg.get("scripts")
-    if not isinstance(scripts, dict):
-        return []
-    found = sorted(k for k in scripts if k.lower() in NPM_LIFECYCLE_KEYS)
-    if found:
-        return [f"{rel}: 禁止 npm 生命周期脚本 {found}（依赖安装阶段会执行任意命令）"]
-    return []
+    if isinstance(scripts, dict):
+        found = sorted(k for k in scripts if k.lower() in NPM_LIFECYCLE_KEYS)
+        if found:
+            out.append(f"{rel}: 禁止 npm 生命周期脚本 {found}（依赖安装阶段会执行任意命令）")
+    return out + _scan_dependency_specs(pkg, rel)
+
+
+def _scan_package_lock(text: str, rel: Path, pkg_text: str | None) -> list[str]:
+    """package-lock.json 必须钉住每一个包：registry 主机 allowlist + sha512 integrity，
+    且与同目录 package.json 的依赖声明一致。
+
+    只看 v2/v3 的 `packages` 映射；根条目 `""` 是 package.json 的镜像（npm 原样写入四个
+    依赖段），拿它做一致性比对。`inBundle` 的包随父 tarball 分发、没有自己的 resolved /
+    integrity，是唯一放行的缺省形态。
+    """
+    try:
+        lock = json.loads(text)
+    except ValueError:
+        return [f"{rel}: package-lock.json 不是合法 JSON{LOCKFILE_REGEN_HINT}"]
+    if not isinstance(lock, dict):
+        return [f"{rel}: package-lock.json 顶层必须为对象{LOCKFILE_REGEN_HINT}"]
+    if lock.get("lockfileVersion") not in LOCKFILE_VERSIONS:
+        return [f"{rel}: lockfileVersion 必须是 {list(LOCKFILE_VERSIONS)} 之一，"
+                f"得到 {lock.get('lockfileVersion')!r}{LOCKFILE_REGEN_HINT}"]
+    packages = lock.get("packages")
+    if not isinstance(packages, dict) or not isinstance(packages.get(""), dict):
+        return [f'{rel}: package-lock.json 缺少 packages[""] 根条目{LOCKFILE_REGEN_HINT}']
+    out: list[str] = []
+    for key, entry in sorted(packages.items()):
+        if key == "":
+            continue
+        if not isinstance(entry, dict):
+            out.append(f"{rel}: packages[{key!r}] 必须为对象")
+            continue
+        if not key.startswith("node_modules/") or entry.get("link") is True:
+            out.append(f"{rel}: packages[{key!r}] 不是从 registry 安装的包"
+                       f"（workspace / file: / link 依赖不可复现，禁止）{LOCKFILE_REGEN_HINT}")
+            continue
+        if entry.get("inBundle") is True:
+            continue
+        resolved = entry.get("resolved")
+        if not isinstance(resolved, str) or not resolved.startswith(NPM_REGISTRY_URL_PREFIXES):
+            out.append(f"{rel}: packages[{key!r}].resolved 必须以 "
+                       f"{' / '.join(NPM_REGISTRY_URL_PREFIXES)} 开头，得到 {resolved!r}"
+                       f"（其它 registry/镜像/任意 URL 一律拒绝；私有镜像生成的 lockfile 要对公共 registry 重新生成）"
+                       f"{LOCKFILE_REGEN_HINT}")
+        integrity = entry.get("integrity")
+        if not isinstance(integrity, str) or not _SRI_SHA512_RE.search(integrity):
+            out.append(f"{rel}: packages[{key!r}].integrity 缺少 sha512{LOCKFILE_REGEN_HINT}")
+    if pkg_text is None:
+        out.append(f"{rel}: 同目录没有 package.json——npm ci 需要两者同在")
+        return out
+    try:
+        pkg = json.loads(pkg_text)
+    except ValueError:
+        return out      # package.json 自己那条已由 _scan_package_json 报
+    if isinstance(pkg, dict):
+        root = packages[""]
+        for section in _DEP_SECTIONS:
+            if _dep_map(pkg, section) != _dep_map(root, section):
+                out.append(f'{rel}: packages[""].{section} 与 package.json 不一致——'
+                           f"改了 package.json 之后要重新生成 lockfile{LOCKFILE_REGEN_HINT}")
+    return out
 
 
 def _check_user_name_decoded(text: str, rel: Path) -> list[str]:
@@ -312,9 +407,16 @@ def scan_redlines(site_dir: Path, manifest: dict) -> list[str]:
 
     backend_dir = site_dir / "backend"
     backend_files = _read_all(backend_dir)
-    backend_text = "\n".join(t for _, t in backend_files)
+    texts = {p: t for p, t in backend_files}
+    # lockfile 不是站点代码：不进 HEALTH_RE 的合并文本，也不走下面的泛用正则（几十 KB 的
+    # 包名 / URL 上那些正则只会制造误报，且对 auth / 写文件红线没有信息量——站点自己依赖了
+    # 什么，package.json 文本里就有）。它只走 _scan_package_lock。
+    backend_text = "\n".join(t for p, t in backend_files if p.name != "package-lock.json")
     for p, text in backend_files:
         rel = p.relative_to(site_dir)
+        if p.name == "package-lock.json":
+            violations += _scan_package_lock(text, rel, texts.get(p.parent / "package.json"))
+            continue
         if AUTH_RE.search(text):
             violations.append(f"{rel}: 站点代码禁止自带 auth 逻辑（鉴权由平台边缘层统一处理）")
         if FILE_WRITE_RE.search(text):
@@ -322,6 +424,15 @@ def scan_redlines(site_dir: Path, manifest: dict) -> list[str]:
         violations += _check_user_name_decoded(text, rel)
         if p.name == "package.json":
             violations += _scan_package_json(text, rel)
+    # npm ci 的两个前提：package.json 与 package-lock.json 同在 backend/ 根。缺任一它在
+    # package 阶段才失败（provision-db 之后）；这里提前到 validate 并给出修法。
+    for name in ("package.json", "package-lock.json"):
+        if not (backend_dir / name).is_file():
+            violations.append(f"backend/{name} 缺失：后端依赖必须锁定，构建用 npm ci"
+                              f"{LOCKFILE_REGEN_HINT}")
+    if (backend_dir / "npm-shrinkwrap.json").exists():
+        violations.append("backend/npm-shrinkwrap.json: 禁止——npm ci 会优先读它、跳过"
+                          "被校验的 package-lock.json")
     if (backend_dir / ".npmrc").exists():
         violations.append("backend/.npmrc: 禁止自带 .npmrc（可改 registry 拉入恶意包）")
     if not HEALTH_RE.search(backend_text):

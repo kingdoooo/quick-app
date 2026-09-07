@@ -232,10 +232,11 @@ deployer exec 角色另有 `role/site-rt-*` 上的 `PutRolePolicy` / `AttachRole
 | 站点**自己的** `package.json` 里写 `preinstall`/`postinstall` 等 | **两道**：合同校验器在 CodeBuild **之前**就拒（`contract/redlines.py` 的 `NPM_LIFECYCLE_KEYS`；`_scan_package_json` 对 `backend/` 下**任何** `package.json` 生效）＋ `--ignore-scripts` |
 | 站点**自己的** `backend/.npmrc` | **两道**：合同校验器直接拒＋ buildspec 的 `find /tmp/site -name .npmrc -delete` |
 | **依赖**（transitive）里的生命周期脚本 | **只有 `--ignore-scripts` 一道** |
+| lockfile 的 `resolved` 指向任意 tarball、`file:` / git / URL 规格的依赖 | **合同校验器一道**（红线 8）：`backend/package-lock.json` 必须存在，每个条目 `resolved` 在 registry allowlist 且带 sha512 `integrity`，`package.json` 四个依赖段禁非 registry 规格；构建器用 `npm ci` 只装 lockfile 里那棵树 |
 
-第三行才是要紧的那一行：`_scan_package_json` **只看站点自己的 `scripts` 段，从不检查
-`dependencies`**（registry、版本范围、`git+`、`file:` 规格一概不限），而扫描器只读
-`TEXT_EXT` 里的后缀 ⇒ **`.tgz` 依赖根本不被打开**。实测（npm 10.9.8 / node 22）：把一个
+第三行才是要紧的那一行：红线 8 之后 `file:` / git / URL 规格在 validate 就被拒、lockfile
+条目必须来自 registry allowlist，但那是**可复现性**约束——registry 上的包照样可以带生命周期
+脚本，校验器不打开任何 tarball。实测（npm 10.9.8 / node 22）：把一个
 带 `preinstall` 的包 `npm pack` 成本地 `.tgz`、以 `"file:./dep.tgz"` 作依赖，
 `npm install` **会执行**那个 `preinstall`，而加上 `--ignore-scripts` **不会**。
 也就是说对"依赖投毒"这条最现实的路径，那条 flag 确实是唯一控制点，且它对合同校验器

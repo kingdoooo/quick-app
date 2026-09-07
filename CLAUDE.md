@@ -31,7 +31,7 @@ Quick 自动化建站平台（Site Builder）：业务人员在任意支持 Skil
 - 同名 cookie 遮蔽只关掉了 DoS，**没关身份混淆**：攻击者持有另一个**合法** token 时仍会先被取到。根治是 host-only 会话，独立成包。
 - **在 HS256 形态下，平台的安全边界就是 AWS 账号本身**。账号内任何具备只读级权限的 principal 都能取得会话密钥（三条路：Edge 产物里是明文，含历史已发布版本；同一份产物在 CDK bootstrap S3 桶里还有带活密钥的 asset；SSM 参数有四个动作都能读出明文），从而以任意用户身份访问任意站点**与控制台写接口**。密钥带 `kid`、可轮转都不改变这一条：对称 ⇒ 读到就能签。AWS 托管策略 `ReadOnlyAccess` 就含 `ssm:Get*` 与 `lambda:GetFunction`，所以资产在采用者的共享账号里必须按这个威胁模型设计——这正是 3c-final（KMS 非对称、Edge 只放公钥）存在的理由。**别按 merged review 里 M09 第 2 步的原话去收窄 invoke，那是假修复**（同一批身份还握着密钥读取与自助提权）。实测数字、为什么 SCP / resource policy / 对称签名都不成立、以及盯住暴露面别再变大的闸门（A 直接失守 + B IAM 写静态快照两层；C 站点 route/alias 可达性归部署验收），见 `docs/security/account-trust-boundary.md`。**本文件不记那些数字**：它们每部署一次 Edge 就变，写死必过时；有一条单测按标记核对文档与基线一致。
 
-**CodeBuild 那道隔断分两层，别记成"只有一条 flag"**：跑不可信站点依赖安装的 CodeBuild 角色对 bootstrap 桶零权限（S3 权限全集由 `deployer/tests/security_contracts.py` 按等值断言），但 `--ignore-scripts` 仍然必须留着，因为构建容器里任意代码执行仍能读 `validated/*`、写 `artifacts/*`。站点**自己的** `package.json` 生命周期脚本与 `backend/.npmrc` 由合同校验器在 CodeBuild **之前**就拒（`contract/redlines.py` 的 `NPM_LIFECYCLE_KEYS`）；**依赖里**的生命周期脚本**只有** `buildspec-package.yml` 的 `npm install --ignore-scripts` 一道——`_scan_package_json` 从不检查 `dependencies`，而 `.tgz` 依赖根本不在扫描后缀里（实测：带 `preinstall` 的包打成本地 `.tgz` 作依赖，`npm install` 会执行它，加上 `--ignore-scripts` 不会）。
+**CodeBuild 那道隔断分两层，别记成"只有一条 flag"**：跑不可信站点依赖安装的 CodeBuild 角色对 bootstrap 桶零权限（S3 权限全集由 `deployer/tests/security_contracts.py` 按等值断言），但 `--ignore-scripts` 仍然必须留着，因为构建容器里任意代码执行仍能读 `validated/*`、写 `artifacts/*`。站点**自己的** `package.json` 生命周期脚本与 `backend/.npmrc` 由合同校验器在 CodeBuild **之前**就拒（`contract/redlines.py` 的 `NPM_LIFECYCLE_KEYS`）；**依赖里**的生命周期脚本**只有** `buildspec-package.yml` 的 `npm ci --ignore-scripts` 一道——合同的红线 8 拒的是 `file:` / git / URL 规格与非公共 registry 的 lockfile 条目（可复现性），registry 上的依赖照样能带 `preinstall`，所以那条 flag 不能去（实测：带 `preinstall` 的包打成本地 `.tgz` 作依赖，`npm install` 会执行它，加上 `--ignore-scripts` 不会；今天这种 `file:` 规格在 validate 就被拒，但结论对 registry 依赖同样成立）。
 
 **具体进度与闸门数字不写在本文件**（会过时）：确切数字靠下面的测试命令自己跑；
 **待办与优先级**见 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9
@@ -303,7 +303,7 @@ decodeURIComponent）。**CloudFront 全站禁缓存是鉴权正确性前提**
 
 | 改动 | 必须同步检查 |
 |---|---|
-| `contract/` schema/redlines | validator、Skill references、fixtures、生成模板 |
+| `contract/` schema/redlines | validator、Skill references、fixtures、生成模板；红线 8（lockfile）还与 `deployer/buildspec-package.yml` 的 `npm ci` 和 `deployer/tests/security_contracts.py` 的精确命令 allowlist 互为前提——撤任何一侧另一侧就失效 |
 | `permissions.py` | deployer tests、panel、key-proxy、MCP、三个产物重部 |
 | `auth/session.py` | auth 调用方、panel copy、Edge verifier、auth→Edge 向量 |
 | `origin_request.py` | router tests、origin-response 对称契约、CDK asset、Edge 部署 |

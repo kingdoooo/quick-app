@@ -19,7 +19,10 @@ phases:
       - cd /tmp/site/backend
       # --ignore-scripts 必需：站点 package.json 由 AI 生成、owner 可任意改，
       # preinstall/postinstall 会在本构建容器内以 CodeBuild 角色凭证任意执行。
-      - npm install --omit=dev --no-audit --no-fund --ignore-scripts
+      # npm ci 而不是 npm install：合同要求 backend/package-lock.json（红线 8），ci 只装
+      # lockfile 里那棵树、与 package.json 不一致直接失败、不改写 lockfile ——
+      # 同一份上传字节在任何时间装出同一棵依赖树。
+      - npm ci --omit=dev --no-audit --no-fund --ignore-scripts
       - cp /tmp/site/run.sh ./run.sh && chmod +x ./run.sh
       - zip -qr /tmp/backend.zip .
       - aws s3 cp /tmp/backend.zip "s3://$ARTIFACTS_BUCKET/artifacts/$JOB_ID/backend.zip"

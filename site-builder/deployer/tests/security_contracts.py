@@ -29,8 +29,9 @@ import shlex
 _SEPARATORS = ("&&", "||", ";", "|")
 # **精确 token 列表**，不是"含某个子串"：加一个 `--ignore-scripts=false` 或
 # `--no-ignore-scripts` 都能把语义翻过来，而"含 --ignore-scripts"照样绿。
-EXPECT_NPM_INSTALL = ["npm", "install", "--omit=dev", "--no-audit", "--no-fund",
-                      "--ignore-scripts"]
+# `ci` 而不是 `install`：合同强制 lockfile（红线 8），只有 ci 会拒 lockfile 漂移、不改写它。
+EXPECT_NPM_CI = ["npm", "ci", "--omit=dev", "--no-audit", "--no-fund",
+                 "--ignore-scripts"]
 EXPECT_NPMRC_DELETE = ["find", "/tmp/site", "-name", ".npmrc", "-delete"]
 
 # **整条命令序列的 allowlist。** 只判"有没有别的 npm 子命令"是不够的——实测
@@ -39,7 +40,7 @@ EXPECT_NPMRC_DELETE = ["find", "/tmp/site", "-name", ".npmrc", "-delete"]
 # `bash -lc`…），所以改成整体等值：buildspec 只有 12 条固定命令，任何新增/改写/换序
 # 都必须显式更新本清单并重新过一次 review。
 #
-# 两条隔断（`EXPECT_NPMRC_DELETE` 在 `EXPECT_NPM_INSTALL` **之前**）由这份清单的
+# 两条隔断（`EXPECT_NPMRC_DELETE` 在 `EXPECT_NPM_CI` **之前**）由这份清单的
 # 顺序本身保证；单独那几条判据留着只是为了报文能点名是哪条隔断坏了。
 EXPECTED_COMMANDS: list[list[str]] = [
     ["aws", "s3", "cp",
@@ -50,7 +51,7 @@ EXPECTED_COMMANDS: list[list[str]] = [
     ["test", "-f", "/tmp/site/run.sh"],
     EXPECT_NPMRC_DELETE,
     ["cd", "/tmp/site/backend"],
-    EXPECT_NPM_INSTALL,
+    EXPECT_NPM_CI,
     ["cp", "/tmp/site/run.sh", "./run.sh"],
     ["chmod", "+x", "./run.sh"],
     ["zip", "-qr", "/tmp/backend.zip", "."],
@@ -117,14 +118,14 @@ def build_container_interlock_violations(src: str) -> list[str]:
         return out
     # ① 先给两条隔断单独的报文（整体等值也能抓到，但报文说不出坏的是哪条隔断）
     installs = [(i, c) for i, c in enumerate(cmds)
-                if c[:2] == ["npm", "install"]]
+                if c[:2] == ["npm", "ci"]]
     if len(installs) != 1:
-        out.append(f"buildspec 里有 {len(installs)} 条 `npm install`（必须恰好 1 条）")
+        out.append(f"buildspec 里有 {len(installs)} 条 `npm ci`（必须恰好 1 条）")
     else:
         i_npm, install = installs[0]
-        if install != EXPECT_NPM_INSTALL:
-            out.append(f"`npm install` 的 token 不是预期的精确列表。\n"
-                       f"      期望: {EXPECT_NPM_INSTALL}\n      实际: {install}\n"
+        if install != EXPECT_NPM_CI:
+            out.append(f"`npm ci` 的 token 不是预期的精确列表。\n"
+                       f"      期望: {EXPECT_NPM_CI}\n      实际: {install}\n"
                        f"      （精确比对是刻意的：`--ignore-scripts=false` 与 "
                        f"`--no-ignore-scripts` 都能把语义翻过来，而「含这个子串」照样绿）")
         finds = [i for i, c in enumerate(cmds) if c == EXPECT_NPMRC_DELETE]
@@ -133,7 +134,7 @@ def build_container_interlock_violations(src: str) -> list[str]:
             out.append(f"找不到精确的删 .npmrc 命令 {EXPECT_NPMRC_DELETE}"
                        f"（近似的有 {got or '无'}——删错目录等于没删）")
         elif min(finds) > i_npm:
-            out.append(f"删 .npmrc 发生在 `npm install` **之后**（第 {min(finds)} 条 vs "
+            out.append(f"删 .npmrc 发生在 `npm ci` **之后**（第 {min(finds)} 条 vs "
                        f"第 {i_npm} 条）——装依赖时 registry 已经被它改过了")
     # ② 整体等值：任何新增命令（含 `env npm rebuild` / `sh -c '…'` / `npx` / `node -e`
     #    这类绕过首 token 判据的 wrapper）都在这里红

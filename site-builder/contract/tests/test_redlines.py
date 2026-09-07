@@ -1,12 +1,33 @@
+import copy
 import json
 from pathlib import Path
 import pytest
 from contract import scan_redlines
 
+# 红线 8 之后"合法 fullstack 站点"必须带这一对；无依赖的最小形态（npm 对空依赖生成的就是它）。
+MINIMAL_PACKAGE_JSON = '{"name": "t", "private": true}'
+MINIMAL_LOCK = json.dumps({"name": "t", "lockfileVersion": 3, "requires": True,
+                           "packages": {"": {"name": "t"}}})
+# 带一个 registry 依赖的配对：负向用例在它上面做单点变形，正向对照就是它本身。
+# 哈希是假的（校验器只看 SRI 形态，不算哈希——算哈希是 npm ci 的事）。
+ONE_DEP_PACKAGE_JSON = '{"name": "t", "private": true, "dependencies": {"express": "^4.19"}}'
+ONE_DEP_LOCK = {
+    "name": "t", "lockfileVersion": 3, "requires": True,
+    "packages": {
+        "": {"name": "t", "dependencies": {"express": "^4.19"}},
+        "node_modules/express": {
+            "version": "4.21.2",
+            "resolved": "https://registry.npmjs.org/express/-/express-4.21.2.tgz",
+            "integrity": "sha512-" + "A" * 86 + "==",
+            "license": "MIT"},
+    }}
+
 
 def make_site(tmp_path: Path, *, tier="fullstack-sql", index="fetch('/api/items')",
               server="app.get('/api/health',(q,s)=>s.send('ok'))",
-              schema="CREATE TABLE t (id UUID PRIMARY KEY);") -> tuple[Path, dict]:
+              schema="CREATE TABLE t (id UUID PRIMARY KEY);",
+              package_json: str | None = MINIMAL_PACKAGE_JSON,
+              lockfile: str | None = MINIMAL_LOCK) -> tuple[Path, dict]:
     (tmp_path / "frontend").mkdir()
     (tmp_path / "frontend/index.html").write_text(f"<script>{index}</script>")
     manifest = {"name": "t", "tier": tier,
@@ -16,6 +37,10 @@ def make_site(tmp_path: Path, *, tier="fullstack-sql", index="fetch('/api/items'
     if tier != "static":
         (tmp_path / "backend").mkdir()
         (tmp_path / "backend/server.js").write_text(server)
+        if package_json is not None:
+            (tmp_path / "backend/package.json").write_text(package_json)
+        if lockfile is not None:
+            (tmp_path / "backend/package-lock.json").write_text(lockfile)
         manifest["backend"] = {"runtime": "nodejs22.x", "entrypoint": "node server.js", "port": 8080}
         if tier == "fullstack-sql":
             (tmp_path / "backend/schema.sql").write_text(schema)
@@ -706,3 +731,190 @@ def test_table_name_charsets_are_documented_in_the_agent_facing_contract():
     # 光贴两个正则不够：Agent 需要知道**怎么改**，而它拿到的报错只有校验器那一条
     assert "_" in section and "连字符" in section, \
         "那一节没写清「用下划线代替连字符」这个可执行的修法"
+
+
+# ── 红线 8：后端依赖必须锁定（合同强制 lockfile，构建用 npm ci）──────────────
+#
+# 为什么在合同层而不是只靠 npm ci：npm ci 对"无 lockfile"/"与 package.json 不一致"确实会
+# 失败，但那发生在 package 阶段——provision-db 之后，用户已经等了两个 phase，且报错是 npm 的
+# 原文。更要紧的是 npm ci **不拒** `file:` link 依赖（单机实测：装出 symlink 并成功），也不管
+# `resolved` 指向哪个主机——这两条只能由校验器拒。
+
+
+def _lock_mutations() -> dict[str, dict]:
+    """在 ONE_DEP_LOCK 上做**单点**变形；每条都必须让校验器红。"""
+    base = ONE_DEP_LOCK
+    k = "node_modules/express"
+    muts: dict[str, dict] = {}
+
+    def mut(label):
+        m = copy.deepcopy(base)
+        muts[label] = m
+        return m
+
+    mut("resolved 指向别的主机")["packages"][k]["resolved"] = "https://evil.example/x.tgz"
+    mut("resolved 用 http")["packages"][k]["resolved"] = "http://registry.npmjs.org/x.tgz"
+    mut("主机后缀伪装")["packages"][k]["resolved"] = \
+        "https://registry.npmjs.org.evil.example/x.tgz"
+    del mut("没有 integrity")["packages"][k]["integrity"]
+    mut("integrity 只有 sha1")["packages"][k]["integrity"] = "sha1-deadbeef"
+    mut("lockfileVersion 1")["lockfileVersion"] = 1
+    mut("link 依赖")["packages"]["node_modules/local"] = {"resolved": "local", "link": True}
+    mut("workspace 键（不在 node_modules/ 下）")["packages"]["libs/x"] = {"version": "1.0.0"}
+    del mut("没有根条目")["packages"][""]
+    mut("根条目依赖漂移")["packages"][""]["dependencies"]["lodash"] = "^4"
+    return muts
+
+
+def test_one_dep_lockfile_is_the_positive_control(tmp_path):
+    """负向用例全部建立在这一份能过的 lockfile 上；它不过，下面的红都没有意义。"""
+    d, m = make_site(tmp_path, package_json=ONE_DEP_PACKAGE_JSON,
+                     lockfile=json.dumps(ONE_DEP_LOCK))
+    assert scan_redlines(d, m) == []
+
+
+@pytest.mark.parametrize("label", list(_lock_mutations()))
+def test_each_lockfile_mutation_is_rejected(tmp_path, label):
+    mutated = _lock_mutations()[label]
+    assert mutated != ONE_DEP_LOCK, f"变形没生效：{label}"
+    d, m = make_site(tmp_path, package_json=ONE_DEP_PACKAGE_JSON,
+                     lockfile=json.dumps(mutated))
+    v = scan_redlines(d, m)
+    assert any("package-lock.json" in x for x in v), f"**没红**：{label}: {v}"
+
+
+def test_missing_lockfile_is_a_violation(tmp_path):
+    d, m = make_site(tmp_path, lockfile=None)
+    v = scan_redlines(d, m)
+    assert any("package-lock.json 缺失" in x for x in v), v
+    assert any("npm install --package-lock-only" in x for x in v), "报错没给可执行的修法"
+
+
+def test_missing_package_json_is_a_violation(tmp_path):
+    """npm ci 没有 package.json 直接 EUSAGE——今天它是可选的，红线 8 起必需。"""
+    d, m = make_site(tmp_path, package_json=None)
+    assert any("package.json 缺失" in x for x in scan_redlines(d, m))
+
+
+def test_shrinkwrap_is_rejected(tmp_path):
+    """npm ci 有 npm-shrinkwrap.json 就优先读它、忽略被校验的 package-lock.json。"""
+    d, m = make_site(tmp_path)
+    (d / "backend/npm-shrinkwrap.json").write_text(MINIMAL_LOCK)
+    assert any("npm-shrinkwrap.json" in x for x in scan_redlines(d, m))
+
+
+def test_lockfile_out_of_sync_with_package_json_is_rejected(tmp_path):
+    """改了 package.json 忘了重生成 lockfile：npm ci 会在 package 阶段才失败，这里提前。"""
+    pkg = json.loads(ONE_DEP_PACKAGE_JSON)
+    pkg["dependencies"]["lodash"] = "^4"
+    d, m = make_site(tmp_path, package_json=json.dumps(pkg), lockfile=json.dumps(ONE_DEP_LOCK))
+    assert any("与 package.json 不一致" in x for x in scan_redlines(d, m))
+
+
+def test_lockfile_that_is_not_json_is_rejected(tmp_path):
+    d, m = make_site(tmp_path, lockfile="not json")
+    assert any("package-lock.json" in x for x in scan_redlines(d, m))
+    sub = tmp_path / "arr"          # 第二个站点要一个还没有 frontend/ 的目录
+    sub.mkdir()
+    d2, m2 = make_site(sub, lockfile="[]")
+    assert any("package-lock.json" in x for x in scan_redlines(d2, m2))
+
+
+def test_bundled_entry_needs_no_resolved_or_integrity(tmp_path):
+    """inBundle 的包随父 tarball 分发，npm 不给它单独的 resolved/integrity——放行是刻意的。"""
+    lock = copy.deepcopy(ONE_DEP_LOCK)
+    lock["packages"]["node_modules/express/node_modules/b"] = {"version": "1.0.0", "inBundle": True}
+    d, m = make_site(tmp_path, package_json=ONE_DEP_PACKAGE_JSON, lockfile=json.dumps(lock))
+    assert scan_redlines(d, m) == []
+
+
+@pytest.mark.parametrize("spec", [
+    "file:./dep", "git+ssh://git@github.com/a/b.git", "github:a/b", "a/b",
+    "https://example.test/y.tgz", "npm:lodash-es@^4", "link:../x",
+])
+def test_non_registry_dependency_specs_are_rejected(tmp_path, spec):
+    """规格含 ':' 或 '/' 的都不是 registry 依赖：装本地字节或绕开主机 allowlist。"""
+    pkg = {"name": "t", "private": True, "dependencies": {"d": spec}}
+    d, m = make_site(tmp_path, package_json=json.dumps(pkg))
+    assert any("不是 registry 依赖" in x for x in scan_redlines(d, m)), spec
+
+
+def test_registry_specs_in_every_section_pass(tmp_path):
+    pkg = {"name": "t", "private": True,
+           "dependencies": {"express": "^4.19", "x": "latest", "y": "1.0.0 || 2.x"},
+           "devDependencies": {"z": "~1"}, "optionalDependencies": {"o": "*"},
+           "peerDependencies": {"p": ">=1 <3"}}
+    lock = {"name": "t", "lockfileVersion": 3, "requires": True,
+            "packages": {"": {"name": "t", **{s: pkg[s] for s in (
+                "dependencies", "devDependencies", "optionalDependencies", "peerDependencies")}}}}
+    d, m = make_site(tmp_path, package_json=json.dumps(pkg), lockfile=json.dumps(lock))
+    assert scan_redlines(d, m) == []
+
+
+def test_dev_dependency_spec_is_also_checked(tmp_path):
+    pkg = {"name": "t", "private": True, "devDependencies": {"d": "file:./tool"}}
+    d, m = make_site(tmp_path, package_json=json.dumps(pkg))
+    assert any("devDependencies.d" in x for x in scan_redlines(d, m))
+
+
+def test_lockfile_is_not_scanned_by_the_code_redlines(tmp_path):
+    """lockfile 不是站点代码：里面出现 `cookie-session` 这种**包名**不该触发 auth 红线。
+
+    站点自己若真依赖它，package.json 文本里就有这个词，那一处照样被 AUTH_RE 拦。
+    """
+    lock = copy.deepcopy(ONE_DEP_LOCK)
+    lock["packages"]["node_modules/cookie-session"] = {
+        "version": "2.1.0",
+        "resolved": "https://registry.npmjs.org/cookie-session/-/cookie-session-2.1.0.tgz",
+        "integrity": "sha512-" + "B" * 86 + "=="}
+    d, m = make_site(tmp_path, package_json=ONE_DEP_PACKAGE_JSON, lockfile=json.dumps(lock))
+    assert not any("auth" in x.lower() for x in scan_redlines(d, m))
+
+
+def test_static_tier_needs_no_lockfile(tmp_path):
+    d, m = make_site(tmp_path, tier="static")
+    assert scan_redlines(d, m) == []
+
+
+# ── 黄金 fixture 与合同的 parity ─────────────────────────────────────────────
+# 改合同要同步三处（CLAUDE.md）：校验器、references、fixtures。这条锁 fixtures：三个黄金样例
+# 必须原样过 schema + 红线；fullstack 的两个必须带 lockfile（红线 8）。fixture 的 run.sh 在
+# fixtures/ 父目录，不在扫描范围内（校验器不查它，打包器才查）。
+FIXTURES = Path(__file__).parents[2] / "fixtures"
+
+
+@pytest.mark.parametrize("fixture", sorted(
+    p.name for p in FIXTURES.iterdir() if (p / "site.json").is_file()))
+def test_golden_fixture_passes_the_contract(fixture):
+    from contract.schema import validate_manifest
+    tree = FIXTURES / fixture
+    manifest = json.loads((tree / "site.json").read_text(encoding="utf-8"))
+    assert validate_manifest(manifest) == []
+    assert scan_redlines(tree, manifest) == [], f"黄金样例 {fixture} 过不了自己的合同"
+    if manifest["tier"] != "static":
+        assert (tree / "backend/package-lock.json").is_file(), \
+            f"{fixture} 没有 lockfile——Agent 照着它生成的站点会被红线 8 拒"
+
+
+def test_lockfile_redline_is_documented_in_the_agent_facing_docs():
+    """红线 8 的三处同步里的"文档"这一处：校验器拦了、文档没写 ⇒ Agent 只能靠报错自解释。
+
+    期望值从代码真源推导（registry 前缀、lockfileVersion 列表），不在测试里抄第二份——
+    否则"改了常量忘了改文档"这个唯一有价值的信号就没了（同表名字符集那条守卫的理由）。
+    切到 `## 红线 8` 那一节内判，不做全文 substring。
+    """
+    from contract.redlines import LOCKFILE_VERSIONS, NPM_REGISTRY_URL_PREFIXES
+    skill = Path(__file__).parents[2] / "skills" / "site-builder"
+    redlines_doc = (skill / "references" / "redlines.md").read_text(encoding="utf-8")
+    anchor = "## 红线 8"
+    assert anchor in redlines_doc, "redlines.md 里找不到红线 8 那一节——本条已空转"
+    section = redlines_doc.split(anchor, 1)[1].split("\n## ", 1)[0]
+    for needle in ("package-lock.json", "npm-shrinkwrap.json", "npm install --package-lock-only",
+                   f"lockfileVersion 必须是 {list(LOCKFILE_VERSIONS)}",
+                   *NPM_REGISTRY_URL_PREFIXES, "file:"):
+        assert needle in section, f"红线 8 那一节没写 {needle!r}"
+    contract_doc = (skill / "references" / "contract.md").read_text(encoding="utf-8")
+    assert "package-lock.json" in contract_doc and "npm ci" in contract_doc, \
+        "contract.md 的目录树没把 lockfile 与 npm ci 写进去"
+    skill_md = (skill / "SKILL.md").read_text(encoding="utf-8")
+    assert "package-lock.json" in skill_md, "SKILL.md 的打包步骤没提 lockfile 要随包上传"

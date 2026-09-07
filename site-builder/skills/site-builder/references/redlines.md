@@ -224,6 +224,50 @@ CREATE INDEX idx_orders_user ON orders (user_id);
 `ALTER ROLE`、`AWS IAM GRANT`）或全局 DDL——不是被扫描器拦下，而是执行时因
 权限不足直接失败。只写本站点自己的表/索引/视图。
 
+## 红线 8：后端依赖必须锁定（仅 fullstack）
+
+- **规则**：`backend/package.json` 与 `backend/package-lock.json` 必须同时存在；
+  lockfile 的 `lockfileVersion 必须是 [2, 3]` 之一（npm ≥ 7 生成的就是），每个包的
+  `resolved` 必须以 `https://registry.npmjs.org/` 开头且带 `sha512` 的 `integrity`；
+  lockfile 根条目的依赖声明必须与 `package.json` 一致；禁止 `backend/npm-shrinkwrap.json`；
+  `package.json` 四个依赖段（`dependencies` / `devDependencies` / `optionalDependencies` /
+  `peerDependencies`）的规格只许 semver 范围或 dist-tag——禁止 `file:`、`git+…`、
+  `github:user/repo`、`user/repo`、URL、`npm:alias`（判据：规格里不能有 `:` 或 `/`）。
+- **为什么**：部署时用 `npm ci` 按 lockfile 安装，同一份上传在任何时间装出同一棵依赖树，
+  事后能回答"当时线上跑的是哪些包"。没有 lockfile 的话 `npm ci` 会在 provision-db 之后
+  才失败；`resolved` 指向别的主机等于绕开平台的 registry 限制；`file:` / `link` 依赖装的是
+  本地字节，`npm ci` 不会拒它，所以由校验器拒。
+- **怎么做**：在 `backend/` 下跑一次 `npm install`（本地预览本来就要跑），会生成
+  `package-lock.json`；打包时排除 `node_modules`、**保留** `package-lock.json`。
+  只想生成锁文件不装依赖、或机器上配了私有镜像时用：
+  ```bash
+  cd backend && npm install --package-lock-only --registry=https://registry.npmjs.org/
+  ```
+  改过 `package.json` 之后重跑同一条命令。
+- **违反后果**（按命中分别出现，报错尾巴都带上面那条重生成命令）：
+  - `backend/package.json 缺失：后端依赖必须锁定，构建用 npm ci（…）`
+  - `backend/package-lock.json 缺失：后端依赖必须锁定，构建用 npm ci（…）`
+  - `backend/npm-shrinkwrap.json: 禁止——npm ci 会优先读它、跳过被校验的 package-lock.json`
+  - `backend/package-lock.json: lockfileVersion 必须是 [2, 3] 之一，得到 1（…）`
+  - `backend/package-lock.json: packages['node_modules/x'].resolved 必须以 https://registry.npmjs.org/ 开头，得到 '…'（其它 registry/镜像/任意 URL 一律拒绝）`
+  - `backend/package-lock.json: packages['node_modules/x'].integrity 缺少 sha512（…）`
+  - `backend/package-lock.json: packages['libs/x'] 不是从 registry 安装的包（workspace / file: / link 依赖不可复现，禁止）`
+  - `backend/package-lock.json: packages[""].dependencies 与 package.json 不一致——改了 package.json 之后要重新生成 lockfile（…）`
+  - `backend/package.json: dependencies.dep 的规格 'file:./dep' 不是 registry 依赖（禁止 file:/git/URL/别名规格——它们绕开锁定与 registry 校验）`
+- **正确**：
+  ```json
+  { "name": "notes-backend", "private": true,
+    "dependencies": { "express": "^4.19", "@aws-sdk/lib-dynamodb": "^3" } }
+  ```
+  加上 `npm install` 生成的 `package-lock.json`，两者一起进 zip。
+- **错误**：
+  ```json
+  { "dependencies": { "helper": "file:../helper", "tool": "github:someone/tool" } }
+  ```
+  或者 zip 里只有 `package.json` 没有 `package-lock.json`。
+- 黄金样例：`fixtures/nosql-notes/backend/` 与 `fixtures/sql-expenses/backend/` 各带一份
+  lockfile。无依赖的后端同样要放这一对（对空依赖的 `package.json` 跑同一条命令即可）。
+
 ## 运行时约束（扫描器不查，但违反同样部署失败或线上出错）
 
 - 监听端口读 `process.env.PORT`，不要硬编码。

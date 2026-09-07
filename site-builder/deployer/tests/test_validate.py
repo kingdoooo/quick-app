@@ -52,8 +52,15 @@ FULLSTACK_MANIFEST = {"name": "fullstack", "tier": "fullstack-nosql",
                       "backend": {"runtime": "nodejs22.x",
                                   "entrypoint": "node app.js", "port": 8080},
                       "auth": {"require_login": False, "allowed_users": "org"}}
+# 红线 8：fullstack 后端必须带 package.json + package-lock.json（contract/redlines.py），
+# "合法站点"的 fixture 必须带上——无依赖的最小配对。
+MINIMAL_PACKAGE_JSON = '{"name": "t", "private": true}'
+MINIMAL_LOCK = json.dumps({"name": "t", "lockfileVersion": 3, "requires": True,
+                           "packages": {"": {"name": "t"}}})
 GOOD_BACKEND = {"run.sh": "#!/bin/sh\nnode app.js\n",
                 "backend/app.js": "// GET /api/health\nok()",
+                "backend/package.json": MINIMAL_PACKAGE_JSON,
+                "backend/package-lock.json": MINIMAL_LOCK,
                 # index.html 是合同要求（缺失 = 首页永久 403，见
                 # contract/redlines.py）——"合法站点"的 fixture 必须带上
                 "frontend/index.html": "<h1>hi</h1>"}
@@ -162,7 +169,8 @@ def test_codebuild_input_is_immune_to_upload_swap(aws):
     assert after == before, "校验失败的那次运行覆盖了已有的 validated/ 工件"
     with zipfile.ZipFile(io.BytesIO(after)) as z:
         assert "res.cookie" not in z.read("backend/app.js").decode()
-        assert sorted(z.namelist()) == ["backend/app.js", "run.sh"]  # 前端不进构建容器
+        assert sorted(z.namelist()) == ["backend/app.js", "backend/package-lock.json",
+                                        "backend/package.json", "run.sh"]  # 前端不进构建容器
 
 
 def test_successful_run_reads_the_upload_exactly_once(aws, monkeypatch):
@@ -284,7 +292,8 @@ def test_build_artifact_streams_from_disk_instead_of_memory(aws, monkeypatch):
     # 落盘之后内容仍要对：流式上传最容易的错法是传了个没 seek 回 0 的句柄 ⇒ 空对象
     got = boto3.client("s3").get_object(Bucket="site-artifacts-1", Key=key)["Body"].read()
     with zipfile.ZipFile(io.BytesIO(got)) as z:
-        assert sorted(z.namelist()) == ["backend/app.js", "run.sh"], z.namelist()
+        assert sorted(z.namelist()) == ["backend/app.js", "backend/package-lock.json",
+                                        "backend/package.json", "run.sh"], z.namelist()
 
 
 def _package_project_resources(app_src: str, consts: dict) -> set[str]:
