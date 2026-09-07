@@ -1958,6 +1958,8 @@ name**；值必须是裸 `true`/`false`——configparser 会把行内注释并�
    > AWS_IAM + 只授权 edge role 即可，登录功能不受影响。
    > 验证：`https://auth.{base_domain}/login` 返回 302（跳 Cognito），
    > Function URL 直连 `/login` 返回 403 `{"Message":"Forbidden"}`。
+   > 不带 `redirect` 的 `/login` 缺省落点是控制台 `https://console.{base_domain}/`，那条路由
+   > 要到 ⑤b 部署 panel 时才注册，所以"在浏览器里走完一次登录"放在 ⑤b 的验收里。
 6. **冒烟**（CloudFront 传播需 15-30 分钟后再跑）：
   ```bash
    cd {仓库根} && bash site-builder/scripts/smoke_router.sh
@@ -2222,6 +2224,11 @@ M3 之前部署的，**先重跑一次** `cd site-builder/auth && python3 deploy
 ```bash
 python3 site-builder/scripts/verify_console_e2e.py     # 64 项
 ```
+
+再在浏览器里直接打开 `https://auth.{base_domain}/login`（**不带** `redirect`）把登录走完：
+应落在 `https://console.{base_domain}/`。缺省落点是控制台而不是 apex——平台的 alias 与
+DNS 都只有 `*.{base_domain}` 通配，apex 上没有任何东西在听，落到那里会显示连接被关闭、
+看起来像登录失败而 auth 日志零错误。
 
 它覆盖未登录 fail-closed、伪造 `x-user-email` 直连 Function URL 仍 403、
 前端真的能加载、越权读写全拒且**线上数据零改动**、CSRF 四形态、合法写与审计、

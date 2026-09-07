@@ -53,20 +53,71 @@ def test_login_rejects_foreign_redirect():
     assert r["statusCode"] == 400
 
 
+def _login_state(login_response) -> str:
+    """从 /login 的 302 Location 里取出原始 state 串（URL 解码后）。"""
+    import urllib.parse as up
+    return up.unquote(login_response["headers"]["Location"].split("state=")[1].split("&")[0])
+
+
+def _state_redirect(login_response) -> str:
+    """解签 /login 发出的 state，返回它承载的 redirect（只用生产解码器，不自己拼）。"""
+    decoded = lh._decode_state(_login_state(login_response))
+    assert decoded is not None, "state 解签失败"
+    return decoded
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_login_without_redirect_defaults_to_the_console():
+    """直接打开 /login（不带 redirect）时，缺省落点是控制台，不是 apex。
+
+    平台分发的 alias 与 DNS 都只有 `*.{base}` 通配，通配不匹配 apex ⇒ apex 在本平台上
+    不存在。缺省指向它会让"登录成功"在浏览器里看起来像连接被关闭（merged review §9 3h）。
+    """
+    r = lh.handler(_event("/login"), None)
+    assert r["statusCode"] == 302
+    assert _state_redirect(r) == "https://console.example.com/"
+
+
+@patch.dict(lh.os.environ, ENV)
+def test_login_with_an_explicit_redirect_keeps_it_verbatim():
+    """带 redirect 时缺省值不参与：state 里就是调用方给的那个 URL，一个字节不变。"""
+    target = "https://app-x.example.com/page?tab=2"
+    r = lh.handler(_event("/login", {"redirect": target}), None)
+    assert r["statusCode"] == 302
+    assert _state_redirect(r) == target
+
+
+@pytest.mark.parametrize("bad", [
+    "https://console.example.com.evil.com/",   # 后缀伪装：以平台域开头、落在别人域上
+    "https://evil.com/?next=console.example.com",
+    "http://console.example.com/",             # 非 https
+    "https://console.example.com\\@evil.com/",  # 反斜杠：urlparse 与浏览器分歧
+    "https://notexample.com/",                  # 后缀比较丢了点（endswith(base)）时会放行
+], ids=["suffix-lookalike", "host-in-query", "plain-http", "backslash", "dropped-dot"])
+@patch.dict(lh.os.environ, ENV)
+def test_login_redirect_allowlist_is_unchanged_by_the_console_default(bad):
+    """缺省值改到 console 不放宽白名单：显式 redirect 仍只许 https + 平台域。"""
+    r = lh.handler(_event("/login", {"redirect": bad}), None)
+    assert r["statusCode"] == 400
+
+
+@pytest.mark.parametrize("login_qs,landing", [
+    ({"redirect": "https://app-x.example.com/page?tab=2"}, "https://app-x.example.com/page?tab=2"),
+    # 用户可见的那一跳：不带 redirect 走完整流程，/callback 的 302 落在控制台首页（§9 3h）
+    (None, "https://console.example.com/"),
+], ids=["explicit-redirect", "bare-login-lands-on-console"])
 @patch.dict(lh.os.environ, ENV)
 @patch.object(lh, "_exchange_code", return_value={"email": "a@x.com", "name": "Alice",
                                                   "idp": "Feishu"})
-def test_callback_sets_cookie_and_redirects(mock_ex):
-    r_login = lh.handler(_event("/login", {"redirect": "https://app-x.example.com/page?tab=2"}),
-                         None)
-    import urllib.parse as up
-    state = up.unquote(r_login["headers"]["Location"].split("state=")[1].split("&")[0])
+def test_callback_sets_cookie_and_redirects(mock_ex, login_qs, landing):
+    r_login = lh.handler(_event("/login", login_qs), None)
+    state = _login_state(r_login)
     pkce = next(c for c in r_login["cookies"]
                 if c.startswith(lh.PKCE_COOKIE)).split(";")[0]
     r = lh.handler(_event("/callback", {"code": "abc", "state": state},
                           cookies=[pkce]), None)
     assert r["statusCode"] == 302
-    assert r["headers"]["Location"] == "https://app-x.example.com/page?tab=2"
+    assert r["headers"]["Location"] == landing
     cookie = next(c for c in r["cookies"] if c.startswith("sb_session="))
     assert "Domain=.example.com" in cookie
     assert "HttpOnly" in cookie and "Secure" in cookie
@@ -765,8 +816,7 @@ def _login_leg():
     """真的走一遍 /login，取回 (state, PKCE cookie)。**必须在目标 env 的 patch 之内调用**
     ——state 的 HMAC 与 pkce cookie 都由那份 env 里的 login-flow secret 签。"""
     r_login = lh.handler(_event("/login", {"redirect": "https://app-x.example.com/"}), None)
-    import urllib.parse as up
-    state = up.unquote(r_login["headers"]["Location"].split("state=")[1].split("&")[0])
+    state = _login_state(r_login)
     pkce = next(c for c in r_login["cookies"] if c.startswith(lh.PKCE_COOKIE)).split(";")[0]
     return state, pkce
 

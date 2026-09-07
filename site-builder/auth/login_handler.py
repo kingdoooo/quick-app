@@ -1,5 +1,5 @@
 """站点登录端点（Lambda Function URL）。
-/login → Cognito Hosted UI（后接飞书 OIDC）；/callback → 验 state、验 PKCE、
+/login → Cognito Hosted UI（后接飞书 OIDC；不带 redirect 时登录后落控制台首页）；/callback → 验 state、验 PKCE、
 验 id_token、种顶域会话 cookie；/logout。
 安全：OAuth 授权码 + PKCE(S256) + nonce；state HMAC 签名 + 5 分钟过期
 （防 login CSRF/redirect 篡改，密钥是 auth 私有的 login-flow secret，
@@ -521,7 +521,12 @@ def handler(event, context):
     base = os.environ["BASE_DOMAIN"]
 
     if path == "/login":
-        redirect = qs.get("redirect", f"https://{base}/")
+        # 缺省落点是控制台，**不是 apex**：平台分发的 CloudFront alias 与 DNS 都只有
+        # `*.{base}` 通配，通配不匹配 apex ⇒ apex 在本平台上没有任何东西在听。
+        # 缺省指向它时，登录其实成功（/callback 正常 302 并种下 sb_session），但浏览器
+        # 落在 apex 上显示连接被关闭，看起来像失败、auth 日志却零错误（§9 3h）。
+        # 带 redirect 的调用方（Edge 的未登录 302、/console-session）不走这个缺省。
+        redirect = qs.get("redirect", f"https://console.{base}/")
         if not _is_safe_redirect(redirect):
             return {"statusCode": 400, "body": "invalid redirect"}
         verifier, challenge = _pkce_pair()
