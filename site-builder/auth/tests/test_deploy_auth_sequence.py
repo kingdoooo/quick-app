@@ -235,8 +235,21 @@ def _run_main(monkeypatch, ssm):
     monkeypatch.setattr(da, "ensure_alarm_pipeline",
                         lambda **kw: {"changed": [], "subscription_state": "confirmed"})
     monkeypatch.setattr(da, "_alert_email", lambda: "ops@example.test")
+    # M07：Function URL 授权走共享的 converge；这里换成记录器（Recorder 的 get_policy 返回的不是 policy），
+    # 它的真实行为由 deployer/tests/test_function_url_policy.py 与下面的端到端用例覆盖。
+    monkeypatch.setattr(da, "converge_function_url_policy",
+                        lambda client, fn, arn: _CONVERGE_CALLS.append((client, fn, arn)) or _DriftStub())
+    _CONVERGE_CALLS.clear()
     da.main()
     return lam, iam, ddb
+
+
+_CONVERGE_CALLS: list = []
+
+
+class _DriftStub:
+    def summary(self):
+        return "一致"
 
 
 def test_main_creates_the_login_flow_secret_when_it_is_absent(cfg_files, monkeypatch):
@@ -375,3 +388,140 @@ def test_l3_main_does_not_try_to_create_a_parameter_with_an_empty_name(cfg_files
     assert "" not in created, created
     assert "/site-builder/jwt-secret" not in created, "L3 之后不该再碰那把密钥"
     assert "/site-builder/login-flow-secret" in created, "login-flow 的缺省补建不该被一起关掉"
+
+
+# ---- M07：Function URL 的 resource policy 按期望集合等值收敛（auth 那条此前既不收敛也无闸门）----------
+#
+# 三条不变量：① 实现是共享的那一份（不在本脚本里另写）；② main() 在 precheck 之后、任何写之前先校验
+# edge_role_arn（空 / 通配即拒绝部署）；③ main() 恰好调用一次 converge，本脚本里不再有任何直接的
+# add_permission / remove_permission（pre-token 触发器那处除外——那是 Cognito 调 Lambda 的授权，不是 M07 的面）。
+
+import importlib.util as _ilu
+
+import function_url_policy as fup          # deploy_auth import 时已把 deployer/functions 铺进 sys.path
+
+
+def _fake_policy_module():
+    """按路径加载 deployer/tests 的有状态替身，不往 sys.path 塞那个目录（会与本包的 conftest 撞名）。"""
+    path = Path(da.__file__).resolve().parents[1] / "deployer" / "tests" / "fake_lambda_policy.py"
+    spec = _ilu.spec_from_file_location("fake_lambda_policy", path)
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_deploy_auth_binds_the_shared_function_url_policy_implementation():
+    assert da.converge_function_url_policy is fup.converge
+    assert da.function_url_statements is fup.expected_statements
+
+
+def test_main_converges_the_function_url_policy_once_with_the_configured_edge_role(cfg_files, monkeypatch):
+    ssm = FakeSSM(present=set(da.required_parameters()) | {LOGIN_FLOW_PARAM, "/site-builder/jwt-secret"})
+    lam, _, _ = _run_main(monkeypatch, ssm)
+    assert _CONVERGE_CALLS == [(lam, da.FN, "arn:aws:iam::111111111111:role/site-edge-role")]
+
+
+@pytest.mark.parametrize("bad", ["", "*", "arn:aws:iam::111111111111:role/*", "site-edge-role"])
+def test_main_aborts_before_any_write_when_edge_role_arn_is_unusable(tmp_path, monkeypatch, bad):
+    """缺 / 通配 / 非 ARN 一律在 precheck 之后立刻 SystemExit：Lambda、角色、resource policy、路由表零写入。"""
+    p = tmp_path / "config.ini"
+    p.write_text(CFG.replace("edge_role_arn = arn:aws:iam::111111111111:role/site-edge-role",
+                             f"edge_role_arn = {bad}"))
+    c = configparser.ConfigParser()
+    c.read(p)
+    monkeypatch.setattr(da, "CFG_PATH", p)
+    monkeypatch.setattr(da, "_CFG", c)
+    ssm = FakeSSM(present=set(da.required_parameters()))
+    lam, iam, ddb = Recorder(), Recorder(), Recorder()
+    for k, v in (("ssm", ssm), ("lambda", lam), ("iam", iam), ("dynamodb", ddb)):
+        monkeypatch.setitem(da._CLIENTS, k, v)
+    monkeypatch.setattr(da, "build_zip", lambda: (_ for _ in ()).throw(AssertionError("不该打包")))
+    with pytest.raises(SystemExit, match="edge_role_arn"):
+        da.main()
+    assert lam.calls == [] and iam.calls == [] and ddb.calls == []
+    assert not [c for c in ssm.calls if c[0] == "put_parameter"]
+
+
+def test_main_validates_edge_role_after_precheck_and_before_the_first_write():
+    """结构守卫：main() 里 edge_role_arn() 排在 precheck() 之后、第一个写助手之前。"""
+    tree = ast.parse(Path(da.__file__).read_text())
+    main_fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
+    order = sorted((node.lineno, node.func.id) for node in ast.walk(main_fn)
+                   if isinstance(node, ast.Call) and isinstance(node.func, ast.Name))
+    names = [n for _, n in order]
+    first_write = min(names.index(n) for n in ("ensure_secret", "ensure_lambda_role", "build_zip", "deploy_function")
+                      if n in names)
+    assert names.index("precheck") < names.index("edge_role_arn") < first_write, names
+
+
+def test_no_direct_permission_calls_outside_the_pre_token_trigger():
+    """add_permission / remove_permission 只许出现在 ensure_pre_token_trigger 里：Function URL 那两条全走 converge。
+    "同名 StatementId 已存在就 pass"回来的唯一途径就是有人在这里又写一遍。"""
+    tree = ast.parse(Path(da.__file__).read_text())
+    owners = {}
+    for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                    and node.func.attr in ("add_permission", "remove_permission"):
+                owners.setdefault(node.func.attr, set()).add(fn.name)
+    assert owners.get("add_permission", set()) <= {"ensure_pre_token_trigger"}, owners
+    # 老 Sid（public-url / public-url-invoke）的点名删除由 converge 的野 Sid 清理覆盖：本脚本零 remove_permission。
+    # 按 AST 判，不 grep 文本——注释里提到那两个名字是合法的（本仓库栽过"断言的字样只活在注释里"的反面）。
+    assert owners.get("remove_permission", set()) == set(), owners
+
+
+class _PolicyRecorder(Recorder):
+    """Recorder + 真的 resource policy 状态：get_policy / add_permission / remove_permission 交给有状态替身。"""
+    def __init__(self, fake):
+        super().__init__()
+        self.fake = fake
+        self.exceptions = type("E", (), {"ResourceNotFoundException": fake.exceptions.ResourceNotFoundException,
+                                          "ResourceConflictException": fake.exceptions.ResourceConflictException,
+                                          "NoSuchEntityException": _NotFound})
+
+    def __getattr__(self, name):
+        if name in ("get_policy", "add_permission", "remove_permission"):
+            return getattr(self.fake, name)
+        return super().__getattr__(name)
+
+
+def test_main_end_to_end_replaces_a_deleted_role_principal_and_clears_legacy_public_statements(cfg_files, monkeypatch):
+    """端到端（真 converge + 有状态替身）：edge role 重建后的 AROA principal 被换成配置里的 ARN，老版本留下的
+    public-url 语句被删，最终 policy 与期望集合逐字节一致。这正是 M07 "重部永不重建 Principal" 的反例。"""
+    flp = _fake_policy_module()
+    edge = "arn:aws:iam::111111111111:role/site-edge-role"
+    aroa = "AROA" + "EXAMPLEDELETED" + "XXXX"
+    fake = flp.FakeLambdaPolicy([
+        flp.rendered("edge-invoke", "lambda:InvokeFunctionUrl", aroa, function_url_auth_type="AWS_IAM"),
+        flp.rendered("edge-invoke-function", "lambda:InvokeFunction", aroa, invoked_via_function_url=True),
+        flp.rendered("public-url", "lambda:InvokeFunctionUrl", "*", function_url_auth_type="NONE")])
+    monkeypatch.setattr(fup, "_sleep", lambda s: None)
+    ssm = FakeSSM(present=set(da.required_parameters()) | {LOGIN_FLOW_PARAM, "/site-builder/jwt-secret"})
+    lam, iam, ddb = _PolicyRecorder(fake), Recorder(), Recorder()
+    for k, v in (("ssm", ssm), ("lambda", lam), ("iam", iam), ("dynamodb", ddb)):
+        monkeypatch.setitem(da._CLIENTS, k, v)
+    monkeypatch.setattr(da, "build_zip", lambda: b"zip")
+    monkeypatch.setattr(da, "ensure_pre_token_trigger", lambda *a, **k: None)
+    monkeypatch.setattr(da, "ensure_alarm_pipeline", lambda **kw: {"changed": [], "subscription_state": "confirmed"})
+    monkeypatch.setattr(da, "_alert_email", lambda: "ops@example.test")
+    da.main()
+    assert fup.drift(json.loads(fake.get_policy(FunctionName=da.FN)["Policy"]), edge).ok
+    assert {s["Sid"] for s in fake.statements} == set(fup.EXPECTED_SIDS)
+    assert {s["Principal"]["AWS"] for s in fake.statements} == {edge}
+
+
+def test_rerunning_main_on_a_converged_policy_writes_nothing(cfg_files, monkeypatch):
+    """幂等重部的正对照：policy 已一致 ⇒ 一次 get_policy、零 add/remove。"""
+    flp = _fake_policy_module()
+    fake = flp.FakeLambdaPolicy(flp.good_pair("arn:aws:iam::111111111111:role/site-edge-role"))
+    ssm = FakeSSM(present=set(da.required_parameters()) | {LOGIN_FLOW_PARAM, "/site-builder/jwt-secret"})
+    lam, iam, ddb = _PolicyRecorder(fake), Recorder(), Recorder()
+    for k, v in (("ssm", ssm), ("lambda", lam), ("iam", iam), ("dynamodb", ddb)):
+        monkeypatch.setitem(da._CLIENTS, k, v)
+    monkeypatch.setattr(da, "build_zip", lambda: b"zip")
+    monkeypatch.setattr(da, "ensure_pre_token_trigger", lambda *a, **k: None)
+    monkeypatch.setattr(da, "ensure_alarm_pipeline", lambda **kw: {"changed": [], "subscription_state": "confirmed"})
+    monkeypatch.setattr(da, "_alert_email", lambda: "ops@example.test")
+    da.main()
+    assert fake.writes() == []
+    assert [c for c in fake.calls if c[0] == "get_policy"] == [("get_policy", None, None)]

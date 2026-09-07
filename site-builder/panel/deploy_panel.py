@@ -7,7 +7,9 @@ Function URL（AWS_IAM，仅授权 edge role）→ 上传前端到版本化 S3 �
 
 关键约束（改动前先读）：
 - Function URL **必须** AuthType=AWS_IAM，且 resource policy 恰好两条语句、
-  Principal 是逐字符 exact 的 edge role ARN。2025-10 起需要
+  Principal 是逐字符 exact 的 edge role ARN——由 `function_url_policy.converge`
+  **每次部署按期望集合等值写**（读回、替换内容不对的同名语句、删野 Sid、写后读回核对；
+  不是"同名 Sid 存在就 pass"，见 merged review M07）。2025-10 起需要
   InvokeFunctionUrl + InvokeFunction(InvokedViaFunctionUrl) 两条，缺一即 403；
   `AuthType=NONE` + `Principal:*` 会被安全扫描自动处置（实测删光整个
   resource policy）。**缺 edge_role_arn 一律抛错中止，绝不 fallback 到宽权限**
@@ -42,6 +44,11 @@ CFG = configparser.ConfigParser(interpolation=None)
 CFG.read(HERE.parent / "config.ini")
 # 3c-1A：[SessionKeys] 的唯一定义在 auth/session_keys.py（构建期 import，不进包——运行时只读环境变量）
 sys.path.insert(0, str(HERE.parent / "auth"))
+# Function URL resource policy 的唯一实现（auth / panel / key-proxy / 闸门共用；构建期 import，不进包）
+sys.path.insert(0, str(HERE.parent / "deployer" / "functions"))
+from function_url_policy import FUNCTION_URL_AUTH_TYPE  # noqa: E402
+from function_url_policy import converge as converge_function_url_policy  # noqa: E402
+from function_url_policy import expected_statements as function_url_statements  # noqa: E402
 from secrets_util import precheck_parameters  # noqa: E402
 from session_keys import (env_json, legacy_entry, load_session_keys,  # noqa: E402
                           ssm_parameter_arns, ssm_parameter_names)
@@ -59,7 +66,6 @@ def _cfg(section: str, key: str, default: str | None = None) -> str:
 
 FN_NAME = "site-panel"
 ROLE_NAME = "site-panel-role"
-FUNCTION_URL_AUTH_TYPE = "AWS_IAM"
 RUNTIME = "python3.13"
 
 # 构建时复制进包的模块。**七个都必需**：
@@ -146,34 +152,6 @@ def frontend_prefix(version: str | None = None) -> str:
     # 但默认不再用它——留空即走内容指纹。
     v = version or _cfg("Panel", "console_version", "") or frontend_content_version()
     return f"platform/console/{v}"
-
-
-def function_url_statements(edge_role_arn: str) -> list[dict]:
-    """Function URL 的两条 resource policy 语句。
-
-    **缺 edge_role_arn 或给通配一律抛错**：fallback 到 `Principal:*` 会让
-    Function URL 全网可调，而 handler.py 把"x-user-email 存在"当作"请求经过
-    Edge"的证据——两者一起失效意味着任何人都能伪造任意身份调用面板 API。
-    """
-    arn = (edge_role_arn or "").strip()
-    if not arn:
-        raise ValueError(
-            "config.ini [Deployer] edge_role_arn 为空——Function URL 的调用者"
-            "必须绑定到 exact edge role，不能放宽。请先部署路由层并回填该值")
-    if "*" in arn or not arn.startswith("arn:aws:iam::"):
-        raise ValueError(f"edge_role_arn 必须是精确的 IAM role ARN: {arn!r}")
-    return [
-        {"StatementId": "edge-invoke-url",
-         "Action": "lambda:InvokeFunctionUrl",
-         "Principal": arn,
-         "FunctionUrlAuthType": FUNCTION_URL_AUTH_TYPE},
-        # 2025-10 起 InvokeFunctionUrl 单条不够，缺 InvokeFunction 即 403。
-        # InvokedViaFunctionUrl 把它限定为仅经 Function URL 调用。
-        {"StatementId": "edge-invoke-function",
-         "Action": "lambda:InvokeFunction",
-         "Principal": arn,
-         "InvokedViaFunctionUrl": True},
-    ]
 
 
 def role_statements() -> list[dict]:
@@ -472,13 +450,10 @@ def ensure_function(role_arn: str, code: bytes, edge_role_id_value: str) -> str:
                 FunctionName=FN_NAME, AuthType=FUNCTION_URL_AUTH_TYPE)
         url = cur["FunctionUrl"]
 
-    for stmt in function_url_statements(_cfg("Deployer", "edge_role_arn", "")):
-        kwargs = {k: v for k, v in stmt.items() if k != "StatementId"}
-        try:
-            lam.add_permission(FunctionName=FN_NAME,
-                               StatementId=stmt["StatementId"], **kwargs)
-        except lam.exceptions.ResourceConflictException:
-            pass        # 幂等：同 StatementId 已存在
+    # resource policy 按期望集合等值收敛（merged review M07）：读回、替换内容不对的同名语句（edge role 重建后
+    # Principal 会被 IAM 改写成已删角色的 AROA 形态）、删野 Sid、写后读回核对；一致时零写入。
+    print("   Function URL 授权（收敛前的漂移；「一致」= 零写入，其它 = 已按期望集合改写并读回核对）："
+          f"{converge_function_url_policy(lam, FN_NAME, _cfg('Deployer', 'edge_role_arn', '')).summary()}")
     return url
 
 

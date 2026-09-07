@@ -1120,3 +1120,38 @@ def test_key_proxy_role_cannot_perform_offboarding_revoke():
                 .get("ForAllValues:StringEquals", {}).get("dynamodb:Attributes", []))
     assert "revoked" not in attrs, (
         "UpdateItem 允许写 revoked——key-proxy 就能自己吊销别人的 Key 了")
+
+
+# ---- M07：Function URL 的 resource policy 走共享的等值收敛（形态与 panel 那三条一致）-------------------
+
+import function_url_policy as fup
+
+
+def test_deploy_key_proxy_binds_the_shared_function_url_policy_implementation():
+    assert dkp.function_url_statements is fup.expected_statements
+    assert dkp.converge_function_url_policy is fup.converge
+    assert dkp.FUNCTION_URL_AUTH_TYPE is fup.FUNCTION_URL_AUTH_TYPE
+    assert "def function_url_statements" not in SCRIPT.read_text(), "本脚本又长出了第二份语句定义"
+
+
+def test_deploy_key_proxy_has_no_direct_permission_calls():
+    tree = ast.parse(SCRIPT.read_text())
+    direct = {node.func.attr for node in ast.walk(tree)
+              if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+              and node.func.attr in ("add_permission", "remove_permission")}
+    assert direct == set(), direct
+
+
+def test_ensure_function_converges_the_policy_once_for_the_configured_edge_role(monkeypatch):
+    from unittest.mock import MagicMock
+    lam = MagicMock()
+    for name in ("ResourceNotFoundException", "ResourceConflictException", "InvalidParameterValueException"):
+        setattr(lam.exceptions, name, type(name, (Exception,), {}))
+    lam.get_function_url_config.return_value = {"FunctionUrl": "https://x.lambda-url.us-east-1.on.aws/",
+                                                "AuthType": "AWS_IAM"}
+    monkeypatch.setattr(dkp.boto3, "client", lambda *a, **k: lam)
+    calls = []
+    monkeypatch.setattr(dkp, "converge_function_url_policy",
+                        lambda client, fn, arn: calls.append((client, fn, arn)) or fup.Drift())
+    dkp.ensure_function("arn:aws:iam::000000000000:role/site-key-proxy-role", b"zip", "AROAEXAMPLE", _cfg())
+    assert calls == [(lam, dkp.FN_NAME, EDGE_ROLE)]

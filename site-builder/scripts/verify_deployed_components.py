@@ -12,7 +12,8 @@
      （①② 是纯本地判定，--local 时只跑这两段。x-user-name 那条红线进过
       "修漏报 → 引入误报 → 再修"的循环，所以正反两侧都要覆盖。）
   ③ 线上 deployer Lambda 群：contract/redlines.py + 守卫三件套逐包核对；
-  ④ 线上 auth 服务：login_handler.py / session.py + SSM TTL 在产物中；
+  ④ 线上 auth 服务：login_handler.py / session.py + SSM TTL 在产物中 + Function URL AuthType 与
+     resource policy 等值（M07 之前这条 Function URL **没有任何闸门**）；
   ⑤ 线上 panel：**进包清单从 `deploy_panel.COPY_FILES` 推导**后逐字节核对
      + Function URL AuthType 与 resource policy 两条语句 + 环境变量**无明文
      密钥** + 非 Edge 的签名直连必须 403；
@@ -64,6 +65,8 @@ from pathlib import Path
 HERE = Path(__file__).parent
 ROOT = HERE.parent.parent
 sys.path.insert(0, str(ROOT / "site-builder/contract/src"))
+# Function URL resource policy 的判定与三个部署脚本同一份（deployer/functions/function_url_policy.py）
+sys.path.insert(0, str(ROOT / "site-builder/deployer/functions"))
 CFG_PATH = HERE.parent / "config.ini"
 # Lambda@Edge 的产物在 router 那一侧（⑧ 要读它的 PLATFORM_SUBDOMAINS）
 ROUTER_CFG_PATH = ROOT / "router" / "config.ini"
@@ -83,9 +86,9 @@ MIN_LOCAL_CHECKS = 15       # ① 合规 8 + ② 违规 7
 # ④ 段的 `*_PARAM` 条数**随状态变**：L2 是两个（JWT_SECRET_PARAM + LOGIN_FLOW_SECRET_PARAM），
 # L3 清空 legacy_param 之后只剩一个。所以这里只记**恒定**的那部分，`*_PARAM` 那几条由
 # `_min_param_checks()` 在运行时按本地推导值补上——写死 2 会让 L3 的每次核对都差一条而红。
-MIN_DEPLOYED_CHECKS = 20    # ③ 4 + ④ 1 + ⑤ 6 + ⑥ 3 + ⑦ 6 = 20（④⑤ 都已扣掉 `*_PARAM` 那几条）
-# L2 下 20 + 3 = 23，与 3c-1B 之前的常量一致（本次拆分不改变已部署状态的下限）；
-# L3 下 20 + 1 = 21，正好少掉 auth 与 panel 各一条 legacy 的 `*_PARAM`。
+# ④ 的 Function URL 三条（AuthType / 语句集合 / 逐条内容）是 M07 补的：此前 auth 的 Function URL 完全不在闸门里。
+MIN_DEPLOYED_CHECKS = 23    # ③ 4 + ④ 4 + ⑤ 6 + ⑥ 3 + ⑦ 6 = 23（④⑤ 都已扣掉 `*_PARAM` 那几条）
+# L2 下 23 + 3 = 26；L3 下 23 + 1 = 24，正好少掉 auth 与 panel 各一条 legacy 的 `*_PARAM`。
 # ⑧ 只在 [ApiKey] 段存在（组件启用）时计入：产物 1 + 环境变量 2 + scope 1 +
 # Function URL 3 + EDGE_ROLE_ID 1 + 环境变量整体 1 + route 6 + Edge 白名单 1 +
 # runtime 3 + 哨兵行 2 + role 2 = 23
@@ -497,13 +500,17 @@ def _check_env_has_no_plaintext_secret(env: dict, label: str,
 
 
 def _check_function_url_authz(lam, fn: str, label: str, edge_role: str) -> None:
-    """Function URL 的 AuthType + resource policy 恰好两条动作 + Principal 逐字符。
+    """Function URL 的 AuthType + resource policy 与期望集合**等值**（三条 check）。
 
-    2025-10 起需要 `InvokeFunctionUrl` + `InvokeFunction`(InvokedViaFunctionUrl)
-    两条，缺一即 403；`AuthType=NONE` + `Principal:*` 会被安全扫描自动处置
-    （实测删光整个 resource policy）。
+    判定不在这里另写一份，用部署脚本写 policy 时的同一个 `function_url_policy.drift`：闸门与部署脚本对
+    "对的形态"只能有一个定义（M07 的教训是部署脚本只管加、闸门只数动作与 principal 集合，于是 Sid 改名、
+    Condition 缺失、多一条同 principal 的语句都是假绿）。2025-10 起需要 `InvokeFunctionUrl` +
+    `InvokeFunction`(InvokedViaFunctionUrl) 两条，缺一即 403；`AuthType=NONE` + `Principal:*` 会被安全扫描
+    自动处置（实测删光整个 resource policy）。policy 整个不存在按"两条都缺"记红，不让脚本崩成"执行中断"。
     """
     import json
+
+    import function_url_policy as fup
 
     url_conf = lam.get_function_url_config(FunctionName=fn)
     check(url_conf["AuthType"] == "AWS_IAM",
@@ -511,19 +518,23 @@ def _check_function_url_authz(lam, fn: str, label: str, edge_role: str) -> None:
           f"实际 {url_conf['AuthType']}"
           + ("" if url_conf["AuthType"] == "AWS_IAM"
              else " —— NONE 等于 endpoint 全网可调"))
-    policy = json.loads(lam.get_policy(FunctionName=fn)["Policy"])
-    actions, principals = set(), set()
-    for s in policy.get("Statement", []):
-        a = s.get("Action")
-        actions |= set(a if isinstance(a, list) else [a])
-        p = s.get("Principal", {})
-        principals.add(p.get("AWS") if isinstance(p, dict) else p)
-    check(actions == {"lambda:InvokeFunctionUrl", "lambda:InvokeFunction"},
-          f"{label} resource policy 恰好两条动作（2025-10 起缺一即 403）",
-          f"实际 {sorted(actions)}")
-    check(principals == {edge_role},
-          f"{label} Principal 逐字符 == edge role（不是 * 不是账号根）",
-          f"实际 {sorted(principals)}")
+    try:
+        policy = json.loads(lam.get_policy(FunctionName=fn)["Policy"])
+    except lam.exceptions.ResourceNotFoundException:
+        policy = None
+    d = fup.drift(policy, edge_role)
+    # 只为诊断文案：线上到底授给了谁（AROA… 一眼就能认出是"角色被删过"）
+    principals = sorted({str(p.get("AWS") if isinstance(p, dict) else p)
+                         for p in (s.get("Principal") for s in (policy or {}).get("Statement", []))})
+    check(not d.missing and not d.stray,
+          f"{label} resource policy 恰好是期望的两条语句（Sid 无缺无多；2025-10 起缺一即 403）",
+          f"缺 {list(d.missing)}，非预期 {list(d.stray)}" if (d.missing or d.stray)
+          else f"{list(fup.EXPECTED_SIDS)}")
+    check(not d.mismatched,
+          f"{label} 每条语句的 Principal / Action / Condition 逐字节 == 期望"
+          "（Principal 是 exact edge role，不是 * / 账号根 / 已删角色的 AROA 形态）",
+          f"内容不对 {list(d.mismatched)}；线上 principals={principals}" if d.mismatched
+          else "与部署脚本写入的形态一致")
 
 
 def _check_edge_role_id_env(env: dict, edge_role: str, label: str) -> str:
@@ -707,6 +718,9 @@ def run_deployed() -> None:
     # 且**不会因为线上少了一个键而少核一条**（少了的话整体等值那条先红）。
     _check_env_has_no_plaintext_secret(got_env, "site-auth-service",
                                        _present(want_env, AUTH_SESSION_PARAM_KEYS))
+    # M07：auth 的 Function URL 此前**没有任何闸门**——edge role 重建后 policy 仍授旧 principal ⇒ 全平台登录
+    # 403 而 deploy_auth exit 0。与 ⑤⑧ 同一个判定，三条平台 Function URL 全覆盖。
+    _check_function_url_authz(lam, "site-auth-service", "auth", read_cfg("Deployer", "edge_role_arn"))
 
 
 def run_panel() -> None:

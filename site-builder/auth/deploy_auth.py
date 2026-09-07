@@ -16,8 +16,12 @@ from pathlib import Path
 
 import boto3
 
+# 共享的 Function URL resource policy 实现（三个平台脚本 + 闸门共用；构建期 import，不进 auth 的部署包）
+sys.path.insert(0, str(Path(__file__).parent.parent / "deployer" / "functions"))
 sys.path.insert(0, str(Path(__file__).parent))   # 被 verify_deployed_components 按路径加载时也能找到同目录模块
 from alarm_pipeline import ensure_alarm_pipeline
+from function_url_policy import converge as converge_function_url_policy
+from function_url_policy import expected_statements as function_url_statements
 from secrets_util import ensure_secret as _ensure_secret, precheck_parameters
 from session_keys import (env_json, legacy_entry, load_session_keys, ssm_parameter_arns,
                           ssm_parameter_names)
@@ -195,6 +199,20 @@ def precheck() -> None:
     precheck_parameters(required_parameters(), ssm=_ssm())
 
 
+def edge_role_arn() -> str:
+    """`[Deployer] edge_role_arn`，先过 `function_url_statements` 的校验（空 / 通配 / 非 role ARN 即 SystemExit）。
+
+    与 panel / key-proxy 第 ① 步同一条纪律：缺配置**中止**，绝不 fallback 到宽权限。放在 precheck 之后、
+    任何写之前——拿空值往下跑的话 Lambda 与角色都建好了才在授权那一步炸，留下半个部署。
+    """
+    arn = cfg().get("Deployer", "edge_role_arn", fallback="")
+    try:
+        function_url_statements(arn)
+    except ValueError as exc:
+        raise SystemExit(f"config.ini [Deployer] edge_role_arn 不可用，拒绝部署（任何写都未发生）：{exc}")
+    return arn
+
+
 def deploy_function(lam, *, role_arn: str, env: dict, code: bytes) -> None:
     """**先配置、后代码**（spec §11.8.3）：1B 的 env 变化都是新增变量——旧代码忽略新变量无害，而新代码
     缺新变量会 500 几秒（1A 那次 502 的同一窗口形状）。L3 删 JWT_SECRET_PARAM 时旧代码在那几秒里也不会
@@ -214,8 +232,10 @@ def deploy_function(lam, *, role_arn: str, env: dict, code: bytes) -> None:
 
 
 def main():
-    # ⓪ 任何写之前：本函数要读的外部参数都得在（缺参 = 运行时全部登录 500 而脚本 exit 0）
+    # ⓪ 任何写之前：本函数要读的外部参数都得在（缺参 = 运行时全部登录 500 而脚本 exit 0），
+    #    且 Function URL 要授权的 edge role 必须是一个精确的 role ARN（缺 / 通配即中止）。
     precheck()
+    edge_arn = edge_role_arn()
     # 密钥仍在这里**确保存在**（首次部署要生成 JWT secret），但只写进 SSM，
     # 不进环境变量——运行时由 login_handler._secret() 去读。
     keys = load_session_keys(CFG_PATH)
@@ -246,24 +266,13 @@ def main():
         url = url_cfg["FunctionUrl"]
         if url_cfg["AuthType"] != "AWS_IAM":
             lam.update_function_url_config(FunctionName=FN, AuthType="AWS_IAM")
-    # 清掉历史的 Principal:* 语句（老版本部署留下的；已被 mitigate 删除时容忍不存在）
-    for sid in ("public-url", "public-url-invoke"):
-        try:
-            lam.remove_permission(FunctionName=FN, StatementId=sid)
-        except lam.exceptions.ResourceNotFoundException:
-            pass
-    # 2025-10 起 Function URL 需要 InvokeFunctionUrl + InvokeFunction 两条语句
-    # （缺一个就 403）。两条各自幂等；与 deploy_lambda_site.py 的站点授权同模式。
-    edge_role_arn = cfg()["Deployer"]["edge_role_arn"]
-    for sid, action, extra in (
-        ("edge-invoke", "lambda:InvokeFunctionUrl", {"FunctionUrlAuthType": "AWS_IAM"}),
-        ("edge-invoke-function", "lambda:InvokeFunction", {"InvokedViaFunctionUrl": True}),
-    ):
-        try:
-            lam.add_permission(FunctionName=FN, StatementId=sid, Action=action,
-                               Principal=edge_role_arn, **extra)
-        except lam.exceptions.ResourceConflictException:
-            pass
+    # resource policy 按期望集合**等值收敛**（merged review M07）：读回 → 内容不对的同名语句替换（edge role
+    # 重建后 IAM 会把 Principal 改写成已删角色的 AROA 形态，同名 Sid 存在但永不匹配）→ 缺的补上 → 野 Sid
+    # 删除（含老版本留下的 public-url / public-url-invoke）→ 写后读回核对。一致时零写入。
+    # "同名 StatementId 已存在就 pass"是这条缺陷的原始形态：同名只说明有一条语句叫这个名字，不说明内容对。
+    # 唯一实现在 deployer/functions/function_url_policy.py，panel / key-proxy / 闸门共用同一份判定。
+    print(f"  Function URL 授权（收敛前的漂移；「一致」= 零写入，其它 = 已按期望集合改写并读回核对）："
+          f"{converge_function_url_policy(lam, FN, edge_arn).summary()}")
     _ddb().put_item(TableName=cfg()["Platform"]["routing_table"], Item={
         "subdomain": {"S": "auth"}, "site_id": {"S": "auth-service"},
         "route_mode": {"S": "api-only"},  # 全路径走 Lambda（/login 不匹配 /api/*）

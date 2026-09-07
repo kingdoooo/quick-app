@@ -607,3 +607,27 @@ def test_stray_policy_statements_on_the_candidate_color_are_removed(aws,
         "非预期 sid 下的额外授权（Principal:*）没被清掉——新后端公网可达"
     assert removed - {"totally-legit-public-access"} <= \
         {"edge-invoke", "edge-invoke-function"}
+
+
+# ---- M07：站点色的授权与三个平台脚本授的是同一形态（parity）--------------------------------------
+#
+# `deploy_lambda_site` 自己那段（清野 Sid + remove→add + 抛出）是 M07 点名的"正确形态"，平台三条改为共用
+# `function_url_policy`；两边暂时是两份代码，这条用例把 Sid / Action / Principal / Condition 钉成同一个投影，
+# 任一侧改形态另一侧不跟就红。evidence: fake/unit。
+
+def test_site_color_grants_have_the_same_shape_as_the_platform_function_urls(aws, monkeypatch):
+    import deploy_lambda_site as d, common
+    import function_url_policy as fup
+    edge = "arn:aws:iam::1:role/edge-role"
+    monkeypatch.setenv("EDGE_ROLE_ARN", edge)
+    common.create_job("a@x.com", "s-1")
+    lam = _lam_mock(exists=False)
+    with patch.object(d, "_lambda", return_value=lam):
+        d.handler(dict(EVENT), None)
+    granted = {}
+    for c in lam.add_permission.call_args_list:
+        kw = dict(c.kwargs)
+        assert kw.pop("Qualifier") == "blue"
+        kw.pop("FunctionName")
+        granted[kw.pop("StatementId")] = ("Allow", kw["Action"], kw["Principal"], fup._rendered_condition(kw))
+    assert granted == fup.expected_projection(edge), granted

@@ -24,7 +24,9 @@ Function URL（AWS_IAM，只授权 edge role）→ `__switch__` 哨兵行（**�
   所有 Key 都 401"（两侧单测各自都绿）。
 
 - Function URL **必须** AuthType=AWS_IAM，且 resource policy 恰好两条语句、
-  Principal 是逐字符 exact 的 edge role ARN。2025-10 起需要 InvokeFunctionUrl
+  Principal 是逐字符 exact 的 edge role ARN——由 `function_url_policy.converge`
+  **每次部署按期望集合等值写**（读回、替换内容不对的同名语句、删野 Sid、写后读回核对；
+  不是"同名 Sid 存在就 pass"，见 merged review M07）。2025-10 起需要 InvokeFunctionUrl
   + InvokeFunction(InvokedViaFunctionUrl) 两条，缺一即 403；`AuthType=NONE` +
   `Principal:*` 会被安全扫描自动处置（实测删光整个 resource policy）。
   **缺 edge_role_arn 一律抛错中止，绝不 fallback 到宽权限**——handler 的第 ⓪ 步
@@ -81,13 +83,16 @@ from edge_caller import EDGE_ROLE_ID_ENV                      # noqa: E402
 from handler import AGENTCORE_ENDPOINT_ENV                    # noqa: E402
 from keygen import SWITCH_PK                                  # noqa: E402
 import keystore                                               # noqa: E402
+# Function URL resource policy 的唯一实现（auth / panel / key-proxy / 闸门共用；构建期 import，不进包）
+from function_url_policy import FUNCTION_URL_AUTH_TYPE        # noqa: E402
+from function_url_policy import converge as converge_function_url_policy  # noqa: E402
+from function_url_policy import expected_statements as function_url_statements  # noqa: E402
 
 CFG = configparser.ConfigParser(interpolation=None)
 CFG.read(HERE.parent / "config.ini")
 
 FN_NAME = "site-key-proxy"
 ROLE_NAME = "site-key-proxy-role"
-FUNCTION_URL_AUTH_TYPE = "AWS_IAM"
 RUNTIME = "python3.13"
 # handler 的转发超时是 25s，Lambda 侧留 30s：反过来的话客户端拿到的是空响应
 # 而不是一条可归因的 504。
@@ -203,34 +208,6 @@ def machine_client_id(cfg=None) -> str:
         sys.exit("[ApiKey] 段存在但 [Cognito] machine_client_id 为空——"
                  "先跑 deploy_pool.py 建 machine client 并回填 config.ini")
     return mid
-
-
-def function_url_statements(edge_role_arn: str) -> list[dict]:
-    """Function URL 的两条 resource policy 语句（形态与 panel 一致）。
-
-    **缺 edge_role_arn 或给通配一律抛错**：fallback 到 `Principal:*` 会让
-    Function URL 全网可调。对 key-proxy 而言绕过 Edge 不等于绕过认证（攻击者
-    还得有一把有效 Key），但 **Edge 是限流与可观测性的唯一位置**——绕过它意味着
-    Key 的暴力尝试不留任何可告警痕迹。
-    """
-    arn = (edge_role_arn or "").strip()
-    if not arn:
-        raise ValueError(
-            "config.ini [Deployer] edge_role_arn 为空——Function URL 的调用者"
-            "必须绑定到 exact edge role，不能放宽。请先部署路由层并回填该值")
-    if "*" in arn or not arn.startswith("arn:aws:iam::"):
-        raise ValueError(f"edge_role_arn 必须是精确的 IAM role ARN: {arn!r}")
-    return [
-        {"StatementId": "edge-invoke-url",
-         "Action": "lambda:InvokeFunctionUrl",
-         "Principal": arn,
-         "FunctionUrlAuthType": FUNCTION_URL_AUTH_TYPE},
-        # 2025-10 起 InvokeFunctionUrl 单条不够，缺 InvokeFunction 即 403。
-        {"StatementId": "edge-invoke-function",
-         "Action": "lambda:InvokeFunction",
-         "Principal": arn,
-         "InvokedViaFunctionUrl": True},
-    ]
 
 
 def role_statements(cfg=None) -> list[dict]:
@@ -487,14 +464,10 @@ def ensure_function(role_arn: str, code: bytes, edge_role_id_value: str,
                 FunctionName=FN_NAME, AuthType=FUNCTION_URL_AUTH_TYPE)
         url = cur["FunctionUrl"]
 
-    for stmt in function_url_statements(_cfg(cfg, "Deployer", "edge_role_arn",
-                                             "")):
-        kwargs = {k: v for k, v in stmt.items() if k != "StatementId"}
-        try:
-            lam.add_permission(FunctionName=FN_NAME,
-                               StatementId=stmt["StatementId"], **kwargs)
-        except lam.exceptions.ResourceConflictException:
-            pass        # 幂等：同 StatementId 已存在
+    # resource policy 按期望集合等值收敛（merged review M07）：读回、替换内容不对的同名语句（edge role 重建后
+    # Principal 会被 IAM 改写成已删角色的 AROA 形态）、删野 Sid、写后读回核对；一致时零写入。
+    print("   Function URL 授权（收敛前的漂移；「一致」= 零写入，其它 = 已按期望集合改写并读回核对）："
+          f"{converge_function_url_policy(lam, FN_NAME, _cfg(cfg, 'Deployer', 'edge_role_arn', '')).summary()}")
     return url
 
 

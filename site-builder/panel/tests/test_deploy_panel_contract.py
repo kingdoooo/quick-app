@@ -1170,3 +1170,49 @@ def test_panel_deploy_script_does_not_pass_login_flow_to_the_ssm_helper():
     """结构守卫：`login_flow=True` 只许出现在 deploy_auth 里。"""
     src = (PANEL / "deploy_panel.py").read_text()
     assert "login_flow" not in src, "deploy_panel 引用了 login_flow 开关"
+
+
+# ---- M07：Function URL 的 resource policy 走共享的等值收敛 -------------------------------------------
+#
+# 三条：① 实现是共享的那一份（`function_url_statements` / `converge_function_url_policy` / `FUNCTION_URL_AUTH_TYPE`
+# 都从 function_url_policy 来）；② 本脚本里不再有任何 add_permission / remove_permission；③ ensure_function
+# 恰好调用一次 converge，实参是 (lam, FN_NAME, 配置里的 edge_role_arn)。converge 自身的行为在
+# deployer/tests/test_function_url_policy.py。evidence: fake/unit。
+
+import function_url_policy as fup
+
+
+def test_deploy_panel_binds_the_shared_function_url_policy_implementation():
+    assert dp.function_url_statements is fup.expected_statements
+    assert dp.converge_function_url_policy is fup.converge
+    assert dp.FUNCTION_URL_AUTH_TYPE is fup.FUNCTION_URL_AUTH_TYPE
+    src = (PANEL / "deploy_panel.py").read_text()
+    assert "def function_url_statements" not in src, "本脚本又长出了第二份语句定义"
+
+
+def test_deploy_panel_has_no_direct_permission_calls():
+    """"同名 StatementId 已存在就 pass"回来的唯一途径就是有人在这里又写一遍 add_permission。"""
+    tree = ast.parse((PANEL / "deploy_panel.py").read_text())
+    direct = {node.func.attr for node in ast.walk(tree)
+              if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+              and node.func.attr in ("add_permission", "remove_permission")}
+    assert direct == set(), direct
+
+
+def test_ensure_function_converges_the_policy_once_for_the_configured_edge_role(monkeypatch):
+    from unittest.mock import MagicMock
+    lam = MagicMock()
+    for name in ("ResourceNotFoundException", "ResourceConflictException", "InvalidParameterValueException"):
+        setattr(lam.exceptions, name, type(name, (Exception,), {}))
+    lam.get_function_url_config.return_value = {"FunctionUrl": "https://x.lambda-url.us-east-1.on.aws/",
+                                                "AuthType": "AWS_IAM"}
+    monkeypatch.setattr(dp.boto3, "client", lambda *a, **k: lam)
+    monkeypatch.setattr(dp, "_region", lambda: "us-east-1")
+    monkeypatch.setattr(dp, "lambda_environment", lambda eid: {})
+    monkeypatch.setattr(dp, "_cfg", lambda section, key, default=None:
+                        {("Deployer", "edge_role_arn"): EDGE_ROLE}.get((section, key), default or ""))
+    calls = []
+    monkeypatch.setattr(dp, "converge_function_url_policy",
+                        lambda client, fn, arn: calls.append((client, fn, arn)) or fup.Drift())
+    dp.ensure_function("arn:aws:iam::000000000000:role/site-panel-role", b"zip", "AROAEXAMPLE")
+    assert calls == [(lam, dp.FN_NAME, EDGE_ROLE)]

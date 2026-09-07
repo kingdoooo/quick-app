@@ -316,12 +316,18 @@ decodeURIComponent）。**CloudFront 全站禁缓存是鉴权正确性前提**
 | `[SessionKeys] login_flow_secret_param` | 只进 auth（`LOGIN_FLOW_SECRET_PARAM` + 角色清单），`login_handler._login_flow_sig` 是唯一读取点；`ensure_session_keys.py` 创建、`deploy_auth.ensure_secret` 兜底（**不进写前核对清单**，见 `docs/adr/0004-*.md`）；panel 有三条负向断言锁死它永不持有；闸门记成 grant `read-login-flow-secret` 且**不算冒充面** |
 | CLAUDE.md「仓库外的几样东西」第 2 步的 venv 表 | `scripts/bootstrap_venvs.sh` 的 `VENVS` 表（守卫 `deployer/tests/test_bootstrap_venvs.py` 按表逐行核对）、DEPLOY.md「本机工具链」 |
 | 验收工具的本地 mint（`scripts/_session_mint.py`） | 六处调用方（四个 `verify_*`、`verify_kid_entry_live.py`、E2E 的会话 cookie fixture）。改它等于同时改六个验收面；非对称化后它整体被夹具签发器（spec §11.7）替代，所以**本地 mint 只许存在于这一个模块里** |
+| `deployer/functions/function_url_policy.py`（Function URL resource policy 的唯一实现） | 三个部署脚本的 `converge_function_url_policy` 调用（auth 的 `edge_role_arn()` 校验、panel / key-proxy 的 `ensure_function`）、闸门 `_check_function_url_authz` 与 `MIN_DEPLOYED_CHECKS`、`deploy_lambda_site` 的 parity 用例（站点色授权与平台三条同形）、`fake_lambda_policy.py` 的渲染形态 |
 
 ## 高频坑（都是真机踩过的）
 
 - Function URL 一律 `AuthType=AWS_IAM` + 只授权 edge role，且需要
 `InvokeFunctionUrl` + `InvokeFunction`(InvokedViaFunctionUrl) 两条语句，缺一即 403。
 `AuthType=NONE` + `Principal:*` 会被安全扫描自动处置（删光 resource policy）。
+**三个平台脚本的 resource policy 由 `function_url_policy.converge` 每次部署按期望集合等值写**
+（读回、替换内容不对的同名语句、删野 Sid、写后读回核对；一致时零写入）——"同名 StatementId 已存在
+就 pass"是假幂等：edge role 被删后重建时 IAM 会把 policy 里的 Principal 改写成已删角色的 AROA 形态，
+同名语句存在但永不匹配，症状是重部 exit 0 而 Edge 全 403（auth 那条 = 全平台登录不可用）。
+`verify_deployed_components.py` 对 auth / panel / key-proxy 三条都用同一个 `drift` 断言。
 - AgentCore 镜像构建必须 `--provenance=false`（buildx 默认加 attestation
 manifest，CreateAgentRuntime 校验失败但报成 IAM 权限错误文案）。
 - S3 预签名 PUT 不能带 Content-Type 头（签名按无该头计算，加了必 403）。

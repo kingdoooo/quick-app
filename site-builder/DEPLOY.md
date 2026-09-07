@@ -1954,6 +1954,8 @@ name**；值必须是裸 `true`/`false`——configparser 会把行内注释并�
    > 需要的权限是操作者自己的 `cloudformation:DescribeStacks / GetTemplate / GetStackPolicy / SetStackPolicy`
    > ——CDK bootstrap 的角色没有 SetStackPolicy，脚本刻意不走它们。
 3. 记录 CfnOutput 的 **EdgeRoleArn**，回填 `site-builder/config.ini [Deployer] edge_role_arn`（Task 17 执行器需要它给站点 Function URL 授权）。记录 **DistributionDomainName**。
+
+   **换 edge role 之后**（路由层栈重建、角色重创、或修正写错的 `edge_role_arn`）：重跑 ⑤ `deploy_auth.py`、⑤b `deploy_panel.py`、⑤c `deploy_key_proxy.py` 即可——三个脚本每次都按期望集合等值收敛各自 Function URL 的 resource policy（读回、替换内容不对的同名语句、删野 Sid、写后读回核对；一致时零写入）。IAM 在角色被删时会把 policy 里的 Principal 改写成已删角色的唯一 ID，所以"同名语句已存在"不等于授权还对；`verify_deployed_components.py` 对三条都断言。
 4. DNS：在 `{base_domain}` 加通配符 CNAME 或 A-alias 指向 CloudFront 域名：
   ```
    *.{base_domain}  →  {distribution_domain_name}  (如 d1234abcd.cloudfront.net)

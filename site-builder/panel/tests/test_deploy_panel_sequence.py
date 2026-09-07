@@ -71,6 +71,10 @@ def test_required_parameters_are_legacy_plus_console_family_only():
 def test_ensure_function_updates_configuration_before_code(monkeypatch):
     lam = Recorder()
     monkeypatch.setattr(dp.boto3, "client", lambda *a, **k: lam)
+    # M07：Function URL 授权走共享的 converge（它要读真 policy，Recorder 给不出来）；本用例只看更新顺序，
+    # converge 的行为在 deployer/tests/test_function_url_policy.py，接线在 test_deploy_panel_contract.py。
+    monkeypatch.setattr(dp, "converge_function_url_policy",
+                        lambda *a, **k: type("D", (), {"summary": lambda self: "一致"})())
     dp.ensure_function("arn:x", b"zip", "AROA-TEST-ROLE-ID")
     head = lam.calls[:7]
     assert head == ["get_function", "update_function_configuration", "get_waiter", "wait",

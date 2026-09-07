@@ -414,10 +414,11 @@ def test_the_floor_tracks_state_instead_of_being_a_constant():
     l3 = (len(g._present(l3_auth, g.AUTH_SESSION_PARAM_KEYS))
           + len(g._present(l3_panel, g.PANEL_SESSION_PARAM_KEYS)))
     assert (l2, l3) == (3, 1), (l2, l3)
-    # L2 的总下限必须与 3c-1B 之前那个常量一致（本次拆分不改变已部署状态）
-    assert g.MIN_DEPLOYED_CHECKS + l2 == 23
+    # M07 给 ④ 补了 auth 的 Function URL 三条（AuthType / 语句集合 / 逐条内容）：L2 从 23 抬到 26
+    assert g.MIN_DEPLOYED_CHECKS == 23
+    assert g.MIN_DEPLOYED_CHECKS + l2 == 26
     # 且 L3 恰好少两条，不是"少一条"或"不变"
-    assert g.MIN_DEPLOYED_CHECKS + l3 == 21
+    assert g.MIN_DEPLOYED_CHECKS + l3 == 24
 
 
 def test_min_param_checks_counts_both_sections_from_the_same_source_as_the_checks():
@@ -428,3 +429,112 @@ def test_min_param_checks_counts_both_sections_from_the_same_source_as_the_check
         "下限只数了一段——另一段的 *_PARAM 条数不会被补上"
     assert "lambda_env()" in body and "lambda_environment(" in body, \
         "下限没按**本地推导**值数（用线上值会让漏下发变成少核一条而不是红）"
+
+
+# ---- M07：三条平台 Function URL 的授权闸门（auth 此前完全没有）----------------------------------
+#
+# 判定与部署脚本共用 `function_url_policy.drift`；这里只证明闸门把它接对了：三种真实漂移各红在正确的那一条，
+# 正对照全绿，policy 整个不存在按"两条都缺"记红而不是崩。evidence: fake/unit。
+
+import fake_lambda_policy as flp
+
+FUP_EDGE = "arn:aws:iam::000000000000:role/site-edge-role"
+
+
+def _authz(lam, edge=FUP_EDGE):
+    g = _gate()
+    g.results.clear()
+    g._check_function_url_authz(lam, "site-auth-service", "auth", edge)
+    return g.results
+
+
+def test_function_url_authz_is_all_green_on_the_documented_shape():
+    """正对照：与 AWS 文档形态逐字节相同 ⇒ 恰好三条 PASS。"""
+    res = _authz(flp.FakeLambdaPolicy(flp.good_pair(FUP_EDGE)))
+    assert len(res) == 3 and all(ok for ok, _, _ in res), res
+
+
+def test_function_url_authz_catches_a_principal_rewritten_to_a_deleted_role():
+    """M07 的核心形态：edge role 重建后 Principal 成了 AROA…——只有"逐条内容"那条红，集合那条绿。"""
+    aroa = "AROA" + "EXAMPLEDELETED" + "XXXX"
+    lam = flp.FakeLambdaPolicy([
+        flp.rendered("edge-invoke", "lambda:InvokeFunctionUrl", aroa, function_url_auth_type="AWS_IAM"),
+        flp.rendered("edge-invoke-function", "lambda:InvokeFunction", aroa, invoked_via_function_url=True)])
+    res = _authz(lam)
+    assert [ok for ok, _, _ in res] == [True, True, False], res
+    assert "AROA" in res[2][2], "detail 里要能看到线上的 principal 形态"
+
+
+def test_function_url_authz_catches_a_stray_statement():
+    lam = flp.FakeLambdaPolicy(flp.good_pair(FUP_EDGE) + [
+        flp.rendered("public-url", "lambda:InvokeFunctionUrl", "*", function_url_auth_type="NONE")])
+    res = _authz(lam)
+    assert [ok for ok, _, _ in res] == [True, False, True], res
+    assert "public-url" in res[1][2]
+
+
+def test_function_url_authz_catches_a_missing_statement():
+    res = _authz(flp.FakeLambdaPolicy(flp.good_pair(FUP_EDGE)[:1]))
+    assert [ok for ok, _, _ in res] == [True, False, True], res
+    assert "edge-invoke-function" in res[1][2]
+
+
+def test_function_url_authz_catches_auth_type_none():
+    res = _authz(flp.FakeLambdaPolicy(flp.good_pair(FUP_EDGE), auth_type="NONE"))
+    assert [ok for ok, _, _ in res] == [False, True, True], res
+
+
+def test_function_url_authz_reports_an_absent_policy_as_failures_not_a_crash():
+    """policy 整个不存在（被安全扫描删光的实测形态）⇒ 两条 policy check 红，脚本不崩成"执行中断"。"""
+    res = _authz(flp.FakeLambdaPolicy())
+    assert [ok for ok, _, _ in res] == [True, False, True], res
+    assert "edge-invoke" in res[1][2] and "edge-invoke-function" in res[1][2]
+
+
+def _function_url_authz_targets(src: str) -> set:
+    """源码里每处 `_check_function_url_authz(...)` 调用的**字符串常量实参**集合（按 AST，注释不算）。
+
+    与 `_auth_plaintext_check_param_keys` 同一条纪律：不 grep 文本。panel / key-proxy 那两处用的是变量 `fn`，
+    所以常量集合里只会出现 auth 那处的 "site-auth-service"（以及三处的 label）。
+    """
+    import ast as _ast
+    found = set()
+    for node in _ast.walk(_ast.parse(src)):
+        if isinstance(node, _ast.Call) and getattr(node.func, "id", None) == "_check_function_url_authz":
+            for a in list(node.args) + [kw.value for kw in node.keywords]:
+                if isinstance(a, _ast.Constant) and isinstance(a.value, str):
+                    found.add(a.value)
+    return found
+
+
+def _function_url_authz_targets_in(src: str, function_name: str) -> set:
+    """同上，但只看某个函数体内的调用（按 AST 定位函数，不切源码文本——④ 段的 print 里有框线字符，切片会不可解析）。"""
+    import ast as _ast
+    tree = _ast.parse(src)
+    fn = next(n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef) and n.name == function_name)
+    return _function_url_authz_targets(_ast.unparse(fn))
+
+
+def test_the_auth_section_asserts_the_function_url_policy():
+    """结构守卫：④ 段（run_deployed）里必须有一处对 `site-auth-service` 的 `_check_function_url_authz` 调用。"""
+    src = _SCRIPT.read_text()
+    assert "site-auth-service" in _function_url_authz_targets_in(src, "run_deployed"), "auth 的 Function URL 仍然没有闸门"
+    assert {"auth", "panel", "key-proxy"} <= _function_url_authz_targets(src), "三条平台 Function URL 没有全覆盖"
+
+
+def test_the_auth_target_extractor_reads_arguments_not_comments():
+    """自测：喂给**同一个**抽取器，注释里的字面量不算、实参里的才算。"""
+    assert _function_url_authz_targets(
+        '# 该给 site-auth-service 也加 _check_function_url_authz\n'
+        '_check_function_url_authz(lam, fn, "panel", edge_role)\n') == {"panel"}
+    assert _function_url_authz_targets(
+        '_check_function_url_authz(lam, "site-auth-service", "auth", edge)\n') == {"site-auth-service", "auth"}
+
+
+def test_the_gate_uses_the_shared_drift_judgement_not_its_own():
+    """`_check_function_url_authz` 里必须调用 `function_url_policy.drift`——闸门与部署脚本对"对的形态"只能有一个定义。"""
+    import ast as _ast
+    tree = _ast.parse(_SCRIPT.read_text())
+    fn = next(n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef) and n.name == "_check_function_url_authz")
+    calls = {_ast.unparse(n.func) for n in _ast.walk(fn) if isinstance(n, _ast.Call)}
+    assert any(c == "drift" or c.endswith(".drift") for c in calls), sorted(calls)
