@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import secrets
+from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 import boto3
@@ -36,8 +37,18 @@ SITE_ALLOWLIST_JSON = '''{{SITE_ALLOWLIST_JSON}}'''
 LEGACY_ENTRY = "{{LEGACY_ENTRY}}"        # "on" | "off"（[SessionKeys] legacy_param 非空即 on）
 # 解析结果的缓存。None = 还没解析过；解析在 `_site_allowlist()` 里**惰性**做（ticket 21）。
 _SITE_ALLOWLIST = None
-_ROUTE_CACHE: dict = {}  # subdomain -> (expires_epoch, item)
+# 路由缓存：subdomain -> (expires_epoch, item)。**有界 LRU**（M19）：键是请求 host 的第一段，
+# 而分发挂的是 `*.{base_domain}` 通配别名 ⇒ 键由攻击者选；无上界的 dict 用随机子域打一轮就能
+# 把一个 Edge 实例的内存撑满。超过上界时淘汰**最久没被访问**的那条（OrderedDict 的插入序 +
+# 命中时 move_to_end）：在一轮淘汰窗口内被访问过的热站点留下；持续洪水下空闲超过一个窗口的
+# 站点仍会被淘汰——LRU 缩小这个窗口，不关闭它。
+# **未命中也缓存，是刻意的**：不缓存 miss 的话，一个被反复打的同一个不存在 host 就变成路由表
+# 的热键，同一分区上真实站点的 GetItem 会一起被限流成 404；随机 host 洪水本来每个都要打一次
+# GetItem，缓存 miss 与否对它没有影响，它只被上界约束。上界的量级守卫与 LRU/FIFO 反例在
+# `test_edge_route_cache.py`。
+_ROUTE_CACHE: OrderedDict[str, tuple[float, Optional[dict]]] = OrderedDict()   # (expires_epoch, item|None)
 ROUTE_CACHE_TTL = 60
+ROUTE_CACHE_MAX_ENTRIES = 1024
 DEFAULT_PROTOCOL = "https"
 DEFAULT_PORT = 443
 DEFAULT_SSL_PROTOCOLS = ["TLSv1.2"]
@@ -440,7 +451,8 @@ def _deser(item: dict) -> dict:
 def _lookup_route(subdomain: str):
     import time as _t
     hit = _ROUTE_CACHE.get(subdomain)
-    if hit and hit[0] > _t.time():
+    if hit is not None and hit[0] > _t.time():
+        _ROUTE_CACHE.move_to_end(subdomain)  # 命中 = 最近使用，LRU 的"R"就靠这一行
         return hit[1]
     try:
         resp = _ddb().get_item(TableName=DYNAMODB_TABLE_NAME,
@@ -450,7 +462,11 @@ def _lookup_route(subdomain: str):
     except ClientError as e:
         logger.error(f"DynamoDB错误: {e}")
         return None
+    # 过期条目在这里被同键覆盖；先删再插让它回到队尾（直接赋值只更新值、不动位置）。
+    _ROUTE_CACHE.pop(subdomain, None)
     _ROUTE_CACHE[subdomain] = (_t.time() + ROUTE_CACHE_TTL, item)
+    while len(_ROUTE_CACHE) > ROUTE_CACHE_MAX_ENTRIES:
+        _ROUTE_CACHE.popitem(last=False)
     return item
 
 
