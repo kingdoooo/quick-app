@@ -518,9 +518,11 @@ cd "$(git rev-parse --show-toplevel)"
 (cd site-builder/panel && python3 deploy_panel.py --skip-frontend)   # 本 runbook 不改前端
 python3 site-builder/scripts/verify_deployed_components.py           # 环境变量整体 == 本地推导
 
-# ── B. 部署 Edge（**每次都 rm -rf cdk.out**，否则用陈旧 asset）
+# ── B. 部署 Edge（**每次都 rm -rf cdk.out**，否则用陈旧 asset；stack policy 三步：open → deploy → apply）
+python3 site-builder/scripts/router_stack_policy.py open
 (cd router/infrastructure && rm -rf cdk.out \
    && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never)
+python3 site-builder/scripts/router_stack_policy.py apply   # 无论 deploy 成败都要跑
 # 等 CloudFront 真的 Deployed（CLI 会挂在最后一步 10–20 分钟，别盯它的输出）：
 aws cloudfront get-distribution --id {distribution_id} \
   --query 'Distribution.Status' --output text     # 必须是 Deployed
@@ -1114,7 +1116,7 @@ python3 site-builder/scripts/migrate_sites_to_blue_green.py --apply --site-id <s
 | 2 | panel + key-proxy + MCP **三个都重部** | `permissions.py` 被复制进这三个产物，漏一个就是产物陈旧而部署脚本一切正常。**第一波**强制重登从这一刻开始（见下面「三波重登」） |
 | 3 | `backfill_site_role_policies.py --apply` | **必须在 1 之后**（它调新版 `ensure_site_role`）。全流程唯一不可逆的一步 |
 | 4 | auth | **第二波**重登从这一刻开始 |
-| 5 | router（Edge） | 必须在 auth 之后：反过来会让新签发的会话被 Edge 拒（登录循环） |
+| 5 | router（Edge）：`open` → deploy → `apply` | 必须在 auth 之后：反过来会让新签发的会话被 Edge 拒（登录循环） |
 | 6 | 等 CloudFront `Status == Deployed` | **放在 5 之后而不是之前**：触发 Lambda@Edge 全球传播的是 router 部署本身，在它之前等待不会等到任何新版本。判据用 `Status`，不要盲等固定分钟数。**第三波**重登在这期间发生 |
 | 7 | 真机验收（7 条 + 硬闸门） | 见下面「六个硬闸门」 |
 
@@ -1159,8 +1161,10 @@ python3 site-builder/scripts/backfill_site_role_policies.py --apply    # 真写 
 # 4 auth（第二波重登从这里开始）
 (cd site-builder/auth && python3 deploy_auth.py)
 
-# 5 router / Edge
+# 5 router / Edge（stack policy 三步：open → deploy → apply；open 之后无论成败都要 apply）
+python3 site-builder/scripts/router_stack_policy.py open
 (cd router/infrastructure && rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never)
+python3 site-builder/scripts/router_stack_policy.py apply
 ```
 
 **第 6 步**（等 CloudFront 分发 `Status` 回到 `Deployed`，第三波重登在这期间发生）
@@ -1226,7 +1230,7 @@ exit "$m01_rc"
 | `backfill_site_role_policies.py --check` | 第 7 步 | 四层：site-scope 与期望**完整等值**、角色上只有 site-scope 一条 policy、ACTIVE 站点的角色反向存在、全部 dynamodb 站点过 IAM 模拟器**全部六个数据动作** | **不看信任策略**（`AssumeRolePolicyDocument` 被放宽的角色四层全过）、**不看 `site-runtime-boundary` 还挂着没有**——而 `ensure_site_role` 只在**新建**角色时挂 boundary，所以 `--apply` 不会把被摘掉的 boundary 挂回去。DSQL 站点只有文本等值，没有功能模拟 |
 | `verify_deployed_components.py` | 第 7 步，且**必须在第 2 步之后** | 线上产物里的 `permissions.py` / `common.py` / `session.py` / `login_handler.py` 与仓库逐字节一致；线上 `site-deployer-*` 函数**集合**与 `app.py` 的 `PLATFORM_FUNCTION_NAMES` 精确相等（函数整个消失/多出都红——消失的函数进不了逐包循环）；**每个 `site-deployer-*` 函数自己的 handler**（从部署定义的 Handler 派生，如 `provision_dynamodb.py` / `undeploy.py`）与本地一致；validate 包的 `contract/redlines.py` **和 `contract/schema.py`** 都一致 | 这是**唯一**能发现"某个 **Lambda** 产物漏部了"的闸门。漏一个的症状是产物陈旧而部署脚本全程正常。曾只比守卫三件套——"common 新、handler 旧"的半量部署照样全绿（Codex deployed-state 复审 2026-08-24 指出，判定已抽成纯函数反向验证）。**它不覆盖 Edge**：它下载 Edge 产物，但只问一个问题（`mcp` 有没有进 `PLATFORM_SUBDOMAINS`），M05/M06 的 Edge 半边它一个字都没看 |
 | `verify_table_collision_e2e.py` | 第 7 步（部署后可随时跑；**会真实部署/下线两个一次性站点**） | 表名碰撞在真机上关闭的**行为**证据：B 正常部署（正对照）、A 的碰撞 manifest 被线上 validate 以 `TABLE_NAME_RE` 原话拒绝、A 侧零资源残留、B 侧逐字段不变（表 schema/tags/role policy/data_tables）、purge 三态幂等（对已购清站点重复 purge 收敛到 DELETED）。跑完强一致读回核对清零，输出含 site/job ID 的 JSON 摘要 | 清理与幂等探针**直接 Event 调 `site-deployer-undeploy`**（复刻 MCP 建 job 后的动作）——证明的是部署函数行为，不是 MCP/panel 鉴权链路（那由 `verify_api_key_e2e.py` 覆盖）。sites/jobs 的 DELETED 历史行保留 |
-| `verify_deployed_edge.sh` | 第 7 步，**在业务验收之前**（第 6 步等到 `Deployed` 之后） | CloudFront **当前关联的那个版本**的产物与本地 `origin_request.py` 逐行相同（只允许占位符行有差异）、占位符全部替换、安全开关是收紧值，外加 M05（查 `typ`）与 M06（逐个验、不截断）两条哨兵 | **证据等级是静态产物比对，不是行为探针**：它证明"跑在线上的就是这份源码"，M05/M06 的**行为**由下面那条闸门单独证。也不看非默认 cache behavior 上的关联 |
+| `verify_deployed_edge.sh` | 第 7 步，**在业务验收之前**（第 6 步等到 `Deployed` 之后） | CloudFront **当前关联的那个版本**的产物与本地 `origin_request.py` 逐行相同（只允许占位符行有差异）、占位符全部替换、安全开关是收紧值，外加 M05（查 `typ`）与 M06（逐个验、不截断）两条哨兵；**⑤ router 栈的 stack policy**：一条 Deny 精确覆盖 Edge 两函数、分发与路由表四个逻辑 ID，且策略带 Allow-all（`router_stack_policy.py check`，只读） | **证据等级是静态产物比对，不是行为探针**：它证明"跑在线上的就是这份源码"，M05/M06 的**行为**由下面那条闸门单独证。也不看非默认 cache behavior 上的关联。也不证明谁持有 `cloudformation:SetStackPolicy`（那是 IAM 层，归探针与信任边界文档） |
 | `verify_site_table_integrity.py` | 第 7 步（部署后自检，也可随时跑） | per-site 数据表的归属：ACTIVE NoSQL 站点的表存在且 tag `project`/`site_id` 正确；**每个 `site-rt-{site_id}` 角色的 DynamoDB 表 ARN 集合与同一站点自己的表精确相等**（不多、不少、无通配、不含别站的表）；DSQL 角色没有任何表 ARN；static（engine=none）站点**没有**运行时角色是合法态（角色存在时表 ARN 集合必须为空）；全部 `data_tables` 逻辑名符合 `TABLE_NAME_RE` | 只看**当前 ACTIVE** 站点——历史/DELETED 行不做全量对账（表可能已删），但它们含连字符的 `data_tables` 仍会被报出来。不核 DSQL 侧的 schema/role 隔离（那在 PG 层）。要害判定抽成了纯函数 `role_arn_problems`，反向验证在 `deployer/tests/test_verify_site_table_integrity.py` |
 | `verify_session_token_semantics.py` | 第 7 步，紧跟上一条 | M05/M06 的**真机行为**：遮蔽 cookie 排在合法会话之前时 `/console-session` 仍换出升级码、Edge 侧仍放行（含 14 条遮蔽的量级）、console 升级码当站点会话被拒；含正对照（单枚合法会话能进）与负对照（无 cookie 仍 302）。**只发 GET，不写数据** | 它只挑路由表里第一个 `require_auth=True` 的站点，不遍历全部站点；候选条数上限那一类**回归**残留由单测的结构守卫管，不在这里 |
 
@@ -1901,7 +1905,9 @@ name**；值必须是裸 `true`/`false`——configparser 会把行内注释并�
    python3 -m venv --clear .venv                  # 或一次建齐：bash site-builder/scripts/bootstrap_venvs.sh（见 §0 本机工具链）
    .venv/bin/pip install -r requirements.txt -q
    PATH=.venv/bin:$PATH npx -y aws-cdk@latest bootstrap aws://{account_id}/us-east-1   # 首次
+   python3 ../../site-builder/scripts/router_stack_policy.py open    # 首次部署栈还不存在 → 打印 SKIP
    PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never
+   python3 ../../site-builder/scripts/router_stack_policy.py apply   # 设 stack policy 并读回核对；open 之后无论成败都要跑
   ```
 
    stack.py 部署时会从 SSM 读真实密钥注入 Edge 函数（`load_jwt_secret` / `load_site_allowlist`）；
@@ -1933,6 +1939,20 @@ name**；值必须是裸 `true`/`false`——configparser 会把行内注释并�
    > origin **之后**才触发，填不可解析的值（如 `.invalid` 保留 TLD）会让所有请求
    > 在 Edge 执行前就 `502 CloudFront wasn't able to resolve the origin domain name`,
    > 连 Edge 自己的 404 都返回不了。
+
+   > **router 栈带 stack policy，`cdk deploy` 前后各一步。** 策略对 Edge 两函数、CloudFront 分发与
+   > 路由表四个资源的**精确逻辑 ID** 拒绝 `Update:*`（含 Modify——Edge 换码就是 Lambda `Code` 的
+   > Modify，只拒 Replace/Delete 拦不住它）。效果：持有 `cloudformation:UpdateStack` 或
+   > `CreateChangeSet`+`ExecuteChangeSet` **但没有 `cloudformation:SetStackPolicy`** 的 principal 改不了
+   > 这四个资源（AWS 文档：越过策略必须有 SetStackPolicy；ExecuteChangeSet 不接受临时覆盖策略）。
+   > 所以每次部署是三步：`open`（换成 Allow-all）→ `cdk deploy` → `apply`（按已部署模板推导逻辑 ID、
+   > 写回并读回核对）。**stack policy 设上就删不掉，只能换**——"回滚本功能"也是先 `open`。
+   > 它**不防** DeleteStack（termination protection 另配）、不防持有 SetStackPolicy 的人、不防绕开
+   > CloudFormation 直接调 Lambda / CloudFront API 的那条路（那条的边际收益为 0，见 spec §1）。
+   > 忘 open：`cdk deploy` 在 ExecuteChangeSet 阶段失败、事件原因含 "stack policy"、整栈回滚，
+   > Edge 不受影响，open 后重跑。忘 apply：**没有任何症状**，只有 `verify_deployed_edge.sh` ⑤ 会红。
+   > 需要的权限是操作者自己的 `cloudformation:DescribeStacks / GetTemplate / GetStackPolicy / SetStackPolicy`
+   > ——CDK bootstrap 的角色没有 SetStackPolicy，脚本刻意不走它们。
 3. 记录 CfnOutput 的 **EdgeRoleArn**，回填 `site-builder/config.ini [Deployer] edge_role_arn`（Task 17 执行器需要它给站点 Function URL 授权）。记录 **DistributionDomainName**。
 4. DNS：在 `{base_domain}` 加通配符 CNAME 或 A-alias 指向 CloudFront 域名：
   ```
@@ -2481,7 +2501,7 @@ protection，不会也不该被删**（历史 Key 行是审计证据）；断言
 | # | 目标 | 命令 |
 |---|---|---|
 | ① | 执行器栈（两张表 + rollup Lambda + EventBridge 规则） | `cd site-builder/deployer/infra && rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never` |
-| ② | 路由层（Edge 埋点 + edge role 的 PutItem） | `cd router/infrastructure && rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never` |
+| ② | 路由层（Edge 埋点 + edge role 的 PutItem） | 见 ②「路由 + 鉴权层」第 2 步的三步（`open` → `cdk deploy` → `apply`） |
 | ③ | 控制台 panel（统计页 + 站点列表迷你趋势） | `cd site-builder/panel && python3 deploy_panel.py` |
 | ④ | key-proxy（**容易漏**，见下） | `cd site-builder/key-proxy && python3 deploy_key_proxy.py` |
 | ⑤ | MCP（第 9 个工具） | `cd site-builder/mcp && python3 deploy_agentcore.py` |

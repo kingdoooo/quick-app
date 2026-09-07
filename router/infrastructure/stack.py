@@ -27,6 +27,8 @@ from aws_cdk import (
 )
 from constructs import Construct
 
+from stack_policy import assert_protected_constructs
+
 
 class ConfigLoader:
     """Configuration loader supporting config.ini and environment variables"""
@@ -500,7 +502,11 @@ class WebRouterStack(Stack):
             minimum_protocol_version=cloudfront.SecurityPolicyProtocol.TLS_V1_2_2021,
             enable_ipv6=True,
         )
-        
+
+        # stack policy 的声明必须与栈一致（construct ID / L1 类型 / 逻辑 ID 形态），
+        # 否则 synth 失败——不让 router_stack_policy.py 在 20 分钟的 Edge 部署之后才发现推不出 ID。
+        assert_protected_constructs(self)
+
         # Outputs
         CfnOutput(self, "DynamoDBTableName", value=mapping_table.table_name)
         CfnOutput(self, "EdgeFunctionArn", value=edge_function.current_version.function_arn)

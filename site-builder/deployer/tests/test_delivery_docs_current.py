@@ -954,3 +954,108 @@ def test_status_guard_ignores_protocol_prose_and_paths():
         "**待办与优先级**见 §9；还剩什么没做读那张表；而下一步是不可逆的删参数。",
     ])
     assert _status_violations(clean) == [], _status_violations(clean)
+
+
+# --------------------------------------------------------------------------
+# asset-v1 ticket 02：router 栈的 stack policy——每个 router 部署点都要 open → deploy → apply
+# --------------------------------------------------------------------------
+_CDK_DEPLOY_RE = re.compile(r"aws-cdk@latest deploy")
+_ROUTER_CWD_RE = re.compile(r"cd router/infrastructure\b")
+_DEPLOYER_CWD_RE = re.compile(r"cd site-builder/deployer/infra\b")
+
+
+def _fenced_blocks(text: str):
+    """(开围栏的行号, 围栏内的行列表)。"""
+    lines, inside, start, buf = text.splitlines(), False, 0, []
+    for no, ln in enumerate(lines, 1):
+        if ln.lstrip().startswith("```"):
+            if inside:
+                yield start, buf
+            inside, start, buf = not inside, no, []
+        elif inside:
+            buf.append(ln)
+
+
+def _router_deploy_sites(block: list) -> list:
+    """围栏块里哪些行是 **router** 的 `cdk deploy`：同一行或之前最近一次 `cd` 指向 router/infrastructure。
+    `(cd … )` 子 shell 闭合后 cwd 归零（一行式当场闭合；带 `\\` 续行的等到以 `)` 结尾的那行）。"""
+    sites, cwd, subshell = [], None, False
+    for i, ln in enumerate(block):
+        s = ln.strip()
+        if _ROUTER_CWD_RE.search(ln):
+            cwd = "router"
+        elif _DEPLOYER_CWD_RE.search(ln):
+            cwd = "deployer"
+        if _CDK_DEPLOY_RE.search(ln) and cwd == "router":
+            sites.append(i)
+        if "(cd " in ln and s.endswith(")"):
+            cwd = None
+        elif "(cd " in ln:
+            subshell = True
+        elif subshell and s.endswith(")"):
+            subshell, cwd = False, None
+    return sites
+
+
+def _unwrapped_router_deploys(text: str, name: str = "doc") -> tuple[int, list]:
+    """(找到的 router 部署点数, 违规描述列表)。判定与 test_… 分离，好让合成文本做变形对照。"""
+    seen, problems = 0, []
+    for start, block in _fenced_blocks(text):
+        for i in _router_deploy_sites(block):
+            seen += 1
+            before, after = "\n".join(block[:i]), "\n".join(block[i + 1:])
+            if "router_stack_policy.py open" not in before:
+                problems.append(f"{name} L{start + 1 + i}：router 的 cdk deploy 之前没有 open")
+            if "router_stack_policy.py apply" not in after:
+                problems.append(f"{name} L{start + 1 + i}：router 的 cdk deploy 之后没有 apply")
+    fenced = {no for start, block in _fenced_blocks(text) for no in range(start, start + len(block) + 2)}
+    for no, ln in enumerate(text.splitlines(), 1):
+        if no not in fenced and _ROUTER_CWD_RE.search(ln) and _CDK_DEPLOY_RE.search(ln):
+            problems.append(f"{name} L{no}：围栏外（表格）写了 router 的部署命令——改成引用 ② 节")
+    return seen, problems
+
+
+def test_every_router_deploy_site_is_wrapped_by_stack_policy_open_and_apply():
+    """stack policy 拒 `Update:*` ⇒ 不先 open 的 router 部署会在 ExecuteChangeSet 阶段失败回滚；
+    部署后不 apply 则保护一直开着、只有 verify_deployed_edge.sh ⑤ 会点出来。所以文档里**每一处**
+    router 的 `cdk deploy` 都必须在同一个围栏块里前有 open、后有 apply；表格单元格里不许再写
+    router 的部署命令（那里放不下三步，改成引用 ② 那一节）。"""
+    seen = 0
+    for doc in (CLAUDE_MD, DEPLOY):
+        n, problems = _unwrapped_router_deploys(_read(doc), doc.name)
+        assert problems == [], "\n".join(problems)
+        seen += n
+    assert seen >= 4, f"只找到 {seen} 处 router 部署点——判据失效？CLAUDE.md 1 处 + DEPLOY.md 至少 3 处"
+
+
+_WRAPPED_SITE = """intro
+```bash
+python3 site-builder/scripts/router_stack_policy.py open
+(cd router/infrastructure && rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never)
+python3 site-builder/scripts/router_stack_policy.py apply
+(cd site-builder/deployer/infra && rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never)
+```
+"""
+
+
+def test_router_deploy_guard_can_fail_on_synthetic_docs():
+    """**变形对照**：合成一段合规文本（router 三步 + 紧跟的 deployer 部署不被误认为 router 的），
+    再分别去掉 open、去掉 apply、把 router 部署写进表格——每种都必须红，且 deployer 那一行永不计入。"""
+    seen, problems = _unwrapped_router_deploys(_WRAPPED_SITE, "synthetic")
+    assert (seen, problems) == (1, []), (seen, problems)
+    no_open = _WRAPPED_SITE.replace("python3 site-builder/scripts/router_stack_policy.py open\n", "")
+    assert any("没有 open" in p for p in _unwrapped_router_deploys(no_open, "synthetic")[1])
+    no_apply = _WRAPPED_SITE.replace("python3 site-builder/scripts/router_stack_policy.py apply\n", "")
+    assert any("没有 apply" in p for p in _unwrapped_router_deploys(no_apply, "synthetic")[1])
+    table = _WRAPPED_SITE + "| ② | 路由层 | `cd router/infrastructure && npx -y aws-cdk@latest deploy` |\n"
+    assert any("围栏外" in p for p in _unwrapped_router_deploys(table, "synthetic")[1])
+    # 多行子 shell：`(cd router/infrastructure && \` 续行后以 `)` 收尾，收尾后的 deployer 部署不算 router 的
+    multiline = """```bash
+python3 site-builder/scripts/router_stack_policy.py open
+(cd router/infrastructure && rm -rf cdk.out && \\
+   PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never)
+python3 site-builder/scripts/router_stack_policy.py apply
+(cd site-builder/deployer/infra && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy)
+```
+"""
+    assert _unwrapped_router_deploys(multiline, "synthetic") == (1, [])

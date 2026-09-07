@@ -181,7 +181,11 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 # 路由层（改过 config.ini 必须先 rm -rf cdk.out，否则用陈旧 asset）
+# router 栈有 stack policy（拒 Update:* 落在 Edge 两函数 / 分发 / 路由表上），所以三步一组：
+# open 打开（首次部署栈不存在时打印 SKIP）→ deploy → apply 关回去并读回核对。**open 之后无论 deploy 成败都要 apply。**
+python3 site-builder/scripts/router_stack_policy.py open
 (cd router/infrastructure && rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never)
+python3 site-builder/scripts/router_stack_policy.py apply
 
 # 执行器（bundling 需要 Docker）
 (cd site-builder/deployer/infra && rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never)
@@ -303,6 +307,7 @@ decodeURIComponent）。**CloudFront 全站禁缓存是鉴权正确性前提**
 | `permissions.py` | deployer tests、panel、key-proxy、MCP、三个产物重部 |
 | `auth/session.py` | auth 调用方、panel copy、Edge verifier、auth→Edge 向量 |
 | `origin_request.py` | router tests、origin-response 对称契约、CDK asset、Edge 部署 |
+| router 栈的四个受保护 construct ID（`OriginRequestFunction` / `OriginResponseFunction` / `Distribution` / `SubdomainMappingTable`） | `router/infrastructure/stack_policy.py` 的 `PROTECTED_CONSTRUCTS`（synth 期守卫 `assert_protected_constructs` 会红）、`scripts/router_stack_policy.py`、`verify_deployed_edge.sh` ⑤、DEPLOY.md ② 的 open → deploy → apply。**改 construct ID = 换逻辑 ID = 替换资源**——对分发与路由表那是事故 |
 | 路由权限字段 | permissions、register/resync、补偿恢复、Edge 反序列化 |
 | DynamoDB/DSQL 资源 | runtime inline policy、boundary、undeploy、backfill、IAM 模拟 |
 | `[SessionKeys]`（`auth/session_keys.py`） | `config.ini.example`、`ensure_session_keys.py`、`deploy_auth`/`deploy_panel` 的 env 与 role SSM 清单、`router/infrastructure/stack.py` 注入、闸门 `session_key_params`、`verify_deployed_edge.sh`、`verifier_env.py`（auth 拥有、panel 复制） |
@@ -355,6 +360,12 @@ JWT。别"顺手补齐"这个名单。
 - **改了 `permissions.py` 这类共享模块，要重部的是三个组件**：panel、key-proxy、MCP
 各自把它打进自己的产物（key-proxy 也带，虽然它只用 `EMAIL_RE`）。漏一个的症状是
 产物陈旧而部署脚本一切正常——`verify_deployed_components.py` 是唯一会点出来的地方。
+- **router 栈有 stack policy，`cdk deploy` 前后各一步**：`router_stack_policy.py open` → deploy → `apply`。
+  忘 open 的症状：`cdk deploy` 在 ExecuteChangeSet 阶段失败、栈事件里该资源 UPDATE_FAILED 且原因含
+  "stack policy"、整栈回滚（Edge 不受影响；open 后重跑）。忘 apply **没有任何症状**——保护一直开着，
+  只有 `verify_deployed_edge.sh` ⑤ 会红。策略拒的是 `Update:*`（Edge 换码是 Lambda `Code` 的
+  Modify，只拒 Replace/Delete 拦不住它），越过它要 `cloudformation:SetStackPolicy`；它不管
+  DeleteStack（termination protection 另配），也不管绕开 CloudFormation 直接调 Lambda/CloudFront API。
 
 ## 文档地图
 

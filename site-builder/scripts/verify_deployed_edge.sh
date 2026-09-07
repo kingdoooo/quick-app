@@ -268,6 +268,17 @@ else
   echo "PASS  产物无候选条数上限常量"
 fi
 
+# ---- asset-v1 / §9 3f：router 栈的 stack policy ----
+# 四个受保护资源（Edge 两函数、分发、路由表）的**精确逻辑 ID** 必须在一条 Deny 里，且策略里
+# 有 Allow-all（否则整栈冻住）。判定与推导都在 router_stack_policy.py（只读子命令 check），
+# 这里只把它的退出码计入 FAILURES。红的三种形态：没策略 / 被 open 着（部署后没 apply）/ 缺资源或带通配。
+echo "── ⑤ stack policy：Deny 精确覆盖 Edge 两函数、分发、路由表 ─"
+if python3 "$HERE/router_stack_policy.py" check; then
+  echo "PASS  router 栈的 stack policy 覆盖全部受保护资源"
+else
+  fail "router 栈的 stack policy 缺失、被 open 着（部署后没 apply）或未覆盖全部受保护资源 —— 修复：python3 site-builder/scripts/router_stack_policy.py apply"
+fi
+
 echo
 if [ "$FAILURES" -gt 0 ]; then
   echo "结果：$FAILURES 项未达预期 —— 线上 Edge 与预期不一致，先排查再继续"
