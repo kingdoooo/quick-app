@@ -144,6 +144,17 @@ def test_signature_length_check_precedes_rsa_verify(monkeypatch):
     assert calls == [255]
 
 
+def test_rsa_verify_rejects_a_wrong_length_signature_without_calling_the_primitive():
+    """长度不等于模长 ⇒ 直接 False，**不调** RSA 原语（spec §5：不许交给 RSA 层"补零"）。
+    用一把假公钥：verify() 被调到就抛，所以本用例只在守卫存在时才能过。"""
+    class _Key:
+        key_size = 2048
+        def verify(self, *a, **kw):
+            raise AssertionError("长度不符时不许调到 RSA 原语")
+    for bad_len in (255, 257, 0):
+        assert session._rsa_verify(_Key(), b"x", b"\x00" * bad_len) is False
+
+
 # ---- 用途与受众 ----
 
 @pytest.mark.parametrize("token_use,allowlist,wrong_use", [
