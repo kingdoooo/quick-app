@@ -8,18 +8,19 @@ from unittest.mock import patch
 import pytest
 
 import login_handler as lh
-from conftest import (CONSOLE_KID_SECRET, LOGIN_FLOW_PARAM, LOGIN_FLOW_SECRET,
-                      SITE_KID_SECRET)
+import upgrade_code_vectors as v
+from conftest import LOGIN_FLOW_PARAM, LOGIN_FLOW_SECRET
 
-ENV = {"JWT_SECRET": "s3cret",
-       "COGNITO_DOMAIN": "https://sso.auth.us-east-1.amazoncognito.com",
+ENV = {"COGNITO_DOMAIN": "https://sso.auth.us-east-1.amazoncognito.com",
        "CLIENT_ID": "cid", "CLIENT_SECRET": "csec", "BASE_DOMAIN": "example.com",
        "USER_POOL_ID": "us-east-1_test",
-       # 3c-1B：state 与 pkce cookie 的 HMAC 改用 login-flow secret（只下发参数名，值在 conftest 的假 SSM）
+       # state 与 pkce cookie 的 HMAC 用 auth 私有的 login-flow secret（只下发参数名，值在 conftest 的假 SSM）
        "LOGIN_FLOW_SECRET_PARAM": "/site-builder/login-flow-secret",
-       # 3c-1B：/callback 会经 _signer_mode() 分派签发形态。本文件只关心 state/PKCE 那一半
-       # （它**与开关无关**），所以固定 legacy；新形态的 cookie 断言在 test_login_handler。
-       "SESSION_SIGNER": "legacy"}
+       # /callback 会经 `_signer("site")` 取签发材料（KMS）。本文件只关心 state/PKCE 那一半，
+       # 但会话签发这条路必须走得通，否则 /callback 在验完 state 之后就抛了、下面的 302 断言全空转。
+       # 形态断言（RS256 头、claim 集合）在 test_login_handler，不在这里重复。
+       "SESSION_KEYS_JSON": v.session_keys_json((v.SITE_KID, "current"), (v.CONSOLE_KID, "current")),
+       "FIXTURE_ISSUER": "off"}
 
 
 def _event(path, qs=None, cookies=None):
@@ -202,7 +203,7 @@ def test_callback_passes_idp_into_session():
     with patch.object(lh, "_exchange_code",
                       return_value={"email": "a@x.com", "name": "A",
                                     "idp": "Feishu"}), \
-         patch.object(lh, "mint_session_jwt", return_value="tok") as mint:
+         patch.object(lh, "mint_token", return_value="tok") as mint:
         lh.handler(_event("/callback", {"code": "abc", "state": state},
                           cookies=[pkce_cookie]), None)
     assert mint.call_args.kwargs.get("idp") == "Feishu"
@@ -248,7 +249,7 @@ def test_exchange_code_accepts_matching_nonce():
 
 @patch.dict(lh.os.environ, ENV)
 def test_exchange_code_returns_idp_and_auth_via():
-    """两个 claim 都要透出来——mint_session_jwt 要把它们写进会话。"""
+    """两个 claim 都要透出来——mint_token 要把它们写进会话。"""
     class _Key:
         key = "k"
 
@@ -697,67 +698,115 @@ def test_safe_error_whitelists(raw, expected):
     assert lh._safe_error(raw) == expected
 
 
-# ── 3c-1B：登录流程的 HMAC 用 auth 私有的 login-flow secret，不再用会话密钥 ──────────
+# ── 登录流程的 HMAC 用 auth 私有的 login-flow secret，与会话签名材料完全无关 ──────────
 #
-# 为什么这是一条独立的密钥（spec §11.3 / §11.8.6）：signer 切到 family kid 之后，state 与
-# pkce cookie 会变成共享会话密钥**唯一**的活用途，3c-3 删 legacy 时被迫二次迁移。而这两样
-# 东西的价值也完全不同——读到 login-flow secret 只值一个登录 CSRF，读到会话密钥等于能伪造
-# 任意用户的会话。混用让后者的暴露面白白多一处。
+# 为什么这是一条独立的密钥（spec §11.3 / §11.8.6）：登录流程若继续用会话密钥，就会变成那把
+# 密钥**唯一**的活用途，删 legacy 时被迫二次迁移；而两样东西的价值也差一个数量级——读到
+# login-flow secret 只值一个登录 CSRF（state 与 cookie 都只活 300 秒），读到会话签名能力
+# 等于能伪造任意用户的会话。混用让后者的暴露面白白多一处。
 #
-# 本组用例的前提：conftest 里 LOGIN_FLOW_SECRET 与 JWT_SECRET / 两把 family 密钥**都不同**，
-# 否则"用哪把签的"分不出来，下面几条会假绿。
+# **3c-final 起断言的形态变了**：会话密钥是 KMS 非对称 CMK，私钥取不出来，所以"拿会话密钥
+# 复算一遍 state 的签名"这种直接对照已经写不出来了。同一条性质改成三句可证的话：
+#   ① 算一次登录流程签名**一次 KMS 都不打**，且只从 SSM 读 LOGIN_FLOW_SECRET_PARAM
+#      （它一旦碰到 `_signer` / `_allowlist` / `_get_public_key` 那条路，① 立刻红）；
+#   ② 换掉 login-flow secret 后旧签名验不过（正对照：同一把仍验得过）——签名真绑在这把上；
+#   ③ 用平台**另一把**对称秘密（client secret）签的 state / pkce cookie 必须被拒。
+# 末尾那条 AST 守卫管的是"以后不会有人再把会话签名材料拿回来签登录数据"。
 
 def _sig_with(secret: str, body: str) -> str:
     return base64.urlsafe_b64encode(
         hmac.new(secret.encode(), body.encode(), hashlib.sha256).digest()).rstrip(b"=").decode()
 
 
+def _recording_ssm(monkeypatch, value=LOGIN_FLOW_SECRET) -> list:
+    """把 `lh._ssm` 换成会**记录读取**的假件：只认 LOGIN_FLOW_PARAM，别的参数名响亮失败。
+
+    值仍取自 conftest 的同一个常量（一处定义），所以"用哪把签的"不会因为这里另写一份而走形。
+    """
+    reads: list = []
+
+    class _SSM:
+        @staticmethod
+        def get_parameter(Name, WithDecryption=False):
+            reads.append(Name)
+            assert Name == LOGIN_FLOW_PARAM, f"登录流程读了别的 SSM 参数：{Name}"
+            return {"Parameter": {"Value": value}}
+
+    monkeypatch.setattr(lh, "_ssm", lambda: _SSM())
+    lh._secret_cache.clear()
+    return reads
+
+
 @patch.dict(lh.os.environ, ENV)
-def test_login_flow_signature_is_the_login_flow_secret_not_any_session_key():
-    """正向 + 负向同时断言：只有 login-flow secret 能复算出 state 的签名。"""
+def test_login_flow_signature_is_the_login_flow_secret_not_any_session_key(
+        _fake_platform_clients, monkeypatch):
+    """① 只读 login-flow secret、**零 KMS 调用**；② 换掉那把密钥后旧签名验不过。
+
+    ① 是"没碰会话签名材料"在非对称形态下唯一还能直接观测的判据：会话密钥的每一条取值路径
+    （`_signer` / `_allowlist` / `_get_public_key`）都必然打 KMS，所以 `kms.calls == []` 就是
+    "登录流程没走那条路"。② 是"签名真的绑在这把密钥上"——少了它，一个返回常量的
+    `_login_flow_sig` 也能让 ① 绿。
+    """
+    kms = _fake_platform_clients
+    reads = _recording_ssm(monkeypatch)
+    kms.calls.clear()
+
     state = lh._encode_state("https://app-x.example.com/")
     body, _, sig = state.rpartition(".")
     assert sig == _sig_with(LOGIN_FLOW_SECRET, body), "state 不是用 login-flow secret 签的"
-    for label, other in (("legacy JWT_SECRET", ENV["JWT_SECRET"]),
-                         ("site family key", SITE_KID_SECRET),
-                         ("console family key", CONSOLE_KID_SECRET)):
-        assert sig != _sig_with(other, body), f"state 仍在用{label}签名"
+    assert reads == [LOGIN_FLOW_PARAM], f"登录流程的取值点不只 login-flow secret：{reads}"
+    assert kms.calls == [], f"算 state 签名竟然打了 KMS ⇒ 碰到会话签名材料了：{kms.calls}"
+    assert lh._decode_state(state) == "https://app-x.example.com/", "正对照：同一把必须验得过"
+
+    _recording_ssm(monkeypatch, LOGIN_FLOW_SECRET + "-rotated")
+    assert lh._decode_state(state) is None, "换掉 login-flow secret 后旧 state 仍被接受"
 
 
 @patch.dict(lh.os.environ, ENV)
-def test_pkce_cookie_signature_is_the_login_flow_secret_too():
+def test_pkce_cookie_signature_is_the_login_flow_secret_too(_fake_platform_clients, monkeypatch):
+    kms = _fake_platform_clients
+    reads = _recording_ssm(monkeypatch)
+    kms.calls.clear()
+
     cookie = lh._pkce_cookie("theverifier", "thenonce")
     payload, _, sig = cookie.split(";")[0].split("=", 1)[1].rpartition(".")
     assert sig == _sig_with(LOGIN_FLOW_SECRET, payload)
-    assert sig != _sig_with(ENV["JWT_SECRET"], payload), "pkce cookie 仍在用会话密钥签名"
+    assert reads == [LOGIN_FLOW_PARAM], f"pkce cookie 的取值点不只 login-flow secret：{reads}"
+    assert kms.calls == [], f"算 pkce cookie 签名竟然打了 KMS：{kms.calls}"
+    assert lh._read_pkce_cookie({"cookies": [f"{lh.PKCE_COOKIE}={payload}.{sig}"]}) == \
+        {"v": "theverifier", "n": "thenonce"}, "正对照：同一把必须读得出来"
+
+    _recording_ssm(monkeypatch, LOGIN_FLOW_SECRET + "-rotated")
+    assert lh._read_pkce_cookie({"cookies": [f"{lh.PKCE_COOKIE}={payload}.{sig}"]}) is None, \
+        "换掉 login-flow secret 后旧 pkce cookie 仍被接受"
 
 
 @patch.dict(lh.os.environ, ENV)
-def test_login_flow_signed_with_the_session_key_is_rejected_by_callback():
-    """拿会话密钥签一个格式完全正确的 state 投进 /callback，必须 400。
+def test_state_signed_with_another_platform_secret_is_rejected_by_callback():
+    """拿平台**另一把**对称秘密（Cognito client secret）签一个格式完全正确的 state，必须 400。
 
-    这条是迁移**真的发生了**的判据：只改注释或只加一把新密钥而 `_login_flow_sig` 仍读 JWT_SECRET 时，
-    它会绿——所以必须配上面那两条正向签名断言一起看。
+    3c-final 之后 client secret 是 auth 手上仅剩的另一把对称密钥，所以它就是"顺手复用一把
+    现成秘密"最可能的落点。签名验不过 ⇒ 拿到它也造不出可用的 state。
     """
     import json as _json
     import time as _time
     body = base64.urlsafe_b64encode(_json.dumps(
         {"r": "https://app-x.example.com/", "exp": int(_time.time()) + 300}).encode()).decode().rstrip("=")
-    forged = f"{body}.{_sig_with(ENV['JWT_SECRET'], body)}"
-    assert lh._decode_state(forged) is None, "会话密钥签的 state 被接受了"
+    forged = f"{body}.{_sig_with(ENV['CLIENT_SECRET'], body)}"
+    assert lh._decode_state(forged) is None, "别的平台秘密签的 state 被接受了"
     pkce = lh._pkce_cookie("v", "n").split(";")[0]          # 有效 cookie：锁定 400 来自 state
     r = lh.handler(_event("/callback", {"code": "abc", "state": forged}, cookies=[pkce]), None)
     assert r["statusCode"] == 400
 
 
 @patch.dict(lh.os.environ, ENV)
-def test_pkce_cookie_signed_with_the_session_key_is_rejected_by_callback():
+def test_pkce_cookie_signed_with_another_platform_secret_is_rejected_by_callback():
     import json as _json
     payload = base64.urlsafe_b64encode(_json.dumps(
         {"t": "pkce", "v": "theverifier", "n": "thenonce"}).encode()).decode().rstrip("=")
-    forged = f"{payload}.{_sig_with(ENV['JWT_SECRET'], payload)}"
+    forged = f"{payload}.{_sig_with(ENV['CLIENT_SECRET'], payload)}"
     assert lh._read_pkce_cookie({"cookies": [f"{lh.PKCE_COOKIE}={forged}"]}) is None, \
-        "会话密钥签的 pkce cookie 被接受了"
+        "别的平台秘密签的 pkce cookie 被接受了"
     state = lh._encode_state("https://app-x.example.com/")   # 有效 state：锁定 400 来自 cookie
     r = lh.handler(_event("/callback", {"code": "abc", "state": state},
                           cookies=[f"{lh.PKCE_COOKIE}={forged}"]), None)
@@ -779,13 +828,13 @@ def test_type_marker_defence_survives_the_key_change():
         {"v": "theverifier", "n": "thenonce"}
 
 
-@patch.dict(lh.os.environ, {k: v for k, v in ENV.items() if k != "LOGIN_FLOW_SECRET_PARAM"},
+@patch.dict(lh.os.environ, {k: val for k, val in ENV.items() if k != "LOGIN_FLOW_SECRET_PARAM"},
             clear=True)
-def test_missing_login_flow_secret_fails_loudly_instead_of_reusing_jwt_secret():
+def test_missing_login_flow_secret_fails_loudly_instead_of_falling_back():
     """没配 LOGIN_FLOW_SECRET_PARAM 时必须抛错。
 
-    静默改用 JWT_SECRET 会让"部署脚本忘下发新变量"表现为一切正常，而迁移根本没发生
-    （1A 那次 502 的反面：那次是响亮失败，这里的风险是**静默不迁移**）。
+    静默回落到别的秘密会让"部署脚本忘下发这个变量"表现为一切正常，而登录 CSRF 防护其实
+    挂在一把不该管这件事的密钥上——响亮失败才看得见。
     """
     lh._secret_cache.clear()
     with pytest.raises(RuntimeError, match="LOGIN_FLOW_SECRET"):
@@ -801,8 +850,13 @@ _LOGIN_FLOW_FUNCS = ("_login_flow_sig", "_encode_state", "_decode_state",
                      "_pkce_cookie", "_read_pkce_cookie")
 
 
+# 3c-final 的会话签名材料取值路径就是这四个（都必然打 KMS）。HS 时代那两个字符串常量
+# 留在禁用清单里：它们不该回来，回来就意味着又有人把一把 SSM 里的对称密钥接进了登录流程。
+_SESSION_KEY_PATHS = ("_signer", "_allowlist", "_get_public_key", "_kms")
+
+
 def _session_key_in_login_flow(src: str) -> list:
-    """登录流程那几个函数里出现会话密钥的读取 → 原因列表；空列表 = 干净。"""
+    """登录流程那几个函数里出现会话签名材料的读取 → 原因列表；空列表 = 干净。"""
     import ast
     tree = ast.parse(src)
     bad = []
@@ -813,29 +867,28 @@ def _session_key_in_login_flow(src: str) -> list:
             if isinstance(node, ast.Constant) and isinstance(node.value, str) and \
                     node.value in ("JWT_SECRET", "JWT_SECRET_PARAM"):
                 bad.append(f"{fn.name} 里出现 {node.value!r} —— 登录流程不得用会话密钥签名")
-            # `_secret_by_param(...)` / `_allowlist(...)` 也是会话密钥的取值路径
-            if isinstance(node, ast.Call) and getattr(node.func, "id", None) in (
-                    "_secret_by_param", "_allowlist", "_legacy_secret"):
-                bad.append(f"{fn.name} 里调用了 {node.func.id}() —— 那是会话密钥的取值路径")
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) in _SESSION_KEY_PATHS:
+                bad.append(f"{fn.name} 里调用了 {node.func.id}() —— 那是会话签名材料的取值路径")
     return bad
 
 
 def test_login_flow_signing_never_touches_a_session_key():
     import inspect
     offenders = _session_key_in_login_flow(inspect.getsource(lh))
-    assert not offenders, ("登录流程的 HMAC 又用上会话密钥了：\n  " + "\n  ".join(offenders)
+    assert not offenders, ("登录流程的 HMAC 又用上会话签名材料了：\n  " + "\n  ".join(offenders)
                            + "\n它必须只用 LOGIN_FLOW_SECRET（spec §11.3）。")
 
 
 def test_login_flow_guard_bites_a_regression():
-    """变形：把 `_login_flow_sig` 改回读 JWT_SECRET，守卫必须红（证明上一条不是装饰）。"""
+    """变形：把 `_login_flow_sig` 的取值改成会话侧的每一条路，守卫都必须红（证明上一条不是装饰）。"""
     import inspect
     src = inspect.getsource(lh)
     assert not _session_key_in_login_flow(src), "当前源码本该干净——本条前提不成立"
     for label, (old, new) in {
         "改回 JWT_SECRET": ('_secret("LOGIN_FLOW_SECRET")', '_secret("JWT_SECRET")'),
-        "改成读 family 密钥": ('_secret("LOGIN_FLOW_SECRET")',
-                          '_secret_by_param("/site-builder/session-keys/site-hs-v1")'),
+        "改成经 _signer 取签名器": ('_secret("LOGIN_FLOW_SECRET")', '_signer("site")[1]'),
+        "改成经 _allowlist 取公钥": ('_secret("LOGIN_FLOW_SECRET")', '_allowlist("site")["k"]'),
+        "改成直接抓 KMS client": ('_secret("LOGIN_FLOW_SECRET")', '_kms().whatever'),
     }.items():
         assert old in src, f"变异锚点找不到（{label}）——本条空转"
         assert _session_key_in_login_flow(src.replace(old, new, 1)), f"守卫没咬住：{label}"
