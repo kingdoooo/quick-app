@@ -21,3 +21,7 @@ site-builder/scripts/backfill-old-policies.json*
 
 # mattpocock skills 的本地 issue/spec（可能含真实资源 ID，不入库；见 docs/agents/issue-tracker.md）
 .scratch/
+
+# 账号信任边界闸门的基线：含单账号实测（principal 指纹、语句指纹、公钥指纹），
+# 不随资产分发（ADR 0005 / 3c-final D1）。采用者首跑 `--update-baseline` 自己生成。
+site-builder/scripts/account_trust_baseline.json

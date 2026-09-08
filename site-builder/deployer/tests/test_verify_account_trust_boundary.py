@@ -1,7 +1,8 @@
 """账号信任边界闸门（`scripts/verify_account_trust_boundary.py`）的纯函数部分。
 
 这个闸门盯的是 M09：账号里**除 Edge 与部署器之外**还有谁能 direct invoke 平台/
-站点 Lambda、谁能取得 HS256 会话密钥、谁能替换平台代码。集合本身**关不掉**
+站点 Lambda、谁能签出会话（3c-final：`kms:Sign`，或先 `kms:PutKeyPolicy` /
+`kms:CreateGrant` 给自己授权再签）、谁能替换平台代码。集合本身**关不掉**
 （见 `docs/security/account-trust-boundary.md`），闸门的职责是"别再长"——
 所以它的正确性全在下面这些能红的用例上：
 
@@ -48,6 +49,25 @@ _SCRIPT = _ROOT / "site-builder" / "scripts" / "verify_account_trust_boundary.py
 _BASELINE = _ROOT / "site-builder" / "scripts" / "account_trust_baseline.json"
 _DOC = _ROOT / "docs" / "security" / "account-trust-boundary.md"
 
+_NO_BASELINE = "本地无基线（gitignored；采用者首跑 --update-baseline 生成）"
+
+
+def _baseline_raw() -> str:
+    """基线文件的原文，**不存在就 skip**（3c-final D1：基线含单账号实测，不随资产分发）。
+
+    skip 不是"这层检查没了"：下面 `test_the_baseline_checks_really_run_on_a_synthetic_baseline`
+    用 `write_baseline` 从合成 bundle 造一份真基线，把同一组断言跑一遍——**那条是正对照**，
+    它保证这些断言不是在空转。本地跑过 `--update-baseline` 之后（Task 21 ★），这批用例自己
+    也会重新生效。
+    """
+    if not _BASELINE.exists():
+        pytest.skip(_NO_BASELINE)
+    return _BASELINE.read_text(encoding="utf-8")
+
+
+def _baseline_data() -> dict:
+    return json.loads(_baseline_raw())
+
 # 指纹形态：每 4 位十六进制一组。分组是**必需的**——裸 16 位十六进制里会偶然出现
 # 12 位连续数字，而 `scan_staged_secrets.sh` 按 `[0-9]{12}` 找账号 ID，于是每次更新
 # 基线都命中一次假阳性；反复的假阳性会训练出无脑 `--allow-hits`。
@@ -91,8 +111,9 @@ def _is_version_id(value: str) -> bool:
 _GRANT_RE = re.compile(
     r"(?:invoke-platform|replace-platform-code)(?:@alias|@version)?:[A-Za-z0-9._-]+"
     r"|invoke-site(?:@alias|@version)?:(?:all|some\(\d+\):" + _FP_RE + r")"
-    r"|read-edge-code|read-edge-asset|read-jwt-param"
-    r"|read-session-key:(?:site|console)-(?:hs|rs)-v\d+"    # 3c-1A：每 kid 一条
+    # 3c-final：能签会话的两条路，每 kid 各一条。kid 形态由 session_keys.KID_RE 保证。
+    r"|kms-sign:(?:site|console)-rs-v\d+"
+    r"|kms-self-authorize:(?:site|console)-rs-v\d+"
     # 3c-1B：login-flow secret 的读取者。**它刻意不进 `is_secret_grant()`**（读到它只值一个
     # 登录 CSRF，不是冒充面），但它照样是一条 grant，所以必须在文法里——2026-09-03 首次真机
     # 执行 runbook ② 时，基线第一次带上它，这条文法守卫就红了（ticket 06 加了常量却没加文法）。
@@ -114,12 +135,29 @@ def _is_undecided_item(value: str) -> bool:
     return bool(_UNDECIDED_ITEM_RE.fullmatch(value))
 
 
+def _is_key_spec(value: str) -> bool:
+    return bool(re.fullmatch(r"RSA_[0-9]+", value))
+
+
+def _is_key_usage(value: str) -> bool:
+    return value == "SIGN_VERIFY"
+
+
+def _is_sha256_hex(value: str) -> bool:
+    return bool(re.fullmatch(r"[0-9a-f]{64}", value))
+
+
 _TYPED_VALUE_PATHS = (
     # VersionId 形如 v1/v2/…：既不是指纹，也不能是任意字符串（写成角色名或占位
     # "?" 都必须红）。放成"任意字符串"就等于不检查；要求它是指纹又会把合法的 v3 报红。
     ("managed_policy_versions.*", _is_version_id),
     ("principals.*.grants[]", _is_grant),
     ("coverage.undecided_items[]", _is_undecided_item),
+    # 3c-final 的 kms 分节：三个值不是指纹形态，各按自己的类型判（放成"任意字符串"就等于
+    # 不检查这三处，而 `key_spec` / `key_usage` 正是"这把 key 还是不是签名用的 RSA"的证据）。
+    ("kms.*.key_spec", _is_key_spec),
+    ("kms.*.key_usage", _is_key_usage),
+    ("kms.*.spki_sha256", _is_sha256_hex),
 )
 # **自由文本**：说明性字段，这一层不校验形态；泄密由第一层的整文件 raw 扫描兜。
 _FREE_TEXT_PATHS = (
@@ -130,8 +168,8 @@ _FREE_TEXT_PATHS = (
 _NON_FP_KEY_PATHS = (
     "",                                     # 顶层结构键（schema/note/facts/…）
     "facts",                                # fact 名
-    "facts.session_keys",                   # 3c-1A：键是 kid（{family}-{alg}-v{n}，不是账号值），形态由下面的用例钉死
-    "facts.session_keys.*",                 # 3c-1A：结构键（两个计数名）
+    "kms",                                  # 3c-final：键是 kid（site-rs-v1 这种，不是账号值），形态由下面的用例钉死
+    "kms.*",                                # 3c-final：结构键（arn_fp / key_policy_fp / key_spec / …）
     "principals.*",                         # 每个 principal 条目内的 category/grants
     "resource_policies",                    # 结构键（platform/site_*/bootstrap_bucket）
     "resource_policies.platform",           # 键是平台函数名（app.py 里就有，不是账号值）
@@ -249,16 +287,14 @@ def test_missing_context_is_surfaced_not_swallowed():
 # --------------------------------------------------------------------------
 
 def _targets(g, *, platform=("site-panel", "site-deployer-undeploy"),
-             sites=("site-a", "site-b"),
-             assets=("arn:aws:s3:::assets/edge.zip",),
+             sites=("site-a", "site-b"), kms=None, login_flow="",
              aliases=None, versions=None):
     fn = "arn:aws:lambda:us-east-1:1:function:{}".format
     return g.Targets(
         platform_functions=tuple(fn(n) for n in platform),
         site_functions=tuple(fn(n) for n in sites),
-        edge_code_arns=(fn("edge"),),
-        edge_assets=tuple(assets),
-        jwt_parameter="arn:aws:ssm:us-east-1:1:parameter/site-builder/jwt-secret",
+        kms_keys=dict(kms or {}),
+        login_flow_parameter=login_flow,
         alias_arns=dict(aliases or {}),
         version_arns=dict(versions or {}))
 
@@ -324,41 +360,34 @@ def test_site_subset_records_the_count_so_widening_reds():
     assert one != two
 
 
-def test_three_secret_paths_are_separate_grants():
-    """读密钥的三条路必须分开记：Edge 函数产物、**CDK bootstrap S3 asset**、
-    SSM 参数。合成一项就看不出「只给了 S3 只读的身份也能拿到密钥」这件事
-    ——那正是 2026-08-25 复审补上的第三条路（21 个 principal 只在这条路上）。"""
-    g = _gate()
-    t = _targets(g)
-    only_code = g.grants_from_decisions(
-        {f"lambda:GetFunction|{t.edge_code_arns[0]}": "allowed"}, t)
-    only_asset = g.grants_from_decisions(
-        {f"s3:GetObject|{t.edge_assets[0]}": "allowed"}, t)
-    only_param = g.grants_from_decisions(
-        {f"ssm:GetParameter|{t.jwt_parameter}": "allowed"}, t)
-    assert only_code == {g.G_READ_EDGE_CODE}
-    assert only_asset == {g.G_READ_EDGE_ASSET}
-    assert only_param == {g.G_READ_JWT_PARAM}
-    assert len({g.G_READ_EDGE_CODE, g.G_READ_EDGE_ASSET, g.G_READ_JWT_PARAM}) == 3
+def test_the_signing_paths_are_separate_grants_per_key_and_per_family():
+    """能签会话的路必须分开记：**每把 key × 两条路**（直接 `kms:Sign` / 先自助授权再签）。
 
-
-def test_asset_grant_disappears_when_the_asset_no_longer_carries_the_key():
-    """根治之后（asset 里不再有明文密钥），这条 grant 必须自己消失。
-
-    `Targets.edge_asset=None` 表示"实测过、那份产物已不含活密钥"。
-    这条保证闸门是在**测事实**而不是复读一个写死的假设。
+    压成一条的后果有两层：① 看不出"今天就能签"与"随时能让自己能签"是两批人（严重度与修法
+    都不同）；② 两个 family 合并的话，spec §4.1 的整个论点（panel 被攻破不该能伪造站点会话）
+    在基线里就没有对应的观测了。
     """
     g = _gate()
-    t = _targets(g, assets=())
-    grants = g.grants_from_decisions({"s3:GetObject|arn:aws:s3:::assets/edge.zip": "allowed"}, t)
-    assert g.G_READ_EDGE_ASSET not in grants
+    keys = {"site-rs-v1": "arn:aws:kms:us-east-1:1:key/aaaa", 
+            "console-rs-v1": "arn:aws:kms:us-east-1:1:key/bbbb"}
+    t = _targets(g, kms=keys)
+    got = set()
+    for kid, arn in keys.items():
+        for action, grant in (("kms:Sign", f"kms-sign:{kid}"),
+                              ("kms:CreateGrant", f"kms-self-authorize:{kid}"),
+                              ("kms:PutKeyPolicy", f"kms-self-authorize:{kid}")):
+            assert g.grants_from_decisions({f"{action}|{arn}": "allowed"}, t) == {grant}
+            got.add(grant)
+    assert len(got) == 4, sorted(got)
+    assert all(g.is_secret_grant(x) for x in got)
 
 
-def test_secret_detection_reads_python_inside_the_zip():
-    """`secret_in_zip_bytes` 是"产物里还有没有活密钥"的判据本体。
+def test_artifact_value_detection_reads_python_inside_the_zip():
+    """`secret_in_zip_bytes` 是"当前 Edge 产物里有没有这个值"的判据本体（3c-final 找的是
+    公钥的 base64 与 login-flow 的值）。
 
-    正对照 + 负对照都要有：只有正对照时，一个永远返回 True 的实现也会绿，
-    于是"根治了闸门自己知道"这条性质是假的。
+    正对照 + 负对照都要有：只有正对照时，一个永远返回 True 的实现也会绿——而三条硬断言里有
+    两条是"**不得**出现"，那种实现会让它们永远红；另一条是"必须出现"，会永远绿。
     """
     import io
     import zipfile
@@ -370,10 +399,11 @@ def test_secret_detection_reads_python_inside_the_zip():
             z.writestr("index.py", src)
         return buf.getvalue()
 
-    live = "a" * 64
-    assert g.secret_in_zip_bytes(zbytes(f'JWT_SECRET = "{live}"'), live)
-    assert not g.secret_in_zip_bytes(zbytes('JWT_SECRET = "{{JWT_SECRET}}"'), live)
-    assert not g.secret_in_zip_bytes(b"not a zip at all", live)
+    spki = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A" + "Q" * 360
+    injected = zbytes(f"SITE_ALLOWLIST_JSON = \'\'\'{{\"site-rs-v1\": {{\"spki_b64\": \"{spki}\"}}}}\'\'\'")
+    assert g.secret_in_zip_bytes(injected, spki)
+    assert not g.secret_in_zip_bytes(zbytes("SITE_ALLOWLIST_JSON = \'\'\'{{SITE_ALLOWLIST_JSON}}\'\'\'"), spki)
+    assert not g.secret_in_zip_bytes(b"not a zip at all", spki)
 
 
 # --------------------------------------------------------------------------
@@ -550,11 +580,11 @@ def test_new_principal_is_a_failure():
     assert "WorkloadB" in rep.render()
 
 
-@pytest.mark.parametrize("grant", ["read-edge-asset", "read-session-key:site-hs-v1",
-                                   "read-session-key:console-hs-v1"])
-def test_known_principal_gaining_secret_read_is_a_failure(grant):
-    """从「只能 invoke」变成「还能读会话密钥」——这一步把读面失守升级成写面失守
-    （同一个 `/site-builder/jwt-secret` 也签 `__Host-sb_console`）。3c-1A 起每 kid 一条 grant，同样成立。"""
+@pytest.mark.parametrize("grant", ["kms-sign:site-rs-v1", "kms-sign:console-rs-v1",
+                                   "kms-self-authorize:site-rs-v1"])
+def test_known_principal_gaining_signing_power_is_a_failure(grant):
+    """从「只能 invoke」变成「还能签会话」——这一步把读面失守升级成写面失守
+    （console family 那把签 `__Host-sb_console`）。3c-final 起每 kid 两条 grant，同样成立。"""
     g = _gate()
     base = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel"]))
     now = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel", grant]))
@@ -593,7 +623,7 @@ def test_required_principal_present_but_without_invoke_is_a_failure():
     （收窄改的是策略，不是角色）。"""
     g = _gate()
     base = _with_required(g, {})
-    now = {**_observed(g, EdgeRole=[g.G_READ_JWT_PARAM]),
+    now = {**_observed(g, EdgeRole=[g.G_READ_LOGIN_FLOW]),
            **_observed(g, **{"site-deployer-exec-role": ["invoke-site@alias:all"]})}
     rep = g.compare_to_baseline(now, _baseline_of(base), required=REQUIRED)
     assert not rep.ok
@@ -619,7 +649,10 @@ def test_baseline_carries_no_account_values():
     **两层缺一不可**：`note` / `category` 是自由文本，第二层刻意放行，只有这一层能抓
     住写进 `note` 的账号值。
     """
-    raw = _BASELINE.read_text(encoding="utf-8")
+    _assert_baseline_carries_no_account_values(_baseline_raw())
+
+
+def _assert_baseline_carries_no_account_values(raw: str) -> None:
     assert not re.search(r"\b\d{12}\b", raw), "基线里出现了 12 位账号 ID"
     for forbidden in ("arn:aws:", "role/", "cdk-hnb659fds", "Isengard"):
         assert forbidden not in raw, f"基线里出现了 {forbidden!r}——那是账号内的真实标识"
@@ -673,7 +706,7 @@ def test_doc_counts_come_from_the_baseline():
     必须紧挨着标记**。只校验标记的话，标记与正文可以各写一个数，那就白防了。
     """
     g = _gate()
-    data = json.loads(_BASELINE.read_text(encoding="utf-8"))
+    data = _baseline_data()
     principals = data["principals"]
     def count(pred):
         return sum(1 for p in principals.values() if pred(p))
@@ -689,13 +722,13 @@ def test_doc_counts_come_from_the_baseline():
     expected = {
         # ---- A：直接失守（headline）----
         "A总数": len(principals),
-        "可读密钥": count(lambda p: any(g.is_secret_grant(x) for x in p["grants"])),
+        # 3c-final：`is_secret_grant` 现在就是 KMS 那两类（能签 / 能让自己能签）
+        "可签会话": count(lambda p: any(g.is_secret_grant(x) for x in p["grants"])),
         "非平台可直调": count(
             lambda p: p["category"] != "platform"
             and (has_prefix(p, f"{g.G_INVOKE_PLATFORM}:")
                  or has_prefix(p, f"{g.G_INVOKE_SITE}:"))),
-        "带活密钥的asset": data["facts"]["edge_assets_carrying_live_key"],
-        "带活密钥的Edge代码目标": data["facts"]["edge_code_targets_carrying_live_key"],
+        "kms_key数": len(data["kms"]),
         # ---- B：IAM 写观察。**不进 A 的人数**——"持有一条未证明可提权的 IAM 写语句"
         #      与"现在就能拿密钥"是两种风险，相加当成一个数字正是这一轮要消掉的错误。
         "B持有IAM写语句": len(data["iam_write_statements"]),
@@ -716,7 +749,7 @@ def test_doc_counts_come_from_the_baseline():
 def test_no_unclassified_principal_in_baseline():
     """基线里不许留 unclassified：类别决定了「这条是既定信任模型还是暴露面」，
     留空就等于把判断推给下一个读文档的人，而上面那条文档计数会跟着失真。"""
-    principals = json.loads(_BASELINE.read_text(encoding="utf-8"))["principals"]
+    principals = _baseline_data()["principals"]
     unlabeled = [fp for fp, p in principals.items()
                  if p.get("category") in (None, "", "unclassified")]
     assert not unlabeled, f"这些指纹还没标 category：{unlabeled}"
@@ -729,9 +762,12 @@ def test_baseline_schema_is_current():
     分节清单也在这里钉死：**少任何一节都等于那一层的检查静默消失**。
     """
     g = _gate()
-    data = json.loads(_BASELINE.read_text(encoding="utf-8"))
+    _assert_baseline_sections(g, _baseline_data())
+
+
+def _assert_baseline_sections(g, data: dict) -> None:
     assert data["schema"] == g.BASELINE_SCHEMA
-    for key in ("resource_policies", "facts", "coverage", "principals",
+    for key in ("resource_policies", "facts", "coverage", "principals", "kms",
                 "iam_write_statements", "permissions_boundaries",
                 "managed_policy_versions"):
         assert key in data, f"基线缺顶层分节 {key}"
@@ -756,35 +792,18 @@ def test_ssm_read_is_an_action_class_not_one_action():
     实测（2026-08-25）：账号里有一个角色**只**被授予 `ssm:GetParameters`
     （复数）on `Resource:*`、没有单数那个，于是首版闸门把它整个漏掉了。
     AWS 另外明确警告 `GetParameterHistory` 即使在拒绝 `GetParameter` 时也可能
-    读到当前值。四个动作**任一**命中都必须产生 read-jwt-param。
+    读到当前值。四个动作**任一**命中都必须产生那条 grant。
+
+    3c-final 起 SSM 里只剩 login-flow secret 这一个目标（会话密钥全在 KMS），
+    所以这条用它当探针——动作等价类那个形状本身不变。
     """
     g = _gate()
-    t = _targets(g)
+    param = "arn:aws:ssm:us-east-1:1:parameter/site-builder/login-flow-secret"
+    t = _targets(g, login_flow=param)
     assert len(g.A_READ_PARAM) >= 4, f"动作等价类被缩回去了：{g.A_READ_PARAM}"
     for action in g.A_READ_PARAM:
-        grants = g.grants_from_decisions({f"{action}|{t.jwt_parameter}": "allowed"}, t)
-        assert g.G_READ_JWT_PARAM in grants, f"{action} 单独命中时没产生 grant"
-
-
-def test_every_live_key_asset_is_probed_not_only_the_current_one():
-    """历史 asset 也带着**当前有效**的密钥（实测 9 个，因为旧 asset 不删、
-    密钥从未轮转）。只探"当前 CloudFormation 模板指向的那一个"时，
-    「只能读旧对象」的 principal 完全不可见。"""
-    g = _gate()
-    t = _targets(g, assets=("arn:aws:s3:::b/new.zip", "arn:aws:s3:::b/old.zip"))
-    only_old = g.grants_from_decisions({"s3:GetObject|arn:aws:s3:::b/old.zip": "allowed"}, t)
-    assert g.G_READ_EDGE_ASSET in only_old, "只能读旧 asset 的 principal 被漏掉了"
-
-
-def test_object_version_read_is_in_the_same_class():
-    """桶开着版本控制（noncurrent 保留 30 天），而 `s3:GetObjectVersion` 是
-    **另一个** IAM 动作 ⇒ 删掉对象之后仍可按 version ID 读到旧版本。"""
-    g = _gate()
-    t = _targets(g, assets=("arn:aws:s3:::b/new.zip",))
-    assert "s3:GetObjectVersion" in g.A_READ_OBJECT
-    grants = g.grants_from_decisions(
-        {"s3:GetObjectVersion|arn:aws:s3:::b/new.zip": "allowed"}, t)
-    assert g.G_READ_EDGE_ASSET in grants
+        grants = g.grants_from_decisions({f"{action}|{param}": "allowed"}, t)
+        assert g.G_READ_LOGIN_FLOW in grants, f"{action} 单独命中时没产生 grant"
 
 
 def test_alias_and_unqualified_invoke_are_distinct_grants():
@@ -839,7 +858,7 @@ def test_overbroad_platform_grant_shrinking_is_still_an_improvement():
     """反向的正对照：`platform-overbroad` 这一类**就是**要缩小的，
     它丢掉授权必须算改善而不是红。否则"集合等值"会把我们想要的修复判成故障。"""
     g = _gate()
-    base = _observed(g, BuildRole=[g.G_READ_EDGE_ASSET])
+    base = _observed(g, BuildRole=["kms-sign:site-rs-v1"])
     baseline = {"schema": 2,
                 "principals": {fp: {"category": "platform-overbroad",
                                     "grants": p["grants"]}
@@ -956,12 +975,10 @@ def test_missing_context_growth_is_reported_with_a_delta():
     g = _gate()
     observed = _with_required(g, {})
     baseline = {**_baseline_of(observed),
-                "facts": {"principals_with_missing_context": 162,
-                          "edge_assets_carrying_live_key": 9}}
+                "facts": {"principals_with_missing_context": 162}}
     rep = g.compare_to_baseline(
         observed, baseline, required=REQUIRED,
-        facts={"principals_with_missing_context": 200,
-               "edge_assets_carrying_live_key": 9})
+        facts={"principals_with_missing_context": 200})
     assert rep.ok, "这条不该影响退出码"
     joined = rep.render()
     assert "162" in joined and "200" in joined and "+38" in joined, joined
@@ -972,9 +989,9 @@ def test_edge_functions_are_in_the_platform_set():
 
     它们属于 **router 栈**，而 `platform_function_names()` 读的是 deployer 栈
     `infra/app.py` 的 `PLATFORM_FUNCTION_NAMES` ⇒ 结构上不可能含它们。
-    漏掉一次的实测后果：Edge 的 9 个已发布版本一个都没被枚举，于是
-    「谁能读旧版本 Edge 代码（里面是明文密钥）」与「谁能 UpdateFunctionCode
-    换掉 Edge」两条完全在视野外。
+    漏掉一次的实测后果：Edge 的已发布版本一个都没被枚举，于是「谁能 UpdateFunctionCode
+    换掉 Edge」这条完全在视野外——3c-final 之后它仍是一条冒充路（换掉 verifier 就等于
+    自己定义谁是谁）。
     """
     g = _gate()
     assert g.EDGE_ORIGIN_REQUEST_FN in g.EDGE_FUNCTIONS
@@ -1164,7 +1181,7 @@ def test_baseline_redline_scan_walks_unknown_keys():
     （bootstrap_bucket / coverage / iam_write_statements / permissions_boundaries），
     照旧写法它们全部自动绕过"必须是指纹形态"这条。
     """
-    data = json.loads(_BASELINE.read_text(encoding="utf-8"))
+    data = _baseline_data()
     bad = list(_non_fingerprint_leaves(data))
     assert not bad, f"这些位置出现了形态不对的字符串：{bad}"
 
@@ -1175,22 +1192,24 @@ def test_all_facts_are_integers():
     留成"任意字符串"的话，哪天某个 fact 改成资源名/ARN，递归红线会自动放行
     （`_walk_baseline` 只产出字符串，整数走不到检查）。
     """
-    facts = json.loads(_BASELINE.read_text(encoding="utf-8"))["facts"]
+    _assert_facts_are_integers(_baseline_data())
 
+
+def _assert_facts_are_integers(data: dict) -> None:
     def walk(node, path):
-        if isinstance(node, dict):          # 3c-1A：facts.session_keys.<kid>.<计数> 是嵌套整数
+        if isinstance(node, dict):
             for k, v in node.items():
                 walk(v, f"{path}.{k}")
         else:
             assert isinstance(node, int) and not isinstance(node, bool), \
                 f"{path} 不是整数而是 {type(node).__name__}: {node!r}"
-    walk(facts, "facts")
-    # 3c-1A：session_keys 的键只能是合法 kid，内层只能是两个计数名——键被 _NON_FP_KEY_PATHS 放行了，
-    # 形态就由这里钉住，否则一个账号值可以伪装成"kid"进基线。
-    import re as _re
-    for kid, row in facts.get("session_keys", {}).items():
-        assert _re.fullmatch(r"(site|console)-(hs|rs)-v\d+", kid), f"facts.session_keys 的键不是合法 kid: {kid!r}"
-        assert set(row) == {"edge_code_targets_carrying_key", "edge_assets_carrying_key"}, sorted(row)
+    walk(data["facts"], "facts")
+    # 3c-final：kms 分节的键只能是合法 kid，内层只能是那六个字段名——键被 _NON_FP_KEY_PATHS
+    # 放行了，形态就由这里钉住，否则一个账号值可以伪装成"kid"进基线。
+    for kid, row in (data.get("kms") or {}).items():
+        assert re.fullmatch(r"(site|console)-rs-v[0-9]+", kid), f"kms 分节的键不是合法 kid: {kid!r}"
+        assert set(row) == {"arn_fp", "key_policy_fp", "key_spec", "key_usage",
+                            "spki_sha256", "grants"}, sorted(row)
 
 
 def test_baseline_redline_scan_catches_an_injected_new_subkey():
@@ -1198,7 +1217,7 @@ def test_baseline_redline_scan_catches_an_injected_new_subkey():
 
     没有这条的话，上面那条在"递归实现其实没递归"时同样是绿的。
     """
-    raw = _BASELINE.read_text(encoding="utf-8")
+    raw = _baseline_raw()
     data = json.loads(raw)
     data["resource_policies"]["brand_new_subkey"] = ["arn:aws:iam::000000000000:role/Sneaky"]
     assert list(_non_fingerprint_leaves(data)), \
@@ -1229,7 +1248,7 @@ def test_raw_forbidden_pattern_scan_still_covers_free_text_fields():
     结构化递归检查刻意不校验它们的形态 ⇒ 只有整文件 raw 扫描能抓住写进 `note` 的
     真实账号 ID 或内部角色名。这条钉住"raw 那层没被递归检查替换掉"。
     """
-    raw = _BASELINE.read_text(encoding="utf-8")
+    raw = _baseline_raw()
     # 第一层：整文件（与 test_baseline_carries_no_account_values 同一组判据）
     for forbidden in ("arn:aws:", "role/", "cdk-hnb659fds", "Isengard"):
         assert forbidden not in raw, f"基线里出现了 {forbidden!r}"
@@ -1605,46 +1624,31 @@ def test_undecided_resource_class_folds_sites_but_not_platform_functions():
     每次部署漂移。
     """
     g = _gate()
-    t = _targets(g)
+    key = "arn:aws:kms:us-east-1:1:key/aaaa"
+    param = "arn:aws:ssm:us-east-1:1:parameter/site-builder/login-flow-secret"
+    t = _targets(g, kms={"site-rs-v1": key}, login_flow=param)
     fn = "arn:aws:lambda:us-east-1:1:function:{}".format
     assert g.undecided_resource_class(fn("site-a"), t) == "sites"
     assert g.undecided_resource_class(fn("site-b"), t) == "sites"
     assert g.undecided_resource_class(fn("site-panel"), t) == "fn:site-panel"
     assert g.undecided_resource_class(fn("site-panel") + ":blue", t) == "fn:site-panel"
-    assert g.undecided_resource_class(t.jwt_parameter, t) == "jwt-param"
-    assert g.undecided_resource_class(t.edge_assets[0], t) == "edge-asset"
+    assert g.undecided_resource_class(key, t) == "kms-key:site-rs-v1"
+    assert g.undecided_resource_class(param, t) == "login-flow-param"
     assert g.undecided_resource_class("", t) == "unattributed"
-
-
-def test_undecided_item_fp_carries_no_principal_name():
-    g = _gate()
-    fp = g.undecided_item_fp(f"arn:aws:iam::{_ACCT}:role/Secret", "invoke", "sites")
-    assert re.fullmatch(_FP_RE, fp)
-    assert "Secret" not in fp and _ACCT not in fp
 
 
 def test_undecided_item_is_decomposable_and_carries_no_account_values():
     """可分解成员（3c-1B-G A6 复审）：三段能拆回来，principal 段是指纹、其余两段是词表里的类名。"""
     g = _gate()
     arn = f"arn:aws:iam::{_ACCT}:role/Secret"
-    item = g.undecided_item(arn, "read-param", {"session-key:site-hs-v2", "jwt-param"})
+    item = g.undecided_item(arn, "kms-sign", {"kms-key:site-rs-v2", "kms-key:console-rs-v1"})
     assert "Secret" not in item and _ACCT not in item and "arn:" not in item
     assert g.UNDECIDED_ITEM_RE.fullmatch(item), item
     pfp, cls, classes = g.parse_undecided_item(item)
-    assert pfp == g.principal_fingerprint(arn) and cls == "read-param"
-    assert classes == frozenset({"jwt-param", "session-key:site-hs-v2"})
+    assert pfp == g.principal_fingerprint(arn) and cls == "kms-sign"
+    assert classes == frozenset({"kms-key:console-rs-v1", "kms-key:site-rs-v2"})
     # 资源类排序 ⇒ 集合相同就是同一个成员（与 undecided_members 的 `if classes` 一样是可比性前提）
-    assert item == g.undecided_item(arn, "read-param", ["jwt-param", "session-key:site-hs-v2"])
-
-
-def test_coverage_form_tells_hash_from_decomposable_and_refuses_a_mix():
-    g = _gate()
-    v4 = g.undecided_item_fp("arn:aws:iam::1:role/A", "invoke", "sites")
-    v5 = g.undecided_item("arn:aws:iam::1:role/A", "invoke", {"sites"})
-    assert g.coverage_form([]) == "v5" and g.coverage_form(None) == "v5"
-    assert g.coverage_form([v4, v4]) == "v4" and g.coverage_form([v5]) == "v5"
-    with pytest.raises(SystemExit, match="混杂"):
-        g.coverage_form([v4, v5])
+    assert item == g.undecided_item(arn, "kms-sign", ["kms-key:site-rs-v2", "kms-key:console-rs-v1"])
 
 
 # ==========================================================================
@@ -1675,25 +1679,6 @@ def test_no_grant_path_produces_iam_policy_write():
     assert grants, "正对照失效：全 allowed 却没产生任何 grant"
     assert not any(x.startswith("iam-policy-write") for x in grants), sorted(grants)
     assert not hasattr(g, "G_IAM_POLICY_WRITE"), "A 的 grant 常量还在"
-
-
-def test_the_legacy_grant_string_exists_only_for_migration():
-    """迁移代码**必须**能识别旧 grant 串，所以不能断言全文不含它——
-    但这个字面量只许出现在那一个 legacy 常量上。
-
-    用 AST 而不是 grep：注释与"提到它"的 docstring 不该让这条红。
-    """
-    import ast
-    tree = ast.parse(_SCRIPT.read_text(encoding="utf-8"))
-    holders = set()
-    for node in ast.walk(tree):
-        if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
-                and node.value.value == "iam-policy-write"):
-            holders |= {t.id for t in node.targets if isinstance(t, ast.Name)}
-    assert holders == {"LEGACY_IAM_POLICY_WRITE_PREFIX"}, holders
-    exact = [n for n in ast.walk(tree)
-             if isinstance(n, ast.Constant) and n.value == "iam-policy-write"]
-    assert len(exact) == 1, f"这个字面量出现了 {len(exact)} 次，只许在 legacy 常量上"
 
 
 # ---- B 的红绿：任何 added / removed / changed 都红 ------------------------
@@ -2035,86 +2020,6 @@ def test_dump_mode_does_not_require_an_existing_current_schema_baseline():
         "要写基线时必须先读（category 要沿用）"
 
 
-def test_old_baseline_schema_hard_fails(tmp_path):
-    """拿 schema 2 的基线跑 schema 3 的脚本必须**硬失败**，不能开跑。
-
-    没有运行时校验时，版本不对的症状是"每个 principal 都报成新增"——一屏红，
-    而真因只是版本不匹配。
-    """
-    g = _gate()
-    p = tmp_path / "b.json"
-    p.write_text(json.dumps({"schema": 2, "principals": {}}), encoding="utf-8")
-    with pytest.raises(SystemExit) as exc:
-        g.load_baseline(p)
-    assert "--migrate-from-schema" in str(exc.value)
-
-
-def test_migration_only_accepts_schema_3_or_4_to_5(tmp_path):
-    """3c-1A 开的 3→4 通道与 A6 复审开的 4→5 通道串成一条链；2→x 不再从 CLI 可达。"""
-    g = _gate()
-    assert g.BASELINE_SCHEMA == 5, "这条用例的前提是脚本已经是 schema 5"
-    p = tmp_path / "b.json"
-    p.write_text(json.dumps({"schema": 2, "principals": {}, "facts": {}}), encoding="utf-8")
-    with pytest.raises(SystemExit):
-        g.load_baseline(p, migrate_from=2)          # 2→5 不支持
-    p.write_text(json.dumps({"schema": 3, "principals": {}, "facts": {}}), encoding="utf-8")
-    with pytest.raises(SystemExit):
-        g.load_baseline(p, migrate_from=4)          # 声明的版本与文件里的不一致
-    migrated = g.load_baseline(p, migrate_from=3)
-    assert migrated["schema"] == 5 and migrated["facts"]["session_keys"] == {}
-    p.write_text(json.dumps({"schema": 4, "principals": {}, "facts": {"session_keys": {}},
-                             "coverage": {"undecided_items": ["0000-1111-2222-3333"]}}),
-                 encoding="utf-8")
-    migrated = g.load_baseline(p, migrate_from=4)
-    # 4→5 在内存里只改版本号：成员仍是哈希，由 _compare_coverage 的 v4 分支按旧形态比
-    assert migrated["schema"] == 5 and g.coverage_form(migrated["coverage"]["undecided_items"]) == "v4"
-
-
-def test_a_schema_5_baseline_on_disk_must_carry_decomposable_members(tmp_path):
-    """落盘的 schema 5 里混着哈希成员 = 迁移没跑完或手改。读入就拒——放进去的后果是
-    退役声明静默失效（与没修一样）。"""
-    g = _gate()
-    p = tmp_path / "b.json"
-    p.write_text(json.dumps({"schema": 5, "principals": {},
-                             "coverage": {"undecided_items": ["0000-1111-2222-3333"]}}),
-                 encoding="utf-8")
-    with pytest.raises(SystemExit, match="哈希形态"):
-        g.load_baseline(p)
-    ok = g.undecided_item("arn:aws:iam::1:role/A", "invoke", {"sites"})
-    p.write_text(json.dumps({"schema": 5, "principals": {}, "coverage": {"undecided_items": [ok]}}),
-                 encoding="utf-8")
-    assert g.load_baseline(p)["schema"] == 5
-
-
-@pytest.mark.parametrize("old", [3, 4])
-def test_migrate_baseline_only_refuses_every_path_to_5_because_members_need_a_live_run(old, tmp_path, monkeypatch):
-    """`--migrate-baseline-only` 是纯结构迁移；到 5 的每条链都经过"只改版本号"的 4→5，成员仍是哈希
-    ⇒ 落盘就是一份下一次 load 必拒的自相矛盾基线（复审二轮 P2-2 用 schema 3 复现：第一版只挡了 ≥4）。"""
-    g = _gate()
-    p = tmp_path / "b.json"
-    p.write_text(json.dumps({"schema": old, "principals": {}, "facts": {},
-                             "coverage": {"undecided_items": ["0000-1111-2222-3333"]}}), encoding="utf-8")
-    monkeypatch.setattr(g, "BASELINE_PATH", p)
-    with pytest.raises(SystemExit, match="实测"):
-        g.main(["--migrate-baseline-only", "--migrate-from-schema", str(old)])
-    assert json.loads(p.read_text())["schema"] == old, "被拒时不许改文件"
-
-
-def test_schema4_fingerprints_in_a_snapshot_must_be_real_fingerprints():
-    """复审二轮 P2-1：迁移那一跑直接拿这一列与旧基线比，所以它不能是任意字符串——
-    v5 成员、ARN、随便一个词都要在 BUNDLE_SHAPE 这层被拒。"""
-    g = _gate()
-    good = g.undecided_item_fp("arn:aws:iam::1:role/A", "invoke", "sites")
-    bundle = _complete_bundle(g)
-    bundle["coverage"]["schema4_fingerprints"] = [good, good]
-    g.check_bundle_complete(bundle, where="t")                     # 正向控制
-    for bad in ("not-a-fingerprint", g.undecided_item("arn:aws:iam::1:role/A", "invoke", {"sites"}),
-                "arn:aws:iam::1:role/A", ""):
-        bundle["coverage"]["schema4_fingerprints"] = [good, bad]
-        with pytest.raises(SystemExit, match="schema4_fingerprints"):
-            g.check_bundle_complete(bundle, where="t")
-
-
 def test_write_dump_replaces_a_symlink_instead_of_following_it(tmp_path):
     """复审三轮 P2：`os.open` 跟随 symlink ⇒ `atb.json → victim` 会把 victim 截断改写再 chmod 600。
     原子替换只换路径本身：victim 内容与权限不变，链接被一个 0600 的普通文件取代。"""
@@ -2170,8 +2075,11 @@ def test_grant_strings_follow_the_grant_grammar():
 
     放行的话，grant 构造失误把完整 ARN / 角色名 / 账号值拼进串里，递归红线不会抓。
     """
-    grants = [x for p in json.loads(_BASELINE.read_text(encoding="utf-8"))["principals"]
-              .values() for x in p["grants"]]
+    _assert_baseline_grants_follow_the_grammar(_baseline_data())
+
+
+def _assert_baseline_grants_follow_the_grammar(data: dict) -> None:
+    grants = [x for p in data["principals"].values() for x in p["grants"]]
     assert grants, "基线里一条 grant 都没有？"
     for x in grants:
         assert _GRANT_RE.fullmatch(x), f"grant {x!r} 不符合文法"
@@ -2186,8 +2094,9 @@ def test_every_grant_constant_in_the_gate_is_covered_by_the_grammar():
     单测全绿是**必然的、不是巧合**（合成基线里没有这条）。代价是演练当场三条红。
 
     本条把两处钉在一起：闸门里每个 `G_*` 常量都必须能被文法认出来。有些常量本身就是完整
-    grant（`read-jwt-param`），有些是需要后缀的前缀（`invoke-platform` → `:<函数名>`），
-    所以下面给出每种前缀的**代表性实例**；**新增一种 grant 而不在这里登记就会红**。
+    grant（`read-login-flow-secret`），有些是需要后缀的前缀（`invoke-platform` → `:<函数名>`、
+    `kms-sign` → `:<kid>`），所以下面给出每种前缀的**代表性实例**；**新增一种 grant 而不在
+    这里登记就会红**。
     """
     g = _gate()
     # 前缀 → 一个代表性的完整实例。新增 G_* 常量时必须在这里登记（否则下面的断言会报"未登记"）。
@@ -2195,7 +2104,8 @@ def test_every_grant_constant_in_the_gate_is_covered_by_the_grammar():
         g.G_INVOKE_PLATFORM: f"{g.G_INVOKE_PLATFORM}:site-panel",
         g.G_INVOKE_SITE: f"{g.G_INVOKE_SITE}:all",
         g.G_REPLACE_CODE: f"{g.G_REPLACE_CODE}:site-panel",
-        g.G_READ_SESSION_KEY: f"{g.G_READ_SESSION_KEY}:site-hs-v1",
+        g.G_KMS_SIGN: f"{g.G_KMS_SIGN}:site-rs-v1",
+        g.G_KMS_SELF_AUTHORIZE: f"{g.G_KMS_SELF_AUTHORIZE}:console-rs-v1",
     }
     constants = {name: getattr(g, name) for name in dir(g)
                  if name.startswith("G_") and isinstance(getattr(g, name), str)}
@@ -2223,7 +2133,11 @@ def test_that_coverage_guard_would_have_caught_the_1b_regression():
 def test_a_grant_carrying_an_arn_is_caught():
     """**元用例**：往 grant 里注入 ARN / 拼接垃圾 / legacy 串，都必须被文法拒绝。"""
     for bad in (f"invoke-platform:arn:aws:iam::{_ACCT}:role/X",
-                "read-jwt-param-and-then-some",
+                "read-jwt-param",                    # HS 时代的串：3c-final 之后不许再出现
+                "read-session-key:site-hs-v1",
+                "kms-sign:site-hs-v1",               # HS 形态的 kid 不合文法
+                "kms-sign:site-rs-v1-and-then-some",
+                "kms-sign:", "kms-self-authorize:other-rs-v1",
                 "read-login-flow-secret-x",          # 3c-1B：新增那一支同样不许前缀匹配放水
                 "read-login-flow",
                 "iam-policy-write:any",
@@ -2232,7 +2146,9 @@ def test_a_grant_carrying_an_arn_is_caught():
         assert not _GRANT_RE.fullmatch(bad), f"文法放过了 {bad!r}"
     # 正对照：真实形态必须过
     for ok in ("invoke-platform:site-panel", "invoke-platform@version:site-access-rollup",
-               "invoke-site:all", "invoke-site@alias:all", "read-edge-asset",
+               "invoke-site:all", "invoke-site@alias:all",
+               "kms-sign:site-rs-v1", "kms-sign:console-rs-v2",
+               "kms-self-authorize:site-rs-v1",
                "read-login-flow-secret",             # 3c-1B
                "invoke-site:some(2):aaaa-bbbb-cccc-dddd"):
         assert _GRANT_RE.fullmatch(ok), f"文法误拒了 {ok!r}"
@@ -2240,21 +2156,21 @@ def test_a_grant_carrying_an_arn_is_caught():
 
 def test_a_grant_carrying_an_arn_is_caught_by_the_tree_scan():
     """注入到基线树里也要被递归红线抓到（不只是文法函数本身能判）。"""
-    data = json.loads(_BASELINE.read_text(encoding="utf-8"))
+    data = _baseline_data()
     fp = next(iter(data["principals"]))
     data["principals"][fp]["grants"] = [f"invoke-platform:arn:aws:iam::{_ACCT}:role/X"]
     assert list(_non_fingerprint_leaves(data)), "grant 里的 ARN 没被递归红线抓到"
 
 
 def test_managed_policy_versions_are_version_ids():
-    versions = json.loads(_BASELINE.read_text(encoding="utf-8"))["managed_policy_versions"]
+    versions = _baseline_data()["managed_policy_versions"]
     for fp, ver in versions.items():
         assert re.fullmatch(r"v[0-9]+", ver), f"{fp} 的版本 {ver!r} 不是 VersionId 形态"
 
 
 def test_baseline_has_no_iam_policy_write_grants():
     """A 的基线不许再带 `iam-policy-write:*`——那会把 B 的观察算进 A 的人数。"""
-    data = json.loads(_BASELINE.read_text(encoding="utf-8"))
+    data = _baseline_data()
     for fp, p in data["principals"].items():
         assert not any(x.startswith("iam-policy-write") for x in p["grants"]), \
             f"基线 {fp} 还带着 iam-policy-write"
@@ -2262,7 +2178,7 @@ def test_baseline_has_no_iam_policy_write_grants():
 
 def test_statement_text_never_enters_the_baseline():
     """B 的三个分节只许存指纹：语句原文里 Principal 是带账号 ID 的角色 ARN。"""
-    data = json.loads(_BASELINE.read_text(encoding="utf-8"))
+    data = _baseline_data()
     assert "texts" not in json.dumps(data), "语句原文（texts）漏进基线了"
     for fp, fps in data["iam_write_statements"].items():
         assert re.fullmatch(_FP_RE, fp)
@@ -2277,7 +2193,7 @@ def test_statement_text_never_enters_the_baseline():
 
 def test_bucket_policy_statement_fingerprints_are_in_the_baseline():
     """bootstrap 桶的快照必须真的落进基线（否则那一层等于没有）。"""
-    fps = json.loads(_BASELINE.read_text(encoding="utf-8"))["resource_policies"]["bootstrap_bucket"]
+    fps = _baseline_data()["resource_policies"]["bootstrap_bucket"]
     assert fps, "基线里 bootstrap_bucket 是空的——那一层没落地"
     for fp in fps:
         assert re.fullmatch(_FP_RE, fp), f"{fp!r} 不是指纹形态"
@@ -2331,7 +2247,6 @@ def _complete_bundle(g) -> dict:
     """
     return {
         "schema": g.BASELINE_SCHEMA,
-        "asset_scan_complete": True,
         "principals": {"0000-1111-2222-3333": {
             "name": "SomeRole", "arn": "arn:aws:iam::1:role/SomeRole",
             "kind": "role", "grants": ["invoke-platform:site-panel"]}},
@@ -2343,15 +2258,20 @@ def _complete_bundle(g) -> dict:
             "sites": {"site-fn": {"alias": {"blue": []}, "version": [],
                                   "unqualified": []}},
             "bootstrap_bucket": [], "bootstrap_bucket_texts": {}},
-        "facts": {"edge_code_targets_carrying_live_key": 0,
-                  "edge_assets_carrying_live_key": 0,
-                  "principals_with_missing_context": 0, "session_keys": {}},
-        # A6 复审：成员是可分解形态；`schema4_fingerprints` 是迁移期的比较用料（归 3c-3 删）。
-        # 两者都是 BUNDLE_SHAPE 的一部分 ⇒ 缺它照样硬失败，与其它分节同一条 fail-closed 合同。
-        "coverage": {"undecided_items": [], "schema4_fingerprints": []},
+        "facts": {"principals_with_missing_context": 0},
+        # A6 复审：成员是可分解形态。它是 BUNDLE_SHAPE 的一部分 ⇒ 缺它照样硬失败，
+        # 与其它分节同一条 fail-closed 合同。
+        "coverage": {"undecided_items": []},
         "iam_write": {"statements": {}, "boundaries": {},
                       "managed_versions": {}, "texts": {}},
-        "required": {"edge": "EdgeRole", "deployer": "DeployerRole"},
+        # 3c-final：kms 分节带**一个成员**——`*` 通配层的内层规格只有在样例里真的有成员时
+        # 才会被 `_required_paths` 展开到，空 dict 下那一层等于没验。
+        "kms": {"site-rs-v1": {"arn_fp": "aaaa-bbbb-cccc-dddd",
+                               "key_policy_fp": "1111-2222-3333-4444",
+                               "key_spec": "RSA_2048", "key_usage": "SIGN_VERIFY",
+                               "spki_sha256": "0" * 64, "grants": []}},
+        "required": {"edge": "EdgeRole", "deployer": "DeployerRole",
+                     "auth": "AuthRole", "panel": "PanelRole"},
     }
 
 def test_insecure_tls_warning_is_fatal():
@@ -2387,44 +2307,6 @@ def test_each_worker_gets_its_own_iam_client():
     assert id(g.thread_iam_client("us-east-1")) == id(g.thread_iam_client("us-east-1"))
 
 
-def test_no_asset_scan_may_not_produce_a_verdict_or_rewrite_the_baseline():
-    """`--no-asset-scan` 只看当前 asset，带活密钥的**历史对象**整个不进目标集合
-    ⇒ 只能读到那批对象的 principal 会从 observed 消失，而比较器把它报成
-    「集合缩小（绿）」，asset 数 9→1 只是一条不影响退出码的 note。实测 rep.ok = True。
-
-    所以它最多只能用于**纯观测**，不得出闸门结论、更不得改写基线。
-    """
-    import argparse
-    g = _gate()
-    ok = argparse.Namespace(no_asset_scan=True, dump_observed="/tmp/x.json",
-                            update_baseline=False)
-    g.check_flag_combination(ok)          # 纯观测：允许
-    for bad in (
-        argparse.Namespace(no_asset_scan=True, dump_observed=None, update_baseline=False),
-        argparse.Namespace(no_asset_scan=True, dump_observed="/tmp/x.json",
-                           update_baseline=True),
-    ):
-        with pytest.raises(SystemExit) as exc:
-            g.check_flag_combination(bad)
-        assert "no-asset-scan" in str(exc.value)
-
-
-def test_incomplete_asset_scan_cannot_be_replayed_as_a_verdict(tmp_path):
-    """`--no-asset-scan` 产出的快照要带标记，`--from-dump` 必须拒绝它。
-
-    否则绕一步就回到权威绿：先用 --no-asset-scan 产出快照（允许），再 --from-dump 它。
-    """
-    g = _gate()
-    p = tmp_path / "partial.json"
-    # 除 `asset_scan_complete` 外一切完整——好让这条用例只验扫描完整性这一维，
-    # 不会因为别的分节缺失而"因为另一个原因红"。
-    p.write_text(json.dumps({**_complete_bundle(g), "asset_scan_complete": False}),
-                 encoding="utf-8")
-    with pytest.raises(SystemExit) as exc:
-        g.load_dump(p)
-    assert "asset" in str(exc.value)
-
-
 def test_bundle_missing_a_section_hard_fails(tmp_path):
     """同 schema 但**缺分节**的快照必须硬失败。
 
@@ -2436,7 +2318,7 @@ def test_bundle_missing_a_section_hard_fails(tmp_path):
     g = _gate()
     full = _complete_bundle(g)
     g.check_bundle_complete(full, where="test")          # 完整：放行
-    for drop in ("coverage", "iam_write", "resource_policies", "principals", "facts"):
+    for drop in ("coverage", "iam_write", "resource_policies", "principals", "facts", "kms"):
         partial = {k: v for k, v in full.items() if k != drop}
         with pytest.raises(SystemExit) as exc:
             g.check_bundle_complete(partial, where="test")
@@ -2618,19 +2500,6 @@ def test_a_truncated_per_site_shape_hard_fails():
     assert "resource_policies.sites.site-fn.alias" in str(exc.value)
 
 
-def test_asset_scan_complete_must_be_a_true_bool():
-    """`if not bundle.get(...)` 下字符串 `"false"` 是 truthy ⇒ 不完整观测照样出结论。"""
-    g = _gate()
-    full = _complete_bundle(g)
-    for bad in ("false", "true", "yes", 1, 0, None, [], {}):
-        with pytest.raises(SystemExit) as exc:
-            g.check_bundle_complete({**full, "asset_scan_complete": bad}, where="test")
-        assert "asset" in str(exc.value), f"{bad!r} 被拒了但报文没说是扫描完整性"
-    with pytest.raises(SystemExit):
-        g.check_bundle_complete(
-            {k: v for k, v in full.items() if k != "asset_scan_complete"}, where="test")
-
-
 def test_an_unknown_bundle_section_hard_fails():
     """`measure()` 新增分节必须同时进 `BUNDLE_SHAPE`。
 
@@ -2810,7 +2679,7 @@ def test_baseline_platform_shape_matches_what_the_snapshot_produces():
                                           platform=(fn,), sites=(), aliases={})
     want_keys = set(produced["platform"][fn])
 
-    platform = json.loads(_BASELINE.read_text(encoding="utf-8"))["resource_policies"]["platform"]
+    platform = _baseline_data()["resource_policies"]["platform"]
     assert platform, "基线里 platform 是空的"
     for name, shape in platform.items():
         assert isinstance(shape, dict), (
@@ -3027,7 +2896,7 @@ def test_uid_never_reaches_the_baseline():
     （递归默认拒绝，所以只要没写进合同就一定进不去）。
     """
     g = _gate()
-    raw = _BASELINE.read_text(encoding="utf-8")
+    raw = _baseline_raw()
     assert '"uid"' not in raw, "基线里出现了 uid ——它会随合法重建每天变一次"
     assert "uid" not in g.BUNDLE_SHAPE["principals"]["*"], \
         "uid 进了快照合同——那条路会把它带进基线"
@@ -3320,166 +3189,51 @@ def test_docs_do_not_claim_atomic_observation():
 
 
 # --------------------------------------------------------------------------
-# 3c-1A：两个 HS key family（plan Task 6）——每 kid 一条 grant、Edge 不得含 console key、
-# 基线 schema 3→4 只做结构迁移
-# --------------------------------------------------------------------------
-
-_SK_ARNS = {"site-hs-v1": "arn:aws:ssm:us-east-1:1:parameter/site-builder/session-keys/site-hs-v1",
-            "console-hs-v1": "arn:aws:ssm:us-east-1:1:parameter/site-builder/session-keys/console-hs-v1"}
-
-
-def _targets_sk(g):
-    t = _targets(g)
-    return g.Targets(**{**t.__dict__, "session_key_parameters": dict(_SK_ARNS)})
-
-
-def test_session_key_grants_are_per_kid_and_separate_from_legacy():
-    """「谁能读 site 的 key」与「谁能读 console 的 key」必须分得开——spec §4.1 的整个论点就是
-    这两者要分开；合成一条就看不出 panel 被攻破能不能伪造站点会话。"""
-    g = _gate()
-    t = _targets_sk(g)
-    only_site = g.grants_from_decisions({f"ssm:GetParameter|{_SK_ARNS['site-hs-v1']}": "allowed"}, t)
-    only_console = g.grants_from_decisions({f"ssm:GetParameter|{_SK_ARNS['console-hs-v1']}": "allowed"}, t)
-    only_legacy = g.grants_from_decisions({f"ssm:GetParameter|{t.jwt_parameter}": "allowed"}, t)
-    assert only_site == {"read-session-key:site-hs-v1"}
-    assert only_console == {"read-session-key:console-hs-v1"}
-    assert only_legacy == {g.G_READ_JWT_PARAM}
-    assert all(g.is_secret_grant(x) for x in only_site | only_console | only_legacy)
-    assert not g.is_secret_grant("invoke-platform:site-panel")
-
-
-def test_session_key_params_are_simulated_and_classified_by_kid():
-    g = _gate()
-    t = _targets_sk(g)
-    assert set(_SK_ARNS.values()) <= set(t.other_resources())
-    assert g.undecided_resource_class(_SK_ARNS["site-hs-v1"], t) == "session-key:site-hs-v1"
-    assert g.undecided_resource_class(t.jwt_parameter, t) == "jwt-param"
-
-
-def test_console_key_inside_edge_artifacts_is_red():
-    """Edge 的 allowlist 里不出现 console 的 key（spec §4.1）：产物里测到就是红，不是事实类 note。"""
-    g = _gate()
-    base = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel"]))
-    clean = {"edge_code_targets_carrying_live_key": 1, "edge_assets_carrying_live_key": 1,
-             "principals_with_missing_context": 0, "session_keys": {},
-             "session_keys": {"site-hs-v1": {"edge_code_targets_carrying_key": 1,
-                                             "edge_assets_carrying_key": 1},
-                              "console-hs-v1": {"edge_code_targets_carrying_key": 0,
-                                                "edge_assets_carrying_key": 0}}}
-    ok = g.compare_to_baseline(base, _baseline_of(base), required=REQUIRED, facts=clean)
-    assert ok.ok, ok.render()
-    leaked = json.loads(json.dumps(clean))
-    leaked["session_keys"]["console-hs-v1"]["edge_assets_carrying_key"] = 1
-    bad = g.compare_to_baseline(base, _baseline_of(base), required=REQUIRED, facts=leaked)
-    assert not bad.ok
-    assert "console-hs-v1" in bad.render()
-
-
-def test_multi_key_scan_downloads_each_artifact_once_and_reports_per_key():
-    import io
-    import zipfile
-    g = _gate()
-
-    def zbytes(src: str) -> bytes:
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w") as z:
-            z.writestr("index.py", src)
-        return buf.getvalue()
-
-    legacy, site, console = "L" * 64, "S" * 64, "C" * 64
-    objects = {"a.zip": zbytes(f'JWT_SECRET = "{legacy}"'),
-               "b.zip": zbytes(f'JWT_SECRET = "{legacy}"\nSITE_ALLOWLIST_JSON = \'\'\'{{"site-hs-v1": {{"secret": "{site}"}}}}\'\'\''),
-               "c.zip": zbytes("nothing here")}
-    downloads = []
-
-    class _S3:
-        def get_paginator(self, name):
-            assert name == "list_object_versions"
-            class _P:
-                def paginate(self, Bucket):
-                    yield {"Versions": [{"Key": k, "VersionId": "v", "Size": len(b)} for k, b in objects.items()]}
-            return _P()
-
-        def get_object(self, Bucket, Key, VersionId=None):
-            downloads.append(Key)
-            return {"Body": io.BytesIO(objects[Key])}
-
-    found = g.assets_carrying_keys({"s3": _S3()}, "bucket",
-                                   {"legacy": legacy, "site-hs-v1": site, "console-hs-v1": console})
-    assert found == {"legacy": ["a.zip", "b.zip"], "site-hs-v1": ["b.zip"], "console-hs-v1": []}
-    assert sorted(downloads) == ["a.zip", "b.zip", "c.zip"], "每个对象只该下载一次"
-
-
-def test_migrate_3_to_4_is_structural_only():
-    """精确迁移，不是重置：principal / grants / 其它分节原样保留，只新增空的 facts.session_keys。"""
-    g = _gate()
-    old = {"schema": 3, "principals": {"fp": {"category": "admin", "grants": ["read-jwt-param"]}},
-           "facts": {"edge_code_targets_carrying_live_key": 10, "edge_assets_carrying_live_key": 9,
-                     "principals_with_missing_context": 162, "session_keys": {}},
-           "coverage": {"undecided_items": []}, "iam_write_statements": {"x": 1}}
-    new = g.migrate_baseline_3_to_4(json.loads(json.dumps(old)))
-    assert new["schema"] == 4
-    assert new["principals"] == old["principals"] and new["iam_write_statements"] == old["iam_write_statements"]
-    assert new["facts"] == {**old["facts"], "session_keys": {}}
-
-
-def test_bundle_shape_accepts_session_key_facts_and_rejects_unknown_fact_keys():
-    g = _gate()
-    facts_ok = {"edge_code_targets_carrying_live_key": 1, "edge_assets_carrying_live_key": 1,
-                "principals_with_missing_context": 0, "session_keys": {},
-                "session_keys": {"site-hs-v1": {"edge_code_targets_carrying_key": 1,
-                                                "edge_assets_carrying_key": 1}}}
-    g._check_shape(facts_ok, g.BUNDLE_SHAPE["facts"], path="facts", where="test")
-    with pytest.raises(SystemExit):
-        g._check_shape({**facts_ok, "bogus": 1}, g.BUNDLE_SHAPE["facts"], path="facts", where="test")
-    with pytest.raises(SystemExit):
-        bad = json.loads(json.dumps(facts_ok)); bad["session_keys"]["site-hs-v1"]["edge_assets_carrying_key"] = True
-        g._check_shape(bad, g.BUNDLE_SHAPE["facts"], path="facts", where="test")
-
-
-# --------------------------------------------------------------------------
 # 3c-1A code-review 修复：新 kid 首次观测走「迁移桶」而不是被当成普通 grew 红后人工放行
 # --------------------------------------------------------------------------
 
 def test_declared_new_kid_on_existing_secret_holder_goes_to_migration_bucket_not_red():
     """plan Task 6：新 kid 的 grant 以首次观测进入并在报告里**单列**。
 
-    条件两条都要：kid 由操作者用 --new-kid 显式声明；principal 此前已持有某条密钥读 grant
-    （同一批 SSM 前缀/通配授权）。满足 ⇒ 进 migration_grants（绿），不满足 ⇒ 仍是红。
+    条件两条都要：kid 由操作者用 --new-kid 显式声明；principal 此前已持有某条能签的 grant
+    （同一批 `kms:*` on `key/*` 授权）。满足 ⇒ 进 migration_grants（绿），不满足 ⇒ 仍是红。
     """
     g = _gate()
-    base = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel", g.G_READ_JWT_PARAM]))
-    now = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel", g.G_READ_JWT_PARAM,
-                                                    "read-session-key:site-hs-v1"]))
-    rep = g.compare_to_baseline(now, _baseline_of(base), required=REQUIRED, new_keys=("site-hs-v1",))
+    base = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel",
+                                                     "kms-sign:site-rs-v1"]))
+    now = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel",
+                                                    "kms-sign:site-rs-v1",
+                                                    "kms-sign:site-rs-v2"]))
+    rep = g.compare_to_baseline(now, _baseline_of(base), required=REQUIRED, new_keys=("site-rs-v2",))
     assert rep.ok, rep.render()
-    assert rep.migration_grants and "read-session-key:site-hs-v1" in rep.render()
+    assert rep.migration_grants and "kms-sign:site-rs-v2" in rep.render()
 
 
 def test_undeclared_new_kid_stays_red_even_on_existing_secret_holder():
     g = _gate()
-    base = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel", g.G_READ_JWT_PARAM]))
-    now = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel", g.G_READ_JWT_PARAM,
-                                                    "read-session-key:site-hs-v1"]))
+    base = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel",
+                                                     "kms-sign:site-rs-v1"]))
+    now = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel",
+                                                    "kms-sign:site-rs-v1",
+                                                    "kms-sign:site-rs-v2"]))
     rep = g.compare_to_baseline(now, _baseline_of(base), required=REQUIRED)
     assert not rep.ok and rep.new_grants
 
 
 def test_declared_new_kid_on_a_principal_without_prior_secret_read_stays_red():
-    """声明了 kid 也不放行"从不能读密钥到能读密钥"的那种扩权——那是真扩权，不是迁移。"""
+    """声明了 kid 也不放行"从不能签到能签"的那种扩权——那是真扩权，不是迁移。"""
     g = _gate()
     base = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel"]))
     now = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel",
-                                                    "read-session-key:site-hs-v1"]))
-    rep = g.compare_to_baseline(now, _baseline_of(base), required=REQUIRED, new_keys=("site-hs-v1",))
+                                                    "kms-sign:site-rs-v2"]))
+    rep = g.compare_to_baseline(now, _baseline_of(base), required=REQUIRED, new_keys=("site-rs-v2",))
     assert not rep.ok and rep.new_grants
 
 
-def test_gate_source_has_no_stale_migration_text_or_dead_single_key_scanners():
+def test_gate_source_has_no_dead_scanners_or_hs_era_helpers():
     src = _SCRIPT.read_text(encoding="utf-8")
-    assert "2→3" not in src.split("def load_baseline")[1].split("def ")[0] or True  # docstring may mention history
-    assert "当前只支持 2→3" not in src, "帮助文案与 load_baseline 只接受 3→4 矛盾"
     for dead in ("def assets_carrying_key(", "def edge_code_arns_carrying_key(",
+                 "def assets_carrying_keys(",          # 3c-final：只看当前 asset，多对象扫描器是死代码
                  "def migrate_baseline_2_to_3(",
                  # 3c-1B：泛化成 grants_for_labels 之后这个只认 kid 的助手就是死代码
                  "def _is_declared_new_kid_grant("):
@@ -3490,6 +3244,7 @@ def test_gate_source_has_no_stale_migration_text_or_dead_single_key_scanners():
 # --------------------------------------------------------------------------
 # 3c-1B：迁移桶泛化成 --new-key / --retire-key（spec §11.8.7），login-flow secret
 # 记为一条**不算冒充面**的 grant，Edge 产物含它是硬失败
+# 3c-final：kid 的 grant 换成 KMS 那两类，`legacy` 标签随 HS 层一起消失
 # --------------------------------------------------------------------------
 
 _LOGIN_FLOW_ARN = "arn:aws:ssm:us-east-1:1:parameter/site-builder/login-flow-secret"
@@ -3507,66 +3262,63 @@ def _platform_baseline(g, observed):
 
 def test_labels_map_to_the_grants_they_are_supposed_to_declare():
     g = _gate()
-    assert g.grants_for_labels(["site-hs-v2"]) == {"read-session-key:site-hs-v2"}
-    assert g.grants_for_labels(["legacy"]) == {g.G_READ_JWT_PARAM}
+    # 一个 kid 映到**两条**：同一批 `kms:*` on `key/*` 的授权对新 CMK 两条一起增减，
+    # 只声明一条会让另一条照红，而那不是本次迁移之外的任何信息。
+    assert g.grants_for_labels(["site-rs-v2"]) == {"kms-sign:site-rs-v2",
+                                                  "kms-self-authorize:site-rs-v2"}
     assert g.grants_for_labels(["login-flow"]) == {g.G_READ_LOGIN_FLOW}
     assert g.grants_for_labels([]) == set()
+    # `legacy` 不再是合法标签（HS 层没了）——它现在只是一个打错的字，由下面那条校验用例挡
 
 
-def test_declaring_legacy_does_not_also_release_the_edge_artifact_grants():
-    """`legacy` 只映到 `read-jwt-param`。把 read-edge-code / read-edge-asset 一起放进来
-    会让一次 L3 声明顺手放行两条与本次迁移无关的丢失。"""
-    g = _gate()
-    got = g.grants_for_labels(["legacy"])
-    assert g.G_READ_EDGE_CODE not in got and g.G_READ_EDGE_ASSET not in got
-
-
-@pytest.mark.parametrize("bad", ["site-hs-v9", "sitehsv1", "Legacy", "login_flow", ""])
+@pytest.mark.parametrize("bad", ["site-rs-v9", "sitersv1", "legacy", "Legacy", "login_flow", ""])
 def test_unknown_migration_label_fails_loudly(bad):
-    """打错一个字的后果本来是静默的：生成一条永不匹配的 grant，操作者以为已声明。"""
+    """打错一个字的后果本来是静默的：生成一条永不匹配的 grant，操作者以为已声明。
+
+    `legacy` 在这份名单里是**刻意的**：3c-final 之后它不是"以前能用的标签"而是一个错字，
+    照样必须硬失败——否则按旧 runbook 抄命令的人会以为声明生效了。
+    """
     g = _gate()
     with pytest.raises(SystemExit):
-        g.check_migration_labels([bad], known_kids=["site-hs-v1", "console-hs-v1"])
+        g.check_migration_labels([bad], known_kids=["site-rs-v1", "console-rs-v1"])
 
 
-def test_known_kids_and_the_two_non_kid_labels_pass_validation():
+def test_known_kids_and_the_login_flow_label_pass_validation():
     g = _gate()
-    g.check_migration_labels(["site-hs-v1", "console-hs-v1", "legacy", "login-flow"],
-                            known_kids=["site-hs-v1", "console-hs-v1"])
+    g.check_migration_labels(["site-rs-v1", "console-rs-v1", "login-flow"],
+                            known_kids=["site-rs-v1", "console-rs-v1"])
 
 
 def test_baseline_kids_are_a_second_source_of_known_kids():
     """**退役那一步的前提**：到能声明 `--retire-key <kid>` 的时刻，config 已经不含那个 kid 了。
 
     退役的动作就是"把 kid 从 config 删掉再重部"，而 grant 的丢失只有重部之后才出现。所以
-    `configured_kids()` 是唯一来源时，DEPLOY.md 十步 runbook 的第 ⑩ 步**根本无法执行**——
-    标签校验会先硬退出。基线是那把 key 曾经存在过的唯一记录。
+    `configured_kids()` 是唯一来源时，轮转 runbook 的最后一步**根本无法执行**——
+    标签校验会先硬退出。基线是那把 key 曾经存在过的唯一记录（3c-final：`kms` 分节的键）。
     """
     g = _gate()
-    baseline = {"facts": {"session_keys": {"site-hs-v1": {"edge_code_targets_carrying_key": 0,
-                                                          "edge_assets_carrying_key": 0},
-                                           "console-hs-v1": {"edge_code_targets_carrying_key": 0,
-                                                             "edge_assets_carrying_key": 0}}}}
-    assert g.baseline_kids(baseline) == ["console-hs-v1", "site-hs-v1"]
+    baseline = {"kms": {"site-rs-v1": {"spki_sha256": "0" * 64},
+                        "console-rs-v1": {"spki_sha256": "1" * 64}}}
+    assert g.baseline_kids(baseline) == ["console-rs-v1", "site-rs-v1"]
     # config 只剩 v2（v1 两节已删）时，v1 仍然是合法的退役标签
-    g.check_migration_labels(["site-hs-v1", "console-hs-v1"],
-                             known_kids=["site-hs-v2"] + g.baseline_kids(baseline))
+    g.check_migration_labels(["site-rs-v1", "console-rs-v1"],
+                             known_kids=["site-rs-v2"] + g.baseline_kids(baseline))
 
 
-def test_baseline_kids_tolerates_a_missing_or_empty_facts_block():
-    """迁移期与首次建基线时这一块可能不存在——校验不该因此炸掉。"""
+def test_baseline_kids_tolerates_a_missing_or_empty_kms_block():
+    """首次建基线时这一块可能不存在——校验不该因此炸掉。"""
     g = _gate()
-    for empty in ({}, {"facts": {}}, {"facts": {"session_keys": {}}}, {"facts": None}):
+    for empty in ({}, {"kms": {}}, {"kms": None}, {"facts": {}}):
         assert g.baseline_kids(empty) == []
 
 
 def test_the_second_source_does_not_relax_the_typo_guard():
     """正对照：多一个来源不等于放松校验——两处都不在的标签照样硬失败。"""
     g = _gate()
-    baseline = {"facts": {"session_keys": {"site-hs-v1": {}}}}
+    baseline = {"kms": {"site-rs-v1": {}}}
     with pytest.raises(SystemExit):
-        g.check_migration_labels(["site-hs-v9"],
-                                 known_kids=["site-hs-v2"] + g.baseline_kids(baseline))
+        g.check_migration_labels(["site-rs-v9"],
+                                 known_kids=["site-rs-v2"] + g.baseline_kids(baseline))
 
 
 def test_cli_reads_the_baseline_for_known_kids_not_only_the_config():
@@ -3580,15 +3332,15 @@ def test_cli_reads_the_baseline_for_known_kids_not_only_the_config():
 # ---- 退役桶 -------------------------------------------------------------------
 
 def test_declared_retire_key_lets_a_platform_role_lose_that_grant_without_red():
-    """L3 与演练第 ⑩ 步的形状：platform 角色丢掉被声明的那一条 ⇒ 迁移分节，绿。"""
+    """轮转 runbook 最后一步的形状：platform 角色丢掉被声明的那一条 ⇒ 迁移分节，绿。"""
     g = _gate()
     base = _with_required(g, _observed(g, AuthRole=["invoke-platform:site-panel",
-                                                    g.G_READ_JWT_PARAM]))
+                                                    "kms-sign:site-rs-v1"]))
     now = _with_required(g, _observed(g, AuthRole=["invoke-platform:site-panel"]))
     rep = g.compare_to_baseline(now, _platform_baseline(g, base), required=REQUIRED,
-                                retired_keys=("legacy",))
+                                retired_keys=("site-rs-v1",))
     assert rep.ok, rep.render()
-    assert rep.migration_grants and g.G_READ_JWT_PARAM in rep.render()
+    assert rep.migration_grants and "kms-sign:site-rs-v1" in rep.render()
     assert not rep.missing_required
 
 
@@ -3597,21 +3349,21 @@ def test_undeclared_loss_in_the_same_round_is_still_red():
     且报告里只列没声明的那条。"""
     g = _gate()
     base = _with_required(g, _observed(g, AuthRole=["invoke-platform:site-panel",
-                                                    g.G_READ_JWT_PARAM,
-                                                    "read-session-key:site-hs-v1"]))
+                                                    "kms-sign:site-rs-v1",
+                                                    "kms-sign:console-rs-v1"]))
     now = _with_required(g, _observed(g, AuthRole=["invoke-platform:site-panel"]))
     rep = g.compare_to_baseline(now, _platform_baseline(g, base), required=REQUIRED,
-                                retired_keys=("legacy",))
+                                retired_keys=("site-rs-v1",))
     assert not rep.ok, rep.render()
-    assert "read-session-key:site-hs-v1" in " ".join(rep.missing_required)
-    assert g.G_READ_JWT_PARAM not in " ".join(rep.missing_required), "被声明的那条不该也红"
+    assert "kms-sign:console-rs-v1" in " ".join(rep.missing_required)
+    assert "kms-sign:site-rs-v1" not in " ".join(rep.missing_required), "被声明的那条不该也红"
 
 
 def test_retiring_without_declaring_it_stays_red():
     """正对照：不带 --retire-key 时，同一次丢失照样红（否则上面那条在测空气）。"""
     g = _gate()
     base = _with_required(g, _observed(g, AuthRole=["invoke-platform:site-panel",
-                                                    g.G_READ_JWT_PARAM]))
+                                                    "kms-sign:site-rs-v1"]))
     now = _with_required(g, _observed(g, AuthRole=["invoke-platform:site-panel"]))
     rep = g.compare_to_baseline(now, _platform_baseline(g, base), required=REQUIRED)
     assert not rep.ok and rep.missing_required
@@ -3621,9 +3373,9 @@ def test_non_platform_loss_is_still_an_improvement_declared_or_not():
     """非 platform 类的丢失与声明无关，仍归"改善"——退役桶不该改变这一侧的口径。"""
     g = _gate()
     base = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel",
-                                                     g.G_READ_JWT_PARAM]))
+                                                     "kms-sign:site-rs-v1"]))
     now = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel"]))
-    for retired in ((), ("legacy",)):
+    for retired in ((), ("site-rs-v1",)):
         rep = g.compare_to_baseline(now, _baseline_of(base), required=REQUIRED,
                                     retired_keys=retired)
         assert rep.ok, rep.render()
@@ -3634,12 +3386,12 @@ def test_retire_declaration_does_not_leak_into_the_gained_side():
     """`--retire-key X` 不得让 X 的**新增**变绿——两个桶必须各管一个方向。"""
     g = _gate()
     base = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel",
-                                                     g.G_READ_JWT_PARAM]))
+                                                     "kms-sign:site-rs-v1"]))
     now = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel",
-                                                    g.G_READ_JWT_PARAM,
-                                                    "read-session-key:site-hs-v2"]))
+                                                    "kms-sign:site-rs-v1",
+                                                    "kms-sign:site-rs-v2"]))
     rep = g.compare_to_baseline(now, _baseline_of(base), required=REQUIRED,
-                                retired_keys=("site-hs-v2",))
+                                retired_keys=("site-rs-v2",))
     assert not rep.ok and rep.new_grants
 
 
@@ -3647,22 +3399,22 @@ def test_new_declaration_does_not_leak_into_the_lost_side():
     """镜像的另一半：`--new-key X` 不得让 X 的**丢失**变绿。"""
     g = _gate()
     base = _with_required(g, _observed(g, AuthRole=["invoke-platform:site-panel",
-                                                    g.G_READ_JWT_PARAM]))
+                                                    "kms-sign:site-rs-v1"]))
     now = _with_required(g, _observed(g, AuthRole=["invoke-platform:site-panel"]))
     rep = g.compare_to_baseline(now, _platform_baseline(g, base), required=REQUIRED,
-                                new_keys=("legacy",))
+                                new_keys=("site-rs-v1",))
     assert not rep.ok and rep.missing_required
 
 
 # ---- login-flow：新增桶 + 不算冒充面 ---------------------------------------------
 
 def test_declared_login_flow_on_an_existing_secret_holder_goes_to_migration():
-    """② 步的形状：login-flow 参数首次出现，此前已能读某把会话密钥的 principal 顺带能读它。"""
+    """② 步的形状：login-flow 参数首次出现，此前已能签某把会话密钥的 principal 顺带能读它。"""
     g = _gate()
     base = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel",
-                                                     g.G_READ_JWT_PARAM]))
+                                                     "kms-sign:site-rs-v1"]))
     now = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel",
-                                                    g.G_READ_JWT_PARAM,
+                                                    "kms-sign:site-rs-v1",
                                                     g.G_READ_LOGIN_FLOW]))
     rep = g.compare_to_baseline(now, _baseline_of(base), required=REQUIRED,
                                 new_keys=("login-flow",))
@@ -3671,7 +3423,7 @@ def test_declared_login_flow_on_an_existing_secret_holder_goes_to_migration():
 
 
 def test_login_flow_on_a_principal_that_could_not_read_any_key_stays_red():
-    """声明了也不放行"从不能读密钥到能读一把密钥"——那是真扩权，与是哪把无关。"""
+    """声明了也不放行"从不能签到能读一把密钥"——那是真扩权，与是哪把无关。"""
     g = _gate()
     base = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel"]))
     now = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel",
@@ -3684,9 +3436,9 @@ def test_login_flow_on_a_principal_that_could_not_read_any_key_stays_red():
 def test_undeclared_login_flow_grant_stays_red():
     g = _gate()
     base = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel",
-                                                     g.G_READ_JWT_PARAM]))
+                                                     "kms-sign:site-rs-v1"]))
     now = _with_required(g, _observed(g, WorkloadA=["invoke-platform:site-panel",
-                                                    g.G_READ_JWT_PARAM,
+                                                    "kms-sign:site-rs-v1",
                                                     g.G_READ_LOGIN_FLOW]))
     rep = g.compare_to_baseline(now, _baseline_of(base), required=REQUIRED)
     assert not rep.ok and rep.new_grants
@@ -3697,25 +3449,28 @@ def test_login_flow_grant_is_not_a_secret_grant():
     **签不出任何会话** ⇒ 不进冒充面。正对照：会话密钥那几条仍是 True。"""
     g = _gate()
     assert not g.is_secret_grant(g.G_READ_LOGIN_FLOW)
-    assert g.G_READ_LOGIN_FLOW not in g.SECRET_GRANTS
-    for real in (g.G_READ_JWT_PARAM, g.G_READ_EDGE_CODE, g.G_READ_EDGE_ASSET,
-                 "read-session-key:site-hs-v1", "read-session-key:console-hs-v1"):
+    for real in ("kms-sign:site-rs-v1", "kms-sign:console-rs-v1",
+                 "kms-self-authorize:site-rs-v1", "kms-self-authorize:console-rs-v1"):
         assert g.is_secret_grant(real), real
+    # 3c-final：这些都**不再**算冒充面（产物与 SSM 里只剩公钥与 login-flow）
+    for not_real in ("read-jwt-param", "read-edge-code", "read-edge-asset",
+                     "read-session-key:site-hs-v1", "invoke-platform:site-panel"):
+        assert not g.is_secret_grant(not_real), not_real
 
 
 def test_login_flow_grant_does_not_change_the_impersonation_counts():
     """把 login-flow 的读取者算进冒充面会让那个数字凭空变大。按闸门自己的口径数一遍。"""
     g = _gate()
-    holders = {"A": [g.G_READ_JWT_PARAM], "B": [g.G_READ_LOGIN_FLOW],
-               "C": [g.G_READ_JWT_PARAM, g.G_READ_LOGIN_FLOW],
+    holders = {"A": ["kms-sign:site-rs-v1"], "B": [g.G_READ_LOGIN_FLOW],
+               "C": ["kms-sign:site-rs-v1", g.G_READ_LOGIN_FLOW],
                "D": ["invoke-platform:site-panel"]}
     can_sign = [n for n, grants in holders.items() if any(g.is_secret_grant(x) for x in grants)]
-    assert can_sign == ["A", "C"], "只有能读会话密钥的才算冒充面"
+    assert can_sign == ["A", "C"], "只有能签会话的才算冒充面"
 
 
 def test_login_flow_param_is_simulated_and_classified_but_only_when_configured():
     g = _gate()
-    t = g.Targets(**{**_targets(g).__dict__, "login_flow_parameter": _LOGIN_FLOW_ARN})
+    t = _targets(g, login_flow=_LOGIN_FLOW_ARN)
     assert _LOGIN_FLOW_ARN in t.other_resources()
     assert g.undecided_resource_class(_LOGIN_FLOW_ARN, t) == "login-flow-param"
     got = g.grants_from_decisions({f"ssm:GetParameter|{_LOGIN_FLOW_ARN}": "allowed"}, t)
@@ -3730,109 +3485,43 @@ def test_login_flow_param_is_simulated_and_classified_but_only_when_configured()
 def test_login_flow_secret_is_deliberately_absent_from_the_key_enumeration():
     """**刻意的排除要有正向断言**（3c-1B ticket 03 复审转来）。
 
-    `measure()` 里 `key_values` 只装 legacy + 两 family 的 HS 行；login-flow 只进 `scan_values`
-    （用于"Edge 产物里有没有它"那条硬断言）。没有这条断言的话，将来有人"顺手补齐"枚举就会
-    把 read-edge-code / read-edge-asset 的资源并集撑大 ⇒ 冒充面数字凭空放大，而没有守卫会红。
+    `measure()` 里 login-flow 的值只进 `scan_values`（"Edge 产物里有没有它"那条硬断言），
+    **不进 `kms_keys`**——后者是"谁能签会话"的目标集合。没有这条断言的话，将来有人"顺手
+    补齐"枚举就会把冒充面的目标集合撑大，而没有守卫会红。
     """
     src = _SCRIPT.read_text(encoding="utf-8")
     body = src.split("def measure(")[1]
-    assert 'key_values: dict[str, str] = {"legacy": live_key}' in body
-    assert "key_values[ref.kid] =" in body
-    assert "scan_values = {**key_values, LABEL_LOGIN_FLOW: login_flow_value}" in body, (
-        "login-flow 必须只进 scan_values，不进 key_values")
-    assert "key_values[LABEL_LOGIN_FLOW]" not in body and 'key_values["login-flow"]' not in body
-    # 目标集合的并集只跨 key_values 的 label——跨 scan_values 就等于把 login-flow 算进冒充面
-    for line in ("set(edge_code_by[k]) for k in key_values", "set(asset_by[k]) for k in key_values"):
-        assert line in body, f"并集口径变了：{line}"
+    assert "scan_values = {**spki_b64_by, LABEL_LOGIN_FLOW: login_flow_value}" in body, (
+        "login-flow 必须只进 scan_values")
+    assert "kms_keys={r.kid: r.key_arn for r in refs}" in body, (
+        "kms_keys 的来源必须只是 [SessionKeys] 的 RS 行")
+    for bad in ("kms_keys[LABEL_LOGIN_FLOW]", 'kms_keys["login-flow"]',
+                "login_flow_value, **spki_b64_by"):
+        assert bad not in body, f"login-flow 漏进了签名目标集合：{bad}"
 
 
-# ---- Edge 产物含 login-flow 值 ⇒ 硬失败 -------------------------------------------
+# ---- Edge 产物的三条硬断言 -------------------------------------------------------
 
-def test_login_flow_value_inside_edge_artifacts_is_a_hard_failure():
-    g = _gate()
-    g.assert_login_flow_not_in_edge((), [])          # 干净时静默通过
-    with pytest.raises(SystemExit, match="login-flow"):
-        g.assert_login_flow_not_in_edge(("arn:aws:lambda:us-east-1:1:function:edge:7",), [])
-    with pytest.raises(SystemExit, match="login-flow"):
-        g.assert_login_flow_not_in_edge((), ["assets/edge-abc.zip"])
-
-
-def test_login_flow_hard_failure_message_says_it_is_not_baseline_releasable():
+def test_edge_artifact_hard_failure_message_says_it_is_not_baseline_releasable():
     """处置文案必须说清"这条不接受基线放行"——最省力的处置永远是更新基线。"""
     g = _gate()
     with pytest.raises(SystemExit) as e:
-        g.assert_login_flow_not_in_edge(("x",), [])
+        g.assert_edge_artifacts({"site:site-rs-v1": ["code"], "login-flow": ["code"]}, {},
+                                site_kids=["site-rs-v1"], console_kids=[])
     text = str(e.value)
     assert "基线" in text and "auth" in text
 
 
-def test_login_flow_check_adds_no_facts_and_keeps_the_baseline_schema():
-    """spec §11.8.7：不新增 facts、BUNDLE_SHAPE 的 facts 不变。（schema 后来因 A6 复审升到 5，
-    那是 coverage 成员形态的事，与 login-flow 无关——facts 清单仍钉在这里。）"""
+def test_the_edge_assertions_add_no_facts():
+    """spec §11.8.7：三条硬断言不新增 facts——它们没有"可接受的基线数字"这种东西。"""
     g = _gate()
-    assert g.BASELINE_SCHEMA == 5
-    assert set(g.BUNDLE_SHAPE["facts"]) == {
-        "edge_code_targets_carrying_live_key", "edge_assets_carrying_live_key",
-        "principals_with_missing_context", "session_keys"}
-    assert set(g.BUNDLE_SHAPE["facts"]["session_keys"]["*"]) == {
-        "edge_code_targets_carrying_key", "edge_assets_carrying_key"}
+    assert g.BASELINE_SCHEMA == 6
+    assert set(g.BUNDLE_SHAPE["facts"]) == {"principals_with_missing_context"}
     assert "login" not in json.dumps(g.BUNDLE_SHAPE, default=str)
+    assert "spki" not in json.dumps(g.BUNDLE_SHAPE["facts"], default=str)
 
 
-def test_load_baseline_names_the_migration_channel_for_a_schema_4_file(tmp_path):
-    """schema 4 的基线（3c-1A/1B 时期）现在必须经 4→5 迁移；报文要把那条命令说出来。"""
-    g = _gate()
-    p = tmp_path / "b.json"
-    p.write_text(json.dumps({"schema": 4, "principals": {}}), encoding="utf-8")
-    with pytest.raises(SystemExit, match="--migrate-from-schema 4"):
-        g.load_baseline(p)
-
-
-# ---- legacy_param 为空（L3 之后）------------------------------------------------
-
-class _FakeKeys:
-    """只带 `legacy_param` 的最小替身——`check_legacy_param` 只看这一个字段。"""
-
-    def __init__(self, legacy_param):
-        self.legacy_param = legacy_param
-
-
-def test_empty_legacy_param_is_accepted_so_l3_does_not_blow_up_the_gate():
-    """L3 清空 `legacy_param` 之后闸门**不能炸**（行为断言，不是读源码）。"""
-    g = _gate()
-    g.check_legacy_param(_FakeKeys(""))            # 不抛即通过
-
-
-def test_matching_non_empty_legacy_param_is_accepted():
-    g = _gate()
-    g.check_legacy_param(_FakeKeys(g.JWT_PARAM_NAME))
-
-
-@pytest.mark.parametrize("other", ["/site-builder/jwt-secret-2", "/other/jwt-secret",
-                                   "/site-builder/session-keys/site-hs-v1"])
-def test_mismatched_non_empty_legacy_param_is_still_rejected(other):
-    """非空时两处必须一致——这条不能因为"允许为空"而一起松掉（能红的反例）。"""
-    g = _gate()
-    assert other != g.JWT_PARAM_NAME
-    with pytest.raises(SystemExit, match="不一致"):
-        g.check_legacy_param(_FakeKeys(other))
-
-
-def test_the_legacy_parameter_is_still_tracked_and_still_produces_its_grant():
-    """"允许为空"不等于"停止追踪"：目标里仍有 jwt_parameter，能读它仍记 `read-jwt-param`。
-
-    那把密钥在 L3 之后仍存在于 SSM、仍能被宽读者读到，只是不再有 verifier 接受它签的 token。
-    """
-    g = _gate()
-    t = _targets(g)
-    assert t.jwt_parameter.endswith(g.JWT_PARAM_NAME)
-    assert t.jwt_parameter in t.other_resources()
-    assert g.grants_from_decisions({f"ssm:GetParameter|{t.jwt_parameter}": "allowed"}, t) \
-        == {g.G_READ_JWT_PARAM}
-    # 常量是追踪的真源（3c-3 删参数时才动它），measure() 按它拼 ARN 而不是按 legacy_param
-    body = _SCRIPT.read_text(encoding="utf-8").split("def measure(")[1]
-    assert "parameter{JWT_PARAM_NAME}" in body, "ARN 改成按 legacy_param 拼了——L3 会让追踪消失"
-
+# ---- family 清单不手抄 ----------------------------------------------------------
 
 def test_configured_kids_uses_the_family_list_from_session_keys():
     """family 清单不手抄第三份：加一个 family 时手抄的副本会让合法 kid 被判"未知标签"。"""
@@ -3844,62 +3533,95 @@ def test_configured_kids_uses_the_family_list_from_session_keys():
 
 
 # ---- CLI ----------------------------------------------------------------------
+#
+# 三条用例原先真的 fork 一次进程、读**真的** `site-builder/config.ini`。3c-final 之后不行了：
+# 那份 config 是 gitignored 的、在硬切换那一步之前还是 HS 形态，`load_session_keys` 会先抛
+# `SessionKeysError`（"含 signer"）——那是另一种失败，用例就测不到标签校验了。所以改成
+# 进程内跑 `main()`，把 `CONFIG_PATH` 与 `BASELINE_PATH` 指到临时文件上。
+#
+# **"没发 AWS 调用"这个前提照样成立**：两条路标（标签错误、没有基线）都在 `measure()`
+# 之前抛，而 `measure()` 是唯一发调用的地方；把 BASELINE_PATH 指到一个不存在的路径，
+# "没有基线，先 --update-baseline" 就是校验**之后**、任何调用**之前**的那个路标。
 
-_CONFIG_INI = _ROOT / "site-builder" / "config.ini"
+_KMS_CONFIG = """[SessionKeys]
+site_current = site-rs-v1
+console_current = console-rs-v1
+login_flow_secret_param = /site-builder/login-flow-secret
+
+[SessionKey:site-rs-v1]
+alg = RS256
+key_arn = arn:aws:kms:us-east-1:111111111111:key/11111111-2222-3333-4444-000000000001
+spki_sha256 = {site}
+
+[SessionKey:console-rs-v1]
+alg = RS256
+key_arn = arn:aws:kms:us-east-1:111111111111:key/11111111-2222-3333-4444-000000000002
+spki_sha256 = {console}
+""".format(site="a" * 64, console="b" * 64)
+
+
+def _cli(g, tmp_path, monkeypatch, argv):
+    """把 config 与基线指到 tmp_path 上跑一次 `main()`，返回 (SystemExit 文本 | None)。"""
+    cfg = tmp_path / "config.ini"
+    cfg.write_text(_KMS_CONFIG, encoding="utf-8")
+    monkeypatch.setattr(g, "CONFIG_PATH", cfg)
+    monkeypatch.setattr(g, "BASELINE_PATH", tmp_path / "nope.json")
+    try:
+        g.main(argv)
+    except SystemExit as exc:
+        return str(exc)
+    return None
 
 
 @pytest.mark.parametrize("flag", ["--new-key", "--new-kid", "--retire-key"])
-def test_migration_flags_validate_labels_before_any_aws_call(flag):
-    """真的跑一次进程：三个入口（含 `--new-kid` 别名）都必须在**任何 AWS 调用之前**
-    拒掉打错的标签。
+def test_migration_flags_validate_labels_before_any_aws_call(flag, tmp_path, monkeypatch):
+    """三个入口（含 `--new-kid` 别名）都必须在**任何 AWS 调用之前**拒掉打错的标签。
 
     这条同时证明两件事：别名接到了同一个 dest（否则 `--new-kid` 会 argparse 报未知参数
-    而不是标签错误），以及校验发生在 `measure()` 之前（这里没有可用凭证，真发调用会是
-    另一种失败——超时或 NoCredentials，而不是我们要的那句）。
+    而不是标签错误），以及校验发生在 `measure()` 之前。
     """
-    if not _CONFIG_INI.exists():
-        pytest.skip("需要 site-builder/config.ini（gitignored）才能枚举已配置的 kid")
-    r = subprocess.run([sys.executable, str(_SCRIPT), flag, "bogus-label"],
-                       capture_output=True, text=True, timeout=120)
-    assert r.returncode != 0
-    assert "不是已配置的 kid" in (r.stdout + r.stderr), (r.stdout, r.stderr)
+    g = _gate()
+    monkeypatch.setattr(g, "measure", lambda *a, **k: pytest.fail("发了 AWS 调用"))
+    text = _cli(g, tmp_path, monkeypatch, [flag, "bogus-label"])
+    assert text and "不是已配置的 kid" in text, text
 
 
 @pytest.mark.parametrize("flag", ["--new-key", "--new-kid", "--retire-key"])
-def test_migration_flags_accept_a_configured_kid_and_reach_the_next_stage(flag):
+def test_migration_flags_accept_a_configured_kid_and_reach_the_next_stage(flag, tmp_path, monkeypatch):
     """正对照：合法标签必须**通过校验并走到下一段**（否则上面那条只证明了"什么都拒"）。
 
-    配 `--migrate-baseline-only`（缺 `--migrate-from-schema` 时它自己会抱怨）当"下一段"的
-    路标：那条抱怨在校验**之后**、任何 AWS 调用**之前**，所以既能证明校验放行了，又不会
-    真跑一次 11 分钟的模拟。
+    路标取"没有基线，先 --update-baseline"那句：它在校验**之后**、任何 AWS 调用**之前**。
 
     **不能用 `--help` 当路标**：`-h/--help` 在 `parse_args()` 内部就退出，校验根本没执行到，
     于是合法与非法标签都"通过"——那样这条用例是空转的（3c-1B /code-review 抓到过一次）。
     """
-    if not _CONFIG_INI.exists():
-        pytest.skip("需要 site-builder/config.ini（gitignored）才能枚举已配置的 kid")
     g = _gate()
-    kid = g.configured_kids(g.load_session_keys(_CONFIG_INI))[0]
-    r = subprocess.run([sys.executable, str(_SCRIPT), flag, kid, "--migrate-baseline-only"],
-                       capture_output=True, text=True, timeout=120)
-    out = r.stdout + r.stderr
-    assert "不是已配置的 kid" not in out, out
-    assert "--migrate-from-schema" in out, ("没走到校验之后的那一段：" + out)
+    monkeypatch.setattr(g, "measure", lambda *a, **k: pytest.fail("发了 AWS 调用"))
+    # `site-rs-v1` 是 `_KMS_CONFIG` 里配着的那把——由下面那条用例证明它真的被读到了，
+    # 不是巧合命中了别处的字面量。
+    text = _cli(g, tmp_path, monkeypatch, [flag, "site-rs-v1"])
+    assert text and "不是已配置的 kid" not in text, text
+    assert "没有基线" in text, ("没走到校验之后的那一段：" + str(text))
 
 
-def test_the_positive_control_marker_really_sits_after_label_validation(flag="--new-key"):
+def test_the_positive_control_marker_really_sits_after_label_validation(tmp_path, monkeypatch):
     """上面那条用例的**前提**：非法标签必须在走到那个路标之前就被拒。
 
-    不钉住这一点，`--migrate-baseline-only` 的抱怨若跑到校验之前，正对照就又变成空转。
+    不钉住这一点，"没有基线"那句若跑到校验之前，正对照就又变成空转。
     """
-    if not _CONFIG_INI.exists():
-        pytest.skip("需要 site-builder/config.ini（gitignored）才能枚举已配置的 kid")
-    r = subprocess.run([sys.executable, str(_SCRIPT), flag, "bogus-label",
-                        "--migrate-baseline-only"],
-                       capture_output=True, text=True, timeout=120)
-    out = r.stdout + r.stderr
-    assert "不是已配置的 kid" in out, out
-    assert "--migrate-from-schema" not in out, ("路标跑到校验之前了：" + out)
+    g = _gate()
+    monkeypatch.setattr(g, "measure", lambda *a, **k: pytest.fail("发了 AWS 调用"))
+    text = _cli(g, tmp_path, monkeypatch, ["--new-key", "bogus-label"])
+    assert text and "不是已配置的 kid" in text, text
+    assert "没有基线" not in text, ("路标跑到校验之前了：" + str(text))
+
+
+def test_the_configured_kid_really_comes_from_the_temp_config(tmp_path, monkeypatch):
+    """上面那条正对照的另一半前提：临时 config 真的被读到了（否则 `site-rs-v1` 是巧合）。"""
+    g = _gate()
+    cfg = tmp_path / "config.ini"
+    cfg.write_text(_KMS_CONFIG, encoding="utf-8")
+    assert g.configured_kids(g.load_session_keys(cfg)) == ["site-rs-v1", "console-rs-v1"]
 
 
 def test_new_kid_alias_and_retire_key_are_wired_into_the_comparison():
@@ -3926,31 +3648,35 @@ def test_new_kid_alias_and_retire_key_are_wired_into_the_comparison():
 # 归一化对**两侧**做，新增 / 退役 / 二者同轮全走同一条判据；快照里不再存按声明算的第二份。
 
 _A6_ARN = "arn:aws:iam::111111111111:role/reader"
-_A6_KID = "site-hs-v9"
-_A6_OLD = "console-hs-v1"
+_A6_BASE = "site-rs-v1"        # 总在的那把（锚）
+_A6_KID = "site-rs-v9"         # 新就位的那把
+_A6_OLD = "console-rs-v1"      # 退役的那把
+
+
+def _a6_key(kid):
+    return f"arn:aws:kms:us-east-1:1:key/{kid}"
 
 
 def _a6_pairs(*kids):
-    """同一个 principal 的 (动作, 资源) 对：jwt-secret 之外，每把在位的 key 多一个 session-key 资源。"""
-    pairs = {("ssm:GetParameter", _A6_JWT)}
+    """同一个 principal 的 (动作, 资源) 对：锚那把 CMK 之外，每把在位的 key 多一个 CMK 资源。
+
+    锚**必须与被增减的 key 同一个动作等价类**（都走 `kms:Sign`）：churn 的机制正是
+    "某 principal 某动作类下的**整个资源类集合**折成一个成员"，所以一把 key 的增减要能让
+    那个成员**换值**。锚换成另一个动作类（比如 login-flow 的 read-param）时，新 key 会产生
+    一个**新增的成员**而不是让旧成员换值 ⇒ 归一化那几条用例全变成在测另一回事。
+    """
+    pairs = {("kms:Sign", _a6_key(_A6_BASE))}
     for kid in kids:
-        pairs.add(("ssm:GetParameter", _a6_param(kid)))
+        pairs.add(("kms:Sign", _a6_key(kid)))
     return pairs
-
-
-_A6_JWT = "arn:aws:ssm:us-east-1:1:parameter/site-builder/jwt-secret"
-
-
-def _a6_param(kid):
-    return f"arn:aws:ssm:us-east-1:1:parameter/site-builder/session-keys/{kid}"
 
 
 def _a6_targets(*kids):
     """复用既有 `_targets` 的字段（**不手写一份 Targets**，字段漂移时会静默变成别的东西）。"""
     g = _gate()
     base = _targets(g)
-    return g.Targets(**{**base.__dict__, "jwt_parameter": _A6_JWT,
-                        "session_key_parameters": {k: _a6_param(k) for k in kids}})
+    return g.Targets(**{**base.__dict__,
+                        "kms_keys": {k: _a6_key(k) for k in (_A6_BASE, *kids)}})
 
 
 def _a6_members(*kids):
@@ -3962,13 +3688,16 @@ def test_classes_for_labels_matches_the_resource_class_names_actually_emitted():
     """对应关系必须精确——差一个字的后果是"声明了却仍然红"，与没修一样。"""
     g = _gate()
     t = _a6_targets(_A6_KID)
-    assert g.classes_for_labels((_A6_KID,), t) == frozenset({f"session-key:{_A6_KID}"})
-    assert g.classes_for_labels((g.LABEL_LEGACY,), t) == frozenset({"jwt-param"})
+    assert g.classes_for_labels((_A6_KID,), t) == frozenset({f"kms-key:{_A6_KID}"})
     assert g.classes_for_labels((g.LABEL_LOGIN_FLOW,), t) == frozenset({"login-flow-param"})
-    assert g.classes_for_labels((_A6_KID,)) == frozenset({f"session-key:{_A6_KID}"}), "t 可省"
+    assert g.classes_for_labels((_A6_KID,)) == frozenset({f"kms-key:{_A6_KID}"}), "t 可省"
     # 真的由 undecided_resource_class 产出同名类（不是两处各写一份字面量）
     emitted = {g.undecided_resource_class(r, t) for _, r in _a6_pairs(_A6_KID)}
-    assert g.classes_for_labels((_A6_KID, g.LABEL_LEGACY), t) <= emitted
+    assert g.classes_for_labels((_A6_KID, _A6_BASE), t) <= emitted
+    # login-flow 那一支同样要与实际产出的类名对上（它不在 _a6_pairs 里，单独造一次）
+    lf = "arn:aws:ssm:us-east-1:1:parameter/site-builder/login-flow-secret"
+    t2 = _targets(g, login_flow=lf)
+    assert g.classes_for_labels((g.LABEL_LOGIN_FLOW,), t2) == {g.undecided_resource_class(lf, t2)}
 
 
 def test_the_churn_is_real_the_member_changes_for_every_affected_principal():
@@ -3987,12 +3716,12 @@ def test_normalizing_both_sides_makes_new_and_retired_keys_compare_equal():
         assert g.normalize_undecided_items(was, ignore) == g.normalize_undecided_items(now, ignore)
 
 
-def _a6_compare(*, declared, was, now, extra_now=(), now_v4=None):
+def _a6_compare(*, declared, was, now, extra_now=()):
     """跑一次 `_compare_coverage`：基线 = was，本次 = now(+extra)。"""
     g = _gate()
     rep = g.Report()
     g._compare_coverage(rep, sorted(was), sorted(set(now) | set(extra_now)),
-                        now_v4=now_v4, declared_labels=tuple(declared))
+                        declared_labels=tuple(declared))
     return rep
 
 
@@ -4065,7 +3794,7 @@ def test_the_same_snapshot_can_be_compared_under_different_declarations():
     """快照里不再存"按哪组声明算的反事实"：同一份 coverage 分节，声明不同结论不同。
     （第一版把反事实存进快照，`--from-dump` 时声明与快照不匹配只能硬拒。）"""
     g = _gate()
-    coverage = {"undecided_items": sorted(_a6_members()), "schema4_fingerprints": []}
+    coverage = {"undecided_items": sorted(_a6_members())}
     baseline = {"principals": {}, "coverage": {"undecided_items": sorted(_a6_members(_A6_OLD))}}
     assert "counterfactual" not in json.dumps(g.BUNDLE_SHAPE, default=str)
     red = g.compare_to_baseline({}, baseline, required={}, coverage=coverage)
@@ -4073,28 +3802,10 @@ def test_the_same_snapshot_can_be_compared_under_different_declarations():
     assert not red.ok and green.ok
 
 
-def test_a_schema_4_baseline_is_compared_by_the_old_hashes_and_absorbs_nothing():
-    """迁移那一跑：基线还是哈希 ⇒ 用观测里的 `schema4_fingerprints` 比（漂移仍可见），
-    声明**不吸收**（哈希剔不掉类），照红并说明；没有 v4 指纹的观测直接拒。"""
-    g = _gate()
-    t0, t1 = _a6_targets(), _a6_targets(_A6_KID)
-    was_v4 = g.undecided_members_v4(_A6_ARN, _a6_pairs(), t0)
-    now_v4 = g.undecided_members_v4(_A6_ARN, _a6_pairs(_A6_KID), t1)
-    # 没变：绿，且报告点明按旧形态比
-    rep = _a6_compare(declared=(), was=was_v4, now=_a6_members(), now_v4=sorted(was_v4))
-    assert rep.ok and any("schema 4" in n for n in rep.notes)
-    # 变了且声明了：照红（不吸收），并说清为什么
-    rep = _a6_compare(declared=(_A6_KID,), was=was_v4, now=_a6_members(_A6_KID), now_v4=sorted(now_v4))
-    assert rep.new_undecided_items and not rep.migration_undecided and not rep.ok
-    assert any("不吸收" in n for n in rep.notes)
-    with pytest.raises(SystemExit, match="schema4_fingerprints"):
-        _a6_compare(declared=(), was=was_v4, now=_a6_members(), now_v4=None)
-
-
 def test_bundle_shape_rejects_hash_members_and_account_values_in_coverage():
     """观测里的成员必须是可分解形态：哈希（旧 dump）与带 ARN 的字符串都在 BUNDLE_SHAPE 这层被拒。"""
     g = _gate()
-    for bad in (g.undecided_item_fp(_A6_ARN, "invoke", "sites"),
+    for bad in (g.principal_fingerprint(_A6_ARN),          # 旧的哈希形态（schema 4）
                 f"{_A6_ARN}|invoke|sites", "0000-1111-2222-3333|invoke|"):
         bundle = _complete_bundle(g)
         bundle["coverage"]["undecided_items"] = [bad]
@@ -4133,20 +3844,20 @@ def test_the_green_bucket_is_not_a_red_field():
 
 
 def test_absorption_requires_prior_capability_and_that_is_deliberate():
-    """声明**不能**吸收"原先读不到任何密钥、现在能读了"这种增长（3c-1B-G A6 的结论）。
+    """声明**不能**吸收"原先签不出任何会话、现在能签了"这种增长（3c-1B-G A6 的结论）。
 
     两轮 review 都把 `any(is_secret_grant(x) for x in was)` 这个前置条件报成缺陷，
     结论是**不改**：声明的语义是"新建了一把 key，能读同一批参数的人自然多读到一把"（良性）；
-    而一个原先读不到任何会话密钥的 principal 现在能读到，是**能力面真的变大**，
+    而一个原先签不出任何会话的 principal 现在能签了，是**能力面真的变大**，
     一句 `--new-key` 不该把它抹掉。这条用例存在的目的就是让下一次 review 不必再推一遍——
     它断言的是**意图**，不是实现细节。
     """
     g = _gate()
-    kid = "site-hs-v9"
+    kid = "site-rs-v9"
     fp = g.principal_fingerprint("arn:aws:iam::1:role/newcomer")
     observed = {fp: {"name": "newcomer", "arn": "arn:aws:iam::1:role/newcomer", "kind": "role",
-                     "grants": [f"read-session-key:{kid}"]}}
-    # 基线里这个 principal **没有任何**会话密钥 grant（只有一条无关的 invoke）
+                     "grants": [f"kms-sign:{kid}"]}}
+    # 基线里这个 principal **一条能签的 grant 都没有**（只有一条无关的 invoke）
     baseline = {"principals": {fp: {"name": "newcomer", "arn": "arn:aws:iam::1:role/newcomer",
                                    "kind": "role", "grants": ["invoke-platform:site-panel"],
                                    "category": "unrelated-workload"}}}
@@ -4154,3 +3865,401 @@ def test_absorption_requires_prior_capability_and_that_is_deliberate():
     assert rep.new_grants and kid in rep.new_grants[0], rep.new_grants
     assert not rep.migration_grants
     assert not rep.ok
+
+
+# --------------------------------------------------------------------------
+# 3c-final：KMS 层
+#
+# HS 层（"谁能读到那把明文密钥"：SSM 参数 / Edge 产物 / bootstrap asset）整层换成 KMS 层
+# （"谁能 kms:Sign、谁能先给自己授权再签"，加上每把 CMK 自己的 key policy / grants / 公钥
+# 指纹快照）。基线 schema 6，**没有 3/4/5 → 6 的迁移通道**：旧形态里根本没有 KMS 分节可比。
+# --------------------------------------------------------------------------
+
+KEY = {"site-rs-v1": "arn:aws:kms:us-east-1:111111111111:key/11111111-2222-3333-4444-000000000001",
+       "console-rs-v1": "arn:aws:kms:us-east-1:111111111111:key/11111111-2222-3333-4444-000000000002"}
+
+
+def _targets_kms(g):
+    return g.Targets(platform_functions=(), site_functions=(), kms_keys=dict(KEY),
+                     login_flow_parameter="arn:aws:ssm:us-east-1:111111111111:parameter/site-builder/login-flow-secret")
+
+
+def test_kms_sign_and_self_authorize_are_per_kid_grants_and_both_count_as_impersonation():
+    g = _gate()
+    t = _targets_kms(g)
+    sign_site = g.grants_from_decisions({f"kms:Sign|{KEY['site-rs-v1']}": "allowed"}, t)
+    grant_console = g.grants_from_decisions({f"kms:CreateGrant|{KEY['console-rs-v1']}": "allowed"}, t)
+    policy_console = g.grants_from_decisions({f"kms:PutKeyPolicy|{KEY['console-rs-v1']}": "allowed"}, t)
+    assert sign_site == {"kms-sign:site-rs-v1"}
+    assert grant_console == policy_console == {"kms-self-authorize:console-rs-v1"}
+    assert all(g.is_secret_grant(x) for x in sign_site | grant_console)
+    assert not g.is_secret_grant("read-login-flow-secret") and not g.is_secret_grant("invoke-platform:site-panel")
+
+
+def test_kms_get_public_key_is_not_a_grant():
+    g = _gate()
+    assert g.grants_from_decisions({f"kms:GetPublicKey|{KEY['site-rs-v1']}": "allowed"}, _targets_kms(g)) == set()
+
+
+def test_kms_keys_are_simulated_with_the_contract_context_and_classified_by_kid():
+    g = _gate()
+    t = _targets_kms(g)
+    assert set(KEY.values()) <= set(t.other_resources())
+    assert g.undecided_resource_class(KEY["site-rs-v1"], t) == "kms-key:site-rs-v1"
+    calls = []
+
+    class _IAM:
+        def get_paginator(self, name):
+            class _P:
+                def paginate(self, **kw):
+                    calls.append(kw); return iter(())
+            return _P()
+    g.simulate(_IAM(), "arn:aws:iam::111111111111:role/x", t)
+    ctx = {(e["ContextKeyName"], tuple(e["ContextKeyValues"])) for c in calls for e in c.get("ContextEntries", [])}
+    assert ("kms:SigningAlgorithm", ("RSASSA_PKCS1_V1_5_SHA_256",)) in ctx and ("kms:MessageType", ("RAW",)) in ctx
+
+
+def test_the_kms_context_values_are_the_contract_not_a_hand_copy():
+    """两个 Condition 值必须与 `auth/session_kms.py` 逐字一致——手抄的副本漂移时闸门会静静地
+    测错东西（`kms:Sign` 判成"缺上下文"⇒ auth / panel 的必需 grant 消失 ⇒ 正向控制假红）。"""
+    g = _gate()
+    import session_kms as sk
+    assert g.KMS_SIGNING_ALGORITHM == sk.SIGNING_ALGORITHM
+    assert g.KMS_MESSAGE_TYPE == sk.MESSAGE_TYPE
+
+
+def test_hs_era_symbols_are_gone():
+    g = _gate()
+    for name in ("JWT_PARAM_NAME", "LABEL_LEGACY", "G_READ_JWT_PARAM", "G_READ_SESSION_KEY", "G_READ_EDGE_CODE",
+                 "G_READ_EDGE_ASSET", "SECRET_GRANTS", "check_legacy_param", "migrate_baseline_3_to_4",
+                 "migrate_baseline_4_to_5", "undecided_members_v4", "undecided_item_fp", "coverage_form",
+                 "_check_console_key_not_in_edge"):
+        assert not hasattr(g, name), name
+    src = _SCRIPT.read_text(encoding="utf-8")
+    for bad in ("--migrate-from-schema", "--migrate-baseline-only", "--no-asset-scan", "schema4_fingerprints",
+                "edge_code_targets_carrying_live_key", "edge_assets_carrying_live_key"):
+        assert bad not in src, bad
+
+
+def _kms_entry(**over):
+    base = {"arn_fp": "aaaa-bbbb-cccc-dddd", "key_policy_fp": "1111-2222-3333-4444", "key_spec": "RSA_2048",
+            "key_usage": "SIGN_VERIFY", "spki_sha256": "0" * 64, "grants": []}
+    base.update(over); return base
+
+
+def test_kms_section_red_on_policy_change_grant_or_undeclared_key_add_or_remove():
+    g = _gate()
+    base = {"site-rs-v1": _kms_entry(), "console-rs-v1": _kms_entry(spki_sha256="1" * 64)}
+    same = json.loads(json.dumps(base))
+    rep = g.Report(); g._compare_kms(rep, base, same, new_keys=(), retired_keys=())
+    assert not rep.kms_drift
+    for mutate, why in (
+        (lambda d: d["site-rs-v1"].__setitem__("key_policy_fp", "9999-9999-9999-9999"), "key policy 变了"),
+        (lambda d: d["site-rs-v1"]["grants"].append("abcd-abcd-abcd-abcd"), "多了一条 grant"),
+        (lambda d: d["site-rs-v1"].__setitem__("spki_sha256", "f" * 64), "公钥换了"),
+        (lambda d: d.__setitem__("site-rs-v2", _kms_entry()), "未声明的新 key"),
+        (lambda d: d.pop("console-rs-v1"), "未声明的 key 消失"),
+    ):
+        now = json.loads(json.dumps(base)); mutate(now)
+        rep = g.Report(); g._compare_kms(rep, base, now, new_keys=(), retired_keys=())
+        assert rep.kms_drift and not rep.ok, why
+
+
+def test_declared_new_or_retired_key_lands_in_the_green_migration_bucket():
+    g = _gate()
+    base = {"site-rs-v1": _kms_entry()}
+    now = {**base, "site-rs-v2": _kms_entry(spki_sha256="2" * 64)}
+    rep = g.Report(); g._compare_kms(rep, base, now, new_keys=("site-rs-v2",), retired_keys=())
+    assert rep.ok and rep.migration_grants
+    rep = g.Report(); g._compare_kms(rep, now, base, new_keys=(), retired_keys=("site-rs-v2",))
+    assert rep.ok and rep.migration_grants
+
+
+def test_the_kms_layer_is_wired_into_compare_to_baseline():
+    """**接线**：纯比较器存在但没人调用是这类闸门最经典的 false-green。"""
+    g = _gate()
+    base = {"kms": {"site-rs-v1": _kms_entry()}, "principals": {}}
+    now = {"site-rs-v1": _kms_entry(key_policy_fp="9999-9999-9999-9999")}
+    rep = g.compare_to_baseline({}, base, required={}, kms=now)
+    assert rep.kms_drift and not rep.ok, rep.render()
+    assert ("kms_drift", "kms") in [(f, k) for f, _, k in g.RED_FIELDS]
+    assert "kms" in g.RED_MESSAGES
+    # 不传 kms（比如 --from-dump 之前的形态）时这一层整层不比——那由 check_bundle_complete 兜
+    assert g.compare_to_baseline({}, base, required={}).ok
+
+
+def test_bundle_shape_requires_the_kms_section_and_only_the_missing_context_fact():
+    g = _gate()
+    assert set(g.BUNDLE_SHAPE["facts"]) == {"principals_with_missing_context"}
+    assert set(g.BUNDLE_SHAPE["kms"]["*"]) == {"arn_fp", "key_policy_fp", "key_spec", "key_usage", "spki_sha256", "grants"}
+    assert "schema4_fingerprints" not in g.BUNDLE_SHAPE["coverage"]
+
+
+def test_edge_artifact_assertions_fail_closed_in_both_directions():
+    g = _gate()
+    site, console = "U0lURQ==", "Q09OU09MRQ=="
+    g.assert_edge_artifacts({"site:site-rs-v1": ["code"], "console:console-rs-v1": [], "login-flow": []},
+                            {"site:site-rs-v1": ["a.zip"], "console:console-rs-v1": [], "login-flow": []},
+                            site_kids=["site-rs-v1"], console_kids=["console-rs-v1"])
+    with pytest.raises(SystemExit, match="site-rs-v1"):        # 当前 Edge 没带 site 公钥 = 全员 302
+        g.assert_edge_artifacts({"site:site-rs-v1": [], "console:console-rs-v1": [], "login-flow": []},
+                                {"site:site-rs-v1": [], "console:console-rs-v1": [], "login-flow": []},
+                                site_kids=["site-rs-v1"], console_kids=["console-rs-v1"])
+    with pytest.raises(SystemExit, match="console-rs-v1"):     # console 公钥进了 Edge（spec §4.1）
+        g.assert_edge_artifacts({"site:site-rs-v1": ["code"], "console:console-rs-v1": ["code"], "login-flow": []},
+                                {"site:site-rs-v1": ["a"], "console:console-rs-v1": [], "login-flow": []},
+                                site_kids=["site-rs-v1"], console_kids=["console-rs-v1"])
+    with pytest.raises(SystemExit, match="login-flow"):
+        g.assert_edge_artifacts({"site:site-rs-v1": ["code"], "console:console-rs-v1": [], "login-flow": ["code"]},
+                                {"site:site-rs-v1": ["a"], "console:console-rs-v1": [], "login-flow": []},
+                                site_kids=["site-rs-v1"], console_kids=["console-rs-v1"])
+    # console 公钥只在 **asset** 里出现时同样要红（两处都扫，缺一边就是一条静默通道）
+    with pytest.raises(SystemExit, match="console-rs-v1"):
+        g.assert_edge_artifacts({"site:site-rs-v1": ["code"], "console:console-rs-v1": [], "login-flow": []},
+                                {"site:site-rs-v1": ["a"], "console:console-rs-v1": ["a"], "login-flow": []},
+                                site_kids=["site-rs-v1"], console_kids=["console-rs-v1"])
+    del site, console
+
+
+def test_the_edge_scan_only_covers_the_associated_version_not_latest():
+    """`edge_code_arns_carrying_keys` 按**点名的 qualifier** 扫，不自己补一个未限定的 `$LATEST`。
+
+    补了的后果正是那条"必须带每把 site 公钥"的断言要抓的场景：代码已更新（`$LATEST` 里有新
+    kid）而 CloudFront 还指着旧版本 ⇒ 线上全员 302，闸门却因为 `$LATEST` 命中而绿。
+    """
+    import io
+    import urllib.request
+    import zipfile
+    g = _gate()
+
+    def zbytes(text):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("index.py", text)
+        return buf.getvalue()
+
+    bodies = {"7": zbytes("nothing here"), "8": zbytes('spki_b64 = "NEWKEY"')}
+    asked = []
+
+    class _NotFound(Exception):
+        pass
+
+    class _Lambda:
+        exceptions = type("E", (), {"ResourceNotFoundException": _NotFound})
+
+        def get_function(self, FunctionName, Qualifier=None):
+            asked.append(Qualifier)
+            return {"Code": {"Location": f"https://example.test/{Qualifier}"}}
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    real = urllib.request.urlopen
+    urllib.request.urlopen = lambda url: _Resp(bodies[url.rsplit("/", 1)[1]])
+    try:
+        out = g.edge_code_arns_carrying_keys({"lambda": _Lambda()}, "edge-fn",
+                                             "arn:aws:lambda:us-east-1:111111111111:function:edge-fn",
+                                             ("7",), {"site:site-rs-v2": "NEWKEY"})
+    finally:
+        urllib.request.urlopen = real
+    assert asked == ["7"], f"扫了点名之外的 qualifier：{asked}"
+    assert out == {"site:site-rs-v2": ()}, out
+
+
+def test_schema_six_has_no_migration_channel(tmp_path):
+    g = _gate()
+    p = tmp_path / "b.json"
+    p.write_text(json.dumps({"schema": 5, "principals": {}}))
+    with pytest.raises(SystemExit, match="重生成"):
+        g.load_baseline(p)
+    p.write_text(json.dumps({"schema": 3, "principals": {}}))
+    with pytest.raises(SystemExit):
+        g.load_baseline(p)
+
+
+def test_a_baseline_on_disk_must_carry_decomposable_coverage_members(tmp_path):
+    """schema 对了但 coverage 成员是旧的哈希形态 = 手改或改了个版本号。读入就拒——放进去的
+    后果是退役声明静默失效（照红、与没修一样）。"""
+    g = _gate()
+    p = tmp_path / "b.json"
+    p.write_text(json.dumps({"schema": 6, "principals": {},
+                             "coverage": {"undecided_items": ["0000-1111-2222-3333"]}}))
+    with pytest.raises(SystemExit, match="undecided_items"):
+        g.load_baseline(p)
+    ok = g.undecided_item("arn:aws:iam::1:role/A", "kms-sign", {"kms-key:site-rs-v1"})
+    p.write_text(json.dumps({"schema": 6, "principals": {}, "coverage": {"undecided_items": [ok]}}))
+    assert g.load_baseline(p)["schema"] == 6
+
+
+def test_missing_baseline_is_not_a_verdict(tmp_path, capsys, monkeypatch):
+    g = _gate()
+    monkeypatch.setattr(g, "BASELINE_PATH", tmp_path / "nope.json")
+    empty = g.load_baseline(g.BASELINE_PATH)
+    assert empty["schema"] == g.BASELINE_SCHEMA and empty["principals"] == {}
+    assert "--update-baseline" in capsys.readouterr().err
+
+
+def test_main_refuses_to_produce_a_verdict_without_a_baseline(tmp_path, monkeypatch):
+    """`load_baseline` 的空壳**不许**变成一次绿：与空基线比 ⇒ 每个 principal 都报成"新增"，
+    一屏红而真因只是没有基线，而那种红会训练出"红了就更新基线"。所以 main 直接硬退出。"""
+    g = _gate()
+    monkeypatch.setattr(g, "BASELINE_PATH", tmp_path / "nope.json")
+    monkeypatch.setattr(g, "measure", lambda *a, **k: pytest.fail("发了 AWS 调用"))
+    with pytest.raises(SystemExit, match="--update-baseline"):
+        g.main([])
+    # 正对照：带 --update-baseline 时同一条路必须走得通（它就是采用者的首跑）
+    bundle = _complete_bundle(g)
+    monkeypatch.setattr(g, "measure", lambda *a, **k: bundle)
+    monkeypatch.setattr(g, "write_baseline", lambda *a, **k: None)
+    assert g.main(["--update-baseline"]) == 0
+
+
+def test_baseline_file_is_gitignored_not_tracked():
+    rel = "site-builder/scripts/account_trust_baseline.json"
+    tracked = subprocess.run(["git", "ls-files", rel], cwd=_ROOT, capture_output=True, text=True).stdout.strip()
+    assert tracked == "", "基线含单账号实测，不随资产分发（ADR 0005）"
+    ign = subprocess.run(["git", "check-ignore", "-q", rel], cwd=_ROOT).returncode
+    assert ign == 0, "基线路径必须在 .gitignore 里，否则下次 git add -A 又会把它加回来"
+
+
+def test_auth_and_panel_signing_grants_are_positive_controls():
+    g = _gate()
+    assert g.REQUIRED_GRANT_PREFIXES["auth"] == ("kms-sign:site-", "kms-sign:console-")
+    assert g.REQUIRED_GRANT_PREFIXES["panel"] == ("kms-sign:console-",)
+
+
+def test_losing_the_signing_grant_is_a_failure_for_auth_and_for_panel():
+    """正向控制要能**红**：丢了 = 全平台登录 500 / 面板会话签不出来，两者都不在任何单测里。"""
+    g = _gate()
+    required = {"auth": "AuthRole", "panel": "PanelRole"}
+    full = _observed(g, AuthRole=["kms-sign:site-rs-v1", "kms-sign:console-rs-v1"],
+                     PanelRole=["kms-sign:console-rs-v1"])
+    assert g.compare_to_baseline(full, _baseline_of(full), required=required).ok
+    # auth 只剩一个 family（3c-1B 那种"只给 console"的收窄）⇒ 红
+    half = _observed(g, AuthRole=["kms-sign:console-rs-v1"], PanelRole=["kms-sign:console-rs-v1"])
+    rep = g.compare_to_baseline(half, _baseline_of(full), required=required)
+    assert not rep.ok and any("AuthRole" in x for x in rep.missing_required), rep.render()
+    # panel 完全没有签名权限 ⇒ 红
+    none = _observed(g, AuthRole=["kms-sign:site-rs-v1", "kms-sign:console-rs-v1"],
+                     PanelRole=["invoke-platform:site-panel"])
+    rep = g.compare_to_baseline(none, _baseline_of(full), required=required)
+    assert not rep.ok and any("PanelRole" in x for x in rep.missing_required), rep.render()
+
+
+def test_panel_role_name_comes_from_deploy_panel_not_a_hand_copy():
+    g = _gate()
+    src = (_ROOT / "site-builder" / "panel" / "deploy_panel.py").read_text(encoding="utf-8")
+    want = re.search(r'^ROLE_NAME = "([^"]+)"', src, re.M).group(1)
+    assert g.panel_role_name() == want
+    assert want not in _SCRIPT.read_text(encoding="utf-8"), \
+        "闸门里手抄了 panel 的角色名——panel 改名时正向控制会盯着一个不存在的角色"
+
+
+def test_the_baseline_checks_really_run_on_a_synthetic_baseline(tmp_path):
+    """**正对照**：上面那批读 `_BASELINE` 的用例在本地无基线时 skip（D1：基线不再 tracked）。
+    没有这一条，"skip 了" 与 "断言其实是空的" 在输出上没有区别。
+
+    这里用生产的 `write_baseline` 从一份合成 bundle 造出真基线，再把同一组断言跑一遍。
+    """
+    g = _gate()
+    bundle = _complete_bundle(g)
+    bundle["principals"]["0000-1111-2222-3333"]["category"] = "unrelated-workload"
+    out = tmp_path / "baseline.json"
+    g.write_baseline(bundle, {}, out)
+    data = json.loads(out.read_text(encoding="utf-8"))
+    _assert_baseline_sections(g, data)
+    _assert_baseline_carries_no_account_values(out.read_text(encoding="utf-8"))
+    _assert_facts_are_integers(data)
+    _assert_baseline_grants_follow_the_grammar(data)
+    assert not list(_non_fingerprint_leaves(data)), list(_non_fingerprint_leaves(data))
+    # kms 分节真的被写出去了（否则 schema 6 的基线里那一层等于不存在）
+    assert set(data["kms"]) == set(bundle["kms"])
+
+
+def test_module_constant_hard_fails_when_the_far_side_renames_it():
+    """"真源在对面"这条只有在**拿不到就硬失败**时才成立——静默兜一个默认值等于手抄。"""
+    g = _gate()
+    assert g._module_constant(_SCRIPT, "BASELINE_SCHEMA") == 6
+    with pytest.raises(SystemExit, match="找不到模块级常量"):
+        g._module_constant(_SCRIPT, "NO_SUCH_CONSTANT_HERE")
+
+
+def test_key_policy_fingerprint_ignores_whitespace_and_key_order():
+    """key policy 的原文来自 `GetKeyPolicy`，AWS 返回的空白与键序不保证稳定。
+
+    直接对原文取指纹会把格式抖动误报成漂移，而反复的假红会训练出无脑更新基线；
+    反过来，**语义变化必须改指纹**——两个方向都断言。
+    """
+    g = _gate()
+    a = '{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "kms:*"}]}'
+    b = '{"Statement":[{"Action":"kms:*","Effect":"Allow"}],\n  "Version":"2012-10-17"}'
+    assert g.canonical_json(a) == g.canonical_json(b)
+    assert g.principal_fingerprint(g.canonical_json(a)) == g.principal_fingerprint(g.canonical_json(b))
+    changed = a.replace('"Allow"', '"Deny"')
+    assert g.canonical_json(changed) != g.canonical_json(a)
+
+
+def _cfront(g, tmp_path, monkeypatch, *, items, outputs=None, stack="RouterStack"):
+    (tmp_path / "router").mkdir(exist_ok=True)
+    (tmp_path / "router" / "config.ini").write_text(f"[CDK]\nstack_name = {stack}\n", encoding="utf-8")
+    monkeypatch.setattr(g, "_SITE_BUILDER", tmp_path / "site-builder")
+    outs = [{"OutputKey": "DistributionId", "OutputValue": "E123"}] if outputs is None else outputs
+
+    class _CFN:
+        def describe_stacks(self, StackName):
+            assert StackName == stack, StackName
+            return {"Stacks": [{"Outputs": outs}]}
+
+    class _CF:
+        def get_distribution_config(self, Id):
+            assert Id == "E123", Id
+            return {"DistributionConfig": {"DefaultCacheBehavior": {
+                "LambdaFunctionAssociations": {"Items": items}}}}
+
+    return {"cloudformation": _CFN(), "cloudfront": _CF()}
+
+
+def test_edge_current_version_reads_the_association_not_the_highest_version(tmp_path, monkeypatch):
+    """**不按"版本号最大"挑**：刚部署完但分发还指着旧版本时，两者不是一回事，而那正是
+    "线上跑的是不是这份 config"要抓的场景（与 verify_deployed_edge.sh ① 同一规则）。"""
+    g = _gate()
+    arn = "arn:aws:lambda:us-east-1:111111111111:function:edge"
+    clients = _cfront(g, tmp_path, monkeypatch, items=[
+        {"EventType": "origin-response", "LambdaFunctionARN": f"{arn}:12"},
+        {"EventType": "origin-request", "LambdaFunctionARN": f"{arn}:7"}])
+    assert g.edge_current_version(clients) == "7", "挑成了版本号最大的那个"
+
+
+@pytest.mark.parametrize("items,why", [
+    ([], "一个 origin-request 关联都没有"),
+    ([{"EventType": "origin-request", "LambdaFunctionARN": "arn:aws:lambda:us-east-1:1:function:e:7"},
+      {"EventType": "origin-request", "LambdaFunctionARN": "arn:aws:lambda:us-east-1:1:function:e:8"}],
+     "关联了两个"),
+    ([{"EventType": "origin-request", "LambdaFunctionARN": "arn:aws:lambda:us-east-1:1:function:e"}],
+     "关联的是未限定 ARN（Lambda@Edge 不允许，但要能说出来）"),
+])
+def test_edge_current_version_refuses_anything_but_exactly_one_numbered_version(items, why, tmp_path, monkeypatch):
+    """探针前提不成立时**硬失败**，不许猜一个版本继续往下跑——那会让三条硬断言对着错的产物评估。"""
+    g = _gate()
+    clients = _cfront(g, tmp_path, monkeypatch, items=items)
+    with pytest.raises(SystemExit, match="编号版本"):
+        g.edge_current_version(clients)
+
+
+def test_edge_current_version_needs_the_distribution_output_and_a_router_config(tmp_path, monkeypatch):
+    """两个前提各有一条：栈里没有 DistributionId 输出、router/config.ini 读不到任何段。
+
+    后者是本仓库反复吃过的那个坑：`configparser` 对缺失文件是**静默的** ⇒ 不硬失败就会拿空
+    栈名去问 CloudFormation，错误信息与"栈没部"混在一起。
+    """
+    g = _gate()
+    clients = _cfront(g, tmp_path, monkeypatch, items=[], outputs=[])
+    with pytest.raises(SystemExit, match="DistributionId"):
+        g.edge_current_version(clients)
+    (tmp_path / "router" / "config.ini").unlink()
+    with pytest.raises(SystemExit, match="读不到任何段"):
+        g.edge_current_version(clients)

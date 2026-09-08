@@ -7,14 +7,14 @@
 
 - SCP 对 Organizations 管理账号无效，而本部署就在管理账号（`policies/README.md` 边界①）；
 - Lambda 的 resource policy 没有写 Deny 的 API（`AddPermission` 只能写 Allow）；
-- 应用层给 Edge 加签名也不成立：能读到那把 HS256 密钥的 principal 远多于能 invoke 的，
-  于是签名与被签名的东西都在攻击者手里。
+- 应用层给 Edge 加签名也不成立：Edge 得能验签，而验签要用的东西按定义是公开的。
 
-**只收窄 `lambda:InvokeFunction` 是假修复**：同一批 principal 还握着密钥读取、
+**只收窄 `lambda:InvokeFunction` 是假修复**：同一批 principal 还握着
 `lambda:UpdateFunctionCode` 与 `iam:PutRolePolicy`，边界一寸也没有移动。
-更要紧的是——**冒充任意用户根本不需要 invoke**：拿到密钥就能签任意 email 的会话
-cookie 与 `scope=console` 的 `__Host-sb_console`（同一个 `/site-builder/jwt-secret`）。
-完整风险模型与实测证据见 `docs/security/account-trust-boundary.md`。
+更要紧的是——**冒充任意用户根本不需要 invoke**。3c-final 之后私钥不出 KMS，
+但能 `kms:Sign`（或先 `kms:PutKeyPolicy` / `kms:CreateGrant` 给自己授权再签）的
+principal 照样能签出任意 email 的会话 cookie 与 `scope=console` 的
+`__Host-sb_console`。完整风险模型与实测证据见 `docs/security/account-trust-boundary.md`。
 
 在那之前，本脚本承担唯一还能自动化的职责：**这个集合别再长**。
 
@@ -26,7 +26,7 @@ cookie 与 `scope=console` 的 `__Host-sb_console`（同一个 `/site-builder/jw
 | 压成什么 | 漏掉了谁 |
 |---|---|
 | 只探未限定函数 ARN | 挂在 `blue` alias 上的授权（M7 之后站点的 Function URL 全在 alias 上） |
-| 只探当前那一个 CDK asset | 带同一把活密钥的 9 个历史对象 |
+| 只探当前那一个 CDK asset | （HS 时代）带同一把活密钥的那批历史 asset 对象 |
 | 只探 `ssm:GetParameter` | 一个**只**被授予 `ssm:GetParameters`（复数）的角色 |
 | IAM 写只对着字面量 `role/*` 模拟 | 6 个精确/窄授权的 principal（IAM 里请求资源是具体 ARN，policy 的 `role/ExactRole` 不匹配字面量 `role/*`；而 `CreatePolicyVersion` 的资源类型根本是 **policy**） |
 
@@ -84,11 +84,18 @@ cookie 与 `scope=console` 的 `__Host-sb_console`（同一个 `/site-builder/jw
    **legacy 形态只认基线里的点名豁免**——
    「存量迁移站点要兼容 legacy」不等于「新站点也可以再产生 legacy」。
 
-④ **密钥物化位置的事实**。密钥有三处明文副本，每次都**实测**而不是假设：
-   Edge 函数产物（含每个仍含活密钥的已发布版本）、**CDK bootstrap S3 asset**
-   （全部仍含活密钥的对象；asset 位置从**已部署的 CloudFormation 模板**推导，
-   不手抄对象 key）、以及 SSM 参数。都比对 SHA-256；某处不再含活密钥时，
-   对应资源自动掉出集合、grant 随之消失并报成改善——根治了它，闸门自己就知道。
+④ **KMS 层**（3c-final）。会话私钥不出 KMS，所以"密钥的明文副本在哪"这个问题没有了；
+   取而代之的是**每把会话签名 CMK 自己的快照**：key policy 指纹、`ListGrants` 每条
+   grant 的指纹、`KeySpec` / `KeyUsage`、以及公钥的 `spki_sha256`。任一字段变化都红
+   （默认 key policy 是 root 委派，能改它的人本来就在冒充面里，但**变了**就要有人看）；
+   key 集合的增减必须用 `--new-key` / `--retire-key` 声明。
+   公钥指纹与 `config.ini` 的 `[SessionKeys]` 不一致时**硬失败**：那说明 config 指的
+   不是这把 key，闸门对着别的东西出结论没有意义。
+
+⑤ **Edge 产物的三条硬断言**（不落 facts、连 `--update-baseline` 一起挡）：
+   CloudFront **当前关联**的那个 origin-request 版本必须带**每一把** site kid 的公钥
+   （缺 = 线上全员 302，部署的不是这份 config）；**不得**出现任何 console kid 的公钥
+   （spec §4.1）；**不得**出现 login-flow secret 的值（spec §11.3）。
 
 ## 红绿口径（两套，刻意不对称）
 
@@ -106,14 +113,18 @@ cookie 与 `scope=console` 的 `__Host-sb_console`（同一个 `/site-builder/jw
 **A（直接失守）**
 
 - `SimulatePrincipalPolicy` 对带 Condition 的策略需要调用方补 `ContextEntries`；
-  本脚本不补，于是那些判定是**下界**。逐项的不确定面记在 `coverage.undecided_items`
+  本脚本**只补 KMS 签名合同那两个键**（`kms:SigningAlgorithm` / `kms:MessageType`，
+  值由 spec §11.5 固定；不补的话平台自己那条必需的 `kms:Sign` 会判成"缺上下文"、
+  正向控制假红），其余一概不补，于是那些判定是**下界**。逐项的不确定面记在 `coverage.undecided_items`
   （成员级：同一个 principal 多出一项判不出的目标也会红；顶层的 `MissingContextValues`
   保守地归给该动作下每个非 allowed 的资源）。`principals_with_missing_context`
   那个笼统计数只报 delta、不参与红绿。
 - 动作等价类不是穷尽的。
-- 它只看 IAM、Lambda resource policy、以及 bootstrap 桶的 bucket policy，
-  不看 KMS grants、VPC endpoint policy、其它服务的 resource policy，
-  **也不看 S3 access point**。
+- 它看 IAM、Lambda resource policy、bootstrap 桶的 bucket policy、以及会话签名 CMK
+  的 key policy 与 grants；**不看** VPC endpoint policy、其它服务的 resource policy，
+  **也不看 S3 access point**。KMS 那一层只做**快照比对**（任一字段变化即红），
+  不做权限分析——"这条 grant 是否真的让某人能签"要的是 KMS 授权语义分析器，
+  与 B 层刻意不造 IAM 分析器同一条理由。
 - 它不看跨账号 principal（但语句里出现**外部账号**的 principal 会改变指纹 ⇒ 会红）。
 - 它看不见"临时建了一个角色用完就删"。
 
@@ -158,91 +169,105 @@ BASELINE_PATH = _HERE / "account_trust_baseline.json"
 CONFIG_PATH = _SITE_BUILDER / "config.ini"
 APP_PY = _SITE_BUILDER / "deployer" / "infra" / "app.py"
 
-BASELINE_SCHEMA = 5      # 3c-1B-G A6 复审：coverage 成员改成**可分解**形态（见 undecided_item）；4 = 3c-1A 的 facts.session_keys
-JWT_PARAM_NAME = "/site-builder/jwt-secret"
+# 6 = 3c-final：HS 层（SSM 参数 / Edge 产物里的明文密钥）整层换成 KMS 层。
+# **没有 3/4/5 → 6 的迁移通道**：旧形态里根本没有 KMS 分节可比，硬失败并让操作者删掉重生成
+# （基线含单账号实测、不随资产分发，采用者首跑就是 `--update-baseline`）。
+BASELINE_SCHEMA = 6
 DEPLOYER_EXEC_ROLE = "site-deployer-exec-role"
-# 3c-1A：[SessionKeys] 的唯一定义在 auth/session_keys.py；闸门按它枚举两把 HS family 密钥的参数名
+AUTH_SERVICE_ROLE = "site-auth-service-role"      # deploy_auth.py 建的执行角色名
+PANEL_DEPLOY_PY = _SITE_BUILDER / "panel" / "deploy_panel.py"
+SESSION_KMS_PY = _SITE_BUILDER / "auth" / "session_kms.py"
+# [SessionKeys] 的唯一定义在 auth/session_keys.py；闸门按它枚举两个 family 的 RS 行
+# （kid / key ARN / spki_sha256）。它只 import 标准库 ⇒ 模块级 import 是安全的。
+# **`session_kms` 刻意只在 `measure()` 里 import**：它 `import session`，那条链要 `cryptography`，
+# 而闸门跑在不带路径的 python3 上（CLAUDE.md「仓库外的几样东西」第 3 步只给它装了 boto3 与
+# pip-system-certs）。放在模块级会让 `--from-dump`、`--help`、标签校验与全部单测都跟着要那个包。
 sys.path.insert(0, str(_SITE_BUILDER / "auth"))
-from session_keys import FAMILIES as KEY_FAMILIES, load_session_keys  # noqa: E402
+from session_keys import FAMILIES as KEY_FAMILIES, key_refs, load_session_keys  # noqa: E402
 if str(_HERE) not in sys.path:          # 测试用 spec_from_file_location 加载本文件时，本目录不在 sys.path
     sys.path.insert(0, str(_HERE))
 from _secure_write import write_private_text  # noqa: E402
 
-# Edge 函数名：router 栈的两个 Lambda@Edge 里，**origin-request 那个**才内联着
-# 会话密钥（`stack.py` 把 `{{JWT_SECRET}}` 替换进它）。origin-response 不验签。
+
+def _module_constant(path: Path, name: str) -> str:
+    """按 AST 取某个模块级字符串常量。
+
+    **不 import**：那些模块顶层会 import boto3 / cryptography，而闸门跑在不带路径的 python3 上
+    （见上面的注释）。**也不手抄**：手抄的副本在对面改值时不会红，闸门会静静地测错东西
+    （`kms:Sign` 的 Condition 值对不上 ⇒ 平台自己的必需 grant 消失 ⇒ 正向控制假红）。
+    """
+    for node in ast.parse(path.read_text(encoding="utf-8")).body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and getattr(node.targets[0], "id", None) == name
+                and isinstance(node.value, ast.Constant)):
+            return node.value.value
+    raise SystemExit(f"{path} 里找不到模块级常量 {name}——它被改名或改成计算出来的了？"
+                     f"闸门靠它与对面保持同一份合同，拿不到就不能往下跑。")
+
+# Edge 函数名：router 栈的两个 Lambda@Edge 里，**origin-request 那个**才内联着 site family 的
+# 公钥 allowlist（`stack.py` 把 `{{SITE_ALLOWLIST_JSON}}` 替换进它）。origin-response 不验签。
 EDGE_ORIGIN_REQUEST_FN = "ApplicationWebRouterStack-application-web-router"
 EDGE_ORIGIN_RESPONSE_FN = "ApplicationWebRouterStack-origin-response"
 # **这两个必须手写**：它们属于 router 栈，而 `PLATFORM_FUNCTION_NAMES` 是
 # deployer 栈 `infra/app.py` 里的清单，结构上不可能含它们。漏掉的后果实测过一次
-# ——Edge 的 9 个已发布版本一个都没被枚举，于是「谁能读某个旧版本的 Edge 代码
-# （里面就是明文密钥）」「谁能 UpdateFunctionCode 换掉 Edge」两条完全在视野外。
+# ——Edge 的已发布版本一个都没被枚举，于是「谁能 UpdateFunctionCode 换掉 Edge」
+# （3c-final 之后这仍是一条冒充路：换掉 verifier 就等于自己定义谁是谁）完全在视野外。
 EDGE_FUNCTIONS = (EDGE_ORIGIN_REQUEST_FN, EDGE_ORIGIN_RESPONSE_FN)
-# 产物里密钥的形态：`JWT_SECRET = "<64 hex>"`。只用来**定位**，不打印取到的值。
-_SECRET_ASSIGN_RE = re.compile(r"""JWT_SECRET\s*=\s*["']([^"']*)["']""")
 
 # ---- grant 词表 ----------------------------------------------------------
 # grant 是 `种类[:资源]` 形态的字符串，进基线文件。改词表等于基线全量漂移。
 G_INVOKE_PLATFORM = "invoke-platform"      # + ":<函数名>"
 G_INVOKE_SITE = "invoke-site"              # + ":all" / ":some(k)"
 G_REPLACE_CODE = "replace-platform-code"   # + ":<函数名>"
-# 读密钥的三条路**必须分开记**：严重度与修法都不同。
-#  · read-edge-code：`lambda:GetFunction` 下载 Edge 产物，密钥是**明文**在
-#    `index.py` 里（Lambda@Edge 不支持环境变量，只能部署时字符串替换）。
-#    不经 KMS、不需 invoke。AWS 托管的 `ReadOnlyAccess` 就带这个动作。
-#  · read-edge-asset：同一份产物在 **CDK bootstrap S3 桶**里还有一份（asset）。
-#    每次 Edge 部署留一个新对象，旧对象不会被删 ⇒ 密钥不轮转的话，**历次**
-#    asset 都带着当前有效的密钥。桶策略只 Deny 非 TLS；对象用 `alias/aws/s3`，
-#    该托管键的策略是 `Principal:*` + `ViaService=s3` 的**直接授权**，所以
-#    identity policy 里的 `s3:GetObject` 单独就够。
-#  · read-jwt-param：`ssm:GetParameter` 读 SecureString。KMS 那道同样是虚的
-#    （`alias/aws/ssm` 的 key policy 是同一种直接授权形态）。
-G_READ_EDGE_CODE = "read-edge-code"
-G_READ_EDGE_ASSET = "read-edge-asset"
-G_READ_JWT_PARAM = "read-jwt-param"
-SECRET_GRANTS = (G_READ_EDGE_CODE, G_READ_EDGE_ASSET, G_READ_JWT_PARAM)
-# 3c-1A：两把 HS family 密钥各自一条 grant `read-session-key:<kid>`，**不与 legacy 合并**——
-# 「谁能读 site 的 key」与「谁能读 console 的 key」分得开，是 spec §4.1 两个 family 的全部意义。
-G_READ_SESSION_KEY = "read-session-key"
+# 能签会话的两条路**必须分开记**（spec §1 的 `sign:kms-direct` / `sign:kms-self-authorize`）：
+#  · kms-sign:<kid>            —— identity policy 上就有 `kms:Sign` on 这把 CMK。key policy 是
+#    默认的 root 委派（ADR 0001），所以 identity 那一侧允许就是真的能签。
+#  · kms-self-authorize:<kid>  —— `kms:PutKeyPolicy` 或 `kms:CreateGrant`：现在不能签，
+#    但能先给自己授权再签。严重度与修法都与上一条不同（前者是收权限，后者是改 key 的治理），
+#    合成一条就看不出"今天能签的人"与"随时能让自己能签的人"是两批。
+G_KMS_SIGN = "kms-sign"                      # + ":<kid>"
+G_KMS_SELF_AUTHORIZE = "kms-self-authorize"  # + ":<kid>"
+# `kms:GetPublicKey` **刻意不是 grant**：公钥按定义是公开的（Edge 产物里就内联着它），
+# 读到它签不出任何东西。把它记成 grant 会让冒充面的数字凭空变大。
 # 3c-1B：登录流程的 HMAC 密钥（auth 私有，签 OAuth state 与 __Host-sb_pkce cookie）。
-# **刻意不是 SECRET_GRANTS 的成员、is_secret_grant() 对它返回 False**：读到它只能伪造
-# 一次登录 CSRF（state 与 cookie 都只活 300 秒），**签不出任何会话**——把它算进冒充面
-# 会让那个数字凭空变大，而"冒充面"这个词在 docs/security/account-trust-boundary.md 里
-# 有精确含义（能以任意用户身份访问任意站点与控制台写接口）。分类错的代价是双向的：
-# 算进去会稀释真正的靶子，漏掉一条真能签会话的路才是漏报。
+# **刻意不算冒充面、is_secret_grant() 对它返回 False**：读到它只能伪造一次登录 CSRF
+# （state 与 cookie 都只活 300 秒），**签不出任何会话**——把它算进冒充面会让那个数字凭空
+# 变大，而"冒充面"这个词在 docs/security/account-trust-boundary.md 里有精确含义（能以任意
+# 用户身份访问任意站点与控制台写接口）。分类错的代价是双向的：算进去会稀释真正的靶子，
+# 漏掉一条真能签会话的路才是漏报。
 G_READ_LOGIN_FLOW = "read-login-flow-secret"
 
 
 def is_secret_grant(grant: str) -> bool:
-    """能直接取得某把**会话签名**密钥的 grant（legacy 三条路 + 每 kid 一条）。
+    """能产生一个 verifier 会接受的签名的 grant（3c-final：只有 KMS 两类）。
 
-    `read-login-flow-secret` **不在其中**，理由见 G_READ_LOGIN_FLOW 的注释。
+    读 SSM / 读 Edge 产物 / 读 bootstrap asset **都不再算**：那里只剩公钥与 login-flow。
+    `read-login-flow-secret` 同样不在其中，理由见 G_READ_LOGIN_FLOW 的注释。
     """
-    return grant in SECRET_GRANTS or grant.startswith(G_READ_SESSION_KEY + ":")
+    return (grant.startswith(G_KMS_SIGN + ":")
+            or grant.startswith(G_KMS_SELF_AUTHORIZE + ":"))
 
 
 # ---- 迁移声明的标签 ----------------------------------------------------------
-# `--new-key LABEL` / `--retire-key LABEL` 的 LABEL ∈ 已配置 kid ∪ {legacy, login-flow}。
-LABEL_LEGACY = "legacy"
+# `--new-key LABEL` / `--retire-key LABEL` 的 LABEL ∈ 已配置 kid ∪ {login-flow}。
+# `legacy` 这个标签随 HS 层一起消失了（3c-final 没有 legacy 入口）。
 LABEL_LOGIN_FLOW = "login-flow"
-NON_KID_LABELS = (LABEL_LEGACY, LABEL_LOGIN_FLOW)
+NON_KID_LABELS = (LABEL_LOGIN_FLOW,)
 
 
 def grants_for_labels(labels) -> set:
     """LABEL 集合 → 它们对应的 grant 字符串集合。
 
-    `legacy` 映到 `read-jwt-param` 一条而**不含** `read-edge-code` / `read-edge-asset`：
-    后两条说的是"谁能读 Edge 产物"，L3（清空 legacy_param）不改变那件事——它只让
-    auth/panel 的角色 SSM 清单不再含 legacy 参数。把三条一起放进来会让一次声明顺手
-    放行两条与本次迁移无关的丢失。
+    一个 kid 映到**两条** grant（`kms-sign:` 与 `kms-self-authorize:`）：新建/退役一把 CMK
+    时，同一批"能对 `key/*` 做这些动作"的 principal 两条 grant 会同时增减，只声明一条会让
+    另一条照红，而那不是本次迁移之外的任何信息。
     """
     out: set = set()
     for label in labels:
-        if label == LABEL_LEGACY:
-            out.add(G_READ_JWT_PARAM)
-        elif label == LABEL_LOGIN_FLOW:
+        if label == LABEL_LOGIN_FLOW:
             out.add(G_READ_LOGIN_FLOW)
         else:
-            out.add(f"{G_READ_SESSION_KEY}:{label}")
+            out |= {f"{G_KMS_SIGN}:{label}", f"{G_KMS_SELF_AUTHORIZE}:{label}"}
     return out
 
 
@@ -255,13 +280,8 @@ def classes_for_labels(labels, t: "Targets | None" = None) -> frozenset:
     """
     out = set()
     for label in labels:
-        if label == LABEL_LEGACY:
-            out.add("jwt-param")
-        elif label == LABEL_LOGIN_FLOW:
-            out.add("login-flow-param")
-        else:
-            out.add(f"session-key:{label}")
-    del t          # 目前不需要实例；留参数是为了将来 RS/KMS 类要按 targets 推导
+        out.add("login-flow-param" if label == LABEL_LOGIN_FLOW else f"kms-key:{label}")
+    del t          # 目前不需要实例；留参数是为了将来按 targets 推导
     return frozenset(out)
 
 
@@ -272,24 +292,24 @@ def configured_kids(session_keys) -> list:
 
 
 def baseline_kids(baseline: dict) -> list:
-    """**基线**里记过的 kid（`facts.session_keys` 的键）。
+    """**基线**里记过的 kid（`kms` 分节的键）。
 
     `--retire-key <kid>` 必须认这一处，否则退役那一步无法执行：退役的动作正是"把 kid 从
     config 里删掉再重部"，而 grant 的丢失只有重部之后才出现 ⇒ 到能声明的时刻，
-    `configured_kids()` 已经不含它了（DEPLOY.md 十步 runbook 的第 ⑩ 步）。基线是那把 key
-    "曾经存在过"的唯一记录，且它同样是被版本控制的、不能随手编，所以拿它当第二个来源
-    不会放松"标签打错一个字就硬失败"这条守卫——`site-hs-v9` 两处都不在，照样退出。
+    `configured_kids()` 已经不含它了（DEPLOY.md 轮转 runbook 的最后一步）。基线是那把 key
+    "曾经存在过"的唯一记录，且它同样不能随手编，所以拿它当第二个来源不会放松"标签打错一个
+    字就硬失败"这条守卫——`site-rs-v9` 两处都不在，照样退出。
     """
-    return sorted((baseline.get("facts") or {}).get("session_keys") or {})
+    return sorted(baseline.get("kms") or {})
 
 
 def check_migration_labels(labels, *, known_kids) -> None:
-    """LABEL 必须是 `known_kids` 里的 kid 或两个非 kid 标签之一，否则**硬失败**。
+    """LABEL 必须是 `known_kids` 里的 kid 或非 kid 标签之一，否则**硬失败**。
 
     `known_kids` = config 里配置着的 kid **∪** 基线里记过的 kid（`baseline_kids`）。后半个
     并集是退役那一步必需的，理由见 `baseline_kids` 的 docstring。
 
-    不校验的后果很隐蔽：`--retire-key site-hs-v9`（打错一个字）会被静默接受，
+    不校验的后果很隐蔽：`--retire-key site-rs-v9`（打错一个字）会被静默接受，
     生成一条永不匹配的 grant，于是操作者以为已经声明、闸门照样红，或者更糟——
     以为声明生效而实际红的是别的东西。
     """
@@ -299,34 +319,41 @@ def check_migration_labels(labels, *, known_kids) -> None:
             f"--new-key/--retire-key 的标签 {unknown} 不是已配置的 kid（config ∪ 基线两处都没有），"
             f"也不是 {list(NON_KID_LABELS)}。可用 kid：{sorted(set(known_kids))}")
 
-# **IAM 写不再是 A 的一条 grant。** 它移到 B——那一层是纯静态文本快照，明确不声称
-# 提权链。这个前缀只为 schema 2→3 迁移保留：旧基线里 22 个 principal 带着
-# `iam-policy-write:{any,scoped,condition-gated}`，迁移要能识别并剥掉它们。
-# A 的 grant 生成路径不再产生它（`test_no_grant_path_produces_iam_policy_write`）。
-LEGACY_IAM_POLICY_WRITE_PREFIX = "iam-policy-write"
 
 # ---- 动作等价类 ----------------------------------------------------------
 # **一种能力 = 一个动作等价类 × 一个资源等价类。** 这个形状是本文件最重要的
 # 不变量，因为把它压成"单个动作/单个资源"这个错误已经犯过三次：
 #   · 首版只探未限定函数 ARN ⇒ 挂在 blue alias 上的授权全看不见（M7 之后站点
 #     的 Function URL 都在 alias 上）；
-#   · 首版只探当前那一个 CDK asset ⇒ 带同一把活密钥的 9 个历史对象看不见；
+#   · 首版只探当前那一个 CDK asset ⇒（HS 时代）带同一把活密钥的那批历史对象看不见；
 #   · 首版只探 `ssm:GetParameter` ⇒ 一个**只**被授予 `ssm:GetParameters`
 #     （复数）的角色被整个漏掉（2026-08-25 实测，它没有 boundary，
-#     `WithDecryption=true` 即可读出当前密钥）。
+#     `WithDecryption=true` 即可读出当前值）。
 # 往任一类里加动作/资源时，同时加一条只命中该新成员的用例。
 A_INVOKE = ("lambda:InvokeFunction",)
 A_REPLACE = ("lambda:UpdateFunctionCode",)
-# 下载产物：`GetFunction` 返回代码的预签名 URL。`GetFunctionConfiguration`
-# 不返回代码，所以不在类里。
-A_READ_CODE = ("lambda:GetFunction",)
-# 桶开着版本控制（noncurrent 保留 30 天），而 `GetObjectVersion` 是**另一个**
-# 动作 ⇒ 对象被删之后旧版本仍可按 version ID 读到。
-A_READ_OBJECT = ("s3:GetObject", "s3:GetObjectVersion")
 # 四个动作都能读出同一个 SecureString 的明文；AWS 明确警告
 # `GetParameterHistory` 在拒绝 `GetParameter` 时仍可能读到当前值。
+# 3c-final 起 SSM 里只剩 login-flow secret 这一个目标（会话密钥全在 KMS）。
 A_READ_PARAM = ("ssm:GetParameter", "ssm:GetParameters",
                 "ssm:GetParametersByPath", "ssm:GetParameterHistory")
+# 3c-final：签名能力（spec §1 的 sign:kms-direct / sign:kms-self-authorize）。key policy 是
+# 默认的 root 委派（ADR 0001），所以 identity policy 上的 `kms:Sign` 就是能签；
+# `PutKeyPolicy` / `CreateGrant` 是"先给自己授权再签"。
+# **`kms:GetPublicKey` 刻意不在任何类里**：公钥是公开的，读到它签不出东西。
+A_KMS_SIGN = ("kms:Sign",)
+A_KMS_SELF_AUTHORIZE = ("kms:PutKeyPolicy", "kms:CreateGrant")
+# 模拟 `kms:Sign` 时喂给 Condition 的上下文：auth / panel 的语句带 SigningAlgorithm 与
+# MessageType 两个 StringEquals（deploy_auth / deploy_panel 把 spec §11.5 的合同钉进 IAM）。
+# 不给上下文时模拟器判"缺上下文"⇒ 平台角色的必需 grant 会从结果里消失、正向控制假红。
+KMS_SIGNING_ALGORITHM = _module_constant(SESSION_KMS_PY, "SIGNING_ALGORITHM")
+KMS_MESSAGE_TYPE = _module_constant(SESSION_KMS_PY, "MESSAGE_TYPE")
+KMS_CONTEXT = [{"ContextKeyName": "kms:SigningAlgorithm",
+                "ContextKeyValues": [KMS_SIGNING_ALGORITHM],
+                "ContextKeyType": "string"},
+               {"ContextKeyName": "kms:MessageType",
+                "ContextKeyValues": [KMS_MESSAGE_TYPE],
+                "ContextKeyType": "string"}]
 # IAM 策略变更动作。**这一类不进模拟器**——它只用来判"哪些语句进 B 的静态快照"。
 #
 # 原先这里走的是"静态解析发现候选 → 模拟器对具体 ARN 确认 → 三值分类"两步。已删除：
@@ -358,12 +385,17 @@ REQUIRED_GRANT_PREFIXES = {
     # blue/green 健康门是**带 Qualifier** 的直调，所以这里锁 alias 那一类，
     # 不是"任意 invoke-site"——收窄只砍掉 alias 授权时前者才会红。
     "deployer": (f"{G_INVOKE_SITE}{Q_ALIAS}:",),
+    # 3c-final：签名侧的两条正向控制。auth 签站点会话与控制台升级码/会话 ⇒ 两个 family 都要；
+    # panel 只签 console family（spec §4.3：拿到 site 的 key 等于 panel 被攻破就能伪造站点会话）。
+    # 丢了的真机症状是「全平台登录 500」与「面板会话签不出来」，两者都不会在任何单测里出现。
+    "auth": (f"{G_KMS_SIGN}:site-", f"{G_KMS_SIGN}:console-"),
+    "panel": (f"{G_KMS_SIGN}:console-",),
 }
 
 # 两次 simulate 调用的动作分组：函数类资源一组，其余一组。分开是为了不产生
 # 大量无意义的 (动作, 资源) 组合——一次调用的响应体是资源数 × 动作数。
-ACTIONS_FUNCTION = A_INVOKE + A_REPLACE + A_READ_CODE
-ACTIONS_OTHER = A_READ_OBJECT + A_READ_PARAM
+ACTIONS_FUNCTION = A_INVOKE + A_REPLACE
+ACTIONS_OTHER = A_READ_PARAM + A_KMS_SIGN + A_KMS_SELF_AUTHORIZE
 ACTIONS = ACTIONS_FUNCTION + ACTIONS_OTHER
 
 
@@ -442,27 +474,21 @@ class Targets:
     - `alias_arns` / `version_arns`：未限定 ARN → 它的 alias / 版本 ARN。
       M7 之后站点的 Function URL 与授权语句都挂在 `blue` 上，且 AWS 支持把
       permission 限定到具体 version ⇒ 只探未限定 ARN 等于看一个空集。
-    - `edge_code_arns`：Edge 函数**及其每个仍含活密钥的已发布版本**。
-    - `edge_assets`：CDK bootstrap 桶里**全部**仍含活密钥的对象（实测 9 个，
-      因为旧 asset 不删而密钥从未轮转）。空元组表示已根治，此时不产生
-      `read-edge-asset`——闸门因此是在测事实，不是复读写死的假设。
+    - `kms_keys`：kid → 会话签名 CMK 的 key ARN（两个 family 的全部 RS 行）。3c-final 起
+      "谁能签会话"这个问题的目标集合就是它；密钥的明文副本不再存在，所以没有
+      Edge 产物 / bootstrap asset / SSM 那三类目标了。
     """
     platform_functions: tuple[str, ...]
     site_functions: tuple[str, ...]
-    edge_code_arns: tuple[str, ...]
-    edge_assets: tuple[str, ...]
-    jwt_parameter: str
+    kms_keys: dict[str, str] = field(default_factory=dict)
     alias_arns: dict[str, tuple[str, ...]] = field(default_factory=dict)
     version_arns: dict[str, tuple[str, ...]] = field(default_factory=dict)
-    # 3c-1A：kid → 该 family HS 密钥的 SSM 参数 ARN（legacy 仍在 jwt_parameter）
-    session_key_parameters: dict[str, str] = field(default_factory=dict)
     # 3c-1B：auth 私有的 login-flow secret 的 SSM 参数 ARN。空串 = 不追踪。
     # 它进模拟目标（"谁能读它"是要记的事实），但它的 grant **不算冒充面**——见 G_READ_LOGIN_FLOW。
     login_flow_parameter: str = ""
 
     def function_resources(self) -> list[str]:
         out = list(self.platform_functions) + list(self.site_functions)
-        out.extend(self.edge_code_arns)
         for mapping in (self.alias_arns, self.version_arns):
             for arns in mapping.values():
                 out.extend(arns)
@@ -470,8 +496,7 @@ class Targets:
 
     def other_resources(self) -> list[str]:
         extra = {self.login_flow_parameter} if self.login_flow_parameter else set()
-        return sorted(set(self.edge_assets) | {self.jwt_parameter}
-                      | set(self.session_key_parameters.values()) | extra)
+        return sorted(set(self.kms_keys.values()) | extra)
 
 
 # 动作 → 动作等价类名。coverage 的成员指纹按**类**记，不按单个动作
@@ -479,9 +504,9 @@ class Targets:
 ACTION_CLASS_NAMES = {
     **{a: "invoke" for a in A_INVOKE},
     **{a: "replace-code" for a in A_REPLACE},
-    **{a: "read-code" for a in A_READ_CODE},
-    **{a: "read-object" for a in A_READ_OBJECT},
     **{a: "read-param" for a in A_READ_PARAM},
+    **{a: "kms-sign" for a in A_KMS_SIGN},
+    **{a: "kms-self-authorize" for a in A_KMS_SELF_AUTHORIZE},
 }
 
 
@@ -569,14 +594,6 @@ def undecided_members(principal_arn: str, pairs, t: "Targets") -> set[str]:
             for cls, classes in _undecided_by_action(pairs, t).items() if classes}
 
 
-def undecided_members_v4(principal_arn: str, pairs, t: "Targets") -> set[str]:
-    """schema 4 的成员形态（不可分解的哈希）。**只为一次性迁移保留**：基线还是 schema 4 时，
-    比较器拿它与旧基线比，让迁移那一跑仍然看得见 coverage 漂移而不是盲写。基线转成 schema 5
-    后它不再被读，连同 `undecided_item_fp` 与 bundle 里的 `schema4_fingerprints` 归 3c-3 删。"""
-    return {undecided_item_fp(principal_arn, cls, "|".join(sorted(classes)))
-            for cls, classes in _undecided_by_action(pairs, t).items() if classes}
-
-
 def undecided_resource_class(resource: str, t: "Targets") -> str:
     """资源 → **稳定**的资源类名。
 
@@ -588,17 +605,11 @@ def undecided_resource_class(resource: str, t: "Targets") -> str:
     """
     if not resource:
         return "unattributed"
-    if resource == t.jwt_parameter:
-        return "jwt-param"
     if t.login_flow_parameter and resource == t.login_flow_parameter:
         return "login-flow-param"
-    for kid, arn in t.session_key_parameters.items():
+    for kid, arn in t.kms_keys.items():
         if resource == arn:
-            return f"session-key:{kid}"
-    if resource in t.edge_assets:
-        return "edge-asset"
-    if resource in t.edge_code_arns:
-        return "edge-code"
+            return f"kms-key:{kid}"
     parts = resource.split(":")
     if len(parts) >= 7 and parts[2] == "lambda":
         name = parts[6]
@@ -610,16 +621,9 @@ def undecided_resource_class(resource: str, t: "Targets") -> str:
     return "other"
 
 
-def undecided_item_fp(principal_arn: str, action_class: str, resource_class: str) -> str:
-    """**schema 4** 的成员指纹 = hash(principal, 动作等价类, 资源类集合)。不可分解 ⇒ 退役声明
-    无法归一（见 `undecided_members`）。只在 `undecided_members_v4` 里还用，归 3c-3 删。"""
-    return principal_fingerprint(
-        f"undecided:{principal_arn}|{action_class}|{resource_class}")
-
-
 _PFP_RE = re.compile(r"[0-9a-f]{4}(?:-[0-9a-f]{4}){3}")
 # 可分解成员：`<principal 指纹>|<动作等价类>|<资源类>[,<资源类>…]`。资源类名里不许有 `|` `,` 与空白
-# （`fn:<函数名>` / `session-key:<kid>` 都满足：Lambda 函数名与 KID_RE 都不含这三种字符）。
+# （`fn:<函数名>` / `kms-key:<kid>` 都满足：Lambda 函数名与 KID_RE 都不含这三种字符）。
 UNDECIDED_ITEM_RE = re.compile(
     rf"{_PFP_RE.pattern}\|[a-z][a-z-]*\|[^|,\s]+(?:,[^|,\s]+)*")
 
@@ -629,7 +633,7 @@ def undecided_item(principal_arn: str, action_class: str, classes) -> str:
 
     三段都不是账号值：principal 只进指纹（与 `principals` 分节同一种指纹）；动作等价类是
     `ACTION_CLASS_NAMES` 的值；资源类是 `undecided_resource_class` 的输出（`sites` /
-    `jwt-param` / `session-key:<kid>` / `fn:<平台函数名>` …，平台函数名本来就在 app.py 里）。
+    `kms-key:<kid>` / `login-flow-param` / `fn:<平台函数名>` …，平台函数名本来就在 app.py 里）。
     可分解 ⇒ 基线侧也能剔类（A6 的退役反事实非它不可）。
     """
     return f"{principal_fingerprint(principal_arn)}|{action_class}|{','.join(sorted(classes))}"
@@ -652,21 +656,6 @@ def normalize_undecided_items(items, ignore_classes: frozenset) -> set[str]:
         if rest:
             out.add(f"{pfp}|{cls}|{','.join(sorted(rest))}")
     return out
-
-
-def coverage_form(items) -> str:
-    """基线里 coverage 成员的形态：`"v5"`（可分解）或 `"v4"`（schema 4 的哈希）。**混杂即拒**——
-    半份可分解半份哈希的基线只能是手改或迁移中断的产物，比出来的结论两半口径不同。"""
-    items = list(items or [])
-    v5 = sum(1 for x in items if isinstance(x, str) and UNDECIDED_ITEM_RE.fullmatch(x))
-    v4 = sum(1 for x in items if isinstance(x, str) and _PFP_RE.fullmatch(x))
-    if v5 == len(items):
-        return "v5"
-    if v4 == len(items):
-        return "v4"
-    raise SystemExit(
-        f"基线的 coverage.undecided_items 形态混杂（可分解 {v5} / 哈希 {v4} / 共 {len(items)}）"
-        "——不是任何一次 --update-baseline 会写出的东西，先查基线文件再比。")
 
 
 def _fn_name(arn: str) -> str:
@@ -719,15 +708,11 @@ def grants_from_decisions(decisions: dict[str, str], t: Targets) -> set[str]:
                 grants.add(f"{G_INVOKE_SITE}{qual}:some({len(members)}):"
                            f"{principal_fingerprint('sites:' + ','.join(members))}")
 
-    if t.edge_code_arns and allowed(A_READ_CODE, t.edge_code_arns):
-        grants.add(G_READ_EDGE_CODE)
-    if t.edge_assets and allowed(A_READ_OBJECT, t.edge_assets):
-        grants.add(G_READ_EDGE_ASSET)
-    if allowed(A_READ_PARAM, (t.jwt_parameter,)):
-        grants.add(G_READ_JWT_PARAM)
-    for kid, arn in t.session_key_parameters.items():
-        if allowed(A_READ_PARAM, (arn,)):
-            grants.add(f"{G_READ_SESSION_KEY}:{kid}")
+    for kid, arn in t.kms_keys.items():
+        if allowed(A_KMS_SIGN, (arn,)):
+            grants.add(f"{G_KMS_SIGN}:{kid}")
+        if allowed(A_KMS_SELF_AUTHORIZE, (arn,)):
+            grants.add(f"{G_KMS_SELF_AUTHORIZE}:{kid}")
     if t.login_flow_parameter and allowed(A_READ_PARAM, (t.login_flow_parameter,)):
         grants.add(G_READ_LOGIN_FLOW)
     return grants
@@ -1034,7 +1019,7 @@ RED_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("new_undecided_items",  "新增判不出的项（红）",                          "undecided"),
     ("iam_write_drift",      "IAM 写语句快照漂移（红）",                      "iam"),
     ("boundary_drift",       "permissions boundary 漂移（红）",               "iam"),
-    ("console_key_in_edge",  "Edge 产物含 console family 的密钥（红）",       "console-in-edge"),
+    ("kms_drift",            "KMS 层漂移（key policy / grants / 公钥 / key 集合）（红）", "kms"),
 )
 GREEN_FIELDS: tuple[tuple[str, str], ...] = (
     ("unclassified", "基线里未分类（请标注 category）"),
@@ -1046,17 +1031,17 @@ GREEN_FIELDS: tuple[tuple[str, str], ...] = (
 # 每个红字段都要有一条**处置**文案：闸门红了但不说该怎么办，等于把判断推给下一个人，
 # 而最省力的"处置"永远是更新基线。
 RED_MESSAGES = {
-    "console-in-edge": ("闸门红：Edge 的产物（代码版本或 bootstrap asset）里测到了 console family 的密钥。"
-                        "spec §4.1：Edge 的 allowlist 里不出现 console 的 key，否则 panel signer 被攻破 ⇒ "
-                        "伪造站点会话。先查 router/infrastructure/stack.py 的 load_site_allowlist 只取 site family。"),
+    "kms": ("闸门红：会话签名 CMK 的 key policy、grants、公钥或 key 集合变了。默认 key policy"
+            "（ADR 0001）下能改它的人本来就在冒充面里，但**变了**就要有人看：新 grant = 多了"
+            "能签会话的 principal；key 集合变化必须用 --new-key / --retire-key 声明。"),
     "grew": ("闸门红：账号里能冒充任意用户的授权面**变大了**。这不是又出了一个新缺陷，"
              "而是既有暴露面扩张。处理方式见 docs/security/account-trust-boundary.md。"),
     "lost": ("闸门红：平台自己的必需 invoke 权限丢了。真机症状是全站 403（Edge）或每次"
              "部署在健康门失败（deployer）——**先确认是不是刚做过一次收窄**，别去查网络。"),
-    "bucket": ("闸门红：CDK bootstrap 桶的 bucket policy 变了。这个桶里有 9 个仍带活密钥的 "
-               "asset，而 SimulatePrincipalPolicy **不看** bucket policy（对 role 更是不支持"
+    "bucket": ("闸门红：CDK bootstrap 桶的 bucket policy 变了。Edge 的部署产物就在这个桶里，"
+               "而 SimulatePrincipalPolicy **不看** bucket policy（对 role 更是不支持"
                "模拟 resource policy）⇒ 这条通道只有这份快照能咬住。新增 Allow = 多了能读"
-               "签名密钥的人；丢掉那条 TLS Deny 同样是扩权。上面每条都打了归一化语句原文。"),
+               "Edge 产物的人；丢掉那条 TLS Deny 同样是扩权。上面每条都打了归一化语句原文。"),
     "undecided": ("闸门红：判不出的 (principal, 动作类, 资源) 项变多了。这**不等于**有人拿到"
                   "了新权限，但**闸门对这一块的答案退化成了下界**——先看新增那几项对应哪条 "
                   "Condition（`--dump-observed` 看带真实名字的快照），再决定是补 "
@@ -1081,7 +1066,7 @@ class Report:
     new_undecided_items: list[str] = field(default_factory=list)
     iam_write_drift: list[str] = field(default_factory=list)
     boundary_drift: list[str] = field(default_factory=list)
-    console_key_in_edge: list[str] = field(default_factory=list)
+    kms_drift: list[str] = field(default_factory=list)
     migration_grants: list[str] = field(default_factory=list)
     migration_undecided: list[str] = field(default_factory=list)
     improvements: list[str] = field(default_factory=list)
@@ -1110,18 +1095,19 @@ def compare_to_baseline(observed: dict[str, dict], baseline: dict, *,
                         facts: dict | None = None,
                         coverage: dict | None = None,
                         iam_write: dict | None = None,
+                        kms: dict | None = None,
                         new_keys: tuple = (),
                         retired_keys: tuple = ()) -> Report:
     """observed = {fingerprint: {"name", "arn", "grants"}}。
 
     `new_keys` / `retired_keys`：操作者用 `--new-key` / `--retire-key` 显式声明的标签
-    （LABEL ∈ 已配置 kid ∪ {legacy, login-flow}，`--new-kid` 是 `--new-key` 的别名）。
+    （LABEL ∈ 已配置 kid ∪ {login-flow}，`--new-kid` 是 `--new-key` 的别名）。
     两个桶**互为镜像**，替代"看到红之后人工 --update-baseline"（1A 首跑就是那么放的，
     于是"当时为什么绿"只存在于 progress 里）：
 
-    - **新增桶**：被声明的那条 grant 在**此前已能读某把会话密钥**的 principal 上不算扩权
-      （同一批 SSM 前缀/通配授权自然覆盖新参数），单列进 migration_grants；在此前**不能**
-      读密钥的 principal 上仍是红——那是真扩权。未声明的一律红。
+    - **新增桶**：被声明的那条 grant 在**此前已能签某把会话密钥**的 principal 上不算扩权
+      （同一批 `kms:*` on `key/*` 的授权自然覆盖新 CMK），单列进 migration_grants；在此前
+      **不能**签的 principal 上仍是红——那是真扩权。未声明的一律红。
     - **退役桶**：platform 类 principal **丢掉**被声明的那条 grant 计入 migration_grants
       而不红；同一轮丢的其它 grant 照样红（`missing_required`）。非 platform 类的丢失
       仍按"改善"处理，与声明无关。
@@ -1154,8 +1140,8 @@ def compare_to_baseline(observed: dict[str, dict], baseline: dict, *,
         if gained:
             # **前置条件"这个 principal 原本就能读到某把会话密钥"是刻意的，别按"改成看被声明的
             # grant 类"去放宽**（3c-1B-G A6 复核；两轮 review 都提过这条，结论是不改）：
-            # 声明的语义是"我新建了一把 key，能读**同一批**参数的人自然多读到它一把"——
-            # 那是良性的。而一个**原先读不到任何会话密钥**的 principal 现在能读到了，
+            # 声明的语义是"我新建了一把 key，能对**同一批**资源做这些动作的人自然多一把可签"——
+            # 那是良性的。而一个**原先签不出任何会话**的 principal 现在能签了，
             # 那是**能力面真的变大**，不该被一句 `--new-key` 抹掉，必须红、必须人看。
             # 两条既有用例把这个意图钉住了：`…without_prior_secret_read_stays_red` 与
             # `…could_not_read_any_key_stays_red`。
@@ -1211,16 +1197,48 @@ def compare_to_baseline(observed: dict[str, dict], baseline: dict, *,
     if coverage is not None:
         _compare_coverage(rep, (baseline.get("coverage") or {}).get("undecided_items"),
                           coverage.get("undecided_items"),
-                          now_v4=coverage.get("schema4_fingerprints"),
                           declared_labels=tuple(new_keys) + tuple(retired_keys))
 
     if iam_write is not None:
         # 第二个实参是整个 baseline：B 的三个分节都在基线顶层。
         _compare_iam_write(rep, baseline, iam_write)
 
+    if kms is not None:
+        _compare_kms(rep, baseline.get("kms") or {}, kms,
+                     new_keys=tuple(new_keys), retired_keys=tuple(retired_keys))
+
     _compare_facts(rep, baseline.get("facts") or {}, facts)
-    _check_console_key_not_in_edge(rep, facts)
     return rep
+
+
+def _compare_kms(rep: Report, base: dict, now: dict, *, new_keys: tuple,
+                 retired_keys: tuple) -> None:
+    """KMS 层：会话签名 CMK 自己的快照。**任一字段变化都红，不判方向。**
+
+    与 B 层同一条纪律（只报变化、不做权限分析）：判断"这条新 grant 是否真的让某人能签"
+    需要一个 KMS 授权语义分析器，而那正是本闸门被反复点名的根因。
+
+    key 集合的增减必须**声明**（`--new-key` / `--retire-key`）才落绿桶：轮转期新 key 就位、
+    旧 key 退役都是计划内的，而"多出一把没人声明的会话签名 CMK"是要有人看的事。
+    """
+    for kid in sorted(set(base) | set(now)):
+        if kid not in base:
+            (rep.migration_grants if kid in new_keys else rep.kms_drift).append(
+                f"kms {kid}：新出现"
+                + ("（--new-key 已声明）" if kid in new_keys else "——未声明的新 key"))
+            continue
+        if kid not in now:
+            (rep.migration_grants if kid in retired_keys else rep.kms_drift).append(
+                f"kms {kid}：消失"
+                + ("（--retire-key 已声明）" if kid in retired_keys else "——未声明的 key 退场"))
+            continue
+        for k in ("arn_fp", "key_policy_fp", "key_spec", "key_usage", "spki_sha256"):
+            if base[kid].get(k) != now[kid].get(k):
+                rep.kms_drift.append(f"kms {kid}：{k} 变了")
+        if sorted(base[kid].get("grants", [])) != sorted(now[kid].get("grants", [])):
+            rep.kms_drift.append(
+                f"kms {kid}：grants 从 {len(base[kid].get('grants', []))} 条变成 "
+                f"{len(now[kid].get('grants', []))} 条")
 
 
 def _compare_iam_write(rep: Report, base: dict, now: dict) -> None:
@@ -1277,12 +1295,12 @@ def _compare_iam_write(rep: Report, base: dict, now: dict) -> None:
 
 
 def _compare_coverage(rep: Report, base_items, now_items, *,
-                      now_v4=None, declared_labels: tuple = ()) -> None:
+                      declared_labels: tuple = ()) -> None:
     """判不出的项按**成员**比：**新成员红、消失算改善、数量只作文档摘要。**
 
     成员是 `(principal, 动作等价类, 资源类集合)`（可分解形态，`undecided_item`）。按 principal
-    集合比会漏掉这个反例：P 原本只对 site-a 的 Invoke 判不出，后来对 jwt-secret 的
-    `GetParameters` 也判不出 —— 前后都是 `{P}` ⇒ 绿，而新增的**密钥读取**不确定面没被发现。
+    集合比会漏掉这个反例：P 原本只对 site-a 的 Invoke 判不出，后来对某把会话 CMK 的
+    `kms:Sign` 也判不出 —— 前后都是 `{P}` ⇒ 绿，而新增的**签名**不确定面没被发现。
 
     **被声明 key 引起的 churn**（3c-1B-G A6；复审 P1-1 改成两侧归一化）：资源类集合整体进成员，
     所以一把 key 的增减会让每个受影响 principal 的成员换值（旧的消失 + 新的出现）。判据：把被
@@ -1290,46 +1308,27 @@ def _compare_coverage(rep: Report, base_items, now_items, *,
     的 key 解释，整批记进 `migration_undecided`（绿）；**剔掉之后仍多出来的成员照红**。两侧都剔
     才同时覆盖新增（类只在本次有）、退役（类只在基线有）与二者同轮发生；旧实现只在本次观测上剔
     （"反事实"快照），退役声明过也照样红。
-
-    基线还是 schema 4 的哈希形态时（一次性迁移那一跑）：与 `now_v4` 比，声明**不吸收**（哈希
-    剔不掉类）。那一跑是 `--update-baseline --migrate-from-schema 4`：churn 在报告里显示出来，
-    然后以可分解形态写进新基线。
     """
     was, now = set(base_items or []), set(now_items or [])
-    if coverage_form(was) == "v4":
-        if now_v4 is None:
-            raise SystemExit(
-                "基线的 coverage 还是 schema 4 的哈希形态，而这份观测没有 schema4_fingerprints"
-                "——两种形态比不了。走实测路径（不要用旧快照）：--update-baseline --migrate-from-schema 4。")
-        now = set(now_v4)
-        rep.notes.append(
-            "coverage：基线是 schema 4 的哈希形态，本次按旧形态比较；--update-baseline 会以"
-            "可分解形态重写，之后 --new-key/--retire-key 才能吸收 coverage churn")
-        if declared_labels:
+    gained, gone = now - was, was - now
+    if declared_labels and (gained or gone):
+        ignore = classes_for_labels(declared_labels, None)
+        was_n = normalize_undecided_items(was, ignore)
+        now_n = normalize_undecided_items(now, ignore)
+        gained_n, gone_n = now_n - was_n, was_n - now_n
+        explained = (len(gained) - len(gained_n), len(gone) - len(gone_n))
+        if explained != (0, 0):
+            # 措辞按事实分两档（复审二轮）：只有归一化后**两个方向都没有**剩余差异才说"相等"；
+            # 否则只说解释了多少，剩余差异按下面的常规红绿处理（新成员红、消失算改善）。
+            tail = ("两侧剔掉其资源类后归一化**相等**" if not (gained_n or gone_n) else
+                    f"归一化后仍有 {len(gained_n)} 项新成员 / {len(gone_n)} 项消失，按常规红绿处理")
+            rep.migration_undecided.append(
+                f"被声明的 key（{sorted(declared_labels)}）解释了 {explained[0]} 项新成员 / "
+                f"{explained[1]} 项旧成员的 churn；{tail}（--new-key/--retire-key 已声明）")
+        if gained_n:
             rep.notes.append(
-                f"声明的 key {sorted(declared_labels)} 本次**不吸收** coverage churn"
-                "（哈希形态剔不掉资源类），下面照红")
-        gained, gone = now - was, was - now
-    else:
-        gained, gone = now - was, was - now
-        if declared_labels and (gained or gone):
-            ignore = classes_for_labels(declared_labels, None)
-            was_n = normalize_undecided_items(was, ignore)
-            now_n = normalize_undecided_items(now, ignore)
-            gained_n, gone_n = now_n - was_n, was_n - now_n
-            explained = (len(gained) - len(gained_n), len(gone) - len(gone_n))
-            if explained != (0, 0):
-                # 措辞按事实分两档（复审二轮）：只有归一化后**两个方向都没有**剩余差异才说"相等"；
-                # 否则只说解释了多少，剩余差异按下面的常规红绿处理（新成员红、消失算改善）。
-                tail = ("两侧剔掉其资源类后归一化**相等**" if not (gained_n or gone_n) else
-                        f"归一化后仍有 {len(gained_n)} 项新成员 / {len(gone_n)} 项消失，按常规红绿处理")
-                rep.migration_undecided.append(
-                    f"被声明的 key（{sorted(declared_labels)}）解释了 {explained[0]} 项新成员 / "
-                    f"{explained[1]} 项旧成员的 churn；{tail}（--new-key/--retire-key 已声明）")
-            if gained_n:
-                rep.notes.append(
-                    f"声明的 key 解释不了全部 churn：剔掉其资源类后仍有 {len(gained_n)} 项新成员，下面照红")
-            gained, gone = gained_n, gone_n
+                f"声明的 key 解释不了全部 churn：剔掉其资源类后仍有 {len(gained_n)} 项新成员，下面照红")
+        gained, gone = gained_n, gone_n
     for fp in sorted(gained):
         rep.new_undecided_items.append(
             f"[{fp}] 新增一项判不出的 (principal, 动作类, 资源)——不确定面变大了；"
@@ -1443,60 +1442,47 @@ def _compare_bucket_policy(rep: Report, base_fps, now_fps, *, texts: dict) -> No
             f"bootstrap 桶少了语句 [{fp}]——**消失也红**：丢掉现有的 TLS Deny 是扩权")
 
 
-def check_legacy_param(session_keys) -> None:
-    """`[SessionKeys] legacy_param` 与闸门常量的关系（3c-1B，spec §11.8.7）。
+def assert_edge_artifacts(code_hits: dict, asset_hits: dict, *, site_kids, console_kids) -> None:
+    """Edge 产物的**三条硬断言**（3c-final）。都是 SystemExit，不是红字段。
 
-    **`JWT_PARAM_NAME` 常量是"追踪 legacy 参数"的真源，直到 3c-3 真的删掉那个参数。**
-    非空时两处必须指同一把（分叉的症状是闸门盯着一把没人用的密钥）；L3 清空它之后照常
-    按常量追踪、照常记 grant——那把密钥仍然存在、仍能被宽读者读到，只是不再有 verifier
-    接受它签的 token。**这条不能改成"为空就不追踪"**：那等于在 L3 到 3c-3 之间把一把
-    活密钥从闸门视野里摘掉。
+    为什么是硬失败而不是走基线比较：① 它们不落 facts ⇒ 没有可比较的基线数字；
+    ② 必须连 `--update-baseline` 一起挡住——红字段挡不住那条路，而这三种形态没有任何
+    可以接受的基线；③ spec §11.8.7 对 login-flow 那条明写"实现为直接断言、不新增 facts"，
+    另两条同理。
 
-    单独成函数是为了能不发 AWS 调用就测两个方向（1A 起本仓库的纪律：新判据要有能红的反例，
-    而 `measure()` 里的分支只能靠读源码断言——那是 static 证据，不是行为证据）。
+    三条各自防什么：
+    · **当前关联的版本必须带每一把 site kid 的公钥**——缺了不是"少一点观测"，而是线上
+      **全员 302**（Edge 的 allowlist 里没有这个 kid ⇒ `unknown_kid`）。它是"部署的确实是
+      这份 config"的唯一可执行证据；`edge_current_version` 刻意按 CloudFront 的关联取版本，
+      不按"版本号最大"挑（$LATEST 可能已经是下一次要发的代码）。
+    · **不得出现任何 console kid 的公钥**（spec §4.1）：进了 Edge 的 allowlist ⇒ panel signer
+      被攻破就能伪造站点会话。
+    · **不得出现 login-flow secret 的值**（spec §11.3）：它是 auth 私有的，只签 OAuth state
+      与 `__Host-sb_pkce` cookie，Edge 与 panel 永不持有。
+
+    **一条已知代价**（3c-1B /code-review 转来）：`--from-dump` 覆盖不到这三条——快照里没有
+    这些信息（它们刻意不落 facts），所以拿快照出结论时它们不成立。`main()` 的 `--from-dump`
+    提示里已明说。抛点在 IAM 模拟（本文件最慢的一段）**之前**，而快照本来就要等模拟结束才
+    完整 ⇒ 任何保留 BUNDLE_SHAPE 的实现都拿不到那份快照。
     """
-    if session_keys.legacy_param and session_keys.legacy_param != JWT_PARAM_NAME:
-        raise SystemExit(f"[SessionKeys] legacy_param={session_keys.legacy_param!r} 与闸门的 "
-                         f"JWT_PARAM_NAME={JWT_PARAM_NAME!r} 不一致——两处必须指同一把 legacy 密钥")
-
-
-def assert_login_flow_not_in_edge(code_targets, asset_keys) -> None:
-    """login-flow secret 出现在 Edge 产物里 ⇒ 立即 SystemExit（spec §11.8.7 的"直接断言"）。
-
-    与 `console_key_in_edge` 是同一类不变量（"这把密钥不该在这个组件里"），但处置形态不同：
-    console 那条是红字段（走基线比较、有 delta 可读），这条是硬失败。三个理由：
-    ① 它不落 facts ⇒ 没有可比较的基线数字；② 它必须连 `--update-baseline` 一起挡住——
-    红字段挡不住那条路，而"把一把 auth 私有密钥写进全球复制的 Edge 产物"没有任何
-    可以接受的基线；③ spec §11.8.7 明写"实现为直接断言、不新增 facts"。
-
-    **两条已知代价，写下来免得下次当成 bug 重新发现**（3c-1B /code-review 转来）：
-    · `--from-dump` 覆盖不到这条——快照里没有 login-flow 的信息（它刻意不落 facts），
-      所以拿快照出结论时这条不成立。`main()` 的 `--from-dump` 提示里已明说。
-    · 它在 `measure()` 中途抛，本次运行不会产出报告或 `--dump-observed` 快照。代价比看起来
-      小：抛点在 Edge/asset 扫描之后、400 个 principal 的 IAM 模拟（本文件最慢的一段）**之前**，
-      而快照本来就要等模拟结束才完整 ⇒ 任何保留 BUNDLE_SHAPE 的实现都拿不到那份快照。
-    """
-    hits = list(code_targets) + list(asset_keys)
-    if not hits:
-        return
-    raise SystemExit(
-        f"闸门硬失败：Edge 产物里测到了 **login-flow secret**（{len(code_targets)} 个代码目标 + "
-        f"{len(asset_keys)} 个 bootstrap asset）。它是 auth 私有的（spec §11.3）：只签 OAuth state "
-        f"与 __Host-sb_pkce cookie，Edge 与 panel 永不持有。出现在这里说明注入路径把它当成了"
-        f"会话密钥——先查 router/infrastructure/stack.py 往 Edge 注入了哪些值。"
-        f"\n这条不接受基线放行：Edge 产物有 9 个历史版本且全球复制，写进去就等于永久泄漏。")
-
-
-def _check_console_key_not_in_edge(rep: Report, facts: dict | None) -> None:
-    """spec §4.1 的闸门形态：console family 的密钥在 Edge 产物里出现即**红**，不是事实类 note。"""
-    for kid, row in ((facts or {}).get("session_keys") or {}).items():
-        if not kid.startswith("console-"):       # kid 格式 {family}-{alg}-v{n}，由 session_keys.KID_RE 保证
-            continue
-        n = int(row.get("edge_code_targets_carrying_key", 0)) + int(row.get("edge_assets_carrying_key", 0))
-        if n:
-            rep.console_key_in_edge.append(
-                f"{kid}：{row.get('edge_code_targets_carrying_key', 0)} 个 Edge 代码目标 + "
-                f"{row.get('edge_assets_carrying_key', 0)} 个 asset 带着它")
+    problems = []
+    for kid in site_kids:
+        if not code_hits.get(f"site:{kid}"):
+            problems.append(
+                f"当前关联的 Edge 版本里没有 {kid} 的公钥——部署的不是这份 config 的 allowlist，"
+                f"线上会全员 302")
+    for kid in console_kids:
+        if code_hits.get(f"console:{kid}") or asset_hits.get(f"console:{kid}"):
+            problems.append(
+                f"Edge 产物里出现了 console family 的公钥 {kid}——spec §4.1：panel signer 被攻破"
+                f"就能伪造站点会话。先查 router/infrastructure/stack.py 的 site allowlist 只取 site family")
+    if code_hits.get(LABEL_LOGIN_FLOW) or asset_hits.get(LABEL_LOGIN_FLOW):
+        problems.append(
+            "Edge 产物里出现了 login-flow secret 的值——它是 auth 私有的（spec §11.3）：只签 "
+            "OAuth state 与 __Host-sb_pkce cookie，Edge 与 panel 永不持有。出现在这里说明注入"
+            "路径把它当成了会话密钥；Edge 产物全球复制，写进去就等于永久泄漏")
+    if problems:
+        raise SystemExit("闸门硬失败（不接受基线放行）：\n  " + "\n  ".join(problems))
 
 
 def _compare_facts(rep: Report, base_facts: dict, now_facts: dict | None) -> None:
@@ -1505,7 +1491,6 @@ def _compare_facts(rep: Report, base_facts: dict, now_facts: dict | None) -> Non
     `principals_with_missing_context` 会随账号里任何一条带 Condition 的新策略
     变动，跟本平台无关；让它决定退出码就会频繁红在无关变更上，
     进而训练出"红了就更新基线"。所以：算出来、打印出来、不影响退出码。
-    带活密钥的 asset 数同理（每次 Edge 部署就多一个）。
     """
     if not base_facts and not now_facts:
         return
@@ -1549,15 +1534,21 @@ def read_config(path: Path = CONFIG_PATH) -> configparser.ConfigParser:
     return cfg
 
 
-def secret_in_zip_bytes(blob: bytes, secret: str) -> bool:
-    """zip 里的 .py 是否含 `secret` 这个字面量。**不打印、不返回密钥本身。**"""
+def secret_in_zip_bytes(blob: bytes, value: str) -> bool:
+    """zip 里的 .py 是否含 `value` 这个字面量。**不打印、不返回取到的值本身。**
+
+    3c-final 起要找的东西有两类：base64 的 SPKI 公钥（`SITE_ALLOWLIST_JSON` 里那些
+    `spki_b64`，392 字符，子串命中不会有假阳性）与 login-flow secret 的值。
+    HS 时代那条按 `JWT_SECRET = "…"` 赋值形态精确匹配的分支已经删掉——它只对 64 位
+    十六进制那种"可能偶然出现在别处"的短值有意义。
+    """
     try:
         z = zipfile.ZipFile(io.BytesIO(blob))
         src = b"".join(z.read(n) for n in z.namelist()
                        if n.endswith(".py")).decode("utf-8", "ignore")
     except (zipfile.BadZipFile, KeyError):
         return False
-    return any(m == secret for m in _SECRET_ASSIGN_RE.findall(src)) or secret in src
+    return value in src
 
 
 # ---------------------------------------------------------------- 真机部分
@@ -1603,8 +1594,12 @@ def _aws_clients(region: str):
     from botocore.config import Config
     harden_tls_warnings()
     cfg = Config(retries={"max_attempts": 12, "mode": "adaptive"})
-    return {n: boto3.client(n, region_name=region, config=cfg)
-            for n in ("iam", "lambda", "sts", "s3", "ssm", "cloudformation")}
+    clients = {n: boto3.client(n, region_name=region, config=cfg)
+               for n in ("iam", "lambda", "sts", "s3", "ssm", "cloudformation", "kms")}
+    # CloudFront 是全局服务：带 region_name 也只会打到 us-east-1，但显式不带，
+    # 免得将来有人把 --region 改成别的区时这一路静默变成"对着另一个区问分发"。
+    clients["cloudfront"] = boto3.client("cloudfront", config=cfg)
+    return clients
 
 
 def resolve_managed_policy(iam, arn: str, *, docs: dict, versions: dict):
@@ -1840,27 +1835,6 @@ def edge_asset_location(clients, function_name: str) -> tuple[str, str]:
                      f"它可能改成了内联代码，这条路要重新判定")
 
 
-def assets_carrying_keys(clients, bucket: str, keys: dict[str, str],
-                         max_size: int = 200 * 1024) -> dict[str, list[str]]:
-    """`assets_carrying_key` 的多密钥形态（3c-1A）：每个对象只下载一次，对每把密钥各判一次。
-    返回 {label: [key…]}，label 是 "legacy" 或 kid。"""
-    found: dict[str, set[str]] = {label: set() for label in keys}
-    seen: set[str] = set()
-    paginator = clients["s3"].get_paginator("list_object_versions")
-    for page in paginator.paginate(Bucket=bucket):
-        for obj in page.get("Versions", []):
-            key = obj["Key"]
-            if key in seen or not key.endswith(".zip") or obj["Size"] > max_size:
-                continue
-            seen.add(key)
-            blob = clients["s3"].get_object(
-                Bucket=bucket, Key=key, VersionId=obj["VersionId"])["Body"].read()
-            for label, value in keys.items():
-                if secret_in_zip_bytes(blob, value):
-                    found[label].add(key)
-    return {label: sorted(v) for label, v in found.items()}
-
-
 def function_versions(lam, names) -> dict[str, tuple[str, ...]]:
     """`{函数名: (已发布版本号…)}`（不含 `$LATEST`）。
 
@@ -1880,11 +1854,19 @@ def function_versions(lam, names) -> dict[str, tuple[str, ...]]:
 
 
 def edge_code_arns_carrying_keys(clients, function_name: str, fn_arn: str,
-                                 versions: tuple[str, ...], keys: dict[str, str]) -> dict[str, tuple]:
-    """`edge_code_arns_carrying_key` 的多密钥形态（3c-1A）：每个版本只下载一次。"""
+                                 qualifiers: tuple[str, ...],
+                                 values: dict[str, str]) -> dict[str, tuple]:
+    """扫点名的那几个 Edge 代码目标，每个只下载一次，对每个待找的值各判一次。
+
+    **`qualifiers` 是精确清单，函数自己不再补一个未限定的 `$LATEST`**（3c-final）：
+    `assert_edge_artifacts` 那条"当前关联的版本必须带每把 site 公钥"的断言只有在
+    `code_hits` 里**只有**那个版本时才成立——把 `$LATEST` 一起扫进来的话，一次"代码已更新
+    但 CloudFront 还指着旧版本"的部署（正是要抓的那种）会因为 `$LATEST` 命中而变绿。
+    "最新代码里有没有不该有的东西"由当前 CDK asset 那一路覆盖（它就是产出 `$LATEST` 的字节）。
+    """
     import urllib.request
-    out: dict[str, list[str]] = {label: [] for label in keys}
-    for qualifier in (None, *versions):
+    out: dict[str, list[str]] = {label: [] for label in values}
+    for qualifier in qualifiers:
         kw = {"FunctionName": function_name}
         if qualifier:
             kw["Qualifier"] = qualifier
@@ -1894,11 +1876,39 @@ def edge_code_arns_carrying_keys(clients, function_name: str, fn_arn: str,
             continue
         with urllib.request.urlopen(url) as fh:      # noqa: S310 (AWS 预签名 URL)
             blob = fh.read()
-        arn = fn_arn if qualifier is None else f"{fn_arn}:{qualifier}"
-        for label, value in keys.items():
+        arn = fn_arn if not qualifier else f"{fn_arn}:{qualifier}"
+        for label, value in values.items():
             if secret_in_zip_bytes(blob, value):
                 out[label].append(arn)
     return {label: tuple(v) for label, v in out.items()}
+
+
+def edge_current_version(clients) -> str:
+    """CloudFront **当前关联**的 origin-request Lambda 版本号。
+
+    与 `verify_deployed_edge.sh` ① / `verify_deployed_components._edge_deployed_source` 同一
+    规则：**不按"版本号最大"挑**。刚 `cdk deploy` 完但复制还没铺开、或改了代码没重部分发时，
+    最大版本号与线上真正在跑的不是一回事，而这道断言的全部意义就是"线上跑的是不是这份 config"。
+
+    分发 ID 从 router 栈的 CfnOutput 取（config.ini 只放输入，不放部署产物）。
+    """
+    rcfg = configparser.ConfigParser(interpolation=None)
+    rcfg.read(_SITE_BUILDER.parent / "router" / "config.ini", encoding="utf-8")
+    if not rcfg.sections():
+        raise SystemExit("router/config.ini 读不到任何段——configparser 对缺失文件是静默的，"
+                         "再往下跑会拿空栈名去问 CloudFormation。先确认路径与 cwd。")
+    stack = rcfg["CDK"]["stack_name"].split("#")[0].strip()
+    outs = clients["cloudformation"].describe_stacks(StackName=stack)["Stacks"][0].get("Outputs", [])
+    dist = next((o["OutputValue"] for o in outs if o["OutputKey"] == "DistributionId"), "")
+    if not dist:
+        raise SystemExit(f"栈 {stack} 没有 CfnOutput DistributionId——router 栈没部？")
+    assoc = (clients["cloudfront"].get_distribution_config(Id=dist)["DistributionConfig"]
+             ["DefaultCacheBehavior"].get("LambdaFunctionAssociations", {}).get("Items", []))
+    arns = [a["LambdaFunctionARN"] for a in assoc if a.get("EventType") == "origin-request"]
+    if len(arns) != 1 or not arns[0].rsplit(":", 1)[-1].isdigit():
+        raise SystemExit(f"origin-request 关联的不是恰好一个编号版本：{arns}——"
+                         f"Lambda@Edge 必须关联编号版本，这是探针前提")
+    return arns[0].rsplit(":", 1)[-1]
 
 
 def function_aliases(lam, names) -> dict[str, tuple[str, ...]]:
@@ -1957,8 +1967,13 @@ def simulate(iam, principal_arn: str,
     """两次调用：函数类资源一组、其余一组。
 
     分组不是为了省钱，是为了不产生大量无意义的 (动作, 资源) 组合——一次调用的
-    响应体是 资源数 × 动作数，而 `ssm:*` 对 Lambda ARN、`lambda:*` 对 S3 ARN
+    响应体是 资源数 × 动作数，而 `ssm:*` / `kms:*` 对 Lambda ARN、`lambda:*` 对 KMS key ARN
     都是纯噪音。
+
+    第二组带 `ContextEntries=KMS_CONTEXT`：auth / panel 的 `kms:Sign` 语句上有
+    `kms:SigningAlgorithm` 与 `kms:MessageType` 两个 StringEquals，不喂上下文时模拟器判
+    "缺上下文"⇒ 平台自己那条必需的 grant 会从结果里消失、正向控制假红。喂进去的值是
+    spec §11.5 固定的合同值（`session_kms` 的两个常量，不手抄）。
 
     返回三项：逐资源判定、`missing`（principal 级的 bool，喂 `facts` 那个笼统计数，
     只报 delta 不参与红绿）、`pairs`（item 级的判不出集合，**新成员即红**）。
@@ -1967,20 +1982,39 @@ def simulate(iam, principal_arn: str,
     out: dict[str, str] = {}
     missing = False
     pairs: set[tuple[str, str]] = set()
-    for actions, resources in ((ACTIONS_FUNCTION, t.function_resources()),
-                               (ACTIONS_OTHER, t.other_resources())):
+    for actions, resources, context in ((ACTIONS_FUNCTION, t.function_resources(), None),
+                                        (ACTIONS_OTHER, t.other_resources(), KMS_CONTEXT)):
         if not resources:
             continue
+        extra = {"ContextEntries": context} if context else {}
         for page in iam.get_paginator("simulate_principal_policy").paginate(
                 PolicySourceArn=principal_arn, ActionNames=list(actions),
-                ResourceArns=resources):
+                ResourceArns=resources, **extra):
             out.update(decisions_from_simulation(page["EvaluationResults"]))
             missing = missing or missing_context_in(page["EvaluationResults"])
             pairs |= undecided_pairs(page["EvaluationResults"])
     return out, missing, pairs
 
 
-def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
+def canonical_json(text: str) -> str:
+    """policy 文本的规范化：解析再按排序键紧凑序列化。
+
+    key policy 的原文来自 `GetKeyPolicy`，AWS 返回的空白与键序不保证稳定 ⇒ 直接对原文取指纹
+    会把格式抖动误报成漂移，而反复的假红会训练出无脑更新基线。
+    """
+    return json.dumps(json.loads(text), sort_keys=True, separators=(",", ":"))
+
+
+def panel_role_name(path: Path | None = None) -> str:
+    """panel 执行角色的名字 = `panel/deploy_panel.py` 的 `ROLE_NAME`（真源在那边）。
+
+    手抄的副本在 panel 改角色名时不会红，正向控制会盯着一个不存在的角色，症状是
+    "panel 缺 kms-sign"这种假红。
+    """
+    return _module_constant(path or PANEL_DEPLOY_PY, "ROLE_NAME")
+
+
+def measure(region: str, *, workers: int = 4) -> dict:
     clients = _aws_clients(region)
     iam, lam = clients["iam"], clients["lambda"]
     cfg = read_config()
@@ -2002,80 +2036,68 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
     def fn_arn(n: str) -> str:
         return f"arn:aws:lambda:{region}:{account}:function:{n}"
 
-    live_key = clients["ssm"].get_parameter(
-        Name=JWT_PARAM_NAME, WithDecryption=True)["Parameter"]["Value"]
-    # 3c-1A：两个 HS key family 的密钥也是"读到即能签"的目标；legacy 仍单列。
+    # ---- KMS 层：每把会话签名 CMK 自己的快照（3c-final）----
+    # `session_kms` 在这里才 import（它 import session ⇒ 要 cryptography）：只有实测路径需要
+    # 取公钥并做四项校验，`--from-dump` 与全部纯函数路径都不该被这个包卡住。
+    import session_kms
     session_keys = load_session_keys(CONFIG_PATH)
-    check_legacy_param(session_keys)
-    key_values: dict[str, str] = {"legacy": live_key}
-    kid_family: dict[str, str] = {}
-    kid_param: dict[str, str] = {}
-    for fam in KEY_FAMILIES:
-        for ref in session_keys.allowlist(fam):
-            if ref.alg != "HS256":
-                continue
-            key_values[ref.kid] = clients["ssm"].get_parameter(
-                Name=ref.ssm_param, WithDecryption=True)["Parameter"]["Value"]
-            kid_family[ref.kid] = fam
-            kid_param[ref.kid] = ref.ssm_param
-    # 3c-1B：login-flow 的值**只进扫描输入、不进 key_values**。key_values 是"读到它就能签
-    # 会话"的密钥枚举，冒充面的目标集合（read-edge-code / read-edge-asset 的资源并集）由它
-    # 决定；把 login-flow 塞进去会让那个数字凭空变大。这条刻意的排除由
+    refs = key_refs(session_keys, KEY_FAMILIES)
+    kms = clients["kms"]
+    kms_section: dict = {}
+    spki_b64_by: dict[str, str] = {}
+    for ref in refs:
+        der, fp = session_kms.describe_public_key(kms, ref.key_arn)   # 形态四项在这里就过了
+        if fp != ref.spki_sha256:
+            raise SystemExit(
+                f"闸门硬失败：{ref.kid} 的 KMS 公钥指纹 {fp} != config 的 {ref.spki_sha256}——"
+                "config.ini 指的不是这把 key；不出结论也不写基线")
+        meta = kms.describe_key(KeyId=ref.key_arn)["KeyMetadata"]
+        policy = kms.get_key_policy(KeyId=ref.key_arn, PolicyName="default")["Policy"]
+        # grant 逐条指纹化：`GranteePrincipal` 是带账号 ID 的 ARN（仓库红线，不进基线原文），
+        # 而 `Operations` / `Constraints` 决定这条 grant 到底给了什么。三者一起进指纹。
+        grants = [principal_fingerprint(json.dumps(
+                      [g.get("GranteePrincipal"), sorted(g.get("Operations", [])),
+                       g.get("Constraints", {})], sort_keys=True))
+                  for page in kms.get_paginator("list_grants").paginate(KeyId=ref.key_arn)
+                  for g in page["Grants"]]
+        kms_section[ref.kid] = {
+            "arn_fp": principal_fingerprint(ref.key_arn),
+            "key_policy_fp": principal_fingerprint(canonical_json(policy)),
+            "key_spec": meta["KeySpec"], "key_usage": meta["KeyUsage"],
+            "spki_sha256": fp, "grants": sorted(grants)}
+        spki_b64_by[f"{ref.family}:{ref.kid}"] = session_kms.spki_b64(der)
+    # login-flow 的值**只进扫描输入、不进 kms_keys**：它不是会话签名 key（读到它签不出会话），
+    # 混进冒充面的目标集合会让那个数字凭空变大。这条刻意的排除由
     # test_login_flow_secret_is_deliberately_absent_from_the_key_enumeration 正向断言。
     login_flow_value = clients["ssm"].get_parameter(
         Name=session_keys.login_flow_secret_param, WithDecryption=True)["Parameter"]["Value"]
-    scan_values = {**key_values, LABEL_LOGIN_FLOW: login_flow_value}
+    scan_values = {**spki_b64_by, LABEL_LOGIN_FLOW: login_flow_value}
     facts: dict[str, object] = {}
 
     aliases = function_aliases(lam, all_functions)
     versions = function_versions(lam, all_functions)
 
-    # ---- 密钥的物化位置：**实测**，不假设 ----
-    edge_versions = versions.get(EDGE_ORIGIN_REQUEST_FN, ())
+    # ---- Edge 产物：只看 CloudFront **当前关联**的版本 + **当前** asset ----
+    # 3c-final 之后产物里只有公钥，历史版本不再是负债 ⇒ 不扫历史（那条"跳过历史扫描"的旗标
+    # 连带它"扫描不完整"的岔路一起删掉了）。这一段产出三条硬断言的输入，不落 facts。
+    current_version = edge_current_version(clients)
     edge_code_by = edge_code_arns_carrying_keys(
         clients, EDGE_ORIGIN_REQUEST_FN, fn_arn(EDGE_ORIGIN_REQUEST_FN),
-        edge_versions, scan_values)
-    facts["edge_code_targets_carrying_live_key"] = len(edge_code_by["legacy"])
-
+        (current_version,), scan_values)
     asset_bucket, asset_key = edge_asset_location(clients, EDGE_ORIGIN_REQUEST_FN)
-    if scan_assets:
-        asset_by = assets_carrying_keys(clients, asset_bucket, scan_values)
-    else:
-        blob = clients["s3"].get_object(Bucket=asset_bucket, Key=asset_key)["Body"].read()
-        asset_by = {label: ([asset_key] if secret_in_zip_bytes(blob, v) else [])
-                    for label, v in scan_values.items()}
-        print("（--no-asset-scan：只看当前 asset，历史对象未扫）", file=sys.stderr)
-    # 3c-1B：**硬断言**，不落 facts（spec §11.8.7）。login-flow 是 auth 私有的，Edge 与 panel
-    # 永不持有它；它出现在 Edge 产物里意味着注入路径把它当成了会话密钥，那是配置错而不是漂移。
-    # 做成 SystemExit 而不是红字段：它必须连 `--update-baseline` 一起挡住（红字段挡不住那条路），
-    # 而 facts 与 BUNDLE_SHAPE 不为一个不参与红绿的数字做基线迁移。
-    assert_login_flow_not_in_edge(edge_code_by[LABEL_LOGIN_FLOW], asset_by[LABEL_LOGIN_FLOW])
-    # 每 kid 一组事实；console family 在 Edge 产物里出现由 compare_to_baseline 判红
-    # 只放整数（基线红线要求 facts 的叶子全是整数）；family 由 kid 前缀决定（session_keys.KID_RE 保证格式）
-    facts["session_keys"] = {
-        kid: {"edge_code_targets_carrying_key": len(edge_code_by[kid]),
-              "edge_assets_carrying_key": len(asset_by[kid])}
-        for kid in kid_family}
-    # 读到**任一**把密钥都等于能签 ⇒ 目标集合取并集；legacy 那两个计数单列在上面。
-    # **并集只跨 key_values 的 label**，不跨 scan_values：只带 login-flow 值的产物不是
-    # 冒充面的目标（读到它签不出会话），混进来会让 read-edge-code / read-edge-asset 的
-    # 资源集合虚增，从而放大 A 组的数字。
-    edge_code = tuple(sorted(set().union(*(set(edge_code_by[k]) for k in key_values))))
-    asset_keys = sorted(set().union(*(set(asset_by[k]) for k in key_values)))
-    if asset_key not in asset_keys and scan_assets:
-        # 当前部署的 asset 不含活密钥 = 根治已生效（或密钥刚轮转）。这是好消息，
-        # 但要说出来——它会让 read-edge-asset 的资源集合变小。
-        print("注意：当前部署的 asset 已不含活密钥", file=sys.stderr)
-    facts["edge_assets_carrying_live_key"] = len(asset_keys)
+    blob = clients["s3"].get_object(Bucket=asset_bucket, Key=asset_key)["Body"].read()
+    asset_by = {label: ([asset_key] if secret_in_zip_bytes(blob, v) else [])
+                for label, v in scan_values.items()}
+    assert_edge_artifacts(edge_code_by, asset_by,
+                          site_kids=[r.kid for r in refs if r.family == "site"],
+                          console_kids=[r.kid for r in refs if r.family == "console"])
+    print(f"Edge 当前关联版本 {current_version}：site 公钥齐、无 console 公钥、无 login-flow 值",
+          file=sys.stderr)
 
     targets = Targets(
         platform_functions=tuple(fn_arn(n) for n in platform),
         site_functions=tuple(fn_arn(n) for n in sites),
-        edge_code_arns=edge_code,
-        edge_assets=tuple(f"arn:aws:s3:::{asset_bucket}/{k}" for k in asset_keys),
-        jwt_parameter=f"arn:aws:ssm:{region}:{account}:parameter{JWT_PARAM_NAME}",
-        session_key_parameters={kid: f"arn:aws:ssm:{region}:{account}:parameter{p}"
-                                for kid, p in kid_param.items()},
+        kms_keys={r.kid: r.key_arn for r in refs},
         login_flow_parameter=(f"arn:aws:ssm:{region}:{account}:parameter"
                               f"{session_keys.login_flow_secret_param}"),
         alias_arns={fn_arn(n): tuple(f"{fn_arn(n)}:{a}" for a in al)
@@ -2091,7 +2113,7 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
     rp = resource_policy_snapshot(policies, account=account, platform=platform,
                                  sites=sites, aliases=aliases)
 
-    # bootstrap 桶的 bucket policy：模拟器看不见这条通道，而桶里有带活密钥的 asset。
+    # bootstrap 桶的 bucket policy：模拟器看不见这条通道，而 Edge 的部署产物就在这个桶里。
     bucket_stmts = bucket_policy_statements(clients["s3"], asset_bucket)
     rp["bootstrap_bucket"] = sorted({canonical_statement_fp(s, account=account)
                                     for s in bucket_stmts})
@@ -2149,7 +2171,7 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
           f"探测资源 {len(targets.function_resources()) + len(targets.other_resources())} 个"
           f"（含 alias {sum(len(v) for v in targets.alias_arns.values())}、"
           f"版本 {sum(len(v) for v in targets.version_arns.values())}）；"
-          f"含活密钥的 Edge 代码目标 {len(edge_code)} 个、asset {len(asset_keys)} 个",
+          f"会话签名 CMK {len(kms_section)} 把",
           file=sys.stderr)
 
     observed: dict[str, dict] = {}
@@ -2158,9 +2180,6 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
     # item 级的判不出集合：成员是 (principal, 动作等价类, 资源类) 的指纹。
     # `n_missing` 那个 principal 级计数继续留作环境事实（只报 delta），红绿看这个。
     undecided: set[str] = set()
-    # 反事实（3c-1B-G A6）：把被声明 key 的资源类当作"还不存在"再算一遍。
-    # 声明为空时它与 `undecided` 恒等，比较器也不会用到它。
-    undecided_v4: set[str] = set()      # 迁移期比较用，见 undecided_members_v4
 
     with cf.ThreadPoolExecutor(max_workers=workers) as pool:
         # **每线程独立 client**：共享一个 client 并发用会让一部分请求跳过证书校验
@@ -2178,7 +2197,6 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
             # 折成成员指纹。放在下面 `if grants:` 的**外面**——一个 principal 可能一条
             # grant 都没有却有判不出的项，而那正是最该盯住的那种（条件哪天放宽就是新 grant）。
             undecided |= undecided_members(p["arn"], pairs, targets)
-            undecided_v4 |= undecided_members_v4(p["arn"], pairs, targets)
             grants = grants_from_decisions(decisions, targets)
             if grants:
                 observed[principal_fingerprint(p["arn"])] = {
@@ -2229,73 +2247,48 @@ def measure(region: str, *, workers: int = 4, scan_assets: bool = True) -> dict:
           file=sys.stderr)
 
     facts["principals_with_missing_context"] = n_missing
-    return {# 快照带 schema 与完整性标记：`--from-dump` 要能拒绝旧形态与不完整的快照
+    return {# 快照带 schema：`--from-dump` 要能拒绝旧形态的快照
             # （缺分节时比较器整层跳过，输出与"真的没漂移"逐字相同）。
             "schema": BASELINE_SCHEMA,
-            # --no-asset-scan 只看当前 asset ⇒ 这份观测不完整，不许出结论/写基线。
-            "asset_scan_complete": scan_assets,
             "principals": observed, "resource_policies": rp, "facts": facts,
-            "coverage": {"undecided_items": sorted(undecided),
-                         # schema 4 形态的同一批成员：**只给基线还是 schema 4 时的那一次迁移比较用**，
-                         # 不写进基线（`write_baseline` 只取 undecided_items）。归 3c-3 删。
-                         "schema4_fingerprints": sorted(undecided_v4)},
+            "coverage": {"undecided_items": sorted(undecided)},
             # `texts` 只进 stdout 与 --dump-observed 的产物，**不进基线**。
             "iam_write": {"statements": iam_stmts, "boundaries": boundaries,
                           "managed_versions": used_policies, "texts": stmt_texts},
-            "required": {"edge": edge_role_name, "deployer": DEPLOYER_EXEC_ROLE}}
+            "kms": kms_section,
+            # 四条正向控制的角色名。auth / panel 那两条是签名侧（3c-final）：
+            # panel 的名字从 deploy_panel.py 的 ROLE_NAME 读，不手抄。
+            "required": {"edge": edge_role_name, "deployer": DEPLOYER_EXEC_ROLE,
+                         "auth": AUTH_SERVICE_ROLE, "panel": panel_role_name()}}
 
 
-def migrate_baseline_4_to_5(data: dict) -> dict:
-    """schema 4 → 5（3c-1B-G A6 复审）：**只改版本号**。coverage 成员从哈希变成可分解形态这件事
-    没法离线做（哈希不可逆），由随后的实测重算并按旧形态比过之后写入（`_compare_coverage` 的
-    v4 分支）。所以本函数的产物**只能在内存里过渡**——`load_baseline` 对落盘的 schema 5 要求
-    成员已是可分解形态，`--migrate-baseline-only` 对 4→5 被拒。"""
-    out = dict(data)
-    out["schema"] = 5
-    return out
+def load_baseline(path: Path) -> dict:
+    """读基线并**硬校验 schema**。3c-final 起**没有迁移通道**。
 
-
-def migrate_baseline_3_to_4(data: dict) -> dict:
-    """schema 3 → 4 的**一次性结构迁移**（3c-1A）：只新增空的 `facts.session_keys`，
-    principal / grants / 其它分节原样保留。**不是重置**：每 kid 的 grant 与事实由随后的实测
-    填进来并按"新增即红"审过再写基线（spec §6.2 3c-3 一节反对全量重置的理由同样适用）。"""
-    facts = dict(data.get("facts") or {})
-    facts.setdefault("session_keys", {})
-    return {**data, "schema": 4, "facts": facts}     # 字面量 4：这一步只到 4，5 由 migrate_baseline_4_to_5 接
-
-
-def load_baseline(path: Path, *, migrate_from: int | None = None) -> dict:
-    """读基线并**硬校验 schema**。
-
-    没有运行时校验时，版本不对的症状是"每个 principal 都报成新增"——一屏红，
-    而真因只是版本不匹配。那种红会训练出"红了就更新基线"。
+    两条语义：
+    · **文件不存在**不是"与空基线比"，而是"这一轮只能生成第一份基线"。返回一个空壳并在
+      stderr 说清楚；`main()` 在不带 `--update-baseline` 时会硬退出——否则每个 principal
+      都会被报成"新增"，一屏红而真因只是没有基线（那种红会训练出"红了就更新基线"）。
+      基线含单账号实测、**不随资产分发**（ADR 0005），所以采用者首跑就是这一步。
+    · **schema 不是当前版本**⇒ 硬失败并让操作者删掉重生成。不做 3/4/5 → 6 的迁移：旧形态里
+      根本没有 KMS 分节可比，"迁移"出来的只会是一份半真半假的基线。
     """
     if not path.exists():
+        print(f"（没有基线 {path}：本次只能 --update-baseline 生成第一份，不能出结论——"
+              "基线含单账号实测、不随资产分发，采用者首跑就是这一步）", file=sys.stderr)
         return {"schema": BASELINE_SCHEMA, "principals": {}}
     data = json.loads(path.read_text(encoding="utf-8"))
-    got = data.get("schema")
-    if got == BASELINE_SCHEMA:
-        # schema 5 的基线里 coverage 成员必须是可分解形态：哈希形态混进来（手改、或把
-        # `--migrate-baseline-only` 的产物当成迁移完成）会让退役声明静默失效——照红、
-        # 与没修一样。所以在读入时就拒。
-        if coverage_form((data.get("coverage") or {}).get("undecided_items")) != "v5":
-            raise SystemExit(
-                f"基线 schema 是 {got} 但 coverage.undecided_items 还是 schema 4 的哈希形态"
-                "——4→5 必须经一次实测重算成员：--update-baseline --migrate-from-schema 4 "
-                "（`--migrate-baseline-only` 对 4→5 无效，会被拒）。")
-        return data
-    if migrate_from is None:
+    if data.get("schema") != BASELINE_SCHEMA:
         raise SystemExit(
-            f"基线 schema 是 {got}，脚本要 {BASELINE_SCHEMA}。直接比会把每个 principal 都"
-            f"报成新增。一次性迁移：--update-baseline --migrate-from-schema {got}")
-    if migrate_from != got or got not in (3, 4):
-        raise SystemExit(
-            f"只支持 schema 3/4 → {BASELINE_SCHEMA} 的一次性迁移（--migrate-from-schema "
-            f"{migrate_from}，文件里是 {got}，脚本是 {BASELINE_SCHEMA}）")
-    print(f"（一次性迁移基线 schema {got} → {BASELINE_SCHEMA}）", file=sys.stderr)
-    if got == 3:
-        data = migrate_baseline_3_to_4(data)
-    return migrate_baseline_4_to_5(data)
+            f"基线 schema 是 {data.get('schema')}，脚本要 {BASELINE_SCHEMA}。3c-final 起没有"
+            "迁移通道（旧形态没有 KMS 层可比）：删掉这个文件，跑一次 --update-baseline 重生成。")
+    # coverage 成员必须是可分解形态。哈希形态混进来（手改、或把旧 schema 的文件改个版本号）
+    # 会让退役声明静默失效——照红、与没修一样。所以在读入时就拒。
+    items = (data.get("coverage") or {}).get("undecided_items")
+    if items is not None:
+        _check_shape(items, _list_of_undecided_items,
+                     path="coverage.undecided_items", where=f"基线 {path}")
+    return data
 
 
 def _nonempty_str(v) -> bool:
@@ -2314,11 +2307,6 @@ def _list_of_str(v) -> bool:
 def _list_of_undecided_items(v) -> bool:
     return isinstance(v, list) and all(isinstance(x, str) and UNDECIDED_ITEM_RE.fullmatch(x)
                                        for x in v)
-
-
-def _list_of_v4_fingerprints(v) -> bool:
-    # 迁移那一跑拿这一列直接与旧基线比 ⇒ 它也要是"旧口径的真实观测"的形态，不能是任意字符串。
-    return isinstance(v, list) and all(isinstance(x, str) and _PFP_RE.fullmatch(x) for x in v)
 
 
 # 一份**权威**观测必须有的分节、**内层键**与类型。**递归默认拒绝**：
@@ -2353,18 +2341,19 @@ BUNDLE_SHAPE: dict = {
                           "sites": {"*": _POLICY_SHAPE},
                           "bootstrap_bucket": _list_of_str,
                           "bootstrap_bucket_texts": dict},
-    "facts": {"edge_code_targets_carrying_live_key": _plain_int,
-              "edge_assets_carrying_live_key": _plain_int,
-              "principals_with_missing_context": _plain_int,
-              # 3c-1A：每 kid 一组；键是 kid（不是账号值），成员按同一份子规格校验
-              "session_keys": {"*": {"edge_code_targets_carrying_key": _plain_int,
-                                     "edge_assets_carrying_key": _plain_int}}},
+    # 3c-final：只剩这一个事实数字。密钥的物化位置不再是"事实"（私钥不出 KMS），
+    # Edge 产物那三件事改成硬断言（`assert_edge_artifacts`）——它们不该有可比较的基线数字。
+    "facts": {"principals_with_missing_context": _plain_int},
     # 成员必须是可分解形态（不是任意字符串）：写成哈希或带账号值都要在这里被拒。
-    "coverage": {"undecided_items": _list_of_undecided_items,
-                 "schema4_fingerprints": _list_of_v4_fingerprints},
+    "coverage": {"undecided_items": _list_of_undecided_items},
     "iam_write": {"statements": dict, "boundaries": dict,
                   "managed_versions": dict, "texts": dict},
-    "required": {"edge": _nonempty_str, "deployer": _nonempty_str},
+    # 3c-final：每把会话签名 CMK 一组。键是 kid（不是账号值）；ARN 与 key policy 只落指纹。
+    "kms": {"*": {"arn_fp": _nonempty_str, "key_policy_fp": _nonempty_str,
+                  "key_spec": _nonempty_str, "key_usage": _nonempty_str,
+                  "spki_sha256": _nonempty_str, "grants": _list_of_str}},
+    "required": {"edge": _nonempty_str, "deployer": _nonempty_str,
+                 "auth": _nonempty_str, "panel": _nonempty_str},
 }
 
 
@@ -2412,15 +2401,6 @@ def check_bundle_complete(bundle: dict, *, where: str) -> None:
 
     这是一条 fail-closed 合同：**不完整的观测不许变成一个权威的绿。**
     """
-    # `asset_scan_complete` 先单独判，好让报文说清是"扫描不完整"而不是"少个键"。
-    # **必须按类型判**：`if not bundle.get(...)` 下字符串 `"false"` 是 truthy。
-    if bundle.get("asset_scan_complete") is not True:
-        raise SystemExit(
-            f"{where}：这份观测的 asset_scan_complete 不是 True（实际 "
-            f"{bundle.get('asset_scan_complete')!r}）——它是 --no-asset-scan 产出的"
-            f"（只看了当前 asset）。带活密钥的**历史对象**整个不在目标集合里 ⇒ 只能读到"
-            f"那批对象的 principal 会从结果里消失，而比较器会把它报成「集合缩小（绿）」。"
-            f"不许拿它出结论或写基线。")
     missing = [k for k in BUNDLE_SHAPE if k not in bundle]
     if missing:
         raise SystemExit(
@@ -2429,7 +2409,7 @@ def check_bundle_complete(bundle: dict, *, where: str) -> None:
             f"重新跑一次完整的 --dump-observed。")
     for key, spec in BUNDLE_SHAPE.items():
         _check_shape(bundle[key], spec, path=key, where=where)
-    unknown = sorted(set(bundle) - set(BUNDLE_SHAPE) - {"asset_scan_complete"})
+    unknown = sorted(set(bundle) - set(BUNDLE_SHAPE))
     if unknown:
         raise SystemExit(
             f"{where}：观测里出现规格外的分节 {unknown}——新分节必须同时进 BUNDLE_SHAPE，"
@@ -2462,31 +2442,12 @@ def load_dump(path: Path) -> dict:
     return data
 
 
-def check_flag_combination(args) -> None:
-    """`--no-asset-scan` 只许用于**纯观测**，不得出闸门结论、更不得改写基线。
-
-    实测：它只看当前 asset，历史对象不进目标集合 ⇒ 只能读历史对象的 principal 从
-    observed 里消失，比较器把它报成 `improvements`（绿），而 asset 数 9→1 只是一条
-    不影响退出码的 note。`rep.ok` 为 True——漏测被解释成了改善。
-    """
-    if not getattr(args, "no_asset_scan", False):
-        return
-    if args.update_baseline:
-        raise SystemExit(
-            "--no-asset-scan 不能与 --update-baseline 同用：那会用一次不完整的扫描"
-            "改写基线，把历史 asset 上的暴露面从基线里抹掉。")
-    if not args.dump_observed:
-        raise SystemExit(
-            "--no-asset-scan 只能与「纯 --dump-observed」一起用：它的观测不完整，"
-            "拿来出闸门结论会把漏测报成「集合缩小（绿）」。")
-
-
 def wants_baseline(args) -> bool:
     """只有"要出闸门结论"或"要写基线"时才需要读基线。
 
-    `--dump-observed` 单独用时是**纯观测**：迁移期第一次跑它的时候，仓库里的基线还是
-    旧 schema，若在发 AWS 调用前就硬校验，dump 根本产不出来——**而那次 dump 正是
-    迁移的输入**。这是一个真实踩过的死锁。
+    `--dump-observed` 单独用时是**纯观测**：基线还是旧 schema（或还不存在）时，若在发
+    AWS 调用前就硬校验，dump 根本产不出来——**而那次 dump 正是重建基线的输入**。
+    这是一个真实踩过的死锁。
     """
     return not (args.dump_observed and not args.update_baseline)
 
@@ -2507,23 +2468,24 @@ def write_baseline(bundle: dict, baseline: dict, path: Path) -> None:
     path.write_text(json.dumps(
         {"schema": BASELINE_SCHEMA,
          "note": ("account trust boundary baseline —— principal 与策略语句只存指纹；coverage 成员是"
-                  "「principal 指纹|动作等价类|资源类,…」，资源类名来自脚本词表（sites / jwt-param / "
-                  "session-key:<kid> / fn:<平台函数名> …），不含账号值"
+                  "「principal 指纹|动作等价类|资源类,…」，资源类名来自脚本词表（sites / "
+                  "kms-key:<kid> / login-flow-param / fn:<平台函数名> …），不含账号值"
                   "（仓库红线：真实账号值/角色名/ARN 不进被跟踪文件）。见 "
                   "docs/security/account-trust-boundary.md 与 "
                   "scripts/verify_account_trust_boundary.py。"),
          # platform-overbroad：平台自己的角色，但这条授权它并不需要
-         # （当前唯一一个：跑不可信站点依赖安装的 CodeBuild 角色，CDK 自动给了它
-         #  整个 bootstrap 桶的读权限 ⇒ 它能读到 Edge asset 里的明文密钥）。
+         # （典型的一个：跑不可信站点依赖安装的 CodeBuild 角色，CDK 自动给了它
+         #  整个 bootstrap 桶的读权限）。
          "categories": ["platform", "platform-overbroad", "admin", "break-glass",
                         "cdk-admin", "cdk-readonly", "unrelated-workload",
                         "unclassified"],
          "facts": bundle["facts"],
          # 判不出的项按**成员**存（新成员即红）。principal 级的那个笼统计数在 facts 里，
          # 只报 delta——它会随账号里任何一条带 Condition 的新策略变动。
-         # **只持久化 undecided_items**（可分解形态）：`schema4_fingerprints` 是迁移期的比较
-         # 用料，写进基线就等于把不可分解的旧形态带进 schema 5（load_baseline 会拒）。
          "coverage": {"undecided_items": bundle["coverage"]["undecided_items"]},
+         # 3c-final：会话签名 CMK 的快照（key policy / grants / 公钥指纹只落指纹或 hex，
+         # key ARN 本身含账号 ID ⇒ 只落 arn_fp）。
+         "kms": bundle["kms"],
          "principals": principals,
          # B：IAM 写的纯静态文本快照。**只落指纹**——语句原文（`texts`）刻意不写，
          # 它含账号内标识（Principal 是带账号 ID 的角色 ARN）。
@@ -2561,75 +2523,52 @@ def main(argv: list | None = None) -> int:
                     help="从 PATH 读 {角色名: category} 映射，据此标注基线的 "
                          "category（配合 --update-baseline）。映射文件同样"
                          "含真实名字，**不要提交**。")
-    ap.add_argument("--migrate-from-schema", type=int, metavar="N",
-                    help="一次性通道：允许读入 schema N 的旧基线并迁移（支持 3/4 → 5；4→5 要"
-                         "实测重算 coverage 成员，只能配 --update-baseline）。平时不要带。")
     ap.add_argument("--new-key", "--new-kid", action="append", metavar="LABEL", dest="new_key",
                     help="本轮**首次出现**的密钥标签（可重复）。LABEL ∈ 已配置 kid ∪ "
-                         "{legacy, login-flow}。它对应的 grant 在此前已能读某把会话密钥的 "
-                         "principal 上单列为迁移，不算扩权；此前不能读密钥的 principal 上仍红；"
-                         "未声明的一律红。`--new-kid` 是本参数的别名（3c-1A 的旧名）。")
+                         "{login-flow}。它对应的 grant 在此前已能签某把会话密钥的 "
+                         "principal 上单列为迁移，不算扩权；此前不能签的 principal 上仍红；"
+                         "未声明的一律红。kid 的增减同时决定 kms 分节比较的口径。"
+                         "`--new-kid` 是本参数的别名（3c-1A 的旧名）。")
     ap.add_argument("--retire-key", action="append", metavar="LABEL", dest="retire_key",
                     help="本轮**退役**的密钥标签（可重复）。platform 类 principal "
                          "丢掉它对应的 grant 计入迁移不红；同一轮丢的其它 grant 照样红。"
-                         "L3（--retire-key legacy）与演练第 ⑩ 步（--retire-key site-hs-v1 …）用它。"
+                         "轮转 runbook 的最后一步（--retire-key site-rs-v1 …）用它。"
                          "**kid 的合法来源是 config ∪ 基线**——退役时 config 已经不含它了，"
                          "基线是它曾经存在过的记录。")
-    ap.add_argument("--migrate-baseline-only", action="store_true",
-                    help="不发 AWS 调用：按 --migrate-from-schema 做基线的结构迁移并写回，然后退出。"
-                         "3c-1A 用它把 schema 3 的基线升到 4（只加空的 facts.session_keys）。")
-    ap.add_argument("--no-asset-scan", action="store_true",
-                    help="跳过「bootstrap 桶里有多少 asset 带活密钥」那一遍扫描"
-                         "（默认做；它要读几十个小对象）")
     args = ap.parse_args(argv)
     # 标签打错一个字的后果是"以为声明了、其实没有"——静默的，所以在任何比较之前就校验。
-    # 位置在所有分支**之上**，只读 config、不发 AWS 调用 ⇒ `--from-dump` 与
-    # `--migrate-baseline-only` 这两条也一样覆盖。
+    # 位置在所有分支**之上**，只读 config、不发 AWS 调用 ⇒ `--from-dump` 那条也一样覆盖。
     declared_labels = tuple(args.new_key or ()) + tuple(args.retire_key or ())
     if declared_labels:
         cfg_keys = load_session_keys(CONFIG_PATH)
-        # 基线只在这里读一次原始 JSON（不走 load_baseline 的 schema 硬校验：那条在迁移期会
-        # 把本校验挡死，而这里只需要"这个 kid 曾经存在过"这一个事实）。读不到就只认 config。
+        # 基线只在这里读一次原始 JSON（不走 load_baseline 的 schema 硬校验：那条会在基线不存在
+        # 或形态旧时把本校验挡死，而这里只需要"这个 kid 曾经存在过"这一个事实）。读不到就只认 config。
         try:
             raw_baseline = json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             raw_baseline = {}
         check_migration_labels(declared_labels,
                                known_kids=configured_kids(cfg_keys) + baseline_kids(raw_baseline))
-    if args.migrate_baseline_only:
-        if args.migrate_from_schema is None:
-            raise SystemExit("--migrate-baseline-only 需要 --migrate-from-schema N")
-        if args.migrate_from_schema < BASELINE_SCHEMA:
-            # 3→5 与 4→5 都经过"只改版本号"的 4→5 那一步，coverage 成员仍是哈希 ⇒ 落盘就是一份
-            # 下一次 load 必拒的自相矛盾基线（复审二轮 P2-2 用 schema 3 复现）。到 schema 5 没有任何
-            # 纯结构迁移可做，一律走实测。旗标留着，只为把这句话说出来。
-            raise SystemExit(
-                f"schema {args.migrate_from_schema} → {BASELINE_SCHEMA} 不是纯结构迁移：coverage 成员"
-                "要从哈希重算成可分解形态，必须走一次实测——"
-                f"--update-baseline --migrate-from-schema {args.migrate_from_schema}")
-        migrated = load_baseline(BASELINE_PATH, migrate_from=args.migrate_from_schema)
-        BASELINE_PATH.write_text(json.dumps(migrated, ensure_ascii=False, indent=2) + "\n",
-                                 encoding="utf-8")
-        print(f"已把 {BASELINE_PATH} 结构迁移到 schema {migrated['schema']}（未发任何 AWS 调用）")
-        return 0
-    check_flag_combination(args)
-
-    # **纯 dump 模式不读基线**：迁移期第一次跑 `--dump-observed` 时仓库里的基线还是
-    # 旧 schema，在这里硬校验就会把 dump 挡死——而那次 dump 正是迁移的输入。
-    baseline = load_baseline(BASELINE_PATH, migrate_from=args.migrate_from_schema) \
-        if wants_baseline(args) else {}
+    # **纯 dump 模式不读基线**：基线还是旧 schema（或还不存在）时，在这里硬校验就会把 dump
+    # 挡死——而那次 dump 正是重建基线的输入。
+    baseline = load_baseline(BASELINE_PATH) if wants_baseline(args) else {}
+    # **没有基线且不是在生成基线** ⇒ 硬退出。与空基线比较会把每个 principal 都报成"新增"，
+    # 一屏红而真因只是没有基线，那种红会训练出"红了就更新基线"。
+    if wants_baseline(args) and not args.update_baseline and not BASELINE_PATH.exists():
+        raise SystemExit(
+            f"没有基线 {BASELINE_PATH}，先 --update-baseline 生成第一份再出结论"
+            "（基线含单账号实测、不随资产分发；生成时会先打印一遍比较报告）。")
 
     if args.from_dump:
         bundle = load_dump(Path(args.from_dump))
         print(f"（--from-dump：读的是快照 {args.from_dump}，未发 AWS 调用。"
-              f"**快照里没有 login-flow 的信息**（它刻意不进 facts / BUNDLE_SHAPE），"
-              f"所以「Edge 产物含 login-flow 值」那条硬断言在本次运行里不成立——"
-              f"它只在实测路径上评估。）", file=sys.stderr)
+              f"**快照里没有 Edge 产物那三条硬断言的信息**（它们刻意不进 facts / BUNDLE_SHAPE），"
+              f"所以「当前 Edge 版本带齐 site 公钥 / 不含 console 公钥 / 不含 login-flow 值」"
+              f"在本次运行里不成立——它们只在实测路径上评估。）", file=sys.stderr)
     else:
         # 声明（--new-key/--retire-key）**不进观测**：A6 的归一化在比较时对两侧做，
         # 所以同一份快照可以按不同声明重比（复审 P1-1 之前快照里存着按声明算的反事实）。
-        bundle = measure(args.region, workers=args.workers,
-                        scan_assets=not args.no_asset_scan)
+        bundle = measure(args.region, workers=args.workers)
 
     observed = bundle["principals"]
     print(f"\n具备至少一项敏感授权的 principal：{len(observed)}")
@@ -2671,6 +2610,7 @@ def main(argv: list | None = None) -> int:
             observed, baseline, required=bundle["required"],
             resource_policies=bundle["resource_policies"], facts=bundle["facts"],
             coverage=bundle["coverage"], iam_write=bundle["iam_write"],
+            kms=bundle["kms"],
             new_keys=tuple(args.new_key or ()), retired_keys=tuple(args.retire_key or ()))
         print(preview.render())
         write_baseline(bundle, baseline, BASELINE_PATH)
@@ -2683,6 +2623,7 @@ def main(argv: list | None = None) -> int:
                               facts=bundle["facts"],
                               coverage=bundle["coverage"],
                               iam_write=bundle["iam_write"],
+                              kms=bundle["kms"],
                               new_keys=tuple(args.new_key or ()),
                               retired_keys=tuple(args.retire_key or ()))
     print("\n" + rep.render())
