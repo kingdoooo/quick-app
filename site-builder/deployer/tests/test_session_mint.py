@@ -42,9 +42,12 @@ def _b64(raw: bytes) -> str:
 
 
 # 带 kid 的 header（真机形态）：CLI 的记录字段 `kid` 是从 header 解出来的，
-# 上面那枚 TOKEN 的 header 里没有 kid，证不出"解对了"。
+# 上面那枚 TOKEN 的 header 里没有 kid，证不出"解对了"。两枚 kid 不同，`role=previous`
+# 拿到的必须是 v0 那枚——否则"记录里的 role 与实际那把 key 一致"这条断言是空话。
 KID_TOKEN = (_b64(json.dumps({"alg": "RS256", "typ": "JWT", "kid": "site-rs-v1"}).encode())
              + ".eyJlbWFpbCI6InByb2JlQGUyZS5pbnZhbGlkIn0.c2ln")
+KID_TOKEN_PREV = (_b64(json.dumps({"alg": "RS256", "typ": "JWT", "kid": "site-rs-v0"}).encode())
+                  + ".eyJlbWFpbCI6InByb2JlQGUyZS5pbnZhbGlkIn0.c2ln")
 
 
 class FakeSession:
@@ -67,19 +70,26 @@ class FakeSession:
 
 
 class FakeHttp:
-    """记录每个请求；按 URL 路径给出理想应答（auth 的 /fixture-session、/console-session、panel 的 callback）。"""
-    def __init__(self, *, fixture_status=200, token=TOKEN):
+    """记录每个请求；按 URL 路径给出理想应答（auth 的 /fixture-session、/console-session、panel 的 callback）。
+
+    `token_previous` 给 `role=previous` 的应答换一枚**header 里 kid 不同**的 token：签发器真机上就是
+    这样（两个槽位两把 key），而"记录里的 kid 是从 header 解出来的"只有在两枚不同时才证得出来。
+    """
+    def __init__(self, *, fixture_status=200, token=TOKEN, token_previous=None):
         self.requests = []
         self.fixture_status = fixture_status
         self.token = token
+        self.token_previous = token_previous
 
     def __call__(self, method, url, headers, body):
         self.requests.append((method, url, dict(headers), body))
         path = urlparse(url).path
         if path.endswith("/fixture-session"):
             b = json.loads(body)
+            previous = b.get("role", "current") == "previous"
             return self.fixture_status, {"content-type": "application/json"}, json.dumps(
-                {"token": self.token, "kid": "site-rs-v1" if b.get("role", "current") == "current" else "site-rs-v0",
+                {"token": self.token_previous if (previous and self.token_previous) else self.token,
+                 "kid": "site-rs-v0" if previous else "site-rs-v1",
                  "ttl_seconds": b.get("ttl_seconds", 1800)})
         if path == "/console-session":
             return 302, {"location": f"https://console.example.test/api/session-callback?code={CODE}"}, ""
@@ -200,6 +210,27 @@ def test_a_chain_step_that_does_not_hand_back_a_cookie_is_fatal(tmp_path):
         _minter(tmp_path, http).console_session("probe@e2e.invalid", site_session="GIVEN.a.b")
 
 
+@pytest.mark.parametrize("token_use", ["console-upgrade", "console-session"])
+def test_console_uses_refuse_a_non_current_role_before_any_request(tmp_path, token_use):
+    """`role=previous` 配 console 用途必须**响亮拒绝**，不是静默按 current 走。
+
+    静默忽略的后果：`save_token` 记下 `role: previous`，而链路里那枚升级码永远是 auth 用
+    console current key 签的 ⇒ DEPLOY.md 退役前预存的那条负向探针（退役后期望 panel 401）
+    会**因为码过期**而变绿，而它要证明的是"旧 kid 不再被接受"。下一步就是不可逆的删参数。
+    """
+    http = FakeHttp()
+    with pytest.raises(SystemExit, match="role"):
+        _minter(tmp_path, http).mint(token_use, "probe@e2e.invalid", role="previous")
+    assert http.requests == [], "拒绝必须发生在任何一次 HTTP 之前"
+
+
+def test_site_session_still_accepts_previous_as_a_positive_control(tmp_path):
+    """正对照：同一个入口下 site-session + previous 必须照旧可用（上面那条拒的是 console 用途，不是 previous）。"""
+    http = FakeHttp(token=KID_TOKEN, token_previous=KID_TOKEN_PREV)
+    assert _minter(tmp_path, http).mint("site-session", "probe@e2e.invalid", role="previous") == KID_TOKEN_PREV
+    assert json.loads(http.requests[0][3])["role"] == "previous"
+
+
 def test_mint_dispatches_by_token_use_and_has_no_family_override(tmp_path):
     m = _minter(tmp_path)
     assert m.mint("site-session", "p@e2e.invalid") == TOKEN
@@ -299,7 +330,12 @@ def test_load_saved_token_round_trips_and_rejects_garbage(tmp_path):
 
 
 def test_cli_mints_and_saves_with_role_and_prints_no_token(tmp_path, capsys, monkeypatch):
-    http = FakeHttp(token=KID_TOKEN)
+    """`--role previous` 写出的记录必须自洽：`role` 与 token **header 里的 kid** 指同一把 key。
+
+    从前这条断言的是 `role=previous` + `kid=site-rs-v1`（current 那把），自相矛盾——而"记录里的
+    role 与实际签名的 key 一致"正是退役前负向探针唯一的依据。
+    """
+    http = FakeHttp(token=KID_TOKEN, token_previous=KID_TOKEN_PREV)
     m = _minter(tmp_path, http)
     scratch = tmp_path / ".scratch"; scratch.mkdir()
     monkeypatch.setattr(sm.Minter, "from_config", classmethod(lambda cls, *a, **kw: m))
@@ -311,10 +347,24 @@ def test_cli_mints_and_saves_with_role_and_prints_no_token(tmp_path, capsys, mon
     rec = json.loads(out_file.read_text())
     assert set(rec) == {"token_use", "role", "kid", "email", "minted_at", "ttl_seconds", "token"}
     assert (rec["token_use"], rec["role"], rec["kid"], rec["email"]) == (
-        "site-session", "previous", "site-rs-v1", sm.PROBE_EMAIL)
-    assert rec["token"] == KID_TOKEN and json.loads(http.requests[0][3])["role"] == "previous"
+        "site-session", "previous", "site-rs-v0", sm.PROBE_EMAIL)
+    assert rec["token"] == KID_TOKEN_PREV and json.loads(http.requests[0][3])["role"] == "previous"
     printed = capsys.readouterr().out
-    assert rec["token"] not in printed and "site-rs-v1" in printed
+    assert rec["token"] not in printed and "site-rs-v0" in printed
+
+
+def test_cli_refuses_a_non_current_role_for_console_upgrade(tmp_path, monkeypatch):
+    """argparse 层就拒（exit 2），且什么都不写：记录里 `role=previous` 而实际是 current key 签的
+    升级码，会让退役前那条负向探针因为"码过期"而假绿。"""
+    m = _minter(tmp_path, FakeHttp())
+    scratch = tmp_path / ".scratch"; scratch.mkdir()
+    monkeypatch.setattr(sm.Minter, "from_config", classmethod(lambda cls, *a, **kw: m))
+    monkeypatch.setattr(sm, "SCRATCH_ROOT", scratch)
+    out_file = scratch / "code.json"
+    with pytest.raises(SystemExit) as exc:
+        sm.main(["--token-use", "console-upgrade", "--role", "previous", "--save", str(out_file)])
+    assert exc.value.code == 2
+    assert not out_file.exists()
 
 
 def test_cli_defaults_to_the_probe_identity_and_refuses_a_console_session_record(tmp_path, capsys, monkeypatch):

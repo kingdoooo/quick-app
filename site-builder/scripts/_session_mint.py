@@ -177,13 +177,28 @@ class Minter:
 
     def mint(self, token_use: str, email: str, *, ttl_seconds: int = FIXTURE_MAX_TTL, role: str = "current",
              name: str | None = None) -> str:
-        """六处调用方的兼容入口。`console-*` 两种 token 不接受 role/ttl（真实链路决定）。"""
+        """六处调用方的兼容入口。
+
+        **`console-*` 两种 token 只接受 `role="current"`，别的 role 一律响亮拒绝**（不是静默忽略）：
+        夹具签发器只签 site family 的会话（D3），升级码与面板会话由**真实链路**产出，而链路里那枚
+        升级码永远是 auth 用 **console family 的 current key** 签的。静默忽略 role 的后果是
+        `save_token` 记下 `role: previous` 而实际用的是 current——于是 DEPLOY.md 退役前那条负向探针
+        （预存一枚"previous 的升级码"，退役后期望 panel 401）会**因为码过期而变绿**，而它要证明的是
+        "旧 kid 已经不被接受"。那一步紧接着就是不可逆的删参数。
+
+        `ttl_seconds` / `name` 同理只作用于 site-session：升级码的 TTL 由 auth 钳到 60 s，面板会话的
+        claims 来自那枚码，本模块给不出也不该给第二套值。
+        """
+        if token_use in ("console-upgrade", "console-session"):
+            if role != "current":
+                raise SystemExit(
+                    f"{token_use} 不能按 role={role!r} 取：夹具签发器只签 site family 的会话（D3），"
+                    "升级码与面板会话走真实链路、由 auth 用 console current key 签。"
+                    "要 console family 的负向探针请用退役前预存的记录（--retired-token），"
+                    "不要让记录里的 role 与实际签名的 key 不一致")
+            return self.upgrade_code(email) if token_use == "console-upgrade" else self.console_session(email)
         if token_use == "site-session":
             return self.site_session(email, ttl_seconds=ttl_seconds, name=name, role=role)
-        if token_use == "console-upgrade":
-            return self.upgrade_code(email)
-        if token_use == "console-session":
-            return self.console_session(email)
         raise SystemExit(f"token_use 必须是 {TOKEN_USES} 之一，得到 {token_use!r}")
 
 
@@ -322,10 +337,16 @@ def main(argv: list | None = None) -> int:
     ap.add_argument("--token-use", required=True, choices=("site-session", "console-upgrade"),
                     help="面板会话记录不接受：panel 只在写请求上验它，探针只发 GET")
     ap.add_argument("--email", default=PROBE_EMAIL)
-    ap.add_argument("--role", default="current", choices=ROLES)
+    ap.add_argument("--role", default="current", choices=ROLES,
+                    help="只对 --token-use site-session 有意义（console 那条走真实链路，永远是 console current key 签的）")
     ap.add_argument("--ttl", type=int, default=600, help="秒（≤ 1800）；升级码由链路决定 60 s")
     ap.add_argument("--save", required=True, metavar="FILE", help="写 JSON 记录（只许 .scratch/ 下）；不在终端打印 token")
     args = ap.parse_args(argv)
+    if args.role != "current" and args.token_use != "site-session":
+        # argparse 层就拒：让记录里的 role 与实际签名的 key 不一致，等于给退役前的负向探针发一张
+        # 假证明（它会因为码过期而变绿），而下一步是不可逆的删参数。
+        ap.error(f"--role {args.role} 只能配 --token-use site-session；{args.token_use} 由真实换取链路产出，"
+                 "永远是 console family 的 current key 签的")
     m = Minter.from_config(CONFIG_PATH)
     token = m.mint(args.token_use, args.email, role=args.role, ttl_seconds=args.ttl)
     head = token.split(".")[0]

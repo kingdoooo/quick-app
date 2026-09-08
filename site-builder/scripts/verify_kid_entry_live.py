@@ -101,7 +101,11 @@ def run_role_checks(get, rt: RoleTokens, *, site_url: str) -> list:
     out = []
     st, hd = get(site_url, f"sb_session={rt.site}")
     out.append(Check(f"role={rt.role}：站点会话放行（必须 200）", st == 200, f"{st}"))
-    out.append(Check(f"role={rt.role}：真实换取链路换出面板会话（__Host-sb_console）",
+    # 措辞精确到"谁签的"：链路里那枚升级码永远是 auth 用 **console current key** 签的，
+    # `role` 只描述**载体站点会话**用的是哪把 site key。写成"role 的升级码"会让人以为
+    # 这条在验 console previous，而带外根本签不出 console family 的 token（D3）。
+    out.append(Check(f"role={rt.role}：该 role 的会话走真实换取链路换出面板会话"
+                     f"（__Host-sb_console；码由 console current 签）",
                      bool(rt.console_cookie), "已换出" if rt.console_cookie else "没换出来"))
     return out
 
