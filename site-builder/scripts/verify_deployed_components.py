@@ -13,12 +13,17 @@
       "修漏报 → 引入误报 → 再修"的循环，所以正反两侧都要覆盖。）
   ③ 线上 deployer Lambda 群：contract/redlines.py + 守卫三件套逐包核对；
   ④ 线上 auth 服务：login_handler.py / session.py + SSM TTL 在产物中 + Function URL AuthType 与
-     resource policy 等值（M07 之前这条 Function URL **没有任何闸门**）；
+     resource policy 等值（M07 之前这条 Function URL **没有任何闸门**）
+     + **会话 key 的三方对账**（线上 env 的引用 == config == KMS 里那把 key 的真实公钥指纹，
+     spec §11.6 第 3 层）+ 夹具签发器与 `[Verification]` 一致（`FIXTURE_ISSUER` env、
+     `site-builder-verifier` 角色的存在与否、resource policy 里 verifier 那两条语句）；
   ⑤ 线上 panel：**进包清单从 `deploy_panel.COPY_FILES` 推导**后逐字节核对
      + Function URL AuthType 与 resource policy 两条语句 + 环境变量**无明文
-     密钥** + 非 Edge 的签名直连必须 403；
+     密钥** + console family 的三方对账 + 非 Edge 的签名直连必须 403；
   ⑥ 线上 MCP runtime：镜像 digest 可追溯 + runtime role 含 ops-log PutItem
      与 created_at 白名单；
+  ⑥b Edge 产物里的会话公钥：含每把 site 公钥（**按 base64 DER SPKI 逐字节**，不是比 kid）
+     + 不含任何 console 公钥（spec §4.1）+ 是 RS256 形态（有黄金预热、无 HS/legacy 残留）；
   ⑦ console route 记录形态（split / api_target / static_prefix / require_auth）；
   ⑧ 线上 key-proxy（二期 M4 的 API Key 交换层，**仅在 config.ini 有 `[ApiKey]`
      段时才跑**——没有该段 = 平台只允许 OAuth 一条认证路径，组件本就不存在）：
@@ -78,17 +83,21 @@ results: list[tuple[bool, str, str]] = []
 # **只数不可 SKIP 的项**：非 Edge 直连那条在当前身份无 InvokeFunctionUrl 权限时
 # 合法地 SKIP（那时的 403 来自 IAM 而不是 handler，算 PASS 就是假绿）。
 MIN_LOCAL_CHECKS = 15       # ① 合规 8 + ② 违规 7
-# ④ 里 `*_PARAM` 现在**逐个**出一条 check（3c-1B 起是 JWT_SECRET_PARAM 与
-# LOGIN_FLOW_SECRET_PARAM 两个，理由见 _check_env_has_no_plaintext_secret 的 docstring），
-# 所以这个下限比上一版 +1。**它一直是个保守下限、不是等值**：④ 段实际会出 5–6 条
-# （进包清单 / SSM TTL（带 if）/ 环境变量整体等值 / 无明文密钥 / 两个 *_PARAM），
-# 这里只记与上一版同样保守的那部分，不趁机重算其它段。
-# ④ 段的 `*_PARAM` 条数**随状态变**：L2 是两个（JWT_SECRET_PARAM + LOGIN_FLOW_SECRET_PARAM），
-# L3 清空 legacy_param 之后只剩一个。所以这里只记**恒定**的那部分，`*_PARAM` 那几条由
-# `_min_param_checks()` 在运行时按本地推导值补上——写死 2 会让 L3 的每次核对都差一条而红。
+# **它一直是个保守下限、不是等值**：只记**恒定**的那几条，`*_PARAM` 那些由 `_min_param_checks()`
+# 在运行时按本地推导值补上（3c-final 之后那个数恒为 1——auth 的 LOGIN_FLOW_SECRET_PARAM；
+# panel 一个都不持有）。写死它会让每次核对都差一条而红，而"没跑完"与"真的漂移了"在退出码上一样。
 # ④ 的 Function URL 三条（AuthType / 语句集合 / 逐条内容）是 M07 补的：此前 auth 的 Function URL 完全不在闸门里。
-MIN_DEPLOYED_CHECKS = 23    # ③ 4 + ④ 4 + ⑤ 6 + ⑥ 3 + ⑦ 6 = 23（④⑤ 都已扣掉 `*_PARAM` 那几条）
-# L2 下 23 + 3 = 26；L3 下 23 + 1 = 24，正好少掉 auth 与 panel 各一条 legacy 的 `*_PARAM`。
+# **算式（改了 check 条数就改这里，别只改数字）**：
+#     上一版 23 = ③ 4 + ④ 4 + ⑤ 6 + ⑥ 3 + ⑦ 6
+#   + ④ 三方对账 2（site / console 各**至少**一把 current）
+#   + ④ FIXTURE_ISSUER 1 + ④ verifier 角色存在性 1
+#   + ⑤ 三方对账 1（console **至少**一把 current）
+#   + Edge 公钥 3（含每把 site / 不含任何 console / RS256 形态）
+#   = 31
+# 三方对账那三条是**下限而非等值**：配了 previous 的 family 各多一条，实际数只会更多
+# （下限的语义是"少于它就是没跑完"，多出来不算问题）。
+MIN_DEPLOYED_CHECKS = 31
+# 三方对账（spec §11.6 第 3 层）与 Edge 公钥对账都**无条件计入**：会话签名的 KMS 形态不是可选组件。
 # ⑧ 只在 [ApiKey] 段存在（组件启用）时计入：产物 1 + 环境变量 2 + scope 1 +
 # Function URL 3 + EDGE_ROLE_ID 1 + 环境变量整体 1 + route 6 + Edge 白名单 1 +
 # runtime 3 + 哨兵行 2 + role 2 = 23
@@ -428,13 +437,14 @@ def _looks_high_entropy(v: str) -> bool:
 
 
 # auth 的会话相关 `*_PARAM`：④ 段对**每一个**单独出一条 check。
-# 只列这两个（不含 `CLIENT_SECRET_PARAM`——那是 Cognito client secret，与会话签名无关，
-# 本节的题目是"会话密钥有没有变成明文"）。**`JWT_SECRET_PARAM` 在 L3 之后整个键不下发**，
-# 所以点名前先按本地推导值取交集，见 `_present`。
-AUTH_SESSION_PARAM_KEYS = ("JWT_SECRET_PARAM", "LOGIN_FLOW_SECRET_PARAM")
-# panel 只有 legacy 那一个会话相关的 `*_PARAM`（它不参与登录流程，永不持 login-flow）。
-# 同样在 L3 之后整个键消失。
-PANEL_SESSION_PARAM_KEYS = ("JWT_SECRET_PARAM",)
+# 3c-final 起只剩 login-flow 一个（会话签名密钥在 KMS，`JWT_SECRET_PARAM` 整个键不存在了；
+# `CLIENT_SECRET_PARAM` 是 Cognito client secret，与会话签名无关，本节的题目是"会话密钥有没有
+# 变成明文"）。**清单里不许留已删掉的键**：`_present` 会把它交集掉 ⇒ 那条核对静默消失、
+# `_min_param_checks()` 同步缩水，闸门总数与下限一起降，什么都不红（Task 8 复审 I1 就是这个形态）。
+AUTH_SESSION_PARAM_KEYS = ("LOGIN_FLOW_SECRET_PARAM",)
+# panel **一个会话相关的 `*_PARAM` 都不持有**：它不参与登录流程（永不持 login-flow，spec §11.3），
+# 会话签名密钥在 KMS。空元组是意图本身，不是"还没填"——同上，写一个已删的键等于零条断言。
+PANEL_SESSION_PARAM_KEYS: tuple = ()
 
 
 def _present(env: dict, names: tuple) -> tuple:
@@ -499,7 +509,84 @@ def _check_env_has_no_plaintext_secret(env: dict, label: str,
               env.get(k, "缺失"))
 
 
-def _check_function_url_authz(lam, fn: str, label: str, edge_role: str) -> None:
+def _config_key_rows(families: tuple) -> dict:
+    """`site-builder/config.ini` 的 `[SessionKeys]` → 与 `SESSION_KEYS_JSON` **同一形态**的行。
+
+    形态与解析都用 `auth/session_keys.py`（`load_session_keys` + `env_json`），不在这里另写一个
+    parser：config 的合法形态只能有一个定义，抠字面量的第二份解析器对"清单改成计算出来的"
+    这类变化会静默给出旧答案（同 `_load_deploy_module` 的理由）。
+
+    `env_json` 只吐引用（kid / alg / role / key_arn / spki_sha256），**没有任何密钥材料**，
+    所以这些行可以进 check 的 detail。
+    """
+    import json
+    sys.path.insert(0, str(ROOT / "site-builder" / "auth"))
+    from session_keys import env_json, load_session_keys
+    return json.loads(env_json(load_session_keys(ROOT / "site-builder" / "config.ini"), families))
+
+
+def _check_session_keys_three_way(kms, env_json_text: str, label: str, families: tuple) -> None:
+    """spec §11.6 第 3 层：线上 env 的每一行 == config 的同一行，且 KMS 公钥的 SHA-256 == 那行的
+    `spki_sha256`。每个 kid 一条 check。
+
+    **为什么必须是三方而不是两方**：`SESSION_KEYS_JSON` 里没有密钥材料，只有引用。于是
+      · 只比 env 与 config ⇒ config 里 `spki_sha256` 抄错（换 key 时改了 ARN 忘了改指纹）时两边一致，
+        而 auth/panel 在**运行时**加载 allowlist 就会被 `verifier_env` 的自检拒掉 ⇒ 全部会话验签失败，
+        而部署与闸门双双全绿；
+      · 只比 config 与 KMS ⇒ "改了 config 没重部组件"看不出来（线上仍下发旧引用）。
+    三者同时相等才是"线上真的在用配置里那把 key"。
+
+    `kms.get_public_key` 失败（AccessDenied / 限流 / key 被删）时把异常名当指纹写进 detail ⇒ 那条
+    **红**而不是让整个脚本崩成"执行中断"（那会把后面所有段一起丢掉，见 `__main__` 的 crashed 分支）。
+    """
+    import json
+    env_rows = json.loads(env_json_text or "{}")
+    cfg_rows = _config_key_rows(families)
+    for fam in families:
+        for row in cfg_rows.get(fam, []):
+            live = next((r for r in env_rows.get(fam, []) if r.get("kid") == row["kid"]), None)
+            try:
+                der = kms.get_public_key(KeyId=row["key_arn"])["PublicKey"]
+                kms_fp = hashlib.sha256(der).hexdigest()
+            except Exception as exc:  # noqa: BLE001
+                kms_fp = f"<{type(exc).__name__}>"
+            ok = live == row and kms_fp == row["spki_sha256"]
+            check(ok, f"{label} 的 {row['kid']}：env == config == KMS 公钥指纹（三方对账）",
+                  "一致" if ok else f"env={live} config={row} kms_spki={kms_fp}")
+
+
+def _check_edge_public_keys(src: str, site_b64s: list, console_b64s: list) -> None:
+    """Edge 产物（`index.py` 文本）的公钥形态：含每把 site 公钥、不含任何 console 公钥、是 RS256 形态。
+
+    **按 base64(DER SPKI) 逐字节比，不比 kid**：kid 名字对而注入的是另一把公钥（换 key 时
+    `stack.py` 从 KMS 取到的与 config 期望的不是同一把、或注入了离线占位符）时，只比 kid 集合会全绿
+    而线上**每一个**会话都验签失败 ⇒ 全员 302 回登录页。
+
+    console 那条查的是**整份产物**而不是只查 allowlist 段：console family 的公钥不得以任何形式进 Edge
+    （spec §4.1）——注释里、别的常量里同样算漏。
+
+    公钥是公开材料，detail 里打**尾** 12 字符。**不能打头部**：RSA-2048 的 DER SPKI 头是固定的，
+    每把 key 的 base64 前 32 字符都是 `MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA…` ⇒ 打头部时
+    三把 key 在报告里长得一模一样，人眼无法判断缺的是哪一把（实测确认）。尾部与
+    `aws kms get-public-key --query PublicKey --output text` 的输出可直接对眼。
+    """
+    import re
+    m = re.search(r"^SITE_ALLOWLIST_JSON = '''(.*?)'''$", src, re.S | re.M)
+    body = m.group(1) if m else ""
+    check(bool(m) and all(b in body for b in site_b64s), "Edge 产物含每把 site 公钥（否则全员 302）",
+          f"缺 …{[b[-12:] for b in site_b64s if b not in body]}" if m else "找不到 SITE_ALLOWLIST_JSON")
+    check(not any(b in src for b in console_b64s), "Edge 产物不含任何 console 公钥（spec §4.1）",
+          f"混进来了 …{[b[-12:] for b in console_b64s if b in src]}"
+          if any(b in src for b in console_b64s) else f"{len(console_b64s)} 把都不在")
+    check("RS256_GOLDEN = " in src and "JWT_SECRET =" not in src and "LEGACY_ENTRY" not in src,
+          "Edge 产物是 RS256 形态（有黄金预热、无 HS/legacy 残留）",
+          "缺 RS256_GOLDEN" if "RS256_GOLDEN = " not in src
+          else "还有 JWT_SECRET / LEGACY_ENTRY 残留 —— 部署的是 3c-final 之前的代码"
+          if ("JWT_SECRET =" in src or "LEGACY_ENTRY" in src) else "")
+
+
+def _check_function_url_authz(lam, fn: str, label: str, edge_role: str, *,
+                              extra_principals: dict | None = None) -> None:
     """Function URL 的 AuthType + resource policy 与期望集合**等值**（三条 check）。
 
     判定不在这里另写一份，用部署脚本写 policy 时的同一个 `function_url_policy.drift`：闸门与部署脚本对
@@ -507,6 +594,12 @@ def _check_function_url_authz(lam, fn: str, label: str, edge_role: str) -> None:
     Condition 缺失、多一条同 principal 的语句都是假绿）。2025-10 起需要 `InvokeFunctionUrl` +
     `InvokeFunction`(InvokedViaFunctionUrl) 两条，缺一即 403；`AuthType=NONE` + `Principal:*` 会被安全扫描
     自动处置（实测删光整个 resource policy）。policy 整个不存在按"两条都缺"记红，不让脚本崩成"执行中断"。
+
+    `extra_principals`（`{标签: 精确 role ARN}`）透传给 `drift`：今天只有 auth 一处用它——
+    `[Verification] fixture_issuer = true` 时 `site-builder-verifier` 的两条（spec §11.7）。
+    **传与不传是两个方向的断言**：开着组件而语句缺 ⇒ `missing` 红；关掉组件而语句还在 ⇒ 那两条
+    成了野 Sid、`stray` 红（spec §11.7 要求关掉时它们被删掉）。**条数恒为三条**，不随
+    `extra_principals` 变——`MIN_DEPLOYED_CHECKS` 把 Function URL 记成恒定的三条。
     """
     import json
 
@@ -522,14 +615,15 @@ def _check_function_url_authz(lam, fn: str, label: str, edge_role: str) -> None:
         policy = json.loads(lam.get_policy(FunctionName=fn)["Policy"])
     except lam.exceptions.ResourceNotFoundException:
         policy = None
-    d = fup.drift(policy, edge_role)
+    d = fup.drift(policy, edge_role, extra_principals=extra_principals)
+    want_sids = fup.sids_for(edge_role, extra_principals)
     # 只为诊断文案：线上到底授给了谁（AROA… 一眼就能认出是"角色被删过"）
     principals = sorted({str(p.get("AWS") if isinstance(p, dict) else p)
                          for p in (s.get("Principal") for s in (policy or {}).get("Statement", []))})
     check(not d.missing and not d.stray,
-          f"{label} resource policy 恰好是期望的两条语句（Sid 无缺无多；2025-10 起缺一即 403）",
+          f"{label} resource policy 恰好是期望的 {len(want_sids)} 条语句（Sid 无缺无多；2025-10 起缺一即 403）",
           f"缺 {list(d.missing)}，非预期 {list(d.stray)}" if (d.missing or d.stray)
-          else f"{list(fup.EXPECTED_SIDS)}")
+          else f"{list(want_sids)}")
     check(not d.mismatched,
           f"{label} 每条语句的 Principal / Action / Condition 逐字节 == 期望"
           "（Principal 是 exact edge role，不是 * / 账号根 / 已删角色的 AROA 形态）",
@@ -718,9 +812,47 @@ def run_deployed() -> None:
     # 且**不会因为线上少了一个键而少核一条**（少了的话整体等值那条先红）。
     _check_env_has_no_plaintext_secret(got_env, "site-auth-service",
                                        _present(want_env, AUTH_SESSION_PARAM_KEYS))
+    # 3c-final（spec §11.6 第 3 层）：会话签名密钥在 KMS，环境变量只有**引用**。所以除了"env == 本地
+    # 推导值"之外，还要问第三方：KMS 里那把 key 的真实公钥指纹 == 引用里写的 `spki_sha256` 吗。
+    # 两方比较全绿而运行时全挂的形态见 `_check_session_keys_three_way` 的 docstring。
+    _check_session_keys_three_way(boto3.client("kms", region_name=region),
+                                  got_env.get("SESSION_KEYS_JSON"), "site-auth-service",
+                                  ("site", "console"))
+    # 夹具签发器（spec §11.7 / ADR 0002）：`[Verification]` 是**可选段**，段缺失 = 组件不存在。
+    # 判定用 `deploy_auth.read_verification`（与部署脚本同一个真源），不在这里另写一遍 flag 解析——
+    # 那会让"config 写了个 yes"在两侧得出不同结论。它对坏值 SystemExit，而那时 deploy_auth 本来
+    # 也拒绝部署，闸门跟着响亮失败是对的。**不用 read_cfg**：那个函数对缺键硬退出。
+    da_verification = da.read_verification(_parsed_cfg(CFG_PATH),
+                                           account=read_cfg("Platform", "account_id"))
+    fixture_on = da_verification.fixture_issuer
+    verifier_arn = (f"arn:aws:iam::{read_cfg('Platform', 'account_id')}:role/{da.VERIFIER_ROLE_NAME}"
+                    if fixture_on else "")
     # M07：auth 的 Function URL 此前**没有任何闸门**——edge role 重建后 policy 仍授旧 principal ⇒ 全平台登录
     # 403 而 deploy_auth exit 0。与 ⑤⑧ 同一个判定，三条平台 Function URL 全覆盖。
-    _check_function_url_authz(lam, "site-auth-service", "auth", read_cfg("Deployer", "edge_role_arn"))
+    # 开着夹具组件时期望集合多 verifier 两条；**关掉时故意不传** ⇒ 残留的那两条被报成野 Sid（spec §11.7
+    # 要求关掉即删——留着就是一条仍可 assume 的冒充路径的一半）。
+    _check_function_url_authz(lam, "site-auth-service", "auth", read_cfg("Deployer", "edge_role_arn"),
+                              extra_principals=({"verifier": verifier_arn} if fixture_on else None))
+    check(got_env.get("FIXTURE_ISSUER") == ("on" if fixture_on else "off"),
+          "auth 的 FIXTURE_ISSUER 与 [Verification] 一致",
+          f"线上 {got_env.get('FIXTURE_ISSUER', '缺失')!r}，配置 {'on' if fixture_on else 'off'}"
+          + ("" if got_env.get("FIXTURE_ISSUER") == ("on" if fixture_on else "off")
+             else " —— POST /fixture-session 的存在与否与配置不符"))
+    # **角色的存在性要单独判**：关掉组件时 resource policy 那两条被删掉了，但角色本身还在的话
+    # 它的 inline policy 也还在 ⇒ 账号内被信任的 principal 仍能 assume 它（spec §11.7 的关闭语义是
+    # 角色消失）。`ensure_verifier_role` 关掉时会删它，所以线上留着 = 那一步没跑成。
+    iam = boto3.client("iam")
+    try:
+        iam.get_role(RoleName=da.VERIFIER_ROLE_NAME)
+        role_exists = True
+    except iam.exceptions.NoSuchEntityException:
+        role_exists = False
+    check(role_exists == fixture_on,
+          f"{da.VERIFIER_ROLE_NAME} 角色存在性与 [Verification] 一致",
+          f"线上{'有' if role_exists else '无'}该角色，配置 {'on' if fixture_on else 'off'}"
+          + ("" if role_exists == fixture_on
+             else " —— 关掉组件却留着角色 = 一条仍可 assume 的夹具签发路径；"
+                  "开着组件却没有角色 = 验收夹具跑不起来"))
 
 
 def run_panel() -> None:
@@ -761,6 +893,11 @@ def run_panel() -> None:
     diff = sorted(k for k in set(env) | set(want_env) if env.get(k) != want_env.get(k))
     check(not diff, "panel 环境变量 == 本地 lambda_environment() 推导值",
           f"不一致的键: {diff}" if diff else f"{len(want_env)} 个键一致（只有参数名，无明文）")
+
+    # 3c-final：panel 只持 console family 的引用（site 的一把都不该在它的 env 里，spec §4.1）。
+    # 与 ④ 同一个三方判定，families 只给 console。
+    _check_session_keys_three_way(boto3.client("kms", region_name=region),
+                                  env.get("SESSION_KEYS_JSON"), "panel", ("console",))
 
     edge_role = read_cfg("Deployer", "edge_role_arn")
     _check_function_url_authz(lam, fn, "panel", edge_role)
@@ -847,7 +984,9 @@ def _verify_direct_invoke_is_rejected(lam, fn: str, path: str, name: str,
 
 
 def run_mcp_and_route() -> None:
-    """⑥ MCP runtime 与 ⑦ console route。"""
+    """⑥ MCP runtime、⑥b Edge 产物的会话公钥、⑦ console route。"""
+    import base64
+
     import boto3
 
     region = read_cfg("Platform", "region")
@@ -901,6 +1040,30 @@ def run_mcp_and_route() -> None:
               uri.rsplit("/", 1)[-1][:40] if uri else "取不到 containerUri")
     else:
         check(False, "找到 site_builder_deploy runtime")
+
+    # ---- Edge 产物里的会话公钥（3c-final；spec §4.1 / §11.6）--------------------------------
+    # **放在 ⑦ 之前**：⑦ 在 console route 缺失时会 return，那之后的检查一条都不会跑。
+    # 这一段问三件事：site 的每把公钥都在产物里、console 的一把都不在、产物是 RS256 形态。
+    # 期望值**从 KMS 现取**（`GetPublicKey` 的 DER 再 base64），不用 config 里的 `spki_sha256`——
+    # 那是**指纹**不是公钥本体，拿它去 grep 产物永远匹配不上，会得到一条恒红（或反过来，
+    # 若判据写成"存在即可"则恒绿）的假检查。
+    print("\n── ⑥b Edge 产物里的会话公钥（RS256 形态）─────────")
+    try:
+        edge_src = _edge_deployed_source()
+        kms = boto3.client("kms", region_name=region)
+        fam_b64: dict = {}
+        for fam in ("site", "console"):
+            fam_b64[fam] = [
+                base64.b64encode(kms.get_public_key(KeyId=r["key_arn"])["PublicKey"]).decode()
+                for r in _config_key_rows(("site", "console")).get(fam, [])]
+    except Exception as exc:            # noqa: BLE001 读不到就是没验成，不许当通过
+        # 与 `_check_mcp_is_not_a_platform_subdomain` 同一条纪律：读不到产物/取不到公钥时出一条
+        # **红**，而不是让脚本崩成"执行中断"（那会把 ⑦⑧⑨ 一起丢掉）。少掉的两条由 min_expected
+        # 的下限第二次抓住——两个信号方向一致。
+        check(False, "读到 Edge 产物与 KMS 公钥（Edge 公钥对账的前提）",
+              f"{type(exc).__name__}: {exc} —— 下面三条公钥对账**未验成**，不能当通过")
+    else:
+        _check_edge_public_keys(edge_src, fam_b64["site"], fam_b64["console"])
 
     print("\n── ⑦ console route 记录 ────────────────────────────")
     table = read_cfg("Platform", "routing_table")

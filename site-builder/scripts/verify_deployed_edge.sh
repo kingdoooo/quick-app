@@ -97,6 +97,27 @@ unzip -o -q "$TMP/code.zip" -d "$TMP"
 # 这个坑很容易踩。
 echo "  已取到 ${FUNCTION}:${QUALIFIER}（$(wc -c <"$TMP/code.zip") 字节）"
 
+# ---- 3c-final / ADR 0003：Edge 内嵌 verifier 现在 import cryptography ----
+# Lambda@Edge 既没有层也没有环境变量，所以 `stack.py` 把锁定的 cryptography 闭包**交叉安装**进
+# asset 目录。没装成时 Edge **每次冷启动**都 import 失败（不是"某些请求慢"，是整站不可用）。
+# `stack.py` 在走离线降级路径（注入占位符、不 vendoring）时会在 asset 里放一个哨兵文件——
+# 两者**由构造互斥**，所以"有 cryptography/ 且没有哨兵"两条一起才证明产物可部署。
+if [ -d "$TMP/cryptography" ] && grep -qE '^RS256_GOLDEN = ' "$TMP/index.py"; then
+  echo "PASS  产物带 vendored cryptography 与黄金预热（RS256 形态，ADR 0003）"
+else
+  fail "产物不是 RS256 形态：缺 cryptography/ 目录或 RS256_GOLDEN —— 部署的是 3c-final 之前的代码"
+fi
+if [ -f "$TMP/SYNTH-ONLY-PLACEHOLDER-DO-NOT-DEPLOY.txt" ]; then
+  fail "产物里有 SYNTH-ONLY-PLACEHOLDER-DO-NOT-DEPLOY.txt —— 部署的是离线 synth 的占位产物（无真公钥、无 cryptography），Edge 冷启动必失败"
+else
+  echo "PASS  产物无离线 synth 哨兵文件"
+fi
+if grep -qE '^JWT_SECRET = |^LEGACY_ENTRY = ' "$TMP/index.py"; then
+  fail "产物里还有 JWT_SECRET / LEGACY_ENTRY —— HS/legacy 残留"
+else
+  echo "PASS  产物无 JWT_SECRET / LEGACY_ENTRY 赋值（HS/legacy 形态已删净）"
+fi
+
 echo "── ③ 逐行比对：产物必须 == 源码经占位符替换 ───────"
 # 只允许差异出现在**含占位符的行**上。行数不同、或出现非占位符差异，都说明
 # 部署出去的不是这份源码（陈旧 cdk.out / 手改过线上代码 / 版本搞错）。
@@ -191,70 +212,82 @@ else
 fi
 
 # ---- S1：M05（token 用途混用）与 M06（同名 cookie 遮蔽）----
-# ③ 的逐行比对已经能发现"产物不是这份源码"，这里再点名两条**语义**：核对旧版本
-# （`$0 <version>`）时 ③ 只会说"行数/内容不一致"，而这两行会直接说出缺的是哪条
-# 安全属性。同样按代码行断言，不用裸 grep——两个名字在注释里都出现。
-# **M05 现在有两条产物断言，不是一条**（3c-1B-G A1）：3c-1B 之后线上 token 全是新形态，
-# 用途比较落在 `token_use` 上；`typ` 那条只管 legacy 入口（L3 已关、3c-3 才删代码）。
-# 只查 `typ` 会在"新入口的 token_use 比较被删掉"时**全绿**——那正是今天的主路径。
+# ③ 的逐行比对已经能发现"产物不是这份源码"，这里再点名一条**语义**：核对旧版本
+# （`$0 <version>`）时 ③ 只会说"行数/内容不一致"，而这一行会直接说出缺的是哪条
+# 安全属性。同样按代码行断言，不用裸 grep——这个名字在注释里也出现。
+# **3c-final 起只有一条**：legacy 入口整条代码已删，`typ` 那条断言随它一起删掉
+# （留着它会永久红，而"永久红"很快会被当成噪音忽略——那比没有断言更糟）。
 if grep -qE '^\s+if claims\.get\("token_use"\) != "site-session":' "$TMP/index.py"; then
-  echo "PASS  新入口查 token_use（M05 主路径：console 用途的 token 不能当站点会话）"
+  echo "PASS  查 token_use（M05：console 用途的 token 不能当站点会话）"
 else
-  fail "产物的 _verify_site_session 没有 token_use 检查 —— M05 在**新形态**上未生效：一个 console 升级码/面板会话就是一个有效站点会话"
+  fail "产物的 _verify_site_session 没有 token_use 检查 —— M05 未生效：一个 console 升级码/面板会话就是一个有效站点会话"
 fi
-if grep -qE '^\s+if claims\.get\("typ"\) != "session":' "$TMP/index.py"; then
-  echo "PASS  legacy 入口查 typ（M05 旧路径；L3 后入口已关，3c-3 删代码时这条一起删）"
-else
-  fail "产物的 legacy 验签没有 typ 检查 —— legacy 入口若被重开，60s 升级码就是有效站点会话"
-fi
-# ---- 3c-1A：site family 的 kid allowlist + legacy 入口开关（spec §4.3 / §11.6）----
-# 产物里的 allowlist 必须**恰好**是 site-builder/config.ini [SessionKeys] 的 site family（不多不少、
-# 不含 console），legacy 开关必须与 legacy_param 是否非空一致，且新入口的"未知 kid 直接拒"分支在。
-# 比对只取 kid，**不打印 secret**。
-SK_EXPECTED="$(python3 - "$ROOT" <<'PY'
+# ---- 3c-final：site family 的**公钥精确对账**（spec §4.1 / §4.3 / §11.6）----
+# 判据从"kid 集合相等"升级为"**每把 key 的公钥逐字节**"。为什么必须升级：kid 只是个名字，
+# 而注入的是 `stack.py` 从 KMS 现取的公钥。两者可以不一致——换 key 时改了 config 的 key_arn、
+# 用了陈旧 cdk.out、或走了离线降级路径——那时 kid 集合照样相等，而线上**每一个**会话都验签
+# 失败（全员 302 回登录页）。反过来，console family 的公钥**一把都不许出现在产物任何位置**
+# （spec §4.1：Edge 只持 site）。
+# 公钥是公开材料，可以打印；这里打**尾** 12 字符——RSA-2048 的 DER 头固定，前 32 字符每把都一样。
+SK_ROWS="$(python3 - "$ROOT" <<'PY'
 import sys
 from pathlib import Path
 root = Path(sys.argv[1]); sys.path.insert(0, str(root / "site-builder" / "auth"))
 from session_keys import load_session_keys
 k = load_session_keys(root / "site-builder" / "config.ini")
-print(",".join(sorted(r.kid for r in k.allowlist("site"))), "on" if k.legacy_param else "off")
+for fam in ("site", "console"):
+    for r in k.allowlist(fam):
+        print(fam, r.kid, r.key_arn)
 PY
 )"
-SK_DEPLOYED="$(python3 - "$TMP/index.py" <<'PY'
+[ -n "$SK_ROWS" ] || { echo "读不出 config.ini [SessionKeys] 的任何 key 行"; exit 1; }
+SITE_KIDS_EXPECTED="$(printf '%s\n' "$SK_ROWS" | awk '$1=="site"{print $2}' | sort | paste -sd, -)"
+SITE_KIDS_DEPLOYED="$(python3 - "$TMP/index.py" <<'PY'
 import json, re, sys
 src = open(sys.argv[1]).read()
 m = re.search(r"^SITE_ALLOWLIST_JSON = \'\'\'(.*?)\'\'\'$", src, re.S | re.M)
-le = re.search(r'^LEGACY_ENTRY = "(on|off)"', src, re.M)   # 行尾有注释，不锚 $
-if not m or not le:
+if not m:
     print("MISSING"); sys.exit(0)
-print(",".join(sorted(json.loads(m.group(1)))), le.group(1))
+try:
+    print(",".join(sorted(json.loads(m.group(1)))))
+except ValueError:
+    print("UNPARSABLE")
 PY
 )"
-if [ "$SK_DEPLOYED" = "$SK_EXPECTED" ]; then
-  echo "PASS  Edge allowlist 的 kid 集合与 legacy 开关 == config（${SK_EXPECTED}）"
+if [ "$SITE_KIDS_DEPLOYED" = "$SITE_KIDS_EXPECTED" ]; then
+  echo "PASS  Edge allowlist 的 kid 集合 == config 的 site family（${SITE_KIDS_EXPECTED}）"
 else
-  fail "Edge allowlist/legacy 开关与 config 不一致：产物=[$SK_DEPLOYED] 期望=[$SK_EXPECTED]"
+  fail "Edge allowlist 的 kid 集合与 config 不一致（要不多不少）：产物=[$SITE_KIDS_DEPLOYED] 期望=[$SITE_KIDS_EXPECTED]"
 fi
+# 逐把对账。**用 here-doc 喂 while，不用管道**：`... | while read` 会把循环体放进子 shell，
+# 于是 `fail()` 里的 `FAILURES++` 落在子 shell 里、循环结束就丢掉 ⇒ 每一条红都被打印出来
+# 却**进不了退出码**，整个脚本 exit 0。这是本文件全部断言共同依赖的前提。
+while read -r FAM KID ARN; do
+  [ -n "${FAM:-}" ] || continue
+  B64="$(aws kms get-public-key --key-id "$ARN" --region "$REGION" \
+          --query PublicKey --output text 2>/dev/null || echo "")"
+  if [ -z "$B64" ] || [ "$B64" = "None" ]; then
+    # 变量后紧跟全角括号**必须加花括号**（本文件 ② 段那条注释）：`$KID（` 会被读成变量名
+    # `KID（`，set -u 下当场 `unbound variable` ⇒ 整个脚本中断，而这条本该只是一条红。
+    # 实测过：不加花括号时这个分支把闸门变成"执行中断"。
+    fail "取不到 ${KID}（${ARN}）的 KMS 公钥 —— 这条**未验成**，不当通过（先查凭证 / 区 / key 状态）"
+    continue
+  fi
+  if grep -qF -- "$B64" "$TMP/index.py"; then FOUND=yes; else FOUND=no; fi
+  case "${FAM}:${FOUND}" in
+    site:yes)    echo "PASS  site kid $KID 的 KMS 公钥逐字节在产物里（尾 …${B64: -12}）" ;;
+    site:no)     fail "site kid $KID 的 KMS 公钥**不在**产物里（尾 …${B64: -12}）—— Edge 拿的是另一把公钥，该 kid 签的会话全部 302（陈旧 cdk.out / 换了 key 没重部 / 离线降级）" ;;
+    console:no)  echo "PASS  console kid $KID 的公钥不在 Edge 产物里（spec §4.1）" ;;
+    console:yes) fail "console kid $KID 的公钥出现在 Edge 产物里 —— console family 的公钥不得进 Edge（spec §4.1）：面板会话会被站点边缘接受" ;;
+  esac
+done <<ROWS
+$SK_ROWS
+ROWS
 if grep -qE '^\s+return None, "unknown_kid"' "$TMP/index.py"; then
-  echo "PASS  未知 kid 直接拒、不回落 legacy（状态机第 5 条）"
+  echo "PASS  未知 kid 直接拒（状态机第 5 条：不回落任何别的入口）"
 else
   fail "产物的 verifier 没有 unknown_kid 分支 —— 部署的是 3c-1A 之前的代码"
 fi
-# ---- 3c-1B：JWT_SECRET 的**空/非空**必须与 legacy 开关一致（spec §11.8.1）----
-# 这是本文件已经栽过一次的形态（见上面 TRUSTED_IDPS 那段注释）：一个被**空替换**掉的注入值
-# 让本该收紧的配置静默失效，而按"有没有引号里的东西"断言看不出来。两个方向都要判：
-#   · 开关 on 而密钥为空 ⇒ 线上现存的 legacy cookie 全部验签失败（用户被踢回登录页）；
-#   · 开关 off 而密钥非空 ⇒ L3 没做干净，一把本该退场的密钥还留在全球复制的产物里。
-# **按整行断言**，避免注释里的同名字样蒙混过关。
-LEGACY_SWITCH="${SK_DEPLOYED##* }"
-if grep -qE '^JWT_SECRET = ""' "$TMP/index.py"; then JWT_EMPTY=yes; else JWT_EMPTY=no; fi
-case "${LEGACY_SWITCH}:${JWT_EMPTY}" in
-  on:no)   echo "PASS  legacy 开关 on 且 JWT_SECRET 非空（形态一致）" ;;
-  off:yes) echo "PASS  legacy 开关 off 且 JWT_SECRET 为空串（L3 形态一致）" ;;
-  on:yes)  fail "legacy 开关是 on 但 JWT_SECRET 被替换成空串 —— 线上现存的 legacy cookie 会全部验签失败" ;;
-  off:no)  fail "legacy 开关是 off 但 JWT_SECRET 仍非空 —— L3 没做干净，一把该退场的密钥还留在产物里" ;;
-  *)       fail "读不出 legacy 开关（SK_DEPLOYED=[$SK_DEPLOYED]），无法核对 JWT_SECRET 形态" ;;
-esac
 # 同名 sb_session 必须**逐个**验，且**不得截断**：条数上限会按路径深度让 M06 复活
 # （可遮蔽条数上界 4n−2，n 是路径段数，站点 URL 空间不受平台约束 ⇒ n 无界）。
 if grep -qE '^\s+for token in _get_cookies\(request, "sb_session"\):' "$TMP/index.py"; then

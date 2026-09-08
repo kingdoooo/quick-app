@@ -38,10 +38,14 @@ def rendered(sid, action, principal, *, function_url_auth_type=None, invoked_via
     return s
 
 
-def good_pair(edge_role_arn):
-    """与 `function_url_policy.expected_statements` 渲染后完全相同的两条（正对照用）。"""
-    return [rendered("edge-invoke", "lambda:InvokeFunctionUrl", edge_role_arn, function_url_auth_type="AWS_IAM"),
-            rendered("edge-invoke-function", "lambda:InvokeFunction", edge_role_arn, invoked_via_function_url=True)]
+def good_pair(role_arn, *, label="edge"):
+    """与 `function_url_policy.expected_statements` 渲染后完全相同的两条（正对照用）。
+
+    `label` 对应 `_pair(label, arn)` 的 Sid 前缀：默认 `edge`（edge role 那两条），
+    `label="verifier"` 造 `[Verification] fixture_issuer = true` 时 `site-builder-verifier` 的那两条。
+    """
+    return [rendered(f"{label}-invoke", "lambda:InvokeFunctionUrl", role_arn, function_url_auth_type="AWS_IAM"),
+            rendered(f"{label}-invoke-function", "lambda:InvokeFunction", role_arn, invoked_via_function_url=True)]
 
 
 class FakeLambdaPolicy:

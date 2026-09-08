@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """三个 verifier 的 `session_verify` outcome 计数（CloudWatch Logs Insights，**只读**）。
 
-spec §8：退役 legacy 入口的判据是 `accepted_legacy == 0 且总量非 0` 持续超过最长 TTL。
+spec §8：退役一把旧 key 的判据是 `accepted_previous == 0 且总量非 0` 持续超过最长 TTL。
 "总量非 0" 那半句是为了证明埋点本身在工作（埋点异常一律吞掉，丢行是无声的）。
-本脚本就是那个读数工具（3c-1A 先建好；3c-1B/L2→L3 用它下判断）。
+本脚本就是那个读数工具（轮转 runbook 的排空一步用它下判断）。
+
+**3c-final 起只有一个排空目标**（`previous`）：HS/legacy 入口整条不存在，词表里也没有它那一列。
+理由与代价见 `DRAIN_TARGETS` / `OUTCOMES` 上方的注释。
 
 日志组：
   auth   /aws/lambda/site-auth-service                         （us-east-1）
@@ -15,14 +18,15 @@ Edge 的组名前缀 `us-east-1.` 是 Lambda@Edge 的固定形态；区清单用
 用法（用不带路径的 python3，见 CLAUDE.md）：
     python3 site-builder/scripts/session_verify_counts.py --hours 1
     python3 site-builder/scripts/session_verify_counts.py --hours 24 --require-total   # 任一 verifier 为 0 即退 1
-    # 排空闸门（runbook 的 ④ / ⑨）**只用这一个旗标**：四条判据锁在脚本里（3c-1B-G A2）
-    python3 site-builder/scripts/session_verify_counts.py --drain-gate previous    # ④ 用 --drain-gate legacy
+    # 排空闸门（轮转 runbook 的排空一步）**只用这一个旗标**：四条判据锁在脚本里（3c-1B-G A2）
+    python3 site-builder/scripts/session_verify_counts.py --drain-gate previous
     # 下面这些是**诊断**旗标，自由组合、可配短窗口；**空窗口下 --require-zero 会退 0**，所以它们不是闸门
     python3 site-builder/scripts/session_verify_counts.py --hours 1 --require-total --require-zero accepted_previous
 
 退出码：0 = 所有要求都满足；1 = 任一要求不满足（stderr 说明是哪条）；2 = 用法错误（如 --require-zero 打错词表外的 outcome）。
 **区级失败不静默**：Edge 日志组按 DescribeRegions 返回的（**已启用**）区逐个查，任一区 DescribeLogGroups 失败
-（AccessDenied / 限流 / 网络）即退出——静默跳过 = 少算一区 = `accepted_*` 假 0，而 ⑨ 守的是不可逆的 ⑩。
+（AccessDenied / 限流 / 网络）即退出——静默跳过 = 少算一区 = `accepted_*` 假 0，而排空闸门守的是
+不可逆的下一步（把退役的那把 key 从 config 与 KMS 里去掉）。
 """
 from __future__ import annotations
 
@@ -40,9 +44,14 @@ AUTH_FN = "site-auth-service"
 PANEL_FN = "site-panel"
 # 排空闸门（3c-1B-G A2）：`--drain-gate <目标>` → 要求为 0 的那一列。
 # 26 h 的来历见 DEPLOY.md：站点会话 TTL 24 h + auth 的 secret 缓存 5 min + Edge 全球复制 10–20 min + 余量。
-DRAIN_TARGETS = {"previous": "accepted_previous", "legacy": "accepted_legacy"}
+# **3c-final 起只有一个目标**：`previous`（退役上一把 RS key）。HS/legacy 那个目标随 HS 形态一起删掉，
+# 且**必须真的删掉、不能留着当无害的别名**：那一列再也不会有读数 ⇒ 以它为目标的排空判据恒真，
+# 一个看起来像闸门的旗标变成空转，而它守的是不可逆的退役步骤。
+DRAIN_TARGETS = {"previous": "accepted_previous"}
 DRAIN_MIN_HOURS = 26
-OUTCOMES = ("accepted_current", "accepted_previous", "accepted_legacy", "unknown_kid",
+# 词表必须与 `auth/session.py` 的 `OUTCOMES` 逐字相同（`test_outcome_vocabulary_matches_session_module`
+# 按等值断言）：多一个不存在的 outcome = 一列永远为 0 的读数，少一个 = 那一列的读数被静默丢掉。
+OUTCOMES = ("accepted_current", "accepted_previous", "unknown_kid",
             "alg_mismatch", "wrong_audience", "wrong_token_use", "bad_signature", "expired")
 QUERY = ('fields @message | filter @message like /"event": "session_verify"/ '
          '| parse @message /"outcome": "(?<outcome>[a-z_]+)"/ | stats count() as n by outcome')
@@ -78,7 +87,7 @@ def require_edge_groups(groups: list) -> list:
 def nonzero_outcomes(by_verifier: dict, outcomes: list) -> list:
     """要求为 0 的 outcome 里，任一 verifier 列 > 0 的那些；每条带三列读数，给 stderr 直接打。
 
-    ④/⑨ 的判据是"三列 accepted_legacy / accepted_previous 全 0"——原来由人读三列，脚本 exit 0 并不代表它。
+    排空的判据是"三列 accepted_previous 全 0"——原来由人读三列，脚本 exit 0 并不代表它。
     """
     out = []
     for o in outcomes:
@@ -150,15 +159,15 @@ def collect(session, hours: float) -> dict[str, dict[str, int]]:
 
 def render(by_verifier: dict[str, dict[str, int]]) -> tuple[str, int, int]:
     lines = [f"{'outcome':18s} {'auth':>8s} {'panel':>8s} {'edge':>8s}"]
-    total = legacy = 0
+    total = previous = 0
     for o in OUTCOMES:
         row = [by_verifier[v].get(o, 0) for v in ("auth", "panel", "edge")]
         total += sum(row)
-        if o == "accepted_legacy":
-            legacy = sum(row)
+        if o == "accepted_previous":
+            previous = sum(row)
         lines.append(f"{o:18s} {row[0]:>8d} {row[1]:>8d} {row[2]:>8d}")
-    lines.append(f"总量 {total}；accepted_legacy {legacy}")
-    return "\n".join(lines), total, legacy
+    lines.append(f"总量 {total}；accepted_previous {previous}")
+    return "\n".join(lines), total, previous
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -168,21 +177,21 @@ def main(argv: list[str] | None = None) -> int:
                     help="任一 verifier 的总量为 0 即退 1（按 auth / panel / edge 分别看：证明每处埋点都在工作，"
                          "这是退役判据的另一半；Edge 列为 0 不能被 auth/panel 的总量遮住）")
     ap.add_argument("--require-zero", action="append", default=[], metavar="OUTCOME", choices=OUTCOMES,
-                    help="该 outcome 在任一 verifier 列 > 0 即退 1（可重复）。⑨ 用 accepted_previous、④ 用 accepted_legacy："
+                    help="该 outcome 在任一 verifier 列 > 0 即退 1（可重复）。排空用 accepted_previous："
                          "这是退役判据的正面那半，脚本自己判，不留给人读三列")
     ap.add_argument("--require-nonzero", action="append", default=[], metavar="OUTCOME", choices=OUTCOMES,
-                    help="该 outcome 在**每一**verifier 列都必须 > 0，否则退 1（可重复）。④/⑨ 用 accepted_current：证明新形态"
+                    help="该 outcome 在**每一**verifier 列都必须 > 0，否则退 1（可重复）。排空用 accepted_current：证明新形态"
                          "在三处都真的被接受过")
-    ap.add_argument("--drain-gate", choices=tuple(DRAIN_TARGETS), metavar="{previous,legacy}",
-                    help="排空闸门（runbook 的 ④ / ⑨ 只用这一个旗标）：把四条判据锁进脚本"
+    ap.add_argument("--drain-gate", choices=tuple(DRAIN_TARGETS), metavar="{previous}",
+                    help="排空闸门（轮转 runbook 的排空一步只用这一个旗标）：把四条判据锁进脚本"
                          f"——窗口 ≥ {DRAIN_MIN_HOURS} h、每个 verifier 总量 > 0、"
-                         "accepted_{previous,legacy} 三列全 0、accepted_current 三列全 > 0。"
+                         "accepted_previous 三列全 0、accepted_current 三列全 > 0。"
                          "不可逆的退役步骤只许用它，别用下面那几个自由组合的诊断旗标")
     args = ap.parse_args(argv)
     if args.drain_gate:
         # **把四条判据合成一个旗标**（3c-1B-G A2）：原先它们是四个独立参数，少任何一个都
         # 静默放宽，而最坏的一种不是"少判一条"而是**空窗口**——`--require-zero` 只报非零列，
-        # 三列全空自然通过 ⇒ exit 0 被读成"已排空"，下一步就是删 SSM 参数（不可逆）。
+        # 三列全空自然通过 ⇒ exit 0 被读成"已排空"，下一步就是退役那把 key（不可逆）。
         if args.hours != ap.get_default("hours") and args.hours < DRAIN_MIN_HOURS:
             raise SystemExit(
                 f"--drain-gate 的窗口不得短于 {DRAIN_MIN_HOURS} h（给的是 {args.hours}）——"
@@ -195,10 +204,10 @@ def main(argv: list[str] | None = None) -> int:
     elif set(args.require_zero) & set(DRAIN_TARGETS.values()):
         # 复审低优先级 1：旧文档里的那条组合仍然合法（诊断用），但它不是闸门——空窗口照样退 0。
         # 不拒绝（短窗口看"previous 还有没有人用"是正当需求），只在 stderr 说一句。
-        print("提醒：--require-zero accepted_previous/accepted_legacy 不带 --drain-gate 时**不是排空闸门**"
-              "——空窗口也会退 0。判 ④/⑨ 用 --drain-gate {previous,legacy}。", file=sys.stderr)
+        print("提醒：--require-zero accepted_previous 不带 --drain-gate 时**不是排空闸门**"
+              "——空窗口也会退 0。判排空用 --drain-gate previous。", file=sys.stderr)
     by_verifier = collect(boto3.Session(), args.hours)
-    text, _total, _legacy = render(by_verifier)
+    text, _total, _previous = render(by_verifier)
     print(text)
     rc = 0
     silent = silent_verifiers(by_verifier)

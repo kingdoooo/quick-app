@@ -7,6 +7,7 @@ provision_dynamodb.py / undeploy.py / schema.py 仍是旧版"这种半量部署�
 判定抽成纯函数后在这里喂坏形态：每一种半量部署都必须被咬住。
 """
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -14,6 +15,10 @@ import pytest
 
 _SCRIPT = (Path(__file__).parents[2] / "scripts"
            / "verify_deployed_components.py")
+# 三套件共用的 RS256 测试密钥 + FakeKms（panel/tests/upgrade_code_vectors.py 的文件头解释了为什么共用
+# 一份）。**在这里 insert 而不是在 conftest 里**：auth / router 两侧也是各自 test 文件自己 insert，
+# 往 deployer 的 conftest 里塞会让各包的同名 conftest 撞车。
+sys.path.insert(0, str(Path(__file__).parents[2] / "panel" / "tests"))
 
 
 def _gate():
@@ -198,15 +203,17 @@ def _env_check(env, param_key):
     return g.results
 
 
-AUTH_PARAM_KEYS = ("JWT_SECRET_PARAM", "LOGIN_FLOW_SECRET_PARAM")
-GOOD_ENV = {"JWT_SECRET_PARAM": "/site-builder/jwt-secret",
-            "LOGIN_FLOW_SECRET_PARAM": "/site-builder/login-flow-secret",
+# 3c-final：会话签名密钥进 KMS，`JWT_SECRET_PARAM` 整个键不存在了 ⇒ auth 只剩 login-flow 这一个
+# 会话相关的 `*_PARAM`（`CLIENT_SECRET_PARAM` 是 Cognito client secret，与会话签名无关）。
+AUTH_PARAM_KEYS = ("LOGIN_FLOW_SECRET_PARAM",)
+GOOD_ENV = {"LOGIN_FLOW_SECRET_PARAM": "/site-builder/login-flow-secret",
             "CLIENT_SECRET_PARAM": "/site-builder/site-client-secret",
+            "SESSION_KEYS_JSON": '{"site":[],"console":[]}',
             "BASE_DOMAIN": "example.test"}
 
 
-def test_param_name_only_env_is_green_for_both_secret_params():
-    """正对照：两个参数名都在、都是路径 ⇒ 全绿（否则下面的红证明不了什么）。"""
+def test_param_name_only_env_is_green_for_the_secret_param():
+    """正对照：参数名在、是路径 ⇒ 全绿（否则下面的红证明不了什么）。"""
     assert all(ok for ok, _, _ in _env_check(GOOD_ENV, AUTH_PARAM_KEYS))
 
 
@@ -265,19 +272,24 @@ def _auth_plaintext_check_param_keys(src: str | None = None) -> set:
     return found
 
 
-def test_the_gate_passes_both_auth_param_keys_not_just_jwt():
-    """结构守卫：auth 那处必须把两个键都交给这条检查，否则上面几条只是理论上有效。
+def test_the_gate_passes_the_login_flow_param_key():
+    """结构守卫：auth 那处必须把 login-flow 那个键交给这条检查，否则上面几条只是理论上有效。
 
-    **3c-1B ticket 07 起清单不再是调用点的字面元组**：L3（清空 `legacy_param`）之后
-    `JWT_SECRET_PARAM` 整个键不下发，写死的元组会让那条核对在一个不该存在的键上永久失败。
-    所以意图清单搬到常量 `AUTH_SESSION_PARAM_KEYS`，调用点用 `_present(want_env, …)` 按
-    本地推导值取交集。守卫随之分两半：① 常量里两个键都在；② 调用点确实经 `_present`
-    把那个常量传进去（不是另抄一份或退回单键）。
+    **清单不是调用点的字面元组**：意图清单在常量 `AUTH_SESSION_PARAM_KEYS`，调用点用
+    `_present(want_env, …)` 按本地推导值取交集。守卫随之分两半：① 常量里那个键在、且
+    3c-final 删掉的 `JWT_SECRET_PARAM` **不在**；② 调用点确实经 `_present` 把那个常量传进去
+    （不是另抄一份）。
+
+    `JWT_SECRET_PARAM` 留在常量里不会红成一条断言——`_present` 会把它交集掉 ⇒ 那条核对静默
+    消失、`_min_param_checks()` 同步缩水，闸门总数与下限一起降，**什么都不红**（Task 8 复审 I1）。
+    所以这里正面断言它不在。
     """
     g = _gate()
-    assert set(g.AUTH_SESSION_PARAM_KEYS) == {"JWT_SECRET_PARAM", "LOGIN_FLOW_SECRET_PARAM"}, (
+    assert set(g.AUTH_SESSION_PARAM_KEYS) == {"LOGIN_FLOW_SECRET_PARAM"}, (
         f"意图清单是 {list(g.AUTH_SESSION_PARAM_KEYS)}——"
         "LOGIN_FLOW_SECRET_PARAM 漏下发时它不会红")
+    assert "JWT_SECRET_PARAM" not in g.AUTH_SESSION_PARAM_KEYS, \
+        "3c-final 没有这个键；留着它 = 一条被 _present 静默交集掉的空检查"
     names = _auth_plaintext_check_call_names()
     assert {"_present", "AUTH_SESSION_PARAM_KEYS"} <= names, (
         f"auth 那处没有经 _present 传那个常量：{sorted(names)}")
@@ -310,12 +322,11 @@ def _auth_plaintext_check_call_names(src: str | None = None) -> set:
 
 
 def test_present_narrows_the_intent_list_by_what_is_actually_shipped():
-    """`_present` 的两个方向：L2 两个都在、L3 少了 JWT 那个。"""
+    """`_present` 的两个方向：键在 ⇒ 进清单；键不在 ⇒ 不进（3c-final 的 auth env 里必然有 login-flow）。"""
     g = _gate()
-    l2 = {"JWT_SECRET_PARAM": "/a", "LOGIN_FLOW_SECRET_PARAM": "/b", "SESSION_SIGNER": "legacy"}
-    l3 = {"LOGIN_FLOW_SECRET_PARAM": "/b", "SESSION_SIGNER": "current"}
-    assert g._present(l2, g.AUTH_SESSION_PARAM_KEYS) == ("JWT_SECRET_PARAM", "LOGIN_FLOW_SECRET_PARAM")
-    assert g._present(l3, g.AUTH_SESSION_PARAM_KEYS) == ("LOGIN_FLOW_SECRET_PARAM",)
+    shipped = {"LOGIN_FLOW_SECRET_PARAM": "/b", "SESSION_KEYS_JSON": "{}"}
+    assert g._present(shipped, g.AUTH_SESSION_PARAM_KEYS) == ("LOGIN_FLOW_SECRET_PARAM",)
+    assert g._present({"SESSION_KEYS_JSON": "{}"}, g.AUTH_SESSION_PARAM_KEYS) == ()
 
 
 def test_the_floor_is_derived_at_runtime_not_a_constant():
@@ -329,22 +340,22 @@ def test_the_floor_is_derived_at_runtime_not_a_constant():
 _EXTRACTOR_CASES = {
     # 第一版守卫的假绿形态：字面量只活在注释里
     "注释里有、实参里没有": (
-        '# 3c-1B：两个 *_PARAM 都核（LOGIN_FLOW_SECRET_PARAM 漏下发会 500）\n'
-        '_check_env_has_no_plaintext_secret(got_env, "site-auth-service", ("JWT_SECRET_PARAM",))\n',
-        {"JWT_SECRET_PARAM"}),
+        '# 3c-final：核 LOGIN_FLOW_SECRET_PARAM（漏下发会让所有 /login 500）\n'
+        '_check_env_has_no_plaintext_secret(got_env, "site-auth-service", ("CLIENT_SECRET_PARAM",))\n',
+        {"CLIENT_SECRET_PARAM"}),
     # 元组分支（线上就是这一种）
     "元组实参": (
         '_check_env_has_no_plaintext_secret(e, "site-auth-service",\n'
-        '                                   ("JWT_SECRET_PARAM", "LOGIN_FLOW_SECRET_PARAM"))\n',
-        {"JWT_SECRET_PARAM", "LOGIN_FLOW_SECRET_PARAM"}),
+        '                                   ("CLIENT_SECRET_PARAM", "LOGIN_FLOW_SECRET_PARAM"))\n',
+        {"CLIENT_SECRET_PARAM", "LOGIN_FLOW_SECRET_PARAM"}),
     # keyword 分支：改成关键字传参不能让抽取器瞎掉
     "keyword 实参": (
         '_check_env_has_no_plaintext_secret(e, "site-auth-service",\n'
-        '                                   param_keys=("JWT_SECRET_PARAM", "LOGIN_FLOW_SECRET_PARAM"))\n',
-        {"JWT_SECRET_PARAM", "LOGIN_FLOW_SECRET_PARAM"}),
+        '                                   param_keys=("CLIENT_SECRET_PARAM", "LOGIN_FLOW_SECRET_PARAM"))\n',
+        {"CLIENT_SECRET_PARAM", "LOGIN_FLOW_SECRET_PARAM"}),
     # 别的 label 那两处调用（panel / key-proxy）不能被算进 auth 的集合
     "只认 auth 那一处": (
-        '_check_env_has_no_plaintext_secret(e, "panel", ("JWT_SECRET_PARAM",))\n'
+        '_check_env_has_no_plaintext_secret(e, "panel", ("CLIENT_SECRET_PARAM",))\n'
         '_check_env_has_no_plaintext_secret(e, "site-auth-service", ("LOGIN_FLOW_SECRET_PARAM",))\n',
         {"LOGIN_FLOW_SECRET_PARAM"}),
 }
@@ -372,10 +383,16 @@ def test_extractor_self_test_corpus_really_contains_the_comment_trap():
 # ---- 3c-1B ticket 07：panel 那处也要按状态取交集，下限随状态走 -----------------------------
 
 def test_the_panel_plaintext_check_also_intersects_with_the_local_env():
-    """**这条是复审抓到的真缺陷的回归**：panel 那处原先写死 `("JWT_SECRET_PARAM",)`，
-    L3 之后那个键整个不下发 ⇒ 核对在一个不该存在的键上永久失败，runbook 第 ⑤ 步就撞上。"""
+    """3c-final：panel 一个会话相关的 `*_PARAM` 都不持有（它永不持 login-flow，会话密钥在 KMS）
+    ⇒ 清单是**空元组**，而调用点仍必须经 `_present` 传那个常量。
+
+    **为什么空元组也要断言**（Task 8 复审 I1）：清单曾停在 `("JWT_SECRET_PARAM",)`，而 `_present`
+    会把它交集掉 ⇒ panel 那条 `*_PARAM` 核对变成**零条断言**、`_min_param_checks()` 同步缩水，
+    闸门总数与下限一起降 ⇒ 什么都不红。所以意图必须显式写成"零个"，不能靠交集去演。
+    """
     g = _gate()
-    assert tuple(g.PANEL_SESSION_PARAM_KEYS) == ("JWT_SECRET_PARAM",)
+    assert tuple(g.PANEL_SESSION_PARAM_KEYS) == ()
+    assert "JWT_SECRET_PARAM" not in g.PANEL_SESSION_PARAM_KEYS
     src = _SCRIPT.read_text()
     assert '_check_env_has_no_plaintext_secret(env, "panel", ("JWT_SECRET_PARAM",))' not in src, \
         "panel 那处仍写死清单"
@@ -398,27 +415,30 @@ def _plaintext_check_call_names(src: str, *, label: str) -> set:
     return set()
 
 
-def test_the_floor_tracks_state_instead_of_being_a_constant():
-    """下限必须**随状态**走：L2 三条 `*_PARAM`（auth 两 + panel 一）、L3 只剩一条。
+def test_the_floor_tracks_the_shipped_env_instead_of_being_a_constant():
+    """下限仍必须**按本地推导的 env** 算，不是写死——只是 3c-final 之后那个数恒为 1。
 
-    写死的后果是 L3 每次核对都差两条、被判成"没跑完"——而"没跑完"与"真的漂移了"在
-    退出码上一模一样。这里按 `_present` 的两个方向算一遍，证明公式跟着状态动。
+    `MIN_DEPLOYED_CHECKS` 的算式（每一项都是本轮真的会出的 check）：
+      上一版 23（③ 4 + ④ 4 + ⑤ 6 + ⑥ 3 + ⑦ 6）
+      + ④ 三方对账 2（site / console 各至少一把 current）+ FIXTURE_ISSUER 1 + verifier 角色 1
+      + ⑤ 三方对账 1（console 至少一把 current）
+      + Edge 公钥 3（含每把 site / 不含 console / RS256 形态）
+      = 31
+    三方对账那三条是**保守下限**：配了 previous 的 family 会多出一条，实际数只会更多。
     """
     g = _gate()
-    l2_auth = {"JWT_SECRET_PARAM": "/a", "LOGIN_FLOW_SECRET_PARAM": "/b"}
-    l3_auth = {"LOGIN_FLOW_SECRET_PARAM": "/b"}
-    l2_panel = {"JWT_SECRET_PARAM": "/a"}
-    l3_panel: dict = {}
-    l2 = (len(g._present(l2_auth, g.AUTH_SESSION_PARAM_KEYS))
-          + len(g._present(l2_panel, g.PANEL_SESSION_PARAM_KEYS)))
-    l3 = (len(g._present(l3_auth, g.AUTH_SESSION_PARAM_KEYS))
-          + len(g._present(l3_panel, g.PANEL_SESSION_PARAM_KEYS)))
-    assert (l2, l3) == (3, 1), (l2, l3)
-    # M07 给 ④ 补了 auth 的 Function URL 三条（AuthType / 语句集合 / 逐条内容）：L2 从 23 抬到 26
-    assert g.MIN_DEPLOYED_CHECKS == 23
-    assert g.MIN_DEPLOYED_CHECKS + l2 == 26
-    # 且 L3 恰好少两条，不是"少一条"或"不变"
-    assert g.MIN_DEPLOYED_CHECKS + l3 == 24
+    auth_env = {"LOGIN_FLOW_SECRET_PARAM": "/b", "SESSION_KEYS_JSON": "{}"}
+    panel_env = {"SESSION_KEYS_JSON": "{}"}
+    n = (len(g._present(auth_env, g.AUTH_SESSION_PARAM_KEYS))
+         + len(g._present(panel_env, g.PANEL_SESSION_PARAM_KEYS)))
+    assert n == 1, n
+    assert g.MIN_DEPLOYED_CHECKS == 31
+    assert g.MIN_DEPLOYED_CHECKS + n == 32
+    # 算式必须写在常量旁边（下一个人改 check 条数时要能核对，不然 31 是个来历不明的数）
+    src = _SCRIPT.read_text()
+    head = src[:src.index("def check(")]
+    for part in ("三方对账", "FIXTURE_ISSUER", "Edge 公钥"):
+        assert part in head, f"MIN_DEPLOYED_CHECKS 的算式注释里没有 {part} 这一项"
 
 
 def test_min_param_checks_counts_both_sections_from_the_same_source_as_the_checks():
@@ -538,3 +558,255 @@ def test_the_gate_uses_the_shared_drift_judgement_not_its_own():
     fn = next(n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef) and n.name == "_check_function_url_authz")
     calls = {_ast.unparse(n.func) for n in _ast.walk(fn) if isinstance(n, _ast.Call)}
     assert any(c == "drift" or c.endswith(".drift") for c in calls), sorted(calls)
+
+
+# ---- 3c-final：三方公钥对账 / Edge 产物公钥 / verifier 的 Function URL 两条 --------------------
+#
+# spec §11.6 的第 3 层：`SESSION_KEYS_JSON` 只是**引用**（kid / key_arn / spki_sha256），没有密钥材料。
+# 于是"线上下发的引用"与"config 里写的引用"与"KMS 里那把 key 的真实公钥"三者必须同时相等——
+# 只比前两者时，config 里 spki_sha256 抄错（换 key 时改了 ARN 没改指纹）会让 auth 在**运行时**
+# 拒绝加载 allowlist（verifier_env 的自检），而部署与闸门双双全绿。
+# evidence: fake/unit（FakeKms 按同一组 RS 测试密钥回答，与 auth / panel / router 三侧共用）。
+
+import upgrade_code_vectors as v  # noqa: E402
+
+
+def test_three_way_key_check_is_green_when_env_config_and_kms_agree_and_red_on_any_disagreement(monkeypatch):
+    g = _gate(); g.results.clear()
+    env_json = v.session_keys_json((v.SITE_KID, "current"), (v.CONSOLE_KID, "current"))
+    monkeypatch.setattr(g, "_config_key_rows", lambda families: json.loads(env_json))
+    g._check_session_keys_three_way(v.FakeKms(), env_json, "auth", ("site", "console"))
+    assert [ok for ok, _, _ in g.results] == [True, True]
+    g.results.clear()
+    kms = v.FakeKms(); kms.tamper_public_key_for[v.KEY_ARN[v.CONSOLE_KID]] = v.SITE_KEY
+    g._check_session_keys_three_way(kms, env_json, "auth", ("site", "console"))
+    assert [ok for ok, _, _ in g.results] == [True, False]
+
+
+def test_three_way_key_check_reds_when_the_deployed_env_row_drifts_from_config(monkeypatch):
+    """线上 env 与 config 同 kid 但**内容**不同（改了 config 没重部 auth）⇒ 必须红。
+
+    正对照在上一条；这里证明第三方（KMS）一致时那条比较仍在做——否则"env == config"这半
+    可以被 KMS 那半的绿掩盖。
+    """
+    g = _gate(); g.results.clear()
+    cfg_rows = json.loads(v.session_keys_json((v.SITE_KID, "current")))
+    stale = json.loads(v.session_keys_json((v.SITE_KID, "current")))
+    stale["site"][0]["role"] = "previous"          # 线上还停在轮转前的角色
+    monkeypatch.setattr(g, "_config_key_rows", lambda families: cfg_rows)
+    g._check_session_keys_three_way(v.FakeKms(), json.dumps(stale), "auth", ("site",))
+    assert [ok for ok, _, _ in g.results] == [False]
+
+
+def test_three_way_key_check_reds_when_a_config_kid_is_missing_from_the_deployed_env(monkeypatch):
+    """config 里有两把、线上只下发一把（轮转的第一步做了 config、没重部）⇒ 缺的那把红，不是少一条 check。"""
+    g = _gate(); g.results.clear()
+    cfg_rows = json.loads(v.session_keys_json((v.SITE_KID, "current"), (v.SITE_PREV_KID, "previous")))
+    monkeypatch.setattr(g, "_config_key_rows", lambda families: cfg_rows)
+    g._check_session_keys_three_way(v.FakeKms(), v.session_keys_json((v.SITE_KID, "current")),
+                                    "auth", ("site",))
+    assert [ok for ok, _, _ in g.results] == [True, False]
+
+
+def test_three_way_key_check_reds_instead_of_crashing_when_kms_is_unreachable(monkeypatch):
+    """`kms.get_public_key` 抛异常（AccessDenied / 限流 / key 被删）⇒ 那条红，脚本不崩成"执行中断"。"""
+    g = _gate(); g.results.clear()
+    env_json = v.session_keys_json((v.SITE_KID, "current"))
+    monkeypatch.setattr(g, "_config_key_rows", lambda families: json.loads(env_json))
+
+    class _Denied:
+        def get_public_key(self, KeyId):
+            raise RuntimeError("AccessDeniedException")
+
+    g._check_session_keys_three_way(_Denied(), env_json, "auth", ("site",))
+    assert [ok for ok, _, _ in g.results] == [False]
+    assert "RuntimeError" in g.results[0][2], g.results
+
+
+def test_edge_public_key_check_requires_every_site_key_and_forbids_console_keys():
+    g = _gate()
+    src = 'SITE_ALLOWLIST_JSON = \'\'\'{"site-rs-v1": {"alg": "RS256", "spki_b64": "U0lURQ==", "role": "current"}}\'\'\'\nRS256_GOLDEN = {}\n'
+    g.results.clear(); g._check_edge_public_keys(src, ["U0lURQ=="], ["Q09OU09MRQ=="])
+    assert all(ok for ok, _, _ in g.results)
+    g.results.clear(); g._check_edge_public_keys(src, ["T1RIRVI="], ["Q09OU09MRQ=="])
+    assert not all(ok for ok, _, _ in g.results)
+    g.results.clear(); g._check_edge_public_keys(src.replace("U0lURQ==", "Q09OU09MRQ=="), ["Q09OU09MRQ=="], ["Q09OU09MRQ=="])
+    assert not all(ok for ok, _, _ in g.results)
+    g.results.clear(); g._check_edge_public_keys(src + 'JWT_SECRET = "x"\n', ["U0lURQ=="], [])
+    assert not all(ok for ok, _, _ in g.results)
+
+
+def test_edge_public_key_check_reds_on_a_hs_or_legacy_remnant_and_on_a_missing_golden():
+    """RS256 形态那条的**每一种**破法都要红：没有黄金预热、留着 JWT_SECRET、留着 LEGACY_ENTRY。
+
+    三个条件写在一条 check 里，所以必须逐个证明它会红——否则其中两个可能是装饰。
+    """
+    g = _gate()
+    base = 'SITE_ALLOWLIST_JSON = \'\'\'{"site-rs-v1": {"spki_b64": "U0lURQ=="}}\'\'\'\n'
+    for broken, why in ((base, "没有 RS256_GOLDEN"),
+                        (base + 'RS256_GOLDEN = {}\nJWT_SECRET = ""\n', "留着 JWT_SECRET"),
+                        (base + 'RS256_GOLDEN = {}\nLEGACY_ENTRY = "off"\n', "留着 LEGACY_ENTRY")):
+        g.results.clear()
+        g._check_edge_public_keys(broken, ["U0lURQ=="], [])
+        assert not all(ok for ok, _, _ in g.results), why
+
+
+def test_edge_public_key_check_is_not_fooled_by_a_console_key_outside_the_allowlist():
+    """console 公钥出现在**产物任何地方**（注释、别的常量）都算漏，不只在 SITE_ALLOWLIST_JSON 里。"""
+    g = _gate(); g.results.clear()
+    src = ('SITE_ALLOWLIST_JSON = \'\'\'{"site-rs-v1": {"spki_b64": "U0lURQ=="}}\'\'\'\n'
+           'RS256_GOLDEN = {}\n'
+           '# 顺手记一下 console 那把：Q09OU09MRQ==\n')
+    g._check_edge_public_keys(src, ["U0lURQ=="], ["Q09OU09MRQ=="])
+    assert not all(ok for ok, _, _ in g.results)
+
+
+def test_function_url_authz_expects_the_verifier_pair_only_when_the_component_is_on():
+    g = _gate()
+    ver = "arn:aws:iam::000000000000:role/site-builder-verifier"
+    lam = flp.FakeLambdaPolicy(flp.good_pair(FUP_EDGE))
+    g.results.clear(); g._check_function_url_authz(lam, "site-auth-service", "auth", FUP_EDGE, extra_principals={"verifier": ver})
+    assert not all(ok for ok, _, _ in g.results), "开着组件却没有 verifier 两条 ⇒ 红"
+    lam2 = flp.FakeLambdaPolicy(flp.good_pair(FUP_EDGE) + flp.good_pair(ver, label="verifier"))
+    g.results.clear(); g._check_function_url_authz(lam2, "site-auth-service", "auth", FUP_EDGE, extra_principals={"verifier": ver})
+    assert all(ok for ok, _, _ in g.results)
+    g.results.clear(); g._check_function_url_authz(lam2, "site-auth-service", "auth", FUP_EDGE)
+    assert not all(ok for ok, _, _ in g.results), "关了组件而语句还在 ⇒ 野 Sid 红"
+
+
+def test_function_url_authz_still_emits_exactly_three_checks_with_extra_principals():
+    """条数不许随 `extra_principals` 变——`MIN_DEPLOYED_CHECKS` 把 Function URL 记成恒定的三条。"""
+    g = _gate()
+    ver = "arn:aws:iam::000000000000:role/site-builder-verifier"
+    lam = flp.FakeLambdaPolicy(flp.good_pair(FUP_EDGE) + flp.good_pair(ver, label="verifier"))
+    g.results.clear(); g._check_function_url_authz(lam, "site-auth-service", "auth", FUP_EDGE, extra_principals={"verifier": ver})
+    assert len(g.results) == 3, g.results
+    # 通过时的 detail 要说出**全部**期望 Sid（含 verifier 两条），否则读报告的人以为只授了 edge
+    assert "verifier-invoke" in g.results[1][2], g.results[1]
+
+
+def test_the_auth_section_passes_extra_principals_derived_from_the_verification_section():
+    """结构守卫：auth 那处必须把 `extra_principals` 交给 `_check_function_url_authz`，且它来自
+    `[Verification]` 的判定（不是写死 None，也不是无条件传）。
+
+    写死 None 的后果：开着夹具组件时线上那两条语句成了"野 Sid"，闸门每次都红；无条件传的后果：
+    关掉组件后残留的两条不会被报成野 Sid（spec §11.7 要求它们被删掉）。
+    """
+    import ast as _ast
+    src = _SCRIPT.read_text()
+    tree = _ast.parse(src)
+    fn = next(n for n in _ast.walk(tree)
+              if isinstance(n, _ast.FunctionDef) and n.name == "run_deployed")
+    call = next(n for n in _ast.walk(fn)
+                if isinstance(n, _ast.Call)
+                and getattr(n.func, "id", None) == "_check_function_url_authz")
+    kw = {k.arg: _ast.unparse(k.value) for k in call.keywords}
+    assert "extra_principals" in kw, "auth 那处没传 extra_principals"
+    assert kw["extra_principals"] != "None", "写死 None ⇒ 开着夹具组件时闸门每次都红"
+    assert "fixture_on" in kw["extra_principals"], kw["extra_principals"]
+
+
+def test_the_auth_section_asserts_fixture_issuer_and_the_verifier_role_agree_with_config():
+    """结构守卫：④ 段必须另出两条 check——`FIXTURE_ISSUER` env 与 `[Verification]` 一致、
+    `site-builder-verifier` 角色的**存在与否**与 `[Verification]` 一致。
+
+    只比 env 是不够的：关掉组件而角色还在 = 一条仍可被 assume 的冒充路径（Function URL 的
+    resource policy 那两条已被删，但角色本身的 inline policy 还在，且它是账号内可 assume 的）。
+    """
+    import ast as _ast
+    src = _SCRIPT.read_text()
+    fn = next(n for n in _ast.walk(_ast.parse(src))
+              if isinstance(n, _ast.FunctionDef) and n.name == "run_deployed")
+    body = _ast.unparse(fn)
+    assert "FIXTURE_ISSUER" in body, "FIXTURE_ISSUER 与配置的一致性没有闸门"
+    assert "fixture_on" in body and "role_exists" in body, \
+        "verifier 角色的存在性没有与 [Verification] 对账"
+
+
+def test_the_panel_section_reconciles_the_console_family_only():
+    """结构守卫：⑤ 段的三方对账只要 console family——panel 永不持有 site 的任何引用（spec §4.1）。"""
+    import ast as _ast
+    src = _SCRIPT.read_text()
+    fn = next(n for n in _ast.walk(_ast.parse(src))
+              if isinstance(n, _ast.FunctionDef) and n.name == "run_panel")
+    call = next(n for n in _ast.walk(fn)
+                if isinstance(n, _ast.Call)
+                and getattr(n.func, "id", None) == "_check_session_keys_three_way")
+    families = _ast.unparse(call.args[3])
+    assert families == "('console',)", families
+
+
+def test_the_config_rows_come_from_session_keys_not_a_second_parser():
+    """`_config_key_rows` 必须用 `session_keys.env_json` / `load_session_keys`——config 的形态只能有一个解析器。"""
+    import ast as _ast
+    src = _SCRIPT.read_text()
+    fn = next(n for n in _ast.walk(_ast.parse(src))
+              if isinstance(n, _ast.FunctionDef) and n.name == "_config_key_rows")
+    body = _ast.unparse(fn)
+    assert "env_json" in body and "load_session_keys" in body, body
+
+
+def test_the_edge_public_key_section_runs_before_the_console_route_early_return():
+    """结构守卫：Edge 公钥那三条必须在 ⑦ 之前。
+
+    ⑦ 在 console route 缺失时 `return`——放在它之后的检查一条都不会跑，而"缺 route"是个
+    常见的中间状态（先部 auth 后部 panel）。那时 Edge 公钥对账会**静默消失**，只留下
+    "只跑了 N 项"这一个含糊的信号。
+    """
+    import ast as _ast
+    src = _SCRIPT.read_text()
+    fn = next(n for n in _ast.walk(_ast.parse(src))
+              if isinstance(n, _ast.FunctionDef) and n.name == "run_mcp_and_route")
+    body = _ast.unparse(fn)
+    assert "_check_edge_public_keys" in body, "⑥b 整段不在 run_mcp_and_route 里"
+    assert body.index("_check_edge_public_keys") < body.index("console route 存在"), \
+        "Edge 公钥对账排在 ⑦ 的 early return 之后 —— 缺 console route 时它整段不跑"
+
+
+def test_the_edge_public_keys_come_from_kms_not_from_the_config_fingerprint():
+    """结构守卫：期望的 b64 公钥必须由 `kms.get_public_key` 的 DER 现算，不能拿 config 的 `spki_sha256`。
+
+    `spki_sha256` 是**指纹**不是公钥本体：拿它去 grep 产物永远匹配不上 ⇒ "含每把 site 公钥"那条
+    恒红（或判据一放宽就恒绿）。两种都是假检查，而它守的是"全员 302"这种全站故障。
+    """
+    import ast as _ast
+    src = _SCRIPT.read_text()
+    fn = next(n for n in _ast.walk(_ast.parse(src))
+              if isinstance(n, _ast.FunctionDef) and n.name == "run_mcp_and_route")
+    body = _ast.unparse(fn)
+    assert "get_public_key" in body and "b64encode" in body, body[-800:]
+    assert "spki_sha256" not in body, "拿指纹当公钥去比 —— 那条检查永远不会真的成立"
+
+
+def test_the_edge_section_reds_instead_of_crashing_when_the_artifact_is_unreachable():
+    """读不到产物 / 取不到公钥时必须出一条 `check(False, …)`，不能让异常冒出去。
+
+    冒出去的后果不是"这一段红"而是**整个脚本崩成"执行中断"**，⑦⑧⑨ 一起丢掉——而那三段里
+    有 M5 统计管道与 key-proxy 的全部断言。
+    """
+    import ast as _ast
+    src = _SCRIPT.read_text()
+    fn = next(n for n in _ast.walk(_ast.parse(src))
+              if isinstance(n, _ast.FunctionDef) and n.name == "run_mcp_and_route")
+    handler = next(h for n in _ast.walk(fn) if isinstance(n, _ast.Try)
+                   for h in n.handlers
+                   if "_check_edge_public_keys" in _ast.unparse(n))
+    text = _ast.unparse(handler)
+    assert "check(False" in text, text
+
+
+def test_the_fixture_flag_is_read_through_deploy_auths_own_parser():
+    """结构守卫：`[Verification]` 的判定必须走 `deploy_auth.read_verification`，不在闸门里再解析一遍 flag。
+
+    另写一份的后果不是"多几行"：`read_verification` 对 `fixture_issuer = yes` 这类坏值 SystemExit
+    （deploy_auth 那时也拒绝部署），而一份 `== "true"` 的复制品会把它读成 off ⇒ 闸门拿一个
+    deploy 根本不会产出的期望值去比对，两侧结论不同。同 `_check_function_url_authz` 用共享
+    `drift` 的理由：对"什么算开着"只能有一个定义。
+    """
+    import ast as _ast
+    src = _SCRIPT.read_text()
+    fn = next(n for n in _ast.walk(_ast.parse(src))
+              if isinstance(n, _ast.FunctionDef) and n.name == "run_deployed")
+    body = _ast.unparse(fn)
+    assert "read_verification" in body, "闸门自己解析 [Verification] 的 flag —— 两侧会分叉"
+    assert "VERIFIER_ROLE_NAME" in body, "角色名写死了字面量，不是 deploy_auth 的常量"

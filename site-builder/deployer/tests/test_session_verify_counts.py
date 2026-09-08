@@ -16,19 +16,31 @@ def test_outcome_vocabulary_matches_session_module():
 
 
 def test_parse_results_keeps_only_vocabulary_and_sums_duplicates():
-    rows = [[{"field": "outcome", "value": "accepted_legacy"}, {"field": "n", "value": "3"}],
-            [{"field": "outcome", "value": "accepted_legacy"}, {"field": "n", "value": "2.0"}],
+    rows = [[{"field": "outcome", "value": "accepted_previous"}, {"field": "n", "value": "3"}],
+            [{"field": "outcome", "value": "accepted_previous"}, {"field": "n", "value": "2.0"}],
             [{"field": "outcome", "value": "totally_made_up"}, {"field": "n", "value": "9"}],
             [{"field": "n", "value": "9"}]]
-    assert svc.parse_results(rows) == {"accepted_legacy": 5}
+    assert svc.parse_results(rows) == {"accepted_previous": 5}
 
 
-def test_render_totals_and_legacy_count():
-    text, total, legacy = svc.render({"auth": {"accepted_legacy": 2, "unknown_kid": 1},
-                                      "panel": {"accepted_current": 4},
-                                      "edge": {"accepted_legacy": 10, "expired": 1}})
-    assert (total, legacy) == (18, 12)
-    assert "accepted_legacy" in text and "总量 18" in text
+def test_accepted_legacy_is_gone_from_the_vocabulary_and_the_drain_targets():
+    """3c-final 硬切换：HS/legacy 入口整条不存在 ⇒ 这个 outcome 不该还在词表里。
+
+    留着它的代价不是多一行读数：`--require-zero accepted_legacy` 会**永远退 0**（那一列
+    再也不会有读数），于是一个看起来像闸门的旗标变成恒真的空转。
+    """
+    assert "accepted_legacy" not in svc.OUTCOMES
+    assert "accepted_legacy" not in svc.DRAIN_TARGETS.values()
+    assert tuple(svc.DRAIN_TARGETS) == ("previous",)
+
+
+def test_render_totals_and_previous_count():
+    text, total, previous = svc.render({"auth": {"accepted_previous": 2, "unknown_kid": 1},
+                                        "panel": {"accepted_current": 4},
+                                        "edge": {"accepted_previous": 10, "expired": 1}})
+    assert (total, previous) == (18, 12)
+    assert "accepted_previous" in text and "总量 18" in text
+    assert "accepted_legacy" not in text
 
 
 def test_query_filters_on_the_event_marker_and_groups_by_outcome():
@@ -43,9 +55,9 @@ def test_edge_function_name_comes_from_the_gate_not_a_second_literal():
 
 def test_require_each_fails_when_any_single_verifier_is_silent():
     """§8：退役判据的另一半是"埋点在工作"——按 verifier 分别看，Edge 列为 0 不能被 auth/panel 的总量遮住。"""
-    by = {"auth": {"accepted_legacy": 3}, "panel": {"accepted_legacy": 1}, "edge": {}}
+    by = {"auth": {"accepted_previous": 3}, "panel": {"accepted_previous": 1}, "edge": {}}
     assert svc.silent_verifiers(by) == ["edge"]
-    assert svc.silent_verifiers({"auth": {"x": 1}, "panel": {"y": 2}, "edge": {"accepted_legacy": 5}}) == []
+    assert svc.silent_verifiers({"auth": {"x": 1}, "panel": {"y": 2}, "edge": {"accepted_previous": 5}}) == []
 
 
 def test_no_edge_log_group_anywhere_is_an_error_not_a_silent_skip():
@@ -65,12 +77,12 @@ import types as _types  # noqa: E402
 def test_nonzero_outcomes_names_the_verifier_columns_that_are_not_zero():
     by = {"auth": {"accepted_previous": 0, "accepted_current": 5},
           "panel": {"accepted_current": 2},
-          "edge": {"accepted_previous": 3, "accepted_legacy": 1}}
-    got = svc.nonzero_outcomes(by, ["accepted_previous", "accepted_legacy"])
-    assert got == ["accepted_previous: auth=0 panel=0 edge=3", "accepted_legacy: auth=0 panel=0 edge=1"]
+          "edge": {"accepted_previous": 3, "unknown_kid": 1}}
+    got = svc.nonzero_outcomes(by, ["accepted_previous", "unknown_kid"])
+    assert got == ["accepted_previous: auth=0 panel=0 edge=3", "unknown_kid: auth=0 panel=0 edge=1"]
     assert svc.nonzero_outcomes(by, ["accepted_previous"]) == ["accepted_previous: auth=0 panel=0 edge=3"]
     assert svc.nonzero_outcomes({"auth": {}, "panel": {}, "edge": {"accepted_current": 9}},
-                                ["accepted_previous", "accepted_legacy"]) == []
+                                ["accepted_previous", "unknown_kid"]) == []
 
 
 @pytest.mark.parametrize("edge_counts,expect_rc", [({"accepted_current": 4}, 0),
@@ -95,11 +107,11 @@ def test_require_zero_rejects_outcomes_outside_the_vocabulary():
 
 def test_require_zero_is_repeatable_and_all_must_hold(monkeypatch):
     by = {"auth": {"accepted_current": 1}, "panel": {"accepted_current": 1},
-          "edge": {"accepted_current": 1, "accepted_legacy": 2}}
+          "edge": {"accepted_current": 1, "expired": 2}}
     monkeypatch.setattr(svc, "collect", lambda session, hours: by)
     monkeypatch.setattr(svc.boto3, "Session", lambda: None)
     assert svc.main(["--require-zero", "accepted_previous"]) == 0
-    assert svc.main(["--require-zero", "accepted_previous", "--require-zero", "accepted_legacy"]) == 1
+    assert svc.main(["--require-zero", "accepted_previous", "--require-zero", "expired"]) == 1
 
 
 class _FakeLogs:
@@ -142,7 +154,7 @@ def test_edge_log_groups_aborts_when_any_region_query_fails_instead_of_undercoun
 
 def test_missing_outcome_columns_names_the_verifiers_where_it_is_zero():
     """判据的另一半："三列 accepted_current 全 > 0"，按列判、不被别列遮住。"""
-    by = {"auth": {"accepted_current": 3}, "panel": {"accepted_legacy": 1}, "edge": {"accepted_current": 0}}
+    by = {"auth": {"accepted_current": 3}, "panel": {"unknown_kid": 1}, "edge": {"accepted_current": 0}}
     assert svc.missing_outcome_columns(by, ["accepted_current"]) == ["accepted_current: panel=0 edge=0"]
     assert svc.missing_outcome_columns({"auth": {"accepted_current": 1}, "panel": {"accepted_current": 1},
                                         "edge": {"accepted_current": 1}}, ["accepted_current"]) == []
@@ -217,16 +229,20 @@ def test_drain_gate_defaults_to_the_full_window_without_being_told(monkeypatch):
 
     monkeypatch.setattr(svc, "collect", _collect)
     monkeypatch.setattr(svc.boto3, "Session", lambda: None)
-    assert svc.main(["--drain-gate", "legacy"]) == 0
+    assert svc.main(["--drain-gate", "previous"]) == 0
     assert seen["hours"] >= 26
 
 
-def test_drain_gate_picks_the_outcome_column_from_its_argument(monkeypatch, capsys):
-    by = {"auth": {"accepted_current": 1}, "panel": {"accepted_current": 1},
-          "edge": {"accepted_current": 1, "accepted_legacy": 4}}
-    assert _gate(monkeypatch, by, ["--drain-gate", "previous"]) == 0    # legacy 列不在本闸门判据里
-    assert _gate(monkeypatch, by, ["--drain-gate", "legacy"]) == 1
-    assert "accepted_legacy" in capsys.readouterr().err
+def test_drain_gate_judges_only_its_own_column(monkeypatch, capsys):
+    """3c-final 起只剩一个目标（previous）。别的 outcome 有读数不该让排空闸门变红——
+    `unknown_kid` 在轮转窗口里本来就会出现（旧节点上的旧 cookie），把它算进判据等于永远排不空。"""
+    noise = {"auth": {"accepted_current": 1}, "panel": {"accepted_current": 1},
+             "edge": {"accepted_current": 1, "unknown_kid": 4}}
+    assert _gate(monkeypatch, noise, ["--drain-gate", "previous"]) == 0
+    target = {"auth": {"accepted_current": 1}, "panel": {"accepted_current": 1},
+              "edge": {"accepted_current": 1, "accepted_previous": 4}}
+    assert _gate(monkeypatch, target, ["--drain-gate", "previous"]) == 1
+    assert "accepted_previous" in capsys.readouterr().err
 
 
 def test_require_zero_on_a_drain_target_without_the_gate_warns_but_still_works(monkeypatch, capsys):
@@ -241,9 +257,23 @@ def test_require_zero_on_a_drain_target_without_the_gate_warns_but_still_works(m
     doc = svc.__doc__
     assert "--drain-gate previous" in doc
     assert "--hours 26 --require-total --require-zero accepted_previous" not in doc
+    assert "accepted_legacy" not in doc and "--drain-gate legacy" not in doc, \
+        "文档还在教一个已不存在的目标——照抄会得到 argparse 用法错误（退 2）"
 
 
-def test_drain_gate_rejects_an_unknown_target():
+@pytest.mark.parametrize("target", ["current", "legacy"])
+def test_drain_gate_rejects_an_unknown_target(monkeypatch, target):
+    """`legacy` 现在也是未知目标：留着它会让一条恒真的空转旗标看起来像闸门。
+
+    `collect` 被换成一个直接炸的替身：拒绝必须发生在 argparse 那一层，**任何 AWS 调用之前**。
+    不装这个替身时"argparse 放过了"会退化成一次真实的 Logs Insights 查询（26 小时窗口、
+    每区一次），红是红的，但那是网络红而不是判定红——本条已经这样跑过一次。
+    """
+    def _boom(session, hours):
+        raise AssertionError(f"argparse 放过了未知目标 {target!r}，已经走到 collect()")
+
+    monkeypatch.setattr(svc, "collect", _boom)
+    monkeypatch.setattr(svc.boto3, "Session", lambda: None)
     with pytest.raises(SystemExit) as ei:
-        svc.main(["--drain-gate", "current"])
+        svc.main(["--drain-gate", target])
     assert ei.value.code == 2
