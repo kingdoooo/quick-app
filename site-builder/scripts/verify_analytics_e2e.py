@@ -82,14 +82,13 @@ ROOT = HERE.parents[1]
 CFG_PATH = HERE.parent / "config.ini"
 ROUTER_CFG_PATH = ROOT / "router" / "config.ini"
 
-sys.path.insert(0, str(HERE.parent / "auth"))   # session.py：签发算法唯一实现
 sys.path.insert(0, str(HERE))                   # _mcp_client.py（scripts/ 不是包）
 # common.py：前端版本前缀格式的唯一定义（尾斜杠是实测红线）。这个闸门要造一条
 # 真路由，手抄一份格式就等于让闸门用一份可能已经漂移的路径去验生产。
 sys.path.insert(0, str(HERE.parent / "deployer" / "functions"))
 
 import common as sb_common                      # noqa: E402
-import _session_mint as sm                      # noqa: E402  验收工具唯一的本地 mint 入口
+import _session_mint as sm                      # noqa: E402  验收登录态的唯一入口（夹具签发器客户端）
 from _mcp_client import (Mcp, claims as token_claims,  # noqa: E402
                          http, load_user_token, mcp_endpoint)
 
@@ -300,9 +299,9 @@ def main() -> int:                                      # noqa: C901
     lam = boto3.client("lambda", region_name=region,
                        config=BotoConfig(read_timeout=310, retries={"max_attempts": 0}))
     s3 = boto3.client("s3", region_name=region)
-    # 会话由 _session_mint 统一签发（新形态、带 kid；idp 取 router/config.ini 的 trusted_idps 第一项，
-    # 写死 "Feishu" 会让脚本在换 IdP 的环境上全红）。取不到密钥/idp 它自己 exit——验收不可信就不往下走。
-    minter = sm.Minter.from_config(ROOT / "site-builder" / "config.ini", ROOT / "router" / "config.ini")
+    # 会话由 _session_mint 统一取（夹具签发器客户端，ADR 0002）：站点会话来自 auth 的
+    # /fixture-session，面板会话走真实换取链路。取不到它自己 exit——验收不可信就不往下走。
+    minter = sm.Minter.from_config(ROOT / "site-builder" / "config.ini")
 
     # ── fixture 身份与命名（一次性后缀）────────────────────────────────
     suf = secrets.token_hex(4)
@@ -313,16 +312,18 @@ def main() -> int:                                      # noqa: C901
     # 对象，整站 403 —— CLAUDE.md 高频坑）。这里的"job_id"位置放的是固定串
     # `m5e2e`，因为这条 fixture 路由不是由某次真实部署写出来的。
     static_prefix = sb_common.static_prefix_for(site_id, "m5e2e")
-    owner = f"m5e2e-owner-{suf}@example.com"
-    visitor = f"m5e2e-visitor-{suf}@example.com"
-    visitor2 = f"m5e2e-visitor2-{suf}@example.com"
-    outsider = f"m5e2e-outsider-{suf}@example.com"
+    # 四个身份都在**夹具域**（ADR 0002）：Edge 只在 owner 属于夹具域的路由上认夹具会话，
+    # 而下面那条 fixture 路由的 owner 就是这个 `owner`。换成别的域 ⇒ 每条站点请求 302，
+    # 埋点一行都不会写，而症状读起来像"统计没生效"。
+    owner = f"m5e2e-owner-{suf}@e2e.invalid"
+    visitor = f"m5e2e-visitor-{suf}@e2e.invalid"
+    visitor2 = f"m5e2e-visitor2-{suf}@e2e.invalid"
+    outsider = f"m5e2e-outsider-{suf}@e2e.invalid"
     page_mark = f"m5e2e-page-{suf}"
     css_mark = f"m5e2e-asset-{suf}"
 
     def mint(email: str, scope: str = "") -> str:
-        return minter.mint("console-session" if scope == "console" else "site-session",
-                           email, ttl_seconds=3600)
+        return minter.mint("console-session" if scope == "console" else "site-session", email)
 
     def ck(email: str) -> dict:
         return {"cookie": f"sb_session={mint(email)}"}

@@ -4,9 +4,11 @@ python3 site-builder/scripts/deploy_fixture.py site-builder/fixtures/nosql-notes
 python3 site-builder/scripts/deploy_fixture.py <fixture> --owner me@example.com
 python3 site-builder/scripts/deploy_fixture.py <fixture> --site-id notes-abc123 --marker m7-b
 
-owner 默认 `fixture@test`（E2E 用，不对应真人）。**要用 MCP 工具操作这个站点时
-必须传 --owner 你的登录邮箱**——否则 role_of() 判你不是 owner，所有权限工具
-都会拒绝，而症状看起来像"工具坏了"。
+owner 默认 `fixture@e2e.invalid`（E2E 用，不对应真人）。**夹具域（ADR 0002）：Edge 只在夹具
+站点（route owner 的域是 `e2e.invalid`）上认夹具会话，所以 E2E 建的站点 owner 必须在这个域**
+——换成别的域时夹具会话一律 302，症状是"站点部好了但所有请求都跳登录"。
+**要用 MCP 工具操作这个站点时必须传 --owner 你的登录邮箱**——否则 role_of() 判你不是
+owner，所有权限工具都会拒绝，而症状看起来像"工具坏了"。
 
 `--site-id` 复用同一个 site_id（不给就随机，行为与从前逐字相同），`--marker` 把一个
 串写进后端 `/api/health` 的响应体。**两个开关是配套的**：只有"同一个站点连着部两次、
@@ -128,7 +130,7 @@ def build_zip(tree: Path, manifest: dict, run_sh: Path) -> bytes:
     return buf.getvalue()
 
 
-def main(fixture_dir: str, owner: str = "fixture@test", *,
+def main(fixture_dir: str, owner: str = "fixture@e2e.invalid", *,
          site_id: str | None = None, marker: str | None = None):
     root = Path(fixture_dir)
     manifest = json.loads((root / "site.json").read_text())
@@ -257,7 +259,7 @@ def main(fixture_dir: str, owner: str = "fixture@test", *,
 def cli(argv=None) -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("fixture_dir")
-    ap.add_argument("--owner", default="fixture@test",
+    ap.add_argument("--owner", default="fixture@e2e.invalid",
                     help="站点 owner 邮箱；要用 MCP 权限工具操作它就填你的登录邮箱")
     ap.add_argument("--site-id",
                     help="复用/指定 site_id（默认按 site.json 的 name 随机生成）；"

@@ -41,8 +41,9 @@ application/x-www-form-urlencoded`——用 urllib 上传必 403，且错误文�
 - `MIN_CHECKS` 下限 + 非零退出。
 
 **开关为什么不经控制台的 admin HTTP 接口翻**（`PUT /api/settings/api-key`）：
-那条路径要一个**管理员**的面板会话，而本脚本能造出的只有"用会话密钥本地签一个
-任意 email 的会话"（经 `_session_mint`）。拿真实管理员的邮箱去签，等于在 `ops_log` 里留下一条
+那条路径要一个**管理员**的面板会话，而本脚本能拿到的只有"夹具域 `@e2e.invalid` 身份的会话"
+（经 `_session_mint` → auth 的 `/fixture-session`），而夹具域邮箱**永远不能是管理员**
+（`permissions.py` 的数据层硬拒，ADR 0002）。拿真实管理员的邮箱去签更是不可能且不该——那等于在 `ops_log` 里留下一条
 "某位管理员关掉了全平台 Key 通道"的假审计——审计可信度的代价远大于多覆盖一条
 HTTP 路径。这里直接调 `keystore.set_switch`（**同一个写入实现**）并把 `actor`
 标成本脚本名（沿用 `deploy_key_proxy.py` 写哨兵行时的既有约定），再断言
@@ -180,16 +181,17 @@ def main() -> int:
 
     ddb = boto3.resource("dynamodb", region_name=region)
     keys_tbl = ddb.Table("site-api-keys")
-    # 会话由 _session_mint 统一签发（新形态、带 kid；idp 取 router/config.ini 的 trusted_idps 第一项）。
-    minter = sm.Minter.from_config(CFG_PATH, ROOT / "router" / "config.ini")
+    # 会话由 _session_mint 统一取（夹具签发器客户端，ADR 0002）：站点会话来自 auth 的
+    # /fixture-session，面板会话走真实换取链路。
+    minter = sm.Minter.from_config(CFG_PATH)
 
     suf = secrets.token_hex(4)
-    owner = f"apikeye2e-{suf}@example.com"
+    # 夹具域（ADR 0002）：Edge 只在夹具站点与平台路由上认夹具会话，本脚本的探针身份必须在这个域。
+    owner = f"apikeye2e-{suf}@e2e.invalid"
     started_at = datetime.now(timezone.utc)
 
     def mint(scope: str = "") -> str:
-        return minter.mint("console-session" if scope == "console" else "site-session",
-                           owner, ttl_seconds=1800)
+        return minter.mint("console-session" if scope == "console" else "site-session", owner)
 
     console_ck = f"sb_session={mint()}; __Host-sb_console={mint('console')}"
     console_headers = {"cookie": console_ck, "origin": console_origin}

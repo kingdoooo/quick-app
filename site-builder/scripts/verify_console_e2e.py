@@ -6,11 +6,13 @@
 数据是否真被改）。用 HTTP 层做可以无人值守、可重复、失败点精确。真浏览器那两项
 在本脚本末尾列出来交给人工（同 `verify_auth_alarm.sh` 的 ② 段既有设计）。
 
-**会话怎么来**：经 `_session_mint`（验收工具唯一的本地 mint 入口）用 site/console family
-的 current 密钥签出与托管登录**同形态**的带 kid 会话（含 idp/auth_via，Edge 的 REQUIRE_IDP_CLAIM
-要求它们）。这不是绕过鉴权——签名密钥就是唯一的信任根，verifier 验的就是这个；3c-2A 把那个模块
-换成夹具签发器，本脚本不动。它验证的是 Edge→panel
-的完整链路：CloudFront → origin-request 验签 → 注入 x-user-email →
+**会话怎么来**：经 `_session_mint`（夹具签发器的客户端，ADR 0002）——assume `site-builder-verifier`
+→ auth 的 `POST /fixture-session` 拿站点会话；面板会话走**真实**换取链路
+（auth `/console-session` → panel `/api/session-callback`）。这不是绕过鉴权：签的是 auth 自己用
+KMS 签的那把 site key，verifier 验的就是它；本脚本一个密钥都拿不到。**三个探针身份都在夹具域
+`@e2e.invalid`**：Edge 只在夹具站点（route owner 的域是夹具域）与平台路由上认夹具会话，本脚本
+建的 fixture 站点 owner 因此也必须在这个域，否则每条请求都 302（读起来像"部署坏了"）。
+它验证的是 Edge→panel 的完整链路：CloudFront → origin-request 验签 → 注入 x-user-email →
 Function URL(AWS_IAM) → handler 五步前置。
 
 **纪律（照 smoke_router.sh 的三条）**：
@@ -42,7 +44,7 @@ sys.path.insert(0, str(HERE.parent / "auth"))
 sys.path.insert(0, str(HERE.parent / "deployer" / "functions"))
 sys.path.insert(0, str(HERE))       # _session_mint.py（scripts/ 不是包）
 
-import _session_mint as sm      # noqa: E402  (验收工具唯一的本地 mint 入口；2A 换夹具签发器)
+import _session_mint as sm      # noqa: E402  (验收登录态的唯一入口：夹具签发器客户端，ADR 0002)
 
 CHECKS = 0
 FAILURES = 0
@@ -145,25 +147,26 @@ def main() -> int:
     # ── fixture：本次专用的站点 + 两个探针身份 ──────────────────────────
     suf = secrets.token_hex(4)
     site_id = f"conse2e-{suf}"
-    owner = f"conse2e-owner-{suf}@example.com"
-    outsider = f"conse2e-outsider-{suf}@example.com"
-    collaborator = f"conse2e-collab-{suf}@example.com"
+    # 三个身份都在**夹具域**（ADR 0002）：Edge 只在 owner 属于夹具域的路由上认夹具会话，
+    # 而本段建的 fixture 站点 owner 就是下面这个 `owner`。换成别的域 ⇒ 每条请求 302。
+    owner = f"conse2e-owner-{suf}@e2e.invalid"
+    outsider = f"conse2e-outsider-{suf}@e2e.invalid"
+    collaborator = f"conse2e-collab-{suf}@e2e.invalid"
     created: list[tuple[str, dict]] = []
 
-    # 会话由 _session_mint 统一签发（新形态、带 kid；idp 取 router/config.ini 的 trusted_idps 第一项，
-    # 写死 "Feishu" 会让脚本在换 IdP 的环境上全红，而红的原因与被测代码无关）。取不到密钥/idp 时它
-    # 自己会 exit，验收不可信就不往下走。
-    minter = sm.Minter.from_config(CFG_PATH, HERE.parents[1] / "router" / "config.ini")
+    # 会话由 _session_mint 统一取（夹具签发器客户端）：站点会话来自 auth 的 /fixture-session，
+    # 面板会话走真实换取链路。取不到（组件没开 / 本机凭据不在 verifier_trusted_principals 里）
+    # 它自己会 exit——验收不可信就不往下走。
+    minter = sm.Minter.from_config(CFG_PATH)
 
     def mint(email: str, *, scope: str = "") -> str:
-        """站点会话；scope="console" 是面板会话（token_use=console-session，console family 的 kid）。"""
-        return minter.mint("console-session" if scope == "console" else "site-session",
-                           email, ttl_seconds=1800)
+        """站点会话；scope="console" 是面板会话（真实换取链路，每次消费一枚一次性升级码）。"""
+        return minter.mint("console-session" if scope == "console" else "site-session", email)
 
     def cookies_for(email: str, *, console_session: bool) -> dict:
         out = {"sb_session": mint(email)}
         if console_session:
-            # 面板会话：scope=console 的会话 JWT，与 console_session.py 同形态
+            # 面板会话：auth 发一次性 code → panel 的 /api/session-callback 下发 __Host-sb_console
             out["__Host-sb_console"] = mint(email, scope="console")
         return out
 

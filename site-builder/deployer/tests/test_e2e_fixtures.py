@@ -1,7 +1,8 @@
 """真实 AWS 端到端：RUN_E2E=1 .venv/bin/pytest tests/test_e2e_fixtures.py -q
-断言真实 HTTP 行为，不只看部署退出码。登录态经 `scripts/_session_mint`（验收工具唯一的本地
-mint 入口）用 site family 的 current 密钥签出带 kid 的会话 cookie——无需人工飞书扫码即可自动化
-验证 CRUD；3c-2A 把那个模块换成夹具签发器，本文件不动。
+断言真实 HTTP 行为，不只看部署退出码。登录态经 `scripts/_session_mint`（夹具签发器的客户端，
+ADR 0002）向 auth 的 `POST /fixture-session` 取夹具域会话 cookie——无需人工飞书扫码即可自动化
+验证 CRUD，且本文件一个密钥都拿不到。**身份与站点 owner 都必须在夹具域 `e2e.invalid`**：
+Edge 只在 owner 属于夹具域的路由上认夹具会话（`deploy_fixture` 的默认 owner 同域）。
 
 **M7 的五条（spec §5）在本文件的后半段**。它们与前面几条的区别在于：前面几条验
 "部署一次能用"，后面五条验**更新的原子性**——同一个 site_id 连着部两次、每次带
@@ -43,6 +44,11 @@ ROUTE_CACHE_WAIT = 70
 # 下面 _live_color 是按这条契约独立实现的一份，不是被测函数的引用。
 COLORS = ("blue", "green")
 
+# 夹具域（ADR 0002）：Edge 只在夹具站点（route owner 的域是 `e2e.invalid`）与平台路由上认夹具
+# 会话，而本文件的站点由 `deploy_fixture` 建、owner 就是它的默认值 `fixture@e2e.invalid`（同域）。
+# 换成任何别的域 ⇒ 每条带 cookie 的请求都 302，而症状读起来像"部署出来的站点不通"。
+E2E_EMAIL = "e2e-bot@e2e.invalid"
+
 
 @pytest.fixture(scope="module")
 def cfg():
@@ -56,17 +62,18 @@ def cfg():
 # 本文件有**两类** HTTPS 请求，过去只管了第一类：
 #   ① 测试自己发的 —— 走下面的 `_ssl_context()`，显式用 certifi，一直是好的；
 #   ② **在进程内被调用的生产代码**发的 —— 走 Python 的**默认**上下文。
-#      `migrate_sites_to_blue_green._public_check` → `smoke_test._head` → `urlopen()`
-#      就是这一类（spec §5.4 那条用例在进程内直接调 `migrate_one`）。
+#      `smoke_test._head` → `urlopen()` 就是这一类（模块级 `build_opener`，见
+#      `_frozen_https_contexts`）。今天本文件不再在进程内调迁移脚本，但**理由仍然成立**：
+#      任何一处在进程内直连的生产代码（`verify_*` 类、smoke 门）都走默认上下文。
 #
 # `deployer/.venv/bin/python3` 的默认上下文**一个 CA 都没有**（实测
 # `cert_store_stats()` 全 0，CLAUDE.md 记过这个坑），于是第二类请求以
 # CERTIFICATE_VERIFY_FAILED 失败——症状读起来像网络/证书故障，其实是本机解释器的
 # 信任库是空的。真机第一次跑就栽在这里（21 分钟之后才炸）。
 #
-# **生产上没有这个问题**：`smoke_test` 在 Lambda 里跑，迁移脚本按 CLAUDE.md 用系统
+# **生产上没有这个问题**：`smoke_test` 在 Lambda 里跑，`scripts/*.py` 按 CLAUDE.md 用系统
 # `python3`（走 pip 注入的 truststore，读 macOS keychain）。所以要修的是本 harness，
-# **不是** `smoke_test.py` 或迁移脚本——改那两个文件等于为了 harness 的缺陷去动生产码。
+# **不是** `smoke_test.py` 或那些脚本——改它们等于为了 harness 的缺陷去动生产码。
 
 def _ctx_trust_ok(ctx) -> bool:
     """这个 SSL 上下文能不能验证证书。
@@ -275,21 +282,29 @@ def _cleanup_created_sites(_platform_env):
 
 
 @pytest.fixture(scope="module")
-def session_cookie(cfg):
-    """合成一个**能通过 Edge 全部检查**的会话 cookie。
+def _minter(cfg):
+    """夹具签发器客户端（`scripts/_session_mint`）。
 
-    必须带 idp 与 auth_via：Edge 开了 `require_idp_claim=true` 之后，缺这两个
-    claim 的会话会被 302 到登录页，于是后面所有 CRUD 断言都在"根本没到站点"
-    的前提下通过/失败，验的不是它们声称的东西（Codex 审查 2026-08-06 P2）。
-    这两个值必须与 Edge 的 TRUSTED_IDPS / TRUSTED_AUTH_SOURCES 逐字符一致——
-    真机实测过 Cognito 签出的就是 `Feishu` 与 `TokenGeneration_HostedAuth`。
-    idp 从 router/config.ini 读，避免这里和部署配置漂移。
+    取不到（组件没开 / 本机凭据不在 `[Verification] verifier_trusted_principals` 里）时
+    `from_config` 自己 exit——E2E 必然失败，早停比跑 37 分钟后在断言里炸清楚得多。
     """
     sys.path.insert(0, str(ROOT / "site-builder/scripts"))
     import _session_mint as sm
-    # idp 取 router/config.ini 的 trusted_idps 第一项；取不到时 from_config 自己 exit（E2E 必然失败，早停）
-    minter = sm.Minter.from_config(ROOT / "site-builder/config.ini", ROOT / "router/config.ini")
-    return "sb_session=" + minter.mint("site-session", "e2e@test.com", name="E2E Bot", ttl_seconds=86400)
+    return sm.Minter.from_config(ROOT / "site-builder/config.ini")
+
+
+@pytest.fixture
+def session_cookie(_minter):
+    """**每条用例一枚新的**夹具会话 cookie（`token_use=site-session`，auth 用 KMS 的 site key 签）。
+
+    **function 级不是洁癖**（D11）：夹具签发器的 TTL 上限是 30 分钟，而本文件整轮约 37 分钟——
+    module 级会在中途过期，症状是后半段用例全部 302 到登录页，读起来像"Edge 突然不认会话了"。
+    每次调用同时会现 assume 一次 `site-builder-verifier`（角色会话上限 1 小时，同一个理由）。
+
+    claim 的形状由签发器决定（`auth_via=fixture-issuer`、`idp=fixture`），本文件不再拼它：
+    Edge 对这两个夹具标记有专门分支，且只在 owner 属于夹具域的路由上放行（ADR 0002）。
+    """
+    return "sb_session=" + _minter.site_session(E2E_EMAIL, name="E2E Bot")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -406,7 +421,7 @@ def test_notes_site_auth_and_crud(session_cookie, cfg):
                          {"text": "e2e note"})
     assert code == 201, body
     created = json.loads(body)
-    assert created["author"] == "e2e@test.com"  # x-user-email 注入生效
+    assert created["author"] == E2E_EMAIL  # x-user-email 注入生效
     code, _, body = _req(url + "/api/notes", cookie=session_cookie)
     assert code == 200
     assert any(n["id"] == created["id"] for n in json.loads(body))  # read-back
@@ -424,7 +439,7 @@ def test_notes_site_auth_and_crud(session_cookie, cfg):
                          {"text": "header-strip probe"}, extra_headers=fake)
     assert code == 201, body
     probe = json.loads(body)
-    assert probe["author"] == "e2e@test.com", \
+    assert probe["author"] == E2E_EMAIL, \
         f"伪造的 x-user-email 未被剥除，站点看到了 {probe['author']}"
     _req(f"{url}/api/notes/{probe['id']}", "DELETE", session_cookie)
 
@@ -453,7 +468,7 @@ def test_update_visible_and_undeploy_404(cfg):
     from datetime import datetime, timezone
     jid = f"job-e2e-un-{site_id[-6:]}"
     now = datetime.now(timezone.utc).isoformat()
-    jobs.put_item(Item={"job_id": jid, "site_id": site_id, "owner": "fixture@test",
+    jobs.put_item(Item={"job_id": jid, "site_id": site_id, "owner": "fixture@e2e.invalid",
                         "status": "PENDING", "phase": "submitted", "error": "",
                         "url": "", "created_at": now, "updated_at": now})
     fn.invoke(FunctionName="site-deployer-undeploy",
@@ -494,7 +509,7 @@ def _assert_site_id_is_free(site_id: str) -> None:
     **真站点**的 site_id 形如 `notes-<6 位十六进制>`（真人 owner，permissions_rev 已经
     十几），而本函数从前生成的**正是同一个形状**。撞上之后：
 
-      ① `--site-id` 让部署覆盖那个站点的 Lambda 与路由，并把 owner 改成 fixture@test；
+      ① `--site-id` 让部署覆盖那个站点的 Lambda 与路由，并把 owner 改成 fixture@e2e.invalid；
       ② 紧接着 module 级清理按 `purge_data=True` 下线它 ⇒ 连 DynamoDB 数据表一起删。
 
     也就是**不可恢复地毁掉一个真用户的站点**。单次概率 1/16^6，但代价不可逆，所以
@@ -737,97 +752,6 @@ def test_failed_update_leaves_live_intact_and_then_recovers(
     assert m_a not in body, f"公网还在服务 v1：{body[:300]}"
 
 
-def test_legacy_site_migrates_to_blue_green_and_then_survives_a_bad_update(
-        session_cookie, cfg, tmp_path):
-    """spec §5.4 存量迁移。
-
-    先把一个刚部好的站点**退化**成迁移前的形态（函数级 FURL + 路由指它 + 没有
-    alias），这样"存量站点"是真的存量形态而不是描述。
-
-    红的条件：退化后的站点更新竟然没有 fail-closed（那正是 §4.3 不允许的隐式半迁移）、
-    迁移脚本没把路由切到 blue、迁移后公网不通、或迁移后的坏更新又打到了线上。
-    """
-    site_id = _new_site_id()
-    m = _marker("legacy")
-    url = _deploy("nosql-notes", site_id=site_id, marker=m)
-    old_url = _degrade_to_legacy(cfg, site_id)
-    time.sleep(ROUTE_CACHE_WAIT)
-    assert m in _health_body(url, session_cookie), "退化成旧式形态后站点就不通了"
-    assert _live_color(cfg, site_id) is None, "退化没做干净，还认得出颜色"
-
-    # ① 未迁移的站点更新必须 fail-closed（spec §4.3：不做隐式半迁移）
-    job = _deploy_expected_to_fail(
-        _variant(tmp_path / "bad1", server_js=_BAD_BOOT_SERVER), site_id)
-    assert "UnmigratedSite" in job.get("error", ""), \
-        f"未迁移站点没有 fail-closed，而是走到了别的失败：{job.get('error', '')}"
-    assert m in _health_body(url, session_cookie), "被拒的部署仍然动了线上"
-
-    # ② 跑迁移。**按 site_id 单点调 migrate_one，不跑 CLI 的全表扫描**：
-    #    这是真账号，全表扫会把所有真实站点一起迁掉。
-    sys.path.insert(0, str(ROOT / "site-builder/scripts"))
-    import migrate_sites_to_blue_green as mig
-    mig._load_config()
-    assert mig.migrate_one(_lam(), _ddb(), site_id, dry_run=False) == "migrated"
-
-    blue = _color_url(site_id, COLORS[0])
-    assert blue, f"迁移后 {COLORS[0]} 没有 Function URL"
-    item = _route_item(cfg, site_id)
-    assert item["api_target"]["S"].rstrip("/") == blue, \
-        f"路由没指向 {COLORS[0]}：{item['api_target']['S']} != {blue}"
-    assert _live_color(cfg, site_id) == COLORS[0]
-    assert old_url != blue, "迁移前后是同一个端点，等于什么都没迁"
-    assert m in _health_body(url, session_cookie), "迁移后公网不通"
-
-    # ③ 迁移之后，坏更新同样打不到线上——而且必须是**健康门**在空闲色上拦下的，
-    #    不是又一次 UnmigratedSite（那说明迁移其实没被部署路径认出来）
-    job = _deploy_expected_to_fail(
-        _variant(tmp_path / "bad2", server_js=_BAD_BOOT_SERVER), site_id)
-    err = job.get("error", "")
-    assert f"site-{site_id}:{_other(COLORS[0])}" in err, \
-        f"迁移后的坏更新不是被空闲色的健康门拦下的：{err}"
-    assert _live_color(cfg, site_id) == COLORS[0], "坏更新把颜色换了"
-    assert m in _health_body(url, session_cookie), "坏更新打到了线上"
-
-
-def _degrade_to_legacy(cfg, site_id: str) -> str:
-    """把一个 blue/green 站点退回迁移前形态，返回那个函数级（无 qualifier）URL。
-
-    **顺序不能反**：先建旧 URL 并把路由指过去，再删颜色的 URL 与 alias。反过来会有
-    一段时间路由指着一个已经不存在的端点——那不是"存量站点"的形态，是一次故障。
-    """
-    lam, fn = _lam(), f"site-{site_id}"
-    try:
-        old = lam.create_function_url_config(
-            FunctionName=fn, AuthType="AWS_IAM")["FunctionUrl"]
-    except lam.exceptions.ResourceConflictException:
-        old = lam.get_function_url_config(FunctionName=fn)["FunctionUrl"]
-    # 2025-10 起 Edge 调用需要 InvokeFunctionUrl + InvokeFunction 两条语句，缺一即
-    # 403。这里**不带 Qualifier**——存量站点的授权就是授在函数上的。
-    for sid, action, extra in (
-            ("edge-invoke", "lambda:InvokeFunctionUrl",
-             {"FunctionUrlAuthType": "AWS_IAM"}),
-            ("edge-invoke-function", "lambda:InvokeFunction",
-             {"InvokedViaFunctionUrl": True})):
-        try:
-            lam.add_permission(FunctionName=fn, StatementId=sid, Action=action,
-                               Principal=cfg["Deployer"]["edge_role_arn"], **extra)
-        except lam.exceptions.ResourceConflictException:
-            pass
-    _ddb().update_item(TableName=cfg["Platform"]["routing_table"],
-                       Key={"subdomain": {"S": f"app-{site_id}"}},
-                       UpdateExpression="SET api_target = :t",
-                       ExpressionAttributeValues={":t": {"S": old.rstrip("/")}})
-    for c in COLORS:
-        for call, kw in ((lam.delete_function_url_config,
-                          {"FunctionName": fn, "Qualifier": c}),
-                         (lam.delete_alias, {"FunctionName": fn, "Name": c})):
-            try:
-                call(**kw)
-            except lam.exceptions.ResourceNotFoundException:
-                pass
-    return old.rstrip("/")
-
-
 def test_smoke_failure_after_the_commit_point_restores_the_whole_route_item(
         cfg, tmp_path):
     """spec §5.5 提交点之后失败会恢复路由。
@@ -872,10 +796,9 @@ def test_rev_less_legacy_route_can_still_roll_back_after_a_smoke_failure(
     """spec §5.5 的**存量形态**：路由上没有 `permissions_rev` 时同样能回滚。
 
     这是 Codex 2026-08-17 P1-4。为什么原来那条 §5.5 用例证明不了它：它验的路由是
-    一次 M7 部署刚写出来的，`register_route` 必写 rev。而**生产上 6 条站点路由里
-    有 5 条没有 rev**（M3 之前写入的；实测只有 app-notes-01d147 有），
-    `_degrade_to_legacy` 退化的是 URL 与 alias，**没有**动 rev —— 于是那 8/8 全绿
-    与"真实存量路由能不能回滚"完全无关。
+    一次 M7 部署刚写出来的，`register_route` 必写 rev。而存量路由里有一批没有 rev
+    （M3 之前写入的），而当时那条"退化成存量形态"的用例只动了 Function URL 与 alias、
+    **没有**动 rev —— 于是它 8/8 全绿与"真实存量路由能不能回滚"完全无关。
 
     所以这里显式把 rev 从路由上 REMOVE 掉，做出真实存量形状，再走同一条
     提交点之后失败的路径。

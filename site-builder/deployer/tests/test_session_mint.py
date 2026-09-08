@@ -1,8 +1,8 @@
-"""`scripts/_session_mint.py`：验收工具唯一的本地 mint 入口（3c-1B ticket 01，spec §11.8.4）。
+"""`scripts/_session_mint.py`：夹具签发器的客户端（3c-final；ADR 0002）。**import 期不得碰 AWS。**
 
-先于实现写下并跑红。它读 `[SessionKeys]`、按 family/role 取 SSM 值、调用**生产** `session.mint_token`
-（legacy role 调用旧 mint，用于 L3/退役之前预存负向探针 token）。路径只来自 config；`--save` 只许写进
-`.scratch/`。2A 把这个模块换成夹具签发器，六处调用方不动。
+本模块不再持有任何密钥：站点会话来自 `sts.assume_role(site-builder-verifier)` + SigV4 `POST`
+auth 的 `/fixture-session`；升级码与面板会话走**真实**换取链路。`family=` 覆盖已删——KMS 之后
+没有任何组件能带外签 console family，跨 family 反例改由 auth / Edge 单测给（plan D3）。
 """
 import base64
 import json
@@ -10,197 +10,277 @@ import os
 import sys
 import textwrap
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
-import boto3
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
-for d in ("scripts", "auth"):
+for d in ("scripts", "auth", "deployer/functions"):
     sys.path.insert(0, str(ROOT / "site-builder" / d))
-import _session_mint as sm  # noqa: E402  —— import 期不得碰 AWS
-import session as sess  # noqa: E402
+import _session_mint as sm  # noqa: E402
 
 CFG = textwrap.dedent("""
     [Platform]
     region = us-east-1
     base_domain = example.test
+    account_id = 111111111111
     routing_table = site-routes
 
-    [SessionKeys]
-    site_current = site-hs-v1
-    site_previous =
-    console_current = console-hs-v1
-    console_previous =
-    signer = legacy
-    legacy_param = /site-builder/jwt-secret
-    login_flow_secret_param = /site-builder/login-flow-secret
-
-    [SessionKey:site-hs-v1]
-    alg = HS256
-    ssm_param = /site-builder/session-keys/site-hs-v1
-
-    [SessionKey:console-hs-v1]
-    alg = HS256
-    ssm_param = /site-builder/session-keys/console-hs-v1
+    [Verification]
+    fixture_issuer = true
+    verifier_trusted_principals = arn:aws:iam::111111111111:user/kent
 """)
-CFG_WITH_PREVIOUS = (CFG.replace("site_previous =", "site_previous = site-hs-v0")
-                     .replace("console_previous =", "console_previous = console-hs-v0")
-                     + textwrap.dedent("""
-    [SessionKey:site-hs-v0]
-    alg = HS256
-    ssm_param = /site-builder/session-keys/site-hs-v0
-
-    [SessionKey:console-hs-v0]
-    alg = HS256
-    ssm_param = /site-builder/session-keys/console-hs-v0
-"""))
-ROUTER = textwrap.dedent("""
-    [SiteBuilder]
-    trusted_idps = Feishu-Test, Other   # 第一个是 Edge 信任的
-    require_idp_claim = true
-""")
-SECRETS = {"/site-builder/session-keys/site-hs-v1": "site-v1-secret",
-           "/site-builder/session-keys/console-hs-v1": "console-v1-secret",
-           "/site-builder/session-keys/site-hs-v0": "site-v0-secret",
-           "/site-builder/session-keys/console-hs-v0": "console-v0-secret",
-           "/site-builder/jwt-secret": "legacy-secret"}
+CFG_OFF = CFG.replace("fixture_issuer = true", "fixture_issuer = false")
+URL = "https://abc.lambda-url.us-east-1.on.aws/"
+TOKEN = "eyJhbGciOiJSUzI1NiJ9.eyJlbWFpbCI6InByb2JlQGUyZS5pbnZhbGlkIn0.c2ln"
+CODE = "eyJhbGciOiJSUzI1NiJ9.eyJqdGkiOiJ4In0.c2ln"
+CONSOLE = "eyJhbGciOiJSUzI1NiJ9.eyJ0b2tlbl91c2UiOiJjb25zb2xlLXNlc3Npb24ifQ.c2ln"
 
 
-def _files(tmp_path, cfg=CFG):
-    c = tmp_path / "config.ini"; c.write_text(cfg)
-    r = tmp_path / "router.ini"; r.write_text(ROUTER)
-    return c, r
+def _b64(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
 
-def _ssm_with_secrets():
-    ssm = boto3.client("ssm", region_name="us-east-1")
-    for k, v in SECRETS.items():
-        ssm.put_parameter(Name=k, Value=v, Type="SecureString")
-    return ssm
+# 带 kid 的 header（真机形态）：CLI 的记录字段 `kid` 是从 header 解出来的，
+# 上面那枚 TOKEN 的 header 里没有 kid，证不出"解对了"。
+KID_TOKEN = (_b64(json.dumps({"alg": "RS256", "typ": "JWT", "kid": "site-rs-v1"}).encode())
+             + ".eyJlbWFpbCI6InByb2JlQGUyZS5pbnZhbGlkIn0.c2ln")
 
 
-def _header(tok):
-    h = tok.split(".")[0]
-    return json.loads(base64.urlsafe_b64decode(h + "=" * (-len(h) % 4)))
+class FakeSession:
+    """boto3.Session 替身：sts.assume_role 与 lambda.get_function_url_config。"""
+    def __init__(self):
+        self.calls = []
+
+    def client(self, svc, region_name=None):
+        outer = self
+
+        class C:
+            def assume_role(self, **kw):
+                outer.calls.append(("assume_role", kw))
+                return {"Credentials": {"AccessKeyId": "AKIA" + "X" * 16, "SecretAccessKey": "s", "SessionToken": "t"}}
+
+            def get_function_url_config(self, FunctionName):
+                outer.calls.append(("get_function_url_config", FunctionName))
+                return {"FunctionUrl": URL, "AuthType": "AWS_IAM"}
+        return C()
 
 
-def _payload(tok):
-    p = tok.split(".")[1]
-    return json.loads(base64.urlsafe_b64decode(p + "=" * (-len(p) % 4)))
+class FakeHttp:
+    """记录每个请求；按 URL 路径给出理想应答（auth 的 /fixture-session、/console-session、panel 的 callback）。"""
+    def __init__(self, *, fixture_status=200, token=TOKEN):
+        self.requests = []
+        self.fixture_status = fixture_status
+        self.token = token
+
+    def __call__(self, method, url, headers, body):
+        self.requests.append((method, url, dict(headers), body))
+        path = urlparse(url).path
+        if path.endswith("/fixture-session"):
+            b = json.loads(body)
+            return self.fixture_status, {"content-type": "application/json"}, json.dumps(
+                {"token": self.token, "kid": "site-rs-v1" if b.get("role", "current") == "current" else "site-rs-v0",
+                 "ttl_seconds": b.get("ttl_seconds", 1800)})
+        if path == "/console-session":
+            return 302, {"location": f"https://console.example.test/api/session-callback?code={CODE}"}, ""
+        if path == "/api/session-callback":
+            return 302, {"location": "https://console.example.test/",
+                         "set-cookie": [f"__Host-sb_console={CONSOLE}; Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age=14400"]}, ""
+        raise AssertionError(f"unexpected {method} {url}")
 
 
-def _minter(tmp_path, cfg=CFG):
-    c, r = _files(tmp_path, cfg)
-    return sm.Minter.from_config(c, r, ssm=_ssm_with_secrets())
+def _cfg(tmp_path, text=CFG):
+    p = tmp_path / "config.ini"; p.write_text(text); return p
+
+
+def _minter(tmp_path, http=None, text=CFG):
+    return sm.Minter.from_config(_cfg(tmp_path, text), session=FakeSession(), http=http or FakeHttp())
 
 
 def test_import_has_no_side_effects_and_exposes_the_api():
-    assert callable(sm.Minter.from_config) and callable(sm.main) and callable(sm.save_token)
+    for name in ("Minter", "live_target", "save_token", "load_saved_token", "PROBE_EMAIL", "FIXTURE_SITE_ID"):
+        assert hasattr(sm, name), name
+    assert sm.PROBE_EMAIL == "probe@e2e.invalid" and sm.FIXTURE_SITE_ID == "e2e-probe"
 
 
-def test_default_role_is_current_and_token_is_kid_form(aws, tmp_path):
-    m = _minter(tmp_path)
-    tok = m.mint("site-session", "v@example.test", ttl_seconds=600)
-    assert _header(tok) == {"alg": "HS256", "typ": "JWT", "kid": "site-hs-v1"}
-    claims, outcome = sess.verify_token(
-        tok, allowlist={"site-hs-v1": {"alg": "HS256", "secret": "site-v1-secret", "role": "current"}},
-        token_use="site-session")
-    assert outcome == "accepted_current" and claims["email"] == "v@example.test"
-    # Edge 的 REQUIRE_IDP_CLAIM：idp 取 router 配置 trusted_idps 的第一个，auth_via 是托管登录值
-    assert claims["idp"] == "Feishu-Test" and claims["auth_via"] == "TokenGeneration_HostedAuth"
-    assert claims["name"] == "v"      # 默认 name = 邮箱本地部分（与今天六处调用方一致）
+def test_from_config_only_finds_the_auth_url_and_each_mint_assumes_the_role_afresh(tmp_path):
+    fs = FakeSession()
+    m = sm.Minter.from_config(_cfg(tmp_path), session=fs, http=FakeHttp())
+    assert [c[0] for c in fs.calls] == ["get_function_url_config"] and fs.calls[0][1] == "site-auth-service"
+    m.site_session("probe@e2e.invalid")
+    m.site_session("probe@e2e.invalid")
+    # D11：验收角色会话上限 3600 s、E2E 约 37 min——构造时只 assume 一次会贴着上限，过期症状是 Function URL 403、
+    # 读起来像授权配错。每次 mint 一次 AssumeRole（900 s 是 STS 允许的最小值），没有到期刷新那套时钟逻辑。
+    assert [c[0] for c in fs.calls] == ["get_function_url_config", "assume_role", "assume_role"]
+    kw = fs.calls[1][1]
+    assert kw["RoleArn"] == "arn:aws:iam::111111111111:role/site-builder-verifier" and kw["DurationSeconds"] == 900
+    assert kw["RoleSessionName"].startswith("verify-")
 
 
-def test_console_family_tokens_use_console_current_kid(aws, tmp_path):
-    m = _minter(tmp_path)
-    code = m.mint("console-upgrade", "v@example.test", ttl_seconds=600)
-    cookie = m.mint("console-session", "v@example.test", ttl_seconds=600)
-    assert _header(code)["kid"] == "console-hs-v1" and _header(cookie)["kid"] == "console-hs-v1"
-    allow = {"console-hs-v1": {"alg": "HS256", "secret": "console-v1-secret", "role": "current"}}
-    c1, o1 = sess.verify_token(code, allowlist=allow, token_use="console-upgrade")
-    c2, o2 = sess.verify_token(cookie, allowlist=allow, token_use="console-session")
-    assert o1 == o2 == "accepted_current" and c1["jti"]
-    assert _payload(code)["exp"] - _payload(code)["iat"] <= 60      # 升级码 TTL 钳到 60
+def test_from_config_refuses_when_the_component_is_off(tmp_path):
+    with pytest.raises(SystemExit, match="fixture_issuer"):
+        sm.Minter.from_config(_cfg(tmp_path, CFG_OFF), session=FakeSession(), http=FakeHttp())
 
 
-def test_previous_role_uses_the_previous_kid(aws, tmp_path):
-    m = _minter(tmp_path, CFG_WITH_PREVIOUS)
-    tok = m.mint("site-session", "v@example.test", role="previous", ttl_seconds=600)
-    assert _header(tok)["kid"] == "site-hs-v0"
-    _, outcome = sess.verify_token(
-        tok, allowlist={"site-hs-v1": {"alg": "HS256", "secret": "site-v1-secret", "role": "current"},
-                        "site-hs-v0": {"alg": "HS256", "secret": "site-v0-secret", "role": "previous"}},
-        token_use="site-session")
-    assert outcome == "accepted_previous"
+def test_from_config_refuses_an_empty_config(tmp_path):
+    """configparser 对缺失文件是静默的——不硬失败就会拿空值往下拼出假结论。"""
+    with pytest.raises(SystemExit, match="读空了"):
+        sm.Minter.from_config(tmp_path / "missing.ini", session=FakeSession(), http=FakeHttp())
 
 
-def test_previous_role_fails_loudly_when_previous_is_empty(aws, tmp_path):
-    m = _minter(tmp_path)
-    with pytest.raises(SystemExit, match="previous"):
-        m.mint("site-session", "v@example.test", role="previous", ttl_seconds=600)
+def test_site_session_posts_a_sigv4_signed_request_with_the_contract_body(tmp_path):
+    http = FakeHttp()
+    tok = _minter(tmp_path, http).site_session("probe@e2e.invalid", ttl_seconds=600, name="Probe")
+    assert tok == TOKEN
+    method, url, headers, body = http.requests[0]
+    assert (method, url) == ("POST", URL + "fixture-session")
+    assert json.loads(body) == {"email": "probe@e2e.invalid", "ttl_seconds": 600, "name": "Probe", "role": "current"}
+    h = {k.lower(): v for k, v in headers.items()}
+    assert h["authorization"].startswith("AWS4-HMAC-SHA256") and "x-amz-security-token" in h and "x-amz-date" in h
+    assert h["content-type"] == "application/json"
 
 
-def test_legacy_role_mints_the_old_kid_less_form(aws, tmp_path):
-    m = _minter(tmp_path)
-    site = m.mint("site-session", "v@example.test", role="legacy", ttl_seconds=600)
-    console = m.mint("console-session", "v@example.test", role="legacy", ttl_seconds=600)
-    code = m.mint("console-upgrade", "v@example.test", role="legacy", ttl_seconds=600)
-    for t in (site, console, code):
-        assert "kid" not in _header(t)
-    assert sess.verify_session_jwt(site, "legacy-secret", expected_typ="session")["email"] == "v@example.test"
-    assert "scope" not in _payload(site)
-    assert _payload(console)["scope"] == "console"
-    assert sess.verify_upgrade_code(code, "legacy-secret")["jti"]
+def test_role_previous_is_passed_through(tmp_path):
+    http = FakeHttp()
+    _minter(tmp_path, http).site_session("probe@e2e.invalid", role="previous")
+    assert json.loads(http.requests[0][3])["role"] == "previous"
 
 
-def test_unknown_role_is_rejected(aws, tmp_path):
+def test_an_unknown_role_is_refused_before_any_request(tmp_path):
+    http = FakeHttp()
     with pytest.raises(SystemExit, match="role"):
-        _minter(tmp_path).mint("site-session", "v@example.test", role="next", ttl_seconds=600)
+        _minter(tmp_path, http).site_session("probe@e2e.invalid", role="legacy")
+    assert http.requests == []
 
 
-def test_each_ssm_parameter_is_read_once(aws, tmp_path):
-    c, r = _files(tmp_path)
-    real = _ssm_with_secrets()
-    calls = []
-
-    class Counting:
-        def get_parameter(self, **kw):
-            calls.append(kw["Name"])
-            return real.get_parameter(**kw)
-
-    m = sm.Minter.from_config(c, r, ssm=Counting())
-    for _ in range(3):
-        m.mint("site-session", "a@example.test", ttl_seconds=60)
-        m.mint("console-session", "a@example.test", ttl_seconds=60)
-    assert sorted(calls) == ["/site-builder/session-keys/console-hs-v1", "/site-builder/session-keys/site-hs-v1"]
+@pytest.mark.parametrize("email", ["a@example.com", "a@e2e.invalid.x", "", "a@E2E.INVALID"])
+def test_non_fixture_emails_are_refused_client_side_before_any_request(tmp_path, email):
+    http = FakeHttp()
+    with pytest.raises(SystemExit, match="e2e.invalid"):
+        _minter(tmp_path, http).site_session(email)
+    assert http.requests == []
 
 
-def test_empty_secret_value_is_fatal_not_an_empty_key(aws, tmp_path):
-    c, r = _files(tmp_path)
-    ssm = _ssm_with_secrets()
-
-    class Blank:
-        def get_parameter(self, **kw):
-            return {"Parameter": {"Value": ""}}
-
-    with pytest.raises(SystemExit, match="取不到"):
-        sm.Minter.from_config(c, r, ssm=Blank()).mint("site-session", "a@example.test", ttl_seconds=60)
+def test_non_200_from_the_issuer_is_fatal_and_names_the_status(tmp_path):
+    with pytest.raises(SystemExit, match="403"):
+        _minter(tmp_path, FakeHttp(fixture_status=403)).site_session("probe@e2e.invalid")
 
 
-def test_trusted_idp_is_the_first_entry_and_missing_is_fatal(tmp_path):
-    c, r = _files(tmp_path)
-    assert sm.trusted_idp(r) == "Feishu-Test"
-    (tmp_path / "empty.ini").write_text("[SiteBuilder]\ntrusted_idps =\n")
-    with pytest.raises(SystemExit, match="trusted_idps"):
-        sm.trusted_idp(tmp_path / "empty.ini")
+def test_upgrade_code_and_console_session_walk_the_real_exchange_chain(tmp_path):
+    http = FakeHttp()
+    m = _minter(tmp_path, http)
+    assert m.upgrade_code("probe@e2e.invalid") == CODE
+    http.requests.clear()
+    assert m.console_session("probe@e2e.invalid") == CONSOLE
+    paths = [(r[0], urlparse(r[1]).netloc, urlparse(r[1]).path) for r in http.requests]
+    assert paths == [("POST", urlparse(URL).netloc, "/fixture-session"),
+                     ("GET", "auth.example.test", "/console-session"),
+                     ("GET", "console.example.test", "/api/session-callback")]
+    assert http.requests[1][2]["cookie"] == f"sb_session={TOKEN}"
+    assert parse_qs(urlparse(http.requests[2][1]).query)["code"] == [CODE]
 
+
+def test_console_session_reuses_the_given_site_session_instead_of_minting_again(tmp_path):
+    """一枚会话走完整条链路：多签一枚不是错，但那让"这枚会话被 auth 与 panel 都接受了"证不成立。"""
+    http = FakeHttp()
+    m = _minter(tmp_path, http)
+    assert m.console_session("probe@e2e.invalid", site_session="GIVEN.a.b") == CONSOLE
+    assert [urlparse(r[1]).path for r in http.requests] == ["/console-session", "/api/session-callback"]
+    assert all(r[2]["cookie"] == "sb_session=GIVEN.a.b" for r in http.requests)
+
+
+def test_a_chain_step_that_does_not_hand_back_a_cookie_is_fatal(tmp_path):
+    """panel 不下发 `__Host-sb_console` 时必须响亮失败——静默返回空串会让调用方拿空 cookie 继续。"""
+    def http(method, url, headers, body):
+        if url.endswith("/console-session"):
+            return 302, {"location": f"https://console.example.test/api/session-callback?code={CODE}"}, ""
+        return 401, {}, "no"
+
+    with pytest.raises(SystemExit, match="session-callback"):
+        _minter(tmp_path, http).console_session("probe@e2e.invalid", site_session="GIVEN.a.b")
+
+
+def test_mint_dispatches_by_token_use_and_has_no_family_override(tmp_path):
+    m = _minter(tmp_path)
+    assert m.mint("site-session", "p@e2e.invalid") == TOKEN
+    assert m.mint("console-upgrade", "p@e2e.invalid") == CODE
+    assert m.mint("console-session", "p@e2e.invalid") == CONSOLE
+    with pytest.raises(TypeError):
+        m.mint("site-session", "p@e2e.invalid", family="console")
+    with pytest.raises(SystemExit):
+        m.mint("legacy", "p@e2e.invalid")
+
+
+def test_live_target_picks_only_the_resident_fixture_site(aws, tmp_path):
+    import boto3
+    ddb = boto3.resource("dynamodb", region_name="us-east-1")
+    t = ddb.create_table(TableName="site-routes", KeySchema=[{"AttributeName": "subdomain", "KeyType": "HASH"}],
+                         AttributeDefinitions=[{"AttributeName": "subdomain", "AttributeType": "S"}],
+                         BillingMode="PAY_PER_REQUEST")
+    t.put_item(Item={"subdomain": "app-real", "require_auth": True, "owner": "real@example.test"})
+    with pytest.raises(SystemExit, match="ensure_fixture_site"):
+        sm.live_target(_cfg(tmp_path), ddb=ddb)
+    t.put_item(Item={"subdomain": "app-e2e-probe", "require_auth": True, "owner": sm.PROBE_EMAIL})
+    tgt = sm.live_target(_cfg(tmp_path), ddb=ddb)
+    assert (tgt.subdomain, tgt.owner, tgt.base) == ("app-e2e-probe", sm.PROBE_EMAIL, "example.test")
+
+
+def test_live_target_pages_through_the_whole_routing_table(tmp_path):
+    """夹具站点在第二页 —— 不翻页就会以"没有夹具站点"失败（3c-1B-G A5），而报文指向路由表内容，真因是分页。"""
+    pages = [{"Items": [{"subdomain": "console", "owner": "platform", "require_auth": True},
+                        {"subdomain": "app-open", "owner": "o@x.test", "require_auth": False}],
+              "LastEvaluatedKey": {"subdomain": "app-open"}},
+             {"Items": [{"subdomain": "app-e2e-probe", "owner": sm.PROBE_EMAIL, "require_auth": True}]}]
+    seen = []
+
+    class _T:
+        def scan(self, **kw):
+            seen.append(kw.get("ExclusiveStartKey"))
+            return pages[len(seen) - 1]
+
+    class _DDB:
+        def Table(self, name):
+            return _T()
+
+    t = sm.live_target(_cfg(tmp_path), ddb=_DDB())
+    assert t.subdomain == "app-e2e-probe" and t.owner == sm.PROBE_EMAIL
+    assert seen == [None, {"subdomain": "app-open"}], seen
+    assert (t.site_url, t.auth_host, t.console_host) == (
+        "https://app-e2e-probe.example.test/", "auth.example.test", "console.example.test")
+
+
+def test_org_target_finds_a_real_org_site_and_is_none_when_the_account_has_none(aws, tmp_path):
+    """ADR 0002 的边界判据要一条**真实** org 站点（夹具会话投过去必须 302）。
+
+    没有这样的站点时返回 None（闸门据此报 skip，不是失败）；夹具站点自己即使 `allowed_users="org"`
+    也不算——拿它当目标那条判据就变成了"夹具会话能进夹具站点"，与正对照重复。
+    """
+    import boto3
+    ddb = boto3.resource("dynamodb", region_name="us-east-1")
+    t = ddb.create_table(TableName="site-routes", KeySchema=[{"AttributeName": "subdomain", "KeyType": "HASH"}],
+                         AttributeDefinitions=[{"AttributeName": "subdomain", "AttributeType": "S"}],
+                         BillingMode="PAY_PER_REQUEST")
+    t.put_item(Item={"subdomain": "app-e2e-probe", "owner": sm.PROBE_EMAIL, "require_auth": True,
+                     "allowed_users": "org"})
+    t.put_item(Item={"subdomain": "app-open", "owner": "real@example.test", "require_auth": False,
+                     "allowed_users": "org"})
+    t.put_item(Item={"subdomain": "app-listed", "owner": "real@example.test", "require_auth": True,
+                     "allowed_users": ["real@example.test"]})
+    assert sm.org_target(_cfg(tmp_path), ddb=ddb) is None
+    t.put_item(Item={"subdomain": "app-org", "owner": "real@example.test", "require_auth": True,
+                     "allowed_users": "org"})
+    tgt = sm.org_target(_cfg(tmp_path), ddb=ddb)
+    assert tgt is not None and (tgt.subdomain, tgt.owner) == ("app-org", "real@example.test")
+
+
+# ---- 预存 / 读回（负向探针用）：不碰签发，原样保留 -------------------------------------------
 
 def test_save_token_writes_json_record_only_under_scratch(tmp_path):
     scratch = tmp_path / ".scratch"
     scratch.mkdir()
-    rec = {"token_use": "site-session", "role": "previous", "kid": "site-hs-v0",
-           "email": "v@example.test", "token": "a.b.c"}
-    out = sm.save_token(scratch / "3c-1b" / "v0.json", rec, scratch_root=scratch)
+    rec = {"token_use": "site-session", "role": "previous", "kid": "site-rs-v0",
+           "email": sm.PROBE_EMAIL, "token": "a.b.c"}
+    out = sm.save_token(scratch / "rotation" / "v0.json", rec, scratch_root=scratch)
     assert json.loads(out.read_text()) == rec
     with pytest.raises(SystemExit, match="scratch"):
         sm.save_token(tmp_path / "elsewhere.json", rec, scratch_root=scratch)
@@ -210,68 +290,50 @@ def test_save_token_writes_json_record_only_under_scratch(tmp_path):
 
 def test_load_saved_token_round_trips_and_rejects_garbage(tmp_path):
     p = tmp_path / "t.json"
-    p.write_text(json.dumps({"token_use": "console-session", "role": "legacy", "kid": None,
-                             "email": "v@example.test", "token": "x.y.z"}))
-    assert sm.load_saved_token(p) == ("console-session", "x.y.z")
+    p.write_text(json.dumps({"token_use": "console-upgrade", "role": "previous", "kid": "console-rs-v1",
+                             "email": sm.PROBE_EMAIL, "token": "x.y.z"}))
+    assert sm.load_saved_token(p) == ("console-upgrade", "x.y.z")
     (tmp_path / "bad.json").write_text('{"token": "x.y.z"}')
     with pytest.raises(SystemExit, match="token_use"):
         sm.load_saved_token(tmp_path / "bad.json")
 
 
-def test_cli_mints_and_saves_with_role_and_prints_no_token(aws, tmp_path, capsys, monkeypatch):
-    c, r = _files(tmp_path, CFG_WITH_PREVIOUS)
-    _ssm_with_secrets()
+def test_cli_mints_and_saves_with_role_and_prints_no_token(tmp_path, capsys, monkeypatch):
+    http = FakeHttp(token=KID_TOKEN)
+    m = _minter(tmp_path, http)
     scratch = tmp_path / ".scratch"; scratch.mkdir()
-    monkeypatch.setattr(sm, "CONFIG_PATH", c)
-    monkeypatch.setattr(sm, "ROUTER_CONFIG", r)
+    monkeypatch.setattr(sm.Minter, "from_config", classmethod(lambda cls, *a, **kw: m))
     monkeypatch.setattr(sm, "SCRATCH_ROOT", scratch)
-    out_file = scratch / "3c-1b" / "site-v0.json"
-    rc = sm.main(["--token-use", "site-session", "--email", "v@example.test", "--role", "previous",
+    out_file = scratch / "rotation" / "site-previous.json"
+    rc = sm.main(["--token-use", "site-session", "--email", sm.PROBE_EMAIL, "--role", "previous",
                   "--ttl", "600", "--save", str(out_file)])
     assert rc == 0
     rec = json.loads(out_file.read_text())
-    assert rec["kid"] == "site-hs-v0" and rec["role"] == "previous" and _header(rec["token"])["kid"] == "site-hs-v0"
+    assert set(rec) == {"token_use", "role", "kid", "email", "minted_at", "ttl_seconds", "token"}
+    assert (rec["token_use"], rec["role"], rec["kid"], rec["email"]) == (
+        "site-session", "previous", "site-rs-v1", sm.PROBE_EMAIL)
+    assert rec["token"] == KID_TOKEN and json.loads(http.requests[0][3])["role"] == "previous"
     printed = capsys.readouterr().out
-    assert rec["token"] not in printed and "site-hs-v0" in printed
+    assert rec["token"] not in printed and "site-rs-v1" in printed
 
 
-# ---- 探针目标发现（kid 探针与语义闸门共用；今天冒充真实 owner 是 2A 之前的过渡）----
-
-def _routes(items):
-    ddb = boto3.client("dynamodb", region_name="us-east-1")
-    ddb.create_table(TableName="site-routes",
-                     KeySchema=[{"AttributeName": "subdomain", "KeyType": "HASH"}],
-                     AttributeDefinitions=[{"AttributeName": "subdomain", "AttributeType": "S"}],
-                     BillingMode="PAY_PER_REQUEST")
-    t = boto3.resource("dynamodb", region_name="us-east-1").Table("site-routes")
-    for it in items:
-        t.put_item(Item=it)
-
-
-def test_live_target_picks_a_require_auth_site_that_is_not_platform(aws, tmp_path):
-    c, _ = _files(tmp_path)
-    _routes([{"subdomain": "console", "owner": "platform", "require_auth": True},
-             {"subdomain": "app-open", "owner": "o@example.test", "require_auth": False},
-             {"subdomain": "app-x", "owner": "owner@example.test", "require_auth": True}])
-    t = sm.live_target(c)
-    assert t.owner == "owner@example.test"
-    assert t.site_url == "https://app-x.example.test/"
-    assert t.auth_host == "auth.example.test" and t.console_host == "console.example.test"
-
-
-def test_live_target_is_fatal_when_no_site_qualifies(aws, tmp_path):
-    c, _ = _files(tmp_path)
-    _routes([{"subdomain": "console", "owner": "platform", "require_auth": True}])
-    with pytest.raises(SystemExit, match="require_auth"):
-        sm.live_target(c)
+def test_cli_defaults_to_the_probe_identity_and_refuses_a_console_session_record(tmp_path, capsys, monkeypatch):
+    """面板会话记录不接受：panel 只在写请求上验它，而探针只发 GET（预存那种记录读回时才炸）。"""
+    m = _minter(tmp_path, FakeHttp())
+    scratch = tmp_path / ".scratch"; scratch.mkdir()
+    monkeypatch.setattr(sm.Minter, "from_config", classmethod(lambda cls, *a, **kw: m))
+    monkeypatch.setattr(sm, "SCRATCH_ROOT", scratch)
+    with pytest.raises(SystemExit):
+        sm.main(["--token-use", "console-session", "--save", str(scratch / "x.json")])
+    assert sm.main(["--token-use", "console-upgrade", "--save", str(scratch / "code.json")]) == 0
+    assert json.loads((scratch / "code.json").read_text())["email"] == sm.PROBE_EMAIL
 
 
 # ---- ticket 17 第 6、13 条（/code-review 2026-09-04）------------------------------------------
 #
 # 6：`--save` 的相对路径按 `.scratch/` 解析，于是模块 docstring 自己的例子
-#    `--save .scratch/3c-1b/x.json` 会落进 `.scratch/.scratch/3c-1b/`——命令**成功**，
-#    到 ⑤/⑩ 用 `--retired-token` 读回（按 cwd 解析）时才以"不是 --save 写出的记录"失败，
-#    而那时配置已改、三个组件已重部，且 ⑩ 的 previous 已从 config 删掉、token 无法重签。
+#    `--save .scratch/rotation/x.json` 会落进 `.scratch/.scratch/rotation/`——命令**成功**，
+#    到用 `--retired-token` 读回（按 cwd 解析）时才以"不是 --save 写出的记录"失败。
 # 13：token 是活凭证，却按默认 umask 落成 0644、目录 0755。
 
 def test_save_token_accepts_a_leading_scratch_prefix_instead_of_nesting_it(tmp_path):
@@ -282,9 +344,9 @@ def test_save_token_accepts_a_leading_scratch_prefix_instead_of_nesting_it(tmp_p
     """
     scratch = tmp_path / ".scratch"
     rec = {"token_use": "site-session", "token": "t.t.t"}
-    a = sm.save_token(".scratch/3c-1b/v1.json", rec, scratch_root=scratch)
-    b = sm.save_token("3c-1b/v1.json", rec, scratch_root=scratch)
-    assert a == b == (scratch / "3c-1b" / "v1.json").resolve()
+    a = sm.save_token(".scratch/rotation/v1.json", rec, scratch_root=scratch)
+    b = sm.save_token("rotation/v1.json", rec, scratch_root=scratch)
+    assert a == b == (scratch / "rotation" / "v1.json").resolve()
     assert not (scratch / ".scratch").exists(), "又嵌了一层 .scratch/"
     # 读回那一步（探针按 cwd 解析）必须能拿到它
     assert sm.load_saved_token(a) == ("site-session", "t.t.t")
@@ -304,7 +366,7 @@ def test_save_token_still_refuses_paths_outside_scratch(tmp_path):
 
 
 def test_save_token_writes_a_live_credential_with_owner_only_permissions(tmp_path):
-    """0644 的活凭证同机任何账号可读、可重放成目标站点 owner 的会话。"""
+    """0644 的活凭证同机任何账号可读、可重放成夹具身份的会话。"""
     scratch = tmp_path / ".scratch"
     out = sm.save_token("rotation/v1.json", {"token_use": "site-session", "token": "t.t.t"},
                         scratch_root=scratch)
@@ -322,54 +384,7 @@ def test_module_docstring_save_example_is_a_form_that_round_trips(tmp_path):
     assert out.is_relative_to(scratch) and not (scratch / ".scratch").exists()
 
 
-# ---- 3c-1B-G A1：跨 family 同形态 token（family separation 闸门的隔离变量）------------------
-#
-# `mint()` 原先只由 `token_use` 推导 family（`FAMILY_OF`），于是**造不出**"console kid +
-# token_use=site-session"这一种形态——而那正是唯一能单独证明"console kid 不在 site
-# allowlist"的 token。缺了它，探针同时改了两个变量（kid family 与 token_use），
-# 它的 302 可以来自任一条，闸门因此在 allowlist 真的失守时照旧全绿（见下面 Edge 侧那条）。
-
-def test_family_override_mints_a_cross_family_same_shape_token(aws, tmp_path):
-    """`family=` 显式覆盖 ⇒ console kid 签的 **site-session** token（只改 kid family 一个变量）。"""
-    m = _minter(tmp_path)
-    tok = m.mint("site-session", "v@example.test", ttl_seconds=600, family="console")
-    assert _header(tok)["kid"] == "console-hs-v1", _header(tok)
-    p = _payload(tok)
-    assert p["token_use"] == "site-session" and p["aud"] == "site-edge", p
-    # 对照：不给 family 时仍是 site kid（默认行为不变）
-    assert _header(m.mint("site-session", "v@example.test", ttl_seconds=600))["kid"] == "site-hs-v1"
-
-
-def test_family_override_is_validated_not_silently_ignored(aws, tmp_path):
-    m = _minter(tmp_path)
-    with pytest.raises(SystemExit, match="family"):
-        m.mint("site-session", "v@example.test", ttl_seconds=600, family="nope")
-
-
-# ---- 3c-1B-G A5：分页、目录权限、target==root -----------------------------------------------
-
-def test_live_target_pages_through_the_whole_routing_table(tmp_path):
-    """首页只有公开站点/平台行时，合格站点在第二页 —— 不翻页就会以"没有目标"失败。"""
-    pages = [{"Items": [{"subdomain": "console", "owner": "platform", "require_auth": True},
-                        {"subdomain": "app-open", "owner": "o@x.test", "require_auth": False}],
-              "LastEvaluatedKey": {"subdomain": "app-open"}},
-             {"Items": [{"subdomain": "app-deep", "owner": "deep@x.test", "require_auth": True}]}]
-    seen = []
-
-    class _T:
-        def scan(self, **kw):
-            seen.append(kw.get("ExclusiveStartKey"))
-            return pages[len(seen) - 1]
-
-    class _DDB:
-        def Table(self, name):
-            return _T()
-
-    _files(tmp_path)
-    t = sm.live_target(tmp_path / "config.ini", ddb=_DDB())
-    assert t.subdomain == "app-deep" and t.owner == "deep@x.test"
-    assert seen == [None, {"subdomain": "app-open"}], seen
-
+# ---- 3c-1B-G A5：目录权限、target==root -----------------------------------------------------
 
 def test_save_token_refuses_the_scratch_root_itself(tmp_path):
     """`--save .scratch` 会被前缀吃成空路径 ⇒ 曾经抛裸 IsADirectoryError。"""
@@ -384,13 +399,13 @@ def test_save_token_tightens_directories_that_already_exist(tmp_path):
     """复审低优先级 2：`.scratch/` 与子目录已经以 0755 存在时也要收到 0700——否则"目录 0700"
     只对新克隆成立。范围到 scratch 根为止：它的父目录不动。"""
     root = tmp_path / ".scratch"
-    (root / "3c-1b").mkdir(parents=True)
-    os.chmod(root, 0o755); os.chmod(root / "3c-1b", 0o755)
+    (root / "rotation").mkdir(parents=True)
+    os.chmod(root, 0o755); os.chmod(root / "rotation", 0o755)
     parent_mode = oct(tmp_path.stat().st_mode)[-3:]
-    sm.save_token(Path("3c-1b/v1.json"), {"token_use": "site-session", "token": "a.b.c"},
+    sm.save_token(Path("rotation/v1.json"), {"token_use": "site-session", "token": "a.b.c"},
                   scratch_root=root)
     assert oct(root.stat().st_mode)[-3:] == "700"
-    assert oct((root / "3c-1b").stat().st_mode)[-3:] == "700"
+    assert oct((root / "rotation").stat().st_mode)[-3:] == "700"
     assert oct(tmp_path.stat().st_mode)[-3:] == parent_mode, "scratch 根以上的目录不该被动"
 
 
@@ -398,22 +413,22 @@ def test_save_token_does_not_follow_a_symlink_out_of_scratch(tmp_path):
     """复审三轮 P2 的同一个洞在 token 文件上（内容是一枚可重放的 cookie）。这里比 write_dump 更强：
     `save_token` 先 `resolve()` 再做逃逸检查 ⇒ 指向 .scratch **外**的 symlink 被**拒绝**而不是被跟随，
     victim 一个字节不动。（.scratch 内部的 symlink 会解析到真实文件——那仍在 0700 目录里，是有意的。）"""
-    root = tmp_path / ".scratch"; (root / "3c-1b").mkdir(parents=True)
+    root = tmp_path / ".scratch"; (root / "rotation").mkdir(parents=True)
     victim = tmp_path / "victim"; victim.write_text("keep me"); os.chmod(victim, 0o644)
-    link = root / "3c-1b" / "v1.json"; link.symlink_to(victim)
+    link = root / "rotation" / "v1.json"; link.symlink_to(victim)
     with pytest.raises(SystemExit, match="只许写进"):
-        sm.save_token(Path("3c-1b/v1.json"), {"token_use": "site-session", "token": "a.b.c"}, scratch_root=root)
+        sm.save_token(Path("rotation/v1.json"), {"token_use": "site-session", "token": "a.b.c"}, scratch_root=root)
     assert victim.read_text() == "keep me" and oct(victim.stat().st_mode)[-3:] == "644"
     assert link.is_symlink(), "拒绝时不该动那个链接"
 
 
 def test_save_token_writes_a_fresh_0600_inode_over_an_existing_0644_file(tmp_path):
     """覆盖已有 0644 文件：不能在旧 inode 上原地截断（写入期间仍 0644、已打开的读者会读到新 cookie）。"""
-    root = tmp_path / ".scratch"; (root / "3c-1b").mkdir(parents=True)
-    out = root / "3c-1b" / "v1.json"; out.write_text("old"); os.chmod(out, 0o644)
+    root = tmp_path / ".scratch"; (root / "rotation").mkdir(parents=True)
+    out = root / "rotation" / "v1.json"; out.write_text("old"); os.chmod(out, 0o644)
     old_ino = out.stat().st_ino
     with open(out) as reader:
-        sm.save_token(Path("3c-1b/v1.json"), {"token_use": "site-session", "token": "a.b.c"}, scratch_root=root)
+        sm.save_token(Path("rotation/v1.json"), {"token_use": "site-session", "token": "a.b.c"}, scratch_root=root)
         assert reader.read() == "old"
     assert out.stat().st_ino != old_ino and oct(out.stat().st_mode)[-3:] == "600"
     assert sm.load_saved_token(out) == ("site-session", "a.b.c")
@@ -422,7 +437,7 @@ def test_save_token_writes_a_fresh_0600_inode_over_an_existing_0644_file(tmp_pat
 def test_save_token_locks_down_the_scratch_root_it_creates(tmp_path):
     """`mkdir(mode=…)` 不作用于顺带创建的父目录 ⇒ 新克隆上 `.scratch/` 会是 0755。"""
     root = tmp_path / ".scratch"          # 故意**不**预先创建
-    sm.save_token(Path("3c-1b/v1.json"), {"token_use": "site-session", "token": "a.b.c"},
+    sm.save_token(Path("rotation/v1.json"), {"token_use": "site-session", "token": "a.b.c"},
                   scratch_root=root)
     assert oct(root.stat().st_mode)[-3:] == "700", oct(root.stat().st_mode)
-    assert oct((root / "3c-1b").stat().st_mode)[-3:] == "700"
+    assert oct((root / "rotation").stat().st_mode)[-3:] == "700"

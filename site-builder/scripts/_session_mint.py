@@ -1,144 +1,193 @@
 #!/usr/bin/env python3
-"""验收工具唯一的本地 mint 入口（3c-1B ticket 01；spec §11.8.4、§11.8.11）。
+"""验收工具唯一的登录态入口（3c-final；spec §11.7 / ADR 0002）：**夹具签发器的客户端**。
 
-四个 `verify_*`、`verify_kid_entry_live.py` 与 E2E 的会话 cookie fixture 都从这里拿 token，
-不再各自读 SSM 明文调用旧 mint。它做三件事：
-- 读 `[SessionKeys]`（`auth/session_keys.py` 校验，路径只来自 config，不接受命令行路径），按
-  family 与 role（`current` 默认 / `previous` / `legacy`）取 SSM 值，值按参数名缓存；
-- `current` / `previous` 调用**生产** `session.mint_token`（带 kid 的新形态）；`legacy` 调用旧的
-  `mint_session_jwt` / `mint_upgrade_code`（无 kid），只用于 L3 与退役**之前**预存负向探针 token；
-- `--save FILE` 把 token 连同元数据写成 JSON，**只许写进 `.scratch/`**（gitignored）。
+四个 `verify_*`、`verify_kid_entry_live.py` 与 E2E 的会话 cookie fixture 都从这里拿 token；本模块**不持有
+任何密钥**（KMS 之后本地也拿不到）。三条路：
+- 站点会话：`sts.assume_role(site-builder-verifier)`（只有 `[Verification] verifier_trusted_principals` 里列的
+  principal 能 assume）→ SigV4 `POST` auth 的 Function URL `/fixture-session` → 只给夹具域 `@e2e.invalid`、
+  TTL ≤ 30 min、`role=current|previous`（就位期探针用 previous）。
+- 升级码：拿夹具站点会话走**真实**的 `GET https://auth.{base}/console-session`，从 302 Location 里取 code。
+- 面板会话：再 `GET https://console.{base}/api/session-callback?code=…`（经 CloudFront → Edge → panel），
+  从 Set-Cookie 里取 `__Host-sb_console`。**这一步会消费那枚一次性升级码**（session-codes 表多一行，1 h TTL）。
+所以带外签发的只有一种 token、一个域（ADR 0002）；`family=` 覆盖已删——KMS 之后没有任何组件能带外签 console
+family，"console kid 签 site-session"这类跨 family 反例改由单测 + 产物公钥对账证明（plan D3）。
 
-身份：`idp` 取 `router/config.ini` 的 `trusted_idps` 第一项，`auth_via` 是托管登录值——Edge 开了
-`require_idp_claim` 之后缺这两个 claim 的会话会被 302，后面的断言都在"根本没到站点"的前提下通过/失败。
-邮箱仍由调用方给（今天冒充目标站点 owner / `e2e@test.com`），3c-2A 按 ADR-0002 把本模块换成夹具签发器，
-调用方不动。用不带路径的 python3 跑（CLAUDE.md）。
+调用方接口沿用 `Minter.mint(token_use, email, ttl_seconds=, role=, name=)`。`--save FILE` 只许写进 `.scratch/`。
+用不带路径的 python3 跑（CLAUDE.md）。
 
-    python3 site-builder/scripts/_session_mint.py --token-use site-session --email <owner> \
-        --role legacy --ttl 600 --save 3c-1b/legacy-site.json   # 相对 .scratch/；写成 .scratch/3c-1b/… 也一样
+    python3 site-builder/scripts/_session_mint.py --token-use site-session --email probe@e2e.invalid \
+        --role previous --ttl 600 --save rotation/site-previous.json
 """
 from __future__ import annotations
 
 import argparse
+import base64
 import configparser
 import json
 import os
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "site-builder" / "auth"))
-import session as sess  # noqa: E402
-from session_keys import SessionKeys, load_session_keys  # noqa: E402
+sys.path.insert(0, str(ROOT / "site-builder" / "deployer" / "functions"))
+from permissions import FIXTURE_DOMAIN, is_fixture_email  # noqa: E402  夹具域的唯一定义（与 auth/session.py 等值）
 if str(Path(__file__).resolve().parent) not in sys.path:      # 被 tests / E2E 以别的 cwd import 时
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _secure_write import write_private_text  # noqa: E402
 
 CONFIG_PATH = ROOT / "site-builder" / "config.ini"
-ROUTER_CONFIG = ROOT / "router" / "config.ini"
 SCRATCH_ROOT = ROOT / ".scratch"
-ROLES = ("current", "previous", "legacy")
-FAMILY_OF = {"site-session": "site", "console-upgrade": "console", "console-session": "console"}
-AUTH_VIA = "TokenGeneration_HostedAuth"   # Edge 的 TRUSTED_AUTH_SOURCES 之一，与真机 Cognito 签出的一致
+ROLES = ("current", "previous")
+TOKEN_USES = ("site-session", "console-upgrade", "console-session")
+VERIFIER_ROLE_NAME = "site-builder-verifier"
+AUTH_FN = "site-auth-service"
+PROBE_EMAIL = f"probe@{FIXTURE_DOMAIN}"
+FIXTURE_SITE_ID = "e2e-probe"
+FIXTURE_MAX_TTL = 1800
 
 
 def _strip(v: str) -> str:
     return v.split("#")[0].split(";")[0].strip()
 
 
-def trusted_idp(router_config: Path = ROUTER_CONFIG) -> str:
-    """Edge 实际信任的 idp（`trusted_idps` 第一项）。写死 "Feishu" 会让脚本在换 IdP 的环境上全红。"""
-    rc = configparser.ConfigParser(interpolation=None)
-    rc.read(router_config)
-    for sec in rc.sections():
-        if rc.has_option(sec, "trusted_idps"):
-            first = _strip(rc.get(sec, "trusted_idps")).split(",")[0].strip()
-            if first:
-                return first
-    raise SystemExit(f"{router_config} 里取不到 trusted_idps——签出来的会话 Edge 不认，验收不可信")
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **kw):
+        return None
+
+
+def _urllib_http(method: str, url: str, headers: dict, body: str | None):
+    """→ (status, headers（http.client.HTTPMessage，支持 get_all）, text)。不跟随 302——Location 就是要读的东西。"""
+    req = urllib.request.Request(url, method=method, headers=headers, data=body.encode() if body else None)
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(req, timeout=30) as r:
+            return r.status, r.headers, r.read().decode(errors="replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers, e.read().decode(errors="replace")
+
+
+def _hdr(headers, name: str):
+    """大小写不敏感取头；`set-cookie` 取全部（urllib 的 HTTPMessage 与测试替身的 dict 都支持）。"""
+    if hasattr(headers, "get_all"):
+        vals = headers.get_all(name) or []
+        return vals if name.lower() == "set-cookie" else (vals[0] if vals else "")
+    for k, v in headers.items():
+        if k.lower() == name.lower():
+            if name.lower() != "set-cookie":
+                return v
+            return v if isinstance(v, list) else [v]
+    return [] if name.lower() == "set-cookie" else ""
+
+
+def _require_fixture_email(email) -> None:
+    if not is_fixture_email(email):
+        raise SystemExit(f"验收身份必须是 <local>@{FIXTURE_DOMAIN}（ADR 0002），得到 {email!r}——签发器也会拒，这里提前停")
 
 
 class Minter:
-    def __init__(self, keys: SessionKeys, get_param, *, idp: str):
-        self._keys = keys
-        self._get_param = get_param
-        self._idp = idp
-        self._cache: dict[str, str] = {}
+    """夹具签发器客户端。`http(method, url, headers, body) -> (status, headers, text)` 可替换（测试）。"""
+
+    def __init__(self, *, base_domain: str, region: str, account_id: str, function_url: str, session, http=None):
+        self.base = base_domain
+        self.region = region
+        self.account_id = account_id
+        self.function_url = function_url if function_url.endswith("/") else function_url + "/"
+        self._session = session          # boto3.Session（或测试替身）；凭据不缓存，每次 mint 现 assume（D11）
+        self._http = http or _urllib_http
 
     @classmethod
-    def from_config(cls, config_path: Path = CONFIG_PATH, router_config: Path = ROUTER_CONFIG, *,
-                    ssm=None) -> "Minter":
-        keys = load_session_keys(config_path)
-        if ssm is None:
+    def from_config(cls, config_path: Path = CONFIG_PATH, *, session=None, http=None) -> "Minter":
+        cfg = configparser.ConfigParser(interpolation=None)
+        cfg.read(config_path)
+        if not cfg.sections():
+            raise SystemExit(f"{config_path} 读空了——configparser 对缺失文件是静默的")
+        if _strip(cfg.get("Verification", "fixture_issuer", fallback="false")).lower() != "true":
+            raise SystemExit("config.ini [Verification] fixture_issuer 不是 true——验收工具的登录态来自 auth 的 /fixture-session"
+                             "（ADR 0002），先开它并重部 auth（deploy_auth.py 会建 site-builder-verifier 角色）")
+        base = _strip(cfg["Platform"]["base_domain"])
+        region = _strip(cfg.get("Platform", "region", fallback="us-east-1")) or "us-east-1"
+        account = _strip(cfg["Platform"]["account_id"])
+        if session is None:
             import boto3
-            cfg = configparser.ConfigParser(interpolation=None)
-            cfg.read(config_path)
-            region = _strip(cfg.get("Platform", "region", fallback="us-east-1")) or "us-east-1"
-            ssm = boto3.client("ssm", region_name=region)
-        return cls(keys, lambda name: ssm.get_parameter(Name=name, WithDecryption=True)["Parameter"]["Value"],
-                   idp=trusted_idp(router_config))
+            session = boto3.Session()
+        url = session.client("lambda", region_name=region).get_function_url_config(FunctionName=AUTH_FN)["FunctionUrl"]
+        return cls(base_domain=base, region=region, account_id=account, function_url=url, session=session, http=http)
 
-    @property
-    def keys(self) -> SessionKeys:
-        return self._keys
+    def _verifier_credentials(self) -> dict:
+        """每次 mint 现 assume（D11）：角色会话上限 3600 s 而 E2E 约 37 min，缓存一份会贴着上限过期，症状是
+        Function URL 403、读起来像授权配错。900 s 是 STS 允许的最小 DurationSeconds，一枚凭据只签一个请求。"""
+        return self._session.client("sts", region_name=self.region).assume_role(
+            RoleArn=f"arn:aws:iam::{self.account_id}:role/{VERIFIER_ROLE_NAME}",
+            RoleSessionName=f"verify-{os.getpid()}-{int(time.time())}", DurationSeconds=900)["Credentials"]
 
-    def _secret(self, param: str) -> str:
-        if param not in self._cache:
-            value = self._get_param(param)
-            if not value:
-                raise SystemExit(f"取不到 {param} 的值——无法签发会话，验收不可信")
-            self._cache[param] = value
-        return self._cache[param]
+    # ---- 站点会话：带外签发的唯一一种 token ----
 
-    def key(self, family: str, role: str) -> tuple[str | None, str]:
-        """→ (kid 或 None（legacy）, secret)。previous 为空 / legacy 已清空都响亮失败，不回落。"""
+    def site_session(self, email: str, *, ttl_seconds: int = FIXTURE_MAX_TTL, name: str | None = None,
+                     role: str = "current") -> str:
+        _require_fixture_email(email)
         if role not in ROLES:
             raise SystemExit(f"role 必须是 {ROLES} 之一，得到 {role!r}")
-        if role == "legacy":
-            if not self._keys.legacy_param:
-                raise SystemExit("[SessionKeys] legacy_param 为空（legacy 入口已关闭）——不能再 mint legacy 形态")
-            return None, self._secret(self._keys.legacy_param)
-        ref = self._keys.families[family][role]
-        if ref is None:
-            raise SystemExit(f"[SessionKeys] {family}_previous 为空——没有 previous key 可用于 mint")
-        if ref.alg != "HS256":
-            raise SystemExit(f"{ref.kid} 是 {ref.alg}，本模块只会 HS256 本地 mint（RS 是 3c-2A 的夹具签发器）")
-        return ref.kid, self._secret(ref.ssm_param)
+        from botocore.auth import SigV4Auth
+        from botocore.awsrequest import AWSRequest
+        from botocore.credentials import Credentials
+        body = json.dumps({"email": email, "ttl_seconds": int(ttl_seconds),
+                           "name": name or email.split("@")[0], "role": role})
+        url = self.function_url + "fixture-session"
+        req = AWSRequest(method="POST", url=url, data=body,
+                         headers={"content-type": "application/json", "host": urllib.parse.urlparse(url).netloc})
+        creds = self._verifier_credentials()
+        SigV4Auth(Credentials(creds["AccessKeyId"], creds["SecretAccessKey"], creds["SessionToken"]),
+                  "lambda", self.region).add_auth(req)
+        status, _, text = self._http("POST", url, dict(req.headers), body)
+        if status != 200:
+            # **不 JSON 解析非 200 的 body**：签发器的错误体是纯文本（没有 content-type），
+            # 解析它会把"403 forbidden"变成一个 JSONDecodeError，报文与真因无关。
+            raise SystemExit(f"/fixture-session 返回 {status}：{text[:200]}——"
+                             "403 = 调用者不是 site-builder-verifier（本机凭据不在 verifier_trusted_principals 里？）；"
+                             "404 = auth 没开 FIXTURE_ISSUER（重部 auth）")
+        return json.loads(text)["token"]
 
-    def mint(self, token_use: str, email: str, *, role: str = "current", ttl_seconds: int,
-             name: str | None = None, auth_via: str = AUTH_VIA, family: str | None = None) -> str:
-        """按 `token_use` 签一枚 token；`family` 可**显式覆盖**签名用的 key family。
+    # ---- 升级码与面板会话：真实换取链路 ----
 
-        缺省（`family=None`）走 `FAMILY_OF[token_use]`，与全部既有调用方一致。
+    def upgrade_code(self, email: str, *, site_session: str | None = None) -> str:
+        tok = site_session or self.site_session(email)
+        status, headers, _ = self._http("GET", f"https://auth.{self.base}/console-session",
+                                        {"cookie": f"sb_session={tok}"}, None)
+        loc = _hdr(headers, "location")
+        if status != 302 or "/api/session-callback?code=" not in loc:
+            raise SystemExit(f"/console-session 没有换出升级码：{status} {loc[:120]}——夹具站点会话没被 auth 接受？")
+        return urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)["code"][0]
 
-        **`family` 是给 family-separation 探针用的，不是给生产用的**（3c-1B-G A1）：
-        只有"console kid 签的 `token_use=site-session`"这一种**跨 family 同形态** token
-        能单独证明"console kid 不在 site allowlist"。不给这个覆盖的话，探针只能造出
-        "console kid + console-session"，它同时改了 kid family 与 token_use 两个变量
-        ⇒ Edge 的 302 可能来自任一条 ⇒ allowlist 真的失守时闸门照旧全绿
-        （`test_edge_accepts_the_cross_family_token_once_the_console_kid_leaks_in` 是那条反例）。
-        """
-        if token_use not in FAMILY_OF:
-            raise SystemExit(f"token_use 必须是 {tuple(FAMILY_OF)} 之一，得到 {token_use!r}")
-        if family is not None and family not in self._keys.families:
-            raise SystemExit(f"family 必须是 {tuple(self._keys.families)} 之一，得到 {family!r}")
-        name = email.split("@")[0] if name is None else name
-        kid, secret = self.key(FAMILY_OF[token_use] if family is None else family, role)
-        if kid is None:                                   # legacy：旧形态、旧合同
-            if token_use == "console-upgrade":
-                return sess.mint_upgrade_code(email, secret, ttl_seconds=ttl_seconds)
-            return sess.mint_session_jwt(email, name, secret, ttl_seconds=ttl_seconds, idp=self._idp,
-                                         scope="console" if token_use == "console-session" else "",
-                                         auth_via=auth_via)
-        return sess.mint_token(kid=kid, secret=secret, token_use=token_use, email=email,
-                               ttl_seconds=ttl_seconds, name=name, idp=self._idp, auth_via=auth_via)
+    def console_session(self, email: str, *, site_session: str | None = None) -> str:
+        tok = site_session or self.site_session(email)
+        code = self.upgrade_code(email, site_session=tok)
+        status, headers, text = self._http(
+            "GET", f"https://console.{self.base}/api/session-callback?code={urllib.parse.quote(code, safe='')}",
+            {"cookie": f"sb_session={tok}"}, None)
+        for c in _hdr(headers, "set-cookie"):
+            name, _, rest = c.partition("=")
+            if name.strip() == "__Host-sb_console":
+                return rest.split(";")[0]
+        raise SystemExit(f"/api/session-callback 没有下发面板会话：{status} {text[:120]}——panel 拒了升级码（夹具身份被 Edge 302？）")
+
+    def mint(self, token_use: str, email: str, *, ttl_seconds: int = FIXTURE_MAX_TTL, role: str = "current",
+             name: str | None = None) -> str:
+        """六处调用方的兼容入口。`console-*` 两种 token 不接受 role/ttl（真实链路决定）。"""
+        if token_use == "site-session":
+            return self.site_session(email, ttl_seconds=ttl_seconds, name=name, role=role)
+        if token_use == "console-upgrade":
+            return self.upgrade_code(email)
+        if token_use == "console-session":
+            return self.console_session(email)
+        raise SystemExit(f"token_use 必须是 {TOKEN_USES} 之一，得到 {token_use!r}")
 
 
-# ---- 探针目标（kid 探针与语义闸门共用）-------------------------------------------------------
-
-from dataclasses import dataclass  # noqa: E402
-
+# ---- 探针目标：常驻夹具站点 ---------------------------------------------------------------
 
 @dataclass(frozen=True)
 class Target:
@@ -160,36 +209,62 @@ class Target:
         return f"console.{self.base}"
 
 
-def live_target(config_path: Path = CONFIG_PATH, *, ddb=None) -> Target:
-    """路由表里第一个 `require_auth=True` 且 owner 不是 platform 的站点（只读 scan）。
-
-    探针冒充它的**真实 owner**——这是 3c-2A 常驻夹具站点（ADR-0002）就位前的过渡做法；2A 之后
-    本函数改成返回夹具站点，调用方不动。"""
+def _platform_bits(config_path: Path) -> tuple[str, str, str]:
     cfg = configparser.ConfigParser(interpolation=None)
     cfg.read(config_path)
-    base = _strip(cfg["Platform"]["base_domain"])
-    region = _strip(cfg.get("Platform", "region", fallback="us-east-1")) or "us-east-1"
-    table = _strip(cfg["Platform"]["routing_table"])
+    if not cfg.sections():
+        raise SystemExit(f"{config_path} 读空了——configparser 对缺失文件是静默的")
+    return (_strip(cfg["Platform"]["base_domain"]),
+            _strip(cfg.get("Platform", "region", fallback="us-east-1")) or "us-east-1",
+            _strip(cfg["Platform"]["routing_table"]))
+
+
+def _scan_routes(table: str, region: str, ddb):
+    """路由表全表只读扫描（**必须翻页**，3c-1B-G A5）。
+
+    `scan()` 单次最多返回 1 MB，丢掉 `LastEvaluatedKey` 就等于只看第一页。路由表每部署一个站点
+    多一行，一旦超过一页而首页恰好没有目标行，调用方就会以"没有目标"失败——报文指向路由表内容，
+    而真因是分页，排查方向全错。
+    """
     if ddb is None:
         import boto3
         ddb = boto3.resource("dynamodb", region_name=region)
-    # **必须翻页**（3c-1B-G A5）：`scan()` 单次最多返回 1 MB，丢掉 `LastEvaluatedKey` 就等于
-    # 只看第一页。路由表每部署一个站点多一行，一旦超过一页而首页恰好只有公开站点与平台行，
-    # 本函数就会以"探针没有目标"失败——报文指向路由表内容，而真因是分页，排查方向全错。
     t = ddb.Table(table)
     kwargs: dict = {}
     while True:
         page = t.scan(**kwargs)
-        for it in page.get("Items", []):
-            if it.get("require_auth") is True and it.get("owner") != "platform":
-                return Target(subdomain=str(it["subdomain"]), owner=str(it["owner"]),
-                              base=base, region=region)
+        yield from page.get("Items", [])
         last = page.get("LastEvaluatedKey")
         if not last:
-            break
+            return
         kwargs["ExclusiveStartKey"] = last
-    raise SystemExit(f"路由表 {table} 里找不到 require_auth=True 的非平台站点——探针没有目标"
-                     "（已翻完所有页）")
+
+
+def live_target(config_path: Path = CONFIG_PATH, *, ddb=None) -> Target:
+    """路由表里 owner == PROBE_EMAIL 且 require_auth=True 的那条（常驻夹具站点，ensure_fixture_site.py 建）。
+    不再冒充任何真实 owner（ADR 0002）。"""
+    base, region, table = _platform_bits(config_path)
+    for it in _scan_routes(table, region, ddb):
+        if it.get("require_auth") is True and it.get("owner") == PROBE_EMAIL:
+            return Target(subdomain=str(it["subdomain"]), owner=PROBE_EMAIL, base=base, region=region)
+    raise SystemExit(f"路由表 {table} 里没有 owner={PROBE_EMAIL} 的常驻夹具站点——先跑 "
+                     "python3 site-builder/scripts/ensure_fixture_site.py（已翻完所有页）")
+
+
+def org_target(config_path: Path = CONFIG_PATH, *, ddb=None) -> Target | None:
+    """一条**真实**的 org 站点路由（`allowed_users == "org"`、owner 不是夹具域、require_auth=True），没有则 None。
+
+    ADR 0002 的边界判据要打它：`allowed_users="org"` 的站点会放行任何可信来源的邮箱，所以"夹具会话投给
+    真实 org 站点必 302"才是那条边界的真机证据。夹具站点自己即使是 org 也不算——那条判据会退化成正对照。
+    账号里没有这种站点时返回 None，闸门据此报 skip 而不是失败（干净账号上本来就没有）。
+    """
+    base, region, table = _platform_bits(config_path)
+    for it in _scan_routes(table, region, ddb):
+        owner = it.get("owner")
+        if (it.get("require_auth") is True and it.get("allowed_users") == "org"
+                and isinstance(owner, str) and not is_fixture_email(owner) and owner != "platform"):
+            return Target(subdomain=str(it["subdomain"]), owner=owner, base=base, region=region)
+    return None
 
 
 # ---- 预存 / 读回（负向探针用）--------------------------------------------------------------
@@ -199,13 +274,13 @@ def save_token(path: Path, record: dict, *, scratch_root: Path = SCRATCH_ROOT) -
 
     **相对路径按 `scratch_root` 解析，但开头写不写 `.scratch/` 都一样**（3c-1B ticket 17 第 6 条）：
     仓库文档里两种写法都出现过（本模块 docstring 用 `.scratch/…`、runbook 用 `rotation/…`），
-    而"多嵌一层 `.scratch/.scratch/`"是**静默**的——命令照样成功，只有 ⑤/⑩ 用 `--retired-token`
+    而"多嵌一层 `.scratch/.scratch/`"是**静默**的——命令照样成功，只有用 `--retired-token`
     读回（那个旗标按 cwd 解析）时才以"不是 --save 写出的记录"失败；到那一刻配置已改、三处已重部，
-    ⑩ 更是已经把 previous 从 config 删掉、token 无法重签。所以这里把前缀吃掉，而不是让它嵌套。
+    退役那一步更是已经把 previous 从 config 删掉、token 无法重签。所以这里把前缀吃掉，而不是让它嵌套。
     逃逸检查在**吃掉前缀之后**做，`.scratch/../x` 仍然被拒。
 
     **权限 0600 / 目录 0700**（第 13 条）：记录里是一枚可直接重放的会话 cookie，
-    默认 umask 会落成 0644 ⇒ 同机任何账号都能读它、以目标站点 owner 的身份访问站点。
+    默认 umask 会落成 0644 ⇒ 同机任何账号都能读它、以夹具身份访问夹具站点。
     """
     root = Path(scratch_root).resolve()
     path = Path(path)
@@ -222,7 +297,7 @@ def save_token(path: Path, record: dict, *, scratch_root: Path = SCRATCH_ROOT) -
     # 所以新克隆上第一次用会留下 0755 的 `.scratch/`，而 docstring 承诺的是 0700。
     # 逐层建 + 逐层收权限（3c-1B-G A5）。
     # **已存在的目录同样收到 0700**（复审低优先级 2）：只改新建的那几层，等于承诺"目录 0700"
-    # 只对新克隆成立——本仓库的 `.scratch/` 与 `.scratch/3c-1b/` 实测就是 0755。范围只到
+    # 只对新克隆成立——本仓库的 `.scratch/` 与子目录实测就是 0755。范围只到
     # scratch 根为止（`root in d.parents or d == root`），不碰仓库根以上的任何目录。
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     for d in (target.parent, *target.parent.parents):
@@ -244,20 +319,21 @@ def load_saved_token(path: Path) -> tuple[str, str]:
 
 def main(argv: list | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--token-use", required=True, choices=tuple(FAMILY_OF))
-    ap.add_argument("--email", required=True)
+    ap.add_argument("--token-use", required=True, choices=("site-session", "console-upgrade"),
+                    help="面板会话记录不接受：panel 只在写请求上验它，探针只发 GET")
+    ap.add_argument("--email", default=PROBE_EMAIL)
     ap.add_argument("--role", default="current", choices=ROLES)
-    ap.add_argument("--ttl", type=int, default=600, help="秒；升级码会被钳到 60")
+    ap.add_argument("--ttl", type=int, default=600, help="秒（≤ 1800）；升级码由链路决定 60 s")
     ap.add_argument("--save", required=True, metavar="FILE", help="写 JSON 记录（只许 .scratch/ 下）；不在终端打印 token")
     args = ap.parse_args(argv)
-    m = Minter.from_config(CONFIG_PATH, ROUTER_CONFIG)
-    kid, _ = m.key(FAMILY_OF[args.token_use], args.role)
+    m = Minter.from_config(CONFIG_PATH)
     token = m.mint(args.token_use, args.email, role=args.role, ttl_seconds=args.ttl)
+    head = token.split(".")[0]
+    kid = json.loads(base64.urlsafe_b64decode(head + "=" * (-len(head) % 4))).get("kid")
     out = save_token(Path(args.save), {"token_use": args.token_use, "role": args.role, "kid": kid,
                                        "email": args.email, "minted_at": int(time.time()),
-                                       "ttl_seconds": args.ttl, "token": token},
-                     scratch_root=SCRATCH_ROOT)
-    print(f"已写 {out}：{args.token_use} role={args.role} kid={kid or 'legacy(无 kid)'}（token 不打印）")
+                                       "ttl_seconds": args.ttl, "token": token}, scratch_root=SCRATCH_ROOT)
+    print(f"已写 {out}：{args.token_use} role={args.role} kid={kid}（token 不打印）")
     return 0
 
 
