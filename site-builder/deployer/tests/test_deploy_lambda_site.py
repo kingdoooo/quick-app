@@ -384,7 +384,7 @@ def test_unmigrated_site_fails_closed(aws, monkeypatch):
     _route_item("https://old.lambda-url.us-east-1.on.aws")
     lam = _lam_mock(exists=True, colors=())
     with patch.object(d, "_lambda", return_value=lam):
-        with pytest.raises(d.UnmigratedSite, match="UnmigratedSite|未迁移"):
+        with pytest.raises(d.UnmigratedSite, match="不是 blue/green 任何一色.*未迁移"):
             d.handler(dict(EVENT), None)
     lam.update_function_code.assert_not_called()      # $LATEST 都没碰
     lam.publish_version.assert_not_called()
@@ -435,7 +435,7 @@ def test_half_migrated_site_fails_closed(aws, monkeypatch):
     _route_item("https://old.lambda-url.us-east-1.on.aws")   # 路由仍在 $LATEST
     lam = _lam_mock(exists=True, colors=("blue",))           # 但 blue 已经建好了
     with patch.object(d, "_lambda", return_value=lam):
-        with pytest.raises(d.UnmigratedSite, match="UnmigratedSite|未迁移"):
+        with pytest.raises(d.UnmigratedSite, match="不是 blue/green 任何一色.*未迁移"):
             d.handler(dict(EVENT), None)
     lam.update_function_code.assert_not_called()      # ← 这条才是 P1-3 的要害
     lam.publish_version.assert_not_called()

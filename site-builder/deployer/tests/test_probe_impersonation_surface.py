@@ -259,3 +259,60 @@ def test_the_known_gaps_admit_the_assume_role_chain_is_not_modelled(probe):
     否则那个计数会被读成"夹具入口的完整持有者集合"。"""
     src = _SCRIPT.read_text(encoding="utf-8")
     assert "assume" in src and "信任策略" in src
+
+
+def test_a_principal_left_with_only_the_fixture_label_has_left_the_surface(probe):
+    """**修复轮 I1**：`{sign:kms-direct, sign:fixture-issuer}` 的 principal 在 KMS 那一组关掉后
+    只剩受限入口（只能签夹具域邮箱）⇒ 它**真的离开了冒充面**，必须计入收益。
+
+    旧口径拿"还有标签没被关掉"当判据，于是它留在 `remaining` 里，
+    `restrictive-kms-key-policy` 的 `principals_removed` 少报一个——而那个数字就是
+    "限制性 key policy 值不值得做"的唯一依据。单标签的反例照不出这个错：两个标签才行。
+    """
+    agg = probe.summarize({
+        "p-kms-and-fixture": {probe.S_KMS_DIRECT, probe.S_FIXTURE_ISSUER},
+        "p-kms-and-hijack": {probe.S_KMS_DIRECT, probe.S_HIJACK_AUTH},
+    })
+    assert agg["impersonation_surface_union"] == 2
+    m = agg["marginal_value_if_closed"]["restrictive-kms-key-policy"]
+    assert m["principals_removed"] == 1, m       # 只有 p-kms-and-fixture 离开
+    assert m["surface_after"] == 1, m            # p-kms-and-hijack 还剩劫持 signer
+    # 反向：关掉劫持那一组时，p-kms-and-fixture 一个都不动（它没有那条路）
+    assert agg["marginal_value_if_closed"]["harden-signer-code-update"][
+        "principals_removed"] == 0
+
+
+def test_the_same_membership_criterion_decides_entering_and_leaving_the_surface(probe):
+    """进面与离面必须用**同一个**判据（`is_surface_label`）。
+
+    两套判据的症状不是崩，而是一个安静地算错的数字：受限标签既不让人进面，
+    就不能在离面时把人留住。
+    """
+    assert probe.is_surface_label(probe.S_KMS_DIRECT)
+    assert probe.is_surface_label(probe.E_CFN_UPDATE_STACK)
+    assert not probe.is_surface_label(probe.S_FIXTURE_ISSUER)
+    # 全部标签都要有明确归属：要么进面，要么是被单列的那一个
+    for lb in probe.ALL_LABELS:
+        assert probe.is_surface_label(lb) or lb == probe.S_FIXTURE_ISSUER, lb
+
+
+def test_the_verifier_role_name_is_pinned_to_the_deploy_auth_constant(probe):
+    """**修复轮 I2**：探针里那份 `VERIFIER_ROLE_NAME` 是第四份手写字面量，必须有东西钉住它。
+
+    改了角色名而漏改探针的症状是**静默**的：名字判据不再命中任何 principal，
+    `sign:fixture-issuer` 的计数少掉 URL 入口那一半，而探针照样 exit 0。
+
+    这里按 AST 从 `auth/deploy_auth.py`（生产真源）读那个常量，**不 import 它**——
+    探针刻意不依赖 boto3，`--self-test` 那条路必须一个 AWS 依赖都没有。
+    同一条纪律见 `test_verify_deployed_components.py` 里"角色名写死了字面量"那条。
+    """
+    import ast
+    src = (_ROOT / "site-builder" / "auth" / "deploy_auth.py").read_text(encoding="utf-8")
+    found = [n.value.value for n in ast.parse(src).body
+             if isinstance(n, ast.Assign) and len(n.targets) == 1
+             and getattr(n.targets[0], "id", None) == "VERIFIER_ROLE_NAME"
+             and isinstance(n.value, ast.Constant)]
+    assert len(found) == 1, f"deploy_auth.py 里的 VERIFIER_ROLE_NAME 不是唯一的字面量赋值：{found}"
+    assert probe.VERIFIER_ROLE_NAME == found[0], (
+        f"探针写的是 {probe.VERIFIER_ROLE_NAME!r}，deploy_auth.py 是 {found[0]!r}"
+        "——名字判据已经命不中任何 principal 了")

@@ -261,6 +261,18 @@ def classify(allowed: frozenset[str], s: Surface, name: str = "") -> set[str]:
     return labels
 
 
+def is_surface_label(label: str) -> bool:
+    """这个标签本身是否构成**冒充面成员资格**。
+
+    `summarize` 的三处判定（can_sign / can_edge / 边际收益的剩余标签）必须用**同一个**判据，
+    否则会出现"进面按一套、离面按另一套"：`{sign:kms-direct, sign:fixture-issuer}` 的 principal
+    在 KMS 那一组被关掉后已经离开冒充面（夹具入口只能签夹具域邮箱），而按"还有标签"判会把它
+    算成留下，于是限制性 key policy 的收益少报一个。
+    """
+    return label != S_FIXTURE_ISSUER and (label.startswith(SIGN_PREFIX)
+                                         or label.startswith(EDGE_PREFIX))
+
+
 def summarize(by_principal: dict[str, set[str]]) -> dict[str, Any]:
     """能力标签 → 聚合结论。**只出计数与集合关系，不出名字。**"""
     def holders(pred) -> set[str]:
@@ -269,17 +281,25 @@ def summarize(by_principal: dict[str, set[str]]) -> dict[str, Any]:
     per_label = {lb: len(holders(lambda ls, lb=lb: lb in ls)) for lb in ALL_LABELS}
     # **`sign:fixture-issuer` 不进 `can_sign`**（spec §1：受限冒充，单列不合并）。它带 `sign:`
     # 前缀是为了在 per_label 里与其它签名路径排在一起，但它签不出任意用户的会话。
-    can_sign = holders(lambda ls: any(l.startswith(SIGN_PREFIX) and l != S_FIXTURE_ISSUER
+    can_sign = holders(lambda ls: any(is_surface_label(l) and l.startswith(SIGN_PREFIX)
                                       for l in ls))
-    can_edge = holders(lambda ls: any(l.startswith(EDGE_PREFIX) for l in ls))
+    can_edge = holders(lambda ls: any(is_surface_label(l) and l.startswith(EDGE_PREFIX)
+                                      for l in ls))
     surface = can_sign | can_edge
 
     # 每个候选措施的**边际收益** = 关掉那一组路径后完全离开冒充面的 principal 数。
-    # **分母与分子都只在 `surface` 里算**：拿全体 principal 当分母时，只持夹具入口的人
-    # （不在冒充面里）会留在 remaining 里，把 `principals_removed` 算成负数。
+    #
+    # 两条都必须按 `is_surface_label` 过滤，判据与 can_sign/can_edge **是同一个**：
+    # · **分母只在 `surface` 里算**：拿全体 principal 当分母时，只持夹具入口的人（本来就不在
+    #   冒充面里）会留在 remaining 里，把 `principals_removed` 算成负数；
+    # · **剩余标签也只看冒充面标签**：`{sign:kms-direct, sign:fixture-issuer}` 这种 principal 在
+    #   KMS 那一组关掉之后**真的离开了冒充面**（剩下的夹具入口只能签夹具域），拿"还有标签没被关掉"
+    #   当判据会把它算成留下 ⇒ `restrictive-kms-key-policy` 的收益少报一个，而那个数字正是
+    #   "限制性 key policy 值不值得做"的唯一依据。
     marginal: dict[str, dict[str, int]] = {}
     for name, closed in MITIGATIONS.items():
-        remaining = {arn for arn in surface if by_principal[arn] - set(closed)}
+        remaining = {arn for arn in surface
+                     if {l for l in by_principal[arn] if is_surface_label(l)} - set(closed)}
         marginal[name] = {
             "closes_paths": len(closed),
             "surface_after": len(remaining),
@@ -422,14 +442,19 @@ def self_test() -> int:
         "p-kms-and-hijack": {S_KMS_DIRECT, S_HIJACK_AUTH},
         "p-cfn-only": {E_CFN_UPDATE_STACK},
         "p-fixture-only": {S_FIXTURE_ISSUER},
+        # **两个标签、其中一个是受限的那条**：关掉 KMS 那一组之后它只剩夹具入口
+        # ⇒ 真的离开了冒充面，必须计入收益。按"还有标签没关掉"判会把它算成留下
+        # （`restrictive-kms-key-policy` 于是读成 1 而不是 2）。
+        "p-kms-and-fixture": {S_KMS_DIRECT, S_FIXTURE_ISSUER},
     })["marginal_value_if_closed"]
     # 夹具签发器那条按 0 记：只持它的人本来就不在冒充面里 ⇒ 关掉它没人离开
     # （分母是冒充面，否则这个数会是负的）。
-    mv_want = {"restrictive-kms-key-policy": 1, "harden-signer-code-update": 0,
+    mv_want = {"restrictive-kms-key-policy": 2, "harden-signer-code-update": 0,
                "router-stack-policy": 1, "fixture-issuer-verifier-boundary": 0}
     mv_bad = {k: (mv[k]["principals_removed"], v) for k, v in mv_want.items()
               if mv[k]["principals_removed"] != v}
-    print(f"  {'ok  ' if not mv_bad else 'FAIL'} 边际收益：key policy 收不掉劫持 signer")
+    print(f"  {'ok  ' if not mv_bad else 'FAIL'} 边际收益：key policy 收不掉劫持 signer；"
+          f"只剩受限标签的 principal 算离开")
     if mv_bad:
         print(f"       {mv_bad}")
 
