@@ -1,34 +1,24 @@
-"""auth 与 panel 共用的 verifier 运行时装配（3c-1A）。
+"""auth 与 panel 共用的 verifier / signer 运行时装配（3c-final，RS-only）。
 
-三件事，原先两处各手写一份（login_handler / console_session），复制品漂移正是本仓库最怕的
-风险类型，所以收成一份：auth 拥有本文件，panel 打包时复制（deploy_panel.py 的 COPY_FILES）。
-- load_allowlist：SESSION_KEYS_JSON（只有参数名）→ 本 verifier 那份 kid allowlist，值按参数名取；
-  **出现本 verifier 不该持有的 family 直接拒**（spec §4.3：panel 只持 console）；缺配置直接抛，
-  不静默成空 allowlist（空 allowlist 会把新形态会话全拒而看起来像"用户没登录"）。
-- legacy_secret：LEGACY_ENTRY on/off → legacy 入口密钥或 None（None = 入口已删，3c-3）。
+原先两处各手写一份（login_handler / console_session），复制品漂移正是本仓库最怕的风险类型，所以收成一份：
+auth 拥有本文件，panel 打包时复制（deploy_panel.py 的 COPY_FILES）。
+- load_allowlist：SESSION_KEYS_JSON（kid / alg / role / key_arn / spki_sha256，**没有密钥材料**）→ 本 verifier
+  那份 kid allowlist，公钥按 key_arn 经 `get_public_key(key_arn, spki_sha256)` 取（session_kms.public_key_loader：
+  GetPublicKey + 指纹核对，不符抛）。**出现本 verifier 不该持有的 family 直接拒**（spec §4.3：panel 只持 console）；
+  缺配置直接抛，不静默成空 allowlist（空 allowlist 会把全部会话拒掉而看起来像"用户没登录"）。
+- signing_ref：同一份 JSON 里 role=current（或显式 previous）的 (kid, key_arn, spki_sha256)。**故意复用 _rows**：
+  签发用的 kid 必须是本 verifier 自己也接受的那把，共用一条解析路径就不可能分叉。它不调 KMS——签名器
+  （session_kms.KmsSigner）由调用方用返回值构造并缓存。
 - log_verify：spec §8 的固定低基数词表，**不记 token**，异常一律吞掉。
-
-3c-1B 起本文件也装配 **signer** 侧的两件事（spec §11.8.3 明写"加在 verifier_env.py，**不改文件名**"
-——改名要同时动 auth 的 AUTH_PACKAGE_MODULES 与 panel 的 COPY_FILES，两处任一漏改就是
-`Runtime.ImportModuleError` ⇒ 整个组件 502，那是 2026-09-02 真踩过的事故）：
-- signing_key：从同一份 SESSION_KEYS_JSON 取 role=current 的 (kid, secret)。**故意复用
-  load_allowlist**：签发用的 kid 必须是本 verifier 自己也接受的那把，共用一条解析路径就不可能分叉。
-- signer_mode：SESSION_SIGNER legacy/current，缺失或别的值硬失败（与 legacy_secret 同款
-  "部署脚本没下发"）。**不默认任何值**：默认 legacy 会让漏下发变成"切换看起来做了但没生效"，
-  默认 current 会让漏下发变成"legacy_param 还在但已按新形态签"，两种都是静默的。
 """
 from __future__ import annotations
 
 import json
 
+ROLES = ("current", "previous")
+
 
 def _rows(env_json: str | None, family: str, allowed_families: tuple) -> list:
-    """解析并校验 `SESSION_KEYS_JSON`，返回该 family 的行。**不取任何 secret。**
-
-    拆出来是为了让签发侧能"校验全部行、只取 current 的值"（3c-1B-G B1），
-    而验签侧继续取全部行的值。两条路共用同一份解析 ⇒ "签发的 kid 一定在本 verifier 的
-    allowlist 里"仍然是结构保证。
-    """
     if env_json is None:
         raise RuntimeError("SESSION_KEYS_JSON 缺失——部署脚本没下发")
     try:
@@ -42,48 +32,32 @@ def _rows(env_json: str | None, family: str, allowed_families: tuple) -> list:
     return keys[family]
 
 
-def load_allowlist(env_json: str | None, family: str, get_secret, *, allowed_families: tuple) -> dict:
-    """验签用的 allowlist：**每一行都取 secret**（current 与 previous 都要能验签）。"""
-    return {r["kid"]: {"alg": r["alg"], "secret": get_secret(r["ssm_param"]), "role": r["role"]}
+def load_allowlist(env_json: str | None, family: str, get_public_key, *, allowed_families: tuple) -> dict:
+    """验签用的 allowlist：**每一行都取公钥**（current 与 previous 都要能验签）。"""
+    return {r["kid"]: {"alg": r["alg"], "public_key": get_public_key(r["key_arn"], r["spki_sha256"]),
+                       "role": r["role"]}
             for r in _rows(env_json, family, allowed_families)}
 
 
-def signing_key(env_json: str | None, family: str, get_secret, *,
-                allowed_families: tuple) -> tuple[str, str]:
-    """→ (kid, secret)：该 family 里 role=current 的那把。签发用，**只有 signer 侧调用**。
+def signing_ref(env_json: str | None, family: str, *, allowed_families: tuple,
+                role: str = "current") -> tuple[str, str, str]:
+    """→ (kid, key_arn, spki_sha256)：该 family 里指定 role 的那把。签发用，**只有 signer 侧调用**。
 
-    与 load_allowlist 共用 `_rows` 的解析与校验：那样"签发的 kid 一定在本 verifier 的
-    allowlist 里"是结构保证而不是巧合。
-    current 不唯一（0 个或 2 个）时硬失败——env_json 只会给出一个，出现别的数量说明下发的
-    JSON 被手改过，静默取第一个会让"签哪把"变成字典序的副产品。
-
-    **只取 current 那一行的 secret**（3c-1B-G B1）。原先它走 `load_allowlist`，于是把
-    family 里每个 kid 的 secret 都取一遍 ⇒ 签发**硬依赖 previous 参数可读**，而
-    `/callback` 每次登录都调本函数（ticket 20 把它提前到烧授权码之前）。后果：十步的 ⑩
-    若先删退役 key 的参数再重部，每次登录 500——缺的还是那把"没人再用它签"的 key；
-    另外冷缓存下每次登录白打一次 `GetParameter`。
+    `role="previous"` 只给 auth 的 /fixture-session（就位期正向探针，spec §11.8.8）；生产签发一律 current。
+    current 不唯一（0 个或 2 个）时硬失败——env_json 只会给出一个，出现别的数量说明下发的 JSON 被手改过。
     """
+    if role not in ROLES:
+        raise RuntimeError(f"role 必须是 {ROLES} 之一，得到 {role!r}")
     rows = _rows(env_json, family, allowed_families)
     current = [r for r in rows if r.get("role") == "current"]
     if len(current) != 1:
-        raise RuntimeError(
-            f"SESSION_KEYS_JSON 的 {family} family 有 {len(current)} 个 role=current 的 kid，"
-            "必须恰好 1 个——部署脚本坏了")
-    row = current[0]
-    return row["kid"], get_secret(row["ssm_param"])
-
-
-def signer_mode(flag: str | None) -> str:
-    """→ "legacy" | "current"。缺失或别的值硬失败（不默认任何值，见模块 docstring）。"""
-    if flag not in ("legacy", "current"):
-        raise RuntimeError("SESSION_SIGNER 必须是 legacy/current——部署脚本没下发")
-    return flag
-
-
-def legacy_secret(flag: str | None, get_legacy):
-    if flag not in ("on", "off"):
-        raise RuntimeError("LEGACY_ENTRY 必须是 on/off——部署脚本没下发")
-    return get_legacy() if flag == "on" else None
+        raise RuntimeError(f"SESSION_KEYS_JSON 的 {family} family 有 {len(current)} 个 role=current 的 kid，"
+                           "必须恰好 1 个——部署脚本坏了")
+    picked = current if role == "current" else [r for r in rows if r.get("role") == "previous"]
+    if not picked:
+        raise RuntimeError(f"SESSION_KEYS_JSON 的 {family} family 没有 previous 行——就位之前没有 previous key 可签")
+    row = picked[0]
+    return row["kid"], row["key_arn"], row["spki_sha256"]
 
 
 def log_verify(verifier: str, outcome) -> None:
