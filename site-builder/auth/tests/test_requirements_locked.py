@@ -27,6 +27,11 @@ APP_PY = INFRA_DIR / "app.py"
 PANEL_DIR = Path(__file__).parents[2] / "panel"
 PANEL_REQ = PANEL_DIR / "requirements.txt"
 DEPLOY_PANEL = PANEL_DIR / "deploy_panel.py"
+# 3c-final：Lambda@Edge 的 verifier 也 import cryptography，而 Edge 没有层、装法是 synth 时交叉装进
+# asset 目录（router/infrastructure/stack.py 的 vendor_edge_dependencies）。同一对守卫再扩到它：
+# **parents[3] 才是仓库根**（[2] 是 site-builder/）。
+ROUTER_STACK = Path(__file__).parents[3] / "router" / "infrastructure" / "stack.py"
+EDGE_REQ = Path(__file__).parents[3] / "router" / "infrastructure" / "lambda" / "requirements-edge.txt"
 
 
 def _str_consts(node: ast.AST) -> list[str]:
@@ -36,6 +41,23 @@ def _str_consts(node: ast.AST) -> list[str]:
     if isinstance(node, ast.JoinedStr):
         return [s for v in node.values for s in _str_consts(v)]
     return []
+
+
+def _call_str_args(node: ast.Call) -> list[str]:
+    """一次调用里所有**实参位置**的字符串字面量，argv 那种 list/tuple 字面量要展开一层。
+
+    只看实参、**不看 docstring 与注释**：这正是走 AST 的理由。裸 `ast.walk` 收全部 Constant 会把
+    函数 docstring 也收进来——我为解释这些开关写的那段文字自己就能满足断言，而 argv 里那条被删掉
+    也照样绿（M7 fix round 1 实测过这个形态）。
+    """
+    out: list[str] = []
+    for arg in node.args:
+        if isinstance(arg, (ast.List, ast.Tuple)):
+            for el in arg.elts:
+                out += _str_consts(el)
+        else:
+            out += _str_consts(arg)
+    return out
 
 
 def _bundling_specs(src: str) -> list[tuple[str, set[str]]]:
@@ -115,6 +137,46 @@ def test_panel_every_package_is_pinned_and_hashed():
     # cryptography 是 panel 唯一真正需要的那个（session.py 的 RS256 验签）；
     # cffi / pycparser 是它的传递闭包——列全三个是为了确认清单覆盖闭包而不只是顶层那一行。
     assert names == {"cffi", "cryptography", "pycparser"}, f"panel 清单的包集合变了：{names}"
+
+
+def test_edge_every_package_is_pinned_and_hashed():
+    names = _assert_all_pinned_and_hashed(EDGE_REQ)      # 与 auth / panel 那两条同一个助手
+    # cryptography 是 Edge verifier 唯一真正需要的那个；cffi / pycparser 是它的传递闭包
+    # ——列全三个是为了确认清单覆盖闭包而不只是顶层那一行。
+    assert names == {"cffi", "cryptography", "pycparser"}, f"Edge 清单的包集合变了：{names}"
+
+
+def test_edge_requirements_pin_the_same_versions_as_auth():
+    """三份清单（auth / panel / Edge）的 cryptography 闭包必须钉同一批版本。
+
+    分叉的后果是"同一份 session.py 的验签核心在三处跑在不同的 cryptography 上"——本仓库把
+    Edge 那份当作与 auth 字节等价的副本，版本漂移会让"两侧单测都绿而真机一侧不同"重新变成可能。
+    Edge 只钉 cp311 / manylinux2014_x86_64 那一个 wheel 的 hash（auth 那份含多平台），所以这里
+    比的是**版本**，不是 hash 行数。
+    """
+    import re
+    pins = lambda p: dict(re.findall(r"^([a-zA-Z0-9_-]+)==([^ \\]+)", p.read_text(), re.M))  # noqa: E731
+    edge, auth = pins(EDGE_REQ), pins(AUTH_REQ)
+    assert set(edge) == {"cffi", "cryptography", "pycparser"} and all(auth[k] == v for k, v in edge.items()), \
+        f"Edge 与 auth 的钉版不一致：{edge} vs {{k: auth.get(k) for k in edge}}"
+
+
+def test_stack_vendoring_pip_argv_carries_the_four_cross_install_switches():
+    """AST 取 stack.py 里 vendor_edge_dependencies 的 subprocess.run 参数列表（与 deploy_auth 那条同一套做法）。
+
+    走 AST 而不是全文 substring：ast 天生不含注释，所以"命令里有没有那个开关"是纯粹的代码事实
+    ——我为解释这些开关写的注释既不能满足断言，也不能把它判红（这个形态在 M7 fix round 1 真的
+    发生过：注释自己满足了断言，而 argv 里那条被删掉了）。
+    """
+    tree = ast.parse(ROUTER_STACK.read_text(encoding="utf-8"))
+    fn = next((n for n in tree.body
+               if isinstance(n, ast.FunctionDef) and n.name == "vendor_edge_dependencies"), None)
+    assert fn is not None, "stack.py 里没有模块级的 vendor_edge_dependencies——本条已空转"
+    consts = [s for node in ast.walk(fn) if isinstance(node, ast.Call) for s in _call_str_args(node)]
+    assert consts, "vendor_edge_dependencies 里一条实参字面量都没解析出来——本条已空转"
+    for want in ("--require-hashes", "--platform", "manylinux2014_x86_64", "--only-binary", ":all:",
+                 "--python-version", "3.11", "--implementation", "cp"):
+        assert want in consts, want
 
 
 def test_bundling_every_package_is_pinned_and_hashed():

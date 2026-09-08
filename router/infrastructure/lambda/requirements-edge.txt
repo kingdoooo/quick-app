@@ -1,0 +1,12 @@
+# Lambda@Edge（origin-request）的**锁定**依赖闭包：cryptography 及其两个传递依赖，manylinux2014_x86_64 / cp311
+# 的 wheel 各钉一个 sha256（ADR 0003；数字与装法见 spec §11.1）。stack.py 在 synth 时用
+# `pip install --require-hashes --platform manylinux2014_x86_64 --only-binary :all: --python-version 3.11 --implementation cp`
+# 把它装进 Edge 的 asset 目录；auth/tests/test_requirements_locked.py 守着这四个开关与"每个包都带 hash"。
+# 重新生成：python3 site-builder/scripts/spike_edge_crypto_coldstart.py --regen-requirements 之后把
+# site-builder/scripts/spike_edge_crypto_requirements.txt 的 requirement 正文抄进来（版本必须与 auth 清单同）。
+cffi==2.1.1 \
+    --hash=sha256:34e261f78cb6ceaaa36f42f2613f4380d94d9c759a9c73c769ee6e0247364632
+cryptography==50.0.0 \
+    --hash=sha256:06a32a980526a6ab9a4b9bf8f7385800791e2bb960903cb6b530e4817509a3b7
+pycparser==3.0 \
+    --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992

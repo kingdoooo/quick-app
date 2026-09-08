@@ -1,55 +1,80 @@
-"""stack.py 的静态守卫（stack.py import aws_cdk，普通解释器里没有，所以按源码文本断言）。"""
+"""stack.py 的静态守卫（stack.py import aws_cdk，普通解释器里没有，所以按源码文本断言）。
+
+3c-final：Edge 注入的是 **site family 的 RS256 公钥 allowlist**（`spki_b64`），来源是 KMS
+（`session_kms.fetch_verified_public_key_der` 的四项校验），不再有 `{{JWT_SECRET}}` /
+`{{LEGACY_ENTRY}}`。**行为**用把 `load_site_allowlist` … `class WebRouterStack` 之间那段源码
+切出来单独 exec 的方式验（stack.py 自己 import aws_cdk，本 venv 没有）；纯文本断言只用来钉
+"不许回到旧形态"。
+"""
+import json
 import re
+import subprocess
+import sys as _sys
+import tempfile
+import textwrap
+import types
 from pathlib import Path
 
-SRC = (Path(__file__).parents[1] / "stack.py").read_text()
+import pytest
+
+HERE = Path(__file__).resolve().parent
+SRC = (HERE.parent / "stack.py").read_text()
+
+# 三套件共用的 RS 测试密钥 + FakeKms（panel/tests/upgrade_code_vectors.py 的文件头解释了为什么共用一份），
+# 以及 `[SessionKeys]` 的真加载器与 KMS 边界。`RS` / `RS_WITH_PREVIOUS` 两段配置文本从 auth 的套件
+# **import**，不在这里抄第二份——抄一份就会与 session_keys 的 schema 各自漂。
+_sys.path.insert(0, str(HERE.parents[2] / "site-builder" / "auth"))
+_sys.path.insert(0, str(HERE.parents[2] / "site-builder" / "auth" / "tests"))
+_sys.path.insert(0, str(HERE.parents[2] / "site-builder" / "panel" / "tests"))
+import session_keys as sk  # noqa: E402
+import session_kms  # noqa: E402
+import upgrade_code_vectors as v  # noqa: E402
+from test_session_keys import RS, RS_WITH_PREVIOUS  # noqa: E402
+
+OFFLINE_FLAG = "APP_SYNTH_OFFLINE"
 
 
 def test_stack_uses_shared_session_keys_helpers_not_inline_copies():
+    """3c-final 删了 legacy 入口：`legacy_entry` 与 `load_jwt_secret` 都不该再出现。
+
+    `legacy_entry` 已经从 `session_keys.py` 删除（Task 2），所以留着那条 import 是 synth 期
+    ImportError；`load_jwt_secret` 留着则意味着 Edge 还在被注入一把对称密钥。
+    """
     body = SRC[SRC.index("def load_site_allowlist"):SRC.index("class WebRouterStack")]
-    assert "legacy_entry(" in body and '"on" if keys.legacy_param else "off"' not in body
+    assert "legacy_entry(" not in body and "load_jwt_secret" not in SRC
     assert "env_json" not in body, "局部名 env_json 与 session_keys.env_json 撞名"
 
 
-def test_stack_ssm_failure_injects_the_synth_placeholder_not_an_empty_allowlist():
+def test_no_hs_era_placeholder_is_injected_anymore():
+    """`{{JWT_SECRET}}` / `{{LEGACY_ENTRY}}` 两个注入点随 Task 10 一起消失。
+
+    多余的 `.replace` **不会**被残留检查抓到（它只看剩下的占位符），所以这条要单独钉：
+    留着它们等于 stack.py 还在为一个不存在的注入点准备值。
+    """
+    assert "{{JWT_SECRET}}" not in SRC and "{{LEGACY_ENTRY}}" not in SRC
+    assert "{{SITE_ALLOWLIST_JSON}}" in SRC
+
+
+def test_stack_key_fetch_failure_injects_the_synth_placeholder_not_an_empty_allowlist():
     body = SRC[SRC.index("def load_site_allowlist"):SRC.index("class WebRouterStack")]
     assert 'text = "{}"' not in body, "空 allowlist 看起来合法，synth 与部署前测试都过；要注入带 SYNTH-ONLY 标记的占位"
     assert "SYNTH_PLACEHOLDER_ALLOWLIST_JSON" in body
 
 
-# ---- 3c-1B ticket 07：legacy 注入的路径来自配置，为空即 L3 -------------------------------
-#
-# `stack.py` import aws_cdk（普通解释器里没有），所以**行为**用把两个待测函数从源码里切出来
-# 单独 exec 的方式验；纯文本断言只用来钉"不许回到硬编码"。
+def test_session_keys_are_loaded_lazily_for_the_injected_allowlist():
+    """`[SessionKeys]` 只有一个消费方（allowlist），且**加载必须是惰性的**（controller R17）。
 
-import sys as _sys  # noqa: E402
-import textwrap  # noqa: E402
-import types  # noqa: E402
-
-import pytest  # noqa: E402
-
-L3_LEGACY = ""
-LIVE_LEGACY = "/site-builder/jwt-secret"
-
-
-def test_legacy_parameter_path_is_not_hardcoded_anymore():
-    """硬编码与 `[SessionKeys] legacy_param` 分叉时，闸门盯着一把密钥而 Edge 注入的是另一把，
-    **两边都不报错**。所以路径只许来自配置。"""
-    body = SRC[SRC.index("def load_jwt_secret"):SRC.index("def load_site_allowlist")]
-    assert 'Name="/site-builder/jwt-secret"' not in body, "legacy 参数路径仍硬编码"
-    assert "Name=legacy_param" in body, "没有按配置里的路径取"
-    assert "def load_jwt_secret(legacy_param: str)" in body, (
-        "路径必须是**必填**入参：给默认值或自己再读一次 config 就多了一条可能与 "
-        "load_site_allowlist 不一致的取值路径")
-
-
-def test_session_keys_is_parsed_once_for_both_injected_values():
-    """两个注入值必须来自同一份解析——各读一次的话，中途改 config 会让 Edge 拿到
-    自相矛盾的 (allowlist, legacy secret) 组合。"""
+    离线 synth（`APP_SYNTH_OFFLINE=1`）与显式覆盖（`APP_SITE_ALLOWLIST_JSON`）这两条路都必须在
+    **配置根本加载不动**时仍然能出模板——切换窗口里 `site-builder/config.ini` 就是旧形态（HS）。
+    在 `__init__` 里写 `session_keys = _session_keys()` 会让 `SessionKeysError` 在进 `load_site_allowlist`
+    之前就抛出来，两条路一起失效，所以传进去的是**取值函数**而不是取好的值。
+    """
     body = SRC[SRC.index("class WebRouterStack"):]
-    assert "session_keys = _session_keys()" in body
-    assert "load_jwt_secret(session_keys.legacy_param)" in body
+    assert "session_keys = _session_keys" in body
+    assert "session_keys = _session_keys()" not in body, (
+        "急加载：配置读不动时离线 synth 与显式覆盖都会先炸在这一行（R17）")
     assert "load_site_allowlist(session_keys)" in body
+    assert "load_jwt_secret" not in SRC
 
 
 def test_session_keys_path_insert_is_unconditional():
@@ -69,227 +94,246 @@ def test_session_keys_path_insert_is_unconditional():
     assert SRC.count("site-builder\" / \"auth\"") == 1, "放路径的地方有第二份副本，两处会漂移"
 
 
-def _load_jwt_secret_fn():
-    """把 `load_jwt_secret` 从源码里切出来，在一个只有它需要的名字的命名空间里 exec。
-
-    这样能测**行为**而不只是文本，且不需要 aws_cdk。片段刻意只含 `load_jwt_secret` 一个函数
-    （结束锚点是下一个 def）：多切进来一个函数就会带进它的模块级依赖，症状是片段里
-    `NameError`，读起来像被测函数坏了。
-    """
-    start = SRC.index("def load_jwt_secret")
-    end = SRC.index("def _session_keys_on_path(")   # 片段只含 load_jwt_secret 一个函数
-    mod = types.ModuleType("_stack_jwt_fragment")
-    mod.__dict__.update(os=__import__("os"), sys=_sys)
-    if "def _synth_offline" in SRC:   # ticket 19：两个注入函数共用的离线开关助手，一并切进来
-        hs = SRC.index("def _synth_offline"); he = SRC.index("def ", hs + 1)
-        exec(compile(textwrap.dedent(SRC[hs:he]), "<stack helpers>", "exec"), mod.__dict__)
-    exec(compile(textwrap.dedent(SRC[start:end]), "<stack fragment>", "exec"), mod.__dict__)
-    return mod
-
-
-def test_empty_legacy_param_injects_an_empty_string_and_stays_silent(capsys, monkeypatch):
-    """L3：注入空串，**不打 SYNTH 警告**，也不去读 SSM。"""
-    mod = _load_jwt_secret_fn()
-    monkeypatch.delenv("APP_JWT_SECRET", raising=False)
-    assert mod.load_jwt_secret(L3_LEGACY) == ""
-    err = capsys.readouterr().err
-    assert "SYNTH" not in err and "WARNING" not in err, err
-
-
-def test_the_empty_string_is_not_the_synth_placeholder():
-    """两条产物核对断言看的是 `SYNTH-ONLY-PLACEHOLDER` 字样与未替换的 `{{…}}`——
-    空替换两条都不命中，所以 L3 的部署不会被误判成"SSM 读取失败"。"""
-    mod = _load_jwt_secret_fn()
-    got = mod.load_jwt_secret(L3_LEGACY)
-    assert "SYNTH-ONLY-PLACEHOLDER" not in got
-    assert "{{" not in got and "}}" not in got
-
-
-def test_explicit_override_still_wins_when_the_entry_is_open(monkeypatch):
-    monkeypatch.setenv("APP_JWT_SECRET", "override-value")
-    mod = _load_jwt_secret_fn()
-    assert mod.load_jwt_secret(LIVE_LEGACY) == "override-value"
-
-
-def test_override_is_ignored_once_the_entry_is_closed(monkeypatch):
-    """L3 的判断在覆盖之前：入口已关闭时不该因为环境里留着一个 APP_JWT_SECRET 就把密钥注回去。"""
-    monkeypatch.setenv("APP_JWT_SECRET", "override-value")
-    mod = _load_jwt_secret_fn()
-    assert mod.load_jwt_secret(L3_LEGACY) == ""
-
-
-def test_real_ssm_failure_still_falls_back_to_the_synth_placeholder(capsys, monkeypatch):
-    """回归：入口开着而 SSM 真读不到，**显式离线模式下**仍落 SYNTH 占位并告警——**这条与"刻意为空"必须分得开**，
-    否则 L3 每次部署都被产物核对判红，而真故障反而被当成日常。（不带 APP_SYNTH_OFFLINE 时的行为见 ticket 19 那组：抛。）"""
-    monkeypatch.delenv("APP_JWT_SECRET", raising=False)
-    monkeypatch.setenv("APP_SYNTH_OFFLINE", "1")
-    mod = _load_jwt_secret_fn()
-    # 让 `import boto3` 在片段里失败：注入一个抛异常的假模块
-    broken = types.ModuleType("boto3")
-
-    def _boom(*a, **k):
-        raise RuntimeError("no credentials in this test")
-
-    broken.client = _boom
-    monkeypatch.setitem(_sys.modules, "boto3", broken)
-    got = mod.load_jwt_secret(LIVE_LEGACY)
-    assert got == "SYNTH-ONLY-PLACEHOLDER-DO-NOT-DEPLOY"
-    err = capsys.readouterr().err
-    assert "WARNING" in err and LIVE_LEGACY in err
-
-
-@pytest.mark.parametrize("legacy,expect", [(LIVE_LEGACY, "on"), (L3_LEGACY, "off")])
-def test_legacy_entry_follows_the_same_single_switch(legacy, expect):
-    """第三处后果的另一半：同一处配置同时决定 `{{LEGACY_ENTRY}}`。取的是共用助手，
-    不是本文件的第二份判断（`test_stack_uses_shared_session_keys_helpers_not_inline_copies` 锁死）。"""
-    _sys.path.insert(0, str(Path(__file__).parents[3] / "site-builder" / "auth"))
-    import session_keys as sk
-    keys = types.SimpleNamespace(legacy_param=legacy)
-    assert sk.legacy_entry(keys) == expect
-
-
-# ---- 3c-1B ticket 19：synth fail-closed（merged review M12）--------------------------------------
+# ---- 3c-final：公钥 allowlist 的行为（KMS 四项 + 三种模式）--------------------------------------
 #
-# 此前两个注入函数整段 `except Exception` ⇒ 非 HS256 的配置错、ParameterNotFound、AccessDenied 都退化成
-# SYNTH 占位符 + 一行 stderr WARNING，而 `cdk deploy` 照样 exit 0、把一个 kid 永不匹配的 allowlist 全球
-# 复制出去（全员登录循环，直到有人读 cdk 日志或跑 verify_deployed_edge.sh）。现在：**默认任何失败都让
-# synth 失败**；占位符路径只在显式 `APP_SYNTH_OFFLINE=1` 下保留（离线 synth / 无凭据的 CI）；配置错误
-# 在任何模式下都抛。
-
-OFFLINE_FLAG = "APP_SYNTH_OFFLINE"
+# 此前是"按 ssm_param 取对称密钥"。现在每把 site key 都要过 spec §11.6 第 1 层的四项校验
+# （DescribeKey 三项 + 指纹 == config），公钥以 base64 DER SPKI 注入；console 的公钥永不进 Edge。
+# 三种模式（controller R17）：显式覆盖 ⇒ 根本不读 config；离线且读不动 ⇒ 占位 + stderr 警告；
+# 部署模式下任何失败（配置 / KMS / 指纹）⇒ synth 响亮失败。
 
 
-def _load_site_allowlist_fn():
-    """把 `load_site_allowlist` 切出来 exec；`_session_keys_on_path` 用一个只放路径的替身。"""
+def _cfg_with(text: str) -> Path:
+    """把 `[SessionKeys]` 文本写成一份真的 config.ini（`load_session_keys` 只接受文件路径）。"""
+    path = Path(tempfile.mkdtemp()) / "config.ini"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _fragment(name: str = "_stack_allowlist_fragment"):
+    """把 `load_site_allowlist` … `class WebRouterStack` 之间那段切出来，在一个只有它需要的名字的
+    命名空间里 exec（`EDGE_REQUIREMENTS` 与 `vendor_edge_dependencies` 也在这一段里）。
+
+    这样能测**行为**而不只是文本，且不需要 aws_cdk。`_session_keys_on_path` 用一个只放路径的替身；
+    `__file__` 必须注进来（compile 出来的片段没有它，缺了会 NameError 而不是报出真正的问题）。
+    """
     start = SRC.index("def load_site_allowlist")
     end = SRC.index("class WebRouterStack")
-    mod = types.ModuleType("_stack_allowlist_fragment")
-    root = Path(__file__).parents[3]
+    mod = types.ModuleType(name)
+    root = HERE.parents[2]
 
     def _on_path():
         _sys.path.insert(0, str(root / "site-builder" / "auth"))
         return root
 
-    mod.__dict__.update(os=__import__("os"), sys=_sys, json=__import__("json"), _session_keys_on_path=_on_path)
-    # 片段里若引用了 _synth_offline() 这类同文件助手，也一并切进来（以 def 开头、在 load_jwt_secret 之前）
-    helpers_start = SRC.index("def _synth_offline") if "def _synth_offline" in SRC else None
-    if helpers_start is not None:
-        helpers_end = SRC.index("def ", helpers_start + 1)
-        exec(compile(textwrap.dedent(SRC[helpers_start:helpers_end]), "<stack helpers>", "exec"), mod.__dict__)
+    mod.__dict__.update(os=__import__("os"), sys=_sys, json=json, subprocess=subprocess, Path=Path,
+                        __file__=str(HERE.parent / "stack.py"), _session_keys_on_path=_on_path)
+    # 片段里引用的同文件助手（`_synth_offline`）也一并切进来
+    hs = SRC.index("def _synth_offline")
+    exec(compile(textwrap.dedent(SRC[hs:SRC.index("def ", hs + 1)]), "<stack helpers>", "exec"),
+         mod.__dict__)
     exec(compile(textwrap.dedent(SRC[start:end]), "<stack fragment>", "exec"), mod.__dict__)
     return mod
 
 
-def _ref(kid, alg="HS256", role="current"):
-    return types.SimpleNamespace(kid=kid, alg=alg, role=role, ssm_param=f"/site-builder/session-keys/{kid}")
+def _fragment_vendor():
+    """同一段片段——`vendor_edge_dependencies` / `EDGE_REQUIREMENTS` 就在里面（独立模块名，避免串味）。"""
+    return _fragment("_stack_vendor_fragment")
 
 
-def _keys(site=(), console=(), legacy_param=""):
+def _keys(site=(), console=()):
+    """手搭的 `SessionKeys` 替身：只用于"配置加载不出来的形态"（真配置会先被 session_keys 拒掉）。"""
     fams = {"site": list(site), "console": list(console)}
-    return types.SimpleNamespace(legacy_param=legacy_param, allowlist=lambda fam: fams[fam])
+    return types.SimpleNamespace(allowlist=lambda fam: fams[fam])
 
 
-def _fake_boto3(monkeypatch, values: dict | None = None, error: Exception | None = None):
-    """注入一个假的 boto3：`client("ssm").get_parameter(Name=…)` 按 values 取值，或统一抛 error。"""
-    fake = types.ModuleType("boto3")
-
-    class _SSM:
-        def get_parameter(self, Name, WithDecryption):
-            if error is not None:
-                raise error
-            if Name not in (values or {}):
-                raise RuntimeError(f"ParameterNotFound: {Name}")
-            return {"Parameter": {"Value": values[Name]}}
-
-    fake.client = lambda service, region_name: _SSM()
-    monkeypatch.setitem(_sys.modules, "boto3", fake)
-    return fake
+def _ref(kid, alg="RS256", role="current"):
+    return types.SimpleNamespace(kid=kid, alg=alg, role=role, key_arn=v.KEY_ARN.get(kid, "arn:x"),
+                                 spki_sha256="0" * 64)
 
 
 @pytest.fixture
 def clean_env(monkeypatch):
-    for k in ("APP_SITE_ALLOWLIST_JSON", "APP_JWT_SECRET", OFFLINE_FLAG):
+    for k in ("APP_SITE_ALLOWLIST_JSON", OFFLINE_FLAG):
         monkeypatch.delenv(k, raising=False)
 
 
-def test_allowlist_takes_only_the_site_family_and_reads_each_secret_from_ssm(clean_env, monkeypatch):
-    """spec §4.1：console 的 key 永不进 Edge；每行的 secret 按它自己的 ssm_param 取。"""
-    _fake_boto3(monkeypatch, {"/site-builder/session-keys/site-hs-v1": "s1", "/site-builder/session-keys/site-hs-v2": "s2",
-                              "/site-builder/session-keys/console-hs-v1": "c1"})
-    mod = _load_site_allowlist_fn()
-    text, entry = mod.load_site_allowlist(_keys(site=[_ref("site-hs-v1"), _ref("site-hs-v2", role="previous")],
-                                                console=[_ref("console-hs-v1")], legacy_param=""))
-    got = __import__("json").loads(text)
-    assert got == {"site-hs-v1": {"alg": "HS256", "secret": "s1", "role": "current"},
-                   "site-hs-v2": {"alg": "HS256", "secret": "s2", "role": "previous"}}
-    assert "c1" not in text and entry == "off"
-
-
-@pytest.mark.parametrize("offline", [False, True])
-def test_non_hs256_row_is_a_config_error_in_every_mode(clean_env, monkeypatch, offline):
-    """配置错不是"SSM 读不到"：无论在线/离线都必须抛，不许被吞成占位符。"""
-    if offline:
+@pytest.fixture(params=[False, True], ids=["online", "offline"])
+def offline_flag(request, monkeypatch):
+    """两种模式各跑一遍：判据是"这条在**任何**模式下都抛"，不是"默认模式下抛"。"""
+    if request.param:
         monkeypatch.setenv(OFFLINE_FLAG, "1")
-    _fake_boto3(monkeypatch, {"/site-builder/session-keys/site-rs-v1": "x"})
-    mod = _load_site_allowlist_fn()
-    with pytest.raises(ValueError, match="HS256"):
-        mod.load_site_allowlist(_keys(site=[_ref("site-rs-v1", alg="RS256")]))
+    else:
+        monkeypatch.delenv(OFFLINE_FLAG, raising=False)
+    return request.param
 
 
-def test_ssm_failure_fails_synth_by_default_instead_of_injecting_the_placeholder(clean_env, monkeypatch, capsys):
-    """M12：`cdk deploy` 路径上 ParameterNotFound / AccessDenied 必须让 synth 失败，而不是 exit 0 + 占位符。"""
-    _fake_boto3(monkeypatch, error=RuntimeError("AccessDeniedException: ssm:GetParameter"))
-    mod = _load_site_allowlist_fn()
-    with pytest.raises(Exception) as ei:
-        mod.load_site_allowlist(_keys(site=[_ref("site-hs-v1")]))
-    msg = str(ei.value)
-    assert "AccessDeniedException" in msg and OFFLINE_FLAG in msg, msg
+def test_allowlist_takes_only_the_site_family_and_fetches_each_public_key_from_kms(clean_env, monkeypatch):
+    """spec §4.1：console 的公钥永不进 Edge；每把 site key 的公钥按 key_arn 从 KMS 取并过四项校验。"""
+    mod = _fragment()
+    keys = sk.load_session_keys(_cfg_with(RS_WITH_PREVIOUS))
+    kms = v.FakeKms()
+    text = mod.load_site_allowlist(keys, kms=kms)
+    got = json.loads(text)
+    assert got == {"site-rs-v1": {"alg": "RS256", "spki_b64": v.spki_b64(v.SITE_KEY), "role": "current"},
+                   "site-rs-v0": {"alg": "RS256", "spki_b64": v.spki_b64(v.SITE_PREV_KEY), "role": "previous"}}
+    assert v.spki_b64(v.CONSOLE_KEY) not in text, "console 的公钥进了 Edge"
+    assert {c[0] for c in kms.calls} == {"describe_key", "get_public_key"}
+    assert "\\" not in text and "'''" not in text
+
+
+def test_a_key_whose_fingerprint_differs_from_config_fails_synth_in_every_mode(clean_env, monkeypatch, offline_flag):
+    """指纹不符不是"读不到"，是 config.ini 指错了 key（或 key 被换过）——离线模式也不许退成占位。"""
+    kms = v.FakeKms()
+    kms.tamper_public_key_for[v.KEY_ARN[v.SITE_KID]] = v.CONSOLE_KEY
+    with pytest.raises(session_kms.KeyMaterialMismatch):
+        _fragment().load_site_allowlist(sk.load_session_keys(_cfg_with(RS)), kms=kms)
+
+
+@pytest.mark.parametrize("bad_alg", ["HS256", "RS512"])
+def test_a_non_rs256_row_is_a_config_error_in_every_mode(clean_env, offline_flag, bad_alg):
+    """Edge 只有 RS256 一条验签路径。已加载成功的行里出现别的 alg 是配置错，任何模式都抛。"""
+    with pytest.raises(ValueError, match="RS256"):
+        _fragment().load_site_allowlist(_keys(site=[_ref("site-rs-v1", alg=bad_alg)]), kms=v.FakeKms())
+
+
+def test_kms_failure_fails_synth_by_default_instead_of_injecting_the_placeholder(clean_env, capsys):
+    """M12：`cdk deploy` 路径上 AccessDenied / 限流 / 网络失败必须让 synth 失败，而不是 exit 0 + 占位符。"""
+    class Boom:
+        def describe_key(self, **kw):
+            raise RuntimeError("AccessDeniedException")
+
+    with pytest.raises(RuntimeError, match="AccessDeniedException") as ei:
+        _fragment().load_site_allowlist(sk.load_session_keys(_cfg_with(RS)), kms=Boom())
+    assert OFFLINE_FLAG in str(ei.value)
     assert "SYNTH-ONLY-PLACEHOLDER" not in capsys.readouterr().err
 
 
-def test_ssm_failure_falls_back_to_the_placeholder_only_when_offline_is_explicit(clean_env, monkeypatch, capsys):
+def test_kms_failure_falls_back_to_the_placeholder_only_when_offline_is_explicit(clean_env, monkeypatch, capsys):
     """离线 synth 仍可用，但必须显式声明；占位符带标记且 kid 永不匹配（verify_deployed_edge.sh 会抓）。"""
     monkeypatch.setenv(OFFLINE_FLAG, "1")
-    _fake_boto3(monkeypatch, error=RuntimeError("no credentials"))
-    mod = _load_site_allowlist_fn()
-    text, _ = mod.load_site_allowlist(_keys(site=[_ref("site-hs-v1")]))
+
+    class Boom:
+        def describe_key(self, **kw):
+            raise RuntimeError("no network")
+
+    text = _fragment().load_site_allowlist(sk.load_session_keys(_cfg_with(RS)), kms=Boom())
+    assert "SYNTH-ONLY-PLACEHOLDER-DO-NOT-DEPLOY" in text
+    assert "DO NOT deploy" in capsys.readouterr().err
+
+
+def test_a_synth_interpreter_without_the_crypto_closure_fails_loudly_by_default(clean_env, monkeypatch, capsys):
+    """四项校验要 `session_kms`（→ session → cryptography）。装不上时不许静默出一份没过校验的模板。
+
+    这条不是假想：`router/infrastructure/.venv` 的 requirements.txt 今天只有 CDK 与 boto3，所以
+    `cdk deploy` 那条路会真的走到这个分支——报文必须点名要装什么，而不是"KMS 取不到公钥"。
+    离线（只想看模板）才退占位。
+    """
+    monkeypatch.setitem(_sys.modules, "session_kms", None)   # `import session_kms` ⇒ ImportError
+    keys = sk.load_session_keys(_cfg_with(RS))
+    with pytest.raises(RuntimeError, match="cryptography") as ei:
+        _fragment().load_site_allowlist(keys, kms=v.FakeKms())
+    assert OFFLINE_FLAG in str(ei.value)
+    monkeypatch.setenv(OFFLINE_FLAG, "1")
+    text = _fragment().load_site_allowlist(keys, kms=v.FakeKms())
+    assert "SYNTH-ONLY-PLACEHOLDER-DO-NOT-DEPLOY" in text
+    assert "DO NOT deploy" in capsys.readouterr().err
+
+
+# ---- controller R17：`[SessionKeys]` 本身读不动时的三种模式 --------------------------------------
+#
+# 切换窗口里 `site-builder/config.ini` 还是旧形态（HS），`load_session_keys` 会抛 SessionKeysError。
+# 离线 synth 与显式覆盖这两条"只想看模板"的路必须仍然走得通，而 `cdk deploy` 那条必须响亮失败。
+
+
+def _unloadable_keys(marker="配置读不动"):
+    """一个真的会抛 `SessionKeysError` 的取值函数（走 session_keys 自己的报错，不是假异常）。"""
+    def _load():
+        return sk.load_session_keys(Path(tempfile.mkdtemp()) / f"{marker}-nope.ini")
+    return _load
+
+
+def test_the_explicit_override_never_reads_the_config(clean_env, monkeypatch):
+    """R17 模式 1：`APP_SITE_ALLOWLIST_JSON` 在场时**根本不加载** `[SessionKeys]`，也不碰 KMS。"""
+    monkeypatch.setenv("APP_SITE_ALLOWLIST_JSON",
+                       '{"site-rs-v1": {"alg": "RS256", "spki_b64": "AA", "role": "current"}}')
+
+    def _must_not_load():
+        raise AssertionError("显式覆盖时不该去读 config")
+
+    text = _fragment().load_site_allowlist(_must_not_load, kms=v.FakeKms())
+    assert '"spki_b64": "AA"' in text
+    monkeypatch.setenv("APP_SITE_ALLOWLIST_JSON", "{not json")
+    with pytest.raises(ValueError):
+        _fragment().load_site_allowlist(_must_not_load)
+
+
+def test_offline_synth_survives_a_config_that_cannot_be_loaded(clean_env, monkeypatch, capsys):
+    """R17 模式 2：显式离线 + 配置读不动 ⇒ 占位 allowlist + stderr 警告（那份模板不可部署）。"""
+    monkeypatch.setenv(OFFLINE_FLAG, "1")
+    text = _fragment().load_site_allowlist(_unloadable_keys(), kms=v.FakeKms())
     assert "SYNTH-ONLY-PLACEHOLDER-DO-NOT-DEPLOY" in text
     err = capsys.readouterr().err
     assert "WARNING" in err and "DO NOT deploy" in err
 
 
-def test_explicit_override_wins_and_is_validated_as_json(clean_env, monkeypatch):
-    monkeypatch.setenv("APP_SITE_ALLOWLIST_JSON", '{"site-hs-v1": {"alg": "HS256", "secret": "o", "role": "current"}}')
-    _fake_boto3(monkeypatch, error=RuntimeError("must not be called"))
-    mod = _load_site_allowlist_fn()
-    text, _ = mod.load_site_allowlist(_keys(site=[_ref("site-hs-v1")]))
-    assert '"secret": "o"' in text
-    monkeypatch.setenv("APP_SITE_ALLOWLIST_JSON", "{not json")
-    with pytest.raises(ValueError):
-        mod.load_site_allowlist(_keys(site=[_ref("site-hs-v1")]))
+def test_a_config_that_cannot_be_loaded_fails_synth_by_default(clean_env):
+    """R17 模式 3：没有覆盖、也没有显式离线 ⇒ `SessionKeysError` 原样抛，什么都不部署。"""
+    with pytest.raises(sk.SessionKeysError, match=r"SessionKeys"):
+        _fragment().load_site_allowlist(_unloadable_keys(), kms=v.FakeKms())
 
 
-@pytest.mark.parametrize("bad", ["a'''b", "a\\b"])
-def test_secret_that_would_break_the_injected_source_is_rejected(clean_env, monkeypatch, bad):
-    _fake_boto3(monkeypatch, {"/site-builder/session-keys/site-hs-v1": bad})
-    mod = _load_site_allowlist_fn()
-    with pytest.raises(ValueError, match="三引号|反斜杠"):
-        mod.load_site_allowlist(_keys(site=[_ref("site-hs-v1")]))
+def test_an_allowlist_that_would_break_the_injected_source_is_rejected(clean_env, monkeypatch):
+    """注进三引号字符串的文本里不许有反斜杠或三引号。
+
+    KMS 取来的 base64 天然不含它们，所以这条唯一还能被触发的入口是显式覆盖——**它仍然要拦**：
+    坏值进产物的后果是 Edge 源码语法错，而 Edge 回滚要 10-20 分钟全球复制。
+    """
+    for bad in (r'{"k": {"spki_b64": "a\\b"}}', "{\"k\": {\"spki_b64\": \"a'''b\"}}"):
+        monkeypatch.setenv("APP_SITE_ALLOWLIST_JSON", bad)
+        with pytest.raises(ValueError, match="三引号|反斜杠"):
+            _fragment().load_site_allowlist(_unloadable_keys())
 
 
-def test_legacy_secret_ssm_failure_fails_synth_by_default_too(clean_env, monkeypatch):
-    """两个注入函数对称：legacy 入口开着而 SSM 读不到，默认也让 synth 失败。"""
-    mod = _load_jwt_secret_fn()
-    broken = types.ModuleType("boto3")
+# ---- 3c-final：Edge 依赖的交叉安装（ADR 0003 / spec §11.1）--------------------------------------
+#
+# Edge 内嵌 verifier 现在 import cryptography，而 Lambda@Edge 没有层、也不能带环境变量 ⇒ 依赖必须
+# 在 synth 时按 hash 交叉装进 asset 目录。装的目标是 Lambda@Edge 的 python3.11 / x86_64，**不是**
+# 本机——用宿主 wheel 装出来的 cryptography 在运行时 import 失败（deployer 的 bundling 已被咬过）。
 
-    def _boom(*a, **k):
-        raise RuntimeError("ParameterNotFound")
 
-    broken.client = _boom
-    monkeypatch.setitem(_sys.modules, "boto3", broken)
-    with pytest.raises(Exception) as ei:
-        mod.load_jwt_secret(LIVE_LEGACY)
-    assert "ParameterNotFound" in str(ei.value) and OFFLINE_FLAG in str(ei.value)
+def test_vendoring_runs_hash_checked_cross_platform_pip_into_the_asset_dir(monkeypatch):
+    calls = []
+    monkeypatch.setattr(subprocess, "run",
+                        lambda cmd, **kw: calls.append(cmd) or type("R", (), {"returncode": 0})())
+    _fragment_vendor().vendor_edge_dependencies("/tmp/x")
+    assert len(calls) == 1, f"应当只调一次 pip，实际 {len(calls)} 次"
+    argv = calls[0]
+    for flag in ("--require-hashes", "--platform", "manylinux2014_x86_64", "--only-binary", ":all:",
+                 "--python-version", "3.11", "--implementation", "cp", "--target", "/tmp/x"):
+        assert flag in argv, flag
+    assert argv[argv.index("-r") + 1].endswith("lambda/requirements-edge.txt")
+    assert argv.index("--require-hashes") < argv.index("-r"), f"开关位置不对：{argv}"
+
+
+def test_vendoring_is_skipped_only_in_explicit_offline_synth_and_runs_before_the_asset_is_taken():
+    body = SRC[SRC.index("class WebRouterStack"):]
+    vend = body.index("vendor_edge_dependencies(temp_dir)")
+    asset = body.index("lambda_.Code.from_asset(temp_dir)")
+    assert vend < asset
+    assert "if not _synth_offline():" in body[vend - 200:vend]
+
+
+def test_vendoring_targets_the_edge_runtime_not_the_host():
+    """交叉装的三个开关与 auth / panel 的产物同款，只有 python-version 不同（Edge 是 3.11）。
+
+    AST 那侧的守卫在 `auth/tests/test_requirements_locked.py`（与 deploy_auth 那条同一套做法）；
+    这条钉的是"清单路径与 Edge 运行时版本一致"——`lambda_.Runtime.PYTHON_3_11` 与
+    `--python-version 3.11` 分叉的症状是 Edge 冷启动 import 失败（全站 502）。
+    """
+    fn = SRC[SRC.index("def vendor_edge_dependencies"):SRC.index("class WebRouterStack")]
+    assert "3.11" in fn and "3.12" not in fn and "3.13" not in fn
+    assert "PYTHON_3_11" in SRC[SRC.index("class WebRouterStack"):]
+    assert 'EDGE_REQUIREMENTS = Path(__file__).parent / "lambda" / "requirements-edge.txt"' in SRC
 
 
 # ---- 3c-1B ticket 21：注入表漏项必须让 synth 失败（惰性解析只缩小半径，不该让坏产物出得去）----

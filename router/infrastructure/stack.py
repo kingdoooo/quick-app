@@ -6,6 +6,7 @@ CloudFront-based dynamic subdomain routing system using Lambda@Edge and DynamoDB
 import os
 import configparser
 import json
+import subprocess
 import sys
 import tempfile
 import shutil
@@ -109,61 +110,6 @@ def assert_edge_source_fully_injected(src: str) -> str:
     return src
 
 
-def load_jwt_secret(legacy_param: str) -> str:
-    """Deploy-time **legacy-entry** secret injection for the edge function.
-
-    3c-1B（spec §11.8.1）：参数路径来自 `[SessionKeys] legacy_param`（唯一真源），
-    **不再硬编码** `/site-builder/jwt-secret`——硬编码与真源分叉时，闸门盯着一把密钥而
-    Edge 注入的是另一把，两边都不报错。**路径必须由调用方传入**（不给默认值，也不在这里
-    自己读一次 config）：调用方已经加载过 `SessionKeys`，多一条"自己读"的路就多一份可能
-    与它不一致的取值，而"两个注入值来自同一份解析"正是这次要保证的性质。
-
-    Resolution order:
-    1. `legacy_param` 为**空**（L3：legacy 入口已关闭）→ 空串，且**不打警告**。
-       空串**不是** SYNTH 占位符：`verify_deployed_edge.sh` 的两条占位符断言看的是
-       `SYNTH-ONLY-PLACEHOLDER` 字样与未替换的 `{{…}}`，空替换不会误报。
-       Edge 在 `LEGACY_ENTRY=off` 下根本不读这个常量（1A 已按开关分支）。
-    2. `APP_JWT_SECRET` environment variable (explicit override)
-    3. SSM SecureString parameter at `legacy_param` (us-east-1)
-    4. SSM read failure (unreachable / parameter missing / boto3 not
-       installed): **synth fails** (RuntimeError) — nothing gets deployed
-       (3c-1B ticket 19, merged review M12). Only with an explicit
-       `APP_SYNTH_OFFLINE=1` does it fall back to the synth-only
-       placeholder so `cdk synth` can run offline; that template MUST NOT
-       be deployed (verify_deployed_edge.sh catches the marker). Real
-       deployments must have the SSM parameter in place
-       (ensure_session_keys.py creates it).
-
-    **第 1 条与第 4 条必须分得开**：两者都让 Edge 拒绝 legacy token，但一个是刻意的
-    （入口已关闭，无 legacy token 还在流通），另一个是故障（SSM 读不到，线上现存的
-    legacy cookie 全部失效）。把"刻意为空"也走占位符路径会让 L3 的每次部署都被
-    产物核对判红，而真故障反而被当成日常。
-    """
-    if not legacy_param:
-        return ""
-    env_secret = os.getenv("APP_JWT_SECRET")
-    if env_secret:
-        return env_secret
-    try:
-        import boto3
-        ssm = boto3.client("ssm", region_name="us-east-1")
-        return ssm.get_parameter(
-            Name=legacy_param, WithDecryption=True
-        )["Parameter"]["Value"]
-    except Exception as exc:  # noqa: BLE001
-        if not _synth_offline():
-            raise RuntimeError(
-                f"读 SSM {legacy_param} 失败（{type(exc).__name__}: {exc}）——synth 拒绝生成模板，什么都不会部署。"
-                "这是 cdk deploy 路径：先修凭据/参数再重跑；离线只看模板请显式设 APP_SYNTH_OFFLINE=1"
-                "（产物会带 SYNTH-ONLY 标记，不可部署）或用 APP_JWT_SECRET 覆盖。") from exc
-        print(
-            f"WARNING: could not read SSM {legacy_param} ({exc}); "
-            "APP_SYNTH_OFFLINE=1 ⇒ using a synth-only placeholder. DO NOT deploy this template.",
-            file=sys.stderr,
-        )
-        return "SYNTH-ONLY-PLACEHOLDER-DO-NOT-DEPLOY"
-
-
 def _session_keys_on_path() -> Path:
     """把 `site-builder/auth` 放进 `sys.path` 并返回仓库根。
 
@@ -191,57 +137,111 @@ def _session_keys():
     return load_session_keys(root / "site-builder" / "config.ini")
 
 
-def load_site_allowlist(keys) -> tuple:
-    """3c-1A：Edge 只认 site family 的 kid allowlist（spec §4.1 / §11.6）。
+def load_site_allowlist(keys, *, kms=None) -> str:
+    """3c-final：Edge 只认 site family 的 RS256 公钥 allowlist（spec §4.1 / §11.6）。
 
-    `keys` 是**必填**的已加载 `SessionKeys`（由调用方与 `load_jwt_secret` 共用同一份，
-    见 `WebRouterStack.__init__`）——本函数不自己再读一次 config。
+    → JSON 文本 `kid -> {"alg": "RS256", "spki_b64": <base64 DER SPKI>, "role"}`。每把 key 在这里过 spec §11.6
+    第 1 层的四项校验（DescribeKey 三项 + 指纹 == config；session_kms.fetch_verified_public_key_der），任一不符
+    **任何模式都抛**——那不是"读不到"，是配置指错了 key。**只取 site family，console 的公钥不进 Edge**
+    （公钥不是秘密，但"接受哪些 key"本身就是授权边界）。
 
-    → (allowlist_json, legacy_entry)。kid 清单来自 `site-builder/config.ini` 的 [SessionKeys]
-    （唯一取值来源，经 site-builder/auth/session_keys.py 校验，缺段/写错即 synth 失败），
-    secret 值按每行的 ssm_param 从 SSM 取；**只取 site family，console 的 key 不进 Edge**。
-    legacy 开关：legacy_param 非空即 "on"，为空即 "off"（清空它 = 3c-1B 的 L3，关闭入口）。
+    `keys` 可以是已加载的 `SessionKeys`，也可以是**取值函数**（controller R17）：`WebRouterStack` 传的是后者，
+    因为"只想看模板"的两条路——显式覆盖与显式离线——必须在 `[SessionKeys]` **根本加载不动**时仍然走得通
+    （切换窗口里 site-builder/config.ini 还是旧形态）。急加载会让 `SessionKeysError` 在进本函数之前就抛出来。
 
-    SSM 读失败沿用 load_jwt_secret 的语义（见 `_synth_offline`）：**默认让 synth 失败**；只有显式
-    `APP_SYNTH_OFFLINE=1` 才注入带 SYNTH-ONLY 标记的占位 allowlist 并在 stderr 警告，该模板**绝不能部署**
-    （verify_deployed_edge.sh 会抓到标记）。非 HS256 行是配置错，任何模式都抛。
+    三类失败，三种处置（`_degrade` 是唯一的退化点）：
+    1. **配置写错**——非 RS256 行、或 KMS 里的 key 与配置声明的不是同一把（`KeyMaterialMismatch`）：
+       **任何模式都抛**，绝不注占位。那不是"读不到"，是指错了 key。
+    2. **配置读不动 / 依赖装不上 / KMS 调不通**：默认让 synth 失败（什么都不部署）；只有显式
+       `APP_SYNTH_OFFLINE=1` 才注入带 SYNTH-ONLY 标记的占位 allowlist 并在 stderr 警告，
+       该模板**绝不能部署**（verify_deployed_edge.sh 会抓到标记）。
+    3. `APP_SITE_ALLOWLIST_JSON` 在场 ⇒ 用它，**根本不加载配置、不碰 KMS**（离线 synth / 测试）。
+
+    `import session_kms` **刻意放在取公钥那一步里、不在函数顶部**：它拖着 cryptography 闭包，而离线 synth
+    的解释器（router/infrastructure/.venv）里没有那个包——放顶部会让"只想看模板"这条路死在 import 上，
+    而那正是 R17 要保住的路。
     """
-    _session_keys_on_path()          # 无条件放路径：不依赖调用方是否先调过 _session_keys()
-    from session_keys import SYNTH_PLACEHOLDER_ALLOWLIST_JSON, legacy_entry
-    override = os.getenv("APP_SITE_ALLOWLIST_JSON")   # 与 APP_JWT_SECRET 同款的显式覆盖（离线 synth / 测试）
+    _session_keys_on_path()
+    from session_keys import SYNTH_PLACEHOLDER_ALLOWLIST_JSON, SessionKeysError
+
+    def _degrade(reason_cn: str, reason_en: str, exc: Exception, fix: str = "",
+                 *, reraise: bool = False) -> str:
+        """**唯一**的退化点：默认让 synth 失败，显式离线才注占位。
+
+        `reraise` 给配置本身读不动的那一路——`SessionKeysError` 的消息已经指名道姓（缺哪个键、
+        哪个小节），再包一层只会把它推远。
+        """
+        if not _synth_offline():
+            if reraise:
+                raise exc
+            raise RuntimeError(
+                f"{reason_cn}（{type(exc).__name__}: {exc}）——synth 拒绝生成模板，什么都不会部署。{fix}"
+                "离线只看模板请显式设 APP_SYNTH_OFFLINE=1（产物带 SYNTH-ONLY 标记，不可部署）"
+                "或用 APP_SITE_ALLOWLIST_JSON 覆盖。") from exc
+        print(f"WARNING: {reason_en} ({exc}); APP_SYNTH_OFFLINE=1 ⇒ injecting the SYNTH-ONLY "
+              "placeholder allowlist. DO NOT deploy this template.", file=sys.stderr)
+        return SYNTH_PLACEHOLDER_ALLOWLIST_JSON
+
+    override = os.getenv("APP_SITE_ALLOWLIST_JSON")   # 显式覆盖（离线 synth / 测试）
     if override:
         text = override
     else:
-        site_refs = list(keys.allowlist("site"))
-        for ref in site_refs:                      # 配置校验在 try 之外：写错不是"读不到"，任何模式都抛
-            if ref.alg != "HS256":
-                raise ValueError(f"{ref.kid}: 3c-1A 的 Edge 只支持 HS256 行（RS 行是 3c-2B）")
         try:
-            import boto3
-            ssm = boto3.client("ssm", region_name="us-east-1")
-            allow = {}
-            for ref in site_refs:
-                val = ssm.get_parameter(Name=ref.ssm_param, WithDecryption=True)["Parameter"]["Value"]
-                allow[ref.kid] = {"alg": ref.alg, "secret": val, "role": ref.role}
-            text = json.dumps(allow, separators=(",", ":"))
-        except Exception as exc:  # noqa: BLE001
-            if not _synth_offline():
-                raise RuntimeError(
-                    f"按 [SessionKeys] 从 SSM 组装 site allowlist 失败（{type(exc).__name__}: {exc}）——synth 拒绝生成"
-                    "模板，什么都不会部署。这是 cdk deploy 路径：先确认 ensure_session_keys.py 已建参数、凭据可读；"
-                    "离线只看模板请显式设 APP_SYNTH_OFFLINE=1（产物带 SYNTH-ONLY 标记，不可部署）"
-                    "或用 APP_SITE_ALLOWLIST_JSON 覆盖。") from exc
-            print(f"WARNING: could not build the site allowlist from SSM ({exc}); APP_SYNTH_OFFLINE=1 ⇒ "
-                  "injecting the SYNTH-ONLY placeholder allowlist. DO NOT deploy this template.",
-                  file=sys.stderr)
-            text = SYNTH_PLACEHOLDER_ALLOWLIST_JSON   # 合法 JSON、带标记、kid 永不匹配（session_keys 里有说明）
+            site_refs = list((keys() if callable(keys) else keys).allowlist("site"))
+        except SessionKeysError as exc:
+            text = _degrade("读 [SessionKeys] 失败", "could not load [SessionKeys]", exc, reraise=True)
+            site_refs = None
+        if site_refs is not None:
+            for ref in site_refs:      # 已加载成功的行：非 RS256 是配置错，在 try 之外 ⇒ 任何模式都抛
+                if ref.alg != "RS256":
+                    raise ValueError(f"{ref.kid}: Edge 只支持 RS256 行（3c-final）")
+            try:
+                import boto3
+                import session_kms
+            except ImportError as exc:
+                text = _degrade("synth 取公钥要 boto3 与 cryptography（session_kms 的闭包）",
+                                "boto3/cryptography missing in the synth interpreter", exc,
+                                "先给 router/infrastructure/.venv 装 requirements.txt（bootstrap_venvs.sh "
+                                "--only router/infrastructure）；")
+            else:
+                try:
+                    kms = kms or boto3.client("kms", region_name="us-east-1")
+                    allow = {ref.kid: {"alg": ref.alg,
+                                       "spki_b64": session_kms.spki_b64(
+                                           session_kms.fetch_verified_public_key_der(kms, ref)),
+                                       "role": ref.role} for ref in site_refs}
+                    text = json.dumps(allow, separators=(",", ":"))
+                except session_kms.KeyMaterialMismatch:
+                    raise          # 配置指错 key（或 key 被换过）：任何模式都不注占位
+                except Exception as exc:  # noqa: BLE001
+                    text = _degrade("按 [SessionKeys] 从 KMS 取 site 公钥失败",
+                                    "could not fetch site public keys from KMS", exc,
+                                    "这是 cdk deploy 路径：先确认 deployer 栈已建 CMK、凭据有 "
+                                    "kms:DescribeKey / GetPublicKey；")
     if "\'\'\'" in text or "\\" in text:
         raise ValueError("allowlist JSON 含三引号或反斜杠，注进三引号字符串会破坏 Edge 源码")
     # 注入前保证是合法 JSON。ticket 21 之后 Edge 侧是惰性解析（不合法只让"带 cookie 的私有
     # 请求"500，不再是 import 期整个分发 502），但这条**仍然是最该拦住它的地方**：
     # 坏值根本不该进产物，Edge 回滚要 10-20 分钟全球复制。
     json.loads(text)
-    return text, legacy_entry(keys)
+    return text
+
+
+EDGE_REQUIREMENTS = Path(__file__).parent / "lambda" / "requirements-edge.txt"
+
+
+def vendor_edge_dependencies(target_dir: str) -> None:
+    """把 Edge 的锁定依赖（cryptography 闭包）按 hash 交叉装进 asset 目录（ADR 0003 / spec §11.1）。
+
+    与 deploy_auth.build_zip / deploy_panel._build_zip 同一套开关，目标换成 Lambda@Edge 的
+    python3.11 / x86_64（**不是本机**：宿主 wheel 装出来的 cryptography 在 Edge 运行时 import
+    失败，而那是全站 502）。`--require-hashes` 是全量语义，清单里任何一个包缺 hash 都会让这条
+    install 直接失败——守卫在 auth/tests/test_requirements_locked.py（清单 + 本函数的 argv）。
+    """
+    subprocess.run([sys.executable, "-m", "pip", "install", "--require-hashes",
+                    "-r", str(EDGE_REQUIREMENTS), "--target", target_dir, "-q",
+                    "--platform", "manylinux2014_x86_64", "--only-binary", ":all:",
+                    "--python-version", "3.11", "--implementation", "cp"], check=True)
 
 
 class WebRouterStack(Stack):
@@ -353,14 +353,15 @@ class WebRouterStack(Stack):
             config.get("DynamoDB", "region", "APP_DYNAMODB_REGION")
         )
 
-        # Site-builder placeholders (Task 6/7). JWT secret comes from SSM at
-        # deploy time (see load_jwt_secret); the bucket lives in us-east-1
+        # Site-builder placeholders (Task 6/7). The frontend bucket lives in us-east-1
         # (Lambda@Edge SigV4 in origin_request.py signs for us-east-1).
-        # `[SessionKeys]` 只解析一遍，两个注入值都从同一份取——分开各读一次的话，
-        # 中途改 config 会让 Edge 拿到自相矛盾的 (allowlist, legacy secret) 组合。
-        session_keys = _session_keys()
-        jwt_secret = load_jwt_secret(session_keys.legacy_param)
-        site_allowlist_json, legacy_entry = load_site_allowlist(session_keys)
+        # 3c-final 起 Edge 拿到的是 site family 的 **RS256 公钥** allowlist：公钥在 synth 时按
+        # [SessionKeys] 的 key_arn 从 KMS 取、过四项校验（load_site_allowlist）——Edge 手里再没有
+        # 任何能签发的材料。
+        # 传的是**取值函数**而不是取好的值（controller R17）：显式覆盖与显式离线这两条"只想看
+        # 模板"的路必须在 `[SessionKeys]` 根本加载不动时仍然走得通，急加载会先炸在这一行。
+        session_keys = _session_keys
+        site_allowlist_json = load_site_allowlist(session_keys)
         # 两个值都要在 synth 时验证——它们控制的是 org 语义在请求路径上的
         # 唯一执行点，配错的代价不对称：
         # ① configparser 默认**保留行内注释**（inline_comment_prefixes=()）：
@@ -397,9 +398,7 @@ class WebRouterStack(Stack):
         lambda_code = (lambda_code
             .replace("{{FRONTEND_BUCKET_DOMAIN}}",
                      f"{frontend_bucket}.s3.us-east-1.amazonaws.com")
-            .replace("{{JWT_SECRET}}", jwt_secret)
             .replace("{{SITE_ALLOWLIST_JSON}}", site_allowlist_json)
-            .replace("{{LEGACY_ENTRY}}", legacy_entry)
             .replace("{{BASE_DOMAIN}}", base_domain)
             .replace("{{REQUIRE_IDP_CLAIM}}", require_idp_claim)
             .replace("{{TRUSTED_IDPS}}", trusted_idps)
@@ -412,6 +411,14 @@ class WebRouterStack(Stack):
         temp_dir = tempfile.mkdtemp()
         with open(os.path.join(temp_dir, 'index.py'), 'w') as f:
             f.write(lambda_code)
+
+        # Edge 内嵌 verifier 现在 import cryptography（RS256 验签），而 Lambda@Edge 既没有层
+        # 也不能带环境变量 ⇒ 依赖必须在这里按 hash 交叉装进 asset 目录（ADR 0003 / spec §11.1）。
+        # **离线 synth 跳过**（装依赖要联网）：那条路的产物本来就带 SYNTH-ONLY 标记、不可部署，
+        # 少一个 cryptography/ 目录是同一件事的一部分。真产物里有没有它由
+        # verify_deployed_edge.sh 事后核对。
+        if not _synth_offline():
+            vendor_edge_dependencies(temp_dir)
 
         # Lambda@Edge function
         edge_function = lambda_.Function(
