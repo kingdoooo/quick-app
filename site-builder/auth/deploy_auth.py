@@ -1,7 +1,13 @@
-"""部署 auth-service：打 zip（session.py+login_handler.py+pyjwt 依赖）→ 建/更新 Lambda
-→ Function URL(AWS_IAM，仅 Edge role 可调) → 生成 JWT_SECRET 存 SSM
-→ 路由表注册 subdomain=auth → pre-token-generation 触发器（email 注入 access
-token，部署 MCP 的 owner 识别依赖它）。幂等可重跑。"""
+"""部署 auth-service：打 zip（login_handler.py + session.py + session_kms.py + verifier_env.py + 锁定依赖）
+→ 建/更新 Lambda → Function URL(AWS_IAM，仅 Edge role 与 verifier 角色可调) → 路由表注册 subdomain=auth
+→ pre-token-generation 触发器（email 注入 access token，部署 MCP 的 owner 识别依赖它）。幂等可重跑。
+
+3c-final：会话签名密钥是两把 KMS 非对称 CMK（deployer 栈建），本脚本**不再生成任何会话密钥**——
+它只在第一次写之前核对每个 RS kid 的 KMS 四项（`session_kms.precheck_keys`，spec §11.6 第 1 层），
+并给执行角色授 `kms:Sign`（带算法与 `MessageType` 两个条件）+ `kms:GetPublicKey` 的精确 key ARN。
+唯一还由本脚本 ensure 的 SSM 密钥是 auth 私有的 login-flow HMAC（spec §11.3 / ADR 0004）。
+`[Verification]`（spec §11.7）开着时另建 `site-builder-verifier` 角色，并把它的两条 invoke 语句
+交给共享的 Function URL 收敛。"""
 import configparser
 import io
 import json
@@ -12,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import boto3
@@ -19,11 +26,13 @@ import boto3
 # 共享的 Function URL resource policy 实现（三个平台脚本 + 闸门共用；构建期 import，不进 auth 的部署包）
 sys.path.insert(0, str(Path(__file__).parent.parent / "deployer" / "functions"))
 sys.path.insert(0, str(Path(__file__).parent))   # 被 verify_deployed_components 按路径加载时也能找到同目录模块
+import session_kms
+
 from alarm_pipeline import ensure_alarm_pipeline
 from function_url_policy import converge as converge_function_url_policy
 from function_url_policy import expected_statements as function_url_statements
 from secrets_util import ensure_secret as _ensure_secret, precheck_parameters
-from session_keys import (env_json, legacy_entry, load_session_keys, ssm_parameter_arns,
+from session_keys import (env_json, key_refs, kms_key_arns, load_session_keys, ssm_parameter_arns,
                           ssm_parameter_names)
 
 FN = "site-auth-service"
@@ -88,6 +97,11 @@ def _iam():
     return _client("iam", regional=False)
 
 
+def _kms():
+    """3c-final：部署前四项校验的 KMS client（本脚本只读 DescribeKey / GetPublicKey，从不签名）。"""
+    return _client("kms")
+
+
 def ensure_secret(name: str, generate) -> str:
     # 单一实现在 secrets_util.py（scripts/ensure_session_keys.py 也用它）；这里只是绑定本脚本的 client
     return _ensure_secret(name, generate, ssm=_ssm())
@@ -117,21 +131,89 @@ def build_zip() -> bytes:
         return buf.getvalue()
 
 
-JWT_SECRET_PARAM = "/site-builder/jwt-secret"
 # 进包的本地模块（handler + 它 import 的同目录模块）；与 panel 的 COPY_FILES 同一种"清单以闭包断言为准"的纪律
 AUTH_PACKAGE_MODULES = ("login_handler.py", "session.py", "verifier_env.py", "session_kms.py")
 CLIENT_SECRET_PARAM = "/site-builder/site-client-secret"
+
+# ---- `[Verification]`：验收夹具签发器与它的调用者（spec §11.7 / ADR 0002）--------------------
+VERIFIER_ROLE_NAME = "site-builder-verifier"
+_PRINCIPAL_RE = re.compile(r"^arn:aws:iam::(\d{12}):(role|user)/[^*?]+$")
+
+
+@dataclass(frozen=True)
+class Verification:
+    fixture_issuer: bool
+    trusted_principals: tuple
+
+
+def read_verification(c: configparser.ConfigParser, *, account: str) -> Verification:
+    """`[Verification]`（spec §11.7）。段缺失 = 组件不存在（fixture_issuer=False）。开着时清单必须非空、每项都是
+    **本账号**的精确 role/user ARN——通配会让"谁能签夹具会话"变成账号内任何人，而那是一条冒充路径。"""
+    if not c.has_section("Verification"):
+        return Verification(False, ())
+    flag = c.get("Verification", "fixture_issuer", fallback="false").split("#")[0].strip().lower()
+    if flag not in ("true", "false"):
+        raise SystemExit(f"config.ini [Verification] fixture_issuer 必须是 true/false（当前 {flag!r}）")
+    raw = c.get("Verification", "verifier_trusted_principals", fallback="").split("#")[0]
+    principals = tuple(p.strip() for p in raw.split(",") if p.strip())
+    if flag == "false":
+        return Verification(False, ())
+    bad = [p for p in principals if not _PRINCIPAL_RE.match(p) or _PRINCIPAL_RE.match(p).group(1) != account]
+    if not principals or bad:
+        raise SystemExit("config.ini [Verification] verifier_trusted_principals 必须是本账号精确 role/user ARN 的"
+                         f"非空清单（不接受通配），拒绝部署（任何写都未发生）：坏项 {bad}，共 {len(principals)} 项")
+    return Verification(True, principals)
+
+
+def ensure_verifier_role(iam, verification: Verification, *, account: str, region: str):
+    """`site-builder-verifier`（spec §11.7）：开 ⇒ 建 / 收敛并返回 ARN；关 ⇒ 存在则删并返回 None。
+    信任策略只列显式 ARN，会话上限 1 小时；权限只有对 auth 函数的两条 invoke（与 edge role 同形）。"""
+    fn_arn = f"arn:aws:lambda:{region}:{account}:function:{FN}"
+    try:
+        iam.get_role(RoleName=VERIFIER_ROLE_NAME)
+        exists = True
+    except iam.exceptions.NoSuchEntityException:
+        exists = False
+    if not verification.fixture_issuer:
+        if exists:
+            # inline policy 可能已经不在（上一次 create_role 成功、put_role_policy 没写成的半失败状态）。
+            # 对它抛 NoSuchEntity 会让"关掉夹具组件"把**整个 auth 部署**堵死（本函数在 deploy_function 之前），
+            # 而这里想要的终态就是角色消失——所以缺 policy 不是错误，缺了照样往下删角色
+            # （IAM 不允许删还带 inline policy 的角色，所以这一步不能跳过）。
+            try:
+                iam.delete_role_policy(RoleName=VERIFIER_ROLE_NAME, PolicyName="invoke-auth-function-url")
+            except iam.exceptions.NoSuchEntityException:
+                pass
+            iam.delete_role(RoleName=VERIFIER_ROLE_NAME)
+            print(f"  [Verification] 已关闭：删除角色 {VERIFIER_ROLE_NAME}")
+        return None
+    trust = json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": {"AWS": list(verification.trusted_principals)},
+        "Action": "sts:AssumeRole"}]})
+    if exists:
+        iam.update_assume_role_policy(RoleName=VERIFIER_ROLE_NAME, PolicyDocument=trust)
+        iam.update_role(RoleName=VERIFIER_ROLE_NAME, MaxSessionDuration=3600)
+    else:
+        iam.create_role(RoleName=VERIFIER_ROLE_NAME, AssumeRolePolicyDocument=trust, MaxSessionDuration=3600,
+                        Description="site-builder acceptance verifier - may only call POST /fixture-session on the auth function")
+    iam.put_role_policy(RoleName=VERIFIER_ROLE_NAME, PolicyName="invoke-auth-function-url",
+        PolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": [
+            {"Sid": "InvokeAuthUrl", "Effect": "Allow", "Action": "lambda:InvokeFunctionUrl",
+             "Resource": fn_arn, "Condition": {"StringEquals": {"lambda:FunctionUrlAuthType": "AWS_IAM"}}},
+            {"Sid": "InvokeAuthViaUrl", "Effect": "Allow", "Action": "lambda:InvokeFunction",
+             "Resource": fn_arn, "Condition": {"StringEquals": {"lambda:FunctionUrlAuthType": "AWS_IAM"}}}]}))
+    if not exists:
+        import time; time.sleep(10)
+    return f"arn:aws:iam::{account}:role/{VERIFIER_ROLE_NAME}"
 
 
 def lambda_env() -> dict:
     """Lambda 环境变量：**只下发参数名，不下发密钥明文**。
 
     `lambda:GetFunctionConfiguration` 会原样回显环境变量（部署时实测确认），
-    而那是个常见的只读权限。三个 `*_PARAM` 都只是参数名，值运行时才读。
-    JWT_SECRET 泄漏尤其致命——Edge 只验 HS256 签名，
-    拿到它即可伪造任意用户的会话 cookie，绕过 owner / allowed_users /
-    collaborators 全部判定。运行时由 login_handler._secret() 从 SSM
-    SecureString 读并在容器内缓存。
+    而那是个常见的只读权限。两个 `*_PARAM` 都只是参数名，值运行时才读
+    （login_handler._secret() 从 SSM SecureString 读并在容器内缓存）。
+    3c-final 起会话签名密钥在 KMS 里，环境变量只有 kid / key_arn / spki_sha256。
     """
     keys = load_session_keys(CFG_PATH)
     env = {
@@ -150,53 +232,35 @@ def lambda_env() -> dict:
         # 环境变量缺失、代码回落默认值（true），行为仍然安全，但配置里写的
         # false 不生效——运维会以为关掉了却没关。
         "REQUIRE_EMAIL_VERIFIED": _require_email_verified_cfg(),
-        # 3c-1A：两个 family 的 kid 清单（**只有参数名**，值运行时按参数名读 SSM）与 legacy 入口开关。
+        # 3c-final：两个 family 的 kid 清单（kid / alg / role / key_arn / spki_sha256，**没有任何密钥材料**）。
         # 形态由 auth/session_keys.py 唯一定义；panel 的那份只含 console（各自 verifier 各自的 allowlist）。
         "SESSION_KEYS_JSON": env_json(keys, ("site", "console")),
-        "LEGACY_ENTRY": legacy_entry(keys),
-        # 3c-1B：签发形态开关（spec §11.8.3）。真源是 [SessionKeys] signer；回滚 = 改那一行重跑
-        # 本脚本（先 panel 后 auth）。verify_deployed_components 按"env 整体 == lambda_env()"
-        # 比对，所以这一项自动入闸，不需要在那边点名。
-        "SESSION_SIGNER": keys.signer,
+        # 夹具签发器开关（spec §11.7）：`POST /fixture-session` 只在 "on" 时存在。真源是 [Verification]
+        # fixture_issuer；verify_deployed_components 按"env 整体 == lambda_env()"比对，所以这一项自动入闸。
+        "FIXTURE_ISSUER": "on" if read_verification(cfg(), account=cfg()["Platform"]["account_id"]).fixture_issuer else "off",
     }
-    # legacy 参数名的唯一真源是 [SessionKeys] legacy_param（role 的精确 ARN 清单也从它推导；
-    # 两处分叉的症状是运行时 AccessDenied）。**L3（清空它）之后整个键不下发**，而不是下发空串：
-    # `_secret("JWT_SECRET")` 走的是 `{name}_PARAM` 约定，键存在但值为空会让它抛"无来源"，
-    # 与"入口已关闭所以谁也不该来取"这个事实对不上；键不在才是 fail-closed 的表达。
-    # 取值路径本身在 LEGACY_ENTRY=off 时根本不会被调用（verifier_env.legacy_secret 返回 None）。
-    if keys.legacy_param:
-        env["JWT_SECRET_PARAM"] = keys.legacy_param
     return {"Variables": env}
 
 
 def required_parameters() -> list:
-    """部署前必须已存在的 SSM 参数：本函数要读、但**不是本脚本创建**的那些——两个 family 的 HS 行
-    （scripts/ensure_session_keys.py 建）与 site client secret（deploy_pool 建）。与 role 的 ARN 清单
-    同一上游（ssm_parameter_names）。
+    """部署前必须已存在的 SSM 参数：只剩 deploy_pool 建的 site client secret。login-flow 由本脚本 ensure（ADR 0004，
+    只有 auth 一个消费方，排除是安全的）；会话签名密钥在 KMS，由 precheck() 里的 session_kms.precheck_keys 四项校验。
 
-    `owned` 里那两个由本脚本自己 `ensure_secret`，核对它们等于让这条缺省补建永远走不到（首次部署必然被
-    自己拒掉）。核对的意义是"**多个**消费方必须就同一个值达成一致，所以不能由本脚本随手造一把"：
-    - login-flow：只有 auth 一个消费方（panel 与 Edge 永不持有），auth 自己造一把随机值完全正确，
-      所以这条排除是**安全**的；
-    - legacy 参数：同一条排除，但**并不安全，这是一个已知缺口**（3c-1A 的既定取舍，非本票引入）。
-      它有**第二个**消费方——Edge 那份是 CDK 部署时字符串替换注入的。成熟部署上它若被删，本脚本会
-      造一把新的而 Edge 仍拿着旧的 ⇒ 正是 precheck 本要防的全员登录循环。今天唯一的现场信号是
-      `ensure_secret` 创建时打的那一行（见它的 docstring）；真正的修复要区分"首次部署"与"参数不该
-      不存在"，那是独立的设计面，不在 1B 范围内。
-      **这一条与 spec §11.8.12 的字面清单有意不同**，裁定真源是
-      `docs/adr/0004-login-flow-secret-outside-the-pre-write-precheck.md`
-      （照 §11.8.12 原话把它加回清单会让首次部署失败）。
+    **与 spec §11.8.12 的字面清单有意不同**，裁定真源是
+    `docs/adr/0004-login-flow-secret-outside-the-pre-write-precheck.md`：核对 login-flow 等于让本脚本对它的
+    缺省补建永远走不到（首次部署必然被自己拒掉）。核对的意义是"**多个**消费方必须就同一个值达成一致，
+    所以不能由本脚本随手造一把"——login-flow 只有 auth 一个消费方（panel 与 Edge 永不持有它，spec §11.3）。
+    与 role 的 ARN 清单同一上游（ssm_parameter_names），两处不会分叉。
     """
     keys = load_session_keys(CFG_PATH)
-    owned = {keys.legacy_param, keys.login_flow_secret_param}
-    return [p for p in ssm_parameter_names(keys, ("site", "console"), login_flow=True,
-                                           extra=(CLIENT_SECRET_PARAM,))
-            if p not in owned]
+    return [p for p in ssm_parameter_names(keys, ("site", "console"), login_flow=True, extra=(CLIENT_SECRET_PARAM,))
+            if p != keys.login_flow_secret_param]
 
 
 def precheck() -> None:
-    """spec §11.8.12：第一次写之前核对（只读、不解密、不打印值）。缺任一参数即 SystemExit。"""
-    precheck_parameters(required_parameters(), ssm=_ssm())
+    """第一次写之前：SSM 参数存在 + 每个 RS kid 的 KMS 四项（spec §11.6 第 1 层 / §11.8.12）。只读、不打印值。"""
+    precheck_parameters(required_parameters(), ssm=_ssm(), hint="client secret 由 scripts/deploy_pool.py 创建；先跑它。")
+    session_kms.precheck_keys(_kms(), key_refs(load_session_keys(CFG_PATH), ("site", "console")))
 
 
 def edge_role_arn() -> str:
@@ -214,9 +278,10 @@ def edge_role_arn() -> str:
 
 
 def deploy_function(lam, *, role_arn: str, env: dict, code: bytes) -> None:
-    """**先配置、后代码**（spec §11.8.3）：1B 的 env 变化都是新增变量——旧代码忽略新变量无害，而新代码
-    缺新变量会 500 几秒（1A 那次 502 的同一窗口形状）。L3 删 JWT_SECRET_PARAM 时旧代码在那几秒里也不会
-    碰它（signer 已是 current、legacy 分支只在无 kid token 上走）。两步各自等 function_updated。"""
+    """**先配置、后代码**（spec §11.8.3）：旧代码忽略新变量无害，而新代码缺新变量会 500 几秒
+    （2026-09-02 那次 502 的同一窗口形状）。3c-final 这次两侧都变——新代码要 `SESSION_KEYS_JSON` 的 RS 行，
+    而 HS 时代那三个键同时消失——所以顺序反过来的窗口是"新代码 + 旧 env"，即整段登录 500。
+    两步各自等 function_updated。"""
     try:
         lam.get_function(FunctionName=FN)
         lam.update_function_configuration(FunctionName=FN, Environment=env)
@@ -236,19 +301,21 @@ def main():
     #    且 Function URL 要授权的 edge role 必须是一个精确的 role ARN（缺 / 通配即中止）。
     precheck()
     edge_arn = edge_role_arn()
-    # 密钥仍在这里**确保存在**（首次部署要生成 JWT secret），但只写进 SSM，
-    # 不进环境变量——运行时由 login_handler._secret() 去读。
+    # `[Verification]`（spec §11.7）也在**任何写之前**读：清单空 / 含通配 / 跨账号一律 SystemExit，
+    # 否则一个写宽了的信任策略要等到角色已经建好才被发现。
+    verification = read_verification(cfg(), account=cfg()["Platform"]["account_id"])
     keys = load_session_keys(CFG_PATH)
-    # L3 之后 legacy_param 为空：**不建、也不碰**那把密钥（参数本体到 3c-3 才删）。
-    # 不加这个判断的话 ensure_secret 会拿空名字去 put_parameter，AWS 侧报一个读不懂的 ValidationException。
-    if keys.legacy_param:
-        ensure_secret(keys.legacy_param, lambda: secrets.token_hex(32))
-    # login-flow secret（3c-1B）：主创建点是 scripts/ensure_session_keys.py（部署序列第①步一次
+    # login-flow secret（spec §11.3）：主创建点是 scripts/ensure_session_keys.py（部署序列第①步一次
     # 建齐 config 声明的所有密钥），这里是**缺省补建**（spec §11.8.6 把它叫「兜底」）——
-    # 两处都只创建不覆盖，先跑哪个都一样。
+    # 两处都只创建不覆盖，先跑哪个都一样。**它是本脚本唯一还 ensure 的密钥**：会话签名密钥是
+    # KMS 里的 CMK（deployer 栈建），本脚本只在 precheck 里核对它们。
     # 覆盖它的后果是所有**进行中**的登录失败一次（已签发的会话不受影响），见 _login_flow_sig 的说明。
     ensure_secret(keys.login_flow_secret_param, lambda: secrets.token_hex(32))
     role_arn = ensure_lambda_role()
+    # 夹具签发器的调用者角色：开着 ⇒ 建 / 收敛并拿到 ARN（下面进 Function URL 的期望集合）；
+    # 关着 ⇒ 存在则删、返回 None ⇒ 那两条语句在同一次 converge 里被当野 Sid 清掉。
+    verifier_arn = ensure_verifier_role(_iam(), verification,
+                                        account=cfg()["Platform"]["account_id"], region=region())
     env = lambda_env()
     code = build_zip()
     lam = _lam()
@@ -271,8 +338,12 @@ def main():
     # 删除（含老版本留下的 public-url / public-url-invoke）→ 写后读回核对。一致时零写入。
     # "同名 StatementId 已存在就 pass"是这条缺陷的原始形态：同名只说明有一条语句叫这个名字，不说明内容对。
     # 唯一实现在 deployer/functions/function_url_policy.py，panel / key-proxy / 闸门共用同一份判定。
+    # extra_principals 只在 [Verification] 开着时带上 verifier 的两条（spec §11.7）；关着时是 None，
+    # 于是上一次留下的 verifier-invoke / verifier-invoke-function 在这里就是野 Sid，被删掉。
+    extra_principals = {"verifier": verifier_arn} if verifier_arn else None
+    drift = converge_function_url_policy(lam, FN, edge_arn, extra_principals=extra_principals)
     print(f"  Function URL 授权（收敛前的漂移；「一致」= 零写入，其它 = 已按期望集合改写并读回核对）："
-          f"{converge_function_url_policy(lam, FN, edge_arn).summary()}")
+          f"{drift.summary()}")
     _ddb().put_item(TableName=cfg()["Platform"]["routing_table"], Item={
         "subdomain": {"S": "auth"}, "site_id": {"S": "auth-service"},
         "route_mode": {"S": "api-only"},  # 全路径走 Lambda（/login 不匹配 /api/*）
@@ -466,15 +537,17 @@ def ensure_lambda_role() -> str:
     # 每次都收敛：基础执行策略 + 密钥读取
     iam.attach_role_policy(RoleName=name,
         PolicyArn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole")
-    # 密钥从 SSM SecureString 运行时读（见 lambda_env 的说明），故需要
-    # GetParameter + kms:Decrypt。资源限定到本平台的参数前缀——给 "*"
-    # 等于让这个角色能读账号里所有 SecureString。
+    # 两把 SSM 密钥（login-flow 与 client secret）运行时读（见 lambda_env 的说明），故需要
+    # GetParameter + kms:Decrypt。资源是精确 ARN 清单——给前缀通配等于让这个角色能读
+    # 本平台前缀下未来的一切秘密。
+    keys = load_session_keys(CFG_PATH)
+    key_arns = kms_key_arns(keys, ("site", "console"))
     iam.put_role_policy(RoleName=name, PolicyName="read-platform-secrets",
         PolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": [
             {"Sid": "ReadPlatformSecrets", "Effect": "Allow",
              "Action": "ssm:GetParameter",
              # login_flow=True 只有 auth 传：那把密钥 panel 与 Edge 永不持有（spec §11.3）
-             "Resource": ssm_parameter_arns(load_session_keys(CFG_PATH), ("site", "console"),
+             "Resource": ssm_parameter_arns(keys, ("site", "console"),
                                             region=region(), account=cfg()["Platform"]["account_id"],
                                             login_flow=True, extra=(CLIENT_SECRET_PARAM,))},
             # SecureString 用账号默认的 aws/ssm key 加密；解密走 SSM 服务，
@@ -483,6 +556,13 @@ def ensure_lambda_role() -> str:
              "Action": "kms:Decrypt", "Resource": "*",
              "Condition": {"StringEquals": {
                  "kms:ViaService": f"ssm.{region()}.amazonaws.com"}}},
+            # 3c-final（spec §11.2 / ADR 0001）：kms:Sign 只经 identity policy 授、精确到两个 family 的 key ARN，
+            # 两个条件把 §11.5 的合同钉进 IAM（零自锁风险）；GetPublicKey 给 verifier 冷启动与 signer 自检用。
+            {"Sid": "SignSessionTokens", "Effect": "Allow", "Action": "kms:Sign", "Resource": key_arns,
+             "Condition": {"StringEquals": {"kms:SigningAlgorithm": "RSASSA_PKCS1_V1_5_SHA_256",
+                                            "kms:MessageType": "RAW"}}},
+            {"Sid": "ReadSessionPublicKeys", "Effect": "Allow", "Action": "kms:GetPublicKey",
+             "Resource": key_arns},
         ]}))
     if created:
         import time; time.sleep(10)  # IAM 传播
