@@ -191,26 +191,72 @@ def test_fixture_literals_match_auth_session():
 
 # ---- 与 auth/session.py 的字节等价（CLAUDE.md 不变量）----
 
+AUTH_SRC = (HERE.parents[2] / "site-builder" / "auth" / "session.py").read_text(encoding="utf-8")
+
+# (起始锚点, auth 侧结束锚点, Edge 侧结束锚点)——**七个函数全覆盖**。两侧结束锚点只有两处不同：
+# session.py 在 `_rsa_verify` 后面还有 `local_signer`（Edge 不签名、不需要私钥），而 Edge 在
+# `_aud_matches` 后面接的是内部名别名那一行。段之间不许夹任何一行（注释也算），见 Edge 那边的段头说明。
+CORE_SEGMENTS = (
+    ("def _b64url(", "def _b64url_decode_strict", "def _b64url_decode_strict"),
+    ("def _b64url_decode_strict", "def _strict_json", "def _strict_json"),
+    ("def _strict_json", "def spki_sha256", "def spki_sha256"),
+    ("def spki_sha256", "def load_public_key_der", "def load_public_key_der"),
+    ("def load_public_key_der", "def _rsa_verify", "def _rsa_verify"),
+    ("def _rsa_verify", "def local_signer", "def _aud_matches"),
+    ("def _aud_matches", "def mint_token", "_load_public_key_der = load_public_key_der"),
+)
+
+
 def _segment(src: str, start: str, end: str) -> str:
     s = src.index(start)
     return src[s:src.index(end, s + 1)]
 
 
-def test_edge_verifier_core_is_byte_identical_to_session_py():
-    auth_src = (HERE.parents[2] / "site-builder" / "auth" / "session.py").read_text(encoding="utf-8")
-    for start, end in (("def _b64url_decode_strict", "def _strict_json"),
-                       ("def _strict_json", "def spki_sha256"),
-                       ("def load_public_key_der", "def _rsa_verify"),
-                       ("def _rsa_verify", "def local_signer")):
-        assert _segment(auth_src, start, end).strip() == _segment(SRC, start, end.replace("local_signer", "_aud_matches") if end == "def local_signer" else end).strip(), start
-    # verify_token 的判定段：auth 从 `try:` 到 `return claims`；Edge 的 _verify_site_session 同一段，只多 allowlist 取值行
-    auth_body = _segment(auth_src, "def verify_token", "# 黄金三元组")
+@pytest.mark.parametrize("start,auth_end,edge_end", CORE_SEGMENTS)
+def test_edge_verifier_core_is_byte_identical_to_session_py(start, auth_end, edge_end):
+    assert _segment(AUTH_SRC, start, auth_end).strip() == _segment(SRC, start, edge_end).strip(), start
+
+
+def test_every_function_the_invariant_names_is_actually_covered_by_a_segment():
+    """元用例：CLAUDE.md 那条不变量点名的函数，必须每一个都真的落在某一段的**起始锚点**上。
+
+    上一版漏了 `_aud_matches`（它在 session.py 里排在 `local_signer` 之后，而第四段止于
+    `local_signer` ⇒ 谁改 Edge 那份 `_aud_matches`，四段全绿）。这条把"锚点集合"本身钉住，
+    以后再加共享函数时忘了加段会在这里红，而不是等漂移真的发生。
+    """
+    anchored = {start[len("def "):].rstrip("(") for start, _, _ in CORE_SEGMENTS}
+    assert anchored == {"_b64url", "_b64url_decode_strict", "_strict_json", "spki_sha256",
+                        "load_public_key_der", "_rsa_verify", "_aud_matches"}, anchored
+
+
+def test_edge_verify_judgement_segment_is_byte_identical_to_session_py():
+    """verify_token 的判定段：auth 从 `try:` 到 `return claims`；Edge 的 `_verify_site_session`
+    同一段**逐字相同**，唯一的例外是多一行 allowlist 取值（取值位置本身是契约，见那边的注释）。
+
+    `token_use` 在 Edge 是 try 之前绑好的局部名、在 auth 是形参，所以这一段两侧连字面量都不差——
+    上一版靠"把 Edge 的三处 `"site-session"` 归一成 token_use"来比，那种归一化会顺手掩盖
+    "有人把某一处写成了另一个 family"。现在字面量由下面 test_source_pins_the_local_token_use 钉。
+    """
+    auth_body = _segment(AUTH_SRC, "def verify_token", "# 黄金三元组")
     edge_body = _segment(SRC, "def _verify_site_session", "def _get_cookies")
     a = auth_body[auth_body.index("    try:"):auth_body.rindex("return claims")]
     e = edge_body[edge_body.index("    try:"):edge_body.rindex("return claims")]
-    e = e.replace("    allowlist = _site_allowlist()\n", "").replace('"site-session"', "token_use").replace(
-        'TOKEN_USES["site-session"]', "TOKEN_USES[token_use]")
+    e = e.replace("    allowlist = _site_allowlist()\n", "")
     assert a == e, "Edge 的验签判定段与 auth/session.py 分叉了"
+
+
+def test_shared_constants_equal_the_ones_in_auth_session():
+    """常量也得等值：判定段引用了 `TOKEN_USES`，`load_public_key_der` 引用了两个 RSA 约束，
+    而它们**都不在任何比对段里**（段的边界是 `def`）。改 auth 那边的表却漏改 Edge 这份，
+    上一版的守卫一条都不会红。"""
+    assert orq.ALG == auth_session.ALG
+    assert orq.TOKEN_USES == auth_session.TOKEN_USES
+    assert orq.RSA_MODULUS_BITS == auth_session.RSA_MODULUS_BITS
+    assert orq.RSA_PUBLIC_EXPONENT == auth_session.RSA_PUBLIC_EXPONENT
+    assert orq._B64URL_RE.pattern == auth_session._B64URL_RE.pattern
+    # padding / hash 实例没有 __eq__（`PKCS1v15() == PKCS1v15()` 是 False），所以比类型与摘要名
+    assert type(orq._PAD) is type(auth_session._PAD)
+    assert type(orq._HASH) is type(auth_session._HASH) and orq._HASH.name == auth_session._HASH.name
 
 
 def test_golden_triple_matches_auth_session():
@@ -225,6 +271,14 @@ def test_source_indexes_allowlist_only_by_kid_and_parses_it_once():
     assert indexes and all(i == "kid" for i in indexes), indexes
     assert "_site_allowlist()" in verify
     assert SRC.count("json.loads(SITE_ALLOWLIST_JSON)") == 1
+
+
+def test_source_pins_the_local_token_use_to_the_site_family():
+    """判定段里 `token_use` 是局部名，所以字面量本身要单独钉：写成 `"console-session"` 的话
+    字节等价守卫照样绿（那一行在段外），只有正向向量会红。两道一起才完整。"""
+    verify = SRC[SRC.index("def _verify_site_session"):SRC.index("def _get_cookies")]
+    assert '    token_use = "site-session"' in verify
+    assert verify.count("token_use = ") == 1
 
 
 def test_source_has_no_kid_derived_resource_paths():

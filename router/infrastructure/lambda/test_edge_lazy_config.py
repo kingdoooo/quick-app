@@ -16,12 +16,15 @@
 判据都在真源 `origin_request.py` 上（经 `edge_substitutions` 做与 CDK 同一套替换），
 不测副本、不测简化件。
 """
+import base64
 import json
 import sys
 import types
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
 import edge_substitutions as es
 
@@ -183,6 +186,81 @@ def test_a_malformed_cookie_still_never_needs_the_allowlist():
     resp = _broken()._check_auth(_req(cookie="sb_session=a.b.c"), dict(ROUTE_PRIVATE),
                                  "app-x.example.com")
     assert resp["status"] == "302"
+
+
+# ---- ③b 解析出的**公钥**坏掉时，走的是同一个出口、同一个爆炸半径 -----------------------
+#
+# JSON 合法但条目建不出公钥，是 3c-final 新增的一类失败（HS 时代只要 JSON 合法就没有下一步）。
+# 判据与上面那三条一样，逐条钉：**私有路由响亮 500、公开路由不受影响、报文不回显那份文本**。
+# 少了这一组的话，"注入坏了只影响带 cookie 的私有请求"这条爆炸半径只在 JSON 分支上被证明过。
+
+
+def _spki_b64(key) -> str:
+    return base64.b64encode(key.public_key().public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)).decode()
+
+
+_SMALL_RSA_SPKI = _spki_b64(rsa.generate_private_key(public_exponent=65537, key_size=1024))
+_EC_SPKI = _spki_b64(ec.generate_private_key(ec.SECP256R1()))
+
+
+def _entry_json(**fields) -> str:
+    return json.dumps({"site-rs-v1": dict({"alg": "RS256", "role": "current"}, **fields)})
+
+
+# (名字, 注入的 JSON, 不许出现在报文里的那串)
+BAD_KEY_SHAPES = [
+    ("spki_b64 不是合法 base64", _entry_json(spki_b64=LEAK_MARKER), LEAK_MARKER),
+    ("整条缺 spki_b64", _entry_json(note=LEAK_MARKER), LEAK_MARKER),
+    ("RSA 模长不在 spec §5 的三档（1024）", _entry_json(spki_b64=_SMALL_RSA_SPKI), _SMALL_RSA_SPKI),
+    ("根本不是 RSA 公钥（EC P-256）", _entry_json(spki_b64=_EC_SPKI), _EC_SPKI),
+]
+
+
+@pytest.mark.parametrize("name,allowlist_json,must_not_leak", BAD_KEY_SHAPES,
+                         ids=[b[0] for b in BAD_KEY_SHAPES])
+def test_a_bad_public_key_fails_loudly_on_private_routes_only(name, allowlist_json, must_not_leak):
+    mod = _load(SITE_ALLOWLIST_JSON=allowlist_json)
+    # ① 带 cookie 的私有请求：响亮失败，报文点名注入点（不许静默当成"验签不过"放人走 302）
+    with pytest.raises(RuntimeError, match="SITE_ALLOWLIST_JSON") as excinfo:
+        mod._check_auth(_req(cookie=f"sb_session={_kid_token()}"), dict(ROUTE_PRIVATE),
+                        "app-x.example.com")
+    # ② 报文/cause/context 里都不许出现被注入的那串
+    rendered = f"{excinfo.value}|{excinfo.value.__cause__}|{excinfo.value.__context__}"
+    assert must_not_leak not in rendered, f"{name}: 注入的文本进了报文：{rendered[:200]}"
+    assert excinfo.value.__cause__ is None and excinfo.value.__suppress_context__
+    # ③ 公开路由与没带 cookie 的请求完全不受影响（爆炸半径没有因为这一类失败变大）
+    assert mod._check_auth(_req(), dict(ROUTE_PUBLIC), "app-x.example.com") is None
+    assert mod._check_auth(_req(), dict(ROUTE_PRIVATE), "app-x.example.com")["status"] == "302"
+
+
+def test_a_bad_public_key_surfaces_as_a_500_through_the_handler(monkeypatch):
+    """上一条从 `_check_auth` 看"抛"，这条从 `lambda_handler` 看"500"——两者之间还有一层
+    `except Exception` 兜底，只测前者就没证明它没被吞成 200/302。
+
+    `_lookup_route` 必须替掉（否则会真的查 DynamoDB）；埋点走不到——`_check_auth` 抛出去时
+    `_maybe_record` 那一行还没执行（conftest 的护栏也只装在落盘副本上，这里是内存模块）。
+    """
+    mod = _load(SITE_ALLOWLIST_JSON=BAD_KEY_SHAPES[0][1])
+    monkeypatch.setattr(mod, "_lookup_route", lambda subdomain: dict(ROUTE_PRIVATE))
+    monkeypatch.setattr(mod, "_maybe_record", lambda *a, **k: pytest.fail("埋点不该被走到"))
+    event = {"Records": [{"cf": {"request": {
+        "uri": "/", "querystring": "", "method": "GET",
+        "headers": {"host": [{"key": "Host", "value": "app-x.example.com"}],
+                    "cookie": [{"key": "Cookie", "value": f"sb_session={_kid_token()}"}]}}}}]}
+    resp = mod.lambda_handler(event, None)
+    assert resp["status"] == "500", resp
+    assert LEAK_MARKER not in json.dumps(resp), "注入的文本进了响应体"
+
+
+def test_the_broken_shapes_really_are_broken_only_in_the_public_key(monkeypatch):
+    """正对照：把同一批条目的 `spki_b64` 换成一把**好**公钥，`_site_allowlist()` 必须成功。
+
+    没有这条的话，上面那组可能是因为别的原因红（比如 JSON 本身就不合法），而不是因为
+    "公钥建不出来"——那样它们就退化成了 ③ 那组的重复。
+    """
+    good = _load(SITE_ALLOWLIST_JSON=_entry_json(spki_b64=v.spki_b64(v.SITE_KEY)))
+    assert set(good._site_allowlist()) == {"site-rs-v1"}
 
 
 # ---- ④ 路由表 client 同样惰性（它不缩小半径，但决定了"能不能 import"）------------------

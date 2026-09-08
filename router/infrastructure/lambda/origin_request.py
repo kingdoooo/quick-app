@@ -70,8 +70,13 @@ _ROUTE_TABLE_CLIENT = None
 
 
 # ---- RS256 验签核心：与 site-builder/auth/session.py **字节等价**（test_edge_kid_allowlist.py 逐段比对）----
-# 改这里之前先读那条守卫：它按段落逐字比对本文件与 session.py，方向是"把 Edge 改到与 auth 相同"，
-# 不是反过来。四个函数（含它们的 docstring）是从 session.py 复制过来的，别手抄、别顺手润色。
+# 改这里之前先读那条守卫：它按锚点逐段比对本文件与 session.py（七个函数 + 四个常量的等值），
+# 方向是"把 Edge 改到与 auth 相同"，不是反过来。下面这些函数（含 docstring）是从 session.py
+# 复制过来的，别手抄、别顺手润色。
+#
+# **比对段之间不许夹任何一行，注释也不行**（段的边界就是下一个 `def`）。所以两样东西被刻意
+# 排在段外：`_load_public_key_der` 那个内部名别名紧跟在最后一段之后（它同时是那一段的结束锚点），
+# 而黄金三元组与预热验签排在别名之后。
 ALG = "RS256"
 TOKEN_USES = {"site-session": "site-edge",
               "console-upgrade": "console-exchange",
@@ -156,9 +161,7 @@ def _aud_matches(got, want: str) -> bool:
     return isinstance(got, str) and got == want
 
 
-# `load_public_key_der` 的别名：本文件里"下划线开头 = 内部"，而上面那个名字是从 session.py
-# 逐字复制的（比对段里不许多一行），所以别名单独放在比对段之外。
-_load_public_key_der = load_public_key_der
+_load_public_key_der = load_public_key_der      # 内部名别名；也是最后一段的结束锚点，见段头说明
 
 # 黄金三元组（与 auth/session.py 字面相同）+ **import 期预热一次验签**（spec §11.1 / ADR 0003 的
 # 判据建立在"库初始化 + 首次验签发生在 Init 阶段"上；材料坏了在 Init 就炸，与 spike 同形）。
@@ -199,6 +202,11 @@ def _site_allowlist() -> dict:
 
     公钥的解析（`spki_b64` → RSAPublicKey，含 spec §5 那四项校验）也在这里，**同样是惰性的**：
     放到模块顶层就等于把"注入坏了 ⇒ 整个分发 502"换个理由带回来。
+
+    **三类失败走同一个出口**：JSON 不合法、不是对象、以及"逐条建公钥"时的任何异常
+    （`spki_b64` 缺失 → KeyError、不是合法 base64 → binascii.Error、模长/算法/DER 形态不合
+    spec §5 → ValueError）。都抛点名注入点的 RuntimeError，**都不回显那份文本**，爆炸半径
+    与上面那段一致（公开路由与无 cookie 的请求根本走不到这里）。
     """
     global _SITE_ALLOWLIST
     if _SITE_ALLOWLIST is None:
@@ -213,8 +221,23 @@ def _site_allowlist() -> dict:
             raise RuntimeError(
                 f"SITE_ALLOWLIST_JSON 解析出 {type(parsed).__name__}，要的是 kid -> 条目 的对象"
                 "——注错形状时不要留到按 kid 取值那一步才 TypeError。")
-        _SITE_ALLOWLIST = {kid: {"alg": e["alg"], "public_key": _load_public_key_der(base64.b64decode(e["spki_b64"])),
-                                 "role": e["role"]} for kid, e in parsed.items()}
+        built = {}
+        for kid, entry in parsed.items():
+            # 逐条建而不是一个推导式：报文要能点名是哪一条坏了（kid 来自注入的那份 JSON，
+            # 也就是 stack.py 的产物，不是请求里的攻击者输入）。
+            try:
+                built[kid] = {"alg": entry["alg"], "role": entry["role"],
+                              "public_key": _load_public_key_der(base64.b64decode(entry["spki_b64"]))}
+            except Exception as exc:
+                # **只带异常类名，不带它的报文、也不 chain**：`.doc` / args 里可能带着注入的
+                # 那份文本（见上面那条 from None 的理由），而类名已经足够分辨四种成因。
+                raise RuntimeError(
+                    f"SITE_ALLOWLIST_JSON 里 kid={kid!r} 这一条建不出公钥"
+                    f"（{type(exc).__module__}.{type(exc).__name__}）：要的是 base64(DER SPKI)"
+                    " 且满足 spec §5 的四项"
+                    "（rsaEncryption、指数 65537、模长 2048/3072/4096、DER 最小形式）。"
+                    "值不打印。") from None
+        _SITE_ALLOWLIST = built
     return _SITE_ALLOWLIST
 
 
@@ -668,15 +691,16 @@ def _verify_session_jwt(token: str) -> dict | None:
 def _verify_site_session(token: str, now: int | None = None) -> tuple:
     """→ (claims 或 None, outcome)。任何异常都归为拒绝（fail-closed）。
 
-    **从 `try:` 到 `return claims` 与 auth/session.py 的 `verify_token` 字节等价**
-    （token_use 固定 `site-session`，allowlist 在 try 之后才取——位置是契约的一部分，见
-    `_site_allowlist` 的说明）。守卫把 Edge 的三处 `"site-session"` 字面量归一成 auth 那边的
-    `token_use` 形参再逐字比对，所以那段里**照抄**了两个在本文件里恒为真/恒为假的写法：
-      · `now` 形参（Edge 没有调用方会传它，默认 None ⇒ 走 `time.time()`）；
-      · `if "site-session" == "console-upgrade"` 那条 jti 检查（对本文件是死分支，
+    **从 `try:` 到 `return claims` 与 auth/session.py 的 `verify_token` 逐字相同**（守卫只
+    额外允许 `allowlist = _site_allowlist()` 那一行——取值的位置是契约的一部分，见
+    `_site_allowlist` 的说明）。为此有两样东西是**照抄**、在本文件里恒定：
+      · `token_use` 是下面那个局部名（Edge 只认站点会话，spec §4.1），auth 那边是形参；
+      · `now` 形参（Edge 没有调用方会传它，默认 None ⇒ 走 `time.time()`），以及
+        `if token_use == "console-upgrade"` 那条 jti 检查（对本文件是死分支，
         它在 auth 那边管的是 console 升级码）。
     **不要"顺手"把它们化简掉**：那会让两份实现分叉，而分叉正是这条不变量要防的东西。
     """
+    token_use = "site-session"      # 本文件只认站点会话；写成局部名让下面那段与 auth 逐字相同
     try:
         header_b64, payload_b64, sig_b64 = token.split(".")
         header = _strict_json(_b64url_decode_strict(header_b64))
@@ -698,9 +722,9 @@ def _verify_site_session(token: str, now: int | None = None) -> tuple:
         claims = _strict_json(_b64url_decode_strict(payload_b64))
     except Exception:
         return None, "bad_signature"
-    if claims.get("token_use") != "site-session":
+    if claims.get("token_use") != token_use:
         return None, "wrong_token_use"
-    if not _aud_matches(claims.get("aud"), TOKEN_USES["site-session"]):
+    if not _aud_matches(claims.get("aud"), TOKEN_USES[token_use]):
         return None, "wrong_audience"
     t = int(time.time()) if now is None else now
     try:
@@ -711,7 +735,7 @@ def _verify_site_session(token: str, now: int | None = None) -> tuple:
     email = claims.get("email")
     if not isinstance(email, str) or not email:
         return None, "bad_signature"
-    if "site-session" == "console-upgrade" and not claims.get("jti"):
+    if token_use == "console-upgrade" and not claims.get("jti"):
         return None, "bad_signature"
     return claims, f"accepted_{entry['role']}"
 
