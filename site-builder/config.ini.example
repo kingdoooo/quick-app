@@ -131,49 +131,49 @@ console_version =
 # 控制台自己不可用时的应急旁路（aws CLI 直改该行）见 DEPLOY.md「⑤c」。
 
 # ============================================================================
-# 会话签名密钥（3c，spec §11.6）。**HS 与 RS 两阶段共用这一个 schema**。
+# 会话签名密钥（spec §11.6）。只有 KMS 非对称 CMK（RS256）一种形态。
 # ============================================================================
 [SessionKeys]
-# 3c-1A：每 family 一把 current（HS256），previous 留空；legacy_param 是拆 family 之前
-# 的共享密钥（今天的 /site-builder/jwt-secret）。**3c-1B/L3：清空它即关闭 legacy 入口**
-# （见下面 legacy_param 那行的说明）；SSM 参数本体与代码里的 legacy 分支到 3c-3 才删。
-# 值就是固定的 SSM 参数路径：ensure_session_keys.py 按这里的 HS 行幂等创建 SecureString，
-# router 栈 synth 时只取 site family、panel 只取 console family、auth 两个都取。
-# RS 行（key_arn 带 :key/<uuid> 的完整 ARN，永不写 alias；spki_sha256 64 位 hex）3c-2B 起才出现。
-# 槽位语义（术语真源是根 CONTEXT.md 的 Key family / 就位 两条；DEPLOY.md 的十步 runbook 同源）：
-#   *_current  = signer 开关为 current 时**签发**用的那把；
+# 两把 CMK 由 deployer CDK 栈创建（默认 key policy，docs/adr/0001-*.md）。部署顺序见 DEPLOY.md：
+# 先部 deployer 栈拿到两个 CfnOutput 的 key ARN，再用 scripts/session_key_fingerprint.py 算出
+# 每把的 spki_sha256，回填下面两个 [SessionKey:*] 小节，然后才部 router / auth / panel。
+# key_arn 必须是带 :key/<uuid> 的完整 ARN（永不写 alias）；spki_sha256 是 SHA-256(DER SPKI) 的 64 位 hex。
+# 槽位语义（术语真源是根 CONTEXT.md 的 Key family / 就位 两条；DEPLOY.md「轮转会话密钥」同源）：
+#   *_current  = **签发**用的那把；
 #   *_previous = 另一把**被接受**的 key——要么是排空中的旧 key，要么是就位中的新 key。
-# 新 key 一律**经 previous 就位**（runbook ⑥），切换 = 两槽互换（⑦），排空后清空 previous
-# 并删掉那一节（⑩，含删 SSM 参数、不可逆）。**不要就地覆盖任何一把 key 的值**：那会造成一段
-# 全员登录循环（auth/panel 5 分钟切换 vs Edge 重部 + 10–20 分钟全球复制）。
-site_current = site-hs-v1
+# 新 key 一律**经 previous 就位**，切换 = 两槽互换，排空（--drain-gate previous）后清空 previous
+# 并删掉那一节。**不要就地换掉任何一把 key 的 ARN**：那会造成一段全员登录循环
+# （auth/panel 5 分钟切换 vs Edge 重部 + 10–20 分钟全球复制）。
+site_current = site-rs-v1
 site_previous =
-console_current = console-hs-v1
+console_current = console-rs-v1
 console_previous =
-# 3c-1B（spec §11.8.3）：**签发**形态开关，legacy | current。两个 family 同步，下发为 auth 与
-# panel 的 SESSION_SIGNER（两个组件各自部署，所以切换有先后：runbook 是 panel 先、auth 后）。
-# 验签侧与它无关（verifier 全程同时接受 current/previous/legacy），所以回滚 = 把这一行改回去、
-# 重跑 deploy_panel 与 deploy_auth，**不动 Edge、不回退代码**。
-# 十步 runbook 里本行**只改一次**：③ legacy → current（切签发，panel 先 auth 后）。
-# ⑤ 清空 legacy_param（L3）改的是下一行，不是本行——那一刻起 legacy 也不再是本行的合法取值
-# （加载器会拒 signer=legacy + 空 legacy_param 的组合）。
-signer = legacy
-# **清空本行即关闭 legacy 入口**（3c-1B 的 L3，spec §11.8.1）。一处配置三处后果：
-# legacy_entry() 变 off（三处 verifier 只认 kid）、auth/panel 不再下发 JWT_SECRET_PARAM
-# 且角色 SSM 精确清单不含它、router 栈给 Edge 注入空串（空串**不是** SYNTH 占位符）。
-# 清空前必须先把 signer 切到 current——加载器拒绝 (legacy, 空) 这个组合。
-# 参数本体与代码里的 legacy 分支**不在这一步删**（3c-3）：那把密钥仍存在、仍被闸门追踪。
-legacy_param = /site-builder/jwt-secret
-# 3c-1B：登录流程（OAuth state 与 __Host-sb_pkce cookie）的 HMAC 密钥，**auth 私有**。
+# 登录流程（OAuth state 与 __Host-sb_pkce cookie）的 HMAC 密钥，**auth 私有**，是唯一的 SSM SecureString。
 # 不是 kid、不属于任何 family、不签发也不验证会话；panel 与 Edge 永不持有它。
-# ensure_session_keys.py 一并幂等创建；轮转 = put-parameter --overwrite（见 DEPLOY.md「轮转」节：
-# auth 5 分钟缓存窗口内进行中的登录失败一次，无会话影响）。
+# deploy_auth.py 不存在时自动创建（只创建、不覆盖）；轮转 = put-parameter --overwrite
+# （auth 5 分钟缓存窗口内进行中的登录失败一次，无会话影响）。
 login_flow_secret_param = /site-builder/login-flow-secret
 
-[SessionKey:site-hs-v1]
-alg = HS256
-ssm_param = /site-builder/session-keys/site-hs-v1
+[SessionKey:site-rs-v1]
+alg = RS256
+key_arn = arn:aws:kms:us-east-1:000000000000:key/00000000-0000-0000-0000-000000000000
+spki_sha256 = 0000000000000000000000000000000000000000000000000000000000000000
 
-[SessionKey:console-hs-v1]
-alg = HS256
-ssm_param = /site-builder/session-keys/console-hs-v1
+[SessionKey:console-rs-v1]
+alg = RS256
+key_arn = arn:aws:kms:us-east-1:000000000000:key/00000000-0000-0000-0000-000000000001
+spki_sha256 = 0000000000000000000000000000000000000000000000000000000000000001
+
+# ── 验收（可选组件；spec §11.7 / docs/adr/0002-*.md）────────────────────────
+# fixture_issuer = true 时 deploy_auth.py 会：建 IAM 角色 site-builder-verifier（信任下面列出的
+# principal，会话上限 1 小时）、给 auth 的 Function URL 多两条只对该角色的语句、给 auth 下发
+# FIXTURE_ISSUER=on 让 POST /fixture-session 生效。该接口**只**给夹具域 e2e.invalid 的邮箱签
+# 站点会话（TTL ≤ 30 分钟，idp=fixture / auth_via=fixture-issuer），Edge 只在夹具站点与平台路由上
+# 认这种会话，panel 拒绝把夹具域邮箱写进管理员名单或非夹具站点的权限字段。
+# **不配置 = 路径 404、角色与语句都不存在**（与 [ApiKey] 同款"不存在"）。四个 verify_* 闸门、
+# smoke_router 之外的真机验收与 E2E 都依赖它；不跑那些就不用开。
+# verifier_trusted_principals：逗号分隔的精确 IAM ARN（user 或 role，不接受通配），即"谁能 assume
+# site-builder-verifier"。留空且 fixture_issuer=true 是配置错。
+[Verification]
+fixture_issuer = false
+verifier_trusted_principals =
