@@ -166,6 +166,11 @@ def test_lambda_role_grants_ssm_read_on_every_run():
     src = whole[whole.index("def ensure_lambda_role"):whole.index("def json_trust")]
     assert "ssm:GetParameter" in src, "缺 SSM 读权限，运行时读密钥会 AccessDenied"
     assert "kms:Decrypt" in src, "SecureString 解密需要 kms:Decrypt"
+    # 3c-final：会话签名不再是 SSM 里的 HMAC 秘密，而是两把 KMS 非对称 CMK。签发要 kms:Sign
+    # （带算法与 MessageType 两个条件——少任何一个都等于把这把 key 的其余用法一并交出去），
+    # verifier 冷启动装 allowlist 要 kms:GetPublicKey。缺哪条的症状都是"部署 exit 0 而登录全 500"。
+    assert "kms:Sign" in src and "kms:GetPublicKey" in src and "RSASSA_PKCS1_V1_5_SHA_256" in src \
+        and '"kms:MessageType": "RAW"' in src
     # early-return 会让已有角色永远补不上权限
     body = src[src.index("try:"):]
     assert "return iam.get_role" not in body.split("except")[0], \
@@ -179,7 +184,7 @@ def test_deploy_auth_does_not_ship_plaintext_secrets():
     env_block = src[src.index("def lambda_env"):src.index("def main()")]
     assert '"JWT_SECRET":' not in env_block, "JWT_SECRET 明文不得进环境变量"
     assert '"CLIENT_SECRET":' not in env_block, "CLIENT_SECRET 明文不得进环境变量"
-    assert "JWT_SECRET_PARAM" in src and "CLIENT_SECRET_PARAM" in src
+    assert "CLIENT_SECRET_PARAM" in src and "JWT_SECRET_PARAM" not in src
 
 
 # ---- 3c-1A：auth 的 SSM 权限收成精确清单；环境变量多两项（都不是明文）----
@@ -191,34 +196,16 @@ def test_deploy_auth_ssm_resources_are_exact_not_prefixed():
     assert "load_session_keys" in src, "SSM 资源清单必须从 [SessionKeys] 推导，不手抄"
 
 
-def test_deploy_auth_ships_session_keys_json_and_legacy_switch_without_values():
-    src = (Path(__file__).parents[1] / "deploy_auth.py").read_text()
-    env_block = src[src.index("def lambda_env"):src.index("def main()")]
-    assert '"SESSION_KEYS_JSON"' in env_block and '"LEGACY_ENTRY"' in env_block
-    assert '"secret"' not in env_block and "token_hex" not in env_block, "环境变量里只能有参数名"
+def test_deploy_auth_ships_session_keys_json_and_fixture_switch_without_values():
+    """env 里只有 RS 行的清单与夹具签发器开关；HS 时代那三个键必须彻底消失。
 
-
-def test_deploy_auth_ships_the_signer_switch_from_config_not_a_literal():
-    """3c-1B：`SESSION_SIGNER` 必须下发，且值来自 [SessionKeys] signer。
-
-    漏下发的后果是 handler 的 `_signer_mode()` 抛 → 每次 /callback 与 /console-session 都 500
-    （响亮，这是有意的）；写成字面量的后果是配置与线上分叉——改 config 重部却没变，
-    而回滚协议整个建立在"改一行配置重部"上。
+    留着任何一个的后果都不是"多个没用的变量"：`LEGACY_ENTRY` / `SESSION_SIGNER` 在 3c-final 的
+    handler 里没有读取点，留在配置里会让下一个人以为还能靠改它们回滚（真正的回滚是换 kid）；
+    `JWT_SECRET_PARAM` 则指向一个即将被删的 SSM 参数。
     """
-    import sys
-    sys.path.insert(0, str(Path(__file__).parents[1]))
-    import deploy_auth as da
     src = (Path(__file__).parents[1] / "deploy_auth.py").read_text()
     env_block = src[src.index("def lambda_env"):src.index("def main()")]
-    assert '"SESSION_SIGNER": keys.signer' in env_block, "signer 不是从 [SessionKeys] 取的"
-    assert da.lambda_env()["Variables"]["SESSION_SIGNER"] in ("legacy", "current")
-
-
-def test_deploy_auth_legacy_param_has_one_source_of_truth():
-    """env 里的 JWT_SECRET_PARAM 与 role 精确 ARN 清单必须都来自 [SessionKeys] legacy_param，
-    不能一个硬编码一个推导——分叉的症状是运行时 AccessDenied。"""
-    src = (Path(__file__).parents[1] / "deploy_auth.py").read_text()
-    env_block = src[src.index("def lambda_env"):src.index("def main()")]
-    assert '"JWT_SECRET_PARAM": JWT_SECRET_PARAM' not in env_block, "env 值仍是硬编码常量"
-    assert "legacy_param" in env_block
-    assert "ssm_parameter_arns(" in src and "def ssm_parameter_arns" not in src, "ARN 清单应由 session_keys.ssm_parameter_arns 生成"
+    assert '"SESSION_KEYS_JSON"' in env_block and '"FIXTURE_ISSUER"' in env_block
+    for gone in ('"LEGACY_ENTRY"', '"SESSION_SIGNER"', '"JWT_SECRET_PARAM"'):
+        assert gone not in env_block, gone
+    assert '"secret"' not in env_block and "token_hex" not in env_block, "环境变量里只能有参数名"

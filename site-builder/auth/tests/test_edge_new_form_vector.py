@@ -24,24 +24,23 @@ import pytest
 
 import login_handler as lh
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "panel" / "tests"))
-from conftest import SITE_KID_SECRET
+import upgrade_code_vectors as v  # noqa: E402
 from module_mutation import mutate_module_segment  # noqa: E402
 # 复用 /login → /callback 的完整走法（真 state、真 PKCE cookie，只 patch code 交换），
 # 免得这里再写第二份"怎么拿到一枚会话 cookie"——那正是复制品漂移的形状。
-from test_login_handler import ENV, ENV_CURRENT, _b64d, _do_callback, _session_cookie
+from test_login_handler import ENV, _b64d, _do_callback, _session_cookie
 
 AUTH = Path(__file__).resolve().parents[1]
 EDGE_SRC_PATH = AUTH.parents[1] / "router" / "infrastructure" / "lambda" / "origin_request.py"
 
-# Edge 的 allowlist 里**只有 site family**（spec §4.1）；secret 与 conftest 假 SSM 给 auth 的
-# 那把是同一个值——跨组件向量的全部意义就在于两侧对同一把 key 达成一致。
-EDGE_ALLOWLIST = {"site-hs-v1": {"alg": "HS256", "secret": SITE_KID_SECRET, "role": "current"}}
+# Edge 的 allowlist 里**只有 site family**（spec §4.1），且只有**公钥**（spki_b64）——与 auth 侧那把
+# 私钥同一对：跨组件向量的全部意义就在于两侧对同一把 key 达成一致。
+EDGE_ALLOWLIST = {v.SITE_KID: {"alg": "RS256", "spki_b64": v.spki_b64(v.SITE_KEY), "role": "current"}}
 # 替换表的唯一定义在 router/…/lambda/edge_substitutions.py（ticket 22）；本文件只覆盖
-# 跨组件向量真正关心的两项：与 auth 假 SSM 同一把 site key，以及 legacy 密钥同 ENV。
+# 跨组件向量真正关心的那一项：与 auth 签发同一把 site key 的公钥。
 sys.path.insert(0, str(EDGE_SRC_PATH.parent))
 import edge_substitutions as es  # noqa: E402
-EDGE_OVERRIDES = {"JWT_SECRET": ENV["JWT_SECRET"], "SITE_ALLOWLIST_JSON": json.dumps(EDGE_ALLOWLIST),
-                  "LEGACY_ENTRY": "on"}
+EDGE_OVERRIDES = {"SITE_ALLOWLIST_JSON": json.dumps(EDGE_ALLOWLIST)}
 
 ROUTE = {"subdomain": "app-x", "site_id": "x", "static_prefix": "sites/x", "api_target": "",
          "require_auth": True, "allowed_users": "org", "owner": "o@example.test"}
@@ -74,7 +73,7 @@ def _edge_allows(edge_mod, token: str) -> bool:
 # ---- 正向向量 -----------------------------------------------------------------------------
 
 def test_session_minted_by_the_auth_handler_verifies_at_the_edge(edge):
-    token = _session_cookie(_do_callback(ENV_CURRENT, email="a@x.com", name="Alice"))
+    token = _session_cookie(_do_callback(ENV, email="a@x.com", name="Alice"))
     claims = edge._verify_session_jwt(token)
     assert claims, "auth 按 current 形态签的会话在 Edge 验不过——线上等于每个人登录后立刻被踢回"
     assert claims["email"] == "a@x.com" and claims["token_use"] == "site-session"
@@ -85,7 +84,7 @@ def test_session_minted_by_the_auth_handler_verifies_at_the_edge(edge):
 def test_the_edge_records_it_as_accepted_current_not_accepted_legacy(edge, caplog):
     """④ 观察窗口的判据是"accepted_legacy 三列归零"——记成 legacy 的话那个窗口永远不会到。"""
     import logging
-    token = _session_cookie(_do_callback(ENV_CURRENT))
+    token = _session_cookie(_do_callback(ENV))
     with caplog.at_level(logging.INFO):
         edge._verify_session_jwt(token)
     rows = [json.loads(r.getMessage()) for r in caplog.records
@@ -93,20 +92,13 @@ def test_the_edge_records_it_as_accepted_current_not_accepted_legacy(edge, caplo
     assert rows and rows[-1]["outcome"] == "accepted_current"
 
 
-def test_the_legacy_form_still_verifies_at_the_edge_while_the_switch_is_legacy(edge):
-    """回滚方向的向量：③ 之前与回滚之后 auth 签的是 legacy 形态，Edge 同样必须认。"""
-    token = _session_cookie(_do_callback(ENV))
-    assert _edge_allows(edge, token)
-    assert _b64d(token.split(".")[0]) == {"alg": "HS256", "typ": "JWT"}
-
-
 def test_the_console_family_upgrade_code_is_rejected_at_the_edge(edge):
     """负向对照：同一次切换里 auth 也在发升级码，它**不得**是一枚站点会话。"""
     with pytest.MonkeyPatch.context() as mp:
-        for k, v in ENV_CURRENT.items():
-            mp.setenv(k, v)
+        for k, val in ENV.items():
+            mp.setenv(k, val)
         r = lh.handler({"rawPath": "/console-session", "queryStringParameters": {},
-                        "cookies": [f"sb_session={_session_cookie(_do_callback(ENV_CURRENT))}"],
+                        "cookies": [f"sb_session={_session_cookie(_do_callback(ENV))}"],
                         "requestContext": {"http": {"method": "GET"}}}, None)
     code = r["headers"]["Location"].split("code=", 1)[1]
     import urllib.parse
@@ -127,6 +119,7 @@ def _handler_variant(tmp_path, old: str, new: str, *, region=CALLBACK_REGION):
                                tmp_path=tmp_path, module_name="_login_handler_mutant")
     # 假 SSM 只装在真模块上（conftest 的 autouse 夹具）；副本自带一份干净的缓存与 client
     mod._ssm = lh._ssm
+    mod._kms = lh._kms          # 假 KMS 同理：副本自带一份空的 signer 缓存
     return mod
 
 
@@ -134,7 +127,7 @@ def _mutant_callback(mod):
     from unittest.mock import patch
     user = {"email": "a@x.com", "name": "Alice", "idp": "Feishu",
             "auth_via": "TokenGeneration_HostedAuth"}
-    with patch.dict(mod.os.environ, ENV_CURRENT), patch.object(mod, "_exchange_code", return_value=user):
+    with patch.dict(mod.os.environ, ENV), patch.object(mod, "_exchange_code", return_value=user):
         r_login = mod.handler({"rawPath": "/login", "queryStringParameters": {"redirect": "https://app-x.example.com/"},
                                "cookies": [], "requestContext": {"http": {"method": "GET"}}}, None)
         import urllib.parse as up
@@ -161,8 +154,8 @@ def test_mutating_the_signer_token_use_by_one_character_fails_before_it_signs(tm
 
 
 def test_mutating_the_signing_family_to_console_turns_the_vector_red(edge, tmp_path):
-    """`_signing_key("site")` → `("console")`：Edge 的 allowlist 里没有 console 的 kid ⇒ unknown_kid。"""
-    mod = _handler_variant(tmp_path, '_signing_key("site")', '_signing_key("console")')
+    """`_signer("site")` → `("console")`：Edge 的 allowlist 里没有 console 的 kid ⇒ unknown_kid。"""
+    mod = _handler_variant(tmp_path, '_signer("site")', '_signer("console")')
     token = _session_cookie(_mutant_callback(mod))
-    assert _b64d(token.split(".")[0])["kid"] == "console-hs-v1"
+    assert _b64d(token.split(".")[0])["kid"] == v.CONSOLE_KID
     assert not _edge_allows(edge, token)

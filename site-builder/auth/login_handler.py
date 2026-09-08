@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import time
 import urllib.error
@@ -24,9 +25,9 @@ import urllib.request
 import jwt as pyjwt
 from jwt import PyJWKClient
 
-from session import (SESSION_TYP, UPGRADE_MAX_TTL, mint_session_jwt,  # noqa: F401
-                     mint_token, mint_upgrade_code, verify_session_jwt,
-                     verify_with_legacy)
+from session import (FIXTURE_AUTH_VIA, FIXTURE_DOMAIN, FIXTURE_IDP, FIXTURE_MAX_TTL,  # noqa: F401
+                     UPGRADE_MAX_TTL, mint_token, verify_token)
+import session_kms
 import verifier_env
 
 _jwks_client = None  # 模块级缓存，Lambda 容器复用
@@ -57,30 +58,24 @@ def _secret(name: str) -> str:
     """从 SSM SecureString 读密钥，容器内缓存。
 
     **不从环境变量下发生产密钥**：`lambda:GetFunctionConfiguration` 会原样
-    回显环境变量明文，而那是个很常见的只读权限（部署时实测确认过）。
-    JWT_SECRET 的后果尤重——Edge 只验 HS256 签名，拿到它即可伪造任意用户的
-    会话 cookie，等于绕过 owner / allowed_users / collaborators 全部判定。
+    回显环境变量明文，而那是个很常见的只读权限（部署时实测确认过）。login-flow secret
+    读到就值一个登录 CSRF（state 与 pkce cookie 都只活 300 秒），client secret 读到
+    则能替本 app client 换 token——两者都不该躺在环境变量里。
 
     仍认环境变量直给的值：单测与本地调试依赖它，且生产部署只下发 `*_PARAM`
     参数名（见 deploy_auth 的 lambda_env），所以明文不会回到线上配置。
-    两个来源都没有时抛错——空密钥签出的 HS256 任何人都能伪造，静默降级
-    在这里等于关掉鉴权。
+    两个来源都没有时抛错——空密钥算出的 HMAC 任何人都能伪造，静默降级
+    在这里等于关掉 login CSRF 防护。
 
     缓存带 `SECRET_TTL_SECONDS` 的 TTL：无 TTL 时轮转密钥后 warm 容器会永久
     用旧值（Lambda 执行环境可复用数小时），表现为部分请求成功、部分
     invalid_client，且改配置也不触发刷新。
 
-    ⚠️ **会话密钥的轮转不能靠就地改值，也不能只靠这个 TTL**：Edge 那份是 CDK
-    部署时字符串替换注入的（Lambda@Edge 不支持环境变量），改一次要 10-20 分钟
-    全球复制。auth 侧读到新值时 Edge 可能还在用旧值验签 → 这期间新签发的会话
-    全部验签失败，用户登录后立刻被踢回登录页（症状极难定位到密钥版本）。
-    3c-1A/1B 的解法就是"版本化 + 双接受 + 先 verifier 后 signer"：每把 key 有
-    `kid`，verifier 全程同时接受 current 与 previous，新 key 先经 `previous`
-    槽位随 Edge 复制就位，复制完成后才互换槽位切签发（`SESSION_SIGNER` /
-    `[SessionKeys]` 的 current/previous）。**动手前先读 DEPLOY.md 的十步轮转
-    runbook**——那里有每步的闸门、探针与"排空后才退役、退役最后才删 SSM 参数"。
-    `JWT_SECRET`（legacy 入口那把）不在这套机制里：它没有 `kid`、只被验签用，
-    3c-3 随 legacy 入口一起删，**在那之前不要就地改它的值**。
+    ⚠️ **本函数只管两把 HMAC / OAuth 密钥（login-flow secret 与 Cognito client secret）。会话签名密钥不在 SSM
+    里**：它们是 KMS 非对称 CMK，签发经 `_signer()`（session_kms.KmsSigner），验签经 `_allowlist()` 按
+    key_arn 取公钥。它们的轮转按 `kid` + `current` / `previous` 双槽位走（新 key 经 `previous` 就位、Edge
+    重部复制完成后才互换），协议在 DEPLOY.md「轮转会话密钥」——**动手前先读它**；Edge 那份公钥是 CDK
+    部署时注入的，改一次要 10–20 分钟全球复制，所以顺序是 verifier 先行。
     """
     hit = _secret_cache.get(name)
     if hit is not None and time.monotonic() - hit[1] < SECRET_TTL_SECONDS:
@@ -93,49 +88,58 @@ def _secret(name: str) -> str:
     if not param:
         raise RuntimeError(
             f"{name} 无来源：既没有环境变量 {name}，也没有 {name}_PARAM 指向 "
-            "SSM 参数。拒绝继续——空密钥签出的 HMAC 任何人都能伪造（会话密钥如此，"
-            "3c-1B 起走这条路的 LOGIN_FLOW_SECRET 也如此：它保护 OAuth state 与 "
-            "PKCE cookie，缺它等于关掉 login CSRF 防护）。")
+            "SSM 参数。拒绝继续——空密钥算出的 HMAC 任何人都能伪造：LOGIN_FLOW_SECRET "
+            "保护 OAuth state 与 PKCE cookie，缺它等于关掉 login CSRF 防护。")
     value = _ssm().get_parameter(Name=param, WithDecryption=True)[
         "Parameter"]["Value"]
     _secret_cache[name] = (value, time.monotonic())
     return value
 
 
-def _secret_by_param(param: str) -> str:
-    """按 SSM 参数名取密钥，TTL 缓存与 _secret 同一套（3c-1A：一个 family 一把 HS 密钥）。"""
-    hit = _secret_cache.get(param)
-    if hit is not None and time.monotonic() - hit[1] < SECRET_TTL_SECONDS:
-        return hit[0]
-    value = _ssm().get_parameter(Name=param, WithDecryption=True)["Parameter"]["Value"]
-    _secret_cache[param] = (value, time.monotonic())
-    return value
+_kms_client = None
+_SIGNERS: dict = {}          # key_arn -> KmsSigner（容器复用：自检只做一次）
+_public_key = None           # session_kms.public_key_loader(_kms())（容器复用：每把公钥只取一次）
+VERIFIER_ROLE_NAME = "site-builder-verifier"
+
+
+def _kms():
+    global _kms_client
+    if _kms_client is None:
+        import boto3
+        _kms_client = boto3.client("kms", region_name="us-east-1")
+    return _kms_client
+
+
+def _reset_signers() -> None:
+    """测试钩子：换掉 `_kms()` 之后清掉按 ARN 缓存的 signer 与公钥加载器。"""
+    global _public_key
+    _SIGNERS.clear()
+    _public_key = None
+
+
+def _get_public_key(key_arn: str, spki_sha256: str):
+    global _public_key
+    if _public_key is None:
+        _public_key = session_kms.public_key_loader(_kms())
+    return _public_key(key_arn, spki_sha256)
 
 
 def _allowlist(family: str) -> dict:
-    """本 verifier 那份 allowlist（auth 持两个 family），装配逻辑在 verifier_env（与 panel 共用一份）。"""
-    return verifier_env.load_allowlist(os.environ.get("SESSION_KEYS_JSON"), family, _secret_by_param,
+    """本 verifier 那份 allowlist（auth 持两个 family）：公钥按 key_arn 取、与 spki_sha256 核对（fail closed）。"""
+    return verifier_env.load_allowlist(os.environ.get("SESSION_KEYS_JSON"), family, _get_public_key,
                                        allowed_families=("site", "console"))
 
 
-def _legacy_secret():
-    return verifier_env.legacy_secret(os.environ.get("LEGACY_ENTRY"), lambda: _secret("JWT_SECRET"))
-
-
-def _signer_mode() -> str:
-    """签发形态开关（3c-1B，spec §11.8.3）：`legacy` | `current`，来自 SESSION_SIGNER。
-
-    **handler 里唯一的分派点**：`mint_token` 只在 current 分支、`mint_session_jwt` /
-    `mint_upgrade_code` 只在 legacy 分支，由 tests/test_signer_switch_guard.py 的 AST 守卫锁死
-    （多一条不经开关的签发路径 = 多一批没人接受或不该存在的 token）。
-    """
-    return verifier_env.signer_mode(os.environ.get("SESSION_SIGNER"))
-
-
-def _signing_key(family: str) -> tuple:
-    """→ 该 family 的 (current kid, secret)。**handler 取签发 key 的唯一入口。**"""
-    return verifier_env.signing_key(os.environ.get("SESSION_KEYS_JSON"), family, _secret_by_param,
-                                    allowed_families=("site", "console"))
+def _signer(family: str, role: str = "current") -> tuple:
+    """→ (kid, sign)。**handler 取签发材料的唯一入口**（tests/test_signer_guard.py 的 AST 守卫锁死：
+    每次 mint_token 的 kid/sign 都必须是本函数同一次调用绑定出来的）。`role="previous"` 只给
+    /fixture-session（就位期探针）。KmsSigner 按 ARN 缓存：首次调用做一次 GetPublicKey 指纹自检。"""
+    kid, key_arn, spki = verifier_env.signing_ref(os.environ.get("SESSION_KEYS_JSON"), family,
+                                                  allowed_families=("site", "console"), role=role)
+    signer = _SIGNERS.get(key_arn)
+    if signer is None:
+        signer = _SIGNERS[key_arn] = session_kms.KmsSigner(_kms(), key_arn, spki)
+    return kid, signer
 
 
 def _log_verify_outcome(outcome: str) -> None:
@@ -490,9 +494,11 @@ def _oauth_error(err: urllib.error.HTTPError) -> tuple[str, str]:
 def _exchange_code(code: str, verifier: str, nonce: str) -> dict:
     """code → Cognito token → JWKS 验签 + nonce 校验 → {email, name}"""
     tokens = _post_token(code, verifier)
-    signing_key = _get_jwks_client().get_signing_key_from_jwt(tokens["id_token"])
+    # 名字不叫 signing_key：那是**会话**签名侧的词（tests/test_signer_guard.py 的
+    # FORBIDDEN_NAMES 锁着它），这里是 Cognito 的 JWKS 验签公钥，两回事。
+    id_token_key = _get_jwks_client().get_signing_key_from_jwt(tokens["id_token"])
     claims = pyjwt.decode(
-        tokens["id_token"], signing_key.key, algorithms=["RS256"],
+        tokens["id_token"], id_token_key.key, algorithms=["RS256"],
         audience=os.environ["CLIENT_ID"],
         issuer=f"https://cognito-idp.us-east-1.amazonaws.com/{os.environ['USER_POOL_ID']}")
     if claims.get("token_use") != "id":
@@ -561,24 +567,11 @@ def handler(event, context):
         if not code:
             return {"statusCode": 400,
                     "body": "授权失败或被取消，请重新登录"}
-        # 开关与签发密钥都先读、`_exchange_code` 后调：响亮失败必须发生在**烧掉这枚一次性
-        # 授权码之前**，否则用户重试还得从 /login 重来一遍（code 不能复用），而配置修好之前
-        # 每一次登录都如此。
-        # **真正会失败的是取密钥这步，不是开关**：`_signing_key` → allowlist 解析 →
-        # `ssm:GetParameter`，失败面是 SESSION_KEYS_JSON 缺失/非 JSON/family 缺 current、
-        # AccessDenied、ParameterNotFound（新 kid 的参数还没建）——都比"环境变量字面量漏下发"
-        # 常见得多。提前取不增加成本：**取密钥的总次数不变**（还是一次，只是挪到了前面），
-        # 而 `_secret_cache` 的 TTL 让它在 warm 容器上通常连 SSM 都不打。代价只有一处：
-        # code 无效的那些 callback 现在也会取一次密钥（以前跳过），上界仍是每 300 秒一次。
-        # legacy 那条随 3c-3 删 legacy 入口时一起消失，在那之前同样守住。
-        signer = _signer_mode()
-        if signer == "current":
-            kid, secret = _signing_key("site")
-        else:
-            # 名字带 signing：本函数下面的 /console-session 分支另有一个 `legacy_secret`，
-            # 那是**验签**用的（`_legacy_secret()`，LEGACY_ENTRY 关掉时是 None）。
-            # 同名会让"签发密钥"与"可以是 None 的验签密钥"在同一个作用域里混淆。
-            legacy_signing_secret = _secret("JWT_SECRET")
+        # 签发材料先取、`_exchange_code` 后调：响亮失败必须发生在**烧掉这枚一次性授权码之前**（ticket 20）。
+        # 会失败的是 SESSION_KEYS_JSON 缺失 / site 缺 current / kms:GetPublicKey AccessDenied / 公钥指纹
+        # 与配置不符（KmsSigner.self_check）——都比"环境变量漏下发"常见。自检只在容器首次签发时打一次 KMS。
+        kid, sign = _signer("site")
+        sign.self_check()
         try:
             user = _exchange_code(code, pkce["v"], pkce["n"])
         except (ValueError, TokenExchangeRejected, pyjwt.InvalidTokenError):
@@ -591,20 +584,12 @@ def handler(event, context):
             # 上游 5xx / 超时 / JWKS 拉取失败不在此列，照原样上抛成 5xx——
             # 平台故障不能伪装成"请重新登录"。
             return {"statusCode": 400, "body": "登录校验失败，请重新登录"}
-        # 3c-1B：签发形态由 SESSION_SIGNER 决定（spec §11.8.3）。current 用 site family 的
-        # current kid + 新合同（token_use/aud/iat，无 payload typ）；legacy 字节级沿用旧形态。
-        # 两条分支的 TTL 与 cookie 属性完全相同——本票只换签名密钥与 claim 集合。
-        # 密钥在上面（交换之前）就取好了，这里只用不取。
-        if signer == "current":
-            token = mint_token(kid=kid, secret=secret, token_use="site-session",
-                               email=user["email"], ttl_seconds=SESSION_TTL_SECONDS,
-                               name=user["name"], idp=user.get("idp", ""),
-                               auth_via=user.get("auth_via", ""))
-        else:
-            token = mint_session_jwt(user["email"], user["name"],
-                                     legacy_signing_secret, ttl_seconds=SESSION_TTL_SECONDS,
-                                     idp=user.get("idp", ""),
-                                     auth_via=user.get("auth_via", ""))
+        # 只有一种形态（spec §11.4 的站点会话表）：site family 的 current kid + RS256，签名经 KMS。
+        # 签发材料在上面（交换之前）就取好并自检过了，这里只用不取。
+        token = mint_token(kid=kid, sign=sign, token_use="site-session",
+                           email=user["email"], ttl_seconds=SESSION_TTL_SECONDS,
+                           name=user["name"], idp=user.get("idp", ""),
+                           auth_via=user.get("auth_via", ""))
         cookie = (f"sb_session={token}; Domain=.{base}; Path=/; Max-Age={SESSION_TTL_SECONDS}; "
                   f"Secure; HttpOnly; SameSite=Lax")
         clear_pkce = f"{PKCE_COOKIE}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax"
@@ -626,15 +611,13 @@ def handler(event, context):
         # typ=session 的候选"，不是"header 里的第一条"。理由见
         # `_session_cookie_candidates`（站点 JS 能在更长的 Path 上新建一条
         # 遮蔽项，只取第一条会让控制台写操作持久 302）。
-        # 3c-1A：「2 + 1」入口——site family 的 kid allowlist + legacy 入口（状态机 L1）。
-        # 有 kid 但不在 allowlist 直接拒、不回落；没有 kid 且 legacy 开着才按旧合同验。
+        # 3c-final：入口只有 site family 的 kid allowlist——**没有任何回落路径**。
+        # kid 不在 allowlist 直接拒（outcome=unknown_kid），签名对不上是 bad_signature。
         site_allowlist = _allowlist("site")
-        legacy_secret = _legacy_secret()
         claims, outcome = None, "bad_signature"
         for candidate in _session_cookie_candidates(event):
-            claims, outcome = verify_with_legacy(candidate, allowlist=site_allowlist,
-                                                 token_use="site-session",
-                                                 legacy_secret=legacy_secret)
+            claims, outcome = verify_token(candidate, allowlist=site_allowlist,
+                                           token_use="site-session")
             if claims:
                 break
         _log_verify_outcome(outcome)
@@ -649,20 +632,67 @@ def handler(event, context):
                     "headers": {"Location": f"https://auth.{base}/login?redirect={back}",
                                 "cache-control": "no-store"},
                     "body": ""}
-        # 3c-1B：升级码同样按 SESSION_SIGNER 分派，用的是 **console** family 的 current kid
-        # （auth 持两个 family 的读取权；Edge 只持 site，所以升级码投给 Edge 必拒——这正是
-        # 拆 family 想要的性质）。60 秒上限由 mint_token / mint_upgrade_code 各自钳制。
-        if _signer_mode() == "current":
-            kid, secret = _signing_key("console")
-            code = mint_token(kid=kid, secret=secret, token_use="console-upgrade",
-                              email=claims["email"], ttl_seconds=UPGRADE_MAX_TTL)
-        else:
-            code = mint_upgrade_code(claims["email"], _secret("JWT_SECRET"))
+        # 升级码用 **console** family 的 current kid（auth 持两个 family 的签发权；Edge 只持 site 的
+        # 公钥，所以升级码投给 Edge 必拒——这正是拆 family 想要的性质）。60 秒上限由 mint_token 钳制。
+        kid, sign = _signer("console")
+        code = mint_token(kid=kid, sign=sign, token_use="console-upgrade",
+                          email=claims["email"], ttl_seconds=UPGRADE_MAX_TTL)
         target = (f"https://console.{base}/api/session-callback"
                   f"?code={urllib.parse.quote(code, safe='')}")
         return {"statusCode": 302,
                 "headers": {"Location": target, "cache-control": "no-store"},
                 "body": ""}
+
+    if path == "/fixture-session":
+        # 验收身份的受控签发（spec §11.7 / ADR 0002）。**不配置 = 404**（与 ApiKey 组件同款"不存在"）。
+        if os.environ.get("FIXTURE_ISSUER") != "on":
+            return {"statusCode": 404, "body": "not found"}
+        if ((event.get("requestContext") or {}).get("http") or {}).get("method") != "POST":
+            return {"statusCode": 405, "body": ""}
+        # 应用层核对调用者：Edge role 能调同一个 Function URL（resource policy 放行它），必须在这里也拒。
+        # **这道检查只挡经 Function URL 的调用**——直接 lambda:InvokeFunction 的调用方自己构造整个事件，
+        # userArn 可伪造（edge_caller.py 的 Path A）；那条入口的危害上限由 Edge / panel 的夹具边界规则给，
+        # 不由这里给（ADR 0002）。
+        caller = (((event.get("requestContext") or {}).get("authorizer") or {}).get("iam") or {}).get("userArn") or ""
+        account = (getattr(context, "invoked_function_arn", "") or "").split(":")[4:5]
+        if not account or not re.fullmatch(
+                rf"arn:aws:sts::{re.escape(account[0])}:assumed-role/{re.escape(VERIFIER_ROLE_NAME)}/[^/]+", caller):
+            return {"statusCode": 403, "body": "forbidden"}
+        try:
+            body = json.loads(event.get("body") or "")
+            if not isinstance(body, dict):
+                raise ValueError("not an object")
+        except ValueError:
+            return {"statusCode": 400, "body": "body must be a JSON object"}
+        email = body.get("email")
+        # 夹具域是常量不是配置（授权边界要进 git review）；大小写敏感、精确后缀，不接受子域。
+        if (not isinstance(email, str) or email.count("@") != 1 or not email.split("@")[1] == FIXTURE_DOMAIN
+                or not email.split("@")[0]):
+            return {"statusCode": 400, "body": f"email must be <local>@{FIXTURE_DOMAIN}"}
+        role = body.get("role", "current")
+        if role not in ("current", "previous"):
+            return {"statusCode": 400, "body": "role must be current or previous"}
+        try:
+            ttl = min(int(body.get("ttl_seconds", FIXTURE_MAX_TTL)), FIXTURE_MAX_TTL)
+        except (TypeError, ValueError):
+            return {"statusCode": 400, "body": "ttl_seconds must be an integer"}
+        if ttl <= 0:
+            return {"statusCode": 400, "body": "ttl_seconds must be positive"}
+        name = body.get("name") if isinstance(body.get("name"), str) and body.get("name") else email.split("@")[0]
+        try:
+            kid, sign = _signer("site", role=role)
+        except RuntimeError as exc:                 # previous 槽位为空：就位之前没有 previous key 可签
+            if "previous" in str(exc):
+                return {"statusCode": 400, "body": "no previous site key is staged"}
+            raise
+        # 只签站点会话；来源标记是**夹具专用值**，请求体不能指定（Edge 据此只在夹具站点与平台路由上放行）。
+        token = mint_token(kid=kid, sign=sign, token_use="site-session", email=email,
+                           ttl_seconds=ttl, name=name, idp=FIXTURE_IDP, auth_via=FIXTURE_AUTH_VIA)
+        print(json.dumps({"event": "fixture_session_issued", "email": email, "kid": kid, "ttl_seconds": ttl,
+                          "caller": caller}))
+        return {"statusCode": 200,
+                "headers": {"content-type": "application/json", "cache-control": "no-store"},
+                "body": json.dumps({"token": token, "kid": kid, "ttl_seconds": ttl})}
 
     if path == "/logout":
         # 清平台会话，然后**把用户送去 Cognito 的 /logout 结束托管登录会话**。

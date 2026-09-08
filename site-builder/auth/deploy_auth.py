@@ -119,7 +119,7 @@ def build_zip() -> bytes:
 
 JWT_SECRET_PARAM = "/site-builder/jwt-secret"
 # 进包的本地模块（handler + 它 import 的同目录模块）；与 panel 的 COPY_FILES 同一种"清单以闭包断言为准"的纪律
-AUTH_PACKAGE_MODULES = ("login_handler.py", "session.py", "verifier_env.py")
+AUTH_PACKAGE_MODULES = ("login_handler.py", "session.py", "verifier_env.py", "session_kms.py")
 CLIENT_SECRET_PARAM = "/site-builder/site-client-secret"
 
 
