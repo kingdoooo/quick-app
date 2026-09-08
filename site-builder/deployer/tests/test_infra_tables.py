@@ -1363,3 +1363,20 @@ def test_real_template_buildspec_is_inlined_byte_for_byte(template):
     from security_contracts import buildspec_template_violations
     assert buildspec_template_violations(
         template.to_json(), BUILDSPEC.read_bytes()) == []
+
+
+# ── 3c-final：两把会话签名 CMK（spec §11.2 / ADR 0001）────────────────────
+# AST 侧的形态守卫在 `test_infra_kms_keys.py`（always-on、不需要 CDK）。这里补的是
+# "源码 AST 看不见"的那一半：`DeletionPolicy` / `UpdateReplacePolicy` 是 resource 级字段，
+# **默认 key policy 长什么样**更是 CDK 自己渲染出来的（ADR 0001 的全部内容就是"不写
+# policy、让 root 委派生效"——只有真模板能证明它确实只有那一条语句）。
+def test_session_signing_keys_are_asymmetric_retained_and_default_policy(template):
+    template.resource_count_is("AWS::KMS::Key", 2)
+    template.has_resource("AWS::KMS::Key", {"DeletionPolicy": "Retain", "UpdateReplacePolicy": "Retain",
+                                            "Properties": {"KeySpec": "RSA_2048", "KeyUsage": "SIGN_VERIFY"}})
+    for res in template.find_resources("AWS::KMS::Key").values():
+        props = res["Properties"]
+        assert props.get("EnableKeyRotation") in (None, False)
+        stmts = props["KeyPolicy"]["Statement"]
+        assert len(stmts) == 1 and stmts[0]["Action"] == "kms:*" and "root" in json.dumps(stmts[0]["Principal"])
+    template.resource_count_is("AWS::KMS::Alias", 2)

@@ -7,7 +7,8 @@
 
 这份文件盯三件事：
 
-① **探针自带的 18 条反例 + 2 条聚合/边际断言全过**（`test_script_self_test_passes`）；
+① **探针自带的那一屏反例 + 聚合/边际断言全过**（`test_script_self_test_passes`）；
+   条数不写死——新增等价路径就要新增一条反例，写死的数字只会变成过时的注释。
 ② **反例本身能红**（`test_*_mutation_*`）。探针的反例与被测代码在同一个文件里，
    最容易退化成"改判定顺手改期望"⇒ 这里从外面把动作等价类改窄，断言自检**转红**。
    这一条防的正是本仓库反复吃到的那类：守卫看着绿，其实什么都没证明。
@@ -158,3 +159,103 @@ def test_evidence_file_carries_no_account_id_or_role_names():
     data = json.loads(text)
     assert "raw_observed_sha256" in data, "没有原始输出的 hash ⇒ 无法回指 gitignored 产物"
     assert data["known_gaps"], "没有已知盲区清单 ⇒ 这份证据会被读成完整上界"
+
+
+# ---- 3c-final：真 key ARN + 夹具签发器那条受限冒充路 --------------------------------
+
+def test_the_two_real_cmks_come_from_config_not_a_placeholder_arn(probe):
+    """占位 ARN 时代量的是"对本账号**任意** key 的 identity 上界"；两把 CMK 真的存在之后，
+    继续用占位 ARN 会把 key policy 维度整条抹掉（`kms:Sign|<占位>` 谁都不会有）⇒
+    `sign:kms-direct` 恒为 0，读起来像"这条路已经关掉了"。
+    """
+    src = _SCRIPT.read_text(encoding="utf-8")
+    assert "placeholder-key" not in src, "还在用占位 key ARN"
+    s = probe._fake_surface()
+    assert isinstance(s.kms_keys, tuple) and len(s.kms_keys) >= 2, s.kms_keys
+    # 两把都要进模拟的资源集合，否则只量到 site 那把
+    resources = {r for _, rs in s.groups() for r in rs}
+    assert set(s.kms_keys) <= resources, resources
+
+
+def test_sign_on_either_key_counts(probe):
+    """**任一把**成立即标：console 那把能签面板会话，site 那把能签站点会话——
+    折成"只看 site"会漏掉一整个 family 的冒充面。"""
+    s = probe._fake_surface()
+    for key in s.kms_keys:
+        assert probe.classify(frozenset({f"kms:Sign|{key}"}), s) == {probe.S_KMS_DIRECT}, key
+        assert probe.classify(frozenset({f"kms:CreateGrant|{key}"}), s) == {probe.S_KMS_SELF}, key
+
+
+def test_fixture_issuer_is_a_label_and_has_a_candidate_mitigation(probe):
+    assert probe.S_FIXTURE_ISSUER == "sign:fixture-issuer"
+    assert probe.S_FIXTURE_ISSUER in probe.ALL_LABELS
+    covered = {lb for group in probe.MITIGATIONS.values() for lb in group}
+    assert probe.S_FIXTURE_ISSUER in covered
+
+
+def test_direct_invoke_of_the_auth_function_is_the_fixture_issuer_entry(probe):
+    """`POST /fixture-session` 走 auth 的 Function URL；能直接 `lambda:InvokeFunction`
+    的 principal 不需要 assume verifier 角色就能拿到夹具会话（spec §11.7 / ADR 0002）。"""
+    s = probe._fake_surface()
+    assert probe.classify(frozenset({f"lambda:InvokeFunction|{s.auth_fn}"}), s) \
+        == {probe.S_FIXTURE_ISSUER}
+    # 资源维度不许折叠：打在 panel / Edge 上的 invoke 不是夹具签发入口
+    assert probe.classify(frozenset({f"lambda:InvokeFunction|{s.panel_fn}"}), s) == set()
+    assert probe.classify(frozenset({f"lambda:InvokeFunction|{s.edge_fn}"}), s) == set()
+
+
+def test_the_verifier_role_itself_is_the_url_entry(probe):
+    """URL 入口：`site-builder-verifier` 角色的 inline policy 就是那两条 invoke 语句 ⇒
+    角色本身即持有这条路，不需要在模拟结果里出现任何动作。"""
+    s = probe._fake_surface()
+    assert probe.classify(frozenset(), s, probe.VERIFIER_ROLE_NAME) == {probe.S_FIXTURE_ISSUER}
+    assert probe.classify(frozenset(), s, "some-other-role") == set()
+
+
+def test_read_only_kms_is_still_not_a_capability(probe):
+    """反例：只有 `kms:GetPublicKey` 的 principal 既不能签，也拿不到夹具会话。
+    公钥不是秘密——把它算进冒充面会让 headline 虚高一大截。"""
+    s = probe._fake_surface()
+    for key in s.kms_keys:
+        assert probe.classify(frozenset({f"kms:GetPublicKey|{key}",
+                                         f"kms:DescribeKey|{key}"}), s) == set()
+
+
+def test_fixture_issuer_is_reported_separately_from_can_sign(probe):
+    """夹具签发器是**受限**冒充（只签夹具域邮箱、TTL ≤ 30 分钟、Edge 只在夹具站点认）
+    ⇒ 单列，不并进 `can_sign`。并进去会让"3c 之后还有多少人能冒充任意用户"这个数字
+    把验收工具的持有者也算进来。
+    """
+    agg = probe.summarize({"p-fixture-only": {probe.S_FIXTURE_ISSUER},
+                           "p-real-sign": {probe.S_KMS_DIRECT}})
+    assert agg["can_sign"] == 1, "夹具签发器被并进了 can_sign"
+    assert agg["impersonation_surface_union"] == 1
+    assert agg["fixture_issuer_holders"] == 1
+
+
+def test_no_mitigation_can_report_a_negative_marginal_value(probe):
+    """边际收益 = 冒充面里离开的人数，**分母是冒充面**。拿全体 principal 做分母时，
+    只持夹具入口的人会让 `principals_removed` 变成负数（面 1 → remaining 2）。
+    """
+    agg = probe.summarize({"p-fixture-only": {probe.S_FIXTURE_ISSUER},
+                           "p-cfn-only": {probe.E_CFN_UPDATE_STACK}})
+    for name, m in agg["marginal_value_if_closed"].items():
+        assert 0 <= m["principals_removed"] <= agg["impersonation_surface_union"], (name, m)
+        assert m["surface_after"] <= agg["impersonation_surface_union"], (name, m)
+    assert agg["marginal_value_if_closed"]["fixture-issuer-verifier-boundary"][
+        "principals_removed"] == 0, "关掉验收工具不该被记成冒充面收益"
+
+
+def test_self_test_goes_red_when_the_fixture_issuer_entry_is_dropped(probe, capsys):
+    """变形测试：把"直接 invoke auth"这条入口从动作等价类里去掉，自检必须转红。
+    否则上面那些 `classify` 断言可能只是在复述一个恒真的实现。"""
+    probe.LAMBDA_INVOKE = ("lambda:ThisActionDoesNotExist",)
+    assert probe.self_test() == 1
+    capsys.readouterr()
+
+
+def test_the_known_gaps_admit_the_assume_role_chain_is_not_modelled(probe):
+    """能 assume `site-builder-verifier` 的链要靠信任策略分析，本探针不做 ⇒ 必须写进盲区，
+    否则那个计数会被读成"夹具入口的完整持有者集合"。"""
+    src = _SCRIPT.read_text(encoding="utf-8")
+    assert "assume" in src and "信任策略" in src

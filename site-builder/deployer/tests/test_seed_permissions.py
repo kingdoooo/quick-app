@@ -447,10 +447,6 @@ _REQUIRE_AUTH_ALLOWED = {
     # `_parse_allowed` 那样把坏类型报成错误：Edge 对那些行的判定是明确的
     # （fail-closed 需登录），报成"数据损坏"会把一批策略清楚的行拦在迁移之外。
     "scripts/migrate_permissions.py",
-    # migrate_sites_to_blue_green.py：只 `SET api_target`（带
-    # attribute_exists(subdomain)，造不出半行）。它读 `require_auth` 是为了在
-    # 计划输出里标注"这条是公开站点"，同一个 fail-closed 推导。
-    "scripts/migrate_sites_to_blue_green.py",
     # check_permissions_state.py：只读诊断。`require_auth` 出现在
     # `ENFORCING_PAIRS`（真源字段 ↔ 投影字段的对照表，用来报"真源说私有、Edge
     # 仍按公开放行"）和一个打印字段清单里。它一行都不写。

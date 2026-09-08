@@ -384,7 +384,7 @@ def test_unmigrated_site_fails_closed(aws, monkeypatch):
     _route_item("https://old.lambda-url.us-east-1.on.aws")
     lam = _lam_mock(exists=True, colors=())
     with patch.object(d, "_lambda", return_value=lam):
-        with pytest.raises(d.UnmigratedSite, match="migrate_sites_to_blue_green"):
+        with pytest.raises(d.UnmigratedSite, match="UnmigratedSite|未迁移"):
             d.handler(dict(EVENT), None)
     lam.update_function_code.assert_not_called()      # $LATEST 都没碰
     lam.publish_version.assert_not_called()
@@ -417,10 +417,9 @@ def test_half_migrated_site_fails_closed(aws, monkeypatch):
     """**半迁移**（blue alias + blue URL 都建好了，但路由还指着无 qualifier 的旧
     URL）⇒ 同样必须拒绝，且必须在动任何字节**之前**。
 
-    这是 Codex 2026-08-17 P1-3。可达性不是纸面的：迁移脚本
-    (`migrate_sites_to_blue_green.migrate_one`) 的健康门失败时正好留下这个状态
-    ——它建完 alias / URL / 授权才跑健康门，不过就返回 `skipped:unhealthy` 并
-    **故意不切路由**。
+    这是 Codex 2026-08-17 P1-3。可达性不是纸面的：存量环境的迁移脚本（资产不含它，
+    ADR 0005）在健康门失败时正好留下这个状态——它建完 alias / URL / 授权才跑健康门，
+    不过就**故意不切路由**。被中断的手工重部也能造出同一态。
 
     旧判据 `live is None and not urls` 的那个 AND 漏掉这一态：`urls` 非空 ⇒ 闸门
     放行 ⇒ `update_function_code` 推 $LATEST，而路由此刻正指着 $LATEST 的 URL ⇒
@@ -436,7 +435,7 @@ def test_half_migrated_site_fails_closed(aws, monkeypatch):
     _route_item("https://old.lambda-url.us-east-1.on.aws")   # 路由仍在 $LATEST
     lam = _lam_mock(exists=True, colors=("blue",))           # 但 blue 已经建好了
     with patch.object(d, "_lambda", return_value=lam):
-        with pytest.raises(d.UnmigratedSite, match="migrate_sites_to_blue_green"):
+        with pytest.raises(d.UnmigratedSite, match="UnmigratedSite|未迁移"):
             d.handler(dict(EVENT), None)
     lam.update_function_code.assert_not_called()      # ← 这条才是 P1-3 的要害
     lam.publish_version.assert_not_called()

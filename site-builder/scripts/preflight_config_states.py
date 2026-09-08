@@ -1,10 +1,9 @@
-"""把轮转 runbook 剩余各步的 `config.ini` 状态**提前模拟**，跑单测看哪条会红。
+"""把轮转 runbook 各步的 `config.ini` 状态**提前模拟**，跑单测看哪条会红。
 
-为什么要有它（2026-09-03 真机踩出来的）：演练的每一步都在改 `[SessionKeys]`
-（⑤ 清空 `legacy_param`、⑥ 加 v2 两节 + 设 `*_previous`、⑦ 互换槽位、⑩ 清 previous + 删 v1 两节）。
+为什么要有它（2026-09-03 真机踩出来的）：轮转的每一步都在改 `[SessionKeys]`
+（**就位** = 加 v2 两节 + 设 `*_previous`、**切换** = 互换槽位、**退役** = 清 previous + 删 v1 两节）。
 把配置的**当前值**写死的用例会在**改完配置、部署之后**才成片转红——ticket 10 就是这么撞上的，
-而它们要守的性质其实一条都没变。本脚本在动生产之前把这些假红全找出来：首跑实测 panel
-在 ⑤⑥⑦ 各 3 条红、⑩ 6 条红，其余六包全绿。
+而它们要守的性质其实一条都没变。本脚本在动生产之前把这些假红全找出来。
 
 **不发任何 AWS 调用**，但**它会就地改写 `site-builder/config.ini`**——那是所有部署脚本与 CDK 栈的
 唯一取值来源。因此有三道保护（3c-1B ticket 17 第 9 条加的；此前只有一个 `finally` + `assert`）：
@@ -23,19 +22,23 @@
 
 3c-1B-G A3 修了三条会让它变成"打印 RED 然后 exit 0"的报告脚本的缺陷：
 
-4. **下一版 kid 从 config 推导**（`{family}_current` 的版本号 +1），不再写死 `*-hs-v2`。
-   v1→v2 那轮之后线上 current 就是 v2，无条件追加 `[SessionKey:*-hs-v2]` 会让
+4. **下一版 kid 从 config 推导**（`{family}_current` 的版本号 +1），不再写死 `*-rs-v2`。
+   v1→v2 那轮之后线上 current 就是 v2，无条件追加 `[SessionKey:*-rs-v2]` 会让
    configparser 抛 `DuplicateSectionError` ⇒ 六个套件全在 collection 期炸。`--next-kid`
-   可以点名（`--next-kid site=site-hs-v9`）。
-5. **⑤ 同时把 signer 切成 current**，并且每个模拟状态**先过 `load_session_keys` 自校验**
-   再跑套件。加载器硬拒 `(signer=legacy, 空 legacy_param)`，而出厂默认就是 `signer = legacy`。
+   可以点名（`--next-kid site=site-rs-v9`）。
+5. 每个模拟状态**先过 `load_session_keys` 自校验**再跑套件——非法配置该在这里一句话响亮失败，
+   而不是让六个套件各自以 collection error 的形式红一片（那种报告读不出根因）。
 6. **任一套件红 ⇒ 退出码非零**，且 collection `ERROR`/`E   ` 行与 stderr 都进报告
    （原先只 filter `FAILED`，collection 期失败会显示成"红 0 条"）。
    状态变换里的裸 `assert` 也换成了 `PreflightError`——`-O` 下 assert 被删掉的话，
-   变换静默 no-op，脚本会拿**未修改**的配置跑出"四个状态全绿"。
+   变换静默 no-op，脚本会拿**未修改**的配置跑出"三个状态全绿"。
+
+3c-final 起只有三个状态：签发形态只有一种（KMS RS256），既没有旧的共享密钥入口可清、也没有
+签发形态开关可切，HS 时代那个多出来的状态随之消失。就位用的**假 key 材料**（假 ARN + 假指纹）
+只需要过加载器的形态校验——本脚本不发 AWS 调用，也不需要那把 key 真的存在。
 
     python3 site-builder/scripts/preflight_config_states.py
-    python3 site-builder/scripts/preflight_config_states.py --next-kid site=site-hs-v9
+    python3 site-builder/scripts/preflight_config_states.py --next-kid site=site-rs-v9
 """
 import argparse, hashlib, json, os, re, shutil, signal, subprocess, sys, tempfile, time
 from pathlib import Path
@@ -48,7 +51,7 @@ class PreflightError(RuntimeError):
     """状态变换本身出错（锚点没命中、节没删掉、推导不出版本）。
 
     **刻意不是 `assert`**：`python3 -O` 会把 assert 整条去掉，于是变换静默 no-op，
-    脚本拿**未修改**的配置跑六个套件、全绿、报告"四个状态都没问题"——那正是本脚本
+    脚本拿**未修改**的配置跑六个套件、全绿、报告"三个状态都没问题"——那正是本脚本
     要防的那类假绿的最坏形态（还原核对早在 ticket 17 就因为同一条理由改成了真异常）。
     """
 
@@ -74,9 +77,9 @@ def current_kids(t):
         if not m:
             raise PreflightError(f"config 里找不到 {fam}_current —— 没法推导下一版 kid")
         kid = m.group(1)
-        v = re.fullmatch(rf"{fam}-hs-v(\d+)", kid)
+        v = re.fullmatch(rf"{fam}-rs-v(\d+)", kid)
         if not v:
-            raise PreflightError(f"{fam}_current={kid!r} 不是 `{fam}-hs-v<N>` 形态 —— 无法推导下一版")
+            raise PreflightError(f"{fam}_current={kid!r} 不是 `{fam}-rs-v<N>` 形态 —— 无法推导下一版")
         out[fam] = (kid, int(v.group(1)))
     return out
 
@@ -84,47 +87,62 @@ def current_kids(t):
 def next_kids(t, explicit: dict | None = None):
     """下一轮要就位的 kid：默认 current 的版本号 +1；`explicit` 可点名（`--next-kid`）。
 
-    **不能写死 `*-hs-v2`**（3c-1B-G A3）：v1→v2 那轮之后线上 current 就是 v2，
-    再无条件追加一份 `[SessionKey:*-hs-v2]` 会让 configparser 直接
+    **不能写死 `*-rs-v2`**（3c-1B-G A3）：v1→v2 那轮之后线上 current 就是 v2，
+    再无条件追加一份 `[SessionKey:*-rs-v2]` 会让 configparser 直接
     `DuplicateSectionError` ⇒ 六个套件全在 collection 期炸，而报告里只看到"红 0 条"。
     """
     cur = current_kids(t)
     out = {}
     for fam, (kid, n) in cur.items():
-        nxt = (explicit or {}).get(fam) or f"{fam}-hs-v{n + 1}"
+        nxt = (explicit or {}).get(fam) or f"{fam}-rs-v{n + 1}"
         if nxt == kid:
             raise PreflightError(f"{fam} 的下一版 kid 与 current 相同（{kid}）——那不是一次轮转")
         out[fam] = nxt
     return out
 
 
+def _fake_material(kid: str) -> tuple:
+    """给 kid 造一对**互不相同**的假 key 材料（假 KMS key ARN + 假 spki_sha256）。
+
+    加载器只校验形态（`arn:aws:kms:<区>:<12 位账号>:key/<uuid>` 与 64 位小写 hex），
+    所以这里不需要那把 key 真的存在——本脚本一个 AWS 调用都不发。
+
+    **索引必须逐 kid 唯一，不能按版本号生成**：`site-rs-v2` 与 `console-rs-v2` 都是 v2，
+    按版本号生成会让两个 family 拿到同一份材料，而加载器把"两个 kid 指向同一把 KMS key /
+    同一个公钥指纹"判成配置错 ⇒ 三个状态全部死在 `validate()`，报的是"模拟状态本身不是
+    合法配置"，看不出根因在这个函数（`test_the_two_families_get_distinct_fake_key_material`）。
+    偏移 2 是为了不与 `config.ini.example` 里 v1 那两行的 0 / 1 撞。
+    """
+    m = re.fullmatch(r"(site|console)-rs-v(\d+)", kid)
+    if not m:
+        raise PreflightError(f"{kid!r} 不是 `{{site|console}}-rs-v<N>` 形态 —— 造不出假 key 材料")
+    idx = int(m.group(2)) * 2 + (0 if m.group(1) == "site" else 1)
+    return f"arn:aws:kms:us-east-1:000000000000:key/00000000-0000-0000-0000-{idx:012x}", f"{idx:064x}"
+
+
 def key_sections(kids: dict) -> str:
-    """给 kid 生成 `[SessionKey:<kid>]` 小节；`ssm_param` 必须**恰好**是前缀 + kid（A4 的等值约束）。"""
-    return "".join(f"\n[SessionKey:{kid}]\nalg = HS256\n"
-                   f"ssm_param = /site-builder/session-keys/{kid}\n" for kid in kids.values())
+    """给 kid 生成 `[SessionKey:<kid>]` 小节：RS 三行（alg / key_arn / spki_sha256）。"""
+    out = []
+    for kid in kids.values():
+        arn, spki = _fake_material(kid)
+        out.append(f"\n[SessionKey:{kid}]\nalg = RS256\nkey_arn = {arn}\nspki_sha256 = {spki}\n")
+    return "".join(out)
 
 
-def state_l3(t, nxt=None):             # ⑤
-    """清空 legacy_param。**必须同时把 signer 切成 current**：加载器硬拒
-    `(signer=legacy, 空 legacy_param)` 这个组合，而出厂 `config.ini.example` 的
-    signer 就是 legacy ⇒ 不切的话四个模拟状态全是非法配置，六个套件一片红，
-    而红的原因与本脚本要找的"写死当前值的用例"毫无关系（3c-1B-G A3）。"""
-    return setkey(setkey(t, "signer", "current"), "legacy_param", "")
-
-def state_stage(t, nxt=None):          # ⑥（在 ⑤ 之后）
+def state_stage(t, nxt=None):          # 就位：新 key 经 previous 进入接受集合
     nxt = nxt or next_kids(t)
-    t = state_l3(t) + key_sections(nxt)
+    t = t + key_sections(nxt)
     t = setkey(t, "site_previous", nxt["site"])
     return setkey(t, "console_previous", nxt["console"])
 
-def state_switch(t, nxt=None):         # ⑦
+def state_switch(t, nxt=None):         # 切换：两槽互换（新 key 开始签发）
     nxt = nxt or next_kids(t)
     cur = {f: k for f, (k, _) in current_kids(t).items()}
     t = state_stage(t, nxt)
     t = setkey(t, "site_current", nxt["site"]);       t = setkey(t, "site_previous", cur["site"])
     t = setkey(t, "console_current", nxt["console"]); return setkey(t, "console_previous", cur["console"])
 
-def state_retire(t, nxt=None):         # ⑩
+def state_retire(t, nxt=None):         # 退役：排空之后清 previous + 删旧 key 两节
     nxt = nxt or next_kids(t)
     cur = {f: k for f, (k, _) in current_kids(t).items()}
     t = state_switch(t, nxt)
@@ -133,10 +151,15 @@ def state_retire(t, nxt=None):         # ⑩
     return drop_section(t, f"SessionKey:{cur['console']}")
 
 
+# runbook 的三步，**顺序即依赖**（每个状态都在前一个之上叠）。加/减状态要同时改
+# `test_the_states_are_exactly_stage_switch_retire_and_the_l3_state_is_gone`。
+STATES = (("stage", state_stage), ("switch", state_switch), ("retire", state_retire))
+
+
 def validate(text: str, tag: str) -> None:
     """模拟出来的状态**先过加载器**再跑套件。
 
-    非法配置（例如忘了切 signer、或推导出的 kid 与既有小节重复）应当在这里一句话响亮失败，
+    非法配置（例如推导出的 kid 与既有小节重复、或假 key 材料两个 family 撞了）应当在这里一句话响亮失败，
     而不是让六个套件各自以 collection error 的形式红一片——那种报告读不出根因。
     """
     sys.path.insert(0, str(ROOT / "site-builder" / "auth"))
@@ -225,7 +248,7 @@ def restore(backup: Path, base: str) -> None:
 def main(argv: list | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--next-kid", action="append", default=[], metavar="FAMILY=KID",
-                    help="点名下一轮要就位的 kid（可重复，如 site=site-hs-v3）。"
+                    help="点名下一轮要就位的 kid（可重复，如 site=site-rs-v3）。"
                          "缺省从 config 里 `{family}_current` 的版本号 +1 推导")
     args = ap.parse_args(argv)
     explicit = {}
@@ -265,8 +288,7 @@ def main(argv: list | None = None) -> int:
         # 信号处理也放进 try：从哨兵写下的那一刻起，任何失败都必须走 finally 的 restore。
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             signal.signal(sig, _on_signal)
-        for tag, fn in (("⑤L3", state_l3), ("⑥stage", state_stage),
-                        ("⑦switch", state_switch), ("⑩retire", state_retire)):
+        for tag, fn in STATES:
             text = fn(base, nxt)
             validate(text, tag)          # 非法配置在这里就响亮失败，不浪费六套件的时间
             CFG.write_text(text)

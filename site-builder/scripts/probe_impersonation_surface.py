@@ -86,6 +86,7 @@ _HERE = Path(__file__).resolve().parent
 _ROOT = _HERE.parent.parent                      # 仓库根（**不写绝对路径**）
 GATE = _HERE / "verify_account_trust_boundary.py"
 ROUTER_CONFIG = _ROOT / "router" / "config.ini"
+SITE_CONFIG = _ROOT / "site-builder" / "config.ini"      # [SessionKeys]：两把 CMK 的 key ARN
 EVIDENCE = _ROOT / "docs" / "security" / "3c-impersonation-surface.json"
 
 # ---------------------------------------------------------------- 动作等价类
@@ -109,6 +110,10 @@ KMS_READONLY = ("kms:GetPublicKey", "kms:DescribeKey")
 LAMBDA_CODE_EXEC = ("lambda:UpdateFunctionCode", "lambda:UpdateFunctionConfiguration")
 LAMBDA_PUBLISH = ("lambda:PublishVersion",)
 LAMBDA_CREATE = ("lambda:CreateFunction",)
+# 夹具签发器的**直接入口**：`POST /fixture-session` 走 auth 的 Function URL，而 Function URL
+# 的 IAM 授权用的就是 `lambda:InvokeFunctionUrl` + `lambda:InvokeFunction`。能直接调 auth 函数的
+# principal 不需要 assume `site-builder-verifier` 就能拿到夹具会话（spec §11.7 / ADR 0002）。
+LAMBDA_INVOKE = ("lambda:InvokeFunction",)
 CF_READ = ("cloudfront:GetDistributionConfig",)
 CF_WRITE = ("cloudfront:UpdateDistribution",)
 # router 栈已关联 CFN service role 且无 stack policy ⇒ 这两条都不需要 PassRole。
@@ -127,15 +132,26 @@ S_KMS_DIRECT = "sign:kms-direct"
 S_KMS_SELF = "sign:kms-self-authorize"
 S_HIJACK_AUTH = "sign:hijack-auth-signer"
 S_HIJACK_PANEL = "sign:hijack-panel-signer"
+# **受限**冒充：夹具签发器只给夹具域（`e2e.invalid`）的邮箱签站点会话，TTL ≤ 30 分钟，
+# 而 Edge 只在夹具站点与平台路由上认这种会话、panel 拒绝把夹具域邮箱写进任何权限字段
+# （spec §11.7 / ADR 0002）。所以它**单列**、不并进 `can_sign`：并进去会让"3c 之后还有多少人
+# 能冒充任意用户"这个 headline 把验收工具的持有者也算进来。
+S_FIXTURE_ISSUER = "sign:fixture-issuer"
 E_PUBLISH_THEN_ASSOCIATE = "edge:code+publish+associate"
 E_PUBLISH_INLINE = "edge:code(Publish=True)+associate"
 E_NEW_FUNCTION = "edge:new-function+associate"
 E_CFN_UPDATE_STACK = "edge:cfn-update-stack"
 E_CFN_CHANGE_SET = "edge:cfn-change-set"
 
-ALL_LABELS = (S_KMS_DIRECT, S_KMS_SELF, S_HIJACK_AUTH, S_HIJACK_PANEL,
+ALL_LABELS = (S_KMS_DIRECT, S_KMS_SELF, S_HIJACK_AUTH, S_HIJACK_PANEL, S_FIXTURE_ISSUER,
               E_PUBLISH_THEN_ASSOCIATE, E_PUBLISH_INLINE, E_NEW_FUNCTION,
               E_CFN_UPDATE_STACK, E_CFN_CHANGE_SET)
+
+# 夹具签发器角色名。**第四份同名字面量**（`auth/deploy_auth.py` 与 `auth/login_handler.py` 是
+# 生产真源，`scripts/_session_mint.py` 是验收客户端）：本探针刻意不 import 它们——那会把
+# boto3 与 auth 的模块级初始化拖进 `--self-test`（那条路必须一个 AWS 依赖都没有）。
+# 这里只做**名字相等比较**，改名时 `verify_deployed_components.py` 的角色存在性那条会先红。
+VERIFIER_ROLE_NAME = "site-builder-verifier"
 
 # ---------------------------------------------------------------- 候选缓解措施
 #
@@ -154,6 +170,11 @@ MITIGATIONS: dict[str, tuple[str, ...]] = {
     # 锁住 Edge 的 association / 换码那条直接链
     "lock-edge-association": (E_PUBLISH_INLINE, E_PUBLISH_THEN_ASSOCIATE,
                               E_NEW_FUNCTION),
+    # 夹具签发器：它的"缓解"就是 **verifier 侧的边界**（ADR 0002：Edge 只在夹具站点与平台路由上
+    # 认夹具会话，panel 拒绝夹具域邮箱进任何权限字段），这条边界已经在生产代码里。关掉这一组
+    # 等于关掉整套验收工具（四个 verify_* + E2E + smoke 都靠它拿登录态）⇒ **边际收益按 0 记**，
+    # 而 0 正是 `summarize` 会算出来的结果：夹具入口不进 `can_sign` ⇒ 只持它的人本来就不在冒充面里。
+    "fixture-issuer-verifier-boundary": (S_FIXTURE_ISSUER,),
 }
 
 
@@ -162,7 +183,10 @@ class Surface:
     """探针要打的资源集合。**全部靠发现，不硬编码**——distribution ID / 账号 ID /
     内部角色名都不许出现在被跟踪的源码里（仓库红线）。"""
     region: str
-    kms_key: str            # 占位 ARN：3c 的两把 CMK 还不存在
+    # 真实的两把会话签名 CMK（`[SessionKeys]` 里 site + console 的 current/previous 全部 key ARN）。
+    # **不再是占位 ARN**：占位 ARN 量的是"对本账号任意 key 的 identity 上界"，两把 key 真的存在之后
+    # 那个口径会把 `kms:Sign|<占位>` 变成谁都没有 ⇒ `sign:kms-direct` 恒为 0，读起来像这条路已经关了。
+    kms_keys: tuple[str, ...]
     edge_fn: str
     auth_fn: str
     panel_fn: str
@@ -177,8 +201,8 @@ class Surface:
         """按服务分组批量模拟。跨服务混在一条调用里会产生大量无意义的
         action×resource 组合（都是 implicitDeny），既慢又难读。"""
         return (
-            (list(KMS_SIGN + KMS_SELF_AUTHORIZE + KMS_READONLY), [self.kms_key]),
-            (list(LAMBDA_CODE_EXEC + LAMBDA_PUBLISH + LAMBDA_CREATE),
+            (list(KMS_SIGN + KMS_SELF_AUTHORIZE + KMS_READONLY), list(self.kms_keys)),
+            (list(LAMBDA_CODE_EXEC + LAMBDA_PUBLISH + LAMBDA_CREATE + LAMBDA_INVOKE),
              [self.edge_fn, self.auth_fn, self.panel_fn, self.new_fn]),
             (list(CF_READ + CF_WRITE), [self.distribution]),
             (list(CFN_UPDATE + CFN_CHANGESET), [self.stack]),
@@ -186,20 +210,30 @@ class Surface:
         )
 
 
-def classify(allowed: frozenset[str], s: Surface) -> set[str]:
-    """一个 principal 的 `"action|resource"` 允许集合 → 它持有的**能力标签**。
+def classify(allowed: frozenset[str], s: Surface, name: str = "") -> set[str]:
+    """一个 principal 的 `"action|resource"` 允许集合（+ 它的名字）→ 它持有的**能力标签**。
 
     **纯函数**，不碰 AWS ⇒ 反例可以在本文件里跑（`--self-test`）。这是本脚本唯一
     的判定逻辑；真机部分只负责把 `allowed` 填出来。
+
+    `name` 只用于一条判据：`site-builder-verifier` 角色**本身**就持有夹具签发器那条路
+    （它的 inline policy 就是对 auth Function URL 的两条 invoke 语句），这在
+    `simulate_principal_policy` 的结果里表现为 invoke 被允许，但显式按名字判一次更稳
+    ——它是资产里唯一"名字即能力"的角色。
     """
     def ok(actions, resource: str) -> bool:
         return any(f"{a}|{resource}" in allowed for a in actions)
 
+    def ok_any_key(actions) -> bool:
+        """**任一把 key 成立即算**：site 那把能签站点会话、console 那把能签面板会话，
+        两者都是完整冒充。折成"只看 site"会漏掉一整个 family。"""
+        return any(ok(actions, k) for k in s.kms_keys)
+
     labels: set[str] = set()
 
-    if ok(KMS_SIGN, s.kms_key):
+    if ok_any_key(KMS_SIGN):
         labels.add(S_KMS_DIRECT)
-    if ok(KMS_SELF_AUTHORIZE, s.kms_key):
+    if ok_any_key(KMS_SELF_AUTHORIZE):
         labels.add(S_KMS_SELF)
     # 劫持 signer：这两个函数的 Function URL 无 qualifier、服务 `$LATEST`
     # ⇒ 换码即刻生效，**不需要发版本、不需要碰 CloudFront**。
@@ -207,6 +241,9 @@ def classify(allowed: frozenset[str], s: Surface) -> set[str]:
         labels.add(S_HIJACK_AUTH)
     if ok(LAMBDA_CODE_EXEC, s.panel_fn):
         labels.add(S_HIJACK_PANEL)
+    # 夹具签发器（受限冒充，单列）：直接 invoke auth 函数 = 直接入口；角色名相等 = URL 入口。
+    if ok(LAMBDA_INVOKE, s.auth_fn) or (name and name == VERIFIER_ROLE_NAME):
+        labels.add(S_FIXTURE_ISSUER)
 
     # Edge：必须让 CloudFront 关联到攻击者的代码上。三类等价路径。
     if ok(CF_WRITE, s.distribution):
@@ -230,14 +267,19 @@ def summarize(by_principal: dict[str, set[str]]) -> dict[str, Any]:
         return {arn for arn, ls in by_principal.items() if pred(ls)}
 
     per_label = {lb: len(holders(lambda ls, lb=lb: lb in ls)) for lb in ALL_LABELS}
-    can_sign = holders(lambda ls: any(l.startswith(SIGN_PREFIX) for l in ls))
+    # **`sign:fixture-issuer` 不进 `can_sign`**（spec §1：受限冒充，单列不合并）。它带 `sign:`
+    # 前缀是为了在 per_label 里与其它签名路径排在一起，但它签不出任意用户的会话。
+    can_sign = holders(lambda ls: any(l.startswith(SIGN_PREFIX) and l != S_FIXTURE_ISSUER
+                                      for l in ls))
     can_edge = holders(lambda ls: any(l.startswith(EDGE_PREFIX) for l in ls))
     surface = can_sign | can_edge
 
     # 每个候选措施的**边际收益** = 关掉那一组路径后完全离开冒充面的 principal 数。
+    # **分母与分子都只在 `surface` 里算**：拿全体 principal 当分母时，只持夹具入口的人
+    # （不在冒充面里）会留在 remaining 里，把 `principals_removed` 算成负数。
     marginal: dict[str, dict[str, int]] = {}
     for name, closed in MITIGATIONS.items():
-        remaining = {arn for arn, ls in by_principal.items() if ls - set(closed)}
+        remaining = {arn for arn in surface if by_principal[arn] - set(closed)}
         marginal[name] = {
             "closes_paths": len(closed),
             "surface_after": len(remaining),
@@ -248,6 +290,8 @@ def summarize(by_principal: dict[str, set[str]]) -> dict[str, Any]:
         "per_label": per_label,
         "can_sign": len(can_sign),
         "can_replace_edge_verifier": len(can_edge),
+        # 单列：受限冒充的持有者数（**不在** impersonation_surface_union 里）。
+        "fixture_issuer_holders": len(holders(lambda ls: S_FIXTURE_ISSUER in ls)),
         "impersonation_surface_union": len(surface),
         "both": len(can_sign & can_edge),
         "sign_only": len(can_sign - can_edge),
@@ -260,7 +304,8 @@ def summarize(by_principal: dict[str, set[str]]) -> dict[str, Any]:
 # ---------------------------------------------------------------- 反例自检
 
 def _fake_surface() -> Surface:
-    return Surface(region="r", kms_key="KEY", edge_fn="EDGE", auth_fn="AUTH",
+    # 两把 key（site / console）：`kms:Sign` 打在**任一把**上都是完整冒充，反例要能分别命中。
+    return Surface(region="r", kms_keys=("KEY", "KEY2"), edge_fn="EDGE", auth_fn="AUTH",
                    panel_fn="PANEL", new_fn="NEW", distribution="DIST",
                    stack="STACK", edge_role="EDGEROLE",
                    edge_association_qualifier="7")
@@ -327,9 +372,22 @@ def self_test() -> int:
          {E_NEW_FUNCTION}),
         # ---- 反例⑥：KMS ----
         ("kms:Sign", labels("kms:Sign|KEY"), {S_KMS_DIRECT}),
+        ("kms:Sign 打在另一把 key 上同样成立（console family）",
+         labels("kms:Sign|KEY2"), {S_KMS_DIRECT}),
         ("kms:CreateGrant 自助授权", labels("kms:CreateGrant|KEY"), {S_KMS_SELF}),
-        ("kms:GetPublicKey 不是冒充能力（公钥不是秘密）",
-         labels("kms:GetPublicKey|KEY"), set()),
+        ("kms:GetPublicKey 不是冒充能力（公钥不是秘密），也不是夹具入口",
+         labels("kms:GetPublicKey|KEY2", "kms:DescribeKey|KEY2"), set()),
+        # ---- 反例⑦：夹具签发器（受限冒充，单列标签）----
+        ("只有 lambda:InvokeFunction(auth)：夹具签发器的直接入口，不需要 assume verifier",
+         labels("lambda:InvokeFunction|AUTH"), {S_FIXTURE_ISSUER}),
+        ("同一个动作打在 panel 上不是夹具入口（资源维度不折叠）",
+         labels("lambda:InvokeFunction|PANEL"), set()),
+        ("换 auth 的码是完整冒充，不是受限的那条",
+         labels("lambda:UpdateFunctionCode|AUTH"), {S_HIJACK_AUTH}),
+        ("verifier 角色本身即持有 URL 入口（名字判据）",
+         classify(frozenset(), s, VERIFIER_ROLE_NAME), {S_FIXTURE_ISSUER}),
+        ("别的角色名不因为名字拿到夹具入口",
+         classify(frozenset(), s, "site-deployer-validate"), set()),
         ("空集", labels(), set()),
     ]
 
@@ -339,17 +397,20 @@ def self_test() -> int:
         if got != want:
             print(f"       期望 {sorted(want)} 实得 {sorted(got)}")
 
-    # 聚合层的反例：sign 与 edge 两类必须分别计入并集，不能只算一类。
+    # 聚合层的反例：sign 与 edge 两类必须分别计入并集，不能只算一类；而**夹具签发器单列**
+    # ——只持它的 principal 不进并集（受限冒充，spec §1）。
     agg = summarize({
         "p-sign-only": {S_HIJACK_AUTH},
         "p-edge-only": {E_CFN_UPDATE_STACK},
         "p-both": {S_KMS_DIRECT, E_CFN_CHANGE_SET},
+        "p-fixture-only": {S_FIXTURE_ISSUER},
     })
     want_agg = {"can_sign": 2, "can_replace_edge_verifier": 2,
                 "impersonation_surface_union": 3, "both": 1,
-                "sign_only": 1, "edge_only": 1}
+                "sign_only": 1, "edge_only": 1, "fixture_issuer_holders": 1}
     agg_bad = {k: (agg[k], v) for k, v in want_agg.items() if agg[k] != v}
-    print(f"  {'ok  ' if not agg_bad else 'FAIL'} 聚合：sign/edge 两类都进并集")
+    print(f"  {'ok  ' if not agg_bad else 'FAIL'} 聚合：sign/edge 两类都进并集，"
+          f"夹具签发器单列不进")
     if agg_bad:
         print(f"       {agg_bad}")
 
@@ -360,9 +421,12 @@ def self_test() -> int:
         "p-kms-only": {S_KMS_DIRECT},
         "p-kms-and-hijack": {S_KMS_DIRECT, S_HIJACK_AUTH},
         "p-cfn-only": {E_CFN_UPDATE_STACK},
+        "p-fixture-only": {S_FIXTURE_ISSUER},
     })["marginal_value_if_closed"]
+    # 夹具签发器那条按 0 记：只持它的人本来就不在冒充面里 ⇒ 关掉它没人离开
+    # （分母是冒充面，否则这个数会是负的）。
     mv_want = {"restrictive-kms-key-policy": 1, "harden-signer-code-update": 0,
-               "router-stack-policy": 1}
+               "router-stack-policy": 1, "fixture-issuer-verifier-boundary": 0}
     mv_bad = {k: (mv[k]["principals_removed"], v) for k, v in mv_want.items()
               if mv[k]["principals_removed"] != v}
     print(f"  {'ok  ' if not mv_bad else 'FAIL'} 边际收益：key policy 收不掉劫持 signer")
@@ -387,6 +451,27 @@ def load_gate():
     sys.modules["_gate"] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+def session_key_arns() -> tuple[str, ...]:
+    """`[SessionKeys]` 声明的全部会话签名 key ARN（两个 family 的 current + previous）。
+
+    经 `session_keys.load_session_keys` 读，**不自己解析 config**：kid → 小节 → key_arn 的
+    形态校验只有一份实现（auth 拥有它）。轮转中途 previous 有值时是 3–4 把，全部计入——
+    "任一把能签"就是完整冒充，少算一把就少报一条路。
+
+    读不到就 SystemExit：**不再回落占位 ARN**。占位 ARN 下 `kms:Sign|<占位>` 谁都不会有，
+    于是整条 KMS 路径静默变成 0，而报告长得和"这条路已经关掉了"一模一样。
+    """
+    sys.path.insert(0, str(_ROOT / "site-builder" / "auth"))
+    from session_keys import SessionKeysError, key_refs, load_session_keys
+    try:
+        keys = load_session_keys(SITE_CONFIG)
+    except SessionKeysError as exc:
+        raise SystemExit(
+            f"{SITE_CONFIG} 的 [SessionKeys] 读不出两把 CMK：{exc}\n"
+            "本探针量的就是「谁能用那两把 key 签名」——拿不到真 ARN 时不出结论。") from None
+    return tuple(dict.fromkeys(r.key_arn for r in key_refs(keys, ("site", "console"))))
 
 
 def discover(gate, clients, region: str, account: str) -> Surface:
@@ -441,9 +526,7 @@ def discover(gate, clients, region: str, account: str) -> Surface:
 
     return Surface(
         region=region,
-        # 3c 的两把 CMK 还不存在 ⇒ 用占位 ARN 量"对本账号任意 key 的 identity 上界"。
-        kms_key=f"arn:aws:kms:{region}:{account}:key/"
-                "00000000-0000-0000-0000-000000000000",
+        kms_keys=session_key_arns(),
         edge_fn=fn(edge_fn), auth_fn=fn("site-auth-service"),
         panel_fn=fn("site-panel"),
         new_fn=fn("probe-placeholder-new-function"),
@@ -572,12 +655,13 @@ def main(argv: list[str] | None = None) -> int:
     principals = list_principals(clients["iam"])
     print(f"待模拟 {len(principals)} 个 × {len(s.groups())} 组", flush=True)
 
+    names = {p["arn"]: p["name"] for p in principals}
     decisions = simulate_all(gate, s, principals, args.workers)
-    by_principal = {arn: classify(a, s) for arn, a in decisions.items()}
+    # 名字也进判定：`site-builder-verifier` 角色本身即持有夹具签发器那条 URL 入口。
+    by_principal = {arn: classify(a, s, names.get(arn, ""))
+                    for arn, a in decisions.items()}
     agg = summarize(by_principal)
     sets = agg.pop("_sets")
-
-    names = {p["arn"]: p["name"] for p in principals}
     raw = {
         "can_sign": sorted(names[a] for a in sets["can_sign"]),
         "can_replace_edge_verifier": sorted(names[a] for a in sets["can_edge"]),
@@ -619,13 +703,17 @@ def main(argv: list[str] | None = None) -> int:
             "lambda_code_exec": list(LAMBDA_CODE_EXEC),
             "lambda_publish": list(LAMBDA_PUBLISH),
             "lambda_create": list(LAMBDA_CREATE),
+            "lambda_invoke": list(LAMBDA_INVOKE),
             "cloudfront_write": list(CF_WRITE),
             "cfn_update": list(CFN_UPDATE),
             "cfn_change_set": list(CFN_CHANGESET),
             "iam_passrole": list(IAM_PASSROLE),
         },
+        # **只写等价类的名字，不写 ARN**：ARN 带 12 位账号 ID，而这份证据是 tracked 的
+        # （`test_evidence_file_carries_no_account_id_or_role_names` 会咬）。
         "resource_equivalence_classes": [
-            "kms:placeholder-key(3c 的 CMK 还不存在，量的是对本账号任意 key 的上界)",
+            f"kms:session-signing-keys({len(s.kms_keys)} 把，来自 [SessionKeys] "
+            "的 site + console 两个 family 的 current/previous)",
             "lambda:edge-origin-request", "lambda:site-auth-service",
             "lambda:site-panel", "lambda:placeholder-new-function",
             "cloudfront:wildcard-distribution", "cloudformation:router-stack",
@@ -648,6 +736,10 @@ def main(argv: list[str] | None = None) -> int:
             "claim）是另一条 MCP 侧冒充路径，不在 3c 范围。",
             "site-deployer-* 等平台角色是否在 3c 后持 kms:Sign 取决于实现；"
             "本探针按 spec §4.1 只算 auth 与 panel。",
+            "sign:fixture-issuer 只把**角色本身**与**直接 invoke auth 函数**这两个入口计入；"
+            "「能 assume site-builder-verifier 的链」不建模——那要做信任策略分析"
+            "（角色的 trust policy × 各 principal 的 sts:AssumeRole），本探针只发"
+            "identity policy 的模拟。⇒ 这个计数是该条路径持有者的**下界**。",
         ],
     }
     if args.write_evidence:

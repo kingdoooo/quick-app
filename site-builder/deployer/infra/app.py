@@ -11,7 +11,7 @@ from aws_cdk import (App, CfnOutput, Duration, Environment, RemovalPolicy, Size,
                      aws_cloudwatch_actions as cw_actions,
                      aws_codebuild as cb, aws_dynamodb as ddb,
                      aws_events as events, aws_events_targets as targets,
-                     aws_iam as iam, aws_lambda as lam_,
+                     aws_iam as iam, aws_kms as kms, aws_lambda as lam_,
                      aws_lambda_destinations as destinations, aws_s3 as s3,
                      aws_sns as sns, aws_sqs as sqs, aws_stepfunctions as sfn,
                      aws_stepfunctions_tasks as tasks)
@@ -225,6 +225,31 @@ class SiteDeployerStack(Stack):
                            deletion_protection=True,
                            point_in_time_recovery_specification=_PITR,
                            removal_policy=RemovalPolicy.RETAIN)
+
+        # ---- 3c-final：两把会话签名 CMK（spec §11.2 / ADR 0001）----
+        # 默认 key policy（root 委派）：限制性策略只减 1 个 principal、结构上收不掉"劫持 signer"那条路，
+        # 且带自锁风险；kms:Sign 只经 auth / panel 的 identity policy 授（deploy_auth / deploy_panel）。
+        # 非对称 CMK 不支持自动轮转（spec §3.3）⇒ 轮转 = 加一个新 construct（…RsV2），走 DEPLOY.md
+        # 「轮转会话密钥」的就位 → 切换 → 排空 → 退役；旧 construct 删掉时 RETAIN 留下 key，退役最后一步
+        # 才 schedule-key-deletion。alias 只为控制台可读，**代码永不引用 alias**（config 写完整 key ARN）。
+        #
+        # **两把 key 各写一遍、construct ID 是字面量**，不用 for 循环：形态守卫
+        # （tests/test_infra_kms_keys.py）按 AST 读 `kms.Key(self, "<字面量>", …)`，循环变量在 AST 里
+        # 读不出 ID ⇒ 那个守卫会退化成"零把 key 也算过"。轮转时在这里再加一段同形的 …RsV2。
+        site_session_key = kms.Key(
+            self, "SiteSessionKeyRsV1",
+            key_spec=kms.KeySpec.RSA_2048, key_usage=kms.KeyUsage.SIGN_VERIFY,
+            enable_key_rotation=False, removal_policy=RemovalPolicy.RETAIN,
+            alias="alias/site-builder/session/site-rs-v1",
+            description="site-builder session signing key site-rs-v1 - RS256 - default key policy per ADR 0001")
+        CfnOutput(self, "SiteSessionKeyRsV1Arn", value=site_session_key.key_arn)
+        console_session_key = kms.Key(
+            self, "ConsoleSessionKeyRsV1",
+            key_spec=kms.KeySpec.RSA_2048, key_usage=kms.KeyUsage.SIGN_VERIFY,
+            enable_key_rotation=False, removal_policy=RemovalPolicy.RETAIN,
+            alias="alias/site-builder/session/console-rs-v1",
+            description="site-builder session signing key console-rs-v1 - RS256 - default key policy per ADR 0001")
+        CfnOutput(self, "ConsoleSessionKeyRsV1Arn", value=console_session_key.key_arn)
 
         # 二期 M3：操作审计（append-only）。写入方只被授予 PutItem。
         # RETAIN 与 admins 同理：审计记录误删会丢失合规证据。

@@ -2,7 +2,7 @@
 
 这个脚本会**就地改写 `site-builder/config.ini`**——所有部署脚本与 CDK 栈的唯一取值来源。
 被守的失败面不是"它跑得对不对"，而是"它没跑完时留下什么"：进程被硬杀 ⇒ `finally` 不执行 ⇒
-config 静默停在模拟态（例如 `site_current = site-hs-v2` 而那把参数还不存在）⇒ 之后任何
+config 静默停在模拟态（例如 `site_current = site-rs-v2` 而那把 CMK 还不存在）⇒ 之后任何
 `deploy_*` 都会照着它动生产。所以这里钉三件事：import 无副作用、哨兵能拦住下一次运行、还原核对
 不是 `assert`（`python3 -O` 会把 assert 整条删掉）。
 
@@ -10,6 +10,7 @@ config 静默停在模拟态（例如 `site_current = site-hs-v2` 而那把参�
 """
 import ast
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -104,17 +105,44 @@ def test_signals_are_handled_so_the_finally_actually_runs():
         "信号处理里没有还原"
 
 
-def test_the_four_simulated_states_still_match_the_runbook_steps():
-    """状态函数是这个脚本的全部价值：少一个就有一步的假红不会被提前发现。"""
+def test_the_three_simulated_states_still_match_the_runbook_steps():
+    """状态函数是这个脚本的全部价值：少一个就有一步的假红不会被提前发现。
+
+    3c-final 起只有三步（就位 / 切换 / 退役）：HS 时代那个"清空 legacy 入口"的状态随
+    legacy 入口一起消失了，signer 开关也不存在——签发形态只有一种。
+    """
     base = (ROOT / "site-builder" / "config.ini.example").read_text(encoding="utf-8")
-    l3 = pf.state_l3(base)
-    assert "legacy_param =\n" in l3 or l3.rstrip().endswith("legacy_param =")
     stage = pf.state_stage(base)
-    assert "[SessionKey:site-hs-v2]" in stage and "site_previous = site-hs-v2" in stage
+    assert "[SessionKey:site-rs-v2]" in stage and "site_previous = site-rs-v2" in stage
+    # 新节必须是 **RS 行**：alg + key_arn + spki_sha256。少任何一个都过不了加载器，
+    # 而"过不了加载器"在这个脚本里的症状是六个套件一片红、根因读不出来。
+    assert "alg = RS256" in stage and "key_arn = arn:aws:kms:" in stage
+    assert "spki_sha256 = " in stage
     switch = pf.state_switch(base)
-    assert "site_current = site-hs-v2" in switch and "site_previous = site-hs-v1" in switch
+    assert "site_current = site-rs-v2" in switch and "site_previous = site-rs-v1" in switch
     retire = pf.state_retire(base)
-    assert "[SessionKey:site-hs-v1]" not in retire and "site_previous =\n" in retire
+    assert "[SessionKey:site-rs-v1]" not in retire and "site_previous =\n" in retire
+
+
+def test_the_states_are_exactly_stage_switch_retire_and_the_l3_state_is_gone():
+    """`state_l3`（清空 legacy 入口）是 HS 时代的状态机的第 ⑤ 步，3c-final 之后它不存在。
+
+    留着的后果不是多跑一个状态：它会 `setkey` 两个已经不在 config 里的键 ⇒ `PreflightError`
+    ⇒ 整个脚本在第一个状态就死，而报的是"config 的键名或格式变了"。
+    """
+    assert not hasattr(pf, "state_l3"), "legacy 入口那个状态还在"
+    assert [name for name, _ in pf.STATES] == ["stage", "switch", "retire"]
+    assert all(callable(fn) for _, fn in pf.STATES)
+
+
+def test_the_source_carries_no_hs_era_vocabulary():
+    """3c-final：签发形态只有一种 ⇒ 源码里不该再出现 signer 开关、legacy 入口、HS 的 kid 形态。
+
+    这三个词拼出来而不是写字面量：Task 16 的全仓 HS 词汇守卫会连本文件一起扫。
+    """
+    src = SRC_PATH.read_text(encoding="utf-8")
+    for token in ("signer", "legacy" + "_param", "-hs-v"):
+        assert token not in src, f"源码里还有 {token}"
 
 
 # ---- 3c-1B-G A3：版本推导、非法状态先拦、RED 必须非零退出 --------------------------------
@@ -123,47 +151,46 @@ LIVE_SHAPE = """[Platform]
 account_id = 111111111111
 
 [SessionKeys]
-site_current = site-hs-v2
+site_current = site-rs-v2
 site_previous =
-console_current = console-hs-v2
+console_current = console-rs-v2
 console_previous =
-signer = current
-legacy_param =
 login_flow_secret_param = /site-builder/login-flow-secret
 
-[SessionKey:site-hs-v2]
-alg = HS256
-ssm_param = /site-builder/session-keys/site-hs-v2
+[SessionKey:site-rs-v2]
+alg = RS256
+key_arn = arn:aws:kms:us-east-1:111111111111:key/11111111-2222-3333-4444-000000000001
+spki_sha256 = 1111111111111111111111111111111111111111111111111111111111111111
 
-[SessionKey:console-hs-v2]
-alg = HS256
-ssm_param = /site-builder/session-keys/console-hs-v2
+[SessionKey:console-rs-v2]
+alg = RS256
+key_arn = arn:aws:kms:us-east-1:111111111111:key/11111111-2222-3333-4444-000000000002
+spki_sha256 = 2222222222222222222222222222222222222222222222222222222222222222
 """
 
 
 def test_next_kid_is_derived_from_the_current_config_not_hardcoded():
-    """轮转过一轮之后 current 就是 v2 —— 写死 v2 会让 ⑥ 追加出重复小节。
+    """轮转过一轮之后 current 就是 v2 —— 写死 v2 会让"就位"那步追加出重复小节。
 
     这是本票的现场：v1→v2 之后再跑这个脚本，`configparser` 直接 `DuplicateSectionError`，
     六个套件全在 collection 期炸，而汇总只打印"红 0 条"。
     """
-    assert pf.next_kids(LIVE_SHAPE) == {"site": "site-hs-v3", "console": "console-hs-v3"}
+    assert pf.next_kids(LIVE_SHAPE) == {"site": "site-rs-v3", "console": "console-rs-v3"}
     stage = pf.state_stage(LIVE_SHAPE)
-    assert stage.count("[SessionKey:site-hs-v2]") == 1, "既有小节被复制了"
-    assert "[SessionKey:site-hs-v3]" in stage and "site_previous = site-hs-v3" in stage
+    assert stage.count("[SessionKey:site-rs-v2]") == 1, "既有小节被复制了"
+    assert "[SessionKey:site-rs-v3]" in stage and "site_previous = site-rs-v3" in stage
 
 
 def test_next_kid_can_be_named_explicitly():
-    nxt = pf.next_kids(LIVE_SHAPE, {"site": "site-hs-v9"})
-    assert nxt == {"site": "site-hs-v9", "console": "console-hs-v3"}
+    nxt = pf.next_kids(LIVE_SHAPE, {"site": "site-rs-v9"})
+    assert nxt == {"site": "site-rs-v9", "console": "console-rs-v3"}
 
 
 def test_the_simulated_states_load_under_the_real_loader():
-    """四个状态都必须是**合法配置**——否则套件红的原因与本脚本要找的东西无关。"""
+    """三个状态都必须是**合法配置**——否则套件红的原因与本脚本要找的东西无关。"""
     sys.path.insert(0, str(ROOT / "site-builder" / "auth"))
     import session_keys as sk
-    for tag, fn in (("l3", pf.state_l3), ("stage", pf.state_stage),
-                    ("switch", pf.state_switch), ("retire", pf.state_retire)):
+    for tag, fn in pf.STATES:
         text = fn(LIVE_SHAPE)
         path = Path(__file__).parent / f"_pf_{tag}.ini"
         path.write_text(text)
@@ -173,16 +200,27 @@ def test_the_simulated_states_load_under_the_real_loader():
             path.unlink(missing_ok=True)
 
 
-def test_l3_also_switches_the_signer_because_the_loader_rejects_the_pair():
-    """出厂 `signer = legacy` + 空 `legacy_param` 被加载器硬拒 ⇒ ⑤ 必须一起切 signer。"""
-    example = (ROOT / "site-builder" / "config.ini.example").read_text(encoding="utf-8")
-    assert "signer = legacy" in example, "出厂默认变了，这条用例的前提要更新"
-    l3 = pf.state_l3(example)
-    assert "signer = current" in l3 and "signer = legacy" not in l3
+def test_the_two_families_get_distinct_fake_key_material():
+    """两个 family 的假 ARN / 假指纹**必须互不相同**。
+
+    最容易写成"按版本号生成"（`site-rs-v2` 与 `console-rs-v2` 都是 v2 ⇒ 同一份假材料），
+    而加载器把"两个 kid 指向同一把 KMS key"判成配置错 ⇒ 三个状态全部在 `validate()`
+    就死，而报的是"模拟状态本身不是合法配置"，看不出根因是这个生成函数。
+    """
+    nxt = pf.next_kids(LIVE_SHAPE)
+    text = pf.key_sections(nxt)
+    arns = re.findall(r"(?m)^key_arn\s*=\s*(\S+)$", text)
+    fps = re.findall(r"(?m)^spki_sha256\s*=\s*(\S+)$", text)
+    assert len(arns) == len(fps) == 2, text
+    assert len(set(arns)) == 2 and len(set(fps)) == 2, text
+    # 也不许与既有那两行撞（既有的是 LIVE_SHAPE 里 v2 的两把）
+    assert not set(arns) & set(re.findall(r"(?m)^key_arn\s*=\s*(\S+)$", LIVE_SHAPE))
+    for fp in fps:
+        assert re.fullmatch(r"[0-9a-f]{64}", fp), fp
 
 
 def test_state_transforms_raise_instead_of_asserting():
-    """`-O` 会删掉 assert ⇒ 变换静默 no-op ⇒ 拿未改的 config 跑出"四个状态全绿"。"""
+    """`-O` 会删掉 assert ⇒ 变换静默 no-op ⇒ 拿未改的 config 跑出"三个状态全绿"。"""
     import ast
     src = SRC_PATH.read_text(encoding="utf-8")
     tree = ast.parse(src)
@@ -194,10 +232,13 @@ def test_state_transforms_raise_instead_of_asserting():
 
 
 def test_a_transform_that_cannot_find_its_anchor_is_loud():
-    with pytest.raises(pf.PreflightError, match="legacy_param"):
-        pf.setkey("[SessionKeys]\nsigner = current\n", "legacy_param", "")
+    with pytest.raises(pf.PreflightError, match="site_previous"):
+        pf.setkey("[SessionKeys]\nsite_current = site-rs-v1\n", "site_previous", "")
     with pytest.raises(pf.PreflightError, match="site_current"):
-        pf.current_kids("[SessionKeys]\nsigner = current\n")
+        pf.current_kids("[SessionKeys]\nlogin_flow_secret_param = /x\n")
+    # kid 形态不对时也要吵：`{fam}-rs-v<N>` 是推导下一版的唯一依据
+    with pytest.raises(pf.PreflightError, match="site-rs-v"):
+        pf.current_kids("[SessionKeys]\nsite_current = something-else\n")
 
 
 def test_red_suites_make_the_script_exit_nonzero(monkeypatch, capsys, tmp_path):
@@ -230,7 +271,7 @@ def test_a_bad_next_kid_fails_before_any_backup_or_sentinel_exists(tmp_path, mon
     # 正向控制：合法的 --next-kid 走到套件（这里让 run_all 立即返回空 = 全绿）
     monkeypatch.setattr(pf, "validate", lambda text, tag: None)
     monkeypatch.setattr(pf, "run_all", lambda tag: [])
-    assert pf.main(["--next-kid=site=site-hs-v9"]) == 0
+    assert pf.main(["--next-kid=site=site-rs-v9"]) == 0
     assert not pf.SENTINEL.exists() and pf.CFG.read_text() == LIVE_SHAPE
 
 

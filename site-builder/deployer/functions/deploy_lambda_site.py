@@ -28,9 +28,11 @@ class BackendUnhealthy(Exception):
 
 
 class UnmigratedSite(Exception):
-    """这个站点还没进 blue/green 模型。**不做隐式半迁移**——先跑
-    scripts/migrate_sites_to_blue_green.py。理由见 M7-SPEC §4.3：
-    半套迁移会让首次更新仍然把未经健康门的代码暴露在 $LATEST 上。"""
+    """这个站点还没进 blue/green 模型。**不做隐式半迁移**：理由见 M7-SPEC §4.3——
+    半套迁移会让首次更新仍然把未经健康门的代码暴露在 $LATEST 上。
+
+    资产不含存量迁移路径（ADR 0005：交付物是资产，不是某一个环境的中间态），所以出路只有两条：
+    把路由的 api_target 指向 blue/green 任一色的 Function URL 后重试，或下线重建。"""
 
 
 def _lambda():
@@ -186,9 +188,9 @@ def handler(event, context):
         # **判据是"路由指着的东西认不认得"，不是"有没有颜色 URL"。**
         #
         # 原来写的是 `live is None and not urls`，那个 AND 漏掉了**半迁移**状态：
-        # 迁移脚本的健康门失败时（migrate_sites_to_blue_green 的
-        # `skipped:unhealthy` 分支）会留下 blue alias + blue URL 而**故意不切
-        # 路由**，于是 `urls` 非空、`live` 仍是 None ⇒ 闸门放行 ⇒ 下面
+        # 存量迁移（资产不含它，ADR 0005）的健康门失败时会留下 blue alias + blue URL 而
+        # **故意不切路由**；被中断的手工重部也能造出同一态。
+        # 于是 `urls` 非空、`live` 仍是 None ⇒ 闸门放行 ⇒ 下面
         # `update_function_code` 推 $LATEST，而路由此刻正指着无 qualifier 的
         # URL（= $LATEST）⇒ 未经健康门的新代码当场上线。那正是本闸门要挡的事
         # （M7-SPEC §4.3，v1 被驳回的 P1-1 同一形态；Codex 2026-08-17 P1-3
@@ -208,8 +210,9 @@ def handler(event, context):
             raise UnmigratedSite(
                 f"{fn} 的路由指向 {target}，它不是 blue/green 任何一色的 Function "
                 "URL（未迁移，或上次迁移只做了一半：alias/URL 已建但路由还在 "
-                "$LATEST）。先跑 scripts/migrate_sites_to_blue_green.py 把路由切到"
-                "某个颜色，再重试部署。")
+                "$LATEST）。这个部署没有存量迁移路径（资产不含它，ADR 0005）："
+                "把路由的 api_target 指向 blue/green 任一色的 Function URL 后重试，"
+                "或下线重建。")
         color = _idle_color(live)
         lam.update_function_code(FunctionName=fn, **code)
         lam.get_waiter("function_updated").wait(FunctionName=fn)

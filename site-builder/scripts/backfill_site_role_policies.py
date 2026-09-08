@@ -67,8 +67,7 @@ def _load_env(config_path=None):
 
     **直接赋值，不用 setdefault**：config.ini 是部署脚本的唯一取值来源
     （CLAUDE.md），setdefault 会让 shell 里残留的旧值静默改写写入目标。
-    `migrate_permissions._load_config` 与 `migrate_sites_to_blue_green._load_config`
-    的 docstring 都明写了这条，本脚本必须一致。
+    `migrate_permissions._load_config` 的 docstring 也明写了这条，本脚本必须一致。
 
     **STS 账号核对是硬要求**：若操作者的 AWS_PROFILE / 临时凭证指向另一个账号，
     那里没有 `site-rt-*` 角色 ⇒ 闸门看到"0 个不合格"⇒ dry-run / --apply / --check
