@@ -27,6 +27,14 @@ auth 那条一挂 = 全平台登录不可用。
 
 本模块**不 import boto3、不读配置、不读环境变量**：client 由调用方传入（三个脚本各自缓存 client，
 `except lam.exceptions.X` 比对的是那个实例上的异常类）。
+
+**额外 principal（`extra_principals`）**：`expected_statements` / `expected_projection` / `drift` / `converge`
+接受可选的 `extra_principals`（`{标签: 精确 role ARN}`），每个标签产出与 edge 两条同形的
+`<标签>-invoke`（`InvokeFunctionUrl` + `AWS_IAM`）/ `<标签>-invoke-function`（`InvokeFunction` +
+`InvokedViaFunctionUrl`）。今天**只有一个使用方**：auth 在 `[Verification] fixture_issuer = true` 时给
+`site-builder-verifier` 角色的两条（spec §11.7）；关掉组件时不再传它 ⇒ 那两条在下一次 converge 里被当
+野 Sid 删掉。默认 `extra_principals=None`（也含 `{}`）⇒ 行为与只有 edge 两条时**字节相同**。标签的
+ARN 与 edge_role_arn 用**同一条**校验（`_exact_role_arn`）：空 / 通配 / 非 role ARN 一律抛错，不放宽。
 """
 from __future__ import annotations
 
@@ -75,32 +83,50 @@ class Drift:
         return "、".join(parts)
 
 
-def expected_statements(edge_role_arn: str) -> list[dict]:
-    """两条 `add_permission` 的关键字参数（含 `StatementId`）。
+def _exact_role_arn(arn: str, what: str) -> str:
+    """把 `arn` 校验成精确的 IAM role ARN，否则抛 `ValueError`。
 
-    **缺 edge_role_arn 或给通配一律抛错**：fallback 到 `Principal:*` 会让 Function URL 全网可调，而 panel /
-    key-proxy 的 handler 把"x-user-email 存在"当作"请求经过 Edge"的证据——两者一起失效意味着任何人都能
-    伪造任意身份。
+    **缺值 / 给通配 / 非 role ARN 一律抛错**：fallback 到 `Principal:*` 会让 Function URL 全网可调，而
+    panel / key-proxy 的 handler 把"x-user-email 存在"当作"请求经过 Edge"的证据——两者一起失效意味着
+    任何人都能伪造任意身份。edge_role_arn 与每个额外 principal 都走这一条。
     """
-    arn = (edge_role_arn or "").strip()
+    arn = (arn or "").strip()
     if not arn:
-        raise ValueError(
-            "config.ini [Deployer] edge_role_arn 为空——Function URL 的调用者"
-            "必须绑定到 exact edge role，不能放宽。请先部署路由层并回填该值")
-    if "*" in arn or not arn.startswith("arn:aws:iam::"):
-        raise ValueError(f"edge_role_arn 必须是精确的 IAM role ARN: {arn!r}")
+        raise ValueError(f"{what} 为空——Function URL 的调用者必须绑定到 exact role ARN，不能放宽")
+    if "*" in arn or not arn.startswith("arn:aws:iam::") or ":role/" not in arn:
+        raise ValueError(f"{what} 必须是精确的 IAM role ARN: {arn!r}")
+    return arn
+
+
+def _pair(label: str, arn: str) -> list[dict]:
+    """一个 principal 的两条 `add_permission` 关键字参数（`<label>-invoke` / `<label>-invoke-function`）。"""
     return [
-        {"StatementId": EXPECTED_SIDS[0],
-         "Action": "lambda:InvokeFunctionUrl",
-         "Principal": arn,
-         "FunctionUrlAuthType": FUNCTION_URL_AUTH_TYPE},
+        {"StatementId": f"{label}-invoke", "Action": "lambda:InvokeFunctionUrl",
+         "Principal": arn, "FunctionUrlAuthType": FUNCTION_URL_AUTH_TYPE},
         # 2025-10 起 InvokeFunctionUrl 单条不够，缺 InvokeFunction 即 403。
         # InvokedViaFunctionUrl 把它限定为仅经 Function URL 调用。
-        {"StatementId": EXPECTED_SIDS[1],
-         "Action": "lambda:InvokeFunction",
-         "Principal": arn,
-         "InvokedViaFunctionUrl": True},
+        {"StatementId": f"{label}-invoke-function", "Action": "lambda:InvokeFunction",
+         "Principal": arn, "InvokedViaFunctionUrl": True},
     ]
+
+
+def expected_statements(edge_role_arn: str, *, extra_principals: dict | None = None) -> list[dict]:
+    """期望语句：edge role 两条 + `extra_principals`（标签 → 精确 role ARN）每个两条，形态相同。
+
+    edge 两条的 Sid 恒为 `EXPECTED_SIDS`。**缺 edge_role_arn / 给通配 / 非 role ARN 一律抛错**（见
+    `_exact_role_arn`）。`extra_principals` 今天只有一个使用方：auth 在 `[Verification] fixture_issuer = true`
+    时给 `site-builder-verifier` 角色的两条（spec §11.7）；关掉组件时不传它 ⇒ 那两条在下一次 converge
+    里被当野 Sid 删掉。默认 `None`（也含 `{}`）⇒ 只有 edge 两条，与改动前字节相同。
+    """
+    out = _pair("edge", _exact_role_arn(edge_role_arn, "config.ini [Deployer] edge_role_arn"))
+    for label, arn in (extra_principals or {}).items():
+        out += _pair(label, _exact_role_arn(arn, f"额外 principal {label!r}"))
+    return out
+
+
+def sids_for(edge_role_arn: str, extra_principals: dict | None = None) -> tuple:
+    """全部期望 Sid，按声明顺序（edge 两条在前，各额外 principal 两条随后）。"""
+    return tuple(s["StatementId"] for s in expected_statements(edge_role_arn, extra_principals=extra_principals))
 
 
 def _rendered_condition(stmt: dict) -> tuple:
@@ -114,10 +140,10 @@ def _rendered_condition(stmt: dict) -> tuple:
     return ()
 
 
-def expected_projection(edge_role_arn: str) -> dict:
+def expected_projection(edge_role_arn: str, *, extra_principals: dict | None = None) -> dict:
     """Sid → (Effect, Action, Principal, Condition 三元组序列)。与 `_project()` 同一形态，可直接相等比较。"""
     return {s["StatementId"]: ("Allow", s["Action"], s["Principal"], _rendered_condition(s))
-            for s in expected_statements(edge_role_arn)}
+            for s in expected_statements(edge_role_arn, extra_principals=extra_principals)}
 
 
 def _project(statement: dict) -> tuple:
@@ -136,9 +162,14 @@ def _project(statement: dict) -> tuple:
     return (statement.get("Effect"), action, principal, triples)
 
 
-def drift(policy: dict | None, edge_role_arn: str) -> Drift:
-    """线上 policy（`get_policy` 的 JSON，或 None = 还没有 policy）与期望集合的差。纯函数。"""
-    want = expected_projection(edge_role_arn)
+def drift(policy: dict | None, edge_role_arn: str, *, extra_principals: dict | None = None) -> Drift:
+    """线上 policy（`get_policy` 的 JSON，或 None = 还没有 policy）与期望集合的差。纯函数。
+
+    `missing` / `mismatched` 按**全部**期望 Sid 判（含 `extra_principals`）；不在期望里的 Sid（含关掉组件后
+    残留的 verifier 两条）落 `stray`。
+    """
+    want = expected_projection(edge_role_arn, extra_principals=extra_principals)
+    sids = tuple(want)
     got: dict = {}
     strays: list = []
     for s in (policy or {}).get("Statement", []):
@@ -149,8 +180,8 @@ def drift(policy: dict | None, edge_role_arn: str) -> Drift:
             got[sid] = _project(s)
         else:
             strays.append(sid)
-    return Drift(missing=tuple(sid for sid in EXPECTED_SIDS if sid not in got),
-                 mismatched=tuple(sid for sid in EXPECTED_SIDS if sid in got and got[sid] != want[sid]),
+    return Drift(missing=tuple(sid for sid in sids if sid not in got),
+                 mismatched=tuple(sid for sid in sids if sid in got and got[sid] != want[sid]),
                  stray=tuple(strays))
 
 
@@ -174,14 +205,17 @@ def _add_replacing_conflict(lam, fn: str, stmt: dict, q: dict) -> None:
             lam.remove_permission(FunctionName=fn, StatementId=stmt["StatementId"], **q)
 
 
-def converge(lam, fn: str, edge_role_arn: str, *, qualifier: str | None = None, log=print) -> Drift:
-    """把 `fn`（或 `fn:qualifier`）的 resource policy 收敛到 `expected_statements(edge_role_arn)`。
+def converge(lam, fn: str, edge_role_arn: str, *, qualifier: str | None = None, log=print,
+             extra_principals: dict | None = None) -> Drift:
+    """把 `fn`（或 `fn:qualifier`）的 resource policy 收敛到
+    `expected_statements(edge_role_arn, extra_principals=...)`。
 
     返回**写之前**观察到的漂移（一致时零写入、只读一次）。写之后读回核对，不一致抛 `PolicyDriftError`。
+    不传 `extra_principals` ⇒ 上一次留下的额外语句（如关掉的 verifier 两条）此刻是野 Sid，被删掉。
     """
-    stmts = {s["StatementId"]: s for s in expected_statements(edge_role_arn)}
+    stmts = {s["StatementId"]: s for s in expected_statements(edge_role_arn, extra_principals=extra_principals)}
     q = {"Qualifier": qualifier} if qualifier else {}
-    before = drift(_read_policy(lam, fn, q), edge_role_arn)
+    before = drift(_read_policy(lam, fn, q), edge_role_arn, extra_principals=extra_principals)
     if before.ok:
         return before
     if NO_SID in before.stray:
@@ -190,14 +224,14 @@ def converge(lam, fn: str, edge_role_arn: str, *, qualifier: str | None = None, 
     for sid in before.mismatched:
         log(f"  {fn}: 语句 {sid!r} 内容与期望不同（principal / action / condition 漂移），替换")
         lam.remove_permission(FunctionName=fn, StatementId=sid, **q)
-    for sid in EXPECTED_SIDS:
+    for sid in stmts:
         if sid in before.missing or sid in before.mismatched:
             _add_replacing_conflict(lam, fn, stmts[sid], q)
     for sid in before.stray:
         log(f"  {fn}: resource policy 有非预期语句 {sid!r}，删除")
         lam.remove_permission(FunctionName=fn, StatementId=sid, **q)
     for attempt in range(_READBACK_ATTEMPTS):
-        after = drift(_read_policy(lam, fn, q), edge_role_arn)
+        after = drift(_read_policy(lam, fn, q), edge_role_arn, extra_principals=extra_principals)
         if after.ok:
             return before
         if attempt + 1 < _READBACK_ATTEMPTS:

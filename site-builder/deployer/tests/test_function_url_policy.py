@@ -238,3 +238,63 @@ def test_module_imports_no_boto3_and_reads_no_environment():
     imported = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
     imported |= {n.module.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
     assert "boto3" not in imported and "botocore" not in imported and "os" not in imported, imported
+
+
+# ── 额外 principal（verifier 的两条同形语句，Task 6）────────────────────────
+
+VERIFIER = "arn:aws:iam::111111111111:role/site-builder-verifier"
+
+
+def _ver_pair(arn):
+    """与 `expected_statements(..., extra_principals={"verifier": arn})` 渲染后相同的两条（正对照用）。"""
+    return [rendered("verifier-invoke", "lambda:InvokeFunctionUrl", arn, function_url_auth_type="AWS_IAM"),
+            rendered("verifier-invoke-function", "lambda:InvokeFunction", arn, invoked_via_function_url=True)]
+
+
+def test_extra_principal_adds_two_statements_of_the_same_shape():
+    stmts = fup.expected_statements(EDGE, extra_principals={"verifier": VERIFIER})
+    sids = [s["StatementId"] for s in stmts]
+    assert sids == ["edge-invoke", "edge-invoke-function", "verifier-invoke", "verifier-invoke-function"]
+    ver = {s["StatementId"]: s for s in stmts}
+    assert ver["verifier-invoke"] == {"StatementId": "verifier-invoke", "Action": "lambda:InvokeFunctionUrl",
+                                      "Principal": VERIFIER, "FunctionUrlAuthType": "AWS_IAM"}
+    assert ver["verifier-invoke-function"] == {"StatementId": "verifier-invoke-function", "Action": "lambda:InvokeFunction",
+                                               "Principal": VERIFIER, "InvokedViaFunctionUrl": True}
+
+
+def test_no_extra_principal_is_byte_identical_to_before():
+    assert fup.expected_statements(EDGE) == fup.expected_statements(EDGE, extra_principals=None) == \
+        fup.expected_statements(EDGE, extra_principals={})
+
+
+def test_sids_for_lists_every_expected_sid_in_declaration_order():
+    assert fup.sids_for(EDGE) == fup.EXPECTED_SIDS == ("edge-invoke", "edge-invoke-function")
+    assert fup.sids_for(EDGE, {"verifier": VERIFIER}) == \
+        ("edge-invoke", "edge-invoke-function", "verifier-invoke", "verifier-invoke-function")
+
+
+@pytest.mark.parametrize("bad", ["", "*", "arn:aws:iam::111111111111:role/*", "site-builder-verifier",
+                                 "arn:aws:iam::111111111111:user/kent"])
+def test_extra_principal_must_be_an_exact_role_arn(bad):
+    with pytest.raises(ValueError):
+        fup.expected_statements(EDGE, extra_principals={"verifier": bad})
+
+
+def test_drift_treats_a_missing_verifier_statement_as_missing_and_a_leftover_one_as_stray():
+    pol = _policy(*good_pair(EDGE), *_ver_pair(VERIFIER))       # 四条都在
+    assert fup.drift(pol, EDGE, extra_principals={"verifier": VERIFIER}).ok
+    d = fup.drift(pol, EDGE)                                    # 期望里没有 verifier ⇒ 那两条是野 Sid
+    assert set(d.stray) == {"verifier-invoke", "verifier-invoke-function"} and not d.missing
+    d2 = fup.drift(_policy(*good_pair(EDGE)), EDGE, extra_principals={"verifier": VERIFIER})
+    assert set(d2.missing) == {"verifier-invoke", "verifier-invoke-function"}
+
+
+def test_converge_adds_the_verifier_pair_and_removes_it_when_the_component_is_turned_off():
+    lam = FakeLambdaPolicy()          # deployer/tests/fake_lambda_policy.py 的有状态替身
+    fup.converge(lam, FN, EDGE, extra_principals={"verifier": VERIFIER}, log=lambda *_: None)
+    assert fup.drift(json.loads(lam.get_policy(FunctionName=FN)["Policy"]), EDGE,
+                     extra_principals={"verifier": VERIFIER}).ok
+    fup.converge(lam, FN, EDGE, log=lambda *_: None)      # 关掉组件：verifier 两条被当野 Sid 删掉
+    pol = json.loads(lam.get_policy(FunctionName=FN)["Policy"])
+    assert fup.drift(pol, EDGE).ok
+    assert {s["Sid"] for s in pol["Statement"]} == {"edge-invoke", "edge-invoke-function"}
