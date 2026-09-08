@@ -175,7 +175,7 @@ def test_expected_set_comes_from_the_cdk_app_constant():
 
 
 def test_panel_branch_compares_the_whole_environment_to_the_local_derivation():
-    """3c-1A code-review：panel 漏发 SESSION_KEYS_JSON / LEGACY_ENTRY 此前无人能抓（只查明文）。"""
+    """3c-1A code-review：panel 漏发 SESSION_KEYS_JSON 此前无人能抓（只查明文）。"""
     src = _SCRIPT.read_text(encoding="utf-8")
     panel = src[src.index("def run_panel"):src.index("\ndef ", src.index("def run_panel") + 10)]
     assert "lambda_environment(" in panel and "环境变量 == 本地" in panel
@@ -810,3 +810,69 @@ def test_the_fixture_flag_is_read_through_deploy_auths_own_parser():
     body = _ast.unparse(fn)
     assert "read_verification" in body, "闸门自己解析 [Verification] 的 flag —— 两侧会分叉"
     assert "VERIFIER_ROLE_NAME" in body, "角色名写死了字面量，不是 deploy_auth 的常量"
+
+
+# ---- Task 14 复审 I2：⑥b 与 ⑧ 共用一次下载 / 一个版本 -------------------------------------------
+#
+# ⑥b 的判据（site 公钥逐字节）**是版本敏感的**：换 key 之后新版本带新公钥、旧版本带旧公钥。
+# 所以本轮里两处必须读同一个版本，而不是各定位一次。顺带去掉了那个预签名 URL 的第二次下载
+# （实测会 RemoteDisconnected）。
+
+def test_the_edge_source_is_downloaded_once_per_run(monkeypatch):
+    """缓存命中时直接返回，**一个 AWS 调用都不发**；缓存为空时同样的替身会炸（负向控制）。
+
+    替身是个假 `boto3` 模块，`client()` 直接抛。两个方向都跑：
+      · 缓存满 ⇒ 不抛（证明第二次调用真的没去下载，而不是"下载了但结果一样"）；
+      · 缓存空 ⇒ 抛（证明那个替身是承重的，上一半不是因为替身没生效才绿）。
+    """
+    import types as _t
+    fake = _t.ModuleType("boto3")
+
+    def _no(*a, **k):
+        raise AssertionError("缓存命中时不该再建 AWS client")
+
+    fake.client = _no
+    monkeypatch.setitem(sys.modules, "boto3", fake)
+
+    g = _gate()
+    g._edge_source_cache = "SENTINEL-SOURCE"
+    assert g._edge_deployed_source() == "SENTINEL-SOURCE"
+
+    g._edge_source_cache = None
+    with pytest.raises(AssertionError, match="缓存命中时不该"):
+        g._edge_deployed_source()
+
+
+def test_a_failed_read_is_not_cached():
+    """**只缓存成功**：把失败写进缓存会让"第一次网络抖动"变成"这一整轮都读不到"。
+
+    按 AST 断言赋值语句在函数体的**最后**（所有 raise 之后）——这是"失败不进缓存"的结构证明；
+    真实的网络失败没法在单测里造。
+    """
+    import ast as _ast
+    src = _SCRIPT.read_text()
+    fn = next(n for n in _ast.walk(_ast.parse(src))
+              if isinstance(n, _ast.FunctionDef) and n.name == "_edge_deployed_source")
+    assigns = [n for n in fn.body if isinstance(n, _ast.Assign)
+               and any(getattr(t, "id", None) == "_edge_source_cache" for t in n.targets)]
+    assert len(assigns) == 1, "缓存赋值不止一处 —— 其中一处可能在 raise 之前"
+    raises = [n for n in _ast.walk(fn) if isinstance(n, _ast.Raise)]
+    assert raises, "这个函数本来会 raise（读不到产物/版本不对），前提变了"
+    assert assigns[0].lineno > max(r.lineno for r in raises), \
+        "缓存赋值在某个 raise 之前 —— 失败会被缓存下来"
+    assert "global _edge_source_cache" in _ast.unparse(fn)
+
+
+def test_the_edge_source_docstring_no_longer_claims_the_duplication_is_harmless():
+    """文案必须说真话：⑥b 之后这份重复定位逻辑是**承重的**，且要点出漂移的后果。
+
+    旧文案写着"这份重复不可能让两个脚本给出相反的结论"，理由是本段只问一个版本无关的问题。
+    ⑥b 引入了版本敏感的判据之后那句话变成假的——而一句安抚性的假话比没有注释更糟：
+    下一个人会据此单独改一侧。
+    """
+    g = _gate()
+    doc = g._edge_deployed_source.__doc__
+    assert "不可能让两个脚本给出相反的结论" not in doc, "旧的安抚性说法还在"
+    assert "版本敏感" in doc or "高度敏感" in doc, doc
+    assert "相反结论" in doc or "相反的结论" in doc, "没有点出漂移的后果"
+    assert "verify_deployed_edge.sh" in doc, "没有指出另一侧是谁"

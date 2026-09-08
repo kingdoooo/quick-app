@@ -450,10 +450,14 @@ PANEL_SESSION_PARAM_KEYS: tuple = ()
 def _present(env: dict, names: tuple) -> tuple:
     """`names` 里在 `env` 中确实存在的那些（保序）。
 
-    用本地推导值取交集而不是写死清单：3c-1B 的 L3 清空 `legacy_param` 之后
-    `JWT_SECRET_PARAM` 整个键消失，写死会让那条核对在一个不该存在的键上永久失败。
-    这样做**不会漏核**——上面那条"env 整体 == 本地推导值"已经保证线上与本地同集合，
+    用本地推导值取交集而不是写死清单：一个键**是否下发**会随形态变（3c-final 删掉了
+    `JWT_SECRET_PARAM`；将来加/减 `*_PARAM` 同理），写死会让那条核对在一个不该存在的键上
+    永久失败。这样做**不会漏核**——上面那条"env 整体 == 本地推导值"已经保证线上与本地同集合，
     线上少一个键的话那条先红。
+
+    **代价（Task 8 复审 I1 的真实形态）**：交集也会把"意图清单里写了一个已经不存在的键"
+    静默吞掉——那条核对变成零条断言，而 `_min_param_checks()` 同步缩水 ⇒ 闸门总数与下限一起
+    降，什么都不红。所以两个意图清单常量各有一条**正面断言那个已删的键不在里面**的用例。
     """
     return tuple(n for n in names if n in env)
 
@@ -461,9 +465,10 @@ def _present(env: dict, names: tuple) -> tuple:
 def _min_param_checks() -> int:
     """"逐个 `*_PARAM`"在 ④（auth）与 ⑤（panel）两段一共会出多少条 check。
 
-    L2 = 3（auth 两个 + panel 一个）；L3 清空 `legacy_param` 之后 = 1（只剩 auth 的
-    login-flow）。与 `MIN_DEPLOYED_CHECKS` 分开是因为它随状态变；合进常量的后果是
-    L3 之后每次核对都差两条、判成"没跑完"。
+    3c-final 起恒为 1（auth 的 `LOGIN_FLOW_SECRET_PARAM`；panel 一个都不持有）。仍然**按运行时
+    推导而不是写死 1**：与 `MIN_DEPLOYED_CHECKS` 分开的理由不变——下一次给某个组件加一个
+    `*_PARAM` 时，这里自动跟上，而写死的常量会让每次核对都差一条、判成"没跑完"，
+    而"没跑完"与"真的漂移了"在退出码上一模一样。
 
     两段都按各自的**本地推导** env 数——与真正传给检查的那个清单同一个来源，
     所以"下限"与"实际条数"不可能分叉。
@@ -480,11 +485,13 @@ def _check_env_has_no_plaintext_secret(env: dict, label: str,
     ③ 点名的每个 `*_PARAM` 都存在且是 SSM 路径。
 
     `lambda:GetFunctionConfiguration` 会**原样回显**环境变量，而它是个常见的
-    只读权限：拿到 JWT_SECRET 即可伪造任意用户会话，拿到 machine client secret
-    即可自己换机器 token。
+    只读权限：拿到 machine client secret 即可自己换机器 token，拿到 login-flow 密钥即可伪造
+    OAuth state 与 `__Host-sb_pkce`。3c-final 之后**会话签名密钥已经不在这条路上**（私钥在
+    KMS，环境变量只有 kid / key_arn / spki_sha256 这些引用）——但这条检查照样必须留着：
+    它守的是"有人把值而不是参数名下发了"这个动作，而那个动作与具体是哪个密钥无关。
 
-    `param_keys` **一律是元组**，单个键也写成 1-元组（3c-1B：auth 有
-    `JWT_SECRET_PARAM` 与 `LOGIN_FLOW_SECRET_PARAM` 两个，panel/key-proxy 各一个）。
+    `param_keys` **一律是元组**，单个键也写成 1-元组（今天 auth 一个
+    `LOGIN_FLOW_SECRET_PARAM`、panel 零个、key-proxy 一个）。
     不接受裸字符串：`isinstance` 归一化会让同一个形参在三个调用点有两种形状，而
     字符串本身可迭代——传错时不报错，而是按字符逐个去查环境变量，静默全红。
     **逐个键单独出一条 check**：合成一条时某个键缺失只会让 detail 里多一个"缺失"
@@ -796,20 +803,22 @@ def run_deployed() -> None:
               and "time.monotonic() - hit[1] < SECRET_TTL_SECONDS" in body,
               "SSM 密钥缓存的 TTL 在产物中生效（赋值 + 判定都在）",
               "无 TTL 时轮转密钥后 warm 容器会永久用旧值")
-    # 3c-1A：环境变量**整体** == 本地 lambda_env() 推导值（SESSION_KEYS_JSON / LEGACY_ENTRY 也在其中），
+    # 环境变量**整体** == 本地 lambda_env() 推导值（`SESSION_KEYS_JSON` / `FIXTURE_ISSUER` 也在
+    # 其中；3c-final 起没有 `LEGACY_ENTRY` / `SESSION_SIGNER` / `JWT_SECRET_PARAM` 这几个键），
     # 且无明文密钥。漏下发的症状是 /console-session 全部 500，而单测有 ENV 兜着看不出来。
+    # 这条是"新变量自动入闸"的机制：`lambda_env()` 里加一项，这里立刻覆盖它。
     got_env = lam.get_function_configuration(FunctionName="site-auth-service").get(
         "Environment", {}).get("Variables", {})
     want_env = da.lambda_env()["Variables"]
     diff = sorted(k for k in set(got_env) | set(want_env) if got_env.get(k) != want_env.get(k))
     check(not diff, "site-auth-service 环境变量 == 本地 lambda_env() 推导值",
           f"不一致的键: {diff}" if diff else f"{len(want_env)} 个键一致（只有参数名，无明文）")
-    # 3c-1B：`*_PARAM` 逐个核（LOGIN_FLOW_SECRET_PARAM 漏下发的症状是**所有 /login 500**，
+    # `*_PARAM` 逐个核（LOGIN_FLOW_SECRET_PARAM 漏下发的症状是**所有 /login 500**，
     # 因为 _login_flow_sig 经 _secret("LOGIN_FLOW_SECRET") 取值、无来源时响亮抛错）。
-    # **点名清单从本地推导值来**，不写死：L3（清空 legacy_param）之后 `JWT_SECRET_PARAM`
-    # 整个键不下发，写死会让那条核对在一个不该存在的键上永久失败。上面那条"env 整体 =="
-    # 已经保证 got_env 与 want_env 同集合，所以按 want_env 点名等价于按线上点名，
-    # 且**不会因为线上少了一个键而少核一条**（少了的话整体等值那条先红）。
+    # **点名清单从本地推导值来**，不写死：一个键是否下发会随形态变，写死会让那条核对在一个
+    # 不该存在的键上永久失败。上面那条"env 整体 =="已经保证 got_env 与 want_env 同集合，
+    # 所以按 want_env 点名等价于按线上点名，且**不会因为线上少了一个键而少核一条**
+    # （少了的话整体等值那条先红）。反向的代价见 `_present` 的 docstring。
     _check_env_has_no_plaintext_secret(got_env, "site-auth-service",
                                        _present(want_env, AUTH_SESSION_PARAM_KEYS))
     # 3c-final（spec §11.6 第 3 层）：会话签名密钥在 KMS，环境变量只有**引用**。所以除了"env == 本地
@@ -883,12 +892,14 @@ def run_panel() -> None:
                                dp, ROOT / "site-builder/panel"))
 
     env = conf.get("Environment", {}).get("Variables", {})
-    # 环境变量**整体** == 本地 lambda_environment() 推导值（SESSION_KEYS_JSON / LEGACY_ENTRY 也在其中）。
+    # 环境变量**整体** == 本地 lambda_environment() 推导值（`SESSION_KEYS_JSON` 也在其中；
+    # 3c-final 起没有 `LEGACY_ENTRY` / `SESSION_SIGNER` / `JWT_SECRET_PARAM` 这几个键）。
     # EDGE_ROLE_ID 是部署时从线上取的值，比对时以线上值为准喂给推导函数。
     want_env = dp.lambda_environment(env.get("EDGE_ROLE_ID", ""))
-    # 3c-1B/L3：与 auth 那处同一条纪律——点名清单按**本地推导值**取交集。写死
-    # `("JWT_SECRET_PARAM",)` 的后果是 legacy 入口关闭之后这条核对在一个不该存在的键上
-    # 永久失败（runbook 第 ⑤ 步就会撞上）。
+    # 与 auth 那处同一条纪律——点名清单按**本地推导值**取交集。panel 今天的意图是**零个**
+    # 会话相关 `*_PARAM`（`PANEL_SESSION_PARAM_KEYS` 是空元组），所以这条只出"无明文密钥"
+    # 一条 check；意图清单里若留着一个已删的键，`_present` 会把它吞掉而不是红（见那个常量
+    # 旁边的注释与 `_present` 的 docstring）。
     _check_env_has_no_plaintext_secret(env, "panel", _present(want_env, PANEL_SESSION_PARAM_KEYS))
     diff = sorted(k for k in set(env) | set(want_env) if env.get(k) != want_env.get(k))
     check(not diff, "panel 环境变量 == 本地 lambda_environment() 推导值",
@@ -1178,18 +1189,32 @@ def _check_frontend_bucket_has_no_expiry(bucket: str, region: str) -> None:
           else f"{len(rules)} 条规则，均不覆盖 sites/")
 
 
+# 一次运行里只下载一次 Edge 产物（⑥b 的公钥对账与 ⑧ 的 PLATFORM_SUBDOMAINS 共用）。
+# **两个理由**：① 两处必须读**同一个版本**——⑥b 的判据（公钥字节）是版本敏感的，两次定位
+# 之间真发生一次部署会让同一份报告里两段说的是两个版本；② 那个预签名 URL 实测会
+# RemoteDisconnected，少下一次就少一次失败机会。**只缓存成功**：失败不写缓存，第二个调用方
+# 自己重试并各自记红（把失败缓存下来会让"第一次网络抖动"变成"这一整轮都读不到"）。
+_edge_source_cache: str | None = None
+
+
 def _edge_deployed_source() -> str:
-    """CloudFront **当前关联的那个版本**的 Edge 产物 → `index.py` 文本。
+    """CloudFront **当前关联的那个版本**的 Edge 产物 → `index.py` 文本（本轮内缓存）。
 
     版本选择规则与 `verify_deployed_edge.sh` ① 段一致，**不按"版本号最大/时间
     最新"挑**：Lambda@Edge 的旧版本要等全球副本排空才能删，CDK 期间会出现多次
     `DELETE_FAILED (skipped)`，实测**旧版本的 LastModified 比新版本更晚**。
 
-    这里与那个 shell 脚本有一段重复的定位逻辑。之所以可以接受：本段只问一个
-    问题——`mcp` 有没有进 `PLATFORM_SUBDOMAINS`——而这个答案对"读到哪个版本"
-    不敏感（`mcp` 从来没进过任何版本；真有人把它加进去并部署了，$LATEST 与
-    关联版本都会带上它）。也就是说这份重复**不可能让两个脚本给出相反的结论**。
+    **这份定位逻辑与那个 shell 脚本重复，而它现在是承重的。** 3c-final 之前本段只问一个
+    版本无关的问题（`mcp` 有没有进 `PLATFORM_SUBDOMAINS`——它从来没进过任何版本），所以
+    重复无害。现在 ⑥b 拿这份源码**逐字节对账 site family 的公钥**，那个答案对"读到哪个版本"
+    **高度敏感**：换 key 之后的新版本带新公钥、旧版本带旧公钥。于是两个闸门的定位逻辑必须
+    继续给出同一个版本——它们今天都从分发的 origin-request 关联 ARN 取限定符，所以**由构造
+    一致**；谁单独改一侧（例如改成挑最新版本、或加个"取不到就回落 $LATEST"），两个闸门就会
+    在同一次部署上给出相反结论，而且**先红的那个看起来像误报**。改任一侧都要同时改另一侧。
     """
+    global _edge_source_cache
+    if _edge_source_cache is not None:
+        return _edge_source_cache
     import boto3
 
     region = "us-east-1"        # Lambda@Edge / ACM 的硬约束区域
@@ -1217,7 +1242,8 @@ def _edge_deployed_source() -> str:
                        f"{stack}-{short}", qualifier)
     if "index.py" not in set(z.namelist()):
         raise RuntimeError("Edge 产物里没有 index.py——打包方式变了？")
-    return z.read("index.py").decode()
+    _edge_source_cache = z.read("index.py").decode()
+    return _edge_source_cache
 
 
 def _check_mcp_is_not_a_platform_subdomain(sub: str) -> None:
