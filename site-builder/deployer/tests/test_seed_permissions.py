@@ -845,3 +845,70 @@ def test_projection_writer_scan_bites_probe_modules(tmp_path):
         '    expr = "SET require_auth" + " = :a"\n'
         '    return _upd(UpdateExpression=expr, v=site)\n')
     assert _projection_writers(concatenated) == {}
+
+
+# ---- ADR 0002：首次部署的权限 seed 也拒夹具域进非夹具站点 ----
+# seed 直接从 manifest 的 auth 块取 allowed_users，而合同校验只查邮箱形态。真实 owner 的
+# site.json 若把 @e2e.invalid 列进 allowed_users，就会把夹具身份 seed 进非夹具站点。
+
+_FIX = "probe@e2e.invalid"
+_MANIFEST_WITH_FIXTURE = {"require_login": True,
+                          "allowed_users": ["keep@example.com", _FIX]}
+
+
+def test_seed_rejects_fixture_email_for_real_owner_site(aws):
+    """反例：真实 owner + manifest 里含夹具域邮箱 ⇒ PolicyDataInvalid，且零写入。"""
+    import boto3
+    import common
+    import permissions
+    import pytest
+    import register_route
+
+    common.upsert_site("s-fxseed", owner="o@x.com", name="n", status="DEPLOYING")
+    job_id = common.create_job("o@x.com", "s-fxseed")
+    with pytest.raises(permissions.PolicyDataInvalid, match="e2e.invalid"):
+        register_route.handler(
+            {"job_id": job_id, "site_id": "s-fxseed", "api_target": "",
+             "manifest": {"auth": _MANIFEST_WITH_FIXTURE}}, None)
+
+    # 拒绝发生在 update_item（路由注册提交点）之前 ⇒ 真源没被写、路由没被建
+    after = common.get_site_consistent("s-fxseed")
+    assert "allowed_users" not in after and "permissions_rev" not in after, "拒绝必须零写入"
+    route = boto3.client("dynamodb").get_item(
+        TableName="routing", Key={"subdomain": {"S": "app-s-fxseed"}})
+    assert "Item" not in route, "拒绝在提交点之前，路由不该被创建"
+
+
+def test_seed_allows_fixture_email_for_fixture_owner_site(aws):
+    """正对照：夹具 owner + 同一份 manifest ⇒ 正常 seed（夹具站点可以持有夹具邮箱）。"""
+    import common
+    import register_route
+
+    common.upsert_site("s-fxok", owner=_FIX, name="n", status="DEPLOYING")
+    job_id = common.create_job(_FIX, "s-fxok")
+    register_route.handler(
+        {"job_id": job_id, "site_id": "s-fxok", "api_target": "",
+         "manifest": {"auth": _MANIFEST_WITH_FIXTURE}}, None)
+
+    after = common.get_site_consistent("s-fxok")
+    assert after.get("allowed_users") == ["keep@example.com", _FIX]   # normalize 后 sorted
+    assert after.get("require_login") is True
+    assert int(after["permissions_rev"]) == 1
+
+
+def test_seed_allows_org_string_for_real_owner_site(aws):
+    """正对照：真实 owner + allowed_users="org" 仍正常 seed（字符串形态不得被 list 检查误伤）。"""
+    import common
+    import register_route
+
+    common.upsert_site("s-fxorg", owner="o@x.com", name="n", status="DEPLOYING")
+    job_id = common.create_job("o@x.com", "s-fxorg")
+    register_route.handler(
+        {"job_id": job_id, "site_id": "s-fxorg", "api_target": "",
+         "manifest": {"auth": {"require_login": True, "allowed_users": "org"}}},
+        None)
+
+    after = common.get_site_consistent("s-fxorg")
+    assert after.get("allowed_users") == "org"
+    assert after.get("require_login") is True
+    assert int(after["permissions_rev"]) == 1

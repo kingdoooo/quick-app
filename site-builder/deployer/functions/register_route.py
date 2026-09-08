@@ -47,6 +47,16 @@ def _seed_permissions_if_absent(site_id: str, manifest_auth: dict,
     """
     import botocore.exceptions
     allowed = permissions.normalize_allowed_users(manifest_auth["allowed_users"])
+    # ADR 0002：夹具域邮箱只许出现在夹具站点（owner 是夹具域）的 allowed_users。首次部署的 seed 直接从
+    # manifest 的 auth 块取 allowed_users，而合同校验只查邮箱形态——真实 owner 的 site.json 若把
+    # @e2e.invalid 列进 allowed_users，就会把夹具身份 seed 进非夹具站点。位置：在 update_item
+    # （路由注册提交点）之前抛错 ⇒ 不影响任何线上状态（CLAUDE.md 不变量）。allowed 可能是 "org" 字面量，
+    # 用 isinstance 挡住字符串形态。
+    if not permissions.is_fixture_email(owner) and isinstance(allowed, list):
+        bad = [e for e in allowed if permissions.is_fixture_email(e)]
+        if bad:
+            raise permissions.PolicyDataInvalid(
+                f"夹具域邮箱只许出现在夹具站点的 allowed_users（ADR 0002）：{bad}")
     try:
         boto3.resource("dynamodb", region_name=os.environ.get(
             "AWS_DEFAULT_REGION", "us-east-1")).Table(

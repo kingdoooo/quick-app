@@ -1318,3 +1318,19 @@ def test_add_admin_refuses_fixture_domain(aws):
     with pytest.raises(ValueError, match="e2e.invalid"):
         perm.add_admin(FIX, added_by="t")
     assert not perm.is_admin(FIX)
+
+
+def test_fixture_site_may_add_a_fixture_collaborator(aws):
+    """正对照：夹具站点加夹具协作者要放行（若 :712 的豁免被误写成也拦，这条会红）。"""
+    site_id = _seed_site(owner=FIX)
+    out = perm.write_permissions(site_id, actor=FIX, action="manage_collaborators",
+                                 collaborators=["helper@e2e.invalid"])
+    assert out["collaborators"] == ["helper@e2e.invalid"]
+
+
+def test_fixture_site_may_transfer_to_another_fixture_owner(aws):
+    """正对照：夹具站点转给另一个夹具 owner 要放行（若 :714 的反向规则被误写成也拦，这条会红）。"""
+    site_id = _seed_site(owner=FIX)
+    out = perm.write_permissions(site_id, actor=FIX, action="transfer_owner",
+                                 new_owner="successor@e2e.invalid")
+    assert out["owner"] == "successor@e2e.invalid"
