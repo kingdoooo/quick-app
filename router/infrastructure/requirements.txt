@@ -1,6 +1,12 @@
 aws-cdk-lib==2.100.0
 constructs>=10.0.0,<11.0.0
-# stack.py 的 load_jwt_secret 用它从 SSM 读会话签名密钥注入 Edge 函数。
-# 缺 boto3 时不会报错，而是静默落回 SYNTH-ONLY-PLACEHOLDER —— 部署出去所有
-# 会话 token 都验签失败（无限登录跳转），所以必须列为依赖。
+# stack.py 的 load_site_allowlist 用它按 [SessionKeys] 的 key_arn 从 KMS 取 site family 的公钥
+# （DescribeKey / GetPublicKey）注入 Edge 函数。缺 boto3 时 synth 会响亮失败并点名要装什么
+# （3c-final 之前是静默落回 SYNTH-ONLY-PLACEHOLDER —— 部署出去所有会话 token 都验签失败），
+# 但那条路上 cdk deploy 就停在 synth 了，所以必须列为依赖。
 boto3
+# 同一条路上的四项校验（spec §11.6 第 1 层）走 session_kms → session.load_public_key_der /
+# spki_sha256，那两个函数要 cryptography。**版本与 auth / panel / lambda/requirements-edge.txt
+# 同一个钉版**：三处的 session.py 验签核心互为副本，跑在不同 cryptography 上就不再是同一份行为。
+# 这个 venv 不是 hash 锁定的（aws-cdk-lib 也只钉版本），所以这里也只钉版本。
+cryptography==50.0.0
