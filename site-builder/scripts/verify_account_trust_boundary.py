@@ -514,8 +514,8 @@ def undecided_pairs(evaluation_results) -> set[tuple[str, str]]:
     """→ {(动作, 资源)}：该资源**非 allowed**，且它自己或**顶层**带 `MissingContextValues`。
 
     比 `missing_context_in`（principal 级的一个 bool）细一档，因为那个集合会漏掉这个
-    反例：P 原本只对 site-a 的 Invoke 判不出，后来对 jwt-secret 的 `GetParameters`
-    也判不出——按 principal 集合前后都是 `{P}` ⇒ 绿，而新增的**密钥读取**不确定面
+    反例：P 原本只对 site-a 的 Invoke 判不出，后来对某把会话签名 CMK 的 `kms:Sign`
+    也判不出——按 principal 集合前后都是 `{P}` ⇒ 绿，而新增的**签名**不确定面
     没被发现。
 
     **顶层的 `MissingContextValues` 也算**（并进每个非 allowed 资源的键集）：只在
@@ -1220,7 +1220,13 @@ def _compare_kms(rep: Report, base: dict, now: dict, *, new_keys: tuple,
 
     key 集合的增减必须**声明**（`--new-key` / `--retire-key`）才落绿桶：轮转期新 key 就位、
     旧 key 退役都是计划内的，而"多出一把没人声明的会话签名 CMK"是要有人看的事。
+
+    **逐字段比的清单由 `BUNDLE_SHAPE["kms"]["*"]` 派生，不在这里手写**：手写的那一份在有人给
+    快照加第七个字段时不会跟着变，于是新字段进了观测与基线却从不参与比较——而"多了一个字段"
+    与"那个字段没变过"在输出上一模一样（这正是本文件被反复点名的那类 false-green）。
+    `grants` 从标量清单里剔掉、单独比：它是列表，要按排序后的集合比，并把条数差打出来。
     """
+    scalars = [k for k in BUNDLE_SHAPE["kms"]["*"] if k != "grants"]
     for kid in sorted(set(base) | set(now)):
         if kid not in base:
             (rep.migration_grants if kid in new_keys else rep.kms_drift).append(
@@ -1232,7 +1238,7 @@ def _compare_kms(rep: Report, base: dict, now: dict, *, new_keys: tuple,
                 f"kms {kid}：消失"
                 + ("（--retire-key 已声明）" if kid in retired_keys else "——未声明的 key 退场"))
             continue
-        for k in ("arn_fp", "key_policy_fp", "key_spec", "key_usage", "spki_sha256"):
+        for k in scalars:
             if base[kid].get(k) != now[kid].get(k):
                 rep.kms_drift.append(f"kms {kid}：{k} 变了")
         if sorted(base[kid].get("grants", [])) != sorted(now[kid].get("grants", [])):
@@ -1537,10 +1543,11 @@ def read_config(path: Path = CONFIG_PATH) -> configparser.ConfigParser:
 def secret_in_zip_bytes(blob: bytes, value: str) -> bool:
     """zip 里的 .py 是否含 `value` 这个字面量。**不打印、不返回取到的值本身。**
 
-    3c-final 起要找的东西有两类：base64 的 SPKI 公钥（`SITE_ALLOWLIST_JSON` 里那些
-    `spki_b64`，392 字符，子串命中不会有假阳性）与 login-flow secret 的值。
-    HS 时代那条按 `JWT_SECRET = "…"` 赋值形态精确匹配的分支已经删掉——它只对 64 位
-    十六进制那种"可能偶然出现在别处"的短值有意义。
+    要找的东西有两类：base64 的 SPKI 公钥（`SITE_ALLOWLIST_JSON` 里那些 `spki_b64`，
+    392 字符）与 login-flow secret 的值。两者都够长 ⇒ 子串命中不会有假阳性，所以判据就是
+    朴素的子串包含。**别为了"更严"加回按赋值语句形态精确匹配的那一支**：注入点的形态
+    （今天是一整份 JSON 里的一个字段）不由本函数决定，绑死形态只会让某次 stack.py 改写
+    注入方式时三条硬断言集体失效，而失效方向是"没找到"⇒ 其中两条负向断言会静静地绿。
     """
     try:
         z = zipfile.ZipFile(io.BytesIO(blob))
@@ -1817,8 +1824,11 @@ def edge_asset_location(clients, function_name: str) -> tuple[str, str]:
     tags = clients["lambda"].get_function(FunctionName=function_name).get("Tags", {})
     stack = tags.get("aws:cloudformation:stack-name")
     if not stack:
-        raise SystemExit(f"{function_name} 没有 CloudFormation stack tag——"
-                         f"推不出 asset 位置，闸门会漏掉 read-edge-asset 这条路")
+        raise SystemExit(
+            f"{function_name} 没有 CloudFormation stack tag——推不出当前 asset 的位置。"
+            f"asset 那一侧是 `assert_edge_artifacts` 两条负向断言（不得含 console 公钥 / "
+            f"不得含 login-flow 值）的一半输入，缺了它闸门只剩 code 那一半，"
+            f"而“少扫了一处”与“那里干净”在输出上一模一样")
     body = clients["cloudformation"].get_template(
         StackName=stack, TemplateStage="Processed")["TemplateBody"]
     if isinstance(body, str):
@@ -1949,9 +1959,11 @@ def bucket_policy_statements(s3, bucket: str) -> list[dict]:
     """CDK bootstrap 桶的 bucket policy → 语句列表；无策略时 `[]`。
 
     **为什么必须单独有这一层**：`SimulatePrincipalPolicy` 不纳入 resource-based policy
-    （对 role 根本不支持模拟它），而 S3 bucket policy 单独就能授权读 asset ⇒ 有人往这个
-    桶上加一条 Allow，A 那一层会全绿而实际多了能读签名密钥的人（桶里有 9 个仍带活密钥
-    的对象）。返回 `[]` 时随后会被比成"少了语句" ⇒ 红，所以整条 policy 被删也咬得住。
+    （对 role 根本不支持模拟它），而 S3 bucket policy 单独就能授权读写这个桶里的对象。
+    3c-final 之后 asset 里已经没有私钥了，这一层要防的换成了**写**那一侧：Edge 的部署产物
+    就在这个桶里，能改它的人等于能换掉 verifier，也就是能自己定义谁是谁。有人往桶上加一条
+    Allow 时 A 那一层会全绿，只有这份快照能咬住。返回 `[]` 时随后会被比成"少了语句" ⇒ 红，
+    所以整条 policy 被删也咬得住。
     """
     from botocore.exceptions import ClientError
     try:

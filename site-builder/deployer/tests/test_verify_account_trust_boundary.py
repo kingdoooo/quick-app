@@ -3947,16 +3947,44 @@ def _kms_entry(**over):
     base.update(over); return base
 
 
-def test_kms_section_red_on_policy_change_grant_or_undeclared_key_add_or_remove():
+def _perturb(value):
+    """任意字段值 → 一个**不等**的同类型值。列表加一项，标量换一个串。"""
+    if isinstance(value, list):
+        return value + ["abcd-abcd-abcd-abcd"]
+    return "9" * 64 if value == "0" * 64 else "PERTURBED"
+
+
+def test_every_field_in_the_kms_shape_is_actually_compared():
+    """**逐字段**变形：`BUNDLE_SHAPE["kms"]["*"]` 里的每一个字段动一下都必须红。
+
+    手写一份字段清单（原实现）与 `BUNDLE_SHAPE` 分家一次就够疼了：加第七个字段时合同会
+    要求它出现在快照与基线里，却**没有任何东西**要求它参与比较——而"多了一个字段"与
+    "那个字段没变过"在输出上一模一样。所以这条用例**遍历合同**而不是遍历手写名单，
+    新字段自动进入覆盖；末尾那条计数断言保证遍历不是空转。
+    """
+    g = _gate()
+    fields = list(g.BUNDLE_SHAPE["kms"]["*"])
+    assert len(fields) >= 6, fields
+    base = {"site-rs-v1": _kms_entry(), "console-rs-v1": _kms_entry(spki_sha256="1" * 64)}
+    rep = g.Report(); g._compare_kms(rep, base, json.loads(json.dumps(base)),
+                                    new_keys=(), retired_keys=())
+    assert not rep.kms_drift, rep.kms_drift          # 正对照：没变就不许红
+    covered = []
+    for field in fields:
+        now = json.loads(json.dumps(base))
+        now["site-rs-v1"][field] = _perturb(now["site-rs-v1"][field])
+        assert now["site-rs-v1"][field] != base["site-rs-v1"][field], f"{field} 的变形没改动它"
+        rep = g.Report(); g._compare_kms(rep, base, now, new_keys=(), retired_keys=())
+        assert rep.kms_drift and not rep.ok, f"{field} 变了却没红"
+        assert field in " ".join(rep.kms_drift), f"报文里没点出是哪个字段：{rep.kms_drift}"
+        covered.append(field)
+    assert covered == fields, (covered, fields)
+
+
+def test_kms_section_red_on_undeclared_key_add_or_remove():
     g = _gate()
     base = {"site-rs-v1": _kms_entry(), "console-rs-v1": _kms_entry(spki_sha256="1" * 64)}
-    same = json.loads(json.dumps(base))
-    rep = g.Report(); g._compare_kms(rep, base, same, new_keys=(), retired_keys=())
-    assert not rep.kms_drift
     for mutate, why in (
-        (lambda d: d["site-rs-v1"].__setitem__("key_policy_fp", "9999-9999-9999-9999"), "key policy 变了"),
-        (lambda d: d["site-rs-v1"]["grants"].append("abcd-abcd-abcd-abcd"), "多了一条 grant"),
-        (lambda d: d["site-rs-v1"].__setitem__("spki_sha256", "f" * 64), "公钥换了"),
         (lambda d: d.__setitem__("site-rs-v2", _kms_entry()), "未声明的新 key"),
         (lambda d: d.pop("console-rs-v1"), "未声明的 key 消失"),
     ):
@@ -4059,7 +4087,9 @@ def test_the_edge_scan_only_covers_the_associated_version_not_latest():
             return False
 
     real = urllib.request.urlopen
-    urllib.request.urlopen = lambda url: _Resp(bodies[url.rsplit("/", 1)[1]])
+    # 未知 qualifier 返回一个**空** zip 而不是 KeyError：变形（把 `$LATEST` 加回扫描范围）时
+    # 该红的是下面 `asked == ["7"]` 那条断言，不是夹具自己炸掉——诊断信息差很多。
+    urllib.request.urlopen = lambda url: _Resp(bodies.get(url.rsplit("/", 1)[1], zbytes("")))
     try:
         out = g.edge_code_arns_carrying_keys({"lambda": _Lambda()}, "edge-fn",
                                              "arn:aws:lambda:us-east-1:111111111111:function:edge-fn",
@@ -4130,6 +4160,38 @@ def test_auth_and_panel_signing_grants_are_positive_controls():
     g = _gate()
     assert g.REQUIRED_GRANT_PREFIXES["auth"] == ("kms-sign:site-", "kms-sign:console-")
     assert g.REQUIRED_GRANT_PREFIXES["panel"] == ("kms-sign:console-",)
+
+
+def test_every_required_prefix_label_is_produced_by_measure():
+    """`REQUIRED_GRANT_PREFIXES` 的键集必须与 `measure()` 写进 `required` 的键集**逐个相等**。
+
+    两个方向都是静默失效，所以按等值断言而不是包含：
+    · 多一条前缀条目 ⇒ `compare_to_baseline` 只遍历 `required.items()`，那条**永远不被求值**
+      （以为加了一道正向控制，其实什么都没加）；
+    · 少一条 ⇒ `REQUIRED_GRANT_PREFIXES[label]` 直接 `KeyError`，闸门在比较中途炸掉。
+    `measure()` 那一段发 AWS 调用，所以按 AST 取它 `return` 里 `"required"` 那个字典的键。
+    """
+    g = _gate()
+    tree = ast.parse(_SCRIPT.read_text(encoding="utf-8"))
+    fn = next(n for n in tree.body
+              if isinstance(n, ast.FunctionDef) and n.name == "measure")
+    keys = None
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Dict):
+            continue
+        names = [k.value for k in node.keys
+                 if isinstance(k, ast.Constant) and isinstance(k.value, str)]
+        if "required" in names:
+            required = node.values[names.index("required")]
+            assert isinstance(required, ast.Dict), ast.unparse(required)
+            keys = {k.value for k in required.keys}
+    assert keys, "measure() 的 return 里找不到 required 字典——本条空转了"
+    assert keys == set(g.REQUIRED_GRANT_PREFIXES), (
+        f"required 的键 {sorted(keys)} 与 REQUIRED_GRANT_PREFIXES 的键 "
+        f"{sorted(g.REQUIRED_GRANT_PREFIXES)} 不一致："
+        "多出来的前缀条目永远不被求值，少的那个会让比较器 KeyError")
+    # BUNDLE_SHAPE 的 required 分节同样要跟上——否则新角色名不进合同、快照截断也看不出
+    assert set(g.BUNDLE_SHAPE["required"]) == keys
 
 
 def test_losing_the_signing_grant_is_a_failure_for_auth_and_for_panel():

@@ -117,10 +117,10 @@ MUTATIONS: list[tuple] = [
      '                                         ActionNames=["iam:PutRolePolicy"])\n'
      '            iam_stmts[fp] = sorted(fps)',
      "does_not_call_the_simulator"),
-    (10, "coverage 退回 principal 级", SCRIPT,
-     '    return principal_fingerprint(\n'
-     '        f"undecided:{principal_arn}|{action_class}|{resource_class}")',
-     '    return principal_fingerprint(f"undecided:{principal_arn}")',
+    (10, "coverage 成员丢掉资源类那一段（退回 principal × 动作类）", SCRIPT,
+     '    return f"{principal_fingerprint(principal_arn)}|{action_class}|'
+     '{\',\'.join(sorted(classes))}"',
+     '    return f"{principal_fingerprint(principal_arn)}|{action_class}|unattributed"',
      "second_undecided_target or undecided_item_swap "
      "or second_undecided_platform_function"),
     (11, "undecided_pairs 丢掉顶层 MissingContextValues", SCRIPT,
@@ -133,10 +133,10 @@ MUTATIONS: list[tuple] = [
      '                if False:\n                    continue',
      "all_allowed_resources_are_not_undecided or allowed_resources_never_enter"),
     (13, "coverage 成员按 action 全局折叠（丢掉资源类集合）", SCRIPT,
-     '    return {undecided_item_fp(principal_arn, cls, "|".join(sorted(classes)))\n'
-     '            for cls, classes in by_action.items()}',
-     '    return {undecided_item_fp(principal_arn, cls, "unattributed")\n'
-     '            for cls in by_action}',
+     '    return {undecided_item(principal_arn, cls, classes)\n'
+     '            for cls, classes in _undecided_by_action(pairs, t).items() if classes}',
+     '    return {undecided_item(principal_arn, cls, {"unattributed"})\n'
+     '            for cls, classes in _undecided_by_action(pairs, t).items() if classes}',
      "second_undecided_platform_function"),
     (14, "bucket policy 不快照", SCRIPT,
      '    _compare_bucket_policy(rep, base_rp.get("bootstrap_bucket"),',
@@ -193,18 +193,14 @@ MUTATIONS: list[tuple] = [
       '            thread_iam_client._shared = boto3.client(',
       '    return thread_iam_client._shared'),
      "own_iam_client"),
-    (24, "--no-asset-scan 不再限制用途", SCRIPT,
-     '    if not getattr(args, "no_asset_scan", False):\n        return',
-     '    return\n    if not getattr(args, "no_asset_scan", False):\n        return',
-     "no_asset_scan_may_not_produce_a_verdict"),
+    # 24 / 26 / 35 曾经守着 `--no-asset-scan` 与 `asset_scan_complete`（HS 时代"历史 asset
+    # 里有活密钥"那条通道）。3c-final 删掉了整条路：产物里只剩公钥，闸门只看当前 asset ⇒
+    # 没有"扫描不完整"这个状态可以伪装成权威绿了。三条变形连同它们守的用例一起删除，
+    # **不保留成注释**（一条永远 BROKEN 的变形会让 harness 的退出码失去意义）。
     (25, "bundle 缺分节不再硬失败", SCRIPT,
      '    missing = [k for k in BUNDLE_SHAPE if k not in bundle]',
      '    missing = []',
      "bundle_missing_a_section or from_dump_rejects_a_bundle_missing"),
-    (26, "不完整的 asset 扫描可以当权威结果", SCRIPT,
-     '    if bundle.get("asset_scan_complete") is not True:',
-     '    if False:',
-     "incomplete_asset_scan_cannot_be_replayed"),
     (27, "平台 resource policy 压回扁平集合（qualifier 类丢失）", SCRIPT,
      '        raw = raw.replace(f"{function}:{qualifier}", f"<self>:<{qualifier_class}>")',
      '        raw = raw.replace(f"{function}:{qualifier}", "<self>:<alias>")',
@@ -240,7 +236,7 @@ MUTATIONS: list[tuple] = [
      '        for key, sub in list(spec.items())[:0]:\n            if key not in value:',
      "bundle_missing_an_inner_key"),
     (33, "coverage 只要求是 dict（内层 undecided_items 可缺）", SCRIPT,
-     '    "coverage": {"undecided_items": _list_of_str},',
+     '    "coverage": {"undecided_items": _list_of_undecided_items},',
      '    "coverage": dict,',
      "coverage_items_are_required"),
     (34, "resource_policies 不要求 sites（整层站点检查可缺）", SCRIPT,
@@ -251,14 +247,10 @@ MUTATIONS: list[tuple] = [
      '                          "sites": {"*": _POLICY_SHAPE},',
      '                          "sites": dict,',
      "a_truncated_per_site_shape_hard_fails"),
-    (35, "asset_scan_complete 退回 truthiness 判断", SCRIPT,
-     '    if bundle.get("asset_scan_complete") is not True:',
-     '    if not bundle.get("asset_scan_complete"):',
-     "asset_scan_complete_must_be_a_true_bool"),
     # 两处一起改：默认拒绝在嵌套层与顶层各有一处，只改一处另一处照样红。
     (36, "规格外的新分节放行（删默认拒绝）", SCRIPT,
      ('        unknown = sorted(set(value) - set(spec))',
-      '    unknown = sorted(set(bundle) - set(BUNDLE_SHAPE) - {"asset_scan_complete"})'),
+      '    unknown = sorted(set(bundle) - set(BUNDLE_SHAPE))'),
      ('        unknown = []',
       '    unknown = []'),
      "an_unknown_bundle_section_hard_fails"),
@@ -346,6 +338,80 @@ MUTATIONS: list[tuple] = [
      "    items[:] = [i for i in items\n"
      "                if i.name != 'test_pagination_window_is_a_known_blind_spot']",
      "blind_spot_tests_are_collected or blind_spot_tests_actually_execute"),
+    # ---- 3c-final（asset-v1/08 ticket 13）：KMS 层 + Edge 产物三条硬断言 ------------
+    #
+    # 这一段守的是本轮新判据。每条都对着**这一轮加的那个守卫**，不是通用的"改坏就红"：
+    # 前两条证明两类签名能力各自被记成 grant；第三条正是复审 I2 那个发现（字段清单手写 ⇒
+    # 新字段进合同却从不参与比较）；后四条证明三条硬断言里每一条都真的会挡。
+    (53, "grants_from_decisions 不再记 kms-sign（“能签”这条能力整类消失）", SCRIPT,
+     '        if allowed(A_KMS_SIGN, (arn,)):\n'
+     '            grants.add(f"{G_KMS_SIGN}:{kid}")',
+     '        if False:\n'
+     '            grants.add(f"{G_KMS_SIGN}:{kid}")',
+     "kms_sign_and_self_authorize or signing_paths_are_separate"),
+    (54, "grants_from_decisions 不再记 kms-self-authorize（“能让自己能签”消失）", SCRIPT,
+     '        if allowed(A_KMS_SELF_AUTHORIZE, (arn,)):\n'
+     '            grants.add(f"{G_KMS_SELF_AUTHORIZE}:{kid}")',
+     '        if False:\n'
+     '            grants.add(f"{G_KMS_SELF_AUTHORIZE}:{kid}")',
+     "kms_sign_and_self_authorize or signing_paths_are_separate"),
+    (55, "_compare_kms 的字段清单改回手写（少比三个字段）", SCRIPT,
+     '    scalars = [k for k in BUNDLE_SHAPE["kms"]["*"] if k != "grants"]',
+     '    scalars = ["key_policy_fp", "spki_sha256"]',
+     "every_field_in_the_kms_shape_is_actually_compared"),
+    (56, "_compare_kms 不比 grants（key 上多一条授权不再红）", SCRIPT,
+     '        if sorted(base[kid].get("grants", [])) != sorted(now[kid].get("grants", [])):',
+     '        if False:',
+     "every_field_in_the_kms_shape_is_actually_compared"),
+    (57, "assert_edge_artifacts 不再要求当前版本带 site 公钥（全员 302 也绿）", SCRIPT,
+     '        if not code_hits.get(f"site:{kid}"):',
+     '        if False:',
+     "edge_artifact_assertions_fail_closed"),
+    (58, "assert_edge_artifacts 不再拒 console 公钥（spec §4.1 失守）", SCRIPT,
+     '        if code_hits.get(f"console:{kid}") or asset_hits.get(f"console:{kid}"):',
+     '        if False:',
+     "edge_artifact_assertions_fail_closed"),
+    (59, "console 那条只看 code、不看 asset（半边扫描 = 一条静默通道）", SCRIPT,
+     '        if code_hits.get(f"console:{kid}") or asset_hits.get(f"console:{kid}"):',
+     '        if code_hits.get(f"console:{kid}"):',
+     "edge_artifact_assertions_fail_closed"),
+    (60, "assert_edge_artifacts 不再拒 login-flow 值（spec §11.3 失守）", SCRIPT,
+     '    if code_hits.get(LABEL_LOGIN_FLOW) or asset_hits.get(LABEL_LOGIN_FLOW):',
+     '    if False:',
+     "edge_artifact_assertions_fail_closed or edge_artifact_hard_failure_message"),
+    (61, "Edge 代码扫描把 $LATEST 也算进来（“部署了但分发还指旧版本”变绿）", SCRIPT,
+     '    for qualifier in qualifiers:',
+     '    for qualifier in (None, *qualifiers):',
+     "edge_scan_only_covers_the_associated_version"),
+    (62, "simulate 不喂 KMS 的 Condition 上下文（平台必需 grant 判成缺上下文）", SCRIPT,
+     '    for actions, resources, context in ((ACTIONS_FUNCTION, t.function_resources(), None),\n'
+     '                                        (ACTIONS_OTHER, t.other_resources(), KMS_CONTEXT)):',
+     '    for actions, resources, context in ((ACTIONS_FUNCTION, t.function_resources(), None),\n'
+     '                                        (ACTIONS_OTHER, t.other_resources(), None)):',
+     "kms_keys_are_simulated_with_the_contract_context"),
+    (63, "KMS 的两个合同值改成手抄（与 session_kms 分家）", SCRIPT,
+     'KMS_SIGNING_ALGORITHM = _module_constant(SESSION_KMS_PY, "SIGNING_ALGORITHM")\n'
+     'KMS_MESSAGE_TYPE = _module_constant(SESSION_KMS_PY, "MESSAGE_TYPE")',
+     'KMS_SIGNING_ALGORITHM = "RSASSA_PSS_SHA_256"\n'
+     'KMS_MESSAGE_TYPE = "DIGEST"',
+     "kms_context_values_are_the_contract"),
+    (64, "panel 的角色名改成手抄（panel 改名时正向控制盯空角色）", SCRIPT,
+     '    return _module_constant(path or PANEL_DEPLOY_PY, "ROLE_NAME")',
+     '    return "site-panel-role"',
+     "panel_role_name_comes_from_deploy_panel"),
+    (65, "load_baseline 不再硬校验 schema（旧形态基线直接开比）", SCRIPT,
+     '    if data.get("schema") != BASELINE_SCHEMA:',
+     '    if False:',
+     "schema_six_has_no_migration_channel"),
+    (66, "没有基线也照出结论（全部 principal 报成新增的那一屏红）", SCRIPT,
+     '    if wants_baseline(args) and not args.update_baseline and not BASELINE_PATH.exists():',
+     '    if False:',
+     "main_refuses_to_produce_a_verdict_without_a_baseline"),
+    (67, "REQUIRED_GRANT_PREFIXES 多一条 measure 不产出的前缀（永不被求值）", SCRIPT,
+     '    "panel": (f"{G_KMS_SIGN}:console-",),\n}',
+     '    "panel": (f"{G_KMS_SIGN}:console-",),\n'
+     '    "keyproxy": (f"{G_KMS_SIGN}:site-",),\n}',
+     "every_required_prefix_label_is_produced_by_measure"),
 ]
 
 
