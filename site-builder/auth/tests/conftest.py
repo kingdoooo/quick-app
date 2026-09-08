@@ -25,16 +25,18 @@ def _fake_platform_clients(monkeypatch):
             raise RuntimeError(f"测试里意外读了 SSM 参数 {Name}")
 
     kms = vectors.FakeKms()
-    # Task 5 之前 login_handler 尚未切 RS：import 失败即不打补丁；需要它的测试模块自己 import 会响亮失败
+    # Task 5 之前 login_handler 尚未切 RS：import 失败即不打补丁；需要它的测试模块自己 import 会响亮失败。
+    # try 只包 import：Task 5 之后钩子（_ssm/_kms/_reset_signers）缺失必须 AttributeError 响亮失败，
+    # 不许被吞掉后静默跑到真 boto3 SSM/KMS（本机有活凭据）。
     try:
         import login_handler as lh
-        lh._secret_cache.clear()
-        lh._reset_signers()
-        monkeypatch.setattr(lh, "_ssm", lambda: _SSM())
-        monkeypatch.setattr(lh, "_kms", lambda: kms)
-    except (ImportError, AttributeError):
+    except ImportError:
         yield None
         return
+    lh._secret_cache.clear()
+    lh._reset_signers()
+    monkeypatch.setattr(lh, "_ssm", lambda: _SSM())
+    monkeypatch.setattr(lh, "_kms", lambda: kms)
     yield kms
     lh._secret_cache.clear()
     lh._reset_signers()
