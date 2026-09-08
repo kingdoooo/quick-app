@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """把 deployer 栈建出来的会话签名 CMK 变成可粘贴进 config.ini 的 `[SessionKey:<kid>]` 小节（spec §11.6）。
 
-    python3 site-builder/scripts/session_key_fingerprint.py --from-stack            # 读栈的两个 CfnOutput
-    python3 site-builder/scripts/session_key_fingerprint.py --kid site-rs-v1 --arn arn:aws:kms:…:key/…
+    site-builder/deployer/.venv/bin/python3 site-builder/scripts/session_key_fingerprint.py --from-stack
+    site-builder/deployer/.venv/bin/python3 site-builder/scripts/session_key_fingerprint.py \
+        --kid site-rs-v1 --arn arn:aws:kms:…:key/…
 
 只读（DescribeKey + GetPublicKey），不写 config；形态四项（KeySpec / KeyUsage / SigningAlgorithms / SPKI）
-在这里就校验——指纹算错的症状是三个部署脚本的 precheck 全部拒绝部署。用不带路径的 python3 跑。
+在这里就校验——指纹算错的症状是三个部署脚本的 precheck 全部拒绝部署。
+
+**解释器是这一族 `scripts/*.py` 里的例外**：它经 `session_kms` → `session` 用到 `cryptography`
+（第 4 项就是"这段 DER 真的是一个合规的 RSA-2048 SPKI"），而 CLAUDE.md 给宿主 `python3` 装的
+只有 boto3 + pip-system-certs ⇒ 裸 `python3` 跑会 `ModuleNotFoundError: cryptography`。
+用上面那个 venv 解释器（实测可跑），或给宿主 `python3` 补上 cryptography。
 
 **回填是人做的**，这个脚本只打印。自动改写 config 会让"部署前核对"这道闸门失去意义：那时 config
 与 KMS 天然一致，而没人确认过换的是哪一把 key。
@@ -19,7 +25,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "site-builder" / "auth"))
-import session_kms  # noqa: E402
+try:
+    import session_kms  # noqa: E402
+except ModuleNotFoundError as exc:      # 多半是 cryptography（见文件头「解释器」那段）
+    raise SystemExit(
+        f"缺依赖 {exc.name}：本脚本要做形态四项校验，其中公钥侧经 session_kms → session 用到 "
+        "cryptography，而宿主 python3 默认只有 boto3。\n"
+        "改用 site-builder/deployer/.venv/bin/python3 跑，或给宿主 python3 补上 cryptography。"
+    ) from None
 from session_keys import KID_RE  # noqa: E402
 
 STACK_OUTPUTS = {"site-rs-v1": "SiteSessionKeyRsV1Arn", "console-rs-v1": "ConsoleSessionKeyRsV1Arn"}
