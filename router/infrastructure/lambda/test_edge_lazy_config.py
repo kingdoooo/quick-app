@@ -17,6 +17,7 @@
 不测副本、不测简化件。
 """
 import json
+import sys
 import types
 from pathlib import Path
 
@@ -25,11 +26,14 @@ import pytest
 import edge_substitutions as es
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parents[2] / "site-builder" / "panel" / "tests"))
+import upgrade_code_vectors as v  # noqa: E402  三套件共用的 RS 测试密钥
 RAW_SRC = es.EDGE_SRC_PATH.read_text(encoding="utf-8")
 
-# allowlist 里的值是**签名密钥**。故意让坏 JSON 带上这个标记，用来断言它不会出现在报文里。
-LEAK_MARKER = "LEAK-MARKER-THIS-IS-A-SIGNING-KEY"
-BROKEN_ALLOWLIST_JSON = '{"site-hs-v1": {"alg": "HS256", "secret": "' + LEAK_MARKER + '"'  # 少一个括号
+# 故意让坏 JSON 带上这个标记，用来断言整份文本不会出现在报文里（3c-final 之后它是公钥、
+# 不再是密钥，但"报文只点名注入点"这条不变——回显一整份 JSON 只会淹掉唯一有用的那句）。
+LEAK_MARKER = "LEAK-MARKER-THIS-IS-THE-INJECTED-BLOB"
+BROKEN_ALLOWLIST_JSON = '{"site-rs-v1": {"alg": "RS256", "spki_b64": "' + LEAK_MARKER + '"'  # 少一个括号
 
 
 def _load_raw(name: str = "_edge_unsubstituted") -> types.ModuleType:
@@ -93,17 +97,23 @@ def test_the_allowlist_error_never_echoes_the_value_because_it_holds_the_keys():
 
 def test_a_non_object_allowlist_is_rejected_instead_of_being_indexed():
     """JSON 合法但不是对象（例如注成了数组）⇒ 明确报错，不要留到 `allowlist[kid]` 才 TypeError。"""
-    mod = _load(SITE_ALLOWLIST_JSON='["site-hs-v1"]')
+    mod = _load(SITE_ALLOWLIST_JSON='["site-rs-v1"]')
     with pytest.raises(RuntimeError, match="SITE_ALLOWLIST_JSON"):
         mod._site_allowlist()
 
 
 def test_the_allowlist_is_parsed_once_and_then_memoised():
-    """解析一次即缓存：把源字符串换成坏 JSON 之后仍能拿到同一个对象 ⇒ 没有重复解析。"""
-    allow = {"site-hs-v1": {"alg": "HS256", "secret": "s", "role": "current"}}
+    """解析一次即缓存：把源字符串换成坏 JSON 之后仍能拿到同一个对象 ⇒ 没有重复解析。
+
+    返回值里 `spki_b64` 已经被换成 **RSAPublicKey 对象**（那一步也在这个函数里、也是惰性的），
+    所以判据是"kid 集合 + alg/role 原样 + public_key 已经是对象"，不是与入参 dict 相等。
+    """
+    allow = {v.SITE_KID: {"alg": "RS256", "spki_b64": v.spki_b64(v.SITE_KEY), "role": "current"}}
     mod = _load(SITE_ALLOWLIST_JSON=json.dumps(allow))
     first = mod._site_allowlist()
-    assert first == allow
+    assert set(first) == {v.SITE_KID}
+    assert first[v.SITE_KID]["alg"] == "RS256" and first[v.SITE_KID]["role"] == "current"
+    assert first[v.SITE_KID]["public_key"].key_size == 2048
     mod.SITE_ALLOWLIST_JSON = BROKEN_ALLOWLIST_JSON      # 若还会再解析，这一步会让下面炸
     assert mod._site_allowlist() is first
 
@@ -131,17 +141,15 @@ def _b64(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
 
-def _kid_token(kid: str = "site-hs-v2", secret: str = "whatever") -> str:
-    """一枚**带 kid** 的 token。签名对不对无所谓：契约顺序是先查 allowlist 再验签，
+def _kid_token(kid: str = "site-rs-v2") -> str:
+    """一枚**带 kid** 的 token。签名对不对无所谓：契约顺序是先取 allowlist 再验签，
     所以它足以走到取 allowlist 那一步（用 `a.b.c` 是不行的——那连 header 都解不出来，
     在 `bad_signature` 就返回了，第一版用例正是这样假绿的）。"""
-    import hashlib
-    import hmac
     import time
-    h = _b64(json.dumps({"alg": "HS256", "typ": "JWT", "kid": kid}).encode())
+    h = _b64(json.dumps({"alg": "RS256", "typ": "JWT", "kid": kid}).encode())
     p = _b64(json.dumps({"token_use": "site-session", "aud": "site-edge", "email": "a@x.com",
                          "exp": int(time.time()) + 600}).encode())
-    sig = _b64(hmac.new(secret.encode(), f"{h}.{p}".encode(), hashlib.sha256).digest())
+    sig = _b64(b"x" * 256)          # 长度对得上模长，内容是垃圾（走不到验签就够了）
     return f"{h}.{p}.{sig}"
 
 
@@ -175,27 +183,6 @@ def test_a_malformed_cookie_still_never_needs_the_allowlist():
     resp = _broken()._check_auth(_req(cookie="sb_session=a.b.c"), dict(ROUTE_PRIVATE),
                                  "app-x.example.com")
     assert resp["status"] == "302"
-
-
-def test_legacy_entry_tokens_do_not_need_the_allowlist_at_all():
-    """契约顺序的副产品：header 无 kid 且 legacy 入口开着 ⇒ 走 legacy 分支，不碰 allowlist。
-
-    （线上 L3 之后开关是 off，这条只是钉住"取 allowlist 的位置在 kid 分支里"。）
-    """
-    import base64
-    import hashlib
-    import hmac
-    import time
-    mod = _load(SITE_ALLOWLIST_JSON=BROKEN_ALLOWLIST_JSON, LEGACY_ENTRY="on",
-                JWT_SECRET="legacy-secret")
-    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()   # noqa: E731
-    h = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
-    p = b64(json.dumps({"typ": "session", "email": "a@x.com", "name": "A", "idp": "Feishu",
-                        "auth_via": "TokenGeneration_HostedAuth",
-                        "exp": int(time.time()) + 600}).encode())
-    sig = b64(hmac.new(b"legacy-secret", f"{h}.{p}".encode(), hashlib.sha256).digest())
-    r = _req(cookie=f"sb_session={h}.{p}.{sig}")
-    assert mod._check_auth(r, dict(ROUTE_PRIVATE), "app-x.example.com") is None
 
 
 # ---- ④ 路由表 client 同样惰性（它不缩小半径，但决定了"能不能 import"）------------------

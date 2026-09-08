@@ -1,35 +1,46 @@
-import base64, hashlib, hmac, json, time
+import base64, json, time
 import sys
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).parent))
-_SRC = (Path(__file__).parent / "origin_request.py").read_text()
-for k, v in {"{{DYNAMODB_TABLE_NAME}}": "t", "{{DYNAMODB_REGION}}": "us-east-1",
-             "{{FRONTEND_BUCKET_DOMAIN}}": "b.s3.us-east-1.amazonaws.com",
-             "{{JWT_SECRET}}": "test-secret", "{{BASE_DOMAIN}}": "example.com",
-             "{{REQUIRE_IDP_CLAIM}}": "true",
-             "{{TRUSTED_IDPS}}": "Feishu,Okta",
-             "{{SITE_ALLOWLIST_JSON}}": '{"site-hs-v1": {"alg": "HS256", "secret": "site-secret-v1", "role": "current"}}', "{{LEGACY_ENTRY}}": "on"}.items():
-    _SRC = _SRC.replace(k, v)
-(Path(__file__).parent / "_edge_auth_testable.py").write_text(_SRC)
-import _edge_auth_testable as orq
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parents[2] / "site-builder" / "panel" / "tests"))
+import edge_substitutions as es          # 替换表的唯一定义（ticket 22）
+import upgrade_code_vectors as v          # 三套件共用的 RS 测试密钥
+
+orq = es.load_edge_module("_edge_auth_testable", write_to=HERE)
 
 
-def _jwt(email="a@x.com", name="Alice", exp_delta=3600, secret="test-secret",
-         idp="Feishu", auth_via="TokenGeneration_HostedAuth"):
-    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
-    h = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
-    payload = {"typ": "session", "name": name, "exp": int(time.time()) + exp_delta}
-    if email is not None:  # email=None -> payload 完全省略 email 字段
+def _b64(raw: bytes) -> str:
+    """规范 base64url（无填充、urlsafe 字母表）——Edge 的 verifier 拒非规范形式。"""
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def _jwt(email="a@x.com", name="Alice", exp_delta=3600, key=None, kid=None,
+         idp="Feishu", auth_via="TokenGeneration_HostedAuth",
+         token_use="site-session", aud="site-edge"):
+    """RS256 站点会话（3c-final）。
+
+    **手搓而不是调 `session.mint_token`** 是刻意的：本文件有一批用例要省掉某个 claim
+    （`email=None`、`token_use=None`）或注入假值，而 mint 不给这种口子——那些用例正是
+    "缺字段被当成有效会话"这类退化的守卫。跨组件正向向量另有其人
+    （`test_a_real_auth_token_verifies_at_the_edge` 与 test_edge_kid_allowlist.py 全套）。
+    """
+    h = _b64(json.dumps({"alg": "RS256", "typ": "JWT", "kid": kid or v.SITE_KID}).encode())
+    payload = {"name": name, "exp": int(time.time()) + exp_delta}
+    if token_use is not None:      # token_use=None -> payload 完全省略该字段
+        payload["token_use"] = token_use
+    if aud is not None:
+        payload["aud"] = aud
+    if email is not None:          # email=None -> payload 完全省略 email 字段
         payload["email"] = email
     if idp:
         payload["idp"] = idp
     if auth_via:
         payload["auth_via"] = auth_via
-    p = b64(json.dumps(payload).encode())
-    sig = b64(hmac.new(secret.encode(), f"{h}.{p}".encode(), hashlib.sha256).digest())
-    return f"{h}.{p}.{sig}"
+    p = _b64(json.dumps(payload).encode())
+    return f"{h}.{p}.{_b64(v.signer(key or v.SITE_KEY)(f'{h}.{p}'.encode()))}"
 
 
 ROUTE_AUTH = {"subdomain": "app-x", "site_id": "x", "static_prefix": "sites/x",
@@ -74,7 +85,8 @@ def test_expired_cookie_redirects():
 
 
 def test_wrong_signature_redirects():
-    r = _req(cookie=f"sb_session={_jwt(secret='other')}")
+    """header 说 site kid，签名却出自另一把私钥 ⇒ bad_signature。"""
+    r = _req(cookie=f"sb_session={_jwt(key=v.CONSOLE_KEY)}")
     assert orq._check_auth(r, dict(ROUTE_AUTH), "app-x.example.com")["status"] == "302"
 
 
@@ -253,20 +265,11 @@ def test_org_route_admits_any_email_from_trusted_idp():
 # ---- Task 8b: idp / auth_via 校验（org 语义的执行点，spec §3.5） ----
 
 
-def _jwt_idp(email="a@x.com", idp="Feishu", exp_delta=3600, secret="test-secret",
+def _jwt_idp(email="a@x.com", idp="Feishu", exp_delta=3600, key=None,
              auth_via="TokenGeneration_HostedAuth"):
-    """带 idp + auth_via 的会话 JWT（Task 13 起 auth 服务签的就是这种）。"""
-    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
-    h = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
-    payload = {"typ": "session", "email": email, "name": "Alice",
-               "exp": int(time.time()) + exp_delta}
-    if idp:
-        payload["idp"] = idp
-    if auth_via:
-        payload["auth_via"] = auth_via
-    p = b64(json.dumps(payload).encode())
-    sig = b64(hmac.new(secret.encode(), f"{h}.{p}".encode(), hashlib.sha256).digest())
-    return f"{h}.{p}.{sig}"
+    """带 idp + auth_via 的会话 JWT（auth 服务签的就是这种形态）。"""
+    return _jwt(email=email, name="Alice", exp_delta=exp_delta, key=key,
+                idp=idp, auth_via=auth_via)
 
 
 def test_trusted_idp_session_is_admitted():
@@ -339,20 +342,8 @@ def test_idp_check_disabled_by_switch():
 
     用独立的 testable 副本验证：把占位符替换成 false 后重新加载模块。
     """
-    import importlib
-    import sys
-    src = (Path(__file__).parent / "origin_request.py").read_text()
-    for k, v in {"{{DYNAMODB_TABLE_NAME}}": "t", "{{DYNAMODB_REGION}}": "us-east-1",
-                 "{{FRONTEND_BUCKET_DOMAIN}}": "b.s3.us-east-1.amazonaws.com",
-                 "{{JWT_SECRET}}": "test-secret", "{{BASE_DOMAIN}}": "example.com",
-                 "{{REQUIRE_IDP_CLAIM}}": "false",
-                 "{{TRUSTED_IDPS}}": "Feishu",
-                 "{{SITE_ALLOWLIST_JSON}}": '{"site-hs-v1": {"alg": "HS256", "secret": "site-secret-v1", "role": "current"}}', "{{LEGACY_ENTRY}}": "on"}.items():
-        src = src.replace(k, v)
-    (Path(__file__).parent / "_edge_noidp_testable.py").write_text(src)
-    sys.path.insert(0, str(Path(__file__).parent))
-    mod = importlib.import_module("_edge_noidp_testable")
-    importlib.reload(mod)
+    mod = es.load_edge_module("_edge_noidp_testable", write_to=HERE,
+                              REQUIRE_IDP_CLAIM="false", TRUSTED_IDPS="Feishu")
     r = _req(cookie=f"sb_session={_jwt_idp(idp=None)}")
     assert mod._check_auth(r, dict(ROUTE_AUTH), "app-x.example.com") is None
 
@@ -541,14 +532,14 @@ def test_pkce_cookie_is_also_stripped_from_site_requests():
     assert "__Host-sb_pkce" not in kept and "keep=1" in kept
 
 
-# ---- S1/M05: Edge 内嵌 verifier 必须查 typ ----
-# 会话 token 与 console 一次性升级码用**同一个密钥**签名、线格式也相同，
-# 唯一的区别是载荷里的 typ。Edge 不查 typ 时，一个 60s 的升级码就是一个
-# 有效站点会话（而它还能在 auth 的 /console-session 无限续期）。
+# ---- S1/M05: Edge 内嵌 verifier 必须查 token_use ----
+# 会话 token 与 console 一次性升级码线格式相同，区别在载荷的 token_use / aud
+# （3c-final 之后还多一层：两者用**不同 family 的 key** 签，kid 也不同）。Edge 不查
+# token_use 时，一个 60s 的升级码就是一个有效站点会话（而它还能在 auth 的
+# /console-session 无限续期）。
 #
-# 下面两条"不带 typ"的用例**故意不用 `_jwt`**：那个辅助已经带上了 typ
-# （Step 4），用它就测不到"缺 typ"这件事本身。手搓是为了让用例不会因为
-# 别人改辅助而静默失效。
+# 下面这些"缺字段"的用例靠 `_jwt(token_use=None)` 这类口子构造——见 `_jwt` 的
+# docstring：正向跨组件向量另有其人，这里要的就是"生产 mint 签不出来的形态"。
 
 # auth 包（site-builder/auth）不在 Edge 的运行时路径里，只有测试期为了跑
 # 跨组件向量才需要它。按 __file__ 定位而不是相对 cwd——本文件顶部就是这个
@@ -556,55 +547,36 @@ def test_pkce_cookie_is_also_stripped_from_site_requests():
 _AUTH_PKG = str(Path(__file__).resolve().parents[3] / "site-builder" / "auth")
 
 
-def test_edge_rejects_a_token_without_typ():
-    """缺 typ 的旧会话被拒（走 302，不是 403）。
+def test_edge_rejects_a_token_without_token_use():
+    """缺 token_use 的会话被拒（走 302，不是 403）。
 
     302 而非 403 的理由与既有的 idp/auth_via 检查一致：引导用户去登录，
     而不是让他以为"没权限"去找站点 owner 加名单。
-    这一条也是"全员重登一次"的技术表现。
     """
-    claims = {"email": "v@example.test", "name": "V",
-              "exp": int(time.time()) + 600}          # 故意不带 typ
-    def b64(raw):
-        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
-    header = b64(json.dumps({"alg": "HS256", "typ": "JWT"},
-                            separators=(",", ":")).encode())
-    payload = b64(json.dumps(claims, separators=(",", ":")).encode())
-    sig = b64(hmac.new(b"test-secret", f"{header}.{payload}".encode(),
-                       hashlib.sha256).digest())
-    assert orq._verify_session_jwt(f"{header}.{payload}.{sig}") is None
+    assert orq._verify_session_jwt(_jwt(token_use=None)) is None
 
 
 def test_edge_rejects_a_console_upgrade_code_as_a_site_session():
-    """console 升级码不得当站点会话用（M05 在 Edge 侧的那一半）。"""
+    """console 升级码不得当站点会话用（M05 在 Edge 侧的那一半）。
+
+    3c-final 下它有两道拦：kid 是 console family（不在 Edge 的 allowlist 里），
+    且 token_use/aud 也不是站点会话那一组。这里用**真的 mint** 签一枚，所以
+    两道拦哪一道松了都会被看见。
+    """
     sys.path.insert(0, _AUTH_PKG)
-    from session import mint_upgrade_code
-    code = mint_upgrade_code("v@example.test", "test-secret")
+    from session import mint_token
+    code = mint_token(kid=v.CONSOLE_KID, sign=v.signer(v.CONSOLE_KEY),
+                      token_use="console-upgrade", email="v@example.test", ttl_seconds=60)
     assert orq._verify_session_jwt(code) is None
 
 
-def test_check_auth_redirects_a_typeless_token_to_login():
-    """缺 typ 走到 `_check_auth` 是 **302 到登录端点**，不是 403。
+def test_check_auth_redirects_a_token_without_token_use_to_login():
+    """缺 token_use 走到 `_check_auth` 是 **302 到登录端点**，不是 403。
 
     口径与既有的 idp / auth_via 检查一致：引导用户去登录，
     而不是让他以为"没权限"去找站点 owner 加名单。
-
-    手搓 token 而不用 `_jwt`：那个辅助现在会带 typ，用它这条用例就变成
-    "带 typ 的合法会话被 302"——恒绿且测的是别的东西。
     """
-    def b64(raw):
-        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
-    header = b64(json.dumps({"alg": "HS256", "typ": "JWT"},
-                            separators=(",", ":")).encode())
-    payload = b64(json.dumps(
-        {"email": "v@example.test", "name": "V", "idp": "Feishu",
-         "auth_via": "TokenGeneration_HostedAuth",
-         "exp": int(time.time()) + 600},              # 故意不带 typ
-        separators=(",", ":")).encode())
-    sig = b64(hmac.new(b"test-secret", f"{header}.{payload}".encode(),
-                       hashlib.sha256).digest())
-    token = f"{header}.{payload}.{sig}"
-    request = _req(cookie=f"sb_session={token}")
+    request = _req(cookie=f"sb_session={_jwt(email='v@example.test', token_use=None)}")
     denied = orq._check_auth(request, ROUTE_AUTH, "app-x.example.test")
     assert denied is not None and denied["status"] == "302"
     assert "/login?redirect=" in denied["headers"]["location"][0]["value"]
@@ -613,69 +585,55 @@ def test_check_auth_redirects_a_typeless_token_to_login():
 def test_a_real_auth_token_verifies_at_the_edge():
     """**跨组件正向向量**：auth 真签出来的 token 必须能过 Edge 的 verifier。
 
-    这是唯一能发现 `auth/session.py` 的 `SESSION_TYP` 与 Edge 里硬编码的
-    `"session"` 漂移的东西——两处按设计必须字节等价，但 Edge 拿不到那个常量
-    （Lambda@Edge 不能 import auth 包）。只有负向用例的话，把 auth 改成
-    `typ="sess"` 而 Edge 仍查 `"session"`，全部负向用例照样绿，
-    而线上所有会话失效。
+    这是唯一能发现"auth 的 mint 与 Edge 的 verifier 漂移"的东西——两处按设计
+    字节等价，但 Edge 拿不到那个模块（Lambda@Edge 不能 import auth 包）。只有负向
+    用例的话，把 auth 的 `token_use` / `aud` / kid family 改错一个字，全部负向用例
+    照样绿（它们本来就期望"拒"），而线上每一枚会话都验不过。
     """
     sys.path.insert(0, _AUTH_PKG)
-    from session import mint_session_jwt
-    token = mint_session_jwt("v@example.test", "V", "test-secret",
-                             idp="Feishu", auth_via="TokenGeneration_HostedAuth")
+    from session import mint_token
+    token = mint_token(kid=v.SITE_KID, sign=v.signer(v.SITE_KEY), token_use="site-session",
+                       email="v@example.test", ttl_seconds=600, name="V",
+                       idp="Feishu", auth_via="TokenGeneration_HostedAuth")
     claims = orq._verify_session_jwt(token)
-    assert claims is not None, "auth 签的 token 在 Edge 侧被拒——两处 typ 漂移了"
+    assert claims is not None, "auth 签的 token 在 Edge 侧被拒——两处的合同漂移了"
     assert claims["email"] == "v@example.test"
 
 
-def test_edge_expected_typ_is_not_caller_supplied():
-    """期望的 typ 是**硬编码字面量**，不是入参——钉住这个形状本身。
+def test_edge_expected_token_use_is_not_caller_supplied():
+    """期望的 token_use 是**硬编码字面量**，不是入参——钉住这个形状本身。
 
-    auth 侧的 `verify_session_jwt(..., expected_typ=...)` 有一个假值洞：
-    显式传 `expected_typ=None` 时，缺 typ 的旧 token 走到 `None != None` ——
-    为假，于是**被接受**，正好退回 M05 要消灭的那个行为。Edge 这份不收这个参数，
-    所以那个洞在这里不可达（没有任何调用方能影响期望值），因此这里**不加**
-    "假值一律拒"的守卫——那道守卫在本形状下守不住任何东西。
-
-    这条用例是那个判断的保险：谁把 Edge 改成收 `expected_typ`（例如为了向
-    auth/session.py 的签名靠拢），本用例立刻红，提醒他这一刻必须把
-    `if not expected_typ or not isinstance(expected_typ, str): return None`
-    一起抄过来。
+    auth 那边 `verify_token(token, *, allowlist, token_use, …)` 的期望值由调用方给，
+    于是"传错一个 family 的期望值"是可能的；Edge 这份把它写成字面量
+    （`claims.get("token_use") != "site-session"`），调用方没有任何口子影响它。
+    谁把 Edge 改成收这个参数（例如为了向 session.py 的签名靠拢），本用例立刻红，
+    提醒他这一刻必须同时加上"缺失/非字符串一律拒"的守卫——否则
+    `token_use=None` 会让缺 token_use 的 token 通过。
     """
     import inspect
     params = list(inspect.signature(orq._verify_session_jwt).parameters)
     assert params == ["token"], (
-        f"_verify_session_jwt 现在收 {params}——期望 typ 一旦可由调用方传入，"
-        "就必须同时加上'缺失/非字符串一律拒'的守卫，否则 expected_typ=None "
-        "会让缺 typ 的旧 token 通过")
+        f"_verify_session_jwt 现在收 {params}——期望值一旦可由调用方传入，"
+        "就必须同时加上'缺失/非字符串一律拒'的守卫")
 
 
-@pytest.mark.parametrize("bad_typ", [
-    pytest.param(None, id="typ-null"),
-    pytest.param("", id="typ-空串"),
-    pytest.param(0, id="typ-0"),
-    pytest.param(False, id="typ-false"),
-    pytest.param([], id="typ-空数组"),
+@pytest.mark.parametrize("bad_use", [
+    pytest.param(None, id="token_use-null"),
+    pytest.param("", id="token_use-空串"),
+    pytest.param(0, id="token_use-0"),
+    pytest.param(False, id="token_use-false"),
+    pytest.param([], id="token_use-空数组"),
 ])
-def test_edge_rejects_falsy_typ_claims(bad_typ):
+def test_edge_rejects_falsy_token_use_claims(bad_use):
     """载荷侧的假值同样一律拒——"假值兜底"在鉴权路径上是本仓库的记录在案的陷阱。
 
-    这是上面那个洞在**claim 方向**的镜像：判据一旦被写成
-    `if claims.get("typ") and claims.get("typ") != "session"`（看起来像"给存量
-    会话留个兼容"的软化），这五种形态连同"完全没有 typ"就全部通过了。
-    现在的 `!= "session"` 对它们都成立，本用例把这件事钉住。
+    判据一旦被写成 `if claims.get("token_use") and claims.get("token_use") != "site-session"`
+    （看起来像"给存量会话留个兼容"的软化），这五种形态连同"完全没有 token_use"就全部
+    通过了。现在的 `!= "site-session"` 对它们都成立，本用例把这件事钉住。
     """
-    def b64(raw):
-        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
-    header = b64(json.dumps({"alg": "HS256", "typ": "JWT"},
-                            separators=(",", ":")).encode())
-    payload = b64(json.dumps(
-        {"typ": bad_typ, "email": "v@example.test", "name": "V",
-         "exp": int(time.time()) + 600}, separators=(",", ":")).encode())
-    sig = b64(hmac.new(b"test-secret", f"{header}.{payload}".encode(),
-                       hashlib.sha256).digest())
-    assert orq._verify_session_jwt(f"{header}.{payload}.{sig}") is None, (
-        f"typ={bad_typ!r} 被当成有效会话——假值不等于'不用查'")
+    token = _jwt(email="v@example.test", token_use=bad_use)
+    assert orq._verify_session_jwt(token) is None, (
+        f"token_use={bad_use!r} 被当成有效会话——假值不等于'不用查'")
 
 
 # ---- S1/M06: 同名 cookie 全取并逐个验签 ----

@@ -4,11 +4,20 @@ Lambda@Edge Origin Request处理器
 根据DynamoDB中存储的subdomain路由表，将CloudFront请求分流到后端
 Lambda Function URL（SigV4）或共享前端S3桶（SigV4 GET）。
 支持 route_mode：split（/api/ 走后端，其余走S3静态）与 api-only（全路径走后端）。
+
+会话验签是 **RS256**（3c-final）：本文件内嵌一份与 `site-builder/auth/session.py`
+**字节等价**的验签核心，只持 site family 的**公钥**（allowlist 由 CDK 在部署时注入）。
+RSA 原语来自 `cryptography`（ADR 0003），它由 stack.py 交叉装进 Edge 产物——
+Lambda@Edge 没有 layer，依赖必须和本文件打在同一个 zip 里。
 """
+import base64
+import hashlib
 import json
 import logging
 import os
+import re
 import secrets
+import time
 from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
@@ -18,6 +27,9 @@ from botocore.exceptions import ClientError
 from botocore.auth import S3SigV4Auth, SigV4Auth
 from botocore.awsrequest import AWSRequest
 import urllib.parse
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 
 # 配置日志
@@ -28,13 +40,11 @@ logger.setLevel(logging.INFO)
 DYNAMODB_TABLE_NAME = "{{DYNAMODB_TABLE_NAME}}"
 DYNAMODB_REGION = "{{DYNAMODB_REGION}}"
 FRONTEND_BUCKET_DOMAIN = "{{FRONTEND_BUCKET_DOMAIN}}"
-JWT_SECRET = "{{JWT_SECRET}}"  # Task 7 使用
-# 3c-1A（spec §4.3 / §11.6）：site family 的 kid allowlist 与 legacy 入口开关。
-# JSON 形态 kid -> {"alg","secret","role"}；只含 site family（Edge 的 allowlist 里**不出现**
-# console 的 key，spec §4.1）。用三引号是因为注入的是含双引号的 JSON；stack.py 在注入前断言
-# 文本里没有 ''' 与反斜杠。JWT_SECRET 从此只是 **legacy 入口**的密钥，3c-3 一并删。
+# site family 的 kid allowlist（spec §4.3）：JSON 形态 kid -> {alg, spki_b64, role}，
+# `spki_b64` 是 base64(DER SPKI)。只含 site family——console 的公钥**不进这里**（spec §4.1）：
+# 公钥不是秘密，但**接受哪些 key 本身就是授权边界**，多一把就是多一条能签站点会话的路。
+# 用三引号是因为注入的是含双引号的 JSON；stack.py 在注入前断言文本里没有 ''' 与反斜杠。
 SITE_ALLOWLIST_JSON = '''{{SITE_ALLOWLIST_JSON}}'''
-LEGACY_ENTRY = "{{LEGACY_ENTRY}}"        # "on" | "off"（[SessionKeys] legacy_param 非空即 on）
 # 解析结果的缓存。None = 还没解析过；解析在 `_site_allowlist()` 里**惰性**做（ticket 21）。
 _SITE_ALLOWLIST = None
 # 路由缓存：subdomain -> (expires_epoch, item)。**有界 LRU**（M19）：键是请求 host 的第一段，
@@ -59,6 +69,109 @@ DEFAULT_KEEPALIVE_TIMEOUT = 5
 _ROUTE_TABLE_CLIENT = None
 
 
+# ---- RS256 验签核心：与 site-builder/auth/session.py **字节等价**（test_edge_kid_allowlist.py 逐段比对）----
+# 改这里之前先读那条守卫：它按段落逐字比对本文件与 session.py，方向是"把 Edge 改到与 auth 相同"，
+# 不是反过来。四个函数（含它们的 docstring）是从 session.py 复制过来的，别手抄、别顺手润色。
+ALG = "RS256"
+TOKEN_USES = {"site-session": "site-edge",
+              "console-upgrade": "console-exchange",
+              "console-session": "console-panel"}
+RSA_MODULUS_BITS = (2048, 3072, 4096)
+RSA_PUBLIC_EXPONENT = 65537
+_PAD = padding.PKCS1v15()
+_HASH = hashes.SHA256()
+_B64URL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+# 夹具身份（spec §11.7 / ADR 0002）——与 auth/session.py 同一组字面量。
+# **授权边界要进 git review，所以是常量不是配置**；router 单测钉住三者与 session.py 等值。
+FIXTURE_DOMAIN = "e2e.invalid"
+FIXTURE_IDP = "fixture"
+FIXTURE_AUTH_VIA = "fixture-issuer"
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _b64url_decode_strict(s: str) -> bytes:
+    """规范 base64url：字母表只许 A-Za-z0-9-_（拒 `=` 填充与标准字母表的 + /），且重编码必须逐字符
+    相等（拒非规范尾比特——同一串字节的第二种编码是"同一签名两种写法"的入口）。"""
+    if not isinstance(s, str) or not _B64URL_RE.fullmatch(s):
+        raise ValueError("non-canonical base64url")
+    raw = base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+    if _b64url(raw) != s:
+        raise ValueError("non-canonical base64url")
+    return raw
+
+
+def _strict_json(raw: bytes) -> dict:
+    """拒绝重复键：Python 默认取最后一个，攻击者可放两个 kid 让不同实现看到不同值。"""
+    def no_dupes(pairs):
+        d = {}
+        for k, v in pairs:
+            if k in d:
+                raise ValueError("duplicate key")
+            d[k] = v
+        return d
+    obj = json.loads(raw, object_pairs_hook=no_dupes)
+    if not isinstance(obj, dict):
+        raise ValueError("not an object")
+    return obj
+
+
+def spki_sha256(der: bytes) -> str:
+    """`[SessionKey:<kid>] spki_sha256` 的定义：SHA-256(DER SPKI) 的 64 位 hex。"""
+    return hashlib.sha256(der).hexdigest()
+
+
+def load_public_key_der(der: bytes):
+    """DER SPKI → RSAPublicKey，公钥侧四项（spec §5）：rsaEncryption、指数 65537、模长 ∈ RSA_MODULUS_BITS、
+    DER 最小形式（重新序列化逐字节相等）。任一不符抛 ValueError；调用方（部署脚本 / verifier 冷启动）
+    把它当硬失败，不回落。"""
+    key = serialization.load_der_public_key(der)
+    if not isinstance(key, rsa.RSAPublicKey):
+        raise ValueError("SPKI 不是 rsaEncryption")
+    if key.public_numbers().e != RSA_PUBLIC_EXPONENT:
+        raise ValueError("RSA 公钥指数不是 65537")
+    if key.key_size not in RSA_MODULUS_BITS:
+        raise ValueError(f"RSA 模长 {key.key_size} 不在 {RSA_MODULUS_BITS}")
+    canonical = key.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    if canonical != der:
+        raise ValueError("SPKI DER 不是最小形式")
+    return key
+
+
+def _rsa_verify(public_key, signing_input: bytes, sig: bytes) -> bool:
+    """签名长度必须**严格等于**模长（spec §5）——不许交给 RSA 层去"补零"；其余交给 PKCS1 v1.5 验签。"""
+    if len(sig) != public_key.key_size // 8:
+        return False
+    try:
+        public_key.verify(sig, signing_input, _PAD, _HASH)
+        return True
+    except InvalidSignature:
+        return False
+
+
+def _aud_matches(got, want: str) -> bool:
+    """字符串**精确相等**。数组形态的 aud 一律不匹配（RFC 7519 允许数组，本平台不允许）。"""
+    return isinstance(got, str) and got == want
+
+
+# `load_public_key_der` 的别名：本文件里"下划线开头 = 内部"，而上面那个名字是从 session.py
+# 逐字复制的（比对段里不许多一行），所以别名单独放在比对段之外。
+_load_public_key_der = load_public_key_der
+
+# 黄金三元组（与 auth/session.py 字面相同）+ **import 期预热一次验签**（spec §11.1 / ADR 0003 的
+# 判据建立在"库初始化 + 首次验签发生在 Init 阶段"上；材料坏了在 Init 就炸，与 spike 同形）。
+# 私钥已丢弃，公钥与签名都不是秘密；**不要用它签任何 token**。
+RS256_GOLDEN = {
+    "spki_b64": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAx2eNvs12AANfSjqTYb85HR0pX6TUwA5kQpmCWGDJwEOl1ckHHzAHdWPDBNCHwaiZyC7fnvzqy3a41abvxvX5gzLZdfdRYkGJNx05/T3u6t5d2F87TtYIIvRkpJKEFKWlkrfIk00iOV/fjF04CFy0j6GXIHEKJ3Yg6SYFreqdCwg4Uh1xLKuK+NL7UyP15gOzEhXjG4yKR2FTZ9VEsxFe06sgG9+i3gS5kLIIJ+C7IJZhO8e9qNXGK6lAwX0ua/Oznq2dXGUfE4Nf9mrNimwtFjAw5Zx6Ro4nX7LxUifFeMmTjIgEywaiv9bzruWH9lNAYr23YznWwSgHWQc4bVi43QIDAQAB",
+    "signing_input": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImdvbGRlbi1ycy12MCJ9.eyJ0b2tlbl91c2UiOiJzaXRlLXNlc3Npb24iLCJhdWQiOiJzaXRlLWVkZ2UiLCJlbWFpbCI6ImdvbGRlbkBlMmUuaW52YWxpZCIsImV4cCI6MCwiaWF0IjowfQ",
+    "signature_b64": "P92df6Bjg13TN86Skcbup/uscO+/6JVap6jETiXYvCxLuiT7xQogdljNqPdRxAblz3qn+jlKwovcAUg+MBu5nhtjkxYdn/jbvI3Kj3ua02rNIKSIPxtDshWMWbEsH/XttCLmHuzVqKVA7b6YN0R9rk7KO076DkSgeAkY7/UZ0YvRWPQWOm8zAzEYGif0CfPpveqwssulc1WOTHlflEjj58oOKRx9QHImsYR/1FDIB2nbLJhkQ6GIfws+e8BIb6TJboK8f9V3UvXYiIp4AhZCNQp/aq+fxqeDo+foYvNfycFXxs8HVQS+3uYo8+qdiMG6/5LdNqN36qBUfDGjHig0lA==",
+}
+load_public_key_der(base64.b64decode(RS256_GOLDEN["spki_b64"])).verify(
+    base64.b64decode(RS256_GOLDEN["signature_b64"]), RS256_GOLDEN["signing_input"].encode(), _PAD, _HASH)
+
+
 def _site_allowlist() -> dict:
     """site family 的 kid allowlist，**首次使用时才解析**（3c-1B ticket 21）。
 
@@ -71,17 +184,21 @@ def _site_allowlist() -> dict:
 
     挪进本函数之后，只有**带 sb_session 的私有路由请求**会 500：`_check_auth` 在
     `require_auth is False` 与"没有 cookie"两条路上都到不了这里。
-    **别把范围记得比这更窄**：legacy 入口那条分支只在 `LEGACY_ENTRY == "on"` 时先返回，
-    线上 L3 已经把它关了 ⇒ 无 kid 的旧 cookie 同样会走到这里；`require_auth` 是坏类型时
-    也按需要登录处理、一样会走到这里。
+    **别把范围记得比这更窄**：连 header 都解不出来的 cookie 在 bad_signature 就返回了，
+    但任何**能解出 header** 的 cookie（哪怕签名是垃圾）都会走到这里；`require_auth` 是坏
+    类型时也按需要登录处理、一样会走到这里。
 
-    **报文只点名注入点、绝不回显值**：这份 JSON 是 kid -> {alg, secret, role}，即每把会话
-    密钥的明文。也**不 chain 原异常**（`from None`）：`JSONDecodeError` 把整份文本挂在 `.doc`
-    上，当前 CPython 不把它放进 `args`/`str()`，但那不是契约——别给它进日志的机会。
+    **报文只点名注入点、绝不回显值**：这份 JSON 里现在是公钥（不是秘密），但回显整份文本
+    只会淹掉那句唯一有用的提示。也**不 chain 原异常**（`from None`）：`JSONDecodeError` 把
+    整份文本挂在 `.doc` 上，当前 CPython 不把它放进 `args`/`str()`，但那不是契约——别给它
+    进日志的机会。
 
     ⚠️ 讲这些注入点时**用名字、不要写花括号形态**：stack.py 的注入是全文替换，注释里出现
-    一次就会在产物里把值多印一遍（allowlist 那份=多印一次密钥），而逐行比对与残留检查都在
-    替换之后做、两侧一致 ⇒ 看不出来。`test_edge_lazy_config.py` 有一条守卫盯着这点。
+    一次就会在产物里把值多印一遍，而逐行比对与残留检查都在替换之后做、两侧一致 ⇒ 看不出来。
+    `test_edge_lazy_config.py` 有一条守卫盯着这点。
+
+    公钥的解析（`spki_b64` → RSAPublicKey，含 spec §5 那四项校验）也在这里，**同样是惰性的**：
+    放到模块顶层就等于把"注入坏了 ⇒ 整个分发 502"换个理由带回来。
     """
     global _SITE_ALLOWLIST
     if _SITE_ALLOWLIST is None:
@@ -90,12 +207,14 @@ def _site_allowlist() -> dict:
         except ValueError:
             raise RuntimeError(
                 "SITE_ALLOWLIST_JSON 不是合法 JSON：部署时的字符串替换没落到这个注入点"
-                "（stack.py 的替换链漏了它）。值不打印：它是每个 kid 的签名密钥。") from None
+                "（stack.py 的替换链漏了它）。值不打印：形态由 stack.py 决定，"
+                "回显整份 JSON 只会淹掉这句报文。") from None
         if not isinstance(parsed, dict):
             raise RuntimeError(
                 f"SITE_ALLOWLIST_JSON 解析出 {type(parsed).__name__}，要的是 kid -> 条目 的对象"
                 "——注错形状时不要留到按 kid 取值那一步才 TypeError。")
-        _SITE_ALLOWLIST = parsed
+        _SITE_ALLOWLIST = {kid: {"alg": e["alg"], "public_key": _load_public_key_der(base64.b64decode(e["spki_b64"])),
+                                 "role": e["role"]} for kid, e in parsed.items()}
     return _SITE_ALLOWLIST
 
 
@@ -526,26 +645,6 @@ TRUSTED_AUTH_SOURCES = ("TokenGeneration_HostedAuth",
                         "TokenGeneration_RefreshTokens")
 
 
-def _b64url_decode(s: str) -> bytes:
-    import base64
-    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
-
-
-def _strict_json(raw: bytes) -> dict:
-    """拒绝重复键（两个 kid 让不同实现看到不同值）。与 auth/session.py 同名函数字节等价。"""
-    def no_dupes(pairs):
-        d = {}
-        for k, v in pairs:
-            if k in d:
-                raise ValueError("duplicate key")
-            d[k] = v
-        return d
-    obj = json.loads(raw, object_pairs_hook=no_dupes)
-    if not isinstance(obj, dict):
-        raise ValueError("not an object")
-    return obj
-
-
 def _log_verify_outcome(outcome: str) -> None:
     """spec §8：只记固定低基数词表，**不记 token**；埋点异常一律吞掉。"""
     try:
@@ -555,29 +654,36 @@ def _log_verify_outcome(outcome: str) -> None:
 
 
 def _verify_session_jwt(token: str) -> dict | None:
-    """与 site-builder/auth/session.py 的 `verify_with_legacy(token_use="site-session")` 字节等价，
+    """与 site-builder/auth/session.py 的 `verify_token(token_use="site-session")` 字节等价，
     改动须两处同步（CLAUDE.md 不变量）。`_check_auth` 只认"claims 或 None"，outcome 只进日志。
 
-    「2 + 1」入口（状态机 L1）：header 有 kid ⇒ 查 allowlist，**不在就拒、不回落**；
-    header 没有 kid 且 LEGACY_ENTRY == "on" ⇒ legacy 入口按旧合同验（typ=session 且无 scope）。
-    `kid` 是攻击者控制的输入：只拿它查表，不拼任何资源。
+    **只有一个入口**：header 的 kid 必须在 site allowlist 里，否则拒、不回落（3c-final 之后
+    既没有共享密钥也没有 legacy 入口）。`kid` 是攻击者控制的输入：只拿它查表，不拼任何资源。
     """
     claims, outcome = _verify_site_session(token)
     _log_verify_outcome(outcome)
     return claims
 
 
-def _verify_site_session(token: str) -> tuple:
-    import base64, hashlib, hmac as _hmac, time as _t
+def _verify_site_session(token: str, now: int | None = None) -> tuple:
+    """→ (claims 或 None, outcome)。任何异常都归为拒绝（fail-closed）。
+
+    **从 `try:` 到 `return claims` 与 auth/session.py 的 `verify_token` 字节等价**
+    （token_use 固定 `site-session`，allowlist 在 try 之后才取——位置是契约的一部分，见
+    `_site_allowlist` 的说明）。守卫把 Edge 的三处 `"site-session"` 字面量归一成 auth 那边的
+    `token_use` 形参再逐字比对，所以那段里**照抄**了两个在本文件里恒为真/恒为假的写法：
+      · `now` 形参（Edge 没有调用方会传它，默认 None ⇒ 走 `time.time()`）；
+      · `if "site-session" == "console-upgrade"` 那条 jti 检查（对本文件是死分支，
+        它在 auth 那边管的是 console 升级码）。
+    **不要"顺手"把它们化简掉**：那会让两份实现分叉，而分叉正是这条不变量要防的东西。
+    """
     try:
-        header_b64, payload_b64, sig = token.split(".")
-        header = _strict_json(_b64url_decode(header_b64))
+        header_b64, payload_b64, sig_b64 = token.split(".")
+        header = _strict_json(_b64url_decode_strict(header_b64))
     except Exception:
         return None, "bad_signature"
-    if "kid" not in header and LEGACY_ENTRY == "on":
-        return _verify_legacy_site_session(token)
-    # allowlist 在这里才取（ticket 21）：**位置本身是契约的一部分**——放到函数开头会让
-    # legacy 入口那条分支也依赖它，注入坏掉时连"无 kid 的旧 cookie"都跟着 500。
+    if "crit" in header:                      # RFC 7515 §4.1.11：本平台不认任何 critical 扩展
+        return None, "bad_signature"
     allowlist = _site_allowlist()
     kid = header.get("kid")
     if not isinstance(kid, str) or kid not in allowlist:
@@ -586,60 +692,28 @@ def _verify_site_session(token: str) -> tuple:
     if header.get("alg") != entry["alg"]:
         return None, "alg_mismatch"
     try:
-        expected = base64.urlsafe_b64encode(
-            _hmac.new(entry["secret"].encode(), f"{header_b64}.{payload_b64}".encode(),
-                      hashlib.sha256).digest()).rstrip(b"=").decode()
-        if not _hmac.compare_digest(sig, expected):
+        sig = _b64url_decode_strict(sig_b64)
+        if not _rsa_verify(entry["public_key"], f"{header_b64}.{payload_b64}".encode(), sig):
             return None, "bad_signature"
-        claims = _strict_json(_b64url_decode(payload_b64))
+        claims = _strict_json(_b64url_decode_strict(payload_b64))
     except Exception:
         return None, "bad_signature"
     if claims.get("token_use") != "site-session":
         return None, "wrong_token_use"
-    aud = claims.get("aud")
-    if not isinstance(aud, str) or aud != "site-edge":      # 字符串精确相等，数组必拒
+    if not _aud_matches(claims.get("aud"), TOKEN_USES["site-session"]):
         return None, "wrong_audience"
+    t = int(time.time()) if now is None else now
     try:
-        if int(claims.get("exp", 0)) <= int(_t.time()):
+        if int(claims.get("exp", 0)) <= t:
             return None, "expired"
     except Exception:
         return None, "bad_signature"
     email = claims.get("email")
     if not isinstance(email, str) or not email:
         return None, "bad_signature"
-    return claims, "accepted_" + entry["role"]
-
-
-def _verify_legacy_site_session(token: str) -> tuple:
-    """legacy 入口：拆 family 之前的共享密钥 + 旧合同。**只在 header 没有 kid 时到这里。**
-
-    **必须查 `typ`**（M05）：会话 token 与 console 一次性升级码用**同一个密钥**签名、线格式也相同。
-    旧合同里 site 会话是 typ=session 且**无 scope**；scope=console 的是面板会话，不是站点会话
-    （spec §6.2 状态机第 3 条；今天之前 Edge 不查 scope，这是相对现状的收紧）。
-    """
-    import base64, hashlib, hmac as _hmac, time as _t
-    try:
-        h, p, sig = token.split(".")
-        expected = base64.urlsafe_b64encode(
-            _hmac.new(JWT_SECRET.encode(), f"{h}.{p}".encode(), hashlib.sha256).digest()
-        ).rstrip(b"=").decode()
-        if not _hmac.compare_digest(sig, expected):
-            return None, "bad_signature"
-        claims = json.loads(_b64url_decode(p))
-        # typ 先查：这是"不能跨上下文复用"的唯一技术保证。字面量与
-        # auth/session.py 的 SESSION_TYP 必须一致（Edge 拿不到那个常量）。
-        if claims.get("typ") != "session":
-            return None, "bad_signature"
-        if claims.get("scope") == "console":
-            return None, "wrong_token_use"
-        if int(claims.get("exp", 0)) <= int(_t.time()):
-            return None, "expired"
-        email = claims.get("email")
-        if not isinstance(email, str) or not email:
-            return None, "bad_signature"  # 缺 email 的 token 视为无效，_check_auth 依赖 claims["email"]
-        return claims, "accepted_legacy"
-    except Exception:
+    if "site-session" == "console-upgrade" and not claims.get("jti"):
         return None, "bad_signature"
+    return claims, f"accepted_{entry['role']}"
 
 
 # **同名 sb_session 候选不设条数上限**——界由 Cookie 头体积给，不由常量给。
@@ -659,12 +733,20 @@ def _verify_legacy_site_session(token: str) -> tuple:
 # （方向是 fail-closed：真 token 落在被截掉的那段里 ⇒ 无一验签通过 ⇒ 302，
 # 但用户被挡在登录循环里，且重新登录清不掉遮蔽项）。
 #
-# 而放大是**不可能**的，因为总 HMAC 输入字节数由 Cookie 头体积封顶，与候选条数
-# 无关：单条 Cookie 头受浏览器/CloudFront 约 8KB 限制（**这个数字是本仓库的
-# 自述、没有对应到 AWS 配额文档**，但它是不是正好 8KB 不影响结论——存在一个由
-# 传输层强制的上界就够了）。实测（in-process，非真机）：8182B 头 / 248 候选
-# = 0.076ms，32734B 头 / 992 候选 = 0.185ms。也就是说"防放大"这个理由从来
-# 没有数字支撑，而它换来的是一个按路径深度复活的 DoS。
+# 而放大是**不可能**的，因为总验签工作量由 Cookie 头体积封顶，与候选条数无关：
+# 单条 Cookie 头受浏览器/CloudFront 约 8KB 限制（**这个数字是本仓库的自述、没有
+# 对应到 AWS 配额文档**，但它是不是正好 8KB 不影响结论——存在一个由传输层强制的
+# 上界就够了）。共享密钥（对称签名）时代实测（in-process，非真机）：8182B 头 /
+# 248 候选 = 0.076ms，32734B 头 / 992 候选 = 0.185ms。
+#
+# **改成非对称签名之后这笔账要重算一次，结论不变**（3c-final）：单次 RSA-2048
+# PKCS1 v1.5 验签实测约 32µs（in-process，cryptography 49），比一次对称摘要贵三个
+# 数量级。但**能走到验签的候选贵得多**：契约顺序是 base64url → JSON → crit →
+# kid ∈ allowlist → alg，所以最短形态 `sb_session=`（以及任何随手写的垃圾）在
+# 解 header 时就死了，成本是纯解析。要吃到一次 RSA 运算，候选必须带合法 header
+# （已知 kid + 匹配的 alg，约 62B base64）**和一段长度恰好等于模长的签名**
+# （256B → 342 个 base64url 字符），单条至少约 420B ⇒ 整请求 32KB 的上界只装得下
+# 约 78 条 ⇒ 约 2.5ms。仍然是"由传输层封顶"，不是由条数常量封顶。
 #
 # **不要重新引入一个条数上限。** 要加限制的话，限的应该是 Cookie 头体积
 # （那才是真正的界，且与路径深度无关），而不是候选条数。
@@ -809,7 +891,7 @@ def _check_auth(request, route, host, sink=None):
 
     # 逐个尝试**全部**同名候选，任一验签通过即放行（M06）。
     # 不截断：见 `_get_cookies` 上方那段——条数上限会按路径深度让 M06 复活，
-    # 而总 HMAC 工作量本就由 Cookie 头体积封顶。
+    # 而总验签工作量本就由 Cookie 头体积封顶（那段里有 RS256 的重算）。
     claims = None
     for token in _get_cookies(request, "sb_session"):
         claims = _verify_session_jwt(token)
@@ -819,7 +901,20 @@ def _check_auth(request, route, host, sink=None):
         return _redirect_login(host, request.get("uri", "/"),
                                request.get("querystring", ""))
 
-    if REQUIRE_IDP_CLAIM:
+    # 夹具会话（spec §11.7 / ADR 0002）：两个来源标记必须**同时**是夹具值，且只在夹具站点
+    # （route owner 的域是夹具域）或平台路由（console 的升级链路要经它）上按 allowed_users 正常
+    # 判定；其它路由一律 302——`allowed_users = "org"` 的真实站点放行任何可信邮箱，这条分支
+    # 就是不让夹具会话成为全组织的钥匙。平台身份用 _is_platform_route（按 host 推导，见那边的
+    # 注释），**不看 route 的可写字段**。
+    is_fixture = claims.get("auth_via") == FIXTURE_AUTH_VIA or claims.get("idp") == FIXTURE_IDP
+    if is_fixture:
+        both = claims.get("auth_via") == FIXTURE_AUTH_VIA and claims.get("idp") == FIXTURE_IDP
+        owner = route.get("owner")
+        owner_is_fixture = (isinstance(owner, str) and owner.count("@") == 1
+                            and owner.split("@")[1] == FIXTURE_DOMAIN and bool(owner.split("@")[0]))
+        if not both or not (_is_platform_route(route) or owner_is_fixture):
+            return _redirect_login(host, request.get("uri", "/"), request.get("querystring", ""))
+    elif REQUIRE_IDP_CLAIM:
         # 按未登录处理（302）而非 403：本地用户/旧会话应被引导去正规登录，
         # 403 会让用户以为"没权限"而去找站点 owner 加名单。
         # 两个 claim 都要过：

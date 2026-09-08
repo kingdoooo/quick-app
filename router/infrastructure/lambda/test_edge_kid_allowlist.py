@@ -1,290 +1,249 @@
-"""Edge 内嵌 verifier 认 site family 的 kid allowlist + legacy 入口开关（plan 3c-1A Task 3）。
-
-先于实现写下并跑红。Edge 拿不到 auth 包，所以这里 import `auth/session.py` 的**生产 mint**
-做跨组件正向向量（新入口一条、legacy 入口一条），负向按 spec §9。
-"""
+"""Edge 内嵌 verifier 认 site family 的 RS256 allowlist（3c-final）：正向跨组件向量、spec §9 负例矩阵、
+夹具边界（ADR 0002）、与 auth/session.py 的字节等价守卫。"""
 import base64
-import hashlib
-import hmac
-import importlib
 import json
 import logging
 import re
 import sys
-import time
 from pathlib import Path
 
-HERE = Path(__file__).parent
-_AUTH = HERE.parents[2] / "site-builder" / "auth"
-sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(_AUTH))
-import session as auth_session  # noqa: E402
+import pytest
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parents[2] / "site-builder" / "auth"))
+sys.path.insert(0, str(HERE.parents[2] / "site-builder" / "panel" / "tests"))
 import edge_substitutions as es  # noqa: E402
+import session as auth_session  # noqa: E402
+import upgrade_code_vectors as v  # noqa: E402
 
-SITE_V1, SITE_V0, CONSOLE_V1, LEGACY = "site-secret-v1", "site-secret-v0", "console-secret-v1", "test-secret"
-ALLOWLIST = {"site-hs-v1": {"alg": "HS256", "secret": SITE_V1, "role": "current"},
-             "site-hs-v0": {"alg": "HS256", "secret": SITE_V0, "role": "previous"}}
-# 替换表的唯一定义在 edge_substitutions（ticket 22）；这里只给本文件关心的那几项覆盖。
-SRC = es.EDGE_SRC_PATH.read_text()
-
-
-def _load(name: str, legacy_entry: str):
-    return es.load_edge_module(name, write_to=HERE, JWT_SECRET=LEGACY,
-                               SITE_ALLOWLIST_JSON=json.dumps(ALLOWLIST), LEGACY_ENTRY=legacy_entry)
-
-
-orq = _load("_edge_kid_testable", "on")
-orq_off = _load("_edge_kid_legacy_off_testable", "off")
+SRC = es.EDGE_SRC_PATH.read_text(encoding="utf-8")
+ALLOWLIST = {v.SITE_KID: {"alg": "RS256", "spki_b64": v.spki_b64(v.SITE_KEY), "role": "current"},
+             v.SITE_PREV_KID: {"alg": "RS256", "spki_b64": v.spki_b64(v.SITE_PREV_KEY), "role": "previous"}}
+orq = es.load_edge_module("_edge_kid_testable", write_to=HERE, SITE_ALLOWLIST_JSON=json.dumps(ALLOWLIST))
 
 ROUTE = {"subdomain": "app-x", "site_id": "x", "static_prefix": "sites/x", "api_target": "",
          "require_auth": True, "allowed_users": "org", "owner": "o@example.test"}
+FIXTURE_ROUTE = {**ROUTE, "subdomain": "app-e2e-probe", "site_id": "e2e-probe", "owner": "probe@e2e.invalid",
+                 "allowed_users": ["probe@e2e.invalid"]}
+CONSOLE_ROUTE = {"subdomain": "console", "site_id": "console", "static_prefix": "platform/console/v",
+                 "api_target": "https://p.lambda-url.us-east-1.on.aws", "route_mode": "split",
+                 "require_auth": True, "allowed_users": "org", "owner": "platform", orq._PLATFORM_KEY: True}
 
 
-def _req(token: str):
+def _req(token: str, host="app-x.example.com"):
     return {"uri": "/", "querystring": "", "method": "GET",
-            "headers": {"host": [{"key": "Host", "value": "app-x.example.com"}],
+            "headers": {"host": [{"key": "Host", "value": host}],
                         "cookie": [{"key": "Cookie", "value": f"sb_session={token}"}]}}
 
 
-def allowed(mod, token: str) -> bool:
-    resp = mod._check_auth(_req(token), dict(ROUTE), "app-x.example.com")
-    return resp is None
+def allowed(mod, token: str, route=None, host="app-x.example.com") -> bool:
+    return mod._check_auth(_req(token, host), dict(route or ROUTE), host) is None
+
+
+def site_token(**kw) -> str:
+    args = dict(kid=v.SITE_KID, sign=v.signer(v.SITE_KEY), token_use="site-session", email="v@example.test",
+                ttl_seconds=600, name="V", idp="Feishu", auth_via="TokenGeneration_HostedAuth")
+    args.update(kw)
+    return auth_session.mint_token(**args)
+
+
+def fixture_token(email="probe@e2e.invalid", **kw) -> str:
+    return site_token(email=email, idp="fixture", auth_via="fixture-issuer", **kw)
 
 
 def b64(obj) -> str:
-    raw = obj if isinstance(obj, bytes) else json.dumps(obj, separators=(",", ":")).encode()
-    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+    return base64.urlsafe_b64encode(json.dumps(obj, separators=(",", ":")).encode()).rstrip(b"=").decode()
 
 
 def unb64(s: str) -> dict:
     return json.loads(base64.urlsafe_b64decode(s + "=" * (-len(s) % 4)))
 
 
-def resign(token: str, secret: str, *, header=None, payload=None) -> str:
+def resign(token: str, key, *, header=None, payload=None) -> str:
     h, p, _ = token.split(".")
-    h2 = b64(unb64(h) if header is None else header)
-    p2 = b64(unb64(p) if payload is None else payload)
-    sig = b64(hmac.new(secret.encode(), f"{h2}.{p2}".encode(), hashlib.sha256).digest())
-    return f"{h2}.{p2}.{sig}"
+    h2 = b64(header) if header is not None else h
+    p2 = b64(payload) if payload is not None else p
+    sig = v.signer(key)(f"{h2}.{p2}".encode())
+    return f"{h2}.{p2}.{base64.urlsafe_b64encode(sig).rstrip(b'=').decode()}"
 
 
-def site_token(**kw) -> str:
-    args = dict(kid="site-hs-v1", secret=SITE_V1, token_use="site-session", email="v@example.test",
-                ttl_seconds=600, name="V", idp="Feishu", auth_via="TokenGeneration_HostedAuth")
-    args.update(kw)
-    return auth_session.mint_token(**args)
-
-
-def legacy_token(**kw) -> str:
-    args = dict(email="v@example.test", name="V", secret=LEGACY, idp="Feishu",
-                auth_via="TokenGeneration_HostedAuth")
-    args.update(kw)
-    return auth_session.mint_session_jwt(args.pop("email"), args.pop("name"), args.pop("secret"), **args)
-
-
-# ---- 跨组件正向向量（auth 真签的 token 必须过 Edge）--------------------------------
+# ---- 正向 ----
 
 def test_auth_minted_current_kid_token_verifies_at_the_edge():
-    assert allowed(orq, site_token())
     claims = orq._verify_session_jwt(site_token())
     assert claims and claims["email"] == "v@example.test"
 
 
 def test_auth_minted_previous_kid_token_verifies_at_the_edge():
-    assert allowed(orq, site_token(kid="site-hs-v0", secret=SITE_V0))
-
-
-def test_auth_minted_legacy_token_verifies_while_legacy_entry_is_on():
-    assert allowed(orq, legacy_token())
+    assert allowed(orq, site_token(kid=v.SITE_PREV_KID, sign=v.signer(v.SITE_PREV_KEY)))
 
 
 def test_verify_function_keeps_its_contract_for_check_auth():
-    """`_check_auth` 不动：`_verify_session_jwt(token)` 仍返回 claims 或 None。"""
     assert orq._verify_session_jwt("garbage") is None
     assert isinstance(orq._verify_session_jwt(site_token()), dict)
 
 
-# ---- legacy 入口开关 -----------------------------------------------------------------
-
-def test_legacy_token_is_rejected_when_legacy_entry_is_off():
-    assert not allowed(orq_off, legacy_token())
-    assert allowed(orq_off, site_token())      # 新入口不受开关影响
-
-
-def test_legacy_console_scoped_session_is_rejected_at_the_edge():
-    """旧合同的 site 会话 = typ=session 且**无 scope**；console 会话即使签名对也不是站点会话。"""
-    assert not allowed(orq, legacy_token(scope="console"))
-
-
-# ---- §9 反例 -----------------------------------------------------------------------------
+# ---- spec §9 负例 ----
 
 def test_console_kid_is_not_in_the_edge_allowlist():
-    tok = auth_session.mint_token(kid="console-hs-v1", secret=CONSOLE_V1, token_use="site-session",
-                                  email="v@example.test", ttl_seconds=600, name="V",
-                                  idp="Feishu", auth_via="TokenGeneration_HostedAuth")
+    tok = auth_session.mint_token(kid=v.CONSOLE_KID, sign=v.signer(v.CONSOLE_KEY), token_use="site-session",
+                                  email="v@example.test", ttl_seconds=600, idp="Feishu", auth_via="TokenGeneration_HostedAuth")
     assert not allowed(orq, tok)
 
 
-def test_console_session_new_form_is_rejected_at_the_edge():
-    tok = auth_session.mint_token(kid="console-hs-v1", secret=CONSOLE_V1, token_use="console-session",
-                                  email="v@example.test", ttl_seconds=600, name="V")
-    assert not allowed(orq, tok)
+def test_unknown_kid_is_rejected():
+    assert not allowed(orq, resign(site_token(), v.SITE_KEY, header={"alg": "RS256", "typ": "JWT", "kid": "site-rs-v7"}))
 
 
-def test_unknown_kid_does_not_fall_back_to_the_legacy_entry():
-    """签名用的是 legacy 密钥、payload 是旧合同、legacy 入口开着：只因 header 带了未知 kid 就必须拒。"""
-    tok = resign(legacy_token(), LEGACY, header={"alg": "HS256", "typ": "JWT", "kid": "site-hs-v7"})
-    assert not allowed(orq, tok)
+def test_missing_kid_is_rejected():
+    assert not allowed(orq, resign(site_token(), v.SITE_KEY, header={"alg": "RS256", "typ": "JWT"}))
 
 
 def test_wrong_token_use_is_rejected():
-    tok = auth_session.mint_token(kid="site-hs-v1", secret=SITE_V1, token_use="console-session",
+    tok = auth_session.mint_token(kid=v.SITE_KID, sign=v.signer(v.SITE_KEY), token_use="console-session",
                                   email="v@example.test", ttl_seconds=600, name="V")
     assert not allowed(orq, tok)
 
 
 def test_aud_as_list_is_rejected():
-    tok = site_token()
-    pl = unb64(tok.split(".")[1])
-    pl["aud"] = ["site-edge"]
-    assert not allowed(orq, resign(tok, SITE_V1, payload=pl))
+    claims = unb64(site_token().split(".")[1]); claims["aud"] = ["site-edge"]
+    assert not allowed(orq, resign(site_token(), v.SITE_KEY, payload=claims))
 
 
-def test_alg_none_with_known_kid_is_rejected():
-    tok = resign(site_token(), SITE_V1, header={"alg": "none", "typ": "JWT", "kid": "site-hs-v1"})
-    assert not allowed(orq, tok.rsplit(".", 1)[0] + ".")
+@pytest.mark.parametrize("alg", ["none", "None", "HS256", "RS512", "PS256"])
+def test_alg_other_than_the_allowlisted_one_is_rejected(alg):
+    assert not allowed(orq, resign(site_token(), v.SITE_KEY, header={"alg": alg, "typ": "JWT", "kid": v.SITE_KID}))
 
 
 def test_third_key_under_known_kid_is_rejected():
-    assert not allowed(orq, resign(site_token(), "third-key"))
+    assert not allowed(orq, site_token(sign=v.signer(v.CONSOLE_KEY)))     # header 说 site-rs-v1，签名是别的私钥
 
 
 def test_expired_kid_token_is_rejected():
-    assert not allowed(orq, site_token(ttl_seconds=1, now=int(time.time()) - 5))
+    assert not allowed(orq, site_token(ttl_seconds=-5))
 
 
 def test_idp_and_auth_via_are_still_required_on_the_new_entry():
-    """新入口验完签名后仍走 REQUIRE_IDP_CLAIM 那段：缺 idp/auth_via 的新形态 token 照样 302。"""
     assert not allowed(orq, site_token(idp="", auth_via=""))
     assert not allowed(orq, site_token(auth_via="TokenGeneration_Authentication"))
 
 
-# ---- 观测：outcome 进日志，token 不进 ----------------------------------------------------
+@pytest.mark.parametrize("name,mutate,expect_reject", v.RS_MUTATIONS)
+def test_rs_mutation_vectors_at_the_edge(name, mutate, expect_reject):
+    assert allowed(orq, mutate(site_token())) == (not expect_reject), name
+
+
+def test_crit_header_is_rejected_even_with_a_valid_signature():
+    assert not allowed(orq, resign(site_token(), v.SITE_KEY, header={"alg": "RS256", "typ": "JWT", "kid": v.SITE_KID, "crit": ["exp"]}))
+
 
 def test_outcome_is_logged_as_fixed_vocabulary_without_the_token(caplog):
-    tok = site_token()
     with caplog.at_level(logging.INFO):
+        tok = site_token()
         orq._verify_session_jwt(tok)
-        orq._verify_session_jwt(resign(tok, LEGACY, header={"alg": "HS256", "typ": "JWT", "kid": "nope"}))
-    events = []
-    for rec in caplog.records:
-        msg = rec.getMessage()
-        for seg in tok.split("."):
-            assert seg not in msg, "日志里出现了 token 片段"
-        if msg.startswith("{") and '"session_verify"' in msg:
-            events.append(json.loads(msg)["outcome"])
-    assert events == ["accepted_current", "unknown_kid"]
-    assert set(events) <= set(auth_session.OUTCOMES)
+        orq._verify_session_jwt(resign(tok, v.SITE_KEY, header={"alg": "RS256", "typ": "JWT", "kid": "nope"}))
+    outcomes = [json.loads(r.getMessage())["outcome"] for r in caplog.records
+                if r.getMessage().startswith("{") and '"session_verify"' in r.getMessage()]
+    assert outcomes == ["accepted_current", "unknown_kid"]
+    assert tok not in caplog.text and "accepted_legacy" not in caplog.text
 
 
-# ---- 源码守卫（spec §4.4：kid 不拼资源、allowlist 只按 kid 查表）------------------------------
+# ---- 夹具边界（ADR 0002 / D6）----
+
+def test_fixture_session_is_accepted_on_a_fixture_owned_route():
+    assert allowed(orq, fixture_token(), FIXTURE_ROUTE, host="app-e2e-probe.example.com")
+
+
+def test_fixture_session_is_accepted_on_the_console_platform_route():
+    assert allowed(orq, fixture_token(), CONSOLE_ROUTE, host="console.example.com")
+
+
+def test_fixture_session_is_redirected_on_a_real_org_route():
+    """`allowed_users = "org"` 的真实站点放行任何可信邮箱——夹具会话必须在这里被 302，否则夹具签发器就是全组织的钥匙。"""
+    resp = orq._check_auth(_req(fixture_token()), dict(ROUTE), "app-x.example.com")
+    assert resp and resp["status"] == "302"
+
+
+def test_fixture_session_on_a_real_route_that_lists_the_fixture_email_is_still_redirected():
+    route = {**ROUTE, "allowed_users": ["probe@e2e.invalid"]}      # 数据层本该拒绝写入；Edge 独立再拒一次
+    assert not allowed(orq, fixture_token(), route)
+
+
+def test_fixture_marks_must_both_be_present_or_both_absent():
+    assert not allowed(orq, site_token(idp="fixture"), FIXTURE_ROUTE, host="app-e2e-probe.example.com")
+    assert not allowed(orq, site_token(auth_via="fixture-issuer"), FIXTURE_ROUTE, host="app-e2e-probe.example.com")
+
+
+def test_a_real_idp_session_still_enters_a_fixture_site_when_listed():
+    route = {**FIXTURE_ROUTE, "allowed_users": ["v@example.test"]}
+    assert allowed(orq, site_token(), route, host="app-e2e-probe.example.com")
+
+
+def test_fixture_domain_is_matched_exactly_on_the_owner():
+    for owner in ("x@e2e.invalid.evil", "x@evil.e2e.invalid", "platform", "", "probe@E2E.INVALID"):
+        assert not allowed(orq, fixture_token(), {**FIXTURE_ROUTE, "owner": owner}, host="app-e2e-probe.example.com"), owner
+
+
+def test_fixture_literals_match_auth_session():
+    assert (orq.FIXTURE_DOMAIN, orq.FIXTURE_IDP, orq.FIXTURE_AUTH_VIA) == \
+        (auth_session.FIXTURE_DOMAIN, auth_session.FIXTURE_IDP, auth_session.FIXTURE_AUTH_VIA)
+
+
+# ---- 与 auth/session.py 的字节等价（CLAUDE.md 不变量）----
+
+def _segment(src: str, start: str, end: str) -> str:
+    s = src.index(start)
+    return src[s:src.index(end, s + 1)]
+
+
+def test_edge_verifier_core_is_byte_identical_to_session_py():
+    auth_src = (HERE.parents[2] / "site-builder" / "auth" / "session.py").read_text(encoding="utf-8")
+    for start, end in (("def _b64url_decode_strict", "def _strict_json"),
+                       ("def _strict_json", "def spki_sha256"),
+                       ("def load_public_key_der", "def _rsa_verify"),
+                       ("def _rsa_verify", "def local_signer")):
+        assert _segment(auth_src, start, end).strip() == _segment(SRC, start, end.replace("local_signer", "_aud_matches") if end == "def local_signer" else end).strip(), start
+    # verify_token 的判定段：auth 从 `try:` 到 `return claims`；Edge 的 _verify_site_session 同一段，只多 allowlist 取值行
+    auth_body = _segment(auth_src, "def verify_token", "# 黄金三元组")
+    edge_body = _segment(SRC, "def _verify_site_session", "def _get_cookies")
+    a = auth_body[auth_body.index("    try:"):auth_body.rindex("return claims")]
+    e = edge_body[edge_body.index("    try:"):edge_body.rindex("return claims")]
+    e = e.replace("    allowlist = _site_allowlist()\n", "").replace('"site-session"', "token_use").replace(
+        'TOKEN_USES["site-session"]', "TOKEN_USES[token_use]")
+    assert a == e, "Edge 的验签判定段与 auth/session.py 分叉了"
+
+
+def test_golden_triple_matches_auth_session():
+    assert orq.RS256_GOLDEN == auth_session.RS256_GOLDEN
+
+
+# ---- 源码守卫（spec §4.4：kid 不拼资源、allowlist 只按 kid 查表；§11.1：预热在顶层）----
 
 def test_source_indexes_allowlist_only_by_kid_and_parses_it_once():
-    assert SRC.count("json.loads(SITE_ALLOWLIST_JSON)") == 1
-    # ticket 21 起解析是惰性的，取值经 `allowlist = _site_allowlist()` 落到一个局部名上；
-    # 本守卫盯的东西没变：**kid 只用来查表**。
-    # **必须切到 `_verify_site_session` 这一段再匹配**：`allowlist` 这个名字在
-    # `_check_auth` 里还指 allowed_users 那个**列表**局部变量，全文匹配的话那边将来出现一个
-    # `allowlist[0]` 就会把这条 kid 守卫弄红（读起来像"kid 被拿去拼东西"，方向完全错）。
-    verify = SRC[SRC.index("def _verify_site_session"):SRC.index("def _verify_legacy_site_session")]
+    verify = SRC[SRC.index("def _verify_site_session"):SRC.index("def _get_cookies")]
     indexes = re.findall(r"\ballowlist\[([^\]]+)\]", verify)
-    assert indexes and set(indexes) == {"kid"}, indexes
-    assert "_site_allowlist()" in verify, "取值函数没了？那 allowlist 又回到模块级解析了"
-    assert "SITE_ALLOWLIST_JSON = '''{{SITE_ALLOWLIST_JSON}}'''" in SRC
-    assert 'LEGACY_ENTRY = "{{LEGACY_ENTRY}}"' in SRC
+    assert indexes and all(i == "kid" for i in indexes), indexes
+    assert "_site_allowlist()" in verify
+    assert SRC.count("json.loads(SITE_ALLOWLIST_JSON)") == 1
 
 
 def test_source_has_no_kid_derived_resource_paths():
-    """kid 不得进 f-string / 拼接去构造路径、参数名、ARN。"""
-    for m in re.finditer(r"f\"[^\"]*\{kid\}[^\"]*\"|f'[^']*\{kid\}[^']*'", SRC):
-        assert False, f"kid 被拼进字符串：{m.group(0)}"
+    assert not re.search(r"(ssm|kms|s3|arn:)[^\n]*\bkid\b", SRC)
 
 
-# ---- 3c-1B ticket 07：L3 之后 Edge 的行为（`{{JWT_SECRET}}` 注入空串 + `LEGACY_ENTRY=off`）----
-#
-# 上面 test_legacy_token_is_rejected_when_legacy_entry_is_off 已经覆盖"开关为 off 时 legacy 被拒"，
-# 但它用的 testable 副本注的仍是**非空**的 legacy 密钥。L3 的真实产物是**空串**，所以再造一份
-# 与线上完全同形的副本：空 JWT_SECRET + off。少了这一份的话，"空密钥被当成一把合法密钥"这类
-# 退化（`hmac.new(b"", …)` 照样能算出签名）在测试里看不见。
-def _reload_l3():
-    """把 `{{JWT_SECRET}}` 也换成空串（默认表里是非空值）。"""
-    src = es.edge_source(SITE_ALLOWLIST_JSON=json.dumps(ALLOWLIST), LEGACY_ENTRY="off", JWT_SECRET="")
-    assert 'JWT_SECRET = ""' in src, "空替换没落到那一行——L3 的产物形态变了"
-    return es.load_edge_module("_edge_kid_l3_empty_testable", write_to=HERE,
-                               SITE_ALLOWLIST_JSON=json.dumps(ALLOWLIST), LEGACY_ENTRY="off", JWT_SECRET="")
+def test_source_has_no_hmac_no_legacy_and_no_shared_secret_left():
+    for bad in ("hmac", "JWT_SECRET", "LEGACY_ENTRY", "_verify_legacy_site_session", "accepted_legacy", "HS256"):
+        assert bad not in SRC, bad
 
 
-orq_l3_empty = _reload_l3()
+def test_warmup_verify_happens_at_import_time_with_the_golden_triple():
+    top = SRC[:SRC.index("def _site_allowlist")]
+    assert "RS256_GOLDEN" in top and ".verify(" in top, "spec §11.1：预热验签必须在模块顶层"
+    handler_side = SRC[SRC.index("def lambda_handler"):]
+    assert "load_pem_public_key" not in SRC and "RS256_GOLDEN" not in handler_side
 
 
-def test_l3_artifact_shape_has_an_empty_secret_and_the_switch_off():
-    """产物形态自查：这两条是下面几条断言的前提（前提坏了那些断言就是在测别的东西）。"""
-    assert orq_l3_empty.JWT_SECRET == ""
-    assert orq_l3_empty.LEGACY_ENTRY == "off"
-
-
-def test_kid_form_sessions_still_verify_with_an_empty_legacy_secret():
-    """L3 的正向：新入口完全不依赖那个常量，注空串不影响任何 kid token。"""
-    assert allowed(orq_l3_empty, site_token())
-    assert allowed(orq_l3_empty, site_token(kid="site-hs-v0", secret=SITE_V0))
-
-
-def test_legacy_tokens_are_rejected_after_l3_regardless_of_which_secret_signed_them():
-    """负向：预存的 legacy token（用**真**密钥签的）在 L3 之后必拒。
-
-    契约顺序让这条与过期无关（spec §5：kid 先于 exp）——无 kid ⇒ legacy 入口 ⇒ 入口已关 ⇒ 拒。
-    """
-    assert not allowed(orq_l3_empty, legacy_token())
-    assert not allowed(orq_l3_empty, legacy_token(secret=""))
-
-
-def _load_empty_secret_with_legacy_on():
-    """反事实副本：空 JWT_SECRET 但 `LEGACY_ENTRY=on`（**线上永不会是这个组合**）。
-
-    只用来证明下面那条依赖关系：安全性来自开关，不来自"密钥恰好是空的"。
-    """
-    return es.load_edge_module("_edge_empty_secret_legacy_on_testable", write_to=HERE,
-                               SITE_ALLOWLIST_JSON=json.dumps(ALLOWLIST), LEGACY_ENTRY="on", JWT_SECRET="")
-
-
-def test_the_safety_of_an_empty_secret_comes_from_the_switch_not_from_emptiness():
-    """**空密钥不是一道防线**：`hmac.new(b"", …)` 照样算得出签名。
-
-    左边（开关 on + 空密钥，线上不会出现的反事实组合）：任何人都能用空串签出**被接受**的
-    legacy 会话——这正是"注空串"本身毫无保护作用的证明。
-    右边（开关 off，L3 的真实形态）：同一枚 token 必拒。
-    所以 L3 的安全性完全落在 `LEGACY_ENTRY=off` 那道分支上；把这条依赖写成用例，是为了让
-    将来任何"反正密钥是空的，开关无所谓"的简化当场变红。
-    """
-    forged = legacy_token(secret="")
-    assert allowed(_load_empty_secret_with_legacy_on(), forged), \
-        "空密钥签的 legacy token 在开关 on 下竟然被拒——那这条依赖关系的前提变了"
-    assert not allowed(orq_l3_empty, forged)
-
-
-def test_rejection_reason_after_l3_is_unknown_kid_by_contract_order():
-    """拒绝理由必须是 `unknown_kid`：spec §5 的契约顺序是 kid 先于 exp，所以预存的
-    legacy/v1 token 在退役后一律 `unknown_kid`，**与它是否过期无关**（spec Further Notes）。"""
-    _, outcome = auth_session.verify_with_legacy(
-        legacy_token(secret=""), allowlist=ALLOWLIST, token_use="site-session", legacy_secret=None)
-    assert outcome == "unknown_kid", outcome
-
-
-def test_legacy_outcome_after_l3_is_unknown_kid_not_bad_signature(caplog):
-    """观测词表：L3 之后零星的过期 legacy cookie 应记成 `unknown_kid`（DEPLOY.md 说"属预期"），
-    而 `bad_signature` 才是"有人在伪造"的信号。两者混在一起就读不出区别了。"""
-    with caplog.at_level(logging.INFO):
-        orq_l3_empty._verify_session_jwt(legacy_token())
-    outcomes = [json.loads(r.getMessage())["outcome"] for r in caplog.records
-                if r.getMessage().startswith("{") and '"session_verify"' in r.getMessage()]
-    assert outcomes == ["unknown_kid"], outcomes
+def test_public_key_parsing_stays_lazy_so_public_routes_survive_a_bad_injection():
+    """D9：解析仍在首次使用（ticket 21）——注入坏掉时只有带 cookie 的私有请求 500。"""
+    top = SRC[:SRC.index("def _site_allowlist")]
+    assert "json.loads(SITE_ALLOWLIST_JSON)" not in top and "_load_public_key_der(base64" not in top

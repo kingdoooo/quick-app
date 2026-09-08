@@ -1,30 +1,35 @@
-"""M5 埋点单测。机制同 test_edge_auth.py：把 origin_request.py 读进来做
-占位符替换后写成一个 testable 副本再 import（所以改 origin_request.py 会自动
-流进本文件，不存在"两份代码漂移"）。
+"""M5 埋点单测。机制同 test_edge_auth.py：把 origin_request.py 做占位符替换后写成一个
+testable 副本再 import（所以改 origin_request.py 会自动流进本文件，不存在"两份代码漂移"）。
+替换表的唯一定义在 `edge_substitutions.py`（ticket 22）。
 """
-import importlib
 import json
+import sys
 from pathlib import Path
 
 import pytest
 
-_SRC = (Path(__file__).parents[0] / "origin_request.py").read_text()
-_SUBS = {
-    "{{DYNAMODB_TABLE_NAME}}": "test-table",
-    "{{DYNAMODB_REGION}}": "us-east-1",
-    "{{FRONTEND_BUCKET_DOMAIN}}": "site-frontend-123.s3.us-east-1.amazonaws.com",
-    "{{JWT_SECRET}}": "test-secret",
-    "{{BASE_DOMAIN}}": "example.test",
-    "{{REQUIRE_IDP_CLAIM}}": "false",
-    "{{TRUSTED_IDPS}}": "Feishu",
-    "{{ACCESS_TABLE}}": "site-access-events",
-    "{{ACCESS_REPLICA_REGIONS}}": "us-east-1,ap-southeast-1,ap-northeast-1",
-    "{{SITE_ALLOWLIST_JSON}}": '{"site-hs-v1": {"alg": "HS256", "secret": "site-secret-v1", "role": "current"}}', "{{LEGACY_ENTRY}}": "on",
-}
-for _k, _v in _SUBS.items():
-    _SRC = _SRC.replace(_k, _v)
-(Path(__file__).parent / "_edge_access_testable.py").write_text(_SRC)
-import _edge_access_testable as orq          # noqa: E402
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parents[2] / "site-builder" / "panel" / "tests"))
+import edge_substitutions as es  # noqa: E402
+import upgrade_code_vectors as v  # noqa: E402  三套件共用的 RS 测试密钥
+
+# 本文件关心的三项：埋点表名、副本区域清单、以及"默认不要求 idp"（多数用例只测埋点）。
+_SUBS = {"BASE_DOMAIN": "example.test", "REQUIRE_IDP_CLAIM": "false", "TRUSTED_IDPS": "Feishu",
+         "DYNAMODB_TABLE_NAME": "test-table",
+         "FRONTEND_BUCKET_DOMAIN": "site-frontend-123.s3.us-east-1.amazonaws.com",
+         "ACCESS_REPLICA_REGIONS": "us-east-1,ap-southeast-1,ap-northeast-1"}
+orq = es.load_edge_module("_edge_access_testable", write_to=HERE, **_SUBS)
+
+
+def _site_session(**claims) -> str:
+    """一枚真形态的 RS256 站点会话（默认 allowlist 里那把 site key 签的）。"""
+    sys.path.insert(0, str(HERE.parents[2] / "site-builder" / "auth"))
+    import session as auth_session
+    args = dict(kid=v.SITE_KID, sign=v.signer(v.SITE_KEY), token_use="site-session",
+                email="a@b.co", ttl_seconds=600, name="A")
+    args.update(claims)
+    return auth_session.mint_token(**args)
 
 
 class Ctx:
@@ -325,17 +330,9 @@ def test_unauthenticated_denial_writes_an_empty_email(monkeypatch):
 
 def test_sink_carries_email_even_when_access_is_forbidden():
     """被拒记录的价值在于"谁被拒了"，所以 403 分支也要有邮箱。"""
-    import base64, hashlib, hmac, time
-    # typ 是必需的（S1/M05）：Edge 的 verifier 先查它，缺了就在 403 分支之前
+    # token 必须是**能验签通过**的真形态：kid/token_use/aud 任一不对就在 403 分支之前
     # 变成 302，本用例要测的"被拒者的邮箱"根本走不到。
-    payload = base64.urlsafe_b64encode(json.dumps(
-        {"typ": "session", "email": "out@b.co",
-         "exp": int(time.time()) + 600}).encode()).rstrip(b"=").decode()
-    head = base64.urlsafe_b64encode(b'{"alg":"HS256"}').rstrip(b"=").decode()
-    sig = base64.urlsafe_b64encode(hmac.new(
-        b"test-secret", f"{head}.{payload}".encode(), hashlib.sha256).digest()
-    ).rstrip(b"=").decode()
-    token = f"{head}.{payload}.{sig}"
+    token = _site_session(email="out@b.co")
     req = {"uri": "/", "method": "GET", "querystring": "",
            "headers": {"host": [{"key": "Host", "value": "app-x.example.test"}],
                        "cookie": [{"key": "Cookie", "value": f"sb_session={token}"}]}}
@@ -353,31 +350,17 @@ def test_untrusted_idp_session_yields_302_without_an_email():
     这条与上一条是一对：403 必须有邮箱（"谁被拒了"），302 必须没有
     （契约说 redirect_login 的 email 是空串）。只写其中一条都会漏掉 P2-1。
     需要 REQUIRE_IDP_CLAIM=true 的副本，机制照 test_edge_auth.py 的
-    `_edge_noidp_testable` 形态：把占位符替换成 true 后重新加载模块。
+    `_edge_noidp_testable` 形态：把那一项替换成 true 后另加载一个模块。
     """
-    import importlib
-    src = (Path(__file__).parents[0] / "origin_request.py").read_text()
-    subs = dict(_SUBS, **{"{{REQUIRE_IDP_CLAIM}}": "true"})
-    for k, v in subs.items():
-        src = src.replace(k, v)
-    (Path(__file__).parent / "_edge_access_idp_testable.py").write_text(src)
-    mod = importlib.import_module("_edge_access_idp_testable")
-    import base64, hashlib, hmac, time
-    head = base64.urlsafe_b64encode(b'{"alg":"HS256"}').rstrip(b"=").decode()
-    # typ 必须带上（S1/M05）：缺 typ 的 token 死在 verifier 里，同样得到 302 +
-    # 空 sink，本用例会**为了错误的原因通过**——它要钉的是"验签成功但来源不可信"
-    # 那条分支，不是"验签失败"。
-    payload = base64.urlsafe_b64encode(json.dumps(
-        {"typ": "session", "email": "linked@b.co", "exp": int(time.time()) + 600,
-         "idp": "Cognito",
-         "auth_via": "TokenGeneration_Authentication"}).encode()).rstrip(b"=").decode()
-    sig = base64.urlsafe_b64encode(hmac.new(
-        b"test-secret", f"{head}.{payload}".encode(), hashlib.sha256).digest()
-    ).rstrip(b"=").decode()
+    mod = es.load_edge_module("_edge_access_idp_testable", write_to=HERE,
+                              **dict(_SUBS, REQUIRE_IDP_CLAIM="true"))
+    # token 必须**验签通过**：验签失败同样得到 302 + 空 sink，本用例会为了错误的原因
+    # 通过——它要钉的是"验签成功但来源不可信"那条分支。
+    token = _site_session(email="linked@b.co", idp="Cognito",
+                          auth_via="TokenGeneration_Authentication")
     req = {"uri": "/", "method": "GET", "querystring": "",
            "headers": {"host": [{"key": "Host", "value": "app-x.example.test"}],
-                       "cookie": [{"key": "Cookie",
-                                   "value": f"sb_session={head}.{payload}.{sig}"}]}}
+                       "cookie": [{"key": "Cookie", "value": f"sb_session={token}"}]}}
     sink = {}
     denied = mod._check_auth(req, {"require_auth": True, "allowed_users": "org"},
                              "app-x.example.test", sink)

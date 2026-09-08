@@ -20,7 +20,7 @@ Lambda@Edge 不支持环境变量，所以 `origin_request.py` 的配置由 CDK 
 用法（三种粒度，都会做残留断言）：
 
     import edge_substitutions as es
-    src  = es.edge_source(JWT_SECRET="s", LEGACY_ENTRY="off")       # → 替换后的源码文本
+    src  = es.edge_source(TRUSTED_IDPS="Feishu")                    # → 替换后的源码文本
     mod  = es.load_edge_module("_edge_for_x", SITE_ALLOWLIST_JSON=json.dumps(allow))   # → 已 exec 的模块
     text = es.substitute(any_src, BASE_DOMAIN="example.com")        # → 任意源码文本
 """
@@ -35,6 +35,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 EDGE_SRC_PATH = HERE / "origin_request.py"
+sys.path.insert(0, str(HERE.parents[2] / "site-builder" / "panel" / "tests"))
+import upgrade_code_vectors as _v  # noqa: E402  三套件共用的 RS 测试密钥（import 期生成）
 
 # **正则必须含数字**：`{{SITE_ALLOWLIST_JSON}}` 没有数字，但下一个注入点未必
 # （`{{ACCESS_TABLE_V2}}` 这种），而 `[A-Z_]+` 会让它悄悄躲过残留检查。
@@ -42,15 +44,15 @@ PLACEHOLDER_RE = re.compile(r"\{\{[A-Z0-9_]+\}\}")
 
 # 默认值：能让 Edge 代码跑起来的中性取值。**安全开关取的是收紧值**
 # （`REQUIRE_IDP_CLAIM=true`、非空 `TRUSTED_IDPS`）——测试的默认态不该比生产松。
-DEFAULT_SITE_ALLOWLIST = {"site-hs-v1": {"alg": "HS256", "secret": "test-secret", "role": "current"}}
+# allowlist 的默认值用 `upgrade_code_vectors` 那把 site 私钥的**公钥**（三套件共用同一把，
+# 于是"auth 签、Edge 验"的跨组件向量不必各自维护一份密钥）。
+DEFAULT_SITE_ALLOWLIST = {_v.SITE_KID: {"alg": "RS256", "spki_b64": _v.spki_b64(_v.SITE_KEY), "role": "current"}}
 DEFAULTS: dict[str, str] = {
     "DYNAMODB_TABLE_NAME": "t",
     "DYNAMODB_REGION": "us-east-1",
     "FRONTEND_BUCKET_DOMAIN": "b.s3.us-east-1.amazonaws.com",
     "BASE_DOMAIN": "example.com",
-    "JWT_SECRET": "test-secret",
     "SITE_ALLOWLIST_JSON": json.dumps(DEFAULT_SITE_ALLOWLIST),
-    "LEGACY_ENTRY": "on",
     "REQUIRE_IDP_CLAIM": "true",
     "TRUSTED_IDPS": "Feishu,Okta",
     "ACCESS_TABLE": "site-access-events",

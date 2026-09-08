@@ -1,26 +1,17 @@
 """Edge 路由单测——DynamoDB 与签名 mock 掉，测分流与改写逻辑。"""
-import importlib
 import sys
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-sys.path.insert(0, str(Path(__file__).parent))
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import edge_substitutions as es          # 替换表的唯一定义（ticket 22）
 
 # 占位符在测试中先替换再 import
-_SRC = (Path(__file__).parent / "origin_request.py").read_text()
-_SRC = (_SRC.replace("{{DYNAMODB_TABLE_NAME}}", "test-table")
-            .replace("{{DYNAMODB_REGION}}", "us-east-1")
-            .replace("{{FRONTEND_BUCKET_DOMAIN}}", "site-frontend-123.s3.us-east-1.amazonaws.com")
-            .replace("{{JWT_SECRET}}", "test-secret")
-            .replace("{{ACCESS_TABLE}}", "site-access-events")
-            .replace("{{ACCESS_REPLICA_REGIONS}}",
-                     "us-east-1,ap-southeast-1,ap-northeast-1")
-            .replace("{{SITE_ALLOWLIST_JSON}}",
-                     '{"site-hs-v1": {"alg": "HS256", "secret": "site-secret-v1", "role": "current"}}')
-            .replace("{{LEGACY_ENTRY}}", "on"))
-_mod_path = Path(__file__).parent / "_origin_request_testable.py"
-_mod_path.write_text(_SRC)
-import _origin_request_testable as orq
+orq = es.load_edge_module("_origin_request_testable", write_to=HERE,
+                          DYNAMODB_TABLE_NAME="test-table",
+                          FRONTEND_BUCKET_DOMAIN="site-frontend-123.s3.us-east-1.amazonaws.com",
+                          ACCESS_REPLICA_REGIONS="us-east-1,ap-southeast-1,ap-northeast-1")
 
 
 ROUTE = {"subdomain": "app-demo1", "site_id": "demo1", "route_mode": "split",

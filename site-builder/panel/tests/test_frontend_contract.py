@@ -745,7 +745,7 @@ def _edge_module():
     # 而注入点大多在文件更靠后的位置 —— 等于几乎什么都没查。
     sys.path.insert(0, str(REPO / "router" / "infrastructure" / "lambda"))
     import edge_substitutions as es
-    return es.load_edge_module("_edge_for_frontend_contract", JWT_SECRET="s", TRUSTED_IDPS="Feishu")
+    return es.load_edge_module("_edge_for_frontend_contract", TRUSTED_IDPS="Feishu")
 
 
 @pytest.mark.parametrize("uri,rel", [("/", "index.html"),
