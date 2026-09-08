@@ -56,7 +56,7 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 | | 其中**能取得会话签名密钥**的 | 56 <!-- baseline:可读密钥=56 --> |
 | | 其中**非平台**身份可直接 `lambda:InvokeFunction` 平台或站点函数的 | 18 <!-- baseline:非平台可直调=18 --> |
 | | Edge 函数里仍带着 **legacy** 密钥的**代码目标**（历史已发布版本；L3 起 `$LATEST` 与新版本不再带） | 10 <!-- baseline:带活密钥的Edge代码目标=10 --> |
-| | CDK bootstrap 桶里仍带着**任一**活密钥（legacy ∪ 各 kid，取并集）的 asset 对象 | 14 <!-- baseline:带活密钥的asset=14 --> |
+| | CDK bootstrap 桶里仍带着**任一**活密钥（legacy ∪ 各 kid，取并集）的 asset 对象 | 15 <!-- baseline:带活密钥的asset=15 --> |
 | **B IAM 写观察** | 持有相关 IAM 策略变更语句的 principal | 22 <!-- baseline:B持有IAM写语句=22 --> |
 | | 其中**不在 A 里**（只有 IAM 写、**未证明可提权**） | 4 <!-- baseline:仅IAM写=4 --> |
 

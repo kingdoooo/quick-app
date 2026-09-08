@@ -15,15 +15,15 @@
     "edge_code_targets_carrying_live_key": 10,
     "session_keys": {
       "site-hs-v2": {
-        "edge_code_targets_carrying_key": 5,
-        "edge_assets_carrying_key": 4
+        "edge_code_targets_carrying_key": 6,
+        "edge_assets_carrying_key": 5
       },
       "console-hs-v2": {
         "edge_code_targets_carrying_key": 0,
         "edge_assets_carrying_key": 0
       }
     },
-    "edge_assets_carrying_live_key": 14,
+    "edge_assets_carrying_live_key": 15,
     "principals_with_missing_context": 164
   },
   "coverage": {
@@ -2182,16 +2182,16 @@
         "alias": {},
         "version": [],
         "unqualified": [
-          "741e-a473-267f-829a",
-          "faff-cda4-0d27-6ce9"
+          "3131-c9ea-75ac-533b",
+          "741e-a473-267f-829a"
         ]
       },
       "site-key-proxy": {
         "alias": {},
         "version": [],
         "unqualified": [
-          "741e-a473-267f-829a",
-          "faff-cda4-0d27-6ce9"
+          "3131-c9ea-75ac-533b",
+          "741e-a473-267f-829a"
         ]
       },
       "site-auth-service": {
