@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 import permissions as perm
@@ -1260,3 +1262,59 @@ def test_a_broken_audit_table_cannot_mask_the_refusal(aws, monkeypatch):
     # 异常类型必须还是 PolicyDataInvalid（不是 RuntimeError），文案也还在
     with pytest.raises(perm.PolicyDataInvalid, match="require_login"):
         perm.effective_policy_audited(site, actor="o@example.test")
+
+
+# ---- ADR 0002：夹具域邮箱只能出现在夹具站点上；永不做管理员 ----
+
+FIX = "probe@e2e.invalid"
+
+
+def test_fixture_domain_constant_and_predicates():
+    assert perm.FIXTURE_DOMAIN == "e2e.invalid"
+    assert perm.is_fixture_email(FIX) and not perm.is_fixture_email("a@example.com")
+    assert not perm.is_fixture_email("a@e2e.invalid.evil") and not perm.is_fixture_email("a@E2E.INVALID")
+    assert perm.site_is_fixture({"owner": FIX}) and not perm.site_is_fixture({"owner": "o@x.com"}) and not perm.site_is_fixture({})
+
+
+def _seed_site(owner="o@x.com", site_id="s-fx"):
+    import boto3, os
+    boto3.client("dynamodb", region_name="us-east-1").put_item(
+        TableName=os.environ["SITES_TABLE"],
+        Item={"site_id": {"S": site_id}, "owner": {"S": owner}, "status": {"S": "ACTIVE"}, "tier": {"S": "static"},
+              "require_login": {"BOOL": True}, "allowed_users": {"S": "org"}, "collaborators": {"L": []},
+              "permissions_rev": {"N": "1"}})
+    return site_id
+
+
+@pytest.mark.parametrize("kw", [
+    {"collaborators": [FIX]},
+    {"allowed_users": ["a@x.com", FIX]},
+    {"new_owner": FIX},
+])
+def test_fixture_email_may_not_enter_a_non_fixture_site(aws, kw):
+    site_id = _seed_site()
+    with pytest.raises(perm.PolicyDataInvalid, match="e2e.invalid"):
+        perm.write_permissions(site_id, actor="o@x.com", action="manage_collaborators" if "collaborators" in kw
+                               else ("transfer_owner" if "new_owner" in kw else "set_access_policy"), **kw)
+    item = perm._site_or_raise(site_id, consistent=True)
+    assert item.get("permissions_rev") == 1 and FIX not in json.dumps(item, default=str), "拒绝必须零副作用"
+
+
+def test_fixture_site_may_hold_fixture_emails(aws):
+    site_id = _seed_site(owner=FIX)
+    out = perm.write_permissions(site_id, actor=FIX, action="set_access_policy",
+                                 allowed_users=[FIX, "visitor@e2e.invalid"])
+    assert sorted(out["allowed_users"]) == ["probe@e2e.invalid", "visitor@e2e.invalid"]
+
+
+def test_fixture_site_may_not_be_transferred_to_a_real_owner_either(aws):
+    """反向也拒：把夹具站点转给真实邮箱，会让一个由验收工具建的站点变成"真实站点"而 allowed_users 里还留着夹具账号。"""
+    site_id = _seed_site(owner=FIX)
+    with pytest.raises(perm.PolicyDataInvalid, match="e2e.invalid"):
+        perm.write_permissions(site_id, actor=FIX, action="transfer_owner", new_owner="real@x.com")
+
+
+def test_add_admin_refuses_fixture_domain(aws):
+    with pytest.raises(ValueError, match="e2e.invalid"):
+        perm.add_admin(FIX, added_by="t")
+    assert not perm.is_admin(FIX)

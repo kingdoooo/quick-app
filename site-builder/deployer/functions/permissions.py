@@ -212,6 +212,21 @@ def assert_can(email: str, site: dict | None, action: str, *,
 # 与 contract.schema.EMAIL_RE 同 pattern：权限入口与合同校验对邮箱的判定必须一致
 EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 
+# ---- 夹具身份（spec §11.7 / ADR 0002）--------------------------------------------------------
+# 与 auth/session.py 的 FIXTURE_DOMAIN 是同一个字面量（auth 单测钉住等值）。夹具会话能进 console（Edge 放行
+# 平台路由），所以 panel 侧必须由**数据层**保证：夹具域邮箱只能出现在夹具站点（owner 是夹具域）的权限字段里，
+# 且永不是管理员。这两条让夹具会话的危害上限是"夹具站点"，而不是"全组织"。
+FIXTURE_DOMAIN = "e2e.invalid"
+
+
+def is_fixture_email(email) -> bool:
+    return isinstance(email, str) and email.count("@") == 1 and email.split("@")[1] == FIXTURE_DOMAIN
+
+
+def site_is_fixture(site: dict | None) -> bool:
+    """夹具站点的标记就是 owner 的域（ensure_fixture_site.py 与闸门"站点形状"层用同一条规则）。"""
+    return is_fixture_email((site or {}).get("owner"))
+
 _ddb = None
 
 
@@ -262,6 +277,8 @@ def add_admin(email: str, added_by: str) -> None:
     import botocore.exceptions
     if not EMAIL_RE.fullmatch(email or ""):
         raise ValueError(f"非法邮箱: {email!r}")
+    if is_fixture_email(email):
+        raise ValueError(f"夹具域 @{FIXTURE_DOMAIN} 的邮箱不能做管理员（ADR 0002）: {email!r}")
     # 经 _ddb_client() 取 client（而不是就地 boto3.client）：测试要能注入
     # TransactionConflict 才能覆盖下面的退避重试分支——绕开这个 hook 会让
     # 冲突分支永远测不到（错误实现照样全绿）。
@@ -687,6 +704,16 @@ def write_permissions(site_id: str, *, actor: str, action: str,
     # 坏数据一律拒绝投影，不猜方向（M02）。位置是硬要求：**读到 site 行之后、
     # 构造事务之前** ⇒ 抛错时事务根本不发起，零副作用。
     effective = effective_policy_audited(site, actor=actor)
+
+    # ADR 0002：夹具域不得越界。**位置**与 M02 那条相同——读到 site 行之后、构造事务之前 ⇒ 抛错时零副作用。
+    fixture_site = site_is_fixture(site)
+    incoming = list(collaborators or []) + (list(allowed_users) if isinstance(allowed_users, list) else []) \
+        + ([new_owner] if new_owner is not None else [])
+    if not fixture_site and any(is_fixture_email(e) for e in incoming):
+        raise PolicyDataInvalid(f"站点 {site_id} 不是夹具站点，不许把 @{FIXTURE_DOMAIN} 的邮箱写进权限字段（ADR 0002）")
+    if fixture_site and new_owner is not None and not is_fixture_email(new_owner):
+        raise PolicyDataInvalid(f"夹具站点 {site_id} 不许转给非 @{FIXTURE_DOMAIN} 的 owner（ADR 0002）")
+
     sets = ["permissions_updated_at = :t", "permissions_updated_by = :by",
             "permissions_rev = :nrev"]
     vals = {":t": {"S": now_iso()}, ":by": {"S": actor},
