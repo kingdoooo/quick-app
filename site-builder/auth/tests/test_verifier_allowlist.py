@@ -1,317 +1,310 @@
-"""verifier allowlist 核心（spec §5 验签合同 / §9 反例 / §11.4 claim 表；plan 3c-1A Task 2）。
-
-先于实现写下并跑红。每条反例配一条正向控制，否则负向全绿证明不了任何东西。
-两条 meta 用例（文件末）证明关键反例真的钉在它们声称盯住的那一行上。
-"""
+"""RS256 验签核心（spec §5 / §9 / §11.4；3c-final）。每条负例配一条正对照。"""
 import base64
-import hashlib
-import hmac
 import json
 import time
 
 import pytest
 
 import session
+import upgrade_code_vectors as v
 
-S1, S0, C1, LEGACY = "site-secret-v1", "site-secret-v0", "console-secret-v1", "legacy-secret"
-SITE_AL = {"site-hs-v1": {"alg": "HS256", "secret": S1, "role": "current"},
-           "site-hs-v0": {"alg": "HS256", "secret": S0, "role": "previous"}}
-CONSOLE_AL = {"console-hs-v1": {"alg": "HS256", "secret": C1, "role": "current"}}
-SPEC_OUTCOMES = {"accepted_current", "accepted_previous", "accepted_legacy", "unknown_kid",
-                 "alg_mismatch", "wrong_audience", "wrong_token_use", "bad_signature", "expired"}
+NOW = 1_800_000_000
 
 
-def b64(obj) -> str:
-    raw = obj if isinstance(obj, (bytes, bytearray)) else json.dumps(obj, separators=(",", ":")).encode()
-    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+def _mint(token_use="site-session", *, kid=v.SITE_KID, key=v.SITE_KEY, email="a@x.com", **kw):
+    return session.mint_token(kid=kid, sign=v.signer(key), token_use=token_use, email=email,
+                              ttl_seconds=600, name="A", idp="Feishu", auth_via="TokenGeneration_HostedAuth",
+                              now=NOW, **kw)
 
 
-def unb64(s: str) -> dict:
+def _verify(token, token_use="site-session", allowlist=None):
+    return session.verify_token(token, allowlist=allowlist or v.SITE_ALLOWLIST, token_use=token_use, now=NOW + 1)
+
+
+def _b64(obj) -> str:
+    return base64.urlsafe_b64encode(json.dumps(obj, separators=(",", ":")).encode()).rstrip(b"=").decode()
+
+
+def _unb64(s: str) -> dict:
     return json.loads(base64.urlsafe_b64decode(s + "=" * (-len(s) % 4)))
 
 
-def resign(token: str, secret: str, *, header=None, payload=None, raw_header: str | None = None) -> str:
-    """改 header / payload 后用给定密钥重签。raw_header 用于塞非规范 JSON（重复键）。"""
-    h, p, _ = token.split(".")
-    hd = unb64(h) if header is None else header
-    pl = unb64(p) if payload is None else payload
-    h2 = raw_header if raw_header is not None else b64(hd)
-    p2 = b64(pl)
-    sig = b64(hmac.new(secret.encode(), f"{h2}.{p2}".encode(), hashlib.sha256).digest())
-    return f"{h2}.{p2}.{sig}"
-
-
-def site_token(**kw) -> str:
-    args = dict(kid="site-hs-v1", secret=S1, token_use="site-session", email="v@example.test",
-                ttl_seconds=600, name="V", idp="Feishu", auth_via="TokenGeneration_HostedAuth")
-    args.update(kw)
-    return session.mint_token(**args)
-
-
-def console_token(**kw) -> str:
-    args = dict(kid="console-hs-v1", secret=C1, token_use="console-session",
-                email="v@example.test", ttl_seconds=600, name="V")
-    args.update(kw)
-    return session.mint_token(**args)
-
-
-def upgrade_code(**kw) -> str:
-    args = dict(kid="console-hs-v1", secret=C1, token_use="console-upgrade",
-                email="v@example.test", ttl_seconds=60)
-    args.update(kw)
-    return session.mint_token(**args)
-
-
-# ---- 正向控制 ------------------------------------------------------------
-
 def test_current_site_token_is_accepted_with_full_claims():
-    claims, outcome = session.verify_token(site_token(), allowlist=SITE_AL, token_use="site-session")
+    claims, outcome = _verify(_mint())
     assert outcome == "accepted_current"
-    assert claims["email"] == "v@example.test" and claims["idp"] == "Feishu"
-    assert claims["token_use"] == "site-session" and claims["aud"] == "site-edge"
+    assert set(claims) == {"token_use", "aud", "email", "name", "idp", "auth_via", "exp", "iat"}
+    assert (claims["token_use"], claims["aud"]) == ("site-session", "site-edge")
 
 
 def test_previous_key_is_accepted_and_labelled_previous():
-    tok = site_token(kid="site-hs-v0", secret=S0)
-    assert session.verify_token(tok, allowlist=SITE_AL, token_use="site-session")[1] == "accepted_previous"
+    al = {**v.SITE_ALLOWLIST, v.SITE_PREV_KID: v.public_entry(v.SITE_PREV_KEY, "previous")}
+    _, outcome = _verify(_mint(kid=v.SITE_PREV_KID, key=v.SITE_PREV_KEY), allowlist=al)
+    assert outcome == "accepted_previous"
 
 
 def test_console_family_positive_controls():
-    assert session.verify_token(console_token(), allowlist=CONSOLE_AL,
-                                token_use="console-session")[1] == "accepted_current"
-    claims, outcome = session.verify_token(upgrade_code(), allowlist=CONSOLE_AL,
-                                           token_use="console-upgrade")
-    assert outcome == "accepted_current" and claims["jti"]
+    code = _mint("console-upgrade", kid=v.CONSOLE_KID, key=v.CONSOLE_KEY)
+    claims, outcome = _verify(code, "console-upgrade", v.CONSOLE_ALLOWLIST)
+    assert outcome == "accepted_current" and set(claims) == {"token_use", "aud", "email", "jti", "exp", "iat"}
+    cs = _mint("console-session", kid=v.CONSOLE_KID, key=v.CONSOLE_KEY)
+    assert _verify(cs, "console-session", v.CONSOLE_ALLOWLIST)[1] == "accepted_current"
 
 
-def test_legacy_tokens_are_accepted_through_the_legacy_entry():
-    site = session.mint_session_jwt("v@example.test", "V", LEGACY, idp="Feishu")
-    cons = session.mint_session_jwt("v@example.test", "V", LEGACY, scope="console")
-    code = session.mint_upgrade_code("v@example.test", LEGACY)
-    kw = dict(legacy_secret=LEGACY)
-    assert session.verify_with_legacy(site, allowlist=SITE_AL, token_use="site-session", **kw)[1] == "accepted_legacy"
-    assert session.verify_with_legacy(cons, allowlist=CONSOLE_AL, token_use="console-session", **kw)[1] == "accepted_legacy"
-    assert session.verify_with_legacy(code, allowlist=CONSOLE_AL, token_use="console-upgrade", **kw)[1] == "accepted_legacy"
+def test_header_is_exactly_alg_typ_kid_and_alg_is_rs256():
+    hdr = _unb64(_mint().split(".")[0])
+    assert hdr == {"alg": "RS256", "typ": "JWT", "kid": v.SITE_KID}
 
 
-def test_new_entry_token_also_passes_verify_with_legacy():
-    """verify_with_legacy 是 handler 真正调用的入口：新形态必须从它进新入口。"""
-    assert session.verify_with_legacy(site_token(), allowlist=SITE_AL, token_use="site-session",
-                                      legacy_secret=LEGACY)[1] == "accepted_current"
+def test_signature_is_exactly_the_modulus_length():
+    sig = _mint().split(".")[2]
+    assert len(base64.urlsafe_b64decode(sig + "=" * (-len(sig) % 4))) == 256
 
 
-# ---- §9 kid 解析 ------------------------------------------------------------
+# ---- kid 解析（spec §9）----
 
-def test_unknown_kid_is_rejected_and_does_not_fall_back_to_legacy():
-    """**状态机第 5 条**：有 kid 但不在 allowlist ⇒ 拒，哪怕签名用的是 legacy 密钥且 legacy 开着。"""
-    tok = resign(site_token(), LEGACY, header={"alg": "HS256", "typ": "JWT", "kid": "site-hs-v7"})
-    assert session.verify_token(tok, allowlist=SITE_AL, token_use="site-session")[1] == "unknown_kid"
-    assert session.verify_with_legacy(tok, allowlist=SITE_AL, token_use="site-session",
-                                      legacy_secret=LEGACY)[1] == "unknown_kid"
+def test_unknown_kid_is_rejected():
+    tok = _mint(kid="site-rs-v9")
+    assert _verify(tok) == (None, "unknown_kid")
 
 
-def test_missing_kid_with_legacy_entry_closed_is_unknown_kid():
-    legacy_tok = session.mint_session_jwt("v@example.test", "V", LEGACY)
-    assert session.verify_with_legacy(legacy_tok, allowlist=SITE_AL, token_use="site-session",
-                                      legacy_secret=None)[1] == "unknown_kid"
-    assert session.verify_token(legacy_tok, allowlist=SITE_AL, token_use="site-session")[1] == "unknown_kid"
+def test_missing_kid_is_unknown_kid():
+    h, p, s = _mint().split(".")
+    hdr = _unb64(h); hdr.pop("kid")
+    assert _verify(f"{_b64(hdr)}.{p}.{s}") == (None, "unknown_kid")
 
 
 def test_duplicate_kid_keys_in_header_are_rejected():
-    raw = b64(b'{"alg":"HS256","typ":"JWT","kid":"site-hs-v0","kid":"site-hs-v1"}')
-    tok = resign(site_token(), S1, raw_header=raw)
-    assert session.verify_token(tok, allowlist=SITE_AL, token_use="site-session")[1] == "bad_signature"
+    _, p, s = _mint().split(".")
+    raw = '{"alg":"RS256","typ":"JWT","kid":"site-rs-v1","kid":"site-rs-v9"}'
+    h = base64.urlsafe_b64encode(raw.encode()).rstrip(b"=").decode()
+    assert _verify(f"{h}.{p}.{s}") == (None, "bad_signature")
 
 
-@pytest.mark.parametrize("alg", ["HS512", "RS256", "none", "None", "NONE", "", None])
+@pytest.mark.parametrize("alg", ["HS256", "RS512", "PS256", "none", "None", "NONE", "ES256"])
 def test_right_kid_wrong_alg_is_alg_mismatch(alg):
-    hd = {"alg": alg, "typ": "JWT", "kid": "site-hs-v1"}
-    if alg is None:
-        del hd["alg"]
-    tok = resign(site_token(), S1, header=hd)
-    if alg in ("none", "None", "NONE"):
-        tok = tok.rsplit(".", 1)[0] + "."          # alg=none 攻击的经典形态：空签名
-    assert session.verify_token(tok, allowlist=SITE_AL, token_use="site-session")[1] == "alg_mismatch"
+    h, p, s = _mint().split(".")
+    hdr = _unb64(h); hdr["alg"] = alg
+    assert _verify(f"{_b64(hdr)}.{p}.{s}") == (None, "alg_mismatch")
 
 
 def test_site_kid_presented_to_console_allowlist_is_unknown():
-    assert session.verify_token(site_token(), allowlist=CONSOLE_AL, token_use="console-session")[1] == "unknown_kid"
+    assert _verify(_mint(), "console-upgrade", v.CONSOLE_ALLOWLIST) == (None, "unknown_kid")
 
 
 def test_console_kid_presented_to_site_allowlist_is_unknown():
-    """Edge 的 allowlist 里没有 console 的 kid（spec §4.1）。"""
-    assert session.verify_token(console_token(), allowlist=SITE_AL, token_use="site-session")[1] == "unknown_kid"
+    tok = _mint(kid=v.CONSOLE_KID, key=v.CONSOLE_KEY)   # console kid 签的 **site-session**：只改 kid family
+    assert _verify(tok) == (None, "unknown_kid")
 
 
 def test_third_key_signing_under_a_known_kid_is_bad_signature():
-    tok = resign(site_token(), "some-third-key")
-    assert session.verify_token(tok, allowlist=SITE_AL, token_use="site-session")[1] == "bad_signature"
+    tok = _mint(kid=v.SITE_KID, key=v.SITE_PREV_KEY)     # header 声称 v1，签名是别的私钥
+    assert _verify(tok) == (None, "bad_signature")
 
 
-# ---- 用途与受众 ------------------------------------------------------------
+def test_crit_header_is_rejected_even_with_a_valid_signature():
+    h, p, _ = _mint().split(".")
+    hdr = _unb64(h); hdr["crit"] = ["exp"]
+    h2 = _b64(hdr)
+    sig = v.signer(v.SITE_KEY)(f"{h2}.{p}".encode())
+    tok = f"{h2}.{p}.{base64.urlsafe_b64encode(sig).rstrip(b'=').decode()}"
+    assert _verify(tok) == (None, "bad_signature")
 
-@pytest.mark.parametrize("mint, allowlist, wrong_use", [
-    (site_token, SITE_AL, "console-session"),
-    (site_token, SITE_AL, "console-upgrade"),
-    (console_token, CONSOLE_AL, "console-upgrade"),
-    (console_token, CONSOLE_AL, "site-session"),
-    (upgrade_code, CONSOLE_AL, "console-session"),
-    (upgrade_code, CONSOLE_AL, "site-session"),
+
+# ---- JOSE 层：规范 base64url 与签名长度（spec §5）----
+
+@pytest.mark.parametrize("name,mutate,expect_reject", v.RS_MUTATIONS)
+def test_rs_mutation_vectors(name, mutate, expect_reject):
+    claims, _ = _verify(mutate(_mint()))
+    assert (claims is None) == expect_reject, name
+
+
+def test_non_canonical_trailing_bits_in_signature_are_rejected():
+    h, p, s = _mint().split(".")
+    last = s[-1]
+    # 同一段字节的另一种编码：把末字符换成"解码相同、编码不同"的字符（尾比特非零）。
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    idx = alphabet.index(last)
+    alias = alphabet[idx ^ 1]      # 翻最低位：len%4==2 时末字符低 4 位是尾比特，==3 时低 2 位
+    if len(s) % 4 == 0:
+        pytest.skip("本次签名编码没有尾比特")
+    tok = f"{h}.{p}.{s[:-1]}{alias}"
+    assert tok != _mint() and _verify(tok) == (None, "bad_signature")
+
+
+def test_signature_length_check_precedes_rsa_verify(monkeypatch):
+    """变形：把长度检查去掉后，一个 255 字节的签名会交给 cryptography（它也会拒）。这里只钉住
+    "长度不等即拒且不调 verify"——防将来有人把它换成"补零后再验"。"""
+    calls = []
+    orig = session._rsa_verify
+
+    def spy(pub, data, sig):
+        calls.append(len(sig)); return orig(pub, data, sig)
+    monkeypatch.setattr(session, "_rsa_verify", spy)
+    _verify(v._short_sig(_mint()))
+    assert calls == [255]
+
+
+# ---- 用途与受众 ----
+
+@pytest.mark.parametrize("token_use,allowlist,wrong_use", [
+    ("site-session", v.SITE_ALLOWLIST, "console-session"),
+    ("site-session", v.SITE_ALLOWLIST, "console-upgrade"),
+    ("console-upgrade", v.CONSOLE_ALLOWLIST, "console-session"),
+    ("console-session", v.CONSOLE_ALLOWLIST, "console-upgrade"),
 ])
-def test_token_use_matrix_off_diagonal_is_rejected(mint, allowlist, wrong_use):
-    """M05 那一类的完整矩阵：升级码当面板会话、面板会话当站点会话……全部 wrong_token_use。"""
-    assert session.verify_token(mint(), allowlist=allowlist, token_use=wrong_use)[1] == "wrong_token_use"
+def test_token_use_matrix_off_diagonal_is_rejected(token_use, allowlist, wrong_use):
+    kid, key = (v.SITE_KID, v.SITE_KEY) if token_use == "site-session" else (v.CONSOLE_KID, v.CONSOLE_KEY)
+    tok = _mint(wrong_use, kid=kid, key=key)
+    assert _verify(tok, token_use, allowlist) == (None, "wrong_token_use")
 
 
 def test_aud_mismatch_is_rejected_even_with_right_token_use():
-    tok = site_token()
-    pl = unb64(tok.split(".")[1]); pl["aud"] = "console-panel"
-    tok2 = resign(tok, S1, payload=pl)
-    assert session.verify_token(tok2, allowlist=SITE_AL, token_use="site-session")[1] == "wrong_audience"
+    h, p, _ = _mint().split(".")
+    claims = _unb64(p); claims["aud"] = "console-panel"
+    p2 = _b64(claims)
+    sig = v.signer(v.SITE_KEY)(f"{h}.{p2}".encode())
+    assert _verify(f"{h}.{p2}.{base64.urlsafe_b64encode(sig).rstrip(b'=').decode()}") == (None, "wrong_audience")
 
 
 def test_aud_as_list_is_rejected():
-    tok = site_token()
-    pl = unb64(tok.split(".")[1]); pl["aud"] = ["site-edge"]
-    tok2 = resign(tok, S1, payload=pl)
-    assert session.verify_token(tok2, allowlist=SITE_AL, token_use="site-session")[1] == "wrong_audience"
+    h, p, _ = _mint().split(".")
+    claims = _unb64(p); claims["aud"] = ["site-edge"]
+    p2 = _b64(claims)
+    sig = v.signer(v.SITE_KEY)(f"{h}.{p2}".encode())
+    assert _verify(f"{h}.{p2}.{base64.urlsafe_b64encode(sig).rstrip(b'=').decode()}") == (None, "wrong_audience")
 
 
 def test_expired_is_rejected():
-    tok = site_token(ttl_seconds=1, now=int(time.time()) - 10)
-    assert session.verify_token(tok, allowlist=SITE_AL, token_use="site-session")[1] == "expired"
+    assert session.verify_token(_mint(), allowlist=v.SITE_ALLOWLIST, token_use="site-session",
+                                now=NOW + 601) == (None, "expired")
 
 
 @pytest.mark.parametrize("email", ["", None, 5])
 def test_missing_or_empty_email_is_rejected(email):
-    tok = site_token()
-    pl = unb64(tok.split(".")[1])
-    if email is None:
-        del pl["email"]
-    else:
-        pl["email"] = email
-    tok2 = resign(tok, S1, payload=pl)
-    assert session.verify_token(tok2, allowlist=SITE_AL, token_use="site-session")[1] == "bad_signature"
+    h, p, _ = _mint().split(".")
+    claims = _unb64(p); claims["email"] = email
+    p2 = _b64(claims)
+    sig = v.signer(v.SITE_KEY)(f"{h}.{p2}".encode())
+    assert _verify(f"{h}.{p2}.{base64.urlsafe_b64encode(sig).rstrip(b'=').decode()}") == (None, "bad_signature")
 
 
 def test_upgrade_code_without_jti_is_rejected():
-    tok = upgrade_code()
-    pl = unb64(tok.split(".")[1]); del pl["jti"]
-    tok2 = resign(tok, C1, payload=pl)
-    assert session.verify_token(tok2, allowlist=CONSOLE_AL, token_use="console-upgrade")[1] == "bad_signature"
-
-
-def test_tampered_payload_keeps_old_signature_is_bad_signature():
-    tok = site_token()
-    h, p, s = tok.split(".")
-    pl = unb64(p); pl["email"] = "attacker@example.test"
-    assert session.verify_token(f"{h}.{b64(pl)}.{s}", allowlist=SITE_AL,
-                                token_use="site-session")[1] == "bad_signature"
+    h, p, _ = _mint("console-upgrade", kid=v.CONSOLE_KID, key=v.CONSOLE_KEY).split(".")
+    claims = _unb64(p); claims.pop("jti")
+    p2 = _b64(claims)
+    sig = v.signer(v.CONSOLE_KEY)(f"{h}.{p2}".encode())
+    tok = f"{h}.{p2}.{base64.urlsafe_b64encode(sig).rstrip(b'=').decode()}"
+    assert _verify(tok, "console-upgrade", v.CONSOLE_ALLOWLIST) == (None, "bad_signature")
 
 
 def test_typ_session_alone_does_not_pass_the_new_entry():
-    """新入口只认 token_use + aud；旧合同的 typ=session 在新入口无效（状态机第 3、4 条）。"""
-    tok = resign(site_token(), S1, payload={"typ": "session", "email": "v@example.test",
-                                            "exp": int(time.time()) + 600})
-    assert session.verify_token(tok, allowlist=SITE_AL, token_use="site-session")[1] == "wrong_token_use"
+    """旧合同（typ=session、无 token_use/aud）用 site key 签出来：新入口必须拒。"""
+    h = _b64({"alg": "RS256", "typ": "JWT", "kid": v.SITE_KID})
+    p = _b64({"typ": "session", "email": "a@x.com", "exp": NOW + 600})
+    sig = v.signer(v.SITE_KEY)(f"{h}.{p}".encode())
+    assert _verify(f"{h}.{p}.{base64.urlsafe_b64encode(sig).rstrip(b'=').decode()}") == (None, "wrong_token_use")
 
 
-@pytest.mark.parametrize("garbage", ["", "a", "a.b", "a.b.c", "....", "\x00.\x00.\x00",
-                                     b64(b"[]") + "." + b64(b"{}") + ".x",
-                                     b64(b'{"kid":"site-hs-v1","alg":"HS256"}') + ".notjson.x"])
+@pytest.mark.parametrize("garbage", ["", ".", "..", "a.b", "a.b.c.d", "\x00.\x00.\x00", "ey.ey.ey"])
 def test_garbage_never_raises_and_outcome_is_in_vocabulary(garbage):
-    claims, outcome = session.verify_token(garbage, allowlist=SITE_AL, token_use="site-session")
-    assert claims is None and outcome in SPEC_OUTCOMES
-    claims, outcome = session.verify_with_legacy(garbage, allowlist=SITE_AL, token_use="site-session",
-                                                 legacy_secret=LEGACY)
-    assert claims is None and outcome in SPEC_OUTCOMES
+    claims, outcome = _verify(garbage)
+    assert claims is None and outcome in session.OUTCOMES
 
 
-def test_outcome_vocabulary_is_exactly_spec_section_8():
-    assert set(session.OUTCOMES) == SPEC_OUTCOMES
+def test_outcome_vocabulary_is_exactly_spec_section_8_minus_legacy():
+    assert session.OUTCOMES == ("accepted_current", "accepted_previous", "unknown_kid", "alg_mismatch",
+                                "wrong_audience", "wrong_token_use", "bad_signature", "expired")
 
 
-# ---- legacy 入口按旧合同、且只在 legacy 入口 -------------------------------------
-
-def test_legacy_console_scoped_session_is_not_a_site_session():
-    cons = session.mint_session_jwt("v@example.test", "V", LEGACY, scope="console")
-    claims, outcome = session.verify_with_legacy(cons, allowlist=SITE_AL, token_use="site-session",
-                                                 legacy_secret=LEGACY)
-    assert claims is None and outcome != "accepted_legacy"
-
-
-def test_legacy_site_session_is_not_a_console_session():
-    site = session.mint_session_jwt("v@example.test", "V", LEGACY)
-    claims, _ = session.verify_with_legacy(site, allowlist=CONSOLE_AL, token_use="console-session",
-                                           legacy_secret=LEGACY)
-    assert claims is None
-
-
-def test_legacy_upgrade_code_is_not_a_console_session_and_vice_versa():
-    code = session.mint_upgrade_code("v@example.test", LEGACY)
-    cons = session.mint_session_jwt("v@example.test", "V", LEGACY, scope="console")
-    kw = dict(allowlist=CONSOLE_AL, legacy_secret=LEGACY)
-    assert session.verify_with_legacy(code, token_use="console-session", **kw)[0] is None
-    assert session.verify_with_legacy(cons, token_use="console-upgrade", **kw)[0] is None
-
-
-# ---- mint_token 的合同（spec §11.4）-----------------------------------------------
+# ---- claim 集合（spec §11.4）----
 
 def test_site_session_claims_are_exactly_the_spec_table():
-    assert set(unb64(site_token().split(".")[1])) == {"token_use", "aud", "email", "name", "idp",
-                                                       "auth_via", "exp", "iat"}
+    assert set(_unb64(_mint().split(".")[1])) == {"token_use", "aud", "email", "name", "idp", "auth_via", "exp", "iat"}
 
 
 def test_upgrade_code_claims_are_exactly_the_spec_table_and_ttl_is_capped():
-    pl = unb64(upgrade_code(ttl_seconds=999).split(".")[1])
-    assert set(pl) == {"token_use", "aud", "email", "jti", "exp", "iat"}
-    assert 0 < pl["exp"] - pl["iat"] <= session.UPGRADE_MAX_TTL
-    assert len({unb64(upgrade_code().split(".")[1])["jti"] for _ in range(20)}) == 20
+    tok = session.mint_token(kid=v.CONSOLE_KID, sign=v.signer(v.CONSOLE_KEY), token_use="console-upgrade",
+                             email="a@x.com", ttl_seconds=999, now=NOW)
+    claims = _unb64(tok.split(".")[1])
+    assert set(claims) == {"token_use", "aud", "email", "jti", "exp", "iat"} and claims["exp"] - claims["iat"] == 60
 
 
 def test_console_session_claims_are_exactly_the_spec_table():
-    assert set(unb64(console_token().split(".")[1])) == {"token_use", "aud", "email", "name", "exp", "iat"}
-
-
-def test_header_is_exactly_alg_typ_kid_and_aud_is_a_string():
-    tok = site_token()
-    assert unb64(tok.split(".")[0]) == {"alg": "HS256", "typ": "JWT", "kid": "site-hs-v1"}
-    assert isinstance(unb64(tok.split(".")[1])["aud"], str)
+    tok = v.console_session_token(session.mint_token)
+    assert set(_unb64(tok.split(".")[1])) == {"token_use", "aud", "email", "name", "exp", "iat"}
 
 
 def test_name_is_capped_at_256_chars():
-    pl = unb64(site_token(name="N" * 300).split(".")[1])
-    assert len(pl["name"]) == 256
+    tok = session.mint_token(kid=v.SITE_KID, sign=v.signer(v.SITE_KEY), token_use="site-session",
+                             email="a@x.com", ttl_seconds=60, name="x" * 300, now=NOW)
+    assert len(_unb64(tok.split(".")[1])["name"]) == 256
 
 
-def test_oversize_signing_input_is_refused_not_signed():
-    with pytest.raises(ValueError):
-        site_token(email="a" * 4200 + "@example.test")
+def test_oversize_signing_input_is_refused_before_sign_is_called():
+    called = []
+
+    def sign(data):
+        called.append(1); return b"\x00" * 256
+    with pytest.raises(ValueError, match="4096"):
+        session.mint_token(kid=v.SITE_KID, sign=sign, token_use="site-session", email="a" * 4000 + "@x.com",
+                           ttl_seconds=60, now=NOW)
+    assert not called, "超长 signing input 不许到 KMS"
 
 
 def test_mint_token_rejects_unknown_token_use():
     with pytest.raises(KeyError):
-        site_token(token_use="session")
+        session.mint_token(kid=v.SITE_KID, sign=v.signer(v.SITE_KEY), token_use="session", email="a@x.com", ttl_seconds=1)
 
 
-# ---- meta：证明关键反例钉在它们声称的那一行 ------------------------------------------
+# ---- 公钥侧四项（spec §5）----
 
-def test_meta_aud_list_case_is_anchored_on_exact_string_compare(monkeypatch):
-    """把 aud 比对换成"成员"语义，aud 数组那条必须**转绿**——否则它没盯住那一行。"""
-    monkeypatch.setattr(session, "_aud_matches",
-                        lambda got, want: (want in got) if isinstance(got, list) else got == want)
-    tok = site_token()
-    pl = unb64(tok.split(".")[1]); pl["aud"] = ["site-edge"]
-    assert session.verify_token(resign(tok, S1, payload=pl), allowlist=SITE_AL,
-                                token_use="site-session")[1] == "accepted_current"
+def test_load_public_key_der_accepts_the_test_keys():
+    for key in (v.SITE_KEY, v.CONSOLE_KEY):
+        pub = session.load_public_key_der(v.spki_der(key))
+        assert pub.key_size == 2048
 
 
-def test_meta_no_fallback_case_is_anchored_on_kid_presence(monkeypatch):
-    """把"有 kid"判定换成"kid 在 allowlist 里"，未知 kid 就会回落 legacy 并被接受——那条反例必须因此转绿。"""
-    monkeypatch.setattr(session, "_has_kid", lambda header: header.get("kid") in SITE_AL)
-    tok = resign(site_token(), LEGACY, header={"alg": "HS256", "typ": "JWT", "kid": "site-hs-v7"})
-    # legacy 合同要求 typ=session；给它一个旧合同 payload 才能证明"回落后会被接受"
-    tok = resign(tok, LEGACY, payload={"typ": "session", "email": "v@example.test",
-                                       "exp": int(time.time()) + 600})
-    assert session.verify_with_legacy(tok, allowlist=SITE_AL, token_use="site-session",
-                                      legacy_secret=LEGACY)[1] == "accepted_legacy"
+def test_load_public_key_der_rejects_non_rsa_and_bad_exponent_and_short_modulus():
+    from cryptography.hazmat.primitives.asymmetric import ec, rsa as _rsa
+    ec_der = ec.generate_private_key(ec.SECP256R1()).public_key().public_bytes(
+        v.serialization.Encoding.DER, v.serialization.PublicFormat.SubjectPublicKeyInfo)
+    with pytest.raises(ValueError, match="rsaEncryption"):
+        session.load_public_key_der(ec_der)
+    with pytest.raises(ValueError, match="65537"):
+        session.load_public_key_der(v.spki_der(_rsa.generate_private_key(public_exponent=3, key_size=2048)))
+    with pytest.raises(ValueError, match="模长"):
+        session.load_public_key_der(v.spki_der(_rsa.generate_private_key(public_exponent=65537, key_size=1024)))
+
+
+def test_load_public_key_der_rejects_non_minimal_der():
+    der = v.spki_der(v.SITE_KEY)
+    with pytest.raises(ValueError):
+        session.load_public_key_der(der + b"\x00")
+
+
+def test_spki_sha256_is_64_hex_of_the_der():
+    assert session.spki_sha256(v.spki_der(v.SITE_KEY)) == v.spki_hex(v.SITE_KEY)
+
+
+# ---- 黄金三元组（Edge 预热与三处 verifier 共用）----
+
+def test_golden_triple_verifies_and_is_canonical():
+    g = session.RS256_GOLDEN
+    pub = session.load_public_key_der(base64.b64decode(g["spki_b64"]))
+    assert session._rsa_verify(pub, g["signing_input"].encode(), base64.b64decode(g["signature_b64"]))
+    assert g["signing_input"].count(".") == 1     # 就是一个 JWS signing input（header.payload）
+
+
+# ---- 夹具常量（ADR 0002）----
+
+def test_fixture_constants_are_the_adr_literals():
+    assert (session.FIXTURE_DOMAIN, session.FIXTURE_IDP, session.FIXTURE_AUTH_VIA, session.FIXTURE_MAX_TTL) == \
+        ("e2e.invalid", "fixture", "fixture-issuer", 1800)
+
+
+def test_fixture_domain_matches_the_permissions_copy():
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "deployer" / "functions"))
+    import permissions
+    assert permissions.FIXTURE_DOMAIN == session.FIXTURE_DOMAIN

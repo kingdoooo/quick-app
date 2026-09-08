@@ -1,32 +1,21 @@
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "panel" / "tests"))   # upgrade_code_vectors（三套件共用）
 
 import pytest
 
-SITE_KID_SECRET = "site-secret-v1"          # 两把 family 假密钥的唯一定义（test_login_handler 从这里 import）
-CONSOLE_KID_SECRET = "console-secret-v1"
-# 3c-1B：登录流程（state 与 pkce cookie）的 HMAC 密钥。**与上面两把、与 legacy 的 JWT_SECRET
-# 全都不同** —— 测试要能区分"用哪把签的"，三者相同的话本票的核心断言会假绿。
+import upgrade_code_vectors as vectors  # noqa: E402
+
 LOGIN_FLOW_SECRET = "login-flow-secret-v1"
 LOGIN_FLOW_PARAM = "/site-builder/login-flow-secret"
 
 
 @pytest.fixture(autouse=True)
-def _fake_session_key_params(monkeypatch):
-    """3c-1A：login_handler 会按 SESSION_KEYS_JSON 里的参数名读两把 family 密钥。
-    3c-1B 起还会按 LOGIN_FLOW_SECRET_PARAM 读登录流程那把（同一条 `{name}_PARAM` 约定）。
-
-    测试里不碰真 SSM：把 `_ssm` 换成只认下面那三个参数名的假件（两把 family 密钥的值与
-    test_login_handler 的 SITE_KID_SECRET / CONSOLE_KID_SECRET 一致，第三把是 login-flow）。legacy 的 JWT_SECRET 仍走各测试 ENV 里的
-    明文（_secret 对本地测试保留这条路，见 test_secret_loading）。需要别的 SSM 行为的测试
-    自己再 monkeypatch `_ssm`，后设的覆盖本夹具。
-    """
-    import login_handler as lh
-    values = {"/site-builder/session-keys/site-hs-v1": SITE_KID_SECRET,
-              "/site-builder/session-keys/console-hs-v1": CONSOLE_KID_SECRET,
-              # 3c-1B：login-flow secret 也按 `{name}_PARAM` 约定从 SSM 读（生产只下发参数名）
-              LOGIN_FLOW_PARAM: LOGIN_FLOW_SECRET}
+def _fake_platform_clients(monkeypatch):
+    """login_handler 的两个 AWS 边界都换成替身：SSM 只认 login-flow 那一把；KMS 按 vectors 的三把私钥
+    回答 DescribeKey / GetPublicKey / Sign。任何别的参数名 / KeyId 都响亮失败。"""
+    values = {LOGIN_FLOW_PARAM: LOGIN_FLOW_SECRET}
 
     class _SSM:
         @staticmethod
@@ -35,7 +24,17 @@ def _fake_session_key_params(monkeypatch):
                 return {"Parameter": {"Value": values[Name]}}
             raise RuntimeError(f"测试里意外读了 SSM 参数 {Name}")
 
+    kms = vectors.FakeKms()
+    # Task 5 之前 login_handler 尚未切 RS：import 失败即不打补丁；需要它的测试模块自己 import 会响亮失败
+    try:
+        import login_handler as lh
+        lh._secret_cache.clear()
+        lh._reset_signers()
+        monkeypatch.setattr(lh, "_ssm", lambda: _SSM())
+        monkeypatch.setattr(lh, "_kms", lambda: kms)
+    except (ImportError, AttributeError):
+        yield None
+        return
+    yield kms
     lh._secret_cache.clear()
-    monkeypatch.setattr(lh, "_ssm", lambda: _SSM())
-    yield
-    lh._secret_cache.clear()
+    lh._reset_signers()
