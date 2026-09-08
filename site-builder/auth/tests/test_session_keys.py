@@ -59,21 +59,35 @@ def test_previous_is_loaded_and_ordered_after_current(tmp_path):
     assert [(r.kid, r.role) for r in keys.allowlist("site")] == [("site-rs-v1", "current"), ("site-rs-v0", "previous")]
 
 
+# `why` 既是描述**也是期望错误消息的正则片段**：pytest.raises(match=why) 让 no-op 变形（改不动文本）
+# 与"因别的理由被拒"都无法蒙混成绿（M1；正是这个缺失放过了三条坏变形）。
 @pytest.mark.parametrize("mutate,why", [
-    (lambda t: t.replace("site_current = site-rs-v1", "site_current = site-hs-v1"), "HS kid 不再合法"),
-    (lambda t: t.replace("alg = RS256\nkey_arn = " + v.KEY_ARN[v.SITE_KID], "alg = HS256\nkey_arn = " + v.KEY_ARN[v.SITE_KID]), "alg 只许 RS256"),
-    (lambda t: t.replace(v.KEY_ARN[v.SITE_KID], "alias/site-builder/session/site-rs-v1"), "alias 不接受"),
-    (lambda t: t.replace(v.spki_hex(v.SITE_KEY), "abc"), "spki 必须 64 位 hex"),
-    (lambda t: t.replace("[SessionKey:console-rs-v1]", "[SessionKey:console-rs-v2]"), "缺小节"),
-    (lambda t: t.replace("site_current = site-rs-v1", "site_current ="), "缺 current"),
-    (lambda t: t.replace("login_flow_secret_param = /site-builder/login-flow-secret", "login_flow_secret_param ="), "缺 login-flow"),
-    (lambda t: t.replace("[SessionKeys]", "[SessionKeys]\nsigner = current"), "signer 键已删——出现即配置错"),
-    (lambda t: t.replace("[SessionKeys]", "[SessionKeys]\nlegacy_param = /site-builder/jwt-secret"), "legacy_param 键已删——出现即配置错"),
-    (lambda t: t.replace("[SessionKey:site-rs-v1]\nalg = RS256", "[SessionKey:site-rs-v1]\nalg = RS256\nssm_param = /x"), "RS 行不许带 ssm_param"),
+    (lambda t: t.replace("site_current = site-rs-v1", "site_current = site-hs-v1"), r"不是本 family 的合法 kid"),
+    (lambda t: t.replace("alg = RS256\nkey_arn = " + v.KEY_ARN[v.SITE_KID], "alg = HS256\nkey_arn = " + v.KEY_ARN[v.SITE_KID]), r"只有 RS256"),
+    (lambda t: t.replace(v.KEY_ARN[v.SITE_KID], "alias/site-builder/session/site-rs-v1"), r"不接受 alias"),
+    (lambda t: t.replace(v.spki_hex(v.SITE_KEY), "abc"), r"64 位小写 hex"),
+    (lambda t: t.replace("[SessionKey:console-rs-v1]", "[SessionKey:console-rs-v2]"), r"小节"),
+    (lambda t: t.replace("site_current = site-rs-v1", "site_current ="), r"缺 site_current"),
+    (lambda t: t.replace("login_flow_secret_param = /site-builder/login-flow-secret", "login_flow_secret_param ="), r"缺 login_flow_secret_param"),
+    (lambda t: t.replace("[SessionKeys]", "[SessionKeys]\nsigner = current"), r"含 signer"),
+    (lambda t: t.replace("[SessionKeys]", "[SessionKeys]\nlegacy_param = /site-builder/jwt-secret"), r"含 legacy_param"),
+    (lambda t: t.replace("[SessionKey:site-rs-v1]\nalg = RS256", "[SessionKey:site-rs-v1]\nalg = RS256\nssm_param = /x"), r"带 ssm_param"),
+    # I1：四条补齐——每条都真正走到目标分支（原来那批要么没这条、要么被更早的分支截掉）。
+    # (a) kid 合 KID_RE 但 family 前缀与槽位不符：走 `_key_ref` 的 `m.group(1) != family`
+    #     （case 1 的 site-hs-v1 在 `not m` 就被拦下，够不到这条）。console-rs-v1 的小节 RS 里本就有。
+    (lambda t: t.replace("site_current = site-rs-v1", "site_current = console-rs-v1"), r"不是本 family 的合法 kid"),
+    # (b) previous == current：走 load_session_keys 里 `if prev == cur`。
+    (lambda t: t.replace("site_previous =", "site_previous = site-rs-v1"), r"previous 与 current 相同"),
+    # (c) configparser 自身报错（重复 [SessionKeys] 段）必须被包成本模块的错误类型/消息，而非裸 configparser.Error。
+    (lambda t: t + "\n[SessionKeys]\nsite_current = dup\n", r"解析失败"),
+    # (d) 文件有别的段但没有 [SessionKeys]：走 `not cfg.has_section("SessionKeys")`（found 非空，非"文件不存在"）。
+    (lambda t: t.replace("[SessionKeys]", "[SessionKeysX]"), r"段（或文件不存在）"),
 ])
 def test_misconfiguration_raises_instead_of_falling_back(tmp_path, mutate, why):
-    with pytest.raises(sk.SessionKeysError):
-        _load(tmp_path, mutate(RS)), why
+    mutated = mutate(RS)
+    assert mutated != RS, f"变形没改动文本（no-op），这条负例形同虚设：{why}"
+    with pytest.raises(sk.SessionKeysError, match=why):
+        _load(tmp_path, mutated)
 
 
 @pytest.mark.parametrize("mutate,why", [
