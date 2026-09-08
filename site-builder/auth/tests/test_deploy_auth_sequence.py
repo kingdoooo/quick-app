@@ -423,11 +423,59 @@ def test_verification_on_creates_the_verifier_role_and_passes_it_to_converge(tmp
     assert sorted(trust["Statement"][0]["Principal"]["AWS"]) == ["arn:aws:iam::111111111111:role/ci",
                                                                   "arn:aws:iam::111111111111:user/kent"]
     pol = json.loads(iam.kwargs["put_role_policy"]["PolicyDocument"])       # 最后一次 put_role_policy 是 verifier 的
-    acts = {s["Action"] for s in pol["Statement"]}
-    assert acts == {"lambda:InvokeFunctionUrl", "lambda:InvokeFunction"}
+    by_action = {s["Action"]: s for s in pol["Statement"]}
+    assert set(by_action) == {"lambda:InvokeFunctionUrl", "lambda:InvokeFunction"}
     assert all(s["Resource"] == f"arn:aws:lambda:us-east-1:111111111111:function:{da.FN}" for s in pol["Statement"])
-    assert "3600" in json.dumps(iam.kwargs.get("update_role", iam.kwargs.get("create_role", {})))
+    # **两条 Condition 逐字钉住**（复审 Important 1/2）：`InvokeFunctionUrl` 配 `StringEquals
+    # lambda:FunctionUrlAuthType=AWS_IAM`，`InvokeFunction` 配 **`Bool lambda:InvokedViaFunctionUrl=true`**。
+    # 把第二条也写成 FunctionUrlAuthType 的后果是它永不匹配 ⇒ verifier 调用 403，而只断言 action/resource
+    # 的用例照绿——那正是这条缺陷此前隐形的原因。
+    assert by_action["lambda:InvokeFunctionUrl"]["Condition"] == {
+        "StringEquals": {"lambda:FunctionUrlAuthType": "AWS_IAM"}}
+    assert by_action["lambda:InvokeFunction"]["Condition"] == {
+        "Bool": {"lambda:InvokedViaFunctionUrl": "true"}}
+    assert iam.kwargs["update_role"]["MaxSessionDuration"] == 3600
     assert da.lambda_env()["Variables"]["FIXTURE_ISSUER"] == "on"
+
+
+def test_verifier_inline_policy_is_the_same_two_shapes_as_the_shared_renderer():
+    """identity 侧（本脚本）与 resource 侧（function_url_policy）只许有**一个**真源。
+
+    两侧求交才是实际授权：形态不同 ⇒ 交集为空 ⇒ 403，而两边的单测各自都绿（本仓库栽过同形的
+    "同名 StatementId 已存在就 pass"）。所以这里不重写一遍期望值，而是把 inline policy 投影成
+    `function_url_policy.expected_projection` 的比较形态直接相等比较。
+    """
+    iam = Recorder()
+    verifier_arn = f"arn:aws:iam::111111111111:role/{da.VERIFIER_ROLE_NAME}"
+    da.ensure_verifier_role(iam, da.Verification(True, ("arn:aws:iam::111111111111:role/ci",)),
+                            account="111111111111", region="us-east-1")
+    pol = json.loads(iam.kwargs["put_role_policy"]["PolicyDocument"])
+    want = {(action, triples) for _sid, (_effect, action, _principal, triples)
+            in fup.expected_projection(verifier_arn).items()}
+    got = {(s["Action"], tuple(sorted((op, key, val) for op, kv in s["Condition"].items()
+                                      for key, val in kv.items())))
+           for s in pol["Statement"]}
+    assert got == want, (got, want)
+
+
+def test_verification_on_creates_the_role_when_it_is_absent(monkeypatch):
+    """`create_role` 分支的正对照：上面那条 ON 用例里 Recorder 的 `get_role` 恒命中，走的是 update 路径，
+    于是"首次部署建角色"这条路一直没人跑过。新建后还有一次 IAM 传播等待，这里把它拿掉。"""
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    iam = Recorder(missing_role=True)
+    on = da.Verification(True, ("arn:aws:iam::111111111111:user/kent",))
+    arn = da.ensure_verifier_role(iam, on, account="111111111111", region="us-east-1")
+    assert arn == f"arn:aws:iam::111111111111:role/{da.VERIFIER_ROLE_NAME}"
+    assert iam.calls == ["get_role", "create_role", "put_role_policy"], iam.calls
+    kw = iam.kwargs["create_role"]
+    assert kw["RoleName"] == da.VERIFIER_ROLE_NAME and kw["MaxSessionDuration"] == 3600
+    trust = json.loads(kw["AssumeRolePolicyDocument"])
+    assert trust["Statement"][0]["Principal"]["AWS"] == ["arn:aws:iam::111111111111:user/kent"]
+    assert trust["Statement"][0]["Action"] == "sts:AssumeRole"
+    pol = json.loads(iam.kwargs["put_role_policy"]["PolicyDocument"])
+    assert {s["Action"] for s in pol["Statement"]} == {"lambda:InvokeFunctionUrl", "lambda:InvokeFunction"}
+    # 新建路径不许顺手也走 update（那会掩盖"到底建没建"）
+    assert "update_assume_role_policy" not in iam.calls and "update_role" not in iam.calls
 
 
 @pytest.mark.parametrize("bad", ["", "arn:aws:iam::111111111111:role/*", "*", "kent",
@@ -501,6 +549,9 @@ def _fake_policy_module():
 def test_deploy_auth_binds_the_shared_function_url_policy_implementation():
     assert da.converge_function_url_policy is fup.converge
     assert da.function_url_statements is fup.expected_statements
+    # verifier 的 inline policy 也从这一份渲染器推导（`_verifier_invoke_statements`）：绑成本地副本
+    # 就是 identity / resource 两侧漂移的入口，而漂移的症状是 403 而不是红测试。
+    assert da.function_url_projection is fup.expected_projection
 
 
 def test_main_converges_the_function_url_policy_once_with_the_configured_edge_role(cfg_files, monkeypatch):

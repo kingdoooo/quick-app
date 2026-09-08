@@ -30,6 +30,7 @@ import session_kms
 
 from alarm_pipeline import ensure_alarm_pipeline
 from function_url_policy import converge as converge_function_url_policy
+from function_url_policy import expected_projection as function_url_projection
 from function_url_policy import expected_statements as function_url_statements
 from secrets_util import ensure_secret as _ensure_secret, precheck_parameters
 from session_keys import (env_json, key_refs, kms_key_arns, load_session_keys, ssm_parameter_arns,
@@ -165,10 +166,34 @@ def read_verification(c: configparser.ConfigParser, *, account: str) -> Verifica
     return Verification(True, principals)
 
 
+def _verifier_invoke_statements(fn_arn: str, verifier_arn: str) -> list:
+    """verifier 角色 inline policy 的两条语句：Action 与 Condition **从共享渲染器推导**（`function_url_policy`
+    的 `expected_projection`），不在这里手写第二份。
+
+    形态必须与 resource policy 侧逐字相同（AWS 文档 lambda/latest/dg/urls-auth）：
+    `lambda:InvokeFunctionUrl` 配 `StringEquals lambda:FunctionUrlAuthType=AWS_IAM`，
+    `lambda:InvokeFunction` 配 **`Bool lambda:InvokedViaFunctionUrl=true`**（操作符是 Bool 不是 StringEquals，
+    条件键也不同）。identity 侧与 resource 侧的实际授权是两者求交：把第二条写成 `FunctionUrlAuthType`
+    看上去很对，但那个键在 `InvokeFunction` 上不产生，条件永不满足 ⇒ verifier 调用 403，而两侧的单测
+    各自都绿——所以这里只许有一个真源。传 `verifier_arn` 只为过渲染器那条精确 role ARN 校验，
+    Principal 由本函数丢弃（identity policy 没有 Principal）。
+    """
+    out = []
+    for _sid, (_effect, action, _principal, triples) in function_url_projection(verifier_arn).items():
+        cond: dict = {}
+        for op, key, val in triples:
+            cond.setdefault(op, {})[key] = val
+        sid = "InvokeAuthUrl" if action == "lambda:InvokeFunctionUrl" else "InvokeAuthViaUrl"
+        out.append({"Sid": sid, "Effect": "Allow", "Action": action, "Resource": fn_arn, "Condition": cond})
+    return out
+
+
 def ensure_verifier_role(iam, verification: Verification, *, account: str, region: str):
     """`site-builder-verifier`（spec §11.7）：开 ⇒ 建 / 收敛并返回 ARN；关 ⇒ 存在则删并返回 None。
-    信任策略只列显式 ARN，会话上限 1 小时；权限只有对 auth 函数的两条 invoke（与 edge role 同形）。"""
+    信任策略只列显式 ARN，会话上限 1 小时；权限只有对 auth 函数的两条 invoke（与 edge role **逐字同形**，
+    见 `_verifier_invoke_statements`）。"""
     fn_arn = f"arn:aws:lambda:{region}:{account}:function:{FN}"
+    verifier_arn = f"arn:aws:iam::{account}:role/{VERIFIER_ROLE_NAME}"
     try:
         iam.get_role(RoleName=VERIFIER_ROLE_NAME)
         exists = True
@@ -194,17 +219,17 @@ def ensure_verifier_role(iam, verification: Verification, *, account: str, regio
         iam.update_assume_role_policy(RoleName=VERIFIER_ROLE_NAME, PolicyDocument=trust)
         iam.update_role(RoleName=VERIFIER_ROLE_NAME, MaxSessionDuration=3600)
     else:
+        # Description 只说 IAM 真的能表达的事：**IAM 无法按路径限权**，这两条语句覆盖 auth Function URL 的
+        # 每一个路径；"只能打 /fixture-session"是 handler 里那道调用者检查的事，不是这个角色的边界。
         iam.create_role(RoleName=VERIFIER_ROLE_NAME, AssumeRolePolicyDocument=trust, MaxSessionDuration=3600,
-                        Description="site-builder acceptance verifier - may only call POST /fixture-session on the auth function")
+                        Description="site-builder acceptance verifier - may invoke only the auth Function URL"
+                                    " (any path); the /fixture-session restriction is enforced by the handler")
     iam.put_role_policy(RoleName=VERIFIER_ROLE_NAME, PolicyName="invoke-auth-function-url",
-        PolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": [
-            {"Sid": "InvokeAuthUrl", "Effect": "Allow", "Action": "lambda:InvokeFunctionUrl",
-             "Resource": fn_arn, "Condition": {"StringEquals": {"lambda:FunctionUrlAuthType": "AWS_IAM"}}},
-            {"Sid": "InvokeAuthViaUrl", "Effect": "Allow", "Action": "lambda:InvokeFunction",
-             "Resource": fn_arn, "Condition": {"StringEquals": {"lambda:FunctionUrlAuthType": "AWS_IAM"}}}]}))
+        PolicyDocument=json.dumps({"Version": "2012-10-17",
+                                   "Statement": _verifier_invoke_statements(fn_arn, verifier_arn)}))
     if not exists:
         import time; time.sleep(10)
-    return f"arn:aws:iam::{account}:role/{VERIFIER_ROLE_NAME}"
+    return verifier_arn
 
 
 def lambda_env() -> dict:
