@@ -45,39 +45,50 @@ def _describe_checks(meta: dict, key_arn: str) -> list:
     return problems
 
 
-def describe_public_key(kms, key_arn: str) -> tuple[bytes, str]:
-    """→ (DER SPKI, spki_sha256)。做 DescribeKey 的形态检查与公钥侧四项（session.load_public_key_der），
-    **不**与任何配置值比对——`scripts/session_key_fingerprint.py` 靠它算出要回填的指纹。"""
-    meta = kms.describe_key(KeyId=key_arn)["KeyMetadata"]
-    problems = _describe_checks(meta, key_arn)
-    if problems:
-        raise KeyMaterialMismatch(f"{key_arn}: " + "；".join(problems))
-    der = kms.get_public_key(KeyId=key_arn)["PublicKey"]
+def _verified(kms, key_arn: str, label: str, expect_fp: str | None = None) -> tuple[bytes, str]:
+    """四项校验的**唯一实现**（`describe_public_key` 与 `fetch_verified_public_key_der` 的共同体，spec §11.6 第 1 层）。
+    **汇总**这把 key 的所有不符项后，以 `label` 为前缀抛一个 `KeyMaterialMismatch`（precheck 直接把它 str 进汇总，
+    "lists every mismatch"），任一不符即拒：
+
+    1. `_describe_checks`：DescribeKey 形态五项；
+    2. `GetPublicKey`——**包在 try 里**：真 KMS 对 pending-deletion / disabled 的 key 会拒 GetPublicKey
+       （DisabledException / KMSInvalidStateException），那不是"KMS 不可达"而是"这把 key 不能用"，必须归为
+       `KeyMaterialMismatch`（否则 Task 11 的 verifier 冷启动会把它误判成 SYNTH-ONLY 占位符那条路）。异常只记
+       类名与消息，**不打印密钥材料**（公钥不在异常里）；
+    3. `load_public_key_der`：公钥侧四项（ValueError → problem）；
+    4. `expect_fp` 给定时比对指纹（不给 = `describe_public_key` 的算指纹用法，不与任何配置值比对）。
+    """
+    problems = _describe_checks(kms.describe_key(KeyId=key_arn)["KeyMetadata"], key_arn)
+    der = fp = None
     try:
-        session.load_public_key_der(der)
-    except ValueError as exc:
-        raise KeyMaterialMismatch(f"{key_arn}: 公钥 SPKI 不合合同（{exc}）") from exc
-    return der, session.spki_sha256(der)
+        der = kms.get_public_key(KeyId=key_arn)["PublicKey"]
+    except Exception as exc:  # noqa: BLE001  GetPublicKey 对 pending-deletion/disabled/AccessDenied 都会抛
+        problems.append(f"GetPublicKey 失败：{type(exc).__name__}: {exc}")
+    if der is not None:
+        try:
+            session.load_public_key_der(der)
+        except ValueError as exc:
+            problems.append(f"公钥 SPKI 不合合同（{exc}）")
+        fp = session.spki_sha256(der)
+        if expect_fp is not None and fp != expect_fp:
+            problems.append(
+                f"KMS 公钥的 spki_sha256={fp} != 配置的 {expect_fp}——"
+                "config.ini 指的不是这把 key（或 key 被换过）")
+    if problems:
+        raise KeyMaterialMismatch(f"{label}: " + "；".join(problems))
+    return der, fp
+
+
+def describe_public_key(kms, key_arn: str) -> tuple[bytes, str]:
+    """→ (DER SPKI, spki_sha256)。DescribeKey 形态检查 + 公钥侧四项（session.load_public_key_der），
+    **不**与任何配置值比对——`scripts/session_key_fingerprint.py` 靠它算出要回填的指纹。"""
+    return _verified(kms, key_arn, key_arn)
 
 
 def fetch_verified_public_key_der(kms, ref) -> bytes:
-    """spec §11.6 第 1 层：DescribeKey 三项 + 公钥侧四项 + 指纹等值。**汇总**该 key 的所有不符项后
-    以 `ref.kid` 为前缀抛一个 KeyMaterialMismatch——precheck 直接把它 str 进汇总（"lists every mismatch"），
-    调用方一次就能看清哪把 key、错在哪几项。任一不符即拒。"""
-    meta = kms.describe_key(KeyId=ref.key_arn)["KeyMetadata"]
-    problems = _describe_checks(meta, ref.key_arn)
-    der = kms.get_public_key(KeyId=ref.key_arn)["PublicKey"]
-    try:
-        session.load_public_key_der(der)
-    except ValueError as exc:
-        problems.append(f"公钥 SPKI 不合合同（{exc}）")
-    fp = session.spki_sha256(der)
-    if fp != ref.spki_sha256:
-        problems.append(
-            f"KMS 公钥的 spki_sha256={fp} != 配置的 {ref.spki_sha256}——"
-            "config.ini 指的不是这把 key（或 key 被换过）")
-    if problems:
-        raise KeyMaterialMismatch(f"{ref.kid}: " + "；".join(problems))
+    """spec §11.6 第 1 层：DescribeKey 形态 + 公钥侧四项 + 指纹等值。任一不符抛 `KeyMaterialMismatch`
+    （以 `ref.kid` 标识，汇总全部不符项）。"""
+    der, _ = _verified(kms, ref.key_arn, ref.kid, expect_fp=ref.spki_sha256)
     return der
 
 

@@ -57,6 +57,30 @@ def test_precheck_keys_lists_every_mismatch_and_exits_before_any_write(capsys):
     assert "console-rs-v1" in msg and "KeyUsage" in msg and "spki_sha256" in msg and "site-rs-v1" not in msg
 
 
+class _GetPublicKeyRaises(v.FakeKms):
+    """真 KMS 对 pending-deletion / disabled 的 key 会拒 GetPublicKey；FakeKms 默认不建模 key state，
+    这个替身把那条 AWS 行为补上（DescribeKey 照常，GetPublicKey 抛）。"""
+
+    def get_public_key(self, KeyId):
+        self.calls.append(("get_public_key", KeyId))
+        raise RuntimeError("KMSInvalidStateException: PendingDeletion")
+
+
+def test_get_public_key_failure_is_folded_into_key_material_mismatch_naming_the_kid():
+    kms = _GetPublicKeyRaises()
+    with pytest.raises(sm.KeyMaterialMismatch) as ei:
+        sm.fetch_verified_public_key_der(kms, _ref())
+    msg = str(ei.value)
+    assert v.SITE_KID in msg and "GetPublicKey" in msg and "KMSInvalidStateException" in msg
+
+
+def test_precheck_keys_still_lists_the_kid_when_get_public_key_raises():
+    kms = _GetPublicKeyRaises()
+    with pytest.raises(SystemExit) as ei:
+        sm.precheck_keys(kms, [_ref()])
+    assert v.SITE_KID in str(ei.value) and "GetPublicKey" in str(ei.value)
+
+
 def test_precheck_keys_is_silent_and_read_only_when_everything_matches():
     kms = v.FakeKms()
     sm.precheck_keys(kms, [_ref(), _ref(v.CONSOLE_KID, v.CONSOLE_KEY)])
