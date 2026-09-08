@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """部署 M3 控制台（panel）。幂等可重跑。
 
-流程：复制依赖模块 → 打 zip → 建/更新 IAM 角色 → 建/更新 Lambda →
+流程：复制依赖模块 + 交叉装 cryptography → 打 zip → 建/更新 IAM 角色 → 建/更新 Lambda →
 Function URL（AWS_IAM，仅授权 edge role）→ 上传前端到版本化 S3 前缀 →
 注册 console route。
 
@@ -15,11 +15,16 @@ Function URL（AWS_IAM，仅授权 edge role）→ 上传前端到版本化 S3 �
   resource policy）。**缺 edge_role_arn 一律抛错中止，绝不 fallback 到宽权限**
   ——那会让 panel 的整套身份假设失效（handler.py 依赖"x-user-email 存在即
   请求来自 Edge"）。
-- 环境变量**只下发 SSM 参数名**，明文密钥严禁进环境变量：
-  GetFunctionConfiguration 会原样回显，拿到 JWT_SECRET 即可伪造任意用户会话。
-- panel role 的 SSM 资源限定**精确** jwt-secret ARN，**不照抄 auth 的
-  `parameter/site-builder/*` 前缀**（那是 auth 还要读 site-client-secret 的
-  业务需要）——拿前缀等于被攻破时顺带交出 Cognito client secret。
+- 环境变量里**没有任何密钥材料**，只有 kid / key_arn / spki_sha256 这类引用：
+  GetFunctionConfiguration 会原样回显，拿到会话签名密钥即可伪造任意用户会话
+  （docs/security/account-trust-boundary.md 是那条路的原文；3c-final 起会话签名 key
+  在 KMS 非对称 CMK 里，私钥不出 KMS）。
+- panel role 的 KMS 权限精确到 **console family 的 key ARN**，且 `kms:Sign` 带
+  `kms:SigningAlgorithm` 与 `kms:MessageType` 两个条件（把 spec §11.5 的合同钉进 IAM）。
+  **不含 site family**（spec §4.3）：拿到 site 的 key 等于 panel 被攻破时能伪造站点会话。
+  panel **一处 SSM 都不读**——`required_parameters()` 是空的，写前核对只剩 KMS 四项。
+- 产物里交叉装 cryptography（`requirements.txt`，hash 与 auth 那份逐字节相同）：panel 是
+  升级码与面板会话的 verifier，RS256 验签在本地做（ADR 0003 否决了手写 RSA）。
 
 用法：
     python3 deploy_panel.py                 # 全量
@@ -32,7 +37,9 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import zipfile
 from pathlib import Path
@@ -40,18 +47,22 @@ from pathlib import Path
 import boto3
 
 HERE = Path(__file__).parent
+# `[SessionKeys]` 那一段的读取路径**单独一个常量**：测试要能把它指到一份 RS 形态的临时 config 上
+# （真 config.ini 是 gitignored 的、里面是真实账号的 key ARN 与指纹，不能进断言）。
+# `CFG`（region / account / routing_table 等）仍然读同一个文件。
+CFG_PATH = HERE.parent / "config.ini"
 CFG = configparser.ConfigParser(interpolation=None)
-CFG.read(HERE.parent / "config.ini")
-# 3c-1A：[SessionKeys] 的唯一定义在 auth/session_keys.py（构建期 import，不进包——运行时只读环境变量）
+CFG.read(CFG_PATH)
+# [SessionKeys] 的唯一定义在 auth/session_keys.py（构建期 import，不进包——运行时只读环境变量）
 sys.path.insert(0, str(HERE.parent / "auth"))
 # Function URL resource policy 的唯一实现（auth / panel / key-proxy / 闸门共用；构建期 import，不进包）
 sys.path.insert(0, str(HERE.parent / "deployer" / "functions"))
+import session_kms  # noqa: E402  （KMS 边界的唯一实现；本脚本只用它的部署前四项校验）
 from function_url_policy import FUNCTION_URL_AUTH_TYPE  # noqa: E402
 from function_url_policy import converge as converge_function_url_policy  # noqa: E402
 from function_url_policy import expected_statements as function_url_statements  # noqa: E402
-from secrets_util import precheck_parameters  # noqa: E402
-from session_keys import (env_json, legacy_entry, load_session_keys,  # noqa: E402
-                          ssm_parameter_arns, ssm_parameter_names)
+from session_keys import (env_json, key_refs, kms_key_arns,  # noqa: E402
+                          load_session_keys)
 
 
 def _cfg(section: str, key: str, default: str | None = None) -> str:
@@ -68,11 +79,13 @@ FN_NAME = "site-panel"
 ROLE_NAME = "site-panel-role"
 RUNTIME = "python3.13"
 
-# 构建时复制进包的模块。**七个都必需**：
+# 构建时复制进包的模块。**每一个都必需**：
 #   common.py / permissions.py —— 授权与表访问的单一真源
 #   ops_log.py                 —— permissions.py import 它（M3 审计落点）
 #   session.py                 —— upgrade code 与会话 JWT 的单一编解码实现
-#   verifier_env.py            —— allowlist 装配 / legacy 开关 / 观测日志（3c-1A，与 auth 共用一份）
+#   verifier_env.py            —— allowlist 装配 / 观测日志（与 auth 共用一份）
+#   session_kms.py             —— KMS 边界的唯一实现（公钥加载器 + KmsSigner，3c-final；
+#                                 与 auth 共用一份，auth 拥有它）
 #   edge_caller.py             —— "调用者真是 Edge"的单一判定（handler 的第 ⓪ 步，
 #                                 与 key-proxy 共用同一份，见该模块 docstring）
 #   keystore.py                —— `site-api-keys` 的唯一访问层（api.py 只经它
@@ -89,8 +102,12 @@ RUNTIME = "python3.13"
 # test_copy_files_covers_every_local_module_panel_imports 按传递闭包核对——
 # **清单以那条断言为准**，不要照着记性加减（本清单曾经漏过 keystore.py）。
 COPY_FILES = ("common.py", "permissions.py", "ops_log.py", "session.py", "verifier_env.py",
-              "edge_caller.py", "keystore.py", "keygen.py",
+              "session_kms.py", "edge_caller.py", "keystore.py", "keygen.py",
               "analytics.py", "access_rollup.py")
+
+# 交叉装进产物的第三方依赖（cryptography 闭包三包，hash 与 auth/requirements.txt 逐字节相同）。
+# session.py 的 RS256 验签要它；ADR 0003 否决了"手写 RSA 省掉这个依赖"。
+REQUIREMENTS = HERE / "requirements.txt"
 
 
 def _region() -> str:
@@ -168,12 +185,21 @@ def role_statements() -> list[dict]:
       · session-codes：PutItem（jti 一次性消费的条件写）；
       · api-keys：Get/Put/Update + 两个 GSI 的 Query，**无 DeleteItem**（吊销
         是置 `revoked` 而不是删行，删了就没有审计痕迹）、**无 Scan**；
-      · SSM：**精确** jwt-secret ARN + kms:Decrypt 带 ViaService。
+      · KMS：`kms:Sign` + `kms:GetPublicKey`，**只对 console family 的 key ARN**，
+        Sign 带算法与 MessageType 两个条件；**一处 SSM 都没有**。
     """
     region, acct = _region(), _account()
     tbl = f"arn:aws:dynamodb:{region}:{acct}:table"
     routing = _cfg("Platform", "routing_table")
+    console_keys = kms_key_arns(load_session_keys(CFG_PATH), ("console",))
     return [
+        # 3c-final（spec §11.2 / ADR 0001）：panel 只签面板会话 ⇒ 只对 console family 的 key 有 kms:Sign；
+        # 两个条件把 §11.5 的合同钉进 IAM；GetPublicKey 给验签冷启动与 signer 自检用。
+        {"Sid": "SignConsoleTokens", "Effect": "Allow", "Action": "kms:Sign", "Resource": console_keys,
+         "Condition": {"StringEquals": {"kms:SigningAlgorithm": "RSASSA_PKCS1_V1_5_SHA_256",
+                                        "kms:MessageType": "RAW"}}},
+        {"Sid": "ReadConsolePublicKeys", "Effect": "Allow", "Action": "kms:GetPublicKey",
+         "Resource": console_keys},
         {"Sid": "SitesReadAndScopedUpdate", "Effect": "Allow",
          "Action": ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:Scan",
                     "dynamodb:UpdateItem", "dynamodb:ConditionCheckItem"],
@@ -236,16 +262,6 @@ def role_statements() -> list[dict]:
         {"Sid": "AccessTablesQueryOnly", "Effect": "Allow",
          "Action": "dynamodb:Query",
          "Resource": [f"{tbl}/site-access-events", f"{tbl}/site-access-daily"]},
-        # 3c-1A：legacy jwt-secret + console family 的 HS 行，**精确 ARN 清单、不含 site family**
-        # （spec §4.3：panel 只持 console 的 allowlist；拿到 site 的 key = 被攻破时能伪造站点会话）
-        {"Sid": "ReadSessionKeysConsoleOnly", "Effect": "Allow",
-         "Action": "ssm:GetParameter",
-         "Resource": ssm_parameter_arns(load_session_keys(HERE.parent / "config.ini"), ("console",),
-                                        region=region, account=acct)},
-        {"Sid": "DecryptViaSSM", "Effect": "Allow",
-         "Action": "kms:Decrypt", "Resource": "*",
-         "Condition": {"StringEquals": {
-             "kms:ViaService": f"ssm.{region}.amazonaws.com"}}},
         {"Sid": "InvokeUndeploy", "Effect": "Allow",
          "Action": "lambda:InvokeFunction",
          "Resource": f"arn:aws:lambda:{region}:{acct}:function:site-deployer-undeploy"},
@@ -280,13 +296,13 @@ def edge_role_id(edge_role_arn: str) -> str:
 
 
 def lambda_environment(edge_role_id_value: str = "") -> dict:
-    """Lambda 环境变量。**只有参数名，没有明文密钥**（见模块 docstring）。
+    """Lambda 环境变量。**没有任何密钥材料，只有引用**（见模块 docstring）。
 
     EDGE_ROLE_ID 不是秘密（它是个公开的资源标识，不能用来签发任何东西），
     但**缺了它 handler 会拒绝所有请求**——见 edge_caller.caller_is_edge：
     "配置缺失就不检查"恰好是这个缺陷的原始形态，所以宁可整站拒绝。
     """
-    keys = load_session_keys(HERE.parent / "config.ini")
+    keys = load_session_keys(CFG_PATH)
     env = {
         "EDGE_ROLE_ID": edge_role_id_value,
         "JOBS_TABLE": "site-deploy-jobs",
@@ -309,22 +325,12 @@ def lambda_environment(edge_role_id_value: str = "") -> dict:
         "BASE_DOMAIN": _base_domain(),
         "CONSOLE_HOST": console_host(),
         "UNDEPLOY_FN": "site-deployer-undeploy",
-        # 3c-1A：console family 的 kid 清单（只有参数名）与 legacy 入口开关，
-        # 全部来自 [SessionKeys]（唯一真源；role 的精确 ARN 清单也从它推导）
+        # 3c-final：console family 的 kid 引用（kid / alg / role / key_arn / spki_sha256），
+        # 全部来自 [SessionKeys]（唯一真源；role 的精确 key ARN 清单也从它推导）。
+        # **没有密钥材料**：公钥运行时经 kms:GetPublicKey 取、与 spki_sha256 核对后才装进 allowlist。
+        # 漏下发的症状是 console_cookie / verify_console_cookie 抛 → 500（响亮，有意的）。
         "SESSION_KEYS_JSON": env_json(keys, ("console",)),
-        "LEGACY_ENTRY": legacy_entry(keys),
-        # 3c-1B：面板会话的签发形态开关（spec §11.8.3），与 auth 同一个配置真源
-        # （[SessionKeys] signer）。runbook 里 panel **先**切、auth 后切：面板会话只有
-        # panel 自己验、TTL 4 h，是爆炸半径最小的先行指标。漏下发的症状是 console_cookie
-        # 抛 → /api/session-callback 500（响亮，有意的）。
-        "SESSION_SIGNER": keys.signer,
     }
-    # 3c-1B/L3：`legacy_param` 为空即 legacy 入口关闭，整个键**不下发**（不是下发空串）。
-    # 理由与 auth 那边同一条：`console_session._secret()` 直接 `os.environ["JWT_SECRET_PARAM"]`，
-    # 空串会让它去读一个空参数名；键不在时那条路径根本不会被调用
-    # （verifier_env.legacy_secret 在 off 下返回 None）。
-    if keys.legacy_param:
-        env["JWT_SECRET_PARAM"] = keys.legacy_param
     return env
 
 
@@ -347,7 +353,16 @@ def console_route_item(function_url: str) -> dict:
 
 
 def _build_zip() -> bytes:
-    """把 panel 模块 + 复制来的依赖打成 zip（内存里，不落盘残留）。"""
+    """把交叉装的第三方依赖 + panel 模块 + 复制来的本地模块打成 zip（内存里，不落盘残留）。
+
+    pip 的开关与 `deploy_auth.build_zip` **逐字相同**（`auth/tests/test_requirements_locked.py`
+    截获真实 argv 比对两侧）：
+      · `--require-hashes` —— 清单里有 hash 但装的时候不校验等于什么都没做。全量语义：任何一个
+        包（含传递依赖）缺 hash 或对不上即整条 install 失败，而不是静默装一个被替换过的包；
+      · `--platform manylinux2014_x86_64` / `--only-binary :all:` / `--python-version 3.13`
+        —— Lambda 是 x86_64 + Python 3.13。拿宿主 wheel 装出来的 cryptography 在运行时
+        import 失败（deployer 的 bundling 被这一类咬过：Apple Silicon 上装出 aarch64 psycopg）。
+    """
     fn_dir = HERE.parent / "deployer" / "functions"
     auth_dir = HERE.parent / "auth"
     staged = []
@@ -360,15 +375,24 @@ def _build_zip() -> bytes:
         dst = HERE / name
         shutil.copyfile(src, dst)
         staged.append(dst)
+    td = tempfile.mkdtemp()
     try:
+        subprocess.run(["python3", "-m", "pip", "install", "--require-hashes",
+                        "-r", str(REQUIREMENTS), "-t", td, "-q",
+                        "--platform", "manylinux2014_x86_64", "--only-binary", ":all:",
+                        "--python-version", RUNTIME.replace("python", "")], check=True)
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            for p in sorted(Path(td).rglob("*")):
+                if p.is_file():
+                    z.write(p, p.relative_to(td))
             for py in sorted(HERE.glob("*.py")):
                 if py.name == "deploy_panel.py":
                     continue
                 z.write(py, py.name)
         return buf.getvalue()
     finally:
+        shutil.rmtree(td, ignore_errors=True)
         for p in staged:
             p.unlink(missing_ok=True)
 
@@ -400,15 +424,42 @@ def ensure_role() -> str:
     return arn
 
 
+def _kms():
+    return boto3.client("kms", region_name=_region())
+
+
 def required_parameters() -> list:
-    """部署前必须已存在的 SSM 参数：legacy + console family 的 HS 行（panel 不读 site family）。
-    与 role_statements 的精确 ARN 清单同一上游（ssm_parameter_names），两处不会分叉。"""
-    return ssm_parameter_names(load_session_keys(HERE.parent / "config.ini"), ("console",))
+    """**panel 一处 SSM 参数都不读**（3c-final：会话签名 key 在 KMS，login-flow 是 auth 私有的）。
+
+    保留这个函数是因为它是"写前核对"的清单入口，`verify_deployed_components` 与部署顺序
+    用例都按它判；返回空列表就是"这一层没有东西要核对"的显式表达，而不是把调用点删掉——
+    删掉的话，某天有人给 panel 加回一个 SSM 参数时不会有任何地方提醒他补核对。
+    """
+    return []
 
 
 def precheck() -> None:
-    """spec §11.8.12：第一次写之前核对（只读、不解密、不打印值）。缺任一参数即 SystemExit。"""
-    precheck_parameters(required_parameters(), ssm=boto3.client("ssm", region_name=_region()))
+    """spec §11.6 第 1 层：第一次写之前对 console family 的每个 RS kid 做 KMS 四项校验
+    （DescribeKey 形态 + GetPublicKey 公钥侧四项 + 指纹等值）。任一不符即 SystemExit，
+    且函数 / 角色 / resource policy / 路由表零写入。只读，不打印任何密钥材料。"""
+    session_kms.precheck_keys(_kms(), key_refs(load_session_keys(CFG_PATH), ("console",)))
+
+
+def assert_no_fixture_admins(ddb, admins_table: str, admin_seed: str) -> None:
+    """ADR 0002：管理员名单里不许有夹具域邮箱（夹具会话能到 console，但绝不能是 admin）。
+    读 [Platform] admin_seed 与 admins 表（Scan 一张几十行的小表），任一命中即拒绝部署——在任何写之前。"""
+    from permissions import FIXTURE_DOMAIN, is_fixture_email
+    bad = []
+    if is_fixture_email(admin_seed):
+        bad.append(f"[Platform] admin_seed={admin_seed}")
+    paginator = ddb.get_paginator("scan")
+    for page in paginator.paginate(TableName=admins_table, ProjectionExpression="email"):
+        for it in page.get("Items", []):
+            e = it.get("email", {}).get("S", "")
+            if is_fixture_email(e):
+                bad.append(f"admins 表：{e}")
+    if bad:
+        raise SystemExit(f"管理员名单不许含夹具域 @{FIXTURE_DOMAIN}（ADR 0002），拒绝部署（任何写都未发生）：{bad}")
 
 
 def ensure_function(role_arn: str, code: bytes, edge_role_id_value: str) -> str:
@@ -528,8 +579,15 @@ def main() -> int:
     ap.add_argument("--skip-frontend", action="store_true")
     args = ap.parse_args()
 
-    print("⓪ 部署前核对：本函数要读的 SSM 参数都在（缺参 = 运行时全部 500 而脚本 exit 0）")
+    print("⓪ 部署前核对：console family 的每把 KMS key 都存在且是配置声明的那一把"
+          "（不符 = 运行时全部 500 而脚本 exit 0）")
     precheck()
+
+    # ADR 0002：夹具域邮箱永不做管理员。放在 precheck 之后、**任何写之前**——排在写之后
+    # 就已经晚了（那次部署已经把新代码推上去）。名单被手工污染过时这里停下来。
+    print("⓪b 管理员名单核对：不许含夹具域邮箱")
+    assert_no_fixture_admins(boto3.client("dynamodb", region_name=_region()),
+                             "site-admins", _cfg("Platform", "admin_seed", ""))
 
     print("① 校验 Function URL 授权配置（缺 edge_role_arn 即中止）")
     edge_arn = _cfg("Deployer", "edge_role_arn", "")

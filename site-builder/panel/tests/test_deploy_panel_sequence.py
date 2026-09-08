@@ -1,4 +1,14 @@
-"""deploy_panel 的部署顺序合同（3c-1B ticket 02；spec §11.8.3、§11.8.12）——与 auth 那份同一对纪律。"""
+"""deploy_panel 的部署顺序合同（spec §11.6 第 1 层、§11.8.3）——与 auth 那份同一对纪律。
+
+三条不变量：
+① **第一次写之前**核对：`[SessionKeys]` 里 console family 的每个 RS kid 的 KMS 四项校验必须通过
+   （3c-final 起 panel 一处 SSM 参数都不读）；不符即拒绝部署，且函数 / 角色 / 路由表零写入；
+② 更新 Lambda 时**先** update_function_configuration **再** update_function_code；
+③ `main()` 里 `precheck()` 排在每个写助手之前（结构守卫，按 AST 判调用顺序）。
+
+`[SessionKeys]` 从 `rs_config` 夹具那份临时 config 读，不读真 config.ini——理由见 conftest 里
+`RS_SESSION_KEYS` 上面那段。
+"""
 import ast
 import re
 import sys
@@ -7,29 +17,26 @@ from pathlib import Path
 import pytest
 
 import deploy_panel as dp
+import upgrade_code_vectors as v
+
+
+@pytest.fixture(autouse=True)
+def _use_rs_config(rs_config):
+    """本文件每条用例都按 RS 形态的临时 config 判（实现在 conftest.rs_config）。"""
+    return rs_config
 
 
 class _NotFound(Exception):
     pass
 
 
-class FakeSSM:
-    def __init__(self, present):
-        self.present = set(present)
-        self.calls = []
-        self.exceptions = type("E", (), {"ParameterNotFound": _NotFound})
-
-    def get_parameter(self, **kw):
-        self.calls.append(("get_parameter", kw))
-        if kw["Name"] not in self.present:
-            raise _NotFound(kw["Name"])
-        return {"Parameter": {"Value": "v"}}
-
-
 class Recorder:
-    def __init__(self, missing_function=False):
+    def __init__(self, missing_function=False, scan_pages=None):
         self.calls = []
         self.missing_function = missing_function
+        # `get_paginator("scan")` 的返回：assert_no_fixture_admins 用它扫 admins 表。
+        # 默认一页空——"名单干净"是绝大多数用例要的形态。
+        self.scan_pages = scan_pages if scan_pages is not None else [{"Items": []}]
         self.exceptions = type("E", (), {"ResourceNotFoundException": _NotFound,
                                           "ResourceConflictException": type("C", (Exception,), {}),
                                           "InvalidParameterValueException": type("I", (Exception,), {}),
@@ -42,30 +49,19 @@ class Recorder:
                 raise _NotFound()
             if name == "get_waiter":
                 return type("W", (), {"wait": lambda s, **k: self.calls.append("wait")})()
+            if name == "get_paginator":
+                pages = self.scan_pages
+                return type("P", (), {"paginate": lambda s, **k: iter(pages)})()
             return {"FunctionUrl": "https://x.lambda-url.example/", "Role": {"Arn": "arn:x", "RoleId": "AROA-TEST-ROLE-ID"}}
         return call
 
 
-def _live_keys():
-    """线上 `config.ini` 的 `[SessionKeys]`，按加载器解析。
-
-    别把配置的**当前值**写死：演练每一步都在改它（⑤ 清空 legacy、⑦ 换 console current 到 v2、
-    ⑩ 删 v1 两节），写死会让这些用例在部署之后成片假红，而它们要守的性质一条都没变。
-    """
-    sys.path.insert(0, str(Path(dp.__file__).parents[1] / "auth"))
-    from session_keys import load_session_keys
-    return load_session_keys(Path(dp.__file__).parents[1] / "config.ini")
-
-
-def test_required_parameters_are_legacy_plus_console_family_only():
-    keys = _live_keys()
-    names = dp.required_parameters()
-    # legacy **iff 配置里非空**：L3 之后它不该在清单里（那时它已被清空）
-    assert ("/site-builder/jwt-secret" in names) == bool(keys.legacy_param), \
-        f"legacy 该出现 iff legacy_param 非空；legacy_param={keys.legacy_param!r} names={names}"
-    console_current = keys.families["console"]["current"].ssm_param
-    assert any(n.endswith(console_current) for n in names), (console_current, names)
-    assert not any("/session-keys/site-" in n for n in names), "panel 不得读 site family 的密钥"
+def test_panel_reads_no_ssm_parameter_at_all():
+    """3c-final：会话签名 key 在 KMS，login-flow 是 auth 私有的 ⇒ panel 的写前核对清单是空的。"""
+    assert dp.required_parameters() == []
+    src = Path(dp.__file__).read_text()
+    assert "get_parameter" not in src and "precheck_parameters" not in src, \
+        "panel 又开始读 SSM 参数了（会话密钥在 KMS）"
 
 
 def test_ensure_function_updates_configuration_before_code(monkeypatch):
@@ -81,23 +77,38 @@ def test_ensure_function_updates_configuration_before_code(monkeypatch):
                     "update_function_code", "get_waiter", "wait"], lam.calls
 
 
-def test_main_aborts_before_any_write_when_a_parameter_is_missing(monkeypatch):
-    # 缺的那个是 console family 的 current（名字从加载器取：⑦ 之后它是 v2）
-    console_current = _live_keys().families["console"]["current"].ssm_param
-    present = set(dp.required_parameters()) - {console_current}
-    ssm = FakeSSM(present=present)
+def test_main_aborts_before_any_write_when_a_key_is_not_the_configured_one(monkeypatch):
+    """KMS 四项校验不过 ⇒ 写前 SystemExit：角色、Lambda、路由表、打包全部零动作。"""
+    kms = v.FakeKms()
+    kms.tamper_public_key_for[v.KEY_ARN[v.CONSOLE_KID]] = v.SITE_KEY
     iam, lam = Recorder(), Recorder()
-    made = []
 
     def client(service, *a, **k):
-        made.append(service)
-        return {"ssm": ssm, "iam": iam, "lambda": lam}[service]
+        return {"kms": kms, "iam": iam, "lambda": lam}[service]
 
     monkeypatch.setattr(dp.boto3, "client", client)
     monkeypatch.setattr(dp.boto3, "resource", lambda *a, **k: (_ for _ in ()).throw(AssertionError("不该碰路由表")))
     monkeypatch.setattr(dp, "_build_zip", lambda: (_ for _ in ()).throw(AssertionError("不该打包")))
     monkeypatch.setattr(sys, "argv", ["deploy_panel.py", "--skip-frontend"])
-    with pytest.raises(SystemExit, match=re.escape(console_current)):
+    with pytest.raises(SystemExit, match=re.escape(v.CONSOLE_KID)):
+        dp.main()
+    assert iam.calls == [] and lam.calls == []
+
+
+def test_main_aborts_before_any_write_when_the_admin_list_carries_a_fixture_email(monkeypatch):
+    """ADR 0002：夹具域管理员 ⇒ 写前 SystemExit（precheck 已过，但仍在第一个写之前）。"""
+    kms = v.FakeKms()
+    iam, lam = Recorder(), Recorder()
+    ddb = Recorder(scan_pages=[{"Items": [{"email": {"S": "x@e2e.invalid"}}]}])
+
+    def client(service, *a, **k):
+        return {"kms": kms, "iam": iam, "lambda": lam, "dynamodb": ddb}[service]
+
+    monkeypatch.setattr(dp.boto3, "client", client)
+    monkeypatch.setattr(dp.boto3, "resource", lambda *a, **k: (_ for _ in ()).throw(AssertionError("不该碰路由表")))
+    monkeypatch.setattr(dp, "_build_zip", lambda: (_ for _ in ()).throw(AssertionError("不该打包")))
+    monkeypatch.setattr(sys, "argv", ["deploy_panel.py", "--skip-frontend"])
+    with pytest.raises(SystemExit, match="e2e.invalid"):
         dp.main()
     assert iam.calls == [] and lam.calls == []
 
@@ -108,7 +119,7 @@ def test_main_source_calls_precheck_before_every_write_helper():
     order = sorted((node.lineno, node.func.id) for node in ast.walk(main_fn)
                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name))
     names = [n for _, n in order]
-    assert "precheck" in names
+    assert "precheck" in names and "assert_no_fixture_admins" in names, names
     first_write = min(names.index(n) for n in ("ensure_role", "ensure_function", "_build_zip", "upload_frontend",
                                               "register_route") if n in names)
-    assert names.index("precheck") < first_write, names
+    assert names.index("precheck") < names.index("assert_no_fixture_admins") < first_write, names

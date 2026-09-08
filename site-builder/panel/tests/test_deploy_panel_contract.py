@@ -1,19 +1,36 @@
-"""deploy_panel.py 的部署契约——不实际部署，断言它会构造出什么。"""
+"""deploy_panel.py 的部署契约——不实际部署，断言它会构造出什么。
+
+**`[SessionKeys]` 一律从 `rs_config` 夹具那份临时 config 读，不读真 config.ini**（理由见
+conftest 里 `RS_SESSION_KEYS` 上面那段）。`_cfg`（region / account / routing_table 等非密钥项）
+仍走模块级那份真 config——那些值本文件不逐字断言。
+"""
 import ast
 import json
 import sys
 import re
 from pathlib import Path
 
-import types
-
+import boto3
 import pytest
 from unittest.mock import patch
 
 import deploy_panel as dp
+import upgrade_code_vectors as v
 
 PANEL = Path(__file__).parents[1]
 EDGE_ROLE = "arn:aws:iam::000000000000:role/site-edge-role"
+
+@pytest.fixture(autouse=True)
+def _use_rs_config(rs_config):
+    """本文件每条用例都按 RS 形态的临时 config 判（实现在 conftest.rs_config）。"""
+    return rs_config
+
+
+def _live_keys():
+    """夹具那份 config 的 `[SessionKeys]`，**按加载器解析**（别把值写死在断言里）。"""
+    sys.path.insert(0, str(PANEL.parent / "auth"))
+    from session_keys import load_session_keys
+    return load_session_keys(dp.CFG_PATH)
 
 
 def _actions(stmt):
@@ -46,16 +63,19 @@ def test_build_copies_session_py_too():
     另写一份）。**位置是 `deployer/functions/` 而不是 `panel/`**，正是为了让
     这条与隔壁的闭包断言能看见它们。
 
-    verifier_env.py（3c-1A）：console_session 顶层 import 它（allowlist 装配 / legacy 开关 /
-    观测日志的唯一实现，auth 拥有）。漏它 = 面板会话全部 500。
+    verifier_env.py（3c-1A）：console_session 顶层 import 它（allowlist 装配 / 观测日志的
+    唯一实现，auth 拥有）。漏它 = 面板会话全部 500。
+
+    session_kms.py（3c-final）：KMS 边界的唯一实现——公钥加载器（验签）与 KmsSigner（签发）
+    都在里面。漏它 = console_session 顶层 import 失败 = 面板会话与升级码全部 500。
 
     这条是**恒定集合**的快照，隔壁那条按传递闭包推导——两条一起才既挡住
     "改了代码忘了改清单"，也挡住"往清单里塞了不存在的文件"（后者会让
     `_build_zip` 在真机上 `sys.exit`，而闭包断言不看这个方向）。
     """
     assert set(dp.COPY_FILES) == {"common.py", "permissions.py", "ops_log.py",
-                                  "session.py", "verifier_env.py", "edge_caller.py",
-                                  "keystore.py", "keygen.py",
+                                  "session.py", "verifier_env.py", "session_kms.py",
+                                  "edge_caller.py", "keystore.py", "keygen.py",
                                   "analytics.py", "access_rollup.py"}
 
 
@@ -149,63 +169,39 @@ def test_missing_or_wildcard_edge_role_aborts_instead_of_widening(bad):
         dp.function_url_statements(bad)
 
 
-def _live_keys():
-    """线上 `config.ini` 的 `[SessionKeys]`，**按加载器解析**。
-
-    2026-09-03 预演踩过：本组用例原先把 config 的**当前值**写死（legacy 非空、console kid 是
-    `console-hs-v1`）。而演练的每一步都在改这份配置——⑤ 清空 `legacy_param`、⑦ 把 console
-    current 换成 `console-hs-v2`、⑩ 删掉 v1 两节——于是它们会在**改完配置、部署之后**才成片转红，
-    而它们要守的性质其实一条都没变。**一律从加载器推导，别写死值。**
-    """
-    sys.path.insert(0, str(PANEL.parent / "auth"))
-    from session_keys import load_session_keys
-    return load_session_keys(PANEL.parent / "config.ini")
-
-
-def _expected_panel_ssm_suffixes():
-    """panel 该读的 SSM 参数 = 非空的 legacy + console family 的 HS 行，**永远没有 site**。"""
-    keys = _live_keys()
-    params = {r.ssm_param for r in keys.allowlist("console") if r.alg == "HS256"}
-    if keys.legacy_param:                     # L3 之后为空：那时它本来就不该在清单里
-        params.add(keys.legacy_param)
-    return {f"parameter{p}" for p in params}
-
-
-def test_panel_role_ssm_resources_are_exact_arns_for_legacy_and_console_family_only():
-    """**不照抄 auth 的前缀**，且 3c-1A 起也**不含 site family**（spec §4.3：panel 只持 console）。
-
-    panel 拿前缀等于被攻破时顺带交出 Cognito client secret 与该前缀下未来的一切秘密；
-    拿到 site 的 key 等于 panel 被攻破 ⇒ 伪造站点会话。
-    """
-    ssm = [s for s in dp.role_statements()
-           if any(a.startswith("ssm:") for a in _actions(s))]
-    assert ssm, "panel role 缺 SSM 读取权限"
-    got = set()
-    for s in ssm:
-        for res in _resources(s):
-            assert not res.endswith("*"), "出现通配前缀——会顺带拿到别的秘密"
-            assert "session-keys/site-" not in res, f"panel 拿到了 site family 的密钥：{res}"
-            got.add(res.split(":", 5)[-1])
-    assert got == _expected_panel_ssm_suffixes(), got
-
-
 def test_environment_session_keys_json_has_only_the_console_family():
     env = dp.lambda_environment()
     keys = json.loads(env["SESSION_KEYS_JSON"])
     assert set(keys) == {"console"}, "panel 的 SESSION_KEYS_JSON 只能有 console family"
     for row in keys["console"]:
-        assert set(row) == {"kid", "alg", "role", "ssm_param"}, "只下发参数名，不下发值"
+        # 3c-final：只有引用（kid / alg / role / key_arn / spki_sha256），**没有任何密钥材料**
+        assert set(row) == {"kid", "alg", "role", "key_arn", "spki_sha256"}, row
         assert row["kid"].startswith("console-")
-    assert env["LEGACY_ENTRY"] in ("on", "off")
 
 
-def test_kms_decrypt_is_scoped_via_ssm():
-    """kms:Decrypt 必须带 ViaService 条件，否则这个角色能直接拿 key 干别的。"""
-    kms = [s for s in dp.role_statements() if "kms:Decrypt" in _actions(s)]
-    assert kms, "缺 kms:Decrypt——SecureString 读不出来"
-    for s in kms:
-        cond = s.get("Condition", {}).get("StringEquals", {})
-        assert "kms:ViaService" in cond, f"kms:Decrypt 没有 ViaService 限定: {s}"
+# ── 3c-final：panel 的 IAM 面从 SSM 换成 KMS（spec §11.2 / §11.5 / ADR 0001）────────
+#
+# 两条一对：① 一处 SSM / kms:Decrypt 都不许剩（对称密钥"读到就能签"这条路整个删掉）；
+# ② KMS 的两个动作精确到 console family 的 key ARN，且 kms:Sign 带算法与 MessageType 两个条件
+#    ——那两个条件把 §11.5 的合同钉进 IAM，缺了它们这个角色能用同一把 key 签 PSS / DIGEST 形态。
+
+def test_panel_has_no_ssm_statement_at_all():
+    assert not [s for s in dp.role_statements() if any(a.startswith("ssm:") or a == "kms:Decrypt"
+                                                      for a in _actions(s))], \
+        "panel 不再读任何 SSM 参数；会话签名密钥在 KMS"
+
+
+def test_panel_role_signs_and_reads_public_key_for_the_console_key_only():
+    by_sid = {s["Sid"]: s for s in dp.role_statements()}
+    sign, pub = by_sid["SignConsoleTokens"], by_sid["ReadConsolePublicKeys"]
+    assert sign["Action"] == "kms:Sign" and sign["Resource"] == [v.KEY_ARN[v.CONSOLE_KID]]
+    assert sign["Condition"] == {"StringEquals": {"kms:SigningAlgorithm": "RSASSA_PKCS1_V1_5_SHA_256",
+                                                 "kms:MessageType": "RAW"}}
+    assert pub["Action"] == "kms:GetPublicKey" and pub["Resource"] == [v.KEY_ARN[v.CONSOLE_KID]]
+    # 配置里**有** site family 的那把（见 RS_SESSION_KEYS），所以这条不是空转：
+    # 拿到 site 的 key = panel 被攻破时能伪造站点会话（spec §4.3）。
+    assert v.KEY_ARN[v.SITE_KID] not in sign["Resource"] + pub["Resource"]
+    assert not any("site" in r for r in sign["Resource"] + pub["Resource"])
 
 
 def test_panel_role_has_no_putitem_on_sites_or_admins():
@@ -610,22 +606,19 @@ def test_no_wildcard_dynamodb_actions_anywhere():
 
 
 def test_environment_has_no_plaintext_secret():
-    """环境变量只下发**参数名**。
+    """环境变量里没有任何密钥材料。
 
-    GetFunctionConfiguration 会原样回显环境变量，拿到 JWT_SECRET 即可伪造
-    任意用户会话（deploy_auth.py 已记录该原因）。
+    GetFunctionConfiguration 会原样回显环境变量，拿到会话签名密钥即可伪造任意用户会话
+    （docs/security/account-trust-boundary.md 的整条理由）。3c-final 起 panel 的会话签名 key
+    在 KMS 里，环境变量只有 kid / key_arn / spki_sha256 这类**引用**。
     """
     env = dp.lambda_environment()
-    # 3c-1B/L3：`legacy_param` 清空后整个键不下发，所以是**条件**断言——在的时候必须是参数名。
-    # 下面那条"看起来像密钥的键必须以 _PARAM 结尾"是无条件的，两种状态都覆盖。
-    if "JWT_SECRET_PARAM" in env:
-        assert env["JWT_SECRET_PARAM"].startswith("/"), "应是 SSM 参数名"
-    for k, v in env.items():
+    for k, val in env.items():
         assert "SECRET" not in k or k.endswith("_PARAM"), (
             f"环境变量 {k} 看起来在下发明文密钥")
     src = (PANEL / "deploy_panel.py").read_text()
-    assert "get_parameter" not in src or "WithDecryption" not in src, (
-        "部署脚本不该读出明文密钥再塞进环境变量")
+    # panel 不再读任何 SSM 参数——不是"读了但不解密"，是一处都不读
+    assert "get_parameter" not in src, "panel 又开始读 SSM 参数了（会话密钥在 KMS）"
 
 
 # ── 环境变量扫描跟随"真正进包的那批文件"（2026-08-12 加宽，故意的）────────
@@ -771,25 +764,22 @@ def test_shipped_env_scan_is_not_vacuous():
         "可达性闭包没走进复制模块的私有函数——解析口径坏了")
 
 
-def _assert_env_covers_every_read(keys=None, env_override=None):
+def _assert_env_covers_every_read(env_override=None):
     """代码里 os.environ[...] 读到的键必须都在环境变量里下发。
 
     少一个的症状是运行时 KeyError → 500，而单测有 conftest 兜着看不出来。
 
     扫描范围是**整个进包清单**（panel 自己的 `*.py` + COPY_FILES 复制进来的），
     按可达性归属——理由见上面那段注释，别改回只 glob `panel/*.py`。
+
+    3c-final 起**没有任何条件豁免**：旧版本对 `JWT_SECRET_PARAM` 有一条（legacy 关闭时那个读
+    根本不发生），而那条豁免本身就得再配一个正对照才不至于放水。现在那个键连代码里都没有了，
+    豁免与它的正对照一起删掉，只留下面那条"少下发一个必需键必须真的红"的元用例。
     """
     env = set(dp.lambda_environment()) if env_override is None else set(env_override)
     read, _ = _reachable_env_reads()
     # AWS 运行时自带的
     read -= {"AWS_DEFAULT_REGION", "AWS_REGION", "AWS_LAMBDA_FUNCTION_NAME"}
-    # `JWT_SECRET_PARAM` 是**条件必需**：`console_session._secret()` 确实无条件 `os.environ[...]`，
-    # 但它是作为 callable 传进 `verifier_env.legacy_secret(flag, get_legacy)` 的，那里
-    # `return get_legacy() if flag == "on" else None` ⇒ **LEGACY_ENTRY=off 时这个读根本不发生**。
-    # 静态扫描看不见这道守卫，所以 L3（legacy_param 清空）之后本条会假红。下面那条用例是配套的
-    # 正对照：legacy **开着**的时候少下发它必须仍然被抓，否则这里就是把覆盖检查整个放水了。
-    if not (keys or _live_keys()).legacy_param:
-        read -= {"JWT_SECRET_PARAM"}
     missing = read - env
     assert not missing, f"代码会读但部署没下发的环境变量: {sorted(missing)}"
 
@@ -799,25 +789,30 @@ def test_environment_covers_every_env_var_the_code_reads():
     _assert_env_covers_every_read()
 
 
-def test_env_coverage_still_catches_a_missing_var_while_legacy_is_on():
-    """**正对照（变形测试）**：上一条对 `JWT_SECRET_PARAM` 的豁免只在 legacy 关掉时成立。
+def test_environment_key_set_is_exactly_this(monkeypatch):
+    """**精确**键集快照——上面那条只查"读到的都下发了"，多下发一个它看不见。
 
-    legacy 开着时把它从 env 里拿掉，上面那条覆盖用例必须**真的抛**——否则那条豁免就等于把检查放水了。
+    3c-final 删掉的三个（`JWT_SECRET_PARAM` / `LEGACY_ENTRY` / `SESSION_SIGNER`）就靠这条挡回来：
+    多下发一个键不会让任何东西 500，所以只有精确集合能发现"删了代码但 env 里还留着"。
+    """
+    assert set(dp.lambda_environment("AROATEST")) == {
+        "ACCESS_DAILY_TABLE", "ACCESS_EVENTS_TABLE", "ADMINS_TABLE", "API_KEYS_TABLE",
+        "BASE_DOMAIN", "CONSOLE_HOST", "EDGE_ROLE_ID", "JOBS_TABLE", "OPS_LOG_TABLE",
+        "ROUTING_TABLE", "SESSION_CODES_TABLE", "SESSION_KEYS_JSON", "SITES_TABLE",
+        "UNDEPLOY_FN"}
 
-    **实现上必须调用被守护的那个函数本身**（3c-1B ticket 17 第 12 条）：本用例早先自己
-    重算了一遍 `exempt`，而锚点 `legacy_param` 是个非空字面量 ⇒ `exempt` 恒为空集、三元表达式是死代码，
-    于是断言退化成恒真式，在 L2 与 L3 两种状态下都过。把覆盖用例的豁免改成无条件（= 放水），
-    那个版本的"正对照"照样绿。现在改成注入 keys/env 直接驱动它，放水就会让本条红。
+
+def test_env_coverage_still_catches_a_missing_var():
+    """**元用例**：上一条真的会红。
+
+    实现上必须调用被守护的那个函数本身（3c-1B ticket 17 第 12 条）：自己重算一遍判据的
+    "正对照"在判据被放水时照样绿。这里拿掉一个**确实被读**的键，覆盖检查必须指名道姓地抛。
     """
     read, _ = _reachable_env_reads()
-    assert "JWT_SECRET_PARAM" in read, "锚点失效：代码已经不读 JWT_SECRET_PARAM 了"
-    legacy_on = types.SimpleNamespace(legacy_param="/site-builder/jwt-secret")
-    env_without_it = set(dp.lambda_environment()) - {"JWT_SECRET_PARAM"}
-    with pytest.raises(AssertionError, match="JWT_SECRET_PARAM"):
-        _assert_env_covers_every_read(keys=legacy_on, env_override=env_without_it)
-    # 对称：legacy **关**着时同样少下发它，必须**不**红（那正是被豁免的那一支）
-    legacy_off = types.SimpleNamespace(legacy_param="")
-    _assert_env_covers_every_read(keys=legacy_off, env_override=env_without_it)
+    victim = "SESSION_KEYS_JSON"
+    assert victim in read, f"锚点失效：代码已经不读 {victim} 了"
+    with pytest.raises(AssertionError, match=victim):
+        _assert_env_covers_every_read(env_override=set(dp.lambda_environment()) - {victim})
 
 
 def test_console_route_is_split_mode_with_platform_prefix():
@@ -838,19 +833,6 @@ def test_frontend_prefix_is_versioned():
 
 
 # ── EDGE_ROLE_ID 必须下发（Codex 审查 2026-08-10 P1-1）──────────────────
-
-def test_lambda_environment_ships_the_signer_switch_from_config_not_a_literal():
-    """3c-1B：`SESSION_SIGNER` 必须下发，且值来自 [SessionKeys] signer（与 auth 同一真源）。
-
-    漏下发的症状是 `console_cookie` 抛 → `/api/session-callback` 500（响亮，有意的）；
-    写成字面量的症状是"改 config 重部却没变"——而回滚协议整个建立在"改一行配置重部"上，
-    且 panel 是 runbook 里**先切**的那个，分叉在这里会让先行信号是假的。
-    """
-    src = (PANEL / "deploy_panel.py").read_text()
-    env_block = src[src.index("def lambda_environment"):src.index("def console_route_item")]
-    assert '"SESSION_SIGNER": keys.signer' in env_block, "signer 不是从 [SessionKeys] 取的"
-    assert dp.lambda_environment()["SESSION_SIGNER"] in ("legacy", "current")
-
 
 def test_lambda_environment_carries_edge_role_id():
     """handler 靠它确认调用者是 Edge；不下发 = 线上拒绝所有请求。"""
@@ -1040,116 +1022,8 @@ def test_skip_frontend_must_not_move_route_to_an_unuploaded_prefix():
         f"传了 static_prefix 却没生效: {captured.get('static_prefix')}")
 
 
-def test_panel_legacy_param_env_comes_from_session_keys_not_a_literal():
-    """3c-1B/L3：`legacy_param` 非空时下发它、为空时整个键不下发——两种状态都由本条覆盖。"""
-    sys.path.insert(0, str(PANEL.parent / "auth"))
-    from session_keys import load_session_keys
-    keys = load_session_keys(PANEL.parent / "config.ini")
-    env = dp.lambda_environment()
-    if keys.legacy_param:
-        assert env["JWT_SECRET_PARAM"] == keys.legacy_param
-    else:
-        assert "JWT_SECRET_PARAM" not in env, "legacy 入口已关闭却仍下发那个键"
-    src = (PANEL / "deploy_panel.py").read_text()
-    assert '"JWT_SECRET_PARAM": "/site-builder/jwt-secret"' not in src, "legacy 参数名硬编码，与 [SessionKeys] 分叉"
-    assert "def _panel_ssm_parameter_arns" not in src, "ARN 清单应由 session_keys.ssm_parameter_arns 生成"
-
-
-# ── 3c-1B ticket 07：L3（清空 legacy_param）的 panel 侧后果 ─────────────────
-#
-# panel 与 auth 是同一处配置的两个消费方，所以两边的用例形状刻意对称
-# （auth 那组在 auth/tests/test_deploy_auth_sequence.py）。
-
-def _rewrite_key(text: str, key: str, value: str) -> str:
-    """把 `[SessionKeys]` 里某个键改成给定值，**按键名匹配、不按当前值匹配**。
-
-    2026-09-03 实测踩过：原先这里是 `text.replace("signer = legacy", ...)`，锚点是那个键
-    **当前的值**。而 `signer` 的值本来就会在演练过程中被改（1B 的 ③ 就是把它改成 `current`），
-    于是真机演练一开始，用例就以「改 signer 的锚点失效了」整片红——它测的东西没坏，是锚点坏了。
-    另一处（角色清单那条）当时**连守卫都没有**，`replace` 静默变成 no-op ⇒ 用例还在绿，
-    但测的已经不是它想测的那份 config。按键名重写 + 断言恰好替换一次，两个毛病一起去掉。
-    """
-    import re
-    out, n = re.subn(rf"(?m)^{re.escape(key)}\s*=.*$", f"{key} = {value}".rstrip(), text)
-    assert n == 1, f"config.ini 里 `{key}` 期望恰好一行，实际 {n} 行——锚点或配置结构变了"
-    return out
-
-
-def _panel_env_with(monkeypatch, tmp_path, *, signer, legacy):
-    """用一份临时 config 驱动 `lambda_environment()`。
-
-    `deploy_panel` 从 `HERE.parent / "config.ini"` 读，所以造一个临时目录树并把 `HERE` 指过去
-    ——比 patch `load_session_keys` 更接近真实路径（后者会把"从哪个文件读"这件事也 mock 掉）。
-    **以真实 config 为底、只重写这两个键**，所以线上把 signer 切到 current 之后本组用例照样成立。
-    """
-    real = (PANEL.parent / "config.ini").read_text()
-    text = _rewrite_key(_rewrite_key(real, "signer", signer), "legacy_param", legacy)
-    (tmp_path / "config.ini").write_text(text)
-    panel_dir = tmp_path / "panel"
-    panel_dir.mkdir()
-    monkeypatch.setattr(dp, "HERE", panel_dir)
-    return dp.lambda_environment("AROATEST")
-
-
-def test_the_config_rewriter_is_value_independent_and_loud():
-    """**元用例**：本组用例的前提就是"重写与 signer 当前值无关"。
-
-    正向：无论底稿写的是 legacy 还是 current，都能改成目标值；
-    负向：键不存在时必须响亮失败（而不是静默 no-op——那正是旧写法的第二个毛病）。
-    """
-    for cur in ("legacy", "current"):
-        base = f"[SessionKeys]\nsigner = {cur}\nlegacy_param = /site-builder/jwt-secret\n"
-        assert "signer = current" in _rewrite_key(base, "signer", "current")
-        assert "signer = legacy" in _rewrite_key(base, "signer", "legacy")
-        assert "legacy_param =\n" in _rewrite_key(base, "legacy_param", "")
-    with pytest.raises(AssertionError):
-        _rewrite_key("[SessionKeys]\nsomething = else\n", "signer", "current")
-
-
-def test_l3_panel_env_drops_the_jwt_secret_param_key_entirely(monkeypatch, tmp_path):
-    env = _panel_env_with(monkeypatch, tmp_path, signer="current", legacy="")
-    assert "JWT_SECRET_PARAM" not in env
-    assert env["LEGACY_ENTRY"] == "off"
-    assert env["SESSION_SIGNER"] == "current"
-    # console family 的清单不受影响（**取加载器给的 current kid**，别写死 v1——⑦ 之后它是 v2）
-    assert _live_keys().families["console"]["current"].kid in env["SESSION_KEYS_JSON"]
-
-
-def test_before_l3_panel_env_still_ships_it(monkeypatch, tmp_path):
-    env = _panel_env_with(monkeypatch, tmp_path, signer="legacy", legacy="/site-builder/jwt-secret")
-    assert env["JWT_SECRET_PARAM"] == "/site-builder/jwt-secret"
-    assert env["LEGACY_ENTRY"] == "on"
-
-
-def test_l3_panel_role_ssm_list_no_longer_carries_the_legacy_arn(monkeypatch, tmp_path):
-    """角色清单与 env 是同一处配置推导出来的两个产物，必须一起收敛。"""
-    real = (PANEL.parent / "config.ini").read_text()
-    (tmp_path / "config.ini").write_text(
-        _rewrite_key(_rewrite_key(real, "signer", "current"), "legacy_param", ""))
-    panel_dir = tmp_path / "panel"
-    panel_dir.mkdir()
-    monkeypatch.setattr(dp, "HERE", panel_dir)
-    ssm = [r for st in dp.role_statements() if any(a.startswith("ssm:") for a in _actions(st))
-           for r in _resources(st)]
-    assert ssm, "panel role 缺 SSM 读取权限"
-    assert not any(r.endswith("parameter/site-builder/jwt-secret") for r in ssm), ssm
-    assert not any(r.endswith(":parameter") or r.endswith(":parameter/") for r in ssm), \
-        "空参数名拼出了一个畸形 ARN"
-    console_current = _live_keys().families["console"]["current"].ssm_param
-    assert any(r.endswith(console_current) for r in ssm), "console family 的 key 不该被一起收掉"
-
-
-# ── 3c-1B：login-flow secret 是 auth 私有的，panel 永不持有（spec §11.3）──────
-#
-# 这是一条**负向**不变量，形态与"panel 不得持 site family 的密钥"完全相同：panel 是公网可达
-# 组件，多给它一把密钥就多一处被攻破时能拿到的东西。login-flow 只值一个登录 CSRF，但 panel
-# 压根不参与登录流程——它连"需要"这一条理由都没有。默认关（ssm_parameter_names 的 login_flow
-# 默认 False）意味着漏改这里不会静默扩权，但仍要把它钉死，免得有人"顺手补齐"。
-
 def _login_flow_param():
-    sys.path.insert(0, str(PANEL.parent / "auth"))
-    from session_keys import load_session_keys
-    return load_session_keys(PANEL.parent / "config.ini").login_flow_secret_param
+    return _live_keys().login_flow_secret_param
 
 
 def test_panel_environment_has_no_login_flow_secret_param():
@@ -1166,10 +1040,108 @@ def test_panel_role_cannot_read_the_login_flow_secret():
             assert param not in res, f"panel role 能读 login-flow secret：{res}"
 
 
-def test_panel_deploy_script_does_not_pass_login_flow_to_the_ssm_helper():
-    """结构守卫：`login_flow=True` 只许出现在 deploy_auth 里。"""
-    src = (PANEL / "deploy_panel.py").read_text()
-    assert "login_flow" not in src, "deploy_panel 引用了 login_flow 开关"
+# ── 3c-final：panel 产物交叉装 cryptography（ADR 0003 / plan D4）────────────────────
+#
+# panel 是升级码与面板会话的 verifier，RS256 验签必须在本地做（每请求 kms:Verify 的代价见 D4），
+# 所以 zip 里要有 cryptography。三包的版本与 hash **与 auth 清单逐字节相同**——两份分叉的症状是
+# "auth 签出来的 token panel 验不过"，而那要等真机才看得见。
+
+def test_copy_files_include_the_kms_module_and_the_zip_vendors_cryptography():
+    """`_build_zip` 里那条 pip install 的开关——**按 AST 判 argv，不按源码文本**。
+
+    源码文本 substring 是个假守卫：那段源码含注释，我为解释这几个开关写的注释自己就能满足断言
+    （auth 那份清单守卫记着这次实测：把 `"--require-hashes",` 从 argv 里整条删掉，四条测试照样
+    全绿）。这里解析 `subprocess.run(...)` 第一个实参里的字符串字面量——注释进不了 AST。
+    `--python-version` 的值由 `RUNTIME` 推导（不是字面量），所以那一项断言落在 `dp.RUNTIME` 上；
+    真正"开关到达 pip"的判据在 `auth/tests/test_requirements_locked.py::
+    test_deploy_panel_installs_with_require_hashes`（截获真实 argv）。
+    """
+    assert "session_kms.py" in dp.COPY_FILES
+    tree = ast.parse((PANEL / "deploy_panel.py").read_text())
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_build_zip")
+    runs = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute) and n.func.attr == "run"]
+    assert len(runs) == 1, f"_build_zip 里应恰好一条 subprocess.run，实际 {len(runs)}"
+    argv = runs[0].args[0]
+    literals = [e.value for e in argv.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+    for flag in ("--require-hashes", "--platform", "manylinux2014_x86_64", "--only-binary", ":all:",
+                 "--python-version", "-r", "-t"):
+        assert flag in literals, (flag, literals)
+    assert dp.RUNTIME == "python3.13", dp.RUNTIME
+    # 清单路径是 REQUIREMENTS（真源常量），且它就是 panel 自己那份
+    assert any(isinstance(e, ast.Call) and isinstance(e.func, ast.Name) and e.func.id == "str"
+               and isinstance(e.args[0], ast.Name) and e.args[0].id == "REQUIREMENTS"
+               for e in argv.elts), "pip 的清单不是 REQUIREMENTS 常量"
+    assert dp.REQUIREMENTS == PANEL / "requirements.txt" and dp.REQUIREMENTS.exists()
+
+
+def test_panel_requirements_pin_the_same_cryptography_closure_as_auth():
+    def pins(p):
+        return dict(re.findall(r"^([a-zA-Z0-9_-]+)==([^ \\]+)", p.read_text(), re.M))
+    panel, auth = pins(PANEL / "requirements.txt"), pins(PANEL.parent / "auth" / "requirements.txt")
+    assert set(panel) == {"cffi", "cryptography", "pycparser"}
+    assert all(auth[k] == vv for k, vv in panel.items()), (panel, {k: auth.get(k) for k in panel})
+
+
+def test_panel_requirements_hashes_are_byte_identical_to_the_auth_lockfile():
+    """版本相同还不够——**hash 集合**才是"装出来的是同一个 wheel"的判据。
+
+    只比 `==` 版本时，panel 清单里少列一个平台的 hash 就会在 pip 的 tag 优先级随版本变化那天
+    构建失败（auth 清单头部记着这个坑），而"两份一致"这条断言照样绿。
+    """
+    def blocks(p):
+        out, cur = {}, None
+        for line in p.read_text().splitlines():
+            m = re.match(r"^([a-zA-Z0-9_-]+)==", line)
+            if m:
+                cur = m.group(1)
+                out[cur] = []
+            elif cur and line.strip().startswith("--hash="):
+                out[cur].append(line.strip().rstrip(" \\"))
+        return out
+    panel, auth = blocks(PANEL / "requirements.txt"), blocks(PANEL.parent / "auth" / "requirements.txt")
+    assert set(panel) == {"cffi", "cryptography", "pycparser"}
+    for name, hashes in panel.items():
+        assert hashes, f"{name} 一条 hash 都没有"
+        assert hashes == auth[name], f"{name} 的 hash 集合与 auth 清单不同"
+
+
+def test_required_parameters_is_empty_and_precheck_hits_kms(monkeypatch):
+    """3c-final：panel 不读 SSM ⇒ 写前核对的对象只剩 KMS 那四项（session_kms.precheck_keys）。"""
+    assert dp.required_parameters() == []
+    kms = v.FakeKms()
+    monkeypatch.setattr(dp, "_kms", lambda: kms)
+    dp.precheck()
+    assert {c[1] for c in kms.calls if c[0] == "describe_key"} == {v.KEY_ARN[v.CONSOLE_KID]}
+
+
+def test_precheck_refuses_a_key_whose_fingerprint_is_not_the_configured_one(monkeypatch):
+    """负对照：指纹不符必须 SystemExit（写前拒绝），不是"记个日志继续部"。"""
+    kms = v.FakeKms()
+    kms.tamper_public_key_for[v.KEY_ARN[v.CONSOLE_KID]] = v.SITE_KEY
+    monkeypatch.setattr(dp, "_kms", lambda: kms)
+    with pytest.raises(SystemExit, match=v.CONSOLE_KID):
+        dp.precheck()
+
+
+# ── ADR 0002：管理员名单里不许有夹具域邮箱 ─────────────────────────────────
+#
+# 夹具会话能到 console（Edge 放行平台路由），所以"夹具身份永不是管理员"这条必须由**数据层**保证。
+# permissions.add_admin 已经拒（Task 9），本条是部署期的第二道：existing 名单被手工污染过时，
+# 下一次部署就停下来——**在任何写之前**。
+
+def test_deploy_refuses_a_fixture_domain_admin_seed_or_admin_row(aws, monkeypatch):
+    ddb = boto3.client("dynamodb", region_name="us-east-1")
+    dp.assert_no_fixture_admins(ddb, "site-admins", "ops@example.test")        # 干净：不抛
+    with pytest.raises(SystemExit, match="e2e.invalid"):
+        dp.assert_no_fixture_admins(ddb, "site-admins", "probe@e2e.invalid")
+    ddb.put_item(TableName="site-admins", Item={"email": {"S": "x@e2e.invalid"}})
+    with pytest.raises(SystemExit, match="e2e.invalid"):
+        dp.assert_no_fixture_admins(ddb, "site-admins", "ops@example.test")
+
+
+# `main()` 里的调用顺序（precheck → assert_no_fixture_admins → 第一个写助手）由
+# `test_deploy_panel_sequence.py::test_main_source_calls_precheck_before_every_write_helper` 守。
 
 
 # ---- M07：Function URL 的 resource policy 走共享的等值收敛 -------------------------------------------

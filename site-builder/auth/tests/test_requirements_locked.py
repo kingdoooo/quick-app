@@ -21,6 +21,12 @@ DEPLOY_AUTH = AUTH_DIR / "deploy_auth.py"
 INFRA_DIR = Path(__file__).parents[2] / "deployer" / "infra"
 BUNDLING_REQ = INFRA_DIR / "bundling-requirements.txt"
 APP_PY = INFRA_DIR / "app.py"
+# 3c-final：panel 产物也交叉装 cryptography（本地验 RS256），所以同一对守卫扩到它。
+# 本文件住在 auth 而管着 panel 的清单，是因为两份 requirements 的 hash 必须逐字节相同
+# （panel/requirements.txt 是从 auth 那份抄的三段）——两条断言在同一个文件里才不会各自漂。
+PANEL_DIR = Path(__file__).parents[2] / "panel"
+PANEL_REQ = PANEL_DIR / "requirements.txt"
+DEPLOY_PANEL = PANEL_DIR / "deploy_panel.py"
 
 
 def _str_consts(node: ast.AST) -> list[str]:
@@ -104,6 +110,13 @@ def test_auth_every_package_is_pinned_and_hashed():
     assert {"pyjwt", "cryptography"} <= names, f"缺直接/传递依赖：{names}"
 
 
+def test_panel_every_package_is_pinned_and_hashed():
+    names = _assert_all_pinned_and_hashed(PANEL_REQ)      # 与 auth 那条同一个助手
+    # cryptography 是 panel 唯一真正需要的那个（session.py 的 RS256 验签）；
+    # cffi / pycparser 是它的传递闭包——列全三个是为了确认清单覆盖闭包而不只是顶层那一行。
+    assert names == {"cffi", "cryptography", "pycparser"}, f"panel 清单的包集合变了：{names}"
+
+
 def test_bundling_every_package_is_pinned_and_hashed():
     names = _assert_all_pinned_and_hashed(BUNDLING_REQ)
     # 两个都得在：bundling 那条 pip install 装的就是这两个顶层包，
@@ -137,6 +150,81 @@ def test_deploy_auth_installs_with_require_hashes():
     # 开关要作用在**这一次** `-r <清单>` 安装上，不是漂在别处
     assert argv.index("--require-hashes") < argv.index("-r"), f"开关位置不对：{argv}"
     assert argv[argv.index("-r") + 1].endswith("requirements.txt"), argv
+
+
+def _load_by_path(name: str, path: Path):
+    """按路径加载一个部署脚本（`_load_deploy_module` 在 scripts/verify_deployed_components.py 的同一写法）。
+
+    不走 `import deploy_panel`：那要求 `panel/` 在 sys.path 上，而本套件的 sys.path 是 auth 的。
+    模块级只有 `configparser.read()` 这类副作用（不发 AWS 调用），且它自己会把要用的目录
+    insert 进 sys.path。
+    """
+    import importlib.util
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_deploy_panel_installs_with_require_hashes():
+    """与上一条同一套截获真实 pip argv 的做法，对象换成 `deploy_panel._build_zip`。
+
+    panel 的 zip 里要有 cryptography（本地验 RS256）。装的时候不带 `--require-hashes`，
+    清单里那 148 行 hash 就一行都没被校验——而部署照样成功，产物却没有任何来源保证。
+    交叉装的三个开关也一起钉住：Lambda 是 x86_64 / Python 3.13，用宿主 wheel 装出来的
+    cryptography 在运行时 import 失败（deployer 的 bundling 已被这一类咬过）。
+    """
+    dp = _load_by_path("deploy_panel", DEPLOY_PANEL)
+
+    captured = []
+
+    def fake_run(argv, *a, **kw):
+        captured.append(argv)
+        return subprocess.CompletedProcess(argv, 0)
+
+    with patch.object(dp.subprocess, "run", fake_run):
+        dp._build_zip()
+    assert len(captured) == 1, f"_build_zip 应当只调一次 pip，实际 {len(captured)} 次"
+    argv = captured[0]
+    assert "--require-hashes" in argv, (
+        f"--require-hashes 不在真正传给 pip 的参数里 = 清单有 hash 也白搭：{argv}")
+    assert argv.index("--require-hashes") < argv.index("-r"), f"开关位置不对：{argv}"
+    assert argv[argv.index("-r") + 1] == str(dp.REQUIREMENTS), argv
+    assert argv[argv.index("-r") + 1].endswith("requirements.txt"), argv
+    # 交叉装的三个开关：与 deploy_auth.build_zip 逐字相同（两处分叉 = 两个产物的 ABI 不同）
+    assert argv[argv.index("--platform") + 1] == "manylinux2014_x86_64", argv
+    assert argv[argv.index("--only-binary") + 1] == ":all:", argv
+    assert argv[argv.index("--python-version") + 1] == "3.13", argv
+
+
+def test_both_lambda_packages_cross_install_with_the_same_flags():
+    """auth 与 panel 的交叉装开关必须逐字相同——分叉的症状是一侧的 cryptography 在 Lambda 里 import 失败。
+
+    比的是**真正传给 pip 的 argv**（去掉各自的 `-t <tmpdir>` 与清单路径），不是源码文本：
+    两处各自写一份注释解释开关，文本比对会被注释满足。
+    """
+    import deploy_auth
+    dp = _load_by_path("deploy_panel", DEPLOY_PANEL)
+
+    def argv_of(mod, build):
+        got = []
+        with patch.object(mod.subprocess, "run", lambda a, *x, **k: got.append(a)
+                          or subprocess.CompletedProcess(a, 0)):
+            build()
+        return got[0]
+
+    def normalize(argv):
+        out = list(argv)
+        for flag in ("-t", "-r"):
+            i = out.index(flag)
+            del out[i:i + 2]
+        return out
+
+    assert normalize(argv_of(deploy_auth, deploy_auth.build_zip)) \
+        == normalize(argv_of(dp, dp._build_zip))
 
 
 # 模块级出现这些方法调用即等于 import 时读配置 / 建 AWS client。

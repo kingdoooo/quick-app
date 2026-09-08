@@ -2,13 +2,15 @@
 
 **本模块不实现 code 的编解码**——单一实现在 auth/session.py，deploy_panel.py
 打包时复制过来（同 common.py / permissions.py 模式）。这里只做三件事：
-① 用 verify_upgrade_code 验签后**原子消费 jti**（条件写 session-codes）；
-② 构造/校验 __Host-sb_console（TTL 4h；线格式由 SESSION_SIGNER 决定，见 console_cookie）；
+① 验升级码（RS256）后**原子消费 jti**（条件写 session-codes）；
+② 构造/校验 __Host-sb_console（TTL 4h；线格式见 console_cookie）；
 ③ CSRF 校验，且必须**前置于**一切业务副作用（spec §5.4，顺序在 handler.py）。
 
-密钥：环境变量只有参数名 JWT_SECRET_PARAM，运行时从 SSM SecureString 读 +
-TTL 缓存（照抄 auth 的 _secret 模式）。**明文严禁进环境变量**——
-GetFunctionConfiguration 会原样回显，拿到 JWT_SECRET 即可伪造任意用户会话。
+密钥：会话签名 key 在 KMS（非对称 CMK，spec §11.2 / ADR 0001）；环境变量只有
+kid / key_arn / spki_sha256，公钥运行时取、指纹核对后才用（session_kms.public_key_loader）。
+签发经 `session_kms.KmsSigner`——私钥永不离开 KMS，所以"账号内任何只读身份读到密钥即可
+伪造任意用户会话"这条路不存在了（docs/security/account-trust-boundary.md 是那条路的原文）。
+**panel 只碰 console family**（spec §4.3）：拿到 site 的 key 等于 panel 被攻破时能伪造站点会话。
 """
 import os
 import time
@@ -17,18 +19,19 @@ from datetime import datetime, timezone
 import boto3
 
 import session
+import session_kms
 import verifier_env
 
 CONSOLE_COOKIE = "__Host-sb_console"
-CONSOLE_SCOPE = "console"
 CONSOLE_TTL_SECONDS = 4 * 3600
 # 消费标记留存时长：code 本身 60 秒过期，但标记要留得久一点才能挡住
 # "过期后重放"的探测，也便于排查。TTL 到点由 DynamoDB 自动清。
 CONSUMED_TTL_SECONDS = 3600
-SECRET_TTL_SECONDS = 300
 WRITE_METHODS = ("PUT", "POST", "DELETE")
 
-_secret_cache: dict[str, tuple[str, float]] = {}
+_kms_client = None
+_public_key = None        # session_kms.public_key_loader(_kms())（容器复用：每把公钥只取一次）
+_SIGNER = None            # console current 的 KmsSigner（容器复用：自检只做一次）
 
 
 class UpgradeRejected(Exception):
@@ -39,61 +42,53 @@ class CsrfRejected(Exception):
     """前置校验未过。handler 转 403，且**此时尚未发生任何副作用**。"""
 
 
-def _secret_by_param(name: str) -> str:
-    """按 SSM 参数名读密钥，带 TTL 缓存。
-
-    TTL 不可省：无 TTL 时轮转密钥后 warm 容器会永久用旧值，表现为
-    "部分请求验签失败"这种极难查的间歇故障（auth 的既有教训）。
-    """
-    hit = _secret_cache.get(name)
-    if hit is not None and time.monotonic() - hit[1] < SECRET_TTL_SECONDS:
-        return hit[0]
-    value = boto3.client("ssm", region_name=os.environ.get(
-        "AWS_DEFAULT_REGION", "us-east-1")).get_parameter(
-            Name=name, WithDecryption=True)["Parameter"]["Value"]
-    _secret_cache[name] = (value, time.monotonic())
-    return value
+def _kms():
+    global _kms_client
+    if _kms_client is None:
+        _kms_client = boto3.client("kms", region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+    return _kms_client
 
 
-def _secret() -> str:
-    """legacy 入口的密钥（拆 family 之前的共享 jwt-secret）。"""
-    return _secret_by_param(os.environ["JWT_SECRET_PARAM"])
+def _reset_signing() -> None:
+    """测试钩子：换掉 _kms() 后清掉缓存的公钥加载器与 signer。"""
+    global _public_key, _SIGNER
+    _public_key = None
+    _SIGNER = None
+
+
+def _get_public_key(key_arn: str, spki_sha256: str):
+    global _public_key
+    if _public_key is None:
+        _public_key = session_kms.public_key_loader(_kms())
+    return _public_key(key_arn, spki_sha256)
 
 
 def _console_allowlist() -> dict:
-    """panel 自己那份 allowlist：**只有 console family**（spec §4.3）。装配逻辑在 verifier_env
-    （auth 拥有、构建时复制进包），SESSION_KEYS_JSON 里出现别的 family 就直接拒。"""
-    return verifier_env.load_allowlist(os.environ.get("SESSION_KEYS_JSON"), "console", _secret_by_param,
+    """panel 自己那份 allowlist：**只有 console family**（spec §4.3）。公钥按 key_arn 取、与 spki_sha256 核对。
+
+    装配逻辑在 verifier_env（auth 拥有、构建时复制进包），SESSION_KEYS_JSON 里出现别的 family
+    就直接拒——panel 是公网可达组件，拿到 site 的 key 等于能伪造站点会话。
+    """
+    return verifier_env.load_allowlist(os.environ.get("SESSION_KEYS_JSON"), "console", _get_public_key,
                                        allowed_families=("console",))
 
 
-def _legacy_secret():
-    return verifier_env.legacy_secret(os.environ.get("LEGACY_ENTRY"), _secret)
+def _signer() -> tuple:
+    """→ (kid, sign)：console family 的 current。**panel 只签面板会话，只碰 console family。**
 
+    与 auth 同形（`auth/tests/test_signer_guard.py` 的 AST 守卫按路径读本文件，锁死"每次
+    mint_token 的 kid/sign 都是本函数同一次调用绑定出来的"）。这是一条有意的跨包耦合——
+    守卫要同时看住两个组件的签发点才有意义——但方向容易反着猜，所以写在这里：
+    **改本函数或 `console_cookie` 会让 auth 的套件变红，不是 panel 的。**
 
-def _signer_mode() -> str:
-    """面板会话的签发形态（3c-1B，spec §11.8.3）：`legacy` | `current`，来自 SESSION_SIGNER。
-
-    **与 auth 是同一个开关、同一份配置真源**（`[SessionKeys] signer`），但两个组件各自部署，
-    所以切换有先后：runbook 是 panel 先、auth 后——面板会话只有 panel 自己验、TTL 4 h，
-    是爆炸半径最小的先行指标。验签侧不受影响（verifier 全程双接受），所以先切 panel
-    不会让任何已签发的 cookie 失效。
-
-    **改动本函数或 `console_cookie` 会让 auth 的测试套件变红**，不是 panel 的：签发面的 AST
-    守卫住在 `auth/tests/test_signer_switch_guard.py`（它按路径读本文件）。这是一条有意的
-    跨包耦合——守卫要同时看住两个组件的签发点才有意义——但方向容易反着猜，所以写在这里。
+    KmsSigner 按 key_arn 缓存：首次调用做一次 GetPublicKey 指纹自检（spec §11.6 第 2 层）。
     """
-    return verifier_env.signer_mode(os.environ.get("SESSION_SIGNER"))
-
-
-def _signing_key() -> tuple[str, str]:
-    """→ console family 的 (current kid, secret)。**panel 只签面板会话，只碰 console family。**
-
-    `allowed_families=("console",)` 与验签那边同一个口径：SESSION_KEYS_JSON 里出现 site
-    就是部署配置错，直接拒——panel 是公网可达组件，拿到 site 的 key 等于能伪造站点会话。
-    """
-    return verifier_env.signing_key(os.environ.get("SESSION_KEYS_JSON"), "console",
-                                    _secret_by_param, allowed_families=("console",))
+    global _SIGNER
+    kid, key_arn, spki = verifier_env.signing_ref(os.environ.get("SESSION_KEYS_JSON"), "console",
+                                                  allowed_families=("console",))
+    if _SIGNER is None or _SIGNER.key_arn != key_arn:
+        _SIGNER = session_kms.KmsSigner(_kms(), key_arn, spki)
+    return kid, _SIGNER
 
 
 def _log_verify(outcome: str) -> None:
@@ -124,9 +119,8 @@ def consume_code(code: str, *, expected_email: str) -> str:
     而"忘记传"恰好退化成原来那个缺陷。
     """
     import botocore.exceptions
-    claims, outcome = session.verify_with_legacy(code or "", allowlist=_console_allowlist(),
-                                                 token_use="console-upgrade",
-                                                 legacy_secret=_legacy_secret())
+    claims, outcome = session.verify_token(code or "", allowlist=_console_allowlist(),
+                                           token_use="console-upgrade")
     _log_verify(outcome)
     if not claims:
         raise UpgradeRejected("升级码无效或已过期")
@@ -148,24 +142,20 @@ def consume_code(code: str, *, expected_email: str) -> str:
 
 
 def ensure_signing_material() -> None:
-    """把签发面板会话要用的材料**先取一遍**，取不到就抛（3c-1B-G B2 = tracked §9 的 3i）。
+    """签发前把材料取一遍（3i）：解析 SESSION_KEYS_JSON、构造 signer、做一次 GetPublicKey 自检。**不签发**。
 
     `handler` 的 `/api/session-callback` 必须在 `consume_code()` **之前**调它：那一步是
-    DynamoDB 条件写，**不可逆**地作废那枚一次性升级码。原先取密钥发生在
-    `console_cookie()` 里、也就是消费之后 ⇒ `SESSION_KEYS_JSON` 缺失/非 JSON/family 缺
-    current、`ssm:GetParameter` AccessDenied、ParameterNotFound 任一发生，用户就丢掉一枚
-    码并拿到 500，必须重走 auth→console 的升级跳转。与 ticket 20 给 `/callback` 做的是
-    同一件事，只是轻一档（那边重来一次要整个 Cognito 往返）。
+    DynamoDB 条件写，**不可逆**地作废那枚一次性升级码。原先取材料发生在 `console_cookie()`
+    里、也就是消费之后 ⇒ `SESSION_KEYS_JSON` 缺失/非 JSON/family 缺 current、`kms:GetPublicKey`
+    AccessDenied、公钥指纹与配置不符任一发生，用户就丢掉一枚码并拿到 500，必须重走
+    auth→console 的升级跳转。与 ticket 20 给 `/callback` 做的是同一件事，只是轻一档
+    （那边重来一次要整个 Cognito 往返）。
 
-    **它不签发**，只把 `_signer_mode()` 与密钥读取跑通——`console_cookie` 仍是 panel
-    唯一的签发点（signer 的 AST 守卫要求 `handler.py` 里一次 mint 都不能有）。
-    值走 `_secret_by_param` 的 TTL 缓存，所以 `console_cookie` 随后那次是命中缓存，
-    不多打一次 SSM。
+    **它不签发**，只把材料解析与自检跑通——`console_cookie` 仍是 panel 唯一的签发点
+    （signer 的 AST 守卫要求 `handler.py` 里一次 mint 都不能有）。自检结果在 KmsSigner 里
+    记住了，所以 `console_cookie` 随后那次不再多打一次 GetPublicKey。
     """
-    if _signer_mode() == "current":
-        _signing_key()
-    else:
-        _secret()
+    _signer()[1].self_check()
 
 
 def console_cookie(email: str, name: str) -> str:
@@ -175,25 +165,18 @@ def console_cookie(email: str, name: str) -> str:
     不要给本函数加 domain 参数——任何 Domain= 都会让浏览器整条丢弃 cookie，
     表现为"登录成功但面板一直 401"（auth 的 PKCE cookie 有同样的注释）。
 
-    3c-1B：线格式由 SESSION_SIGNER 决定——`current` 用 console family 的 current kid +
-    `mint_token(console-session)`（§11.4 的面板会话表：token_use/aud/email/name/exp/iat，
-    **不再写 typ 与 scope**）；`legacy` 字节级沿用旧形态（typ=session + scope=console）。
-    cookie 的 `__Host-` 三要素与 TTL 两侧完全相同，本票只换签名密钥与 claim 集合。
+    线格式（spec §11.4 的面板会话表）：console family 的 current kid + RS256 签名，
+    claim 恰好是 token_use / aud / email / name / exp / iat——**没有 typ，也没有 scope**。
     """
-    if _signer_mode() == "current":
-        kid, secret = _signing_key()
-        token = session.mint_token(kid=kid, secret=secret, token_use="console-session",
-                                   email=email, ttl_seconds=CONSOLE_TTL_SECONDS, name=name)
-    else:
-        token = session.mint_session_jwt(email, name, _secret(),
-                                         ttl_seconds=CONSOLE_TTL_SECONDS,
-                                         scope=CONSOLE_SCOPE)
+    kid, sign = _signer()
+    token = session.mint_token(kid=kid, sign=sign, token_use="console-session",
+                               email=email, ttl_seconds=CONSOLE_TTL_SECONDS, name=name)
     return (f"{CONSOLE_COOKIE}={token}; Secure; HttpOnly; "
             f"SameSite=Lax; Path=/; Max-Age={CONSOLE_TTL_SECONDS}")
 
 
 def verify_console_cookie(cookie_header: str, *, x_user_email: str) -> str:
-    """→ email。验签 + 未过期 + scope==console + **与 Edge 身份一致**。
+    """→ email。验签 + 未过期 + token_use/aud 是面板会话 + **与 Edge 身份一致**。
 
     最后一条不能省：换人登录后浏览器里可能还留着前一个人的
     __Host-sb_console（4h TTL），而 x-user-email 是 Edge 刚验过的真身份。
@@ -207,11 +190,9 @@ def verify_console_cookie(cookie_header: str, *, x_user_email: str) -> str:
             break
     if not token:
         raise UpgradeRejected("缺少面板会话")
-    # 3c-1A：新形态按 token_use=console-session + aud 验；legacy 形态按旧合同
-    # （typ=session + scope=console）验——两条都在 verify_with_legacy 里，这里不再手查 scope。
-    claims, outcome = session.verify_with_legacy(token, allowlist=_console_allowlist(),
-                                                 token_use="console-session",
-                                                 legacy_secret=_legacy_secret())
+    # token_use=console-session + aud=console-panel 由 verify_token 一起判，这里不再手查 scope
+    claims, outcome = session.verify_token(token, allowlist=_console_allowlist(),
+                                           token_use="console-session")
     _log_verify(outcome)
     if not claims:
         raise UpgradeRejected("面板会话无效或已过期")

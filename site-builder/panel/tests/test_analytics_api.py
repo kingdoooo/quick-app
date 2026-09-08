@@ -114,7 +114,7 @@ def test_list_sites_survives_an_unreadable_access_table(monkeypatch, aws, caplog
 
 
 def test_list_sites_returns_200_when_the_trend_cannot_be_read(monkeypatch, aws,
-                                                              secret):
+                                                              keys):
     """端点层的同一件事：**HTTP 仍然是 200**，不是 500。
 
     `do_list_sites` 不抛不等于端点 200——真正决定用户看到什么的是 handler。

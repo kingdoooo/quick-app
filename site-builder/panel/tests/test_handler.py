@@ -13,9 +13,15 @@ import handler
 import permissions
 import session
 from test_authz import _seed
-from upgrade_code_vectors import SECRET
+import upgrade_code_vectors as v
 
 CONSOLE = "console.example.com"
+
+
+def _upgrade_code(email: str) -> str:
+    """一枚升级码（RS256，console family 的 kid）。**测试自己用本地私钥签**——生产是 KMS。"""
+    return session.mint_token(kid=v.CONSOLE_KID, sign=v.signer(v.CONSOLE_KEY),
+                              token_use="console-upgrade", email=email, ttl_seconds=60)
 
 
 # Edge 执行角色的 RoleId（测试用）。真机形态见 test_real_edge_caller_shape_is_accepted
@@ -61,21 +67,21 @@ def _write_ev(path, **kw):
     return _ev(kw.pop("method", "PUT"), path, **kw)
 
 
-def test_missing_edge_identity_is_401_not_500(aws, secret):
+def test_missing_edge_identity_is_401_not_500(aws, keys):
     """没有 x-user-email 说明请求没经过 Edge——必须拒绝，且不是 500。"""
     ev = _ev("GET", "/api/me")
     del ev["headers"]["x-user-email"]
     assert handler.handler(ev, None)["statusCode"] == 401
 
 
-def test_read_without_console_session_is_allowed(aws, secret):
+def test_read_without_console_session_is_allowed(aws, keys):
     """读接口只要 Edge 身份即可（面板会话是写操作的前置）。"""
     r = handler.handler(_ev("GET", "/api/me"), None)
     assert r["statusCode"] == 200
     assert json.loads(r["body"])["email"] == "owner@x.com"
 
 
-def test_write_without_console_session_is_401_with_need_hint(aws, secret):
+def test_write_without_console_session_is_401_with_need_hint(aws, keys):
     _seed()
     r = handler.handler(_ev("PUT", "/api/sites/s-1/permissions",
                             origin=f"https://{CONSOLE}",
@@ -84,7 +90,7 @@ def test_write_without_console_session_is_401_with_need_hint(aws, secret):
     assert json.loads(r["body"])["need"] == "console-session"
 
 
-def test_csrf_failure_performs_zero_writes(aws, secret):
+def test_csrf_failure_performs_zero_writes(aws, keys):
     """**副作用前置断言**：CSRF 不合法时不得有任何 DynamoDB 写调用。
 
     spec §5.4：不得出现"先更新 DynamoDB，再发现 CSRF 不合法"。
@@ -137,7 +143,7 @@ def test_csrf_failure_performs_zero_writes(aws, secret):
     assert seen == [], f"CSRF 失败却发生了写调用: {seen}"
 
 
-def test_bad_console_session_performs_zero_writes(aws, secret):
+def test_bad_console_session_performs_zero_writes(aws, keys):
     """同上，但失败点是面板会话（顺序里的第 ③ 步）。"""
     _seed()
     seen = []
@@ -171,7 +177,7 @@ def test_bad_console_session_performs_zero_writes(aws, secret):
     assert seen == [], f"会话校验失败却发生了写调用: {seen}"
 
 
-def test_permission_denied_is_403(aws, secret):
+def test_permission_denied_is_403(aws, keys):
     _seed()
     r = handler.handler(_write_ev("/api/sites/s-1/permissions",
                                   email="nobody@x.com",
@@ -179,7 +185,7 @@ def test_permission_denied_is_403(aws, secret):
     assert r["statusCode"] == 403
 
 
-def test_permission_conflict_is_409(aws, secret):
+def test_permission_conflict_is_409(aws, keys):
     _seed()
     with patch.object(permissions, "set_access_policy",
                       side_effect=permissions.PermissionConflict("并发")):
@@ -188,7 +194,7 @@ def test_permission_conflict_is_409(aws, secret):
     assert r["statusCode"] == 409
 
 
-def test_value_error_is_400(aws, secret):
+def test_value_error_is_400(aws, keys):
     """非法邮箱这类入口校验错误是用户可纠正的，不该是 500。"""
     _seed()
     r = handler.handler(_write_ev("/api/sites/s-1/collaborators",
@@ -196,7 +202,7 @@ def test_value_error_is_400(aws, secret):
     assert r["statusCode"] == 400
 
 
-def test_policy_data_invalid_maps_to_409_not_a_generic_500(aws, secret,
+def test_policy_data_invalid_maps_to_409_not_a_generic_500(aws, keys,
                                                            monkeypatch):
     """坏数据必须给 409 + 可判读文案，不能被兜底吞成 500「服务内部错误」。
 
@@ -231,7 +237,7 @@ def test_policy_data_invalid_maps_to_409_not_a_generic_500(aws, secret,
 # 反过来则是让他一遍遍重新部署去修一个部署改不好的值。所以两条各断言
 # "有自己那句"且"没有另一句"——只断言前半截时，把两句合并成一句大杂烩照样绿。
 
-def test_absent_field_over_http_tells_the_user_to_deploy_once(aws, secret):
+def test_absent_field_over_http_tells_the_user_to_deploy_once(aws, keys):
     """字段缺失（从没成功部署过）：文案要说"部署一次"，不能说"去改库"。"""
     common._table("SITES_TABLE").put_item(Item={
         # 只有 create_site_record 写的那几个字段：权限字段由首次成功部署的
@@ -251,7 +257,7 @@ def test_absent_field_over_http_tells_the_user_to_deploy_once(aws, secret):
         f"对一行没有坏值的记录说去手改库——用户找不到要改的东西: {msg}")
 
 
-def test_wrong_typed_field_over_http_tells_the_user_to_fix_the_row(aws, secret):
+def test_wrong_typed_field_over_http_tells_the_user_to_fix_the_row(aws, keys):
     """类型不对：文案要说"改那一行"，且**不能**建议再部署一次（部署改不好它）。"""
     _seed()
     permissions._ddb_client().update_item(
@@ -269,7 +275,7 @@ def test_wrong_typed_field_over_http_tells_the_user_to_fix_the_row(aws, secret):
         f"建议去部署一次——而部署不会改好一个坏值: {msg}")
 
 
-def test_policy_data_invalid_409_carries_a_machine_readable_code(aws, secret):
+def test_policy_data_invalid_409_carries_a_machine_readable_code(aws, keys):
     """409 要带 `code`，前端才能把"刷新后重试即可"那句**不加**上去。
 
     reportError 对**所有** 409 追加"（刷新后重试即可）"——对并发冲突是对的
@@ -295,34 +301,34 @@ def test_policy_data_invalid_409_carries_a_machine_readable_code(aws, secret):
     assert "code" not in json.loads(c["body"]), c
 
 
-def test_unknown_route_is_404(aws, secret):
+def test_unknown_route_is_404(aws, keys):
     assert handler.handler(_ev("GET", "/api/nope"), None)["statusCode"] == 404
 
 
-def test_unknown_route_does_not_require_console_session(aws, secret):
+def test_unknown_route_does_not_require_console_session(aws, keys):
     """404 不该先要求面板会话——否则探测者拿到的是 401，路由表被间接泄漏。"""
     r = handler.handler(_ev("POST", "/api/nope", origin=f"https://{CONSOLE}"),
                         None)
     assert r["statusCode"] == 404
 
 
-def test_wrong_method_on_known_path_is_404(aws, secret):
+def test_wrong_method_on_known_path_is_404(aws, keys):
     assert handler.handler(_ev("DELETE", "/api/me"), None)["statusCode"] == 404
 
 
-def test_malformed_json_body_is_400_not_500(aws, secret):
+def test_malformed_json_body_is_400_not_500(aws, keys):
     ev = _write_ev("/api/sites/s-1/permissions")
     ev["body"] = "{not json"
     assert handler.handler(ev, None)["statusCode"] == 400
 
 
-def test_non_object_json_body_is_400(aws, secret):
+def test_non_object_json_body_is_400(aws, keys):
     ev = _write_ev("/api/sites/s-1/permissions")
     ev["body"] = "[1,2,3]"
     assert handler.handler(ev, None)["statusCode"] == 400
 
 
-def test_unexpected_exception_is_500_without_leaking_internals(aws, secret):
+def test_unexpected_exception_is_500_without_leaking_internals(aws, keys):
     """500 的 body 不得含堆栈/ARN/表名——那是内部结构泄漏。"""
     with patch.object(api, "do_me", side_effect=RuntimeError(
             "arn:aws:dynamodb:us-east-1:000000000000:table/site-sites 挂了")):
@@ -332,49 +338,49 @@ def test_unexpected_exception_is_500_without_leaking_internals(aws, secret):
         assert bad not in r["body"], f"500 响应泄漏了 {bad}"
 
 
-def test_responses_are_no_store(aws, secret):
+def test_responses_are_no_store(aws, keys):
     """面板响应随权限变化，绝不能被缓存。"""
     r = handler.handler(_ev("GET", "/api/me"), None)
     assert r["headers"]["cache-control"] == "no-store"
 
 
-def test_user_name_is_url_decoded(aws, secret):
+def test_user_name_is_url_decoded(aws, keys):
     """Edge 注入的 x-user-name 是 URL 编码的（含中文/空格）。"""
     ev = _ev("GET", "/api/me")
     ev["headers"]["x-user-name"] = "%E5%BC%A0%20%E4%B8%89"
     assert json.loads(handler.handler(ev, None)["body"])["name"] == "张 三"
 
 
-def test_session_callback_sets_console_cookie_and_redirects(aws, secret):
-    code = session.mint_upgrade_code("owner@x.com", SECRET)
+def test_session_callback_sets_console_cookie_and_redirects(aws, keys):
+    code = _upgrade_code("owner@x.com")
     r = handler.handler(_ev("GET", "/api/session-callback",
                             qs={"code": code}), None)
     assert r["statusCode"] == 302
     assert any("__Host-sb_console=" in c for c in r.get("cookies", []))
 
 
-def test_session_callback_rejects_replayed_code(aws, secret):
-    code = session.mint_upgrade_code("owner@x.com", SECRET)
+def test_session_callback_rejects_replayed_code(aws, keys):
+    code = _upgrade_code("owner@x.com")
     ev = _ev("GET", "/api/session-callback", qs={"code": code})
     assert handler.handler(ev, None)["statusCode"] == 302
     assert handler.handler(ev, None)["statusCode"] == 401
 
 
-def test_callback_code_email_must_match_edge_identity(aws, secret):
+def test_callback_code_email_must_match_edge_identity(aws, keys):
     """拿别人的 code 到自己的会话里换 cookie —— 必须拒绝。"""
-    code = session.mint_upgrade_code("victim@x.com", SECRET)
+    code = _upgrade_code("victim@x.com")
     r = handler.handler(_ev("GET", "/api/session-callback",
                             email="attacker@x.com", qs={"code": code}), None)
     assert r["statusCode"] == 401
     assert not r.get("cookies"), "拒绝路径不该设 cookie"
 
 
-def test_callback_without_code_is_401(aws, secret):
+def test_callback_without_code_is_401(aws, keys):
     assert handler.handler(_ev("GET", "/api/session-callback"),
                            None)["statusCode"] == 401
 
 
-def test_full_write_roundtrip_succeeds(aws, secret):
+def test_full_write_roundtrip_succeeds(aws, keys):
     """五步全部合规时写操作要真的成功（防"全都拒绝"式假安全）。"""
     _seed()
     r = handler.handler(_write_ev("/api/sites/s-1/permissions",
@@ -384,7 +390,7 @@ def test_full_write_roundtrip_succeeds(aws, secret):
     assert common.get_site("s-1")["require_login"] is False
 
 
-def test_admin_routes_dispatch(aws, secret):
+def test_admin_routes_dispatch(aws, keys):
     permissions.add_admin("boss@x.com", "seed")
     r = handler.handler(_ev("GET", "/api/admins", email="boss@x.com"), None)
     assert r["statusCode"] == 200
@@ -395,7 +401,7 @@ def test_admin_routes_dispatch(aws, secret):
     assert "new@x.com" in json.loads(r["body"])["admins"]
 
 
-def test_jobs_and_get_site_dispatch(aws, secret):
+def test_jobs_and_get_site_dispatch(aws, keys):
     _seed()
     assert handler.handler(_ev("GET", "/api/sites/s-1"),
                            None)["statusCode"] == 200
@@ -403,7 +409,7 @@ def test_jobs_and_get_site_dispatch(aws, secret):
                            None)["statusCode"] == 200
 
 
-def test_list_sites_all_flag_reaches_api(aws, secret):
+def test_list_sites_all_flag_reaches_api(aws, keys):
     _seed()
     r = handler.handler(_ev("GET", "/api/sites", qs={"all": "1"}), None)
     assert r["statusCode"] == 403       # 非 admin
@@ -413,7 +419,7 @@ def test_list_sites_all_flag_reaches_api(aws, secret):
     assert r["statusCode"] == 200
 
 
-def test_resync_route_dispatch(aws, secret):
+def test_resync_route_dispatch(aws, keys):
     _seed()
     permissions.add_admin("boss@x.com", "seed")
     r = handler.handler(_write_ev("/api/admin/resync/s-1", method="POST",
@@ -421,7 +427,7 @@ def test_resync_route_dispatch(aws, secret):
     assert r["statusCode"] == 200
 
 
-def test_undeploy_dispatch_is_async_and_returns_job(aws, secret, monkeypatch):
+def test_undeploy_dispatch_is_async_and_returns_job(aws, keys, monkeypatch):
     _seed()
     invoked = []
     real_client = boto3.client
@@ -476,7 +482,7 @@ def _undeploy_spy(monkeypatch):
 
 @pytest.mark.parametrize("bad", ["false", "0", "true", "", 1, 0, [], {},
                                  ["yes"], None])
-def test_undeploy_rejects_non_boolean_purge_data(aws, secret, monkeypatch, bad):
+def test_undeploy_rejects_non_boolean_purge_data(aws, keys, monkeypatch, bad):
     """字符串/数字/数组/对象/null 一律 400，且**零副作用**（不发 invoke）。"""
     _seed()
     invoked = _undeploy_spy(monkeypatch)
@@ -486,7 +492,7 @@ def test_undeploy_rejects_non_boolean_purge_data(aws, secret, monkeypatch, bad):
     assert not invoked, f"purge_data={bad!r} 已经触发下线: {invoked}"
 
 
-def test_undeploy_missing_purge_data_defaults_to_false(aws, secret, monkeypatch):
+def test_undeploy_missing_purge_data_defaults_to_false(aws, keys, monkeypatch):
     """字段缺失 = 不清数据（默认必须是最安全的那一侧）。"""
     _seed()
     invoked = _undeploy_spy(monkeypatch)
@@ -496,7 +502,7 @@ def test_undeploy_missing_purge_data_defaults_to_false(aws, secret, monkeypatch)
     assert invoked and "purge_data" not in invoked[0], invoked
 
 
-def test_undeploy_true_boolean_still_purges(aws, secret, monkeypatch):
+def test_undeploy_true_boolean_still_purges(aws, keys, monkeypatch):
     """别把校验写成"什么都不清"——真布尔 True 仍要透传。"""
     _seed()
     invoked = _undeploy_spy(monkeypatch)
@@ -506,7 +512,7 @@ def test_undeploy_true_boolean_still_purges(aws, secret, monkeypatch):
     assert invoked and invoked[0]["purge_data"] is True, invoked
 
 
-def test_undeploy_invoke_failure_does_not_leave_pending_job(aws, secret,
+def test_undeploy_invoke_failure_does_not_leave_pending_job(aws, keys,
                                                             monkeypatch):
     """调 undeploy Lambda 失败时，不得留下永久 PENDING 的 job。
 
@@ -566,7 +572,7 @@ def test_undeploy_invoke_failure_does_not_leave_pending_job(aws, secret,
 _edge_ev = _ev
 
 
-def test_real_edge_caller_shape_is_accepted(aws, secret, monkeypatch):
+def test_real_edge_caller_shape_is_accepted(aws, keys, monkeypatch):
     """真机抓到的 callerId 形态必须放行——否则整个控制台 403。
 
     这条是防"修复本身把站点打死"的护栏：如果有人把校验改成与
@@ -577,7 +583,7 @@ def test_real_edge_caller_shape_is_accepted(aws, secret, monkeypatch):
     assert r["statusCode"] == 200, r
 
 
-def test_same_account_non_edge_signed_request_is_403(aws, secret, monkeypatch):
+def test_same_account_non_edge_signed_request_is_403(aws, keys, monkeypatch):
     """同账号、非 Edge、但有 Function URL 调用权限的签名请求必须被拒。
 
     这是 P1-1 的核心断言：resource policy 挡不住它，只有校验 caller 能挡。
@@ -595,7 +601,7 @@ def test_same_account_non_edge_signed_request_is_403(aws, secret, monkeypatch):
     assert "AROA" not in r["body"] and "EDGE_ROLE_ID" not in r["body"]
 
 
-def test_role_id_prefix_must_not_be_substring_matchable(aws, secret, monkeypatch):
+def test_role_id_prefix_must_not_be_substring_matchable(aws, keys, monkeypatch):
     """必须按 `AROA...:` 边界比，不能用 startswith/in 之类的松匹配。
 
     `AROAEDGEROLEIDXXXXXXEVIL:...` 能骗过 startswith；
@@ -612,7 +618,7 @@ def test_role_id_prefix_must_not_be_substring_matchable(aws, secret, monkeypatch
             f"松匹配放行了 {bad!r}")
 
 
-def test_missing_iam_context_is_403_not_open(aws, secret, monkeypatch):
+def test_missing_iam_context_is_403_not_open(aws, keys, monkeypatch):
     """拿不到 IAM 上下文时 fail-closed（缺字段不等于放行）。"""
     monkeypatch.setenv("EDGE_ROLE_ID", EDGE_ROLE_ID)
     for ctx in ({"authorizer": {}}, {"authorizer": {"iam": {}}},
@@ -631,7 +637,7 @@ def test_missing_iam_context_is_403_not_open(aws, secret, monkeypatch):
     assert handler.handler(ev, None)["statusCode"] == 403
 
 
-def test_unconfigured_edge_role_id_fails_closed(aws, secret, monkeypatch):
+def test_unconfigured_edge_role_id_fails_closed(aws, keys, monkeypatch):
     """**没配 EDGE_ROLE_ID 时必须拒绝所有请求**，不能"没配就不检查"。
 
     "配置缺失 → 跳过校验"是本项目记录过的陷阱形态（假值兜底恰好是放宽）。
@@ -642,7 +648,7 @@ def test_unconfigured_edge_role_id_fails_closed(aws, secret, monkeypatch):
     assert r["statusCode"] in (403, 500), r
 
 
-def test_write_path_also_checks_caller(aws, secret, monkeypatch):
+def test_write_path_also_checks_caller(aws, keys, monkeypatch):
     """写路径同样要校验——别只在读路径加。"""
     monkeypatch.setenv("EDGE_ROLE_ID", EDGE_ROLE_ID)
     _seed()
@@ -728,7 +734,7 @@ def _ddb_write_spy(monkeypatch) -> list:
     return seen
 
 
-def test_write_spy_would_notice_a_key_write(aws, secret, monkeypatch):
+def test_write_spy_would_notice_a_key_write(aws, keys, monkeypatch):
     """间谍自身的验证：合规的创建请求必须被它看见。
 
     没有这条时，下面两条"零写"断言可能只是因为间谍装不上（keystore 缓存了
@@ -743,7 +749,7 @@ def test_write_spy_would_notice_a_key_write(aws, secret, monkeypatch):
 
 @pytest.mark.parametrize("method,path,body", KEY_WRITES)
 def test_key_writes_without_console_session_are_401_and_write_nothing(
-        aws, secret, monkeypatch, method, path, body):
+        aws, keys, monkeypatch, method, path, body):
     seen = _ddb_write_spy(monkeypatch)
     r = handler.handler(_ev(method, path, origin=f"https://{CONSOLE}",
                             body=body), None)
@@ -754,7 +760,7 @@ def test_key_writes_without_console_session_are_401_and_write_nothing(
 
 @pytest.mark.parametrize("method,path,body", KEY_WRITES)
 def test_key_writes_with_forged_origin_are_403_and_write_nothing(
-        aws, secret, monkeypatch, method, path, body):
+        aws, keys, monkeypatch, method, path, body):
     seen = _ddb_write_spy(monkeypatch)
     r = handler.handler(_ev(method, path, cookie=_cookie(),
                             origin="https://evil.example.com", body=body), None)
@@ -762,14 +768,14 @@ def test_key_writes_with_forged_origin_are_403_and_write_nothing(
     assert seen == [], f"CSRF 失败却发生了写: {seen}"
 
 
-def test_key_reads_need_only_edge_identity(aws, secret):
+def test_key_reads_need_only_edge_identity(aws, keys):
     """读接口不要求面板会话（与站点列表同口径）。"""
     r = handler.handler(_ev("GET", "/api/keys"), None)
     assert r["statusCode"] == 200
     assert json.loads(r["body"]) == {"keys": []}
 
 
-def test_key_crud_dispatches_end_to_end(aws, secret):
+def test_key_crud_dispatches_end_to_end(aws, keys):
     """创建 → 列表 → 吊销，全部经真实的六步前置。"""
     created = handler.handler(_write_ev("/api/keys", method="POST",
                                         body={"name": "笔记本"}), None)
@@ -791,7 +797,7 @@ def test_key_crud_dispatches_end_to_end(aws, secret):
     assert after["keys"][0]["revoked"] is True
 
 
-def test_revoking_someone_elses_key_over_http_is_403(aws, secret):
+def test_revoking_someone_elses_key_over_http_is_403(aws, keys):
     """403 而不是 500——而且与"不存在"同一句话（api 层用例覆盖文案一致性）。"""
     import keystore
     victim = keystore.create("victim@x.com", name="victim")
@@ -803,13 +809,13 @@ def test_revoking_someone_elses_key_over_http_is_403(aws, secret):
     assert mine["body"] == missing["body"], "两种情形的响应可区分 = 枚举探测器"
 
 
-def test_key_switch_requires_admin_over_http(aws, secret):
+def test_key_switch_requires_admin_over_http(aws, keys):
     for ev in (_ev("GET", "/api/settings/api-key"),
                _write_ev("/api/settings/api-key", body={"enabled": True})):
         assert handler.handler(ev, None)["statusCode"] == 403, ev["rawPath"]
 
 
-def test_key_switch_dispatches_for_admin(aws, secret):
+def test_key_switch_dispatches_for_admin(aws, keys):
     permissions.add_admin("boss@x.com", "seed")
     r = handler.handler(_write_ev("/api/settings/api-key", email="boss@x.com",
                                   body={"enabled": True}), None)
@@ -821,7 +827,7 @@ def test_key_switch_dispatches_for_admin(aws, secret):
 
 
 @pytest.mark.parametrize("bad", ["false", "0", "true", "", 1, 0, [], {}, None])
-def test_non_boolean_enabled_is_400_with_zero_writes(aws, secret, monkeypatch,
+def test_non_boolean_enabled_is_400_with_zero_writes(aws, keys, monkeypatch,
                                                      bad):
     """`{"enabled":"false"}` 被当成 True 就是"以为关了其实开着"（同 P1-2）。"""
     permissions.add_admin("boss@x.com", "seed")
@@ -832,7 +838,7 @@ def test_non_boolean_enabled_is_400_with_zero_writes(aws, secret, monkeypatch,
     assert seen == [], f"enabled={bad!r} 被拒却写了库: {seen}"
 
 
-def test_missing_enabled_field_is_400_not_a_silent_off(aws, secret, monkeypatch):
+def test_missing_enabled_field_is_400_not_a_silent_off(aws, keys, monkeypatch):
     """缺字段**不能**兜个 False：那会让一个畸形请求静默关掉全平台 Key 通道。
 
     与 purge_data 刻意相反（那里缺失=False 才是安全侧）——开关的两个方向都是
@@ -846,14 +852,14 @@ def test_missing_enabled_field_is_400_not_a_silent_off(aws, secret, monkeypatch)
     assert seen == [], seen
 
 
-def test_me_exposes_api_key_feature_flags(aws, secret):
+def test_me_exposes_api_key_feature_flags(aws, keys):
     """前端按 `features.api_key.deployed` 决定 UI 可用性（Codex P1-5）。"""
     me = json.loads(handler.handler(_ev("GET", "/api/me"), None)["body"])
     feat = me["features"]["api_key"]
     assert feat == {"deployed": False, "enabled": False}, feat
 
 
-def test_every_new_key_route_is_dispatched(aws, secret):
+def test_every_new_key_route_is_dispatched(aws, keys):
     """ROUTES 加了分发忘了写 = 500。逐条走一遍，断言没有一条落到那个兜底上。
 
     比"挑一条试试"强：`_dispatch` 的兜底 RuntimeError 只在真的漏分支时才触发，
@@ -985,7 +991,7 @@ def test_dispatch_branch_scan_is_not_vacuous():
         "空转（集合为空时它是恒真的）。要么补回路由，要么先读它的 docstring")
 
 
-def test_undeploy_is_rejected_while_a_deploy_holds_the_lease(aws, secret,
+def test_undeploy_is_rejected_while_a_deploy_holds_the_lease(aws, keys,
                                                             monkeypatch):
     """部署 RUNNING 期间从控制台下线 ⇒ 409 且**零副作用**（不发 invoke）。
 
@@ -1011,7 +1017,7 @@ def test_undeploy_is_rejected_while_a_deploy_holds_the_lease(aws, secret,
     assert not invoked, "已经触发了下线 invoke——拒绝必须发生在副作用之前"
 
 
-def test_undeploy_acquires_the_lease_and_blocks_deploys(aws, secret, monkeypatch):
+def test_undeploy_acquires_the_lease_and_blocks_deploys(aws, keys, monkeypatch):
     """panel 发起的下线要**持有**租约（holder = undeploy job，RUNNING）。"""
     import common
     _seed()
@@ -1025,7 +1031,7 @@ def test_undeploy_acquires_the_lease_and_blocks_deploys(aws, secret, monkeypatch
     assert job["status"] == "RUNNING" and job.get("kind") == "undeploy"
 
 
-def test_uncertain_invoke_error_keeps_running_and_lease(aws, secret, monkeypatch):
+def test_uncertain_invoke_error_keeps_running_and_lease(aws, keys, monkeypatch):
     """invoke **网络错误（结果不确定）** ⇒ job 保持 RUNNING、租约不放、409。
 
     事件可能已被 Lambda 受理、下线正在后台删资源；此刻写 FAILED 就是把租约
@@ -1107,7 +1113,7 @@ def test_the_callback_still_works_when_the_signing_material_is_fine(monkeypatch)
 def test_handler_has_no_mint_call_of_its_own(monkeypatch):
     """B2 不许把签发搬进 handler——`console_cookie` 仍是 panel 唯一签发点。
 
-    signer 的 AST 守卫（`auth/tests/test_signer_switch_guard.py` 的 NON_SIGNER_FILES）
+    signer 的 AST 守卫（`auth/tests/test_signer_guard.py` 的 NON_SIGNER_FILES）
     已经盯着这件事；这里再从**行为**侧钉一次：handler 只调"取材料"，不调 mint。
     """
     src = (Path(__file__).parents[1] / "handler.py").read_text(encoding="utf-8")
