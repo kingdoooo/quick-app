@@ -68,6 +68,23 @@ def _baseline_raw() -> str:
 def _baseline_data() -> dict:
     return json.loads(_baseline_raw())
 
+
+def _synthetic_baseline(tmp_path) -> tuple[str, dict]:
+    """用**生产的** `write_baseline` 从合成 bundle 造一份真基线 → (原文, 解析结果)。
+
+    **元用例**（往树里注入一个坏值、断言扫描器抓得到）不该依赖本地有没有基线：基线自 3c-final
+    起不再 tracked（D1），而"扫描器是不是真的会抓"与那个账号的实测内容毫无关系。用真基线跑
+    元用例只会让 D1 把这批反向验证一起 skip 掉——而"skip 了"与"断言其实是空的"在输出上没有
+    区别（变形 harness 的 #29 / #30 实测因此拿不到绿基准）。
+    """
+    g = _gate()
+    out = tmp_path / "baseline.json"
+    bundle = _complete_bundle(g)
+    bundle["principals"]["0000-1111-2222-3333"]["category"] = "unrelated-workload"
+    g.write_baseline(bundle, {}, out)
+    raw = out.read_text(encoding="utf-8")
+    return raw, json.loads(raw)
+
 # 指纹形态：每 4 位十六进制一组。分组是**必需的**——裸 16 位十六进制里会偶然出现
 # 12 位连续数字，而 `scan_staged_secrets.sh` 按 `[0-9]{12}` 找账号 ID，于是每次更新
 # 基线都命中一次假阳性；反复的假阳性会训练出无脑 `--allow-hits`。
@@ -1212,13 +1229,15 @@ def _assert_facts_are_integers(data: dict) -> None:
                             "spki_sha256", "grants"}, sorted(row)
 
 
-def test_baseline_redline_scan_catches_an_injected_new_subkey():
+def test_baseline_redline_scan_catches_an_injected_new_subkey(tmp_path):
     """**元用例**：往基线树里注入新子键，必须被抓到。
 
     没有这条的话，上面那条在"递归实现其实没递归"时同样是绿的。
+
+    用**合成**基线而不是本地那份：本地基线不再 tracked（D1），拿真文件跑会让这条反向验证
+    随之 skip，而这里断言的是扫描器的行为、与那个账号的实测内容无关。
     """
-    raw = _baseline_raw()
-    data = json.loads(raw)
+    raw, data = _synthetic_baseline(tmp_path)
     data["resource_policies"]["brand_new_subkey"] = ["arn:aws:iam::000000000000:role/Sneaky"]
     assert list(_non_fingerprint_leaves(data)), \
         "注入了一个含 ARN 的新子键却没被抓到——递归红线检查是假的"
@@ -1243,12 +1262,15 @@ def test_version_id_position_is_type_checked_not_waved_through():
         assert list(_non_fingerprint_leaves(tree)), f"VersionId 位置写成 {bad!r} 却没被抓到"
 
 
-def test_raw_forbidden_pattern_scan_still_covers_free_text_fields():
+def test_raw_forbidden_pattern_scan_still_covers_free_text_fields(tmp_path):
     """**两层缺一不可**：`note` / `categories[]` / `category` 是自由文本，
     结构化递归检查刻意不校验它们的形态 ⇒ 只有整文件 raw 扫描能抓住写进 `note` 的
     真实账号 ID 或内部角色名。这条钉住"raw 那层没被递归检查替换掉"。
+
+    同样用**合成**基线：两层的分工是代码性质，不是那个账号的性质。真文件的第一层由
+    `test_baseline_carries_no_account_values` 负责（它在本地无基线时 skip）。
     """
-    raw = _baseline_raw()
+    raw, _data = _synthetic_baseline(tmp_path)
     # 第一层：整文件（与 test_baseline_carries_no_account_values 同一组判据）
     for forbidden in ("arn:aws:", "role/", "cdk-hnb659fds", "Isengard"):
         assert forbidden not in raw, f"基线里出现了 {forbidden!r}"
@@ -2154,9 +2176,9 @@ def test_a_grant_carrying_an_arn_is_caught():
         assert _GRANT_RE.fullmatch(ok), f"文法误拒了 {ok!r}"
 
 
-def test_a_grant_carrying_an_arn_is_caught_by_the_tree_scan():
-    """注入到基线树里也要被递归红线抓到（不只是文法函数本身能判）。"""
-    data = _baseline_data()
+def test_a_grant_carrying_an_arn_is_caught_by_the_tree_scan(tmp_path):
+    """注入到基线树里也要被递归红线抓到（不只是文法函数本身能判）。合成基线，理由同上。"""
+    _raw, data = _synthetic_baseline(tmp_path)
     fp = next(iter(data["principals"]))
     data["principals"][fp]["grants"] = [f"invoke-platform:arn:aws:iam::{_ACCT}:role/X"]
     assert list(_non_fingerprint_leaves(data)), "grant 里的 ARN 没被递归红线抓到"
@@ -4228,18 +4250,14 @@ def test_the_baseline_checks_really_run_on_a_synthetic_baseline(tmp_path):
     这里用生产的 `write_baseline` 从一份合成 bundle 造出真基线，再把同一组断言跑一遍。
     """
     g = _gate()
-    bundle = _complete_bundle(g)
-    bundle["principals"]["0000-1111-2222-3333"]["category"] = "unrelated-workload"
-    out = tmp_path / "baseline.json"
-    g.write_baseline(bundle, {}, out)
-    data = json.loads(out.read_text(encoding="utf-8"))
+    raw, data = _synthetic_baseline(tmp_path)
     _assert_baseline_sections(g, data)
-    _assert_baseline_carries_no_account_values(out.read_text(encoding="utf-8"))
+    _assert_baseline_carries_no_account_values(raw)
     _assert_facts_are_integers(data)
     _assert_baseline_grants_follow_the_grammar(data)
     assert not list(_non_fingerprint_leaves(data)), list(_non_fingerprint_leaves(data))
     # kms 分节真的被写出去了（否则 schema 6 的基线里那一层等于不存在）
-    assert set(data["kms"]) == set(bundle["kms"])
+    assert set(data["kms"]) == set(_complete_bundle(g)["kms"])
 
 
 def test_module_constant_hard_fails_when_the_far_side_renames_it():
