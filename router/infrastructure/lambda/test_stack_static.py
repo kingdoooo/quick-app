@@ -277,9 +277,17 @@ def test_offline_synth_survives_a_config_that_cannot_be_loaded(clean_env, monkey
 
 
 def test_a_config_that_cannot_be_loaded_fails_synth_by_default(clean_env):
-    """R17 模式 3：没有覆盖、也没有显式离线 ⇒ `SessionKeysError` 原样抛，什么都不部署。"""
-    with pytest.raises(sk.SessionKeysError, match=r"SessionKeys"):
+    """R17 模式 3：没有覆盖、也没有显式离线 ⇒ 抛，什么都不部署。
+
+    类型仍是 `SessionKeysError`（"这是配置错，不是环境故障"），原消息一字不改地在最前面，
+    后面补上与 KMS 那条同样的出路提示（fix round 1 的 Minor 3）——只报"缺哪个键"的话，
+    "我现在只想看模板"没有答案。
+    """
+    with pytest.raises(sk.SessionKeysError, match=r"SessionKeys") as ei:
         _fragment().load_site_allowlist(_unloadable_keys(), kms=v.FakeKms())
+    msg = str(ei.value)
+    assert OFFLINE_FLAG in msg and "APP_SITE_ALLOWLIST_JSON" in msg, msg
+    assert "缺 [SessionKeys] 段" in msg, "原始消息被包掉了：缺哪个键才是第一要紧的信息"
 
 
 def test_an_allowlist_that_would_break_the_injected_source_is_rejected(clean_env, monkeypatch):
@@ -315,12 +323,63 @@ def test_vendoring_runs_hash_checked_cross_platform_pip_into_the_asset_dir(monke
     assert argv.index("--require-hashes") < argv.index("-r"), f"开关位置不对：{argv}"
 
 
-def test_vendoring_is_skipped_only_in_explicit_offline_synth_and_runs_before_the_asset_is_taken():
+def test_vendoring_is_skipped_only_when_the_injected_allowlist_carries_the_marker():
+    """**判据是注进产物的文本，不是 `_synth_offline()` 旗标**（fix round 1 的 Important 1）。
+
+    按旗标判会开出第四种组合：旗标留在环境里 + config 已是 RS 形态 + KMS 可达 ⇒ 注真 allowlist
+    （产物无标记、看起来正常）却跳过 vendoring ⇒ 没有 cryptography/ ⇒ 每次 Edge 冷启动 import
+    失败 = 全站 502，回滚要 10-20 分钟全球复制。两支都要在取 asset 之前。
+    """
     body = SRC[SRC.index("class WebRouterStack"):]
     vend = body.index("vendor_edge_dependencies(temp_dir)")
+    sentinel = body.index("_write_synth_only_sentinel(temp_dir)")
     asset = body.index("lambda_.Code.from_asset(temp_dir)")
-    assert vend < asset
-    assert "if not _synth_offline():" in body[vend - 200:vend]
+    assert vend < asset and sentinel < asset, "vendoring / 哨兵必须在产物被取走之前"
+    # **判据落在代码上，注释先剥掉**：这一段的注释里正写着"不是 `_synth_offline()` 那个旗标"，
+    # 不剥的话那句解释自己就能把下面这条断言判红（同一个坑的反向形态）。
+    seg = body[max(0, sentinel - 800):vend]
+    code = "\n".join(ln for ln in seg.splitlines() if not ln.lstrip().startswith("#"))
+    assert "_asset_is_synth_only(site_allowlist_json)" in code, code
+    assert "_synth_offline()" not in code, (
+        "判据回到了旗标：陈旧的 APP_SYNTH_OFFLINE + 可用的 config/KMS = 无标记却缺 cryptography/ "
+        f"的产物（部署出去全站 502）：{code}")
+
+
+def test_the_offline_flag_alone_does_not_skip_vendoring(clean_env, monkeypatch):
+    """第四种组合的**行为**判据：旗标在，但 config 能加载、KMS 也能取 ⇒ 注的是真 allowlist ⇒ 必须装依赖。
+
+    上一条按源码结构判分支，这一条按 `load_site_allowlist` 的真实返回值判决策——两条一起才把
+    "旗标不参与这个决定"钉死。
+    """
+    monkeypatch.setenv(OFFLINE_FLAG, "1")
+    mod = _fragment()
+    text = mod.load_site_allowlist(sk.load_session_keys(_cfg_with(RS)), kms=v.FakeKms())
+    assert v.spki_b64(v.SITE_KEY) in text and "SYNTH-ONLY" not in text, "旗标不该改变注入内容"
+    assert mod._asset_is_synth_only(text) is False, (
+        "这份产物没有标记，所以它必须带 cryptography/ —— 决定不能来自旗标")
+
+
+def test_skipping_vendoring_marks_the_asset_by_construction(tmp_path):
+    """「标记 ⇔ 不可部署」：跳过 vendoring 的那一支一定往 asset 里写带标记的哨兵。"""
+    mod = _fragment()
+    assert mod._asset_is_synth_only(sk.SYNTH_PLACEHOLDER_ALLOWLIST_JSON) is True
+    # 显式覆盖里带上标记同样算"我知道这份不可部署"——离线看模板的正当出路
+    assert mod._asset_is_synth_only('{"x": {"n": "SYNTH-ONLY-PLACEHOLDER-DO-NOT-DEPLOY"}}') is True
+    path = mod._write_synth_only_sentinel(str(tmp_path))
+    assert path.parent == tmp_path and path.name.endswith(".txt")
+    body = path.read_text(encoding="utf-8")
+    assert "SYNTH-ONLY-PLACEHOLDER-DO-NOT-DEPLOY" in body and "cryptography" in body
+    assert [q.name for q in tmp_path.iterdir()] == [path.name], "哨兵之外不该写别的东西"
+
+
+def test_the_marker_string_has_a_single_definition():
+    """标记只许有一处定义（session_keys 的占位常量）——stack.py 里抄一份就会与闸门的 grep 漂。"""
+    fn = SRC[SRC.index("def _synth_only_marker"):SRC.index("def _asset_is_synth_only")]
+    assert "SYNTH_PLACEHOLDER_ALLOWLIST_JSON" in fn
+    code = "\n".join(ln for ln in fn.splitlines() if not ln.strip().startswith("#"))
+    code = code[:code.index('"""')] + code[code.rindex('"""') + 3:]     # 去掉 docstring
+    assert "SYNTH-ONLY" not in code, code
+    assert _fragment()._synth_only_marker() == "SYNTH-ONLY-PLACEHOLDER-DO-NOT-DEPLOY"
 
 
 def test_vendoring_targets_the_edge_runtime_not_the_host():

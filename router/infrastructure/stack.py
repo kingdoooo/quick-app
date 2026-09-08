@@ -56,13 +56,18 @@ class ConfigLoader:
 
 
 def _synth_offline() -> bool:
-    """3c-1B ticket 19（merged review M12）：SSM/凭据失败时是否允许退化成 SYNTH 占位符。
+    """3c-1B ticket 19（merged review M12）：**取不到公钥**时是否允许退化成 SYNTH 占位 allowlist。
 
-    **默认不允许**——`cdk deploy` 一定带凭据，走到这里的失败（ParameterNotFound / AccessDenied /
-    限流 / 网络）都是该让部署失败的事，而不是"打一行 WARNING 然后 exit 0 把一个 kid 永不匹配的
-    allowlist 全球复制出去"。离线 synth（无凭据的 CI、本地看模板）显式设 `APP_SYNTH_OFFLINE=1`
-    才走占位符路径，且产物仍带 SYNTH-ONLY 标记（verify_deployed_edge.sh 会抓，纵深保留）。
-    配置错误（如非 HS256 行）在任何模式下都抛：那不是"读不到"，是写错了。
+    **默认不允许**——`cdk deploy` 一定带凭据，走到这里的失败（`[SessionKeys]` 读不动、
+    cryptography 闭包缺失、DescribeKey / GetPublicKey 被拒 / 限流 / 网络）都是该让部署失败的事，
+    而不是"打一行 WARNING 然后 exit 0 把一个 kid 永不匹配的 allowlist 全球复制出去"。离线 synth
+    （无凭据的 CI、本地看模板）显式设 `APP_SYNTH_OFFLINE=1` 才走占位符路径，且产物仍带 SYNTH-ONLY
+    标记（verify_deployed_edge.sh 会抓，纵深保留）。
+    配置错误（非 RS256 行、KMS 里的 key 与 `spki_sha256` 不符）在任何模式下都抛：那不是"读不到"，
+    是写错了。
+
+    **它只回答"可不可以退化"这一个问题。** 产物里要不要装 Edge 依赖**不看它**，看注进去的 allowlist
+    带不带 SYNTH-ONLY 标记（`_asset_is_synth_only`）——理由见 `WebRouterStack.__init__` 那一段。
     """
     return os.getenv("APP_SYNTH_OFFLINE") == "1"
 
@@ -165,19 +170,22 @@ def load_site_allowlist(keys, *, kms=None) -> str:
     from session_keys import SYNTH_PLACEHOLDER_ALLOWLIST_JSON, SessionKeysError
 
     def _degrade(reason_cn: str, reason_en: str, exc: Exception, fix: str = "",
-                 *, reraise: bool = False) -> str:
+                 *, as_config_error: bool = False) -> str:
         """**唯一**的退化点：默认让 synth 失败，显式离线才注占位。
 
-        `reraise` 给配置本身读不动的那一路——`SessionKeysError` 的消息已经指名道姓（缺哪个键、
-        哪个小节），再包一层只会把它推远。
+        `as_config_error` 给配置本身读不动的那一路：**类型仍是 `SessionKeysError`**（调用方与闸门
+        按它判"这是配置错，不是环境故障"），原消息一字不改地留在最前面（它已经指名道姓缺哪个键、
+        哪个小节），后面补上与 KMS 那条同样的出路提示——原消息缺的只是"我现在只想看模板怎么办"。
         """
+        way_out = ("离线只看模板请显式设 APP_SYNTH_OFFLINE=1（产物带 SYNTH-ONLY 标记、且不含 "
+                   "cryptography/，不可部署）或用 APP_SITE_ALLOWLIST_JSON 覆盖。")
         if not _synth_offline():
-            if reraise:
-                raise exc
+            if as_config_error:
+                raise SessionKeysError(
+                    f"{exc}——synth 拒绝生成模板，什么都不会部署。{way_out}") from exc
             raise RuntimeError(
                 f"{reason_cn}（{type(exc).__name__}: {exc}）——synth 拒绝生成模板，什么都不会部署。{fix}"
-                "离线只看模板请显式设 APP_SYNTH_OFFLINE=1（产物带 SYNTH-ONLY 标记，不可部署）"
-                "或用 APP_SITE_ALLOWLIST_JSON 覆盖。") from exc
+                + way_out) from exc
         print(f"WARNING: {reason_en} ({exc}); APP_SYNTH_OFFLINE=1 ⇒ injecting the SYNTH-ONLY "
               "placeholder allowlist. DO NOT deploy this template.", file=sys.stderr)
         return SYNTH_PLACEHOLDER_ALLOWLIST_JSON
@@ -189,7 +197,8 @@ def load_site_allowlist(keys, *, kms=None) -> str:
         try:
             site_refs = list((keys() if callable(keys) else keys).allowlist("site"))
         except SessionKeysError as exc:
-            text = _degrade("读 [SessionKeys] 失败", "could not load [SessionKeys]", exc, reraise=True)
+            text = _degrade("读 [SessionKeys] 失败", "could not load [SessionKeys]", exc,
+                            as_config_error=True)
             site_refs = None
         if site_refs is not None:
             for ref in site_refs:      # 已加载成功的行：非 RS256 是配置错，在 try 之外 ⇒ 任何模式都抛
@@ -225,6 +234,47 @@ def load_site_allowlist(keys, *, kms=None) -> str:
     # 坏值根本不该进产物，Edge 回滚要 10-20 分钟全球复制。
     json.loads(text)
     return text
+
+
+SYNTH_ONLY_SENTINEL = "SYNTH-ONLY-PLACEHOLDER-DO-NOT-DEPLOY.txt"
+
+
+def _synth_only_marker() -> str:
+    """SYNTH-ONLY 标记的**唯一来源**：占位 allowlist 的那个 kid（定义在 session_keys.py）。
+
+    **不在这里抄第二份字面量**——抄一份就会与占位常量、与 verify_deployed_edge.sh 的 grep 各自漂，
+    而这三处必须是同一个字符串才谈得上"标记 ⇔ 不可部署"。
+    """
+    _session_keys_on_path()
+    from session_keys import SYNTH_PLACEHOLDER_ALLOWLIST_JSON
+    return next(iter(json.loads(SYNTH_PLACEHOLDER_ALLOWLIST_JSON)))
+
+
+def _asset_is_synth_only(site_allowlist_json: str) -> bool:
+    """这份产物是不是"看得出不可部署"的那种：**注进去的** allowlist 带 SYNTH-ONLY 标记。
+
+    判据刻意是**产物内容**而不是 `_synth_offline()` 那个旗标（见 `__init__` 里的理由）。用包含而不是
+    与占位常量等值比：显式 `APP_SITE_ALLOWLIST_JSON` 里带上这个标记同样算"我知道这份不可部署"，
+    那是离线看模板的正当出路。
+    """
+    return _synth_only_marker() in site_allowlist_json
+
+
+def _write_synth_only_sentinel(target_dir: str) -> Path:
+    """跳过 vendoring 时往 asset 里放一个带标记的哨兵文件，让"缺依赖"这件事在产物里看得见。
+
+    没有它，"asset 里没有 cryptography/"只能靠数目录发现；有了它，任何按标记做的核对
+    （verify_deployed_edge.sh、人眼 `ls`）都会命中。Lambda 产物多一个文本文件无副作用。
+    """
+    path = Path(target_dir) / SYNTH_ONLY_SENTINEL
+    path.write_text(
+        f"{_synth_only_marker()}\n\n"
+        "这份 Edge 产物是 synth 的占位形态：注入的 allowlist 是 SYNTH-ONLY 占位（kid 永不匹配），\n"
+        "且**没有**交叉安装 cryptography 闭包，所以 Lambda@Edge 冷启动会 import 失败。\n"
+        "不要部署它。要真产物：让 [SessionKeys] 可加载、凭据能 kms:DescribeKey / GetPublicKey，\n"
+        "然后不带 APP_SYNTH_OFFLINE / APP_SITE_ALLOWLIST_JSON 重新 synth。\n",
+        encoding="utf-8")
+    return path
 
 
 EDGE_REQUIREMENTS = Path(__file__).parent / "lambda" / "requirements-edge.txt"
@@ -414,10 +464,18 @@ class WebRouterStack(Stack):
 
         # Edge 内嵌 verifier 现在 import cryptography（RS256 验签），而 Lambda@Edge 既没有层
         # 也不能带环境变量 ⇒ 依赖必须在这里按 hash 交叉装进 asset 目录（ADR 0003 / spec §11.1）。
-        # **离线 synth 跳过**（装依赖要联网）：那条路的产物本来就带 SYNTH-ONLY 标记、不可部署，
-        # 少一个 cryptography/ 目录是同一件事的一部分。真产物里有没有它由
-        # verify_deployed_edge.sh 事后核对。
-        if not _synth_offline():
+        #
+        # **判据是注进产物的 allowlist 带不带 SYNTH-ONLY 标记，不是 `_synth_offline()` 那个旗标。**
+        # 按旗标判会开出第四种组合：旗标还留在 shell / CI 环境里（陈旧变量），而 config 已是 RS 形态、
+        # KMS 可达、四项校验通过 ⇒ 注进去的是**真** allowlist（产物没有标记、看起来完全正常），
+        # 却跳过了 vendoring ⇒ asset 里没有 cryptography/ ⇒ **每次** Edge 冷启动 import 失败
+        # = 所有子域 502，而 Edge 回滚要 10-20 分钟全球复制。资产的安全叙事是
+        # 「标记 ⇔ 不可部署」，这里按**构造**维持它：跳过 vendoring 的那一支一定写标记哨兵，
+        # 没有标记的那一支一定装依赖。第三种结局是**响亮失败**——带真 allowlist 而 pip 装不动
+        # （无网）时 `check=True` 让 synth 失败，那正确：这种产物既没有标记又缺依赖。
+        if _asset_is_synth_only(site_allowlist_json):
+            _write_synth_only_sentinel(temp_dir)
+        else:
             vendor_edge_dependencies(temp_dir)
 
         # Lambda@Edge function
