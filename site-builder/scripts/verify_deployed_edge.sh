@@ -221,8 +221,14 @@ fi
 # 安全属性。同样按代码行断言，不用裸 grep——这个名字在注释里也出现。
 # **3c-final 起只有一条**：legacy 入口整条代码已删，`typ` 那条断言随它一起删掉
 # （留着它会永久红，而"永久红"很快会被当成噪音忽略——那比没有断言更糟）。
-if grep -qE '^\s+if claims\.get\("token_use"\) != "site-session":' "$TMP/index.py"; then
-  echo "PASS  查 token_use（M05：console 用途的 token 不能当站点会话）"
+# 判据的形态跟着 Edge 的字节等价守卫走（router 单测：`_verify_site_session` 从 `try:` 到
+# `return claims` 与 auth/session.py 的 `verify_token` 逐字相同）：Edge 把用途钉成局部名
+# `token_use = "site-session"`，判定行写成 `!= token_use`。所以这里要**两行都在**——只查判定行
+# 抓不到"局部名被改成别的用途"，只查局部名抓不到"判定行被删"；两条各有一条负例
+# （deployer/tests/test_verify_deployed_edge_static.py，用真源码跑本段）。
+if grep -qE '^\s+token_use = "site-session"' "$TMP/index.py" \
+   && grep -qE '^\s+if claims\.get\("token_use"\) != token_use:' "$TMP/index.py"; then
+  echo "PASS  查 token_use（M05：console 用途的 token 不能当站点会话；用途钉 site-session + 判定行都在）"
 else
   fail "产物的 _verify_site_session 没有 token_use 检查 —— M05 未生效：一个 console 升级码/面板会话就是一个有效站点会话"
 fi

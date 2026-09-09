@@ -38,6 +38,8 @@ ARTIFACT_START = "# ---- 3c-final / ADR 0003："
 ARTIFACT_END = 'echo "── ③'
 KEYS_START = "# ---- 3c-final：site family 的**公钥精确对账**"
 KEYS_END = "\nROWS\n"          # 逐把对账那个 while 的 here-doc 终止符
+M05_START = "# ---- S1：M05（token 用途混用）与 M06（同名 cookie 遮蔽）----"
+M05_END = KEYS_START           # M05 段紧挨着公钥对账段
 
 
 def _slice(start: str, end: str, *, keep_end: bool) -> str:
@@ -48,6 +50,8 @@ def _slice(start: str, end: str, *, keep_end: bool) -> str:
 
 ARTIFACT_BLOCK = _slice(ARTIFACT_START, ARTIFACT_END, keep_end=False)
 KEYS_BLOCK = _slice(KEYS_START, KEYS_END, keep_end=True)
+M05_BLOCK = _slice(M05_START, M05_END, keep_end=False)
+EDGE_SRC = (ROOT / "router" / "infrastructure" / "lambda" / "origin_request.py").read_text(encoding="utf-8")
 
 
 def _code_only(text: str) -> str:
@@ -403,3 +407,41 @@ def test_artifact_block_reds_without_the_golden_warmup(env):
     rc, out = _run(ARTIFACT_BLOCK, env)
     assert rc != 0, out
     assert "RS256_GOLDEN" in out, out
+
+
+# ---- M05 段：**用真源码跑**（正对照）+ 两个方向的红 -------------------------------------------
+#
+# 为什么必须用真源码：这段是本分支之前就有的旧断言，Task 10 把 Edge 的判定行从
+# `!= "site-session":` 改成 `!= token_use:`（局部名钉用途，好让那段与 auth 逐字相同），
+# 而这条断言的 grep 没跟着改；两个 Task 的单测各自全绿，直到切换后第一次真机跑闸门才假红。
+# 下面第一条就是缺的那道链：闸门的判据必须能在 HEAD 的 origin_request.py 上过。
+
+def test_m05_block_passes_on_the_real_edge_source(env):
+    """**正对照**：HEAD 的 origin_request.py 原样当产物 ⇒ M05 段零红。"""
+    (env["art"] / "index.py").write_text(EDGE_SRC, encoding="utf-8")
+    rc, out = _run(M05_BLOCK, env)
+    assert rc == 0, out
+    assert "PASS  查 token_use" in out, out
+
+
+def test_m05_block_reds_when_the_check_line_is_removed(env):
+    """删掉判定行 ⇒ 任何用途的 token 都当站点会话 ⇒ 必须红。"""
+    mutated = EDGE_SRC.replace('    if claims.get("token_use") != token_use:\n        return None, "wrong_token_use"\n', "")
+    assert mutated != EDGE_SRC, "变形没生效——源码里的判定行形态变了，先改这里再改闸门"
+    (env["art"] / "index.py").write_text(mutated, encoding="utf-8")
+    rc, out = _run(M05_BLOCK, env)
+    assert rc != 0, out
+    assert "M05 未生效" in out, out
+
+
+def test_m05_block_reds_when_the_local_pin_is_retargeted(env):
+    """局部名改钉成别的用途（判定行原样）⇒ Edge 会接受 console 升级码当站点会话 ⇒ 必须红。
+
+    这是"两行都在"里第二行存在的理由：只查判定行看不见这一种改法。
+    """
+    mutated = EDGE_SRC.replace('    token_use = "site-session"', '    token_use = "console-upgrade"', 1)
+    assert mutated != EDGE_SRC, "变形没生效——源码里的用途钉形态变了，先改这里再改闸门"
+    (env["art"] / "index.py").write_text(mutated, encoding="utf-8")
+    rc, out = _run(M05_BLOCK, env)
+    assert rc != 0, out
+    assert "M05 未生效" in out, out
