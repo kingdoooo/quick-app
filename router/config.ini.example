@@ -53,9 +53,7 @@ region = us-east-1
 # Lambda Settings (OPTIONAL - Can keep defaults)
 # ============================================================================
 [Lambda]
-# IAM role name for Lambda execution
-# This role will be created by CDK if it doesn't exist
-execution_role_name = lambda-execution-role
+# The Edge execution role is created and named by CDK (see stack.py); it is not configurable here.
 # Lambda memory size in MB (128-10240)
 memory_size = 128
 # Lambda timeout in seconds (max 30 for Lambda@Edge origin-request)
@@ -67,15 +65,6 @@ timeout_seconds = 5
 [LambdaEdge]
 # Lambda@Edge function name for origin request
 origin_request_function_name = application-web-router
-
-# ============================================================================
-# Lambda Test Settings (OPTIONAL - For testing only)
-# ============================================================================
-[LambdaTest]
-# ECR repository name for test Lambda images
-ecr_repository = expressjs-demo
-# Function name prefix for test deployments
-function_prefix = expressjs-demo
 
 # ============================================================================
 # CDK Stack Settings (OPTIONAL - Can keep defaults)

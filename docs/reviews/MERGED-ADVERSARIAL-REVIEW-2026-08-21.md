@@ -1014,7 +1014,7 @@ PutItem（回落时还是跨区），无限流、无采样、无去重；行带 
 都不引用 `templates/`。子代理 rev-contract 逐对 diff 过 5 组，当前一致——
 即无缺陷、但无守卫，与 M11 同类。
 
-### M22 · [P3] 文档/配置漂移
+### M22 · [P3] 文档/配置漂移 — **已修（2026-09-10，asset-v1 工单 11）**：三个死键删除而非接线（表由 CDK 按字面量建、三个部署脚本与测试按字面量交叉核对）；`[Alerting] email` 进就绪清单；守卫 `test_config_example_keys_are_read.py`。下面是当时的原文。
 
 - `site-builder/config.ini.example:83` 的 `[Alerting] email` 出厂为空，而
   `site-builder/auth/alarm_pipeline.py` 在其为空时抛 `ValueError`
@@ -1218,7 +1218,7 @@ ap-northeast-1 侧 97/97、us-east-1 侧 62/62 全部同区解析，
 | 7 | **M03 + M16** | 必须**一起**做：强制可重放 DDL 的前提是子目录不能绕过扫描 |
 | 8 | **M04 的判别实验** | 无副作用的真机实验；出结果再决定是否进队列 |
 | 9 | M11、M13、~~M17~~（✅ 2026-09-10，asset-v1 工单 10）、M21 | 把手抄的不变量变成可执行守卫 |
-| 10 | ~~M14~~（**✅ 2026-09-07 已修并部署**，asset-v1 工单 09。**处方与本行原结论相反**：不是"持久化 npm install 解析结果并按五键复用"，而是**合同强制 `backend/package-lock.json`**（红线 8：lockfileVersion 2/3、每条 `resolved` 在 registry.npmjs.org 且带 sha512 `integrity`、根条目与 package.json 一致、拒 shrinkwrap / link / 非 node_modules 键、四个依赖段禁 file:/git/URL/别名规格）+ CodeBuild 改 `npm ci --ignore-scripts`。反转理由：复审方前提"生成方是 Agent、无法凭空产出 lockfile"不成立——SKILL 第 4/5a 步本来就让 Agent 本地 `npm install` 预览，lockfile 是副产品；持久化方案是一个有状态的新设计面（不可变存储、五键绑定、artifacts 写权限收窄、首次解析审计）。代价：存量无 lockfile 的站点下次重部会被 validate 拒，报错给出一行重生成命令）、M15、~~M19~~（**✅ 2026-09-07 已修并部署**，asset-v1 工单 05：`_ROUTE_CACHE` 改有界 LRU、上界 1024；**miss 仍缓存是刻意的**——不缓存会让同一个被反复打的不存在 host 变成路由表热键，随机 host 洪水本就每个一次 GetItem、只受上界约束；每标签一次 GetItem 的放大不在本票射程）、M20、M22 | 卫生、文档、可观测性 |
+| 10 | ~~M14~~（**✅ 2026-09-07 已修并部署**，asset-v1 工单 09。**处方与本行原结论相反**：不是"持久化 npm install 解析结果并按五键复用"，而是**合同强制 `backend/package-lock.json`**（红线 8：lockfileVersion 2/3、每条 `resolved` 在 registry.npmjs.org 且带 sha512 `integrity`、根条目与 package.json 一致、拒 shrinkwrap / link / 非 node_modules 键、四个依赖段禁 file:/git/URL/别名规格）+ CodeBuild 改 `npm ci --ignore-scripts`。反转理由：复审方前提"生成方是 Agent、无法凭空产出 lockfile"不成立——SKILL 第 4/5a 步本来就让 Agent 本地 `npm install` 预览，lockfile 是副产品；持久化方案是一个有状态的新设计面（不可变存储、五键绑定、artifacts 写权限收窄、首次解析审计）。代价：存量无 lockfile 的站点下次重部会被 validate 拒，报错给出一行重生成命令）、M15、~~M19~~（**✅ 2026-09-07 已修并部署**，asset-v1 工单 05：`_ROUTE_CACHE` 改有界 LRU、上界 1024；**miss 仍缓存是刻意的**——不缓存会让同一个被反复打的不存在 host 变成路由表热键，随机 host 洪水本就每个一次 GetItem、只受上界约束；每标签一次 GetItem 的放大不在本票射程）、M20、~~M22~~（**✅ 2026-09-10 已修**，asset-v1 工单 11：三个死键从两份 `.example` 删除（含 router 的 `[Lambda] execution_role_name` 与整个 `[LambdaTest]`），`[Alerting] email` 进 §0「告警收件人」与就绪清单，守卫 `deployer/tests/test_config_example_keys_are_read.py` 要求 `.example` 每个键至少被一处非测试源码点名） | 卫生、文档、可观测性 |
 | 11 | **IdP 通用性验证 + 内置"Cognito 管理员建户"模式**（2026-09-06 新增；ADR 0006） | 面向所有 AWS 用户，多数采用者没有飞书。v1 前用 Google 与第二个 Cognito 池各走一遍部署与登录；`deploy_pool.py` 可选建第二个池作 IdP（管理员建户、邮箱不可自改），平台代码零改动 |
 | 12 | **迁移脚手架与单账号数据移出资产**（2026-09-06 新增；ADR 0005） | legacy 状态机、schema 3/4→5 通道、HS 版 runbook、blue/green 存量迁移脚本删除；`account_trust_baseline.json` 与探针结果不再 tracked；DEPLOY.md 的时间线迁到决策记录。**基线 untrack 已随 08 完成**；探针结果 JSON 与 DEPLOY.md 时间线仍归本行 |
 | 13 | **文档两层**（2026-09-06 新增） | 采用者文档（**含 CLAUDE.md**：验证环境状态迁出）过"新用户新账号"检查；spec/plan/review/security 保留 tracked，文件头声明"含单账号实测与迁移过程，不是操作指引" |

@@ -83,9 +83,9 @@ require_email_verified = true
 email =
 
 # 二期 M3 控制台（panel）。deploy_panel.py 从这里取值。
+# 控制台用的表（site-ops-log / site-session-codes）**不是配置项**：由 ④ 的 deployer 栈按字面量建，
+# deploy_panel.py 按同一字面量下发——所以这里没有表名键。
 [Panel]
-ops_log_table = site-ops-log
-session_codes_table = site-session-codes
 # 前端静态资源的版本前缀：S3 platform/console/{version}/
 # **留空（推荐）**：版本段自动取前端产物的内容指纹，改了前端就是新前缀，
 # 不依赖人记得递增。前缀不可变——deploy_panel 拒绝往已发布且内容不同的前缀
@@ -107,7 +107,6 @@ console_version =
 #
 # 需要给"只能配静态 Header 的客户端"（如 Quick Desktop Remote MCP）用时才配：
 # [ApiKey]
-# keys_table = site-api-keys
 # # client_credentials 必须有 resource server + scope（不能用空 scope 建 client）。
 # # 这两个值拼成 machine token 请求的 scope（{resource_server_id}/{scope}），
 # # 由 deploy_key_proxy.py 下发给 key-proxy，运行时不再重新拼。

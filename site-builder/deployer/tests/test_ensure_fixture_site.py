@@ -30,9 +30,6 @@ CFG = textwrap.dedent("""
     [Deployer]
     sites_table = site-sites
     admins_table = site-admins
-
-    [Panel]
-    ops_log_table = site-ops-log
 """)
 SUB = f"app-{efs.FIXTURE_SITE_ID}"
 
@@ -242,6 +239,21 @@ def test_the_config_values_are_what_permissions_sees_during_the_call(aws, tmp_pa
                     "OPS_LOG_TABLE": "site-ops-log"}
 
 
+def test_ops_log_table_is_the_platform_literal_not_a_config_key(aws, tmp_path, monkeypatch):
+    """`OPS_LOG_TABLE` 不是配置项（merged review M22）：deployer 栈按字面量建 `site-ops-log`、
+    `deploy_panel` 按同一字面量下发给 panel。本脚本若从 config 读它，采用者填个别的值就会让夹具脚本
+    与 panel 写两张**不同**的审计表——比"改了不生效"更糟。所以 config 里写了别的值也不生效、
+    没有 `[Panel]` 段也不算缺值，环境里的陈旧值同样被覆盖。"""
+    monkeypatch.setenv("OPS_LOG_TABLE", "stale-from-env")
+    with_other = CFG + "\n[Panel]\nops_log_table = somebody-elses-table\n"
+    with efs._config_env(_cfg(tmp_path, with_other)) as want:
+        assert want["OPS_LOG_TABLE"] == "site-ops-log"
+        assert os.environ["OPS_LOG_TABLE"] == "site-ops-log"
+    with efs._config_env(_cfg(tmp_path)) as want:          # 没有 [Panel] 段也不算缺值
+        assert want["OPS_LOG_TABLE"] == "site-ops-log"
+    assert os.environ["OPS_LOG_TABLE"] == "stale-from-env", "退出时要还原环境"
+
+
 # ---- 与真源模块、与闸门的对账 ----------------------------------------------------------------
 
 def test_the_real_permissions_module_converges_both_rows_and_then_the_gate_finds_the_target(aws, tmp_path):
@@ -293,3 +305,15 @@ def test_the_read_back_uses_the_gates_own_lookup_not_a_second_copy_of_the_criter
         assert efs._gate_target(cfg) is None, bad
     _route(ddb)
     assert efs._gate_target(cfg).subdomain == SUB
+
+
+def test_the_ops_log_literal_is_pinned_to_the_cdk_table_and_the_panel_env():
+    """`_ENV_LITERALS["OPS_LOG_TABLE"]` 是第三份手抄的 `site-ops-log`：唯一创建者是 `deployer/infra/app.py`
+    的 CDK 表定义，panel 的 `deploy_panel.py` 按同一字面量下发。漂移的症状不是报错而是写进一张不存在的表
+    （`ops_log` 的 PutItem 被吞），所以三份必须由这一条钉在一起——与 key-proxy 的
+    `test_api_keys_table_name_matches_the_cdk_table` 同款。"""
+    name = efs._ENV_LITERALS["OPS_LOG_TABLE"]
+    app_src = (ROOT / "site-builder" / "deployer" / "infra" / "app.py").read_text(encoding="utf-8")
+    panel_src = (ROOT / "site-builder" / "panel" / "deploy_panel.py").read_text(encoding="utf-8")
+    assert f'table_name="{name}"' in app_src, f"CDK 不再按 {name!r} 建 ops-log 表了？先改 app.py 再改这里"
+    assert f'"OPS_LOG_TABLE": "{name}"' in panel_src, f"deploy_panel 下发的 OPS_LOG_TABLE 不再是 {name!r}"

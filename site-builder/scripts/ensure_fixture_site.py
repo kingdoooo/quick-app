@@ -19,7 +19,7 @@ static 站点（fixtures/static-hello）、`require_login=True`、`allowed_users
 失败，把操作者指回一个刚说"没问题"的脚本。事务在路由行缺失时会返回 `route_synced=False`
 （真源写了、投影没写），那正是这种形态。
 
-**取值只认 config.ini**：六个环境变量在本函数执行期间被**无条件覆盖**成 config 的值、退出时还原。
+**取值只认 config.ini**：六个环境变量在本函数执行期间被**无条件覆盖**（五个是 config 的值，`OPS_LOG_TABLE` 是与部署面相同的平台字面量）、退出时还原。
 `setdefault` 是错的——一个陈旧的 `AWS_DEFAULT_REGION` export 会让本脚本去另一个区读 sites 表，
 而 `deploy_fixture` 按 config 部署 ⇒ 每次都判成"不存在"并重新部署（幂等性没了），或者把权限写进错误的区。
 用不带路径的 python3 跑（CLAUDE.md）。
@@ -46,13 +46,17 @@ from _session_mint import FIXTURE_SITE_ID, PROBE_EMAIL, live_target  # noqa: E40
 CONFIG_PATH = ROOT / "site-builder" / "config.ini"
 FIXTURE = "static-hello"
 # permissions.py 与 common.py 按环境变量找表（它们本来是 Lambda 里的模块）。
-# 值全部来自 config.ini，**不接受环境变量覆盖**——见模块 docstring 最后一段。
+# 值来自 config.ini，**不接受环境变量覆盖**——见模块 docstring 最后一段。
 _ENV_FROM_CONFIG = (("SITES_TABLE", "Deployer", "sites_table", "site-sites"),
                     ("ADMINS_TABLE", "Deployer", "admins_table", "site-admins"),
-                    ("OPS_LOG_TABLE", "Panel", "ops_log_table", "site-ops-log"),
                     ("ROUTING_TABLE", "Platform", "routing_table", None),
                     ("BASE_DOMAIN", "Platform", "base_domain", None),
                     ("AWS_DEFAULT_REGION", "Platform", "region", "us-east-1"))
+# 平台自己的审计表**不是配置项**：deployer 栈按字面量建 `site-ops-log`、`deploy_panel` 按同一字面量
+# 下发 OPS_LOG_TABLE。这里曾从 `[Panel] ops_log_table` 读——那个键没有任何部署路径尊重它
+# （merged review M22），采用者填个别的值只会让本脚本与 panel 写两张不同的审计表。
+# 与部署面同一个字面量，同样**无条件覆盖**环境里的陈旧值。
+_ENV_LITERALS = {"OPS_LOG_TABLE": "site-ops-log"}
 
 
 @contextlib.contextmanager
@@ -66,7 +70,7 @@ def _config_env(config_path: Path):
     cfg.read(config_path)
     if not cfg.sections():
         raise SystemExit(f"{config_path} 读空了——configparser 对缺失文件是静默的")
-    want = {}
+    want = dict(_ENV_LITERALS)
     for key, section, option, default in _ENV_FROM_CONFIG:
         raw = cfg.get(section, option, fallback=default) or ""
         want[key] = raw.split("#")[0].strip() or (default or "")

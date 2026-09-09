@@ -1709,10 +1709,10 @@ def run_analytics() -> int:
     #
     # 角色名取自 site-builder/config.ini 的 `[Deployer] edge_role_arn`——与
     # `_check_edge_role_id_env` 和 ⑤⑧ 的 Principal 断言同一个来源。
-    # **不用 router/config.ini 的 `[Lambda] execution_role_name`**：那个键与线上
-    # Edge 角色无关（角色由 CDK 生成名字，实测线上叫
-    # `ApplicationWebRouterStack-EdgeFunctionRole…`），拿它去 list_role_policies
-    # 得到的是 NoSuchEntity——闸门会红，但红的理由是假的。
+    # **不从 router/config.ini 猜角色名**：Edge 角色由 CDK 生成名字（实测线上叫
+    # `ApplicationWebRouterStack-EdgeFunctionRole…`）。router 的 `.example` 曾有一个
+    # `[Lambda] execution_role_name` 键，与线上角色无关、无人读取（merged review M22，已删）；
+    # 拿那种手填的名字去 list_role_policies 得到的是 NoSuchEntity——闸门会红，但红的理由是假的。
     iam = boto3.client("iam")
     edge_role = read_cfg("Deployer", "edge_role_arn").rsplit("/", 1)[-1]
     # 账号取 router 的 `[AWS] account_id`：`stack.py` 拼这几个 ARN 用的就是它

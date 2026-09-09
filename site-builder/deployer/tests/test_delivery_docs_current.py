@@ -1183,3 +1183,30 @@ def test_threat_model_marks_the_hs_era_section_historical():
         "「密钥有三条路能拿到」这一节没有 superseded / 历史记录 标记——"
         f"读者会把 HS 形态当成现状。认可的标记：{_SUPERSEDED_MARKERS}")
     assert "HS256" in sec, "标记在，但这一节已经不谈 HS 形态了——标记该跟着走"
+
+
+# ---- 配置键与就绪清单的对账（merged review M22）-------------------------------------------
+
+def test_deploy_md_readiness_lists_the_alert_recipient():
+    """`[Alerting] email` 为空时 `deploy_auth.py` 响亮失败（`alarm_pipeline` 抛 ValueError），
+    而 §0 的就绪清单从前没列它：采用者按 §0 备齐一切、到 ① 才被一个没听说过的键拦下。
+    两处都要有：§0 正文（讲清"要有人能收信并点 SNS 确认链接"与 `SB_ALERT_EMAIL` 这条覆盖路径）
+    与「部署顺序总览」末尾那份 checklist。"""
+    doc = _read(DEPLOY)
+    sec0 = _section(doc, "## 0. 前置要求（全部备齐才开始）")
+    assert "[Alerting]" in sec0 and "SB_ALERT_EMAIL" in sec0, "§0 没提告警收件人"
+    assert "确认" in sec0 and "deploy_auth.py" in sec0, "§0 要讲清订阅须手工确认、缺它 deploy_auth.py 会失败"
+    overview = _section(doc, "## 部署顺序总览")
+    checklist = overview[overview.index("开始前的就绪清单"):]
+    assert "[Alerting]" in checklist, "「开始前的就绪清单」没列 [Alerting] email"
+
+
+def test_deploy_md_does_not_document_config_keys_that_nothing_reads():
+    """M22 的三个死键（`[Panel] ops_log_table` / `session_codes_table`、`[ApiKey] keys_table`）从
+    `.example` 删了：表名由 deployer 栈按字面量建、部署脚本按同一字面量下发，不是配置项。
+    文档若还把它们列成"要回填的字段"，采用者会去填一个不存在的键。否定断言覆盖整个文件。"""
+    doc = _read(DEPLOY)
+    for key in ("ops_log_table", "session_codes_table"):
+        assert key not in doc, f"DEPLOY.md 还在提已删除的配置键 {key}"
+    assert not re.search(r"(?<![_a-z])keys_table\b", doc), "DEPLOY.md 还在提已删除的配置键 keys_table"
+

@@ -506,6 +506,17 @@ key 只在 ⑤ 的最后一步删。
 就回滚 Edge**，回滚只会把窗口拉长。login-flow secret 泄漏的处置是 `aws ssm put-parameter --overwrite`（5 分钟内
 进行中的登录失败一次，无会话影响）。
 
+### 告警收件人
+
+登录失败告警（`deploy_auth.py` 幂等收敛：metric filter → SNS topic → email 订阅 → alarm）要一个收件人：
+`site-builder/config.ini` 的 `[Alerting] email`，或环境变量 `SB_ALERT_EMAIL`（CI 场景，优先）。
+**两者都空时 `deploy_auth.py` 响亮失败**——不允许静默造出一个没人收通知的 alarm，所以这个邮箱在 ① 之前就要定下来。
+（那次失败抛在 Lambda 已经收敛**之后**：① 会部分落地；补上邮箱再跑一遍 `deploy_auth.py` 即幂等收敛，无需回退。）
+
+选邮箱的唯一硬要求：**有人能收信并点 SNS 的确认链接**。脚本只能创建订阅、无法代为确认；未确认时 alarm
+照样进 ALARM 而无人收到，`deploy_auth.py` 会把 `PendingConfirmation` 显式报告为「未完成」，
+`verify_auth_alarm.sh` 也只认 confirmed 的订阅。真实邮箱只写进 gitignored 的 `config.ini`，不进 `.example`。
+
 ### 本机工具链
 
 
@@ -626,6 +637,8 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
 - [ ] 身份源就绪：【飞书】企业自建应用（App ID/Secret，含用户 userid + 邮箱权限）
       / 【标准 IdP】OIDC/SAML 应用已建、email attribute 可映射
 - [ ] Docker 运行中；`npx` 可用
+- [ ] `[Alerting] email`（或 `SB_ALERT_EMAIL`）已定：一个**有人能点 SNS 确认链接**的邮箱——
+      为空时 ① 的 `deploy_auth.py` 直接失败
 - [ ] `site-builder/config.ini` 与 `router/config.ini` 已从 `.example` 复制并填好
 
 ---
@@ -2601,7 +2614,7 @@ RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/tes
 | [Deployer] | state_machine_arn                                      | ④ CfnOutput StateMachineArn |
 | [MCP]      | endpoint_url                                           | ⑤                           |
 | [Alerting] | email                                                  | 你指定的告警收件人（**必须手工点确认订阅链接**） |
-| [Panel]    | ops_log_table / session_codes_table / console_version   | 直接用 `.example` 的默认值（⑤b 读它） |
+| [Panel]    | console_version                                        | **留空**（`.example` 默认；⑤b 读它）：版本段取前端产物的内容指纹，只在手工回滚到某个已知前缀时才填。控制台的表名不是配置项（④ 按字面量建） |
 
 `router/config.ini` 的 `[SiteBuilder]` 还需 `require_idp_claim` /
 `trusted_idps`（见 ②）。
