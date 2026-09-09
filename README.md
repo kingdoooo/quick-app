@@ -136,9 +136,10 @@ KMS 非对称 CMK 由执行器（④）那个 CDK 栈创建（每把 $1/月 + `k
 1. **备齐前置**：照 [site-builder/DEPLOY.md](site-builder/DEPLOY.md) §0 的就绪清单
    逐项确认，并从两份 `config.ini.example` 复制出自己的配置。
 2. **部署**：照同文档七个阶段执行
-   （①身份层 → ②路由 → ③DSQL → ④执行器 → ⑤MCP → ⑥客户端 → ⑦彩排）；
+   （①身份层 → ②路由 → ③DSQL → ④执行器 → ⑤MCP → ⑥客户端 → ⑦部署后验收）；
    每阶段产出的 ARN/ID 按手册回填 `site-builder/config.ini`。
-3. **演示**：⑦ 的 E2E 通过后，演示叙事见实施计划 Task 23。
+3. **验收**：⑦ 的验收集（七条分发的闸门，同文档「部署后验收」一节）全绿即部署完成；
+   演示叙事见实施计划 Task 23。
 4. **仍未交付的候选**：Python 站点 runtime（当前仅 Node.js 后端）、精细缓存
    （当前 CloudFront 全站禁缓存，那是鉴权正确性的前提）。
    原清单里的 MCP API-Key、站点协作者、管理面板、PKCE/nonce **都已在二期交付**

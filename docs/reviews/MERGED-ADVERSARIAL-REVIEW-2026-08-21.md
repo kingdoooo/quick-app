@@ -1222,7 +1222,7 @@ ap-northeast-1 侧 97/97、us-east-1 侧 62/62 全部同区解析，
 | 11 | **IdP 通用性验证 + 内置"Cognito 管理员建户"模式**（2026-09-06 新增；ADR 0006） | 面向所有 AWS 用户，多数采用者没有飞书。v1 前用 Google 与第二个 Cognito 池各走一遍部署与登录；`deploy_pool.py` 可选建第二个池作 IdP（管理员建户、邮箱不可自改），平台代码零改动 |
 | 12 | **迁移脚手架与单账号数据移出资产**（2026-09-06 新增；ADR 0005） | legacy 状态机、schema 3/4→5 通道、HS 版 runbook、blue/green 存量迁移脚本删除；`account_trust_baseline.json` 与探针结果不再 tracked；DEPLOY.md 的时间线迁到决策记录。**基线 untrack 已随 08 完成**；探针结果 JSON 与 DEPLOY.md 时间线仍归本行 |
 | 13 | **文档两层**（2026-09-06 新增） | 采用者文档（**含 CLAUDE.md**：验证环境状态迁出）过"新用户新账号"检查；spec/plan/review/security 保留 tracked，文件头声明"含单账号实测与迁移过程，不是操作指引" |
-| 14 | **验收打包**（2026-09-06 新增） | 分发 `verify_deployed_*` + `smoke_router` + 四个 `verify_*`；E2E、账号信任边界闸门、冒充面探针标为开发者 / 可选工具 |
+| 14 | ~~**验收打包**~~（2026-09-06 新增；**✅ 2026-09-10 已修**，asset-v1 工单 13：DEPLOY.md「⑦ 部署后验收」= 前置表 + 七条 fail-fast 验收集 + 「开发者回归」（E2E）+ 「可选：账号信任边界自检」（闸门首跑 --update-baseline、探针；`mkdir -p .scratch`）；七条守卫 `test_delivery_docs_current.py` 钉命令集合精确相等） | 分发 `verify_deployed_*` + `smoke_router` + 四个 `verify_*`；E2E、账号信任边界闸门、冒充面探针标为开发者 / 可选工具 |
 | 15 | **v1 出口验收与 tag**（2026-09-06 新增） | 全新账号只看 DEPLOY.md 从零部署并跑第 14 行的验收集，卡住处修回手册；通过后打 `v1.0.0`，之后小修走 v1.x |
 | — | M18、M23 | 已接受风险 / 风险观察，不进修复队列 |
 

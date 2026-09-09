@@ -570,9 +570,9 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
 组件间有依赖，必须按序：
 
 ```
-①身份层 → ③DSQL → ④执行器(第一次) → 回填 [SessionKeys] → ②路由层 → 回填 edge_role_arn → ④执行器(第二次) → auth → ⑤部署MCP → ⑤b控制台 → 夹具站点 → ⑥客户端接入 → ⑦端到端彩排
- deploy_pool.py    cluster   SFN+Lambda+两把CMK  session_key_       CloudFront   [Deployer]         同一条 cdk        deploy_   AgentCore   deploy_panel   ensure_      Skill+MCP        RUN_E2E
- (Task 3)          (Task 13) (Task 17)           fingerprint.py     (Task 8)     edge_role_arn      deploy 再跑一次    auth.py   (Task 20)   (二期 M3)      fixture_     (Task 22)        (Task 23)
+①身份层 → ③DSQL → ④执行器(第一次) → 回填 [SessionKeys] → ②路由层 → 回填 edge_role_arn → ④执行器(第二次) → auth → ⑤部署MCP → ⑤b控制台 → 夹具站点 → ⑥客户端接入 → ⑦部署后验收
+ deploy_pool.py    cluster   SFN+Lambda+两把CMK  session_key_       CloudFront   [Deployer]         同一条 cdk        deploy_   AgentCore   deploy_panel   ensure_      Skill+MCP        验收集（七条）
+ (Task 3)          (Task 13) (Task 17)           fingerprint.py     (Task 8)     edge_role_arn      deploy 再跑一次    auth.py   (Task 20)   (二期 M3)      fixture_     (Task 22)        
                                                  --from-stack                                                                                              site.py
                                              ⑤c API Key（可选，二期 M4）· ⑤d 访问统计（二期 M5）
 ```
@@ -775,7 +775,7 @@ exit "$m01_rc"
 | `verify_table_collision_e2e.py` | 第 7 步（部署后可随时跑；**会真实部署/下线两个一次性站点**） | 表名碰撞在真机上关闭的**行为**证据：B 正常部署（正对照）、A 的碰撞 manifest 被线上 validate 以 `TABLE_NAME_RE` 原话拒绝、A 侧零资源残留、B 侧逐字段不变（表 schema/tags/role policy/data_tables）、purge 三态幂等（对已购清站点重复 purge 收敛到 DELETED）。跑完强一致读回核对清零，输出含 site/job ID 的 JSON 摘要 | 清理与幂等探针**直接 Event 调 `site-deployer-undeploy`**（复刻 MCP 建 job 后的动作）——证明的是部署函数行为，不是 MCP/panel 鉴权链路（那由 `verify_api_key_e2e.py` 覆盖）。sites/jobs 的 DELETED 历史行保留 |
 | `verify_deployed_edge.sh` | 第 7 步，**在业务验收之前**（第 6 步等到 `Deployed` 之后） | CloudFront **当前关联的那个版本**的产物与本地 `origin_request.py` 逐行相同（只允许占位符行有差异）、占位符全部替换、安全开关是收紧值，外加 M05（查 `typ`）与 M06（逐个验、不截断）两条哨兵、产物里注入的 `FRONTEND_BUCKET_DOMAIN` == 按 `router/config.ini [AWS] account_id` 推出的 `site-frontend-<account_id>.s3.us-east-1.amazonaws.com`；**⑤ router 栈的 stack policy**：一条 Deny 精确覆盖 Edge 两函数、分发与路由表四个逻辑 ID，且策略带 Allow-all（`router_stack_policy.py check`，只读） | **证据等级是静态产物比对，不是行为探针**：它证明"跑在线上的就是这份源码"，M05/M06 的**行为**由下面那条闸门单独证。也不看非默认 cache behavior 上的关联。也不证明谁持有 `cloudformation:SetStackPolicy`（那是 IAM 层，归探针与信任边界文档） |
 | `verify_site_table_integrity.py` | 第 7 步（部署后自检，也可随时跑） | per-site 数据表的归属：ACTIVE NoSQL 站点的表存在且 tag `project`/`site_id` 正确；**每个 `site-rt-{site_id}` 角色的 DynamoDB 表 ARN 集合与同一站点自己的表精确相等**（不多、不少、无通配、不含别站的表）；DSQL 角色没有任何表 ARN；static（engine=none）站点**没有**运行时角色是合法态（角色存在时表 ARN 集合必须为空）；全部 `data_tables` 逻辑名符合 `TABLE_NAME_RE` | 只看**当前 ACTIVE** 站点——历史/DELETED 行不做全量对账（表可能已删），但它们含连字符的 `data_tables` 仍会被报出来。不核 DSQL 侧的 schema/role 隔离（那在 PG 层）。要害判定抽成了纯函数 `role_arn_problems`，反向验证在 `deployer/tests/test_verify_site_table_integrity.py` |
-| `verify_session_token_semantics.py` | 第 7 步，紧跟上一条 | M05/M06 的**真机行为**：遮蔽 cookie 排在合法会话之前时 `/console-session` 仍换出升级码、Edge 侧仍放行（含 14 条遮蔽的量级）、console 升级码当站点会话被拒；含正对照（单枚合法会话能进）与负对照（无 cookie 仍 302）。**只发 GET，不写数据** | 它只挑路由表里第一个 `require_auth=True` 的站点，不遍历全部站点；候选条数上限那一类**回归**残留由单测的结构守卫管，不在这里 |
+| `verify_session_token_semantics.py` | 第 7 步，紧跟上一条 | M05/M06 的**真机行为**：遮蔽 cookie 排在合法会话之前时 `/console-session` 仍换出升级码、Edge 侧仍放行（含 14 条遮蔽的量级）、console 升级码当站点会话被拒；含正对照（单枚合法会话能进）与负对照（无 cookie 仍 302）。**只发 GET，不写数据** | 它只打**常驻夹具站点**（`_session_mint.live_target`：路由表里 owner 是夹具域、`require_auth=True` 的那条，`ensure_fixture_site.py` 建），不遍历真实站点——真实站点上的同一行为只能由「线上产物 == 这份源码」推出；夹具身份边界那一条要账号里有真实 org 站点，没有时印 **SKIP**（既不算通过也不算失败）；候选条数上限那一类**回归**残留由单测的结构守卫管，不在这里 |
 
 另两条：`verify_permission_matrix.py`（权限矩阵端到端，M02 之后唯一覆盖它的）、
 `verify_console_e2e.py` + `smoke_router.sh`（控制台与路由层）。
@@ -1384,7 +1384,7 @@ pre-token 触发器、managed login branding。命令与实测基线见前面
    describe 核对全部符合，即可进入 ②。**端到端的真人登录验证不在这一步**：
    完整链路（Hosted UI → IdP → 回调 → 会话）要等 ② 路由层与登录服务都在线
    才存在，放在 ⑥ 客户端接入（auth.js 首次 OAuth 能拿到含 email 的 access
-   token）与 ⑦ 彩排里做。
+   token）与 ⑦ 部署后验收里做。
 
 > **MCP 的 token 形态已钉死**（2026-07-29 真机）：AgentCore 网关只接受
 > **access token**（id_token 会被 401 `Claim 'client_id' value mismatch`），
@@ -2584,17 +2584,145 @@ claude mcp add --transport http site-builder-deploy {mcp_endpoint_url} \
 
 ---
 
-## ⑦ 端到端彩排（Task 23）
+## ⑦ 部署后验收
+
+**怎么知道它对：下面「验收集」那个围栏块里的七条命令全绿。** 七条分三层——线上产物就是这份源码
+（前两条）、鉴权在边缘生效（第三、四条）、三条业务链路在真机上可用（后三条）。任一条红：先读它自己
+打印的 `FAIL` 行（每条都是失败即非零退出、不会只打印不通过），再回到对应组件小节末尾的「实测坑」。
+它们只碰自己建的一次性资源并读回清理，可以对已有用户的环境反复跑。
+
+**不在验收集里的两组工具各有自己的小节**：全量 E2E 是开发者回归（见下），账号信任边界闸门与冒充面
+探针是可选自检（见下）。它们回答的都不是"这次部署对不对"。
+
+### 前置条件（全新账号里每条都有获取路径）
+
+三条通用前置：AWS 凭据指向目标账号（`aws sts get-caller-identity`，闸门要读 Lambda / KMS / IAM /
+DynamoDB / CloudFront，用部署时那套凭据即可）；两份 `config.ini` 已按「部署后回填检查清单」回填；
+② 的 CloudFront 分发状态是 `Deployed`（Edge 全球复制 10–20 分钟，没等到就跑会验到旧版本）。
+Python 脚本一律用**不带路径的 `python3`**（≥ 3.10，装了 boto3 / pip-system-certs / cryptography，
+见「本机工具链」）；两个 shell 脚本另需 `aws` CLI 与 `curl`。
+
+| 脚本 | 它还需要什么 | 在全新账号里怎么拿到 | 副作用 |
+|---|---|---|---|
+| `verify_deployed_components.py` | 无 | — | 只读。`[ApiKey]` 段缺席时第 ⑧ 段跑的是 **absence 断言**（不是 SKIP） |
+| `verify_deployed_edge.sh` | 分发已 `Deployed` | 等 ② 的部署真正结束 | 只读；默认核对 CloudFront **当前关联**的版本 |
+| `smoke_router.sh` | 无 | — | 写一次性路由行与 S3 对象，跑完逐个删除并读回；含 65 秒等路由更新可见 |
+| `verify_session_token_semantics.py` | 夹具登录态 | `[Verification]` + 常驻夹具站点（见下一段） | 只发 GET |
+| `verify_console_e2e.py` | 夹具登录态；部署了 ⑤b 控制台 | 同上 | 建两条 fixture 记录，删后强一致读回 |
+| `verify_analytics_e2e.py` | 夹具登录态 **+ 一个真实用户的 OAuth token** | 同上；token 见下面第 3 条 | 自建一次性站点、发真实请求、跑一次 rollup，再逐个清理 |
+| `verify_api_key_e2e.py` | `[ApiKey]` 段（⑤c 已启用）+ 夹具登录态 | 只有启用 ⑤c 的采用者才有这条 | 创建真实 Key 并完成一次真实部署；场景 ④ 临时关闸再开回（`finally` 恢复） |
+
+夹具登录态与 OAuth token 是两个**不同**的东西，各有一条获取路径：
+
+1. **夹具登录态**（`[Verification]`，可选组件；详见「夹具站点与验收前置」一节）。`site-builder/config.ini`
+   的 `[Verification] fixture_issuer = true`，`verifier_trusted_principals` 里列出本机凭据对应的 IAM ARN
+   （`aws sts get-caller-identity` 的 `Arn`），然后**重跑 `deploy_auth.py`**——那条 `/fixture-session`
+   路由与 `site-builder-verifier` 角色只在这个开关开着时才部署。不开它平台功能完整，代价是表里标
+   "夹具登录态"的四条闸门跑不了（它们会响亮失败，不会静默跳过）。
+2. **常驻夹具站点**：`python3 site-builder/scripts/ensure_fixture_site.py`（幂等）。上面四条只打这个站点，
+   不冒充任何真实 owner；它不存在时闸门报"没有目标"，不是"部署坏了"。
+3. **真实用户的 OAuth token**（只有 `verify_analytics_e2e.py` 的 MCP 段要）：
+   `node site-builder/clients/quick-desktop-proxy/auth.js "{mcp_endpoint_url}" "{mcp_client_id}"`
+   在浏览器里走一次平台 IdP 登录，token 落到 `~/.site-builder-deploy-token.json`。⑥ 里 `claude mcp add`
+   那次 OAuth **不是**这个落点——闸门只读 `auth.js` 写的那个文件。refresh 有效期 1 天，过期后重跑
+   `auth.js` 是预期行为；拿不到 token 时该闸门记 FAIL 而不是 SKIP（「验收未完成」不能长得像「验收通过」）。
+
+### 验收集（按这个顺序跑）
 
 ```bash
-# 前一天跑：全链路 E2E（会话 cookie 经 auth 的 /fixture-session 取，自动化 CRUD，无需人工扫码）
+set -euo pipefail
+cd {仓库根}
+
+# 1 线上每个 Lambda 产物 == 这份源码（含 Function URL 授权、会话 key 的 env/config/KMS 三方对账、
+#   Edge 产物里只有 site 公钥、⑦ console route 形态、⑨ 统计管道的副本区集合）
+python3 site-builder/scripts/verify_deployed_components.py
+# 2 CloudFront 当前关联的 Edge 版本 == 本地 origin_request.py（逐行；占位符全部替换）+ router 栈的 stack policy 仍在
+bash site-builder/scripts/verify_deployed_edge.sh
+# 3 路由层行为：无 auth 静态 200 / 有 auth 302 / 未知子域 404 / 路由更新 65 秒内生效
+bash site-builder/scripts/smoke_router.sh
+# 4 会话语义的真机行为（只发 GET）：同名 cookie 遮蔽下仍放行、未知 kid 被拒且不回落、夹具会话进不了真实站点
+python3 site-builder/scripts/verify_session_token_semantics.py
+# 5 控制台全链路：未登录 fail-closed、伪造 x-user-email 直连 403、越权全拒且线上数据零改动、CSRF、/console-session
+python3 site-builder/scripts/verify_console_e2e.py
+# 6 访问统计全链路：真实请求 → Edge 埋点 → rollup → 面板与 MCP 读回同一组数字（MCP 段要上面第 3 条的 token）
+python3 site-builder/scripts/verify_analytics_e2e.py
+# 7 API Key 通道（⑤c 是可选组件：没启用就没有验收对象，脚本会明确退出说明，不是 SKIP）
+if grep -q '^\[ApiKey\]' site-builder/config.ini; then
+  python3 site-builder/scripts/verify_api_key_e2e.py
+fi
+```
+
+顺序有两处是硬的：第 1、2 条在业务闸门**之前**——产物是旧的时候，后面五条的结果没有解读价值
+（旧 Edge 会放过它不认识的 claim，业务探针结构上分辨不出新旧）；第 2 条要等 CloudFront `Deployed`。
+第 3、4 条是路由层与会话语义的行为，比业务链路更底层——它们红了，后三条的红就没有独立解读价值，
+所以排在第 5–7 条那三条业务链路之前。启用了 ⑤c 的采用者另跑 ⑤c 小节里的 `verify_oauth_and_impersonation.py`
+（它要的也是第 3 条那个 token）。
+
+**耗时（单账号实测；principal / 站点数与链路快慢决定量级，慢链路上大致翻倍）**：串行整轮约 26 分钟——
+第 1 条约 14 分钟（逐个 Lambda 下载产物做字节比对，全场最长），第 2 条约 4 分钟，第 3 条约 2.5 分钟
+（含两次 65 秒等路由更新可见），第 4 条不到 1 分钟，第 5 条与第 7 条各约 1.5 分钟，第 6 条约 2 分钟。
+第 1 条在十几分钟里只零星打点，**输出停住不等于挂死**。
+
+**这七条不证明的**：账号里谁能 `kms:Sign` 两把 CMK、谁能改 auth / panel / Edge 的代码——那是账号信任边界，
+归下面的可选自检；per-site 角色与数据表的归属完整性归「S1 加固」一节的 `backfill_site_role_policies.py --check`
+与 `verify_site_table_integrity.py`（存量环境升级时跑，全新账号首装时没有存量角色可查）。
+
+### 开发者回归（不在验收集里）
+
+全量 E2E 走真实部署（static / notes / expenses 三档 fixture 的建站、登录 CRUD、下线），整轮约 37 分钟，
+超过很多工具的单次超时上限：中途被杀会让清理 fixture 跑不完、留下真站点，所以要后台跑或调大超时。
+它验的是执行器与合同的行为，不是"这次部署对不对"——验收集的第 1 条已经证明产物是这份源码，
+而这份源码的行为由七个包的单测覆盖（命令见 `CLAUDE.md`「测试命令」）。改了 deployer / contract 的人在
+提交前跑它；采用者不需要。
+
+```bash
 cd {仓库根}
 RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/test_e2e_fixtures.py -q
 ```
 
-预期 9 passed：static 200、notes 未登录 302 + 登录后 CRUD + author=IdP 邮箱、expenses DSQL CRUD、undeploy 后 404 等。
+轮转会话密钥时的两个探针（`verify_kid_entry_live.py` 的 `--role` / `--retired-token`、
+`session_verify_counts.py --drain-gate previous`）属于「轮转会话密钥（KMS）」那节的 runbook，不属于验收集。
 
-演示叙事（10 分钟）与故障预案见 plan Task 23。
+### 可选：账号信任边界自检
+
+平台的安全边界是 AWS 账号本身（`docs/security/account-trust-boundary.md`）：账号内能 `kms:Sign` 两把
+CMK、能给自己授权（`kms:PutKeyPolicy` / `kms:CreateGrant`）、能改 auth / panel 代码或替换 CloudFront
+正在执行的 Edge 版本的 principal 仍能冒充任意用户，这个集合收不到零。两个工具回答的是"**这个集合有多大、
+有没有变大**"，与部署对不对无关，所以是可选的；共享账号（多个团队 / 多套工作负载）里建议跑，
+专用账号里它主要用来发现漂移。两个都**只读**，用不带路径的 `python3`。
+
+```bash
+cd {仓库根}
+mkdir -p .scratch   # 下面 --dump-observed 的落点。闸门是原子写（临时文件建在目标的**父目录**里），
+                    # 父目录不存在就 FileNotFoundError——而那一步在**跑完十几分钟之后**才执行，
+                    # 全新 clone 里没有 .scratch/
+
+# 漂移闸门。基线不随资产分发（含单账号实测值，gitignored）⇒ **首跑只能生成基线、不出结论**：
+python3 site-builder/scripts/verify_account_trust_boundary.py --update-baseline
+# 之后每次部署后比一次；任何 added / removed / changed 都红，不判"改善"。
+# 密钥增减必须声明（--new-key / --retire-key，见轮转 runbook），否则一律红。
+python3 site-builder/scripts/verify_account_trust_boundary.py
+# 想看红条目对应哪些真实角色名：一次扫描落快照 + 多次离线重比（快照含账号内标识，只许落 .scratch/，按 0600 写）
+python3 site-builder/scripts/verify_account_trust_boundary.py --dump-observed .scratch/trust-boundary-observed.json
+python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump .scratch/trust-boundary-observed.json
+
+# 冒充面探针：按「动作等价类 × 资源等价类」数出谁能签会话 / 谁能替换运行中的 Edge，含等价类计数与已知盲区
+python3 site-builder/scripts/probe_impersonation_surface.py --self-test      # 反例自检，不碰 AWS，秒级
+python3 -u site-builder/scripts/probe_impersonation_surface.py \
+    --dump-observed .scratch/observed-impersonation-surface.json           # 名字只许落 gitignored 路径，脚本发请求前先查
+```
+
+**耗时（单账号实测，principal 数决定量级）**：闸门约 11 分钟——几百个 principal × 3 次 IAM 模拟
++ **两次** `GetAccountAuthorizationDetails`（第二次是模拟后的窗口**两端**一致性复查，两端不一致就作废本轮、
+不出结论也不写基线；它不保证原子，三个已接受的盲区见风险文档）+ 扫 bootstrap 桶 + 逐版本校验 Edge 代码。
+探针约 5 分钟（脚本实测 4–6 分钟；链路慢时成倍变长——同一个账号上那个「约 11 分钟」的闸门实测过 28 分钟）。
+它用 `-u` 逐步打点；单次 AWS 调用的 `read_timeout` 是 120 秒，输出停住不到这个量级不算挂死，
+把它调小反而会把 `GetAccountAuthorizationDetails` 变成超时重试的假挂死。探针的 `--write-evidence` 会重写仓库里
+那份脱敏聚合证据（只有计数与指纹）——采用者自检不需要它。
+
+**结论怎么读**：闸门红的是"集合变大了"，不是"部署坏了"——先用 `--dump-observed` 看是哪条 grant、
+属于哪个 principal，再决定是收权还是接受后 `--update-baseline`（它先打印比较报告再写，接受了什么会留痕）。
+"集合能收到多小"的量测边界、以及为什么 SCP / resource policy / 应用层签名 / 收窄 invoke 都不成立，见风险文档。
 
 ---
 

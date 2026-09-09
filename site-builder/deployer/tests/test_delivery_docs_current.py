@@ -1210,3 +1210,145 @@ def test_deploy_md_does_not_document_config_keys_that_nothing_reads():
         assert key not in doc, f"DEPLOY.md 还在提已删除的配置键 {key}"
     assert not re.search(r"(?<![_a-z])keys_table\b", doc), "DEPLOY.md 还在提已删除的配置键 keys_table"
 
+
+
+# --------------------------------------------------------------------------
+# asset-v1 ticket 13：验收打包（spec §11.9 第 2、8 条）——采用者部署完"怎么知道它对"
+# --------------------------------------------------------------------------
+#
+# DEPLOY.md 的最后一步是**分发的验收集**：`verify_deployed_*` + `smoke_router` + 四个 `verify_*`。
+# E2E 是开发者回归、账号信任边界闸门与冒充面探针是可选自检——三者都不在验收集里，但各有自己的
+# 小节（读者要能找到它们，只是不该把它们当成"部署对不对"的判据）。
+ACCEPTANCE_HEADING = "## ⑦ 部署后验收"
+ACCEPTANCE_SET_HEADING = "### 验收集（按这个顺序跑）"
+DEVELOPER_REGRESSION_HEADING = "### 开发者回归（不在验收集里）"
+TRUST_BOUNDARY_HEADING = "### 可选：账号信任边界自检"
+
+# spec §11.9 第 2 条的原话展开；"四个 verify_*" 的成员以「夹具站点与验收前置」一节点名的为准。
+DISTRIBUTED_GATES = (
+    "verify_deployed_components.py", "verify_deployed_edge.sh", "smoke_router.sh",
+    "verify_console_e2e.py", "verify_analytics_e2e.py", "verify_api_key_e2e.py",
+    "verify_session_token_semantics.py",
+)
+# 在验收集的**围栏块**里出现即红（散文里提一句"E2E 见开发者回归"是允许的，那是指针不是清单项）。
+NOT_IN_ACCEPTANCE_SET = (
+    "RUN_E2E", "test_e2e_fixtures.py",
+    "verify_account_trust_boundary.py", "probe_impersonation_surface.py",
+    "verify_kid_entry_live.py", "session_verify_counts.py",
+)
+_FULL_E2E_RE = re.compile(r"test_e2e_fixtures\.py\s+-q")   # 全量 E2E；④ 的单条冒烟带 `::test_…`，不算
+
+
+def _fenced_text(text: str) -> str:
+    """只取围栏代码块里的内容——验收集"只列这些"的判据看命令，不看散文。"""
+    return "\n".join("\n".join(block) for _, block in _fenced_blocks(text))
+
+
+def _acceptance_set_violations(doc: str) -> list:
+    """判定与 test_… 分离，好让合成文本做正负对照。
+
+    **"不多不少"要两侧都有断言**：白名单在场 + 黑名单缺席只证明了"不少"——往围栏里加一条
+    `verify_permission_matrix.py` / `verify_site_table_integrity.py` 照样全绿，而采用者会把
+    多出来的那条当成必过项。所以按围栏里出现的 `site-builder/scripts/<名字>` 抽出**实际集合**
+    与清单做等值比较（`origin_request.py`、`site-builder/config.ini` 都不在 `scripts/` 前缀下，
+    不会误入）。
+    """
+    cmds = _fenced_text(_section(doc, ACCEPTANCE_SET_HEADING))
+    names = set(re.findall(r"site-builder/scripts/([\w.-]+)", cmds))
+    out = [f"验收集里没列 {g}" for g in sorted(set(DISTRIBUTED_GATES) - names)]
+    out += [f"验收集里混进了 {t}" for t in NOT_IN_ACCEPTANCE_SET if t in cmds]
+    out += [f"验收集里多出 {n}（不在七条分发闸门里）" for n in sorted(names - set(DISTRIBUTED_GATES))]
+    return out
+
+
+def test_deploy_md_acceptance_set_lists_exactly_the_distributed_gates():
+    """采用者部署完最需要的一句话是"怎么知道它对"——答案是一个围栏块，七条命令，不多不少。
+    多一条（E2E、信任边界闸门）会让采用者把开发者工具当成必过项；少一条则漏验一层。"""
+    doc = _read(DEPLOY)
+    _section(doc, ACCEPTANCE_HEADING)          # 标题被改名时在这里自报空转
+    assert _acceptance_set_violations(doc) == [], _acceptance_set_violations(doc)
+    # fail-fast 是这个围栏块的语义前提：第一条红了还继续跑，采用者会拿着半套结果当"验收通过"。
+    cmds = _fenced_text(_section(doc, ACCEPTANCE_SET_HEADING))
+    assert cmds.strip().splitlines()[0].strip() == "set -euo pipefail", \
+        f"验收集围栏的第一行不是 set -euo pipefail，而是 {cmds.strip().splitlines()[0]!r}"
+    assert "|| true" not in cmds, "验收集里有 `|| true`——它把失败吞成绿"
+
+
+def test_acceptance_set_guard_fires_on_missing_and_on_smuggled_entries():
+    """**正负对照**：漏一条要红、围栏里混进开发者工具要红、散文里提到不算混进。"""
+    good = "\n".join(
+        [ACCEPTANCE_HEADING, "", ACCEPTANCE_SET_HEADING, "",
+         "E2E（RUN_E2E）不在这里，见开发者回归。", "", "```bash"]
+        + [f"python3 site-builder/scripts/{g}" for g in DISTRIBUTED_GATES]
+        + ["```", "", DEVELOPER_REGRESSION_HEADING, "", "```bash",
+           "RUN_E2E=1 pytest test_e2e_fixtures.py -q", "```"])
+    assert _acceptance_set_violations(good) == [], _acceptance_set_violations(good)
+    missing = good.replace("python3 site-builder/scripts/smoke_router.sh\n", "")
+    assert any("smoke_router.sh" in v for v in _acceptance_set_violations(missing))
+    smuggled = good.replace("```\n\n" + DEVELOPER_REGRESSION_HEADING,
+                            "RUN_E2E=1 pytest test_e2e_fixtures.py -q\n```\n\n" + DEVELOPER_REGRESSION_HEADING, 1)
+    hits = _acceptance_set_violations(smuggled)
+    assert any("RUN_E2E" in v for v in hits) and any("test_e2e_fixtures.py" in v for v in hits), hits
+    # **多列一条**（黑名单之外的真实闸门）同样要红——否则"不多不少"只有一半有断言。
+    extra = good.replace("```\n\n" + DEVELOPER_REGRESSION_HEADING,
+                         "python3 site-builder/scripts/verify_permission_matrix.py\n```\n\n"
+                         + DEVELOPER_REGRESSION_HEADING, 1)
+    assert any("verify_permission_matrix.py" in v for v in _acceptance_set_violations(extra)), \
+        _acceptance_set_violations(extra)
+
+
+def test_deploy_md_acceptance_section_gives_an_acquisition_path_for_every_prerequisite():
+    """全新账号里每个分发脚本的前置条件都要有**获取路径**（工单 13 的第二句）：
+    登录态 → `[Verification]`（本机凭据列进 verifier_trusted_principals，改完重跑 deploy_auth.py）
+    + `ensure_fixture_site.py`；用户 OAuth token → `quick-desktop-proxy/auth.js`；
+    可选组件 → `[ApiKey]` 决定 verify_api_key_e2e.py 跑不跑。缺任一项，采用者会把"前置没备齐"
+    读成"部署坏了"。"""
+    sec = _section(_read(DEPLOY), ACCEPTANCE_HEADING)
+    for needle, why in (
+        ("[Verification]", "夹具签发器的开关"),
+        ("verifier_trusted_principals", "本机凭据要列进信任名单，否则 assume 不了 verifier 角色"),
+        ("ensure_fixture_site.py", "常驻夹具站点"),
+        ("deploy_auth.py", "改了 [Verification] 要重部 auth 才生效"),
+        ("quick-desktop-proxy/auth.js", "verify_analytics_e2e.py 的 MCP 段要真实用户 OAuth token"),
+        ("[ApiKey]", "可选组件缺席时 verify_api_key_e2e.py 无对象"),
+    ):
+        assert needle in sec, f"部署后验收一节没写 {needle}（{why}）"
+
+
+def test_deploy_md_full_e2e_lives_only_in_developer_regression():
+    """E2E 移到「开发者回归」，且全量 E2E 命令**只**在那里出现（否定断言覆盖整份文档）。
+    ④ 里手工触发一条 `::test_static_site_public_200` 当执行器冒烟不算全量。"""
+    doc = _read(DEPLOY)
+    dev = _section(doc, DEVELOPER_REGRESSION_HEADING)
+    assert "RUN_E2E=1" in dev and _FULL_E2E_RE.search(dev), "开发者回归一节没有全量 E2E 命令"
+    assert len(_FULL_E2E_RE.findall(doc)) == len(_FULL_E2E_RE.findall(dev)), \
+        "全量 E2E 命令还出现在「开发者回归」之外"
+    assert re.search(r"端到端彩排|⑦\s*彩排", doc) is None, \
+        "旧的 ⑦ 叫法还在（含「⑦ 彩排」这种带空格、无「端到端」的写法）——总览箭头图或正文没同步"
+
+
+def test_deploy_md_trust_boundary_self_check_is_optional_and_says_first_run_and_duration():
+    """账号信任边界闸门与冒充面探针是**可选**自检（§11.9 第 8 条）：小节要写明首跑只能
+    `--update-baseline` 生成基线、不出结论（基线不随资产分发），以及耗时——不写耗时，
+    采用者会在第 3 分钟把它当成挂死杀掉。"""
+    sec = _section(_read(DEPLOY), TRUST_BOUNDARY_HEADING)
+    for needle in ("verify_account_trust_boundary.py", "probe_impersonation_surface.py",
+                   "--update-baseline", "分钟", "--dump-observed"):
+        assert needle in sec, f"可选自检一节没写 {needle}"
+    assert re.search(r"首跑|第一次跑", sec), "没写明首跑的语义（只能生成基线，不能出结论）"
+    assert re.search(r"不出结论|不能出结论", sec), "没写明首跑不出结论"
+
+
+def test_deploy_md_acceptance_section_is_status_free():
+    """DEPLOY.md 整体进 `_STATUS_FREE_DOCS` 归工单 12；新写的验收一节从第一天起就按那条守——
+    它是采用者部署完读的最后一节，日期 / SHA / "已部署" 在这里比在别处更误导。"""
+    bad = _status_violations(_section(_read(DEPLOY), ACCEPTANCE_HEADING))
+    assert not bad, "部署后验收一节里有验证环境的状态：\n  " + \
+        "\n  ".join(f"L{no} {kind}: {hit}" for no, kind, hit in bad)
+
+
+def test_deploy_md_overview_arrow_ends_at_acceptance():
+    """总览箭头图的最后一格是 ⑦ 部署后验收（不再是 E2E 彩排）——采用者照箭头走到最后一格
+    就该得到"对不对"的答案。"""
+    sec = _section(_read(DEPLOY), "## 部署顺序总览")
+    assert "⑦部署后验收" in sec, "箭头图最后一格不是 ⑦部署后验收"
