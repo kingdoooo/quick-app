@@ -19,8 +19,9 @@ p95 +147.1 ms，256 MB 与之无差，热调用验签增量 0.12 ms。决定 ven
 ## Consequences
 
 - Edge 部署包从 1 个文件变成约 15.8 MB 解压 / 172 个文件，在 Lambda@Edge 50 MB 上限之内。
-- 公钥必须在模块顶层加载并预热一次验签：这一步是总差从 300 ms 降到 143 ms 的全部原因，
-  Edge 单测要断言 handler 路径里没有 `load_pem_public_key`。
+- `cryptography` 的 import 与一次**黄金三元组**验签在模块顶层（预热），而 allowlist 里那几把公钥
+  在**首次使用时**解析一次并缓存（惰性形态）：预热保住总差从 300 ms 降到 143 ms 这个收益，惰性
+  让"注入坏掉"只打到需要验签的路由、公开路由不受影响。Edge 单测断言两者的位置。
 - `--require-hashes` 的 AST 守卫要从 deployer bundling 扩到 `router/infrastructure/stack.py`。
 - JOSE 层检查（规范 base64url、拒 `crit`、`alg` 只比对 allowlist、签名长度等于模长）与实现选择无关，照样要做。
 - 若日后要撤回，spec §5 RSA 原语层的条款与反例清单仍在，那是唯一可接受的替代实现。

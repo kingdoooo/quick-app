@@ -104,7 +104,7 @@ def _kms():
 
 
 def ensure_secret(name: str, generate) -> str:
-    # 单一实现在 secrets_util.py（scripts/ensure_session_keys.py 也用它）；这里只是绑定本脚本的 client
+    # 单一实现在 secrets_util.py；这里只是绑定本脚本的 client
     return _ensure_secret(name, generate, ssm=_ssm())
 
 
@@ -330,9 +330,9 @@ def main():
     # 否则一个写宽了的信任策略要等到角色已经建好才被发现。
     verification = read_verification(cfg(), account=cfg()["Platform"]["account_id"])
     keys = load_session_keys(CFG_PATH)
-    # login-flow secret（spec §11.3）：主创建点是 scripts/ensure_session_keys.py（部署序列第①步一次
-    # 建齐 config 声明的所有密钥），这里是**缺省补建**（spec §11.8.6 把它叫「兜底」）——
-    # 两处都只创建不覆盖，先跑哪个都一样。**它是本脚本唯一还 ensure 的密钥**：会话签名密钥是
+    # login-flow secret（spec §11.3）：**本脚本的 `ensure_secret` 是唯一的创建方**（3c-final 起，
+    # 那个专门建密钥的脚本已删除，plan 08 D5；ADR 0004 说明它为什么不进写前核对清单）——
+    # 只创建不覆盖。**它是本脚本唯一还 ensure 的密钥**：会话签名密钥是
     # KMS 里的 CMK（deployer 栈建），本脚本只在 precheck 里核对它们。
     # 覆盖它的后果是所有**进行中**的登录失败一次（已签发的会话不受影响），见 _login_flow_sig 的说明。
     ensure_secret(keys.login_flow_secret_param, lambda: secrets.token_hex(32))

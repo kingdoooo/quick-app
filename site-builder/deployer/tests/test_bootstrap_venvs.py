@@ -31,7 +31,7 @@ GITIGNORE = ROOT / ".gitignore"
 CLAUDE_MD = ROOT / "CLAUDE.md"
 DEPLOY_MD = ROOT / "site-builder" / "DEPLOY.md"
 OUTSIDE_REPO_HEADING = "### 仓库外的几样东西（新 clone / 新机器按这个顺序恢复）"
-HOST_DEPS_CMD = "python3 -m pip install --user --break-system-packages boto3 pip-system-certs"
+HOST_DEPS_CMD = "python3 -m pip install --user --break-system-packages boto3 pip-system-certs cryptography"
 VENV_EXEC_LINE = '"$PY" -m venv --clear .venv'
 
 

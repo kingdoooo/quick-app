@@ -93,19 +93,16 @@ frontend_bucket = site-frontend-123456789012
 # e.g. domain_name = *.example.com -> base_domain = example.com).
 # auth.<base_domain> hosts the login service.
 base_domain = example.com
-# 3c-1A/1B: the Edge session allowlist (site family kids + the legacy switch) comes from
+# The Edge session allowlist (the site family's kids and their PUBLIC keys) comes from
 # site-builder/config.ini [SessionKeys]; stack.py reads it at synth time. Nothing to set here.
-# No secret VALUE is stored here either -- stack.py reads each one from SSM at deploy time and
-# string-substitutes it into the Edge function (Lambda@Edge has no environment variables):
-#   * the site family HS keys, from the [SessionKey:<kid>] ssm_param rows;
-#   * the legacy shared key, from [SessionKeys] legacy_param (3c-1B; the path is NO LONGER
-#     hardcoded here). Clearing legacy_param closes the legacy entry (L3): {{JWT_SECRET}} then
-#     gets an EMPTY STRING and LEGACY_ENTRY=off. An empty string is NOT the SYNTH placeholder --
-#     an SSM read failure makes synth FAIL (nothing is deployed); the SYNTH-ONLY-PLACEHOLDER
-#     fallback only exists under an explicit APP_SYNTH_OFFLINE=1 and that template must not be deployed.
-# The login-flow secret is auth-private and never reaches the Edge (a gate asserts this).
-# Create the keys with site-builder/scripts/ensure_session_keys.py (idempotent); rotation follows
-# the ten-step runbook in site-builder/DEPLOY.md -- never overwrite a session key in place.
+# No signing material of any kind lives here or in the Edge bundle: sessions are RS256 and the
+# private keys stay in two KMS asymmetric CMKs. At synth time stack.py fetches each site key's
+# public key from KMS, checks it against the configured spki_sha256, and string-substitutes the
+# allowlist into the Edge function (Lambda@Edge has no environment variables). A fetch failure or
+# a fingerprint mismatch makes synth FAIL (nothing is deployed); the SYNTH-ONLY placeholder
+# fallback only exists under an explicit APP_SYNTH_OFFLINE=1 and that template must not be deployed.
+# Keys are KMS CMKs created by the deployer stack; the Edge only embeds site public keys.
+# Rotation follows DEPLOY.md「轮转会话密钥（KMS）」 -- never swap a key's ARN in place.
 # spec §3.5：会话必须来自可信企业 IdP。存量会话没有 idp claim，
 # 所以首次部署配 false；切到平台专用 pool 且全体用户重新登录后置 true
 # （M1 的完成条件——停在 false 等于这道防线没生效）。

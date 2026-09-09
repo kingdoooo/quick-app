@@ -1,11 +1,12 @@
-"""SSM SecureString 的幂等创建与部署前核对（deploy_auth.py / deploy_panel.py / scripts/ensure_session_keys.py 共用）。
+"""SSM SecureString 的幂等创建与部署前核对（deploy_auth.py / deploy_panel.py 共用）。
 
 - ensure_secret：只在参数**不存在**时生成并写入；存在则原样返回，**绝不覆盖**（覆盖 = 换密钥 = 全员会话
-  失效，见 DEPLOY.md「轮转会话密钥」）。
+  失效，见 DEPLOY.md「轮转会话密钥（KMS）」）。3c-final 起 SSM 里只剩两把 HMAC / OAuth 密钥
+  （login-flow secret 与 site client secret），会话签名密钥是 KMS 里的 CMK、不经本模块。
 - precheck_parameters（3c-1B，spec §11.8.12）：部署脚本在**第一次写之前**核对它要读的每个参数存在。
   只读、不解密、不打印值；缺任一个 ⇒ SystemExit。auth/panel 的密钥值在运行时才按参数名读，参数缺失的
-  症状是全部登录 500 而部署脚本 exit 0（与 1A 那次 502 同形）；就位新 key 时忘跑 ensure_session_keys.py
-  就会撞上。这也是 spec §11.6 第 1 层"部署前校验"的落点，2B 在同一个钩子里加 KMS 四项。
+  症状是全部登录 500 而部署脚本 exit 0。这也是 spec §11.6 第 1 层"部署前校验"的落点——同一个钩子里
+  还做 KMS 那四项（DescribeKey + GetPublicKey，指纹与 config 不符即拒绝部署）。
 """
 from __future__ import annotations
 
@@ -24,20 +25,19 @@ def precheck_parameters(names, *, ssm, hint: str = "") -> None:
     if missing:
         raise SystemExit("部署前核对失败：这些 SSM 参数不存在，拒绝部署（任何写都未发生）：\n  "
                          + "\n  ".join(missing)
-                         + f"\n{hint or '会话密钥由 scripts/ensure_session_keys.py 按 [SessionKeys] 幂等创建；先跑它。'}")
+                         + f"\n{hint or 'login-flow secret 由 deploy_auth.py 的 ensure_secret 缺省补建；先跑它（ADR 0004）。'}")
 
 
 def ensure_secret(name: str, generate, *, ssm=None, region: str = "us-east-1") -> str:
     """参数不存在时生成并写入，存在则原样返回。**创建时打一行（只有参数名，没有值）。**
 
-    为什么创建必须有声音（3c-1B 复审）：本函数创建的那几把密钥都**不在**部署前核对清单里
-    （它们由本脚本自己创建，核对它们等于让创建永远走不到；见
+    为什么创建必须有声音：本函数创建的那把密钥**不在**部署前核对清单里（它由 deploy_auth 自己
+    创建，核对它等于让创建永远走不到；见
     `docs/adr/0004-login-flow-secret-outside-the-pre-write-precheck.md`）。于是"参数被删了、
     脚本默默重造一把"没有任何信号——事后只看到一轮失败的登录，无从判断发生过什么。
 
-    对 legacy 的 `jwt-secret` 这一行更要紧：它有**第二个**消费方（Edge 那份是 CDK 部署时
-    字符串替换注入的）。成熟部署里它被删之后，auth 造一把新的而 Edge 还拿着旧的 ⇒ 正是
-    全员登录循环。在成熟部署上看到它被 created，就该停下来查，而不是继续部署。
+    在成熟部署上看到它被 created，就该停下来查（谁删了它？），而不是继续部署：虽然 login-flow
+    secret 只有 auth 一个消费方、重造一把是正确行为，但"参数消失"本身是需要解释的事件。
 
     存在时保持安静：幂等重跑是常态，每次刷一行会把"创建"这个信号淹掉。
     """

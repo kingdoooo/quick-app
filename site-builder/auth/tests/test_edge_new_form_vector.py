@@ -108,7 +108,7 @@ def test_the_console_family_upgrade_code_is_rejected_at_the_edge(edge):
 # ---- 变形测试：证明正向向量真会红 -----------------------------------------------------------
 
 # 变形只允许落在 `//callback` 这一段里：`token_use="site-session"` 在文件里出现两次，另一处是
-# `/console-session` 里 `verify_with_legacy` 的**验签**参数——改它测的是另一件事，且会让
+# `/console-session` 里 `verify_token` 的**验签**参数——改它测的是另一件事，且会让
 # "变形必红"变成假信号。所以锚点先按段落切，再要求段内唯一。
 CALLBACK_REGION = ('if path == "/callback"', 'if path == "/console-session"')
 

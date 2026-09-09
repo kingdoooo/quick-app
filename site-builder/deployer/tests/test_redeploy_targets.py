@@ -88,7 +88,7 @@ def test_hand_asserted_coupling_pulls_in_the_edge():
     """session.py 改了也要重部 router——这条边推不出来，只能手写。
 
     `auth/session.py` 与 `router/infrastructure/lambda/origin_request.py` 是**两份独立
-    实现靠人手同步**同一套 HS256 会话验签（CLAUDE.md:145「两处必须字节级同步」、
+    实现靠人手同步**同一套 RS256 会话验签（CLAUDE.md 的「两处必须字节级同步」、
     origin_request.py:453 同款注释），不是文件复制，任何复制清单里都没有它。
     答成 `auth, panel` 而漏掉 router 的后果是**全平台会话验签失败**——这个工具存在
     的意义就是不在这类事上安静地答错。

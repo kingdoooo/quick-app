@@ -26,10 +26,11 @@ Edge 角色的 RoleId，`/api/me` 返回 200 且被识别成管理员。**这不
 **真正能关掉 Path A 的只有账号级 IAM 收窄**：让同账号里除 Edge / 部署器 / 面板之外
 的身份根本没有 `lambda:InvokeFunction` on 站点函数。SCP 是实现它的一种办法。
 
-> **⚠️ 2026-08-25 实测补充：关掉 Path A 也不足以恢复「身份只能来自 Edge」。**
-> 冒充任意用户**不需要 invoke**——账号内只读级权限即可取得 HS256 会话密钥
-> （Edge 产物里是明文；SSM 那条的 KMS 是 `alias/aws/ssm` 的直接授权，等于没有），
-> 拿到密钥就能签出真实会话 cookie 与 `scope=console` 的面板会话。
+> **⚠️ 关掉 Path A 也不足以恢复「身份只能来自 Edge」。**
+> 冒充任意用户**不需要 invoke**：账号内能 `kms:Sign` 那两把会话签名 CMK 的 principal（或能给自己
+> 授权的、或能改 auth / panel 的代码与配置的、或能替换 CloudFront 正在执行的 Edge 版本的）都能
+> 签出真实会话 cookie 与 `scope=console` 的面板会话。**只读级权限不再够**（RS256 之后产物与 SSM
+> 里只有公钥），但这条路径也不是 invoke 收窄能关掉的。
 > 所以本目录这份制品的定位比原先写的还要更弱一档：它收窄的是**其中一条**路径。
 > 完整风险模型、实测数字与漂移闸门见 **`docs/security/account-trust-boundary.md`**。
 

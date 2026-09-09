@@ -5,6 +5,20 @@
 > 这份文档是 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9 里
 > **M09 第 1 步**的产物，并且**扩大了 M09 的结论**——见「M09 的框架不够大」一节。
 
+> **3c-final 之后：面从"能读密钥"收到了"能签 ∪ 能替换验签代码"。** 会话签名是 RS256，私钥在两把
+> KMS 非对称 CMK 里，三处 verifier 只持公钥。于是**读 Edge 产物 / 读 bootstrap asset / 读 SSM
+> 参数都不再进冒充面**——那三条路上现在只有公钥与 login-flow secret。留下的面是三类，**它们不是
+> 同一个数字，别相加也别互相替代**：
+> ① **能签**——`kms:Sign` 两把 CMK 的 principal，加上能给自己授权的（`kms:PutKeyPolicy` /
+>   `kms:CreateGrant`）。闸门把这两类合成 `is_secret_grant`，表里那行叫「可签会话」。
+> ② **能替换平台代码**（`replace-platform-code:<fn>`）——改 auth / panel 的代码或配置、或替换
+>   CloudFront 正在执行的 Edge 版本，都能以 signer 的身份签或让 verifier 放行任意 token。
+> ③ **劫持 signer**——恶意代码以 signer 角色的身份调 KMS，所以**限制性 key policy 结构上关不掉它**。
+> 「可签会话」那一行**不是冒充面总数**，只是 ① 的计数。
+>
+> **下面「一句话」与「密钥有三条路能拿到」两节写的是 HS 形态（历史记录）**，结论已被本段取代；
+> 那两节与按类别的大表的改写归 §9 的工单 12/13，本次只改状态段、实测表、历史横幅与闸门承诺那一节。
+
 ## 一句话
 
 **这个平台的安全边界是 AWS 账号本身。** 账号内任何具备「读 Lambda 产物」、
@@ -53,13 +67,16 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 | 组 | 项 | 数 |
 |---|---|---|
 | **A 直接失守** | 具备非 IAM-write 敏感授权的 principal | 61 <!-- baseline:A总数=61 --> |
-| | 其中**能取得会话签名密钥**的 | 56 <!-- baseline:可读密钥=56 --> |
+| | 其中**能签会话**的（`kms:Sign` ∪ 能给自己授权；= 闸门的 `is_secret_grant`。**这不是冒充面总数**，见状态段 ②③） | TBD <!-- baseline:可签会话=TBD --> |
 | | 其中**非平台**身份可直接 `lambda:InvokeFunction` 平台或站点函数的 | 18 <!-- baseline:非平台可直调=18 --> |
-| | Edge 函数里仍带着 **legacy** 密钥的**代码目标**（历史已发布版本；L3 起 `$LATEST` 与新版本不再带） | 10 <!-- baseline:带活密钥的Edge代码目标=10 --> |
-| | CDK bootstrap 桶里仍带着**任一**活密钥（legacy ∪ 各 kid，取并集）的 asset 对象 | 15 <!-- baseline:带活密钥的asset=15 --> |
+| | 会话签名 CMK 数（site / console 各一把） | 2 <!-- baseline:kms_key数=2 --> |
 | **B IAM 写观察** | 持有相关 IAM 策略变更语句的 principal | 22 <!-- baseline:B持有IAM写语句=22 --> |
 | | 其中**不在 A 里**（只有 IAM 写、**未证明可提权**） | 4 <!-- baseline:仅IAM写=4 --> |
 
+> **以下这段是 HS 形态的口径（历史记录，3c-final 之后不再成立）**：那两个产物计数所依据的
+> `facts` 键随 HS 密钥材料一起删除，表里对应的两行也已删。留在这里是为了让读到旧闸门输出的人
+> 认得出那些字段是什么。**今天唯一还成立的一条是 login-flow 那一行**（它仍然不进冒充面）。
+>
 > **三个口径必须分开读：legacy / 每把 kid / login-flow。** 前两者进计数，第三者**不进**：
 >
 > | 口径 | 落在哪 | 进不进 A 组的"可读密钥"|
@@ -111,6 +128,10 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 的人），都可以冒充任意用户。
 
 ## 密钥有三条路能拿到，三条都实测可用
+
+> **历史记录（HS256 形态）。** 3c-final 之后这三条路读到的**只有公钥**：私钥在 KMS 非对称 CMK 里、
+> 任何组件的产物 / 环境变量 / SSM 里都没有能签会话的材料。整节保留是因为它记录了"为什么对称形态
+> 在共享账号里站不住"这条推导，而那正是非对称化的理由。**别把它当现状读**，现状在文件头的状态段。
 
 会话 JWT 与控制台会话（`__Host-sb_console`）用**同一把** HS256 密钥，
 真源是 SSM SecureString `/site-builder/jwt-secret`。
@@ -543,8 +564,9 @@ python3 site-builder/scripts/verify_account_trust_boundary.py \
   只命中该新成员的用例——这个纪律是**四次** false-green 换来的。
 - 它只看 IAM、Lambda resource policy、以及 **bootstrap 桶的 bucket policy**
   （模拟器不纳入 resource-based policy，对 role 更是不支持模拟它），
-  不看 KMS grants、VPC endpoint policy、其它服务的 resource policy，
-  **也不看 S3 access point**。
+  KMS 层看的是 **key policy 快照、grants、以及 `kms:Sign` / `kms:PutKeyPolicy` / `kms:CreateGrant`
+  的 identity policy 上界**；**不看 assume-role 链**（"A 能 assume B 而 B 能签"这种间接路径不在
+  射程内）。VPC endpoint policy、其它服务的 resource policy、**S3 access point** 都不看。
 - 它不看跨账号 principal。但语句里出现**外部账号**的 principal 会改变指纹 ⇒ 会红
   （账号归一化只归**当前**账号，就是为了留住这个信号）。
 - 它统计的是**当前**存在的 principal 与资源；某人临时建一个角色用完删掉，
@@ -684,9 +706,8 @@ merged review 的 M09 记的是「同账号 `lambda:InvokeFunction` 可对 panel
 - `site-builder/deployer/buildspec-package.yml` —— `--ignore-scripts` 那一行；
   它是「不可信站点依赖」与「平台签名密钥」之间当前唯一的隔断（见上文过宽授权一节）
 - `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §4 的 `M09` 与 §9 优先级表
-- `site-builder/DEPLOY.md` 「轮转会话密钥：十步 runbook」一节 —— **3c-1B（2026-09-05）之后
-  这条应急已经有了可执行协议**：verifier 全程双接受、新 key 经 `previous` 就位、切换 = 两槽互换、
-  排空满 26 h 才退役，且**首次执行已在生产跑完一轮**（含把 signer 回滚到旧 key 的演示）。
-  所以"换掉被读的密钥"不再是一个需要临时设计的动作，照 ⑥–⑩ 五步做即可。
-  仍与本文档直接相关的部分：**换掉它要连带清理 bootstrap 桶里那些仍带旧密钥的 asset 对象**
-  （数量见上面那张基线断言表的 asset 行，**别在这里写死**——每部署一次 Edge 就 +1）
+- `site-builder/DEPLOY.md` 「轮转会话密钥（KMS）」一节 —— **换一把会话签名 key 有可执行协议**：
+  verifier 全程两把都认、新 key 经 `previous` 就位、切换 = 两槽互换、排空满 26 h 才退役，
+  最后一步 `schedule-key-deletion` 才不可逆。所以"换掉一把可疑的 key"不是需要临时设计的动作。
+  与本文档的关系在 3c-final 之后变了：**产物与 asset 里已经没有私钥，所以不再需要清理 bootstrap
+  桶**；要看的是 CloudTrail 里 `eventName=Sign` 的调用者（谁在用那把 key），见该节的「应急」

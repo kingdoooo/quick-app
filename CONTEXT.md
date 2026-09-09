@@ -16,7 +16,7 @@ _Avoid_: issuer（会与 JWT 的 `iss` 混淆）、发牌方
 _Avoid_: validator、authorizer
 
 **Key family**：
-服务同一类 token 的一组密钥，同一时刻最多持有 current 与 previous 两把。平台只有两个 family：site-session 与 console。两个槽位的含义固定：**current** 是 signer 开关为 current 时签发用的那把；**previous** 是另一把被接受的 key，它要么是排空中的旧 key，要么是就位中的新 key。
+服务同一类 token 的一组密钥，同一时刻最多持有 current 与 previous 两把。平台只有两个 family：site-session 与 console。两个槽位的含义固定：**current** 是签发用的那把；**previous** 是另一把被接受的 key，它要么是排空中的旧 key，要么是就位中的新 key。
 _Avoid_: key ring、密钥组、key set、把 previous 理解成"一定比 current 旧"
 
 **Staging（就位）**：
@@ -24,7 +24,7 @@ _Avoid_: key ring、密钥组、key set、把 previous 理解成"一定比 curre
 _Avoid_: 预发布、pre-rotation、灰度
 
 **Retire（退役）**：
-把一把 key 或 legacy 入口从所有 verifier 的接受集合中移除，并销毁其密钥材料。只在观察窗口判据满足之后进行；退役后持该 key 的 token 被当作未知 kid 拒绝，与是否过期无关。
+把一把 key 从所有 verifier 的接受集合中移除，并销毁其密钥材料。只在观察窗口判据满足之后进行；退役后持该 key 的 token 被当作未知 kid 拒绝，与是否过期无关。
 _Avoid_: 删 key、rotate out、下线、把硬切换叫退役
 
 **kid**：
@@ -35,16 +35,8 @@ _Avoid_: key name、key alias
 一个 verifier 自己接受的 kid 集合，以及每个 kid 绑定的算法与密钥材料。不同 verifier 之间不共享。
 _Avoid_: key registry（暗示全局共享）、trust store
 
-**Legacy entry（legacy 入口）**：
-迁移期接受无 kid 旧 token 的独立第三条验证路径。带 kid 但不在 allowlist 的 token 直接被拒，不会进入它。它有两个不同的终态：**关闭**（所有 verifier 不再接受无 kid token，路径本身仍存在）与**删除**（路径与旧密钥不复存在）。状态机的 L3 由"关闭"定义，"删除"是之后的清理。
-_Avoid_: legacy fallback、回落、兜底、把"关闭"说成"删除"
-
-**Signer switch（signer 开关）**：
-决定 signer 以 legacy 形态还是以 current key 签发的单一开关，两个 key family 同步切换。它只改签发，不改任何 verifier 接受什么。
-_Avoid_: feature flag、灰度、signer mode
-
 **Observation window（观察窗口）**：
-从最后一个 signer 切换完成起算、长度不短于最长 token TTL 的滑动窗口。退役 legacy 入口或 previous key 的判据只在这个窗口上评估：被退役的一方接受计数为 0，且每个 verifier 都有非 0 的总量。
+从最后一个 signer 切换完成起算、长度不短于最长 token TTL 的滑动窗口。退役 previous key 的判据只在这个窗口上评估：被退役的一方接受计数为 0，且每个 verifier 都有非 0 的总量。
 _Avoid_: 静默期、冷却期、固定天数
 
 **token_use**：

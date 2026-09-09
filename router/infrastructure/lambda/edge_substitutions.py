@@ -65,7 +65,7 @@ def substitute(src: str, **overrides: str) -> str:
 
     两个方向都要硬失败：
     - **少替换**（源码新增了注入点而本文件没跟上）⇒ 残留检查抛，报文点名缺哪个；
-    - **多给/拼错**（`LEGACY_ENTRYY="off"`）⇒ 静默用默认值是最坏的，因为调用方以为自己
+    - **多给/拼错**（`TRUSTED_IDPSS="Okta"`）⇒ 静默用默认值是最坏的，因为调用方以为自己
       设了开关。所以 override 的名字必须在源码里真的以占位符出现。
     """
     unknown = [k for k in overrides if f"{{{{{k}}}}}" not in src]

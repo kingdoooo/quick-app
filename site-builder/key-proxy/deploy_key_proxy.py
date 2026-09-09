@@ -223,8 +223,8 @@ def role_statements(cfg=None) -> list[dict]:
         - **不给任何 `index/*`**：本组件的两条路径（lookup / touch_last_used）
           都按主键走，GSI 查询是 panel 的列表与吊销路径。
       · SSM：**精确** machine-client-secret ARN（不用 `parameter/site-builder/*`
-        前缀——拿前缀等于被攻破时顺带交出 jwt-secret 与 site client secret，
-        而前者能伪造任意用户的会话）。
+        前缀——拿前缀等于被攻破时顺带交出 login-flow secret 与 site client secret，
+        而后者能替本 app client 换 token）。
       · kms:Decrypt 带 `ViaService` 限定，否则这个角色能拿那把 key 干别的。
       · **没有任何 bedrock 权限**：AgentCore 的 invocations 端点只认 Bearer JWT，
         不走 SigV4（见 `handler._endpoint` 的 docstring）。

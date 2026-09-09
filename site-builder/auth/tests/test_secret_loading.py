@@ -1,13 +1,13 @@
 """密钥不得以明文躺在 Lambda 环境变量里。
 
 部署时实测（2026-08-05）：`aws lambda get-function-configuration` 直接回显
-CLIENT_SECRET 与 JWT_SECRET 的明文——任何持 lambda:GetFunctionConfiguration
-的主体（一个很常见的只读权限）都能读到。
+环境变量明文——任何持 lambda:GetFunctionConfiguration 的主体（一个很常见的
+只读权限）都能读到。
 
-JWT_SECRET 的后果比 client secret 更重：Edge 只验 HS256 签名，拿到它即可
-伪造任意用户的会话 cookie，等于绕过平台全部鉴权（owner/allowed_users/
-collaborators 全部失效）。而两个值本来就以 SSM SecureString 为真源
-（deploy_auth.ensure_secret 写入），复制进环境变量纯属多余的暴露面。
+3c-final 起 auth 只有两把对称密钥要读：LOGIN_FLOW_SECRET（OAuth state 与
+`__Host-sb_pkce` cookie 的 HMAC）与 CLIENT_SECRET（Cognito app client）。
+会话签名密钥不在这条路上——它是 KMS 里的 CMK，进程只拿到 key ARN。
+两个值都以 SSM SecureString 为真源，复制进环境变量纯属多余的暴露面。
 """
 import sys
 from pathlib import Path
@@ -32,12 +32,12 @@ def test_secrets_are_read_from_ssm_not_env(monkeypatch):
 
     lh._secret_cache.clear()
     monkeypatch.setattr(lh, "_ssm", lambda: _SSM())
-    monkeypatch.delenv("JWT_SECRET", raising=False)
+    monkeypatch.delenv("LOGIN_FLOW_SECRET", raising=False)
     monkeypatch.delenv("CLIENT_SECRET", raising=False)
-    monkeypatch.setenv("JWT_SECRET_PARAM", "/site-builder/jwt-secret")
+    monkeypatch.setenv("LOGIN_FLOW_SECRET_PARAM", "/site-builder/login-flow-secret")
     monkeypatch.setenv("CLIENT_SECRET_PARAM", "/site-builder/site-client-secret")
 
-    assert lh._secret("JWT_SECRET") == "value-of-jwt-secret"
+    assert lh._secret("LOGIN_FLOW_SECRET") == "value-of-login-flow-secret"
     assert lh._secret("CLIENT_SECRET") == "value-of-site-client-secret"
     assert all(w is True for _, w in calls), "SecureString 必须 WithDecryption"
 
@@ -54,11 +54,11 @@ def test_secret_is_cached_across_calls(monkeypatch):
 
     lh._secret_cache.clear()
     monkeypatch.setattr(lh, "_ssm", lambda: _SSM())
-    monkeypatch.delenv("JWT_SECRET", raising=False)
-    monkeypatch.setenv("JWT_SECRET_PARAM", "/p/jwt")
+    monkeypatch.delenv("LOGIN_FLOW_SECRET", raising=False)
+    monkeypatch.setenv("LOGIN_FLOW_SECRET_PARAM", "/p/login-flow")
 
     for _ in range(5):
-        assert lh._secret("JWT_SECRET") == "v"
+        assert lh._secret("LOGIN_FLOW_SECRET") == "v"
     assert len(n) == 1, f"应只读一次 SSM，实际 {len(n)} 次"
 
 
@@ -135,20 +135,20 @@ def test_env_plaintext_still_honored_for_local_tests(monkeypatch):
 
     lh._secret_cache.clear()
     monkeypatch.setattr(lh, "_ssm", lambda: _SSM())
-    monkeypatch.setenv("JWT_SECRET", "local-dev-secret")
-    assert lh._secret("JWT_SECRET") == "local-dev-secret"
+    monkeypatch.setenv("LOGIN_FLOW_SECRET", "local-dev-secret")
+    assert lh._secret("LOGIN_FLOW_SECRET") == "local-dev-secret"
 
 
 def test_missing_both_sources_fails_loudly(monkeypatch):
     """两个来源都没有时必须抛错，不能静默用空串签 JWT。
 
-    空密钥签出的 HS256 是**任何人都能伪造**的——静默降级在这里等于关掉鉴权。
+    空密钥算出的 HMAC 是**任何人都能伪造**的——静默降级在这里等于关掉 login CSRF 防护。
     """
     lh._secret_cache.clear()
-    monkeypatch.delenv("JWT_SECRET", raising=False)
-    monkeypatch.delenv("JWT_SECRET_PARAM", raising=False)
-    with pytest.raises(RuntimeError, match="JWT_SECRET"):
-        lh._secret("JWT_SECRET")
+    monkeypatch.delenv("LOGIN_FLOW_SECRET", raising=False)
+    monkeypatch.delenv("LOGIN_FLOW_SECRET_PARAM", raising=False)
+    with pytest.raises(RuntimeError, match="LOGIN_FLOW_SECRET"):
+        lh._secret("LOGIN_FLOW_SECRET")
 
 
 def test_lambda_role_grants_ssm_read_on_every_run():
@@ -201,7 +201,7 @@ def test_deploy_auth_ships_session_keys_json_and_fixture_switch_without_values()
 
     留着任何一个的后果都不是"多个没用的变量"：`LEGACY_ENTRY` / `SESSION_SIGNER` 在 3c-final 的
     handler 里没有读取点，留在配置里会让下一个人以为还能靠改它们回滚（真正的回滚是换 kid）；
-    `JWT_SECRET_PARAM` 则指向一个即将被删的 SSM 参数。
+    `JWT_SECRET_PARAM` 则指向一个已经不存在的 SSM 参数。
     """
     src = (Path(__file__).parents[1] / "deploy_auth.py").read_text()
     env_block = src[src.index("def lambda_env"):src.index("def main()")]

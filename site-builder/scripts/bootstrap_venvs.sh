@@ -6,6 +6,7 @@
 #   bash site-builder/scripts/bootstrap_venvs.sh --only site-builder/deployer   # 只重建一个（可重复给）
 #   bash site-builder/scripts/bootstrap_venvs.sh --host-deps             # 顺带做第 3 步：给不带路径的
 #                                                                        #   python3 装 boto3 + pip-system-certs
+#                                                                        #   + cryptography
 #                                                                        #   （改的是机器不是仓库，默认不做）
 #   bash site-builder/scripts/bootstrap_venvs.sh --check                 # 只做前置检查，不建 venv
 #
@@ -40,7 +41,7 @@ usage() {
 用法: bash site-builder/scripts/bootstrap_venvs.sh [--only <目录>]... [--host-deps] [--check]
 
   --only <目录>   只重建这一个 venv（目录相对仓库根，如 site-builder/deployer；可重复）
-  --host-deps     顺带给不带路径的 python3 装 boto3 + pip-system-certs（--user；改机器不改仓库）
+  --host-deps     顺带给不带路径的 python3 装 boto3 + pip-system-certs + cryptography（--user；改机器不改仓库）
   --check         只做前置检查（python3.12 / python3.13 / python3 >= 3.10），不建 venv
   -h, --help      本说明
 
@@ -150,8 +151,8 @@ for entry in "${SELECTED[@]}"; do
 done
 
 if [ "$HOST_DEPS" = 1 ]; then
-  echo "==> python3 (${PY3_VER}) 上装 boto3 + pip-system-certs（--user，只写 user site）"
-  python3 -m pip install --user --break-system-packages boto3 pip-system-certs
+  echo "==> python3 (${PY3_VER}) 上装 boto3 + pip-system-certs + cryptography（--user，只写 user site）"
+  python3 -m pip install --user --break-system-packages boto3 pip-system-certs cryptography
 fi
 
 # ── 证据：每个 venv 的解释器版本与 pytest ────────────────────────────────────────

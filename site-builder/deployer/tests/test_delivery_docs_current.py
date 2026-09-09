@@ -279,29 +279,6 @@ def test_deploy_md_says_bundling_copies_the_contract_package():
         "没在同一处解释原因（PEP 517 会联网装未锁的 setuptools）"
 
 
-def test_migrate_script_has_an_entry_in_both_deploy_and_claude():
-    """`migrate_sites_to_blue_green.py` 是存量环境升到 blue/green 的必经一步，
-    两份文档里都必须有入口，且写清四件事：默认 dry-run、`--apply` 才写、
-    `--site-id` 可单点重跑、**static 站点会被报成 skipped**（它们没有后端 Lambda，
-    那不是失败）。
-    """
-    for p in (DEPLOY, CLAUDE_MD):
-        txt = _read(p)
-        assert "migrate_sites_to_blue_green" in txt, f"{p.name} 里没有迁移脚本入口"
-    # **切到迁移那一节再断言**：`static` 与 `skipped` 这两个词在 DEPLOY.md 别处也有
-    # （tier 名、别的小节），全文匹配会被它们满足 —— 实测把这一节里那条 static 说明
-    # 整句删掉之后，全文版本的断言仍然是绿的。
-    sec = _section(_read(DEPLOY),
-                   "### 存量站点迁移到 blue/green（M7；**只有存量环境需要**）")
-    assert "--apply" in sec and "dry-run" in sec, \
-        "迁移那一节没写清默认 dry-run / --apply 才真写"
-    assert "--site-id" in sec, "迁移那一节没写 --site-id 单点重跑"
-    assert "static" in sec and "skipped" in sec, \
-        "迁移那一节没写 static 站点会被报成 skipped（会被误读成失败）"
-    assert "拒绝" in sec or "人工" in sec, \
-        "没写「共用旧 URL 的站点会被拒并要求人工处理」"
-
-
 def test_claude_md_test_commands_carry_the_two_measured_traps():
     """CLAUDE.md 的测试命令小节要带两条本轮实测的坑，否则下一个人会白花时间：
 
@@ -827,11 +804,11 @@ def test_deploy_md_lists_every_production_session_verifier():
         "DEPLOY.md 又出现了「verify_session_jwt 只有测试在用」——"
         "实测有两个生产调用方")
 
-    # 两个名字都算：auth/panel 用 `verify_session_jwt`，Edge 里那份叫 `_verify_session_jwt`
-    # （Lambda@Edge 不能 import auth 包，所以它是内嵌的另一份实现）。
-    # 3c-1A 起 handler 调的是 verify_with_legacy（「2 + 1」入口），verify_token 是新入口本体；
-    # 旧名字保留是因为 legacy 入口仍经它们，且 Edge 那份仍叫 _verify_session_jwt。
-    wanted = {"verify_session_jwt", "_verify_session_jwt", "verify_with_legacy", "verify_token"}
+    # 两个名字都算：auth / panel 调的是 `session.verify_token`，Edge 里那份叫
+    # `_verify_session_jwt`（Lambda@Edge 不能 import auth 包，所以它是内嵌的另一份实现）。
+    # 3c-final 起只剩这两个：`verify_session_jwt` / `verify_with_legacy`（HS 时代的「2 + 1」入口）
+    # 已随 legacy 入口一起删除，写在这里只会让派生集合永远差一个空名字。
+    wanted = {"verify_token", "_verify_session_jwt"}
     tracked = subprocess.run(["git", "ls-files", "*.py"], cwd=ROOT,
                              capture_output=True, text=True, check=True).stdout.split()
     callers: set[str] = set()
@@ -1059,3 +1036,150 @@ python3 site-builder/scripts/router_stack_policy.py apply
 ```
 """
     assert _unwrapped_router_deploys(multiline, "synthetic") == (1, [])
+
+
+# --------------------------------------------------------------------------
+# asset-v1 工单 08：HS256 时代的词汇只许留在决策记录里
+# --------------------------------------------------------------------------
+#
+# 会话签名改成 KMS RS256 之后，最贵的一类残留不是"少写了一句新话"，而是"旧话还在"：
+# 采用者照着 `ensure_session_keys.py` / `jwt-secret` / `signer = legacy` 去做，得到的是
+# **不存在的脚本、不存在的参数、加载器会硬拒的配置组合**——而每一条读起来都像正确的指令。
+# 所以这条守卫扫全仓，不扫一张文档清单。
+_HS_ERA_TOKENS = ("HS256", "jwt-secret", "JWT_SECRET", "SESSION_SIGNER", "LEGACY_ENTRY", "legacy_param",
+                  "mint_session_jwt", "verify_with_legacy", "ensure_session_keys", "migrate_sites_to_blue_green",
+                  "--drain-gate legacy", "signer = legacy", "signer = current")
+# 决策记录允许出现（文件头声明性质）；采用者文档不许
+_HS_ALLOWED_PREFIXES = ("docs/superpowers/", "docs/reviews/", "docs/adr/", "docs/security/3c-", ".scratch/")
+
+# **逐路径**例外：这些文件带禁用词是因为它们**拒绝**这些名字（反向断言、否定用例、
+# 已删符号清单）。删掉否定用例、或为了躲开 grep 去混淆代码，都比留下这份清单更糟。
+# 每条一句"它为什么必须提到旧名字"。
+_HS_EXEMPT_PATHS = {
+    "site-builder/auth/session_keys.py":
+        "`REMOVED_KEYS` 要点名 legacy_param / signer 才能对写着旧键的 config 报出可读的错",
+    "site-builder/auth/tests/test_session_keys.py":
+        "否定用例把已删的键注进 config，断言加载器硬拒",
+    "site-builder/auth/tests/test_deploy_auth_sequence.py":
+        "反向断言：HS 时代那三个 env 键必须从 lambda_env 里彻底消失",
+    "site-builder/auth/tests/test_secret_loading.py":
+        "反向断言：三个已删 env 键不许出现在 auth 的 lambda_env / 源码里",
+    "site-builder/auth/tests/test_pkce.py":
+        "变形用例把 login-flow 的取值改回会话密钥名，证明守卫会咬",
+    "site-builder/auth/tests/test_signer_guard.py":
+        "`FORBIDDEN_NAMES` 是已删签发/验签函数名的清单，AST 守卫按它咬",
+    "site-builder/auth/tests/test_verifier_allowlist.py":
+        "否定参数：allowlist 必须拒 HS256 等非 RS256 alg",
+    "router/infrastructure/lambda/test_edge_kid_allowlist.py":
+        "自带禁用词清单，断言 Edge 源码里不再出现它们",
+    "router/infrastructure/lambda/test_stack_static.py":
+        "反向断言两个注入点已消失 + 否定参数 bad_alg=HS256",
+    "site-builder/scripts/verify_deployed_components.py":
+        "真机反向断言：线上产物里出现这些名字即判「部的是 3c-final 之前的代码」",
+    "site-builder/scripts/verify_deployed_edge.sh":
+        "同上，Edge 产物那一半",
+    "site-builder/deployer/tests/test_verify_deployed_components.py":
+        "上面那条闸门的用例，正负两侧都要拿旧名字造样本",
+    "site-builder/deployer/tests/test_verify_deployed_edge_static.py":
+        "同上，Edge 那一半",
+    "site-builder/deployer/tests/test_verify_account_trust_boundary.py":
+        "`test_hs_era_symbols_are_gone` 点名已删符号 + 解析用例里的样例 SSM ARN",
+    "site-builder/deployer/tests/test_session_verify_counts.py":
+        "反向断言：`--drain-gate legacy` 这个旗标与 accepted_legacy 列都必须不存在",
+    "site-builder/panel/tests/test_console_session.py":
+        "反向断言：三个 HS 时代 env 键不许出现在 panel 的环境里",
+    "site-builder/panel/tests/test_deploy_panel_contract.py":
+        "反向断言：3c-final 删掉的三个 env 键靠等值清单挡回来",
+    "site-builder/panel/tests/test_handler.py":
+        "反向断言：panel 源码里不许再有本地签发函数",
+    "site-builder/deployer/tests/test_delivery_docs_current.py":
+        "本文件——`_HS_ERA_TOKENS` 自己就是那张清单",
+    "docs/security/account-trust-boundary.md":
+        "威胁模型真源：HS 形态那一节是显式标了「历史记录」的对照，"
+        "另由 test_threat_model_marks_the_hs_era_section_historical 守着标记还在",
+}
+
+
+def _hs_era_hits(paths) -> list:
+    hits = []
+    for rel in paths:
+        if rel.startswith(_HS_ALLOWED_PREFIXES) or rel in _HS_EXEMPT_PATHS:
+            continue
+        if not rel.endswith((".md", ".py", ".sh", ".ini", ".example", ".txt", ".yaml", ".yml")):
+            continue
+        path = ROOT / rel
+        if not path.exists():          # 已删但索引里还在（rename 中途）
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for tok in _HS_ERA_TOKENS:
+            if tok in text:
+                hits.append(f"{rel}: {tok}")
+    return hits
+
+
+def _tracked_files() -> list:
+    return subprocess.run(["git", "ls-files"], cwd=ROOT,
+                          capture_output=True, text=True, check=True).stdout.split()
+
+
+def test_adopter_docs_and_code_carry_no_hs_era_vocabulary():
+    """3c-final 之后 HS256 / legacy 入口 / signer 开关只存在于决策记录里（spec / review / ADR）。
+
+    采用者文档（CLAUDE.md、README、DEPLOY.md、client-setup、skills、CONTEXT.md）与全部源码 /
+    测试都不许再提——例外只有 `_HS_EXEMPT_PATHS` 里那些"因为要拒绝旧名字所以必须写出它"的文件。
+    """
+    tracked = _tracked_files()
+    assert len(tracked) > 50, f"git ls-files 只给了 {len(tracked)} 个文件——本条空转"
+    hits = _hs_era_hits(tracked)
+    assert not hits, "HS/legacy 词汇残留（要么删掉，要么它属于决策记录并搬到允许的目录）：\n  " + \
+        "\n  ".join(hits)
+
+
+def test_hs_era_exemption_list_cannot_go_stale():
+    """例外清单只许列**真的存在、且真的还带禁用词**的文件。
+
+    没有这一条，清单会变成"曾经需要例外"的墓地：文件改干净了、甚至被删了，条目还留着，
+    于是下一次真的有人往那个文件里写回 `jwt-secret`，守卫默默放过。
+    """
+    tracked = set(_tracked_files())
+    stale = []
+    for rel, why in _HS_EXEMPT_PATHS.items():
+        assert why.strip(), f"{rel} 的例外没写理由"
+        if rel not in tracked:
+            stale.append(f"{rel}: 不在 git 索引里（删了/改名了？把条目一起删）")
+            continue
+        text = (ROOT / rel).read_text(encoding="utf-8", errors="replace")
+        if not any(tok in text for tok in _HS_ERA_TOKENS):
+            stale.append(f"{rel}: 已经不含任何禁用词了 —— 例外条目该删（否则它成了永久豁免）")
+    assert not stale, "例外清单过期：\n  " + "\n  ".join(stale)
+
+
+def test_hs_era_guard_bites_a_synthetic_leftover():
+    """**变形对照**：给一个既不在允许前缀、也不在例外清单里的路径塞一个禁用词，必须命中；
+    允许前缀与例外清单必须仍然放过。证明上面那条不是靠空集合过的。"""
+    real = "site-builder/DEPLOY.md"
+    assert real in set(_tracked_files()), "锚点文件不在索引里——本条空转"
+    assert _hs_era_hits([real]) == [], "DEPLOY.md 现在应当是干净的——本条前提不成立"
+    assert _hs_era_hits(["docs/superpowers/specs/whatever.md"]) == [], "允许前缀被误伤"
+    exempt = next(iter(_HS_EXEMPT_PATHS))
+    assert _hs_era_hits([exempt]) == [], "例外清单没生效"
+    # 真正的变形：把禁用词写进一个**不受豁免**的路径
+    victim = ROOT / "site-builder" / "DEPLOY.md"
+    original = victim.read_text(encoding="utf-8")
+    try:
+        victim.write_text(original + "\n照着 ensure_session_keys.py 建 jwt-secret。\n", encoding="utf-8")
+        hits = _hs_era_hits([real])
+        assert any("jwt-secret" in h for h in hits) and any("ensure_session_keys" in h for h in hits), hits
+    finally:
+        victim.write_text(original, encoding="utf-8")
+
+
+def test_threat_model_marks_the_hs_era_section_historical():
+    """威胁模型文档在例外清单里，所以那份文档的 HS 形态段落**必须自带「已被取代」标记**——
+    否则例外就等于让一整份文档回到无人看管的状态，而它恰好是"平台防谁"的真源。"""
+    doc = _read(ROOT / "docs" / "security" / "account-trust-boundary.md")
+    sec = _section(doc, "## 密钥有三条路能拿到，三条都实测可用")
+    assert any(m in sec for m in _SUPERSEDED_MARKERS), (
+        "「密钥有三条路能拿到」这一节没有 superseded / 历史记录 标记——"
+        f"读者会把 HS 形态当成现状。认可的标记：{_SUPERSEDED_MARKERS}")
+    assert "HS256" in sec, "标记在，但这一节已经不谈 HS 形态了——标记该跟着走"

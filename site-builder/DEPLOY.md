@@ -146,38 +146,47 @@ email/enterprise_email 字段。
 
 ### SSM 参数
 
+只剩两把，都是 HMAC / OAuth 用途的对称密钥。**会话签名密钥不在 SSM 里**——它们是 KMS
+非对称 CMK，见下一节。
 
 | 参数名                                | 何时创建               | 用途                                   |
 | ---------------------------------- | ------------------ | ------------------------------------ |
-| `/site-builder/jwt-secret`         | **部署 ② 之前手工创建**    | 站点会话 JWT 的 HS256 签名密钥，Edge 函数与登录服务共用（3c-1A 起它只是 legacy 入口那一把） |
-| `/site-builder/site-client-secret` | ① 阶段建完 Cognito 后写入 | 站点登录 App Client 的 secret             |
-| `/site-builder/session-keys/{site,console}-hs-v1` | `scripts/ensure_session_keys.py`（幂等，路径来自 `[SessionKeys]`） | 两个 key family 各一把 HS256 会话签名密钥（3c-1A）。Edge 只持 site、panel 只持 console、auth 两个都持 |
-| `/site-builder/login-flow-secret`  | 同上（`ensure_session_keys.py`；`deploy_auth.py` 另有一条 `ensure_secret` 缺省补建） | **登录流程**（OAuth state 与 `__Host-sb_pkce` cookie）的 HMAC 密钥，3c-1B 起启用。**auth 私有**：不是 `kid`、不属于任何 family、不签发也不验证会话，panel 与 Edge 永不持有它 |
+| `/site-builder/site-client-secret` | ① 阶段建完 Cognito 后写入（`deploy_pool.py`） | 站点登录 App Client 的 secret。轮转要 Cognito 侧配合，见下一节的第一类 |
+| `/site-builder/login-flow-secret`  | `deploy_auth.py` 的 `ensure_secret`（参数不存在时创建，幂等、不覆盖） | **登录流程**（OAuth state 与 `__Host-sb_pkce` cookie）的 HMAC 密钥。**auth 私有**：不是 `kid`、不属于任何 key family、不签发也不验证会话，panel 与 Edge 永不持有它。轮转 = `put-parameter --overwrite`，auth 的 5 分钟缓存窗口内**进行中**的登录失败一次（重试即可），已签发的会话完全不受影响 |
 
+**两个值都不进 Lambda 环境变量**：auth 只拿到参数名（`CLIENT_SECRET_PARAM` /
+`LOGIN_FLOW_SECRET_PARAM`），运行时读 SSM 并在容器内缓存。原因是
+`lambda:GetFunctionConfiguration` 会原样回显环境变量，而那是个很常见的只读权限。
+auth 的执行角色因此需要 `ssm:GetParameter`（限定到这两个精确参数名）与 `kms:Decrypt`
+（`ViaService` 限定 ssm），`deploy_auth.py` 每次运行都会收敛这几条。
+
+`login-flow-secret` 的创建方**只有** `deploy_auth.ensure_secret` 一处，而它**不在**部署脚本
+"写之前先核对参数存在"的那张清单里——列进去会让缺省补建永远走不到、首次部署自我拒绝。
+理由与边界在 `docs/adr/0004-*.md`。
+
+### 会话签名密钥（KMS）
+
+会话 token（站点会话 `sb_session`、升级码、面板会话 `__Host-sb_console`）用 **RS256** 签，私钥在两把
+KMS 非对称 CMK 里（`RSA_2048` / `SIGN_VERIFY`，默认 key policy——理由见 `docs/adr/0001-*.md`），
+由 ④ 的 deployer 栈创建；auth 持两把的 `kms:Sign`，panel 只持 console 那把，Edge **零 KMS 权限**、
+只内嵌 site 公钥。**任何组件的产物、环境变量、SSM 里都没有能签会话的材料**——这是资产在共享账号里
+站得住的前提（`docs/security/account-trust-boundary.md`）。
+
+回填 `config.ini` 的 `[SessionKeys]`：④ 部完后
 
 ```bash
-aws ssm put-parameter --region us-east-1 \
-  --name /site-builder/jwt-secret --type SecureString \
-  --value "$(openssl rand -hex 32)"
+python3 site-builder/scripts/session_key_fingerprint.py --from-stack     # 打印两个 [SessionKey:*] 小节（含 spki_sha256）
 ```
 
-`jwt-secret` 必须早于 ② 存在：② 的栈部署时从 SSM 读它并字符串替换注入 Edge
-函数（Lambda@Edge 不支持环境变量）。读取失败时 **synth 直接报错退出、不生成模板**
-（3c-1B ticket 19 起；此前只打一行 `SYNTH-ONLY-PLACEHOLDER-DO-NOT-DEPLOY` 警告而 deploy 照样
-继续，部出去的每个会话 token 都验签失败、表现为无限登录跳转）。只有显式 `APP_SYNTH_OFFLINE=1`
-才会退化成占位符模板，那种模板**不可部署**。
+把输出粘进 `site-builder/config.ini`（替换 `.example` 里的占位）。三个部署脚本（router 栈 synth、`deploy_auth`、
+`deploy_panel`）在第一次写之前都会对每把 key 做 DescribeKey + GetPublicKey 四项校验，指纹与 config 不符即
+拒绝部署——所以**先部 ④ 再部 ②**（下面「部署顺序总览」的依赖箭头）。
 
-**两个密钥都不进 Lambda 环境变量**：auth 服务只拿到参数名
-（`JWT_SECRET_PARAM` / `CLIENT_SECRET_PARAM`），运行时读 SSM 并在容器内缓存。
-原因是 `lambda:GetFunctionConfiguration` 会原样回显环境变量，而那是个很常见的
-只读权限；JWT secret 泄漏尤重——Edge 只验 HS256 签名，拿到它即可伪造任意用户的
-会话 cookie，绕过 owner / allowed_users / collaborators 全部判定。
-auth 的执行角色因此需要 `ssm:GetParameter`（限定 `/site-builder/*`）与
-`kms:Decrypt`（`ViaService` 限定 ssm），`deploy_auth.py` 每次运行都会收敛这两条。
+每把 key 运行时的成本：$1/月 + `kms:Sign` 每万次 $0.03（只在登录 / 换码路径调用，不在每请求路径）。
 
-#### 轮转密钥：四类的代价完全不同
+### 轮转密钥：三类的代价完全不同
 
-四类密钥的轮转代价完全不同，别按同一套做（会话密钥有专门的十步 runbook，在本节末尾）：
+三类密钥的轮转代价完全不同，别按同一套做（会话签名 key 有专门的 runbook，在本节末尾）：
 
 - `site-client-secret`：**不能只改 SSM**。这个值不是我们自己定的——它必须是
   Cognito 那个 app client 认可的 secret。直接写一个新随机值进 SSM，5 分钟后
@@ -227,24 +236,23 @@ auth 的执行角色因此需要 `ssm:GetParameter`（限定 `/site-builder/*`�
   ```
 
   顺序反了（先删旧、再加新）会在两步之间造成登录中断，且旧值已不可恢复。
-- **会话密钥**（两个 family 的 `/site-builder/session-keys/<kid>`）：**有正规的轮转
-  协议，不要就地改值**——见本节末尾的「轮转会话密钥：十步 runbook」。就地覆盖一把
-  kid 的值会造成一段全员无法登录的窗口，因为它有三个消费方且更新速度不同：
-  - auth / panel（签发 + 验签）——读 SSM，最长 5 分钟切到新值；
-  - Edge（验签）——值是 CDK 部署时**字符串替换**注入的（Lambda@Edge 不支持环境
-    变量），要重新部署 ② 并等 **10–20 分钟全球复制**。
+- **会话签名 key**（两把 KMS 非对称 CMK）：**有正规的轮转协议，不要在 KMS 侧就地做手术**
+  ——见本节末尾的「轮转会话密钥（KMS）」。非对称 CMK **不支持自动轮转**（KMS 的自动轮转只对
+  对称 key 生效），所以"轮转"在这里的含义是**加一把新 key、让三处 verifier 先认它、再切签发、
+  排空后退役旧 key**。直接把 signer 切到一把还没被 verifier 接受的 key，会造成一段全员无法登录的
+  窗口，因为三个消费方的更新速度差一个量级：
+  - auth / panel（签发 + 验签）——改 `config.ini` 重部，几分钟就切；
+  - Edge（只验签）——公钥是 CDK 部署时**字符串替换**注入的（Lambda@Edge 不支持环境变量），
+    要重新部署 ② 并等 **10–20 分钟全球复制**。
 
-  auth 先切、Edge 后到，这期间新签发的 cookie 在尚未更新的边缘节点验签失败，
-  用户登录后立刻被踢回登录页；而**已登录用户的旧 cookie 在 auth 切换后仍在
-  旧 Edge 节点上有效**，于是同一时刻不同用户、不同地区表现不一致。
-  症状（无限登录跳转）与"密钥读取失败"完全一样，极难定位到密钥版本。
-  **runbook 存在的全部意义就是把这个窗口消掉**：新 key 先经 `previous` 槽位让所有
-  verifier 都接受，再切签发方；**signer 的回滚因此只是改一行配置重部 auth/panel**
-  （改 allowlist 的那几步仍要重部 Edge，逐步的回滚动作见 runbook 末尾的回滚表）。
-- **legacy 共享密钥** `/site-builder/jwt-secret`（拆 family 之前那把）：**不轮转。**
-  它只剩 legacy 入口在用，收敛路径是 runbook 的 ⑤（清空 `[SessionKeys] legacy_param`
-  即关闭入口）；参数本体与代码里的 legacy 分支由 3c-3 删除。
-- `login-flow-secret`（3c-1B 起）：**这一把可以就地改值**，是四类里唯一一把。
+  signer 先切、Edge 后到，这期间新签发的 cookie 在尚未更新的边缘节点验签失败，用户登录后立刻被
+  踢回登录页；而已登录用户的旧 cookie 在旧 Edge 节点上仍然有效，于是同一时刻不同用户、不同地区
+  表现不一致。症状（无限登录跳转）与"公钥注入坏了"完全一样，极难定位到是哪一把 key。
+  **runbook 存在的全部意义就是把这个窗口消掉**：新 key 先经 `previous` 槽位让所有 verifier 都接受，
+  再切签发方；**signer 的回滚因此只是改一行配置重部 auth / panel**（改 allowlist 的那几步仍要重部
+  Edge，逐步的回滚动作见 runbook 末尾的回滚表）。
+
+- `login-flow-secret`：**这一把可以就地改值**，是三类里唯一一把。
 
   ```bash
   set -euo pipefail
@@ -258,7 +266,7 @@ PY
 )
   GOT=$(aws sts get-caller-identity --query Account --output text)
   [ "$WANT" = "$GOT" ] || { echo "账号不符：凭据在 $GOT，config.ini 写的是 $WANT——中止"; exit 1; }
-  # ② 参数必须**已存在**：这是轮转，不是创建。创建走 ensure_session_keys.py。
+  # ② 参数必须**已存在**：这是轮转，不是创建。创建走 deploy_auth.py 的 ensure_secret。
   aws ssm get-parameter --region us-east-1 --name /site-builder/login-flow-secret >/dev/null
 
   aws ssm put-parameter --region us-east-1 --overwrite \
@@ -276,714 +284,189 @@ PY
   代价是 auth 的 5 分钟缓存窗口（`SECRET_TTL_SECONDS`）内**进行中**的登录失败
   一次：那期间已经拿到旧密钥签的 state / pkce cookie 的用户，回到 `/callback` 时
   会撞上"登录状态已过期，请重新登录"的 400，**重试一次即可**。
-  **已签发的会话完全不受影响**——会话由会话密钥签（signer 切换前是 legacy 那把、
-  切换后是各 family 的 current），这把密钥碰不到它们。所以覆盖它既不需要重部署
-  任何组件，也不需要等任何复制窗口。
+  **已签发的会话完全不受影响**——会话由两把 KMS CMK 签，这把密钥碰不到它们。所以覆盖它既不需要
+  重部署任何组件，也不需要等任何复制窗口。
 
-  > 别把它与会话密钥混在一起做。读到这把密钥只值一个登录 CSRF（state 与
-  > cookie 都只活 300 秒）；读到会话密钥等于能伪造任意用户的会话。它在 3c-1B
-  > 从共享会话密钥里分出来正是为了不让后者的暴露面白白多摊一处
-  > （spec §11.3，`login_handler._login_flow_sig` 的 docstring 有完整理由）。
+  > 别把它与会话签名 key 混在一起做。读到这把密钥只值一个登录 CSRF（state 与 cookie 都只活
+  > 300 秒）；能签会话 key 等于能伪造任意用户的会话。它从会话密钥里分出来正是为了不让后者的
+  > 暴露面白白多摊一处（spec §11.3，`login_handler._login_flow_sig` 的 docstring 有完整理由）。
 
-**3c-1A（2026-09-02 已部署）：verifier 侧先认 `kid`。** 五个验签点按 spec §5 的合同验：
-每个 verifier 只认自己那份 `kid → {alg, key}` allowlist（每 family `current` + `previous`）
-加一条 legacy 入口（无 `kid` 的今天形态）。清单在 `site-builder/config.ini` 的
-`[SessionKeys]`（唯一取值来源，`auth/session_keys.py` 校验），两把 HS 密钥
-`/site-builder/session-keys/{site,console}-hs-v1` 由 `scripts/ensure_session_keys.py`
-幂等创建。3c-1A 期间的三处改动：
-
-| 文件 | 改了什么 |
-|---|---|
-| `router/infrastructure/stack.py` | `load_site_allowlist()`：只取 **site** family，注入 `{{SITE_ALLOWLIST_JSON}}` 与 `{{LEGACY_ENTRY}}`；`{{JWT_SECRET}}` 从此只是 legacy 入口的密钥 |
-| `router/infrastructure/lambda/origin_request.py` | `_verify_session_jwt()` = `verify_with_legacy(site-session)` 的字节等价副本：有 `kid` 不在 allowlist 直接拒、不回落；legacy 入口拒 `scope=console` |
-| `site-builder/auth/session.py` + `login_handler.py` / `panel/console_session.py` | `verify_with_legacy` 是 handler 调的入口；auth 读两个 family、panel 只读 console；环境变量 `SESSION_KEYS_JSON`（只有参数名）+ `LEGACY_ENTRY` |
-
-**3c-1A 的部署顺序（实测）**：`ensure_session_keys.py` → 闸门先认两个 family（基线 schema 4）
-→ `deploy_auth.py` → `deploy_panel.py --skip-frontend` → `verify_deployed_components.py` →
-router CDK（`rm -rf cdk.out`）→ CloudFront `Deployed` → `verify_deployed_edge.sh` →
-`verify_kid_entry_live.py` / `verify_session_token_semantics.py` / console E2E / `smoke_router.sh`
-→ `session_verify_counts.py` → 闸门复跑。**（以下是 1A 当时的性质，1B 之后已不成立）**
-那一刻 signer 还没变，所以任一 verifier 单独回滚到上一版都安全（旧代码只认 legacy，
-而线上 token 全是 legacy）；SSM 里的两把新 secret 不删。**1B 之后线上 token 全是 v2 形态**，
-回滚 verifier 到 1A 之前的版本会让全部会话验签失败——回滚锚点见 runbook 末尾那张表。
-
-**3c-1B 已于 2026-09-03/05 全部执行完毕**（十步的真实时间线见下面的 runbook 首节；
-④ 经裁决跳过、⑨ 是观察窗口机制唯一的真机证明）。**生产现在的形态**：`signer = current`、
-`legacy_param` 空（L3，三处 verifier 都不认 legacy）、两个 family 只剩 `*-hs-v2` 作 `current`、
-`previous` 两槽为空、v1 的两把 SSM 参数已删除（不可逆）。下面这段讲的是**代码侧的上齐顺序**，
-再次轮转时从 ⑥ 开始照抄即可。
-
-**3c-1B：signer 也切 `kid`、关闭 legacy 入口、并做一次真实轮转演练。** 代码侧已一次上齐
-（`[SessionKeys] signer` 开关、auth 私有的 login-flow secret、`scripts/_session_mint.py`、
-闸门的 `--new-key` / `--retire-key`、`stack.py` 改从 `legacy_param` 取路径、两个部署脚本
-"先配置后代码" + 写前核对 SSM 参数存在），**当时 `signer` 的初值是 `legacy`——代码就位而线上
-形态未变**（**这是代码上齐那一刻的状态；今天线上是 `current`**，见上面那段）。切换、观察、
-关闭 legacy 与 v1→v2 演练全部按下面的十步 runbook 执行——首次执行已完成，**下一次轮转从 ⑥ 起**。
-
-> ⚠️ **生产验签有三处，不是一处。** 这条注记从前把 `session.py` 的
-> `verify_session_jwt()` 说成**只有测试会调用它**——**那是错的**（大概写在
-> M3/M05 之前，之后没跟上）。实测非测试调用点：
+> ⚠️ **生产验签有三处，不是一处。** 这条注记从前把 `session.py` 的验签函数说成**只有测试会
+> 调用它**——**那是错的**（大概写在 M3/M05 之前，之后没跟上）。实测非测试调用点：
 >
 > | 验签点 | 位置 | 验的是什么 |
 > |---|---|---|
 > | Edge | `router/infrastructure/lambda/origin_request.py` `_verify_session_jwt()` | 站点访问的 `sb_session` |
-> | auth | `site-builder/auth/login_handler.py` `/console-session`（`verify_with_legacy`） | 换升级码时的 `sb_session` |
-> | panel | `site-builder/panel/console_session.py` `verify_console_cookie()` / `consume_code()` | 面板会话 `__Host-sb_console` / 一次性升级码 |
+> | auth | `site-builder/auth/login_handler.py` `/console-session`（`verify_token`） | 换升级码时的 `sb_session` |
+> | panel | `site-builder/panel/console_session.py` `verify_console_cookie()` / `consume_code()`（都经 `verify_token`） | 面板会话 `__Host-sb_console` / 一次性升级码 |
 >
-> （panel 还在 `:82` 消费一次性升级码。`login_handler.py` 的 `_login_flow_sig` 另有一处
-> 裸 HMAC 签 OAuth state 与 `__Host-sb_pkce` cookie——**3c-1B 起它用的是 auth 私有的
-> login-flow secret，不再是会话密钥**，所以它已经不在"读到密钥就能伪造会话"那个面上；
-> 但它仍然是一处独立的签名点，改 cookie/state 线格式时别漏掉它。）
-> 按"只改 Edge 一处"去估算改动范围会漏掉两个生产消费方；非对称化时尤其致命，
-> 因为 panel 现在**没有 requirements.txt**、产物里只有 `.py`。
+> `login_handler.py` 的 `_login_flow_sig` 另有一处裸 HMAC 签 OAuth state 与 `__Host-sb_pkce`
+> cookie——它用的是 auth 私有的 login-flow secret，不是会话 key，所以它不在"能签会话就能冒充"
+> 那个面上；但它仍然是一处独立的签名点，改 cookie / state 线格式时别漏掉它。
+> 按"只改 Edge 一处"去估算改动范围会漏掉两个生产消费方。
 
 ---
 
-#### 轮转会话密钥：十步 runbook
+#### 轮转会话密钥（KMS）：就位 → 切换 → 排空 → 退役
 
-**这是可执行协议，不是描述。** 每一步 = 一处 `config.ini` 修改 + 现成脚本 + 一个硬停止点
-+ 该步的闸门声明。每步的命令都能从这里直接照抄，不需要读 spec。
+**这是可执行协议，不是描述。** 每一步 = 一处 `config.ini`（或 `deployer/infra/app.py`）修改 + 现成脚本 +
+一个硬停止点 + 该步的闸门声明。非对称 CMK 不支持自动轮转（spec §3.3），所以轮转就是**加一把新 key、
+让三处 verifier 先认它、再切签发、排空后退役旧 key**。两个 family 可以同步做，也可以只轮一个。
 
-**故意没有编排脚本**：硬停止点一旦藏进一个进程里就会被 `exit 0` 掩盖——1A 那次 auth 全部
-502 约 4 分钟，正是"脚本说成功、线上全红"的形状。
-
-**分两段读**：
-
-- **①–⑤ 是 legacy 入口的一次性收敛**（3c-1B 首次也是最后一次执行；进入 L3 之后不再重复）。
-- **⑥–⑩ 是每次轮转照抄的五步**（就位 → 切换 → 回滚演示 → 排空 → 退役）。（2026-09-06 裁定：
-  HS → KMS **不走**这五步，验证环境硬切换；这五步的形态保留给采用者轮转 KMS 密钥，3c-final
-  会把它改写成 KMS 版并删掉本 HS 版。见 spec §11.9。）
-
-##### 开始之前：先把剩余各步的 config 状态干跑一遍
+##### 开始之前
 
 ```bash
-python3 site-builder/scripts/preflight_config_states.py     # 只读 config、不碰 AWS，约 10 分钟
+python3 site-builder/scripts/preflight_config_states.py     # 不碰 AWS：把就位/切换/退役三个状态各跑一遍单测，先找出写死当前 kid 的用例
 ```
 
-它把 ⑤⑥⑦⑩ 的 `[SessionKeys]` 状态逐个写进 `config.ini`、跑六个包的单测、再逐字节还原。
-**目的是把"把配置当前值写死"的假红提前挖出来**：那类用例会在**改完配置、部署之后**才转红，
-于是你在演练中途面对一片红，而它们要守的性质一条都没变。2026-09-03 首跑实测：panel 在
-⑤⑥⑦ 各 3 条、⑩ 6 条，其余六包全绿；改成从加载器推导之后四个状态全绿。
-**跑它的时候不要并行跑任何读 config 的东西**（部署脚本与 `verify_*` 闸门都读它）。
-
-##### 开始之前：三条 1A 的教训（每次动 auth/panel 之前过一遍）
-
-- [ ] **auth 的进包清单是 `deploy_auth.AUTH_PACKAGE_MODULES`**（panel 那边叫 `COPY_FILES`），
-      由 `auth/tests/test_deploy_auth_package.py` 按 `login_handler` 的 import 闭包核对。给
-      handler 新加一个同目录 import 却没进包 ⇒ `Runtime.ImportModuleError` ⇒ **整个 auth 502**
-      （2026-09-02 实测约 4 分钟，而单测与 `verify_deployed_components.py` 当时都绿）。
-      本 runbook 不新增 auth 模块，但每次改动合并前都要跑这两条守卫。
-- [ ] **别用 `publish_version` 做回滚锚点。** 闸门会为每个 principal 多出一条 `@version`
-      invoke grant（1A 实测 19 条噪音）。回滚锚点是**改配置重部**（`signer` 开关或槽位互换）
-      或**git 重部**（代码），见末尾的回滚表。
-- [ ] **变形测试用 `git stash` 或临时副本**，别对含未提交修改的文件 `git checkout --`
-      （1A 用它把未提交的 `AUTH_PACKAGE_MODULES` 修复冲掉过一次）。
-
-##### 三个时刻与两道 26 小时时间闸
-
-| 记号 | 定义 | 用途 |
-|---|---|---|
-| **T0** | ③ 的 `deploy_auth.py` 返回的时刻（`signer = current` 生效） | ④ 观察窗口的起点 |
-| **T1** | ⑦ 的 `deploy_auth.py` 返回的时刻（`current = *-hs-v2` 生效） | 只作记录，**排空不从这里算** |
-| **T2** | ⑧ 回滚演示结束、**换回 v2 之后**那次 `deploy_auth.py` 返回的时刻 | ⑨ 排空窗口的起点 |
-
-两道时间闸都是 **26 小时**，都用同一条命令下判断（不许估）：
-
-```bash
-set -euo pipefail
-cd "$(git rev-parse --show-toplevel)"
-
-# ④ 判 legacy、⑨ 判 v1（previous）。**只用这一个旗标**，四条判据在脚本里
-python3 site-builder/scripts/session_verify_counts.py --drain-gate previous   # ④ 用 legacy
-```
-
-**四条判据全由脚本下，exit 0 才算过**（`--drain-gate`，3c-1B-G A2 起）：窗口 ≥ 26 h、
-每个 verifier 总量 > 0、`accepted_{previous,legacy}` 三列全 0、`accepted_current` 三列全 > 0。
-**不要再手写那四个自由组合的旗标**——它们仍在（诊断用），但少任何一个都是**静默放宽**，
-而最坏的一种不是"少判一条"：空窗口下 `--require-zero` 只报非零列，三列全空自然"通过"
-⇒ exit 0 被读成"已排空"，下一步就是删 SSM 参数（不可逆）。`--drain-gate` 还会拒绝
-把 `--hours 26` 打成 `2.6` 这类窗口。旧写法的语义仍是：`--require-zero X` = 三列 X 全 0；
-`--require-nonzero accepted_current` = 三列 accepted_current 全 > 0；`--require-total` = 每处总量 > 0。
-此前脚本只判总量、三列归零靠人读，exit 0 不等于闸门绿。区级 DescribeLogGroups 失败也会直接退出
-（少算一区 = 假 0），不再静默跳过。
-
-26 = 站点会话 TTL 24 h ＋ auth 的 secret 缓存 5 min ＋ Edge 全球复制 10–20 min 再加余量
-（spec §7 的 TTL 表）。**排空从 T2 起算而不是 T1**：⑧ 的回滚演示又用 v1 签了几分钟，最后
-一枚 v1 token 的出生时刻在 T2。
-
-> **下判断之前先把四个 `verify_*` 跑一遍**，否则「总量非 0」可能只是别人的流量。它们从
-> 3c-1B 起都经 `_session_mint` 发新形态，不再是 `accepted_legacy` 的来源。
-> 读数按 **verifier 分列**（auth / panel / edge 三列各自判零）——panel 列会因为"最近没人
-> 用控制台"而为 0，那不能被 auth/edge 的总量遮住，所以 `--require-total` 是任一列为 0 即退 1。
+**它会就地改写 `site-builder/config.ini`**（跑完还原，备份与哨兵落 `.scratch/`）。被硬杀过一次之后
+它会拒绝再跑并打印恢复办法——**别忽略那条提示**：config 留在模拟态时后续 `deploy_*` 会照着它部署。
 
 ##### 两个方向相反的顺序，别照抄错
 
-- **新建部署**：**auth 先于 router**（CLAUDE.md 不变量里那条）。理由是**依赖**——② 的 router
-  栈 synth 时要从 SSM 读密钥并字符串替换注入 Edge（Lambda@Edge 不支持环境变量），密钥必须
-  已经存在。
-- **切换（本 runbook）**：**verifier 先行**。所有验签方先能接受新形态，才允许 signer 发它。
-  理由是**速度差**——auth/panel 读 SSM 最长 5 分钟就切，Edge 要重新部署再等 10–20 分钟全球
-  复制。signer 先切就等于让新 cookie 在尚未更新的边缘节点上验签失败，用户登录后立刻被踢回
-  登录页，而已登录用户的旧 cookie 在旧节点上仍有效 ⇒ 同一时刻不同地区表现不一致。
+- **新建部署**：**④ deployer 栈先于 ② router 与 auth / panel**（依赖——三处 synth / 部署时要从 KMS 取公钥并核对指纹）。
+- **切换（本 runbook）**：**verifier 先行**。所有验签方先能接受新 key，才允许 signer 用它签。理由是速度差——
+  auth / panel 重部几分钟就切，Edge 要重部 + 10–20 分钟全球复制；signer 先切等于让新 cookie 在旧边缘节点上
+  验签失败，用户登录后立刻被踢回登录页。
 
-两条都对，适用阶段不同。所以本 runbook 里 Edge 永远**先接受、后改标签**：⑥ 先让 Edge 认 v2
-（作为 `previous`），⑦ 才切 signer，⑦ 之后再重部一次 Edge **只为**把 current/previous 标签
-摆正。Edge 一共部署 4 次：⑤⑥⑦⑩。
+##### 槽位语义
 
-##### 槽位语义（`current` / `previous`）
+术语真源是根 `CONTEXT.md` 的 **Key family** / **就位** 两条：`current` = 签发用的那把；`previous` = 另一把
+**被接受**的 key——要么是排空中的旧 key，要么是就位中的新 key。新 key 一律经 `previous` 就位，切换 = 两槽互换。
+就位期 `accepted_previous` 应当只来自我们自己的探针。
 
-定义在根 `CONTEXT.md` 的 **Key family** / **就位** 两条（术语真源，本节只是复述）：
+##### ① 建新 key（deployer 栈）
 
-- `current` = `signer` 开关为 `current` 时**签发**用的那把；
-- `previous` = 另一把**被接受**的 key——**要么**是排空中的旧 key，**要么**是就位中的新 key。
-  （所以 **`previous` 不一定比 `current` 旧**，就位期正好相反。）
-
-新 key 一律**经 `previous` 就位**，切换 = 两槽互换。就位期 `accepted_previous` **应当只来自
-我们自己的探针**：多出来的计数意味着有人拿就位中的 key 签了 token，是红旗而不是噪音。
-
-##### 首次执行的真实时间线（2026-09-03/05，**照这个估时长**）
-
-十步在生产上跑完一次的实测记录。**排期按这张表，不要按"十步≈十个小时"直觉估**：
-总墙钟 **47h23m**（T0 → 删参数），拆开是——
-
-- **⑨ 的强制等待 30h12m**（闸下限是 T2+26h，实际多等了 4h11m 才去判定）；
-- **③ 到 ④ 裁决之间 11h49m**（含夜间空档；④ 最终被裁决跳过，所以这段不是"等满了窗口"）；
-- **真正动手约 5h22m**（⑤⑥⑦⑧ 连着做了 4h03m，⑨ 通过后到删完参数 43m，裁决到 ⑤ 36m）。
-
-也就是说：**九成的墙钟是等，不是做**。多人环境下 ④ 不能跳过，那还要再加一段 26 h。
-
-| 步 | 时刻（UTC） | 与上一格的间隔 | 备注 |
-|---|---|---|---|
-| ③ 切 signer = **T0** | `2026-09-03T13:51:18Z` | — | `deploy_auth` 返回的那一刻 |
-| ④ 观察窗口 | `2026-09-04T01:40:40Z` | +11h49m | **经操作者裁决跳过**（不是通过）。理由与代价见下面那条注 |
-| ⑤ L3 关闭 legacy 入口 | `2026-09-04T02:16:34Z` | +36m | CloudFront `UPDATE_COMPLETE` |
-| ⑥ v2 经 `previous` 就位 | `2026-09-04T05:23:35Z` | +3h07m | 同上（含闸门一轮）|
-| ⑦ 两槽互换 = **T1** | `2026-09-04T06:01:53Z` | +38m | 只作记录，**排空不从这里算** |
-| ⑧ 回滚演示结束 = **T2** | `2026-09-04T06:19:29Z` | +18m | 换回 v2 后那次 `deploy_auth` 返回 |
-| ⑨ 排空判定 exit 0 | `2026-09-05T12:31Z` | +30h12m | 闸的下限是 T2+26h（`08:19:29Z`）⇒ 实际多等 4h11m |
-| v1 退出接受集合 | `2026-09-05T12:43:29Z` | +12m | 三处重部完成 |
-| ⑩ 删两把 v1 SSM 参数 | `2026-09-05T13:14Z` | +31m | **不可逆**，删前单独确认 |
-
-单步耗时里值得单独记的：**每次 Edge 部署 8–20 分钟**（CDK 返回后 CloudFront 还要全球复制；
-一共部 4 次 = ⑤⑥⑦⑩），**每轮闸门 11±1 分钟**（`--dump-observed` 一次扫描喂两条命令可省掉
-第二轮），`preflight_config_states.py` 约 10 分钟，E2E 10 条约 37 分钟。
-
-> **④ 被跳过这件事必须连带读**（`2026-09-04T01:40:40Z` 裁决）：本环境是单人开发账号，
-> 只读读数已证实 T0 以来 `accepted_legacy` 三列全 0，所以"关掉 legacy 入口会踢人下线"
-> 这个风险在此不成立。**没有做"缩短窗口版的 ④"**（那是换掉判据再声称通过，比明确跳过更糟）。
-> 代价是：**观察窗口机制的真机证明只剩 ⑨ 一次**，因此 ⑨ 不得缩短、不得跳过。
-> 多人环境下不要照抄这个裁决。
-
-##### 一条读数上的坑：Logs Insights 有摄取延迟
-
-`session_verify_counts.py` 读的是 CloudWatch Logs Insights，**刚打完探针立刻读数会少一列**
-（⑤ 实测：panel 列首跑 `unknown_kid 0`，数分钟后才变 1）。看到某一列是 0 时**先等几分钟重跑**，
-别去查那个 verifier 的埋点——两道 26 小时时间闸都用这条命令下判断，误判成"埋点坏了"会让人
-去改代码。
-
-##### 四条容易被"顺手优化"掉的规定
-
-- **⑤（L3）与 ⑥（就位）不合并成一次 Edge 部署。** 合并省 20 分钟，代价是失败无法归因（关
-  legacy 关坏了？还是 v2 就位错了？）。
-- **排空时钟从 T2 起算**，不是 T1（理由见上表）。
-- **③ 的 legacy 回滚不在生产演示。** 把开关改回 `legacy` 是有效的回滚路径（见回滚表），但不
-  为了演示它而在生产上多签一批 legacy token——那会把 ④ 的观察窗口整个重置。
-- **⑩ 含删两把 v1 的 SSM 参数，且要在运行时单独确认。** 不删的话，一把无人接受的密钥继续
-  留给账号里的宽读者，闸门还要为不在 config 里的 kid 记账。**这一步不可逆。**
-  **一个已接受的度量缺口**（2026-09-05 实测）：本节的顺序是「闸门 C1 → C2 → 删参数」，所以 C2 写基线时
-  v1 已经不在 config、基线也就不再跟踪它 ⇒ **删除本身在闸门上不产生任何 delta**，"宽读者少两把可读密钥"
-  这个真实收益记不进闸门。想让它可度量就得把 C2 挪到删参数之后（多一轮约 12 分钟的扫描）。
-  按原顺序做没错，但验收时别期待看到那条 delta。
-
-##### 每步都要用到的三个片段
+`deployer/infra/app.py` 里**照抄一段同形的 `kms.Key(self, "SiteSessionKeyRsV2", …)` + 它的
+`CfnOutput(self, "SiteSessionKeyRsV2Arn", …)`**（`alias` 换成 `alias/site-builder/session/site-rs-v2`，
+`description` 里的 kid 同步；**不动旧那一段**）。**不要改写成 `for` 循环**：形态守卫
+（`deployer/tests/test_infra_kms_keys.py`）按 AST 读 `kms.Key(self, "<字面量>", …)`，循环变量在 AST 里
+读不出 construct ID ⇒ 那个守卫会退化成"零把 key 也算过"。然后：
 
 ```bash
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
+(cd site-builder/deployer/infra && rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never)
+STACK=$(python3 - <<'PY'
+import configparser, pathlib
+c = configparser.ConfigParser(interpolation=None); c.read(pathlib.Path("site-builder/config.ini"))
+print((c.get("Deployer", "stack_name", fallback="SiteDeployerStack") or "SiteDeployerStack").split("#")[0].strip())
+PY
+)
+python3 site-builder/scripts/session_key_fingerprint.py --kid site-rs-v2 --arn "$(aws cloudformation describe-stacks --stack-name "$STACK" --query "Stacks[0].Outputs[?OutputKey=='SiteSessionKeyRsV2Arn'].OutputValue | [0]" --output text)"
+```
 
-# ── A. 部署 auth / panel（两者都会先 update_function_configuration 再 update_function_code，
-#      并在第一次写之前 GetParameter 核对自己需要的 SSM 参数存在，缺一即拒绝部署）
-#      ⚠️ **两个组件的核对清单不一样，别记成同一条**：
-#        · panel = ssm_parameter_names(keys, ("console",))，**含非空的 legacy_param**
-#          ⇒ legacy 参数被删时 panel 部署会被拦住；
-#        · auth  = 同一个上游再**减去** legacy 与 login-flow（deploy_auth 的 `owned`），另含
-#          site client secret ⇒ **legacy 参数被删时 auth 不会被拦住**。
-#      那条排除的理由与边界在 docs/adr/0004-*.md：列进清单会让 `ensure_secret` 的缺省补建
-#      永远走不到、首次部署自我拒绝。login-flow 只有 auth 一个消费方，排除它是**安全**的；
-#      **legacy 那条并不安全**——Edge 那份值是部署时注入的副本，成熟部署上参数若被删，auth 会
-#      静默重造一把而 Edge 仍是旧值 ⇒ 正是本节开头那个全员登录循环。1B 不修（独立设计面）。
-#      ⚠️ **两者的先后按每步表格里写的那个，不是按本片段的行序**：
-#         ③⑦⑧（切 signer / 换槽位）是 panel 先、auth 后；⑤⑥⑩ 是 auth 先、panel 后。
-(cd site-builder/auth  && python3 deploy_auth.py)
-(cd site-builder/panel && python3 deploy_panel.py --skip-frontend)   # 本 runbook 不改前端
-python3 site-builder/scripts/verify_deployed_components.py           # 环境变量整体 == 本地推导
+**新 key 只能走 `--kid/--arn` 这条路**：`--from-stack` 里那张表钉的是**首次部署那两把**
+（`site-rs-v1` / `console-rs-v1`）的 CfnOutput 名，加 key 时它不认新的；⑤ 删掉 v1 那一段之后
+`--from-stack` 会以"栈缺 CfnOutput"响亮失败——那是预期，改用 `--kid/--arn`，或同步改那张表。
 
-# ── B. 部署 Edge（**每次都 rm -rf cdk.out**，否则用陈旧 asset；stack policy 三步：open → deploy → apply）
+把打印的 `[SessionKey:site-rs-v2]` 小节粘进 `config.ini`，**先不改 `site_previous`**。闸门第一轮（只有 key、还没人
+持它的 grant——auth / panel 的 IAM 在下一步才扩）：
+
+```bash
+python3 site-builder/scripts/verify_account_trust_boundary.py --new-key site-rs-v2      # 期望：kms 分节新出现 site-rs-v2（已声明，绿）
+```
+
+##### ② 就位：新 key 进 `previous`，三处 verifier 先认
+
+`config.ini`：`site_previous = site-rs-v2`。然后 **auth → panel → Edge** 重部（auth / panel 的 IAM 随之多出对
+v2 的 `kms:Sign` / `GetPublicKey`；Edge 的 allowlist 多一把公钥）：
+
+```bash
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+(cd site-builder/auth && python3 deploy_auth.py)
+(cd site-builder/panel && python3 deploy_panel.py --skip-frontend)
 python3 site-builder/scripts/router_stack_policy.py open
-(cd router/infrastructure && rm -rf cdk.out \
-   && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never)
-python3 site-builder/scripts/router_stack_policy.py apply   # 无论 deploy 成败都要跑
-# 等 CloudFront 真的 Deployed（CLI 会挂在最后一步 10–20 分钟，别盯它的输出）：
-aws cloudfront get-distribution --id {distribution_id} \
-  --query 'Distribution.Status' --output text     # 必须是 Deployed
-bash site-builder/scripts/verify_deployed_edge.sh # 产物逐行核对 + 占位符全部替换
-
-# ── C. 闸门：**出结论**（C1）与**写回基线**（C2）是两件事，顺序不能反
-#      （--update-baseline 会先渲染一遍比较报告再写、报告生成不了就不写——但它**不改退出码**，
-#       语义仍是"我知道并接受这些变化"，所以先用 C1 出结论，再决定 C2）
-# C1 出结论：一次扫描 + 一次比较
-# **落 .scratch/ 而不是 /tmp**：dump 含真实角色名（gitignored 目录才安全），而 macOS 会清理 /tmp
-# ——2026-09-05 ⑩ 就是因为 ⑥ 那份 dump 已被清掉，`探测资源 68 → 73` 里有 +2 净增无法做集合差集归因。
-DUMP="$(git rev-parse --show-toplevel)/.scratch/atb-$(date +%s).json"   # 含真实角色名，**不要提交**
-python3 site-builder/scripts/verify_account_trust_boundary.py --dump-observed "$DUMP"
-python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump "$DUMP" <声明旗标>
-# C2 写回基线：**只在被声明的 delta 已经真的出现之后**（见下面的告警），可复用同一份快照
-python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump "$DUMP" --update-baseline
+(cd router/infrastructure && rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never)
+python3 site-builder/scripts/router_stack_policy.py apply
+# 等 CloudFront 真的 Deployed（10–20 分钟），然后：
+bash site-builder/scripts/verify_deployed_edge.sh
+python3 site-builder/scripts/verify_kid_entry_live.py --role previous        # 用就位中的 key 签的夹具会话必须 200（会消费一枚升级码）
+python3 site-builder/scripts/verify_account_trust_boundary.py --new-key site-rs-v2   # auth 多出 kms-sign:site-rs-v2（已声明）
+python3 site-builder/scripts/verify_account_trust_boundary.py --new-key site-rs-v2 --update-baseline
 ```
 
-> **片段 C 的一次扫描喂两条命令**，省掉第二个 11 分钟（实测 11±1 min）。**唯一的例外是 ②**：
-> 「Edge 产物含 login-flow 值即红」是硬断言、刻意不落 facts，所以**它只在实测路径上评估**
-> （`--from-dump` 跑时脚本会自己在 stderr 说明这一点）。② 因此走实测路径两遍，命令写在那一步里。
->
-> 声明旗标的 `LABEL` ∈ 已配置的 kid ∪ 基线里记过的 kid ∪ `{legacy, login-flow}`。**声明过的
-> 增减落在 `migration_grants` 分节（绿）**；未声明的增减一律红。看到红先读闸门自己打的处置文案。
-> （"基线里记过的 kid"那一支是 ⑩ 必需的：退役的动作正是把 kid 从 config 删掉再重部，而 grant
-> 的丢失只有重部之后才出现 ⇒ 到能声明的时刻 config 已经不含它了。打错一个字仍然硬失败。）
->
-> ⚠️ **每一次密钥增减都会让闸门在 `new_undecided_items` 上红，这是结构性的、不是漂移。**
-> 2026-09-03 首次执行 ② 时实测：305 条红「新增判不出的项」，**同时** 305 条绿「这一项已能
-> 判定」，`undecided_items: 774 → 774（+0）`。机制在 `undecided_members()` 的 docstring 里
-> 就是刻意设计——成员指纹 = `(principal, 动作等价类, 判不出的**资源类集合**)`，**集合整体进
-> 指纹**（为的是"多出一个精确平台函数照样红"）。于是新增一个 SSM 参数会让每个 SSM 读被
-> Condition 挡住的 principal 的资源类集合多一项 ⇒ 旧指纹消失、新指纹出现。
-> **当时** `--new-key` / `--retire-key` 只把 `gained` / `lost` 的 grant 送进迁移桶，coverage churn
-> 没有迁移通道，所以这几步没法按"闸门必须全绿"验收。**3c-1B-G 之后有了**（2026-09-06 复审版）：
-> 成员改成可分解形态、基线 schema 5，被声明 key 的资源类从**两侧**剔掉后相等即整批落绿
-> `migration_undecided`——新增与退役都能吸收，⑥/⑩ 声明过就该全绿。下面**五条判据只在声明解释
-> 不了 churn（报告里仍有红）时才需要人工走**（全中才算良性，任一条不成立就是真漂移，停下来查）：
->
-> 1. `undecided_items` 的总量 delta 是 `+0`（或 ≤ 本轮声明的 key 数所能解释的量；**或**能归因到点名的
->    无关 principal——`aws iam list-roles/list-users` 按 CreateDate 落在两次扫描之间过滤，带 Condition 策略的
->    每个最多贡献 5 条（成员指纹上界 = principal × 动作类）。2026-09-04 ⑥ 实测：同账号另一工程新建 6 个
->    `bedrock-*` 角色、2 个带 Condition ⇒ `+10` 与 `principals_with_missing_context +2`，与两把 v2 无关。
->    共享账号里每一步都可能撞上，归因写进 progress 再接受，不许只凭"数字不大"接受）；
-> 2. 红的条数 == 绿「已能判定」的条数（1:1 置换）。**用 dump 的集合比对，不要数报告的行数**：
->    段落里有换行续行，数行数会得出"红 784 / 绿 810"这种假象（2026-09-05 ⑩ 实测踩过）。正确做法：
->    `python3 -c` 读基线与 dump 的 `coverage.undecided_items`，比 `len(b-n)` / `len(n-b)` / 交集
->    （⑩ 实测 gone 784 / new 784 / 交集 0，才是真的 1:1）；
-> 3. 迁移分节**只**含本轮声明的 label；
-> 4. 其余红字段（`new_grants` / `missing_required` / `new_statements` /
->    `bucket_policy_drift` / `iam_write_drift` / `boundary_drift` / `console_key_in_edge`）
->    **一条都没有**；
-> 5. facts 的每条 delta 都能被**本步的动作**解释（`principals_with_missing_context` 与基线一致；
->    含 Edge 部署的步骤里 `edge_assets_carrying_live_key`（**并集**，跨全部活密钥）与
->    `session_keys.<current kid>` 两项各 **+1**——新版本/新 asset 带着 current kid 的值，这是
->    `_compare_facts` 的 docstring 写明的"每次 Edge 部署就多一个"；⑤ 另有 legacy 代码目标 **−1**，
->    因为 `$LATEST` 从此不再带那个值）。对不上的 delta 才是漂移。facts 本身不参与红绿，所以
->    这一条要**人读**，闸门 exit 0 不代替它。
->
-> （历史注：这里原写"真修复没有排期"。它已在 3c-1B-G 及其复审里做掉——但**不是**"让被声明的资源类
-> 永久不参与 coverage"那个方向（那会让该资源类在 coverage 维度上失明），而是成员可分解 + 比较时
-> 对两侧临时剔类，基线里仍完整记着每个资源类。见上面 3c-1B-G 那段。）
->
-> ⚠️ **C2 的时机是这套流程最容易做错的一步。** 被声明的 grant delta 分两批出现：
-> `ensure_session_keys.py` 建出参数**只**改变"通配前缀的宽读者能读到什么"，而 auth/panel 上
-> 那条**精确 ARN** 的 grant 要等各自的部署脚本收敛策略之后才存在。所以 ② 与 ⑥ 的闸门要跑
-> **两轮 C1**（部署前、部署后各一次，都带同样的声明旗标），**C2 只在最后一轮之后跑**。
-> 顺序做反的症状：基线记下了部署前的状态，于是下一步一次无声明的复跑就在 `new_grants` 上转红。
+**console family 的就位没有正向探针**（夹具签发器只签站点会话，ADR 0002）：`console_previous` 就位后能做的只有
+`verify_deployed_components.py` 的三方公钥对账（静态证据），第一次真机证明发生在 ③ 切换那一刻。这是刻意接受的代价：
+console family 的 verifier 只有 auth 与 panel（Edge 不持 console 公钥），切错的回滚是把 ③ 那两行 config 改回来重部两个
+Lambda，约 5 分钟、无 CloudFront 窗口。
 
----
+##### ③ 切换：两槽互换（= T1）
 
-##### ① 前置代码一次上齐（`signer = legacy`）
-
-| | |
-|---|---|
-| **配置** | `[SessionKeys]` 新增 `signer = legacy` 与 `login_flow_secret_param = /site-builder/login-flow-secret`；`legacy_param` 保持非空 |
-| **动作** | 只是代码与配置就位，**不部署任何组件**。七个包单测**串行**跑全绿（`contract/tests/test_redlines.py` 有墙钟哨兵，并行会假红） |
-| **硬停止点** | 单测全绿 + 工作树干净 + commit SHA 记进 progress |
-| **闸门** | 不跑（没有部署，账号里什么都没变） |
-| **回滚** | git |
-
-##### ② 建 login-flow secret，部 auth **与 panel**（开关仍 `legacy`）
-
-| | |
-|---|---|
-| **配置** | 无（① 已写好 `login_flow_secret_param`） |
-| **动作** | `ensure_session_keys.py` → **闸门第一轮**（出结论，不写基线）→ 片段 A 的 auth → 片段 A 的 **panel** → **闸门第二轮 + 写基线**。两轮都走实测路径、都带同样的声明旗标，见下面的命令 |
-| **硬停止点** | (a) `GET https://auth.{base_domain}/login` 必须 302 且带 `Set-Cookie: __Host-sb_pkce=`；(b) 操作者**人工完整登录一次**（证明整条 /login → /callback 在换了 login-flow secret 之后是通的）；(c) `verify_deployed_components.py` **80/80 全绿**——本步把两个组件都带到 1B 代码，所以这里就该全绿，不留到 ③ |
-| **闸门** | 两轮都带 `--new-key login-flow`。第一轮（部署前）只多出参数本身带来的宽读者面；**第二轮（部署后）才会出现** auth 执行角色上那条精确 ARN 的 grant `read-login-flow-secret`，落在 `migration_grants`（绿）。**它不进 `is_secret_grant()`——读到它只值一个登录 CSRF，不是冒充面**，所以冒充面数字不变 |
-| **回滚** | 改 `signer` 无关；这一步的风险只在 `/login`。回滚 = git 重部 auth。**SSM 里新建的 secret 不删** |
+`config.ini`：`site_current = site-rs-v2`、`site_previous = site-rs-v1`。**panel 先、auth 后**重部，然后 Edge
+重部一次只为把 current / previous 标签摆正（排空曲线要在 Edge 列上读）：
 
 ```bash
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
-
-python3 site-builder/scripts/ensure_session_keys.py
-
-# 闸门第一轮：**走实测路径**，不用片段 C 的 --from-dump 快照——「Edge 产物含 login-flow 值
-# 即红」是硬断言、刻意不落 facts ⇒ 它只在实测路径上评估（--from-dump 时脚本会自己说明）。
-# **这一轮不写基线**：auth 角色上那条精确 ARN 的 grant 还不存在。
-python3 site-builder/scripts/verify_account_trust_boundary.py --new-key login-flow
-
-# …片段 A 的 auth，接着片段 A 的 panel（两者都还是 signer=legacy）…
-
-# ⚠️ **panel 也要在本步部署，别留到 ③。** 本步之前 panel 还是上一包（1A）的代码；如果留到
-#    ③，那一次 deploy_panel 会把「panel 的 1B 代码」与「panel 切 current」并成一次部署，
-#    panel 一出问题就无法归因——而 auth 的这两件事本来就是分在 ②/③ 的。开关仍是 legacy，
-#    所以这一次部署**行为中性**（面板会话仍是旧形态，字节级不变），代价约 1 分钟。
-#    2026-09-03 首次执行时就是按拆开做的：拆开后 verify_deployed_components 当场 80/80。
-
-python3 site-builder/scripts/verify_deployed_components.py   # 本步就该 80/80
-
-# 硬停止点先做（秒级），再跑 11 分钟的闸门：
-BASE=$(python3 - <<'PY'
-import configparser, pathlib
-c = configparser.ConfigParser(interpolation=None); c.read(pathlib.Path("site-builder/config.ini"))
-print(c["Platform"]["base_domain"].split("#")[0].strip())
-PY
-)
-curl -sS -D- -o /dev/null "https://auth.${BASE}/login" | grep -Ei '^(HTTP/|location:|set-cookie:)'
-# ↑ 必须是 302 + Location 指向 Cognito + Set-Cookie: __Host-sb_pkce=…，然后人工登录一次
-
-# 闸门第二轮：同样的声明，确认 delta 就是那一条；确认后才写基线
-python3 site-builder/scripts/verify_account_trust_boundary.py --new-key login-flow
-python3 site-builder/scripts/verify_account_trust_boundary.py --update-baseline
-```
-
-> 为什么这一步单独部一次：登录流程的 HMAC 从会话密钥换成 login-flow secret 之后，auth 的
-> 5 分钟缓存窗口内**进行中**的登录会失败一次（用户重试即可）。把它与 signer 切换分开，
-> `/login` 的一次性失败窗口就不会和"会话是否有效"纠缠在一起。**已签发的会话完全不受影响。**
->
-> **这次人工登录不会刷新 MCP 的 OAuth token**——那是另一条流程（`node
-> site-builder/clients/quick-desktop-proxy/auth.js`），③ 的 `verify_analytics_e2e.py` /
-> `verify_api_key_e2e.py` 仍会因为它过期而失败。趁这一步顺手把那条也跑一次。
-
-##### ③ 切 signer：`legacy` → `current`（= T0）
-
-| | |
-|---|---|
-| **配置** | `[SessionKeys] signer = current`（**本 runbook 里这一行只改一次**）|
-| **动作** | 片段 A 的 panel **先**，auth **后**（`deploy_auth.py` 返回的时刻 = **T0**，记进 progress）。两者的 1B 代码都已在 ② 上线，本步**只**改 `SESSION_SIGNER` 一个变量 |
-| **硬停止点** | 四个 `verify_*` + `verify_kid_entry_live.py` + `smoke_router.sh` 全绿 → `session_verify_counts.py --hours 1 --require-total --require-nonzero accepted_current`（**三列的 `accepted_current` 都 > 0**，脚本判，exit 0 才算） → E2E 后台跑一次（10 条、约 37 分钟）→ 预存**两枚** legacy 探针 token（⑤ 用）|
-| **闸门** | 无需声明（没有密钥增减）。可复跑一次确认没有夹带漂移 |
-| **回滚** | `signer = legacy` → 重部 panel + auth。**不动 Edge、不回退代码**（verifier 全程双接受）|
-
-```bash
-set -euo pipefail
-cd "$(git rev-parse --show-toplevel)"
-
-python3 site-builder/scripts/verify_console_e2e.py
-python3 site-builder/scripts/verify_analytics_e2e.py          # 需要新鲜的 MCP OAuth token
-python3 site-builder/scripts/verify_api_key_e2e.py            # 无 [ApiKey] 段时自行跳过并返回 0
-python3 site-builder/scripts/verify_session_token_semantics.py
-python3 site-builder/scripts/verify_kid_entry_live.py
-bash    site-builder/scripts/smoke_router.sh
-python3 site-builder/scripts/session_verify_counts.py --hours 1 --require-total --require-nonzero accepted_current
-
-# ⑤ 的负向探针要 legacy 形态的 token，而 legacy 入口马上就要关：现在预存。
-# **要两枚**：`site-session` 证明 Edge 拒（302），`console-upgrade` 证明 panel 拒（401）。
-# 只存一枚 site-session 的话，探针根本不会去打 panel——`--retired-token` 按记录里的
-# token_use 分派，而 panel 只在写请求上验面板会话，探针只发 GET。
-# 届时两枚都已过期，但 §5 的合同是 kid 先于 exp ⇒ 结果仍是 unknown_kid，与过期无关。
-# ⚠️ **两个旗标的路径基准不一样**（实测踩过）：`--save` 的相对路径**按 `.scratch/` 解析**
-#    （token 是活凭证，只许落在 gitignored 目录里），而 `--retired-token` 是普通路径、按 cwd
-#    解析。所以同一个文件在这里写 `rotation/x.json`、在 ⑤/⑩ 读时写 `.scratch/rotation/x.json`。
-#    写成 `--save .scratch/rotation/x.json` 不会报错，而是落进 `.scratch/.scratch/rotation/`，
-#    到读回那一步才以「不是 --save 写出的记录」失败。
-python3 site-builder/scripts/_session_mint.py --token-use site-session \
-  --email <目标站点 owner> --role legacy --ttl 600 \
-  --save rotation/legacy-site.json     # ← **相对 `.scratch/`**，见下面的路径告警
-python3 site-builder/scripts/_session_mint.py --token-use console-upgrade \
-  --email <目标站点 owner> --role legacy --ttl 60 \
-  --save rotation/legacy-upgrade.json
-```
-
-> **panel 先、auth 后**是刻意的：面板会话只有 panel 自己验、TTL 4 h，是爆炸半径最小的那个
-> 组件，用它拿先行信号。
-
-##### ④ 观察窗口（≥ T0 + 26 h）
-
-| | |
-|---|---|
-| **配置** | 无 |
-| **动作** | 先跑四个 `verify_*`（证明埋点在工作），再 `session_verify_counts.py --drain-gate legacy`（旧写法 `--hours 26 --require-total --require-zero accepted_legacy --require-nonzero accepted_current` |
-| **硬停止点** | 上一条命令 **exit 0**（= 三列 `accepted_legacy` **全 0**、三列 `accepted_current` **全 > 0**、每处总量 > 0，三条都由脚本判）。**不满足就不许进 ⑤**——继续观察或先查是谁还在发 legacy。**第一次判定失败是常态，不是故障**（见下面的窗口算术）|
-| **闸门** | 不跑 |
-| **回滚** | 无（只读一步）|
-
-```bash
-set -euo pipefail
-cd "$(git rev-parse --show-toplevel)"
-
-# 先证明埋点在工作（这四个都发新形态，不会污染 accepted_legacy），再读计数
-python3 site-builder/scripts/verify_console_e2e.py
-python3 site-builder/scripts/verify_analytics_e2e.py          # 需要新鲜的 MCP OAuth token
-python3 site-builder/scripts/verify_api_key_e2e.py            # 无 [ApiKey] 段时自行跳过并返回 0
-python3 site-builder/scripts/verify_session_token_semantics.py
-
-python3 site-builder/scripts/session_verify_counts.py --drain-gate legacy    # exit 0 才算过
-```
-
-> **窗口算术：`≥ T0+26 h` 是最早**可以**尝试**的时刻，不是能过的时刻。** spec §11.8.2 写明
-> **实际落点在 T0+26 h 到 T0+52 h 之间**，取决于**最后一枚 legacy cookie 何时被用**。原因是
-> 判据跑在**滑动窗口** `[X-26h, X]` 上：legacy cookie 在 T0 之前签出、还能活 24 h，所以只要
-> 有人在 T0+23 h 用了一枚，能干净的窗口就得等到 T0+49 h。**算法**：
-> `最早可过时刻 = 最后一次 accepted_legacy 的时刻 + 26 h`，每次判定失败就按新的"最后一次"重算。
-> 判定失败时**不要**换掉旗标去凑绿（那是把判据换掉，不是通过判据）。`--drain-gate` 正是为此存在：
-> 四条判据锁在脚本里，操作者只选 previous 还是 legacy。
->
-> ⚠️ **观察窗口期间不要跑 `verify_kid_entry_live.py`。** 它有一条**故意**的正对照
-> 「legacy 会话仍 200 放行」——`_session_mint --role legacy` 现签一枚 legacy token 打到 Edge。
-> 那会给 `accepted_legacy` 记上一笔、把上面那个"最后一次"推到当下，**等于把 26 h 时钟按回零**。
-> 四个 `verify_*` 都不发 legacy（`_session_mint` 默认 current），所以 ④ 只跑那四个是刻意的。
-> 2026-09-03 实测：③ 里跑的那次 kid 探针就在 13:56 记了一笔 `accepted_legacy`，于是
-> T0+26 h 那一刻的窗口 `[T0, T0+26h]` 必然包含它 ⇒ 第一次判定注定失败，差的就是那几分钟。
-
-##### ⑤ L3：关闭 legacy 入口
-
-| | |
-|---|---|
-| **配置** | `[SessionKeys] legacy_param =`（**清空**。一处配置三处后果：`legacy_entry()` 变 off、auth/panel 不再下发 `JWT_SECRET_PARAM` 且角色 SSM 精确清单不含它、router 栈给 Edge 注入空串）|
-| **动作** | 片段 A 的 auth → 片段 A 的 panel → 片段 B 的 Edge |
-| **硬停止点** | 两枚预存的 legacy token：`site-session` 打站点必 **302**、`console-upgrade` 打 panel 必 **401**，日志 outcome 是 `unknown_kid`（不是 `expired`）|
-| **闸门** | `--retire-key legacy`。预期 delta：auth/panel 的执行角色**丢掉** legacy 参数的读权限（落 `migration_grants`，绿）；**宽读者的数量不变**——他们靠的是通配前缀，L3 不动那件事。⚠️ **别指望任何计数归零**：legacy 的产物计数是 `facts.edge_code_targets_carrying_live_key` / `edge_assets_carrying_live_key`（**不在** `facts.session_keys` 里——那个只按 kid 记，legacy 不是 kid），而 L3 只让**新**部署的 Edge 版本不再带那个值；已存在的历史版本与 bootstrap asset 仍带着它，所以这两个数**不会**变 0。真正的清零归 3c-3 删参数。**2026-09-04 实测**：本步**没有** `new_undecided_items` 的 churn（`774 → 774`、红条 0）——churn 来自 SSM 参数的**增删**改变了宽读者的资源类集合，而 L3 只收 grant、参数本体还在；churn 会在 ⑩ 真删参数时才出现。facts 实测：legacy 代码目标 11→10（`$LATEST` 不再带）、asset 并集 10→11、`site-hs-v1` 代码目标 2→3 / asset 1→2（版本 11 与它的 asset） |
-| **回滚** | `legacy_param` 填回去 → 重部 auth + panel + Edge。**参数本体没删，所以这条路是通的**（参数与代码分支由 3c-3 删除）|
-
-```bash
-set -euo pipefail
-cd "$(git rev-parse --show-toplevel)"
-
-python3 site-builder/scripts/verify_kid_entry_live.py \
-  --retired-token .scratch/rotation/legacy-site.json \
-  --retired-token .scratch/rotation/legacy-upgrade.json
-
-# 闸门（部署已完成 ⇒ delta 已经存在，一轮 C1 + 一次 C2 就够）
-DUMP="$(git rev-parse --show-toplevel)/.scratch/atb-$(date +%s).json"   # 含真实角色名，**不要提交**；落 .scratch/ 不落 /tmp（见片段 C）
-python3 site-builder/scripts/verify_account_trust_boundary.py --dump-observed "$DUMP"
-python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump "$DUMP" --retire-key legacy
-python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump "$DUMP" --update-baseline
-```
-
-> **空串不是 SYNTH 占位符**：`verify_deployed_edge.sh` 的两条占位符断言不会因为"刻意为空"
-> 而误报。看到 `SYNTH-ONLY-PLACEHOLDER` 才是 SSM 读取真的失败了——而 ticket 19 起那种失败会让 synth
-> 直接退出，正常 `cdk deploy` 路径上已经到不了产物核对这一步；产物里若仍出现占位符，说明有人带着
-> `APP_SYNTH_OFFLINE=1` 部署了，同样按故障处理。
->
-> 清空 `legacy_param` **之前** `signer` 必须已经是 `current`：加载器硬拒 `(legacy, 空)` 这个
-> 组合。到这里为止都是一次性的；下面五步是永久的轮转协议。
-
-##### ⑥ 就位：新 key 进 `previous` 槽位
-
-| | |
-|---|---|
-| **配置** | 加两节 `[SessionKey:site-hs-v2]` / `[SessionKey:console-hs-v2]`（`alg = HS256` + `ssm_param = /site-builder/session-keys/<kid>`），并把 `site_previous = site-hs-v2`、`console_previous = console-hs-v2` |
-| **动作** | `ensure_session_keys.py` → **闸门第一轮**（C1，不写基线）→ 片段 A 的 auth → 片段 A 的 panel → 片段 B 的 Edge → 探针 → **闸门第二轮（C1）+ 写基线（C2）** |
-| **硬停止点** | `verify_kid_entry_live.py --role previous` 必绿（站点会话 200、升级码经 panel 换出面板 cookie）|
-| **闸门** | 两轮都带 `--new-key site-hs-v2 --new-key console-hs-v2`。**精确 ARN 的读权限只在第二轮出现**（auth 两个 family、panel 只 console），落 `migration_grants`（绿）；`facts.session_keys` 多出 `site-hs-v2` 与 `console-hs-v2` 两行——**`console-hs-v2` 的 Edge 计数必须是 0**，否则 `console_key_in_edge` 直接红（Edge 的 allowlist 里不许出现 console family 的 key）|
-| **回滚** | `*_previous` 清空 → 重部三处。**新 secret 不删** |
-
-```bash
-set -euo pipefail
-cd "$(git rev-parse --show-toplevel)"
-
-KEYS="--new-key site-hs-v2 --new-key console-hs-v2"
-
-python3 site-builder/scripts/ensure_session_keys.py
-
-# 闸门第一轮（C1）：只有参数本身，**不写基线**
-ROOT="$(git rev-parse --show-toplevel)"      # dump 落 .scratch/ 不落 /tmp（见片段 C）；后缀区分前后两份
-D1="$ROOT/.scratch/atb-$(date +%s)-stage-before.json"        # 含真实角色名，**不要提交**
-python3 site-builder/scripts/verify_account_trust_boundary.py --dump-observed "$D1"
-python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump "$D1" $KEYS
-
-# …片段 A 的 auth → 片段 A 的 panel → 片段 B 的 Edge…
-
-python3 site-builder/scripts/verify_kid_entry_live.py --role previous
-
-# 闸门第二轮（C1）+ 写基线（C2）：精确 ARN 的 grant 到这里才存在
-D2="$ROOT/.scratch/atb-$(date +%s)-stage-after.json"
-python3 site-builder/scripts/verify_account_trust_boundary.py --dump-observed "$D2"
-python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump "$D2" $KEYS
-python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump "$D2" --update-baseline
-```
-
-> **本步忘跑 `ensure_session_keys.py` 不会静默**：两个部署脚本在第一次写之前 `GetParameter`
-> 核对自己需要的参数，缺一即拒绝部署（只读、不打印值）。没有这道防线时的症状是"部署脚本
-> exit 0、全部登录 500"。v2 两把是 family HS 行，**auth 与 panel 的清单都含它们**，所以本步
-> 在覆盖范围内（两个清单的差别只在 legacy 与 login-flow，见片段 A 的告警）。
->
-> 就位期 `accepted_previous` 应当**只等于探针数**。多出来的计数 = 有人拿就位中的 key 签了
-> token，查清楚再往下走。
-
-##### ⑦ 切换：两槽互换（= T1）
-
-| | |
-|---|---|
-| **配置** | `site_current = site-hs-v2` / `site_previous = site-hs-v1`；console 同理（**两槽互换**）|
-| **动作** | 片段 A 的 panel **先** → 片段 A 的 auth **后**（返回时刻 = **T1**）→ 探针 → **再部一次 Edge**（片段 B）|
-| **硬停止点** | `--role current` 与 `--role previous` **都必须 200**；Edge 重部并 `Deployed` 之后 `verify_deployed_edge.sh` 绿；**标签摆正要用读数证明**（见本步末尾）|
-| **闸门** | 无需声明（密钥集合没变，只换了标签）|
-| **回滚** | 互换回去 → 重部 panel + auth。**Edge 不必回滚**（双接受）|
-
-```bash
-set -euo pipefail
-cd "$(git rev-parse --show-toplevel)"
-
+(cd site-builder/panel && python3 deploy_panel.py --skip-frontend)
+(cd site-builder/auth && python3 deploy_auth.py)
 python3 site-builder/scripts/verify_kid_entry_live.py --role current
 python3 site-builder/scripts/verify_kid_entry_live.py --role previous
+# Edge 重部：三步一组，与 ② 同形
+python3 site-builder/scripts/router_stack_policy.py open
+(cd router/infrastructure && rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never)
+python3 site-builder/scripts/router_stack_policy.py apply
+# 等 CloudFront 真的 Deployed（10–20 分钟），然后 bash site-builder/scripts/verify_deployed_edge.sh
 ```
 
-> **最后那次 Edge 重部只为把标签摆正**：⑦ 之后到 Edge 重部之前，Edge 仍把 v1 记成
-> `accepted_current`、v2 记成 `accepted_previous`，与 auth/panel 正好相反。站点会话的绝大多数
-> 验签发生在 Edge，⑨ 的排空曲线本来就该在 Edge 列上读，所以标签必须摆正。它不在关键路径上
-> （Edge 早已双接受）。
->
-> **怎么证明标签真的摆正了**（`verify_deployed_edge.sh` 只核对 kid 集合，**不核对 role**）：两条，都便宜。
-> ① 从产物里把 kid→role 解出来（不解 secret）：
-> `aws lambda get-function --function-name <栈名>-<origin_request_function_name> --qualifier <版本> --query Code.Location`
-> → 下载解包 → 从 `SITE_ALLOWLIST_JSON` 读 `{kid: role}`，必须与 config 的槽位一致。
-> ② 行为侧：Edge 重部之后**只**发一次 `--role current` 探针，再读一个窄窗口
-> （`session_verify_counts.py --hours 0.1`，约 6 分钟）——`accepted_previous` 必须三列全 0。
-> 只发一种 role 是关键：两条探针都跑过就分不清哪一列来自哪一枚。2026-09-04 ⑦ 实测两条都过
-> （产物 `{site-hs-v2: current, site-hs-v1: previous}`；窄窗口 `accepted_current` 1/0/1、`accepted_previous` 全 0）。
+回滚 = 两槽换回去、重部 panel + auth（Edge 不动：它两把都认）。
 
-##### ⑧ 回滚演示（= T2）
-
-| | |
-|---|---|
-| **配置** | 互换回 v1 → 重部 → 再互换回 v2 |
-| **动作** | 互换回去 → 片段 A 的 panel + auth → 探针 → 换回 v2 → 片段 A 的 panel + auth（第二次 auth 返回的时刻 = **T2**）|
-| **硬停止点** | 回滚态下 `--role current`（此刻是 v1）与 `--role previous`（v2）都 200；换回之后同样两条都 200 |
-| **闸门** | 无需声明 |
-| **回滚** | 这一步本身就是回滚演示 |
+##### ④ 排空（≥ T1 + 26 h）
 
 ```bash
-set -euo pipefail
-cd "$(git rev-parse --show-toplevel)"
-
-# 互换回 v1 → 片段 A 的 panel + auth，然后：
-python3 site-builder/scripts/verify_kid_entry_live.py --role current    # 此刻 current = v1
-python3 site-builder/scripts/verify_kid_entry_live.py --role previous   # 此刻 previous = v2
-# 再互换回 v2 → 片段 A 的 panel + auth（第二次 auth 返回的时刻 = T2，记进 progress），然后：
-python3 site-builder/scripts/verify_kid_entry_live.py --role current
-python3 site-builder/scripts/verify_kid_entry_live.py --role previous
+python3 site-builder/scripts/verify_console_e2e.py && python3 site-builder/scripts/verify_analytics_e2e.py   # 先证明埋点在工作
+python3 site-builder/scripts/session_verify_counts.py --drain-gate previous    # 四条判据锁在脚本里：窗口 ≥ 26 h、每处总量 > 0、accepted_previous 三列全 0、accepted_current 三列全 > 0
 ```
 
-> **这一步是要证明回滚路径真的能走**，而不是纸面声明：signer 的回滚只是改一行配置重部两个
-> 组件，全程不动 Edge、不回退代码。⑧ 期间 Edge 标签会再次倒置几分钟，**不处理**——⑧ 结束后
-> Edge 的 `current = v2` 与 signer 重新一致。
+exit 0 才算过。26 = 站点会话 TTL 24 h + Edge 全球复制 + 余量。
 
-##### ⑨ 排空（≥ T2 + 26 h）
-
-| | |
-|---|---|
-| **配置** | 无 |
-| **动作** | 先跑四个 `verify_*`，再 `session_verify_counts.py --drain-gate previous`（旧写法 `--hours 26 --require-total --require-zero accepted_previous --require-nonzero accepted_current` |
-| **硬停止点** | 上一条命令 **exit 0**（= 三列 `accepted_previous` **全 0**、三列 `accepted_current` **全 > 0**、每处总量 > 0，三条都由脚本判）。不满足就不许进 ⑩ |
-| **闸门** | 不跑 |
-| **回滚** | 无（只读一步）|
+##### ⑤ 退役旧 key（**最后一步不可逆**）
 
 ```bash
-set -euo pipefail
-cd "$(git rev-parse --show-toplevel)"
-
-# 先证明埋点在工作（这四个都发新形态，不会污染 accepted_legacy），再读计数
-python3 site-builder/scripts/verify_console_e2e.py
-python3 site-builder/scripts/verify_analytics_e2e.py          # 需要新鲜的 MCP OAuth token
-python3 site-builder/scripts/verify_api_key_e2e.py            # 无 [ApiKey] 段时自行跳过并返回 0
-python3 site-builder/scripts/verify_session_token_semantics.py
-
-python3 site-builder/scripts/session_verify_counts.py --drain-gate previous  # exit 0 才算过
+python3 site-builder/scripts/_session_mint.py --token-use site-session --role previous --save rotation/site-v1.json   # 先预存负向探针
 ```
 
-##### ⑩ 退役旧 key（含删 SSM 参数，**不可逆**）
-
-| | |
-|---|---|
-| **配置** | `*_previous` 清空、删掉 `[SessionKey:site-hs-v1]` / `[SessionKey:console-hs-v1]` 两节 |
-| **动作** | **先**预存两枚 v1 探针 token（配置还没改的时候）→ 改配置 → 片段 A 的 auth → 片段 A 的 panel → 片段 B 的 Edge → 负向探针 → 片段 C（`--retire-key site-hs-v1 --retire-key console-hs-v1`）→ **单独确认后**删两把 v1 的 SSM 参数 |
-| **硬停止点** | 两枚预存的 v1 token 必须被**明确拒绝**（站点 302 / panel 401，outcome `unknown_kid`）；删参数前**逐条读出参数名再确认一次** |
-| **闸门** | 上面那两条声明。预期 delta：两把 v1 参数的读权限从 auth/panel 上消失（落 `migration_grants`，绿）；`facts.session_keys` 的 v1 两行消失 |
-| **回滚** | 删参数**之前**：填回 `*_previous` + 两节 config，重部三处。删参数**之后：没有回滚**——只能建一把新 key 走 ⑥ |
+`config.ini`：`site_previous =`，删 `[SessionKey:site-rs-v1]` 小节；`app.py` 删 `SiteSessionKeyRsV1` 那**一整段**
+（`kms.Key` + `CfnOutput`；`RemovalPolicy.RETAIN` ⇒ key 留在账号里、脱离栈管理，alias 一并解绑）。**auth → panel → Edge** 重部，等 Deployed，然后：
 
 ```bash
-set -euo pipefail
-cd "$(git rev-parse --show-toplevel)"
-
-# 顺序关键：先预存，再改 config（改完 `--role previous` 就会响亮失败——取不到那把 key 了）
-python3 site-builder/scripts/_session_mint.py --token-use site-session \
-  --email <目标站点 owner> --role previous --ttl 600 \
-  --save rotation/v1-site.json
-python3 site-builder/scripts/_session_mint.py --token-use console-upgrade \
-  --email <目标站点 owner> --role previous --ttl 60 \
-  --save rotation/v1-upgrade.json
-# …改 config、按上面的顺序重部三处…
-python3 site-builder/scripts/verify_kid_entry_live.py \
-  --retired-token .scratch/rotation/v1-site.json \
-  --retired-token .scratch/rotation/v1-upgrade.json
-
-# 闸门（部署已完成 ⇒ 丢失已经发生，一轮 C1 + 一次 C2 就够）
-DUMP="$(git rev-parse --show-toplevel)/.scratch/atb-$(date +%s).json"   # 含真实角色名，**不要提交**；落 .scratch/ 不落 /tmp（见片段 C）
-python3 site-builder/scripts/verify_account_trust_boundary.py --dump-observed "$DUMP"
-python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump "$DUMP" \
-  --retire-key site-hs-v1 --retire-key console-hs-v1
-python3 site-builder/scripts/verify_account_trust_boundary.py --from-dump "$DUMP" --update-baseline
-
-# ---- 到这里为止都可回滚。下面**不可逆**：删两把 v1 的 SSM 参数。 ----
-# 先核对账号，再逐条读出参数名（只读、不解密），确认无误后才删。
-WANT=$(python3 - <<'PY'
-import configparser, pathlib
-c = configparser.ConfigParser(interpolation=None); c.read(pathlib.Path("site-builder/config.ini"))
-print(c["Platform"]["account_id"].split("#")[0].strip())
-PY
-)
-GOT=$(aws sts get-caller-identity --query Account --output text)
-[ "$WANT" = "$GOT" ] || { echo "账号不符：凭据在 $GOT，config.ini 写的是 $WANT——中止"; exit 1; }
-
-for P in /site-builder/session-keys/site-hs-v1 /site-builder/session-keys/console-hs-v1; do
-  aws ssm get-parameter --region us-east-1 --name "$P" \
-    --query 'Parameter.[Name,Type,Version]' --output text     # **不带 --with-decryption**
-done
-read -r -p "以上两个参数将被永久删除（无回滚）。输入 DELETE 确认：" ANS
-[ "$ANS" = "DELETE" ] || { echo "未确认，中止（config 与部署已完成，删参数可以稍后再做）"; exit 1; }
-for P in /site-builder/session-keys/site-hs-v1 /site-builder/session-keys/console-hs-v1; do
-  aws ssm delete-parameter --region us-east-1 --name "$P"
-done
+python3 site-builder/scripts/verify_kid_entry_live.py --retired-token .scratch/rotation/site-v1.json   # 必 302 且日志 unknown_kid
+python3 site-builder/scripts/verify_account_trust_boundary.py --retire-key site-rs-v1
+python3 site-builder/scripts/verify_account_trust_boundary.py --retire-key site-rs-v1 --update-baseline
+# 不可逆：先读回 key 的描述核对账号与 alias，再排期删除（7–30 天窗口内仍可取消）
+aws kms describe-key --key-id <site-rs-v1 的 key ARN> --query 'KeyMetadata.[Arn,Description,KeyState]'
+aws kms schedule-key-deletion --key-id <site-rs-v1 的 key ARN> --pending-window-in-days 7
 ```
+
+**console family 的退役证据是静态的，没有真机负向探针。** 夹具签发器只签站点会话（ADR 0002），而
+console 那条链路上唯一能预存的 token 是升级码、TTL 60 秒——26 小时排空跑完时它早已过期，那时的 401
+证明的是"过期"而不是"kid 已退役"，是一条会骗人的绿。所以 console family 退役后能拿到的证据是三层：
+panel 的 allowlist 单测（退役 kid 不在 `SESSION_KEYS_JSON` 里）+ `verify_deployed_components.py` 的三方
+对账（退役 kid 同时不在 env、config 与 KMS 集合里）+ `verify_account_trust_boundary.py --retire-key console-rs-vN`
+（grant 与 coverage 成员的迁移被声明）。site family 的负向探针（上面那条 `--retired-token`）**不能**替它作证：
+两个 family 的 allowlist 是各自独立注入的。
 
 ##### 回滚一览
 
-| 出问题的步骤 | 回滚动作 | 要不要动 Edge | 要不要回退代码 |
-|---|---|---|---|
-| ③ signer 切 current | `signer = legacy` → 重部 panel + auth | 不要 | 不要 |
-| ⑤ L3 关 legacy | `legacy_param` 填回 → 重部 auth + panel + Edge | 要 | 不要 |
-| ⑥ 新 key 就位 | `*_previous` 清空 → 重部三处 | 要 | 不要 |
-| ⑦ 切换 / ⑧ 回滚演示 | 两槽互换回去 → 重部 panel + auth | 不要 | 不要 |
-| ⑩ 退役（**删参数前**） | 填回 `*_previous` + 两节 config → 重部三处 | 要 | 不要 |
-| ⑩ 退役（**删参数后**） | 无回滚：建一把新 key 从 ⑥ 重走 | 要 | 不要 |
-| 代码本身有 bug | git 重部（`AUTH_PACKAGE_MODULES` / `COPY_FILES` 守卫先跑一遍）| 视改动 | 要 |
+| 出问题的步骤 | 回滚动作 | 要不要动 Edge |
+|---|---|---|
+| ② 就位 | `*_previous` 清空 → 重部三处 | 要 |
+| ③ 切换 | 两槽互换回去 → 重部 panel + auth | 不要 |
+| ⑤ 退役（删 key 之前） | 填回 `*_previous` + 小节 + construct → 重部三处 | 要 |
+| ⑤ 退役（已 schedule-key-deletion） | 窗口内 `aws kms cancel-key-deletion`，否则建新 key 从 ① 重走 | 要 |
+| 代码本身有 bug | git 重部（`AUTH_PACKAGE_MODULES` / `COPY_FILES` 守卫先跑一遍） | 视改动 |
 
-三条贯穿全表的原则：
+三条原则：signer 的回滚永远只是"改配置重部 auth/panel"（verifier 全程两把都认）；verifier 不回滚（它认的是超集）；
+key 只在 ⑤ 的最后一步删。
 
-1. **signer 的回滚永远只是"改配置重部 auth/panel"**，因为 verifier 全程同时接受
-   `current` / `previous`（L3 之前还接受 legacy）。
-2. **verifier 不回滚。** Edge 回滚只会拉长窗口——它认得的 key 是新旧的超集。
-3. **SSM 里的新密钥不删**（⑩ 那一步是唯一的例外，且明确不可逆）。
+##### 应急：一把会话签名 key 疑似被滥用
 
-演练结束后 `config.ini` 的状态：`signer = current`、`*_current = *-hs-v2`、`*_previous` 空、
-`legacy_param` 空。（原计划 3c-2B 的 RS key 从这个状态经 ⑥ 就位；2026-09-06 起改为硬切换，见 spec §11.9。）
-
-##### 应急：一把会话密钥已泄漏，必须立刻失效
-
-走十步 runbook 的 ⑥→⑦→⑩，但把
-⑨ 的 26 小时排空闸**跳过**——那是拿"所有在线会话立刻失效"换"密钥立刻失效"。具体是
-⑥ 就位新 key（Edge 部署 + 全球复制，10–20 分钟，这段时间无法压缩）→ ⑦ 切换 →
-直接跳到 ⑩ 退役被泄漏的那把并删它的 SSM 参数。代价是每个持旧 cookie 的用户被踢回
-登录页一次（不是无限循环——旧 kid 已不在 allowlist，重新登录即拿到新 kid 签的会话）。
-**处置期间不要因为"用户报登录跳转"就回滚 Edge**，回滚只会把泄漏窗口拉长。
-
-如果泄漏的是 legacy 共享密钥而 legacy 入口还开着（L2 之前），直接做 ⑤（清空
-`legacy_param` + 三处重部）就是最快的失效路径，代价同上。
+`kms:Sign` 的调用者与次数在 CloudTrail 里（`eventName=Sign`、`resources.ARN`）——先看是谁。处置走 ①→②→③ 再**直接跳到 ⑤**
+（跳过 26 h 排空），代价是每个持旧 cookie 的用户被踢回登录页一次（不是循环）。**处置期间不要因为"用户报登录跳转"
+就回滚 Edge**，回滚只会把窗口拉长。login-flow secret 泄漏的处置是 `aws ssm put-parameter --overwrite`（5 分钟内
+进行中的登录失败一次，无会话影响）。
 
 ### 本机工具链
 
@@ -993,14 +476,23 @@ done
 | AWS CLI | 已配置指向目标账号（`aws sts get-caller-identity` 确认）                        |
 | CDK CLI | 用 `npx -y aws-cdk@latest`（部分环境全局 CDK 过旧）                           |
 | Docker  | ④ 执行器栈需要（bundling 装 psycopg，拉 x86_64 镜像）；⑤ MCP 需 buildx 构 ARM64 镜像 |
-| Python  | 3.12+                                                              |
+| Python  | 3.12+（宿主 `python3` 另需 `boto3` / `pip-system-certs` / `cryptography`，见下）  |
 | Node.js | 仅 `npx`（CDK 与 MCP Inspector）                                       |
 
 **本地 Python 环境一条命令建齐**：`bash site-builder/scripts/bootstrap_venvs.sh`——前置检查
 （`python3.12` 必须有；不带路径的 `python3` 必须 ≥ 3.10，否则打印解法并退出）+ 五个 venv 全部
-`--clear` 重建 + 按各自清单安装；`--host-deps` 再给 `python3` 装 `boto3` 与 `pip-system-certs`
-（闸门脚本靠它们发 HTTPS）；`--only <目录>` 单独重建一个。下文 ②、④ 里手工建 venv 的两段是它的
+`--clear` 重建 + 按各自清单安装；`--host-deps` 再给 `python3` 装 `boto3`、`pip-system-certs` 与
+`cryptography`；`--only <目录>` 单独重建一个。下文 ②、④ 里手工建 venv 的两段是它的
 子集，写在那里是为了把坑说清楚。venv 的路径与清单表见 CLAUDE.md「仓库外的几样东西」第 2 步。
+
+**宿主 `python3` 需要 `cryptography`**（不是只有 venv 需要）：`deploy_auth.py`、`deploy_panel.py`、
+`session_key_fingerprint.py` 与两个闸门（`verify_deployed_components.py`、
+`verify_account_trust_boundary.py` 的实测路径）都经 `session_kms` → `session` 用到它做公钥解析与
+指纹核对。宿主上不必钉版本；Lambda 产物里钉死 `cryptography==50.0.0`。缺它的症状是脚本在
+import 期就以 `ModuleNotFoundError` 退出，并打印可用的解释器建议——那不是权限或配置问题。
+`pip-system-certs` 缺失的症状完全不同（每一次 HTTPS 都 `CERTIFICATE_VERIFY_FAILED`，读起来像
+公司代理故障）。`router/infrastructure/.venv` 现在也装 `cryptography`（synth 期要核对 KMS 公钥指纹），
+但它**仍然没有 pytest**——router 的测试借 deployer 的 venv 跑。
 
 
 ### 成本预期（PoC 量级）
@@ -1013,7 +505,8 @@ done
 | Aurora DSQL 共享 cluster（低用量，按请求计费）              | ~$0-10        |
 | AgentCore MCP + Step Functions + CodeBuild     | ~$5-15        |
 | Cognito（月活 &lt;50）                             | 免费额度内         |
-| **合计**                                         | **~$15-50/月** |
+| KMS：两把 RSA_2048 CMK（会话签名）                      | $2 + `kms:Sign` 每万次 $0.03（只在登录 / 换码路径） |
+| **合计**                                         | **~$17-52/月** |
 
 
 CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只在 cache miss
@@ -1028,12 +521,17 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
 组件间有依赖，必须按序：
 
 ```
-①身份层        →  ②路由层  →  ③DSQL  →  ④执行器  →  ⑤部署MCP  →  ⑤b控制台   →  ⑥客户端接入  →  ⑦端到端彩排
-   deploy_pool.py   CloudFront    cluster    SFN+Lambda   AgentCore     deploy_panel   Skill+MCP      RUN_E2E
-   + deploy_auth    (Task 8)      (Task 13)  (Task 17)    (Task 20)     (二期 M3)      (Task 22)      (Task 23)
-   (Task 3)
+①身份层 → ③DSQL → ④执行器（含两把 CMK）→ 回填 [SessionKeys] → ②路由层 → auth → ⑤部署MCP → ⑤b控制台 → 夹具站点 → ⑥客户端接入 → ⑦端到端彩排
+ deploy_pool.py    cluster   SFN+Lambda        session_key_       CloudFront   deploy_   AgentCore   deploy_panel   ensure_      Skill+MCP        RUN_E2E
+ (Task 3)          (Task 13) (Task 17)         fingerprint.py     (Task 8)     auth.py   (Task 20)   (二期 M3)      fixture_     (Task 22)        (Task 23)
+                                               --from-stack                                                        site.py
                                              ⑤c API Key（可选，二期 M4）· ⑤d 访问统计（二期 M5）
 ```
+
+**② 与 auth 都依赖 ④ 的 CMK**：router 栈 synth 时从 KMS 取 site 公钥、auth / panel 部署前核对指纹
+（`spki_sha256` 与 config 不符即拒绝部署）。所以首次部署把 ② 挪到 ④ 之后，中间插一步
+`session_key_fingerprint.py --from-stack` 回填 `[SessionKeys]`；**存量重部顺序不变**（下面
+「MCP 先于执行器栈」那条照旧）。①（`deploy_pool.py`）与 ③ 不依赖 CMK，仍可最先做。
 
 ### ⚠️ 存量重部时顺序不同：**MCP 必须先于执行器栈**
 
@@ -1055,32 +553,12 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
 任务记录里没有 upload_etag——请重新调用 confirm_upload（本任务可能由旧版MCP 创建）
 ```
 
-### 存量站点迁移到 blue/green（M7；**只有存量环境需要**）
-
-栈更新之后，已有站点还挂在旧的"函数级 Function URL"上（`$LATEST`）。新版部署逻辑对
-**未迁移**的站点是 fail-closed 的（抛 `UnmigratedSite`，拒绝隐式半迁移），所以升级后
-要跑一次迁移：
-
-```bash
-cd /path/to/repo            # 从仓库根跑
-python3 site-builder/scripts/migrate_sites_to_blue_green.py              # 默认 dry-run，只打印计划
-python3 site-builder/scripts/migrate_sites_to_blue_green.py --apply      # 真的写
-python3 site-builder/scripts/migrate_sites_to_blue_green.py --apply --site-id <site_id>   # 单点重跑
-```
-
-- **默认 dry-run**：不带 `--apply` 时一个字都不写，先看计划再执行。
-- **`--site-id` 可单点重跑**：某个站点失败后不必重跑全量。
-- **`static` 站点会被报成 `skipped`，那不是失败**：纯静态站点没有后端 Lambda，
-  没有 alias 可建，本来就不参与 blue/green。看到 `skipped: static` 是预期结果。
-- **共用同一个旧 Function URL 的站点会被**拒绝**并要求人工处理**：那种情况下无法判定
-  该把哪个站点切到哪个颜色，脚本不猜。
-
 ⑤c 与 ⑤d 不是独立的部署阶段，而是**跨已有组件的改动**：全新账号照 ①→⑦ 走一遍就
 把它们一起装上了（两张统计表在 ④ 的栈里、埋点在 ② 的 Edge 里、读侧在 ⑤/⑤b 里）。
 **已经在跑的环境要单独升级到 M5，见下面的 `⑤d 访问统计` 一节——那里的顺序是硬依赖，
 反了不会报错，只会静默丢数据。**
 
-依赖关系：②需要①产出的 JWT_SECRET（已在 SSM）与 edge role；④需要①的 boundary、②的 edge_role_arn、③的 DSQL endpoint；⑤需要④的 state_machine_arn 与①的 Cognito；**⑤b 需要②的 edge_role_arn、④的五张表与①的 jwt-secret**（可选组件：不部署它只是没有控制台，站点与 MCP 通道不受影响）。
+依赖关系：**② 与 auth / ⑤b 都需要 ④ 的两把 CMK**（`config.ini` 的 `[SessionKeys]` 回填之后才能部）；② 还需要 ① 的 edge role；④ 需要 ① 的 boundary、② 的 edge_role_arn、③ 的 DSQL endpoint；⑤ 需要 ④ 的 state_machine_arn 与 ① 的 Cognito；⑤b 另需 ② 的 edge_role_arn 与 ④ 的五张表（可选组件：不部署它只是没有控制台，站点与 MCP 通道不受影响）。
 
 ④ 建 `site-admins` 表，而 **admin 种子必须在 ④ 之后单独跑**（CDK 只建表不写
 数据，漏了则谁都不是 admin——见 ① 末尾）。
@@ -1090,9 +568,10 @@ python3 site-builder/scripts/migrate_sites_to_blue_green.py --apply --site-id <s
 - [ ] AWS 凭证指向目标账号 / us-east-1（`aws sts get-caller-identity`）
 - [ ] `*.{base_domain}` ACM 证书 ISSUED（us-east-1）
 - [ ] `{base_domain}` DNS 可修改（Route53 hosted zone 或等价）
-- [ ] SSM `/site-builder/jwt-secret` 已创建（SecureString）
-- [ ] `python3 site-builder/scripts/ensure_session_keys.py` 已跑过：两把 family HS 密钥
-      与 `/site-builder/login-flow-secret` 都在（幂等、只创建不覆盖）
+- [ ] `[SessionKeys]` 的两个 `[SessionKey:*-rs-v1]` 小节已按 `session_key_fingerprint.py --from-stack`
+      的输出回填（④ 部完之后才拿得到；② 与 auth / panel 都会核对指纹）
+- [ ] （可选）`[Verification]` 段已配置且 `python3 site-builder/scripts/ensure_fixture_site.py` 已跑过
+      ——四个 `verify_*` 闸门与 kid 探针的登录态都来自夹具签发器
 - [ ] 身份源就绪：【飞书】企业自建应用（App ID/Secret，含用户 userid + 邮箱权限）
       / 【标准 IdP】OIDC/SAML 应用已建、email attribute 可映射
 - [ ] Docker 运行中；`npx` 可用
@@ -1244,8 +723,9 @@ exit "$m01_rc"
 `docs/security/account-trust-boundary.md`）+ 扫 bootstrap 桶 + 逐版本校验
 Edge 代码，实测 11±1 分钟：11m33s / 10m57s 两次）。它盯的不是
 "这次部署对不对"，而是**这个 AWS 账号里能冒充任意用户的授权面有没有变大**——该面
-关不掉（管理账号 SCP 无效、Lambda 无 Deny API、对称签名的根就是那把可被只读权限
-取得的 HS256 密钥），所以纪律是"别再长"。它的形状是「一种能力 = 一个**动作等价类** × 一个**资源等价类**」——把它压成单个动作或
+收不到零（管理账号 SCP 无效、Lambda 无 Deny API；RS256 之后只读权限不再够，但能
+`kms:Sign` 两把 CMK、能给自己授权、能替换 auth / panel / Edge 的代码的 principal 仍能冒充），
+所以纪律是"别再长"。它的形状是「一种能力 = 一个**动作等价类** × 一个**资源等价类**」——把它压成单个动作或
 单个资源的错误已经犯过三次（漏 alias、漏历史 asset、漏 `ssm:GetParameters`），每次都
 留下一个当时看不出来的 false-green。
 
@@ -1454,7 +934,7 @@ PY
 
    **影响面比想象的小**：这个 secret 只在"Cognito 拿授权码去适配器换 token"
    那一步用到。所以
-   - **已登录的用户不受影响**——会话 JWT 是平台自己用 `JWT_SECRET` 签的；
+   - **已登录的用户不受影响**——会话 JWT 是平台自己用会话签名 CMK 签的；
    - **refresh 也不受影响**——Cognito 刷新不回调 IdP；
    - 受影响的只有**轮换窗口内的新登录**（回调报 `invalid_client`）。
 
@@ -1854,7 +1334,7 @@ pre-token 触发器、managed login branding。命令与实测基线见前面
 **前置**（来自 ①，缺任一项本阶段会失败）：
 - `site-builder/config.ini [Cognito]` 四项已填（auth-service 要读 `site_client_id`）
 - SSM `/site-builder/site-client-secret` 已写入（① 的 `deploy_pool.py` 自动写）
-- SSM `/site-builder/jwt-secret` 已存在（§0；栈部署时注入 Edge 函数）
+- ④ 的两把 CMK 已存在且 `[SessionKeys]` 已回填指纹（栈 synth 时从 KMS 取 site 公钥注入 Edge 函数）
 
 确认 `router/config.ini` 已填好：account_id / domain_name / certificate_arn /
 frontend_bucket / base_domain（从 `router/config.ini.example` 复制）。
@@ -1968,7 +1448,7 @@ name**；值必须是裸 `true`/`false`——configparser 会把行内注释并�
    cd ../../site-builder/auth && python3 deploy_auth.py
    # 它会：打 zip（含 pyjwt）→ 建/更新 Lambda site-auth-service
    #      → Function URL(AWS_IAM，仅 edge role 可调，公网直连 403)
-   #      → 生成/复用 SSM /site-builder/jwt-secret → 路由表注册 subdomain=auth (route_mode=api-only)
+   #      → 路由表注册 subdomain=auth (route_mode=api-only)
    #      → 部署 pre-token-generation V2 触发器 site-auth-pre-token 并挂到用户池
    #        （把 email 注入 access token；⑤ 部署 MCP 的 owner 识别依赖它，
    #         用户池须 Essentials+ tier，原理见 ⑤ 的 token 形态说明）
@@ -1992,33 +1472,28 @@ name**；值必须是裸 `true`/`false`——configparser 会把行内注释并�
    脚本会往路由表与前端桶写测试数据（`app-smoke*` 路由、`sites/smoke*` 对象），
    验证完记得清理：删掉那几条 `subdomain` item 与 `s3://{frontend_bucket}/sites/smoke*`。
 
-   除脚本外建议再手工验一次**带真实会话 cookie 的鉴权闭环**（脚本只验到 302）：
+   除脚本外建议再验一次**带真实会话 cookie 的鉴权闭环**（脚本只验到 302）。会话 cookie
+   **只能由平台签发**（私钥在 KMS，本机拿不到），所以这一步走夹具签发器，打的是常驻夹具站点
+   `app-e2e-probe.{base_domain}`——夹具会话只在夹具站点与平台路由上被放行（ADR 0002），
+   拿它去打真实站点会被 302，那是预期而不是故障。前置：`[Verification]` 段已配置、本机凭据的
+   IAM ARN 在 `verifier_trusted_principals` 里、`ensure_fixture_site.py` 已跑过。
+
   ```bash
-   SECRET=$(aws ssm get-parameter --name /site-builder/jwt-secret --with-decryption \
-     --region us-east-1 --query 'Parameter.Value' --output text)
-   COOKIE=$(python3 -c "
-   import sys; sys.path.insert(0,'site-builder/auth')
-   from session import mint_session_jwt
-   print(mint_session_jwt('you@example.com','You',sys.argv[1],
-                          idp='Feishu', auth_via='TokenGeneration_HostedAuth'),
-         end='')" "$SECRET")
-   # 对一个 require_auth=true 的测试路由：
-   curl -s -o /dev/null -w '%{http_code}\n' https://app-<test>.{base_domain}/            # 期望 302
-   curl -s -w '\n' -H "Cookie: sb_session=$COOKIE" https://app-<test>.{base_domain}/     # 期望 200 + 内容
+   python3 site-builder/scripts/_session_mint.py --token-use site-session --save smoke/site.json
+   COOKIE=$(python3 -c "import json,pathlib;print(json.loads(pathlib.Path('.scratch/smoke/site.json').read_text())['token'],end='')")
+   curl -s -o /dev/null -w '%{http_code}\n' https://app-e2e-probe.{base_domain}/                    # 期望 302（无 cookie）
+   curl -s -o /dev/null -w '%{http_code}\n' -H "Cookie: sb_session=$COOKIE" \
+     https://app-e2e-probe.{base_domain}/                                                            # 期望 200
    curl -s -o /dev/null -w '%{http_code}\n' -H "Cookie: sb_session=${COOKIE}x" \
-     https://app-<test>.{base_domain}/                                                    # 期望 302（验签失败）
+     https://app-e2e-probe.{base_domain}/                                                            # 期望 302（验签失败）
   ```
 
-   > **`idp` 与 `auth_via` 两个 claim 必须带上**（Edge 的
-   > `REQUIRE_IDP_CLAIM=true` 起作用后）：不带就会被 302 回登录页，而这
-   > **看起来与"Edge 回归了"完全一样**——操作者会因此怀疑一次正确的部署。
-   > 两个值要与 `TRUSTED_IDPS` / `TRUSTED_AUTH_SOURCES` 对齐（见
-   > `router/infrastructure/lambda/origin_request.py`）：`idp` 取
-   > `config.ini [IdP] provider_name`（本环境为 `Feishu`），`auth_via` 取
-   > `TokenGeneration_HostedAuth`。
-   > 反过来，**"不带 claim → 302" 本身就是一条值得跑的负向用例**：把上面的
-   > `idp=`/`auth_via=` 去掉再请求一次，期望 302——这证明的是 Edge 真的在
-   > 校验身份来源，而不是碰巧放行了。
+   > 这条闭环已经脚本化：`python3 site-builder/scripts/verify_kid_entry_live.py`（正向 + 负向，
+   > 只发 GET）。`--role current|previous` 选用哪个槽位的 key 签，`--retired-token FILE` 跑退役
+   > 负向（期望 Edge 302 / panel 401 且日志 `outcome=unknown_kid`）。**`idp` / `auth_via` 两个
+   > claim 不再由操作者填**：夹具签发器按 `REQUIRE_IDP_CLAIM` 的要求签好，Edge 另要求夹具的两个
+   > 标记"要么都有、要么都没有"。手工构造缺 claim 的 token 已经不可能，那条负向用例由 Edge 单测
+   > 覆盖（`router/infrastructure/lambda/` 下的 allowlist 与 claim 用例）。
 
 ---
 
@@ -2221,8 +1696,8 @@ MCP runtime 角色靠 `dynamodb:Attributes` 条件把可写字段收窄。**这�
 
 **为什么排在 ⑤ 之后**：它要 ② 产出的 `edge_role_arn`（Function URL 只授权这个
 角色）、④ 建的 `site-sites` / `site-deploy-jobs` / `site-admins` /
-`site-ops-log` / `site-session-codes` 五张表，以及 ① 的 `/site-builder/jwt-secret`
-（面板会话与站点会话同一套 HS256）。
+`site-ops-log` / `site-session-codes` 五张表，以及 ④ 建的 console 那把 CMK
+（面板会话与站点会话同一套 RS256 合同，但两个 family 各有自己的 key：panel 只持 console 那把）。
 
 ```bash
 cd site-builder/panel && python3 deploy_panel.py
@@ -2972,6 +2447,31 @@ done
 
 ---
 
+## 夹具站点与验收前置（`[Verification]`，**可选组件**）
+
+四个 `verify_*` 闸门（`verify_console_e2e.py` / `verify_analytics_e2e.py` /
+`verify_api_key_e2e.py` / `verify_session_token_semantics.py`）、kid 探针
+`verify_kid_entry_live.py` 与 E2E 的会话 cookie fixture 都需要一个**登录态**，
+而私钥在 KMS、本机签不出 token。登录态因此来自 auth 的 `/fixture-session`
+（夹具签发器，ADR 0002）：`config.ini` 的 `[Verification]` 段开着时，`deploy_auth.py` 才会
+部署那条路由，并给 `site-builder-verifier` 角色开 Function URL 的 invoke。
+
+两件前置，缺任一闸门会响亮失败（不是静默跳过）：
+
+1. `[Verification] fixture_issuer = true`，且 `verifier_trusted_principals` 里列出**本机凭据
+   对应的 IAM ARN**（只有列进去的 principal 能 assume `site-builder-verifier`；用
+   `aws sts get-caller-identity` 看自己是谁）。改完要重跑 `deploy_auth.py`。
+2. 常驻夹具站点已建：
+
+```bash
+python3 site-builder/scripts/ensure_fixture_site.py   # 幂等：site_id=e2e-probe、owner probe@e2e.invalid、static、require_login
+```
+
+夹具会话只在**夹具站点 ∪ 平台路由**上被放行，`@e2e.invalid` 这个域不可能属于真实用户，TTL ≤ 30 分钟。
+不部署这个组件（`[Verification]` 缺失或 `false`）时平台功能完整，代价是上面那几个闸门与 E2E 不能跑。
+
+---
+
 ## ⑥ 客户端接入（Task 22）
 
 **Claude Code（先做，自动化程度高）**：
@@ -2998,7 +2498,7 @@ claude mcp add --transport http site-builder-deploy {mcp_endpoint_url} \
 ## ⑦ 端到端彩排（Task 23）
 
 ```bash
-# 前一天跑：全链路 E2E（用 JWT_SECRET mint 测试会话 cookie，自动化 CRUD，无需人工扫码）
+# 前一天跑：全链路 E2E（会话 cookie 经 auth 的 /fixture-session 取，自动化 CRUD，无需人工扫码）
 cd {仓库根}
 RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/test_e2e_fixtures.py -q
 ```
@@ -3047,7 +2547,9 @@ RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/tes
       那是浏览器推断的 host-only 归属，不代表服务端设了 Domain（设了会被整条丢弃）；
       对比 `sb_session` 显示的是 `.{base_domain}`（**有**前导点 = 真的设了 Domain）
 
-SSM 参数：`/site-builder/jwt-secret`（§0 手工建）、`/site-builder/site-client-secret`（① 的 `deploy_pool.py` 写入）。
+SSM 参数：`/site-builder/site-client-secret`（① 的 `deploy_pool.py` 写入）、
+`/site-builder/login-flow-secret`（`deploy_auth.py` 的 `ensure_secret` 缺省补建）。
+**会话签名密钥不在 SSM**：两把 KMS CMK 由 ④ 的栈创建，指纹回填在 `[SessionKeys]`。
 
 ## per-site 部署租约（M7 加固；排障必读）
 

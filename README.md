@@ -74,7 +74,7 @@ Amazon Quick / Kiro …）里用自然语言开发简易全栈站点，说一句
   执行器只认合同。校验器 + 红线扫描器把不合规产物在部署前拦下。
 - **站点代码按不可信代码对待**：每站点独立 IAM 角色（PermissionsBoundary 封顶）、
   DSQL per-site schema + 非 admin PG role、DynamoDB 表按站点前缀隔离。
-- **鉴权统一在边缘**：站点代码零 auth 逻辑，Lambda@Edge 验 HS256 会话 cookie、
+- **鉴权统一在边缘**：站点代码零 auth 逻辑，Lambda@Edge 验 RS256 会话 cookie（公钥内嵌，私钥在 KMS）、
   按名单放行、注入 `x-user-email`；CloudFront **全站禁缓存**（origin-request 鉴权
   在 cache hit 时会被绕过——禁缓存是正确性前提）。
 - **三档 tier**：`static`（纯前端）/ `fullstack-nosql`（Express+DynamoDB）/
@@ -102,7 +102,7 @@ Amazon Quick / Kiro …）里用自然语言开发简易全栈站点，说一句
 
 - **七个包各有单元测试**（contract / auth / router edge / deployer / mcp / panel /
   key-proxy），另有一组 E2E 在 `RUN_E2E=1` + 真实部署后运行，含自动化登录 CRUD
-  ——用平台 JWT_SECRET 直接 mint 测试会话 cookie，无需人工飞书扫码。
+  ——经 auth 的 `/fixture-session` 取夹具会话（ADR 0002），无需人工飞书扫码。
   **这里不写各包的测试数量**：那些数字每加一个用例就变假。要当下的确切数字，
   照 [CLAUDE.md](CLAUDE.md) 的「测试命令」小节跑一遍，输出就是答案。
 - 每个任务经独立子代理实现 + 审查/裁决 + 修复闭环；开发过程中修复的典型问题：
@@ -120,8 +120,9 @@ Amazon Quick / Kiro …）里用自然语言开发简易全栈站点，说一句
 本方案面向**在你自己的 AWS 账号里从零部署**。需要先准备：**us-east-1 区域**
 （Lambda@Edge 与 CloudFront 用的 ACM 证书强制）、一个可改 DNS 的域名 + 该域名的
 `*.<域名>` ACM 通配符证书、一个身份源——飞书企业自建应用（需用户邮箱权限）**或**
-任意能提供 email claim 的标准 OIDC/SAML IdP——以及 SSM 里的会话签名密钥、本机
-Docker。
+任意能提供 email claim 的标准 OIDC/SAML IdP——以及本机 Docker。会话签名用的两把
+KMS 非对称 CMK 由部署脚本自己创建（每把 $1/月 + `kms:Sign` 每万次 $0.03，只在登录 /
+换码路径调用），不需要预先准备。
 
 逐项要求与命令见 **[site-builder/DEPLOY.md](site-builder/DEPLOY.md) §0 前置要求**
 （含就绪检查清单与成本预期）。

@@ -8,7 +8,7 @@
 解释由解释器默认处理打印出来。等价形状实测（2026-09-04）：
 
     结果：只跑了 0 项（预期 ≥70）—— 验收**未完成**
-    取不到 trusted_idps——签出来的会话 Edge 不认，验收不可信
+    取不到夹具签发器（[Verification] 没开 / 本机凭据不在 verifier_trusted_principals 里）——拿不到登录态，验收不可信
     exit code = 1
 
 两行都在，退出码 1。**但那个形状只差一次缩进就真的会丢**：把 `sys.exit(rc)` 挪进 `finally`
@@ -80,7 +80,7 @@ def test_a_finally_that_exits_must_also_catch_systemexit(script):
         flat = set().union(*names) if names else set()
         assert "SystemExit" in flat, (
             f"{script.name}: `finally` 里 sys.exit 会顶掉在飞的 SystemExit，"
-            f"而被调用方（如 _session_mint 的 trusted_idp / Minter.key）用 "
+            f"而被调用方（如 _session_mint 取夹具会话时的前置检查）用 "
             f"`raise SystemExit('解释')` 报前置条件失败 ⇒ 解释永远不会被打印。"
             f"当前 handlers = {names}")
         idx_se = next(i for i, s in enumerate(names) if "SystemExit" in s)

@@ -25,6 +25,10 @@ AWS_IAM，resource policy 只多一个 `site-builder-verifier` 角色（两条�
 - `verify_session_token_semantics.py` 不再冒充真实 owner，改打常驻夹具站点。
 - E2E 的 `e2e@test.com` 改为夹具域身份。
 - Edge 与 panel 的夹具边界规则必须与签发器同一次部署上线，不得晚于它（原写"先于、同在 3c-2A"；2026-09-06 起 2A 并入 3c-final，见 ADR 0005）。
+- Edge 对夹具会话的放行范围是**夹具站点 ∪ 平台路由（console）**——升级码与面板会话走真实换取链路，
+  而那条链路的入口在 console 平台路由上（plan 08 D6）。只放行夹具站点会让"换升级码"这一步无门可进。
+- Edge 要求夹具的两个标记**要么都有、要么都没有**：`idp=fixture` 配一个真实的 `auth_via`（或反过来）
+  的 token 一律被拒。少了这条，攻击面是"用一个标记去骗过按另一个标记做的判断"。
 - 谁能改 auth 代码谁就能签夹具域会话。相对今天"谁能改 auth 代码谁能签任意会话"，这是收窄，不是新增。
 
 出处：`docs/superpowers/specs/2026-08-28-asymmetric-session-signing-spec.md` §11.7。

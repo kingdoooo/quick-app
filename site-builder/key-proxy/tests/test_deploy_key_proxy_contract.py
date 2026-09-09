@@ -333,8 +333,9 @@ def test_key_proxy_never_calls_the_management_side_of_keystore():
 def test_ssm_resource_is_the_exact_machine_secret_param():
     """**精确参数 ARN，不用 `parameter/site-builder/*` 前缀。**
 
-    拿前缀等于被攻破时顺带交出 `jwt-secret`（能伪造任意用户会话）与 site client
-    secret。auth 用前缀是它自己要读多个参数的业务需要，不是可以照抄的形态。
+    拿前缀等于被攻破时顺带交出 login-flow secret（一次登录 CSRF）与 site client
+    secret（能替本 app client 换 token）。auth 读多个参数是它自己的业务需要，
+    不是可以照抄的形态。
     """
     ssm = [s for s in dkp.role_statements(_cfg())
            if any(a.startswith("ssm:") for a in _actions(s))]

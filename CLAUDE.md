@@ -23,13 +23,13 @@ Quick 自动化建站平台（Site Builder）：业务人员在任意支持 Skil
 
 ### 资产包含什么
 
-一期建站链路、二期的 `console.{base_domain}` 自助控制台、API Key 交换层（可选组件）、访问统计聚合、站点更新的 blue/green 原子切换，以及加固包（merged review §9 里的 M01 跨租户 IAM 精确 ARN 隔离、M02 权限数据 fail-closed、M05 token 用途绑定、M06 同名 cookie 遮蔽的 DoS 关闭）。会话签名带 `kid`，每个 key family（site / console）各有 `current` 与 `previous` 两个槽位，可轮转；legacy 共享密钥入口由 `[SessionKeys] legacy_param` 与 `signer` 控制——**`config.ini.example` 出厂是 `signer = legacy` + legacy 入口开着**（状态机 L1），关闭它要按 DEPLOY.md 的轮转 runbook 走到 L3。**密钥形态是 HS256 对称**，非对称化（KMS）是 spec 里已裁定、编号 3c-final 的包，见文档地图。
+一期建站链路、二期的 `console.{base_domain}` 自助控制台、API Key 交换层（可选组件）、访问统计聚合、站点更新的 blue/green 原子切换，以及加固包（merged review §9 里的 M01 跨租户 IAM 精确 ARN 隔离、M02 权限数据 fail-closed、M05 token 用途绑定、M06 同名 cookie 遮蔽的 DoS 关闭）。会话签名是 RS256：两把 KMS 非对称 CMK（site / console 两个 key family，各有 `current` 与 `previous` 两个 `kid` 槽位，可轮转），auth 持两把的 `kms:Sign`、panel 只持 console、Edge 零 KMS 权限只内嵌 site 公钥；验收工具的登录态来自 auth 的 `/fixture-session`（夹具域 `e2e.invalid`，可选组件 `[Verification]`）。
 
 ### 三条设计边界，别当成已解决
 
 - per-site IAM 的 `dsql:DbConnect` 是 `Resource: *`。DSQL 的租户隔离在 PG 层（per-site schema + 非 admin role），不在 IAM 层，这是既定设计而非残留。
 - 同名 cookie 遮蔽只关掉了 DoS，**没关身份混淆**：攻击者持有另一个**合法** token 时仍会先被取到。根治是 host-only 会话，独立成包。
-- **在 HS256 形态下，平台的安全边界就是 AWS 账号本身**。账号内任何具备只读级权限的 principal 都能取得会话密钥（三条路：Edge 产物里是明文，含历史已发布版本；同一份产物在 CDK bootstrap S3 桶里还有带活密钥的 asset；SSM 参数有四个动作都能读出明文），从而以任意用户身份访问任意站点**与控制台写接口**。密钥带 `kid`、可轮转都不改变这一条：对称 ⇒ 读到就能签。AWS 托管策略 `ReadOnlyAccess` 就含 `ssm:Get*` 与 `lambda:GetFunction`，所以资产在采用者的共享账号里必须按这个威胁模型设计——这正是 3c-final（KMS 非对称、Edge 只放公钥）存在的理由。**别按 merged review 里 M09 第 2 步的原话去收窄 invoke，那是假修复**（同一批身份还握着密钥读取与自助提权）。实测数字、为什么 SCP / resource policy / 对称签名都不成立、以及盯住暴露面别再变大的闸门（A 直接失守 + B IAM 写静态快照两层；C 站点 route/alias 可达性归部署验收），见 `docs/security/account-trust-boundary.md`。**本文件不记那些数字**：它们每部署一次 Edge 就变，写死必过时；有一条单测按标记核对文档与基线一致。
+- **平台的安全边界是 AWS 账号本身，但面从"能读"收到了"能签或能改验签代码"**：账号内能 `kms:Sign` 两把 CMK（或能给自己授权）、能改 auth / panel 的代码或配置、能替换 CloudFront 正在执行的 Edge 版本的 principal 仍能冒充任意用户；只读级权限（`ReadOnlyAccess`）不再够——Edge 产物、bootstrap asset、SSM 里都只有公钥与 login-flow secret。数字与方法在 `docs/security/account-trust-boundary.md`，闸门是 `verify_account_trust_boundary.py`（KMS 层：`kms:Sign` / `PutKeyPolicy` / `CreateGrant` 持有者、key policy、grants、公钥指纹）。**别按 merged review 里 M09 第 2 步的原话去收窄 invoke，那是假修复。**
 
 **CodeBuild 那道隔断分两层，别记成"只有一条 flag"**：跑不可信站点依赖安装的 CodeBuild 角色对 bootstrap 桶零权限（S3 权限全集由 `deployer/tests/security_contracts.py` 按等值断言），但 `--ignore-scripts` 仍然必须留着，因为构建容器里任意代码执行仍能读 `validated/*`、写 `artifacts/*`。站点**自己的** `package.json` 生命周期脚本与 `backend/.npmrc` 由合同校验器在 CodeBuild **之前**就拒（`contract/redlines.py` 的 `NPM_LIFECYCLE_KEYS`）；**依赖里**的生命周期脚本**只有** `buildspec-package.yml` 的 `npm ci --ignore-scripts` 一道——合同的红线 8 拒的是 `file:` / git / URL 规格与非公共 registry 的 lockfile 条目（可复现性），registry 上的依赖照样能带 `preinstall`，所以那条 flag 不能去（实测：带 `preinstall` 的包打成本地 `.tgz` 作依赖，`npm install` 会执行它，加上 `--ignore-scripts` 不会；今天这种 `file:` 规格在 validate 就被拒，但结论对 registry 依赖同样成立）。
 
@@ -51,7 +51,7 @@ cd "$(git rev-parse --show-toplevel)"
 (cd site-builder/contract && .venv/bin/pytest tests -q)
 # auth 无自己的 venv，借 contract 的——含 pyjwt 与 boto3；重建该 venv 后两者都要手工重装
 (cd site-builder/auth && ../contract/.venv/bin/pytest tests -q)
-# router 的 .venv 只有 CDK 依赖没有 pytest，借 deployer 的（含 boto3）
+# router 的 .venv 有 CDK 依赖与 cryptography（synth 期核对 KMS 公钥指纹）但**没有 pytest**，借 deployer 的（含 boto3）
 (cd router/infrastructure/lambda && ../../../site-builder/deployer/.venv/bin/pytest . -q)
 # 必须指定 tests/——裸 pytest 会误收集 infra/cdk.out 里的 asset 副本
 (cd site-builder/deployer && .venv/bin/pytest tests -q)
@@ -114,20 +114,21 @@ E2E 与真机闸门（需要真实 AWS 部署 + config.ini 已回填）：
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/test_e2e_fixtures.py -q   # **10 条**，实测约 37 分钟
+RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/test_e2e_fixtures.py -q   # **9 条**，实测约 37 分钟
 # ↑ 它超过很多工具的单次超时上限，中途被杀会让 autouse 的清理 fixture 跑不完 ⇒ 留下真站点。
 #   要后台跑或调大超时。
 bash site-builder/scripts/smoke_router.sh    # 路由层冒烟（会写测试数据，跑完清理；含 65s 等 Edge 缓存）
 python3 site-builder/scripts/verify_console_e2e.py      # 控制台端到端
 python3 site-builder/scripts/verify_analytics_e2e.py    # 统计端到端
+python3 site-builder/scripts/ensure_fixture_site.py     # 常驻夹具站点（四个 verify_* 与 kid 探针只打它）
 python3 site-builder/scripts/verify_kid_entry_live.py   # 会话入口真机正/负向（只发 GET；--self-test 不碰 AWS）
-# ↑ 轮转时用两个旗标：`--role current|previous`（正向，会消费一枚升级码）、
+# ↑ 轮转时用两个旗标：`--role current|previous`（正向，打夹具站点；会消费一枚升级码）、
 #   `--retired-token FILE`（负向，期望 Edge 302 / panel 401 且 outcome=unknown_kid）。
 #   FILE 由 `_session_mint.py --save` 预存，**只许写进 .scratch/**（gitignored，token 是活凭证）。
 python3 site-builder/scripts/session_verify_counts.py --hours 1 --require-total   # 三处 session_verify 埋点读数（只读；任一 verifier 为 0 即退 1）
-# ↑ 轮转的排空闸门是 `--drain-gate previous`（legacy 用 `--drain-gate legacy`），四条判据锁在脚本里
+# ↑ 轮转的排空闸门是 `--drain-gate previous`，四条判据锁在脚本里
 #   （窗口 ≥ 26 h、每处总量 > 0、目标列三列全 0、accepted_current 三列全 > 0），exit 0 才算过。
-#   手写那四个旗标少任何一个都是静默放宽——空窗口下裸 `--require-zero` 会退 0，而下一步是不可逆的删参数。
+#   手写那四个旗标少任何一个都是静默放宽——空窗口下裸 `--require-zero` 会退 0，而下一步是不可逆的退役 key。
 #   判据说明见 DEPLOY.md 的轮转 runbook
 # 账号信任边界的漂移闸门（只读；A 直接失守 + B IAM 写静态快照两层；几百个 principal × 2 次
 # IAM 模拟 + **两次** GetAccountAuthorizationDetails——第二次是模拟后的**窗口两端一致性复查**，
@@ -135,9 +136,9 @@ python3 site-builder/scripts/session_verify_counts.py --hours 1 --require-total 
 # 三个已接受盲区见 docs/security/account-trust-boundary.md）+ 扫 bootstrap 桶，实测约 11 分钟
 python3 site-builder/scripts/verify_account_trust_boundary.py
 # 密钥增减必须**声明**，否则一律红：`--new-key LABEL` / `--retire-key LABEL`
-# （LABEL ∈ 已配置 kid ∪ {legacy, login-flow}）。声明管**两件**事：
-#   ① grant delta → `migration_grants`（绿）。**前置条件是该 principal 原本就能读到某把
-#      会话密钥**——"原先读不到、现在能读"是能力面真的变大，声明不该抹掉它，**这是刻意的**；
+# （LABEL ∈ 已配置 kid ∪ {login-flow}）。声明管**两件**事：
+#   ① grant delta → `migration_grants`（绿）。**前置条件是该 principal 原本就能签某把
+#      会话 key**——"原先签不了、现在能签"是能力面真的变大，声明不该抹掉它，**这是刻意的**；
 #   ② coverage 成员迁移 → `migration_undecided`（绿）。成员是**可分解**形态
 #      `指纹|动作类|资源类,…`，判据是把被声明 key 的资源类从**基线与本次两侧**剔掉再比：
 #      相等才整批落绿，**剔完仍多出来的照红**。两侧都剔才同时覆盖新增（类只在本次有）与退役（类只在基线有）。
@@ -145,6 +146,7 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 # "我知道并接受这些变化"，接受了什么必须留痕。用 `--dump-observed` 一次扫描 + 多条 `--from-dump`
 # 省掉第二个 11 分钟（dump 含真实角色名，落 .scratch/，按 0600 写）；声明不进快照、比较时才归一化
 # ⇒ 同一份快照可按不同声明重比；**只有一条只在实测路径上评估**：login-flow 那条硬断言（快照刻意不含它）。
+# **没有基线时只能 `--update-baseline` 生成，不能出结论**（基线 gitignored，含单账号实测值）。
 ```
 
 `site-builder/scripts/verify_*` 是真机闸门（部署后跑，不是单测）。**本文件不记数量与
@@ -181,23 +183,18 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 # 路由层（改过 config.ini 必须先 rm -rf cdk.out，否则用陈旧 asset）
+# 依赖 ④ 的 CMK：synth 时从 KMS 取 site 公钥并核对 config 的 spki_sha256，取不到或不符即 synth 失败
 # router 栈有 stack policy（拒 Update:* 落在 Edge 两函数 / 分发 / 路由表上），所以三步一组：
 # open 打开（首次部署栈不存在时打印 SKIP）→ deploy → apply 关回去并读回核对。**open 之后无论 deploy 成败都要 apply。**
 python3 site-builder/scripts/router_stack_policy.py open
 (cd router/infrastructure && rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never)
 python3 site-builder/scripts/router_stack_policy.py apply
 
-# 执行器（bundling 需要 Docker）
+# 执行器（bundling 需要 Docker；两把会话签名 CMK 也在这个栈里）
 (cd site-builder/deployer/infra && rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never)
 
-# 两把 HS 会话密钥 + login-flow secret 先存在（幂等、只创建不覆盖、不打印值；
-# 路径全来自 site-builder/config.ini 的 [SessionKeys]）。忘跑它不会静默：
-# deploy_auth / deploy_panel 在第一次写之前 GetParameter 核对自己需要的参数，缺一即拒绝部署。
-# **两个清单不一样**：panel 含非空的 legacy_param；auth 把 legacy 与 login-flow 减掉（`owned`，
-# 列进去会让 ensure_secret 的缺省补建走不到、首次部署自我拒绝，见 docs/adr/0004-*.md）
-# ⇒ **legacy 参数被删时 panel 会被拦住、auth 不会**。login-flow 只有 auth 一个消费方，排除它
-# 是安全的；legacy 那条排除是已知缺口，不是安全结论。
-python3 site-builder/scripts/ensure_session_keys.py
+# 首次 / 加 key 时：把两个 [SessionKey:*] 小节（含 spki_sha256）粘进 site-builder/config.ini
+python3 site-builder/scripts/session_key_fingerprint.py --from-stack
 
 # auth 服务（Lambda + Function URL + pre-token 触发器，幂等）
 (cd site-builder/auth && python3 deploy_auth.py)
@@ -212,12 +209,6 @@ python3 site-builder/scripts/ensure_session_keys.py
 # 控制台 panel（Lambda + Function URL + 前端上传 + console route，幂等）
 # --skip-frontend 只改后端。改前端后必须重跑（不带该开关）才会上传。
 (cd site-builder/panel && python3 deploy_panel.py)
-
-# 存量站点迁移到 blue/green（**只有存量环境需要**，新账号不必跑）
-# 默认 dry-run 只打印计划，--apply 才写；--site-id 可单点重跑。
-# static 站点会被报成 skipped（没有后端 Lambda，不参与 blue/green）——那不是失败。
-python3 site-builder/scripts/migrate_sites_to_blue_green.py            # 看计划
-python3 site-builder/scripts/migrate_sites_to_blue_green.py --apply    # 真写
 
 # 生成含真实值的用户接入指引（产物 gitignored）
 python3 site-builder/scripts/gen_onboarding.py
@@ -264,8 +255,8 @@ validate 步骤把不合规产物在部署前拦下。改合同要同步三处�
 runtime role 的逐表精确 ARN，禁止使用 `site-data-{site_id}-*` 前缀通配；
 DSQL 使用 per-site schema + 非 admin PG role。CodeBuild 装依赖使用
 `--ignore-scripts`。任何给执行器/站点加权限的改动都要维持这个模型。
-- **鉴权全部在边缘**：站点代码零 auth 逻辑。Edge 验 HS256 会话 cookie
-（与 `auth/session.py` 同算法，**两处必须字节级同步**，见
+- **鉴权全部在边缘**：站点代码零 auth 逻辑。Edge 验 RS256 会话 cookie（只内嵌 site family 的
+公钥，零 KMS 权限）（与 `auth/session.py` 同算法，**两处必须字节级同步**，见
 `router/infrastructure/lambda/origin_request.py` 注释）、按 allowed_users
 放行、注入 `x-user-email` / `x-user-name`（后者 URL 编码，站点须
 decodeURIComponent）。**CloudFront 全站禁缓存是鉴权正确性前提**
@@ -274,9 +265,10 @@ decodeURIComponent）。**CloudFront 全站禁缓存是鉴权正确性前提**
 无感。Cognito access token 默认不含 email，靠 pre-token V2 触发器
 （`auth/pre_token_email.py`）注入——MCP 网关只收 access token
 （id_token 会 401，不要把 authorizer 改成 allowedAudience）。
-- **Lambda@Edge 不支持环境变量**：Edge 函数的配置（表名、JWT 密钥）由 CDK
-部署时字符串替换注入（`{{PLACEHOLDER}}` 形态）。SSM 读取失败时 **synth 直接失败、什么都不部**；
-占位符只在显式 `APP_SYNTH_OFFLINE=1` 下出现，那种模板不可部署，`verify_deployed_edge.sh` 会抓。
+- **Lambda@Edge 不支持环境变量**：Edge 函数的配置（表名、site family 的公钥 allowlist）由 CDK
+部署时字符串替换注入（`{{PLACEHOLDER}}` 形态）。取公钥失败时 **synth 直接失败、什么都不部**
+（指纹与 config 的 `spki_sha256` 不符同样抛，且不看 `APP_SYNTH_OFFLINE`——那不是"读不到"是写错了）；
+占位符只在显式 `APP_SYNTH_OFFLINE=1` 下出现，产物带 SYNTH-ONLY 标记、不可部署，`verify_deployed_edge.sh` 会抓。
 
 ## 不可破坏的系统不变量
 
@@ -289,13 +281,13 @@ decodeURIComponent）。**CloudFront 全站禁缓存是鉴权正确性前提**
 `PLATFORM_SUBDOMAINS`；不得从 route owner 或其他权限投影字段推导平台身份。
 - **站点 origin 不可信。** 平台 cookie、`x-user-*` 与平台标记在到达站点前必须剥除；
 可信身份头只能由 Edge 验签后重新注入。
-- **auth/session 与 Edge verifier 是跨部署单元的同一契约**（含 `[SessionKeys]` 的 allowlist：`session.verify_with_legacy` 与 Edge 的 `_verify_session_jwt` 字节等价，Edge 只持 site family、panel 只持 console）。claim、算法或密钥形态变化
+- **auth/session 与 Edge verifier 是跨部署单元的同一契约**（含 `[SessionKeys]` 的 allowlist：`session.verify_token` 与 Edge 的 `_verify_session_jwt` 字节等价，Edge 只持 site family 的公钥、panel 只持 console）。claim、算法或密钥形态变化
 必须同步 auth、panel、Edge、跨组件测试和部署顺序。
-**顺序有两个方向，别照抄错**：**新建部署**是 `auth 先于 router`（依赖——router 栈 synth 时
-要从 SSM 读密钥字符串替换注入 Edge）；**切换/轮转**必须 **verifier 先行**（速度差——auth/panel
-读 SSM 5 分钟就切，Edge 要重部 + 10–20 分钟全球复制；signer 先切 = 新 cookie 在旧边缘节点
-验签失败，症状与"密钥读取失败"一模一样）。切换的完整协议是 `site-builder/DEPLOY.md`
-「轮转会话密钥」一节。
+**顺序有两个方向，别照抄错**：**新建部署**是 `deployer 栈先于 router 与 auth/panel`（依赖——两把
+CMK 在那个栈里，router 栈 synth 要从 KMS 取 site 公钥注入 Edge，auth/panel 部署前核对指纹）；
+**切换/轮转**必须 **verifier 先行**（速度差——auth/panel 改配置重部几分钟就切，Edge 要重部 +
+10–20 分钟全球复制；signer 先切 = 新 cookie 在旧边缘节点验签失败，症状与"公钥注入坏了"一模一样）。
+切换的完整协议是 `site-builder/DEPLOY.md`「轮转会话密钥（KMS）」一节。
 - **异步调用结果未知时保留恢复状态。** 网络超时不等于请求未受理；不得在结果不确定时
 释放租约、回滚为可重试状态或允许新的部署/下线并发进入。
 
@@ -310,13 +302,12 @@ decodeURIComponent）。**CloudFront 全站禁缓存是鉴权正确性前提**
 | router 栈的四个受保护 construct ID（`OriginRequestFunction` / `OriginResponseFunction` / `Distribution` / `SubdomainMappingTable`） | `router/infrastructure/stack_policy.py` 的 `PROTECTED_CONSTRUCTS`（synth 期守卫 `assert_protected_constructs` 会红）、`scripts/router_stack_policy.py`、`verify_deployed_edge.sh` ⑤、DEPLOY.md ② 的 open → deploy → apply。**改 construct ID = 换逻辑 ID = 替换资源**——对分发与路由表那是事故 |
 | 路由权限字段 | permissions、register/resync、补偿恢复、Edge 反序列化 |
 | DynamoDB/DSQL 资源 | runtime inline policy、boundary、undeploy、backfill、IAM 模拟 |
-| `[SessionKeys]`（`auth/session_keys.py`） | `config.ini.example`、`ensure_session_keys.py`、`deploy_auth`/`deploy_panel` 的 env 与 role SSM 清单、`router/infrastructure/stack.py` 注入、闸门 `session_key_params`、`verify_deployed_edge.sh`、`verifier_env.py`（auth 拥有、panel 复制） |
-| `[SessionKeys] signer`（`legacy`\|`current`） | auth 与 panel 的 `SESSION_SIGNER`（两个组件各自部署 ⇒ 切换有先后：**panel 先、auth 后**）、`verifier_env.signer_mode()`、两个 handler 的签发分支与 AST 守卫。**验签侧与它无关**（verifier 全程双接受）⇒ 回滚 = 改这一行重部 auth+panel，不动 Edge、不回退代码 |
-| `[SessionKeys] legacy_param` 清空（状态机 L3） | `legacy_entry()` 变 off、auth/panel 不再下发 `JWT_SECRET_PARAM` 且角色 SSM 清单不含它、`stack.py` 给 Edge 注入空串（**空串不是 SYNTH 占位符**）、闸门 `--retire-key legacy`。清空前 `signer` 必须已是 `current`（加载器硬拒该组合） |
-| `[SessionKeys] login_flow_secret_param` | 只进 auth（`LOGIN_FLOW_SECRET_PARAM` + 角色清单），`login_handler._login_flow_sig` 是唯一读取点；`ensure_session_keys.py` 创建、`deploy_auth.ensure_secret` 兜底（**不进写前核对清单**，见 `docs/adr/0004-*.md`）；panel 有三条负向断言锁死它永不持有；闸门记成 grant `read-login-flow-secret` 且**不算冒充面** |
+| `[SessionKeys]`（`auth/session_keys.py`） | `config.ini.example`、`session_key_fingerprint.py`、`deploy_auth`/`deploy_panel` 的 env（`SESSION_KEYS_JSON` 的 RS 行）与 KMS IAM 清单、`router/infrastructure/stack.py` 的公钥注入、闸门 kms 分节、`verify_deployed_edge.sh` 的公钥对账、`verifier_env.py`（auth 拥有、panel 复制）、`session_kms.py`（同上） |
+| `[SessionKeys] login_flow_secret_param` | 只进 auth（`LOGIN_FLOW_SECRET_PARAM` + 角色清单），`login_handler._login_flow_sig` 是唯一读取点；`deploy_auth.ensure_secret` 创建（**不进写前核对清单**，见 `docs/adr/0004-*.md`）；panel 有三条负向断言锁死它永不持有；闸门记成 grant `read-login-flow-secret` 且**不算冒充面** |
 | CLAUDE.md「仓库外的几样东西」第 2 步的 venv 表 | `scripts/bootstrap_venvs.sh` 的 `VENVS` 表（守卫 `deployer/tests/test_bootstrap_venvs.py` 按表逐行核对）、DEPLOY.md「本机工具链」 |
-| 验收工具的本地 mint（`scripts/_session_mint.py`） | 六处调用方（四个 `verify_*`、`verify_kid_entry_live.py`、E2E 的会话 cookie fixture）。改它等于同时改六个验收面；非对称化后它整体被夹具签发器（spec §11.7）替代，所以**本地 mint 只许存在于这一个模块里** |
-| `deployer/functions/function_url_policy.py`（Function URL resource policy 的唯一实现） | 三个部署脚本的 `converge_function_url_policy` 调用（auth 的 `edge_role_arn()` 校验、panel / key-proxy 的 `ensure_function`）、闸门 `_check_function_url_authz` 与 `MIN_DEPLOYED_CHECKS`、`deploy_lambda_site` 的 parity 用例（站点色授权与平台三条同形）、`fake_lambda_policy.py` 的渲染形态 |
+| 验收工具的夹具签发器客户端（`scripts/_session_mint.py`） | 六处调用方（四个 `verify_*`、`verify_kid_entry_live.py`、E2E 的会话 cookie fixture）+ `ensure_fixture_site.py`。改它等于同时改六个验收面；**它不持任何密钥**（登录态全部经 auth 的 `/fixture-session`），带外签发只此一处 |
+| `session.py` 的 `FIXTURE_*` 常量 | Edge 内嵌字面量（router 单测钉住等值）、`permissions.FIXTURE_DOMAIN`（auth 单测钉住等值）、`deploy_panel` 的 admin 断言、`ensure_fixture_site.py`、闸门的站点形状层 |
+| `deployer/functions/function_url_policy.py`（Function URL resource policy 的唯一实现） | 三个部署脚本的 `converge_function_url_policy` 调用（auth 的 `edge_role_arn()` 校验、panel / key-proxy 的 `ensure_function`）、闸门 `_check_function_url_authz` 与 `MIN_DEPLOYED_CHECKS`、`deploy_lambda_site` 的 parity 用例（站点色授权与平台三条同形）、`fake_lambda_policy.py` 的渲染形态、`extra_principals`（`[Verification]` 开着时 auth 多 verifier 两条） |
 
 ## 高频坑（都是真机踩过的）
 
@@ -366,6 +357,10 @@ JWT。别"顺手补齐"这个名单。
 - **改了 `permissions.py` 这类共享模块，要重部的是三个组件**：panel、key-proxy、MCP
 各自把它打进自己的产物（key-proxy 也带，虽然它只用 `EMAIL_RE`）。漏一个的症状是
 产物陈旧而部署脚本一切正常——`verify_deployed_components.py` 是唯一会点出来的地方。
+- **auth / panel 的 `SESSION_KEYS_JSON` 只有 `kid` / `key_arn` / `spki_sha256`，公钥运行时按 ARN 取、
+指纹不符即拒**（冷启动 500，而不是接受一把来历不明的公钥）。改了 CMK 却没重跑
+`session_key_fingerprint.py` 回填 config，三个部署脚本（router 栈 synth、`deploy_auth`、`deploy_panel`）
+都在第一次写之前拒绝部署——**那不是权限问题**，是 config 与 KMS 里的 key 不是同一把。
 - **router 栈有 stack policy，`cdk deploy` 前后各一步**：`router_stack_policy.py open` → deploy → `apply`。
   忘 open 的症状：`cdk deploy` 在 ExecuteChangeSet 阶段失败、栈事件里该资源 UPDATE_FAILED 且原因含
   "stack policy"、整栈回滚（Edge 不受影响；open 后重跑）。忘 apply **没有任何症状**——保护一直开着，
@@ -383,8 +378,8 @@ JWT。别"顺手补齐"这个名单。
 | **还剩什么没做 / 优先级** | `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9（**tracked**；两轮独立对抗性审查的合并版。做完的行带对勾或删除线；第 11 行起的先后由 spec §11.9 第 12 条与工单给，不由行号给） |
 | **平台防谁 / 不防谁（账号信任边界）** | `docs/security/account-trust-boundary.md`（**tracked**；M09 的结论真源。含只读实测方法、由基线断言的数字、为什么 SCP/resource policy/应用层签名/收窄 invoke 都不成立） |
 | **CodeBuild 对 bootstrap 桶读权限的收窄（§9 的 3b）** | `docs/superpowers/specs/2026-08-27-codebuild-bootstrap-read-narrowing-spec.md`（**tracked**；含为什么已有那条 AST 守卫看不见这个洞、三层守卫各自能证明什么、部署窗口的干净失败面） |
-| **轮转会话密钥** | `site-builder/DEPLOY.md`「轮转会话密钥」一节（就位 → 切换 → 回滚演示 → 排空 → 退役）。裁定原文在 spec §11.8，状态机在 spec §6.2。过程记录在 `.scratch/3c-1b/`——gitignored、不随仓库分发，别当状态真源 |
-| **会话签名非对称化的设计（3c；分包与顺序）** | `docs/superpowers/specs/2026-08-28-asymmetric-session-signing-spec.md`（**tracked**；§6.1 是时序真源，其中 3c-final 那一行是当前定义、2A/2B/3 三行只保留设计内容；§11 是全部裁定与被否决项，§11.9 是"交付物是资产"框架下的收敛：2A/2B/3 合为 3c-final、验证环境硬切换、HS 不进 v1；ADR 在 `docs/adr/`。含量测过的收益边界、两个 key family 的模型、部署与回滚协议、以及「四个 verify_* 闸门靠读 SSM 明文本地 mint 会话，非对称化后由夹具签发器替代」这条容易漏的代价） |
+| **轮转会话密钥（KMS）** | `site-builder/DEPLOY.md`「轮转会话密钥（KMS）」一节（① 建新 key → ② 就位 → ③ 切换 → ④ 排空 → ⑤ 退役，附回滚表与应急）。非对称 CMK 不支持自动轮转，所以轮转 = 加一把新 key + verifier 先行 + 排空后退役。裁定原文在 spec §11.8 |
+| **会话签名非对称化的设计（3c；分包与顺序）** | `docs/superpowers/specs/2026-08-28-asymmetric-session-signing-spec.md`（**tracked**；§6.1 是时序真源，其中 3c-final 那一行是当前定义、2A/2B/3 三行只保留设计内容；§11 是全部裁定与被否决项，§11.9 是"交付物是资产"框架下的收敛：2A/2B/3 合为 3c-final、验证环境硬切换、HS 不进 v1；ADR 在 `docs/adr/`。含量测过的收益边界、两个 key family 的模型、部署与回滚协议、以及「四个 verify_* 闸门的登录态改由夹具签发器提供」这条容易漏的代价） |
 | **3c 冒充面的可复跑证据** | `site-builder/scripts/probe_impersonation_surface.py`（**tracked**，只读，约 20 分钟）→ `docs/security/3c-impersonation-surface.json`（**tracked**，只有计数/等价类/边际收益/盲区清单，名字只进 gitignored dump）。**`--self-test` 不碰 AWS**，反例与变形测试在 `deployer/tests/test_probe_impersonation_surface.py` |
 | 加固包的设计与实施 | `docs/superpowers/specs/2026-08-22-s1-isolation-and-auth-hardening-spec.md` + `docs/superpowers/plans/2026-08-22-s1-isolation-and-auth-hardening.md`；存量环境的升级/闸门/回滚见 `site-builder/DEPLOY.md` 的「S1 加固」一节 |
 | 一期设计决策与范围 | `docs/superpowers/specs/2026-07-21-quick-site-builder-design.md`（已实现快照，勿改） |
@@ -436,7 +431,7 @@ JWT。别"顺手补齐"这个名单。
 
    | venv | 依赖清单 | 备注 |
    |---|---|---|
-   | `router/infrastructure/.venv` | `requirements.txt` | 只有 CDK 依赖，**没有 pytest**（router 的测试借 deployer 的 venv） |
+   | `router/infrastructure/.venv` | `requirements.txt` | CDK 依赖 + `cryptography`（synth 期取 KMS 公钥并核对指纹），**没有 pytest**（router 的测试借 deployer 的 venv） |
    | `site-builder/contract/.venv` | `requirements-dev.txt` | 含 `-e .`，一条 `pip install -r` 装完 |
    | `site-builder/deployer/.venv` | `requirements-dev.txt` | 含 `-e ../contract`，同上 |
    | `site-builder/deployer/infra/.venv` | `requirements.txt` | aws_cdk **只在这个** venv 里 |
@@ -446,9 +441,11 @@ JWT。别"顺手补齐"这个名单。
    路径按**进程 cwd** 解析，不是按文件位置。`auth` / `panel` / `key-proxy` 没有自己的
    venv，借别人的，组合见上面「测试命令」。deployer 那份是精确钉死的，直接依赖的原始声明
    留在文件头注释里。两份都实测过：空 venv 一条命令装完，六个借用它们的套件全绿。
-3. **`python3`（第 0 步那个 3.12）上装两个包**：
-   `python3 -m pip install --user --break-system-packages boto3 pip-system-certs`
+3. **`python3`（第 0 步那个 3.12）上装三个包**：
+   `python3 -m pip install --user --break-system-packages boto3 pip-system-certs cryptography`
    （即 `bootstrap_venvs.sh --host-deps`；默认不做，因为它改的是机器不是仓库）。
+   `cryptography` 是 3c-final 加的：两个部署脚本、`session_key_fingerprint.py` 与两个闸门都经
+   `session_kms` → `session` 用它解析公钥、核对指纹。宿主上不钉版本；Lambda 产物里钉 50.0.0。
    **五个 `verify_*` 真机闸门与所有 `scripts/*.py` 都用它跑。**
    两个开关缺一不可：Homebrew 的 python 带 PEP 668 标记，不加
    `--break-system-packages` 直接被拒；加 `--user` 是为了只写 user site

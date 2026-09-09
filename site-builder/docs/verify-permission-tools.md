@@ -35,7 +35,7 @@
 `team-kudos-wall-1d5lpc` 等是验证过的一期产物，改坏了要重部署。
 
 ```bash
-# --owner 必须填**你的登录邮箱**：默认的 fixture@test 会让 role_of() 判你不是
+# --owner 必须填**你的登录邮箱**：默认的 fixture@e2e.invalid 会让 role_of() 判你不是
 # owner，所有权限工具都拒绝，症状看起来像"工具坏了"
 python3 site-builder/scripts/deploy_fixture.py \
   site-builder/fixtures/nosql-notes --owner <你的飞书邮箱>

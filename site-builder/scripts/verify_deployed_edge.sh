@@ -148,7 +148,7 @@ then FAILURES=$((FAILURES + 1)); fi
 
 echo "── ④ 注入值与安全开关 ───────────────────────────"
 if grep -q "SYNTH-ONLY-PLACEHOLDER" "$TMP/index.py"; then
-  fail "产物含 SYNTH-ONLY-PLACEHOLDER —— SSM 读取失败，线上所有会话验签都会失败"
+  fail "产物含 SYNTH-ONLY-PLACEHOLDER —— synth 期取 KMS 公钥失败后按占位符部署了，线上所有会话验签都会失败"
 else
   echo "PASS  无 SYNTH-ONLY-PLACEHOLDER"
 fi

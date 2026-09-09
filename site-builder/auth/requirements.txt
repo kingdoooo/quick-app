@@ -1,8 +1,8 @@
 # auth Lambda 的**锁定**依赖清单（装时必须带 --require-hashes）。
 #
-# 为什么锁到 hash：本函数**签发并校验会话 JWT**——它就是身份层的 TCB。Edge 只验
-# HS256 签名，一个被污染的上游版本能直接改"谁是谁"，绕过 owner / allowed_users /
-# collaborators 全部判定。而 `pyjwt[crypto]>=2.8` 这种范围声明让"干净环境重部署
+# 为什么锁到 hash：本函数**签发并校验会话 JWT**——它就是身份层的 TCB。签发是
+# `kms:Sign`，但**头部与 claims 是本进程拼的**，一个被污染的上游版本能直接改"谁是谁"
+# 并让 KMS 照签，绕过 owner / allowed_users / collaborators 全部判定。而 `pyjwt[crypto]>=2.8` 这种范围声明让"干净环境重部署
 # 得到相同产物"不成立（Codex 2026-08-15 P2-2）。同一理由已写在 mcp/requirements.txt
 # 顶部——auth 的 TCB 位置不比它低。
 #
