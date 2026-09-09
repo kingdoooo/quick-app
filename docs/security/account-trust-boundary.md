@@ -49,12 +49,12 @@
 它**不**回答「怎么把账号里那 38 个无关工作负载清理干净」——那是账号治理，
 不是本仓库能提交的改动。
 
-## 实测（2026-08-27，全部只读）
+## 实测（2026-08-27 首测；数字按 2026-09-09 3c-final 切换后的基线回填；全部只读）
 
 方法：`iam:GetAccountAuthorizationDetails` 枚举账号内**全部**非 service-linked
 角色与 IAM 用户，逐个 `iam:SimulatePrincipalPolicy`（模拟器会算 permissions
 boundary；本账号是 Organizations 管理账号，SCP 对它无效）。
-枚举到的 principal 全部**收到**模拟结果、无一因限流丢失（本次 401 个）——丢一个与「它没有权限」在
+枚举到的 principal 全部**收到**模拟结果、无一因限流丢失（本次 408 个）——丢一个与「它没有权限」在
 输出上一模一样，所以脚本对模拟失败是硬失败。
 
 复跑（这就是最新结果的取得方式，本文不承诺数字长期有效）：
@@ -67,12 +67,12 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 
 | 组 | 项 | 数 |
 |---|---|---|
-| **A 直接失守** | 具备非 IAM-write 敏感授权的 principal | 61 <!-- baseline:A总数=61 --> |
-| | 其中**能签会话**的（`kms:Sign` ∪ 能给自己授权；= 闸门的 `is_secret_grant`。**这不是冒充面总数**，见状态段 ②③） | TBD <!-- baseline:可签会话=TBD --> |
+| **A 直接失守** | 具备非 IAM-write 敏感授权的 principal | 37 <!-- baseline:A总数=37 --> |
+| | 其中**能签会话**的（`kms:Sign` ∪ 能给自己授权；= 闸门的 `is_secret_grant`。**这不是冒充面总数**，见状态段 ②③；单账号实测——采用者以自己账号的基线为准） | 15 <!-- baseline:可签会话=15 --> |
 | | 其中**非平台**身份可直接 `lambda:InvokeFunction` 平台或站点函数的 | 18 <!-- baseline:非平台可直调=18 --> |
 | | 会话签名 CMK 数（site / console 各一把） | 2 <!-- baseline:kms_key数=2 --> |
 | **B IAM 写观察** | 持有相关 IAM 策略变更语句的 principal | 22 <!-- baseline:B持有IAM写语句=22 --> |
-| | 其中**不在 A 里**（只有 IAM 写、**未证明可提权**） | 4 <!-- baseline:仅IAM写=4 --> |
+| | 其中**不在 A 里**（只有 IAM 写、**未证明可提权**） | 6 <!-- baseline:仅IAM写=6 --> |
 
 > **以下这段是 HS 形态的口径（历史记录，3c-final 之后不再成立）**：那两个产物计数所依据的
 > `facts` 键随 HS 密钥材料一起删除，表里对应的两行也已删。留在这里是为了让读到旧闸门输出的人
@@ -98,13 +98,13 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 > **那一轮也是 `--update-baseline` 第一次先打印比较报告再写**（3c-1B-G A6：原先它在比较之前
 > 就 return，"接受了什么"完全不留痕，而 spec §11.8.7 反对的正是这种人工放行）。
 
-> **A + B 的并集是 65，但那个数不是 headline。** A 是"现在就能拿到密钥或直接调用平台
+> **A + B 的并集是 43，但那个数不是 headline。** A 是"现在就能拿到密钥或直接调用平台
 > 函数"；B 只是"持有一条可能影响 IAM 策略的语句"，本闸门**明确不证明**它构成提权链
 > （判那个需要一个 IAM 权限分析器——那正是这道闸门被前五轮复审反复点名的根因）。
 > 把两者相加当成一个风险数字，是这一轮收缩要消掉的那个错误。
 >
-> **B 里那 4 个不在 A 里的 principal 没有类别分布可写**：schema 3 的 `principals`
-> 只保留 A 的 61 个，那 4 个的 `category` 不在基线里 ⇒ 任何按类别的拆分都没有真源，
+> **B 里那 6 个不在 A 里的 principal 没有类别分布可写**：基线的 `principals`
+> 只保留 A 的 37 个，那 6 个的 `category` 不在基线里 ⇒ 任何按类别的拆分都没有真源，
 > 只能靠人记，下次 B 的成员变了就会静默腐烂。要看它们是谁，跑
 > `--dump-observed` 看带真实名字的快照（产物含账号内标识，勿提交）。
 
@@ -116,13 +116,13 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 | `platform` | 6 <!-- baseline:类别_platform=6 --> | 平台自己的角色，授权都是**必需且精确**的，见下节 |
 | `platform-overbroad` | 0 <!-- baseline:类别_platform_overbroad=0 --> | **已清零**（2026-08-27 收窄 CodeBuild 的 bootstrap 桶读权限）。这一行不能删——文档数字守卫对每个类别都要求正文出现对应标记 |
 | `admin` | 3 <!-- baseline:类别_admin=3 --> | 账号管理身份（含账号 owner 的 IAM 用户）。属既定信任模型 |
-| `break-glass` | 6 <!-- baseline:类别_break_glass=6 --> | 企业内部托管的管理/审计角色。不由本项目控制 |
-| `cdk-admin` | 6 <!-- baseline:类别_cdk_admin=6 --> | CDK bootstrap 的 CloudFormation 执行角色与部署角色（各 3 个区），按约定是 `AdministratorAccess`。**任何能在本账号跑 `cdk deploy` 的人都能用** |
-| `cdk-readonly` | 4 <!-- baseline:类别_cdk_readonly=4 --> | CDK bootstrap 的 lookup 与 file-publishing 角色。它们**足以拿到密钥** |
-| `unrelated-workload` | 36 <!-- baseline:类别_unrelated=36 --> | 与本平台无关的工作负载：EC2/ECS/EMR/EKS 实例角色、多个 SageMaker 与 Personalize 执行角色、Glue、Batch、SSM 自动化与 QuickSetup、另一套 GenAI Agent 栈、若干应用与 CDK BucketDeployment 角色 |
+| `break-glass` | 1 <!-- baseline:类别_break_glass=1 --> | 企业内部托管的管理/审计角色。不由本项目控制（3c-final 后只剩 1 个仍在 A 里：其余几个原先只靠 SSM 读进 A，HS 材料删除后退出） |
+| `cdk-admin` | 3 <!-- baseline:类别_cdk_admin=3 --> | CDK bootstrap 的 CloudFormation 执行角色（3 个区），按约定是 `AdministratorAccess` ⇒ 两把 CMK 都能 `kms:Sign`。**任何能在本账号跑 `cdk deploy` 的人都能用**（部署角色本身只剩 IAM 写观察，不再进 A） |
+| `cdk-readonly` | 3 <!-- baseline:类别_cdk_readonly=3 --> | CDK bootstrap 的 lookup 角色（3 个区）。3c-final 后只剩 `read-login-flow-secret`——**不进冒充面**（那把是登录流 HMAC，签不出会话） |
+| `unrelated-workload` | 21 <!-- baseline:类别_unrelated=21 --> | 与本平台无关的工作负载：EC2/ECS/EMR/EKS 实例角色、多个 SageMaker 与 Personalize 执行角色、Glue、Batch、SSM 自动化与 QuickSetup、另一套 GenAI Agent 栈、若干应用与 CDK BucketDeployment 角色 |
 
-合计 61 = A 组总数。**这一轮把这张表的裸数字也加上了校验标记**：`unrelated-workload`
-那个曾经写着 38，而 A 收缩后是 36——裸数字正是文档腐烂的入口。
+合计 37 = A 组总数。**这一轮把这张表的裸数字也加上了校验标记**：`unrelated-workload`
+那个曾经写着 38，A 收缩后是 36，3c-final 删掉 HS 材料后是 21——裸数字正是文档腐烂的入口。
 
 ⇒ 这不是「只有我一个人有权限」的个人账号，而是一个**多工作负载共享账号**。
 任何一个上述工作负载被拿下（含任何能在本账号里跑 notebook / EC2 / `cdk deploy`
@@ -332,7 +332,7 @@ Python 后端而用 `pip install` 装 sdist），这条链就从「账号内部�
 `site-builder/DEPLOY.md`「轮转 `jwt-secret`」那一节记的"当前实现不支持安全轮转"
 都要一起重做。**它是独立设计包，本轮没有做。**
 
-**B 做完之后残留多少：已量测，不是估计。** 2026-08-30 的只读模拟（401 个 principal，
+**B 做完之后残留多少：已量测，不是估计。** 2026-08-30 的只读模拟（HS 形态下的量测；3c-final 之后那份探针 JSON 尚未重跑，归工单 12；401 个 principal，
 探针与脱敏聚合证据都是 tracked 的，见 `docs/security/3c-impersonation-surface.json`，
 可用 `site-builder/scripts/probe_impersonation_surface.py` 复跑）：
 
@@ -508,9 +508,11 @@ policy 里的 `role/ExactRole` 不会匹配字面量 `role/*` ⇒ 精确授权�
   变更上，进而训练出"红了就更新基线"。
 
 一次完整运行实测 **8.5–10.5 分钟**（四次实测 10:32 / 9:49 / 9:36 / 8:47；
-最后那次是每线程独立 IAM client 之后的——共享 client 的连接池争用同时也拖慢了它）（400 个 principal × 2 次 IAM 模拟 + 一次
+最后那次是每线程独立 IAM client 之后的——共享 client 的连接池争用同时也拖慢了它）（当时 400 个 principal × 2 腿 IAM 模拟 + 一次
 `GetAccountAuthorizationDetails` 静态收语句 + 扫 bootstrap 桶 + 逐版本校验 Edge 代码）。
 去掉 IAM 写的逐个模拟确认之后省下的时间不多——主要成本一直是那 800 次模拟。
+3c-final 后是 **3 腿**（第三腿只对 CMK 资源模拟 `kms:Sign` 的 `MessageType=DIGEST`）加**第二次**
+`GetAccountAuthorizationDetails`（窗口两端一致性复查）：408 个 principal 约 1,224 次模拟，切换当晚在慢链路上实测 28 分钟。
 
 **`--dump-observed` 是纯观测模式**：它不读基线、不比较，退出码不代表闸门结论。
 分开是刻意的——把「产出用于分类/迁移的快照」与「出闸门结论」混在一条命令里，
@@ -626,7 +628,7 @@ python3 site-builder/scripts/verify_account_trust_boundary.py \
 **闸门自己的 fail-closed（这些都不会"打印一条警告然后退出 0"）**
 
 - **未校验服务端证书的请求是致命错误**。实测过一次真实现场：共享一个 IAM client 给 4 个
-  worker 并发用，800 次模拟里有十几次跳过了证书校验（顺序执行 0 次、每线程独立 client
+  worker 并发用，800 次模拟（当时 2 腿 × 400）里有十几次跳过了证书校验（顺序执行 0 次、每线程独立 client
   0 次）。闸门的答案能被主动 MITM 伪造的话，那次"绿"就不能当安全证据。
   现在每线程一个独立 client，且 `InsecureRequestWarning` 直接抛。
 - **不完整的观测不会变成一个权威的绿**：`--no-asset-scan` 只能用于纯
