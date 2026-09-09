@@ -15,7 +15,8 @@
   · **未知 kid** 的 token（本地造，不需要任何密钥）必须被 Edge 拒，且不回落；
   · **夹具会话投给真实 org 站点必被拒**（ADR 0002 的边界：`allowed_users="org"` 的站点会放行
     任何可信来源的邮箱，所以这条才是"夹具身份的危害上限是夹具站点"的真机证据）。账号里没有
-    org 站点时该条报 `skip: 账号里没有 org 站点`，**不算失败**；
+    org 站点时该条**印成 SKIP**（`Check.ok is None`）并把原因带进汇总行，**既不算通过也不算
+    失败**——退出码放行，但报告里不许写"全部通过"（印成 PASS 等于宣布这条验过了）；
   · 正对照：单枚合法夹具会话必须能进（否则上面几条 302 证明不了任何东西）；
   · 负对照：无 cookie 必须 302（确认 fail-closed 没被这些改动弄坏）。
 
@@ -60,9 +61,21 @@ class Tokens:
 
 @dataclass(frozen=True)
 class Check:
+    """`ok` 是**三值**：`True` = PASS、`False` = FAIL、`None` = SKIP（这一条没被验）。
+
+    `None` 这一档是被复审揪出来的：跳过的判据原先记 `ok=True`，于是报告里印
+    `PASS`、汇总印"全部通过"，而那条判据是**唯一**证明"夹具会话打不开真实 org 站点"
+    的真机证据（ADR 0002）。"没验过"与"验过且通过"在输出上一模一样，就等于把一个
+    未知当成了结论。退出码仍然放行 SKIP（干净账号里本来就没有 org 站点，报失败会让
+    闸门永远红），但**报告必须说它没验**。
+    """
     name: str
-    ok: bool
+    ok: bool | None
     detail: str
+
+    @property
+    def label(self) -> str:
+        return "SKIP" if self.ok is None else ("PASS" if self.ok else "FAIL")
 
 
 def _login_302(st, hd, auth_host) -> bool:
@@ -95,8 +108,9 @@ def run_checks(get, tokens: Tokens, *, site_url: str, auth_host: str,
     else:
         # **不是失败**：干净账号里本来就没有 `allowed_users="org"` 的真实站点，
         # 而拿夹具站点当目标会把这条判据退化成正对照（它 owner 就是夹具域）。
+        # `ok=None` ⇒ SKIP。**不是 `True`**：印成 PASS 就等于宣布这条验过了。
         add("ADR 0002 边界：夹具会话投给真实 org 站点被拒（302；org 站点对任何可信邮箱都开门）",
-            True, "skip: 账号里没有 org 站点")
+            None, "skip: 账号里没有 org 站点")
     st, hd = get(site_url, f"sb_session={tokens.good}")
     add("正对照：单枚合法夹具会话正常放行（200）", st == 200, f"{st}")
     st, hd = get(site_url, "")
@@ -105,10 +119,23 @@ def run_checks(get, tokens: Tokens, *, site_url: str, auth_host: str,
 
 
 def render(checks: list) -> int:
+    """打印逐条判定并给退出码。**SKIP 既不算通过也不算失败。**
+
+    汇总行在有 SKIP 时**不许出现"全部通过"**：操作者只会读这一行，而"六条里有一条
+    根本没验"必须在这一行里就能看见，连原因一起。退出码只看 FAIL。
+    """
     for c in checks:
-        print(f"  {'PASS' if c.ok else 'FAIL'}  {c.name}   [{c.detail}]")
-    failed = sum(1 for c in checks if not c.ok)
-    print(f"\n结果：{'全部通过' if failed == 0 else f'{failed} 项失败'}")
+        print(f"  {c.label}  {c.name}   [{c.detail}]")
+    failed = [c for c in checks if c.ok is False]
+    skipped = [c for c in checks if c.ok is None]
+    parts = [f"{len(checks) - len(failed) - len(skipped)} 项通过"]
+    if failed:
+        parts.append(f"**{len(failed)} 项失败**")
+    if skipped:
+        parts.append(f"{len(skipped)} 项 SKIP（未验证："
+                     + "；".join(f"{c.name} —— {c.detail}" for c in skipped) + "）")
+    verdict = "全部通过" if not failed and not skipped else "、".join(parts)
+    print(f"\n结果：{verdict}")
     return 1 if failed else 0
 
 
@@ -156,7 +183,8 @@ def self_test(**flags) -> int:
     checks = run_checks(_ideal_responder(**flags), Tokens(good="GOOD", unknown_kid="UNKNOWN"),
                         site_url="https://app-e2e-probe.example.test/", auth_host="auth.example.test",
                         org_site_url="https://app-org.example.test/")
-    return 1 if any(not c.ok for c in checks) else 0
+    # `c.ok is False`，不是 `not c.ok`：SKIP（`None`）不是失败。
+    return 1 if any(c.ok is False for c in checks) else 0
 
 
 # ---- 真机 -------------------------------------------------------------------------------------

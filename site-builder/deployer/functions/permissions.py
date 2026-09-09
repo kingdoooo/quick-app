@@ -706,6 +706,10 @@ def write_permissions(site_id: str, *, actor: str, action: str,
     effective = effective_policy_audited(site, actor=actor)
 
     # ADR 0002：夹具域不得越界。**位置**与 M02 那条相同——读到 site 行之后、构造事务之前 ⇒ 抛错时零副作用。
+    # **这两条是刻意不对称的，别"顺手补齐"**：拦的是"夹具身份写进真实站点"，**不拦**"真实邮箱
+    # 写进夹具站点"（夹具站点照样可以有真实协作者）。这道边界保护的是真实站点不被夹具身份打开，
+    # 反方向本来就没有可保护的东西——Edge 对任何路由都接受真实会话，夹具站点也不例外。
+    # 真正要紧的那个形态（把夹具站点转给真实 owner，或反过来）由下面第二条 `new_owner` 拦住。
     fixture_site = site_is_fixture(site)
     incoming = list(collaborators or []) + (list(allowed_users) if isinstance(allowed_users, list) else []) \
         + ([new_owner] if new_owner is not None else [])

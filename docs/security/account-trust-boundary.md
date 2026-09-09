@@ -569,6 +569,12 @@ python3 site-builder/scripts/verify_account_trust_boundary.py \
   KMS 层看的是 **key policy 快照、grants、以及 `kms:Sign` / `kms:PutKeyPolicy` / `kms:CreateGrant`
   的 identity policy 上界**；**不看 assume-role 链**（"A 能 assume B 而 B 能签"这种间接路径不在
   射程内）。VPC endpoint policy、其它服务的 resource policy、**S3 access point** 都不看。
+  **`kms:Sign` 按 `kms:MessageType` 的 RAW 与 DIGEST 两个取值各模拟一腿**（两腿取并集，
+  任一取值下能签就算签名者）：`RSASSA_PKCS1_V1_5_SHA_256` 下调用方在本地对
+  `header.payload` 做 SHA-256 再签那 32 字节摘要，得到的签名与 RAW 路**逐字节相同**
+  ⇒ 一条只允许 DIGEST 的授权就是完整的冒充能力，而它在 RAW 上下文下评估成
+  implicitDeny（不是"缺上下文"，所以那个笼统计数也看不见它），只模拟 RAW 会把持有者
+  干干净净地报成"不能签"。
 - 它不看跨账号 principal。但语句里出现**外部账号**的 principal 会改变指纹 ⇒ 会红
   （账号归一化只归**当前**账号，就是为了留住这个信号）。
 - 它统计的是**当前**存在的 principal 与资源；某人临时建一个角色用完删掉，

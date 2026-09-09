@@ -130,8 +130,8 @@ python3 site-builder/scripts/session_verify_counts.py --hours 1 --require-total 
 #   （窗口 ≥ 26 h、每处总量 > 0、目标列三列全 0、accepted_current 三列全 > 0），exit 0 才算过。
 #   手写那四个旗标少任何一个都是静默放宽——空窗口下裸 `--require-zero` 会退 0，而下一步是不可逆的退役 key。
 #   判据说明见 DEPLOY.md 的轮转 runbook
-# 账号信任边界的漂移闸门（只读；A 直接失守 + B IAM 写静态快照两层；几百个 principal × 2 次
-# IAM 模拟 + **两次** GetAccountAuthorizationDetails——第二次是模拟后的**窗口两端一致性复查**，
+# 账号信任边界的漂移闸门（只读；A 直接失守 + B IAM 写静态快照两层；几百个 principal × 3 次
+# IAM 模拟（第三次是 kms:Sign 的 MessageType=DIGEST 那一腿）+ **两次** GetAccountAuthorizationDetails——第二次是模拟后的**窗口两端一致性复查**，
 # 两端不一致就作废本轮、不出结论也不写基线；它**不保证原子**，只覆盖 principal 层、只证明两端相等，
 # 三个已接受盲区见 docs/security/account-trust-boundary.md）+ 扫 bootstrap 桶，实测约 11 分钟
 python3 site-builder/scripts/verify_account_trust_boundary.py

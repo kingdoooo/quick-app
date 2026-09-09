@@ -3941,6 +3941,120 @@ def test_kms_keys_are_simulated_with_the_contract_context_and_classified_by_kid(
     assert ("kms:SigningAlgorithm", ("RSASSA_PKCS1_V1_5_SHA_256",)) in ctx and ("kms:MessageType", ("RAW",)) in ctx
 
 
+def _sim_iam(allow_message_types, *, action="kms:Sign", resource=None):
+    """一个**按 `kms:MessageType` 上下文决定判定**的假 IAM。
+
+    真实 IAM 就是这个行为：`kms:Sign` 语句上带 `StringEquals kms:MessageType` 时，
+    另一个取值下的请求评估成 `implicitDeny`——**不是**"缺上下文"（上下文喂了，只是值
+    不匹配），所以 `missing_context_in` 那条路看不见它，闸门会把持有者报成"不能签"。
+    """
+    resource = resource or KEY["site-rs-v1"]
+    allow = set(allow_message_types)
+
+    class _IAM:
+        def __init__(self):
+            self.calls = []
+
+        def get_paginator(self, name):
+            assert name == "simulate_principal_policy", name
+            outer = self
+
+            class _P:
+                def paginate(self, **kw):
+                    outer.calls.append(kw)
+                    mt = {v for e in (kw.get("ContextEntries") or [])
+                          if e["ContextKeyName"] == "kms:MessageType"
+                          for v in e["ContextKeyValues"]}
+                    results = []
+                    for a in kw["ActionNames"]:
+                        per = [{"EvalResourceName": r,
+                                "EvalResourceDecision":
+                                    "allowed" if (a == action and r == resource and mt & allow)
+                                    else "implicitDeny"}
+                               for r in kw["ResourceArns"]]
+                        results.append({
+                            "EvalActionName": a,
+                            "EvalResourceName": "arn:aws:kms:${Region}:${Account}:key/${KeyId}",
+                            "EvalDecision": "implicitDeny",
+                            "ResourceSpecificResults": per})
+                    return iter([{"EvaluationResults": results}])
+            return _P()
+    return _IAM()
+
+
+def _sign_grants(g, iam):
+    decisions, _missing, _pairs = g.simulate(iam, "arn:aws:iam::111111111111:role/x", _targets_kms(g))
+    return {x for x in g.grants_from_decisions(decisions, _targets_kms(g)) if x.startswith("kms-sign:")}
+
+
+def test_a_digest_only_signing_grant_is_still_a_signer():
+    """`kms:Sign` 只在 `MessageType=DIGEST` 下被允许的 principal **就是签名者**。
+
+    PKCS#1 v1.5 下两条路的签名**逐字节相同**：调用方在本地对 `header.payload` 做
+    SHA-256 再签那 32 字节摘要，KMS 只是跳过哈希这一步，产出的签名与 RAW 路一模一样
+    ⇒ 三个 verifier 全接受。只模拟 RAW 的闸门会把这个 principal 报成"不能签"，
+    而它的输出看起来是权威的——比缺一项检查更糟。
+    """
+    g = _gate()
+    assert _sign_grants(g, _sim_iam({"DIGEST"})) == {"kms-sign:site-rs-v1"}
+
+
+def test_a_raw_only_signing_grant_is_still_a_signer():
+    """正向控制：加了 DIGEST 那一腿之后，RAW 下的 allowed **不能**被后一腿的
+    implicitDeny 覆盖掉（`dict.update` 就会覆盖——那是自己制造出来的新假绿）。"""
+    g = _gate()
+    assert _sign_grants(g, _sim_iam({"RAW"})) == {"kms-sign:site-rs-v1"}
+
+
+def test_no_signing_grant_when_denied_under_both_message_types():
+    """负向控制：两个取值下都拒 ⇒ 一条签名 grant 都不该出现（否则上面两条会因为
+    "什么都算能签"而假绿）。"""
+    g = _gate()
+    assert _sign_grants(g, _sim_iam(set())) == set()
+
+
+def test_both_kms_message_types_are_simulated_and_the_extra_leg_is_narrow():
+    """两个 `MessageType` 都要进模拟，且多出来的那一腿**只有 `kms:Sign`、只对 CMK**。
+
+    第二腿要是把 `ACTIONS_OTHER` 全套再对全部资源跑一遍，成本翻倍换不来任何信号
+    （`ssm:Get*` 与 `kms:MessageType` 无关）。合同值（`session_kms.MESSAGE_TYPE`）必须
+    在被模拟的取值里——否则闸门测的不是平台实际走的那条路。
+    """
+    g = _gate()
+    iam = _sim_iam(set())
+    g.simulate(iam, "arn:aws:iam::111111111111:role/x", _targets_kms(g))
+    mts = {v for c in iam.calls for e in (c.get("ContextEntries") or [])
+           if e["ContextKeyName"] == "kms:MessageType" for v in e["ContextKeyValues"]}
+    assert mts == {"RAW", "DIGEST"}, mts
+    assert g.KMS_MESSAGE_TYPE in mts
+    extra = [c for c in iam.calls
+             if {"DIGEST"} == {v for e in (c.get("ContextEntries") or [])
+                               if e["ContextKeyName"] == "kms:MessageType" for v in e["ContextKeyValues"]}]
+    assert len(extra) == 1, extra
+    assert list(extra[0]["ActionNames"]) == list(g.A_KMS_SIGN)
+    assert sorted(extra[0]["ResourceArns"]) == sorted(KEY.values())
+    # 算法那一维不跟着变：两腿喂的都是合同算法。
+    assert {v for c in iam.calls for e in (c.get("ContextEntries") or [])
+            if e["ContextKeyName"] == "kms:SigningAlgorithm"
+            for v in e["ContextKeyValues"]} == {g.KMS_SIGNING_ALGORITHM}
+
+
+def test_the_reported_leg_count_is_what_simulate_actually_calls():
+    """进度输出报的腿数必须等于 `simulate` 真正发出的调用数。
+
+    这行输出是"这一轮扫了多少东西"的唯一凭据，闸门本身要跑 11 分钟、没人会去数
+    HTTP 请求。写死"2 次"的字面量在加了 DIGEST 那腿之后就是**静静地说谎**，而说谎的
+    方向恰好是"看起来和以前一样"。
+    """
+    g = _gate()
+    t = g.Targets(platform_functions=("arn:aws:lambda:us-east-1:111111111111:function:site-panel",),
+                  site_functions=(), kms_keys=dict(KEY),
+                  login_flow_parameter="arn:aws:ssm:us-east-1:111111111111:parameter/site-builder/login-flow-secret")
+    iam = _sim_iam(set())
+    g.simulate(iam, "arn:aws:iam::111111111111:role/x", t)
+    assert len(iam.calls) == g.SIM_LEGS_PER_PRINCIPAL == 3, (len(iam.calls), g.SIM_LEGS_PER_PRINCIPAL)
+
+
 def test_the_kms_context_values_are_the_contract_not_a_hand_copy():
     """两个 Condition 值必须与 `auth/session_kms.py` 逐字一致——手抄的副本漂移时闸门会静静地
     测错东西（`kms:Sign` 判成"缺上下文"⇒ auth / panel 的必需 grant 消失 ⇒ 正向控制假红）。"""

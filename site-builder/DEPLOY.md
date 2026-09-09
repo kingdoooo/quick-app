@@ -768,7 +768,9 @@ exit "$m01_rc"
 `verify_console_e2e.py` + `smoke_router.sh`（控制台与路由层）。
 
 **还有一条不属于任何部署步骤的闸门**：`verify_account_trust_boundary.py`
-（只读；**A 直接失守 + B IAM 写静态快照**两层；400 个 principal × 2 次 IAM 模拟 + **两次**
+（只读；**A 直接失守 + B IAM 写静态快照**两层；400 个 principal × 3 次 IAM 模拟
+（函数类 / 其余 / `kms:Sign` 的 `MessageType=DIGEST`——PKCS#1 v1.5 下 DIGEST 签出的字节与
+RAW 路相同，只模拟 RAW 会把一条只允许 DIGEST 的授权报成「不能签」）+ **两次**
 `GetAccountAuthorizationDetails`（第一次静态收语句，第二次是模拟后的**窗口两端一致性复查**——枚举
 与模拟之间约 10 分钟，两端不一致就作废本轮、不出结论也不写基线；它**不保证原子**，三个盲区见
 `docs/security/account-trust-boundary.md`）+ 扫 bootstrap 桶 + 逐版本校验

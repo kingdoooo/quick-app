@@ -2,8 +2,14 @@
 
 **签发**由调用方注入 `sign(signing_input: bytes) -> bytes`（生产：`session_kms.KmsSigner`，
 测试与夹具单测：`local_signer(private_key)`）；**验签**在本模块用 `cryptography` 本地完成。
-Edge（router/infrastructure/lambda/origin_request.py）内嵌一份**字节等价**的验签核心
-（`_b64url_decode_strict` / `_strict_json` / `load_public_key_der` / `_rsa_verify` / `verify_token` 的判定段），
+Edge（router/infrastructure/lambda/origin_request.py）内嵌一份**字节等价**的验签核心。
+被逐段比对的是**七个函数全部**——`_b64url` / `_b64url_decode_strict` / `_strict_json` /
+`spki_sha256` / `load_public_key_der` / `_rsa_verify` / `_aud_matches`——加上 `verify_token`
+的**判定段**（Edge 侧叫 `_verify_site_session`），再加四组**段外**的等值物：`ALG`、`TOKEN_USES`、
+两个 RSA 约束（`RSA_MODULUS_BITS` / `RSA_PUBLIC_EXPONENT`）、`_B64URL_RE` 与 `_PAD` / `_HASH`
+的类型，以及黄金三元组。**这份清单必须与 `test_edge_kid_allowlist.py` 的 `CORE_SEGMENTS`
+一致**：那边另有一条元用例把锚点集合钉成硬编码名单，所以少写一个名字时这段散文不会红
+（漏 `_aud_matches` 已经发生过一次——它当时排在某一段的结束锚点之后，四段全绿）。
 改这里必须同步那边（CLAUDE.md 不变量；router 的 test_edge_kid_allowlist.py 逐段比对）。
 panel 构建时复制本文件（deploy_panel.COPY_FILES）。
 

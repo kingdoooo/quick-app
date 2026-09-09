@@ -348,12 +348,35 @@ A_KMS_SELF_AUTHORIZE = ("kms:PutKeyPolicy", "kms:CreateGrant")
 # 不给上下文时模拟器判"缺上下文"⇒ 平台角色的必需 grant 会从结果里消失、正向控制假红。
 KMS_SIGNING_ALGORITHM = _module_constant(SESSION_KMS_PY, "SIGNING_ALGORITHM")
 KMS_MESSAGE_TYPE = _module_constant(SESSION_KMS_PY, "MESSAGE_TYPE")
-KMS_CONTEXT = [{"ContextKeyName": "kms:SigningAlgorithm",
-                "ContextKeyValues": [KMS_SIGNING_ALGORITHM],
-                "ContextKeyType": "string"},
-               {"ContextKeyName": "kms:MessageType",
-                "ContextKeyValues": [KMS_MESSAGE_TYPE],
-                "ContextKeyType": "string"}]
+# **`kms:MessageType` 的两个取值都要模拟。** 只喂合同值（今天是 RAW）时，一条
+# `StringEquals kms:MessageType: DIGEST` 的 `kms:Sign` 语句会评估成 implicitDeny
+# ——不是"缺上下文"（上下文喂了，只是值不匹配）⇒ `missing_context_in` 那条路也看不见，
+# 持有者被干干净净地报成"不能签"。而 `RSASSA_PKCS1_V1_5_SHA_256` 下这两条路**产出
+# 同一个签名**：DIGEST 只是让 KMS 跳过哈希这一步，调用方在本地对 `header.payload`
+# 做 SHA-256 再签那 32 字节摘要，得到的字节与 RAW 路逐字节相同 ⇒ 三个 verifier 全接受。
+# 「任一取值下能签」就是能签，所以两腿的判定取并集（`merge_allowed`）。
+# 合同值放第一位并去重：`session_kms.MESSAGE_TYPE` 改成别的值时它仍然在被模拟的取值里
+# （闸门必须测平台真正走的那条路），DIGEST/RAW 两条也仍然都在。
+# EXTERNAL_MU 不进这里：它对 RSA 不可达。
+KMS_MESSAGE_TYPES = tuple(dict.fromkeys((KMS_MESSAGE_TYPE, "RAW", "DIGEST")))
+
+
+def kms_context(message_type: str) -> list[dict]:
+    return [{"ContextKeyName": "kms:SigningAlgorithm",
+             "ContextKeyValues": [KMS_SIGNING_ALGORITHM],
+             "ContextKeyType": "string"},
+            {"ContextKeyName": "kms:MessageType",
+             "ContextKeyValues": [message_type],
+             "ContextKeyType": "string"}]
+
+
+# 合同值那一条：`ACTIONS_OTHER` 那一组（`ssm:Get*` + `kms:*`）用它。
+KMS_CONTEXT = kms_context(KMS_MESSAGE_TYPE)
+# 每个 principal 的模拟腿数：函数类一腿 + 其余一腿（含合同 MessageType）+ `kms:Sign`
+# 其余每个 MessageType 各一腿。**进度输出报这个数**，而不是写死"2 次"——腿数由
+# `KMS_MESSAGE_TYPES` 决定，写死的字面量会在加/减一腿时静静地说谎（有一条单测把这个
+# 常量与 `simulate` 真正发出的调用数对齐）。
+SIM_LEGS_PER_PRINCIPAL = 1 + len(KMS_MESSAGE_TYPES)
 # IAM 策略变更动作。**这一类不进模拟器**——它只用来判"哪些语句进 B 的静态快照"。
 #
 # 原先这里走的是"静态解析发现候选 → 模拟器对具体 ARN 确认 → 三值分类"两步。已删除：
@@ -392,8 +415,11 @@ REQUIRED_GRANT_PREFIXES = {
     "panel": (f"{G_KMS_SIGN}:console-",),
 }
 
-# 两次 simulate 调用的动作分组：函数类资源一组，其余一组。分开是为了不产生
+# simulate 调用的动作分组：函数类资源一组，其余一组。分开是为了不产生
 # 大量无意义的 (动作, 资源) 组合——一次调用的响应体是资源数 × 动作数。
+# 每个 principal 的调用数 = 2 + `len(KMS_MESSAGE_TYPES) - 1`（多出来的每腿**只有**
+# `kms:Sign`、**只对** CMK：把 `ACTIONS_OTHER` 全套再跑一遍是成本翻倍换不来信号，
+# `ssm:Get*` 与 `kms:MessageType` 无关）。今天是 3 腿。
 ACTIONS_FUNCTION = A_INVOKE + A_REPLACE
 ACTIONS_OTHER = A_READ_PARAM + A_KMS_SIGN + A_KMS_SELF_AUTHORIZE
 ACTIONS = ACTIONS_FUNCTION + ACTIONS_OTHER
@@ -1974,9 +2000,21 @@ def bucket_policy_statements(s3, bucket: str) -> list[dict]:
         return []
 
 
+def merge_allowed(base: dict[str, str], extra: dict[str, str]) -> None:
+    """把一腿的逐资源判定并进累积结果：**allowed 粘住**。
+
+    裸 `dict.update` 在多腿下是错的：后一腿（DIGEST）对同一个 `动作|资源` 判
+    implicitDeny 时会把前一腿（RAW）的 allowed 覆盖掉——**加一腿反而制造出一个新的
+    假绿**。"任一 MessageType 下能签就是能签"，所以并集的方向只能是 allowed 优先。
+    """
+    for key, decision in extra.items():
+        if base.get(key) != "allowed":
+            base[key] = decision
+
+
 def simulate(iam, principal_arn: str,
              t: Targets) -> tuple[dict[str, str], bool, set[tuple[str, str]]]:
-    """两次调用：函数类资源一组、其余一组。
+    """分腿调用：函数类资源一组、其余一组，`kms:Sign` 的每个额外 `MessageType` 各一组。
 
     分组不是为了省钱，是为了不产生大量无意义的 (动作, 资源) 组合——一次调用的
     响应体是 资源数 × 动作数，而 `ssm:*` / `kms:*` 对 Lambda ARN、`lambda:*` 对 KMS key ARN
@@ -1987,6 +2025,12 @@ def simulate(iam, principal_arn: str,
     "缺上下文"⇒ 平台自己那条必需的 grant 会从结果里消失、正向控制假红。喂进去的值是
     spec §11.5 固定的合同值（`session_kms` 的两个常量，不手抄）。
 
+    **`kms:Sign` 还要按 `KMS_MESSAGE_TYPES` 的其余取值各跑一腿**（今天就是 DIGEST 一腿，
+    只对 CMK 这几个资源）。理由见 `KMS_MESSAGE_TYPES`：PKCS#1 v1.5 下 DIGEST 路签出的
+    字节与 RAW 路相同，所以一条只允许 DIGEST 的语句同样是完整的冒充能力，而它在 RAW
+    上下文下评估成 implicitDeny ⇒ 只跑一腿的闸门会把持有者报成"不能签"。多腿的判定
+    用 `merge_allowed` 取并集。
+
     返回三项：逐资源判定、`missing`（principal 级的 bool，喂 `facts` 那个笼统计数，
     只报 delta 不参与红绿）、`pairs`（item 级的判不出集合，**新成员即红**）。
     两者都要：前者是环境事实，后者才是判据。
@@ -1994,17 +2038,27 @@ def simulate(iam, principal_arn: str,
     out: dict[str, str] = {}
     missing = False
     pairs: set[tuple[str, str]] = set()
-    for actions, resources, context in ((ACTIONS_FUNCTION, t.function_resources(), None),
-                                        (ACTIONS_OTHER, t.other_resources(), KMS_CONTEXT)):
+    legs: list[tuple[tuple[str, ...], list[str], list[dict] | None]] = [
+        (ACTIONS_FUNCTION, t.function_resources(), None),
+        (ACTIONS_OTHER, t.other_resources(), KMS_CONTEXT),
+    ]
+    legs += [(A_KMS_SIGN, sorted(t.kms_keys.values()), kms_context(mt))
+             for mt in KMS_MESSAGE_TYPES[1:]]
+    for actions, resources, context in legs:
         if not resources:
             continue
         extra = {"ContextEntries": context} if context else {}
         for page in iam.get_paginator("simulate_principal_policy").paginate(
                 PolicySourceArn=principal_arn, ActionNames=list(actions),
                 ResourceArns=resources, **extra):
-            out.update(decisions_from_simulation(page["EvaluationResults"]))
+            merge_allowed(out, decisions_from_simulation(page["EvaluationResults"]))
             missing = missing or missing_context_in(page["EvaluationResults"])
             pairs |= undecided_pairs(page["EvaluationResults"])
+    # 某一腿判 allowed 的项**不是**"判不出"：另一腿在它上面缺上下文也改不了这件事。
+    # 不滤掉的话，一个已经确定能签的 (动作, 资源) 会同时进 coverage 成员，
+    # 方向是假红，但那种红同样会训练出"红了就更新基线"。
+    pairs = {(action, resource) for action, resource in pairs
+             if out.get(f"{action}|{resource}") != "allowed"}
     return out, missing, pairs
 
 
@@ -2179,7 +2233,9 @@ def measure(region: str, *, workers: int = 4) -> dict:
           f"记了版本的托管策略 {len(used_policies)} 份", file=sys.stderr)
 
     print(f"账号 {account} / 区 {region}：平台函数 {len(platform)}、站点函数 "
-          f"{len(sites)}、待模拟 principal {len(principals)}；"
+          f"{len(sites)}、待模拟 principal {len(principals)} × {SIM_LEGS_PER_PRINCIPAL} 腿"
+          f"（函数类 / 其余 / kms:Sign 的 MessageType "
+          f"{'+'.join(KMS_MESSAGE_TYPES)}）；"
           f"探测资源 {len(targets.function_resources()) + len(targets.other_resources())} 个"
           f"（含 alias {sum(len(v) for v in targets.alias_arns.values())}、"
           f"版本 {sum(len(v) for v in targets.version_arns.values())}）；"

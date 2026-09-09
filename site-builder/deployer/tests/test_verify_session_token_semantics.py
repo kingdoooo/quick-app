@@ -59,12 +59,44 @@ def test_the_docstring_points_at_the_two_static_evidence_files_and_they_exist():
         assert (ROOT / p).exists(), f"docstring 点的 {p} 不存在"
 
 
-def test_the_fixture_boundary_criterion_is_a_skip_not_a_failure_without_an_org_site():
-    """账号里没有 org 站点时那条必须是 skip：报失败会让干净账号上的闸门永远红。"""
+def test_the_fixture_boundary_criterion_is_a_skip_neither_pass_nor_failure(capsys):
+    """账号里没有 org 站点时那条必须是 **SKIP**——两个方向都错：
+
+    - 记成失败 ⇒ 干净账号上的闸门永远红；
+    - 记成 **PASS**（原形态就是 `ok=True`）⇒ "没验过"与"验过且通过"在输出上一模一样，
+      而这条是**唯一**证明"夹具会话打不开真实 org 站点"的真机证据（ADR 0002）。
+    """
     checks = _checks(org=None)
     boundary = [c for c in checks if "org 站点" in c.name]
-    assert len(boundary) == 1 and boundary[0].ok and "skip" in boundary[0].detail, boundary
+    assert len(boundary) == 1, boundary
+    assert boundary[0].ok is None, boundary          # 既不是 True 也不是 False
+    assert boundary[0].label == "SKIP"
+    assert "skip" in boundary[0].detail
     assert len(checks) == len(_checks()), "skip 那条不许整条消失（消失了就没人注意到它没被验）"
+    assert gate.render(checks) == 0, "SKIP 不是失败，退出码要放行"
+    out = capsys.readouterr().out
+    assert "SKIP" in out and "全部通过" not in out, out
+    assert "PASS  ADR 0002" not in out, out
+    assert "1 项 SKIP" in out and boundary[0].detail in out, out
+
+
+def test_a_skip_can_never_be_counted_as_a_pass(capsys):
+    """元用例：汇总行的"通过"计数不许包含 SKIP，且有 SKIP 时不许出现"全部通过"。
+
+    直接喂 `render` 一份人工 checks——不经 `run_checks`，所以将来任何一条判据改成
+    可跳过时，这条守卫都还站得住。
+    """
+    mixed = [gate.Check("p", True, ""), gate.Check("f", False, "500"),
+             gate.Check("s", None, "skip: 账号里没有 org 站点")]
+    assert gate.render(mixed) == 1
+    out = capsys.readouterr().out
+    assert "1 项通过" in out and "1 项失败" in out and "1 项 SKIP" in out, out
+    only_skip = [gate.Check("p", True, ""), gate.Check("s", None, "skip: 账号里没有 org 站点")]
+    assert gate.render(only_skip) == 0, "只有 SKIP 时退出码仍是 0"
+    out = capsys.readouterr().out
+    assert "全部通过" not in out and "1 项通过" in out and "1 项 SKIP" in out, out
+    assert gate.render([gate.Check("p", True, "")]) == 0
+    assert "全部通过" in capsys.readouterr().out
 
 
 def test_allow_paths_require_200_not_merely_non_302():
@@ -85,7 +117,7 @@ def test_the_three_bad_paths_are_separable_not_one_flag():
     """每个旗标只该弄红它自己那一族——合成一个旗标的话，"遮蔽坏了""allowlist 坏了"
     "夹具边界坏了"在报告里分不开，而三者的修法与后果完全不同。"""
     def red(**flags):
-        return {c.name for c in _checks(gate._ideal_responder(**flags)) if not c.ok}
+        return {c.name for c in _checks(gate._ideal_responder(**flags)) if c.ok is False}
 
     shadow, kid, boundary = red(break_shadow=True), red(break_unknown_kid=True), red(break_fixture_boundary=True)
     assert shadow and all("遮蔽" in n for n in shadow), shadow
@@ -98,7 +130,7 @@ def test_every_criterion_has_some_break_path_that_makes_it_red():
     """元用例：除两条对照外，每条判据都必须能被某个 break 旗标弄红——否则它是 pass-now 的。"""
     all_red = set()
     for flags in ({"break_shadow": True}, {"break_unknown_kid": True}, {"break_fixture_boundary": True}):
-        all_red |= {c.name for c in _checks(gate._ideal_responder(**flags)) if not c.ok}
+        all_red |= {c.name for c in _checks(gate._ideal_responder(**flags)) if c.ok is False}
     never_red = [n for n in _names() if n not in all_red and "对照" not in n]
     assert not never_red, f"这些判据没有任何 break 路径能让它红：{never_red}"
 

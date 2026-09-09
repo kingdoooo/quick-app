@@ -933,6 +933,15 @@ def _check_auth(request, route, host, sink=None):
     is_fixture = claims.get("auth_via") == FIXTURE_AUTH_VIA or claims.get("idp") == FIXTURE_IDP
     if is_fixture:
         both = claims.get("auth_via") == FIXTURE_AUTH_VIA and claims.get("idp") == FIXTURE_IDP
+        # **这里读的 `owner` 是权限投影字段，而平台身份那条不变量禁止从可写字段推导授权。**
+        # 这一处的界在别处：`owner` 只有两条写入路径，两条都拒绝夹具域身份落到非夹具站点上
+        # ——`permissions.write_permissions` 的 ADR 0002 段（非夹具站点不许把 @e2e.invalid
+        # 写进 owner/collaborators/allowed_users；夹具站点也不许转给非夹具 owner）与首次部署的
+        # `register_route._seed_permissions_if_absent`（非夹具 owner 的 manifest 不许 seed 夹具
+        # 邮箱），且站点的 `owner` 本身来自已认证的调用者。所以"owner 是夹具域的路由"只可能是
+        # **当初就作为夹具站点建出来的那种**，这个读法退化成"这条路由是不是夹具站点"。
+        # 平台身份**不能**这么办：它没有对应的写入侧闭合，所以走 `_is_platform_route`
+        # 按真实请求 host 推导。改这两条写入侧的守卫时必须回来重读这一段。
         owner = route.get("owner")
         owner_is_fixture = (isinstance(owner, str) and owner.count("@") == 1
                             and owner.split("@")[1] == FIXTURE_DOMAIN and bool(owner.split("@")[0]))

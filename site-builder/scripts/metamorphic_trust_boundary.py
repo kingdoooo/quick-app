@@ -384,10 +384,8 @@ MUTATIONS: list[tuple] = [
      '    for qualifier in (None, *qualifiers):',
      "edge_scan_only_covers_the_associated_version"),
     (62, "simulate 不喂 KMS 的 Condition 上下文（平台必需 grant 判成缺上下文）", SCRIPT,
-     '    for actions, resources, context in ((ACTIONS_FUNCTION, t.function_resources(), None),\n'
-     '                                        (ACTIONS_OTHER, t.other_resources(), KMS_CONTEXT)):',
-     '    for actions, resources, context in ((ACTIONS_FUNCTION, t.function_resources(), None),\n'
-     '                                        (ACTIONS_OTHER, t.other_resources(), None)):',
+     '        (ACTIONS_OTHER, t.other_resources(), KMS_CONTEXT),',
+     '        (ACTIONS_OTHER, t.other_resources(), None),',
      "kms_keys_are_simulated_with_the_contract_context"),
     (63, "KMS 的两个合同值改成手抄（与 session_kms 分家）", SCRIPT,
      'KMS_SIGNING_ALGORITHM = _module_constant(SESSION_KMS_PY, "SIGNING_ALGORITHM")\n'
@@ -412,6 +410,16 @@ MUTATIONS: list[tuple] = [
      '    "panel": (f"{G_KMS_SIGN}:console-",),\n'
      '    "keyproxy": (f"{G_KMS_SIGN}:site-",),\n}',
      "every_required_prefix_label_is_produced_by_measure"),
+    (68, "simulate 只跑合同那一个 MessageType（DIGEST 下的签名能力隐形）", SCRIPT,
+     '    legs += [(A_KMS_SIGN, sorted(t.kms_keys.values()), kms_context(mt))\n'
+     '             for mt in KMS_MESSAGE_TYPES[1:]]',
+     '    legs += []',
+     "digest_only_signing_grant or both_kms_message_types_are_simulated "
+     "or reported_leg_count"),
+    (69, "多腿判定用裸 dict.update（后一腿的 implicitDeny 覆盖前一腿的 allowed）", SCRIPT,
+     '        if base.get(key) != "allowed":\n            base[key] = decision',
+     '        base[key] = decision',
+     "raw_only_signing_grant"),
 ]
 
 
