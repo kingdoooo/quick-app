@@ -199,7 +199,9 @@ fi
 FB_ACCOUNT="$(read_cfg AWS account_id)"
 FB_EXPECTED="site-frontend-${FB_ACCOUNT}.s3.us-east-1.amazonaws.com"
 FB_DEPLOYED="$(awk -F'"' '/^FRONTEND_BUCKET_DOMAIN = "/ {print $2; exit}' "$TMP/index.py")"
-if [ -z "$FB_DEPLOYED" ]; then
+if ! [[ "$FB_ACCOUNT" =~ ^[0-9]{12}$ ]]; then
+  fail "router/config.ini 的 [AWS] account_id 不是 12 位数字（读到 '${FB_ACCOUNT}'）—— 值为空或被整行注释吞掉；这不是「换了账号」，先修 config 再跑闸门"
+elif [ -z "$FB_DEPLOYED" ]; then
   fail "产物里找不到 FRONTEND_BUCKET_DOMAIN 的赋值 —— 注入点被删或改名，Edge 取不到任何静态资源"
 elif [ "$FB_DEPLOYED" = "$FB_EXPECTED" ]; then
   echo "PASS  FRONTEND_BUCKET_DOMAIN == ${FB_EXPECTED}"

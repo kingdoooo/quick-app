@@ -560,3 +560,15 @@ def test_frontend_bucket_block_strips_an_inline_comment_from_the_account_id(env)
         f'FRONTEND_BUCKET_DOMAIN = "{_fb_domain(FB_ACCOUNT)}"\n', encoding="utf-8")
     rc, out = _run(FB_BLOCK, env, prelude=READ_CFG)
     assert rc == 0, out
+
+
+def test_frontend_bucket_block_reds_with_an_accurate_message_when_the_account_is_malformed(env):
+    """账号为空 / 被整行注释吞掉时，期望值会变成 `site-frontend-.s3…`——照样红，但原先的文案说的是
+    「换了账号没重部」，指错方向。现在先断 12 位数字形态，消息直指 config。"""
+    for bad in ("account_id = # 111122223333", "account_id ="):
+        (env["root"] / "router" / "config.ini").write_text(f"[AWS]\n{bad}\n", encoding="utf-8")
+        (env["art"] / "index.py").write_text(
+            f'FRONTEND_BUCKET_DOMAIN = "{_fb_domain(FB_ACCOUNT)}"\n', encoding="utf-8")
+        rc, out = _run(FB_BLOCK, env, prelude=READ_CFG)
+        assert rc != 0, (bad, out)
+        assert "12 位数字" in out and "换了账号没重部" not in out, (bad, out)
