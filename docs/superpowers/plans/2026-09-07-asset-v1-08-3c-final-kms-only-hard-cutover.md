@@ -573,8 +573,9 @@ def test_non_canonical_trailing_bits_in_signature_are_rejected():
 
 
 def test_signature_length_check_precedes_rsa_verify(monkeypatch):
-    """变形：把长度检查去掉后，一个 255 字节的签名会交给 cryptography（它也会拒）。这里只钉住
-    "长度不等即拒且不调 verify"——防将来有人把它换成"补零后再验"。"""
+    """钉住的是 **verify_token 不补零**：255 字节的签名必须原样交到 `_rsa_verify`（它再拒）。
+    spy 在 `_rsa_verify` 的长度守卫**之前**就记下长度 ⇒ 本用例管不了那句守卫本身，
+    守卫由下面那条直接用例钉（执行时修订，见 SDD ledger Ruling R4）。"""
     calls = []
     orig = session._rsa_verify
 
@@ -583,6 +584,18 @@ def test_signature_length_check_precedes_rsa_verify(monkeypatch):
     monkeypatch.setattr(session, "_rsa_verify", spy)
     _verify(v._short_sig(_mint()))
     assert calls == [255]
+
+
+def test_rsa_verify_rejects_a_wrong_length_signature_without_calling_the_primitive():
+    """长度不等于模长 ⇒ 直接 False，**不调** RSA 原语（spec §5：不许交给 RSA 层"补零"）。
+    用一把假公钥：verify() 被调到就抛，所以本用例只在守卫存在时才能过。
+    （执行时补，见 SDD ledger Ruling R4）"""
+    class _Key:
+        key_size = 2048
+        def verify(self, *a, **kw):
+            raise AssertionError("长度不符时不许调到 RSA 原语")
+    for bad_len in (255, 257, 0):
+        assert session._rsa_verify(_Key(), b"x", b"\x00" * bad_len) is False
 
 
 # ---- 用途与受众 ----
@@ -1057,7 +1070,13 @@ Expected: 全绿，只有 `test_fixture_domain_matches_the_permissions_copy` 红
 
 - [ ] **Step 9: 变形自证（守卫真的会红）**
 
-临时把 `_rsa_verify` 里的 `if len(sig) != public_key.key_size // 8: return False` 注掉再跑 `test_signature_length_check_precedes_rsa_verify` 与 `RS_MUTATIONS` 的「签名少一字节」——前者必红；把 `if "crit" in header` 注掉，`test_crit_header_is_rejected_even_with_a_valid_signature` 必红。用 `git stash` 还原，不用 `git checkout --`。
+三处变形，每处只改一行；用 `git stash` 还原，不用 `git checkout --`：
+
+1. 把 `verify_token` 传给 `_rsa_verify` 的签名改成「补零到模长再验」（`sig = sig.rjust(public_key.key_size // 8, b"\x00")`）⇒ `test_signature_length_check_precedes_rsa_verify` 必红（`calls` 变成 `[256]`）。
+2. 把 `_rsa_verify` 里的 `if len(sig) != public_key.key_size // 8: return False` 注掉 ⇒ `test_rsa_verify_rejects_a_wrong_length_signature_without_calling_the_primitive` 必红（假公钥的 `verify()` 被调到即抛）。
+3. 把 `if "crit" in header` 注掉 ⇒ `test_crit_header_is_rejected_even_with_a_valid_signature` 必红。
+
+**别把第 2 条的变形配给第 1 条的 meta-test**：注掉 `_rsa_verify` 的长度守卫红不了它——spy 在守卫之前就记下了长度，且 cryptography 自己也会拒 255 字节的签名。同理 `RS_MUTATIONS` 的「签名少一字节」在两种实现下都是拒，配不了任何一条。（执行时修订，见 SDD ledger Ruling R4）
 
 - [ ] **Step 10: Commit**
 
@@ -1161,17 +1180,21 @@ def test_previous_is_loaded_and_ordered_after_current(tmp_path):
 
 @pytest.mark.parametrize("mutate,why", [
     (lambda t: t.replace("site_current = site-rs-v1", "site_current = site-hs-v1"), "HS kid 不再合法"),
-    (lambda t: t.replace("alg = RS256\n    key_arn = " + v.KEY_ARN[v.SITE_KID], "alg = HS256\n    key_arn = " + v.KEY_ARN[v.SITE_KID]), "alg 只许 RS256"),
+    (lambda t: t.replace("alg = RS256\nkey_arn = " + v.KEY_ARN[v.SITE_KID], "alg = HS256\nkey_arn = " + v.KEY_ARN[v.SITE_KID]), "alg 只许 RS256"),
     (lambda t: t.replace(v.KEY_ARN[v.SITE_KID], "alias/site-builder/session/site-rs-v1"), "alias 不接受"),
     (lambda t: t.replace(v.spki_hex(v.SITE_KEY), "abc"), "spki 必须 64 位 hex"),
     (lambda t: t.replace("[SessionKey:console-rs-v1]", "[SessionKey:console-rs-v2]"), "缺小节"),
     (lambda t: t.replace("site_current = site-rs-v1", "site_current ="), "缺 current"),
     (lambda t: t.replace("login_flow_secret_param = /site-builder/login-flow-secret", "login_flow_secret_param ="), "缺 login-flow"),
-    (lambda t: t + "\nsigner = current\n", "signer 键已删——出现即配置错"),
+    (lambda t: t.replace("[SessionKeys]", "[SessionKeys]\nsigner = current"), "signer 键已删——出现即配置错"),
     (lambda t: t.replace("[SessionKeys]", "[SessionKeys]\nlegacy_param = /site-builder/jwt-secret"), "legacy_param 键已删——出现即配置错"),
-    (lambda t: t.replace("[SessionKey:site-rs-v1]\n    alg = RS256", "[SessionKey:site-rs-v1]\n    alg = RS256\n    ssm_param = /x"), "RS 行不许带 ssm_param"),
+    (lambda t: t.replace("[SessionKey:site-rs-v1]\nalg = RS256", "[SessionKey:site-rs-v1]\nalg = RS256\nssm_param = /x"), "RS 行不许带 ssm_param"),
 ])
 def test_misconfiguration_raises_instead_of_falling_back(tmp_path, mutate, why):
+    # 三处变形的写法在执行时修订过（SDD ledger：Task 2 Step 1 笔误）：`RS` 经过 textwrap.dedent，
+    # 行首没有缩进 ⇒ 变形串里不能写 "\n    key_arn"（replace 会无操作，配置仍合法、raises 不触发）；
+    # `signer` 必须插在 `[SessionKeys]` 之后而不是追加到文本末尾（末尾属于最后一个 [SessionKey:*] 小节，
+    # `[SessionKeys]` 的 REMOVED_KEYS 检查看不到它）。
     with pytest.raises(sk.SessionKeysError):
         _load(tmp_path, mutate(RS)), why
 
@@ -1542,7 +1565,7 @@ git commit -m "feat(asset-v1/08): [SessionKeys] 只认 RS 行（key_arn + spki_s
   - `SIGNING_ALGORITHM = "RSASSA_PKCS1_V1_5_SHA_256"`、`KEY_SPEC = "RSA_2048"`、`KEY_USAGE = "SIGN_VERIFY"`、`MESSAGE_TYPE = "RAW"`
   - `class KeyMaterialMismatch(RuntimeError)`
   - `describe_public_key(kms, key_arn) -> tuple[bytes, str]`：`(DER, spki_sha256)`，含 DescribeKey 三项 + `load_public_key_der`（**不**比对配置指纹——`session_key_fingerprint.py` 用它算出指纹）
-  - `fetch_verified_public_key_der(kms, ref: KeyRef) -> bytes`：四项（KeySpec / KeyUsage / SigningAlgorithms 含 RSASSA_PKCS1_V1_5_SHA_256 / 指纹 == `ref.spki_sha256`），任一不符抛 `KeyMaterialMismatch`
+  - `fetch_verified_public_key_der(kms, ref: KeyRef) -> bytes`：四项（KeySpec / KeyUsage / SigningAlgorithms 含 RSASSA_PKCS1_V1_5_SHA_256 / 指纹 == `ref.spki_sha256`），任一不符抛 `KeyMaterialMismatch`（**按 key 汇总全部不符项后再抛**，不是遇到第一项就抛——Step 1 的 `test_precheck_keys_lists_every_mismatch…` 要求如此；两个函数共用私有 `_verified`。执行时修订，见 SDD ledger Ruling R10/R11）
   - `precheck_keys(kms, refs) -> None`：逐把 `fetch_verified_public_key_der`，汇总所有不符项后 `SystemExit`（与 `secrets_util.precheck_parameters` 同形：任何写之前调）
   - `public_key_loader(kms)`：返回 `get_public_key(key_arn, spki_sha256) -> RSAPublicKey`，容器内按 ARN 缓存；指纹不符抛 `KeyMaterialMismatch`（verifier 冷启动 fail closed）
   - `class KmsSigner(kms, key_arn, spki_sha256)`：可调用 `(signing_input: bytes) -> bytes`；首次调用先做一次 `GetPublicKey` 指纹自检；每次 `Sign` 断言响应 `KeyId == key_arn`；`MessageType=RAW`、`SigningAlgorithm=RSASSA_PKCS1_V1_5_SHA_256`；超过 `SIGNING_INPUT_MAX` 拒
@@ -1740,28 +1763,49 @@ def _describe_checks(meta: dict, key_arn: str) -> list:
     return problems
 
 
-def describe_public_key(kms, key_arn: str) -> tuple[bytes, str]:
-    """→ (DER SPKI, spki_sha256)。做 DescribeKey 的形态检查与公钥侧四项（session.load_public_key_der），
-    **不**与任何配置值比对——`scripts/session_key_fingerprint.py` 靠它算出要回填的指纹。"""
-    meta = kms.describe_key(KeyId=key_arn)["KeyMetadata"]
-    problems = _describe_checks(meta, key_arn)
-    if problems:
-        raise KeyMaterialMismatch(f"{key_arn}: " + "；".join(problems))
-    der = kms.get_public_key(KeyId=key_arn)["PublicKey"]
+def _verified(kms, key_arn: str, label: str, expect_fp: str | None = None) -> tuple[bytes, str]:
+    """四项校验的**唯一实现**（下面两个函数的共同体，spec §11.6 第 1 层）。**汇总**这把 key 的所有不符项后
+    以 `label` 为前缀抛一个 `KeyMaterialMismatch`（precheck 直接把它 str 进汇总 ⇒ Step 1 的"列出每一项不符"
+    成立）：
+
+    1. `_describe_checks`：DescribeKey 形态五项；
+    2. `GetPublicKey`——**必须包在 try 里**：真 KMS 对 pending-deletion / disabled 的 key 会拒 GetPublicKey
+       （DisabledException / KMSInvalidStateException），那不是"KMS 不可达"而是"这把 key 不能用"，得归成
+       `KeyMaterialMismatch`（否则 Task 11 的离线退化路径会把它误判成"读不到 KMS"）。只记类名与消息；
+    3. `load_public_key_der`：公钥侧四项（ValueError → 一条 problem）；
+    4. `expect_fp` 给定时比对指纹；不给 = `describe_public_key` 的算指纹用法，不与任何配置值比对。
+    """
+    problems = _describe_checks(kms.describe_key(KeyId=key_arn)["KeyMetadata"], key_arn)
+    der = fp = None
     try:
-        session.load_public_key_der(der)
-    except ValueError as exc:
-        raise KeyMaterialMismatch(f"{key_arn}: 公钥 SPKI 不合合同（{exc}）") from exc
-    return der, session.spki_sha256(der)
+        der = kms.get_public_key(KeyId=key_arn)["PublicKey"]
+    except Exception as exc:  # noqa: BLE001  pending-deletion / disabled / AccessDenied 都会抛
+        problems.append(f"GetPublicKey 失败：{type(exc).__name__}: {exc}")
+    if der is not None:
+        try:
+            session.load_public_key_der(der)
+        except ValueError as exc:
+            problems.append(f"公钥 SPKI 不合合同（{exc}）")
+        fp = session.spki_sha256(der)
+        if expect_fp is not None and fp != expect_fp:
+            problems.append(
+                f"KMS 公钥的 spki_sha256={fp} != 配置的 {expect_fp}——"
+                "config.ini 指的不是这把 key（或 key 被换过）")
+    if problems:
+        raise KeyMaterialMismatch(f"{label}: " + "；".join(problems))
+    return der, fp
+
+
+def describe_public_key(kms, key_arn: str) -> tuple[bytes, str]:
+    """→ (DER SPKI, spki_sha256)。DescribeKey 形态检查 + 公钥侧四项（session.load_public_key_der），
+    **不**与任何配置值比对——`scripts/session_key_fingerprint.py` 靠它算出要回填的指纹。"""
+    return _verified(kms, key_arn, key_arn)
 
 
 def fetch_verified_public_key_der(kms, ref) -> bytes:
-    """spec §11.6 第 1 层：DescribeKey 三项 + 指纹等值。任一不符抛 KeyMaterialMismatch。"""
-    der, fp = describe_public_key(kms, ref.key_arn)
-    if fp != ref.spki_sha256:
-        raise KeyMaterialMismatch(
-            f"{ref.kid}: KMS 公钥的 spki_sha256={fp} != 配置的 {ref.spki_sha256}——"
-            "config.ini 指的不是这把 key（或 key 被换过）")
+    """spec §11.6 第 1 层：DescribeKey 形态 + 公钥侧四项 + 指纹等值。任一不符抛 `KeyMaterialMismatch`
+    （以 `ref.kid` 标识，汇总全部不符项）。"""
+    der, _ = _verified(kms, ref.key_arn, ref.kid, expect_fp=ref.spki_sha256)
     return der
 
 
@@ -2061,11 +2105,12 @@ git commit -m "feat(asset-v1/08): verifier_env 按公钥装配 allowlist、signi
 - Modify: `site-builder/auth/tests/test_login_handler.py`
 - Modify: `site-builder/auth/tests/test_secret_loading.py`
 - Modify: `site-builder/auth/tests/test_edge_new_form_vector.py`（只改 allowlist 形态；Edge 侧在 Task 10 才能绿——本 Task 允许它红）
+- Modify: `site-builder/auth/tests/test_pkce.py`（**执行时补进本 Task 的清单，见 SDD ledger Ruling R12**：它测的是 login_handler 的登录流，而 Task 1 删掉 conftest 的 `*_KID_SECRET` 后它就 collection error，原 plan 里没有任何 Task 认领它。改法：`ENV` 加 `SESSION_KEYS_JSON` / `FIXTURE_ISSUER`、删 `SESSION_SIGNER`，`mint_session_jwt` 的 seam 换成 `mint_token`；两条"state 用会话密钥签"的 HS 负例换成 RS 等价性质——`_login_flow_sig` 零 KMS 调用且只读 `LOGIN_FLOW_SECRET_PARAM`、换 secret 后旧 state 不再验过 + 一条正对照。无 RS 类比的 HS 断言删掉并在报告里列出）
 - Create: `site-builder/auth/tests/test_fixture_session.py`
 - Create: `site-builder/auth/tests/test_signer_guard.py`
 - Delete: `site-builder/auth/tests/test_signer_switch_guard.py`
 - Modify: `site-builder/auth/deploy_auth.py` **只改一行**：`AUTH_PACKAGE_MODULES = ("login_handler.py", "session.py", "verifier_env.py", "session_kms.py")`（其余 deploy_auth 改动在 Task 7；`test_deploy_auth_package.py` 的闭包断言要求本 Task 就加）
-- Test: `test_login_handler.py`、`test_fixture_session.py`、`test_signer_guard.py`、`test_secret_loading.py`、`test_deploy_auth_package.py`
+- Test: `test_login_handler.py`、`test_fixture_session.py`、`test_signer_guard.py`、`test_secret_loading.py`、`test_deploy_auth_package.py`、`test_pkce.py`（R12）
 
 **Interfaces:**
 - Consumes: `session.mint_token / verify_token / FIXTURE_*`、`session_kms.KmsSigner / public_key_loader`、`verifier_env.load_allowlist / signing_ref`。
@@ -2916,18 +2961,45 @@ def ensure_verifier_role(iam, verification: Verification, *, account: str, regio
         iam.update_assume_role_policy(RoleName=VERIFIER_ROLE_NAME, PolicyDocument=trust)
         iam.update_role(RoleName=VERIFIER_ROLE_NAME, MaxSessionDuration=3600)
     else:
+        # Description 别写"只许调 POST /fixture-session"：IAM 不能按 HTTP 路径限，Function URL 的 invoke 权限覆盖
+        # 每一个路径；"只能打 /fixture-session"是 handler 里那道调用者检查的事，不是这个角色的边界。
         iam.create_role(RoleName=VERIFIER_ROLE_NAME, AssumeRolePolicyDocument=trust, MaxSessionDuration=3600,
-                        Description="site-builder acceptance verifier - may only call POST /fixture-session on the auth function")
+                        Description="site-builder acceptance verifier - may invoke only the auth Function URL"
+                                    " (any path); the /fixture-session restriction is enforced by the handler")
     iam.put_role_policy(RoleName=VERIFIER_ROLE_NAME, PolicyName="invoke-auth-function-url",
-        PolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": [
-            {"Sid": "InvokeAuthUrl", "Effect": "Allow", "Action": "lambda:InvokeFunctionUrl",
-             "Resource": fn_arn, "Condition": {"StringEquals": {"lambda:FunctionUrlAuthType": "AWS_IAM"}}},
-            {"Sid": "InvokeAuthViaUrl", "Effect": "Allow", "Action": "lambda:InvokeFunction",
-             "Resource": fn_arn, "Condition": {"StringEquals": {"lambda:FunctionUrlAuthType": "AWS_IAM"}}}]}))
+        PolicyDocument=json.dumps({"Version": "2012-10-17",
+                                   "Statement": _verifier_invoke_statements(fn_arn, verifier_arn)}))
     if not exists:
         import time; time.sleep(10)
     return f"arn:aws:iam::{account}:role/{VERIFIER_ROLE_NAME}"
+
+
+def _verifier_invoke_statements(fn_arn: str, verifier_arn: str) -> list:
+    """两条 invoke 语句的 Action 与 Condition **从共享渲染器推导**（Task 6 的
+    `function_url_policy.expected_projection`，import 为 `function_url_projection`），不在这里手写第二份。
+
+    `lambda:InvokeFunctionUrl` 配 `StringEquals lambda:FunctionUrlAuthType=AWS_IAM`，
+    `lambda:InvokeFunction` 配 **`Bool lambda:InvokedViaFunctionUrl=true`**——操作符是 `Bool` 不是
+    `StringEquals`，条件键也不同。identity 侧与 resource 侧的实际授权是两者求交，把第二条也写成
+    `FunctionUrlAuthType` 看着很对，但那个键在 `InvokeFunction` 上不产生 ⇒ 条件永不满足 ⇒ verifier 调用 403，
+    而两侧单测各自都绿。传 `verifier_arn` 只为过渲染器那条精确 role ARN 校验，Principal 由本函数丢弃
+    （identity policy 没有 Principal）。
+    """
+    out = []
+    for _sid, (_effect, action, _principal, triples) in function_url_projection(verifier_arn).items():
+        cond: dict = {}
+        for op, key, val in triples:
+            cond.setdefault(op, {})[key] = val
+        sid = "InvokeAuthUrl" if action == "lambda:InvokeFunctionUrl" else "InvokeAuthViaUrl"
+        out.append({"Sid": sid, "Effect": "Allow", "Action": action, "Resource": fn_arn, "Condition": cond})
+    return out
 ```
+
+（执行时修订，见 SDD ledger Task 7 review Important 1 + Ruling R15：plan 原文把两条语句都写成
+`StringEquals lambda:FunctionUrlAuthType`，第二条的条件键错 ⇒ 部署出去 verifier 必 403；且那是
+`function_url_policy` 已有形态的第二份手抄。修法要求从渲染器派生，并对两条 `Condition` 逐字断言。
+`Description` 同时改掉"只许调 POST /fixture-session"那句——IAM 不能按路径限，路径限制由 handler 里的
+调用者检查执行。）
 
 （d）`lambda_env()`：删 `LEGACY_ENTRY` / `SESSION_SIGNER` / `JWT_SECRET_PARAM` 三处；`"SESSION_KEYS_JSON": env_json(keys, ("site", "console"))` 不变；加 `"FIXTURE_ISSUER": "on" if read_verification(cfg(), account=cfg()["Platform"]["account_id"]).fixture_issuer else "off"`。docstring 里 "JWT_SECRET 泄漏尤其致命…" 那段改为一句"会话签名密钥在 KMS 里，环境变量只有 kid / key_arn / spki_sha256"。
 
@@ -3157,7 +3229,9 @@ def test_deploy_refuses_a_fixture_domain_admin_seed_or_admin_row(aws, monkeypatc
         dp.assert_no_fixture_admins(ddb, "site-admins", "ops@example.test")
 ```
 
-`_expected_panel_ssm_suffixes` 等只服务已删用例的助手一并删。`test_deploy_panel_sequence.py` 里若有对 `precheck` 用 FakeSSM 的用例，改成 monkeypatch `dp._kms`。`deployer/tests/test_redeploy_targets.py::test_vendor_map_matches_the_hardcoded_snapshot` 的快照加 `session_kms.py → {auth, panel}`（`which_targets_to_redeploy.py` 按 `AUTH_PACKAGE_MODULES` / `COPY_FILES` 的 AST 自动推导，快照是手写的对照）。
+`_expected_panel_ssm_suffixes` 等只服务已删用例的助手一并删。`test_deploy_panel_sequence.py` 里若有对 `precheck` 用 FakeSSM 的用例，改成 monkeypatch `dp._kms`。
+
+（执行时修订：原文这里还有一条"`deployer/tests/test_redeploy_targets.py::test_vendor_map_matches_the_hardcoded_snapshot` 的快照加 `session_kms.py → {auth, panel}`"——**那条是错的，不要做**。`which_targets_to_redeploy.vendor_map()` 的键只来自 `deployer/functions/*.py`（deployer 打整个目录，三份复制清单再往上加组件），而 `session_kms.py` 住在 `auth/`，永远不会出现在那张表里；`auth` / `panel` 的牵连由 `DIR_RULES` 的目录规则给。见 SDD ledger Task 8 记录。另外本 Step 顺带补了 `deploy_panel.CFG_PATH` 与 conftest 的 `rs_config` 夹具——panel 的 deploy 类测试不得依赖 gitignored 的真 config。）
 
 - [ ] **Step 5: `auth/tests/test_requirements_locked.py` 扩到 panel（先红）**
 
@@ -3450,6 +3524,7 @@ git commit -m "feat(asset-v1/08): permissions——夹具域邮箱只许出现�
 - Modify: `router/infrastructure/lambda/origin_request.py`
 - Modify: `router/infrastructure/lambda/edge_substitutions.py`
 - Modify: `router/infrastructure/lambda/test_edge_kid_allowlist.py`（重写）、`test_edge_auth.py`、`test_edge_lazy_config.py`、`test_edge_access_log.py` / `test_origin_request.py` / `test_edge_route_cache.py`（只改 token 生成助手）
+- Modify: `router/infrastructure/lambda/test_edge_substitutions.py`（**执行时补进清单**：它的元用例按名字引用 `edge_substitutions.DEFAULTS` 里已删的 `JWT_SECRET` / `LEGACY_ENTRY` 键，Step 2 改完 DEFAULTS 后它必红）
 - Modify: `site-builder/panel/tests/test_frontend_contract.py`、`site-builder/deployer/tests/test_migrate_permissions.py`（它们经 `edge_substitutions` 加载 Edge——只需确认不再传 `JWT_SECRET` / `LEGACY_ENTRY`）
 - Test: router 套件（`cd router/infrastructure/lambda && ../../../site-builder/deployer/.venv/bin/pytest . -q`）+ `auth/tests/test_edge_new_form_vector.py`
 
@@ -3767,7 +3842,11 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 （报文措辞把"它是每个 kid 的签名密钥"改成"值不打印：形态由 stack.py 决定"。）
 
-（d）在 `BASE_DOMAIN = …` 之前加 RS 段（**与 session.py 逐字相同的四个函数**——从 session.py 复制粘贴，不手抄）：
+（d）加 RS 段（**与 session.py 逐字相同的七个函数**——从 session.py 复制粘贴，不手抄）。**落点由 Step 1 的两条守卫定，不是 `BASE_DOMAIN` 之前**（执行时修订）：
+
+- 整段必须落在 `def _site_allowlist` **之前**——`test_warmup_verify_happens_at_import_time_with_the_golden_triple` 取的 `top` 是 `SRC[:SRC.index("def _site_allowlist")]`，要求 `RS256_GOLDEN` 与 `.verify(` 都在里面。实测落点是配置常量段（`SITE_ALLOWLIST_JSON` / `_SITE_ALLOWLIST = None`）之后、`def _site_allowlist` 之前；`BASE_DOMAIN` 在文件里远在其后，按原文写会让那条守卫红。
+- `_load_public_key_der = load_public_key_der` 这行别名要放在 **`_aud_matches` 之后**（不是 `_rsa_verify` 与 `_aud_matches` 之间）：字节等价守卫的第七段用它作 Edge 侧的结束锚点（`("def _aud_matches", "def mint_token", "_load_public_key_der = load_public_key_der")`），第六段的 Edge 侧结束锚点是 `def _aud_matches`。放错位置两段一起红。
+- 七个函数之间**不许夹任何一行**（注释也算）——两侧逐字比对，注释算差异。
 
 ```python
 # 【片段】不是完整模块：插进正文所指的函数体 / 字典 / 调用点，缩进以落点为准
@@ -3811,12 +3890,11 @@ def _rsa_verify(public_key, signing_input: bytes, sig: bytes) -> bool:
     …（session.py 原文）…
 
 
-_load_public_key_der = load_public_key_der
-
-
 def _aud_matches(got, want: str) -> bool:
-    return isinstance(got, str) and got == want
+    …（session.py 原文）…
 
+
+_load_public_key_der = load_public_key_der      # 内部名别名；也是字节等价守卫最后一段的结束锚点
 
 # 黄金三元组（与 auth/session.py 字面相同）+ **import 期预热一次验签**（spec §11.1 / ADR 0003 的判据建立在
 # "库初始化 + 首次验签发生在 Init 阶段"上；材料坏了在 Init 就炸，与 spike 同形）。
@@ -3914,6 +3992,7 @@ git commit -m "feat(asset-v1/08): Edge 改 RS256 验签（vendored cryptography�
 
 **Files:**
 - Create: `router/infrastructure/lambda/requirements-edge.txt`
+- Modify: `router/infrastructure/requirements.txt`（**执行时补进清单，见 SDD ledger Ruling R18**：加 `cryptography==50.0.0`（与 auth / panel / `requirements-edge.txt` 同钉）。router venv 原先只有 CDK 依赖，而 Task 10 让 `edge_substitutions` 顶层 import 测试向量、部署模式 synth 又经 `session_kms` 真需要它 ⇒ **任何模式下 synth 都 import 不了 `cryptography`**。连带 Task 16：CLAUDE.md 的 venv 表与 DEPLOY.md「本机工具链」里"router venv 只有 CDK 依赖"那句要改）
 - Modify: `router/infrastructure/stack.py`
 - Modify: `router/infrastructure/lambda/test_stack_static.py`
 - Modify: `site-builder/auth/tests/test_requirements_locked.py`（守卫扩到 `stack.py` 与 `requirements-edge.txt`）
@@ -3921,8 +4000,9 @@ git commit -m "feat(asset-v1/08): Edge 改 RS256 验签（vendored cryptography�
 
 **Interfaces:**
 - Produces:
-  - `load_site_allowlist(keys, *, kms=None) -> str`（JSON；每行 `{"alg": "RS256", "spki_b64", "role"}`；非 RS 行任何模式都抛；KMS 失败默认让 synth 失败，`APP_SYNTH_OFFLINE=1` 才注 `SYNTH_PLACEHOLDER_ALLOWLIST_JSON`；`APP_SITE_ALLOWLIST_JSON` 显式覆盖仍在）
+  - `load_site_allowlist(keys, *, kms=None) -> str`（JSON；每行 `{"alg": "RS256", "spki_b64", "role"}`；非 RS 行任何模式都抛；KMS 失败默认让 synth 失败，`APP_SYNTH_OFFLINE=1` 才注 `SYNTH_PLACEHOLDER_ALLOWLIST_JSON`；`APP_SITE_ALLOWLIST_JSON` 显式覆盖仍在）。**`keys` 既可以是已加载的 `SessionKeys`，也可以是取值函数（thunk）**——`WebRouterStack` 传后者，见 Step 4 与 Ruling R17
   - `EDGE_REQUIREMENTS = Path(__file__).parent / "lambda" / "requirements-edge.txt"`；`vendor_edge_dependencies(target_dir: str) -> None`（pip `--require-hashes --platform manylinux2014_x86_64 --only-binary :all: --python-version 3.11 --implementation cp`）
+  - `SYNTH_ONLY_SENTINEL`（哨兵文件名）、`_synth_only_marker()`（标记字串的唯一来源 = 占位 allowlist 的那个 kid）、`_asset_is_synth_only(site_allowlist_json) -> bool`、`_write_synth_only_sentinel(target_dir)`（执行时新增，见 Step 4）
   - **删**：`load_jwt_secret`、`{{JWT_SECRET}}` / `{{LEGACY_ENTRY}}` 两处 `.replace`、`legacy_entry` import
   - `_session_keys_on_path()` / `_session_keys()` / `assert_edge_source_fully_injected` / `_synth_offline` 不变
 
@@ -4051,42 +4131,102 @@ def load_site_allowlist(keys, *, kms=None) -> str:
     第 1 层的四项校验（DescribeKey 三项 + 指纹 == config；session_kms.fetch_verified_public_key_der），任一不符
     **任何模式都抛**——那不是"读不到"，是配置指错了 key。**只取 site family，console 的公钥不进 Edge**
     （公钥不是秘密，但"接受哪些 key"本身就是授权边界）。
-    KMS 调用失败：默认让 synth 失败；只有显式 APP_SYNTH_OFFLINE=1 才注入带 SYNTH-ONLY 标记的占位 allowlist
-    并在 stderr 警告，该模板**绝不能部署**（verify_deployed_edge.sh 会抓到标记）。
+
+    `keys` 可以是已加载的 `SessionKeys`，**也可以是取值函数（thunk）**：`WebRouterStack` 传后者，因为
+    "只想看模板"的两条路（显式覆盖、显式离线）必须在 `[SessionKeys]` **根本加载不动**时仍然走得通——
+    切换窗口里 site-builder/config.ini 还是旧形态，急加载会让 `SessionKeysError` 在进本函数之前就抛。
+
+    三类失败，三种处置（`_degrade` 是唯一退化点）：
+    1. **配置写错**——非 RS256 行、或 KMS 里的 key 与配置声明的不是同一把（`KeyMaterialMismatch`）：
+       **任何模式都抛**，绝不注占位；
+    2. **配置读不动 / 依赖装不上 / KMS 调不通**：默认让 synth 失败；只有显式 `APP_SYNTH_OFFLINE=1`
+       才注入带 SYNTH-ONLY 标记的占位 allowlist 并在 stderr 警告（该模板绝不能部署）。配置读不动那一路
+       重抛的类型仍是 `SessionKeysError`（调用方与闸门按它判"这是配置错，不是环境故障"）；
+    3. `APP_SITE_ALLOWLIST_JSON` 在场 ⇒ 用它，**根本不加载配置、不碰 KMS**。
+
+    `import session_kms` **刻意放在取公钥那一步里、不在函数顶部**：它拖着 cryptography 闭包，放顶部会让
+    "只想看模板"这条路死在 import 上，而那正是 R17 要保住的路。
     """
     _session_keys_on_path()
-    from session_keys import SYNTH_PLACEHOLDER_ALLOWLIST_JSON
-    import session_kms
+    from session_keys import SYNTH_PLACEHOLDER_ALLOWLIST_JSON, SessionKeysError
+
+    def _degrade(reason_cn: str, reason_en: str, exc: Exception, fix: str = "",
+                 *, as_config_error: bool = False) -> str:
+        way_out = ("离线只看模板请显式设 APP_SYNTH_OFFLINE=1（产物带 SYNTH-ONLY 标记、且不含 "
+                   "cryptography/，不可部署）或用 APP_SITE_ALLOWLIST_JSON 覆盖。")
+        if not _synth_offline():
+            if as_config_error:
+                raise SessionKeysError(f"{exc}——synth 拒绝生成模板，什么都不会部署。{way_out}") from exc
+            raise RuntimeError(f"{reason_cn}（{type(exc).__name__}: {exc}）——synth 拒绝生成模板，"
+                               f"什么都不会部署。{fix}" + way_out) from exc
+        print(f"WARNING: {reason_en} ({exc}); APP_SYNTH_OFFLINE=1 ⇒ injecting the SYNTH-ONLY "
+              "placeholder allowlist. DO NOT deploy this template.", file=sys.stderr)
+        return SYNTH_PLACEHOLDER_ALLOWLIST_JSON
+
     override = os.getenv("APP_SITE_ALLOWLIST_JSON")
     if override:
         text = override
     else:
-        site_refs = list(keys.allowlist("site"))
-        for ref in site_refs:
-            if ref.alg != "RS256":
-                raise ValueError(f"{ref.kid}: Edge 只支持 RS256 行（3c-final）")
         try:
-            kms = kms or __import__("boto3").client("kms", region_name="us-east-1")
-            allow = {ref.kid: {"alg": ref.alg,
-                               "spki_b64": session_kms.spki_b64(session_kms.fetch_verified_public_key_der(kms, ref)),
-                               "role": ref.role} for ref in site_refs}
-            text = json.dumps(allow, separators=(",", ":"))
-        except session_kms.KeyMaterialMismatch:
-            raise                                  # 配置指错 key：任何模式都不注占位
-        except Exception as exc:  # noqa: BLE001
-            if not _synth_offline():
-                raise RuntimeError(
-                    f"按 [SessionKeys] 从 KMS 取 site 公钥失败（{type(exc).__name__}: {exc}）——synth 拒绝生成模板，"
-                    "什么都不会部署。这是 cdk deploy 路径：先确认 deployer 栈已建 CMK、凭据有 kms:DescribeKey / "
-                    "GetPublicKey；离线只看模板请显式设 APP_SYNTH_OFFLINE=1（产物带 SYNTH-ONLY 标记，不可部署）"
-                    "或用 APP_SITE_ALLOWLIST_JSON 覆盖。") from exc
-            print(f"WARNING: could not fetch site public keys from KMS ({exc}); APP_SYNTH_OFFLINE=1 ⇒ "
-                  "injecting the SYNTH-ONLY placeholder allowlist. DO NOT deploy this template.", file=sys.stderr)
-            text = SYNTH_PLACEHOLDER_ALLOWLIST_JSON
+            site_refs = list((keys() if callable(keys) else keys).allowlist("site"))
+        except SessionKeysError as exc:
+            text = _degrade("读 [SessionKeys] 失败", "could not load [SessionKeys]", exc, as_config_error=True)
+            site_refs = None
+        if site_refs is not None:
+            for ref in site_refs:      # 已加载成功的行：非 RS256 是配置错，在 try 之外 ⇒ 任何模式都抛
+                if ref.alg != "RS256":
+                    raise ValueError(f"{ref.kid}: Edge 只支持 RS256 行（3c-final）")
+            try:
+                import boto3
+                import session_kms
+            except ImportError as exc:
+                text = _degrade("synth 取公钥要 boto3 与 cryptography（session_kms 的闭包）",
+                                "boto3/cryptography missing in the synth interpreter", exc,
+                                "先给 router/infrastructure/.venv 装 requirements.txt；")
+            else:
+                try:
+                    kms = kms or boto3.client("kms", region_name="us-east-1")
+                    allow = {ref.kid: {"alg": ref.alg,
+                                       "spki_b64": session_kms.spki_b64(
+                                           session_kms.fetch_verified_public_key_der(kms, ref)),
+                                       "role": ref.role} for ref in site_refs}
+                    text = json.dumps(allow, separators=(",", ":"))
+                except session_kms.KeyMaterialMismatch:
+                    raise                          # 配置指错 key：任何模式都不注占位
+                except Exception as exc:  # noqa: BLE001
+                    text = _degrade("按 [SessionKeys] 从 KMS 取 site 公钥失败",
+                                    "could not fetch site public keys from KMS", exc,
+                                    "这是 cdk deploy 路径：先确认 deployer 栈已建 CMK、凭据有 "
+                                    "kms:DescribeKey / GetPublicKey；")
     if "\'\'\'" in text or "\\" in text:
         raise ValueError("allowlist JSON 含三引号或反斜杠，注进三引号字符串会破坏 Edge 源码")
     json.loads(text)
     return text
+
+
+SYNTH_ONLY_SENTINEL = "SYNTH-ONLY-PLACEHOLDER-DO-NOT-DEPLOY.txt"
+
+
+def _synth_only_marker() -> str:
+    """SYNTH-ONLY 标记的**唯一来源**：占位 allowlist 的那个 kid（定义在 session_keys.py）。
+    不在这里抄第二份字面量——占位常量、哨兵、verify_deployed_edge.sh 的 grep 必须是同一个字符串。"""
+    _session_keys_on_path()
+    from session_keys import SYNTH_PLACEHOLDER_ALLOWLIST_JSON
+    return next(iter(json.loads(SYNTH_PLACEHOLDER_ALLOWLIST_JSON)))
+
+
+def _asset_is_synth_only(site_allowlist_json: str) -> bool:
+    """这份产物是不是"看得出不可部署"的那种：**注进去的** allowlist 带 SYNTH-ONLY 标记。
+    用包含而不是等值比：显式 `APP_SITE_ALLOWLIST_JSON` 里带上标记同样算"我知道这份不可部署"。"""
+    return _synth_only_marker() in site_allowlist_json
+
+
+def _write_synth_only_sentinel(target_dir: str) -> Path:
+    """跳过 vendoring 时往 asset 里放一个带标记的哨兵文件，让"缺依赖"在产物里看得见。"""
+    path = Path(target_dir) / SYNTH_ONLY_SENTINEL
+    path.write_text(f"{_synth_only_marker()}\n\n……（说明：allowlist 是占位、且没有交叉安装 "
+                    "cryptography 闭包，冷启动会 import 失败；不要部署它）\n", encoding="utf-8")
+    return path
 
 
 EDGE_REQUIREMENTS = Path(__file__).parent / "lambda" / "requirements-edge.txt"
@@ -4100,7 +4240,23 @@ def vendor_edge_dependencies(target_dir: str) -> None:
                     "--python-version", "3.11", "--implementation", "cp"], check=True)
 ```
 
-- `WebRouterStack.__init__`：`session_keys = _session_keys()`；`site_allowlist_json = load_site_allowlist(session_keys)`；替换链删 `.replace("{{JWT_SECRET}}", jwt_secret)` 与 `.replace("{{LEGACY_ENTRY}}", legacy_entry)`；写完 `index.py` 后、`Code.from_asset(temp_dir)` 之前加 `if not _synth_offline(): vendor_edge_dependencies(temp_dir)`。`import subprocess`。
+- `WebRouterStack.__init__`：`session_keys = _session_keys`（**不加括号——传函数本身**，见上面 thunk 那段与 Ruling R17）；`site_allowlist_json = load_site_allowlist(session_keys)`；替换链删 `.replace("{{JWT_SECRET}}", jwt_secret)` 与 `.replace("{{LEGACY_ENTRY}}", legacy_entry)`；写完 `index.py` 后、`Code.from_asset(temp_dir)` 之前加：
+
+```python
+# 【片段】不是完整模块：插进正文所指的落点
+if _asset_is_synth_only(site_allowlist_json):
+    _write_synth_only_sentinel(temp_dir)
+else:
+    vendor_edge_dependencies(temp_dir)
+```
+
+  `import subprocess`。**判据是注进产物的 allowlist 带不带 SYNTH-ONLY 标记，不是 `_synth_offline()` 那个旗标**
+  （执行时修订，见 SDD ledger Task 11 review Important 1）：按旗标判会开出第四种组合——旗标还留在 shell / CI
+  环境里（陈旧变量），而 config 已是 RS 形态、KMS 可达、四项校验通过 ⇒ 注进去的是**真** allowlist（产物没有
+  标记、看起来完全正常），却跳过了 vendoring ⇒ asset 里没有 `cryptography/` ⇒ **每次** Edge 冷启动 import 失败
+  = 所有子域 502，而 Edge 回滚要 10–20 分钟全球复制。「标记 ⇔ 不可部署」这条叙事在这里按**构造**维持：
+  跳过 vendoring 的那一支一定写标记哨兵，没有标记的那一支一定装依赖；带真 allowlist 而 pip 装不动时
+  `check=True` 让 synth 响亮失败（那种产物既没标记又缺依赖）。
 - 模块 docstring / 注释里 "JWT secret comes from SSM at deploy time" 之类改成 KMS 公钥。
 
 - [ ] **Step 5: 跑绿**
@@ -4114,9 +4270,13 @@ Expected: 全绿。`test_stack_edge_iam.py` 若 synth：需 `router/infrastructu
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)/router/infrastructure"
 rm -rf cdk.out && APP_SYNTH_OFFLINE=1 PATH=.venv/bin:$PATH npx -y aws-cdk@latest synth --quiet >/dev/null
-ls cdk.out/asset.*/ | head            # 离线模式：只有 index.py（不 vendoring）
+ls cdk.out/asset.*/                   # 离线模式：index.py + SYNTH-ONLY-PLACEHOLDER-DO-NOT-DEPLOY.txt，无 cryptography/
 grep -c 'SYNTH-ONLY-PLACEHOLDER' cdk.out/asset.*/index.py   # ≥ 1（占位，不可部署）
 ```
+
+离线产物里那个哨兵文件是 Step 4 的修订带来的（执行时修订：原文写"只有 index.py"）——跳过 vendoring 与写哨兵
+是同一支，所以离线 asset 一定是两个文件。这条离线 synth 也是 R17 的落地判据：它必须在 `[SessionKeys]`
+**还是旧形态、`load_session_keys` 必拒**的情况下跑得通（验证环境的真 config 到 Task 18 ★ 才回填）。
 
 真机 synth（含 vendoring 与 KMS 取公钥）在 Task 19 ★ 的 `cdk deploy` 里发生；`verify_deployed_edge.sh` 事后核对产物里有 `cryptography/` 目录与 site 公钥。
 
@@ -4126,7 +4286,7 @@ grep -c 'SYNTH-ONLY-PLACEHOLDER' cdk.out/asset.*/index.py   # ≥ 1（占位，�
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 bash site-builder/scripts/scan_staged_secrets.sh
-git add router/infrastructure/stack.py router/infrastructure/lambda/requirements-edge.txt router/infrastructure/lambda/test_stack_static.py site-builder/auth/tests/test_requirements_locked.py
+git add router/infrastructure/stack.py router/infrastructure/requirements.txt router/infrastructure/lambda/requirements-edge.txt router/infrastructure/lambda/test_stack_static.py site-builder/auth/tests/test_requirements_locked.py
 git commit -m "feat(asset-v1/08): router 栈按 KMS 四项校验注入 site 公钥（spki_b64）、synth 时按 hash 交叉装 Edge 依赖；删 load_jwt_secret 与 LEGACY_ENTRY 注入"
 ```
 
@@ -4686,13 +4846,16 @@ static 站点（fixtures/static-hello）、`require_login=True`、`allowed_users
 不再冒充任何真实 owner。绕过 MCP 直接起状态机（deploy_fixture.py 那条路，含 per-site 部署租约），
 所以 owner 可以是夹具域——MCP 建站的 owner 是 OAuth 身份，夹具域没有 OAuth 身份。
 
-三种起点都处理：不存在 / DELETED 墓碑 ⇒ 部署；存在但权限漂了 ⇒ 只收敛权限（经 permissions.set_access_policy，
-真源 + 投影原子写）；存在但 owner 不是夹具域 ⇒ 拒绝（有人占了这个 site_id，不覆盖别人的站点）。
+四种起点都处理：sites 行不存在 / DELETED 墓碑 / **路由行缺失** ⇒ 部署；存在但权限或**路由投影上的名单**
+漂了 ⇒ 收敛（经 permissions.set_access_policy，真源 + 投影原子写）；存在但 owner 不是夹具域 ⇒ 拒绝
+（有人占了这个 site_id，不覆盖别人的站点）。收敛后按**闸门自己那段查找**读回核对，核不到就响亮失败——
+否则操作者会被闸门指回一个刚说"没问题"的脚本（执行时修订，Ruling R20）。
 用不带路径的 python3 跑（CLAUDE.md）。
 """
 from __future__ import annotations
 
 import configparser
+import contextlib
 import os
 import sys
 from pathlib import Path
@@ -4702,26 +4865,60 @@ import boto3
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "site-builder" / "deployer" / "functions"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import common  # noqa: E402  subdomain_for（子域拼法的唯一定义，别在这里手拼 f"app-{site_id}"）
 import permissions  # noqa: E402
-from _session_mint import FIXTURE_SITE_ID, PROBE_EMAIL  # noqa: E402  两个字面量的唯一定义
+from _session_mint import FIXTURE_SITE_ID, PROBE_EMAIL, live_target  # noqa: E402  三者的唯一定义
 
 CONFIG_PATH = ROOT / "site-builder" / "config.ini"
 FIXTURE = "static-hello"
 
+# 键 → (小节, 选项, 默认)。permissions.py 与 common.py 按环境变量找表（与 E2E 的 _platform_env 同一批键）。
+_ENV_FROM_CONFIG = (
+    ("SITES_TABLE", "Deployer", "sites_table", "site-sites"),
+    ("ADMINS_TABLE", "Deployer", "admins_table", "site-admins"),
+    ("OPS_LOG_TABLE", "Panel", "ops_log_table", "site-ops-log"),
+    ("ROUTING_TABLE", "Platform", "routing_table", None),
+    ("BASE_DOMAIN", "Platform", "base_domain", None),
+    ("AWS_DEFAULT_REGION", "Platform", "region", "us-east-1"),
+)
 
-def _env_from_config(config_path: Path) -> None:
-    """permissions.py 按环境变量找表（与 E2E 的 _platform_env 同一批键）。"""
+# 小助手（各三五行，实现时按这些名字写）：`_site_row(ddb)` / `_route_row(ddb)` 读两张表的行（
+# ConsistentRead）；`_wanted_users()` = `[PROBE_EMAIL]`；`_site_needs_convergence(site)` 判真源上的
+# require_login / allowed_users；`_route_users_drifted(route)` 判**路由投影**上的名单（`live_target`
+# 不看名单，所以这一条要自己判）；`_gate_target(config_path)` 用 `live_target` 查一次、`SystemExit`
+# 时返回 None——收敛后的读回核对必须走闸门自己那段查找，否则会出现"本脚本说没问题、闸门说先跑本脚本"
+# 的死循环（执行时修订，Ruling R20）。
+
+
+@contextlib.contextmanager
+def _config_env(config_path: Path):
+    """把 config.ini 的表名/域名/区域**无条件**导成环境变量，退出时还原（同 E2E 的 `_platform_env`）。
+
+    **不用 `os.environ.setdefault`**（执行时修订，见 SDD ledger Task 12 review Important 1）：那会让
+    进程里已有的 `SITES_TABLE` / `ROUTING_TABLE` 等悄悄盖过 config.ini —— 而 CLAUDE.md 的硬约束是
+    "config.ini 是唯一取值来源"。症状是脚本去**别的账号/别的表**读写夹具站点，而它一切正常地退 0。
+    任一取值为空 ⇒ `SystemExit`，不从环境变量兜底。还原是因为本函数可被 import 调用（单测、验收编排），
+    留下进程级副作用会让同一进程里的另一个模块去错的表读数。
+    """
     cfg = configparser.ConfigParser(interpolation=None)
     cfg.read(config_path)
     if not cfg.sections():
         raise SystemExit(f"{config_path} 读空了——configparser 对缺失文件是静默的")
-    s = lambda sec, key, default=None: (cfg.get(sec, key, fallback=default) or "").split("#")[0].strip()
-    os.environ.setdefault("SITES_TABLE", s("Deployer", "sites_table", "site-sites"))
-    os.environ.setdefault("ADMINS_TABLE", s("Deployer", "admins_table", "site-admins"))
-    os.environ.setdefault("OPS_LOG_TABLE", s("Panel", "ops_log_table", "site-ops-log"))
-    os.environ.setdefault("ROUTING_TABLE", s("Platform", "routing_table"))
-    os.environ.setdefault("BASE_DOMAIN", s("Platform", "base_domain"))
-    os.environ.setdefault("AWS_DEFAULT_REGION", s("Platform", "region", "us-east-1") or "us-east-1")
+    want = {}
+    for key, section, option, default in _ENV_FROM_CONFIG:      # 模块级表：键 → (小节, 选项, 默认)
+        raw = cfg.get(section, option, fallback=default) or ""
+        want[key] = raw.split("#")[0].strip() or (default or "")
+    missing = sorted(k for k, v in want.items() if not v)
+    if missing:
+        raise SystemExit(f"{config_path} 里这些取值是空的：{missing}——回填后再跑"
+                         "（config.ini 是唯一取值来源，本脚本不从环境变量兜底）")
+    saved = {k: os.environ.get(k) for k in want}
+    os.environ.update(want)
+    try:
+        yield want
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
 
 
 def _deploy_default(fixture: str, owner: str, *, site_id=None, marker=None):
@@ -4736,34 +4933,46 @@ def _deploy_default(fixture: str, owner: str, *, site_id=None, marker=None):
 
 
 def ensure(config_path: Path = CONFIG_PATH, *, deploy=_deploy_default, ddb=None) -> dict:
-    _env_from_config(config_path)
-    ddb = ddb or boto3.client("dynamodb", region_name=os.environ["AWS_DEFAULT_REGION"])
-    item = ddb.get_item(TableName=os.environ["SITES_TABLE"], Key={"site_id": {"S": FIXTURE_SITE_ID}},
-                        ConsistentRead=True).get("Item") or {}
-    owner = item.get("owner", {}).get("S", "")
-    status = item.get("status", {}).get("S", "")
-    deployed = False
-    if item and status != "DELETED":
-        if not permissions.is_fixture_email(owner):
-            raise SystemExit(f"site_id {FIXTURE_SITE_ID} 已被 owner={owner!r} 占用，不是夹具域 @{permissions.FIXTURE_DOMAIN}"
-                             "——不覆盖别人的站点；换 FIXTURE_SITE_ID 或先处理那个站点")
-    else:
-        print(f"  部署常驻夹具站点 {FIXTURE_SITE_ID}（{FIXTURE}，owner {PROBE_EMAIL}）…")
-        deploy(FIXTURE, PROBE_EMAIL, site_id=FIXTURE_SITE_ID)
-        deployed = True
-        item = ddb.get_item(TableName=os.environ["SITES_TABLE"], Key={"site_id": {"S": FIXTURE_SITE_ID}},
-                            ConsistentRead=True).get("Item") or {}
-    want_users = [PROBE_EMAIL]
-    have_login = item.get("require_login", {}).get("BOOL")
-    have_users = [x.get("S", "") for x in item.get("allowed_users", {}).get("L", [])] \
-        if "L" in item.get("allowed_users", {}) else item.get("allowed_users", {}).get("S", "")
-    changed = False
-    if have_login is not True or sorted(have_users) != want_users if isinstance(have_users, list) else True:
-        permissions.set_access_policy(FIXTURE_SITE_ID, actor=PROBE_EMAIL, require_login=True, allowed_users=want_users)
-        changed = True
-    print(f"  夹具站点 {FIXTURE_SITE_ID}：deployed={deployed} permissions_changed={changed} "
-          f"→ https://app-{FIXTURE_SITE_ID}.{os.environ['BASE_DOMAIN']}/（只有 {PROBE_EMAIL} 能进）")
-    return {"deployed": deployed, "permissions_changed": changed}
+    """三种起点：不存在 / DELETED 墓碑 / 路由行缺失 ⇒ 部署；权限或路由投影漂了 ⇒ 收敛；
+    owner 不是夹具域 ⇒ 拒绝。**最后按闸门自己那段查找读回核对**（执行时修订，Ruling R20）。"""
+    with _config_env(config_path) as env:
+        ddb = ddb or boto3.client("dynamodb", region_name=env["AWS_DEFAULT_REGION"])
+        site = _site_row(ddb)
+        if site and site.get("status", {}).get("S") != "DELETED":
+            owner = site.get("owner", {}).get("S", "")
+            if not permissions.is_fixture_email(owner):
+                raise SystemExit(f"site_id {FIXTURE_SITE_ID} 已被 owner={owner!r} 占用，不是夹具域 "
+                                 f"@{permissions.FIXTURE_DOMAIN}——不覆盖别人的站点；"
+                                 "换 FIXTURE_SITE_ID 或先处理那个站点")
+            live = True
+        else:
+            live = False
+        route = _route_row(ddb)                  # 路由投影是 Edge 的真源，**也要收敛**
+        deployed = False
+        if not live or not route:
+            why = "sites 行缺失或已是墓碑" if not live else "路由行缺失（只有部署路径会建它）"
+            print(f"  部署常驻夹具站点 {FIXTURE_SITE_ID}（{FIXTURE}，owner {PROBE_EMAIL}）：{why}…")
+            deploy(FIXTURE, PROBE_EMAIL, site_id=FIXTURE_SITE_ID)
+            deployed = True
+            site, route = _site_row(ddb), _route_row(ddb)
+        changed = False
+        if _site_needs_convergence(site) or _route_users_drifted(route) or _gate_target(config_path) is None:
+            permissions.set_access_policy(FIXTURE_SITE_ID, actor=PROBE_EMAIL, require_login=True,
+                                          allowed_users=_wanted_users())
+            changed = True
+        if _gate_target(config_path) is None:    # 读回核对：**用闸门自己那段查找**（`_session_mint.live_target`）
+            route = _route_row(ddb)
+            # 整行打出来，不在这里逐个点名字段：闸门的判据只有它自己那一份定义，
+            # 本脚本复述任何一个字段名都会变成第二份判据。
+            raise SystemExit(
+                f"收敛之后闸门在路由表里仍然找不到 {common.subdomain_for(FIXTURE_SITE_ID)}"
+                f"（当前那行：{route or '不存在'}）——常见原因是权限事务的投影那一半没写成"
+                "（返回 route_synced=False，真源已写、路由没写）。先看这条路由行是否存在、"
+                "是否被别的写入方踩过，再重跑本脚本")
+        print(f"  夹具站点 {FIXTURE_SITE_ID}：deployed={deployed} permissions_changed={changed} "
+              f"→ https://{common.subdomain_for(FIXTURE_SITE_ID)}.{env['BASE_DOMAIN']}/"
+              f"（只有 {PROBE_EMAIL} 能进）")
+        return {"deployed": deployed, "permissions_changed": changed}
 
 
 def main() -> int:
@@ -4851,6 +5060,7 @@ git commit -m "feat(asset-v1/08): 验收身份改夹具签发器（assume site-b
 - Modify: `site-builder/scripts/verify_account_trust_boundary.py`
 - Modify: `site-builder/deployer/tests/test_verify_account_trust_boundary.py`
 - Modify: `site-builder/deployer/tests/test_blind_spot_coverage.py`（只在它引用被删符号时）
+- Modify: `site-builder/scripts/metamorphic_trust_boundary.py`（**执行时补进清单，见 SDD ledger Ruling R21**：闸门守卫的变形/元测试 harness，威胁模型文档与 merged review §9 引它作证据，原 plan 里没有任何 Task 认领它。改法：删/替换 5 条已过时的变形（HS 层与迁移通道那批），加 KMS 层变形（`kms-sign` / `kms-self-authorize` grant、`_compare_kms` 漂移、`assert_edge_artifacts` 三条各一），本地跑到 exit 0。**它运行时会临时改工作树，所以要在 review 之后串行做**）
 - Modify: `.gitignore`（`site-builder/scripts/account_trust_baseline.json`）；`git rm --cached` 该文件（D1）
 - Test: `deployer/tests/test_verify_account_trust_boundary.py`、`test_blind_spot_coverage.py`、`test_verify_script_exit_contracts.py`
 
@@ -4858,7 +5068,7 @@ git commit -m "feat(asset-v1/08): 验收身份改夹具签发器（assume site-b
 - Consumes: `session_keys.load_session_keys / key_refs`（RS 行）、`session_kms.describe_public_key`。
 - Produces（脚本内部与测试依赖）:
   - `BASELINE_SCHEMA = 6`；`load_baseline(path)`：不存在 ⇒ `{"schema": 6, "principals": {}, ...空分节}` 并在 stderr 说明"没有基线：只能 `--update-baseline` 生成，不能出结论"；`schema != 6` ⇒ `SystemExit`（无迁移通道，指示删掉重生成）
-  - 动作类：`A_KMS_SIGN = ("kms:Sign",)`、`A_KMS_SELF_AUTHORIZE = ("kms:PutKeyPolicy", "kms:CreateGrant")`；`ACTIONS_OTHER = A_READ_PARAM + A_KMS_SIGN + A_KMS_SELF_AUTHORIZE`（`A_READ_OBJECT` 与 `A_READ_CODE` 删——Edge 产物与 asset 不再承载密钥）；`simulate()` 对 `ACTIONS_OTHER` 那组带 `ContextEntries`（`kms:SigningAlgorithm=RSASSA_PKCS1_V1_5_SHA_256`、`kms:MessageType=RAW`，字符串类型）
+  - 动作类：`A_KMS_SIGN = ("kms:Sign",)`、`A_KMS_SELF_AUTHORIZE = ("kms:PutKeyPolicy", "kms:CreateGrant")`；`ACTIONS_OTHER = A_READ_PARAM + A_KMS_SIGN + A_KMS_SELF_AUTHORIZE`（`A_READ_OBJECT` 与 `A_READ_CODE` 删——Edge 产物与 asset 不再承载密钥）；`simulate()` 对 `ACTIONS_OTHER` 那组带 `ContextEntries`（`kms:SigningAlgorithm=RSASSA_PKCS1_V1_5_SHA_256`、`kms:MessageType=RAW`，字符串类型）。**`kms:Sign` 还要按 `kms:MessageType` 的另一个取值再模拟一腿（`DIGEST`），两腿的判定取并集**（`merge_allowed`，allowed 优先）——**执行时补，见 SDD ledger 终审 Important 1**：只喂合同值 `RAW` 时，一条 `StringEquals kms:MessageType: DIGEST` 的 `kms:Sign` 语句会被模拟器判成 implicit deny 而漏报，而 PKCS#1 v1.5 下调用方在本地先 hash 再走 DIGEST 签出的字节与 RAW 逐字节相同 ⇒ 那是**真实的冒充能力**。裸 `dict.update` 在多腿下是错的：后一腿的 implicitDeny 会抹掉前一腿的 allowed（假绿）。`KMS_MESSAGE_TYPES` 以合同值开头（闸门必须测平台真正走的那条路）。进度输出报的腿数由这张表派生，不要写死"2 次"
   - grant：`G_KMS_SIGN = "kms-sign"`（`:<kid>`）、`G_KMS_SELF_AUTHORIZE = "kms-self-authorize"`（`:<kid>`）、`G_READ_LOGIN_FLOW` 不变；`is_secret_grant(g)` = `g.startswith("kms-sign:") or g.startswith("kms-self-authorize:")`；**删** `G_READ_EDGE_CODE / G_READ_EDGE_ASSET / G_READ_JWT_PARAM / SECRET_GRANTS / G_READ_SESSION_KEY / JWT_PARAM_NAME / LABEL_LEGACY / check_legacy_param`
   - `Targets`：**删** `edge_code_arns / edge_assets / jwt_parameter / session_key_parameters`；**加** `kms_keys: dict[str, str]`（kid → key ARN）；`other_resources()` = kms key ARN ∪ login-flow 参数 ARN
   - `undecided_resource_class`：kms key ARN → `f"kms-key:{kid}"`；login-flow 不变；删 `jwt-param` / `session-key:` / `edge-asset` / `edge-code`
@@ -5219,6 +5429,11 @@ def assert_edge_artifacts(code_hits: dict, asset_hits: dict, *, site_kids, conso
 
 ```python
 def _compare_kms(rep: Report, base: dict, now: dict, *, new_keys: tuple, retired_keys: tuple) -> None:
+    """**逐字段比的清单由 `BUNDLE_SHAPE["kms"]["*"]` 派生，不在这里手写**（执行时修订，见 SDD ledger
+    Task 13 review Important 2）：手写那一份在有人给快照加第七个字段时不会跟着变，于是新字段进了观测
+    与基线却从不参与比较——而"多了一个字段"与"那个字段没变过"在输出上一模一样，正是本文件被反复
+    点名的那类 false-green。`grants` 从标量清单里剔掉、单独按排序后的集合比。"""
+    scalars = [k for k in BUNDLE_SHAPE["kms"]["*"] if k != "grants"]
     for kid in sorted(set(base) | set(now)):
         if kid not in base:
             (rep.migration_grants if kid in new_keys else rep.kms_drift).append(
@@ -5228,7 +5443,7 @@ def _compare_kms(rep: Report, base: dict, now: dict, *, new_keys: tuple, retired
             (rep.migration_grants if kid in retired_keys else rep.kms_drift).append(
                 f"kms {kid}：消失" + ("（--retire-key 已声明）" if kid in retired_keys else "——未声明的 key 退场"))
             continue
-        for k in ("arn_fp", "key_policy_fp", "key_spec", "key_usage", "spki_sha256"):
+        for k in scalars:                       # 派生，不手写这五个名字
             if base[kid].get(k) != now[kid].get(k):
                 rep.kms_drift.append(f"kms {kid}：{k} 变了")
         if sorted(base[kid].get("grants", [])) != sorted(now[kid].get("grants", [])):
@@ -5778,6 +5993,7 @@ python3 site-builder/scripts/verify_account_trust_boundary.py --new-key site-rs-
 `verify_deployed_components.py` 的三方公钥对账（静态证据），第一次真机证明发生在 ③ 切换那一刻。这是刻意接受的代价：
 console family 的 verifier 只有 auth 与 panel（Edge 不持 console 公钥），切错的回滚是把 ③ 那两行 config 改回来重部两个
 Lambda，约 5 分钟、无 CloudFront 窗口。
+（**就位期没有正向探针这一条仍然成立；退役期的负向探针不同——那一条是有的**，见 ⑤ 与 SDD ledger Ruling R26。）
 
 ##### ③ 切换：两槽互换（= T1）
 
@@ -5785,6 +6001,16 @@ Lambda，约 5 分钟、无 CloudFront 窗口。
 重部一次只为把 current / previous 标签摆正（排空曲线要在 Edge 列上读）：
 
 ```bash
+# ⚠️ **换槽位之前先预存 console family 的负向探针**（执行时补，见 SDD ledger Ruling R26）：升级码永远由
+# console 的 **current** key 签（`_session_mint` 在 argparse 层就拒 `--role previous` 配 console-upgrade），
+# 所以"要退役的那把"只有在**这一刻**还是 current；换完槽位就再也签不出用旧 key 签的升级码了。
+# 这是整条 runbook 里唯一一处"晚了就补不回来"的取证。
+python3 site-builder/scripts/_session_mint.py --token-use console-upgrade --email probe@e2e.invalid \
+  --save rotation/console-v1-upgrade.json
+#   记录里 role 写的是 `current`——那是**诚实的**：签它的就是当时的 current key（即将退役的那把）。
+#   码的 TTL 只有 60 秒，到 ⑤ 早已过期，但那不妨碍这条证明：spec §5 的合同是 **kid 先于 exp**
+#   （`session.verify_token` 在 kid 不在 allowlist 时直接返回 `unknown_kid`，根本走不到过期判定）。
+#   **只在本轮真的要退役 console family 时才预存它**；同理只轮 console 时 site 那条 --save 也不要做。
 (cd site-builder/panel && python3 deploy_panel.py --skip-frontend)
 (cd site-builder/auth && python3 deploy_auth.py)
 python3 site-builder/scripts/verify_kid_entry_live.py --role current
@@ -5809,11 +6035,30 @@ exit 0 才算过。26 = 站点会话 TTL 24 h + Edge 全球复制 + 余量。
 python3 site-builder/scripts/_session_mint.py --token-use site-session --role previous --save rotation/site-v1.json   # 先预存负向探针
 ```
 
-`config.ini`：`site_previous =`，删 `[SessionKey:site-rs-v1]` 小节；`app.py` 删 `SiteSessionKeyRsV1` 那一项
-（RETAIN ⇒ key 留在账号里、脱离栈管理）。**auth → panel → Edge** 重部，等 Deployed，然后：
+**退役是按 family 各做一遍的**，两个 family 的动作不一样（Edge 只持 site 公钥）——**执行时修订：原文只写了
+site 那一路**（见 SDD ledger Task 16 fix round 2）：
+
+| 要退役的 family | `config.ini` | `app.py` | 重部 |
+|---|---|---|---|
+| **site** | `site_previous =`，删 `[SessionKey:site-rs-v1]` 小节 | 删 `SiteSessionKeyRsV1` 那**一整段**（`kms.Key` + `CfnOutput`） | **auth → panel → Edge**，等 CloudFront `Deployed` |
+| **console** | `console_previous =`，删 `[SessionKey:console-rs-v1]` 小节 | 删 `ConsoleSessionKeyRsV1` 那一整段 | **auth → panel**（Edge 不持 console 公钥 ⇒ 不用重部、没有 10–20 分钟窗口）|
+
+`RemovalPolicy.RETAIN` ⇒ 删掉 construct 只是让 key 脱离栈管理，key 与 alias 留在账号里；最后一步
+`schedule-key-deletion` 才真的删。**只轮一个 family 时只做那一行**：③ 的预存与下面的探针都只对**本轮真的
+在退役**的 family 有意义，拿一个仍在 allowlist 里的 kid 去跑探针会得到**假绿**。重部完之后：
 
 ```bash
-python3 site-builder/scripts/verify_kid_entry_live.py --retired-token .scratch/rotation/site-v1.json   # 必 302 且日志 unknown_kid
+# ① 真机负向：本轮退役了哪个 family 就带哪条 --retired-token（两个都退就都带）
+#    站点会话期望 302（Edge），升级码期望 401（panel）
+python3 site-builder/scripts/verify_kid_entry_live.py \
+  --retired-token .scratch/rotation/site-v1.json \
+  --retired-token .scratch/rotation/console-v1-upgrade.json
+# ② **HTTP 状态本身不是证据**（执行时修订，Task 16 fix round 2）：预存的 token 到这时早已过期，而"过期"与
+#    "kid 已退役"在两处都被压成同一个响应（Edge 都是 302 回登录，panel 的 UpgradeRejected 都是 401）
+#    ⇒ kid 其实还在 allowlist 里也会绿。分辨只能读埋点的 outcome：`unknown_kid` 那一行，
+#    **site 探针看 `edge` 列、console 探针看 `panel` 列**，本轮退役的 family 对应的那列必须 ≥ 1。
+#    （`expired` ≥ 1 而 `unknown_kid` 仍是 0 ⇒ 退役没生效，别继续往下走。）
+python3 site-builder/scripts/session_verify_counts.py --hours 1
 python3 site-builder/scripts/verify_account_trust_boundary.py --retire-key site-rs-v1
 python3 site-builder/scripts/verify_account_trust_boundary.py --retire-key site-rs-v1 --update-baseline
 # 不可逆：先读回 key 的描述核对账号与 alias，再排期删除（7–30 天窗口内仍可取消）
@@ -5821,13 +6066,19 @@ aws kms describe-key --key-id <site-rs-v1 的 key ARN> --query 'KeyMetadata.[Arn
 aws kms schedule-key-deletion --key-id <site-rs-v1 的 key ARN> --pending-window-in-days 7
 ```
 
+**console family 的真机负向探针靠 ③ 里预存的那枚升级码**（Ruling R26 修正了先前"码过期所以 401 证明不了什么、
+console 只能有静态证据"的裁定：`verify_token` 先查 kid 再查 exp，退役后过期的旧码仍得 `unknown_kid`）。
+**静态证据保留为补充，不是替代**：panel 的 allowlist 单测 + `verify_deployed_components.py` 的三方对账
+（退役 kid 同时不在 env、config 与 KMS 集合里）+ 闸门的 `--retire-key`。site 的负向探针**不能**替 console
+作证，反之亦然——两个 family 的 allowlist 各自独立注入。
+
 ##### 回滚一览
 
 | 出问题的步骤 | 回滚动作 | 要不要动 Edge |
 |---|---|---|
 | ② 就位 | `*_previous` 清空 → 重部三处 | 要 |
 | ③ 切换 | 两槽互换回去 → 重部 panel + auth | 不要 |
-| ⑤ 退役（删 key 之前） | 填回 `*_previous` + 小节 + construct → 重部三处 | 要 |
+| ⑤ 退役（删 key 之前） | **按本轮退役过的每个 family 各回一遍**：site → 填回 `site_previous` + 小节 + `SiteSessionKeyRsV1` construct，重部 auth → panel → Edge；console → 填回 `console_previous` + 小节 + `ConsoleSessionKeyRsV1`，重部 auth → panel。**回滚后对应的负向探针会失败**（旧 kid 又被接受了）——那是预期，不是新缺陷 | site 要，console 不要 |
 | ⑤ 退役（已 schedule-key-deletion） | 窗口内 `aws kms cancel-key-deletion`，否则建新 key 从 ① 重走 | 要 |
 | 代码本身有 bug | git 重部（`AUTH_PACKAGE_MODULES` / `COPY_FILES` 守卫先跑一遍） | 视改动 |
 
@@ -5845,12 +6096,24 @@ key 只在 ⑤ 的最后一步删。
 （e）`## 部署顺序总览`：箭头图改为
 
 ```
-①身份层 → ③DSQL → ④执行器（含两把 CMK）→ 回填 [SessionKeys] → ②路由层 → auth → ⑤部署MCP → ⑤b控制台 → 夹具站点 → ⑥客户端接入 → ⑦端到端彩排
+①身份层 → ③DSQL → ④执行器(第一次) → 回填 [SessionKeys] → ②路由层 → 回填 edge_role_arn → ④执行器(第二次) → auth → ⑤部署MCP → ⑤b控制台 → 夹具站点 → ⑥客户端接入 → ⑦端到端彩排
 ```
 
-并加一句"**② 与 auth 都依赖 ④ 的 CMK**：router 栈 synth 时从 KMS 取 site 公钥、auth / panel 部署前核对指纹。首次部署把 ② 挪到 ④ 之后；存量重部顺序不变（`MCP 先于执行器栈` 那条照旧）"。`### 存量站点迁移到 blue/green` 整节删。`验收` 相关处加 `python3 site-builder/scripts/ensure_fixture_site.py`（建常驻夹具站点；`[Verification] fixture_issuer = true` 时才有意义）与四个 `verify_*` 的前置说明（登录态来自夹具签发器，`[Verification]` 段与 `verifier_trusted_principals` 里要列本机凭据对应的 IAM ARN）。生产验签点那张表（`test_deploy_md_lists_every_production_session_verifier` 守着）：三行的函数名改 `verify_token`（auth `/console-session`、panel 升级码与面板会话）与 `_verify_session_jwt`（Edge）。`S1 加固` 一节里若引用 `ensure_session_keys` / `jwt-secret` 的行改掉。
+**（执行时修订，见 SDD ledger Task 16 review Important 1）：原文只把 ④ 挪到 ② 之前，那样写会成环——
+必须写成 ④ 部两次。** ② 与 auth / ⑤b 依赖 ④ 建的两把 CMK（router 栈 synth 时从 KMS 取 site 公钥、
+auth / panel 部署前核对 `spki_sha256`，不符即拒绝部署），而 ④ 的 step Lambda 又要 ② 产出的
+`edge_role_arn` ⇒ **全新账号上 ④ 要部两次**：④（只为建 CMK）→ 回填 `[SessionKeys]` → ② →
+回填 `edge_role_arn` → ④ 再一次。**漏掉第二次是无声的**（空 `EDGE_ROLE_ARN` 照过 synth 与部署，
+到第一次真实建站才炸），所以这一段要在箭头图下方明文写出来，不能只靠箭头。
+存量重部顺序不变（`MCP 先于执行器栈` 那条照旧）。`### 存量站点迁移到 blue/green` 整节删。`验收` 相关处加 `python3 site-builder/scripts/ensure_fixture_site.py`（建常驻夹具站点；`[Verification] fixture_issuer = true` 时才有意义）与四个 `verify_*` 的前置说明（登录态来自夹具签发器，`[Verification]` 段与 `verifier_trusted_principals` 里要列本机凭据对应的 IAM ARN）。生产验签点那张表（`test_deploy_md_lists_every_production_session_verifier` 守着）：三行的函数名改 `verify_token`（auth `/console-session`、panel 升级码与面板会话）与 `_verify_session_jwt`（Edge）。`S1 加固` 一节里若引用 `ensure_session_keys` / `jwt-secret` 的行改掉。
 
-（f）「本机工具链」：Python 一行加"host `python3` 不需要 cryptography（闸门脚本只用 boto3 + hashlib）"。
+（f）「本机工具链」：Python 一行加"host `python3` **需要** `cryptography`"——`deploy_auth` / `deploy_panel` /
+`verify_deployed_components` / `session_key_fingerprint.py` 与两个闸门现在 import 期就经 `session_kms` → `session`
+用它解析公钥、核对指纹。**（执行时修订，见 SDD ledger Ruling R14：plan 原文写的是"不需要 cryptography
+（闸门脚本只用 boto3 + hashlib）"，那是 3c-final 之前的事实，必须反转。）** 同时把宿主依赖三件套改成四件：
+`bootstrap_venvs.sh --host-deps`、CLAUDE.md「仓库外的几样东西」第 3 步、DEPLOY.md「本机工具链」三处同步
+（宿主上不钉版本；Lambda 产物里钉 50.0.0）。R18 连带：CLAUDE.md 的 venv 表与「本机工具链」里
+"router venv 只有 CDK 依赖"那句要改成"CDK 依赖 + `cryptography`（synth 期核对 KMS 公钥指纹）"。
 
 （g）散落处（survey 点名的行；行号会漂，按原文 grep）：`## 部署顺序总览` 里"②需要①产出的 JWT_SECRET（已在 SSM）…⑤b 需要…①的 jwt-secret"那句改成"② 与 auth / ⑤b 都需要 ④ 的两把 CMK（config 回填 `[SessionKeys]` 后才能部）"；`## 部署后回填检查清单` 里 `SSM /site-builder/jwt-secret 已创建` 与 `ensure_session_keys.py 已跑过` 两条删，换成 `[SessionKeys] 两个 [SessionKey:*-rs-v1] 小节已按 session_key_fingerprint.py 回填` 与（可选）`[Verification] 已配置且 ensure_fixture_site.py 已跑`；`## ② 路由 + 鉴权层` 的 step 5 注释"生成/复用 SSM /site-builder/jwt-secret"删、"stack.py 从 SSM 读密钥"那段改成"synth 时从 KMS 取 site 公钥并核对指纹，读不到即 synth 失败"；`router/config.ini.example` 里 "Create the keys with site-builder/scripts/ensure_session_keys.py … ten-step runbook" 两行改为 "Keys are KMS CMKs created by the deployer stack; the Edge only embeds site public keys (stack.py fetches them at synth). Rotation follows DEPLOY.md「轮转会话密钥（KMS）」"；`scripts/which_targets_to_redeploy.py` 的 `SEMANTIC_COUPLINGS` 注释里 "HS256 会话验签" 改 "RS256 会话验签"。
 
@@ -5933,7 +6196,19 @@ Expected: 第二条闸门 exit 0（与 Task 0 同样"与基线一致"）；**红
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 (cd site-builder/deployer/infra && rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest diff 2>&1 | tail -40)
-# diff 里必须只有：2 个 AWS::KMS::Key（新增）+ 2 个 AWS::KMS::Alias（新增）+ 2 个 Output（新增）。别的变化先停下解释。
+# diff 预期（执行时修订，见 SDD ledger Task 18 ★ Step 1）：2 个 AWS::KMS::Key（新增）+ 2 个 AWS::KMS::Alias
+# （新增）+ 2 个 Output（新增）+ **全部 step Lambda 的 Code（且只有 Code）**。别的变化先停下解释。
+#
+# 那批 Code 更新是本分支自己的改动，不是意外：Task 6 / 9 / 15 改了 `deployer/functions/` 下四个文件
+# （deploy_lambda_site / function_url_policy / permissions / register_route），而 `app.py` 把**整个**
+# functions/ 目录打进每一个 step Lambda 的产物（bundling 的与裸 from_asset 的都算）⇒ 每个 Lambda 的
+# asset S3Key 都变。核对方法：`git diff --stat <SHA0>..HEAD -- site-builder/deployer/functions`
+# 只应是那四个文件；要更硬的证据就下载线上任一 step Lambda 的产物，与 SHA0 的 worktree 逐字节比
+# （除那四个文件外应完全相同）。IAM 变化只应有两把 key 的 root 委派 key policy。
+#
+# 顺带（pre-existing，不属本票）：`from_asset` 没有 `exclude` ⇒ `functions/__pycache__` 会被打进产物，
+# asset hash 跨 worktree / 跨次不可复现，所以**每次** deployer 栈部署都会更新全部 step Lambda。
+# 功能无害（Python 按源文件 mtime/size 校验 .pyc），归后续工单（`exclude=["__pycache__"]`）。
 (cd site-builder/deployer/infra && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never)
 ```
 
