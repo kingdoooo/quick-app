@@ -29,7 +29,7 @@ Quick 自动化建站平台（Site Builder）：业务人员在任意支持 Skil
 
 - per-site IAM 的 `dsql:DbConnect` 是 `Resource: *`。DSQL 的租户隔离在 PG 层（per-site schema + 非 admin role），不在 IAM 层，这是既定设计而非残留。
 - 同名 cookie 遮蔽只关掉了 DoS，**没关身份混淆**：攻击者持有另一个**合法** token 时仍会先被取到。根治是 host-only 会话，独立成包。
-- **平台的安全边界是 AWS 账号本身，但面从"能读"收到了"能签或能改验签代码"**：账号内能 `kms:Sign` 两把 CMK（或能给自己授权）、能改 auth / panel 的代码或配置、能替换 CloudFront 正在执行的 Edge 版本的 principal 仍能冒充任意用户；只读级权限（`ReadOnlyAccess`）不再够——Edge 产物、bootstrap asset、SSM 里都只有公钥与 login-flow secret。数字与方法在 `docs/security/account-trust-boundary.md`，闸门是 `verify_account_trust_boundary.py`（KMS 层：`kms:Sign` / `PutKeyPolicy` / `CreateGrant` 持有者、key policy、grants、公钥指纹）。**别按 merged review 里 M09 第 2 步的原话去收窄 invoke，那是假修复。**
+- **平台的安全边界是 AWS 账号本身，但面从"能读"收到了"能签或能改验签代码"**：账号内能 `kms:Sign` 两把 CMK（或能给自己授权）、能改 auth / panel 的代码或配置、能替换 CloudFront 正在执行的 Edge 版本的 principal 仍能冒充任意用户；只读级权限（`ReadOnlyAccess`）不再够——Edge 产物与 bootstrap asset 里只有**公钥**，SSM 里只剩两把**对称**密钥（login-flow secret 与 `site-client-secret`），三者都签不出会话。数字与方法在 `docs/security/account-trust-boundary.md`，闸门是 `verify_account_trust_boundary.py`（KMS 层：`kms:Sign` / `PutKeyPolicy` / `CreateGrant` 持有者、key policy、grants、公钥指纹）。**别按 merged review 里 M09 第 2 步的原话去收窄 invoke，那是假修复。**
 
 **CodeBuild 那道隔断分两层，别记成"只有一条 flag"**：跑不可信站点依赖安装的 CodeBuild 角色对 bootstrap 桶零权限（S3 权限全集由 `deployer/tests/security_contracts.py` 按等值断言），但 `--ignore-scripts` 仍然必须留着，因为构建容器里任意代码执行仍能读 `validated/*`、写 `artifacts/*`。站点**自己的** `package.json` 生命周期脚本与 `backend/.npmrc` 由合同校验器在 CodeBuild **之前**就拒（`contract/redlines.py` 的 `NPM_LIFECYCLE_KEYS`）；**依赖里**的生命周期脚本**只有** `buildspec-package.yml` 的 `npm ci --ignore-scripts` 一道——合同的红线 8 拒的是 `file:` / git / URL 规格与非公共 registry 的 lockfile 条目（可复现性），registry 上的依赖照样能带 `preinstall`，所以那条 flag 不能去（实测：带 `preinstall` 的包打成本地 `.tgz` 作依赖，`npm install` 会执行它，加上 `--ignore-scripts` 不会；今天这种 `file:` 规格在 validate 就被拒，但结论对 registry 依赖同样成立）。
 
@@ -178,9 +178,21 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 
 ## 部署/重部署命令
 
+**下面是重部署顺序**（各组件已存在、config.ini 已回填）。**全新账号的首装顺序不同**：
+④ 与 ② 互为前置（② 要 ④ 的 CMK 公钥，④ 的 step Lambda 要 ② 的 `edge_role_arn`），所以
+**④ 要部两次**——④（只为建 CMK）→ 回填 `[SessionKeys]` → ② → 回填 `edge_role_arn` → ④ 再一次。
+漏掉第二次是无声的（空 `EDGE_ROLE_ARN` 照过，到第一次真实建站才炸），完整说明在
+`site-builder/DEPLOY.md`「部署顺序总览」。
+
 ```bash
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
+
+# 执行器（bundling 需要 Docker；两把会话签名 CMK 也在这个栈里）
+(cd site-builder/deployer/infra && rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never)
+
+# 首次 / 加 key 时：把两个 [SessionKey:*] 小节（含 spki_sha256）粘进 site-builder/config.ini
+python3 site-builder/scripts/session_key_fingerprint.py --from-stack
 
 # 路由层（改过 config.ini 必须先 rm -rf cdk.out，否则用陈旧 asset）
 # 依赖 ④ 的 CMK：synth 时从 KMS 取 site 公钥并核对 config 的 spki_sha256，取不到或不符即 synth 失败
@@ -189,12 +201,6 @@ cd "$(git rev-parse --show-toplevel)"
 python3 site-builder/scripts/router_stack_policy.py open
 (cd router/infrastructure && rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never)
 python3 site-builder/scripts/router_stack_policy.py apply
-
-# 执行器（bundling 需要 Docker；两把会话签名 CMK 也在这个栈里）
-(cd site-builder/deployer/infra && rm -rf cdk.out && PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never)
-
-# 首次 / 加 key 时：把两个 [SessionKey:*] 小节（含 spki_sha256）粘进 site-builder/config.ini
-python3 site-builder/scripts/session_key_fingerprint.py --from-stack
 
 # auth 服务（Lambda + Function URL + pre-token 触发器，幂等）
 (cd site-builder/auth && python3 deploy_auth.py)

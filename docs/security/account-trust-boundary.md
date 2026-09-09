@@ -7,7 +7,8 @@
 
 > **3c-final 之后：面从"能读密钥"收到了"能签 ∪ 能替换验签代码"。** 会话签名是 RS256，私钥在两把
 > KMS 非对称 CMK 里，三处 verifier 只持公钥。于是**读 Edge 产物 / 读 bootstrap asset / 读 SSM
-> 参数都不再进冒充面**——那三条路上现在只有公钥与 login-flow secret。留下的面是三类，**它们不是
+> 参数都不再进冒充面**——Edge 产物与 bootstrap asset 里只有**公钥**，SSM 里只剩两把**对称**密钥
+> （login-flow secret 与 `site-client-secret`），读到它们签不出任何会话。留下的面是三类，**它们不是
 > 同一个数字，别相加也别互相替代**：
 > ① **能签**——`kms:Sign` 两把 CMK 的 principal，加上能给自己授权的（`kms:PutKeyPolicy` /
 >   `kms:CreateGrant`）。闸门把这两类合成 `is_secret_grant`，表里那行叫「可签会话」。
@@ -129,7 +130,8 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 
 ## 密钥有三条路能拿到，三条都实测可用
 
-> **历史记录（HS256 形态）。** 3c-final 之后这三条路读到的**只有公钥**：私钥在 KMS 非对称 CMK 里、
+> **历史记录（HS256 形态）。** 3c-final 之后这三条路都不再交出能签会话的材料：Edge 产物与 bootstrap
+> asset 里只有**公钥**，SSM 里只剩 login-flow secret 与 `site-client-secret` 两把对称密钥。私钥在 KMS 非对称 CMK 里、
 > 任何组件的产物 / 环境变量 / SSM 里都没有能签会话的材料。整节保留是因为它记录了"为什么对称形态
 > 在共享账号里站不住"这条推导，而那正是非对称化的理由。**别把它当现状读**，现状在文件头的状态段。
 

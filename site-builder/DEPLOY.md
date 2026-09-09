@@ -400,6 +400,15 @@ Lambda，约 5 分钟、无 CloudFront 窗口。
 ```bash
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
+# ⚠️ **换槽位之前先预存 console family 的负向探针**：升级码永远由 console 的 **current** key 签
+# （`_session_mint` 在 argparse 层就拒 `--role previous` 配 console-upgrade），所以"要退役的那把"
+# 只有在**这一刻**还是 current。换完槽位就再也签不出用旧 key 签的升级码了。
+python3 site-builder/scripts/_session_mint.py --token-use console-upgrade --email probe@e2e.invalid \
+  --save rotation/console-v1-upgrade.json
+#   记录里 role 写的是 `current`——那是**诚实的**：签它的就是当时的 current key（即将退役的那把）。
+#   码的 TTL 只有 60 秒，到 ⑤ 早已过期，但 §5 的合同是 **kid 先于 exp**
+#   （`session.verify_token`：kid 不在 allowlist 直接返回 `unknown_kid`，根本走不到过期判定）
+#   ⇒ ⑤ 里那个 401 证明的是"kid 已退役"，与过期无关。
 (cd site-builder/panel && python3 deploy_panel.py --skip-frontend)
 (cd site-builder/auth && python3 deploy_auth.py)
 python3 site-builder/scripts/verify_kid_entry_live.py --role current
@@ -432,7 +441,10 @@ python3 site-builder/scripts/_session_mint.py --token-use site-session --role pr
 （`kms.Key` + `CfnOutput`；`RemovalPolicy.RETAIN` ⇒ key 留在账号里、脱离栈管理，alias 一并解绑）。**auth → panel → Edge** 重部，等 Deployed，然后：
 
 ```bash
-python3 site-builder/scripts/verify_kid_entry_live.py --retired-token .scratch/rotation/site-v1.json   # 必 302 且日志 unknown_kid
+# 两个 family 各一条真机负向：站点会话必 302（Edge），升级码必 401（panel），两者的日志都 outcome=unknown_kid
+python3 site-builder/scripts/verify_kid_entry_live.py \
+  --retired-token .scratch/rotation/site-v1.json \
+  --retired-token .scratch/rotation/console-v1-upgrade.json
 python3 site-builder/scripts/verify_account_trust_boundary.py --retire-key site-rs-v1
 python3 site-builder/scripts/verify_account_trust_boundary.py --retire-key site-rs-v1 --update-baseline
 # 不可逆：先读回 key 的描述核对账号与 alias，再排期删除（7–30 天窗口内仍可取消）
@@ -440,12 +452,15 @@ aws kms describe-key --key-id <site-rs-v1 的 key ARN> --query 'KeyMetadata.[Arn
 aws kms schedule-key-deletion --key-id <site-rs-v1 的 key ARN> --pending-window-in-days 7
 ```
 
-**console family 的退役证据是静态的，没有真机负向探针。** 夹具签发器只签站点会话（ADR 0002），而
-console 那条链路上唯一能预存的 token 是升级码、TTL 60 秒——26 小时排空跑完时它早已过期，那时的 401
-证明的是"过期"而不是"kid 已退役"，是一条会骗人的绿。所以 console family 退役后能拿到的证据是三层：
+**console family 的真机负向探针要靠 ③ 里预存的那枚升级码**——它必须在换槽位**之前**取（换完就签不出了），
+这是整条 runbook 里唯一一处"晚了就补不回来"的取证。**码过期不影响这条证明**：§5 的合同是 kid 先于 exp
+（`session.verify_token` 在 kid 不在 allowlist 时直接返回 `unknown_kid`，根本走不到过期判定），
+和 site family 那条负向探针依赖的是同一个顺序。
+
+**静态证据是补充，不是替代**（探针没预存时它只能证明"配置里没有了"，证明不了线上真的拒）：
 panel 的 allowlist 单测（退役 kid 不在 `SESSION_KEYS_JSON` 里）+ `verify_deployed_components.py` 的三方
 对账（退役 kid 同时不在 env、config 与 KMS 集合里）+ `verify_account_trust_boundary.py --retire-key console-rs-vN`
-（grant 与 coverage 成员的迁移被声明）。site family 的负向探针（上面那条 `--retired-token`）**不能**替它作证：
+（grant 与 coverage 成员的迁移被声明）。site family 的负向探针**不能**替 console 作证，反之亦然：
 两个 family 的 allowlist 是各自独立注入的。
 
 ##### 回滚一览
@@ -454,7 +469,7 @@ panel 的 allowlist 单测（退役 kid 不在 `SESSION_KEYS_JSON` 里）+ `veri
 |---|---|---|
 | ② 就位 | `*_previous` 清空 → 重部三处 | 要 |
 | ③ 切换 | 两槽互换回去 → 重部 panel + auth | 不要 |
-| ⑤ 退役（删 key 之前） | 填回 `*_previous` + 小节 + construct → 重部三处 | 要 |
+| ⑤ 退役（删 key 之前） | 填回 `*_previous` + 小节 + construct → 重部三处。**回滚后两条负向探针都会转绿失败**（旧 kid 又被接受了）——那是预期，不是新缺陷 | 要 |
 | ⑤ 退役（已 schedule-key-deletion） | 窗口内 `aws kms cancel-key-deletion`，否则建新 key 从 ① 重走 | 要 |
 | 代码本身有 bug | git 重部（`AUTH_PACKAGE_MODULES` / `COPY_FILES` 守卫先跑一遍） | 视改动 |
 
@@ -521,17 +536,28 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
 组件间有依赖，必须按序：
 
 ```
-①身份层 → ③DSQL → ④执行器（含两把 CMK）→ 回填 [SessionKeys] → ②路由层 → auth → ⑤部署MCP → ⑤b控制台 → 夹具站点 → ⑥客户端接入 → ⑦端到端彩排
- deploy_pool.py    cluster   SFN+Lambda        session_key_       CloudFront   deploy_   AgentCore   deploy_panel   ensure_      Skill+MCP        RUN_E2E
- (Task 3)          (Task 13) (Task 17)         fingerprint.py     (Task 8)     auth.py   (Task 20)   (二期 M3)      fixture_     (Task 22)        (Task 23)
-                                               --from-stack                                                        site.py
+①身份层 → ③DSQL → ④执行器(第一次) → 回填 [SessionKeys] → ②路由层 → 回填 edge_role_arn → ④执行器(第二次) → auth → ⑤部署MCP → ⑤b控制台 → 夹具站点 → ⑥客户端接入 → ⑦端到端彩排
+ deploy_pool.py    cluster   SFN+Lambda+两把CMK  session_key_       CloudFront   [Deployer]         同一条 cdk        deploy_   AgentCore   deploy_panel   ensure_      Skill+MCP        RUN_E2E
+ (Task 3)          (Task 13) (Task 17)           fingerprint.py     (Task 8)     edge_role_arn      deploy 再跑一次    auth.py   (Task 20)   (二期 M3)      fixture_     (Task 22)        (Task 23)
+                                                 --from-stack                                                                                              site.py
                                              ⑤c API Key（可选，二期 M4）· ⑤d 访问统计（二期 M5）
 ```
 
-**② 与 auth 都依赖 ④ 的 CMK**：router 栈 synth 时从 KMS 取 site 公钥、auth / panel 部署前核对指纹
-（`spki_sha256` 与 config 不符即拒绝部署）。所以首次部署把 ② 挪到 ④ 之后，中间插一步
-`session_key_fingerprint.py --from-stack` 回填 `[SessionKeys]`；**存量重部顺序不变**（下面
-「MCP 先于执行器栈」那条照旧）。①（`deploy_pool.py`）与 ③ 不依赖 CMK，仍可最先做。
+**全新账号上 ④ 要部两次，这不是笔误，是一个真实的环形依赖**：② 与 auth / ⑤b 依赖 ④ 建的两把 CMK
+（router 栈 synth 时从 KMS 取 site 公钥、auth / panel 部署前核对 `spki_sha256`，不符即拒绝部署），
+而 ④ 的十个 step Lambda 又依赖 ② 产出的 `edge_role_arn`（站点 Function URL 只授权那个角色）。
+拆法是**同一个栈部两次**：
+
+- **④ 第一次**——目的只是让两把 CMK 存在（`[Deployer] edge_role_arn` 此时还空着）。
+  **它不会报错**：synth 允许空字符串，栈会带着 `EDGE_ROLE_ARN=""` 部上去。
+- **② 路由层**——拿到 `edge_role_arn` 回填 `config.ini`。
+- **④ 第二次**——同一条 `cdk deploy`，这次十个 step Lambda 才拿到真的 `EDGE_ROLE_ARN`。
+
+**漏掉第二次是无声的**：`deploy_lambda_site.py` 只在环境变量**缺键**时 `KeyError`，空字符串照过，
+症状要等到**第一次真实建站**才出现（站点 Function URL 的 resource policy 授权给一个空 principal）。
+所以第二次部署不是"可选的收尾"，它和第一次一样是必做步骤。①（`deploy_pool.py`）与 ③ 不依赖 CMK，
+仍可最先做。**存量重部顺序不变**（下面「MCP 先于执行器栈」那条照旧，且存量环境的 `edge_role_arn`
+早已回填 ⇒ 不需要部两次）。
 
 ### ⚠️ 存量重部时顺序不同：**MCP 必须先于执行器栈**
 
@@ -558,7 +584,9 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
 **已经在跑的环境要单独升级到 M5，见下面的 `⑤d 访问统计` 一节——那里的顺序是硬依赖，
 反了不会报错，只会静默丢数据。**
 
-依赖关系：**② 与 auth / ⑤b 都需要 ④ 的两把 CMK**（`config.ini` 的 `[SessionKeys]` 回填之后才能部）；② 还需要 ① 的 edge role；④ 需要 ① 的 boundary、② 的 edge_role_arn、③ 的 DSQL endpoint；⑤ 需要 ④ 的 state_machine_arn 与 ① 的 Cognito；⑤b 另需 ② 的 edge_role_arn 与 ④ 的五张表（可选组件：不部署它只是没有控制台，站点与 MCP 通道不受影响）。
+依赖关系：**② 与 auth / ⑤b 都需要 ④ 的两把 CMK**（`config.ini` 的 `[SessionKeys]` 回填之后才能部）；② 还需要 ① 的 edge role；④ 需要 ① 的 boundary、**② 的 edge_role_arn**、③ 的 DSQL endpoint；⑤ 需要 ④ 的 state_machine_arn 与 ① 的 Cognito；⑤b 另需 ② 的 edge_role_arn 与 ④ 的五张表（可选组件：不部署它只是没有控制台，站点与 MCP 通道不受影响）。
+
+**④ 与 ② 互为前置 ⇒ 全新账号上 ④ 部两次**（第一次只为建 CMK，`edge_role_arn` 空着也能部完；② 之后回填再部第二次，十个 step Lambda 这时才拿到真值）。上面的箭头图与 ④ 那一节的「前置」写的是同一件事。
 
 ④ 建 `site-admins` 表，而 **admin 种子必须在 ④ 之后单独跑**（CDK 只建表不写
 数据，漏了则谁都不是 admin——见 ① 末尾）。
@@ -1566,7 +1594,16 @@ migrator role 能在本 schema 建表，但建其他 schema / 建角色 / 改 IA
 
 **产出**：jobs/sites 表、artifacts 桶、CodeBuild、状态机 `site-deploy`、10 个 step Lambda、undeploy Lambda、runtime boundary、exec role；回填 `config.ini [Deployer] state_machine_arn`。
 
-**前置**：`[Deployer] edge_role_arn`（来自②）、`[DSQL] cluster_endpoint`（来自③）必须已回填，否则站点 Function URL 授权与 DSQL 连接会失败。
+**前置**：`[DSQL] cluster_endpoint`（来自③）必须已回填。`[Deployer] edge_role_arn`（来自②）分两种情况：
+
+- **全新账号：本节要跑两次。** 第一次在 ② 之前跑（`edge_role_arn` 还空着），目的只是让两把会话签名 CMK
+  存在——② 的 synth 与 auth / panel 的部署前校验都要用它们的公钥。**空值不会让部署失败**（synth 允许空
+  字符串），但十个 step Lambda 会拿到 `EDGE_ROLE_ARN=""`，而 `deploy_lambda_site.py` 只在**缺键**时
+  `KeyError` ⇒ 症状要到第一次真实建站才出现。所以 ② 回填 `edge_role_arn` 之后**必须再跑一次本节的
+  `cdk deploy`**（同一条命令，幂等）。
+- **存量环境：`edge_role_arn` 早已回填，照常只部一次。**
+
+`[DSQL] cluster_endpoint` 缺失会让 DSQL 连接失败，那条没有两趟的说法。
 
 ```bash
 cd site-builder/deployer/infra
@@ -2503,7 +2540,7 @@ cd {仓库根}
 RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/test_e2e_fixtures.py -q
 ```
 
-预期 4 passed：static 200、notes 未登录 302 + 登录后 CRUD + author=飞书邮箱、expenses DSQL CRUD、undeploy 后 404。
+预期 9 passed：static 200、notes 未登录 302 + 登录后 CRUD + author=IdP 邮箱、expenses DSQL CRUD、undeploy 后 404 等。
 
 演示叙事（10 分钟）与故障预案见 plan Task 23。
 

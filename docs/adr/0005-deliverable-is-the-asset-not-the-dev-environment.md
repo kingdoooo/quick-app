@@ -27,7 +27,7 @@ AWS 托管策略 `ReadOnlyAccess` 就含 `ssm:Get*` 与 `lambda:GetFunction`，�
   "全新用户在全新账号上 clone，这段对他有意义吗"这道检查。**CLAUDE.md 在采用者那一层**：它是采用者的
   Agent 第一个读的文件，验证环境的"现在到哪了"（部署日期、时间线、当前配置形态）不得写在里面，
   只住 gitignored 的接手点文件与 spec 的状态列——否则每个后续 session 都被这些状态牵着走。
-- `account_trust_baseline.json` 与冒充面探针结果**将**移出 tracked（工单 08 执行——3c-final 的闸门改动落在同一处）；采用者首跑
+- `account_trust_baseline.json` 已随工单 08 移出 tracked（3c-final 的闸门改动落在同一处）；**冒充面探针结果 JSON 仍是 tracked，归工单 12**；采用者首跑
   `--update-baseline` 生成自己的。执行时要同时处理 `test_verify_account_trust_boundary.py` 里十余处直接读基线文件的
   断言与"新 clone 无基线"的闸门路径，否则 untrack 的那一刻套件与闸门都是 FileNotFoundError。
 - v1 的出口验收是在一个全新账号里只看 DEPLOY.md 从零部署并跑分发的验收集；通过才打 `v1.0.0`。

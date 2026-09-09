@@ -121,7 +121,7 @@ Amazon Quick / Kiro …）里用自然语言开发简易全栈站点，说一句
 （Lambda@Edge 与 CloudFront 用的 ACM 证书强制）、一个可改 DNS 的域名 + 该域名的
 `*.<域名>` ACM 通配符证书、一个身份源——飞书企业自建应用（需用户邮箱权限）**或**
 任意能提供 email claim 的标准 OIDC/SAML IdP——以及本机 Docker。会话签名用的两把
-KMS 非对称 CMK 由部署脚本自己创建（每把 $1/月 + `kms:Sign` 每万次 $0.03，只在登录 /
+KMS 非对称 CMK 由执行器（④）那个 CDK 栈创建（每把 $1/月 + `kms:Sign` 每万次 $0.03，只在登录 /
 换码路径调用），不需要预先准备。
 
 逐项要求与命令见 **[site-builder/DEPLOY.md](site-builder/DEPLOY.md) §0 前置要求**
