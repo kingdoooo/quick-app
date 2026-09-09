@@ -6,6 +6,7 @@ CloudFront-based dynamic subdomain routing system using Lambda@Edge and DynamoDB
 import os
 import configparser
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -294,6 +295,166 @@ def vendor_edge_dependencies(target_dir: str) -> None:
                     "--python-version", "3.11", "--implementation", "cp"], check=True)
 
 
+ACCOUNT_ID_PLACEHOLDER = "{account_id}"
+# 约定名（裁定 D-I10-1）。资产里有**四个生产方**把它写死，所以它不是可自由配置的键：
+#   ① deployer/infra/app.py  —— 执行器角色的 IAM 资源 ARN（`arn:aws:s3:::site-frontend-<acct>[/*]`）
+#   ② deployer/infra/app.py  —— 六个 step Lambda 的 `FRONTEND_BUCKET` 环境变量
+#   ③ panel/deploy_panel.py  —— 控制台前端上传的目标桶
+#   ④ scripts/verify_deployed_components.py —— 真机核对（含"桶上不许有 sites/ 过期规则"那条）
+# ②的消费方是 upload / undeploy / mark_job 三个 step。改桶名要同时改这四处，改这一个键不够。
+FRONTEND_BUCKET_CONVENTION = "site-frontend-" + ACCOUNT_ID_PLACEHOLDER
+_ACCOUNT_ID_RE = re.compile(r"^[0-9]{12}$")
+# S3 通用桶名的字符集与长度（3-63、小写字母/数字/`.`/`-`、首尾必须是字母或数字）。
+_BUCKET_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+_IPV4_LIKE_RE = re.compile(r"^[0-9]{1,3}(\.[0-9]{1,3}){3}$")
+
+
+def normalize_account_id(raw: str) -> str:
+    """`[AWS] account_id` 的**唯一**归一化点（工单 10 item 8）：→ 正好 12 位数字，否则抛。
+
+    本栈有三个消费方——前端桶名、埋点明细表的 DynamoDB 资源 ARN、栈的 `Environment`。此前三处各自
+    `config.get(...)`，而只有桶名那条会因为空值/垃圾**响亮**失败。埋点那条是**静默**的：账号为空时
+    ARN 渲染成 `arn:aws:dynamodb:{region}::table/…`，Edge 的 PutItem 全部 AccessDenied，
+    而埋点异常一律吞掉（统计不是安全控制）⇒ 那个区静默零数据，没有任何人会知道。
+
+    **只剥空白，行内注释一律拒**——与 `frontend_bucket`、`require_idp_claim`、`trusted_idps`
+    三个兄弟键同法。`ConfigLoader` 用裸 `ConfigParser`（`inline_comment_prefixes` 默认关），所以
+    `account_id = 000000000000  # 你的账号` 读出来带着那句注释。剥掉它等于替采用者猜意图，而
+    「猜对了」与「猜错了」在 synth 输出里长得一模一样；拒掉的话操作者看到的是一句"注释另起一行"。
+    """
+    account = (raw or "").strip()
+    if not account:
+        raise ValueError(
+            "[AWS] account_id 为空——它要拼进前端桶名、edge role 的 DynamoDB 资源 ARN 与栈的 "
+            "Environment。空值在桶名那条会响亮失败，但在埋点 ARN 上是**静默**的（PutItem 全部 "
+            "AccessDenied，而埋点异常一律吞掉 ⇒ 该区静默零数据）。先填 router/config.ini 的 "
+            "[AWS] account_id（12 位数字）。")
+    if "#" in account or ";" in account:
+        raise ValueError(
+            f"[AWS] account_id 含注释字符（当前 {account!r}）——configparser 会把行内注释并进值，"
+            "而账号里不会有 `#` 或 `;`。值里只放 12 位数字，注释另起一行。")
+    if not _ACCOUNT_ID_RE.fullmatch(account):
+        raise ValueError(
+            f"[AWS] account_id 必须是 12 位数字（剥掉两端空白后得到 {account!r}）——"
+            "它要拼进前端桶名与 IAM 资源 ARN，写错的后果一半响亮一半静默（见本函数 docstring）。")
+    return account
+
+
+def resolve_frontend_bucket(raw: str, account_id: str) -> str:
+    """`[SiteBuilder] frontend_bucket` → 真实桶名（merged review M17；裁定 D-I10-1）。
+
+    契约：**已归一化的 account 进、桶名出**（`account_id` 必须正好 12 位数字，归一化在
+    `normalize_account_id` 那一处做）。`{account_id}` 按它插值，与 site-builder 侧同一约定
+    （`[Deployer] frontend_bucket`，由 `smoke_router.sh` / `verify_analytics_e2e.py` 同法插值）
+    ⇒ 采用者在两份 config.ini 里都不必手填账号。
+
+    **插值后必须等于约定名 `site-frontend-<account_id>`**：与约定相同的字面量放行（已手填账号的
+    存量 config.ini 不用改），**其它字面量一律拒**。理由不是洁癖：桶名由上面 `FRONTEND_BUCKET_CONVENTION`
+    注释里的四个生产方写死，只改这一个键的结果是 Edge 去读一个**没人写过**的桶 ⇒ 每个静态资源 403，
+    而私有桶上"没权限"与"没这个对象"都是 403 ⇒ 最难诊断的那一类。
+
+    行内注释**按拒绝处理、不按剥离处理**——与 `normalize_account_id` 以及下面
+    `require_idp_claim` / `trusted_idps` 两个兄弟键同法（这三个键 + 本键显式拒注释；其余读取点没有注释处置）：
+    `ConfigLoader` 用裸 `ConfigParser`（`inline_comment_prefixes` 默认关），所以
+    `frontend_bucket = site-frontend-{account_id}  # 别改` 读出来的值里带着那句注释。剥掉它等于替
+    采用者猜意图；共享键本来就不许带注释（`deployer/tests/test_example_config_consistency.py` 有一条
+    专门的断言）。
+
+    每条拒绝都在 **synth 期**抛、什么都不部署：这个值同时进 `arn:aws:s3:::{bucket}/sites/*`（edge role
+    的读权限）与 Edge 源码里的 `FRONTEND_BUCKET_DOMAIN`，而 Edge 改一次要 10-20 分钟全球复制才能回滚。
+    """
+    bucket = (raw or "").strip()
+    account = account_id or ""
+    if not bucket:
+        raise ValueError(
+            "[SiteBuilder] frontend_bucket 为空——插出来的 `site-frontend-` 是个合法但不存在的桶名，"
+            "IAM 资源 ARN 与 Edge 的 FRONTEND_BUCKET_DOMAIN 照样渲染得出来（症状是每个静态资源 403）。"
+            f"填成 {FRONTEND_BUCKET_CONVENTION!r} 即可。")
+    if "#" in bucket or ";" in bucket:
+        raise ValueError(
+            f"frontend_bucket 含注释字符（当前 {bucket!r}）——configparser 会把行内注释并进值，"
+            "而桶名里不会有 `#` 或 `;`。值里只放桶名，注释另起一行。")
+    if not _ACCOUNT_ID_RE.fullmatch(account):
+        raise ValueError(
+            f"account_id 必须是已归一化的 12 位数字（当前 {account!r}）——本函数的契约是"
+            "「已归一化的 account 进、桶名出」，归一化只在 `normalize_account_id` 一处做，"
+            "这里**刻意不再洗一遍**（洗第二遍等于开第二条路径，两条会漂）。"
+            "调用方漏了归一化，或者 router/config.ini 的 [AWS] account_id 还没填。")
+    bucket = bucket.replace(ACCOUNT_ID_PLACEHOLDER, account)
+    if "{" in bucket or "}" in bucket:
+        raise ValueError(
+            f"frontend_bucket 插值后仍含占位符（当前 {bucket!r}）——只认 {ACCOUNT_ID_PLACEHOLDER}。"
+            "残留的占位符会原样进 `arn:aws:s3:::…/sites/*` 与 Edge 源码，那是把花括号部署出去。")
+    if not _BUCKET_NAME_RE.fullmatch(bucket):
+        raise ValueError(
+            f"frontend_bucket 不是合法的 S3 桶名（当前 {bucket!r}）——只允许小写字母、数字、`.`、`-`，"
+            "长度 3-63，首尾必须是字母或数字。引号/空格/换行/反斜杠/斜杠都不合法。")
+    if ".." in bucket:
+        raise ValueError(f"frontend_bucket 含连续的点（当前 {bucket!r}）——S3 桶名不允许 `..`。")
+    if _IPV4_LIKE_RE.fullmatch(bucket):
+        raise ValueError(f"frontend_bucket 像 IP 地址（当前 {bucket!r}）——S3 桶名不允许 IPv4 形态。")
+    expected = FRONTEND_BUCKET_CONVENTION.replace(ACCOUNT_ID_PLACEHOLDER, account)
+    if bucket != expected:
+        raise ValueError(
+            f"frontend_bucket 必须解析成 {expected!r}（当前 {bucket!r}）——桶名在本资产里是**约定**，"
+            "不是可自由配置的键：四个生产方把它写死了（deployer/infra/app.py 的 IAM 资源 ARN 与 "
+            "FRONTEND_BUCKET 环境变量、panel/deploy_panel.py 的前端上传、经那个环境变量取值的 "
+            "upload/undeploy/mark_job、scripts/verify_deployed_components.py 的核对）。**改桶名不是改"
+            "这一个键**，要同时改那四处；只改这里的结果是 Edge 去读一个没人写过的桶 ⇒ 每个静态资源 403。"
+            f"保持 {FRONTEND_BUCKET_CONVENTION!r} 模板不动即可。")
+    return bucket
+
+
+def assert_frontend_bucket_matches_site_builder(resolved: str, *, config_path=None):
+    """两份 config.ini 必须指同一个前端桶（裁定 D-I10-2）。→ 对账用的 site-builder 侧值（跳过时 None）。
+
+    抓两类事故：**错账号**（`AWS_PROFILE` / 手填指到另一个账号，两份文件各说各话）与**手抄漂移**
+    （一侧被改成写死的字面量）。此前没有任何运行期交叉校验：本栈只读 router 侧，
+    `verify_deployed_components.py` 只读 site-builder 侧，两边各自都"能用"。
+
+    退化只在「离线」那一条与 `load_site_allowlist` 的 `_degrade` 同款（controller R17）；「读不到」那一条**刻意 fail-open**（首装顺序里 site-builder/config.ini 可能还没回填），这与 R17 的部署模式硬失败不同：
+    · 显式离线（`APP_SYNTH_OFFLINE=1`）⇒ 连读都不读，stderr 警告后跳过。"只想看模板"这条路必须在
+      site-builder/config.ini 还没回填时也走得通。
+    · **读不到**（文件不存在 / 缺段 / 缺键 / 解析不了）⇒ stderr 警告后跳过，**刻意不失败**：
+      首装顺序里 site-builder/config.ini 可能还没回填到这一段，而 router 侧自己那份已经够渲染出
+      正确的桶名（四个生产方也不读这个键）。
+    · **写错了**（值本身不合约定）⇒ 抛。那不是"读不到"，与 `_degrade` 里"配置写错任何模式都抛"同一条纪律。
+    · 两侧解析出**不同的桶** ⇒ 抛，什么都不部署。
+    """
+    if _synth_offline():
+        print("WARNING: APP_SYNTH_OFFLINE=1; skipping the frontend_bucket cross-config reconciliation "
+              "with site-builder/config.ini (template-only synth).", file=sys.stderr)
+        return None
+    path = Path(config_path) if config_path else \
+        Path(__file__).resolve().parents[2] / "site-builder" / "config.ini"
+    cfg = configparser.ConfigParser()
+    try:
+        if not cfg.read(path):
+            raise FileNotFoundError(str(path))
+        raw = cfg.get("Deployer", "frontend_bucket")
+        account = cfg.get("Platform", "account_id")
+    except (OSError, configparser.Error) as exc:
+        print(f"WARNING: could not read [Deployer] frontend_bucket / [Platform] account_id from {path} "
+              f"({type(exc).__name__}: {exc}); skipping the frontend_bucket cross-config reconciliation.",
+              file=sys.stderr)
+        return None
+    try:
+        # site-builder 侧的账号走**同一个**归一化点：同样的行内注释在两份文件里必须有同样的待遇。
+        other = resolve_frontend_bucket(raw, normalize_account_id(account))
+    except ValueError as exc:
+        raise ValueError(
+            f"site-builder/config.ini 的 [Deployer] frontend_bucket / [Platform] account_id 本身写错了：{exc}"
+        ) from exc
+    if other != resolved:
+        raise ValueError(
+            f"两份 config.ini 指向不同的前端桶：router/config.ini 解析出 {resolved!r}，"
+            f"{path} 解析出 {other!r}。两份文件描述的是**同一个**账号里的**同一个**桶，"
+            "写成两个名字的症状是每个静态资源 403（私有桶上「没权限」与「没这个对象」都是 403，"
+            "极难诊断）。先让两侧的 account_id 相等，并把两个 frontend_bucket 都保持成 "
+            f"{FRONTEND_BUCKET_CONVENTION!r} 模板。")
+    return other
+
+
 class WebRouterStack(Stack):
     """CloudFront dynamic subdomain routing Stack"""
     
@@ -302,7 +463,13 @@ class WebRouterStack(Stack):
         
         config = ConfigLoader()
         stack_name = construct_id
-        
+
+        # `[AWS] account_id` 只在这里读一次、归一化一次（工单 10 item 8）。三个消费方共用它：
+        # 前端桶名、埋点明细表的 DynamoDB 资源 ARN、栈的 Environment（模块底部那处也走同一个
+        # 归一化函数）。各读一次的旧形态里只有桶名那条对空值/垃圾响亮，埋点那条是静默的
+        # （理由见 normalize_account_id 的 docstring）。
+        account_id = normalize_account_id(config.get("AWS", "account_id", "APP_ACCOUNT_ID"))
+
         # Apply tags to all resources in this stack
         tags = config.get_tags()
         for key, value in tags.items():
@@ -346,7 +513,12 @@ class WebRouterStack(Stack):
 
         # Site-builder: shared frontend bucket (private; edge function reads
         # static assets via SigV4-signed GET)
-        frontend_bucket = config.get("SiteBuilder", "frontend_bucket", "APP_FRONTEND_BUCKET")
+        # `{account_id}` 模板按 [AWS] account_id 插值——与 site-builder/config.ini 同一约定（M17）。
+        frontend_bucket = resolve_frontend_bucket(
+            config.get("SiteBuilder", "frontend_bucket", "APP_FRONTEND_BUCKET"), account_id)
+        # 裁定 D-I10-2：再与 site-builder/config.ini 对账（错账号 / 手抄漂移）。
+        # 离线或读不到时只警告并跳过；两侧不一致或那边写错了则抛，什么都不部署。
+        assert_frontend_bucket_matches_site_builder(frontend_bucket)
         base_domain = config.get("SiteBuilder", "base_domain", "APP_BASE_DOMAIN")
         # 站点前端在 sites/ 下；M3 控制台前端在 platform/console/{version}/ 下。
         # **两个前缀都要给、且只给这两个**：
@@ -373,7 +545,9 @@ class WebRouterStack(Stack):
         # ——一个 **dict**，模板断言没法按字符串比。用 config 的字面量则渲染成
         # 普通字符串，断言可以逐字比。这也更符合 CLAUDE.md 的「config.ini 是
         # 账号/域名的唯一取值来源」。
-        access_account = config.get("AWS", "account_id", "APP_ACCOUNT_ID").strip()
+        # 值来自 __init__ 顶部那**唯一**的归一化点（工单 10 item 8）——这条 ARN 上的空账号
+        # 是静默失败，所以它必须和桶名那条同源、共享同一道校验。
+        access_account = account_id
         access_table = config.get("SiteBuilder", "access_table",
                                   "APP_ACCESS_TABLE").strip()
         access_regions = [r.strip() for r in
@@ -590,7 +764,7 @@ WebRouterStack(
     app,
     config.get("CDK", "stack_name", "APP_STACK_NAME"),
     env=Environment(
-        account=config.get("AWS", "account_id", "APP_ACCOUNT_ID"),
+        account=normalize_account_id(config.get("AWS", "account_id", "APP_ACCOUNT_ID")),
         region=config.get("AWS", "region", "APP_REGION")
     ),
     description=config.get("CDK", "stack_description", "APP_STACK_DESCRIPTION")

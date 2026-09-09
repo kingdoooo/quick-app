@@ -187,6 +187,26 @@ else
   fail "产物里没有 _UNKNOWN 的赋值或使用点 —— 部署的是 fail-open 的旧代码"
 fi
 
+# ---- 工单 10（M17）：前端桶域名 == router/config.ini 的 [AWS] account_id ----
+# synth 期已经有两道（`resolve_frontend_bucket` 的约定校验、与 site-builder/config.ini 的跨 config
+# 对账），但那两道都只看**本地**。换账号没重部、陈旧 cdk.out、绕开 CloudFormation 直接改 Lambda 代码，
+# 只有在**产物**上比才看得见。症状是每个静态资源 403，而私有桶上「没权限」与「没这个对象」都是 403
+# ⇒ 最难诊断的那一类（本文档自己警告过）。
+# 期望值从 config 推、不写死账号；桶名是约定 `site-frontend-<account_id>`（四个生产方写死了它，
+# 见 router/infrastructure/stack.py 的 FRONTEND_BUCKET_CONVENTION）。
+# 取值用 awk 而不是 `sed | head -1`：`set -o pipefail` 下 head 先退会给 sed 一个 SIGPIPE，
+# 那会把这条断言变成"整脚本中断"。
+FB_ACCOUNT="$(read_cfg AWS account_id)"
+FB_EXPECTED="site-frontend-${FB_ACCOUNT}.s3.us-east-1.amazonaws.com"
+FB_DEPLOYED="$(awk -F'"' '/^FRONTEND_BUCKET_DOMAIN = "/ {print $2; exit}' "$TMP/index.py")"
+if [ -z "$FB_DEPLOYED" ]; then
+  fail "产物里找不到 FRONTEND_BUCKET_DOMAIN 的赋值 —— 注入点被删或改名，Edge 取不到任何静态资源"
+elif [ "$FB_DEPLOYED" = "$FB_EXPECTED" ]; then
+  echo "PASS  FRONTEND_BUCKET_DOMAIN == ${FB_EXPECTED}"
+else
+  fail "FRONTEND_BUCKET_DOMAIN 与 router/config.ini 的 [AWS] account_id 不一致：产物=${FB_DEPLOYED} 期望=${FB_EXPECTED} —— 换了账号没重部 / 陈旧 cdk.out / 两份 config.ini 写了两个桶（症状是每个静态资源 403）"
+fi
+
 # ---- M3：console 平台子域与两个平台保留 cookie ----
 # 同样**按赋值整行断言**：这些名字在注释里也出现（PLATFORM_SUBDOMAINS 上方
 # 就有一整段说明），裸 grep 会让"回滚了常量但留着注释"照样 PASS。

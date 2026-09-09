@@ -760,7 +760,7 @@ exit "$m01_rc"
 | `backfill_site_role_policies.py --check` | 第 7 步 | 四层：site-scope 与期望**完整等值**、角色上只有 site-scope 一条 policy、ACTIVE 站点的角色反向存在、全部 dynamodb 站点过 IAM 模拟器**全部六个数据动作** | **不看信任策略**（`AssumeRolePolicyDocument` 被放宽的角色四层全过）、**不看 `site-runtime-boundary` 还挂着没有**——而 `ensure_site_role` 只在**新建**角色时挂 boundary，所以 `--apply` 不会把被摘掉的 boundary 挂回去。DSQL 站点只有文本等值，没有功能模拟 |
 | `verify_deployed_components.py` | 第 7 步，且**必须在第 2 步之后** | 线上产物里的 `permissions.py` / `common.py` / `session.py` / `login_handler.py` 与仓库逐字节一致；线上 `site-deployer-*` 函数**集合**与 `app.py` 的 `PLATFORM_FUNCTION_NAMES` 精确相等（函数整个消失/多出都红——消失的函数进不了逐包循环）；**每个 `site-deployer-*` 函数自己的 handler**（从部署定义的 Handler 派生，如 `provision_dynamodb.py` / `undeploy.py`）与本地一致；validate 包的 `contract/redlines.py` **和 `contract/schema.py`** 都一致 | 这是**唯一**能发现"某个 **Lambda** 产物漏部了"的闸门。漏一个的症状是产物陈旧而部署脚本全程正常。曾只比守卫三件套——"common 新、handler 旧"的半量部署照样全绿（Codex deployed-state 复审 2026-08-24 指出，判定已抽成纯函数反向验证）。**它不覆盖 Edge**：它下载 Edge 产物，但只问一个问题（`mcp` 有没有进 `PLATFORM_SUBDOMAINS`），M05/M06 的 Edge 半边它一个字都没看 |
 | `verify_table_collision_e2e.py` | 第 7 步（部署后可随时跑；**会真实部署/下线两个一次性站点**） | 表名碰撞在真机上关闭的**行为**证据：B 正常部署（正对照）、A 的碰撞 manifest 被线上 validate 以 `TABLE_NAME_RE` 原话拒绝、A 侧零资源残留、B 侧逐字段不变（表 schema/tags/role policy/data_tables）、purge 三态幂等（对已购清站点重复 purge 收敛到 DELETED）。跑完强一致读回核对清零，输出含 site/job ID 的 JSON 摘要 | 清理与幂等探针**直接 Event 调 `site-deployer-undeploy`**（复刻 MCP 建 job 后的动作）——证明的是部署函数行为，不是 MCP/panel 鉴权链路（那由 `verify_api_key_e2e.py` 覆盖）。sites/jobs 的 DELETED 历史行保留 |
-| `verify_deployed_edge.sh` | 第 7 步，**在业务验收之前**（第 6 步等到 `Deployed` 之后） | CloudFront **当前关联的那个版本**的产物与本地 `origin_request.py` 逐行相同（只允许占位符行有差异）、占位符全部替换、安全开关是收紧值，外加 M05（查 `typ`）与 M06（逐个验、不截断）两条哨兵；**⑤ router 栈的 stack policy**：一条 Deny 精确覆盖 Edge 两函数、分发与路由表四个逻辑 ID，且策略带 Allow-all（`router_stack_policy.py check`，只读） | **证据等级是静态产物比对，不是行为探针**：它证明"跑在线上的就是这份源码"，M05/M06 的**行为**由下面那条闸门单独证。也不看非默认 cache behavior 上的关联。也不证明谁持有 `cloudformation:SetStackPolicy`（那是 IAM 层，归探针与信任边界文档） |
+| `verify_deployed_edge.sh` | 第 7 步，**在业务验收之前**（第 6 步等到 `Deployed` 之后） | CloudFront **当前关联的那个版本**的产物与本地 `origin_request.py` 逐行相同（只允许占位符行有差异）、占位符全部替换、安全开关是收紧值，外加 M05（查 `typ`）与 M06（逐个验、不截断）两条哨兵、产物里注入的 `FRONTEND_BUCKET_DOMAIN` == 按 `router/config.ini [AWS] account_id` 推出的 `site-frontend-<account_id>.s3.us-east-1.amazonaws.com`；**⑤ router 栈的 stack policy**：一条 Deny 精确覆盖 Edge 两函数、分发与路由表四个逻辑 ID，且策略带 Allow-all（`router_stack_policy.py check`，只读） | **证据等级是静态产物比对，不是行为探针**：它证明"跑在线上的就是这份源码"，M05/M06 的**行为**由下面那条闸门单独证。也不看非默认 cache behavior 上的关联。也不证明谁持有 `cloudformation:SetStackPolicy`（那是 IAM 层，归探针与信任边界文档） |
 | `verify_site_table_integrity.py` | 第 7 步（部署后自检，也可随时跑） | per-site 数据表的归属：ACTIVE NoSQL 站点的表存在且 tag `project`/`site_id` 正确；**每个 `site-rt-{site_id}` 角色的 DynamoDB 表 ARN 集合与同一站点自己的表精确相等**（不多、不少、无通配、不含别站的表）；DSQL 角色没有任何表 ARN；static（engine=none）站点**没有**运行时角色是合法态（角色存在时表 ARN 集合必须为空）；全部 `data_tables` 逻辑名符合 `TABLE_NAME_RE` | 只看**当前 ACTIVE** 站点——历史/DELETED 行不做全量对账（表可能已删），但它们含连字符的 `data_tables` 仍会被报出来。不核 DSQL 侧的 schema/role 隔离（那在 PG 层）。要害判定抽成了纯函数 `role_arn_problems`，反向验证在 `deployer/tests/test_verify_site_table_integrity.py` |
 | `verify_session_token_semantics.py` | 第 7 步，紧跟上一条 | M05/M06 的**真机行为**：遮蔽 cookie 排在合法会话之前时 `/console-session` 仍换出升级码、Edge 侧仍放行（含 14 条遮蔽的量级）、console 升级码当站点会话被拒；含正对照（单枚合法会话能进）与负对照（无 cookie 仍 302）。**只发 GET，不写数据** | 它只挑路由表里第一个 `require_auth=True` 的站点，不遍历全部站点；候选条数上限那一类**回归**残留由单测的结构守卫管，不在这里 |
 
@@ -1390,7 +1390,21 @@ pre-token 触发器、managed login branding。命令与实测基线见前面
 - ④ 的两把 CMK 已存在且 `[SessionKeys]` 已回填指纹（栈 synth 时从 KMS 取 site 公钥注入 Edge 函数）
 
 确认 `router/config.ini` 已填好：account_id / domain_name / certificate_arn /
-frontend_bucket / base_domain（从 `router/config.ini.example` 复制）。
+base_domain（从 `router/config.ini.example` 复制）。这几个键的值里**不要写行内注释**——
+configparser 会把注释并进值，synth 一律**拒**而不替你剥（注释另起一行）。`account_id`
+只在 synth 时读一次并当场校验（非空、正好 12 位数字），前端桶名、edge role 的埋点
+DynamoDB 资源 ARN 与栈 Environment 三处共用那个值：空账号在桶名那条响亮，在埋点 ARN 上
+却是**静默**的（PutItem 全被拒，而埋点异常一律吞掉 ⇒ 那个副本区静默零数据）。**`frontend_bucket` 那一行不要动**：
+桶名是**约定**而不是可配置项——它固定为 `site-frontend-{account_id}`，键保留模板形态，
+栈 synth 时按 `[AWS] account_id` 插值（与 `site-builder/config.ini [Deployer] frontend_bucket`
+同一约定，所以两份文件里都不用手填账号）。**填别的值 synth 会直接拒**：资产里有四个生产方
+把这个名字写死了（`deployer/infra/app.py` 的 IAM 资源 ARN 与 `FRONTEND_BUCKET` 环境变量、
+`panel/deploy_panel.py` 的前端上传、经那个环境变量取值的 upload/undeploy/mark_job、
+`scripts/verify_deployed_components.py` 的核对），只改这一个键的结果是 Edge 去读一个没人
+写过的桶 = 每个静态资源 403，而私有桶上「没权限」与「没这个对象」都是 403，极难诊断。
+真要换桶名就得同时改那四处。synth 还会把解析结果与 `site-builder/config.ini` 的
+`[Deployer] frontend_bucket` + `[Platform] account_id` 对账，两侧解析不出同一个桶即失败
+（抓「AWS_PROFILE 指错账号」与手抄漂移）；那份读不到时只打一行警告并跳过。
 `[SiteBuilder]` 段还必须有 `require_idp_claim` 与 `trusted_idps` 两键
 （缺任一 synth 直接 NoOptionError）。**全新部署直接填 `true` + 你的 provider
 name**；值必须是裸 `true`/`false`——configparser 会把行内注释并进值，

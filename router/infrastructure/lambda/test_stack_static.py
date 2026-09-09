@@ -6,6 +6,7 @@
 切出来单独 exec 的方式验（stack.py 自己 import aws_cdk，本 venv 没有）；纯文本断言只用来钉
 "不许回到旧形态"。
 """
+import configparser
 import json
 import re
 import subprocess
@@ -125,7 +126,8 @@ def _fragment(name: str = "_stack_allowlist_fragment"):
         _sys.path.insert(0, str(root / "site-builder" / "auth"))
         return root
 
-    mod.__dict__.update(os=__import__("os"), sys=_sys, json=json, subprocess=subprocess, Path=Path,
+    mod.__dict__.update(os=__import__("os"), sys=_sys, json=json, re=re, configparser=configparser,
+                        subprocess=subprocess, Path=Path,
                         __file__=str(HERE.parent / "stack.py"), _session_keys_on_path=_on_path)
     # 片段里引用的同文件助手（`_synth_offline`）也一并切进来
     hs = SRC.index("def _synth_offline")
@@ -479,3 +481,335 @@ def test_residue_check_is_not_bypassed_by_a_second_write_path():
     writes = re.findall(r"\.write(?:_text|_bytes)?\(\s*lambda_code", body)
     assert len(writes) == 1, f"lambda_code 有 {len(writes)} 条落盘路径：{writes}"
     assert "from_asset(temp_dir)" in body, "产物目录换了名字？这条守卫的前提要跟着改"
+
+
+# ---- 工单 10（M17）：frontend_bucket 的解析 + 两份 config.ini 的对账 -----------------------------
+#
+# 起点：两份 `.example` 对**同一个桶**用了两种写法（site-builder 侧是 `{account_id}` 模板、router
+# 侧写死一个占位账号），且没有任何交叉校验。症状是**每个静态资源 403**，而私有桶上"没权限"与
+# "没这个对象"都是 403 ⇒ 极难诊断（DEPLOY.md 自己就警告过这一类）。
+#
+# 裁定 D-I10-1：桶名在本资产里是**约定**、不是自由配置。四个生产方把 `site-frontend-<account_id>`
+# 写死了——`deployer/infra/app.py` 的 IAM 资源 ARN 与 `FRONTEND_BUCKET` 环境变量、
+# `panel/deploy_panel.py` 的前端上传、经那个环境变量取值的 upload/undeploy/mark_job、
+# `scripts/verify_deployed_components.py` 的核对。所以插值后**必须等于**约定名：
+# **与约定相同的字面量放行，其它字面量一律拒**（"配了另一个桶名"只会让 Edge 去读一个没人写过的桶，
+# 而那正是最难诊断的 403）。
+# 裁定 D-I10-2：部署模式下再与 `site-builder/config.ini` 对账，抓"错账号"与"手抄漂移"。
+#
+# **行内注释按拒绝处理、不按剥离处理**：与 20 行之下的兄弟键（`require_idp_claim` / `trusted_idps`）
+# 同法。configparser 默认把行内注释并进值，剥掉它等于替采用者猜意图；而共享键本来就不许带注释
+# （`deployer/tests/test_example_config_consistency.py` 有一条专门的断言）。
+
+GOOD_ACCOUNT = "111122223333"
+OTHER_ACCOUNT = "000000000000"
+TEMPLATE = "site-frontend-{account_id}"
+CONVENTION = f"site-frontend-{GOOD_ACCOUNT}"
+
+
+# ---- 正对照：三种被接受的形态 -------------------------------------------------------------------
+
+def test_frontend_bucket_template_is_resolved_from_the_aws_account_id():
+    assert _fragment().resolve_frontend_bucket(TEMPLATE, GOOD_ACCOUNT) == CONVENTION
+
+
+def test_a_literal_equal_to_the_convention_is_accepted():
+    """采用者已经把账号手填进去的 config.ini 不用改（D-I10-1：等于约定名即放行）。"""
+    assert _fragment().resolve_frontend_bucket(CONVENTION, GOOD_ACCOUNT) == CONVENTION
+
+
+def test_surrounding_whitespace_is_tolerated_on_the_bucket_value():
+    """桶名侧的**前后**空白不改变意图（configparser 已经剥过一层，这里是纵深）。
+
+    账号侧**不**在这里洗——它的契约是"已归一化"（`normalize_account_id` 是唯一归一化点，
+    见 `test_resolve_requires_an_already_normalized_account`）。
+    """
+    assert _fragment().resolve_frontend_bucket(f"  {TEMPLATE}  ", GOOD_ACCOUNT) == CONVENTION
+
+
+# ---- 每条拒绝各一条负例 -------------------------------------------------------------------------
+
+@pytest.mark.parametrize("raw,fragment,why", [
+    ("", "为空", "空值：`site-frontend-` 这种桶名合法但不存在，IAM ARN 照样渲染得出来"),
+    ("   ", "为空", "只有空白，同上"),
+    ('x"; import os #', "注释字符", "引号 + 注释字符（注入形态；被 `#` 那道拒）"),
+    ('site-frontend-111122223333"', "S3 桶名", "裸引号、不带 #（被字符集那道拒——能破坏 Edge 源码字面量的字符）"),
+    (TEMPLATE + "  # 别改", "注释字符", "行内注释被 configparser 并进值"),
+    (TEMPLATE + " ; 别改", "注释字符", "分号注释同理"),
+    ("site-frontend-{acct}", "仍含占位符", "占位符名字写错 ⇒ 会原样进 arn:aws:s3:::…/sites/*"),
+    ("Site_Frontend_123", "S3 桶名", "大写 + 下划线"),
+    ("site frontend", "S3 桶名", "值里有空格"),
+    ("ab", "S3 桶名", "短于 3 字符"),
+    ("a" * 70, "S3 桶名", "长于 63 字符"),
+    ("site-frontend-111122223333\\", "S3 桶名", "尾随反斜杠"),
+    ("site-frontend-111122223333\nsite-frontend-000000000000", "S3 桶名", "值里有换行（两行挤进一个值）"),
+    ("bucket/sites/../x", "S3 桶名", "路径穿越形态"),
+    ("site..frontend-111122223333", "连续的点", "S3 桶名不允许 `..`"),
+    ("192.168.1.1", "像 IP", "S3 桶名不允许 IPv4 形态"),
+    ("my-own-bucket", "四个生产方", "合法桶名，但不是约定名（D-I10-1）"),
+])
+def test_every_rejected_frontend_bucket_shape_fails_synth(raw, fragment, why):
+    """注入类与写错类一律在 synth 期抛，不许渲染进 `arn:aws:s3:::{bucket}/sites/*` 或 Edge 源码。"""
+    with pytest.raises(ValueError, match=fragment):
+        _fragment().resolve_frontend_bucket(raw, GOOD_ACCOUNT)
+
+
+@pytest.mark.parametrize("account,why", [
+    ("", "空账号"),
+    ("   ", "只有空白"),
+    ("  111122223333  ", "两端空白 = 根本没经过 normalize_account_id（契约违反）"),
+    ("111122223333  # 我的账号", "行内注释还在 = 同上"),
+    ("1234", "短于 12 位"),
+    ("1111222233334", "长于 12 位"),
+    ("11112222333a", "含非数字"),
+    ("1111-2222-3333", "带分隔符"),
+])
+def test_resolve_requires_an_already_normalized_account(account, why):
+    """契约是「**已归一化**的 account 进、桶名出」（工单 10 item 8）：归一化只在
+    `normalize_account_id` 一处做，这里只做契约断言，**刻意不再 `.strip()`**。
+
+    为什么要断言而不是"顺手再洗一遍"：洗第二遍就等于开了第二条归一化路径，两条会漂。
+    而账号是垃圾时 `site-frontend-` + 垃圾 是个不存在的桶、IAM ARN 照样渲染出来。
+    """
+    with pytest.raises(ValueError, match="12 位数字"):
+        _fragment().resolve_frontend_bucket(TEMPLATE, account)
+
+
+# ---- item 8：`[AWS] account_id` 的唯一归一化点 --------------------------------------------------
+#
+# 本栈有**三个**消费方：前端桶名、埋点明细表的 DynamoDB 资源 ARN、栈的 `Environment`。此前三处
+# 各自 `config.get(...)`，只有桶名那条会因为空值/垃圾响亮失败。埋点那条是**静默**的——ARN 渲染成
+# `arn:aws:dynamodb:{region}::table/...`，PutItem 全部 AccessDenied，而埋点异常一律吞掉
+# （统计不是安全控制）⇒ 那个区静默零数据，没有任何人会知道。
+
+
+@pytest.mark.parametrize("raw,why", [
+    ("111122223333", "本来就干净"),
+    ("  111122223333  ", "两端空白"),
+    ("111122223333\t", "尾随制表符"),
+    ("\n111122223333\n", "两端换行"),
+])
+def test_normalize_account_id_cleans_the_value(raw, why):
+    """归一化只剥**空白**。行内注释走拒绝那条路（见下一组）——account_id / frontend_bucket /
+    trusted_idps / require_idp_claim 这四个显式校验的键都是同一条规则：**注释一律拒、绝不替采用者剥**。"""
+    assert _fragment().normalize_account_id(raw) == GOOD_ACCOUNT
+
+
+@pytest.mark.parametrize("raw,fragment,why", [
+    ("", "为空", "键留空（`.example` 复制过来没填）"),
+    ("   ", "为空", "只有空白"),
+    ("111122223333  # 我的账号", "注释字符", "行内注释（裸 ConfigParser 会把它并进值）"),
+    ("111122223333 ; 我的账号", "注释字符", "分号注释"),
+    ("# 111122223333", "注释字符", "注释把整个值吞了"),
+    ("1234", "12 位数字", "短于 12 位"),
+    ("1111222233334", "12 位数字", "长于 12 位"),
+    ("11112222333a", "12 位数字", "含非数字"),
+    ("1111-2222-3333", "12 位数字", "带分隔符"),
+    ("111122223333 000000000000", "12 位数字", "两个账号挤进一个值"),
+])
+def test_normalize_account_id_fails_loudly(raw, fragment, why):
+    """`#`/`;` 一律拒，**不剥**——与 `frontend_bucket`、`require_idp_claim`、`trusted_idps`
+    三个兄弟键同法（controller 已裁定）。
+
+    剥掉等于替采用者猜意图，而"猜对了"和"猜错了"在 synth 输出里长得一模一样；拒掉的话操作者
+    看到的是一句"注释另起一行"。共享键本来就不许带注释
+    （`deployer/tests/test_example_config_consistency.py` 有一条专门的断言）。
+    """
+    with pytest.raises(ValueError, match=fragment):
+        _fragment().normalize_account_id(raw)
+
+
+def test_the_empty_and_comment_branches_raise_distinguishable_messages():
+    """两条 `match=` 必须能区分分支：`# 111122223333` 走的是注释那条，不是"为空"那条。"""
+    mod = _fragment()
+    with pytest.raises(ValueError) as empty:
+        mod.normalize_account_id("   ")
+    with pytest.raises(ValueError) as swallowed:
+        mod.normalize_account_id("# 111122223333")
+    assert "为空" in str(empty.value) and "注释字符" not in str(empty.value)
+    assert "注释字符" in str(swallowed.value) and "为空" not in str(swallowed.value)
+
+
+_ACCOUNT_READ_RE = re.compile(r'config\.get\(\s*"AWS"\s*,\s*"account_id"[^)]*\)')
+
+
+def _account_read_violations(src: str) -> list:
+    """`[AWS] account_id` 的读取纪律：只两处（`__init__` 顶部、模块级 `Environment`），
+    每处都裹在 `normalize_account_id(` 里，且没有第二条归一化路径（裸 `.strip()`），
+    埋点 ARN 用的是归一化后的那个局部名。"""
+    out = []
+    reads = list(_ACCOUNT_READ_RE.finditer(src))
+    if len(reads) != 2:
+        out.append(f"读了 {len(reads)} 次（应为 2）：{[m.group(0) for m in reads]}")
+    for m in reads:
+        if "normalize_account_id(" not in src[max(0, m.start() - 40):m.start()]:
+            out.append(f"未经归一化的读取：…{src[max(0, m.start() - 30):m.end()]}")
+    if re.search(r'"account_id"[^)]*\)\s*\.strip\(\)', src):
+        out.append("裸 .strip() —— 第二条归一化路径")
+    if not re.search(r"access_account\s*=\s*account_id\b", src):
+        out.append("埋点 ARN 没用 __init__ 顶部那个归一化后的 account_id")
+    return out
+
+
+def test_every_account_id_read_goes_through_the_single_normalizer():
+    assert _account_read_violations(SRC) == []
+
+
+@pytest.mark.parametrize("mutate,why", [
+    (lambda s: s.replace(
+        "        access_account = account_id",
+        '        access_account = config.get("AWS", "account_id", "APP_ACCOUNT_ID").strip()'),
+     "埋点 ARN 退回自己读 config（空账号 ⇒ 静默零数据）"),
+    (lambda s: s.replace(
+        '        account=normalize_account_id(config.get("AWS", "account_id", "APP_ACCOUNT_ID")),',
+        '        account=config.get("AWS", "account_id", "APP_ACCOUNT_ID"),'),
+     "栈 Environment 退回读原值"),
+], ids=["analytics-arn", "stack-environment"])
+def test_the_account_normalization_guard_reds_on_each_bypass(mutate, why):
+    """**变形测试**：守卫真的能咬住"某一处又自己去读 config"这种回退。"""
+    mutated = mutate(SRC)
+    assert mutated != SRC, f"变形没生效——那一行的形态变了，先改这里（{why}）"
+    assert _account_read_violations(mutated), f"守卫抓不住：{why}"
+
+
+def test_the_account_and_placeholder_branches_raise_distinguishable_messages():
+    """两条 `match=` 必须能区分分支。
+
+    原先一条用 `match="frontend_bucket"`——那个词出现在几乎每条消息里，于是"占位符写错"和
+    "账号为空"哪条都能让它绿，断言等于只验了"抛了 ValueError"。
+    """
+    mod = _fragment()
+    with pytest.raises(ValueError) as bad_account:
+        mod.resolve_frontend_bucket(TEMPLATE, "")
+    with pytest.raises(ValueError) as bad_placeholder:
+        mod.resolve_frontend_bucket("site-frontend-{acct}", GOOD_ACCOUNT)
+    assert "12 位数字" in str(bad_account.value) and "仍含占位符" not in str(bad_account.value)
+    assert "仍含占位符" in str(bad_placeholder.value) and "12 位数字" not in str(bad_placeholder.value)
+
+
+def test_the_literal_rejection_names_all_four_hardcoding_producers():
+    """D-I10-1 的可操作性：拒绝时必须说出"改桶名要同时改哪四处"，否则采用者只会把值改回去再撞一次。"""
+    with pytest.raises(ValueError) as exc:
+        _fragment().resolve_frontend_bucket("my-own-bucket", GOOD_ACCOUNT)
+    msg = str(exc.value)
+    for producer in ("app.py", "deploy_panel", "mark_job", "verify_deployed_components"):
+        assert producer in msg, f"消息没点到生产方 {producer}：{msg}"
+
+
+# ---- D-I10-2：与 site-builder/config.ini 对账 ---------------------------------------------------
+
+def _sb_config(tmp_path, *, account=GOOD_ACCOUNT, bucket=TEMPLATE, body=None) -> Path:
+    path = tmp_path / "config.ini"
+    path.write_text(body if body is not None else
+                    f"[Platform]\naccount_id = {account}\n\n[Deployer]\nfrontend_bucket = {bucket}\n",
+                    encoding="utf-8")
+    return path
+
+
+def test_the_two_configs_are_reconciled_in_deploy_mode(tmp_path, clean_env):
+    """**正对照**：两侧解析出同一个桶 ⇒ 返回那个值、不抛。下面几条红没有这一条证明不了什么。"""
+    got = _fragment().assert_frontend_bucket_matches_site_builder(
+        CONVENTION, config_path=_sb_config(tmp_path))
+    assert got == CONVENTION
+
+
+@pytest.mark.parametrize("account,bucket,why", [
+    (OTHER_ACCOUNT, TEMPLATE, "site-builder 侧填的是另一个账号（AWS_PROFILE 指错 / 抄错）"),
+    (OTHER_ACCOUNT, f"site-frontend-{OTHER_ACCOUNT}", "site-builder 侧写死了另一个账号的桶名"),
+])
+def test_a_site_builder_config_naming_another_bucket_fails_synth(tmp_path, clean_env, account, bucket, why):
+    """两份 config.ini 指向不同的桶 ⇒ synth 抛，什么都不部（否则线上每个静态资源 403）。"""
+    with pytest.raises(ValueError, match="两份 config.ini"):
+        _fragment().assert_frontend_bucket_matches_site_builder(
+            CONVENTION, config_path=_sb_config(tmp_path, account=account, bucket=bucket))
+
+
+def test_a_malformed_site_builder_value_is_a_config_error_not_a_skip(tmp_path, clean_env):
+    """site-builder 侧的值本身写错 ⇒ 抛（那不是"读不到"，是写错了；与 `_degrade` 同一条纪律）。"""
+    with pytest.raises(ValueError, match="site-builder/config.ini"):
+        _fragment().assert_frontend_bucket_matches_site_builder(
+            CONVENTION, config_path=_sb_config(tmp_path, bucket="Site_Frontend"))
+
+
+@pytest.mark.parametrize("body,why", [
+    (None, "整个文件不存在"),
+    ("[Platform]\naccount_id = 111122223333\n", "缺 [Deployer] frontend_bucket"),
+    ("[Deployer]\nfrontend_bucket = site-frontend-{account_id}\n", "缺 [Platform] account_id"),
+    ("account_id = 111122223333\n", "没有段头（MissingSectionHeaderError）"),
+])
+def test_an_unreadable_site_builder_config_degrades_to_a_warning(tmp_path, clean_env, capsys, body, why):
+    """读不到就 stderr 警告并跳过（与 R17 同款退化）——**且必须仍然不抛**，因为对账不是本栈的必要条件。
+
+    刻意**不**让它失败：切换窗口/首装顺序里 site-builder/config.ini 可能还没回填到这一段，而 router
+    侧自己那份已经够渲染出正确的桶名（四个生产方也不读这个键）。
+    """
+    path = tmp_path / "nope.ini" if body is None else _sb_config(tmp_path, body=body)
+    got = _fragment().assert_frontend_bucket_matches_site_builder(CONVENTION, config_path=path)
+    assert got is None
+    err = capsys.readouterr().err
+    assert "skipping" in err and "frontend_bucket" in err, err
+
+
+def test_offline_synth_skips_the_cross_config_reconciliation(tmp_path, monkeypatch, capsys):
+    """显式离线（只想看模板）⇒ 连读都不读、不抛，哪怕两侧真的不一致（R17 那两条路必须走得通）。"""
+    monkeypatch.setenv(OFFLINE_FLAG, "1")
+    got = _fragment().assert_frontend_bucket_matches_site_builder(
+        CONVENTION, config_path=_sb_config(tmp_path, account=OTHER_ACCOUNT))
+    assert got is None
+    assert OFFLINE_FLAG in capsys.readouterr().err
+
+
+def test_the_default_reconciliation_path_is_the_repo_site_builder_config():
+    """默认路径必须是仓库里那份 site-builder/config.ini（测试全部显式传 path，所以这条单独钉）。"""
+    body = SRC[SRC.index("def assert_frontend_bucket_matches_site_builder"):SRC.index("class WebRouterStack")]
+    assert 'parents[2]' in body and '"site-builder" / "config.ini"' in body, body
+
+
+# ---- 接线守卫（源码文本）+ 两条变形 -------------------------------------------------------------
+
+_WIRING_RE = re.compile(r"frontend_bucket\s*=\s*resolve_frontend_bucket\s*\(")
+_RECONCILE_RE = re.compile(r"assert_frontend_bucket_matches_site_builder\s*\(\s*frontend_bucket\s*\)")
+
+# `__init__` 里那三行的**逐字**形态。变形用例按它替换，所以每条都先 `assert mutated != SRC`：
+# 形态一改，变形失效 ⇒ 那两条守卫会静默变成"改什么都绿"。
+_WIRED_CALL = ('frontend_bucket = resolve_frontend_bucket(\n'
+               '            config.get("SiteBuilder", "frontend_bucket", "APP_FRONTEND_BUCKET"), account_id)')
+_RAW_CALL = 'frontend_bucket = config.get("SiteBuilder", "frontend_bucket", "APP_FRONTEND_BUCKET")'
+
+
+def _init_src(src: str = None) -> str:
+    s = SRC if src is None else src
+    return s[s.index("class WebRouterStack"):]
+
+
+def test_stack_init_resolves_the_bucket_template_before_building_s3_resources():
+    """判据是**正则**而不是 `"resolve_frontend_bucket(" in body`：后者对"调用了但返回值被丢弃"全绿。"""
+    assert _WIRING_RE.search(_init_src()), "__init__ 没把解析结果赋给 frontend_bucket——模板会原样进 IAM ARN"
+
+
+def test_stack_init_reconciles_the_two_configs():
+    assert _RECONCILE_RE.search(_init_src()), (
+        "__init__ 没拿解析结果去和 site-builder/config.ini 对账（D-I10-2）")
+
+
+@pytest.mark.parametrize("mutate,why", [
+    (lambda s: s.replace(_WIRED_CALL, _RAW_CALL), "解析器整条被删（config 原值直接进 IAM ARN）"),
+    (lambda s: s.replace(_WIRED_CALL,
+                         _WIRED_CALL.replace("frontend_bucket = resolve", "resolve")
+                         + "\n        " + _RAW_CALL),
+     "调用还在、返回值被丢弃（原值仍然进 ARN）"),
+], ids=["call-deleted", "return-discarded"])
+def test_the_wiring_guard_reds_on_each_bypass(mutate, why):
+    """**变形测试**：守卫真的能咬住两种绕过形态，而不只是"这段文本恰好在"。"""
+    mutated = mutate(SRC)
+    assert mutated != SRC, f"变形没生效——`__init__` 里那几行的形态变了，先改这里（{why}）"
+    assert _WIRING_RE.search(_init_src(mutated)) is None, f"守卫抓不住：{why}"
+
+
+def test_the_reconciliation_guard_reds_when_the_call_is_dropped():
+    """同上，对账那条也要有变形——只有正向断言时删掉它一样是静默通过。"""
+    call = "\n        assert_frontend_bucket_matches_site_builder(frontend_bucket)"
+    assert call in SRC, "对账调用的形态变了，先改这里"
+    mutated = SRC.replace(call, "")
+    assert mutated != SRC
+    assert _RECONCILE_RE.search(_init_src(mutated)) is None

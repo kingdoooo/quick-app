@@ -40,6 +40,10 @@ KEYS_START = "# ---- 3c-final：site family 的**公钥精确对账**"
 KEYS_END = "\nROWS\n"          # 逐把对账那个 while 的 here-doc 终止符
 M05_START = "# ---- S1：M05（token 用途混用）与 M06（同名 cookie 遮蔽）----"
 M05_END = KEYS_START           # M05 段紧挨着公钥对账段
+# 工单 10（M17）：前端桶域名那一段。END 用紧跟其后那段的标记（同 M05_END 的做法）——
+# 中间被插进新代码时切片会带上它、用例随之变化，而段被删/改名时 `_slice` 直接 ValueError。
+FB_START = "# ---- 工单 10（M17）：前端桶域名"
+FB_END = "# ---- M3：console 平台子域"
 
 
 def _slice(start: str, end: str, *, keep_end: bool) -> str:
@@ -51,6 +55,11 @@ def _slice(start: str, end: str, *, keep_end: bool) -> str:
 ARTIFACT_BLOCK = _slice(ARTIFACT_START, ARTIFACT_END, keep_end=False)
 KEYS_BLOCK = _slice(KEYS_START, KEYS_END, keep_end=True)
 M05_BLOCK = _slice(M05_START, M05_END, keep_end=False)
+FB_BLOCK = _slice(FB_START, FB_END, keep_end=False)
+# 前导里要用到脚本自己的 `read_cfg`（读 router/config.ini）。**从脚本里切出来、不手抄**：
+# 手抄的副本证明的是副本的行为（用户全局 CLAUDE.md：不维护未验证平价的简化副本）。
+CFG_LINE = next(ln for ln in SRC.splitlines() if ln.startswith("CFG="))
+READ_CFG = CFG_LINE + "\n" + _slice("read_cfg() {", "\nPY\n}\n", keep_end=True)
 EDGE_SRC = (ROOT / "router" / "infrastructure" / "lambda" / "origin_request.py").read_text(encoding="utf-8")
 
 
@@ -218,6 +227,11 @@ key_arn = arn:aws:kms:us-east-1:000000000000:key/00000000-0000-0000-0000-0000000
 spki_sha256 = %s
 """ % ("a" * 64, "b" * 64, "c" * 64)
 
+# 工单 10（M17）：闸门从 router/config.ini 的 [AWS] account_id 推出期望的桶域名。
+FB_ACCOUNT = "111122223333"
+OTHER_ACCOUNT = "000000000000"
+ROUTER_CONFIG = f"[AWS]\naccount_id = {FB_ACCOUNT}\nregion = us-east-1\n"
+
 # 替身 aws 按 key ARN 的末字符造一个可预期的"公钥"。真实值是 base64(DER SPKI)，
 # 这里只需要"每把不同、可放进 index.py 比对"。
 PUB = {"site-rs-v1": "PUBKEY-AAAA", "site-rs-v0": "PUBKEY-BBBB", "console-rs-v1": "PUBKEY-CCCC"}
@@ -260,6 +274,8 @@ def env(tmp_path):
     root = tmp_path / "root"
     (root / "site-builder" / "auth").mkdir(parents=True)
     (root / "site-builder" / "config.ini").write_text(CONFIG, encoding="utf-8")
+    (root / "router").mkdir(parents=True)
+    (root / "router" / "config.ini").write_text(ROUTER_CONFIG, encoding="utf-8")
     shutil.copy(ROOT / "site-builder" / "auth" / "session_keys.py",
                 root / "site-builder" / "auth" / "session_keys.py")
     art = tmp_path / "art"
@@ -273,17 +289,19 @@ def env(tmp_path):
     return {"root": root, "art": art, "bin": bin_dir}
 
 
-def _run(block: str, env: dict, **extra_env) -> tuple:
+def _run(block: str, env: dict, *, prelude: str = "", **extra_env) -> tuple:
     """把切片装进最小前导里跑一遍 → (rc, 输出)。
 
     前导只提供脚本自己提供的那几样（`fail` / `FAILURES` / `ROOT` / `TMP` / `REGION`），
-    结尾按脚本的总判定退出（`FAILURES > 0` ⇒ 非 0）。
+    结尾按脚本的总判定退出（`FAILURES > 0` ⇒ 非 0）。`prelude` 给需要脚本里别的助手的段
+    （工单 10 那段要 `read_cfg`），内容同样是**从脚本里切出来的**，不是手抄。
     """
     script = (
         'set -euo pipefail\n'
         'ROOT="$1"; TMP="$2"; REGION=us-east-1\n'
         'FAILURES=0\n'
         'fail() { echo "FAIL  $1"; FAILURES=$((FAILURES + 1)); }\n'
+        + prelude + "\n"
         + block +
         '\necho "FAILURES=$FAILURES"\n'
         '[ "$FAILURES" -eq 0 ]\n')
@@ -445,3 +463,100 @@ def test_m05_block_reds_when_the_local_pin_is_retargeted(env):
     rc, out = _run(M05_BLOCK, env)
     assert rc != 0, out
     assert "M05 未生效" in out, out
+
+
+# ---- 前端桶域名段（工单 10 / M17）：真源码 + 合成产物各一条正对照 + 四种红 -----------------------
+#
+# 这一段抓的是"两份 config.ini 指向不同的桶"在**已部署产物**上的投影。synth 期已经有两道
+# （`resolve_frontend_bucket` 的约定校验、`assert_frontend_bucket_matches_site_builder` 的跨 config
+# 对账），但那两道都只看**本地**：换账号没重部、陈旧 cdk.out、绕过 CloudFormation 直接改 Lambda
+# 代码，都只有在产物上比才看得见。症状是每个静态资源 403，而私有桶上「没权限」与「没这个对象」
+# 都是 403 ⇒ 最难诊断的那一类。
+
+
+def _fb_domain(account: str) -> str:
+    return f"site-frontend-{account}.s3.us-east-1.amazonaws.com"
+
+
+def _substituted_edge_src(account: str) -> str:
+    """真源码按 `stack.py` 的替换链把 `{{FRONTEND_BUCKET_DOMAIN}}` 换掉。
+
+    **必须用真源码**：这一段的判据是个 grep，而 grep 与源码行形态的漂移正是 M05 那条栽过的坑
+    （两个 Task 的单测各自全绿，直到真机跑闸门才假红）。
+    """
+    out = EDGE_SRC.replace("{{FRONTEND_BUCKET_DOMAIN}}", _fb_domain(account))
+    assert out != EDGE_SRC, "真源码里没有 {{FRONTEND_BUCKET_DOMAIN}} 注入点了 —— 先改这里再改闸门"
+    return out
+
+
+def test_the_frontend_bucket_block_derives_the_expected_name_from_config():
+    """静态：期望值必须从 `read_cfg AWS account_id` 推，不许写死账号（写死了换账号就验错对象）。"""
+    assert "read_cfg AWS account_id" in FB_BLOCK, FB_BLOCK
+    assert re.search(r"(?<!\d)\d{12}(?!\d)", FB_BLOCK) is None, "闸门里写死了一个 12 位账号"
+    assert "fail " in FB_BLOCK and 'echo "PASS' in FB_BLOCK, FB_BLOCK
+
+
+def test_the_frontend_bucket_block_runs_before_the_verdict():
+    """段落必须在总判定之前，否则它的红进不了退出码。"""
+    assert SRC.index(FB_START) < SRC.index('if [ "$FAILURES" -gt 0 ]')
+
+
+def test_frontend_bucket_block_passes_on_the_real_edge_source(env):
+    """**正对照 ①**：HEAD 的 origin_request.py 按替换链注入后当产物 ⇒ 零红、退 0。"""
+    (env["art"] / "index.py").write_text(_substituted_edge_src(FB_ACCOUNT), encoding="utf-8")
+    rc, out = _run(FB_BLOCK, env, prelude=READ_CFG)
+    assert rc == 0, out
+    assert "FAILURES=0" in out and _fb_domain(FB_ACCOUNT) in out, out
+
+
+def test_frontend_bucket_block_passes_on_a_synthetic_artifact(env):
+    """**正对照 ②**：只有那一行的合成产物同样过——证明上一条不是靠源码里别的东西过的。"""
+    (env["art"] / "index.py").write_text(
+        f'FRONTEND_BUCKET_DOMAIN = "{_fb_domain(FB_ACCOUNT)}"\n', encoding="utf-8")
+    rc, out = _run(FB_BLOCK, env, prelude=READ_CFG)
+    assert rc == 0, out
+    assert "FAILURES=0" in out, out
+
+
+def test_frontend_bucket_block_reds_on_another_accounts_bucket(env):
+    """产物里是另一个账号的桶（换账号没重部 / 陈旧 cdk.out / 两份 config 写了两个桶）⇒ 必须红。"""
+    (env["art"] / "index.py").write_text(_substituted_edge_src(OTHER_ACCOUNT), encoding="utf-8")
+    rc, out = _run(FB_BLOCK, env, prelude=READ_CFG)
+    assert rc != 0, out
+    assert _fb_domain(OTHER_ACCOUNT) in out and _fb_domain(FB_ACCOUNT) in out, out
+
+
+def test_frontend_bucket_block_reds_when_the_assignment_is_missing(env):
+    """注入点被删/改名 ⇒ 必须红，而不是"取到空串再和空串比"那种静默通过。"""
+    (env["art"] / "index.py").write_text(
+        _substituted_edge_src(FB_ACCOUNT).replace("FRONTEND_BUCKET_DOMAIN = ", "FB_DOMAIN = ", 1),
+        encoding="utf-8")
+    rc, out = _run(FB_BLOCK, env, prelude=READ_CFG)
+    assert rc != 0, out
+    assert "找不到 FRONTEND_BUCKET_DOMAIN" in out, out
+
+
+def test_frontend_bucket_block_hard_fails_when_the_account_id_key_is_missing(env):
+    """`read_cfg` 的纪律：键缺失硬失败、不回落空串（否则期望值成了 `site-frontend-.s3…`，恒红且无解释）。"""
+    (env["root"] / "router" / "config.ini").write_text("[AWS]\nregion = us-east-1\n", encoding="utf-8")
+    (env["art"] / "index.py").write_text(
+        f'FRONTEND_BUCKET_DOMAIN = "{_fb_domain(FB_ACCOUNT)}"\n', encoding="utf-8")
+    rc, out = _run(FB_BLOCK, env, prelude=READ_CFG)
+    assert rc != 0, out
+    assert "缺少 [AWS] account_id" in out, out
+
+
+def test_frontend_bucket_block_strips_an_inline_comment_from_the_account_id(env):
+    """bash 侧**剥**行内注释（`read_cfg` 原有行为），而 synth 期**拒**（`normalize_account_id`）。
+    这个不对称是刻意的，且**不会**掩盖任何真实的不一致：
+
+    带注释的 config **不可能**产出过一次部署——`normalize_account_id` 会让那次 synth 直接失败、
+    什么都不部。所以闸门在这一侧剥完得到的，正是当初构建那个产物时用的账号；按它比才是对的答案。
+    反过来在 shell 里再造一份"拒"的判定，就是多一处会与 Python 侧漂开的手抄判据。
+    """
+    (env["root"] / "router" / "config.ini").write_text(
+        f"[AWS]\naccount_id = {FB_ACCOUNT}  # 我的账号\n", encoding="utf-8")
+    (env["art"] / "index.py").write_text(
+        f'FRONTEND_BUCKET_DOMAIN = "{_fb_domain(FB_ACCOUNT)}"\n', encoding="utf-8")
+    rc, out = _run(FB_BLOCK, env, prelude=READ_CFG)
+    assert rc == 0, out

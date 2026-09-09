@@ -32,7 +32,8 @@
 #
 #     bash site-builder/scripts/scan_staged_secrets.sh --allow-hits && git commit ...
 #
-# 本仓库可预期的故意命中：*@x.com 假邮箱、000000000000 占位账号、
+# 本仓库可预期的故意命中：*@x.com 假邮箱、000000000000 / 111122223333 占位账号（后者是 test_common 与
+# router / deployer 几个测试文件的主账号夹具）、
 # ProbeOnly!2026x 探测口令、botocore Stubber 的 aws_access_key_id="t"、
 # config.ini.example 里的空 client_secret =。
 # 还有一类天然会整片命中：**本脚本自己的回归测试**

@@ -5,8 +5,14 @@
 # AWS Account Settings (REQUIRED - Must be modified)
 # ============================================================================
 [AWS]
-# Your AWS account ID (12 digits)
-account_id = 123456789012
+# Your AWS account ID (12 digits). Placeholder: replace with your own.
+# Must equal site-builder/config.ini [Platform] account_id (both files describe one account).
+# Read ONCE at synth time and validated there: exactly 12 digits, non-empty, and inline
+# comments are rejected (not stripped) -- configparser folds them into the value. Keep any
+# comment on its own line. An empty/garbled account is loud for the bucket name but SILENT
+# for the edge role's DynamoDB analytics ARN (PutItem is denied and telemetry errors are
+# swallowed by design), which is why synth validates it in one place for all three consumers.
+account_id = 000000000000
 # AWS region for deployment (must be us-east-1 for Lambda@Edge)
 region = us-east-1
 
@@ -19,7 +25,7 @@ region = us-east-1
 domain_name = *.example.com
 # ACM certificate ARN in us-east-1 region for your domain
 # Create certificate in ACM console and copy the ARN here
-certificate_arn = arn:aws:acm:us-east-1:123456789012:certificate/your-cert-id
+certificate_arn = arn:aws:acm:us-east-1:000000000000:certificate/your-cert-id
 # Fallback origin. The edge function rewrites the origin on every normal path,
 # but CloudFront resolves this domain BEFORE invoking the origin-request event —
 # so it MUST be a resolvable domain. Using a non-resolvable value (e.g. anything
@@ -88,7 +94,17 @@ stack_description = CloudFront-based dynamic subdomain routing system using Lamb
 [SiteBuilder]
 # Shared private S3 bucket holding site static assets under sites/<site_id>/...
 # The edge function reads it with SigV4; the bucket must be in us-east-1.
-frontend_bucket = site-frontend-123456789012
+# `{account_id}` is substituted from [AWS] account_id at synth time -- leave it as is.
+# This name is a CONVENTION, not a free-form setting: four producers hard-code
+# site-frontend-<account_id> (deployer/infra/app.py IAM resource ARNs and the FRONTEND_BUCKET
+# env var, panel/deploy_panel.py, upload/undeploy/mark_job via that env var, and
+# scripts/verify_deployed_components.py). Anything else makes synth FAIL -- changing the bucket
+# name means changing those four places, not this key.
+# Synth also reconciles this against site-builder/config.ini [Deployer] frontend_bucket +
+# [Platform] account_id: the two files must resolve to the SAME bucket. A mismatch is every
+# static asset 403, and on a private bucket 'no permission' and 'no such object' are both 403.
+# Inline comments are rejected, not stripped: configparser folds them into the value.
+frontend_bucket = site-frontend-{account_id}
 # Base domain for site subdomains (must match the CloudFront wildcard domain,
 # e.g. domain_name = *.example.com -> base_domain = example.com).
 # auth.<base_domain> hosts the login service.
