@@ -407,8 +407,10 @@ python3 site-builder/scripts/_session_mint.py --token-use console-upgrade --emai
   --save rotation/console-v1-upgrade.json
 #   记录里 role 写的是 `current`——那是**诚实的**：签它的就是当时的 current key（即将退役的那把）。
 #   码的 TTL 只有 60 秒，到 ⑤ 早已过期，但 §5 的合同是 **kid 先于 exp**
-#   （`session.verify_token`：kid 不在 allowlist 直接返回 `unknown_kid`，根本走不到过期判定）
-#   ⇒ ⑤ 里那个 401 证明的是"kid 已退役"，与过期无关。
+#   （`session.verify_token`：kid 不在 allowlist 直接返回 `unknown_kid`，根本走不到过期判定）。
+#   **只在本轮真的要退役 console family 时才预存它**：拿一个仍在 allowlist 里的 kid 去跑 ⑤ 的探针
+#   会得到假绿（panel 对"过期"与"未知 kid"都回 401）⇒ ⑤ 的判据是埋点的 `unknown_kid` 列，不是 401。
+#   同理，只轮 console 不轮 site 时，site 那条 `--save rotation/site-v1.json` 也不要做。
 (cd site-builder/panel && python3 deploy_panel.py --skip-frontend)
 (cd site-builder/auth && python3 deploy_auth.py)
 python3 site-builder/scripts/verify_kid_entry_live.py --role current
@@ -437,14 +439,33 @@ exit 0 才算过。26 = 站点会话 TTL 24 h + Edge 全球复制 + 余量。
 python3 site-builder/scripts/_session_mint.py --token-use site-session --role previous --save rotation/site-v1.json   # 先预存负向探针
 ```
 
-`config.ini`：`site_previous =`，删 `[SessionKey:site-rs-v1]` 小节；`app.py` 删 `SiteSessionKeyRsV1` 那**一整段**
-（`kms.Key` + `CfnOutput`；`RemovalPolicy.RETAIN` ⇒ key 留在账号里、脱离栈管理，alias 一并解绑）。**auth → panel → Edge** 重部，等 Deployed，然后：
+**退役是按 family 各做一遍的**，两个 family 的动作不一样（Edge 只持 site 公钥）：
+
+| 要退役的 family | `config.ini` | `app.py` | 重部 |
+|---|---|---|---|
+| **site** | `site_previous =`，删 `[SessionKey:site-rs-v1]` 小节 | 删 `SiteSessionKeyRsV1` 那**一整段**（`kms.Key` + `CfnOutput`） | **auth → panel → Edge**，等 CloudFront `Deployed` |
+| **console** | `console_previous =`，删 `[SessionKey:console-rs-v1]` 小节 | 删 `ConsoleSessionKeyRsV1` 那一整段 | **auth → panel**（Edge 不持 console 公钥 ⇒ 不用重部、没有 10–20 分钟窗口）|
+
+`RemovalPolicy.RETAIN` ⇒ 删掉 construct 只是让 key 脱离栈管理，key 与它的 alias 留在账号里，
+最后一步 `schedule-key-deletion` 才真的删。
+
+**只轮一个 family 时，只做那一行**：③ 的预存与下面的探针都只对**本轮真的在退役**的 family 有意义。
+拿一个仍在 allowlist 里的 kid 去跑探针会得到一条**假绿**——见下面那段。
+
+重部完（site 那行要等 CloudFront `Deployed`）之后：
 
 ```bash
-# 两个 family 各一条真机负向：站点会话必 302（Edge），升级码必 401（panel），两者的日志都 outcome=unknown_kid
+# ① 真机负向：本轮退役了哪个 family 就带哪条 --retired-token（两个都退就都带）
+#    站点会话期望 302（Edge），升级码期望 401（panel）
 python3 site-builder/scripts/verify_kid_entry_live.py \
   --retired-token .scratch/rotation/site-v1.json \
   --retired-token .scratch/rotation/console-v1-upgrade.json
+# ② **HTTP 状态本身不是证据**：预存的 token 到这时早已过期，而"过期"与"kid 已退役"在两处都被压成同一个
+#    响应（Edge 都是 302 回登录，panel 的 UpgradeRejected 都是 401）⇒ kid 其实还在 allowlist 里也会绿。
+#    分辨它们只能读埋点的 outcome：下面这张表里 `unknown_kid` 那一行，
+#    **site 探针看 `edge` 列、console 探针看 `panel` 列，本轮退役的 family 对应的那列必须 ≥ 1**。
+#    （`expired` 那一行 ≥ 1 而 `unknown_kid` 仍是 0 ⇒ 退役没生效，别继续往下走。）
+python3 site-builder/scripts/session_verify_counts.py --hours 1
 python3 site-builder/scripts/verify_account_trust_boundary.py --retire-key site-rs-v1
 python3 site-builder/scripts/verify_account_trust_boundary.py --retire-key site-rs-v1 --update-baseline
 # 不可逆：先读回 key 的描述核对账号与 alias，再排期删除（7–30 天窗口内仍可取消）
@@ -453,9 +474,11 @@ aws kms schedule-key-deletion --key-id <site-rs-v1 的 key ARN> --pending-window
 ```
 
 **console family 的真机负向探针要靠 ③ 里预存的那枚升级码**——它必须在换槽位**之前**取（换完就签不出了），
-这是整条 runbook 里唯一一处"晚了就补不回来"的取证。**码过期不影响这条证明**：§5 的合同是 kid 先于 exp
-（`session.verify_token` 在 kid 不在 allowlist 时直接返回 `unknown_kid`，根本走不到过期判定），
-和 site family 那条负向探针依赖的是同一个顺序。
+这是整条 runbook 里唯一一处"晚了就补不回来"的取证。**码过期不妨碍这条证明，但只有读了 outcome 才算证明**：
+§5 的合同是 kid 先于 exp（`session.verify_token` 在 kid 不在 allowlist 时直接返回 `unknown_kid`，
+根本走不到过期判定），所以退役生效时 outcome 一定是 `unknown_kid`；而**响应码分不出这两种情况**
+——panel 对"过期"和"未知 kid"都抛 `UpgradeRejected` ⇒ 401，Edge 对两者都 302。site family 那条
+负向探针依赖的是同一个顺序，也有同一个歧义，所以上面那张 `unknown_kid` 表是**两条探针共同的**判据。
 
 **静态证据是补充，不是替代**（探针没预存时它只能证明"配置里没有了"，证明不了线上真的拒）：
 panel 的 allowlist 单测（退役 kid 不在 `SESSION_KEYS_JSON` 里）+ `verify_deployed_components.py` 的三方
@@ -469,7 +492,7 @@ panel 的 allowlist 单测（退役 kid 不在 `SESSION_KEYS_JSON` 里）+ `veri
 |---|---|---|
 | ② 就位 | `*_previous` 清空 → 重部三处 | 要 |
 | ③ 切换 | 两槽互换回去 → 重部 panel + auth | 不要 |
-| ⑤ 退役（删 key 之前） | 填回 `*_previous` + 小节 + construct → 重部三处。**回滚后两条负向探针都会转绿失败**（旧 kid 又被接受了）——那是预期，不是新缺陷 | 要 |
+| ⑤ 退役（删 key 之前） | **按本轮退役过的每个 family 各回一遍**：site → 填回 `site_previous` + `[SessionKey:site-rs-v1]` + `SiteSessionKeyRsV1` construct，重部 auth → panel → Edge；console → 填回 `console_previous` + 小节 + `ConsoleSessionKeyRsV1`，重部 auth → panel。**回滚后对应的负向探针会失败**（旧 kid 又被接受了）——那是预期，不是新缺陷 | site 要，console 不要 |
 | ⑤ 退役（已 schedule-key-deletion） | 窗口内 `aws kms cancel-key-deletion`，否则建新 key 从 ① 重走 | 要 |
 | 代码本身有 bug | git 重部（`AUTH_PACKAGE_MODULES` / `COPY_FILES` 守卫先跑一遍） | 视改动 |
 
