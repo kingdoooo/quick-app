@@ -91,7 +91,6 @@ def reader_files() -> list[Path]:
                 continue
             if p.parent.name == "scripts" and (p.name.startswith("verify_") or p.name.startswith("probe_")):
                 continue      # 验收 / 探针脚本只读不部署，读了不算"生效"（见文件头）
-                continue
             out.append(p)
     return sorted(out)
 
@@ -186,6 +185,11 @@ def test_reader_set_covers_the_deploy_scripts_and_excludes_tests(readers):
         assert "/tests/" not in f"/{p}" and Path(p).name != "conftest.py" \
             and not Path(p).name.startswith("test_"), f"测试文件混进了读者集合：{p}"
         assert ".venv" not in p and "cdk.out" not in p, p
+    # 验收 / 探针脚本**必不在**：这条排除规则今天没有真实的金丝雀键（artifacts_bucket 删掉后仓库里恰好没有
+    # verifier-only 的键），规则被误删时全套件仍会绿——所以在这里点名钉住（Codex review）。
+    for must_not in ("site-builder/scripts/verify_deployed_components.py", "site-builder/scripts/verify_sfn_failure_paths.py",
+                     "site-builder/scripts/probe_impersonation_surface.py"):
+        assert must_not not in rel, f"验收 / 探针脚本进了读者集合：{must_not}（它读一个键不代表部署按它生效）"
 
 
 # ---- 反例与正对照：证明每条判据真的会动 ------------------------------------------------------

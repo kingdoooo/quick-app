@@ -32,7 +32,8 @@ def test_the_bucket_is_derived_from_the_account():
     "11112222333a", "111122223333 # 注释",
 ])
 def test_non_ascii_or_malformed_accounts_are_rejected(account):
-    assert account.strip().isdigit() or not account.strip().isdigit()   # 记录：isdigit 对前两种为 True
+    if account in ("١١١١٢٢٢٢٣٣٣٣", "１１１１２２２２３３３３"):
+        assert account.isdigit() and len(account) == 12, "这两条正是 isdigit() 放过的反例——它们要是不再 isdigit，负例就失去意义"
     with pytest.raises(SystemExit, match="12 位 ASCII 数字"):
         vsf.artifacts_bucket_for(account)
 
