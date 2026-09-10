@@ -1417,7 +1417,7 @@ DynamoDB 资源 ARN 与栈 Environment 三处共用那个值：空账号在桶�
 写过的桶 = 每个静态资源 403，而私有桶上「没权限」与「没这个对象」都是 403，极难诊断。
 真要换桶名就得同时改那四处。synth 还会把解析结果与 `site-builder/config.ini` 的
 `[Deployer] frontend_bucket` + `[Platform] account_id` 对账，两侧解析不出同一个桶即失败
-（抓「AWS_PROFILE 指错账号」与手抄漂移）；那份读不到时只打一行警告并跳过。
+（抓「AWS_PROFILE 指错账号」与手抄漂移）；那份**文件不存在**时只打一行警告并跳过，**存在但**缺段 / 缺键 / 语法错误 / 读不动即 synth 失败（键名拼错不许绕过对账）。
 `[SiteBuilder]` 段还必须有 `require_idp_claim` 与 `trusted_idps` 两键
 （缺任一 synth 直接 NoOptionError）。**全新部署直接填 `true` + 你的 provider
 name**；值必须是裸 `true`/`false`——configparser 会把行内注释并进值，
@@ -2550,8 +2550,10 @@ done
 1. `[Verification] fixture_issuer = true`，且 `verifier_trusted_principals` 里列出**本机凭据
    对应的底层 IAM user / role ARN**（只有列进去的 principal 能 assume `site-builder-verifier`；用
    `aws sts get-caller-identity` 看自己是谁——返回 `arn:aws:sts::…:assumed-role/<角色名>/<会话名>` 的
-   （Identity Center / AssumeRole）要换成 `arn:aws:iam::<账号>:role/<角色名>`，`deploy_auth.py` 拒会话 ARN 并会
-   打印换法）。改完要重跑 `deploy_auth.py`。
+   （Identity Center / AssumeRole）那是会话 ARN，**不要手拼**成 `role/<角色名>`：Identity Center 的权限集角色带路径
+   （`role/aws-reserved/sso.amazonaws.com/<区>/AWSReservedSSO_…`），手拼的无路径 ARN 能过语法校验、写信任策略时却找不到
+   principal。一律用 `aws iam get-role --role-name <角色名> --query Role.Arn --output text` 取完整 ARN；
+   `deploy_auth.py` 拒会话 ARN 并会打印这条换法）。改完要重跑 `deploy_auth.py`。
 2. 常驻夹具站点已建：
 
 ```bash
@@ -2620,8 +2622,9 @@ Python 脚本一律用**不带路径的 `python3`**（≥ 3.10，装了 boto3 / 
    的 `[Verification] fixture_issuer = true`，`verifier_trusted_principals` 里列出本机凭据对应的**底层 IAM
    user / role ARN**（`aws sts get-caller-identity` 的 `Arn` 是 `arn:aws:iam::…:user/…` 时直接用；Identity Center /
    AssumeRole 凭据下它给的是 `arn:aws:sts::…:assumed-role/<角色名>/<会话名>`——那是会话不是 principal，会被
-   `deploy_auth.py` 拒，要换成 `arn:aws:iam::<账号>:role/<角色名>`，Identity Center 的权限集角色带路径，用
-   `aws iam get-role --role-name <角色名> --query Role.Arn --output text` 取），然后**重跑 `deploy_auth.py`**——那条 `/fixture-session`
+   `deploy_auth.py` 拒；**不要手拼**成 `role/<角色名>`（Identity Center 的权限集角色带路径，手拼的无路径 ARN 过得了
+   语法校验、写信任策略时找不到 principal），一律用
+   `aws iam get-role --role-name <角色名> --query Role.Arn --output text` 取完整 ARN），然后**重跑 `deploy_auth.py`**——那条 `/fixture-session`
    路由与 `site-builder-verifier` 角色只在这个开关开着时才部署。不开它平台功能完整，代价是表里标
    "夹具登录态"的四条闸门跑不了（它们会响亮失败，不会静默跳过）。
 2. **常驻夹具站点**：`python3 site-builder/scripts/ensure_fixture_site.py`（幂等）。上面四条只打这个站点，

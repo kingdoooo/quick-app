@@ -7,9 +7,9 @@
 
 判据（刻意保守、可解释；**它只证明"有人读"，不证明"读它的那个组件就是采用者以为的那个"**——
 `[Deployer] jobs_table` 这类"CDK 按字面量建表、脚本按 config 读表名"的半配置态不在它射程内）：
-  · **验收脚本也算读者**（`scripts/verify_*`）——所以 `[Deployer] artifacts_bucket` / `frontend_bucket` 这两个只被
-    验收脚本读、由 CDK 写死的桶名模板能过本守卫；它们的"填了别的也无效"由脚本侧的模板解析 + 约定名核对与
-    `.example` 注释兜住（工单 10 / Codex review），不由本守卫兜。
+  · **只被验收脚本读不算「有人读」**（`scripts/verify_*.py` / `scripts/probe_*.py` 不进读者集合）：验收脚本读一个键
+    不代表部署按它生效——`[Deployer] artifacts_bucket` 就是这样一个假配置面（唯一读者是 verify_sfn_failure_paths、
+    CDK 写死桶名），已删。`[Deployer] frontend_bucket` 留着是因为 router 栈 synth（生产路径）读它做跨 config 对账。
   · 读者 = `site-builder/` 与 `router/` 下的非测试 Python 源码（tests/、test_*.py、conftest.py、
     .venv、cdk.out、fixtures 排除；测试读了 .example 不算"有人读"）。
   · 键 (S, K) 算被读 ⇔ 存在一个读者文件同时**点名** S 与 K。"点名" = 该字符串是文件里的一个
@@ -88,6 +88,9 @@ def reader_files() -> list[Path]:
             if EXCLUDED_DIRS & set(parts[:-1]):
                 continue
             if p.name == "conftest.py" or p.name.startswith("test_"):
+                continue
+            if p.parent.name == "scripts" and (p.name.startswith("verify_") or p.name.startswith("probe_")):
+                continue      # 验收 / 探针脚本只读不部署，读了不算"生效"（见文件头）
                 continue
             out.append(p)
     return sorted(out)

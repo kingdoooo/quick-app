@@ -733,15 +733,10 @@ def test_a_malformed_site_builder_value_is_a_config_error_not_a_skip(tmp_path, c
 
 @pytest.mark.parametrize("body,why", [
     (None, "整个文件不存在"),
-    ("[Platform]\naccount_id = 111122223333\n", "缺 [Deployer] frontend_bucket"),
-    ("[Deployer]\nfrontend_bucket = site-frontend-{account_id}\n", "缺 [Platform] account_id"),
 ])
-def test_a_not_yet_backfilled_site_builder_config_degrades_to_a_warning(tmp_path, clean_env, capsys, body, why):
-    """「还没有」才退化：文件不存在 / 缺段 / 缺键 ⇒ stderr 警告并跳过，**且必须仍然不抛**。
-
-    刻意**不**让它失败：切换窗口/首装顺序里 site-builder/config.ini 可能还没回填到这一段，而 router
-    侧自己那份已经够渲染出正确的桶名（四个生产方也不读这个键）。**文件存在但坏了**不在此列——见下一条。
-    """
+def test_a_missing_site_builder_config_degrades_to_a_warning(tmp_path, clean_env, capsys, body, why):
+    """**只有整个文件不存在**才退化（stderr 警告并跳过、不抛）：那是"site-builder 侧还没配置"。
+    文件存在时 [Deployer] frontend_bucket / [Platform] account_id 从 .example 复制就在——缺了是错，见下一条。"""
     path = tmp_path / "nope.ini" if body is None else _sb_config(tmp_path, body=body)
     got = _fragment().assert_frontend_bucket_matches_site_builder(CONVENTION, config_path=path)
     assert got is None
@@ -750,6 +745,10 @@ def test_a_not_yet_backfilled_site_builder_config_degrades_to_a_warning(tmp_path
 
 
 @pytest.mark.parametrize("body,why", [
+    ("[Platform]\naccount_id = 111122223333\n", "缺 [Deployer] 段（NoSectionError）"),
+    ("[Deployer]\nfrontend_buket = site-frontend-{account_id}\n[Platform]\naccount_id = 111122223333\n",
+     "键名拼错（NoOptionError）——Codex review 的复现：原先 warning 后继续 synth"),
+    ("[Deployer]\nfrontend_bucket = site-frontend-{account_id}\n", "缺 [Platform] account_id（NoSectionError）"),
     ("account_id = 111122223333\n", "没有段头（MissingSectionHeaderError）"),
     ("[Deployer]\nfrontend_bucket = site-frontend-{account_id}\nfrontend_bucket = other\n[Platform]\naccount_id = 111122223333\n",
      "重复键（DuplicateOptionError）"),
@@ -763,7 +762,7 @@ def test_a_corrupt_site_builder_config_hard_fails_instead_of_skipping(tmp_path, 
     path = _sb_config(tmp_path, body=body)
     with pytest.raises(ValueError, match="存在但读不了或不合法") as exc:
         _fragment().assert_frontend_bucket_matches_site_builder(CONVENTION, config_path=path)
-    assert "还没回填" in str(exc.value), why
+    assert "config.ini.example" in str(exc.value), why
 
 
 def test_a_site_builder_config_that_exists_but_is_unreadable_hard_fails(tmp_path, clean_env):

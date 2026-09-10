@@ -29,11 +29,10 @@ cluster_endpoint =
 jobs_table = site-deploy-jobs
 sites_table = site-sites
 admins_table = site-admins
-# 两个桶名**不是自由配置**：CDK（deployer/infra/app.py）按 site-artifacts-{account_id} / site-frontend-{account_id}
-# 写死建桶与 IAM，deploy_panel 与 upload/undeploy 同样写死；这两个键只被验收脚本读（并按同一模板插值、
-# 与约定名核对，写别的会被拒），router 侧的 [SiteBuilder] frontend_bucket 在 synth 时还会与这里对账。
-# 保持模板形态，不要填字面量、不要加行内注释。
-artifacts_bucket = site-artifacts-{account_id}
+# 前端桶名**不是自由配置**：CDK（deployer/infra/app.py）按 site-frontend-{account_id} 写死建桶与 IAM，
+# deploy_panel 与 upload/undeploy 同样写死。这个键留在这里只为一件事：router 栈 synth 时把 router/config.ini 的
+# [SiteBuilder] frontend_bucket 与它对账（两份 config 指同一个桶、同一个账号）。保持模板形态，不要填字面量、
+# 不要加行内注释；写别的 router synth 会拒。（产物桶 site-artifacts-{account_id} 同样由 CDK 写死，没有配置键。）
 frontend_bucket = site-frontend-{account_id}
 state_machine_arn =
 edge_role_arn =

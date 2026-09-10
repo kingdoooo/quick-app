@@ -680,7 +680,7 @@ def test_an_assumed_role_session_arn_is_rejected_with_the_conversion_hint(tmp_pa
     with pytest.raises(SystemExit) as exc:
         da.read_verification(c, account="111111111111")
     msg = str(exc.value)
-    assert "assumed-role" in msg and "arn:aws:iam::<账号>:role/<角色名>" in msg and "aws iam get-role" in msg, msg
+    assert "assumed-role" in msg and "不要手拼" in msg and "aws iam get-role" in msg and "aws-reserved/sso.amazonaws.com" in msg, msg
     good = "arn:aws:iam::111111111111:role/aws-reserved/sso.amazonaws.com/us-east-1/AWSReservedSSO_Admin_0123456789abcdef"
     c2 = configparser.ConfigParser()
     c2.read_string(CFG.replace("fixture_issuer = false", "fixture_issuer = true")

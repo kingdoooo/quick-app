@@ -415,7 +415,7 @@ def assert_frontend_bucket_matches_site_builder(resolved: str, *, config_path=No
     退化只在「离线」那一条与 `load_site_allowlist` 的 `_degrade` 同款（controller R17）；「读不到」那一条**刻意 fail-open**（首装顺序里 site-builder/config.ini 可能还没回填），这与 R17 的部署模式硬失败不同：
     · 显式离线（`APP_SYNTH_OFFLINE=1`）⇒ 连读都不读，stderr 警告后跳过。"只想看模板"这条路必须在
       site-builder/config.ini 还没回填时也走得通。
-    · **读不到**（文件不存在 / 缺段 / 缺键 / 解析不了）⇒ stderr 警告后跳过，**刻意不失败**：
+    · **文件不存在** ⇒ stderr 警告后跳过，**刻意不失败**（缺段 / 缺键 / 解析不了 = 文件存在但错了 ⇒ 硬失败）：
       首装顺序里 site-builder/config.ini 可能还没回填到这一段，而 router 侧自己那份已经够渲染出
       正确的桶名（四个生产方也不读这个键）。
     · **写错了**（值本身不合约定）⇒ 抛。那不是"读不到"，与 `_degrade` 里"配置写错任何模式都抛"同一条纪律。
@@ -437,18 +437,20 @@ def assert_frontend_bucket_matches_site_builder(resolved: str, *, config_path=No
             cfg.read_file(fh)
         raw = cfg.get("Deployer", "frontend_bucket")
         account = cfg.get("Platform", "account_id")
-    except (FileNotFoundError, configparser.NoSectionError, configparser.NoOptionError) as exc:
-        # **只有"还没有"才退化**：文件不存在、缺段、缺键——首装顺序里 site-builder/config.ini 可能还没回填到这一段。
-        print(f"WARNING: could not read [Deployer] frontend_bucket / [Platform] account_id from {path} "
-              f"({type(exc).__name__}: {exc}); skipping the frontend_bucket cross-config reconciliation.",
-              file=sys.stderr)
+    except FileNotFoundError:
+        # **只有整个文件不存在才退化**：那是"还没有 site-builder 侧的配置"。文件一旦存在（采用者从 .example 复制而来），
+        # [Deployer] frontend_bucket 与 [Platform] account_id 两个键就在——缺段 / 缺键不是"未回填"，是拼错键名、
+        # 旧模板或误删（Codex review：`frontend_buket` 曾能 warning 后继续 synth）。
+        print(f"WARNING: {path} does not exist; skipping the frontend_bucket cross-config reconciliation "
+              "(site-builder side not configured yet).", file=sys.stderr)
         return None
     except (OSError, configparser.Error) as exc:
-        # 文件**存在但坏了**（重复键 / 重复段 / 没有段头 / 解析错误 / 权限拒绝）不是"还没有"，是配置损坏：
-        # 这里放过去等于让一个 INI 语法错误绕开对账继续部署 router。硬失败，与 R17 对"配置错误"的处置一致。
+        # 文件**存在但**缺段 / 缺键 / 重复键 / 重复段 / 没有段头 / 解析错误 / 权限拒绝：都是配置错误，不是"还没有"。
+        # 这里放过去等于让一处手误绕开对账继续部署 router。硬失败，与 R17 对"配置错误"的处置一致。
         raise ValueError(
             f"site-builder/config.ini 存在但读不了或不合法（{type(exc).__name__}: {exc}）——"
-            "这不是首装期的「还没回填」，是文件损坏；修好它再 synth。") from exc
+            "缺段 / 缺键请对照 config.ini.example 的 [Deployer] frontend_bucket 与 [Platform] account_id；"
+            "这不是首装期的「还没回填」（那只表现为文件不存在），修好它再 synth。") from exc
     try:
         # site-builder 侧的账号走**同一个**归一化点：同样的行内注释在两份文件里必须有同样的待遇。
         other = resolve_frontend_bucket(raw, normalize_account_id(account))
