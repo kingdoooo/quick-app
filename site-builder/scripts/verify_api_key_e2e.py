@@ -8,9 +8,16 @@
      （MCP initialize → tools/list → deploy_site → 预签名 PUT → confirm_upload
       → 轮询到 SUCCEEDED → 站点 URL 可访问，且站点 owner == Key 持有者）
   ③ 吊销后**立即** 401（吊销与下一次调用之间不等待——这是"不缓存"的真机证据）
-  ④ 关闸 → **另一把有效 Key** 也 401（证明是全局关闸，不是单 Key 失效）
-  ⑤ 开闸 → 恢复
-  ⑥ 五种拒绝原因的响应体**逐字节相同**（无效 / 吊销 / 关闸 / 未知 / 没带）
+  ④ 关闸 → **另一把有效 Key** 也 401（证明是全局关闸，不是单 Key 失效）   ← 只在 --include-global-switch 时跑
+  ⑤ 开闸 → 恢复                                                            ← 同上
+  ⑥ 各种拒绝原因的响应体**逐字节相同**（无效 / 吊销 / 未知 / 没带；带开关时多一种「关闸」）
+
+**④⑤ 为什么默认不跑**：关闸是**全局**的——窗口内账号里所有真实 API Key 都 401，不只是本脚本建的两把；
+`finally` 能恢复正常异常与 Ctrl-C，但进程被超时工具 SIGTERM/SIGKILL、或恢复那次写失败时，开关会留在
+关闸态。这不是能对已有用户的环境反复跑的验收，所以分发的验收集（DEPLOY.md ⑦）跑默认模式，
+`--include-global-switch` 归开发者回归。留在关闸态的恢复：DEPLOY.md ⑤c「应急旁路」直改哨兵行。
+**没有 `[ApiKey]` 段时本脚本报 `PASS  组件缺席` 并退 0**（组件不存在是合法状态，验收集里这条无条件执行）；
+有段但哨兵行不存在仍是失败。
   N2 机器 token 直连 AgentCore、不带 on-behalf 头 → 拒（fail-closed）
   N3 非 Edge 的签名直连 key-proxy Function URL → 403
   N4 明文 Key **不在任何日志里**（key-proxy 与 panel 两个日志组）
@@ -91,7 +98,8 @@ CHECKS = 0
 FAILURES = 0
 # 全绿时的实际断言条数。低于它说明脚本中途退出或某个分支被跳过，而
 # "跑了 3 项全过"读起来跟"30 项全过"一样像成功（M3-FINDINGS §2.3）。
-MIN_CHECKS = 34
+MIN_CHECKS = 29                 # 默认（不含 ④⑤ 全局开关的 5 项）
+MIN_CHECKS_WITH_SWITCH = 34     # --include-global-switch
 
 # 哨兵行与审计里的署名。**不是某个人**——见模块 docstring 里"开关为什么不经
 # 控制台 admin 接口翻"那一段。
@@ -152,7 +160,12 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep-on-failure", action="store_true",
                     help="失败时保留 Key 与站点便于排查（开关仍会恢复）")
+    ap.add_argument("--include-global-switch", action="store_true",
+                    help="连场景 ④⑤（全局关闸 → 开闸）一起跑。**关闸窗口内所有真实 Key 都 401**，且进程被 "
+                         "SIGKILL / 超时工具杀掉时开关会留在关闸态——所以它不在分发的验收集里，属于开发者回归；"
+                         "默认跳过。恢复办法见 DEPLOY.md ⑤c「应急旁路」（哨兵行 {\"BOOL\":true}）")
     args = ap.parse_args()
+    min_checks = MIN_CHECKS_WITH_SWITCH if args.include_global_switch else MIN_CHECKS
 
     c = _cfg_obj(CFG_PATH)
     region = cfg(c, "Platform", "region")
@@ -174,8 +187,12 @@ def main() -> int:
     import _session_mint as sm
 
     if not api_key_config.api_key_enabled(c):
-        sys.exit("config.ini 无 [ApiKey] 段 = API Key 组件未启用，本验收无对象。"
-                 "先按 config.ini.example 配置该段并跑完四步部署。")
+        # 组件缺席是一个**合法状态**（config.ini 是唯一取值源：没有 [ApiKey] 段 = 组件不存在），
+        # 不是失败——验收集要求这条无条件执行，所以这里明确报 PASS 并退 0，而不是 SKIP、也不是非零。
+        # 反过来「有 [ApiKey] 段但哨兵行不存在」仍是失败（下面）：配置说启用了，部署却没做。
+        print("PASS  组件缺席：config.ini 无 [ApiKey] 段（⑤c 未启用，本验收无对象；要启用先按 "
+              "config.ini.example 配置该段并跑完四步部署）")
+        return 0
 
     mcp_url = f"https://{api_key_config.mcp_subdomain(c)}.{base}/"
 
@@ -358,48 +375,51 @@ def main() -> int:
         check(st == 401, "吊销后下一次调用立刻 401（零等待）", f"HTTP {st}")
         reject_bodies["吊销"] = revoked_body
 
-        # ─────────────────────── ④ 关闸 → 全部 Key 401 ─────────────────────
-        print("\n── ④ 关闸 → 另一把有效 Key 也 401（全局关闸）─────────")
-        alive = Mcp(mcp_url, {"x-api-key": k2})
-        st, _ = alive.initialize()
-        check(st == 200, "关闸前第二把 Key 可用（前置）", f"HTTP {st}")
-
-        keystore.set_switch(False, actor=ACTOR)
-        off = Mcp(mcp_url, {"x-api-key": k2})
-        st, off_body = off.raw_body(
-            {"jsonrpc": "2.0", "id": 98, "method": "tools/list", "params": {}})
-        check(st == 401, "关闸后有效 Key 也 401（不是单 Key 失效）", f"HTTP {st}")
-        reject_bodies["关闸"] = off_body
-
-        # 关闸窗口里顺便取另外三种拒绝的响应体：都在同一时刻取，排除"不同时间
-        # 的响应体差异"这种干扰。
+        # ─────────── 未知但形态合法的 Key → 401（与开关状态无关，所以在闸外取）────────────
         reject_bodies["未知但形态合法"] = Mcp(
             mcp_url, {"x-api-key": keygen.new_key().plaintext}).raw_body(
                 {"jsonrpc": "2.0", "id": 97, "method": "tools/list"})[1]
 
-        audits = ddb.Table("site-ops-log").query(
-            KeyConditionExpression=DdbKey("target").eq("apikey:switch"),
-            ScanIndexForward=False, Limit=5).get("Items", [])
-        check(any(a.get("action") == "disable_api_key_switch"
-                  and a.get("actor") == ACTOR for a in audits),
-              "关闸落了 ops_log 审计行且署名是本脚本",
-              f"最近 {len(audits)} 条里找不到" if not audits else f"actor={ACTOR}")
+        if args.include_global_switch:
+            # ─────────────────────── ④ 关闸 → 全部 Key 401 ─────────────────────
+            print("\n── ④ 关闸 → 另一把有效 Key 也 401（全局关闸）─────────")
+            alive = Mcp(mcp_url, {"x-api-key": k2})
+            st, _ = alive.initialize()
+            check(st == 200, "关闸前第二把 Key 可用（前置）", f"HTTP {st}")
 
-        # ─────────────────────────── ⑤ 开闸 → 恢复 ─────────────────────────
-        print("\n── ⑤ 开闸 → 立即恢复 ───────────────────────────────")
-        keystore.set_switch(True, actor=ACTOR)
-        back = Mcp(mcp_url, {"x-api-key": k2})
-        st, _ = back.initialize()
-        check(st == 200, "开闸后第二把 Key 立刻恢复可用（零等待）", f"HTTP {st}")
-        audits = ddb.Table("site-ops-log").query(
-            KeyConditionExpression=DdbKey("target").eq("apikey:switch"),
-            ScanIndexForward=False, Limit=5).get("Items", [])
-        check(any(a.get("action") == "enable_api_key_switch"
-                  and a.get("actor") == ACTOR for a in audits),
-              "开闸也落了 ops_log 审计行", f"最近 {len(audits)} 条")
+            keystore.set_switch(False, actor=ACTOR)
+            off = Mcp(mcp_url, {"x-api-key": k2})
+            st, off_body = off.raw_body(
+                {"jsonrpc": "2.0", "id": 98, "method": "tools/list", "params": {}})
+            check(st == 401, "关闸后有效 Key 也 401（不是单 Key 失效）", f"HTTP {st}")
+            reject_bodies["关闸"] = off_body
+
+            audits = ddb.Table("site-ops-log").query(
+                KeyConditionExpression=DdbKey("target").eq("apikey:switch"),
+                ScanIndexForward=False, Limit=5).get("Items", [])
+            check(any(a.get("action") == "disable_api_key_switch"
+                      and a.get("actor") == ACTOR for a in audits),
+                  "关闸落了 ops_log 审计行且署名是本脚本",
+                  f"最近 {len(audits)} 条里找不到" if not audits else f"actor={ACTOR}")
+
+            # ─────────────────────────── ⑤ 开闸 → 恢复 ─────────────────────────
+            print("\n── ⑤ 开闸 → 立即恢复 ───────────────────────────────")
+            keystore.set_switch(True, actor=ACTOR)
+            back = Mcp(mcp_url, {"x-api-key": k2})
+            st, _ = back.initialize()
+            check(st == 200, "开闸后第二把 Key 立刻恢复可用（零等待）", f"HTTP {st}")
+            audits = ddb.Table("site-ops-log").query(
+                KeyConditionExpression=DdbKey("target").eq("apikey:switch"),
+                ScanIndexForward=False, Limit=5).get("Items", [])
+            check(any(a.get("action") == "enable_api_key_switch"
+                      and a.get("actor") == ACTOR for a in audits),
+                  "开闸也落了 ops_log 审计行", f"最近 {len(audits)} 条")
+        else:
+            print("\n── ④⑤ 全局关闸 → 开闸：**默认跳过**（--include-global-switch 才做）──────")
+            print("     关闸窗口内所有真实 Key 都 401，进程被杀会留在关闸态——那是开发者回归的事，不进验收集。")
 
         # ──────────────────── ⑥ 五种拒绝**逐字节相同** ─────────────────────
-        print("\n── ⑥ 五种拒绝原因的响应体逐字节相同 ─────────────────")
+        print("\n── ⑥ 各种拒绝原因的响应体逐字节相同（默认 4 种；--include-global-switch 时 5 种）───")
         # 剩下两种在开闸状态下取（"无效形态"与"没带 Key"与开关无关）
         reject_bodies["形态无效"] = Mcp(
             mcp_url, {"x-api-key": "sk-not-a-real-key"}).raw_body(
@@ -413,7 +433,7 @@ def main() -> int:
               f"{ {k: v[:40] for k, v in reject_bodies.items()} }"
               if len(distinct) != 1 else repr(next(iter(distinct))[:60]))
         check(all(v for v in reject_bodies.values()),
-              "五种拒绝都真的拿到了响应体（不是空串蒙混过关）",
+              f"{len(reject_bodies)} 种拒绝都真的拿到了响应体（不是空串蒙混过关）",
               f"空的: {[k for k, v in reject_bodies.items() if not v]}")
 
         # ───────────────── N2 机器 token 直连 AgentCore 不带头 ──────────────
@@ -494,7 +514,8 @@ def main() -> int:
         print("\n── 清理（开关先恢复，再删资源）────────────────────")
         # **开关最先恢复**：后面的清理即便失败，也不能把生产留在关闸状态。
         try:
-            keystore.set_switch(entry_switch, actor=ACTOR)
+            if args.include_global_switch:          # 默认模式从没碰过开关：只读回核对，不写（不留假审计行）
+                keystore.set_switch(entry_switch, actor=ACTOR)
             _, now = keystore.switch_state()
             check(now == entry_switch,
                   f"开关已恢复成进入时的值（{'开' if entry_switch else '关'}）",
@@ -525,8 +546,8 @@ def main() -> int:
                     check(False, f"已删除并读回确认 Key 行（{label}）", str(exc)[:120])
 
         print()
-        if CHECKS < MIN_CHECKS:
-            print(f"❌ 只跑了 {CHECKS} 项（下限 {MIN_CHECKS}）——脚本中途退出，"
+        if CHECKS < min_checks:
+            print(f"❌ 只跑了 {CHECKS} 项（下限 {min_checks}）——脚本中途退出，"
                   "结果不可信")
             rc = 1
         elif FAILURES:

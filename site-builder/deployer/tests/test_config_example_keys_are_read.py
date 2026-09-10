@@ -7,6 +7,9 @@
 
 判据（刻意保守、可解释；**它只证明"有人读"，不证明"读它的那个组件就是采用者以为的那个"**——
 `[Deployer] jobs_table` 这类"CDK 按字面量建表、脚本按 config 读表名"的半配置态不在它射程内）：
+  · **验收脚本也算读者**（`scripts/verify_*`）——所以 `[Deployer] artifacts_bucket` / `frontend_bucket` 这两个只被
+    验收脚本读、由 CDK 写死的桶名模板能过本守卫；它们的"填了别的也无效"由脚本侧的模板解析 + 约定名核对与
+    `.example` 注释兜住（工单 10 / Codex review），不由本守卫兜。
   · 读者 = `site-builder/` 与 `router/` 下的非测试 Python 源码（tests/、test_*.py、conftest.py、
     .venv、cdk.out、fixtures 排除；测试读了 .example 不算"有人读"）。
   · 键 (S, K) 算被读 ⇔ 存在一个读者文件同时**点名** S 与 K。"点名" = 该字符串是文件里的一个

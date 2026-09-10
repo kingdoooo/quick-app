@@ -735,19 +735,49 @@ def test_a_malformed_site_builder_value_is_a_config_error_not_a_skip(tmp_path, c
     (None, "整个文件不存在"),
     ("[Platform]\naccount_id = 111122223333\n", "缺 [Deployer] frontend_bucket"),
     ("[Deployer]\nfrontend_bucket = site-frontend-{account_id}\n", "缺 [Platform] account_id"),
-    ("account_id = 111122223333\n", "没有段头（MissingSectionHeaderError）"),
 ])
-def test_an_unreadable_site_builder_config_degrades_to_a_warning(tmp_path, clean_env, capsys, body, why):
-    """读不到就 stderr 警告并跳过（与 R17 同款退化）——**且必须仍然不抛**，因为对账不是本栈的必要条件。
+def test_a_not_yet_backfilled_site_builder_config_degrades_to_a_warning(tmp_path, clean_env, capsys, body, why):
+    """「还没有」才退化：文件不存在 / 缺段 / 缺键 ⇒ stderr 警告并跳过，**且必须仍然不抛**。
 
     刻意**不**让它失败：切换窗口/首装顺序里 site-builder/config.ini 可能还没回填到这一段，而 router
-    侧自己那份已经够渲染出正确的桶名（四个生产方也不读这个键）。
+    侧自己那份已经够渲染出正确的桶名（四个生产方也不读这个键）。**文件存在但坏了**不在此列——见下一条。
     """
     path = tmp_path / "nope.ini" if body is None else _sb_config(tmp_path, body=body)
     got = _fragment().assert_frontend_bucket_matches_site_builder(CONVENTION, config_path=path)
     assert got is None
     err = capsys.readouterr().err
     assert "skipping" in err and "frontend_bucket" in err, err
+
+
+@pytest.mark.parametrize("body,why", [
+    ("account_id = 111122223333\n", "没有段头（MissingSectionHeaderError）"),
+    ("[Deployer]\nfrontend_bucket = site-frontend-{account_id}\nfrontend_bucket = other\n[Platform]\naccount_id = 111122223333\n",
+     "重复键（DuplicateOptionError）"),
+    ("[Deployer]\nfrontend_bucket = site-frontend-{account_id}\n[Deployer]\n[Platform]\naccount_id = 111122223333\n",
+     "重复段（DuplicateSectionError）"),
+    ("[Deployer\nfrontend_bucket = x\n", "段头不闭合（ParsingError）"),
+])
+def test_a_corrupt_site_builder_config_hard_fails_instead_of_skipping(tmp_path, clean_env, body, why):
+    """文件**存在但坏了**不许退化：退化只服务"还没回填"，把 INI 语法错误也放过去等于让对账可被任何一处
+    手误绕开、router 照样部署（Codex review P2）。抛 ValueError，消息点名"损坏"而不是"缺失"。"""
+    path = _sb_config(tmp_path, body=body)
+    with pytest.raises(ValueError, match="存在但读不了或不合法") as exc:
+        _fragment().assert_frontend_bucket_matches_site_builder(CONVENTION, config_path=path)
+    assert "还没回填" in str(exc.value), why
+
+
+def test_a_site_builder_config_that_exists_but_is_unreadable_hard_fails(tmp_path, clean_env):
+    """权限拒绝也是"存在但坏了"（PermissionError ⊂ OSError），不是"还没有"。root 下 chmod 000 挡不住读，跳过。"""
+    import os
+    if os.geteuid() == 0:
+        pytest.skip("root 无视文件权限位")
+    path = _sb_config(tmp_path, body="[Deployer]\nfrontend_bucket = site-frontend-{account_id}\n[Platform]\naccount_id = 111122223333\n")
+    path.chmod(0)
+    try:
+        with pytest.raises(ValueError, match="存在但读不了或不合法"):
+            _fragment().assert_frontend_bucket_matches_site_builder(CONVENTION, config_path=path)
+    finally:
+        path.chmod(0o600)
 
 
 def test_offline_synth_skips_the_cross_config_reconciliation(tmp_path, monkeypatch, capsys):

@@ -1258,6 +1258,14 @@ def _acceptance_set_violations(doc: str) -> list:
     out = [f"验收集里没列 {g}" for g in sorted(set(DISTRIBUTED_GATES) - names)]
     out += [f"验收集里混进了 {t}" for t in NOT_IN_ACCEPTANCE_SET if t in cmds]
     out += [f"验收集里多出 {n}（不在七条分发闸门里）" for n in sorted(names - set(DISTRIBUTED_GATES))]
+    # **每条都要无条件执行**：包在 `if …; then` 里的命令不跑时 bash 仍退 0，"七条全绿"就成了"六条 + 一条没跑"。
+    # 组件缺席由脚本自己表达（verify_api_key_e2e 无 [ApiKey] 段 ⇒ PASS 组件缺席、退 0），不由外层条件表达。
+    for line in cmds.splitlines():
+        if re.match(r"\s*(if|elif|case)\b", line) or re.match(r"\s+(python3|bash) site-builder/scripts/", line):
+            out.append(f"验收集里有条件执行 / 缩进的命令：{line.strip()!r}——每条闸门必须顶格无条件执行")
+    for g in DISTRIBUTED_GATES:
+        if not re.search(rf"^(python3|bash) site-builder/scripts/{re.escape(g)}( |$)", cmds, re.M):
+            out.append(f"{g} 在验收集里不是顶格无条件的一条命令")
     return out
 
 
@@ -1295,6 +1303,12 @@ def test_acceptance_set_guard_fires_on_missing_and_on_smuggled_entries():
                          + DEVELOPER_REGRESSION_HEADING, 1)
     assert any("verify_permission_matrix.py" in v for v in _acceptance_set_violations(extra)), \
         _acceptance_set_violations(extra)
+    # **条件执行**同样要红：包进 `if grep …; then … fi` 的那条不跑时 bash 仍退 0（Codex review P2）。
+    guarded = good.replace("python3 site-builder/scripts/verify_api_key_e2e.py",
+                           "if grep -q '^\\[ApiKey\\]' site-builder/config.ini; then\n"
+                           "  python3 site-builder/scripts/verify_api_key_e2e.py\nfi", 1)
+    hits = _acceptance_set_violations(guarded)
+    assert any("条件执行" in v for v in hits) and any("verify_api_key_e2e.py" in v and "顶格" in v for v in hits), hits
 
 
 def test_deploy_md_acceptance_section_gives_an_acquisition_path_for_every_prerequisite():

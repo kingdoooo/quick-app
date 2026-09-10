@@ -45,6 +45,22 @@ def read_cfg(section: str, key: str) -> str:
     return c[section][key].split("#")[0].split(";")[0].strip()
 
 
+def resolve_artifacts_bucket(raw: str, account_id: str) -> str:
+    """`[Deployer] artifacts_bucket` 是 `site-artifacts-{account_id}` 模板：这里插值，并核对结果就是 CDK 写死的
+    约定名（`deployer/infra/app.py` 用 `f"site-artifacts-{ACCOUNT}"` 建桶，不读这个键）。原先把带花括号的字面量
+    直接塞进 `ARTIFACTS_BUCKET`，验收工具就对着一个不存在的桶名跑（Codex review）。与 router 侧
+    `resolve_frontend_bucket` 同一处置：这个键不是自由配置，写别的就拒。"""
+    account = (account_id or "").strip()
+    if not account.isdigit() or len(account) != 12:
+        raise SystemExit(f"[Platform] account_id 必须是 12 位数字（当前 {account!r}）")
+    bucket = raw.strip().replace("{account_id}", account)
+    expected = f"site-artifacts-{account}"
+    if bucket != expected:
+        raise SystemExit(f"[Deployer] artifacts_bucket 解析成 {bucket!r}，但 CDK 把桶名写死为 {expected!r}——"
+                         "这个键只能是 site-artifacts-{account_id} 模板（或与之相等的字面量）")
+    return bucket
+
+
 SUFFIX = uuid.uuid4().hex[:8]
 results: list[tuple[bool, str, str]] = []
 probe_jobs: set[str] = set()
@@ -82,7 +98,8 @@ def main() -> int:
     os.environ["SITES_TABLE"] = read_cfg("Deployer", "sites_table")
     os.environ["ADMINS_TABLE"] = read_cfg("Deployer", "admins_table")
     os.environ["ROUTING_TABLE"] = read_cfg("Platform", "routing_table")
-    os.environ["ARTIFACTS_BUCKET"] = read_cfg("Deployer", "artifacts_bucket")
+    os.environ["ARTIFACTS_BUCKET"] = resolve_artifacts_bucket(
+        read_cfg("Deployer", "artifacts_bucket"), read_cfg("Platform", "account_id"))
     os.environ["BASE_DOMAIN"] = read_cfg("Platform", "base_domain")
     sm_arn = read_cfg("Deployer", "state_machine_arn")
     os.environ["STATE_MACHINE_ARN"] = sm_arn

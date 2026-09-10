@@ -429,15 +429,26 @@ def assert_frontend_bucket_matches_site_builder(resolved: str, *, config_path=No
         Path(__file__).resolve().parents[2] / "site-builder" / "config.ini"
     cfg = configparser.ConfigParser()
     try:
-        if not cfg.read(path):
+        if not path.exists():
             raise FileNotFoundError(str(path))
+        # **显式 open**：`ConfigParser.read()` 会把读不动的文件（权限拒绝 / 是目录）静默跳过、当成空配置，
+        # 那会让"存在但坏了"伪装成"缺段"而退化掉。read_file 让 OSError 子类浮出来，走下面的硬失败。
+        with path.open(encoding="utf-8") as fh:
+            cfg.read_file(fh)
         raw = cfg.get("Deployer", "frontend_bucket")
         account = cfg.get("Platform", "account_id")
-    except (OSError, configparser.Error) as exc:
+    except (FileNotFoundError, configparser.NoSectionError, configparser.NoOptionError) as exc:
+        # **只有"还没有"才退化**：文件不存在、缺段、缺键——首装顺序里 site-builder/config.ini 可能还没回填到这一段。
         print(f"WARNING: could not read [Deployer] frontend_bucket / [Platform] account_id from {path} "
               f"({type(exc).__name__}: {exc}); skipping the frontend_bucket cross-config reconciliation.",
               file=sys.stderr)
         return None
+    except (OSError, configparser.Error) as exc:
+        # 文件**存在但坏了**（重复键 / 重复段 / 没有段头 / 解析错误 / 权限拒绝）不是"还没有"，是配置损坏：
+        # 这里放过去等于让一个 INI 语法错误绕开对账继续部署 router。硬失败，与 R17 对"配置错误"的处置一致。
+        raise ValueError(
+            f"site-builder/config.ini 存在但读不了或不合法（{type(exc).__name__}: {exc}）——"
+            "这不是首装期的「还没回填」，是文件损坏；修好它再 synth。") from exc
     try:
         # site-builder 侧的账号走**同一个**归一化点：同样的行内注释在两份文件里必须有同样的待遇。
         other = resolve_frontend_bucket(raw, normalize_account_id(account))

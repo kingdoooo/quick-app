@@ -161,8 +161,16 @@ def read_verification(c: configparser.ConfigParser, *, account: str) -> Verifica
         return Verification(False, ())
     bad = [p for p in principals if not _PRINCIPAL_RE.match(p) or _PRINCIPAL_RE.match(p).group(1) != account]
     if not principals or bad:
+        hint = ""
+        if any(p.startswith("arn:aws:sts::") and ":assumed-role/" in p for p in bad):
+            # `aws sts get-caller-identity` 在 Identity Center / AssumeRole 凭据下返回的是会话 ARN，
+            # 不是能写进信任策略的 principal。给出换法，别让采用者对着正则猜。
+            hint = ("。其中 `arn:aws:sts::<账号>:assumed-role/<角色名>/<会话名>` 是**会话** ARN，要换成底层角色 "
+                    "`arn:aws:iam::<账号>:role/<角色名>`（Identity Center 的权限集角色带路径，如 "
+                    "`role/aws-reserved/sso.amazonaws.com/<区>/AWSReservedSSO_…`——用 "
+                    "`aws iam get-role --role-name <角色名> --query Role.Arn` 取完整 ARN）")
         raise SystemExit("config.ini [Verification] verifier_trusted_principals 必须是本账号精确 role/user ARN 的"
-                         f"非空清单（不接受通配），拒绝部署（任何写都未发生）：坏项 {bad}，共 {len(principals)} 项")
+                         f"非空清单（不接受通配），拒绝部署（任何写都未发生）：坏项 {bad}，共 {len(principals)} 项{hint}")
     return Verification(True, principals)
 
 

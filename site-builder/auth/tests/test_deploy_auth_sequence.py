@@ -479,7 +479,9 @@ def test_verification_on_creates_the_role_when_it_is_absent(monkeypatch):
 
 
 @pytest.mark.parametrize("bad", ["", "arn:aws:iam::111111111111:role/*", "*", "kent",
-                                 "arn:aws:iam::222222222222:user/kent"])
+                                 "arn:aws:iam::222222222222:user/kent",
+                                 # Identity Center / AssumeRole 凭据下 `aws sts get-caller-identity` 给的是会话 ARN
+                                 "arn:aws:sts::111111111111:assumed-role/AWSReservedSSO_Admin_0123456789abcdef/kent"])
 def test_verification_on_with_a_bad_principal_list_aborts_before_any_write(tmp_path, monkeypatch, bad):
     p = tmp_path / "config.ini"
     p.write_text(CFG.replace("fixture_issuer = false", "fixture_issuer = true")
@@ -664,3 +666,30 @@ def test_rerunning_main_on_a_converged_policy_writes_nothing(cfg_files, monkeypa
     da.main()
     assert fake.writes() == []
     assert [c for c in fake.calls if c[0] == "get_policy"] == [("get_policy", None, None)]
+
+
+
+def test_an_assumed_role_session_arn_is_rejected_with_the_conversion_hint(tmp_path, monkeypatch):
+    """SSO / AssumeRole 用户照文档跑 `aws sts get-caller-identity` 拿到的是 `arn:aws:sts::…:assumed-role/R/S`。
+    它被拒是对的（信任策略要的是 principal，不是会话）——但错误里必须告诉人怎么换，否则采用者只能对着正则猜。
+    正对照：带路径的 Identity Center 角色 ARN（`role/aws-reserved/sso.amazonaws.com/<区>/AWSReservedSSO_…`）被接受。"""
+    sso_session = "arn:aws:sts::111111111111:assumed-role/AWSReservedSSO_Admin_0123456789abcdef/kent"
+    c = configparser.ConfigParser()
+    c.read_string(CFG.replace("fixture_issuer = false", "fixture_issuer = true")
+                  .replace("verifier_trusted_principals =", f"verifier_trusted_principals = {sso_session}"))
+    with pytest.raises(SystemExit) as exc:
+        da.read_verification(c, account="111111111111")
+    msg = str(exc.value)
+    assert "assumed-role" in msg and "arn:aws:iam::<账号>:role/<角色名>" in msg and "aws iam get-role" in msg, msg
+    good = "arn:aws:iam::111111111111:role/aws-reserved/sso.amazonaws.com/us-east-1/AWSReservedSSO_Admin_0123456789abcdef"
+    c2 = configparser.ConfigParser()
+    c2.read_string(CFG.replace("fixture_issuer = false", "fixture_issuer = true")
+                   .replace("verifier_trusted_principals =", f"verifier_trusted_principals = {good}"))
+    assert da.read_verification(c2, account="111111111111").trusted_principals == (good,)
+    # 非 assumed-role 的坏项不带这段提示（提示只在有会话 ARN 时出现，避免误导）
+    c3 = configparser.ConfigParser()
+    c3.read_string(CFG.replace("fixture_issuer = false", "fixture_issuer = true")
+                   .replace("verifier_trusted_principals =", "verifier_trusted_principals = kent"))
+    with pytest.raises(SystemExit) as exc3:
+        da.read_verification(c3, account="111111111111")
+    assert "assumed-role" not in str(exc3.value)

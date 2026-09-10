@@ -572,7 +572,7 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
 ```
 ①身份层 → ③DSQL → ④执行器(第一次) → 回填 [SessionKeys] → ②路由层 → 回填 edge_role_arn → ④执行器(第二次) → auth → ⑤部署MCP → ⑤b控制台 → 夹具站点 → ⑥客户端接入 → ⑦部署后验收
  deploy_pool.py    cluster   SFN+Lambda+两把CMK  session_key_       CloudFront   [Deployer]         同一条 cdk        deploy_   AgentCore   deploy_panel   ensure_      Skill+MCP        验收集（七条）
- (Task 3)          (Task 13) (Task 17)           fingerprint.py     (Task 8)     edge_role_arn      deploy 再跑一次    auth.py   (Task 20)   (二期 M3)      fixture_     (Task 22)        
+ (Task 3)          (Task 13) (Task 17)           fingerprint.py     (Task 8)     edge_role_arn      deploy 再跑一次    auth.py   (Task 20)   (二期 M3)      fixture_     (Task 22)
                                                  --from-stack                                                                                              site.py
                                              ⑤c API Key（可选，二期 M4）· ⑤d 访问统计（二期 M5）
 ```
@@ -2548,8 +2548,10 @@ done
 两件前置，缺任一闸门会响亮失败（不是静默跳过）：
 
 1. `[Verification] fixture_issuer = true`，且 `verifier_trusted_principals` 里列出**本机凭据
-   对应的 IAM ARN**（只有列进去的 principal 能 assume `site-builder-verifier`；用
-   `aws sts get-caller-identity` 看自己是谁）。改完要重跑 `deploy_auth.py`。
+   对应的底层 IAM user / role ARN**（只有列进去的 principal 能 assume `site-builder-verifier`；用
+   `aws sts get-caller-identity` 看自己是谁——返回 `arn:aws:sts::…:assumed-role/<角色名>/<会话名>` 的
+   （Identity Center / AssumeRole）要换成 `arn:aws:iam::<账号>:role/<角色名>`，`deploy_auth.py` 拒会话 ARN 并会
+   打印换法）。改完要重跑 `deploy_auth.py`。
 2. 常驻夹具站点已建：
 
 ```bash
@@ -2589,7 +2591,7 @@ claude mcp add --transport http site-builder-deploy {mcp_endpoint_url} \
 **怎么知道它对：下面「验收集」那个围栏块里的七条命令全绿。** 七条分三层——线上产物就是这份源码
 （前两条）、鉴权在边缘生效（第三、四条）、三条业务链路在真机上可用（后三条）。任一条红：先读它自己
 打印的 `FAIL` 行（每条都是失败即非零退出、不会只打印不通过），再回到对应组件小节末尾的「实测坑」。
-它们只碰自己建的一次性资源并读回清理，可以对已有用户的环境反复跑。
+它们只碰自己建的一次性资源并读回清理，可以对已有用户的环境反复跑——第七条**默认不做全局关闸**（`--include-global-switch` 才做，那属于下面的开发者回归：关闸窗口内账号里所有真实 Key 都 401，进程被杀会留在关闸态，恢复见 ⑤c「应急旁路」）。
 
 **不在验收集里的两组工具各有自己的小节**：全量 E2E 是开发者回归（见下），账号信任边界闸门与冒充面
 探针是可选自检（见下）。它们回答的都不是"这次部署对不对"。
@@ -2610,13 +2612,16 @@ Python 脚本一律用**不带路径的 `python3`**（≥ 3.10，装了 boto3 / 
 | `verify_session_token_semantics.py` | 夹具登录态 | `[Verification]` + 常驻夹具站点（见下一段） | 只发 GET |
 | `verify_console_e2e.py` | 夹具登录态；部署了 ⑤b 控制台 | 同上 | 建两条 fixture 记录，删后强一致读回 |
 | `verify_analytics_e2e.py` | 夹具登录态 **+ 一个真实用户的 OAuth token** | 同上；token 见下面第 3 条 | 自建一次性站点、发真实请求、跑一次 rollup，再逐个清理 |
-| `verify_api_key_e2e.py` | `[ApiKey]` 段（⑤c 已启用）+ 夹具登录态 | 只有启用 ⑤c 的采用者才有这条 | 创建真实 Key 并完成一次真实部署；场景 ④ 临时关闸再开回（`finally` 恢复） |
+| `verify_api_key_e2e.py` | `[ApiKey]` 段（⑤c 已启用）+ 夹具登录态 | 只有启用 ⑤c 的采用者才有这条 | 创建真实 Key 并完成一次真实部署；**默认不碰全局开关**（④⑤ 关闸/开闸只在 `--include-global-switch` 下跑，见开发者回归） |
 
 夹具登录态与 OAuth token 是两个**不同**的东西，各有一条获取路径：
 
 1. **夹具登录态**（`[Verification]`，可选组件；详见「夹具站点与验收前置」一节）。`site-builder/config.ini`
-   的 `[Verification] fixture_issuer = true`，`verifier_trusted_principals` 里列出本机凭据对应的 IAM ARN
-   （`aws sts get-caller-identity` 的 `Arn`），然后**重跑 `deploy_auth.py`**——那条 `/fixture-session`
+   的 `[Verification] fixture_issuer = true`，`verifier_trusted_principals` 里列出本机凭据对应的**底层 IAM
+   user / role ARN**（`aws sts get-caller-identity` 的 `Arn` 是 `arn:aws:iam::…:user/…` 时直接用；Identity Center /
+   AssumeRole 凭据下它给的是 `arn:aws:sts::…:assumed-role/<角色名>/<会话名>`——那是会话不是 principal，会被
+   `deploy_auth.py` 拒，要换成 `arn:aws:iam::<账号>:role/<角色名>`，Identity Center 的权限集角色带路径，用
+   `aws iam get-role --role-name <角色名> --query Role.Arn --output text` 取），然后**重跑 `deploy_auth.py`**——那条 `/fixture-session`
    路由与 `site-builder-verifier` 角色只在这个开关开着时才部署。不开它平台功能完整，代价是表里标
    "夹具登录态"的四条闸门跑不了（它们会响亮失败，不会静默跳过）。
 2. **常驻夹具站点**：`python3 site-builder/scripts/ensure_fixture_site.py`（幂等）。上面四条只打这个站点，
@@ -2631,7 +2636,7 @@ Python 脚本一律用**不带路径的 `python3`**（≥ 3.10，装了 boto3 / 
 
 ```bash
 set -euo pipefail
-cd {仓库根}
+cd "$(git rev-parse --show-toplevel)"
 
 # 1 线上每个 Lambda 产物 == 这份源码（含 Function URL 授权、会话 key 的 env/config/KMS 三方对账、
 #   Edge 产物里只有 site 公钥、⑦ console route 形态、⑨ 统计管道的副本区集合）
@@ -2646,10 +2651,9 @@ python3 site-builder/scripts/verify_session_token_semantics.py
 python3 site-builder/scripts/verify_console_e2e.py
 # 6 访问统计全链路：真实请求 → Edge 埋点 → rollup → 面板与 MCP 读回同一组数字（MCP 段要上面第 3 条的 token）
 python3 site-builder/scripts/verify_analytics_e2e.py
-# 7 API Key 通道（⑤c 是可选组件：没启用就没有验收对象，脚本会明确退出说明，不是 SKIP）
-if grep -q '^\[ApiKey\]' site-builder/config.ini; then
-  python3 site-builder/scripts/verify_api_key_e2e.py
-fi
+# 7 API Key 通道（⑤c 是可选组件：config.ini 没有 [ApiKey] 段时脚本打印 `PASS  组件缺席` 并退 0——组件不存在是合法状态；
+#   有段但哨兵行不存在才是失败。默认**不**做全局关闸，见开发者回归）
+python3 site-builder/scripts/verify_api_key_e2e.py
 ```
 
 顺序有两处是硬的：第 1、2 条在业务闸门**之前**——产物是旧的时候，后面五条的结果没有解读价值
@@ -2676,8 +2680,11 @@ fi
 提交前跑它；采用者不需要。
 
 ```bash
-cd {仓库根}
+cd "$(git rev-parse --show-toplevel)"
 RUN_E2E=1 site-builder/deployer/.venv/bin/pytest site-builder/deployer/tests/test_e2e_fixtures.py -q
+# API Key 通道的场景 ④⑤（全局关闸 → 开闸）：窗口内所有真实 Key 401、进程被杀会留在关闸态（恢复见 ⑤c「应急旁路」），
+# 所以只在这里跑、不进验收集（默认模式已在验收集里跑过其余场景）
+python3 site-builder/scripts/verify_api_key_e2e.py --include-global-switch
 ```
 
 轮转会话密钥时的两个探针（`verify_kid_entry_live.py` 的 `--role` / `--retired-token`、
@@ -2692,7 +2699,7 @@ CMK、能给自己授权（`kms:PutKeyPolicy` / `kms:CreateGrant`）、能改 au
 专用账号里它主要用来发现漂移。两个都**只读**，用不带路径的 `python3`。
 
 ```bash
-cd {仓库根}
+cd "$(git rev-parse --show-toplevel)"
 mkdir -p .scratch   # 下面 --dump-observed 的落点。闸门是原子写（临时文件建在目标的**父目录**里），
                     # 父目录不存在就 FileNotFoundError——而那一步在**跑完十几分钟之后**才执行，
                     # 全新 clone 里没有 .scratch/
