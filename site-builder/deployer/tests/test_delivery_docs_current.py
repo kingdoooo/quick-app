@@ -1366,3 +1366,34 @@ def test_deploy_md_overview_arrow_ends_at_acceptance():
     就该得到"对不对"的答案。"""
     sec = _section(_read(DEPLOY), "## 部署顺序总览")
     assert "⑦部署后验收" in sec, "箭头图最后一格不是 ⑦部署后验收"
+
+
+# ── 工单 07：ADR 0006 的实现机理措辞（决策没变，只修机理 ⇒ 不 supersede）──────
+
+ADR_0006 = ROOT / "docs" / "adr" / "0006-built-in-cognito-admin-created-users-idp-mode.md"
+
+
+def test_adr_0006_names_the_real_email_immutability_mechanism():
+    """ADR 0006 原文写的"应用客户端对 `email` 只读"**按字面做不出来**（工单 06 Q3
+    实测）：显式给出的 WriteAttributes 必须包含全部 Required=True 属性，
+    `["name"]` 被 InvalidParameterException 拒，而 `["email","name"]` 反而被接受。
+    真正的实现点是用户池 schema 的 `Mutable=False`。
+
+    ADR 是 accepted 状态的 tracked 决策文档，读它的人会照着实现 ⇒ 机理写错的代价
+    是有人去配 WriteAttributes 并以为拿到了一条边界。**决策没变，所以不 supersede。**
+    """
+    doc = _read(ADR_0006)
+    assert "Mutable" in doc, "ADR 0006 没点名 schema 的 Mutable=False（真实实现点）"
+    assert "邮箱属性对应用客户端不可写" not in doc, \
+        "ADR 0006 还留着按字面做不出来的那句措辞"
+    # 提到 WriteAttributes 时必须是"它不是防线"的意思
+    for i, line in enumerate(doc.splitlines()):
+        if "WriteAttributes" in line:
+            assert "不是" in line, f"ADR 0006:{i + 1} 把 WriteAttributes 说成了防线"
+
+
+def test_adr_0006_no_longer_says_the_mode_is_unimplemented():
+    """模式已落地 ⇒ "待实现"是过时口径（否定断言覆盖整份文件）。"""
+    doc = _read(ADR_0006)
+    for stale in ("待实现", "07 实现"):
+        assert stale not in doc, f"ADR 0006 还写着 {stale!r}"
