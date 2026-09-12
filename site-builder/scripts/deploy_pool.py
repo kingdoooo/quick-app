@@ -337,8 +337,13 @@ def client_configs(base_domain: str, extra_mcp_callbacks: list[str],
             "CallbackURLs": [],
             # machine 走 client_credentials，与用户身份无关
             "SupportedIdentityProviders": ["COGNITO"],
-            # 不开任何原生认证 flow（与 site/mcp 同一条边界）
-            "ExplicitAuthFlows": [],
+            # 不开任何原生认证 flow（与 site/mcp 同一条边界）。
+            # **必须是显式的 ["ALLOW_REFRESH_TOKEN_AUTH"]，不能是 []**：空数组被
+            # Cognito 当成"未指定"，而未指定的默认值含 ALLOW_USER_SRP_AUTH +
+            # ALLOW_CUSTOM_AUTH（工单 06 实测：[] 时 USER_SRP_AUTH 调 InitiateAuth
+            # 成功返回挑战）。client_credentials 与 ExplicitAuthFlows 正交，
+            # 收紧它不影响 key-proxy 换 token。
+            "ExplicitAuthFlows": list(NATIVE_AUTH_DISABLED),
         }
     return out
 
@@ -676,8 +681,17 @@ def _assert_no_native_flows(key: str, params: dict) -> None:
     放在下发之前——配置漂移（有人为了调试加回 USER_PASSWORD_AUTH）会让
     allowed_users="org" 的边界失效，而 claim 校验拦不住"原生认证 → refresh
     洗白"这条路径。
+
+    **空 / 缺席同样是缺陷**（工单 06 实测）：Cognito 把它当成"未指定"，默认值是
+    ALLOW_REFRESH_TOKEN_AUTH + ALLOW_USER_SRP_AUTH + ALLOW_CUSTOM_AUTH ⇒ 能力面
+    是开着的，而与 NATIVE_AUTH_FLOWS 求交集恰好为空 ⇒ 两道闸门一起瞎掉。
     """
     flows = set(params.get("ExplicitAuthFlows") or [])
+    if not flows:
+        raise SystemExit(
+            f"client {key} 的 ExplicitAuthFlows 为空 / 未给——Cognito 会把它当成"
+            "「未指定」并套用默认值（含 ALLOW_USER_SRP_AUTH + ALLOW_CUSTOM_AUTH），"
+            f"等于原生认证全开。必须显式给 {NATIVE_AUTH_DISABLED}。")
     bad = flows & set(NATIVE_AUTH_FLOWS)
     if bad:
         raise SystemExit(
@@ -686,11 +700,20 @@ def _assert_no_native_flows(key: str, params: dict) -> None:
 
 
 def _verify_no_native_flows(cog, pool_id: str, clients: dict) -> None:
-    """下发后读回复验：update_user_pool_client 是整体替换，漏传即被清空/改写。"""
+    """下发后读回复验：update_user_pool_client 是整体替换，漏传即被清空/改写。
+
+    **读回 [] / None 也要红**：那是"未指定" ⇒ 线上能力面含 SRP + CUSTOM
+    （工单 06 实测），而旧判据会为它打印一行 ✓。
+    """
     for key, client_id in clients.items():
         desc = cog.describe_user_pool_client(
             UserPoolId=pool_id, ClientId=client_id)["UserPoolClient"]
         flows = set(desc.get("ExplicitAuthFlows") or [])
+        if not flows:
+            raise SystemExit(
+                f"client {key}({client_id}) 线上的 ExplicitAuthFlows 是空 / 未设——"
+                "Cognito 按「未指定」套默认值（含 SRP + CUSTOM），原生认证实际开着，"
+                f"中止。期望恰好是 {NATIVE_AUTH_DISABLED}（spec §3.5 第 4 条）")
         bad = flows & set(NATIVE_AUTH_FLOWS)
         if bad:
             raise SystemExit(

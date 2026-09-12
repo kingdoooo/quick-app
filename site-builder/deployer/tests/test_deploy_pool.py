@@ -198,7 +198,7 @@ def test_machine_client_with_scopes_is_client_credentials_only():
     assert machine["AllowedOAuthScopes"] == ["site-builder/deploy"]
     assert machine["GenerateSecret"] is True
     assert machine["CallbackURLs"] == []
-    assert machine["ExplicitAuthFlows"] == []
+    assert machine["ExplicitAuthFlows"] == ["ALLOW_REFRESH_TOKEN_AUTH"]
 
 
 @pytest.mark.parametrize("key", ["site", "mcp"])
@@ -883,27 +883,61 @@ def test_ensure_resource_server_adds_missing_scope_preserving_others():
         stub.assert_no_pending_responses()
 
 
-def test_machine_client_passes_both_native_flow_gates():
-    """machine client 的 ExplicitAuthFlows 是**空列表**，两道闸门必须放行它。
+def test_machine_client_explicitly_disables_native_flows_not_empty_list():
+    """machine client 的 ExplicitAuthFlows 必须是**显式的** ["ALLOW_REFRESH_TOKEN_AUTH"]。
 
-    两道闸门判的是"有没有**开**原生 flow"（与 NATIVE_AUTH_FLOWS 求交集），
-    不是"有没有配 flow"。将来若有人把判定"收严"成
-    `flows == set(NATIVE_AUTH_DISABLED)`，machine client 会当场部署失败——
-    而那个改动看起来像是加固。这条用例锁住这一点。
+    **这条用例取代了原先那条锁死"`[]` 必须放行"的用例**，因为它的前提被实测推翻了
+    （工单 06）：Cognito 把空数组当成**未指定**，而未指定的默认值是
+    ALLOW_REFRESH_TOKEN_AUTH + **ALLOW_USER_SRP_AUTH** + **ALLOW_CUSTOM_AUTH**。
+    实测（对一个 ExplicitAuthFlows=[] 的 client 带正确 SECRET_HASH 调 InitiateAuth）：
+    `USER_SRP_AUTH` **成功返回挑战**，`CUSTOM_AUTH` 只因没配 lambda 而失败 ⇒ 两个
+    flow 都是开的。改成显式那一项后三者全部 `not enabled`。
+
+    所以"读回来是空"与"能力面是空"是两件事，中间差一次**行为**验证——这也是
+    NATIVE_AUTH_DISABLED 一开始就写成 ["ALLOW_REFRESH_TOKEN_AUTH"] 而不是 [] 的原因。
     """
     from botocore.stub import Stubber
     machine = dp.client_configs("example.com", [], idp_name="Okta",
                                 include_machine=True,
                                 machine_scopes=("site-builder-mcp/invoke",))["machine"]
-    assert machine["ExplicitAuthFlows"] == []
+    assert machine["ExplicitAuthFlows"] == ["ALLOW_REFRESH_TOKEN_AUTH"]
     dp._assert_no_native_flows("machine", machine)          # 不得抛
 
     cog = _resource_server_cog()
     with Stubber(cog) as stub:
         stub.add_response("describe_user_pool_client",
-                          {"UserPoolClient": {"ExplicitAuthFlows": []}},
+                          {"UserPoolClient": {"ExplicitAuthFlows":
+                                              ["ALLOW_REFRESH_TOKEN_AUTH"]}},
                           {"UserPoolId": "us-east-1_x", "ClientId": "m1"})
         dp._verify_no_native_flows(cog, "us-east-1_x", {"machine": "m1"})
+
+
+@pytest.mark.parametrize("flows", [[], None])
+def test_assert_no_native_flows_rejects_unspecified(flows):
+    """空 / 缺席同样要被拦：它等于"未指定" ⇒ Cognito 的默认值把 SRP 与 CUSTOM 打开。
+
+    这条判据不能只写在 machine client 的用例里——闸门本身必须会红，否则下一个
+    手抄一份 client 参数的人照样能把 `[]` 递进去。
+    """
+    params = {} if flows is None else {"ExplicitAuthFlows": flows}
+    with pytest.raises(SystemExit, match="未指定|显式"):
+        dp._assert_no_native_flows("probe", params)
+
+
+@pytest.mark.parametrize("flows", [[], None])
+def test_verify_no_native_flows_rejects_unspecified_readback(flows):
+    """读回复验同样要拦空值：线上读回 [] / None 时能力面是**开着**的
+    （SRP + CUSTOM），而旧判据会把它当成"边界成立"打印一行 ✓。"""
+    import boto3
+    from botocore.stub import Stubber
+    live = {} if flows is None else {"ExplicitAuthFlows": flows}
+    cog = boto3.client("cognito-idp", region_name="us-east-1",
+                       aws_access_key_id="t", aws_secret_access_key="t")
+    with Stubber(cog) as stub:
+        stub.add_response("describe_user_pool_client", {"UserPoolClient": live},
+                          {"UserPoolId": "us-east-1_test", "ClientId": "c1"})
+        with pytest.raises(SystemExit, match="未指定|显式"):
+            dp._verify_no_native_flows(cog, "us-east-1_test", {"site": "c1"})
 
 
 def test_store_client_secrets_writes_machine_secret_when_it_exists():
