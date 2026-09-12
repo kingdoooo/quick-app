@@ -479,8 +479,13 @@ def _idp(**over):
     return base
 
 
-def _captured_mapping(idp: dict) -> dict:
-    """跑 _ensure_oidc_idp 的 create 分支，抓它下发的 AttributeMapping。"""
+def _captured_idp_call(idp: dict, *, mode: str = dp.IDP_MODE_EXTERNAL) -> dict:
+    """跑 _ensure_oidc_idp 的 create 分支，抓它下发的**全部**参数。
+
+    工单 07 让这个函数变成模式感知的（secret 的来源随模式不同），所以既要能看
+    AttributeMapping 也要能看 ProviderDetails —— 两处各写一份 Stubber 样板就是
+    第二份真源，所以 `_captured_mapping` 改成薄封装。
+    """
     seen = {}
 
     class _Cog:
@@ -497,8 +502,13 @@ def _captured_mapping(idp: dict) -> dict:
         def update_identity_provider(self, **kw):
             seen.update(kw)
 
-    dp._ensure_oidc_idp(_Cog(), "us-east-1_x", idp)
-    return seen["AttributeMapping"]
+    dp._ensure_oidc_idp(_Cog(), "us-east-1_x", idp, mode=mode)
+    return seen
+
+
+def _captured_mapping(idp: dict) -> dict:
+    """跑 _ensure_oidc_idp 的 create 分支，抓它下发的 AttributeMapping。"""
+    return _captured_idp_call(idp)["AttributeMapping"]
 
 
 def test_idp_client_secret_can_come_from_env(monkeypatch):
@@ -1776,3 +1786,67 @@ def test_ensure_idp_pool_client_fails_loudly_without_a_secret():
                                UserPoolId="us-east-1_a"))
         with pytest.raises(SystemExit, match="client_secret"):
             dp._ensure_idp_pool_client(cog, "us-east-1_a", idpresponse)
+
+
+# ---------------------------------------------------------------------------
+# 工单 07：_ensure_oidc_idp 模式感知 + 派生 issuer / client_id / secret
+# ---------------------------------------------------------------------------
+
+def test_cognito_mode_idp_derives_issuer_from_the_new_pool():
+    """issuer 是池的 discovery 地址（不是托管域名）——托管域名只出现在 discovery
+    文档里的三个端点上。写错这一条的症状是 create_identity_provider 就失败。"""
+    src = _idp_cognito()
+    out = dp.cognito_mode_idp(src, region="us-east-1", idp_pool_id="us-east-1_abc",
+                              client_id="c1", client_secret="s1")
+    assert out["issuer"] == "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_abc"
+    assert out["client_id"] == "c1"
+    assert out["client_secret"] == "s1"
+    assert out["provider_name"] == "CognitoSource"     # config 的值原样带过
+    assert "issuer" not in src                          # 不得改动入参
+
+
+def test_cognito_mode_ignores_sb_idp_client_secret_env(monkeypatch):
+    """**环境变量不许覆盖派生出来的 secret。**
+
+    `SB_IDP_CLIENT_SECRET` 是 external-oidc 那条路的注入通道（让明文只活在子进程
+    里）。内置模式下 secret 是本次运行刚从新建的 client 上读到的，如果环境里恰好
+    留着上一条路的值，覆盖的后果是 provider 带着一个错的 secret 建成功、
+    **到用户登录换 token 那一刻才报 invalid_client**。
+    """
+    monkeypatch.setenv("SB_IDP_CLIENT_SECRET", "STALEsecretfromanotherIdP0001")
+    idp = dp.cognito_mode_idp(_idp_cognito(), region="us-east-1",
+                              idp_pool_id="us-east-1_abc", client_id="c1",
+                              client_secret="DERIVEDsecretFROMnewPOOL0001")
+    seen = _captured_idp_call(idp, mode=dp.IDP_MODE_COGNITO)
+    assert seen["ProviderDetails"]["client_secret"] == "DERIVEDsecretFROMnewPOOL0001"
+    assert seen["ProviderType"] == "OIDC"
+    assert seen["ProviderName"] == "CognitoSource"
+
+
+def test_external_mode_still_prefers_the_env_secret(monkeypatch):
+    """回归钉子：external-oidc 那条路的注入通道不能被改坏
+    （既有用例 test_idp_client_secret_can_come_from_env 也覆盖，这条锁"模式参数
+    不影响它"）。"""
+    monkeypatch.setenv("SB_IDP_CLIENT_SECRET", "ENVsecret0001")
+    seen = _captured_idp_call(_idp(client_secret="cfg"),
+                              mode=dp.IDP_MODE_EXTERNAL)
+    assert seen["ProviderDetails"]["client_secret"] == "ENVsecret0001"
+
+
+def test_cognito_mode_still_maps_email_verified():
+    """内置池发 email_verified（建户时置 true），映射必须照常配上——
+    平台侧 require_email_verified 默认 true，缺映射时该池所有登录都会被拒。"""
+    idp = dp.cognito_mode_idp(_idp_cognito(), region="us-east-1",
+                              idp_pool_id="us-east-1_abc", client_id="c1",
+                              client_secret="s1")
+    seen = _captured_idp_call(idp, mode=dp.IDP_MODE_COGNITO)
+    assert seen["AttributeMapping"] == {"email": "email", "name": "name",
+                                        "email_verified": "email_verified"}
+
+
+def test_cognito_mode_without_a_derived_secret_is_an_internal_invariant():
+    """内置模式下 secret 为空 = main() 的接线坏了，不是配置问题。
+    文案必须说清这一点，否则采用者会去 config.ini 里找一个本该留空的键。"""
+    idp = dict(_idp_cognito(), client_secret="")
+    with pytest.raises(SystemExit, match="内部不变量"):
+        _captured_idp_call(idp, mode=dp.IDP_MODE_COGNITO)

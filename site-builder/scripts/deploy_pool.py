@@ -967,8 +967,26 @@ def _ensure_branding(cog, pool_id: str, clients: dict) -> None:
             print(f"  {key}: branding 已存在")
 
 
-def _ensure_oidc_idp(cog, pool_id: str, idp: dict) -> None:
-    """联邦一个 OIDC IdP。飞书适配器与标准 IdP（Okta 等）走同一条路径。
+def cognito_mode_idp(idp: dict, *, region: str, idp_pool_id: str,
+                     client_id: str, client_secret: str) -> dict:
+    """把刚建好的内置 IdP 池派生成 `_ensure_oidc_idp` 认的那份 idp dict。
+
+    issuer 是**池的 discovery 地址**（`https://cognito-idp.{region}.amazonaws.com/
+    {poolId}`），不是托管域名——托管域名只出现在 discovery 文档里的
+    authorize / token / userinfo 三个端点上（所以域名仍是必需的，见 _ensure_domain）。
+
+    返回新 dict，不改入参（调用方还要用 config 的原值打印回填提示）。
+    """
+    return {**idp,
+            "issuer": f"https://cognito-idp.{region}.amazonaws.com/{idp_pool_id}",
+            "client_id": client_id,
+            "client_secret": client_secret}
+
+
+def _ensure_oidc_idp(cog, pool_id: str, idp: dict, *,
+                     mode: str = IDP_MODE_EXTERNAL) -> None:
+    """联邦一个 OIDC IdP。飞书适配器、标准 IdP（Okta 等）与**内置 Cognito 池**
+    走同一条路径。
 
     **email 的可信度是整个授权模型的地基**：owner / collaborators /
     allowed_users / 会话 claim 全以 email 为键。而联邦映射进 Cognito 的 email
@@ -988,20 +1006,38 @@ def _ensure_oidc_idp(cog, pool_id: str, idp: dict) -> None:
       · 它证明"IdP 声明该邮箱已验证"，不证明"邮箱不可被用户自改"。真正的
         强约束是企业 IdP 侧保证邮箱唯一且用户不可自改。
       · 长期正解是把授权主键换成 issuer+subject，email 只作展示（spec 未来项）。
+
+    **secret 的来源随模式不同**：
+      · external-oidc：环境变量 SB_IDP_CLIENT_SECRET 优先，其次 config（明文只活在
+        子进程里）；两者都缺时**部署期**退出——空 secret 建出的 provider 只在用户
+        登录换 token 那一刻才报 invalid_client。
+      · cognito-admin：secret 由本次运行从新建的 IdP client 派生，**不读环境变量**。
     """
     name = idp["provider_name"]
-    # secret 优先从环境变量取：config.ini 虽 gitignored，但落成磁盘明文仍会
-    # 进备份 / 编辑器缓存 / 误 cat 的终端回滚。用
-    #   asm-exec -- env SB_IDP_CLIENT_SECRET={{resolve:secretsmanager:…}} \
-    #     python3 deploy_pool.py
-    # 可让明文只存在于子进程。显式注入优先于 config 值。
-    secret = os.environ.get("SB_IDP_CLIENT_SECRET", "").strip() \
-        or idp.get("client_secret", "").strip()
-    if not secret:
-        sys.exit(f"IdP {name} 缺 client_secret：填 config.ini [IdP] client_secret，"
-                 "或用环境变量 SB_IDP_CLIENT_SECRET 注入。\n"
-                 "空值建出的 provider 会在**用户登录时**才失败"
-                 "（回调报 invalid_client），比部署时报错难查得多。")
+    if mode == IDP_MODE_COGNITO:
+        # secret 是本次运行刚从新建的 IdP client 上读到的（cognito_mode_idp 派生）。
+        # **绝不读环境变量**：环境里若留着 external-oidc 那条路的 SB_IDP_CLIENT_SECRET，
+        # 覆盖后果是 provider 带着一个错的 secret 建成功，到用户登录换 token 那一刻
+        # 才报 invalid_client。
+        secret = str(idp.get("client_secret", "")).strip()
+        if not secret:
+            raise SystemExit(
+                f"内部不变量被破坏：{IDP_MODE_COGNITO} 模式下 client_secret 应由 "
+                "_ensure_idp_pool_client 派生。这不是配置问题（那三个键本就该留空），"
+                "请检查 main() 的接线。")
+    else:
+        # secret 优先从环境变量取：config.ini 虽 gitignored，但落成磁盘明文仍会
+        # 进备份 / 编辑器缓存 / 误 cat 的终端回滚。用
+        #   asm-exec -- env SB_IDP_CLIENT_SECRET={{resolve:secretsmanager:…}} \
+        #     python3 deploy_pool.py
+        # 可让明文只存在于子进程。显式注入优先于 config 值。
+        secret = os.environ.get("SB_IDP_CLIENT_SECRET", "").strip() \
+            or idp.get("client_secret", "").strip()
+        if not secret:
+            sys.exit(f"IdP {name} 缺 client_secret：填 config.ini [IdP] client_secret，"
+                     "或用环境变量 SB_IDP_CLIENT_SECRET 注入。\n"
+                     "空值建出的 provider 会在**用户登录时**才失败"
+                     "（回调报 invalid_client），比部署时报错难查得多。")
     details = {
         "client_id": idp["client_id"],
         "client_secret": secret,
