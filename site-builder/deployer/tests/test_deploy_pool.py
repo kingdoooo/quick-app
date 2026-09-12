@@ -1850,3 +1850,72 @@ def test_cognito_mode_without_a_derived_secret_is_an_internal_invariant():
     idp = dict(_idp_cognito(), client_secret="")
     with pytest.raises(SystemExit, match="内部不变量"):
         _captured_idp_call(idp, mode=dp.IDP_MODE_COGNITO)
+
+
+# ---------------------------------------------------------------------------
+# 工单 07：main() 的次序（preflight → 第一次写 → ②b → ③）
+# ---------------------------------------------------------------------------
+
+def _main_call_order() -> list:
+    """main() 里按源码位置排列的被调用函数名。
+
+    用 AST 而不是 `in source`：后者对"函数被调用了"成立，对"在写之前被调用"
+    无话可说——而次序正是这条路的全部安全性所在。
+    """
+    import ast
+    import inspect
+    tree = ast.parse(inspect.getsource(dp.main))
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+    calls.sort(key=lambda n: (n.lineno, n.col_offset))
+    return [getattr(n.func, "id", getattr(n.func, "attr", "")) for n in calls]
+
+
+def test_main_runs_local_preflight_before_the_first_aws_write():
+    """**次序是这条路的全部安全性所在**：本地 preflight → 只读 preflight → 第一次写。
+
+    工单 06 那个坑正是"池和域名都建好之后才炸"（provider_name 填了保留名）。
+    """
+    called = _main_call_order()
+    assert "_ensure_pool" in called, "main() 没调用 _ensure_pool（本条空转）"
+    first_write = called.index("_ensure_pool")
+    for name in ("idp_mode", "check_idp_section", "resolve_idp_pool_names",
+                 "preflight_idp_pool"):
+        assert name in called, f"main() 没调用 {name}"
+        assert called.index(name) < first_write, \
+            f"{name} 排在 _ensure_pool（第一次 AWS 写）之后——preflight 失去意义"
+
+
+def test_main_creates_the_idp_pool_after_the_platform_domain():
+    """②b 必须在 ②（平台池托管域名）之后：IdP client 的回调要平台池托管域名的
+    **真实现值**，而 _ensure_domain 在池已有域名时沿用现值、忽略配置前缀
+    （拼错的症状是最后一跳 redirect_uri_mismatch）。
+    同时它必须在 ③（建 provider）之前：provider 要 IdP 池的 issuer + secret。"""
+    called = _main_call_order()
+    assert called.index("_ensure_domain") < called.index("_ensure_idp_pool")
+    assert called.index("_ensure_idp_pool") < called.index("_ensure_oidc_idp")
+    assert called.index("_ensure_idp_pool_client") < called.index("_ensure_oidc_idp")
+    # IdP 池那个 client 也要过读回复验（工单 06 Q4：手工建的池没有这道闸门）
+    assert "_verify_no_native_flows" in called
+
+
+def test_main_has_the_two_idp_isolation_flags():
+    """隔离旗标必须在 CLI 上（裁定 2）。默认 None ⇒ 生产运行时取 config 值。"""
+    import inspect
+    src = inspect.getsource(dp.main)
+    for flag in ("--idp-pool-name", "--idp-domain-prefix"):
+        assert flag in src, f"main() 缺旗标 {flag}"
+
+
+def test_main_prints_the_two_admin_create_user_commands():
+    """内置模式下脚本必须把建户那两条命令打出来（含真实 pool id）。
+
+    少第二条（admin-set-user-password --permanent）的后果实测过：用户停在
+    FORCE_CHANGE_PASSWORD，hosted UI 首登多一屏强制改密。裁定 3 决定建户不进
+    脚本，那么"把命令递到手上"就是这条路唯一的降门槛手段。
+    """
+    import inspect
+    src = inspect.getsource(dp.main)
+    assert "admin-create-user" in src
+    assert "admin-set-user-password" in src and "--permanent" in src
+    assert "email_verified,Value=true" in src        # require_email_verified 的前提
+    assert "SUPPRESS" in src

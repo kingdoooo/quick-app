@@ -1114,13 +1114,38 @@ def main() -> None:
     # （Task 15 Step 7）。默认仍是生产 pool 名。
     ap.add_argument("--pool-name", default=POOL_NAME,
                     help=f"user pool 名（默认 {POOL_NAME}；仅隔离 spike 时改）")
+    # 内置 IdP 池的隔离旗标：默认取 config 的两个键。**--pool-name 隔离不到 IdP 池**
+    # （它的名字来自 config），所以隔离运行时这两个必须显式给——否则会对生产 IdP
+    # 池的 app client 做写操作，见 resolve_idp_pool_names。
+    ap.add_argument("--idp-pool-name", default=None,
+                    help="内置 IdP 池名（默认取 [IdP] cognito_user_pool_name）")
+    ap.add_argument("--idp-domain-prefix", default=None,
+                    help="内置 IdP 池的托管域名前缀（默认取 [IdP] cognito_domain_prefix）")
     args = ap.parse_args()
 
     import boto3
     cfg = _cfg()
     region = cfg["Platform"]["region"]
     base_domain = cfg["Platform"]["base_domain"]
+
+    # ⓿ preflight。**纯本地判断放在建 boto3 client 之前**：工单 06 那个坑是
+    # "池和托管域名都建好之后才炸"（provider_name 填了保留名），停在中途最难收拾。
+    idp = dict(cfg["IdP"]) if cfg.has_section("IdP") else {}
+    mode = idp_mode(idp)
+    check_idp_section(idp, mode)
+    idp_pool_name = idp_domain_prefix = ""
+    if mode == IDP_MODE_COGNITO:
+        idp_pool_name, idp_domain_prefix = resolve_idp_pool_names(
+            pool_name=args.pool_name, idp_pool_name=args.idp_pool_name,
+            idp_domain_prefix=args.idp_domain_prefix, idp=idp)
+    print(f"⓿ preflight 通过（[IdP] mode = {mode}）")
+
     cog = boto3.client("cognito-idp", region_name=region)
+
+    # 只读 preflight：仍在第一次写之前
+    idp_pool_existing = None
+    if mode == IDP_MODE_COGNITO:
+        idp_pool_existing = preflight_idp_pool(cog, idp_pool_name, idp_domain_prefix)
 
     print(f"① user pool（禁自注册）: {args.pool_name}")
     pool_id = _ensure_pool(cog, base_domain, args.pool_name)
@@ -1128,17 +1153,38 @@ def main() -> None:
     print("② 托管域名")
     domain_prefix = _ensure_domain(cog, pool_id, args.domain_prefix)
 
+    # ②b 内置 IdP 池。**必须在 ② 之后**：它的 client 要登记平台池托管域名的
+    # /oauth2/idpresponse，而 ② 在池已有域名时沿用现值、忽略配置前缀。
+    # **也必须在 ③ 之前**：provider 要这个池的 issuer + client secret。
+    # 两个方向合起来 = 一趟做完，不需要跑两次（工单 06 的双向依赖）。
+    idp_pool_id = None
+    platform_idpresponse = (
+        f"https://{domain_prefix}.auth.{region}.amazoncognito.com/oauth2/idpresponse")
+    if mode == IDP_MODE_COGNITO:
+        print(f"②b 内置 IdP 池（mode = {IDP_MODE_COGNITO}）: {idp_pool_name}")
+        idp_pool_id = _ensure_idp_pool(cog, idp_pool_name, idp_pool_existing)
+        _ensure_domain(cog, idp_pool_id, idp_domain_prefix,
+                       managed_login_version=None)
+        idp_client_id, idp_client_secret = _ensure_idp_pool_client(
+            cog, idp_pool_id, platform_idpresponse)
+        # 这个池是本脚本建的，所以它也要过那道读回复验——手工建的池没有它，
+        # 而"读回值看起来对、能力面其实是开的"正是最容易骗过人的地方（工单 06 Q4）。
+        _verify_no_native_flows(cog, idp_pool_id,
+                                {"idp-federation": idp_client_id})
+        idp = cognito_mode_idp(idp, region=region, idp_pool_id=idp_pool_id,
+                               client_id=idp_client_id,
+                               client_secret=idp_client_secret)
+
     # IdP 必须先建：client 的 SupportedIdentityProviders 要引用它的名字，
     # 且生产 client 不放 COGNITO（spec §3.5）——顺序颠倒会因 provider
     # 不存在而 InvalidParameterException。
     idp_name = None
-    if cfg.has_section("IdP") and cfg["IdP"].get("provider_name"):
+    if _clean(idp.get("provider_name", "")):
         print("③ OIDC IdP 联邦")
-        idp = dict(cfg["IdP"])
-        _ensure_oidc_idp(cog, pool_id, idp)
+        _ensure_oidc_idp(cog, pool_id, idp, mode=mode)
         idp_name = idp["provider_name"]
     else:
-        print("③ 跳过 IdP 联邦（config.ini 无 [IdP] 段）")
+        print("③ 跳过 IdP 联邦（config.ini 无 [IdP] 段，或 provider_name 为空）")
         print("   ⚠️  未接企业 IdP：**新建**的 site/mcp client 只能用 COGNITO 本地用户。")
         print("      此状态下 allowed_users=\"org\" 不代表\"全组织\"——")
         print("      接上 IdP 后重跑本脚本，client 会切成仅该 IdP。")
@@ -1214,9 +1260,27 @@ def main() -> None:
     else:
         print("  [Cognito] machine_client_id = （无 [ApiKey] 段：OAuth-only，"
               "不需要）")
-    if idp_name:
+    if mode == IDP_MODE_COGNITO:
+        print(f"\n【内置 Cognito 模式】IdP 池 {idp_pool_id}")
+        print("  issuer / client_id / client_secret 由本次部署派生，"
+              "**不要**回填 config.ini（非空即报冲突）")
+        print(f"  IdP 侧回调已自动登记：{platform_idpresponse}")
+        print("\n  给第一个用户建号（两条都要——少第二条用户会停在 "
+              "FORCE_CHANGE_PASSWORD，首登多一屏强制改密）：")
+        print(f"    aws cognito-idp admin-create-user --region {region} \\")
+        print(f"      --user-pool-id {idp_pool_id} --username <email> \\")
+        print("      --user-attributes Name=email,Value=<email> "
+              "Name=email_verified,Value=true Name=name,Value=<显示名> \\")
+        print("      --message-action SUPPRESS")
+        print(f"    aws cognito-idp admin-set-user-password --region {region} \\")
+        print(f"      --user-pool-id {idp_pool_id} --username <email> \\")
+        print("      --password '<初始密码>' --permanent")
+        print("  email_verified=true 是平台侧 require_email_verified 能过的前提；"
+              "SUPPRESS 表示不发邮件 ⇒ 初始密码要你自己交给用户。")
+        print("  ⚠️  email 在 schema 层不可变 ⇒ **建错邮箱只能删号重建**，没有改的路。")
+    elif idp_name:
         print(f"\n在 IdP（{idp_name}）侧把这个回调加进白名单：")
-        print(f"  https://{domain_prefix}.auth.{region}.amazoncognito.com/oauth2/idpresponse")
+        print(f"  {platform_idpresponse}")
 
 
 if __name__ == "__main__":
