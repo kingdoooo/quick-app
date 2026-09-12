@@ -1397,3 +1397,49 @@ def test_adr_0006_no_longer_says_the_mode_is_unimplemented():
     doc = _read(ADR_0006)
     for stale in ("待实现", "07 实现"):
         assert stale not in doc, f"ADR 0006 还写着 {stale!r}"
+
+
+# ── 工单 07：DEPLOY.md 第 3 条路（内置 Cognito）已脚本化 ─────────────────────
+
+BUILT_IN_COGNITO_HEADING = "### 【内置 Cognito】第二个池的确切形态"
+
+
+def test_deploy_md_built_in_cognito_path_is_scripted_not_manual():
+    """第 3 条路的门槛就是这一节：它必须给出**配置 + 一条命令**，而不是一串
+    aws cognito-idp create-* 让采用者手工建池。"""
+    doc = _read(DEPLOY)
+    sec = _section(doc, BUILT_IN_COGNITO_HEADING)      # 标题改名时自报空转
+    assert "mode = cognito-admin" in sec
+    assert "cognito_user_pool_name" in sec and "cognito_domain_prefix" in sec
+    assert "deploy_pool.py" in sec, "这一节没告诉读者是哪个脚本建的"
+    # 三个派生字段不许再出现在"要填的 [IdP]"清单里
+    for derived in ("issuer =", "client_id ="):
+        assert f"{derived} <" not in sec, \
+            f"这一节还在让采用者填 {derived}——内置模式下它由部署过程派生"
+    # 否定断言覆盖整份文件：占位口径不许残留在任何地方
+    for stale in ("目前依赖工单 07", "尚未落地", "在那之前按本节手工建"):
+        assert stale not in doc, f"DEPLOY.md 还留着占位口径 {stale!r}"
+
+
+def test_deploy_md_keeps_the_two_admin_create_user_commands():
+    """建户不进脚本（裁定 3）⇒ 手册必须留这两条，且必须带 --permanent
+    与 email_verified=true——少第二条用户停在 FORCE_CHANGE_PASSWORD，
+    少 email_verified 则 require_email_verified 把他挡在 /callback。"""
+    sec = _section(_read(DEPLOY), BUILT_IN_COGNITO_HEADING)
+    assert "admin-create-user" in sec
+    assert "admin-set-user-password" in sec and "--permanent" in sec
+    assert "email_verified,Value=true" in sec
+    assert "SUPPRESS" in sec
+
+
+def test_deploy_md_readiness_for_built_in_cognito_is_config_only():
+    """就绪清单是**开始部署前**的检查。内置模式下"第二个池"是 ① 建出来的产物，
+    所以这一条的前置只能是配置 + 前缀可用，不能要求池已存在
+    （旧文案要求"第二个池 + 托管域名 + app client 已建"，那是手工时代的口径）。"""
+    doc = _read(DEPLOY)
+    overview = _section(doc, "## 部署顺序总览")
+    checklist = overview[overview.index("开始前的就绪清单"):]
+    assert "【内置 Cognito】" in checklist, "就绪清单里没有【内置 Cognito】那一条（本条空转）"
+    assert "mode = cognito-admin" in checklist
+    assert "第二个池 + 托管域名 + app client 已建" not in checklist, \
+        "就绪清单还在要求采用者先手工建好池"

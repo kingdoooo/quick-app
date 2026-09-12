@@ -97,11 +97,12 @@ aws acm describe-certificate --region us-east-1 \
 > 一个普通 OIDC IdP。手册里所有标 **【飞书】** 的步骤只在你确实要接飞书时执行，
 > 其余三条路一律跳过。同一套做法可用来接任何没有原生 OIDC 的身份源。
 
-> **第 3 条路（内置 Cognito）目前依赖工单 07**：ADR 0006 已裁定采用它，
-> `deploy_pool.py` 的模式开关尚未落地。可行性本身已经真机验证过——第二个池作
-> OIDC IdP、管理员建户、**平台池零代码改动**，登录后 `email` / `email_verified` /
-> `name` / `idp` / `auth_via` 五个 claim 在 id token 与 access token 里都到位。
-> 07 落地前，按下面「内置 Cognito 池的确切形态」手工建第二个池同样可用。
+> **第 3 条路只需要三行配置 + 那条 `deploy_pool.py`**：填 `[IdP] mode = cognito-admin`
+> 与 `cognito_user_pool_name` / `cognito_domain_prefix`，① 阶段的 `deploy_pool.py`
+> 会在**同一次运行**里把第二个池、它的托管域名与联邦 app client 一起建出来，并把
+> 平台池的 `/oauth2/idpresponse` 自动登记为回调（IdP 侧不用你手工填任何东西）。
+> 池建好后用两条 `aws cognito-idp` 命令建第一个用户，见下面「【内置 Cognito】」一节。
+> 可行性与每一项配置的理由都在那一节里；决策见 `docs/adr/0006-*.md`。
 
 **这三条路对平台其余部分完全等价。** 平台唯一感知 IdP 的代码是
 `auth/login_handler.py` 的 `_exchange_code`（消费 `email` / `email_verified` /
@@ -183,7 +184,38 @@ IdP 一样联邦它。平台代码零改动——"邮箱由身份源控制"这�
 配置**满足，而不是放松平台池（放松平台池会让邮箱回到用户手里，而 owner /
 allowed_users / 会话 claim 全以邮箱为键）。决策见 `docs/adr/0006-*.md`。
 
-> `deploy_pool.py` 的模式开关属于工单 07，尚未落地。在那之前按本节手工建。
+**怎么做**：填三行配置，跑 ① 的 `deploy_pool.py`。
+
+```ini
+# site-builder/config.ini
+[IdP]
+mode = cognito-admin
+# 自取；同一个值要逐字符加进 router/config.ini 的 [SiteBuilder] trusted_idps
+provider_name = CognitoSource
+cognito_user_pool_name = site-builder-idp
+# 跨账号全局唯一，可能被占用
+cognito_domain_prefix = <全局唯一前缀>
+# issuer / client_id / client_secret **留空**：由部署过程从新建的池派生，非空即报冲突
+issuer =
+client_id =
+client_secret =
+scopes = openid email profile
+map_email_verified = true
+require_email_verified = true
+```
+
+```bash
+python3 site-builder/scripts/deploy_pool.py     # ①；②b 那一步就是这个池
+```
+
+脚本在**第一次 AWS 写之前**会拒掉这些配置错误：未知 `mode`、两套模式字段混填、
+`provider_name` 是四个社交保留名之一、按池名与按域名前缀找到的不是同一个池、
+按池名找到的池已有一个**不同**的托管域名。建完还会读回复验两条边界
+（自注册已关、`email` 不可变）与那个 client 的 `ExplicitAuthFlows`。
+跑完照脚本末尾打印的那两条命令建第一个用户（也抄在本节末尾）。
+
+下面这张表是脚本建出来的形态；列在这里是为了让你知道每条边界靠什么成立，
+**以及在别处看到一个手工建的池时怎么核对它**。
 
 **池本身**（下面每一项都是必需的，理由在右侧）：
 
@@ -195,7 +227,8 @@ allowed_users / 会话 claim 全以邮箱为键）。决策见 `docs/adr/0006-*.
 | `AutoVerifiedAttributes` | `["email"]` | — |
 | `Schema` 的 `email` | `Required: true`, **`Mutable: false`** | **"邮箱不可自改"的唯一实现点**。设成不可变后连管理员都改不了（`admin-update-user-attributes` 会报 `user.email: Attribute cannot be updated.`） |
 
-**建完池就读回核对这两项**（手工建的池没有脚本替你复验，而这两项各自都是一条边界）：
+**这两项各自都是一条边界，脚本每次运行都读回复验**；下面两条命令给你自己核对，
+或用来核对别处一个手工建的池：
 
 ```bash
 aws cognito-idp describe-user-pool --region us-east-1 --user-pool-id <idp_pool_id> \
@@ -235,7 +268,9 @@ managed login v2，那边"API 建的 client 不套 branding 则登录页不可�
   > 直接用 API 认证。显式写 `["ALLOW_REFRESH_TOKEN_AUTH"]` 后三个 flow 全部报
   > "not enabled"。
   >
-  > **建完必须读回核对**（这个池是手工建的，没有脚本替你复验）：
+  > **脚本已经读回复验过这一条**（`_verify_no_native_flows` 也覆盖 IdP 池那个
+  > client，而且它把"读回是空 / 未设"也判成失败——空值就是"未指定"）。
+  > 下面这条命令给你自己核对：
   >
   > ```bash
   > aws cognito-idp describe-user-pool-client --region us-east-1 \
@@ -267,18 +302,9 @@ aws cognito-idp admin-set-user-password --region us-east-1 \
 `email_verified=true` 是平台侧 `require_email_verified` 能过的前提。
 `--message-action SUPPRESS` 表示不发邮件——**你需要用别的渠道把初始密码交给用户**。
 
-**回填平台池的 `[IdP]` 段**：
-
-```ini
-[IdP]
-provider_name = <自取，如 CognitoSource；同一个值要加进 router 的 trusted_idps>
-issuer = https://cognito-idp.<region>.amazonaws.com/<idp_pool_id>
-client_id = <上面那个 app client 的 ID>
-client_secret = <它的 secret；可用 SB_IDP_CLIENT_SECRET 注入不落磁盘>
-scopes = openid email profile
-map_email_verified = true
-require_email_verified = true
-```
+**`[IdP]` 段不需要回填任何东西**：`issuer`（= `https://cognito-idp.<region>.amazonaws.com/<idp_pool_id>`）、
+`client_id` 与 `client_secret` 都由部署过程从新建的池派生，**填了反而报冲突**。
+secret 也不落任何地方（不进 SSM、不进 config.ini）——幂等重跑会重新取。
 
 **代价，接受它再选这条路**：`email` 不可变 ⇒ **建错邮箱只能删号重建**，没有改的路。
 另外初始密码要靠人工分发，且这个池没有邮件投递配置（`SUPPRESS`）。
@@ -843,9 +869,10 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
       `/oauth2/idpresponse` 已登记为回调
       / **2【Google】** GCP OAuth client（Web application）已建、`/oauth2/idpresponse`
       填进 Authorized redirect URIs、登录用的账号已加进 Audience → Test users
-      / **3【内置 Cognito】** 第二个池 + 托管域名 + app client 已建、
-      管理员已建好用户（含 `email_verified=true` 与永久密码）、
-      且 §0 那两条读回核对（`selfSignupClosed`/`emailImmutable`、`ExplicitAuthFlows`）都过了
+      / **3【内置 Cognito】** `[IdP] mode = cognito-admin` + `cognito_user_pool_name`
+      / `cognito_domain_prefix` 已填，且那个域名前缀（跨账号全局唯一）没被占用
+      ——池本身由 ① 的 `deploy_pool.py` 建；建完再用两条 `aws cognito-idp`
+      命令建第一个用户（见 §0）
       / **【飞书】** 企业自建应用（App ID/Secret，含用户 userid + 邮箱权限）
 - [ ] `[IdP] provider_name` 不是四个社交保留名之一，且**同一个值**已写进
       `router/config.ini` 的 `[SiteBuilder] trusted_idps`（这一对没有自动闸门，见 §0）
@@ -1194,6 +1221,16 @@ PY
    两者都缺时脚本在**部署时**明确退出——空 secret 建出的 provider 只在用户
    登录换 token 那一刻才报 `invalid_client`，症状是"登录页正常、回调失败"，
    难查得多。
+
+   **【内置 Cognito】** `[IdP] mode = cognito-admin` 时**不需要** `client_secret`
+   （也不需要 `issuer` / `client_id`）：同一次运行的 ②b 步会建出第二个池、它的
+   托管域名（classic hosted UI，LITE 档不支持 managed login v2，也不需要 branding）
+   与联邦 app client，然后从那个 client 上取 secret 直接建 provider。
+   secret **不落任何地方**（不进 SSM、不进 config.ini）——幂等重跑会重新取。
+   跑完照脚本末尾打印的那两条 `aws cognito-idp` 命令建第一个用户。
+   要在隔离池上试这条路时，`--pool-name` 之外还必须同时给 `--idp-pool-name` 与
+   `--idp-domain-prefix`（IdP 池的名字来自 config，`--pool-name` 隔离不到它；
+   缺任一个脚本在任何 AWS 写之前退出）。
 
    #### 轮换这个 secret（泄漏后必做）
 
