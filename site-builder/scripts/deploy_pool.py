@@ -63,14 +63,155 @@ NATIVE_AUTH_FLOWS = ("ALLOW_USER_PASSWORD_AUTH", "ALLOW_USER_SRP_AUTH",
                      "USER_PASSWORD_AUTH")
 
 
+def _clean(value: str) -> str:
+    """config.ini 的取值清洗：切掉行内注释再 strip，**不改大小写**。
+
+    裸 ConfigParser 不剥行内注释（本仓库刻意保持这个语义，见
+    deployer/tests/test_example_config_consistency.py），所以每个自己判分支的键
+    都要先过这里。大小写必须原样保留——Cognito 的 provider 名校验区分大小写
+    （实测：`Google` 被拒而 `google` 接受）。
+    """
+    return str(value).split("#")[0].split(";")[0].strip()
+
+
 def _truthy(value: str) -> bool:
-    """config.ini 的布尔解析。行内注释会被 configparser 并进值，故先切掉 #/;。
+    """config.ini 的布尔解析。行内注释会被 configparser 并进值，故先过 _clean。
 
     只认明确的真值词；写错（yes/1/on 之外的拼写）一律当 False，与
     router/stack.py 对 require_idp_claim 的严格态度一致。
     """
-    head = str(value).split("#")[0].split(";")[0].strip().lower()
-    return head in ("true", "yes", "1", "on")
+    return _clean(value).lower() in ("true", "yes", "1", "on")
+
+
+# ---- [IdP] 模式（ADR 0006 / 工单 07）-------------------------------------
+#
+# external-oidc：采用者已有 OIDC IdP（Okta / Entra / Google / 飞书适配器…），
+#                issuer / client_id / client_secret 由他给出。**默认值**，
+#                也是 mode 键缺失时的回落——存量 config.ini 里没有这个键。
+# cognito-admin：资产自己再建第二个 Cognito 池当 OIDC IdP（LITE、只许管理员
+#                建户、email 在 schema 层 Mutable=False），三个联邦字段由部署
+#                过程派生。决策见 docs/adr/0006-*.md。
+#
+# **名字不叫 cognito-managed**（ADR 早期用过）：LITE 档恰恰**不支持** managed
+# login v2，那个名字会把读者引到反面。
+IDP_MODE_EXTERNAL = "external-oidc"
+IDP_MODE_COGNITO = "cognito-admin"
+IDP_MODES = (IDP_MODE_EXTERNAL, IDP_MODE_COGNITO)
+
+# cognito-admin 独有的键（缺一不可：少了池名无法幂等找回那个池，少了域名前缀
+# 就没有 authorization/token/userinfo 端点）
+_COGNITO_MODE_KEYS = ("cognito_user_pool_name", "cognito_domain_prefix")
+# external-oidc 独有的键；cognito-admin 下由部署过程派生，**非空即冲突**
+_EXTERNAL_MODE_KEYS = ("issuer", "client_id", "client_secret")
+
+# provider_name 的保留名（**逐个实测，区分大小写**，工单 06 腿 1）。
+# 只有四个**社交类型名**会被 Cognito 拒（`Provider X cannot be of type OIDC`）；
+# `SAML` 与小写 `google` 都被接受，所以不许往这张表里凭印象加名字——多拒一个
+# 就是用一句假话挡住采用者。`COGNITO` 是本仓库自己的规则，理由见值。
+RESERVED_PROVIDER_NAMES = {
+    "Google": "Cognito 把它保留给原生 social provider 类型（ProviderType=Google），"
+              "与本平台一律走的 ProviderType=OIDC 冲突。接 Google 用 GoogleOIDC。",
+    "Facebook": "同上（原生 social provider 类型名）。",
+    "LoginWithAmazon": "同上（原生 social provider 类型名）。",
+    "SignInWithApple": "同上（原生 social provider 类型名）。",
+    "COGNITO": "Cognito 的 API 接受它，但 app client 的 SupportedIdentityProviders "
+               "用这个字面量表示「池内建用户目录」——同名会让配置语义无法分辨。",
+}
+
+
+def idp_mode(idp: dict) -> str:
+    """[IdP] mode 的唯一解析点。键缺失 / 为空 → external-oidc（向后兼容）。
+
+    未知值**响亮失败**：静默回落会让写错模式名的采用者建出一个「没有 IdP 池、
+    client 只列 COGNITO」的平台池，而脚本输出看起来一切正常。
+    """
+    raw = _clean(idp.get("mode", ""))
+    if not raw:
+        return IDP_MODE_EXTERNAL
+    if raw not in IDP_MODES:
+        raise SystemExit(
+            f"[IdP] mode = {raw!r} 不认识。只能是 {IDP_MODE_EXTERNAL}（已有 OIDC "
+            f"IdP，默认）或 {IDP_MODE_COGNITO}（资产内置第二个 Cognito 池当 IdP）。"
+            "键缺失时按 external-oidc。")
+    return raw
+
+
+def assert_provider_name_allowed(name: str) -> None:
+    """provider_name 的保留名校验。**纯本地、零 API 调用，前移到任何 AWS 写之前。**
+
+    不前移的代价实测过（工单 06 腿 1）：Cognito 要到 create_identity_provider
+    才报 `Provider Google cannot be of type OIDC`，而那一步在建池与建托管域名
+    **之后**，脚本停在中途。文档挡不住手滑。
+    """
+    why = RESERVED_PROVIDER_NAMES.get(name)
+    if why:
+        raise SystemExit(f"[IdP] provider_name = {name!r} 不能用：{why}")
+
+
+def check_idp_section(idp: dict, mode: str) -> None:
+    """[IdP] 段的本地一致性校验（零 AWS 调用）。
+
+    三类判据：
+      ① provider_name 非空时不许是保留名（两种模式都查）；
+      ② 模式所需键齐备（cognito-admin 才有必填项——external-oidc 下"全空 =
+         跳过联邦"是支持的首次部署状态，见 main() ③ 的告警分支）；
+      ③ 两套模式的字段不许混填（静默忽略比报错难查得多：采用者以为自己指定了
+         issuer，实际生效的是另一个池的）。
+    """
+    name = _clean(idp.get("provider_name", ""))
+    if name:
+        assert_provider_name_allowed(name)
+
+    cognito_filled = [k for k in _COGNITO_MODE_KEYS if _clean(idp.get(k, ""))]
+    # client_secret 不过 _clean：secret 里的 `#` 不是注释（Cognito 的 secret 是
+    # [\w+]+，但别让清洗逻辑成为一条能改写凭证的路径）
+    external_filled = [k for k in _EXTERNAL_MODE_KEYS if str(idp.get(k, "")).strip()]
+
+    if mode == IDP_MODE_COGNITO:
+        if not name:
+            raise SystemExit(
+                f"[IdP] mode = {IDP_MODE_COGNITO} 必须给 provider_name（Cognito 里那个"
+                " provider 名，自取）。同一个值还要逐字符写进 router/config.ini 的"
+                " [SiteBuilder] trusted_idps，否则 require_idp_claim=true 下这个 IdP"
+                "的用户全部被 Edge 302——那一对没有任何自动闸门。")
+        missing = [k for k in _COGNITO_MODE_KEYS if k not in cognito_filled]
+        if missing:
+            raise SystemExit(
+                f"[IdP] mode = {IDP_MODE_COGNITO} 缺 {', '.join(missing)}。"
+                "这两个键与 mode 是一组、缺一不可：没有池名就无法幂等找回那个 IdP 池，"
+                "没有托管域名前缀就没有 authorize/token/userinfo 端点"
+                "（issuer 的 discovery 文档全指向托管域名）。")
+        if external_filled:
+            raise SystemExit(
+                f"[IdP] mode = {IDP_MODE_COGNITO} 下 {', '.join(external_filled)} 必须留空"
+                "——它们由本次部署从新建的 IdP 池派生。填了值说明这份 config 混了两套"
+                "模式的字段，静默忽略会让你以为生效的是自己填的那个 issuer。")
+    elif cognito_filled:
+        raise SystemExit(
+            f"[IdP] mode = {IDP_MODE_EXTERNAL}（或未给 mode）时 {', '.join(cognito_filled)}"
+            f" 必须留空——那是 {IDP_MODE_COGNITO} 模式的键。要用内置 IdP 池请显式写"
+            f" mode = {IDP_MODE_COGNITO}。")
+
+
+def resolve_idp_pool_names(*, pool_name: str, idp_pool_name: str | None,
+                           idp_domain_prefix: str | None,
+                           idp: dict) -> tuple[str, str]:
+    """内置 IdP 池的池名与托管域名前缀：命令行旗标优先于 config。
+
+    **隔离守卫**：`--pool-name` 不是生产池时，两个旗标必须都显式给出。
+    `--pool-name` 只隔离了三样东西（平台池名、pre-token 函数名、SSM 前缀），
+    **IdP 池的名字来自 config** ⇒「隔离平台池 + 生产 IdP 池」这个组合会对生产
+    IdP 池的 app client 做 read-modify-write（改 SupportedIdentityProviders /
+    ExplicitAuthFlows / CallbackURLs）。这里在任何 AWS 写之前拒掉它。
+    """
+    if pool_name != POOL_NAME and not (idp_pool_name and idp_domain_prefix):
+        raise SystemExit(
+            f"--pool-name {pool_name!r} 不是生产池，但没有同时给 --idp-pool-name 与"
+            " --idp-domain-prefix。内置 IdP 池的名字来自 config.ini，`--pool-name`"
+            "隔离不到它——照这样跑会对**生产 IdP 池**的 app client 做写操作。"
+            "两个旗标都显式给出后再跑。")
+    return (idp_pool_name or _clean(idp.get("cognito_user_pool_name", "")),
+            idp_domain_prefix or _clean(idp.get("cognito_domain_prefix", "")))
 
 
 def pool_config(base_domain: str) -> dict:

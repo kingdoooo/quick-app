@@ -1254,3 +1254,153 @@ def test_idp_derived_keys_are_probed_from_client_configs():
     assert keys == {"site", "mcp"}          # 当前形态的回归锚点
     # machine 不在其中：它的 COGNITO 与 [IdP] 无关
     assert "machine" not in keys
+
+
+# ---------------------------------------------------------------------------
+# 工单 07：[IdP] mode —— 纯本地 preflight（零 AWS 调用）
+# ---------------------------------------------------------------------------
+#
+# **为什么这些用例必须存在**：`test_config_example_keys_are_read.py` 把"整段读取"
+# （`dict(cfg["IdP"])`，deploy_pool 正是这样读的）算成"读了该段每个键"，所以往
+# `[IdP]` 里加任何键，那个守卫都恒真——它证明不了新键影响行为。本节是新键的
+# **唯一**行为证据。
+
+def _idp_cognito(**over) -> dict:
+    """cognito-admin 模式的最小合法 [IdP]（issuer/client_id/client_secret 必须缺席）。"""
+    base = {"mode": "cognito-admin", "provider_name": "CognitoSource",
+            "cognito_user_pool_name": "site-builder-idp",
+            "cognito_domain_prefix": "acme-idp-2026"}
+    base.update(over)
+    return base
+
+
+def test_idp_mode_defaults_to_external_when_key_absent():
+    """键缺失 ⇒ external-oidc。这是向后兼容的支点：存量 config.ini 里没有 mode。"""
+    assert dp.idp_mode({}) == dp.IDP_MODE_EXTERNAL
+    assert dp.idp_mode({"provider_name": "Feishu"}) == dp.IDP_MODE_EXTERNAL
+    assert dp.idp_mode({"mode": ""}) == dp.IDP_MODE_EXTERNAL
+
+
+def test_idp_mode_tolerates_inline_comments():
+    """裸 ConfigParser 会把行内注释并进值。mode 是本脚本自己判分支用的，
+    所以它必须先切掉 `#` / `;`——否则 `mode = cognito-admin  # 内置` 会被判成未知模式。"""
+    assert dp.idp_mode({"mode": "cognito-admin  # 内置池"}) == dp.IDP_MODE_COGNITO
+    assert dp.idp_mode({"mode": "external-oidc ; 已有 IdP"}) == dp.IDP_MODE_EXTERNAL
+
+
+def test_idp_mode_rejects_unknown_value():
+    """未知模式必须响亮失败：静默回落成 external-oidc 会让写错模式名的采用者
+    建出一个"没有 IdP 池、client 只列 COGNITO"的池，而输出看起来一切正常。"""
+    with pytest.raises(SystemExit, match="cognito-admin"):
+        dp.idp_mode({"mode": "cognito-managed"})     # ADR 早期用过的名字，不是最终值
+
+
+@pytest.mark.parametrize("name", ["Google", "Facebook", "LoginWithAmazon",
+                                  "SignInWithApple", "COGNITO"])
+def test_reserved_provider_names_are_rejected_locally(name):
+    """保留名校验必须**在任何 AWS 调用之前**：Cognito 要到 create_identity_provider
+    才报 `Provider Google cannot be of type OIDC`，而那时池与托管域名都已建好，
+    脚本停在中途（工单 06 腿 1 实测踩过）。前四个是 Cognito 拒的社交类型名；
+    COGNITO 是本仓库自己的规则——API 接受它，但 app client 的
+    SupportedIdentityProviders 用这个字面量表示"池内建用户目录"，同名无法分辨。"""
+    with pytest.raises(SystemExit) as e:
+        dp.assert_provider_name_allowed(name)
+    assert name in str(e.value)
+
+
+@pytest.mark.parametrize("name", ["GoogleOIDC", "SAML", "google", "CognitoSource",
+                                  "Feishu"])
+def test_non_reserved_provider_names_are_accepted(name):
+    """校验**区分大小写且只拒实测被拒的那些**，不许自己发明规则。
+
+    逐个实测过：`SAML` 与 `google`（小写）Cognito 都接受。多拒一个名字的代价是
+    采用者被一条不存在的限制挡住，而错误文案会告诉他"Cognito 保留了这个名字"
+    ——一句假话。`google` 能用但不该依赖（大小写差一个字母就变成被拒的那个），
+    这条提醒写在 config.ini.example 的注释里，不写成硬失败。
+    """
+    dp.assert_provider_name_allowed(name)      # 不得抛
+
+
+def test_reserved_name_check_sees_through_inline_comments():
+    """`provider_name = Google  # 我们的 IdP` 同样要被拦住。"""
+    with pytest.raises(SystemExit, match="Google"):
+        dp.check_idp_section({"provider_name": "Google  # 我们的 IdP"},
+                             dp.IDP_MODE_EXTERNAL)
+
+
+def test_external_mode_with_empty_provider_name_is_not_an_error():
+    """**回归钉子（裁定 1）**：`[IdP]` 段存在但全空 ⇒ 不报错。
+
+    `.example` 出厂就是空值，而 main() 对这种情形的既有行为是打印告警并跳过联邦
+    （"首次部署、联邦还没接"那条路）。把它改成硬失败会改掉生产在用的那条代码路径。
+    """
+    dp.check_idp_section({}, dp.IDP_MODE_EXTERNAL)                       # 不得抛
+    dp.check_idp_section({"provider_name": "", "issuer": ""},
+                         dp.IDP_MODE_EXTERNAL)                            # 不得抛
+
+
+def test_cognito_mode_requires_provider_name():
+    """cognito-admin 下必定要建 provider ⇒ 名字必填，且它还要逐字符进 router 的
+    trusted_idps（那一对没有任何自动闸门）。"""
+    with pytest.raises(SystemExit, match="provider_name"):
+        dp.check_idp_section(_idp_cognito(provider_name=""), dp.IDP_MODE_COGNITO)
+
+
+@pytest.mark.parametrize("missing", ["cognito_user_pool_name", "cognito_domain_prefix"])
+def test_cognito_mode_requires_both_of_its_own_keys(missing):
+    """两个键缺一不可：少了池名就无法幂等找回那个池，少了域名前缀就没有
+    authorization/token/userinfo 端点（issuer 的 discovery 全指向托管域名）。"""
+    idp = _idp_cognito(**{missing: ""})
+    with pytest.raises(SystemExit, match=missing):
+        dp.check_idp_section(idp, dp.IDP_MODE_COGNITO)
+
+
+@pytest.mark.parametrize("field", ["issuer", "client_id", "client_secret"])
+def test_cognito_mode_rejects_externally_supplied_federation_fields(field):
+    """三个字段在内置模式下由部署过程从新建的池派生 ⇒ **非空即报冲突**，不静默忽略。
+
+    静默忽略的症状最难查：采用者以为自己指定了 issuer，实际生效的是另一个池的
+    issuer，而两者的 discovery 文档都合法、登录页都能开，只有 claim 里的 `idp`
+    与预期不同。
+    """
+    with pytest.raises(SystemExit, match=field):
+        dp.check_idp_section(_idp_cognito(**{field: "x"}), dp.IDP_MODE_COGNITO)
+
+
+@pytest.mark.parametrize("field", ["cognito_user_pool_name", "cognito_domain_prefix"])
+def test_external_mode_rejects_cognito_mode_keys(field):
+    """反向混填同样拒：填了内置模式的键却没切模式 ⇒ 采用者以为会建第二个池，
+    而实际什么都没建（.example 出厂两键为空，所以只有"填了"才触发）。"""
+    idp = {"provider_name": "Okta", "issuer": "https://okta.example/",
+           "client_id": "c", "client_secret": "s", field: "acme-idp"}
+    with pytest.raises(SystemExit, match=field):
+        dp.check_idp_section(idp, dp.IDP_MODE_EXTERNAL)
+
+
+def test_cognito_mode_minimal_config_passes():
+    dp.check_idp_section(_idp_cognito(), dp.IDP_MODE_COGNITO)      # 不得抛
+
+
+def test_idp_pool_names_prefer_flags_over_config():
+    assert dp.resolve_idp_pool_names(
+        pool_name=dp.POOL_NAME, idp_pool_name=None, idp_domain_prefix=None,
+        idp=_idp_cognito()) == ("site-builder-idp", "acme-idp-2026")
+    assert dp.resolve_idp_pool_names(
+        pool_name=dp.POOL_NAME, idp_pool_name="spike-idp",
+        idp_domain_prefix="spike-idp-2026",
+        idp=_idp_cognito()) == ("spike-idp", "spike-idp-2026")
+
+
+@pytest.mark.parametrize("flags", [(None, None), ("spike-idp", None),
+                                   (None, "spike-idp-2026")])
+def test_isolated_platform_pool_requires_both_idp_isolation_flags(flags):
+    """**裁定 2**：`--pool-name` 的三层隔离（池名 / pre-token 函数名 / SSM 前缀）
+    **覆盖不到 IdP 池**——它的名字来自 config。所以"隔离平台池 + 生产 IdP 池"
+    这个组合会对**生产 IdP 池的 app client** 做 read-modify-write
+    （`SupportedIdentityProviders` / `ExplicitAuthFlows` / `CallbackURLs`）。
+    在任何 AWS 写之前拒掉它，而不是靠人记得同时改 config。
+    """
+    name, prefix = flags
+    with pytest.raises(SystemExit, match="--idp-pool-name"):
+        dp.resolve_idp_pool_names(pool_name="sb-idp-spike", idp_pool_name=name,
+                                  idp_domain_prefix=prefix, idp=_idp_cognito())
