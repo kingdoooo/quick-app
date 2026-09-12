@@ -207,9 +207,9 @@ def resolve_idp_pool_names(*, pool_name: str, idp_pool_name: str | None,
     if pool_name != POOL_NAME and not (idp_pool_name and idp_domain_prefix):
         raise SystemExit(
             f"--pool-name {pool_name!r} 不是生产池，但没有同时给 --idp-pool-name 与"
-            " --idp-domain-prefix。内置 IdP 池的名字来自 config.ini，`--pool-name`"
-            "隔离不到它——照这样跑会对**生产 IdP 池**的 app client 做写操作。"
-            "两个旗标都显式给出后再跑。")
+            " --idp-domain-prefix。内置 IdP 池的名字来自 config.ini，"
+            "`--pool-name` 隔离不到它——照这样跑会对**生产 IdP 池**的 app client "
+            "做写操作。两个旗标都显式给出后再跑。")
     return (idp_pool_name or _clean(idp.get("cognito_user_pool_name", "")),
             idp_domain_prefix or _clean(idp.get("cognito_domain_prefix", "")))
 
