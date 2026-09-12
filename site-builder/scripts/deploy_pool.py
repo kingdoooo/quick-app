@@ -544,7 +544,8 @@ def _ensure_pool(cog, base_domain: str, pool_name: str = POOL_NAME) -> str:
 MANAGED_LOGIN_V2 = 2
 
 
-def _ensure_domain(cog, pool_id: str, prefix: str) -> str:
+def _ensure_domain(cog, pool_id: str, prefix: str, *,
+                   managed_login_version: int | None = MANAGED_LOGIN_V2) -> str:
     """建/纠正托管域名。
 
     **`ManagedLoginVersion` 属于 domain API，不是 client API**：
@@ -554,22 +555,34 @@ def _ensure_domain(cog, pool_id: str, prefix: str) -> str:
     不显式指定时 domain 默认 classic hosted UI（version 1），而
     `CreateManagedLoginBranding` 给的是 managed login 的 style——两者不匹配
     时登录页仍不可用。
+
+    `managed_login_version=None` 是**内置 IdP 池**那条路：LITE 档只有 classic
+    hosted UI，传 2 会 `FeatureUnavailableInTierException`（实测），而 classic
+    hosted UI **不需要** CreateManagedLoginBranding（实测 /login 200 且带密码表单）。
+    平台池仍走默认值 v2——那边"不套 branding 则登录页不可用"依然成立，两条别混。
     """
     pool = cog.describe_user_pool(UserPoolId=pool_id)["UserPool"]
     existing = pool.get("Domain")
     if not existing:
-        cog.create_user_pool_domain(Domain=prefix, UserPoolId=pool_id,
-                                    ManagedLoginVersion=MANAGED_LOGIN_V2)
-        print(f"  域名前缀 {prefix}（managed login v{MANAGED_LOGIN_V2}）")
+        kw = ({"ManagedLoginVersion": managed_login_version}
+              if managed_login_version is not None else {})
+        cog.create_user_pool_domain(Domain=prefix, UserPoolId=pool_id, **kw)
+        print(f"  域名前缀 {prefix}"
+              + (f"（managed login v{managed_login_version}）"
+                 if managed_login_version is not None else "（classic hosted UI）"))
         return prefix
 
     # 已存在：核对版本，漂移了就纠回来（幂等重跑要能修配错的 domain）
     desc = cog.describe_user_pool_domain(Domain=existing)
     version = desc.get("DomainDescription", {}).get("ManagedLoginVersion")
-    if version != MANAGED_LOGIN_V2:
+    if managed_login_version is None:
+        # LITE 池没有 managed login，没有"版本漂移"可纠——只报告现值
+        print(f"  域名 {existing}（classic hosted UI，v{version}）")
+        return existing
+    if version != managed_login_version:
         cog.update_user_pool_domain(Domain=existing, UserPoolId=pool_id,
-                                    ManagedLoginVersion=MANAGED_LOGIN_V2)
-        print(f"  域名 {existing}: managed login v{version} → v{MANAGED_LOGIN_V2}")
+                                    ManagedLoginVersion=managed_login_version)
+        print(f"  域名 {existing}: managed login v{version} → v{managed_login_version}")
     else:
         print(f"  域名 {existing}（managed login v{version}）")
     return existing
@@ -835,6 +848,102 @@ def _verify_no_native_flows(cog, pool_id: str, clients: dict) -> None:
                 f"client {key}({client_id}) 线上仍开着 {sorted(bad)}——"
                 "org 边界失效，中止（spec §3.5 第 4 条）")
     print("  ✓ 所有 client 均未开启原生认证 flow（org 边界成立）")
+
+
+def _verify_idp_pool_boundaries(cog, pool_id: str) -> None:
+    """读回复验内置 IdP 池的两条边界。
+
+    这个池今天没有别的闸门替采用者复验（平台池那套 CDK 与 verify_* 都不覆盖它），
+    所以两条都在这里硬断言：
+      · AllowAdminCreateUserOnly —— 开着自注册 = 任何人自己造一个邮箱身份；
+      · email 的 Mutable=False —— "邮箱由身份源控制"的唯一实现点。
+    第二条**不可自愈**（schema 建后不能改），所以文案必须说删池重建。
+    """
+    pool = cog.describe_user_pool(UserPoolId=pool_id)["UserPool"]
+    only_admin = pool.get("AdminCreateUserConfig", {}).get("AllowAdminCreateUserOnly")
+    if only_admin is not True:
+        raise SystemExit(
+            f"IdP pool {pool_id} 的 AllowAdminCreateUserOnly={only_admin!r}——"
+            "自注册未关闭，任何人都能自助注册出一个邮箱身份，"
+            "「邮箱由身份源控制」不成立，中止")
+    mutable = [a.get("Mutable") for a in pool.get("SchemaAttributes", [])
+               if a.get("Name") == "email"]
+    if mutable != [False]:
+        raise SystemExit(
+            f"IdP pool {pool_id} 的 email 属性 Mutable={mutable}，必须是 [False]。"
+            "这是「邮箱不可自改」的唯一实现点，而 schema 在建池后**不能修改**"
+            "——只能删掉这个池重建（改 [IdP] cognito_user_pool_name 换个名字也行）。中止")
+    print("  ✓ 自注册已关闭、email 不可变（连管理员都改不了）")
+
+
+def _ensure_idp_pool(cog, pool_name: str, existing: str | None) -> str:
+    """幂等建/纠正内置 IdP 池；existing 由 preflight_idp_pool 给出。
+
+    已存在时只纠正 AdminCreateUserConfig（唯一可自愈的那条边界），其余字段靠
+    pool_update_params 原样回填——update_user_pool 是整体替换，手抄白名单会
+    静默关掉威胁防护、短信配置与 tags（见那个函数的 docstring）。
+    tier 不在这里纠正：LITE 与 ESSENTIALS 都能工作，它不是边界，只是成本。
+    """
+    if not existing:
+        pool_id = cog.create_user_pool(**idp_pool_config(pool_name))["UserPool"]["Id"]
+        print(f"  新建 IdP pool {pool_id}（LITE，只许管理员建户，email 不可变）")
+    else:
+        pool_id = existing
+        print(f"  已存在 IdP pool {pool_id}，核对关键配置")
+        pool = cog.describe_user_pool(UserPoolId=pool_id)["UserPool"]
+        kwargs = pool_update_params(cog, pool)
+        kwargs["AdminCreateUserConfig"] = \
+            idp_pool_config(pool_name)["AdminCreateUserConfig"]
+        cog.update_user_pool(UserPoolId=pool_id, **kwargs)
+    _verify_idp_pool_boundaries(cog, pool_id)
+    return pool_id
+
+
+def _ensure_idp_pool_client(cog, idp_pool_id: str,
+                            platform_idpresponse: str) -> tuple[str, str]:
+    """幂等建/更新联邦用 app client；返回 (client_id, client_secret)。
+
+    **secret 不持久化**：create / update 都回传 ClientSecret，幂等重跑能重取，
+    所以它既不进 SSM 也不进 config.ini（少一份长期副本就少一处泄漏面）。
+
+    **CallbackURLs 取并集，不替换**：UpdateUserPoolClient 是整体替换，直接下发
+    我们这一条会摘掉线上已登记的回调——若那是另一个平台池的 idpresponse，
+    那个环境的登录当场全断。多一个已登记 URL 无害（同 site client 的 LogoutURLs）。
+    """
+    existing = {}
+    token = None
+    while True:
+        kw = {"NextToken": token} if token else {}
+        resp = cog.list_user_pool_clients(UserPoolId=idp_pool_id, MaxResults=60, **kw)
+        for c in resp.get("UserPoolClients", []):
+            existing[c["ClientName"]] = c["ClientId"]
+        token = resp.get("NextToken")
+        if not token:
+            break
+
+    params = idp_client_config(platform_idpresponse)
+    _assert_no_native_flows("idp-federation", params)
+    client_id = existing.get(IDP_CLIENT_NAME)
+    if client_id is None:
+        desc = cog.create_user_pool_client(UserPoolId=idp_pool_id,
+                                           **params)["UserPoolClient"]
+        print(f"  新建 IdP client {desc['ClientId']}（{IDP_CLIENT_NAME}）")
+    else:
+        # CallbackURLs 交给下面并集处理，所以先不声明它
+        desired = {k: v for k, v in params.items() if k != "CallbackURLs"}
+        update = _client_update_params(cog, idp_pool_id, client_id, desired)
+        update["CallbackURLs"] = sorted(
+            set(update.get("CallbackURLs") or []) | set(params["CallbackURLs"]))
+        desc = cog.update_user_pool_client(UserPoolId=idp_pool_id, ClientId=client_id,
+                                           **update)["UserPoolClient"]
+        print(f"  更新 IdP client {client_id}，回调 {update['CallbackURLs']}")
+    secret = desc.get("ClientSecret", "")
+    if not secret:
+        raise SystemExit(
+            f"IdP client {desc['ClientId']} 没有 client_secret——Cognito 作 OIDC RP "
+            "必须有它，否则 provider 会在**用户登录时**才报 invalid_client。"
+            f"删掉那个 client（{IDP_CLIENT_NAME}）让本脚本重建。")
+    return desc["ClientId"], secret
 
 
 def _ensure_branding(cog, pool_id: str, clients: dict) -> None:

@@ -1628,3 +1628,151 @@ def test_domain_lookup_treats_missing_and_not_found_alike():
             raise self.exceptions.ResourceNotFoundException(Domain)
 
     assert dp._pool_id_for_domain(_Raising(pools={}, domains={}), "nope") is None
+
+
+# ---------------------------------------------------------------------------
+# 工单 07：IdP 池收敛（建池 → 托管域名 → 联邦 client → 读回复验）
+# ---------------------------------------------------------------------------
+
+def test_idp_domain_is_created_without_managed_login_version():
+    """LITE 池只有 classic hosted UI：传 ManagedLoginVersion=2 会
+    `FeatureUnavailableInTierException`（实测）。所以内置 IdP 池这条路必须
+    **不带**这个参数——Stubber 按精确参数匹配，多传一个键就不匹配。"""
+    import boto3
+    from botocore.stub import Stubber
+    cog = boto3.client("cognito-idp", region_name="us-east-1",
+                       aws_access_key_id="t", aws_secret_access_key="t")
+    with Stubber(cog) as stub:
+        stub.add_response("describe_user_pool", {"UserPool": {"Id": "us-east-1_a"}},
+                          {"UserPoolId": "us-east-1_a"})
+        stub.add_response("create_user_pool_domain", {},
+                          {"Domain": "acme-idp-2026", "UserPoolId": "us-east-1_a"})
+        assert dp._ensure_domain(cog, "us-east-1_a", "acme-idp-2026",
+                                 managed_login_version=None) == "acme-idp-2026"
+        stub.assert_no_pending_responses()
+
+
+def test_platform_domain_still_requests_managed_login_v2_by_default():
+    """回归钉子：平台池那条路（默认参数）**必须**仍然传 v2。
+    平台池是 managed login v2 + 必须套 branding，混成一条就是登录页不可用。"""
+    import inspect
+    sig = inspect.signature(dp._ensure_domain)
+    assert sig.parameters["managed_login_version"].default == dp.MANAGED_LOGIN_V2
+
+
+def test_ensure_idp_pool_creates_and_verifies_both_boundaries():
+    import boto3
+    from botocore.stub import Stubber
+    cog = boto3.client("cognito-idp", region_name="us-east-1",
+                       aws_access_key_id="t", aws_secret_access_key="t")
+    with Stubber(cog) as stub:
+        stub.add_response("create_user_pool", {"UserPool": {"Id": "us-east-1_new"}},
+                          dp.idp_pool_config("acme-idp"))
+        stub.add_response("describe_user_pool", {"UserPool": {
+            "Id": "us-east-1_new",
+            "AdminCreateUserConfig": {"AllowAdminCreateUserOnly": True},
+            "SchemaAttributes": [{"Name": "email", "Mutable": False},
+                                 {"Name": "name", "Mutable": True}]}},
+                          {"UserPoolId": "us-east-1_new"})
+        assert dp._ensure_idp_pool(cog, "acme-idp", None) == "us-east-1_new"
+        stub.assert_no_pending_responses()
+
+
+@pytest.mark.parametrize("live,match", [
+    ({"AdminCreateUserConfig": {"AllowAdminCreateUserOnly": False},
+      "SchemaAttributes": [{"Name": "email", "Mutable": False}]}, "自注册"),
+    ({"AdminCreateUserConfig": {"AllowAdminCreateUserOnly": True},
+      "SchemaAttributes": [{"Name": "email", "Mutable": True}]}, "重建"),
+])
+def test_idp_pool_boundaries_fail_closed(live, match):
+    """两条边界各自都要红。
+
+    email 可变那条**不可自愈**（schema 建后不能改），所以文案必须说"删池重建"
+    ——否则采用者会以为幂等重跑能修好它，反复跑一个永远不满足前提的部署。
+    """
+    import boto3
+    from botocore.stub import Stubber
+    cog = boto3.client("cognito-idp", region_name="us-east-1",
+                       aws_access_key_id="t", aws_secret_access_key="t")
+    with Stubber(cog) as stub:
+        stub.add_response("describe_user_pool",
+                          {"UserPool": dict(live, Id="us-east-1_a")},
+                          {"UserPoolId": "us-east-1_a"})
+        with pytest.raises(SystemExit, match=match):
+            dp._verify_idp_pool_boundaries(cog, "us-east-1_a")
+
+
+def test_ensure_idp_pool_client_creates_with_secret():
+    import boto3
+    from botocore.stub import Stubber
+    fake_secret = "FAKEidpclientsecretFAKEidpcs1"
+    cog = boto3.client("cognito-idp", region_name="us-east-1",
+                       aws_access_key_id="t", aws_secret_access_key="t")
+    idpresponse = "https://plat.auth.us-east-1.amazoncognito.com/oauth2/idpresponse"
+    with Stubber(cog) as stub:
+        stub.add_response("list_user_pool_clients", {"UserPoolClients": []},
+                          {"UserPoolId": "us-east-1_a", "MaxResults": 60})
+        stub.add_response("create_user_pool_client",
+                          {"UserPoolClient": {"ClientId": "idpc1",
+                                              "ClientSecret": fake_secret}},
+                          dict(dp.idp_client_config(idpresponse),
+                               UserPoolId="us-east-1_a"))
+        assert dp._ensure_idp_pool_client(cog, "us-east-1_a", idpresponse) == \
+            ("idpc1", fake_secret)
+        stub.assert_no_pending_responses()
+
+
+def test_ensure_idp_pool_client_unions_callbacks_on_update():
+    """**回调取并集，绝不替换**（裁定 2 的第二半）。
+
+    UpdateUserPoolClient 是整体替换，直接下发我们这一条会摘掉线上已登记的回调
+    ——若那是另一个平台池的 idpresponse，那个环境的登录当场全断。沿用本仓库
+    既有的先例（LogoutURLs 的注释：多一个已登记 URL 无害，少一个会报错）。
+    """
+    import boto3
+    from botocore.stub import Stubber
+    fake_secret = "FAKEidpclientsecretFAKEidpcs1"
+    other = "https://other.auth.us-east-1.amazoncognito.com/oauth2/idpresponse"
+    mine = "https://plat.auth.us-east-1.amazoncognito.com/oauth2/idpresponse"
+    cog = boto3.client("cognito-idp", region_name="us-east-1",
+                       aws_access_key_id="t", aws_secret_access_key="t")
+    captured = _capture_update_params(cog)
+    with Stubber(cog) as stub:
+        stub.add_response("list_user_pool_clients",
+                          {"UserPoolClients": [{"ClientName": dp.IDP_CLIENT_NAME,
+                                                "ClientId": "idpc1"}]},
+                          {"UserPoolId": "us-east-1_a", "MaxResults": 60})
+        stub.add_response("describe_user_pool_client",
+                          {"UserPoolClient": {"ClientId": "idpc1",
+                                              "ClientName": dp.IDP_CLIENT_NAME,
+                                              "CallbackURLs": [other],
+                                              "ExplicitAuthFlows":
+                                                  ["ALLOW_REFRESH_TOKEN_AUTH"]}},
+                          {"UserPoolId": "us-east-1_a", "ClientId": "idpc1"})
+        stub.add_response("update_user_pool_client",
+                          {"UserPoolClient": {"ClientId": "idpc1",
+                                              "ClientSecret": fake_secret}}, None)
+        assert dp._ensure_idp_pool_client(cog, "us-east-1_a", mine) == \
+            ("idpc1", fake_secret)
+    assert sorted(captured[0]["CallbackURLs"]) == sorted([other, mine])
+    # WriteAttributes 在 update 路径上同样不许被塞进来（线上没设 ⇒ 保持未设）
+    assert "WriteAttributes" not in captured[0]
+
+
+def test_ensure_idp_pool_client_fails_loudly_without_a_secret():
+    """没 secret 的 provider 只在**用户登录**那一刻报 invalid_client，
+    比部署期报错难查得多——所以这里硬失败。"""
+    import boto3
+    from botocore.stub import Stubber
+    cog = boto3.client("cognito-idp", region_name="us-east-1",
+                       aws_access_key_id="t", aws_secret_access_key="t")
+    idpresponse = "https://plat.auth.us-east-1.amazoncognito.com/oauth2/idpresponse"
+    with Stubber(cog) as stub:
+        stub.add_response("list_user_pool_clients", {"UserPoolClients": []},
+                          {"UserPoolId": "us-east-1_a", "MaxResults": 60})
+        stub.add_response("create_user_pool_client",
+                          {"UserPoolClient": {"ClientId": "idpc1"}},
+                          dict(dp.idp_client_config(idpresponse),
+                               UserPoolId="us-east-1_a"))
+        with pytest.raises(SystemExit, match="client_secret"):
+            dp._ensure_idp_pool_client(cog, "us-east-1_a", idpresponse)
