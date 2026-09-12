@@ -436,6 +436,54 @@ def _find_pool(cog, name: str) -> str | None:
             return None
 
 
+def _pool_id_for_domain(cog, prefix: str) -> str | None:
+    """按托管域名前缀反查 pool id；查不到返回 None。
+
+    **实测形态**：不存在的前缀不抛异常，而是返回**空的** DomainDescription。
+    ResourceNotFoundException 也一并当成 None（防御性——若 AWS 改行为，preflight
+    应当退化成"没查到"，而不是把整个部署打成崩溃）。
+
+    注意效力边界：前缀是**跨账号全局唯一**的，被**别的账号**占用时这里同样返回
+    None（我们看不见别人的池）。那种情形留给 create_user_pool_domain 报错——
+    它的文案已经足够清楚，而 preflight 无法区分"没人用"与"别人在用"。
+    """
+    try:
+        desc = cog.describe_user_pool_domain(Domain=prefix)
+    except cog.exceptions.ResourceNotFoundException:
+        return None
+    return (desc.get("DomainDescription") or {}).get("UserPoolId") or None
+
+
+def preflight_idp_pool(cog, pool_name: str, domain_prefix: str) -> str | None:
+    """内置 IdP 池的**只读** preflight；返回已存在的池 id（没有则 None）。
+
+    两条判据都 fail closed，且都在第一次 AWS **写**之前（工单 06 那个坑正是
+    "池和域名都建好之后才炸"）：
+      ④ 按名字与按域名前缀找到的不是同一个池 ⇒ 停。放它过去意味着我们要么对着
+         别人的前缀建域名，要么把平台池的回调写进另一个环境的 IdP client。
+      ⑤ 按名字找到的池已有托管域名但 ≠ 配置前缀 ⇒ 停。`_ensure_domain` 会沿用
+         现值、忽略配置前缀，于是得到"config 说 A、线上用 B"的静默漂移，症状是
+         登录最后一跳 redirect_uri_mismatch。
+    """
+    by_name = _find_pool(cog, pool_name)
+    by_domain = _pool_id_for_domain(cog, domain_prefix)
+    if by_domain and by_domain != by_name:
+        raise SystemExit(
+            f"[IdP] cognito_domain_prefix = {domain_prefix!r} 已被 pool {by_domain} 占用，"
+            f"而按 cognito_user_pool_name = {pool_name!r} 找到的是 "
+            f"{by_name or '（不存在）'}——两者不是同一个池，中止。"
+            "两个键必须指向同一个 IdP 池（改配置，或先清理那个池的托管域名）。")
+    if by_name:
+        live = (cog.describe_user_pool(UserPoolId=by_name)["UserPool"] or {}).get("Domain")
+        if live and live != domain_prefix:
+            raise SystemExit(
+                f"IdP pool {by_name}（{pool_name}）的托管域名是 {live!r}，而 config 写的是"
+                f" {domain_prefix!r}，中止。托管域名建好后本脚本会沿用现值、忽略配置前缀，"
+                "放行只会得到「config 说一个、线上用另一个」的静默漂移——症状是登录"
+                "最后一跳 redirect_uri_mismatch。把 config 改成线上现值，或删掉那个域名。")
+    return by_name
+
+
 def pool_update_params(cog, pool: dict) -> dict:
     """describe_user_pool 结果 → update_user_pool 的完整参数。
 

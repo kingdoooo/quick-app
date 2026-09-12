@@ -1527,3 +1527,104 @@ def test_idp_pool_and_client_pass_botocore_param_validation():
                   UserPoolId="us-east-1_abc")
     validate_parameters(params,
                         model.operation_model("CreateUserPoolClient").input_shape)
+
+
+# ---------------------------------------------------------------------------
+# 工单 07：内置 IdP 池的只读 preflight（第 4/5 条分叉 fail closed）
+# ---------------------------------------------------------------------------
+
+class _ReadOnlyCog:
+    """只实现 preflight 需要的三个**读** API 的假 client。
+
+    "preflight 不写"因此是**结构性**的：任何 create_* / update_* 调用会
+    AttributeError，而不是靠人读代码确认。比 Stubber 更强的一点是它记录调用顺序，
+    可以断言"读了哪几个、没读别的"。
+    """
+
+    class exceptions:
+        class ResourceNotFoundException(Exception):
+            pass
+
+    def __init__(self, pools: dict, domains: dict):
+        self._pools = pools            # {pool_name: {"Id":…, "Domain":…}}
+        self._domains = domains        # {domain_prefix: pool_id}
+        self.calls: list = []
+
+    def list_user_pools(self, **kw):
+        self.calls.append(("list_user_pools", kw))
+        return {"UserPools": [{"Id": p["Id"], "Name": n}
+                              for n, p in self._pools.items()]}
+
+    def describe_user_pool(self, UserPoolId):
+        self.calls.append(("describe_user_pool", UserPoolId))
+        for p in self._pools.values():
+            if p["Id"] == UserPoolId:
+                return {"UserPool": dict(p)}
+        raise self.exceptions.ResourceNotFoundException(UserPoolId)
+
+    def describe_user_pool_domain(self, Domain):
+        self.calls.append(("describe_user_pool_domain", Domain))
+        pool_id = self._domains.get(Domain)
+        # **实测形态**：不存在的前缀返回空的 DomainDescription，不抛异常
+        return {"DomainDescription": {"UserPoolId": pool_id} if pool_id else {}}
+
+
+def test_preflight_returns_none_when_nothing_exists_and_only_reads():
+    cog = _ReadOnlyCog(pools={}, domains={})
+    assert dp.preflight_idp_pool(cog, "acme-idp", "acme-idp-2026") is None
+    assert {c[0] for c in cog.calls} <= {"list_user_pools", "describe_user_pool",
+                                         "describe_user_pool_domain"}
+
+
+def test_preflight_returns_existing_pool_when_name_and_domain_agree():
+    cog = _ReadOnlyCog(
+        pools={"acme-idp": {"Id": "us-east-1_a", "Domain": "acme-idp-2026"}},
+        domains={"acme-idp-2026": "us-east-1_a"})
+    assert dp.preflight_idp_pool(cog, "acme-idp", "acme-idp-2026") == "us-east-1_a"
+
+
+def test_preflight_fails_closed_when_domain_belongs_to_another_pool():
+    """判据 4：按名字与按域名前缀找到的**不是同一个池** ⇒ 停。
+
+    继续往下跑的后果是把这个域名前缀当成"还没建"，于是 create_user_pool_domain
+    对着别的池的前缀失败（或更糟：那个池是另一个环境的 IdP 池，而我们正准备把
+    平台池的回调写到它的 client 上）。
+    """
+    cog = _ReadOnlyCog(
+        pools={"acme-idp": {"Id": "us-east-1_a", "Domain": "other-prefix"}},
+        domains={"acme-idp-2026": "us-east-1_b", "other-prefix": "us-east-1_a"})
+    with pytest.raises(SystemExit, match="us-east-1_b"):
+        dp.preflight_idp_pool(cog, "acme-idp", "acme-idp-2026")
+
+
+def test_preflight_fails_closed_when_named_pool_has_a_different_domain():
+    """判据 5：按名字找到的池存在，但它的托管域名 ≠ 配置里的前缀 ⇒ 停。
+
+    `_ensure_domain` 在池已有域名时**沿用现值、忽略配置前缀**，所以放它过去会得到
+    "config 说 A、线上用 B"的静默漂移，而最后一跳的症状是 redirect_uri_mismatch
+    （工单 06 的第 4 条 code-review 结论）。
+    """
+    cog = _ReadOnlyCog(
+        pools={"acme-idp": {"Id": "us-east-1_a", "Domain": "legacy-prefix"}},
+        domains={"legacy-prefix": "us-east-1_a"})
+    with pytest.raises(SystemExit, match="legacy-prefix"):
+        dp.preflight_idp_pool(cog, "acme-idp", "acme-idp-2026")
+
+
+def test_preflight_allows_existing_pool_without_a_domain_yet():
+    """池建好了但域名没建（上一次跑到一半中断）⇒ 这是可收敛的状态，不该拒。"""
+    cog = _ReadOnlyCog(pools={"acme-idp": {"Id": "us-east-1_a"}}, domains={})
+    assert dp.preflight_idp_pool(cog, "acme-idp", "acme-idp-2026") == "us-east-1_a"
+
+
+def test_domain_lookup_treats_missing_and_not_found_alike():
+    """两种"没有"都要当成 None：空 DomainDescription（实测形态）与
+    ResourceNotFoundException（防御性，AWS 若改行为不至于把 preflight 打成崩溃）。"""
+    cog = _ReadOnlyCog(pools={}, domains={})
+    assert dp._pool_id_for_domain(cog, "nope") is None
+
+    class _Raising(_ReadOnlyCog):
+        def describe_user_pool_domain(self, Domain):
+            raise self.exceptions.ResourceNotFoundException(Domain)
+
+    assert dp._pool_id_for_domain(_Raising(pools={}, domains={}), "nope") is None
