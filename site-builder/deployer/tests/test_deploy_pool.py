@@ -1438,3 +1438,92 @@ def test_isolated_platform_pool_requires_both_idp_isolation_flags(flags):
     with pytest.raises(SystemExit, match="--idp-pool-name"):
         dp.resolve_idp_pool_names(pool_name="sb-idp-spike", idp_pool_name=name,
                                   idp_domain_prefix=prefix, idp=_idp_cognito())
+
+
+# ---------------------------------------------------------------------------
+# 工单 07：内置 IdP 池的参数生成（纯函数）
+# ---------------------------------------------------------------------------
+
+def test_idp_pool_is_lite_tier():
+    """LITE 够用：平台池要 ESSENTIALS 是为了 pre-token V2，而这个池不挂任何触发器
+    （实测 access token 里 email/idp/auth_via 都由**平台池**那个触发器注入）。
+    LITE 还明确拒 managed login v2 ⇒ 只有 classic hosted UI，也不需要 branding。
+    采用者的月成本因此只加 LITE 一档。"""
+    assert dp.idp_pool_config("acme-idp")["UserPoolTier"] == "LITE"
+
+
+def test_idp_pool_email_is_required_and_immutable():
+    """**这是"邮箱由身份源控制"的唯一实现点。**
+
+    实测复验：Mutable=False 下 admin_update_user_attributes 改 email 报
+    `InvalidParameterException: user.email: Attribute cannot be updated.`
+    ——连管理员都改不了。代价是建错邮箱只能删号重建（写进 DEPLOY.md）。
+    """
+    schema = dp.idp_pool_config("acme-idp")["Schema"]
+    email = [a for a in schema if a["Name"] == "email"]
+    assert email == [{"Name": "email", "AttributeDataType": "String",
+                      "Required": True, "Mutable": False}]
+
+
+def test_idp_pool_disables_self_signup():
+    """开着自注册 = 任何人都能自己造一个邮箱身份，整条路的地基就没了
+    （也是 palisade.udd.cognito.pool.open 扫的那一条）。"""
+    cfg = dp.idp_pool_config("acme-idp")
+    assert cfg["AdminCreateUserConfig"]["AllowAdminCreateUserOnly"] is True
+    assert cfg["PoolName"] == "acme-idp"
+    assert cfg["UsernameAttributes"] == ["email"]
+    assert cfg["AutoVerifiedAttributes"] == ["email"]
+
+
+def test_idp_client_omits_write_attributes_entirely():
+    """**WriteAttributes 这个键必须整个不给**，而不是给一份不含 email 的名单。
+
+    实测（工单 06 Q3）：显式给出的 WriteAttributes 必须包含全部 Required=True 属性
+    ——`["name"]` 被 `InvalidParameterException: Invalid write attributes specified
+    while creating a client` 拒，而 `["email","name"]` 反而**被接受**（哪怕 email 是
+    Mutable=False）。所以它**不是防线**；不给这个键时读回是 None，语义是"全部
+    **可变**标准属性可写"，而 email 在 schema 层不可变 ⇒ 自动被排除。
+    """
+    assert "WriteAttributes" not in dp.idp_client_config("https://x/oauth2/idpresponse")
+
+
+def test_idp_client_reads_the_three_mapping_targets():
+    """ReadAttributes 缺 email 而请求了 email scope ⇒ token 端点 invalid_grant。"""
+    cfg = dp.idp_client_config("https://x/oauth2/idpresponse")
+    assert set(cfg["ReadAttributes"]) == {"email", "email_verified", "name"}
+
+
+def test_idp_client_is_confidential_code_flow_with_platform_callback():
+    cfg = dp.idp_client_config(
+        "https://plat.auth.us-east-1.amazoncognito.com/oauth2/idpresponse")
+    assert cfg["GenerateSecret"] is True    # Cognito 作 OIDC RP 时要 client_secret
+    assert cfg["AllowedOAuthFlows"] == ["code"]
+    assert cfg["AllowedOAuthFlowsUserPoolClient"] is True
+    assert set(cfg["AllowedOAuthScopes"]) == {"openid", "email", "profile"}
+    assert cfg["CallbackURLs"] == [
+        "https://plat.auth.us-east-1.amazoncognito.com/oauth2/idpresponse"]
+    # IdP 池自己就是身份源：它的 client 只列 COGNITO（与平台池刻意不列 COGNITO 相反）
+    assert cfg["SupportedIdentityProviders"] == ["COGNITO"]
+    assert cfg["ClientName"] == dp.IDP_CLIENT_NAME
+
+
+def test_idp_client_passes_the_native_flow_gate():
+    """身份源池上原生认证全开 = 可以绕过 hosted UI 直接用 API 认证
+    （工单 06 的 Q4 更正）。这个池今天没有 CDK / 控制台替它复验，闸门就是这条。"""
+    cfg = dp.idp_client_config("https://x/oauth2/idpresponse")
+    assert cfg["ExplicitAuthFlows"] == ["ALLOW_REFRESH_TOKEN_AUTH"]
+    dp._assert_no_native_flows("idp-federation", cfg)      # 不得抛
+
+
+def test_idp_pool_and_client_pass_botocore_param_validation():
+    """参数形态按 service model 校验：拼错键名 / 类型的症状否则是真机上
+    ParamValidationError，而那时平台池已经建好了。"""
+    import botocore.session
+    from botocore.validate import validate_parameters
+    model = botocore.session.get_session().get_service_model("cognito-idp")
+    validate_parameters(dp.idp_pool_config("acme-idp"),
+                        model.operation_model("CreateUserPool").input_shape)
+    params = dict(dp.idp_client_config("https://x/oauth2/idpresponse"),
+                  UserPoolId="us-east-1_abc")
+    validate_parameters(params,
+                        model.operation_model("CreateUserPoolClient").input_shape)

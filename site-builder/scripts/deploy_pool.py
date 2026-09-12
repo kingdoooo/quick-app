@@ -348,6 +348,73 @@ def client_configs(base_domain: str, extra_mcp_callbacks: list[str],
     return out
 
 
+# ---- 内置 IdP 池（[IdP] mode = cognito-admin，ADR 0006）------------------
+#
+# 平台池 vs 这个池的分工：平台池是**RP**（联邦到某个 IdP、发平台自己的 token），
+# 这个池是**IdP**（真正存用户与密码，只许管理员建户）。两者的配置刻意不同：
+#   · tier：平台池 ESSENTIALS（pre-token V2），这个池 LITE（不挂触发器）；
+#   · 托管登录：平台池 managed login v2 + 必须套 branding，这个池 classic
+#     hosted UI + **不需要** branding（LITE 拒 v2）；
+#   · SupportedIdentityProviders：平台池刻意**不**列 COGNITO（否则暴露本地登录
+#     入口，击穿 allowed_users="org"），这个池**只**列 COGNITO（它就是目录本身）。
+# 每一项都在工单 06 的隔离池上实测过。
+IDP_CLIENT_NAME = "platform-federation"
+
+
+def idp_pool_config(pool_name: str) -> dict:
+    """内置 IdP 池的 CreateUserPool 参数。
+
+    `email` 的 `Required=True, Mutable=False` 是**"邮箱由身份源控制"的唯一实现点**
+    ——app client 的 WriteAttributes 不是防线（显式给出时必须包含全部 Required
+    属性，`["name"]` 被拒而 `["email","name"]` 反而被接受）。实测复验：
+    Mutable=False 下连 admin_update_user_attributes 都报
+    `user.email: Attribute cannot be updated.`。
+    **代价**：建错邮箱只能删号重建，没有改的路（写进 DEPLOY.md）。
+
+    schema 建后不可改 ⇒ 一个 email 可变的既有池**修不回来**，`_ensure_idp_pool`
+    的读回复验会明说要删池重建。
+    """
+    return {
+        "PoolName": pool_name,
+        # LITE 够用：平台池要 ESSENTIALS 是为了 pre-token V2，这个池不挂触发器。
+        # LITE 拒 managed login v2（FeatureUnavailableInTierException）⇒ 只有
+        # classic hosted UI，实测 /login 直接 200 且带密码表单、无注册入口。
+        "UserPoolTier": "LITE",
+        "AutoVerifiedAttributes": ["email"],
+        "UsernameAttributes": ["email"],
+        "Schema": [{"Name": "email", "AttributeDataType": "String",
+                    "Required": True, "Mutable": False}],
+        # 与平台池同一条硬要求：只许管理员建户。
+        "AdminCreateUserConfig": {"AllowAdminCreateUserOnly": True},
+        "UserPoolTags": {"project": "site-builder", "managed_by": "deploy_pool.py",
+                         "role": "idp-source"},
+    }
+
+
+def idp_client_config(platform_idpresponse: str) -> dict:
+    """IdP 池里"给平台池联邦用"的 app client。
+
+    platform_idpresponse 必须是**平台池托管域名的真实现值**拼出来的
+    `/oauth2/idpresponse`，不是按配置前缀拼的——`_ensure_domain` 在池已有域名时
+    沿用现值、忽略配置前缀，拼错的症状是最后一跳 `redirect_uri_mismatch`。
+
+    **WriteAttributes 整个键不给**（见 idp_pool_config 的 docstring）。
+    **ExplicitAuthFlows 必须显式给**：[] 被当成未指定 ⇒ SRP + CUSTOM 默认开着，
+    可绕过 hosted UI 直接用 API 认证（工单 06 实测）。
+    """
+    return {
+        "ClientName": IDP_CLIENT_NAME,
+        "GenerateSecret": True,          # Cognito 作 OIDC RP 时要 client_secret
+        "AllowedOAuthFlows": ["code"],
+        "AllowedOAuthFlowsUserPoolClient": True,
+        "AllowedOAuthScopes": ["openid", "email", "profile"],
+        "CallbackURLs": [platform_idpresponse],
+        "SupportedIdentityProviders": ["COGNITO"],   # 这个池自己就是身份源
+        "ReadAttributes": ["email", "email_verified", "name"],
+        "ExplicitAuthFlows": list(NATIVE_AUTH_DISABLED),
+    }
+
+
 def _cfg() -> configparser.ConfigParser:
     cfg = configparser.ConfigParser()
     cfg.read(HERE.parent / "config.ini")
