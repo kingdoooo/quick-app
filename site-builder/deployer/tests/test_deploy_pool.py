@@ -1919,3 +1919,56 @@ def test_main_prints_the_two_admin_create_user_commands():
     assert "admin-set-user-password" in src and "--permanent" in src
     assert "email_verified,Value=true" in src        # require_email_verified 的前提
     assert "SUPPRESS" in src
+
+
+# ---------------------------------------------------------------------------
+# 工单 07：出厂 config.ini.example 必须过自己的 preflight
+# ---------------------------------------------------------------------------
+
+def _example_idp() -> dict:
+    """出厂 `.example` 的 [IdP] 段，**裸 ConfigParser**（与生产同款：行内注释留在值里）。"""
+    import configparser
+    cfg = configparser.ConfigParser()
+    cfg.read(Path(__file__).resolve().parents[3] / "site-builder" / "config.ini.example")
+    assert cfg.sections(), ".example 读空了——本条空转"
+    return dict(cfg["IdP"])
+
+
+def test_shipped_example_declares_the_three_mode_keys():
+    idp = _example_idp()
+    for key in ("mode", "cognito_user_pool_name", "cognito_domain_prefix"):
+        assert key in idp, f".example 的 [IdP] 缺 {key}"
+
+
+def test_shipped_example_passes_its_own_preflight():
+    """**出厂模板必须过自己的 preflight。**
+
+    这条比它看起来重要：`cognito_user_pool_name` 若出厂就带一个推荐值
+    （`site-builder-idp`），而 mode 是 external-oidc ⇒ 判据③（两套字段混填）当场
+    把每个采用者的第一次部署打红。所以两个 cognito_* 键出厂**必须为空**，
+    推荐值只写在注释里。
+    """
+    idp = _example_idp()
+    mode = dp.idp_mode(idp)
+    assert mode == dp.IDP_MODE_EXTERNAL, ".example 的出厂模式必须是 external-oidc"
+    dp.check_idp_section(idp, mode)          # 不得抛
+
+
+def test_example_switched_to_cognito_admin_passes_preflight():
+    """采用者按注释填完之后也必须过：把 mode 换成 cognito-admin、补两个键、
+    清空三个派生字段——这就是 DEPLOY.md 第 3 条路要他做的全部编辑。"""
+    idp = dict(_example_idp(), mode="cognito-admin", provider_name="CognitoSource",
+               cognito_user_pool_name="site-builder-idp",
+               cognito_domain_prefix="acme-idp-2026",
+               issuer="", client_id="", client_secret="")
+    assert dp.idp_mode(idp) == dp.IDP_MODE_COGNITO
+    dp.check_idp_section(idp, dp.IDP_MODE_COGNITO)      # 不得抛
+
+
+def test_example_mode_keys_have_no_inline_comments():
+    """行内注释会被裸 ConfigParser 并进值 ⇒ `mode = cognito-admin  # 内置` 虽然被
+    `_clean` 兜住了，但 cognito_user_pool_name 带注释就会拼出一个带空格与井号的
+    池名。注释一律写在**上一行**（与 test_example_config_consistency 同一条纪律）。"""
+    idp = _example_idp()
+    for key in ("mode", "cognito_user_pool_name", "cognito_domain_prefix"):
+        assert "#" not in idp[key] and ";" not in idp[key], f"{key} = {idp[key]!r}"

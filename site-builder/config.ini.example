@@ -59,6 +59,25 @@ endpoint_url =
 # 不满足这两条的 IdP（如允许自助注册并自设邮箱的公共 IdP）绝不能接——
 # 攻击者把自己的 email 改成某站点 owner 的地址即可继承其全部权限。
 [IdP]
+# 身份源模式。两种取值，**键缺失时按 external-oidc**（存量 config.ini 无此键）：
+#   external-oidc —— 你已有 OIDC IdP（Okta / Entra ID / Google / 飞书适配器…）。
+#                    下面的 issuer / client_id / client_secret 由你填。
+#   cognito-admin —— 让资产自己再建**第二个** Cognito 用户池充当 OIDC IdP：
+#                    只许管理员建户、email 在 schema 层不可变（连管理员都改不了）。
+#                    适用于「还没有任何 IdP」，零外部依赖。此模式下
+#                    issuer / client_id / client_secret **必须留空**——它们由部署
+#                    过程从新建的池派生，**非空即报冲突**（不会被静默忽略）。
+#                    决策见 docs/adr/0006-*.md，操作见 DEPLOY.md §0 第 3 条路。
+mode = external-oidc
+# 下面两个键**只在 mode = cognito-admin 时填，且缺一不可**：
+#   cognito_user_pool_name —— 那个 IdP 池的名字（建议 site-builder-idp）。
+#                             幂等重跑靠它找回池，改名等于建一个新池。
+#   cognito_domain_prefix  —— 它的托管域名前缀，**跨账号全局唯一**，可能被占用。
+#                             必须建：issuer 的 discovery 文档里 authorize / token /
+#                             userinfo 三个端点全部指向托管域名。
+# 出厂留空是刻意的：external-oidc 下填了它们会被判成「两套模式混填」而拒。
+cognito_user_pool_name =
+cognito_domain_prefix =
 # Cognito 里的 provider 名，自取。两条约束：
 #   ① **四个社交类型名不能用**（区分大小写）：Google / Facebook /
 #      LoginWithAmazon / SignInWithApple。它们被 Cognito 绑给了各自的原生 social
