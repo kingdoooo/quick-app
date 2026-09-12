@@ -79,30 +79,234 @@ aws acm describe-certificate --region us-east-1 \
 ### 身份源（IdP）场景选择
 
 平台对上游 IdP 的唯一硬要求：**Cognito 能联邦到它，且能拿到用户 email claim**
-（owner / allowed_users 全以邮箱为标识）。按你组织的身份源二选一，
-后文所有标 **【飞书】** 的步骤只在飞书场景执行，标准 IdP 场景跳过：
+（owner / allowed_users 全以邮箱为标识）。**没有现成 IdP 也能部署**——第 3 条路
+就是为这种情况准备的，不必"先去申请一个 IdP 客户端"。按你组织的身份源三选一：
 
-| | 【飞书】场景 | 【标准 IdP】场景（Okta / Azure AD / IAM Identity Center 等） |
-|---|---|---|
-| 适用 | 组织用飞书，用户以飞书账号登录 | 组织已有标准 OIDC/SAML IdP |
-| Cognito 联邦方式 | 经**自建 OIDC 适配器**（① 部署的 API Gateway+Lambda，把飞书 OAuth 包装成 OIDC） | Cognito **原生 OIDC/SAML 联邦**，无需适配器 |
-| ① 阶段做法 | 部署 feishu-quick-sso 上游方案 | 自建 user pool + 控制台添加 IdP（见 ① 的标准 IdP 分支） |
-| email 来源 | 飞书通讯录（两个坑见下节） | IdP 的 email attribute mapping |
-| 本手册验证状态 | **全流程真机验证过** | 架构兼容（平台代码不感知 IdP），未真机验证 |
+| | 1【已有 OIDC IdP】 | 2【Google】 | 3【内置 Cognito】 |
+|---|---|---|---|
+| 适用 | 组织已有标准 OIDC/SAML IdP（Okta / Entra ID / IAM Identity Center…） | 组织用 Google Workspace，或想用一个免费的真实第三方 IdP 起步 | **还没有任何 IdP**，希望零外部依赖 |
+| Cognito 联邦方式 | Cognito **原生 OIDC/SAML 联邦**，无适配器 | Cognito 原生 OIDC 联邦，issuer `https://accounts.google.com` | 再建**第二个 Cognito 池**当 OIDC IdP，平台池照常联邦它 |
+| 用户从哪来 | 你的目录 | Google 账号（由 GCP 侧的 app 可见范围约束） | **管理员建户**（池内关自注册） |
+| `email_verified` | 视 IdP 而定（**Entra ID 默认不发，见下面的已知差异**） | Google 下发 | 建户时置 `true` |
+| 额外成本 | 无 | 无（GCP 项目免费） | 多一个 Cognito 池（**LITE 档即可**） |
+| 门槛 | 需要目录管理员配合 | 需要一个 GCP 项目 | **零外部依赖** |
+| 证据强度 | 架构兼容（平台不感知 IdP），未逐个真机验证 | **单账号真机验证过**（登录到 claim 落地这一段） | **单账号真机验证过**（同左） |
+
+> **飞书是一个参考适配器，不是第四条路**。飞书没有标准 OIDC 端点，所以要经一个
+> 自建适配器（把飞书 OAuth 包装成 OIDC）接进来；对平台而言它就是第 1 条路里的
+> 一个普通 OIDC IdP。手册里所有标 **【飞书】** 的步骤只在你确实要接飞书时执行，
+> 其余三条路一律跳过。同一套做法可用来接任何没有原生 OIDC 的身份源。
+
+> **第 3 条路（内置 Cognito）目前依赖工单 07**：ADR 0006 已裁定采用它，
+> `deploy_pool.py` 的模式开关尚未落地。可行性本身已经真机验证过——第二个池作
+> OIDC IdP、管理员建户、**平台池零代码改动**，登录后 `email` / `email_verified` /
+> `name` / `idp` / `auth_via` 五个 claim 在 id token 与 access token 里都到位。
+> 07 落地前，按下面「内置 Cognito 池的确切形态」手工建第二个池同样可用。
+
+**这三条路对平台其余部分完全等价。** 平台唯一感知 IdP 的代码是
+`auth/login_handler.py` 的 `_exchange_code`（消费 `email` / `email_verified` /
+`name` / `idp` / `auth_via`，出口是与 IdP 无关的 dict）；它之后的会话签发、
+Edge 验签、建站、访问、控制台不含任何 IdP 分支。所以换 IdP 只改 `[IdP]` 段
+（外加 `router/config.ini` 的 `trusted_idps`），不改代码。
+
+#### 换 IdP 时的三个硬约束
+
+这三条与选哪条路无关。**首次部署不涉及**（那时还没有存量用户），但
+**在一个已经有人在用的部署上换 IdP 之前必须全读**：
+
+1. **平台只支持"一个" IdP，而换掉它会当场切断全部存量用户的登录。**
+   `[IdP]` 只有一个 `provider_name`，`deploy_pool.py` 会把 site / mcp 两个 app client 的
+   `SupportedIdentityProviders` 设成**仅**这一个（刻意不含 `COGNITO`，见 §0 的 org 边界）。
+   所以在生产池上改 `[IdP]` 重跑脚本 = 旧 provider 从 client 上被摘掉 = 托管登录页不再有
+   旧 IdP 入口，**所有老用户立刻登不进**，直到把 `[IdP]` 改回去重跑。
+   **"同时挂两个 IdP" 今天配置不出来**（要改代码）。
+   ⇒ **要试一个新 IdP，不要在生产池上试。** 用隔离池：
+
+   ```bash
+   # 独立 pool + 独立托管域名前缀；脚本会自动把 pre-token 触发器与 SSM 参数
+   # 也隔离掉（函数名加 -spike-{pool}，参数前缀改 /site-builder-spike/{pool}），
+   # 所以生产池、生产触发器、生产 client secret 一个字节都不动。
+   python3 site-builder/scripts/deploy_pool.py \
+     --pool-name my-idp-trial --domain-prefix my-idp-trial-<随机后缀>
+   ```
+
+   验完把隔离池删掉即可。真要做**正式迁移**（把存量用户从 A 换到 B），除了下面第 3 条的
+   别名问题，还要接受一个登录中断窗口——那是一次独立设计，不在本手册范围。
+
+2. **`trusted_idps` 要先于 signer 就位。** `[IdP] provider_name` 的值必须出现在
+   `router/config.ini` 的 `[SiteBuilder] trusted_idps` 里（逗号分隔，**可以是超集，
+   所以能提前把新名字加进去**），否则 `require_idp_claim = true` 下该 IdP 的用户全部被
+   Edge 302。而 Edge 改一次要 **10–20 分钟全球复制**，所以顺序是**先把新 provider 名
+   加进 `trusted_idps` 并部完 router，再切 `[IdP]`**——反过来做，症状是
+   "登录成功但访问站点被踢回登录页"。
+
+   > **这一对没有任何自动闸门，只能你自己核对。**
+   > `deployer/tests/test_example_config_consistency.py` 只读两份**模板**
+   > （`*.example`，出厂都是空值 ⇒ 那条断言对采用者恒真），
+   > 而 router synth 只拒"`require_idp_claim=true` 但 `trusted_idps` 为空"和
+   > "值里带行内注释"两种情形，**不检查 `provider_name` 是否真在名单里**。
+   > 写错的代价是静默的 Edge 302。
+
+3. **同一个邮箱不要跨 provider 出现。** 平台池是 `UsernameAttributes = ["email"]`，
+   联邦用户的 username 形如 `{ProviderName}_{sub}`。同一个邮箱先由 A 联邦建过用户、
+   之后又从 B 登录时，Cognito 会因 email 别名已被占用而在**登录阶段**失败
+   （不是部署阶段）。**注意作用域是"同一个池"**——在隔离池里试新 IdP 时用同一个邮箱
+   完全没问题，因为那个池里没有旧用户。真要做 IdP 迁移则需要账号链接
+   （`AdminLinkProviderForUser`），同样是独立设计。
 
 > **"org" 的边界 = 你联邦的 IdP 的用户集合，不是邮箱域名**。
 > `allowed_users: "org"` 的判定链是"会话有效 + 来自 trusted_idps 里的 provider
 > 即放行"——代码里没有任何按 `@域名` 过滤的逻辑，邮箱只是标识符（owner/名单里
-> 的键）。飞书场景：org = 创建企业自建应用的那个租户（成员邮箱可以是任意域，
-> 含个人 Gmail）；标准 IdP 场景：org = 该目录里能对此应用完成 SSO 的用户（受
-> IdP 侧 app assignment 约束）。想要"仅限本公司员工"，联邦你自己的企业 IdP 就
-> 自动得到；IdP 里有外部账号时在 IdP 侧收窄，不要指望按邮箱域名筛。
+> 的键）。逐条对应：
+> **1 已有 OIDC IdP** —— org = 该目录里能对此应用完成 SSO 的用户（受 IdP 侧
+> app assignment 约束）；
+> **2 Google** —— org = **能通过你那个 GCP OAuth 应用的可见范围的 Google 账号**。
+> 这条最容易踩：GCP 应用发布状态为 *Testing* 时 org = 你登记的测试用户；一旦
+> 发布为 *In production* 且用户类型是 *External*，**任何 Google 账号都在 org 里**
+> ——那等于把 `allowed_users: "org"` 的站点对全互联网开放。要么把用户类型设成
+> *Internal*（仅 Google Workspace 组织内），要么别用 `org`、改用显式名单；
+> **3 内置 Cognito** —— org = 你在第二个池里**亲手建过的那些用户**，边界最清晰；
+> **飞书** —— org = 创建企业自建应用的那个租户（成员邮箱可以是任意域，含个人 Gmail）。
+> 想要"仅限本公司员工"，联邦你自己的企业 IdP 就自动得到；IdP 里有外部账号时在
+> IdP 侧收窄，不要指望按邮箱域名筛。
 
 > **与 Agent 客户端的账号体系无关**：Claude Code / Codex / Quick 各自怎么登录
 > 是客户端自己的事，本方案对此不做任何假设、也无任何依赖。用户在客户端里添加
 > 部署 MCP 时，走的是**本平台** Cognito 的 OAuth（联邦到你在这一步接入的 IdP）；
 > 站点访问与控制台同理。唯一的实务建议：IdP 给出的邮箱要与你日常用于
 > allowed_users 名单的邮箱一致，否则名单对不上人。
+
+### 【内置 Cognito】第二个池的确切形态
+
+第 3 条路：**再建一个 Cognito 用户池充当 OIDC IdP**，平台池像对任何第三方 OIDC
+IdP 一样联邦它。平台代码零改动——"邮箱由身份源控制"这条硬要求由**第二个池的
+配置**满足，而不是放松平台池（放松平台池会让邮箱回到用户手里，而 owner /
+allowed_users / 会话 claim 全以邮箱为键）。决策见 `docs/adr/0006-*.md`。
+
+> `deploy_pool.py` 的模式开关属于工单 07，尚未落地。在那之前按本节手工建。
+
+**池本身**（下面每一项都是必需的，理由在右侧）：
+
+| 配置 | 值 | 为什么 |
+|---|---|---|
+| `UserPoolTier` | `LITE` | 够用且最便宜。**平台池**必须 `ESSENTIALS` 是因为 pre-token V2，而这个池不需要任何触发器 |
+| `AdminCreateUserConfig.AllowAdminCreateUserOnly` | `true` | 关自注册。这是整条路的地基：开着就等于任何人都能自己造一个邮箱身份 |
+| `UsernameAttributes` | `["email"]` | 用邮箱登录 |
+| `AutoVerifiedAttributes` | `["email"]` | — |
+| `Schema` 的 `email` | `Required: true`, **`Mutable: false`** | **"邮箱不可自改"的唯一实现点**。设成不可变后连管理员都改不了（`admin-update-user-attributes` 会报 `user.email: Attribute cannot be updated.`） |
+
+**建完池就读回核对这两项**（手工建的池没有脚本替你复验，而这两项各自都是一条边界）：
+
+```bash
+aws cognito-idp describe-user-pool --region us-east-1 --user-pool-id <idp_pool_id> \
+  --query '{selfSignupClosed: UserPool.AdminCreateUserConfig.AllowAdminCreateUserOnly,
+            emailImmutable: UserPool.SchemaAttributes[?Name==`email`].Mutable | [0]}'
+# 期望 {"selfSignupClosed": true, "emailImmutable": false}
+```
+
+`selfSignupClosed` 为 false = 任何人都能自助注册出一个邮箱身份（也正是 Amazon 内部
+`palisade.udd.cognito.pool.open` 扫的那一条）；`emailImmutable` 为 true = 邮箱可被改写，
+"邮箱由身份源控制"不成立。
+
+**托管域名**：必须建（`create-user-pool-domain`），因为 issuer 的 discovery 文档里
+`authorization_endpoint` / `token_endpoint` / `userinfo_endpoint` 全部指向托管域名
+——没有域名就没有这些端点，联邦无从建立。**不要传 `ManagedLoginVersion`**：
+LITE 档只有 classic hosted UI，传 2 会 `FeatureUnavailableInTierException`。
+也**不需要**套 branding（classic hosted UI 直接可用——这与平台池不同，平台池是
+managed login v2，那边"API 建的 client 不套 branding 则登录页不可用"仍然成立）。
+
+**联邦用 app client**：
+
+- `GenerateSecret: true`（Cognito 作 OIDC RP 时要 client_secret）
+- `AllowedOAuthFlows: ["code"]`、`AllowedOAuthFlowsUserPoolClient: true`、
+  `AllowedOAuthScopes: ["openid","email","profile"]`
+- `CallbackURLs`: **平台池**托管域名的 `/oauth2/idpresponse`
+  （即 `https://{平台 domain-prefix}.auth.{region}.amazoncognito.com/oauth2/idpresponse`）
+- `ReadAttributes: ["email","email_verified","name"]`
+- **`ExplicitAuthFlows: ["ALLOW_REFRESH_TOKEN_AUTH"]`** —— 与平台池同一个值。
+  classic hosted UI 的登录不走 `InitiateAuth`，所以收紧它不影响登录页（实测登录页
+  仍 200 且可用）。
+
+  > **别写成 `[]`，那是个陷阱。** 空数组会被 Cognito 当成"未指定"（读回来是空），
+  > 而未指定的默认值是 `ALLOW_REFRESH_TOKEN_AUTH` + **`ALLOW_USER_SRP_AUTH`** +
+  > **`ALLOW_CUSTOM_AUTH`**。实测确认过：`ExplicitAuthFlows: []` 建出来的 client，
+  > 拿 `USER_SRP_AUTH` 调 `InitiateAuth` **成功返回挑战**（`USER_PASSWORD_AUTH` 才报
+  > "flow not enabled"）⇒ 这个**身份源**池上的 SRP 密码认证是全开的，可以绕过登录页
+  > 直接用 API 认证。显式写 `["ALLOW_REFRESH_TOKEN_AUTH"]` 后三个 flow 全部报
+  > "not enabled"。
+  >
+  > **建完必须读回核对**（这个池是手工建的，没有脚本替你复验）：
+  >
+  > ```bash
+  > aws cognito-idp describe-user-pool-client --region us-east-1 \
+  >   --user-pool-id <idp_pool_id> --client-id <client_id> \
+  >   --query 'UserPoolClient.ExplicitAuthFlows'
+  > # 期望恰好是 ["ALLOW_REFRESH_TOKEN_AUTH"]；输出 null 或 [] 都是**没配上**
+  > ```
+- **`WriteAttributes` 整个键不要给**。这里有个反直觉的坑：显式给出的
+  `WriteAttributes` **必须包含全部 `Required: true` 的属性**，所以
+  `["name"]`（想借此让 email 只读）会被 `InvalidParameterException: Invalid write
+  attributes specified while creating a client` 拒，而 `["email","name"]` 反而被接受
+  ——**它不是防线**。不给这个键时读回来是空，语义是"全部**可变**标准属性可写"，
+  而 email 在 schema 层就不可变 ⇒ 自动被排除。防线始终是上面那个 `Mutable: false`
+
+**管理员建户**（两条命令，少第二条用户会停在 `FORCE_CHANGE_PASSWORD`，
+首次登录多一屏强制改密）：
+
+```bash
+aws cognito-idp admin-create-user --region us-east-1 \
+  --user-pool-id <idp_pool_id> --username <email> \
+  --user-attributes Name=email,Value=<email> Name=email_verified,Value=true \
+                    Name=name,Value=<显示名> \
+  --message-action SUPPRESS
+aws cognito-idp admin-set-user-password --region us-east-1 \
+  --user-pool-id <idp_pool_id> --username <email> \
+  --password '<初始密码>' --permanent
+```
+
+`email_verified=true` 是平台侧 `require_email_verified` 能过的前提。
+`--message-action SUPPRESS` 表示不发邮件——**你需要用别的渠道把初始密码交给用户**。
+
+**回填平台池的 `[IdP]` 段**：
+
+```ini
+[IdP]
+provider_name = <自取，如 CognitoSource；同一个值要加进 router 的 trusted_idps>
+issuer = https://cognito-idp.<region>.amazonaws.com/<idp_pool_id>
+client_id = <上面那个 app client 的 ID>
+client_secret = <它的 secret；可用 SB_IDP_CLIENT_SECRET 注入不落磁盘>
+scopes = openid email profile
+map_email_verified = true
+require_email_verified = true
+```
+
+**代价，接受它再选这条路**：`email` 不可变 ⇒ **建错邮箱只能删号重建**，没有改的路。
+另外初始密码要靠人工分发，且这个池没有邮件投递配置（`SUPPRESS`）。
+
+### 已知差异：Microsoft Entra ID 默认不发 `email_verified`
+
+Entra ID（原 Azure AD）默认**不下发** `email_verified` claim。它的影响是精确的、
+只在一处：
+
+- `map_email_verified = true` 照留（映射不到就是 no-op，官方明示"只有 claim 存在
+  才映射"，**不会导致登录失败**）；
+- 但 `require_email_verified = true` 会让**所有** Entra 用户登不进——
+  `auth/login_handler.py` 与 `mcp/server.py` 两处都是 fail-closed（claim 缺失、
+  `"false"`、类型不对一律拒）。症状是登录走完 IdP 后在 `/callback` 被拒。
+
+两个选择，**没有第三个**：
+
+1. 在 Entra 侧配一个 optional claim / claims mapping policy 把验证状态发出来
+   （推荐；这样技术防线还在）；
+2. 设 `require_email_verified = false`。**代价要写进你自己的变更记录**：这道防线
+   消失后，"邮箱可信"完全退回到 IdP 选型本身——Entra ID 作为企业目录、邮箱由管理员
+   控制、用户不能自改，所以这个退让在 Entra 上是可接受的；但**同样的退让不能顺手
+   用在允许用户自设邮箱的 IdP 上**，那等于让攻击者把 email 改成某站点 owner 的地址
+   即可继承其权限。
+
+> 本条**未在本手册的验证环境实测**，是按上述两处代码的 fail-closed 语义与 Entra
+> 的默认 claim 集推导的已知差异。接 Entra 时先用一个测试账号走一遍登录，
+> 看 `/callback` 是否因这条被拒，再决定走 1 还是 2。
 
 ### 【飞书】企业自建应用
 
@@ -634,8 +838,17 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
       的输出回填（④ 部完之后才拿得到；② 与 auth / panel 都会核对指纹）
 - [ ] （可选）`[Verification]` 段已配置且 `python3 site-builder/scripts/ensure_fixture_site.py` 已跑过
       ——四个 `verify_*` 闸门与 kid 探针的登录态都来自夹具签发器
-- [ ] 身份源就绪：【飞书】企业自建应用（App ID/Secret，含用户 userid + 邮箱权限）
-      / 【标准 IdP】OIDC/SAML 应用已建、email attribute 可映射
+- [ ] 身份源就绪（按 §0 选定的那条路只看一行）：
+      **1【已有 OIDC IdP】** OIDC/SAML 应用已建、email attribute 可映射、Cognito 的
+      `/oauth2/idpresponse` 已登记为回调
+      / **2【Google】** GCP OAuth client（Web application）已建、`/oauth2/idpresponse`
+      填进 Authorized redirect URIs、登录用的账号已加进 Audience → Test users
+      / **3【内置 Cognito】** 第二个池 + 托管域名 + app client 已建、
+      管理员已建好用户（含 `email_verified=true` 与永久密码）、
+      且 §0 那两条读回核对（`selfSignupClosed`/`emailImmutable`、`ExplicitAuthFlows`）都过了
+      / **【飞书】** 企业自建应用（App ID/Secret，含用户 userid + 邮箱权限）
+- [ ] `[IdP] provider_name` 不是四个社交保留名之一，且**同一个值**已写进
+      `router/config.ini` 的 `[SiteBuilder] trusted_idps`（这一对没有自动闸门，见 §0）
 - [ ] Docker 运行中；`npx` 可用
 - [ ] `[Alerting] email`（或 `SB_ALERT_EMAIL`）已定：一个**有人能点 SNS 确认链接**的邮箱——
       为空时 ① 的 `deploy_auth.py` 直接失败
@@ -1293,10 +1506,95 @@ PY
 pre-token 触发器、managed login branding。命令与实测基线见前面
 [决定安全边界的几项配置](#决定安全边界的几项配置先读这节)第 1 项。
 
-下面步骤 1 是**准备 IdP**（按 §0 选定的场景二选一），步骤 2 起是拿到 pool 之后
-的通用核对（把命令里的 IdP 名 `Feishu` 换成你实际的 provider name）。
+下面步骤 1 是**准备 IdP**（按 §0 选定的那条路，四个分支里只做一个），步骤 2 起是
+拿到 pool 之后的通用核对（把命令里的 IdP 名 `Feishu` 换成你实际的 provider name）。
 
-1. **【飞书】** 克隆并按其 README 部署上游方案（把飞书 OAuth 包装成标准 OIDC
+> **不管走哪条路，`[IdP]` 段的形状都一样**（`provider_name` / `issuer` /
+> `client_id` / `client_secret` / `scopes` / `map_email_verified` /
+> `require_email_verified`），`deploy_pool.py` 也只有一条 OIDC provider 代码路径。
+> 四个分支的差别只在"issuer 与 client 凭证从哪来"、"回调登记在哪一侧"。
+
+1. **【已有 OIDC IdP】** 无需上游方案与适配器：把 IdP 的 issuer / client_id /
+   client_secret 填进 `[IdP]` 段，`deploy_pool.py` 会用 Cognito 原生 OIDC
+   联邦建好（含 email 与 `email_verified` 映射）。IdP 侧登记 Cognito 的回调
+   `https://{hosted-ui-domain}/oauth2/idpresponse`。
+
+   **首次部署时，回调 URL 在跑脚本之前就能拼出来**（不必先跑一遍拿地址）：域名前缀是
+   你给的 `--domain-prefix`（默认 `site-builder-auth`），形态是
+   `https://{domain-prefix}.auth.{region}.amazoncognito.com/oauth2/idpresponse`。
+
+   > **只对"首次建域名"成立，两种情况会不一样，所以脚本跑完那一行输出必须核对**：
+   > ① 池上**已经有**托管域名时，`_ensure_domain` 直接沿用**现有**域名、
+   > **忽略 `--domain-prefix`**——真实回调与你算出来的不是一个；
+   > ② 域名前缀是**跨账号全局唯一**的，被别人占了 `create-user-pool-domain` 会直接失败。
+   > 拿算出来的 URL 去 IdP 侧登记、而真实域名是另一个，症状是登录最后一步
+   > `redirect_uri_mismatch`，读起来像 IdP 配错了。
+
+   SAML IdP 目前脚本未覆盖，需按下面官方文档手工加 provider，其余步骤相同——
+   **attribute mapping 里把 IdP 的 email 映射到 pool 的 email 属性是硬要求**，
+   漏了整个权限模型不成立。
+
+   **【Google】** 与上一条同一条代码路径，只是 issuer 固定、凭证来自一个免费的
+   GCP 项目：
+
+   - GCP 控制台 → 新建项目 → **OAuth consent screen**：user type 按 §0 的 org
+     边界那条注意事项选（**External + 已发布 = 任何 Google 账号都在 org 里**）；
+     scopes 勾 `openid` / `email` / `profile`。发布状态留 *Testing* 时只有登记的
+     测试用户能登录，适合先验证。
+   - **Credentials → Create OAuth client ID → Web application**，
+     *Authorized redirect URIs* 填上面那个 `/oauth2/idpresponse` 地址
+     （Google 要求**完全一致**，末尾不能多斜杠）。
+   - 把 client ID / secret 与下面这三项填进 `[IdP]`：
+
+     ```ini
+     provider_name = GoogleOIDC
+     issuer = https://accounts.google.com
+     scopes = openid email profile
+     ```
+
+   > **`provider_name` 绝对不能填 `Google`。** Cognito 把这个名字保留给它**原生的
+   > social provider 类型**，而本平台走的是通用 OIDC 路径（`ProviderType=OIDC`），
+   > 两者冲突：`deploy_pool.py` 会在建 provider 时报
+   > `InvalidParameterException: Provider Google cannot be of type OIDC`。
+   > 名字换成 `GoogleOIDC` 之类即可。**实测**（在隔离池上逐个试建 `ProviderType=OIDC`）：
+   > 被拒的**恰好是四个社交类型名** `Google` / `Facebook` / `LoginWithAmazon` /
+   > `SignInWithApple`，且**区分大小写**——`google` 小写反而是接受的（别靠这个，
+   > 意图不清）。`SAML` 与 `COGNITO` API 层面接受，但
+   > **`COGNITO` 绝对不要用**：app client 的 `SupportedIdentityProviders` 用这个字面量
+   > 表示"池内建用户目录"，同名会让配置语义无法分辨。
+   > **你选的这个名字要逐字符一致地进 `router/config.ini` 的 `trusted_idps`。**
+
+   Google 的 discovery 文档（`https://accounts.google.com/.well-known/openid-configuration`）
+   的 `claims_supported` 含 `email` / `email_verified` / `name` 三项——正好是
+   `deploy_pool.py` 映射的三个目标，所以 `require_email_verified = true`
+   保持开着不会锁死登录。
+
+   **证据强度：单账号真机验证过**（登录到 claim 落地这一段）。用真实授权码调真实的
+   `login_handler._exchange_code`，在 `require_email_verified = true` 下拿到
+   `email` / `name` / `idp` / `auth_via` 四项；access token 里同样带 `email` 与
+   `email_verified`（pre-token V2 注入），满足 MCP 网关那条链。
+
+   > **Google 的 `name` 是显示名，可能带空格**（例如 `Pen Ken`），不是邮箱。
+   > Edge 会把它 URL 编码进 `x-user-name`，所以站点必须 `decodeURIComponent`
+   > ——合同里本来就要求这么做，但飞书给的名字通常不带空格，**这条在飞书路径上
+   > 从没被真正触发过**。自己写站点时别直接把 `x-user-name` 当纯文本贴进 HTML。
+
+   > **在 Amazon 内部（Isengard 注册的）账号里部署时注意**：把 Google 这类社交
+   > 身份源联邦进 Cognito 会命中 CloudSecurity 的 "Cognito Must Not Use Social
+   > Identity Providers" 检查项并开安全 ticket。三条路里只有这一条有这个问题——
+   > 第 1 条（企业目录）与第 3 条（内置 Cognito 池）都不会。
+   > 自注册那一条（`palisade.udd.cognito.pool.open`）**平台池**已硬满足：
+   > `deploy_pool.py` 建池时 `AllowAdminCreateUserOnly=true` 并**读回复验**。
+   > **但走第 3 条路时，第二个池是你手工建的，没有任何脚本替你复验**——
+   > 那个池同样会被扫，漏掉就是一个开着自注册的池，见下面的读回命令。
+
+   **【内置 Cognito】** 按 §0 的「内置 Cognito 池的确切形态」先建好第二个池
+   与它的 app client、管理员建好用户，再把该池的 issuer
+   （`https://cognito-idp.{region}.amazonaws.com/{idp_pool_id}`）与 client 凭证
+   填进 `[IdP]`。**这一条不需要在"IdP 侧"另外登记回调**——回调就是第二个池
+   app client 的 `CallbackURLs`，建它的时候已经填了平台池的 `/oauth2/idpresponse`。
+
+   **【飞书】** 克隆并按其 README 部署上游方案（把飞书 OAuth 包装成标准 OIDC
    的适配器；平台把它当成一个普通 OIDC IdP 来联邦）：
   ```bash
    git clone https://github.com/aws-samples/sample-for-amazon-quick-sso-with-feishu /tmp/feishu-sso
@@ -1309,15 +1607,7 @@ pre-token 触发器、managed login branding。命令与实测基线见前面
    `redirect_uri`（原样透传给 Cognito），所以**新建 pool 不需要在飞书后台改
    任何回调**——飞书侧登记的始终是适配器自己的 `{issuer}/callback`。
 
-   **【标准 IdP】** 无需上游方案与适配器：把 IdP 的 issuer / client_id /
-   client_secret 填进 `[IdP]` 段，`deploy_pool.py` 会用 Cognito 原生 OIDC
-   联邦建好（含 email 与 `email_verified` 映射）。IdP 侧登记 Cognito 的回调
-   `https://{hosted-ui-domain}/oauth2/idpresponse`（脚本跑完会打印这个地址）。
-   SAML IdP 目前脚本未覆盖，需按下面官方文档手工加 provider，其余步骤相同——
-   **attribute mapping 里把 IdP 的 email 映射到 pool 的 email 属性是硬要求**，
-   漏了整个权限模型不成立。
-
-   逐步操作的 AWS 官方文档：
+   逐步操作的 AWS 官方文档（第 1 条路用）：
    - **Okta（SAML，逐步截图版，含 Okta 侧配置）**：
      [How do I set up Okta as a SAML identity provider in an Amazon Cognito user pool?](https://repost.aws/knowledge-center/cognito-okta-saml-identity-provider)
      ——第 9 步的 email attribute mapping 就是上面说的硬要求
@@ -1329,6 +1619,14 @@ pre-token 触发器、managed login branding。命令与实测基线见前面
      [Mapping IdP attributes to profiles and tokens](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pools-specifying-attribute-mapping.html)
    - Azure AD / Entra ID：
      [How to set up Amazon Cognito for federated authentication using Azure AD](https://aws.amazon.com/blogs/security/how-to-set-up-amazon-cognito-for-federated-authentication-using-azure-ad/)
+     ——**接 Entra 前先读 §0 的「已知差异：Microsoft Entra ID 默认不发
+     `email_verified`」**，那条决定你要不要动 `require_email_verified`
+   - 第 3 条路（把一个 Cognito 池当 OIDC IdP）的端点与 issuer 形态：
+     [Identity provider and relying party endpoints](https://docs.aws.amazon.com/cognito/latest/developerguide/federation-endpoints.html)
+     ——`{issuer}/.well-known/openid-configuration` 里的 authorize / token /
+     userInfo 全部指向那个池的**托管域名**，所以 IdP 池必须先建域名
+   - 各档位能力（为什么 IdP 池 `LITE` 就够、而平台池必须 `ESSENTIALS`）：
+     [User pool feature plans](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-sign-in-feature-plans.html)
 
 2. **跑脚本建 pool 与 client**（幂等可重跑）：
 

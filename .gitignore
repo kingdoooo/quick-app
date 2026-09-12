@@ -5,6 +5,9 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 cdk.out/
+# 浏览器自动化工具（chrome-devtools / playwright MCP）的落盘产物：
+# 页面快照与 console 日志，纯过程文件
+.playwright-mcp/
 site-builder/config.ini
 site-builder/contract/build/
 # deploy_agentcore.py 构建时从 deployer/functions/ 复制进来，构建后删除；
