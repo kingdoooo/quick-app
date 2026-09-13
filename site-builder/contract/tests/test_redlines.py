@@ -25,7 +25,10 @@ ONE_DEP_LOCK = {
 
 def make_site(tmp_path: Path, *, tier="fullstack-sql", index="fetch('/api/items')",
               server="app.get('/api/health',(q,s)=>s.send('ok'))",
-              schema="CREATE TABLE t (id UUID PRIMARY KEY);",
+              # **默认必须是可重放形态**（红线 9 / M03）：这个 schema 是"合法站点"的
+              # 基线，几十条用例靠它断言 `== []`。裸 `CREATE TABLE` 从红线 9 起本身
+              # 就是违规，留着会让每一条正向用例都红成"新红线误报"的样子。
+              schema="CREATE TABLE IF NOT EXISTS t (id UUID PRIMARY KEY);",
               migrations: dict[str, str] | None = None,
               migration_subdirs: dict[str, dict[str, str]] | None = None,
               package_json: str | None = MINIMAL_PACKAGE_JSON,
@@ -582,8 +585,19 @@ def test_scanner_is_not_quadratic_on_large_files():
 
 SYNC_INDEX_SQL = ("CREATE TABLE t (id UUID PRIMARY KEY, d DATE);\n"
                   "CREATE INDEX IF NOT EXISTS idx_d ON t (d);")
-ASYNC_INDEX_SQL = ("CREATE TABLE t (id UUID PRIMARY KEY, d DATE);\n"
+ASYNC_INDEX_SQL = ("CREATE TABLE IF NOT EXISTS t (id UUID PRIMARY KEY, d DATE);\n"
                    "CREATE INDEX ASYNC IF NOT EXISTS idx_d ON t (d);")
+
+
+def _index_rule_hits(violations) -> bool:
+    """索引红线（`CREATE INDEX` 缺 ASYNC）有没有命中。
+
+    **不要用裸 `"ASYNC" in v` 做这个判断**：红线 9（可重放）的提示文本里也写着
+    `CREATE [UNIQUE] INDEX ASYNC IF NOT EXISTS`，两条规则的报错会串味，于是
+    "索引规则没命中"的用例会被另一条规则的文案判成命中（实测：本文件 6 条用例
+    因此假红）。锚在索引规则**独有**的那句上。
+    """
+    return any("必须写 CREATE INDEX ASYNC" in v for v in violations)
 
 
 def test_sync_create_index_in_schema_fails(tmp_path):
@@ -624,10 +638,13 @@ def test_index_rule_matrix(tmp_path, sql, should_fail):
     """逐形态锁定：UNIQUE、大小写、空白、IF NOT EXISTS 都要判对。
 
     只测一种写法的规则很容易被一个变体绕过（比如只认大写、或被 UNIQUE 打断）。
+
+    **本条只判索引规则**：`should_fail=False` 的几个形态里，缺 `IF NOT EXISTS` 的那些
+    仍会被红线 9（可重放）拦下——两条规则关心的事不同，各自有自己的用例。
     """
     d, m = make_site(tmp_path,
-                     schema="CREATE TABLE t (id UUID PRIMARY KEY, c TEXT);\n" + sql)
-    hit = any("ASYNC" in v for v in scan_redlines(d, m))
+                     schema="CREATE TABLE IF NOT EXISTS t (id UUID PRIMARY KEY, c TEXT);\n" + sql)
+    hit = _index_rule_hits(scan_redlines(d, m))
     assert hit == should_fail, f"{sql!r} 命中={hit} 期望={should_fail}"
 
 
@@ -658,11 +675,11 @@ def test_migration_file_naming_matches_the_executor(tmp_path):
     mig.mkdir()
     # 不符合命名约定 → 执行器不会跑它 → 校验器也不该报
     (mig / "scratch.sql").write_text("CREATE INDEX idx_x ON t (c);")
-    assert not any("ASYNC" in x for x in scan_redlines(d, m)), (
+    assert not _index_rule_hits(scan_redlines(d, m)), (
         "执行器不会执行 scratch.sql，校验器却报了它")
     # 符合约定 → 两边都要认
     (mig / "002_real.sql").write_text("CREATE INDEX idx_y ON t (c);")
-    assert any("ASYNC" in x for x in scan_redlines(d, m))
+    assert _index_rule_hits(scan_redlines(d, m))
 
 
 def test_missing_index_html_is_a_violation(tmp_path):
@@ -965,3 +982,62 @@ def test_index_async_rule_reports_migration_path(tmp_path):
         "001_idx.sql": "CREATE INDEX idx_t ON t (id);\n"})
     v = scan_redlines(d, m)
     assert any("migrations/001_idx.sql" in s and "ASYNC" in s for s in v), v
+
+
+@pytest.mark.parametrize("sql", [
+    "CREATE TABLE IF NOT EXISTS t (id UUID PRIMARY KEY);",
+    "CREATE INDEX ASYNC IF NOT EXISTS idx_t ON t (id);",
+    "CREATE UNIQUE INDEX ASYNC IF NOT EXISTS uq_t ON t (id);",
+    "ALTER TABLE IF EXISTS t ADD COLUMN IF NOT EXISTS c TEXT;",
+    "ALTER TABLE t ADD COLUMN IF NOT EXISTS c TEXT;",
+    "ALTER TABLE IF EXISTS t DROP COLUMN IF EXISTS c;",
+    "ALTER TABLE IF EXISTS t DROP CONSTRAINT IF EXISTS ck;",
+    "CREATE OR REPLACE VIEW v AS SELECT id FROM t;",
+    "CREATE OR REPLACE RECURSIVE VIEW v (n) AS SELECT 1;",
+    "INSERT INTO t (id) VALUES (gen_random_uuid()) ON CONFLICT DO NOTHING;",
+    # 串内分号不该被切开（切错会把后半截判成不在白名单）
+    "CREATE TABLE IF NOT EXISTS t (id UUID PRIMARY KEY, note TEXT DEFAULT 'a;b');",
+    # 注释里的坏词不算（先抹注释再判）
+    "-- 这里提到 DROP TABLE t; 只是注释\nCREATE TABLE IF NOT EXISTS t (id UUID PRIMARY KEY);",
+    "/* DROP TABLE t; */ CREATE TABLE IF NOT EXISTS t (id UUID PRIMARY KEY);",
+    # 大小写与多行不敏感
+    "create table if not exists t (\n  id uuid primary key\n);",
+    "",                     # 空文件：没有语句 = 没有违规
+    "-- 只有注释\n",
+])
+def test_replayable_forms_pass(sql):
+    from contract.redlines import _check_sql_replayable
+    assert _check_sql_replayable(sql, "backend/schema.sql") == []
+
+
+@pytest.mark.parametrize("sql", [
+    "CREATE TABLE t (id UUID PRIMARY KEY);",                 # 缺 IF NOT EXISTS
+    "CREATE SCHEMA foo;",                                    # 白名单外（文档未确认幂等）
+    "DROP TABLE t;",                                         # 白名单外（同上）
+    "DROP TABLE IF EXISTS t;",                               # 同上：IF 形态文档没说
+    "ALTER TABLE t ADD COLUMN c TEXT;",                      # ADD COLUMN 缺 IF NOT EXISTS
+    "ALTER TABLE t ALTER COLUMN c TYPE INT;",                # ALTER COLUMN 不在白名单
+    "CREATE VIEW v AS SELECT 1;",                            # 缺 OR REPLACE
+    "INSERT INTO t (id) VALUES (gen_random_uuid());",        # DML 缺 ON CONFLICT DO NOTHING
+    "INSERT INTO t (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET id = 1;",  # DO UPDATE 非幂等
+    "UPDATE t SET c = '1';",                                 # 白名单外
+    "DELETE FROM t;",                                        # 白名单外
+    "CREATE INDEX ASYNC ON t (id);",                         # 缺 IF NOT EXISTS
+    "CREATE INDEX ASYNC IF NOT EXISTS ON t (id);",           # IF NOT EXISTS 时索引名必填
+    "CREATE SEQUENCE s;",                                    # 白名单外
+    "BEGIN;",                                                # 事务包裹本就禁止
+])
+def test_non_replayable_forms_flagged(sql):
+    from contract.redlines import _check_sql_replayable
+    out = _check_sql_replayable(sql, "backend/schema.sql")
+    assert out and "backend/schema.sql" in out[0] and "不可重放" in out[0], out
+
+
+def test_replayable_redline_applies_to_schema_and_migrations(tmp_path):
+    """裁定 2：schema.sql 与 migrations/*.sql 同等对待。"""
+    d, m = make_site(tmp_path,
+                     schema="CREATE TABLE t (id UUID PRIMARY KEY);",
+                     migrations={"001_seed.sql": "INSERT INTO t (id) VALUES (1);\n"})
+    v = scan_redlines(d, m)
+    assert any("backend/schema.sql" in s and "不可重放" in s for s in v), v
+    assert any("migrations/001_seed.sql" in s and "不可重放" in s for s in v), v

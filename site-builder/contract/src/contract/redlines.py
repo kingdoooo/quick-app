@@ -70,6 +70,54 @@ FORBIDDEN_DDL = ["REFERENCES", "SERIAL", "JSONB", "CREATE TRIGGER", "CREATE TEMP
 # `IF NOT EXISTS`（DSQL 支持且推荐用于幂等），所以 ASYNC 出现在它之前。
 CREATE_INDEX_RE = re.compile(
     r"\bCREATE\s+(?:UNIQUE\s+)?INDEX\b(?!\s+ASYNC\b)", re.IGNORECASE)
+# ── 红线 9：DSQL 建表/迁移必须可重放（M03）─────────────────────────────────
+# 机理：DSQL 每条语句 autocommit（一事务只许一条 DDL，且 DDL 与 DML 不能同事务，
+# 所以"整个文件包进一个事务"**不可行**），而 DSQL 与平台元数据之间**没有原子事务**。
+# 一个迁移文件跑到一半失败 ⇒ 前面的语句已提交、"这个文件跑过了"的 marker 没写 ⇒
+# 重试从头重跑本文件 ⇒ 不可重放的语句撞"已存在/重复插入"而失败，站点卡在
+# 「同一份产物再也部署不上去」。语句级 marker 关不掉这个窗口（只会变窄），所以
+# 处方是**在合同层强制可重放形式**——最早、最便宜的拦截点。
+#
+# **白名单而非黑名单**：只放行 AWS 文档确认幂等的形态。`CREATE SCHEMA` / `DROP TABLE`
+# / `CREATE SEQUENCE` / `CREATE STATISTICS` 等的 IF 形态在 DSQL 文档里**没有说**，
+# 一律拒——这正是选白名单的全部好处：不需要真机去验每一种 IF 形态到底行不行。
+#
+# 两条已知边界（文档原话），要一并写进 references：`IF NOT EXISTS` 的守卫**只看名字**
+# 不比对类型（列："a column already exists with this name"；索引："no guarantee that
+# the existing index resembles the one that would have been created"）⇒ 改过列类型后
+# 重放会**静默 no-op**。另：同步 DDL 失败后是否原子回滚，DSQL 文档没有说，别假设。
+_REPLAYABLE_FORMS = (
+    re.compile(r"^CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\b", re.I),
+    # CREATE [UNIQUE] INDEX ASYNC IF NOT EXISTS <名>：用 IF NOT EXISTS 时索引名**必填**
+    re.compile(r"^CREATE\s+(?:UNIQUE\s+)?INDEX\s+ASYNC\s+IF\s+NOT\s+EXISTS\s+"
+               r"(?!ON\b)\S+", re.I),
+    # ALTER TABLE [IF EXISTS] … 后面**只允许**幂等动作；动作级 IF 由下面三条各自要求
+    re.compile(r"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?\S.*"
+               r"\bADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\b", re.I | re.S),
+    re.compile(r"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?\S.*"
+               r"\bDROP\s+(?:COLUMN\s+)?IF\s+EXISTS\b", re.I | re.S),
+    re.compile(r"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?\S.*"
+               r"\bDROP\s+CONSTRAINT\s+IF\s+EXISTS\b", re.I | re.S),
+    # DSQL 文档确认 CREATE [OR REPLACE] [RECURSIVE] VIEW——OR REPLACE 即幂等形态。
+    # references 明确告诉站点作者"可以建视图"，白名单漏掉它会拒掉文档承诺的写法。
+    re.compile(r"^CREATE\s+OR\s+REPLACE\s+(?:RECURSIVE\s+)?VIEW\b", re.I),
+    # DML：种子 INSERT 必须 ON CONFLICT DO NOTHING（裁定见 plan 的「DML 子决策」(b)）。
+    # 禁 DML 会把种子逼进不可信站点代码；只警告会留着"重放重复插入"这个不幂等来源。
+    # DO NOTHING 需要唯一约束作冲突目标，与"每表带 PRIMARY KEY"的既有约定同向。
+    # **DO UPDATE 不算**：它不是"重放无副作用"，而是每次都写。
+    re.compile(r"^INSERT\s+INTO\b(?:(?!\bON\s+CONFLICT\b).)*"
+               r"\bON\s+CONFLICT\b(?:(?!\bDO\s+UPDATE\b).)*"
+               r"\bDO\s+NOTHING\b", re.I | re.S),
+)
+_REPLAYABLE_HINT = (
+    "迁移/建表 SQL 必须可重放：DSQL 每条语句 autocommit 且与平台元数据无原子事务，"
+    "一个文件半途失败后重试会**整文件重跑**。允许的形态只有："
+    "CREATE TABLE IF NOT EXISTS；CREATE [UNIQUE] INDEX ASYNC IF NOT EXISTS <索引名>；"
+    "ALTER TABLE 的 ADD COLUMN IF NOT EXISTS / DROP COLUMN IF EXISTS / "
+    "DROP CONSTRAINT IF EXISTS；CREATE OR REPLACE VIEW；"
+    "INSERT … ON CONFLICT DO NOTHING。"
+    "其余（裸 CREATE TABLE、CREATE SCHEMA、DROP TABLE、裸 INSERT、UPDATE、DELETE、"
+    "BEGIN/COMMIT 等）一律拒")
 # Edge 注入的 x-user-name 是 **URL 编码**的（HTTP 头不能携带非 ASCII 字节——
 # 不编码会让中文名字直接被 CloudFront 拒掉），站点必须 decodeURIComponent。
 # 为什么值得一条红线：漏掉时**不报错**，而是把 `%E5%BD%AD…` 当人名显示、写库，
@@ -473,7 +521,38 @@ def scan_redlines(site_dir: Path, manifest: dict) -> list[str]:
                 violations.append(
                     f"{rel}: DSQL 建索引必须写 CREATE INDEX ASYNC"
                     "（同步建索引报 unsupported mode，站点会部署失败）")
+            violations += _check_sql_replayable(body, rel)
     return violations
+
+
+def _sql_statements(text: str) -> list[str]:
+    """把 SQL 抹掉注释/字符串字面量后按 `;` 切成规范化语句串（空白折叠为单空格）。
+
+    **合同层刻意不引入 sqlparse**：执行器侧那份有生产 0.6.0 / 单测 0.5.5 的版本偏斜
+    且无人守（改锁定清单不重跑 `rm -rf cdk.out` 还会部出旧版），给合同再加一份依赖
+    只会放大同一个偏斜面。这里用保守切分：字符串里的 `;`（`DEFAULT 'a;b'`）因先被
+    抹白不会误切；切碎产生的非关键词片段会在白名单里落到"不匹配"分支被拒——
+    **偏误报，方向安全**，与本模块"宁可误报不可漏报"的一贯口径一致。
+    """
+    text = re.sub(r"--[^\n]*", " ", text)                    # 行注释
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)       # 块注释（跨行）
+    text = re.sub(r"'(?:''|[^'])*'", "''", text)             # 单引号串（含 '' 转义）
+    out = []
+    for raw in text.split(";"):
+        s = re.sub(r"\s+", " ", raw).strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def _check_sql_replayable(sql_text: str, rel: str) -> list[str]:
+    """每条语句都必须落在 `_REPLAYABLE_FORMS` 白名单里，否则报违规（红线 9 / M03）。"""
+    out = []
+    for stmt in _sql_statements(sql_text):
+        if not any(p.match(stmt) for p in _REPLAYABLE_FORMS):
+            snippet = stmt[:60] + ("…" if len(stmt) > 60 else "")
+            out.append(f"{rel}: 不可重放的语句 `{snippet}`——{_REPLAYABLE_HINT}")
+    return out
 
 
 def _dsql_sql_files(backend_dir):
