@@ -1129,3 +1129,33 @@ def test_alter_table_requires_every_action_to_be_idempotent(sql):
 def test_alter_table_all_idempotent_actions_pass(sql):
     from contract.redlines import _check_sql_replayable
     assert _check_sql_replayable(sql, "x.sql") == []
+
+
+def test_redline_9_doc_matches_the_validator():
+    """红线 9 那一节必须写清白名单的每一种形态、子目录规则与存量站点的升级路径。
+
+    与红线 8 的同类守卫一样：期望值从**代码真源**推导，不在测试里抄第二份，否则
+    "改了校验器忘了改文档"这个唯一有价值的信号就没了（跨组件矩阵要求四处同步）。
+    """
+    skill = Path(__file__).parents[2] / "skills" / "site-builder"
+    doc = (skill / "references" / "redlines.md").read_text(encoding="utf-8")
+    anchor = "## 红线 9"
+    assert anchor in doc, "redlines.md 里找不到红线 9 那一节——本条已空转"
+    section = doc.split(anchor, 1)[1].split("\n## ", 1)[0]
+    for needle in ("CREATE TABLE IF NOT EXISTS",
+                   "CREATE OR REPLACE VIEW",
+                   "ON CONFLICT DO NOTHING",
+                   "ADD COLUMN IF NOT EXISTS",
+                   "DROP COLUMN IF EXISTS",
+                   "DROP CONSTRAINT IF EXISTS",
+                   "INDEX ASYNC IF NOT EXISTS",
+                   "不允许子目录",          # M16 那半边
+                   "IF NOT EXISTS"):        # 升级路径那段
+        assert needle in section, f"红线 9 那一节没写 {needle!r}"
+    # 存量站点的升级路径必须写明（本红线对每次部署生效，含"只改前端"的部署）
+    assert "存量" in section or "已经上线" in section, \
+        "红线 9 没写存量站点怎么升级——它会挡住那些站点的每一次部署"
+    # migrations 约定那份文档也要提到可重放与子目录
+    contract_doc = (skill / "references" / "contract.md").read_text(encoding="utf-8")
+    assert "可重放" in contract_doc and "不允许子目录" in contract_doc, \
+        "contract.md 的 migrations 约定没同步可重放/子目录两条"
