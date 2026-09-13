@@ -148,8 +148,29 @@ def handler(event, context):
 
         def run_file(key: str, marker: str):
             body = s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode()
-            for stmt in _statements(body):
-                cur.execute(stmt)
+            stmts = _statements(body)
+            for idx, stmt in enumerate(stmts, start=1):
+                try:
+                    cur.execute(stmt)
+                except Exception as e:
+                    # 富失败信息（M03 处方第 4 条）：文件名、第几条语句、SQLSTATE、
+                    # **已知已提交的条数**，并直接给出补救办法。原来抛的是 psycopg
+                    # 的原始异常，只有一句 "column already exists"——看不出是哪个
+                    # 文件的第几条，也看不出前面几条已经不可回滚地提交了。
+                    sqlstate = getattr(e, "sqlstate", None) or getattr(e, "pgcode", None)
+                    raise RuntimeError(
+                        f"{marker} 第 {idx}/{len(stmts)} 条语句执行失败"
+                        f"（SQLSTATE={sqlstate}）：{str(e)[:200]}。"
+                        f"本文件前 {idx - 1} 条已提交且**不可回滚**"
+                        f"（DSQL 每条语句 autocommit），而本文件的已应用标记不会写入，"
+                        f"所以下次部署会**整文件重跑**。"
+                        f"补救：把该文件改成可重放形态"
+                        f"（CREATE TABLE IF NOT EXISTS / "
+                        f"ALTER TABLE … ADD COLUMN IF NOT EXISTS / "
+                        f"CREATE OR REPLACE VIEW / INSERT … ON CONFLICT DO NOTHING），"
+                        f"重新部署即可从头安全重跑；合同层红线 9 会在下次 validate "
+                        f"就拦下不可重放的语句。出错语句：{stmt[:120]}"
+                    ) from e
             applied.append(marker)
             common.upsert_site(site_id, migrations_applied=applied)  # 逐文件立即记录
 

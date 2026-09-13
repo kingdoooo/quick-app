@@ -1,4 +1,5 @@
 import boto3
+import re
 from unittest.mock import MagicMock, patch
 
 
@@ -189,3 +190,154 @@ def test_marker_read_uses_consistent_read(aws, monkeypatch):
     _, _, mig_sqls, _, _ = _run(admin=(admin_conn, admin_cur))
     assert not any("CREATE TABLE" in s for s in mig_sqls), (
         f"读到了陈旧的最终一致值，schema.sql 被重跑: {mig_sqls}")
+
+
+# ---- M03 反例：用**真能记住状态**的 fake，而不是 mock 掉 execute ----
+
+class _StatefulCur:
+    """记得住已建对象的 fake cursor。
+
+    merged review 对 M03 的回归要求原文：「用真能记住状态的 fake（不是 mock 掉
+    execute），让第 3 条抛错，再重跑一次，断言第二次**不是** duplicate_table 失败」。
+    mock 掉 execute 的用例永远看不见这个缺陷——"一个记得住第 2 条语句的数据库"
+    从未被重放过。
+    """
+
+    def __init__(self, tables=None):
+        self.tables = set(tables or ())
+        self.executed = []
+        self.fail_once = None       # 命中该子串的语句第一次执行时抛（模拟 typo/超时）
+        self.table_count = None     # catalog 守卫的 SELECT count(*) 返回值
+        # 包成 MagicMock 才能让 _run 的 `execute.call_args_list` 照常取到发出的 SQL，
+        # 同时 side_effect 保留"记得住已建对象"这个本用例的全部价值。
+        self.execute = MagicMock(side_effect=self._execute)
+
+    def _execute(self, sql, params=None):
+        self.executed.append(sql)
+        norm = " ".join(sql.split())
+        if self.fail_once and self.fail_once in norm:
+            self.fail_once = None
+            raise RuntimeError("transient boom")     # 无 sqlstate ⇒ 不是 duplicate
+        m = re.match(r"CREATE TABLE (?:IF NOT EXISTS )?(\w+)", norm, re.I)
+        if m:
+            name = m.group(1)
+            if name in self.tables:
+                if "IF NOT EXISTS" in norm.upper():
+                    return                            # 幂等：无害
+                err = type("DupTable", (Exception,), {"sqlstate": "42P07"})
+                raise err(f'relation "{name}" already exists')
+            self.tables.add(name)
+
+    def fetchone(self):
+        return (len(self.tables) if self.table_count is None else self.table_count,)
+
+    def fetchall(self):
+        return []
+
+
+def _stateful(tables=None):
+    conn = MagicMock()
+    cur = _StatefulCur(tables)
+    conn.cursor.return_value = cur
+    return conn, cur
+
+
+def test_m03_non_replayable_schema_bricks_on_retry(aws):
+    """今天的失败形态：第 3 条失败 ⇒ 无 marker ⇒ 重试重跑第 1 条 ⇒ 42P07 ⇒ 永久失败。
+
+    这是**红线 9 存在的理由**：执行层修不了它（DSQL 与 DynamoDB 无原子事务，语句级
+    marker 也只能让窗口变窄），只能在合同层强制可重放形式把它拦在 validate。
+    """
+    import common
+    import pytest
+    common.create_job("a@x.com", "exp-brick")
+    _put("job-1", "backend/schema.sql",
+         b"CREATE TABLE a (id UUID PRIMARY KEY);\n"
+         b"CREATE TABLE b (id UUID PRIMARY KEY);\n"
+         b"CREATE TABLE c (id UUID PRIMARY KEY);")
+    admin1, admin_cur1 = _stateful()
+    mig1_conn, mig1 = _stateful()
+    mig1.fail_once = "CREATE TABLE c"
+    with pytest.raises(Exception):
+        _run(event=_event(job_id="job-1", site_id="exp-brick"),
+             admin=(admin1, admin_cur1), mig=(mig1_conn, mig1))
+    # 文件没跑完 ⇒ marker 未写；但 a、b 两条**已提交**（autocommit，无回滚）
+    assert (common.get_site_consistent("exp-brick") or {}).get("migrations_applied", []) == []
+    assert mig1.tables == {"a", "b"}
+
+    # 重试 = 再调一次 deploy_site ⇒ **新 job_id、新 extracted/ 前缀**，site_id 不变，
+    # migrations_applied 是按 site 存的。同一份产物重新上传到新前缀。
+    _put("job-2", "backend/schema.sql",
+         b"CREATE TABLE a (id UUID PRIMARY KEY);\n"
+         b"CREATE TABLE b (id UUID PRIMARY KEY);\n"
+         b"CREATE TABLE c (id UUID PRIMARY KEY);")
+    admin2, admin_cur2 = _stateful(mig1.tables)
+    mig2_conn, mig2 = _stateful(mig1.tables)
+    admin_cur2.table_count = 2          # schema 非空，catalog 守卫不该介入
+    with pytest.raises(Exception) as ei:
+        _run(event=_event(job_id="job-2", site_id="exp-brick"),
+             admin=(admin2, admin_cur2), mig=(mig2_conn, mig2))
+    assert "42P07" in str(ei.value) or "already exists" in str(ei.value), str(ei.value)
+
+
+def test_replayable_schema_recovers_on_retry(aws):
+    """同样的三张表带 IF NOT EXISTS：半途失败后重试**不再**是 duplicate 失败，而是成功。"""
+    import common
+    import pytest
+    common.create_job("a@x.com", "exp-recover")
+    _put("job-3", "backend/schema.sql",
+         b"CREATE TABLE IF NOT EXISTS a (id UUID PRIMARY KEY);\n"
+         b"CREATE TABLE IF NOT EXISTS b (id UUID PRIMARY KEY);\n"
+         b"CREATE TABLE IF NOT EXISTS c (id UUID PRIMARY KEY);")
+    admin3, admin_cur3 = _stateful()
+    mig3_conn, mig3 = _stateful()
+    mig3.fail_once = "CREATE TABLE IF NOT EXISTS c"
+    with pytest.raises(Exception):
+        _run(event=_event(job_id="job-3", site_id="exp-recover"),
+             admin=(admin3, admin_cur3), mig=(mig3_conn, mig3))
+    assert (common.get_site_consistent("exp-recover") or {}).get("migrations_applied", []) == []
+
+    _put("job-4", "backend/schema.sql",
+         b"CREATE TABLE IF NOT EXISTS a (id UUID PRIMARY KEY);\n"
+         b"CREATE TABLE IF NOT EXISTS b (id UUID PRIMARY KEY);\n"
+         b"CREATE TABLE IF NOT EXISTS c (id UUID PRIMARY KEY);")
+    admin4, admin_cur4 = _stateful(mig3.tables)
+    mig4_conn, mig4 = _stateful(mig3.tables)
+    admin_cur4.table_count = 2
+    _run(event=_event(job_id="job-4", site_id="exp-recover"),
+         admin=(admin4, admin_cur4), mig=(mig4_conn, mig4))       # 不抛
+    assert common.get_site_consistent("exp-recover")["migrations_applied"] == ["schema.sql"]
+    assert mig4.tables == {"a", "b", "c"}
+
+
+# ---- 裁定 3④：富失败信息（文件名、第几条、SQLSTATE、已提交条数、补救办法）----
+
+def test_run_file_failure_reports_file_stmt_sqlstate_and_remedy(aws):
+    """失败信息必须能让人**不看日志上下文**就知道要改哪里、怎么改。
+
+    从前抛的是 psycopg 的原始异常：只有一句 `column "z" already exists`，既不知道是
+    哪个文件的第几条，也不知道前面有几条已经提交（不可回滚），更没有补救办法。
+    """
+    import common
+    import pytest
+    common.create_job("a@x.com", "exp-rich")
+    _put("job-1", "backend/schema.sql",
+         b"CREATE TABLE IF NOT EXISTS a (id UUID PRIMARY KEY);\n"
+         b"ALTER TABLE a ADD COLUMN z TEXT;")
+    mig_conn, mig_cur = _mock_conn()
+
+    def _boom(sql, *a, **kw):
+        if "COLUMN z" in sql:
+            err = type("DupColumn", (Exception,), {"sqlstate": "42701"})
+            raise err('column "z" of relation "a" already exists')
+    mig_cur.execute.side_effect = _boom
+
+    with pytest.raises(RuntimeError) as ei:
+        _run(event=_event(job_id="job-1", site_id="exp-rich"), mig=(mig_conn, mig_cur))
+    msg = str(ei.value)
+    assert "schema.sql" in msg, msg                 # 哪个文件
+    assert "第 2/2 条" in msg, msg                   # 第几条语句
+    assert "42701" in msg, msg                      # SQLSTATE
+    assert "1 条已提交" in msg, msg                  # 已知已提交的对象
+    assert "可重放" in msg, msg                      # 补救办法
+    assert "COLUMN z" in msg, msg                   # 出错的语句本体
