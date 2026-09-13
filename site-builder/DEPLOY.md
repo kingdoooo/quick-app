@@ -3347,7 +3347,7 @@ python3 -u site-builder/scripts/probe_impersonation_surface.py \
 
 ## 把平台从账号里拆掉（评估完想清干净时看这节）
 
-**顺序是有依赖的。** 平台的资源分三类，只有第二类跟着 CloudFormation 走：
+**顺序是有依赖的。** 平台的资源分**四类**，只有下表**第 2 行**那类跟着 CloudFormation 走：
 
 | 类 | 谁建的 | 栈删掉会怎样 |
 |---|---|---|
@@ -3357,8 +3357,8 @@ python3 -u site-builder/scripts/probe_impersonation_surface.py \
 | **手工建的**（③ 的 DSQL cluster、② 步骤 1 的前端桶、② 步骤 4 的 DNS 记录、CDK bootstrap） | 你自己照手册跑的命令 | **一个都不会走** |
 
 所以顺序是「先站点 → 再脚本件与手工件 → 再栈 → 最后收孤儿」。
-跳过第 ① 步直接删栈是最常见的错法；**第二类里最容易整个忘掉的是 DSQL cluster**
-（它在 ③ 建、不属于任何栈，而拆除时没有任何东西会提醒你）。
+跳过第 ① 步直接删栈是最常见的错法；**最容易整个忘掉的是第 4 行里的 DSQL cluster**
+（它在 ③ 手工建、不属于任何栈，而拆除时没有任何东西会提醒你）。
 
 ### ① 先下线所有站点，而且要 `purge_data`
 
@@ -3382,56 +3382,68 @@ aws lambda invoke --function-name site-deployer-undeploy --region us-east-1 \
 
 ### ② 再删脚本建的平台件（都不在栈里）
 
+**下面这段保持 fail-fast**，只在"这东西本来就可能不存在"的调用上显式加 `|| true`
+（哪些是"可能不存在"写在各自行内）。**不要用 `set +e` 或"少写一个 `-e`"来对付它**：
+`set -uo pipefail` **不会关掉你 shell 里已有的 `-e`**（它只设 `-u` 和 `pipefail`），
+所以那种写法在"先跑过验收集那段 `set -euo pipefail`"的同一个 shell 里等于没写——
+一条预期内的失败就会让后面的 DSQL / 栈 / RETAIN 清理全部不执行。
+
 ```bash
-set -uo pipefail          # **刻意不带 -e**：下面几条对"本来就不存在"要能容忍，见注释
+set -euo pipefail
+
+# 全部按「不存在也算成功」处理：这一节的每一条都可能因为组件没启用 / 上一次拆到一半
+# 而目标已经没了，而**中途中止的代价是后面的孤儿全留下**。
+ok() { "$@" || true; }
 
 # MCP runtime + ECR 仓库
-aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id <runtime_id> --region us-east-1
-aws ecr delete-repository --repository-name site-builder-mcp --region us-east-1 --force
+ok aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id <runtime_id> --region us-east-1
+ok aws ecr delete-repository --repository-name site-builder-mcp --region us-east-1 --force
 
-# Lambda。**启用过 ⑤c 的话把 site-key-proxy 也列进来**（不在这张表里就永远删不掉它）。
-# `|| true` 不是偷懒：`site-auth-pre-token` 是 Cognito 触发器，**它没有 Function URL**
-# ⇒ 那条 delete-function-url-config 必然失败。在 `set -e` 的 shell 里它会让整段在
-# **删函数之前**中止（`2>/dev/null` 只藏 stderr，不改退出码）。
-for FN in site-panel site-auth-service site-auth-pre-token; do   # ⑤c: 加 site-key-proxy
-  aws lambda delete-function-url-config --function-name "$FN" --region us-east-1 2>/dev/null || true
-  aws lambda delete-function --function-name "$FN" --region us-east-1 || true
+# Lambda。**site-key-proxy 无条件列进来**：没启用过 ⑤c 时它不存在，`ok` 会吞掉。
+# 而 `site-auth-pre-token` 是 Cognito 触发器、**根本没有 Function URL**，
+# 所以那条 delete-function-url-config 必然失败（`2>/dev/null` 只藏 stderr、不改退出码）。
+for FN in site-panel site-auth-service site-auth-pre-token site-key-proxy; do
+  ok aws lambda delete-function-url-config --function-name "$FN" --region us-east-1
+  ok aws lambda delete-function --function-name "$FN" --region us-east-1
 done
 
 # IAM 角色：**必须先清 inline policy、detach 托管策略，否则 DeleteConflict**。
-# ⑤c 启用过的话再加 site-key-proxy-role；`[Verification]` 开过才有 site-builder-verifier。
-for R in site-panel-role site-auth-service-role site-mcp-runtime-role site-builder-verifier; do
+# site-key-proxy-role（仅 ⑤c）与 site-builder-verifier（仅开过 [Verification]）
+# 同样无条件列出——不存在时两个 list 返回空、delete 被 ok 吞掉。
+for R in site-panel-role site-auth-service-role site-mcp-runtime-role \
+         site-key-proxy-role site-builder-verifier; do
   for P in $(aws iam list-role-policies --role-name "$R" \
-              --query 'PolicyNames' --output text 2>/dev/null); do
-    aws iam delete-role-policy --role-name "$R" --policy-name "$P"
+              --query 'PolicyNames' --output text 2>/dev/null || true); do
+    ok aws iam delete-role-policy --role-name "$R" --policy-name "$P"
   done
   for A in $(aws iam list-attached-role-policies --role-name "$R" \
-              --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null); do
-    aws iam detach-role-policy --role-name "$R" --policy-arn "$A"
+              --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null || true); do
+    ok aws iam detach-role-policy --role-name "$R" --policy-arn "$A"
   done
-  aws iam delete-role --role-name "$R" 2>/dev/null || true
+  ok aws iam delete-role --role-name "$R"
 done
 
 # 告警管道（**这条的真名容易猜错**）
-aws cloudwatch delete-alarms --alarm-names site-builder-auth-invalid-grant --region us-east-1
-aws sns delete-topic --topic-arn arn:aws:sns:us-east-1:{account_id}:site-builder-alarms
+ok aws cloudwatch delete-alarms --alarm-names site-builder-auth-invalid-grant --region us-east-1
+ok aws sns delete-topic --topic-arn arn:aws:sns:us-east-1:{account_id}:site-builder-alarms
 
 # Cognito：**托管域名要先删才能删池**，两个池各一个（平台池 + 内置 IdP 池）
-aws cognito-idp delete-user-pool-domain --domain <前缀> --user-pool-id <pool_id> --region us-east-1
-aws cognito-idp delete-user-pool --user-pool-id <pool_id> --region us-east-1
+ok aws cognito-idp delete-user-pool-domain --domain <前缀> --user-pool-id <pool_id> --region us-east-1
+ok aws cognito-idp delete-user-pool --user-pool-id <pool_id> --region us-east-1
 
-# SSM 参数：默认两个；**⑤c 启用过的话还有第三个**
-aws ssm delete-parameter --name /site-builder/site-client-secret --region us-east-1
-aws ssm delete-parameter --name /site-builder/login-flow-secret  --region us-east-1
-aws ssm delete-parameter --name /site-builder/machine-client-secret --region us-east-1  # 仅 ⑤c
+# SSM 参数：前两个总有；第三个只有启用过 ⑤c 才有（没有时 ok 吞掉）
+ok aws ssm delete-parameter --name /site-builder/site-client-secret     --region us-east-1
+ok aws ssm delete-parameter --name /site-builder/login-flow-secret      --region us-east-1
+ok aws ssm delete-parameter --name /site-builder/machine-client-secret  --region us-east-1
 ```
 
 > `m5-edge-analytics-failed-global` 与 `m5-rollup-no-successful-invocation-24h`
 > **属于 deployer 栈**，别手工删（下一步会带走）。
 
-> **⚠️ 上面带「仅 ⑤c」标注的四处（`site-key-proxy` 函数、`site-key-proxy-role`、
+> **⚠️ 与 ⑤c 有关的那几项（`site-key-proxy` 函数、`site-key-proxy-role`、
 > `machine-client-secret`，以及 ⑤c 自己那节的 route 与哨兵行）没有在启用状态下实测过**
-> ——出口验收走的是推荐的 OAuth-only 形态。启用过 ⑤c 的人拆除时请逐条读回核对。
+> ——出口验收走的是推荐的 OAuth-only 形态。上面的命令对"不存在"是安全的，但启用过 ⑤c 的人
+> 拆除后请按下面「收尾核对」逐条读回。
 
 ### ②b DSQL cluster（③ 手工建的，**不属于任何栈**）
 
@@ -3474,10 +3486,13 @@ deployer 栈约 **10 分钟**走完（`site-artifacts-*` 桶由自定义资源�
 栈删完之后 `RemovalPolicy.RETAIN` 的资源全部留在账号里：
 
 ```bash
+set -euo pipefail
+ok() { "$@" || true; }        # 同 ② 的理由：某张表已经不在时不能让整段中止
+
 # 四张表（都带 deletion protection ⇒ 先关再删）
 for T in site-access-daily site-admins site-api-keys site-ops-log; do
-  aws dynamodb update-table --table-name "$T" --no-deletion-protection-enabled --region us-east-1
-  aws dynamodb delete-table --table-name "$T" --region us-east-1
+  ok aws dynamodb update-table --table-name "$T" --no-deletion-protection-enabled --region us-east-1
+  ok aws dynamodb delete-table --table-name "$T" --region us-east-1
 done
 ```
 

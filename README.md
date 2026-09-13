@@ -41,13 +41,24 @@ cd quick-app
 git checkout v1.0.0
 ```
 
-> **这个 tag 固定的是源码与手册，不是 CDK 工具链版本。** 手册用
+> **这个 tag 固定的是源码与手册，不固定 CDK 工具链版本。** 手册用
 > `npx -y aws-cdk@latest`（刻意的：部分环境的全局 CDK 太旧），而
 > `site-builder/deployer/infra/requirements.txt` 里 `aws-cdk-lib` 只钉了范围
 > （`>=2.140,<3`；router 那份是精确的 `==2.100.0`）。**于是在不同时间 checkout 同一个
-> tag，装到的 CDK CLI 与 aws-cdk-lib 可能不同，synth 出的模板也可能有差异。**
-> 功能不受影响（部署路径由手册与七条验收集保证），但如果你需要**逐字节可复现的模板**，
-> 就自己把 CLI 与 `aws-cdk-lib` 钉到具体版本再部署。收敛这一条是 v1.x 的候选工作。
+> tag，装到的 CDK CLI 与 `aws-cdk-lib` 可能不同，synth 出的模板也可能有差异。**
+>
+> 出口验收那一次实际用到的版本（记在这里是为了给你一个可回退的已知组合，
+> **不是**对其它版本的任何承诺）：
+>
+> | | 版本 |
+> |---|---|
+> | CDK CLI（`aws-cdk@latest` 当时解析到的） | `2.1141.0` |
+> | `aws-cdk-lib`（`deployer/infra/.venv`） | `2.267.0` |
+> | `aws-cdk-lib`（`router/infrastructure/.venv`） | `2.100.0`（本来就是精确钉的） |
+>
+> 需要可复现就把这三个钉死再部署。**这里不宣称"换版本功能不受影响"**——一次固定时间的
+> 验收证明不了未来的 `@latest`，而未来的 `@latest` 正是这条限制里唯一未被验证的变量。
+> 收敛工具链版本（含把 CLI 版本记进部署日志——现在的日志里没有它）是 v1.x 的候选工作。
 
 然后照 [site-builder/DEPLOY.md](site-builder/DEPLOY.md) 走：§0 前置要求 → 「CDK bootstrap」
 → 「部署顺序总览」→ 各阶段 → 「⑦ 部署后验收」。**`git clone` 拿不到能跑的环境**，

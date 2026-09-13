@@ -76,15 +76,46 @@ def seed(email: str, *, dry_run: bool = True) -> dict:
     already = permissions.is_admin(email)
     if dry_run:
         return {"email": email, "already_admin": already, "written": False}
+    # **写之前**先记下已有的审计行主键：`add_admin` 的审计 target 是
+    # `admins:{email}`，而同一个邮箱完全可能**历史上**被加过又删过
+    # （加第二个管理员 → 删第一个 → 再加回来）。只问"这个邮箱有没有 add_admin 行"
+    # 会把那条历史行当成本次的 ⇒ 审计其实没落却报 audited=True。
+    before = _audit_keys(email)
     # add_admin 本身幂等（条件写 + __count__ 事务），重复跑不会让计数虚高
     permissions.add_admin(email, added_by="seed_admin.py")
-    audited = _audit_row_present(email) if not already else None
+    audited = _audit_row_landed(email, before) if not already else None
     return {"email": email, "already_admin": already, "written": not already,
             "audited": audited}
 
 
-def _audit_row_present(email: str) -> bool:
-    """写完之后**读回**确认审计行真的落了。
+# 审计行的排序键。`ops_log` 用 `{ts}#{actor}#{4 字节随机}` ⇒ 同一秒的两条也不同键，
+# 所以"写前快照 → 写后差集"能精确指认**本次**那一行，不必改 `ops_log.record` 的签名
+# （它是共享的平台函数，被很多调用点用；为了这一处改它的返回值会波及全部调用方）。
+_AUDIT_SORT_KEY = "ts_actor"
+
+
+def _audit_keys(email: str) -> set | None:
+    """`admins:{email}` 这个分区下现有审计行的排序键集合；读不出来返回 None。
+
+    None 与 `set()` 是两种不同的状态，不能混：前者是"我没法判定"，
+    后者是"确实一条都没有"。混掉会让"读不出来"变成"新写了一行"的假绿。
+    """
+    table = os.environ.get("OPS_LOG_TABLE")
+    if not table:
+        return None
+    try:
+        import boto3
+        from boto3.dynamodb.conditions import Key
+        rows = boto3.resource("dynamodb").Table(table).query(
+            KeyConditionExpression=Key("target").eq(f"admins:{email}"),
+            ConsistentRead=True)["Items"]
+    except Exception:                      # noqa: BLE001 —— 判不了就说判不了
+        return None
+    return {r.get(_AUDIT_SORT_KEY) for r in rows}
+
+
+def _audit_row_landed(email: str, before: set | None) -> bool:
+    """**本次**这一条 `add_admin` 审计行是否真的落了。
 
     为什么不能只靠"没抛异常"：`ops_log.record` 是刻意 best-effort 的
     （异常吞掉、只打 traceback、不 re-raise —— 平台级裁定：业务动作已经成功，
@@ -92,22 +123,33 @@ def _audit_row_present(email: str) -> bool:
     表不存在、`AccessDenied`、被限流都会走同一条静默路径。
     而"第一个管理员"是平台上权限最大的一次授予，**它没有审计行 = 从审计上看它从未发生**。
 
-    所以这里不改 `ops_log` 的全局语义（那会让每个调用点都变成"审计挂了就整件事失败"），
-    只在**这一处**把结果读回来，让调用方能响亮地报告"授权成功但审计缺失"。
-    读回本身失败也返回 False —— 判不了就当没有，方向是保守的。
+    判据是**写前/写后的差集**里有没有一条本次形态的行：`action == "add_admin"`
+    且 `actor == "seed_admin.py"`。只看"这个邮箱有没有 add_admin 行"是不够的
+    —— 同一邮箱被加过又删过时那条历史行会冒充本次（Codex 复审复现过）。
+
+    任一侧读不出来（None）⇒ 返回 False：判不了就当没有，方向是保守的。
     """
-    table = os.environ.get("OPS_LOG_TABLE")
-    if not table:
+    if before is None:
         return False
+    after = _audit_keys(email)
+    if after is None:
+        return False
+    new_keys = after - before
+    if not new_keys:
+        return False
+    table = os.environ["OPS_LOG_TABLE"]
     try:
         import boto3
         from boto3.dynamodb.conditions import Key
         rows = boto3.resource("dynamodb").Table(table).query(
             KeyConditionExpression=Key("target").eq(f"admins:{email}"),
             ConsistentRead=True)["Items"]
-    except Exception:                      # noqa: BLE001 —— 读不出来就当没有
+    except Exception:                      # noqa: BLE001
         return False
-    return any(r.get("action") == "add_admin" for r in rows)
+    return any(r.get(_AUDIT_SORT_KEY) in new_keys
+               and r.get("action") == "add_admin"
+               and r.get("actor") == "seed_admin.py"
+               for r in rows)
 
 
 def main() -> None:
@@ -134,13 +176,16 @@ def main() -> None:
     # 已经写进去了，退非零会把操作者引向"重跑"，而重跑只会走幂等分支、不补那条行），
     # 而是把它作为一条必须处置的告警打出来。
     if report["written"] and report.get("audited") is False:
-        print(f"  ⚠️  管理员已写入，但 site-ops-log 里读不到 add_admin 审计行。"
-              f"\n      授权本身有效（上面的名单就是证据），缺的是审计留痕。"
-              f"\n      常见原因：ops-log 表还不存在（④ 的栈没部完）、本机凭据缺"
-              f"该表的 dynamodb:PutItem、或被限流。"
-              f"\n      处置：修好之后在控制台把该管理员删掉再重新添加一次"
-              f"（重跑本脚本只会走幂等分支，不会补这条审计行）。")
-        return 0
+        print(f"  ⚠️  管理员已写入，但 site-ops-log 里读不到**本次**的 add_admin 审计行。"
+              f"\n      授权本身有效（上面的名单就是证据），缺的只是审计留痕。"
+              f"\n      常见原因：ops-log 表还不存在（④ 的栈没部完）、本机凭据缺该表的"
+              f" dynamodb:PutItem、或被限流。"
+              f"\n      **补录不能靠重跑本脚本**（它会走幂等分支，不补审计行），也**不能**"
+              f"靠「删掉再加回来」——"
+              f"\n      第一个管理员通常是唯一管理员，而 remove_admin 明确拒绝删除最后一个。"
+              f"\n      处置：先修好上面那个原因，然后从控制台**再加一个**管理员"
+              f"（那一次会留下审计行、且能证明管道已通）；"
+              f"\n      本次这条缺失属于既成事实，记进你自己的变更记录即可。")
     return 0
 
 
