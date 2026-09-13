@@ -8,7 +8,15 @@
     "维护者更新这份快照的办法：先在参考账号上跑 verify_account_trust_boundary.py --update-baseline，",
     "再用 SB_TRUST_BASELINE_IS_REFERENCE=1 跑 test_reference_counts_match_the_local_baseline 核对，",
     "然后把新数字同时写进本文件与那份文档（两处一起进同一个提交，review 时看得见）。",
-    "键名就是文档里 `<!-- baseline:标签=数字 -->` 标记的标签，必须与守卫算出来的标签集合完全一致。"
+    "键名就是文档里 `<!-- baseline:标签=数字 -->` 标记的标签，必须与守卫算出来的标签集合完全一致。",
+    "",
+    "【已接受的残余风险，别误以为守卫覆盖了它】默认套件只证明「文档 == 本文件」。",
+    "同时改这两处即可全绿 ⇒ **没有任何自动检查能证明这组数字真的来自参考账号的实测**。",
+    "这是刻意的取舍：唯一能证明来源的对账需要参考账号的凭据，而那不可能在采用者机器上跑",
+    "（拿本机基线当判据正是工单 14 撞到的那条假红）。所以来源只由维护者的发布流程保证：",
+    "改这组数字时**必须**先在参考账号跑 --update-baseline，再用",
+    "SB_TRUST_BASELINE_IS_REFERENCE=1 跑 test_reference_counts_match_the_local_baseline 核对，",
+    "两处一起进同一个提交（review 时看得见）。跳过这一步的后果是文档与本文件一致但都是假的。"
   ],
   "counts": {
     "A总数": 37,

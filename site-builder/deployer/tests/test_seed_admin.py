@@ -118,6 +118,38 @@ def test_apply_after_load_config_writes_an_audit_row(aws, seed_admin_with_config
     assert "add_admin" in actions, f"没有 add_admin 审计行: {rows}"
 
 
+def test_apply_reports_audit_gap_when_the_row_did_not_land(aws, seed_admin_with_config,
+                                                          monkeypatch, capsys):
+    """Codex 复审 P2：缺 `OPS_LOG_TABLE` 只是审计失败的**一个**原因。
+    `ops_log.record` 吞掉一切异常（表不存在 / AccessDenied / 限流都走同一条静默路径），
+    所以"没抛异常"不等于"审计落了"。授权必须仍然成立，但**缺失要响亮**。
+
+    这里用"让审计写入抛异常"来模拟那一整类原因，断言两件事：
+      ① 管理员确实写进去了（授权不因审计失败而回退——那是平台级裁定）；
+      ② 报告里 audited=False，且 main() 打出可处置的告警。
+    """
+    import permissions
+    import ops_log
+
+    sa = seed_admin_with_config
+    sa._load_config()
+    monkeypatch.setattr(ops_log, "_put",
+                        lambda **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+    out = sa.seed("admin@example.com", dry_run=False)
+    assert out["written"] is True
+    assert permissions.is_admin("admin@example.com"), "授权不该因为审计失败而回退"
+    assert out["audited"] is False, "审计没落，报告里必须说出来"
+
+
+def test_apply_reports_audited_true_on_the_happy_path(aws, seed_admin_with_config):
+    """正对照：审计表健康时 audited 必须是 True。
+    少了它，上面那条用"永远 False"实现也能绿。"""
+    sa = seed_admin_with_config
+    sa._load_config()
+    out = sa.seed("admin@example.com", dry_run=False)
+    assert out["audited"] is True
+
+
 @pytest.mark.parametrize("bad", ["not-an-email", "a@b", "@x.com", "a b@x.com"])
 def test_malformed_email_rejected_before_write(aws, bad):
     """dry-run 也要校验——否则拼错的邮箱要到 --apply 才暴露。"""

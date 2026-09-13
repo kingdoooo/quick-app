@@ -4614,6 +4614,26 @@ def test_non_optional_missing_function_is_not_tolerated():
     assert "site-panel" in keep and "site-auth-service" in keep
 
 
+def test_optional_component_gate_delegates_to_the_single_decision_point():
+    """`OPTIONAL_FUNCTIONS` 的判定函数必须**就是**那个组件自己的唯一判定点对象。
+
+    Codex 复审指出的漂移面：闸门原先在 `resolve_optional_functions` 里自己写了一份
+    `cfg.has_section("ApiKey")`，而 `api_key_config.api_key_enabled` 的 docstring 明确
+    声明自己是唯一真源（"判段存在而不是段里的 enabled 键"那条裁定就在它上面）。
+    两份判定在语义变化时会朝两个方向走，而 mcp 那边的唯一性用例扫不到 `scripts/`
+    ⇒ 漂移是静默的。这里按**对象同一性**咬住，比"行为恰好一致"更严。
+    """
+    g = _gate()
+    _, _, decide = g.OPTIONAL_FUNCTIONS["site-key-proxy"]
+    src = _ROOT / "site-builder" / "deployer" / "functions" / "api_key_config.py"
+    assert decide.__name__ == "api_key_enabled", (
+        f"site-key-proxy 的组件判定是 {decide.__name__!r}，不是 api_key_enabled"
+        "——那是它声明的唯一判定点，别在闸门里另写一份 has_section")
+    assert Path(decide.__code__.co_filename).resolve() == src.resolve(), (
+        f"api_key_enabled 来自 {decide.__code__.co_filename}，不是 {src}"
+        "——闸门必须用组件自己那一份，不是某处的副本")
+
+
 def test_optional_functions_table_names_only_real_platform_functions():
     """`OPTIONAL_FUNCTIONS` 的键必须真的在 `PLATFORM_FUNCTION_NAMES` 里。
     写错名字的后果是静默的：那个键永不命中，闸门退回崩溃前的行为。"""

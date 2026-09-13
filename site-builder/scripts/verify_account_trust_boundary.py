@@ -219,8 +219,15 @@ EDGE_FUNCTIONS = (EDGE_ORIGIN_REQUEST_FN, EDGE_ORIGIN_RESPONSE_FN)
 # 不容忍的后果实测过（工单 14，全新账号 + 推荐的 OAuth-only 形态）：`function_aliases`
 # 的 `list_aliases` 直接 `ResourceNotFoundException` 崩掉，整个闸门退 1 ——
 # 也就是说这个**采用者面向**的闸门对**推荐默认配置**结构上跑不起来。
-# 形态：`{函数名: 判定该组件是否启用的 (section, 说明)}`。
-OPTIONAL_FUNCTIONS = {"site-key-proxy": ("ApiKey", "⑤c API Key 交换层")}
+#
+# 形态：`{函数名: (段名, 说明, 判定函数)}`。**判定函数一律是那个组件自己的唯一判定点**
+# ——不要在这里写第二份 `has_section`，否则判定语义一改，部署路径与本闸门就朝两个方向走。
+sys.path.insert(0, str(_SITE_BUILDER / "deployer" / "functions"))
+from api_key_config import api_key_enabled  # noqa: E402
+
+OPTIONAL_FUNCTIONS = {
+    "site-key-proxy": ("ApiKey", "⑤c API Key 交换层", api_key_enabled),
+}
 
 # ---- grant 词表 ----------------------------------------------------------
 # grant 是 `种类[:资源]` 形态的字符串，进基线文件。改词表等于基线全量漂移。
@@ -1594,8 +1601,13 @@ def resolve_optional_functions(lam, cfg, names) -> tuple[str, ...]:
         if spec is None:
             keep.append(name)
             continue
-        section, label = spec
-        enabled = cfg.has_section(section)
+        section, label, is_enabled = spec
+        # **判定必须走组件自己的那个唯一判定点**，不要在这里重写一遍 `has_section`：
+        # `api_key_config.api_key_enabled` 的 docstring 明确说自己是唯一真源（"判段存在
+        # 而不是段里的 enabled 键"那条裁定就在它上面）。闸门另抄一份的话，将来判定语义
+        # 一改，**部署路径与安全闸门就会朝两个方向走**，而 mcp 那边的唯一性用例
+        # （test_component_gate）扫不到 scripts/ ⇒ 漂移是静默的。
+        enabled = is_enabled(cfg)
         exists = _function_exists(lam, name)
         if enabled and not exists:
             raise SystemExit(
@@ -1608,7 +1620,7 @@ def resolve_optional_functions(lam, cfg, names) -> tuple[str, ...]:
                 f"要么补回 [{section}] 段，要么按 DEPLOY.md「下线这个组件」把它摘掉。")
         (keep if exists else dropped).append(name)
     for name in dropped:
-        section, label = OPTIONAL_FUNCTIONS[name]
+        section, label, _ = OPTIONAL_FUNCTIONS[name]
         print(f"  组件缺席：{name}（{label}）——config.ini 无 [{section}] 段，"
               f"线上也确实没有，已从枚举中去掉")
     return tuple(keep)

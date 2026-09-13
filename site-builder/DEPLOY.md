@@ -3353,9 +3353,12 @@ python3 -u site-builder/scripts/probe_impersonation_surface.py \
 |---|---|---|
 | **站点自己的**（per-site IAM 角色、`site-data-*` 表、DSQL schema / role / IAM 映射、前端对象） | 执行器在建站时建 | **全部变孤儿** —— 一个都不在栈里 |
 | **两个 CFN 栈**（router、deployer） | `cdk deploy` | 大部分跟着走，但 `RemovalPolicy.RETAIN` 的**留下**（见下面第 ④ 步） |
-| **脚本建的平台件**（auth / panel / key-proxy 的 Lambda 与 Function URL、pre-token 触发器、MCP runtime、四个 IAM 角色、告警管道、Cognito 两个池、两个 SSM 参数、前端桶） | ①/auth/⑤/⑤b/⑤c 的部署脚本 | **一个都不会走** |
+| **脚本建的平台件**（auth / panel / key-proxy 的 Lambda 与 Function URL、pre-token 触发器、MCP runtime + ECR 仓库、四~五个 IAM 角色、告警管道、Cognito **两个**池、两~三个 SSM 参数、前端桶） | ①/auth/⑤/⑤b/⑤c 的部署脚本 | **一个都不会走** |
+| **手工建的**（③ 的 DSQL cluster、② 步骤 1 的前端桶、② 步骤 4 的 DNS 记录、CDK bootstrap） | 你自己照手册跑的命令 | **一个都不会走** |
 
-所以顺序是「先站点 → 再脚本件 → 再栈 → 最后收孤儿」。跳过第 ① 步直接删栈是最常见的错法。
+所以顺序是「先站点 → 再脚本件与手工件 → 再栈 → 最后收孤儿」。
+跳过第 ① 步直接删栈是最常见的错法；**第二类里最容易整个忘掉的是 DSQL cluster**
+（它在 ③ 建、不属于任何栈，而拆除时没有任何东西会提醒你）。
 
 ### ① 先下线所有站点，而且要 `purge_data`
 
@@ -3380,29 +3383,67 @@ aws lambda invoke --function-name site-deployer-undeploy --region us-east-1 \
 ### ② 再删脚本建的平台件（都不在栈里）
 
 ```bash
+set -uo pipefail          # **刻意不带 -e**：下面几条对"本来就不存在"要能容忍，见注释
+
 # MCP runtime + ECR 仓库
 aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id <runtime_id> --region us-east-1
 aws ecr delete-repository --repository-name site-builder-mcp --region us-east-1 --force
-# 三个 Lambda（key-proxy 启用过的话第四个是 site-key-proxy）
-for FN in site-panel site-auth-service site-auth-pre-token; do
-  aws lambda delete-function-url-config --function-name $FN --region us-east-1 2>/dev/null
-  aws lambda delete-function --function-name $FN --region us-east-1
+
+# Lambda。**启用过 ⑤c 的话把 site-key-proxy 也列进来**（不在这张表里就永远删不掉它）。
+# `|| true` 不是偷懒：`site-auth-pre-token` 是 Cognito 触发器，**它没有 Function URL**
+# ⇒ 那条 delete-function-url-config 必然失败。在 `set -e` 的 shell 里它会让整段在
+# **删函数之前**中止（`2>/dev/null` 只藏 stderr，不改退出码）。
+for FN in site-panel site-auth-service site-auth-pre-token; do   # ⑤c: 加 site-key-proxy
+  aws lambda delete-function-url-config --function-name "$FN" --region us-east-1 2>/dev/null || true
+  aws lambda delete-function --function-name "$FN" --region us-east-1 || true
 done
-# 四个 IAM 角色（先清 inline / detach 托管策略）
-#   site-panel-role site-auth-service-role site-mcp-runtime-role site-builder-verifier
+
+# IAM 角色：**必须先清 inline policy、detach 托管策略，否则 DeleteConflict**。
+# ⑤c 启用过的话再加 site-key-proxy-role；`[Verification]` 开过才有 site-builder-verifier。
+for R in site-panel-role site-auth-service-role site-mcp-runtime-role site-builder-verifier; do
+  for P in $(aws iam list-role-policies --role-name "$R" \
+              --query 'PolicyNames' --output text 2>/dev/null); do
+    aws iam delete-role-policy --role-name "$R" --policy-name "$P"
+  done
+  for A in $(aws iam list-attached-role-policies --role-name "$R" \
+              --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null); do
+    aws iam detach-role-policy --role-name "$R" --policy-arn "$A"
+  done
+  aws iam delete-role --role-name "$R" 2>/dev/null || true
+done
+
 # 告警管道（**这条的真名容易猜错**）
 aws cloudwatch delete-alarms --alarm-names site-builder-auth-invalid-grant --region us-east-1
 aws sns delete-topic --topic-arn arn:aws:sns:us-east-1:{account_id}:site-builder-alarms
-# Cognito：**托管域名要先删才能删池**，两个池各一个
+
+# Cognito：**托管域名要先删才能删池**，两个池各一个（平台池 + 内置 IdP 池）
 aws cognito-idp delete-user-pool-domain --domain <前缀> --user-pool-id <pool_id> --region us-east-1
 aws cognito-idp delete-user-pool --user-pool-id <pool_id> --region us-east-1
-# 两个 SSM 参数
+
+# SSM 参数：默认两个；**⑤c 启用过的话还有第三个**
 aws ssm delete-parameter --name /site-builder/site-client-secret --region us-east-1
 aws ssm delete-parameter --name /site-builder/login-flow-secret  --region us-east-1
+aws ssm delete-parameter --name /site-builder/machine-client-secret --region us-east-1  # 仅 ⑤c
 ```
 
 > `m5-edge-analytics-failed-global` 与 `m5-rollup-no-successful-invocation-24h`
 > **属于 deployer 栈**，别手工删（下一步会带走）。
+
+> **⚠️ 上面带「仅 ⑤c」标注的四处（`site-key-proxy` 函数、`site-key-proxy-role`、
+> `machine-client-secret`，以及 ⑤c 自己那节的 route 与哨兵行）没有在启用状态下实测过**
+> ——出口验收走的是推荐的 OAuth-only 形态。启用过 ⑤c 的人拆除时请逐条读回核对。
+
+### ②b DSQL cluster（③ 手工建的，**不属于任何栈**）
+
+```bash
+# 站点侧的 schema / role / IAM 映射已在第 ① 步随 purge 清掉；这里删的是 cluster 本身
+aws dsql delete-cluster --identifier <cluster_id> --region us-east-1
+aws dsql get-cluster --identifier <cluster_id> --region us-east-1 --query status --output text
+```
+
+`③` 建它时带的是 `--no-deletion-protection-enabled`（PoC 便于清理）；**开了删除保护的话
+要先关**，否则 `delete-cluster` 被拒。cluster 的 endpoint 是自己拼的，删掉之后
+`[DSQL] cluster_endpoint` 那一行就失效了。
 
 ### ③ 删两个栈
 
@@ -3465,9 +3506,27 @@ aws s3api delete-bucket --bucket site-frontend-{account_id} --region us-east-1
 # 最后（确认不再部署了）：CDKToolkit 栈与 cdk-hnb659fds-assets-* 桶
 ```
 
-**收尾核对**：`aws dynamodb list-tables`、`aws lambda list-functions`、
-`aws cognito-idp list-user-pools`、`aws s3 ls`、`aws kms list-keys` 里都不该再有平台的东西
-（Edge 那两个函数会等 router 栈那次重试才消失）。
+**收尾核对**（**逐条都要看，漏掉的那几类正是最容易留孤儿的**）：
+
+```bash
+aws dynamodb list-tables --region us-east-1                        # 不该有 site-* 与路由表
+aws lambda   list-functions --region us-east-1 --query 'Functions[].FunctionName'
+aws cognito-idp list-user-pools --max-results 20 --region us-east-1 # 两个池都没了
+aws s3 ls                                                          # 无 site-frontend-* / site-artifacts-*
+aws kms list-keys --region us-east-1                               # 两把签名 CMK 应是 PendingDeletion
+aws iam list-roles  --query 'Roles[?starts_with(RoleName,`site-`)].RoleName' --output text
+aws ssm describe-parameters --region us-east-1 \
+    --query 'Parameters[?starts_with(Name,`/site-builder/`)].Name' --output text
+aws dsql list-clusters --region us-east-1                          # cluster 已删
+aws logs describe-log-groups --region us-east-1 \
+    --query 'logGroups[?starts_with(logGroupName,`/aws/lambda/site-`)].logGroupName' --output text
+aws cloudformation describe-stacks --region us-east-1 \
+    --query 'Stacks[].StackName' --output text                     # 只该剩 CDKToolkit（若还留着）
+```
+
+前四条与 KMS 那条**都该是空的（或 PendingDeletion）**；IAM / SSM / DSQL / 日志组这四条
+**是原先漏掉的那几类**——它们不属于任何栈，没人会替你删。
+唯一预期的例外：Edge 那两个函数与路由表要等 router 栈那次重试才消失。
 
 ## 部署后回填检查清单
 

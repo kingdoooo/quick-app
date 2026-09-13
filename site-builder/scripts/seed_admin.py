@@ -78,7 +78,36 @@ def seed(email: str, *, dry_run: bool = True) -> dict:
         return {"email": email, "already_admin": already, "written": False}
     # add_admin 本身幂等（条件写 + __count__ 事务），重复跑不会让计数虚高
     permissions.add_admin(email, added_by="seed_admin.py")
-    return {"email": email, "already_admin": already, "written": not already}
+    audited = _audit_row_present(email) if not already else None
+    return {"email": email, "already_admin": already, "written": not already,
+            "audited": audited}
+
+
+def _audit_row_present(email: str) -> bool:
+    """写完之后**读回**确认审计行真的落了。
+
+    为什么不能只靠"没抛异常"：`ops_log.record` 是刻意 best-effort 的
+    （异常吞掉、只打 traceback、不 re-raise —— 平台级裁定：业务动作已经成功，
+    审计失败不该改变它的结果）。缺 `OPS_LOG_TABLE` 只是它失败的**一个**原因；
+    表不存在、`AccessDenied`、被限流都会走同一条静默路径。
+    而"第一个管理员"是平台上权限最大的一次授予，**它没有审计行 = 从审计上看它从未发生**。
+
+    所以这里不改 `ops_log` 的全局语义（那会让每个调用点都变成"审计挂了就整件事失败"），
+    只在**这一处**把结果读回来，让调用方能响亮地报告"授权成功但审计缺失"。
+    读回本身失败也返回 False —— 判不了就当没有，方向是保守的。
+    """
+    table = os.environ.get("OPS_LOG_TABLE")
+    if not table:
+        return False
+    try:
+        import boto3
+        from boto3.dynamodb.conditions import Key
+        rows = boto3.resource("dynamodb").Table(table).query(
+            KeyConditionExpression=Key("target").eq(f"admins:{email}"),
+            ConsistentRead=True)["Items"]
+    except Exception:                      # noqa: BLE001 —— 读不出来就当没有
+        return False
+    return any(r.get("action") == "add_admin" for r in rows)
 
 
 def main() -> None:
@@ -98,6 +127,21 @@ def main() -> None:
 
     import permissions
     print(f"  当前管理员名单: {permissions.list_admins()}")
+
+    # **审计缺失要响亮**：`ops_log.record` 是 best-effort（异常吞掉、不 re-raise），
+    # 所以"授权成功"与"审计落了"是两件独立的事。第一个管理员是平台上权限最大的一次
+    # 授予——它没有审计行就等于从审计上看它从未发生。这里不让脚本失败（管理员**确实**
+    # 已经写进去了，退非零会把操作者引向"重跑"，而重跑只会走幂等分支、不补那条行），
+    # 而是把它作为一条必须处置的告警打出来。
+    if report["written"] and report.get("audited") is False:
+        print(f"  ⚠️  管理员已写入，但 site-ops-log 里读不到 add_admin 审计行。"
+              f"\n      授权本身有效（上面的名单就是证据），缺的是审计留痕。"
+              f"\n      常见原因：ops-log 表还不存在（④ 的栈没部完）、本机凭据缺"
+              f"该表的 dynamodb:PutItem、或被限流。"
+              f"\n      处置：修好之后在控制台把该管理员删掉再重新添加一次"
+              f"（重跑本脚本只会走幂等分支，不会补这条审计行）。")
+        return 0
+    return 0
 
 
 if __name__ == "__main__":

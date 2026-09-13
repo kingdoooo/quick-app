@@ -41,6 +41,14 @@ cd quick-app
 git checkout v1.0.0
 ```
 
+> **这个 tag 固定的是源码与手册，不是 CDK 工具链版本。** 手册用
+> `npx -y aws-cdk@latest`（刻意的：部分环境的全局 CDK 太旧），而
+> `site-builder/deployer/infra/requirements.txt` 里 `aws-cdk-lib` 只钉了范围
+> （`>=2.140,<3`；router 那份是精确的 `==2.100.0`）。**于是在不同时间 checkout 同一个
+> tag，装到的 CDK CLI 与 aws-cdk-lib 可能不同，synth 出的模板也可能有差异。**
+> 功能不受影响（部署路径由手册与七条验收集保证），但如果你需要**逐字节可复现的模板**，
+> 就自己把 CLI 与 `aws-cdk-lib` 钉到具体版本再部署。收敛这一条是 v1.x 的候选工作。
+
 然后照 [site-builder/DEPLOY.md](site-builder/DEPLOY.md) 走：§0 前置要求 → 「CDK bootstrap」
 → 「部署顺序总览」→ 各阶段 → 「⑦ 部署后验收」。**`git clone` 拿不到能跑的环境**，
 仓库外还有几样东西要先恢复（两个 Python 解释器、两份 `config.ini`、五个 venv、
