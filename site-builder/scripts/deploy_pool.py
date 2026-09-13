@@ -669,6 +669,45 @@ def _ensure_domain(cog, pool_id: str, prefix: str, *,
     return existing
 
 
+def _wait_for_domain_active(cog, domain: str, *, attempts: int = 40,
+                            delay: float = 5.0, sleep=None) -> None:
+    """等托管域名到 `ACTIVE` 才返回。
+
+    **为什么必须等**：`create_user_pool_domain` 是**异步**的（先返回
+    `Status: CREATING`）。而 Cognito 建 OIDC provider 时会按 `oidc_issuer` 去取
+    `/.well-known/openid-configuration` 解析 authorize / token / userInfo 端点，
+    那三个端点**只有池有了域名之后才出现在那份文档里**。②b 建完域名到 ③ 建
+    provider 只隔几个 API 调用，抢在前面的后果是**静默的**：provider 建出来但端点
+    缺失，脚本退 0，直到第一次真实登录才在 /oauth2/authorize 那一跳炸。
+    DEPLOY.md 原来那条手工路径之所以没踩到，是因为人在两步之间天然有停顿。
+
+    超时**响亮失败**：继续往下建 provider 就是把竞态兑换成那个静默坏配置。
+    读不到 Status 时按"未就绪"计入重试（Cognito 不返回该字段的形态不该把部署
+    卡死在轮询里，但也不该被当成就绪）。
+
+    sleep 可注入：单测不真的睡。
+    """
+    if sleep is None:
+        import time
+        sleep = time.sleep
+    for i in range(attempts):
+        desc = cog.describe_user_pool_domain(Domain=domain)
+        status = (desc.get("DomainDescription") or {}).get("Status")
+        if status == "ACTIVE":
+            if i:
+                print(f"  域名 {domain} 已 ACTIVE（等了约 {int(i * delay)} 秒）")
+            return
+        if i == 0:
+            print(f"  等域名 {domain} 就绪（现在是 {status!r}）——"
+                  "provider 要靠它才能解析出 authorize/token/userInfo 端点")
+        sleep(delay)
+    raise SystemExit(
+        f"域名 {domain} 等了约 {int(attempts * delay)} 秒仍未 ACTIVE，中止。"
+        "继续建 OIDC provider 会得到一个**端点缺失**的 provider：脚本会退 0，"
+        "而第一次真实登录在 /oauth2/authorize 那一跳失败。"
+        "去 Cognito 控制台看这个域名的状态，好了再重跑本脚本（幂等）。")
+
+
 SCOPE_DESCRIPTION = "Invoke the site-builder deploy MCP"
 
 
@@ -1245,8 +1284,11 @@ def main() -> None:
     if mode == IDP_MODE_COGNITO:
         print(f"②b 内置 IdP 池（mode = {IDP_MODE_COGNITO}）: {idp_pool_name}")
         idp_pool_id = _ensure_idp_pool(cog, idp_pool_name, idp_pool_existing)
-        _ensure_domain(cog, idp_pool_id, idp_domain_prefix,
-                       managed_login_version=None)
+        idp_domain = _ensure_domain(cog, idp_pool_id, idp_domain_prefix,
+                                    managed_login_version=None)
+        # 域名是异步创建的，而 ③ 的 create_identity_provider 要靠它解析端点 ——
+        # 抢在前面的后果是静默的坏 provider（见 _wait_for_domain_active）。
+        _wait_for_domain_active(cog, idp_domain)
         idp_client_id, idp_client_secret = _ensure_idp_pool_client(
             cog, idp_pool_id, platform_idpresponse)
         # 这个池是本脚本建的，所以它也要过那道读回复验——手工建的池没有它，

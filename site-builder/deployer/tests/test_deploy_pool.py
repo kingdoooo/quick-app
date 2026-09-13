@@ -2085,3 +2085,64 @@ def test_valid_domain_prefixes_are_accepted(prefix):
     """负对照：合法前缀不许被误拒——多拒一个就是用一条不存在的限制挡住采用者。"""
     dp.check_idp_section(_idp_cognito(cognito_domain_prefix=prefix),
                          dp.IDP_MODE_COGNITO)      # 不得抛
+
+
+# ---------------------------------------------------------------------------
+# 工单 07 的 /code-review finding #1：托管域名是异步的，provider 不能抢在它前面建
+# ---------------------------------------------------------------------------
+
+def test_wait_for_domain_polls_until_active():
+    """**finding #1**：prefix domain 是异步创建的（`Status: CREATING`）。
+
+    Cognito 建 OIDC provider 时按 `oidc_issuer` 去取
+    `/.well-known/openid-configuration` 解析 authorize / token / userInfo 端点，
+    而那份文档里的这三个端点**只有池有了域名之后才存在**。②b 建完域名到 ③ 建
+    provider 只隔几个 API 调用 —— 手工路径有人工停顿，脚本没有。撞上的后果是
+    静默的：脚本退 0，第一次真实登录才在 /oauth2/authorize 那一跳炸。
+
+    **本票的真机运行不能作为"没有这个竞态"的证据**：那次的时序是建域名 → 建
+    provider → 读回 → **幂等复跑（update_identity_provider）** → 登录，而那次
+    update 会重新解析端点 ⇒ 即使首次创建拿到空端点也被盖好了。
+    """
+    calls = []
+
+    class _Cog:
+        def describe_user_pool_domain(self, Domain):
+            calls.append(Domain)
+            status = "CREATING" if len(calls) < 3 else "ACTIVE"
+            return {"DomainDescription": {"Status": status}}
+
+    dp._wait_for_domain_active(_Cog(), "acme-idp-2026", sleep=lambda _s: None)
+    assert len(calls) == 3, f"应当轮询到 ACTIVE 才返回，实际 {len(calls)} 次"
+
+
+def test_wait_for_domain_gives_up_loudly_instead_of_racing_on():
+    """超时必须**响亮失败**而不是"算了继续建 provider"：继续走的结果正是那个
+    静默坏配置（provider 建成功、端点是空的）。"""
+    class _Cog:
+        def describe_user_pool_domain(self, Domain):
+            return {"DomainDescription": {"Status": "CREATING"}}
+
+    with pytest.raises(SystemExit, match="ACTIVE"):
+        dp._wait_for_domain_active(_Cog(), "acme-idp-2026", attempts=3,
+                                   sleep=lambda _s: None)
+
+
+def test_wait_for_domain_tolerates_a_missing_status_field():
+    """Cognito 不返回 Status 的形态（老 API 行为 / 空 DomainDescription）不该把部署
+    卡死在轮询里——查不到状态时按"未就绪"计入重试，用尽后仍是响亮失败。"""
+    class _Cog:
+        def describe_user_pool_domain(self, Domain):
+            return {"DomainDescription": {}}
+
+    with pytest.raises(SystemExit, match="ACTIVE"):
+        dp._wait_for_domain_active(_Cog(), "acme-idp-2026", attempts=2,
+                                   sleep=lambda _s: None)
+
+
+def test_main_waits_for_the_idp_domain_before_building_the_provider():
+    """次序守卫：`_wait_for_domain_active` 必须排在 `_ensure_oidc_idp` 之前
+    （否则这个修复只是"函数存在"，竞态照旧）。"""
+    called = _main_call_order()
+    assert "_wait_for_domain_active" in called, "main() 没等域名 ACTIVE"
+    assert called.index("_wait_for_domain_active") < called.index("_ensure_oidc_idp")
