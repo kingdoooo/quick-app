@@ -153,9 +153,19 @@ def handler(event, context):
         if "schema.sql" not in applied:
             run_file(f"extracted/{job_id}/backend/schema.sql", "schema.sql")
 
-        resp = s3.list_objects_v2(Bucket=bucket,
-                                  Prefix=f"extracted/{job_id}/backend/migrations/")
-        for obj in sorted(resp.get("Contents", []), key=lambda o: o["Key"]):
+        # Delimiter="/"：只列 migrations/ **直下层**，子目录落进 CommonPrefixes 被忽略。
+        # 与校验器 `_dsql_sql_files` 的非递归 glob 口径一致（校验器已在 validate 拒掉
+        # 带子目录的站点）。从前递归列举 + 取 basename ⇒ 子目录里的 SQL 会被执行却
+        # 不被红线扫描（M16），而那正是禁用 DDL 推迟到执行期才炸的成因。
+        # paginator：单次 list_objects_v2 只回 1000 条且**静默截断**，迁移文件多了会漏跑。
+        paginator = s3.get_paginator("list_objects_v2")
+        objs = []
+        for page in paginator.paginate(
+                Bucket=bucket,
+                Prefix=f"extracted/{job_id}/backend/migrations/",
+                Delimiter="/"):
+            objs.extend(page.get("Contents", []))
+        for obj in sorted(objs, key=lambda o: o["Key"]):
             fname = PurePosixPath(obj["Key"]).name
             if re.match(r"^\d{3}_.+\.sql$", fname) and fname not in applied:
                 run_file(obj["Key"], fname)

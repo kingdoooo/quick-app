@@ -143,3 +143,26 @@ def test_duplicate_object_tolerated_but_real_errors_raised():
         with pytest.raises(Exception) as ei:
             provision_dsql._exec_ignoring_duplicate(cur, "AWS IAM GRANT r TO 'arn'")
         assert getattr(ei.value, "sqlstate", None) == sqlstate
+
+
+# ---- M16 执行器半边：只列 migrations/ 直下层 ----
+
+def test_migrations_in_subdirectory_are_not_executed(aws):
+    """执行器列举带 Delimiter="/"，子目录里的 SQL 不再被执行。
+
+    与校验器口径一致（校验器已在 validate 拒掉带子目录的站点）：从前执行器递归看到
+    子目录、`PurePosixPath(key).name` 把 `nested/002_bad.sql` 取成 `002_bad.sql` 就跑，
+    而红线扫描只看直下层 ⇒ 「执行器扫的 ⊋ 校验器扫的」，禁用 DDL 因此推迟到执行期才炸。
+    """
+    import common
+    common.create_job("a@x.com", "exp-a1b2c3")
+    _put("job-1", "backend/schema.sql",
+         b"CREATE TABLE IF NOT EXISTS a (id UUID PRIMARY KEY);")
+    _put("job-1", "backend/migrations/001_ok.sql",
+         b"ALTER TABLE IF EXISTS a ADD COLUMN IF NOT EXISTS x TEXT;")
+    _put("job-1", "backend/migrations/nested/002_bad.sql",
+         b"ALTER TABLE IF EXISTS a ADD COLUMN IF NOT EXISTS y TEXT;")
+    _, _, mig_sqls, _, _ = _run()
+    applied = common.get_site("exp-a1b2c3")["migrations_applied"]
+    assert applied == ["schema.sql", "001_ok.sql"], applied
+    assert not any("COLUMN y" in s for s in mig_sqls), mig_sqls
