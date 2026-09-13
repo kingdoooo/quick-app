@@ -607,3 +607,55 @@ def test_absent_tables_do_not_relax_ownership_checks_for_the_rest(aws, monkeypat
     assert common.get_job(jid)["status"] == "PURGE_FAILED"
     assert not [c for c in calls if c[0] == "DeleteTable"]
     assert "site-data-hello-x1-theirs" in ddb.list_tables()["TableNames"]
+
+
+def test_purge_dsql_clears_migration_marker(aws):
+    """purge 掉 schema 之后必须把已应用标记也清掉（裁定 4 的 purge 半边）。
+
+    今天的坏状态：schema 没了、marker 还在 ⇒ 下次部署跳过 schema.sql ⇒ 站点起来但
+    **一张表都没有**，而且**静默**（部署报 SUCCEEDED）。反向（marker 清了、schema 还在）
+    则在 provision-db 响亮失败，所以两个方向的坏状态不对称——这决定了修法方向。
+
+    落点：`DROP SCHEMA` **之后**（schema 真没了才清）、`DROP ROLE` 循环**之前**
+    （role 的 drop 是 warn-only，放后面会被一次 role 失败跳过）。
+    """
+    import undeploy, common
+    _seed(common, boto3, site_id="exp-mk", tier="fullstack-sql")
+    common.upsert_site("exp-mk", migrations_applied=["schema.sql", "001_add.sql"])
+    conn, cur = MagicMock(), MagicMock()
+    conn.cursor.return_value = cur
+    cur.fetchall.return_value = []          # 无 IAM 映射
+    import sys, types
+    fake = types.ModuleType("psycopg")
+    fake.connect = lambda **kw: conn
+    with patch.dict(sys.modules, {"psycopg": fake}), \
+         patch.object(undeploy, "_lambda", return_value=_lam_mock()), \
+         patch.object(undeploy.boto3, "client") as bc:
+        bc.return_value.generate_db_connect_admin_auth_token.return_value = "tok"
+        undeploy._purge_dsql("exp-mk")
+    assert common.get_site_consistent("exp-mk")["migrations_applied"] == []
+    sqls = [c.args[0] for c in cur.execute.call_args_list]
+    assert any('DROP SCHEMA IF EXISTS "site_expmk" CASCADE' in s for s in sqls), sqls
+
+
+def test_purge_dsql_marker_clear_failure_is_reported_not_swallowed(aws):
+    """清 marker 失败**不许**自己吞掉：让它抛到 handler ⇒ purged["dsql_error"] ⇒
+    job 落 PURGE_FAILED，残留状态是被**报告**的而不是静默的。"""
+    import undeploy, common
+    import pytest
+    _seed(common, boto3, site_id="exp-mkerr", tier="fullstack-sql")
+    common.upsert_site("exp-mkerr", migrations_applied=["schema.sql"])
+    conn, cur = MagicMock(), MagicMock()
+    conn.cursor.return_value = cur
+    cur.fetchall.return_value = []
+    import sys, types
+    fake = types.ModuleType("psycopg")
+    fake.connect = lambda **kw: conn
+    with patch.dict(sys.modules, {"psycopg": fake}), \
+         patch.object(undeploy, "_lambda", return_value=_lam_mock()), \
+         patch.object(undeploy.boto3, "client") as bc, \
+         patch.object(undeploy.common, "upsert_site",
+                      side_effect=RuntimeError("ddb down")):
+        bc.return_value.generate_db_connect_admin_auth_token.return_value = "tok"
+        with pytest.raises(RuntimeError):
+            undeploy._purge_dsql("exp-mkerr")

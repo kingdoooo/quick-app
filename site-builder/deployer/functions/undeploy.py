@@ -123,6 +123,16 @@ def _purge_dsql(site_id: str) -> str:
             except Exception as e:
                 logger.warning(f"REVOKE {role} <- {arn} 失败: {e}")
         cur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        # **schema 没了，已应用标记也必须清掉**，否则重新部署会跳过 schema.sql ⇒
+        # 站点起来但一张表都没有，且**静默**（部署报 SUCCEEDED）。
+        # 落点：`DROP SCHEMA` 之后（schema 真没了才清）、`DROP ROLE` 循环之前
+        # （role 的 drop 是 warn-only，放后面会被一次 role 失败跳过）。
+        # **刻意不包 try/except**：让它抛到 handler → purged["dsql_error"] → job
+        # PURGE_FAILED，残留状态是被**报告**的。反向坏状态（标记清了、schema 还在）
+        # 会在 provision-db 响亮失败，比静默的正向坏状态好。
+        # upsert_site 是 SET-only，所以写 `[]` 而不是 REMOVE——够用：唯一的读者
+        # provision_dsql 对 `[]` 与"这一列不存在"处理相同。
+        common.upsert_site(site_id, migrations_applied=[])
         for role in (f"{schema}_app", f"{schema}_mig"):
             try:
                 cur.execute(f"DROP ROLE IF EXISTS {role}")
