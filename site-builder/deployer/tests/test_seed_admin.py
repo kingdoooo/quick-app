@@ -56,6 +56,68 @@ def test_empty_seed_fails_loudly(aws):
     assert "admin_seed" in str(e.value)
 
 
+# --- _load_config 必须把 permissions/ops_log 需要的**全部**环境变量备齐（工单 14 实测） ---
+# 上面那些用例直接调 seed(),从不经过 _load_config(),而 conftest 的 `aws` fixture
+# 白送了一整套 ENV(含 OPS_LOG_TABLE) ⇒ **缺环境变量这类缺陷在这套测试里结构性看不见**。
+# 真机上的后果:`add_admin` 里的 ops-log 写入是 best-effort(异常被吞、只打 traceback、
+# 退 0),于是"第一个管理员"这次授予**成功但没有审计行**,而操作者看到一条 KeyError
+# traceback,读起来像失败。下面两条专门盯这道缝:一律先把变量从 env 里**删掉**,
+# 逼 _load_config 自己造出来。
+
+_CONFIG_INI = """\
+[Platform]
+base_domain = example.com
+account_id = 000000000000
+region = us-east-1
+admin_seed = admin@example.com
+
+[Deployer]
+jobs_table = site-deploy-jobs
+sites_table = site-sites
+admins_table = site-admins
+"""
+
+
+@pytest.fixture
+def seed_admin_with_config(tmp_path, monkeypatch):
+    """让 _load_config() 读一份临时 config.ini,并清掉它该负责设置的环境变量。"""
+    import seed_admin
+
+    (tmp_path / "config.ini").write_text(_CONFIG_INI, encoding="utf-8")
+    # _load_config 读的是 HERE.parent / "config.ini"
+    monkeypatch.setattr(seed_admin, "HERE", tmp_path / "scripts")
+    for var in ("OPS_LOG_TABLE", "ADMINS_TABLE", "SITES_TABLE"):
+        monkeypatch.delenv(var, raising=False)
+    return seed_admin
+
+
+def test_load_config_sets_every_env_var_its_callees_read(aws, seed_admin_with_config):
+    """`_load_config` 是这个脚本唯一的环境变量装配点——漏一个就是一条静默缺陷。"""
+    cfg = seed_admin_with_config._load_config()
+    import os
+    assert os.environ["ADMINS_TABLE"] == "site-admins"
+    assert os.environ["SITES_TABLE"] == "site-sites"
+    assert os.environ["AWS_DEFAULT_REGION"] == "us-east-1"
+    # 审计表**不是配置项**(deployer 栈与 deploy_panel 都按同一字面量),但仍然必须被设上
+    assert os.environ["OPS_LOG_TABLE"] == "site-ops-log"
+    assert cfg["Platform"]["admin_seed"] == "admin@example.com"
+
+
+def test_apply_after_load_config_writes_an_audit_row(aws, seed_admin_with_config):
+    """端到端那半句:第一个管理员必须留下审计行。
+    这是平台上权限最大的一次授予,没有审计行等于它从未发生过。"""
+    import boto3
+
+    seed_admin_with_config._load_config()
+    out = seed_admin_with_config.seed("admin@example.com", dry_run=False)
+    assert out["written"] is True
+
+    rows = boto3.resource("dynamodb", region_name="us-east-1") \
+        .Table("site-ops-log").scan()["Items"]
+    actions = [r.get("action") for r in rows]
+    assert "add_admin" in actions, f"没有 add_admin 审计行: {rows}"
+
+
 @pytest.mark.parametrize("bad", ["not-an-email", "a@b", "@x.com", "a b@x.com"])
 def test_malformed_email_rejected_before_write(aws, bad):
     """dry-run 也要校验——否则拼错的邮箱要到 --apply 才暴露。"""

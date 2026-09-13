@@ -66,6 +66,15 @@ boundary；本账号是 Organizations 管理账号，SCP 对它无效）。
 python3 site-builder/scripts/verify_account_trust_boundary.py
 ```
 
+> **下面这些数字是参考部署的，不是你的。** 它们与
+> `docs/security/account-trust-boundary-reference-counts.json`（tracked，**只有计数、无账号内
+> 标识**）逐个对账，守卫是 `deployer/tests/test_verify_account_trust_boundary.py` 的
+> `test_doc_counts_come_from_the_reference_snapshot`。
+> **对账的两侧都是 tracked 物，与你本机有没有基线无关**——你自己账号的基线
+> （`scripts/account_trust_baseline.json`，gitignored、单账号）只被结构性检查，
+> 数值与 `category` 标注都不参与。所以照 DEPLOY.md ⑦ 跑一次 `--update-baseline`
+> **不会**让任何测试变红；反过来，也不要拿本文这组数字去核对你自己的账号。
+
 闸门分**两层**，承诺宽度不同，所以数字也分两组（见「这道闸门不证明什么」）：
 
 | 组 | 项 | 数 |

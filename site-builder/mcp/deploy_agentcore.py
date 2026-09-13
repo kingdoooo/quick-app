@@ -629,7 +629,7 @@ def deploy_runtime(image_uri: str, role_arn: str) -> dict:
         return acc.update_agent_runtime(agentRuntimeId=existing, **common)
     print("  创建新 runtime")
     return acc.create_agent_runtime(agentRuntimeName=RUNTIME_NAME,
-                                    description="Site Builder 部署 MCP（owner 绑飞书账号）",
+                                    description="Site Builder 部署 MCP（owner 绑平台 IdP 的邮箱身份）",
                                     **common)
 
 
@@ -724,7 +724,7 @@ def main() -> None:
     print("\n冒烟（需要一个真实 Cognito token）：")
     print("  npx @modelcontextprotocol/inspector  # 连上面 endpoint，带 Bearer token")
     print(f"  检查：{EXPECTED_TOOL_COUNT} 个工具列出 / 无 token 返回 401 /")
-    print("       list_my_sites 的 owner == 登录的飞书邮箱（验证 email claim 透传）")
+    print("       list_my_sites 的 owner == 登录用户的邮箱（验证 email claim 透传）")
 
 
 if __name__ == "__main__":

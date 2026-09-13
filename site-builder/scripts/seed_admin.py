@@ -39,6 +39,14 @@ def _load_config() -> configparser.ConfigParser:
     cfg.read(path)
     # 一期就存在的 config.ini 没有二期新增的键（admins_table 是其中之一）。
     # 裸 KeyError('admins_table') 对操作者毫无指向性，明确告诉他补哪一行。
+    # 平台自己的审计表**不是配置项**：deployer 栈按字面量建 `site-ops-log`、
+    # `deploy_panel` 按同一字面量下发，所以这里也只能是同一个字面量
+    # （与 ensure_fixture_site._ENV_LITERALS 同源；那边的注释是这条约定的说明）。
+    # **不给它的后果是静默的**：`permissions.add_admin` 里的 ops-log 写入是
+    # best-effort（异常被吞、只打 traceback、退 0），于是"第一个管理员"——平台上
+    # 权限最大的那一次授予——**写成了却没有审计行**，而操作者看到的是一条
+    # KeyError traceback，读起来像失败。同样用直接赋值，理由见上面。
+    os.environ["OPS_LOG_TABLE"] = "site-ops-log"
     try:
         os.environ["ADMINS_TABLE"] = cfg["Deployer"]["admins_table"]
         os.environ["SITES_TABLE"] = cfg["Deployer"]["sites_table"]

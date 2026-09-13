@@ -6,7 +6,6 @@
 **部署的是当前最新版本（含二期全部里程碑：控制台、API Key 交换层、访问统计、
 blue/green 原子更新）**：照 ①→⑦ 走一遍即可（⑤b 控制台、⑤c API Key 均可选），
 无需先部旧版本再升级。
-已在运行旧版本的环境见[从一期环境升级](#从一期环境升级本仓库自己的环境走过这条路)。
 
 - **区域**：`us-east-1`（Lambda@Edge 与 CloudFront 用的 ACM 证书共同强制）
 - 下文 `{account_id}`、`{base_domain}` 等**花括号占位符需手工替换成你的实际值**
@@ -813,6 +812,32 @@ import 期就以 `ModuleNotFoundError` 退出，并打印可用的解释器建�
 但它**仍然没有 pytest**——router 的测试借 deployer 的 venv 跑。
 
 
+### CDK bootstrap
+
+两个 CDK 栈（④ 执行器、② 路由层）共用目标环境的 bootstrap 资源，**跑一次就够**：
+
+```bash
+# 从**仓库根**跑（不要在 router/infrastructure 或 deployer/infra 里跑，见下）
+cd {仓库根}
+npx -y aws-cdk@latest bootstrap aws://{account_id}/us-east-1
+```
+
+**必须在 ④ 之前做完。** ④ 排在 ② 前面（下面「部署顺序总览」），而 CDK 是**先 synth 再检查
+bootstrap** ⇒ 漏了这一步的症状是白跑一整趟 Docker bundling 之后才被告知要 bootstrap。
+
+> **为什么要从仓库根跑，而不是在某个栈目录里。** 那两个目录各有 `cdk.json`，
+> 而 `cdk bootstrap` 在有 `cdk.json` 的目录里**同样会先 synth 整个 app**。
+> `router/infrastructure` 的 synth 要从 KMS 取 ④ 建的 site 公钥（那道守卫是刻意的，
+> 见 ②），于是"在 router 目录里 bootstrap"是个**死锁**：④ 要 bootstrap，
+> 而这条 bootstrap 要 ④ 的 CMK。报文长这样，不要当成凭据或配置问题：
+>
+> ```
+> RuntimeError: 按 [SessionKeys] 从 KMS 取 site 公钥失败（... kms:DescribeKey ...
+> because the resource does not exist in this Region ...）——synth 拒绝生成模板
+> ```
+>
+> 仓库根没有 `cdk.json`，`bootstrap` 就只做它自己那件事。
+
 ### 成本预期（PoC 量级）
 
 
@@ -830,11 +855,49 @@ import 期就以 `ModuleNotFoundError` 退出，并打印可用的解释器建�
 CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只在 cache miss
 时执行），PoC 流量下成本影响可忽略；高流量场景需评估精细缓存（二期）。
 
+### 首次部署要多久，以及必然撞到的几处
+
+下面是**一次全新账号首装的实测**（单账号，家用宽带 + Docker Desktop on Apple Silicon；
+①→ 夹具站点，不含 ⑦ 验收）。列出来是为了让你能判断"卡住了"还是"本来就这么慢"。
+
+| 步骤 | 挂钟 | 备注 |
+|---|---|---|
+| §0 CDK bootstrap | ~40 s | 一次性 |
+| ① `deploy_pool.py` | ~50 s | 含内置 IdP 池那一路（②b） |
+| ① 建第一个用户 | 秒级 | 两条 `aws cognito-idp` |
+| ③ DSQL cluster | ~25 s | `CREATING → ACTIVE` 约 10 s |
+| ② 步骤 1 前端桶 | 秒级 | 手工建 + public-access-block |
+| ④ 第一次 `cdk deploy` | ~5 min | Docker bundling 十个 step Lambda |
+| ② router `cdk deploy` | ~4 min | 分发到 `Deployed` 比手册估的 10–20 min 快得多，但**不要指望** |
+| ② 步骤 4 DNS | 秒级 | Route53 到 `INSYNC` 很快 |
+| ④ 第二次 `cdk deploy` | ~25 s | 只换十个 step Lambda 的一个环境变量 |
+| auth `deploy_auth.py` | ~30 s | |
+| ⑤ `deploy_agentcore.py` | ~2 min / 次 | buildx ARM64 + 推 ECR + 建 runtime |
+| ⑤b `deploy_panel.py` | ~35 s | |
+| ④ 后的 `seed_admin.py --apply` | 秒级 | |
+| 夹具站点 `ensure_fixture_site.py` | ~30 s | 这也是第一次真实建站，顺带证明 ④ 的第二次部署生效了 |
+
+**含三次被迫重试，整条链路的挂钟约 40 分钟。** 那三次重试**不是操作失误，是这条路上
+必然的三处**，每一处上面对应的小节都写了原样报文与处置：
+
+1. **① 的托管域名前缀撞车**——默认值被参考部署占着（见 ① 步骤 2 的 ⚠️）。
+2. **④ 的第一次 `cdk deploy` 失败 + 整栈回滚**——账号里第一张 DynamoDB Global Table 的
+   SLR 传播竞态。**清孤儿是这三处里唯一花时间的**（四张 RETAIN 表 + 两把 CMK，约 4 分钟），
+   见 ④ 那条 ⚠️ 与 ⑤d 的对应小节。
+3. **⑤ 的第一次 `CreateAgentRuntime` 失败**——新建 runtime 角色的 IAM 传播延迟，
+   而恢复办法**不是**重跑同一条命令（见 ⑤ 那条 ⚠️）。
+
+三处的共同点：**报文都指向一个错误的原因**（"你自己的池已有域名" / "凭据无效" /
+"角色缺 ECR 权限"），照着字面去查全是死路。撞到时先回对应小节核对报文，别自己推理。
+
+一件**不会**在这条链路里自己完成的事：`[Alerting] email` 的 SNS 订阅要收件人**手工点确认
+链接**。`deploy_auth.py` 会把它显式报成「未完成」（`pending`），那不是失败——但确认之前
+登录失败告警没有人收得到。
+
 ## 部署顺序总览
 
 **这份 Runbook 部署的是当前最新版本（含二期全部里程碑）。全新账号照 ①→⑦ 走一遍
-即可，不需要"先部一期再升级"。** 已经跑着一期的环境要升级，见文末
-[从一期环境升级](#从一期环境升级本仓库自己的环境走过这条路)。
+即可，不需要"先部一期再升级"。**
 
 组件间有依赖，必须按序：
 
@@ -897,6 +960,8 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
 开始前的就绪清单（详见上面 §0）：
 
 - [ ] AWS 凭证指向目标账号 / us-east-1（`aws sts get-caller-identity`）
+- [ ] **CDK 已 bootstrap**（`aws://{account_id}/us-east-1`）——④ 与 ② 两个栈共用它，
+      而 ④ 排在 ② 前面 ⇒ 必须在这里就做完，见下面「CDK bootstrap」
 - [ ] `*.{base_domain}` ACM 证书 ISSUED（us-east-1）
 - [ ] `{base_domain}` DNS 可修改（Route53 hosted zone 或等价）
 - [ ] `[SessionKeys]` 的两个 `[SessionKey:*-rs-v1]` 小节已按 `session_key_fingerprint.py --from-stack`
@@ -913,6 +978,10 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
       ——池本身由 ① 的 `deploy_pool.py` 建；建完再用两条 `aws cognito-idp`
       命令建第一个用户（见 §0）
       / **【飞书】** 企业自建应用（App ID/Secret，含用户 userid + 邮箱权限）
+- [ ] **平台池自己的托管域名前缀已选定，且不是默认值** ——
+      `deploy_pool.py --domain-prefix <你的前缀>`。Cognito 托管域名前缀**跨全部 AWS 账号
+      全局唯一**，而默认值 `site-builder-auth` **已经被占用**（本方案的参考部署持有它）
+      ⇒ **不带这个开关裸跑必然失败**，见 ① 步骤 2
 - [ ] `[IdP] provider_name` 不是四个社交保留名之一，且**同一个值**已写进
       `router/config.ini` 的 `[SiteBuilder] trusted_idps`（这一对没有自动闸门，见 §0）
 - [ ] Docker 运行中；`npx` 可用
@@ -1674,11 +1743,21 @@ pre-token 触发器、managed login branding。命令与实测基线见前面
    > **但走第 3 条路时，第二个池是你手工建的，没有任何脚本替你复验**——
    > 那个池同样会被扫，漏掉就是一个开着自注册的池，见下面的读回命令。
 
-   **【内置 Cognito】** 按 §0 的「内置 Cognito 池的确切形态」先建好第二个池
-   与它的 app client、管理员建好用户，再把该池的 issuer
-   （`https://cognito-idp.{region}.amazonaws.com/{idp_pool_id}`）与 client 凭证
-   填进 `[IdP]`。**这一条不需要在"IdP 侧"另外登记回调**——回调就是第二个池
-   app client 的 `CallbackURLs`，建它的时候已经填了平台池的 `/oauth2/idpresponse`。
+   **【内置 Cognito】** 这条路**不需要你先建任何东西**：填 `[IdP] mode = cognito-admin`
+   + `provider_name` + `cognito_user_pool_name` / `cognito_domain_prefix` 四行，
+   下面步骤 2 的**同一次** `deploy_pool.py` 就会把第二个池、它的托管域名与联邦
+   app client 一起建出来（输出里的 `②b` 那一段），形态见 §0 的
+   「【内置 Cognito】第二个池的确切形态」。
+
+   > **`issuer` / `client_id` / `client_secret` 必须留空。** 它们由部署过程从新建的池
+   > 派生，**填了不是被忽略而是报冲突**（`check_idp_section` 在第一次 AWS 写之前就拒）。
+   > 同理不需要在"IdP 侧"登记回调——回调就是第二个池 app client 的 `CallbackURLs`，
+   > 脚本建它时已经把平台池的 `/oauth2/idpresponse` 填进去了。
+
+   池建好后再用 §0 末尾那两条 `aws cognito-idp` 命令建第一个用户
+   （`deploy_pool.py` 结束时也会把带真实 pool id 的两条命令打出来，直接抄）。
+   **`Name=name,Value=` 的显示名带空格时要加引号**（`Name=name,Value="Kent Peng"`），
+   否则 shell 会把它切成两个参数。
 
    **【飞书】** 克隆并按其 README 部署上游方案（把飞书 OAuth 包装成标准 OIDC
    的适配器；平台把它当成一个普通 OIDC IdP 来联邦）：
@@ -1718,8 +1797,28 @@ pre-token 触发器、managed login branding。命令与实测基线见前面
 
   ```bash
    # [IdP] 段填好后跑；client_secret 可用 SB_IDP_CLIENT_SECRET 注入不落磁盘
-   python3 site-builder/scripts/deploy_pool.py
+   # --domain-prefix 是**必给**的，理由见下面那条 ⚠️
+   python3 site-builder/scripts/deploy_pool.py --domain-prefix <你的全局唯一前缀>
   ```
+
+   > ⚠️ **`--domain-prefix` 的默认值必然失败，不要省这个开关。** Cognito 托管域名前缀是
+   > **跨全部 AWS 账号全局唯一**的一个命名空间，而默认值 `site-builder-auth` 已经被本方案的
+   > 参考部署占着 ⇒ 任何采用者裸跑都会撞上它。自己取一个（如把域名或组织名掺进去）。
+   >
+   > 前缀撞车时的报文**是误导性的**——它读起来像"**你自己的**池已经有域名了"，
+   > 而真实原因是这个**全局**名字属于**别的账号**：
+   >
+   > ```
+   > InvalidParameterException: An error occurred (InvalidParameterException) when calling
+   > the CreateUserPoolDomain operation: Domain already associated with another user pool.
+   > ```
+   >
+   > 失败点在**平台池已经建好之后**，所以账号里会留下一个**没有托管域名的池**。
+   > 这不需要清理：换个前缀重跑即可，脚本按池名幂等找回那个池、接着往下建域名。
+   >
+   > 这个前缀**不进 `config.ini`**（脚本从池上读回现值），所以只有首次那一次要给。
+   > 重跑时 `_ensure_domain` 一律**沿用池上已有的域名并忽略本开关**——也就是说
+   > **建错了不能靠改这个开关改回来**，只能删掉那个域名再建。
 
    它建：平台专用 pool（关自注册 + ESSENTIALS tier，pre-token V2 需要）、
    托管域名（managed login v2）、OIDC 联邦（含 `email` 与 `email_verified`
@@ -1764,7 +1863,7 @@ pre-token 触发器、managed login branding。命令与实测基线见前面
    > Cognito 的 `/logout` **不登出上游 IdP**（飞书会话仍在），所以 UI 文案不能
    > 承诺"已完全退出"。
 
-7. **验证点**：`deploy_pool.py` 结束时打印的核对项全部通过 + 上面步骤里的
+4. **验证点**：`deploy_pool.py` 结束时打印的核对项全部通过 + 上面步骤里的
    describe 核对全部符合，即可进入 ②。**端到端的真人登录验证不在这一步**：
    完整链路（Hosted UI → IdP → 回调 → 会话）要等 ② 路由层与登录服务都在线
    才存在，放在 ⑥ 客户端接入（auth.js 首次 OAuth 能拿到含 email 的 access
@@ -1839,7 +1938,8 @@ name**；值必须是裸 `true`/`false`——configparser 会把行内注释并�
    >
    > 生命周期规则表达不了"除了每个站点最新的那一份"，所以这里没有"改窄"的写法，
    > 只能不配。
-2. 部署栈（首次需先 bootstrap）：
+2. 部署栈（bootstrap 已在 §0「CDK bootstrap」做过——**不要**在这个目录里跑
+   `cdk bootstrap`，它会先 synth 本 app 而本 app 的 synth 需要 ④ 的 CMK）：
   ```bash
    cd router/infrastructure
    # --clear：首次创建与已存在时重建都适用。venv 的 shebang 是绝对路径，
@@ -1847,14 +1947,18 @@ name**；值必须是裸 `true`/`false`——configparser 会把行内注释并�
    # python3 -m venv 对已存在目录不会重写 shebang（重跑也修不了）
    python3 -m venv --clear .venv                  # 或一次建齐：bash site-builder/scripts/bootstrap_venvs.sh（见 §0 本机工具链）
    .venv/bin/pip install -r requirements.txt -q
-   PATH=.venv/bin:$PATH npx -y aws-cdk@latest bootstrap aws://{account_id}/us-east-1   # 首次
    python3 ../../site-builder/scripts/router_stack_policy.py open    # 首次部署栈还不存在 → 打印 SKIP
    PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never
    python3 ../../site-builder/scripts/router_stack_policy.py apply   # 设 stack policy 并读回核对；open 之后无论成败都要跑
   ```
 
-   stack.py 部署时会从 SSM 读真实密钥注入 Edge 函数（`load_jwt_secret` / `load_site_allowlist`）；
-   读取失败时 synth 直接报 `RuntimeError` 退出、不部署——检查凭证与 SSM 参数后重跑。
+   synth 时 stack.py 按 `site-builder/config.ini` 的 `[SessionKeys]` 逐把从 **KMS 取 site family
+   的公钥**、核对 `spki_sha256`，再把这份 allowlist 字符串替换进 Edge 函数
+   （`load_site_allowlist`；Lambda@Edge 没有环境变量）。**Edge 手里只有公钥**——它零 KMS 权限，
+   也没有任何 SSM 密钥（会话是 RS256，私钥留在 ④ 建的两把 CMK 里）。
+   取不到公钥、或指纹与 config 不符，synth 直接 `RuntimeError` 退出、**什么都不部**
+   ——那不是权限问题就是 config 与 KMS 里的 key 不是同一把（改过 CMK 就重跑
+   `session_key_fingerprint.py --from-stack` 回填）。
    若看到 `SYNTH-ONLY-PLACEHOLDER` 警告仍继续部署了，说明环境里带着 `APP_SYNTH_OFFLINE=1`，去掉它。
 
    > **`cdk deploy` 会长时间挂在最后一步**（Lambda@Edge 复制到全球边缘节点，可达
@@ -1899,12 +2003,33 @@ name**；值必须是裸 `true`/`false`——configparser 会把行内注释并�
 3. 记录 CfnOutput 的 **EdgeRoleArn**，回填 `site-builder/config.ini [Deployer] edge_role_arn`（Task 17 执行器需要它给站点 Function URL 授权）。记录 **DistributionDomainName**。
 
    **换 edge role 之后**（路由层栈重建、角色重创、或修正写错的 `edge_role_arn`）：重跑 ⑤ `deploy_auth.py`、⑤b `deploy_panel.py`、⑤c `deploy_key_proxy.py` 即可——三个脚本每次都按期望集合等值收敛各自 Function URL 的 resource policy（读回、替换内容不对的同名语句、删野 Sid、写后读回核对；一致时零写入）。IAM 在角色被删时会把 policy 里的 Principal 改写成已删角色的唯一 ID，所以"同名语句已存在"不等于授权还对；`verify_deployed_components.py` 对三条都断言。
-4. DNS：在 `{base_domain}` 加通配符 CNAME 或 A-alias 指向 CloudFront 域名：
+4. **DNS：栈里没有任何 Route53 资源，这一步必须手工做。** 在 `{base_domain}` 加通配符
+   CNAME 或 A-alias 指向 CloudFront 域名：
   ```
    *.{base_domain}  →  {distribution_domain_name}  (形如 dxxxxxxxxxxxxx.cloudfront.net)
   ```
+   **`cdk deploy` 成功 ≠ 能访问。** 漏了这一步的症状是"域名打不开"，读起来像部署失败。
+
+   Route53 的话（通配符 A-alias；`Z2FDTNDATAQYW2` 是 **CloudFront 的固定 alias hosted zone
+   id**，对所有分发都是这一个，不是你自己 zone 的 id——这个值猜不出来）：
+
+  ```bash
+   cat > /tmp/rrset.json <<'JSON'
+   {"Comment":"wildcard -> CloudFront (site-builder router)",
+    "Changes":[{"Action":"UPSERT","ResourceRecordSet":{
+      "Name":"*.{base_domain}","Type":"A",
+      "AliasTarget":{"HostedZoneId":"Z2FDTNDATAQYW2",
+                     "DNSName":"{distribution_domain_name}","EvaluateTargetHealth":false}}}]}
+   JSON
+   aws route53 change-resource-record-sets --hosted-zone-id {your_zone_id} \
+     --change-batch file:///tmp/rrset.json
+  ```
+
    同 zone 下**已有的显式子域记录不受影响**（DNS 显式记录优先于通配符）；但此后
    新增子域在建记录前会先落到本方案并返回 404，排查时留意。
+
+   > **顺手核对一件事**：`aws acm describe-certificate … --query Certificate.InUseBy`
+   > 现在应该出现那个分发的 ARN。这是"证书真的被用上了"最直接的判据，比读配置可靠。
 5. **部署 auth-service Lambda**（Task 5 的登录端点，依赖①的 Cognito + 本步骤的路由表；
    **还依赖上一步回填的 `[Deployer] edge_role_arn`**，脚本要用它授权 Function URL）：
   ```bash
@@ -2051,6 +2176,21 @@ python3 -m venv --clear .venv                  # 见 ② 的说明：venv 不可
 PATH=.venv/bin:$PATH npx -y aws-cdk@latest deploy --require-approval never
 ```
 
+> **⚠️ 全新账号的第一次 `cdk deploy` 大概率在这里失败一次，而报文是误导性的。**
+> 本栈含账号里的第一张 DynamoDB Global Table（M5 的访问明细表），它会顺带创建
+> `AWSServiceRoleForDynamoDBReplication`，而紧随其后的建副本调用会撞上 IAM 传播延迟：
+>
+> ```
+> SiteDeployerStack | CREATE_FAILED | AWS::DynamoDB::GlobalTable | AccessEvents
+> "'UnrecognizedClientException':'The security token included in the request is invalid.'"
+> ```
+>
+> **凭据没有问题，不要去查 profile / opt-in 区域 / session token。** 完整口径、以及
+> **首次 create 整栈回滚后必须清掉的那 6 个孤儿资源**（四张 RETAIN 表 + 两把会话签名 CMK
+> ——后者不冲突、因此静默留在账号里），见 ⑤d 的
+> [首建 Global Table 的 SLR 传播竞态](#新账号首次部署会踩一次首建-global-table-的-slr-传播竞态)。
+> 清完重跑同一条命令即可，SLR 此后永久存在。
+
 记录 CfnOutput 的 **StateMachineArn**，回填 `site-builder/config.ini [Deployer] state_machine_arn`。
 
 **冒烟（手工触发一次 static 部署，验证执行器全链路）**：
@@ -2084,6 +2224,50 @@ cd site-builder/mcp
 python3 deploy_agentcore.py        # 建 ECR → buildx ARM64 → 推送 → 建角色 → 建/更新 runtime
 # 只改配置不重建镜像：python3 deploy_agentcore.py --skip-build
 ```
+
+> **⚠️ 全新账号的第一次很可能失败一次，而报文指向一个不存在的原因。**
+> 本脚本在**同一次运行**里先建 runtime 执行角色 `site-mcp-runtime-role`、紧接着调
+> `CreateAgentRuntime`，而 AgentCore 会当场校验那个角色能否拉 ECR 镜像 ⇒ 撞上新建
+> IAM 角色的传播延迟：
+>
+> ```
+> ValidationException: … CreateAgentRuntime … Access denied while validating ECR URI
+> '…@sha256:…'. The execution role requires permissions for ecr:GetAuthorizationToken,
+> ecr:BatchGetImage, and ecr:GetDownloadUrlForLayer operations.
+> ```
+>
+> **这个文案有三个可能成因，只有第三个需要你动手**（前两个本资产已经处理掉，
+> 但报文一模一样，所以先排除再怀疑）：
+>
+> | 成因 | 怎么排除 |
+> |---|---|
+> | 镜像是 buildx 的 attestation manifest | 脚本已固定 `--provenance=false`；核对：`aws ecr batch-get-image …` 读回应是单架构 OCI `image.manifest.v1+json` |
+> | 角色真的缺 ECR 权限 | 核对：`aws iam get-role-policy --role-name site-mcp-runtime-role --policy-name mcp-scope` 里应有 `ECRImageAccess` + `ecr:GetAuthorizationToken` |
+> | **新建角色还没传播**（全新账号独有） | 上面两条都符合就是它。**任何重部都不会撞**——那时角色早已存在 |
+>
+> **恢复办法只有一条，而且不是"重跑同一条命令"**：那次失败**已经把镜像推上 ECR** 了，
+> 于是重跑时脚本判"镜像已存在，复用"、跳过构建，接着撞上一道供应链守卫——它把 ECR 里
+> 该 tag 的 digest 与**当前 runtime 引用的** digest 比，而 runtime 根本还不存在
+> （那正是失败掉的东西）：
+>
+> ```
+> 拒绝复用 ECR 里已有的 tag git-…：
+>   该 tag 指向 sha256:…
+>   当前 runtime 指向 （无 runtime 或未按 digest 引用）
+> ```
+>
+> `--skip-build` 同样被这道守卫拦住。**正确做法是删掉那个 tag 再重跑**，让镜像是本机
+> 真的重新构建推上去的（buildx 缓存热，代价很小）：
+>
+> ```bash
+> aws ecr batch-delete-image --repository-name site-builder-mcp --region us-east-1 \
+>   --image-ids imageTag=<脚本第 ① 步打印的那个 git-… tag>
+> python3 deploy_agentcore.py
+> ```
+>
+> **不要用 `--trust-existing-image` 图省事。** tag 是从 commit SHA 派生的、可预测，
+> 而"没有 runtime 可比"恰恰就是分不清"我上次失败推的"与"别人抢占了这个 tag"的那一刻
+> ——这道守卫**唯一**真正有用的场景就是现在，绕过它等于把它删掉。
 
 脚本做的事（全部幂等）：ECR 仓库 → cp `deployer/functions/common.py` 进构建上下文 →
 `docker buildx --platform linux/arm64` 构建推送 → runtime 执行角色
@@ -2520,21 +2704,51 @@ UnrecognizedClientException: The security token included in the request is inval
 （可以先排除掉三个经典成因：副本区 `list-tables` 通不通、区域 opt-in 状态、
 `get-session-token` 在副本区是否成功。都通的话就是这条。）
 
-**处置：重跑同一条部署命令即可**（SLR 此后永久存在）。但**回滚会留下一张孤儿表**，
-让原地重试因名字冲突必然失败：`site-access-daily` 是 `RETAIN` + deletion protection，
-回滚时被打成 `DELETE_SKIPPED`——**这正是「统计数据不能被一次回滚删掉」这条不变量在
-起作用，不是缺陷**。重试前的清理步骤：
+**处置：清掉回滚留下的孤儿资源，然后重跑同一条部署命令**（SLR 此后永久存在）。
+回滚**不会**删掉 `RemovalPolicy.RETAIN` 的资源，它们被打成 `DELETE_SKIPPED`
+——**这正是「统计数据不能被一次回滚删掉」这条不变量在起作用，不是缺陷**。
+
+**孤儿的范围取决于这次是"首次 create"还是"存量 update"，别只清一张表**：
+
+- **存量重部**（栈已存在，只有 Global Table 是新资源）：回滚只把这一次新建的资源
+  打回去 ⇒ 通常只有 `site-access-daily` 一张孤儿表。
+- **全新账号首次 create**：**整栈回滚**，于是**这个栈里每一个 RETAIN 资源都成了孤儿**。
+  实测一次首建失败留下 **6 个**：`site-access-daily` / `site-admins` / `site-api-keys` /
+  `site-ops-log` 四张表（都是 RETAIN + deletion protection），**加两把会话签名 CMK**。
+
+先按下面这条把实际孤儿列出来，不要凭记忆清：
 
 ```bash
-# ① 确认它真的是空的——**必须实时 scan**：describe-table 的 ItemCount 有最多 6 小时延迟
-aws dynamodb scan --table-name site-access-daily --select COUNT --region us-east-1
-# ② 确认它不属于任何栈（describe-stack-resources 查不到 site-access 资源）
-# ③ 关掉 deletion protection，再删
-aws dynamodb update-table --table-name site-access-daily \
-  --no-deletion-protection-enabled --region us-east-1
-aws dynamodb delete-table --table-name site-access-daily --region us-east-1
-# ④ 读回确认不存在，然后重跑部署
+aws cloudformation describe-stack-resources --stack-name SiteDeployerStack --region us-east-1 \
+  --query 'StackResources[?ResourceStatus==`DELETE_SKIPPED`].[LogicalResourceId,PhysicalResourceId,ResourceType]' \
+  --output text
 ```
+
+**四张表：名字冲突 ⇒ 不清掉重试必失败**（症状响亮）。逐张按同一套做：
+
+```bash
+for T in site-access-daily site-admins site-api-keys site-ops-log; do
+  # ① 确认它真的是空的——**必须实时 scan**：describe-table 的 ItemCount 有最多 6 小时延迟
+  aws dynamodb scan --table-name "$T" --select COUNT --region us-east-1 --query Count --output text
+  # ② 关掉 deletion protection，再删
+  aws dynamodb update-table --table-name "$T" --no-deletion-protection-enabled --region us-east-1
+  aws dynamodb delete-table --table-name "$T" --region us-east-1
+done
+# ③ 读回确认全没了（首建失败时四张必然都是空表，但读回仍是纪律），然后重跑部署
+aws dynamodb list-tables --region us-east-1 --query TableNames
+```
+
+**两把 CMK：不冲突，所以完全无声——正因如此必须手工清。** key 的 **alias 不是 RETAIN**，
+回滚时已经被删掉了 ⇒ 重试会新建两把 key 和两个 alias、**一切正常**，而旧的那两把
+就那样躺在账号里：每把 $1/月，形态是"能签会话"（默认 key policy），却不在任何
+`[SessionKeys]` allowlist、也不在信任边界闸门的基线里。
+
+```bash
+# 上面那条 describe-stack-resources 输出里 AWS::KMS::Key 那两行的 PhysicalResourceId
+aws kms schedule-key-deletion --key-id <orphan_key_id> --pending-window-in-days 7 --region us-east-1
+```
+
+（前端桶 `site-frontend-{account_id}` 不在这个栈里——它由 ② 步骤 1 手工建，不受回滚影响。）
 
 ### 验收（部署完立刻跑，从仓库根）
 
@@ -3042,10 +3256,17 @@ python3 site-builder/scripts/verify_api_key_e2e.py
 所以排在第 5–7 条那三条业务链路之前。启用了 ⑤c 的采用者另跑 ⑤c 小节里的 `verify_oauth_and_impersonation.py`
 （它要的也是第 3 条那个 token）。
 
-**耗时（单账号实测；principal / 站点数与链路快慢决定量级，慢链路上大致翻倍）**：串行整轮约 26 分钟——
-第 1 条约 14 分钟（逐个 Lambda 下载产物做字节比对，全场最长），第 2 条约 4 分钟，第 3 条约 2.5 分钟
-（含两次 65 秒等路由更新可见），第 4 条不到 1 分钟，第 5 条与第 7 条各约 1.5 分钟，第 6 条约 2 分钟。
+**耗时（单账号实测；principal / 站点数与链路快慢决定量级，慢链路上大致翻倍）**：
+**成熟环境**串行整轮约 26 分钟——第 1 条约 14 分钟（逐个 Lambda 下载产物做字节比对，全场最长），
+第 2 条约 4 分钟，第 3 条约 2.5 分钟（含两次 65 秒等路由更新可见），第 4 条不到 1 分钟，
+第 5 条与第 7 条各约 1.5 分钟，第 6 条约 2 分钟。
 第 1 条在十几分钟里只零星打点，**输出停住不等于挂死**。
+
+> **首装当天会快一个数量级，别拿上面的数字判断"是不是卡住了"**：第 1、2 条的耗时几乎全部
+> 由**账号里有多少个 Lambda 与已发布版本**决定，而全新账号里只有平台自己那十几个、每个一个版本。
+> 全新账号实测：第 1 条约 **90 秒**（70 项）、第 2 条约 **20 秒**。站点数涨上去之后才会逼近
+> 上面那组数字。（第 1 条的项数也随组件数变化：不启用 ⑤c 时它跑 `[ApiKey]` 的 absence 断言，
+> 项数比启用时少。）
 
 **这七条不证明的**：账号里谁能 `kms:Sign` 两把 CMK、谁能改 auth / panel / Edge 的代码——那是账号信任边界，
 归下面的可选自检；per-site 角色与数据表的归属完整性归「S1 加固」一节的 `backfill_site_role_policies.py --check`
@@ -3085,8 +3306,17 @@ mkdir -p .scratch   # 下面 --dump-observed 的落点。闸门是原子写（�
                     # 全新 clone 里没有 .scratch/
 
 # 漂移闸门。基线不随资产分发（含单账号实测值，gitignored）⇒ **首跑只能生成基线、不出结论**：
+#   不带 --update-baseline 而基线不存在时它**退 1** 并告诉你就是这一步 —— 那不是失败，是首跑的形态。
+#   --update-baseline 会**先打印一遍完整比较报告再写**（新 key、新 principal 全列出来），
+#   所以"我接受了什么"有留痕；新条目 category=unclassified，需要人工标注。
 python3 site-builder/scripts/verify_account_trust_boundary.py --update-baseline
 # 之后每次部署后比一次；任何 added / removed / changed 都红，不判"改善"。
+# 未启用 ⑤c 时它会打一行 `组件缺席：site-key-proxy` 并把它从枚举里去掉（config 与线上**两边**
+# 都说不存在才跳过；只有一边说不存在是漂移，闸门响亮失败）。
+#
+# 生成基线**不会**让任何单元测试变红：你这份基线是单账号实测（gitignored），只被结构性检查，
+# 数值与 category 标注都不参与。`docs/security/account-trust-boundary.md` 里那组数字是
+# **参考部署**的，它跟一份 tracked 的计数快照对账，与你的账号无关——别拿它核对你自己的数字。
 # 密钥增减必须声明（--new-key / --retire-key，见轮转 runbook），否则一律红。
 python3 site-builder/scripts/verify_account_trust_boundary.py
 # 想看红条目对应哪些真实角色名：一次扫描落快照 + 多次离线重比（快照含账号内标识，只许落 .scratch/，按 0600 写）
@@ -3102,6 +3332,8 @@ python3 -u site-builder/scripts/probe_impersonation_surface.py \
 **耗时（单账号实测，principal 数决定量级）**：闸门约 11 分钟——几百个 principal × 3 次 IAM 模拟
 + **两次** `GetAccountAuthorizationDetails`（第二次是模拟后的窗口**两端**一致性复查，两端不一致就作废本轮、
 不出结论也不写基线；它不保证原子，三个已接受的盲区见风险文档）+ 扫 bootstrap 桶 + 逐版本校验 Edge 代码。
+**专用账号刚装完时会快得多**：`principal 数决定量级`不是修辞——一个只有本平台的新账号实测
+**55 个** principal、整轮约 **2 分 45 秒**。上面那个 11 分钟是共享账号（几百个 principal）的量级。
 探针约 5 分钟（脚本实测 4–6 分钟；链路慢时成倍变长——同一个账号上那个「约 11 分钟」的闸门实测过 28 分钟）。
 它用 `-u` 逐步打点；单次 AWS 调用的 `read_timeout` 是 120 秒，输出停住不到这个量级不算挂死，
 把它调小反而会把 `GetAccountAuthorizationDetails` 变成超时重试的假挂死。探针的 `--write-evidence` 会重写仓库里
@@ -3112,6 +3344,130 @@ python3 -u site-builder/scripts/probe_impersonation_surface.py \
 "集合能收到多小"的量测边界、以及为什么 SCP / resource policy / 应用层签名 / 收窄 invoke 都不成立，见风险文档。
 
 ---
+
+## 把平台从账号里拆掉（评估完想清干净时看这节）
+
+**顺序是有依赖的。** 平台的资源分三类，只有第二类跟着 CloudFormation 走：
+
+| 类 | 谁建的 | 栈删掉会怎样 |
+|---|---|---|
+| **站点自己的**（per-site IAM 角色、`site-data-*` 表、DSQL schema / role / IAM 映射、前端对象） | 执行器在建站时建 | **全部变孤儿** —— 一个都不在栈里 |
+| **两个 CFN 栈**（router、deployer） | `cdk deploy` | 大部分跟着走，但 `RemovalPolicy.RETAIN` 的**留下**（见下面第 ④ 步） |
+| **脚本建的平台件**（auth / panel / key-proxy 的 Lambda 与 Function URL、pre-token 触发器、MCP runtime、四个 IAM 角色、告警管道、Cognito 两个池、两个 SSM 参数、前端桶） | ①/auth/⑤/⑤b/⑤c 的部署脚本 | **一个都不会走** |
+
+所以顺序是「先站点 → 再脚本件 → 再栈 → 最后收孤儿」。跳过第 ① 步直接删栈是最常见的错法。
+
+### ① 先下线所有站点，而且要 `purge_data`
+
+不 purge 就只删路由/Lambda/前端，**数据侧全留**（这是刻意的防误删默认）。
+
+```bash
+# 有 owner 的站点走 MCP（Agent 客户端里，或用 scripts/_mcp_client.py）
+#   undeploy_site(site_id=…, purge_data=True)
+# 常驻夹具站点的 owner 是夹具域，MCP 认不了它 ⇒ 直接 invoke undeploy Lambda
+#   （它要求 jobs 表里先有一条 job 行）
+JOB=job-teardown-e2e-probe
+aws dynamodb put-item --table-name site-deploy-jobs --region us-east-1 --item \
+  "{\"job_id\":{\"S\":\"$JOB\"},\"site_id\":{\"S\":\"e2e-probe\"},\"owner\":{\"S\":\"probe@e2e.invalid\"},\"status\":{\"S\":\"PENDING\"}}"
+aws lambda invoke --function-name site-deployer-undeploy --region us-east-1 \
+  --cli-binary-format raw-in-base64-out \
+  --payload "{\"site_id\":\"e2e-probe\",\"job_id\":\"$JOB\",\"purge_data\":true}" /tmp/undeploy.json
+```
+
+**读回核对**（这四条全空才算站点侧干净）：`site-rt-*` 角色、DSQL 里 `site_%` 的 schema 与
+`sys.iam_pg_role_mappings`、前端桶的 `sites/` 前缀、`site-sites` 表里非 `DELETED` 的行。
+
+### ② 再删脚本建的平台件（都不在栈里）
+
+```bash
+# MCP runtime + ECR 仓库
+aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id <runtime_id> --region us-east-1
+aws ecr delete-repository --repository-name site-builder-mcp --region us-east-1 --force
+# 三个 Lambda（key-proxy 启用过的话第四个是 site-key-proxy）
+for FN in site-panel site-auth-service site-auth-pre-token; do
+  aws lambda delete-function-url-config --function-name $FN --region us-east-1 2>/dev/null
+  aws lambda delete-function --function-name $FN --region us-east-1
+done
+# 四个 IAM 角色（先清 inline / detach 托管策略）
+#   site-panel-role site-auth-service-role site-mcp-runtime-role site-builder-verifier
+# 告警管道（**这条的真名容易猜错**）
+aws cloudwatch delete-alarms --alarm-names site-builder-auth-invalid-grant --region us-east-1
+aws sns delete-topic --topic-arn arn:aws:sns:us-east-1:{account_id}:site-builder-alarms
+# Cognito：**托管域名要先删才能删池**，两个池各一个
+aws cognito-idp delete-user-pool-domain --domain <前缀> --user-pool-id <pool_id> --region us-east-1
+aws cognito-idp delete-user-pool --user-pool-id <pool_id> --region us-east-1
+# 两个 SSM 参数
+aws ssm delete-parameter --name /site-builder/site-client-secret --region us-east-1
+aws ssm delete-parameter --name /site-builder/login-flow-secret  --region us-east-1
+```
+
+> `m5-edge-analytics-failed-global` 与 `m5-rollup-no-successful-invocation-24h`
+> **属于 deployer 栈**，别手工删（下一步会带走）。
+
+### ③ 删两个栈
+
+```bash
+aws cloudformation delete-stack --stack-name ApplicationWebRouterStack --region us-east-1
+aws cloudformation delete-stack --stack-name SiteDeployerStack        --region us-east-1
+```
+
+deployer 栈约 **10 分钟**走完（`site-artifacts-*` 桶由自定义资源自动清空删除）。
+
+> **⚠️ router 栈第一次一定失败，这不是你做错了什么。** 分发已经删掉，但两个 Edge 函数的
+> **已发布版本**删不掉：
+>
+> ```
+> ApplicationWebRouterStack | DELETE_FAILED
+> "Lambda was unable to delete …:function:…-application-web-router:1 because it is a
+>  replicated function. Please see our documentation for Deleting Lambda@Edge Functions
+>  and Replicas."
+> ```
+>
+> AWS 要**几个小时**才把全球副本清完，而 CloudFormation 不等、当场失败并停在
+> `DELETE_FAILED`（`Distribution` 那时已经是 `DELETE_COMPLETE`）。**立刻重试仍然失败**。
+> 处置：**过几小时再跑同一条 `delete-stack`**（幂等）。stack policy 的 `Deny Update:*`
+> **不拦 DeleteStack**，所以这一步不需要先 `router_stack_policy.py open`。
+
+### ④ 最后收孤儿（**这一步最容易漏，而且有一半是无声的**）
+
+栈删完之后 `RemovalPolicy.RETAIN` 的资源全部留在账号里：
+
+```bash
+# 四张表（都带 deletion protection ⇒ 先关再删）
+for T in site-access-daily site-admins site-api-keys site-ops-log; do
+  aws dynamodb update-table --table-name "$T" --no-deletion-protection-enabled --region us-east-1
+  aws dynamodb delete-table --table-name "$T" --region us-east-1
+done
+```
+
+**两把会话签名 CMK 是无声的那一半**：它们同样 RETAIN，但**别指望按 alias 找**——alias
+不是 RETAIN，已经随栈删掉了。只能按 description 认，然后排期删除：
+
+```bash
+for K in $(aws kms list-keys --region us-east-1 --query 'Keys[].KeyId' --output text); do
+  aws kms describe-key --key-id "$K" --region us-east-1 \
+    --query 'KeyMetadata.[KeyId,KeyState,Description]' --output text
+done | grep 'site-builder session signing key'
+aws kms schedule-key-deletion --key-id <每一把> --pending-window-in-days 7 --region us-east-1
+```
+
+不收它们的代价：每把 **$1/月永久**，而且账号里躺着两把"能签会话"形态、默认 key policy、
+不在任何 allowlist 也不在闸门基线里的非对称 CMK。
+
+剩下的收尾（都不会自己走）：
+
+```bash
+aws s3 rm s3://site-frontend-{account_id} --recursive     # ② 步骤 1 手工建的，不在栈里
+aws s3api delete-bucket --bucket site-frontend-{account_id} --region us-east-1
+# Route53 的 *.{base_domain} 记录（DELETE 时要把 AliasTarget 原样写回去）
+# 日志组：/aws/lambda/site-*、/aws/lambda/us-east-1.ApplicationWebRouterStack-*（Edge 的在这里）、
+#         /aws/codebuild/site-package、/aws/bedrock-agentcore/runtimes/*
+# 最后（确认不再部署了）：CDKToolkit 栈与 cdk-hnb659fds-assets-* 桶
+```
+
+**收尾核对**：`aws dynamodb list-tables`、`aws lambda list-functions`、
+`aws cognito-idp list-user-pools`、`aws s3 ls`、`aws kms list-keys` 里都不该再有平台的东西
+（Edge 那两个函数会等 router 栈那次重试才消失）。
 
 ## 部署后回填检查清单
 

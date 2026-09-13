@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """控制台（M3 panel）真机端到端验收——spec §7 的 13 项。
 
-**为什么不是浏览器脚本**：13 项里只有"飞书同意页"与"cookie 落盘"必须真浏览器，
+**为什么不是浏览器脚本**：13 项里只有"IdP 同意页"与"cookie 落盘"必须真浏览器，
 其余全是 HTTP 层可判定的行为（302 / 403 / 401 / 404 / 200 + 响应形态 + 线上
 数据是否真被改）。用 HTTP 层做可以无人值守、可重复、失败点精确。真浏览器那两项
 在本脚本末尾列出来交给人工（同 `verify_auth_alarm.sh` 的 ② 段既有设计）。
@@ -566,7 +566,7 @@ def main() -> int:
     if FAILURES:
         return 1
     print("\n仍需人工在真浏览器里确认的两项（本脚本无法覆盖）：")
-    print(f"  · 完整登录流：无痕窗口开 {origin}/ → 飞书同意页 → 回到控制台首页")
+    print(f"  · 完整登录流：无痕窗口开 {origin}/ → 你的 IdP 登录/同意页 → 回到控制台首页")
     print("  · 浏览器真的接受了 __Host-sb_console（DevTools > Application > Cookies）")
     return 0
 

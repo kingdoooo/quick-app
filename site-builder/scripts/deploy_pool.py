@@ -549,8 +549,10 @@ def _pool_id_for_domain(cog, prefix: str) -> str | None:
     应当退化成"没查到"，而不是把整个部署打成崩溃）。
 
     注意效力边界：前缀是**跨账号全局唯一**的，被**别的账号**占用时这里同样返回
-    None（我们看不见别人的池）。那种情形留给 create_user_pool_domain 报错——
-    它的文案已经足够清楚，而 preflight 无法区分"没人用"与"别人在用"。
+    None（我们看不见别人的池），preflight 无法区分"没人用"与"别人在用"。
+    那种情形只能等 `create_user_pool_domain` 报错——但**它的原文是误导性的**
+    （"another user pool" 读起来像你自己那个池），所以由
+    `_die_on_domain_taken` 翻译成可行动的文案，不要原样抛给操作者。
     """
     try:
         desc = cog.describe_user_pool_domain(Domain=prefix)
@@ -649,8 +651,44 @@ def _ensure_pool(cog, base_domain: str, pool_name: str = POOL_NAME) -> str:
 MANAGED_LOGIN_V2 = 2
 
 
+_DOMAIN_TAKEN = "domain already associated with another user pool"
+
+# `--domain-prefix` 的出厂默认值。撞车的默认值等于"每个采用者都必然失败一次"，
+# 所以文案里要能点名它——引用 argparse 的 default 会绕一圈，这里直接钉住。
+DEFAULT_DOMAIN_PREFIX = "site-builder-auth"
+
+
+def _die_on_domain_taken(exc, prefix: str, pool_id: str, *, which: str) -> None:
+    """把 `create_user_pool_domain` 的前缀撞车翻译成可行动的文案。
+
+    **为什么必须翻译**：AWS 的原文是 "Domain already associated with another user
+    pool"，读起来像"**你自己的**那个池已经有域名了"（那反而是本函数上面
+    `existing` 那条分支处理的情形，走不到这里）。真实原因是托管域名前缀是**跨全部
+    AWS 账号**的一个全局命名空间，而这个名字属于**别人的账号**——我们看不见那个池，
+    所以 `_pool_id_for_domain` 的 preflight 结构上查不出来（它只能看见本账号）。
+
+    不是本条错误就原样抛回去（调用方 `raise`），别把无关的
+    InvalidParameterException 也吞成这段文案。
+    """
+    if _DOMAIN_TAKEN not in str(exc).lower():
+        return
+    hint = ("**这就是出厂默认值**——本方案的参考部署占着它，所以任何采用者裸跑都会"
+            f"撞上。换一个自己的前缀（把域名或组织名掺进去）。\n  "
+            if prefix == DEFAULT_DOMAIN_PREFIX else "")
+    raise SystemExit(
+        f"托管域名前缀 {prefix!r} 已被占用，中止（{which}）。\n  "
+        f"{hint}"
+        "Cognito 托管域名前缀是**跨全部 AWS 账号的全局命名空间**，这个名字属于"
+        "**别的账号**——AWS 的原文 'Domain already associated with another user pool' "
+        "读起来像你自己的池已有域名，那是误导。\n  "
+        "本账号里看不见别人的池，所以 preflight 结构上查不出这一条，只能在这里报。\n  "
+        f"池 {pool_id} 已经建好、只是还没有托管域名：换一个前缀重跑本脚本即可"
+        "（幂等，会按池名找回它并接着往下建）。")
+
+
 def _ensure_domain(cog, pool_id: str, prefix: str, *,
-                   managed_login_version: int | None = MANAGED_LOGIN_V2) -> str:
+                   managed_login_version: int | None = MANAGED_LOGIN_V2,
+                   which: str = "平台池") -> str:
     """建/纠正托管域名。
 
     **`ManagedLoginVersion` 属于 domain API，不是 client API**：
@@ -671,7 +709,11 @@ def _ensure_domain(cog, pool_id: str, prefix: str, *,
     if not existing:
         kw = ({"ManagedLoginVersion": managed_login_version}
               if managed_login_version is not None else {})
-        cog.create_user_pool_domain(Domain=prefix, UserPoolId=pool_id, **kw)
+        try:
+            cog.create_user_pool_domain(Domain=prefix, UserPoolId=pool_id, **kw)
+        except cog.exceptions.InvalidParameterException as exc:
+            _die_on_domain_taken(exc, prefix, pool_id, which=which)
+            raise
         print(f"  域名前缀 {prefix}"
               + (f"（managed login v{managed_login_version}）"
                  if managed_login_version is not None else "（classic hosted UI）"))
@@ -1327,7 +1369,8 @@ def main() -> None:
         print(f"②b 内置 IdP 池（mode = {IDP_MODE_COGNITO}）: {idp_pool_name}")
         idp_pool_id = _ensure_idp_pool(cog, idp_pool_name, idp_pool_existing)
         idp_domain = _ensure_domain(cog, idp_pool_id, idp_domain_prefix,
-                                    managed_login_version=None)
+                                    managed_login_version=None,
+                                    which="内置 IdP 池（[IdP] cognito_domain_prefix）")
         # 域名是异步创建的，而 ③ 的 create_identity_provider 要靠它解析端点 ——
         # 抢在前面的后果是静默的坏 provider（见 _wait_for_domain_active）。
         _wait_for_domain_active(cog, idp_domain)

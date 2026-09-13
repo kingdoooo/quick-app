@@ -709,34 +709,53 @@ def test_statement_fingerprint_normalizes_account_and_self():  # noqa: D401
 
 
 # --------------------------------------------------------------------------
-# 文档与基线不许各说一套
+# 文档与**参考计数快照**不许各说一套
+#
+# 这一层曾经是"文档 vs 本机基线"，而基线自 3c-final 起是 gitignored 的**单账号**实测
+# （每个采用者自己一份）。于是工单 14 在全新账号上撞出这个形态：采用者照 DEPLOY.md ⑦
+# 跑一次 `--update-baseline`，本机基线就变成了他自己账号的数字 + 一堆
+# `category=unclassified`（脚本按设计这么写），deployer 套件当场红两条——其中一条还在
+# 要求他去改 `docs/security/account-trust-boundary.md`，可那是**参考部署的决策记录**
+# （文件头自己写着"不是操作指引"），方向完全反了。
+#
+# 修法：维护者的不变量本来就只关于**两份 tracked 物**——"我发布的数字"与"我文档里写的
+# 数字"别各说一套。所以计数搬进 `account-trust-boundary-reference-counts.json`（只有
+# 计数、无账号内标识 ⇒ 可 tracked），这一层比"文档 ⇄ 快照"，与本机有没有基线无关。
+# 本机基线那一侧只剩**结构**检查（下面 test_local_baseline_structure_only），不查数值、
+# 不要求 category 已标注。维护者要核对"快照是否等于参考账号的实测"时，用
+# SB_TRUST_BASELINE_IS_REFERENCE=1 打开最后那条 opt-in 用例。
 # --------------------------------------------------------------------------
 
-def test_doc_counts_come_from_the_baseline():
-    """风险模型文档里的数字必须与基线文件算出来的一致。
+_REF_COUNTS = _ROOT / "docs" / "security" / "account-trust-boundary-reference-counts.json"
 
-    这条防的是文档腐烂：基线更新了而文档还写着旧数字时，读文档的人会以为
-    集合没变——而"集合别再长"正是这个闸门存在的唯一理由。这一轮它就抓住了
-    两次：41→62（补上 CDK asset 那条路）、62→63（补上 `ssm:GetParameters`）。
+# 类别名 → 标记里的 slug（标记名不能带连字符以外的怪字符，统一成下划线）
+_CATEGORY_SLUGS = {"platform": "platform", "platform-overbroad": "platform_overbroad",
+                   "admin": "admin", "break-glass": "break_glass",
+                   "cdk-admin": "cdk_admin", "cdk-readonly": "cdk_readonly",
+                   "unrelated-workload": "unrelated"}
 
-    断言的形态是 `<数字> <!-- baseline:标签=<数字> -->`：**正文里显示的那个数字
-    必须紧挨着标记**。只校验标记的话，标记与正文可以各写一个数，那就白防了。
-    """
-    g = _gate()
-    data = _baseline_data()
+# 守卫认得的全部标签。**快照的键集合必须与它逐字相等**——否则新加一个类别时，
+# 它会既不进快照也不进文档，而两边都"一致"⇒ 这一层静默漏掉一整类。
+_COUNT_LABELS = ("A总数", "可签会话", "非平台可直调", "kms_key数",
+                 "B持有IAM写语句", "仅IAM写",
+                 *(f"类别_{slug}" for slug in _CATEGORY_SLUGS.values()))
+
+
+def _reference_counts() -> dict:
+    return json.loads(_REF_COUNTS.read_text(encoding="utf-8"))["counts"]
+
+
+def _counts_from_baseline(g, data: dict) -> dict:
+    """从一份基线算出那组计数。维护者刷新快照时用的就是这个口径。"""
     principals = data["principals"]
+
     def count(pred):
         return sum(1 for p in principals.values() if pred(p))
 
     def has_prefix(p, prefix):
         return any(x.startswith(prefix) for x in p["grants"])
 
-    # 类别名 → 标记里的 slug（标记名不能带连字符以外的怪字符，统一成下划线）
-    category_slugs = {"platform": "platform", "platform-overbroad": "platform_overbroad",
-                      "admin": "admin", "break-glass": "break_glass",
-                      "cdk-admin": "cdk_admin", "cdk-readonly": "cdk_readonly",
-                      "unrelated-workload": "unrelated"}
-    expected = {
+    return {
         # ---- A：直接失守（headline）----
         "A总数": len(principals),
         # 3c-final：`is_secret_grant` 现在就是 KMS 那两类（能签 / 能让自己能签）
@@ -747,29 +766,85 @@ def test_doc_counts_come_from_the_baseline():
                  or has_prefix(p, f"{g.G_INVOKE_SITE}:"))),
         "kms_key数": len(data["kms"]),
         # ---- B：IAM 写观察。**不进 A 的人数**——"持有一条未证明可提权的 IAM 写语句"
-        #      与"现在就能拿密钥"是两种风险，相加当成一个数字正是这一轮要消掉的错误。
+        #      与"现在就能拿密钥"是两种风险，相加当成一个数字正是当初要消掉的错误。
         "B持有IAM写语句": len(data["iam_write_statements"]),
         "仅IAM写": len(set(data["iam_write_statements"]) - set(principals)),
-        # ---- 按类别：原先是**裸数字**（`无关工作负载` 那个曾经是 38，A 收缩后成了 36），
-        #      这一轮全部加上标记，让文档腐烂测得出来。
         **{f"类别_{slug}": count(lambda p, c=cat: p["category"] == c)
-           for cat, slug in category_slugs.items()},
+           for cat, slug in _CATEGORY_SLUGS.items()},
     }
+
+
+def test_reference_counts_snapshot_covers_exactly_the_known_labels():
+    """快照的键集合 == 守卫认得的标签集合。
+
+    少一个：那个数字既不进快照也不进文档，"文档 ⇄ 快照一致"于是对它恒真 ⇒ 整类漏掉。
+    多一个：文档里没有对应标记，下面那条会红，但先在这里说清是拼写问题。
+    """
+    assert set(_reference_counts()) == set(_COUNT_LABELS), (
+        f"缺 {sorted(set(_COUNT_LABELS) - set(_reference_counts()))} / "
+        f"多 {sorted(set(_reference_counts()) - set(_COUNT_LABELS))}")
+
+
+def test_doc_counts_come_from_the_reference_snapshot():
+    """风险模型文档里的数字必须与 tracked 的参考计数快照一致。
+
+    这条防的是文档腐烂：发布的数字变了而文档还写着旧数字时，读文档的人会以为集合没变
+    ——而"集合别再长"正是这个闸门存在的唯一理由。它抓住过两次：
+    41→62（补上 CDK asset 那条路）、62→63（补上 `ssm:GetParameters`）。
+
+    断言的形态是 `<数字> <!-- baseline:标签=<数字> -->`：**正文里显示的那个数字
+    必须紧挨着标记**。只校验标记的话，标记与正文可以各写一个数，那就白防了。
+    """
     doc = _DOC.read_text(encoding="utf-8")
-    for label, n in expected.items():
+    for label, n in _reference_counts().items():
         needle = f"{n} <!-- baseline:{label}={n} -->"
         assert needle in doc, (
-            f"文档里 {label} 与基线不符（基线算出 {n}，期望正文出现 {needle!r}）"
-            f"——更新基线时必须同步文档，否则两处各说一套")
+            f"文档里 {label} 与参考快照不符（快照写 {n}，期望正文出现 {needle!r}）"
+            f"——改了快照必须同步文档，两份都是 tracked，一起进同一个提交")
 
 
-def test_no_unclassified_principal_in_baseline():
-    """基线里不许留 unclassified：类别决定了「这条是既定信任模型还是暴露面」，
-    留空就等于把判断推给下一个读文档的人，而上面那条文档计数会跟着失真。"""
-    principals = _baseline_data()["principals"]
-    unlabeled = [fp for fp, p in principals.items()
-                 if p.get("category") in (None, "", "unclassified")]
-    assert not unlabeled, f"这些指纹还没标 category：{unlabeled}"
+def test_reference_snapshot_has_no_unclassified_bucket():
+    """快照里不许出现 unclassified 那一类：类别决定了「这条是既定信任模型还是暴露面」，
+    留空等于把判断推给下一个读文档的人，而上面那条文档计数会跟着失真。
+
+    注意作用域是**参考快照**，不是采用者本机的基线——新生成的基线按设计全是
+    unclassified（脚本自己打印"新条目 category=unclassified，请人工标注"），
+    拿那个当判据就是工单 14 撞到的那条假红。
+    """
+    counts = _reference_counts()
+    bogus = {k: v for k, v in counts.items()
+             if k.startswith("类别_") and "unclassified" in k and v}
+    assert not bogus, f"参考快照里还有未标注类别：{bogus}"
+
+
+def test_local_baseline_structure_only():
+    """本机基线（gitignored、单账号）只查**结构**：分节齐、schema 同版本、
+    category 是已知词表里的值**或** unclassified。
+
+    **刻意不查数值、不要求已标注**：那是参考部署的事（上面三条）。采用者照
+    DEPLOY.md ⑦ 跑一次 `--update-baseline` 之后，这条必须仍然绿。
+    """
+    g = _gate()
+    data = _baseline_data()          # 无基线时 skip
+    _assert_baseline_sections(g, data)
+    known = set(_CATEGORY_SLUGS) | {"unclassified", None, ""}
+    bad = {fp: p.get("category") for fp, p in data["principals"].items()
+           if p.get("category") not in known}
+    assert not bad, f"基线里有不认识的 category（词表之外）：{bad}"
+
+
+@pytest.mark.skipif(not os.environ.get("SB_TRUST_BASELINE_IS_REFERENCE"),
+                    reason="只对**参考部署**的基线成立；设 SB_TRUST_BASELINE_IS_REFERENCE=1 打开")
+def test_reference_counts_match_the_local_baseline():
+    """维护者刷新快照时的对账用例（默认 skip）。
+
+    在参考账号上跑完 `--update-baseline` 之后带 `SB_TRUST_BASELINE_IS_REFERENCE=1` 跑它，
+    就能证明"快照里那组数字确实等于参考账号的实测"，然后把新数字同时写进快照与文档。
+    它**不是**主守卫（主守卫是"文档 ⇄ 快照"那条，与本机无关）——所以它默认不跑，
+    采用者的本机基线不会因为它变红。
+    """
+    g = _gate()
+    assert _counts_from_baseline(g, _baseline_data()) == _reference_counts()
 
 
 def test_baseline_schema_is_current():
@@ -4457,3 +4532,92 @@ def test_edge_current_version_needs_the_distribution_output_and_a_router_config(
     (tmp_path / "router" / "config.ini").unlink()
     with pytest.raises(SystemExit, match="读不到任何段"):
         g.edge_current_version(clients)
+
+
+# --------------------------------------------------------------------------
+# 可选组件（⑤c API Key）缺席时，闸门必须能跑——而且只在**两边都说不存在**时才跳过。
+#
+# 工单 14 实测：`PLATFORM_FUNCTION_NAMES` 无条件含 `site-key-proxy`，而 `[ApiKey]` 段
+# 缺席（**手册推荐的默认**）时那个函数不存在 ⇒ `function_aliases` 的 `list_aliases`
+# 抛 `ResourceNotFoundException`、闸门退 1。也就是说这个采用者面向的闸门对推荐默认
+# 配置结构上跑不起来。修复不能是"查不到就跳过"：那会让"config 说启用却没部"和
+# "没声明却在跑"两种真漂移一起静默。
+# --------------------------------------------------------------------------
+class _FakeLambdaExistence:
+    class exceptions:
+        class ResourceNotFoundException(Exception):
+            pass
+
+    def __init__(self, existing):
+        self._existing = set(existing)
+        self.asked = []
+
+    def get_function(self, FunctionName):
+        self.asked.append(FunctionName)
+        if FunctionName not in self._existing:
+            raise self.exceptions.ResourceNotFoundException(FunctionName)
+        return {"Configuration": {"FunctionName": FunctionName}}
+
+
+def _cfg_with(sections):
+    import configparser
+    cfg = configparser.ConfigParser(interpolation=None)
+    for s in sections:
+        cfg.add_section(s)
+    return cfg
+
+
+_PLATFORM = ("site-panel", "site-key-proxy", "site-auth-service")
+
+
+def test_optional_function_dropped_when_config_and_account_both_say_absent(capsys):
+    """推荐默认形态：无 [ApiKey] 段、线上也没有那个函数 ⇒ 去掉它并打一行说明。"""
+    g = _gate()
+    lam = _FakeLambdaExistence({"site-panel", "site-auth-service"})
+    keep = g.resolve_optional_functions(lam, _cfg_with(["Platform"]), _PLATFORM)
+    assert keep == ("site-panel", "site-auth-service")
+    assert "组件缺席" in capsys.readouterr().out
+    # 只对**可选**的那个做存在性探测——别把整份平台清单都拿去问 AWS
+    assert lam.asked == ["site-key-proxy"]
+
+
+def test_optional_function_kept_when_enabled_and_present():
+    """启用且线上有 ⇒ 照常枚举（正对照：修复没把它永久排除掉）。"""
+    g = _gate()
+    lam = _FakeLambdaExistence(set(_PLATFORM))
+    keep = g.resolve_optional_functions(lam, _cfg_with(["Platform", "ApiKey"]), _PLATFORM)
+    assert keep == _PLATFORM
+
+
+def test_enabled_in_config_but_missing_online_is_loud():
+    """漂移方向一：config 说启用、线上什么都没有 ⇒ 不许对不完整的部署出结论。"""
+    g = _gate()
+    lam = _FakeLambdaExistence({"site-panel", "site-auth-service"})
+    with pytest.raises(SystemExit, match="不存在"):
+        g.resolve_optional_functions(lam, _cfg_with(["Platform", "ApiKey"]), _PLATFORM)
+
+
+def test_present_online_but_undeclared_in_config_is_loud():
+    """漂移方向二：一个没被 config 声明的公网组件在跑，而它正是闸门要数进冒充面的东西。"""
+    g = _gate()
+    lam = _FakeLambdaExistence(set(_PLATFORM))
+    with pytest.raises(SystemExit, match="没有 \\[ApiKey\\] 段"):
+        g.resolve_optional_functions(lam, _cfg_with(["Platform"]), _PLATFORM)
+
+
+def test_non_optional_missing_function_is_not_tolerated():
+    """**刻意不做**的那件事：非可选平台函数缺席不该被这个机制吃掉。
+    它必须原样留在枚举里，让后面的 AWS 调用照常炸——那是"部署不完整"，不是"组件没启用"。"""
+    g = _gate()
+    lam = _FakeLambdaExistence({"site-key-proxy"})   # site-panel / auth-service 都不存在
+    keep = g.resolve_optional_functions(lam, _cfg_with(["Platform", "ApiKey"]), _PLATFORM)
+    assert "site-panel" in keep and "site-auth-service" in keep
+
+
+def test_optional_functions_table_names_only_real_platform_functions():
+    """`OPTIONAL_FUNCTIONS` 的键必须真的在 `PLATFORM_FUNCTION_NAMES` 里。
+    写错名字的后果是静默的：那个键永不命中，闸门退回崩溃前的行为。"""
+    g = _gate()
+    assert set(g.OPTIONAL_FUNCTIONS) <= set(g.platform_function_names()), (
+        f"OPTIONAL_FUNCTIONS 里有不属于平台清单的名字："
+        f"{set(g.OPTIONAL_FUNCTIONS) - set(g.platform_function_names())}")

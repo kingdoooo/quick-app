@@ -214,6 +214,14 @@ EDGE_ORIGIN_RESPONSE_FN = "ApplicationWebRouterStack-origin-response"
 # （3c-final 之后这仍是一条冒充路：换掉 verifier 就等于自己定义谁是谁）完全在视野外。
 EDGE_FUNCTIONS = (EDGE_ORIGIN_REQUEST_FN, EDGE_ORIGIN_RESPONSE_FN)
 
+# `PLATFORM_FUNCTION_NAMES` 里属于**可选组件**的那些：config.ini 没有对应段时整个组件
+# 不存在，账号里根本没有这个函数。**闸门必须容忍它缺席，但只在"配置也说它不该在"时**。
+# 不容忍的后果实测过（工单 14，全新账号 + 推荐的 OAuth-only 形态）：`function_aliases`
+# 的 `list_aliases` 直接 `ResourceNotFoundException` 崩掉，整个闸门退 1 ——
+# 也就是说这个**采用者面向**的闸门对**推荐默认配置**结构上跑不起来。
+# 形态：`{函数名: 判定该组件是否启用的 (section, 说明)}`。
+OPTIONAL_FUNCTIONS = {"site-key-proxy": ("ApiKey", "⑤c API Key 交换层")}
+
 # ---- grant 词表 ----------------------------------------------------------
 # grant 是 `种类[:资源]` 形态的字符串，进基线文件。改词表等于基线全量漂移。
 G_INVOKE_PLATFORM = "invoke-platform"      # + ":<函数名>"
@@ -1556,6 +1564,56 @@ def platform_function_names(app_py: Path = APP_PY) -> tuple[str, ...]:
     raise SystemExit(f"{app_py} 里找不到 PLATFORM_FUNCTION_NAMES——闸门会空转")
 
 
+def _function_exists(lam, name: str) -> bool:
+    try:
+        lam.get_function(FunctionName=name)
+        return True
+    except lam.exceptions.ResourceNotFoundException:
+        return False
+
+
+def resolve_optional_functions(lam, cfg, names) -> tuple[str, ...]:
+    """把 `names` 里**可选组件**的函数按"配置 + 线上"两边核对后再决定要不要枚举。
+
+    **两个方向都 fail closed**，不是"查不到就跳过"：
+
+      · 配置里**有**那一段（组件启用）而线上函数**不存在** ⇒ 响亮失败。那是真漂移
+        （config 说启用、却什么都没部），静默跳过会让闸门对着一个不完整的部署出结论。
+      · 配置里**没有**那一段（组件不存在是合法状态、也是推荐默认）而线上函数**存在**
+        ⇒ 同样响亮失败。那是反方向的漂移：一个没被配置声明的公网组件正在跑，
+        而它恰恰是本闸门要数进冒充面的东西。
+      · 配置没有那一段、线上也没有 ⇒ 从枚举里去掉，并打一行说明。
+
+    **不做的事**：不对**非**可选的平台函数做存在性探测。那些缺席就是部署不完整，
+    应该让原来的 `ResourceNotFoundException` 照常炸出来——把它一并"容忍"掉等于
+    让闸门在半个平台上安静地出结论。
+    """
+    keep, dropped = [], []
+    for name in names:
+        spec = OPTIONAL_FUNCTIONS.get(name)
+        if spec is None:
+            keep.append(name)
+            continue
+        section, label = spec
+        enabled = cfg.has_section(section)
+        exists = _function_exists(lam, name)
+        if enabled and not exists:
+            raise SystemExit(
+                f"config.ini 有 [{section}] 段（{label} 已启用）但线上函数 {name} 不存在——"
+                f"闸门拒绝对着一个不完整的部署出结论。先把该组件部完，或删掉 [{section}] 段。")
+        if not enabled and exists:
+            raise SystemExit(
+                f"线上存在函数 {name}（{label}）但 config.ini 没有 [{section}] 段——"
+                f"这是一个没被配置声明的组件在跑，而它正是本闸门要数进冒充面的东西。"
+                f"要么补回 [{section}] 段，要么按 DEPLOY.md「下线这个组件」把它摘掉。")
+        (keep if exists else dropped).append(name)
+    for name in dropped:
+        section, label = OPTIONAL_FUNCTIONS[name]
+        print(f"  组件缺席：{name}（{label}）——config.ini 无 [{section}] 段，"
+              f"线上也确实没有，已从枚举中去掉")
+    return tuple(keep)
+
+
 def read_config(path: Path = CONFIG_PATH) -> configparser.ConfigParser:
     cfg = configparser.ConfigParser(interpolation=None)
     cfg.read(path, encoding="utf-8")
@@ -2096,8 +2154,11 @@ def measure(region: str, *, workers: int = 4) -> dict:
 
     # 平台函数 = deployer 栈的清单（AST 取，不手抄）+ router 栈的两个 Edge 函数。
     platform = platform_function_names() + EDGE_FUNCTIONS
+    # **`sites` 的排除名单用未过滤的 `platform`**：可选组件的函数即使这次不枚举，也绝不能
+    # 被当成"用户站点"（那会让它落进 invoke-site 的计数里，语义完全错）。过滤只作用于
+    # 后面按名字逐个问 AWS 的那些调用。
     sites = site_function_names(lam, platform)
-    all_functions = list(platform) + list(sites)
+    all_functions = list(resolve_optional_functions(lam, cfg, platform)) + list(sites)
 
     def fn_arn(n: str) -> str:
         return f"arn:aws:lambda:{region}:{account}:function:{n}"

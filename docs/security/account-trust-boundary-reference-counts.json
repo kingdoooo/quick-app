@@ -1,0 +1,28 @@
+{
+  "_note": [
+    "参考部署的账号信任边界计数。**只有计数，没有任何账号内标识**——所以它可以 tracked。",
+    "它的唯一用途：让 docs/security/account-trust-boundary.md 正文里的数字有一个 tracked 的对账对象。",
+    "为什么不直接拿本机基线对账：基线是 gitignored 的**单账号**实测（每个采用者自己一份），",
+    "拿它当判据会让「采用者跑一次 --update-baseline」把维护者的文档不变量变成红灯，",
+    "而那条不变量真正要说的是「两份 tracked 物之间别各说一套」——与本机状态无关。",
+    "维护者更新这份快照的办法：先在参考账号上跑 verify_account_trust_boundary.py --update-baseline，",
+    "再用 SB_TRUST_BASELINE_IS_REFERENCE=1 跑 test_reference_counts_match_the_local_baseline 核对，",
+    "然后把新数字同时写进本文件与那份文档（两处一起进同一个提交，review 时看得见）。",
+    "键名就是文档里 `<!-- baseline:标签=数字 -->` 标记的标签，必须与守卫算出来的标签集合完全一致。"
+  ],
+  "counts": {
+    "A总数": 37,
+    "可签会话": 15,
+    "非平台可直调": 18,
+    "kms_key数": 2,
+    "B持有IAM写语句": 22,
+    "仅IAM写": 6,
+    "类别_platform": 6,
+    "类别_platform_overbroad": 0,
+    "类别_admin": 3,
+    "类别_break_glass": 1,
+    "类别_cdk_admin": 3,
+    "类别_cdk_readonly": 3,
+    "类别_unrelated": 21
+  }
+}

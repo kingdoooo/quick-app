@@ -372,6 +372,86 @@ def test_existing_domain_with_v1_is_upgraded():
         assert dp._ensure_domain(cog, "us-east-1_test", "pfx") == "old"
 
 
+# --- 托管域名前缀撞车：AWS 原文误导，必须翻译（工单 14 实测） ---
+# 前缀是**跨全部 AWS 账号**的全局命名空间，而出厂默认值被参考部署占着 ⇒ 每个采用者
+# 裸跑 deploy_pool.py 都会撞上。AWS 的原文 "Domain already associated with another
+# user pool" 读起来像"**你自己的**池已经有域名了"（那条其实走 existing 分支、到不了
+# 这里），于是操作者会去查自己的池而不是换前缀。本账号看不见别人的池 ⇒
+# _pool_id_for_domain 的 preflight 结构上查不出这一条，只能在写失败时翻译。
+
+
+class _FakeDomainTaken:
+    """describe_user_pool 说"池还没有域名"，create_user_pool_domain 抛前缀撞车。"""
+
+    class exceptions:
+        class InvalidParameterException(Exception):
+            pass
+
+    def __init__(self, message):
+        self._message = message
+
+    def describe_user_pool(self, **_):
+        return {"UserPool": {}}
+
+    def create_user_pool_domain(self, **_):
+        raise self.exceptions.InvalidParameterException(self._message)
+
+
+_AWS_TAKEN_MESSAGE = (
+    "An error occurred (InvalidParameterException) when calling the "
+    "CreateUserPoolDomain operation: Domain already associated with another user pool.")
+
+
+def test_domain_prefix_taken_by_another_account_is_translated():
+    """撞车必须变成 SystemExit，且文案要点出"全局命名空间 / 别的账号 / 换前缀重跑"。"""
+    cog = _FakeDomainTaken(_AWS_TAKEN_MESSAGE)
+    with pytest.raises(SystemExit) as ei:
+        dp._ensure_domain(cog, "us-east-1_test", "acme-auth")
+    msg = str(ei.value)
+    assert "acme-auth" in msg
+    assert "全局命名空间" in msg, msg
+    assert "别的账号" in msg, msg
+    # 可行动的那半句：池已经建好了，换前缀重跑即可（幂等），不需要清理
+    assert "重跑" in msg, msg
+    assert "us-east-1_test" in msg, msg
+
+
+def test_domain_prefix_taken_names_the_shipped_default():
+    """撞的是出厂默认值时要额外点名它——那是"每个采用者必然踩一次"的那条。"""
+    cog = _FakeDomainTaken(_AWS_TAKEN_MESSAGE)
+    with pytest.raises(SystemExit) as ei:
+        dp._ensure_domain(cog, "us-east-1_test", dp.DEFAULT_DOMAIN_PREFIX)
+    assert "出厂默认值" in str(ei.value), str(ei.value)
+    # 反面：换了前缀就不该再提默认值那句，否则文案在正常撞车时是噪音
+    cog2 = _FakeDomainTaken(_AWS_TAKEN_MESSAGE)
+    with pytest.raises(SystemExit) as ei2:
+        dp._ensure_domain(cog2, "us-east-1_test", "acme-auth")
+    assert "出厂默认值" not in str(ei2.value), str(ei2.value)
+
+
+def test_default_domain_prefix_matches_argparse_default():
+    """`DEFAULT_DOMAIN_PREFIX` 是钉住的字面量。它与 `--domain-prefix` 的 default 一漂移，
+    上面那条"点名出厂默认值"的文案就会挂在错误的前缀上（或永不触发）。"""
+    import pathlib
+    import re as _re
+
+    src = pathlib.Path(dp.__file__).read_text(encoding="utf-8")
+    m = _re.search(r'"--domain-prefix",\s*default="([^"]+)"', src)
+    assert m, "找不到 --domain-prefix 的 default（argparse 那行改过了？）"
+    assert m.group(1) == dp.DEFAULT_DOMAIN_PREFIX, (
+        f"argparse default={m.group(1)!r} 与 DEFAULT_DOMAIN_PREFIX="
+        f"{dp.DEFAULT_DOMAIN_PREFIX!r} 漂移了")
+
+
+def test_unrelated_invalid_parameter_still_propagates():
+    """正面对照（mutation guard）：不是撞车的 InvalidParameterException 必须原样抛出，
+    否则这段翻译会把任意配置错误都伪装成"换个前缀就好"。"""
+    cog = _FakeDomainTaken("InvalidParameterException: 1 validation error detected: "
+                           "Value at 'domain' failed to satisfy constraint")
+    with pytest.raises(_FakeDomainTaken.exceptions.InvalidParameterException):
+        dp._ensure_domain(cog, "us-east-1_test", "Bad_Prefix")
+
+
 # --- 幂等重跑不得重置线上配置（Codex review P2） ---
 # UpdateUserPoolClient 是整体替换语义：官方明示未提供的参数会被设回默认值。
 # 只发脚本声明的字段会把运营/安全加固静默打回默认，其中

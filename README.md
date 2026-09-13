@@ -27,6 +27,30 @@ Cognito 池当身份源，飞书只是其中一种参考适配器）。
 > 更细的逐任务进度与实测发现记在仓库内的 `docs/design/`，那些文件**不随仓库分发**
 > （含真实账号与资源值，git-ignored）——所以本文件与 DEPLOY.md 才是对外的口径真源。
 
+## 版本
+
+当前发布版本 **v1.0.0** —— 一期建站链路 + 二期全部里程碑（自助控制台、API Key 交换层、
+访问统计、blue/green 原子切换）+ 加固包，全部包含在内。这个 tag 是一次**全新沙箱账号
+上只看 `site-builder/DEPLOY.md` 从零走通**的出口验收所对应的状态。
+
+### 从 tag 部署
+
+```bash
+git clone <本仓库> quick-app
+cd quick-app
+git checkout v1.0.0
+```
+
+然后照 [site-builder/DEPLOY.md](site-builder/DEPLOY.md) 走：§0 前置要求 → 「CDK bootstrap」
+→ 「部署顺序总览」→ 各阶段 → 「⑦ 部署后验收」。**`git clone` 拿不到能跑的环境**，
+仓库外还有几样东西要先恢复（两个 Python 解释器、两份 `config.ini`、五个 venv、
+宿主 `python3` 的三个包），清单见 [CLAUDE.md](CLAUDE.md) 的「仓库外的几样东西」。
+
+首次部署的实测耗时、以及这条路上**必然**撞到的三处（托管域名前缀撞车、首建 Global Table
+的 SLR 竞态、AgentCore 首次建 runtime 的 IAM 传播）都写在 DEPLOY.md §0
+「首次部署要多久，以及必然撞到的几处」——那三处的报文都指向错误的原因，撞到时按手册核对，
+不要照字面去查。
+
 ## 架构
 
 <!-- tool-list:begin  ② 那格的工具面由 site-builder/mcp/tests/test_doc_tool_surface.py
@@ -137,9 +161,13 @@ KMS 非对称 CMK 由执行器（④）那个 CDK 栈创建（每把 $1/月 + `k
 
 1. **备齐前置**：照 [site-builder/DEPLOY.md](site-builder/DEPLOY.md) §0 的就绪清单
    逐项确认，并从两份 `config.ini.example` 复制出自己的配置。
-2. **部署**：照同文档七个阶段执行
-   （①身份层 → ②路由 → ③DSQL → ④执行器 → ⑤MCP → ⑥客户端 → ⑦部署后验收）；
-   每阶段产出的 ARN/ID 按手册回填 `site-builder/config.ini`。
+2. **部署**：照同文档执行。**注意小节编号不是执行顺序**——全新账号的顺序是
+   ①身份层 → ③DSQL → ④执行器（**第一次**，只为建两把 CMK）→ 回填 `[SessionKeys]`
+   → ②路由 → 回填 `edge_role_arn` → ④执行器（**第二次**）→ auth → ⑤MCP → ⑤b控制台
+   → 夹具站点 → ⑥客户端 → ⑦部署后验收。
+   ④ 要部两次是一个真实的环形依赖，**漏掉第二次是无声的**（要到第一次真实建站才炸）；
+   权威顺序图见 DEPLOY.md「部署顺序总览」。每阶段产出的 ARN/ID 按手册回填
+   `site-builder/config.ini`。
 3. **验收**：⑦ 的验收集（七条分发的闸门，同文档「部署后验收」一节；未启用 API Key 组件时第七条报「组件缺席」而非跳过）全绿即部署完成；
    演示叙事见实施计划 Task 23。
 4. **仍未交付的候选**：Python 站点 runtime（当前仅 Node.js 后端）、精细缓存
