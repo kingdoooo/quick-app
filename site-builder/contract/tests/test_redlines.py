@@ -1041,3 +1041,36 @@ def test_replayable_redline_applies_to_schema_and_migrations(tmp_path):
     v = scan_redlines(d, m)
     assert any("backend/schema.sql" in s and "不可重放" in s for s in v), v
     assert any("migrations/001_seed.sql" in s and "不可重放" in s for s in v), v
+
+
+def test_validator_and_executor_agree_on_migration_scope():
+    """校验器与执行器对"哪些迁移文件算数"必须口径一致（跨包漂移守卫）。
+
+    `_dsql_sql_files` 的 docstring 明写"校验器多扫或少扫都会与真实行为不符"。这条把
+    两侧的三个约定钉在一起：
+      ① 命名形态：两边用同一个正则字面量 `^\\d{3}_.+\\.sql$`；
+      ② 列举范围：执行器带 `Delimiter="/"`（只看直下层），校验器用非递归 glob 且拒子目录；
+      ③ 分页：执行器用 paginator（单次 list_objects_v2 只回 1000 条且**静默截断**）。
+    任一侧改了列举/匹配规则，这条会红。
+    """
+    import inspect
+    from contract import redlines
+    executor = (Path(__file__).parents[2] / "deployer" / "functions"
+                / "provision_dsql.py").read_text(encoding="utf-8")
+
+    # ① 命名形态：同一个正则字面量出现在两侧
+    naming = r"^\d{3}_.+\.sql$"
+    assert naming in inspect.getsource(redlines._dsql_sql_files), \
+        "校验器的迁移命名正则变了"
+    assert naming in executor, "执行器的迁移命名正则与校验器不一致"
+
+    # ② 列举范围：执行器只看直下层；校验器非递归且拒子目录
+    assert 'Delimiter="/"' in executor, \
+        "执行器列举迁移必须带 Delimiter='/'，否则会执行校验器没扫过的子目录 SQL"
+    src = inspect.getsource(redlines)
+    assert 'migrations.glob("*.sql")' in src, "校验器的 glob 不该变成递归 rglob"
+    assert "不允许子目录" in src, "校验器少了拒绝 migrations 子目录的红线"
+
+    # ③ 分页：不许退回裸 list_objects_v2
+    assert 'get_paginator("list_objects_v2")' in executor, \
+        "执行器列举迁移必须用 paginator（单次调用 1000 条上限是静默截断）"
