@@ -91,13 +91,10 @@ _REPLAYABLE_FORMS = (
     # CREATE [UNIQUE] INDEX ASYNC IF NOT EXISTS <名>：用 IF NOT EXISTS 时索引名**必填**
     re.compile(r"^CREATE\s+(?:UNIQUE\s+)?INDEX\s+ASYNC\s+IF\s+NOT\s+EXISTS\s+"
                r"(?!ON\b)\S+", re.I),
-    # ALTER TABLE [IF EXISTS] … 后面**只允许**幂等动作；动作级 IF 由下面三条各自要求
-    re.compile(r"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?\S.*"
-               r"\bADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\b", re.I | re.S),
-    re.compile(r"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?\S.*"
-               r"\bDROP\s+(?:COLUMN\s+)?IF\s+EXISTS\b", re.I | re.S),
-    re.compile(r"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?\S.*"
-               r"\bDROP\s+CONSTRAINT\s+IF\s+EXISTS\b", re.I | re.S),
+    # **ALTER TABLE 不在这张表里**：它支持 `action [, ...]`，必须逐个动作判，
+    # 见 `_is_replayable_alter_table`。用一条 `.*幂等动作` 的正则会让**一个**幂等动作
+    # 为同语句里其它所有动作背书（实测：`ALTER TABLE t ALTER COLUMN c TYPE INT,
+    # ADD COLUMN IF NOT EXISTS d TEXT` 整条放行，而重放时第一个动作照样炸）。
     # DSQL 文档确认 CREATE [OR REPLACE] [RECURSIVE] VIEW——OR REPLACE 即幂等形态。
     # references 明确告诉站点作者"可以建视图"，白名单漏掉它会拒掉文档承诺的写法。
     re.compile(r"^CREATE\s+OR\s+REPLACE\s+(?:RECURSIVE\s+)?VIEW\b", re.I),
@@ -525,18 +522,40 @@ def scan_redlines(site_dir: Path, manifest: dict) -> list[str]:
     return violations
 
 
+# 注释与字符串/标识符字面量。**必须在同一个 pass 里按位置竞争**——分成"先抹注释、
+# 再抹字符串"两步会让串内的 `--` 吃掉行尾（连 `;` 一起），后面的语句被并进前一条：
+# 校验器只看到一条合规语句，而执行器（sqlparse 不在串内断句）照样把那条跑出去。
+# 实测过这条绕过：`CREATE TABLE IF NOT EXISTS t (a TEXT DEFAULT 'x--y'); DROP TABLE o;`
+# 整体过关。同一个缺陷的另一面是误拒合法文件（`'rate 10--20'`）。
+# 与本模块上面 `_COMMENTS_AND_STRINGS_RE` 是同一套思路（那边解 JS，这边解 SQL）。
+_SQL_LITERALS_RE = re.compile(
+    r"'(?:''|\\.|[^'\\])*'"              # 单引号串（'' 与反斜杠转义都认）
+    r"|\$(?P<tag>\w*)\$.*?\$(?P=tag)\$"  # dollar-quoted（$$…$$ / $tag$…$tag$）
+    r'|"(?:""|[^"])*"'                   # 双引号标识符（里面可能有 ; 或 --）
+    r"|--[^\n]*"                         # 行注释
+    r"|/\*.*?\*/",                       # 块注释（跨行）
+    re.S)
+
+
+def _blank_sql_literal(m: "re.Match") -> str:
+    s = m.group(0)
+    if s.startswith("--") or s.startswith("/*"):
+        return " "          # 注释整体丢掉
+    if s.startswith('"'):
+        return '""'         # 双引号标识符：留一个占位，别把语句结构打断
+    return "''"             # 字符串字面量（含 dollar-quoted）
+
+
 def _sql_statements(text: str) -> list[str]:
     """把 SQL 抹掉注释/字符串字面量后按 `;` 切成规范化语句串（空白折叠为单空格）。
 
     **合同层刻意不引入 sqlparse**：执行器侧那份有生产 0.6.0 / 单测 0.5.5 的版本偏斜
     且无人守（改锁定清单不重跑 `rm -rf cdk.out` 还会部出旧版），给合同再加一份依赖
-    只会放大同一个偏斜面。这里用保守切分：字符串里的 `;`（`DEFAULT 'a;b'`）因先被
-    抹白不会误切；切碎产生的非关键词片段会在白名单里落到"不匹配"分支被拒——
+    只会放大同一个偏斜面。这里用保守切分：字符串与标识符里的 `;` / `--` 因先被抹白
+    不会误切；切碎产生的非关键词片段会在白名单里落到"不匹配"分支被拒——
     **偏误报，方向安全**，与本模块"宁可误报不可漏报"的一贯口径一致。
     """
-    text = re.sub(r"--[^\n]*", " ", text)                    # 行注释
-    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)       # 块注释（跨行）
-    text = re.sub(r"'(?:''|[^'])*'", "''", text)             # 单引号串（含 '' 转义）
+    text = _SQL_LITERALS_RE.sub(_blank_sql_literal, text)
     out = []
     for raw in text.split(";"):
         s = re.sub(r"\s+", " ", raw).strip()
@@ -545,11 +564,51 @@ def _sql_statements(text: str) -> list[str]:
     return out
 
 
+# ALTER TABLE 的**每一个**动作都必须是幂等形态。DSQL 的语法是 `action [, ...]`，
+# 所以判定必须落在动作粒度上，不能用"整条里出现过一个幂等动作"来放行。
+_IDEMPOTENT_ALTER_ACTIONS = (
+    re.compile(r"^ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\b", re.I),
+    re.compile(r"^DROP\s+(?:COLUMN\s+)?IF\s+EXISTS\b", re.I),
+    re.compile(r"^DROP\s+CONSTRAINT\s+IF\s+EXISTS\b", re.I),
+)
+_ALTER_TABLE_HEAD_RE = re.compile(
+    r"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?"
+    r"(?:[\w.$]+|\"\")\s+(?P<actions>\S.*)$", re.I | re.S)
+
+
+def _split_top_level_commas(text: str) -> list[str]:
+    """按**顶层**逗号切分（括号内的逗号不算，如 `NUMERIC(10,2)`）。"""
+    parts, depth, cur = [], 0, []
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur))
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _is_replayable_alter_table(stmt: str) -> bool:
+    m = _ALTER_TABLE_HEAD_RE.match(stmt)
+    if not m:
+        return False
+    actions = _split_top_level_commas(m.group("actions"))
+    if not actions:
+        return False
+    return all(any(p.match(a) for p in _IDEMPOTENT_ALTER_ACTIONS) for a in actions)
+
+
 def _check_sql_replayable(sql_text: str, rel: str) -> list[str]:
     """每条语句都必须落在 `_REPLAYABLE_FORMS` 白名单里，否则报违规（红线 9 / M03）。"""
     out = []
     for stmt in _sql_statements(sql_text):
-        if not any(p.match(stmt) for p in _REPLAYABLE_FORMS):
+        if not (any(p.match(stmt) for p in _REPLAYABLE_FORMS)
+                or _is_replayable_alter_table(stmt)):
             snippet = stmt[:60] + ("…" if len(stmt) > 60 else "")
             out.append(f"{rel}: 不可重放的语句 `{snippet}`——{_REPLAYABLE_HINT}")
     return out

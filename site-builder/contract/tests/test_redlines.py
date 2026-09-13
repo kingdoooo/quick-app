@@ -1074,3 +1074,58 @@ def test_validator_and_executor_agree_on_migration_scope():
     # ③ 分页：不许退回裸 list_objects_v2
     assert 'get_paginator("list_objects_v2")' in executor, \
         "执行器列举迁移必须用 paginator（单次调用 1000 条上限是静默截断）"
+
+
+# ---- 红线 9 的两个绕过（/code-review high 发现，已用生产校验器复现）----
+
+def test_replayable_splitter_is_not_fooled_by_dashes_inside_strings(tmp_path):
+    """串内的 `--` 不得被当成行注释。
+
+    抹注释若发生在抹字符串**之前**，`'x--y'` 里的 `--` 会吃掉行尾（连 `;` 一起），
+    于是后面的语句被并进前一条 ⇒ 校验器只看到一条合规语句，而执行器（sqlparse
+    不在串内断句）照样把 `DROP TABLE` 跑出去。**validate 是唯一的拦截点**，所以这是
+    真绕过而不是误报方向的不精确。
+    """
+    from contract.redlines import _check_sql_replayable, _sql_statements
+    sql = ("CREATE TABLE IF NOT EXISTS t (a TEXT DEFAULT 'x--y');\n"
+           "DROP TABLE old_orders;\n")
+    assert len(_sql_statements(sql)) == 2, _sql_statements(sql)
+    out = _check_sql_replayable(sql, "backend/schema.sql")
+    assert any("DROP TABLE" in o for o in out), out
+
+
+def test_replayable_splitter_does_not_false_reject_dashes_inside_strings():
+    """同一个缺陷的另一面：合法文件被误拒（`'rate 10--20'` 把语句截断）。"""
+    from contract.redlines import _check_sql_replayable
+    sql = "INSERT INTO t (a) VALUES ('rate 10--20') ON CONFLICT DO NOTHING;"
+    assert _check_sql_replayable(sql, "x.sql") == []
+
+
+def test_replayable_splitter_handles_semicolons_in_quoted_identifiers():
+    """双引号标识符里的 `;` 同理不该断句。"""
+    from contract.redlines import _sql_statements
+    assert len(_sql_statements('CREATE TABLE IF NOT EXISTS "od;d" (a TEXT);')) == 1
+
+
+@pytest.mark.parametrize("sql", [
+    # 一个幂等动作**不能**为同语句里的其它动作背书（DSQL 的 ALTER TABLE 支持 action[,…]）
+    "ALTER TABLE t ADD COLUMN IF NOT EXISTS a TEXT, ADD COLUMN b TEXT;",
+    "ALTER TABLE t ALTER COLUMN c TYPE INT, ADD COLUMN IF NOT EXISTS d TEXT;",
+    "ALTER TABLE IF EXISTS t DROP COLUMN IF EXISTS a, DROP COLUMN b;",
+    "ALTER TABLE t ADD COLUMN IF NOT EXISTS a TEXT, DROP CONSTRAINT ck;",
+])
+def test_alter_table_requires_every_action_to_be_idempotent(sql):
+    from contract.redlines import _check_sql_replayable
+    out = _check_sql_replayable(sql, "x.sql")
+    assert out and "不可重放" in out[0], f"多动作 ALTER 被整条放行: {sql}"
+
+
+@pytest.mark.parametrize("sql", [
+    "ALTER TABLE t ADD COLUMN IF NOT EXISTS a TEXT, ADD COLUMN IF NOT EXISTS b TEXT;",
+    "ALTER TABLE IF EXISTS t ADD COLUMN IF NOT EXISTS a NUMERIC(10,2);",   # 括号内逗号
+    "ALTER TABLE t DROP COLUMN IF EXISTS a, DROP CONSTRAINT IF EXISTS ck;",
+    "ALTER TABLE t DROP IF EXISTS a;",                                      # COLUMN 可省
+])
+def test_alter_table_all_idempotent_actions_pass(sql):
+    from contract.redlines import _check_sql_replayable
+    assert _check_sql_replayable(sql, "x.sql") == []
