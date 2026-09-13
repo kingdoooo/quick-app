@@ -948,3 +948,20 @@ def test_migrations_subdirectory_is_rejected(tmp_path):
         "nested": {"001_x.sql": "CREATE TABLE IF NOT EXISTS a (id UUID PRIMARY KEY);\n"}})
     v = scan_redlines(d, m)
     assert any("backend/migrations/nested/" in s and "子目录" in s for s in v), v
+
+
+def test_forbidden_ddl_scanned_in_migration_files(tmp_path):
+    """M16/F6：FORBIDDEN_DDL 从前只扫 schema.sql，migration 里的禁用 DDL 在 validate
+    抓不到、只在 provision-db 半途炸——那正是 M03 永久 brick 的触发条件。"""
+    d, m = make_site(tmp_path, migrations={
+        "001_bad.sql": "ALTER TABLE IF EXISTS t ADD COLUMN IF NOT EXISTS n SERIAL;\n"})
+    v = scan_redlines(d, m)
+    assert any("migrations/001_bad.sql" in s and "SERIAL" in s for s in v), v
+
+
+def test_index_async_rule_reports_migration_path(tmp_path):
+    """索引规则本来就扫两者，但报错里要带 migrations 的相对路径（回归保护）。"""
+    d, m = make_site(tmp_path, migrations={
+        "001_idx.sql": "CREATE INDEX idx_t ON t (id);\n"})
+    v = scan_redlines(d, m)
+    assert any("migrations/001_idx.sql" in s and "ASYNC" in s for s in v), v

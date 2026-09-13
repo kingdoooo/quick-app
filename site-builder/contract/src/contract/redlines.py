@@ -454,18 +454,21 @@ def scan_redlines(site_dir: Path, manifest: dict) -> list[str]:
         schema = backend_dir / "schema.sql"
         if not schema.exists():
             violations.append("backend/schema.sql: fullstack-sql 必须提供建表 SQL")
-        else:
-            sql_upper = schema.read_text(errors="replace").upper()
-            for kw in FORBIDDEN_DDL:
-                if kw in sql_upper:
-                    violations.append(f"backend/schema.sql: 含 DSQL 不支持的 {kw}（见红线文档替代方案）")
-        # 索引规则对 schema.sql 与 migrations/*.sql **一视同仁**：
-        # provision_dsql.py 用同一个连接、同样逐条 execute 两者，所以同步建索引
-        # 在哪个文件里都会失败。只扫 schema.sql 会让"写进 migrations 就能绕过"
-        # ——而绕过的结果是部署失败，不是绕过成功。
+        # 禁用特性与索引规则对 schema.sql 与 migrations/*.sql **一视同仁**：
+        # provision_dsql.py 用同一个 migrator 连接、同样逐条 execute 两者，所以禁用
+        # DDL 与同步建索引在哪个文件里都会在 provision-db 阶段失败。
+        # **`FORBIDDEN_DDL` 从前只扫 schema.sql**（M16/F6）：migration 里的禁用 DDL
+        # 因此在 validate 抓不到、只在执行时半途炸——那正是 M03「同输入重试不幂等」
+        # 的触发条件。绕过的结果不是绕过成功，是部署卡死。
         for sql_file in _dsql_sql_files(backend_dir):
             rel = sql_file.relative_to(backend_dir.parent).as_posix()
             body = sql_file.read_text(errors="replace")
+            # 大写后子串匹配（注释里出现也命中，与既有口径一致）
+            body_upper = body.upper()
+            for kw in FORBIDDEN_DDL:
+                if kw in body_upper:
+                    violations.append(
+                        f"{rel}: 含 DSQL 不支持的 {kw}（见红线文档替代方案）")
             if CREATE_INDEX_RE.search(body):
                 violations.append(
                     f"{rel}: DSQL 建索引必须写 CREATE INDEX ASYNC"
