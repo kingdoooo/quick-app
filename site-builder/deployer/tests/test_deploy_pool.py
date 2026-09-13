@@ -2146,3 +2146,27 @@ def test_main_waits_for_the_idp_domain_before_building_the_provider():
     called = _main_call_order()
     assert "_wait_for_domain_active" in called, "main() 没等域名 ACTIVE"
     assert called.index("_wait_for_domain_active") < called.index("_ensure_oidc_idp")
+
+
+def test_the_two_branding_docstrings_state_their_scope():
+    """**finding #5**：两处 docstring 对"classic hosted UI 要不要 branding"给出过
+    相反的**实测**结论，读者无从判断哪条管事。
+
+    真相是它们说的不是同一件事：`_ensure_branding` 那条实测于 **managed login v2**
+    （平台池），`_ensure_domain` 那条实测于 **LITE + classic hosted UI**（内置 IdP
+    池，`/login` 200 带密码表单）。若旧那条其实才对，第三条接入路径就会带着一个
+    打不开的登录页发货 —— 而那种失败只在浏览器里看得见，任何测试与闸门都抓不到。
+    所以两条都必须自报作用域。
+    """
+    import inspect
+    branding = inspect.getdoc(dp._ensure_branding)
+    domain = inspect.getdoc(dp._ensure_domain)
+    assert "managed login v2" in branding, "_ensure_branding 没写清它只管 v2"
+    assert "classic hosted UI" in branding and "相反" in branding, \
+        "_ensure_branding 没点出 classic hosted UI 是相反的情形"
+    assert "classic hosted UI" in domain and "不需要" in domain, \
+        "_ensure_domain 没写清 classic hosted UI 不需要 branding"
+    # 且内置 IdP 池确实不进 _ensure_branding（"刻意不是漏了"要有代码背书）
+    src = inspect.getsource(dp.main)
+    assert src.count("_ensure_branding(") == 1, \
+        "_ensure_branding 被调了多于一次——内置 IdP 池不该进去"

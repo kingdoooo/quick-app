@@ -1067,15 +1067,20 @@ def _ensure_idp_pool_client(cog, idp_pool_id: str,
 
 
 def _ensure_branding(cog, pool_id: str, clients: dict) -> None:
-    """给 API 创建的 app client 套 branding style。
+    """给 API 创建的 app client 套 branding style。**只对平台池（managed login v2）。**
 
     AWS 明确：经 CreateUserPoolClient 建的 client **不会**自动获得 branding
-    style，套上之前 managed login 与 classic hosted UI 页面都不可用
-    （控制台建的会自动有，所以这个坑只在脚本化部署时出现）。不做这步，
-    后面所有登录验证会在 /oauth2/authorize 第一步就失败。
+    style（控制台建的会自动有，所以这个坑只在脚本化部署时出现）。不做这步，
+    平台池后面所有登录验证会在 /oauth2/authorize 第一步就失败。
     用 Cognito 默认样式（UseCognitoProvidedValues=True），不做定制。
     前提是 domain 已是 managed login v2（见 _ensure_domain）——style 与
     domain 版本不匹配时登录页依然不可用。
+
+    **作用域必须写清，否则与 _ensure_domain 的 docstring 读起来相互矛盾**
+    （/code-review finding #5）：这条"不套 branding 则登录页不可用"实测于
+    **managed login v2**；而 **LITE 档 + classic hosted UI** 的内置 IdP 池恰恰
+    相反 —— 完全不调本函数，`/login` 也直接 200 且带密码表单（工单 06 与工单 07
+    各真机测过一次）。所以内置 IdP 池刻意不进这里，不是漏了。
     """
     for key in ("site", "mcp"):
         try:

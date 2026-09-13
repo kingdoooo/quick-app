@@ -248,6 +248,19 @@ LITE 档只有 classic hosted UI，传 2 会 `FeatureUnavailableInTierException`
 也**不需要**套 branding（classic hosted UI 直接可用——这与平台池不同，平台池是
 managed login v2，那边"API 建的 client 不套 branding 则登录页不可用"仍然成立）。
 
+> **建完域名要等它 `ACTIVE` 才能建 OIDC provider。** `create-user-pool-domain` 是
+> **异步**的（先返回 `Status: CREATING`），而 Cognito 建 provider 时按 `oidc_issuer`
+> 去取 discovery 文档解析 authorize / token / userInfo 端点——那三个端点只有池有了
+> 域名之后才出现在文档里。抢在前面的后果是**静默的**：provider 建出来但端点缺失，
+> 命令全部成功，直到第一次真实登录才在 `/oauth2/authorize` 那一跳失败。
+> `deploy_pool.py` 会替你轮询（超时就响亮失败）；手工建时自己等：
+>
+> ```bash
+> aws cognito-idp describe-user-pool-domain --region us-east-1 \
+>   --domain <idp_domain_prefix> --query DomainDescription.Status
+> # 期望 "ACTIVE"；"CREATING" 就再等
+> ```
+
 **联邦用 app client**：
 
 - `GenerateSecret: true`（Cognito 作 OIDC RP 时要 client_secret）
