@@ -203,6 +203,34 @@ def test_an_unrelated_row_landing_in_the_window_does_not_count(aws, seed_admin_w
         "——action/actor 过滤没起作用")
 
 
+def test_a_noop_audit_row_must_not_count_as_this_ones(aws, seed_admin_with_config,
+                                                     monkeypatch):
+    """**Codex 复审 P1 的第二个复现**：`add_admin` 的幂等分支写的是
+    `action=add_admin, actor=seed_admin.py, result=noop` —— 同 action、同 actor，
+    只有 `result` 不同。那条行的含义是"这个邮箱本来就已经是管理员"，
+    **不是**"本次授予留下了审计"。
+
+    真机上够得着这条：`is_admin()` 与 `add_admin()` 之间有窗口，
+    别人抢先加同一个邮箱就会走到幂等分支。
+    """
+    import ops_log
+
+    sa = seed_admin_with_config
+    sa._load_config()
+    real_put = ops_log._put
+
+    def put_as_noop(**kw):
+        if kw.get("action") == "add_admin":
+            kw = {**kw, "result": "noop"}      # action / actor 都不动，只改 result
+        return real_put(**kw)
+
+    monkeypatch.setattr(ops_log, "_put", put_as_noop)
+    out = sa.seed("admin@example.com", dry_run=False)
+    assert out["written"] is True
+    assert out["audited"] is False, (
+        "result=noop 的审计行被当成了本次授予的证据——没有检查 result == 'ok'")
+
+
 def test_unreadable_audit_table_is_reported_as_not_audited(aws, seed_admin_with_config,
                                                            monkeypatch):
     """读不出来（None）必须当成"没有"，不能当成"新写了一行"。

@@ -123,9 +123,16 @@ def _audit_row_landed(email: str, before: set | None) -> bool:
     表不存在、`AccessDenied`、被限流都会走同一条静默路径。
     而"第一个管理员"是平台上权限最大的一次授予，**它没有审计行 = 从审计上看它从未发生**。
 
-    判据是**写前/写后的差集**里有没有一条本次形态的行：`action == "add_admin"`
-    且 `actor == "seed_admin.py"`。只看"这个邮箱有没有 add_admin 行"是不够的
-    —— 同一邮箱被加过又删过时那条历史行会冒充本次（Codex 复审复现过）。
+    判据是**写前/写后的差集**里有没有一条本次形态的行：`action == "add_admin"`、
+    `actor == "seed_admin.py"`，**且 `result == "ok"`**。三条都不能少：
+
+      · 只看"这个邮箱有没有 add_admin 行"⇒ 同一邮箱被加过又删过时那条历史行会冒充本次；
+      · 差集非空还不够 ⇒ 同一窗口里落的别的审计行（并发 remove_admin、别的 actor）会冒充；
+      · **`result` 必须是 `ok`** ⇒ `add_admin` 的幂等分支写的是 `result="noop"`
+        （同 action、同 actor）。那条行的含义是"这个邮箱本来就已经是管理员"，
+        它**不是**"本次授予留下了审计"。这条分支在真机上够得着：`is_admin` 与
+        `add_admin` 之间有窗口，别人抢先加同一个邮箱就会走到它。
+        （以上三条都由 Codex 复审逐个复现过。）
 
     任一侧读不出来（None）⇒ 返回 False：判不了就当没有，方向是保守的。
     """
@@ -149,6 +156,7 @@ def _audit_row_landed(email: str, before: set | None) -> bool:
     return any(r.get(_AUDIT_SORT_KEY) in new_keys
                and r.get("action") == "add_admin"
                and r.get("actor") == "seed_admin.py"
+               and r.get("result") == "ok"
                for r in rows)
 
 

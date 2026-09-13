@@ -3353,12 +3353,21 @@ python3 -u site-builder/scripts/probe_impersonation_surface.py \
 |---|---|---|
 | **站点自己的**（per-site IAM 角色、`site-data-*` 表、DSQL schema / role / IAM 映射、前端对象） | 执行器在建站时建 | **全部变孤儿** —— 一个都不在栈里 |
 | **两个 CFN 栈**（router、deployer） | `cdk deploy` | 大部分跟着走，但 `RemovalPolicy.RETAIN` 的**留下**（见下面第 ④ 步） |
-| **脚本建的平台件**（auth / panel / key-proxy 的 Lambda 与 Function URL、pre-token 触发器、MCP runtime + ECR 仓库、四~五个 IAM 角色、告警管道、Cognito **两个**池、两~三个 SSM 参数、前端桶） | ①/auth/⑤/⑤b/⑤c 的部署脚本 | **一个都不会走** |
+| **脚本建的平台件**（auth / panel / key-proxy 的 Lambda 与 Function URL、pre-token 触发器、MCP runtime + ECR 仓库、四~五个 IAM 角色、告警管道、Cognito **两个**池、两~三个 SSM 参数） | ①/auth/⑤/⑤b/⑤c 的部署脚本 | **一个都不会走** |
 | **手工建的**（③ 的 DSQL cluster、② 步骤 1 的前端桶、② 步骤 4 的 DNS 记录、CDK bootstrap） | 你自己照手册跑的命令 | **一个都不会走** |
 
-所以顺序是「先站点 → 再脚本件与手工件 → 再栈 → 最后收孤儿」。
+**下面各步就是按这个顺序排的**（手工件不是一整块，它被 DSQL 与"其余"拆开了，
+因为只有 DSQL 需要在删栈之前处理）：
+
+```
+① 站点（purge）→ ② 脚本件 → ②b DSQL cluster → ③ 两个栈 → ④ 收孤儿 + 其余手工件
+                                                              （前端桶 / DNS / bootstrap）
+```
+
 跳过第 ① 步直接删栈是最常见的错法；**最容易整个忘掉的是第 4 行里的 DSQL cluster**
 （它在 ③ 手工建、不属于任何栈，而拆除时没有任何东西会提醒你）。
+前端桶归**手工建的**那一行——它由 ② 步骤 1 手工创建，不是任何脚本建的；
+它排在最后是因为删栈之前 Edge 可能还在读它。
 
 ### ① 先下线所有站点，而且要 `purge_data`
 
@@ -3391,20 +3400,37 @@ aws lambda invoke --function-name site-deployer-undeploy --region us-east-1 \
 ```bash
 set -euo pipefail
 
-# 全部按「不存在也算成功」处理：这一节的每一条都可能因为组件没启用 / 上一次拆到一半
-# 而目标已经没了，而**中途中止的代价是后面的孤儿全留下**。
-ok() { "$@" || true; }
+# ── 这一节共用的容错 helper。**后面每个围栏块都假设它已定义**（同一个 shell 里跑）──
+# 为什么不是 `|| true`：那会把 AccessDenied、限流、参数错误、`ResourceInUseException`
+# 一起吞掉，于是「清理跑完了」与「什么都没清掉」在输出上没有区别。
+# 这里**只**吞服务明确说的"目标不存在"——那才是「组件没启用 / 上一次拆到一半」的合法形态。
+_is_absent_err() {
+  case "$1" in
+    *ResourceNotFoundException*|*NotFoundException*|*NoSuchEntity*|*NoSuchBucket*|\
+    *ParameterNotFound*|*RepositoryNotFoundException*|*ClusterNotFound*|*"does not exist"*)
+      return 0 ;;
+  esac
+  return 1
+}
+absent_ok() {                      # 只有"目标不存在"算成功，其它错误照常中止
+  local err rc=0
+  err="$("$@" 2>&1 >/dev/null)" || rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  if _is_absent_err "$err"; then echo "  跳过（目标已不存在）: $*"; return 0; fi
+  printf '%s\n' "$err" >&2
+  return "$rc"
+}
 
 # MCP runtime + ECR 仓库
-ok aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id <runtime_id> --region us-east-1
-ok aws ecr delete-repository --repository-name site-builder-mcp --region us-east-1 --force
+absent_ok aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id <runtime_id> --region us-east-1
+absent_ok aws ecr delete-repository --repository-name site-builder-mcp --region us-east-1 --force
 
 # Lambda。**site-key-proxy 无条件列进来**：没启用过 ⑤c 时它不存在，`ok` 会吞掉。
 # 而 `site-auth-pre-token` 是 Cognito 触发器、**根本没有 Function URL**，
 # 所以那条 delete-function-url-config 必然失败（`2>/dev/null` 只藏 stderr、不改退出码）。
 for FN in site-panel site-auth-service site-auth-pre-token site-key-proxy; do
-  ok aws lambda delete-function-url-config --function-name "$FN" --region us-east-1
-  ok aws lambda delete-function --function-name "$FN" --region us-east-1
+  absent_ok aws lambda delete-function-url-config --function-name "$FN" --region us-east-1
+  absent_ok aws lambda delete-function --function-name "$FN" --region us-east-1
 done
 
 # IAM 角色：**必须先清 inline policy、detach 托管策略，否则 DeleteConflict**。
@@ -3414,27 +3440,27 @@ for R in site-panel-role site-auth-service-role site-mcp-runtime-role \
          site-key-proxy-role site-builder-verifier; do
   for P in $(aws iam list-role-policies --role-name "$R" \
               --query 'PolicyNames' --output text 2>/dev/null || true); do
-    ok aws iam delete-role-policy --role-name "$R" --policy-name "$P"
+    absent_ok aws iam delete-role-policy --role-name "$R" --policy-name "$P"
   done
   for A in $(aws iam list-attached-role-policies --role-name "$R" \
               --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null || true); do
-    ok aws iam detach-role-policy --role-name "$R" --policy-arn "$A"
+    absent_ok aws iam detach-role-policy --role-name "$R" --policy-arn "$A"
   done
-  ok aws iam delete-role --role-name "$R"
+  absent_ok aws iam delete-role --role-name "$R"
 done
 
 # 告警管道（**这条的真名容易猜错**）
-ok aws cloudwatch delete-alarms --alarm-names site-builder-auth-invalid-grant --region us-east-1
-ok aws sns delete-topic --topic-arn arn:aws:sns:us-east-1:{account_id}:site-builder-alarms
+absent_ok aws cloudwatch delete-alarms --alarm-names site-builder-auth-invalid-grant --region us-east-1
+absent_ok aws sns delete-topic --topic-arn arn:aws:sns:us-east-1:{account_id}:site-builder-alarms
 
 # Cognito：**托管域名要先删才能删池**，两个池各一个（平台池 + 内置 IdP 池）
-ok aws cognito-idp delete-user-pool-domain --domain <前缀> --user-pool-id <pool_id> --region us-east-1
-ok aws cognito-idp delete-user-pool --user-pool-id <pool_id> --region us-east-1
+absent_ok aws cognito-idp delete-user-pool-domain --domain <前缀> --user-pool-id <pool_id> --region us-east-1
+absent_ok aws cognito-idp delete-user-pool --user-pool-id <pool_id> --region us-east-1
 
 # SSM 参数：前两个总有；第三个只有启用过 ⑤c 才有（没有时 ok 吞掉）
-ok aws ssm delete-parameter --name /site-builder/site-client-secret     --region us-east-1
-ok aws ssm delete-parameter --name /site-builder/login-flow-secret      --region us-east-1
-ok aws ssm delete-parameter --name /site-builder/machine-client-secret  --region us-east-1
+absent_ok aws ssm delete-parameter --name /site-builder/site-client-secret     --region us-east-1
+absent_ok aws ssm delete-parameter --name /site-builder/login-flow-secret      --region us-east-1
+absent_ok aws ssm delete-parameter --name /site-builder/machine-client-secret  --region us-east-1
 ```
 
 > `m5-edge-analytics-failed-global` 与 `m5-rollup-no-successful-invocation-24h`
@@ -3448,9 +3474,36 @@ ok aws ssm delete-parameter --name /site-builder/machine-client-secret  --region
 ### ②b DSQL cluster（③ 手工建的，**不属于任何栈**）
 
 ```bash
-# 站点侧的 schema / role / IAM 映射已在第 ① 步随 purge 清掉；这里删的是 cluster 本身
-aws dsql delete-cluster --identifier <cluster_id> --region us-east-1
-aws dsql get-cluster --identifier <cluster_id> --region us-east-1 --query status --output text
+set -euo pipefail                       # 承接上一块；absent_ok 已在 ② 定义
+CID=<cluster_id>
+
+# 站点侧的 schema / role / IAM 映射已在第 ① 步随 purge 清掉；这里删的是 cluster 本身。
+# **这一段要能安全重跑**：拆到一半再走一遍手册时 cluster 可能已经没了，而裸
+# delete-cluster 在 set -e 下会让脚本在删两个栈**之前**退出。
+# 0 = 确认已删（服务明确说 NotFound）；1 = 还在；2 = 读不出来且**不是** NotFound
+dsql_gone() {
+  local err
+  err="$(aws dsql get-cluster --identifier "$1" --region us-east-1 2>&1 >/dev/null)" && return 1
+  _is_absent_err "$err" && return 0
+  printf '%s\n' "$err" >&2
+  return 2
+}
+
+if aws dsql get-cluster --identifier "$CID" --region us-east-1 >/dev/null 2>&1; then
+  absent_ok aws dsql delete-cluster --identifier "$CID" --region us-east-1
+  for _ in $(seq 1 60); do                # 轮询到服务说 NotFound（约 10 分钟上限）
+    rc=0; dsql_gone "$CID" || rc=$?
+    if [ "$rc" -eq 0 ]; then echo "  cluster 已删除"; break; fi
+    if [ "$rc" -eq 2 ]; then
+      echo "  ⚠️ 读不出 cluster 状态，而且**不是** NotFound（报文见上）。" >&2
+      echo "     别当成已删除——先查清楚（凭据 / 限流），这一步没完成就不要往下删栈。" >&2
+      break
+    fi
+    sleep 10
+  done
+else
+  echo "  跳过（cluster 已不存在）"
+fi
 ```
 
 `③` 建它时带的是 `--no-deletion-protection-enabled`（PoC 便于清理）；**开了删除保护的话
@@ -3487,12 +3540,26 @@ deployer 栈约 **10 分钟**走完（`site-artifacts-*` 桶由自定义资源�
 
 ```bash
 set -euo pipefail
-ok() { "$@" || true; }        # 同 ② 的理由：某张表已经不在时不能让整段中止
+# absent_ok 已在 ② 定义（同一个 shell）
 
-# 四张表（都带 deletion protection ⇒ 先关再删）
+# 四张表（都带 deletion protection ⇒ 先关、**等它真的关完**、再删）。
+# ⚠️ `update-table` 是**异步**的：表会进 `UPDATING`，而 `UPDATING` 期间 `DeleteTable`
+#    返回 `ResourceInUseException`。"关保护紧接着删"是一个确定的竞态 ——
+#    而如果那条失败又被无差别吞掉，**四张表会全部留下而脚本报成功**。
+#    所以这里不用 absent_ok 兜删除，而是显式判存在 + 用 waiter 等状态。
 for T in site-access-daily site-admins site-api-keys site-ops-log; do
-  ok aws dynamodb update-table --table-name "$T" --no-deletion-protection-enabled --region us-east-1
-  ok aws dynamodb delete-table --table-name "$T" --region us-east-1
+  if ! aws dynamodb describe-table --table-name "$T" --region us-east-1 >/dev/null 2>&1; then
+    echo "  跳过（已不存在）: $T"; continue
+  fi
+  if [ "$(aws dynamodb describe-table --table-name "$T" --region us-east-1 \
+            --query 'Table.DeletionProtectionEnabled' --output text)" = "True" ]; then
+    aws dynamodb update-table --table-name "$T" --no-deletion-protection-enabled \
+      --region us-east-1 >/dev/null
+    aws dynamodb wait table-exists --table-name "$T" --region us-east-1   # 等回 ACTIVE
+  fi
+  aws dynamodb delete-table --table-name "$T" --region us-east-1 >/dev/null
+  aws dynamodb wait table-not-exists --table-name "$T" --region us-east-1 # 读回确认真删了
+  echo "  已删除: $T"
 done
 ```
 
