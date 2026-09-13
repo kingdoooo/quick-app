@@ -1431,13 +1431,10 @@ def test_idp_pool_names_prefer_flags_over_config():
     **旗标只在非生产 `--pool-name` 下合法**——反向组合会把生产平台池的 provider
     指向 spike IdP 池，见 test_isolation_flags_require_a_non_production_platform_pool。
     """
-    assert dp.resolve_idp_pool_names(
-        pool_name=dp.POOL_NAME, idp_pool_name=None, idp_domain_prefix=None,
-        idp=_idp_cognito()) == ("site-builder-idp", "acme-idp-2026")
-    assert dp.resolve_idp_pool_names(
-        pool_name="sb-idp-spike", idp_pool_name="spike-idp",
-        idp_domain_prefix="spike-idp-2026",
-        idp=_idp_cognito()) == ("spike-idp", "spike-idp-2026")
+    assert _resolve() == ("site-builder-idp", "acme-idp-2026")
+    assert _resolve(pool_name="sb-idp-spike", platform_domain_prefix="sb-idp-spike-2026",
+                    idp_pool_name="spike-idp",
+                    idp_domain_prefix="spike-idp-2026") == ("spike-idp", "spike-idp-2026")
 
 
 @pytest.mark.parametrize("flags", [(None, None), ("spike-idp", None),
@@ -1451,8 +1448,10 @@ def test_isolated_platform_pool_requires_both_idp_isolation_flags(flags):
     """
     name, prefix = flags
     with pytest.raises(SystemExit, match="--idp-pool-name"):
-        dp.resolve_idp_pool_names(pool_name="sb-idp-spike", idp_pool_name=name,
-                                  idp_domain_prefix=prefix, idp=_idp_cognito())
+        dp.resolve_idp_pool_names(pool_name="sb-idp-spike",
+                                  platform_domain_prefix="sb-idp-spike-2026",
+                                  idp_pool_name=name, idp_domain_prefix=prefix,
+                                  idp=_idp_cognito())
 
 
 # ---------------------------------------------------------------------------
@@ -1993,20 +1992,24 @@ def test_isolation_flags_require_a_non_production_platform_pool():
     是同一类事故，只是从新开的这道门进来。
     """
     with pytest.raises(SystemExit, match="--pool-name"):
-        dp.resolve_idp_pool_names(pool_name=dp.POOL_NAME, idp_pool_name="spike-idp",
-                                  idp_domain_prefix="spike-2026", idp=_idp_cognito())
+        _resolve(idp_pool_name="spike-idp", idp_domain_prefix="spike-2026")
     # 单给一个旗标同样拒（否则"只给池名"会静默走 config 的域名前缀）
     with pytest.raises(SystemExit, match="--pool-name"):
-        dp.resolve_idp_pool_names(pool_name=dp.POOL_NAME, idp_pool_name="spike-idp",
-                                  idp_domain_prefix=None, idp=_idp_cognito())
+        _resolve(idp_pool_name="spike-idp")
 
 
 def test_production_run_without_flags_still_works():
     """正对照：生产运行（默认 pool-name、不给旗标）必须照常从 config 取值。
     上一条守卫收紧后最容易误伤的就是它。"""
-    assert dp.resolve_idp_pool_names(
-        pool_name=dp.POOL_NAME, idp_pool_name=None, idp_domain_prefix=None,
-        idp=_idp_cognito()) == ("site-builder-idp", "acme-idp-2026")
+    assert _resolve() == ("site-builder-idp", "acme-idp-2026")
+
+
+def _resolve(**over):
+    """resolve_idp_pool_names 的默认合法调用（生产运行形态），按需覆盖。"""
+    kw = {"pool_name": dp.POOL_NAME, "platform_domain_prefix": "site-builder-auth",
+          "idp_pool_name": None, "idp_domain_prefix": None, "idp": _idp_cognito()}
+    kw.update(over)
+    return dp.resolve_idp_pool_names(**kw)
 
 
 @pytest.mark.parametrize("key,value", [
@@ -2022,17 +2025,53 @@ def test_built_in_idp_pool_must_not_be_the_platform_pool(key, value):
     `Mutable: True` 而中止，**而那条错误文案写着"只能删掉这个池重建"**——照做
     就是删掉生产池与它全部的联邦用户。一行本地不等式就消灭整个场景。
     """
-    idp = _idp_cognito(**{key: value})
     with pytest.raises(SystemExit, match="平台池"):
-        dp.check_idp_section(idp, dp.IDP_MODE_COGNITO,
-                             platform_pool_name="site-builder-users",
-                             platform_domain_prefix="site-builder-auth")
+        _resolve(idp=_idp_cognito(**{key: value}))
 
 
-def test_platform_pool_comparison_is_optional_for_pure_config_checks():
-    """两个平台侧参数不给时（纯 config 校验，比如 .example 的自证用例）不做这条比较
-    ——否则那些用例得凭空编一个平台池名，而它们要证明的是另一回事。"""
-    dp.check_idp_section(_idp_cognito(), dp.IDP_MODE_COGNITO)      # 不得抛
+@pytest.mark.parametrize("flag,value,match", [
+    ("idp_pool_name", "site-builder-users", "平台池"),
+    ("idp_pool_name", "sb-spike", "平台池"),          # 本次运行的平台池
+    ("idp_domain_prefix", "sb-spike-2026", "前缀同值"),   # 本次运行的平台前缀
+])
+def test_flags_cannot_bypass_the_platform_pool_check(flag, value, match):
+    """**第二轮 /code-review finding #1**：判据放错层，旗标正好绕过它。
+
+    上一轮把"内置池 ≠ 平台池"判在 config 值上，而部署用的是
+    `resolve_idp_pool_names` 的**返回值**——旗标胜过 config ⇒
+    `--pool-name sb-spike --idp-pool-name site-builder-users` 时 config 的
+    `site-builder-idp` 与 `sb-spike` 不同、判据放行，然后 `_ensure_idp_pool` 照旧
+    对**生产平台池**跑 `update_user_pool`，读回复验再抛出那句"只能删掉这个池重建"
+    ——finding #4 声称消灭的灾难场景原地复活。所以判据必须判解析后的值。
+    """
+    kw = {"pool_name": "sb-spike", "platform_domain_prefix": "sb-spike-2026",
+          "idp_pool_name": "spike-idp", "idp_domain_prefix": "spike-2026"}
+    kw[flag] = value                     # 把生产名字粘进隔离旗标里
+    with pytest.raises(SystemExit, match=match):
+        _resolve(**kw)
+
+
+def test_a_prefix_owned_by_another_pool_is_caught_by_the_read_only_preflight():
+    """本地判据只能比"本次运行的平台前缀"——隔离运行**合法地**覆盖了 --domain-prefix，
+    所以"生产平台池的前缀"在本地无从得知（采用者的生产前缀是他自己配的）。
+
+    那一种由 `preflight_idp_pool` 的判据 ④ 兜住：按前缀反查到的池 ≠ 按名字找到的池
+    ⇒ fail closed（见 test_preflight_fails_closed_when_domain_belongs_to_another_pool）。
+    它是一次 AWS **读**，仍在第一次写之前。这条用例把这个分工写下来，免得将来有人
+    以为本地判据漏了一种情形而去加一个用错误常量比较的检查。
+    """
+    assert _resolve(pool_name="sb-spike", platform_domain_prefix="sb-spike-2026",
+                    idp_pool_name="spike-idp",
+                    idp_domain_prefix="site-builder-auth") == \
+        ("spike-idp", "site-builder-auth")
+
+
+def test_resolved_idp_pool_name_cannot_be_the_production_pool_even_when_isolated():
+    """即使平台池已隔离，把内置 IdP 池指到**生产**平台池名上同样要拒
+    （那是 finding #1 举的那条具体命令）。"""
+    with pytest.raises(SystemExit, match="生产平台池|平台池"):
+        _resolve(pool_name="sb-spike", platform_domain_prefix="sb-spike-2026",
+                 idp_pool_name=dp.POOL_NAME, idp_domain_prefix="spike-2026")
 
 
 @pytest.mark.parametrize("field", ["provider_name", "issuer", "client_id", "scopes"])
@@ -2075,16 +2114,14 @@ def test_malformed_domain_prefix_fails_locally_not_with_a_traceback(prefix):
     文案 fail closed"）落空。格式判断是纯本地的，前移到 ⓿ 与其它判据同处。
     """
     with pytest.raises(SystemExit, match="cognito_domain_prefix"):
-        dp.check_idp_section(_idp_cognito(cognito_domain_prefix=prefix),
-                             dp.IDP_MODE_COGNITO)
+        _resolve(idp=_idp_cognito(cognito_domain_prefix=prefix))
 
 
 @pytest.mark.parametrize("prefix", ["acme-idp-2026", "a", "site-builder-idp",
                                     "x" * 63, "abc123"])
 def test_valid_domain_prefixes_are_accepted(prefix):
     """负对照：合法前缀不许被误拒——多拒一个就是用一条不存在的限制挡住采用者。"""
-    dp.check_idp_section(_idp_cognito(cognito_domain_prefix=prefix),
-                         dp.IDP_MODE_COGNITO)      # 不得抛
+    assert _resolve(idp=_idp_cognito(cognito_domain_prefix=prefix))[1] == prefix
 
 
 # ---------------------------------------------------------------------------
@@ -2170,3 +2207,59 @@ def test_the_two_branding_docstrings_state_their_scope():
     src = inspect.getsource(dp.main)
     assert src.count("_ensure_branding(") == 1, \
         "_ensure_branding 被调了多于一次——内置 IdP 池不该进去"
+
+
+@pytest.mark.parametrize("prefix", ["acme-cognito-idp", "aws-corp-idp",
+                                    "amazon-idp", "myaws"])
+def test_domain_prefix_reserved_words_are_rejected_locally(prefix):
+    """**第二轮 finding #2**：Cognito 的托管域名前缀里不许出现 `aws` / `amazon` /
+    `cognito`（AWS 文档）。`acme-cognito-idp` 是很自然会被写出来的取名，它过了
+    字符集/长度校验，到 ②b 建域名才失败——而那时平台池、平台域名与 IdP 池都建好了，
+    脚本停在中途。纯本地一行判断就挡掉。"""
+    with pytest.raises(SystemExit, match="保留词"):
+        _resolve(idp=_idp_cognito(cognito_domain_prefix=prefix))
+
+
+def test_wait_for_domain_fails_fast_on_terminal_failed_status():
+    """**第二轮 finding #3**：`FAILED` 是终态，再轮询 200 秒也不会变。
+    早退并把真实原因（前缀被占 / 含保留词 / 配额）指出来，而不是让操作者等完超时
+    再看到一句"仍未 ACTIVE"。"""
+    class _Cog:
+        class exceptions:
+            class ResourceNotFoundException(Exception):
+                pass
+
+        def describe_user_pool_domain(self, Domain):
+            return {"DomainDescription": {"Status": "FAILED"}}
+
+    with pytest.raises(SystemExit, match="FAILED"):
+        dp._wait_for_domain_active(_Cog(), "acme-idp-2026", sleep=lambda _s: None)
+
+
+def test_wait_for_domain_survives_resource_not_found():
+    """紧跟 create_user_pool_domain 之后可能还查不到（与 _pool_id_for_domain 同一条
+    防御）。裸 traceback 会让这一步失去"响亮而可读地失败"的全部意义。"""
+    calls = []
+
+    class _Cog:
+        class exceptions:
+            class ResourceNotFoundException(Exception):
+                pass
+
+        def describe_user_pool_domain(self, Domain):
+            calls.append(Domain)
+            if len(calls) < 2:
+                raise self.exceptions.ResourceNotFoundException(Domain)
+            return {"DomainDescription": {"Status": "ACTIVE"}}
+
+    dp._wait_for_domain_active(_Cog(), "acme-idp-2026", sleep=lambda _s: None)
+    assert len(calls) == 2
+
+
+def test_idp_flag_help_says_isolation_only():
+    """**第二轮 finding #4**：反向守卫加上之后，"默认取 config"这句 help 会把操作者
+    引向一个 SystemExit（比如配置的前缀被全局占用、想只覆盖前缀重跑一次）。
+    help 必须自己说清"仅隔离运行可用"。"""
+    import inspect
+    src = inspect.getsource(dp.main)
+    assert src.count("仅隔离运行可用") == 2, "两个旗标的 help 都要写明"
