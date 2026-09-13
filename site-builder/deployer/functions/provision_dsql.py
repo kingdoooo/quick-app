@@ -133,13 +133,32 @@ def handler(event, context):
         #
         # **效力边界**：schema 空 + marker 非空 = 已证明的失配；schema **非空**则什么都
         # 证明不了（不告诉你哪些文件跑过），此时不动。
-        # **必须用 admin 连接**（此刻正在 admin 块内）：mig role 能否读 pg_catalog /
-        # information_schema **未验证**，不赌它。SELECT 不受"一事务一条 DDL"约束，可参数化。
+        # **查 `pg_tables` 而不是 `information_schema.tables`**：后者按 PostgreSQL 的定义
+        # 是**按权限过滤**的（只列"当前用户有权访问的表"），而站点的表是 `{schema}_mig`
+        # 建的、这里用的是 admin 连接，且 DSQL 的 admin 是引导角色而非 superuser ⇒ 很可能
+        # 一张都看不见 ⇒ count=0 ⇒ **每次重部都误判成失配**。`pg_tables` 走 pg_class +
+        # pg_namespace、不按权限过滤，且 DSQL 的系统表文档明确列它为支持
+        # （`information_schema` 不在那份清单里）。SELECT 不受"一事务一条 DDL"约束，可参数化。
+        #
+        # **失败方向是刻意的：查不出来就什么都不做。** 这个守卫的前提（admin 能看见
+        # mig role 建的表）在真机上没有验证过。前提若不成立：把"查不出来"当成"空"会在
+        # 每次重部清掉 marker 并重跑全部迁移；让异常冒出去会让每一个存量 fullstack-sql
+        # 站点的重部直接失败。两者都比"守卫不生效"糟糕得多——它是**加固**，不是部署的
+        # 必要条件，所以只在**读到了一个确定为 0 的计数**时才动手。
         if applied:
-            cur.execute("SELECT count(*) FROM information_schema.tables "
-                        "WHERE table_schema = %s", (schema,))
-            row = cur.fetchone()
-            if row and row[0] == 0:
+            table_count = None
+            try:
+                cur.execute("SELECT count(*) FROM pg_tables WHERE schemaname = %s",
+                            (schema,))
+                row = cur.fetchone()
+                if row and isinstance(row[0], int) and not isinstance(row[0], bool):
+                    table_count = row[0]
+                else:
+                    logger.warning("catalog 守卫：读回的计数不可用（%r），跳过", row)
+            except Exception as e:
+                # 不 re-raise、也不当成空：见上面那段的失败方向说明
+                logger.warning("catalog 守卫：pg_tables 查询失败，跳过本次检查: %s", e)
+            if table_count == 0:
                 stale = list(applied)
                 applied = []
                 common.upsert_site(site_id, migrations_applied=applied)
@@ -193,18 +212,22 @@ def handler(event, context):
                     # 的原始异常，只有一句 "column already exists"——看不出是哪个
                     # 文件的第几条，也看不出前面几条已经不可回滚地提交了。
                     sqlstate = getattr(e, "sqlstate", None) or getattr(e, "pgcode", None)
+                    # **先说能行动的，再说解释性的**：这条消息唯一到得了用户眼前的
+                    # 通道是 job.error，而 mark_job 会把 SFN 的 Cause（一个 JSON 信封）
+                    # 截到 500 字符 ⇒ 排在后面的补救办法与出错语句会被切掉。
+                    # 措辞对**两种**失败都成立：不可重放的语句，以及瞬时错误
+                    # （超时 / OCC 中止 / 连接重置）——后者的 SQL 可能本来就是合规的，
+                    # 断言"你的 SQL 不可重放"是错的建议。原异常挂在 __cause__ 上，
+                    # sqlstate 仍可被程序取到。
                     raise RuntimeError(
-                        f"{marker} 第 {idx}/{len(stmts)} 条语句执行失败"
-                        f"（SQLSTATE={sqlstate}）：{str(e)[:200]}。"
-                        f"本文件前 {idx - 1} 条已提交且**不可回滚**"
-                        f"（DSQL 每条语句 autocommit），而本文件的已应用标记不会写入，"
-                        f"所以下次部署会**整文件重跑**。"
-                        f"补救：把该文件改成可重放形态"
-                        f"（CREATE TABLE IF NOT EXISTS / "
-                        f"ALTER TABLE … ADD COLUMN IF NOT EXISTS / "
-                        f"CREATE OR REPLACE VIEW / INSERT … ON CONFLICT DO NOTHING），"
-                        f"重新部署即可从头安全重跑；合同层红线 9 会在下次 validate "
-                        f"就拦下不可重放的语句。出错语句：{stmt[:120]}"
+                        f"{marker} 第 {idx}/{len(stmts)} 条失败"
+                        f"（SQLSTATE={sqlstate}）：{stmt[:120]}"
+                        f" ← {str(e)[:160]}"
+                        f"｜本文件前 {idx - 1} 条已提交且不可回滚（每条语句 autocommit），"
+                        f"标记未写入 ⇒ 下次部署整文件重跑。"
+                        f"若该语句不是可重放形态，改成 IF NOT EXISTS / "
+                        f"ON CONFLICT DO NOTHING 之类（合同层红线 9 会在 validate 拦它）；"
+                        f"若是瞬时错误（超时/冲突），直接重新部署即可。"
                     ) from e
             applied.append(marker)
             common.upsert_site(site_id, migrations_applied=applied)  # 逐文件立即记录

@@ -341,6 +341,33 @@ def test_run_file_failure_reports_file_stmt_sqlstate_and_remedy(aws):
     assert "1 条已提交" in msg, msg                  # 已知已提交的对象
     assert "可重放" in msg, msg                      # 补救办法
     assert "COLUMN z" in msg, msg                   # 出错的语句本体
+    # 原异常仍可被程序取到（不是只剩一个字符串）
+    assert getattr(ei.value.__cause__, "sqlstate", None) == "42701"
+    # **能行动的部分必须活过截断**：唯一到得了用户眼前的通道是 job.error，而
+    # mark_job 把 SFN 的 Cause（JSON 信封）截到 500 字符。留出信封开销后按 300 字符验。
+    head = msg[:300]
+    for needle in ("schema.sql", "第 2/2 条", "42701", "COLUMN z"):
+        assert needle in head, f"{needle!r} 掉在截断窗口之外: {head}"
+
+
+def test_run_file_failure_message_survives_mark_job_truncation(aws):
+    """瞬时错误不该被断言成"你的 SQL 不可重放"——措辞要对两种失败都成立。"""
+    import common
+    import pytest
+    common.create_job("a@x.com", "exp-transient")
+    _put("job-1", "backend/schema.sql",
+         b"CREATE TABLE IF NOT EXISTS a (id UUID PRIMARY KEY);")
+    mig_conn, mig_cur = _mock_conn()
+    def _timeout(sql, *a, **kw):        # 只在建表那条上抛（SET search_path 不在 run_file 内）
+        if "CREATE TABLE" in sql:
+            raise TimeoutError("connection reset")
+    mig_cur.execute.side_effect = _timeout
+    with pytest.raises(RuntimeError) as ei:
+        _run(event=_event(job_id="job-1", site_id="exp-transient"),
+             mig=(mig_conn, mig_cur))
+    msg = str(ei.value)
+    assert "瞬时错误" in msg and "重新部署" in msg, msg
+    assert isinstance(ei.value.__cause__, TimeoutError)
 
 
 # ---- 裁定 4/5/10：catalog 守卫（schema 已证明为空 + marker 非空 ⇒ 自愈 + 审计）----
@@ -367,8 +394,8 @@ def test_catalog_guard_self_heals_empty_schema_with_stale_marker(aws):
     _, admin_sqls, mig_sqls, _, _ = _run(
         event=_event(job_id="job-1", site_id="exp-heal"), admin=(admin_conn, admin_cur))
 
-    # 用 admin 连接查 catalog（mig role 能否读 information_schema 未验证，不赌它）
-    assert any("information_schema.tables" in s for s in admin_sqls), admin_sqls
+    # 用 admin 连接查 catalog（mig role 能否读 pg_catalog 未验证，不赌它）
+    assert any("pg_tables" in s for s in admin_sqls), admin_sqls
     # 自愈：marker 清空 ⇒ schema.sql 重跑 ⇒ 跑完重新记上
     assert any("CREATE TABLE" in s for s in mig_sqls), mig_sqls
     assert common.get_site_consistent("exp-heal")["migrations_applied"] == ["schema.sql"]
@@ -402,3 +429,71 @@ def test_catalog_guard_not_queried_when_marker_empty(aws):
          b"CREATE TABLE IF NOT EXISTS a (id UUID PRIMARY KEY);")
     _, admin_sqls, _, _, _ = _run(event=_event(job_id="job-1", site_id="exp-first"))
     assert not any("information_schema" in s for s in admin_sqls), admin_sqls
+
+
+# ---- catalog 守卫的两处加固（/code-review high）----
+
+def test_catalog_guard_uses_pg_tables_not_information_schema(aws):
+    """必须查 `pg_tables`，**不能**查 `information_schema.tables`。
+
+    两个理由：① `information_schema` 按 PostgreSQL 的定义是**按权限过滤**的（只列
+    "当前用户有权访问的表"），而站点的表是 `{schema}_mig` 建的、守卫用的是 admin
+    连接，DSQL 的 admin 是引导角色而非 superuser ⇒ 很可能一张都看不见 ⇒ count=0 ⇒
+    **每次重部都误判成失配并自愈**；② DSQL 的系统表文档没有把 `information_schema`
+    列进支持面，而 `pg_tables` 明确列为支持。
+    """
+    import common
+    common.create_job("a@x.com", "exp-pgt")
+    common.upsert_site("exp-pgt", migrations_applied=["schema.sql"])
+    _put("job-1", "backend/schema.sql",
+         b"CREATE TABLE IF NOT EXISTS a (id UUID PRIMARY KEY);")
+    admin_conn, admin_cur = _mock_conn()
+    admin_cur.fetchone.return_value = (2,)
+    _, admin_sqls, _, _, _ = _run(
+        event=_event(job_id="job-1", site_id="exp-pgt"), admin=(admin_conn, admin_cur))
+    assert any("pg_tables" in s for s in admin_sqls), admin_sqls
+    assert not any("information_schema" in s for s in admin_sqls), admin_sqls
+
+
+def test_catalog_guard_failure_does_not_break_deploy_or_wipe_marker(aws):
+    """catalog 查询失败 ⇒ 守卫**什么都不做**（退回本票之前的行为），不炸也不清 marker。
+
+    这是**故意的失败方向**：守卫的前提（admin 能看见 mig role 建的表）在真机上没有
+    验证过。前提若不成立，"查不出来就当成空"会在每次重部都清掉 marker 并重跑全部
+    迁移；而让异常冒出去会让每一个存量 fullstack-sql 站点的重部直接失败。两者都比
+    "守卫不生效"糟糕得多——守卫是**加固**，不是部署的必要条件。
+    """
+    import common
+    common.create_job("a@x.com", "exp-guarderr")
+    common.upsert_site("exp-guarderr", migrations_applied=["schema.sql"])
+    _put("job-1", "backend/schema.sql",
+         b"CREATE TABLE IF NOT EXISTS a (id UUID PRIMARY KEY);")
+    admin_conn, admin_cur = _mock_conn()
+
+    def _boom(sql, *a, **kw):
+        if "pg_tables" in sql:
+            raise RuntimeError("relation \"pg_tables\" does not exist")
+    admin_cur.execute.side_effect = _boom
+
+    _, _, mig_sqls, _, _ = _run(
+        event=_event(job_id="job-1", site_id="exp-guarderr"),
+        admin=(admin_conn, admin_cur))          # 不抛
+    assert common.get_site_consistent("exp-guarderr")["migrations_applied"] == ["schema.sql"]
+    assert not any("CREATE TABLE" in s for s in mig_sqls), mig_sqls
+    assert [r for r in _ops_rows() if r["action"] == "dsql-marker-self-heal"] == []
+
+
+def test_catalog_guard_ignores_unusable_count(aws):
+    """读回的计数不是可用的数字（None / 非整数）⇒ 同样什么都不做。"""
+    import common
+    for site_id, row in (("exp-cnone", None), ("exp-cbad", ("x",))):
+        common.create_job("a@x.com", site_id)
+        common.upsert_site(site_id, migrations_applied=["schema.sql"])
+        _put("job-1", "backend/schema.sql",
+             b"CREATE TABLE IF NOT EXISTS a (id UUID PRIMARY KEY);")
+        admin_conn, admin_cur = _mock_conn()
+        admin_cur.fetchone.return_value = row
+        _, _, mig_sqls, _, _ = _run(event=_event(job_id="job-1", site_id=site_id),
+                                    admin=(admin_conn, admin_cur))
+        assert common.get_site_consistent(site_id)["migrations_applied"] == ["schema.sql"]
+        assert not any("CREATE TABLE" in s for s in mig_sqls), (site_id, mig_sqls)
