@@ -11,6 +11,7 @@ import boto3
 import sqlparse
 
 import common
+import ops_log
 
 logger = logging.getLogger()
 
@@ -117,6 +118,40 @@ def handler(event, context):
     try:
         cur = conn.cursor()
         cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+
+        # ---- catalog 守卫：marker 非空却查到 schema 是空的 = **已证明的失配** ----
+        # undeploy 的 purge 路径只覆盖 5 条让 marker 失效的路径里的 1 条，另外 4 条是：
+        #   ① DEPLOY.md 自己教的孤儿清理 `DROP SCHEMA "site_xxx" CASCADE`（预期会被用）；
+        #   ② DSQL cluster 重建 / endpoint 重指——sites 行里**不记任何 DSQL 身份**，
+        #      换 cluster 会让每个 fullstack-sql 站点的 marker 一次性全部失效，无人察觉；
+        #   ③ 站点自己的 SQL `DROP TABLE`；④ purge 时 tier 未知会跳过 DSQL 清理。
+        # 失配的后果是**静默**的：跳过 schema.sql ⇒ 站点起来但一张表都没有。
+        #
+        # **自愈而不是 fail closed**：判据是"schema 已证明为空"，空 schema 上重跑不可能
+        # 覆盖数据；而 fail closed 会把一个可自动修复的状态变成人工工单，且手册自己教的
+        # 手工 DROP SCHEMA 之后必然撞上它。审计行让「平台替你重跑了建库 SQL」留痕。
+        #
+        # **效力边界**：schema 空 + marker 非空 = 已证明的失配；schema **非空**则什么都
+        # 证明不了（不告诉你哪些文件跑过），此时不动。
+        # **必须用 admin 连接**（此刻正在 admin 块内）：mig role 能否读 pg_catalog /
+        # information_schema **未验证**，不赌它。SELECT 不受"一事务一条 DDL"约束，可参数化。
+        if applied:
+            cur.execute("SELECT count(*) FROM information_schema.tables "
+                        "WHERE table_schema = %s", (schema,))
+            row = cur.fetchone()
+            if row and row[0] == 0:
+                stale = list(applied)
+                applied = []
+                common.upsert_site(site_id, migrations_applied=applied)
+                job = common.get_job(job_id) or {}
+                ops_log.record(actor=job.get("owner", ""),
+                               action="dsql-marker-self-heal",
+                               target=f"site:{site_id}", result="ok",
+                               detail={"schema": schema, "cleared_marker": stale,
+                                       "reason": "schema 已证明为空而已应用标记非空——"
+                                                 "重置标记以重跑建库 SQL"})
+                logger.warning("catalog 守卫自愈 site=%s schema=%s 清空 marker=%s",
+                               site_id, schema, stale)
 
         # runtime role（站点 Lambda 用，无 CREATE）与 migrator role（跑 DDL，仅本 schema）
         for role in (pg_role, mig_role):

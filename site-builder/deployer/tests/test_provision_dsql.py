@@ -341,3 +341,64 @@ def test_run_file_failure_reports_file_stmt_sqlstate_and_remedy(aws):
     assert "1 条已提交" in msg, msg                  # 已知已提交的对象
     assert "可重放" in msg, msg                      # 补救办法
     assert "COLUMN z" in msg, msg                   # 出错的语句本体
+
+
+# ---- 裁定 4/5/10：catalog 守卫（schema 已证明为空 + marker 非空 ⇒ 自愈 + 审计）----
+
+def _ops_rows():
+    return boto3.resource("dynamodb", region_name="us-east-1").Table(
+        "site-ops-log").scan()["Items"]
+
+
+def test_catalog_guard_self_heals_empty_schema_with_stale_marker(aws):
+    """purge 路径只覆盖 5 条让 marker 失效的路径里的 1 条（F9 列了另外 4 条：手册教的
+    手工 DROP SCHEMA、DSQL cluster 重建/endpoint 重指、站点自己 DROP TABLE、purge 时
+    tier 未知跳过 DSQL）。守卫按"schema **已证明**为空"自愈：空 schema 上重跑不可能
+    覆盖数据。**不 fail closed**——那会把一个可自动修复的状态变成人工工单，而手册自己
+    教的 DROP SCHEMA 之后必然撞上它。
+    """
+    import common
+    common.create_job("a@x.com", "exp-heal")
+    common.upsert_site("exp-heal", migrations_applied=["schema.sql", "001_add.sql"])
+    _put("job-1", "backend/schema.sql",
+         b"CREATE TABLE IF NOT EXISTS a (id UUID PRIMARY KEY);")
+    admin_conn, admin_cur = _mock_conn()
+    admin_cur.fetchone.return_value = (0,)          # schema 里 0 张表 ⇒ 已证明失配
+    _, admin_sqls, mig_sqls, _, _ = _run(
+        event=_event(job_id="job-1", site_id="exp-heal"), admin=(admin_conn, admin_cur))
+
+    # 用 admin 连接查 catalog（mig role 能否读 information_schema 未验证，不赌它）
+    assert any("information_schema.tables" in s for s in admin_sqls), admin_sqls
+    # 自愈：marker 清空 ⇒ schema.sql 重跑 ⇒ 跑完重新记上
+    assert any("CREATE TABLE" in s for s in mig_sqls), mig_sqls
+    assert common.get_site_consistent("exp-heal")["migrations_applied"] == ["schema.sql"]
+    # 审计留痕：「平台替你重跑了建库 SQL」这件事必须能查
+    rows = [r for r in _ops_rows() if r["action"] == "dsql-marker-self-heal"]
+    assert len(rows) == 1 and rows[0]["target"] == "site:exp-heal", rows
+    assert "001_add.sql" in rows[0]["detail"], rows[0]["detail"]
+
+
+def test_catalog_guard_leaves_nonempty_schema_alone(aws):
+    """schema 非空则**什么都证明不了**（不知道哪些文件跑过），守卫必须不动。"""
+    import common
+    common.create_job("a@x.com", "exp-keep")
+    common.upsert_site("exp-keep", migrations_applied=["schema.sql"])
+    _put("job-1", "backend/schema.sql",
+         b"CREATE TABLE IF NOT EXISTS a (id UUID PRIMARY KEY);")
+    admin_conn, admin_cur = _mock_conn()
+    admin_cur.fetchone.return_value = (3,)
+    _, _, mig_sqls, _, _ = _run(
+        event=_event(job_id="job-1", site_id="exp-keep"), admin=(admin_conn, admin_cur))
+    assert not any("CREATE TABLE" in s for s in mig_sqls), mig_sqls
+    assert common.get_site_consistent("exp-keep")["migrations_applied"] == ["schema.sql"]
+    assert [r for r in _ops_rows() if r["action"] == "dsql-marker-self-heal"] == []
+
+
+def test_catalog_guard_not_queried_when_marker_empty(aws):
+    """marker 本来就空（首次部署）：没有失配可言，不该多打一次 catalog 查询。"""
+    import common
+    common.create_job("a@x.com", "exp-first")
+    _put("job-1", "backend/schema.sql",
+         b"CREATE TABLE IF NOT EXISTS a (id UUID PRIMARY KEY);")
+    _, admin_sqls, _, _, _ = _run(event=_event(job_id="job-1", site_id="exp-first"))
+    assert not any("information_schema" in s for s in admin_sqls), admin_sqls
