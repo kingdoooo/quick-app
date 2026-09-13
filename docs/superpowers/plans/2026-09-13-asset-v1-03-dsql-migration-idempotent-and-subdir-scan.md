@@ -7,7 +7,7 @@
 
 **Goal:** DSQL 建库/迁移半途失败后同输入重试要么幂等成功、要么在 provision-db 响亮失败并给出补救办法，且 `migrations/` 子目录里的 SQL 不再能绕过红线扫描。
 
-**Architecture:** 处方分两层落地。**合同层（validate 之前，最便宜的拦截点）**：新增一条"可重放"红线，用**白名单**只放行 AWS 文档确认幂等的 DDL/DML 形态，其余一律拒；`migrations/` 下出现子目录即拒；`FORBIDDEN_DDL` 的扫描面从只扫 `schema.sql` 扩到全部被执行的 `.sql` 文件。**执行层（provision-db）**：列举迁移对象时加 `Delimiter="/"`（不再递归看子目录，与合同层口径一致）；admin 引导连接上加一次 catalog 探测，在"schema 已证明为空但 marker 非空"这个可自愈的失配上自愈并写审计行；marker 读取改强一致；`run_file` 失败时抛出含文件名/语句序号/SQLSTATE/已提交对象/补救办法的富错误。下线的 `purge_data` 路径补上清 marker（今天 5 条让 marker 失效的路径只覆盖了 1 条，catalog 守卫兜住其余 4 条）。
+**Architecture:** 处方分两层落地。**合同层（validate 之前，最便宜的拦截点）**：新增一条"可重放"红线，用**白名单**只放行 AWS 文档确认幂等的 **DDL** 形态，其余一律拒（DML 整类豁免——原裁定 (b) 要求 `ON CONFLICT DO NOTHING`，**实施后被推翻**，见下面「DML 子决策」一节）；`migrations/` 下出现子目录即拒；`FORBIDDEN_DDL` 的扫描面从只扫 `schema.sql` 扩到全部被执行的 `.sql` 文件。**执行层（provision-db）**：列举迁移对象时加 `Delimiter="/"`（不再递归看子目录，与合同层口径一致）；admin 引导连接上加一次 catalog 探测，在"schema 已证明为空但 marker 非空"这个可自愈的失配上自愈并写审计行；marker 读取改强一致；`run_file` 失败时抛出含文件名/语句序号/SQLSTATE/已提交对象/补救办法的富错误。下线的 `purge_data` 路径补上清 marker（今天 5 条让 marker 失效的路径只覆盖了 1 条，catalog 守卫兜住其余 4 条）。
 
 **Tech Stack:** Python 3.12、pytest、moto（`mock_aws`）、`unittest.mock`（连接层 mock + 有状态 fake cursor）、boto3（DynamoDB/S3）、sqlparse（**仅执行器侧** `provision_dsql._statements`；合同层不引入 sqlparse——见 Task 3 的口径说明）。
 
@@ -33,14 +33,53 @@
 - **`git commit` 绝不带 `--no-verify`**（根 `CLAUDE.md` Git 段）。提交前 `git add` 后单独跑 `bash site-builder/scripts/scan_staged_secrets.sh` 并看 `$?`（经管道退出码会被吞）。
 - **默认不跑真机。** 证据强度如实标"mock 层 + AWS 文档核实"。白名单红线的正确性不依赖 `CREATE SCHEMA`/`DROP TABLE` 的 IF 形态到底行不行（选白名单的全部好处）；两条反例都能在 mock 层证明。
 
-## DML 子决策（本计划裁定，理由留痕）
+## DML 子决策（本计划裁定 (b)，**实施后被推翻，改为 DML 整类退出**）
 
-**裁定：采纳处方倾向的 (b) —— `schema.sql`/migrations 里的 DML（`INSERT` 种子数据）必须带 `ON CONFLICT DO NOTHING`，否则红线拒。**
+> **⚠️ 这一节保留原始裁定与它被推翻的过程。落地的是"DML 不在红线 9 射程内"，
+> 不是下面原本裁定的 (b)。** 真源是 `contract/src/contract/redlines.py` 的 `_DML_RE`
+> 注释与 `references/redlines.md` 红线 9 的「种子数据」一节。
 
-- **为什么不选 (a) 禁止 DML**：种子数据是站点作者的真实需求（枚举表、初始配置行）。禁掉会逼作者把种子塞进应用启动代码，那既绕开了合同层的可重放保证，又让"数据初始化"散落到不可信站点代码里。
-- **为什么不选 (c) 只警告**：本票的完成判据是"同输入重试幂等"。裸 `INSERT` 重放会重复插入，是本票要消灭的不幂等来源之一，只警告等于留着它。
-- **为什么 (b) 自洽**：`ON CONFLICT DO NOTHING` 需要一个唯一约束（PK 或 UNIQUE）作冲突目标，而 fixture/文档里的建表约定本就是每表带 `PRIMARY KEY`（`sql-expenses` 的 `id UUID PRIMARY KEY`）。要求 `ON CONFLICT DO NOTHING` 与这条既有约定同向，不引入新约束。
-- **F1 不阻碍 (b)**：DSQL 禁止 DDL 与 DML 同事务、每事务一条 DDL——但执行器是 **autocommit**，每条语句各自一个事务，`INSERT` 独立成事务合法。禁的是 `BEGIN; DDL; DML; COMMIT;` 这种包裹（合同层与文档本就禁 `BEGIN`/`COMMIT`）。
+**原裁定 (b)**：`schema.sql`/migrations 里的 DML（`INSERT` 种子数据）必须带
+`ON CONFLICT DO NOTHING`，否则红线拒。当时的理由：
+
+- 不选 (a) 禁止 DML —— 种子数据是站点作者的真实需求，禁掉会逼作者把种子塞进应用启动
+  代码，那既绕开了合同层的可重放保证，又让"数据初始化"散落到不可信站点代码里。
+- 不选 (c) 只警告 —— 裸 `INSERT` 重放会重复插入，是本票要消灭的不幂等来源之一。
+- 认为 (b) 自洽 —— `ON CONFLICT DO NOTHING` 需要一个唯一约束作冲突目标，而建表约定本就
+  是每表带 `PRIMARY KEY`。
+- F1 不阻碍 (b) —— 执行器 autocommit，`INSERT` 独立成事务合法。
+
+**为什么被推翻（四条独立理由，实施后才发现）**：
+
+1. **它不 brick 部署，也就是说它不在 M03 的射程内。** M03 的失败模式是"同输入重试永久
+   失败"：裸 `CREATE TABLE` 重放报 `42P07` ⇒ 抛出 ⇒ 此后每次部署都同样失败。裸 `INSERT`
+   重放是**成功**的（没有约束冲突）⇒ 文件跑完 ⇒ 标记写入 ⇒ **部署 SUCCEEDED**。多出来
+   的只是几行重复数据 —— 数据质量问题，而红线 9 管的是可部署性。上面"是本票要消灭的
+   不幂等来源之一"那句把两种"不幂等"混为一谈了。
+2. **强制它违反白名单自己的原则。** 白名单拒 `DROP TABLE IF EXISTS` 的唯一理由是"DSQL
+   文档没说 ⇒ 不放行"。而 `ON CONFLICT` 的**子句级**支持恰恰也是"未说明"：userguide 只在
+   总表里粗粒度写了 `INSERT INTO … VALUES/SELECT [ON CONFLICT]`，没有 INSERT 的详细语法
+   页，`DO NOTHING` / conflict_target 支持到什么程度都没写。**用"文档没说"拒一个形态、
+   同时强制另一个"文档没说"的形态，这两件事不能同时成立**；更糟的是红线可能把作者推进
+   一个不受支持的写法，那是制造故障而不是防故障。
+3. **"需要唯一约束作冲突目标"这条推理对最常见的种子形状不成立。** `id UUID PRIMARY KEY
+   DEFAULT gen_random_uuid()` 且没有自然键时，`ON CONFLICT DO NOTHING` 的冲突目标每次都是
+   新生成的 uuid ⇒ **永不冲突** ⇒ 过了红线仍然重复插入。实测：验证环境一个 ACTIVE 站点
+   （`return-analysis-ckvnjq`）的 `schema.sql` 是 35 条语句 / 30 条种子 `INSERT`，DDL 那半
+   本来就合规，而它正是这个形状 —— 按当时文档写的升级路径（补 `ON CONFLICT`）改完**仍然
+   不幂等**。一条要花成本、合规后仍不成立的红线，比没有这条红线更糟（假安全感）。
+4. **平台从不要求种子数据**：SKILL 与 templates 对此完全沉默，三个 fixture 里唯一的 `.sql`
+   零条 DML。这条形态是 Agent 自发产出的（dashboard 类站点几乎必然），所以代价会反复付。
+
+**落地形态**：`_DML_RE` 把 `INSERT` / `UPDATE` / `DELETE` 整类豁免（`UPDATE … SET 常量`
+与 `DELETE … WHERE` 重放本就幂等，同样不 brick）。**`BEGIN`/`COMMIT` 仍然拒** —— 它们不是
+DML，且"一事务只许一条 DDL、DDL 与 DML 不能同事务"有文档依据。`references` 把种子数据从
+"规则"降为"建议"，并给出**真的**幂等写法：内联 `UNIQUE` 自然键（在 DSQL 的 `CREATE TABLE`
+支持语法内）+ `ON CONFLICT (那个键) DO NOTHING`，同时写明**不要**拿
+`CREATE UNIQUE INDEX ASYNC` 当冲突目标（文档明说异步索引初始 `INVALID`、需
+`sys.wait_for_job()` 等待）。
+
+**顺带的效果**：那个 ACTIVE 站点无需改动即恢复可部署。
 
 ## 处方与裁定的映射（六条，别重新论证）
 
@@ -48,6 +87,7 @@
 |---|---|
 | 1. 子目录**拒**（校验器加红线 + 执行器 `Delimiter="/"`）；M16「marker 键含相对路径」因此无事可做 | Task 1（校验器）+ Task 6（执行器） |
 | 2. `schema.sql` 与 `migrations/*.sql` 同等对待（可重放红线两者都管） | Task 2、Task 3 |
+| （追加）DML 整类退出红线 9 —— **推翻本计划的裁定 (b)** | 见「DML 子决策」一节 |
 | 3. 幂等按 merged review 组合方案：① 白名单可重放 + ④ 富失败信息 + ② 降级为红线白名单，不做语句级 marker；③ 单独开票 | Task 3（①②）、Task 8（④） |
 | 4. `undeploy(purge_data=True)` 清 marker + catalog 守卫 | Task 9（守卫）+ Task 10（purge 清 marker） |
 | 5. catalog 守卫失配时**自愈 + 写审计行**（非 fail closed） | Task 9 |
@@ -234,7 +274,7 @@ git commit -m "feat(contract/03): FORBIDDEN_DDL/索引扫描面扩到 migrations
 4. `ALTER TABLE [IF EXISTS] … DROP COLUMN IF EXISTS …`
 5. `ALTER TABLE [IF EXISTS] … DROP CONSTRAINT IF EXISTS …`
 6. `CREATE OR REPLACE VIEW …`（DSQL 文档确认支持 `OR REPLACE`，重放即替换、不报错）
-7. `INSERT INTO … ON CONFLICT DO NOTHING …`（DML，见上「DML 子决策」(b)）
+7. ~~`INSERT INTO … ON CONFLICT DO NOTHING …`~~ —— **已删除**：DML 整类退出红线 9（推翻裁定 (b)，见「DML 子决策」一节）
 
 **口径说明（写进 docstring，Global Constraints 第 4 条）**：合同层**不引入 sqlparse**（执行器侧用的 sqlparse 有 0.6.0/0.5.5 生产/测试版本偏斜，见 F2；给合同再加一份只会放大偏斜面）。合同层用一个**保守的**切分器：先把 `--`/`/* */` 注释与单引号字符串抹白，再按 `;` 切。字符串里的 `;`（如 `DEFAULT 'a;b'`）因已抹白不会误切。切完对每条判白名单——切法与执行器不必字节一致，因为本检查偏保守（宁可误报）：切碎产生的非关键词片段会落到"不在白名单"分支被拒，方向安全。
 
@@ -254,7 +294,7 @@ from contract.redlines import _check_sql_replayable
     "ALTER TABLE IF EXISTS t DROP COLUMN IF EXISTS c;",
     "ALTER TABLE IF EXISTS t DROP CONSTRAINT IF EXISTS ck;",
     "CREATE OR REPLACE VIEW v AS SELECT id FROM t;",
-    "INSERT INTO t (id) VALUES (gen_random_uuid()) ON CONFLICT DO NOTHING;",
+    "INSERT INTO t (id) VALUES (gen_random_uuid()) ON CONFLICT DO NOTHING;",   # 注：DML 后来整类豁免
     "CREATE TABLE IF NOT EXISTS t (id UUID PRIMARY KEY, note TEXT DEFAULT 'a;b');",  # 串内分号
     "-- 只是注释 DROP TABLE t;\nCREATE TABLE IF NOT EXISTS t (id UUID PRIMARY KEY);",  # 注释里的坏词不算
 ])
@@ -269,6 +309,7 @@ def test_replayable_forms_pass(sql):
     "ALTER TABLE t ADD COLUMN c TEXT;",                      # ADD COLUMN 缺 IF NOT EXISTS
     "ALTER TABLE t ALTER COLUMN c TYPE INT;",               # ALTER COLUMN 不在白名单
     "CREATE VIEW v AS SELECT 1;",                            # 缺 OR REPLACE
+    # ↓ 这四条 DML 在最终形态里**是放行的**（裁定 (b) 被推翻），保留原文以记录当时的判据
     "INSERT INTO t (id) VALUES (gen_random_uuid());",        # DML 缺 ON CONFLICT DO NOTHING
     "UPDATE t SET c = '1';",                                 # 白名单外
     "DELETE FROM t;",                                        # 白名单外
