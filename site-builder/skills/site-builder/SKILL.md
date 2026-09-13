@@ -109,5 +109,5 @@ description: 开发并一键部署简易 Web 站点到 AWS。当用户想创建/
 - 渲染用户输入用 textContent / DOM API，禁止拼 innerHTML（存储型 XSS）
 - DSQL 禁：外键/SERIAL/JSONB 列/触发器/TEMP TABLE → 用 UUID 主键、TEXT 存 JSON
 - 数据库访问只用模板 db.js 的 makePool()，不自写连接（平台注入专属只读身份）
-- site.json 的 auth.require_login=true 时访问者需飞书登录；
+- site.json 的 auth.require_login=true 时访问者需经平台的 IdP 登录；
   allowed_users 填 "org"（全组织）或邮箱数组

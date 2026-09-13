@@ -6,7 +6,8 @@
 **与客户端自身的账号体系无关**：Claude Code / Codex / Quick 各自怎么登录是
 客户端自己的事，本方案不做任何假设。这里的"认证"全部指**对本平台**的身份
 （部署权限、站点访问、控制台），走平台自带的 Cognito——联邦到部署时接入的
-飞书或标准 IdP。下文"飞书登录/授权页"在标准 IdP 场景对应你的 IdP 登录页。
+你在部署时接入的那个 OIDC IdP。下文说"IdP 登录/授权页"时，指的就是它的登录页
+（飞书是其中一种参考适配器，走的也是同一条 OIDC 路径）。
 
 **前置**：DEPLOY.md ①–⑤ 全部完成，`config.ini [MCP] endpoint_url` 已回填。
 
@@ -18,7 +19,7 @@ https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/<url-encoded-runtime-
 
 ## 通用前提：拿一个 Cognito token
 
-所有客户端都用 OAuth 携带飞书身份。runtime 配的是 `customJWTAuthorizer`
+所有客户端都用 OAuth 携带 IdP 身份。runtime 配的是 `customJWTAuthorizer`
 （`allowedClients=[mcp_client_id]`），调用必须带 `Authorization: Bearer <token>`。
 
 **token 里必须有 `email` claim**——`owner`（谁部署的、谁能改）就取自它。
@@ -87,7 +88,7 @@ print(d['projects']['$PWD']['mcpServers']['site-builder-deploy']['args'])"
 
 预期：Skill 走完澄清 → 生成代码 → 本地预览 → `deploy_site` → PUT zip →
 `confirm_upload` → 轮询 `get_deploy_status` 播报 phase → 返回
-`https://app-xxx.{base_domain}`。浏览器打开该 URL 应跳飞书登录，登录后可加书。
+`https://app-xxx.{base_domain}`。浏览器打开该 URL 应跳 IdP 登录，登录后可加书。
 
 ## Amazon Quick Desktop（人工配置；已真机走通）
 
@@ -99,7 +100,7 @@ print(d['projects']['$PWD']['mcpServers']['site-builder-deploy']['args'])"
    用 `site-builder/clients/quick-desktop-proxy/`（纯 Node 内置模块，免 install）：
    ```bash
    cd site-builder/clients/quick-desktop-proxy
-   node auth.js "{mcp_endpoint_url}" "{mcp_client_id}"   # 浏览器飞书登录，token 落盘
+   node auth.js "{mcp_endpoint_url}" "{mcp_client_id}"   # 浏览器走 IdP 登录，token 落盘
    ```
    然后注册为 Local MCP。推荐直接编辑
    `~/.quickwork/profiles/{profile}/mcp_config.json`（重启生效；args 是 JSON
@@ -155,9 +156,9 @@ npx @modelcontextprotocol/inspector
 |---|---|---|
 | 列出工具 | <!-- tool-count:begin -->9<!-- tool-count:end --> 个（清单见下） | 容器未起或协议不匹配（应为 stateless streamable-http，0.0.0.0:8000/mcp） |
 | 不带 token 调用 | 401 | authorizer 未生效——任何人可部署 |
-| `list_my_sites` 的 owner | == 你的飞书邮箱 | email claim 没透传：检查 `requestHeaderAllowlist` 含 `Authorization`，再按上文选 id_token 或 pre-token Lambda |
+| `list_my_sites` 的 owner | == 你在 IdP 里的邮箱 | email claim 没透传：检查 `requestHeaderAllowlist` 含 `Authorization`，再按上文选 id_token 或 pre-token Lambda |
 | 换另一个账号调 `get_deploy_status(别人的 job)` | 报"你不是…所有者" | owner 校验被绕过 |
-| 完整部署一次 | 拿到 URL 且浏览器能飞书登录访问 | 见 DEPLOY.md 各阶段排查 |
+| 完整部署一次 | 拿到 URL 且浏览器能经 IdP 登录访问 | 见 DEPLOY.md 各阶段排查 |
 
 上表第一行应当列出的工具面（工具面的真源是 `mcp/server.py` 的装饰器，
 由 `mcp/tests/test_agentcore_contract.py` 与 `test_doc_tool_surface.py` 两侧锁定）：

@@ -32,7 +32,7 @@
 - **规则**：前端禁止 `innerHTML` / `outerHTML` 赋值或拼接（`=`、`+=`、
   `||=`、`??=`），禁止 `insertAdjacentHTML()`、`document.write()` /
   `document.writeln()`。
-- **为什么**：站点在组织内共享飞书登录会话（顶域 cookie），存储型 XSS 的
+- **为什么**：站点在组织内共享同一个登录会话（顶域 cookie），存储型 XSS 的
   危害被放大——一个用户提交的恶意内容会在所有访问者的登录态下执行。
 - **违反后果**：
   `frontend/xxx: 前端禁止 innerHTML 赋值/拼接（存储型 XSS 风险），改用 textContent 或安全模板`
@@ -55,7 +55,7 @@
 - **规则**：后端禁止出现任何自带鉴权的痕迹：`jwt.sign`、`jsonwebtoken`、
   `passport`、`OAuth2`、`client_secret`、`express-session`、`cookie-session`、
   `res.cookie(`、`Set-Cookie`、`set_cookie(...session` 等。
-- **为什么**：登录/鉴权由平台边缘层统一处理（飞书 SSO + 顶域会话 cookie）。
+- **为什么**：登录/鉴权由平台边缘层统一处理（IdP 联邦 + 顶域会话 cookie）。
   站点自带 auth 代码是 AI 生成错误的重灾区，且会与平台鉴权冲突。
 - **违反后果**：
   `backend/xxx: 站点代码禁止自带 auth 逻辑（鉴权由平台边缘层统一处理）`

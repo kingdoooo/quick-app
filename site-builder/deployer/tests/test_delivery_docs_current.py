@@ -1575,3 +1575,73 @@ def test_tracked_label_guard_catches_a_synthetic_lie(tmp_path):
     assert hits == ["docs/security/does-not-exist.json"], hits
     assert _is_doc_pointer(hits[0])
     assert not _distributed(hits[0], {"docs/security/other.json"}, README)
+
+
+# ── 工单 12 的两件新增内容 ─────────────────────────────────────────────────
+
+def test_deploy_md_recommends_a_dedicated_account_and_says_why():
+    """§9 的 3d 把「迁独立成员账号」从工程项降为**手册建议**（ADR 0005）。
+    降级的前提是手册真的写了它并说清理由——否则那一行裁定等于把事情丢掉了。
+
+    判据切到 §0 的账号一节：必须同时有"建议专用账号"、"为什么"（那三条能力）、
+    以及"共享账号也站得住"（不然读者会以为这是硬前置而卡在这里）。
+    """
+    sec = _section(_read(DEPLOY), "#### 建议：部署到一个**专用**账号（是建议，不是硬要求）")
+    assert "kms:Sign" in sec, "没说清「能签会话」是哪条能力"
+    assert "ReadOnlyAccess" in sec, "没说清只读权限不够（这是刻意做到的那一半）"
+    assert "共享账号" in sec, "没说清共享账号里资产仍然站得住 ⇒ 读者会当成硬前置"
+    assert "account-trust-boundary.md" in sec, "没指向完整口径"
+    assert "verify_account_trust_boundary.py" in sec, "没说清漂移闸门在共享账号里会变噪音"
+
+
+# 采用者文档里不许出现的**具体主张**（工单 12）。判据是这些"把身份等同于飞书"的
+# 说法，**不是"出现飞书"**——后者做不成守卫：手册里有整节【飞书】步骤、有逐路枚举
+# org 边界的表、有"这个 secret 不是飞书 App Secret"这类澄清，全是正当的。
+# 试过按行 + 短语白名单，四轮下来白名单越长、判据越弱，最后会放行一切。
+_FEISHU_BINDING_CLAIMS = (
+    "绑定飞书账号", "绑飞书账号", "都绑飞书", "需飞书登录", "必须飞书登录",
+    "全组织飞书用户", "访问者需飞书", "飞书或标准 IdP", "携带飞书身份",
+    "跳飞书登录", "你的飞书邮箱", "能飞书登录",
+)
+
+
+def _feishu_binding_offenders(text: str, name: str) -> list:
+    """→ 违规行清单。守卫与正/负对照**共用**它（判定只有一处）。"""
+    out = []
+    for no, line in enumerate(text.splitlines(), 1):
+        for claim in _FEISHU_BINDING_CLAIMS:
+            if claim in line:
+                out.append(f"{name}:{no} [{claim}] {line.strip()[:80]}")
+    return out
+
+
+def test_adopter_docs_do_not_bind_identity_to_feishu():
+    """飞书是**一种参考适配器**，不是身份模型的一部分（ADR 0006 / 工单 12）。
+
+    "访问者需飞书登录 / 绑定飞书账号 / 全组织飞书用户"会让没有飞书的人以为这个平台
+    用不了——而三条身份路径里有两条与飞书无关。**否定断言覆盖整份文件**（连
+    【飞书】那一节也一样：那一节该说的是"走这条路时…"，不是无条件的"都绑飞书"）。
+    """
+    offenders = []
+    for doc in (README, CLAUDE_MD, CONTEXT_MD, DEPLOY, CLIENT_SETUP,
+                SKILL_MD, SKILL_CONTRACT, SKILL_REDLINES):
+        offenders += _feishu_binding_offenders(_read(doc), doc.name)
+    assert not offenders, (
+        "这些位置把身份绑在飞书上（它只是一种参考适配器）：\n  " + "\n  ".join(offenders))
+
+
+def test_feishu_binding_guard_fires_on_each_claim():
+    """**正对照**：每条主张都必须真的被**同一个判定函数**认出来。
+
+    上一版这条是同义反复（自己造一行含 claim 的文本，再断言 claim 在里面），
+    那种正对照在判定逻辑写错时照样绿。现在走 `_feishu_binding_offenders`。
+    """
+    for claim in _FEISHU_BINDING_CLAIMS:
+        hits = _feishu_binding_offenders(f"前缀：{claim}，其余照旧。", "probe.md")
+        assert len(hits) == 1 and claim in hits[0], (claim, hits)
+    # 负对照：正当的谈法不许被认成违规
+    for clean in ("飞书是一种参考适配器，走 OIDC 适配器接进来。",
+                  "> **飞书** —— org = 创建企业自建应用的那个租户。",
+                  "**不是飞书 App Secret**。看 describe-identity-provider 就明白。",
+                  "走这条路时，站点登录与部署权限绑的就是飞书账号。"):
+        assert _feishu_binding_offenders(clean, "probe.md") == [], clean

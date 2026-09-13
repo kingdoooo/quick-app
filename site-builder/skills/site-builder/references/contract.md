@@ -51,8 +51,8 @@ my-site/
 | `database.tables[].name` | string | dynamodb 每项必填 | 正则 `[a-z][a-z0-9_]{0,29}`（小写开头，长度 1–30）——**不得含连字符**，见下方「表名与属性名的字符集为什么不同」 | `"notes"` |
 | `database.tables[].pk` | string | dynamodb 每项必填 | 分区键属性名，正则 `[a-z][a-z0-9_-]{0,29}`——**允许连字符**（与表名不同，属性名不参与资源命名）；类型固定为字符串（S） | `"id"` |
 | `auth` | object | 必填 | 见下两行 | — |
-| `auth.require_login` | boolean | 必填 | `true`：访问者必须飞书登录；`false`：匿名可访问 | `true` |
-| `auth.allowed_users` | string 或 array | 必填 | `"org"`（全组织飞书用户）或非空邮箱数组（每项须为合法邮箱） | `"org"` 或 `["a@corp.com", "b@corp.com"]` |
+| `auth.require_login` | boolean | 必填 | `true`：访问者必须经平台的 IdP 登录；`false`：匿名可访问 | `true` |
+| `auth.allowed_users` | string 或 array | 必填 | `"org"`（平台 IdP 里的全部用户）或非空邮箱数组（每项须为合法邮箱） | `"org"` 或 `["a@corp.com", "b@corp.com"]` |
 
 > **`auth` 只在站点首次部署时生效。** 站点建好后，访问策略的真源是平台侧
 > 记录：用户在控制台（`https://console.<域名>`）或 MCP 工具
