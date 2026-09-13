@@ -1,5 +1,8 @@
 # 内置 Cognito 管理员建户 IdP 模式（asset-v1 工单 07）Implementation Plan
 
+> **决策记录，不是操作指引。** 本文含单账号实测数据与当时的取舍过程，按写下的那一刻为准；
+> 采用者要的操作步骤真源是 `site-builder/DEPLOY.md`，还剩什么没做看 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 给 `deploy_pool.py` 加一个 `[IdP] mode = cognito-admin` 模式：同一次运行里再建**第二个** Cognito 用户池充当 OIDC IdP（LITE 档、只许管理员建户、`email` 在 schema 层不可变），平台池照常以 OIDC 联邦接它——让"还没有任何 IdP"的采用者零外部依赖完成首次部署。

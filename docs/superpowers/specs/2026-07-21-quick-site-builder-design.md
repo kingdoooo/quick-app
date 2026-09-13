@@ -1,5 +1,8 @@
 # Quick 自动化建站方案（Site Builder）设计文档
 
+> **决策记录，不是操作指引。** 本文含单账号实测数据与当时的取舍过程，按写下的那一刻为准；
+> 采用者要的操作步骤真源是 `site-builder/DEPLOY.md`，还剩什么没做看 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9。
+
 - **日期**：2026-07-21
 - **状态**：设计已确认（brainstorming 完成），待实施计划
 - **交付形态**：客户 PoC / 参考方案——业务人员在 Amazon Quick Desktop（或其他 Agent 客户端）里开发简易全栈站点后，一键部署到客户自己的 AWS 账号，站点登录与管理权限绑定飞书账号

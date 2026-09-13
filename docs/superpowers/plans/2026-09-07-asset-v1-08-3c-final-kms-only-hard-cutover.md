@@ -1,5 +1,8 @@
 # asset-v1 · 08 3c-final：会话签名 KMS-only 硬切换 实施计划
 
+> **决策记录，不是操作指引。** 本文含单账号实测数据与当时的取舍过程，按写下的那一刻为准；
+> 采用者要的操作步骤真源是 `site-builder/DEPLOY.md`，还剩什么没做看 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 >
 > **本 plan 在主会话（coordinator）里按 `executing-plans` 串行执行。** 标了 ★ 的 Task 是 coordinator 手动任务（部署 / 真机闸门 / 不可逆步骤），`executing-plans` 的 checkpoint 落在它们上；其余 Task 是代码任务，每个都以"该包套件绿 + commit"收尾。

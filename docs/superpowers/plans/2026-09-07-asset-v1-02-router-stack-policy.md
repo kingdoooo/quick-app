@@ -1,5 +1,8 @@
 # router 栈的 CloudFormation stack policy Implementation Plan
 
+> **决策记录，不是操作指引。** 本文含单账号实测数据与当时的取舍过程，按写下的那一刻为准；
+> 采用者要的操作步骤真源是 `site-builder/DEPLOY.md`，还剩什么没做看 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 给 router 栈加一份 CloudFormation stack policy，用**精确逻辑 ID**（不用 `*`）拒绝对 Edge 两个函数、CloudFront 分发与路由表的更新，并把"策略存在且覆盖这四个资源"做成 `verify_deployed_edge.sh` 的一段真机核对。

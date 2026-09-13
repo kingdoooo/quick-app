@@ -1,5 +1,8 @@
 # Quick Site Builder 一期/二期完整对抗性 Review
 
+> **决策记录，不是操作指引。** 本文含单账号实测数据与当时的取舍过程，按写下的那一刻为准；
+> 采用者要的操作步骤真源是 `site-builder/DEPLOY.md`，还剩什么没做看 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9。
+
 - **Review 日期**：2026-08-21
 - **审查提交**：`05797af372f2577fafa5e8fd1ae54a3343d475be`
 - **审查分支**：`master`

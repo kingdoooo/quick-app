@@ -1,8 +1,15 @@
 """交付文档的**时效**守卫：面向新账号/新读者的那几份文档不许留过时口径。
 
-守的是 `README.md` / `CLAUDE.md` / `site-builder/DEPLOY.md` /
-`site-builder/scripts/gen_onboarding.py` —— 它们是"换个人/换个账号照着做"的唯一入口，
-过时的一行在这里的代价是对方按错的顺序部署、或按不存在的路径执行。
+守的是采用者会照着做的那几份：`README.md` / `CLAUDE.md` / `CONTEXT.md` /
+`site-builder/DEPLOY.md` / `site-builder/docs/client-setup.md` / 建站 Skill 的
+`SKILL.md` 与两份 references / `site-builder/scripts/gen_onboarding.py`
+—— 它们是"换个人/换个账号照着做"的唯一入口，过时的一行在这里的代价是对方按错的
+顺序部署、或按不存在的路径执行。
+
+**另一半方向相反**：`docs/superpowers/` / `docs/reviews/` / `docs/security/` 下的决策
+记录**保留**单账号实测数据（那是它们的价值），改为在文件头自报"不是操作指引"
+——见本文件末尾 `test_decision_records_declare_their_nature`。ADR 两边都不进
+（日期是那个文体固有的）。
 
 **为什么放在 deployer 包里**：仓库根没有 `tests/` 也没有 pytest 配置或 venv，新建一个
 根级 `tests/` 会得到一份"没有任何标准命令会跑到"的守卫——那比没有守卫更糟（它占着
@@ -1459,3 +1466,59 @@ def test_deploy_md_readiness_for_built_in_cognito_is_config_only():
     assert "mode = cognito-admin" in checklist
     assert "第二个池 + 托管域名 + app client 已建" not in checklist, \
         "就绪清单还在要求采用者先手工建好池"
+
+
+# ── 工单 12 第 2 条：决策记录必须自报"不是操作指引" ──────────────────────────
+#
+# 采用者拿到的仓库里，`docs/superpowers/`、`docs/reviews/`、`docs/security/` 下的
+# tracked 文档**确实**含单账号实测数据与当时的迁移过程——那是它们的价值，不该清掉
+# （这与 _STATUS_FREE_DOCS 那条方向相反，别混）。风险是采用者把其中某一段当成
+# 操作步骤照做：那些步骤是对**当时那个环境**说的。所以每一份自己在文件头声明。
+_DECISION_RECORD_GLOBS = ("docs/superpowers/specs/*.md", "docs/superpowers/plans/*.md",
+                          "docs/reviews/*.md", "docs/security/*.md",
+                          "docs/phase2-requirements.md")
+_DECISION_BANNER = "决策记录，不是操作指引"
+
+
+def _decision_records() -> list:
+    """**按 git 问**，不按硬编码清单：新加一份 spec/plan/review 自动进射程。"""
+    import subprocess
+    r = subprocess.run(["git", "ls-files", "-z", *_DECISION_RECORD_GLOBS],
+                       cwd=ROOT, capture_output=True, text=True)
+    assert r.returncode == 0, f"git ls-files 失败（本条空转）：{r.stderr.strip()}"
+    out = [f for f in r.stdout.split("\0") if f]
+    assert len(out) > 10, f"只找到 {len(out)} 份决策记录——本条空转（glob 写错？）"
+    return out
+
+
+def test_decision_records_declare_their_nature():
+    """每一份 tracked 决策记录的**开头**都要有那句声明。
+
+    "开头"是判据的一部分：写在第 300 行的免责声明救不了一个从中间读起的人，而
+    采用者读这类文档时几乎总是被别处的链接直接带到某一节。
+    """
+    offenders = []
+    for rel in _decision_records():
+        head = "".join((ROOT / rel).read_text(encoding="utf-8").splitlines(True)[:8])
+        if _DECISION_BANNER not in head:
+            offenders.append(rel)
+    assert not offenders, (
+        "这些决策记录的前 8 行里没有那句声明（新加的 spec/plan/review 也要加）：\n  "
+        + "\n  ".join(offenders))
+
+
+def test_decision_record_banner_points_at_the_operational_truth_source():
+    """声明本身要给出去处，否则它只是免责而不指路。"""
+    for rel in _decision_records():
+        head = "".join((ROOT / rel).read_text(encoding="utf-8").splitlines(True)[:8])
+        assert "site-builder/DEPLOY.md" in head, f"{rel} 的声明没指向操作真源"
+
+
+def test_status_free_docs_and_decision_records_do_not_overlap():
+    """两条纪律方向相反，同一份文档不能同时进两边——那会要求它既保留实测数据
+    又清掉实测数据。ADR 两边都不进（日期是那个文体固有的），这条也把它钉住。"""
+    free = {p.relative_to(ROOT).as_posix() for p in _STATUS_FREE_DOCS}
+    records = set(_decision_records())
+    assert not (free & records), f"同时进了两条纪律：{sorted(free & records)}"
+    adrs = {f for f in records if f.startswith("docs/adr/")}
+    assert not adrs, f"ADR 不该进决策记录声明（日期是文体固有的）：{sorted(adrs)}"

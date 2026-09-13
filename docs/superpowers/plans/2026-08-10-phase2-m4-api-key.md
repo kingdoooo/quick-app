@@ -1,5 +1,8 @@
 # Site Builder 二期 M4 实施计划（API Key + key-proxy 交换层）
 
+> **决策记录，不是操作指引。** 本文含单账号实测数据与当时的取舍过程，按写下的那一刻为准；
+> 采用者要的操作步骤真源是 `site-builder/DEPLOY.md`，还剩什么没做看 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 让"只能配静态 Header"的客户端（Quick Desktop Remote MCP 等）用一把 `sk-` API Key 直连部署 MCP，免 stdio 代理；Key 由用户在控制台自助创建/吊销，可即时生效；整套能力是**可选组件**（不配置 `[ApiKey]` 即 OAuth-only），且带一个 admin 可在控制台操作的应急关闸开关。

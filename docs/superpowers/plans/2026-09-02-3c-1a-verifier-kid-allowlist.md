@@ -1,5 +1,8 @@
 # 3c-1A · verifier 认 kid allowlist（HS256，signer 不动）实施计划
 
+> **决策记录，不是操作指引。** 本文含单账号实测数据与当时的取舍过程，按写下的那一刻为准；
+> 采用者要的操作步骤真源是 `site-builder/DEPLOY.md`，还剩什么没做看 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 让全部五个验签点（Edge、auth `/console-session`、panel 面板会话、panel 升级码、auth legacy）按 spec §5 的合同验 token：`kid → {family, alg, key}` 固定 allowlist、每 family `current` + `previous`、legacy 第三入口（状态机 **L1**）。**signer 一行不改**：本包结束时线上所有 token 仍是今天的形态，verifier 只是**多了**两条入口。

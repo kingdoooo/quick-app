@@ -1,5 +1,8 @@
 # 账号信任边界：平台能防谁，不能防谁
 
+> **决策记录，不是操作指引。** 本文含单账号实测数据与当时的取舍过程，按写下的那一刻为准；
+> 采用者要的操作步骤真源是 `site-builder/DEPLOY.md`，还剩什么没做看 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9。
+
 > **状态：已知未修（不是已接受）。** 最近一次实测 2026-08-27（收窄 CodeBuild 的
 > bootstrap 桶读权限之后），方法与原始数据见下。
 > 这份文档是 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9 里

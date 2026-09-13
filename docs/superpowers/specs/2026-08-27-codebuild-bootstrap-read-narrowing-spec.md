@@ -1,5 +1,8 @@
 # M09 真修复①：收窄 CodeBuild 对 CDK bootstrap 桶的读权限
 
+> **决策记录，不是操作指引。** 本文含单账号实测数据与当时的取舍过程，按写下的那一刻为准；
+> 采用者要的操作步骤真源是 `site-builder/DEPLOY.md`，还剩什么没做看 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9。
+
 > **状态：✅ 2026-08-27 已实施并部署生产，基线与文档已同步。** 这是
 > `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9 的 **3b**。风险模型的真源是
 > `docs/security/account-trust-boundary.md`，本文不重复它，只写这一条改动。

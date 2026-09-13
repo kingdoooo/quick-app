@@ -1,5 +1,8 @@
 # S1 · 隔离与鉴权加固 设计文档
 
+> **决策记录，不是操作指引。** 本文含单账号实测数据与当时的取舍过程，按写下的那一刻为准；
+> 采用者要的操作步骤真源是 `site-builder/DEPLOY.md`，还剩什么没做看 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9。
+
 > 输入来源：`docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md`（Claude + Codex
 > 两轮独立对抗性审查合并版，v3）。本文只覆盖该文档拆出的 **S1** 包：M01、M02、M05、M06。
 > 其余包（S2 迁移可重放性 / S3 部署期正确性 / S4 守卫化 / S5 账号边界）各自独立成 spec。

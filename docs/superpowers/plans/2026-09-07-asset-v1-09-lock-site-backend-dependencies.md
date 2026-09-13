@@ -1,5 +1,8 @@
 # asset-v1 / 09 · 锁定站点后端依赖（合同强制 lockfile + `npm ci`）实施计划
 
+> **决策记录，不是操作指引。** 本文含单账号实测数据与当时的取舍过程，按写下的那一刻为准；
+> 采用者要的操作步骤真源是 `site-builder/DEPLOY.md`，还剩什么没做看 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 让每一次站点部署装出的依赖树由上传的字节唯一决定：合同要求 fullstack 站点带 `backend/package-lock.json`，校验器在 `validate` 阶段拒无锁文件、未钉住（非公共 registry / 无 `integrity` / 与 `package.json` 不一致）的产物，CodeBuild 用 `npm ci --ignore-scripts` 而不是 `npm install`；Skill 文档与两个黄金 fixture 同步。

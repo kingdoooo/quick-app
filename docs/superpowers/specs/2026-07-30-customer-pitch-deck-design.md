@@ -1,5 +1,8 @@
 # 客户方案介绍 PPT（HTML）设计文档
 
+> **决策记录，不是操作指引。** 本文含单账号实测数据与当时的取舍过程，按写下的那一刻为准；
+> 采用者要的操作步骤真源是 `site-builder/DEPLOY.md`，还剩什么没做看 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9。
+
 2026-07-30 brainstorming 产出。目标：一份面向**潜在客户技术人员**的方案介绍 PPT，
 HTML 单文件形态，现场演讲配套（30-45 分钟技术交流）。
 

@@ -1,5 +1,8 @@
 # Quick Site Builder 二期 M5：访问记录 / 统计 细化 spec
 
+> **决策记录，不是操作指引。** 本文含单账号实测数据与当时的取舍过程，按写下的那一刻为准；
+> 采用者要的操作步骤真源是 `site-builder/DEPLOY.md`，还剩什么没做看 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9。
+
 - **日期**：2026-08-14
 - **状态**：设计已确认（brainstorming 完成），待实施计划
 - **母 spec**：`2026-07-30-quick-site-builder-phase2-design.md`（下称 phase2

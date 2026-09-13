@@ -1,5 +1,8 @@
 # 客户方案介绍 PPT（HTML）Implementation Plan
 
+> **决策记录，不是操作指引。** 本文含单账号实测数据与当时的取舍过程，按写下的那一刻为准；
+> 采用者要的操作步骤真源是 `site-builder/DEPLOY.md`，还剩什么没做看 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 产出单文件 `docs/presentation/slides.html`——20 页深色主题 HTML PPT，面向潜在客户技术人员介绍 Quick Site Builder 方案（痛点/架构/安全/AWS 组件/成本/Manus 对比/路线图）。

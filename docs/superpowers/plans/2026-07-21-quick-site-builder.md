@@ -1,5 +1,8 @@
 # Quick 自动化建站方案（Site Builder）Implementation Plan
 
+> **决策记录，不是操作指引。** 本文含单账号实测数据与当时的取舍过程，按写下的那一刻为准；
+> 采用者要的操作步骤真源是 `site-builder/DEPLOY.md`，还剩什么没做看 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 业务人员在 Quick Desktop（或任意支持 Skill+MCP 的 Agent 客户端）开发的简易全栈站点，一键部署到 AWS 并获得 `https://app-xxx.<域名>`，站点访问与管理权限绑定飞书账号。

@@ -1,5 +1,8 @@
 # Quick Site Builder 二期设计文档（控制台 + 权限身份 + 访问统计）
 
+> **决策记录，不是操作指引。** 本文含单账号实测数据与当时的取舍过程，按写下的那一刻为准；
+> 采用者要的操作步骤真源是 `site-builder/DEPLOY.md`，还剩什么没做看 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9。
+
 - **日期**：2026-07-30
 - **状态**：设计已确认（brainstorming 完成），待实施计划
 - **范围决策**：大切——需求清单（`docs/phase2-requirements.md`）A/B/C 全做；

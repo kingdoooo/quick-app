@@ -1,5 +1,8 @@
 # Site Builder 二期 M3 实施计划（控制台 + 两个 Blocking 前置）
 
+> **决策记录，不是操作指引。** 本文含单账号实测数据与当时的取舍过程，按写下的那一刻为准；
+> 采用者要的操作步骤真源是 `site-builder/DEPLOY.md`，还剩什么没做看 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 交付 `console.{base_domain}` Web 控制台（自助管理站点权限/协作者/所有权/部署历史/下线 + 管理员全局视图与名单），并在此之前闭合两个 Blocking 前置：SFN 终态两层收敛（TIMED_OUT/ABORTED 不再让 job 永久停 RUNNING）与登录失败告警的自动化部署。
