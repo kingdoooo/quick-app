@@ -439,6 +439,18 @@ def scan_redlines(site_dir: Path, manifest: dict) -> list[str]:
         violations.append("backend: 必须实现 GET /api/health 端点（部署冒烟测试依赖）")
 
     if manifest.get("database", {}).get("engine") == "dsql":
+        # M16：migrations/ 只允许直下的 NNN_*.sql，**拒绝子目录**。
+        # 执行器（provision_dsql）列举时带 Delimiter="/"，两处口径因此一致——这是
+        # **消灭**"执行器扫的 ⊋ 校验器扫的"这个不一致，而不是对齐它（对齐要求两处
+        # 递归规则永远一致，那是又一条跨包耦合）。子目录从未被任何文档承诺过。
+        migrations_dir = backend_dir / "migrations"
+        if migrations_dir.is_dir():
+            for child in sorted(migrations_dir.iterdir()):
+                if child.is_dir():
+                    violations.append(
+                        f"backend/migrations/{child.name}/: 不允许子目录——迁移文件必须"
+                        "直接放在 backend/migrations/ 下（执行器只扫直下层，子目录里的 "
+                        "SQL 不会被执行，也不该存在）")
         schema = backend_dir / "schema.sql"
         if not schema.exists():
             violations.append("backend/schema.sql: fullstack-sql 必须提供建表 SQL")

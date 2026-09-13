@@ -26,8 +26,15 @@ ONE_DEP_LOCK = {
 def make_site(tmp_path: Path, *, tier="fullstack-sql", index="fetch('/api/items')",
               server="app.get('/api/health',(q,s)=>s.send('ok'))",
               schema="CREATE TABLE t (id UUID PRIMARY KEY);",
+              migrations: dict[str, str] | None = None,
+              migration_subdirs: dict[str, dict[str, str]] | None = None,
               package_json: str | None = MINIMAL_PACKAGE_JSON,
               lockfile: str | None = MINIMAL_LOCK) -> tuple[Path, dict]:
+    """铺一个最小站点目录。
+
+    `migrations`：`{文件名: SQL}` 铺进 `backend/migrations/` 直下。
+    `migration_subdirs`：`{子目录名: {文件名: SQL}}`——**只有**子目录红线的用例该用它。
+    """
     (tmp_path / "frontend").mkdir()
     (tmp_path / "frontend/index.html").write_text(f"<script>{index}</script>")
     manifest = {"name": "t", "tier": tier,
@@ -44,6 +51,14 @@ def make_site(tmp_path: Path, *, tier="fullstack-sql", index="fetch('/api/items'
         manifest["backend"] = {"runtime": "nodejs22.x", "entrypoint": "node server.js", "port": 8080}
         if tier == "fullstack-sql":
             (tmp_path / "backend/schema.sql").write_text(schema)
+        for name, body in (migrations or {}).items():
+            (tmp_path / "backend/migrations").mkdir(exist_ok=True)
+            (tmp_path / "backend/migrations" / name).write_text(body)
+        for sub, files in (migration_subdirs or {}).items():
+            d = tmp_path / "backend/migrations" / sub
+            d.mkdir(parents=True, exist_ok=True)
+            for name, body in files.items():
+                (d / name).write_text(body)
     (tmp_path / "site.json").write_text(json.dumps(manifest))
     return tmp_path, manifest
 
@@ -918,3 +933,18 @@ def test_lockfile_redline_is_documented_in_the_agent_facing_docs():
         "contract.md 的目录树没把 lockfile 与 npm ci 写进去"
     skill_md = (skill / "SKILL.md").read_text(encoding="utf-8")
     assert "package-lock.json" in skill_md, "SKILL.md 的打包步骤没提 lockfile 要随包上传"
+
+
+# ---- 红线 9：DSQL 建表/迁移必须可重放 + migrations 子目录被拒（M03 + M16）----
+
+def test_migrations_subdirectory_is_rejected(tmp_path):
+    """migrations/ 下出现子目录即拒。
+
+    执行器（provision_dsql）列举时带 Delimiter="/" 只看直下层，所以子目录里的 SQL
+    在**旧行为**下会被执行却不被扫描（M16）。两侧口径统一为"拒子目录"——这是消灭
+    "执行器扫的 ⊋ 校验器扫的"这个不一致，不是对齐它。
+    """
+    d, m = make_site(tmp_path, migration_subdirs={
+        "nested": {"001_x.sql": "CREATE TABLE IF NOT EXISTS a (id UUID PRIMARY KEY);\n"}})
+    v = scan_redlines(d, m)
+    assert any("backend/migrations/nested/" in s and "子目录" in s for s in v), v
