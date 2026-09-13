@@ -994,7 +994,13 @@ def test_index_async_rule_reports_migration_path(tmp_path):
     "ALTER TABLE IF EXISTS t DROP CONSTRAINT IF EXISTS ck;",
     "CREATE OR REPLACE VIEW v AS SELECT id FROM t;",
     "CREATE OR REPLACE RECURSIVE VIEW v (n) AS SELECT 1;",
+    # DML 整类不在红线 9 射程内（它不 brick 部署，见白名单常量的注释）
     "INSERT INTO t (id) VALUES (gen_random_uuid()) ON CONFLICT DO NOTHING;",
+    "INSERT INTO t (id) VALUES (gen_random_uuid());",
+    "INSERT INTO t (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET id = 1;",
+    "UPDATE t SET c = '1';",
+    "DELETE FROM t WHERE id = 1;",
+    "DELETE FROM t;",
     # 串内分号不该被切开（切错会把后半截判成不在白名单）
     "CREATE TABLE IF NOT EXISTS t (id UUID PRIMARY KEY, note TEXT DEFAULT 'a;b');",
     # 注释里的坏词不算（先抹注释再判）
@@ -1018,10 +1024,6 @@ def test_replayable_forms_pass(sql):
     "ALTER TABLE t ADD COLUMN c TEXT;",                      # ADD COLUMN 缺 IF NOT EXISTS
     "ALTER TABLE t ALTER COLUMN c TYPE INT;",                # ALTER COLUMN 不在白名单
     "CREATE VIEW v AS SELECT 1;",                            # 缺 OR REPLACE
-    "INSERT INTO t (id) VALUES (gen_random_uuid());",        # DML 缺 ON CONFLICT DO NOTHING
-    "INSERT INTO t (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET id = 1;",  # DO UPDATE 非幂等
-    "UPDATE t SET c = '1';",                                 # 白名单外
-    "DELETE FROM t;",                                        # 白名单外
     "CREATE INDEX ASYNC ON t (id);",                         # 缺 IF NOT EXISTS
     "CREATE INDEX ASYNC IF NOT EXISTS ON t (id);",           # IF NOT EXISTS 时索引名必填
     "CREATE SEQUENCE s;",                                    # 白名单外
@@ -1037,7 +1039,7 @@ def test_replayable_redline_applies_to_schema_and_migrations(tmp_path):
     """裁定 2：schema.sql 与 migrations/*.sql 同等对待。"""
     d, m = make_site(tmp_path,
                      schema="CREATE TABLE t (id UUID PRIMARY KEY);",
-                     migrations={"001_seed.sql": "INSERT INTO t (id) VALUES (1);\n"})
+                     migrations={"001_seed.sql": "CREATE TABLE u (id UUID PRIMARY KEY);\n"})
     v = scan_redlines(d, m)
     assert any("backend/schema.sql" in s and "不可重放" in s for s in v), v
     assert any("migrations/001_seed.sql" in s and "不可重放" in s for s in v), v
@@ -1144,7 +1146,6 @@ def test_redline_9_doc_matches_the_validator():
     section = doc.split(anchor, 1)[1].split("\n## ", 1)[0]
     for needle in ("CREATE TABLE IF NOT EXISTS",
                    "CREATE OR REPLACE VIEW",
-                   "ON CONFLICT DO NOTHING",
                    "ADD COLUMN IF NOT EXISTS",
                    "DROP COLUMN IF EXISTS",
                    "DROP CONSTRAINT IF EXISTS",
@@ -1155,7 +1156,59 @@ def test_redline_9_doc_matches_the_validator():
     # 存量站点的升级路径必须写明（本红线对每次部署生效，含"只改前端"的部署）
     assert "存量" in section or "已经上线" in section, \
         "红线 9 没写存量站点怎么升级——它会挡住那些站点的每一次部署"
+    # DML 豁免必须写明，且要给出"靠自然键才真的幂等"这条（否则读者会以为加一句
+    # ON CONFLICT 就够了——那在 uuid 主键上是空转的）
+    assert "不受本红线约束" in section or "不管 DML" in section, \
+        "红线 9 没写 DML 豁免——读者会以为种子 INSERT 也被拦"
+    assert "自然键" in section, \
+        "红线 9 没写「靠自然键才幂等」，读者会以为加一句 ON CONFLICT 就够了"
     # migrations 约定那份文档也要提到可重放与子目录
     contract_doc = (skill / "references" / "contract.md").read_text(encoding="utf-8")
     assert "可重放" in contract_doc and "不允许子目录" in contract_doc, \
         "contract.md 的 migrations 约定没同步可重放/子目录两条"
+
+
+# ---- DML 退出红线 9（grill 推翻了裁定 (b)，四条理由见 redlines.py 的常量注释）----
+
+@pytest.mark.parametrize("sql", [
+    "INSERT INTO seeds (k) VALUES ('a');",              # 裸 INSERT：重放只是多几行，部署照样成功
+    "INSERT INTO seeds (k) VALUES ('a') ON CONFLICT DO NOTHING;",
+    "INSERT INTO seeds (k) VALUES ('a') ON CONFLICT (k) DO UPDATE SET k = 'a';",
+    "UPDATE seeds SET k = 'a';",
+    "DELETE FROM seeds;",
+    "insert into seeds (k) values ('a');",              # 大小写不敏感
+])
+def test_dml_is_out_of_scope_for_redline_9(sql):
+    """DML 不 brick 部署：裸 `INSERT` 重放会**成功**（无约束冲突）⇒ 文件跑完 ⇒ 标记写入
+    ⇒ 部署 SUCCEEDED。多出来的只是几行重复数据（数据质量），而 M03 讲的是可部署性。
+
+    另外两条理由：`ON CONFLICT` 的**子句级**支持在 DSQL 文档里是"未说明"的（userguide
+    只在总表里粗粒度写了 `[ON CONFLICT]`，没有 INSERT 的详细语法页），所以强制它会违反
+    白名单自己的原则（"只放行文档确认支持的形态"，`DROP TABLE IF EXISTS` 正是因此被拒）；
+    而在最常见的种子形状（`gen_random_uuid()` 主键 + 无自然键）下，`ON CONFLICT DO NOTHING`
+    永远不冲突 ⇒ 合规却仍然重复插入，是**假安全感**。
+    """
+    from contract.redlines import _check_sql_replayable
+    assert _check_sql_replayable(sql, "backend/schema.sql") == []
+
+
+@pytest.mark.parametrize("sql", [
+    "BEGIN;",
+    "COMMIT;",
+    "BEGIN TRANSACTION;",
+])
+def test_transaction_wrapping_still_rejected(sql):
+    """`BEGIN`/`COMMIT` 不是 DML，仍然拒：一事务一条 DDL、DDL 与 DML 不能同事务，
+    这两条**有文档依据**，所以事务包裹在 DSQL 上本来就不成立。"""
+    from contract.redlines import _check_sql_replayable
+    out = _check_sql_replayable(sql, "backend/schema.sql")
+    assert out and "不可重放" in out[0], out
+
+
+def test_ddl_still_rejected_alongside_exempt_dml():
+    """同一个文件里 DML 放行、DDL 照判——不能因为豁免了 DML 就整文件放过。"""
+    from contract.redlines import _check_sql_replayable
+    sql = ("INSERT INTO seeds (k) VALUES ('a');\n"
+           "CREATE TABLE t (id UUID PRIMARY KEY);\n")
+    out = _check_sql_replayable(sql, "backend/schema.sql")
+    assert len(out) == 1 and "CREATE TABLE t" in out[0], out

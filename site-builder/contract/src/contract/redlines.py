@@ -98,23 +98,41 @@ _REPLAYABLE_FORMS = (
     # DSQL 文档确认 CREATE [OR REPLACE] [RECURSIVE] VIEW——OR REPLACE 即幂等形态。
     # references 明确告诉站点作者"可以建视图"，白名单漏掉它会拒掉文档承诺的写法。
     re.compile(r"^CREATE\s+OR\s+REPLACE\s+(?:RECURSIVE\s+)?VIEW\b", re.I),
-    # DML：种子 INSERT 必须 ON CONFLICT DO NOTHING（裁定见 plan 的「DML 子决策」(b)）。
-    # 禁 DML 会把种子逼进不可信站点代码；只警告会留着"重放重复插入"这个不幂等来源。
-    # DO NOTHING 需要唯一约束作冲突目标，与"每表带 PRIMARY KEY"的既有约定同向。
-    # **DO UPDATE 不算**：它不是"重放无副作用"，而是每次都写。
-    re.compile(r"^INSERT\s+INTO\b(?:(?!\bON\s+CONFLICT\b).)*"
-               r"\bON\s+CONFLICT\b(?:(?!\bDO\s+UPDATE\b).)*"
-               r"\bDO\s+NOTHING\b", re.I | re.S),
 )
+# **DML 整类不在本红线射程内。** 这条曾经反过来（要求种子 `INSERT` 必须带
+# `ON CONFLICT DO NOTHING`），被四条独立理由推翻。记在这里免得有人"顺手补齐"：
+#
+# ① **它不 brick 部署。** 本红线要防的失败模式是"同输入重试永久失败"：裸 `CREATE TABLE`
+#    重放报 42P07 ⇒ 抛出 ⇒ 此后每次部署都同样失败。裸 `INSERT` 重放是**成功**的（没有
+#    约束冲突）⇒ 文件跑完 ⇒ 标记写入 ⇒ 部署 SUCCEEDED。多出来的只是几行重复数据，
+#    那是数据质量问题，而本红线管的是可部署性。`UPDATE … SET 常量` 与 `DELETE … WHERE`
+#    重放本来就幂等，同理。
+# ② **强制它会违反白名单自己的原则。** 本红线拒 `DROP TABLE IF EXISTS` 的唯一理由是
+#    "DSQL 文档没说 ⇒ 不放行"。而 `ON CONFLICT` 的**子句级**支持恰恰也是"未说明"：
+#    userguide 只在总表里粗粒度写了 `INSERT INTO … VALUES/SELECT [ON CONFLICT]`，没有
+#    INSERT 的详细语法页，`DO NOTHING` / conflict_target 支持到什么程度都没写。强制一个
+#    文档未确认的形态 = 红线有可能把作者推进不受支持的写法里，那是制造故障而非防故障。
+# ③ **合规常常是空转的。** 最常见的种子形状是 `id UUID PRIMARY KEY DEFAULT
+#    gen_random_uuid()` 且没有自然键（实测：验证环境某活站点 30 条种子 INSERT 正是这个
+#    形状）。给它加 `ON CONFLICT DO NOTHING` 之后，冲突目标是每次新生成的 uuid ⇒ 永不
+#    冲突 ⇒ 过了红线仍然重复插入。**假安全感比没有规则更糟。**
+# ④ 平台从不要求种子数据（SKILL 与 templates 对此完全沉默），也没有 fixture 用它。
+#
+# 幂等的种子写法仍然值得**推荐**（`references/redlines.md` 给了带自然键的样例），但那是
+# 建议、不是判据。**`BEGIN`/`COMMIT` 不算 DML，仍然被拒**：一事务只许一条 DDL、且 DDL
+# 与 DML 不能同事务，这两条有文档依据 ⇒ 事务包裹在 DSQL 上本来就不成立。
+_DML_RE = re.compile(r"^(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\b", re.I)
 _REPLAYABLE_HINT = (
-    "迁移/建表 SQL 必须可重放：DSQL 每条语句 autocommit 且与平台元数据无原子事务，"
-    "一个文件半途失败后重试会**整文件重跑**。允许的形态只有："
+    "建表/迁移的 **DDL** 必须可重放：DSQL 每条语句 autocommit 且与平台元数据无原子事务，"
+    "一个文件半途失败后重试会**整文件重跑**，不可重放的 DDL 第二次撞「已存在」就让部署卡死。"
+    "允许的 DDL 形态只有："
     "CREATE TABLE IF NOT EXISTS；CREATE [UNIQUE] INDEX ASYNC IF NOT EXISTS <索引名>；"
     "ALTER TABLE 的 ADD COLUMN IF NOT EXISTS / DROP COLUMN IF EXISTS / "
-    "DROP CONSTRAINT IF EXISTS；CREATE OR REPLACE VIEW；"
-    "INSERT … ON CONFLICT DO NOTHING。"
-    "其余（裸 CREATE TABLE、CREATE SCHEMA、DROP TABLE、裸 INSERT、UPDATE、DELETE、"
-    "BEGIN/COMMIT 等）一律拒")
+    "DROP CONSTRAINT IF EXISTS；CREATE OR REPLACE VIEW。"
+    "其余（裸 CREATE TABLE、CREATE SCHEMA、DROP TABLE、CREATE SEQUENCE、"
+    "BEGIN/COMMIT 等）一律拒。"
+    "DML（INSERT/UPDATE/DELETE）不受本红线约束，但重放会重复插入——"
+    "要幂等就给一个自然键并用 ON CONFLICT (那个键) DO NOTHING")
 # Edge 注入的 x-user-name 是 **URL 编码**的（HTTP 头不能携带非 ASCII 字节——
 # 不编码会让中文名字直接被 CloudFront 拒掉），站点必须 decodeURIComponent。
 # 为什么值得一条红线：漏掉时**不报错**，而是把 `%E5%BD%AD…` 当人名显示、写库，
@@ -607,6 +625,8 @@ def _check_sql_replayable(sql_text: str, rel: str) -> list[str]:
     """每条语句都必须落在 `_REPLAYABLE_FORMS` 白名单里，否则报违规（红线 9 / M03）。"""
     out = []
     for stmt in _sql_statements(sql_text):
+        if _DML_RE.match(stmt):
+            continue        # DML 整类豁免，见 _DML_RE 上面那四条理由
         if not (any(p.match(stmt) for p in _REPLAYABLE_FORMS)
                 or _is_replayable_alter_table(stmt)):
             snippet = stmt[:60] + ("…" if len(stmt) > 60 else "")

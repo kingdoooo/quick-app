@@ -272,12 +272,12 @@ CREATE INDEX idx_orders_user ON orders (user_id);
 - 黄金样例：`fixtures/nosql-notes/backend/` 与 `fixtures/sql-expenses/backend/` 各带一份
   lockfile。无依赖的后端同样要放这一对（对空依赖的 `package.json` 跑同一条命令即可）。
 
-## 红线 9：DSQL 建表/迁移必须可重放（仅 fullstack-sql）
+## 红线 9：DSQL 建表/迁移的 DDL 必须可重放（仅 fullstack-sql）
 
-- **规则**：`backend/schema.sql` 与 `backend/migrations/*.sql` 里的**每一条**语句都必须
+- **规则**：`backend/schema.sql` 与 `backend/migrations/*.sql` 里的每一条 **DDL** 都必须
   是下列可重放形态之一，否则 validate 拒：
 
-  | 允许的形态 | 说明 |
+  | 允许的 DDL 形态 | 说明 |
   |---|---|
   | `CREATE TABLE IF NOT EXISTS …` | 建表 |
   | `CREATE [UNIQUE] INDEX ASYNC IF NOT EXISTS <索引名> …` | 用 `IF NOT EXISTS` 时**索引名必填** |
@@ -285,16 +285,21 @@ CREATE INDEX idx_orders_user ON orders (user_id);
   | `ALTER TABLE [IF EXISTS] … DROP COLUMN IF EXISTS …` | 删列 |
   | `ALTER TABLE [IF EXISTS] … DROP CONSTRAINT IF EXISTS …` | 删约束 |
   | `CREATE OR REPLACE VIEW …` | 建视图（`RECURSIVE` 也可） |
-  | `INSERT INTO … ON CONFLICT DO NOTHING …` | 种子数据（**`DO UPDATE` 不算**，它每次都写） |
 
+  多动作的 `ALTER TABLE`（`action [, ...]`）要求**每个动作**都是幂等形态——一个幂等动作
+  不能替同语句里的其它动作背书。
+
+- **DML（`INSERT` / `UPDATE` / `DELETE`）不受本红线约束**，但要知道重放语义，见下面
+  「种子数据」一节。
 - **规则（子目录）**：迁移文件必须直接放在 `backend/migrations/` 下，**不允许子目录**。
 - **为什么**：DSQL 每条语句 autocommit（一个事务只许一条 DDL，且 DDL 与 DML 不能同
   事务，所以"把整个文件包进一个事务"**做不到**），而 DSQL 与平台元数据之间**没有原子
   事务**。一个文件跑到一半失败（一个 typo、或超时落在文件中间），前面的语句**已经提交**
-  而"这个文件跑过了"的标记没写上 —— 重试会**整文件重跑**。此时不可重放的语句
-  （裸 `CREATE TABLE`、裸 `INSERT`）第二次撞上"已存在 / 重复插入"而失败，站点会卡在
-  「同一份产物再也部署不上去」，直到 SQL 被改成可重放。
-- **两条容易踩的边界**（AWS 文档原话，实测口径一致）：
+  而"这个文件跑过了"的标记没写上 —— 重试会**整文件重跑**。此时不可重放的 DDL
+  （裸 `CREATE TABLE`）第二次撞上"已存在"而失败，站点会卡在
+  「同一份产物再也部署不上去」，直到 SQL 被改成可重放。**这是可部署性问题**，也正是
+  本红线只管 DDL 的原因（见「种子数据」）。
+- **两条容易踩的边界**（AWS 文档原话）：
   - `IF NOT EXISTS` 的守卫**只看名字，不比对类型**。文档对列的说法是 "a column already
     exists with this name"；索引那边更直白："no guarantee that the existing index
     resembles the one that would have been created"。**⇒ 改过某列的类型之后重放会
@@ -313,8 +318,7 @@ CREATE INDEX idx_orders_user ON orders (user_id);
   );
   CREATE INDEX ASYNC IF NOT EXISTS idx_expenses_title ON expenses (title);
   CREATE OR REPLACE VIEW expenses_recent AS SELECT * FROM expenses;
-  -- 种子数据：靠唯一约束做冲突目标（表本来就该有主键）
-  INSERT INTO categories (id, name) VALUES ('food', '餐饮') ON CONFLICT DO NOTHING;
+  ALTER TABLE IF EXISTS expenses ADD COLUMN IF NOT EXISTS note TEXT;
   ```
 
 - **错误**：
@@ -322,8 +326,8 @@ CREATE INDEX idx_orders_user ON orders (user_id);
   ```sql
   CREATE TABLE orders (id UUID PRIMARY KEY);        -- 缺 IF NOT EXISTS
   ALTER TABLE orders ADD COLUMN note TEXT;          -- 缺 IF NOT EXISTS
+  ALTER TABLE orders ADD COLUMN IF NOT EXISTS a TEXT, ADD COLUMN b TEXT;  -- 第二个动作缺
   CREATE VIEW v AS SELECT 1;                        -- 缺 OR REPLACE
-  INSERT INTO categories VALUES ('food', '餐饮');    -- 缺 ON CONFLICT DO NOTHING
   DROP TABLE old_orders;                            -- 白名单外（IF 形态文档未确认幂等）
   CREATE SCHEMA extra;                              -- 白名单外（同上；而且站点无权建 schema）
   BEGIN; … COMMIT;                                  -- 禁止事务包裹（DSQL 一事务一条 DDL）
@@ -334,10 +338,42 @@ CREATE INDEX idx_orders_user ON orders (user_id);
   与其猜，不如让站点作者用已确认可行的那几种形态表达同样的意图。
 - **已经上线的站点怎么升级**：本红线在**每次**部署的 validate 都跑，所以一个 `schema.sql`
   里写着裸 `CREATE TABLE` 的存量站点，连"只改前端"的部署也会被拒。修法是**直接把那些
-  语句补上 `IF NOT EXISTS`**——这与上面"已应用过的文件不可再修改"不冲突：改动对运行时
+  DDL 补上 `IF NOT EXISTS`**——这与「已应用过的文件不可再修改」不冲突：改动对运行时
   是**无副作用的**（已应用标记仍然按文件名跳过该文件，补上的 `IF NOT EXISTS` 一次都不会
   被执行），它的唯一作用就是让 validate 通过，并让**将来**万一需要重跑时是安全的。
-  多动作的 `ALTER TABLE` 要每个动作都补（一个幂等动作不能替其它动作背书）。
+  多动作的 `ALTER TABLE` 要每个动作都补。种子 `INSERT` **不需要改**（不在本红线射程内）。
+
+### 种子数据（`INSERT`）：不被拦，但重放会重复插入
+
+本红线**不管 DML**。四条理由，其中两条会直接影响你怎么写：
+
+1. **它不会让部署卡死。** 裸 `INSERT` 重放是**成功**的（没有约束冲突），文件跑完、标记
+   写上、部署 SUCCEEDED。多出来的只是几行重复数据 —— 数据质量问题，不是可部署性问题。
+2. **`ON CONFLICT` 的子句级支持，DSQL 文档没有说。** userguide 只在总表里粗粒度写了
+   `INSERT INTO … VALUES/SELECT [ON CONFLICT]`，没有 INSERT 的详细语法页。既然本红线拒
+   `DROP TABLE IF EXISTS` 的理由就是"文档没说"，那它也不该**强制**一个文档没说的形态。
+3. **强制它常常是空转的**：`id UUID PRIMARY KEY DEFAULT gen_random_uuid()` 且没有自然键
+   时，`ON CONFLICT DO NOTHING` 的冲突目标每次都是新 uuid ⇒ 永不冲突 ⇒ 照样重复插入。
+   过了检查却没有变幂等，是**假安全感**。
+4. 平台从不要求你写种子数据。
+
+**所以：想让种子数据幂等，靠的是自然键，不是加一句 `ON CONFLICT`。** 推荐写法（`UNIQUE`
+列约束在 DSQL 的 `CREATE TABLE` 支持语法内，且不走异步索引任务）：
+
+```sql
+CREATE TABLE IF NOT EXISTS categories (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  code TEXT NOT NULL UNIQUE,          -- 自然键：重放时靠它判重
+  name TEXT NOT NULL
+);
+INSERT INTO categories (code, name) VALUES ('food', '餐饮')
+  ON CONFLICT (code) DO NOTHING;
+```
+
+**不要用 `CREATE UNIQUE INDEX ASYNC` 当冲突目标**：文档明说异步索引初始为 `INVALID`、
+要后台构建完才有效（可用 `sys.jobs` 或 `pg_index.indisvalid` 看状态、`sys.wait_for_job()`
+等待），紧跟其后的 `ON CONFLICT` 不一定能用上它。表内联的 `UNIQUE` 没有这个问题。
+
 
 ## 运行时约束（扫描器不查，但违反同样部署失败或线上出错）
 
