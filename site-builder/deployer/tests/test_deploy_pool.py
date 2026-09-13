@@ -1426,11 +1426,16 @@ def test_cognito_mode_minimal_config_passes():
 
 
 def test_idp_pool_names_prefer_flags_over_config():
+    """生产运行取 config；隔离运行（连平台池一起隔离）取旗标。
+
+    **旗标只在非生产 `--pool-name` 下合法**——反向组合会把生产平台池的 provider
+    指向 spike IdP 池，见 test_isolation_flags_require_a_non_production_platform_pool。
+    """
     assert dp.resolve_idp_pool_names(
         pool_name=dp.POOL_NAME, idp_pool_name=None, idp_domain_prefix=None,
         idp=_idp_cognito()) == ("site-builder-idp", "acme-idp-2026")
     assert dp.resolve_idp_pool_names(
-        pool_name=dp.POOL_NAME, idp_pool_name="spike-idp",
+        pool_name="sb-idp-spike", idp_pool_name="spike-idp",
         idp_domain_prefix="spike-idp-2026",
         idp=_idp_cognito()) == ("spike-idp", "spike-idp-2026")
 
@@ -1972,3 +1977,111 @@ def test_example_mode_keys_have_no_inline_comments():
     idp = _example_idp()
     for key in ("mode", "cognito_user_pool_name", "cognito_domain_prefix"):
         assert "#" not in idp[key] and ";" not in idp[key], f"{key} = {idp[key]!r}"
+
+
+# ---------------------------------------------------------------------------
+# 工单 07 的 /code-review findings（#2 / #3 / #4 / #6）——都落在本地 preflight
+# ---------------------------------------------------------------------------
+
+def test_isolation_flags_require_a_non_production_platform_pool():
+    """**finding #2（最危险的一条）**：守卫原先只做了一个方向。
+
+    反向组合无人拦：默认 `--pool-name`（= 生产平台池）+ 两个 --idp-* 旗标 ⇒
+    脚本会建出 spike IdP 池、派生它的 issuer/client，然后对**生产平台池**跑
+    `update_identity_provider`，把线上那个 OIDC provider 指向一个**没有任何用户**
+    的池 —— 全部生产用户的登录当场断，与 `--pool-name` docstring 早就警告过的
+    是同一类事故，只是从新开的这道门进来。
+    """
+    with pytest.raises(SystemExit, match="--pool-name"):
+        dp.resolve_idp_pool_names(pool_name=dp.POOL_NAME, idp_pool_name="spike-idp",
+                                  idp_domain_prefix="spike-2026", idp=_idp_cognito())
+    # 单给一个旗标同样拒（否则"只给池名"会静默走 config 的域名前缀）
+    with pytest.raises(SystemExit, match="--pool-name"):
+        dp.resolve_idp_pool_names(pool_name=dp.POOL_NAME, idp_pool_name="spike-idp",
+                                  idp_domain_prefix=None, idp=_idp_cognito())
+
+
+def test_production_run_without_flags_still_works():
+    """正对照：生产运行（默认 pool-name、不给旗标）必须照常从 config 取值。
+    上一条守卫收紧后最容易误伤的就是它。"""
+    assert dp.resolve_idp_pool_names(
+        pool_name=dp.POOL_NAME, idp_pool_name=None, idp_domain_prefix=None,
+        idp=_idp_cognito()) == ("site-builder-idp", "acme-idp-2026")
+
+
+@pytest.mark.parametrize("key,value", [
+    ("cognito_user_pool_name", "site-builder-users"),
+    ("cognito_domain_prefix", "site-builder-auth"),
+])
+def test_built_in_idp_pool_must_not_be_the_platform_pool(key, value):
+    """**finding #4**：没人比较过"内置 IdP 池"与"平台池"是不是同一个。
+
+    `cognito_user_pool_name = site-builder-users` 时 preflight 全过（按名字与按
+    域名前缀都解析到同一个池——平台池），`_ensure_idp_pool` 于是对**平台池**跑
+    `update_user_pool`，接着 `_verify_idp_pool_boundaries` 因平台池的 email 是
+    `Mutable: True` 而中止，**而那条错误文案写着"只能删掉这个池重建"**——照做
+    就是删掉生产池与它全部的联邦用户。一行本地不等式就消灭整个场景。
+    """
+    idp = _idp_cognito(**{key: value})
+    with pytest.raises(SystemExit, match="平台池"):
+        dp.check_idp_section(idp, dp.IDP_MODE_COGNITO,
+                             platform_pool_name="site-builder-users",
+                             platform_domain_prefix="site-builder-auth")
+
+
+def test_platform_pool_comparison_is_optional_for_pure_config_checks():
+    """两个平台侧参数不给时（纯 config 校验，比如 .example 的自证用例）不做这条比较
+    ——否则那些用例得凭空编一个平台池名，而它们要证明的是另一回事。"""
+    dp.check_idp_section(_idp_cognito(), dp.IDP_MODE_COGNITO)      # 不得抛
+
+
+@pytest.mark.parametrize("field", ["provider_name", "issuer", "client_id", "scopes"])
+def test_inline_comments_on_aws_bound_keys_are_rejected(field):
+    """**finding #3**：判据过 `_clean`、下发用原值 ⇒ 判据看到的和 AWS 看到的不是同一个串。
+
+    `provider_name = GoogleOIDC  # 也写进 trusted_idps` 会过 ⓿（cleaned 值不是保留名），
+    然后平台池、托管域名、整个内置 IdP 池与 client 都建完，最后在
+    `create_identity_provider(ProviderName="GoogleOIDC  # 也写进 trusted_idps")`
+    因名字正则失败 —— **正是把保留名校验前移要防的那个"停在中途"**。
+
+    修法取"拒"而不是"替他剥掉"：与 `router/infrastructure/stack.py` 对
+    `require_idp_claim` / `trusted_idps` 的既有态度一致（那边也是直接拒行内注释）。
+    `mode` 不在此列——它只在本进程内判分支、从不下发给 AWS，见下一条。
+    """
+    idp = {"provider_name": "Okta", "issuer": "https://okta.example/",
+           "client_id": "c", "client_secret": "s", "scopes": "openid email profile"}
+    idp[field] = idp[field] + "  # 顺手写个注释"
+    with pytest.raises(SystemExit, match=field):
+        dp.check_idp_section(idp, dp.IDP_MODE_EXTERNAL)
+
+
+def test_mode_still_tolerates_inline_comments_because_it_never_reaches_aws():
+    """`mode` 的行内注释仍然容忍（既有用例 test_idp_mode_tolerates_inline_comments
+    钉着）：它只用来判分支，不会变成任何 AWS 参数。上一条的判据必须不误伤它。"""
+    dp.check_idp_section({"mode": "external-oidc  # 已有 IdP", "provider_name": "Okta",
+                          "issuer": "https://okta.example/", "client_id": "c",
+                          "client_secret": "s"}, dp.IDP_MODE_EXTERNAL)   # 不得抛
+
+
+@pytest.mark.parametrize("prefix", ["Acme-IdP", "acme_idp", "-acme", "acme-",
+                                    "a" * 64, "acme.idp"])
+def test_malformed_domain_prefix_fails_locally_not_with_a_traceback(prefix):
+    """**finding #6**：畸形前缀让只读 preflight 以 botocore traceback 收场。
+
+    Cognito 的 prefix domain 只允许小写字母 / 数字 / 连字符，首尾不能是连字符，
+    ≤63 字符。`describe_user_pool_domain(Domain="Acme-IdP")` 抛
+    `InvalidParameterException`，而 `_pool_id_for_domain` 只捕
+    `ResourceNotFoundException` ⇒ 那一步的全部意义（"在第一次 AWS 写之前带着可读
+    文案 fail closed"）落空。格式判断是纯本地的，前移到 ⓿ 与其它判据同处。
+    """
+    with pytest.raises(SystemExit, match="cognito_domain_prefix"):
+        dp.check_idp_section(_idp_cognito(cognito_domain_prefix=prefix),
+                             dp.IDP_MODE_COGNITO)
+
+
+@pytest.mark.parametrize("prefix", ["acme-idp-2026", "a", "site-builder-idp",
+                                    "x" * 63, "abc123"])
+def test_valid_domain_prefixes_are_accepted(prefix):
+    """负对照：合法前缀不许被误拒——多拒一个就是用一条不存在的限制挡住采用者。"""
+    dp.check_idp_section(_idp_cognito(cognito_domain_prefix=prefix),
+                         dp.IDP_MODE_COGNITO)      # 不得抛

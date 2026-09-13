@@ -25,6 +25,7 @@ client_credentials 不能用空 scope 创建，否则脚本会在建 client 这�
 import argparse
 import configparser
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -104,6 +105,15 @@ _COGNITO_MODE_KEYS = ("cognito_user_pool_name", "cognito_domain_prefix")
 # external-oidc 独有的键；cognito-admin 下由部署过程派生，**非空即冲突**
 _EXTERNAL_MODE_KEYS = ("issuer", "client_id", "client_secret")
 
+# **会原样下发给 Cognito 的键**：它们的值里不许有行内注释（判据 ④）。
+# client_secret 刻意不在此列——secret 里的 `#` 不是注释，而把清洗逻辑架在凭证上
+# 等于开一条能改写凭证的路径。`mode` 也不在：它只在本进程内判分支。
+_AWS_BOUND_KEYS = ("provider_name", "issuer", "client_id", "scopes",
+                   "cognito_user_pool_name", "cognito_domain_prefix")
+
+# Cognito prefix domain 的格式：小写字母 / 数字 / 连字符，首尾不能是连字符，1-63 字符。
+_DOMAIN_PREFIX_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+
 # provider_name 的保留名（**逐个实测，区分大小写**，工单 06 腿 1）。
 # 只有四个**社交类型名**会被 Cognito 拒（`Provider X cannot be of type OIDC`）；
 # `SAML` 与小写 `google` 都被接受，所以不许往这张表里凭印象加名字——多拒一个
@@ -148,19 +158,47 @@ def assert_provider_name_allowed(name: str) -> None:
         raise SystemExit(f"[IdP] provider_name = {name!r} 不能用：{why}")
 
 
-def check_idp_section(idp: dict, mode: str) -> None:
+def check_idp_section(idp: dict, mode: str, *,
+                      platform_pool_name: str | None = None,
+                      platform_domain_prefix: str | None = None) -> None:
     """[IdP] 段的本地一致性校验（零 AWS 调用）。
 
-    三类判据：
+    六类判据：
       ① provider_name 非空时不许是保留名（两种模式都查）；
       ② 模式所需键齐备（cognito-admin 才有必填项——external-oidc 下"全空 =
          跳过联邦"是支持的首次部署状态，见 main() ③ 的告警分支）；
       ③ 两套模式的字段不许混填（静默忽略比报错难查得多：采用者以为自己指定了
-         issuer，实际生效的是另一个池的）。
+         issuer，实际生效的是另一个池的）；
+      ④ **下发给 AWS 的键上不许有行内注释**（见 _AWS_BOUND_KEYS）；
+      ⑤ `cognito_domain_prefix` 的格式必须合法（否则只读 preflight 会以
+         botocore 的 InvalidParameterException traceback 收场）；
+      ⑥ **内置 IdP 池不能就是平台池**（两个平台侧参数给出时才比较）。
+
+    platform_pool_name / platform_domain_prefix 只有 main() 会传（它知道
+    `--pool-name` / `--domain-prefix` 的真实取值）；纯 config 校验（`.example`
+    的自证用例）不传，那时跳过判据 ⑥。
     """
     name = _clean(idp.get("provider_name", ""))
     if name:
         assert_provider_name_allowed(name)
+
+    # ④ 下发给 AWS 的值必须与它的 cleaned 形态**逐字节相同**。
+    # 判据过 _clean 而下发用原值时，两者看的不是同一个串：
+    # `provider_name = GoogleOIDC  # 也写进 trusted_idps` 会过保留名校验，然后
+    # 在建完平台池、托管域名与整个内置 IdP 池之后，于 create_identity_provider
+    # 因名字正则失败 —— 正是把保留名校验前移要防的那个"停在中途"。
+    # **取"拒"而不是"替他剥掉"**：与 router/infrastructure/stack.py 对
+    # require_idp_claim / trusted_idps 的既有态度一致。
+    # `mode` 刻意不在此列：它只在本进程内判分支，从不变成任何 AWS 参数。
+    for key in _AWS_BOUND_KEYS:
+        raw = idp.get(key)
+        if raw is None:
+            continue
+        if str(raw).strip() != _clean(raw):
+            raise SystemExit(
+                f"[IdP] {key} 的值里有行内注释（`#` 或 `;`）：{str(raw).strip()!r}。"
+                "裸 ConfigParser 会把注释并进值，而这个值要原样下发给 Cognito"
+                "——注释请写在**上一行**。（`mode` 不受此限：它只在本地判分支。）")
 
     cognito_filled = [k for k in _COGNITO_MODE_KEYS if _clean(idp.get(k, ""))]
     # client_secret 不过 _clean：secret 里的 `#` 不是注释（Cognito 的 secret 是
@@ -186,6 +224,32 @@ def check_idp_section(idp: dict, mode: str) -> None:
                 f"[IdP] mode = {IDP_MODE_COGNITO} 下 {', '.join(external_filled)} 必须留空"
                 "——它们由本次部署从新建的 IdP 池派生。填了值说明这份 config 混了两套"
                 "模式的字段，静默忽略会让你以为生效的是自己填的那个 issuer。")
+        # ⑤ 托管域名前缀的格式（纯本地）。不查的后果是只读 preflight 里那句
+        # describe_user_pool_domain 抛 InvalidParameterException、以 traceback 收场，
+        # 而那一步的全部意义就是"在第一次 AWS 写之前带着可读文案 fail closed"。
+        prefix = _clean(idp.get("cognito_domain_prefix", ""))
+        if not _DOMAIN_PREFIX_RE.fullmatch(prefix):
+            raise SystemExit(
+                f"[IdP] cognito_domain_prefix = {prefix!r} 不是合法的 Cognito 托管域名"
+                "前缀：只允许小写字母 / 数字 / 连字符，首尾不能是连字符，长度 1-63。"
+                "（这个前缀还是**跨账号全局唯一**的，可能已被占用——那种情形只有"
+                "真正建域名时才知道。）")
+        # ⑥ 内置 IdP 池不能就是平台池。不查的后果最恶劣：preflight 全过（按名字与
+        # 按域名前缀都解析到同一个池——平台池），_ensure_idp_pool 于是对**平台池**
+        # 跑 update_user_pool，接着读回复验因平台池的 email 是 Mutable=True 而中止，
+        # **而那条文案写着"只能删掉这个池重建"**——照做就是删掉生产池与它全部的
+        # 联邦用户。
+        pool_name = _clean(idp.get("cognito_user_pool_name", ""))
+        if platform_pool_name and pool_name == platform_pool_name:
+            raise SystemExit(
+                f"[IdP] cognito_user_pool_name = {pool_name!r} 与平台池同名。"
+                "内置 IdP 池必须是**另一个**池——平台池是 RP（联邦到 IdP、发平台自己的"
+                " token），这个池是 IdP（存用户与密码）；两者的 tier、托管登录版本与"
+                " email 可变性刻意相反。取一个别的名字（建议 site-builder-idp）。")
+        if platform_domain_prefix and prefix == platform_domain_prefix:
+            raise SystemExit(
+                f"[IdP] cognito_domain_prefix = {prefix!r} 与平台池的托管域名前缀同值。"
+                "一个前缀只能属于一个池，内置 IdP 池需要自己的前缀。")
     elif cognito_filled:
         raise SystemExit(
             f"[IdP] mode = {IDP_MODE_EXTERNAL}（或未给 mode）时 {', '.join(cognito_filled)}"
@@ -198,11 +262,22 @@ def resolve_idp_pool_names(*, pool_name: str, idp_pool_name: str | None,
                            idp: dict) -> tuple[str, str]:
     """内置 IdP 池的池名与托管域名前缀：命令行旗标优先于 config。
 
-    **隔离守卫**：`--pool-name` 不是生产池时，两个旗标必须都显式给出。
-    `--pool-name` 只隔离了三样东西（平台池名、pre-token 函数名、SSM 前缀），
-    **IdP 池的名字来自 config** ⇒「隔离平台池 + 生产 IdP 池」这个组合会对生产
-    IdP 池的 app client 做 read-modify-write（改 SupportedIdentityProviders /
-    ExplicitAuthFlows / CallbackURLs）。这里在任何 AWS 写之前拒掉它。
+    **隔离守卫是双向的**（单向那版漏掉了更危险的一半）：
+
+    ① `--pool-name` 不是生产池 ⇒ 两个旗标必须都给。`--pool-name` 只隔离了三样
+       东西（平台池名、pre-token 函数名、SSM 前缀），**IdP 池的名字来自 config**
+       ⇒「隔离平台池 + 生产 IdP 池」会对生产 IdP 池的 app client 做
+       read-modify-write（改 SupportedIdentityProviders / ExplicitAuthFlows /
+       CallbackURLs）。
+
+    ② 反过来：给了任一旗标 ⇒ `--pool-name` 必须不是生产池。**这一半更危险**：
+       默认 `--pool-name` + `--idp-pool-name spike` 会建出 spike IdP 池、派生它的
+       issuer/client，然后对**生产平台池**跑 `update_identity_provider`，把线上
+       那个 OIDC provider 指向一个**没有任何用户**的池 —— 全部生产用户的登录当场
+       断（与 `--pool-name` docstring 早就警告过的是同一类事故，只是从新开的这道
+       门进来）。
+
+    两条都在任何 AWS 写之前拒掉。
     """
     if pool_name != POOL_NAME and not (idp_pool_name and idp_domain_prefix):
         raise SystemExit(
@@ -210,6 +285,12 @@ def resolve_idp_pool_names(*, pool_name: str, idp_pool_name: str | None,
             " --idp-domain-prefix。内置 IdP 池的名字来自 config.ini，"
             "`--pool-name` 隔离不到它——照这样跑会对**生产 IdP 池**的 app client "
             "做写操作。两个旗标都显式给出后再跑。")
+    if pool_name == POOL_NAME and (idp_pool_name or idp_domain_prefix):
+        raise SystemExit(
+            f"给了 --idp-pool-name / --idp-domain-prefix，但 --pool-name 仍是生产池"
+            f" {POOL_NAME!r}。这两个旗标只为隔离实验存在——照这样跑会把**生产平台池**的"
+            " OIDC provider 指向那个 spike IdP 池（它一个用户都没有），"
+            "全部存量用户的登录立刻中断。要试就连平台池一起隔离：同时给 --pool-name。")
     return (idp_pool_name or _clean(idp.get("cognito_user_pool_name", "")),
             idp_domain_prefix or _clean(idp.get("cognito_domain_prefix", "")))
 
@@ -1132,7 +1213,8 @@ def main() -> None:
     # "池和托管域名都建好之后才炸"（provider_name 填了保留名），停在中途最难收拾。
     idp = dict(cfg["IdP"]) if cfg.has_section("IdP") else {}
     mode = idp_mode(idp)
-    check_idp_section(idp, mode)
+    check_idp_section(idp, mode, platform_pool_name=args.pool_name,
+                      platform_domain_prefix=args.domain_prefix)
     idp_pool_name = idp_domain_prefix = ""
     if mode == IDP_MODE_COGNITO:
         idp_pool_name, idp_domain_prefix = resolve_idp_pool_names(
