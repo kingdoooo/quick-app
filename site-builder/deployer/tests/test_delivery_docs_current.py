@@ -1522,3 +1522,56 @@ def test_status_free_docs_and_decision_records_do_not_overlap():
     assert not (free & records), f"同时进了两条纪律：{sorted(free & records)}"
     adrs = {f for f in records if f.startswith("docs/adr/")}
     assert not adrs, f"ADR 不该进决策记录声明（日期是文体固有的）：{sorted(adrs)}"
+
+
+# ── 工单 12 第 3 条：不许把「新 clone 里没有的文件」标成 tracked ──────────────
+#
+# 既有的 test_delivery_docs_mark_every_undistributed_doc_pointer 是**块级启发式**：
+# 同一段里出现 "gitignored" 就算标注过。实测它会漏掉这一类——把
+# `docs/security/3c-impersonation-surface.json` untrack 之后，CLAUDE.md 那一格仍写着
+# 「（**tracked**，…名字只进 gitignored dump）」，块里那个"gitignored"说的是**另一个**
+# 文件，于是错标堂堂正正地过了守卫。
+#
+# 所以这条按**相邻**判：`**tracked**` 这个标签紧挨着的那个路径，必须真的被跟踪。
+# 方向是"标签欺骗"，与上面那条"指针缺标注"互补。
+_TRACKED_LABEL_RE = re.compile(
+    r"`([\w./@{}*,+:=<>-]+)`\s*（\s*\*\*tracked\*\*|\*\*tracked\*\*[^）]{0,20}`([\w./@{}*,+:=<>-]+)`")
+
+
+def test_no_doc_labels_an_untracked_path_as_tracked():
+    """`**tracked**` 是个承诺：读者会据此认为 clone 下来就有这个文件。
+
+    扫**全部 tracked .md**（不是三份入口文档）：这个标签在 spec / review / ADR 里
+    同样是承诺，而那几份恰恰最爱标它。
+    """
+    import subprocess
+    r = subprocess.run(["git", "ls-files", "-z", "*.md"], cwd=ROOT,
+                       capture_output=True, text=True)
+    assert r.returncode == 0, f"git ls-files 失败（本条空转）：{r.stderr.strip()}"
+    docs = [d for d in r.stdout.split("\0") if d]
+    assert len(docs) > 5, f"只找到 {len(docs)} 份 tracked .md——本条空转"
+    tracked = _tracked_paths()
+
+    checked, offenders = 0, []
+    for rel in docs:
+        for no, line in enumerate((ROOT / rel).read_text(encoding="utf-8").splitlines(), 1):
+            for m in _TRACKED_LABEL_RE.finditer(line):
+                path = m.group(1) or m.group(2)
+                if not _is_doc_pointer(path):
+                    continue
+                checked += 1
+                if not _distributed(path, tracked, ROOT / rel):
+                    offenders.append(f"{rel}:{no} 把 {path} 标成 tracked，但它没被跟踪")
+    assert not offenders, "\n  ".join(["标签与事实不符："] + offenders)
+    assert checked >= 3, (
+        f"只找到 {checked} 处 `**tracked**` 标签——判据多半跟不上文档了，本条正在空转")
+
+
+def test_tracked_label_guard_catches_a_synthetic_lie(tmp_path):
+    """**正对照**：合成一行"把不存在的文件标成 tracked"，判据必须认出来。
+    没有这条，上面那条在正则写错时会静默全绿。"""
+    line = "| 证据 | `docs/security/does-not-exist.json`（**tracked**，只读） |"
+    hits = [m.group(1) or m.group(2) for m in _TRACKED_LABEL_RE.finditer(line)]
+    assert hits == ["docs/security/does-not-exist.json"], hits
+    assert _is_doc_pointer(hits[0])
+    assert not _distributed(hits[0], {"docs/security/other.json"}, README)

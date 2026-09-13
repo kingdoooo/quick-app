@@ -387,7 +387,7 @@ JWT。别"顺手补齐"这个名单。
 | **CodeBuild 对 bootstrap 桶读权限的收窄（§9 的 3b）** | `docs/superpowers/specs/2026-08-27-codebuild-bootstrap-read-narrowing-spec.md`（**tracked**；含为什么已有那条 AST 守卫看不见这个洞、三层守卫各自能证明什么、部署窗口的干净失败面） |
 | **轮转会话密钥（KMS）** | `site-builder/DEPLOY.md`「轮转会话密钥（KMS）」一节（① 建新 key → ② 就位 → ③ 切换 → ④ 排空 → ⑤ 退役，附回滚表与应急）。非对称 CMK 不支持自动轮转，所以轮转 = 加一把新 key + verifier 先行 + 排空后退役。裁定原文在 spec §11.8 |
 | **会话签名非对称化的设计（3c；分包与顺序）** | `docs/superpowers/specs/2026-08-28-asymmetric-session-signing-spec.md`（**tracked**；§6.1 是时序真源，其中 3c-final 那一行是当前定义、2A/2B/3 三行只保留设计内容；§11 是全部裁定与被否决项，§11.9 是"交付物是资产"框架下的收敛：2A/2B/3 合为 3c-final、验证环境硬切换、HS 不进 v1；ADR 在 `docs/adr/`。含量测过的收益边界、两个 key family 的模型、部署与回滚协议、以及「四个 verify_* 闸门的登录态改由夹具签发器提供」这条容易漏的代价） |
-| **3c 冒充面的可复跑证据** | `site-builder/scripts/probe_impersonation_surface.py`（**tracked**，只读，约 20 分钟）→ `docs/security/3c-impersonation-surface.json`（**tracked**，只有计数/等价类/边际收益/盲区清单，名字只进 gitignored dump）。**`--self-test` 不碰 AWS**，反例与变形测试在 `deployer/tests/test_probe_impersonation_surface.py` |
+| **3c 冒充面的可复跑证据** | `site-builder/scripts/probe_impersonation_surface.py`（**tracked**，只读，约 20 分钟）→ `docs/security/3c-impersonation-surface.json`（**gitignored、新 clone 里没有**——它是单账号计数，不是闸门也没有基线；要用就重跑探针重新生成，名字只进 gitignored dump）。**`--self-test` 不碰 AWS**，反例与变形测试在 `deployer/tests/test_probe_impersonation_surface.py` |
 | 加固包的设计与实施 | `docs/superpowers/specs/2026-08-22-s1-isolation-and-auth-hardening-spec.md` + `docs/superpowers/plans/2026-08-22-s1-isolation-and-auth-hardening.md`；存量环境的升级/闸门/回滚见 `site-builder/DEPLOY.md` 的「S1 加固」一节 |
 | 一期设计决策与范围 | `docs/superpowers/specs/2026-07-21-quick-site-builder-design.md`（已实现快照，勿改） |
 | 二期设计与需求 | `docs/superpowers/specs/2026-07-30-quick-site-builder-phase2-design.md`；需求清单 `docs/phase2-requirements.md` |

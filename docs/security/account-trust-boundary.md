@@ -336,7 +336,8 @@ Python 后端而用 `pip install` 装 sdist），这条链就从「账号内部�
 都要一起重做。**它是独立设计包，本轮没有做。**
 
 **B 做完之后残留多少：已量测，不是估计。** 2026-08-30 的只读模拟（HS 形态下的量测；3c-final 之后那份探针 JSON 尚未重跑，归工单 12；401 个 principal，
-探针与脱敏聚合证据都是 tracked 的，见 `docs/security/3c-impersonation-surface.json`，
+探针脚本是 tracked 的；它的聚合产物 `docs/security/3c-impersonation-surface.json`
+**gitignored、新 clone 里没有**（单账号计数，重跑探针即可重生成），
 可用 `site-builder/scripts/probe_impersonation_surface.py` 复跑）：
 
 | | 数量 |

@@ -28,3 +28,8 @@ site-builder/scripts/backfill-old-policies.json*
 # 账号信任边界闸门的基线：含单账号实测（principal 指纹、语句指纹、公钥指纹），
 # 不随资产分发（ADR 0005 / 3c-final D1）。采用者首跑 `--update-baseline` 自己生成。
 site-builder/scripts/account_trust_baseline.json
+
+# 冒充面探针的产物：同样是单账号计数（等价类数量、边际收益、盲区清单）。
+# 它**不是闸门**、没有基线、不会红，所以对采用者是零信息——要用就自己重跑
+# `probe_impersonation_surface.py`（只读）重新生成（ADR 0005 / 工单 12）。
+docs/security/3c-impersonation-surface.json

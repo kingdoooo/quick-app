@@ -5,7 +5,7 @@ date: 2026-09-02
 # 会话签名 CMK 用默认 KMS key policy，不做限制性策略
 
 3c 把会话签名迁到两把非对称 CMK 时，直觉是给 key policy 只列 auth / panel 两个 signer。
-生产只读量测（`docs/security/3c-impersonation-surface.json` 的 `marginal_value_if_closed`）
+生产只读量测（`docs/security/3c-impersonation-surface.json` 的 `marginal_value_if_closed`；该产物 **gitignored、新 clone 里没有**，重跑探针可重生成）
 显示限制性 key policy 只让 1 个 principal 离开冒充面，且结构上收不掉"劫持 signer 代码"那条路：
 恶意代码以 signer 角色的身份调 KMS，key policy 必须放行它。代价是自锁风险，加一个必须纳入
 闸门枚举的破窗 principal。所以两把 CMK 用默认 key policy（root 委派）；`kms:Sign` 只经 IAM

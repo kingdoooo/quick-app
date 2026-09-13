@@ -1157,7 +1157,7 @@ Lambda/IAM 写调用之前。
 
 | 事实 | 来源 |
 |---|---|
-| 56 能读明文密钥；3c 后 `can_sign` **15**、能替换运行中 Edge **17**、并集 **19**（**已知下界**） | `docs/security/3c-impersonation-surface.json`（tracked，只读 `SimulatePrincipalPolicy`，401 个 principal，2026-08-30） |
+| 56 能读明文密钥；3c 后 `can_sign` **15**、能替换运行中 Edge **17**、并集 **19**（**已知下界**） | `docs/security/3c-impersonation-surface.json`（**gitignored、新 clone 里没有**，重跑探针可重生成；只读 `SimulatePrincipalPolicy`，401 个 principal，2026-08-30） |
 | 九条能力路径各自的持有者数、四个候选措施的边际收益 | 同上（`aggregate.per_label` / `aggregate.marginal_value_if_closed`） |
 | **router 栈已关联 CFN service role 且无 stack policy** ⇒ CFN 那条路的调用方自己不需要 `iam:PassRole` | `cloudformation:DescribeStacks` + `GetStackPolicy`（只读） |
 | **`site-auth-service` / `site-panel` 的 Function URL 无 qualifier、服务 `$LATEST`** ⇒ 换码即劫持 signer | `lambda:GetFunctionUrlConfig` + `GetFunction`（只读）+ 两个部署脚本的裸 `update_function_code` |
@@ -1179,7 +1179,7 @@ Lambda/IAM 写调用之前。
 | 层 | 位置 | 内容 |
 |---|---|---|
 | 探针本体 | `site-builder/scripts/probe_impersonation_surface.py`（**tracked**） | 资源全靠发现（不硬编码 distribution ID / 账号 / 角色名 / 绝对路径）；`--self-test` 是 18 条反例 + 2 条聚合断言，不碰 AWS |
-| 聚合证据 | `docs/security/3c-impersonation-surface.json`（**tracked**） | commit SHA、探测时间、区、动作/资源等价类、各集合计数与交集、每个候选措施的边际收益、原始输出的 sha256、**已知盲区清单** |
+| 聚合证据 | `docs/security/3c-impersonation-surface.json`（**gitignored、新 clone 里没有**，重跑探针可重生成） | commit SHA、探测时间、区、动作/资源等价类、各集合计数与交集、每个候选措施的边际收益、原始输出的 sha256、**已知盲区清单** |
 | 原始名字 | `docs/design/3c-spike/observed-*.json`（**gitignored**） | principal 名字。探针在发第一个请求**之前**用 `git check-ignore` 挡住写进 tracked 路径 |
 
 > **证据里的 `commit` 字段写的是 `bd615de…+dirty`**，这是诚实的：那一跑发生在引入探针
