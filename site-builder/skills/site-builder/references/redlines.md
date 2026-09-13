@@ -158,12 +158,16 @@
   - 平台因此**继续禁用**它：`TEXT` 存 JSON 至少不会让人误以为有索引加速。
     确实需要按某个字段过滤时，把它**提成一个独立列**（可建普通索引），
     这比塞进 jsonb 再指望索引更快也更清晰。
-  migrations 文件不做静态扫描，但同样的禁用特性会在 provision-db 执行时
-  直接报 SQL 错误——**写 migrations 时同样遵守本表**。
+- **扫描面**：禁用特性表与索引 `ASYNC` 规则对 `backend/schema.sql` 与
+  `backend/migrations/*.sql` **一视同仁**，都在 validate 阶段静态扫描
+  （执行器用同一个连接、同样逐条执行两者，所以禁用特性写在哪个文件里都会在
+  provision-db 阶段失败）。**写 migrations 时同样遵守本表。**
 - **违反后果**：
   - `backend/schema.sql: fullstack-sql 必须提供建表 SQL`（文件缺失）
   - `backend/schema.sql: 含 DSQL 不支持的 REFERENCES（见红线文档替代方案）`
-    （逐关键词报，`SERIAL`/`JSONB`/`CREATE TRIGGER`/`CREATE TEMP` 同理）
+    （逐关键词报，`SERIAL`/`JSONB`/`CREATE TRIGGER`/`CREATE TEMP` 同理；
+    migrations 文件报自己的相对路径，如
+    `backend/migrations/001_add.sql: 含 DSQL 不支持的 SERIAL…`）
   - `backend/schema.sql: DSQL 建索引必须写 CREATE INDEX ASYNC`
     （漏 `ASYNC` 时 provision-db 阶段报
     `unsupported mode. please use CREATE INDEX ASYNC.`，**站点不会上线**）
@@ -204,7 +208,7 @@ CREATE INDEX ASYNC IF NOT EXISTS idx_expenses_created_at ON expenses (created_at
 **错误写法**：
 
 ```sql
-CREATE TABLE orders (
+CREATE TABLE orders (                                  -- 违规：缺 IF NOT EXISTS（红线 9）
   id SERIAL PRIMARY KEY,                              -- 违规：SERIAL
   user_id UUID REFERENCES users(id) ON DELETE CASCADE, -- 违规：REFERENCES
   meta JSONB                                           -- 违规：JSONB
@@ -267,6 +271,67 @@ CREATE INDEX idx_orders_user ON orders (user_id);
   或者 zip 里只有 `package.json` 没有 `package-lock.json`。
 - 黄金样例：`fixtures/nosql-notes/backend/` 与 `fixtures/sql-expenses/backend/` 各带一份
   lockfile。无依赖的后端同样要放这一对（对空依赖的 `package.json` 跑同一条命令即可）。
+
+## 红线 9：DSQL 建表/迁移必须可重放（仅 fullstack-sql）
+
+- **规则**：`backend/schema.sql` 与 `backend/migrations/*.sql` 里的**每一条**语句都必须
+  是下列可重放形态之一，否则 validate 拒：
+
+  | 允许的形态 | 说明 |
+  |---|---|
+  | `CREATE TABLE IF NOT EXISTS …` | 建表 |
+  | `CREATE [UNIQUE] INDEX ASYNC IF NOT EXISTS <索引名> …` | 用 `IF NOT EXISTS` 时**索引名必填** |
+  | `ALTER TABLE [IF EXISTS] … ADD COLUMN IF NOT EXISTS …` | 加列 |
+  | `ALTER TABLE [IF EXISTS] … DROP COLUMN IF EXISTS …` | 删列 |
+  | `ALTER TABLE [IF EXISTS] … DROP CONSTRAINT IF EXISTS …` | 删约束 |
+  | `CREATE OR REPLACE VIEW …` | 建视图（`RECURSIVE` 也可） |
+  | `INSERT INTO … ON CONFLICT DO NOTHING …` | 种子数据（**`DO UPDATE` 不算**，它每次都写） |
+
+- **规则（子目录）**：迁移文件必须直接放在 `backend/migrations/` 下，**不允许子目录**。
+- **为什么**：DSQL 每条语句 autocommit（一个事务只许一条 DDL，且 DDL 与 DML 不能同
+  事务，所以"把整个文件包进一个事务"**做不到**），而 DSQL 与平台元数据之间**没有原子
+  事务**。一个文件跑到一半失败（一个 typo、或超时落在文件中间），前面的语句**已经提交**
+  而"这个文件跑过了"的标记没写上 —— 重试会**整文件重跑**。此时不可重放的语句
+  （裸 `CREATE TABLE`、裸 `INSERT`）第二次撞上"已存在 / 重复插入"而失败，站点会卡在
+  「同一份产物再也部署不上去」，直到 SQL 被改成可重放。
+- **两条容易踩的边界**（AWS 文档原话，实测口径一致）：
+  - `IF NOT EXISTS` 的守卫**只看名字，不比对类型**。文档对列的说法是 "a column already
+    exists with this name"；索引那边更直白："no guarantee that the existing index
+    resembles the one that would have been created"。**⇒ 改过某列的类型之后重放会
+    静默 no-op**，不会报错也不会改成新类型。要改类型就新加一个迁移文件换列。
+  - 同步 DDL 失败后**是否原子回滚，DSQL 文档没有说**，不要假设。唯一有明确说法的是
+    异步索引：`CREATE INDEX ASYNC` 失败会留在 `INVALID` 状态，官方建议显式 `DROP` 后重建。
+- **违反后果**：
+  - `backend/schema.sql: 不可重放的语句 \`CREATE TABLE orders (id UUID PRIMARY KEY)\`——…`
+  - `backend/migrations/nested/: 不允许子目录——迁移文件必须直接放在 backend/migrations/ 下…`
+- **正确**：
+
+  ```sql
+  CREATE TABLE IF NOT EXISTS expenses (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    title TEXT NOT NULL
+  );
+  CREATE INDEX ASYNC IF NOT EXISTS idx_expenses_title ON expenses (title);
+  CREATE OR REPLACE VIEW expenses_recent AS SELECT * FROM expenses;
+  -- 种子数据：靠唯一约束做冲突目标（表本来就该有主键）
+  INSERT INTO categories (id, name) VALUES ('food', '餐饮') ON CONFLICT DO NOTHING;
+  ```
+
+- **错误**：
+
+  ```sql
+  CREATE TABLE orders (id UUID PRIMARY KEY);        -- 缺 IF NOT EXISTS
+  ALTER TABLE orders ADD COLUMN note TEXT;          -- 缺 IF NOT EXISTS
+  CREATE VIEW v AS SELECT 1;                        -- 缺 OR REPLACE
+  INSERT INTO categories VALUES ('food', '餐饮');    -- 缺 ON CONFLICT DO NOTHING
+  DROP TABLE old_orders;                            -- 白名单外（IF 形态文档未确认幂等）
+  CREATE SCHEMA extra;                              -- 白名单外（同上；而且站点无权建 schema）
+  BEGIN; … COMMIT;                                  -- 禁止事务包裹（DSQL 一事务一条 DDL）
+  ```
+
+- **为什么是白名单**：只放行 AWS 文档**确认**支持幂等 `IF` 形态的语句。`CREATE SCHEMA`、
+  `DROP TABLE`、`CREATE SEQUENCE` 这些的 `IF` 形态在 DSQL 文档里没有说法，所以一律拒——
+  与其猜，不如让站点作者用已确认可行的那几种形态表达同样的意图。
 
 ## 运行时约束（扫描器不查，但违反同样部署失败或线上出错）
 
