@@ -2,24 +2,25 @@
 
 业务人员在**任意支持 Skill + MCP 的 Agent 客户端**（Claude Code / Codex /
 Amazon Quick / Kiro …）里用自然语言开发简易全栈站点，说一句"部署"即获得
-`https://app-xxx.<你的域名>` 的可分享 URL；站点访问与管理权限绑定**飞书账号**
-（或任意能提供 email claim 的企业 OIDC/SAML IdP 身份）。
+`https://app-xxx.<你的域名>` 的可分享 URL；站点访问与管理权限绑定**你接入的
+OIDC IdP 身份**（凡是能给出 email claim 的都行；没有现成 IdP 时方案可以自己建一个
+Cognito 池当身份源，飞书只是其中一种参考适配器）。
 全程不接触 AWS 控制台，无 EC2/RDS 重资产。
 
 > **与 Agent 客户端的账号体系无关**：Claude Code / Codex / Quick 各自怎么登录是
 > 客户端自己的事，本方案不做任何假设。客户端只需要两件事——能加载 Skill、能连
 > MCP；对**本方案**的认证（部署权限、站点访问、控制台）全部走方案自带的
-> Cognito，联邦到你在部署时接入的飞书或标准 IdP。
+> Cognito，联邦到你在部署时接入的那个 IdP。
 
-> **当前状态**：已在真实 AWS 账号完整部署并端到端验证——自助管理控制台、
-> API Key 交换层、访问统计聚合、以及站点更新的 blue/green 原子切换都已上线并通过
-> 真机闸门（含真实用户经 Claude Code OAuth 接入部署、飞书登录 + 鉴权四态实测）。
+> **资产范围**：除建站链路本身，还包含自助管理控制台、API Key 交换层（可选组件）、
+> 访问统计聚合、以及站点更新的 blue/green 原子切换。每一项都有随仓库分发的真机闸门
+> 脚本，部署完自己跑一遍就知道它在你的账号里对不对（见 DEPLOY.md 的「部署后验收」）。
 >
 > **本段不写测试数量与日期**：那种数字每一轮都会变假，而这里是外部读者看到的第一段话。
 > 想知道当下的确切状态就**自己跑一遍**——各包的测试命令与真机闸门脚本都列在
 > [CLAUDE.md](CLAUDE.md) 的「测试命令」小节里，跑出来的数字就是答案。
 >
-> 部署中踩到的所有坑（ECR manifest、Function URL 权限、飞书回调/邮箱、token 形态、
+> 部署中踩到的所有坑（ECR manifest、Function URL 权限、IdP 回调/邮箱、token 形态、
 > 预签名上传、部署顺序等）均已回写
 > **[site-builder/DEPLOY.md](site-builder/DEPLOY.md)** 与
 > [docs/client-setup.md](site-builder/docs/client-setup.md)，换账号重部署照手册执行即可。
@@ -60,7 +61,7 @@ Amazon Quick / Kiro …）里用自然语言开发简易全栈站点，说一句
 └──────────────────────────┬──────────────────────────────────┘
                            │ 未登录 302 → auth.<域名>/login
 ┌──────────────────────────▼──────────────────────────────────┐
-│ ⑤ 身份层（Cognito 联邦到飞书适配器或任意 OIDC/SAML IdP）      │  site-builder/auth/
+│ ⑤ 身份层（Cognito 联邦到任意 OIDC/SAML IdP；飞书经适配器）    │  site-builder/auth/
 │    一套 Cognito 三处消费：站点访问 / 控制台 / MCP 部署权限     │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -102,7 +103,7 @@ Amazon Quick / Kiro …）里用自然语言开发简易全栈站点，说一句
 
 - **七个包各有单元测试**（contract / auth / router edge / deployer / mcp / panel /
   key-proxy），另有一组 E2E 在 `RUN_E2E=1` + 真实部署后运行，含自动化登录 CRUD
-  ——经 auth 的 `/fixture-session` 取夹具会话（ADR 0002），无需人工飞书扫码。
+  ——经 auth 的 `/fixture-session` 取夹具会话（ADR 0002），无需人工在 IdP 侧登录。
   **这里不写各包的测试数量**：那些数字每加一个用例就变假。要当下的确切数字，
   照 [CLAUDE.md](CLAUDE.md) 的「测试命令」小节跑一遍，输出就是答案。
 - 每个任务经独立子代理实现 + 审查/裁决 + 修复闭环；开发过程中修复的典型问题：
@@ -119,8 +120,9 @@ Amazon Quick / Kiro …）里用自然语言开发简易全栈站点，说一句
 
 本方案面向**在你自己的 AWS 账号里从零部署**。需要先准备：**us-east-1 区域**
 （Lambda@Edge 与 CloudFront 用的 ACM 证书强制）、一个可改 DNS 的域名 + 该域名的
-`*.<域名>` ACM 通配符证书、一个身份源——飞书企业自建应用（需用户邮箱权限）**或**
-任意能提供 email claim 的标准 OIDC/SAML IdP——以及本机 Docker。会话签名用的两把
+`*.<域名>` ACM 通配符证书、一个身份源（三条路任选：已有的
+OIDC/SAML IdP、Google、或让方案自己建第二个 Cognito 池做管理员建户——最后这条
+零外部依赖；飞书走的是"自建适配器包成 OIDC"那条，属于第一类）——以及本机 Docker。会话签名用的两把
 KMS 非对称 CMK 由执行器（④）那个 CDK 栈创建（每把 $1/月 + `kms:Sign` 每万次 $0.03，只在登录 /
 换码路径调用），不需要预先准备。
 

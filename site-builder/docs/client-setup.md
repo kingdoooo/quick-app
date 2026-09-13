@@ -22,9 +22,9 @@ https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/<url-encoded-runtime-
 （`allowedClients=[mcp_client_id]`），调用必须带 `Authorization: Bearer <token>`。
 
 **token 里必须有 `email` claim**——`owner`（谁部署的、谁能改）就取自它。
-这一点已真机钉死（2026-07-29）：网关只接受 **access token**（id_token 会被
+这一点已真机钉死：网关只接受 **access token**（id_token 会被
 401 拒，"Claim 'client_id' value mismatch"），而 Cognito access token 默认
-不含 email，所以平台已部署 **pre-token-generation V2 Lambda**
+不含 email，所以平台带一个 **pre-token-generation V2 Lambda**
 （`auth/pre_token_email.py` → 函数 `site-auth-pre-token`，挂在用户池上）把
 email 注入 access token。客户端无需任何额外配置；若 owner 取不到，先确认该
 触发器还挂在用户池 `LambdaConfig.PreTokenGenerationConfig`（V2_0）上。
@@ -37,7 +37,7 @@ mkdir -p ~/.claude/skills
 cp -r site-builder/skills/site-builder ~/.claude/skills/
 ```
 
-**MCP 必须走 stdio 代理，不能用 HTTP transport 直连**（2026-08-06 实测）。
+**MCP 必须走 stdio 代理，不能用 HTTP transport 直连**（实测）。
 原因：Claude Code 按 MCP 新版规范在 OAuth 请求里带 RFC 8707 的 `resource`
 参数（Resource Indicator），而 **Cognito 不支持它**——授权页能走完、拿到
 授权码，但换 token 时返回 `invalid_grant`，客户端日志里是
@@ -89,7 +89,7 @@ print(d['projects']['$PWD']['mcpServers']['site-builder-deploy']['args'])"
 `confirm_upload` → 轮询 `get_deploy_status` 播报 phase → 返回
 `https://app-xxx.{base_domain}`。浏览器打开该 URL 应跳飞书登录，登录后可加书。
 
-## Amazon Quick Desktop（人工配置；2026-07-29 已真机走通）
+## Amazon Quick Desktop（人工配置；已真机走通）
 
 1. **导入 Skill**：把 `site-builder/skills/site-builder/` 整个目录按 Quick Desktop
    当期的 Skill 导入入口加载（SKILL.md + references/ + templates/ 一并带上，
@@ -172,10 +172,10 @@ npx @modelcontextprotocol/inspector
 
 <!-- tool-list:end -->
 
-## 已知客户端差异（2026-08-06 复核）
+## 已知客户端差异
 
 **两条通道现在都走同一个 stdio 代理**——原本只有 Quick Desktop 需要它
-（Remote MCP 不支持 OAuth），2026-08-06 发现 Claude Code 也必须用
+（Remote MCP 不支持 OAuth），实测发现 Claude Code 也必须用
 （它发的 `resource` 参数 Cognito 不认，见上面 Claude Code 一节）。
 
 | | Claude Code | Quick Desktop |

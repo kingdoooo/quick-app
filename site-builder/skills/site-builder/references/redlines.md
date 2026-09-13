@@ -146,7 +146,7 @@
   这条对 `schema.sql` 与 `migrations/*.sql` **一视同仁**。
 - **为什么**：这些 PostgreSQL 特性在 DSQL 上不可用（DDL 会在 provision-db 阶段
   执行失败），静态扫描把它们拦在 validate 阶段。
-- **`JSONB` 的准确情况**（2026-08-10 真机实测，别照抄旧说法）：
+- **`JSONB` 的准确情况**（真机实测过，别照抄旧说法）：
   - **数据层全部可用**：jsonb 列、`NOT NULL DEFAULT '{}'::jsonb`、
     `->` `->>` `#>` `@>` `?`、`jsonb_set` / `jsonb_agg` / `jsonb_build_object` /
     `jsonb_array_elements_text`，以非 admin 的 per-site role 身份也全部通过。

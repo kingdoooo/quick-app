@@ -26,8 +26,15 @@ from pathlib import Path
 ROOT = Path(__file__).parents[3]
 README = ROOT / "README.md"
 CLAUDE_MD = ROOT / "CLAUDE.md"
+CONTEXT_MD = ROOT / "CONTEXT.md"
 DEPLOY = ROOT / "site-builder" / "DEPLOY.md"
 GEN_ONBOARDING = ROOT / "site-builder" / "scripts" / "gen_onboarding.py"
+# 采用者会读的另外几份（工单 12 把它们一并纳入状态守卫）
+CLIENT_SETUP = ROOT / "site-builder" / "docs" / "client-setup.md"
+_SKILL_DIR = ROOT / "site-builder" / "skills" / "site-builder"
+SKILL_MD = _SKILL_DIR / "SKILL.md"
+SKILL_CONTRACT = _SKILL_DIR / "references" / "contract.md"
+SKILL_REDLINES = _SKILL_DIR / "references" / "redlines.md"
 
 
 def _read(p: Path) -> str:
@@ -164,8 +171,10 @@ def test_readme_status_has_no_stale_numbers_or_date():
     counts = re.findall(r"（\d+\s*测试）", txt)
     assert not counts, f"README 里还有写死的逐包测试数：{counts}"
 
-    # 肯定断言切到状态段：它必须给出**可自查**的去处，而不是一个数字
-    status = _blockquote(txt, "**当前状态**")
+    # 肯定断言切到那个引用块：它必须给出**可自查**的去处，而不是一个数字。
+    # marker 从 `**当前状态**` 换成 `**资产范围**`（工单 12）：README 描述的是**资产
+    # 包含什么**，不是"验证环境现在到哪了"。断言本身不变——一个数字换不来自查路径。
+    status = _blockquote(txt, "**资产范围**")
     assert "CLAUDE.md" in status, "状态段没指向 CLAUDE.md 的测试命令（读者无法自查）"
     assert "docs/design" in status and "不随仓库分发" in status, (
         "状态段没说明 docs/design 不随仓库分发——新 clone 会指向不存在的文件")
@@ -846,10 +855,17 @@ def test_deploy_md_lists_every_production_session_verifier():
 # asset-v1 ticket 15：采用者文档不承载验证环境的状态（ADR 0005）
 # --------------------------------------------------------------------------
 #
-# 目前只对 CLAUDE.md 生效；README / DEPLOY.md / client-setup 还带着大量时间线与"已部署"，
-# 由工单 12 清理后逐份加进 _STATUS_FREE_DOCS。**加进来的那一刻本条就会守住它**，所以清理时
-# 先加再改。
-_STATUS_FREE_DOCS = (CLAUDE_MD,)
+# **采用者会读的每一份都在这里**（工单 12 逐份清理后加进来的；加进来的那一刻本条就
+# 接管它，所以清理时先加再改）。
+#
+# **谁不在这里，以及为什么**：
+#   · ADR（`docs/adr/*.md`）——日期是这个文体固有的（frontmatter 的 `date:`、
+#     "出处：<日期> 定稿"）。清掉等于损坏 ADR，而它本身就是决策记录、不是过程记录。
+#   · 决策记录（spec / plan / review / `docs/security/`）——它们**确实**含单账号实测
+#     数据与迁移过程，那是它们的价值。它们走另一条路：文件头一句声明说清"不是操作
+#     指引"（工单 12 的第 2 条），由 test_decision_records_declare_their_nature 守。
+_STATUS_FREE_DOCS = (CLAUDE_MD, README, CONTEXT_MD, DEPLOY, CLIENT_SETUP,
+                     SKILL_MD, SKILL_CONTRACT, SKILL_REDLINES)
 
 # 每条一句"为什么它是状态"。命中就是红，判断交给人——这是启发式，不是语义分析；
 # 所以模式要窄到不误伤协议说明（"尚未更新的边缘节点"是轮转顺序的解释，不是进度）。

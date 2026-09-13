@@ -361,7 +361,7 @@ Entra ID（原 Azure AD）默认**不下发** `email_verified` claim。它的影
 > 能从飞书通讯录取到即可。
 重定向 URI 需在 ① 部署完后回飞书后台「安全设置 → 重定向 URL」补填。
 **注意填的不是 Cognito Hosted UI 域名**，而是上游 SSO 适配器（API Gateway）的
-callback（2026-07-29 实测，漏注册报飞书错误码 20029"重定向 URL 有误"）：
+callback（实测，漏注册报飞书错误码 20029"重定向 URL 有误"）：
 
 ```bash
 # 从 IdP 配置取适配器 issuer，回调即 {issuer}/callback：
@@ -377,7 +377,7 @@ aws cognito-idp describe-identity-provider --user-pool-id {user_pool_id} \
 邮箱权限不可省：`owner`（谁部署的、谁能改/删站点）与访问名单 `allowed_users`
 都以飞书邮箱为标识，拿不到邮箱则整个权限模型不成立。
 
-**⚠️ 两个条件缺一不可（2026-07-29 实测踩坑）**：
+**⚠️ 两个条件缺一不可（实测踩坑）**：
 ① 应用在「权限管理」开通 `contact:user.email:readonly` + `contact:user.employee:readonly`
 并发布版本；② **用户在通讯录里真的填了邮箱**——飞书个人版账号默认只绑手机号，
 邮箱为空。缺任一个的症状完全相同：OAuth 授权页正常走完，最后回调报
@@ -1024,7 +1024,7 @@ exit "$m01_rc"
 |---|---|---|---|
 | `audit_policy_rows.py` | 第 0 步（部署前） | 没有 ACTIVE 行会被新的严格解析拒绝。退出码**只由 ACTIVE 行驱动** | 非 ACTIVE 行的问题只报成警告、不进退出码；畸形 `status`（`N`/`NULL`/`L`/缺失）四种形态只有夹具覆盖过，真表里从未出现过这种行 |
 | `backfill_site_role_policies.py --check` | 第 7 步 | 四层：site-scope 与期望**完整等值**、角色上只有 site-scope 一条 policy、ACTIVE 站点的角色反向存在、全部 dynamodb 站点过 IAM 模拟器**全部六个数据动作** | **不看信任策略**（`AssumeRolePolicyDocument` 被放宽的角色四层全过）、**不看 `site-runtime-boundary` 还挂着没有**——而 `ensure_site_role` 只在**新建**角色时挂 boundary，所以 `--apply` 不会把被摘掉的 boundary 挂回去。DSQL 站点只有文本等值，没有功能模拟 |
-| `verify_deployed_components.py` | 第 7 步，且**必须在第 2 步之后** | 线上产物里的 `permissions.py` / `common.py` / `session.py` / `login_handler.py` 与仓库逐字节一致；线上 `site-deployer-*` 函数**集合**与 `app.py` 的 `PLATFORM_FUNCTION_NAMES` 精确相等（函数整个消失/多出都红——消失的函数进不了逐包循环）；**每个 `site-deployer-*` 函数自己的 handler**（从部署定义的 Handler 派生，如 `provision_dynamodb.py` / `undeploy.py`）与本地一致；validate 包的 `contract/redlines.py` **和 `contract/schema.py`** 都一致 | 这是**唯一**能发现"某个 **Lambda** 产物漏部了"的闸门。漏一个的症状是产物陈旧而部署脚本全程正常。曾只比守卫三件套——"common 新、handler 旧"的半量部署照样全绿（Codex deployed-state 复审 2026-08-24 指出，判定已抽成纯函数反向验证）。**它不覆盖 Edge**：它下载 Edge 产物，但只问一个问题（`mcp` 有没有进 `PLATFORM_SUBDOMAINS`），M05/M06 的 Edge 半边它一个字都没看 |
+| `verify_deployed_components.py` | 第 7 步，且**必须在第 2 步之后** | 线上产物里的 `permissions.py` / `common.py` / `session.py` / `login_handler.py` 与仓库逐字节一致；线上 `site-deployer-*` 函数**集合**与 `app.py` 的 `PLATFORM_FUNCTION_NAMES` 精确相等（函数整个消失/多出都红——消失的函数进不了逐包循环）；**每个 `site-deployer-*` 函数自己的 handler**（从部署定义的 Handler 派生，如 `provision_dynamodb.py` / `undeploy.py`）与本地一致；validate 包的 `contract/redlines.py` **和 `contract/schema.py`** 都一致 | 这是**唯一**能发现"某个 **Lambda** 产物漏部了"的闸门。漏一个的症状是产物陈旧而部署脚本全程正常。曾只比守卫三件套——"common 新、handler 旧"的半量部署照样全绿（判定已抽成纯函数并反向验证过）。**它不覆盖 Edge**：它下载 Edge 产物，但只问一个问题（`mcp` 有没有进 `PLATFORM_SUBDOMAINS`），M05/M06 的 Edge 半边它一个字都没看 |
 | `verify_table_collision_e2e.py` | 第 7 步（部署后可随时跑；**会真实部署/下线两个一次性站点**） | 表名碰撞在真机上关闭的**行为**证据：B 正常部署（正对照）、A 的碰撞 manifest 被线上 validate 以 `TABLE_NAME_RE` 原话拒绝、A 侧零资源残留、B 侧逐字段不变（表 schema/tags/role policy/data_tables）、purge 三态幂等（对已购清站点重复 purge 收敛到 DELETED）。跑完强一致读回核对清零，输出含 site/job ID 的 JSON 摘要 | 清理与幂等探针**直接 Event 调 `site-deployer-undeploy`**（复刻 MCP 建 job 后的动作）——证明的是部署函数行为，不是 MCP/panel 鉴权链路（那由 `verify_api_key_e2e.py` 覆盖）。sites/jobs 的 DELETED 历史行保留 |
 | `verify_deployed_edge.sh` | 第 7 步，**在业务验收之前**（第 6 步等到 `Deployed` 之后） | CloudFront **当前关联的那个版本**的产物与本地 `origin_request.py` 逐行相同（只允许占位符行有差异）、占位符全部替换、安全开关是收紧值，外加 M05（查 `typ`）与 M06（逐个验、不截断）两条哨兵、产物里注入的 `FRONTEND_BUCKET_DOMAIN` == 按 `router/config.ini [AWS] account_id` 推出的 `site-frontend-<account_id>.s3.us-east-1.amazonaws.com`；**⑤ router 栈的 stack policy**：一条 Deny 精确覆盖 Edge 两函数、分发与路由表四个逻辑 ID，且策略带 Allow-all（`router_stack_policy.py check`，只读） | **证据等级是静态产物比对，不是行为探针**：它证明"跑在线上的就是这份源码"，M05/M06 的**行为**由下面那条闸门单独证。也不看非默认 cache behavior 上的关联。也不证明谁持有 `cloudformation:SetStackPolicy`（那是 IAM 层，归探针与信任边界文档） |
 | `verify_site_table_integrity.py` | 第 7 步（部署后自检，也可随时跑） | per-site 数据表的归属：ACTIVE NoSQL 站点的表存在且 tag `project`/`site_id` 正确；**每个 `site-rt-{site_id}` 角色的 DynamoDB 表 ARN 集合与同一站点自己的表精确相等**（不多、不少、无通配、不含别站的表）；DSQL 角色没有任何表 ARN；static（engine=none）站点**没有**运行时角色是合法态（角色存在时表 ARN 集合必须为空）；全部 `data_tables` 逻辑名符合 `TABLE_NAME_RE` | 只看**当前 ACTIVE** 站点——历史/DELETED 行不做全量对账（表可能已删），但它们含连字符的 `data_tables` 仍会被报出来。不核 DSQL 侧的 schema/role 隔离（那在 PG 层）。要害判定抽成了纯函数 `role_arn_problems`，反向验证在 `deployer/tests/test_verify_site_table_integrity.py` |
@@ -1274,7 +1274,7 @@ PY
    本仓库不含其源码）不同时接受新旧两个值。所以两侧更新之间必然有一段新登录失败，
    选低峰期做，两条命令背靠背执行。
 
-   **适配器确实校验这个 secret（2026-08-13 实测，不是假设）。** 判定方法可复用——
+   **适配器确实校验这个 secret（实测，不是假设）。** 判定方法可复用——
    拿一个**明显无效**的 code 去打两次 `{issuer}/token`：不消费任何真实凭据、不改
    任何状态，只看两次报错的差异：
 
@@ -1322,7 +1322,7 @@ PY
    ARN="<adapter-secret-arn>"
    #    **用 `env.NEW` 而不是 `jq --arg s "$NEW"`**：后者会把展开后的明文放进
    #    jq 的**进程参数**里，同机的 `ps` / 进程审计能看到它，与"密文不进命令
-   #    参数"的目标相矛盾（Codex 审查 2026-08-13 P2-2）。环境变量只有同一用户
+   #    参数"的目标相矛盾。环境变量只有同一用户
    #    读得到 /proc/<pid>/environ，暴露面小一档。
    aws secretsmanager get-secret-value --secret-id "$ARN" \
         --query SecretString --output text \
@@ -1355,7 +1355,7 @@ PY
    **回滚**：旧明文不该留副本，所以回滚**不是**"把旧值粘回去"，而是从
    Secrets Manager 的 `AWSPREVIOUS` 版本取回它（`put-secret-value` 会自动把上一版
    打成这个标签）。第 ① 步那个指纹的作用是**核对**，不是还原——指纹不可逆
-   （Codex 审查 2026-08-13 P2-2 指出原文这里自相矛盾）。
+   （指纹不可逆，它是核对手段而不是还原手段）。
 
    ```bash
    # ③' 适配器一侧：把 cognitoClientSecret 换回上一版的值（其余字段取当前版本，
@@ -1382,7 +1382,7 @@ PY
    `email_verified` 映射）、pre-token 触发器，并把 client secret 写进 SSM。
    跑完回填 `[Cognito]` 四项。
 
-   **登录链路的实测基线（2026-08-05，飞书适配器路径）**——部署后自己走一遍
+   **登录链路的实测基线（飞书适配器路径）**——部署后自己走一遍
    登录时可拿它对照，值不一致说明配置有偏差：
 
    | 观察项 | 实测值 |
@@ -1401,7 +1401,9 @@ PY
    映射进 Cognito 的 email **默认 unverified**，而 `require_email_verified`
    默认 `true` 会拒绝 unverified 的登录。本脚本默认配上 `email_verified`
    映射，两者因此自洽；若你手工建过 pool 而漏了映射，**该 pool 上所有登录都会
-   被拒**（实测过，见文末升级一节）。
+   被拒**（实测过：漏映射的池里联邦用户的 `email_verified` 恒为 `false`，而
+   `require_email_verified` 默认 `true` 就拒掉它）。**顺序因此是先把池配对、
+   再开这个开关**，反过来做是全员登录失败。
 
    ⚠️ **接 IdP 前先确认**：平台的授权主键是 email（owner/allowed_users/会话
    claim 全用它），而联邦映射进 Cognito 的 email 默认是 unverified。因此 IdP
@@ -1420,7 +1422,15 @@ PY
 
    **全新部署直接 `true`**——它是 org 边界的执行点（"身份必须来自企业 IdP"
    只有这里能落到请求路径上）。留 `false` 只有一个理由：环境里已有不带
-   `idp` claim 的存量会话（见文末升级一节）。
+   `idp` claim 的存量会话。
+
+   > **已有活跃会话的部署上翻这个开关，顺序不能反**（实测过）：存量会话没有
+   > `idp` claim，提前翻 `true` 会把**所有已登录用户**（包括你自己）302 到登录页。
+   > 做法是：先带 `false` 部一次 Edge → 自己走一遍登录拿到带 claim 的新会话 →
+   > 再翻 `true` 重部（`rm -rf cdk.out` 必须，否则用陈旧 asset）。翻之前想先知道
+   > 它会怎么判，就把**部署出去的**那份 `index.py` 下载下来在本地跑判定逻辑
+   > ——判定点在请求处理里（搜 `REQUIRE_IDP_CLAIM`），**不在
+   > `_verify_session_jwt`**（那个只管验签）；测错层会得到"全部放行"的假象。
 
    **上面的注释必须像这样单独成行——本片段可直接复制。** configparser 会把
    行内注释并进值：写成 `require_idp_claim = true  # 注释` 时读出来是
@@ -1445,7 +1455,7 @@ PY
    ```
 
    出现 `SYNTH-ONLY-PLACEHOLDER` 说明 synth 时读 SSM 失败且有人带着 `APP_SYNTH_OFFLINE=1` 部署
-   （ticket 19 起默认会在 synth 阶段直接失败），**部署出去的所有
+   （默认会在 synth 阶段直接失败），**部署出去的所有
    会话验签都会失败**（Lambda@Edge 不支持环境变量，配置靠部署时字符串替换）。
 
 3. **admin 种子**（在 ④ 建出 `site-admins` 表之后跑）：`site-builder/config.ini`
@@ -1493,13 +1503,10 @@ PY
    alarm 照样进 ALARM 而无人知情，所以脚本把 `PendingConfirmation` 显式报告
    为「未完成」。
 
-   保留期：脚本把该日志组声明为 **90 天**（2026-08-15 起的全平台统一值，见
-   下方「日志组保留期」一节）。**这一行不再修剪日志**——90 天是抬高保留期，
-   无损、可反复运行，没有配套门禁。
-   > 2026-08-15 之前这里写的是 30 天并附一条"首次在存量环境运行会修剪日志"
-   > 的警告（超过 30 天的日志会被标记删除、约 72 小时内物理删除）。统一到
-   > 90 天后该危险消失，警告与门禁一并作废；留这一句只为让读过旧版的人知道
-   > 它是**被撤销**的，不是被忘了。
+   保留期：脚本把该日志组声明为 **90 天**（全平台统一值，见下方「日志组保留期」
+   一节）。**这一行不会修剪日志**——90 天是抬高保留期，无损、可反复运行。
+   > 若你把它改小，注意方向：**降低**保留期会让超期日志被标记删除（约 72 小时内
+   > 物理删除），那是有损且不可逆的。
 
    **从零部署验收**（"日志打了/metric 有点了"不等于"alarm 会响"）：
 
@@ -1527,7 +1534,7 @@ PY
    各 ≥1），或改为对失败率告警。**把最终阈值与理由写回本文档**，否则下一个人
    无法判断这个数字是否适合当时的流量。
 
-   > **本仓库环境的取值（2026-08-05）**：`--threshold 1 --period 300
+   > **一个可用的起点取值**：`--threshold 1 --period 300
    > --evaluation-periods 2`，即连续两个 5 分钟周期各至少 1 次失败才告警。
    > 理由：当前只有个位数用户，用起步值 10 会让"全员登录失败"也凑不满阈值；
    > 而要求**连续两个周期**能滤掉单次用户重放授权码的正常噪声。
@@ -1711,7 +1718,7 @@ pre-token 触发器、managed login branding。命令与实测基线见前面
               AccessM:AccessTokenValidity}'
   ```
 
-   期望值（2026-08-05 实测基线）：
+   期望值（实测基线）：
 
    | 字段 | 期望 | 不符的后果 |
    |---|---|---|
@@ -1737,7 +1744,7 @@ pre-token 触发器、managed login branding。命令与实测基线见前面
    才存在，放在 ⑥ 客户端接入（auth.js 首次 OAuth 能拿到含 email 的 access
    token）与 ⑦ 部署后验收里做。
 
-> **MCP 的 token 形态已钉死**（2026-07-29 真机）：AgentCore 网关只接受
+> **MCP 的 token 形态已钉死**（真机实测）：AgentCore 网关只接受
 > **access token**（id_token 会被 401 `Claim 'client_id' value mismatch`），
 > 而 Cognito access token 默认不含 email——靠 pre-token V2 触发器注入，
 > `deploy_pool.py` 已一并挂好。**不要把 authorizer 改成 allowedAudience**。
@@ -1772,7 +1779,8 @@ DynamoDB 资源 ARN 与栈 Environment 三处共用那个值：空账号在桶�
 `[SiteBuilder]` 段还必须有 `require_idp_claim` 与 `trusted_idps` 两键
 （缺任一 synth 直接 NoOptionError）。**全新部署直接填 `true` + 你的 provider
 name**；值必须是裸 `true`/`false`——configparser 会把行内注释并进值，
-`true  # 注释` 会被当成 false，防线静默关闭。已有存量会话的环境见文末升级一节。
+`true  # 注释` 会被当成 false，防线静默关闭。已有活跃会话的环境翻这个开关有
+顺序要求，见 ① 步骤 2。
 
 1. 建私有前端桶（若不存在）。**注意此桶不由 CDK 管理**，需手工建并配好
    public-access-block：
@@ -1785,16 +1793,14 @@ name**；值必须是裸 `true`/`false`——configparser 会把行内注释并�
    桶必须保持私有：Edge 函数用 SigV4 签名读它（见 `_add_s3_sigv4_auth`），
    不依赖公开访问。
 
-   > **这个桶上不要配 `sites/` 前缀的生命周期规则。** 2026-08-17 之前这里教的是
-   > 加一条 `expire-old-site-versions`（`Filter.Prefix=sites/`、`Expiration.Days=30`）
-   > 当作旧版本清理的兜底。**那条规则是错的，已从文档与生产桶上移除**：
+   > **这个桶上不要配 `sites/` 前缀的生命周期规则**，哪怕是拿
+   > `expire-old-site-versions`（`Filter.Prefix=sites/`、`Expiration.Days=30`）
+   > 当旧版本清理的兜底。**那种规则是错的**：
    >
    > 站点**线上正在服务**的那一份前端也住在 `sites/{site_id}/{job_id}/` 下，
    > 而这个前缀写一次之后**永不重写**（每次部署换一个新前缀）。桶又没开版本控制。
    > 于是任何 **30 天没有重新部署过**的站点会被这条规则把线上前端删掉，
    > 而且因为桶是私有的，症状是**整站 403 而不是 404**——很容易被当成权限故障去查。
-   > 实测：规则移除时生产上最老的存量前缀已 19 天（`team-kudos-wall-1d5lpc`，
-   > 2026-07-29 上传），离触发只剩约 11 天，还没有站点被删过。
    >
    > 存储上界由 `mark_job._cleanup_old_versions` 提供：它每次成功部署后清掉本站点
    > 的陈旧前缀，只保留当前那一份、上一份（Edge 路由缓存 60s 内仍会引用它）、
@@ -1822,7 +1828,7 @@ name**；值必须是裸 `true`/`false`——configparser 会把行内注释并�
   ```
 
    stack.py 部署时会从 SSM 读真实密钥注入 Edge 函数（`load_jwt_secret` / `load_site_allowlist`）；
-   读取失败时 synth 直接报 `RuntimeError` 退出、不部署（ticket 19 起）——检查凭证与 SSM 参数后重跑。
+   读取失败时 synth 直接报 `RuntimeError` 退出、不部署——检查凭证与 SSM 参数后重跑。
    若看到 `SYNTH-ONLY-PLACEHOLDER` 警告仍继续部署了，说明环境里带着 `APP_SYNTH_OFFLINE=1`，去掉它。
 
    > **`cdk deploy` 会长时间挂在最后一步**（Lambda@Edge 复制到全球边缘节点，可达
@@ -1856,7 +1862,7 @@ name**；值必须是裸 `true`/`false`——configparser 会把行内注释并�
    > Modify，只拒 Replace/Delete 拦不住它）。效果：持有 `cloudformation:UpdateStack` 或
    > `CreateChangeSet`+`ExecuteChangeSet` **但没有 `cloudformation:SetStackPolicy`** 的 principal 改不了
    > 这四个资源（AWS 文档：越过策略必须有 SetStackPolicy；ExecuteChangeSet 不接受临时覆盖策略）。
-   > 所以每次部署是三步：`open`（换成 Allow-all）→ `cdk deploy` → `apply`（按已部署模板推导逻辑 ID、
+   > 所以每次部署是三步：`open`（换成 Allow-all）→ `cdk deploy` → `apply`（按线上模板推导逻辑 ID、
    > 写回并读回核对）。**stack policy 设上就删不掉，只能换**——"回滚本功能"也是先 `open`。
    > 它**不防** DeleteStack（termination protection 另配）、不防持有 SetStackPolicy 的人、不防绕开
    > CloudFormation 直接调 Lambda / CloudFront API 的那条路（那条的边际收益为 0，见 spec §1）。
@@ -1869,7 +1875,7 @@ name**；值必须是裸 `true`/`false`——configparser 会把行内注释并�
    **换 edge role 之后**（路由层栈重建、角色重创、或修正写错的 `edge_role_arn`）：重跑 ⑤ `deploy_auth.py`、⑤b `deploy_panel.py`、⑤c `deploy_key_proxy.py` 即可——三个脚本每次都按期望集合等值收敛各自 Function URL 的 resource policy（读回、替换内容不对的同名语句、删野 Sid、写后读回核对；一致时零写入）。IAM 在角色被删时会把 policy 里的 Principal 改写成已删角色的唯一 ID，所以"同名语句已存在"不等于授权还对；`verify_deployed_components.py` 对三条都断言。
 4. DNS：在 `{base_domain}` 加通配符 CNAME 或 A-alias 指向 CloudFront 域名：
   ```
-   *.{base_domain}  →  {distribution_domain_name}  (如 d1234abcd.cloudfront.net)
+   *.{base_domain}  →  {distribution_domain_name}  (形如 dxxxxxxxxxxxxx.cloudfront.net)
   ```
    同 zone 下**已有的显式子域记录不受影响**（DNS 显式记录优先于通配符）；但此后
    新增子域在建记录前会先落到本方案并返回 404，排查时留意。
@@ -1958,7 +1964,7 @@ echo "$CID.dsql.us-east-1.on.aws"
 
 > `--no-deletion-protection-enabled` 是为了 PoC 便于清理；生产环境应开启删除保护。
 
-**DSQL 权限模型已在真实 cluster 验证通过**（2026-07-28，此前标注为"未验证"）：
+**DSQL 权限模型已在真实 cluster 验证通过**：
 `AWS IAM GRANT` 语法可用、两条 per-site 映射确实写入 `sys.iam_pg_role_mappings`；
 migrator role 能在本 schema 建表，但建其他 schema / 建角色 / 改 IAM 映射全部被
 拒（sqlstate 42501）；运行时 role 能读写表但不能建表。
@@ -1970,7 +1976,7 @@ migrator role 能在本 schema 建表，但建其他 schema / 建角色 / 改 IA
 - **`undeploy` 默认不清理数据侧资源**（DSQL schema / per-site role / IAM 映射，
   DynamoDB 的 `site-data-*` 表同理），这是"数据保留防误删"的默认行为。
   传 `purge_data=true`（MCP 工具 `undeploy_site` 的参数，需向用户确认后再传）
-  才会连数据一起清——**已真机验证（2026-07-29）**：purge 后 DSQL 无孤儿
+  才会连数据一起清——**已真机验证**：purge 后 DSQL 无孤儿
   schema/role/映射、`site-data-*` 表删除。
   默认（不 purge）路径会删掉 `site-rt-*` IAM 角色，于是 `sys.iam_pg_role_mappings`
   里留下指向已删角色的孤儿映射（④ 冒烟后实测复现）。孤儿映射本身无安全风险
@@ -2092,7 +2098,7 @@ AgentCore 校验不认。`deploy_agentcore.py` 已带 `--provenance=false` 规�
 工具面在运行时由 `mcp/tests/test_agentcore_contract.py` 的 `EXPECTED_TOOLS` 锁定，
 在文档里由 `mcp/tests/test_doc_tool_surface.py` 锁定（两侧都对着实时注册表比）。
 
-**token 形态已真机钉死（2026-07-29）**：网关配 `allowedClients` 时只接受
+**token 形态已真机钉死**：网关配 `allowedClients` 时只接受
 **access token**（id_token 会 401 "Claim 'client_id' value mismatch"，因为
 id_token 用 `aud` 而非 `client_id`），MCP 客户端按 OAuth 规范发的也正是
 access token。而 Cognito access token 默认不含 email，所以 **email 注入靠
@@ -2256,7 +2262,7 @@ cd site-builder/panel && python3 deploy_panel.py
 
 `deploy_key_proxy.py` 建哨兵行时写 `enabled=false`（fail-closed），并且**重跑时
 一个字都不改**——否则下一次部署会把管理员的关闸静默覆盖成开。所以部署完的正确
-状态就是"组件已上线、通道未开"，脚本最后会明确打印这一点。
+状态就是"组件在位、通道未开"，脚本最后会明确打印这一点。
 
 开闸：管理员进 `https://console.{base_domain}/` 的 API Key 页面打开开关。
 **每次开关变更都落 `site-ops-log` 审计**（`enable_api_key_switch` /
@@ -2332,7 +2338,7 @@ python3 site-builder/scripts/verify_oauth_and_impersonation.py  # 需先 auth.js
 
 ### 下线这个组件（**删掉 `[ApiKey]` 段是不够的**）
 
-Codex 审查 2026-08-13 P1-3：组件门禁只对**首次部署**成立。已经启用过之后再把
+**组件门禁只对「首次部署」成立。** 已经启用过之后再把
 `config.ini` 的 `[ApiKey]` 段删掉，`deploy_key_proxy.py` 会打印"跳过"并返回 0、
 **一次 AWS 调用都不发**——于是线上的 Lambda、`mcp` route、已开的哨兵行、
 未吊销的 Key、machine client 与它的 SSM secret **一个都不会被拆**。
@@ -2378,7 +2384,7 @@ protection，不会也不该被删**（历史 Key 行是审计证据）；断言
      python3 site-builder/scripts/revoke_keys_for.py 离职者@example.com --yes  # 执行
      ```
 
-     **控制台做不到这件事**（2026-08-13 更正）：本文档此前写的"控制台按 owner
+     **控制台做不到这件事**：本文档此前写的"控制台按 owner
      列得出来"是**错的**——`do_list_keys` 只查调用者自己的 email 分区、
      `keystore.revoke` 硬性要求 `row.email == actor`，管理员手里只有全局总开关
      （关掉会同时中断所有正常用户，不能当常规 offboarding 手段）。
@@ -2390,9 +2396,9 @@ protection，不会也不该被删**（历史 Key 行是审计证据）；断言
      （谁算 admin、CSRF、防 key_id 枚举），而 offboarding 本来就是带 AWS 凭证的
      运维动作——攻击面留在 IAM 比留在 HTTP 小。
 
-     注意吊销 Key **不影响**他已部署站点的存在，只断掉用 Key 调部署 MCP 的通道；
+     注意吊销 Key **不影响**他线上站点的存在，只断掉用 Key 调部署 MCP 的通道；
      站点的所有权转移/下线是另一件事。
-- Key **只认证"谁在调部署 MCP"**，与访问已部署站点的 `require_login` /
+- Key **只认证"谁在调部署 MCP"**，与访问线上站点的 `require_login` /
   `allowed_users` 是两套独立的认证平面，它碰不到站点访问。
 - 明文 Key 在服务端**只出现一次**（创建响应）。用户没抄下来只能吊销重发；
   列表接口与所有日志里都没有明文（有一条真机负测扫两个日志组做零命中断言）。
@@ -2529,21 +2535,19 @@ rollup **重算即修复**、**绝不封今天**、封口后面板读的是聚�
 顺带一并跑 `verify_deployed_components.py`（第 ⑨ 段是 M5 的跨包一致性）与
 `verify_console_e2e.py`（⑪ 段换成了统计端点的真实行为断言）。
 
-### 日志组保留期（统一 90 天，2026-08-15 定稿）
+### 日志组保留期（统一 90 天）
 
-**现行口径：平台全部日志组一律 90 天。** 用户 2026-08-15 的决定（原话「统一到 90 天，
-内部访问量不大。如果真的变大，可以后面再来改」），**取代此前「统一 30 天」的口径**。
-本节是这个数字的现行真源。
+**口径：平台全部日志组一律 90 天。** 理由是内部访问量不大，一个数字比多个数字好维护；
+访问量真的变大时再按组调整。本节是这个数字的真源。
 
-统一后的实测分布（三个区合计，2026-08-15；按 `site-` / `site_builder` / `SiteDeployer` /
-`ApplicationWebRouter` 四个模式合并统计）：
+这条口径覆盖的是**平台自己建的每一个**日志组：执行器 12 步 / rollup / panel /
+key-proxy / auth 服务 / auth pre-token / CodeBuild / MCP 的 AgentCore runtime /
+每个 per-site Lambda / Edge 两函数（每个复制区各 2 个）/ 执行器栈的 S3 auto-delete
+自定义资源。核对方法在本节末尾（按 `site-` / `site_builder` / `SiteDeployer` /
+`ApplicationWebRouter` 四个模式扫，**三个区都要扫**——Edge 的日志落在边缘节点所在区）。
 
-| 保留期 | 数量 | 是谁 |
-|---|---|---|
-| **90 天** | **33** | **全部**：执行器 12 步 / rollup / panel / key-proxy / auth 服务 / auth pre-token（含 spike 遗留）/ CodeBuild / MCP 的 AgentCore runtime / 6 个 per-site Lambda / Edge 两函数（三区各 2）/ 执行器栈的 S3 auto-delete 自定义资源 |
-| 未设 | **0** | —— |
-
-（另有 2 个 731 天的 `FeishuQuickSso*` 组属飞书适配器——上游组件，不是本仓库的代码，不动。）
+（走飞书适配器那条路时，账号里还会有 `FeishuQuickSso*` 的组：那是上游组件，不是本仓库
+的代码，本节不管它。）
 
 **这个数字的真源是代码，不是控制台。** 只手工改存量日志组是无效的：
 
@@ -2553,8 +2557,8 @@ rollup **重算即修复**、**绝不封今天**、封口后面板读的是聚�
 
 两处的数字现在各有用例锁住：`deployer/tests/test_deploy_lambda_site.py::test_site_log_group_retention_is_ninety_days`
 （moto 读回 `describe_log_groups`）与 `auth/tests/test_alarm_pipeline.py` 的 Stubber
-`expected_params`。**2026-08-15 之前两侧都只断言"调用发生了"、不断言值**——把 30 改成
-任何别的数字，两个包的单测都照样全绿。加断言时先反向验证过（改回 30 → 两侧确实变红）。
+`expected_params`。两条断言都**反向验证过**（把值改成别的数字 → 两侧确实变红）：
+只断言"调用发生了"而不断言值的用例，对这个数字是全绿的空转。
 
 **「母 spec §6.3 统一 30 天」已作废。** 那句话的出处是
 `docs/superpowers/specs/2026-07-30-quick-site-builder-phase2-design.md` §6.3
@@ -2565,10 +2569,10 @@ rollup **重算即修复**、**绝不封今天**、封口后面板读的是聚�
 
 **方向决定有损与否**：30→90 无损（只让日志活得更久，可反复运行）；反向的 90→30 有损
 （超过 30 天的日志被标记删除、约 72 小时内物理删除，事后调回也找不回）。把**未设**
-（永久留存）设成 90 天同样是有损的——本轮那一个组只有一条 2026-07-28 起的流，
-早于 90 天的日志根本不存在，才确认无损后执行。将来再收紧任何一档前先算这笔账。
+（永久留存）设成 90 天**同样是有损的**，除非你先确认那个组里没有比 90 天更老的
+日志流。收紧任何一档之前都先算这笔账。
 
-### 两条埋点可观测性告警（原「两个已知的可观测性缺口」，2026-08-15 闭合）
+### 两条埋点可观测性告警
 
 一次性闸门覆盖不了这两件事，而**偶发变红的闸门比没有闸门更糟**（下一个人会学会忽略
 它，连带它本来能抓的真问题）。所以两件都做成告警，**互为对方的守卫**：
@@ -2663,7 +2667,7 @@ us-east-1），**零新增基础设施**。每轮：
 DynamoDB 写权限。**
 
 > **⚠️ 手工建过同名资源的话，必须先删再部——删除是部署的前置条件，不是善后。**
-> 2026-08-15 实测：这两条告警先前是手工 `put-metric-alarm` 建的，于是第一次
+> 实测过：这两条告警若曾被手工 `put-metric-alarm` 建过，第一次
 > `cdk deploy` 直接失败：
 >
 > ```
@@ -2713,20 +2717,16 @@ cd site-builder/deployer/infra && rm -rf cdk.out && PATH=.venv/bin:$PATH \
 
 ⚠️ **阈值与周期是按实测流量定的，换环境必须重算**（与登录失败告警同一条纪律）：
 
-> **本仓库环境的取值（2026-08-15）**：`--threshold 3`（配 `GreaterThanThreshold`
+> **一个可用的起点取值**：`--threshold 3`（配 `GreaterThanThreshold`
 > ⇒ 一天 ≥4 条失败、连续两天才响）、`--period 86400`、
 > `--evaluation-periods 2 --datapoints-to-alarm 2`、`--statistic Maximum`、
 > `--treat-missing-data breaching`。
 >
-> · **流量分母（先纠正一个算错的数）**：实测 18 条 `[INFO] m5-region`（每次尝试写
->   明细恰好打一行）落在 **约 3.2 小时**里 ⇒ **≈5.6 次/小时 ≈ 134 次/天**。
->   本节此前写的是「7 天 18 次（≈2.6 次/天）」，**那个除法错了约 50 倍**：
->   `[INFO] m5-region` 这行是 `8a8fb20` 才随路由层部署上线的（`git log -S` 只有那
->   一个提交动过它），而查询用的是 7 天窗口——**18 条跨不了 7 天，它们只跨了探针
->   上线以来的那几小时**。分母改用探针**寿命**而不是查询窗口之后，与
->   `analytics.py` 里独立写着的「全平台日均 124 行」对得上（那个数字的出处是
->   `docs/design/M5-FINDINGS.md` §4.26，**gitignored、新 clone 里没有**；能核对的
->   tracked 依据是 `analytics.py` 自己那行注释）。
+> · **流量分母怎么算**：实测 18 条 `[INFO] m5-region`（每次尝试写明细恰好打一行）
+>   落在 **约 3.2 小时**里 ⇒ **≈5.6 次/小时 ≈ 134 次/天**，与 `analytics.py` 里
+>   独立写着的「全平台日均 124 行」对得上。
+>   **分母必须用那行日志的寿命，不是查询窗口**：拿同样这 18 条去除一个 7 天窗口会
+>   得到 ≈2.6 次/天 —— 错约 50 倍，而那个数会把阈值定得毫无意义。
 >
 >   > **这个错法很容易再犯**：刚部署一行新日志就去 CloudWatch 拉「N 条 / 7 天」，
 >   > 拿到的一定是被稀释过的速率。查之前先问一句「这行日志存在多久了」，
@@ -3147,7 +3147,7 @@ SSM 参数：`/site-builder/site-client-secret`（① 的 `deploy_pool.py` 写�
   只升级一部分 = 互斥只对一部分入口生效（另一部分是后门）。升级窗口内避免
   并发部署同一站点。
 
-## 合同收紧（2026-08-18）：frontend/index.html 必须存在且非空
+## 合同收紧：frontend/index.html 必须存在且非空
 
 `contract/redlines.py` 新增要求：任何 tier 的站点包必须带非空的
 `frontend/index.html`（Edge 把 `/` 固定改写为 `/{prefix}/index.html`，缺它则
@@ -3222,7 +3222,7 @@ aws lambda get-function --function-name site-deployer-reconcile-job --query 'Con
 
 代码侧的 `functions/edge_caller.py` 只挡得住**经 Function URL** 的那条路
 （`callerId` 由 STS 填写、不可伪造）；**直接 `lambda:Invoke` 可以自造整个 payload
-里的 `callerId`**（2026-08-15 对 site-panel 实测：伪造成 Edge 的 RoleId → 200）。
+里的 `callerId`**（对 site-panel 实测过：伪造成 Edge 的 RoleId → 200）。
 两者合起来是纵深防御，**不是**这条缺陷的修复——当前暴露面按 README 那三条边界判断。
 
 ### MCP runtime 的信任边界（不要外推 IAM 的保护范围）
@@ -3275,7 +3275,7 @@ manifest（因为 AgentCore 的 CreateAgentRuntime 校验不认，见 ⑤ 的坑
 
 容器内不执行站点提供的代码（站点代码只经 CodeBuild 打包，不进 MCP 容器）。
 
-## 2026-07-27 独立审查后的修复（已实证验证，部署前必读）
+## 独立审查后的修复（已实证验证，部署前必读）
 
 两轮独立审查（本机 + Codex）确认的 P0 已修复并用真实 AWS API 验证：
 
@@ -3302,90 +3302,3 @@ migrator role 的 `ALTER DEFAULT PRIVILEGES FOR ROLE` 是否被接受（失败�
 - `_site_policy` 与 Edge S3 签名 region 硬编码 us-east-1（与部署区一致，换区需改）。
 - `provision_dsql` 的 `migrations/*.sql` 不经红线扫描（只扫 schema.sql）；migration 里的禁用 DDL 会在 provision-db 阶段才失败（可读报错，非静默）。
 - 跑测试的 venv：`site-builder/auth` 无自己的 venv，用 `site-builder/contract/.venv/bin/pytest tests`（含 pyjwt）；`site-builder/deployer` 必须 `pytest tests`（裸 `pytest -q` 会误收集 `infra/cdk.out` 里的 asset 副本）。
-
-
----
-
-## 从一期环境升级（本仓库自己的环境走过这条路）
-
-**全新部署不需要读这一节**——上面 ①-⑦ 已经是最新版本。这里只记"已经跑着
-一期、要原地升到二期"时额外需要的动作与顺序。本仓库的环境在 2026-08-05
-按这个顺序做过一遍，下面的坑都是实测的。
-
-### 为什么必须换一个 Cognito pool
-
-一期复用了上游 Quick SSO 的 pool。**pre-token 触发器是 pool 级的且不按
-client_id 区分**——它对该 pool 里所有 app client 的 token 一律注入 claim。
-于是平台升级触发器等于改上游 Quick Desktop/Web 在用的 token 形态，反之亦然，
-而这个耦合没有任何测试能覆盖。另外共享 pool 里的 client 可能开着原生认证
-flow（实测那个 mcp client 开着 `ALLOW_USER_SRP_AUTH`），org 边界不成立。
-
-### 顺序（每一步的前后依赖都踩过）
-
-1. **先部 ④ 执行器**：它建 `site-admins` 表与 sites 表的 `owner-index` GSI。
-   GSI 是在线添加、不替换表，等 `IndexStatus` 变 `ACTIVE` 再继续（实测约 60 秒）。
-   注意 `ItemCount` 会有统计延迟显示 0，用一次真实 Query 确认回填才可靠。
-
-2. **建专用 pool**（`deploy_pool.py`，见上面第 1 项），回填 `[Cognito]` 四项。
-
-   想先验证登录体验再切，可以用 `--pool-name <临时名>` 建隔离 pool 预演——
-   它会自动隔离 SSM 前缀与 pre-token 函数名。**这两处隔离缺一不可**：函数名
-   若不隔离，spike 会 `update_function_code` 到生产在用的那个函数上，静默改掉
-   线上 token 形态而 Cognito 侧毫无异常显示。
-
-3. **部 auth 服务**（`deploy_auth.py`），它会把 Lambda 指到新 pool。
-
-4. **迁移存量站点权限**（一期站点在 sites 表没有权限字段，不迁移则
-   `role_of` 判不出 owner）：
-
-   ```bash
-   python3 site-builder/scripts/migrate_permissions.py           # dry-run，先看报告
-   python3 site-builder/scripts/migrate_permissions.py --apply
-   ```
-
-   dry-run 是唯一的人工审查关口——逐条打印「将写什么值 / 保留哪些在线值」。
-   报告里出现 `问题:` 的站点一律跳过未写，需人工判断原意后手工修，
-   **脚本绝不会自动把无法解析的名单降级成 `org`**（那是扩权）。
-
-   迁移范围是**路由表里在线的站点**，不是 sites 表全量——sites 表里还有已下线
-   记录与 fixture。`owner=platform` 的 auth 路由会被正确跳过。
-
-5. **admin 种子**（见上面第 3 项）。
-
-6. **部 ⑤ MCP**：镜像会因代码变化重新构建。若 ECR 仓库是一期用 MUTABLE 建的，
-   脚本会顺手纠正为 IMMUTABLE（实测本环境正是这种情况——此前镜像链一直没有
-   防覆盖保护）。
-
-7. **部 Edge，但 `require_idp_claim` 先留 `false`**。这是与全新部署唯一的实质
-   差异：**存量会话没有 `idp` claim，提前翻 `true` 会把所有已登录用户 302 到
-   登录页**（包括你自己）。
-
-8. **自己走一遍登录**，拿到新 pool 签发的会话。
-
-9. **翻 `require_idp_claim = true`，再部一次 Edge**（`rm -rf cdk.out` 必须，
-   否则用陈旧 asset）。翻之前可以先验证它会怎么判——把部署出去的那份代码下载
-   下来、改开关在本地跑它的判定逻辑，比翻完再补救便宜得多：
-
-   ```bash
-   # 判定点在 index.py 的请求处理里（搜 REQUIRE_IDP_CLAIM），
-   # 不在 _verify_session_jwt（那个只管验签）——测错层会得到"全部放行"的假象
-   ```
-
-   本环境实测结果：新会话（`idp=Feishu` + `auth_via=TokenGeneration_HostedAuth`）
-   与 refresh 续期出的会话放行；一期旧会话、伪造 idp、原生认证来源全部 302。
-
-### 升级期的其它实测坑
-
-- **一期 pool 里联邦用户的 `email_verified` 是 `false`**（一期没配这个映射），
-  而 `require_email_verified` 默认 `true` 会拒绝它——**所以顺序必须是先切 pool
-  再开这个开关**，反过来是全员登录失败。新 pool 由 `deploy_pool.py` 配好映射，
-  实测切完即为 `true`。
-- **同一个人在两个 pool 里是两个独立 Cognito 用户**（`identities.dateCreated`
-  各自新建），所以切 pool 必然要求全员重新登录一次，顺带把飞书那次授权同意
-  点掉（同意页只弹第一次）。
-- **旧 pool 与旧 client 不要立刻删**：迁移期两个 pool 的 pre-token 调用授权并存
-  （`add_permission` 的 StatementId 带 pool 标识），保留旧的即可随时回滚。
-- **一期建的站点可能存着 URL 编码的用户名**：Edge 对 `x-user-name` 做 URL 编码
-  是必须的（HTTP 头不能放非 ASCII），站点须 `decodeURIComponent`。一期的合同
-  示例漏了这句，那时建的站点会把 `%E5%BD%AD...` 存进数据里。改站点代码后重新
-  部署即可，历史脏数据需单独清洗。
