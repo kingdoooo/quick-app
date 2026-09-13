@@ -102,7 +102,10 @@ def handler(event, context):
     s3 = boto3.client("s3")
     bucket = os.environ["ARTIFACTS_BUCKET"]
 
-    site = common.get_site(site_id) or {}
+    # **强一致读**：marker 是正确性不变量（下面的 catalog 守卫与 undeploy 的 purge
+    # 都按它判断"这个文件跑过没有"）。最终一致读会把那些窗口重新打开一次——一个
+    # marker 刚被 purge 清空的站点可能仍读到旧的非空值 ⇒ 跳过 schema.sql ⇒ 空 schema。
+    site = common.get_site_consistent(site_id) or {}
     applied = list(site.get("migrations_applied", []))
 
     # AWS IAM GRANT 要求 IAM 角色已存在（官方流程：IAM role → DB role → GRANT）

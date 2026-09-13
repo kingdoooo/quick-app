@@ -166,3 +166,26 @@ def test_migrations_in_subdirectory_are_not_executed(aws):
     applied = common.get_site("exp-a1b2c3")["migrations_applied"]
     assert applied == ["schema.sql", "001_ok.sql"], applied
     assert not any("COLUMN y" in s for s in mig_sqls), mig_sqls
+
+
+# ---- 裁定 6：marker 是正确性不变量，读它必须强一致 ----
+
+def test_marker_read_uses_consistent_read(aws, monkeypatch):
+    """marker 一旦成为正确性不变量（catalog 守卫 + purge 清 marker 都依赖它），
+    最终一致读会把刚关上的窗口重新打开一次：一个 marker 刚被 purge 清空的站点，
+    最终一致读可能仍读到旧的非空 marker ⇒ 跳过 schema.sql ⇒ 建出空 schema。
+
+    按行为断言（不数调用次数）：把**最终一致**读改成返回空行，强一致读走真实数据。
+    若代码读的是最终一致，schema.sql 会被重跑；读强一致则跳过。
+    """
+    import common
+    common.create_job("a@x.com", "exp-a1b2c3")
+    common.upsert_site("exp-a1b2c3", migrations_applied=["schema.sql"])
+    _put("job-1", "backend/schema.sql",
+         b"CREATE TABLE IF NOT EXISTS a (id UUID PRIMARY KEY);")
+    monkeypatch.setattr(common, "get_site", lambda site_id: {})   # 陈旧的最终一致读
+    admin_conn, admin_cur = _mock_conn()
+    admin_cur.fetchone.return_value = (3,)      # schema 非空：catalog 守卫不该动它
+    _, _, mig_sqls, _, _ = _run(admin=(admin_conn, admin_cur))
+    assert not any("CREATE TABLE" in s for s in mig_sqls), (
+        f"读到了陈旧的最终一致值，schema.sql 被重跑: {mig_sqls}")
