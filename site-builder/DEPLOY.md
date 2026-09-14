@@ -3356,21 +3356,41 @@ python3 -u site-builder/scripts/probe_impersonation_surface.py \
 > 围栏块既没法测，也保证不了"手册里写的 = 作者真跑过的"。现在那条不变量由
 > `deployer/tests/test_teardown_platform.py` 按阶段注入故障来断言。
 
-### 它的核心不变量
+### 它的四条核心不变量
 
-每一步动手之前先探测，结果只有三种 —— **PRESENT / ABSENT / UNKNOWN**。
-**只有服务明确说 NotFound 才算 ABSENT**；其余任何失败（AccessDenied、限流、参数错误、
-网络）都是 UNKNOWN，而 **UNKNOWN 一律 hard-stop**：非零退出，且**不再执行任何后续
-破坏性调用**。所以"脚本退 0"这件事本身就是"该删的都确认删掉了"的证据。
+1. **每一次读** AWS，结果只有三种 —— **PRESENT / ABSENT / UNKNOWN**。
+   **只有服务明确说 NotFound 才算 ABSENT**；其余任何失败（AccessDenied、限流、参数
+   错误、网络）都是 UNKNOWN，而 **UNKNOWN 一律 hard-stop**：非零退出，且**不再执行
+   任何后续破坏性调用**。**列举调用（`list-*` / `describe-*`）也算**——"列举失败"和
+   "一个都没有"长得一模一样，把前者当后者会让该删的东西被静默留下。
+2. **只删证明得了归属的资源。** 资产支持共享账号（见 §0），所以 `site-*` **不是**
+   平台独占命名空间。日志组按 `preflight` 建的归属清单精确匹配；名字像平台件但
+   证明不了归属的**只报告、不删除**。
+3. **`preflight` 是闸门，不是阶段。** 不论 `--stage` 给的是哪个，账号一致性与
+   "站点是否真的清空"都先查一遍（全是只读的）。
+4. **异步操作要等到服务说完成。** 删栈、删 DSQL cluster、关表的删除保护都是异步的；
+   发出请求 ≠ 做完了。等不到就非零退出，**不打印"完成"**。
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"
 site-builder/scripts/teardown_platform.sh --dry-run      # 先看一遍：一条破坏性调用都不发
 site-builder/scripts/teardown_platform.sh --yes          # 真拆（幂等，可反复重跑）
-site-builder/scripts/teardown_platform.sh --yes --stage stacks   # 只跑一个阶段
+site-builder/scripts/teardown_platform.sh --yes --stage preflight  # 只体检，什么都不删
+site-builder/scripts/teardown_platform.sh --yes --stage stacks     # 只跑一个阶段
 ```
 
-阶段顺序 **preflight → scripts → dsql → stacks → orphans**，对应下面这张资源分类表
+**退出码有三个，别把 3 当失败去查**：
+
+| 码 | 含义 | 怎么办 |
+|---|---|---|
+| `0` | 做完了，没有已知残留 | 走「收尾核对」 |
+| `1` | **拒绝继续**：状态 UNKNOWN / 账号不符 / 站点没清空 / 等待超时 | 修掉报文里说的原因，重跑（幂等） |
+| `3` | **还没完**（不是你做错了）：router 栈第一次删除必定 `DELETE_FAILED`，Lambda@Edge 全球副本要几小时才清完 | 几小时后重跑 `--yes --stage stacks` |
+
+> 为什么 3 要单独占一个码：它曾经和 0 混在一起——脚本只发异步 `delete-stack` 就打印
+> "完成"退 0，而那两个字与栈的真实状态无关。**"预期的失败"仍然不是"完成"。**
+
+阶段顺序 **preflight（闸门）→ scripts → dsql → stacks → orphans**，对应下面这张资源分类表
 ——平台的资源分**四类**，只有第 2 行那类跟着 CloudFormation 走：
 
 | 类 | 谁建的 | 栈删掉会怎样 | 谁来拆 |
@@ -3383,7 +3403,14 @@ site-builder/scripts/teardown_platform.sh --yes --stage stacks   # 只跑一个�
 ### ① 站点必须你自己先下线，而且要 `purge_data`
 
 脚本**不做**这一步（要 MCP / owner 判断、要不要 purge 得问用户），但它会**核对**：
-`site-sites` 表里还有非 `DELETED` 的行时 `preflight` 阶段直接拒绝往下走。
+`preflight` 直接去列 per-site 的 IAM 角色（`site-rt-*`）与数据表（`site-data-*`），
+**有一个就拒绝往下走**。
+
+**它刻意不看 `site-sites` 的 `status` 列**，因为那一列证明不了数据已清除：`undeploy`
+在数据清理失败时**仍然**把 site 写成 `DELETED`，只把 job 写成 `PURGE_FAILED`
+（站点确实下线了，报 `FAILED` 会让人以为 URL 还活着——见 `functions/undeploy.py` 的注释）。
+所以**控制台显示"已下线"不等于数据已清除**；按资源核对才是真的。这也顺带覆盖了
+"有人先删了 sites 表再想起拆除"——那时按 status 核对连输入都没有。
 
 不 purge 就只删路由 / Lambda / 前端，**数据侧全留**（这是刻意的防误删默认）。
 
@@ -3414,6 +3441,9 @@ ApplicationWebRouterStack | DELETE_FAILED
 
 AWS 要**几个小时**才清完全球副本，而 CloudFormation 不等、当场失败。
 **立刻重试仍然失败**。过几小时重跑 `--yes --stage stacks` 即可（幂等）。
+脚本认得这个原因，会把它记成"还没完"并**退 3**（其余任何 `DELETE_FAILED` 原因一律
+按 `1` hard-stop，不会顺手当成预期情况放过）；退 3 那一轮 `orphans` 仍然照跑完
+——孤儿 CMK 是"能签会话"的 key，值得当轮就清掉，不该陪着等几个小时。
 stack policy 的 `Deny Update:*` **不拦 DeleteStack**，所以不需要先 `router_stack_policy.py open`。
 
 **两把会话签名 CMK 是"无声"的那一半。** 它们是 `RETAIN`，但**别指望按 alias 找**
@@ -3433,7 +3463,8 @@ stack policy 的 `Deny Update:*` **不拦 DeleteStack**，所以不需要先 `ro
 ### 收尾核对
 
 脚本退 0 已经意味着它探测过的东西都确认不在了。下面这几条是**独立的**读回，
-用来抓脚本射程之外的残留（尤其上面那两件手工项）：
+用来抓脚本射程之外的残留（尤其上面那两件手工项，以及**它报告过但没删的**那些
+——共享账号里名字像 `site-*` 却证明不了归属的日志组）：
 
 ```bash
 aws dynamodb list-tables --region us-east-1                         # 不该有 site-* 与路由表
