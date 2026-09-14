@@ -8,8 +8,11 @@
 **第四轮又漏了四条 P1，而且是同一类。** 上一版 harness 按"每阶段挑一个代表性 probe"
 建模，于是列举点（`list-keys` / `list-user-pools` / `list-role-policies` /
 `list-attached-role-policies` / `describe-log-groups`）整片没进射程——实测注入
-AccessDenied，五处全部退 0，其中四处还继续发出了破坏性调用。教训写进了下面的
-`_read_calls_in_source`：**射程按脚本源码机械枚举，不按人挑的例子**。
+AccessDenied，五处全部退 0，其中四处还继续发出了破坏性调用。
+
+**第五轮又指出射程仍有偏差**：按 (服务, 动词) 去重，同一 API 出现在多个阶段时只注入到
+最先到达的那一处。所以现在射程按**调用点**枚举（`_collect_read_points`：先跑几个场景，
+把每一条实际发出的读调用连完整参数串一起收下来，逐个注入），源码扫描退居为覆盖率交叉核对。
 
 四条不变量（与脚本头部一一对应）：
 
@@ -27,6 +30,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 from pathlib import Path
 
@@ -45,6 +49,12 @@ _DESTRUCTIVE = (
 _ACCOUNT = "000000000000"
 _ROUTER_STACK = "ApplicationWebRouterStack"
 _SITE_IDS = ("demo-a1b2c3", "shop-d4e5f6")
+# Edge 日志组在**每个执行区**都有一份；这里造三个区（含本区）来验跨区清理。
+_REGIONS = ("us-east-1", "us-west-2", "ap-northeast-1")
+# 归属清单内的 Edge 副本日志组（名字里的区是**归属区**，恒为 us-east-1）
+_OWNED_EDGE_LG = f"/aws/lambda/us-east-1.{_ROUTER_STACK}-application-web-router"
+# 账号里别人的 Edge 函数：DEPLOY.md 实测记过这种（redirectEdge），**删它是事故**
+_FOREIGN_EDGE_LG = "/aws/lambda/us-east-1.redirectEdge"
 
 _SB_CONFIG = """\
 [Platform]
@@ -94,8 +104,11 @@ stack_name = %s
 #   FAKE_UNOWNED_LOG_GROUP         日志组清单里混进一个共享账号里的无关 site-*
 #   FAKE_ROUTER_DELETE_FAILED      router 栈删除失败（默认原因 = Edge 副本）
 #   FAKE_DELETE_FAILED_REASON      改成别的失败原因
+#   FAKE_MIXED_DELETE_FAILURE      Edge 副本 + 另一个真阻塞同时失败（不许被当成预期）
 #   FAKE_STACK_NEVER_GONE          栈永远 DELETE_IN_PROGRESS（验轮询超时）
+#   FAKE_STATUS_STALE_ONCE/_STUCK  删除尚未登记 / 卡在非 DELETE_* 状态
 #   FAKE_DSQL_NEVER_GONE           cluster 删了但一直读得到（验轮询超时）
+#   FAKE_RUNTIME_NEVER_GONE        AgentCore runtime 一直删不完（同上）
 # ---------------------------------------------------------------------------
 _FAKE_AWS = r"""#!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FAKE_LOG"
@@ -148,6 +161,11 @@ case "$*" in
   *"dsql delete-cluster"*)  : > "$FAKE_LOG.dsql-deleted" ;;
   *"dsql get-cluster"*)
       if [ -z "${FAKE_DSQL_NEVER_GONE:-}" ] && [ -f "$FAKE_LOG.dsql-deleted" ]; then absent "$*"; fi ;;
+  *"delete-agent-runtime"*) : > "$FAKE_LOG.runtime-deleted" ;;
+  *"get-agent-runtime"*)
+      # DeleteAgentRuntime 是异步的（202 / status=DELETING）：删过之后 get 仍读得到，
+      # 直到真的删完。FAKE_RUNTIME_NEVER_GONE 模拟"一直删不完"（验超时 hard-stop）。
+      if [ -z "${FAKE_RUNTIME_NEVER_GONE:-}" ] && [ -f "$FAKE_LOG.runtime-deleted" ]; then absent "$*"; fi ;;
   *"cloudformation delete-stack"*) : > "$FAKE_LOG.stack-deleted" ;;
 esac
 
@@ -165,8 +183,25 @@ case "$*" in
       fi
       if [ -f "$FAKE_LOG.stack-deleted" ]; then absent "$*"; fi
       echo "DELETE_IN_PROGRESS"; exit 0 ;;
-  *describe-stack-events*)
-      echo "${FAKE_DELETE_FAILED_REASON:-Lambda was unable to delete arn:aws:lambda:us-east-1:x:function:y:1 because it is a replicated function. Please see our documentation for Deleting Lambda@Edge Functions and Replicas.}"
+  # 失败分类现在按**现状**（describe-stack-resources），不按事件历史。
+  # 两个 length(...) 查询各自返回一个数；明细查询返回逐行的 逻辑ID<TAB>原因。
+  *describe-stack-resources*)
+      _edge=1; _all=1
+      if [ -n "${FAKE_MIXED_DELETE_FAILURE:-}" ]; then _all=2; fi   # Edge 副本 + 另一个真阻塞
+      if [ -n "${FAKE_DELETE_FAILED_REASON:-}" ]; then _edge=0; fi  # 原因不是 Edge 副本
+      case "$*" in
+        *"length(StackResources[?ResourceStatus=='DELETE_FAILED'])"*) echo "$_all"; exit 0 ;;
+        *length*) echo "$_edge"; exit 0 ;;
+      esac
+      # 明细（只在 die 那条路上被调用）
+      printf 'OriginRequestFunction1A2B\t%s\n' \
+        "Lambda was unable to delete arn:…:function:y:1 because it is a replicated function."
+      if [ -n "${FAKE_MIXED_DELETE_FAILURE:-}" ]; then
+        printf 'ArtifactsBucket9Z\t%s\n' "The bucket you tried to delete is not empty"
+      fi
+      if [ -n "${FAKE_DELETE_FAILED_REASON:-}" ]; then
+        printf 'SomeOtherResource7Q\t%s\n' "${FAKE_DELETE_FAILED_REASON}"
+      fi
       exit 0 ;;
 esac
 
@@ -187,9 +222,15 @@ case "$*" in
   *"UserPool.Domain"*)                   echo "some-prefix" ;;
   *list-keys*)                           echo "key-1" ;;
   *describe-key*)                        echo -e "Enabled\tsite-builder session signing key site-rs-v1" ;;
+  *describe-regions*)                    echo "$FAKE_REGIONS" ;;
+  # 带 --log-group-name-prefix 的那次是**跨区扫 Edge 副本**：只回 Edge 形态的名字，
+  # 其中一个是别人的（DEPLOY.md 实测见过 redirectEdge）——它必须不被删。
+  *--log-group-name-prefix*)
+      echo "$FAKE_OWNED_EDGE_LG $FAKE_FOREIGN_EDGE_LG" ;;
   *describe-log-groups*)
-      # 平台自己的 + 每个 site_id 的；FAKE_UNOWNED_LOG_GROUP 再混进一个别人的
-      out="/aws/lambda/site-panel /aws/codebuild/site-package"
+      # 本区：平台自己的 + 每个 site_id 的 + 本区那份 Edge 副本；
+      # FAKE_UNOWNED_LOG_GROUP 再混进一个别人的
+      out="/aws/lambda/site-panel /aws/codebuild/site-package $FAKE_OWNED_EDGE_LG"
       for s in $FAKE_SITE_IDS; do out="$out /aws/lambda/site-$s"; done
       if [ -n "${FAKE_UNOWNED_LOG_GROUP:-}" ]; then out="$out ${FAKE_UNOWNED_LOG_GROUP}"; fi
       echo "$out" ;;
@@ -199,37 +240,51 @@ exit 0
 """
 
 
-@pytest.fixture
-def harness(tmp_path):
-    """在 tmp 下搭一个假仓库（config.ini + 假 aws），返回一个跑脚本的 runner。"""
-    sb = tmp_path / "site-builder"
+_FAKE_ENV_KEYS = (
+    "FAKE_FAIL_ON", "FAKE_FAIL_CODE", "FAKE_ALL_ABSENT",
+    "FAKE_ORPHAN_ROLES", "FAKE_ORPHAN_TABLES", "FAKE_UNOWNED_LOG_GROUP",
+    "FAKE_ROUTER_DELETE_FAILED", "FAKE_DELETE_FAILED_REASON",
+    "FAKE_MIXED_DELETE_FAILURE", "FAKE_STACK_NEVER_GONE", "FAKE_DSQL_NEVER_GONE",
+    "FAKE_RUNTIME_NEVER_GONE", "FAKE_STATUS_STALE_ONCE", "FAKE_STATUS_STUCK",
+)
+
+
+def _build_sandbox(root: Path):
+    """在 root 下搭一个假仓库（config.ini + 假 aws），返回 runner。
+
+    模块级的射程收集与 `harness` fixture 共用它——收集用的沙箱必须和测试用的
+    完全一样，否则"射程"和"实际跑的东西"会悄悄分叉。
+    """
+    sb = root / "site-builder"
     (sb / "scripts").mkdir(parents=True)
-    (tmp_path / "router").mkdir()
+    (root / "router").mkdir()
     (sb / "config.ini").write_text(_SB_CONFIG, encoding="utf-8")
-    (tmp_path / "router" / "config.ini").write_text(_ROUTER_CONFIG, encoding="utf-8")
+    (root / "router" / "config.ini").write_text(_ROUTER_CONFIG, encoding="utf-8")
     shutil.copy(_SCRIPT, sb / "scripts" / "teardown_platform.sh")
     os.chmod(sb / "scripts" / "teardown_platform.sh", 0o755)
 
-    bin_dir = tmp_path / "fakebin"
+    bin_dir = root / "fakebin"
     bin_dir.mkdir()
     aws = bin_dir / "aws"
     aws.write_text(_FAKE_AWS, encoding="utf-8")
     os.chmod(aws, 0o755)
-    log = tmp_path / "aws-calls.log"
+    log = root / "aws-calls.log"
     log.write_text("", encoding="utf-8")
 
     def run(*args, env=None):
+        log.write_text("", encoding="utf-8")
+        for marker in root.glob("aws-calls.log.*"):
+            marker.unlink()
         e = dict(os.environ)
         e["PATH"] = f"{bin_dir}{os.pathsep}{os.path.dirname(sys.executable)}{os.pathsep}{e['PATH']}"
         e["FAKE_LOG"] = str(log)
         e["FAKE_ACCOUNT"] = _ACCOUNT
         e["FAKE_ROUTER_STACK"] = _ROUTER_STACK
         e["FAKE_SITE_IDS"] = " ".join(_SITE_IDS)
-        for k in ("FAKE_FAIL_ON", "FAKE_FAIL_CODE", "FAKE_ALL_ABSENT",
-                  "FAKE_ORPHAN_ROLES", "FAKE_ORPHAN_TABLES", "FAKE_UNOWNED_LOG_GROUP",
-                  "FAKE_ROUTER_DELETE_FAILED", "FAKE_DELETE_FAILED_REASON",
-                  "FAKE_STACK_NEVER_GONE", "FAKE_DSQL_NEVER_GONE",
-                  "FAKE_STATUS_STALE_ONCE", "FAKE_STATUS_STUCK"):
+        e["FAKE_REGIONS"] = " ".join(_REGIONS)
+        e["FAKE_OWNED_EDGE_LG"] = _OWNED_EDGE_LG
+        e["FAKE_FOREIGN_EDGE_LG"] = _FOREIGN_EDGE_LG
+        for k in _FAKE_ENV_KEYS:
             e.pop(k, None)
         # 默认把轮询压掉：这些用例不验时间，只验状态机。验超时的那条自己覆盖回来。
         e.setdefault("TEARDOWN_POLL_TRIES", "2")
@@ -239,11 +294,16 @@ def harness(tmp_path):
         e.update(env or {})
         proc = subprocess.run(
             ["bash", str(sb / "scripts" / "teardown_platform.sh"), *args],
-            capture_output=True, text=True, env=e, cwd=str(tmp_path))
+            capture_output=True, text=True, env=e, cwd=str(root))
         calls = [l for l in log.read_text(encoding="utf-8").splitlines() if l.strip()]
         return proc, calls
 
     return run
+
+
+@pytest.fixture
+def harness(tmp_path):
+    return _build_sandbox(tmp_path)
 
 
 def _destructive(calls):
@@ -251,79 +311,108 @@ def _destructive(calls):
 
 
 # ---------------------------------------------------------------------------
-# 射程：**从脚本源码机械枚举每一个读点**，不由人挑代表
+# 射程：**按调用点枚举**，不按 (服务, 动词) 去重
 #
-# 第四轮的四条 P1 全长在没被挑中的列举点上。所以这里改成扫源码：凡是
-# `aws <服务> <get-|describe-|list-|head-|scan>` 都自动进射程，将来新增读点同样。
+# 第四轮改成扫源码，把列举点纳进来了，但按 (service, verb) 去重仍有偏差
+# （Codex 第五轮指出）：同一个 API 出现在多个阶段时，故障只注入到**最先到达**的那一处。
+# 例如 `dynamodb describe-table` 在 preflight（sites 表）与 orphans（四张 RETAIN 表）
+# 各有调用点，去重后只有 preflight 那处进了射程。
+#
+# 现在改成：先跑几个场景，把**每一条实际发出的读调用（完整参数串）**收集下来逐个注入。
+# 完整参数串天然区分了 `--table-name site-sites` 与 `--table-name site-admins`，
+# 于是每个调用点各被打一次。源码扫描保留为**覆盖率交叉核对**——它负责抓
+# "源码里有、但任何场景都到不了"的读点（那种读点的故障行为完全没被验证过，
+# 而它看起来和"已覆盖"一模一样）。
 # ---------------------------------------------------------------------------
 _READ_VERB = re.compile(r"^(get|describe|list|head)-|^scan$")
 _AWS_CALL = re.compile(r"\baws\s+([a-z0-9-]+)\s+([a-z0-9-]+)")
 
-
-def _read_calls_in_source():
-    src = _SCRIPT.read_text(encoding="utf-8")
-    found = []
-    for service, verb in _AWS_CALL.findall(src):
-        if _READ_VERB.match(verb) and (service, verb) not in found:
-            found.append((service, verb))
-    return found
-
-
-_READ_POINTS = [f"{s} {v}" for s, v in _read_calls_in_source()]
-
-# 少数读点在"默认一切正常"的场景里到不了，需要把场景造出来才可达。
-_SCENARIO = {
-    "cloudformation describe-stack-events": {"FAKE_ROUTER_DELETE_FAILED": "1"},
+# 收集射程用的场景：default 覆盖绝大多数，另两个把只在特定状态下才走到的读点造出来。
+_COLLECT_SCENARIOS = {
+    "default": {},
+    "router-delete-failed": {"FAKE_ROUTER_DELETE_FAILED": "1"},
+    "sites-table-gone": {"FAKE_ALL_ABSENT": "1"},
 }
 
 
-def test_source_scan_finds_every_service_we_know_about():
-    """元测试：源码扫描不能悄悄扫空或漏掉整类调用。
+def _is_read_call(call: str) -> bool:
+    parts = call.split()
+    return len(parts) >= 2 and bool(_READ_VERB.match(parts[1]))
 
-    没有这条，`_READ_POINTS` 变成空列表时上面那个参数化会**零用例通过**。
+
+def _collect_read_points():
+    """跑几个场景，收集每一条实际发出的读调用（完整参数串）→ 到达它需要哪个场景。"""
+    tmp = Path(tempfile.mkdtemp(prefix="teardown-scope-"))
+    try:
+        run = _build_sandbox(tmp)
+        points = {}
+        for name, env in _COLLECT_SCENARIOS.items():
+            _, calls = run("--yes", env=env)
+            for c in calls:
+                if _is_read_call(c) and c not in points:
+                    points[c] = name
+        return points
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+_READ_POINTS = _collect_read_points()
+_READ_POINT_IDS = sorted(_READ_POINTS)
+
+
+def _short_id(call: str) -> str:
+    """短 id：服务 动词 + 第一个具体取值（表名/角色名/函数名…）。"""
+    parts = call.split()
+    tail = next((p for p in parts[2:] if not p.startswith("--")), "")
+    return "-".join(p for p in (parts[0], parts[1], tail) if p)[:70]
+
+
+def test_scope_collection_actually_found_the_call_points():
+    """元测试：射程收集不能悄悄收空——否则下面那个参数化会**零用例通过**。
+
+    另外钉住"同一 API 的多个调用点各自单独在射程里"这件事本身：
+    `describe-table` 至少 5 处（sites 表 + 四张 RETAIN 表），`get-role` 至少 5 处。
     """
-    assert len(_READ_POINTS) >= 15, _READ_POINTS
-    for must in ("sts get-caller-identity", "iam list-roles", "dynamodb list-tables",
-                 "kms list-keys", "logs describe-log-groups",
-                 "cognito-idp list-user-pools", "iam list-role-policies",
-                 "iam list-attached-role-policies", "s3api get-bucket-location",
-                 "cloudformation describe-stacks", "cloudformation describe-stack-events"):
-        assert must in _READ_POINTS, f"{must} 没被扫到:\n{_READ_POINTS}"
+    assert len(_READ_POINTS) >= 40, f"只收到 {len(_READ_POINTS)} 个调用点:\n{_READ_POINT_IDS}"
+    tables = [c for c in _READ_POINTS if "dynamodb describe-table" in c]
+    assert len(tables) >= 5, f"describe-table 的调用点没被分开:\n{tables}"
+    roles = [c for c in _READ_POINTS if "iam get-role " in c]
+    assert len(roles) >= 5, f"get-role 的调用点没被分开:\n{roles}"
 
 
-@pytest.mark.parametrize("needle", _READ_POINTS, ids=lambda n: n.replace(" ", "_"))
-@pytest.mark.parametrize("code", ["AccessDeniedException", "ThrottlingException"])
-def test_every_read_point_hard_stops_on_non_notfound(harness, needle, code):
-    """不变量 ①：**任意**读点上的非 NotFound 故障都必须非零退出，且注入点之后无破坏性调用。"""
+def test_source_scan_has_no_read_point_outside_the_range():
+    """交叉核对：源码里每个 (服务, 动词) 都必须至少有一个调用点进了射程。"""
+    src = _SCRIPT.read_text(encoding="utf-8")
+    in_source = {(s, v) for s, v in _AWS_CALL.findall(src) if _READ_VERB.match(v)}
+    assert len(in_source) >= 15, in_source
+    missing = [f"{s} {v}" for s, v in sorted(in_source)
+               if not any(f"{s} {v}" in c for c in _READ_POINTS)]
+    assert missing == [], (
+        "这些读点在源码里，但任何场景都没跑到 ⇒ 它们的故障行为没被验证过。"
+        "给 _COLLECT_SCENARIOS 加个能到达它的场景，或确认它是死代码：\n  "
+        + "\n  ".join(missing))
+
+
+@pytest.mark.parametrize("needle", _READ_POINT_IDS, ids=_short_id)
+def test_every_read_point_hard_stops_on_non_notfound(harness, needle):
+    """不变量 ①：**每一个调用点**上的非 NotFound 故障都必须非零退出，
+    且注入点之后没有任何破坏性调用。
+
+    **只打一种错误码**（AccessDenied），不是省事：错误码唯一起作用的地方是
+    `_is_absent_err`，它对码的分类由 `test_probe_classifies_only_notfound_as_absent`
+    在最小单位上逐码断言，`test_non_notfound_error_stops_later_stages_too` 再跑一遍四种码。
+    在这里乘以码数只会把套件墙钟翻倍（实测 2 分钟 → 4 分半），不增加任何覆盖。
+    """
+    code = "AccessDeniedException"
     env = {"FAKE_FAIL_ON": needle, "FAKE_FAIL_CODE": code}
-    env.update(_SCENARIO.get(needle, {}))
+    env.update(_COLLECT_SCENARIOS[_READ_POINTS[needle]])
     proc, calls = harness("--yes", env=env)
     idx = next((i for i, c in enumerate(calls) if needle in c), None)
-    assert idx is not None, (
-        f"读点 {needle} 在默认场景里没被调用到 —— 要么是死代码，"
-        f"要么该给它加个 _SCENARIO 条目，否则它其实没进射程:\n" + "\n".join(calls))
+    assert idx is not None, "注入点没被调用到:\n" + "\n".join(calls)
     assert proc.returncode != 0, (
         f"{needle} 遇到 {code} 却退 0 —— UNKNOWN 被当成了 ABSENT\n{proc.stdout}")
     after = _destructive(calls[idx:])
     assert after == [], f"{needle} 在 {code} 之后仍发出破坏性调用: {after}"
-
-
-def test_every_actual_read_call_is_in_range(harness):
-    """元测试：跑一遍 happy path，**每一条真实发出的读调用**都必须被某个射程需求覆盖。
-
-    上一条按源码枚举；这条反向核对——如果脚本用变量拼出了源码里扫不到的读调用，
-    这里会红。少了它，"机械枚举"可能只是看起来全。
-    """
-    proc, calls = harness("--yes")
-    assert proc.returncode == 0, proc.stderr
-    uncovered = []
-    for c in calls:
-        parts = c.split()
-        if len(parts) < 2 or not _READ_VERB.match(parts[1]):
-            continue
-        if not any(n in c for n in _READ_POINTS):
-            uncovered.append(c)
-    assert uncovered == [], f"这些读调用不在射程内:\n" + "\n".join(uncovered)
 
 
 # ---------------------------------------------------------------------------
@@ -505,10 +594,7 @@ def test_stacks_are_waited_for_not_fired_and_forgotten(harness):
 
 
 def test_router_expected_failure_is_incomplete_not_success(harness):
-    """router 栈第一次必定 DELETE_FAILED（Edge 副本）。**预期 ≠ 完成**：整轮必须退 3。
-
-    原先只发异步 delete-stack 就打印"完成"退 0，那两个字与栈的真实状态无关。
-    """
+    """router 栈第一次必定 DELETE_FAILED（Edge 副本）。**预期 ≠ 完成**：整轮必须退 3。"""
     proc, calls = harness("--yes", env={"FAKE_ROUTER_DELETE_FAILED": "1"})
     assert proc.returncode == 3, f"rc={proc.returncode}\n{proc.stdout}\n{proc.stderr}"
     assert "还没完" in proc.stdout, proc.stdout
@@ -518,8 +604,36 @@ def test_router_expected_failure_is_incomplete_not_success(harness):
     assert any("schedule-key-deletion" in c for c in calls), calls
 
 
+def test_mixed_delete_failure_is_not_excused_as_edge_replicas(harness):
+    """**混合失败必须 hard-stop**（Codex 第五轮 P1-2，实测复现过）。
+
+    Edge 副本 + 桶非空同时存在时，原先只要"任一条原因提到 replicated function"
+    就退 3，把真正的阻塞藏了起来。判据现在是"当前**所有** DELETE_FAILED 资源
+    都必须是那两个 Edge 函数、且原因都匹配"。
+    """
+    proc, calls = harness("--yes", env={"FAKE_ROUTER_DELETE_FAILED": "1",
+                                        "FAKE_MIXED_DELETE_FAILURE": "1"})
+    assert proc.returncode == 1, f"rc={proc.returncode}（3 = 又被当成预期失败放过了）\n{proc.stdout}"
+    assert "不只是" in proc.stderr, proc.stderr
+    # 明细要打出来，否则运维不知道真正的阻塞是什么
+    assert "not empty" in proc.stderr, proc.stderr
+    assert "orphans：" not in proc.stdout, "未查清的失败之后不该继续删东西"
+
+
+def test_classification_uses_current_state_not_event_history(harness):
+    """判据必须来自**现状**（describe-stack-resources），不能来自事件历史。
+
+    describe-stack-events 含前几次尝试留下的 DELETE_FAILED，用它分类会把
+    "上次失败、这次成功"与"这次仍失败"混为一谈。
+    """
+    proc, calls = harness("--yes", env={"FAKE_ROUTER_DELETE_FAILED": "1"})
+    assert any("describe-stack-resources" in c for c in calls), calls
+    assert not any("describe-stack-events" in c for c in calls), (
+        "又回去读事件历史了：" + str([c for c in calls if "describe-stack-events" in c]))
+
+
 def test_unexpected_stack_failure_is_a_hard_stop(harness):
-    """DELETE_FAILED 但原因**不是** Edge 副本 ⇒ hard-stop，不能顺手当成预期情况放过。"""
+    """DELETE_FAILED 但原因**不是** Edge 副本 ⇒ hard-stop。"""
     proc, calls = harness("--yes", env={
         "FAKE_ROUTER_DELETE_FAILED": "1",
         "FAKE_DELETE_FAILED_REASON": "The bucket you tried to delete is not empty"})
@@ -642,3 +756,71 @@ def test_teardown_section_still_documents_the_two_unavoidable_pits():
     sec = _teardown_section()
     assert "replicated function" in sec, "丢了 router 栈第一次必失败那条"
     assert "alias 不是" in sec and "description" in sec, "丢了孤儿 CMK 只能按 description 认那条"
+
+
+def test_agentcore_runtime_delete_is_waited_for(harness):
+    """`DeleteAgentRuntime` 是异步的（AWS 文档：`HTTP/1.1 202`，status 含 `DELETING`）。
+
+    删完必须轮询到它真的消失，**才能**去删 ECR 镜像与 site-mcp-runtime-role
+    ——那两样正是 runtime 删除过程本身要用的（Codex 第五轮 P1-3）。
+    """
+    proc, calls = harness("--yes", "--stage", "scripts")
+    assert proc.returncode == 0, proc.stderr
+    del_idx = next(i for i, c in enumerate(calls) if "delete-agent-runtime" in c)
+    after = calls[del_idx + 1:]
+    assert any("get-agent-runtime" in c for c in after), "删完没有轮询确认它消失"
+    # 顺序：确认消失**在**删 ECR / 删角色之前
+    gone_idx = del_idx + 1 + next(i for i, c in enumerate(after) if "get-agent-runtime" in c)
+    for later in ("ecr delete-repository", "iam delete-role --role-name site-mcp-runtime-role"):
+        idx = next((i for i, c in enumerate(calls) if later in c), None)
+        if idx is not None:
+            assert idx > gone_idx, f"{later} 发生在确认 runtime 消失之前"
+
+
+def test_agentcore_wait_timeout_is_a_hard_stop(harness):
+    """runtime 一直删不完（轮询耗尽）⇒ 非零退出，且不去动它还在用的 ECR / 角色。"""
+    proc, calls = harness("--yes", "--stage", "scripts",
+                          env={"FAKE_RUNTIME_NEVER_GONE": "1",
+                               "TEARDOWN_POLL_TRIES": "2", "TEARDOWN_POLL_SLEEP": "0"})
+    assert proc.returncode != 0, proc.stdout
+    assert "超时" in proc.stdout + proc.stderr
+    assert not any("ecr delete-repository" in c for c in calls), calls
+
+
+def test_edge_log_groups_are_cleaned_in_every_region(harness):
+    """Edge 日志组在**每个执行区**都有一份；只清本区会永久留下其余区（第五轮 P2-5）。
+
+    区列表动态枚举（`ec2:DescribeRegions`），不硬编码——别的部署不知道自己的 POP
+    落在哪些区，这跟 access_rollup 跨区扫描是同一条设计理由。
+    """
+    proc, calls = harness("--yes")
+    assert proc.returncode == 0, proc.stderr
+    assert any("ec2 describe-regions" in c for c in calls), "没有动态枚举区列表"
+    deleted = [c for c in calls if "delete-log-group" in c]
+    for region in _REGIONS:
+        assert any(_OWNED_EDGE_LG in c and f"--region {region}" in c for c in deleted), (
+            f"{region} 的 Edge 副本日志组没被删:\n" + "\n".join(deleted))
+
+
+def test_foreign_edge_log_group_is_never_deleted(harness):
+    """账号里别人的 Edge 函数日志组（实测见过 redirectEdge）**一个区都不许删**。
+
+    跨区扫描用的前缀 `/aws/lambda/us-east-1.` 会把它们一起列出来——对只读的聚合器
+    那是可接受的代价，对删除则是事故。所以跨区那一路仍然只删归属清单内的。
+    """
+    proc, calls = harness("--yes")
+    assert proc.returncode == 0, proc.stderr
+    offenders = [c for c in calls if "delete-log-group" in c and _FOREIGN_EDGE_LG in c]
+    assert offenders == [], f"删了别人的 Edge 日志组: {offenders}"
+
+
+def test_tagging_exception_is_not_treated_as_absent(harness):
+    """`UserPoolTaggingException` **不是** NotFound（Cognito 服务模型：标签读写失败）。
+
+    把它当 ABSENT 会让一个**存在**的用户池被静默跳过，而整轮仍退 0（第五轮 P2-4）。
+    """
+    proc, calls = harness("--yes", env={"FAKE_FAIL_ON": "cognito-idp describe-user-pool",
+                                        "FAKE_FAIL_CODE": "UserPoolTaggingException"})
+    assert proc.returncode != 0, (
+        "标签异常被当成了「池不存在」 ⇒ 池漏删而整轮退 0\n" + proc.stdout)
+    assert not any("delete-user-pool" in c for c in calls), calls

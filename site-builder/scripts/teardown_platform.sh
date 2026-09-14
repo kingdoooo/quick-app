@@ -15,8 +15,9 @@
 #      `site-*` 不是平台独占命名空间；按通配删日志组会删掉别人的数据。
 #   ③ 破坏性步骤前的闸门（账号一致 + 站点已清空）**无条件执行**，--stage 也不能绕。
 #   ④ 异步操作要等到**服务说完成**才算完成；等不到就非零退出，不打印"完成"。
-#   四条都由 deployer/tests/test_teardown_platform.py 按**每个读点 × 每种错误码**
-#   注入故障来断言，断言形态是"注入点之后日志里没有任何破坏性调用"，不是"某个例子的输出对不对"。
+#   四条都由 deployer/tests/test_teardown_platform.py 注入故障来断言。射程按**调用点**
+#   枚举（不是按 API 去重——同一个 API 在多个阶段各有调用点，去重会只打到最先到达的那处），
+#   断言形态是"注入点之后日志里没有任何破坏性调用"，不是"某个例子的输出对不对"。
 # ────────────────────────────────────────────────────────────────────────
 #
 # 它**不做**的三件事（都需要人的判断，留在 DEPLOY.md 里）：
@@ -101,11 +102,17 @@ DEPLOYER_STACK="SiteDeployerStack"
 # ---------------------------------------------------------------- 三值探测
 # **这里是整个脚本的安全核心。** 只有服务明确说的 NotFound 才算 ABSENT；
 # 其余任何失败（AccessDenied、限流、参数错误、网络）都是 UNKNOWN，而 UNKNOWN 会 hard-stop。
+# **这张表里只许放"服务在说这东西不存在"的形态。** 放错一条的代价是单向的：
+# 一个存在的资源被判成 ABSENT ⇒ 静默漏删 ⇒ 整轮仍退 0。
+# 曾经错放过 `UserPoolTaggingException`（我自己加的，Codex 第五轮 P2-4 抓到）：
+# 它在 Cognito 的服务模型里是「a user pool tag can't be set or updated」，
+# DescribeUserPool 明确会返回它，而那个池**是存在的** —— 于是标签读取出问题的池会被
+# 当成不存在、直接跳过。DescribeUserPool 的"不存在"是 ResourceNotFoundException，已在表内。
 _is_absent_err() {
   case "$1" in
     *ResourceNotFoundException*|*ResourceNotFound*|*NotFoundException*|*NoSuchEntity*|\
     *NoSuchBucket*|*ParameterNotFound*|*RepositoryNotFoundException*|*ClusterNotFound*|\
-    *UserPoolTaggingException*|*"does not exist"*|*"Function not found"*|*"Unable to find"*)
+    *"does not exist"*|*"Function not found"*|*"Unable to find"*)
       return 0 ;;
   esac
   return 1
@@ -167,6 +174,26 @@ need_delete() {
 在状态未知的账号上继续跑破坏性步骤，可能把该删的留下、也可能对错的目标动手。
 先解决凭据 / 限流，再重跑。" ;;
   esac
+}
+
+# wait_gone <描述> <探测命令...> —— 轮询到**服务明确说 NotFound** 才返回（不变量 ④）。
+#   ABSENT → 0；UNKNOWN → die；次数耗尽 → die。
+# 删除类 API 普遍是异步的（返回 202 / 状态 DELETING），"请求发出去了"不等于"删完了"，
+# 而后面还有别的破坏性步骤要在这个前提上动手。所有异步删除都必须过这个函数。
+wait_gone() {
+  local desc="$1"; shift
+  local i state
+  for i in $(seq 1 "${POLL_TRIES}"); do
+    state="$(probe "${desc}" "$@")"
+    case "${state}" in
+      ABSENT)  log "  ${desc} 已消失（等了约 $((i * POLL_SLEEP)) 秒）"; return 0 ;;
+      UNKNOWN) die "删除 ${desc} 之后读不到它的状态，而且不是 NotFound（见报文）。
+不能当成已删除——后面还有不可逆的操作，先查清楚凭据 / 限流。" ;;
+    esac
+    sleep "${POLL_SLEEP}"
+  done
+  die "等 ${desc} 消失超时（约 $((POLL_TRIES * POLL_SLEEP)) 秒）。它可能仍在删除中。
+**没有确认删掉就不继续往下做**——过几分钟重跑本脚本（幂等）。"
 }
 
 run() {   # 真正的破坏性调用都经这里；--dry-run 只打印
@@ -319,6 +346,12 @@ stage_scripts() {
     if need_delete "AgentCore runtime $rt_id" \
         aws bedrock-agentcore-control get-agent-runtime --agent-runtime-id "$rt_id" --region "$REGION"; then
       run aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id "$rt_id" --region "$REGION"
+      # **DeleteAgentRuntime 是异步的**：AWS 文档写明返回 `HTTP/1.1 202`，响应里的
+      # status 取值含 `DELETING`（Codex 第五轮 P1-3）。原先发完就往下删 ECR 仓库和
+      # site-mcp-runtime-role —— 那是把 runtime 正在用的镜像与执行角色从它脚下抽走，
+      # 而且整轮会在 runtime 还在的时候退 0。
+      [ "$DRY_RUN" -eq 1 ] || wait_gone "AgentCore runtime ${rt_id}" \
+        aws bedrock-agentcore-control get-agent-runtime --agent-runtime-id "$rt_id" --region "$REGION"
     fi
   else
     log "  跳过 AgentCore runtime（config.ini 的 [MCP] endpoint_url 为空）"
@@ -432,21 +465,12 @@ stage_dsql() {
 
   if need_delete "DSQL cluster $cid" aws dsql get-cluster --identifier "$cid" --region "$REGION"; then
     run aws dsql delete-cluster --identifier "$cid" --region "$REGION"
-    [ "$DRY_RUN" -eq 1 ] && return 0
     # 轮询到服务明确说 NotFound。**超时与 UNKNOWN 都必须 hard-stop**——
     # 只 break 的话后面的 stacks 阶段照跑，那就是 fail-open。
-    local i state
-    for i in $(seq 1 "$POLL_TRIES"); do
-      state="$(probe "DSQL cluster $cid" aws dsql get-cluster --identifier "$cid" --region "$REGION")"
-      case "$state" in
-        ABSENT)  log "  cluster 已删除（等了约 $((i * POLL_SLEEP)) 秒）"; return 0 ;;
-        UNKNOWN) die "删 cluster 之后读不到它的状态，而且不是 NotFound（见报文）。
-不能当成已删除——后面还有删栈这种不可逆操作，先查清楚凭据 / 限流。" ;;
-      esac
-      sleep "$POLL_SLEEP"
-    done
-    die "等 DSQL cluster $cid 消失超时（约 $((POLL_TRIES * POLL_SLEEP)) 秒）。它可能仍在删除中。
-**没有确认删掉就不继续往下删栈**——过几分钟重跑本脚本（幂等）。"
+    # 与 AgentCore 走**同一个** wait_gone：两处曾各写一遍，其中一处（AgentCore）
+    # 干脆忘了轮询。同一条不变量不该有两份实现。
+    [ "$DRY_RUN" -eq 1 ] || wait_gone "DSQL cluster ${cid}" \
+      aws dsql get-cluster --identifier "$cid" --region "$REGION"
   fi
 }
 
@@ -491,20 +515,42 @@ wait_stack_deleted() {
     case "${state}" in
       DELETE_IN_PROGRESS) ;;
       DELETE_FAILED)
-        checked "栈 ${st} 的失败原因" aws cloudformation describe-stack-events \
+        # **不能只问"有没有一条原因提到 replicated function"**（Codex 第五轮 P1-2）：
+        # 混合失败（Edge 副本 + 桶非空）里那条 Edge 原因会把真正的阻塞藏起来，实测退 3。
+        # 两处改动：
+        #  · 数据源从 describe-stack-events（**历史**，含前几次尝试的 DELETE_FAILED）
+        #    换成 describe-stack-resources（**现状**）；
+        #  · 判据从"任一条匹配"换成"当前**所有** DELETE_FAILED 资源都必须是那两个 Edge
+        #    函数、且原因都匹配"，逻辑 ID 也一起核（构造 ID 见 router 的 PROTECTED_CONSTRUCTS）。
+        # 交给 JMESPath 数数，不在 bash 里切多行文本——原因串里带空格，切错就又是一次误判。
+        local q_all q_edge n_all n_edge
+        q_all="length(StackResources[?ResourceStatus=='DELETE_FAILED'])"
+        q_edge="length(StackResources[?ResourceStatus=='DELETE_FAILED'"
+        q_edge="${q_edge} && ResourceStatusReason != null"
+        q_edge="${q_edge} && contains(ResourceStatusReason, 'replicated function')"
+        q_edge="${q_edge} && (starts_with(LogicalResourceId, 'OriginRequestFunction')"
+        q_edge="${q_edge} || starts_with(LogicalResourceId, 'OriginResponseFunction'))])"
+        checked "栈 ${st} 当前 DELETE_FAILED 的资源数" aws cloudformation describe-stack-resources \
+          --stack-name "${st}" --region "${REGION}" --query "${q_all}" --output text
+        n_all="${CHECKED_OUT}"
+        checked "栈 ${st} 里属于 Edge 副本的失败资源数" aws cloudformation describe-stack-resources \
+          --stack-name "${st}" --region "${REGION}" --query "${q_edge}" --output text
+        n_edge="${CHECKED_OUT}"
+        if [ -n "${n_all}" ] && [ "${n_all}" != "0" ] && [ "${n_all}" = "${n_edge}" ]; then
+          # 这一条是**预期**的：Lambda@Edge 的已发布版本要等全球副本清完才删得掉。
+          # 但"预期"不等于"完成"——所以记账，收尾退 3。
+          log "  栈 ${st} DELETE_FAILED，${n_all} 个失败资源**全部**是 Lambda@Edge 副本（预期）"
+          INCOMPLETE+=("栈 ${st}：Edge 副本未清完，几小时后重跑 --stage stacks")
+          return 0
+        fi
+        checked "栈 ${st} 的失败明细" aws cloudformation describe-stack-resources \
           --stack-name "${st}" --region "${REGION}" \
-          --query "StackEvents[?ResourceStatus=='DELETE_FAILED'].ResourceStatusReason" --output text
-        case "${CHECKED_OUT}" in
-          *"replicated function"*|*"replicated Function"*)
-            # 这一条是**预期**的：Lambda@Edge 的已发布版本要等全球副本清完才删得掉。
-            # 但"预期"不等于"完成"——所以记账，收尾退 3。
-            log "  栈 ${st} DELETE_FAILED，原因是 Lambda@Edge 副本还没清完（预期）"
-            INCOMPLETE+=("栈 ${st}：Edge 副本未清完，几小时后重跑 --stage stacks")
-            return 0 ;;
-          *) die "栈 ${st} 删除失败，原因**不是** Edge 副本：
+          --query "StackResources[?ResourceStatus=='DELETE_FAILED'].[LogicalResourceId,ResourceStatusReason]" \
+          --output text
+        die "栈 ${st} 删除失败，而且**不只是** Edge 副本那种预期情况：
+当前 ${n_all} 个 DELETE_FAILED 资源里只有 ${n_edge} 个是 Edge 副本。明细：
 ${CHECKED_OUT}
-先到 CloudFormation 控制台看事件，处理掉真正的阻塞资源再重跑。" ;;
-        esac ;;
+先到 CloudFormation 控制台处理掉真正的阻塞资源再重跑。**别把这一轮当成"预期失败"放过**。" ;;
       *)
         # 别在这里 die：`delete-stack` 是**异步**的，紧接着的第一次轮询完全可能还读到
         # 删除前的状态（CREATE_COMPLETE / UPDATE_COMPLETE …）。那时 die 是一条假红。
@@ -591,6 +637,30 @@ stage_orphans() {
       unowned+=("${lg}")
     fi
   done
+  # Lambda@Edge 的日志组在**每个执行区**都有一份，名字全都叫
+  # `/aws/lambda/{归属区}.{函数名}`（归属区恒为 Edge 函数所在的 us-east-1，与执行区无关）。
+  # 只扫本区会把其它区的副本日志永久留下（Codex 第五轮 P2-5）。
+  # 区列表**动态枚举、不硬编码** —— 别的部署不知道自己的 POP 落在哪些区，
+  # 这跟 access_rollup 跨区扫描当初的设计理由是同一条（DEPLOY.md 那一节）。
+  # 只按 Edge 前缀查，而且**仍然只删归属清单内的**：那个前缀会把账号里别人的 Edge
+  # 函数一起列出来（DEPLOY.md 记过实测见到的 `us-east-1.redirectEdge`），
+  # 对只读的聚合器那是可接受的代价，对**删除**则是事故。
+  checked "本账号已启用的区" aws ec2 describe-regions --query 'Regions[].RegionName' --output text
+  local regions="${CHECKED_OUT}" other elg
+  for other in ${regions}; do
+    [ "${other}" = "None" ] && continue
+    [ "${other}" = "${REGION}" ] && continue
+    checked "区 ${other} 里的 Edge 日志组" aws logs describe-log-groups --region "${other}" \
+      --log-group-name-prefix "/aws/lambda/${REGION}." \
+      --query 'logGroups[].logGroupName' --output text
+    for elg in ${CHECKED_OUT}; do
+      [ "${elg}" = "None" ] && continue
+      if _is_ours "${elg}"; then
+        run aws logs delete-log-group --log-group-name "${elg}" --region "${other}"
+      fi
+    done
+  done
+
   if [ "${#unowned[@]}" -gt 0 ]; then
     log ""
     log "  以下日志组名字像平台件，但**证明不了归属**，所以没有删（请自己看一眼）："

@@ -35,6 +35,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -2394,14 +2395,36 @@ def test_each_worker_gets_its_own_iam_client():
     g = _gate()
     got = {}
 
-    def grab(tag):
-        got[tag] = id(g.thread_iam_client("us-east-1"))
+    # **两个线程必须同时活着，而且要留住对象本身**（不是 id()）。
+    # 原先是 `t1.start(); t1.join(); t2.start(); t2.join()` 并只存 id()：
+    # t1 的 client 在 t1 结束后可被回收，CPython 会把同一块地址复用给 t2 的 client
+    # ⇒ 两个 id() 偶发相等 ⇒ 随机假红（Codex 第五轮定位，本仓库实测见过一次）。
+    # 留住引用就不可能重用地址，再用 `is not` 判身份，语义也比 id() 比较更直接。
+    started = threading.Barrier(2)
+    release = threading.Event()
 
-    t1, t2 = threading.Thread(target=grab, args=("a",)), threading.Thread(target=grab, args=("b",))
-    t1.start(); t1.join(); t2.start(); t2.join()
-    assert got["a"] != got["b"], "两个线程拿到了同一个 client —— 那正是触发未校验 TLS 的形态"
+    def grab(tag):
+        got[tag] = g.thread_iam_client("us-east-1")
+        started.wait(timeout=10)   # 两个 client 都建好了才允许任一线程退出
+        release.wait(timeout=10)
+
+    threads = [threading.Thread(target=grab, args=(t,)) for t in ("a", "b")]
+    for t in threads:
+        t.start()
+    try:
+        # 等到两个 client 都存在（Barrier 已被双方 wait 过）
+        for _ in range(100):
+            if len(got) == 2:
+                break
+            time.sleep(0.01)
+        assert len(got) == 2, f"线程没都建出 client: {sorted(got)}"
+        assert got["a"] is not got["b"], "两个线程拿到了同一个 client —— 那正是触发未校验 TLS 的形态"
+    finally:
+        release.set()
+        for t in threads:
+            t.join(timeout=10)
     # 同一线程内要复用，否则 400 个 principal 会建 400 个 client
-    assert id(g.thread_iam_client("us-east-1")) == id(g.thread_iam_client("us-east-1"))
+    assert g.thread_iam_client("us-east-1") is g.thread_iam_client("us-east-1")
 
 
 def test_bundle_missing_a_section_hard_fails(tmp_path):

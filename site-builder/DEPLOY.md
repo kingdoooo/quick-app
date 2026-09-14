@@ -3366,10 +3366,17 @@ python3 -u site-builder/scripts/probe_impersonation_surface.py \
 2. **只删证明得了归属的资源。** 资产支持共享账号（见 §0），所以 `site-*` **不是**
    平台独占命名空间。日志组按 `preflight` 建的归属清单精确匹配；名字像平台件但
    证明不了归属的**只报告、不删除**。
+   这条对**跨区**那一路同样成立：Lambda@Edge 的日志组在每个执行区都有一份，脚本会
+   动态枚举已启用的区（`ec2:DescribeRegions`，不硬编码）逐区清理，但仍然只删
+   `/aws/lambda/{区}.{栈名}-` 这种受栈名限定的名字——那个 Edge 前缀会把账号里
+   别人的 Edge 函数（实测见过 `us-east-1.redirectEdge`）一起列出来。
 3. **`preflight` 是闸门，不是阶段。** 不论 `--stage` 给的是哪个，账号一致性与
    "站点是否真的清空"都先查一遍（全是只读的）。
-4. **异步操作要等到服务说完成。** 删栈、删 DSQL cluster、关表的删除保护都是异步的；
+4. **异步操作要等到服务说完成。** 删栈、删 DSQL cluster、删 AgentCore runtime
+   （文档写明返回 `HTTP/1.1 202`、状态 `DELETING`）、关表的删除保护，全都是异步的；
    发出请求 ≠ 做完了。等不到就非零退出，**不打印"完成"**。
+   AgentCore 那条尤其要紧：它的 ECR 镜像与 `site-mcp-runtime-role` 正是删除过程本身
+   要用的，不等就等于把它们从 runtime 脚下抽走。
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"
@@ -3441,8 +3448,11 @@ ApplicationWebRouterStack | DELETE_FAILED
 
 AWS 要**几个小时**才清完全球副本，而 CloudFormation 不等、当场失败。
 **立刻重试仍然失败**。过几小时重跑 `--yes --stage stacks` 即可（幂等）。
-脚本认得这个原因，会把它记成"还没完"并**退 3**（其余任何 `DELETE_FAILED` 原因一律
-按 `1` hard-stop，不会顺手当成预期情况放过）；退 3 那一轮 `orphans` 仍然照跑完
+脚本认得这个原因，会把它记成"还没完"并**退 3**。判据是**当前所有 `DELETE_FAILED`
+资源都必须是那两个 Edge 函数**（按 `describe-stack-resources` 看**现状**，不是按事件
+历史；逻辑 ID 也一起核）——所以"Edge 副本 + 桶非空"这种**混合失败会 hard-stop 退 1**，
+不会被那条 Edge 原因掩盖过去。其余任何 `DELETE_FAILED` 原因同样退 1。
+退 3 那一轮 `orphans` 仍然照跑完
 ——孤儿 CMK 是"能签会话"的 key，值得当轮就清掉，不该陪着等几个小时。
 stack policy 的 `Deny Update:*` **不拦 DeleteStack**，所以不需要先 `router_stack_policy.py open`。
 
