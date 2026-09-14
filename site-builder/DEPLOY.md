@@ -3347,34 +3347,48 @@ python3 -u site-builder/scripts/probe_impersonation_surface.py \
 
 ## 把平台从账号里拆掉（评估完想清干净时看这节）
 
-**顺序是有依赖的。** 平台的资源分**四类**，只有下表**第 2 行**那类跟着 CloudFormation 走：
+**拆除是程序，不是散文，所以它是一个脚本**：`site-builder/scripts/teardown_platform.sh`
+（随仓库分发）。这一节只讲**它做什么、它刻意不做什么、以及你会撞到的两处**。
 
-| 类 | 谁建的 | 栈删掉会怎样 |
-|---|---|---|
-| **站点自己的**（per-site IAM 角色、`site-data-*` 表、DSQL schema / role / IAM 映射、前端对象） | 执行器在建站时建 | **全部变孤儿** —— 一个都不在栈里 |
-| **两个 CFN 栈**（router、deployer） | `cdk deploy` | 大部分跟着走，但 `RemovalPolicy.RETAIN` 的**留下**（见下面第 ④ 步） |
-| **脚本建的平台件**（auth / panel / key-proxy 的 Lambda 与 Function URL、pre-token 触发器、MCP runtime + ECR 仓库、四~五个 IAM 角色、告警管道、Cognito **两个**池、两~三个 SSM 参数） | ①/auth/⑤/⑤b/⑤c 的部署脚本 | **一个都不会走** |
-| **手工建的**（③ 的 DSQL cluster、② 步骤 1 的前端桶、② 步骤 4 的 DNS 记录、CDK bootstrap） | 你自己照手册跑的命令 | **一个都不会走** |
+> **为什么不是几段可以照抄的命令。** 这一节最初就是那样写的，连续三轮对抗性复审各发现
+> 一个 P1，根因每次都一样：某处"存在性判断"被写成「命令失败就当不存在」，于是
+> AccessDenied / 限流被当成"东西不存在"，脚本继续做破坏性操作并最终**退 0**。
+> 围栏块既没法测，也保证不了"手册里写的 = 作者真跑过的"。现在那条不变量由
+> `deployer/tests/test_teardown_platform.py` 按阶段注入故障来断言。
 
-**下面各步就是按这个顺序排的**（手工件不是一整块，它被 DSQL 与"其余"拆开了，
-因为只有 DSQL 需要在删栈之前处理）：
+### 它的核心不变量
 
-```
-① 站点（purge）→ ② 脚本件 → ②b DSQL cluster → ③ 两个栈 → ④ 收孤儿 + 其余手工件
-                                                              （前端桶 / DNS / bootstrap）
-```
-
-跳过第 ① 步直接删栈是最常见的错法；**最容易整个忘掉的是第 4 行里的 DSQL cluster**
-（它在 ③ 手工建、不属于任何栈，而拆除时没有任何东西会提醒你）。
-前端桶归**手工建的**那一行——它由 ② 步骤 1 手工创建，不是任何脚本建的；
-它排在最后是因为删栈之前 Edge 可能还在读它。
-
-### ① 先下线所有站点，而且要 `purge_data`
-
-不 purge 就只删路由/Lambda/前端，**数据侧全留**（这是刻意的防误删默认）。
+每一步动手之前先探测，结果只有三种 —— **PRESENT / ABSENT / UNKNOWN**。
+**只有服务明确说 NotFound 才算 ABSENT**；其余任何失败（AccessDenied、限流、参数错误、
+网络）都是 UNKNOWN，而 **UNKNOWN 一律 hard-stop**：非零退出，且**不再执行任何后续
+破坏性调用**。所以"脚本退 0"这件事本身就是"该删的都确认删掉了"的证据。
 
 ```bash
-# 有 owner 的站点走 MCP（Agent 客户端里，或用 scripts/_mcp_client.py）
+cd "$(git rev-parse --show-toplevel)"
+site-builder/scripts/teardown_platform.sh --dry-run      # 先看一遍：一条破坏性调用都不发
+site-builder/scripts/teardown_platform.sh --yes          # 真拆（幂等，可反复重跑）
+site-builder/scripts/teardown_platform.sh --yes --stage stacks   # 只跑一个阶段
+```
+
+阶段顺序 **preflight → scripts → dsql → stacks → orphans**，对应下面这张资源分类表
+——平台的资源分**四类**，只有第 2 行那类跟着 CloudFormation 走：
+
+| 类 | 谁建的 | 栈删掉会怎样 | 谁来拆 |
+|---|---|---|---|
+| **站点自己的**（per-site IAM 角色、`site-data-*` 表、DSQL schema / role / IAM 映射、前端对象） | 执行器在建站时建 | **全部变孤儿** —— 一个都不在栈里 | **你**（见下面第 ① 步）|
+| **两个 CFN 栈**（router、deployer） | `cdk deploy` | 大部分跟着走，但 `RemovalPolicy.RETAIN` 的**留下** | 脚本 `stacks` + `orphans` |
+| **脚本建的平台件**（auth / panel / key-proxy 的 Lambda 与 Function URL、pre-token 触发器、MCP runtime + ECR 仓库、四~五个 IAM 角色、告警管道、Cognito **两个**池、两~三个 SSM 参数） | ①/auth/⑤/⑤b/⑤c 的部署脚本 | **一个都不会走** | 脚本 `scripts` |
+| **手工建的**（③ 的 DSQL cluster、② 步骤 1 的前端桶、② 步骤 4 的 DNS 记录、CDK bootstrap） | 你自己照手册跑的命令 | **一个都不会走** | 脚本 `dsql` / `orphans`，**DNS 与 bootstrap 归你** |
+
+### ① 站点必须你自己先下线，而且要 `purge_data`
+
+脚本**不做**这一步（要 MCP / owner 判断、要不要 purge 得问用户），但它会**核对**：
+`site-sites` 表里还有非 `DELETED` 的行时 `preflight` 阶段直接拒绝往下走。
+
+不 purge 就只删路由 / Lambda / 前端，**数据侧全留**（这是刻意的防误删默认）。
+
+```bash
+# 有 owner 的站点走 MCP（Agent 客户端里，或用 scripts/_mcp_client.py）：
 #   undeploy_site(site_id=…, purge_data=True)
 # 常驻夹具站点的 owner 是夹具域，MCP 认不了它 ⇒ 直接 invoke undeploy Lambda
 #   （它要求 jobs 表里先有一条 job 行）
@@ -3386,229 +3400,57 @@ aws lambda invoke --function-name site-deployer-undeploy --region us-east-1 \
   --payload "{\"site_id\":\"e2e-probe\",\"job_id\":\"$JOB\",\"purge_data\":true}" /tmp/undeploy.json
 ```
 
-**读回核对**（这四条全空才算站点侧干净）：`site-rt-*` 角色、DSQL 里 `site_%` 的 schema 与
-`sys.iam_pg_role_mappings`、前端桶的 `sites/` 前缀、`site-sites` 表里非 `DELETED` 的行。
+### ② 你会撞到的两处（都不是你做错了什么）
 
-### ② 再删脚本建的平台件（都不在栈里）
+**router 栈第一次 `delete-stack` 一定 `DELETE_FAILED`。** 分发已经删掉，但两个 Edge
+函数的**已发布版本**删不了：
 
-**下面这段保持 fail-fast**，只在"这东西本来就可能不存在"的调用上显式加 `|| true`
-（哪些是"可能不存在"写在各自行内）。**不要用 `set +e` 或"少写一个 `-e`"来对付它**：
-`set -uo pipefail` **不会关掉你 shell 里已有的 `-e`**（它只设 `-u` 和 `pipefail`），
-所以那种写法在"先跑过验收集那段 `set -euo pipefail`"的同一个 shell 里等于没写——
-一条预期内的失败就会让后面的 DSQL / 栈 / RETAIN 清理全部不执行。
-
-```bash
-set -euo pipefail
-
-# ── 这一节共用的容错 helper。**后面每个围栏块都假设它已定义**（同一个 shell 里跑）──
-# 为什么不是 `|| true`：那会把 AccessDenied、限流、参数错误、`ResourceInUseException`
-# 一起吞掉，于是「清理跑完了」与「什么都没清掉」在输出上没有区别。
-# 这里**只**吞服务明确说的"目标不存在"——那才是「组件没启用 / 上一次拆到一半」的合法形态。
-_is_absent_err() {
-  case "$1" in
-    *ResourceNotFoundException*|*NotFoundException*|*NoSuchEntity*|*NoSuchBucket*|\
-    *ParameterNotFound*|*RepositoryNotFoundException*|*ClusterNotFound*|*"does not exist"*)
-      return 0 ;;
-  esac
-  return 1
-}
-absent_ok() {                      # 只有"目标不存在"算成功，其它错误照常中止
-  local err rc=0
-  err="$("$@" 2>&1 >/dev/null)" || rc=$?
-  [ "$rc" -eq 0 ] && return 0
-  if _is_absent_err "$err"; then echo "  跳过（目标已不存在）: $*"; return 0; fi
-  printf '%s\n' "$err" >&2
-  return "$rc"
-}
-
-# MCP runtime + ECR 仓库
-absent_ok aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id <runtime_id> --region us-east-1
-absent_ok aws ecr delete-repository --repository-name site-builder-mcp --region us-east-1 --force
-
-# Lambda。**site-key-proxy 无条件列进来**：没启用过 ⑤c 时它不存在，`ok` 会吞掉。
-# 而 `site-auth-pre-token` 是 Cognito 触发器、**根本没有 Function URL**，
-# 所以那条 delete-function-url-config 必然失败（`2>/dev/null` 只藏 stderr、不改退出码）。
-for FN in site-panel site-auth-service site-auth-pre-token site-key-proxy; do
-  absent_ok aws lambda delete-function-url-config --function-name "$FN" --region us-east-1
-  absent_ok aws lambda delete-function --function-name "$FN" --region us-east-1
-done
-
-# IAM 角色：**必须先清 inline policy、detach 托管策略，否则 DeleteConflict**。
-# site-key-proxy-role（仅 ⑤c）与 site-builder-verifier（仅开过 [Verification]）
-# 同样无条件列出——不存在时两个 list 返回空、delete 被 ok 吞掉。
-for R in site-panel-role site-auth-service-role site-mcp-runtime-role \
-         site-key-proxy-role site-builder-verifier; do
-  for P in $(aws iam list-role-policies --role-name "$R" \
-              --query 'PolicyNames' --output text 2>/dev/null || true); do
-    absent_ok aws iam delete-role-policy --role-name "$R" --policy-name "$P"
-  done
-  for A in $(aws iam list-attached-role-policies --role-name "$R" \
-              --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null || true); do
-    absent_ok aws iam detach-role-policy --role-name "$R" --policy-arn "$A"
-  done
-  absent_ok aws iam delete-role --role-name "$R"
-done
-
-# 告警管道（**这条的真名容易猜错**）
-absent_ok aws cloudwatch delete-alarms --alarm-names site-builder-auth-invalid-grant --region us-east-1
-absent_ok aws sns delete-topic --topic-arn arn:aws:sns:us-east-1:{account_id}:site-builder-alarms
-
-# Cognito：**托管域名要先删才能删池**，两个池各一个（平台池 + 内置 IdP 池）
-absent_ok aws cognito-idp delete-user-pool-domain --domain <前缀> --user-pool-id <pool_id> --region us-east-1
-absent_ok aws cognito-idp delete-user-pool --user-pool-id <pool_id> --region us-east-1
-
-# SSM 参数：前两个总有；第三个只有启用过 ⑤c 才有（没有时 ok 吞掉）
-absent_ok aws ssm delete-parameter --name /site-builder/site-client-secret     --region us-east-1
-absent_ok aws ssm delete-parameter --name /site-builder/login-flow-secret      --region us-east-1
-absent_ok aws ssm delete-parameter --name /site-builder/machine-client-secret  --region us-east-1
+```
+ApplicationWebRouterStack | DELETE_FAILED
+"Lambda was unable to delete …:function:…-application-web-router:1 because it is a
+ replicated function. Please see our documentation for Deleting Lambda@Edge Functions
+ and Replicas."
 ```
 
-> `m5-edge-analytics-failed-global` 与 `m5-rollup-no-successful-invocation-24h`
-> **属于 deployer 栈**，别手工删（下一步会带走）。
+AWS 要**几个小时**才清完全球副本，而 CloudFormation 不等、当场失败。
+**立刻重试仍然失败**。过几小时重跑 `--yes --stage stacks` 即可（幂等）。
+stack policy 的 `Deny Update:*` **不拦 DeleteStack**，所以不需要先 `router_stack_policy.py open`。
 
-> **⚠️ 与 ⑤c 有关的那几项（`site-key-proxy` 函数、`site-key-proxy-role`、
-> `machine-client-secret`，以及 ⑤c 自己那节的 route 与哨兵行）没有在启用状态下实测过**
-> ——出口验收走的是推荐的 OAuth-only 形态。上面的命令对"不存在"是安全的，但启用过 ⑤c 的人
-> 拆除后请按下面「收尾核对」逐条读回。
-
-### ②b DSQL cluster（③ 手工建的，**不属于任何栈**）
-
-```bash
-set -euo pipefail                       # 承接上一块；absent_ok 已在 ② 定义
-CID=<cluster_id>
-
-# 站点侧的 schema / role / IAM 映射已在第 ① 步随 purge 清掉；这里删的是 cluster 本身。
-# **这一段要能安全重跑**：拆到一半再走一遍手册时 cluster 可能已经没了，而裸
-# delete-cluster 在 set -e 下会让脚本在删两个栈**之前**退出。
-# 0 = 确认已删（服务明确说 NotFound）；1 = 还在；2 = 读不出来且**不是** NotFound
-dsql_gone() {
-  local err
-  err="$(aws dsql get-cluster --identifier "$1" --region us-east-1 2>&1 >/dev/null)" && return 1
-  _is_absent_err "$err" && return 0
-  printf '%s\n' "$err" >&2
-  return 2
-}
-
-if aws dsql get-cluster --identifier "$CID" --region us-east-1 >/dev/null 2>&1; then
-  absent_ok aws dsql delete-cluster --identifier "$CID" --region us-east-1
-  for _ in $(seq 1 60); do                # 轮询到服务说 NotFound（约 10 分钟上限）
-    rc=0; dsql_gone "$CID" || rc=$?
-    if [ "$rc" -eq 0 ]; then echo "  cluster 已删除"; break; fi
-    if [ "$rc" -eq 2 ]; then
-      echo "  ⚠️ 读不出 cluster 状态，而且**不是** NotFound（报文见上）。" >&2
-      echo "     别当成已删除——先查清楚（凭据 / 限流），这一步没完成就不要往下删栈。" >&2
-      break
-    fi
-    sleep 10
-  done
-else
-  echo "  跳过（cluster 已不存在）"
-fi
-```
-
-`③` 建它时带的是 `--no-deletion-protection-enabled`（PoC 便于清理）；**开了删除保护的话
-要先关**，否则 `delete-cluster` 被拒。cluster 的 endpoint 是自己拼的，删掉之后
-`[DSQL] cluster_endpoint` 那一行就失效了。
-
-### ③ 删两个栈
-
-```bash
-aws cloudformation delete-stack --stack-name ApplicationWebRouterStack --region us-east-1
-aws cloudformation delete-stack --stack-name SiteDeployerStack        --region us-east-1
-```
-
-deployer 栈约 **10 分钟**走完（`site-artifacts-*` 桶由自定义资源自动清空删除）。
-
-> **⚠️ router 栈第一次一定失败，这不是你做错了什么。** 分发已经删掉，但两个 Edge 函数的
-> **已发布版本**删不掉：
->
-> ```
-> ApplicationWebRouterStack | DELETE_FAILED
-> "Lambda was unable to delete …:function:…-application-web-router:1 because it is a
->  replicated function. Please see our documentation for Deleting Lambda@Edge Functions
->  and Replicas."
-> ```
->
-> AWS 要**几个小时**才把全球副本清完，而 CloudFormation 不等、当场失败并停在
-> `DELETE_FAILED`（`Distribution` 那时已经是 `DELETE_COMPLETE`）。**立刻重试仍然失败**。
-> 处置：**过几小时再跑同一条 `delete-stack`**（幂等）。stack policy 的 `Deny Update:*`
-> **不拦 DeleteStack**，所以这一步不需要先 `router_stack_policy.py open`。
-
-### ④ 最后收孤儿（**这一步最容易漏，而且有一半是无声的**）
-
-栈删完之后 `RemovalPolicy.RETAIN` 的资源全部留在账号里：
-
-```bash
-set -euo pipefail
-# absent_ok 已在 ② 定义（同一个 shell）
-
-# 四张表（都带 deletion protection ⇒ 先关、**等它真的关完**、再删）。
-# ⚠️ `update-table` 是**异步**的：表会进 `UPDATING`，而 `UPDATING` 期间 `DeleteTable`
-#    返回 `ResourceInUseException`。"关保护紧接着删"是一个确定的竞态 ——
-#    而如果那条失败又被无差别吞掉，**四张表会全部留下而脚本报成功**。
-#    所以这里不用 absent_ok 兜删除，而是显式判存在 + 用 waiter 等状态。
-for T in site-access-daily site-admins site-api-keys site-ops-log; do
-  if ! aws dynamodb describe-table --table-name "$T" --region us-east-1 >/dev/null 2>&1; then
-    echo "  跳过（已不存在）: $T"; continue
-  fi
-  if [ "$(aws dynamodb describe-table --table-name "$T" --region us-east-1 \
-            --query 'Table.DeletionProtectionEnabled' --output text)" = "True" ]; then
-    aws dynamodb update-table --table-name "$T" --no-deletion-protection-enabled \
-      --region us-east-1 >/dev/null
-    aws dynamodb wait table-exists --table-name "$T" --region us-east-1   # 等回 ACTIVE
-  fi
-  aws dynamodb delete-table --table-name "$T" --region us-east-1 >/dev/null
-  aws dynamodb wait table-not-exists --table-name "$T" --region us-east-1 # 读回确认真删了
-  echo "  已删除: $T"
-done
-```
-
-**两把会话签名 CMK 是无声的那一半**：它们同样 RETAIN，但**别指望按 alias 找**——alias
-不是 RETAIN，已经随栈删掉了。只能按 description 认，然后排期删除：
-
-```bash
-for K in $(aws kms list-keys --region us-east-1 --query 'Keys[].KeyId' --output text); do
-  aws kms describe-key --key-id "$K" --region us-east-1 \
-    --query 'KeyMetadata.[KeyId,KeyState,Description]' --output text
-done | grep 'site-builder session signing key'
-aws kms schedule-key-deletion --key-id <每一把> --pending-window-in-days 7 --region us-east-1
-```
-
-不收它们的代价：每把 **$1/月永久**，而且账号里躺着两把"能签会话"形态、默认 key policy、
+**两把会话签名 CMK 是"无声"的那一半。** 它们是 `RETAIN`，但**别指望按 alias 找**
+——alias 不是 `RETAIN`，已经随栈删掉了，所以脚本按 **description** 认它们。
+不收的代价是每把 **$1/月永久**，而且账号里躺着两把"能签会话"形态、默认 key policy、
 不在任何 allowlist 也不在闸门基线里的非对称 CMK。
+（同一类孤儿在**部署**时也会出现：首建 Global Table 的 SLR 竞态让 ④ 整栈回滚，
+留下四张 RETAIN 表 + 这两把 CMK，见 ⑤d 的
+[首建 Global Table 的 SLR 传播竞态](#新账号首次部署会踩一次首建-global-table-的-slr-传播竞态)。）
 
-剩下的收尾（都不会自己走）：
+### ③ 脚本刻意不做的两件事
+
+- **Route53 里 `*.{base_domain}` 那条记录**（要 zone id 与记录内容；`DELETE` 时要把
+  `AliasTarget` 原样写回去）；
+- **`CDKToolkit` 栈与 `cdk-hnb659fds-assets-*` 桶** —— 只在"确认不再往这个账号部署"时删。
+
+### 收尾核对
+
+脚本退 0 已经意味着它探测过的东西都确认不在了。下面这几条是**独立的**读回，
+用来抓脚本射程之外的残留（尤其上面那两件手工项）：
 
 ```bash
-aws s3 rm s3://site-frontend-{account_id} --recursive     # ② 步骤 1 手工建的，不在栈里
-aws s3api delete-bucket --bucket site-frontend-{account_id} --region us-east-1
-# Route53 的 *.{base_domain} 记录（DELETE 时要把 AliasTarget 原样写回去）
-# 日志组：/aws/lambda/site-*、/aws/lambda/us-east-1.ApplicationWebRouterStack-*（Edge 的在这里）、
-#         /aws/codebuild/site-package、/aws/bedrock-agentcore/runtimes/*
-# 最后（确认不再部署了）：CDKToolkit 栈与 cdk-hnb659fds-assets-* 桶
-```
-
-**收尾核对**（**逐条都要看，漏掉的那几类正是最容易留孤儿的**）：
-
-```bash
-aws dynamodb list-tables --region us-east-1                        # 不该有 site-* 与路由表
+aws dynamodb list-tables --region us-east-1                         # 不该有 site-* 与路由表
 aws lambda   list-functions --region us-east-1 --query 'Functions[].FunctionName'
-aws cognito-idp list-user-pools --max-results 20 --region us-east-1 # 两个池都没了
-aws s3 ls                                                          # 无 site-frontend-* / site-artifacts-*
-aws kms list-keys --region us-east-1                               # 两把签名 CMK 应是 PendingDeletion
-aws iam list-roles  --query 'Roles[?starts_with(RoleName,`site-`)].RoleName' --output text
+aws cognito-idp list-user-pools --max-results 20 --region us-east-1  # 两个池都没了
+aws s3 ls                                                           # 无 site-frontend-* / site-artifacts-*
+aws kms list-keys --region us-east-1                                # 两把签名 CMK 应是 PendingDeletion
+aws iam list-roles --query 'Roles[?starts_with(RoleName,`site-`)].RoleName' --output text
 aws ssm describe-parameters --region us-east-1 \
     --query 'Parameters[?starts_with(Name,`/site-builder/`)].Name' --output text
-aws dsql list-clusters --region us-east-1                          # cluster 已删
-aws logs describe-log-groups --region us-east-1 \
-    --query 'logGroups[?starts_with(logGroupName,`/aws/lambda/site-`)].logGroupName' --output text
+aws dsql list-clusters --region us-east-1                           # cluster 已删
 aws cloudformation describe-stacks --region us-east-1 \
-    --query 'Stacks[].StackName' --output text                     # 只该剩 CDKToolkit（若还留着）
+    --query 'Stacks[].StackName' --output text                      # 只该剩 CDKToolkit（若还留着）
 ```
 
-前四条与 KMS 那条**都该是空的（或 PendingDeletion）**；IAM / SSM / DSQL / 日志组这四条
-**是原先漏掉的那几类**——它们不属于任何栈，没人会替你删。
 唯一预期的例外：Edge 那两个函数与路由表要等 router 栈那次重试才消失。
+
 
 ## 部署后回填检查清单
 
