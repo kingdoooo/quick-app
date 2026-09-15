@@ -899,16 +899,23 @@ def test_tagging_exception_is_not_treated_as_absent(harness):
 # 那条报文不在 NotFound 表里 ⇒ 会被正确判成 UNKNOWN 并 hard-stop，
 # 但漏在 orphans 里就意味着表、CMK、前端桶都已经删完了才失败（Codex 第六轮 P1-1）。
 # ---------------------------------------------------------------------------
-# 不带区也能用的服务。**每一条都是清空 AWS_REGION / AWS_DEFAULT_REGION / 配置文件后
-# 实测过的**（aws-cli 2.36.34），不是凭"听说是全局服务"：
-#   iam    全局端点 iam.amazonaws.com
-#   sts    有全局端点回退，实测正常返回身份
-#   s3/s3api 实测正常解析（get-bucket-location 正确报 NoSuchBucket）
-_REGIONLESS_OK = {"iam", "sts", "s3", "s3api"}
+# **不再维护"哪些服务不需要区"的白名单。** 上一轮那张表（iam/sts/s3/s3api）是我在
+# 自己这台机器、当前 endpoint 配置下实测出来的，而它是**环境性结论**：
+# 打开 `AWS_USE_FIPS_ENDPOINT=true` 且无默认区时，`sts get-caller-identity` 实测解析到
+#   Could not connect to the endpoint URL: "https://sts-fips.aws-global.amazonaws.com/"
+# 加 `--region us-east-1` 后立刻正常（Codex 第七轮 P1-1）。
+# 所以规则改成最简单也最强的一条：**这个脚本里每一次 aws 调用都必须显式带 --region**。
+# 对全局服务带上它是无害的，换来的是不依赖任何 endpoint 配置。
 
 
 def _logical_aws_lines():
-    """把续行拼起来、去掉注释，返回每条含 aws 调用的逻辑行。"""
+    """把续行拼起来、去掉注释，返回每条含 aws 调用的逻辑行。
+
+    **用正则 search，不能用 `" aws " in line`**：后者漏掉 `$(aws …)` 这种形态
+    （`aws` 前面是 `(` 不是空格）。上一版就是这么漏掉 `live="$(aws sts …)"` 的
+    ——Codex 把那一行变形成无区的 `$(aws ec2 describe-regions …)`，静态测试仍然全绿，
+    直接证明了扫描洞（第七轮 P1-1）。
+    """
     out, buf = [], ""
     for raw in _SCRIPT.read_text(encoding="utf-8").splitlines():
         if raw.lstrip().startswith("#"):
@@ -916,25 +923,35 @@ def _logical_aws_lines():
         buf += raw[:-1] + " " if raw.rstrip().endswith("\\") else raw
         if raw.rstrip().endswith("\\"):
             continue
-        if " aws " in f" {buf} ":
+        if _AWS_CALL.search(buf):
             out.append(buf)
         buf = ""
     return out
 
 
-def test_every_regional_call_passes_region():
-    """区域性服务的每一次调用都必须显式带 `--region`。"""
+def test_every_aws_call_passes_region():
+    """脚本里**每一次** aws 调用都必须显式带 `--region`。"""
     offenders = []
     for line in _logical_aws_lines():
-        for m in re.finditer(r"\baws\s+([a-z0-9-]+)\s+([a-z0-9-]+)", line):
-            service = m.group(1)
-            if service in _REGIONLESS_OK:
-                continue
-            if "--region" not in line:
-                offenders.append(f"{service} {m.group(2)}  <-  {line.strip()[:100]}")
+        if "--region" in line:
+            continue
+        m = _AWS_CALL.search(line)
+        offenders.append(f"{m.group(1)} {m.group(2)}  <-  {line.strip()[:100]}")
     assert offenders == [], (
-        "这些区域性服务调用没带 --region；没有 CLI 默认区的环境里它们会报 NoRegion，"
-        "而那会在**删过东西之后**才 hard-stop：\n  " + "\n  ".join(offenders))
+        "这些 aws 调用没带 --region。没有默认区、或开了 FIPS 端点的环境里它们会解析到"
+        "错误/不存在的端点，而那会在**删过东西之后**才 hard-stop：\n  "
+        + "\n  ".join(offenders))
+
+
+def test_the_scanner_actually_sees_command_substitution():
+    """元测试：扫描器必须看得见 `$(aws …)` 形态。
+
+    这条是上一版扫描洞的直接守卫——它一旦退回 `" aws " in line`，本条先红。
+    """
+    lines = _logical_aws_lines()
+    assert any("$(aws sts" in l for l in lines), (
+        "扫描器看不见 $(aws …)：那正是上一轮漏掉 sts 那一行的原因\n"
+        + "\n".join(lines[:5]))
 
 
 def test_region_enumeration_happens_in_preflight(harness):
@@ -952,3 +969,119 @@ def test_region_enumeration_failure_blocks_all_deletion(harness):
                                         "FAKE_FAIL_CODE": "AccessDeniedException"})
     assert proc.returncode != 0
     assert _destructive(calls) == [], _destructive(calls)
+
+
+# ---------------------------------------------------------------------------
+# 两条 JMESPath 查询：语法 + 语义都要验（Codex 第七轮 P2-3）
+#
+# 假 aws **不解析 JMESPath**，所以给 Q_EDGE_FAILED 多加一个 `]` 也照样全绿——
+# 语法错要到真机上才炸，而那时栈已经在删了。这里用真的 jmespath 库压住形状。
+#
+# 形状取自真机实测（Codex）：真实栈 10 个资源**全部没有** ResourceStatusReason 字段，
+# 两条原样查询在 `--output text` 下都返回 `0`。所以"缺字段"是常态而非边角。
+# ---------------------------------------------------------------------------
+_Q_RE = re.compile(r'^(Q_ALL_FAILED|Q_EDGE_FAILED)="(.*)"$', re.M)
+
+
+def _queries():
+    qs = dict(_Q_RE.findall(_SCRIPT.read_text(encoding="utf-8")))
+    assert set(qs) == {"Q_ALL_FAILED", "Q_EDGE_FAILED"}, (
+        f"抓不到那两条查询（它们必须各占一行、形如 Q_XXX=\"...\"）: {sorted(qs)}")
+    return qs
+
+
+_EDGE_REASON = ("Lambda was unable to delete arn:aws:lambda:us-east-1:1:function:f:1 "
+                "because it is a replicated function.")
+
+
+def test_both_queries_are_valid_jmespath():
+    """语法：两条查询必须能被 jmespath 编译。"""
+    import jmespath
+    for name, q in _queries().items():
+        try:
+            jmespath.compile(q)
+        except Exception as e:            # noqa: BLE001 - 要把 name 带进报文
+            raise AssertionError(f"{name} 不是合法 JMESPath: {e}\n{q}") from e
+
+
+@pytest.mark.parametrize("resources,want_all,want_edge,why", [
+    ([], 0, 0, "空栈"),
+    # 真机形状：资源在但都不是 DELETE_FAILED，且**没有** ResourceStatusReason 字段
+    ([{"ResourceStatus": "DELETE_COMPLETE", "LogicalResourceId": "X"}] * 10,
+     0, 0, "10 个资源、无失败、无 Reason 字段（Codex 真机实测的形状）"),
+    # 预期情况：两个 Edge 函数都因副本删不掉
+    ([{"ResourceStatus": "DELETE_FAILED", "LogicalResourceId": "OriginRequestFunction1A",
+       "ResourceStatusReason": _EDGE_REASON},
+      {"ResourceStatus": "DELETE_FAILED", "LogicalResourceId": "OriginResponseFunction2B",
+       "ResourceStatusReason": _EDGE_REASON}],
+     2, 2, "只有 Edge 副本 ⇒ 全等 ⇒ 记 INCOMPLETE 退 3"),
+    # 混合失败：那条 Edge 原因**不能**把桶非空盖过去
+    ([{"ResourceStatus": "DELETE_FAILED", "LogicalResourceId": "OriginRequestFunction1A",
+       "ResourceStatusReason": _EDGE_REASON},
+      {"ResourceStatus": "DELETE_FAILED", "LogicalResourceId": "ArtifactsBucket9Z",
+       "ResourceStatusReason": "The bucket you tried to delete is not empty"}],
+     2, 1, "混合 ⇒ 不等 ⇒ 必须 hard-stop"),
+    # **承重用例**：DELETE_FAILED 但完全没有 Reason 字段
+    ([{"ResourceStatus": "DELETE_FAILED", "LogicalResourceId": "OriginRequestFunction1A"}],
+     1, 0, "失败但无 Reason ⇒ 不许算成 Edge，且查询不能抛异常"),
+    # 逻辑 ID 不是 Edge 函数，但原因恰好含那句话 ⇒ 不算
+    ([{"ResourceStatus": "DELETE_FAILED", "LogicalResourceId": "SomethingElse7Q",
+       "ResourceStatusReason": _EDGE_REASON}],
+     1, 0, "原因像 Edge 但逻辑 ID 不是 ⇒ 不许算成 Edge"),
+])
+def test_query_semantics_on_real_shapes(resources, want_all, want_edge, why):
+    """语义：两条查询在各种真实形状上必须数对。
+
+    `want_all == want_edge != 0` 才是"预期的 Edge 副本失败"（退 3），其余一律 hard-stop。
+    """
+    import jmespath
+    qs = _queries()
+    data = {"StackResources": resources}
+    got_all = jmespath.search(qs["Q_ALL_FAILED"], data)
+    got_edge = jmespath.search(qs["Q_EDGE_FAILED"], data)
+    assert (got_all, got_edge) == (want_all, want_edge), (
+        f"{why}: 期望 (all={want_all}, edge={want_edge}) 实得 (all={got_all}, edge={got_edge})")
+
+
+def test_reason_null_guard_is_load_bearing():
+    """`ResourceStatusReason != null` 是**承重的**，不是防御性冗余。
+
+    真实栈里大量资源没有这个字段；jmespath 的 `&&` 短路，去掉守卫后
+    `contains(null, …)` 直接抛 JMESPathTypeError（jmespath 1.1.0 实测）。
+    这条把"守卫存在"和"去掉就炸"同时钉住——否则将来有人当冗余删掉，
+    上面那批用例里"无 Reason"那条会以异常而不是断言失败的形式暴露，读起来像测试坏了。
+    """
+    import jmespath
+    q = _queries()["Q_EDGE_FAILED"]
+    assert "ResourceStatusReason != null" in q, "承重守卫被删了"
+    data = {"StackResources": [{"ResourceStatus": "DELETE_FAILED",
+                                "LogicalResourceId": "OriginRequestFunction1A"}]}
+    assert jmespath.search(q, data) == 0          # 有守卫：正常返回 0
+    with pytest.raises(jmespath.exceptions.JMESPathTypeError):
+        jmespath.search(q.replace("ResourceStatusReason != null && ", ""), data)
+
+
+def test_single_stage_runs_do_not_need_describe_regions(harness):
+    """`ec2:DescribeRegions` 被拒时，不做跨区日志清理的单阶段仍必须能跑。
+
+    `--stage stacks` 是 runbook 推荐的 router 重试路径，它跟跨区日志毫无关系；
+    让它被一个用不到的权限卡住是过度耦合（Codex 第七轮 P2-2）。
+    """
+    for stage in ("scripts", "dsql", "stacks"):
+        proc, calls = harness("--yes", "--stage", stage,
+                              env={"FAKE_FAIL_ON": "ec2 describe-regions",
+                                   "FAKE_FAIL_CODE": "AccessDeniedException"})
+        assert proc.returncode == 0, (
+            f"--stage {stage} 被一个它用不到的权限卡住了:\n{proc.stdout}\n{proc.stderr}")
+        assert not any("ec2 describe-regions" in c for c in calls), (
+            f"--stage {stage} 仍然去枚举了区")
+
+
+def test_orphans_still_requires_describe_regions(harness):
+    """反面：`--stage orphans` 与完整运行**仍然**必须要求区列表可读，
+    否则其它区的 Edge 日志组会被静默留下。"""
+    for args in (("--yes", "--stage", "orphans"), ("--yes",)):
+        proc, calls = harness(*args, env={"FAKE_FAIL_ON": "ec2 describe-regions",
+                                          "FAKE_FAIL_CODE": "AccessDeniedException"})
+        assert proc.returncode != 0, f"{args} 竟然退 0:\n{proc.stdout}"
+        assert _destructive(calls) == [], _destructive(calls)

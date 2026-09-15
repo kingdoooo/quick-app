@@ -3371,9 +3371,12 @@ python3 -u site-builder/scripts/probe_impersonation_surface.py \
    `/aws/lambda/{区}.{栈名}-` 这种受栈名限定的名字——那个 Edge 前缀会把账号里
    别人的 Edge 函数（实测见过 `us-east-1.redirectEdge`）一起列出来。
 3. **`preflight` 是闸门，不是阶段。** 不论 `--stage` 给的是哪个，账号一致性、
-   "站点是否真的清空"、归属清单、跨区要扫的区列表都先查一遍（全是只读的）。
+   "站点是否真的清空"、归属清单都先查一遍（全是只读的）。
    **凡是后面步骤依赖的读取，都要在这里失败**——挪到后面就意味着表、CMK、前端桶
    都已经删掉了才发现读不到。
+   例外是**只在真要用时才取的**：跨区区列表（`ec2:DescribeRegions`）只有完整运行、
+   `--stage orphans`、`--stage preflight` 才枚举。所以缺这个权限时，
+   `--stage stacks`（runbook 推荐的 router 重试）照样跑得动 —— 它跟跨区日志无关。
 4. **异步操作要等到服务说完成。** 删栈、删 DSQL cluster、删 AgentCore runtime
    （文档写明返回 `HTTP/1.1 202`、状态 `DELETING`）、关表的删除保护，全都是异步的；
    发出请求 ≠ 做完了。等不到就非零退出，**不打印"完成"**。

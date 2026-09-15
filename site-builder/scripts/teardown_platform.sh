@@ -99,6 +99,19 @@ REGION="$(cfg "$SB_CFG" Platform region)"
 ROUTER_STACK="$(cfg "$RT_CFG" CDK stack_name)"; ROUTER_STACK="${ROUTER_STACK:-ApplicationWebRouterStack}"
 DEPLOYER_STACK="SiteDeployerStack"
 
+# ── 栈删除失败的分类查询（stage_stacks 用）──────────────────────────────────
+# **必须各占一行**：deployer/tests/test_teardown_platform.py 按 `^Q_ALL_FAILED=` /
+# `^Q_EDGE_FAILED=` 把它们抓出来，用 jmespath 库做语法 + 语义断言。
+# 为什么要那样测（Codex 第七轮 P2-3）：假 aws **不解析 JMESPath**，给 Q_EDGE_FAILED
+# 多加一个 `]` 照样全绿 —— 语法错在真机上才炸，而那时栈已经在删了。
+#
+# `ResourceStatusReason != null` 这一段是**承重的**，不是防御性冗余：真实栈里
+# 大量资源根本没有 ResourceStatusReason 字段（Codex 在真机上实测 10 个资源全都没有），
+# 而 jmespath 的 `&&` 短路——去掉这个守卫，`contains(null, …)` 直接抛
+# JMESPathTypeError（本地用 jmespath 1.1.0 实测过两种写法）。
+Q_ALL_FAILED="length(StackResources[?ResourceStatus=='DELETE_FAILED'])"
+Q_EDGE_FAILED="length(StackResources[?ResourceStatus=='DELETE_FAILED' && ResourceStatusReason != null && contains(ResourceStatusReason, 'replicated function') && (starts_with(LogicalResourceId, 'OriginRequestFunction') || starts_with(LogicalResourceId, 'OriginResponseFunction'))])"
+
 # ---------------------------------------------------------------- 三值探测
 # **这里是整个脚本的安全核心。** 只有服务明确说的 NotFound 才算 ABSENT；
 # 其余任何失败（AccessDenied、限流、参数错误、网络）都是 UNKNOWN，而 UNKNOWN 会 hard-stop。
@@ -214,7 +227,7 @@ want_stage() { [ -z "$ONLY_STAGE" ] || [ "$ONLY_STAGE" = "$1" ]; }
 stage_preflight() {
   step "preflight（闸门，--stage 不能绕）：凭据、账号、站点是否真的清空、归属清单"
   local live
-  live="$(aws sts get-caller-identity --query Account --output text)"
+  live="$(aws sts get-caller-identity --region "${REGION}" --query Account --output text)"
   [ "${live}" = "${ACCOUNT}" ] || die "凭据指向账号 ${live}，而 config.ini 写的是 ${ACCOUNT}。
 拆错账号是不可逆的——先切凭据或改 config。"
   log "  账号一致: ${ACCOUNT} / ${REGION}"
@@ -231,7 +244,7 @@ stage_preflight() {
   # 不与任何平台件同名，所以判据没有歧义。
   # DSQL schema 刻意不查：它随 stage_dsql 删掉整个 cluster 一起消失，不会变孤儿。
   local orphans=()
-  checked "per-site IAM 角色" aws iam list-roles \
+  checked "per-site IAM 角色" aws iam list-roles --region "${REGION}" \
     --query 'Roles[?starts_with(RoleName, `site-rt-`)].RoleName' --output text
   [ -n "${CHECKED_OUT}" ] && [ "${CHECKED_OUT}" != "None" ] && orphans+=("IAM 角色: ${CHECKED_OUT}")
   checked "per-site 数据表" aws dynamodb list-tables --region "${REGION}" \
@@ -254,19 +267,24 @@ $(printf '  · %s\n' "${orphans[@]}")
   # （Codex 第六轮 P1-1 的后半）：那一步在 orphans 末尾，等它失败时表、CMK、前端桶
   # 都已经删掉了。fail-closed 是对的，但应该 fail 得**早**。
   #
-  # `--region` 不能省：EC2 是区域性服务，没有 CLI 默认区时它报
-  # `An error occurred (NoRegion): You must specify a region.`（实测 aws-cli 2.36.34）。
-  # 那条报文不在 NotFound 表里 ⇒ 会被正确判成 UNKNOWN 并 hard-stop，
-  # 但在原来的位置上，hard-stop 发生在删完一堆东西之后。
-  checked "本账号已启用的区" aws ec2 describe-regions --region "${REGION}" \
-    --query 'Regions[].RegionName' --output text
-  ENABLED_REGIONS="${CHECKED_OUT}"
-  case "${ENABLED_REGIONS}" in
-    ""|None) die "枚举不到任何已启用的区（返回为空）。
+  # 但**只在真的要用它的时候取**（Codex 第七轮 P2-2）：只有 orphans 会跨区扫日志组。
+  # 无条件取会让 `ec2:DescribeRegions` 被拒时 scripts / dsql / stacks 三个单阶段
+  # 也全都进不去——而 runbook 推荐的 `--stage stacks`（router 重试）跟跨区日志毫无关系。
+  # "删东西之前失败"这条仍然成立：需要它的那一路，它仍然在任何删除之前就取。
+  case "${ONLY_STAGE}" in
+    ""|preflight|orphans)
+      checked "本账号已启用的区" aws ec2 describe-regions --region "${REGION}" \
+        --query 'Regions[].RegionName' --output text
+      ENABLED_REGIONS="${CHECKED_OUT}"
+      case "${ENABLED_REGIONS}" in
+        ""|None) die "枚举不到任何已启用的区（返回为空）。
 它决定了跨区那一路要扫哪些区，而「读到空清单」和「没有别的区」看起来一模一样
 ——后者会让其它区的 Edge 日志组被静默留下，所以这里不往下走。" ;;
+      esac
+      log "  已启用的区: $(printf '%s' "${ENABLED_REGIONS}" | wc -w | tr -d ' ') 个" ;;
+    *)
+      log "  跳过区枚举（--stage ${ONLY_STAGE} 不做跨区日志清理）" ;;
   esac
-  log "  已启用的区: $(printf '%s' "${ENABLED_REGIONS}" | wc -w | tr -d ' ') 个"
 }
 
 # preflight 取到的区列表，orphans 跨区清理时用
@@ -400,22 +418,22 @@ stage_scripts() {
   local role p a
   for role in site-panel-role site-auth-service-role site-mcp-runtime-role \
               site-key-proxy-role site-builder-verifier; do
-    if need_delete "IAM 角色 $role" aws iam get-role --role-name "$role"; then
+    if need_delete "IAM 角色 $role" aws iam get-role --role-name "$role" --region "${REGION}"; then
       # 这两个列举必须走 checked：读失败时若当成"没有策略"，下面的 delete-role 会
       # DeleteConflict，而在真机上那是一条含义完全不同的报错。
       checked "角色 ${role} 的 inline 策略" aws iam list-role-policies \
-        --role-name "${role}" --query 'PolicyNames' --output text
+        --role-name "${role}" --region "${REGION}" --query 'PolicyNames' --output text
       for p in ${CHECKED_OUT}; do
         [ "$p" = "None" ] && continue
-        run aws iam delete-role-policy --role-name "$role" --policy-name "$p"
+        run aws iam delete-role-policy --role-name "$role" --policy-name "$p" --region "${REGION}"
       done
       checked "角色 ${role} 的托管策略" aws iam list-attached-role-policies \
-        --role-name "${role}" --query 'AttachedPolicies[].PolicyArn' --output text
+        --role-name "${role}" --region "${REGION}" --query 'AttachedPolicies[].PolicyArn' --output text
       for a in ${CHECKED_OUT}; do
         [ "$a" = "None" ] && continue
-        run aws iam detach-role-policy --role-name "$role" --policy-arn "$a"
+        run aws iam detach-role-policy --role-name "$role" --policy-arn "$a" --region "${REGION}"
       done
-      run aws iam delete-role --role-name "$role"
+      run aws iam delete-role --role-name "$role" --region "${REGION}"
     fi
   done
 
@@ -544,18 +562,13 @@ wait_stack_deleted() {
         #  · 判据从"任一条匹配"换成"当前**所有** DELETE_FAILED 资源都必须是那两个 Edge
         #    函数、且原因都匹配"，逻辑 ID 也一起核（构造 ID 见 router 的 PROTECTED_CONSTRUCTS）。
         # 交给 JMESPath 数数，不在 bash 里切多行文本——原因串里带空格，切错就又是一次误判。
-        local q_all q_edge n_all n_edge
-        q_all="length(StackResources[?ResourceStatus=='DELETE_FAILED'])"
-        q_edge="length(StackResources[?ResourceStatus=='DELETE_FAILED'"
-        q_edge="${q_edge} && ResourceStatusReason != null"
-        q_edge="${q_edge} && contains(ResourceStatusReason, 'replicated function')"
-        q_edge="${q_edge} && (starts_with(LogicalResourceId, 'OriginRequestFunction')"
-        q_edge="${q_edge} || starts_with(LogicalResourceId, 'OriginResponseFunction'))])"
+        # 两条查询定义在文件顶部（单行），由测试用 jmespath 库做语法与语义断言。
+        local n_all n_edge
         checked "栈 ${st} 当前 DELETE_FAILED 的资源数" aws cloudformation describe-stack-resources \
-          --stack-name "${st}" --region "${REGION}" --query "${q_all}" --output text
+          --stack-name "${st}" --region "${REGION}" --query "${Q_ALL_FAILED}" --output text
         n_all="${CHECKED_OUT}"
         checked "栈 ${st} 里属于 Edge 副本的失败资源数" aws cloudformation describe-stack-resources \
-          --stack-name "${st}" --region "${REGION}" --query "${q_edge}" --output text
+          --stack-name "${st}" --region "${REGION}" --query "${Q_EDGE_FAILED}" --output text
         n_edge="${CHECKED_OUT}"
         if [ -n "${n_all}" ] && [ "${n_all}" != "0" ] && [ "${n_all}" = "${n_edge}" ]; then
           # 这一条是**预期**的：Lambda@Edge 的已发布版本要等全球副本清完才删得掉。
@@ -636,8 +649,8 @@ stage_orphans() {
   # `(NoSuchBucket) ... The specified bucket does not exist`，两条现成规则都能认。
   # 别名不存在的桶仍然会 403 Forbidden ⇒ 正确地落进 UNKNOWN。
   local bucket="site-frontend-$ACCOUNT"
-  if need_delete "前端桶 $bucket" aws s3api get-bucket-location --bucket "$bucket"; then
-    run aws s3 rm "s3://$bucket" --recursive
+  if need_delete "前端桶 $bucket" aws s3api get-bucket-location --bucket "$bucket" --region "${REGION}"; then
+    run aws s3 rm "s3://$bucket" --recursive --region "${REGION}"
     run aws s3api delete-bucket --bucket "$bucket" --region "$REGION"
   fi
 
