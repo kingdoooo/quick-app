@@ -26,8 +26,9 @@ DSQL 各一对），按串去重仍然只打第一次 ⇒ `wait_gone` 的 UNKNOW
     ④ 异步操作等到服务说完成才算完成；等不到就非零退出、不打印"完成"
 
 harness 用一个假的 `aws` 顶在 PATH 前面，把每次调用记进日志，并按 `FAKE_*` 注入故障。
-判"破坏性"用动词白名单（`_DESTRUCTIVE`），不是某条具体命令——将来加了新的删除动作
-也会自动进射程。
+判"破坏性"是 **fail-closed** 的：只读动词（get-/describe-/list-/head-/scan/wait/ls）
+显式列举，**其余一切默认破坏性**。所以将来加了新的删除动作会自动进射程；
+忘了登记也只会让它多被管一层，不会让它逃出去。
 """
 import os
 import re
@@ -44,12 +45,33 @@ import pytest
 _ROOT = Path(__file__).parents[3]
 _SCRIPT = _ROOT / "site-builder" / "scripts" / "teardown_platform.sh"
 
-# 破坏性动词。**按动词判而不是按整条命令**：新增一种删除动作时不必回来改这张表，
-# 漏改的后果恰恰是"新动作不在射程内"，而那正是这份测试要防的。
-_DESTRUCTIVE = (
-    "delete-", "schedule-key-deletion", "batch-delete-image",
-    "--no-deletion-protection-enabled", "detach-role-policy", " rm ",
-)
+# ── 只读 / 破坏性的判定：**fail-closed** ────────────────────────────────────
+# 原来是一张人工维护的"破坏性关键词表"（`delete-` / `schedule-key-deletion` / …）。
+# 它的失效方式是单向且无声的：**没进表的动作自动脱离射程**，于是
+# `lambda remove-permission` / `s3api abort-multipart-upload` / `iam put-role-policy`
+# 全都被判成"非破坏性"，"注入点之后没有破坏性调用"那条断言对它们形同不存在
+# （Codex 第十轮 P1-3；这与第四轮列举点脱靶是同一形状）。
+#
+# 改成反过来：**只读动词显式列举，其余一切默认破坏性**。新增一种删除动作不必回来改表，
+# 忘了改也只会让它进射程（安全方向），不会让它逃出去。
+_READONLY_PREFIXES = ("get-", "describe-", "list-", "head-")
+_READONLY_EXACT = ("scan", "wait", "ls")      # `aws s3 ls` 也是只读
+
+
+def _verb_of(call):
+    """call 可以是日志里的一行文本，也可以是 argv 列表。"""
+    parts = call.split() if isinstance(call, str) else list(call)
+    return parts[1] if len(parts) >= 2 else ""
+
+
+def _is_readonly(call) -> bool:
+    v = _verb_of(call)
+    return v.startswith(_READONLY_PREFIXES) or v in _READONLY_EXACT
+
+
+def _is_destructive(call) -> bool:
+    return bool(_verb_of(call)) and not _is_readonly(call)
+
 
 _ACCOUNT = "000000000000"
 _PRIMARY_REGION = "us-east-1"
@@ -353,7 +375,7 @@ def harness(tmp_path):
 
 
 def _destructive(calls):
-    return [c for c in calls if any(v in f" {c} " for v in _DESTRUCTIVE)]
+    return [c for c in calls if _is_destructive(c)]
 
 
 # ---------------------------------------------------------------------------
@@ -873,21 +895,41 @@ def test_teardown_section_documents_exit_code_3():
     assert "3" in sec and "还没完" in sec, "没交代「退 3 = 几小时后重跑」这件事"
 
 
+# 第 ① 步"站点下线"是**人的判断**，刻意留在手册里：它用 put-item 建 job 行 + invoke
+# 调 undeploy Lambda。fail-closed 分类下这两个动词也算"破坏性"（对的——它们确实会改状态），
+# 所以这里必须**显式**豁免，而不是像以前那样靠"它们恰好不在关键词表里"蒙过去。
+_DOC_ALLOWED = {("dynamodb", "put-item"), ("lambda", "invoke")}
+
+
 def test_teardown_section_has_no_copyable_destructive_commands():
-    """围栏块里不许再有破坏性动词——那些必须走脚本（脚本有三值探测 + hard-stop）。"""
+    """围栏块里不许再有可照抄的破坏性命令——那些必须走脚本（有三值探测 + hard-stop）。
+
+    判定用与 harness 同一套 fail-closed 分类：只读动词之外一律算破坏性。
+    """
     offenders = []
     for block in _fenced_bash(_teardown_section()):
         for line in block.splitlines():
             s = line.strip()
             if s.startswith("#") or not s:
                 continue
-            for verb in _DESTRUCTIVE:
-                if verb in f" {s} ":
+            for m in _AWS_CALL.finditer(s):
+                sv = (m.group(1), m.group(2))
+                if sv in _DOC_ALLOWED:
+                    continue
+                if not _is_readonly(f"{sv[0]} {sv[1]}"):
                     offenders.append(s)
                     break
     assert offenders == [], (
         "拆除一节的围栏块里又出现了可照抄的破坏性命令，请改为调用 "
         "scripts/teardown_platform.sh：\n  " + "\n  ".join(offenders))
+
+
+def test_doc_exemption_list_stays_minimal():
+    """豁免清单必须只有那两条——它是"手册里允许出现的写操作"的完整边界。
+
+    多一条就等于又开了一个可照抄的口子，而那正是前三轮 P1 的长发地。
+    """
+    assert _DOC_ALLOWED == {("dynamodb", "put-item"), ("lambda", "invoke")}, _DOC_ALLOWED
 
 
 def test_teardown_section_still_documents_the_two_unavoidable_pits():
@@ -1305,6 +1347,7 @@ def test_all_executed_queries_compile(harness):
 _FAIL_RCS = [
     pytest.param("255", id="rc255-waiter-timeout"),
     pytest.param("254", id="rc254-service-error"),
+    pytest.param("252", id="rc252-cli-parse-error"),
     pytest.param("1", id="rc1-generic-nonzero"),
 ]
 
@@ -1407,3 +1450,168 @@ def test_argv_log_round_trips_an_empty_argument(tmp_path):
     rows = [_split_argv(l) for l in
             Path(f"{log}.argv").read_text(encoding="utf-8").splitlines() if l.strip()]
     assert rows == [["iam", "list-roles", "--region", ""]], rows
+
+
+# ---------------------------------------------------------------------------
+# 目标标识符必须**精确**（Codex 第十轮 P1-2）
+#
+# region 那一轮的教训是"验参数存在不等于验值正确"，但当时只把它落到了 --region 上。
+# 把 `site-panel` 拼成 `site-pnael` 时 150 条全绿：stub 对任何名字都回 PRESENT，
+# 于是错名被删、真正的 panel 静默留下，真机上 get-function 会 NotFound ⇒ 跳过 ⇒ 退 0。
+#
+# 下面这张表是"脚本应该动哪些固定资源"的**独立陈述**：它不从脚本抽取，
+# 所以脚本改名时会红——那正是想要的。动态资源（日志组 / KMS key / site_id）
+# 由后面几条按"来源与删除目标一致"来验。
+# ---------------------------------------------------------------------------
+_EXPECTED_TARGETS = {
+    "--function-name": {"site-panel", "site-auth-service", "site-auth-pre-token",
+                        "site-key-proxy"},
+    "--role-name": {"site-panel-role", "site-auth-service-role", "site-mcp-runtime-role",
+                    "site-key-proxy-role", "site-builder-verifier"},
+    "--table-name": {"site-sites", "site-access-daily", "site-admins",
+                     "site-api-keys", "site-ops-log"},
+    "--stack-name": {_ROUTER_STACK, "SiteDeployerStack"},
+    "--repository-name": {"site-builder-mcp"},
+    "--repository-names": {"site-builder-mcp"},
+    "--bucket": {f"site-frontend-{_ACCOUNT}"},
+    "--alarm-names": {"site-builder-auth-invalid-grant"},
+    "--topic-arn": {f"arn:aws:sns:{_PRIMARY_REGION}:{_ACCOUNT}:site-builder-alarms"},
+    "--user-pool-id": {"us-east-1_platform", "us-east-1_idp"},
+    "--name": {"/site-builder/site-client-secret", "/site-builder/login-flow-secret",
+               "/site-builder/machine-client-secret"},
+    "--identifier": {"abcdefghij0123456789abcdef"},          # DSQL cluster（config 里那个）
+    "--agent-runtime-id": {"site_builder_deploy-AAAA"},
+}
+
+
+def test_fixed_resource_targets_are_exact(harness):
+    """每一次调用打的固定资源标识符都必须在预期集合里。"""
+    offenders = []
+    for name, env in _COLLECT_SCENARIOS.items():
+        harness("--yes", env=env)
+        for argv in harness.argv:
+            for i, a in enumerate(argv):
+                if a not in _EXPECTED_TARGETS or i + 1 >= len(argv):
+                    continue
+                got = argv[i + 1]
+                if got not in _EXPECTED_TARGETS[a]:
+                    offenders.append(f"[{name}] {a} {got!r}  <-  {' '.join(argv)[:90]}")
+    assert offenders == [], (
+        "这些调用打在了预期之外的目标上（名字拼错的症状：真机上判成「不存在」⇒ 静默留下真货）：\n  "
+        + "\n  ".join(sorted(set(offenders))))
+
+
+def test_every_expected_target_is_actually_touched(harness):
+    """正对照：预期集合里的每一个固定资源都必须真的被碰过。
+
+    少了这条，上面那条可以靠"脚本少删一堆东西"通过（漏删同样是缺陷）。
+    """
+    touched = {k: set() for k in _EXPECTED_TARGETS}
+    for env in _COLLECT_SCENARIOS.values():
+        harness("--yes", env=env)
+        for argv in harness.argv:
+            for i, a in enumerate(argv):
+                if a in touched and i + 1 < len(argv):
+                    touched[a].add(argv[i + 1])
+    missing = {k: sorted(v - touched[k]) for k, v in _EXPECTED_TARGETS.items()
+               if v - touched[k]}
+    assert not missing, f"这些预期资源一次都没被碰过（漏删？）: {missing}"
+
+
+def test_log_group_deletions_match_their_discovery_region(harness):
+    """日志组的删除区必须与它**被发现的区**一致。
+
+    上一版把**任何** `logs delete-log-group` 都当成"跨区操作"，于是本区的
+    `site-panel` 日志被错发到别的已启用区也照样通过（Codex 第十轮同类洞）。
+    判据：非主区的删除**只允许** Edge 形态的名字（`/aws/lambda/{主区}.`）——
+    那是唯一在每个执行区都有副本的东西；其余一律必须打在主区。
+    """
+    harness("--yes")
+    edge_prefix = f"/aws/lambda/{_PRIMARY_REGION}."
+    offenders = []
+    for argv in harness.argv:
+        if tuple(argv[:2]) != ("logs", "delete-log-group"):
+            continue
+        name = argv[argv.index("--log-group-name") + 1]
+        region = _regions_in(argv)[0]
+        if region == _PRIMARY_REGION:
+            continue
+        if not name.startswith(edge_prefix):
+            offenders.append(f"{name} 被删在 {region}，但它不是 Edge 副本形态")
+        elif region not in _REGIONS:
+            offenders.append(f"{name} 被删在 {region}，而它不在 DescribeRegions 结果里")
+    assert offenders == [], "\n  ".join(offenders)
+
+
+def test_kms_key_deletion_targets_come_from_the_listing(harness):
+    """动态资源：schedule-key-deletion 的 key 必须来自 list-keys 的输出。"""
+    harness("--yes")
+    listed, deleted = set(), set()
+    for argv in harness.argv:
+        if tuple(argv[:2]) == ("kms", "list-keys"):
+            listed.add("key-1")          # stub 的 list-keys 返回值
+        if tuple(argv[:2]) == ("kms", "schedule-key-deletion"):
+            deleted.add(argv[argv.index("--key-id") + 1])
+    assert deleted, "一把 key 都没排期删除 ⇒ 这条测试没在测东西"
+    assert deleted <= listed, f"删了没列举到的 key: {deleted - listed}"
+
+
+# ---------------------------------------------------------------------------
+# fail-closed 分类的元测试
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("call", [
+    "lambda remove-permission --function-name x",
+    "s3api abort-multipart-upload --bucket x",
+    "iam put-role-policy --role-name x",
+    "dynamodb update-table --table-name x",
+    "cloudfront update-distribution --id x",
+    "kms disable-key --key-id x",
+])
+def test_unknown_write_verbs_default_to_destructive(call):
+    """未登记的写操作必须**默认**算破坏性（Codex 第十轮 P1-3 点名的三个都在里面）。
+
+    人工关键词表的失效方式是单向且无声的：没进表的动作自动脱离射程。
+    """
+    assert _is_destructive(call), f"{call} 被判成非破坏性 ⇒ 它脱离了射程"
+
+
+@pytest.mark.parametrize("call", [
+    "iam get-role --role-name x", "dynamodb describe-table --table-name x",
+    "kms list-keys", "s3api head-bucket --bucket x", "dynamodb scan --table-name x",
+    "dynamodb wait table-not-exists --table-name x", "s3 ls",
+])
+def test_readonly_verbs_are_classified_readonly(call):
+    """反面：只读动词不能被误判成破坏性，否则"注入点之后无破坏性调用"会永远假红。"""
+    assert not _is_destructive(call), call
+
+
+def test_destructive_operations_actually_executed_are_the_expected_set(harness):
+    """脚本实际发出的破坏性操作集合必须**逐字**等于预期。
+
+    fail-closed 保证新动作不会脱离射程；这条再加一层：新增一种删除动作会让本条红，
+    强迫作者**有意识地**把它登记进来（而不是悄悄多删一样东西）。
+    """
+    got = set()
+    for env in _COLLECT_SCENARIOS.values():
+        harness("--yes", env=env)
+        for argv in harness.argv:
+            if _is_destructive(argv):
+                got.add(f"{argv[0]} {argv[1]}")
+    expected = {
+        "bedrock-agentcore-control delete-agent-runtime",
+        "ecr delete-repository",
+        "lambda delete-function-url-config", "lambda delete-function",
+        "iam delete-role-policy", "iam detach-role-policy", "iam delete-role",
+        "cloudwatch delete-alarms", "sns delete-topic",
+        "cognito-idp delete-user-pool-domain", "cognito-idp delete-user-pool",
+        "ssm delete-parameter",
+        "dsql delete-cluster",
+        "cloudformation delete-stack",
+        "dynamodb update-table", "dynamodb delete-table",
+        "kms schedule-key-deletion",
+        "s3 rm", "s3api delete-bucket",
+        "logs delete-log-group",
+    }
+    assert got == expected, (
+        f"多出来的: {sorted(got - expected)}\n少掉的: {sorted(expected - got)}")
