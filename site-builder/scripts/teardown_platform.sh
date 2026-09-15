@@ -209,6 +209,32 @@ wait_gone() {
 **没有确认删掉就不继续往下做**——过几分钟重跑本脚本（幂等）。"
 }
 
+# waited <描述> <aws … wait …> —— waiter 失败一律 hard-stop（不变量 ④）。
+#
+# waiter 没有"三值"可分：它要么等到了，要么超时 / 无权限 / 参数错。三种都不能往下走，
+# 所以这里不套 `checked`（那会把 NotFound 当成"没有"而继续）。
+#
+# 为什么要显式包一层，而不是靠 `set -e`（Codex 第八轮 P1-1）：
+# 裸写 `[ "$DRY_RUN" -eq 1 ] || aws dynamodb wait …` **确实**会被 set -e 拦住
+# （waiter 是 `||` 列表里的最后一条命令，实测退 1），所以当时的行为是对的——
+# 但**完全没有测试**：`_READ_VERB` 里没有 `wait`，两个 waiter 都不在射程内，
+# 给它们加个 `|| true` 全部 123 条照样全绿。靠"恰好正确"的 set -e 语义守一条
+# 不可逆操作前的闸门，是这七轮反复出问题的那种脆弱形态。包一层之后：
+# 报文有分类、失败点有名字，而且 waiter 进了故障注入射程。
+waited() {
+  local desc="$1"; shift
+  [ "${DRY_RUN}" -eq 1 ] && return 0
+  local ef rc=0
+  ef="$(mktemp "${TMPDIR:-/tmp}/teardown-wait.XXXXXX")"
+  "$@" >/dev/null 2>"${ef}" || rc=$?
+  local err; err="$(cat "${ef}")"; rm -f "${ef}"
+  [ "${rc}" -eq 0 ] && return 0
+  die "等「${desc}」失败：
+${err}
+waiter 失败可能是超时（东西还在），也可能是没权限读状态——两种都不能当成「已经好了」。
+后面还有别的破坏性步骤要建立在它之上，所以这里停。修掉原因重跑（幂等）。"
+}
+
 run() {   # 真正的破坏性调用都经这里；--dry-run 只打印
   if [ "$DRY_RUN" -eq 1 ]; then log "  [dry-run] $*"; return 0; fi
   log "  $*"
@@ -245,10 +271,10 @@ stage_preflight() {
   # DSQL schema 刻意不查：它随 stage_dsql 删掉整个 cluster 一起消失，不会变孤儿。
   local orphans=()
   checked "per-site IAM 角色" aws iam list-roles --region "${REGION}" \
-    --query 'Roles[?starts_with(RoleName, `site-rt-`)].RoleName' --output text
+    --query "Roles[?starts_with(RoleName, 'site-rt-')].RoleName" --output text
   [ -n "${CHECKED_OUT}" ] && [ "${CHECKED_OUT}" != "None" ] && orphans+=("IAM 角色: ${CHECKED_OUT}")
   checked "per-site 数据表" aws dynamodb list-tables --region "${REGION}" \
-    --query 'TableNames[?starts_with(@, `site-data-`)]' --output text
+    --query "TableNames[?starts_with(@, 'site-data-')]" --output text
   [ -n "${CHECKED_OUT}" ] && [ "${CHECKED_OUT}" != "None" ] && orphans+=("数据表: ${CHECKED_OUT}")
 
   if [ "${#orphans[@]}" -gt 0 ]; then
@@ -615,10 +641,10 @@ stage_orphans() {
       prot="${CHECKED_OUT}"
       if [ "$prot" = "True" ]; then
         run aws dynamodb update-table --table-name "$t" --no-deletion-protection-enabled --region "$REGION"
-        [ "$DRY_RUN" -eq 1 ] || aws dynamodb wait table-exists --table-name "$t" --region "$REGION"
+        waited "表 ${t} 退出 UPDATING" aws dynamodb wait table-exists --table-name "$t" --region "$REGION"
       fi
       run aws dynamodb delete-table --table-name "$t" --region "$REGION"
-      [ "$DRY_RUN" -eq 1 ] || aws dynamodb wait table-not-exists --table-name "$t" --region "$REGION"
+      waited "表 ${t} 消失" aws dynamodb wait table-not-exists --table-name "$t" --region "$REGION"
     fi
   done
 

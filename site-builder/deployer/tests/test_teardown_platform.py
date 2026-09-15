@@ -36,6 +36,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import warnings
 from pathlib import Path
 
 import pytest
@@ -116,6 +117,10 @@ stack_name = %s
 # ---------------------------------------------------------------------------
 _FAKE_AWS = r"""#!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FAKE_LOG"
+# 再写一份**真实 argv**（\t 分隔，一行一次调用）。`$*` 把引号拍平了：
+# 用它判 `--region` 会被行尾注释之类的东西骗过，也没法把带空格的 `--query` 原样取回来
+# （Codex 第八轮 P1-2 / P2-3 都是这么绕过去的）。argv 日志是"实际执行了什么"的唯一真源。
+{ printf '%s\t' "$@"; printf '\n'; } >> "$FAKE_LOG.argv"
 
 fail() { echo "An error occurred ($1) when calling the operation: injected" >&2; exit 254; }
 
@@ -230,8 +235,10 @@ case "$*" in
       if [ -n "${FAKE_ORPHAN_TABLES:-}" ]; then echo "site-data-demo-a1b2c3-notes"; else echo "None"; fi ;;
   *"scan --table-name site-sites"*)      echo "$FAKE_SITE_IDS" ;;
   *"Table.DeletionProtectionEnabled"*)   echo "True" ;;
-  *list-role-policies*)                  echo "None" ;;
-  *list-attached-role-policies*)         echo "None" ;;
+  # 回真的策略名，否则下面两条清理循环体永远不执行 ⇒ delete-role-policy /
+  # detach-role-policy 不在射程内（新加的可达性守卫抓到的）
+  *list-role-policies*)                  echo "inline-1" ;;
+  *list-attached-role-policies*)         echo "arn:aws:iam::aws:policy/Managed1" ;;
   *describe-alarms*)                     echo "site-builder-auth-invalid-grant" ;;
   *list-user-pools*)                     echo "us-east-1_idp" ;;
   *"UserPool.Domain"*)                   echo "some-prefix" ;;
@@ -311,8 +318,13 @@ def _build_sandbox(root: Path):
             ["bash", str(sb / "scripts" / "teardown_platform.sh"), *args],
             capture_output=True, text=True, env=e, cwd=str(root))
         calls = [l for l in log.read_text(encoding="utf-8").splitlines() if l.strip()]
+        argv_log = Path(f"{log}.argv")
+        run.argv = [[a for a in l.split("\t") if a]
+                    for l in (argv_log.read_text(encoding="utf-8").splitlines()
+                              if argv_log.exists() else []) if l.strip()]
         return proc, calls
 
+    run.argv = []
     return run
 
 
@@ -339,7 +351,10 @@ def _destructive(calls):
 # "源码里有、但任何场景都到不了"的读点（那种读点的故障行为完全没被验证过，
 # 而它看起来和"已覆盖"一模一样）。
 # ---------------------------------------------------------------------------
-_READ_VERB = re.compile(r"^(get|describe|list|head)-|^scan$")
+# `wait` 必须在里面（Codex 第八轮 P1-1）：`aws dynamodb wait table-not-exists` 是
+# 一次**读**（轮询状态），漏掉它等于两个 waiter 都不在故障注入射程内——
+# 给其中一个加 `|| true` 时全部 123 条照样全绿。
+_READ_VERB = re.compile(r"^(get|describe|list|head)-|^scan$|^wait$")
 _AWS_CALL = re.compile(r"\baws\s+([a-z0-9-]+)\s+([a-z0-9-]+)")
 
 # 收集射程用的场景：default 覆盖绝大多数，另两个把只在特定状态下才走到的读点造出来。
@@ -347,6 +362,14 @@ _COLLECT_SCENARIOS = {
     "default": {},
     "router-delete-failed": {"FAKE_ROUTER_DELETE_FAILED": "1"},
     "sites-table-gone": {"FAKE_ALL_ABSENT": "1"},
+    # 这两条走的是**死路**（栈分类判定为"不只是 Edge 副本"⇒ hard-stop）。
+    # 加它们是因为"失败明细"那第三次 describe-stack-resources 只在死路上被调用，
+    # 之前整个不在射程里，而源码交叉核对按 (服务, 动词) 被前两次计数查询掩盖了
+    # （Codex 第八轮 P2-4）。
+    "mixed-delete-failure": {"FAKE_ROUTER_DELETE_FAILED": "1",
+                             "FAKE_MIXED_DELETE_FAILURE": "1"},
+    "unexpected-delete-failure": {"FAKE_ROUTER_DELETE_FAILED": "1",
+                                  "FAKE_DELETE_FAILED_REASON": "bucket is not empty"},
 }
 
 
@@ -380,7 +403,25 @@ def _collect_read_points():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+_ALL_EXECUTED_ARGV: list = []
+
+
+def _collect_all_argv():
+    """把所有收集场景里**实际执行过的 argv** 汇总一份（可达性守卫用）。"""
+    tmp = Path(tempfile.mkdtemp(prefix="teardown-argv-"))
+    try:
+        run = _build_sandbox(tmp)
+        out = []
+        for env in _COLLECT_SCENARIOS.values():
+            run("--yes", env=env)
+            out.extend(run.argv)
+        return out
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 _READ_POINTS = _collect_read_points()
+_ALL_EXECUTED_ARGV = _collect_all_argv()
 _READ_POINT_IDS = sorted(_READ_POINTS)
 
 
@@ -466,6 +507,21 @@ def test_unknown_after_delete_is_a_hard_stop(harness, needle, stage):
     assert any("delete-" in c for c in calls), calls
     # 而且命中的确实是第二次
     assert len([c for c in calls if needle in c]) >= 2, calls
+
+
+def test_die_path_calls_are_in_range():
+    """元测试：只在**死路**上才发生的读调用也必须进射程。
+
+    栈分类的第三次 `describe-stack-resources`（失败明细）只在"不只是 Edge 副本 ⇒
+    hard-stop"那条路上被调用。之前它整个不在 `_READ_POINTS` 里，而源码交叉核对按
+    (服务, 动词) 被前两次计数查询掩盖了（Codex 第八轮 P2-4）。
+    所以这里按**调用点数量**核对：两条计数 + 一条明细 = 至少 3 个不同调用点。
+    """
+    dsr = {c for (c, _n) in _READ_POINTS if "describe-stack-resources" in c}
+    assert len(dsr) >= 3, (
+        "describe-stack-resources 只收到 %d 个调用点（应 ≥3：两条计数 + 一条失败明细）。"
+        "很可能是 _COLLECT_SCENARIOS 里少了走死路的场景：\n  %s"
+        % (len(dsr), "\n  ".join(sorted(dsr))))
 
 
 def test_post_delete_polls_are_separately_in_range():
@@ -929,18 +985,42 @@ def _logical_aws_lines():
     return out
 
 
-def test_every_aws_call_passes_region():
-    """脚本里**每一次** aws 调用都必须显式带 `--region`。"""
+def test_every_executed_call_passes_region(harness):
+    """**按真实 argv 判**：脚本实际发出的每一次 aws 调用都必须带 `--region`。
+
+    上一版是"整行文本里有没有 --region"，被两种方式绕过（Codex 第八轮 P1-2）：
+      · 行尾加个注释 `# --region "${REGION}"` 就算通过；
+      · 同一行上多条 aws 命令，一个 --region 能替其他几条冒充。
+    所以判据搬到 **argv** 上：`--region` 必须作为一个独立参数真的出现在那次调用里。
+    静态扫描降级为只负责"源码里有、但一次都没被执行到"的可达性（下一条）。
+    """
     offenders = []
-    for line in _logical_aws_lines():
-        if "--region" in line:
-            continue
-        m = _AWS_CALL.search(line)
-        offenders.append(f"{m.group(1)} {m.group(2)}  <-  {line.strip()[:100]}")
+    for name, env in _COLLECT_SCENARIOS.items():
+        harness("--yes", env=env)
+        for argv in harness.argv:
+            if "--region" not in argv:
+                offenders.append(f"[{name}] {' '.join(argv)[:110]}")
     assert offenders == [], (
-        "这些 aws 调用没带 --region。没有默认区、或开了 FIPS 端点的环境里它们会解析到"
-        "错误/不存在的端点，而那会在**删过东西之后**才 hard-stop：\n  "
-        + "\n  ".join(offenders))
+        "这些**实际执行**的 aws 调用没带 --region。没有默认区、或开了 FIPS 端点的环境里"
+        "它们会解析到错误/不存在的端点：\n  " + "\n  ".join(sorted(set(offenders))))
+
+
+def test_every_source_aws_call_is_actually_exercised():
+    """可达性：源码里每个 (服务, 动词) 都必须至少被某个场景真的执行过。
+
+    上一条只看得见"执行过的"调用，所以这条负责堵另一半：一个从没被执行到的调用，
+    argv 守卫看不见它，它也就没有任何证据说明自己是对的。
+    """
+    src = _SCRIPT.read_text(encoding="utf-8")
+    in_source = set()
+    for line in _logical_aws_lines():
+        for m in _AWS_CALL.finditer(line):
+            in_source.add((m.group(1), m.group(2)))
+    executed = {(a[0], a[1]) for a in _ALL_EXECUTED_ARGV if len(a) >= 2}
+    missing = sorted(f"{s} {v}" for s, v in in_source - executed)
+    assert missing == [], (
+        "这些调用在源码里，但任何收集场景都没真的执行到它 ⇒ 它们的参数与故障行为都没被验证：\n  "
+        + "\n  ".join(missing))
 
 
 def test_the_scanner_actually_sees_command_substitution():
@@ -1085,3 +1165,100 @@ def test_orphans_still_requires_describe_regions(harness):
                                           "FAKE_FAIL_CODE": "AccessDeniedException"})
         assert proc.returncode != 0, f"{args} 竟然退 0:\n{proc.stdout}"
         assert _destructive(calls) == [], _destructive(calls)
+
+
+# ---------------------------------------------------------------------------
+# 实际执行的 --query 必须就是顶部那两个常量（Codex 第八轮 P2-3）
+#
+# 上一版只验"顶部常量"是合法 JMESPath。把**实际调用**改成 `--query "length("`，
+# 11 条查询/栈分类测试照样全绿——常量于是退化成没人用的"证据摆件"。
+# 所以判据要落在 argv 上：真正传给 CLI 的那个字符串，必须等于常量、且能编译。
+# ---------------------------------------------------------------------------
+
+def _executed_queries(argv_rows, service_verb):
+    """从 argv 里取出某个操作实际用的 --query 值（原样，不经 `$*` 拍平）。"""
+    out = []
+    for argv in argv_rows:
+        if argv[:2] != service_verb.split():
+            continue
+        if "--query" in argv:
+            out.append(argv[argv.index("--query") + 1])
+    return out
+
+
+def test_executed_stack_queries_are_exactly_the_constants(harness):
+    """栈分类实际执行的 --query 必须**逐字**等于 Q_ALL_FAILED / Q_EDGE_FAILED，且可编译。"""
+    import jmespath
+    qs = _queries()
+    harness("--yes", env={"FAKE_ROUTER_DELETE_FAILED": "1", "FAKE_MIXED_DELETE_FAILURE": "1"})
+    executed = _executed_queries(harness.argv, "cloudformation describe-stack-resources")
+    assert executed, "一次 describe-stack-resources 都没执行到，这条测试就没在测东西"
+    known = set(qs.values())
+    # 第三次是"失败明细"查询：它不是那两个常量，但同样必须可编译
+    for q in executed:
+        jmespath.compile(q)          # 语法：编译不过直接抛
+    counts = [q for q in executed if q in known]
+    assert len(counts) >= 2, (
+        "实际执行的计数查询不是顶部那两个常量 —— 常量成了没人用的摆件：\n"
+        + "\n".join(f"  executed: {q}" for q in executed)
+        + "\n" + "\n".join(f"  constant: {q}" for q in sorted(known)))
+
+
+def test_all_executed_queries_compile(harness):
+    """兜底：**任何**操作实际用的 --query 都必须是合法 JMESPath。
+
+    这条不点名具体查询，所以将来新增带 --query 的调用会自动进射程。
+    """
+    import jmespath
+    bad = []
+    for name, env in _COLLECT_SCENARIOS.items():
+        harness("--yes", env=env)
+        for argv in harness.argv:
+            if "--query" not in argv:
+                continue
+            q = argv[argv.index("--query") + 1]
+            try:
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    jmespath.compile(q)
+                # 弃用告警也算失败：反引号字面量（`foo`）是 JMESPath 的**已弃用**写法，
+                # 标准写法是 raw string `'foo'`。留着它等于赌 CLI 自带的 jmespath 版本
+                # 永远不移除它；而查询一旦编译失败，preflight 的孤儿扫描就整块过不去。
+                for c in caught:
+                    bad.append(f"[{name}] {q}  -> {c.category.__name__}: {c.message}")
+            except Exception as e:                      # noqa: BLE001
+                bad.append(f"[{name}] {q}  -> {e}")
+    assert bad == [], "这些实际执行的 --query 不是合法 JMESPath:\n  " + "\n  ".join(bad)
+
+
+# ---------------------------------------------------------------------------
+# 两个 DynamoDB waiter（Codex 第八轮 P1-1）
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("waiter", ["table-exists", "table-not-exists"])
+def test_waiter_failure_is_a_hard_stop(harness, waiter):
+    """waiter 失败（超时 / 无权限）必须 hard-stop，且之后不再发任何破坏性调用。
+
+    这两处原先是裸 `[ "$DRY_RUN" -eq 1 ] || aws dynamodb wait …`。靠 set -e 恰好能停下来
+    （实测退 1），但 `_READ_VERB` 里没有 `wait` ⇒ 两个 waiter 都不在射程内，
+    给其中一个加 `|| true` 时 123 条全绿。现在走 `waited`，并且在射程内。
+    """
+    proc, calls = harness("--yes", "--stage", "orphans",
+                          env={"FAKE_FAIL_ON": f"dynamodb wait {waiter}",
+                               "FAKE_FAIL_CODE": "Waiter TableNotExists failed: Max attempts exceeded"})
+    assert proc.returncode != 0, f"waiter 失败却退 0:\n{proc.stdout}"
+    idx = next(i for i, c in enumerate(calls) if f"wait {waiter}" in c)
+    after = _destructive(calls[idx:])
+    assert after == [], f"waiter 失败之后仍发出破坏性调用: {after}"
+    assert "== 完成" not in proc.stdout, "waiter 没等到却打印了完成"
+
+
+def test_both_waiters_are_in_range():
+    """元测试：两个 waiter 都必须作为独立调用点进射程。
+
+    `_READ_VERB` 一旦漏掉 `wait`，本条先红。
+    """
+    waits = {c for (c, _n) in _READ_POINTS if " wait " in f" {c} "}
+    for w in ("table-exists", "table-not-exists"):
+        assert any(w in c for c in waits), (
+            f"waiter {w} 不在射程内:\n{sorted(waits)}")
