@@ -52,20 +52,21 @@ _DESTRUCTIVE = (
 )
 
 _ACCOUNT = "000000000000"
+_PRIMARY_REGION = "us-east-1"
 _ROUTER_STACK = "ApplicationWebRouterStack"
 _SITE_IDS = ("demo-a1b2c3", "shop-d4e5f6")
 # Edge 日志组在**每个执行区**都有一份；这里造三个区（含本区）来验跨区清理。
 _REGIONS = ("us-east-1", "us-west-2", "ap-northeast-1")
 # 归属清单内的 Edge 副本日志组（名字里的区是**归属区**，恒为 us-east-1）
-_OWNED_EDGE_LG = f"/aws/lambda/us-east-1.{_ROUTER_STACK}-application-web-router"
+_OWNED_EDGE_LG = f"/aws/lambda/{_PRIMARY_REGION}.{_ROUTER_STACK}-application-web-router"
 # 账号里别人的 Edge 函数：DEPLOY.md 实测记过这种（redirectEdge），**删它是事故**
-_FOREIGN_EDGE_LG = "/aws/lambda/us-east-1.redirectEdge"
+_FOREIGN_EDGE_LG = f"/aws/lambda/{_PRIMARY_REGION}.redirectEdge"
 
 _SB_CONFIG = """\
 [Platform]
 base_domain = example.com
 account_id = {account}
-region = us-east-1
+region = {region}
 admin_seed = admin@example.com
 
 [Cognito]
@@ -85,7 +86,7 @@ endpoint_url = https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/arn%3A
 [IdP]
 mode = cognito-admin
 cognito_user_pool_name = site-builder-idp
-""".format(account=_ACCOUNT)
+""".format(account=_ACCOUNT, region=_PRIMARY_REGION)
 
 _ROUTER_CONFIG = """\
 [AWS]
@@ -122,7 +123,12 @@ printf '%s\n' "$*" >> "$FAKE_LOG"
 # （Codex 第八轮 P1-2 / P2-3 都是这么绕过去的）。argv 日志是"实际执行了什么"的唯一真源。
 { printf '%s\t' "$@"; printf '\n'; } >> "$FAKE_LOG.argv"
 
-fail() { echo "An error occurred ($1) when calling the operation: injected" >&2; exit 254; }
+# 退出码要能注入（Codex 第九轮 P1-1）。真实 aws-cli 2.36.34 本地实测：
+#   服务返回错误 -> 254    waiter 失败 -> 255    CLI 解析失败 -> 252
+# 原来恒 254 ⇒ `waited` 对 255 的处理从没被打过：在它里面加一条
+# 「rc=255 直接成功返回」，waiter 专测加全读点注入共 76 条仍然全绿。
+fail() { echo "An error occurred ($1) when calling the operation: injected" >&2
+         exit "${FAKE_FAIL_RC:-254}"; }
 
 # 各 API "不存在"时**真 CLI 的报文形态**。别改成统一的 ResourceNotFoundException——
 # 那会把分类器的漏洞盖住（P2 就是这么漏的）。
@@ -263,12 +269,25 @@ exit 0
 
 
 _FAKE_ENV_KEYS = (
-    "FAKE_FAIL_ON", "FAKE_FAIL_ON_NTH", "FAKE_FAIL_CODE", "FAKE_ALL_ABSENT",
+    "FAKE_FAIL_ON", "FAKE_FAIL_ON_NTH", "FAKE_FAIL_CODE", "FAKE_FAIL_RC", "FAKE_ALL_ABSENT",
     "FAKE_ORPHAN_ROLES", "FAKE_ORPHAN_TABLES", "FAKE_UNOWNED_LOG_GROUP",
     "FAKE_ROUTER_DELETE_FAILED", "FAKE_DELETE_FAILED_REASON",
     "FAKE_MIXED_DELETE_FAILURE", "FAKE_STACK_NEVER_GONE", "FAKE_DSQL_NEVER_GONE",
     "FAKE_RUNTIME_NEVER_GONE", "FAKE_STATUS_STALE_ONCE", "FAKE_STATUS_STUCK",
 )
+
+
+def _split_argv(line: str) -> list:
+    """把 argv 日志的一行切回参数表，**保留空参数**。
+
+    `printf '%s\t' "$@"` 会在末尾多出一个空元素，只丢那一个。原来用 `if a` 过滤掉
+    全部空串，于是 `--region ""` 这种形态根本看不出来（Codex 第九轮 P1-2 的后半）。
+    参数本身含 `\t` 的情况本脚本不存在。
+    """
+    parts = line.split("\t")
+    if parts and parts[-1] == "":
+        parts.pop()
+    return parts
 
 
 def _build_sandbox(root: Path):
@@ -319,7 +338,7 @@ def _build_sandbox(root: Path):
             capture_output=True, text=True, env=e, cwd=str(root))
         calls = [l for l in log.read_text(encoding="utf-8").splitlines() if l.strip()]
         argv_log = Path(f"{log}.argv")
-        run.argv = [[a for a in l.split("\t") if a]
+        run.argv = [_split_argv(l)
                     for l in (argv_log.read_text(encoding="utf-8").splitlines()
                               if argv_log.exists() else []) if l.strip()]
         return proc, calls
@@ -985,24 +1004,67 @@ def _logical_aws_lines():
     return out
 
 
-def test_every_executed_call_passes_region(harness):
-    """**按真实 argv 判**：脚本实际发出的每一次 aws 调用都必须带 `--region`。
+# 跨区那一路是**唯一**允许打到非主区的：Edge 日志组在每个执行区各有一份。
+#   · `logs describe-log-groups --log-group-name-prefix …`（枚举别区的 Edge 日志）
+#   · `logs delete-log-group`（主区与别区都有）
+# 其余每一次调用都必须精确打在 config 的区上。
+def _is_cross_region_call(argv):
+    sv = tuple(argv[:2])
+    if sv == ("logs", "delete-log-group"):
+        return True
+    return sv == ("logs", "describe-log-groups") and "--log-group-name-prefix" in argv
 
-    上一版是"整行文本里有没有 --region"，被两种方式绕过（Codex 第八轮 P1-2）：
-      · 行尾加个注释 `# --region "${REGION}"` 就算通过；
-      · 同一行上多条 aws 命令，一个 --region 能替其他几条冒充。
-    所以判据搬到 **argv** 上：`--region` 必须作为一个独立参数真的出现在那次调用里。
-    静态扫描降级为只负责"源码里有、但一次都没被执行到"的可达性（下一条）。
+
+def _regions_in(argv):
+    return [argv[i + 1] if i + 1 < len(argv) else None
+            for i, a in enumerate(argv) if a == "--region"]
+
+
+def test_every_executed_call_targets_the_configured_region(harness):
+    """**按真实 argv 验目标区**：每一次调用恰好一个非空 `--region`，且值必须正确。
+
+    上一版只验"带没带 --region"，于是把 preflight 的 `dynamodb list-tables` 改成
+    `us-west-2` 时 139 条全绿（Codex 第九轮 P1-2，我复现过）。真机上那意味着
+    preflight 去**错误的区**找 site-data-*，找不到就放行后续拆除 —— 目标区的站点数据
+    表会被留成孤儿，而脚本一路退 0。
+
+    判据三条：
+      · 恰好一个 `--region`（多个的话谁生效取决于 CLI 解析顺序，不能靠猜）；
+      · 值非空（`--region ""` 会退化成"用默认区"）；
+      · 除跨区 Edge 日志那一路外，必须等于 config 的区；跨区那一路只允许
+        `DescribeRegions` 返回过的区。
     """
     offenders = []
     for name, env in _COLLECT_SCENARIOS.items():
         harness("--yes", env=env)
         for argv in harness.argv:
-            if "--region" not in argv:
-                offenders.append(f"[{name}] {' '.join(argv)[:110]}")
+            regions = _regions_in(argv)
+            head = f"[{name}] {' '.join(argv)[:100]}"
+            if len(regions) != 1:
+                offenders.append(f"{head}  -> {len(regions)} 个 --region")
+                continue
+            got = regions[0]
+            if not got:
+                offenders.append(f"{head}  -> --region 的值是空的")
+            elif _is_cross_region_call(argv):
+                if got not in _REGIONS:
+                    offenders.append(f"{head}  -> 跨区目标 {got!r} 不在 DescribeRegions 结果里")
+            elif got != _PRIMARY_REGION:
+                offenders.append(f"{head}  -> 打到了 {got!r}，应为 {_PRIMARY_REGION!r}")
     assert offenders == [], (
-        "这些**实际执行**的 aws 调用没带 --region。没有默认区、或开了 FIPS 端点的环境里"
-        "它们会解析到错误/不存在的端点：\n  " + "\n  ".join(sorted(set(offenders))))
+        "这些**实际执行**的调用没有精确打在配置的区上：\n  " + "\n  ".join(sorted(set(offenders))))
+
+
+def test_cross_region_calls_really_hit_other_regions(harness):
+    """正对照：跨区那一路确实打到了**别的**区。
+
+    少了这条，上面那条可以靠"所有调用都在主区"（= 跨区清理根本没发生）通过。
+    """
+    harness("--yes")
+    others = {r for argv in harness.argv if _is_cross_region_call(argv)
+              for r in _regions_in(argv) if r and r != _PRIMARY_REGION}
+    assert others, "没有任何调用打到非主区 ⇒ 跨区 Edge 日志清理没真的发生"
+    assert others <= set(_REGIONS), others
 
 
 def test_every_source_aws_call_is_actually_exercised():
@@ -1235,22 +1297,76 @@ def test_all_executed_queries_compile(harness):
 # 两个 DynamoDB waiter（Codex 第八轮 P1-1）
 # ---------------------------------------------------------------------------
 
+# 真实 aws-cli 的退出码（本地实测 2.36.34）：
+#   254 服务返回错误   255 waiter 失败 / 一般 CLI 错误   252 命令解析失败
+# **waiter 超时走的是 255，而 stub 原来恒 254** ⇒ `waited` 对 255 的处理从没被打过
+# （Codex 第九轮 P1-1：在 waited 里加一条「rc=255 直接成功返回」，76 条仍全绿）。
+# 控制流只依赖"非零"，所以三种码都要能打进来；英文报文不必精确模拟。
+_FAIL_RCS = [
+    pytest.param("255", id="rc255-waiter-timeout"),
+    pytest.param("254", id="rc254-service-error"),
+    pytest.param("1", id="rc1-generic-nonzero"),
+]
+
+
 @pytest.mark.parametrize("waiter", ["table-exists", "table-not-exists"])
-def test_waiter_failure_is_a_hard_stop(harness, waiter):
-    """waiter 失败（超时 / 无权限）必须 hard-stop，且之后不再发任何破坏性调用。
+@pytest.mark.parametrize("rc", _FAIL_RCS)
+def test_waiter_failure_is_a_hard_stop(harness, waiter, rc):
+    """waiter 失败（**任何**非零退出码）必须 hard-stop，且之后不再发任何破坏性调用。
 
     这两处原先是裸 `[ "$DRY_RUN" -eq 1 ] || aws dynamodb wait …`。靠 set -e 恰好能停下来
     （实测退 1），但 `_READ_VERB` 里没有 `wait` ⇒ 两个 waiter 都不在射程内，
-    给其中一个加 `|| true` 时 123 条全绿。现在走 `waited`，并且在射程内。
+    给其中一个加 `|| true` 时 123 条全绿。现在走 `waited`，并且逐个退出码都打一遍。
     """
     proc, calls = harness("--yes", "--stage", "orphans",
                           env={"FAKE_FAIL_ON": f"dynamodb wait {waiter}",
-                               "FAKE_FAIL_CODE": "Waiter TableNotExists failed: Max attempts exceeded"})
-    assert proc.returncode != 0, f"waiter 失败却退 0:\n{proc.stdout}"
+                               "FAKE_FAIL_RC": rc,
+                               "FAKE_FAIL_CODE": "Waiter failed: Max attempts exceeded"})
+    assert proc.returncode != 0, f"waiter 以 rc={rc} 失败却退 0:\n{proc.stdout}"
     idx = next(i for i, c in enumerate(calls) if f"wait {waiter}" in c)
     after = _destructive(calls[idx:])
     assert after == [], f"waiter 失败之后仍发出破坏性调用: {after}"
     assert "== 完成" not in proc.stdout, "waiter 没等到却打印了完成"
+
+
+@pytest.mark.parametrize("rc", _FAIL_RCS)
+def test_read_failure_hard_stops_regardless_of_exit_code(harness, rc):
+    """读取失败的分类只看**报文**，不看退出码——但那件事本身要有测试压住。
+
+    抽一个删除前的探测点打三种码：任何一种都必须 hard-stop。
+    """
+    proc, calls = harness("--yes", env={"FAKE_FAIL_ON": "iam list-roles",
+                                        "FAKE_FAIL_RC": rc,
+                                        "FAKE_FAIL_CODE": "AccessDeniedException"})
+    assert proc.returncode != 0, f"rc={rc} 时退 0:\n{proc.stdout}"
+    assert _destructive(calls) == [], _destructive(calls)
+
+
+def test_harness_can_actually_inject_each_exit_code(tmp_path):
+    """元测试：`FAKE_FAIL_RC` 真的改变了假 aws 的退出码。
+
+    **直接调假 aws**，不经脚本——脚本自己 die 时一律退 1，从它的退出码看不出注入有没有生效。
+    少了这条，上面两批用例可能只是把同一个 254 打了三遍，而那正是这一轮的缺陷本身。
+    """
+    aws = tmp_path / "aws"
+    aws.write_text(_FAKE_AWS, encoding="utf-8")
+    os.chmod(aws, 0o755)
+    # **每次换一个 FAKE_LOG**：nth-match 的计数落在 `$FAKE_LOG.match-count` 上，
+    # 复用同一个 log 会让第 2 次之后的调用不再命中（n≠1）。
+    for i, want in enumerate(("255", "254", "1")):
+        proc = subprocess.run(["bash", str(aws), "iam", "list-roles"],
+                              capture_output=True, text=True,
+                              env={**os.environ, "FAKE_LOG": str(tmp_path / f"log{i}"),
+                                   "FAKE_FAIL_ON": "iam list-roles",
+                                   "FAKE_FAIL_RC": want})
+        assert proc.returncode == int(want), (
+            f"注入 rc={want} 但假 aws 退了 {proc.returncode} —— FAKE_FAIL_RC 没生效")
+    # 不给 FAKE_FAIL_RC 时默认 254（服务错误，最常见的一种）
+    proc = subprocess.run(["bash", str(aws), "iam", "list-roles"],
+                          capture_output=True, text=True,
+                          env={**os.environ, "FAKE_LOG": str(tmp_path / "log-default"),
+                               "FAKE_FAIL_ON": "iam list-roles"})
+    assert proc.returncode == 254, proc.returncode
 
 
 def test_both_waiters_are_in_range():
@@ -1262,3 +1378,32 @@ def test_both_waiters_are_in_range():
     for w in ("table-exists", "table-not-exists"):
         assert any(w in c for c in waits), (
             f"waiter {w} 不在射程内:\n{sorted(waits)}")
+
+
+def test_argv_splitter_preserves_empty_arguments():
+    """`_split_argv` 必须保住空参数，只丢 printf 尾部那一个哨兵空元素。
+
+    这条是独立守卫：只靠"某处真的传了 `--region ''`"来间接发现它是不够的——
+    变形实测过，单独把切分改回 `[a for a in parts if a]` 时其余用例全绿。
+    """
+    assert _split_argv("iam\tlist-roles\t--region\t\t") == ["iam", "list-roles", "--region", ""]
+    assert _split_argv("a\tb\t") == ["a", "b"]
+    assert _split_argv("\t") == [""]        # 单个空参数
+    assert _split_argv("a\t\t\tb\t") == ["a", "", "", "b"]
+
+
+def test_argv_log_round_trips_an_empty_argument(tmp_path):
+    """端到端：假 aws 写出的 argv 日志里，空参数必须能被原样读回。
+
+    光测切分函数不够——写入侧（`printf '%s\t' "$@"`）也可能把空参数吃掉。
+    """
+    aws = tmp_path / "aws"
+    aws.write_text(_FAKE_AWS, encoding="utf-8")
+    os.chmod(aws, 0o755)
+    log = tmp_path / "log"
+    subprocess.run(["bash", str(aws), "iam", "list-roles", "--region", ""],
+                   capture_output=True, text=True,
+                   env={**os.environ, "FAKE_LOG": str(log)})
+    rows = [_split_argv(l) for l in
+            Path(f"{log}.argv").read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert rows == [["iam", "list-roles", "--region", ""]], rows
