@@ -249,7 +249,28 @@ $(printf '  · %s\n' "${orphans[@]}")
   log "  站点侧已清空（没有 site-rt-* 角色、没有 site-data-* 表）"
 
   build_ownership_inventory
+
+  # 跨区清理 Lambda@Edge 日志组要用的区列表。**在 preflight 就取**，不在 orphans 里现取
+  # （Codex 第六轮 P1-1 的后半）：那一步在 orphans 末尾，等它失败时表、CMK、前端桶
+  # 都已经删掉了。fail-closed 是对的，但应该 fail 得**早**。
+  #
+  # `--region` 不能省：EC2 是区域性服务，没有 CLI 默认区时它报
+  # `An error occurred (NoRegion): You must specify a region.`（实测 aws-cli 2.36.34）。
+  # 那条报文不在 NotFound 表里 ⇒ 会被正确判成 UNKNOWN 并 hard-stop，
+  # 但在原来的位置上，hard-stop 发生在删完一堆东西之后。
+  checked "本账号已启用的区" aws ec2 describe-regions --region "${REGION}" \
+    --query 'Regions[].RegionName' --output text
+  ENABLED_REGIONS="${CHECKED_OUT}"
+  case "${ENABLED_REGIONS}" in
+    ""|None) die "枚举不到任何已启用的区（返回为空）。
+它决定了跨区那一路要扫哪些区，而「读到空清单」和「没有别的区」看起来一模一样
+——后者会让其它区的 Edge 日志组被静默留下，所以这里不往下走。" ;;
+  esac
+  log "  已启用的区: $(printf '%s' "${ENABLED_REGIONS}" | wc -w | tr -d ' ') 个"
 }
+
+# preflight 取到的区列表，orphans 跨区清理时用
+ENABLED_REGIONS=""
 
 # ── 归属清单：只删证明得了是自己的东西（不变量 ②）────────────────────────────
 # 为什么需要（Codex 第四轮 P1-4，实测复现过）：日志组清理原先按 `/aws/lambda/site-*`
@@ -645,9 +666,9 @@ stage_orphans() {
   # 只按 Edge 前缀查，而且**仍然只删归属清单内的**：那个前缀会把账号里别人的 Edge
   # 函数一起列出来（DEPLOY.md 记过实测见到的 `us-east-1.redirectEdge`），
   # 对只读的聚合器那是可接受的代价，对**删除**则是事故。
-  checked "本账号已启用的区" aws ec2 describe-regions --query 'Regions[].RegionName' --output text
-  local regions="${CHECKED_OUT}" other elg
-  for other in ${regions}; do
+  # 区列表在 preflight 就取好了（见那里的注释：失败要发生在删任何东西之前）
+  local other elg
+  for other in ${ENABLED_REGIONS}; do
     [ "${other}" = "None" ] && continue
     [ "${other}" = "${REGION}" ] && continue
     checked "区 ${other} 里的 Edge 日志组" aws logs describe-log-groups --region "${other}" \

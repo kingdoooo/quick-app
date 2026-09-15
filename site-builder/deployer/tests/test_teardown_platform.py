@@ -11,8 +11,12 @@
 AccessDenied，五处全部退 0，其中四处还继续发出了破坏性调用。
 
 **第五轮又指出射程仍有偏差**：按 (服务, 动词) 去重，同一 API 出现在多个阶段时只注入到
-最先到达的那一处。所以现在射程按**调用点**枚举（`_collect_read_points`：先跑几个场景，
-把每一条实际发出的读调用连完整参数串一起收下来，逐个注入），源码扫描退居为覆盖率交叉核对。
+最先到达的那一处。改成按完整参数串枚举。
+
+**第六轮指出这还不够**：删除前的探测与删除后的轮询是**完全相同的命令串**（AgentCore 与
+DSQL 各一对），按串去重仍然只打第一次 ⇒ `wait_gone` 的 UNKNOWN 分支从没被打过。
+证据是一次存活的变形：把那条 UNKNOWN 改成 `return 0`，当时 104 条**全绿**。
+所以射程的键现在是 **(完整参数串, 第几次命中)**，stub 侧对应 `FAKE_FAIL_ON_NTH`。
 
 四条不变量（与脚本头部一一对应）：
 
@@ -141,13 +145,24 @@ absent() {
   exit 254
 }
 
+# FAKE_FAIL_ON_NTH：**第几次**命中才失败（默认 1 = 第一次）。
+# 为什么需要它：删除前的探测与删除后的轮询是**完全相同的命令串**
+# （AgentCore 与 DSQL 各一对），只按串注入永远打在第一次上，
+# `wait_gone` 里那条 UNKNOWN 分支于是从没被打过——实测把它改成 `return 0`
+# 全部 104 条仍然全绿（Codex 第六轮 P1-2）。
 if [ -n "${FAKE_FAIL_ON:-}" ] && [[ "$*" == *"$FAKE_FAIL_ON"* ]]; then
-  fail "${FAKE_FAIL_CODE:-AccessDeniedException}"
+  _cf="$FAKE_LOG.match-count"
+  _n=$(( $(cat "$_cf" 2>/dev/null || echo 0) + 1 ))
+  echo "$_n" > "$_cf"
+  if [ "$_n" -eq "${FAKE_FAIL_ON_NTH:-1}" ]; then
+    fail "${FAKE_FAIL_CODE:-AccessDeniedException}"
+  fi
 fi
 
 if [ -n "${FAKE_ALL_ABSENT:-}" ]; then
   case "$*" in
     *get-caller-identity*) echo "$FAKE_ACCOUNT" ;;
+    *describe-regions*)    echo "$FAKE_REGIONS" ;;
     *describe-table*|*get-function*|*get-role*|*get-parameter*|*describe-stacks*|\
     *describe-repositories*|*get-agent-runtime*|*get-cluster*|*describe-user-pool*|\
     *get-topic-attributes*|*get-bucket-location*) absent "$*" ;;
@@ -241,7 +256,7 @@ exit 0
 
 
 _FAKE_ENV_KEYS = (
-    "FAKE_FAIL_ON", "FAKE_FAIL_CODE", "FAKE_ALL_ABSENT",
+    "FAKE_FAIL_ON", "FAKE_FAIL_ON_NTH", "FAKE_FAIL_CODE", "FAKE_ALL_ABSENT",
     "FAKE_ORPHAN_ROLES", "FAKE_ORPHAN_TABLES", "FAKE_UNOWNED_LOG_GROUP",
     "FAKE_ROUTER_DELETE_FAILED", "FAKE_DELETE_FAILED_REASON",
     "FAKE_MIXED_DELETE_FAILURE", "FAKE_STACK_NEVER_GONE", "FAKE_DSQL_NEVER_GONE",
@@ -341,16 +356,25 @@ def _is_read_call(call: str) -> bool:
 
 
 def _collect_read_points():
-    """跑几个场景，收集每一条实际发出的读调用（完整参数串）→ 到达它需要哪个场景。"""
+    """跑几个场景，收集**每一次**读调用 → (完整参数串, 第几次命中) → 需要哪个场景。
+
+    **为什么键里必须带"第几次"**（Codex 第六轮 P1-2）：删除前的探测与删除后的轮询
+    是完全相同的命令串（AgentCore 与 DSQL 各一对），只按串去重就只会打到第一次，
+    于是 `wait_gone` 里那条 UNKNOWN 分支从没被打过——实测把它改成 `return 0`，
+    当时全部 104 条仍然全绿。带上次序之后，删除后那一次是独立的注入点。
+    """
     tmp = Path(tempfile.mkdtemp(prefix="teardown-scope-"))
     try:
         run = _build_sandbox(tmp)
         points = {}
         for name, env in _COLLECT_SCENARIOS.items():
             _, calls = run("--yes", env=env)
+            seen = {}
             for c in calls:
-                if _is_read_call(c) and c not in points:
-                    points[c] = name
+                if not _is_read_call(c):
+                    continue
+                seen[c] = seen.get(c, 0) + 1
+                points.setdefault((c, seen[c]), name)
         return points
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -360,11 +384,13 @@ _READ_POINTS = _collect_read_points()
 _READ_POINT_IDS = sorted(_READ_POINTS)
 
 
-def _short_id(call: str) -> str:
-    """短 id：服务 动词 + 第一个具体取值（表名/角色名/函数名…）。"""
+def _short_id(point) -> str:
+    """短 id：服务 动词 + 第一个具体取值 + 第几次。"""
+    call, nth = point
     parts = call.split()
     tail = next((p for p in parts[2:] if not p.startswith("--")), "")
-    return "-".join(p for p in (parts[0], parts[1], tail) if p)[:70]
+    base = "-".join(p for p in (parts[0], parts[1], tail) if p)[:64]
+    return f"{base}#{nth}"
 
 
 def test_scope_collection_actually_found_the_call_points():
@@ -374,9 +400,10 @@ def test_scope_collection_actually_found_the_call_points():
     `describe-table` 至少 5 处（sites 表 + 四张 RETAIN 表），`get-role` 至少 5 处。
     """
     assert len(_READ_POINTS) >= 40, f"只收到 {len(_READ_POINTS)} 个调用点:\n{_READ_POINT_IDS}"
-    tables = [c for c in _READ_POINTS if "dynamodb describe-table" in c]
+    calls = [c for (c, _n) in _READ_POINTS]
+    tables = [c for c in calls if "dynamodb describe-table" in c]
     assert len(tables) >= 5, f"describe-table 的调用点没被分开:\n{tables}"
-    roles = [c for c in _READ_POINTS if "iam get-role " in c]
+    roles = [c for c in calls if "iam get-role " in c]
     assert len(roles) >= 5, f"get-role 的调用点没被分开:\n{roles}"
 
 
@@ -385,34 +412,71 @@ def test_source_scan_has_no_read_point_outside_the_range():
     src = _SCRIPT.read_text(encoding="utf-8")
     in_source = {(s, v) for s, v in _AWS_CALL.findall(src) if _READ_VERB.match(v)}
     assert len(in_source) >= 15, in_source
+    calls = [c for (c, _n) in _READ_POINTS]
     missing = [f"{s} {v}" for s, v in sorted(in_source)
-               if not any(f"{s} {v}" in c for c in _READ_POINTS)]
+               if not any(f"{s} {v}" in c for c in calls)]
     assert missing == [], (
         "这些读点在源码里，但任何场景都没跑到 ⇒ 它们的故障行为没被验证过。"
         "给 _COLLECT_SCENARIOS 加个能到达它的场景，或确认它是死代码：\n  "
         + "\n  ".join(missing))
 
 
-@pytest.mark.parametrize("needle", _READ_POINT_IDS, ids=_short_id)
-def test_every_read_point_hard_stops_on_non_notfound(harness, needle):
-    """不变量 ①：**每一个调用点**上的非 NotFound 故障都必须非零退出，
-    且注入点之后没有任何破坏性调用。
+@pytest.mark.parametrize("point", _READ_POINT_IDS, ids=_short_id)
+def test_every_read_point_hard_stops_on_non_notfound(harness, point):
+    """不变量 ①：**每一个调用点（含删除后轮询那一次）**上的非 NotFound 故障都必须
+    非零退出，且注入点之后没有任何破坏性调用。
 
     **只打一种错误码**（AccessDenied），不是省事：错误码唯一起作用的地方是
     `_is_absent_err`，它对码的分类由 `test_probe_classifies_only_notfound_as_absent`
     在最小单位上逐码断言，`test_non_notfound_error_stops_later_stages_too` 再跑一遍四种码。
     在这里乘以码数只会把套件墙钟翻倍（实测 2 分钟 → 4 分半），不增加任何覆盖。
     """
-    code = "AccessDeniedException"
-    env = {"FAKE_FAIL_ON": needle, "FAKE_FAIL_CODE": code}
-    env.update(_COLLECT_SCENARIOS[_READ_POINTS[needle]])
+    needle, nth = point
+    env = {"FAKE_FAIL_ON": needle, "FAKE_FAIL_ON_NTH": str(nth),
+           "FAKE_FAIL_CODE": "AccessDeniedException"}
+    env.update(_COLLECT_SCENARIOS[_READ_POINTS[point]])
     proc, calls = harness("--yes", env=env)
-    idx = next((i for i, c in enumerate(calls) if needle in c), None)
-    assert idx is not None, "注入点没被调用到:\n" + "\n".join(calls)
+    hits = [i for i, c in enumerate(calls) if needle in c]
+    assert len(hits) >= nth, (
+        f"第 {nth} 次命中没发生（只命中 {len(hits)} 次）:\n" + "\n".join(calls))
+    idx = hits[nth - 1]
     assert proc.returncode != 0, (
-        f"{needle} 遇到 {code} 却退 0 —— UNKNOWN 被当成了 ABSENT\n{proc.stdout}")
+        f"{needle}（第 {nth} 次）遇到 AccessDenied 却退 0 —— UNKNOWN 被当成了 ABSENT\n{proc.stdout}")
     after = _destructive(calls[idx:])
-    assert after == [], f"{needle} 在 {code} 之后仍发出破坏性调用: {after}"
+    assert after == [], f"{needle}（第 {nth} 次）之后仍发出破坏性调用: {after}"
+
+
+@pytest.mark.parametrize("needle,stage", [
+    ("bedrock-agentcore-control get-agent-runtime", "scripts"),
+    ("dsql get-cluster", "dsql"),
+])
+def test_unknown_after_delete_is_a_hard_stop(harness, needle, stage):
+    """点名钉住 `wait_gone` 的 UNKNOWN 分支：**删除请求已经发出之后**读不到状态，
+    必须 hard-stop，不能当成"删成功了"。
+
+    这两处是删除前探测与删除后轮询用同一条命令的地方，所以只按命令串注入打不到
+    第二次——那正是这条不变量长期没被验证的原因。
+    """
+    proc, calls = harness("--yes", "--stage", stage,
+                          env={"FAKE_FAIL_ON": needle, "FAKE_FAIL_ON_NTH": "2",
+                               "FAKE_FAIL_CODE": "AccessDeniedException"})
+    assert proc.returncode != 0, (
+        f"删除后读不到 {needle} 的状态却退 0 —— 那是把 UNKNOWN 当成删成功\n{proc.stdout}")
+    # 删除请求本身应该已经发出（否则这条测的不是"删除后"）
+    assert any("delete-" in c for c in calls), calls
+    # 而且命中的确实是第二次
+    assert len([c for c in calls if needle in c]) >= 2, calls
+
+
+def test_post_delete_polls_are_separately_in_range():
+    """元测试：那两对"删除前/删除后同一条命令"必须各自以第 2 次出现在射程里。
+
+    少了这条，射程一旦退回按命令串去重，`wait_gone` 的 UNKNOWN 分支会再次静默失守。
+    """
+    seconds = {c for (c, n) in _READ_POINTS if n >= 2}
+    for must in ("bedrock-agentcore-control get-agent-runtime", "dsql get-cluster"):
+        assert any(must in c for c in seconds), (
+            f"{must} 的删除后轮询没作为独立注入点进射程:\n{sorted(seconds)}")
 
 
 # ---------------------------------------------------------------------------
@@ -824,3 +888,67 @@ def test_tagging_exception_is_not_treated_as_absent(harness):
     assert proc.returncode != 0, (
         "标签异常被当成了「池不存在」 ⇒ 池漏删而整轮退 0\n" + proc.stdout)
     assert not any("delete-user-pool" in c for c in calls), calls
+
+
+# ---------------------------------------------------------------------------
+# 静态守卫：区域性服务的每一次调用都必须显式带 --region
+#
+# 假 aws 不关心 --region，所以这条缺陷**注入不出来**，只能静态查。
+# `ec2 describe-regions` 曾漏掉它：没有 CLI 默认区的合法环境里真 CLI 报
+# `An error occurred (NoRegion): You must specify a region.`（实测 aws-cli 2.36.34）。
+# 那条报文不在 NotFound 表里 ⇒ 会被正确判成 UNKNOWN 并 hard-stop，
+# 但漏在 orphans 里就意味着表、CMK、前端桶都已经删完了才失败（Codex 第六轮 P1-1）。
+# ---------------------------------------------------------------------------
+# 不带区也能用的服务。**每一条都是清空 AWS_REGION / AWS_DEFAULT_REGION / 配置文件后
+# 实测过的**（aws-cli 2.36.34），不是凭"听说是全局服务"：
+#   iam    全局端点 iam.amazonaws.com
+#   sts    有全局端点回退，实测正常返回身份
+#   s3/s3api 实测正常解析（get-bucket-location 正确报 NoSuchBucket）
+_REGIONLESS_OK = {"iam", "sts", "s3", "s3api"}
+
+
+def _logical_aws_lines():
+    """把续行拼起来、去掉注释，返回每条含 aws 调用的逻辑行。"""
+    out, buf = [], ""
+    for raw in _SCRIPT.read_text(encoding="utf-8").splitlines():
+        if raw.lstrip().startswith("#"):
+            continue
+        buf += raw[:-1] + " " if raw.rstrip().endswith("\\") else raw
+        if raw.rstrip().endswith("\\"):
+            continue
+        if " aws " in f" {buf} ":
+            out.append(buf)
+        buf = ""
+    return out
+
+
+def test_every_regional_call_passes_region():
+    """区域性服务的每一次调用都必须显式带 `--region`。"""
+    offenders = []
+    for line in _logical_aws_lines():
+        for m in re.finditer(r"\baws\s+([a-z0-9-]+)\s+([a-z0-9-]+)", line):
+            service = m.group(1)
+            if service in _REGIONLESS_OK:
+                continue
+            if "--region" not in line:
+                offenders.append(f"{service} {m.group(2)}  <-  {line.strip()[:100]}")
+    assert offenders == [], (
+        "这些区域性服务调用没带 --region；没有 CLI 默认区的环境里它们会报 NoRegion，"
+        "而那会在**删过东西之后**才 hard-stop：\n  " + "\n  ".join(offenders))
+
+
+def test_region_enumeration_happens_in_preflight(harness):
+    """区列表必须在 preflight 就取到——失败要发生在删任何东西**之前**。"""
+    proc, calls = harness("--yes", "--stage", "preflight")
+    assert proc.returncode == 0, proc.stderr
+    assert any("ec2 describe-regions" in c for c in calls), (
+        "preflight 没枚举区列表 ⇒ 它又回到 orphans 里现取，那时表/CMK/桶已经删了")
+    assert _destructive(calls) == []
+
+
+def test_region_enumeration_failure_blocks_all_deletion(harness):
+    """区列表读不到 ⇒ 一条破坏性调用都不许发出。"""
+    proc, calls = harness("--yes", env={"FAKE_FAIL_ON": "ec2 describe-regions",
+                                        "FAKE_FAIL_CODE": "AccessDeniedException"})
+    assert proc.returncode != 0
+    assert _destructive(calls) == [], _destructive(calls)
