@@ -83,6 +83,10 @@ _REGIONS = ("us-east-1", "us-west-2", "ap-northeast-1")
 _OWNED_EDGE_LG = f"/aws/lambda/{_PRIMARY_REGION}.{_ROUTER_STACK}-application-web-router"
 # 账号里别人的 Edge 函数：DEPLOY.md 实测记过这种（redirectEdge），**删它是事故**
 _FOREIGN_EDGE_LG = f"/aws/lambda/{_PRIMARY_REGION}.redirectEdge"
+# 账号里的 KMS key：两把真的会话签名 key（site / console 两个 family）、
+# 一把外来 key、一把已经在排期删除的。只有前两把该被 schedule-key-deletion。
+_KMS_KEYS = ("key-site-1", "key-site-2", "key-foreign", "key-pending")
+_KMS_SHOULD_SCHEDULE = {"key-site-1", "key-site-2"}
 
 _SB_CONFIG = """\
 [Platform]
@@ -270,8 +274,17 @@ case "$*" in
   *describe-alarms*)                     echo "site-builder-auth-invalid-grant" ;;
   *list-user-pools*)                     echo "us-east-1_idp" ;;
   *"UserPool.Domain"*)                   echo "some-prefix" ;;
-  *list-keys*)                           echo "key-1" ;;
-  *describe-key*)                        echo -e "Enabled\tsite-builder session signing key site-rs-v1" ;;
+  # 真实部署里**至少两把** CMK（site / console 两个 key family）。夹具必须能区分
+  # "两把都删了"和"删了第一把就 break"（Codex 第十一轮 P1-2）。
+  # 另外放一把外来 key 与一把已排期的，验"不该动的不动"。
+  *list-keys*)                           echo "$FAKE_KMS_KEYS" ;;
+  *describe-key*)
+      case "$*" in
+        *key-site-1*) echo -e "Enabled\tsite-builder session signing key site-rs-v1" ;;
+        *key-site-2*) echo -e "Enabled\tsite-builder session signing key console-rs-v1" ;;
+        *key-pending*) echo -e "PendingDeletion\tsite-builder session signing key site-rs-v0" ;;
+        *)            echo -e "Enabled\tsomebody elses key" ;;
+      esac ;;
   *describe-regions*)                    echo "$FAKE_REGIONS" ;;
   # 带 --log-group-name-prefix 的那次是**跨区扫 Edge 副本**：只回 Edge 形态的名字，
   # 其中一个是别人的（DEPLOY.md 实测见过 redirectEdge）——它必须不被删。
@@ -345,6 +358,7 @@ def _build_sandbox(root: Path):
         e["FAKE_ROUTER_STACK"] = _ROUTER_STACK
         e["FAKE_SITE_IDS"] = " ".join(_SITE_IDS)
         e["FAKE_REGIONS"] = " ".join(_REGIONS)
+        e["FAKE_KMS_KEYS"] = " ".join(_KMS_KEYS)
         e["FAKE_OWNED_EDGE_LG"] = _OWNED_EDGE_LG
         e["FAKE_FOREIGN_EDGE_LG"] = _FOREIGN_EDGE_LG
         for k in _FAKE_ENV_KEYS:
@@ -898,38 +912,73 @@ def test_teardown_section_documents_exit_code_3():
 # 第 ① 步"站点下线"是**人的判断**，刻意留在手册里：它用 put-item 建 job 行 + invoke
 # 调 undeploy Lambda。fail-closed 分类下这两个动词也算"破坏性"（对的——它们确实会改状态），
 # 所以这里必须**显式**豁免，而不是像以前那样靠"它们恰好不在关键词表里"蒙过去。
-_DOC_ALLOWED = {("dynamodb", "put-item"), ("lambda", "invoke")}
+# 要钉到**目标与次数**（Codex 第十一轮 P1-3）：上一版只按 (服务, 动词) 豁免，于是往围栏块里
+# 再塞一条 `aws lambda invoke --function-name site-panel` 也照样通过——那等于给
+# "任意 invoke / 任意 put-item"开了口子。
+_DOC_ALLOWED_EXACT = {
+    ("dynamodb", "put-item", "--table-name", "site-deploy-jobs"): 1,
+    ("lambda", "invoke", "--function-name", "site-deployer-undeploy"): 1,
+}
 
 
-def test_teardown_section_has_no_copyable_destructive_commands():
-    """围栏块里不许再有可照抄的破坏性命令——那些必须走脚本（有三值探测 + hard-stop）。
-
-    判定用与 harness 同一套 fail-closed 分类：只读动词之外一律算破坏性。
-    """
-    offenders = []
+def _doc_aws_commands():
+    """围栏块里每一条（拼好续行的）aws 命令 -> (服务, 动词, 目标旗标, 目标值, 原文)。"""
+    out = []
     for block in _fenced_bash(_teardown_section()):
+        joined, buf = [], ""
         for line in block.splitlines():
             s = line.strip()
             if s.startswith("#") or not s:
                 continue
-            for m in _AWS_CALL.finditer(s):
-                sv = (m.group(1), m.group(2))
-                if sv in _DOC_ALLOWED:
-                    continue
-                if not _is_readonly(f"{sv[0]} {sv[1]}"):
-                    offenders.append(s)
+            buf += s[:-1] + " " if s.endswith("\\") else s
+            if s.endswith("\\"):
+                continue
+            joined.append(buf)
+            buf = ""
+        for cmd in joined:
+            m = _AWS_CALL.search(cmd)
+            if not m:
+                continue
+            parts = cmd.split()
+            flag = val = None
+            for f in ("--table-name", "--function-name"):
+                if f in parts:
+                    flag, val = f, parts[parts.index(f) + 1]
                     break
+            out.append((m.group(1), m.group(2), flag, val, cmd))
+    return out
+
+
+def test_teardown_section_has_no_copyable_destructive_commands():
+    """围栏块里的写操作必须**逐条**在豁免表里，且目标与次数都对得上。
+
+    判定用与 harness 同一套 fail-closed 分类：只读动词之外一律算破坏性。
+    """
+    seen, offenders = {}, []
+    for svc, verb, flag, val, cmd in _doc_aws_commands():
+        if _is_readonly(f"{svc} {verb}"):
+            continue
+        key = (svc, verb, flag, val)
+        if key not in _DOC_ALLOWED_EXACT:
+            offenders.append(cmd[:110])
+        else:
+            seen[key] = seen.get(key, 0) + 1
     assert offenders == [], (
-        "拆除一节的围栏块里又出现了可照抄的破坏性命令，请改为调用 "
+        "拆除一节的围栏块里出现了豁免表之外的写操作，请改为调用 "
         "scripts/teardown_platform.sh：\n  " + "\n  ".join(offenders))
+    assert seen == _DOC_ALLOWED_EXACT, (
+        f"豁免命令的出现次数不对：实得 {seen}，期望 {_DOC_ALLOWED_EXACT}")
 
 
 def test_doc_exemption_list_stays_minimal():
-    """豁免清单必须只有那两条——它是"手册里允许出现的写操作"的完整边界。
+    """豁免清单必须只有那两条**具体命令**（含目标与次数）。
 
     多一条就等于又开了一个可照抄的口子，而那正是前三轮 P1 的长发地。
     """
-    assert _DOC_ALLOWED == {("dynamodb", "put-item"), ("lambda", "invoke")}, _DOC_ALLOWED
+    assert _DOC_ALLOWED_EXACT == {
+        ("dynamodb", "put-item", "--table-name", "site-deploy-jobs"): 1,
+        ("lambda", "invoke", "--function-name", "site-deployer-undeploy"): 1,
+    }, _DOC_ALLOWED_EXACT
 
 
 def test_teardown_section_still_documents_the_two_unavoidable_pits():
@@ -1344,12 +1393,13 @@ def test_all_executed_queries_compile(harness):
 # **waiter 超时走的是 255，而 stub 原来恒 254** ⇒ `waited` 对 255 的处理从没被打过
 # （Codex 第九轮 P1-1：在 waited 里加一条「rc=255 直接成功返回」，76 条仍全绿）。
 # 控制流只依赖"非零"，所以三种码都要能打进来；英文报文不必精确模拟。
-_FAIL_RCS = [
-    pytest.param("255", id="rc255-waiter-timeout"),
-    pytest.param("254", id="rc254-service-error"),
-    pytest.param("252", id="rc252-cli-parse-error"),
-    pytest.param("1", id="rc1-generic-nonzero"),
-]
+# **只有这一张表**（Codex 第十一轮 P2-4）：上一版参数化写 255/254/252/1，元测试又另写了
+# 一遍值，于是我实测出来的 252 只进了参数化、没进元测试——把请求的 252 偷换成实际 254 时
+# 252 相关的 4 条仍然全绿。两张表必然漂移，所以合成一张。
+_FAIL_RC_VALUES = ("255", "254", "252", "1")
+_FAIL_RC_MEANING = {"255": "waiter-failure", "254": "service-error",
+                    "252": "cli-parse-error", "1": "generic-nonzero"}
+_FAIL_RCS = [pytest.param(rc, id=f"rc{rc}-{_FAIL_RC_MEANING[rc]}") for rc in _FAIL_RC_VALUES]
 
 
 @pytest.mark.parametrize("waiter", ["table-exists", "table-not-exists"])
@@ -1396,7 +1446,7 @@ def test_harness_can_actually_inject_each_exit_code(tmp_path):
     os.chmod(aws, 0o755)
     # **每次换一个 FAKE_LOG**：nth-match 的计数落在 `$FAKE_LOG.match-count` 上，
     # 复用同一个 log 会让第 2 次之后的调用不再命中（n≠1）。
-    for i, want in enumerate(("255", "254", "1")):
+    for i, want in enumerate(_FAIL_RC_VALUES):
         proc = subprocess.run(["bash", str(aws), "iam", "list-roles"],
                               capture_output=True, text=True,
                               env={**os.environ, "FAKE_LOG": str(tmp_path / f"log{i}"),
@@ -1543,17 +1593,89 @@ def test_log_group_deletions_match_their_discovery_region(harness):
     assert offenders == [], "\n  ".join(offenders)
 
 
-def test_kms_key_deletion_targets_come_from_the_listing(harness):
-    """动态资源：schedule-key-deletion 的 key 必须来自 list-keys 的输出。"""
+def test_kms_keys_are_scheduled_exactly_and_completely(harness):
+    """四把 key 逐把断言结果：**两把签名 key 都要排期**，外来的与已排期的都不许动。
+
+    上一版夹具只有一把 key，断言又只是 `deleted <= listed`（只防误删、不防少删）——
+    在循环首轮后加个 `break`，5 条相关测试全绿，而真机上那会把第二把
+    "能签会话的 key" 静默留在账号里（Codex 第十一轮 P1-2）。
+    """
     harness("--yes")
-    listed, deleted = set(), set()
-    for argv in harness.argv:
-        if tuple(argv[:2]) == ("kms", "list-keys"):
-            listed.add("key-1")          # stub 的 list-keys 返回值
-        if tuple(argv[:2]) == ("kms", "schedule-key-deletion"):
-            deleted.add(argv[argv.index("--key-id") + 1])
-    assert deleted, "一把 key 都没排期删除 ⇒ 这条测试没在测东西"
-    assert deleted <= listed, f"删了没列举到的 key: {deleted - listed}"
+    scheduled = {argv[argv.index("--key-id") + 1] for argv in harness.argv
+                 if tuple(argv[:2]) == ("kms", "schedule-key-deletion")}
+    assert scheduled == _KMS_SHOULD_SCHEDULE, (
+        f"多排期了: {sorted(scheduled - _KMS_SHOULD_SCHEDULE)}\n"
+        f"漏排期了: {sorted(_KMS_SHOULD_SCHEDULE - scheduled)}（少删一把签名 key 是无声的）")
+    # 每把都必须被 describe 过（否则"漏排期"可能只是压根没看）
+    described = {argv[argv.index("--key-id") + 1] for argv in harness.argv
+                 if tuple(argv[:2]) == ("kms", "describe-key")}
+    assert described == set(_KMS_KEYS), f"没逐把看过: {set(_KMS_KEYS) - described}"
+
+
+def test_kms_deletion_targets_come_from_the_listing(harness):
+    """动态资源：排期删除的 key 必须来自 list-keys 的输出，不能凭空出现。"""
+    harness("--yes")
+    assert any(tuple(argv[:2]) == ("kms", "list-keys") for argv in harness.argv)
+    scheduled = {argv[argv.index("--key-id") + 1] for argv in harness.argv
+                 if tuple(argv[:2]) == ("kms", "schedule-key-deletion")}
+    assert scheduled <= set(_KMS_KEYS), f"删了没列举到的 key: {scheduled - set(_KMS_KEYS)}"
+
+
+# ---------------------------------------------------------------------------
+# 破坏性 API 的目标**全集与次数**（Codex 第十一轮 P1-1）
+#
+# 上一版按参数名把所有读写调用汇总起来验"值在合法集合里"，于是把四次
+# `delete-function` 全改成删 `site-panel` 时 172 条全绿：`site-panel` 在合法集合里，
+# 而"每个目标都被碰过"那条正对照被**读探测**替所有目标满足了。
+# 真机后果：panel 被删四次，另外三个平台 Lambda 静默留下，整轮退 0。
+#
+# 所以判据必须绑在**具体的破坏性 API** 上，并且验的是多重集（含次数），不是子集。
+# ---------------------------------------------------------------------------
+_LAMBDAS = ["site-auth-pre-token", "site-auth-service", "site-key-proxy", "site-panel"]
+_ROLES = ["site-auth-service-role", "site-builder-verifier", "site-key-proxy-role",
+          "site-mcp-runtime-role", "site-panel-role"]
+_RETAIN_TABLES = ["site-access-daily", "site-admins", "site-api-keys", "site-ops-log"]
+_SSM_PARAMS = ["/site-builder/login-flow-secret", "/site-builder/machine-client-secret",
+               "/site-builder/site-client-secret"]
+_POOLS = ["us-east-1_idp", "us-east-1_platform"]
+
+_EXPECTED_DESTRUCTIVE_TARGETS = {
+    ("lambda", "delete-function-url-config"): ("--function-name", _LAMBDAS),
+    ("lambda", "delete-function"): ("--function-name", _LAMBDAS),
+    ("iam", "delete-role"): ("--role-name", _ROLES),
+    ("iam", "delete-role-policy"): ("--role-name", _ROLES),
+    ("iam", "detach-role-policy"): ("--role-name", _ROLES),
+    ("dynamodb", "delete-table"): ("--table-name", _RETAIN_TABLES),
+    ("dynamodb", "update-table"): ("--table-name", _RETAIN_TABLES),
+    ("ssm", "delete-parameter"): ("--name", _SSM_PARAMS),
+    ("cognito-idp", "delete-user-pool"): ("--user-pool-id", _POOLS),
+    ("cognito-idp", "delete-user-pool-domain"): ("--user-pool-id", _POOLS),
+    ("cloudformation", "delete-stack"): ("--stack-name",
+                                         sorted([_ROUTER_STACK, "SiteDeployerStack"])),
+    ("ecr", "delete-repository"): ("--repository-name", ["site-builder-mcp"]),
+    ("cloudwatch", "delete-alarms"): ("--alarm-names", ["site-builder-auth-invalid-grant"]),
+    ("sns", "delete-topic"): ("--topic-arn",
+                              [f"arn:aws:sns:{_PRIMARY_REGION}:{_ACCOUNT}:site-builder-alarms"]),
+    ("s3api", "delete-bucket"): ("--bucket", [f"site-frontend-{_ACCOUNT}"]),
+    ("bedrock-agentcore-control", "delete-agent-runtime"): ("--agent-runtime-id",
+                                                           ["site_builder_deploy-AAAA"]),
+    ("dsql", "delete-cluster"): ("--identifier", ["abcdefghij0123456789abcdef"]),
+}
+
+
+@pytest.mark.parametrize("api", sorted(_EXPECTED_DESTRUCTIVE_TARGETS),
+                         ids=lambda a: "-".join(a))
+def test_destructive_api_targets_are_exact_and_complete(harness, api):
+    """每个破坏性 API 打的目标**多重集**必须与预期逐字相等（含次数）。
+
+    子集不够：全删同一个目标是子集，漏删也是子集。
+    """
+    flag, expected = _EXPECTED_DESTRUCTIVE_TARGETS[api]
+    harness("--yes")
+    got = sorted(argv[argv.index(flag) + 1] for argv in harness.argv
+                 if tuple(argv[:2]) == api and flag in argv)
+    assert got == sorted(expected), (
+        f"{' '.join(api)} 的目标不对\n  实得: {got}\n  期望: {sorted(expected)}")
 
 
 # ---------------------------------------------------------------------------
