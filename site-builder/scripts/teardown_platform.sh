@@ -115,19 +115,52 @@ Q_EDGE_FAILED="length(StackResources[?ResourceStatus=='DELETE_FAILED' && Resourc
 # ---------------------------------------------------------------- 三值探测
 # **这里是整个脚本的安全核心。** 只有服务明确说的 NotFound 才算 ABSENT；
 # 其余任何失败（AccessDenied、限流、参数错误、网络）都是 UNKNOWN，而 UNKNOWN 会 hard-stop。
-# **这张表里只许放"服务在说这东西不存在"的形态。** 放错一条的代价是单向的：
-# 一个存在的资源被判成 ABSENT ⇒ 静默漏删 ⇒ 整轮仍退 0。
-# 曾经错放过 `UserPoolTaggingException`（我自己加的，Codex 第五轮 P2-4 抓到）：
-# 它在 Cognito 的服务模型里是「a user pool tag can't be set or updated」，
-# DescribeUserPool 明确会返回它，而那个池**是存在的** —— 于是标签读取出问题的池会被
-# 当成不存在、直接跳过。DescribeUserPool 的"不存在"是 ResourceNotFoundException，已在表内。
-_is_absent_err() {
-  case "$1" in
-    *ResourceNotFoundException*|*ResourceNotFound*|*NotFoundException*|*NoSuchEntity*|\
-    *NoSuchBucket*|*ParameterNotFound*|*RepositoryNotFoundException*|*ClusterNotFound*|\
-    *"does not exist"*|*"Function not found"*|*"Unable to find"*)
-      return 0 ;;
+# 分类**按 (service, operation) 限定错误码**，不看全局报文。放错的代价是单向的：
+# 一个存在的资源被判成 ABSENT ⇒ 静默漏删 ⇒ 整轮仍退 0。曾经错把
+# `UserPoolTaggingException` 当成"不存在"（Codex 第五轮 P2-4）——它其实是
+# 「a user pool tag can't be set or updated」，池是存在的。现在的结构天然挡住这类：
+# describe-user-pool 只认 `ResourceNotFoundException`，别的码一律 UNKNOWN。
+# _absent_codes <service> <operation> —— 该操作里"表示不存在"的错误码（空格分隔）。
+# 只有列在这里的 (service, operation, code) 三元组才判 ABSENT。这张表**按操作限定**，
+# 不是全局子串（Codex 第十二轮）：旧版用 `*"does not exist"*` 之类的全局报文规则，
+# 有"误收"面——一条 AccessDenied 文案里恰好含 "does not exist" 就会被当成"不存在"，
+# 而"把存在的当成不存在"是本脚本唯一朝"漏删"方向失效的地方。
+# 反过来，这张表**漏一条码**只会让真的不存在被判 UNKNOWN ⇒ hard-stop（安全方向）。
+_absent_codes() {
+  case "$1 $2" in
+    "dynamodb describe-table"|"dynamodb scan")              echo "ResourceNotFoundException" ;;
+    "iam get-role")                                         echo "NoSuchEntity" ;;
+    "lambda get-function"|"lambda get-function-url-config") echo "ResourceNotFoundException" ;;
+    "ecr describe-repositories")                            echo "RepositoryNotFoundException" ;;
+    "bedrock-agentcore-control get-agent-runtime")          echo "ResourceNotFoundException" ;;
+    "dsql get-cluster")                          echo "ResourceNotFoundException ClusterNotFoundException" ;;
+    "cognito-idp describe-user-pool")                       echo "ResourceNotFoundException" ;;
+    "sns get-topic-attributes")                             echo "NotFoundException" ;;
+    "ssm get-parameter")                                    echo "ParameterNotFound" ;;
+    "kms describe-key")                                     echo "NotFoundException" ;;
+    "s3api get-bucket-location")                            echo "NoSuchBucket" ;;
+    *)                                                      echo "" ;;
   esac
+}
+
+# _is_absent_err <service> <operation> <errtext> —— 该错误是否表示"资源不存在"。
+_is_absent_err() {
+  local svc="$1" op="$2" err="$3"
+  # CloudFormation 的"栈不存在"是**无类型**的 ValidationError + 固定文案，服务没把它
+  # 建模成 typed NotFound——所以只有它保留一条**窄**消息规则（且仍绑定到具体操作）。
+  case "$svc $op" in
+    "cloudformation describe-stacks"|"cloudformation describe-stack-resources")
+      case "$err" in *ValidationError*"does not exist"*) return 0 ;; esac
+      return 1 ;;
+  esac
+  # 其余：从 `An error occurred (CODE)` 里取出错误码，只认该 (service, operation) 白名单里的码。
+  local code allowed a
+  code="$(printf '%s' "$err" | sed -n 's/.*An error occurred (\([^)]*\)).*/\1/p' | head -1)"
+  [ -n "$code" ] || return 1
+  allowed="$(_absent_codes "$svc" "$op")"
+  for a in $allowed; do
+    [ "$code" = "$a" ] && return 0
+  done
   return 1
 }
 
@@ -135,10 +168,11 @@ _is_absent_err() {
 # **本函数自己从不 die**（它跑在 $( ) 子 shell 里，die 只会杀掉子 shell）。
 probe() {
   local desc="$1"; shift
+  local svc="${2:-}" op="${3:-}"   # $1=aws；$2/$3 = 服务/操作，喂给按操作限定的分类
   local err rc=0
   err="$("$@" 2>&1 >/dev/null)" || rc=$?
   if [ "$rc" -eq 0 ]; then echo PRESENT; return 0; fi
-  if _is_absent_err "$err"; then echo ABSENT; return 0; fi
+  if _is_absent_err "$svc" "$op" "$err"; then echo ABSENT; return 0; fi
   printf '  探测 %s 失败，而且**不是** NotFound：\n%s\n' "$desc" "$err" >&2
   echo UNKNOWN
   return 0
@@ -160,6 +194,7 @@ probe() {
 CHECKED_OUT=""
 checked() {
   local desc="$1"; shift
+  local svc="${2:-}" op="${3:-}"   # $1=aws；$2/$3 = 服务/操作
   local ef rc=0
   ef="$(mktemp "${TMPDIR:-/tmp}/teardown-err.XXXXXX")"
   # 分开接 stdout / stderr：报文绝不能混进返回值（混进去会被当成资源名去删）
@@ -167,7 +202,7 @@ checked() {
   local err; err="$(cat "${ef}")"; rm -f "${ef}"
   if [ "${rc}" -eq 0 ]; then return 0; fi
   # 明确的 NotFound ⇒ 就是"没有"，返回空清单继续
-  if _is_absent_err "${err}"; then CHECKED_OUT=""; return 0; fi
+  if _is_absent_err "${svc}" "${op}" "${err}"; then CHECKED_OUT=""; return 0; fi
   # 注意：报文里不要用 ASCII 双引号——它会在这条双引号字符串里提前收尾。
   # 靠"相邻字符串自动拼接"侥幸成立过，但只要片段里出现空格或 * 就会当场炸。用 「」。
   die "读取「${desc}」失败，而且**不是** NotFound：

@@ -856,26 +856,91 @@ def test_stuck_non_delete_status_still_times_out(harness):
 # 最小单位：probe 的分类
 # ---------------------------------------------------------------------------
 
-def test_probe_classifies_only_notfound_as_absent():
-    """直接对 `probe` 的分类做单元级断言：NotFound → ABSENT，其余 → UNKNOWN。"""
+def _run_is_absent(svc, op, errtext):
+    """把脚本里的 `_absent_codes` + `_is_absent_err` 切出来跑一次，返回是否判 ABSENT。"""
     script = _SCRIPT.read_text(encoding="utf-8")
-    body = script[script.index("_is_absent_err() {"):script.index("# checked <描述>")]
+    body = script[script.index("_absent_codes() {"):script.index("# probe <描述>")]
     prog = textwrap.dedent("""
         set -uo pipefail
         %s
-        fail() { echo "An error occurred ($1) when calling the operation" >&2; return 254; }
-        probe ok true
-        probe nf fail ResourceNotFoundException
-        probe dn fail AccessDeniedException
-        probe th fail ThrottlingException
-        probe to fail RequestTimeout
-        probe hb bash -c 'echo "An error occurred (404) when calling the HeadBucket operation: Not Found" >&2; exit 254'
+        if _is_absent_err "$1" "$2" "$3"; then echo ABSENT; else echo NOT_ABSENT; fi
     """) % body
-    out = subprocess.run(["bash", "-c", prog], capture_output=True, text=True)
-    states = [l for l in out.stdout.split() if l in ("PRESENT", "ABSENT", "UNKNOWN")]
-    # 最后一条是 head-bucket 的真实报文：它**不该**被认成 ABSENT（P2 的最小单位断言）
-    assert states == ["PRESENT", "ABSENT", "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN"], (
-        f"分类错了: {states}\n{out.stdout}\n{out.stderr}")
+    out = subprocess.run(["bash", "-c", prog, "_", svc, op, errtext],
+                         capture_output=True, text=True)
+    assert out.stdout.strip() in ("ABSENT", "NOT_ABSENT"), out.stderr
+    return out.stdout.strip() == "ABSENT"
+
+
+def _err(code, op="TheOperation"):
+    return f"An error occurred ({code}) when calling the {op} operation: something"
+
+
+# (service, operation, 该操作真正的 NotFound 报文) —— 必须判 ABSENT
+_ABSENT_CASES = [
+    ("dynamodb", "describe-table", _err("ResourceNotFoundException")),
+    ("dynamodb", "scan", _err("ResourceNotFoundException")),
+    ("iam", "get-role", _err("NoSuchEntity")),
+    ("lambda", "get-function", _err("ResourceNotFoundException")),
+    ("lambda", "get-function-url-config", _err("ResourceNotFoundException")),
+    ("ecr", "describe-repositories", _err("RepositoryNotFoundException")),
+    ("bedrock-agentcore-control", "get-agent-runtime", _err("ResourceNotFoundException")),
+    ("dsql", "get-cluster", _err("ResourceNotFoundException")),
+    ("cognito-idp", "describe-user-pool", _err("ResourceNotFoundException")),
+    ("sns", "get-topic-attributes", _err("NotFoundException")),
+    ("ssm", "get-parameter", _err("ParameterNotFound")),
+    ("s3api", "get-bucket-location", _err("NoSuchBucket")),
+    # CloudFormation 是唯一的无类型消息规则
+    ("cloudformation", "describe-stacks",
+     "An error occurred (ValidationError) when calling the DescribeStacks "
+     "operation: Stack with id X does not exist"),
+]
+
+
+@pytest.mark.parametrize("svc,op,err", _ABSENT_CASES, ids=lambda x: x if isinstance(x, str) and len(x) < 30 else "")
+def test_real_notfound_is_absent(svc, op, err):
+    assert _run_is_absent(svc, op, err), f"{svc} {op}: {err!r} 应判 ABSENT"
+
+
+# **误收面**：同样的报文出现在**别的操作**上、或换成非 NotFound 的码，都不许判 ABSENT。
+_NOT_ABSENT_CASES = [
+    # AccessDenied 文案里恰好含 "does not exist" —— 旧版全局子串会误收（这是 Codex 的核心担忧）
+    ("iam", "get-role",
+     "An error occurred (AccessDenied) when calling the GetRole operation: "
+     "role does not exist in your permission scope"),
+    # UserPoolTaggingException：池是存在的，只是读标签失败（第五轮那条，现在结构上挡住）
+    ("cognito-idp", "describe-user-pool", _err("UserPoolTaggingException")),
+    # 一个操作的 NotFound 码用在**另一个**操作上：不认（按操作限定）
+    ("iam", "get-role", _err("ResourceNotFoundException")),      # iam 的是 NoSuchEntity
+    ("s3api", "get-bucket-location", _err("AccessDenied")),
+    ("dynamodb", "describe-table", _err("ThrottlingException")),
+    # 非 NotFound 的常见失败
+    ("lambda", "get-function", _err("TooManyRequestsException")),
+    # CFN 的 ValidationError 但不是"不存在"（比如别的校验错）
+    ("cloudformation", "describe-stacks",
+     "An error occurred (ValidationError) when calling the DescribeStacks "
+     "operation: Template format error"),
+    # 未登记的操作：无法证明"不存在"⇒ 一律 NOT_ABSENT（hard-stop，安全方向）
+    ("cloudwatch", "describe-alarms", _err("SomeError")),
+]
+
+
+@pytest.mark.parametrize("svc,op,err", _NOT_ABSENT_CASES)
+def test_non_notfound_or_wrong_operation_is_not_absent(svc, op, err):
+    assert not _run_is_absent(svc, op, err), (
+        f"{svc} {op}: {err!r} 被误判成 ABSENT —— 那正是「误收」，会导致漏删")
+
+
+def test_absent_classifier_is_scoped_per_operation():
+    """结构断言：分类必须**按操作限定**，不是全局子串。
+
+    同一条报文（含 does-not-exist 文案 + 非匹配码）在任何操作上都不该被当成 ABSENT，
+    除非它是该操作真正建模的 NotFound 码。这条钉住"不能退回全局子串规则"。
+    """
+    msg = ("An error occurred (AccessDenied) when calling the X operation: "
+           "resource does not exist / not found / unable to find it")
+    for svc, op in [("iam", "get-role"), ("lambda", "get-function"),
+                    ("s3api", "get-bucket-location"), ("dynamodb", "describe-table")]:
+        assert not _run_is_absent(svc, op, msg), f"{svc} {op} 把全局文案误收成 ABSENT"
 
 
 # ---------------------------------------------------------------------------
@@ -936,16 +1001,20 @@ def _doc_aws_commands():
             joined.append(buf)
             buf = ""
         for cmd in joined:
-            m = _AWS_CALL.search(cmd)
-            if not m:
-                continue
-            parts = cmd.split()
-            flag = val = None
-            for f in ("--table-name", "--function-name"):
-                if f in parts:
-                    flag, val = f, parts[parts.index(f) + 1]
-                    break
-            out.append((m.group(1), m.group(2), flag, val, cmd))
+            # **一行里可能被塞进多条命令**（Codex 第十二轮 P1-3）：合法 invoke 后追加
+            # `; aws lambda invoke --function-name site-panel` 时旧版只看第一条就漏了。
+            # 按命令分隔符切开，每段单独查——分隔符本身也不该出现在可照抄的 runbook 命令里。
+            for seg in re.split(r"(?:;|&&|\|\||\||&)", cmd):
+                m = _AWS_CALL.search(seg)
+                if not m:
+                    continue
+                parts = seg.split()
+                flag = val = None
+                for f in ("--table-name", "--function-name"):
+                    if f in parts:
+                        flag, val = f, parts[parts.index(f) + 1]
+                        break
+                out.append((m.group(1), m.group(2), flag, val, seg.strip()))
     return out
 
 
@@ -1551,6 +1620,20 @@ def test_fixed_resource_targets_are_exact(harness):
         + "\n  ".join(sorted(set(offenders))))
 
 
+def test_s3_rm_only_empties_the_frontend_bucket(harness):
+    """`aws s3 rm` 的目标是**位置参数**（argv[2]），不带 --bucket，所以逃过了
+    `_EXPECTED_DESTRUCTIVE_TARGETS` 那套按旗标的校验（Codex 第十二轮 P1-1）：
+    把清空目标改成别的桶时 193 条全绿，而 `s3 rm --recursive` 会递归删光别人的对象。
+    """
+    harness("--yes")
+    rm_targets = [argv[2] for argv in harness.argv
+                  if tuple(argv[:2]) == ("s3", "rm") and len(argv) > 2]
+    assert rm_targets, "一次 s3 rm 都没发生 ⇒ 这条测试没在测东西"
+    for tgt in rm_targets:
+        assert tgt == f"s3://site-frontend-{_ACCOUNT}", (
+            f"s3 rm 打在了 {tgt!r}，不是前端桶 —— --recursive 会递归误删别人的对象")
+
+
 def test_every_expected_target_is_actually_touched(harness):
     """正对照：预期集合里的每一个固定资源都必须真的被碰过。
 
@@ -1568,29 +1651,52 @@ def test_every_expected_target_is_actually_touched(harness):
     assert not missing, f"这些预期资源一次都没被碰过（漏删？）: {missing}"
 
 
-def test_log_group_deletions_match_their_discovery_region(harness):
-    """日志组的删除区必须与它**被发现的区**一致。
+def _expected_log_deletions():
+    """脚本应发出的 (region, log-group) 删除，各恰好一次。
 
-    上一版把**任何** `logs delete-log-group` 都当成"跨区操作"，于是本区的
-    `site-panel` 日志被错发到别的已启用区也照样通过（Codex 第十轮同类洞）。
-    判据：非主区的删除**只允许** Edge 形态的名字（`/aws/lambda/{主区}.`）——
-    那是唯一在每个执行区都有副本的东西；其余一律必须打在主区。
+    本区（describe-log-groups）删归属清单里的全部：平台件 + 每个 site_id + 本区 Edge 副本。
+    每个非主区（prefix 查询）只删那一份 Edge 副本。外来的（redirectEdge / unrelated）永不删。
     """
+    from collections import Counter
+    c = Counter()
+    c[(_PRIMARY_REGION, "/aws/lambda/site-panel")] += 1
+    c[(_PRIMARY_REGION, "/aws/codebuild/site-package")] += 1
+    c[(_PRIMARY_REGION, _OWNED_EDGE_LG)] += 1
+    for sid in _SITE_IDS:
+        c[(_PRIMARY_REGION, f"/aws/lambda/site-{sid}")] += 1
+    for r in _REGIONS:
+        if r != _PRIMARY_REGION:
+            c[(r, _OWNED_EDGE_LG)] += 1
+    return c
+
+
+def test_log_group_deletions_match_discovery_exactly(harness):
+    """日志组删除的 (region, name) 多重集必须与预期**逐条相等**（Codex 第十二轮 P1-2）。
+
+    上一版只查"非主区删的是不是 Edge 形态"（防误删），不查完整性：把某个已发现的
+    归属日志（如 CodeBuild）在 stub 里换成别的名字时，那条日志静默不被删、守卫仍全绿。
+    完整性 + 次数一起钉，才同时挡住"漏删"和"发错区/删两次"。
+    """
+    from collections import Counter
     harness("--yes")
-    edge_prefix = f"/aws/lambda/{_PRIMARY_REGION}."
-    offenders = []
+    got = Counter()
     for argv in harness.argv:
         if tuple(argv[:2]) != ("logs", "delete-log-group"):
             continue
         name = argv[argv.index("--log-group-name") + 1]
-        region = _regions_in(argv)[0]
-        if region == _PRIMARY_REGION:
-            continue
-        if not name.startswith(edge_prefix):
-            offenders.append(f"{name} 被删在 {region}，但它不是 Edge 副本形态")
-        elif region not in _REGIONS:
-            offenders.append(f"{name} 被删在 {region}，而它不在 DescribeRegions 结果里")
-    assert offenders == [], "\n  ".join(offenders)
+        got[(_regions_in(argv)[0], name)] += 1
+    expected = _expected_log_deletions()
+    assert got == expected, (
+        f"多删/发错区: {sorted((got - expected).elements())}\n"
+        f"漏删: {sorted((expected - got).elements())}")
+
+
+def test_foreign_edge_logs_are_never_deleted_in_any_region(harness):
+    """负向：账号里别人的 Edge 日志（redirectEdge）任何区都不许删。"""
+    harness("--yes", env={"FAKE_UNOWNED_LOG_GROUP": _FOREIGN_EDGE_LG})
+    for argv in harness.argv:
+        if tuple(argv[:2]) == ("logs", "delete-log-group"):
+            assert argv[argv.index("--log-group-name") + 1] != _FOREIGN_EDGE_LG, argv
 
 
 def test_kms_keys_are_scheduled_exactly_and_completely(harness):
@@ -1601,11 +1707,16 @@ def test_kms_keys_are_scheduled_exactly_and_completely(harness):
     "能签会话的 key" 静默留在账号里（Codex 第十一轮 P1-2）。
     """
     harness("--yes")
-    scheduled = {argv[argv.index("--key-id") + 1] for argv in harness.argv
-                 if tuple(argv[:2]) == ("kms", "schedule-key-deletion")}
-    assert scheduled == _KMS_SHOULD_SCHEDULE, (
-        f"多排期了: {sorted(scheduled - _KMS_SHOULD_SCHEDULE)}\n"
-        f"漏排期了: {sorted(_KMS_SHOULD_SCHEDULE - scheduled)}（少删一把签名 key 是无声的）")
+    from collections import Counter
+    scheduled = Counter(argv[argv.index("--key-id") + 1] for argv in harness.argv
+                        if tuple(argv[:2]) == ("kms", "schedule-key-deletion"))
+    # **用 Counter，不是 set**（Codex 第十二轮 P2）：每把活动 CMK 连续排期两次时
+    # set 相等仍绿；这里断言两把签名 key **各恰好一次**、外来 / PendingDeletion **零次**。
+    expected = Counter({k: 1 for k in _KMS_SHOULD_SCHEDULE})
+    assert scheduled == expected, (
+        f"排期次数不对：实得 {dict(scheduled)}，期望 {dict(expected)}")
+    for k in set(_KMS_KEYS) - _KMS_SHOULD_SCHEDULE:
+        assert scheduled[k] == 0, f"{k} 不该被排期却排了 {scheduled[k]} 次"
     # 每把都必须被 describe 过（否则"漏排期"可能只是压根没看）
     described = {argv[argv.index("--key-id") + 1] for argv in harness.argv
                  if tuple(argv[:2]) == ("kms", "describe-key")}
