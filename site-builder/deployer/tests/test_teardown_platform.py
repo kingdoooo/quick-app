@@ -85,6 +85,8 @@ _OWNED_EDGE_LG = f"/aws/lambda/{_PRIMARY_REGION}.{_ROUTER_STACK}-application-web
 _FOREIGN_EDGE_LG = f"/aws/lambda/{_PRIMARY_REGION}.redirectEdge"
 # 账号里的 KMS key：两把真的会话签名 key（site / console 两个 family）、
 # 一把外来 key、一把已经在排期删除的。只有前两把该被 schedule-key-deletion。
+# 自己的 AgentCore runtime 日志组：/aws/bedrock-agentcore/runtimes/{runtimeId}-{endpoint}
+_OWNED_AGENTCORE_LG = "/aws/bedrock-agentcore/runtimes/site_builder_deploy-AAAA-DEFAULT"
 _KMS_KEYS = ("key-site-1", "key-site-2", "key-foreign", "key-pending")
 _KMS_SHOULD_SCHEDULE = {"key-site-1", "key-site-2"}
 
@@ -162,7 +164,7 @@ absent() {
   case "$*" in
     *get-bucket-location*|*head-bucket*)
       echo "An error occurred (NoSuchBucket) when calling the GetBucketLocation operation: The specified bucket does not exist" >&2 ;;
-    *describe-stacks*)
+    *describe-stacks*|*describe-stack-resources*)
       echo "An error occurred (ValidationError) when calling the DescribeStacks operation: Stack with id X does not exist" >&2 ;;
     *get-role*)
       echo "An error occurred (NoSuchEntity) when calling the GetRole operation: The role with name X cannot be found." >&2 ;;
@@ -173,7 +175,8 @@ absent() {
     *get-function*)
       echo "An error occurred (ResourceNotFoundException) when calling the GetFunction operation: Function not found: arn:aws:lambda:x" >&2 ;;
     *get-topic-attributes*)
-      echo "An error occurred (NotFoundException) when calling the GetTopicAttributes operation: Topic does not exist" >&2 ;;
+      # **真实 wire code 是 NotFound**（botocore 模型 error.code），不是异常类型名
+      echo "An error occurred (NotFound) when calling the GetTopicAttributes operation: Topic does not exist" >&2 ;;
     *describe-user-pool*)
       echo "An error occurred (ResourceNotFoundException) when calling the DescribeUserPool operation: User pool does not exist." >&2 ;;
     *)
@@ -293,7 +296,12 @@ case "$*" in
   *describe-log-groups*)
       # 本区：平台自己的 + 每个 site_id 的 + 本区那份 Edge 副本；
       # FAKE_UNOWNED_LOG_GROUP 再混进一个别人的
+      # 每一条归属规则都要有正例，否则那条规则拼错了也看不出来（Codex 第十三轮 P2-4）：
+      #   精确名 / CodeBuild 精确名 / AgentCore runtime 前缀 / deployer 栈前缀 /
+      #   site-deployer- 前缀 / Edge 副本 / per-site
       out="/aws/lambda/site-panel /aws/codebuild/site-package $FAKE_OWNED_EDGE_LG"
+      out="$out $FAKE_OWNED_AGENTCORE_LG /aws/lambda/site-deployer-validate"
+      out="$out /aws/lambda/site-access-rollup"
       for s in $FAKE_SITE_IDS; do out="$out /aws/lambda/site-$s"; done
       if [ -n "${FAKE_UNOWNED_LOG_GROUP:-}" ]; then out="$out ${FAKE_UNOWNED_LOG_GROUP}"; fi
       echo "$out" ;;
@@ -360,6 +368,7 @@ def _build_sandbox(root: Path):
         e["FAKE_REGIONS"] = " ".join(_REGIONS)
         e["FAKE_KMS_KEYS"] = " ".join(_KMS_KEYS)
         e["FAKE_OWNED_EDGE_LG"] = _OWNED_EDGE_LG
+        e["FAKE_OWNED_AGENTCORE_LG"] = _OWNED_AGENTCORE_LG
         e["FAKE_FOREIGN_EDGE_LG"] = _FOREIGN_EDGE_LG
         for k in _FAKE_ENV_KEYS:
             e.pop(k, None)
@@ -886,7 +895,7 @@ _ABSENT_CASES = [
     ("bedrock-agentcore-control", "get-agent-runtime", _err("ResourceNotFoundException")),
     ("dsql", "get-cluster", _err("ResourceNotFoundException")),
     ("cognito-idp", "describe-user-pool", _err("ResourceNotFoundException")),
-    ("sns", "get-topic-attributes", _err("NotFoundException")),
+    ("sns", "get-topic-attributes", _err("NotFound")),   # wire code，不是类型名
     ("ssm", "get-parameter", _err("ParameterNotFound")),
     ("s3api", "get-bucket-location", _err("NoSuchBucket")),
     # CloudFormation 是唯一的无类型消息规则
@@ -909,6 +918,8 @@ _NOT_ABSENT_CASES = [
      "role does not exist in your permission scope"),
     # UserPoolTaggingException：池是存在的，只是读标签失败（第五轮那条，现在结构上挡住）
     ("cognito-idp", "describe-user-pool", _err("UserPoolTaggingException")),
+    # SNS 的**异常类型名**不是 wire code，不许认
+    ("sns", "get-topic-attributes", _err("NotFoundException")),
     # 一个操作的 NotFound 码用在**另一个**操作上：不认（按操作限定）
     ("iam", "get-role", _err("ResourceNotFoundException")),      # iam 的是 NoSuchEntity
     ("s3api", "get-bucket-location", _err("AccessDenied")),
@@ -921,6 +932,26 @@ _NOT_ABSENT_CASES = [
      "operation: Template format error"),
     # 未登记的操作：无法证明"不存在"⇒ 一律 NOT_ABSENT（hard-stop，安全方向）
     ("cloudwatch", "describe-alarms", _err("SomeError")),
+    # ── 以下两条是 Codex 第十三轮 P1-1 的形状。**修完代码但没加这两条用例时，
+    #    把 CFN 判据退回 `*ValidationError*does not exist*`、或把外层码解析退回贪婪，
+    #    121 条仍然全绿**——所以它们必须在这里。
+    # (a) 外层是 AccessDenied，消息里恰好同时含 ValidationError 与 does not exist
+    ("cloudformation", "describe-stacks",
+     "An error occurred (AccessDenied) when calling the DescribeStacks operation: "
+     "ValidationError: resource does not exist in permission scope"),
+    # (b) 外层 AccessDeniedException，消息里**嵌了**另一条 An error occurred (NoSuchEntity)
+    #     —— 贪婪匹配会取到内层那个码
+    ("iam", "get-role",
+     "An error occurred (AccessDeniedException) when calling the GetRole operation: "
+     "upstream said An error occurred (NoSuchEntity) nested"),
+    # (c) 同样的嵌套，但内层是该操作真正的 NotFound 码：仍然必须看**外层**
+    ("dynamodb", "describe-table",
+     "An error occurred (ThrottlingException) when calling the DescribeTable operation: "
+     "retry later; earlier attempt said An error occurred (ResourceNotFoundException)"),
+    # (d) CFN 外层码对，但消息不是"栈不存在"那个完整形状
+    ("cloudformation", "describe-stacks",
+     "An error occurred (ValidationError) when calling the DescribeStacks operation: "
+     "role does not exist for this operation"),
 ]
 
 
@@ -1010,11 +1041,17 @@ def _doc_aws_commands():
                     continue
                 parts = seg.split()
                 flag = val = None
+                dup = False
                 for f in ("--table-name", "--function-name"):
                     if f in parts:
-                        flag, val = f, parts[parts.index(f) + 1]
+                        # **取最后一个**：真实 CLI 用最后出现的那个值。旧版取第一个，
+                        # 于是追加 `--function-name site-panel` 就能骗过守卫而 CLI 真去打
+                        # site-panel（Codex 第十三轮 P2-3，localhost 抓包实证）。
+                        idxs = [i for i, a in enumerate(parts) if a == f]
+                        dup = dup or len(idxs) > 1
+                        flag, val = f, parts[idxs[-1] + 1]
                         break
-                out.append((m.group(1), m.group(2), flag, val, seg.strip()))
+                out.append((m.group(1), m.group(2), flag, val, seg.strip(), dup))
     return out
 
 
@@ -1024,8 +1061,11 @@ def test_teardown_section_has_no_copyable_destructive_commands():
     判定用与 harness 同一套 fail-closed 分类：只读动词之外一律算破坏性。
     """
     seen, offenders = {}, []
-    for svc, verb, flag, val, cmd in _doc_aws_commands():
+    for svc, verb, flag, val, cmd, dup in _doc_aws_commands():
         if _is_readonly(f"{svc} {verb}"):
+            continue
+        if dup:
+            offenders.append(f"{cmd[:90]}   <- 同一个目标旗标出现多次（CLI 取最后一个）")
             continue
         key = (svc, verb, flag, val)
         if key not in _DOC_ALLOWED_EXACT:
@@ -1662,6 +1702,9 @@ def _expected_log_deletions():
     c[(_PRIMARY_REGION, "/aws/lambda/site-panel")] += 1
     c[(_PRIMARY_REGION, "/aws/codebuild/site-package")] += 1
     c[(_PRIMARY_REGION, _OWNED_EDGE_LG)] += 1
+    c[(_PRIMARY_REGION, _OWNED_AGENTCORE_LG)] += 1
+    c[(_PRIMARY_REGION, "/aws/lambda/site-deployer-validate")] += 1
+    c[(_PRIMARY_REGION, "/aws/lambda/site-access-rollup")] += 1
     for sid in _SITE_IDS:
         c[(_PRIMARY_REGION, f"/aws/lambda/site-{sid}")] += 1
     for r in _REGIONS:
@@ -1848,3 +1891,85 @@ def test_destructive_operations_actually_executed_are_the_expected_set(harness):
     }
     assert got == expected, (
         f"多出来的: {sorted(got - expected)}\n少掉的: {sorted(expected - got)}")
+
+
+def test_teardown_section_rejects_shell_substitution():
+    """围栏块里**不许**出现命令替换 / 反引号。
+
+    它们能把第二条命令藏在参数里：把输出路径写成
+    `/tmp/undeploy.json$(aws lambda invoke --function-name site-panel /tmp/e.json)`
+    时，按分隔符切分的解析器只看到外层命令，而 bash 会**先**执行内层那条
+    （Codex 第十三轮 P2-3，实测）。可照抄的 runbook 命令没有任何理由需要它们，
+    所以这里直接拒绝，而不是去写一个懂 shell 结构的解析器。
+    """
+    offenders = []
+    for block in _fenced_bash(_teardown_section()):
+        for line in block.splitlines():
+            s = line.strip()
+            if s.startswith("#") or not s:
+                continue
+            # `cd "$(git rev-parse --show-toplevel)"` 是正当用法，不能一刀切。
+            # 判据是**替换体里是否含 aws 调用**——那才是藏第二条命令的形态。
+            bodies = re.findall(r"\$\(([^)]*)\)", s) + re.findall(r"`([^`]*)`", s)
+            if any(_AWS_CALL.search(b) for b in bodies):
+                offenders.append(s[:110])
+    assert offenders == [], (
+        "拆除一节的围栏块里出现了命令替换——它可以把额外的 aws 调用藏进参数里：\n  "
+        + "\n  ".join(offenders))
+
+
+def test_absent_codes_match_botocore_wire_codes():
+    """表里每个码都必须是该操作真正的 **wire code**（对着 botocore 服务模型核对）。
+
+    `NotFoundException` 这种**异常类型名**不等于 wire code：SNS 的那个 shape
+    `error.code` 是 `NotFound`。写成类型名的后果不是报错而是**幂等回归**——真的没有
+    topic 时判 UNKNOWN，重跑一个已清空的账号就在这里 hard-stop（Codex 第十三轮 P2-2）。
+    有了这条，表就不会再凭"看起来像"去写码。
+    """
+    import botocore.session
+    sess = botocore.session.get_session()
+    # (脚本里的 service, operation) -> botocore 的 (service_id, OperationName)
+    probe = {
+        ("dynamodb", "describe-table"): ("dynamodb", "DescribeTable"),
+        ("dynamodb", "scan"): ("dynamodb", "Scan"),
+        ("iam", "get-role"): ("iam", "GetRole"),
+        ("lambda", "get-function"): ("lambda", "GetFunction"),
+        ("lambda", "get-function-url-config"): ("lambda", "GetFunctionUrlConfig"),
+        ("ecr", "describe-repositories"): ("ecr", "DescribeRepositories"),
+        ("cognito-idp", "describe-user-pool"): ("cognito-idp", "DescribeUserPool"),
+        ("sns", "get-topic-attributes"): ("sns", "GetTopicAttributes"),
+        ("ssm", "get-parameter"): ("ssm", "GetParameter"),
+        ("kms", "describe-key"): ("kms", "DescribeKey"),
+    }
+    script = _SCRIPT.read_text(encoding="utf-8")
+    body = script[script.index("_absent_codes() {"):script.index("# _outer_code <errtext>")]
+    problems = []
+    for (svc, op), (bsvc, bop) in probe.items():
+        prog = "set -uo pipefail\n" + body + '\n_absent_codes "$1" "$2"\n'
+        out = subprocess.run(["bash", "-c", prog, "_", svc, op],
+                             capture_output=True, text=True)
+        declared = set(out.stdout.split())
+        assert declared, f"表里 {svc} {op} 没有任何码（应至少一条）: {out.stderr}"
+        model = sess.get_service_model(bsvc).operation_model(bop)
+        wire = {sh.metadata.get("error", {}).get("code", sh.name) for sh in model.error_shapes}
+        shapes = {sh.name: sh.metadata.get("error", {}).get("code", sh.name)
+                  for sh in model.error_shapes}
+        for code in declared:
+            if code in wire:
+                continue
+            hint = f"（它是异常类型名，wire code 应为 {shapes[code]!r}）" if code in shapes else ""
+            problems.append(f"{svc} {op}: 声明了 {code}，不在该操作的 wire code 集合里{hint}")
+    assert problems == [], "\n  ".join(problems)
+
+
+def test_own_agentcore_log_group_is_deleted(harness):
+    """自己的 AgentCore runtime 日志组必须被删（Codex 第十三轮 P2-4 的正例）。
+
+    只有别人的 runtime 那条负例时，把归属前缀 `runtimes/` 拼成 `runtime/`
+    也全绿——因为完整性 Counter 的输入里压根没有这个资源。
+    """
+    harness("--yes")
+    deleted = {argv[argv.index("--log-group-name") + 1] for argv in harness.argv
+               if tuple(argv[:2]) == ("logs", "delete-log-group")}
+    assert _OWNED_AGENTCORE_LG in deleted, (
+        f"自己的 AgentCore 日志组没被删:\n{sorted(deleted)}")

@@ -135,7 +135,12 @@ _absent_codes() {
     "bedrock-agentcore-control get-agent-runtime")          echo "ResourceNotFoundException" ;;
     "dsql get-cluster")                          echo "ResourceNotFoundException ClusterNotFoundException" ;;
     "cognito-idp describe-user-pool")                       echo "ResourceNotFoundException" ;;
-    "sns get-topic-attributes")                             echo "NotFoundException" ;;
+    # **SNS 的 wire code 是 `NotFound`，不是异常类型名 `NotFoundException`**
+    # （botocore 模型里该 shape 的 error.code = NotFound；Codex 第十三轮 P2-2）。
+    # 写成类型名的后果不是报错而是**幂等回归**：真的没有 topic 时判成 UNKNOWN ⇒ 重跑
+    # 一个已清空的账号会在这里 hard-stop。表里的码一律由
+    # `test_absent_codes_match_botocore_wire_codes` 对着服务模型核对。
+    "sns get-topic-attributes")                             echo "NotFound" ;;
     "ssm get-parameter")                                    echo "ParameterNotFound" ;;
     "kms describe-key")                                     echo "NotFoundException" ;;
     "s3api get-bucket-location")                            echo "NoSuchBucket" ;;
@@ -144,19 +149,37 @@ _absent_codes() {
 }
 
 # _is_absent_err <service> <operation> <errtext> —— 该错误是否表示"资源不存在"。
+# _outer_code <errtext> —— 取 CLI 报文的**外层**错误码，取不到就打空。
+#
+# 两个坑都踩过（Codex 第十三轮 P1-1）：
+#   · `.*An error occurred (` 里的 `.*` 是**贪婪**的 ⇒ 同一行里嵌了别人的报文时
+#     （外层 AccessDeniedException，消息中含 `An error occurred (ResourceNotFoundException)`）
+#     取到的是**内层**那个码 ⇒ 判成 ABSENT ⇒ 漏删。所以这里把模式**锚在行首**：
+#     `^[^(]*` 不允许跨过任何左括号，只可能匹配到该行第一个 `(`。
+#   · 报文可能是多行（stderr 里还有别的东西），所以先只取**第一条**含该前缀的行。
+# 锚不上（例如"An error occurred"前面就有括号）时返回空 ⇒ 调用方一律 NOT_ABSENT（安全方向）。
+_outer_code() {
+  printf '%s\n' "$1" | grep -m1 'An error occurred (' \
+    | sed -n 's/^[^(]*An error occurred (\([^)]*\)).*/\1/p'
+}
+
 _is_absent_err() {
   local svc="$1" op="$2" err="$3"
+  local code; code="$(_outer_code "$err")"
+  [ -n "$code" ] || return 1
   # CloudFormation 的"栈不存在"是**无类型**的 ValidationError + 固定文案，服务没把它
-  # 建模成 typed NotFound——所以只有它保留一条**窄**消息规则（且仍绑定到具体操作）。
+  # 建模成 typed NotFound——所以只有它保留一条消息规则。但**外层码也必须是
+  # ValidationError**，消息也必须是完整的"栈不存在"形状：只匹配
+  # `*ValidationError*does not exist*` 的话，一条外层 AccessDenied、消息里恰好含这两个
+  # 片段的报文就会被判成 ABSENT（实测过），而那是漏删方向。
   case "$svc $op" in
     "cloudformation describe-stacks"|"cloudformation describe-stack-resources")
-      case "$err" in *ValidationError*"does not exist"*) return 0 ;; esac
+      [ "$code" = "ValidationError" ] || return 1
+      case "$err" in *"Stack with id "*"does not exist"*) return 0 ;; esac
       return 1 ;;
   esac
-  # 其余：从 `An error occurred (CODE)` 里取出错误码，只认该 (service, operation) 白名单里的码。
-  local code allowed a
-  code="$(printf '%s' "$err" | sed -n 's/.*An error occurred (\([^)]*\)).*/\1/p' | head -1)"
-  [ -n "$code" ] || return 1
+  # 其余：只认该 (service, operation) 白名单里的**外层** wire code。
+  local allowed a
   allowed="$(_absent_codes "$svc" "$op")"
   for a in $allowed; do
     [ "$code" = "$a" ] && return 0
