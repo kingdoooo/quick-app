@@ -902,6 +902,13 @@ _ABSENT_CASES = [
     ("cloudformation", "describe-stacks",
      "An error occurred (ValidationError) when calling the DescribeStacks "
      "operation: Stack with id X does not exist"),
+    # ARN 形态的栈标识符也必须认（收紧不能把真的"不存在"挡掉）
+    ("cloudformation", "describe-stacks",
+     "An error occurred (ValidationError) when calling the DescribeStacks operation: "
+     "Stack with id arn:aws:cloudformation:us-east-1:1:stack/S/abc-123 does not exist"),
+    ("cloudformation", "describe-stack-resources",
+     "An error occurred (ValidationError) when calling the DescribeStackResources "
+     "operation: Stack with id SiteDeployerStack does not exist"),
 ]
 
 
@@ -952,6 +959,24 @@ _NOT_ABSENT_CASES = [
     ("cloudformation", "describe-stacks",
      "An error occurred (ValidationError) when calling the DescribeStacks operation: "
      "role does not exist for this operation"),
+    # ── 以下四条是 Codex 第十四轮 P1-1 的形状。**修完 _cfn_msg_is_stack_absent 但没加
+    #    这些用例时，把判据退回 `*"Stack with id "*"does not exist"*` 仍然 129 条全绿。**
+    #    中间那个 `*` 能跨过任意文字，所以"栈存在、只是角色没了"也会被判 ABSENT ⇒ 漏删整个栈。
+    ("cloudformation", "describe-stacks",
+     "An error occurred (ValidationError) when calling the DescribeStacks operation: "
+     "Stack with id X exists, but its role does not exist"),
+    # 尾部还有别的话 ⇒ 不是那一句
+    ("cloudformation", "describe-stacks",
+     "An error occurred (ValidationError) when calling the DescribeStacks operation: "
+     "Stack with id X does not exist, retry later"),
+    # 被引述在别的话里 ⇒ 不是那一句
+    ("cloudformation", "describe-stacks",
+     "An error occurred (ValidationError) when calling the DescribeStacks operation: "
+     "upstream said \"Stack with id X does not exist\" while checking"),
+    # 标识符位置是多个词 ⇒ 不是合法栈标识符
+    ("cloudformation", "describe-stacks",
+     "An error occurred (ValidationError) when calling the DescribeStacks operation: "
+     "Stack with id my stack does not exist"),
 ]
 
 
@@ -1017,8 +1042,71 @@ _DOC_ALLOWED_EXACT = {
 }
 
 
+# 围栏块里**唯一**允许的命令替换。精确到整条，不做"体里含 aws 就拒"那种拼法追逐——
+# Codex 第十四轮 P2-3 用 `$($'a''ws' s3 rm …)` 绕过了那种判据（体里没有连续的字面 aws，
+# bash 实测先执行内层删除）。可照抄的 runbook 只需要这一条，所以白名单化。
+_DOC_ALLOWED_SUBST = {"git rev-parse --show-toplevel"}
+
+
+def _command_substitutions(line):
+    """取出**会被 shell 展开**的命令替换体，跳过单引号内的内容。
+
+    必须区分引号状态：`--query 'Roles[?starts_with(RoleName,`site-`)]'` 里的反引号
+    是 JMESPath 的（已弃用的）字面量，在**单引号内**，bash 不做命令替换 ——
+    把它当替换会产生假红。双引号内的 `$( )` 与反引号则确实会展开。
+    """
+    out, i, n = [], 0, len(line)
+    sq = dq = False
+    while i < n:
+        c = line[i]
+        if c == "'" and not dq:
+            sq = not sq; i += 1; continue
+        if c == '"' and not sq:
+            dq = not dq; i += 1; continue
+        if sq:                                  # 单引号内：什么都不展开
+            i += 1; continue
+        if c == "$" and i + 1 < n and line[i + 1] == "(":
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if line[j] == "(": depth += 1
+                elif line[j] == ")": depth -= 1
+                j += 1
+            out.append(line[i + 2:j - 1]); i = j; continue
+        if c == "`":
+            j = line.find("`", i + 1)
+            if j == -1: break
+            out.append(line[i + 1:j]); i = j + 1; continue
+        i += 1
+    return out
+
+
+def _shell_tokens(cmd):
+    """按 shell 引号规则分词，并把 `--flag=value` 统一成 `--flag` `value` 两个 token。
+
+    `seg.split()` 不认引号也不认 `--flag=value`，于是
+    `--function-name=site-panel` 与 `"--function-name" site-panel` 都能骗过重复检测
+    （Codex 第十四轮 P2-2，真实 CLI 对 localhost 的请求确实打到 site-panel）。
+    """
+    import shlex
+    try:
+        raw = shlex.split(cmd)
+    except ValueError:                      # 引号不闭合等 —— 交给调用方当可疑处理
+        return None
+    out = []
+    for tok in raw:
+        if tok.startswith("--") and "=" in tok:
+            flag, _, val = tok.partition("=")
+            out += [flag, val]
+        else:
+            out.append(tok)
+    return out
+
+
 def _doc_aws_commands():
-    """围栏块里每一条（拼好续行的）aws 命令 -> (服务, 动词, 目标旗标, 目标值, 原文)。"""
+    """围栏块里每一条（拼好续行、按 shell 语义分词的）aws 命令。
+
+    返回 (服务, 动词, 目标旗标, 目标值, 原文, 是否重复目标旗标)。
+    """
     out = []
     for block in _fenced_bash(_teardown_section()):
         joined, buf = [], ""
@@ -1032,26 +1120,29 @@ def _doc_aws_commands():
             joined.append(buf)
             buf = ""
         for cmd in joined:
-            # **一行里可能被塞进多条命令**（Codex 第十二轮 P1-3）：合法 invoke 后追加
-            # `; aws lambda invoke --function-name site-panel` 时旧版只看第一条就漏了。
-            # 按命令分隔符切开，每段单独查——分隔符本身也不该出现在可照抄的 runbook 命令里。
             for seg in re.split(r"(?:;|&&|\|\||\||&)", cmd):
-                m = _AWS_CALL.search(seg)
-                if not m:
+                if not _AWS_CALL.search(seg):
                     continue
-                parts = seg.split()
+                parts = _shell_tokens(seg)
+                if parts is None:
+                    out.append(("?", "?", None, None, seg.strip(), True))
+                    continue
+                try:
+                    i = parts.index("aws")
+                except ValueError:
+                    continue
+                svc = parts[i + 1] if i + 1 < len(parts) else ""
+                verb = parts[i + 2] if i + 2 < len(parts) else ""
                 flag = val = None
                 dup = False
                 for f in ("--table-name", "--function-name"):
-                    if f in parts:
-                        # **取最后一个**：真实 CLI 用最后出现的那个值。旧版取第一个，
-                        # 于是追加 `--function-name site-panel` 就能骗过守卫而 CLI 真去打
-                        # site-panel（Codex 第十三轮 P2-3，localhost 抓包实证）。
-                        idxs = [i for i, a in enumerate(parts) if a == f]
+                    idxs = [j for j, a in enumerate(parts) if a == f]
+                    if idxs:
                         dup = dup or len(idxs) > 1
-                        flag, val = f, parts[idxs[-1] + 1]
+                        # 取**最后一个**：真实 CLI 用最后出现的那个值
+                        flag, val = f, (parts[idxs[-1] + 1] if idxs[-1] + 1 < len(parts) else None)
                         break
-                out.append((m.group(1), m.group(2), flag, val, seg.strip(), dup))
+                out.append((svc, verb, flag, val, seg.strip(), dup))
     return out
 
 
@@ -1908,11 +1999,12 @@ def test_teardown_section_rejects_shell_substitution():
             s = line.strip()
             if s.startswith("#") or not s:
                 continue
-            # `cd "$(git rev-parse --show-toplevel)"` 是正当用法，不能一刀切。
-            # 判据是**替换体里是否含 aws 调用**——那才是藏第二条命令的形态。
-            bodies = re.findall(r"\$\(([^)]*)\)", s) + re.findall(r"`([^`]*)`", s)
-            if any(_AWS_CALL.search(b) for b in bodies):
-                offenders.append(s[:110])
+            # **白名单**，不是黑名单：`$($'a''ws' …)` 这种拼法没有连续的字面 aws，
+            # 追它的拼法追不完（Codex 第十四轮 P2-3 实测绕过了"体里含 aws 就拒"）。
+            # runbook 只需要 `$(git rev-parse --show-toplevel)` 这一条。
+            for body in _command_substitutions(s):
+                if body.strip() not in _DOC_ALLOWED_SUBST:
+                    offenders.append(f"{s[:100]}   <- 命令替换 $({body.strip()[:40]}) 不在白名单")
     assert offenders == [], (
         "拆除一节的围栏块里出现了命令替换——它可以把额外的 aws 调用藏进参数里：\n  "
         + "\n  ".join(offenders))
@@ -1940,6 +2032,13 @@ def test_absent_codes_match_botocore_wire_codes():
         ("sns", "get-topic-attributes"): ("sns", "GetTopicAttributes"),
         ("ssm", "get-parameter"): ("ssm", "GetParameter"),
         ("kms", "describe-key"): ("kms", "DescribeKey"),
+        # 上一轮漏了这两个，于是"整张表已逐项核对"是句过头话（Codex 第十四轮指出）
+        ("dsql", "get-cluster"): ("dsql", "GetCluster"),
+        ("bedrock-agentcore-control", "get-agent-runtime"):
+            ("bedrock-agentcore-control", "GetAgentRuntime"),
+        # `s3api get-bucket-location` **刻意不在这里**：GetBucketLocation 在本地模型里
+        # error_shapes 为空（S3 不走 typed error 那套），所以它的 `NoSuchBucket` 依据是
+        # 真机实测（见 test_stub_uses_real_cli_error_shapes 的注释），不是服务模型。
     }
     script = _SCRIPT.read_text(encoding="utf-8")
     body = script[script.index("_absent_codes() {"):script.index("# _outer_code <errtext>")]
@@ -1973,3 +2072,121 @@ def test_own_agentcore_log_group_is_deleted(harness):
                if tuple(argv[:2]) == ("logs", "delete-log-group")}
     assert _OWNED_AGENTCORE_LG in deleted, (
         f"自己的 AgentCore 日志组没被删:\n{sorted(deleted)}")
+
+
+@pytest.mark.parametrize("line,want", [
+    # 单引号内的反引号是 JMESPath 字面量，不是命令替换
+    ("""aws iam list-roles --query 'Roles[?starts_with(RoleName,`site-`)].RoleName'""", []),
+    # 双引号内的 $( ) 会展开
+    ('cd "$(git rev-parse --show-toplevel)"', ["git rev-parse --show-toplevel"]),
+    # 裸 $( ) 会展开
+    ("echo $(date)", ["date"]),
+    # 双引号内的反引号会展开
+    ('echo "`id`"', ["id"]),
+    # 嵌套括号要配对取完整体
+    ("x=$(foo $(bar) baz)", ["foo $(bar) baz"]),
+    # Codex 的绕过形态：体里没有连续的字面 aws，但仍是命令替换 ⇒ 必须被取出来
+    ("""echo /tmp/x$($'a''ws' s3 rm s3://other --recursive)""",
+     ["""$'a''ws' s3 rm s3://other --recursive"""]),
+])
+def test_command_substitution_extractor_respects_quotes(line, want):
+    """提取器必须区分引号状态：单引号内不展开、双引号内展开。
+
+    弄错任一侧都有代价：把单引号内的 JMESPath 反引号当替换 ⇒ 假红；
+    漏掉双引号内的替换 ⇒ 藏在参数里的第二条命令逃出守卫。
+    """
+    assert _command_substitutions(line) == want
+
+
+@pytest.mark.parametrize("cmd,want_dup", [
+    ("aws lambda invoke --function-name a --function-name=b out.json", True),
+    ('aws lambda invoke --function-name a "--function-name" b out.json', True),
+    ("aws lambda invoke --function-name=a out.json", False),
+    ("aws lambda invoke --function-name a out.json", False),
+])
+def test_doc_tokenizer_detects_duplicate_targets_in_both_syntaxes(cmd, want_dup):
+    """`--flag=value` 与带引号的 `"--flag"` 都必须被认出来（Codex 第十四轮 P2-2）。
+
+    真实 CLI 用**最后一个**值，所以漏检等于让 runbook 能悄悄改掉调用目标。
+    """
+    parts = _shell_tokens(cmd)
+    assert parts is not None
+    idxs = [j for j, a in enumerate(parts) if a == "--function-name"]
+    assert (len(idxs) > 1) is want_dup, parts
+
+
+def test_only_notfound_codes_classify_as_absent(harness):
+    """**合法 wire code ≠「资源不存在」**（Codex 第十四轮 P2-4）。
+
+    上一条模型守卫只验"声明的码属于该操作的 error_shapes"，而那里面还有内部故障、
+    限流、参数校验。把 `KMSInternalException` 加进 KMS 的 absent 白名单时，
+    224 条全绿——随后注入它，脚本漏掉第一把签名 key、继续删 S3、退 0。
+
+    所以这里验**补集**：枚举每个操作已建模的全部 wire code，声明之外的**一律**
+    必须 NOT_ABSENT。新增一条无关的码就会让本条红。
+    """
+    import botocore.session
+    sess = botocore.session.get_session()
+    probe = {
+        ("dynamodb", "describe-table"): ("dynamodb", "DescribeTable"),
+        ("iam", "get-role"): ("iam", "GetRole"),
+        ("lambda", "get-function"): ("lambda", "GetFunction"),
+        ("ecr", "describe-repositories"): ("ecr", "DescribeRepositories"),
+        ("cognito-idp", "describe-user-pool"): ("cognito-idp", "DescribeUserPool"),
+        ("sns", "get-topic-attributes"): ("sns", "GetTopicAttributes"),
+        ("ssm", "get-parameter"): ("ssm", "GetParameter"),
+        ("kms", "describe-key"): ("kms", "DescribeKey"),
+        ("dsql", "get-cluster"): ("dsql", "GetCluster"),
+        ("bedrock-agentcore-control", "get-agent-runtime"):
+            ("bedrock-agentcore-control", "GetAgentRuntime"),
+    }
+    script = _SCRIPT.read_text(encoding="utf-8")
+    body = script[script.index("_absent_codes() {"):script.index("# _outer_code <errtext>")]
+    problems = []
+    for (svc, op), (bsvc, bop) in probe.items():
+        prog = "set -uo pipefail\n" + body + '\n_absent_codes "$1" "$2"\n'
+        declared = set(subprocess.run(["bash", "-c", prog, "_", svc, op],
+                                      capture_output=True, text=True).stdout.split())
+        model = sess.get_service_model(bsvc).operation_model(bop)
+        wire = {sh.metadata.get("error", {}).get("code", sh.name) for sh in model.error_shapes}
+        assert wire, f"{svc} {op}: 模型里没有 error_shapes，这条 probe 该移出去"
+        assert declared <= wire, f"{svc} {op}: 声明了不在模型里的码 {declared - wire}"
+        for code in sorted(wire - declared):
+            if _run_is_absent(svc, op, _err(code)):
+                problems.append(
+                    f"{svc} {op}: {code} 不在声明的 NotFound 里，却被判成 ABSENT "
+                    f"—— 那会让一个**存在**的资源被静默跳过")
+    assert problems == [], "\n  ".join(problems)
+
+
+def test_declared_notfound_codes_are_the_expected_minimum(harness):
+    """正对照：每个操作声明的 NotFound 码集合必须**逐字**等于预期。
+
+    上一条验"声明之外的都不算 ABSENT"，这条验"声明的就是这些"——合起来才把
+    "多收一个码"和"悄悄换掉一个码"都挡住。
+    """
+    expected = {
+        ("dynamodb", "describe-table"): {"ResourceNotFoundException"},
+        ("dynamodb", "scan"): {"ResourceNotFoundException"},
+        ("iam", "get-role"): {"NoSuchEntity"},
+        ("lambda", "get-function"): {"ResourceNotFoundException"},
+        ("lambda", "get-function-url-config"): {"ResourceNotFoundException"},
+        ("ecr", "describe-repositories"): {"RepositoryNotFoundException"},
+        ("bedrock-agentcore-control", "get-agent-runtime"): {"ResourceNotFoundException"},
+        ("dsql", "get-cluster"): {"ResourceNotFoundException"},
+        ("cognito-idp", "describe-user-pool"): {"ResourceNotFoundException"},
+        ("sns", "get-topic-attributes"): {"NotFound"},
+        ("ssm", "get-parameter"): {"ParameterNotFound"},
+        ("kms", "describe-key"): {"NotFoundException"},
+        ("s3api", "get-bucket-location"): {"NoSuchBucket"},
+    }
+    script = _SCRIPT.read_text(encoding="utf-8")
+    body = script[script.index("_absent_codes() {"):script.index("# _outer_code <errtext>")]
+    got = {}
+    for svc, op in expected:
+        prog = "set -uo pipefail\n" + body + '\n_absent_codes "$1" "$2"\n'
+        got[(svc, op)] = set(subprocess.run(["bash", "-c", prog, "_", svc, op],
+                                            capture_output=True, text=True).stdout.split())
+    assert got == expected, (
+        "\n".join(f"  {k}: 实得 {sorted(got[k])} 期望 {sorted(v)}"
+                  for k, v in expected.items() if got.get(k) != v))

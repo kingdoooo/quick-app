@@ -133,7 +133,9 @@ _absent_codes() {
     "lambda get-function"|"lambda get-function-url-config") echo "ResourceNotFoundException" ;;
     "ecr describe-repositories")                            echo "RepositoryNotFoundException" ;;
     "bedrock-agentcore-control get-agent-runtime")          echo "ResourceNotFoundException" ;;
-    "dsql get-cluster")                          echo "ResourceNotFoundException ClusterNotFoundException" ;;
+    # 只写模型里真有的码：`ClusterNotFoundException` **不在** GetCluster 的错误集合里
+    # （Codex 第十四轮指出，本地模型实测确认），留着它就是一条无依据的"误收"面。
+    "dsql get-cluster")                                     echo "ResourceNotFoundException" ;;
     "cognito-idp describe-user-pool")                       echo "ResourceNotFoundException" ;;
     # **SNS 的 wire code 是 `NotFound`，不是异常类型名 `NotFoundException`**
     # （botocore 模型里该 shape 的 error.code = NotFound；Codex 第十三轮 P2-2）。
@@ -163,6 +165,29 @@ _outer_code() {
     | sed -n 's/^[^(]*An error occurred (\([^)]*\)).*/\1/p'
 }
 
+# _cfn_msg_is_stack_absent <errtext> —— 消息是否**恰好**是"栈不存在"那一句。
+#
+# 为什么不能用 `*"Stack with id "*"does not exist"*`（Codex 第十四轮 P1-1）：
+# 中间那个 `*` 可以跨过任意文字，于是
+#   `Stack with id X exists, but its role does not exist`
+# 也被判成 ABSENT（实测），而它说的是**栈存在**、只是角色没了 ⇒ 漏删整个 router 栈。
+# 所以这里先把消息从外层错误记录里取出来，再要求它整体等于
+#   Stack with id <合法栈标识符> does not exist
+# 标识符不许含空格，只允许栈名/ARN 用得到的字符——把"任意文字"这条路彻底堵掉。
+_cfn_msg_is_stack_absent() {
+  local line msg rest ident
+  line="$(printf '%s\n' "$1" | grep -m1 'An error occurred (')"
+  case "$line" in *"operation: "*) msg="${line#*operation: }" ;; *) return 1 ;; esac
+  rest="${msg#Stack with id }"
+  [ "$rest" != "$msg" ] || return 1                 # 必须以这句开头
+  ident="${rest% does not exist}"
+  [ "$ident" != "$rest" ] || return 1               # 必须以这句结尾
+  [ -n "$ident" ] || return 1
+  # 标识符里不许有空格，也不许有栈名/ARN 之外的字符
+  case "$ident" in *[!A-Za-z0-9:/_-]*) return 1 ;; esac
+  return 0
+}
+
 _is_absent_err() {
   local svc="$1" op="$2" err="$3"
   local code; code="$(_outer_code "$err")"
@@ -175,7 +200,7 @@ _is_absent_err() {
   case "$svc $op" in
     "cloudformation describe-stacks"|"cloudformation describe-stack-resources")
       [ "$code" = "ValidationError" ] || return 1
-      case "$err" in *"Stack with id "*"does not exist"*) return 0 ;; esac
+      _cfn_msg_is_stack_absent "$err" && return 0
       return 1 ;;
   esac
   # 其余：只认该 (service, operation) 白名单里的**外层** wire code。
