@@ -174,10 +174,68 @@ _outer_code() {
 # 所以这里先把消息从外层错误记录里取出来，再要求它整体等于
 #   Stack with id <合法栈标识符> does not exist
 # 标识符不许含空格，只允许栈名/ARN 用得到的字符——把"任意文字"这条路彻底堵掉。
+#
+# 前缀必须容忍**重试说明**（Codex 第十五轮 P2-1，实测）。botocore 的模板是
+#   An error occurred ({code}) when calling the {Op} operation{retry_info}: {msg}
+# 而 `ClientError._get_retry_info` 在 `MaxAttemptsReached` 时插入
+#   ` (reached max retries: N)`
+# standard 重试模式（AWS CLI v2 的默认）下 `MaxAttemptsChecker` 是**第一个**被求值的
+# 检查器，它对任何错误都会在 attempt >= max_attempts 时打上这个标记 ⇒ `AWS_MAX_ATTEMPTS=1`
+# 时连 ValidationError 也带这个后缀（默认 3 次时也会：前两次限流/5xx、最后一次
+# ValidationError）。只认 `operation: ` 的话这条**真实**报文被判 UNKNOWN ⇒
+# 一个已清空的账号在这里 hard-stop，幂等回归。这里只放行 `(reached max retries: <数字>)`
+# 这一种形状，消息本体仍然整体匹配。
+#
+# 前缀必须**从行首起逐段**解析，不能整行搜 `operation: `（Codex 第十六轮 P1-1，实测）：
+# 带重试后缀时外层前缀里根本没有 `operation: `，于是那条 `*"operation: "*` 会去匹配
+# **正文里**的同名片段 ——
+#   …operation (reached max retries: 0): Stack with id X exists, but nested
+#   operation: Stack with id Y does not exist
+# 被截成 `Stack with id Y does not exist` ⇒ 判 ABSENT ⇒ 漏删整个 router 栈（实测：
+# 假 AWS 注入后跳过该栈、继续 23 次破坏性调用、退 0）。**放宽前缀与锚定前缀必须同时做**。
 _cfn_msg_is_stack_absent() {
-  local line msg rest ident
+  local line head msg rest ident code opname tail attempts
   line="$(printf '%s\n' "$1" | grep -m1 'An error occurred (')"
-  case "$line" in *"operation: "*) msg="${line#*operation: }" ;; *) return 1 ;; esac
+
+  # ① `[CLI 前缀]An error occurred (<code>) when calling the <Op> ` —— 逐段消耗
+  #
+  # **前缀不能锚死在行首**（第十九轮，真机 aws-cli 2.36.34 实测）：真实 stderr 是
+  #   aws: [ERROR]: An error occurred (ValidationError) when calling the DescribeStacks operation: Stack with id X does not exist
+  # 带 `aws: [ERROR]: ` 这个 CLI 自己的前缀。要求行首等于 `An error occurred (` 会把
+  # **真的"栈不存在"**判成 UNKNOWN ⇒ 已清空的账号在 stacks 阶段 hard-stop（幂等回归）。
+  # 所以这里改成：取**第一处** `An error occurred (`，并要求它前面那段**不含括号**
+  # —— 与 `_outer_code` 是同一条规则，于是"第一个 `(` 必属于外层错误码"这个性质仍然成立，
+  # 劫持形态（正文里再出现 `operation: `）照样进不来。
+  head="${line%%An error occurred (*}"
+  [ "$head" != "$line" ] || return 1                # 必须含这句
+  case "$head" in *"("*|*")"*) return 1 ;; esac     # 前缀里有括号 ⇒ 不敢认（安全方向）
+  rest="${line#"$head"}"
+  rest="${rest#An error occurred (}"
+  case "$rest" in *")"*) ;; *) return 1 ;; esac
+  code="${rest%%")"*}"
+  case "$code" in ""|*"("*) return 1 ;; esac        # 码里不许再有括号
+  rest="${rest#"$code"}"                           # 两步走：`${rest#"$code")"}` 在 bash 里
+  rest="${rest#\)}"                                # 是语法错（嵌套引号后跟裸 `)`）
+  case "$rest" in " when calling the "*) ;; *) return 1 ;; esac
+  rest="${rest#" when calling the "}"
+  opname="${rest%% *}"
+  case "$opname" in ""|*[!A-Za-z0-9]*) return 1 ;; esac
+  rest="${rest#"$opname" }"
+
+  # ② `operation` 之后只有两种合法形状：`: ` 或 ` (reached max retries: <数字>): `
+  case "$rest" in
+    "operation: "*) msg="${rest#"operation: "}" ;;
+    "operation (reached max retries: "*)
+      tail="${rest#"operation (reached max retries: "}"
+      attempts="${tail%%")"*}"
+      case "$attempts" in ''|*[!0-9]*) return 1 ;; esac
+      tail="${tail#"$attempts"}"
+      case "$tail" in "): "*) ;; *) return 1 ;; esac
+      msg="${tail#"): "}"
+      ;;
+    *) return 1 ;;
+  esac
+
   rest="${msg#Stack with id }"
   [ "$rest" != "$msg" ] || return 1                 # 必须以这句开头
   ident="${rest% does not exist}"

@@ -30,6 +30,7 @@ harness 用一个假的 `aws` 顶在 PATH 前面，把每次调用记进日志�
 显式列举，**其余一切默认破坏性**。所以将来加了新的删除动作会自动进射程；
 忘了登记也只会让它多被管一层，不会让它逃出去。
 """
+import collections
 import os
 import re
 import shutil
@@ -155,7 +156,7 @@ printf '%s\n' "$*" >> "$FAKE_LOG"
 #   服务返回错误 -> 254    waiter 失败 -> 255    CLI 解析失败 -> 252
 # 原来恒 254 ⇒ `waited` 对 255 的处理从没被打过：在它里面加一条
 # 「rc=255 直接成功返回」，waiter 专测加全读点注入共 76 条仍然全绿。
-fail() { echo "An error occurred ($1) when calling the operation: injected" >&2
+fail() { echo "aws: [ERROR]: An error occurred ($1) when calling the operation: injected" >&2
          exit "${FAKE_FAIL_RC:-254}"; }
 
 # 各 API "不存在"时**真 CLI 的报文形态**。别改成统一的 ResourceNotFoundException——
@@ -163,24 +164,24 @@ fail() { echo "An error occurred ($1) when calling the operation: injected" >&2
 absent() {
   case "$*" in
     *get-bucket-location*|*head-bucket*)
-      echo "An error occurred (NoSuchBucket) when calling the GetBucketLocation operation: The specified bucket does not exist" >&2 ;;
+      echo "aws: [ERROR]: An error occurred (NoSuchBucket) when calling the GetBucketLocation operation: The specified bucket does not exist" >&2 ;;
     *describe-stacks*|*describe-stack-resources*)
-      echo "An error occurred (ValidationError) when calling the DescribeStacks operation: Stack with id X does not exist" >&2 ;;
+      echo "aws: [ERROR]: An error occurred (ValidationError) when calling the DescribeStacks operation: Stack with id X does not exist" >&2 ;;
     *get-role*)
-      echo "An error occurred (NoSuchEntity) when calling the GetRole operation: The role with name X cannot be found." >&2 ;;
+      echo "aws: [ERROR]: An error occurred (NoSuchEntity) when calling the GetRole operation: The role with name X cannot be found." >&2 ;;
     *get-parameter*)
-      echo "An error occurred (ParameterNotFound) when calling the GetParameter operation: " >&2 ;;
+      echo "aws: [ERROR]: An error occurred (ParameterNotFound) when calling the GetParameter operation: " >&2 ;;
     *describe-repositories*)
-      echo "An error occurred (RepositoryNotFoundException) when calling the DescribeRepositories operation: The repository does not exist in the registry" >&2 ;;
+      echo "aws: [ERROR]: An error occurred (RepositoryNotFoundException) when calling the DescribeRepositories operation: The repository does not exist in the registry" >&2 ;;
     *get-function*)
-      echo "An error occurred (ResourceNotFoundException) when calling the GetFunction operation: Function not found: arn:aws:lambda:x" >&2 ;;
+      echo "aws: [ERROR]: An error occurred (ResourceNotFoundException) when calling the GetFunction operation: Function not found: arn:aws:lambda:x" >&2 ;;
     *get-topic-attributes*)
       # **真实 wire code 是 NotFound**（botocore 模型 error.code），不是异常类型名
-      echo "An error occurred (NotFound) when calling the GetTopicAttributes operation: Topic does not exist" >&2 ;;
+      echo "aws: [ERROR]: An error occurred (NotFound) when calling the GetTopicAttributes operation: Topic does not exist" >&2 ;;
     *describe-user-pool*)
-      echo "An error occurred (ResourceNotFoundException) when calling the DescribeUserPool operation: User pool does not exist." >&2 ;;
+      echo "aws: [ERROR]: An error occurred (ResourceNotFoundException) when calling the DescribeUserPool operation: User pool does not exist." >&2 ;;
     *)
-      echo "An error occurred (ResourceNotFoundException) when calling the operation: Requested resource not found" >&2 ;;
+      echo "aws: [ERROR]: An error occurred (ResourceNotFoundException) when calling the operation: Requested resource not found" >&2 ;;
   esac
   exit 254
 }
@@ -641,6 +642,26 @@ def test_happy_path_deletes_things(harness):
         assert expected in d, f"没发出 {expected}:\n{d}"
 
 
+def test_stub_emits_the_real_cli_error_prefix():
+    """假 aws 的每条报文都必须带真 CLI 的 `aws: [ERROR]: ` 前缀（实测 aws-cli 2.36.34）。
+
+    这是**整套测试的射程前提**，也是第十九轮那条真回归的根：stub 之前直接从
+    `An error occurred (` 起写，于是"把外层前缀锚死在行首"这个改动**在 300 条里全绿**，
+    而真机 stderr 是
+
+        aws: [ERROR]: An error occurred (ValidationError) when calling the DescribeStacks operation: Stack with id X does not exist
+
+    ⇒ 真的"栈不存在"被判 UNKNOWN ⇒ 已清空的账号在 stacks 阶段 hard-stop（幂等回归）。
+    前缀留在 stub 里，任何"按行首锚定"的写法都会在这套测试里立刻红。
+    """
+    emits = [l for l in _FAKE_AWS.splitlines() if "An error occurred (" in l]
+    assert len(emits) >= 10, f"stub 里的报文点只找到 {len(emits)} 处，射程可疑"
+    missing = [l.strip()[:90] for l in emits if "aws: [ERROR]: An error occurred (" not in l]
+    assert missing == [], (
+        "假 aws 有报文没带真 CLI 前缀 —— 会让「按行首锚定」的分类器假绿：\n  "
+        + "\n  ".join(missing))
+
+
 def test_stub_uses_real_cli_error_shapes():
     """把真 CLI 的两条报文形态钉住（实测 aws-cli 2.36.34）。
 
@@ -881,7 +902,8 @@ def _run_is_absent(svc, op, errtext):
 
 
 def _err(code, op="TheOperation"):
-    return f"An error occurred ({code}) when calling the {op} operation: something"
+    # 带真 CLI 前缀（实测 aws-cli 2.36.34 的 stderr 是 `aws: [ERROR]: An error occurred (…`）
+    return f"aws: [ERROR]: An error occurred ({code}) when calling the {op} operation: something"
 
 
 # (service, operation, 该操作真正的 NotFound 报文) —— 必须判 ABSENT
@@ -909,6 +931,32 @@ _ABSENT_CASES = [
     ("cloudformation", "describe-stack-resources",
      "An error occurred (ValidationError) when calling the DescribeStackResources "
      "operation: Stack with id SiteDeployerStack does not exist"),
+    # ── botocore 在重试用尽时把 ` (reached max retries: N)` 插在 `operation` 与 `: ` 之间
+    #    （`ClientError.MSG_TEMPLATE` 的 `{retry_info}`）。standard 重试模式（AWS CLI v2 默认）
+    #    下 `MaxAttemptsChecker` 先被求值，于是 `AWS_MAX_ATTEMPTS=1` 时**连 ValidationError**
+    #    也带这个后缀。第十四轮把前缀收成只认 `operation: ` ⇒ 这条真实报文判 UNKNOWN ⇒
+    #    已清空的账号 hard-stop（Codex 第十五轮 P2-1，实测；父提交的旧 glob 反而是对的）。
+    ("cloudformation", "describe-stacks",
+     "An error occurred (ValidationError) when calling the DescribeStacks "
+     "operation (reached max retries: 0): Stack with id X does not exist"),
+    ("cloudformation", "describe-stack-resources",
+     "An error occurred (ValidationError) when calling the DescribeStackResources "
+     "operation (reached max retries: 2): "
+     "Stack with id arn:aws:cloudformation:us-east-1:1:stack/S/abc-123 does not exist"),
+    # ── 第十九轮：**真机 aws-cli 2.36.34 的 stderr 原文**（带 `aws: [ERROR]: ` 前缀）。
+    #    第十七轮把外层前缀锚死在行首，于是这两条真报文被判 UNKNOWN ⇒ 已清空的账号在
+    #    stacks 阶段 hard-stop。手写字符串（不带前缀）看不出来，所以这里照抄真机输出。
+    ("cloudformation", "describe-stacks",
+     "aws: [ERROR]: An error occurred (ValidationError) when calling the DescribeStacks "
+     "operation: Stack with id ReviewStack does not exist"),
+    ("cloudformation", "describe-stacks",
+     "aws: [ERROR]: An error occurred (ValidationError) when calling the DescribeStacks "
+     "operation (reached max retries: 0): Stack with id ReviewStack does not exist"),
+    # 非 CFN 的路径靠 `_outer_code` 取码，本来就不看 `operation: `——钉住它，别在
+    # 将来"顺手"把外层码解析也收成必须紧跟 `operation: `。
+    ("iam", "get-role",
+     "An error occurred (NoSuchEntity) when calling the GetRole "
+     "operation (reached max retries: 0): The role with name X cannot be found."),
 ]
 
 
@@ -977,6 +1025,38 @@ _NOT_ABSENT_CASES = [
     ("cloudformation", "describe-stacks",
      "An error occurred (ValidationError) when calling the DescribeStacks operation: "
      "Stack with id my stack does not exist"),
+    # ── 放行重试说明不能变成"括号里随便写"：只认 `(reached max retries: <数字>)`，
+    #    且消息本体仍要整体匹配、外层码仍要是 ValidationError。
+    ("cloudformation", "describe-stacks",
+     "An error occurred (ValidationError) when calling the DescribeStacks "
+     "operation (reached max retries: many): Stack with id X does not exist"),
+    ("cloudformation", "describe-stacks",
+     "An error occurred (ValidationError) when calling the DescribeStacks "
+     "operation (reached max retries: 0): Stack with id X exists, but its role does not exist"),
+    ("cloudformation", "describe-stacks",
+     "An error occurred (AccessDenied) when calling the DescribeStacks "
+     "operation (reached max retries: 0): Stack with id X does not exist"),
+    # ── 第十六轮 P1-1：**放宽前缀与锚定前缀必须同时做**。上一轮只加了重试分支，而普通
+    #    分支还是整行搜 `*"operation: "*`；带重试后缀时外层前缀里没有 `operation: `，
+    #    于是它去匹配**正文里**的同名片段，把消息截成 `Stack with id Y does not exist`
+    #    ⇒ 判 ABSENT ⇒ 漏删整个 router 栈（实测：跳过该栈、继续 23 次破坏性调用、退 0）。
+    ("cloudformation", "describe-stacks",
+     "An error occurred (ValidationError) when calling the DescribeStacks "
+     "operation (reached max retries: 0): Stack with id X exists, but nested "
+     "operation: Stack with id Y does not exist"),
+    # 带真 CLI 前缀的劫持形态（真机 stderr 形状 + 正文里再塞一个 `operation: `）
+    ("cloudformation", "describe-stacks",
+     "aws: [ERROR]: An error occurred (ValidationError) when calling the DescribeStacks "
+     "operation (reached max retries: 0): Stack with id X exists, but nested "
+     "operation: Stack with id Y does not exist"),
+    # 同样的正文、没有重试后缀时也必须拒（这条在旧版就是绿的，留着当正对照）
+    ("cloudformation", "describe-stacks",
+     "An error occurred (ValidationError) when calling the DescribeStacks operation: "
+     "Stack with id X exists, but nested operation: Stack with id Y does not exist"),
+    # 前缀里**有括号**就不认（安全方向）——这样"第一个 ( 必属于外层错误码"仍然成立
+    ("cloudformation", "describe-stacks",
+     "upstream(1): An error occurred (ValidationError) when calling the DescribeStacks "
+     "operation: Stack with id X does not exist"),
 ]
 
 
@@ -1013,8 +1093,123 @@ def _teardown_section() -> str:
     return t[start:end]
 
 
+# ── 围栏提取：**八层守卫的输入口，也是最致命的一处**（第二十轮 P2-3，六种形态实测）─────
+#
+# 旧实现是 `re.findall(r"```bash\n(.*?)```", text, re.S)`。三种绕过：
+#   · 块**内部**任意位置的三个反引号（例如一行 bash 注释 `# ``` `）会让非贪婪匹配提前收尾，
+#     后面那些**仍在代码块里、仍可照抄执行**的命令**一层都看不到**（实测：藏一条
+#     `export AWS_PROFILE=…` + 另一个函数的 invoke，8/8 全绿，真 CLI 打到 review-other）。
+#   · `~~~bash` 围栏压根不匹配。
+#   · `sh` / `zsh` / `console` 标签被**静默忽略**，而它们一样可照抄执行。
+# 加守卫层数救不了这个——**输入没了，后面几层再多也是零**。
+#
+# 所以按 CommonMark 的围栏规则真正地解析：开栏 ≤3 空格缩进 + ≥3 个 ` 或 ~ + info string
+# （反引号栏的 info 里不许再有反引号）；闭栏必须**独占一行**、同种字符、长度 ≥ 开栏。
+# 然后由 `test_teardown_section_fences_are_bash_only` 要求本节所有围栏都是 `bash` 标签
+# ——不支持的标签**显式报错**，不静默跳过。
+# 开栏：≤3 空格缩进 + ≥3 个 ` 或 ~ + info string（**整行剩余**，lang 取第一个词）。
+# 三处都是拿 markdown-it-py 当参考实现差分出来的**真漏块**（第二十一轮自测），
+# 漏一个块 = 那段命令脱离全部九层守卫：
+#   · info 带额外词（```bash foo=1）—— 旧写法要求剩余部分是单个 `\S*`，于是整块不匹配；
+#     CommonMark 只取第一个词当语言，块照样渲染、照样可照抄。
+#   · CRLF —— `rstrip("\n")` 留下 `\r`，`[ \t]*$` 匹配不上 ⇒ 整块消失。
+#     未来有人用 CRLF 编辑器改一次 DEPLOY.md 就会**静默**关掉九层。
+#   · 引用块里的围栏（`> ```bash`）—— 行首有 `>`，不匹配。这一种不在解析器里支持，
+#     而是由「受支持形态完备规则」（`_FENCE_RUN` / `_FENCE_SUPPORTED_LINE`）显式拒。
+_FENCE_OPEN = re.compile(r"^( {0,3})(`{3,}|~{3,})[ \t]*(.*)$")
+# 解析器**只认顶层、空格缩进 ≤3** 的围栏。别的形态（引用块里、缩进 ≥4、tab 缩进、
+# 列表里的相对缩进…）参考实现认得、它看不见 ⇒ 那段命令会脱离全部守卫。
+#
+# 上一版是**枚举不支持的形态**（两条正则）。r22 的差分证明那条路走不通（tab 缩进、
+# 空格+tab、列表内更深位置的 `>` 都不命中）。现在的方向是**约束文档**：只允许一种
+# 扫描器能可靠处理的写法，其余一律红。
+#
+# **不再声称这是"完备"的**（r23 / r24 两轮各否掉我一次，这里如实记下）：
+#   · r23：只检查"行形状"不能证明那一行在顶层、也不能证明扫描器的块状态对。反例是
+#     列表项里一个未闭合的围栏把后面的独立块并进来（参考 2 块 / 扫描器 1 块）。
+#   · r24：补的"围栏行数 == 2×块数"也不充分。两个反例：① 列表内未闭合围栏 + HTML 块里
+#     的三反引号被当成闭栏 ⇒ **块数相同（各 1）、围栏行恰好 2 条、计数通过**，而正文边界
+#     不同；② 合并块（3 行/1 块）与末尾未闭合块（1 行/1 块）**相互抵消** ⇒ 4 == 2×2 通过。
+# 所以判据换成三条**可逐条验证**的文档约束（都由下面那个守卫断言），它们把上述全部
+# 反例杀掉，但**不等于**"扫描器等价于 CommonMark 解析器"：
+#   ① 围栏行必须在**第 0 列**（两个反例的第一个开栏都在列表里缩进 2 ⇒ 红）；
+#   ② 每个块都必须**显式闭合**（杀掉抵消那一类，也让"未闭合吞后文"不可能）；
+#   ③ 本节不许出现 HTML 块起始行（以 `<` 开头）——那是剩下唯一已知的上下文混淆源。
+# 零缩进还顺带消掉了 r22/r23 的正文 tab 保真差异：开栏缩进为 0 时不剥任何东西。
+# 发现这些的方法是**拿参考实现差分**（markdown-it-py，不在锁定依赖里，一次性跑）；
+# 判据换代不代表以后不用再差分。
+_FENCE_RUN = re.compile(r"`{3,}|~{3,}")
+_FENCE_SUPPORTED_LINE = re.compile(r"^(`{3,}|~{3,})[ \t]*")
+_HTML_BLOCK_START = re.compile(r"^ {0,3}<")
+
+# CommonMark §2.1：行结束**只有** LF / CR / CRLF。`str.splitlines()` 还会在
+# U+000B、U+001C、U+0085、U+2028、U+2029 上断行 —— 参考实现差分实测 5/5 漏：
+# 正文里写 `a<U+2028>``` ` 时，参考实现看成**一行**（不闭栏），而按 splitlines()
+# 它是两行 ⇒ 提前闭栏 ⇒ 后面那条 `aws lambda invoke …` 脱离全部九层守卫。
+# 所以这里只按 `\n` 切。
+def _md_lines(text):
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+    if lines and lines[-1] == "":               # 末尾换行不产生一个空行（同 splitlines）
+        lines.pop()
+    return lines
+
+
+def _strip_fence_indent(line, n):
+    """按 CommonMark §4.5 去缩进：最多移除 n 个**空格**，别的一概不动。
+
+    旧写法是"前 n 个字符全是 `isspace()` 就切掉 n 个字符"，有三处偏差（r21 静态审计）：
+    只有 k<n 个空格时一个都不切；空行的换行会被一起切掉；tab 与 Unicode 空白按**字符**
+    而不是按 §2.2 的 4 列制表位算。这里只吃空格 ⇒ 永远不会切掉正文或行结束符。
+    """
+    k = 0
+    while k < n and k < len(line) and line[k] == " ":
+        k += 1
+    return line[k:]
+
+
+def _fenced_blocks_detailed(text):
+    """按 CommonMark 围栏规则切出 `(语言, 块体, 是否显式闭合)`。"""
+    # 末尾有无行结束符要在**规范化之后**判断：裸 CR 结尾时 `text.endswith("\n")`
+    # 为假，会少保留一个 LF（r23 §3）。CommonMark 的行结束是 LF / CR / CRLF 三种。
+    ends_with_newline = text.endswith(("\n", "\r"))
+    lines = _md_lines(text)
+    out, i, n = [], 0, len(lines)
+    while i < n:
+        m = _FENCE_OPEN.match(lines[i])
+        # 反引号栏的 info string 里不许有反引号（CommonMark），否则不是开栏
+        if not m or (m.group(2)[0] == "`" and "`" in m.group(3)):
+            i += 1
+            continue
+        # CommonMark：info string 的**第一个词**是语言，后面的词随便
+        indent, fence = len(m.group(1)), m.group(2)
+        info = m.group(3).strip()
+        lang = info.split()[0] if info else ""
+        close = re.compile(rf"^ {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}[ \t]*$")
+        body, i, closed = [], i + 1, False
+        while i < n:
+            if close.match(lines[i]):
+                closed = True
+                break
+            body.append(_strip_fence_indent(lines[i], indent))
+            i += 1
+        i += 1                                  # 跳过闭栏（没有闭栏时越过末尾，循环结束）
+        # 未闭合、且原文末尾没有换行时，最后一行**不补**换行（参考实现如此；r22 §1）
+        if body and not closed and not ends_with_newline:
+            text_body = "".join(l + "\n" for l in body[:-1]) + body[-1]
+        else:
+            text_body = "".join(l + "\n" for l in body)
+        out.append((lang, text_body, closed))
+    return out
+
+
+def _fenced_blocks(text):
+    """`(语言, 块体)`——`_fenced_blocks_detailed` 去掉 `closed` 的视图。"""
+    return [(lang, body) for lang, body, _closed in _fenced_blocks_detailed(text)]
+
+
 def _fenced_bash(text):
-    return re.findall(r"```bash\n(.*?)```", text, re.S)
+    return [body for lang, body in _fenced_blocks(text) if lang == "bash"]
 
 
 def test_teardown_section_delegates_to_the_script():
@@ -1033,12 +1228,30 @@ def test_teardown_section_documents_exit_code_3():
 # 第 ① 步"站点下线"是**人的判断**，刻意留在手册里：它用 put-item 建 job 行 + invoke
 # 调 undeploy Lambda。fail-closed 分类下这两个动词也算"破坏性"（对的——它们确实会改状态），
 # 所以这里必须**显式**豁免，而不是像以前那样靠"它们恰好不在关键词表里"蒙过去。
-# 要钉到**目标与次数**（Codex 第十一轮 P1-3）：上一版只按 (服务, 动词) 豁免，于是往围栏块里
-# 再塞一条 `aws lambda invoke --function-name site-panel` 也照样通过——那等于给
-# "任意 invoke / 任意 put-item"开了口子。
-_DOC_ALLOWED_EXACT = {
-    ("dynamodb", "put-item", "--table-name", "site-deploy-jobs"): 1,
-    ("lambda", "invoke", "--function-name", "site-deployer-undeploy"): 1,
+#
+# 判据是**整条 argv 逐 token 相等**，不是 (服务, 动词, 目标旗标, 目标值)。
+# 按"关键字段对得上"判是一条追不完的路（每轮都在追）：
+#   · 第十一轮 —— 只按 (服务, 动词) ⇒ 再塞一条 invoke site-panel 照过；
+#   · 第十四轮 —— `--function-name=x` / `"--function-name" x` 骗过重复检测；
+#   · 第十五轮 —— `$'--function-name'` 骗过 shlex；
+#   · 第十六轮 —— **AWS CLI 接受长选项的唯一前缀缩写**（argparse 默认 `allow_abbrev`）：
+#     `--function-n site-panel` 追加在后面，三条守卫全绿，而 aws-cli 2.36.34 打向本机
+#     HTTP 服务的路径实测是 `/2015-03-31/functions/site-panel/invocations`。
+# 逐 token 等值一次把这一族全关掉，而且顺带关掉同族的 `--endpoint-url` / `--profile`
+# 改向（那两个原本也能悄悄骑上一条"关键字段都对"的命令）。代价是改 runbook 的这两条
+# 命令必须同步改这张表——**那正是想要的**：它们是唯一两条可照抄的破坏性命令。
+_DOC_ALLOWED_ARGV = {
+    ("aws", "dynamodb", "put-item",
+     "--table-name", "site-deploy-jobs",
+     "--region", "us-east-1",
+     "--item", '{"job_id":{"S":"$JOB"},"site_id":{"S":"e2e-probe"},'
+               '"owner":{"S":"probe@e2e.invalid"},"status":{"S":"PENDING"}}'): 1,
+    ("aws", "lambda", "invoke",
+     "--function-name", "site-deployer-undeploy",
+     "--region", "us-east-1",
+     "--cli-binary-format", "raw-in-base64-out",
+     "--payload", '{"site_id":"e2e-probe","job_id":"$JOB","purge_data":true}',
+     "/tmp/undeploy.json"): 1,
 }
 
 
@@ -1048,46 +1261,230 @@ _DOC_ALLOWED_EXACT = {
 _DOC_ALLOWED_SUBST = {"git rev-parse --show-toplevel"}
 
 
-def _command_substitutions(line):
-    """取出**会被 shell 展开**的命令替换体，跳过单引号内的内容。
+# ── 围栏块的**语法白名单**（第十七轮起的主判据）──────────────────────────────
+#
+# 前几轮的形状完全一样：我按 bash 语义补一块解析，下一轮就找到我没覆盖的另一块——
+# 第十四轮 `$'…'`；第十五轮 `\'` 与带引号的 `"aws"`；第十六轮跨行引号、子 shell、
+# 续行补空格、长选项缩写；第十七轮 `${UNSET:-$(…)}`、`{#`、brace expansion、heredoc、
+# `aws --profile <值> <服务> <动词>`、前置 `VAR=v aws …`。**"写一个够用的 bash 词法器"
+# 是追不完的**，而每次追漏都是"守卫全绿 + bash 真的执行"。
+#
+# 所以这里换方向：先把围栏块**可以使用的语法收成一个可穷举的子集**，子集之外一律红。
+# 三条文档守卫是 AND 关系 ⇒ 任何依赖上面那族构造的绕过都过不了这一条，`_lex_block`
+# 只需要在这个子集上正确。子集就是 runbook 真正用得到的东西：
+#
+#   · 裸词：只含 `[A-Za-z0-9_@%+=:,./^-]`，**没有任何 shell 元字符**
+#     （于是 `<<` heredoc、`(`、`{`、`;`、`&`、`|`、`*`、`~`、裸 `$VAR` 全进不来）
+#   · 单引号串 `'…'`：里面一切字面（JMESPath 的反引号/方括号/圆括号都住这里）
+#   · 双引号串：只允许 `\\` `\"` `\$` `` \` `` 这几个转义与**简单** `$VAR`；
+#     裸 `$(`、`${`、裸反引号一律不允许 ⇒ 命令替换只能以下面那一个白名单形态出现
+#   · 唯一允许的命令替换：`"$(git rev-parse --show-toplevel)"`
+#   · 行尾可以有一个续行 `\`，或一个前面带空白的 `# 注释`
+#
+# 每一物理行必须被这条文法**整行**吃掉。有个关键副产物：**引号必须在同一物理行闭合**，
+# 于是"按物理行剥注释"这件事重新变成可靠的（那正是第十六轮 P2-2 的根）。
+_G_BARE = r"[A-Za-z0-9_@%+=:,./^-]+"
+# 引号内排除 **NUL 与其它 C0 控制字符**：bash 会把 NUL 从参数里**丢掉**，而两条分词路径
+# 都原样保留（r23 §4：`'alpha<NUL>beta'` 我给 `alpha\x00beta`、bash 给 `alphabeta`）。
+# runbook 不需要控制字符，所以按字符域拒掉，而不是去建模 bash 的丢弃行为。
+_G_SQ = r"'[^'\x00-\x08\x0b-\x1f\x7f]*'"
+# 双引号内的转义**只允许** `\\` 与 `\"`。刻意不允许 `\$` 与 `` \` ``：shlex 会**保留**
+# 那个反斜杠、bash 会去掉（r22 §3 用真 bash 量到：`"price=\$RATE"` shlex 给
+# `price=\$RATE`、bash 给 `price=$RATE`）。允许它等于让 `"…\$JOB…"` 在我这里"看着是一个
+# 展开"（EXPAND 层要求 JOB 已绑定、JSON 层还会把它替换掉），而 bash 发出去的是**字面量**
+# —— 与第二十轮 P2-1B 同一族的洞。去掉之后，本子集内 shlex 值与 bash 值**只差变量展开
+# 这一件事**，而那件事由 EXPAND / JSON 两层显式建模（见 test_word_values_match_real_bash）。
+_G_DQ = r'"(?:\\[\\"]|\$[A-Za-z_][A-Za-z0-9_]*|[^"\\$`\x00-\x08\x0b-\x1f\x7f])*"'
+_G_SUBST = re.escape('"$(git rev-parse --show-toplevel)"')
+_G_WORD = f"(?:{_G_SUBST}|{_G_SQ}|{_G_DQ}|{_G_BARE})"
+_DOC_LINE_GRAMMAR = re.compile(rf"[ \t]*(?:{_G_WORD}(?:[ \t]+{_G_WORD})*)?[ \t]*")
 
-    必须区分引号状态：`--query 'Roles[?starts_with(RoleName,`site-`)]'` 里的反引号
-    是 JMESPath 的（已弃用的）字面量，在**单引号内**，bash 不做命令替换 ——
-    把它当替换会产生假红。双引号内的 `$( )` 与反引号则确实会展开。
+# 再加一条**行级**规则：赋值形态的词只许**独占一行**。`VAR=v cmd …` 这种前置赋值
+# 能整套换掉凭据/账号而不改服务与动词（第十七轮 P2-4，真机确认换到了另一组凭据），
+# 而它在词法上完全合法 —— 所以只能按结构拒。`--table-name=x` / `'a=b'` 不是赋值形态
+# （不以标识符起头），不受这条影响。
+_G_PREFIX_ASSIGN = re.compile(r"[ \t]*[A-Za-z_][A-Za-z0-9_]*=\S*[ \t]+\S")
+
+
+def _doc_line_ok(line):
+    """这一物理行是否落在语法白名单里。
+
+    先按整行试；不成再按"词首的 `#`"逐个切一次当行尾注释重试（`#` 必须前面是空白，
+    与 bash 的"注释只在词首起"一致）。整行优先保证了 `"…# …"` 这种**引号内**的 `#`
+    不会被当注释——那种情况整行就已经匹配上了。
     """
-    out, i, n = [], 0, len(line)
-    sq = dq = False
+    for cand in [line] + [line[:m.start()] for m in re.finditer(r"(?<=[ \t])#", line)]:
+        cand = cand.rstrip()
+        if cand.endswith("\\"):                 # 行尾续行
+            cand = cand[:-1]
+        if _G_PREFIX_ASSIGN.match(cand):        # `VAR=v cmd …` —— 前置赋值，拒
+            continue
+        if _DOC_LINE_GRAMMAR.fullmatch(cand):
+            return True
+    return False
+
+
+def _doc_grammar_offenders():
+    """拆除一节的围栏块里所有不在语法白名单内的物理行。"""
+    return [line.strip()[:110] for block in _fenced_bash(_teardown_section())
+            for line in block.splitlines()
+            if line.strip() and not line.lstrip().startswith("#") and not _doc_line_ok(line)]
+
+
+def test_teardown_section_uses_only_the_allowed_shell_subset():
+    """围栏块只许用语法白名单里的写法。
+
+    这是第十七轮起的**主判据**：它不去理解 bash，而是把 bash 里那些"我理解不全"的
+    构造（heredoc、`${…}` 参数展开、brace expansion、子 shell / 分组、管道 / 分隔符、
+    前置 `VAR=v`、`aws --global-opt … ` 之外的花样）**在语法层挡掉**。
+    真要往 runbook 里加新写法时这条会红——那时该做的是想清楚它能不能被安全解析，
+    而不是给词法器再补一块。
+    """
+    offenders = _doc_grammar_offenders()
+    assert offenders == [], (
+        "拆除一节的围栏块出现了语法白名单之外的写法（见 _G_WORD 的注释）：\n  "
+        + "\n  ".join(offenders))
+
+
+# bash 的词法状态**跨物理行**。按物理行去剥注释 / 判引号 / 拼续行，会同时开出三个洞
+# （Codex 第十六轮 P2-2 / P2-3 / P2-4 是同一个根，三条都实测复现过）：
+#
+#   · **双引号跨行，而 `#` 在引号内不是注释。** 于是
+#         JOB2="{
+#         # '$(aws s3 rm s3://other --recursive)'
+#         }"
+#     在 bash 里照样执行内层删除（那对单引号在双引号内是**字面量**），而三条守卫
+#     都先"以 # 开头就 continue"⇒ **全绿**。这是一条完整绕过。
+#   · **`\` + 换行是行继续：两个字符都消失、不补空格。** 旧实现把 `\` 换成一个空格，
+#     于是
+#         --function-\
+#           name site-panel
+#     bash 拼成生效的 `--function-name`，守卫却拼成 `--function-` `name` 两个词
+#     ⇒ 重复目标检测失效。真正的分隔来自**下一行的缩进**，所以也不能先 strip 再拼。
+#   · **`( ) { }` 也是命令分隔/分组符。** 只按 `; && || | &` 切时，
+#     `("aws" lambda invoke --function-name site-panel /tmp/e.json)` 分词得到 `(aws`，
+#     token 检测与正则同时落空 ⇒ 整条脱离射程，而 bash 确实执行它。
+#
+# 所以这里只留**一个**词法器，整块扫一遍，三条文档守卫共用它。
+def _lex_block(text):
+    """按 bash 词法把一个围栏块切开。
+
+    返回 `(commands, subs, unterminated)`：
+
+      · `commands` —— 逻辑命令原文：注释按词法状态剥掉、续行按 bash 语义拼好
+        （不补空格）、在**未引用**的 `; & | ( ) { }` 与换行处切开。
+      · `subs` —— 会被 bash 展开的命令替换体（`$( )` 与反引号）。单引号内的不算：
+        `--query 'Roles[?starts_with(RoleName,`site-`)]'` 里的反引号是 JMESPath
+        的字面量，当成替换会假红。
+      · `unterminated` —— 扫完仍在引号 / 替换内 ⇒ 调用方一律当可疑。
+
+    反斜杠**先于**引号处理：裸的 `\\'` 是一个**字面**单引号、不开引号段，于是
+    `/tmp/undeploy.json\\'$(aws s3 rm …)` 在 bash 里照样执行内层替换（第十五轮 P2-3）。
+    双引号内 bash 只对 ``$ ` " \\`` 与换行做转义，其余反斜杠是字面量（`\\"` 这种在本节的
+    `--item "{\\"job_id\\":…}"` 里真实出现，弄错会把 dq 状态翻反）。
+    """
+    cmds, subs, cur = [], [], []
+    sq = dq = unterminated = False
+    prev_ws = True                              # 上一个字符是否空白/行首 ⇒ `#` 是否起注释
+    i, n = 0, len(text)
+
+    def flush():
+        s = "".join(cur).strip()
+        if s:
+            cmds.append(s)
+        cur.clear()
+
     while i < n:
-        c = line[i]
+        c = text[i]
+        if c == "\\" and not sq:                # 单引号内反斜杠是字面量，不转义
+            if i + 1 < n and text[i + 1] == "\n":
+                i += 2; continue                # 行继续：两个字符都消失，**不补空格**
+            if dq and i + 1 < n and text[i + 1] not in '$`"\\':
+                cur.append(c); i += 1; prev_ws = False; continue
+            cur.append(text[i:i + 2]); i += 2; prev_ws = False; continue
         if c == "'" and not dq:
-            sq = not sq; i += 1; continue
+            sq = not sq; cur.append(c); i += 1; prev_ws = False; continue
         if c == '"' and not sq:
-            dq = not dq; i += 1; continue
-        if sq:                                  # 单引号内：什么都不展开
-            i += 1; continue
-        if c == "$" and i + 1 < n and line[i + 1] == "(":
+            dq = not dq; cur.append(c); i += 1; prev_ws = False; continue
+        if sq:                                  # 单引号内：原样保留，换行也不断句
+            cur.append(c); i += 1; prev_ws = False; continue
+        if c == "#" and not dq and prev_ws:     # 只有**未引用**时 `#` 才是注释
+            j = text.find("\n", i)
+            i = n if j < 0 else j               # 换行留给下一轮去断句
+            continue
+        if c == "$" and i + 1 < n and text[i + 1] == "(":
             depth, j = 1, i + 2
             while j < n and depth:
-                if line[j] == "(": depth += 1
-                elif line[j] == ")": depth -= 1
+                if text[j] == "(": depth += 1
+                elif text[j] == ")": depth -= 1
                 j += 1
-            out.append(line[i + 2:j - 1]); i = j; continue
+            if depth:
+                unterminated = True; break
+            subs.append(text[i + 2:j - 1])
+            cur.append(text[i:j]); i = j; prev_ws = False; continue
+        # **不要**在这里加"`${…}` 整段跳过"那种分支：`${UNSET:-$(aws s3 rm …)}` 在变量
+        # 未设置时会真的执行内层替换（第十七轮 P2-1，实测），跳过等于把它藏起来。
+        # 让 `$` 与 `{` 当普通字符走下去 ⇒ 内层 `$(` 照样被取出来（fail-closed）。
+        # `${…}` 本身已由语法白名单在更前面挡掉。
         if c == "`":
-            j = line.find("`", i + 1)
-            if j == -1: break
-            out.append(line[i + 1:j]); i = j + 1; continue
-        i += 1
-    return out
+            j = text.find("`", i + 1)
+            if j < 0:
+                unterminated = True; break
+            subs.append(text[i + 1:j])
+            cur.append(text[i:j + 1]); i = j + 1; prev_ws = False; continue
+        # `{` / `}` **不在**这张表里：bash 只在它们**独立成词**时才当分组关键字，
+        # 而无条件断句会反过来开洞 —— `echo {# $(aws s3 rm …)` 里 bash 把 `{#` 当普通词，
+        # 断句后 `#` 落到词首就被当成注释、把整条替换吞掉（第十七轮 P2-2，实测）。
+        # 分组 / brace expansion 由语法白名单挡掉，这里不猜。
+        if not dq and c in ";&|\n()":           # 命令分隔 / 子 shell
+            flush(); i += 1; prev_ws = True; continue
+        cur.append(c); i += 1; prev_ws = c in " \t"
+    flush()
+    return cmds, subs, unterminated or sq or dq
+
+
+def _command_substitutions(line):
+    """单行版（给下面那组单元用例用）：会被 bash 展开的命令替换体。"""
+    return _lex_block(line)[1]
+
+
+# shlex **不认** bash 的 ANSI-C / locale 引用：它把 `$'--function-name'` 分成
+# `$--function-name`，于是往豁免命令尾部再塞一个 `$'--function-name' site-panel`
+# 时三条守卫全绿，而 bash 展开后真实 CLI 打的是 site-panel（Codex 第十五轮 P2-2，实测）。
+# 追 shlex 与 bash 的语义差不如**拒掉这种写法**：可照抄的 runbook 没有理由需要它，
+# 这与命令替换那条白名单是同一个取舍。`test_teardown_section_rejects_ansi_c_quoting`
+# 另外把它钉在整节上（含非 aws 行）。
+_ANSI_C_QUOTE = re.compile(r"\$['\"]")
+
+
+def _shlex_words(cmd):
+    """shlex 的原始分词（**不做** `--flag=value` 拆分）；分不了词返回空表。
+
+    只用来和 `_raw_words` 对数：两者词数不等说明这条命令不在语法子集里
+    （例如 `a''b` 那种相邻引号拼接），一律当可疑。
+    """
+    import shlex
+    if _ANSI_C_QUOTE.search(cmd):
+        return []
+    try:
+        return shlex.split(cmd)
+    except ValueError:
+        return []
 
 
 def _shell_tokens(cmd):
     """按 shell 引号规则分词，并把 `--flag=value` 统一成 `--flag` `value` 两个 token。
+
+    分不了词（引号不闭合、或出现 `$'…'` / `$"…"`）时返回 `None`，交给调用方当**可疑**
+    处理——不是当"没有 aws 调用"跳过。
 
     `seg.split()` 不认引号也不认 `--flag=value`，于是
     `--function-name=site-panel` 与 `"--function-name" site-panel` 都能骗过重复检测
     （Codex 第十四轮 P2-2，真实 CLI 对 localhost 的请求确实打到 site-panel）。
     """
     import shlex
+    if _ANSI_C_QUOTE.search(cmd):
+        return None
     try:
         raw = shlex.split(cmd)
     except ValueError:                      # 引号不闭合等 —— 交给调用方当可疑处理
@@ -1103,82 +1500,461 @@ def _shell_tokens(cmd):
 
 
 def _doc_aws_commands():
-    """围栏块里每一条（拼好续行、按 shell 语义分词的）aws 命令。
+    """围栏块里每一条 aws 命令：`(服务, 动词, 规范化 argv, 原文)`。
 
-    返回 (服务, 动词, 目标旗标, 目标值, 原文, 是否重复目标旗标)。
+    `argv` 为 `None` 表示"分不了词 / 两套解析不一致"⇒ 调用方一律当可疑。
     """
     out = []
     for block in _fenced_bash(_teardown_section()):
-        joined, buf = [], ""
-        for line in block.splitlines():
-            s = line.strip()
-            if s.startswith("#") or not s:
+        cmds, _subs, unterminated = _lex_block(block)
+        if unterminated:
+            out.append(("?", "?", None, "块扫完仍在引号/替换内：" + block.strip()[:90]))
+        for cmd in cmds:
+            parts = _shell_tokens(cmd)
+            if parts is None:
+                # 分不了词：只要这段沾 aws 就当可疑（宁可假红也不放过）
+                if "aws" in cmd:
+                    out.append(("?", "?", None, cmd))
                 continue
-            buf += s[:-1] + " " if s.endswith("\\") else s
-            if s.endswith("\\"):
+            # **按 token 找 aws，不按正则**：`"aws" lambda invoke …` 里 `aws` 被引号
+            # 包着，`\baws\s+` 匹配不到（第十五轮 P2-2）。带路径的 `/usr/bin/aws` 也算。
+            idxs = [j for j, t in enumerate(parts) if t == "aws" or t.endswith("/aws")]
+            if not idxs:
+                # 正则看见了、分词没看见 ⇒ 两套解析不一致，当可疑处理
+                if _AWS_CALL.search(cmd):
+                    out.append(("?", "?", None, cmd))
                 continue
-            joined.append(buf)
-            buf = ""
-        for cmd in joined:
-            for seg in re.split(r"(?:;|&&|\|\||\||&)", cmd):
-                if not _AWS_CALL.search(seg):
-                    continue
-                parts = _shell_tokens(seg)
-                if parts is None:
-                    out.append(("?", "?", None, None, seg.strip(), True))
-                    continue
-                try:
-                    i = parts.index("aws")
-                except ValueError:
-                    continue
-                svc = parts[i + 1] if i + 1 < len(parts) else ""
-                verb = parts[i + 2] if i + 2 < len(parts) else ""
-                flag = val = None
-                dup = False
-                for f in ("--table-name", "--function-name"):
-                    idxs = [j for j, a in enumerate(parts) if a == f]
-                    if idxs:
-                        dup = dup or len(idxs) > 1
-                        # 取**最后一个**：真实 CLI 用最后出现的那个值
-                        flag, val = f, (parts[idxs[-1] + 1] if idxs[-1] + 1 < len(parts) else None)
-                        break
-                out.append((svc, verb, flag, val, seg.strip(), dup))
+            i = idxs[0]
+            svc = parts[i + 1] if i + 1 < len(parts) else ""
+            verb = parts[i + 2] if i + 2 < len(parts) else ""
+            # 只有"形状规整"的调用才准按 (服务, 动词) 去走只读豁免。两条实测教训：
+            #   · `aws --profile list-prod lambda invoke --function-name site-panel …`
+            #     被解析成 (服务=`--profile`, 动词=`list-prod`)，`list-` 前缀让**整条**
+            #     当只读跳过（第十七轮 P2-3；配好那个临时 profile 后真实 CLI 确实打到
+            #     了 site-panel）。所以服务/动词都不许以 `-` 开头。
+            #   · `aws` 前面有东西（`AWS_PROFILE=other-account aws …`、包装器）时，
+            #     前置赋值能整套换掉凭据/账号而**不改**服务与动词（第十七轮 P2-4，
+            #     真机确认换到了另一组凭据）。所以 `aws` 必须是这条命令的第一个词。
+            wellformed = (i == 0 and svc and verb
+                          and not svc.startswith("-") and not verb.startswith("-"))
+            # argv 取**整条**命令，不是 `parts[i:]`：从 `aws` 起截会把前置赋值/包装器
+            # 丢掉，于是 `AWS_PROFILE=other aws lambda invoke …` 与豁免表逐 token 相等。
+            out.append((svc if wellformed else "?", verb if wellformed else "?",
+                        tuple(parts), cmd))
     return out
 
 
+# ── 语句白名单（第十八轮起的主判据）────────────────────────────────────────
+#
+# 第十七轮那条**字符级**语法白名单只管"词长什么样"，不管"允许执行哪些语句"。
+# 于是三类东西照样进得来（第十八轮，五种形态全部真机复现，见下面的 bypass 表）：
+#
+#   · **命令名不是字面量**：`REVIEW_CMD=aws` + `"$REVIEW_CMD" lambda invoke …`，
+#     或 `bash -c '"aws" lambda invoke …'`。两者都不含 `aws` 这个 token，正则也被
+#     引号挡住 ⇒ 整条脱离射程，而假 aws 记到的 `--function-name` 是 site-panel。
+#   · **独占一行的环境改写**：`export AWS_PROFILE=other-account`（或裸
+#     `AWS_PROFILE=other-account`——重新赋值不清除已有的 export 属性）。豁免命令的
+#     token 一个字没变，但假 aws 记到的 `AWS_PROFILE` 已经是另一组凭据。
+#     上一轮只禁了**同一条命令**的前置赋值，独立一行的没管住。
+#   · **变量值改掉业务语义**：`JOB=\` 续行接 `'job-teardown-e2e-probe","site_id":"victim'`。
+#     豁免的 invoke 一字不改、argv 逐 token 相等，但 `$JOB` 插进 payload 后多出一个
+#     `site_id`，Python 的 json 取**后**一个 ⇒ 目标从夹具站点变成 `victim`，
+#     `purge_data=true` 还在。
+#
+# 所以判据再上一层：**每条逻辑语句必须落进一张点名的形状表**，命令位置只能是固定
+# 字面量，变量绑定只能是点名的那一条。"再去补 `$VAR` / `bash` / `eval` 的黑名单"是
+# 上一轮那条路的重演，不做。
+_STMT_SCRIPT = "site-builder/scripts/teardown_platform.sh"
+_STMT_CD = ("cd", "$(git rev-parse --show-toplevel)")
+# 唯一允许的变量绑定：名字、值、次数都点名。放宽任何一维都会把 P2-3 那条放回来。
+_DOC_ALLOWED_ASSIGN = {"JOB=job-teardown-e2e-probe": 1}
+_STMT_BARE_ARG = re.compile(r"[A-Za-z0-9_.:/-]+")
+
+
+_Stmt = collections.namedtuple("_Stmt", "block kind parts raws cmd")
+
+
+def _aligned_words(cmd):
+    """`(parts, raws)`——**逐下标对齐**的去引号值与原始词；对不齐返回 `([], [])`。
+
+    r21 静态审计指出的独立一致性问题：`_shell_tokens` 会把 `--flag=value` **拆成两个**
+    `parts`，而 `_raw_words` 给的是**一个**原始词。上一版只校验
+    `len(raws) == len(_shlex_words(cmd))`（两边都没拆），所以
+    `--region=us-east-1` 这种全裸值形态**校验通过而下标从此错位**（实测：
+    `zip(raws, parts)` 从那个词起整体偏一位，`raws[parts.index(flag)+1]` 取到的是隔壁的词）。
+    错位的后果是"单引号里的 `$` 不展开"那条检查作用在**错误的词**上 ⇒ P2-1B 重新打开。
+
+    这里改成拆分时**同步复制原始词**，于是两张表永远等长同序。
+    """
+    raws0 = _raw_words(cmd)
+    vals0 = _shlex_words(cmd)
+    if raws0 is None or not vals0 or len(raws0) != len(vals0):
+        return [], []
+    parts, raws = [], []
+    for raw, val in zip(raws0, vals0):
+        if val.startswith("--") and "=" in val:
+            flag, _, v = val.partition("=")
+            parts += [flag, v]; raws += [raw, raw]
+        else:
+            parts.append(val); raws.append(raw)
+    # 与 `_shell_tokens` 必须给出同一串（`_doc_aws_commands` 用的是后者）
+    if parts != (_shell_tokens(cmd) or []):
+        return [], []
+    return parts, raws
+
+
+def _raw_value_segment(raw):
+    """`--flag=value` 形态的原始词里，取 `=` 之后那段的原始形态；其余原样返回。
+
+    拆分后两个 `parts` 共用同一个原始词，而"是不是单引号"要看**值**那一段
+    （`--payload='{…}'` 的整词以 `-` 开头、看着像裸词，值却是单引号）。
+    """
+    m = re.match(r"--[A-Za-z0-9-]*=", raw)
+    return raw[m.end():] if m else raw
+
+
+def _raw_words(cmd):
+    """把一条逻辑命令切成**保留引用形态**的原始词；切不干净返回 `None`。
+
+    为什么必须保留引用（第二十轮 P2-1，两种形态实测）：`_shell_tokens` 走 shlex，会把
+    引号**去掉**，于是两处 bash 语义丢失且守卫全绿——
+      · `'JOB=job-teardown-e2e-probe'` 去引号后与裸赋值同形，语句层记作一次合法绑定；
+        而 bash 把**整体被引用的词**当**命令名**（`command not found`），JOB 压根没赋上。
+      · `--payload '{…"$JOB"…}'` 去引号后与双引号版逐 token 相等；而单引号里 `$JOB`
+        **不展开**，真 CLI 发出去的 job_id 就是字面量 `$JOB`（与 put-item 的主键不是一个）。
+    语法白名单保证每个词恰好是 `_G_WORD` 的一个匹配，所以这里能反过来用它切词，
+    并要求匹配之间只有空白（切不干净就 `None` ⇒ 调用方当可疑）。
+    """
+    words, pos = [], 0
+    for m in re.finditer(_G_WORD, cmd):
+        # 间隙只允许**空格/tab**（不用 Unicode 的 strip：语法里的分隔符就是这两个）
+        if m.start() > pos and cmd[pos:m.start()].strip(" \t"):
+            return None
+        if m.start() == pos and words:          # 相邻两词之间必须有分隔符
+            return None
+        words.append(m.group(0)); pos = m.end()
+    return None if cmd[pos:].strip(" \t") else words
+
+
+def _word_kind(raw):
+    """原始词的引用形态：`subst` / `sq` / `dq` / `bare`。"""
+    if raw == '"$(git rev-parse --show-toplevel)"':
+        return "subst"
+    if raw.startswith("'"):
+        return "sq"
+    if raw.startswith('"'):
+        return "dq"
+    return "bare"
+
+
+def _doc_statements():
+    """围栏块里每条逻辑语句（**按出现顺序**）：`_Stmt(块号, 种类, tokens, 原始词, 原文)`。
+
+    种类 `?` = 不在形状表里。带块号是因为每个围栏块都可以被**单独**照抄，所以变量绑定
+    不能跨块生效（第二十轮 P2-2 的一半）。
+    """
+    out = []
+    for bi, block in enumerate(_fenced_bash(_teardown_section())):
+        cmds, _subs, unterminated = _lex_block(block)
+        if unterminated:
+            out.append(_Stmt(bi, "?", None, None,
+                             "块扫完仍在引号/替换内：" + block.strip()[:90]))
+        for cmd in cmds:
+            parts, raws = _aligned_words(cmd)
+            if not parts:
+                out.append(_Stmt(bi, "?", None, None, cmd)); continue
+            if tuple(parts) == _STMT_CD:
+                kind = "cd"
+            elif parts[0] == _STMT_SCRIPT and all(
+                    _STMT_BARE_ARG.fullmatch(a) for a in parts[1:]):
+                kind = "script"
+            # **赋值必须是裸词**：整体被引用的 `'JOB=…'` 在 bash 里是命令名，不是赋值
+            elif (len(parts) == 1 and parts[0] in _DOC_ALLOWED_ASSIGN
+                    and _word_kind(raws[0]) == "bare"):
+                kind = "assign"
+            elif parts[0] == "aws" and _word_kind(raws[0]) in ("bare", "sq", "dq"):
+                kind = "aws"
+            else:
+                kind = "?"
+            out.append(_Stmt(bi, kind, tuple(parts), tuple(raws), cmd))
+    return out
+
+
+def _json_no_dupes(pairs):
+    """`json.loads` 的 `object_pairs_hook`：同一层出现重复键就红。
+
+    默认行为是**静默取后者**，第十八轮 P2-3 正是靠它把 `site_id` 换成 `victim` 而
+    argv 一字不差。不同层的同名键是合法的，只查同一层。
+    """
+    keys = [k for k, _ in pairs]
+    assert len(keys) == len(set(keys)), f"JSON 里出现重复键 {keys} —— 解码会取后者"
+    return dict(pairs)
+
+
+_ASSIGN_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.S)
+
+
+def _doc_env_timeline():
+    """按**语句顺序**回放围栏块，产出 `(语句, 该语句执行前的 env)`。
+
+    两条纪律都来自实测（第二十轮 P2-2）：
+      · **顺序**——上一版把整节的赋值先汇总成最终字典再套给所有命令，于是把唯一那条
+        `JOB=…` 挪到 invoke **之后**照样 8/8 全绿；而运行时 invoke 处的 `$JOB` 是继承值
+        或空串（真机复现：site_id 变成 review-victim）。
+      · **不跨块**——每个围栏块都可以被单独照抄，A 块里的赋值不能替 B 块背书。
+    只收**裸词**形态的赋值（`'JOB=…'` 在 bash 里是命令名，不是赋值）；刻意也收白名单
+    之外的名字/值，好让下游守卫能独立看见"文档里把绑定换了"。
+    """
+    out, env, block = [], {}, None
+    for st in _doc_statements():
+        if st.block != block:
+            env, block = {}, st.block          # 换块 ⇒ 清空
+        out.append((st, dict(env)))
+        if (st.raws and len(st.raws) == 1 and _word_kind(st.raws[0]) == "bare"
+                and _ASSIGN_WORD.fullmatch(st.parts[0])):
+            name, val = st.parts[0].split("=", 1)
+            env[name] = val
+    return out
+
+
+def _doc_variable_bindings():
+    """整节最终的变量绑定（顺序无关的那份，只给分类器对照表用）。"""
+    env = {}
+    for st, _before in _doc_env_timeline():
+        if (st.raws and len(st.raws) == 1 and _word_kind(st.raws[0]) == "bare"
+                and _ASSIGN_WORD.fullmatch(st.parts[0])):
+            name, val = st.parts[0].split("=", 1)
+            env[name] = val
+    return env
+
+
+def test_teardown_section_uses_only_the_allowed_statements():
+    """围栏块里每条语句都必须落进点名的形状表，变量绑定连**次数**都要对。
+
+    这条管的是"允许执行什么"，上一条（语法白名单）管的是"词长什么样"——两条都要。
+    命令位置只认字面量 `cd` / 拆除脚本 / `aws`：`"$VAR" …`、`bash -c '…'`、`export …`
+    以及任何别的赋值一律红。
+    """
+    offenders, assigns = [], {}
+    for _bi, kind, parts, _raws, cmd in _doc_statements():
+        if kind == "?":
+            offenders.append(cmd[:130])
+        elif kind == "assign":
+            assigns[parts[0]] = assigns.get(parts[0], 0) + 1
+    assert offenders == [], (
+        "拆除一节的围栏块出现了形状表之外的语句（命令位置只能是 cd / 拆除脚本 / aws，"
+        "变量绑定只能是 _DOC_ALLOWED_ASSIGN 里那条）：\n  " + "\n  ".join(offenders))
+    assert assigns == _DOC_ALLOWED_ASSIGN, (
+        f"变量绑定不对：实得 {assigns}，期望 {_DOC_ALLOWED_ASSIGN}")
+
+
+# 本节允许的围栏语言（正向表）。不支持的标签**显式报错**，不静默跳过——
+# `sh` / `~~~bash` / 块内三反引号截断这三种都让整段命令脱离全部八层（第二十轮 P2-3）。
+# `bash` = 要过后面七层的可执行块；`text` = 展示 AWS 输出的块，**不**当 shell 解析，
+# 但也不能藏可照抄的命令（下面第二条断言）。无标签与 `sh` / `zsh` / `console` 一律拒。
+_DOC_ALLOWED_FENCE_LANGS = {"bash", "text"}
+_DOC_SHELL_FENCE_LANGS = {"bash"}
+
+
+def test_teardown_section_fences_are_tagged_and_only_bash_is_shell():
+    """拆除一节的围栏：标签必须在正向表里，且**非 shell 块不许藏可运行命令**。
+
+    这一条守的是**后面七层守卫的输入口**：提取器漏掉的块，加多少层都看不到。
+    实测三种漏法（第二十轮 P2-3，每种都真机执行过）——块内一行 bash 注释 `# ``` `
+    让旧的 `(.*?)` 正则提前收尾、`~~~bash` 压根不匹配、`sh` 标签被静默忽略。
+    加新标签必须先想清楚"它要不要过那七层"，所以按正向表拒；`text` 块只放 AWS 输出，
+    所以额外断言里面没有 `aws <服务> <动词>` 也没有拆除脚本调用——**标签不会阻止
+    任何人照抄**，能阻止的只有"里面没有可抄的东西"。
+    """
+    sec = _teardown_section()
+    lines = _md_lines(sec)
+    # ① 围栏行必须在第 0 列（见 _FENCE_RUN 上面那段：两个 r24 反例的第一个开栏
+    #    都在列表里缩进 2；零缩进还消掉了正文 tab 的去缩进差异）
+    unsupported = [l[:90] for l in lines
+                   if _FENCE_RUN.search(l) and not _FENCE_SUPPORTED_LINE.match(l)]
+    assert unsupported == [], (
+        "拆除一节的围栏行必须在第 0 列（缩进 / 引用块 / 列表内的围栏扫描器处理不了，"
+        "参考实现却认得 —— 那段命令会脱离全部守卫）：\n  " + "\n  ".join(unsupported))
+    # ③ 不许有 HTML 块起始行：HTML 块里的三反引号会被扫描器当成闭栏（r24 反例 ①）
+    html = [l[:80] for l in lines if _HTML_BLOCK_START.match(l)]
+    assert html == [], (
+        "拆除一节出现了 HTML 块起始行 —— HTML 原文里的三反引号会被本提取器当成闭栏，"
+        "块边界就不是参考实现认的那个：\n  " + "\n  ".join(html))
+    detailed = _fenced_blocks_detailed(sec)
+    blocks = [(lang, body) for lang, body, _c in detailed]
+    assert blocks, "拆除一节里没解析出任何围栏块 —— 提取器坏了或那一节被删了"
+    # ② 每个块都必须显式闭合（**逐块**判，不是总量——总量会互相抵消，r24 反例 ②）
+    unclosed = [f"{lang or '(无标签)'}: {body.strip()[:60]}" for lang, body, c in detailed if not c]
+    assert unclosed == [], (
+        "拆除一节有围栏没显式闭合 —— 它会把后面的内容（含后面的块）一起吞进来：\n  "
+        + "\n  ".join(unclosed))
+    # 交叉核对：围栏行数应恰好是 2×块数。这条**只是诊断**，不是充分不变量
+    # （r24 证明它会被抵消），留着是因为它能一眼指出"有多余的围栏行"。
+    fence_lines = [l for l in lines if _FENCE_RUN.search(l)]
+    assert len(fence_lines) == 2 * len(blocks), (
+        f"围栏行 {len(fence_lines)} 条、块 {len(blocks)} 个 —— 不是 1:2，有多余的围栏行：\n  "
+        + "\n  ".join(l[:80] for l in fence_lines))
+    bad = [l or "(无标签)" for l, _b in blocks if l not in _DOC_ALLOWED_FENCE_LANGS]
+    assert bad == [], (
+        f"拆除一节出现了正向表之外的围栏语言 {bad}；允许的是 "
+        f"{sorted(_DOC_ALLOWED_FENCE_LANGS)}（不支持的标签必须显式处理，不能静默忽略）")
+    runnable = [f"[{lang}] {line.strip()[:100]}"
+                for lang, body in blocks if lang not in _DOC_SHELL_FENCE_LANGS
+                for line in body.splitlines()
+                if _AWS_CALL.search(line) or _STMT_SCRIPT in line]
+    assert runnable == [], (
+        "非 shell 围栏块里出现了可照抄的命令 —— 它不过那七层守卫：\n  "
+        + "\n  ".join(runnable))
+
+
+# aws 语句里允许出现的旗标（正向表，就是现节实际用到的那 9 个）。
+#
+# 为什么连**只读**命令也要管：③ 的 argv 等值只作用在破坏性命令上，只读命令整条不受约束。
+# 而 `--endpoint-url http://…` / `--profile <别的账号>` / `--no-verify-ssl` 加在一条
+# `list-*` 上不会被任何别的层看见——那会把一条 SigV4 签名请求发往别处（凭据外泄面），
+# 或者让"体检"读的是另一个账号从而给出假结论。按正向表管旗标一次关掉这一族，
+# 且不必去追 `--endpoint-url` 这种名字（追名字就是黑名单，前几轮的老路）。
+_DOC_ALLOWED_AWS_FLAGS = {
+    "--region", "--query", "--output", "--max-results",
+    "--table-name", "--function-name", "--item", "--payload", "--cli-binary-format",
+}
+
+
+def test_teardown_section_aws_flags_are_allowlisted():
+    """围栏块里每条 aws 语句的旗标都必须在正向表里（**含只读命令**）。"""
+    offenders = []
+    for _bi, kind, parts, _raws, cmd in _doc_statements():
+        if kind != "aws":
+            continue
+        bad = [t for t in parts if t.startswith("-") and t not in _DOC_ALLOWED_AWS_FLAGS]
+        if bad:
+            offenders.append(f"{cmd[:100]}   <- 旗标不在正向表里：{bad}")
+    assert offenders == [], (
+        "拆除一节的 aws 命令用了正向表之外的旗标（见 _DOC_ALLOWED_AWS_FLAGS 的注释）：\n  "
+        + "\n  ".join(offenders))
+
+
+def test_every_expansion_in_the_section_is_a_bound_variable():
+    """每个 `$NAME` 都必须**在它之前、同一个围栏块里**已经被点名绑定过。
+
+    ④ 只把 `--item` / `--payload` 两个 JSON 参数解出来核对；别的参数只受 ③ 的 token
+    等值约束，而 token 等值看不见"这个 `$X` 运行时展开成什么"（未绑定 ⇒ 展开成**空串**，
+    静默改掉请求内容）。第二十轮又补了两条实测教训：
+
+      · **顺序**：绑定必须在使用**之前**（P2-2）。
+      · **引用形态**：单引号里的 `$JOB` 是**字面量**、不展开（P2-1B）——真 CLI 发出去的
+        `job_id` 就是 `$JOB` 这五个字符，和 put-item 写的主键不是一个。所以这里对
+        单引号词里的 `$` 一律红，而不是当成"用了一个绑定过的变量"。
+    唯一例外是白名单里那条命令替换本身。
+    """
+    offenders = []
+    for st, env in _doc_env_timeline():
+        for raw, tok in zip(st.raws or (), st.parts or ()):
+            kind = _word_kind(_raw_value_segment(raw))
+            if kind == "subst":
+                continue
+            if kind == "sq" and "$" in raw:
+                offenders.append(f"{st.cmd[:90]}   <- 单引号里的 {raw[:40]!r} 不展开，是字面量")
+                continue
+            if "$" not in tok:
+                continue
+            for m in re.finditer(r"\$(\{?)([A-Za-z_][A-Za-z0-9_]*)?", tok):
+                brace, name = m.group(1), m.group(2)
+                if brace or not name:
+                    offenders.append(f"{st.cmd[:90]}   <- 不支持的展开形态 {m.group(0)!r}")
+                elif name not in env:
+                    offenders.append(
+                        f"{st.cmd[:90]}   <- ${name} 在此处还没绑定（同块内、本语句之前）")
+    assert offenders == [], (
+        "拆除一节里出现了未按顺序绑定 / 形态不支持 / 被单引号挡住的展开：\n  "
+        + "\n  ".join(offenders))
+
+
+def test_exempted_commands_decode_to_the_expected_requests():
+    """两条豁免写命令**展开变量后**的 JSON 必须解码成预期的请求。
+
+    "源文本 token 相等"不等于"真实请求相等"（第十八轮 P2-3）：`$JOB` 的值里塞进
+    `","site_id":"victim` 时 argv 逐 token 一模一样，而 payload 解出来的 `site_id`
+    变成了 `victim`（json 对重复键取后者），`purge_data` 还是 true。所以这里把
+    **围栏块里真实绑定的值**代进去、按**拒绝重复键**解码，再逐字段核对。取的是文档里
+    那条绑定而不是 `_DOC_ALLOWED_ASSIGN`——否则这条只是在核对一个常量，对"文档里换了
+    绑定值"这种变形一无所知。
+    """
+    import json
+    expected = {
+        "--item": {"job_id": {"S": "job-teardown-e2e-probe"},
+                   "site_id": {"S": "e2e-probe"},
+                   "owner": {"S": "probe@e2e.invalid"},
+                   "status": {"S": "PENDING"}},
+        "--payload": {"site_id": "e2e-probe", "job_id": "job-teardown-e2e-probe",
+                      "purge_data": True},
+    }
+    seen = {}
+    for st, env in _doc_env_timeline():
+        # 用**该语句执行前**的 env，不是整节汇总（第二十轮 P2-2：把绑定挪到 invoke 之后
+        # 也能让"汇总版"绿，而运行时那里的 `$JOB` 是继承值或空串）
+        if st.kind != "aws" or _is_readonly(f"{st.parts[1] if len(st.parts) > 1 else ''} "
+                                            f"{st.parts[2] if len(st.parts) > 2 else ''}"):
+            continue
+        for flag, want in expected.items():
+            if flag not in st.parts:
+                continue
+            idx = st.parts.index(flag) + 1
+            value, raw = st.parts[idx], st.raws[idx] if idx < len(st.raws) else ""
+            # 只有**双引号 / 裸词**里的 `$NAME` 才会被 bash 展开；单引号里是字面量
+            seg = _raw_value_segment(raw)
+            assert _word_kind(seg) != "sq" or "$" not in seg, (
+                f"{flag} 用了单引号，里面的 `$` 不会展开（真 CLI 发出去的是字面量）：{raw[:70]}")
+            for name, val in env.items():
+                value = value.replace(f"${name}", val)
+            assert "$" not in value, (
+                f"{flag} 里还有没解析的展开：{value!r}（本语句之前没给它绑定值 ⇒ "
+                f"运行时会展开成空串）")
+            got = json.loads(value, object_pairs_hook=_json_no_dupes)
+            assert got == want, f"{flag} 展开后是 {got}，期望 {want}"
+            seen[flag] = seen.get(flag, 0) + 1
+    assert seen == {"--item": 1, "--payload": 1}, (
+        f"两条豁免写命令的 JSON 参数没都核对到：{seen}")
+
+
 def test_teardown_section_has_no_copyable_destructive_commands():
-    """围栏块里的写操作必须**逐条**在豁免表里，且目标与次数都对得上。
+    """围栏块里的写操作必须**逐条整条**在豁免表里，且出现次数也对得上。
 
     判定用与 harness 同一套 fail-closed 分类：只读动词之外一律算破坏性。
     """
     seen, offenders = {}, []
-    for svc, verb, flag, val, cmd, dup in _doc_aws_commands():
+    for svc, verb, argv, cmd in _doc_aws_commands():
         if _is_readonly(f"{svc} {verb}"):
             continue
-        if dup:
-            offenders.append(f"{cmd[:90]}   <- 同一个目标旗标出现多次（CLI 取最后一个）")
+        if argv is None or argv not in _DOC_ALLOWED_ARGV:
+            offenders.append(cmd[:130])
             continue
-        key = (svc, verb, flag, val)
-        if key not in _DOC_ALLOWED_EXACT:
-            offenders.append(cmd[:110])
-        else:
-            seen[key] = seen.get(key, 0) + 1
+        seen[argv] = seen.get(argv, 0) + 1
     assert offenders == [], (
         "拆除一节的围栏块里出现了豁免表之外的写操作，请改为调用 "
         "scripts/teardown_platform.sh：\n  " + "\n  ".join(offenders))
-    assert seen == _DOC_ALLOWED_EXACT, (
-        f"豁免命令的出现次数不对：实得 {seen}，期望 {_DOC_ALLOWED_EXACT}")
+    assert seen == _DOC_ALLOWED_ARGV, (
+        f"豁免命令的出现次数不对：实得 {seen}，期望 {_DOC_ALLOWED_ARGV}")
 
 
 def test_doc_exemption_list_stays_minimal():
-    """豁免清单必须只有那两条**具体命令**（含目标与次数）。
+    """豁免清单必须只有那两条命令的**逐 token argv**（含次数）。
 
-    多一条就等于又开了一个可照抄的口子，而那正是前三轮 P1 的长发地。
+    多一条就等于又开了一个可照抄的口子，而那正是前几轮 P1 的长发地。
     """
-    assert _DOC_ALLOWED_EXACT == {
-        ("dynamodb", "put-item", "--table-name", "site-deploy-jobs"): 1,
-        ("lambda", "invoke", "--function-name", "site-deployer-undeploy"): 1,
-    }, _DOC_ALLOWED_EXACT
+    assert _DOC_ALLOWED_ARGV == {
+        ("aws", "dynamodb", "put-item",
+         "--table-name", "site-deploy-jobs",
+         "--region", "us-east-1",
+         "--item", '{"job_id":{"S":"$JOB"},"site_id":{"S":"e2e-probe"},'
+                   '"owner":{"S":"probe@e2e.invalid"},"status":{"S":"PENDING"}}'): 1,
+        ("aws", "lambda", "invoke",
+         "--function-name", "site-deployer-undeploy",
+         "--region", "us-east-1",
+         "--cli-binary-format", "raw-in-base64-out",
+         "--payload", '{"site_id":"e2e-probe","job_id":"$JOB","purge_data":true}',
+         "/tmp/undeploy.json"): 1,
+    }, _DOC_ALLOWED_ARGV
 
 
 def test_teardown_section_still_documents_the_two_unavoidable_pits():
@@ -1992,22 +2768,101 @@ def test_teardown_section_rejects_shell_substitution():
     时，按分隔符切分的解析器只看到外层命令，而 bash 会**先**执行内层那条
     （Codex 第十三轮 P2-3，实测）。可照抄的 runbook 命令没有任何理由需要它们，
     所以这里直接拒绝，而不是去写一个懂 shell 结构的解析器。
+
+    **必须按整块扫**（Codex 第十六轮 P2-2，实测）：按物理行时引号状态每行归零，而
+    `#` 在双引号内不是注释，于是
+
+        JOB2="{
+        # '$(aws s3 rm s3://other --recursive)'
+        }"
+
+    被当成"一行注释"整行跳过，bash 却执行了内层删除。
     """
     offenders = []
     for block in _fenced_bash(_teardown_section()):
-        for line in block.splitlines():
-            s = line.strip()
-            if s.startswith("#") or not s:
-                continue
-            # **白名单**，不是黑名单：`$($'a''ws' …)` 这种拼法没有连续的字面 aws，
-            # 追它的拼法追不完（Codex 第十四轮 P2-3 实测绕过了"体里含 aws 就拒"）。
-            # runbook 只需要 `$(git rev-parse --show-toplevel)` 这一条。
-            for body in _command_substitutions(s):
-                if body.strip() not in _DOC_ALLOWED_SUBST:
-                    offenders.append(f"{s[:100]}   <- 命令替换 $({body.strip()[:40]}) 不在白名单")
+        # **白名单**，不是黑名单：`$($'a''ws' …)` 这种拼法没有连续的字面 aws，
+        # 追它的拼法追不完（Codex 第十四轮 P2-3 实测绕过了"体里含 aws 就拒"）。
+        # runbook 只需要 `$(git rev-parse --show-toplevel)` 这一条。
+        _cmds, subs, unterminated = _lex_block(block)
+        if unterminated:
+            offenders.append(f"{block.strip()[:90]}   <- 块扫完仍在引号/替换内")
+        for body in subs:
+            if body.strip() not in _DOC_ALLOWED_SUBST:
+                offenders.append(f"命令替换 $({body.strip()[:60]}) 不在白名单")
     assert offenders == [], (
         "拆除一节的围栏块里出现了命令替换——它可以把额外的 aws 调用藏进参数里：\n  "
         + "\n  ".join(offenders))
+
+
+def test_teardown_section_rejects_ansi_c_quoting():
+    """围栏块里**不许**出现 `$'…'` / `$"…"`。
+
+    `shlex` 不认它们（`$'--function-name'` → `$--function-name`），而 bash 展开后是
+    一个**生效的旗标**：往豁免命令尾部塞 `$'--function-name' site-panel` 时三条守卫
+    全绿、真实 CLI 打的却是 site-panel（Codex 第十五轮 P2-2，实测）。可照抄的 runbook
+    不需要这种引用，所以按写法拒掉，而不是去追 shlex 与 bash 的语义差。
+
+    注释同样要按**词法状态**剥（第十六轮 P2-2）：所以扫的是 `_lex_block` 切出来的
+    逻辑命令，不是物理行。
+    """
+    offenders = [c[:110] for block in _fenced_bash(_teardown_section())
+                 for c in _lex_block(block)[0] if _ANSI_C_QUOTE.search(c)]
+    assert offenders == [], (
+        "拆除一节的围栏块里出现了 ANSI-C / locale 引用（$'…' / $\"…\"），"
+        "解析器与 bash 对它的理解不一致：\n  " + "\n  ".join(offenders))
+
+
+# (脚本里的 service, operation) -> botocore 的 (service_id, OperationName)。
+#
+# **两个模型守卫必须共用这一张表**（Codex 第十五轮 P2-4，实测）：分成两份写时，
+# 补集那份少了 `dynamodb scan` 与 `lambda get-function-url-config`，于是给
+# Scan 的 `InternalServerError` 开一条 ABSENT 后门（声明表保持不变）时 242 条全绿，
+# 注入后脚本继续删、退 0。覆盖范围由
+# `test_model_probe_map_covers_every_declared_operation` 钉在脚本的 `_absent_codes` 上。
+_MODEL_PROBE = {
+    ("dynamodb", "describe-table"): ("dynamodb", "DescribeTable"),
+    ("dynamodb", "scan"): ("dynamodb", "Scan"),
+    ("iam", "get-role"): ("iam", "GetRole"),
+    ("lambda", "get-function"): ("lambda", "GetFunction"),
+    ("lambda", "get-function-url-config"): ("lambda", "GetFunctionUrlConfig"),
+    ("ecr", "describe-repositories"): ("ecr", "DescribeRepositories"),
+    ("cognito-idp", "describe-user-pool"): ("cognito-idp", "DescribeUserPool"),
+    ("sns", "get-topic-attributes"): ("sns", "GetTopicAttributes"),
+    ("ssm", "get-parameter"): ("ssm", "GetParameter"),
+    ("kms", "describe-key"): ("kms", "DescribeKey"),
+    ("dsql", "get-cluster"): ("dsql", "GetCluster"),
+    ("bedrock-agentcore-control", "get-agent-runtime"):
+        ("bedrock-agentcore-control", "GetAgentRuntime"),
+}
+
+# 唯一允许缺席模型守卫的操作，必须**显式**列出并说明依据：
+# `GetBucketLocation` 在本地模型里 error_shapes 为空（S3 不走 typed error 那套），
+# 它的 `NoSuchBucket` 依据是真机实测（见 test_stub_uses_real_cli_error_shapes 的注释），
+# 不是服务模型。誤收面由 `_NOT_ABSENT_CASES` 里那条 `s3api get-bucket-location`+
+# `AccessDenied` 守着。
+_MODEL_PROBE_EXEMPT = {("s3api", "get-bucket-location")}
+
+
+def _declared_absent_operations():
+    """脚本 `_absent_codes` 里登记过的全部 (service, operation)。"""
+    script = _SCRIPT.read_text(encoding="utf-8")
+    body = script[script.index("_absent_codes() {"):script.index("# _outer_code <errtext>")]
+    return set(re.findall(r'"([a-z0-9-]+) ([a-z0-9-]+)"\)?', body))
+
+
+def test_model_probe_map_covers_every_declared_operation():
+    """脚本登记的每个操作都必须进两张核对表，缺席只能走显式豁免。
+
+    这条是上一轮那个洞的根：漏一个操作时，"该操作声明之外的码一律 NOT_ABSENT"
+    这条补集断言对它形同不存在（Codex 第十五轮 P2-4）。加新操作时它会红。
+    """
+    declared = _declared_absent_operations()
+    assert declared, "没从脚本里解析出任何登记操作——解析器该修了"
+    missing = declared - set(_MODEL_PROBE) - _MODEL_PROBE_EXEMPT
+    assert missing == set(), (
+        f"这些操作登记在脚本里，却没进 _MODEL_PROBE（也没显式豁免）：{sorted(missing)}")
+    stale = (set(_MODEL_PROBE) | _MODEL_PROBE_EXEMPT) - declared
+    assert stale == set(), f"这些操作在核对表里，脚本里却没登记：{sorted(stale)}"
 
 
 def test_absent_codes_match_botocore_wire_codes():
@@ -2020,26 +2875,7 @@ def test_absent_codes_match_botocore_wire_codes():
     """
     import botocore.session
     sess = botocore.session.get_session()
-    # (脚本里的 service, operation) -> botocore 的 (service_id, OperationName)
-    probe = {
-        ("dynamodb", "describe-table"): ("dynamodb", "DescribeTable"),
-        ("dynamodb", "scan"): ("dynamodb", "Scan"),
-        ("iam", "get-role"): ("iam", "GetRole"),
-        ("lambda", "get-function"): ("lambda", "GetFunction"),
-        ("lambda", "get-function-url-config"): ("lambda", "GetFunctionUrlConfig"),
-        ("ecr", "describe-repositories"): ("ecr", "DescribeRepositories"),
-        ("cognito-idp", "describe-user-pool"): ("cognito-idp", "DescribeUserPool"),
-        ("sns", "get-topic-attributes"): ("sns", "GetTopicAttributes"),
-        ("ssm", "get-parameter"): ("ssm", "GetParameter"),
-        ("kms", "describe-key"): ("kms", "DescribeKey"),
-        # 上一轮漏了这两个，于是"整张表已逐项核对"是句过头话（Codex 第十四轮指出）
-        ("dsql", "get-cluster"): ("dsql", "GetCluster"),
-        ("bedrock-agentcore-control", "get-agent-runtime"):
-            ("bedrock-agentcore-control", "GetAgentRuntime"),
-        # `s3api get-bucket-location` **刻意不在这里**：GetBucketLocation 在本地模型里
-        # error_shapes 为空（S3 不走 typed error 那套），所以它的 `NoSuchBucket` 依据是
-        # 真机实测（见 test_stub_uses_real_cli_error_shapes 的注释），不是服务模型。
-    }
+    probe = _MODEL_PROBE
     script = _SCRIPT.read_text(encoding="utf-8")
     body = script[script.index("_absent_codes() {"):script.index("# _outer_code <errtext>")]
     problems = []
@@ -2088,6 +2924,16 @@ def test_own_agentcore_log_group_is_deleted(harness):
     # Codex 的绕过形态：体里没有连续的字面 aws，但仍是命令替换 ⇒ 必须被取出来
     ("""echo /tmp/x$($'a''ws' s3 rm s3://other --recursive)""",
      ["""$'a''ws' s3 rm s3://other --recursive"""]),
+    # 第十五轮 P2-3：裸 `\'` 是**字面**单引号、不开引号段，bash 照样执行内层替换。
+    # 不认转义的扫描器会以为进了单引号 ⇒ 返回空表 ⇒ 三条守卫全绿。
+    ("""echo /tmp/undeploy.json\\'$(aws s3 rm s3://other --recursive)""",
+     ["aws s3 rm s3://other --recursive"]),
+    # 双引号内 `\"` 转义的是引号本身，不许把 dq 状态翻反（本节的 --item 真实用到这种拼法）
+    ('''aws dynamodb put-item --item "{\\"S\\":\\"x\\"}" && echo $(id)''', ["id"]),
+    # 单引号内的反斜杠是**字面量**，不转义后面那个引号 ⇒ 引号段在此结束，`$( )` 会展开
+    ("""echo 'a\\'$(id)""", ["id"]),
+    # 双引号内 `\\$` 转义掉了 `$` ⇒ 那不是命令替换
+    ('''echo "\\$(id)"''', []),
 ])
 def test_command_substitution_extractor_respects_quotes(line, want):
     """提取器必须区分引号状态：单引号内不展开、双引号内展开。
@@ -2105,14 +2951,673 @@ def test_command_substitution_extractor_respects_quotes(line, want):
     ("aws lambda invoke --function-name a out.json", False),
 ])
 def test_doc_tokenizer_detects_duplicate_targets_in_both_syntaxes(cmd, want_dup):
-    """`--flag=value` 与带引号的 `"--flag"` 都必须被认出来（Codex 第十四轮 P2-2）。
+    """`--flag=value` 与带引号的 `"--flag"` 都必须归一到同一个 token（第十四轮 P2-2）。
 
-    真实 CLI 用**最后一个**值，所以漏检等于让 runbook 能悄悄改掉调用目标。
+    这条验的是分词的**规范化**：`_DOC_ALLOWED_ARGV` 按 token 逐项等值比，两种写法
+    必须落到同一串，否则"整条 argv 相等"这个判据自己就有两种写法的缝。
     """
     parts = _shell_tokens(cmd)
     assert parts is not None
     idxs = [j for j, a in enumerate(parts) if a == "--function-name"]
     assert (len(idxs) > 1) is want_dup, parts
+
+
+# ── 历轮的守卫缺口：都用"往围栏块里塞一段"的形态钉住 ────────────────────────
+# 每条都给出**bash 的真实语义**与**当时解析器的看法**，两者不一致就是洞。
+_ANCHOR_INVOKE = "aws lambda invoke --function-name site-deployer-undeploy"
+_DOC_BYPASS_CASES = [
+    # P2-2：双引号跨行 + 引号内的 `#` 不是注释 ⇒ 整段被当注释跳过
+    ("跨行引用把命令替换藏进注释里", "aws dsql list-clusters --region us-east-1",
+     'JOB2="{\n# \'$(aws s3 rm s3://other --recursive)\'\n}"\naws dsql list-clusters --region us-east-1'),
+    # P2-3：子 shell 分组符不在分隔符表里 ⇒ 分词得到 `(aws`，token 与正则同时落空
+    ("子 shell 里的带引号 aws", "aws dsql list-clusters --region us-east-1",
+     'aws dsql list-clusters --region us-east-1\n'
+     '("aws" lambda invoke --function-name site-panel /tmp/e.json)'),
+    # P2-4：`\`+换行是行继续，两个字符都消失；补空格会把生效的旗标拆成两个词
+    ("续行拼出第二个 --function-name",
+     "--payload \"{\\\"site_id\\\":\\\"e2e-probe\\\",\\\"job_id\\\":\\\"$JOB\\\",\\\"purge_data\\\":true}\" /tmp/undeploy.json",
+     "--payload \"{\\\"site_id\\\":\\\"e2e-probe\\\",\\\"job_id\\\":\\\"$JOB\\\",\\\"purge_data\\\":true}\" "
+     "--function-\\\n  name site-panel /tmp/undeploy.json"),
+    # P2-5：AWS CLI 接受长选项的唯一前缀缩写（实测 aws-cli 2.36.34 打到 site-panel）
+    ("缩写旗标 --function-n",
+     "--payload \"{\\\"site_id\\\":\\\"e2e-probe\\\",\\\"job_id\\\":\\\"$JOB\\\",\\\"purge_data\\\":true}\" /tmp/undeploy.json",
+     "--payload \"{\\\"site_id\\\":\\\"e2e-probe\\\",\\\"job_id\\\":\\\"$JOB\\\",\\\"purge_data\\\":true}\" "
+     "--function-n site-panel /tmp/undeploy.json"),
+    # ── 第十七轮 ────────────────────────────────────────────────────────────
+    # P2-1：`${VAR:-默认}` 里的默认值会被展开；未设置时内层替换真的执行（实测 R1）
+    ("参数展开的默认值里藏替换", "aws dsql list-clusters --region us-east-1",
+     'echo "${UNSET:-$("aws" s3 rm s3://other --recursive)}"\n'
+     'aws dsql list-clusters --region us-east-1'),
+    # P2-2a：bash 把 `{#` 当普通词（实测 `echo {#` 打出 `{#`）；无条件在 `{` 断句会让
+    #        `#` 落到词首、被当注释，把整条替换吞掉（实测 R2 照样执行）
+    ("{# 让后半行被当成注释", "aws dsql list-clusters --region us-east-1",
+     'echo {# $("aws" s3 rm s3://other --recursive)\n'
+     'aws dsql list-clusters --region us-east-1'),
+    # P2-2b：brace expansion —— `{aws,}` 展开出一个字面 `aws`
+    ("brace expansion 拼出 aws", "aws dsql list-clusters --region us-east-1",
+     '{aws,} s3 rm s3://other --recursive\n'
+     'aws dsql list-clusters --region us-east-1'),
+    # P2-3：前置全局参数把 (服务, 动词) 挪位 ⇒ `list-` 前缀让整条当只读跳过
+    ("前置 --profile 顶掉服务/动词位", "aws dsql list-clusters --region us-east-1",
+     'aws dsql list-clusters --region us-east-1\n'
+     'aws --profile list-prod lambda invoke --function-name site-panel /tmp/e.json'),
+    # P2-4：前置环境赋值换掉整套凭据/账号，而服务与动词一个字都没变
+    ("前置 AWS_PROFILE= 换账号",
+     "aws lambda invoke --function-name site-deployer-undeploy",
+     "AWS_PROFILE=other-account aws lambda invoke --function-name site-deployer-undeploy"),
+    # P2-5：未引用 delimiter 的 heredoc 里，单引号**不阻止**命令替换（实测 R5 执行了）
+    ("heredoc 里单引号不挡替换", "aws dsql list-clusters --region us-east-1",
+     "cat <<EOF\n'$(\"aws\" s3 rm s3://other --recursive)'\nEOF\n"
+     "aws dsql list-clusters --region us-east-1"),
+    # ── 第十八轮：都在假 aws 上真机确认过实际效果（见 REVIEW 里那张表）────────
+    # P2-1a：命令名藏在变量里 ⇒ 源文本里没有 `aws` 这个 token（实测打到 site-panel）
+    ("变量当命令名", _ANCHOR_INVOKE,
+     'REVIEW_CMD=aws\n"$REVIEW_CMD" lambda invoke --function-name site-panel '
+     '--region us-east-1 /tmp/review.json\n' + _ANCHOR_INVOKE),
+    # P2-1b：内层 shell 把字符串再解释一遍；单引号只挡外层展开，不挡 `bash -c`
+    ("bash -c 里再解释一遍", _ANCHOR_INVOKE,
+     "bash -c '\"aws\" lambda invoke --function-name site-panel "
+     "--region us-east-1 /tmp/review.json'\n" + _ANCHOR_INVOKE),
+    # P2-2a：独占一行的 export 改掉后续命令继承的凭据（实测 AWS_PROFILE=other-account）
+    ("独占一行的 export 换凭据", _ANCHOR_INVOKE,
+     "export AWS_PROFILE=other-account\n" + _ANCHOR_INVOKE),
+    # P2-2b：裸赋值也行 —— 重新赋值不会清除变量已有的 export 属性
+    ("独占一行的裸赋值换凭据", _ANCHOR_INVOKE,
+     "AWS_PROFILE=other-account\n" + _ANCHOR_INVOKE),
+    # P2-3：豁免命令一字不改，靠 $JOB 的值往 payload 里多塞一个 site_id
+    #      （json 取后者 ⇒ 目标变成 victim，purge_data 还是 true）
+    ("$JOB 的值改掉 payload 语义", _ANCHOR_INVOKE,
+     "JOB=\\\n'job-teardown-e2e-probe\",\"site_id\":\"victim'\n" + _ANCHOR_INVOKE),
+    # ── 第十九轮（我自己这轮对抗补的两条，见交接件里的弱点 1 与 4）───────────────
+    # 只读命令整条不受 argv 等值约束 ⇒ `--endpoint-url` / `--profile` 能把一条签名过的
+    # 请求发往别处、或让"体检"读的是另一个账号。旗标正向表关掉这一族。
+    ("只读命令上的 --endpoint-url", "aws dsql list-clusters --region us-east-1",
+     "aws dsql list-clusters --region us-east-1 --endpoint-url http://127.0.0.1:1"),
+    ("只读命令上的 --profile", "aws kms list-keys --region us-east-1",
+     "aws kms list-keys --region us-east-1 --profile other-account"),
+    # `$X` 没绑定时运行时展开成**空串**，静默改掉请求内容；token 等值看不见这件事
+    ("未绑定的展开", "aws cognito-idp list-user-pools --max-results 20 --region us-east-1",
+     'aws cognito-idp list-user-pools --max-results 20 --region "$LIMIT"'),
+    # ── 第二十轮（Codex），六种都真机执行过；根因是三处：引用信息丢失、绑定无顺序、
+    #    以及**围栏提取**（后者最致命：输入没了，后面七层是零）────────────────────────
+    # P2-1A：整体被引用的赋值词在 bash 里是**命令名**（command not found），JOB 没赋上
+    #        ⇒ `$JOB` 用的是继承值（真机复现：invoke 的 site_id 变成 review-victim）
+    ("整体引用的赋值不是赋值", "JOB=job-teardown-e2e-probe",
+     "'JOB=job-teardown-e2e-probe'"),
+    # P2-1B：单引号里 `$JOB` **不展开**；去引号后与双引号版逐 token 相等，而真 CLI 发出去的
+    #        job_id 就是字面量 `$JOB`（和 put-item 写的主键不是一个）
+    ("单引号 payload 挡住展开",
+     '--payload "{\\"site_id\\":\\"e2e-probe\\",\\"job_id\\":\\"$JOB\\",\\"purge_data\\":true}"',
+     '--payload \'{"site_id":"e2e-probe","job_id":"$JOB","purge_data":true}\''),
+    # 绑定被删掉（P2-2 的退化形态）：`$JOB` 运行时展开成空串，token 等值看不见
+    ("绑定被删掉", "JOB=job-teardown-e2e-probe\n", ""),
+    # r22 §3：双引号内的 `\$JOB` —— shlex 留反斜杠、bash 去掉 ⇒ 我这边"看着是展开"、
+    #         bash 发出去是字面量（与第二十轮 P2-1B 同族）。现由 _G_DQ 直接拒。
+    ("双引号内转义的 $",
+     '--payload "{\\"site_id\\":\\"e2e-probe\\",\\"job_id\\":\\"$JOB\\",\\"purge_data\\":true}"',
+     '--payload "{\\"site_id\\":\\"e2e-probe\\",\\"job_id\\":\\"\\$JOB\\",\\"purge_data\\":true}"'),
+    # P2-3a：块内一行 bash 注释里的三个反引号让旧的非贪婪正则提前收尾
+    ("注释里的三反引号截断围栏", "aws dsql list-clusters --region us-east-1",
+     "# ```\nexport AWS_PROFILE=review-other\n"
+     "aws lambda invoke --function-name review-other --region us-east-1 /tmp/review.json\n"
+     "aws dsql list-clusters --region us-east-1"),
+]
+
+# 有两条变形不是"就地替换一段"能表达的（要动围栏本身或语句顺序），单列。
+_DOC_BYPASS_EXTRA = [
+    # P2-2 的另一半：把唯一那条绑定挪到 invoke 之后
+    ("绑定移到 invoke 之后", lambda sec: sec.replace("JOB=job-teardown-e2e-probe\n", "", 1)
+     .replace("/tmp/undeploy.json\n", "/tmp/undeploy.json\nJOB=job-teardown-e2e-probe\n", 1)),
+    # P2-3b：`sh` 标签的围栏——旧提取器只认 ```bash，静默忽略它
+    ("新增 sh 围栏", lambda sec: sec + "\n```sh\nexport AWS_PROFILE=review-other\n"
+     "aws lambda invoke --function-name review-other --region us-east-1 /tmp/review.json\n```\n"),
+    # r22 §2：列表项里 tab 缩进的围栏 —— 参考实现认得、扫描器漏掉、旧的两条正则不命中
+    ("列表里 tab 缩进的围栏", lambda sec: sec + "\n1. step\n\n\t```bash\n\texport AWS_PROFILE=review-other\n"
+     "\taws lambda invoke --function-name review-other --region us-east-1 /tmp/review.json\n\t```\n"),
+    # r23 §1：列表项里未闭合的围栏把后面的独立块并进来（参考 2 块 / 扫描器 1 块，
+    #         而每条围栏行都"合规"）—— 由"围栏行数 == 2×块数"这条不变量拒
+    ("列表内未闭合围栏合并后块", lambda sec: sec + "\n- item\n\n  ```bash\n  alpha\n\nomega\n\n"
+     "```bash\naws lambda invoke --function-name review-other --region us-east-1 /tmp/review.json\n```\n"),
+    # P2-3c：`~~~bash` 围栏——旧提取器的正则压根不匹配波浪线
+    ("新增波浪线 bash 围栏", lambda sec: sec + "\n~~~bash\nexport AWS_PROFILE=review-other\n"
+     "aws lambda invoke --function-name review-other --region us-east-1 /tmp/review.json\n~~~\n"),
+]
+
+
+@pytest.mark.parametrize("name,mutate", _DOC_BYPASS_EXTRA, ids=[c[0] for c in _DOC_BYPASS_EXTRA])
+def test_doc_guards_catch_structural_bypasses(name, mutate, monkeypatch):
+    """要动围栏结构 / 语句顺序的那几种变形，同样至少让一条守卫红。"""
+    sec = _teardown_section()
+    mutated = mutate(sec)
+    assert mutated != sec, f"{name}：变形没生效，用例需要更新"
+    monkeypatch.setattr(sys.modules[__name__], "_teardown_section", lambda: mutated)
+    reds = [g.__name__ for g in _DOC_GUARDS if _guard_reds(g)]
+    assert reds, f"{name}：全部文档守卫全绿，等于这条绕过还开着"
+
+
+def _guard_reds(guard):
+    try:
+        guard(); return False
+    except AssertionError:
+        return True
+
+
+@pytest.mark.parametrize("name,old,new", _DOC_BYPASS_CASES, ids=[c[0] for c in _DOC_BYPASS_CASES])
+def test_doc_guards_catch_known_bypasses(name, old, new, monkeypatch):
+    """四种绕过写法**至少**要让一条文档守卫红。
+
+    这组是元测试：它们盯的不是 DEPLOY.md 的当前内容，而是解析器的**射程**。
+    前几轮的教训是"修了代码但没留这种用例，退回旧解析器仍然全绿"。
+    第十七轮起，大多数会由语法白名单那条先拦下——**这正是想要的**：判据从
+    "认识每一种绕过"换成了"只认识一小撮允许的写法"。
+    """
+    sec = _teardown_section()
+    assert old in sec, f"锚点不在拆除一节里了，用例需要更新：{old[:60]}"
+    monkeypatch.setattr(sys.modules[__name__], "_teardown_section",
+                        lambda: sec.replace(old, new, 1))
+    reds = []
+    for guard in _DOC_GUARDS:
+        try:
+            guard()
+        except AssertionError:
+            reds.append(guard.__name__)
+    assert reds, f"{name}：四条文档守卫全绿，等于这条绕过还开着"
+
+
+# 文档守卫（AND 关系），四层各管一件事：
+#   ① 语法白名单  —— 词长什么样（挡 heredoc / `${}` / brace / 分组 / 管道 / 裸 $VAR …）
+#   ② 语句白名单  —— 允许执行哪些语句（命令位置只认字面量，变量绑定点名）
+#   ③ argv 等值    —— 破坏性命令整条逐 token 相等（挡缩写、多余旗标、前置赋值）
+#   ④ 真实请求     —— 变量展开后的 JSON 解码结果（挡"token 相等但语义变了"）
+# 再加两条形态守卫：命令替换白名单、拒 ANSI-C 引用。
+# `test_doc_guards_catch_known_bypasses` 按这张表逐个跑。
+_DOC_GUARDS = (
+    test_teardown_section_fences_are_tagged_and_only_bash_is_shell,
+    test_teardown_section_uses_only_the_allowed_shell_subset,
+    test_teardown_section_uses_only_the_allowed_statements,
+    test_teardown_section_aws_flags_are_allowlisted,
+    test_every_expansion_in_the_section_is_a_bound_variable,
+    test_teardown_section_has_no_copyable_destructive_commands,
+    test_exempted_commands_decode_to_the_expected_requests,
+    test_teardown_section_rejects_shell_substitution,
+    test_teardown_section_rejects_ansi_c_quoting,
+)
+
+
+@pytest.mark.parametrize("line,ok", [
+    # 现节里真实出现的写法必须全部通过（正对照，防止把白名单收得太死）
+    ('cd "$(git rev-parse --show-toplevel)"', True),
+    ("site-builder/scripts/teardown_platform.sh --yes --stage preflight  # 只跑一个阶段", True),
+    ("JOB=job-teardown-e2e-probe", True),
+    ("aws dynamodb put-item --table-name site-deploy-jobs --region us-east-1 --item \\", True),
+    (r'  "{\"job_id\":{\"S\":\"$JOB\"},\"status\":{\"S\":\"PENDING\"}}"', True),
+    ("aws iam list-roles --query 'Roles[?starts_with(RoleName,`site-`)].RoleName' --output text", True),
+    ('aws s3 ls                       # 无 site-frontend-*', True),
+    # 引号内的 `#` 不是注释，整行仍要能过
+    ('aws x y --item "{\\"a\\": \\"#1\\"}"', True),
+    # ↓ 白名单之外：每一条都是前几轮真绕过去过的构造
+    ('echo "${UNSET:-$(id)}"', False),                     # `${…}` 参数展开
+    ("echo {# $(id)", False),                              # brace / 词内 `#`
+    ("{aws,} s3 rm s3://x --recursive", False),            # brace expansion
+    ("cat <<EOF", False),                                  # heredoc
+    ("AWS_PROFILE=other aws lambda invoke --function-name x out.json", False),  # 前置赋值
+    ('("aws" lambda invoke --function-name x out.json)', False),                # 子 shell
+    ("aws dsql list-clusters; aws lambda invoke --function-name x out.json", False),  # 分隔符
+    ("echo `id`", False),                                  # 裸反引号
+    ("echo $'--function-name'", False),                    # ANSI-C 引用
+    ("echo $(date)", False),                               # 白名单外的命令替换
+    ("aws s3 rm s3://x --recursive | tee log", False),      # 管道
+    ("echo *", False),                                     # 通配
+    ("aws lambda invoke --payload $PAYLOAD out.json", False),  # 裸 $VAR（不在引号里）
+])
+def test_doc_syntax_allowlist_accepts_only_the_subset(line, ok):
+    """语法白名单的正/负对照。
+
+    负例这一半是**判据本身**的射程证明：把 `_G_BARE` 放宽成含 shell 元字符、或把
+    `_G_DQ` 放宽成允许 `$(`，这里立刻红。正例那一半防止白名单收到连现节都过不去
+    （那会变成"没人敢改 runbook"而不是安全）。
+    """
+    assert _doc_line_ok(line) is ok, line
+
+
+@pytest.mark.parametrize("line,kind", [
+    # 现节里真实出现的四种语句（正对照）
+    ('cd "$(git rev-parse --show-toplevel)"', "cd"),
+    ("site-builder/scripts/teardown_platform.sh --yes --stage preflight", "script"),
+    ("JOB=job-teardown-e2e-probe", "assign"),
+    ("aws dsql list-clusters --region us-east-1", "aws"),
+    # ↓ 第十八轮那五种：命令位置不是字面量 / 环境改写 / 换了绑定值
+    ('"$REVIEW_CMD" lambda invoke --function-name site-panel out.json', "?"),
+    ("bash -c '\"aws\" lambda invoke --function-name site-panel out.json'", "?"),
+    ("export AWS_PROFILE=other-account", "?"),
+    ("AWS_PROFILE=other-account", "?"),
+    ("REVIEW_CMD=aws", "?"),
+    ("JOB=something-else", "?"),
+    # 同族的其它入口：eval / 别名 / 带引号的命令名 / 拆除脚本参数里塞展开
+    ("eval \"$X\"", "?"),
+    # 带引号的命令名**是**合法的 `aws`（shlex 与 bash 都去引号），所以这里判 aws；
+    # 拦它的是下一层 argv 等值（site-panel 不在豁免表里）。分层就该这样，别在这条
+    # 里假装它是"?"。
+    ('"aws" lambda invoke --function-name site-panel out.json', "aws"),
+    ('site-builder/scripts/teardown_platform.sh "$STAGE"', "?"),
+    ("/usr/local/bin/aws lambda invoke --function-name site-panel out.json", "?"),
+])
+def test_doc_statement_allowlist_classifies_only_the_named_shapes(line, kind):
+    """语句形状表的正/负对照。
+
+    负例这一半钉住"命令位置只认字面量、绑定只认点名那条"：把 `parts[0] == "aws"` 放宽成
+    "含 aws"、或把绑定判据放宽成"任何 NAME=值"，这里立刻红。
+    """
+    T = _teardown_section
+    try:
+        globals()["_teardown_section"] = lambda: "```bash\n" + line + "\n```\n## x\n"
+        got = [st.kind for st in _doc_statements()]
+    finally:
+        globals()["_teardown_section"] = T
+    assert got == [kind], (line, got)
+
+
+def test_request_decoder_rejects_duplicate_json_keys():
+    """真实请求那条守卫的核心断言：重复键必须直接红（用**同一个** hook，不是复制品）。
+
+    `json.loads` 默认对重复键取**后者**，静默得很——第十八轮 P2-3 正是靠这一点把
+    `site_id` 从夹具站点改成 `victim`，而 argv 一字不差。
+    """
+    import json
+    src = '{"site_id":"e2e-probe","site_id":"victim"}'
+    assert json.loads(src)["site_id"] == "victim", "前提变了：json 不再对重复键取后者"
+    with pytest.raises(AssertionError, match="重复键"):
+        json.loads(src, object_pairs_hook=_json_no_dupes)
+    assert json.loads('{"a":1,"b":{"a":2}}', object_pairs_hook=_json_no_dupes) == \
+        {"a": 1, "b": {"a": 2}}, "同名键在**不同层**是合法的，不该误红"
+
+
+# 围栏解析器的语料。**期望值来自参考实现** markdown-it-py 4.2.0（`MarkdownIt('commonmark')`）
+# 逐条对过，不是我手写的直觉——第二十一轮就是靠这条差分抓出三个真漏块
+# （info 带额外词、CRLF、引用块里的围栏）。参考实现不在本仓库的锁定依赖里，所以差分是
+# **一次性方法**、结论固化成下面这张表；要重跑：另建 venv 装 markdown-it-py，对每条输入比
+# `_fenced_blocks` 与参考实现的 fence token，**只允许"我漏的那个块会被别的守卫显式拒"**。
+_FENCE_CASES = [
+    ("```bash\na\n```\n", [("bash", "a\n")]),
+    # 波浪线栏：里面的三反引号不是闭栏
+    ("~~~bash\na\n```\nb\n~~~\n", [("bash", "a\n```\nb\n")]),
+    # 块内一行注释里的三反引号**不**闭栏（旧正则就死在这里）
+    ("```bash\na\n# ```\nb\n```\n", [("bash", "a\n# ```\nb\n")]),
+    # 闭栏长度必须 ≥ 开栏
+    ("````bash\na\n```\nb\n````\n", [("bash", "a\n```\nb\n")]),
+    # info string 只取第一个词，后面的词随便（第二十一轮差分：旧写法整块漏掉）
+    ("```bash foo=1\na\n```\n", [("bash", "a\n")]),
+    # CRLF（同上，旧写法整块漏掉）
+    ("```bash\r\na\r\n```\r\n", [("bash", "a\n")]),
+    # 缩进 ≤3 是开栏；正文按开栏缩进量剥前导空白
+    ("   ```bash\n   a\n   ```\n", [("bash", "a\n")]),
+    # 闭栏后面还有别的字 ⇒ 不是闭栏
+    ("```bash\na\n``` x\nb\n```\n", [("bash", "a\n``` x\nb\n")]),
+    # 未闭合 ⇒ 延伸到末尾
+    ("```bash\na\nb\n", [("bash", "a\nb\n")]),
+    # 反引号栏的 info 里有反引号 ⇒ 那一行不是开栏；结尾那行 ``` 才是开栏（未闭合空块）。
+    # **r22 更正**：上一版注释说"参考实现给 []、这里刻意多收一个块"——那是我凭假设写的、
+    # 没跑过参考实现。实测参考实现同样给 `[("", "")]`，两边一致，不存在刻意差异。
+    ("```ba`sh\na\n```\n", [("", "")]),
+    # 无标签块要能解析出来（好让标签正向表拒它）
+    ("```\na\n```\n", [("", "a\n")]),
+    # 列表项里的围栏
+    ("- item\n\n  ```bash\n  a\n  ```\n", [("bash", "a\n")]),
+]
+
+
+@pytest.mark.parametrize("md,want", _FENCE_CASES, ids=range(len(_FENCE_CASES)))
+def test_fence_parser_matches_commonmark_reference(md, want):
+    """围栏解析器必须与 CommonMark 参考实现一致（漏块 = 命令脱离全部九层守卫）。"""
+    assert _fenced_blocks(md) == want, md
+
+
+@pytest.mark.parametrize("sep", ["", "", "", " ", " "])
+def test_fence_parser_only_breaks_lines_on_lf(sep):
+    """CommonMark §2.1 的行结束只有 LF / CR / CRLF —— `splitlines()` 认的比这多。
+
+    参考实现差分实测 5/5 漏：正文写 `a<SEP>``` ` 时参考实现看成**一行**（不闭栏），
+    而 `splitlines()` 把它当两行 ⇒ 提前闭栏 ⇒ 后面那条命令脱离全部九层守卫。
+    """
+    hidden = "aws lambda invoke --function-name hidden out.json"
+    md = f"```bash\na{sep}```\n{hidden}\n```\n"
+    blocks = _fenced_blocks(md)
+    assert len(blocks) == 1 and blocks[0][0] == "bash", blocks
+    assert hidden in blocks[0][1], f"{sep!r} 被当成行结束 ⇒ 隐藏命令漏掉了"
+
+
+@pytest.mark.parametrize("line,rejected", [
+    ("    ```bash", True),                      # 缩进 ≥4
+    ("     ~~~bash", True),
+    ("> ```bash", True),                        # 引用块
+    (">> ```bash", True),
+    ("\t```bash", True),                        # tab 缩进（r22：旧的两条正则漏掉它）
+    (" \t```bash", True),                       # 空格+tab（同上）
+    ("    > ```bash", True),                    # 列表内 4 空格后再 `>`（同上）
+    ("\t> ```bash", True),                      # 列表内 tab 后再 `>`（同上）
+    ("x ```bash", True),                        # 行中间
+    ("   ```bash", True),                       # r24：缩进 1–3 也拒（见下面那段说明）
+    (" ```bash", True),
+    ("```bash", False),                         # 只有第 0 列是受支持形态
+    ("~~~bash", False),
+    ("``` ", False),                            # 闭栏
+    ("a `code` b", False),                      # 单反引号不是围栏
+])
+def test_unsupported_fence_shapes_are_explicitly_rejected(line, rejected):
+    """只允许**第 0 列**的围栏行，其余含围栏字符的行一律红。
+
+    判据换过两次，两次都是被差分否掉的：
+      · r22 前：枚举不支持的形态（引用块 + 缩进 ≥4 两条正则）—— tab 缩进、空格+tab、
+        列表内更深位置的 `>` 四种参考实现都认得、两条正则一条都不命中。
+      · r23/r24：放宽到"缩进 ≤3"也不行 —— 列表项里缩进 2 的开栏会被当成顶层，配上
+        未闭合 / HTML 块里的三反引号，就出现"块数相同而边界不同"和"总量抵消"两类反例。
+    所以收到第 0 列。**这不是"完备"**（见 `_FENCE_RUN` 上面那段），是一条可逐条验证的
+    文档约束，配合"逐块显式闭合"与"无 HTML 块起始行"两条一起用。
+    """
+    hit = bool(_FENCE_RUN.search(line) and not _FENCE_SUPPORTED_LINE.match(line))
+    assert hit is rejected, line
+
+
+def test_fence_indent_stripping_never_eats_content_or_newlines():
+    """去缩进只吃**空格**、最多 n 个：不许吞正文、不许吞换行、不许按字符算 tab。
+
+    旧写法是"前 n 个字符全是 isspace() 就切掉 n 个字符"，三处偏差（r21 静态审计）：
+    只有 k<n 个空格时一个都不切；空行的换行被一起切掉；tab 与 Unicode 空白按字符算。
+    """
+    assert _strip_fence_indent(" a", 3) == "a", "只有 1 个空格时也要剥掉"
+    assert _strip_fence_indent("", 3) == "", "空行不该变成别的东西"
+    assert _strip_fence_indent("\ta", 3) == "\ta", "tab 不按空格剥（§2.2 是列宽，不是字符）"
+    assert _strip_fence_indent("    a", 3) == " a", "最多剥 n 个"
+    assert _strip_fence_indent("a", 3) == "a"
+    # 缩进块里的空行必须仍然是一行（不能被吞掉）
+    assert _fenced_blocks("   ```bash\n   a\n\n   b\n   ```\n") == [("bash", "a\n\nb\n")]
+
+
+# 语法子集里允许的词形。**期望值由真 bash 给**（见下面那条测试），不是手写的。
+_BASH_WORD_CASES = [
+    "bare", "a/b.c-d:e", "JOB=x", "--flag", "--flag=value",
+    "''", "'sp ace'", "'$JOB'", "'`id`'", "'a\\b'",
+    '""', '"sp ace"', '"$JOB"', '"a\\\\b"', '"q\\"q"',
+    '"{\\"k\\":\\"$JOB\\"}"',
+]
+
+
+def test_word_values_match_real_bash():
+    r"""`_shell_tokens` 的词值必须与**真 bash** 交给进程的 argv 一致（变量展开除外）。
+
+    r22 §4 指出 `test_lexer_regression_assertions_on_the_bypass_shapes` 不启动 bash、
+    名字 overclaim。这一条是它认可的最小差分形态：临时 PATH 里只放一个用 bash 内建
+    `printf` 写的记录器，`/bin/bash --noprofile --norc` 启动，环境最小化，输入只取
+    语法子集里允许的中性词形。
+
+    契约：本子集内 shlex 值与 bash 值**只差变量展开这一件事**（`$NAME` 在双引号/裸词里
+    会被 bash 展开，shlex 原样保留），别的必须逐字节相等。`\$` 与 `` \` `` 已被
+    `_G_DQ` 拒掉，正是因为它们在这两者之间不一致（r22 §3 量到的那条）。
+    """
+    import os
+    import subprocess
+    import tempfile
+    from pathlib import Path
+    bash = "/bin/bash"
+    if not os.path.exists(bash):
+        pytest.skip("没有 /bin/bash")
+    with tempfile.TemporaryDirectory(prefix="wordval-") as td:
+        rec = Path(td) / "record"
+        rec.write_text('#!' + bash + '\nprintf "%s\\0" "$@"\n', encoding="utf-8")
+        rec.chmod(0o755)
+        env = {"PATH": td, "LC_ALL": "C", "JOB": "JOBVALUE"}
+        mismatches = []
+        for word in _BASH_WORD_CASES:
+            # 每个词都必须在语法子集里，否则这条用例本身没意义
+            assert _DOC_LINE_GRAMMAR.fullmatch("record " + word), word
+            proc = subprocess.run([bash, "--noprofile", "--norc", "-c", "record " + word],
+                                  capture_output=True, text=True, env=env, timeout=10)
+            assert proc.returncode == 0, (word, proc.stderr)
+            actual = proc.stdout.split("\0")[:-1]
+            # **契约的两条显式约定**（都不是缺陷，是本套件刻意的建模）：
+            #   ① `--flag=value` 我刻意拆成两个 token（好让它与 `--flag value` 在 argv
+            #      等值层比得相等），所以对 bash 的 argv 施加同一次规范化再比；
+            #   ② `$NAME` 只在**双引号/裸词**里展开；单引号里是字面量（EXPAND 层就是
+            #      按这条判的）。所以按原始词的引用形态决定要不要代值。
+            norm = []
+            for a in actual:
+                if a.startswith("--") and "=" in a:
+                    f, _, v = a.partition("=")
+                    norm += [f, v]
+                else:
+                    norm.append(a)
+            parts, raws = _aligned_words("record " + word)
+            expected = [p if _word_kind(_raw_value_segment(r)) == "sq"
+                        else p.replace("$JOB", env["JOB"])
+                        for p, r in zip(parts[1:], raws[1:])]
+            if norm != expected:
+                mismatches.append(f"{word!r}: bash={norm!r} 解析={expected!r}")
+        assert mismatches == [], (
+            "shlex 与真 bash 的词值不一致（除变量展开外必须逐字节相等）：\n  "
+            + "\n  ".join(mismatches))
+
+
+def test_raw_words_and_parts_stay_index_aligned():
+    """原始词与规范化 token 必须**逐下标对齐**（r21 §2 的核心发现）。
+
+    `_shell_tokens` 会把 `--flag=value` 拆成两个 token，而原始词只有一个。上一版只校验
+    "原始词数 == shlex 词数"（两边都没拆），于是 `--region=us-east-1` 这种全裸值形态
+    **校验通过而下标从此错位**，`raws[parts.index(flag)+1]` 取到隔壁的词 ⇒
+    "单引号里的 `$` 不展开"那条检查作用在错误的词上。
+    """
+    parts, raws = _aligned_words("aws x y --region=us-east-1 out.json")
+    assert len(parts) == len(raws) and parts[4] == "us-east-1"
+    assert raws[3] == raws[4] == "--region=us-east-1", "拆分时原始词要同步复制"
+    assert parts == _shell_tokens("aws x y --region=us-east-1 out.json")
+    # 值那一段的引用形态要单独取：整词以 `-` 开头看着像裸词，值却可能是单引号
+    assert _word_kind(_raw_value_segment("--payload='{\"a\":1}'")) == "sq"
+    assert _word_kind(_raw_value_segment("--region=us-east-1")) == "bare"
+    # 相邻引号拼接（`a''b`）不在语法子集里 ⇒ 一律当可疑
+    assert _aligned_words("a''b") == ([], [])
+
+
+def test_fence_block_state_invariant_catches_merged_blocks():
+    """围栏行数 == 2×块数：没有这条，未闭合的围栏会把后面的独立块**并进来**。
+
+    r23 的中性反例（正文只有占位文字）：列表项里一个未闭合的 bash 栏，按 CommonMark
+    随列表结束而结束、后面那个顶层栏是**第二个**块；扫描器却一路收到底，
+    参考实现 2 个块 vs 扫描器 1 个块，**而每条围栏行都符合"受支持形态"**。
+    所以"每行形状合规"不等于"块边界对"——这条不变量补的正是那一步。
+    """
+    F = "`" * 3
+    merged = "- item\n\n  " + F + "bash\n  alpha\n\nomega\n\n" + F + "bash\nbeta\n" + F + "\n"
+    blocks = _fenced_blocks(merged)
+    assert len(blocks) == 1, "反例前提变了：扫描器现在不再合并了？"
+    fence_lines = [l for l in _md_lines(merged) if _FENCE_RUN.search(l)]
+    assert len(fence_lines) != 2 * len(blocks), "不变量抓不到这个反例了"
+    # 未闭合的围栏（最简形态）同样违反不变量
+    unclosed = F + "bash\nalpha\n"
+    assert len(_fenced_blocks(unclosed)) == 1
+    assert len([l for l in _md_lines(unclosed) if _FENCE_RUN.search(l)]) == 1
+    # 正对照：本节与"两个都闭合"的样本都满足 1:2
+    for ok in (_teardown_section(), F + "bash\na\n" + F + "\n" + F + "text\nb\n" + F + "\n"):
+        assert len([l for l in _md_lines(ok) if _FENCE_RUN.search(l)]) == 2 * len(_fenced_blocks(ok))
+
+
+def test_zero_indent_fences_need_no_body_dedent():
+    """零缩进围栏下正文**不需要去缩进**，于是 tab 保真差异不可构造。
+
+    r22/r23 的差异是"开栏有缩进 + 正文裸 tab"时参考按 §2.2 的 4 列制表位展开、我只吃空格。
+    r24 指出上一版"拒正文前导 tab"这条**过度拒绝**（零缩进围栏下两边正文其实完全一致，
+    却把合法的 tab 缩进 JSON 也拒了），而且报错文案说"两者解析出的正文不同"并不成立。
+    现在靠"围栏必须在第 0 列"消掉整个差异来源：indent=0 ⇒ 一个字符都不剥。
+    """
+    F = "`" * 3
+    md = F + "bash\n\talpha\n  beta\n" + F + "\n"
+    assert _fenced_blocks(md) == [("bash", "\talpha\n  beta\n")], "零缩进下正文必须原样"
+    assert _strip_fence_indent("\talpha", 0) == "\talpha"
+    # 带缩进的开栏现在由守卫拒（解析器本身仍会剥，那条路走不到）
+    assert not _FENCE_SUPPORTED_LINE.match(" " + F + "bash")
+
+
+def test_fence_guard_rejects_the_r24_counterexamples():
+    """r24 的两个反例：计数判据都过，而边界/归属不对 —— 必须由别的约束拒。
+
+    ① 列表内未闭合围栏 + HTML 块里的三反引号被当成闭栏 ⇒ **双方各 1 块、围栏行恰好 2 条**
+       （计数 `2 == 2×1` 通过），正文却从 `alpha\n\n` 变成含 `<div>` `omega` 的一大块。
+    ② 合并块（3 行/1 块）与末尾未闭合块（1 行/1 块）**相互抵消** ⇒ `4 == 2×2` 通过。
+    现在 ① 被"围栏必须第 0 列"+"无 HTML 块起始行"拒，② 被"第 0 列"+"逐块显式闭合"拒。
+    """
+    F = "`" * 3
+    a = "- item\n\n  " + F + "bash\n  alpha\n\n<div>\nomega\n" + F + "\n</div>\n"
+    b = ("- item\n\n  " + F + "bash\n  alpha\n\nomega\n\n" + F + "bash\nbeta\n" + F + "\n"
+         + "\n" + F + "bash\ngamma\n")
+    for name, md in (("HTML 吞并", a), ("抵消", b)):
+        fl = [l for l in _md_lines(md) if _FENCE_RUN.search(l)]
+        blocks = _fenced_blocks(md)
+        # 前提：计数判据确实看不见它（反例失效时这条会红，而不是静默变成空跑）
+        assert len(fl) == 2 * len(blocks), f"{name}：反例前提变了，计数已经能抓到它"
+        # 而三条约束里至少一条要拒
+        rejected = (any(not _FENCE_SUPPORTED_LINE.match(l) for l in fl)
+                    or any(_HTML_BLOCK_START.match(l) for l in _md_lines(md))
+                    or any(not c for _l, _b, c in _fenced_blocks_detailed(md)))
+        assert rejected, f"{name}：三条约束都没拒它"
+
+
+def test_allowed_command_substitution_matches_real_bash():
+    r"""唯一允许的命令替换 `"$(git rev-parse --show-toplevel)"` 的 bash 语义差分。
+
+    r24 建议给这个分支单独差分（它不是普通变量替换，不能套进"字符串替换"模型）。
+    形态照 r24 给的：临时 PATH 里只放**假 git** 与参数记录器（都只用 bash 内建），
+    `/bin/bash --noprofile --norc`、最小环境、超时；期望值来自假 git 的固定输出与
+    已声明的替换契约。**不调用真实 git。**
+
+    契约（每条都由下面的样本实测）：末尾 LF 全部去掉、内部 LF 保留、整体是**一个**参数
+    （不分词、不通配）、stdout 为空 ⇒ 一个空参数、**git 失败时外层仍可退 0**
+    （所以测试必须把两者状态分开看 —— 这也是 r24 点出的那条）。
+    """
+    import os
+    import shlex
+    import subprocess
+    import tempfile
+    from pathlib import Path
+    bash = "/bin/bash"
+    if not os.path.exists(bash):
+        pytest.skip("没有 /bin/bash")
+    NL = chr(10)
+    cases = [
+        ("/tmp/repo" + NL, 0, ["/tmp/repo"]),
+        ("/tmp/re po/*" + NL, 0, ["/tmp/re po/*"]),
+        ("/tmp/repo" + NL * 3, 0, ["/tmp/repo"]),
+        ("/tmp/a" + NL + "b" + NL, 0, ["/tmp/a" + NL + "b"]),
+        ("", 0, [""]),
+        ("", 1, [""]),
+        ("/tmp/repo" + NL, 1, ["/tmp/repo"]),
+    ]
+    rec_src = "#!" + bash + NL + 'printf "%s\\0" "$@"' + NL
+    with tempfile.TemporaryDirectory(prefix="subst-") as td:
+        d = Path(td)
+        (d / "record").write_text(rec_src, encoding="utf-8")
+        (d / "record").chmod(0o755)
+        gitlog = d / "gitargv"
+        for out, rc, want in cases:
+            git_src = ("#!" + bash + NL
+                       + 'printf "%s\\0" "$@" >> "$GITLOG"' + NL
+                       + "printf '%s' " + shlex.quote(out) + NL
+                       + "exit " + str(rc) + NL)
+            (d / "git").write_text(git_src, encoding="utf-8")
+            (d / "git").chmod(0o755)
+            gitlog.write_text("", encoding="utf-8")
+            proc = subprocess.run(
+                [bash, "--noprofile", "--norc", "-c",
+                 'record "$(git rev-parse --show-toplevel)"'],
+                capture_output=True, text=True, timeout=10,
+                env={"PATH": str(d), "LC_ALL": "C", "GITLOG": str(gitlog)})
+            # git 失败不等于外层失败 —— r24 点出的就是这条，必须分开看
+            assert proc.returncode == 0, (out, rc, proc.stderr)
+            assert proc.stdout.split("\0")[:-1] == want, (out, rc, proc.stdout)
+            assert gitlog.read_text().split("\0")[:-1] == ["rev-parse", "--show-toplevel"]
+    # 本套件对它的处理：语句层按**精确字面量**放行，不进变量替换模型
+    assert _word_kind('"$(git rev-parse --show-toplevel)"') == "subst"
+    assert _STMT_CD == ("cd", "$(git rev-parse --show-toplevel)")
+
+
+def test_fence_bodies_preserve_trailing_newlines_for_every_line_ending():
+    """末尾行结束符的保真：LF / CRLF / 裸 CR 三种都要与参考一致（r23 §3）。
+
+    上一版用**原始** `text.endswith("\n")` 判断，裸 CR 结尾时为假 ⇒ 少保留一个 LF。
+    """
+    F = "`" * 3
+    assert _fenced_blocks(F + "bash\nalpha")[0][1] == "alpha", "无尾结束符时不该补"
+    for end in ("\n", "\r\n", "\r"):
+        assert _fenced_blocks(F + "bash" + end + "alpha" + end)[0][1] == "alpha\n", end
+        assert _fenced_blocks(F + "bash" + end + "alpha" + end + end)[0][1] == "alpha\n\n", end
+
+
+@pytest.mark.parametrize("word", ["'a\x00b'", '"a\x00b"', "'a\x1fb'", "a\x00b"])
+def test_control_characters_are_outside_the_word_grammar(word):
+    """NUL 与其它 C0 控制字符不在词法子集里：bash 会**丢掉** NUL，两条分词路径都保留。
+
+    r23 §4 实测：`'alpha<NUL>beta'` 我给 `alpha\x00beta`、bash 给 `alphabeta`。
+    runbook 不需要控制字符，所以按字符域拒，而不是去建模 bash 的丢弃行为。
+    """
+    assert not _DOC_LINE_GRAMMAR.fullmatch("record " + word), word
+
+
+def test_container_fences_the_scanner_misses_are_all_rejected():
+    """凡是参考实现认得、而 `_fenced_blocks` 漏掉的布局，完备规则都必须拒。
+
+    钉住 r22 差分实测的那批：引用块、嵌套引用块、tab 缩进、空格+tab、
+    列表内 4 空格后再 `>`、列表内 tab 后再 `>`；以及本节自己不许出现它们。
+    """
+    F = "`" * 3
+    for md in ("> " + F + "bash\n> a\n> " + F + "\n",
+               "> > " + F + "bash\n> > a\n> > " + F + "\n",
+               F + "bash\na\n" + F + "\n> " + F + "bash\n> b\n> " + F + "\n",
+               "1. s\n\n\t" + F + "bash\n\ta\n\t" + F + "\n",
+               "- s\n\n \t" + F + "bash\n \ta\n \t" + F + "\n",
+               "1. s\n\n    > " + F + "bash\n    > a\n    > " + F + "\n",
+               "- s\n\n\t> " + F + "bash\n\t> a\n\t> " + F + "\n"):
+        assert any(_FENCE_RUN.search(l) and not _FENCE_SUPPORTED_LINE.match(l)
+                   for l in _md_lines(md)), md
+    assert not any(_FENCE_RUN.search(l) and not _FENCE_SUPPORTED_LINE.match(l)
+                   for l in _md_lines(_teardown_section())), "本节里有不受支持的围栏形态"
+
+
+def test_doc_syntax_allowlist_is_load_bearing_for_the_whole_section():
+    """整节现有内容必须**逐行**过白名单——这条与上面那条正例互为补充。
+
+    上面那条只抽了几行；这条保证不是"抽到的几行刚好能过"。
+    """
+    lines = [l for block in _fenced_bash(_teardown_section())
+             for l in block.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+    assert len(lines) >= 15, f"拆除一节的围栏块只剩 {len(lines)} 行命令，是不是被删了"
+    assert _doc_grammar_offenders() == []
+
+
+def test_lexer_regression_assertions_on_the_bypass_shapes():
+    """词法器在这些形态上的**静态回归断言**。
+
+    **这条不启动 bash**（r22 指出旧名字 overclaim）：期望值是我按 bash 语义手写的，
+    能挡住已知回归，但不是独立差分证据。真差分在 `test_word_values_match_real_bash`。
+
+    第十七轮补两条**反向**要求：`${…}` 不许整段跳过（跳过等于把内层替换藏起来），
+    `{` 不许无条件当分组符（bash 只在它独立成词时才是关键字）。
+    """
+    # `${VAR:-默认}` 的默认值里那条替换必须被取出来（实测 bash 会执行它）
+    assert _command_substitutions('echo "${UNSET:-$(id)}"') == ["id"], \
+        "`${…}` 被整段跳过了 —— 内层替换会被藏起来"
+    # `{#` 是普通词 ⇒ 不许在 `{` 断句、把 `#` 变成注释开头
+    assert _command_substitutions("echo {# $(id)") == ["id"], \
+        "在 `{` 处断了句，`#` 落到词首被当成注释"
+    # ① 引号内的 `#` 不是注释 ⇒ 替换必须被取出来
+    cmds, subs, unterm = _lex_block('JOB2="{\n# \'$(id)\'\n}"\necho done')
+    assert subs == ["id"], subs
+    assert not unterm
+    # ② `( … )` 是分组符 ⇒ 里面的命令要单独成条，且 aws 是一个 token
+    cmds, _s, _u = _lex_block('echo a\n("aws" lambda invoke --function-name site-panel out.json)')
+    assert 'aws lambda invoke --function-name site-panel out.json' in [
+        " ".join(_shell_tokens(c) or []) for c in cmds], cmds
+    # ③ `\`+换行**不补空格**，缩进才是分隔符 —— 两种写法都要与 bash 一致
+    assert _shell_tokens(_lex_block("x --function-\\\nname v")[0][0]) == ["x", "--function-name", "v"]
+    assert _shell_tokens(_lex_block("x --item \\\n  v")[0][0]) == ["x", "--item", "v"]
+    # ④ 块结束时仍在引号内 ⇒ unterminated
+    assert _lex_block('echo "unclosed')[2]
 
 
 def test_only_notfound_codes_classify_as_absent(harness):
@@ -2124,22 +3629,13 @@ def test_only_notfound_codes_classify_as_absent(harness):
 
     所以这里验**补集**：枚举每个操作已建模的全部 wire code，声明之外的**一律**
     必须 NOT_ABSENT。新增一条无关的码就会让本条红。
+
+    **射程与上一条共用 `_MODEL_PROBE`**：这里曾经自带一份少了两个操作的副本，于是
+    给 `dynamodb scan` 开一条 ABSENT 后门时全绿（Codex 第十五轮 P2-4）。
     """
     import botocore.session
     sess = botocore.session.get_session()
-    probe = {
-        ("dynamodb", "describe-table"): ("dynamodb", "DescribeTable"),
-        ("iam", "get-role"): ("iam", "GetRole"),
-        ("lambda", "get-function"): ("lambda", "GetFunction"),
-        ("ecr", "describe-repositories"): ("ecr", "DescribeRepositories"),
-        ("cognito-idp", "describe-user-pool"): ("cognito-idp", "DescribeUserPool"),
-        ("sns", "get-topic-attributes"): ("sns", "GetTopicAttributes"),
-        ("ssm", "get-parameter"): ("ssm", "GetParameter"),
-        ("kms", "describe-key"): ("kms", "DescribeKey"),
-        ("dsql", "get-cluster"): ("dsql", "GetCluster"),
-        ("bedrock-agentcore-control", "get-agent-runtime"):
-            ("bedrock-agentcore-control", "GetAgentRuntime"),
-    }
+    probe = _MODEL_PROBE
     script = _SCRIPT.read_text(encoding="utf-8")
     body = script[script.index("_absent_codes() {"):script.index("# _outer_code <errtext>")]
     problems = []
@@ -2164,6 +3660,9 @@ def test_declared_notfound_codes_are_the_expected_minimum(harness):
 
     上一条验"声明之外的都不算 ABSENT"，这条验"声明的就是这些"——合起来才把
     "多收一个码"和"悄悄换掉一个码"都挡住。
+
+    这张表也必须**覆盖脚本登记的全部操作**：只按自己的 key 去查的话，脚本里新加一个
+    操作时本条照绿（与 Codex 第十五轮 P2-4 同一形状）。
     """
     expected = {
         ("dynamodb", "describe-table"): {"ResourceNotFoundException"},
@@ -2180,6 +3679,10 @@ def test_declared_notfound_codes_are_the_expected_minimum(harness):
         ("kms", "describe-key"): {"NotFoundException"},
         ("s3api", "get-bucket-location"): {"NoSuchBucket"},
     }
+    assert set(expected) == _declared_absent_operations(), (
+        "预期表与脚本登记的操作集合不一致："
+        f"脚本多出 {sorted(_declared_absent_operations() - set(expected))}，"
+        f"表里多出 {sorted(set(expected) - _declared_absent_operations())}")
     script = _SCRIPT.read_text(encoding="utf-8")
     body = script[script.index("_absent_codes() {"):script.index("# _outer_code <errtext>")]
     got = {}

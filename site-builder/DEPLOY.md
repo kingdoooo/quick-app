@@ -3444,7 +3444,7 @@ aws lambda invoke --function-name site-deployer-undeploy --region us-east-1 \
 **router 栈第一次 `delete-stack` 一定 `DELETE_FAILED`。** 分发已经删掉，但两个 Edge
 函数的**已发布版本**删不了：
 
-```
+```text
 ApplicationWebRouterStack | DELETE_FAILED
 "Lambda was unable to delete …:function:…-application-web-router:1 because it is a
  replicated function. Please see our documentation for Deleting Lambda@Edge Functions
