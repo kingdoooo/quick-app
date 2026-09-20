@@ -487,6 +487,28 @@ def _require_email_verified_cfg(cfg) -> str:
     return "false" if head == "false" else "true"
 
 
+def _trusted_idps_cfg(cfg) -> str:
+    """config.ini [IdP] provider_name → runtime `TRUSTED_IDPS`，**校验强度与 Edge 对齐**。
+
+    M13（merged review §9）：Edge 侧（router `stack.py`）对 `trusted_idps` 显式拒行内
+    注释——`ConfigParser` 默认不剥，`Feishu   # 飞书` 会整串进白名单，运行时
+    `server._trusted_idps()` 只 strip 两端、拒不掉中间那个 `#`，于是 `idp ∈ trusted`
+    永不匹配 ⇒ **MCP 侧全员被拒**（潜伏、难排查：像"工具坏了"）。MCP 侧原先零校验，
+    这里补齐：同样在**部署时**响亮拒掉，而不是让它到运行时静默锁死。
+
+    空值 = 迁移宽限期（与 Edge 的 `require_idp_claim=false` 对齐），允许放行。
+    """
+    if not cfg.has_section("IdP"):
+        return ""
+    raw = cfg["IdP"].get("provider_name", "")
+    if "#" in raw or ";" in raw:
+        sys.exit(
+            f"[IdP] provider_name 含注释字符（当前 {raw!r}）——ConfigParser 不剥行内注释，"
+            "整串会进 TRUSTED_IDPS，运行时 idp 校验永不匹配 = MCP 侧全员被拒。"
+            "值里只放 provider 名（须与 router [SiteBuilder] trusted_idps 逐字符一致）。")
+    return raw.strip()
+
+
 def _discovery_url(cfg) -> str:
     pool = cfg["Cognito"]["user_pool_id"]
     if not pool:
@@ -601,7 +623,7 @@ def runtime_kwargs(cfg, image_uri: str, role_arn: str) -> dict:
             # 钉到建表语句上（panel 侧有对称的一条）。
             "ACCESS_EVENTS_TABLE": "site-access-events",
             "ACCESS_DAILY_TABLE": "site-access-daily",
-            "TRUSTED_IDPS": cfg["IdP"]["provider_name"] if cfg.has_section("IdP") else "",
+            "TRUSTED_IDPS": _trusted_idps_cfg(cfg),   # 校验强度与 Edge 对齐（M13）
             # 与 auth 服务同一个开关（两处语义必须一致）：email 是授权主键，
             # 而联邦 email 默认 unverified。默认 "true"，只有接入不发该 claim
             # 的 IdP 时才在 config.ini 设 false。

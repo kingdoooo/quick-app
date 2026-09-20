@@ -1127,3 +1127,41 @@ def test_runtime_access_tables_are_query_only():
     assert not over, (
         f"analytics.py 里出现了 {sorted(over)}——真机会 AccessDenied。"
         "该改的是 analytics.py（读取层不写数、查询都带分区键），不是放宽角色")
+
+
+# ---- M13（merged review §9）：MCP 侧 provider_name → TRUSTED_IDPS 的校验强度与 Edge 对齐 ----
+#
+# Edge（router stack.py）对 trusted_idps 显式拒行内注释；MCP 侧原先零校验，
+# `ConfigParser` 不剥注释、`server._trusted_idps()` 只 strip 两端 ⇒ `Feishu # x`
+# 会整串进白名单、运行时全员被拒（潜伏）。下面钉住"部署时就拒，不到运行时"。
+def _cfg_with_idp(provider_name):
+    import configparser
+    cfg = configparser.ConfigParser()
+    text = "[Platform]\nregion = us-east-1\n"
+    if provider_name is not None:
+        text += f"[IdP]\nprovider_name = {provider_name}\n"
+    cfg.read_string(text)
+    return cfg
+
+
+@pytest.mark.parametrize("bad", ["Feishu # 飞书", "Feishu ; x", "Okta,Feishu # both"])
+def test_provider_name_with_inline_comment_is_rejected_at_deploy(bad):
+    import deploy_agentcore as da
+    with pytest.raises(SystemExit):
+        da._trusted_idps_cfg(_cfg_with_idp(bad))
+
+
+@pytest.mark.parametrize("raw,want", [
+    ("Feishu", "Feishu"),
+    ("  Feishu  ", "Feishu"),      # 两端空白剥掉，与 server._trusted_idps 对齐
+    ("Okta,Feishu", "Okta,Feishu"),
+    ("", ""),                       # 空 = 迁移宽限期，允许
+])
+def test_clean_provider_name_passes_through(raw, want):
+    import deploy_agentcore as da
+    assert da._trusted_idps_cfg(_cfg_with_idp(raw)) == want
+
+
+def test_no_idp_section_is_grace_not_error():
+    import deploy_agentcore as da
+    assert da._trusted_idps_cfg(_cfg_with_idp(None)) == ""

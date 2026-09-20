@@ -866,3 +866,56 @@ def test_fixture_keeps_running_on_an_uncertain_start_error(aws):
                  if ":pending" in str(c.kwargs.get("ExpressionAttributeValues"))]
     assert not rollbacks, \
         "结果不确定却回滚了——执行可能活着，第二次部署会与它并行"
+
+
+# ---- M20（merged review §9）：dev 脚本不得静默接管别人的 owner ----
+#
+# 用 moto 真建表、真跑条件写，而不是 MagicMock —— 断言的是"条件确实挡住了接管"，
+# 不是"调用里带了 ConditionExpression 这个字符串"。
+import moto  # noqa: E402
+
+
+def _sites_table():
+    import boto3
+    ddb = boto3.resource("dynamodb", region_name="us-east-1")
+    ddb.create_table(
+        TableName="site-sites",
+        KeySchema=[{"AttributeName": "site_id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "site_id", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST")
+    return ddb.Table("site-sites")
+
+
+@moto.mock_aws
+def test_fixture_write_creates_when_absent():
+    t = _sites_table()
+    df._write_fixture_site_record(t, "s-new", owner="fixture@e2e.invalid", name="N")
+    row = t.get_item(Key={"site_id": "s-new"})["Item"]
+    assert row["owner"] == "fixture@e2e.invalid" and row["status"] == "DEPLOYING"
+
+
+@moto.mock_aws
+def test_fixture_write_is_idempotent_for_same_owner():
+    t = _sites_table()
+    df._write_fixture_site_record(t, "s1", owner="me@e2e.invalid", name="N1")
+    # 同 owner 重部署：覆盖 name/status，不报错
+    df._write_fixture_site_record(t, "s1", owner="me@e2e.invalid", name="N2")
+    row = t.get_item(Key={"site_id": "s1"})["Item"]
+    assert row["owner"] == "me@e2e.invalid" and row["name"] == "N2"
+
+
+@moto.mock_aws
+def test_fixture_write_refuses_to_take_over_a_foreign_owner():
+    t = _sites_table()
+    # 别人先建了这个站点
+    t.update_item(Key={"site_id": "victim"},
+                  UpdateExpression="SET #o = :o, #n = :n, #s = :s",
+                  ExpressionAttributeNames={"#o": "owner", "#n": "name", "#s": "status"},
+                  ExpressionAttributeValues={":o": "real-user@corp.com",
+                                             ":n": "Real Site", ":s": "ACTIVE"})
+    with pytest.raises(df.FixtureOwnerConflict):
+        df._write_fixture_site_record(t, "victim", owner="fixture@e2e.invalid", name="X")
+    # 关键：victim 的 owner/name/status 一个字节都没被改
+    row = t.get_item(Key={"site_id": "victim"})["Item"]
+    assert row == {"site_id": "victim", "owner": "real-user@corp.com",
+                   "name": "Real Site", "status": "ACTIVE"}

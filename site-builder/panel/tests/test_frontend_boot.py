@@ -1062,3 +1062,32 @@ def test_harness_catches_the_real_message_getting_the_hint_appended(tmp_path):
     rendered = _render_real_messages(tmp_path, app)
     assert RETRY_HINT in rendered["absent"], (
         f"注入了原缺陷但真文案这一路仍然绿——它什么都没盯: {rendered['absent']}")
+
+
+# ── M15（merged review §9）：陈旧的访问统计响应不得覆盖当前页 ──────────────
+#
+# 同一 panel 先渲染 siteA（响应挂起）再渲染 siteB（立即），siteB 画完后才放行 siteA
+# 的陈旧响应。generation 守卫应把 siteA 丢弃 —— 最后一次 innerHTML 必须是 siteB。
+
+def test_stale_analytics_response_does_not_overwrite_the_current_page():
+    code, out = run_boot("m15-stale")
+    assert out["errors"] == [], f"harness 内有异常: {out['errors']}"
+    assert out["last_write_has_fresh"] and not out["last_write_has_stale"], (
+        f"陈旧响应覆盖了当前页（gen 守卫失效）: {out}")
+    assert code == 0
+
+
+def test_m15_scenario_reddens_without_the_guard(tmp_path):
+    """反向验证：去掉 gen 守卫，siteA 的迟到响应就会最后落笔（= 复现缺陷）。
+
+    没有这条，"守卫存在"与"守卫有用"分不开——app.js 里删掉那两行 return，
+    上面那条仍可能因为别的原因碰巧绿。
+    """
+    src = APP.read_text(encoding="utf-8")
+    line = "    if (gen !== analyticsGen) return;     // 已被后来的请求顶掉：这份是陈旧响应，丢弃\n"
+    assert src.count(line) == 1, "守卫那行的锚点变了，用例需要更新"
+    broken = tmp_path / "app.js"
+    broken.write_text(src.replace(line, "", 1), encoding="utf-8")
+    _code, out = run_boot("m15-stale", app=broken)
+    assert out["last_write_has_stale"] and not out["last_write_has_fresh"], (
+        f"去掉守卫却没复现覆盖——场景没在真正驱动那条路径: {out}")

@@ -1281,20 +1281,34 @@ const TREND_RANGES = [
 /* 模块级：换 tab / 换站点仍记得选过的档位与视图（刷新回默认，不落存储）。 */
 const trendPref = { q: 'period=day&n=30', view: 'chart' };
 
+/* 每次进入访问统计（换站点 / 换档位 / 换 tab 都会重入）自增一次。在途响应回来时
+ * 若 gen 已被后来的请求顶掉，就丢弃——**不写 innerHTML**。M15（merged review §9）：
+ * 原先 .then 里读的是**模块级** trendPref.q（响应回来那一刻的值），于是
+ *   ① 慢的 90 天响应渲染在「近 7 天」标题+按钮之下（错档位）；
+ *   ② 请求在途时切站点，甲站点的流量画进乙站点页面（跨站点覆盖——两个用户都有权
+ *      看，不是越权，但审计场景里是误导）。
+ * generation 守卫一条同时关掉两者，比"用响应回显的 period 出标题"更完整：后者只区分
+ * day/month，区分不了 n=7 与 n=30（两者都 period=day）。渲染改用**请求发出时捕获的**
+ * reqQ / reqSite，不再读实时 trendPref。 */
+let analyticsGen = 0;
+
 function renderAnalyticsTab(panel, site) {
+  const gen = ++analyticsGen;
+  const reqQ = trendPref.q;               // 本次请求的档位，锁定，不随后续切换而变
   panel.innerHTML = '<section class="card"><div class="card-body">' +
     '<p class="meta">正在加载访问统计…</p></div></section>';
   const id = encodeURIComponent(site.site_id);
   /* 两个请求并发：趋势与明细互不依赖，串起来会让这一屏等两个 RTT。
    * 任一失败都进 catch —— 只画半屏并且不说原因，比整屏报错更难排查。 */
   Promise.all([
-    apiGet('/api/sites/' + id + '/analytics?' + trendPref.q),
+    apiGet('/api/sites/' + id + '/analytics?' + reqQ),
     apiGet('/api/sites/' + id + '/visitors?days=7&limit=50')
   ]).then((res) => {
+    if (gen !== analyticsGen) return;     // 已被后来的请求顶掉：这份是陈旧响应，丢弃
     const series = (res[0] && res[0].series) || [];
     const rows = (res[1] && res[1].rows) || [];
-    const range = TREND_RANGES.find((r) => r[0] === trendPref.q) || TREND_RANGES[1];
-    const monthly = trendPref.q.indexOf('period=month') === 0;
+    const range = TREND_RANGES.find((r) => r[0] === reqQ) || TREND_RANGES[1];
+    const monthly = reqQ.indexOf('period=month') === 0;
     /* 图表宽度按容器实测（panel 已在 DOM 里）：SVG 用真实像素坐标，文字不被
      * viewBox 拉伸，悬浮层的命中运算也不用换算。拿不到宽度（测试 harness 的
      * DOM stub）就用 860 兜底。 */
@@ -1304,7 +1318,7 @@ function renderAnalyticsTab(panel, site) {
         '<div class="row" style="gap:12px">' +
           '<div class="seg" id="trend-range">' + TREND_RANGES.map((r) =>
             '<button type="button" data-q="' + r[0] + '" aria-pressed="' +
-            (r[0] === trendPref.q) + '">' + r[1] + '</button>').join('') + '</div>' +
+            (r[0] === reqQ) + '">' + r[1] + '</button>').join('') + '</div>' +
           '<div class="seg" id="trend-view">' +
             '<button type="button" data-view="chart" aria-pressed="' +
               (trendPref.view === 'chart') + '">折线图</button>' +
@@ -1319,6 +1333,7 @@ function renderAnalyticsTab(panel, site) {
         '<div class="card-body tight">' + visitorTable(rows) + '</div></section>';
     bindTrendControls(panel, site, series);
   }).catch((err) => {
+    if (gen !== analyticsGen) return;     // 陈旧失败同样不许覆盖当前页
     panel.innerHTML = '<section class="card"><div class="card-body">' +
       '<p class="meta">访问统计读取失败：' +
       esc((err && err.message) || '未知错误') + '</p></div></section>';

@@ -40,6 +40,40 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "deployer" / "functions"))
 import common as sb_common      # noqa: E402
 
 CFG_PATH = Path(__file__).parents[1] / "config.ini"
+
+
+class FixtureOwnerConflict(Exception):
+    """--site-id 指向的行已被**别人**持有 —— 拒绝静默接管（M20）。"""
+
+
+def _write_fixture_site_record(table, site_id: str, *, owner: str, name: str) -> None:
+    """建/更新夹具站点的 sites 行，**只在不存在或已归本 owner 时**才写。
+
+    M20（merged review §9）：原先是无条件 `SET owner,name,status`，绕过了
+    `common.create_site_record` 专门用来防静默接管的 `attribute_not_exists(site_id)`
+    条件。默认 site_id 是随机的（每次新建），但传了 `--site-id`（或随机碰撞）指到
+    一个**别人**的站点时，无条件写会把它的 owner 覆盖成夹具 owner。本脚本读
+    `config.ini`、可以指向生产表，所以这不是纯理论。
+
+    条件是 `attribute_not_exists(site_id) OR #o = :o`：
+      · 行不存在 ⇒ 建（默认路径，随机 site_id）；
+      · 行已存在且 owner 就是本次 owner ⇒ 覆盖 name/status（夹具重部署，幂等）；
+      · 行已存在但 owner 是别人 ⇒ 条件失败 ⇒ **响亮抛错**，绝不接管。
+    """
+    try:
+        table.update_item(
+            Key={"site_id": site_id},
+            UpdateExpression="SET #o = :o, #n = :n, #s = :s",
+            ConditionExpression="attribute_not_exists(site_id) OR #o = :o",
+            ExpressionAttributeNames={"#o": "owner", "#n": "name", "#s": "status"},
+            ExpressionAttributeValues={":o": owner, ":n": name, ":s": "DEPLOYING"})
+    except botocore.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            raise FixtureOwnerConflict(
+                f"site_id {site_id!r} 已被别的 owner 持有 —— 拒绝用夹具 owner "
+                f"{owner!r} 接管它。换一个 --site-id，或先确认这不是别人的站点。"
+            ) from e
+        raise
 _CFG: configparser.ConfigParser | None = None
 
 # marker 落在响应对象的这个字段上。E2E 只按**随机串出现在响应体里**断言，不依赖
@@ -161,13 +195,10 @@ def main(fixture_dir: str, owner: str = "fixture@e2e.invalid", *,
     # 没有 owner（register_route 会从 job 兜底写进路由表，所以只有真源缺失，
     # 两表不一致）。后果：role_of() 判调用者不是 owner，全部权限工具拒绝，
     # 症状看起来像"工具坏了"。实测踩过（2026-08-06）。
-    boto3.resource("dynamodb", region_name="us-east-1").Table(
-        conf["Deployer"]["sites_table"]).update_item(
-            Key={"site_id": site_id},
-            UpdateExpression=("SET #o = :o, #n = :n, #s = :s"),
-            ExpressionAttributeNames={"#o": "owner", "#n": "name", "#s": "status"},
-            ExpressionAttributeValues={":o": owner, ":n": manifest["name"],
-                                       ":s": "DEPLOYING"})
+    _write_fixture_site_record(
+        boto3.resource("dynamodb", region_name="us-east-1").Table(
+            conf["Deployer"]["sites_table"]),
+        site_id, owner=owner, name=manifest["name"])
     # **同理必须自己钉 upload_etag**：MCP 的 do_confirm_upload 会把它 HEAD 到的
     # ETag 写进 job 记录，而 validate 用 `IfMatch` 读同一份字节、缺这个属性一律
     # fail-closed（不做假值兜底）。本脚本绕过 MCP ⇒ 不写的话它建的**每个** job 都会

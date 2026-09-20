@@ -435,7 +435,53 @@ if (SCENARIO === 'probe') {
   process.exit(out.every((c) => c.got === c.want) ? 0 : 3);
 }
 
-setTimeout(() => {
+/* 场景 m15-stale：陈旧的访问统计响应不得覆盖当前页（merged review §9 M15）。
+ *
+ * 直接调 `renderAnalyticsTab`（函数声明，从 eval 泄漏到 global；它闭包里的
+ * `trendPref`/`analyticsGen`/`apiGet` 都是真的）。同一个 panel 先渲染 siteA
+ * （两个请求的响应都**挂起**），紧接着渲染 siteB（立即响应）；siteB 画完之后才放行
+ * siteA 的挂起响应。gen 守卫应把 siteA 那份丢弃——最后一次 innerHTML 必须是 siteB 的
+ * 数据。去掉守卫时 siteA 的迟到响应会最后落笔，本用例即变红。
+ *
+ * 用 A_SERIES 的真实形态（bucket/pv/uv/uv_exact），只把 visitor 行的 email 换成
+ * 每站点唯一的哨兵——visitorTable 直接把 email 渲染成文本，是稳定可断言的标记。 */
+if (SCENARIO === 'm15-stale') {
+  const pending = [];
+  const rowsFor = (mark) => [{ ts: '2026-08-14T09:15:00', email: mark,
+                               path: '/', decision: 'allow' }];
+  global.fetch = async (url) => {
+    const u = String(url);
+    fetched.push(u);
+    const stale = u.includes('STALE');
+    const body = u.includes('/analytics')
+      ? { period: 'day', series: A_SERIES }
+      : { rows: rowsFor(stale ? 'STALE-A@x' : 'FRESH-B@x'), next: null };
+    const resp = { ok: true, status: 200, json: async () => body };
+    if (stale) return new Promise((res) => pending.push(() => res(resp)));
+    return resp;
+  };
+  const panel = stubEl();
+  (async () => {
+    renderAnalyticsTab(panel, { site_id: 'STALE-site', role: 'owner' });
+    await new Promise((r) => setTimeout(r, 5));   // siteA 的两个 fetch 都已发出并挂起
+    renderAnalyticsTab(panel, { site_id: 'FRESH-site', role: 'owner' });
+    await new Promise((r) => setTimeout(r, 5));   // siteB 立即响应并渲染完
+    pending.forEach((fn) => fn());                // 现在才放行 siteA 的陈旧响应
+    await new Promise((r) => setTimeout(r, 5));
+    const last = htmlWrites[htmlWrites.length - 1] || '';
+    console.log(JSON.stringify({
+      scenario: 'm15-stale',
+      last_write_has_fresh: last.includes('FRESH-B@x'),
+      last_write_has_stale: last.includes('STALE-A@x'),
+      errors,
+    }));
+    process.exit(errors.length === 0 ? 0 : 3);
+  })();
+}
+
+// m15-stale 自带 setTimeout 节拍并自行 exit；下面这个默认收尾器 delay 0 会抢在它
+// 前面 exit，所以对该场景跳过。
+if (SCENARIO !== 'm15-stale') setTimeout(() => {
   const askedMe = fetched.some((u) => u.includes('/api/me'));
   console.log(JSON.stringify({
     scenario: SCENARIO, fetched_me: askedMe, fetched,
