@@ -922,6 +922,9 @@ def test_baseline_schema_is_current():
 def _assert_baseline_sections(g, data: dict) -> None:
     assert data["schema"] == g.BASELINE_SCHEMA
     for key in ("resource_policies", "facts", "coverage", "principals", "kms",
+                # 3g / R1-L4：`model_inputs` 也要登记——它的比较器是单向的，基线侧缺了
+                # 就等于整个前提漂移层被永久关掉。
+                "model_inputs",
                 "iam_write_statements", "permissions_boundaries",
                 "managed_policy_versions"):
         assert key in data, f"基线缺顶层分节 {key}"
@@ -2417,8 +2420,10 @@ def _complete_bundle(g) -> dict:
         "principals": {"0000-1111-2222-3333": {
             "name": "SomeRole", "arn": "arn:aws:iam::1:role/SomeRole",
             "kind": "role", "grants": ["invoke-platform:site-panel"],
-            # 3g：派生能力标签。空列表是合法的（有 grant 不代表组得成一条路径）。
-            "capabilities": []}},
+            # 3g：派生能力标签。**放一个真实标签而不是空列表**（R1-L5）：空列表让
+            # `_is_capability` 这条 typed path 在合成正对照里从不被走到，于是把它从
+            # `_TYPED_VALUE_PATHS` 里删掉、或写坏它，都要等真机第一次出现能力才暴露。
+            "capabilities": ["sign:kms-direct"]}},
         # platform / sites 各带**一个成员**：`*` 通配层的内层规格只有在样例里真的
         # 有成员时才会被 `_required_paths` 展开到，空 dict 下那一层等于没验。
         "resource_policies": {
@@ -4448,12 +4453,15 @@ def test_a_baseline_on_disk_must_carry_decomposable_coverage_members(tmp_path):
     后果是退役声明静默失效（照红、与没修一样）。"""
     g = _gate()
     p = tmp_path / "b.json"
+    _MI = {"stacks": {}, "edge_entry": "version", "signers": {}}
     p.write_text(json.dumps({"schema": g.BASELINE_SCHEMA, "principals": {},
+                             "model_inputs": _MI,
                              "coverage": {"undecided_items": ["0000-1111-2222-3333"]}}))
     with pytest.raises(SystemExit, match="undecided_items"):
         g.load_baseline(p)
     ok = g.undecided_item("arn:aws:iam::1:role/A", "kms-sign", {"kms-key:site-rs-v1"})
     p.write_text(json.dumps({"schema": g.BASELINE_SCHEMA, "principals": {},
+                             "model_inputs": _MI,
                              "coverage": {"undecided_items": [ok]}}))
     assert g.load_baseline(p)["schema"] == g.BASELINE_SCHEMA
 
@@ -5326,24 +5334,25 @@ def test_carry_categories_requires_update_baseline():
 def test_carry_categories_conflicting_with_classify_is_fatal():
     """冲突必须报明，不许静默覆盖——这一档的差别就是"丢授权会不会红"。"""
     g = _gate()
+    arn = "arn:aws:iam::1:role/r1"
+    fp = g.principal_fingerprint(arn)
     with pytest.raises(SystemExit) as e:
-        g.merge_categories(carried={"aaaa-bbbb-cccc-dddd": "platform"},
-                           by_name={"r1": "admin"},
-                           observed={"aaaa-bbbb-cccc-dddd":
-                                     {"name": "r1", "arn": "a", "kind": "role",
-                                      "grants": [], "capabilities": []}})
+        g.merge_categories(carried={fp: "platform"}, by_name={"r1": "admin"},
+                           observed={fp: {"name": "r1", "arn": arn, "kind": "role",
+                                          "grants": [], "capabilities": []}})
     assert "r1" in str(e.value) and "platform" in str(e.value)
 
 
 def test_classify_wins_over_carried_when_they_agree_or_only_one_exists():
     g = _gate()
-    observed = {"aaaa-bbbb-cccc-dddd": {"name": "r1", "arn": "a", "kind": "role",
-                                        "grants": [], "capabilities": []}}
+    arn = "arn:aws:iam::1:role/r1"
+    fp = g.principal_fingerprint(arn)
+    observed = {fp: {"name": "r1", "arn": arn, "kind": "role",
+                     "grants": [], "capabilities": []}}
     assert g.merge_categories(carried={}, by_name={"r1": "platform"},
-                              observed=observed) == {"aaaa-bbbb-cccc-dddd": "platform"}
-    assert g.merge_categories(carried={"aaaa-bbbb-cccc-dddd": "platform"},
-                              by_name={}, observed=observed) \
-        == {"aaaa-bbbb-cccc-dddd": "platform"}
+                              observed=observed) == {fp: "platform"}
+    assert g.merge_categories(carried={fp: "platform"},
+                              by_name={}, observed=observed) == {fp: "platform"}
 
 
 def test_write_baseline_precedence_is_classify_then_carried_then_existing(tmp_path):
@@ -5395,3 +5404,110 @@ def test_categories_whitelist_has_one_definition():
     assert "platform" in g.CATEGORIES and "unclassified" in g.CATEGORIES
     src = _SCRIPT.read_text(encoding="utf-8")
     assert src.count('"platform-overbroad"') == 1, "类别白名单又有第二份字面量"
+
+
+# ---- R1-L4 / R1-L5：基线侧的下限与 typed path 的正对照 ---------------------------
+
+def test_an_existing_baseline_missing_model_inputs_is_refused(tmp_path):
+    """**R1-L4（major）**：`_compare_model_inputs` 是**单向**比较器（缺节只记 note），
+    所以基线侧必须有下限。
+
+    复现（修前）：从合法输出里**只删** `model_inputs`，`load_baseline` 照样成功，
+    guard 从 protected 改成 open 之后 `model_input_drift` 仍是空 ⇒ 整个前提漂移层被
+    永久关闭，而"首次生成"与"已有但被截断"在输出上无法区分。
+    """
+    g = _gate()
+    out = tmp_path / "b.json"
+    g.write_baseline(_complete_bundle(g), {"principals": {}}, out)
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert "model_inputs" in data, "writer 没落这一节，后面的断言就没意义了"
+    del data["model_inputs"]
+    out.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(SystemExit, match="model_inputs"):
+        g.load_baseline(out)
+
+
+def test_an_existing_baseline_with_a_truncated_model_inputs_is_refused(tmp_path):
+    """内层同理：`stacks` 里某个成员缺 `guard` 也要拒（截断比整节缺失更难发现）。"""
+    g = _gate()
+    out = tmp_path / "b.json"
+    g.write_baseline(_complete_bundle(g), {"principals": {}}, out)
+    data = json.loads(out.read_text(encoding="utf-8"))
+    label = next(iter(data["model_inputs"]["stacks"]))
+    del data["model_inputs"]["stacks"][label]["guard"]
+    out.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(SystemExit, match="guard"):
+        g.load_baseline(out)
+
+
+def test_a_baseline_principal_without_capabilities_is_refused(tmp_path):
+    """能力层靠 `capabilities` 比对，缺了就等于那个 principal 的能力漂移永远不红。"""
+    g = _gate()
+    out = tmp_path / "b.json"
+    g.write_baseline(_complete_bundle(g), {"principals": {}}, out)
+    data = json.loads(out.read_text(encoding="utf-8"))
+    fp = next(iter(data["principals"]))
+    del data["principals"][fp]["capabilities"]
+    out.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(SystemExit, match="capabilities"):
+        g.load_baseline(out)
+
+
+def test_a_baseline_capability_label_must_be_registered(tmp_path):
+    """基线里出现共享模型没登记的标签 ⇒ 拒（手改或跨版本产物，比对会静默失配）。"""
+    g = _gate()
+    out = tmp_path / "b.json"
+    g.write_baseline(_complete_bundle(g), {"principals": {}}, out)
+    data = json.loads(out.read_text(encoding="utf-8"))
+    fp = next(iter(data["principals"]))
+    data["principals"][fp]["capabilities"] = ["sign:not-a-real-label"]
+    out.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(SystemExit, match="未登记"):
+        g.load_baseline(out)
+
+
+def test_the_synthetic_baseline_actually_exercises_the_capability_validator():
+    """**R1-L5（minor）**：合成正对照必须真的走到 `_is_capability` 那条 typed path。
+
+    `capabilities: []` 时那条分支永远不被走到 ⇒ 把它从 `_TYPED_VALUE_PATHS` 删掉、
+    或写坏它，都要等真机第一次出现能力才暴露。
+    """
+    g = _gate()
+    caps = [c for rec in _complete_bundle(g)["principals"].values()
+            for c in rec["capabilities"]]
+    assert caps, "合成样例的 capabilities 又空了——那条 typed path 不会被走到"
+    assert all(c in set(g.model.ALL_LABELS) for c in caps)
+    # 合法值过、非法值拒：两个方向都要，否则校验器可以写成恒真
+    assert _is_capability(caps[0]) is True
+    assert _is_capability("sign:not-a-real-label") is False
+
+
+def test_merge_categories_uses_the_arn_fingerprint_as_the_only_identity(tmp_path):
+    """**R1-L4（major）**：`merge_categories` 原先按 observed 的**字典键**判冲突，
+    而 `write_baseline` 按 `rec["arn"]` 重算指纹。两个身份键不一致 ⇒ "冲突必须硬失败"
+    这条承诺被绕过：实测 carried[fp(arn)]=platform 与 --classify[name]=admin 同时给出时
+    不报错，writer 最终写下 admin，platform 的等值约束静默丢失。
+    """
+    g = _gate()
+    fp = g.principal_fingerprint("arn:aws:iam::1:role/SomeRole")
+    observed = {"0000-1111-2222-3333": {      # 键**故意**不等于 ARN 指纹
+        "name": "SomeRole", "arn": "arn:aws:iam::1:role/SomeRole", "kind": "role",
+        "grants": [], "capabilities": []}}
+    with pytest.raises(SystemExit, match="冲突"):
+        g.merge_categories(carried={fp: "platform"}, by_name={"SomeRole": "admin"},
+                           observed=observed)
+    # 同值不冲突 ⇒ 正常返回，且键是 ARN 指纹
+    merged = g.merge_categories(carried={fp: "platform"},
+                               by_name={"SomeRole": "platform"}, observed=observed)
+    assert merged == {fp: "platform"}
+
+
+def test_two_observed_entries_for_the_same_arn_are_refused():
+    """同一个 ARN 出现两次 ⇒ 身份键会打架，不能据此写基线。"""
+    g = _gate()
+    observed = {"a": {"name": "R1", "arn": "arn:aws:iam::1:role/R", "kind": "role",
+                      "grants": [], "capabilities": []},
+                "b": {"name": "R2", "arn": "arn:aws:iam::1:role/R", "kind": "role",
+                      "grants": [], "capabilities": []}}
+    with pytest.raises(SystemExit, match="同一个 ARN"):
+        g.merge_categories(carried={}, by_name={}, observed=observed)

@@ -1415,6 +1415,8 @@ def _compare_model_inputs(rep: Report, base: dict, now: dict | None) -> None:
     if now is None:
         return
     if not base:
+        # 只有**文件不存在**的首建空壳会走到这里（`load_baseline` 现在会拒绝一份已存在
+        # 却缺这一节的基线，R1-L4）。所以这条 note 不再是"缺节也能绿"的后门。
         rep.notes.append("model_inputs：基线里还没有这一节（首次生成，下一轮起参与红绿）")
         return
     base_flat = json.dumps(base, sort_keys=True, ensure_ascii=False)
@@ -2827,6 +2829,26 @@ def load_baseline(path: Path) -> dict:
     if items is not None:
         _check_shape(items, _list_of_undecided_items,
                      path="coverage.undecided_items", where=f"基线 {path}")
+    # **已存在的基线必须带齐 schema 7 的新分节**（R1-L4）：`_compare_model_inputs` 是
+    # **单向**比较器（缺节只记 note），所以基线侧必须有下限——否则把一份合法基线的
+    # `model_inputs` 删掉就能**永久关闭**整个前提漂移层，而 guard 从 protected 变 open
+    # 之后 `model_input_drift` 仍是空、报告照样能绿。这与 `BUNDLE_SHAPE` 对观测侧的
+    # "单向比较器的层必须由合同兜住下限"是同一条纪律，只是这里兜的是基线侧。
+    # **"文件不存在"才是首建**，那条路在上面已经 return 了空壳。
+    _check_shape(data.get("model_inputs"), BASELINE_MODEL_INPUTS_SHAPE,
+                 path="model_inputs", where=f"基线 {path}")
+    for fp, rec in (data.get("principals") or {}).items():
+        caps = rec.get("capabilities")
+        if caps is None:
+            raise SystemExit(
+                f"基线 {path} 的 principals.{fp} 缺 capabilities —— schema 7 的能力层"
+                f"靠它比对，缺了就等于那个 principal 的能力漂移永远不红。")
+        bad = [c for c in caps if c not in set(model.ALL_LABELS)]
+        if bad:
+            raise SystemExit(
+                f"基线 {path} 的 principals.{fp}.capabilities 有未登记的标签 {bad}"
+                f"（合法集合见 _impersonation_model.ALL_LABELS）——手改或跨版本的产物，"
+                f"比对会静默失配。")
     return data
 
 
@@ -2876,6 +2898,15 @@ def _list_of_undecided_items(v) -> bool:
 # canonical 集合与部署验收（§9 的 3e）覆盖。
 _POLICY_SHAPE: dict = {"alias": {"*": _list_of_str}, "version": _list_of_str,
                        "unqualified": _list_of_str}
+
+# 基线侧 `model_inputs` 的形状（与 `BUNDLE_SHAPE` 里那一节同形）。单独一份是因为
+# 基线与观测的顶层键不同，但这一节必须逐层校验（R1-L4）。
+BASELINE_MODEL_INPUTS_SHAPE: dict = {
+    "stacks": {"*": {"guard": _nonempty_str, "controls": _list_of_str,
+                     "service_role_fp": str, "premises_verified": _plain_bool}},
+    "edge_entry": _nonempty_str,
+    "signers": {"*": {"entry": _nonempty_str, "layers_supported": _plain_bool}},
+}
 
 BUNDLE_SHAPE: dict = {
     "schema": int,
@@ -3038,9 +3069,25 @@ def merge_categories(*, carried: dict, by_name: dict, observed: dict) -> dict:
     **冲突硬失败**：两处对同一个 principal 给出不同分类时，静默择一等于让操作者以为
     自己标了 A 而实际生效 B——而这一档的差别就是"丢授权会不会红"。
     """
+    # **身份键统一按 ARN 重算指纹**（R1-L4）：`write_baseline` 就是按 `rec["arn"]` 算的，
+    # 而 observed 的字典键不保证等于它（`--from-dump` 的旧快照、手造的 bundle 都可能不等）。
+    # 两处用不同的身份键 ⇒ 冲突检测比的是另一个人，于是"冲突必须硬失败"这条承诺被绕过：
+    # 实测 carried[fp(arn)]=platform 与 --classify[name]=admin 同时给出时不报错，
+    # writer 最终按 ARN 指纹写下 admin，platform 的等值约束静默丢失。
+    by_arn: dict = {}
+    for key, rec in observed.items():
+        fp = principal_fingerprint(rec["arn"])
+        if fp in by_arn:
+            raise SystemExit(
+                f"观测里有两个条目指向同一个 ARN（指纹 {fp}）：{by_arn[fp]['name']!r} 与 "
+                f"{rec['name']!r}。身份键会打架，不能据此写基线。")
+        by_arn[fp] = rec
+        if key != fp:
+            print(f"（note：观测的键 {key} 不等于按 ARN 算的指纹 {fp}，"
+                  f"以 ARN 指纹为准）", file=sys.stderr)
     merged = dict(carried)
     conflicts = []
-    for fp, rec in observed.items():
+    for fp, rec in by_arn.items():
         named = by_name.get(rec["name"])
         if named is None:
             continue
@@ -3054,6 +3101,11 @@ def merge_categories(*, carried: dict, by_name: dict, observed: dict) -> dict:
     if conflicts:
         raise SystemExit("--classify 与 --carry-categories 冲突（不静默覆盖，请自己定）："
                          + "；".join(conflicts))
+    unmatched = sorted(set(carried) - set(by_arn))
+    if unmatched:
+        print(f"--carry-categories：{len(unmatched)} 条分类在本轮观测里匹配不到对应 "
+              f"principal（前 5 个指纹：{unmatched[:5]}）——它们不会进新基线。",
+              file=sys.stderr)
     return merged
 
 
@@ -3227,10 +3279,12 @@ def main(argv: list | None = None) -> int:
                    if args.carry_categories else {})
         by_name = json.loads(Path(args.classify).read_text(encoding="utf-8")) \
             if args.classify else {}
-        for fp, cat in merge_categories(carried=carried, by_name=by_name,
-                                        observed=observed).items():
-            if fp in observed:
-                observed[fp]["category"] = cat
+        _cats = merge_categories(carried=carried, by_name=by_name, observed=observed)
+        # 赋值也按 ARN 指纹找回条目（与 merge / writer 同一个身份键）。
+        for rec in observed.values():
+            cat = _cats.get(principal_fingerprint(rec["arn"]))
+            if cat:
+                rec["category"] = cat
         # **先渲染一遍比较报告，再写基线**（3c-1B-G A6）。原先这条分支在
         # `compare_to_baseline` 之前就 return ⇒ 写基线那条路**什么都不打印**，
         # "这一次到底接受了什么"只存在于操作者的记忆里。spec §11.8.7 反对人工放行的

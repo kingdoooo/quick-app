@@ -95,15 +95,20 @@ ALL_LABELS = model.ALL_LABELS
 
 
 def self_test() -> int:
-    """委托共享模型的聚合断言，并打印它来自哪里。
+    """跑**判定层**共享反例 + 聚合口径断言，都不碰 AWS。
 
-    **判定层的反例不在这里**：它们在 `deployer/tests/test_impersonation_model.py`
-    （pytest 会真的跑到，35 条含 6 条变形），本函数只做一次"共享模型能 import 且聚合
-    口径正常"的冒烟。原先那张 `cases` 表连同判定一起搬走了——反例与被测代码在同一个
-    文件里最容易退化成"改判定顺手改期望"。
+    **判定层那一半必须真的调用 `classify`**（R1-L5）：上一版只把手写标签喂 `summarize`，
+    于是把 `classify` 换成"必抛异常"也照样退出 0——CLI 帮助宣称的"classify 反例自检"
+    是空的。现在用共享模型的 `run_cases()`，与 pytest 共用同一份数据；完整反例集
+    （44 条，含 6 条变形）仍在 `deployer/tests/test_impersonation_model.py`。
     """
     print("判定与聚合来自共享模型 _impersonation_model.py"
-          "（反例集：deployer/tests/test_impersonation_model.py）")
+          "（完整反例集：deployer/tests/test_impersonation_model.py）")
+    failures = model.run_cases()
+    print(f"  {'ok  ' if not failures else 'FAIL'} 判定层共享反例"
+          f"（{len(model._case_rows(model.fake_surface()))} 条）")
+    for f in failures:
+        print(f"       {f}", file=sys.stderr)
     agg = summarize({
         "p-sign": {model.S_HIJACK_AUTH},
         "p-edge": {model.E_CFN_UPDATE_STACK},
@@ -118,8 +123,7 @@ def self_test() -> int:
     print(f"  {'ok  ' if not bad else 'FAIL'} 聚合：两类进并集，受限/未分析单列不进")
     if bad:
         print(f"       {bad}", file=sys.stderr)
-        return 1
-    return 0
+    return 1 if (failures or bad) else 0
 
 
 # ---------------------------------------------------------------- 真机部分

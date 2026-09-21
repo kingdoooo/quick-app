@@ -337,3 +337,61 @@ def summarize(by_principal: dict) -> dict:
         "marginal_value_if_closed": marginal,
         "_sets": {"can_sign": can_sign, "can_edge": can_edge, "surface": surface},
     }
+
+
+# ---------------------------------------------------------------- 共享反例执行器
+#
+# **`--self-test` 必须真的跑 `classify`**（R1-L5）：上一版只把手写标签喂 `summarize`，
+# 于是把 `classify` 换成"必抛异常"的函数，自检照样退出 0 —— CLI 帮助与 DEPLOY.md 宣称的
+# "classify 反例自检"是空的。这里把一小组**判定层**反例做成数据，pytest 与 `--self-test`
+# 共用同一份（完整反例集仍在 `deployer/tests/test_impersonation_model.py`）。
+
+def _case_rows(s: "Surface") -> tuple:
+    router_open = replace(s, stacks=(fake_stack(
+        "router", controls=frozenset({CONTROLS_EDGE}),
+        guard=GUARD_OPEN, premises_verified=True),))
+    router_protected = replace(s, stacks=(fake_stack(
+        "router", controls=frozenset({CONTROLS_EDGE}),
+        guard=GUARD_PROTECTED, premises_verified=True),))
+    return (
+        ("kms:Sign 任一把 key 即完整冒充",
+         s, {f"kms:Sign|{s.kms_keys[1]}"}, {S_KMS_DIRECT}),
+        ("换 auth 的码即劫持 signer",
+         s, {f"lambda:UpdateFunctionCode|{s.auth.arn}"}, {S_HIJACK_AUTH}),
+        ("Edge 上单独换码改不了正在执行的版本",
+         s, {f"lambda:UpdateFunctionCode|{s.edge.arn}"}, set()),
+        ("配置更新在 Edge 上什么都不构成（无 Publish、不支持 Layer）",
+         s, {f"lambda:UpdateFunctionConfiguration|{s.edge.arn}",
+             f"cloudfront:UpdateDistribution|{s.distribution}"}, set()),
+        ("换码 + 关联 = 内联发布那条路",
+         s, {f"lambda:UpdateFunctionCode|{s.edge.arn}",
+             f"cloudfront:UpdateDistribution|{s.distribution}"}, {E_PUBLISH_INLINE}),
+        ("建函数那条路不需要 PublishVersion",
+         s, {f"lambda:CreateFunction|{s.new_candidates[0]}",
+             f"iam:PassRole|{s.edge_role}",
+             f"cloudfront:UpdateDistribution|{s.distribution}"}, {E_NEW_FUNCTION}),
+        ("guard=open 时 UpdateStack 单动作成立",
+         router_open, {"cloudformation:UpdateStack|STACK_ROUTER"}, {E_CFN_UPDATE_STACK}),
+        ("guard=protected 时只出未分析标签",
+         router_protected, {"cloudformation:UpdateStack|STACK_ROUTER"},
+         {E_CFN_TEMPLATE_UNANALYZED}),
+        ("change-set 单个动作不够",
+         router_open, {"cloudformation:CreateChangeSet|STACK_ROUTER"}, set()),
+        ("夹具入口单列，不进冒充面",
+         s, {f"lambda:InvokeFunction|{s.auth.arn}"}, {S_FIXTURE_ISSUER}),
+    )
+
+
+def run_cases() -> list:
+    """跑共享反例 → 失败描述列表（空列表 = 全过）。**真的调用 `classify`。**"""
+    out = []
+    base = fake_surface()
+    for why, surface, allowed, want in _case_rows(base):
+        try:
+            got = classify(frozenset(allowed), surface)
+        except Exception as exc:          # noqa: BLE001 —— 判定崩了也是一条失败，不是 traceback
+            out.append(f"{why}：classify 抛了 {type(exc).__name__}: {exc}")
+            continue
+        if got != want:
+            out.append(f"{why}：期望 {sorted(want)} 实得 {sorted(got)}")
+    return out
