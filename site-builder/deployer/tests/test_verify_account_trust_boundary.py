@@ -187,6 +187,30 @@ def _is_sha256_hex(value: str) -> bool:
     return bool(re.fullmatch(r"[0-9a-f]{64}", value))
 
 
+def _is_guard(v) -> bool:
+    """guard 是**三值**枚举（3g）。放成任意字符串就等于不检查，而"unknown 被写成别的东西"
+    正是"未知被当成否"那个假绿的入口。"""
+    return v in ("protected", "open", "unknown")
+
+
+def _is_entry(v) -> bool:
+    return v in ("latest", "alias", "version", "unknown")
+
+
+def _is_controls_member(v) -> bool:
+    return v in ("edge-verifier", "session-key")
+
+
+def _is_fp_or_empty(v) -> bool:
+    """service role ARN 只落指纹；没有 service role 时是空串（不是账号值）。"""
+    return v == "" or bool(re.fullmatch(_FP_RE, v))
+
+
+def _is_capability(v) -> bool:
+    """能力标签必须是共享模型登记过的那些——手写一个不存在的标签会让比较悄悄失配。"""
+    return v in set(_gate().model.ALL_LABELS)
+
+
 _TYPED_VALUE_PATHS = (
     # VersionId 形如 v1/v2/…：既不是指纹，也不能是任意字符串（写成角色名或占位
     # "?" 都必须红）。放成"任意字符串"就等于不检查；要求它是指纹又会把合法的 v3 报红。
@@ -198,6 +222,14 @@ _TYPED_VALUE_PATHS = (
     ("kms.*.key_spec", _is_key_spec),
     ("kms.*.key_usage", _is_key_usage),
     ("kms.*.spki_sha256", _is_sha256_hex),
+    # 3g：能力层与它的前提。**按类型判而不是放进自由文本**——这几个值本身就是证据
+    # （guard 是不是 unknown、入口是不是编号版本、标签是不是登记过的那些）。
+    ("principals.*.capabilities[]", _is_capability),
+    ("model_inputs.stacks.*.guard", _is_guard),
+    ("model_inputs.stacks.*.controls[]", _is_controls_member),
+    ("model_inputs.stacks.*.service_role_fp", _is_fp_or_empty),
+    ("model_inputs.edge_entry", _is_entry),
+    ("model_inputs.signers.*.entry", _is_entry),
 )
 # **自由文本**：说明性字段，这一层不校验形态；泄密由第一层的整文件 raw 扫描兜。
 _FREE_TEXT_PATHS = (
@@ -219,6 +251,13 @@ _NON_FP_KEY_PATHS = (
     "resource_policies.platform.*.alias",   # 键是 alias 名（blue/green，不是账号值）
     "coverage",                             # 结构键（undecided_items）
     "permissions_boundaries.*",             # 结构键（policy_fp/stmt_fps）
+    # 3g：能力层前提。键分别是结构键、栈的**逻辑标签**（router/deployer，不是 StackId）、
+    # 以及 signer 的函数名（app.py 里就有，不是账号值）。
+    "model_inputs",
+    "model_inputs.stacks",
+    "model_inputs.stacks.*",
+    "model_inputs.signers",
+    "model_inputs.signers.*",
 )
 
 
@@ -2377,7 +2416,9 @@ def _complete_bundle(g) -> dict:
         "schema": g.BASELINE_SCHEMA,
         "principals": {"0000-1111-2222-3333": {
             "name": "SomeRole", "arn": "arn:aws:iam::1:role/SomeRole",
-            "kind": "role", "grants": ["invoke-platform:site-panel"]}},
+            "kind": "role", "grants": ["invoke-platform:site-panel"],
+            # 3g：派生能力标签。空列表是合法的（有 grant 不代表组得成一条路径）。
+            "capabilities": []}},
         # platform / sites 各带**一个成员**：`*` 通配层的内层规格只有在样例里真的
         # 有成员时才会被 `_required_paths` 展开到，空 dict 下那一层等于没验。
         "resource_policies": {
@@ -2390,6 +2431,15 @@ def _complete_bundle(g) -> dict:
         # A6 复审：成员是可分解形态。它是 BUNDLE_SHAPE 的一部分 ⇒ 缺它照样硬失败，
         # 与其它分节同一条 fail-closed 合同。
         "coverage": {"undecided_items": []},
+        # 3g：能力层的前提。两个 `*` 通配层各带**一个成员**，否则内层规格不会被
+        # `_required_paths` 展开到（空 dict 下那一层等于没验）。
+        "model_inputs": {
+            "stacks": {"router": {"guard": "protected", "controls": ["edge-verifier"],
+                                  "service_role_fp": "aaaa-bbbb-cccc-dddd",
+                                  "premises_verified": False}},
+            "edge_entry": "version",
+            "signers": {"site-auth-service": {"entry": "latest",
+                                              "layers_supported": True}}},
         "iam_write": {"statements": {}, "boundaries": {},
                       "managed_versions": {}, "texts": {}},
         # 3c-final：kms 分节带**一个成员**——`*` 通配层的内层规格只有在样例里真的有成员时
@@ -4177,10 +4227,19 @@ def test_the_reported_leg_count_is_what_simulate_actually_calls():
     g = _gate()
     t = g.Targets(platform_functions=("arn:aws:lambda:us-east-1:111111111111:function:site-panel",),
                   site_functions=(), kms_keys=dict(KEY),
-                  login_flow_parameter="arn:aws:ssm:us-east-1:111111111111:parameter/site-builder/login-flow-secret")
+                  login_flow_parameter="arn:aws:ssm:us-east-1:111111111111:parameter/site-builder/login-flow-secret",
+                  # 3g：新增两腿的资源必须**都**给上——常量报的是满配腿数，而空资源组
+                  # 会被跳过（IAM 拒空 ResourceArns）。少给一类就变成"测了个更少的腿数"。
+                  distribution="arn:aws:cloudfront::111111111111:distribution/D1",
+                  edge_role="arn:aws:iam::111111111111:role/edge",
+                  new_fn_candidates=("arn:aws:lambda:us-east-1:111111111111:function:probe-new",),
+                  stacks=(g.model.StackFact(resource="S_ROUTER", label="router"),),
+                  service_roles=("arn:aws:iam::111111111111:role/cfn-exec",))
     iam = _sim_iam(set())
     g.simulate(iam, "arn:aws:iam::111111111111:role/x", t)
-    assert len(iam.calls) == g.SIM_LEGS_PER_PRINCIPAL == 3, (len(iam.calls), g.SIM_LEGS_PER_PRINCIPAL)
+    assert len(iam.calls) == g.SIM_LEGS_PER_PRINCIPAL == 5, (len(iam.calls), g.SIM_LEGS_PER_PRINCIPAL)
+    # 每一腿都必须带资源：空 ResourceArns 会被 IAM 拒，而"少发一腿"是静默少覆盖。
+    assert all(c["ResourceArns"] for c in iam.calls), iam.calls
 
 
 def test_the_kms_context_values_are_the_contract_not_a_hand_copy():
@@ -4826,3 +4885,165 @@ def test_action_classes_come_from_the_shared_model():
     assert g.A_UPDATE_CODE is g.model.A_UPDATE_CODE
     assert g.A_CFN_UPDATE is g.model.A_CFN_UPDATE
     assert g.A_KMS_SIGN is g.model.A_KMS_SIGN
+
+
+# ---- 3g：采集层（新腿、栈观测、model_inputs）---------------------------------
+
+def test_publish_leg_is_not_crossed_with_every_alias():
+    """裁剪按**模型消费面**：`PublishVersion` / `CreateFunction` 不与全部 alias、
+    版本 ARN 做笛卡尔积（那是成本翻倍换不来信号）。"""
+    g = _gate()
+    t = g.Targets(
+        platform_functions=("arn:aws:lambda:r:1:function:p",),
+        site_functions=("arn:aws:lambda:r:1:function:s",),
+        alias_arns={"arn:aws:lambda:r:1:function:s":
+                    ("arn:aws:lambda:r:1:function:s:blue",)},
+        new_fn_candidates=("arn:aws:lambda:r:1:function:probe-new",))
+    assert set(t.publish_resources()) == {"arn:aws:lambda:r:1:function:p",
+                                          "arn:aws:lambda:r:1:function:probe-new"}
+    # 但既有的函数腿覆盖面**不缩小**：alias 照样在里面。
+    assert "arn:aws:lambda:r:1:function:s:blue" in t.function_resources()
+
+
+def test_model_inputs_records_guard_and_entry_kinds():
+    """`model_inputs` 是"能力层为什么变"的唯一对账依据，也是唯一能抓住
+    "没人持 UpdateStack 时 guard 翻转"的地方（那种变化对能力层完全不可见）。"""
+    g = _gate()
+    surface = g.model.Surface(
+        kms_keys=("k",),
+        auth=g.model.FnFact("arn:aws:lambda:r:1:function:site-auth-service",
+                            entry=g.model.ENTRY_LATEST),
+        panel=g.model.FnFact("arn:aws:lambda:r:1:function:site-panel",
+                             entry=g.model.ENTRY_LATEST),
+        edge=g.model.FnFact("E", entry=g.model.ENTRY_VERSION, layers_supported=False),
+        stacks=(g.model.StackFact(resource="S1", label="router",
+                                  guard=g.model.GUARD_PROTECTED,
+                                  service_role="arn:aws:iam::123456789012:role/cfn-exec",
+                                  controls=frozenset({g.model.CONTROLS_EDGE}),
+                                  premises_verified=True),))
+    section = g.model_inputs_section(surface)
+    assert section["stacks"]["router"]["guard"] == "protected"
+    assert section["stacks"]["router"]["controls"] == ["edge-verifier"]
+    assert section["stacks"]["router"]["premises_verified"] is True
+    assert section["edge_entry"] == "version"
+    assert section["signers"]["site-auth-service"] == {"entry": "latest",
+                                                      "layers_supported": True}
+    # service role ARN 含账号 ID ⇒ 只落指纹；StackId 根本不落。
+    blob = json.dumps(section)
+    assert "123456789012" not in blob and "S1" not in blob
+
+
+def test_model_inputs_drift_is_red_in_both_directions():
+    """任一字段变化都红，不判方向：guard 从 protected 变 open 是扩权（忘了
+    `router_stack_policy.py apply` 的真机症状），反过来也要有人看——那条路只是
+    **直接更新**被挡住，模板层路径仍未分析。"""
+    g = _gate()
+    base = {"stacks": {"router": {"guard": "protected", "controls": ["edge-verifier"],
+                                  "service_role_fp": "aaaa-bbbb-cccc-dddd",
+                                  "premises_verified": True}},
+            "edge_entry": "version",
+            "signers": {"site-auth-service": {"entry": "latest",
+                                              "layers_supported": True}}}
+    for field, value in (("guard", "open"), ("premises_verified", False)):
+        now = json.loads(json.dumps(base))
+        now["stacks"]["router"][field] = value
+        rep = g.Report()
+        g._compare_model_inputs(rep, base, now)
+        assert rep.model_input_drift, f"{field} 变化没有红"
+        assert not rep.ok
+    # 相同 ⇒ 不红
+    rep = g.Report()
+    g._compare_model_inputs(rep, base, json.loads(json.dumps(base)))
+    assert not rep.model_input_drift and rep.ok
+
+
+def test_model_inputs_absent_from_baseline_is_a_note_not_a_green_lie():
+    """基线里还没有这一节（首次生成）⇒ 记 note，不假装比过了。"""
+    g = _gate()
+    rep = g.Report()
+    g._compare_model_inputs(rep, {}, {"stacks": {}, "edge_entry": "version",
+                                      "signers": {}})
+    assert rep.ok and any("model_inputs" in n for n in rep.notes)
+
+
+def test_router_and_deployer_stacks_observes_guard_per_stack():
+    """两个栈都要**观测** guard，且 `premises_verified` 保持 False
+    （前提未核 ⇒ 判定只出 `*-unanalyzed`，这是刻意的下界）。"""
+    g = _gate()
+
+    class FakeCfn:
+        def get_stack_policy(self, StackName):
+            if StackName == "RouterStack":
+                return {"StackPolicyBody": json.dumps({"Statement": [
+                    {"Effect": "Allow", "Action": "Update:*", "Principal": "*",
+                     "Resource": "*"},
+                    {"Effect": "Deny", "Action": "Update:*", "Principal": "*",
+                     "Resource": "LogicalResourceId/OriginRequestFunctionAAAAAAAA"}]})}
+            return {}
+
+        def describe_stacks(self, StackName):
+            if StackName == "RouterStack":
+                return {"Stacks": [{"StackId": f"arn:stack/{StackName}",
+                                    "Outputs": [{"OutputKey": "DistributionId",
+                                                 "OutputValue": "D1"}],
+                                    "RoleARN": "arn:aws:iam::1:role/cfn-exec"}]}
+            return {"Stacks": [{"StackId": f"arn:stack/{StackName}"}]}
+
+        def get_paginator(self, name):
+            assert name == "list_stack_resources", name
+
+            class P:
+                def paginate(self, StackName):
+                    return iter([{"StackResourceSummaries": [
+                        {"ResourceType": "AWS::Lambda::Function",
+                         "LogicalResourceId": "OriginRequestFunctionAAAAAAAA"}]}])
+            return P()
+
+    import configparser as _cp
+    real_read = _cp.ConfigParser.read
+
+    def fake_read(self, *a, **k):
+        self.read_dict({"CDK": {"stack_name": "RouterStack"}})
+        return ["router/config.ini"]
+
+    _cp.ConfigParser.read = fake_read
+    try:
+        facts = g.router_and_deployer_stacks({"cloudformation": FakeCfn()},
+                                             "DeployerStack")
+    finally:
+        _cp.ConfigParser.read = real_read
+    by_label = {f.label: f for f in facts}
+    assert set(by_label) == {"router", "deployer"}
+    assert by_label["router"].guard == g.model.GUARD_PROTECTED
+    # 没有 stack policy ⇒ **open**（"没有策略"是已知的 open，不是 unknown）
+    assert by_label["deployer"].guard == g.model.GUARD_OPEN
+    assert by_label["router"].service_role == "arn:aws:iam::1:role/cfn-exec"
+    assert all(f.premises_verified is False for f in facts)
+    assert by_label["deployer"].controls == frozenset({g.model.CONTROLS_SESSION_KEY})
+
+
+def test_the_gate_uses_the_guard_predicate_not_policy_problems():
+    """闸门必须用 `_stack_policy_guard.guard_for`（三值、接受更严格的策略），
+    **不是** `policy_problems()`（那个判部署形态一致性，对 Deny-all 返回非空）。
+    理由与两个谓词的分工见 ADR 0008。
+
+    **按 AST 判而不是按子串判**：子串版会把上面这段解释性注释里出现的
+    `policy_problems()` 也算成违规（实测三次踩到同一个坑）。要断言的性质是"没有真的
+    调用它、也没 import 它"，而不是"这几个字没出现过"。
+    """
+    tree = ast.parse(_SCRIPT.read_text(encoding="utf-8"))
+    called, imported = set(), set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            fn = node.func
+            name = getattr(fn, "id", None) or getattr(fn, "attr", None)
+            if name:
+                called.add(name)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[-1])
+            called |= {a.name for a in node.names}
+        elif isinstance(node, ast.Import):
+            imported |= {a.name.split(".")[-1] for a in node.names}
+    assert "guard_for" in called, "闸门没调用 guard 谓词"
+    assert "policy_problems" not in called, "闸门用了形态一致性谓词当 guard"
+    assert "stack_policy" not in imported, "闸门 import 了 router 侧的形态谓词模块"

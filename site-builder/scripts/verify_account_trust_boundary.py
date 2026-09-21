@@ -182,6 +182,11 @@ APP_PY = _SITE_BUILDER / "deployer" / "infra" / "app.py"
 BASELINE_SCHEMA = 7
 DEPLOYER_EXEC_ROLE = "site-deployer-exec-role"
 AUTH_SERVICE_ROLE = "site-auth-service-role"      # deploy_auth.py 建的执行角色名
+# 两个 signer 的函数名。3g 的能力层要按名字拿它们的入口事实（都服务 `$LATEST`）。
+# **不是第二份清单**：下面 `measure()` 里有一条断言要求它们真的在 `platform` 里，
+# 漏改名字会响亮失败而不是静默少算一条签名路径。
+AUTH_FUNCTION_NAME = "site-auth-service"
+PANEL_FUNCTION_NAME = "site-panel"
 PANEL_DEPLOY_PY = _SITE_BUILDER / "panel" / "deploy_panel.py"
 SESSION_KMS_PY = _SITE_BUILDER / "auth" / "session_kms.py"
 # [SessionKeys] 的唯一定义在 auth/session_keys.py；闸门按它枚举两个 family 的 RS 行
@@ -428,7 +433,7 @@ KMS_CONTEXT = kms_context(KMS_MESSAGE_TYPE)
 # 其余每个 MessageType 各一腿。**进度输出报这个数**，而不是写死"2 次"——腿数由
 # `KMS_MESSAGE_TYPES` 决定，写死的字面量会在加/减一腿时静静地说谎（有一条单测把这个
 # 常量与 `simulate` 真正发出的调用数对齐）。
-SIM_LEGS_PER_PRINCIPAL = 1 + len(KMS_MESSAGE_TYPES)
+SIM_LEGS_PER_PRINCIPAL = 3 + len(KMS_MESSAGE_TYPES)
 # IAM 策略变更动作。**这一类不进模拟器**——它只用来判"哪些语句进 B 的静态快照"。
 #
 # 原先这里走的是"静态解析发现候选 → 模拟器对具体 ARN 确认 → 三值分类"两步。已删除：
@@ -1167,6 +1172,7 @@ RED_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("iam_write_drift",      "IAM 写语句快照漂移（红）",                      "iam"),
     ("boundary_drift",       "permissions boundary 漂移（红）",               "iam"),
     ("kms_drift",            "KMS 层漂移（key policy / grants / 公钥 / key 集合）（红）", "kms"),
+    ("model_input_drift",    "能力层前提漂移（guard / 入口类型 / 栈控制面）（红）",       "model"),
 )
 GREEN_FIELDS: tuple[tuple[str, str], ...] = (
     ("unclassified", "基线里未分类（请标注 category）"),
@@ -1193,6 +1199,11 @@ RED_MESSAGES = {
                   "了新权限，但**闸门对这一块的答案退化成了下界**——先看新增那几项对应哪条 "
                   "Condition（`--dump-observed` 看带真实名字的快照），再决定是补 "
                   "ContextEntries 还是接受并更新基线。"),
+    "model": ("闸门红：能力层的**前提**变了（stack policy 的 guard、函数入口类型、栈控制什么）。"
+              "这不一定意味着有人拿到新权限，但它改变了所有能力结论的解释——guard 从 "
+              "protected 变 open 时，持 CFN 更新权的 principal 会重新进冒充面（真机症状："
+              "忘了 `router_stack_policy.py apply`）；反过来也要有人看，那条路只是**直接更新**"
+              "被挡住，模板层路径仍未分析（ADR 0007/0008、spec §9）。"),
     "iam": ("闸门红：账号内可能影响 IAM 策略变更的**语句集合**变了（Allow 或 Deny），"
             "或某个 principal 的 permissions boundary 变了。**这一层刻意只报变化、"
             "不判方向**：它不声称语句是否生效、是否构成提权链、变化是收紧还是放宽"
@@ -1214,6 +1225,7 @@ class Report:
     iam_write_drift: list[str] = field(default_factory=list)
     boundary_drift: list[str] = field(default_factory=list)
     kms_drift: list[str] = field(default_factory=list)
+    model_input_drift: list[str] = field(default_factory=list)
     migration_grants: list[str] = field(default_factory=list)
     migration_undecided: list[str] = field(default_factory=list)
     improvements: list[str] = field(default_factory=list)
@@ -1243,6 +1255,7 @@ def compare_to_baseline(observed: dict[str, dict], baseline: dict, *,
                         coverage: dict | None = None,
                         iam_write: dict | None = None,
                         kms: dict | None = None,
+                        model_inputs: dict | None = None,
                         new_keys: tuple = (),
                         retired_keys: tuple = ()) -> Report:
     """observed = {fingerprint: {"name", "arn", "grants"}}。
@@ -1354,8 +1367,26 @@ def compare_to_baseline(observed: dict[str, dict], baseline: dict, *,
         _compare_kms(rep, baseline.get("kms") or {}, kms,
                      new_keys=tuple(new_keys), retired_keys=tuple(retired_keys))
 
+    _compare_model_inputs(rep, baseline.get("model_inputs") or {}, model_inputs)
     _compare_facts(rep, baseline.get("facts") or {}, facts)
     return rep
+
+
+def _compare_model_inputs(rep: Report, base: dict, now: dict | None) -> None:
+    """**任一字段变化都红，不判方向**（与 B 层、KMS 层同一条纪律）。
+
+    只比不判的理由同上面两层：判"这个变化是收紧还是放宽"需要的正是本闸门刻意不造的
+    那个分析器。基线里还没有这一节时只记 note（首次生成）。
+    """
+    if now is None:
+        return
+    if not base:
+        rep.notes.append("model_inputs：基线里还没有这一节（首次生成，下一轮起参与红绿）")
+        return
+    base_flat = json.dumps(base, sort_keys=True, ensure_ascii=False)
+    now_flat = json.dumps(now, sort_keys=True, ensure_ascii=False)
+    if base_flat != now_flat:
+        rep.model_input_drift.append(f"能力层的前提变了：基线 {base_flat} → 本次 {now_flat}")
 
 
 def _compare_kms(rep: Report, base: dict, now: dict, *, new_keys: tuple,
@@ -2095,6 +2126,90 @@ def edge_code_arns_carrying_keys(clients, function_name: str, fn_arn: str,
     return {label: tuple(v) for label, v in out.items()}
 
 
+def router_stack_and_distribution(clients) -> tuple[str, str]:
+    """(router 栈名, 分发 ID)。**一次解析给两个调用方**：Edge 当前版本那条与 3g 的栈观测。
+
+    分发 ID 是部署产物，从 router 栈的 CfnOutput 取（config.ini 只放输入）。
+    """
+    rcfg = configparser.ConfigParser(interpolation=None)
+    rcfg.read(_SITE_BUILDER.parent / "router" / "config.ini", encoding="utf-8")
+    if not rcfg.sections():
+        raise SystemExit("router/config.ini 读不到任何段——configparser 对缺失文件是静默的，"
+                         "再往下跑会拿空栈名去问 CloudFormation。先确认路径与 cwd。")
+    stack = rcfg["CDK"]["stack_name"].split("#")[0].strip()
+    outs = clients["cloudformation"].describe_stacks(
+        StackName=stack)["Stacks"][0].get("Outputs", [])
+    dist = next((o["OutputValue"] for o in outs if o["OutputKey"] == "DistributionId"), "")
+    if not dist:
+        raise SystemExit(f"栈 {stack} 没有 CfnOutput DistributionId——router 栈没部？")
+    return stack, dist
+
+
+def stack_logical_ids(cfn, stack: str, types: tuple[str, ...]) -> list[str]:
+    """栈里这些资源类型的 `LogicalResourceId`。guard 谓词按它们判"拦住了什么"。"""
+    out = []
+    for page in cfn.get_paginator("list_stack_resources").paginate(StackName=stack):
+        for r in page["StackResourceSummaries"]:
+            if r["ResourceType"] in types:
+                out.append(r["LogicalResourceId"])
+    return sorted(out)
+
+
+def router_and_deployer_stacks(clients, deployer_stack: str) -> tuple:
+    """两个栈的**观测**事实（3g）。
+
+    · **router 栈**管理 Edge 两函数与分发；自 ADR 0007 起它有 stack policy，所以
+      "能 UpdateStack 就能替换 Edge"这条推理现在要看 guard（三值，见
+      `_stack_policy_guard`；**不能**用 `policy_problems()` 判，理由见 ADR 0008）。
+    · **deployer 栈**拥有两把会话签名 CMK（`infra/app.py` 的 `kms.Key`）⇒ 它是一条
+      **签名**路径，与 Edge 那条不同。栈名由调用方从函数 tag 反查，不手抄。
+
+    `premises_verified` 一律 False：谁执行这次更新已经观测到了（`RoleARN`），但
+    "那个身份是否真能改目标资源"还没核 ⇒ 判定落 `*-unanalyzed`（单列、不进并集）。
+    这是刻意的下界，见 spec §9。
+    """
+    cfn = clients["cloudformation"]
+    router_stack, _dist = router_stack_and_distribution(clients)
+    plan = ((router_stack, "router", frozenset({model.CONTROLS_EDGE}),
+             ("AWS::Lambda::Function", "AWS::CloudFront::Distribution",
+              "AWS::DynamoDB::Table")),
+            (deployer_stack, "deployer", frozenset({model.CONTROLS_SESSION_KEY}),
+             ("AWS::KMS::Key",)))
+    facts = []
+    for name, label, controls, types in plan:
+        body = cfn.get_stack_policy(StackName=name).get("StackPolicyBody")
+        described = cfn.describe_stacks(StackName=name)["Stacks"][0]
+        facts.append(model.StackFact(
+            resource=described["StackId"], label=label,
+            guard=guard_for(json.loads(body) if body else None,
+                            stack_logical_ids(cfn, name, types)),
+            service_role=described.get("RoleARN"), controls=controls,
+            premises_verified=False))
+    return tuple(facts)
+
+
+def model_inputs_section(surface) -> dict:
+    """能力层的**前提**落成可比较的快照（3g）。
+
+    为什么必须单独一节：guard 从 protected 翻成 open，在"当前没人持 `UpdateStack`"的
+    账号里对能力层完全不可见（标签集合一个都不变），而它是实打实的 latent risk。
+    反过来，能力层真的变了时，这一节是"为什么变"的唯一对账依据。
+    ARN 只落指纹（service role ARN 含账号 ID）。
+    """
+    return {
+        "stacks": {st.label: {"guard": st.guard,
+                              "controls": sorted(st.controls),
+                              "service_role_fp": (principal_fingerprint(st.service_role)
+                                                  if st.service_role else ""),
+                              "premises_verified": st.premises_verified}
+                   for st in surface.stacks},
+        "edge_entry": surface.edge.entry,
+        "signers": {fact.arn.rsplit(":", 1)[-1]:
+                    {"entry": fact.entry, "layers_supported": fact.layers_supported}
+                    for fact in (surface.auth, surface.panel)},
+    }
+
+
 def edge_current_version(clients) -> str:
     """CloudFront **当前关联**的 origin-request Lambda 版本号。
 
@@ -2104,16 +2219,7 @@ def edge_current_version(clients) -> str:
 
     分发 ID 从 router 栈的 CfnOutput 取（config.ini 只放输入，不放部署产物）。
     """
-    rcfg = configparser.ConfigParser(interpolation=None)
-    rcfg.read(_SITE_BUILDER.parent / "router" / "config.ini", encoding="utf-8")
-    if not rcfg.sections():
-        raise SystemExit("router/config.ini 读不到任何段——configparser 对缺失文件是静默的，"
-                         "再往下跑会拿空栈名去问 CloudFormation。先确认路径与 cwd。")
-    stack = rcfg["CDK"]["stack_name"].split("#")[0].strip()
-    outs = clients["cloudformation"].describe_stacks(StackName=stack)["Stacks"][0].get("Outputs", [])
-    dist = next((o["OutputValue"] for o in outs if o["OutputKey"] == "DistributionId"), "")
-    if not dist:
-        raise SystemExit(f"栈 {stack} 没有 CfnOutput DistributionId——router 栈没部？")
+    stack, dist = router_stack_and_distribution(clients)
     assoc = (clients["cloudfront"].get_distribution_config(Id=dist)["DistributionConfig"]
              ["DefaultCacheBehavior"].get("LambdaFunctionAssociations", {}).get("Items", []))
     arns = [a["LambdaFunctionARN"] for a in assoc if a.get("EventType") == "origin-request"]
@@ -2216,6 +2322,11 @@ def simulate(iam, principal_arn: str,
     pairs: set[tuple[str, str]] = set()
     legs: list[tuple[tuple[str, ...], list[str], list[dict] | None]] = [
         (ACTIONS_FUNCTION, t.function_resources(), None),
+        # 3g 的两腿。**按模型消费面裁剪**：`PublishVersion` / `CreateFunction` 只在
+        # 平台函数与新建候选上携带信号，与全部 alias/版本叉乘是成本翻倍换不来信号。
+        # 裁掉的组合是"未覆盖"，**不是 deny**（spec §9 的已记盲区）。
+        (ACTIONS_PUBLISH, t.publish_resources(), None),
+        (ACTIONS_MISC, t.misc_resources(), None),
         (ACTIONS_OTHER, t.other_resources(), KMS_CONTEXT),
     ]
     legs += [(A_KMS_SIGN, sorted(t.kms_keys.values()), kms_context(mt))
@@ -2275,6 +2386,14 @@ def measure(region: str, *, workers: int = 4) -> dict:
     # **`sites` 的排除名单用未过滤的 `platform`**：可选组件的函数即使这次不枚举，也绝不能
     # 被当成"用户站点"（那会让它落进 invoke-site 的计数里，语义完全错）。过滤只作用于
     # 后面按名字逐个问 AWS 的那些调用。
+    # 3g：两个 signer 的名字必须真的在平台清单里。漏改名字的症状否则是**静默的**
+    # ——能力层少算一整条签名路径（劫持 signer），而闸门照样 exit 0。
+    missing_signers = [n for n in (AUTH_FUNCTION_NAME, PANEL_FUNCTION_NAME)
+                       if n not in platform]
+    if missing_signers:
+        raise SystemExit(
+            f"平台函数清单里没有 {missing_signers}——能力层会漏掉对应的签名路径。"
+            f"改过函数名就同步改 AUTH_FUNCTION_NAME / PANEL_FUNCTION_NAME。")
     sites = site_function_names(lam, platform)
     all_functions = list(resolve_optional_functions(lam, cfg, platform)) + list(sites)
 
@@ -2339,6 +2458,42 @@ def measure(region: str, *, workers: int = 4) -> dict:
     print(f"Edge 当前关联版本 {current_version}：site 公钥齐、无 console 公钥、无 login-flow 值",
           file=sys.stderr)
 
+    # ---- 3g：能力层的观测前提（栈 guard / 分发 / 入口类型）----
+    # deployer 栈名从平台函数的 CloudFormation tag 反查（**不手抄栈名**，与
+    # `edge_asset_location` 同一手法）。它拥有两把会话签名 CMK ⇒ 一条独立的签名路径。
+    _tags = lam.get_function(FunctionName=AUTH_FUNCTION_NAME).get("Tags") or {}
+    deployer_stack = _tags.get("aws:cloudformation:stack-name", "")
+    if not deployer_stack:
+        raise SystemExit(
+            f"{AUTH_FUNCTION_NAME} 没有 CloudFormation stack tag——推不出 deployer 栈名。"
+            "那个栈拥有两把会话签名 CMK，漏掉它就漏掉一条签名路径（3g）。")
+    stacks = router_and_deployer_stacks(clients, deployer_stack)
+    _router_stack, _dist_id = router_stack_and_distribution(clients)
+    distribution = f"arn:aws:cloudfront::{account}:distribution/{_dist_id}"
+    # 两个候选 ARN：一个中性名、一个与 router 栈同前缀 ⇒ 缩小"按名字前缀授权"的盲区。
+    # **它们只能代表这两个名字**，不能代表任意新函数名（spec §9 的已记盲区）。
+    new_candidates = (fn_arn("sb-probe-new-function"),
+                      fn_arn(f"{_router_stack}-probe-new-function"))
+    service_roles = tuple(st.service_role for st in stacks if st.service_role)
+    surface = model.Surface(
+        kms_keys=tuple(r.key_arn for r in refs),
+        # auth / panel 的 Function URL 无 qualifier、服务 `$LATEST`（部署脚本用裸
+        # `update_function_code`）⇒ 换码即刻生效。
+        auth=model.FnFact(fn_arn(AUTH_FUNCTION_NAME), entry=model.ENTRY_LATEST,
+                          layers_supported=True),
+        panel=model.FnFact(fn_arn(PANEL_FUNCTION_NAME), entry=model.ENTRY_LATEST,
+                           layers_supported=True),
+        # `edge_current_version()` 那条硬断言已经保证 association 是**编号版本**。
+        # Lambda@Edge **不支持 Layer**（AWS 文档）⇒ 改配置不等于任意代码执行。
+        edge=model.FnFact(fn_arn(EDGE_ORIGIN_REQUEST_FN), entry=model.ENTRY_VERSION,
+                          layers_supported=False),
+        new_candidates=new_candidates, distribution=distribution,
+        edge_role=edge_role_arn, stacks=stacks, service_roles=service_roles)
+    print(f"3g 能力层前提：栈 guard "
+          f"{', '.join(f'{st.label}={st.guard}' for st in stacks)}；"
+          f"Edge 入口={surface.edge.entry}（前提未核的栈一律只出 *-unanalyzed 标签）",
+          file=sys.stderr)
+
     targets = Targets(
         platform_functions=tuple(fn_arn(n) for n in platform),
         site_functions=tuple(fn_arn(n) for n in sites),
@@ -2349,6 +2504,8 @@ def measure(region: str, *, workers: int = 4) -> dict:
                     for n, al in aliases.items()},
         version_arns={fn_arn(n): tuple(f"{fn_arn(n)}:{v}" for v in vs)
                       for n, vs in versions.items()},
+        distribution=distribution, edge_role=edge_role_arn,
+        new_fn_candidates=new_candidates, stacks=stacks, service_roles=service_roles,
     )
 
     # ---- resource policy 快照（SimulatePrincipalPolicy 不覆盖这条通道）----
@@ -2445,10 +2602,14 @@ def measure(region: str, *, workers: int = 4) -> dict:
             # grant 都没有却有判不出的项，而那正是最该盯住的那种（条件哪天放宽就是新 grant）。
             undecided |= undecided_members(p["arn"], pairs, targets)
             grants = grants_from_decisions(decisions, targets)
-            if grants:
+            # 能力层：**共享模型**把这些逐资源判定组合成命名路径（3g）。
+            # 名字也进判定：夹具签发器角色本身即持有那条 URL 入口。
+            allowed_pairs = frozenset(k for k, v in decisions.items() if v == "allowed")
+            caps = model.classify(allowed_pairs, surface, p["name"])
+            if grants or caps:
                 observed[principal_fingerprint(p["arn"])] = {
                     "name": p["name"], "arn": p["arn"], "kind": p["kind"],
-                    "grants": sorted(grants)}
+                    "grants": sorted(grants), "capabilities": sorted(caps)}
             if i % 100 == 0:
                 print(f"  已模拟 {i}/{len(principals)}", file=sys.stderr)
 
@@ -2494,11 +2655,19 @@ def measure(region: str, *, workers: int = 4) -> dict:
           file=sys.stderr)
 
     facts["principals_with_missing_context"] = n_missing
+    # headline **只打印，不参与红绿**：红绿在逐 principal 的集合比较那一层已经判过了。
+    agg = model.summarize({fp: set(rec["capabilities"]) for fp, rec in observed.items()})
+    print(f"能力层 headline（只打印）：能签 {agg['can_sign']}、能替换 Edge 验签 "
+          f"{agg['can_replace_edge_verifier']}、并集 {agg['impersonation_surface_union']}"
+          f"（受限/未分析单列 {agg['non_surface_only_holders']}）。"
+          f"**这是下界**：模板层 CFN 路径与 CreateFunction 的名字空间都未分析（spec §9）。",
+          file=sys.stderr)
     return {# 快照带 schema：`--from-dump` 要能拒绝旧形态的快照
             # （缺分节时比较器整层跳过，输出与"真的没漂移"逐字相同）。
             "schema": BASELINE_SCHEMA,
             "principals": observed, "resource_policies": rp, "facts": facts,
             "coverage": {"undecided_items": sorted(undecided)},
+            "model_inputs": model_inputs_section(surface),
             # `texts` 只进 stdout 与 --dump-observed 的产物，**不进基线**。
             "iam_write": {"statements": iam_stmts, "boundaries": boundaries,
                           "managed_versions": used_policies, "texts": stmt_texts},
@@ -2551,6 +2720,11 @@ def _plain_int(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
 
 
+def _plain_bool(v) -> bool:
+    """bool 才行。`premises_verified` 放个字符串 "false" 会让比较器把它当真值。"""
+    return isinstance(v, bool)
+
+
 def _list_of_str(v) -> bool:
     return isinstance(v, list) and all(isinstance(x, str) for x in v)
 
@@ -2587,7 +2761,9 @@ _POLICY_SHAPE: dict = {"alias": {"*": _list_of_str}, "version": _list_of_str,
 BUNDLE_SHAPE: dict = {
     "schema": int,
     "principals": {"*": {"name": _nonempty_str, "arn": _nonempty_str,
-                         "kind": _nonempty_str, "grants": _list_of_str}},
+                         "kind": _nonempty_str, "grants": _list_of_str,
+                         # 3g：派生能力标签（共享模型算出来的）
+                         "capabilities": _list_of_str}},
     "resource_policies": {"platform": {"*": _POLICY_SHAPE},
                           "sites": {"*": _POLICY_SHAPE},
                           "bootstrap_bucket": _list_of_str,
@@ -2597,6 +2773,13 @@ BUNDLE_SHAPE: dict = {
     "facts": {"principals_with_missing_context": _plain_int},
     # 成员必须是可分解形态（不是任意字符串）：写成哈希或带账号值都要在这里被拒。
     "coverage": {"undecided_items": _list_of_undecided_items},
+    # 3g：能力层的前提。缺一层的症状与"这一层没漂移"一模一样 ⇒ 进递归合同。
+    "model_inputs": {
+        "stacks": {"*": {"guard": _nonempty_str, "controls": _list_of_str,
+                         "service_role_fp": str, "premises_verified": _plain_bool}},
+        "edge_entry": _nonempty_str,
+        "signers": {"*": {"entry": _nonempty_str, "layers_supported": _plain_bool}},
+    },
     "iam_write": {"statements": dict, "boundaries": dict,
                   "managed_versions": dict, "texts": dict},
     # 3c-final：每把会话签名 CMK 一组。键是 kid（不是账号值）；ARN 与 key policy 只落指纹。
@@ -2737,6 +2920,8 @@ def write_baseline(bundle: dict, baseline: dict, path: Path) -> None:
          # 3c-final：会话签名 CMK 的快照（key policy / grants / 公钥指纹只落指纹或 hex，
          # key ARN 本身含账号 ID ⇒ 只落 arn_fp）。
          "kms": bundle["kms"],
+         # 3g：能力层的前提（guard / 入口类型 / 栈控制面）。ARN 只落指纹。
+         "model_inputs": bundle["model_inputs"],
          "principals": principals,
          # B：IAM 写的纯静态文本快照。**只落指纹**——语句原文（`texts`）刻意不写，
          # 它含账号内标识（Principal 是带账号 ID 的角色 ARN）。
@@ -2861,7 +3046,7 @@ def main(argv: list | None = None) -> int:
             observed, baseline, required=bundle["required"],
             resource_policies=bundle["resource_policies"], facts=bundle["facts"],
             coverage=bundle["coverage"], iam_write=bundle["iam_write"],
-            kms=bundle["kms"],
+            kms=bundle["kms"], model_inputs=bundle["model_inputs"],
             new_keys=tuple(args.new_key or ()), retired_keys=tuple(args.retire_key or ()))
         print(preview.render())
         write_baseline(bundle, baseline, BASELINE_PATH)
@@ -2875,6 +3060,7 @@ def main(argv: list | None = None) -> int:
                               coverage=bundle["coverage"],
                               iam_write=bundle["iam_write"],
                               kms=bundle["kms"],
+                              model_inputs=bundle["model_inputs"],
                               new_keys=tuple(args.new_key or ()),
                               retired_keys=tuple(args.retire_key or ()))
     print("\n" + rep.render())
