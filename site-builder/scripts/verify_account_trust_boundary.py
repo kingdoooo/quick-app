@@ -586,7 +586,13 @@ class Targets:
     edge_role: str = ""
     new_fn_candidates: tuple[str, ...] = ()
     stacks: tuple = ()                      # tuple[model.StackFact, ...]
-    service_roles: tuple[str, ...] = ()
+    # **按栈标签分开记**（R1-L3）：压成一个 `cfn-service` 会让"又多一个栈的执行角色
+    # 可以 PassRole"完全不产生漂移（实测：前后 grants 都是 [pass-role:cfn-service]）。
+    service_roles_by_label: dict = field(default_factory=dict)
+
+    @property
+    def service_roles(self) -> tuple:
+        return tuple(self.service_roles_by_label.values())
 
     def publish_resources(self) -> list[str]:
         """发布/建函数那一腿的资源：平台函数（含 Edge）+ 候选 ARN。
@@ -739,8 +745,9 @@ def undecided_resource_class(resource: str, t: "Targets") -> str:
         return "distribution"
     if t.edge_role and resource == t.edge_role:
         return "role:edge"
-    if resource in t.service_roles:
-        return "role:cfn-service"
+    for label, role in sorted(t.service_roles_by_label.items()):
+        if resource == role:
+            return f"role:cfn-service@{label}"
     if resource in t.new_fn_candidates:
         return "fn:new-candidate"
     for st in t.stacks:
@@ -862,7 +869,8 @@ def grants_from_decisions(decisions: dict[str, str], t: Targets) -> set[str]:
                 # **逻辑标签**进 grant，StackId 不进（它含账号 ID）。
                 grants.add(f"{kind}:{st.label}")
     for role, cls in ([(t.edge_role, "edge")] if t.edge_role else []) \
-            + [(r, "cfn-service") for r in t.service_roles]:
+            + [(r, f"cfn-service@{label}")
+               for label, r in sorted(t.service_roles_by_label.items())]:
         if allowed(A_PASSROLE, (role,)):
             grants.add(f"{G_PASSROLE}:{cls}")
 
@@ -2181,37 +2189,112 @@ def stack_logical_ids(cfn, stack: str, types: tuple[str, ...]) -> list[str]:
     return sorted(out)
 
 
-def router_and_deployer_stacks(clients, deployer_stack: str) -> tuple:
+def observed_entry(lam, function_name: str, aliases: dict) -> str:
+    """观测这个函数的**入口服务的是什么**（R1-L3）→ `latest` / `alias` / `unknown`。
+
+    判据按"入口"来定，而入口就是 Function URL：
+      · 未限定 URL 存在 ⇒ 服务 `$LATEST` ⇒ 换码/改配置立刻生效（`latest`）；
+      · 未限定 URL 不存在、但该函数有 alias ⇒ 入口挂在 alias 上（`alias`）；
+      · 两者都看不到 ⇒ `unknown`，**不许默认成 latest**（默认成 latest 就把
+        "过度声称"重新引进来了，那正是 3g 要修的东西）。
+
+    Edge 函数不走这条：它的入口是 CloudFront association，由 `edge_current_version()`
+    那条硬断言保证是编号版本。
+    """
+    try:
+        lam.get_function_url_config(FunctionName=function_name)
+        return model.ENTRY_LATEST
+    except Exception as exc:                      # noqa: BLE001
+        if type(exc).__name__ not in ("ResourceNotFoundException",):
+            print(f"（3g note：{function_name} 的 Function URL 配置读不到"
+                  f"（{type(exc).__name__}）⇒ 入口类型记 unknown）", file=sys.stderr)
+            return model.ENTRY_UNKNOWN
+    for name, als in aliases.items():
+        if name == function_name and als:
+            return model.ENTRY_ALIAS
+    return model.ENTRY_UNKNOWN
+
+
+def stack_owning(cfn, physical_ids: tuple) -> tuple:
+    """按**物理资源 ID** 反查它属于哪个栈 → `(栈名, 命中的 physical id)`；查不到返回 `("", "")`。
+
+    `DescribeStackResources` 支持 `PhysicalResourceId` 反查（botocore 输入含该字段）。
+    这比"从某个函数的 `aws:cloudformation:stack-name` tag 猜"强两点：
+      · **不依赖那个函数是 CFN 建的**——`auth/deploy_auth.py` 用裸 `create_function`
+        建 auth，不传 Tags、不经 CFN，所以按 tag 推导在正常部署里必然失败（R1-L3 blocker）；
+      · 它**顺带证明**了归属：能查到就说明这个资源真的由那个栈管理，而"栈里有个同类型资源"
+        证明不了"我们关心的那个资源在里面"。
+    """
+    for pid in physical_ids:
+        if not pid:
+            continue
+        try:
+            found = cfn.describe_stack_resources(PhysicalResourceId=pid)["StackResources"]
+        except Exception:      # noqa: BLE001 —— 不是 CFN 管理的资源会直接报错，那是答案之一
+            continue
+        if found:
+            return found[0]["StackName"], pid
+    return "", ""
+
+
+def router_and_deployer_stacks(clients, *, edge_fn_arn: str, cmk_arns: tuple) -> tuple:
     """两个栈的**观测**事实（3g）。
 
-    · **router 栈**管理 Edge 两函数与分发；自 ADR 0007 起它有 stack policy，所以
-      "能 UpdateStack 就能替换 Edge"这条推理现在要看 guard（三值，见
-      `_stack_policy_guard`；**不能**用 `policy_problems()` 判，理由见 ADR 0008）。
-    · **deployer 栈**拥有两把会话签名 CMK（`infra/app.py` 的 `kms.Key`）⇒ 它是一条
-      **签名**路径，与 Edge 那条不同。栈名由调用方从函数 tag 反查，不手抄。
+    · **router 栈**：栈名来自 `router/config.ini`，但 `controls` 里的 `edge-verifier`
+      要靠反查证明 Edge 函数真的由它管理。**证明不了时不摘掉这个 control**——摘掉等于让
+      那条 CFN 路径从视野里消失（false-green）；改成 `premises_verified=False`，
+      判定会落 `*-unanalyzed`（仍可见、但不定论）。
+    · **deployer 栈**：直接按**两把 CMK 的物理 ID** 反查谁管理它们。查不到 ⇒ 这两把 key
+      不由任何栈管理 ⇒ "改栈模板就能改 key policy"这条路**不存在**，于是不编造一个
+      session-key 栈（而不是硬失败）。
 
-    `premises_verified` 一律 False：谁执行这次更新已经观测到了（`RoleARN`），但
-    "那个身份是否真能改目标资源"还没核 ⇒ 判定落 `*-unanalyzed`（单列、不进并集）。
-    这是刻意的下界，见 spec §9。
+    `premises_verified` 只在"归属已证明"时为真；即便为真，这条路也还缺一环
+    （那个执行身份是否真能改目标资源），所以 spec §9 把它记成已接受的下界。
     """
     cfn = clients["cloudformation"]
     router_stack, _dist = router_stack_and_distribution(clients)
-    plan = ((router_stack, "router", frozenset({model.CONTROLS_EDGE}),
-             ("AWS::Lambda::Function", "AWS::CloudFront::Distribution",
-              "AWS::DynamoDB::Table")),
-            (deployer_stack, "deployer", frozenset({model.CONTROLS_SESSION_KEY}),
-             ("AWS::KMS::Key",)))
     facts = []
-    for name, label, controls, types in plan:
-        body = cfn.get_stack_policy(StackName=name).get("StackPolicyBody")
-        described = cfn.describe_stacks(StackName=name)["Stacks"][0]
+
+    edge_owner, _hit = stack_owning(cfn, (edge_fn_arn, _fn_name(edge_fn_arn)))
+    edge_verified = bool(edge_owner) and edge_owner == router_stack
+    described = cfn.describe_stacks(StackName=router_stack)["Stacks"][0]
+    facts.append(model.StackFact(
+        resource=described["StackId"], label="router",
+        guard=guard_for(_stack_policy_json(cfn, router_stack),
+                        stack_logical_ids(cfn, router_stack,
+                                          ("AWS::Lambda::Function",
+                                           "AWS::CloudFront::Distribution",
+                                           "AWS::DynamoDB::Table"))),
+        service_role=described.get("RoleARN"),
+        controls=frozenset({model.CONTROLS_EDGE}),
+        premises_verified=False))
+    if not edge_verified:
+        print(f"（3g note：反查不到 {_fn_name(edge_fn_arn)} 属于 {router_stack}"
+              f"（实得 {edge_owner!r}）⇒ router 那条 CFN 路径按**未核实**记，"
+              f"标签只出 *-unanalyzed）", file=sys.stderr)
+
+    # CMK 的物理 ID 既可能是 key id 也可能是完整 ARN，两种都试。
+    pids = tuple(a for arn in cmk_arns for a in (arn, arn.rsplit("/", 1)[-1]))
+    dep_stack, hit = stack_owning(cfn, pids)
+    if dep_stack:
+        d2 = cfn.describe_stacks(StackName=dep_stack)["Stacks"][0]
         facts.append(model.StackFact(
-            resource=described["StackId"], label=label,
-            guard=guard_for(json.loads(body) if body else None,
-                            stack_logical_ids(cfn, name, types)),
-            service_role=described.get("RoleARN"), controls=controls,
+            resource=d2["StackId"], label="deployer",
+            guard=guard_for(_stack_policy_json(cfn, dep_stack),
+                            stack_logical_ids(cfn, dep_stack, ("AWS::KMS::Key",))),
+            service_role=d2.get("RoleARN"),
+            controls=frozenset({model.CONTROLS_SESSION_KEY}),
             premises_verified=False))
+    else:
+        print("（3g note：两把会话签名 CMK 反查不到任何 CloudFormation 栈 ⇒ "
+              "「改栈模板改 key policy」这条路不存在，本轮不记 deployer 栈）",
+              file=sys.stderr)
     return tuple(facts)
+
+
+def _stack_policy_json(cfn, stack: str):
+    body = cfn.get_stack_policy(StackName=stack).get("StackPolicyBody")
+    return json.loads(body) if body else None
 
 
 def model_inputs_section(surface) -> dict:
@@ -2487,34 +2570,34 @@ def measure(region: str, *, workers: int = 4) -> dict:
     # ---- 3g：能力层的观测前提（栈 guard / 分发 / 入口类型）----
     # deployer 栈名从平台函数的 CloudFormation tag 反查（**不手抄栈名**，与
     # `edge_asset_location` 同一手法）。它拥有两把会话签名 CMK ⇒ 一条独立的签名路径。
-    _tags = lam.get_function(FunctionName=AUTH_FUNCTION_NAME).get("Tags") or {}
-    deployer_stack = _tags.get("aws:cloudformation:stack-name", "")
-    if not deployer_stack:
-        raise SystemExit(
-            f"{AUTH_FUNCTION_NAME} 没有 CloudFormation stack tag——推不出 deployer 栈名。"
-            "那个栈拥有两把会话签名 CMK，漏掉它就漏掉一条签名路径（3g）。")
-    stacks = router_and_deployer_stacks(clients, deployer_stack)
     _router_stack, _dist_id = router_stack_and_distribution(clients)
+    stacks = router_and_deployer_stacks(
+        clients, edge_fn_arn=fn_arn(EDGE_ORIGIN_REQUEST_FN),
+        cmk_arns=tuple(r.key_arn for r in refs))
     distribution = f"arn:aws:cloudfront::{account}:distribution/{_dist_id}"
-    # 两个候选 ARN：一个中性名、一个与 router 栈同前缀 ⇒ 缩小"按名字前缀授权"的盲区。
-    # **它们只能代表这两个名字**，不能代表任意新函数名（spec §9 的已记盲区）。
-    new_candidates = (fn_arn("sb-probe-new-function"),
-                      fn_arn(f"{_router_stack}-probe-new-function"))
-    service_roles = tuple(st.service_role for st in stacks if st.service_role)
+    # 候选名字规则**住在共享模型里**，两个采集方调同一份（R1-L3：各写一份会让同一个账号
+    # 事实在两个入口得出不同标签）。
+    new_candidates = model.new_function_candidates(fn_arn, _router_stack)
+    # service role 按**栈**分别记（R1-L3）：压成一个 `cfn-service` 会让"又多一个栈的
+    # 执行角色可 PassRole"完全不产生漂移。
+    service_roles = {st.label: st.service_role for st in stacks if st.service_role}
     surface = model.Surface(
         kms_keys=tuple(r.key_arn for r in refs),
-        # auth / panel 的 Function URL 无 qualifier、服务 `$LATEST`（部署脚本用裸
-        # `update_function_code`）⇒ 换码即刻生效。
-        auth=model.FnFact(fn_arn(AUTH_FUNCTION_NAME), entry=model.ENTRY_LATEST,
+        # **入口类型是观测出来的**（R1-L3）：写死 latest 等于把"改配置/改码立刻生效"这个
+        # 前提变成假设，而 spec §4.1 要求它是观测值。
+        auth=model.FnFact(fn_arn(AUTH_FUNCTION_NAME),
+                          entry=observed_entry(lam, AUTH_FUNCTION_NAME, aliases),
                           layers_supported=True),
-        panel=model.FnFact(fn_arn(PANEL_FUNCTION_NAME), entry=model.ENTRY_LATEST,
+        panel=model.FnFact(fn_arn(PANEL_FUNCTION_NAME),
+                           entry=observed_entry(lam, PANEL_FUNCTION_NAME, aliases),
                            layers_supported=True),
         # `edge_current_version()` 那条硬断言已经保证 association 是**编号版本**。
         # Lambda@Edge **不支持 Layer**（AWS 文档）⇒ 改配置不等于任意代码执行。
         edge=model.FnFact(fn_arn(EDGE_ORIGIN_REQUEST_FN), entry=model.ENTRY_VERSION,
                           layers_supported=False),
         new_candidates=new_candidates, distribution=distribution,
-        edge_role=edge_role_arn, stacks=stacks, service_roles=service_roles)
+        edge_role=edge_role_arn, stacks=stacks,
+        service_roles=tuple(service_roles.values()))
     print(f"3g 能力层前提：栈 guard "
           f"{', '.join(f'{st.label}={st.guard}' for st in stacks)}；"
           f"Edge 入口={surface.edge.entry}（前提未核的栈一律只出 *-unanalyzed 标签）",

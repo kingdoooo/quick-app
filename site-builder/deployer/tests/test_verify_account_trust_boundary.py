@@ -150,7 +150,7 @@ _GRANT_RE = re.compile(
     # "grant 不合文法"而不是"新增授权"。
     r"|(?:cfn-update-stack|cfn-create-change-set|cfn-execute-change-set"
     r"|cfn-set-stack-policy):(?:router|deployer)"
-    r"|pass-role:(?:edge|cfn-service)"
+    r"|pass-role:(?:edge|cfn-service@(?:router|deployer))"
     # 3c-final：能签会话的两条路，每 kid 各一条。kid 形态由 session_keys.KID_RE 保证。
     r"|kms-sign:(?:site|console)-rs-v\d+"
     r"|kms-self-authorize:(?:site|console)-rs-v\d+"
@@ -4234,7 +4234,7 @@ def test_the_reported_leg_count_is_what_simulate_actually_calls():
                   edge_role="arn:aws:iam::111111111111:role/edge",
                   new_fn_candidates=("arn:aws:lambda:us-east-1:111111111111:function:probe-new",),
                   stacks=(g.model.StackFact(resource="S_ROUTER", label="router"),),
-                  service_roles=("arn:aws:iam::111111111111:role/cfn-exec",))
+                  service_roles_by_label={"router": "arn:aws:iam::111111111111:role/cfn-exec"})
     iam = _sim_iam(set())
     g.simulate(iam, "arn:aws:iam::111111111111:role/x", t)
     assert len(iam.calls) == g.SIM_LEGS_PER_PRINCIPAL == 5, (len(iam.calls), g.SIM_LEGS_PER_PRINCIPAL)
@@ -4787,7 +4787,7 @@ def _targets_3g(g, **kw):
         stacks=(g.model.StackFact(resource="S_ROUTER", label="router",
                                   guard=g.model.GUARD_OPEN,
                                   controls=frozenset({g.model.CONTROLS_EDGE})),),
-        service_roles=("arn:aws:iam::1:role/cfn-exec",))
+        service_roles_by_label={"router": "arn:aws:iam::1:role/cfn-exec"})
     base.update(kw)
     return g.Targets(**base)
 
@@ -4849,7 +4849,8 @@ def test_pass_role_distinguishes_edge_from_cfn_service_role():
     g = _gate()
     t = _targets_3g(g)
     assert g.grants_from_decisions(
-        {f"iam:PassRole|{t.service_roles[0]}": "allowed"}, t) == {"pass-role:cfn-service"}
+        {f"iam:PassRole|{t.service_roles[0]}": "allowed"}, t) \
+        == {"pass-role:cfn-service@router"}
 
 
 def test_action_class_names_cover_every_simulated_action():
@@ -4870,12 +4871,12 @@ def test_new_resource_classes_are_stable_and_account_free():
         stacks=(g.model.StackFact(
             resource="arn:aws:cloudformation:r:123456789012:stack/Foo/abc",
             label="router"),),
-        service_roles=("arn:aws:iam::123456789012:role/cfn-exec",))
+        service_roles_by_label={"router": "arn:aws:iam::123456789012:role/cfn-exec"})
     got = {g.undecided_resource_class(r, t) for r in
            (t.distribution, t.edge_role, t.new_fn_candidates[0],
             t.stacks[0].resource, t.service_roles[0])}
     assert got == {"distribution", "role:edge", "fn:new-candidate",
-                   "stack:router", "role:cfn-service"}, sorted(got)
+                   "stack:router", "role:cfn-service@router"}, sorted(got)
     assert not any("123456789012" in c for c in got)
 
 
@@ -4966,28 +4967,35 @@ def test_model_inputs_absent_from_baseline_is_a_note_not_a_green_lie():
     assert rep.ok and any("model_inputs" in n for n in rep.notes)
 
 
-def test_router_and_deployer_stacks_observes_guard_per_stack():
-    """两个栈都要**观测** guard，且 `premises_verified` 保持 False
-    （前提未核 ⇒ 判定只出 `*-unanalyzed`，这是刻意的下界）。"""
-    g = _gate()
-
+def _fake_cfn(*, cmk_stack="DeployerStack", edge_stack="RouterStack",
+              router_policy=None):
+    """假 CloudFormation：支持按 PhysicalResourceId 反查归属。"""
     class FakeCfn:
-        def get_stack_policy(self, StackName):
-            if StackName == "RouterStack":
-                return {"StackPolicyBody": json.dumps({"Statement": [
-                    {"Effect": "Allow", "Action": "Update:*", "Principal": "*",
-                     "Resource": "*"},
-                    {"Effect": "Deny", "Action": "Update:*", "Principal": "*",
-                     "Resource": "LogicalResourceId/OriginRequestFunctionAAAAAAAA"}]})}
-            return {}
+        calls = []
+
+        def describe_stack_resources(self, PhysicalResourceId=None, **kw):
+            self.calls.append(("reverse", PhysicalResourceId))
+            if "key/" in str(PhysicalResourceId) or str(PhysicalResourceId).startswith("kid-"):
+                if not cmk_stack:
+                    raise RuntimeError("ValidationError: does not exist")
+                return {"StackResources": [{"StackName": cmk_stack}]}
+            if "origin-request" in str(PhysicalResourceId) or "application-web-router" in str(PhysicalResourceId):
+                if not edge_stack:
+                    raise RuntimeError("ValidationError: does not exist")
+                return {"StackResources": [{"StackName": edge_stack}]}
+            raise RuntimeError("ValidationError: does not exist")
 
         def describe_stacks(self, StackName):
+            out = {"StackId": f"arn:stack/{StackName}",
+                   "RoleARN": f"arn:aws:iam::1:role/{StackName}-exec"}
             if StackName == "RouterStack":
-                return {"Stacks": [{"StackId": f"arn:stack/{StackName}",
-                                    "Outputs": [{"OutputKey": "DistributionId",
-                                                 "OutputValue": "D1"}],
-                                    "RoleARN": "arn:aws:iam::1:role/cfn-exec"}]}
-            return {"Stacks": [{"StackId": f"arn:stack/{StackName}"}]}
+                out["Outputs"] = [{"OutputKey": "DistributionId", "OutputValue": "D1"}]
+            return {"Stacks": [out]}
+
+        def get_stack_policy(self, StackName):
+            if StackName == "RouterStack" and router_policy is not None:
+                return {"StackPolicyBody": json.dumps(router_policy)}
+            return {}
 
         def get_paginator(self, name):
             assert name == "list_stack_resources", name
@@ -4996,30 +5004,144 @@ def test_router_and_deployer_stacks_observes_guard_per_stack():
                 def paginate(self, StackName):
                     return iter([{"StackResourceSummaries": [
                         {"ResourceType": "AWS::Lambda::Function",
-                         "LogicalResourceId": "OriginRequestFunctionAAAAAAAA"}]}])
+                         "LogicalResourceId": "OriginRequestFunctionAAAAAAAA"},
+                        {"ResourceType": "AWS::KMS::Key",
+                         "LogicalResourceId": "SiteSessionKeyRsV1AAAAAAAA"}]}])
             return P()
+    return FakeCfn()
 
+
+def _with_router_cfg(fn):
+    """把 router/config.ini 的读取替换成固定栈名（不碰真文件）。"""
     import configparser as _cp
-    real_read = _cp.ConfigParser.read
+    real = _cp.ConfigParser.read
 
-    def fake_read(self, *a, **k):
+    def fake(self, *a, **k):
         self.read_dict({"CDK": {"stack_name": "RouterStack"}})
         return ["router/config.ini"]
-
-    _cp.ConfigParser.read = fake_read
+    _cp.ConfigParser.read = fake
     try:
-        facts = g.router_and_deployer_stacks({"cloudformation": FakeCfn()},
-                                             "DeployerStack")
+        return fn()
     finally:
-        _cp.ConfigParser.read = real_read
-    by_label = {f.label: f for f in facts}
-    assert set(by_label) == {"router", "deployer"}
-    assert by_label["router"].guard == g.model.GUARD_PROTECTED
-    # 没有 stack policy ⇒ **open**（"没有策略"是已知的 open，不是 unknown）
-    assert by_label["deployer"].guard == g.model.GUARD_OPEN
-    assert by_label["router"].service_role == "arn:aws:iam::1:role/cfn-exec"
+        _cp.ConfigParser.read = real
+
+
+DENY_ALL = {"Statement": [{"Effect": "Deny", "Action": "Update:*", "Principal": "*",
+                           "Resource": "*"}]}
+
+
+def test_stacks_are_discovered_by_reverse_lookup_not_by_the_auth_tag():
+    """**R1-L3 blocker**：原先从 `site-auth-service` 的 `aws:cloudformation:stack-name`
+    tag 推导 deployer 栈，可是 `auth/deploy_auth.py` 用裸 `lam.create_function` 建它、
+    **不传 Tags、不经 CFN** ⇒ 正常部署里那个 tag 根本不存在，闸门首跑必 SystemExit。
+
+    现在按**两把 CMK 的物理 ID** 反查归属，顺带证明了"这两把 key 真由那个栈管理"。
+    这条用例的 fake **完全不提供任何函数 tag**——只要实现回头去读 tag 就会失败。
+    """
+    g = _gate()
+    cfn = _fake_cfn(router_policy=DENY_ALL)
+    facts = _with_router_cfg(lambda: g.router_and_deployer_stacks(
+        {"cloudformation": cfn},
+        edge_fn_arn="arn:aws:lambda:r:1:function:ApplicationWebRouterStack-origin-request",
+        cmk_arns=("arn:aws:kms:r:1:key/kid-site", "arn:aws:kms:r:1:key/kid-console")))
+    by = {f.label: f for f in facts}
+    assert set(by) == {"router", "deployer"}, sorted(by)
+    assert by["deployer"].resource == "arn:stack/DeployerStack"
+    assert by["deployer"].controls == frozenset({g.model.CONTROLS_SESSION_KEY})
+    assert by["router"].guard == g.model.GUARD_PROTECTED
     assert all(f.premises_verified is False for f in facts)
-    assert by_label["deployer"].controls == frozenset({g.model.CONTROLS_SESSION_KEY})
+    # 反查真的发生了（而不是回头读 tag）
+    assert any(kind == "reverse" for kind, _ in cfn.calls)
+
+
+def test_no_deployer_stack_is_invented_when_the_cmks_are_not_cfn_managed():
+    """两把 CMK 反查不到任何栈 ⇒ 「改栈模板改 key policy」这条路**不存在**，
+    不编造一个 deployer 栈，也不硬失败。"""
+    g = _gate()
+    facts = _with_router_cfg(lambda: g.router_and_deployer_stacks(
+        {"cloudformation": _fake_cfn(cmk_stack="", router_policy=DENY_ALL)},
+        edge_fn_arn="arn:aws:lambda:r:1:function:ApplicationWebRouterStack-origin-request",
+        cmk_arns=("arn:aws:kms:r:1:key/kid-site",)))
+    assert {f.label for f in facts} == {"router"}
+
+
+def test_edge_membership_that_cannot_be_proven_keeps_the_path_visible():
+    """反查不到 Edge 函数属于 router 栈时**不摘掉** `edge-verifier` control——
+    摘掉等于让那条 CFN 路径从视野里消失（false-green）。保留 control + 不定论。"""
+    g = _gate()
+    facts = _with_router_cfg(lambda: g.router_and_deployer_stacks(
+        {"cloudformation": _fake_cfn(edge_stack="", router_policy=DENY_ALL)},
+        edge_fn_arn="arn:aws:lambda:r:1:function:ApplicationWebRouterStack-origin-request",
+        cmk_arns=("arn:aws:kms:r:1:key/kid-site",)))
+    router = next(f for f in facts if f.label == "router")
+    assert g.model.CONTROLS_EDGE in router.controls
+    assert router.premises_verified is False
+
+
+def test_observed_entry_reads_the_function_url_instead_of_assuming_latest():
+    """入口类型是**观测值**（R1-L3）：未限定 URL 在 ⇒ latest；不在但有 alias ⇒ alias；
+    都看不到 ⇒ unknown，**不许默认成 latest**。"""
+    g = _gate()
+
+    class NotFound(Exception):
+        pass
+    NotFound.__name__ = "ResourceNotFoundException"
+
+    class Lam:
+        def __init__(self, has_url):
+            self.has_url = has_url
+
+        def get_function_url_config(self, FunctionName):
+            if self.has_url:
+                return {"AuthType": "AWS_IAM"}
+            raise NotFound()
+
+    assert g.observed_entry(Lam(True), "site-panel", {}) == g.model.ENTRY_LATEST
+    assert g.observed_entry(Lam(False), "site-panel",
+                           {"site-panel": ("blue",)}) == g.model.ENTRY_ALIAS
+    assert g.observed_entry(Lam(False), "site-panel", {}) == g.model.ENTRY_UNKNOWN
+
+
+def test_a_second_service_role_is_drift_not_silence():
+    """**R1-L3**：service role 压成一个 `cfn-service` 时，"又多一个栈的执行角色可 PassRole"
+    前后 grants 完全一样（实测 report_ok=True / new_grants=[]）。按栈标签分开记之后必须红。"""
+    g = _gate()
+    before = g.Targets(platform_functions=(), site_functions=(),
+                       service_roles_by_label={"router": "arn:aws:iam::1:role/r-exec"})
+    after = g.Targets(platform_functions=(), site_functions=(),
+                      service_roles_by_label={"router": "arn:aws:iam::1:role/r-exec",
+                                              "deployer": "arn:aws:iam::1:role/d-exec"})
+    dec = {"iam:PassRole|arn:aws:iam::1:role/r-exec": "allowed",
+           "iam:PassRole|arn:aws:iam::1:role/d-exec": "allowed"}
+    g_before = g.grants_from_decisions(dec, before)
+    g_after = g.grants_from_decisions(dec, after)
+    assert g_before == {"pass-role:cfn-service@router"}
+    assert g_after == {"pass-role:cfn-service@router", "pass-role:cfn-service@deployer"}
+    rep = g.compare_to_baseline(
+        {"fp1": {"name": "r1", "arn": "arn:aws:iam::1:role/r1", "kind": "role",
+                 "grants": sorted(g_after), "capabilities": []}},
+        {"schema": g.BASELINE_SCHEMA,
+         "principals": {"fp1": {"category": "admin", "grants": sorted(g_before),
+                                "capabilities": []}}}, required={})
+    assert rep.new_grants and not rep.ok, "多一个 service role 竟然没红"
+
+
+def test_both_collectors_use_the_same_new_function_candidates():
+    """**R1-L3**：闸门与探针各写一份候选名字，会让同一个账号事实在两个入口得出不同标签。
+    规则住在共享模型里，两边都调它。"""
+    g = _gate()
+    src_gate = _SCRIPT.read_text(encoding="utf-8")
+    src_probe = (_ROOT / "site-builder" / "scripts"
+                 / "probe_impersonation_surface.py").read_text(encoding="utf-8")
+    assert "new_function_candidates(" in src_gate
+    assert "new_function_candidates(" in src_probe
+    for src in (src_gate, src_probe):
+        assert "probe-placeholder" not in src, "还有一份自己写的候选名字"
+
+    def fn_arn(n):
+        return f"arn:aws:lambda:r:1:function:{n}"
+    assert g.model.new_function_candidates(fn_arn, "RouterStack") == (
+        fn_arn("sb-probe-new-function"), fn_arn("RouterStack-probe-new-function"))
 
 
 def test_the_gate_uses_the_guard_predicate_not_policy_problems():

@@ -141,6 +141,19 @@ class Surface:
     verifier_role_name: str = "site-builder-verifier"
 
 
+def new_function_candidates(fn_arn, router_stack: str) -> tuple:
+    """"新建函数再关联"那条路要探的候选 ARN。**两个采集方必须用同一份规则**（R1-L3）。
+
+    闸门与探针各写一份名字的后果不是"盲区大小不同"，而是**同一个账号事实在两个入口得出
+    不同标签**：对候选 A 的精确 `CreateFunction` 授权，一边记 `edge:new-function+associate`、
+    另一边记空集。所以规则住在共享模型里，两边都调它。
+
+    两个候选：一个中性名、一个与 router 栈同前缀 —— 为的是缩小"按名字前缀授权"的盲区。
+    **它们只能代表这两个名字**，不能代表任意新函数名（spec §9 的已记盲区）。
+    """
+    return (fn_arn("sb-probe-new-function"), fn_arn(f"{router_stack}-probe-new-function"))
+
+
 def replace_fn(s: Surface, which: str, **changes) -> Surface:
     """测试辅助：换掉 `auth` / `panel` / `edge` 的某个观测字段，其余不动。"""
     return replace(s, **{which: replace(getattr(s, which), **changes)})

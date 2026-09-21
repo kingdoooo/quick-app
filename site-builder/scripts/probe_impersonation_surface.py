@@ -87,7 +87,6 @@ EVIDENCE = _ROOT / "docs" / "security" / "3c-impersonation-surface.json"
 if str(_HERE) not in sys.path:      # 测试用 spec_from_file_location 加载本文件时本目录不在 sys.path
     sys.path.insert(0, str(_HERE))
 import _impersonation_model as model              # noqa: E402
-from _stack_policy_guard import guard_for         # noqa: E402
 
 classify = model.classify
 summarize = model.summarize
@@ -157,44 +156,10 @@ def session_key_arns() -> tuple[str, ...]:
     return tuple(dict.fromkeys(r.key_arn for r in key_refs(keys, ("site", "console"))))
 
 
-def _stack_logical_ids(cfn, stack: str, types: tuple[str, ...]) -> list[str]:
-    """栈里这些资源类型的 `LogicalResourceId`。guard 谓词要按它们判"拦住了什么"。"""
-    out = []
-    for page in cfn.get_paginator("list_stack_resources").paginate(StackName=stack):
-        for r in page["StackResourceSummaries"]:
-            if r["ResourceType"] in types:
-                out.append(r["LogicalResourceId"])
-    return sorted(out)
-
-
-def _stack_facts(cfn, router_stack: str, deployer_stack: str) -> tuple:
-    """两个栈的**观测**事实：guard、service role、控制什么、前提是否核实。
-
-    **router 栈自 ADR 0007 起有 stack policy**（对四个精确逻辑 ID `Deny Update:*`），
-    所以"能 UpdateStack 就能替换 Edge"这条推理现在要看 guard；deployer 栈拥有两把会话
-    签名 CMK（`infra/app.py` 的 `kms.Key`）⇒ 它是一条**签名**路径，与 Edge 那条不同。
-
-    `premises_verified` 一律 False：谁执行这次更新已经观测到了（`RoleARN`），但
-    "那个身份是否真能改目标资源"还没核 ⇒ 判定落 `*-unanalyzed`（单列、不进并集）。
-    这是刻意的下界，见 spec §9。
-    """
-    plan = ((router_stack, "router", frozenset({model.CONTROLS_EDGE}),
-             ("AWS::Lambda::Function", "AWS::CloudFront::Distribution",
-              "AWS::DynamoDB::Table")),
-            (deployer_stack, "deployer", frozenset({model.CONTROLS_SESSION_KEY}),
-             ("AWS::KMS::Key",)))
-    facts = []
-    for name, label, controls, types in plan:
-        body = cfn.get_stack_policy(StackName=name).get("StackPolicyBody")
-        described = cfn.describe_stacks(StackName=name)["Stacks"][0]
-        facts.append(model.StackFact(
-            resource=described["StackId"], label=label,
-            guard=guard_for(json.loads(body) if body else None,
-                            _stack_logical_ids(cfn, name, types)),
-            service_role=described.get("RoleARN"), controls=controls,
-            premises_verified=False))
-    return tuple(facts)
-
+# 栈发现**直接用闸门那一份**（`gate.router_and_deployer_stacks`）：两个采集方各写一份的
+# 后果不是"实现重复"，而是同一个账号事实在两个入口得出不同结论（R1-L3 实测过候选函数名
+# 那一处）。闸门那份按物理资源反查归属，不依赖任何函数的 CloudFormation tag
+# （auth 是裸 create_function 建的，根本没有那个 tag）。
 
 def sim_groups(s) -> tuple:
     """按服务分组批量模拟。跨服务混在一条调用里会产生大量无意义的 action×resource
@@ -269,36 +234,31 @@ def discover(gate, clients, region: str, account: str):
     edge_role = clients["lambda"].get_function(
         FunctionName=edge_fn)["Configuration"]["Role"]
 
-    # deployer 栈名从平台函数的 CloudFormation tag 反查（**不手抄栈名**，与闸门
-    # `edge_asset_location` 同一手法）。它拥有两把会话签名 CMK ⇒ 一条独立的签名路径。
-    tags = clients["lambda"].get_function(
-        FunctionName="site-auth-service").get("Tags") or {}
-    deployer_stack = tags.get("aws:cloudformation:stack-name", "")
-    if not deployer_stack:
-        raise SystemExit(
-            "site-auth-service 没有 CloudFormation stack tag——推不出 deployer 栈名。"
-            "那个栈拥有两把会话签名 CMK，漏掉它就漏掉一条签名路径。")
-
-    stacks = _stack_facts(clients["cloudformation"], stack_name, deployer_stack)
+    keys = session_key_arns()
+    stacks = gate.router_and_deployer_stacks(
+        clients, edge_fn_arn=fn(edge_fn), cmk_arns=keys)
     print(f"Edge association 限定符 = 编号版本 {','.join(numbered)}"
           f"（单动作模型不成立的前提，已实测）；"
           f"栈 guard：{', '.join(f'{st.label}={st.guard}' for st in stacks)}",
           flush=True)
 
     return model.Surface(
-        kms_keys=session_key_arns(),
-        auth=model.FnFact(fn("site-auth-service"), entry=model.ENTRY_LATEST,
+        kms_keys=keys,
+        # 入口类型**观测**，不写死（R1-L3）；`aliases` 传空字典即"没看到 alias"。
+        auth=model.FnFact(fn("site-auth-service"),
+                          entry=gate.observed_entry(clients["lambda"],
+                                                    "site-auth-service", {}),
                           layers_supported=True),
-        panel=model.FnFact(fn("site-panel"), entry=model.ENTRY_LATEST,
+        panel=model.FnFact(fn("site-panel"),
+                           entry=gate.observed_entry(clients["lambda"],
+                                                     "site-panel", {}),
                            layers_supported=True),
         # `entry` 由上面那段 association 观测**硬保证**是编号版本。
         # Lambda@Edge **不支持 Layer**（AWS 文档）⇒ 改配置不等于任意代码执行。
         edge=model.FnFact(fn(edge_fn), entry=model.ENTRY_VERSION,
                           layers_supported=False),
-        # 两个候选：一个中性名、一个与 router 栈同前缀 ⇒ 缩小"按名字前缀授权"的盲区。
-        # **它们只能代表这两个名字**，不能代表任意新函数名（spec §9 的已记盲区）。
-        new_candidates=(fn("probe-placeholder-new-function"),
-                        fn(f"{stack_name}-probe-placeholder")),
+        # 候选名字规则**住在共享模型里**，闸门调的是同一份（R1-L3）。
+        new_candidates=model.new_function_candidates(fn, stack_name),
         distribution=f"arn:aws:cloudfront::{account}:distribution/{dist_id}",
         edge_role=edge_role,
         stacks=stacks,

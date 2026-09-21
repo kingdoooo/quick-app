@@ -110,13 +110,25 @@ def test_self_test_delegates_to_the_shared_model(probe, capsys):
 def test_the_stale_no_stack_policy_premise_is_gone(probe):
     """ADR 0007 之后"router 栈**没有** stack policy"是过期前提。
 
-    按**语义**判而不是按"这几个字出现过"判：探针必须真的去观测 guard
-    （`guard_for` + `get_stack_policy`），而不是把它写成常量或假设。
+    探针现在**不自己判** guard：栈发现整段委派给闸门的 `router_and_deployer_stacks`
+    （R1-L3——两个采集方各写一份会让同一个账号事实在两个入口得出不同结论）。
+    所以这条断言的是"过期前提不在了"+"确实委派了"，而不是"探针自己调了 guard_for"。
     """
     src = _SCRIPT.read_text(encoding="utf-8")
     assert "且**无 stack policy**" not in src, "过期前提还在源码里"
-    assert "guard_for(" in src and "get_stack_policy" in src, \
-        "探针没有观测 guard——那它又在假设了"
+    assert "gate.router_and_deployer_stacks(" in src, "探针没有委派给闸门的栈发现"
+    assert "def _stack_facts(" not in src, "探针又自己写了一份栈发现"
+
+
+def test_probe_does_not_derive_the_stack_from_a_function_tag(probe):
+    """**R1-L3 blocker 的回归守卫**：`auth/deploy_auth.py` 用裸 `create_function` 建
+    auth、不传 Tags、不经 CFN ⇒ 任何"从函数的 aws:cloudformation:stack-name 推导栈名"
+    的写法在正常部署里都会失败。探针与闸门都不许再走那条路。
+    """
+    for rel in ("probe_impersonation_surface.py", "verify_account_trust_boundary.py"):
+        src = (_ROOT / "site-builder" / "scripts" / rel).read_text(encoding="utf-8")
+        assert "aws:cloudformation:stack-name" not in src or "edge_asset_location" in src, \
+            f"{rel} 还在按函数 tag 推导栈名"
 
 
 def test_sim_groups_covers_every_action_class_the_model_consumes(probe):
@@ -167,53 +179,6 @@ def test_sim_groups_drops_empty_resource_groups(probe):
         edge_role="", stacks=(), service_roles=())
     for actions, resources in probe.sim_groups(s):
         assert resources, actions
-
-
-def test_stack_facts_observes_guard_service_role_and_both_labels(probe):
-    """`_stack_facts` 必须把 guard、service role、控制面都**观测**出来，
-    且 `premises_verified` 保持 False（前提未核 ⇒ 判定落 *-unanalyzed）。"""
-    import json as _json
-    calls = {"policy": [], "describe": [], "resources": []}
-
-    class FakeCfn:
-        def get_stack_policy(self, StackName):
-            calls["policy"].append(StackName)
-            if StackName == "RouterStack":
-                return {"StackPolicyBody": _json.dumps({"Statement": [
-                    {"Effect": "Allow", "Action": "Update:*", "Principal": "*",
-                     "Resource": "*"},
-                    {"Effect": "Deny", "Action": "Update:*", "Principal": "*",
-                     "Resource": "LogicalResourceId/OriginRequestFunctionAAAAAAAA"}]})}
-            return {}
-
-        def describe_stacks(self, StackName):
-            calls["describe"].append(StackName)
-            return {"Stacks": [{"StackId": f"arn:stack/{StackName}",
-                                "RoleARN": "arn:aws:iam::1:role/cfn-exec"}]}
-
-        def get_paginator(self, name):
-            assert name == "list_stack_resources", name
-            outer = calls
-
-            class P:
-                def paginate(self, StackName):
-                    outer["resources"].append(StackName)
-                    return iter([{"StackResourceSummaries": [
-                        {"ResourceType": "AWS::Lambda::Function",
-                         "LogicalResourceId": "OriginRequestFunctionAAAAAAAA"}]}])
-            return P()
-
-    facts = probe._stack_facts(FakeCfn(), "RouterStack", "DeployerStack")
-    by_label = {f.label: f for f in facts}
-    assert set(by_label) == {"router", "deployer"}
-    # router 的那份 Deny 覆盖了它唯一的受保护逻辑 ID ⇒ protected
-    assert by_label["router"].guard == probe.model.GUARD_PROTECTED
-    # deployer 没有 stack policy ⇒ open（"没有策略"是**已知**的 open，不是 unknown）
-    assert by_label["deployer"].guard == probe.model.GUARD_OPEN
-    assert all(f.service_role == "arn:aws:iam::1:role/cfn-exec" for f in facts)
-    assert all(f.premises_verified is False for f in facts)
-    assert by_label["router"].controls == frozenset({probe.model.CONTROLS_EDGE})
-    assert by_label["deployer"].controls == frozenset({probe.model.CONTROLS_SESSION_KEY})
 
 
 def test_evidence_records_the_observed_guards(probe):
