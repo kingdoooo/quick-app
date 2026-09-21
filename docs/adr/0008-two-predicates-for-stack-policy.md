@@ -16,12 +16,24 @@ date: 2026-09-21
 `site-builder/scripts/_stack_policy_guard.guard_for(policy, logical_ids)`，只回答
 "这些逻辑 ID 的 Update 被拒了吗"，且**三值**：
 
-| 观测 | guard |
+判定按**逐个逻辑 ID**做三步，因为 **CFN stack policy 是"有策略即默认保护"**
+（AWS Prescriptive Guidance《CloudFormation stack policies》，2026-09-22 查：*By default,
+a stack policy helps protect all resources in the stack… To allow updates for specific
+resources, you include an explicit `Allow` statement*）：
+
+| 该 ID 的观测 | 结果 |
 |---|---|
-| 无 stack policy | `open` |
-| Deny 覆盖了**每一个**受保护逻辑 ID（`Update:*` 或三个具体 Update 动作全集、`Principal: *`、无 Condition） | `protected` |
-| 能解析但没覆盖全 | `open` |
-| 解析不动（未识别语法、带 Condition、`Principal` 不是 `*`、读不到） | `unknown` |
+| 有覆盖它的 Deny（`Update:*` 或三个具体 Update 动作全集、`Principal: *`、无 Condition） | 受保护（显式 Deny 优先） |
+| 否则有覆盖它的 Allow（沾到任一 `Update:*` 动作即算） | 开放 |
+| 两者都没有 | **受保护**（默认拒） |
+
+整栈的 guard = 任一 ID 开放即 `open`，全部受保护才 `protected`；
+无 stack policy = `open`；解析不动（未识别 Effect、带 Condition 的 Deny **或 Allow**、
+`Principal` 不是 `*`、读不到）一律 `unknown`。
+
+**只看 Deny 是不够的**（本谓词第一版的缺陷，R1-L2 复审时发现）：一份没有 Allow-all 的策略
+其实保护着受保护 ID，而只找 Deny 会判成 `open`。那个方向对安全闸门是保守的（高报风险），
+但它会让"改成默认拒的策略"这种真实加固**认不出来**。
 
 `unknown` **不得**按"没拦住"解释，也不得按"拦住了"解释：持 CFN 更新权的 principal 在
 `unknown` 下只拿到 `edge:cfn-template-unanalyzed`（单列、不进冒充面并集）。

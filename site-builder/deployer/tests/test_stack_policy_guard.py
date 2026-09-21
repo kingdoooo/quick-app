@@ -142,3 +142,61 @@ def test_open_policy_from_the_project_is_judged_open(g, sp):
     """`router_stack_policy.py open` 写的那份（等于没有保护）必须判成 `open`——
     忘了 `apply` 的那个窗口里，闸门应当看到保护是开着的。"""
     assert g.guard_for(sp.OPEN_POLICY, IDS) == g.GUARD_OPEN
+
+
+# ---- R1-L2：stack policy 是"有策略即默认保护"，只看 Deny 不够 ---------------------
+#
+# 文档已验证（AWS Prescriptive Guidance《CloudFormation stack policies》，2026-09-22 查）：
+# "By default, a stack policy helps protect all resources in the stack... To allow updates
+# for specific resources, you include an explicit `Allow` statement."
+# ⇒ 逐 ID 判定：覆盖它的 Deny > 覆盖它的 Allow > 默认拒。
+
+
+def _allow(resources, actions=("Update:*",), **extra):
+    return {"Statement": [
+        {"Effect": "Allow", "Action": list(actions), "Principal": "*",
+         "Resource": list(resources), **extra}]}
+
+
+def test_policy_without_any_allow_protects_by_default(g):
+    """只写了针对**别的**资源的 Deny、没有任何 Allow ⇒ 我们关心的 ID 按默认拒受保护。
+    只找 Deny 的那一版会把它判成 open（把真实加固读成"没保护"）。"""
+    policy = _deny(["LogicalResourceId/SomethingElse"])
+    del policy["Statement"][0]          # 去掉 Allow-all，只留那条 Deny
+    assert g.guard_for(policy, IDS) == g.GUARD_PROTECTED
+
+
+def test_allow_scoped_to_other_resources_still_protects_ours(g):
+    """Allow 只放开别的资源 ⇒ 我们的 ID 仍按默认拒受保护。"""
+    assert g.guard_for(_allow(["LogicalResourceId/SomethingElse"]),
+                       IDS) == g.GUARD_PROTECTED
+
+
+def test_allow_all_opens_everything(g):
+    """`router_stack_policy.py open` 写的那份就是 Allow-all ⇒ open。"""
+    assert g.guard_for(_allow(["*"]), IDS) == g.GUARD_OPEN
+
+
+def test_partial_deny_with_allow_all_is_open(g):
+    """Allow-all + 只 Deny 两个 ID ⇒ 另外两个被放开 ⇒ open（任一 ID 开放即不算受保护）。"""
+    policy = _deny([f"LogicalResourceId/{i}" for i in IDS[:2]])
+    assert g.guard_for(policy, IDS) == g.GUARD_OPEN
+
+
+def test_allow_touching_only_update_modify_opens_it(g):
+    """Edge 换码是 `Update:Modify` ⇒ 只放开 Modify 也足以让那条路开着。"""
+    assert g.guard_for(_allow(["*"], actions=("Update:Modify",)),
+                       IDS) == g.GUARD_OPEN
+
+
+def test_conditioned_allow_is_unknown(g):
+    """Allow 带 Condition 是否生效要求值 ⇒ 不猜，返回 unknown。
+    （只对 Deny 侧检查 Condition 会让这种策略被当成确定的 open。）"""
+    assert g.guard_for(_allow(["*"], Condition={"StringEquals": {"x": "y"}}),
+                       IDS) == g.GUARD_UNKNOWN
+
+
+def test_unknown_effect_is_unknown(g):
+    policy = {"Statement": [{"Effect": "Sometimes", "Action": "Update:*",
+                             "Principal": "*", "Resource": "*"}]}
+    assert g.guard_for(policy, IDS) == g.GUARD_UNKNOWN
