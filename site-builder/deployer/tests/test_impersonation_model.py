@@ -359,3 +359,99 @@ def test_all_labels_is_exhaustive(m):
                if k.startswith(("S_", "E_")) and isinstance(v, str)
                and (v.startswith(m.SIGN_PREFIX) or v.startswith(m.EDGE_PREFIX))}
     assert defined == set(m.ALL_LABELS)
+
+
+# ---- 变形/元测试：去掉守卫必须能复现缺陷 -----------------------------------------
+#
+# 这些用例从**外面**改模型的常量，再断言上面那批反例转红。它们防的是本仓库反复吃到的
+# 那类：守卫看着绿，其实什么都没证明。
+
+
+def _cases_pass(mod) -> bool:
+    """把上面那批断言压成一个布尔：任一条不成立就 False。
+
+    只挑**每条变形真正针对**的那几个判定，避免变形测试之间互相遮蔽。
+    """
+    s = mod.fake_surface()
+    from dataclasses import replace
+    router_open = replace(s, stacks=(mod.fake_stack(
+        "router", controls=frozenset({mod.CONTROLS_EDGE}),
+        guard=mod.GUARD_OPEN, premises_verified=True),))
+    router_protected = replace(s, stacks=(mod.fake_stack(
+        "router", controls=frozenset({mod.CONTROLS_EDGE}),
+        guard=mod.GUARD_PROTECTED, premises_verified=True),))
+    checks = [
+        # 配置更新不等于代码更新（Edge 上什么都不构成）
+        mod.classify(frozenset({f"lambda:UpdateFunctionConfiguration|{s.edge.arn}",
+                                f"cloudfront:UpdateDistribution|{s.distribution}"}), s)
+        == set(),
+        # 建函数那条路不需要 PublishVersion
+        mod.classify(frozenset({f"lambda:CreateFunction|{s.new_candidates[0]}",
+                                f"iam:PassRole|{s.edge_role}",
+                                f"cloudfront:UpdateDistribution|{s.distribution}"}), s)
+        == {mod.E_NEW_FUNCTION},
+        # guard=protected 下直接更新那条路关闭
+        mod.classify(frozenset({"cloudformation:UpdateStack|STACK_ROUTER"}),
+                     router_protected) == {mod.E_CFN_TEMPLATE_UNANALYZED},
+        # guard=open 下成立
+        mod.classify(frozenset({"cloudformation:UpdateStack|STACK_ROUTER"}),
+                     router_open) == {mod.E_CFN_UPDATE_STACK},
+        # change-set 单独不够
+        mod.classify(frozenset({"cloudformation:CreateChangeSet|STACK_ROUTER"}),
+                     router_open) == set(),
+        # 未分析标签不进并集
+        mod.summarize({"p": {mod.E_CFN_TEMPLATE_UNANALYZED}})[
+            "impersonation_surface_union"] == 0,
+    ]
+    return all(checks)
+
+
+def test_the_case_set_passes_unmutated(m):
+    assert _cases_pass(m) is True
+
+
+def test_goes_red_when_code_and_config_are_lumped_together(m):
+    """把配置更新并回代码类 ⇒ `UpdateFunctionConfiguration(Edge)` 又会产出 Edge 能力。"""
+    m.A_UPDATE_CODE = ("lambda:UpdateFunctionCode", "lambda:UpdateFunctionConfiguration")
+    assert _cases_pass(m) is False
+
+
+def test_goes_red_when_publish_version_is_required_again(m):
+    """把 `PublishVersion` 加回新建函数那条路的前提 ⇒ 少算重现。"""
+    original = m.classify
+
+    def patched(allowed, s, name=""):
+        labels = original(allowed, s, name)
+        if m.E_NEW_FUNCTION in labels and not any(
+                f"lambda:PublishVersion|{c}" in allowed for c in s.new_candidates):
+            labels.discard(m.E_NEW_FUNCTION)
+        return labels
+
+    m.classify = patched
+    assert _cases_pass(m) is False
+
+
+def test_goes_red_when_guard_is_ignored(m):
+    """把 guard 判据删掉（protected 也算通过）⇒ 假绿重现。"""
+    original = m.classify
+
+    def patched(allowed, s, name=""):
+        from dataclasses import replace
+        opened = replace(s, stacks=tuple(replace(st, guard=m.GUARD_OPEN)
+                                         for st in s.stacks))
+        return original(allowed, opened, name)
+
+    m.classify = patched
+    assert _cases_pass(m) is False
+
+
+def test_goes_red_when_unanalyzed_labels_enter_the_union(m):
+    """把未分析标签并进冒充面 ⇒ 并集断言转红（数字会凭空变大）。"""
+    m.NON_SURFACE_LABELS = frozenset({m.S_FIXTURE_ISSUER})
+    assert _cases_pass(m) is False
+
+
+def test_goes_red_when_changeset_chain_needs_only_one_action(m):
+    """只要 `CreateChangeSet` 就算 ⇒ "建了不能执行"那条反例转红。"""
+    m.A_CFN_EXECUTE_CHANGESET = ("cloudformation:CreateChangeSet",)
+    assert _cases_pass(m) is False
