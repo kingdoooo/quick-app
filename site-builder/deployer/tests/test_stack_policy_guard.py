@@ -200,3 +200,64 @@ def test_unknown_effect_is_unknown(g):
     policy = {"Statement": [{"Effect": "Sometimes", "Action": "Update:*",
                              "Principal": "*", "Resource": "*"}]}
     assert g.guard_for(policy, IDS) == g.GUARD_UNKNOWN
+
+
+# ---- R1-L2 第二轮：按 (ID, 具体动作) 合并，且不可解析的语法一律 unknown --------------
+#
+# 文档已验证（《Prevent updates to stack resources》与 Prescriptive Guidance，2026-09-22 查）：
+# stack policy 支持 NotAction / NotResource，且未显式允许的更新默认被拒、Deny 覆盖 Allow。
+
+
+def test_three_separate_denies_add_up_to_full_protection(g):
+    """三条各写一个具体 Update 动作的 Deny 合起来等于 `Update:*`。
+
+    要求**单条**语句一次覆盖三个动作的写法会把这种策略判成 open ——真实保护被读成没保护。
+    """
+    policy = {"Statement": [
+        {"Effect": "Allow", "Action": "Update:*", "Principal": "*", "Resource": "*"},
+        {"Effect": "Deny", "Action": "Update:Modify", "Principal": "*", "Resource": "*"},
+        {"Effect": "Deny", "Action": "Update:Replace", "Principal": "*", "Resource": "*"},
+        {"Effect": "Deny", "Action": "Update:Delete", "Principal": "*", "Resource": "*"}]}
+    assert g.guard_for(policy, IDS) == g.GUARD_PROTECTED
+
+
+def test_denying_only_modify_is_open_because_replace_also_swaps_the_code(g):
+    """只拒 Modify 不够：`Update:Replace` 把整个函数资源换掉，同样改变正在执行的 Edge 代码。
+    门槛取"三个动作都要被拒"，宁可高报风险。"""
+    policy = {"Statement": [
+        {"Effect": "Allow", "Action": "Update:*", "Principal": "*", "Resource": "*"},
+        {"Effect": "Deny", "Action": "Update:Modify", "Principal": "*", "Resource": "*"}]}
+    assert g.guard_for(policy, IDS) == g.GUARD_OPEN
+
+
+def test_not_resource_is_unknown_not_protected(g):
+    """**方向最要紧的一条**：`Allow Update:* NotResource <别的>` 实际**放开**了我们的 ID。
+
+    把 NotResource 当成"没写 Resource"会判成 protected ⇒ **低报风险**，正是安全闸门最不能
+    犯的错。解析不了就说 unknown。
+    """
+    policy = {"Statement": [{"Effect": "Allow", "Action": "Update:*", "Principal": "*",
+                             "NotResource": "LogicalResourceId/Other"}]}
+    assert g.guard_for(policy, IDS) == g.GUARD_UNKNOWN
+
+
+def test_not_action_is_unknown(g):
+    policy = {"Statement": [
+        {"Effect": "Allow", "Action": "Update:*", "Principal": "*", "Resource": "*"},
+        {"Effect": "Deny", "NotAction": "Update:Delete", "Principal": "*", "Resource": "*"}]}
+    assert g.guard_for(policy, IDS) == g.GUARD_UNKNOWN
+
+
+def test_unrecognised_statement_key_is_unknown(g):
+    """未见过的字段同理：不猜它的语义。"""
+    policy = {"Statement": [{"Effect": "Deny", "Action": "Update:*", "Principal": "*",
+                             "Resource": "*", "SomeFutureField": "x"}]}
+    assert g.guard_for(policy, IDS) == g.GUARD_UNKNOWN
+
+
+def test_statements_unrelated_to_update_do_not_open_anything(g):
+    """与 Update 无关的动作（stack policy 里没有这种，但别人可能写）不影响判定：
+    它既不拒也不放开 ⇒ 默认拒仍然成立。"""
+    policy = {"Statement": [{"Effect": "Allow", "Action": "SomethingElse:*",
+                             "Principal": "*", "Resource": "*"}]}
+    assert g.guard_for(policy, IDS) == g.GUARD_PROTECTED

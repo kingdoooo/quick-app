@@ -21,15 +21,25 @@ date: 2026-09-21
 a stack policy helps protect all resources in the stack… To allow updates for specific
 resources, you include an explicit `Allow` statement*）：
 
-| 该 ID 的观测 | 结果 |
-|---|---|
-| 有覆盖它的 Deny（`Update:*` 或三个具体 Update 动作全集、`Principal: *`、无 Condition） | 受保护（显式 Deny 优先） |
-| 否则有覆盖它的 Allow（沾到任一 `Update:*` 动作即算） | 开放 |
-| 两者都没有 | **受保护**（默认拒） |
+判定的粒度是 **(逻辑 ID, 具体 Update 动作)**，`Update:*` 先展开成
+`Update:Modify` / `Update:Replace` / `Update:Delete` 再按动作合并（三条各写一个动作的 Deny
+合起来等于 `Update:*`；要求单条语句一次覆盖三个动作会把那种写法读成"没保护"）：
 
-整栈的 guard = 任一 ID 开放即 `open`，全部受保护才 `protected`；
-无 stack policy = `open`；解析不动（未识别 Effect、带 Condition 的 Deny **或 Allow**、
-`Principal` 不是 `*`、读不到）一律 `unknown`。
+| 该 (ID, 动作) 的观测 | 结果 |
+|---|---|
+| 有覆盖它的 Deny | 拒（显式 Deny 优先） |
+| 否则有覆盖它的 Allow | 放开 |
+| 两者都没有 | **拒**（默认保护） |
+
+整栈 `protected` = **每个** ID 的**三个**动作都落在"拒"；任一被放开即 `open`。
+取"三个都要拒"这个较严的门槛是刻意的：`Update:Modify` 换 Lambda 的 `Code`、
+`Update:Replace` 换掉整个函数资源，两条都改变正在执行的 Edge 代码。
+无 stack policy = `open`。
+
+**解析不了就 `unknown`，不许当"没写"**：`NotAction` / `NotResource` / `Condition` /
+任何未识别字段、`Effect` 不是 Deny/Allow、`Principal` 不是 `*` 都落 `unknown`。
+这一条的方向最要紧——`Allow Update:* NotResource <别的>` 实际**放开**了我们的 ID，
+把它当"没写 Resource"会判成 `protected`，那是**低报风险**。
 
 **只看 Deny 是不够的**（本谓词第一版的缺陷，R1-L2 复审时发现）：一份没有 Allow-all 的策略
 其实保护着受保护 ID，而只找 Deny 会判成 `open`。那个方向对安全闸门是保守的（高报风险），

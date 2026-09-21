@@ -23,6 +23,28 @@ GUARD_UNKNOWN = "unknown"
 # 测试里的 `build_policy` round-trip 咬住，不是靠常量相等。
 CONCRETE_UPDATE_ACTIONS = ("Update:Modify", "Update:Replace", "Update:Delete")
 
+# 本谓词**能解析**的语句字段。出现别的字段（`NotAction` / `NotResource` / `Condition` /
+# 任何没见过的键）一律 `unknown`——CFN stack policy 确实支持 NotAction/NotResource
+# （文档已验证：Prevent updates to stack resources，2026-09-22 查），而把它们当成"没写"
+# 会给出**方向错误**的答案：`Allow Update:* NotResource <别的>` 实际放开了我们的 ID，
+# 按"没写 Resource"算会判成受保护 ⇒ **低报风险**，正是安全闸门最不能犯的那种错。
+_PARSEABLE_KEYS = frozenset({"Effect", "Action", "Principal", "Resource", "Sid"})
+
+
+def _update_actions(actions: set) -> set:
+    """Action 集合 → 它覆盖的**具体** Update 动作集合。
+
+    `Update:*`（或裸 `*`）展开成三个。**必须展开再按动作合并**：三条各写一个具体动作的
+    Deny 合起来等于 `Update:*`，而"要求单条语句一次覆盖三个动作"会把那种写法判成没保护。
+    """
+    out: set = set()
+    for a in actions:
+        if a in ("Update:*", "*"):
+            out |= set(CONCRETE_UPDATE_ACTIONS)
+        elif a in CONCRETE_UPDATE_ACTIONS:
+            out.add(a)
+    return out
+
 
 def _as_list(v) -> list:
     return [v] if isinstance(v, str) else list(v or [])
@@ -43,21 +65,23 @@ def guard_for(policy: dict | None, logical_ids: list) -> str:
     **CFN stack policy 是"有策略即默认保护"**（AWS Prescriptive Guidance
     《CloudFormation stack policies》，2026-09-22 查：*By default, a stack policy helps
     protect all resources in the stack... To allow updates for specific resources, you
-    include an explicit `Allow` statement*）。所以逐个逻辑 ID 的判定是三步：
+    include an explicit `Allow` statement*）。所以判定是**逐 (逻辑 ID, 具体 Update 动作)**
+    做的，三步：
 
-      1. 有覆盖它的 Deny ⇒ 受保护（显式 Deny 优先于 Allow）；
-      2. 否则有覆盖它的 Allow ⇒ 开放；
-      3. 都没有 ⇒ **受保护**（默认拒）。
+      1. 有覆盖它的 Deny ⇒ 拒（显式 Deny 优先于 Allow）；
+      2. 否则有覆盖它的 Allow ⇒ 放开；
+      3. 都没有 ⇒ **拒**（默认保护）。
 
-    **只看 Deny 是不够的**（本函数第一版的缺陷）：一份没有 Allow-all 的策略（比如只写了
-    针对别的资源的 Allow）其实保护着我们关心的 ID，而只找 Deny 会把它判成 `open`。
-    那个方向对安全闸门是保守的（高报风险），但它会让"改成默认拒的策略"这种真实加固
-    **认不出来**，闸门继续声称那条路是开的。
+    整栈 `protected` 的条件是：**每个** ID 的**三个** Update 动作都落在"拒"。任一被放开即
+    `open`。取"三个都要拒"这个较严的门槛是刻意的——`Update:Modify` 换 Lambda 的 Code、
+    `Update:Replace` 换掉整个函数资源，两条都改变正在执行的 Edge 代码，所以不能只看 Modify；
+    宁可在"只拒了一部分"时报 `open`（高报风险、方向保守）。
 
-    `protected` 的 Deny 判据：`Action` 含 `Update:*` 或覆盖 `CONCRETE_UPDATE_ACTIONS` 全集、
-    `Principal` 为 `*`、`Resource` 覆盖该 ID、且该语句**没有 Condition**。
-    任何解析不动的形态（未识别结构、带 Condition、`Principal` 不是 `*`）一律 `unknown`
-    ——包括 Allow 侧：一条带 Condition 的 Allow 是否生效要求值，本函数不猜。
+    两类**不猜**的情形一律 `unknown`：
+      · 语句里出现本谓词解析不了的字段（`NotAction` / `NotResource` / `Condition` /
+        未识别键，见 `_PARSEABLE_KEYS`）——把它们当"没写"会给出方向错误的答案；
+      · `Effect` 不是 Deny/Allow、`Principal` 不是 `*`、`Statement` 不是非空列表、
+        或者一个 logical id 都没推出来。
     """
     if policy is None:
         return GUARD_OPEN
@@ -67,31 +91,31 @@ def guard_for(policy: dict | None, logical_ids: list) -> str:
     statements = policy.get("Statement")
     if not isinstance(statements, list) or not statements:
         return GUARD_UNKNOWN
-    denied: set = set()
-    allowed: set = set()
+    denied: dict = {lid: set() for lid in logical_ids}
+    allowed: dict = {lid: set() for lid in logical_ids}
     for st in statements:
         if not isinstance(st, dict):
+            return GUARD_UNKNOWN
+        if set(st) - _PARSEABLE_KEYS:
             return GUARD_UNKNOWN
         effect = st.get("Effect")
         if effect not in ("Deny", "Allow"):
             return GUARD_UNKNOWN
-        if st.get("Condition"):
-            # 求值 Condition 就是造分析器 ⇒ 不猜。Allow 与 Deny 两侧同样对待。
-            return GUARD_UNKNOWN
         if st.get("Principal") != "*":
             return GUARD_UNKNOWN
-        actions = set(_as_list(st.get("Action")))
-        covers_update = ("Update:*" in actions
-                         or set(CONCRETE_UPDATE_ACTIONS) <= actions)
+        acts = _update_actions(set(_as_list(st.get("Action"))))
+        if not acts:
+            continue                      # 与 Update 无关的语句（如 Delete:*）不影响本判定
         patterns = _as_list(st.get("Resource"))
-        hit = {lid for lid in logical_ids if any(_covers(p, lid) for p in patterns)}
-        if effect == "Deny":
-            if covers_update:
-                denied |= hit
-        else:
-            # Allow 侧只要**沾到** Update 就算放开（`Update:Modify` 单独放开也足以换 Edge 的码）。
-            if covers_update or any(a.startswith("Update:") for a in actions):
-                allowed |= hit
-    # 显式 Deny 优先；既无 Deny 也无 Allow 的 ID 按默认拒算受保护。
-    open_ids = {lid for lid in logical_ids if lid not in denied and lid in allowed}
-    return GUARD_OPEN if open_ids else GUARD_PROTECTED
+        bucket = denied if effect == "Deny" else allowed
+        for lid in logical_ids:
+            if any(_covers(p, lid) for p in patterns):
+                bucket[lid] |= acts
+    for lid in logical_ids:
+        for action in CONCRETE_UPDATE_ACTIONS:
+            if action in denied[lid]:
+                continue                  # 显式 Deny 优先
+            if action in allowed[lid]:
+                return GUARD_OPEN         # 被放开 ⇒ 这条路开着
+            # 既无 Deny 也无 Allow ⇒ 默认拒 ⇒ 这个动作算被挡住
+    return GUARD_PROTECTED
