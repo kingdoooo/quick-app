@@ -302,3 +302,60 @@ def test_two_stacks_are_judged_independently(m):
         == {m.E_CFN_UPDATE_STACK}
     assert m.classify(frozenset({f"cloudformation:UpdateStack|{deployer.resource}"}), s) \
         == {m.S_CFN_SESSION_KEY_STACK}
+
+
+# ---- 聚合层 -------------------------------------------------------------------
+
+def test_union_counts_both_classes_and_excludes_non_surface(m):
+    """sign 与 edge 两类都进并集；受限/未分析标签单列不进。"""
+    agg = m.summarize({
+        "p-sign": {m.S_HIJACK_AUTH},
+        "p-edge": {m.E_CFN_UPDATE_STACK},
+        "p-both": {m.S_KMS_DIRECT, m.E_CFN_CHANGE_SET},
+        "p-fixture": {m.S_FIXTURE_ISSUER},
+        "p-unanalyzed": {m.E_CFN_TEMPLATE_UNANALYZED},
+    })
+    assert agg["can_sign"] == 2
+    assert agg["can_replace_edge_verifier"] == 2
+    assert agg["impersonation_surface_union"] == 3
+    assert agg["both"] == 1 and agg["sign_only"] == 1 and agg["edge_only"] == 1
+    assert agg["fixture_issuer_holders"] == 1
+    assert agg["non_surface_only_holders"] == 2   # 夹具 + 未分析各一个
+
+
+def test_marginal_value_uses_the_same_membership_predicate(m):
+    """进面与离面必须用**同一个**判据。`{kms-direct, fixture-issuer}` 在 KMS 那组关掉后
+    真的离开了冒充面；按"还有标签"判会把它算成留下 ⇒ key policy 的收益少报一个。"""
+    mv = m.summarize({
+        "p-kms": {m.S_KMS_DIRECT},
+        "p-kms+hijack": {m.S_KMS_DIRECT, m.S_HIJACK_AUTH},
+        "p-cfn": {m.E_CFN_UPDATE_STACK},
+        "p-kms+fixture": {m.S_KMS_DIRECT, m.S_FIXTURE_ISSUER},
+    })["marginal_value_if_closed"]
+    assert mv["restrictive-kms-key-policy"]["principals_removed"] == 2
+    # 劫持 signer 那条路**不需要**攻击者自己有 kms:Sign ⇒ key policy 收不掉它。
+    assert mv["harden-signer-code-update"]["principals_removed"] == 0
+    assert mv["router-stack-policy"]["principals_removed"] == 1
+
+
+def test_every_label_is_covered_by_a_mitigation_or_declared_uncovered(m):
+    """每个标签要么落在某个候选措施里，要么**显式**声明未覆盖并写明理由。
+
+    漏一个的后果是：讨论"关掉哪条路值不值得"时那条路根本不在讨论范围内，而并集里它还在。
+    （旧版这条用例的名字里写着 or_declared_uncovered，但没有任何声明机制——名实不符。）
+    """
+    covered = {lb for group in m.MITIGATIONS.values() for lb in group}
+    missing = set(m.ALL_LABELS) - covered - set(m.UNCOVERED_LABELS)
+    assert not missing, f"这些路径既没有候选措施也没声明未覆盖：{sorted(missing)}"
+    for label, why in m.UNCOVERED_LABELS.items():
+        assert label in m.ALL_LABELS, label
+        assert len(why) > 10, f"{label} 的未覆盖理由太短，等于没写"
+
+
+def test_all_labels_is_exhaustive(m):
+    """`ALL_LABELS` 必须与模块里定义的标签常量全集一致——漏登记的标签在 per_label
+    里不出现，闸门的能力层就少比一项。"""
+    defined = {v for k, v in vars(m).items()
+               if k.startswith(("S_", "E_")) and isinstance(v, str)
+               and (v.startswith(m.SIGN_PREFIX) or v.startswith(m.EDGE_PREFIX))}
+    assert defined == set(m.ALL_LABELS)

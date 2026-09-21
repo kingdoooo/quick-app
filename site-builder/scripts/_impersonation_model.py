@@ -239,3 +239,69 @@ def fake_stack(label: str, *, controls: frozenset[str],
     return StackFact(resource=f"STACK_{label.upper()}", label=label, guard=guard,
                      service_role=None, controls=controls,
                      premises_verified=premises_verified)
+
+
+ALL_LABELS: tuple[str, ...] = (
+    S_KMS_DIRECT, S_KMS_SELF, S_HIJACK_AUTH, S_HIJACK_PANEL, S_FIXTURE_ISSUER,
+    S_CFN_SESSION_KEY_STACK, S_CFN_SESSION_KEY_UNANALYZED,
+    E_PUBLISH_INLINE, E_PUBLISH_THEN_ASSOCIATE, E_NEW_FUNCTION,
+    E_CFN_UPDATE_STACK, E_CFN_CHANGE_SET, E_CFN_TEMPLATE_UNANALYZED)
+
+# 候选缓解措施：**"少算一个动作"与"这个措施值不值得做"是两个问题。**
+# 边际收益 = 关掉这一组路径后**完全**离开冒充面的 principal 数。
+MITIGATIONS: dict[str, tuple[str, ...]] = {
+    "restrictive-kms-key-policy": (S_KMS_DIRECT, S_KMS_SELF),
+    "harden-signer-code-update": (S_HIJACK_AUTH, S_HIJACK_PANEL),
+    "router-stack-policy": (E_CFN_UPDATE_STACK, E_CFN_CHANGE_SET),
+    "lock-edge-association": (E_PUBLISH_INLINE, E_PUBLISH_THEN_ASSOCIATE, E_NEW_FUNCTION),
+    "harden-session-key-stack-update": (S_CFN_SESSION_KEY_STACK,),
+    # 夹具签发器的"缓解"就是 verifier 侧的边界（ADR 0002），已经在生产代码里；
+    # 关掉这一组等于关掉整套验收工具 ⇒ 边际收益按 0 记（`summarize` 会算出 0）。
+    "fixture-issuer-verifier-boundary": (S_FIXTURE_ISSUER,),
+}
+
+# **显式声明未覆盖**的标签：它们不是"某个措施能关掉"的路径，而是"还没分析"的范围。
+UNCOVERED_LABELS: dict[str, str] = {
+    E_CFN_TEMPLATE_UNANALYZED:
+        "stack policy 只挡住受保护资源的直接更新；service role 权限足够高时的模板层路径"
+        "（新增 IAM 授权类资源等）尚未分析 ⇒ 没有对应措施，只有「去做那次分析」。",
+    S_CFN_SESSION_KEY_UNANALYZED:
+        "前提（这次更新以谁的身份执行、那个身份是否真能改 key policy）尚未核实 ⇒ "
+        "先核实前提，再谈措施。",
+}
+
+
+def summarize(by_principal: dict) -> dict:
+    """能力标签 → 聚合结论。**只出计数与集合关系，不出名字。**"""
+    def holders(pred) -> set:
+        return {arn for arn, ls in by_principal.items() if pred(ls)}
+
+    per_label = {lb: len(holders(lambda ls, lb=lb: lb in ls)) for lb in ALL_LABELS}
+    can_sign = holders(lambda ls: any(is_surface_label(l) and l.startswith(SIGN_PREFIX)
+                                      for l in ls))
+    can_edge = holders(lambda ls: any(is_surface_label(l) and l.startswith(EDGE_PREFIX)
+                                      for l in ls))
+    surface = can_sign | can_edge
+    marginal: dict = {}
+    for name, closed in MITIGATIONS.items():
+        remaining = {arn for arn in surface
+                     if {l for l in by_principal[arn] if is_surface_label(l)} - set(closed)}
+        marginal[name] = {"closes_paths": len(closed),
+                          "surface_after": len(remaining),
+                          "principals_removed": len(surface) - len(remaining)}
+    return {
+        "principals_simulated": len(by_principal),
+        "per_label": per_label,
+        "can_sign": len(can_sign),
+        "can_replace_edge_verifier": len(can_edge),
+        "fixture_issuer_holders": len(holders(lambda ls: S_FIXTURE_ISSUER in ls)),
+        # 只持"受限 / 未分析"标签的 principal 数：他们**不在**并集里，但也不是零信息。
+        "non_surface_only_holders": len(holders(
+            lambda ls: bool(ls) and not any(is_surface_label(l) for l in ls))),
+        "impersonation_surface_union": len(surface),
+        "both": len(can_sign & can_edge),
+        "sign_only": len(can_sign - can_edge),
+        "edge_only": len(can_edge - can_sign),
+        "marginal_value_if_closed": marginal,
+        "_sets": {"can_sign": can_sign, "can_edge": can_edge, "surface": surface},
+    }
