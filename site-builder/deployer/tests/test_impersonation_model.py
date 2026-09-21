@@ -113,3 +113,88 @@ def test_invoke_on_panel_is_not_the_fixture_entry(m):
     """资源维度不许折叠：同一个动作打在 panel 上不是夹具入口。"""
     s = m.fake_surface()
     assert m.classify(frozenset({f"lambda:InvokeFunction|{s.panel.arn}"}), s) == set()
+
+
+# ---- Edge 侧：必须让 CloudFront 关联到攻击者的代码上 ----------------------------
+
+def test_update_code_alone_cannot_replace_running_edge_code(m):
+    """**正向控制**：闸门旧模型（只 `UpdateFunctionCode`）对 Edge 是过度声称。
+    CloudFront 必须关联编号版本，而该动作只改 `$LATEST`。"""
+    s = m.fake_surface()
+    assert m.classify(frozenset({f"lambda:UpdateFunctionCode|{s.edge.arn}"}), s) == set()
+    assert m.classify(frozenset({f"lambda:UpdateFunctionCode|{s.edge.arn}",
+                                 f"lambda:PublishVersion|{s.edge.arn}"}), s) == set()
+
+
+def test_update_config_on_edge_yields_nothing(m):
+    """3g 的核心反例：`UpdateFunctionConfiguration(Edge)` + `UpdateDistribution`
+    **不是** `edge:code(Publish=True)+associate`——配置更新没有 `Publish`，
+    而 Lambda@Edge 不支持 Layer ⇒ 这一组什么都不构成。"""
+    s = m.fake_surface()
+    assert m.classify(frozenset({f"lambda:UpdateFunctionConfiguration|{s.edge.arn}",
+                                 f"cloudfront:UpdateDistribution|{s.distribution}"}), s) \
+        == set()
+
+
+def test_inline_publish_plus_associate(m):
+    """`UpdateFunctionCode(Publish=True)` 一次调用即改码即发版本 ⇒ 把
+    `PublishVersion` 当**必需**会少算 principal。"""
+    s = m.fake_surface()
+    labels = m.classify(frozenset({f"lambda:UpdateFunctionCode|{s.edge.arn}",
+                                   f"cloudfront:UpdateDistribution|{s.distribution}"}), s)
+    assert labels == {m.E_PUBLISH_INLINE}
+    both = m.classify(frozenset({f"lambda:UpdateFunctionCode|{s.edge.arn}",
+                                 f"lambda:PublishVersion|{s.edge.arn}",
+                                 f"cloudfront:UpdateDistribution|{s.distribution}"}), s)
+    assert both == {m.E_PUBLISH_INLINE, m.E_PUBLISH_THEN_ASSOCIATE}
+
+
+def test_new_function_path_does_not_require_publish_version(m):
+    """`CreateFunction` 的输入含 `Publish` ⇒ 建函数那条路不需要单独 `PublishVersion`。
+    （旧探针要求它，于是只持 CreateFunction+PassRole+UpdateDistribution 的
+    principal 被漏掉。）"""
+    s = m.fake_surface()
+    cand = s.new_candidates[0]
+    assert m.classify(frozenset({f"lambda:CreateFunction|{cand}",
+                                 f"iam:PassRole|{s.edge_role}",
+                                 f"cloudfront:UpdateDistribution|{s.distribution}"}), s) \
+        == {m.E_NEW_FUNCTION}
+
+
+def test_new_function_path_requires_passrole(m):
+    """缺 `PassRole` 不成立：新函数得挂一个 Edge 能用的执行角色。"""
+    s = m.fake_surface()
+    cand = s.new_candidates[0]
+    assert m.classify(frozenset({f"lambda:CreateFunction|{cand}",
+                                 f"lambda:PublishVersion|{cand}",
+                                 f"cloudfront:UpdateDistribution|{s.distribution}"}), s) \
+        == set()
+
+
+def test_each_new_candidate_is_checked_independently(m):
+    """两个候选 ARN 是为了缩小"按名字前缀授权"的盲区 ⇒ **任一**成立即算。"""
+    s = m.fake_surface()
+    for cand in s.new_candidates:
+        assert m.classify(frozenset({f"lambda:CreateFunction|{cand}",
+                                     f"iam:PassRole|{s.edge_role}",
+                                     f"cloudfront:UpdateDistribution|{s.distribution}"}),
+                          s) == {m.E_NEW_FUNCTION}, cand
+
+
+def test_edge_chain_needs_observed_version_entry(m):
+    """Edge 入口观测不到时不发确定标签（两个采集方都会在更早处硬失败，
+    这条是纯函数层的兜底，不许默认成"能"）。"""
+    s = m.replace_fn(m.fake_surface(), "edge", entry=m.ENTRY_UNKNOWN)
+    assert m.classify(frozenset({"lambda:UpdateFunctionCode|EDGE",
+                                 "cloudfront:UpdateDistribution|DIST"}), s) == set()
+
+
+def test_edge_code_rights_do_not_spill_into_signer_hijack(m):
+    """资源维度不许折叠，两个方向都测。"""
+    s = m.fake_surface()
+    assert m.classify(frozenset({f"lambda:UpdateFunctionCode|{s.edge.arn}",
+                                 f"cloudfront:UpdateDistribution|{s.distribution}"}), s) \
+        == {m.E_PUBLISH_INLINE}
+    assert m.classify(frozenset({f"lambda:UpdateFunctionCode|{s.auth.arn}",
+                                 f"cloudfront:UpdateDistribution|{s.distribution}"}), s) \
+        == {m.S_HIJACK_AUTH}

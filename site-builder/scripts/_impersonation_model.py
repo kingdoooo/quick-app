@@ -73,6 +73,9 @@ S_KMS_SELF = "sign:kms-self-authorize"
 S_HIJACK_AUTH = "sign:hijack-auth-signer"
 S_HIJACK_PANEL = "sign:hijack-panel-signer"
 S_FIXTURE_ISSUER = "sign:fixture-issuer"
+E_PUBLISH_INLINE = "edge:code(Publish=True)+associate"
+E_PUBLISH_THEN_ASSOCIATE = "edge:code+publish+associate"
+E_NEW_FUNCTION = "edge:new-function+associate"
 
 
 @dataclass(frozen=True)
@@ -151,6 +154,18 @@ def classify(allowed: frozenset[str], s: Surface, name: str = "") -> set[str]:
         labels.add(S_HIJACK_PANEL)
     if ok(A_INVOKE, s.auth.arn) or (name and name == s.verifier_role_name):
         labels.add(S_FIXTURE_ISSUER)
+
+    # Edge：光有换码不够，必须让 CloudFront 关联到攻击者的代码上。
+    # `edge.entry` 必须是**观测到的**编号版本——这正是旧模型过度声称的那一步。
+    if s.edge.entry == ENTRY_VERSION and ok(A_CF_WRITE, s.distribution):
+        if ok(A_UPDATE_CODE, s.edge.arn):
+            labels.add(E_PUBLISH_INLINE)              # UpdateFunctionCode(Publish=True)
+            if ok(A_PUBLISH_VERSION, s.edge.arn):
+                labels.add(E_PUBLISH_THEN_ASSOCIATE)
+        # `CreateFunction` 自带 `Publish` ⇒ **不要**把 `PublishVersion` 当必需前提。
+        if any(ok(A_CREATE_FUNCTION, c) for c in s.new_candidates) \
+                and ok(A_PASSROLE, s.edge_role):
+            labels.add(E_NEW_FUNCTION)
     return labels
 
 
