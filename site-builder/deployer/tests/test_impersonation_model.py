@@ -588,3 +588,46 @@ def test_the_test_copy_is_not_registered_under_the_real_module_name(m):
     """
     assert sys.modules.get("_impersonation_model") is not m, \
         "可变形的测试副本占用了真名 ⇒ 会污染闸门与探针"
+
+
+# ---- R1-L1：未分析路径**阻止**"确定离场"的定论 -----------------------------------
+
+def test_unanalyzed_path_blocks_a_definite_benefit_claim(m):
+    """**Reviewer R1-L1（major）**：`{sign:kms-direct, edge:cfn-template-unanalyzed}` 的
+    principal 在 KMS 那组关掉后，"已建模的路径"确实都关了，但它还持一条**未分析**路径
+    ⇒ 不能算"确定离开冒充面"。
+
+    修之前实测 `principals_removed=1, surface_after=0`——那正是 ADR 0007 与 spec §3/§9
+    禁止的"确定收益"声明：CFN 模板层路径还没分析，凭什么说这个人已经出去了。
+    """
+    mv = m.summarize({"p": {m.S_KMS_DIRECT, m.E_CFN_TEMPLATE_UNANALYZED}})[
+        "marginal_value_if_closed"]["restrictive-kms-key-policy"]
+    assert mv["principals_removed"] == 0, mv      # 收益是下界
+    assert mv["principals_uncertain"] == 1, mv    # 被未分析路径阻止定论
+    assert mv["surface_after"] == 1, mv           # 剩余是上界
+
+
+def test_proven_restricted_label_still_counts_as_leaving(m):
+    """对照：`sign:fixture-issuer` 的可排除性**有依据**（ADR 0002 的 verifier 侧边界是已证明的）
+    ⇒ 只剩它的 principal 仍然算离开。修 R1-L1 时不许把这条一起收紧。"""
+    mv = m.summarize({"p": {m.S_KMS_DIRECT, m.S_FIXTURE_ISSUER}})[
+        "marginal_value_if_closed"]["restrictive-kms-key-policy"]
+    assert mv["principals_removed"] == 1, mv
+    assert mv["principals_uncertain"] == 0, mv
+    assert mv["surface_after"] == 0, mv
+
+
+def test_goes_red_when_unanalyzed_labels_stop_blocking_the_claim(m):
+    """变形：把 `UNANALYZED_LABELS` 清空（即回到"未分析也算可排除"）⇒ 上面那条必须转红。"""
+    m.UNANALYZED_LABELS = frozenset()
+    mv = m.summarize({"p": {m.S_KMS_DIRECT, m.E_CFN_TEMPLATE_UNANALYZED}})[
+        "marginal_value_if_closed"]["restrictive-kms-key-policy"]
+    assert mv["principals_removed"] == 1 and mv["principals_uncertain"] == 0, mv
+
+
+def test_every_unanalyzed_label_is_a_non_surface_label(m):
+    """两个集合的关系必须单向成立：未分析 ⊂ 不进并集。反过来不成立（fixture 是例外），
+    所以不能把它们合成一个集合。"""
+    assert m.UNANALYZED_LABELS <= m.NON_SURFACE_LABELS
+    assert m.S_FIXTURE_ISSUER in m.NON_SURFACE_LABELS
+    assert m.S_FIXTURE_ISSUER not in m.UNANALYZED_LABELS

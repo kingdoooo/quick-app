@@ -91,6 +91,15 @@ S_CFN_SESSION_KEY_UNANALYZED = "sign:cfn-session-key-stack-unanalyzed"
 NON_SURFACE_LABELS = frozenset({S_FIXTURE_ISSUER, S_CFN_SESSION_KEY_UNANALYZED,
                                 E_CFN_TEMPLATE_UNANALYZED})
 
+# **"不进并集"与"可以算它离开了并集"是两件事**（R1-L1）：
+#   · `sign:fixture-issuer` 的可排除性有依据——ADR 0002 的 verifier 侧边界是**已证明**的
+#     （Edge 只在夹具站点认夹具会话、panel 拒夹具域邮箱），所以只剩它的 principal 真的离开了；
+#   · 两条 `*-unanalyzed` 恰恰相反：它们的意思是**还没分析**。把它们当成"可排除"，就会把
+#     "已建模的路径都关了"读成"这个人已经不在冒充面里"，而那正是 ADR 0007 与 spec §3/§9
+#     禁止的"确定收益"声明。
+# ⇒ 边际收益里它们**阻止定论**，见 `summarize` 的 `principals_uncertain`。
+UNANALYZED_LABELS = frozenset({S_CFN_SESSION_KEY_UNANALYZED, E_CFN_TEMPLATE_UNANALYZED})
+
 
 @dataclass(frozen=True)
 class FnFact:
@@ -284,11 +293,21 @@ def summarize(by_principal: dict) -> dict:
     surface = can_sign | can_edge
     marginal: dict = {}
     for name, closed in MITIGATIONS.items():
-        remaining = {arn for arn in surface
-                     if {l for l in by_principal[arn] if is_surface_label(l)} - set(closed)}
-        marginal[name] = {"closes_paths": len(closed),
-                          "surface_after": len(remaining),
-                          "principals_removed": len(surface) - len(remaining)}
+        # 三分，而不是二分（R1-L1）：已建模路径是否全关 × 是否还持未分析路径。
+        remaining, uncertain = set(), set()
+        for arn in surface:
+            labels = by_principal[arn]
+            if {l for l in labels if is_surface_label(l)} - set(closed):
+                remaining.add(arn)            # 还有**已建模**的路径没关 ⇒ 确定仍在面里
+            elif set(labels) & UNANALYZED_LABELS:
+                uncertain.add(arn)            # 已建模的都关了，但还有未分析路径 ⇒ **不定论**
+        marginal[name] = {
+            "closes_paths": len(closed),
+            # 两个数字都朝安全方向取：收益是**下界**，剩余是**上界**。
+            "surface_after": len(remaining) + len(uncertain),
+            "principals_removed": len(surface) - len(remaining) - len(uncertain),
+            "principals_uncertain": len(uncertain),
+        }
     return {
         "principals_simulated": len(by_principal),
         "per_label": per_label,
