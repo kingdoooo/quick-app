@@ -1,5 +1,8 @@
 # 3g：信任边界闸门的 `replace-platform-code` 模型对齐（共享判定模型 + schema 7）
 
+> **决策记录，不是操作指引。** 本文含单账号实测数据与当时的取舍过程，按写下的那一刻为准；
+> 采用者要的操作步骤真源是 `site-builder/DEPLOY.md`，还剩什么没做看 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9。
+
 状态：spec 已冻结，待实施。来源条目：`docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9 第 3g 行。
 本 spec 随仓库分发（tracked）：它冻结的是**资产**里的判定模型与迁移协议，不是本验证环境的操作记录。
 

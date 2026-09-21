@@ -575,6 +575,35 @@ PY
 
 ---
 
+#### 信任边界闸门的基线 schema 7（3g）
+
+判定模型是闸门与探针**共用**的 `scripts/_impersonation_model.py`，grant 词表改名
+（`replace-platform-code:<fn>` → `update-fn-code:<fn>`）并新增 CFN / CloudFront /
+PassRole 类，principals 多一个 `capabilities`，另有一个 `model_inputs` 分节 ⇒ **整份基线
+的形态都变了**，旧基线（schema ≤ 6）一律硬失败。
+
+**重生成的唯一正确姿势**：
+
+```bash
+# ① 旧基线先**移走而不是删**——它是下一步的输入
+mv site-builder/scripts/account_trust_baseline.json .scratch/account_trust_baseline.schema6.bak
+# ② 重新扫描生成，**必须带 --carry-categories**
+python3 site-builder/scripts/verify_account_trust_boundary.py \
+    --update-baseline --carry-categories .scratch/account_trust_baseline.schema6.bak
+# ③ 用新基线复核一次，必须绿
+python3 site-builder/scripts/verify_account_trust_boundary.py
+```
+
+**不带 `--carry-categories` 的后果是静默的**：全部 `platform` 标注变成 `unclassified`，
+platform 的**集合等值**约束随之降级成"只看新增"，于是"平台角色丢了一条必需授权"会被
+记成**改善**（绿）。唯一症状就是什么都不红。
+
+**见证流程（旧码跑绿 → 同一份观测喂旧/新两版判定 → 用那份 dump 写新基线 → 新基线复核）
+在仓库外做**，产物落 `.scratch/`：它是本验证环境的一次性迁移步骤，不属于交付资产
+（spec `docs/superpowers/specs/2026-09-20-3g-impersonation-model-alignment-spec.md` §8.2）。
+两点别漏：旧码 `--dump-observed` 退出 0 **不等于**闸门绿（必须真的做过比较）；
+两次独立扫描的差集含"模型变化 + 环境变化"，所以隔离模型影响要用**同一份** decisions。
+
 #### 轮转会话密钥（KMS）：就位 → 切换 → 排空 → 退役
 
 **这是可执行协议，不是描述。** 每一步 = 一处 `config.ini`（或 `deployer/infra/app.py`）修改 + 现成脚本 +

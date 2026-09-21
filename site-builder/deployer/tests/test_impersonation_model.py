@@ -17,17 +17,30 @@ _MODULE = _ROOT / "site-builder" / "scripts" / "_impersonation_model.py"
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("_impersonation_model", _MODULE)
+    """加载一份**独立**的模型模块。
+
+    注册进 `sys.modules` 用的是一个**测试专用的名字**，不是 `_impersonation_model`：
+    下面那批变形测试会就地改模块常量（`A_UPDATE_CODE`、`NON_SURFACE_LABELS`…），而闸门与
+    探针都按真名 `import _impersonation_model`。用真名注册就等于把改坏的那份塞进全局缓存，
+    于是**同一个进程里后加载的闸门会拿到被变形的模型** —— 实测症状是单独跑这个文件全绿、
+    跑整个 tests 目录时闸门那边 11 条红（而且红在 grant 与 coverage 这些看起来毫不相关
+    的用例上）。`fixture` 那边另有一层兜底：跑完把这个名字清掉。
+    """
+    spec = importlib.util.spec_from_file_location("_impersonation_model_undertest",
+                                                  _MODULE)
     assert spec is not None and spec.loader is not None, _MODULE
     mod = importlib.util.module_from_spec(spec)
-    sys.modules["_impersonation_model"] = mod
+    sys.modules["_impersonation_model_undertest"] = mod
     spec.loader.exec_module(mod)
     return mod
 
 
 @pytest.fixture()
 def m():
-    return _load()
+    mod = _load()
+    yield mod
+    # 变形测试改的是这份私有副本，用完即弃——别让它跨用例存活。
+    sys.modules.pop("_impersonation_model_undertest", None)
 
 
 def test_module_has_no_aws_imports():
@@ -564,3 +577,14 @@ def test_goes_red_when_the_fixture_issuer_entry_is_dropped(m):
         == {m.S_FIXTURE_ISSUER}
     m.A_INVOKE = ("lambda:ThisActionDoesNotExist",)
     assert m.classify(frozenset({f"lambda:InvokeFunction|{s.auth.arn}"}), s) == set()
+
+
+def test_the_test_copy_is_not_registered_under_the_real_module_name(m):
+    """**测试隔离的守卫**：这份可变形的副本不许占用真名 `_impersonation_model`。
+
+    占用的后果是跨文件污染：闸门与探针都按真名 import，同一个进程里后加载的那个会拿到
+    被变形测试改坏的模型。实测症状很难往这边猜——单独跑本文件全绿，跑整个 tests 目录时
+    闸门那边 11 条红，且红在 grant / coverage 这些看起来毫不相关的用例上。
+    """
+    assert sys.modules.get("_impersonation_model") is not m, \
+        "可变形的测试副本占用了真名 ⇒ 会污染闸门与探针"

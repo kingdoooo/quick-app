@@ -130,11 +130,19 @@ python3 site-builder/scripts/session_verify_counts.py --hours 1 --require-total 
 #   （窗口 ≥ 26 h、每处总量 > 0、目标列三列全 0、accepted_current 三列全 > 0），exit 0 才算过。
 #   手写那四个旗标少任何一个都是静默放宽——空窗口下裸 `--require-zero` 会退 0，而下一步是不可逆的退役 key。
 #   判据说明见 DEPLOY.md 的轮转 runbook
-# 账号信任边界的漂移闸门（只读；A 直接失守 + B IAM 写静态快照两层；几百个 principal × 3 次
-# IAM 模拟（第三次是 kms:Sign 的 MessageType=DIGEST 那一腿）+ **两次** GetAccountAuthorizationDetails——第二次是模拟后的**窗口两端一致性复查**，
+# 账号信任边界的漂移闸门（只读；A 直接失守 + B IAM 写静态快照两层；几百个 principal × 5 次
+# IAM 模拟（函数腿 / 发布腿 / CFN+CloudFront+PassRole 腿 / 其余腿 / kms:Sign 的
+# MessageType=DIGEST 那一腿；腿数由 SIM_LEGS_PER_PRINCIPAL 报，有单测与实际调用数对齐）
+# + **两次** GetAccountAuthorizationDetails——第二次是模拟后的**窗口两端一致性复查**，
 # 两端不一致就作废本轮、不出结论也不写基线；它**不保证原子**，只覆盖 principal 层、只证明两端相等，
 # 三个已接受盲区见 docs/security/account-trust-boundary.md）+ 扫 bootstrap 桶，实测约 11 分钟
 python3 site-builder/scripts/verify_account_trust_boundary.py
+# **schema 7（3g）的基线迁移**：schema 不匹配的基线一律硬失败。重生成的唯一正确姿势是
+#   `--update-baseline --carry-categories <旧基线副本>`
+# 不带 `--carry-categories` 会把全部 `platform` 标注洗成 `unclassified`，把 platform 的
+# **集合等值**约束静默降级成「只看新增」——唯一症状是**什么都不红**。旧基线要**移走而不是删**
+# （它就是那个旗标的输入）。见证流程在仓库外做，见
+# `docs/superpowers/specs/2026-09-20-3g-impersonation-model-alignment-spec.md` §8.2。
 # 密钥增减必须**声明**，否则一律红：`--new-key LABEL` / `--retire-key LABEL`
 # （LABEL ∈ 已配置 kid ∪ {login-flow}）。声明管**两件**事：
 #   ① grant delta → `migration_grants`（绿）。**前置条件是该 principal 原本就能签某把
@@ -314,6 +322,7 @@ CMK 在那个栈里，router 栈 synth 要从 KMS 取 site 公钥注入 Edge，a
 | 验收工具的夹具签发器客户端（`scripts/_session_mint.py`） | 六处调用方（四个 `verify_*`、`verify_kid_entry_live.py`、E2E 的会话 cookie fixture）+ `ensure_fixture_site.py`。改它等于同时改六个验收面；**它不持任何密钥**（登录态全部经 auth 的 `/fixture-session`），带外签发只此一处 |
 | `session.py` 的 `FIXTURE_*` 常量 | Edge 内嵌字面量（router 单测钉住等值）、`permissions.FIXTURE_DOMAIN`（auth 单测钉住等值）、`deploy_panel` 的 admin 断言、`ensure_fixture_site.py`、闸门的站点形状层 |
 | 两份 `config.ini.example` 的共享键（`frontend_bucket` / `account_id` / `region` / `base_domain` / `routing_table` / IdP 名） | `deployer/tests/test_example_config_consistency.py`（按语义配对，且共享键的值里不许带行内注释——生产是裸 `ConfigParser`，注释会并进值）、`router/infrastructure/stack.py` 的 `resolve_frontend_bucket`（桶名是**约定**：插值后必须等于 `site-frontend-<account_id>`，四个生产方写死了它 —— app.py 的 IAM ARN 与 `FRONTEND_BUCKET` env、deploy_panel、upload/undeploy/mark_job、verify_deployed_components）与 `assert_frontend_bucket_matches_site_builder`（synth 期跨 config 对账，离线/读不到则警告跳过）、`verify_deployed_edge.sh` 的 `FRONTEND_BUCKET_DOMAIN` 段。**改桶名不是改这一个键** |
+| `scripts/_impersonation_model.py`（冒充判定模型，闸门与探针**共用**） | 两个消费方（`probe_impersonation_surface.py` / `verify_account_trust_boundary.py`）、`deployer/tests/test_impersonation_model.py`（反例真源，35 条 + 6 条变形）、`_stack_policy_guard.py`（guard 三值；**不能**用 `policy_problems()` 代替，见 ADR 0008）、**基线 schema**（改模型 = 改基线形态 ⇒ 要重新扫描生成）、`docs/security/account-trust-boundary.md` 的数字。**判定只许有一份**——两边各抄一份正是 3g 的成因 |
 | `deployer/functions/function_url_policy.py`（Function URL resource policy 的唯一实现） | 三个部署脚本的 `converge_function_url_policy` 调用（auth 的 `edge_role_arn()` 校验、panel / key-proxy 的 `ensure_function`）、闸门 `_check_function_url_authz` 与 `MIN_DEPLOYED_CHECKS`、`deploy_lambda_site` 的 parity 用例（站点色授权与平台三条同形）、`fake_lambda_policy.py` 的渲染形态、`extra_principals`（`[Verification]` 开着时 auth 多 verifier 两条） |
 
 ## 高频坑（都是真机踩过的）

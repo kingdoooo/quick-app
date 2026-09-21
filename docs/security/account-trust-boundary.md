@@ -3,6 +3,18 @@
 > **决策记录，不是操作指引。** 本文含单账号实测数据与当时的取舍过程，按写下的那一刻为准；
 > 采用者要的操作步骤真源是 `site-builder/DEPLOY.md`，还剩什么没做看 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9。
 
+> **⚠️ 本页的 headline 与集合关系数字待真机重测（3g，2026-09-21）。** 判定模型已换成
+> `scripts/_impersonation_model.py`（闸门与探针共用、经反例验证），grant 词表与基线 schema
+> 一并升到 7。旧数字由旧模型算出，它有四处失真：对 Edge **过度声称**（只模拟
+> `lambda:UpdateFunctionCode`，而 CloudFront 关联编号版本）、**少算** CFN 两条路与
+> `UpdateFunctionConfiguration`、CFN 前提停留在 ADR 0007 之前（router 栈**现在有**
+> stack policy，门槛是 `cloudformation:SetStackPolicy`）、以及把 `PublishVersion` 当成
+> "新建函数再关联"的必需前提（`CreateFunction` 自带 `Publish`）。
+> **重测前不要引用本页任何计数**；重测步骤见 spec `2026-09-20-3g-*` §8.2。
+>
+> grant 改名：`replace-platform-code:<fn>` → `update-fn-code:<fn>`（旧名声称"已能替换
+> 正在执行的代码"，那对 Edge 不成立）。本页下文出现旧名处按新名理解。
+
 > **状态：已知未修（不是已接受）。** 最近一次实测 2026-08-27（收窄 CodeBuild 的
 > bootstrap 桶读权限之后），方法与原始数据见下。
 > 这份文档是 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9 里
@@ -734,3 +746,24 @@ merged review 的 M09 记的是「同账号 `lambda:InvokeFunction` 可对 panel
   最后一步 `schedule-key-deletion` 才不可逆。所以"换掉一把可疑的 key"不是需要临时设计的动作。
   与本文档的关系在 3c-final 之后变了：**产物与 asset 里已经没有私钥，所以不再需要清理 bootstrap
   桶**；要看的是 CloudTrail 里 `eventName=Sign` 的调用者（谁在用那把 key），见该节的「应急」
+
+## 未分析范围（3g 明确记录，2026-09-21）
+
+判定模型对齐之后，下面几块是**明确记下来的下界**，不是"已经算进去了"：
+
+1. **CFN 模板层路径。** `guard == "protected"`（ADR 0007 的 stack policy）只关掉
+   "直接更新那四个受保护资源"这一条链。CFN service role 权限足够高时，改模板新增 IAM
+   授权类资源等路径未必需要碰那四个资源 ⇒ 持 CFN 更新权的 principal 落
+   `edge:cfn-template-unanalyzed`（**单列、不进冒充面并集**）。
+   **不得**据 guard 宣称某 principal 退出冒充面，也不得算确定收益（ADR 0007 同样要求）。
+2. **deployer 栈那条签名路径的前提。** 那个栈拥有两把会话签名 CMK（`infra/app.py` 的
+   `kms.Key`），但"拥有 CMK、且缺少 stack policy"**还不足以**推出"能改 key policy"：
+   要看这次更新以谁的身份执行（`DescribeStacks[].RoleARN`，已观测）、那个身份是否真能
+   `kms:PutKeyPolicy`（**未核**）⇒ 一律落 `sign:cfn-session-key-stack-unanalyzed`。
+3. **`CreateFunction` 的名字空间。** 只对**两个**候选 ARN 有判定（一个中性名、一个与
+   router 栈同前缀）。按名字前缀授权的策略可能在别的名字上成立。
+4. 既有三个盲区不变：`SimulatePrincipalPolicy` 对带 Condition 的策略只补 KMS 签名合同
+   那两个键（其余判定是下界）、动作等价类不穷尽、看不见"临时建了个角色用完就删"。
+
+**这几条都有单列标签或 spec 记录，刻意不折进 headline**：折进去会让"还有多少人能冒充
+任意用户"这个数字既不是上界也不是下界。
