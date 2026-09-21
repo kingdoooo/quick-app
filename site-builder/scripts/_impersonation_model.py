@@ -76,6 +76,20 @@ S_FIXTURE_ISSUER = "sign:fixture-issuer"
 E_PUBLISH_INLINE = "edge:code(Publish=True)+associate"
 E_PUBLISH_THEN_ASSOCIATE = "edge:code+publish+associate"
 E_NEW_FUNCTION = "edge:new-function+associate"
+# CFN：两条更宽的路。**router 栈自 ADR 0007 起有 stack policy**，所以单动作不再足够。
+E_CFN_UPDATE_STACK = "edge:cfn-update-stack"
+E_CFN_CHANGE_SET = "edge:cfn-change-set"
+# stack policy 挡住的是**受保护资源的直接更新**，不等于关闭了全部 CFN 提权路径
+# （service role 权限足够高时，改模板新增 IAM 授权类资源等路径未必需要碰那四个资源）。
+# ⇒ 这条**不进冒充面并集**，但必须留在视野里、参与漂移比较。
+E_CFN_TEMPLATE_UNANALYZED = "edge:cfn-template-unanalyzed"
+S_CFN_SESSION_KEY_STACK = "sign:cfn-session-key-stack"
+S_CFN_SESSION_KEY_UNANALYZED = "sign:cfn-session-key-stack-unanalyzed"
+
+# **不构成冒充面成员资格**的标签：受限冒充与前提未核实的那几条。
+# 它们仍然进 per-label 计数与逐 principal 的集合比较（新增即红），只是不进并集。
+NON_SURFACE_LABELS = frozenset({S_FIXTURE_ISSUER, S_CFN_SESSION_KEY_UNANALYZED,
+                                E_CFN_TEMPLATE_UNANALYZED})
 
 
 @dataclass(frozen=True)
@@ -166,17 +180,42 @@ def classify(allowed: frozenset[str], s: Surface, name: str = "") -> set[str]:
         if any(ok(A_CREATE_FUNCTION, c) for c in s.new_candidates) \
                 and ok(A_PASSROLE, s.edge_role):
             labels.add(E_NEW_FUNCTION)
+
+    # CFN：逐栈判。**前提是观测**——guard 三值、栈控制什么、前提是否核实。
+    for st in s.stacks:
+        via_update = ok(A_CFN_UPDATE, st.resource)
+        via_change_set = (ok(A_CFN_CREATE_CHANGESET, st.resource)
+                          and ok(A_CFN_EXECUTE_CHANGESET, st.resource))
+        if not (via_update or via_change_set):
+            continue
+        # `protected` 下的门槛是 `SetStackPolicy`；`unknown` 一律不算通过。
+        passable = (st.guard == GUARD_OPEN
+                    or (st.guard == GUARD_PROTECTED and ok(A_CFN_SET_POLICY, st.resource)))
+        definite = passable and st.premises_verified
+        if CONTROLS_EDGE in st.controls:
+            if definite:
+                if via_update:
+                    labels.add(E_CFN_UPDATE_STACK)
+                if via_change_set:
+                    labels.add(E_CFN_CHANGE_SET)
+            else:
+                labels.add(E_CFN_TEMPLATE_UNANALYZED)
+        if CONTROLS_SESSION_KEY in st.controls:
+            labels.add(S_CFN_SESSION_KEY_STACK if definite
+                       else S_CFN_SESSION_KEY_UNANALYZED)
     return labels
 
 
 def is_surface_label(label: str) -> bool:
     """这个标签本身是否构成**冒充面成员资格**。
 
-    `sign:fixture-issuer` 是受限冒充（只能签夹具域邮箱）⇒ 带 `sign:` 前缀只为在
-    per-label 计数里与其它签名路径排在一起，**不进并集**。
+    按 `NON_SURFACE_LABELS` **显式名单**排除，不按前缀猜：新增标签必须在那份名单上
+    做一次决定。`sign:fixture-issuer` 是受限冒充（只能签夹具域邮箱），两条
+    `*-unanalyzed` 是前提未核实 ⇒ 都带 `sign:` / `edge:` 前缀好在 per-label 计数里与
+    同类排在一起，但**不进并集**。
     """
-    return label != S_FIXTURE_ISSUER and (label.startswith(SIGN_PREFIX)
-                                          or label.startswith(EDGE_PREFIX))
+    return label not in NON_SURFACE_LABELS and (label.startswith(SIGN_PREFIX)
+                                                or label.startswith(EDGE_PREFIX))
 
 
 def fake_surface() -> Surface:
@@ -192,3 +231,11 @@ def fake_surface() -> Surface:
         edge_role="EDGEROLE",
         stacks=(),
     )
+
+
+def fake_stack(label: str, *, controls: frozenset[str],
+               guard: str = GUARD_UNKNOWN, premises_verified: bool = False) -> StackFact:
+    """反例用的假栈。`resource` 用标签拼一个不含账号值的假 StackId。"""
+    return StackFact(resource=f"STACK_{label.upper()}", label=label, guard=guard,
+                     service_role=None, controls=controls,
+                     premises_verified=premises_verified)

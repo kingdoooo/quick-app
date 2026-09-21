@@ -198,3 +198,107 @@ def test_edge_code_rights_do_not_spill_into_signer_hijack(m):
     assert m.classify(frozenset({f"lambda:UpdateFunctionCode|{s.auth.arn}",
                                  f"cloudfront:UpdateDistribution|{s.distribution}"}), s) \
         == {m.S_HIJACK_AUTH}
+
+
+# ---- CFN 侧：两个栈、guard 三值 ------------------------------------------------
+
+def _router(m, **kw):
+    return m.fake_stack("router", controls=frozenset({m.CONTROLS_EDGE}), **kw)
+
+
+def _deployer(m, **kw):
+    return m.fake_stack("deployer", controls=frozenset({m.CONTROLS_SESSION_KEY}), **kw)
+
+
+def _with(m, *stacks):
+    from dataclasses import replace
+    return replace(m.fake_surface(), stacks=tuple(stacks))
+
+
+def test_update_stack_on_open_router_stack_replaces_edge(m):
+    """栈已关联 CFN service role ⇒ 调用方自己不需要 `iam:PassRole`。
+    没有 stack policy 时单动作即成立。"""
+    s = _with(m, _router(m, guard=m.GUARD_OPEN, premises_verified=True))
+    st = s.stacks[0]
+    assert m.classify(frozenset({f"cloudformation:UpdateStack|{st.resource}"}), s) \
+        == {m.E_CFN_UPDATE_STACK}
+
+
+def test_stack_policy_closes_the_direct_update_path(m):
+    """ADR 0007：router 栈对四个精确逻辑 ID `Deny Update:*` ⇒ 直接更新那条路被挡住。
+    **但不等于该 principal 退出了冒充面**：模板层路径未分析 ⇒ 单列标签。"""
+    s = _with(m, _router(m, guard=m.GUARD_PROTECTED, premises_verified=True))
+    st = s.stacks[0]
+    labels = m.classify(frozenset({f"cloudformation:UpdateStack|{st.resource}"}), s)
+    assert labels == {m.E_CFN_TEMPLATE_UNANALYZED}
+    assert m.is_surface_label(m.E_CFN_TEMPLATE_UNANALYZED) is False
+
+
+def test_set_stack_policy_reopens_the_path(m):
+    """越过 stack policy 的门槛就是 `SetStackPolicy`（AWS 文档原话）。"""
+    s = _with(m, _router(m, guard=m.GUARD_PROTECTED, premises_verified=True))
+    st = s.stacks[0]
+    assert m.classify(frozenset({f"cloudformation:UpdateStack|{st.resource}",
+                                 f"cloudformation:SetStackPolicy|{st.resource}"}), s) \
+        == {m.E_CFN_UPDATE_STACK}
+
+
+def test_unknown_guard_never_yields_a_definite_label(m):
+    """`GetStackPolicy` 读不到、或策略语法不认识 ⇒ `unknown`。
+    **不得**按"没拦住"也不得按"拦住了"解释。"""
+    s = _with(m, _router(m, guard=m.GUARD_UNKNOWN, premises_verified=True))
+    st = s.stacks[0]
+    assert m.classify(frozenset({f"cloudformation:UpdateStack|{st.resource}"}), s) \
+        == {m.E_CFN_TEMPLATE_UNANALYZED}
+
+
+def test_change_set_chain_needs_both_actions(m):
+    """`CreateChangeSet` 单独不够（建了不能执行）；两个都有才等价于 UpdateStack。"""
+    s = _with(m, _router(m, guard=m.GUARD_OPEN, premises_verified=True))
+    st = s.stacks[0]
+    assert m.classify(frozenset({f"cloudformation:CreateChangeSet|{st.resource}"}), s) \
+        == set()
+    assert m.classify(frozenset({f"cloudformation:CreateChangeSet|{st.resource}",
+                                 f"cloudformation:ExecuteChangeSet|{st.resource}"}), s) \
+        == {m.E_CFN_CHANGE_SET}
+
+
+def test_change_set_chain_is_also_closed_by_the_guard(m):
+    """`ExecuteChangeSet` 没有临时覆盖 stack policy 的选项（ADR 0007）。"""
+    s = _with(m, _router(m, guard=m.GUARD_PROTECTED, premises_verified=True))
+    st = s.stacks[0]
+    assert m.classify(frozenset({f"cloudformation:CreateChangeSet|{st.resource}",
+                                 f"cloudformation:ExecuteChangeSet|{st.resource}"}), s) \
+        == {m.E_CFN_TEMPLATE_UNANALYZED}
+
+
+def test_deployer_stack_is_a_signing_path(m):
+    """两把会话签名 CMK 由 deployer 栈创建（`infra/app.py` 的 `kms.Key`）⇒ 能更新那个栈
+    就能改 key policy。它**不是** Edge 路径，标签也不同。"""
+    s = _with(m, _deployer(m, guard=m.GUARD_OPEN, premises_verified=True))
+    st = s.stacks[0]
+    assert m.classify(frozenset({f"cloudformation:UpdateStack|{st.resource}"}), s) \
+        == {m.S_CFN_SESSION_KEY_STACK}
+    assert m.is_surface_label(m.S_CFN_SESSION_KEY_STACK) is True
+
+
+def test_unverified_premises_downgrade_to_unanalyzed(m):
+    """"拥有 CMK ∧ 无 stack policy"**还不足以**推出"能改 key policy"：
+    要看这次更新以谁的身份执行、那个身份是否真能 `kms:PutKeyPolicy`。
+    前提未核实 ⇒ 单列，不进并集。"""
+    s = _with(m, _deployer(m, guard=m.GUARD_OPEN, premises_verified=False))
+    st = s.stacks[0]
+    assert m.classify(frozenset({f"cloudformation:UpdateStack|{st.resource}"}), s) \
+        == {m.S_CFN_SESSION_KEY_UNANALYZED}
+    assert m.is_surface_label(m.S_CFN_SESSION_KEY_UNANALYZED) is False
+
+
+def test_two_stacks_are_judged_independently(m):
+    """资源维度不许折叠：对 router 的更新权不外溢成签名能力，反之亦然。"""
+    s = _with(m, _router(m, guard=m.GUARD_OPEN, premises_verified=True),
+              _deployer(m, guard=m.GUARD_OPEN, premises_verified=True))
+    router, deployer = s.stacks
+    assert m.classify(frozenset({f"cloudformation:UpdateStack|{router.resource}"}), s) \
+        == {m.E_CFN_UPDATE_STACK}
+    assert m.classify(frozenset({f"cloudformation:UpdateStack|{deployer.resource}"}), s) \
+        == {m.S_CFN_SESSION_KEY_STACK}
