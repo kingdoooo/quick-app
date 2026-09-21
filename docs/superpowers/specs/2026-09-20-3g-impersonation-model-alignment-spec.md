@@ -3,7 +3,24 @@
 > **决策记录，不是操作指引。** 本文含单账号实测数据与当时的取舍过程，按写下的那一刻为准；
 > 采用者要的操作步骤真源是 `site-builder/DEPLOY.md`，还剩什么没做看 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9。
 
-状态：spec 已冻结，待实施。来源条目：`docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9 第 3g 行。
+状态：**代码与单测已实施；真机部分未做。** 来源条目：
+`docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9 第 3g 行。
+
+- **已完成（证据等级：纯函数 / fake 层 + 静态核验）**：共享模型 `scripts/_impersonation_model.py`
+  （反例 **44** 条，含 **6** 条变形测试证明反例集不是摆设）、guard 三值谓词
+  `scripts/_stack_policy_guard.py`（**14** 条，含与 `policy_problems()` 的对账）、
+  探针改用共享模型（**13** 条观测面用例）、闸门 grant 词表 + 采集两新腿 + 派生能力层 +
+  `model_inputs` + `--carry-categories`（闸门套件 **282** 条）。
+  静态核验：botocore 1.43.53 服务模型（`UpdateFunctionConfiguration` 无 `Publish`、
+  `UpdateFunctionCode` / `CreateFunction` 有）、AWS 文档《Restrictions on Lambda@Edge》
+  （不支持 Layer）、ADR 0007 的 stack policy 与门槛。
+- **未做（需要真实 AWS + 完整 config.ini）**：闸门首跑、schema 7 基线生成、探针重量测、
+  `docs/security/account-trust-boundary.md` 的数字、新增两腿的耗时量测。步骤见 §8.2。
+- 本机 `site-builder/config.ini` 是精简+脱敏态（只有 `[Platform]` + `[SessionKeys]` +
+  两个 `[SessionKey:*]`）⇒ panel 的 deploy 类用例在本机 `SystemExit`（27 条），
+  mcp 那条借宿主 `python3` 的命令报 `No module named pytest`。
+  **两者都与本次改动无关**（`git diff master..HEAD` 不含 `site-builder/panel` 与
+  `site-builder/mcp`），是这台机器的既有条件。
 本 spec 随仓库分发（tracked）：它冻结的是**资产**里的判定模型与迁移协议，不是本验证环境的操作记录。
 
 ## 1. 缺陷与本轮核验后的修正
