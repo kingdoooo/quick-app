@@ -455,3 +455,112 @@ def test_goes_red_when_changeset_chain_needs_only_one_action(m):
     """只要 `CreateChangeSet` 就算 ⇒ "建了不能执行"那条反例转红。"""
     m.A_CFN_EXECUTE_CHANGESET = ("cloudformation:CreateChangeSet",)
     assert _cases_pass(m) is False
+
+
+# ---- 从探针测试迁来的聚合语义用例（3g：判定与聚合都归共享模型）-------------------
+
+def test_read_only_kms_is_still_not_a_capability(m):
+    """反例：只有 `kms:GetPublicKey` 的 principal 既不能签，也拿不到夹具会话。
+    公钥不是秘密——把它算进冒充面会让 headline 虚高一大截。"""
+    s = m.fake_surface()
+    for key in s.kms_keys:
+        assert m.classify(frozenset({f"kms:GetPublicKey|{key}",
+                                     f"kms:DescribeKey|{key}"}), s) == set()
+
+
+def test_the_verifier_role_itself_is_the_url_entry(m):
+    """夹具签发器角色**本身**就持有那条入口（它的 inline policy 就是对 auth Function URL
+    的两条 invoke 语句）⇒ 名字判据要命中，别的名字不许因为名字拿到它。"""
+    s = m.fake_surface()
+    assert m.classify(frozenset(), s, s.verifier_role_name) == {m.S_FIXTURE_ISSUER}
+    assert m.classify(frozenset(), s, "some-other-role") == set()
+
+
+def test_fixture_issuer_is_reported_separately_from_can_sign(m):
+    """夹具签发器是**受限**冒充（只签夹具域邮箱、TTL ≤ 30 分钟、Edge 只在夹具站点认）
+    ⇒ 单列，不并进 `can_sign`。并进去会让"3c 之后还有多少人能冒充任意用户"这个数字
+    把验收工具的持有者也算进来。
+    """
+    agg = m.summarize({"p-fixture-only": {m.S_FIXTURE_ISSUER},
+                       "p-real-sign": {m.S_KMS_DIRECT}})
+    assert agg["can_sign"] == 1, "夹具签发器被并进了 can_sign"
+    assert agg["impersonation_surface_union"] == 1
+    assert agg["fixture_issuer_holders"] == 1
+
+
+def test_no_mitigation_can_report_a_negative_marginal_value(m):
+    """边际收益 = 冒充面里离开的人数，**分母是冒充面**。拿全体 principal 做分母时，
+    只持夹具入口的人会让 `principals_removed` 变成负数（面 1 → remaining 2）。
+    """
+    agg = m.summarize({"p-fixture-only": {m.S_FIXTURE_ISSUER},
+                       "p-cfn-only": {m.E_CFN_UPDATE_STACK}})
+    for name, mv in agg["marginal_value_if_closed"].items():
+        assert 0 <= mv["principals_removed"] <= agg["impersonation_surface_union"], (name, mv)
+        assert mv["surface_after"] <= agg["impersonation_surface_union"], (name, mv)
+    assert agg["marginal_value_if_closed"]["fixture-issuer-verifier-boundary"][
+        "principals_removed"] == 0, "关掉验收工具不该被记成冒充面收益"
+
+
+def test_a_principal_left_with_only_the_fixture_label_has_left_the_surface(m):
+    """`{sign:kms-direct, sign:fixture-issuer}` 的 principal 在 KMS 那一组关掉后只剩受限
+    入口（只能签夹具域邮箱）⇒ 它**真的离开了冒充面**，必须计入收益。
+
+    旧口径拿"还有标签没被关掉"当判据，于是它留在 `remaining` 里，
+    `restrictive-kms-key-policy` 的 `principals_removed` 少报一个——而那个数字就是
+    "限制性 key policy 值不值得做"的唯一依据。单标签的反例照不出这个错：两个标签才行。
+    """
+    agg = m.summarize({
+        "p-kms-and-fixture": {m.S_KMS_DIRECT, m.S_FIXTURE_ISSUER},
+        "p-kms-and-hijack": {m.S_KMS_DIRECT, m.S_HIJACK_AUTH},
+    })
+    assert agg["impersonation_surface_union"] == 2
+    mv = agg["marginal_value_if_closed"]["restrictive-kms-key-policy"]
+    assert mv["principals_removed"] == 1, mv      # 只有 p-kms-and-fixture 离开
+    assert mv["surface_after"] == 1, mv           # p-kms-and-hijack 还剩劫持 signer
+    assert agg["marginal_value_if_closed"]["harden-signer-code-update"][
+        "principals_removed"] == 0
+
+
+def test_the_same_membership_criterion_decides_entering_and_leaving_the_surface(m):
+    """进面与离面必须用**同一个**判据（`is_surface_label`）。
+
+    两套判据的症状不是崩，而是一个安静地算错的数字：受限标签既不让人进面，
+    就不能在离面时把人留住。
+    """
+    assert m.is_surface_label(m.S_KMS_DIRECT)
+    assert m.is_surface_label(m.E_CFN_UPDATE_STACK)
+    assert not m.is_surface_label(m.S_FIXTURE_ISSUER)
+    # 全部标签都要有明确归属：要么进面，要么在显式的 NON_SURFACE_LABELS 名单里
+    for lb in m.ALL_LABELS:
+        assert m.is_surface_label(lb) or lb in m.NON_SURFACE_LABELS, lb
+
+
+def test_the_verifier_role_name_is_pinned_to_the_deploy_auth_constant(m):
+    """`Surface.verifier_role_name` 的默认值是那个角色名的**第四份**字面量，必须钉住。
+
+    改了角色名而漏改这里的症状是**静默**的：名字判据不再命中任何 principal，
+    `sign:fixture-issuer` 的计数少掉 URL 入口那一半，而闸门与探针都照样 exit 0。
+
+    按 AST 从 `auth/deploy_auth.py`（生产真源）读，**不 import 它**——本模型刻意零 AWS
+    依赖，import 会把 boto3 拖进这条路。
+    """
+    import ast
+    src = (_ROOT / "site-builder" / "auth" / "deploy_auth.py").read_text(encoding="utf-8")
+    found = [n.value.value for n in ast.parse(src).body
+             if isinstance(n, ast.Assign) and len(n.targets) == 1
+             and getattr(n.targets[0], "id", None) == "VERIFIER_ROLE_NAME"
+             and isinstance(n.value, ast.Constant)]
+    assert len(found) == 1, f"deploy_auth.py 里的 VERIFIER_ROLE_NAME 不唯一：{found}"
+    assert m.Surface.verifier_role_name == found[0], (
+        f"模型写的是 {m.Surface.verifier_role_name!r}，deploy_auth.py 是 {found[0]!r}"
+        "——名字判据已经命不中任何 principal 了")
+
+
+def test_goes_red_when_the_fixture_issuer_entry_is_dropped(m):
+    """变形：把"直接 invoke auth"这条入口从动作等价类里去掉 ⇒ 夹具入口的判定转红。
+    （这条原先在探针的 `--self-test` 里；判定搬走之后它必须跟着搬。）"""
+    s = m.fake_surface()
+    assert m.classify(frozenset({f"lambda:InvokeFunction|{s.auth.arn}"}), s) \
+        == {m.S_FIXTURE_ISSUER}
+    m.A_INVOKE = ("lambda:ThisActionDoesNotExist",)
+    assert m.classify(frozenset({f"lambda:InvokeFunction|{s.auth.arn}"}), s) == set()

@@ -9,30 +9,18 @@ asymmetric-session-signing-spec.md` §1 的数字由本脚本产生。
 
 ## 为什么要单独有它（而不是直接读闸门基线）
 
-闸门的 `replace-platform-code` 把"能替换平台代码"建模成**一个动作**
-（`lambda:UpdateFunctionCode`）。那个模型两个方向都错，本脚本按
-**动作等价类 × 资源等价类**重建：
+闸门是**漂移**闸门（有基线、会红、覆盖 IAM 写与 resource policy 等层）；本脚本回答
+一个不同的问题："今天到底有多少 principal 能冒充任意用户，关掉某一组路径能少几个"。
+它没有基线、不会红，产出的是聚合计数。
 
-- **过度声称**：对 Lambda@Edge 不成立。`UpdateFunctionCode` 只改未发布的
-  `$LATEST`，而 CloudFront **必须**关联编号版本（CFN 文档原文："You must specify
-  the ARN of a function version; you can't specify an alias or `$LATEST`"）
-  ⇒ 光有它不改变正在执行的代码。同理对**站点函数**也不成立：M7 之后站点的
-  Function URL 挂在 blue/green alias 上，改 `$LATEST` 不改变 alias 指向的版本。
-- **同时少算**：至少漏三条等价路径——
-  ① `UpdateFunctionCode(Publish=True)` 一次调用即改码即发版本，不需要单独的
-     `PublishVersion`；
-  ② `cloudformation:UpdateStack` 与 `CreateChangeSet`+`ExecuteChangeSet`（router
-     栈**已关联** CFN service role 且**无 stack policy** ⇒ 调用方自己不需要
-     `iam:PassRole`，CFN 会继续用那个 role）；
-  ③ **劫持 signer 本身**：`site-auth-service` / `site-panel` 的 Function URL
-     **无 qualifier**、部署脚本用裸 `update_function_code` ⇒ 服务的是 `$LATEST`，
-     于是 `lambda:UpdateFunctionCode` 一个动作就是"在那个执行角色下跑任意代码"。
-     3c 之后这两个角色持 `kms:Sign` ⇒ 这条路**既不需要攻击者自己有 `kms:Sign`，
-     也不需要碰 Edge**。闸门今天记的 `replace-platform-code:site-auth-service`
-     其实就是它，但 spec §1 的口径没把它算进冒充面。
-
-⇒ 对 auth/panel 这类"Function URL 服务 `$LATEST`"的函数，单动作模型**恰好是对的**；
-错的是把同一个模型套到必须关联编号版本的 Edge 与挂 alias 的站点函数上。
+**判定本身两边共用同一份**（3g，2026-09-21）：`_impersonation_model.py`。此前闸门与
+本脚本各有一套，两套都失真——闸门把"能替换平台代码"压成 `lambda:UpdateFunctionCode`
+一个动作（对 Edge 过度声称、对 CFN 少算），本脚本把代码更新与配置更新合成一类
+（`UpdateFunctionConfiguration` 没有 `Publish`，而 Lambda@Edge **不支持 Layer**）、
+CFN 前提停在 ADR 0007 之前（router 栈**现在有** stack policy，门槛是
+`cloudformation:SetStackPolicy`）、还把 `PublishVersion` 当成"新建函数再关联"的必需
+前提（`CreateFunction` 自带 `Publish`）。共享模型的反例集在
+`deployer/tests/test_impersonation_model.py`，形状与前提三值见那个模块的 docstring。
 
 ## 只读
 
@@ -78,9 +66,7 @@ import importlib.util
 import json
 import subprocess
 import sys
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 _HERE = Path(__file__).resolve().parent
 _ROOT = _HERE.parent.parent                      # 仓库根（**不写绝对路径**）
@@ -89,379 +75,51 @@ ROUTER_CONFIG = _ROOT / "router" / "config.ini"
 SITE_CONFIG = _ROOT / "site-builder" / "config.ini"      # [SessionKeys]：两把 CMK 的 key ARN
 EVIDENCE = _ROOT / "docs" / "security" / "3c-impersonation-surface.json"
 
-# ---------------------------------------------------------------- 动作等价类
+
+# ---------------------------------------------------------------- 判定不在本文件
 #
-# **一种能力 = 一个动作等价类 × 一个资源等价类。** 这条形状是闸门里最重要的不变量，
-# 本脚本沿用（`verify_account_trust_boundary.py` 的 `A_*` 注释记了它被违反过的
-# 三次）。往任一维加成员时，同时在 `--self-test` 里加一条**只命中该新成员**的反例。
-
-# 直接签。KMS 的 key policy 是权威的 ⇒ 这里量到的是 **identity policy 的上界**。
-KMS_SIGN = ("kms:Sign",)
-# 自助授权：改 key policy 或给自己发 grant，然后再签。
-KMS_SELF_AUTHORIZE = ("kms:PutKeyPolicy", "kms:CreateGrant")
-# 只为对照打印，不构成冒充能力（公钥不是秘密）。
-KMS_READONLY = ("kms:GetPublicKey", "kms:DescribeKey")
-
-# 在某个函数的执行角色下跑任意代码。
-#   · `UpdateFunctionCode`：直接换码。
-#   · `UpdateFunctionConfiguration`：可挂 Layer（Layer 里的模块能遮蔽 handler
-#     import 的模块）⇒ 同样是任意代码执行。**这是上界口径的选择**：它还需要能
-#     发布/读到一个 Layer，本脚本不追那一步，宁可高估也不漏报。
-LAMBDA_CODE_EXEC = ("lambda:UpdateFunctionCode", "lambda:UpdateFunctionConfiguration")
-LAMBDA_PUBLISH = ("lambda:PublishVersion",)
-LAMBDA_CREATE = ("lambda:CreateFunction",)
-# 夹具签发器的**直接入口**：`POST /fixture-session` 走 auth 的 Function URL，而 Function URL
-# 的 IAM 授权用的就是 `lambda:InvokeFunctionUrl` + `lambda:InvokeFunction`。能直接调 auth 函数的
-# principal 不需要 assume `site-builder-verifier` 就能拿到夹具会话（spec §11.7 / ADR 0002）。
-LAMBDA_INVOKE = ("lambda:InvokeFunction",)
-CF_READ = ("cloudfront:GetDistributionConfig",)
-CF_WRITE = ("cloudfront:UpdateDistribution",)
-# router 栈已关联 CFN service role 且无 stack policy ⇒ 这两条都不需要 PassRole。
-CFN_UPDATE = ("cloudformation:UpdateStack",)
-CFN_CHANGESET = ("cloudformation:CreateChangeSet", "cloudformation:ExecuteChangeSet")
-IAM_PASSROLE = ("iam:PassRole",)
-
-# ---------------------------------------------------------------- 能力标签
+# `classify()`、能力标签与聚合口径住在 `_impersonation_model.py`（**闸门 import 同一份**），
+# 反例集在 `deployer/tests/test_impersonation_model.py`。本文件只做两件事：
+# **观测**（真机拼出 `Surface`）与**报告**（聚合计数落 tracked 证据）。
 #
-# `sign:*` = 能产生一个 verifier 会接受的签名；`edge:*` = 能改变 verifier 本身。
-# 两类都是冒充，冒充面 = 并集。
-SIGN_PREFIX = "sign:"
-EDGE_PREFIX = "edge:"
+# 两边各抄一份判定正是 3g 的成因：闸门那份对 Edge 过度声称、对 CFN 少算，本文件那份
+# 把代码更新与配置更新合成一类、CFN 前提停在 ADR 0007 之前、还多要了一个 PublishVersion。
+if str(_HERE) not in sys.path:      # 测试用 spec_from_file_location 加载本文件时本目录不在 sys.path
+    sys.path.insert(0, str(_HERE))
+import _impersonation_model as model              # noqa: E402
+from _stack_policy_guard import guard_for         # noqa: E402
 
-S_KMS_DIRECT = "sign:kms-direct"
-S_KMS_SELF = "sign:kms-self-authorize"
-S_HIJACK_AUTH = "sign:hijack-auth-signer"
-S_HIJACK_PANEL = "sign:hijack-panel-signer"
-# **受限**冒充：夹具签发器只给夹具域（`e2e.invalid`）的邮箱签站点会话，TTL ≤ 30 分钟，
-# 而 Edge 只在夹具站点与平台路由上认这种会话、panel 拒绝把夹具域邮箱写进任何权限字段
-# （spec §11.7 / ADR 0002）。所以它**单列**、不并进 `can_sign`：并进去会让"3c 之后还有多少人
-# 能冒充任意用户"这个 headline 把验收工具的持有者也算进来。
-S_FIXTURE_ISSUER = "sign:fixture-issuer"
-E_PUBLISH_THEN_ASSOCIATE = "edge:code+publish+associate"
-E_PUBLISH_INLINE = "edge:code(Publish=True)+associate"
-E_NEW_FUNCTION = "edge:new-function+associate"
-E_CFN_UPDATE_STACK = "edge:cfn-update-stack"
-E_CFN_CHANGE_SET = "edge:cfn-change-set"
-
-ALL_LABELS = (S_KMS_DIRECT, S_KMS_SELF, S_HIJACK_AUTH, S_HIJACK_PANEL, S_FIXTURE_ISSUER,
-              E_PUBLISH_THEN_ASSOCIATE, E_PUBLISH_INLINE, E_NEW_FUNCTION,
-              E_CFN_UPDATE_STACK, E_CFN_CHANGE_SET)
-
-# 夹具签发器角色名。**第四份同名字面量**（`auth/deploy_auth.py` 与 `auth/login_handler.py` 是
-# 生产真源，`scripts/_session_mint.py` 是验收客户端）：本探针刻意不 import 它们——那会把
-# boto3 与 auth 的模块级初始化拖进 `--self-test`（那条路必须一个 AWS 依赖都没有）。
-# 这里只做**名字相等比较**，改名时 `verify_deployed_components.py` 的角色存在性那条会先红。
-VERIFIER_ROLE_NAME = "site-builder-verifier"
-
-# ---------------------------------------------------------------- 候选缓解措施
-#
-# **"少算一个动作"与"这个措施值不值得做"是两个问题。** 旧口径拿
-# `sign_only`（能签名但不能替换 Edge）当限制性 key policy 的收益判据，那是错的：
-# 劫持 signer 那条路**不需要攻击者自己有 `kms:Sign`**（恶意代码是以 signer 角色的
-# 身份调 KMS 的），所以 key policy 收不掉它。真正的判据是**边际收益**：
-# 关掉这一组路径之后，有多少 principal **完全**离开冒充面。
-MITIGATIONS: dict[str, tuple[str, ...]] = {
-    # 限制性 KMS key policy（spec §1 的决策点、§11 未决项 2）
-    "restrictive-kms-key-policy": (S_KMS_DIRECT, S_KMS_SELF),
-    # 收窄谁能改 site-auth-service / site-panel 的代码与配置
-    "harden-signer-code-update": (S_HIJACK_AUTH, S_HIJACK_PANEL),
-    # 给 router 栈加 stack policy（今天**没有**，实测）
-    "router-stack-policy": (E_CFN_UPDATE_STACK, E_CFN_CHANGE_SET),
-    # 锁住 Edge 的 association / 换码那条直接链
-    "lock-edge-association": (E_PUBLISH_INLINE, E_PUBLISH_THEN_ASSOCIATE,
-                              E_NEW_FUNCTION),
-    # 夹具签发器：它的"缓解"就是 **verifier 侧的边界**（ADR 0002：Edge 只在夹具站点与平台路由上
-    # 认夹具会话，panel 拒绝夹具域邮箱进任何权限字段），这条边界已经在生产代码里。关掉这一组
-    # 等于关掉整套验收工具（四个 verify_* + E2E + smoke 都靠它拿登录态）⇒ **边际收益按 0 记**，
-    # 而 0 正是 `summarize` 会算出来的结果：夹具入口不进 `can_sign` ⇒ 只持它的人本来就不在冒充面里。
-    "fixture-issuer-verifier-boundary": (S_FIXTURE_ISSUER,),
-}
-
-
-@dataclass(frozen=True)
-class Surface:
-    """探针要打的资源集合。**全部靠发现，不硬编码**——distribution ID / 账号 ID /
-    内部角色名都不许出现在被跟踪的源码里（仓库红线）。"""
-    region: str
-    # 真实的两把会话签名 CMK（`[SessionKeys]` 里 site + console 的 current/previous 全部 key ARN）。
-    # **不再是占位 ARN**：占位 ARN 量的是"对本账号任意 key 的 identity 上界"，两把 key 真的存在之后
-    # 那个口径会把 `kms:Sign|<占位>` 变成谁都没有 ⇒ `sign:kms-direct` 恒为 0，读起来像这条路已经关了。
-    kms_keys: tuple[str, ...]
-    edge_fn: str
-    auth_fn: str
-    panel_fn: str
-    new_fn: str             # 占位 ARN：给"新建函数再关联"那条路
-    distribution: str
-    stack: str
-    edge_role: str
-    # 载荷性前提：association 真的挂在**编号版本**上（不是 alias / $LATEST）
-    edge_association_qualifier: str = ""
-
-    def groups(self) -> tuple[tuple[list[str], list[str]], ...]:
-        """按服务分组批量模拟。跨服务混在一条调用里会产生大量无意义的
-        action×resource 组合（都是 implicitDeny），既慢又难读。"""
-        return (
-            (list(KMS_SIGN + KMS_SELF_AUTHORIZE + KMS_READONLY), list(self.kms_keys)),
-            (list(LAMBDA_CODE_EXEC + LAMBDA_PUBLISH + LAMBDA_CREATE + LAMBDA_INVOKE),
-             [self.edge_fn, self.auth_fn, self.panel_fn, self.new_fn]),
-            (list(CF_READ + CF_WRITE), [self.distribution]),
-            (list(CFN_UPDATE + CFN_CHANGESET), [self.stack]),
-            (list(IAM_PASSROLE), [self.edge_role]),
-        )
-
-
-def classify(allowed: frozenset[str], s: Surface, name: str = "") -> set[str]:
-    """一个 principal 的 `"action|resource"` 允许集合（+ 它的名字）→ 它持有的**能力标签**。
-
-    **纯函数**，不碰 AWS ⇒ 反例可以在本文件里跑（`--self-test`）。这是本脚本唯一
-    的判定逻辑；真机部分只负责把 `allowed` 填出来。
-
-    `name` 只用于一条判据：`site-builder-verifier` 角色**本身**就持有夹具签发器那条路
-    （它的 inline policy 就是对 auth Function URL 的两条 invoke 语句），这在
-    `simulate_principal_policy` 的结果里表现为 invoke 被允许，但显式按名字判一次更稳
-    ——它是资产里唯一"名字即能力"的角色。
-    """
-    def ok(actions, resource: str) -> bool:
-        return any(f"{a}|{resource}" in allowed for a in actions)
-
-    def ok_any_key(actions) -> bool:
-        """**任一把 key 成立即算**：site 那把能签站点会话、console 那把能签面板会话，
-        两者都是完整冒充。折成"只看 site"会漏掉一整个 family。"""
-        return any(ok(actions, k) for k in s.kms_keys)
-
-    labels: set[str] = set()
-
-    if ok_any_key(KMS_SIGN):
-        labels.add(S_KMS_DIRECT)
-    if ok_any_key(KMS_SELF_AUTHORIZE):
-        labels.add(S_KMS_SELF)
-    # 劫持 signer：这两个函数的 Function URL 无 qualifier、服务 `$LATEST`
-    # ⇒ 换码即刻生效，**不需要发版本、不需要碰 CloudFront**。
-    if ok(LAMBDA_CODE_EXEC, s.auth_fn):
-        labels.add(S_HIJACK_AUTH)
-    if ok(LAMBDA_CODE_EXEC, s.panel_fn):
-        labels.add(S_HIJACK_PANEL)
-    # 夹具签发器（受限冒充，单列）：直接 invoke auth 函数 = 直接入口；角色名相等 = URL 入口。
-    if ok(LAMBDA_INVOKE, s.auth_fn) or (name and name == VERIFIER_ROLE_NAME):
-        labels.add(S_FIXTURE_ISSUER)
-
-    # Edge：必须让 CloudFront 关联到攻击者的代码上。三类等价路径。
-    if ok(CF_WRITE, s.distribution):
-        if ok(LAMBDA_CODE_EXEC, s.edge_fn):
-            labels.add(E_PUBLISH_INLINE)          # UpdateFunctionCode(Publish=True)
-            if ok(LAMBDA_PUBLISH, s.edge_fn):
-                labels.add(E_PUBLISH_THEN_ASSOCIATE)
-        if (ok(LAMBDA_CREATE, s.new_fn) and ok(LAMBDA_PUBLISH, s.new_fn)
-                and ok(IAM_PASSROLE, s.edge_role)):
-            labels.add(E_NEW_FUNCTION)
-    if ok(CFN_UPDATE, s.stack):
-        labels.add(E_CFN_UPDATE_STACK)
-    if all(f"{a}|{s.stack}" in allowed for a in CFN_CHANGESET):
-        labels.add(E_CFN_CHANGE_SET)
-    return labels
-
-
-def is_surface_label(label: str) -> bool:
-    """这个标签本身是否构成**冒充面成员资格**。
-
-    `summarize` 的三处判定（can_sign / can_edge / 边际收益的剩余标签）必须用**同一个**判据，
-    否则会出现"进面按一套、离面按另一套"：`{sign:kms-direct, sign:fixture-issuer}` 的 principal
-    在 KMS 那一组被关掉后已经离开冒充面（夹具入口只能签夹具域邮箱），而按"还有标签"判会把它
-    算成留下，于是限制性 key policy 的收益少报一个。
-    """
-    return label != S_FIXTURE_ISSUER and (label.startswith(SIGN_PREFIX)
-                                         or label.startswith(EDGE_PREFIX))
-
-
-def summarize(by_principal: dict[str, set[str]]) -> dict[str, Any]:
-    """能力标签 → 聚合结论。**只出计数与集合关系，不出名字。**"""
-    def holders(pred) -> set[str]:
-        return {arn for arn, ls in by_principal.items() if pred(ls)}
-
-    per_label = {lb: len(holders(lambda ls, lb=lb: lb in ls)) for lb in ALL_LABELS}
-    # **`sign:fixture-issuer` 不进 `can_sign`**（spec §1：受限冒充，单列不合并）。它带 `sign:`
-    # 前缀是为了在 per_label 里与其它签名路径排在一起，但它签不出任意用户的会话。
-    can_sign = holders(lambda ls: any(is_surface_label(l) and l.startswith(SIGN_PREFIX)
-                                      for l in ls))
-    can_edge = holders(lambda ls: any(is_surface_label(l) and l.startswith(EDGE_PREFIX)
-                                      for l in ls))
-    surface = can_sign | can_edge
-
-    # 每个候选措施的**边际收益** = 关掉那一组路径后完全离开冒充面的 principal 数。
-    #
-    # 两条都必须按 `is_surface_label` 过滤，判据与 can_sign/can_edge **是同一个**：
-    # · **分母只在 `surface` 里算**：拿全体 principal 当分母时，只持夹具入口的人（本来就不在
-    #   冒充面里）会留在 remaining 里，把 `principals_removed` 算成负数；
-    # · **剩余标签也只看冒充面标签**：`{sign:kms-direct, sign:fixture-issuer}` 这种 principal 在
-    #   KMS 那一组关掉之后**真的离开了冒充面**（剩下的夹具入口只能签夹具域），拿"还有标签没被关掉"
-    #   当判据会把它算成留下 ⇒ `restrictive-kms-key-policy` 的收益少报一个，而那个数字正是
-    #   "限制性 key policy 值不值得做"的唯一依据。
-    marginal: dict[str, dict[str, int]] = {}
-    for name, closed in MITIGATIONS.items():
-        remaining = {arn for arn in surface
-                     if {l for l in by_principal[arn] if is_surface_label(l)} - set(closed)}
-        marginal[name] = {
-            "closes_paths": len(closed),
-            "surface_after": len(remaining),
-            "principals_removed": len(surface) - len(remaining),
-        }
-    return {
-        "principals_simulated": len(by_principal),
-        "per_label": per_label,
-        "can_sign": len(can_sign),
-        "can_replace_edge_verifier": len(can_edge),
-        # 单列：受限冒充的持有者数（**不在** impersonation_surface_union 里）。
-        "fixture_issuer_holders": len(holders(lambda ls: S_FIXTURE_ISSUER in ls)),
-        "impersonation_surface_union": len(surface),
-        "both": len(can_sign & can_edge),
-        "sign_only": len(can_sign - can_edge),
-        "edge_only": len(can_edge - can_sign),
-        "marginal_value_if_closed": marginal,
-        "_sets": {"can_sign": can_sign, "can_edge": can_edge, "surface": surface},
-    }
-
-
-# ---------------------------------------------------------------- 反例自检
-
-def _fake_surface() -> Surface:
-    # 两把 key（site / console）：`kms:Sign` 打在**任一把**上都是完整冒充，反例要能分别命中。
-    return Surface(region="r", kms_keys=("KEY", "KEY2"), edge_fn="EDGE", auth_fn="AUTH",
-                   panel_fn="PANEL", new_fn="NEW", distribution="DIST",
-                   stack="STACK", edge_role="EDGEROLE",
-                   edge_association_qualifier="7")
+classify = model.classify
+summarize = model.summarize
+MITIGATIONS = model.MITIGATIONS
+ALL_LABELS = model.ALL_LABELS
 
 
 def self_test() -> int:
-    """**每条新等价路径都要有一条只命中它的反例**，外加一条正向控制证明我们
-    没有把"单个动作"当成能力。这些用例是 Codex 第十四轮明确要求的独立反例。
+    """委托共享模型的聚合断言，并打印它来自哪里。
+
+    **判定层的反例不在这里**：它们在 `deployer/tests/test_impersonation_model.py`
+    （pytest 会真的跑到，35 条含 6 条变形），本函数只做一次"共享模型能 import 且聚合
+    口径正常"的冒烟。原先那张 `cases` 表连同判定一起搬走了——反例与被测代码在同一个
+    文件里最容易退化成"改判定顺手改期望"。
     """
-    s = _fake_surface()
-
-    def labels(*pairs: str) -> set[str]:
-        return classify(frozenset(pairs), s)
-
-    cases: list[tuple[str, set[str], set[str]]] = [
-        # ---- 正向控制：单动作**不足以**替换正在运行的 Edge ----
-        ("只有 UpdateFunctionCode(Edge)：闸门今天会记 replace-platform-code，"
-         "而它改不了正在执行的代码",
-         labels("lambda:UpdateFunctionCode|EDGE"), set()),
-        ("UpdateFunctionCode+PublishVersion 但不能改 association",
-         labels("lambda:UpdateFunctionCode|EDGE", "lambda:PublishVersion|EDGE"),
-         set()),
-        # ---- 反例①：Publish=True 一次调用，无 PublishVersion ----
-        ("UpdateFunctionCode(Publish=True)+UpdateDistribution（无 PublishVersion）",
-         labels("lambda:UpdateFunctionCode|EDGE",
-                "cloudfront:UpdateDistribution|DIST"),
-         {E_PUBLISH_INLINE}),
-        ("三个都有时两条 Edge 路径都记",
-         labels("lambda:UpdateFunctionCode|EDGE", "lambda:PublishVersion|EDGE",
-                "cloudfront:UpdateDistribution|DIST"),
-         {E_PUBLISH_INLINE, E_PUBLISH_THEN_ASSOCIATE}),
-        # ---- 反例②：change set 链 ----
-        ("CreateChangeSet+ExecuteChangeSet（无 UpdateStack）",
-         labels("cloudformation:CreateChangeSet|STACK",
-                "cloudformation:ExecuteChangeSet|STACK"),
-         {E_CFN_CHANGE_SET}),
-        ("只有 CreateChangeSet 不够（不能执行）",
-         labels("cloudformation:CreateChangeSet|STACK"), set()),
-        ("UpdateStack 单动作即可（栈已关联 service role、无 stack policy）",
-         labels("cloudformation:UpdateStack|STACK"), {E_CFN_UPDATE_STACK}),
-        # ---- 反例③：劫持 signer，不碰 Edge、自己没有 kms:Sign ----
-        ("只有 UpdateFunctionCode(auth)：无 KMS 权限也能签站点+console 会话",
-         labels("lambda:UpdateFunctionCode|AUTH"), {S_HIJACK_AUTH}),
-        ("只有 UpdateFunctionCode(panel)：能签 console 会话",
-         labels("lambda:UpdateFunctionCode|PANEL"), {S_HIJACK_PANEL}),
-        ("UpdateFunctionConfiguration(auth) 也算（Layer 遮蔽模块）",
-         labels("lambda:UpdateFunctionConfiguration|AUTH"), {S_HIJACK_AUTH}),
-        # ---- 反例④：资源维度不许折叠 ----
-        ("Edge 上的换码权限**不能**外溢成劫持 auth signer",
-         labels("lambda:UpdateFunctionCode|EDGE",
-                "cloudfront:UpdateDistribution|DIST"),
-         {E_PUBLISH_INLINE}),
-        ("auth 上的换码权限**不能**外溢成替换 Edge",
-         labels("lambda:UpdateFunctionCode|AUTH",
-                "cloudfront:UpdateDistribution|DIST"),
-         {S_HIJACK_AUTH}),
-        # ---- 反例⑤：新建函数再关联，缺 PassRole 不成立 ----
-        ("CreateFunction+PublishVersion+UpdateDistribution 但无 PassRole",
-         labels("lambda:CreateFunction|NEW", "lambda:PublishVersion|NEW",
-                "cloudfront:UpdateDistribution|DIST"), set()),
-        ("补上 PassRole 后成立",
-         labels("lambda:CreateFunction|NEW", "lambda:PublishVersion|NEW",
-                "cloudfront:UpdateDistribution|DIST", "iam:PassRole|EDGEROLE"),
-         {E_NEW_FUNCTION}),
-        # ---- 反例⑥：KMS ----
-        ("kms:Sign", labels("kms:Sign|KEY"), {S_KMS_DIRECT}),
-        ("kms:Sign 打在另一把 key 上同样成立（console family）",
-         labels("kms:Sign|KEY2"), {S_KMS_DIRECT}),
-        ("kms:CreateGrant 自助授权", labels("kms:CreateGrant|KEY"), {S_KMS_SELF}),
-        ("kms:GetPublicKey 不是冒充能力（公钥不是秘密），也不是夹具入口",
-         labels("kms:GetPublicKey|KEY2", "kms:DescribeKey|KEY2"), set()),
-        # ---- 反例⑦：夹具签发器（受限冒充，单列标签）----
-        ("只有 lambda:InvokeFunction(auth)：夹具签发器的直接入口，不需要 assume verifier",
-         labels("lambda:InvokeFunction|AUTH"), {S_FIXTURE_ISSUER}),
-        ("同一个动作打在 panel 上不是夹具入口（资源维度不折叠）",
-         labels("lambda:InvokeFunction|PANEL"), set()),
-        ("换 auth 的码是完整冒充，不是受限的那条",
-         labels("lambda:UpdateFunctionCode|AUTH"), {S_HIJACK_AUTH}),
-        ("verifier 角色本身即持有 URL 入口（名字判据）",
-         classify(frozenset(), s, VERIFIER_ROLE_NAME), {S_FIXTURE_ISSUER}),
-        ("别的角色名不因为名字拿到夹具入口",
-         classify(frozenset(), s, "site-deployer-validate"), set()),
-        ("空集", labels(), set()),
-    ]
-
-    bad = [(w, got, want) for w, got, want in cases if got != want]
-    for why, got, want in cases:
-        print(f"  {'ok  ' if got == want else 'FAIL'} {why}")
-        if got != want:
-            print(f"       期望 {sorted(want)} 实得 {sorted(got)}")
-
-    # 聚合层的反例：sign 与 edge 两类必须分别计入并集，不能只算一类；而**夹具签发器单列**
-    # ——只持它的 principal 不进并集（受限冒充，spec §1）。
+    print("判定与聚合来自共享模型 _impersonation_model.py"
+          "（反例集：deployer/tests/test_impersonation_model.py）")
     agg = summarize({
-        "p-sign-only": {S_HIJACK_AUTH},
-        "p-edge-only": {E_CFN_UPDATE_STACK},
-        "p-both": {S_KMS_DIRECT, E_CFN_CHANGE_SET},
-        "p-fixture-only": {S_FIXTURE_ISSUER},
+        "p-sign": {model.S_HIJACK_AUTH},
+        "p-edge": {model.E_CFN_UPDATE_STACK},
+        "p-both": {model.S_KMS_DIRECT, model.E_CFN_CHANGE_SET},
+        "p-fixture": {model.S_FIXTURE_ISSUER},
+        "p-unanalyzed": {model.E_CFN_TEMPLATE_UNANALYZED},
     })
-    want_agg = {"can_sign": 2, "can_replace_edge_verifier": 2,
-                "impersonation_surface_union": 3, "both": 1,
-                "sign_only": 1, "edge_only": 1, "fixture_issuer_holders": 1}
-    agg_bad = {k: (agg[k], v) for k, v in want_agg.items() if agg[k] != v}
-    print(f"  {'ok  ' if not agg_bad else 'FAIL'} 聚合：sign/edge 两类都进并集，"
-          f"夹具签发器单列不进")
-    if agg_bad:
-        print(f"       {agg_bad}")
-
-    # 边际收益的反例：**限制性 key policy 收不掉劫持 signer 那条路**。
-    # `p-kms-only` 只有 KMS 直签 ⇒ 会离开；`p-kms-and-hijack` 还剩劫持 signer
-    # ⇒ 留在面里。旧口径（拿"能签名但不能替换 Edge"当判据）会把后者算成收益。
-    mv = summarize({
-        "p-kms-only": {S_KMS_DIRECT},
-        "p-kms-and-hijack": {S_KMS_DIRECT, S_HIJACK_AUTH},
-        "p-cfn-only": {E_CFN_UPDATE_STACK},
-        "p-fixture-only": {S_FIXTURE_ISSUER},
-        # **两个标签、其中一个是受限的那条**：关掉 KMS 那一组之后它只剩夹具入口
-        # ⇒ 真的离开了冒充面，必须计入收益。按"还有标签没关掉"判会把它算成留下
-        # （`restrictive-kms-key-policy` 于是读成 1 而不是 2）。
-        "p-kms-and-fixture": {S_KMS_DIRECT, S_FIXTURE_ISSUER},
-    })["marginal_value_if_closed"]
-    # 夹具签发器那条按 0 记：只持它的人本来就不在冒充面里 ⇒ 关掉它没人离开
-    # （分母是冒充面，否则这个数会是负的）。
-    mv_want = {"restrictive-kms-key-policy": 2, "harden-signer-code-update": 0,
-               "router-stack-policy": 1, "fixture-issuer-verifier-boundary": 0}
-    mv_bad = {k: (mv[k]["principals_removed"], v) for k, v in mv_want.items()
-              if mv[k]["principals_removed"] != v}
-    print(f"  {'ok  ' if not mv_bad else 'FAIL'} 边际收益：key policy 收不掉劫持 signer；"
-          f"只剩受限标签的 principal 算离开")
-    if mv_bad:
-        print(f"       {mv_bad}")
-
-    if bad or agg_bad or mv_bad:
-        print(f"\n{len(bad) + len(agg_bad) + len(mv_bad)} 条反例未通过", file=sys.stderr)
+    want = {"can_sign": 2, "can_replace_edge_verifier": 2,
+            "impersonation_surface_union": 3, "both": 1,
+            "fixture_issuer_holders": 1, "non_surface_only_holders": 2}
+    bad = {k: (agg[k], v) for k, v in want.items() if agg[k] != v}
+    print(f"  {'ok  ' if not bad else 'FAIL'} 聚合：两类进并集，受限/未分析单列不进")
+    if bad:
+        print(f"       {bad}", file=sys.stderr)
         return 1
-    print(f"\n全部 {len(cases)} 条反例 + 2 条聚合/边际断言通过")
     return 0
 
 
@@ -499,7 +157,69 @@ def session_key_arns() -> tuple[str, ...]:
     return tuple(dict.fromkeys(r.key_arn for r in key_refs(keys, ("site", "console"))))
 
 
-def discover(gate, clients, region: str, account: str) -> Surface:
+def _stack_logical_ids(cfn, stack: str, types: tuple[str, ...]) -> list[str]:
+    """栈里这些资源类型的 `LogicalResourceId`。guard 谓词要按它们判"拦住了什么"。"""
+    out = []
+    for page in cfn.get_paginator("list_stack_resources").paginate(StackName=stack):
+        for r in page["StackResourceSummaries"]:
+            if r["ResourceType"] in types:
+                out.append(r["LogicalResourceId"])
+    return sorted(out)
+
+
+def _stack_facts(cfn, router_stack: str, deployer_stack: str) -> tuple:
+    """两个栈的**观测**事实：guard、service role、控制什么、前提是否核实。
+
+    **router 栈自 ADR 0007 起有 stack policy**（对四个精确逻辑 ID `Deny Update:*`），
+    所以"能 UpdateStack 就能替换 Edge"这条推理现在要看 guard；deployer 栈拥有两把会话
+    签名 CMK（`infra/app.py` 的 `kms.Key`）⇒ 它是一条**签名**路径，与 Edge 那条不同。
+
+    `premises_verified` 一律 False：谁执行这次更新已经观测到了（`RoleARN`），但
+    "那个身份是否真能改目标资源"还没核 ⇒ 判定落 `*-unanalyzed`（单列、不进并集）。
+    这是刻意的下界，见 spec §9。
+    """
+    plan = ((router_stack, "router", frozenset({model.CONTROLS_EDGE}),
+             ("AWS::Lambda::Function", "AWS::CloudFront::Distribution",
+              "AWS::DynamoDB::Table")),
+            (deployer_stack, "deployer", frozenset({model.CONTROLS_SESSION_KEY}),
+             ("AWS::KMS::Key",)))
+    facts = []
+    for name, label, controls, types in plan:
+        body = cfn.get_stack_policy(StackName=name).get("StackPolicyBody")
+        described = cfn.describe_stacks(StackName=name)["Stacks"][0]
+        facts.append(model.StackFact(
+            resource=described["StackId"], label=label,
+            guard=guard_for(json.loads(body) if body else None,
+                            _stack_logical_ids(cfn, name, types)),
+            service_role=described.get("RoleARN"), controls=controls,
+            premises_verified=False))
+    return tuple(facts)
+
+
+def sim_groups(s) -> tuple:
+    """按服务分组批量模拟。跨服务混在一条调用里会产生大量无意义的 action×resource
+    组合（都是 implicitDeny），既慢又难读。"""
+    fns = [s.edge.arn, s.auth.arn, s.panel.arn, *s.new_candidates]
+    stacks = [st.resource for st in s.stacks]
+    # **两个来源都要取**：`Surface.service_roles`（闸门填的那份）与各栈自己观测到的
+    # `RoleARN`。只取其中一个的症状是 `pass-role:cfn-service` 恒为"没有"——而"没问"
+    # 与"不允许"在报告上一模一样。
+    roles = list(dict.fromkeys(
+        [s.edge_role, *s.service_roles,
+         *(st.service_role for st in s.stacks if st.service_role)]))
+    groups = [
+        (list(model.A_KMS_SIGN + model.A_KMS_SELF_AUTHORIZE), list(s.kms_keys)),
+        (list(model.A_UPDATE_CODE + model.A_UPDATE_CONFIG + model.A_PUBLISH_VERSION
+              + model.A_CREATE_FUNCTION + model.A_INVOKE), fns),
+        (list(model.A_CF_WRITE), [s.distribution]),
+        (list(model.A_CFN_UPDATE + model.A_CFN_CREATE_CHANGESET
+              + model.A_CFN_EXECUTE_CHANGESET + model.A_CFN_SET_POLICY), stacks),
+        (list(model.A_PASSROLE), roles),
+    ]
+    return tuple((a, r) for a, r in groups if r)
+
+
+def discover(gate, clients, region: str, account: str):
     """从 config + 真机状态推出资源集合。**不接受硬编码的 distribution ID。**"""
     cfg = configparser.ConfigParser(interpolation=None)
     cfg.read(ROUTER_CONFIG, encoding="utf-8")
@@ -549,16 +269,40 @@ def discover(gate, clients, region: str, account: str) -> Surface:
     edge_role = clients["lambda"].get_function(
         FunctionName=edge_fn)["Configuration"]["Role"]
 
-    return Surface(
-        region=region,
+    # deployer 栈名从平台函数的 CloudFormation tag 反查（**不手抄栈名**，与闸门
+    # `edge_asset_location` 同一手法）。它拥有两把会话签名 CMK ⇒ 一条独立的签名路径。
+    tags = clients["lambda"].get_function(
+        FunctionName="site-auth-service").get("Tags") or {}
+    deployer_stack = tags.get("aws:cloudformation:stack-name", "")
+    if not deployer_stack:
+        raise SystemExit(
+            "site-auth-service 没有 CloudFormation stack tag——推不出 deployer 栈名。"
+            "那个栈拥有两把会话签名 CMK，漏掉它就漏掉一条签名路径。")
+
+    stacks = _stack_facts(clients["cloudformation"], stack_name, deployer_stack)
+    print(f"Edge association 限定符 = 编号版本 {','.join(numbered)}"
+          f"（单动作模型不成立的前提，已实测）；"
+          f"栈 guard：{', '.join(f'{st.label}={st.guard}' for st in stacks)}",
+          flush=True)
+
+    return model.Surface(
         kms_keys=session_key_arns(),
-        edge_fn=fn(edge_fn), auth_fn=fn("site-auth-service"),
-        panel_fn=fn("site-panel"),
-        new_fn=fn("probe-placeholder-new-function"),
+        auth=model.FnFact(fn("site-auth-service"), entry=model.ENTRY_LATEST,
+                          layers_supported=True),
+        panel=model.FnFact(fn("site-panel"), entry=model.ENTRY_LATEST,
+                           layers_supported=True),
+        # `entry` 由上面那段 association 观测**硬保证**是编号版本。
+        # Lambda@Edge **不支持 Layer**（AWS 文档）⇒ 改配置不等于任意代码执行。
+        edge=model.FnFact(fn(edge_fn), entry=model.ENTRY_VERSION,
+                          layers_supported=False),
+        # 两个候选：一个中性名、一个与 router 栈同前缀 ⇒ 缩小"按名字前缀授权"的盲区。
+        # **它们只能代表这两个名字**，不能代表任意新函数名（spec §9 的已记盲区）。
+        new_candidates=(fn("probe-placeholder-new-function"),
+                        fn(f"{stack_name}-probe-placeholder")),
         distribution=f"arn:aws:cloudfront::{account}:distribution/{dist_id}",
-        stack=f"arn:aws:cloudformation:{region}:{account}:stack/{stack_name}/*",
         edge_role=edge_role,
-        edge_association_qualifier=",".join(numbered))
+        stacks=stacks,
+        service_roles=tuple(st.service_role for st in stacks if st.service_role))
 
 
 def list_principals(iam) -> list[dict[str, str]]:
@@ -575,8 +319,8 @@ def list_principals(iam) -> list[dict[str, str]]:
     return out
 
 
-def simulate_all(gate, s: Surface, principals: list[dict[str, str]],
-                 workers: int) -> dict[str, frozenset[str]]:
+def simulate_all(gate, s, principals: list[dict[str, str]],
+                 workers: int, region: str) -> dict[str, frozenset[str]]:
     """每个 principal → 允许的 `"action|resource"` 集合。
 
     **必须保留资源维度。** 折叠成"动作集合"会让"能换 auth 的码"与"能换 Edge 的码"
@@ -584,10 +328,10 @@ def simulate_all(gate, s: Surface, principals: list[dict[str, str]],
     """
     got: dict[str, frozenset[str]] = {}
     failures: list[str] = []
-    groups = s.groups()
+    groups = sim_groups(s)
 
     def probe(arn: str) -> frozenset[str]:
-        cl = gate.thread_iam_client(s.region)
+        cl = gate.thread_iam_client(region)
         allowed: set[str] = set()
         for actions, resources in groups:
             r = cl.simulate_principal_policy(
@@ -669,19 +413,17 @@ def main(argv: list[str] | None = None) -> int:
     account = boto3.client("sts", region_name=region,
                            config=cfg).get_caller_identity()["Account"]
     clients = {n: boto3.client(n, region_name=region, config=cfg)
-               for n in ("iam", "lambda", "cloudfront")}
+               for n in ("iam", "lambda", "cloudfront", "cloudformation")}
     print(f"区 {region}（账号值不打印）", flush=True)
 
     s = discover(gate, clients, region, account)
-    print(f"Edge association 限定符 = 编号版本 {s.edge_association_qualifier}"
-          f"（单动作模型不成立的前提，已实测）", flush=True)
 
     print("枚举 principal（ListRoles+ListUsers，不拉策略文档）…", flush=True)
     principals = list_principals(clients["iam"])
-    print(f"待模拟 {len(principals)} 个 × {len(s.groups())} 组", flush=True)
+    print(f"待模拟 {len(principals)} 个 × {len(sim_groups(s))} 组", flush=True)
 
     names = {p["arn"]: p["name"] for p in principals}
-    decisions = simulate_all(gate, s, principals, args.workers)
+    decisions = simulate_all(gate, s, principals, args.workers, region)
     # 名字也进判定：`site-builder-verifier` 角色本身即持有夹具签发器那条 URL 入口。
     by_principal = {arn: classify(a, s, names.get(arn, ""))
                     for arn, a in decisions.items()}
@@ -722,18 +464,26 @@ def main(argv: list[str] | None = None) -> int:
         "probed_at_utc": dt.datetime.now(dt.timezone.utc)
                            .replace(microsecond=0).isoformat(),
         "region": region,
+        # 等价类来自共享模型（3g）。**代码更新与配置更新是两类**：后者的任意代码执行
+        # 靠挂 Layer，而 Lambda@Edge 不支持 Layer ⇒ 在 Edge 上它什么都不构成。
         "action_equivalence_classes": {
-            "kms_sign": list(KMS_SIGN),
-            "kms_self_authorize": list(KMS_SELF_AUTHORIZE),
-            "lambda_code_exec": list(LAMBDA_CODE_EXEC),
-            "lambda_publish": list(LAMBDA_PUBLISH),
-            "lambda_create": list(LAMBDA_CREATE),
-            "lambda_invoke": list(LAMBDA_INVOKE),
-            "cloudfront_write": list(CF_WRITE),
-            "cfn_update": list(CFN_UPDATE),
-            "cfn_change_set": list(CFN_CHANGESET),
-            "iam_passrole": list(IAM_PASSROLE),
+            "kms_sign": list(model.A_KMS_SIGN),
+            "kms_self_authorize": list(model.A_KMS_SELF_AUTHORIZE),
+            "lambda_update_code": list(model.A_UPDATE_CODE),
+            "lambda_update_config": list(model.A_UPDATE_CONFIG),
+            "lambda_publish": list(model.A_PUBLISH_VERSION),
+            "lambda_create": list(model.A_CREATE_FUNCTION),
+            "lambda_invoke": list(model.A_INVOKE),
+            "cloudfront_write": list(model.A_CF_WRITE),
+            "cfn_update": list(model.A_CFN_UPDATE),
+            "cfn_change_set": list(model.A_CFN_CREATE_CHANGESET
+                                   + model.A_CFN_EXECUTE_CHANGESET),
+            "cfn_set_stack_policy": list(model.A_CFN_SET_POLICY),
+            "iam_passrole": list(model.A_PASSROLE),
         },
+        # 每个栈的 guard（观测值，三值）。逻辑标签不含账号值，可以进 tracked 证据。
+        "stack_guards": {st.label: st.guard for st in s.stacks},
+        "stack_premises_verified": {st.label: st.premises_verified for st in s.stacks},
         # **只写等价类的名字，不写 ARN**：ARN 带 12 位账号 ID，而这份证据是 tracked 的
         # （`test_evidence_file_carries_no_account_id_or_role_names` 会咬）。
         "resource_equivalence_classes": [
@@ -742,7 +492,8 @@ def main(argv: list[str] | None = None) -> int:
             "lambda:edge-origin-request", "lambda:site-auth-service",
             "lambda:site-panel", "lambda:placeholder-new-function",
             "cloudfront:wildcard-distribution", "cloudformation:router-stack",
-            "iam:edge-execution-role(PassRole)",
+            "cloudformation:deployer-stack(owns the two session CMKs)",
+            "iam:edge-execution-role(PassRole)", "iam:cfn-service-role(PassRole)",
         ],
         "edge_association_qualifier_is_numbered_version": True,
         "aggregate": agg,
@@ -753,10 +504,21 @@ def main(argv: list[str] | None = None) -> int:
             "那一层由闸门 B 组（IAM 写的静态文本快照）单独覆盖，口径不同不合并。",
             "kms:Sign 的真实集合还要 ∩ key policy；本探针只量 identity policy 上界。",
             "lambda:UpdateFunctionConfiguration 计为代码执行是**上界口径**："
-            "还需要能发布/读到一个 Layer，本探针不追那一步。",
-            "UpdateFunctionCode(Publish=True) 是否在 IAM 上额外要求 "
-            "lambda:PublishVersion，AWS 文档未明确说明；本探针按**不要求**建模"
-            "（取上界）。要证实只能做写调用，超出只读范围。",
+            "还需要能发布/读到一个 Layer，本探针不追那一步。**只在支持 Layer 的函数上**"
+            "才计入——Lambda@Edge 不支持 Layer（AWS 文档），所以它在 Edge 上不构成路径。",
+            "UpdateFunctionCode / CreateFunction 是否在 IAM 上额外要求 "
+            "lambda:PublishVersion，AWS 文档未明确说明；两者的输入都含 Publish"
+            "（botocore 服务模型实测），本探针按**不要求**建模（取上界）。"
+            "要证实只能做写调用，超出只读范围。",
+            "guard=protected 只表示**受保护资源的直接更新**被 stack policy 挡住"
+            "（ADR 0007/0008）。service role 权限足够高时，改模板新增 IAM 授权类资源等"
+            "路径未必需要碰那四个资源 ⇒ 这类持有者落 edge:cfn-template-unanalyzed，"
+            "**单列、不进并集**，也不得据此算确定收益。",
+            "deployer 栈那条签名路径的前提（这次更新以谁的身份执行、那个身份是否真能改"
+            "key policy）**尚未核实** ⇒ 一律落 sign:cfn-session-key-stack-unanalyzed。"
+            "拥有 CMK、且该栈缺少 stack policy，都还不足以推出能改 key policy。",
+            "CreateFunction 只对**两个**候选 ARN 有判定（一个中性名、一个与 router 栈"
+            "同前缀）。按名字前缀授权的策略可能在别的名字上成立 ⇒ 这条是下界。",
             "只覆盖会话签名这一族。Cognito 的 site-auth-pre-token（注入 email "
             "claim）是另一条 MCP 侧冒充路径，不在 3c 范围。",
             "site-deployer-* 等平台角色是否在 3c 后持 kms:Sign 取决于实现；"
