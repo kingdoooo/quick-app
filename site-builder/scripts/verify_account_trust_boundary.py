@@ -169,10 +169,17 @@ BASELINE_PATH = _HERE / "account_trust_baseline.json"
 CONFIG_PATH = _SITE_BUILDER / "config.ini"
 APP_PY = _SITE_BUILDER / "deployer" / "infra" / "app.py"
 
+# 7 = 3g：判定模型换成共享的 `_impersonation_model`。grant 词表改名
+# （`replace-platform-code` → `update-fn-code`）、新增 CFN/CloudFront/PassRole 类、
+# principals 多一个 `capabilities`、多一个 `model_inputs` 分节 ⇒ 整份基线的形态都变了。
 # 6 = 3c-final：HS 层（SSM 参数 / Edge 产物里的明文密钥）整层换成 KMS 层。
-# **没有 3/4/5 → 6 的迁移通道**：旧形态里根本没有 KMS 分节可比，硬失败并让操作者删掉重生成
-# （基线含单账号实测、不随资产分发，采用者首跑就是 `--update-baseline`）。
-BASELINE_SCHEMA = 6
+#
+# **没有跨 schema 的迁移通道**（沿用先例）：旧形态里没有新分节可比，"迁移"出来的只会是
+# 一份半真半假的基线 ⇒ 硬失败，让操作者移走旧文件重新扫描生成。
+# **但重生成时必须带 `--carry-categories <旧基线>`**：不带会把全部 platform 标注洗成
+# `unclassified`，而那会把 platform 的**集合等值**约束静默降级成"只看新增"（唯一症状：
+# 什么都不红）。完整见证流程见 spec `2026-09-20-3g-*` §8.2。
+BASELINE_SCHEMA = 7
 DEPLOYER_EXEC_ROLE = "site-deployer-exec-role"
 AUTH_SERVICE_ROLE = "site-auth-service-role"      # deploy_auth.py 建的执行角色名
 PANEL_DEPLOY_PY = _SITE_BUILDER / "panel" / "deploy_panel.py"
@@ -187,6 +194,11 @@ from session_keys import FAMILIES as KEY_FAMILIES, key_refs, load_session_keys  
 if str(_HERE) not in sys.path:          # 测试用 spec_from_file_location 加载本文件时，本目录不在 sys.path
     sys.path.insert(0, str(_HERE))
 from _secure_write import write_private_text  # noqa: E402
+# 判定模型**与探针共用同一份**（3g）：两边各抄一套正是 3g 的成因。
+# 本文件只负责采集与比较；能力标签的判定在共享模型里，反例集在
+# `deployer/tests/test_impersonation_model.py`。
+import _impersonation_model as model              # noqa: E402
+from _stack_policy_guard import guard_for         # noqa: E402
 
 
 def _module_constant(path: Path, name: str) -> str:
@@ -233,7 +245,21 @@ OPTIONAL_FUNCTIONS = {
 # grant 是 `种类[:资源]` 形态的字符串，进基线文件。改词表等于基线全量漂移。
 G_INVOKE_PLATFORM = "invoke-platform"      # + ":<函数名>"
 G_INVOKE_SITE = "invoke-site"              # + ":all" / ":some(k)"
-G_REPLACE_CODE = "replace-platform-code"   # + ":<函数名>"
+# 3g：旧名 `replace-platform-code` 声称"已能替换正在执行的代码"。那对 Edge 不成立
+# （CloudFront 关联编号版本，本动作只改 `$LATEST`），对挂 alias 的入口也不成立。
+# grant 层只说**动作事实**，"这些授权能组成哪条路"交给能力层（`capabilities`）。
+G_UPDATE_CODE = "update-fn-code"            # + ":<函数名>"
+G_UPDATE_CONFIG = "update-fn-config"        # + ":<函数名>"
+G_PUBLISH_VERSION = "publish-fn-version"    # + ":<函数名>"
+G_CREATE_FN = "create-fn"                   # + ":<候选函数名>"
+G_UPDATE_DISTRIBUTION = "update-distribution"
+G_CFN_UPDATE = "cfn-update-stack"                   # + ":<栈逻辑标签>"
+# **两条分开**：`all()` 组合属于能力层；合成一条会让"只有 CreateChangeSet"与"两个都有"
+# 在基线里长得一样。
+G_CFN_CREATE_CHANGESET = "cfn-create-change-set"    # + ":<栈逻辑标签>"
+G_CFN_EXECUTE_CHANGESET = "cfn-execute-change-set"  # + ":<栈逻辑标签>"
+G_CFN_SET_POLICY = "cfn-set-stack-policy"           # + ":<栈逻辑标签>"
+G_PASSROLE = "pass-role"                            # + ":<角色类>"
 # 能签会话的两条路**必须分开记**（spec §1 的 `sign:kms-direct` / `sign:kms-self-authorize`）：
 #  · kms-sign:<kid>            —— identity policy 上就有 `kms:Sign` on 这把 CMK。key policy 是
 #    默认的 root 委派（ADR 0001），所以 identity 那一侧允许就是真的能签。
@@ -345,8 +371,19 @@ def check_migration_labels(labels, *, known_kids) -> None:
 #     （复数）的角色被整个漏掉（2026-08-25 实测，它没有 boundary，
 #     `WithDecryption=true` 即可读出当前值）。
 # 往任一类里加动作/资源时，同时加一条只命中该新成员的用例。
-A_INVOKE = ("lambda:InvokeFunction",)
-A_REPLACE = ("lambda:UpdateFunctionCode",)
+# **全部来自共享模型**（3g）。`A_READ_PARAM` 例外：SSM 只是 login-flow 的读面，
+# 不构成会话签名能力，所以不在模型的词表里。
+A_INVOKE = model.A_INVOKE
+A_UPDATE_CODE = model.A_UPDATE_CODE
+A_UPDATE_CONFIG = model.A_UPDATE_CONFIG
+A_PUBLISH_VERSION = model.A_PUBLISH_VERSION
+A_CREATE_FUNCTION = model.A_CREATE_FUNCTION
+A_CF_WRITE = model.A_CF_WRITE
+A_CFN_UPDATE = model.A_CFN_UPDATE
+A_CFN_CREATE_CHANGESET = model.A_CFN_CREATE_CHANGESET
+A_CFN_EXECUTE_CHANGESET = model.A_CFN_EXECUTE_CHANGESET
+A_CFN_SET_POLICY = model.A_CFN_SET_POLICY
+A_PASSROLE = model.A_PASSROLE
 # 四个动作都能读出同一个 SecureString 的明文；AWS 明确警告
 # `GetParameterHistory` 在拒绝 `GetParameter` 时仍可能读到当前值。
 # 3c-final 起 SSM 里只剩 login-flow secret 这一个目标（会话密钥全在 KMS）。
@@ -356,8 +393,8 @@ A_READ_PARAM = ("ssm:GetParameter", "ssm:GetParameters",
 # 默认的 root 委派（ADR 0001），所以 identity policy 上的 `kms:Sign` 就是能签；
 # `PutKeyPolicy` / `CreateGrant` 是"先给自己授权再签"。
 # **`kms:GetPublicKey` 刻意不在任何类里**：公钥是公开的，读到它签不出东西。
-A_KMS_SIGN = ("kms:Sign",)
-A_KMS_SELF_AUTHORIZE = ("kms:PutKeyPolicy", "kms:CreateGrant")
+A_KMS_SIGN = model.A_KMS_SIGN
+A_KMS_SELF_AUTHORIZE = model.A_KMS_SELF_AUTHORIZE
 # 模拟 `kms:Sign` 时喂给 Condition 的上下文：auth / panel 的语句带 SigningAlgorithm 与
 # MessageType 两个 StringEquals（deploy_auth / deploy_panel 把 spec §11.5 的合同钉进 IAM）。
 # 不给上下文时模拟器判"缺上下文"⇒ 平台角色的必需 grant 会从结果里消失、正向控制假红。
@@ -435,9 +472,15 @@ REQUIRED_GRANT_PREFIXES = {
 # 每个 principal 的调用数 = 2 + `len(KMS_MESSAGE_TYPES) - 1`（多出来的每腿**只有**
 # `kms:Sign`、**只对** CMK：把 `ACTIONS_OTHER` 全套再跑一遍是成本翻倍换不来信号，
 # `ssm:Get*` 与 `kms:MessageType` 无关）。今天是 3 腿。
-ACTIONS_FUNCTION = A_INVOKE + A_REPLACE
+ACTIONS_FUNCTION = A_INVOKE + A_UPDATE_CODE + A_UPDATE_CONFIG
+# 发布腿：这两个动作只在 Edge 两函数与新建候选上携带信号 ⇒ **不与全部 alias/版本做
+# 笛卡尔积**（那是成本翻倍换不来信号）。裁掉的组合是"未覆盖"，**不是 deny**。
+ACTIONS_PUBLISH = A_PUBLISH_VERSION + A_CREATE_FUNCTION
+# CFN / CloudFront / PassRole 合成一腿：6 个动作 × ~5 个资源 ⇒ 响应体很小。
+ACTIONS_MISC = (A_CFN_UPDATE + A_CFN_CREATE_CHANGESET + A_CFN_EXECUTE_CHANGESET
+                + A_CFN_SET_POLICY + A_CF_WRITE + A_PASSROLE)
 ACTIONS_OTHER = A_READ_PARAM + A_KMS_SIGN + A_KMS_SELF_AUTHORIZE
-ACTIONS = ACTIONS_FUNCTION + ACTIONS_OTHER
+ACTIONS = ACTIONS_FUNCTION + ACTIONS_PUBLISH + ACTIONS_MISC + ACTIONS_OTHER
 
 
 # ---------------------------------------------------------------- 纯函数部分
@@ -527,6 +570,25 @@ class Targets:
     # 3c-1B：auth 私有的 login-flow secret 的 SSM 参数 ARN。空串 = 不追踪。
     # 它进模拟目标（"谁能读它"是要记的事实），但它的 grant **不算冒充面**——见 G_READ_LOGIN_FLOW。
     login_flow_parameter: str = ""
+    # 3g 新增的资源等价类。空值 = 本轮不探（纯函数测试与旧快照也走这条）。
+    distribution: str = ""
+    edge_role: str = ""
+    new_fn_candidates: tuple[str, ...] = ()
+    stacks: tuple = ()                      # tuple[model.StackFact, ...]
+    service_roles: tuple[str, ...] = ()
+
+    def publish_resources(self) -> list[str]:
+        """发布/建函数那一腿的资源：平台函数（含 Edge）+ 候选 ARN。
+        **刻意不含 alias/版本**——`PublishVersion` / `CreateFunction` 在那些资源上
+        不携带信号，叉乘只会让响应体翻倍。"""
+        return sorted(set(self.platform_functions) | set(self.new_fn_candidates))
+
+    def misc_resources(self) -> list[str]:
+        """CFN / CloudFront / PassRole 合成一腿的资源。"""
+        return sorted({st.resource for st in self.stacks}
+                      | ({self.distribution} if self.distribution else set())
+                      | ({self.edge_role} if self.edge_role else set())
+                      | set(self.service_roles))
 
     def function_resources(self) -> list[str]:
         out = list(self.platform_functions) + list(self.site_functions)
@@ -544,7 +606,16 @@ class Targets:
 # （否则同一能力的四个 SSM 动作会各记一项，噪音换不来信号）。
 ACTION_CLASS_NAMES = {
     **{a: "invoke" for a in A_INVOKE},
-    **{a: "replace-code" for a in A_REPLACE},
+    **{a: "update-fn-code" for a in A_UPDATE_CODE},
+    **{a: "update-fn-config" for a in A_UPDATE_CONFIG},
+    **{a: "publish-version" for a in A_PUBLISH_VERSION},
+    **{a: "create-function" for a in A_CREATE_FUNCTION},
+    **{a: "update-distribution" for a in A_CF_WRITE},
+    **{a: "cfn-update" for a in A_CFN_UPDATE},
+    **{a: "cfn-create-change-set" for a in A_CFN_CREATE_CHANGESET},
+    **{a: "cfn-execute-change-set" for a in A_CFN_EXECUTE_CHANGESET},
+    **{a: "cfn-set-stack-policy" for a in A_CFN_SET_POLICY},
+    **{a: "pass-role" for a in A_PASSROLE},
     **{a: "read-param" for a in A_READ_PARAM},
     **{a: "kms-sign" for a in A_KMS_SIGN},
     **{a: "kms-self-authorize" for a in A_KMS_SELF_AUTHORIZE},
@@ -651,6 +722,19 @@ def undecided_resource_class(resource: str, t: "Targets") -> str:
     for kid, arn in t.kms_keys.items():
         if resource == arn:
             return f"kms-key:{kid}"
+    # 3g 的新资源类。**必须在 lambda 分支之前**：候选 ARN 也是 lambda ARN，
+    # 落进 `fn:<名字>` 会让"新建函数"那条路的覆盖缺口混进平台函数的桶里。
+    if t.distribution and resource == t.distribution:
+        return "distribution"
+    if t.edge_role and resource == t.edge_role:
+        return "role:edge"
+    if resource in t.service_roles:
+        return "role:cfn-service"
+    if resource in t.new_fn_candidates:
+        return "fn:new-candidate"
+    for st in t.stacks:
+        if resource == st.resource:
+            return f"stack:{st.label}"
     parts = resource.split(":")
     if len(parts) >= 7 and parts[2] == "lambda":
         name = parts[6]
@@ -726,9 +810,13 @@ def grants_from_decisions(decisions: dict[str, str], t: Targets) -> set[str]:
                                 (Q_VERSION, t.version_arns.get(arn, ()))):
             if resources and allowed(A_INVOKE, resources):
                 grants.add(f"{G_INVOKE_PLATFORM}{qual}:{name}")
-        # UpdateFunctionCode 只作用于未限定函数（alias/version 没有自己的代码）。
-        if allowed(A_REPLACE, (arn,)):
-            grants.add(f"{G_REPLACE_CODE}:{name}")
+        # 这三个动作只作用于未限定函数（alias/version 没有自己的代码）。**各自成 grant**：
+        # 合成一条就看不出"能改码"与"能改配置（挂 Layer）"是两条不同的授权。
+        for actions, kind in ((A_UPDATE_CODE, G_UPDATE_CODE),
+                              (A_UPDATE_CONFIG, G_UPDATE_CONFIG),
+                              (A_PUBLISH_VERSION, G_PUBLISH_VERSION)):
+            if allowed(actions, (arn,)):
+                grants.add(f"{kind}:{name}")
 
     if t.site_functions:
         total = len(t.site_functions)
@@ -748,6 +836,24 @@ def grants_from_decisions(decisions: dict[str, str], t: Targets) -> set[str]:
                 # 指纹只覆盖被允许的那些站点 ⇒ 新建一个它碰不到的站点不产生漂移。
                 grants.add(f"{G_INVOKE_SITE}{qual}:some({len(members)}):"
                            f"{principal_fingerprint('sites:' + ','.join(members))}")
+
+    for cand in t.new_fn_candidates:
+        if allowed(A_CREATE_FUNCTION, (cand,)):
+            grants.add(f"{G_CREATE_FN}:{_fn_name(cand)}")
+    if t.distribution and allowed(A_CF_WRITE, (t.distribution,)):
+        grants.add(G_UPDATE_DISTRIBUTION)
+    for st in t.stacks:
+        for actions, kind in ((A_CFN_UPDATE, G_CFN_UPDATE),
+                              (A_CFN_CREATE_CHANGESET, G_CFN_CREATE_CHANGESET),
+                              (A_CFN_EXECUTE_CHANGESET, G_CFN_EXECUTE_CHANGESET),
+                              (A_CFN_SET_POLICY, G_CFN_SET_POLICY)):
+            if allowed(actions, (st.resource,)):
+                # **逻辑标签**进 grant，StackId 不进（它含账号 ID）。
+                grants.add(f"{kind}:{st.label}")
+    for role, cls in ([(t.edge_role, "edge")] if t.edge_role else []) \
+            + [(r, "cfn-service") for r in t.service_roles]:
+        if allowed(A_PASSROLE, (role,)):
+            grants.add(f"{G_PASSROLE}:{cls}")
 
     for kid, arn in t.kms_keys.items():
         if allowed(A_KMS_SIGN, (arn,)):
@@ -2421,8 +2527,12 @@ def load_baseline(path: Path) -> dict:
     data = json.loads(path.read_text(encoding="utf-8"))
     if data.get("schema") != BASELINE_SCHEMA:
         raise SystemExit(
-            f"基线 schema 是 {data.get('schema')}，脚本要 {BASELINE_SCHEMA}。3c-final 起没有"
-            "迁移通道（旧形态没有 KMS 层可比）：删掉这个文件，跑一次 --update-baseline 重生成。")
+            f"基线 schema 是 {data.get('schema')}，脚本要 {BASELINE_SCHEMA}。**没有跨 schema 的"
+            "迁移通道**（旧形态里没有新分节可比，迁出来的只会是半真半假的基线）："
+            "把这个文件**移到备份位置**（不要删——它是下一步的输入），然后跑\n"
+            "  --update-baseline --carry-categories <那份备份>\n"
+            "**必须带 --carry-categories**：不带会把全部 platform 标注洗成 unclassified，"
+            "而那会把 platform 的集合等值约束静默降级成「只看新增」（唯一症状：什么都不红）。")
     # coverage 成员必须是可分解形态。哈希形态混进来（手改、或把旧 schema 的文件改个版本号）
     # 会让退役声明静默失效——照红、与没修一样。所以在读入时就拒。
     items = (data.get("coverage") or {}).get("undecided_items")

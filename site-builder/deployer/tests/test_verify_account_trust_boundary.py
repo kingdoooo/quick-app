@@ -63,7 +63,19 @@ def _baseline_raw() -> str:
     """
     if not _BASELINE.exists():
         pytest.skip(_NO_BASELINE)
-    return _BASELINE.read_text(encoding="utf-8")
+    text = _BASELINE.read_text(encoding="utf-8")
+    # **schema 不匹配时同样 skip**（3g）：本机那份可能还是上一个 schema（迁移要真实 AWS
+    # 重新扫描才能生成，见 spec §8.2 的见证流程）。拿旧形态的基线跑这些断言，红的是
+    # "这个账号的旧数据"而不是"扫描器坏了"——与文件不存在时是同一个理由，而
+    # `test_the_baseline_checks_really_run_on_a_synthetic_baseline` 那条正对照保证
+    # 这批断言不会因此空转。**不要为了让它变绿去删本机基线**：它是 --carry-categories
+    # 的输入，删了就丢掉全部人工分类。
+    got = json.loads(text).get("schema")
+    want = _gate().BASELINE_SCHEMA
+    if got != want:
+        pytest.skip(f"本机基线 schema 是 {got}，脚本已是 {want}——"
+                    f"等真机重新扫描生成新基线后这批断言自动恢复")
+    return text
 
 
 def _baseline_data() -> dict:
@@ -119,7 +131,8 @@ def _is_version_id(value: str) -> bool:
 
 # grant 的**文法**。`principals.*.grants[]` 不整体放行——放行的话，grant 构造失误把
 # 完整 ARN / 角色名 / 账号值拼进串里，这一层不会抓。
-# `invoke-*` / `replace-*` 后面是平台函数名（`app.py` 里就有，不是账号值）；
+# `invoke-*` / `update-fn-*` / `publish-fn-version` / `create-fn` 后面是函数名
+# （`app.py` 里就有，不是账号值）；栈类只落**逻辑标签**（StackId 含账号 ID）；
 # 站点子集带成员指纹 `some(k):<fp>`。
 #
 # **`some(k)` 那一支本账号当前没有实例**（所有能调站点函数的都是 `:all`），它只由
@@ -127,8 +140,17 @@ def _is_version_id(value: str) -> bool:
 # 就把它从文法里删掉**，删了之后第一个子集授权出现时会被报成"grant 不合文法"
 # 而不是"新增授权"。
 _GRANT_RE = re.compile(
-    r"(?:invoke-platform|replace-platform-code)(?:@alias|@version)?:[A-Za-z0-9._-]+"
+    r"invoke-platform(?:@alias|@version)?:[A-Za-z0-9._-]+"
     r"|invoke-site(?:@alias|@version)?:(?:all|some\(\d+\):" + _FP_RE + r")"
+    # 3g：三个函数动作各自成一条 grant，且**只作用于未限定函数**（alias/version 没有
+    # 自己的代码）⇒ 刻意没有 @alias/@version 变体。
+    r"|(?:update-fn-code|update-fn-config|publish-fn-version|create-fn):[A-Za-z0-9._-]+"
+    r"|update-distribution"
+    # 栈的两个逻辑标签。**新增一个栈就要在这里登记**，否则第一次出现时会被报成
+    # "grant 不合文法"而不是"新增授权"。
+    r"|(?:cfn-update-stack|cfn-create-change-set|cfn-execute-change-set"
+    r"|cfn-set-stack-policy):(?:router|deployer)"
+    r"|pass-role:(?:edge|cfn-service)"
     # 3c-final：能签会话的两条路，每 kid 各一条。kid 形态由 session_keys.KID_RE 保证。
     r"|kms-sign:(?:site|console)-rs-v\d+"
     r"|kms-self-authorize:(?:site|console)-rs-v\d+"
@@ -2201,7 +2223,15 @@ def test_every_grant_constant_in_the_gate_is_covered_by_the_grammar():
     samples = {
         g.G_INVOKE_PLATFORM: f"{g.G_INVOKE_PLATFORM}:site-panel",
         g.G_INVOKE_SITE: f"{g.G_INVOKE_SITE}:all",
-        g.G_REPLACE_CODE: f"{g.G_REPLACE_CODE}:site-panel",
+        g.G_UPDATE_CODE: f"{g.G_UPDATE_CODE}:site-panel",
+        g.G_UPDATE_CONFIG: f"{g.G_UPDATE_CONFIG}:site-panel",
+        g.G_PUBLISH_VERSION: f"{g.G_PUBLISH_VERSION}:site-panel",
+        g.G_CREATE_FN: f"{g.G_CREATE_FN}:probe-new",
+        g.G_CFN_UPDATE: f"{g.G_CFN_UPDATE}:router",
+        g.G_CFN_CREATE_CHANGESET: f"{g.G_CFN_CREATE_CHANGESET}:router",
+        g.G_CFN_EXECUTE_CHANGESET: f"{g.G_CFN_EXECUTE_CHANGESET}:deployer",
+        g.G_CFN_SET_POLICY: f"{g.G_CFN_SET_POLICY}:router",
+        g.G_PASSROLE: f"{g.G_PASSROLE}:edge",
         g.G_KMS_SIGN: f"{g.G_KMS_SIGN}:site-rs-v1",
         g.G_KMS_SELF_AUTHORIZE: f"{g.G_KMS_SELF_AUTHORIZE}:console-rs-v1",
     }
@@ -3635,7 +3665,7 @@ def test_edge_artifact_hard_failure_message_says_it_is_not_baseline_releasable()
 def test_the_edge_assertions_add_no_facts():
     """spec §11.8.7：三条硬断言不新增 facts——它们没有"可接受的基线数字"这种东西。"""
     g = _gate()
-    assert g.BASELINE_SCHEMA == 6
+    assert g.BASELINE_SCHEMA == 7
     assert set(g.BUNDLE_SHAPE["facts"]) == {"principals_with_missing_context"}
     assert "login" not in json.dumps(g.BUNDLE_SHAPE, default=str)
     assert "spki" not in json.dumps(g.BUNDLE_SHAPE["facts"], default=str)
@@ -4334,15 +4364,24 @@ def test_the_edge_scan_only_covers_the_associated_version_not_latest():
     assert out == {"site:site-rs-v2": ()}, out
 
 
-def test_schema_six_has_no_migration_channel(tmp_path):
+def test_no_cross_schema_migration_channel(tmp_path):
+    """**任何**旧 schema 都硬失败（3、5、以及 3g 之前的 6）：旧形态里没有新分节可比，
+    "迁移"出来的只会是一份半真半假的基线。
+
+    报错必须同时说清两件事，否则操作者会按最省力的方式做而丢掉约束：
+    ① 旧文件要**移走而不是删**（它是 `--carry-categories` 的输入）；
+    ② 重生成时**必须带 `--carry-categories`**——不带会把 platform 标注洗成
+       `unclassified`，把集合等值约束静默降级成"只看新增"。
+    """
     g = _gate()
     p = tmp_path / "b.json"
-    p.write_text(json.dumps({"schema": 5, "principals": {}}))
-    with pytest.raises(SystemExit, match="重生成"):
-        g.load_baseline(p)
-    p.write_text(json.dumps({"schema": 3, "principals": {}}))
-    with pytest.raises(SystemExit):
-        g.load_baseline(p)
+    for old in (3, 5, 6):
+        p.write_text(json.dumps({"schema": old, "principals": {}}))
+        with pytest.raises(SystemExit) as e:
+            g.load_baseline(p)
+        text = str(e.value)
+        assert "--carry-categories" in text, f"schema {old} 的报错没提 --carry-categories"
+        assert "移" in text, f"schema {old} 的报错没说「移走而不是删」"
 
 
 def test_a_baseline_on_disk_must_carry_decomposable_coverage_members(tmp_path):
@@ -4350,13 +4389,14 @@ def test_a_baseline_on_disk_must_carry_decomposable_coverage_members(tmp_path):
     后果是退役声明静默失效（照红、与没修一样）。"""
     g = _gate()
     p = tmp_path / "b.json"
-    p.write_text(json.dumps({"schema": 6, "principals": {},
+    p.write_text(json.dumps({"schema": g.BASELINE_SCHEMA, "principals": {},
                              "coverage": {"undecided_items": ["0000-1111-2222-3333"]}}))
     with pytest.raises(SystemExit, match="undecided_items"):
         g.load_baseline(p)
     ok = g.undecided_item("arn:aws:iam::1:role/A", "kms-sign", {"kms-key:site-rs-v1"})
-    p.write_text(json.dumps({"schema": 6, "principals": {}, "coverage": {"undecided_items": [ok]}}))
-    assert g.load_baseline(p)["schema"] == 6
+    p.write_text(json.dumps({"schema": g.BASELINE_SCHEMA, "principals": {},
+                             "coverage": {"undecided_items": [ok]}}))
+    assert g.load_baseline(p)["schema"] == g.BASELINE_SCHEMA
 
 
 def test_missing_baseline_is_not_a_verdict(tmp_path, capsys, monkeypatch):
@@ -4475,7 +4515,7 @@ def test_the_baseline_checks_really_run_on_a_synthetic_baseline(tmp_path):
 def test_module_constant_hard_fails_when_the_far_side_renames_it():
     """"真源在对面"这条只有在**拿不到就硬失败**时才成立——静默兜一个默认值等于手抄。"""
     g = _gate()
-    assert g._module_constant(_SCRIPT, "BASELINE_SCHEMA") == 6
+    assert g._module_constant(_SCRIPT, "BASELINE_SCHEMA") == 7
     with pytest.raises(SystemExit, match="找不到模块级常量"):
         g._module_constant(_SCRIPT, "NO_SUCH_CONSTANT_HERE")
 
@@ -4664,3 +4704,125 @@ def test_optional_functions_table_names_only_real_platform_functions():
     assert set(g.OPTIONAL_FUNCTIONS) <= set(g.platform_function_names()), (
         f"OPTIONAL_FUNCTIONS 里有不属于平台清单的名字："
         f"{set(g.OPTIONAL_FUNCTIONS) - set(g.platform_function_names())}")
+
+
+# ---- 3g：grant 词表对齐动作事实 + 新增 CFN/CloudFront/PassRole 资源类 -------------
+
+def test_replace_platform_code_grant_is_renamed():
+    """`replace-platform-code` 声称"已能替换正在执行的代码"，对 Edge 不成立
+    （CloudFront 关联编号版本，该动作只改 `$LATEST`）。grant 层只说**动作事实**。"""
+    g = _gate()
+    src = _SCRIPT.read_text(encoding="utf-8")
+    assert "G_REPLACE_CODE" not in src, "旧常量还在"
+    assert g.G_UPDATE_CODE == "update-fn-code"
+
+
+def _targets_3g(g, **kw):
+    """3g 新增字段的 Targets。默认给一个 router 栈与一个候选 ARN。"""
+    base = dict(
+        platform_functions=("arn:aws:lambda:r:1:function:site-auth-service",),
+        site_functions=(),
+        distribution="arn:aws:cloudfront::1:distribution/D1",
+        edge_role="arn:aws:iam::1:role/edge",
+        new_fn_candidates=("arn:aws:lambda:r:1:function:probe-new",),
+        stacks=(g.model.StackFact(resource="S_ROUTER", label="router",
+                                  guard=g.model.GUARD_OPEN,
+                                  controls=frozenset({g.model.CONTROLS_EDGE})),),
+        service_roles=("arn:aws:iam::1:role/cfn-exec",))
+    base.update(kw)
+    return g.Targets(**base)
+
+
+def test_grants_cover_the_new_action_classes():
+    """新动作各自成 grant：合并任何两条都会让对应的扩权静静地绿。"""
+    g = _gate()
+    t = _targets_3g(g)
+    fn = t.platform_functions[0]
+    decisions = {
+        f"lambda:UpdateFunctionCode|{fn}": "allowed",
+        f"lambda:UpdateFunctionConfiguration|{fn}": "allowed",
+        f"lambda:PublishVersion|{fn}": "allowed",
+        f"lambda:CreateFunction|{t.new_fn_candidates[0]}": "allowed",
+        f"cloudfront:UpdateDistribution|{t.distribution}": "allowed",
+        "cloudformation:UpdateStack|S_ROUTER": "allowed",
+        "cloudformation:CreateChangeSet|S_ROUTER": "allowed",
+        "cloudformation:ExecuteChangeSet|S_ROUTER": "allowed",
+        "cloudformation:SetStackPolicy|S_ROUTER": "allowed",
+        f"iam:PassRole|{t.edge_role}": "allowed",
+    }
+    assert g.grants_from_decisions(decisions, t) == {
+        "update-fn-code:site-auth-service",
+        "update-fn-config:site-auth-service",
+        "publish-fn-version:site-auth-service",
+        "create-fn:probe-new",
+        "update-distribution",
+        "cfn-update-stack:router",
+        "cfn-create-change-set:router",
+        "cfn-execute-change-set:router",
+        "cfn-set-stack-policy:router",
+        "pass-role:edge",
+    }
+
+
+def test_change_set_actions_are_two_separate_grants():
+    """`all()` 组合属于能力层。grant 层合成一条会让"只有 CreateChangeSet"与
+    "两个都有"在基线里长得一样。"""
+    g = _gate()
+    t = _targets_3g(g)
+    assert g.grants_from_decisions(
+        {"cloudformation:CreateChangeSet|S_ROUTER": "allowed"}, t) \
+        == {"cfn-create-change-set:router"}
+
+
+def test_stack_grants_carry_the_logical_label_not_the_stack_id():
+    """StackId 含账号 ID（仓库红线）⇒ grant 串里只许出现逻辑标签。"""
+    g = _gate()
+    real = "arn:aws:cloudformation:us-east-1:123456789012:stack/Foo/abc"
+    t = _targets_3g(g, stacks=(g.model.StackFact(resource=real, label="router"),))
+    grants = g.grants_from_decisions({f"cloudformation:UpdateStack|{real}": "allowed"}, t)
+    assert grants == {"cfn-update-stack:router"}
+    assert not any("123456789012" in x for x in grants)
+
+
+def test_pass_role_distinguishes_edge_from_cfn_service_role():
+    """两个角色类不许折叠：能 PassRole edge role 与能 PassRole CFN service role
+    是两条不同的路。"""
+    g = _gate()
+    t = _targets_3g(g)
+    assert g.grants_from_decisions(
+        {f"iam:PassRole|{t.service_roles[0]}": "allowed"}, t) == {"pass-role:cfn-service"}
+
+
+def test_action_class_names_cover_every_simulated_action():
+    """coverage 的成员按**动作等价类**记 ⇒ 新动作漏登记会让它落进一个空类名。"""
+    g = _gate()
+    for action in g.ACTIONS:
+        assert action in g.ACTION_CLASS_NAMES, action
+
+
+def test_new_resource_classes_are_stable_and_account_free():
+    """coverage 的资源类名不许含账号值，且新资源不能全落进 `other`。"""
+    g = _gate()
+    t = _targets_3g(
+        g,
+        distribution="arn:aws:cloudfront::123456789012:distribution/D1",
+        edge_role="arn:aws:iam::123456789012:role/edge",
+        new_fn_candidates=("arn:aws:lambda:r:123456789012:function:probe-new",),
+        stacks=(g.model.StackFact(
+            resource="arn:aws:cloudformation:r:123456789012:stack/Foo/abc",
+            label="router"),),
+        service_roles=("arn:aws:iam::123456789012:role/cfn-exec",))
+    got = {g.undecided_resource_class(r, t) for r in
+           (t.distribution, t.edge_role, t.new_fn_candidates[0],
+            t.stacks[0].resource, t.service_roles[0])}
+    assert got == {"distribution", "role:edge", "fn:new-candidate",
+                   "stack:router", "role:cfn-service"}, sorted(got)
+    assert not any("123456789012" in c for c in got)
+
+
+def test_action_classes_come_from_the_shared_model():
+    """动作等价类只许有一份定义：闸门与探针各抄一份正是 3g 的成因。"""
+    g = _gate()
+    assert g.A_UPDATE_CODE is g.model.A_UPDATE_CODE
+    assert g.A_CFN_UPDATE is g.model.A_CFN_UPDATE
+    assert g.A_KMS_SIGN is g.model.A_KMS_SIGN
