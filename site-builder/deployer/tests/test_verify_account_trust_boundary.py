@@ -5625,3 +5625,67 @@ def test_two_observed_entries_for_the_same_arn_are_refused():
                       "grants": [], "capabilities": []}}
     with pytest.raises(SystemExit, match="同一个 ARN"):
         g.merge_categories(carried={}, by_name={}, observed=observed)
+
+
+# ---- R2-L4 / R2-L5：容器类型、名字歧义、报告可见性 -------------------------------
+
+@pytest.mark.parametrize("caps,ok", [
+    ([], True),                                    # 空列表合法
+    (["sign:kms-direct"], True),
+    ("", False),                                   # 迭代出空 ⇒ 旧版误放行
+    ({}, False),
+    ({"sign:kms-direct": False}, False),           # **最糟**：迭代出键 ⇒ 被读成持有该能力
+    (["not-a-label"], False),
+])
+def test_baseline_capabilities_must_be_a_list_of_registered_labels(tmp_path, caps, ok):
+    """**R2-L4 ①**：只"逐成员查词表"时 `""` / `{}` 会因迭代出空而通过，而
+    `{"sign:kms-direct": false}` 更糟——迭代出的是**键**，比较器的 `set()` 把它读成
+    "持有该能力"（实测）。先验容器类型，再验词表。
+    """
+    g = _gate()
+    p = tmp_path / "b.json"
+    p.write_text(json.dumps({
+        "schema": g.BASELINE_SCHEMA,
+        "model_inputs": {"stacks": {}, "edge_entry": "version", "signers": {}},
+        "coverage": {"undecided_items": []},
+        "principals": {"aaaa-bbbb-cccc-dddd": {"category": "admin", "grants": [],
+                                               "capabilities": caps}}}), encoding="utf-8")
+    if ok:
+        assert g.load_baseline(p)["schema"] == g.BASELINE_SCHEMA
+    else:
+        with pytest.raises(SystemExit):
+            g.load_baseline(p)
+
+
+def test_classify_by_name_is_refused_when_the_name_maps_to_several_arns():
+    """**R2-L4 ②**：`--classify` 按名字映射，而 `role/SameName` 与 `user/SameName` 是两个
+    合法的不同 ARN。静默给两人都打上同一类别，会让"只想标其中一个"无法表达——而类别
+    决定的正是比较方向（platform 是集合等值）。
+    """
+    g = _gate()
+    obs = {"a": {"name": "SameName", "arn": "arn:aws:iam::1:role/SameName",
+                 "kind": "role", "grants": [], "capabilities": []},
+           "b": {"name": "SameName", "arn": "arn:aws:iam::1:user/SameName",
+                 "kind": "user", "grants": [], "capabilities": []}}
+    with pytest.raises(SystemExit, match="多个不同 ARN"):
+        g.merge_categories(carried={}, by_name={"SameName": "platform"}, observed=obs)
+    # 指纹映射能分别标注这两个人（这正是报错里推荐的替代路径）
+    fp_role = g.principal_fingerprint("arn:aws:iam::1:role/SameName")
+    merged = g.merge_categories(carried={fp_role: "platform"}, by_name={}, observed=obs)
+    assert merged == {fp_role: "platform"}
+    # 名字不在 --classify 里时，重名本身不该报错
+    assert g.merge_categories(carried={}, by_name={}, observed=obs) == {}
+
+
+def test_the_probe_report_shows_the_uncertain_count_and_labels_the_bounds():
+    """**R2-L5**：`principals_uncertain` 必须出现在**默认终端报告**里。
+
+    只打 surface_after / principals_removed 时，"已建模路径都关了但仍持未分析路径"这第三种
+    结论在报告里消失——JSON 里有，看终端的人分不清"已知残留"与"待核实"（实测两种输入的
+    那一行逐字相同）。
+    """
+    src = (_ROOT / "site-builder" / "scripts"
+           / "probe_impersonation_surface.py").read_text(encoding="utf-8")
+    seg = src[src.index("边际收益"):src.index("提醒")]
+    assert "principals_uncertain" in seg, "报告里没有 uncertain"
+    assert "下界" in seg and "上界" in seg, "没有标明 removed/after 是下界/上界"

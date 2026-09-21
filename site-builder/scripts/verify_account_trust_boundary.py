@@ -2895,6 +2895,11 @@ def load_baseline(path: Path) -> dict:
             raise SystemExit(
                 f"基线 {path} 的 principals.{fp} 缺 capabilities —— schema 7 的能力层"
                 f"靠它比对，缺了就等于那个 principal 的能力漂移永远不红。")
+        # **先验容器，再验词表**（R2-L4 ①）：只"逐成员查词表"时 `""` 与 `{}` 会因为
+        # 迭代出空而通过，而 `{"sign:kms-direct": false}` 更糟——它迭代出的是**键**，
+        # 于是比较器的 `set()` 把它读成"持有该能力"。
+        _check_shape(caps, _list_of_str,
+                     path=f"principals.{fp}.capabilities", where=f"基线 {path}")
         bad = [c for c in caps if c not in set(model.ALL_LABELS)]
         if bad:
             raise SystemExit(
@@ -3137,6 +3142,19 @@ def merge_categories(*, carried: dict, by_name: dict, observed: dict) -> dict:
         if key != fp:
             print(f"（note：观测的键 {key} 不等于按 ARN 算的指纹 {fp}，"
                   f"以 ARN 指纹为准）", file=sys.stderr)
+    # **名字歧义也要拒**（R2-L4 ②）：`--classify` 是按名字映射的，而同一个名字可能对应
+    # 两个不同 ARN（`role/SameName` 与 `user/SameName` 都是合法观测）。静默给两个人都打上
+    # 同一个类别，会让"只想标其中一个"无法表达——而类别决定的正是等值/新增的比较方向。
+    by_name_count: dict = {}
+    for rec in by_arn.values():
+        by_name_count.setdefault(rec["name"], set()).add(rec["arn"])
+    ambiguous = sorted(n for n, arns in by_name_count.items()
+                       if len(arns) > 1 and n in by_name)
+    if ambiguous:
+        raise SystemExit(
+            f"--classify 用的是名字，而这些名字在本轮观测里对应**多个不同 ARN**："
+            f"{ambiguous}。按名字标注会同时标到它们身上，而类别决定比较方向（platform 是"
+            f"集合等值）⇒ 不猜。改用 --carry-categories 的指纹映射，或先把重名消掉。")
     merged = dict(carried)
     conflicts = []
     for fp, rec in by_arn.items():

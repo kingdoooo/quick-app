@@ -410,10 +410,16 @@ def main(argv: list[str] | None = None) -> int:
     for k in ("can_sign", "can_replace_edge_verifier",
               "impersonation_surface_union", "both", "sign_only", "edge_only"):
         print(f"  {k:32} {agg[k]:>4}")
-    print("\n===== 关掉某一组路径的边际收益（离开冒充面的 principal 数）=====")
+    # **三个数都要打印**（R2-L5）：只打 surface_after / principals_removed 时，
+    # "还剩未分析路径所以不定论"这第三种结论在默认报告里完全消失——JSON 里有
+    # `principals_uncertain`，看终端的人却分不清"已知残留"与"待核实"。
+    print("\n===== 关掉某一组路径的边际收益 =====")
+    print("  收益（removed）是**下界**、剩余（after）是**上界**；uncertain = 已建模路径都关了"
+          "但仍持未分析路径、因而不定论的人数。范围限于本轮观测到的群体。")
     for name, m in agg["marginal_value_if_closed"].items():
         print(f"  {name:32} 面 {agg['impersonation_surface_union']:>3}"
-              f" → {m['surface_after']:<3}（-{m['principals_removed']}）")
+              f" → ≤{m['surface_after']:<3}（确定离场 ≥{m['principals_removed']}，"
+              f"待核实 {m.get('principals_uncertain', 0)}）")
     print("\n提醒：`sign:kms-*` 是 identity policy 的**上界**；KMS 的 key policy 是"
           "权威的，\n真实可签名集合 = 该上界 ∩ key policy 放行的集合。"
           "\n`sign:hijack-*` 与 key policy 无关——恶意代码是**以 signer 角色身份**调用的。")
