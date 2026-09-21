@@ -107,7 +107,15 @@ def canonical(policy: Mapping[str, Any]) -> str:
 
 
 def policy_problems(actual: Mapping[str, Any] | None, expected: Mapping[str, Any]) -> list[str]:
-    """空列表 = 线上策略与期望**等价**。否则逐条说清差在哪（缺谁的 Deny、用了通配、被 open 着）。"""
+    """空列表 = 线上策略与期望**等价**。否则逐条说清差在哪（缺谁的 Deny、用了通配、被 open 着）。
+
+    **这不是 guard 谓词。** 它判"与本项目规定的形态是否等价"：一份**更严格**的
+    `Deny Update:* on "*"` 在这里是"有问题"（`covered` 只收字面 Resource 串 ⇒
+    `want - covered` 非空，还会再报一条"含通配"）。信任边界闸门要回答的是另一个问题
+    ——"这些逻辑 ID 的 Update 被拦住了吗"——那条用
+    `site-builder/scripts/_stack_policy_guard.guard_for()`（三值，接受更严格的策略）。
+    两者刻意分开，见 ADR 0008。
+    """
     if actual is None:
         return ["栈没有 stack policy"]
     if canonical(actual) == canonical(expected):
