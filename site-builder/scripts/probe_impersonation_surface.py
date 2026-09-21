@@ -248,14 +248,13 @@ def discover(gate, clients, region: str, account: str):
 
     return model.Surface(
         kms_keys=keys,
-        # 入口类型**观测**，不写死（R1-L3）；`aliases` 传空字典即"没看到 alias"。
+        # 入口类型**观测**，且用闸门那一份自包含的观测（R2-L3 ③：它自己枚举 alias 并验
+        # URL，两个调用方只传 (lam, name) ⇒ 构造上不可能给出不同答案）。
         auth=model.FnFact(fn("site-auth-service"),
-                          entry=gate.observed_entry(clients["lambda"],
-                                                    "site-auth-service", {}),
+                          entry=gate.observed_entry(clients["lambda"], "site-auth-service"),
                           layers_supported=True),
         panel=model.FnFact(fn("site-panel"),
-                           entry=gate.observed_entry(clients["lambda"],
-                                                     "site-panel", {}),
+                           entry=gate.observed_entry(clients["lambda"], "site-panel"),
                            layers_supported=True),
         # `entry` 由上面那段 association 观测**硬保证**是编号版本。
         # Lambda@Edge **不支持 Layer**（AWS 文档）⇒ 改配置不等于任意代码执行。

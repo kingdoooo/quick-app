@@ -2191,52 +2191,90 @@ def stack_logical_ids(cfn, stack: str, types: tuple[str, ...]) -> list[str]:
     return sorted(out)
 
 
-def observed_entry(lam, function_name: str, aliases: dict) -> str:
-    """观测这个函数的**入口服务的是什么**（R1-L3）→ `latest` / `alias` / `unknown`。
+def observed_entry(lam, function_name: str) -> str:
+    """观测这个函数的**入口服务的是什么** → `latest` / `alias` / `unknown`。
 
-    判据按"入口"来定，而入口就是 Function URL：
-      · 未限定 URL 存在 ⇒ 服务 `$LATEST` ⇒ 换码/改配置立刻生效（`latest`）；
-      · 未限定 URL 不存在、但该函数有 alias ⇒ 入口挂在 alias 上（`alias`）；
-      · 两者都看不到 ⇒ `unknown`，**不许默认成 latest**（默认成 latest 就把
-        "过度声称"重新引进来了，那正是 3g 要修的东西）。
+    入口就是 Function URL，所以三步都要有**URL 证据**：
+      1. 未限定 URL 存在 ⇒ 服务 `$LATEST`（换码/改配置立刻生效）；
+      2. 否则逐个 alias 查 URL，有任一 alias 带 URL ⇒ `alias`；
+      3. 都没有 ⇒ `unknown`。**不许默认成 latest**（默认成 latest 就把过度声称重新引进来）。
+
+    **alias 只是存在不算证据**（R2-L3 ③）：上一版只看 alias 名字就宣称 `alias`，
+    而那既没验证入口、又与探针（当时传空 aliases）给出不同答案。现在自己枚举、自己验证，
+    两个调用方只传 `(lam, function_name)` ⇒ **构造上不可能不一致**。
 
     Edge 函数不走这条：它的入口是 CloudFront association，由 `edge_current_version()`
     那条硬断言保证是编号版本。
     """
-    try:
-        lam.get_function_url_config(FunctionName=function_name)
-        return model.ENTRY_LATEST
-    except Exception as exc:                      # noqa: BLE001
-        if type(exc).__name__ not in ("ResourceNotFoundException",):
-            print(f"（3g note：{function_name} 的 Function URL 配置读不到"
+    def _url_exists(**kw) -> bool:
+        try:
+            lam.get_function_url_config(FunctionName=function_name, **kw)
+            return True
+        except Exception as exc:                  # noqa: BLE001
+            if type(exc).__name__ == "ResourceNotFoundException":
+                return False
+            print(f"（3g note：{function_name}{kw} 的 Function URL 配置读不到"
                   f"（{type(exc).__name__}）⇒ 入口类型记 unknown）", file=sys.stderr)
-            return model.ENTRY_UNKNOWN
-    for name, als in aliases.items():
-        if name == function_name and als:
-            return model.ENTRY_ALIAS
+            raise _EntryUnknown from exc
+
+    try:
+        if _url_exists():
+            return model.ENTRY_LATEST
+        for page in lam.get_paginator("list_aliases").paginate(FunctionName=function_name):
+            for alias in page.get("Aliases") or ():
+                if _url_exists(Qualifier=alias["Name"]):
+                    return model.ENTRY_ALIAS
+    except _EntryUnknown:
+        return model.ENTRY_UNKNOWN
+    except Exception as exc:                      # noqa: BLE001
+        if type(exc).__name__ != "ResourceNotFoundException":
+            print(f"（3g note：{function_name} 的 alias 列不出来"
+                  f"（{type(exc).__name__}）⇒ 入口类型记 unknown）", file=sys.stderr)
+        return model.ENTRY_UNKNOWN
     return model.ENTRY_UNKNOWN
 
 
-def stack_owning(cfn, physical_ids: tuple) -> tuple:
-    """按**物理资源 ID** 反查它属于哪个栈 → `(栈名, 命中的 physical id)`；查不到返回 `("", "")`。
+class _EntryUnknown(Exception):
+    """内部信号：入口观测不下去（读不到配置）⇒ 记 unknown，而不是猜。"""
 
-    `DescribeStackResources` 支持 `PhysicalResourceId` 反查（botocore 输入含该字段）。
-    这比"从某个函数的 `aws:cloudformation:stack-name` tag 猜"强两点：
-      · **不依赖那个函数是 CFN 建的**——`auth/deploy_auth.py` 用裸 `create_function`
-        建 auth，不传 Tags、不经 CFN，所以按 tag 推导在正常部署里必然失败（R1-L3 blocker）；
-      · 它**顺带证明**了归属：能查到就说明这个资源真的由那个栈管理，而"栈里有个同类型资源"
-        证明不了"我们关心的那个资源在里面"。
+
+def _cfn_says_unmanaged(exc) -> bool:
+    """这个异常是否**确定**表示"该物理资源不由任何 CloudFormation 栈管理"。
+
+    CFN 对未受管理的 `PhysicalResourceId` 返回 `ValidationError`（消息形如
+    *Stack for <id> does not exist*）。**只有它算"不存在"**——AccessDenied / Throttling /
+    网络故障一律不算（R2-L3 ①）：把它们当"不存在"会让"权限不足"与"确认无归属"在输出上
+    一模一样，而后果是新基线从此没有那个栈的授权与 coverage，且没有任何症状。
     """
-    for pid in physical_ids:
-        if not pid:
-            continue
-        try:
-            found = cfn.describe_stack_resources(PhysicalResourceId=pid)["StackResources"]
-        except Exception:      # noqa: BLE001 —— 不是 CFN 管理的资源会直接报错，那是答案之一
-            continue
-        if found:
-            return found[0]["StackName"], pid
-    return "", ""
+    resp = getattr(exc, "response", None)
+    code = (resp or {}).get("Error", {}).get("Code", "") if isinstance(resp, dict) else ""
+    text = f"{code} {exc}"
+    return "ValidationError" in text and "does not exist" in str(exc)
+
+
+def stack_owning(cfn, physical_id: str) -> str:
+    """按**物理资源 ID** 反查它属于哪个栈 → 栈名；确认不受管理时返回 `""`。
+
+    `DescribeStackResources` 支持 `PhysicalResourceId` 反查。这比"从某个函数的
+    `aws:cloudformation:stack-name` tag 猜"强两点：不依赖那个函数是 CFN 建的
+    （`auth/deploy_auth.py` 用裸 `create_function` 建 auth，不传 Tags），且它**顺带证明**
+    了归属——"栈里有个同类型资源"证明不了"我们关心的那个资源在里面"。
+
+    **只有 `_cfn_says_unmanaged` 认的错误算"不存在"，其余一律硬失败**（R2-L3 ①）：
+    权限不足或限流下静默返回空，等于让闸门在一次不完整的扫描上写出一份少一个栈的基线。
+    """
+    if not physical_id:
+        return ""
+    try:
+        found = cfn.describe_stack_resources(PhysicalResourceId=physical_id)["StackResources"]
+    except Exception as exc:                      # noqa: BLE001
+        if _cfn_says_unmanaged(exc):
+            return ""
+        raise SystemExit(
+            f"按物理资源反查所属栈失败（{physical_id}）：{type(exc).__name__}: {exc}。"
+            f"**这不是「不受管理」**——权限不足/限流/网络故障下静默当成「没有这个栈」，"
+            f"会让本轮写出一份少一个栈的基线，而且没有任何症状。修好访问再跑。") from None
+    return found[0]["StackName"] if found else ""
 
 
 def router_and_deployer_stacks(clients, *, edge_fn_arn: str, cmk_arns: tuple) -> tuple:
@@ -2257,7 +2295,8 @@ def router_and_deployer_stacks(clients, *, edge_fn_arn: str, cmk_arns: tuple) ->
     router_stack, _dist = router_stack_and_distribution(clients)
     facts = []
 
-    edge_owner, _hit = stack_owning(cfn, (edge_fn_arn, _fn_name(edge_fn_arn)))
+    edge_owner = (stack_owning(cfn, edge_fn_arn)
+                  or stack_owning(cfn, _fn_name(edge_fn_arn)))
     edge_verified = bool(edge_owner) and edge_owner == router_stack
     described = cfn.describe_stacks(StackName=router_stack)["Stacks"][0]
     facts.append(model.StackFact(
@@ -2275,9 +2314,22 @@ def router_and_deployer_stacks(clients, *, edge_fn_arn: str, cmk_arns: tuple) ->
               f"（实得 {edge_owner!r}）⇒ router 那条 CFN 路径按**未核实**记，"
               f"标签只出 *-unanalyzed）", file=sys.stderr)
 
-    # CMK 的物理 ID 既可能是 key id 也可能是完整 ARN，两种都试。
-    pids = tuple(a for arn in cmk_arns for a in (arn, arn.rsplit("/", 1)[-1]))
-    dep_stack, hit = stack_owning(cfn, pids)
+    # **逐把 key 各查一次**（R2-L3 ②）：上一版把所有 key 拼成一串、遇首个命中就返回，
+    # 于是第二把/`previous` 那把永远没被核验——轮转期两把 key 分属不同栈时，第二个受控的
+    # 签名栈整条掉出观测（那不是"前提未核实"的已接受盲区，是真的没看）。
+    owners: dict = {}
+    for arn in cmk_arns:
+        for pid in (arn, arn.rsplit("/", 1)[-1]):
+            found = stack_owning(cfn, pid)
+            if found:
+                owners.setdefault(found, []).append(arn)
+                break
+    if len(owners) > 1:
+        raise SystemExit(
+            f"两把以上会话签名 CMK 分属**不同** CloudFormation 栈（{sorted(owners)}）。"
+            f"本模型的 grant 词表按单个 `deployer` 标签记，多 owner 会让那条 grant 指代不明"
+            f"⇒ 不猜、不取第一个。要支持这种拓扑得先扩词表（每个签名栈一个标签）。")
+    dep_stack = next(iter(owners), "")
     if dep_stack:
         d2 = cfn.describe_stacks(StackName=dep_stack)["Stacks"][0]
         facts.append(model.StackFact(
@@ -2588,10 +2640,10 @@ def measure(region: str, *, workers: int = 4) -> dict:
         # **入口类型是观测出来的**（R1-L3）：写死 latest 等于把"改配置/改码立刻生效"这个
         # 前提变成假设，而 spec §4.1 要求它是观测值。
         auth=model.FnFact(fn_arn(AUTH_FUNCTION_NAME),
-                          entry=observed_entry(lam, AUTH_FUNCTION_NAME, aliases),
+                          entry=observed_entry(lam, AUTH_FUNCTION_NAME),
                           layers_supported=True),
         panel=model.FnFact(fn_arn(PANEL_FUNCTION_NAME),
-                           entry=observed_entry(lam, PANEL_FUNCTION_NAME, aliases),
+                           entry=observed_entry(lam, PANEL_FUNCTION_NAME),
                            layers_supported=True),
         # `edge_current_version()` 那条硬断言已经保证 association 是**编号版本**。
         # Lambda@Edge **不支持 Layer**（AWS 文档）⇒ 改配置不等于任意代码执行。

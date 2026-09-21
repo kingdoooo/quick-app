@@ -5086,28 +5086,142 @@ def test_edge_membership_that_cannot_be_proven_keeps_the_path_visible():
     assert router.premises_verified is False
 
 
-def test_observed_entry_reads_the_function_url_instead_of_assuming_latest():
-    """入口类型是**观测值**（R1-L3）：未限定 URL 在 ⇒ latest；不在但有 alias ⇒ alias；
-    都看不到 ⇒ unknown，**不许默认成 latest**。"""
+class _NotFound(Exception):
+    pass
+
+
+_NotFound.__name__ = "ResourceNotFoundException"
+
+
+class _FakeLam:
+    """按"哪些 qualifier 上有 Function URL"造一个假 Lambda。"""
+
+    def __init__(self, url_quals=(), aliases=(), list_raises=None):
+        self.url_quals = set(url_quals)      # "" 表示未限定
+        self.aliases = tuple(aliases)
+        self.list_raises = list_raises
+        self.calls = []
+
+    def get_function_url_config(self, FunctionName, Qualifier=None):
+        self.calls.append(Qualifier or "")
+        if (Qualifier or "") in self.url_quals:
+            return {"AuthType": "AWS_IAM"}
+        raise _NotFound()
+
+    def get_paginator(self, name):
+        assert name == "list_aliases", name
+        outer = self
+
+        class P:
+            def paginate(self, FunctionName):
+                if outer.list_raises:
+                    raise outer.list_raises
+                return iter([{"Aliases": [{"Name": a} for a in outer.aliases]}])
+        return P()
+
+
+def test_observed_entry_requires_url_evidence_not_just_an_alias_name():
+    """**R2-L3 ③**：入口是 Function URL，所以三个结论都要有 URL 证据。
+
+    上一版只看"有没有 alias 名字"就宣称 `alias` —— 既没验证入口，又与探针（当时传空
+    aliases）给出不同答案。现在自己枚举 alias 并逐个验 URL。
+    """
+    g = _gate()
+    assert g.observed_entry(_FakeLam(url_quals=[""]), "site-panel") == g.model.ENTRY_LATEST
+    # alias 存在但**没有** URL ⇒ unknown，不是 alias
+    assert g.observed_entry(_FakeLam(aliases=["blue"]), "site-panel") == g.model.ENTRY_UNKNOWN
+    # alias 上真有 URL ⇒ alias
+    assert g.observed_entry(_FakeLam(url_quals=["blue"], aliases=["blue"]),
+                           "site-panel") == g.model.ENTRY_ALIAS
+    # 什么都没有 ⇒ unknown（**不许默认 latest**）
+    assert g.observed_entry(_FakeLam(), "site-panel") == g.model.ENTRY_UNKNOWN
+
+
+def test_observed_entry_takes_only_the_lambda_client_and_the_name():
+    """签名只有 `(lam, function_name)` ⇒ 两个调用方**构造上**不可能给出不同答案
+    （R2-L3 ③ 的另一半：之前探针传 {}、闸门传真 aliases）。"""
+    import inspect
+    g = _gate()
+    params = list(inspect.signature(g.observed_entry).parameters)
+    assert params == ["lam", "function_name"], params
+    src = (_ROOT / "site-builder" / "scripts"
+           / "probe_impersonation_surface.py").read_text(encoding="utf-8")
+    assert "observed_entry(clients[\"lambda\"], \"site-auth-service\")" in src
+
+
+def test_observed_entry_keeps_unknown_when_the_url_read_fails():
+    """读配置本身失败（不是 NotFound）⇒ unknown，而不是猜成 latest 或 alias。"""
     g = _gate()
 
-    class NotFound(Exception):
-        pass
-    NotFound.__name__ = "ResourceNotFoundException"
+    class Boom(_FakeLam):
+        def get_function_url_config(self, FunctionName, Qualifier=None):
+            raise RuntimeError("ThrottlingException")
+    assert g.observed_entry(Boom(), "site-panel") == g.model.ENTRY_UNKNOWN
 
-    class Lam:
-        def __init__(self, has_url):
-            self.has_url = has_url
 
-        def get_function_url_config(self, FunctionName):
-            if self.has_url:
-                return {"AuthType": "AWS_IAM"}
-            raise NotFound()
+def test_reverse_lookup_treats_only_validation_error_as_unmanaged():
+    """**R2-L3 ①（major）**：`stack_owning` 原先 `except Exception` 一律返回空，于是
+    AccessDenied / 限流 / 网络故障与"确认不由任何栈管理"在输出上一模一样——而后果是
+    本轮写出一份**少一个栈**的基线，且没有任何症状。
 
-    assert g.observed_entry(Lam(True), "site-panel", {}) == g.model.ENTRY_LATEST
-    assert g.observed_entry(Lam(False), "site-panel",
-                           {"site-panel": ("blue",)}) == g.model.ENTRY_ALIAS
-    assert g.observed_entry(Lam(False), "site-panel", {}) == g.model.ENTRY_UNKNOWN
+    只有 CFN 的 `ValidationError ... does not exist` 算"不受管理"，其余硬失败。
+    """
+    g = _gate()
+
+    class Unmanaged:
+        def describe_stack_resources(self, PhysicalResourceId=None):
+            raise RuntimeError("An error occurred (ValidationError) ... "
+                               "Stack for x does not exist")
+
+    class Denied:
+        def describe_stack_resources(self, PhysicalResourceId=None):
+            raise PermissionError("AccessDenied")
+
+    assert g.stack_owning(Unmanaged(), "arn:aws:kms:r:1:key/k1") == ""
+    with pytest.raises(SystemExit, match="不受管理"):
+        g.stack_owning(Denied(), "arn:aws:kms:r:1:key/k1")
+    assert g.stack_owning(Unmanaged(), "") == ""      # 空 id 不发调用
+
+
+def test_every_cmk_is_looked_up_not_just_the_first():
+    """**R2-L3 ②（major）**：上一版把所有 key 拼成一串、遇首个命中即返回 ⇒ 第二把 /
+    `previous` 那把永远没被核验。轮转期两把 key 分属不同栈时，第二个受控签名栈整条
+    掉出观测——那不是"前提未核实"的已接受盲区，是真的没看。
+
+    现在逐把查；发现多个 owner 时**明确拒绝**（grant 词表按单个 deployer 标签记，
+    多 owner 会让那条 grant 指代不明）。
+    """
+    g = _gate()
+    seen = []
+
+    class Two:
+        def describe_stack_resources(self, PhysicalResourceId=None):
+            seen.append(PhysicalResourceId)
+            if "k1" in str(PhysicalResourceId):
+                return {"StackResources": [{"StackName": "KeyStack1"}]}
+            if "k2" in str(PhysicalResourceId):
+                return {"StackResources": [{"StackName": "KeyStack2"}]}
+            raise RuntimeError("ValidationError: Stack for x does not exist")
+
+        def describe_stacks(self, StackName):
+            return {"Stacks": [{"StackId": f"arn:stack/{StackName}",
+                                "Outputs": [{"OutputKey": "DistributionId",
+                                             "OutputValue": "D1"}]}]}
+
+        def get_stack_policy(self, StackName):
+            return {}
+
+        def get_paginator(self, name):
+            class P:
+                def paginate(self, StackName):
+                    return iter([{"StackResourceSummaries": []}])
+            return P()
+
+    with pytest.raises(SystemExit, match="不同"):
+        _with_router_cfg(lambda: g.router_and_deployer_stacks(
+            {"cloudformation": Two()}, edge_fn_arn="arn:aws:lambda:r:1:function:edge",
+            cmk_arns=("arn:aws:kms:r:1:key/k1", "arn:aws:kms:r:1:key/k2")))
+    assert any("k2" in str(x) for x in seen), "第二把 key 根本没被查"
 
 
 def test_a_second_service_role_is_drift_not_silence():
