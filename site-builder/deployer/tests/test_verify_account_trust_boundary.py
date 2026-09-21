@@ -5147,3 +5147,129 @@ def test_baseline_carries_capabilities_so_the_next_run_can_compare(tmp_path):
     fp = g.principal_fingerprint("arn:aws:iam::1:role/SomeRole")
     assert written["principals"][fp]["capabilities"] == ["sign:kms-direct"]
     assert written["model_inputs"]["edge_entry"] == "version"
+
+
+# ---- 3g：--carry-categories（schema 跳变时保住人工标注）-------------------------
+
+def test_baseline_with_retired_grant_prefix_is_refused(tmp_path):
+    """手改出的半真半假基线（schema 号改成 7、grant 还是旧名）必须在读入时被拒。"""
+    g = _gate()
+    p = tmp_path / "b.json"
+    p.write_text(json.dumps({"schema": g.BASELINE_SCHEMA, "principals": {
+        "aaaa-bbbb-cccc-dddd": {"category": "admin",
+                                "grants": ["replace-platform-code:site-panel"],
+                                "capabilities": []}}}), encoding="utf-8")
+    with pytest.raises(SystemExit) as e:
+        g.load_baseline(p)
+    assert "replace-platform-code" in str(e.value)
+
+
+def test_carry_categories_imports_only_categories(tmp_path):
+    """只导入 category；grants / capabilities / 豁免 / 其它状态一概不读。"""
+    g = _gate()
+    old = tmp_path / "old.json"
+    old.write_text(json.dumps({"schema": 6, "principals": {
+        "aaaa-bbbb-cccc-dddd": {"category": "platform",
+                                "grants": ["replace-platform-code:x"]},
+        "1111-2222-3333-4444": {"category": "admin", "grants": []}}}), encoding="utf-8")
+    assert g.load_carried_categories(old) == {"aaaa-bbbb-cccc-dddd": "platform",
+                                              "1111-2222-3333-4444": "admin"}
+
+
+def test_carry_categories_rejects_bad_shape_and_bad_values(tmp_path):
+    """"支持旧 schema"不等于接受任意结构：坏指纹、白名单外的类别都不导入。"""
+    g = _gate()
+    bad_shape = tmp_path / "s.json"
+    bad_shape.write_text(json.dumps({"principals": ["not", "a", "dict"]}),
+                         encoding="utf-8")
+    with pytest.raises(SystemExit):
+        g.load_carried_categories(bad_shape)
+
+    mixed = tmp_path / "f.json"
+    mixed.write_text(json.dumps({"principals": {
+        "not-a-fingerprint": {"category": "platform"},
+        "aaaa-bbbb-cccc-dddd": {"category": "not-a-category"},
+        "2222-3333-4444-5555": {"category": "unclassified"},
+        "1111-2222-3333-4444": {"category": "platform"}}}), encoding="utf-8")
+    assert g.load_carried_categories(mixed) == {"1111-2222-3333-4444": "platform"}
+
+
+def test_carry_categories_requires_update_baseline():
+    """单独给出没有语义——它的唯一作用是写新基线时保住标注。"""
+    g = _gate()
+    with pytest.raises(SystemExit, match="--update-baseline"):
+        g.main(["--carry-categories", "/nonexistent.json"])
+
+
+def test_carry_categories_conflicting_with_classify_is_fatal():
+    """冲突必须报明，不许静默覆盖——这一档的差别就是"丢授权会不会红"。"""
+    g = _gate()
+    with pytest.raises(SystemExit) as e:
+        g.merge_categories(carried={"aaaa-bbbb-cccc-dddd": "platform"},
+                           by_name={"r1": "admin"},
+                           observed={"aaaa-bbbb-cccc-dddd":
+                                     {"name": "r1", "arn": "a", "kind": "role",
+                                      "grants": [], "capabilities": []}})
+    assert "r1" in str(e.value) and "platform" in str(e.value)
+
+
+def test_classify_wins_over_carried_when_they_agree_or_only_one_exists():
+    g = _gate()
+    observed = {"aaaa-bbbb-cccc-dddd": {"name": "r1", "arn": "a", "kind": "role",
+                                        "grants": [], "capabilities": []}}
+    assert g.merge_categories(carried={}, by_name={"r1": "platform"},
+                              observed=observed) == {"aaaa-bbbb-cccc-dddd": "platform"}
+    assert g.merge_categories(carried={"aaaa-bbbb-cccc-dddd": "platform"},
+                              by_name={}, observed=observed) \
+        == {"aaaa-bbbb-cccc-dddd": "platform"}
+
+
+def test_write_baseline_precedence_is_classify_then_carried_then_existing(tmp_path):
+    g = _gate()
+    bundle = _complete_bundle(g)
+    fp = g.principal_fingerprint("arn:aws:iam::1:role/SomeRole")
+    out = tmp_path / "new.json"
+    # 沿用基线里已有的分类优先级最低 ⇒ carried 生效
+    g.write_baseline(bundle, {"principals": {fp: {"category": "cdk-admin"}}}, out,
+                     carried={fp: "platform"})
+    assert json.loads(out.read_text(encoding="utf-8"))[
+        "principals"][fp]["category"] == "platform"
+    # bundle 里已有 category（--classify 写的）时它最优先
+    bundle["principals"]["0000-1111-2222-3333"]["category"] = "break-glass"
+    g.write_baseline(bundle, {"principals": {}}, out, carried={fp: "platform"})
+    assert json.loads(out.read_text(encoding="utf-8"))[
+        "principals"][fp]["category"] == "break-glass"
+
+
+def test_platform_still_goes_red_after_carrying_categories(tmp_path):
+    """**迁移后等值约束必须真的恢复**：category 丢失时 platform 丢一条 grant 只会
+    被当成"改善"（绿）。这条用例证明 carry 之后它照样红。"""
+    g = _gate()
+    bundle = _complete_bundle(g)
+    bundle["principals"]["0000-1111-2222-3333"]["grants"] = [
+        "invoke-platform:site-panel", "invoke-site:all"]
+    fp = g.principal_fingerprint("arn:aws:iam::1:role/SomeRole")
+    out = tmp_path / "new.json"
+    g.write_baseline(bundle, {"principals": {}}, out, carried={fp: "platform"})
+    baseline = json.loads(out.read_text(encoding="utf-8"))
+    assert baseline["principals"][fp]["category"] == "platform"
+    shrunk = {fp: {"name": "SomeRole", "arn": "arn:aws:iam::1:role/SomeRole",
+                   "kind": "role", "grants": ["invoke-site:all"], "capabilities": []}}
+    rep = g.compare_to_baseline(shrunk, baseline, required={})
+    assert rep.missing_required, "platform 丢 grant 没红 ⇒ 等值约束没恢复"
+
+    # **正对照**：不带 carried 时那一条会被记成"改善"（绿）——这正是要防的静默降级
+    g.write_baseline(bundle, {"principals": {}}, out)
+    loose = json.loads(out.read_text(encoding="utf-8"))
+    assert loose["principals"][fp]["category"] == "unclassified"
+    rep2 = g.compare_to_baseline(shrunk, loose, required={})
+    assert not rep2.missing_required and rep2.improvements, \
+        "没带 carried 时居然还红？那这个旗标就没有存在的理由了"
+
+
+def test_categories_whitelist_has_one_definition():
+    """白名单只许有一份：write_baseline 里那份字面量已经改成引用 CATEGORIES。"""
+    g = _gate()
+    assert "platform" in g.CATEGORIES and "unclassified" in g.CATEGORIES
+    src = _SCRIPT.read_text(encoding="utf-8")
+    assert src.count('"platform-overbroad"') == 1, "类别白名单又有第二份字面量"

@@ -297,6 +297,12 @@ def is_secret_grant(grant: str) -> bool:
 # ---- 迁移声明的标签 ----------------------------------------------------------
 # `--new-key LABEL` / `--retire-key LABEL` 的 LABEL ∈ 已配置 kid ∪ {login-flow}。
 # `legacy` 这个标签随 HS 层一起消失了（3c-final 没有 legacy 入口）。
+# 人工标注的类别白名单。`--classify` 与 `--carry-categories` 都按它校验。
+# **`platform` 那一档是集合等值约束的开关**：标注丢了，平台角色的授权丢失会被当成"改善"。
+CATEGORIES: tuple[str, ...] = ("platform", "platform-overbroad", "admin", "break-glass",
+                               "cdk-admin", "cdk-readonly", "unrelated-workload",
+                               "unclassified")
+
 LABEL_LOGIN_FLOW = "login-flow"
 NON_KID_LABELS = (LABEL_LOGIN_FLOW,)
 
@@ -2724,6 +2730,16 @@ def load_baseline(path: Path) -> dict:
             "而那会把 platform 的集合等值约束静默降级成「只看新增」（唯一症状：什么都不红）。")
     # coverage 成员必须是可分解形态。哈希形态混进来（手改、或把旧 schema 的文件改个版本号）
     # 会让退役声明静默失效——照红、与没修一样。所以在读入时就拒。
+    # schema 号对了但 grant 还是旧名 = 手改出来的半真半假形态（改了版本号、没换内容）。
+    # 读进去的后果是整层比较对着两套词表跑，报出来的"新增"全是改名噪音。
+    retired = sorted({x for rec in (data.get("principals") or {}).values()
+                      for x in (rec.get("grants") or ())
+                      if x.startswith("replace-platform-code:")})
+    if retired:
+        raise SystemExit(
+            f"基线里还有已退役的 grant 名 {retired[:3]}（schema 7 起改名为 "
+            f"`{G_UPDATE_CODE}:`）。这份文件的 schema 号是新的、内容是旧的 ⇒ 比较结果"
+            f"没有意义。把它移到备份位置，按 DEPLOY.md 的见证流程重生成。")
     items = (data.get("coverage") or {}).get("undecided_items")
     if items is not None:
         _check_shape(items, _list_of_undecided_items,
@@ -2896,6 +2912,68 @@ def load_dump(path: Path) -> dict:
     return data
 
 
+def load_carried_categories(path: Path) -> dict:
+    """从**任意 schema** 的旧基线里只取 `principals[*].category`（3g）。
+
+    **为什么需要它**：`write_baseline` 只从"这一轮读进来的基线 dict"沿用 category，而
+    schema 不匹配时 `load_baseline` 会硬失败 ⇒ 操作者按提示移走旧文件之后，全部
+    `platform` 标注都变成 `unclassified`，platform 的**集合等值**约束静默降级成
+    "只看新增"（唯一症状：什么都不红）。既有的 `--classify` 按**角色名**映射能部分顶替，
+    但它依赖一份仓库外文件存在且角色名没变过 ⇒ 那是补充，不是替代。
+
+    **"支持旧 schema"不等于接受任意结构**：指纹形态与 category 取值都要校验，不合法的
+    逐条报出、不导入。除 category 以外一概不读（grants / capabilities / coverage / kms
+    都不读——那些必须来自本轮观测）。
+    """
+    data = json.loads(path.read_text(encoding="utf-8"))
+    principals = data.get("principals")
+    if not isinstance(principals, dict):
+        raise SystemExit(f"{path} 没有 dict 形态的 principals 分节——这不是一份基线")
+    out: dict = {}
+    skipped: list = []
+    for fp, rec in principals.items():
+        cat = rec.get("category") if isinstance(rec, dict) else None
+        if not _PFP_RE.fullmatch(str(fp)):
+            skipped.append(f"{fp}（指纹形态不合法）")
+        elif cat is None or cat == "unclassified":
+            skipped.append(f"{fp}（没有有效分类）")
+        elif cat not in CATEGORIES:
+            skipped.append(f"{fp}（类别 {cat!r} 不在白名单）")
+        else:
+            out[str(fp)] = cat
+    if skipped:
+        print(f"--carry-categories：跳过 {len(skipped)} 条：{skipped[:5]}", file=sys.stderr)
+    print(f"--carry-categories：从 {path} 带过来 {len(out)} 条分类"
+          f"（**只读 category**，grants / capabilities / coverage 一概不读）",
+          file=sys.stderr)
+    return out
+
+
+def merge_categories(*, carried: dict, by_name: dict, observed: dict) -> dict:
+    """→ {指纹: category}。优先级 `--classify`（按名字）> `--carry-categories`（按指纹）。
+
+    **冲突硬失败**：两处对同一个 principal 给出不同分类时，静默择一等于让操作者以为
+    自己标了 A 而实际生效 B——而这一档的差别就是"丢授权会不会红"。
+    """
+    merged = dict(carried)
+    conflicts = []
+    for fp, rec in observed.items():
+        named = by_name.get(rec["name"])
+        if named is None:
+            continue
+        if named not in CATEGORIES:
+            raise SystemExit(f"--classify 里 {rec['name']} 的类别 {named!r} 不在白名单 "
+                             f"{list(CATEGORIES)}")
+        if fp in carried and carried[fp] != named:
+            conflicts.append(f"{rec['name']}：--classify={named} vs "
+                             f"--carry-categories={carried[fp]}")
+        merged[fp] = named
+    if conflicts:
+        raise SystemExit("--classify 与 --carry-categories 冲突（不静默覆盖，请自己定）："
+                         + "；".join(conflicts))
+    return merged
+
+
 def wants_baseline(args) -> bool:
     """只有"要出闸门结论"或"要写基线"时才需要读基线。
 
@@ -2906,7 +2984,13 @@ def wants_baseline(args) -> bool:
     return not (args.dump_observed and not args.update_baseline)
 
 
-def write_baseline(bundle: dict, baseline: dict, path: Path) -> None:
+def write_baseline(bundle: dict, baseline: dict, path: Path,
+                   carried: dict | None = None) -> None:
+    """`carried` = `--carry-categories` 带过来的 {指纹: category}（3g）。
+
+    优先级：`--classify`（已经写进 `bundle` 的 `category` 字段）> `carried` >
+    本轮读到的基线 > `unclassified`。
+    """
     old = baseline.get("principals", {})
     principals = {}
     # **指纹从 ARN 重算，不沿用 bundle 的键**：`--from-dump` 读的快照可能是旧格式
@@ -2915,8 +2999,8 @@ def write_baseline(bundle: dict, baseline: dict, path: Path) -> None:
         fp = principal_fingerprint(p["arn"])
         principals[fp] = {
             # `--classify` 传进来的标注优先；否则沿用基线里已有的；都没有才 unclassified。
-            "category": p.get("category")
-            or old.get(fp, {}).get("category", "unclassified"),
+            "category": (p.get("category") or (carried or {}).get(fp)
+                         or old.get(fp, {}).get("category", "unclassified")),
             "grants": p["grants"],
             # 3g：派生能力标签。与 grants 同一套红绿口径（platform 集合等值、
             # 其它类别新增红缩小算改善）。
@@ -2933,9 +3017,7 @@ def write_baseline(bundle: dict, baseline: dict, path: Path) -> None:
          # platform-overbroad：平台自己的角色，但这条授权它并不需要
          # （典型的一个：跑不可信站点依赖安装的 CodeBuild 角色，CDK 自动给了它
          #  整个 bootstrap 桶的读权限）。
-         "categories": ["platform", "platform-overbroad", "admin", "break-glass",
-                        "cdk-admin", "cdk-readonly", "unrelated-workload",
-                        "unclassified"],
+         "categories": list(CATEGORIES),
          "facts": bundle["facts"],
          # 判不出的项按**成员**存（新成员即红）。principal 级的那个笼统计数在 facts 里，
          # 只报 delta——它会随账号里任何一条带 Condition 的新策略变动。
@@ -2982,6 +3064,12 @@ def main(argv: list | None = None) -> int:
                     help="从 PATH 读 {角色名: category} 映射，据此标注基线的 "
                          "category（配合 --update-baseline）。映射文件同样"
                          "含真实名字，**不要提交**。")
+    ap.add_argument("--carry-categories", metavar="PATH",
+                    help="从**任意 schema** 的旧基线里只带过来 principals[*].category"
+                         "（配合 --update-baseline）。schema 跳变时不带它 = 全部 platform "
+                         "标注变成 unclassified ⇒ platform 的集合等值约束静默降级成"
+                         "「只看新增」（唯一症状：什么都不红）。只读 category，其余一概"
+                         "不读；与 --classify 冲突即报错。")
     ap.add_argument("--new-key", "--new-kid", action="append", metavar="LABEL", dest="new_key",
                     help="本轮**首次出现**的密钥标签（可重复）。LABEL ∈ 已配置 kid ∪ "
                          "{login-flow}。它对应的 grant 在此前已能签某把会话密钥的 "
@@ -2997,6 +3085,9 @@ def main(argv: list | None = None) -> int:
     args = ap.parse_args(argv)
     # 标签打错一个字的后果是"以为声明了、其实没有"——静默的，所以在任何比较之前就校验。
     # 位置在所有分支**之上**，只读 config、不发 AWS 调用 ⇒ `--from-dump` 那条也一样覆盖。
+    if args.carry_categories and not args.update_baseline:
+        raise SystemExit("--carry-categories 只与 --update-baseline 同用：它的唯一作用是"
+                         "写新基线时保住人工标注，单独给出没有语义。")
     declared_labels = tuple(args.new_key or ()) + tuple(args.retire_key or ())
     if declared_labels:
         cfg_keys = load_session_keys(CONFIG_PATH)
@@ -3049,12 +3140,14 @@ def main(argv: list | None = None) -> int:
 
     if args.update_baseline:
         check_bundle_complete(bundle, where="--update-baseline")
-        classify = json.loads(Path(args.classify).read_text(encoding="utf-8")) \
+        carried = (load_carried_categories(Path(args.carry_categories))
+                   if args.carry_categories else {})
+        by_name = json.loads(Path(args.classify).read_text(encoding="utf-8")) \
             if args.classify else {}
-        if classify:
-            for p in observed.values():
-                if p["name"] in classify:
-                    p["category"] = classify[p["name"]]
+        for fp, cat in merge_categories(carried=carried, by_name=by_name,
+                                        observed=observed).items():
+            if fp in observed:
+                observed[fp]["category"] = cat
         # **先渲染一遍比较报告，再写基线**（3c-1B-G A6）。原先这条分支在
         # `compare_to_baseline` 之前就 return ⇒ 写基线那条路**什么都不打印**，
         # "这一次到底接受了什么"只存在于操作者的记忆里。spec §11.8.7 反对人工放行的
@@ -3072,7 +3165,7 @@ def main(argv: list | None = None) -> int:
             kms=bundle["kms"], model_inputs=bundle["model_inputs"],
             new_keys=tuple(args.new_key or ()), retired_keys=tuple(args.retire_key or ()))
         print(preview.render())
-        write_baseline(bundle, baseline, BASELINE_PATH)
+        write_baseline(bundle, baseline, BASELINE_PATH, carried=carried)
         print(f"\n已写入 {BASELINE_PATH}（新条目 category=unclassified，请人工标注）")
         return 0
 
