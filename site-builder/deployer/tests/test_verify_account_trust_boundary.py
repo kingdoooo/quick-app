@@ -5047,3 +5047,103 @@ def test_the_gate_uses_the_guard_predicate_not_policy_problems():
     assert "guard_for" in called, "闸门没调用 guard 谓词"
     assert "policy_problems" not in called, "闸门用了形态一致性谓词当 guard"
     assert "stack_policy" not in imported, "闸门 import 了 router 侧的形态谓词模块"
+
+
+# ---- 3g：派生能力层 -----------------------------------------------------------
+
+def _obs(name="r1", *, grants=(), caps=(), arn="arn:aws:iam::1:role/r1"):
+    return {"fp1": {"name": name, "arn": arn, "kind": "role",
+                    "grants": list(grants), "capabilities": list(caps)}}
+
+
+def _base(category="admin", *, grants=(), caps=()):
+    return {"schema": _gate().BASELINE_SCHEMA,
+            "principals": {"fp1": {"category": category, "grants": list(grants),
+                                   "capabilities": list(caps)}}}
+
+
+def test_capabilities_are_compared_per_principal():
+    """能力层按 **principal × 标签集合** 比较——只比总人数或一个布尔会让
+    "A 失去、B 获得"静静地绿。"""
+    g = _gate()
+    rep = g.compare_to_baseline(
+        _obs(grants=["update-fn-code:site-auth-service"],
+             caps=["sign:hijack-auth-signer"]),
+        _base(grants=["update-fn-code:site-auth-service"]), required={})
+    assert rep.new_capabilities, "新增能力标签没有红"
+    assert not rep.ok
+
+
+def test_grant_growth_is_red_even_when_capabilities_are_unchanged():
+    """**能力层不许吃掉 grant 层的灵敏度**：标签集合完全不变，但授权扩到另一个
+    受保护资源 ⇒ 仍然红。"""
+    g = _gate()
+    rep = g.compare_to_baseline(
+        _obs(grants=["update-fn-code:site-auth-service", "update-fn-code:site-panel"],
+             caps=["sign:hijack-auth-signer"]),
+        _base(grants=["update-fn-code:site-auth-service"],
+              caps=["sign:hijack-auth-signer"]), required={})
+    assert rep.new_grants, "grant 扩到另一个资源却没红"
+    assert not rep.new_capabilities
+    assert not rep.ok
+
+
+def test_platform_losing_a_capability_is_red():
+    """platform 类按**集合等值**比：丢失同样要红（丢掉 auth 的签名能力 =
+    全平台登录不可用，而那不会在任何单测里出现）。"""
+    g = _gate()
+    rep = g.compare_to_baseline(
+        _obs("site-auth-service", grants=["kms-sign:site-rs-v1"]),
+        _base("platform", grants=["kms-sign:site-rs-v1"], caps=["sign:kms-direct"]),
+        required={})
+    assert rep.missing_required, "platform 丢能力标签没红"
+    assert not rep.ok
+
+
+def test_non_platform_losing_a_capability_is_an_improvement():
+    g = _gate()
+    rep = g.compare_to_baseline(_obs(), _base("admin", caps=["sign:kms-direct"]),
+                                required={})
+    assert rep.improvements and rep.ok
+
+
+def test_key_declarations_do_not_apply_to_capabilities():
+    """`--new-key` / `--retire-key` 对能力层无效：标签是"任一把 key 成立即算"的口径，
+    加/退一把 CMK 不改变它 ⇒ 轮转期能力层若变化，那不是轮转的副作用。"""
+    g = _gate()
+    rep = g.compare_to_baseline(
+        _obs(grants=["kms-sign:site-rs-v2"], caps=["sign:kms-direct"]),
+        _base(grants=["kms-sign:site-rs-v1"]), required={},
+        new_keys=("site-rs-v2",))
+    assert rep.new_capabilities, "能力标签新增被密钥声明抹掉了"
+
+
+def test_capabilities_come_from_the_shared_model():
+    """闸门不许有第二份判定（按 AST 判：注释里提到函数名不算）。"""
+    tree = ast.parse(_SCRIPT.read_text(encoding="utf-8"))
+    defined = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    assert "classify" not in defined, "闸门里又有一份 classify"
+    calls = {getattr(n.func, "attr", None) for n in ast.walk(tree)
+             if isinstance(n, ast.Call)}
+    assert "classify" in calls, "闸门没调用共享模型的 classify"
+
+
+def test_headline_counts_do_not_drive_the_exit_code():
+    """headline 只打印：红绿在逐 principal 那一层已经判过了。notes 不参与红绿。"""
+    g = _gate()
+    rep = g.Report()
+    rep.notes.append("headline: can_sign=15")
+    assert rep.ok
+
+
+def test_baseline_carries_capabilities_so_the_next_run_can_compare(tmp_path):
+    """能力标签必须真的落进基线——不落的话下一轮拿空集合比，新增永远看不见。"""
+    g = _gate()
+    bundle = _complete_bundle(g)
+    bundle["principals"]["0000-1111-2222-3333"]["capabilities"] = ["sign:kms-direct"]
+    out = tmp_path / "b.json"
+    g.write_baseline(bundle, {"principals": {}}, out)
+    written = json.loads(out.read_text(encoding="utf-8"))
+    fp = g.principal_fingerprint("arn:aws:iam::1:role/SomeRole")
+    assert written["principals"][fp]["capabilities"] == ["sign:kms-direct"]
+    assert written["model_inputs"]["edge_entry"] == "version"

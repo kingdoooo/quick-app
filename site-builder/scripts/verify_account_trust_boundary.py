@@ -1164,6 +1164,7 @@ def site_fingerprint(function_name: str) -> str:
 RED_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("new_principals",       "新增 principal（红）",                         "grew"),
     ("new_grants",           "已知 principal 长出新授权（红）",              "grew"),
+    ("new_capabilities",     "已知 principal 长出新的冒充能力路径（红）",     "grew"),
     ("missing_required",     "必需授权丢失（红）",                           "lost"),
     ("new_statements",       "新增 resource policy 语句（红）",              "grew"),
     ("site_policy_outliers", "站点函数的 resource policy 偏离规范形态（红）", "grew"),
@@ -1226,6 +1227,7 @@ class Report:
     boundary_drift: list[str] = field(default_factory=list)
     kms_drift: list[str] = field(default_factory=list)
     model_input_drift: list[str] = field(default_factory=list)
+    new_capabilities: list[str] = field(default_factory=list)
     migration_grants: list[str] = field(default_factory=list)
     migration_undecided: list[str] = field(default_factory=list)
     improvements: list[str] = field(default_factory=list)
@@ -1324,6 +1326,24 @@ def compare_to_baseline(observed: dict[str, dict], baseline: dict, *,
                         f"必需的，丢失同样要红")
             else:
                 rep.improvements.append(f"{p['name']}  [{fp}]  -{sorted(lost)}")
+        # ---- 能力层（3g）：口径与 grant 层**逐字相同**，刻意的不对称继续 ----
+        # **密钥声明对这一层无效**：标签是"任一把 key 成立即算"的口径，加/退一把 CMK
+        # 不改变它（改变的是 kms-sign:<kid> 那些 grant 与 kms 分节）⇒ 轮转期能力层若
+        # 出现变化，那**不是**轮转的副作用，必须有人看。
+        caps = set(p.get("capabilities") or ())
+        was_caps = set(base[fp].get("capabilities") or ())
+        if caps - was_caps:
+            rep.new_capabilities.append(
+                f"{p['name']}  [{fp}]  +{sorted(caps - was_caps)}")
+        if was_caps - caps:
+            if category == "platform":
+                rep.missing_required.append(
+                    f"{p['name']}（platform）丢了能力路径 {sorted(was_caps - caps)}"
+                    f"——平台自己的能力是精确且必需的（丢掉 auth 的签名能力 = 全平台登录"
+                    f"不可用，而那不会在任何单测里出现）")
+            else:
+                rep.improvements.append(
+                    f"{p['name']}  [{fp}]  -{sorted(was_caps - caps)}（能力路径）")
         if category in (None, "", "unclassified"):
             rep.unclassified.append(f"{p['name']}  [{fp}]")
 
@@ -2898,6 +2918,9 @@ def write_baseline(bundle: dict, baseline: dict, path: Path) -> None:
             "category": p.get("category")
             or old.get(fp, {}).get("category", "unclassified"),
             "grants": p["grants"],
+            # 3g：派生能力标签。与 grants 同一套红绿口径（platform 集合等值、
+            # 其它类别新增红缩小算改善）。
+            "capabilities": p.get("capabilities") or [],
         }
     path.write_text(json.dumps(
         {"schema": BASELINE_SCHEMA,
