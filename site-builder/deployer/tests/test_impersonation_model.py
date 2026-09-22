@@ -334,6 +334,31 @@ def test_union_counts_both_classes_and_excludes_non_surface(m):
     assert agg["both"] == 1 and agg["sign_only"] == 1 and agg["edge_only"] == 1
     assert agg["fixture_issuer_holders"] == 1
     assert agg["non_surface_only_holders"] == 2   # 夹具 + 未分析各一个
+    # 并集外的未分析持有者：只有 `p-unanalyzed`（夹具那位不持未分析标签）
+    assert agg["unanalyzed_outside_union"] == 1
+
+
+def test_unanalyzed_holders_inside_the_union_are_not_counted_as_outside(m):
+    """**R3-b**：`unanalyzed_outside_union` 是 `marginal_value_if_closed` 那层上界的
+    **差额**——反事实只遍历初始并集，所以并集外只持未分析路径的人根本不进
+    `remaining`/`uncertain`。既然是差额，它就必须**只**数并集外的人：
+
+    · 同时持已建模路径与未分析路径的人**在**并集里 ⇒ 他已经被 `uncertain` 覆盖，不算差额
+      （算了就等于同一个人被数两次，那句范围声明又会反过来说小）；
+    · 一个未分析标签都不持的人（受限的夹具签发器）也不算。
+    """
+    agg = m.summarize({
+        "p-inside-both": {m.S_KMS_DIRECT, m.E_CFN_TEMPLATE_UNANALYZED},   # 在并集里
+        "p-outside": {m.S_CFN_SESSION_KEY_UNANALYZED},                    # 并集外，算
+        "p-fixture": {m.S_FIXTURE_ISSUER},                                # 不持未分析，不算
+    })
+    assert agg["impersonation_surface_union"] == 1
+    assert agg["unanalyzed_outside_union"] == 1
+    # 并集内那位由 uncertain 覆盖（关掉 KMS 那组后他仍不定论）
+    assert agg["marginal_value_if_closed"]["restrictive-kms-key-policy"][
+        "principals_uncertain"] == 1
+    # 两条路都没有未分析持有者时是 0（证明它不是常数）
+    assert m.summarize({"p": {m.S_KMS_DIRECT}})["unanalyzed_outside_union"] == 0
 
 
 def test_marginal_value_uses_the_same_membership_predicate(m):

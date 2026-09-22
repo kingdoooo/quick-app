@@ -331,6 +331,12 @@ def summarize(by_principal: dict) -> dict:
         "non_surface_only_holders": len(holders(
             lambda ls: bool(ls) and not any(is_surface_label(l) for l in ls))),
         "impersonation_surface_union": len(surface),
+        # **并集外**还持未分析路径的人数（R3-b）：`marginal_value_if_closed` 只遍历
+        # `surface`，所以这些人既不进 `remaining` 也不进 `uncertain` ⇒ `surface_after`
+        # 是**初始已建模并集内**的上界，不是"本轮观测到的群体"的上界。这个数就是差额，
+        # 报告必须能把它说出来，否则那句范围声明是假的。
+        "unanalyzed_outside_union": len(holders(
+            lambda ls: bool(set(ls) & UNANALYZED_LABELS)) - surface),
         "both": len(can_sign & can_edge),
         "sign_only": len(can_sign - can_edge),
         "edge_only": len(can_edge - can_sign),

@@ -762,7 +762,15 @@ merged review 的 M09 记的是「同账号 `lambda:InvokeFunction` 可对 panel
    `kms:PutKeyPolicy`（**未核**）⇒ 一律落 `sign:cfn-session-key-stack-unanalyzed`。
 3. **`CreateFunction` 的名字空间。** 只对**两个**候选 ARN 有判定（一个中性名、一个与
    router 栈同前缀）。按名字前缀授权的策略可能在别的名字上成立。
-4. 既有三个盲区不变：`SimulatePrincipalPolicy` 对带 Condition 的策略只补 KMS 签名合同
+4. **"栈还管不管这个资源"只核实到栈存活为止。** CMK / Edge 函数的归属靠
+   `DescribeStackResources` 按物理 ID 反查，而它**明文返回已删除栈 90 天内的资源记录**
+   （AWS API Reference，查阅 2026-09-22）⇒ 闸门按记录里的 `StackId` 再查一次
+   `DescribeStacks`，`DELETE_COMPLETE` 的一律不算 owner（不然"上一轮轮转 RETAIN 下来的
+   previous key + 那个栈已删"会凭空变出第二个 owner，把闸门用一个**假理由**挡住）。
+   **还剩一种分辨不了的**：栈**仍存活但已把该资源移出模板**（RETAIN）时记录照样命中。
+   同一族 API 对已删除栈都有那个 90 天窗口，问不出"当前成员"⇒ 按**多报一条路**记
+   （"改这个栈的模板就能改 key policy"），与本文件"不得据未分析宣称退出冒充面"同向。
+5. 既有三个盲区不变：`SimulatePrincipalPolicy` 对带 Condition 的策略只补 KMS 签名合同
    那两个键（其余判定是下界）、动作等价类不穷尽、看不见"临时建了个角色用完就删"。
 
 **这几条都有单列标签或 spec 记录，刻意不折进 headline**：折进去会让"还有多少人能冒充

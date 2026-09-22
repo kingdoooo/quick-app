@@ -94,6 +94,38 @@ MITIGATIONS = model.MITIGATIONS
 ALL_LABELS = model.ALL_LABELS
 
 
+def print_marginal_report(agg: dict, out=None) -> None:
+    """边际收益那一段的**终端报告**。独立成函数是为了让守卫断言**真实 stdout**。
+
+    **三个数都要打印**（R2-L5）：只打 surface_after / principals_removed 时，
+    "还剩未分析路径所以不定论"这第三种结论在默认报告里完全消失——JSON 里有
+    `principals_uncertain`，看终端的人却分不清"已知残留"与"待核实"。
+
+    **范围声明必须说到"初始已建模并集"为止**（R3-b）：`summarize` 的反事实只遍历
+    `surface`（= 初始并集），所以只持未分析路径的人根本不进 `remaining`/`uncertain`。
+    上一版把范围写成"本轮观测到的群体"，于是出现过这种读数：两个 principal、其中一个
+    只持 `edge:cfn-template-unanalyzed`，报告却是「面 1 → ≤0（确定离场 ≥1，待核实 0）」
+    ——看起来像"关掉 KMS 那组就没人了"，而账号里明明还有一个没定论的人。差额就是
+    `unanalyzed_outside_union`，所以这里把它**连数字一起**打出来。
+
+    上一版的守卫是 grep 源码关键词（CLAUDE.md 明确点过这个病），因此看不见这个问题。
+    """
+    def p(line: str) -> None:
+        print(line, file=out or sys.stdout)
+
+    p("\n===== 关掉某一组路径的边际收益 =====")
+    p("  收益（removed）是**下界**、剩余（after）是**上界**；uncertain = 已建模路径都关了"
+      "但仍持未分析路径、因而不定论的人数。")
+    p(f"  上界的范围**仅限初始已建模并集内的成员**"
+      f"（本轮 {agg['impersonation_surface_union']} 人）："
+      f"并集外只持未分析路径的 {agg.get('unanalyzed_outside_union', 0)} 人"
+      f"**未计入任何一行的 after**——措施关不掉他们，他们也从没被算进去。")
+    for name, m in agg["marginal_value_if_closed"].items():
+        p(f"  {name:32} 面 {agg['impersonation_surface_union']:>3}"
+          f" → ≤{m['surface_after']:<3}（确定离场 ≥{m['principals_removed']}，"
+          f"待核实 {m.get('principals_uncertain', 0)}）")
+
+
 def self_test() -> int:
     """跑**判定层**共享反例 + 聚合口径断言，都不碰 AWS。
 
@@ -118,7 +150,10 @@ def self_test() -> int:
     })
     want = {"can_sign": 2, "can_replace_edge_verifier": 2,
             "impersonation_surface_union": 3, "both": 1,
-            "fixture_issuer_holders": 1, "non_surface_only_holders": 2}
+            "fixture_issuer_holders": 1, "non_surface_only_holders": 2,
+            # R3-b：边际收益那层上界的**差额**（并集外还持未分析路径的人）。
+            # 这里就是 `p-unanalyzed` 那一个。
+            "unanalyzed_outside_union": 1}
     bad = {k: (agg[k], v) for k, v in want.items() if agg[k] != v}
     print(f"  {'ok  ' if not bad else 'FAIL'} 聚合：两类进并集，受限/未分析单列不进")
     if bad:
@@ -410,16 +445,7 @@ def main(argv: list[str] | None = None) -> int:
     for k in ("can_sign", "can_replace_edge_verifier",
               "impersonation_surface_union", "both", "sign_only", "edge_only"):
         print(f"  {k:32} {agg[k]:>4}")
-    # **三个数都要打印**（R2-L5）：只打 surface_after / principals_removed 时，
-    # "还剩未分析路径所以不定论"这第三种结论在默认报告里完全消失——JSON 里有
-    # `principals_uncertain`，看终端的人却分不清"已知残留"与"待核实"。
-    print("\n===== 关掉某一组路径的边际收益 =====")
-    print("  收益（removed）是**下界**、剩余（after）是**上界**；uncertain = 已建模路径都关了"
-          "但仍持未分析路径、因而不定论的人数。范围限于本轮观测到的群体。")
-    for name, m in agg["marginal_value_if_closed"].items():
-        print(f"  {name:32} 面 {agg['impersonation_surface_union']:>3}"
-              f" → ≤{m['surface_after']:<3}（确定离场 ≥{m['principals_removed']}，"
-              f"待核实 {m.get('principals_uncertain', 0)}）")
+    print_marginal_report(agg)
     print("\n提醒：`sign:kms-*` 是 identity policy 的**上界**；KMS 的 key policy 是"
           "权威的，\n真实可签名集合 = 该上界 ∩ key policy 放行的集合。"
           "\n`sign:hijack-*` 与 key policy 无关——恶意代码是**以 signer 角色身份**调用的。")

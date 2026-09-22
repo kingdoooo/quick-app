@@ -2245,6 +2245,14 @@ def _cfn_says_unmanaged(exc) -> bool:
     *Stack for <id> does not exist*）。**只有它算"不存在"**——AccessDenied / Throttling /
     网络故障一律不算（R2-L3 ①）：把它们当"不存在"会让"权限不足"与"确认无归属"在输出上
     一模一样，而后果是新基线从此没有那个栈的授权与 coverage，且没有任何症状。
+
+    **证据等级：这段文案是「实测观察」而不是「文档承诺」**（R3 复核）。API Reference 只
+    承诺栈不存在时返回 `ValidationError`，没有承诺未命中反查时的**消息正文**；
+    botocore 1.43.53 上找不到反例（AccessDenied / Throttling / 普通 ValidationError 都
+    走硬失败那条）。**刻意保留这个双条件而不放宽成"只看 Code"**：双条件是能拿到的最窄
+    判据，而它万一失效的方向是**响亮的硬失败**（"CMK 真的不由任何栈管理"的合法拓扑会
+    退成 SystemExit），不是静默少算一个栈。放宽成只看 `Code == ValidationError` 才危险——
+    参数校验类的 ValidationError 会被读成"不受管理"。
     """
     resp = getattr(exc, "response", None)
     code = (resp or {}).get("Error", {}).get("Code", "") if isinstance(resp, dict) else ""
@@ -2252,8 +2260,47 @@ def _cfn_says_unmanaged(exc) -> bool:
     return "ValidationError" in text and "does not exist" in str(exc)
 
 
-def stack_owning(cfn, physical_id: str) -> str:
-    """按**物理资源 ID** 反查它属于哪个栈 → 栈名；确认不受管理时返回 `""`。
+STACK_DELETED = "DELETE_COMPLETE"
+
+
+@dataclass(frozen=True)
+class StackRef:
+    """一个**已核实存活**的归属栈。`stack_id` 为空 = 没有存活的归属栈。
+
+    为什么要带 `StackId` 而不只留栈名（R3-a）：`DescribeStackResources`
+    **明文返回已删除栈 90 天内的资源记录**（AWS API Reference，查阅 2026-09-22：
+    *Returns AWS resource descriptions for running and deleted stacks* /
+    *For deleted stacks ... up to 90 days after the stack has been deleted*）。
+    栈名区分不了"活栈"与"同名的历史记录"；`DescribeStacks` 按**名字**查已删除栈只会
+    `ValidationError`，按 `StackId` 查才拿得到 `DELETE_COMPLETE`（同一份文档：
+    *Deleted stacks: You must specify the unique stack ID*）。
+    """
+    name: str = ""
+    stack_id: str = ""
+    described: dict = field(default_factory=dict)
+
+
+def _describe_live_stack(cfn, stack_id: str) -> dict:
+    """按 **StackId** 描述这个栈；**已删除 / 已过 90 天查不到**一律返回 `{}`。
+
+    必须按 StackId：已删除栈按名字查不到（见 `StackRef` 的文档引用），于是"删了"与
+    "没权限"在输出上一模一样。这里沿用 `_cfn_says_unmanaged` 那条窄判据，其余硬失败。
+    """
+    try:
+        stacks = cfn.describe_stacks(StackName=stack_id)["Stacks"]
+    except Exception as exc:                      # noqa: BLE001
+        if _cfn_says_unmanaged(exc):
+            return {}
+        raise SystemExit(
+            f"按 StackId 描述归属栈失败：{type(exc).__name__}: {exc}。"
+            f"**这不是「栈已删除」**——权限不足/限流/网络故障下静默当成已删除，"
+            f"会让一个真实的签名栈整条掉出观测。修好访问再跑。") from None
+    described = stacks[0] if stacks else {}
+    return {} if described.get("StackStatus") == STACK_DELETED else described
+
+
+def stack_owning(cfn, physical_id: str) -> StackRef:
+    """按**物理资源 ID** 反查它属于哪个**存活**的栈；确认没有时返回空 `StackRef`。
 
     `DescribeStackResources` 支持 `PhysicalResourceId` 反查。这比"从某个函数的
     `aws:cloudformation:stack-name` tag 猜"强两点：不依赖那个函数是 CFN 建的
@@ -2262,19 +2309,46 @@ def stack_owning(cfn, physical_id: str) -> str:
 
     **只有 `_cfn_says_unmanaged` 认的错误算"不存在"，其余一律硬失败**（R2-L3 ①）：
     权限不足或限流下静默返回空，等于让闸门在一次不完整的扫描上写出一份少一个栈的基线。
+
+    **已删除栈的历史记录不算 owner**（R3-a）：那个 90 天窗口（见 `StackRef`）会让
+    "上一轮轮转 RETAIN 下来的 previous key + 那个栈已删"凭空变出第二个 owner，于是
+    `router_and_deployer_stacks` 的多 owner 拒绝以一个**假理由**把整个闸门挡住
+    （可用性回归）。所以计入之前先按记录里的 `StackId` 核实栈存活。
+
+    **只核实到"栈存活"为止**，刻意不再声称"该资源是它的当前成员"：记录也可能属于一个
+    **仍存活但已把该资源移出模板**（RETAIN）的栈，而那在文档上无从分辨——
+    `DescribeStackResource(s)` 对已删除栈同样有 90 天窗口，同一族 API 问不出"当前成员"。
+    它的方向是**多报一条路**（"改这个栈的模板就能改 key policy"），与本模型
+    "未分析不得算成确定离开冒充面"的取向一致 ⇒ 按已接受的上界记，不猜。
     """
     if not physical_id:
-        return ""
+        return StackRef()
     try:
         found = cfn.describe_stack_resources(PhysicalResourceId=physical_id)["StackResources"]
     except Exception as exc:                      # noqa: BLE001
         if _cfn_says_unmanaged(exc):
-            return ""
+            return StackRef()
         raise SystemExit(
             f"按物理资源反查所属栈失败（{physical_id}）：{type(exc).__name__}: {exc}。"
             f"**这不是「不受管理」**——权限不足/限流/网络故障下静默当成「没有这个栈」，"
             f"会让本轮写出一份少一个栈的基线，而且没有任何症状。修好访问再跑。") from None
-    return found[0]["StackName"] if found else ""
+    buried = []
+    for stack_id in dict.fromkeys(r.get("StackId", "") for r in found):
+        rec = next(r for r in found if r.get("StackId", "") == stack_id)
+        if not stack_id:
+            raise SystemExit(
+                f"反查 {physical_id} 的结果里没有 StackId（栈名 {rec.get('StackName', '')!r}）"
+                f"⇒ 无从核实那个栈是否还存活，而已删除栈的记录会保留 90 天。"
+                f"**不猜**：真实 `StackResource` 每条都带 StackId。")
+        described = _describe_live_stack(cfn, stack_id)
+        if described:
+            return StackRef(rec.get("StackName", ""), stack_id, described)
+        buried.append(rec.get("StackName", ""))
+    for name in buried:
+        print(f"（3g note：{physical_id} 的 CFN 反查命中栈 {name}，但按 StackId 核实它"
+              f"**已删除** ⇒ 不算 owner。`DescribeStackResources` 会保留已删除栈 90 天内"
+              f"的资源记录，RETAIN 下来的旧 key 就长这样。）", file=sys.stderr)
+    return StackRef()
 
 
 def router_and_deployer_stacks(clients, *, edge_fn_arn: str, cmk_arns: tuple) -> tuple:
@@ -2295,10 +2369,13 @@ def router_and_deployer_stacks(clients, *, edge_fn_arn: str, cmk_arns: tuple) ->
     router_stack, _dist = router_stack_and_distribution(clients)
     facts = []
 
-    edge_owner = (stack_owning(cfn, edge_fn_arn)
-                  or stack_owning(cfn, _fn_name(edge_fn_arn)))
-    edge_verified = bool(edge_owner) and edge_owner == router_stack
     described = cfn.describe_stacks(StackName=router_stack)["Stacks"][0]
+    edge_ref = stack_owning(cfn, edge_fn_arn)
+    if not edge_ref.stack_id:
+        edge_ref = stack_owning(cfn, _fn_name(edge_fn_arn))
+    # **按 StackId 比，不按名字比**（R3-a 的同一类）：栈删掉再用同名重建时，反查命中的
+    # 那条历史记录名字一模一样，按名字比会让一份**过期记录**"证明"了归属。
+    edge_verified = bool(edge_ref.stack_id) and edge_ref.stack_id == described.get("StackId")
     facts.append(model.StackFact(
         resource=described["StackId"], label="router",
         guard=guard_for(_stack_policy_json(cfn, router_stack),
@@ -2310,37 +2387,44 @@ def router_and_deployer_stacks(clients, *, edge_fn_arn: str, cmk_arns: tuple) ->
         controls=frozenset({model.CONTROLS_EDGE}),
         premises_verified=False))
     if not edge_verified:
-        print(f"（3g note：反查不到 {_fn_name(edge_fn_arn)} 属于 {router_stack}"
-              f"（实得 {edge_owner!r}）⇒ router 那条 CFN 路径按**未核实**记，"
+        print(f"（3g note：反查不到 {_fn_name(edge_fn_arn)} 属于**当前的** {router_stack}"
+              f"（实得 {edge_ref.name!r}）⇒ router 那条 CFN 路径按**未核实**记，"
               f"标签只出 *-unanalyzed）", file=sys.stderr)
 
     # **逐把 key 各查一次**（R2-L3 ②）：上一版把所有 key 拼成一串、遇首个命中就返回，
     # 于是第二把/`previous` 那把永远没被核验——轮转期两把 key 分属不同栈时，第二个受控的
     # 签名栈整条掉出观测（那不是"前提未核实"的已接受盲区，是真的没看）。
-    owners: dict = {}
+    # **owner 按 StackId 归并**（R3-a）：栈名不是身份——已删除的同名栈与活栈同名，而
+    # `stack_owning` 现在只返回**核实过存活**的栈，所以下面那条多 owner 的拒绝才是真的。
+    owners: dict = {}                       # StackId → (StackRef, [key arn, ...])
     for arn in cmk_arns:
         for pid in (arn, arn.rsplit("/", 1)[-1]):
-            found = stack_owning(cfn, pid)
-            if found:
-                owners.setdefault(found, []).append(arn)
+            ref = stack_owning(cfn, pid)
+            if ref.stack_id:
+                owners.setdefault(ref.stack_id, (ref, []))[1].append(arn)
                 break
     if len(owners) > 1:
         raise SystemExit(
-            f"两把以上会话签名 CMK 分属**不同** CloudFormation 栈（{sorted(owners)}）。"
+            f"两把以上会话签名 CMK 分属**不同**且**都存活**的 CloudFormation 栈"
+            f"（{sorted(r.name for r, _ in owners.values())}）。"
             f"本模型的 grant 词表按单个 `deployer` 标签记，多 owner 会让那条 grant 指代不明"
-            f"⇒ 不猜、不取第一个。要支持这种拓扑得先扩词表（每个签名栈一个标签）。")
-    dep_stack = next(iter(owners), "")
-    if dep_stack:
-        d2 = cfn.describe_stacks(StackName=dep_stack)["Stacks"][0]
+            f"⇒ 不猜、不取第一个。要支持这种拓扑得先扩词表（每个签名栈一个标签）。"
+            f"（常规轮转要求新 key 落**同一个** deployer 栈，见 DEPLOY.md 的轮转 runbook；"
+            f"已删除栈的 90 天历史记录已在反查里剔除，所以这里是真的多 owner。）")
+    dep = next(iter(owners.values()), None)
+    if dep is not None:
+        ref = dep[0]
+        # 一律拿 **StackId** 去问后续 API（`GetStackPolicy` / `ListStackResources` 的
+        # `StackName` 都接受 name-or-id）：名字在"删掉再同名重建"下会指向另一个栈。
         facts.append(model.StackFact(
-            resource=d2["StackId"], label="deployer",
-            guard=guard_for(_stack_policy_json(cfn, dep_stack),
-                            stack_logical_ids(cfn, dep_stack, ("AWS::KMS::Key",))),
-            service_role=d2.get("RoleARN"),
+            resource=ref.stack_id, label="deployer",
+            guard=guard_for(_stack_policy_json(cfn, ref.stack_id),
+                            stack_logical_ids(cfn, ref.stack_id, ("AWS::KMS::Key",))),
+            service_role=ref.described.get("RoleARN"),
             controls=frozenset({model.CONTROLS_SESSION_KEY}),
             premises_verified=False))
     else:
-        print("（3g note：两把会话签名 CMK 反查不到任何 CloudFormation 栈 ⇒ "
+        print("（3g note：两把会话签名 CMK 反查不到任何**存活的** CloudFormation 栈 ⇒ "
               "「改栈模板改 key policy」这条路不存在，本轮不记 deployer 栈）",
               file=sys.stderr)
     return tuple(facts)
@@ -2668,7 +2752,12 @@ def measure(region: str, *, workers: int = 4) -> dict:
         version_arns={fn_arn(n): tuple(f"{fn_arn(n)}:{v}" for v in vs)
                       for n, vs in versions.items()},
         distribution=distribution, edge_role=edge_role_arn,
-        new_fn_candidates=new_candidates, stacks=stacks, service_roles=service_roles,
+        new_fn_candidates=new_candidates, stacks=stacks,
+        # **关键字必须是 `service_roles_by_label`**（R3-c blocker）：`service_roles` 自
+        # db493d4 起只是个只读 property，传它 ⇒ `TypeError`。它只在**真机首跑/纯 dump**
+        # 这条路上执行（`--from-dump` 不经过 measure），所以 381 条纯函数用例全绿也照样必崩；
+        # 守卫是 `test_production_dataclass_calls_bind_to_the_real_signature`（AST × 真签名）。
+        service_roles_by_label=service_roles,
     )
 
     # ---- resource policy 快照（SimulatePrincipalPolicy 不覆盖这条通道）----

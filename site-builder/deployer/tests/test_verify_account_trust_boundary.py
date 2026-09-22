@@ -28,8 +28,11 @@
 """
 import ast
 import copy
+import dataclasses
 import fnmatch
 import importlib.util
+import inspect
+import io
 import json
 import os
 import re
@@ -4975,33 +4978,79 @@ def test_model_inputs_absent_from_baseline_is_a_note_not_a_green_lie():
     assert rep.ok and any("model_inputs" in n for n in rep.notes)
 
 
+def _stack_id(name: str, *, gen="uuid") -> str:
+    """真实形态的 `StackId`。**同名不同 id** = "删掉再用同名重建"。"""
+    return f"arn:aws:cloudformation:r:1:stack/{name}/{gen}-{name.lower()}"
+
+
 def _fake_cfn(*, cmk_stack="DeployerStack", edge_stack="RouterStack",
-              router_policy=None):
-    """假 CloudFormation：支持按 PhysicalResourceId 反查归属。"""
+              router_policy=None, owners=(), deleted=(), stack_ids=None):
+    """假 CloudFormation：按 `PhysicalResourceId` 反查归属，且**分得清活栈与已删除栈**。
+
+    两条真实契约（CloudFormation API Reference，查阅 2026-09-22）是 R3-a 能被复现的前提，
+    这个 fake 照它们实现：
+
+    · `DescribeStackResources` "Returns AWS resource descriptions for running **and
+      deleted** stacks"，已删除栈保留 **90 天** ⇒ `deleted` 里的栈照样能被反查命中；
+    · `DescribeStacks` 对已删除栈 "You must specify the unique stack ID"、状态回
+      `DELETE_COMPLETE`，按**名字**查则 `ValidationError` ⇒ 这里按 name/id 分叉。
+
+    每条 `StackResource` 都带 `StackId`（真实 API 如此）。`owners` 是
+    `(物理 ID 子串, 栈名)` 的优先规则，用来造"两把 key 分属两个栈"的拓扑。
+    """
+    ids = dict(stack_ids or {})
+    known = {n for n in (cmk_stack, edge_stack, *dict(owners).values(), *deleted) if n}
+
+    def sid(name):
+        return ids.get(name, _stack_id(name))
+
+    def rec(name):
+        return {"StackResources": [{"StackName": name, "StackId": sid(name)}]}
+
     class FakeCfn:
-        calls = []
+        def __init__(self):
+            self.calls = []
+
+        def _resolve(self, stack_name):
+            """name-or-id → (栈名, 传进来的是不是 id)。"""
+            for n in known:
+                if stack_name == sid(n):
+                    return n, True
+            return stack_name, False
 
         def describe_stack_resources(self, PhysicalResourceId=None, **kw):
+            pid = str(PhysicalResourceId)
             self.calls.append(("reverse", PhysicalResourceId))
-            if "key/" in str(PhysicalResourceId) or str(PhysicalResourceId).startswith("kid-"):
+            for needle, name in owners:
+                if needle in pid:
+                    return rec(name)
+            if "key/" in pid or pid.startswith("kid-"):
                 if not cmk_stack:
                     raise RuntimeError("ValidationError: does not exist")
-                return {"StackResources": [{"StackName": cmk_stack}]}
-            if "origin-request" in str(PhysicalResourceId) or "application-web-router" in str(PhysicalResourceId):
+                return rec(cmk_stack)
+            if "origin-request" in pid or "application-web-router" in pid:
                 if not edge_stack:
                     raise RuntimeError("ValidationError: does not exist")
-                return {"StackResources": [{"StackName": edge_stack}]}
+                return rec(edge_stack)
             raise RuntimeError("ValidationError: does not exist")
 
         def describe_stacks(self, StackName):
-            out = {"StackId": f"arn:stack/{StackName}",
-                   "RoleARN": f"arn:aws:iam::1:role/{StackName}-exec"}
-            if StackName == "RouterStack":
+            self.calls.append(("describe", StackName))
+            name, by_id = self._resolve(StackName)
+            if name in deleted and not by_id:
+                raise RuntimeError("An error occurred (ValidationError) when calling the "
+                                   f"DescribeStacks operation: Stack with id {name} "
+                                   f"does not exist")
+            out = {"StackName": name, "StackId": sid(name),
+                   "StackStatus": "DELETE_COMPLETE" if name in deleted else "UPDATE_COMPLETE",
+                   "RoleARN": f"arn:aws:iam::1:role/{name}-exec"}
+            if name == "RouterStack":
                 out["Outputs"] = [{"OutputKey": "DistributionId", "OutputValue": "D1"}]
             return {"Stacks": [out]}
 
         def get_stack_policy(self, StackName):
-            if StackName == "RouterStack" and router_policy is not None:
+            name, _ = self._resolve(StackName)
+            if name == "RouterStack" and router_policy is not None:
                 return {"StackPolicyBody": json.dumps(router_policy)}
             return {}
 
@@ -5054,7 +5103,7 @@ def test_stacks_are_discovered_by_reverse_lookup_not_by_the_auth_tag():
         cmk_arns=("arn:aws:kms:r:1:key/kid-site", "arn:aws:kms:r:1:key/kid-console")))
     by = {f.label: f for f in facts}
     assert set(by) == {"router", "deployer"}, sorted(by)
-    assert by["deployer"].resource == "arn:stack/DeployerStack"
+    assert by["deployer"].resource == _stack_id("DeployerStack")
     assert by["deployer"].controls == frozenset({g.model.CONTROLS_SESSION_KEY})
     assert by["router"].guard == g.model.GUARD_PROTECTED
     assert all(f.premises_verified is False for f in facts)
@@ -5177,10 +5226,10 @@ def test_reverse_lookup_treats_only_validation_error_as_unmanaged():
         def describe_stack_resources(self, PhysicalResourceId=None):
             raise PermissionError("AccessDenied")
 
-    assert g.stack_owning(Unmanaged(), "arn:aws:kms:r:1:key/k1") == ""
+    assert g.stack_owning(Unmanaged(), "arn:aws:kms:r:1:key/k1").stack_id == ""
     with pytest.raises(SystemExit, match="不受管理"):
         g.stack_owning(Denied(), "arn:aws:kms:r:1:key/k1")
-    assert g.stack_owning(Unmanaged(), "") == ""      # 空 id 不发调用
+    assert g.stack_owning(Unmanaged(), "").stack_id == ""      # 空 id 不发调用
 
 
 def test_every_cmk_is_looked_up_not_just_the_first():
@@ -5198,13 +5247,18 @@ def test_every_cmk_is_looked_up_not_just_the_first():
         def describe_stack_resources(self, PhysicalResourceId=None):
             seen.append(PhysicalResourceId)
             if "k1" in str(PhysicalResourceId):
-                return {"StackResources": [{"StackName": "KeyStack1"}]}
+                return {"StackResources": [{"StackName": "KeyStack1",
+                                            "StackId": _stack_id("KeyStack1")}]}
             if "k2" in str(PhysicalResourceId):
-                return {"StackResources": [{"StackName": "KeyStack2"}]}
+                return {"StackResources": [{"StackName": "KeyStack2",
+                                            "StackId": _stack_id("KeyStack2")}]}
             raise RuntimeError("ValidationError: Stack for x does not exist")
 
         def describe_stacks(self, StackName):
-            return {"Stacks": [{"StackId": f"arn:stack/{StackName}",
+            # 两个 key 栈都**存活** ⇒ 这是真的多 owner，该拒（R3-a 只剔除已删除的那种）
+            return {"Stacks": [{"StackId": StackName if StackName.startswith("arn:")
+                                else _stack_id(StackName),
+                                "StackStatus": "UPDATE_COMPLETE",
                                 "Outputs": [{"OutputKey": "DistributionId",
                                              "OutputValue": "D1"}]}]}
 
@@ -5222,6 +5276,203 @@ def test_every_cmk_is_looked_up_not_just_the_first():
             {"cloudformation": Two()}, edge_fn_arn="arn:aws:lambda:r:1:function:edge",
             cmk_arns=("arn:aws:kms:r:1:key/k1", "arn:aws:kms:r:1:key/k2")))
     assert any("k2" in str(x) for x in seen), "第二把 key 根本没被查"
+
+
+def test_a_deleted_stacks_90_day_record_is_not_counted_as_an_owner():
+    """**R3-a（major）**：`DescribeStackResources` 明文返回**已删除栈 90 天内**的资源记录
+    （CloudFormation API Reference，查阅 2026-09-22）。b4a01f3 的 `stack_owning` 只留栈名、
+    在查栈状态**之前**就按 owner 数拒绝 ⇒ "current key 在活栈、previous key 是上一个
+    已删除栈里 RETAIN 下来的"这种**正常轮转历史**会让整个闸门以一个**假理由**跑不了
+    （可用性回归：拒绝词说"分属不同栈"，而那个栈其实已经不存在了）。
+
+    正向对照就在上一条 `test_every_cmk_is_looked_up_not_just_the_first`：两个栈**都存活**
+    时仍然拒绝。这条只证明"已删除的那种不算 owner"。
+    """
+    g = _gate()
+    cfn = _fake_cfn(owners=[("kid-prev", "OldKeyStack")], deleted=("OldKeyStack",),
+                    router_policy=DENY_ALL)
+    facts = _with_router_cfg(lambda: g.router_and_deployer_stacks(
+        {"cloudformation": cfn},
+        edge_fn_arn="arn:aws:lambda:r:1:function:ApplicationWebRouterStack-origin-request",
+        cmk_arns=("arn:aws:kms:r:1:key/kid-site", "arn:aws:kms:r:1:key/kid-prev")))
+    by = {f.label: f for f in facts}
+    assert set(by) == {"router", "deployer"}, sorted(by)
+    # 活栈胜出，且 `resource` 是 StackId（不是栈名）
+    assert by["deployer"].resource == _stack_id("DeployerStack")
+    # 核实**真的按 StackId 查过**那个已删除栈（否则这条用例会随实现退化而静静变绿）
+    assert ("describe", _stack_id("OldKeyStack")) in cfn.calls, cfn.calls
+
+
+def test_all_owners_being_deleted_stacks_means_no_deployer_stack():
+    """全部 owner 都是历史记录 ⇒ 与"根本没有 CFN 归属"同一个结论：不编造 deployer 栈、
+    也不硬失败。这条守住上一条的另一侧——别把"剔除历史 owner"实现成"取第一个"。"""
+    g = _gate()
+    facts = _with_router_cfg(lambda: g.router_and_deployer_stacks(
+        {"cloudformation": _fake_cfn(cmk_stack="OldKeyStack", deleted=("OldKeyStack",),
+                                     router_policy=DENY_ALL)},
+        edge_fn_arn="arn:aws:lambda:r:1:function:ApplicationWebRouterStack-origin-request",
+        cmk_arns=("arn:aws:kms:r:1:key/kid-site",)))
+    assert {f.label for f in facts} == {"router"}
+
+
+def _recreated_router_cfn(*, stale: bool):
+    """router 栈**删掉再用同名重建**：同名两个 StackId。
+
+    `_fake_cfn` 按栈名索引，表达不了"同名两个栈"，所以这条用专门的 fake。
+    `stale=True` 时反查命中的是**旧（已删除）**那个 id，`stale=False` 时是新的。
+    """
+    new, old = _stack_id("RouterStack", gen="new"), _stack_id("RouterStack", gen="old")
+
+    class Cfn:
+        def describe_stack_resources(self, PhysicalResourceId=None, **kw):
+            return {"StackResources": [{"StackName": "RouterStack",
+                                        "StackId": old if stale else new}]}
+
+        def describe_stacks(self, StackName):
+            if StackName == old:            # 已删除：按 id 查得到、状态 DELETE_COMPLETE
+                return {"Stacks": [{"StackName": "RouterStack", "StackId": old,
+                                    "StackStatus": "DELETE_COMPLETE"}]}
+            return {"Stacks": [{"StackName": "RouterStack", "StackId": new,
+                                "StackStatus": "UPDATE_COMPLETE",
+                                "Outputs": [{"OutputKey": "DistributionId",
+                                             "OutputValue": "D1"}]}]}
+
+        def get_stack_policy(self, StackName):
+            return {}
+
+        def get_paginator(self, name):
+            class P:
+                def paginate(self, StackName):
+                    return iter([{"StackResourceSummaries": []}])
+            return P()
+    return Cfn()
+
+
+@pytest.mark.parametrize("stale,want_note", [(True, True), (False, False)])
+def test_edge_membership_is_matched_by_stack_id_not_by_stack_name(capsys, stale, want_note):
+    """同一条历史记录问题的另一面：router 栈**删掉再用同名重建**后，反查命中的那条记录
+    栈名一模一样，按名字比会让一份**过期记录**"证明"了 Edge 归属。按 `StackId` 比才分得开。
+
+    **它影响的只是那行 note**（`premises_verified` 按 spec §9 一律是 False），所以断言就
+    盯 stderr：过期记录 ⇒ 必须报"反查不到属于当前的栈"；id 一致 ⇒ 必须**不报**。
+    带正对照是因为"永远报 note"和"永远不报"都能让单向断言通过。
+    """
+    g = _gate()
+    facts = _with_router_cfg(lambda: g.router_and_deployer_stacks(
+        {"cloudformation": _recreated_router_cfn(stale=stale)},
+        edge_fn_arn="arn:aws:lambda:r:1:function:ApplicationWebRouterStack-origin-request",
+        cmk_arns=()))
+    router = next(f for f in facts if f.label == "router")
+    assert g.model.CONTROLS_EDGE in router.controls      # control 不摘（false-green 防线）
+    err = capsys.readouterr().err
+    # 盯 router 那条 note 独有的措辞——"反查不到"也出现在"没有 deployer 栈"那条里
+    assert ("router 那条 CFN 路径按**未核实**记" in err) is want_note, err
+
+
+# --------------------------------------------------------------------------
+# **生产装配层**：AST 里的 dataclass 构造 × 真实签名。
+#
+# R3-c（blocker）：`measure()` 里那句 `Targets(..., service_roles=service_roles)` 在
+# db493d4 把字段改名成 `service_roles_by_label`（`service_roles` 退成只读 property）之后
+# **必抛 TypeError**。它只在**真机首跑 / 纯 dump** 这条路上执行（`--from-dump` 不经过
+# `measure`），所以几百条纯函数用例全绿、闸门却会在 11 分钟扫描的末尾崩掉。
+#
+# 这一层按**类**守而不是钉这一处：两个脚本里所有 dataclass 构造都拿
+# `inspect.signature().bind()` 过一遍。**不是 grep 关键词**（CLAUDE.md 点过那个病：
+# 这一轮已经有三条守卫被 docstring / 注释里的同名字符串骗过）。
+# --------------------------------------------------------------------------
+
+def _ctor_binding_problems(src: str, namespaces: dict) -> list[str]:
+    """源码里每个 `X(...)` / `ns.X(...)`：X 是 dataclass 就把实参绑到**真实签名**上。"""
+    problems = []
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        if isinstance(f, ast.Name):
+            holder, attr = "", f.id
+        elif isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name):
+            holder, attr = f.value.id, f.attr
+        else:
+            continue
+        if holder not in namespaces:
+            continue
+        obj = getattr(namespaces[holder], attr, None)
+        if not (isinstance(obj, type) and dataclasses.is_dataclass(obj)):
+            continue
+        # `*args` / `**kwargs` 的调用静态绑不了 ⇒ 跳过（不假装检查过）
+        if any(isinstance(a, ast.Starred) for a in node.args) or \
+                any(k.arg is None for k in node.keywords):
+            continue
+        try:
+            inspect.signature(obj).bind(*[None] * len(node.args),
+                                        **{k.arg: None for k in node.keywords})
+        except TypeError as exc:
+            problems.append(f"{attr} @L{node.lineno}: {exc}")
+    return problems
+
+
+def _ctor_namespaces():
+    """两个脚本各自的名字空间 → 待扫源码。"""
+    from test_probe_impersonation_surface import _probe
+    g, probe = _gate(), _probe()
+    return [(_SCRIPT, {"": g, "model": g.model}),
+            (_ROOT / "site-builder" / "scripts" / "probe_impersonation_surface.py",
+             {"": probe, "model": probe.model})]
+
+
+def test_production_dataclass_calls_bind_to_the_real_signature():
+    """**R3-c（blocker）**：生产代码里的 dataclass 构造必须能绑到真实签名。
+
+    只有真机路径会执行 `measure()` 的那句装配 ⇒ 这一层是"跨层改名后调用方没跟上"的
+    唯一自动化防线（`service_roles` → `service_roles_by_label` 就是这么漏过去的）。
+    """
+    for path, ns in _ctor_namespaces():
+        problems = _ctor_binding_problems(path.read_text(encoding="utf-8"), ns)
+        assert not problems, f"{path.name}: {problems}"
+
+
+def test_the_ctor_binding_scan_really_fails_on_the_original_defect():
+    """**元用例**：把那个关键字改回 `service_roles=`，上面那条必须转红。
+
+    没有这条，"扫描器其实什么都没绑"与"真的全绿"在输出上没有区别。
+    """
+    g = _gate()
+    src = _SCRIPT.read_text(encoding="utf-8")
+    mutated = src.replace("service_roles_by_label=service_roles",
+                          "service_roles=service_roles")
+    assert mutated != src, "生产代码里已经没有那句装配了——这条元用例要跟着改"
+    problems = _ctor_binding_problems(mutated, {"": g, "model": g.model})
+    assert any("Targets" in p and "service_roles" in p for p in problems), problems
+
+
+def test_the_service_role_map_survives_same_named_stacks_end_to_end():
+    """R3-c 的语义那一半：按标签分开的 service role 映射要**整条**进 `Targets`。
+
+    两个栈的执行角色**同名**（不同账号路径下真会这样）时，压成一个 tuple 会让"又多一个
+    栈的执行角色可 PassRole"完全不产生漂移（R1-L3 的原始缺陷）。所以这里拿**生产的**
+    `Targets` + 生产的 `misc_resources()` 断言两条都在。
+    """
+    g = _gate()
+    roles = {"router": "arn:aws:iam::1:role/Same-exec",
+             "deployer": "arn:aws:iam::1:role/Same-exec"}
+    t = g.Targets(platform_functions=(), site_functions=(), service_roles_by_label=roles)
+    assert list(t.service_roles_by_label) == ["router", "deployer"]
+    assert t.service_roles == tuple(roles.values())
+    assert set(roles.values()) <= set(t.misc_resources())
+
+
+def test_a_reverse_lookup_record_without_a_stack_id_is_a_hard_failure():
+    """反查记录缺 `StackId` ⇒ 无从核实栈是否存活。**硬失败**，不静默当成"没有 owner"
+    （静默 = 少算一个签名栈，与 R2-L3 ① 同一个病）。真实 API 每条记录都带 StackId。"""
+    g = _gate()
+
+    class NoId:
+        def describe_stack_resources(self, PhysicalResourceId=None):
+            return {"StackResources": [{"StackName": "SomeStack"}]}
+
+    with pytest.raises(SystemExit, match="StackId"):
+        g.stack_owning(NoId(), "arn:aws:kms:r:1:key/k1")
 
 
 def test_a_second_service_role_is_drift_not_silence():
@@ -5677,15 +5928,59 @@ def test_classify_by_name_is_refused_when_the_name_maps_to_several_arns():
     assert g.merge_categories(carried={}, by_name={}, observed=obs) == {}
 
 
+def _marginal_report(by_principal: dict) -> tuple[str, dict]:
+    """把一组 principal→标签喂给**生产的**聚合 + 报告，拿回真实 stdout。"""
+    from test_probe_impersonation_surface import _probe
+    probe = _probe()
+    agg = probe.summarize(by_principal)
+    agg.pop("_sets")
+    buf = io.StringIO()
+    probe.print_marginal_report(agg, out=buf)
+    return buf.getvalue(), agg
+
+
 def test_the_probe_report_shows_the_uncertain_count_and_labels_the_bounds():
     """**R2-L5**：`principals_uncertain` 必须出现在**默认终端报告**里。
 
     只打 surface_after / principals_removed 时，"已建模路径都关了但仍持未分析路径"这第三种
     结论在报告里消失——JSON 里有，看终端的人分不清"已知残留"与"待核实"（实测两种输入的
     那一行逐字相同）。
+
+    **这条原先是 grep 源码关键词**，因此看不见 R3-b（见下一条）。现在断言**真实 stdout**。
     """
-    src = (_ROOT / "site-builder" / "scripts"
-           / "probe_impersonation_surface.py").read_text(encoding="utf-8")
-    seg = src[src.index("边际收益"):src.index("提醒")]
-    assert "principals_uncertain" in seg, "报告里没有 uncertain"
-    assert "下界" in seg and "上界" in seg, "没有标明 removed/after 是下界/上界"
+    g = _gate()
+    m = g.model
+    text, agg = _marginal_report({"p-uncertain": {m.S_KMS_DIRECT,
+                                                 m.E_CFN_TEMPLATE_UNANALYZED}})
+    assert agg["marginal_value_if_closed"]["restrictive-kms-key-policy"][
+        "principals_uncertain"] == 1
+    assert "下界" in text and "上界" in text, text
+    assert "待核实 1" in text, text          # 不定论那一类真的落到终端上
+    assert "确定离场 ≥0" in text, text       # 而且没被算成"确定离场"
+
+
+def test_the_probe_report_bounds_the_after_count_to_the_initial_modeled_union():
+    """**R3-b（minor）**：`after` 的上界只覆盖**初始已建模并集内**的成员。
+
+    复现（reviewer 给的双人输入）：`p1={sign:kms-direct}`、`p2={edge:cfn-template-unanalyzed}`
+    ⇒ 关掉 KMS 那组时报告打出「面 1 → ≤0（确定离场 ≥1，待核实 0）」。可 p2 **本轮观测到了**、
+    只持未分析路径 ⇒ 它从来没进 `surface`，所以既不进 `remaining` 也不进 `uncertain`。
+    上一版文案却把范围写成"本轮观测到的群体"——那句话是假的。
+
+    断言的是**算出来的数字**（并集外那几个人），不是某句固定文案：正对照（第二组输入）
+    里那个数必须变成 0，否则"把数字写死在句子里"也能过。
+    """
+    g = _gate()
+    m = g.model
+    text, agg = _marginal_report({"p1": {m.S_KMS_DIRECT},
+                                  "p2": {m.E_CFN_TEMPLATE_UNANALYZED}})
+    assert agg["impersonation_surface_union"] == 1 and agg["unanalyzed_outside_union"] == 1
+    assert "面   1 → ≤0" in text, text                 # 反例本身仍然存在
+    assert "仅限初始已建模并集内的成员" in text, text     # 范围收到并集内
+    assert "并集外只持未分析路径的 1 人" in text, text    # 并把差额说出来
+    assert "本轮观测到的群体" not in text, text          # 旧的过宽声明不许回来
+    # 正对照：并集外没有未分析持有者时那个数必须是 0（证明它是算的，不是写死的）
+    text0, agg0 = _marginal_report({"p1": {m.S_KMS_DIRECT},
+                                    "p2": {m.S_FIXTURE_ISSUER}})
+    assert agg0["unanalyzed_outside_union"] == 0
+    assert "并集外只持未分析路径的 0 人" in text0, text0

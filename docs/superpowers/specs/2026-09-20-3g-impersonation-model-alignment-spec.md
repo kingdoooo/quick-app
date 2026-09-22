@@ -132,7 +132,8 @@ class StackFact:
 
 `entry` **不得**默认成 `latest`：查不到 alias、查不到 CloudFront association 都是 `unknown`。
 `controls` 由 `DescribeStackResources` 观测（Edge 两函数 / 分发 / 两把 CMK 的物理 ID 是否属于该栈），
-不由栈名或代码推断。
+不由栈名或代码推断。**归属要带 `StackId` 并核实栈存活**（R3-a）：那个 API 返回已删除栈 90 天内的
+记录，只留栈名分不清"活栈"与"同名历史记录"，也分不清"删掉再同名重建"——见 §9 第 3 条。
 
 ### 4.2 标签词表
 
@@ -348,7 +349,11 @@ grant 重命名不触及它们（它们锁 `invoke-*` 与 `kms-sign:` 前缀）�
    service role 权限足够高时，改模板新增 IAM 授权类资源等路径未必需要碰受保护资源。
    ⇒ 不得据 guard 宣称某 principal 退出冒充面，也不得算确定收益（ADR 0007 已有同样要求）。
 2. **`CreateFunction` 的名字空间**：只对两个候选 ARN 有判定，按名字前缀授权的策略可能在别的名字上成立。
-3. 既有三个盲区（`SimulatePrincipalPolicy` 的 Condition 下界、动作等价类不穷尽、临时角色）不变。
+3. **资源归属只核实到"栈存活"为止**（R3-a 定的边界）：`DescribeStackResources` 返回已删除栈
+   90 天内的记录 ⇒ 计入 owner 前按 `StackId` 查 `DescribeStacks`、`DELETE_COMPLETE` 不算。
+   **仍存活但已把该资源移出模板（RETAIN）**的栈分辨不了（同族 API 都带那个 90 天窗口，
+   问不出"当前成员"）⇒ 按多报一条路记，不猜。
+4. 既有三个盲区（`SimulatePrincipalPolicy` 的 Condition 下界、动作等价类不穷尽、临时角色）不变。
 
 ## 10. 需要同步的真源
 
