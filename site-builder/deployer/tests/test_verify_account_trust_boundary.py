@@ -5432,6 +5432,33 @@ def test_production_dataclass_calls_bind_to_the_real_signature():
         assert not problems, f"{path.name}: {problems}"
 
 
+def test_no_dataclass_is_constructed_through_star_args():
+    """上一条**唯一**的已知盲区：带 `*args` / `**kwargs` 的调用静态绑不了，只能跳过。
+
+    所以这里把"那个盲区里没有活的调用点"钉住：两个脚本里凡是星号传参的调用，都不许解析成
+    dataclass。实测当下命中的四处全是 boto3 client 方法 + `dataclasses.replace`。
+    将来真要写 `Targets(**kw)` 时这条会红 ⇒ 逼着写的人先说明怎么保证绑得上。
+    """
+    for path, ns in _ctor_namespaces():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not (any(isinstance(a, ast.Starred) for a in node.args)
+                    or any(k.arg is None for k in node.keywords)):
+                continue
+            f = node.func
+            if isinstance(f, ast.Name):
+                holder, attr = "", f.id
+            elif isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name):
+                holder, attr = f.value.id, f.attr
+            else:
+                continue
+            obj = getattr(ns[holder], attr, None) if holder in ns else None
+            assert not (isinstance(obj, type) and dataclasses.is_dataclass(obj)), \
+                f"{path.name}:{node.lineno} 用星号传参构造 dataclass {attr} ⇒ 签名扫描看不见它"
+
+
 def test_the_ctor_binding_scan_really_fails_on_the_original_defect():
     """**元用例**：把那个关键字改回 `service_roles=`，上面那条必须转红。
 
