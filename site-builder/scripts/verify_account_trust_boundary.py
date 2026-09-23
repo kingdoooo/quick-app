@@ -300,8 +300,13 @@ def is_secret_grant(grant: str) -> bool:
 # 人工标注的类别白名单。`--classify` 与 `--carry-categories` 都按它校验。
 # **`platform` 那一档是集合等值约束的开关**：标注丢了，平台角色的授权丢失会被当成"改善"。
 CATEGORIES: tuple[str, ...] = ("platform", "platform-overbroad", "admin", "break-glass",
-                               "cdk-admin", "cdk-readonly", "unrelated-workload",
-                               "unclassified")
+                               "cdk-admin", "cdk-deploy", "cdk-readonly",
+                               "unrelated-workload", "unclassified")
+# `cdk-deploy` 是 3g 之后才需要的一档（2026-09-23 真机首次标注）：CDK bootstrap 的
+# **部署**角色与 `cdk-admin`（CloudFormation **执行**角色）不是一回事，能力面也不同——
+# 执行角色按约定是 AdministratorAccess ⇒ 能直接 `kms:Sign`；部署角色是经
+# `UpdateStack` / change-set 改栈模板那条路 ⇒ 落 `*-cfn-template-unanalyzed`
+# （单列、不进并集）。压成同一档会让"多了一个能改栈的身份"不产生漂移。
 
 LABEL_LOGIN_FLOW = "login-flow"
 NON_KID_LABELS = (LABEL_LOGIN_FLOW,)

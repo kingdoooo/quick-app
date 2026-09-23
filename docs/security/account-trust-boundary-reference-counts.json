@@ -19,18 +19,19 @@
     "两处一起进同一个提交（review 时看得见）。跳过这一步的后果是文档与本文件一致但都是假的。"
   ],
   "counts": {
-    "A总数": 37,
-    "可签会话": 15,
-    "非平台可直调": 18,
-    "kms_key数": 2,
+    "A总数": 45,
     "B持有IAM写语句": 22,
-    "仅IAM写": 6,
-    "类别_platform": 6,
-    "类别_platform_overbroad": 0,
+    "kms_key数": 2,
+    "仅IAM写": 4,
+    "可签会话": 15,
     "类别_admin": 3,
-    "类别_break_glass": 1,
+    "类别_break_glass": 3,
     "类别_cdk_admin": 3,
+    "类别_cdk_deploy": 3,
     "类别_cdk_readonly": 3,
-    "类别_unrelated": 21
+    "类别_platform": 7,
+    "类别_platform_overbroad": 0,
+    "类别_unrelated": 23,
+    "非平台可直调": 18
   }
 }

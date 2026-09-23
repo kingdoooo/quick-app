@@ -796,7 +796,8 @@ _REF_COUNTS = _ROOT / "docs" / "security" / "account-trust-boundary-reference-co
 # 类别名 → 标记里的 slug（标记名不能带连字符以外的怪字符，统一成下划线）
 _CATEGORY_SLUGS = {"platform": "platform", "platform-overbroad": "platform_overbroad",
                    "admin": "admin", "break-glass": "break_glass",
-                   "cdk-admin": "cdk_admin", "cdk-readonly": "cdk_readonly",
+                   "cdk-admin": "cdk_admin", "cdk-deploy": "cdk_deploy",
+                   "cdk-readonly": "cdk_readonly",
                    "unrelated-workload": "unrelated"}
 
 # 守卫认得的全部标签。**快照的键集合必须与它逐字相等**——否则新加一个类别时，
@@ -804,6 +805,27 @@ _CATEGORY_SLUGS = {"platform": "platform", "platform-overbroad": "platform_overb
 _COUNT_LABELS = ("A总数", "可签会话", "非平台可直调", "kms_key数",
                  "B持有IAM写语句", "仅IAM写",
                  *(f"类别_{slug}" for slug in _CATEGORY_SLUGS.values()))
+
+
+def test_every_category_has_a_count_slug():
+    """`_CATEGORY_SLUGS` 必须覆盖 `CATEGORIES` 的每一档（`unclassified` 除外）。
+
+    上面那段注释早就写明了后果，但**没有任何东西绑住这两份清单**：新加一个类别却忘了
+    加 slug 时，那一档既不进快照也不进文档，而"快照 ⇄ 文档"那条主守卫照样全绿
+    ⇒ `类别_*` 的和会小于 `A总数`，文档里"合计 = A 组总数"那句话静静地变成假的。
+    实测踩到过：2026-09-23 加 `cdk-deploy` 时那 3 个 principal 不出现在任何 `类别_` 里。
+
+    `unclassified` 刻意排除——`test_reference_snapshot_has_no_unclassified_bucket`
+    要求快照里不许有那一档。
+    """
+    g = _gate()
+    want = set(g.CATEGORIES) - {"unclassified"}
+    assert set(_CATEGORY_SLUGS) == want, (
+        f"CATEGORIES 与 _CATEGORY_SLUGS 不同步：只在 CATEGORIES 里="
+        f"{sorted(want - set(_CATEGORY_SLUGS))}，只在 slug 表里="
+        f"{sorted(set(_CATEGORY_SLUGS) - want)}")
+    # slug 不许重复（两档映射到同一个标记 = 两档的人数被合并，漂移看不见）
+    assert len(set(_CATEGORY_SLUGS.values())) == len(_CATEGORY_SLUGS), _CATEGORY_SLUGS
 
 
 def _reference_counts() -> dict:

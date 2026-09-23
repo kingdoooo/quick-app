@@ -91,12 +91,12 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 
 | 组 | 项 | 数 |
 |---|---|---|
-| **A 直接失守** | 具备非 IAM-write 敏感授权的 principal | 37 <!-- baseline:A总数=37 --> |
+| **A 直接失守** | 具备非 IAM-write 敏感授权的 principal | 45 <!-- baseline:A总数=45 --> |
 | | 其中**能签会话**的（`kms:Sign` ∪ 能给自己授权；= 闸门的 `is_secret_grant`。**这不是冒充面总数**，见状态段 ②③；单账号实测——采用者以自己账号的基线为准） | 15 <!-- baseline:可签会话=15 --> |
 | | 其中**非平台**身份可直接 `lambda:InvokeFunction` 平台或站点函数的 | 18 <!-- baseline:非平台可直调=18 --> |
 | | 会话签名 CMK 数（site / console 各一把） | 2 <!-- baseline:kms_key数=2 --> |
 | **B IAM 写观察** | 持有相关 IAM 策略变更语句的 principal | 22 <!-- baseline:B持有IAM写语句=22 --> |
-| | 其中**不在 A 里**（只有 IAM 写、**未证明可提权**） | 6 <!-- baseline:仅IAM写=6 --> |
+| | 其中**不在 A 里**（只有 IAM 写、**未证明可提权**） | 4 <!-- baseline:仅IAM写=4 --> |
 
 > **以下这段是 HS 形态的口径（历史记录，3c-final 之后不再成立）**：那两个产物计数所依据的
 > `facts` 键随 HS 密钥材料一起删除，表里对应的两行也已删。留在这里是为了让读到旧闸门输出的人
@@ -122,13 +122,13 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 > **那一轮也是 `--update-baseline` 第一次先打印比较报告再写**（3c-1B-G A6：原先它在比较之前
 > 就 return，"接受了什么"完全不留痕，而 spec §11.8.7 反对的正是这种人工放行）。
 
-> **A + B 的并集是 43，但那个数不是 headline。** A 是"现在就能拿到密钥或直接调用平台
+> **A + B 的并集是 49，但那个数不是 headline。** A 是"现在就能拿到密钥或直接调用平台
 > 函数"；B 只是"持有一条可能影响 IAM 策略的语句"，本闸门**明确不证明**它构成提权链
 > （判那个需要一个 IAM 权限分析器——那正是这道闸门被前五轮复审反复点名的根因）。
 > 把两者相加当成一个风险数字，是这一轮收缩要消掉的那个错误。
 >
-> **B 里那 6 个不在 A 里的 principal 没有类别分布可写**：基线的 `principals`
-> 只保留 A 的 37 个，那 6 个的 `category` 不在基线里 ⇒ 任何按类别的拆分都没有真源，
+> **B 里那 4 个不在 A 里的 principal 没有类别分布可写**：基线的 `principals`
+> 只保留 A 的 45 个，那 4 个的 `category` 不在基线里 ⇒ 任何按类别的拆分都没有真源，
 > 只能靠人记，下次 B 的成员变了就会静默腐烂。要看它们是谁，跑
 > `--dump-observed` 看带真实名字的快照（产物含账号内标识，勿提交）。
 
@@ -137,15 +137,16 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 
 | 类别 | 数 | 说明 |
 |---|---|---|
-| `platform` | 6 <!-- baseline:类别_platform=6 --> | 平台自己的角色，授权都是**必需且精确**的，见下节 |
+| `platform` | 7 <!-- baseline:类别_platform=7 --> | 平台自己的角色，授权都是**必需且精确**的，见下节 |
 | `platform-overbroad` | 0 <!-- baseline:类别_platform_overbroad=0 --> | **已清零**（2026-08-27 收窄 CodeBuild 的 bootstrap 桶读权限）。这一行不能删——文档数字守卫对每个类别都要求正文出现对应标记 |
 | `admin` | 3 <!-- baseline:类别_admin=3 --> | 账号管理身份（含账号 owner 的 IAM 用户）。属既定信任模型 |
-| `break-glass` | 1 <!-- baseline:类别_break_glass=1 --> | 企业内部托管的管理/审计角色。不由本项目控制（3c-final 后只剩 1 个仍在 A 里：其余几个原先只靠 SSM 读进 A，HS 材料删除后退出） |
-| `cdk-admin` | 3 <!-- baseline:类别_cdk_admin=3 --> | CDK bootstrap 的 CloudFormation 执行角色（3 个区），按约定是 `AdministratorAccess` ⇒ 两把 CMK 都能 `kms:Sign`。**任何能在本账号跑 `cdk deploy` 的人都能用**（部署角色本身只剩 IAM 写观察，不再进 A） |
+| `break-glass` | 3 <!-- baseline:类别_break_glass=3 --> | 企业内部托管的管理/审计角色。不由本项目控制。**3g 之后回到 3 个**：3c-final 删 HS 材料时它们退出过 A（只靠 SSM 读进来的那批），3g 把 CFN 模板层那条路建模出来之后又以 `*-cfn-template-unanalyzed` 重新进入——**单列、不进冒充面并集** |
+| `cdk-admin` | 3 <!-- baseline:类别_cdk_admin=3 --> | CDK bootstrap 的 CloudFormation **执行**角色（3 个区），按约定是 `AdministratorAccess` ⇒ 两把 CMK 都能 `kms:Sign`。**任何能在本账号跑 `cdk deploy` 的人都能用** |
+| `cdk-deploy` | 3 <!-- baseline:类别_cdk_deploy=3 --> | CDK bootstrap 的**部署**角色（3 个区）。**3g 新增的一档**：上一版这里写着「部署角色只剩 IAM 写观察、不再进 A」，3g 把 `UpdateStack` / change-set 那条路建模出来之后那句话不成立了。它们持 `edge:cfn-template-unanalyzed` 与 `sign:cfn-session-key-stack-unanalyzed`（**都单列、不进并集**：guard=protected 只说明「受保护资源的直接更新被挡住」，模板层未分析）。与 `cdk-admin` **刻意分成两档**——压成一档会让「又多一个能改栈的身份」不产生漂移 |
 | `cdk-readonly` | 3 <!-- baseline:类别_cdk_readonly=3 --> | CDK bootstrap 的 lookup 角色（3 个区）。3c-final 后只剩 `read-login-flow-secret`——**不进冒充面**（那把是登录流 HMAC，签不出会话） |
-| `unrelated-workload` | 21 <!-- baseline:类别_unrelated=21 --> | 与本平台无关的工作负载：EC2/ECS/EMR/EKS 实例角色、多个 SageMaker 与 Personalize 执行角色、Glue、Batch、SSM 自动化与 QuickSetup、另一套 GenAI Agent 栈、若干应用与 CDK BucketDeployment 角色 |
+| `unrelated-workload` | 23 <!-- baseline:类别_unrelated=23 --> | 与本平台无关的工作负载：EC2/ECS/EMR/EKS 实例角色、多个 SageMaker 与 Personalize 执行角色、Glue、Batch、SSM 自动化与 QuickSetup、另一套 GenAI Agent 栈、若干应用与 CDK BucketDeployment 角色 |
 
-合计 37 = A 组总数。**这一轮把这张表的裸数字也加上了校验标记**：`unrelated-workload`
+合计 45 = A 组总数（`类别_*` 之和恒等于 `A总数`，由 `test_every_category_has_a_count_slug` 绑住类别清单与标记清单——少一档时这个等式会破，而「快照 ⇄ 文档」那条主守卫看不出来）。**这一轮把这张表的裸数字也加上了校验标记**：`unrelated-workload`
 那个曾经写着 38，A 收缩后是 36，3c-final 删掉 HS 材料后是 21——裸数字正是文档腐烂的入口。
 
 ⇒ 这不是「只有我一个人有权限」的个人账号，而是一个**多工作负载共享账号**。
