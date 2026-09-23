@@ -87,6 +87,21 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 > 数值与 `category` 标注都不参与。所以照 DEPLOY.md ⑦ 跑一次 `--update-baseline`
 > **不会**让任何测试变红；反过来，也不要拿本文这组数字去核对你自己的账号。
 
+> **`A总数` 37 → 45 的归因已实测，不是推断**（2026-09-23）。把 **3g 之前**的闸门代码
+> （`a2c041f`）对着**同一天的同一个账号**跑一遍，它仍然报 **37**——与 schema 6 基线逐字相同。
+> 同一账号、同一天，旧模型 37 / 新模型 45 ⇒ 那 +8 全部来自**判定模型**，与账号是否长大无关。
+> 新进来的 8 个里 6 个只持 `*-cfn-template-unanalyzed` / `sign:cfn-session-key-stack-unanalyzed`
+> （单列、不进并集），`可签会话` 也仍是 15。
+> 这条替代了 spec §8.2 的「同输入双模型见证」中与本问题相关的那一半：它只回答「账号有没有动」，
+> **不给**逐 principal 的模型差异归因（那仍未做）。
+>
+> 那一轮旧闸门**同时报红**，但红的都不是 3g：① 两个 `openclaw-*InstanceRole`（unrelated-workload）
+> 的 `replace-platform-code:*` 由「判不出」变成「判定为 allowed」；② 多出 1 个带 Condition
+> 判不出的新 principal（`principals_with_missing_context` 165 → 166）；③ IAM 写语句集合与 3 份
+> AWS 托管策略版本变了（SageMaker / DataZone / Epoxy / ComputeOptimizer 那批）。
+> **①「能改平台函数代码的非平台身份」是真的暴露面项，与 3g 正交，需要单独处置**——
+> 这个闸门存在的理由就是"这个集合别再长"。
+
 闸门分**两层**，承诺宽度不同，所以数字也分两组（见「这道闸门不证明什么」）：
 
 | 组 | 项 | 数 |
