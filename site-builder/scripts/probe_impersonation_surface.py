@@ -200,9 +200,25 @@ def session_key_arns() -> tuple[str, ...]:
 # 那一处）。闸门那份按物理资源反查归属，不依赖任何函数的 CloudFormation tag
 # （auth 是裸 create_function 建的，根本没有那个 tag）。
 
-def sim_groups(s) -> tuple:
-    """按服务分组批量模拟。跨服务混在一条调用里会产生大量无意义的 action×resource
-    组合（都是 implicitDeny），既慢又难读。"""
+def sim_groups(s, gate) -> tuple:
+    """按服务分组批量模拟 → `(actions, resources, contexts)` 三元组。跨服务混在一条调用里
+    会产生大量无意义的 action×resource 组合（都是 implicitDeny），既慢又难读。
+
+    第三项是要**轮换**的 `ContextEntries` 列表（`None` = 这一组不喂上下文）。
+
+    **KMS 那组必须喂上下文**：`deploy_auth` / `deploy_panel` 把 spec §11.5 的签名合同
+    钉进了 IAM，signer 角色的 `kms:Sign` 语句带
+    `StringEquals {kms:SigningAlgorithm, kms:MessageType}`。不喂上下文时模拟器把这两条
+    评估成 **implicitDeny**——不是"缺上下文"，所以连 `missing_context_in` 都看不见，
+    持有者被干干净净地报成"不能签"。
+    **实测（2026-09-23，真机复盘）**：因为少了这一步，本探针的 `can_sign` 比闸门少 2 个
+    （`site-auth-service-role` / `site-panel-role`），headline 报 17 而闸门报 19；
+    逐条核对确认 `kms:MessageType=RAW` 那一腿才是 `allowed`。探针的数字进 spec §1 与
+    ADR 0001，所以这是**低报冒充面**。
+
+    取值与上下文构造一律用**闸门那一份**（`gate.KMS_MESSAGE_TYPES` / `gate.kms_context`），
+    判定取并集——「任一取值下能签」就是能签。两边各抄一份判定正是 3g 的成因。
+    """
     fns = [s.edge.arn, s.auth.arn, s.panel.arn, *s.new_candidates]
     stacks = [st.resource for st in s.stacks]
     # **两个来源都要取**：`Surface.service_roles`（闸门填的那份）与各栈自己观测到的
@@ -211,16 +227,23 @@ def sim_groups(s) -> tuple:
     roles = list(dict.fromkeys(
         [s.edge_role, *s.service_roles,
          *(st.service_role for st in s.stacks if st.service_role)]))
+    kms_contexts = [gate.kms_context(mt) for mt in gate.KMS_MESSAGE_TYPES]
     groups = [
-        (list(model.A_KMS_SIGN + model.A_KMS_SELF_AUTHORIZE), list(s.kms_keys)),
+        (list(model.A_KMS_SIGN + model.A_KMS_SELF_AUTHORIZE), list(s.kms_keys), kms_contexts),
         (list(model.A_UPDATE_CODE + model.A_UPDATE_CONFIG + model.A_PUBLISH_VERSION
-              + model.A_CREATE_FUNCTION + model.A_INVOKE), fns),
-        (list(model.A_CF_WRITE), [s.distribution]),
+              + model.A_CREATE_FUNCTION + model.A_INVOKE), fns, [None]),
+        (list(model.A_CF_WRITE), [s.distribution], [None]),
         (list(model.A_CFN_UPDATE + model.A_CFN_CREATE_CHANGESET
-              + model.A_CFN_EXECUTE_CHANGESET + model.A_CFN_SET_POLICY), stacks),
-        (list(model.A_PASSROLE), roles),
+              + model.A_CFN_EXECUTE_CHANGESET + model.A_CFN_SET_POLICY), stacks, [None]),
+        (list(model.A_PASSROLE), roles, [None]),
     ]
-    return tuple((a, r) for a, r in groups if r)
+    return tuple((a, r, c) for a, r, c in groups if r)
+
+
+def sim_legs(groups) -> int:
+    """真正会发出的模拟调用数（KMS 那组每个 MessageType 一腿）。
+    **不写死字面量**：加/减一个 MessageType 时写死的数字会静静地说谎。"""
+    return sum(len(contexts) for _, _, contexts in groups)
 
 
 def discover(gate, clients, region: str, account: str):
@@ -326,25 +349,31 @@ def simulate_all(gate, s, principals: list[dict[str, str]],
     """
     got: dict[str, frozenset[str]] = {}
     failures: list[str] = []
-    groups = sim_groups(s)
+    groups = sim_groups(s, gate)
 
     def probe(arn: str) -> frozenset[str]:
         cl = gate.thread_iam_client(region)
         allowed: set[str] = set()
-        for actions, resources in groups:
-            r = cl.simulate_principal_policy(
-                PolicySourceArn=arn, ActionNames=actions, ResourceArns=resources)
-            for res in r["EvaluationResults"]:
-                act = res["EvalActionName"]
-                rsr = res.get("ResourceSpecificResults") or ()
-                if rsr:
-                    for rr in rsr:
-                        if rr.get("EvalResourceDecision") == "allowed":
-                            allowed.add(f"{act}|{rr['EvalResourceName']}")
-                elif res.get("EvalDecision") == "allowed":
-                    # 单资源组时 IAM 可能不返回 ResourceSpecificResults。
-                    for one in resources:
-                        allowed.add(f"{act}|{one}")
+        for actions, resources, contexts in groups:
+            # 同一组按 contexts **逐腿**模拟，判定取并集（见 `sim_groups` 的文档：
+            # 「任一取值下能签」就是能签）。`None` = 这一组不喂上下文。
+            for ctx in contexts:
+                kw = {"PolicySourceArn": arn, "ActionNames": actions,
+                      "ResourceArns": resources}
+                if ctx:
+                    kw["ContextEntries"] = ctx
+                r = cl.simulate_principal_policy(**kw)
+                for res in r["EvaluationResults"]:
+                    act = res["EvalActionName"]
+                    rsr = res.get("ResourceSpecificResults") or ()
+                    if rsr:
+                        for rr in rsr:
+                            if rr.get("EvalResourceDecision") == "allowed":
+                                allowed.add(f"{act}|{rr['EvalResourceName']}")
+                    elif res.get("EvalDecision") == "allowed":
+                        # 单资源组时 IAM 可能不返回 ResourceSpecificResults。
+                        for one in resources:
+                            allowed.add(f"{act}|{one}")
         return frozenset(allowed)
 
     with cf.ThreadPoolExecutor(max_workers=workers) as pool:
@@ -418,7 +447,9 @@ def main(argv: list[str] | None = None) -> int:
 
     print("枚举 principal（ListRoles+ListUsers，不拉策略文档）…", flush=True)
     principals = list_principals(clients["iam"])
-    print(f"待模拟 {len(principals)} 个 × {len(sim_groups(s))} 组", flush=True)
+    _groups = sim_groups(s, gate)
+    print(f"待模拟 {len(principals)} 个 × {len(_groups)} 组 / {sim_legs(_groups)} 腿"
+          f"（KMS 那组每个 kms:MessageType 各一腿，见 sim_groups）", flush=True)
 
     names = {p["arn"]: p["name"] for p in principals}
     decisions = simulate_all(gate, s, principals, args.workers, region)

@@ -145,7 +145,7 @@ def test_sim_groups_covers_every_action_class_the_model_consumes(probe):
                                        controls=frozenset({probe.model.CONTROLS_EDGE}),
                                        guard=probe.model.GUARD_OPEN),),
         service_roles=("CFNROLE",))
-    asked = {a for actions, _ in probe.sim_groups(s) for a in actions}
+    asked = {a for actions, _, _ in probe.sim_groups(s, probe.load_gate()) for a in actions}
     consumed = set()
     for name, value in vars(probe.model).items():
         if name.startswith("A_") and isinstance(value, tuple):
@@ -165,7 +165,7 @@ def test_sim_groups_probes_both_keys_and_both_stacks(probe):
         stacks=(probe.model.fake_stack("router", controls=frozenset({"x"})),
                 probe.model.fake_stack("deployer", controls=frozenset({"y"}))),
         service_roles=("CFNROLE",))
-    resources = {r for _, rs in probe.sim_groups(s) for r in rs}
+    resources = {r for _, rs, _ in probe.sim_groups(s, probe.load_gate()) for r in rs}
     for want in ("K1", "K2", "NEW1", "NEW2", "DIST", "EDGEROLE", "CFNROLE",
                  "STACK_ROUTER", "STACK_DEPLOYER"):
         assert want in resources, want
@@ -177,8 +177,9 @@ def test_sim_groups_drops_empty_resource_groups(probe):
         kms_keys=(), auth=probe.model.FnFact("AUTH"), panel=probe.model.FnFact("PANEL"),
         edge=probe.model.FnFact("EDGE"), new_candidates=(), distribution="",
         edge_role="", stacks=(), service_roles=())
-    for actions, resources in probe.sim_groups(s):
+    for actions, resources, contexts in probe.sim_groups(s, probe.load_gate()):
         assert resources, actions
+        assert contexts, actions          # 每组至少一腿（None = 不喂上下文）
 
 
 def test_evidence_records_the_observed_guards(probe):
@@ -196,3 +197,59 @@ def test_the_two_real_cmks_come_from_config_not_a_placeholder_arn(probe):
     src = _SCRIPT.read_text(encoding="utf-8")
     assert "placeholder-key" not in src, "还在用占位 key ARN"
     assert "session_key_arns()" in src, "没有从 config 读真 key ARN"
+
+
+def test_conditioned_kms_sign_is_seen_only_when_the_context_is_supplied(probe):
+    """**3g 真机复盘（2026-09-23）**：探针原先一条 `ContextEntries` 都不喂，而
+    `deploy_auth` / `deploy_panel` 把 spec §11.5 的签名合同钉进了 IAM
+    （`StringEquals {kms:SigningAlgorithm, kms:MessageType}`）⇒ signer 角色的
+    `kms:Sign` 被模拟器判成 **implicitDeny**，探针把它们干干净净地报成"不能签"。
+
+    实测后果：探针 `can_sign` 17、闸门 19，差的正是 `site-auth-service-role` 与
+    `site-panel-role`；真机逐腿核对确认只有 `kms:MessageType=RAW` 那一腿是 `allowed`。
+    探针的数字进 spec §1 与 ADR 0001 ⇒ 那是**低报冒充面**。
+
+    这条用 fake IAM **按真实条件语义**判：只有 `kms:MessageType == RAW` 才 allowed。
+    所以它在"不喂上下文"的实现上必然红——不是 grep 源码有没有 `ContextEntries`。
+    """
+    gate = probe.load_gate()
+    s = probe.model.Surface(
+        kms_keys=("K1",),
+        auth=probe.model.FnFact("AUTH"), panel=probe.model.FnFact("PANEL"),
+        edge=probe.model.FnFact("EDGE"), new_candidates=(), distribution="",
+        edge_role="", stacks=(), service_roles=())
+
+    class FakeIam:
+        def __init__(self):
+            self.legs = []
+
+        def simulate_principal_policy(self, **kw):
+            ctx = {c["ContextKeyName"]: c["ContextKeyValues"][0]
+                   for c in kw.get("ContextEntries", [])}
+            self.legs.append(ctx.get("kms:MessageType"))
+            ok = ctx.get("kms:MessageType") == "RAW"      # 真实语句的条件
+            return {"EvaluationResults": [
+                {"EvalActionName": a,
+                 "ResourceSpecificResults": [
+                     {"EvalResourceName": r,
+                      "EvalResourceDecision": "allowed"
+                      if (ok and a == "kms:Sign") else "implicitDeny"}
+                     for r in kw["ResourceArns"]]}
+                for a in kw["ActionNames"]]}
+
+    fake = FakeIam()
+    real_client = gate.thread_iam_client
+    gate.thread_iam_client = lambda region: fake
+    try:
+        allowed = probe.simulate_all(gate, s, [{"arn": "arn:aws:iam::1:role/signer"}],
+                                     1, "us-east-1")
+    finally:
+        gate.thread_iam_client = real_client
+
+    got = allowed["arn:aws:iam::1:role/signer"]
+    assert "kms:Sign|K1" in got, f"合同条件下的 kms:Sign 没被看见：{sorted(got)}"
+    # RAW 真的被作为其中一腿发出（且腿数由闸门那份常量决定，不写死）
+    assert "RAW" in fake.legs, fake.legs
+    assert set(gate.KMS_MESSAGE_TYPES) <= set(x for x in fake.legs if x), fake.legs
+    assert probe.classify(got, s, "signer") & {probe.model.S_KMS_DIRECT}, \
+        "判定层没有据此给出 sign:kms-direct"
