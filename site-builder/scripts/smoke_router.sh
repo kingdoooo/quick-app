@@ -42,6 +42,13 @@ TABLE=$(CFG Platform routing_table)
 ACCOUNT=$(CFG Platform account_id)
 BUCKET=$(CFG Deployer frontend_bucket)
 BUCKET=${BUCKET//\{account_id\}/$ACCOUNT}
+# 下面每条 aws 调用都跟 config 的区走，不跟 shell：路由表只在这个区，跑错区是
+# ResourceNotFound。两个变量都要设——CLI v2 里 AWS_REGION 优先于 AWS_DEFAULT_REGION，
+# 只设后者时 shell 里的 AWS_REGION 照样生效。**不写成 `export X=$(CFG …)`**：
+# export 会吞掉命令替换的失败，set -e 看不见缺键。
+REGION=$(CFG Platform region)
+[ -n "$REGION" ] || { echo "site-builder/config.ini 的 [Platform] region 为空" >&2; exit 2; }
+export AWS_REGION="$REGION" AWS_DEFAULT_REGION="$REGION"
 
 # 一次性后缀：两次运行互不干扰，且清理时能判定"哪些是本次的"
 SUF=$(python3 -c "import secrets;print(secrets.token_hex(4))")

@@ -136,6 +136,65 @@ def test_smoke_has_no_bare_var_before_fullwidth_punctuation():
     assert not bad, "裸 $VAR 紧跟全角标点:\n" + "\n".join(bad)
 
 
+# 桩 aws：按 CLI v2 的优先级（--region > AWS_REGION > AWS_DEFAULT_REGION）记下每次调用
+# **实际会打到的区**，一律成功、读回一律 "None"（让清理核对通过）
+_AWS_STUB = r"""#!/usr/bin/env bash
+eff="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
+prev=""
+for a in "$@"; do [ "$prev" = "--region" ] && eff="$a"; prev="$a"; done
+echo "${eff:-<unset>} $1 $2" >> "$SMOKE_AWS_LOG"
+echo None
+"""
+
+
+def _run_smoke_with_stubs(tmp_path, platform_extra):
+    (tmp_path / "site-builder").mkdir()
+    (tmp_path / "site-builder/config.ini").write_text(
+        "[Platform]\naccount_id = 111122223333\nbase_domain = smoke.invalid\n"
+        f"routing_table = t\n{platform_extra}"
+        "[Deployer]\nfrontend_bucket = site-frontend-{account_id}\n")
+    stubs = tmp_path / "bin"
+    stubs.mkdir()
+    for name, body in (("aws", _AWS_STUB), ("curl", "#!/bin/sh\n"),
+                       ("sleep", "#!/bin/sh\n")):
+        (stubs / name).write_text(body)
+        (stubs / name).chmod(0o755)
+    log = tmp_path / "aws.log"
+    log.write_text("")
+    env = {"PATH": f"{stubs}:/usr/bin:/bin:/opt/homebrew/bin",
+           "HOME": str(tmp_path), "SMOKE_AWS_LOG": str(log),
+           # 事故现场：shell 里是别的区，两个变量都设了
+           "AWS_REGION": "us-west-2", "AWS_DEFAULT_REGION": "us-west-2"}
+    r = subprocess.run(["bash", str(SMOKE)], cwd=tmp_path, env=env,
+                       capture_output=True, text=True, timeout=60)
+    calls = [l.split(" ", 1) for l in log.read_text().splitlines()]
+    return r, calls
+
+
+def test_smoke_pins_every_aws_call_to_config_region(tmp_path):
+    """shell 里的 `AWS_REGION` 不得漏进冒烟：路由表只在 config 的区，跑错区是 ResourceNotFound。
+
+    只 export `AWS_DEFAULT_REGION` 修不了——CLI v2 里 `AWS_REGION` 优先于它（实测 2.36）。
+    """
+    r, calls = _run_smoke_with_stubs(tmp_path, "region = us-east-1\n")
+    ops = {c[1] for c in calls}
+    # 正向控制：桩真的收到了脚本里全部种类的 aws 调用，否则"全在 us-east-1"是空真
+    for op in ("s3 cp", "dynamodb put-item", "dynamodb update-item",
+               "dynamodb delete-item", "s3 rm", "dynamodb get-item"):
+        assert op in ops, f"桩没收到 {op}——脚本提前退出了？\n{r.stdout}\n{r.stderr}"
+    wrong = [c for c in calls if c[0] != "us-east-1"]
+    assert not wrong, f"这些 aws 调用没打到 config 的区: {wrong}"
+
+
+@pytest.mark.parametrize("platform_extra", ["", "region =\n"],
+                         ids=["missing", "empty"])
+def test_smoke_fails_before_any_aws_call_without_config_region(tmp_path, platform_extra):
+    """config 没给区时不得回落到 shell 的区——那正是要防的事故。"""
+    r, calls = _run_smoke_with_stubs(tmp_path, platform_extra)
+    assert r.returncode != 0
+    assert calls == [], f"没有区也发出了 aws 调用: {calls}"
+
+
 # ---------- test_e2e_fixtures.py 的 finalizer ----------
 
 def _e2e_ast():
