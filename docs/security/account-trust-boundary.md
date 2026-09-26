@@ -3,14 +3,14 @@
 > **决策记录，不是操作指引。** 本文含单账号实测数据与当时的取舍过程，按写下的那一刻为准；
 > 采用者要的操作步骤真源是 `site-builder/DEPLOY.md`，还剩什么没做看 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9。
 
-> **⚠️ 本页的 headline 与集合关系数字待真机重测（3g，2026-09-21）。** 判定模型已换成
+> **3g：本页数字已按新判定模型真机重测（2026-09-23），并做完 spec `2026-09-20-3g-*` §8.2 的
+> 同输入双模型见证（2026-09-27，逐 principal 归因见「实测」一节）。** 判定模型已换成
 > `scripts/_impersonation_model.py`（闸门与探针共用、经反例验证），grant 词表与基线 schema
-> 一并升到 7。旧数字由旧模型算出，它有四处失真：对 Edge **过度声称**（只模拟
+> 一并升到 7。旧模型有四处失真：对 Edge **过度声称**（只模拟
 > `lambda:UpdateFunctionCode`，而 CloudFront 关联编号版本）、**少算** CFN 两条路与
 > `UpdateFunctionConfiguration`、CFN 前提停留在 ADR 0007 之前（router 栈**现在有**
 > stack policy，门槛是 `cloudformation:SetStackPolicy`）、以及把 `PublishVersion` 当成
 > "新建函数再关联"的必需前提（`CreateFunction` 自带 `Publish`）。
-> **重测前不要引用本页任何计数**；重测步骤见 spec `2026-09-20-3g-*` §8.2。
 >
 > grant 改名：`replace-platform-code:<fn>` → `update-fn-code:<fn>`（旧名声称"已能替换
 > 正在执行的代码"，那对 Edge 不成立）。本页下文出现旧名处按新名理解。
@@ -87,15 +87,34 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 > 数值与 `category` 标注都不参与。所以照 DEPLOY.md ⑦ 跑一次 `--update-baseline`
 > **不会**让任何测试变红；反过来，也不要拿本文这组数字去核对你自己的账号。
 
-> **`A总数` 37 → 45 的归因已实测，不是推断**（2026-09-23）。把 **3g 之前**的闸门代码
-> （`a2c041f`）对着**同一天的同一个账号**跑一遍，它仍然报 **37**——与 schema 6 基线逐字相同。
-> 同一账号、同一天，旧模型 37 / 新模型 45 ⇒ 那 +8 全部来自**判定模型**，与账号是否长大无关。
-> 新进来的 8 个里 6 个只持 `*-cfn-template-unanalyzed` / `sign:cfn-session-key-stack-unanalyzed`
-> （单列、不进并集），`可签会话` 也仍是 15。
-> 这条替代了 spec §8.2 的「同输入双模型见证」中与本问题相关的那一半：它只回答「账号有没有动」，
-> **不给**逐 principal 的模型差异归因（那仍未做）。
+> **`A总数` 37 → 45 的归因是逐 principal 实测，不是推断**（spec §8.2 见证，2026-09-27）。
+> 方法是**一次扫描、两版判定**：新闸门完整扫一次，同时录下每个 principal 每一腿的原始
+> `EvaluationResults`，再把同一份录制分别喂给 **3g 之前**（`a2c041f`）与当前的判定代码。
+> 能精确回放的前提逐腿断言过：旧闸门三腿与新闸门对应三腿的资源集合、`ContextEntries` 逐字相同，
+> 旧函数腿的动作是新函数腿的真子集，而每条 `EvaluationResult` 只属于一个动作 ⇒ 按动作过滤录制
+> 就是旧闸门会收到的响应（回放器对匹配不上的请求硬失败）。正向控制：新判定的回放与在线结果
+> 逐 principal 相同，也与 `--dump-observed` 产物逐字段相同。
+> 结果（同输入 ⇒ 差异只含模型影响）：旧 37 / 新 45，**进 8、出 0，零条无法解释的差异**——旧词表的
+> grant 改名后逐条保留，新增的只落在 3g 新采集的动作类与能力层：
+> - 3 个 CDK deploy 角色：多了 CFN 两条路的 grant，能力层只得 `edge:cfn-template-unanalyzed` /
+>   `sign:cfn-session-key-stack-unanalyzed`（单列、不进并集）；
+> - 4 个非平台角色（`break-glass` 与 `unrelated-workload` 各 2）：只多了单步 grant（`pass-role` /
+>   `update-distribution` / `create-fn` 之一或两个），凑不成任何能力链，零能力标签；
+> - 1 个夹具签发器角色（`platform`）：只得 `sign:fixture-issuer`（受限冒充，不进并集）。
 >
-> 那一轮旧闸门**同时报红**，但红的都不是 3g：① 两个 `openclaw-*InstanceRole`（unrelated-workload）
+> ⇒ 8 个新进入者对冒充面并集的贡献都是 0，`可签会话` 新旧都是 15。判不出的覆盖项 818 → 2290，
+> 旧成员改名后全部保留，新增项全部属于 3g 新增的九个动作类。
+>
+> **§8.2 第 1 步（旧代码对旧基线必须绿）没做到**，原因在账号侧：旧基线（2026-09-13）之后账号有下面
+> ①②③ 三处变化。见证用账号侧的逐 principal 拆分代替这一步——旧模型下 2026-09-13 → 2026-09-27
+> principal 集合不变，grant 变了的只有 ① 那两个角色。
+> 见证那一轮（新代码对 2026-09-23 的 schema 7 基线）唯一的红也在账号侧：AWS 托管策略
+> `AIDevOpsAgentAccessPolicy` v11（2026-09-24）新增一条 `s3:ListBucket` + `StringLike s3:prefix`
+> 的语句，模拟器把缺失的 `s3:prefix` 报在该角色**全部**被模拟动作上 ⇒ 一个既有 unrelated-workload
+> principal 多了 14 个判不出项（`principals_with_missing_context` 166 → 167），principal 层零变化。
+> 这条语句授不出任何被模拟的动作；审阅后按 §8.2 第 3 步从见证快照重写基线，复核绿。
+>
+> 2026-09-23 那轮旧闸门（`a2c041f` 对 schema 6 基线）**报红**，红的都不是 3g：① 两个 `openclaw-*InstanceRole`（unrelated-workload）
 > 的 `replace-platform-code:*` 由「判不出」变成「判定为 allowed」；② 多出 1 个带 Condition
 > 判不出的新 principal（`principals_with_missing_context` 165 → 166）；③ IAM 写语句集合与 3 份
 > AWS 托管策略版本变了（SageMaker / DataZone / Epoxy / ComputeOptimizer 那批）。
