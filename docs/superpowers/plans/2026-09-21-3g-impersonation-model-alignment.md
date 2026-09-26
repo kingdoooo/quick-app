@@ -42,7 +42,7 @@
 
 Run:
 ```bash
-cd /Users/kentpeng/projects/quick-app/site-builder/deployer
+cd "$(git rev-parse --show-toplevel)/site-builder/deployer"
 .venv/bin/pytest tests/test_probe_impersonation_surface.py tests/test_verify_account_trust_boundary.py -q
 ```
 Expected: 全绿。若有红，先停下来报告——那不是本计划引入的，但会让后面每一步的"失败→通过"失去意义。
@@ -159,7 +159,7 @@ def test_invoke_on_panel_is_not_the_fixture_entry(m):
 
 - [ ] **Step 3: 运行，确认它以 import 失败告终**
 
-Run: `cd /Users/kentpeng/projects/quick-app/site-builder/deployer && .venv/bin/pytest tests/test_impersonation_model.py -q`
+Run: `cd "$(git rev-parse --show-toplevel)/site-builder/deployer" && .venv/bin/pytest tests/test_impersonation_model.py -q`
 Expected: FAIL，全部用例在 `_load()` 处报 `FileNotFoundError` / `spec is None`（模块还不存在）。
 
 - [ ] **Step 4: 写最小实现**
@@ -349,13 +349,13 @@ def fake_surface() -> Surface:
 
 - [ ] **Step 5: 运行，确认全绿**
 
-Run: `cd /Users/kentpeng/projects/quick-app/site-builder/deployer && .venv/bin/pytest tests/test_impersonation_model.py -q`
+Run: `cd "$(git rev-parse --show-toplevel)/site-builder/deployer" && .venv/bin/pytest tests/test_impersonation_model.py -q`
 Expected: PASS（8 条）。
 
 - [ ] **Step 6: 提交**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git add site-builder/scripts/_impersonation_model.py site-builder/deployer/tests/test_impersonation_model.py
 git commit -m "feat(3g): 共享冒充判定模型骨架 + 签名侧反例
 
@@ -467,7 +467,7 @@ def test_edge_code_rights_do_not_spill_into_signer_hijack(m):
 
 - [ ] **Step 2: 运行，确认失败**
 
-Run: `cd /Users/kentpeng/projects/quick-app/site-builder/deployer && .venv/bin/pytest tests/test_impersonation_model.py -q`
+Run: `cd "$(git rev-parse --show-toplevel)/site-builder/deployer" && .venv/bin/pytest tests/test_impersonation_model.py -q`
 Expected: FAIL，8 条新用例报 `AttributeError: module has no attribute 'E_PUBLISH_INLINE'`。
 
 - [ ] **Step 3: 写最小实现**
@@ -498,13 +498,13 @@ E_NEW_FUNCTION = "edge:new-function+associate"
 
 - [ ] **Step 4: 运行，确认全绿**
 
-Run: `cd /Users/kentpeng/projects/quick-app/site-builder/deployer && .venv/bin/pytest tests/test_impersonation_model.py -q`
+Run: `cd "$(git rev-parse --show-toplevel)/site-builder/deployer" && .venv/bin/pytest tests/test_impersonation_model.py -q`
 Expected: PASS（16 条）。
 
 - [ ] **Step 5: 提交**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git add site-builder/scripts/_impersonation_model.py site-builder/deployer/tests/test_impersonation_model.py
 git commit -m "feat(3g): Edge 侧三条等价路径 + 反例
 
@@ -635,7 +635,7 @@ def test_two_stacks_are_judged_independently(m):
 
 - [ ] **Step 2: 运行，确认失败**
 
-Run: `cd /Users/kentpeng/projects/quick-app/site-builder/deployer && .venv/bin/pytest tests/test_impersonation_model.py -q`
+Run: `cd "$(git rev-parse --show-toplevel)/site-builder/deployer" && .venv/bin/pytest tests/test_impersonation_model.py -q`
 Expected: FAIL，9 条新用例报 `AttributeError: module has no attribute 'fake_stack'`。
 
 - [ ] **Step 3: 写最小实现**
@@ -708,13 +708,13 @@ def fake_stack(label: str, *, controls: frozenset[str],
 
 - [ ] **Step 4: 运行，确认全绿**
 
-Run: `cd /Users/kentpeng/projects/quick-app/site-builder/deployer && .venv/bin/pytest tests/test_impersonation_model.py -q`
+Run: `cd "$(git rev-parse --show-toplevel)/site-builder/deployer" && .venv/bin/pytest tests/test_impersonation_model.py -q`
 Expected: PASS（25 条）。
 
 - [ ] **Step 5: 提交**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git add site-builder/scripts/_impersonation_model.py site-builder/deployer/tests/test_impersonation_model.py
 git commit -m "feat(3g): CFN 侧 guard 三值 + router/deployer 两个栈
 
@@ -798,7 +798,7 @@ def test_all_labels_is_exhaustive(m):
 
 - [ ] **Step 2: 运行，确认失败**
 
-Run: `cd /Users/kentpeng/projects/quick-app/site-builder/deployer && .venv/bin/pytest tests/test_impersonation_model.py -q`
+Run: `cd "$(git rev-parse --show-toplevel)/site-builder/deployer" && .venv/bin/pytest tests/test_impersonation_model.py -q`
 Expected: FAIL，4 条新用例报 `AttributeError: module has no attribute 'summarize'`。
 
 - [ ] **Step 3: 写最小实现**
@@ -874,13 +874,13 @@ def summarize(by_principal: dict[str, set[str]]) -> dict:
 
 - [ ] **Step 4: 运行，确认全绿**
 
-Run: `cd /Users/kentpeng/projects/quick-app/site-builder/deployer && .venv/bin/pytest tests/test_impersonation_model.py -q`
+Run: `cd "$(git rev-parse --show-toplevel)/site-builder/deployer" && .venv/bin/pytest tests/test_impersonation_model.py -q`
 Expected: PASS（29 条）。
 
 - [ ] **Step 5: 提交**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git add site-builder/scripts/_impersonation_model.py site-builder/deployer/tests/test_impersonation_model.py
 git commit -m "feat(3g): 聚合层 + 显式未覆盖声明
 
@@ -1001,7 +1001,7 @@ def test_goes_red_when_changeset_chain_needs_only_one_action(m):
 
 - [ ] **Step 2: 运行，确认 6 条变形全部按预期红/绿**
 
-Run: `cd /Users/kentpeng/projects/quick-app/site-builder/deployer && .venv/bin/pytest tests/test_impersonation_model.py -q`
+Run: `cd "$(git rev-parse --show-toplevel)/site-builder/deployer" && .venv/bin/pytest tests/test_impersonation_model.py -q`
 Expected: PASS（35 条）。
 
 若某条变形测试**失败**（即变形后 `_cases_pass` 仍为 True），说明 `_cases_pass` 里缺少针对该维度的检查
@@ -1010,7 +1010,7 @@ Expected: PASS（35 条）。
 - [ ] **Step 3: 提交**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git add site-builder/deployer/tests/test_impersonation_model.py
 git commit -m "test(3g): 六条变形测试证明模型反例集不是摆设"
 ```
@@ -1157,7 +1157,7 @@ def test_policy_problems_cannot_be_used_as_the_guard_predicate(g):
 
 - [ ] **Step 2: 运行，确认失败**
 
-Run: `cd /Users/kentpeng/projects/quick-app/site-builder/deployer && .venv/bin/pytest tests/test_stack_policy_guard.py -q`
+Run: `cd "$(git rev-parse --show-toplevel)/site-builder/deployer" && .venv/bin/pytest tests/test_stack_policy_guard.py -q`
 Expected: FAIL，全部用例在 `_load` 处失败（模块不存在）。
 
 - [ ] **Step 3: 写最小实现**
@@ -1237,7 +1237,7 @@ def guard_for(policy: dict | None, logical_ids: list[str]) -> str:
 
 - [ ] **Step 4: 运行，确认全绿**
 
-Run: `cd /Users/kentpeng/projects/quick-app/site-builder/deployer && .venv/bin/pytest tests/test_stack_policy_guard.py -q`
+Run: `cd "$(git rev-parse --show-toplevel)/site-builder/deployer" && .venv/bin/pytest tests/test_stack_policy_guard.py -q`
 Expected: PASS（13 条）。
 
 - [ ] **Step 5: 在 `policy_problems()` 上加反向指针**
@@ -1252,13 +1252,13 @@ Modify `router/infrastructure/stack_policy.py`，在 `policy_problems` 的 docst
 
 - [ ] **Step 6: 跑 router 单测确认没碰坏**
 
-Run: `cd /Users/kentpeng/projects/quick-app/router/infrastructure/lambda && ../../../site-builder/deployer/.venv/bin/pytest . -q`
+Run: `cd "$(git rev-parse --show-toplevel)/router/infrastructure/lambda" && ../../../site-builder/deployer/.venv/bin/pytest . -q`
 Expected: PASS（只改了 docstring）。
 
 - [ ] **Step 7: 提交**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git add site-builder/scripts/_stack_policy_guard.py site-builder/deployer/tests/test_stack_policy_guard.py router/infrastructure/stack_policy.py
 git commit -m "feat(3g): guard 语义谓词（三值），与 policy_problems 刻意分开
 
@@ -1352,7 +1352,7 @@ def test_discover_observes_guard_and_both_stacks(probe, monkeypatch):
 
 - [ ] **Step 2: 运行，确认失败**
 
-Run: `cd /Users/kentpeng/projects/quick-app/site-builder/deployer && .venv/bin/pytest tests/test_probe_impersonation_surface.py -q`
+Run: `cd "$(git rev-parse --show-toplevel)/site-builder/deployer" && .venv/bin/pytest tests/test_probe_impersonation_surface.py -q`
 Expected: FAIL — `test_probe_does_not_carry_its_own_judgement` 报 "探针里又有一份 classify 定义"。
 
 - [ ] **Step 3: 改探针**
@@ -1492,20 +1492,20 @@ def sim_groups(s: model.Surface) -> tuple[tuple[list[str], list[str]], ...]:
 
 Run:
 ```bash
-cd /Users/kentpeng/projects/quick-app/site-builder/deployer
+cd "$(git rev-parse --show-toplevel)/site-builder/deployer"
 .venv/bin/pytest tests/test_probe_impersonation_surface.py tests/test_impersonation_model.py -q
 ```
 Expected: PASS。
 
 - [ ] **Step 5: 跑探针自检（不碰 AWS）**
 
-Run: `cd /Users/kentpeng/projects/quick-app && python3 site-builder/scripts/probe_impersonation_surface.py --self-test`
+Run: `cd "$(git rev-parse --show-toplevel)" && python3 site-builder/scripts/probe_impersonation_surface.py --self-test`
 Expected: 退出 0，打印"判定与聚合来自共享模型"。
 
 - [ ] **Step 6: 提交**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git add site-builder/scripts/probe_impersonation_surface.py site-builder/deployer/tests/test_probe_impersonation_surface.py
 git commit -m "refactor(3g): 探针改用共享模型，并观测 guard 与两个栈
 
@@ -1629,7 +1629,7 @@ def test_new_resource_classes_are_stable_and_account_free(gate):
 
 - [ ] **Step 2: 运行，确认失败**
 
-Run: `cd /Users/kentpeng/projects/quick-app/site-builder/deployer && .venv/bin/pytest tests/test_verify_account_trust_boundary.py -q -k "renamed or new_action or change_set_actions or logical_label or class_names or resource_classes"`
+Run: `cd "$(git rev-parse --show-toplevel)/site-builder/deployer" && .venv/bin/pytest tests/test_verify_account_trust_boundary.py -q -k "renamed or new_action or change_set_actions or logical_label or class_names or resource_classes"`
 Expected: FAIL（`G_UPDATE_CODE` 不存在 / `Targets` 没有 `distribution` 字段）。
 
 - [ ] **Step 3: 改闸门**
@@ -1788,7 +1788,7 @@ ACTIONS = ACTIONS_FUNCTION + ACTIONS_PUBLISH + ACTIONS_MISC + ACTIONS_OTHER
 
 - [ ] **Step 4: 运行，确认新用例绿、旧用例的 grant 名字期望同步更新**
 
-Run: `cd /Users/kentpeng/projects/quick-app/site-builder/deployer && .venv/bin/pytest tests/test_verify_account_trust_boundary.py -q`
+Run: `cd "$(git rev-parse --show-toplevel)/site-builder/deployer" && .venv/bin/pytest tests/test_verify_account_trust_boundary.py -q`
 Expected: 先会看到一批旧用例因为 `replace-platform-code` 字面量而红。**逐条把期望改成新名字**
 （`grep -n "replace-platform-code\|replace-code" tests/test_verify_account_trust_boundary.py`），
 不要改判定。改完全绿。
@@ -1796,7 +1796,7 @@ Expected: 先会看到一批旧用例因为 `replace-platform-code` 字面量而
 - [ ] **Step 5: 提交**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git add site-builder/scripts/verify_account_trust_boundary.py site-builder/deployer/tests/test_verify_account_trust_boundary.py
 git commit -m "feat(3g): 闸门 grant 词表对齐动作事实 + 新增 CFN/CloudFront/PassRole 资源类
 
@@ -1910,7 +1910,7 @@ def test_model_inputs_drift_is_red_in_both_directions(gate):
 
 - [ ] **Step 2: 运行，确认失败**
 
-Run: `cd /Users/kentpeng/projects/quick-app/site-builder/deployer && .venv/bin/pytest tests/test_verify_account_trust_boundary.py -q -k "sim_legs or publish_leg or model_inputs"`
+Run: `cd "$(git rev-parse --show-toplevel)/site-builder/deployer" && .venv/bin/pytest tests/test_verify_account_trust_boundary.py -q -k "sim_legs or publish_leg or model_inputs"`
 Expected: FAIL（`model_inputs_section` / `_compare_model_inputs` / `model_input_drift` 不存在；腿数不匹配）。
 
 - [ ] **Step 3: 改闸门**
@@ -2111,13 +2111,13 @@ def _plain_bool(v) -> bool:
 
 - [ ] **Step 4: 运行，确认全绿**
 
-Run: `cd /Users/kentpeng/projects/quick-app/site-builder/deployer && .venv/bin/pytest tests/test_verify_account_trust_boundary.py -q`
+Run: `cd "$(git rev-parse --show-toplevel)/site-builder/deployer" && .venv/bin/pytest tests/test_verify_account_trust_boundary.py -q`
 Expected: PASS。`test_report_fields_are_all_classified` 会在漏登记 `model_input_drift` 时红——它是这一步的守卫。
 
 - [ ] **Step 5: 提交**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git add site-builder/scripts/verify_account_trust_boundary.py site-builder/deployer/tests/test_verify_account_trust_boundary.py
 git commit -m "feat(3g): 闸门采集 guard/两个栈/入口类型 + model_inputs 分节
 
@@ -2231,7 +2231,7 @@ def test_headline_counts_do_not_drive_the_exit_code(gate):
 
 - [ ] **Step 2: 运行，确认失败**
 
-Run: `cd /Users/kentpeng/projects/quick-app/site-builder/deployer && .venv/bin/pytest tests/test_verify_account_trust_boundary.py -q -k "capabilit or grant_growth or headline"`
+Run: `cd "$(git rev-parse --show-toplevel)/site-builder/deployer" && .venv/bin/pytest tests/test_verify_account_trust_boundary.py -q -k "capabilit or grant_growth or headline"`
 Expected: FAIL（`Report` 没有 `new_capabilities`）。
 
 - [ ] **Step 3: 改闸门**
@@ -2291,13 +2291,13 @@ Expected: FAIL（`Report` 没有 `new_capabilities`）。
 
 - [ ] **Step 4: 运行，确认全绿**
 
-Run: `cd /Users/kentpeng/projects/quick-app/site-builder/deployer && .venv/bin/pytest tests/test_verify_account_trust_boundary.py -q`
+Run: `cd "$(git rev-parse --show-toplevel)/site-builder/deployer" && .venv/bin/pytest tests/test_verify_account_trust_boundary.py -q`
 Expected: PASS。
 
 - [ ] **Step 5: 提交**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git add site-builder/scripts/verify_account_trust_boundary.py site-builder/deployer/tests/test_verify_account_trust_boundary.py
 git commit -m "feat(3g): 闸门新增派生能力层（逐 principal 集合比较）
 
@@ -2430,7 +2430,7 @@ def test_carry_categories_conflicting_with_classify_is_fatal(gate, tmp_path):
 
 - [ ] **Step 2: 运行，确认失败**
 
-Run: `cd /Users/kentpeng/projects/quick-app/site-builder/deployer && .venv/bin/pytest tests/test_verify_account_trust_boundary.py -q -k "schema_is_seven or retired_grant or carry_categories or precedence or after_carrying"`
+Run: `cd "$(git rev-parse --show-toplevel)/site-builder/deployer" && .venv/bin/pytest tests/test_verify_account_trust_boundary.py -q -k "schema_is_seven or retired_grant or carry_categories or precedence or after_carrying"`
 Expected: FAIL。
 
 - [ ] **Step 3: 改闸门**
@@ -2576,13 +2576,13 @@ def merge_categories(*, carried: dict, by_name: dict, observed: dict) -> dict:
 
 - [ ] **Step 4: 运行，确认全绿**
 
-Run: `cd /Users/kentpeng/projects/quick-app/site-builder/deployer && .venv/bin/pytest tests/test_verify_account_trust_boundary.py -q`
+Run: `cd "$(git rev-parse --show-toplevel)/site-builder/deployer" && .venv/bin/pytest tests/test_verify_account_trust_boundary.py -q`
 Expected: PASS。
 
 - [ ] **Step 5: 提交**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git add site-builder/scripts/verify_account_trust_boundary.py site-builder/deployer/tests/test_verify_account_trust_boundary.py
 git commit -m "feat(3g): BASELINE_SCHEMA=7 + --carry-categories
 
@@ -2707,14 +2707,14 @@ date: 2026-09-21
 
 Run:
 ```bash
-cd /Users/kentpeng/projects/quick-app/site-builder/deployer && .venv/bin/pytest tests -q -k "doc or deploy_md or claude or bootstrap"
+cd "$(git rev-parse --show-toplevel)/site-builder/deployer" && .venv/bin/pytest tests -q -k "doc or deploy_md or claude or bootstrap"
 ```
 Expected: PASS。若某条守卫要求"每一处 router 部署点写成三步"之类的形态，按它的报错补齐。
 
 - [ ] **Step 7: 提交**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git add docs/security/account-trust-boundary.md docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md docs/adr/0008-two-predicates-for-stack-policy.md CLAUDE.md site-builder/DEPLOY.md
 git commit -m "docs(3g): 数字标待重测 + 未分析范围 + ADR 0008（两个 stack policy 谓词）
 
@@ -2779,7 +2779,7 @@ botocore 服务模型与 AWS 文档核验见 §1.1）。**真机部分未做**�
 - [ ] **Step 4: 提交**
 
 ```bash
-cd /Users/kentpeng/projects/quick-app
+cd "$(git rev-parse --show-toplevel)"
 git add docs/superpowers/specs/2026-09-20-3g-impersonation-model-alignment-spec.md
 git commit -m "docs(3g): spec 状态改为「代码+单测已实施，真机待做」并标明证据等级"
 ```
