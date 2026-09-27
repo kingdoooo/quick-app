@@ -118,8 +118,14 @@ python3 site-builder/scripts/verify_account_trust_boundary.py
 > 的 `replace-platform-code:*` 由「判不出」变成「判定为 allowed」；② 多出 1 个带 Condition
 > 判不出的新 principal（`principals_with_missing_context` 165 → 166）；③ IAM 写语句集合与 3 份
 > AWS 托管策略版本变了（SageMaker / DataZone / Epoxy / ComputeOptimizer 那批）。
-> **①「能改平台函数代码的非平台身份」是真的暴露面项，与 3g 正交，需要单独处置**——
-> 这个闸门存在的理由就是"这个集合别再长"。
+> **① 按既定模型处理，无需处置**（2026-09-27 只读核实）：两个角色都是一个无关 demo 的
+> EC2 instance role，挂着 AWS 托管的 `AWSLambda_FullAccess` + `CloudFrontFullAccess`（另有
+> S3 / Bedrock 等一批 `*FullAccess`）——「能改平台函数代码」是 `lambda:*` on `*` 的必然后果，
+> 不是冲着平台授的权。这正是本页的既定模型：**安全边界是账号本身**，账号里任何 admin 级的
+> 无关工作负载被拿下都能冒充，收窄它们是账号治理，不是本仓库能提交的改动（见「M09 的框架
+> 不够大」与「这道闸门不证明什么」）。它们在 schema 7 基线里记为 `unrelated-workload`，能力
+> 标签（`edge:code+publish+associate`、`sign:hijack-*`）是那批 FullAccess 的预期结果，闸门对
+> 它们是绿的。闸门的作用仍是"这个集合别再长"：再出现一个同类身份照样会红，要逐个判定。
 
 闸门分**两层**，承诺宽度不同，所以数字也分两组（见「这道闸门不证明什么」）：
 
