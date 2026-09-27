@@ -2005,18 +2005,14 @@ name**；值必须是裸 `true`/`false`——configparser 会把行内注释并�
    > **改过 config.ini 后要先 `rm -rf cdk.out`**：陈旧 asset 里仍是旧的
    > `BASE_DOMAIN`，直接 synth/deploy 会用到过期值。
    >
-   > **改过依赖清单（`bundling-requirements.txt`）也必须 `rm -rf cdk.out`**，而且这
-   > 一条与上一条是**两个独立的原因**：CDK 的 asset hash **只看 `/asset-input` 那个
-   > 源目录，不含挂载卷里的清单内容**——实测过两份不同的 lockfile 算出同一个
-   > `asset.<同一串>`。于是"只改清单、不改 `app.py`"时 CDK 会复用旧 asset，
-   > 新清单当次**根本没生效**，而部署脚本一切正常。
-   >
-   > **改过 `site-builder/contract/` 同样必须 `rm -rf cdk.out`**，原因与上一条**完全
-   > 相同**：合同包也是**挂载卷**（`infra/app.py` 的 `/asset-contract` → `contract/src`，
-   > 用 `cp -r` 进产物），不进 asset hash。而它被打进**全部 10 个 `site-deployer-*`
-   > step Lambda**（`step_fn` 的 bundling 命令是统一的），所以漏清的后果是"部署全绿
-   > 而 10 个函数继续跑旧的校验器字节"——校验规则改严了却完全没生效，是最难发现的
-   > 那一类。这条以前不在本清单里（只列了 config.ini 与依赖清单），补上。
+   > **改依赖清单（`bundling-requirements.txt`）或 `site-builder/contract/` 不需要清 `cdk.out`**：
+   > 两者都是 bundling 的**挂载卷**（合同包经 `/asset-contract` 用 `cp -r` 打进全部 10 个
+   > `site-deployer-*` step Lambda），CDK 默认的 asset hash 看不见挂载卷的内容——只改它们时
+   > S3Key 不变，`cdk deploy` 会跳过上传与更新，**清 `cdk.out` 也救不了**（重打的包是新字节，
+   > 但同名 key 已在 bootstrap 桶里）。所以 `infra/app.py` 用 `infra/bundle_hash.py` 自己算
+   > hash，覆盖源码树、每个挂载里被读的文件与 bundling 命令。**核对办法**：改完先 `cdk diff`，
+   > 应当看到这 10 个函数的 `Code` 变化；零差异说明改动没进包。部署后
+   > `verify_deployed_components.py` ③ 会逐字节比对线上的 `redlines.py`。
    >
    > **`default_origin` 必须是可解析域名**。origin-request 事件在 CloudFront 解析
    > origin **之后**才触发，填不可解析的值（如 `.invalid` 保留 TLD）会让所有请求

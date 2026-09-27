@@ -264,19 +264,23 @@ def test_deploy_md_documents_that_mcp_deploys_before_the_deployer_stack():
     assert "confirm_upload" in sec, "没给排障锚点（顺序错时会看到的报错原文）"
 
 
-def test_cdk_out_note_also_covers_dependency_manifest_changes():
-    """CDK 的 asset hash **不含挂载卷里的清单内容**（实测：两份不同 lockfile 算出
-    同一个 asset），所以"只改 `bundling-requirements.txt` 不改 `app.py`"时真机会复用
-    旧产物、新清单当次不生效。现有那句 `rm -rf cdk.out` 只提了 config.ini，
-    覆盖到这一条是巧合不是设计 ⇒ 要写成显式条件。
+def test_cdk_out_note_says_mounted_inputs_are_hashed_not_cleared():
+    """CDK 默认 asset hash **不含挂载卷的内容**（锁定清单、contract/）。原来的处方是"改了就
+    `rm -rf cdk.out`"——实测**不成立**：重打的包是新字节，但 S3Key 不变，`cdk deploy` 照样跳过
+    上传与更新。修法是 `infra/bundle_hash.py` 把挂载内容算进 hash。
+
+    ⇒ 文档要写清：机理（挂载卷）、为什么清 cdk.out 没用、核对办法（`cdk diff` 看 Code 变化）；
+    并且**不许**再有任何一行把 `rm -rf cdk.out` 当成清单 / 合同改动的处方。
     """
     txt = _read(DEPLOY)
-    hits = [ln for ln in txt.splitlines()
-            if "rm -rf cdk.out" in ln and ("清单" in ln or "requirements" in ln)]
-    assert hits, "没有任何一处把「改依赖清单」列进必须 rm -rf cdk.out 的条件"
-    win = _window(txt, hits[0].strip()[:40], after=6)
-    assert "asset" in win, "没说明原因（asset hash 不含挂载卷内容）"
-    assert "挂载卷" in win or "asset-input" in win, "原因写得不足以让人判断适用范围"
+    bad = [ln for ln in txt.splitlines()
+           if "必须 `rm -rf cdk.out`" in ln and ("清单" in ln or "contract" in ln)]
+    assert not bad, f"还有把 rm -rf cdk.out 当成清单/合同改动处方的旧说法：{bad}"
+    win = _window(txt, "改依赖清单（`bundling-requirements.txt`）或 `site-builder/contract/`",
+                  after=10)
+    assert "挂载卷" in win, "没说明机理（挂载卷不进默认 asset hash）"
+    assert "救不了" in win, "没说清 rm -rf cdk.out 为什么没用——下一个人会照旧处方做"
+    assert "bundle_hash" in win and "cdk diff" in win, "没给修法与核对办法"
 
 
 def test_deploy_md_says_bundling_copies_the_contract_package():
