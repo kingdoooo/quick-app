@@ -17,6 +17,8 @@ from aws_cdk import (App, CfnOutput, Duration, Environment, RemovalPolicy, Size,
                      aws_stepfunctions_tasks as tasks)
 from constructs import Construct
 
+from bundle_hash import bundle_asset_hash
+
 CFG = configparser.ConfigParser()
 CFG.read(Path(__file__).parents[2] / "config.ini")
 ACCOUNT = CFG["Platform"]["account_id"]
@@ -566,6 +568,59 @@ class SiteDeployerStack(Stack):
             "ACCOUNT_ID": ACCOUNT,
         }
 
+        step_bundling = {
+        "image": lam_.Runtime.PYTHON_3_13.bundling_image,
+        # 钉死 amd64：Lambda 默认 x86_64，Apple Silicon 上不钉平台
+        # 会装出 aarch64 的 psycopg 二进制导致运行时 import 失败
+        "platform": "linux/amd64",
+        # --require-hashes 装锁定清单，不再裸装 'psycopg[binary]' sqlparse：
+        # 这些函数建 per-site IAM 角色、写路由表、连 DSQL admin，是执行器
+        # 的 TCB；范围声明意味着每次 deploy 都可能装到不同版本。清单里有
+        # hash 但装时不校验等于什么都没做，所以开关和清单必须一起改。
+        #
+        # **合同包用 cp 而不是 pip**（Codex 复审 P1-b）：contract 是 PEP 517
+        # 项目（`requires = ["setuptools>=68"]` + setuptools.build_meta），
+        # `pip install /asset-contract` 在默认 build isolation 下会**联网
+        # 下载并执行**一个未锁版本、未锁 hash 的 setuptools，而它的输出进的
+        # 是全部 site-deployer-* 产物。只锁上面那条 install、放开构建后端，
+        # 等于闭包根本没闭（实测：加 `--no-index` 后它直接报
+        # "Could not find a version that satisfies the requirement
+        # setuptools>=68"，证明那一步真的在向外拿东西）。
+        # **cp 安全的依据**：site-contract 是本仓库自己的纯 Python 包、
+        # `dependencies = []`，且没有任何代码读它的 dist 元数据（grep 过
+        # functions/、contract/src/、mcp/：无 importlib.metadata /
+        # pkg_resources 消费方）⇒ 装出来的 site-packages 与直接拷包目录
+        # 对 import 完全等价，少一整条构建工具链。
+        # 顺带清掉宿主机的 `__pycache__`：pip 是从源码建 wheel（不带
+        # pycache），cp 会把开发机上用别的 Python 版本编出来的 .pyc 一起
+        # 塞进产物——它们在 Lambda 上只会被忽略，但让同一份源码产出的
+        # 工件随开发机状态变化。
+        #
+        # **挂载卷的内容不进 CDK 默认的 asset hash**（ledger 实测：两份不同的
+        # lockfile 算出同一个 asset.14ea085b…）——它只看 /asset-input（functions/）。
+        # 原来的处方"改 contract/ 或锁定清单后 `rm -rf cdk.out`"**不够**：重打的包是新
+        # 字节，但 S3Key 不变 ⇒ 上传与 Lambda 更新都被跳过（2026-09-27 实测）。所以
+        # hash 改由 bundle_asset_hash 覆盖全部进包输入，见下面的 step_reads。
+        "command": ["bash", "-c",
+                    "pip install --require-hashes -r "
+                    "/asset-locks/bundling-requirements.txt "
+                    "-t /asset-output -q && "
+                    f"cp -r /asset-input/. /asset-output/ && "
+                    "cp -r /asset-contract/contract /asset-output/ && "
+                    "find /asset-output/contract -name __pycache__ "
+                    "-type d -prune -exec rm -rf {} +"],
+        # 挂 contract/src（= contract_dir）而不是它的父目录：父目录是整个
+        # `contract/`，把 `contract/.venv`、build/、tests/ 一并暴露给构建
+        # 容器，而容器里真正需要的只有 `src/contract` 这一个包目录。
+        "volumes": [{"hostPath": contract_dir,
+                     "containerPath": "/asset-contract"},
+                    {"hostPath": locks_dir,
+                     "containerPath": "/asset-locks"}]}
+        # 每个挂载里命令**实际读**的宿主路径——bundle_asset_hash 只 hash 这些，且要求与
+        # volumes 一一对应（新加挂载不声明就在 synth 期抛错）。改了 command 读的东西就改这里。
+        step_reads = {"/asset-contract": [Path(contract_dir) / "contract"],
+                      "/asset-locks": [Path(locks_dir) / "bundling-requirements.txt"]}
+
         def step_fn(name: str, handler: str, timeout_s: int = 120,
                     ephemeral_mb: int | None = None,
                     role: iam.IRole | None = None) -> lam_.Function:
@@ -574,54 +629,10 @@ class SiteDeployerStack(Stack):
                 self, name, function_name=f"site-deployer-{handler}",
                 runtime=lam_.Runtime.PYTHON_3_13,
                 handler=f"{handler}.handler",
-                code=lam_.Code.from_asset(fn_dir, bundling={
-                    "image": lam_.Runtime.PYTHON_3_13.bundling_image,
-                    # 钉死 amd64：Lambda 默认 x86_64，Apple Silicon 上不钉平台
-                    # 会装出 aarch64 的 psycopg 二进制导致运行时 import 失败
-                    "platform": "linux/amd64",
-                    # --require-hashes 装锁定清单，不再裸装 'psycopg[binary]' sqlparse：
-                    # 这些函数建 per-site IAM 角色、写路由表、连 DSQL admin，是执行器
-                    # 的 TCB；范围声明意味着每次 deploy 都可能装到不同版本。清单里有
-                    # hash 但装时不校验等于什么都没做，所以开关和清单必须一起改。
-                    #
-                    # **合同包用 cp 而不是 pip**（Codex 复审 P1-b）：contract 是 PEP 517
-                    # 项目（`requires = ["setuptools>=68"]` + setuptools.build_meta），
-                    # `pip install /asset-contract` 在默认 build isolation 下会**联网
-                    # 下载并执行**一个未锁版本、未锁 hash 的 setuptools，而它的输出进的
-                    # 是全部 site-deployer-* 产物。只锁上面那条 install、放开构建后端，
-                    # 等于闭包根本没闭（实测：加 `--no-index` 后它直接报
-                    # "Could not find a version that satisfies the requirement
-                    # setuptools>=68"，证明那一步真的在向外拿东西）。
-                    # **cp 安全的依据**：site-contract 是本仓库自己的纯 Python 包、
-                    # `dependencies = []`，且没有任何代码读它的 dist 元数据（grep 过
-                    # functions/、contract/src/、mcp/：无 importlib.metadata /
-                    # pkg_resources 消费方）⇒ 装出来的 site-packages 与直接拷包目录
-                    # 对 import 完全等价，少一整条构建工具链。
-                    # 顺带清掉宿主机的 `__pycache__`：pip 是从源码建 wheel（不带
-                    # pycache），cp 会把开发机上用别的 Python 版本编出来的 .pyc 一起
-                    # 塞进产物——它们在 Lambda 上只会被忽略，但让同一份源码产出的
-                    # 工件随开发机状态变化。
-                    #
-                    # **挂载卷的内容不进 CDK asset hash**（ledger 实测：两份不同的
-                    # lockfile 算出同一个 asset.14ea085b…）——asset hash 只看
-                    # /asset-input 那个源目录（functions/）。所以改 contract/ 或改锁定
-                    # 清单之后**必须 `rm -rf cdk.out`**，否则 CDK 复用旧 asset，
-                    # 部署出去的还是上一次的字节。
-                    "command": ["bash", "-c",
-                                "pip install --require-hashes -r "
-                                "/asset-locks/bundling-requirements.txt "
-                                "-t /asset-output -q && "
-                                f"cp -r /asset-input/. /asset-output/ && "
-                                "cp -r /asset-contract/contract /asset-output/ && "
-                                "find /asset-output/contract -name __pycache__ "
-                                "-type d -prune -exec rm -rf {} +"],
-                    # 挂 contract/src（= contract_dir）而不是它的父目录：父目录是整个
-                    # `contract/`，把 `contract/.venv`、build/、tests/ 一并暴露给构建
-                    # 容器，而容器里真正需要的只有 `src/contract` 这一个包目录。
-                    "volumes": [{"hostPath": contract_dir,
-                                 "containerPath": "/asset-contract"},
-                                {"hostPath": locks_dir,
-                                 "containerPath": "/asset-locks"}]}),
+                code=lam_.Code.from_asset(
+                    fn_dir, bundling=step_bundling,
+                    # 默认 SOURCE hash 看不见挂载卷的内容：见 bundle_hash 模块头
+                    asset_hash=bundle_asset_hash(fn_dir, step_bundling, reads=step_reads)),
                 # 默认共用 exec_role；只有 validate 传自己的窄角色（见上）。
                 role=role or exec_role, timeout=Duration.seconds(timeout_s),
                 memory_size=512, environment=common_env,
