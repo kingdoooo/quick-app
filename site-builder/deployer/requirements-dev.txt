@@ -49,6 +49,6 @@ requests==2.34.2
 responses==0.26.2
 s3transfer==0.19.1
 six==1.17.0
-sqlparse==0.5.5
+sqlparse==0.6.0
 urllib3==2.7.0
 xmltodict==1.0.4

@@ -477,3 +477,20 @@ def test_bundling_lockfile_is_mounted_not_reached_via_asset_input_parent():
             assert "--require-hashes" in seg, (
                 f"装 {ref} 那条命令没有 --require-hashes，清单里的 hash 白列：{seg}")
     assert checked == 1, f"预期恰好一处 bundling 装锁定清单，实际 {checked} 处"
+
+
+DEPLOYER_DEV_REQ = Path(__file__).parents[2] / "deployer" / "requirements-dev.txt"
+
+
+def test_deployer_unit_tests_run_the_bundled_sqlparse():
+    """执行器的 SQL 切分（`provision_dsql` 的 `sqlparse.split`）在单测与 Lambda 里必须是同一版。
+
+    分叉时单测验的是另一个切分器：两版在某条边界语句上切法不同，单测绿、真机把语句切错
+    （03 号工单实测过 0.5.5 / 0.6.0 并存、只是碰巧 27 个用例一致）。住在这里，是因为这个
+    文件已经是 bundling 清单的守卫。
+    """
+    import re
+    pin = lambda p: dict(re.findall(r"^([a-zA-Z0-9_-]+)==([^ \\\n]+)", p.read_text(), re.M))  # noqa: E731
+    bundled, dev = pin(BUNDLING_REQ).get("sqlparse"), pin(DEPLOYER_DEV_REQ).get("sqlparse")
+    assert bundled and bundled == dev, \
+        f"sqlparse：Lambda 产物 {bundled} / deployer 单测 {dev}——改一侧就同步另一侧"
