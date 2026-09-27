@@ -135,3 +135,86 @@ def test_no_log_line_contains_raw_query_value(mock_sig, mock_lookup, caplog):
                                   querystring=f"code={secret}"), None)
     joined = "\n".join(r.getMessage() for r in caplog.records)
     assert secret not in joined, f"认证材料整值进了日志:\n{joined}"
+
+
+# ---------- M04：静态资源的 SigV4 路径（2026-09-27 真机判别实验）----------
+# 原来签的是 `quote(uri)`，而 CloudFront 交给 Edge 的 uri 是 viewer 发来的**已编码**形态
+# ⇒ `%20` 被编成 `%2520`，S3 回 403 SignatureDoesNotMatch。下表是真机结果（专用一次性路由 +
+# 同名对象，浏览器形态的请求路径；只有 plain 与裸括号是 200）。
+M04_REAL_MACHINE = [
+    # (Edge 收到的 uri, 真机旧代码下 S3 是否接受)
+    ("/plain.png", True),
+    ("/a%20b.png", False),
+    ("/logo(1).png", True),
+    ("/%E6%88%91.png", False),
+    ("/100%25.png", False),
+    ("/a%2520b.png", False),
+    ("/logo%281%29.png", False),
+]
+_UNRESERVED = set(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~")
+
+
+def _s3_side_canonical(received_path: str) -> str:
+    """**S3 侧**的 CanonicalURI：把收到的路径解码成对象键，再按 SigV4 规范逐字节编码
+    （unreserved 与 `/` 原样，其余 `%XX` 大写）。刻意手写、不用 urllib.quote——
+    与被测代码用同一个函数就成了自证。"""
+    raw, i, b = bytearray(), 0, received_path.encode()
+    while i < len(b):
+        if b[i] == ord("%") and i + 2 < len(b):
+            raw.append(int(b[i + 1:i + 3], 16))
+            i += 3
+        else:
+            raw.append(b[i])
+            i += 1
+    return "".join(chr(c) if c in _UNRESERVED or c == ord("/") else f"%{c:02X}" for c in raw)
+
+
+class _RecordingS3Auth:
+    """顶替 S3SigV4Auth：记下被签的 URL 路径（S3SigV4Auth 不规范化路径，签的就是它）。"""
+    paths: list = []
+
+    def __init__(self, *a, **k):
+        pass
+
+    def add_auth(self, aws_request):
+        from urllib.parse import urlsplit
+        _RecordingS3Auth.paths.append(urlsplit(aws_request.url).path)
+
+
+def _signed_vs_expected(uri: str):
+    _RecordingS3Auth.paths = []
+    with patch.object(orq, "_lookup_route", return_value=dict(ROUTE)), \
+            patch.object(orq, "S3SigV4Auth", _RecordingS3Auth):
+        req = orq.lambda_handler(_event(uri=uri), None)
+    assert req["origin"]["custom"]["domainName"].startswith("site-frontend-")
+    (signed,) = _RecordingS3Auth.paths
+    return signed, _s3_side_canonical(req["uri"])
+
+
+def test_m04_s3_side_model_reproduces_the_real_machine_table():
+    """正向控制：模拟器配**旧公式** `quote(uri)` 必须复现真机表——否则下一条的绿不代表 S3 会接受。"""
+    import urllib.parse
+    for uri, accepted in M04_REAL_MACHINE:
+        forwarded = f"/{ROUTE['static_prefix']}{uri}"
+        old_signed = urllib.parse.quote(forwarded)
+        assert (old_signed == _s3_side_canonical(forwarded)) is accepted, uri
+
+
+def test_m04_signed_path_is_what_s3_computes_for_every_real_machine_case():
+    bad = [(uri, s, e) for uri, _ in M04_REAL_MACHINE for s, e in [_signed_vs_expected(uri)]
+           if s != e]
+    assert not bad, f"签名路径 != S3 侧 CanonicalURI（S3 会回 SignatureDoesNotMatch）: {bad}"
+
+
+def test_m04_forwarded_uri_is_not_re_encoded():
+    """写回 request["uri"] 的仍是 viewer 的原样编码：S3 按它解码出对象键。"""
+    with patch.object(orq, "_lookup_route", return_value=dict(ROUTE)), \
+            patch.object(orq, "S3SigV4Auth", _RecordingS3Auth):
+        req = orq.lambda_handler(_event(uri="/%E6%88%91.png"), None)
+    assert req["uri"] == "/sites/demo1/job-aaa/%E6%88%91.png"
+
+
+def test_m04_decodes_bytes_not_utf8_text():
+    """单元级（非真机）：按字符串 unquote 会把非 UTF-8 序列换成 U+FFFD，签出来就不是 S3 解出的键。"""
+    signed, expected = _signed_vs_expected("/%FF.png")
+    assert signed == expected == "/sites/demo1/job-aaa/%FF.png"

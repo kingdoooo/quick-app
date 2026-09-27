@@ -1040,8 +1040,14 @@ def _add_s3_sigv4_auth(request, domain: str, uri: str) -> None:
     必须用 S3SigV4Auth 而非通用 SigV4Auth：S3 要求请求带 x-amz-content-sha256，
     通用 SigV4Auth 不生成该头，S3 会返回
     400 InvalidRequest "Missing required header for this request: x-amz-content-sha256"。
+
+    **签的路径 = S3 由收到的 `uri` 算出的 CanonicalURI**：先解码回对象键、再按 SigV4 编码一次。
+    CloudFront 交给 Edge 的 uri 是 viewer 发来的**已编码**形态，原来直接 `quote(uri)` 会把
+    `%20` 编成 `%2520` ⇒ 空格 / 中文 / `%` 文件名一律 403 SignatureDoesNotMatch（M04，
+    2026-09-27 真机判别实验坐实）。S3SigV4Auth 不对路径做规范化，所以这里给出的就是最终签名串。
+    按字节解码：`unquote` 对非 UTF-8 序列会替换成 U+FFFD，签出来就不是 S3 看到的那个键。
     """
-    url = f"https://{domain}{urllib.parse.quote(uri)}"
+    url = f"https://{domain}{urllib.parse.quote(urllib.parse.unquote_to_bytes(uri), safe='/')}"
     aws_request = AWSRequest(method="GET", url=url)
     S3SigV4Auth(credentials, "s3", "us-east-1").add_auth(aws_request)
     for h, v in aws_request.headers.items():
