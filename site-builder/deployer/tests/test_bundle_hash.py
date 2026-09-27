@@ -62,7 +62,9 @@ def test_every_bundle_input_moves_the_hash(tmp_path, mutate):
     assert _h(t) != before
 
 
-@pytest.mark.parametrize("junk", ["__pycache__/validate.cpython-312.pyc", "stale.pyc", ".DS_Store"])
+@pytest.mark.parametrize("junk", ["__pycache__/validate.cpython-312.pyc", "stale.pyc", ".DS_Store",
+                                  # 编译中途留下的原子写临时文件：不以 .pyc 结尾，只能靠目录规则挡
+                                  "__pycache__/validate.cpython-312.pyc.4389232"])
 def test_host_only_junk_does_not_move_the_hash(tmp_path, junk):
     """宿主机上跑测试留下的 pyc、Finder 的 .DS_Store 不能让同一份源码换 hash。"""
     root = tmp_path / "r"
