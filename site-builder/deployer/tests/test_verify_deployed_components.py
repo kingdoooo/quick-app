@@ -876,3 +876,94 @@ def test_the_edge_source_docstring_no_longer_claims_the_duplication_is_harmless(
     assert "版本敏感" in doc or "高度敏感" in doc, doc
     assert "相反结论" in doc or "相反的结论" in doc, "没有点出漂移的后果"
     assert "verify_deployed_edge.sh" in doc, "没有指出另一侧是谁"
+
+
+# ---------- ⑩ 站点 route → blue/green 可达性（merged review §9 第 3e 行）----------
+
+_U_BLUE = "https://blue-id.lambda-url.us-east-1.on.aws"
+_U_GREEN = "https://green-id.lambda-url.us-east-1.on.aws"
+
+
+def _reach(target, urls, auth="AWS_IAM", version="7"):
+    g = _gate()
+    import deploy_lambda_site as dls
+    live = dls._live_color(target, urls)
+    return g.site_reach_checks("app-x", target, urls, live,
+                               auth if live else None, version if live else None)
+
+
+def test_site_reach_green_when_route_points_at_a_published_iam_color():
+    """正对照：路由指着 green、URL 是 AWS_IAM、alias 指编号版本 ⇒ 三条全绿。"""
+    rows = _reach(_U_GREEN + "/", {"blue": _U_BLUE, "green": _U_GREEN})
+    assert [ok for ok, _, _ in rows] == [True, True, True]
+
+
+def test_site_reach_does_not_require_the_idle_color():
+    """首次部署只有 blue：idle 不存在**不是**失败（部署会自己建它）。"""
+    rows = _reach(_U_BLUE, {"blue": _U_BLUE})
+    assert all(ok for ok, _, _ in rows)
+
+
+@pytest.mark.parametrize("target,urls,auth,version,red", [
+    # 路由指向的不是任何一色（未迁移的 $LATEST URL / live 色的 URL 被删）⇒ 后两条的前提也不成立
+    ("https://latest-id.lambda-url.us-east-1.on.aws", {"blue": _U_BLUE}, "AWS_IAM", "7", [0, 1, 2]),
+    (_U_GREEN, {"blue": _U_BLUE}, "AWS_IAM", "7", [0, 1, 2]),
+    (_U_BLUE, {"blue": _U_BLUE}, "NONE", "7", [1]),
+    (_U_BLUE, {"blue": _U_BLUE}, "AWS_IAM", "$LATEST", [2]),
+], ids=["route-not-a-color", "live-color-url-gone", "auth-none", "alias-on-latest"])
+def test_site_reach_reds(target, urls, auth, version, red):
+    rows = _reach(target, urls, auth, version)
+    assert len(rows) == 3, "每个站点恒出 3 条——条数随状态变会让下限失去意义"
+    assert [i for i, (ok, _, _) in enumerate(rows) if not ok] == red
+
+
+def test_run_site_reachability_wires_the_production_helpers(monkeypatch):
+    """接线：分页扫路由表、只看带 api_target 的 `app-` 路由、颜色判定走生产 helper。"""
+    g = _gate()
+    pages = [{"Items": [{"subdomain": "console", "site_id": "", "api_target": "https://p"},
+                        {"subdomain": "app-s1", "site_id": "s1", "api_target": _U_BLUE}],
+              "LastEvaluatedKey": {"subdomain": "app-s1"}},
+             {"Items": [{"subdomain": "app-s2", "site_id": "s2", "api_target": ""},
+                        {"subdomain": "app-s3", "site_id": "s3", "api_target": _U_GREEN}]}]
+
+    class _Table:
+        def scan(self, **kw):
+            return pages[1] if "ExclusiveStartKey" in kw else pages[0]
+
+    class _Res:
+        def Table(self, name):
+            return _Table()
+
+    class _NotFound(Exception):
+        pass
+
+    urls = {("site-s1", "blue"): _U_BLUE, ("site-s3", "blue"): _U_BLUE}   # s3 的 green 被删了
+
+    class _Lam:
+        class exceptions:
+            ResourceNotFoundException = _NotFound
+
+        def get_function_url_config(self, FunctionName, Qualifier):
+            if (FunctionName, Qualifier) not in urls:
+                raise _NotFound()
+            return {"FunctionUrl": urls[(FunctionName, Qualifier)] + "/", "AuthType": "AWS_IAM"}
+
+        def get_alias(self, FunctionName, Name):
+            return {"FunctionVersion": "3"}
+
+    import boto3
+    monkeypatch.setattr(boto3, "resource", lambda *a, **k: _Res())
+    monkeypatch.setattr(boto3, "client", lambda *a, **k: _Lam())
+    monkeypatch.setattr(g, "read_cfg", lambda s, k: {"region": "us-east-1",
+                                                     "routing_table": "t"}[k])
+    g.results.clear()
+    floor = g.run_site_reachability()
+    names = [n for _, n, _ in g.results]
+    assert floor == g.MIN_SITE_REACH_CHECKS
+    assert len(g.results) == 1 + 3 * 2, names          # 枚举 1 + s1 / s3 各 3；console 与静态 s2 不看
+    assert [ok for ok, _, _ in g.results] == [True, True, True, True, False, False, False]
+
+
+def test_site_reachability_counts_toward_the_floor():
+    src = _SCRIPT.read_text()
+    assert "min_expected += run_site_reachability()" in src

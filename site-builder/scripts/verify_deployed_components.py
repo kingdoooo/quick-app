@@ -6,7 +6,7 @@
 "部署产物 == 本地源码"这件事只能有一个脚本回答。**旧名不留 shim**：两个入口
 会让人只跑其中一个，而漏掉的那个正好是没覆盖的层。
 
-九段（缺一不可）：
+十段（缺一不可）：
   ① 合同 scanner 的真实项目风格判定——合规写法一个都不能误拦；
   ② 已知绕过与真违规一个都不能放过；
      （①② 是纯本地判定，--local 时只跑这两段。x-user-name 那条红线进过
@@ -37,6 +37,9 @@
      + 每个副本 ACTIVE + 聚合表开着 deletion protection + Edge 角色对明细表
      **有且只有 PutItem 且资源逐字覆盖每个副本区** + 无写扩权 + rollup 规则
      ENABLED / cron / target 是 rollup 函数。
+  ⑩ 站点 route → blue/green 可达性：每条带 `api_target` 的 `app-` 路由都要指向该站点
+     某一色 alias 的 Function URL（颜色判定用 `deploy_lambda_site` 的生产 helper），且那一色
+     是 AWS_IAM、alias 指编号版本。idle 色只报告不断言（首次部署只有 blue）。
 
 **⑨ 为什么只能在真机上验**：副本清单有三条腿，而它们分处两个包——router 栈
 给 edge_role 的 PutItem 资源集合与 Edge 代码的 `ACCESS_REPLICA_REGIONS` 都从
@@ -57,7 +60,7 @@
 提交之前；auth 的 SSM TTL 修复在仓库里躺了两天没上线。
 
 用法：
-    ./verify_deployed_components.py           # 全部九段
+    ./verify_deployed_components.py           # 全部十段
     ./verify_deployed_components.py --local   # 只跑 ①②（无 AWS 凭证时）
 """
 import argparse
@@ -109,6 +112,10 @@ MIN_KEY_PROXY_ABSENT_CHECKS = 5
 # Edge 角色 4（读到策略/只有 PutItem/资源逐字/无扩权）+ rollup 规则 3
 # （ENABLED/cron/target）= 12。**无条件计入**——M5 不是可选组件。
 MIN_ANALYTICS_CHECKS = 12
+# ⑩ 站点可达性：每个带 api_target 的站点恒出 3 条，但站点数是运行时事实（新账号可能一个
+# fullstack 站点都没有）⇒ 下限只记枚举那 1 条。
+MIN_SITE_REACH_CHECKS = 1
+SITE_ROUTE_PREFIX = "app-"
 # 实际下限由 main() 按"这次真跑了哪几段"累加，finally 里读它。初值是本地那部分
 # ——main() 之前就崩掉时走的是 crashed 分支，不靠这个值。
 min_expected = MIN_LOCAL_CHECKS
@@ -1121,6 +1128,73 @@ def run_mcp_and_route() -> None:
     _check_frontend_bucket_has_no_expiry(bucket, region)
 
 
+def site_reach_checks(subdomain: str, api_target: str, urls: dict, live: str | None,
+                      auth_type: str | None, alias_version: str | None) -> list[tuple]:
+    """一个站点路由的三条可达性判定。**恒出三条**：条数随状态变会让下限失去意义。
+
+    `urls` / `live` 由生产 helper（`deploy_lambda_site._color_urls` / `_live_color`）算出，
+    这里不另写一份颜色判定。live 认不出来时后两条的前提不成立，照样记 FAIL 而不是跳过。
+    **idle 色不断言**：首次部署只有 blue，而 idle 缺失时下一次部署会自己建它。
+    """
+    colors = ",".join(sorted(urls)) or "无"
+    rows = [(live is not None,
+             f"{subdomain}：路由的 api_target 是某一色 alias 的 Function URL",
+             f"live={live or '认不出'}；已存在的颜色 URL：{colors}")]
+    if live is None:
+        why = "前提不成立：路由没指向任何一色（未迁移，或 live 色的 alias/URL 被删）"
+        rows += [(False, f"{subdomain}：live 色 Function URL 是 AWS_IAM", why),
+                 (False, f"{subdomain}：live 色 alias 指向编号版本", why)]
+        return rows
+    rows += [(auth_type == "AWS_IAM", f"{subdomain}：live 色 Function URL 是 AWS_IAM",
+              f"{live}: {auth_type}"),
+             (bool(alias_version) and alias_version != "$LATEST",
+              f"{subdomain}：live 色 alias 指向编号版本（未经健康门的 $LATEST 不得上线）",
+              f"{live} → {alias_version}")]
+    return rows
+
+
+def run_site_reachability() -> int:
+    """⑩ 站点 route → blue/green alias 可达性（merged review §9 第 3e 行）。
+
+    此前没有任何闸门看站点 alias：live 色的 alias 或 URL 丢了 ⇒ 站点 API 挂掉而部署侧
+    一切正常；idle 色丢了 ⇒ 回滚（`previous_route` 指向旧色）落空。返回它承诺的下限。
+    """
+    import boto3
+    import deploy_lambda_site as dls
+    print("\n── ⑩ 站点 route → blue/green 可达性 ──────────────────")
+    region = read_cfg("Platform", "region")
+    table = boto3.resource("dynamodb", region_name=region).Table(
+        read_cfg("Platform", "routing_table"))
+    routes, kw = [], {}
+    while True:
+        page = table.scan(ConsistentRead=True, **kw)
+        routes += page.get("Items", [])
+        if "LastEvaluatedKey" not in page:
+            break
+        kw["ExclusiveStartKey"] = page["LastEvaluatedKey"]
+    # 静态站点（无 api_target）没有 Lambda；平台子域的 api_target 是平台函数，不是 blue/green
+    sites = sorted((r for r in routes if str(r.get("subdomain", "")).startswith(SITE_ROUTE_PREFIX)
+                    and r.get("api_target")), key=lambda r: r["subdomain"])
+    check(bool(routes), "读到路由表（站点可达性的前提）",
+          f"{len(routes)} 条路由，带 api_target 的站点 {len(sites)} 个")
+    lam = boto3.client("lambda", region_name=region)
+    for r in sites:
+        fn = f"site-{r['site_id']}"        # 与 deploy_lambda_site / undeploy / mark_job 同一约定
+        urls = dls._color_urls(lam, fn)
+        live = dls._live_color(str(r["api_target"]), urls)
+        auth = version = None
+        if live:
+            auth = lam.get_function_url_config(FunctionName=fn, Qualifier=live)["AuthType"]
+            version = lam.get_alias(FunctionName=fn, Name=live)["FunctionVersion"]
+        for ok, name, detail in site_reach_checks(r["subdomain"], str(r["api_target"]),
+                                                  urls, live, auth, version):
+            check(ok, name, detail)
+        idle = [c for c in dls.COLORS if c != live]
+        print(f"        idle 色 {'/'.join(idle)}：{'有' if any(c in urls for c in idle) else '无'} URL"
+              "（只报告：首次部署没有 idle，缺失时下次部署会建）")
+    return MIN_SITE_REACH_CHECKS
+
+
 def _check_frontend_bucket_has_no_expiry(bucket: str, region: str) -> None:
     """前端桶上**不许**有覆盖 `sites/` 的 Enabled 过期规则。
 
@@ -1820,6 +1894,7 @@ def main() -> int:
         run_panel()
         run_mcp_and_route()
         min_expected += MIN_DEPLOYED_CHECKS + _min_param_checks()
+        min_expected += run_site_reachability()
         # ⑧ 只在组件启用时计入下限（返回值就是它承诺的最小项数）
         min_expected += run_key_proxy()
         # ⑨ 无条件计入：M5 统计管道不是可选组件
