@@ -2343,3 +2343,54 @@ def test_idp_flag_help_says_isolation_only():
     import inspect
     src = inspect.getsource(dp.main)
     assert src.count("仅隔离运行可用") == 2, "两个旗标的 help 都要写明"
+
+
+# ---------- M10：mcp client 的回调不被裸重跑吊销 ----------
+
+def _run_ensure_clients_with_live_callbacks(site_live: list, mcp_live: list, extra: list):
+    """真 boto3 client + Stubber：线上两个 client 已存在、各带若干回调，重跑 _ensure_clients。"""
+    import boto3
+    from botocore.stub import Stubber
+    cog = boto3.client("cognito-idp", region_name="us-east-1",
+                       aws_access_key_id="t", aws_secret_access_key="t")
+    captured = _capture_update_params(cog)
+    with Stubber(cog) as stub:
+        stub.add_response("list_user_pool_clients", {"UserPoolClients": _two_existing_clients()},
+                          {"UserPoolId": "us-east-1_x", "MaxResults": 60})
+        for name, cid, live in (("site-builder-site", "c-site", site_live),
+                                ("site-builder-mcp", "c-mcp", mcp_live)):
+            stub.add_response("describe_user_pool_client",
+                              {"UserPoolClient": {"ClientId": cid, "ClientName": name,
+                                                  "CallbackURLs": live}},
+                              {"UserPoolId": "us-east-1_x", "ClientId": cid})
+            stub.add_response("update_user_pool_client",
+                              {"UserPoolClient": {"ClientId": cid}}, None)
+        dp._ensure_clients(cog, "us-east-1_x", "example.com", extra, "Okta")
+        stub.assert_no_pending_responses()
+    return {p["ClientName"]: p for p in captured}
+
+
+def test_bare_rerun_keeps_out_of_band_mcp_callbacks():
+    """M10：UpdateUserPoolClient 整体替换 ⇒ 原来裸重跑会把 `--mcp-callback` 加过的回调吊销。
+    改成与 IdP client 同一个先例：并集，不替换。"""
+    extra = "https://agentcore.example/identities/cb"
+    got = _run_ensure_clients_with_live_callbacks(
+        ["https://auth.example.com/callback"], [dp.MCP_LOCALHOST_CALLBACK, extra], [])
+    assert sorted(got["site-builder-mcp"]["CallbackURLs"]) == \
+        sorted([dp.MCP_LOCALHOST_CALLBACK, extra])
+
+
+def test_mcp_callback_flag_adds_to_live_callbacks():
+    old, new = "https://a.example/cb", "https://b.example/cb"
+    got = _run_ensure_clients_with_live_callbacks(
+        ["https://auth.example.com/callback"], [dp.MCP_LOCALHOST_CALLBACK, old], [new])
+    assert sorted(got["site-builder-mcp"]["CallbackURLs"]) == \
+        sorted([dp.MCP_LOCALHOST_CALLBACK, old, new])
+
+
+def test_site_client_callbacks_stay_declared_not_unioned():
+    """并集只给 mcp：site client 的回调是平台自有的唯一一条，漂移了就该被纠回。"""
+    got = _run_ensure_clients_with_live_callbacks(
+        ["https://auth.example.com/callback", "https://stale.example/cb"],
+        [dp.MCP_LOCALHOST_CALLBACK], [])
+    assert got["site-builder-site"]["CallbackURLs"] == ["https://auth.example.com/callback"]

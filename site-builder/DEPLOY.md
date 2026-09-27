@@ -1886,8 +1886,15 @@ pre-token 触发器、managed login branding。命令与实测基线见前面
    mcp client 另需确认**没有 secret**（public client）且回调含
    `http://localhost:18765/callback`（给 Claude Code 等本机客户端的 OAuth 用；
    Cognito 不支持 dynamic client registration，端口选 18765 是因为 8765/8766
-   被 Quick Desktop 的 quickwork-agent 常驻占用，详见 `docs/client-setup.md`）
-   与 AgentCore 的 identities 回调。
+   被 Quick Desktop 的 quickwork-agent 常驻占用，详见 `docs/client-setup.md`）。
+   **不需要** AgentCore 的 identities 回调：MCP 入站鉴权是 AgentCore 校验 Cognito 签发的
+   access token，OAuth 回调只发生在本机客户端与 Cognito 之间（identities 回调属于
+   AgentCore Identity 的出站 OAuth，本平台不用）。
+
+   别的 MCP 客户端需要另一个固定回调时，加 `--mcp-callback <URL>`（可重复）：
+   `python3 site-builder/scripts/deploy_pool.py --mcp-callback https://…/callback`。
+   mcp client 的回调在重跑时**取并集**——之后不带这个旗标重跑不会把它摘掉；要撤掉一个
+   回调，去 Cognito 控制台手工删。
 
    > Cognito 的 `/logout` **不登出上游 IdP**（飞书会话仍在），所以 UI 文案不能
    > 承诺"已完全退出"。

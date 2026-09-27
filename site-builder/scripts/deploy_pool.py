@@ -42,6 +42,11 @@ from api_key_config import (api_key_enabled, machine_scope,  # noqa: E402
 
 POOL_NAME = "site-builder-users"
 MCP_LOCALHOST_CALLBACK = "http://localhost:18765/callback"
+# 更新时 CallbackURLs **取并集、不替换**的 client（M10）。mcp 的回调是运营方可扩展的
+# （`--mcp-callback`，给别的 MCP 客户端），而 UpdateUserPoolClient 是整体替换 ⇒ 不这样做，
+# 一次不带旗标的裸重跑就会把它们吊销。代价：要撤掉一个回调得去 Cognito 控制台手工删。
+# site client 不在此列：它的回调是平台自有的唯一一条，漂移了就该被纠回。
+UNION_CALLBACK_CLIENTS = frozenset({"mcp"})
 
 # spec §3.5 第 4 条：org 边界 = app client 不开任何原生认证 flow。
 # 只留 refresh（正常会话续期需要）。加入下面任何一项即打破边界：
@@ -895,13 +900,17 @@ def _ensure_clients(cog, pool_id: str, base_domain: str,
         name = params["ClientName"]
         if name in existing:
             client_id = existing[name]
-            desired = params
-            if not idp_name and key in federated:
-                # 无 [IdP] 段 → 不声明这个字段，交给 read-modify-write 保留现值
-                desired = {k: v for k, v in params.items()
-                           if k != "SupportedIdentityProviders"}
+            keep_providers = not idp_name and key in federated
+            # 无 [IdP] 段 → 不声明这个字段，交给 read-modify-write 保留现值；
+            # 回调取并集的 client 也先不声明 CallbackURLs，下面合并
+            omit = ({"SupportedIdentityProviders"} if keep_providers else set()) \
+                | ({"CallbackURLs"} if key in UNION_CALLBACK_CLIENTS else set())
+            desired = {k: v for k, v in params.items() if k not in omit}
             update = _client_update_params(cog, pool_id, existing[name], desired)
-            if desired is not params:
+            if key in UNION_CALLBACK_CLIENTS:
+                update["CallbackURLs"] = sorted(
+                    set(update.get("CallbackURLs") or []) | set(params["CallbackURLs"]))
+            if keep_providers:
                 live = update.get("SupportedIdentityProviders")
                 print(f"  {name}: 无 [IdP] 段 → 保留线上 IdP 名单 "
                       f"{live if live else '（线上未显式设置，同样不动）'}")
@@ -1310,7 +1319,8 @@ def main() -> None:
     ap.add_argument("--domain-prefix", default="site-builder-auth",
                     help="Cognito 托管域名前缀（全局唯一）")
     ap.add_argument("--mcp-callback", action="append", default=[],
-                    help="额外的 MCP 回调 URL（如 AgentCore identities 回调），可重复")
+                    help="额外的 MCP 回调 URL（给别的 MCP 客户端的固定回调），可重复。"
+                         "重跑时与线上已登记的取并集，不带本旗标重跑不会摘掉它们")
     # 标准 IdP spike 用独立临时 pool：在生产 pool 上换 [IdP] 重跑会把飞书从
     # 生产 client 的 SupportedIdentityProviders 里移除，线上登录立即中断
     # （Task 15 Step 7）。默认仍是生产 pool 名。
