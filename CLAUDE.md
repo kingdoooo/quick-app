@@ -35,8 +35,8 @@ Quick 自动化建站平台（Site Builder）：业务人员在任意支持 Skil
 
 **具体进度与闸门数字不写在本文件**（会过时）：确切数字靠下面的测试命令自己跑；
 **待办与优先级**见 `docs/reviews/MERGED-ADVERSARIAL-REVIEW-2026-08-21.md` §9
-（**随仓库分发**，是"还剩什么"的真源）。二期需求清单在
-`docs/phase2-requirements.md`；部署手册 `site-builder/DEPLOY.md` 含全部实测坑。
+（**随仓库分发**，是"还剩什么"的真源）。v1 之后的方向统一叫 **phase-3**，候选出处是
+phase-2 设计 spec 的 §11（维护者本机另有 gitignored 的 `docs/phase3.md` 汇总）；部署手册 `site-builder/DEPLOY.md` 含全部实测坑。
 `docs/design/` 下的 HANDOFF / FINDINGS 是当时的过程记录，**gitignored、不随仓库分发**，
 新 clone 里不存在——**不要把它们当状态真源**。
 
@@ -399,7 +399,7 @@ JWT。别"顺手补齐"这个名单。
 | **3c 冒充面的可复跑证据** | `site-builder/scripts/probe_impersonation_surface.py`（**tracked**，只读，约 20 分钟）→ `docs/security/3c-impersonation-surface.json`（**gitignored、新 clone 里没有**——它是单账号计数，不是闸门也没有基线；要用就重跑探针重新生成，名字只进 gitignored dump）。**`--self-test` 不碰 AWS**，反例与变形测试在 `deployer/tests/test_probe_impersonation_surface.py` |
 | 加固包的设计与实施 | `docs/superpowers/specs/2026-08-22-s1-isolation-and-auth-hardening-spec.md` + `docs/superpowers/plans/2026-08-22-s1-isolation-and-auth-hardening.md`；存量环境的升级/闸门/回滚见 `site-builder/DEPLOY.md` 的「S1 加固」一节 |
 | 一期设计决策与范围 | `docs/superpowers/specs/2026-07-21-quick-site-builder-design.md`（已实现快照，勿改） |
-| 二期设计与需求 | `docs/superpowers/specs/2026-07-30-quick-site-builder-phase2-design.md`；需求清单 `docs/phase2-requirements.md` |
+| 二期设计与需求 | `docs/superpowers/specs/2026-07-30-quick-site-builder-phase2-design.md`（§11 = phase-3 候选） |
 | 任务级实现/审查证据链 | `.superpowers/sdd/<计划日期>-<计划名>/progress.md`（**gitignored**、每个 plan 一个目录；`.superpowers/sdd/progress.md` 那个扁平路径是一期的旧布局） |
 | 各里程碑实测发现 | `docs/design/M{3,4,5}-FINDINGS.md`、`M4-SPIKE-2026-08-10.md`、`M7-SPEC-2026-08-16.md`（**gitignored**；含可复用的断言自查清单，已验证过的别再跑一遍） |
 | 历史过程记录 | `docs/design/HANDOFF-2026-08-07.md`（**gitignored**；写到二期为止——**不是**状态真源） |

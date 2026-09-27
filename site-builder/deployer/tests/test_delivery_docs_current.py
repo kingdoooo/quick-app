@@ -1479,8 +1479,7 @@ def test_deploy_md_readiness_for_built_in_cognito_is_config_only():
 # （这与 _STATUS_FREE_DOCS 那条方向相反，别混）。风险是采用者把其中某一段当成
 # 操作步骤照做：那些步骤是对**当时那个环境**说的。所以每一份自己在文件头声明。
 _DECISION_RECORD_GLOBS = ("docs/superpowers/specs/*.md", "docs/superpowers/plans/*.md",
-                          "docs/reviews/*.md", "docs/security/*.md",
-                          "docs/phase2-requirements.md")
+                          "docs/reviews/*.md", "docs/security/*.md")
 _DECISION_BANNER = "决策记录，不是操作指引"
 
 

@@ -2836,8 +2836,7 @@ key-proxy / auth 服务 / auth pre-token / CodeBuild / MCP 的 AgentCore runtime
 `docs/superpowers/specs/2026-07-30-quick-site-builder-phase2-design.md` §6.3
 （原文：「原始 Edge 日志组统一设 30 天保留」），M5 spec 的 §0.3 与 M3 计划各引用了它。
 这些都是**已实现快照 / 历史决策记录**，按仓库惯例不回改（见 CLAUDE.md「勿改」约定），
-所以**现行策略只看本节**。`docs/phase2-requirements.md` 只写了"参照日志组 30 天先例"，
-没定策略。
+所以**现行策略只看本节**。
 
 **方向决定有损与否**：30→90 无损（只让日志活得更久，可反复运行）；反向的 90→30 有损
 （超过 30 天的日志被标记删除、约 72 小时内物理删除，事后调回也找不回）。把**未设**
