@@ -73,7 +73,7 @@ acc = boto3.client("bedrock-agentcore-control", region_name=REGION)
 
 def _run(cmd: list[str], **kw) -> None:
     print(f"  $ {' '.join(cmd)}")
-    subprocess.run(cmd, check=True, **kw)
+    subprocess.run(cmd, check=True, **kw)  # nosemgrep: dangerous-subprocess-use-audit —— argv 列表、不经 shell，参数来自仓库路径与常量
 
 
 def ensure_repo() -> str:
@@ -308,7 +308,7 @@ def ensure_role() -> str:
         arn = iam.create_role(
             RoleName=ROLE_NAME, AssumeRolePolicyDocument=trust,
             Tags=[{"Key": "project", "Value": "site-builder"}])["Role"]["Arn"]
-        time.sleep(10)  # IAM 传播
+        time.sleep(10)  # IAM 传播  nosemgrep: arbitrary-sleep —— IAM 传播：新角色要几秒才对 Lambda 可见，没有可轮询的完成信号
 
     policy = {"Version": "2012-10-17", "Statement": [
         # 拉自建镜像：缺这两个动作 runtime 起不来（镜像在本账号私有 ECR）

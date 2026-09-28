@@ -420,7 +420,7 @@ def ensure_role() -> str:
         PolicyDocument=json.dumps({"Version": "2012-10-17",
                                    "Statement": role_statements()}))
     if created:
-        time.sleep(10)      # IAM 传播
+        time.sleep(10)      # IAM 传播  nosemgrep: arbitrary-sleep —— IAM 传播：新角色要几秒才对 Lambda 可见，没有可轮询的完成信号
     return arn
 
 
@@ -486,7 +486,7 @@ def ensure_function(role_arn: str, code: bytes, edge_role_id_value: str) -> str:
             except lam.exceptions.InvalidParameterValueException:
                 if attempt == 5:
                     raise
-                time.sleep(5)   # 新角色尚未传播
+                time.sleep(5)   # 新角色尚未传播  nosemgrep: arbitrary-sleep —— 重试退避（有次数上限）
         lam.get_waiter("function_active").wait(FunctionName=FN_NAME)
 
     try:
@@ -532,7 +532,8 @@ def upload_frontend() -> int:
     existing = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
     if existing.get("KeyCount"):
         local = {prefix + str(p.relative_to(src)):
-                 hashlib.md5(p.read_bytes()).hexdigest()
+                 # 只用来与 S3 的 ETag 比对（非分段上传的 ETag 即 MD5），不是安全用途
+                 hashlib.md5(p.read_bytes(), usedforsecurity=False).hexdigest()
                  for p in sorted(src.rglob("*")) if p.is_file()}
         for obj in existing.get("Contents", []):
             key, remote = obj["Key"], obj.get("ETag", "").strip('"')

@@ -126,7 +126,7 @@ def run_query(logs, group: str, start: int, end: int, timeout_s: int = 120) -> d
             break
         if time.monotonic() > deadline:
             raise SystemExit(f"Logs Insights 查询超时：{group}")
-        time.sleep(1.0)
+        time.sleep(1.0)  # nosemgrep: arbitrary-sleep —— 轮询间隔（循环有截止条件）
     if res["status"] != "Complete":
         raise SystemExit(f"Logs Insights 查询 {res['status']}：{group}")
     return parse_results(res["results"])

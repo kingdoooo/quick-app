@@ -284,7 +284,7 @@ def main(fixture_dir: str, owner: str = "fixture@e2e.invalid", *,
         if job["status"] in ("SUCCEEDED", "FAILED"):
             print(json.dumps(job, indent=2, ensure_ascii=False, default=str))
             sys.exit(0 if job["status"] == "SUCCEEDED" else 1)
-        time.sleep(10)
+        time.sleep(10)  # nosemgrep: arbitrary-sleep —— 轮询间隔（循环有截止条件）
 
 
 def cli(argv=None) -> None:

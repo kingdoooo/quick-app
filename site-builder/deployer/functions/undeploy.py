@@ -119,10 +119,10 @@ def _purge_dsql(site_id: str) -> str:
                              f"{sorted(expected_roles)}）——查询条件可能被改坏")
                 continue
             try:
-                cur.execute(f"AWS IAM REVOKE {role} FROM '{arn}'")
+                cur.execute(f"AWS IAM REVOKE {role} FROM '{arn}'")  # nosemgrep: sqlalchemy-execute-raw-query —— 标识符来自已校验的 site_id；DSQL 的 DDL 与 AWS IAM GRANT/REVOKE 不能参数化
             except Exception as e:
                 logger.warning(f"REVOKE {role} <- {arn} 失败: {e}")
-        cur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        cur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')  # nosemgrep: sqlalchemy-execute-raw-query —— 标识符来自已校验的 site_id；DSQL 的 DDL 与 AWS IAM GRANT/REVOKE 不能参数化
         # **schema 没了，已应用标记也必须清掉**，否则重新部署会跳过 schema.sql ⇒
         # 站点起来但一张表都没有，且**静默**（部署报 SUCCEEDED）。
         # 落点：`DROP SCHEMA` 之后（schema 真没了才清）、`DROP ROLE` 循环之前
@@ -135,7 +135,7 @@ def _purge_dsql(site_id: str) -> str:
         common.upsert_site(site_id, migrations_applied=[])
         for role in (f"{schema}_app", f"{schema}_mig"):
             try:
-                cur.execute(f"DROP ROLE IF EXISTS {role}")
+                cur.execute(f"DROP ROLE IF EXISTS {role}")  # nosemgrep: sqlalchemy-execute-raw-query —— 标识符来自已校验的 site_id；DSQL 的 DDL 与 AWS IAM GRANT/REVOKE 不能参数化
             except Exception as e:
                 logger.warning(f"DROP ROLE {role} 失败: {e}")
         return f"purged schema {schema} + roles"

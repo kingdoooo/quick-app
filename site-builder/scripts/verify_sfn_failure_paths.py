@@ -150,7 +150,7 @@ def main() -> int:
                 return True
             if time.time() >= deadline:
                 return False
-            time.sleep(3)
+            time.sleep(3)  # nosemgrep: arbitrary-sleep —— 轮询间隔（循环有截止条件）
 
     def probe_update(jid: str, expr: str, names: dict, values: dict) -> None:
         """改 job 行的**唯一入口**：不在本轮 probe_jobs 里的 job_id 一律拒绝。
@@ -373,7 +373,7 @@ def main() -> int:
                 st = sfn.describe_execution(executionArn=arn)["status"]
                 if st != "RUNNING":
                     break
-                time.sleep(1)
+                time.sleep(1)  # nosemgrep: arbitrary-sleep —— 轮询间隔（循环有截止条件）
             if st == "ABORTED":
                 return jid, st
             print(f"  ⓘ 第 {i + 1} 次探针执行终态是 {st}（没抢在 Validate 快速"

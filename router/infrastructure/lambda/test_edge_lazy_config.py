@@ -274,7 +274,8 @@ def test_route_table_client_is_built_on_first_use_not_at_import():
 
 def test_route_table_client_is_cached_after_the_first_build():
     mod = _load(DYNAMODB_REGION="us-east-1")
-    assert mod._ddb() is mod._ddb()
+    first, second = mod._ddb(), mod._ddb()
+    assert first is second, "第二次调用又新建了 client——缓存没生效"
 
 
 def test_route_lookup_goes_through_the_lazy_accessor():

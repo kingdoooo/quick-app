@@ -36,7 +36,7 @@ def handler(event, context):
                                f"{build.get('logs', {}).get('deepLink', 'n/a')}")
         if time.time() > deadline:
             raise PackageError("依赖打包超时（13 分钟）")
-        time.sleep(5)
+        time.sleep(5)  # nosemgrep: arbitrary-sleep —— 轮询间隔（循环有截止条件）
 
     event["backend_zip_key"] = f"artifacts/{event['job_id']}/backend.zip"
     return event

@@ -175,12 +175,13 @@ def validate(text: str, tag: str) -> None:
         tmp.unlink(missing_ok=True)
 
 SUITES = [
-    ("contract",  "site-builder/contract",           ".venv/bin/pytest tests -q"),
-    ("auth",      "site-builder/auth",               "../contract/.venv/bin/pytest tests -q"),
-    ("router",    "router/infrastructure/lambda",    "../../../site-builder/deployer/.venv/bin/pytest . -q"),
-    ("deployer",  "site-builder/deployer",           ".venv/bin/pytest tests -q"),
-    ("panel",     "site-builder/panel",              "../deployer/.venv/bin/pytest tests -q"),
-    ("key-proxy", "site-builder/key-proxy",          "../deployer/.venv/bin/pytest tests -q"),
+    # argv 列表、不经 shell：相对路径的解释器按 cwd 解析（subprocess 在 exec 之前先切 cwd）
+    ("contract",  "site-builder/contract",        [".venv/bin/pytest", "tests", "-q"]),
+    ("auth",      "site-builder/auth",            ["../contract/.venv/bin/pytest", "tests", "-q"]),
+    ("router",    "router/infrastructure/lambda", ["../../../site-builder/deployer/.venv/bin/pytest", ".", "-q"]),
+    ("deployer",  "site-builder/deployer",        [".venv/bin/pytest", "tests", "-q"]),
+    ("panel",     "site-builder/panel",           ["../deployer/.venv/bin/pytest", "tests", "-q"]),
+    ("key-proxy", "site-builder/key-proxy",       ["../deployer/.venv/bin/pytest", "tests", "-q"]),
 ]
 
 def suite_failures(stdout: str, stderr: str) -> list:
@@ -202,7 +203,7 @@ def suite_failures(stdout: str, stderr: str) -> list:
 def run_all(tag):
     bad = []
     for name, cwd, cmd in SUITES:
-        r = subprocess.run(cmd, shell=True, cwd=ROOT / cwd, capture_output=True, text=True)
+        r = subprocess.run(cmd, cwd=ROOT / cwd, capture_output=True, text=True)  # nosemgrep: dangerous-subprocess-use-audit —— argv 列表、不经 shell，参数来自仓库路径与常量
         tail = [l for l in r.stdout.strip().splitlines() if l.strip()][-1:] or [""]
         status = "ok " if r.returncode == 0 else "RED"
         print(f"  [{tag}] {status} {name:10} {tail[0][:70]}")

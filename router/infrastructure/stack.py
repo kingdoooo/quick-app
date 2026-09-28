@@ -289,7 +289,7 @@ def vendor_edge_dependencies(target_dir: str) -> None:
     失败，而那是全站 502）。`--require-hashes` 是全量语义，清单里任何一个包缺 hash 都会让这条
     install 直接失败——守卫在 auth/tests/test_requirements_locked.py（清单 + 本函数的 argv）。
     """
-    subprocess.run([sys.executable, "-m", "pip", "install", "--require-hashes",
+    subprocess.run([sys.executable, "-m", "pip", "install", "--require-hashes",  # nosemgrep: dangerous-subprocess-use-audit —— argv 列表、不经 shell，参数来自仓库路径与常量
                     "-r", str(EDGE_REQUIREMENTS), "--target", target_dir, "-q",
                     "--platform", "manylinux2014_x86_64", "--only-binary", ":all:",
                     "--python-version", "3.11", "--implementation", "cp"], check=True)

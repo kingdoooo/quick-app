@@ -318,7 +318,7 @@ def main() -> int:
                 status, url = last.get("status", ""), last.get("url", "")
                 if status in ("SUCCEEDED", "FAILED"):
                     break
-            time.sleep(10)
+            time.sleep(10)  # nosemgrep: arbitrary-sleep —— 轮询间隔（循环有截止条件）
         check(status == "SUCCEEDED" and bool(url),
               "轮询到 SUCCEEDED 且返回站点 URL",
               f"status={status} url={url}" if status == "SUCCEEDED"
@@ -590,7 +590,7 @@ def _cleanup_site(ddb, sites_table: str, routing_table: str, site_id: str,
             or {}).get("status")
         if route_gone and status == "DELETED":
             break
-        time.sleep(10)
+        time.sleep(10)  # nosemgrep: arbitrary-sleep —— 轮询间隔（循环有截止条件）
     check(bool(route_gone) and status == "DELETED",
           f"站点 {site_id} 已下线并读回确认（路由行消失 + status=DELETED）",
           f"route_gone={route_gone} status={status}")

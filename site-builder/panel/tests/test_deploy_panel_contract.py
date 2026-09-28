@@ -943,7 +943,7 @@ def test_upload_is_idempotent_when_content_matches(monkeypatch):
     for p in sorted(src.rglob("*")):
         if p.is_file():
             key = dp.frontend_prefix() + "/" + str(p.relative_to(src))
-            etags[key] = '"%s"' % hashlib.md5(p.read_bytes()).hexdigest()
+            etags[key] = '"%s"' % hashlib.md5(p.read_bytes(), usedforsecurity=False).hexdigest()
 
     class FakeS3:
         def list_objects_v2(self, **kw):

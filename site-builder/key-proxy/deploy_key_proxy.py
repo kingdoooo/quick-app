@@ -419,7 +419,7 @@ def ensure_role(cfg=None) -> str:
         PolicyDocument=json.dumps({"Version": "2012-10-17",
                                    "Statement": role_statements(cfg)}))
     if created:
-        time.sleep(10)      # IAM 传播
+        time.sleep(10)      # IAM 传播  nosemgrep: arbitrary-sleep —— IAM 传播：新角色要几秒才对 Lambda 可见，没有可轮询的完成信号
     return arn
 
 
@@ -449,7 +449,7 @@ def ensure_function(role_arn: str, code: bytes, edge_role_id_value: str,
             except lam.exceptions.InvalidParameterValueException:
                 if attempt == 5:
                     raise
-                time.sleep(5)   # 新角色尚未传播
+                time.sleep(5)   # 新角色尚未传播  nosemgrep: arbitrary-sleep —— 重试退避（有次数上限）
         lam.get_waiter("function_active").wait(FunctionName=FN_NAME)
 
     try:

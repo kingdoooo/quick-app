@@ -217,7 +217,7 @@ def _changed_paths() -> list[str]:
     out: list[str] = []
     for argv in (["git", "diff", "--name-only", "-z", "HEAD"],
                  ["git", "ls-files", "--others", "--exclude-standard", "-z"]):
-        r = subprocess.run(argv, capture_output=True, text=True, check=True,
+        r = subprocess.run(argv, capture_output=True, text=True, check=True,  # nosemgrep: dangerous-subprocess-use-audit —— argv 列表、不经 shell，参数来自仓库路径与常量
                            cwd=REPO)
         out += [p for p in r.stdout.split("\0") if p]
     return sorted(set(out))

@@ -168,7 +168,7 @@ _load_public_key_der = load_public_key_der      # 内部名别名；也是最后
 # 私钥已丢弃，公钥与签名都不是秘密；**不要用它签任何 token**。
 RS256_GOLDEN = {
     "spki_b64": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAx2eNvs12AANfSjqTYb85HR0pX6TUwA5kQpmCWGDJwEOl1ckHHzAHdWPDBNCHwaiZyC7fnvzqy3a41abvxvX5gzLZdfdRYkGJNx05/T3u6t5d2F87TtYIIvRkpJKEFKWlkrfIk00iOV/fjF04CFy0j6GXIHEKJ3Yg6SYFreqdCwg4Uh1xLKuK+NL7UyP15gOzEhXjG4yKR2FTZ9VEsxFe06sgG9+i3gS5kLIIJ+C7IJZhO8e9qNXGK6lAwX0ua/Oznq2dXGUfE4Nf9mrNimwtFjAw5Zx6Ro4nX7LxUifFeMmTjIgEywaiv9bzruWH9lNAYr23YznWwSgHWQc4bVi43QIDAQAB",
-    "signing_input": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImdvbGRlbi1ycy12MCJ9.eyJ0b2tlbl91c2UiOiJzaXRlLXNlc3Npb24iLCJhdWQiOiJzaXRlLWVkZ2UiLCJlbWFpbCI6ImdvbGRlbkBlMmUuaW52YWxpZCIsImV4cCI6MCwiaWF0IjowfQ",
+    "signing_input": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImdvbGRlbi1ycy12MCJ9.eyJ0b2tlbl91c2UiOiJzaXRlLXNlc3Npb24iLCJhdWQiOiJzaXRlLWVkZ2UiLCJlbWFpbCI6ImdvbGRlbkBlMmUuaW52YWxpZCIsImV4cCI6MCwiaWF0IjowfQ",  # nosemgrep: detected-jwt-token —— 黄金向量的 signing input（私钥已丢弃，不是凭证）
     "signature_b64": "P92df6Bjg13TN86Skcbup/uscO+/6JVap6jETiXYvCxLuiT7xQogdljNqPdRxAblz3qn+jlKwovcAUg+MBu5nhtjkxYdn/jbvI3Kj3ua02rNIKSIPxtDshWMWbEsH/XttCLmHuzVqKVA7b6YN0R9rk7KO076DkSgeAkY7/UZ0YvRWPQWOm8zAzEYGif0CfPpveqwssulc1WOTHlflEjj58oOKRx9QHImsYR/1FDIB2nbLJhkQ6GIfws+e8BIb6TJboK8f9V3UvXYiIp4AhZCNQp/aq+fxqeDo+foYvNfycFXxs8HVQS+3uYo8+qdiMG6/5LdNqN36qBUfDGjHig0lA==",
 }
 load_public_key_der(base64.b64decode(RS256_GOLDEN["spki_b64"])).verify(

@@ -236,7 +236,7 @@ def wait_for_row(ddb, table: str, site_id: str, day: str,
                 return it, round(time.time() - started, 1)
         if time.time() - started >= ROW_TIMEOUT:
             return None, round(time.time() - started, 1)
-        time.sleep(ROW_POLL)
+        time.sleep(ROW_POLL)  # nosemgrep: arbitrary-sleep —— 轮询间隔（循环有截止条件）
 
 
 def get_daily(ddb, site_id: str, date_s: str) -> dict | None:
@@ -443,7 +443,7 @@ def main() -> int:                                      # noqa: C901
             waited = round(time.time() - started, 1)
             if st_ready == 302 or waited >= ROUTE_READY_TIMEOUT:
                 break
-            time.sleep(ROUTE_READY_POLL)
+            time.sleep(ROUTE_READY_POLL)  # nosemgrep: arbitrary-sleep —— 轮询间隔（循环有截止条件）
         check(st_ready == 302,
               f"路由在 Edge 生效（轮询 ≤{ROUTE_READY_TIMEOUT}s，实际 {waited}s）",
               f"HTTP {st_ready}")
@@ -538,7 +538,7 @@ def main() -> int:                                      # noqa: C901
         check(ctrl is not None,
               f"正对照的明细行出现（实际 {waited}s）⇒ 上面三条负测不是空转",
               "" if ctrl is not None else "超时未出现，则三条负测什么都证明不了")
-        time.sleep(NEG_GRACE)       # 见 NEG_GRACE 的注释
+        time.sleep(NEG_GRACE)       # 见 NEG_GRACE 的注释  nosemgrep: arbitrary-sleep —— 负测的宽限期
 
         rows_today = query_rows(ddb, events_table, site_id, day)
         paths_today = {r.get("path", {}).get("S", "") for r in rows_today}

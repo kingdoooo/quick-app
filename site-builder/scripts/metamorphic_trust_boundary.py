@@ -428,7 +428,7 @@ _COUNT_RE = re.compile(r"(\d+) (passed|failed|error|errors|deselected|skipped)")
 
 
 def run_tests(k: str) -> tuple[int, str, dict[str, int]]:
-    r = subprocess.run(
+    r = subprocess.run(  # nosemgrep: dangerous-subprocess-use-audit —— argv 列表、不经 shell，参数来自仓库路径与常量
         [str(PYTEST), "tests/test_verify_account_trust_boundary.py",
          "tests/test_blind_spot_coverage.py", "-q", "-k", k,
          "--no-header", "-p", "no:cacheprovider"],
@@ -479,7 +479,7 @@ def why_not_loadable(path: Path) -> str | None:
     else:
         code = ("import pathlib,sys;p=r'%s';"
                 "compile(pathlib.Path(p).read_text(),p,'exec')" % path)
-    r = subprocess.run([str(PY), "-c", code], capture_output=True, text=True)
+    r = subprocess.run([str(PY), "-c", code], capture_output=True, text=True)  # nosemgrep: dangerous-subprocess-use-audit —— argv 列表、不经 shell，参数来自仓库路径与常量
     if r.returncode == 0:
         return None
     last = (r.stderr.strip().splitlines() or [""])[-1]

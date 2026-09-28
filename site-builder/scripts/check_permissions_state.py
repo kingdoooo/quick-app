@@ -220,7 +220,7 @@ def main() -> int:
                        1: "结果：检查未能完成 —— 状态不可信",
                        2: "结果：发现鉴权字段不一致"}[rc])
                 return rc
-        time.sleep(5)
+        time.sleep(5)  # nosemgrep: arbitrary-sleep —— 轮询间隔（循环有截止条件）
 
 
 if __name__ == "__main__":

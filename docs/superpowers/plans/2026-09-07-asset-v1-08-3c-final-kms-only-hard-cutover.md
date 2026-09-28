@@ -4351,9 +4351,9 @@ CFG = textwrap.dedent("""
 """)
 CFG_OFF = CFG.replace("fixture_issuer = true", "fixture_issuer = false")
 URL = "https://abc.lambda-url.us-east-1.on.aws/"
-TOKEN = "eyJhbGciOiJSUzI1NiJ9.eyJlbWFpbCI6InByb2JlQGUyZS5pbnZhbGlkIn0.c2ln"
-CODE = "eyJhbGciOiJSUzI1NiJ9.eyJqdGkiOiJ4In0.c2ln"
-CONSOLE = "eyJhbGciOiJSUzI1NiJ9.eyJ0b2tlbl91c2UiOiJjb25zb2xlLXNlc3Npb24ifQ.c2ln"
+TOKEN = "eyJhbGciOiJSUzI1NiJ9.eyJlbWFpbCI6InByb2JlQGUyZS5pbnZhbGlkIn0.c2ln"  # nosemgrep: detected-jwt-token —— 假 JWT 夹具，签名段就是 "sig" gitleaks:allow
+CODE = "eyJhbGciOiJSUzI1NiJ9.eyJqdGkiOiJ4In0.c2ln"  # nosemgrep: detected-jwt-token —— 假 JWT 夹具，签名段就是 "sig" gitleaks:allow
+CONSOLE = "eyJhbGciOiJSUzI1NiJ9.eyJ0b2tlbl91c2UiOiJjb25zb2xlLXNlc3Npb24ifQ.c2ln"  # nosemgrep: detected-jwt-token —— 假 JWT 夹具，签名段就是 "sig" gitleaks:allow
 
 
 class FakeSession:

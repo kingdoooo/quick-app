@@ -121,6 +121,14 @@ const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
 
 /* 控制台是**管理界面**：在这里执行脚本就能改权限。站点名 / 邮箱 / job 错误串
  * 都来自他人，一律经 esc() 才能进 innerHTML。 */
+/* 全页唯一的 HTML 写入点。传进来的串都由本文件的模板函数拼成，动态值一律经 esc()——
+ * test_frontend_contract 的 test_all_interpolated_values_go_through_esc 逐行卡死这一点。
+ * 静态扫描（semgrep 的 insecure-innerhtml / insecure-document-method）看不见 esc()，所以把
+ * 原先散在各处的 sink 收成这一处、在这一处标注；新代码不要直接写 `.innerHTML`（有守卫）。 */
+function setHTML(el, html) {
+  el.innerHTML = html; // nosemgrep: insecure-innerhtml, insecure-document-method —— 动态值已逐个 esc()，见上
+}
+
 function esc(v) {
   return String(v == null ? '' : v).replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -347,28 +355,28 @@ function toast(title, body, kind) {
   const type = kind || 'ok';
   const el = document.createElement('div');
   el.className = 'toast ' + type;
-  el.innerHTML =
+  setHTML(el,
     '<span class="tmark">' + (type === 'err' ? ICON.err : type === 'info' ? ICON.info : ICON.ok) + '</span>' +
     '<span><span class="ttitle">' + esc(title) + '</span>' +
     (body ? '<span class="tbody" style="display:block">' + esc(body) + '</span>' : '') + '</span>' +
-    '<button class="tclose" type="button" aria-label="关闭">×</button>';
+    '<button class="tclose" type="button" aria-label="关闭">×</button>');
   $('#toasts').appendChild(el);
   const kill = () => el.remove();
   $('.tclose', el).addEventListener('click', kill);
   setTimeout(kill, type === 'err' ? 9000 : 4600);
 }
 
-function closeModal() { $('#modal-root').innerHTML = ''; }
+function closeModal() { setHTML($('#modal-root'), ''); }
 
 function openModal(opts) {
-  $('#modal-root').innerHTML =
+  setHTML($('#modal-root'),
     '<div class="scrim" data-scrim><div class="modal' + (opts.wide ? ' wide' : '') +
       '" role="dialog" aria-modal="true">' +
       '<div class="modal-head"><h2>' + esc(opts.title) + '</h2>' +
         (opts.desc ? '<p class="meta" style="margin-top:4px">' + esc(opts.desc) + '</p>' : '') + '</div>' +
       '<div class="modal-body">' + opts.body + '</div>' +
       '<div class="modal-foot">' + opts.footer + '</div>' +
-    '</div></div>';
+    '</div></div>');
   $('[data-scrim]').addEventListener('mousedown', (ev) => {
     if (ev.target.hasAttribute('data-scrim')) closeModal();
   });
@@ -481,18 +489,18 @@ function renderNav() {
     html += '<div class="nav-label">平台管理</div>';
     html += item('#/admin', 'shield', '全局管理', p === 'admin');
   }
-  $('#nav-main').innerHTML = html;
+  setHTML($('#nav-main'), html);
   $('#user-email').textContent = state.me ? state.me.email : '';
   $('#user-avatar').textContent = state.me ? initials(state.me.email) : '';
 }
 
 function renderCrumb(items) {
-  $('#breadcrumb').innerHTML = items.map((it, i) => {
+  setHTML($('#breadcrumb'), items.map((it, i) => {
     const sep = i ? '<span class="meta" style="opacity:.6">/</span>' : '';
     return sep + (it.href
       ? '<a class="meta" href="' + it.href + '" style="color:var(--muted)">' + esc(it.label) + '</a>'
       : '<span style="font-size:13px;font-weight:500">' + esc(it.label) + '</span>');
-  }).join('');
+  }).join(''));
 }
 
 /* ══ 页面 1：站点列表 ════════════════════════════════════════════════ */
@@ -501,14 +509,14 @@ async function pageSites() {
   const view = $('#view');
   const all = state.siteScope === 'all' && state.me.is_admin;
   renderCrumb([{ label: all ? '全部站点' : '我的站点' }]);
-  view.innerHTML = skeletonPage();
+  setHTML(view, skeletonPage());
 
   let sites;
   try {
     const res = await apiGet(all ? '/api/sites?all=1' : '/api/sites');
     sites = res.sites || [];
   } catch (err) {
-    view.innerHTML = errorCard('无法加载站点列表', err);
+    setHTML(view, errorCard('无法加载站点列表', err));
     return;
   }
 
@@ -545,7 +553,7 @@ async function pageSites() {
   } else {
     html += '<section class="site-grid">' + rows.map(siteCard).join('') + '</section>';
   }
-  view.innerHTML = html;
+  setHTML(view, html);
 
   $$('#scope-switch button').forEach((b) => b.addEventListener('click', () => {
     state.siteScope = b.dataset.scope;
@@ -683,7 +691,7 @@ async function pageSite() {
   const siteId = state.route.siteId;
   const tab = state.route.tab;
   renderCrumb([{ label: '我的站点', href: '#/sites' }, { label: siteId }]);
-  view.innerHTML = skeletonPage();
+  setHTML(view, skeletonPage());
 
   let site;
   try {
@@ -691,7 +699,7 @@ async function pageSite() {
   } catch (err) {
     /* 403 的文案与"不存在"**故意是同一句**（api.do_get_site 的注释）：
      * 能区分存在性就是站点枚举探测器。这里照样只显示后端给的话。 */
-    view.innerHTML = errorCard('无法打开该站点', err);
+    setHTML(view, errorCard('无法打开该站点', err));
     return;
   }
 
@@ -715,7 +723,7 @@ async function pageSite() {
 
   const tabs = [['overview', '概览'], ['access', '权限'], ['deploys', '部署历史'],
                 ['analytics', '访问统计']];
-  view.innerHTML =
+  setHTML(view,
     '<section><div class="row-between" style="align-items:flex-start;margin-bottom:18px">' +
       '<div><div class="row" style="gap:10px"><h1 class="mono" style="font-size:22px">' +
         esc(site.name || site.site_id) + '</h1>' + siteStatusBadge(site, dstate) +
@@ -738,7 +746,7 @@ async function pageSite() {
     '<div class="tabs" role="tablist">' + tabs.map((t) =>
       '<button class="tab" role="tab" data-tab="' + t[0] + '" aria-selected="' +
       (t[0] === tab) + '">' + esc(t[1]) + '</button>').join('') +
-    '</div></section><div id="tabpanel"></div>';
+    '</div></section><div id="tabpanel"></div>');
 
   $('#copy-url').addEventListener('click', () => {
     if (navigator.clipboard) navigator.clipboard.writeText(site.url);
@@ -862,7 +870,7 @@ function neverLiveCallout(site, st) {
 
 function renderOverviewTab(panel, site, st) {
   const job = st.latest;
-  panel.innerHTML =
+  setHTML(panel,
     '<section style="display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr);gap:16px">' +
       '<div class="card"><div class="card-head"><h2>站点信息</h2>' +
         '<span class="meta">创建于 ' + esc(when(site.created_at)) + '</span></div>' +
@@ -916,7 +924,7 @@ function renderOverviewTab(panel, site, st) {
               (job.error ? '<div class="callout danger" style="margin-top:12px">' + ICON.err +
                 '<span>' + esc(job.error) + '</span></div>' : '')
             : '<p class="meta">暂无部署记录。</p>') +
-        '</div></div></div></section>' + dangerZone(site);
+        '</div></div></div></section>' + dangerZone(site));
 }
 
 /* ── 权限页 ─────────────────────────────────────────────────────────── */
@@ -940,7 +948,7 @@ function renderAccessTab(panel, site) {
   const draft = (state.draft && state.draft.site_id === site.site_id) ? state.draft : fresh;
   state.draft = draft;
 
-  panel.innerHTML =
+  setHTML(panel,
     '<section style="display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr);' +
       'gap:16px;align-items:start">' +
       '<div class="stack" style="gap:16px">' +
@@ -1006,10 +1014,10 @@ function renderAccessTab(panel, site) {
           '<button class="btn btn-danger" id="transfer-btn" type="button"' +
             (mayManage ? '' : ' disabled') + '>转移所有权…</button>' +
           (mayManage ? '' : '<p class="meta">你不是该站点所有者，无法转移所有权。</p>') +
-        '</div></div></div></section>';
+        '</div></div></div></section>');
 
   function renderAllowList() {
-    $('#allow-list').innerHTML =
+    setHTML($('#allow-list'),
       '<div class="taginput" id="allow-tags">' +
         draft.allowed_users.map((e) => '<span class="etag">' + esc(e) +
           '<button type="button" data-rm="' + esc(e) + '" aria-label="移除 ' + esc(e) +
@@ -1017,7 +1025,7 @@ function renderAccessTab(panel, site) {
         '<input id="allow-input" placeholder="输入邮箱后回车添加"' +
           (mayPolicy ? '' : ' disabled') + ' /></div>' +
       '<p class="meta" style="margin-top:6px">当前 ' + draft.allowed_users.length +
-        ' 人 · 回车或逗号分隔添加，<span class="kbd">Backspace</span> 删除最后一个</p>';
+        ' 人 · 回车或逗号分隔添加，<span class="kbd">Backspace</span> 删除最后一个</p>');
     $$('#allow-tags [data-rm]').forEach((b) => b.addEventListener('click', () => {
       draft.allowed_users = draft.allowed_users.filter((e) => e !== b.dataset.rm);
       renderAllowList();
@@ -1047,14 +1055,14 @@ function renderAccessTab(panel, site) {
   function renderCollabs() {
     const list = $('#collab-list');
     if (!draft.collaborators.length) {
-      list.innerHTML = '<p class="meta">还没有协作者。所有者休假时，协作者可以代为查看与重新部署。</p>';
+      setHTML(list, '<p class="meta">还没有协作者。所有者休假时，协作者可以代为查看与重新部署。</p>');
       return;
     }
-    list.innerHTML = '<div class="taginput' + (mayManage ? '' : ' is-disabled') +
+    setHTML(list, '<div class="taginput' + (mayManage ? '' : ' is-disabled') +
       '" style="min-height:auto">' +
       draft.collaborators.map((e) => '<span class="etag">' + esc(e) +
         (mayManage ? '<button type="button" data-rmc="' + esc(e) + '" aria-label="移除 ' +
-          esc(e) + '">×</button>' : '') + '</span>').join('') + '</div>';
+          esc(e) + '">×</button>' : '') + '</span>').join('') + '</div>');
     $$('[data-rmc]').forEach((b) => b.addEventListener('click', async () => {
       const target = b.dataset.rmc;
       b.disabled = true;
@@ -1208,23 +1216,23 @@ function failedJobNote(job) {
 }
 
 async function renderDeploysTab(panel, site) {
-  panel.innerHTML = skeletonTable(4, 5);
+  setHTML(panel, skeletonTable(4, 5));
   let jobs;
   try {
     const res = await apiGet('/api/sites/' + encodeURIComponent(site.site_id) + '/jobs');
     jobs = res.jobs || [];
   } catch (err) {
-    panel.innerHTML = errorCard('无法加载部署历史', err);
+    setHTML(panel, errorCard('无法加载部署历史', err));
     return;
   }
 
   if (!jobs.length) {
-    panel.innerHTML = '<div class="card"><div class="empty"><h2>还没有部署记录</h2>' +
-      '<p>在 Agent 客户端里说「部署」后，这里会出现每次部署的阶段与结果。</p></div></div>';
+    setHTML(panel, '<div class="card"><div class="empty"><h2>还没有部署记录</h2>' +
+      '<p>在 Agent 客户端里说「部署」后，这里会出现每次部署的阶段与结果。</p></div></div>');
     return;
   }
 
-  panel.innerHTML = '<section class="card">' +
+  setHTML(panel, '<section class="card">' +
     '<div class="card-head"><div><h2>部署历史</h2>' +
       '<p class="meta" style="margin-top:2px">共 ' + jobs.length +
       ' 次 · 失败记录可展开查看阶段与错误摘要</p></div>' +
@@ -1254,7 +1262,7 @@ async function renderDeploysTab(panel, site) {
           esc(phaseText(job.phase)) + ' 阶段失败</strong><br />' +
           esc(job.error || '（这次失败没有留下错误摘要）') + '</span></div>' +
           '<p class="meta" style="margin-top:8px">' + esc(failedJobNote(job)) + '</p></td></tr>' : '');
-    }).join('') + '</tbody></table></div></section>';
+    }).join('') + '</tbody></table></div></section>');
 
   $$('[data-expand]').forEach((tr) => tr.addEventListener('click', () => {
     const i = tr.dataset.expand;
@@ -1315,8 +1323,8 @@ let analyticsGen = 0;
 function renderAnalyticsTab(panel, site) {
   const gen = ++analyticsGen;
   const reqQ = trendPref.q;               // 本次请求的档位，锁定，不随后续切换而变
-  panel.innerHTML = '<section class="card"><div class="card-body">' +
-    '<p class="meta">正在加载访问统计…</p></div></section>';
+  setHTML(panel, '<section class="card"><div class="card-body">' +
+    '<p class="meta">正在加载访问统计…</p></div></section>');
   const id = encodeURIComponent(site.site_id);
   /* 两个请求并发：趋势与明细互不依赖，串起来会让这一屏等两个 RTT。
    * 任一失败都进 catch —— 只画半屏并且不说原因，比整屏报错更难排查。 */
@@ -1333,7 +1341,7 @@ function renderAnalyticsTab(panel, site) {
      * viewBox 拉伸，悬浮层的命中运算也不用换算。拿不到宽度（测试 harness 的
      * DOM stub）就用 860 兜底。 */
     const chartW = Math.max(560, Math.min(1400, (panel.clientWidth || 908) - 48));
-    panel.innerHTML =
+    setHTML(panel,
       '<section class="card"><div class="card-head"><h2>访问趋势（' + range[1] + '）</h2>' +
         '<div class="row" style="gap:12px">' +
           '<div class="seg" id="trend-range">' + TREND_RANGES.map((r) =>
@@ -1350,13 +1358,13 @@ function renderAnalyticsTab(panel, site) {
       '<section class="card" style="margin-top:28px">' +
         '<div class="card-head"><h2>访问明细（近 7 天）</h2>' +
         '<span class="tag">含被拒记录</span></div>' +
-        '<div class="card-body tight">' + visitorTable(rows) + '</div></section>';
+        '<div class="card-body tight">' + visitorTable(rows) + '</div></section>');
     bindTrendControls(panel, site, series);
   }).catch((err) => {
     if (gen !== analyticsGen) return;     // 陈旧失败同样不许覆盖当前页
-    panel.innerHTML = '<section class="card"><div class="card-body">' +
+    setHTML(panel, '<section class="card"><div class="card-body">' +
       '<p class="meta">访问统计读取失败：' +
-      esc((err && err.message) || '未知错误') + '</p></div></section>';
+      esc((err && err.message) || '未知错误') + '</p></div></section>');
   });
 }
 
@@ -1756,17 +1764,17 @@ async function pageKeys() {
    * 那等于把"平台没启用这个功能"翻译成一串看不懂的错误。而这个事实
    * /api/me 已经告诉我们了，不需要再去问一次。 */
   if (!feat.deployed) {
-    view.innerHTML = keysHeader() + keysUndeployedCard();
+    setHTML(view, keysHeader() + keysUndeployedCard());
     return;
   }
-  view.innerHTML = keysHeader() + skeletonTable(3, 6);
+  setHTML(view, keysHeader() + skeletonTable(3, 6));
 
   let keys;
   try {
     const res = await apiGet('/api/keys');
     keys = res.keys || [];
   } catch (err) {
-    view.innerHTML = keysHeader() + errorCard('无法加载 API Key 列表', err);
+    setHTML(view, keysHeader() + errorCard('无法加载 API Key 列表', err));
     return;
   }
 
@@ -1786,12 +1794,12 @@ async function pageKeys() {
   }
   const gated = sw ? sw.enabled !== true : !feat.enabled;
 
-  view.innerHTML = keysHeader() +
+  setHTML(view, keysHeader() +
     (gated ? '<div class="callout warn" style="margin-bottom:16px">' + ICON.err +
       '<span>' + KEY_GATED_NOTE + '</span></div>' : '') +
     keysCreateCard() +
     keysListCard(keys, gated) +
-    (state.me.is_admin ? keySwitchCard(sw, swErr) : '');
+    (state.me.is_admin ? keySwitchCard(sw, swErr) : ''));
 
   bindKeysPage(keys);
 }
@@ -2051,14 +2059,14 @@ async function pageAdmin() {
   if (!state.me.is_admin) {
     /* 前端这层只是不显示入口；真正的拦截在后端（_require_admin 用强一致读
      * 判定，撤权立即生效）。手敲 #/admin 到这里也拿不到数据。 */
-    view.innerHTML = '<div class="card"><div class="empty"><div class="empty-mark">' +
+    setHTML(view, '<div class="card"><div class="empty"><div class="empty-mark">' +
       ICON.shield + '</div><h2>需要平台管理员权限</h2>' +
       '<p>你不在平台管理员名单里，没有全局管理入口。</p>' +
       '<div style="margin-top:18px"><a class="btn" href="#/sites">返回我的站点</a></div>' +
-      '</div></div>';
+      '</div></div>');
     return;
   }
-  view.innerHTML = skeletonPage();
+  setHTML(view, skeletonPage());
 
   const f = state.adminFilter;
   let sites = [];
@@ -2068,7 +2076,7 @@ async function pageAdmin() {
     sites = both[0].sites || [];
     admins = both[1].admins || [];
   } catch (err) {
-    view.innerHTML = errorCard('无法加载平台管理数据', err);
+    setHTML(view, errorCard('无法加载平台管理数据', err));
     return;
   }
 
@@ -2083,7 +2091,7 @@ async function pageAdmin() {
     return true;
   });
 
-  view.innerHTML =
+  setHTML(view,
     '<section><div style="margin-bottom:20px"><h1>平台管理</h1>' +
       '<p class="meta" style="margin-top:4px">全局站点视图与管理员名单 · ' +
       '所有写操作都会记入审计日志（ops-log）</p></div></section>' +
@@ -2133,7 +2141,7 @@ async function pageAdmin() {
           '<input class="input mono" id="admin-input" placeholder="name@example.com" ' +
             'style="flex:1" />' +
           '<button class="btn" id="admin-add" type="button">' + ICON.plus + '添加管理员</button>' +
-        '</div></div></section>';
+        '</div></div></section>');
 
   bindSearch('#a-q', (val) => { state.adminFilter.q = val; }, pageAdmin);
   $('#a-owner').addEventListener('change', (ev) => {
@@ -2256,8 +2264,8 @@ $('#user-chip').addEventListener('click', () => {
   } catch (err) {
     /* 未登录时 Edge 就已经 302 到登录页了，走不到这里。真到了这里说明
      * panel 本身有问题——如实说明，不要显示一个空壳控制台。 */
-    document.getElementById('view').innerHTML =
-      errorCard('控制台加载失败', err);
+    setHTML(document.getElementById('view'),
+      errorCard('控制台加载失败', err));
     return;
   }
 

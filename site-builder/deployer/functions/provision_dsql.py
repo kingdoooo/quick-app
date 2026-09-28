@@ -117,7 +117,7 @@ def handler(event, context):
     conn = _connect()
     try:
         cur = conn.cursor()
-        cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+        cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')  # nosemgrep: sqlalchemy-execute-raw-query —— 标识符来自已校验的 site_id；DSQL 的 DDL 与 AWS IAM GRANT/REVOKE 不能参数化
 
         # ---- catalog 守卫：marker 非空却查到 schema 是空的 = **已证明的失配** ----
         # undeploy 的 purge 路径只覆盖 5 条让 marker 失效的路径里的 1 条，另外 4 条是：
@@ -181,8 +181,8 @@ def handler(event, context):
             cur, f"AWS IAM GRANT {mig_role} TO '{exec_role_arn}'")
 
         # 站点运行时：只用不建；migrator：可建对象但仅限本 schema
-        cur.execute(f'GRANT USAGE ON SCHEMA "{schema}" TO {pg_role}')
-        cur.execute(f'GRANT USAGE, CREATE ON SCHEMA "{schema}" TO {mig_role}')
+        cur.execute(f'GRANT USAGE ON SCHEMA "{schema}" TO {pg_role}')  # nosemgrep: sqlalchemy-execute-raw-query —— 标识符来自已校验的 site_id；DSQL 的 DDL 与 AWS IAM GRANT/REVOKE 不能参数化
+        cur.execute(f'GRANT USAGE, CREATE ON SCHEMA "{schema}" TO {mig_role}')  # nosemgrep: sqlalchemy-execute-raw-query —— 标识符来自已校验的 site_id；DSQL 的 DDL 与 AWS IAM GRANT/REVOKE 不能参数化
         # migrator 新建的表自动授权给运行时 role。纯优化：DSQL 2026-04 起支持
         # ALTER DEFAULT PRIVILEGES，但 FOR ROLE 需调用者是该 role 成员，可能被拒。
         # 失败无损——每轮建库结尾都会对全部已存在表显式 GRANT（见阶段二末尾）。
@@ -198,7 +198,7 @@ def handler(event, context):
     mig_conn = _connect_as(mig_role)
     try:
         cur = mig_conn.cursor()
-        cur.execute(f'SET search_path = "{schema}"')
+        cur.execute(f'SET search_path = "{schema}"')  # nosemgrep: sqlalchemy-execute-raw-query —— 标识符来自已校验的 site_id；DSQL 的 DDL 与 AWS IAM GRANT/REVOKE 不能参数化
 
         def run_file(key: str, marker: str):
             body = s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode()

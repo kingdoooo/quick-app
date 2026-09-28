@@ -155,7 +155,7 @@ def main() -> int:
     print(f"碰撞物理表名：{pair.physical}\n")
 
     def deploy_fixture(fixture_dir: Path, site_id: str) -> tuple[int, str]:
-        p = subprocess.run(
+        p = subprocess.run(  # nosemgrep: dangerous-subprocess-use-audit —— argv 列表、不经 shell，参数来自仓库路径与常量
             [sys.executable, str(HERE / "deploy_fixture.py"), str(fixture_dir),
              "--site-id", site_id, "--owner", "probe@collision"],
             capture_output=True, text=True, timeout=900)
@@ -195,7 +195,7 @@ def main() -> int:
                 Key={"job_id": job_id}, ConsistentRead=True).get("Item", {})
             if job.get("status") in ("DELETED", "PURGE_FAILED", "FAILED"):
                 return job
-            time.sleep(5)
+            time.sleep(5)  # nosemgrep: arbitrary-sleep —— 轮询间隔（循环有截止条件）
         return {"status": "TIMEOUT", "job_id": job_id}
 
     def table_exists(name: str) -> bool:

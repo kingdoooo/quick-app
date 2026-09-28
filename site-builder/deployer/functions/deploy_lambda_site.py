@@ -111,7 +111,7 @@ def _health_check(lam, fn: str, qualifier: str) -> None:
             # "这个后端起不来"掩盖成"偶发抖动"，然后照样上线。
             if attempt == VERSION_READY_ATTEMPTS - 1:
                 raise
-            time.sleep(VERSION_READY_SLEEP)
+            time.sleep(VERSION_READY_SLEEP)  # nosemgrep: arbitrary-sleep —— 重试退避（有次数上限）
     else:
         # 只有 VERSION_READY_ATTEMPTS <= 0 才走到这里（循环体一次没进）。那是配置
         # 错，不是运行时状况——但不写这条 else，`resp` 就可能未绑定，症状会是
@@ -235,7 +235,7 @@ def handler(event, context):
             except lam.exceptions.InvalidParameterValueException:
                 if attempt == 5:
                     raise
-                time.sleep(5)
+                time.sleep(5)  # nosemgrep: arbitrary-sleep —— 重试退避（有次数上限）
         lam.get_waiter("function_active").wait(FunctionName=fn)
 
     # 不可变版本 → 指给**空闲色** → 健康门。线上那一色全程没被碰过。

@@ -222,7 +222,7 @@ def generate_key_material() -> dict:
     venv_py = REPO_ROOT / "site-builder" / "contract" / ".venv" / "bin" / "python"
     if not venv_py.exists():
         raise SystemExit(f"ABORT: {venv_py} missing (rebuild the contract venv)")
-    proc = subprocess.run(
+    proc = subprocess.run(  # nosemgrep: dangerous-subprocess-use-audit —— argv 列表、不经 shell，参数来自仓库路径与常量
         [str(venv_py), "-c", KEYGEN_SRC], capture_output=True, text=True, check=False
     )
     if proc.returncode != 0:
@@ -251,7 +251,7 @@ PIP_TARGET_FLAGS = [
 
 def pip_hash_of(wheel: Path) -> str:
     """sha256 via `pip hash`, cross-checked against a local digest."""
-    proc = subprocess.run(
+    proc = subprocess.run(  # nosemgrep: dangerous-subprocess-use-audit —— argv 列表、不经 shell，参数来自仓库路径与常量
         [sys.executable, "-m", "pip", "hash", str(wheel)],
         capture_output=True,
         text=True,
@@ -283,7 +283,7 @@ def generate_requirements(dest: Path) -> None:
             TOP_REQUIREMENT,
         ]
         log("pip download: " + " ".join(cmd[3:]))
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)  # nosemgrep: dangerous-subprocess-use-audit —— argv 列表、不经 shell，参数来自仓库路径与常量
         if proc.returncode != 0:
             raise SystemExit(
                 "ABORT: pip download failed (no fallback to native macOS wheels)\n"
@@ -332,7 +332,7 @@ def pip_install_pinned(target: Path) -> dict:
         str(target),
     ]
     log("pip install (hash-checked): " + " ".join(cmd[3:]))
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)  # nosemgrep: dangerous-subprocess-use-audit —— argv 列表、不经 shell，参数来自仓库路径与常量
     if proc.returncode != 0:
         raise SystemExit(
             "ABORT: hash-checked pip cross-install failed (no fallback to native wheels)\n"
@@ -505,7 +505,7 @@ def create_function(lam, name: str, zip_path: str, role_arn: str) -> None:
         except lam.exceptions.InvalidParameterValueException as exc:
             last_err = exc
             log(f"create_function {name}: role not propagated yet (attempt {attempt}); retrying")
-            time.sleep(5)
+            time.sleep(5)  # nosemgrep: arbitrary-sleep —— 重试退避（有次数上限）
     else:
         raise SystemExit(f"ABORT: create_function {name} failed after 8 attempts: {last_err}")
     lam.get_waiter("function_active_v2").wait(
@@ -521,7 +521,7 @@ def update_and_wait(lam, name: str, **kwargs) -> None:
             lam.update_function_configuration(FunctionName=name, **kwargs)
             break
         except lam.exceptions.ResourceConflictException:
-            time.sleep(3)
+            time.sleep(3)  # nosemgrep: arbitrary-sleep —— 重试退避（有次数上限）
     else:
         raise SystemExit(f"ABORT: update_function_configuration {name} stayed conflicted")
     lam.get_waiter("function_updated_v2").wait(
@@ -955,7 +955,7 @@ def main() -> int:
 
         role_arn = create_role(iam)
         log("sleeping 10 s for role propagation")
-        time.sleep(10)
+        time.sleep(10)  # nosemgrep: arbitrary-sleep —— IAM 传播：新角色要几秒才对 Lambda 可见，没有可轮询的完成信号
         for name, meta in ((FN_STDLIB, a_meta), (FN_VENDORED, b_meta)):
             create_function(lam, name, meta["zip_path"], role_arn)
 

@@ -1,0 +1,24 @@
+# gitleaks 的已知误报（ProbeScan 以 git 历史模式扫描，指纹 = 提交:文件:规则:行）。
+# 每一条都逐个核对过是假值，不是真实凭据：
+#   aws-access-token — AWS 官方文档里那把以 EXAMPLE 结尾的示例 access key（仓库自带的暂存区密钥扫描器的测试夹具 / 文档示例）
+#   generic-api-key  — 测试夹具：固定的假值（0123…cdef 十六进制、test-secret…、UUID 形态的 code、签名为 "sig" 的假 JWT）
+# 新增条目前先确认它确实是假值；真泄漏要轮换凭据并从历史中清除，不能加进这里。
+b89c06593fd80cc171ed166029dae2ac59f990ee:docs/superpowers/plans/2026-07-21-quick-site-builder.md:generic-api-key:626
+312ad22f384b3f4c7c2a12909b5c7475697b77d3:docs/superpowers/plans/2026-07-30-phase2-m1-m2-identity-and-permissions.md:aws-access-token:139
+6b96d36ce908eb4a393243cb1693ba6bbbe92a40:docs/superpowers/plans/2026-09-07-asset-v1-08-3c-final-kms-only-hard-cutover.md:generic-api-key:4191
+44aef8d04017f860f7c6d3f31d8b984ec7e96da9:router/infrastructure/lambda/test_origin_request.py:generic-api-key:129
+bf374f7748b0a2c2b3f1a5fd0778c34fee8e4b28:site-builder/auth/tests/test_session.py:generic-api-key:4
+34b87c5f5b0a3d8cf71fbd7ef90a4374ef15db09:site-builder/deployer/tests/test_scan_staged_secrets.py:aws-access-token:60
+8365a9c1114c0d0bd9622a9857276c5b38480733:site-builder/deployer/tests/test_scan_staged_secrets.py:aws-access-token:169
+8365a9c1114c0d0bd9622a9857276c5b38480733:site-builder/deployer/tests/test_scan_staged_secrets.py:aws-access-token:196
+fe80a9c45f4d7c14eeb145309d0e60947f6628ed:site-builder/deployer/tests/test_scan_staged_secrets.py:aws-access-token:234
+fe80a9c45f4d7c14eeb145309d0e60947f6628ed:site-builder/deployer/tests/test_scan_staged_secrets.py:aws-access-token:237
+fe80a9c45f4d7c14eeb145309d0e60947f6628ed:site-builder/deployer/tests/test_scan_staged_secrets.py:aws-access-token:244
+fe80a9c45f4d7c14eeb145309d0e60947f6628ed:site-builder/deployer/tests/test_scan_staged_secrets.py:aws-access-token:288
+fe80a9c45f4d7c14eeb145309d0e60947f6628ed:site-builder/deployer/tests/test_scan_staged_secrets.py:aws-access-token:295
+fe80a9c45f4d7c14eeb145309d0e60947f6628ed:site-builder/deployer/tests/test_scan_staged_secrets.py:aws-access-token:338
+fe80a9c45f4d7c14eeb145309d0e60947f6628ed:site-builder/deployer/tests/test_scan_staged_secrets.py:aws-access-token:355
+be0a544236171be2875510f6f5ddc73aa632c4a7:site-builder/deployer/tests/test_session_mint.py:generic-api-key:35
+f6c54ce6d84fbaf67aaccce667ca10d883935e4b:site-builder/deployer/tests/test_verify_deployed_components.py:generic-api-key:213
+f6c54ce6d84fbaf67aaccce667ca10d883935e4b:site-builder/deployer/tests/test_verify_deployed_components.py:generic-api-key:227
+34b87c5f5b0a3d8cf71fbd7ef90a4374ef15db09:site-builder/scripts/scan_staged_secrets.sh:aws-access-token:34

@@ -237,7 +237,7 @@ def ensure_verifier_role(iam, verification: Verification, *, account: str, regio
         PolicyDocument=json.dumps({"Version": "2012-10-17",
                                    "Statement": _verifier_invoke_statements(fn_arn, verifier_arn)}))
     if not exists:
-        import time; time.sleep(10)
+        import time; time.sleep(10)  # nosemgrep: arbitrary-sleep —— IAM 传播：新角色要几秒才对 Lambda 可见，没有可轮询的完成信号
     return verifier_arn
 
 
@@ -599,7 +599,7 @@ def ensure_lambda_role() -> str:
              "Resource": key_arns},
         ]}))
     if created:
-        import time; time.sleep(10)  # IAM 传播
+        import time; time.sleep(10)  # IAM 传播  nosemgrep: arbitrary-sleep —— IAM 传播：新角色要几秒才对 Lambda 可见，没有可轮询的完成信号
     return arn
 
 

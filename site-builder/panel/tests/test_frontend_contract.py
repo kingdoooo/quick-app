@@ -1072,6 +1072,36 @@ def test_all_interpolated_values_go_through_esc():
         f"{sorted(bad)[:8]}")
 
 
+_HTML_SINK_RE = re.compile(
+    r"\.(?:innerHTML|outerHTML)\s*(?:\+)?=(?!=)|\binsertAdjacentHTML\s*\(|\bdocument\.write(?:ln)?\s*\(")
+
+
+def _html_sinks(code: str) -> list:
+    return _HTML_SINK_RE.findall(code)
+
+
+def test_html_is_written_only_through_sethtml():
+    """全页只有 `setHTML()` 一处把串写进 DOM。
+
+    上一条（逐行查 esc）管的是**拼进去的值**；这一条管**写入点**：ProbeScan 的 semgrep 规则
+    insecure-innerhtml / insecure-document-method 看不见 esc()，所以 sink 收成 setHTML 一处并在
+    那里标注。新代码直接写 `.innerHTML =` 既绕开唯一入口，也会让扫描器重新报出来。
+    """
+    code = _js()
+    assert len(_html_sinks(code)) == 1, f"HTML 写入点不止 setHTML 一处：{_html_sinks(code)}"
+    body = code[code.index("function setHTML("):]
+    body = body[:body.index("\n}") + 2]
+    assert _html_sinks(body), "唯一的写入点不在 setHTML 里"
+
+
+def test_html_sink_guard_counts_every_sink_form():
+    """元用例：每种写入形态都要被数到（否则上一条在新形态上空转）。"""
+    for extra in ("x.innerHTML = a;", "x.innerHTML += a;", "x.outerHTML = a;",
+                  "x.insertAdjacentHTML('beforeend', a);", "document.write(a);"):
+        assert len(_html_sinks("el.innerHTML = html;\n" + extra)) == 2, extra
+    assert len(_html_sinks("if (x.innerHTML == y) {}")) == 0, "比较不是写入"
+
+
 def test_toast_and_modal_escape_their_text_arguments():
     """上一条把 toast/openModal 的**文本参数**当作安全的，这里证明它成立。
 
