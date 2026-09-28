@@ -1186,6 +1186,27 @@ function renderAccessTab(panel, site) {
 
 /* ── 部署历史 ───────────────────────────────────────────────────────── */
 
+/* 失败记录展开后的那句"下一步"。按 **phase** 分三类（jobs API 不投影 kind，但 phase 足以分类：
+ * 每个会动线上的步骤都在第一个副作用之前写自己的 phase）：
+ *  · submitted / queued：任务还没开始执行就失败了（下线的 invoke 被拒、首个进度写入失败、
+ *    部署没能启动状态机），站点没有任何变化——部署与下线都一样，所以只给中性的"重新发起"。
+ *  · undeploy：undeploy.py 先删路由、再删资源，中途失败时站点多半已经打不开。
+ *  · 其余（部署各步骤、compensating）：mark_job 会按切换前快照恢复路由——首次部署没有旧版本，
+ *    恢复之后就是"没有可访问的版本"；恢复被放弃或失败时它把原因写进错误摘要（三条常量措辞不同，
+ *    所以这里不按某个短语判例外，只让用户以错误摘要为准）。fullstack-sql 的迁移在切换之前执行、
+ *    逐条提交、不回滚（provision_dsql.py），前端拿不到 tier，所以对所有部署失败都带上这半句。 */
+function failedJobNote(job) {
+  if (job.phase === 'submitted' || job.phase === 'queued') {
+    return '这次任务在开始执行之前就失败了，站点没有任何变化；修好后在 Agent 客户端里重新发起即可。';
+  }
+  if (job.phase === 'undeploy') {
+    return '下线中途失败：下线会先删除路由，所以站点多半已经打不开，其余资源可能只删了一部分。';
+  }
+  return '修好后在 Agent 客户端里重新说「部署」即可重试。失败时平台会把路由恢复成这次部署之前的样子' +
+    '（首次部署失败时即还没有可访问的版本）；错误摘要里说路由没能回滚时，以错误摘要为准，需要人工处理。' +
+    '这次部署如果带了数据库迁移，失败前已经执行的迁移不会回滚。';
+}
+
 async function renderDeploysTab(panel, site) {
   panel.innerHTML = skeletonTable(4, 5);
   let jobs;
@@ -1232,8 +1253,7 @@ async function renderDeploysTab(panel, site) {
           '<div class="callout danger">' + ICON.err + '<span><strong>' +
           esc(phaseText(job.phase)) + ' 阶段失败</strong><br />' +
           esc(job.error || '（这次失败没有留下错误摘要）') + '</span></div>' +
-          '<p class="meta" style="margin-top:8px">修好后在 Agent 客户端里重新说「部署」即可重试；' +
-          '此次失败不影响线上正在运行的版本。</p></td></tr>' : '');
+          '<p class="meta" style="margin-top:8px">' + esc(failedJobNote(job)) + '</p></td></tr>' : '');
     }).join('') + '</tbody></table></div></section>';
 
   $$('[data-expand]').forEach((tr) => tr.addEventListener('click', () => {

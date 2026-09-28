@@ -1091,3 +1091,64 @@ def test_m15_scenario_reddens_without_the_guard(tmp_path):
     _code, out = run_boot("m15-stale", app=broken)
     assert out["last_write_has_stale"] and not out["last_write_has_fresh"], (
         f"去掉守卫却没复现覆盖——场景没在真正驱动那条路径: {out}")
+
+
+# ── 部署历史：失败记录展开后的说明不能对所有失败都说"不影响线上" ─────────────
+
+def _failed_rows(html: str) -> dict:
+    """部署历史页最后一次渲染里，每条失败记录的详情行文本（按 data-detail 切开、去标签）。"""
+    rows = {}
+    for chunk in html.split('data-detail="')[1:]:
+        text = re.sub(r"<[^>]*>", "", chunk.split("</tr>", 1)[0])
+        for sentinel in ("DEPLOY-E-SENTINEL", "UNDEPLOY-E-SENTINEL", "EARLY-E-SENTINEL"):
+            if sentinel in text:
+                rows[sentinel] = text
+    return rows
+
+
+def test_failed_job_detail_does_not_promise_that_nothing_changed():
+    """R2 复审：详情行对**任何** FAILED 都说"此次失败不影响线上正在运行的版本"。
+
+    两处是假的：fullstack-sql 的迁移在切换之前执行、逐条提交、不回滚（provision_dsql.py），
+    部署失败时数据库可能已经变了；下线先删路由（undeploy.py），中途失败时站点多半已经打不开，
+    "重新说部署即可重试"也不对。
+    """
+    code, out = run_boot("deploys-failed")
+    assert code == 0 and not out["errors"], out["errors"]
+    last = next(w for w in reversed(out["html_writes"]) if "data-detail=" in w)
+    rows = _failed_rows(last)
+    assert set(rows) == {"DEPLOY-E-SENTINEL", "UNDEPLOY-E-SENTINEL", "EARLY-E-SENTINEL"}, (
+        f"三条失败记录没有都渲染出详情行——本条空转：{sorted(rows)}")
+    for text in rows.values():
+        assert "不影响线上" not in text, f"对失败记录做了无条件的'不影响线上'保证：{text[:120]}"
+        # R3 复审：补偿被放弃 / 首次部署失败时"线上仍是上一个成功的版本"都是假的，
+        # 任何一条失败记录都不许由自己保证当前线上是哪个版本
+        assert "上一个成功的版本" not in text and "上一版" not in text, (
+            f"失败记录保证了线上仍是上一版：{text[:120]}")
+    deploy = rows["DEPLOY-E-SENTINEL"]
+    undeploy = rows["UNDEPLOY-E-SENTINEL"]
+    early = rows["EARLY-E-SENTINEL"]
+    assert "迁移不会回滚" in deploy, f"部署失败没提醒迁移不回滚：{deploy[:160]}"
+    assert "重新说「部署」" in deploy, "部署失败的重试指引被一起删掉了"
+    assert "以错误摘要为准" in deploy, "部署失败没让用户以错误摘要（补偿放弃的原因）为准"
+    assert "打不开" in undeploy and "重新说「部署」" not in undeploy, (
+        f"下线失败的说明不对：{undeploy[:160]}")
+    # submitted 阶段的失败可能是下线（kind 不在 jobs API 里）：不许指引"重新部署"，也不许说路由已删
+    assert "没有任何变化" in early and "部署" not in early.split("SENTINEL", 1)[1] \
+        and "打不开" not in early, f"开始执行前就失败的任务说明不对：{early[:160]}"
+
+
+def test_harness_catches_the_unconditional_reassurance_coming_back(tmp_path):
+    """元用例：把详情行改回原来那句无条件保证，上面那条必须能红。"""
+    src = APP.read_text(encoding="utf-8")
+    needle = "'<p class=\"meta\" style=\"margin-top:8px\">' + esc(failedJobNote(job)) + '</p></td></tr>'"
+    assert src.count(needle) == 1, "详情行的写法变了——更新本元用例的变形点"
+    mutated = tmp_path / "app.js"
+    mutated.write_text(src.replace(
+        needle, "'<p class=\"meta\">修好后在 Agent 客户端里重新说「部署」即可重试；"
+                "此次失败不影响线上正在运行的版本。</p></td></tr>'"), encoding="utf-8")
+    code, out = run_boot("deploys-failed", app=mutated)
+    last = next(w for w in reversed(out["html_writes"]) if "data-detail=" in w)
+    rows = _failed_rows(last)
+    assert rows and any("不影响线上" in t for t in rows.values()), \
+        "变形没生效——元用例空转"

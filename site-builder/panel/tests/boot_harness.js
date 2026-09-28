@@ -170,11 +170,11 @@ const SITE_SCENARIOS = {
 };
 const SCASE = SITE_SCENARIOS[SCENARIO] || null;
 
-/* Key / analytics 场景要直接落在自己的路由上，且不能被"先去升级面板会话"
+/* Key / analytics / deploys-failed 场景要直接落在自己的路由上，且不能被"先去升级面板会话"
  * 截住——所以预置一个**新鲜的**升级标记。键名必须是 app.js 的 UPGRADE_MARK
  * （`sb_console_upgraded_at`）：写错的话 boot 会跳去 /console-session 然后
  * return，场景退化成 first-visit，那一组用例全部静默空转。 */
-const localSeed = (KEYCASE || ACASE || SCASE)
+const localSeed = (KEYCASE || ACASE || SCASE || SCENARIO === 'deploys-failed')
   ? new Map([['sb_console_upgraded_at', String(Date.now())]])
   : new Map();
 
@@ -198,11 +198,25 @@ const A_SITE = {
   created_at: '2026-08-01T00:00:00', require_login: true, allowed_users: 'org',
   collaborators: [], ever_live: true, role: 'owner', subdomain: 'app-' + A_SITE_ID,
 };
-const A_JOBS = [
+const A_JOBS_OK = [
   { job_id: 'jjjj1111', status: 'SUCCEEDED', phase: 'smoke-test',
     created_at: '2026-08-13T10:00:00', finished_at: '2026-08-13T10:01:30',
     duration_s: 90, error: '' },
 ];
+/* 场景 deploys-failed：部署历史页上的失败记录。一条部署在 provision-db 失败（迁移可能
+ * 已部分提交）、一条下线中途失败（路由已先删）、一条在 submitted 就失败（什么都没执行，
+ * 可能是部署也可能是下线）——三条展开后的说明不能是同一句"不影响线上"。
+ * 错误摘要用哨兵串，不含任何会被断言的字样。 */
+const DEPLOYS_FAILED = SCENARIO === 'deploys-failed';
+const A_JOBS = DEPLOYS_FAILED ? [
+  { job_id: 'jjjj4444', status: 'FAILED', phase: 'submitted',
+    created_at: '2026-08-16T10:00:00', duration_s: 1, error: 'EARLY-E-SENTINEL' },
+  { job_id: 'jjjj3333', status: 'FAILED', phase: 'undeploy',
+    created_at: '2026-08-15T10:00:00', duration_s: 5, error: 'UNDEPLOY-E-SENTINEL' },
+  { job_id: 'jjjj2222', status: 'FAILED', phase: 'provision-db',
+    created_at: '2026-08-14T10:00:00', duration_s: 30, error: 'DEPLOY-E-SENTINEL' },
+  ...A_JOBS_OK,
+] : A_JOBS_OK;
 
 /* 第三个桶是 `uv_exact: false` / `uv: null`。
  *
@@ -252,7 +266,8 @@ global.confirm = () => true;
 const loc = {
   _hash: KEYCASE ? '#/keys'
     : ACASE ? '#/sites/' + A_SITE_ID + '/analytics'
-      : SCASE ? '#/sites' : '',
+      : DEPLOYS_FAILED ? '#/sites/' + A_SITE_ID + '/deploys'
+        : SCASE ? '#/sites' : '',
   hostname: 'console.app.example.com',
   protocol: 'https:',
   origin: 'https://console.app.example.com',
