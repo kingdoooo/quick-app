@@ -42,7 +42,7 @@ my-site/
 | `name` | string | 必填 | 小写字母开头，仅含 `[a-z0-9-]`，长度 2–30（正则 `[a-z][a-z0-9-]{1,29}`）；且不得命中**保留前缀**（见下节） | `"expense-tracker"` |
 | `tier` | string（枚举） | 必填 | `static` \| `fullstack-nosql` \| `fullstack-sql` 三选一 | `"fullstack-sql"` |
 | `backend` | object | fullstack 必填；`tier=static` 时**禁止出现** | 见下三行 | — |
-| `backend.runtime` | string（枚举） | fullstack 必填 | 目前仅支持 `nodejs22.x`（Express）；Python 记为二期 | `"nodejs22.x"` |
+| `backend.runtime` | string（枚举） | fullstack 必填 | 目前仅支持 `nodejs22.x`（Express） | `"nodejs22.x"` |
 | `backend.entrypoint` | string | fullstack 必填 | 非空字符串；启动命令 | `"node server.js"` |
 | `backend.port` | number | fullstack 必填 | 必须为 `8080`（Lambda Web Adapter 约定） | `8080` |
 | `database` | object | 必填 | `engine` 必须与 tier 匹配（见下） | — |
@@ -124,6 +124,10 @@ my-site/
   `backend/migrations/NNN_描述.sql`（`NNN` 为三位数字序号，文件名须匹配
   `^\d{3}_.+\.sql$`，如 `001_add_category.sql`），执行器按文件名排序执行
   未跑过的文件。
+- **迁移在新版本上线之前执行，且不能回滚**：执行器先跑迁移、再部署新后端，健康检查通过才
+  切换。健康检查失败时线上仍是旧版本，但迁移已经生效——所以迁移必须**兼容旧版本代码**：
+  只加表、加旧代码不写也不出错的列；删列、改列名这类旧代码还依赖的变更，留到新版本上线之后的
+  下一次部署。
 - **不允许子目录**：迁移文件必须直接放在 `backend/migrations/` 下。执行器只列举
   该目录**直下层**的 `NNN_*.sql`，子目录里的 SQL 不会被执行，校验器也会直接拒。
 - **每条 DDL 必须可重放**：见 `references/redlines.md` 红线 9。一个文件半途失败后

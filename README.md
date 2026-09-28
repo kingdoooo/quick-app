@@ -1,198 +1,173 @@
-# Quick 自动化建站方案（Site Builder）
+# Site-Builder：给 AI Agent 打造的应用上线平台
 
-业务人员在**任意支持 Skill + MCP 的 Agent 客户端**（Claude Code / Codex /
-Amazon Quick / Kiro …）里用自然语言开发简易全栈站点，说一句"部署"即获得
-`https://app-xxx.<你的域名>` 的可分享 URL；站点访问与管理权限绑定**你接入的
-OIDC IdP 身份**（凡是能给出 email claim 的都行；没有现成 IdP 时方案可以自己建一个
-Cognito 池当身份源，飞书只是其中一种参考适配器）。
-全程不接触 AWS 控制台，无 EC2/RDS 重资产。
+业务人员在自己常用的 Agent 客户端里（Claude Code、Amazon Quick Desktop，或任何支持
+Skill 和 MCP 的客户端）用自然语言做出一个小应用，说一句"部署"，就能拿到一个可以分享给
+同事的网址：`https://app-{站点 ID}.{你的域名}`。
 
-> **与 Agent 客户端的账号体系无关**：Claude Code / Codex / Quick 各自怎么登录是
-> 客户端自己的事，本方案不做任何假设。客户端只需要两件事——能加载 Skill、能连
-> MCP；对**本方案**的认证（部署权限、站点访问、控制台）全部走方案自带的
-> Cognito，联邦到你在部署时接入的那个 IdP。
+整套平台部署在**你自己的 AWS 账号**里：应用、数据和登录身份都留在你的账号内，谁能访问
+由站点的所有者自己决定。业务人员全程不用打开 AWS 控制台，也不需要懂云。
 
-> **资产范围**：除建站链路本身，还包含自助管理控制台、API Key 交换层（可选组件）、
-> 访问统计聚合、以及站点更新的 blue/green 原子切换。每一项都有随仓库分发的真机闸门
-> 脚本，部署完自己跑一遍就知道它在你的账号里对不对（见 DEPLOY.md 的「部署后验收」）。
->
-> **本段不写测试数量与日期**：那种数字每一轮都会变假，而这里是外部读者看到的第一段话。
-> 想知道当下的确切状态就**自己跑一遍**——各包的测试命令与真机闸门脚本都列在
-> [CLAUDE.md](CLAUDE.md) 的「测试命令」小节里，跑出来的数字就是答案。
->
-> 部署中踩到的所有坑（ECR manifest、Function URL 权限、IdP 回调/邮箱、token 形态、
-> 预签名上传、部署顺序等）均已回写
-> **[site-builder/DEPLOY.md](site-builder/DEPLOY.md)** 与
-> [docs/client-setup.md](site-builder/docs/client-setup.md)，换账号重部署照手册执行即可。
-> 更细的逐任务进度与实测发现记在仓库内的 `docs/design/`，那些文件**不随仓库分发**
-> （含真实账号与资源值，git-ignored）——所以本文件与 DEPLOY.md 才是对外的口径真源。
+## 解决什么问题
 
-## 版本
+财务的台账、HR 的入职清单、市场的活动报名页，这类内部小工具用 Agent 几分钟就能写出来。
+难的是上线：域名和证书从哪来、谁能访问、数据放在哪、成本怎么算。这些都是云和部署的知识，
+业务人员既不懂，也不该需要懂。
 
-当前发布版本 **v1.0.0** —— 一期建站链路 + 二期全部里程碑（自助控制台、API Key 交换层、
-访问统计、blue/green 原子切换）+ 加固包，全部包含在内。这个 tag 是一次**全新沙箱账号
-上只看 `site-builder/DEPLOY.md` 从零走通**的出口验收所对应的状态。
+Site-Builder 把这些问题在平台里一次性解决。之后每个应用上线，都只是和 Agent 说一句话。
 
-### 从 tag 部署
+## 用起来是什么样
 
-```bash
-git clone <本仓库> quick-app
-cd quick-app
-git checkout v1.0.0
-```
+一次性准备：在 Agent 客户端里导入建站 Skill、添加部署 MCP，用企业身份登录一次。之后全靠对话：
 
-> **这个 tag 固定的是源码与手册，不固定 CDK 工具链版本。** 手册用
-> `npx -y aws-cdk@latest`（刻意的：部分环境的全局 CDK 太旧），而
-> `site-builder/deployer/infra/requirements.txt` 里 `aws-cdk-lib` 只钉了范围
-> （`>=2.140,<3`；router 那份是精确的 `==2.100.0`）。**于是在不同时间 checkout 同一个
-> tag，装到的 CDK CLI 与 `aws-cdk-lib` 可能不同，synth 出的模板也可能有差异。**
->
-> 已观测到的版本，**证据强度分两档，别混着读**：
->
-> | | 版本 | 这个数字能证明什么 |
-> |---|---|---|
-> | `aws-cdk-lib`（`deployer/infra/.venv`） | `2.267.0` | **出口验收当次**——就是这个 venv 跑的那次 `cdk deploy` |
-> | `aws-cdk-lib`（`router/infrastructure/.venv`） | `2.100.0` | 同上；这一份本来就是精确钉的 |
-> | CDK **CLI** | `2.1141.0` | **只是复审时本机 `aws-cdk@latest` 解析到的值**。部署日志里**没有**记录 CLI 版本 ⇒ **不能**证明验收当次用的就是它 |
->
-> 所以这张表**不是**一个"已验证可回退的组合"：两个库版本是验收当次的事实，CLI 那一行不是。
-> **这里也不宣称"换版本功能不受影响"**——一次固定时间的验收证明不了未来的 `@latest`，
-> 而未来的 `@latest` 正是这条限制里唯一未被验证的变量。
-> 需要可复现就自己把 CLI 与两个 `aws-cdk-lib` 钉死再部署。
-> 收敛工具链版本、以及**把 CLI 版本写进部署日志**（现在没有，所以上面那一行才只能是复审
-> 时的观测值）都是 v1.x 的候选工作。
-
-然后照 [site-builder/DEPLOY.md](site-builder/DEPLOY.md) 走：§0 前置要求 → 「CDK bootstrap」
-→ 「部署顺序总览」→ 各阶段 → 「⑦ 部署后验收」。**`git clone` 拿不到能跑的环境**，
-仓库外还有几样东西要先恢复（两个 Python 解释器、两份 `config.ini`、五个 venv、
-宿主 `python3` 的三个包），清单见 [CLAUDE.md](CLAUDE.md) 的「仓库外的几样东西」。
-
-首次部署的实测耗时、以及这条路上**必然**撞到的三处（托管域名前缀撞车、首建 Global Table
-的 SLR 竞态、AgentCore 首次建 runtime 的 IAM 传播）都写在 DEPLOY.md §0
-「首次部署要多久，以及必然撞到的几处」——那三处的报文都指向错误的原因，撞到时按手册核对，
-不要照字面去查。
+1. **说需求**。Agent 按 Skill 先问清楚：站点做什么、要存什么数据、谁能访问。
+2. **生成和预览**。Agent 自动选择站点类型（纯静态、带简单数据、带关联查询），按应用规范
+   生成代码，先在本地跑起来给你看。
+3. **说"部署"**。Agent 上传代码并播报进度，分钟级拿到站点网址。
+4. **改权限、加协作者**。比如"改成全组织可见""只给这几个人看"，约 1 分钟生效，不用重新部署。
+5. **看访问情况**。访问量、独立访客、被拒次数，以及最近的访问记录。
+6. **迭代**。改完再部署一次，网址不变。新版本通过健康检查才会切换，没通过就继续跑旧版本。
+   数据库迁移是例外：它在切换之前执行、不能回滚，所以必须兼容旧版本（见「设计要点」）。
 
 ## 架构
 
-<!-- tool-list:begin  ② 那格的工具面由 site-builder/mcp/tests/test_doc_tool_surface.py
-     对着 MCP 实时注册表校验（漏一个、或留着已删除的都会变红）。本图里除工具名外
-     不要出现别的 snake_case 标识符，否则会被当成"多出来的工具"。 -->
+```
+ ① 建站 Skill ── 加载在 Agent 客户端里，告诉 Agent 按什么规范生成代码
+        │  MCP 调用，带着用户的登录身份
+        ▼
+ ② 部署 MCP ── Amazon Bedrock AgentCore Runtime，所有工具秒级返回
+        │  启动异步部署
+        ▼
+ ③ 部署执行器 ── AWS Step Functions + CodeBuild + Lambda
+        │  校验代码 → 建库 → 打包 → 部署后端 → 上传前端 → 注册路由 → 冒烟测试
+        ▼
+ ④ 路由与鉴权 ── Amazon CloudFront + Lambda@Edge + DynamoDB 路由表
+        │  每个请求：查路由 → 验登录 → 按名单放行 → 转发到站点
+        ▼
+    站点本身 ── 前端在私有 S3，后端是站点自己的 Lambda，数据在 DynamoDB 或 Aurora DSQL
 
+ ⑤ 身份 ── Amazon Cognito，联邦到你的企业 IdP；会话签名的私钥锁在 AWS KMS 里
+
+ 控制台 console.{你的域名} · 可选的 API Key 交换层 mcp.{你的域名}
 ```
-┌─────────────────────────────────────────────────────────────┐
-│ ① 建站 Skill（Agent Skills 开放标准，"部署合同"）             │  site-builder/skills/
-│    Claude Code / Codex / Amazon Quick / Kiro 等通用           │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ MCP 调用（OAuth 携带平台身份）
-┌──────────────────────────▼──────────────────────────────────┐
-│ ② 部署 MCP（AgentCore Runtime，薄壳，工具全部秒级返回）       │  site-builder/mcp/
-│    deploy_site / confirm_upload / get_deploy_status /         │
-│    list_my_sites / undeploy_site / get_site_analytics /       │
-│    update_site_permissions / manage_collaborators /           │
-│    get_site_permissions                                       │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ 条件迁移 PENDING→RUNNING + SFN 启动
-┌──────────────────────────▼──────────────────────────────────┐
-│ ③ 异步部署执行器（Step Functions + Lambda + CodeBuild）       │  site-builder/deployer/
-│    合同校验(zip bomb防护) → 建库(DynamoDB表/DSQL schema+role)  │
-│    → CodeBuild 装依赖 → 站点 Lambda(zip+LWA Layer)            │
-│    → 前端传 S3 版本化前缀 → 路由原子切流 → 冒烟                │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ 路由表（subdomain → 目标 + auth 策略）
-┌──────────────────────────▼──────────────────────────────────┐
-│ ④ 路由 + 鉴权层（CloudFront *.<域名> + Lambda@Edge）           │  router/
-│    查路由 → 验会话 JWT → 注入 x-user-email →                  │
-│    /api/*→站点Lambda(SigV4) / 其余→S3（全站禁缓存）           │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ 未登录 302 → auth.<域名>/login
-┌──────────────────────────▼──────────────────────────────────┐
-│ ⑤ 身份层（Cognito 联邦到任意 OIDC/SAML IdP；飞书经适配器）    │  site-builder/auth/
-│    一套 Cognito 三处消费：站点访问 / 控制台 / MCP 部署权限     │
-└─────────────────────────────────────────────────────────────┘
-```
+
+部署 MCP 提供的工具：
+
+<!-- tool-list:begin 由 site-builder/mcp/tests/test_doc_tool_surface.py 对着 MCP 注册表校验，请勿删除 -->
+
+| 工具 | 做什么 |
+|---|---|
+| `deploy_site` | 发起一次部署（更新已有站点时带上站点 ID），返回代码包的上传地址和任务号 |
+| `confirm_upload` | 确认代码包已上传，启动部署 |
+| `get_deploy_status` | 查询部署进度；成功时返回站点网址，失败时返回原因 |
+| `list_my_sites` | 列出自己拥有或参与协作的站点 |
+| `get_site_permissions` | 查看站点的访问策略、所有者、协作者，以及自己的角色 |
+| `update_site_permissions` | 修改访问策略，约 1 分钟生效，不用重新部署 |
+| `manage_collaborators` | 增删协作者，或转移所有权 |
+| `get_site_analytics` | 按日、周或月查看访问量、独立访客、被拒次数和最近的访问记录 |
+| `undeploy_site` | 下线站点；默认保留数据库，明确要求时才删除数据 |
 
 <!-- tool-list:end -->
 
-### 关键设计决策
+另外两个组件：
 
-- **不做代码生成**——那是 Agent 客户端的事；本方案只做客户端做不了的"部署到 AWS"。
-- **部署合同**（`site.json` + 目录约定 + 代码红线）是锚点：哪个 agent 生成的代码都行，
-  执行器只认合同。校验器 + 红线扫描器把不合规产物在部署前拦下。
-- **站点代码按不可信代码对待**：每站点独立 IAM 角色（PermissionsBoundary 封顶）、
-  DSQL per-site schema + 非 admin PG role、DynamoDB 表按站点前缀隔离。
-- **鉴权统一在边缘**：站点代码零 auth 逻辑，Lambda@Edge 验 RS256 会话 cookie（公钥内嵌，私钥在 KMS）、
-  按名单放行、注入 `x-user-email`；CloudFront **全站禁缓存**（origin-request 鉴权
-  在 cache hit 时会被绕过——禁缓存是正确性前提）。
-- **三档 tier**：`static`（纯前端）/ `fullstack-nosql`（Express+DynamoDB）/
-  `fullstack-sql`（Express+Aurora DSQL）。选 DSQL 因为：免 VPC、闲置零成本、
-  IAM 认证免密码、PG 线协议兼容 AI 生成代码。
-- **后端 zip + Lambda Web Adapter Layer**（禁容器镜像——参考项目实测镜像模式踩坑）。
+- **控制台**（`console.{你的域名}`）：在网页上看自己的站点和部署历史、改权限、管协作者、
+  下线站点；管理员另有全局视图。建站仍然只在 Agent 里完成。站点与 MCP 不依赖它，但部署后
+  验收要求它，所以标准部署包含它。
+- **API Key 交换层**（`mcp.{你的域名}`，可选）：给只能配置静态 Header、走不了 OAuth 的 MCP
+  客户端用。默认不部署。
+
+## 设计要点
+
+- **应用规范是唯一的约定**。规范包括 `site.json` 格式、目录约定和代码红线。哪个 Agent
+  生成的代码都行，平台只按这份规范校验，不合规就不部署。
+- **站点代码一律当作不可信**。代码由 AI 生成，依赖来自公共源。每个站点有自己的 IAM 角色，
+  只能访问自己的数据表或数据库 schema；打包时不执行任何安装脚本。
+- **鉴权全部在边缘完成**。站点代码里没有任何登录逻辑：Lambda@Edge 验证登录、按名单放行，
+  再把可信的用户邮箱传给站点。为了让每个请求都经过鉴权，CloudFront 全站不缓存。
+- **只读权限冒充不了用户**。会话签名的私钥锁在 AWS KMS 里，只有登录服务和控制台后端能调用签名
+  （控制台只能签自己的面板会话），Edge 只有公钥。能冒充用户的只剩能调用签名、或能改签名/验签代码的
+  少数高权限身份，所以平台的安全边界就是 AWS 账号本身。平台防谁、不防谁，见 [docs/security/account-trust-boundary.md](docs/security/account-trust-boundary.md)。
+- **更新是原子切换**。每个站点的后端有 blue、green 两个别名。新版本先部署到备用的那一个，
+  通过健康检查后才切换路由；切换后冒烟测试不通过，就按旧路由恢复。原子的是代码与路由，
+  不含数据库：`fullstack-sql` 站点的迁移在切换之前执行、每条语句立即提交，健康检查失败时迁移
+  也已经生效。所以迁移必须兼容还在运行的旧版本：只加表、加旧代码不写也不出错的列，删列或改名
+  留到下一次部署。
+- **三类站点**。`static`（纯前端）、`fullstack-nosql`（Node.js 后端 + DynamoDB）、
+  `fullstack-sql`（Node.js 后端 + Aurora DSQL）。选 Aurora DSQL，是因为它不用 VPC、
+  用 IAM 认证不用管密码、兼容 PostgreSQL，AI 生成的代码可以直接用。
+- **全 Serverless**。没有常驻服务器，站点没人访问时几乎不产生计算费用。
+
+## 部署到你自己的账号
+
+需要准备：
+
+- **一个 AWS 账号，区域必须是 `us-east-1`**。Lambda@Edge 和 CloudFront 用的证书都要求在
+  这个区域。建议用专用账号：账号里能碰签名密钥的身份越少，安全边界越紧。
+- **一个能改 DNS 的域名**，以及签发在 us-east-1 的 `*.{你的域名}` 通配符证书。建议用一个
+  专用的二级子域（如 `app.example.com`）当平台域名。
+- **一个身份源**，二选一：已有的 OIDC IdP（如 Okta、Entra ID、Google；飞书这类没有标准
+  OIDC 端点的，经适配器接入），或者让平台自己再建一个 Cognito 用户池当 IdP，由管理员
+  创建用户。
+- **本机工具**：AWS CLI、Docker、Python 3.12 和 Node.js。
+
+所有与账号相关的值只写在两份配置文件里：`site-builder/config.ini` 与 `router/config.ini`，从同目录的 `.example` 复制出来。
+
+完整步骤见 **[site-builder/DEPLOY.md](site-builder/DEPLOY.md)**：先看「前置要求」，再照
+「部署顺序总览」执行。有两点要先知道：
+
+- 手册的小节编号不是执行顺序。组件之间有依赖，全新账号上执行器栈要部署两次。漏掉第二次
+  不会报错，要到第一次建站才会暴露；手册顺序里的"夹具站点"一步就是用来发现这个问题的。
+- 单账号实测，全新账号首装约 40 分钟（不含部署后验收），途中遇到了三处失败重试。三处的报错
+  都指向错误的原因，手册里写了原样报错、触发条件和处理办法。
+
+部署完成后，照手册的「部署后验收」跑一遍验收脚本，就能确认每个组件在你的账号里工作正常。
+客户端怎么接入，见 [site-builder/docs/client-setup.md](site-builder/docs/client-setup.md)。
+
+## 成本
+
+部署手册按 PoC 规模估算：数十个低流量站点、路由层每月约 100 万次请求、Cognito 月活 50 人以内，合计每月约 17 到 52 美元。实际费用以账单为准。
+
+## 当前限制
+
+- 只能部署在 `us-east-1`。
+- 站点后端只支持 Node.js（Express），不支持 Python 等其它运行时。
+- CloudFront 全站不缓存，这是鉴权正确的前提。高流量站点要单独评估成本。
+- 站点网址固定为 `app-{站点 ID}.{你的域名}`，不支持给单个站点绑定自定义域名。
+- 身份以邮箱为准，IdP 必须提供 email；部署脚本按 OIDC 方式接入 IdP。
 
 ## 目录导览
 
 | 路径 | 内容 |
 |---|---|
-| `docs/superpowers/specs/2026-07-21-quick-site-builder-design.md` | **一期**设计文档（已实现快照，勿改）——二期的控制台/API Key/统计/blue-green 都不在其中 |
-| `docs/superpowers/plans/2026-07-21-quick-site-builder.md` | **一期**实施计划（23 任务；同为快照）。当前架构口径见本文件与 `CLAUDE.md` |
-| `site-builder/DEPLOY.md` | **部署手册：§0 前置要求 + 七阶段操作（下一步从这里开始）** |
-| `site-builder/contract/` | 部署合同库：site.json 校验器 + 红线扫描器 |
-| `site-builder/auth/` | 会话 JWT + 站点登录服务 |
-| `site-builder/deployer/` | 执行器：7 个 SFN 步骤 + 状态机 CDK + undeploy |
-| `site-builder/mcp/` | 部署 MCP server + Dockerfile/部署脚本 + AgentCore spike 报告 |
-| `site-builder/skills/site-builder/` | 建站 Skill 包（SKILL.md + 合同/红线文档 + 模板） |
-| `site-builder/fixtures/` | 三档黄金样例站点（全部通过合同校验，兼演示素材） |
-| `site-builder/scripts/` | smoke_router.sh（路由层冒烟）、deploy_fixture.py |
-| `router/` | 路由层：CloudFront + Lambda@Edge 分流/鉴权/禁缓存 |
+| `site-builder/DEPLOY.md` | 部署手册：前置要求、部署顺序、各阶段操作、部署后验收、密钥轮换 |
+| `site-builder/docs/client-setup.md` | Agent 客户端接入指引 |
+| `site-builder/skills/site-builder/` | 建站 Skill：给 Agent 的应用规范、代码红线和模板 |
+| `site-builder/contract/` | 应用规范的校验器 |
+| `site-builder/mcp/` | 部署 MCP |
+| `site-builder/deployer/` | 部署执行器：状态机、各步骤、CDK 栈 |
+| `router/` | 路由与鉴权层：CloudFront + Lambda@Edge |
+| `site-builder/auth/` | 登录服务与会话签名 |
+| `site-builder/panel/` | 控制台 |
+| `site-builder/key-proxy/` | API Key 交换层（可选） |
+| `site-builder/clients/quick-desktop-proxy/` | 本地 MCP 代理：替客户端完成 OAuth 登录并自动续期（Claude Code 与 Amazon Quick Desktop 默认都用它） |
+| `site-builder/fixtures/` | 三类站点的样例 |
+| `site-builder/scripts/` | 部署、验收和运维脚本 |
+| `site-builder/policies/` | 可选的账号级加固样例 |
+| `docs/adr/` | 设计决策记录 |
+| `docs/security/` | 账号信任边界：平台防谁、不防谁 |
+| `docs/superpowers/` | 各阶段的设计与实施记录，是历史快照，不代表当前实现 |
 
-## 测试与质量
+## 开发与测试
 
-- **七个包各有单元测试**（contract / auth / router edge / deployer / mcp / panel /
-  key-proxy），另有一组 E2E 在 `RUN_E2E=1` + 真实部署后运行，含自动化登录 CRUD
-  ——经 auth 的 `/fixture-session` 取夹具会话（ADR 0002），无需人工在 IdP 侧登录。
-  **这里不写各包的测试数量**：那些数字每加一个用例就变假。要当下的确切数字，
-  照 [CLAUDE.md](CLAUDE.md) 的「测试命令」小节跑一遍，输出就是答案。
-- 每个任务经独立子代理实现 + 审查/裁决 + 修复闭环；开发过程中修复的典型问题：
-  CloudFront 缓存绕过鉴权（CRITICAL）、auth 子域路由错位、POST body SigV4 签名、
-  DSQL 权限模型、红线扫描器多轮防绕过加固、IAM PermissionsBoundary 条件门 bug。
-- 跑测试：多数包用各自目录下 `.venv/bin/pytest -q`；两个例外——
-  `site-builder/auth` 无自己的 venv，用 `site-builder/contract/.venv/bin/pytest tests`（含 pyjwt）；
-  `site-builder/deployer` 须 `pytest tests`（裸 `pytest -q` 会误收集 `infra/cdk.out` 的 asset 副本）。
-- venv 里的 shebang 是绝对路径：若克隆到别的路径或移动过目录，用
-  `python3 -m venv --clear .venv` 重建（不带 `--clear` 时对已存在目录不会重写
-  shebang，会一直报 bad interpreter）。
+- 本地 Python 环境一条命令建齐：`bash site-builder/scripts/bootstrap_venvs.sh`。
+  需要 Python 3.12；加 `--host-deps` 会顺带给宿主 `python3` 装部署脚本要用的依赖。
+- 各个包的测试命令不一样（有的借用别的包的 venv），照 [CLAUDE.md](CLAUDE.md) 的「测试命令」
+  一节执行。这里不写测试数量，跑一遍的输出就是当前结果。
 
-## 部署前置要求
+## Security
 
-本方案面向**在你自己的 AWS 账号里从零部署**。需要先准备：**us-east-1 区域**
-（Lambda@Edge 与 CloudFront 用的 ACM 证书强制）、一个可改 DNS 的域名 + 该域名的
-`*.<域名>` ACM 通配符证书、一个身份源（三条路任选：已有的
-OIDC/SAML IdP、Google、或让方案自己建第二个 Cognito 池做管理员建户——最后这条
-零外部依赖；飞书走的是"自建适配器包成 OIDC"那条，属于第一类）——以及本机 Docker。会话签名用的两把
-KMS 非对称 CMK 由执行器（④）那个 CDK 栈创建（每把 $1/月 + `kms:Sign` 每万次 $0.03，只在登录 /
-换码路径调用），不需要预先准备。
+See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
 
-逐项要求与命令见 **[site-builder/DEPLOY.md](site-builder/DEPLOY.md) §0 前置要求**
-（含就绪检查清单与成本预期）。
+## License
 
-账号 ID、域名、证书 ARN 等环境相关值全部走配置文件
-（`site-builder/config.ini` 与 `router/config.ini`，均从同目录 `.example`
-复制，gitignored），代码与文档中不硬编码。
-
-## 如何继续
-
-1. **备齐前置**：照 [site-builder/DEPLOY.md](site-builder/DEPLOY.md) §0 的就绪清单
-   逐项确认，并从两份 `config.ini.example` 复制出自己的配置。
-2. **部署**：照同文档执行。**注意小节编号不是执行顺序**——全新账号的顺序是
-   ①身份层 → ③DSQL → ④执行器（**第一次**，只为建两把 CMK）→ 回填 `[SessionKeys]`
-   → ②路由 → 回填 `edge_role_arn` → ④执行器（**第二次**）→ auth → ⑤MCP → ⑤b控制台
-   → 夹具站点 → ⑥客户端 → ⑦部署后验收。
-   ④ 要部两次是一个真实的环形依赖，**漏掉第二次是无声的**（要到第一次真实建站才炸）；
-   权威顺序图见 DEPLOY.md「部署顺序总览」。每阶段产出的 ARN/ID 按手册回填
-   `site-builder/config.ini`。
-3. **验收**：⑦ 的验收集（七条分发的闸门，同文档「部署后验收」一节；未启用 API Key 组件时第七条报「组件缺席」而非跳过）全绿即部署完成；
-   演示叙事见实施计划 Task 23。
-4. **仍未交付的候选**：Python 站点 runtime（当前仅 Node.js 后端）、精细缓存
-   （当前 CloudFront 全站禁缓存，那是鉴权正确性的前提）。
-   原清单里的 MCP API-Key、站点协作者、管理面板、PKCE/nonce **都已在二期交付**
-   （分别是 `site-builder/key-proxy/`、panel 的协作者接口、`console.<域名>`
-   控制台、`auth/login_handler.py` 的 PKCE S256 + nonce 校验）。
+This library is licensed under the MIT-0 License. See the [LICENSE](LICENSE) file.

@@ -178,15 +178,17 @@ def test_readme_status_has_no_stale_numbers_or_date():
     counts = re.findall(r"（\d+\s*测试）", txt)
     assert not counts, f"README 里还有写死的逐包测试数：{counts}"
 
-    # 肯定断言切到那个引用块：它必须给出**可自查**的去处，而不是一个数字。
-    # marker 从 `**当前状态**` 换成 `**资产范围**`（工单 12）：README 描述的是**资产
-    # 包含什么**，不是"验证环境现在到哪了"。断言本身不变——一个数字换不来自查路径。
-    status = _blockquote(txt, "**资产范围**")
-    assert "CLAUDE.md" in status, "状态段没指向 CLAUDE.md 的测试命令（读者无法自查）"
-    assert "docs/design" in status and "不随仓库分发" in status, (
-        "状态段没说明 docs/design 不随仓库分发——新 clone 会指向不存在的文件")
-    assert "HANDOFF" not in status, (
-        "状态段仍以 HANDOFF 为真源，而它是 gitignored ⇒ 新 clone 里不存在")
+    # 肯定断言切到「开发与测试」那一节：它必须给出**可自查**的去处，而不是一个数字。
+    # （README 重写为面向公开读者之前，这条切的是 `**资产范围**` 引用块；判据不变——
+    # 一个数字换不来自查路径。）
+    tests_sec = _section(txt, "## 开发与测试")
+    assert "CLAUDE.md" in tests_sec, "「开发与测试」没指向 CLAUDE.md 的测试命令（读者无法自查）"
+    # 否定断言覆盖整个文件：README 面向新 clone 的读者，**根本不提** gitignored 的过程
+    # 记录。这比旧版"状态段须声明 docs/design 不随仓库分发"更强——旧版允许提、只要求
+    # 标注；现在连提都不许，指针类的回归另由 test_delivery_docs_mark_every_undistributed_doc_pointer 兜住。
+    for gone in ("docs/design", "HANDOFF"):
+        assert gone not in txt, (
+            f"README 提到了 {gone!r}，它是 gitignored 的过程记录 ⇒ 新 clone 里不存在")
 
 
 def test_no_delivery_doc_still_says_phase2_m1_m3():
@@ -379,8 +381,64 @@ def test_deploy_md_calls_the_scp_template_unverified():
 # 这一类过时最误导：读者据此判断"这个能力还没有"，于是重复造或误报缺口。
 # 判定各项是否已交付都有代码/目录证据（见每条断言的注释），不是凭印象。
 
+# 已交付能力的**全部**称呼：改写前文档用的旧称 + 改写后 README / DEPLOY.md 的现行称呼。
+# 判定按称呼命中——文档换了叫法而词表没跟上，判定分支就永远进不去、守卫空转成绿
+# （R1 复审实测：README 改叫「API Key 交换层 / 控制台 / 协作者」后，旧词表一个都命中不了，
+# 往「当前限制」里写"API Key 交换层、控制台和协作者支持均暂不提供"照样绿）。
+# 改文档里的称呼时同步这张表；`test_limits_guard_fires_on_every_capability_alias` 逐个验。
+_DELIVERED_CAPABILITIES = {
+    # site-builder/key-proxy/（可选组件，mcp.{base_domain}）
+    "API Key": ("MCP API-Key", "API-Key", "API Key", "key-proxy", "交换层"),
+    # site-builder/panel/（console.{base_domain}）
+    "控制台": ("管理面板", "控制台", "console."),
+    # panel 与 MCP 的 collaborators 接口（manage_collaborators）
+    "协作者": ("站点协作者", "协作者"),
+    # auth/login_handler.py 的 PKCE_COOKIE + S256 + nonce 校验
+    "PKCE/nonce": ("PKCE", "nonce"),
+}
+# 标记词必须是**否定句造不出来的**那个：`"交付" in sentence` 会被"仍未**交付**"满足，
+# `已交付` / `已在二期交付` / `已支持` 都不可能由否定句产生。
+_DELIVERED_MARKERS = ("已交付", "已在二期交付", "已支持")
+
+
+def _section_lead(sec: str) -> str:
+    """`_section` 的结果里，首个子标题之前的那部分（围栏里的 `#` 注释不算标题）。"""
+    lines = sec.splitlines()
+    mask = _fenced_mask(lines)
+    for i in range(1, len(lines)):
+        if not mask[i] and lines[i].startswith("#"):
+            return "\n".join(lines[:i])
+    return sec
+
+
+def _limits_listing_delivered(sec: str) -> list:
+    """「限制」类小节里提到已交付能力、却没说它已交付的句子（按句号与换行切句）。
+
+    **不能简单断言"这些名字不出现"**：这类小节合理地可能提到它们，只是要说清"已交付"。
+    正确的形态是：**凡提到它们的那句话，必须同时带已交付的标记**。
+    """
+    bad = []
+    # 按语义单元拼回软折行、去掉排版记号与空白再比——"API\n  Key"、"**API** Key" 这类只改格式的
+    # 旧句照样命中（R7 复审：按换行切句时软折行把称呼切成两半，强调符把称呼隔断）。
+    for unit in _prose_units(sec):
+        for sentence in re.split(r"[。；]", unit):
+            flat = _squash(sentence)
+            for cap, aliases in _DELIVERED_CAPABILITIES.items():
+                if any(_squash(a) in flat for a in aliases) and not any(
+                        m in flat for m in _DELIVERED_MARKERS):
+                    bad.append(f"{cap}: {sentence.strip()[:90]}")
+                    break
+    return bad
+
+
+def _squash(s: str) -> str:
+    """`_plain` 之后再去掉全部空白：中文正文软折行拼回时英文词之间的空格不可靠。"""
+    return re.sub(r"\s+", "", _plain(s))
+
+
 def test_readme_future_candidates_do_not_list_delivered_capabilities():
-    """README「如何继续」的二期候选清单里，已交付的能力必须去掉。
+    """README「当前限制」里不许列已交付的能力（原先守的是「如何继续」的候选清单，
+    README 重写后那一节换成了只陈述当前事实的「当前限制」，判据不变）。
 
     实测各项现状：MCP API-Key = 已交付（`site-builder/key-proxy/`，二期 M4）；
     站点协作者 = 已交付（panel 的 collaborators 接口，M3）；管理面板 = 已交付
@@ -388,47 +446,82 @@ def test_readme_future_candidates_do_not_list_delivered_capabilities():
     （`auth/login_handler.py` 的 `PKCE_COOKIE` + S256 + nonce 校验）。
     仍未交付的只有 Python 站点 runtime 与精细缓存。
     """
-    sec = _section(_read(README), "## 如何继续")
-    # **不能简单断言"这些名字不出现"**：这一段合理地需要提到它们，只是要说清"已交付"
-    # ——我第一版就是那么写的，于是被我自己那句"…都已在二期交付"判红了。
-    # 正确的形态是：**凡提到它们的那句话，必须同时说它已交付**。
-    # 这样"把它挪回候选清单"会红（那句话里没有"交付"），而如实说明不会。
-    # 标记词必须是**否定句造不出来的**那个。第一版我查的是 `"交付" in sentence`，
-    # 而候选那句写着"仍未**交付**的候选" ⇒ 断言被**否定句**满足，把 MCP API-Key 挪回
-    # 候选清单时它照样绿。这正是本轮假绿总表第 11 行（散文里的 token 会被无关的偶然
-    # 提及、甚至被反义句满足）——**在记录这条判据的用例里又踩了一次**。
-    # `已交付` / `已在二期交付` 都不可能由"仍未交付"产生。
-    for delivered in ("MCP API-Key", "站点协作者", "管理面板", "PKCE/nonce"):
-        for sentence in sec.split("。"):
-            if delivered in sentence:
-                assert "已交付" in sentence or "已在二期交付" in sentence, (
-                    f"提到 {delivered!r} 的这句话没说明它**已**交付，读者会以为它还没有："
-                    f"{sentence.strip()[:90]}")
-    # 正向：仍未交付的那两项应当还在（否则这条断言退化成"把整段删掉就绿"）
-    assert "Python" in sec and "缓存" in sec, \
-        "仍未交付的 Python runtime / 精细缓存被一起删掉了——那是另一种失真"
+    sec = _section(_read(README), "## 当前限制")
+    bad = _limits_listing_delivered(sec)
+    assert not bad, f"README「当前限制」把已交付的能力写成了限制：{bad}"
+    # 正向：真实存在的那两项限制应当还在（否则这条断言退化成"把整段删掉就绿"）
+    assert "Node.js" in sec and "Python" in sec and "缓存" in sec, \
+        "「只支持 Node.js 后端」/「全站不缓存」这两条真实限制被一起删掉了——那是另一种失真"
 
 
 def test_deploy_md_known_limits_do_not_list_delivered_capabilities():
-    """DEPLOY.md 的「已知限制与延后项（向客户声明）」是**对客户**的口径，
-    把已交付的 API Key fallback 写成"延后"比 README 那处更严重。"""
-    sec = _section(_read(DEPLOY), "## 已知限制与延后项（向客户声明）")
-    assert "API Key fallback 延后" not in sec, \
-        "向客户声明里还写着 API Key fallback 延后，而 M4 已交付 key-proxy"
-    assert "Node.js" in sec, "仍未交付的「仅 Node.js 后端」被删掉了"
+    """DEPLOY.md 的「已知限制（向使用方说明）」是**对使用方**的口径，
+    把已交付的 API Key fallback 写成"延后"比 README 那处更严重。
+    （这一节原名「已知限制与延后项（向客户声明）」；资产只陈述当前事实、不列延后项，所以改了名，判据不变。）"""
+    sec = _section(_read(DEPLOY), "## 已知限制（向使用方说明）")
+    # 称呼判定只看**限制清单本身**（首个子标题之前）：后面几个 `###` 子节讲机制与信任边界，
+    # 合理地提到控制台 / key-proxy 的设计（"已按独立 IAM 角色设计"），不是在列限制。
+    bad = _limits_listing_delivered(_section_lead(sec))
+    assert not bad, f"DEPLOY.md「已知限制」把已交付的能力写成了限制：{bad}"
+    # 旧口径的原句仍对**整节**（含子节）断言——收窄到清单不能让它在子节里复活。
+    assert _squash("API Key fallback 延后") not in _squash(sec), \
+        "向使用方的说明里还写着 API Key fallback 延后，而 key-proxy 已交付"
+    assert "Node.js" in _section_lead(sec), "仍未交付的「仅 Node.js 后端」被删掉了"
+
+
+_ALL_CAPABILITY_ALIASES = [(cap, alias) for cap, aliases in _DELIVERED_CAPABILITIES.items()
+                           for alias in aliases]
+
+
+@pytest.mark.parametrize("cap,alias", _ALL_CAPABILITY_ALIASES)
+def test_limits_guard_fires_on_every_capability_alias(cap, alias):
+    """元用例：词表里**每一个**称呼都要真的进得了判定分支。
+
+    反例用的正是 R1 复审实测漏过的那种句子（"……暂不提供"）；正对照是如实说明已交付
+    的句子与真实存在的限制——它们不许被误伤，否则"全红"也能让反例那半边通过。
+    """
+    assert _limits_listing_delivered(f"- {alias} 暂不提供。\n"), (
+        f"{cap} 的称呼 {alias!r} 写成'暂不提供'时守卫没红——这个称呼进不了判定分支")
+    assert not _limits_listing_delivered(f"- {alias} 已交付，见部署手册。\n")
+    assert not _limits_listing_delivered(
+        "- 站点后端只支持 Node.js，不支持 Python。\n- CloudFront 全站不缓存。\n")
+
+
+def test_limits_guard_fires_on_format_only_edits_of_the_historical_item():
+    """R7 复审实测：旧 DEPLOY 限制清单原句只把 "API Key" 软折行或加强调就漏报。"""
+    old = "- PoC 仅 Node.js 后端（Python 3.13 延后）；MCP 仅 OAuth（API Key fallback 延后）\n"
+    for edited in (old, old.replace("API Key", "API\n  Key"), old.replace("API Key", "**API** Key")):
+        assert _limits_listing_delivered(edited), f"没拦住：{edited!r}"
+        assert _squash("API Key fallback 延后") in _squash(edited)
+    assert not _limits_listing_delivered("- API\n  Key 组件已交付，见 ⑤c。\n")
+
+
+def test_section_lead_stops_at_the_first_subheading_but_not_at_a_fenced_comment():
+    sec = ("## 已知限制\n\n- API Key 暂不提供。\n```bash\n# 注释不是标题\n```\n- 尾项\n"
+           "### 机制\n控制台已按独立角色设计\n")
+    lead = _section_lead(sec)
+    assert "尾项" in lead and "机制" not in lead
+    assert _limits_listing_delivered(lead), "清单里的反例必须仍被抓到"
 
 
 def test_readme_marks_the_phase_one_docs_as_snapshots():
-    """README 目录导览把一期的 spec/plan 当成有效入口，而它们是**一期快照**
-    （CLAUDE.md 的文档地图写着"已实现快照，勿改"）。新读者照它们理解当前架构会错
-    ——二期的控制台/API Key/统计/blue-green 都不在里面。
+    """README 不许把设计记录当成当前架构的有效入口：它们是**历史快照**
+    （CLAUDE.md 的文档地图写着"已实现快照，勿改"）。新读者照一期 spec/plan 理解当前架构
+    会错——二期的控制台/API Key/统计/blue-green 都不在里面。
+
+    README 重写后，目录导览只列 `docs/superpowers/` 这一整个目录、不再逐个点名一期那两份；
+    判据相应改成：**凡是**提到 `docs/superpowers` 或那两份文件名的行，都必须标明是快照。
     """
-    sec = _section(_read(README), "## 目录导览")
-    for row_needle in ("specs/2026-07-21-quick-site-builder-design.md",
-                       "plans/2026-07-21-quick-site-builder.md"):
-        row = _row(sec, row_needle)
-        assert "一期" in row and ("快照" in row or "勿改" in row), (
-            f"这一行没标明是一期快照：{row.strip()[:110]}")
+    txt = _read(README)
+    sec = _section(txt, "## 目录导览")
+    # 正对照：目录导览里确实有这一行（否则"没有任何一行"会让下面的循环空转成绿）
+    assert _row(sec, "docs/superpowers"), "目录导览里没有 docs/superpowers 那一行——本条空转"
+    needles = ("docs/superpowers", "2026-07-21-quick-site-builder-design.md",
+               "2026-07-21-quick-site-builder.md")
+    for ln in txt.splitlines():
+        if any(n in ln for n in needles):
+            assert "快照" in ln or "勿改" in ln, (
+                f"这一行提到了设计记录却没标明是快照：{ln.strip()[:110]}")
 
 
 # ── 活动文档不许再教「已被删除的实现」（Codex 复审 F1）────────────────────────
@@ -763,6 +856,428 @@ def test_delivery_docs_mark_every_undistributed_doc_pointer():
         + "\n  ".join(offenders)
         + f"\n在同一块里加上 {NOT_DISTRIBUTED_MARKERS[0]!r} 之类的标记，或者改指一份"
         "被跟踪的文档。gitignored 的过程记录**不能**充当状态真源。")
+
+
+# CommonMark 的行内链接目标：`<…>` 形态，或不含空白的裸目标（允许一层**平衡括号**，
+# 如 `missing(1).md`），后面可跟一个 title（`"…"` / `'…'` / `(…)`，可以换行）。
+# R2 复审：只认裸目标时 `[x](LICENSE "t")` 整条漏掉、`[x](<LICENSE>)` 误报；
+# R3 复审：平衡括号目标与跨行 title 漏掉。
+_MD_DEST = r"(?:<([^<>\n]*)>|((?:[^\s()<>]|\([^\s()<>]*\))+))"
+_MD_TITLE = r"(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^()]*\)))?"
+_MD_INLINE_LINK_RE = re.compile(r"\]\(\s*" + _MD_DEST + _MD_TITLE + r"\s*\)")
+# 引用式链接的定义行：`[label]: target "title"`
+_MD_REF_DEF_RE = re.compile(r"^ {0,3}\[[^\]\n]+\]:\s*(?:<([^<>\n]*)>|(\S+))", re.M)
+# 围栏代码块（``` 与 ~~~ 两种，闭合围栏至少与开头同长同符号）与行内代码里的 `[a](b)` 是示例，不是链接
+_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[^\n]*\n.*?^ {0,3}\1[`~]*[ \t]*$", re.M | re.S)
+_CODE_SPAN_RE = re.compile(r"(`+)(?!`).+?(?<!`)\1(?!`)", re.S)
+
+
+def _strip_code(text: str) -> str:
+    """剥掉围栏代码块与行内代码。行内代码**不跨段落**（空行即边界），`\\`` 是字面反引号——
+    R4 复审：跨全文配对反引号会让一个落单的反引号吞掉两段之间的真实链接。"""
+    out = []
+    for block in re.split(r"(\n[ \t]*\n)", _FENCE_RE.sub("", text)):
+        block = block.replace("\\`", "\0")          # 转义的反引号不参与配对
+        out.append(_CODE_SPAN_RE.sub("", block).replace("\0", "\\`"))
+    return "".join(out)
+
+
+def _md_link_targets(text: str) -> list:
+    """一份 markdown 里全部链接目标（行内 + 引用式定义）；围栏代码块与行内代码先剥掉。"""
+    prose = _strip_code(text)
+    return [a or b for rx in (_MD_INLINE_LINK_RE, _MD_REF_DEF_RE)
+            for a, b in rx.findall(prose)]
+
+
+def _broken_relative_links(text: str, tracked: set, base: str = "") -> list:
+    """Markdown 链接 `[文字](目标)` 里的**相对**目标中，新 clone 里不存在的那些。
+
+    去掉 `#锚点` 后按「相对文档所在目录」解析；目标是被跟踪的文件、或被跟踪文件的目录，
+    才算存在。外链（`scheme:`）与页内锚点（`#…`）不归本条管。围栏代码块先剥掉。
+    上面那条指针守卫看不见这一类：它只认以 `.md` 结尾或带 `/` 的 token，
+    `CONTRIBUTING.md#security-issue-notifications` 两样都不沾（R1 复审：README 的
+    Security / License 两节指向仓库里从没有过的 CONTRIBUTING.md 与 LICENSE）。
+    """
+    import posixpath
+
+    bad = []
+    for tgt in _md_link_targets(text):
+        if re.match(r"^[a-z][a-z0-9+.-]*:", tgt, re.I) or tgt.startswith("#"):
+            continue
+        path = posixpath.normpath(posixpath.join(base, tgt.split("#", 1)[0]))
+        if path not in tracked and not any(t.startswith(path + "/") for t in tracked):
+            bad.append(tgt)
+    return bad
+
+
+# 公开读者会点的那几份。CONTRIBUTING.md 是 README 的 Security 一节指过去的。
+_LINK_CHECKED_DOCS = (README, ROOT / "CONTRIBUTING.md", CLAUDE_MD, DEPLOY, CLIENT_SETUP,
+                      ROOT / "site-builder" / "clients" / "quick-desktop-proxy" / "README.md")
+
+
+def test_delivery_docs_relative_links_resolve_to_tracked_files():
+    tracked = _tracked_paths()
+    offenders = []
+    for doc in _LINK_CHECKED_DOCS:
+        base = doc.parent.relative_to(ROOT).as_posix()
+        base = "" if base == "." else base
+        offenders += [f"{doc.relative_to(ROOT)} → {t}"
+                      for t in _broken_relative_links(_read(doc), tracked, base)]
+    # 正对照：README 里确实有相对链接（否则提取规则写错时本条空转成绿）
+    assert [t for t in _md_link_targets(_read(README))
+            if not re.match(r"^[a-z][a-z0-9+.-]*:", t, re.I) and not t.startswith("#")], \
+        "README 里一条相对链接都没扫到——本条空转"
+    assert not offenders, "这些相对链接指向新 clone 里不存在的文件：\n  " + "\n  ".join(offenders)
+
+
+def test_relative_link_guard_fires_on_a_missing_target_and_ignores_external_links():
+    tracked = {"README.md", "LICENSE", "docs/security/x.md", "site-builder/docs/y.md"}
+    assert _broken_relative_links("[a](CONTRIBUTING.md#security-issue-notifications)", tracked) \
+        == ["CONTRIBUTING.md#security-issue-notifications"]
+    assert _broken_relative_links("[b](docs/y.md)", tracked) == ["docs/y.md"], "应按文档目录解析"
+    assert not _broken_relative_links("[b](docs/y.md)", tracked, base="site-builder")
+    assert not _broken_relative_links(
+        "[a](LICENSE) [b](docs/security/x.md#s) [c](https://e.com/x.md) [d](#top) "
+        "[e](docs/security/) [f](mailto:a@b.c)\n```\n[g](missing.md)\n```", tracked)
+    # title 与尖括号目标（R2 复审实测：旧提取规则对前者漏报、对后者误报）
+    assert _broken_relative_links('[a](LICENSE-missing "Documentation")', tracked) \
+        == ["LICENSE-missing"]
+    assert _broken_relative_links("[a](CONTRIBUTING-missing.md#s 'T')", tracked) \
+        == ["CONTRIBUTING-missing.md#s"]
+    assert _broken_relative_links("[a](<no such.md> (T))", tracked) == ["no such.md"]
+    assert not _broken_relative_links('[a](<LICENSE>) [b](LICENSE "t") [c]( LICENSE )', tracked)
+    # 引用式定义
+    assert _broken_relative_links("[x]: CONTRIBUTING.md#s \"t\"\n", tracked) == ["CONTRIBUTING.md#s"]
+    assert not _broken_relative_links("[x]: <LICENSE>\n[y]: https://e.com\n", tracked)
+    # 平衡括号目标与跨行 title（R3 复审实测漏报）
+    assert _broken_relative_links("[a](missing(1).md)", tracked) == ["missing(1).md"]
+    assert _broken_relative_links('[a](gone.md\n  "a title")', tracked) == ["gone.md"]
+    assert not _broken_relative_links('[a](LICENSE\n  "a title") [b](docs/security/x.md#s(1))',
+                                      tracked)
+    # 行内代码与 ~~~ 围栏里的 `[a](b)` 是示例（R3 复审实测误报）
+    assert not _broken_relative_links("写法示例：`[a](missing.md)`，或 ``[b](gone.md)``。", tracked)
+    assert not _broken_relative_links("~~~markdown\n[a](missing.md)\n~~~\n", tracked)
+    assert _broken_relative_links("~~~\n[a](x)\n~~~\n[b](missing.md)", tracked) == ["missing.md"]
+    # 转义反引号与跨段落的落单反引号不构成代码（R4 复审实测：旧正则把中间的真实链接吞掉）
+    assert _broken_relative_links("字面 \\` 号，[说明](missing.md)，再一个 \\` 号。", tracked) == ["missing.md"]
+    assert _broken_relative_links("一段里落单的 ` 号。\n\n[说明](missing.md)\n\n另一段落单的 ` 号。",
+                                  tracked) == ["missing.md"]
+    assert not _broken_relative_links("同段跨行的 `[a](missing.md)\n仍是代码` 示例。", tracked)
+    assert not _broken_relative_links("字面 \\` 号旁边的 [正常](LICENSE) 链接。", tracked)
+
+
+# ── 措辞类守卫的合同（resource 口径 / 控制台可选 / 限制清单里的已交付能力）────────
+#
+# 它们是**词法绊线**，钉的是**历史上真实出现过的那几句错误口径**，在**只改格式**的编辑下
+# 仍然要红：加引号 / 强调、软折行、改写成标题、列表、表格（含省略首尾竖线的 GFM 表格）、
+# 引导句加粗等——这些都是整理文档时会顺手做的事，六轮复审逐一实测过。
+# **不承诺拦住换了说法的意译**（例如把旧结论改写成新的句式、换一套同义词）：任何词法规则
+# 都关不上意译，追下去只会把守卫变成一个不可维护的自然语言分类器。意译的防线是评审本身。
+# 改这几条守卫时：旧句的格式变形必须仍红（各自的 *_fires_on_* 元用例），当前文档必须仍绿。
+
+# 「Claude Code 直连为什么失败」的口径：单账号实测到的是"带 resource 时换 token 报
+# invalid_grant"，**不是**"Cognito 不支持 resource"——Cognito 文档写明授权端点支持
+# resource binding（R1 复审，coordinator 读 docs.aws.amazon.com 核实）。旧口径曾同时住在
+# client-setup.md、代理 README 与 gen_onboarding 的生成模板里，只改前两处时第三处照样把
+# 绝对结论发给组织用户（R2 复审）。这里按**旧口径的具体句式**拦，不做通用措辞识别：
+# 否定引用（"别把这条读成'Cognito 不支持 resource'"）不在拦截范围内。
+_RESOURCE_CLAIM_DOCS = (README, CLAUDE_MD, DEPLOY, CLIENT_SETUP, GEN_ONBOARDING,
+                        ROOT / "site-builder" / "clients" / "quick-desktop-proxy" / "README.md")
+# 前两种句式要与 resource 同句才算（"Cognito 不支持 dynamic client registration" 是真的）；
+# 后两种是旧口径特有的**结论句式**（"任何用 Cognito…都会遇到"的泛化、"绕不开"的断言）。
+# 引号里的是引用——"别把这条读成『Cognito 不支持 resource』"这类否定引用放行（R3 复审）。
+# 这两组正则都跑在 `_plain()` 之后：强调符、反引号、引号已经去掉——**只改格式**的变形
+# （"**Cognito** 不支持""Cognito **不支持**""**`resource`** 参数问题绕不开"）一次性归一，
+# 不再逐个补字符类（R7 复审）。否定引用在归一之前由 `_drop_negated_quotes` 先剔掉。
+_OVERCLAIM_WITH_RESOURCE_RE = re.compile(r"[而，,]\s*Cognito\s*不支持|Cognito\s*不认")
+_OVERCLAIM_STANDALONE_RE = re.compile(
+    r"任何用\s*Cognito[^。]*?都会遇到|resource\s*参数问题绕不开")
+_FORMAT_CHARS_RE = re.compile(r"[*_`~“”\"「」『』‘’']")
+
+
+def _plain(s: str) -> str:
+    """去掉只影响排版的记号（强调、行内代码、删除线、各种引号），用于措辞匹配。"""
+    return _FORMAT_CHARS_RE.sub("", s)
+_QUOTED_RE = re.compile(r"[“\"「『][^“”\"「」『』]{0,160}[”\"」』]")
+# 引号前面紧挨着这些词才算**否定引用**（"别把这条读成『…』"）；肯定的引号结论照常参与检测
+# ——R4 复审：一律删掉引号内容会让"结论：『resource 参数问题绕不开』"这种旧口径加个引号就回归。
+# "读成 / 写成"本身不是否定（"结论应写成『…』"是肯定句，R5 复审），要有前面那几个否定词才算。
+_NEGATION_BEFORE_QUOTE_RE = re.compile(r"(?:别把|不要|不能|不是|并非|别再|不再|不应|不该)[^，。；]{0,24}$")
+# GFM 表格的分隔行（首尾竖线可省略）：| --- | :-: | 或 --- | ---
+_TABLE_DELIM_RE = re.compile(r"^\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$|^\|\s*:?-{3,}:?\s*\|$")
+
+
+# 否定只管到它自己那一截：上一个引号之后、最后一个转折词之后才是这个引号的"引导语"
+# ——R6 复审："不是 scope 问题而是「…」""不能写成「…」而应写成「…」"里的否定管不到后一个引号。
+# 前面紧挨"不"的（不应 / 不应该）不是转折。
+_CONTRAST_RE = re.compile(r"(?<!不)(?:而是|而应|而|但是|但|却|应当|应该|应)")
+
+
+def _drop_negated_quotes(sentence: str) -> str:
+    out, pos = [], 0
+    for m in _QUOTED_RE.finditer(sentence):
+        lead_in = _CONTRAST_RE.split(sentence[pos:m.start()])[-1]
+        if _NEGATION_BEFORE_QUOTE_RE.search(lead_in):
+            out.append(sentence[pos:m.start()])
+        else:
+            out.append(sentence[pos:m.end()])
+        pos = m.end()
+    out.append(sentence[pos:])
+    return "".join(out)
+
+
+def _prose_units(text: str, with_indent: bool = False) -> list:
+    """把 markdown 切成语义单元：**表格行、列表项、标题、段落各自成块**，块内折行拼回一行；
+    围栏代码块先剥掉，引用块的 `>` 前缀去掉。`with_indent=True` 时返回 `(缩进, 单元)`，
+    缩进取单元首行（嵌套列表的层级靠它，R8 复审）。
+
+    先前两条守卫把全文的换行一次删光再按句号切——一整张表或相邻列表项会并成"一句"，
+    于是表里另一行的"验收"能豁免这一行的"可选"，相邻两项又会互相误伤（R3 复审实测）。
+    表格按 GFM 的**分隔行**识别（首尾竖线可省略，R4 复审）：分隔行的上一行是表头，
+    之后到空行为止每行一条。
+    """
+    raws = _FENCE_RE.sub("", text).splitlines()
+    lines = [re.sub(r"^(?:>\s?)+", "", raw.strip()).strip() for raw in raws]
+    # 缩进在去掉引用块前缀（`> `）**之后**再量——引用块里的嵌套列表层级在 `>` 后面（R9 复审）
+    quote_prefix = re.compile(r"^[ \t]*(?:>[ \t]?)+")
+    rests = [raw[m.end():] if (m := quote_prefix.match(raw)) else raw for raw in raws]
+    indents = [len(r) - len(r.lstrip()) for r in rests]
+    in_table = [False] * len(lines)
+    for i, ln in enumerate(lines):
+        if i and "|" in lines[i - 1] and _TABLE_DELIM_RE.match(ln):
+            j = i - 1
+            while j < len(lines) and lines[j]:
+                in_table[j] = True
+                j += 1
+    units, buf = [], []
+    start = [0]
+
+    def emit(indent, unit):
+        units.append((indent, unit) if with_indent else unit)
+
+    def flush():
+        if buf:
+            emit(start[0], "".join(buf))
+            buf.clear()
+
+    for ln, table_row, ind in zip(lines, in_table, indents):
+        if buf and not table_row and re.fullmatch(r"=+|-+", ln):
+            # Setext 标题（段落下一行全是 = 或 -）：那一段就是标题
+            emit(start[0], "# " + "".join(buf))
+            buf.clear()
+            continue
+        if not ln:
+            flush()
+        elif table_row or ln.startswith(("|", "#")):
+            flush()
+            emit(ind, ln)
+        else:
+            if re.match(r"^(?:[-*+]|\d+[.)])\s", ln):
+                flush()
+            if not buf:
+                start[0] = ind
+            buf.append(ln)
+    flush()
+    return units
+
+
+def _resource_overclaims(text: str) -> list:
+    hits = []
+    for unit in _prose_units(text):
+        for sent in unit.split("。"):
+            sent = _plain(_drop_negated_quotes(sent))
+            if _OVERCLAIM_STANDALONE_RE.search(sent) or (
+                    "resource" in sent and _OVERCLAIM_WITH_RESOURCE_RE.search(sent)):
+                hits.append(sent.strip()[:90])
+    return hits
+
+
+def test_no_adopter_doc_says_cognito_does_not_support_resource():
+    offenders = [f"{p.relative_to(ROOT)}: {h}" for p in _RESOURCE_CLAIM_DOCS
+                 for h in _resource_overclaims(_read(p))]
+    assert not offenders, "这些位置仍把单账号实测写成了 Cognito 的产品能力缺失：\n  " + \
+        "\n  ".join(offenders)
+    # 正对照：实测本身必须还在（不许"把整段删掉就绿"）
+    assert "invalid_grant" in _read(CLIENT_SETUP) and "resource" in _read(GEN_ONBOARDING)
+
+
+def test_resource_overclaim_guard_fires_on_each_old_phrasing():
+    for old in ("Claude Code 带 RFC 8707 的 `resource`\n参数，而 **Cognito 不支持它**——换 token 失败。",
+                "它发的 `resource` 参数 Cognito 不认，见上面。",
+                "`resource` 才是。这与本平台的配置无关，任何用 Cognito 当 authorization server 的都会遇到。",
+                "| 免代理方案 | 无（`resource` 参数问题绕不开） |",
+                "它在 OAuth 请求里带 RFC 8707 的 `resource` 参数，Cognito 不支持，\n换 token 时报错。"):
+        assert _resource_overclaims(old), f"旧口径没被拦住：{old[:60]}"
+    assert not _resource_overclaims(
+        "所以别把这条读成\"Cognito 不支持 resource\"，也别把任何 invalid_grant 都归到它头上。")
+    assert not _resource_overclaims("Cognito 不支持 dynamic client registration。")
+    # 明确否定的引用（R3 复审实测假红）与段落边界
+    assert not _resource_overclaims("不能断言『任何用 Cognito 当 authorization server 的都会遇到』。")
+    assert not _resource_overclaims("不要再写「resource 参数问题绕不开」。")
+    assert not _resource_overclaims("任何用 Cognito 的部署都要先建 user pool。")
+    assert not _resource_overclaims("带 `resource` 时失败。\n\n另一段：Cognito 不认这个 app client。")
+    # R4 复审：肯定的引号结论照常抓；同一个否定引用软折行后照常放行
+    assert _resource_overclaims("结论：“resource 参数问题绕不开”。")
+    # R5 复审：旧句只加引号、以及"应写成『…』"这类肯定句，照样要抓
+    assert _resource_overclaims("它在 OAuth 请求里带 RFC 8707 的 `resource` 参数，“Cognito 不支持”，换 token 时报错。")
+    assert _resource_overclaims("它带 `resource` 参数，「Cognito 不支持」。")
+    assert _resource_overclaims("结论应写成「resource 参数问题绕不开」。")
+    assert not _resource_overclaims("别把这条读成「resource 参数问题绕不开」。")
+    assert _resource_overclaims("结论应说成「resource 参数问题绕不开」。")
+    assert _resource_overclaims("应读成「resource 参数问题绕不开」。")
+    assert not _resource_overclaims("不能写成「resource 参数问题绕不开」。")
+    assert not _resource_overclaims("不要说成「resource 参数问题绕不开」。")
+    assert not _resource_overclaims("不应该写成「resource 参数问题绕不开」。")
+    # 局部强调 / 引号（R7 复审）
+    for fmt in ("带 `resource` 参数，**Cognito** 不支持，换 token 失败。",
+                "带 `resource` 参数，Cognito **不支持**，换 token 失败。",
+                "| 免代理方案 | 无（**`resource`** 参数问题绕不开） |",
+                "它发的 `resource` 参数 *Cognito* 不认。"):
+        assert _resource_overclaims(fmt), f"只改格式的旧句没被拦住：{fmt}"
+    # 否定管不过转折（R6 复审）
+    assert _resource_overclaims("不是 scope 问题而是「resource 参数问题绕不开」。")
+    assert _resource_overclaims("不能写成「scope 缺失」而应写成「resource 参数问题绕不开」。")
+    assert _resource_overclaims("结论：“任何用 Cognito 当 authorization server 的都会遇到”。")
+    assert not _resource_overclaims("不能断言『任何用 Cognito 当 authorization server 的\n都会遇到』。")
+
+
+# ── 仍然成立的限制不能随过程记录一起删掉（R2 复审）────────────────────────
+
+def test_deploy_md_says_the_cdk_toolchain_is_unpinned_while_it_is():
+    """README 重写时删掉了"源码不固定 CDK 工具链"那段（连同单账号的版本表），而事实没变。
+
+    判据跟着事实走：只要还在用 `aws-cdk@latest`、或 deployer 的 `aws-cdk-lib` 不是精确钉死，
+    DEPLOY.md 的「本机工具链」与「已知限制」就必须说。全部钉死之后这条自动放行。
+    """
+    deploy = _read(DEPLOY)
+    req = _read(ROOT / "site-builder" / "deployer" / "infra" / "requirements.txt")
+    unpinned = "aws-cdk@latest" in deploy or not re.search(r"^aws-cdk-lib==", req, re.M)
+    if not unpinned:
+        return
+    assert "不随源码固定" in _section(deploy, "### 本机工具链"), \
+        "「本机工具链」没说 CDK CLI / aws-cdk-lib 的版本不随源码固定"
+    assert "CDK 工具链" in _section_lead(_section(deploy, "## 已知限制（向使用方说明）")), \
+        "「已知限制」清单里没有 CDK 工具链不固定这一条"
+
+
+def _console_called_optional(text: str) -> list:
+    """把控制台说成「可选」、却没在**同一语义单元的同一句**里交代验收要求它的句子。
+
+    以冒号结尾的引导句（"两个可选组件："）管到紧跟其后的每个列表项——那是 R2 修掉的
+    原句形态，逐单元判时引导句与列表项各不沾边，必须拼起来看。
+    """
+    out, lead, parents = [], "", []      # parents：[(缩进, 以冒号结尾的父列表项)]
+    headings = []                         # [(级别, 标题)]：子标题继承上级标题（R10 复审）
+    for indent, raw in _prose_units(text, with_indent=True):
+        unit = _plain(raw)      # 强调 / 引号只是排版（R7 复审："「两个可选组件：」"）
+        if unit.startswith("#"):
+            level = len(unit) - len(unit.lstrip("#"))
+            headings = [(lv, h) for lv, h in headings if lv < level]
+            own = unit
+            title = unit.lstrip("#").strip().rstrip("：:").strip()   # "### 控制台（…）：" 这种标签式标题
+            # 只让**组件名式的子标题**继承上级标题（"## 两个可选组件" 下的 "### 控制台"）：短、不成句。
+            # 正文段落与成句的子标题不继承——DEPLOY「⑤c API Key 组件（可选）」一节里的
+            # "### 首次部署后开关是关的，要去控制台开一次"说的是控制台这个**地方**，不是把它列进可选组。
+            if len(title) <= 40 and not re.search(r"[，。；：,;]", title):
+                unit = "".join(h for _, h in headings) + unit
+            headings.append((level, own))
+        if re.match(r"^(?:[-*+]|\d+[.)])\s", raw):
+            # 以冒号结尾的**父列表项**（"- 两个可选组件："）只管到它自己的子项：同级或更外层的
+            # 下一项出现时出栈（R8 复审）
+            parents = [(i, p) for i, p in parents if i < indent]
+            ends_with_colon = unit.rstrip().endswith(("：", ":"))
+            own = unit
+            unit = lead + "".join(p for _, p in parents) + unit
+            if ends_with_colon:
+                parents.append((indent, own))
+        elif "|" in unit:
+            # 引导句同样管到紧随的**表格行**（R6 复审：旧清单改写成"组件 | 说明"表格即漏报）；
+            # 挂在父列表项下面的表格也一样（R9 复审）；可选组之外的外层表格退出父作用域
+            parents = [(i, p) for i, p in parents if i < indent]
+            unit = lead + "".join(p for _, p in parents) + unit
+        else:
+            parents = []
+            # 引导句加了强调、引号或写成标题（"### 两个可选组件"）——都管到紧随的列表项
+            # （R5 复审：只认"以冒号结尾"时这些改写都漏掉）
+            lead = unit if unit.rstrip().endswith(("：", ":")) or unit.startswith("#") else ""
+        out += [x.strip()[:90] for x in re.split(r"[。；]", unit)
+                if ("控制台" in x or "⑤b" in x) and "可选" in x and "验收" not in x]
+    return out
+
+
+def test_docs_do_not_call_the_console_optional_while_acceptance_needs_it():
+    """验收集要求控制台在（`verify_deployed_components.py` 无条件查 panel、`verify_console_e2e.py`
+    整条打它），而改写后的 README / DEPLOY.md 把它标成了「可选组件」——照着跳过它的采用者
+    过不了同一本手册定义的完成条件（R2 复审）。验收集不再要求它时，这条自动放行。"""
+    accept = _section(_read(DEPLOY), "## ⑦ 部署后验收")
+    if "verify_console_e2e.py" not in accept:
+        return
+    offenders = [f"{p.name}: {x}" for p in (README, DEPLOY) for x in _console_called_optional(_read(p))]
+    assert not offenders, "这些句子把控制台说成可选，却没说验收要求它：\n  " + "\n  ".join(offenders)
+
+
+def test_console_optional_guard_fires_on_the_old_wording():
+    assert _console_called_optional("两个可选组件：\n\n- **控制台**（`console.x`）：在网页上看站点。")
+    # 引导句加粗 / 写成标题（R5 复审）
+    assert _console_called_optional("**两个可选组件：**\n\n- **控制台**（`console.x`）：在网页上看站点。")
+    assert _console_called_optional("### 两个可选组件\n\n- **控制台**（`console.x`）：在网页上看站点。")
+    for lead in ("「两个可选组件：」", "“两个可选组件：”", "*两个可选组件：*", "__两个可选组件：__",
+                 "两个可选组件\n======", "两个可选组件\n------"):
+        assert _console_called_optional(lead + "\n\n- **控制台**：在网页上看站点。"), lead
+        assert not _console_called_optional(
+            lead.replace("两个可选组件", "另外两个组件") + "\n\n- **控制台**：在网页上看站点。"), lead
+    # 父列表项作引导句、原两项缩进成子列表（R8 复审），三种列表标记
+    for mark in ("-", "*", "1."):
+        nested = f"{mark} 两个可选组件：\n  - **控制台**：在网页上看站点。\n  - **API Key**：默认不部署。\n"
+        assert _console_called_optional(nested), mark
+        assert not _console_called_optional(nested.replace("两个可选组件", "另外两个组件")), mark
+        # 引用块里的父子列表（R9 复审：缩进要在 `>` 之后量）
+        assert _console_called_optional("".join("> " + ln + "\n" for ln in nested.splitlines())), mark
+        # 父列表项下面的表格（有 / 无首尾竖线）
+        for tbl in ("  | 组件 | 说明 |\n  |---|---|\n  | 控制台 | 网页管理 |\n",
+                    "  组件 | 说明\n  --- | ---\n  控制台 | 网页管理\n"):
+            assert _console_called_optional(f"{mark} 两个可选组件：\n\n" + tbl), mark
+            assert not _console_called_optional(f"{mark} 另外两个组件：\n\n" + tbl), mark
+        assert _console_called_optional("".join(">> " + ln + "\n" for ln in nested.splitlines())), mark
+        # 可选组结束后的外层表格不受父项引导句影响
+        assert not _console_called_optional(
+            f"{mark} 两个可选组件：\n  - **API Key**：默认不部署。\n\n| 组件 | 说明 |\n|---|---|\n| 控制台 | 标准部署 |\n"), mark
+        # 可选组之外的同级项不受父项引导句影响
+        assert not _console_called_optional(
+            f"{mark} 两个可选组件：\n  - **API Key**：默认不部署。\n{mark} 控制台：标准部署。\n"), mark
+    assert not _console_called_optional("### 另外两个组件\n\n- **控制台**：标准部署。\n- **API Key**（可选）。")
+    # 引导句 + 表格（R6 复审），有 / 无首尾竖线
+    for tbl in ("| 组件 | 说明 |\n|---|---|\n| 控制台 | 网页管理 |\n",
+                "组件 | 说明\n--- | ---\n控制台 | 网页管理\n"):
+        assert _console_called_optional("两个可选组件：\n\n" + tbl)
+        assert not _console_called_optional("另外两个组件：\n\n" + tbl)
+    assert _console_called_optional("## ⑤b 自助管理控制台 — panel（**可选**）\n正文。")
+    assert _console_called_optional("控制台（⑤b）与\nAPI Key 组件（⑤c）是可选的。")
+    assert not _console_called_optional("API Key 组件（⑤c）是可选的；控制台（⑤b）照常部署。")
+    assert not _console_called_optional("控制台（⑤b）不是必需的，但「⑦ 部署后验收」要求它。")
+    assert not _console_called_optional("```\n 控制台 console · 可选的 API Key\n```")
+    # 表格行与列表项各自成单元（R3 复审实测：合并后同表另一行的"验收"豁免了本行的"可选"）
+    assert _console_called_optional(
+        "| `site-builder/DEPLOY.md` | 部署手册：部署后验收 |\n| `site-builder/panel/` | 控制台（可选） |")
+    assert not _console_called_optional("- 控制台：标准部署\n- API Key：可选\n")
+    # 引导句写成 H2/H3、两项名称写成下一级标题（R10 复审）
+    for top in ("##", "###"):
+        sub = top + "#"
+        doc = (f"{top} 两个可选组件：\n\n{sub} **控制台**（`console.{{你的域名}}`）：\n\n在网页上看站点。\n\n"
+               f"{sub} API Key\n\n默认不部署。\n")
+        assert _console_called_optional(doc), top
+        assert not _console_called_optional(doc.replace("两个可选组件", "另外两个组件")), top
+        # 成句的子标题说的是"去控制台做某事"，不是把控制台列进可选组
+        assert not _console_called_optional(f"{top} API Key 组件（可选）\n\n{sub} 首次部署后开关是关的，要去控制台开一次\n")
+        # 同级 / 上级标题退出可选组
+        assert not _console_called_optional(
+            f"{top} 两个可选组件\n\n{sub} API Key\n\n默认不部署。\n\n{top} 控制台\n\n标准部署。\n"), top
+    # GFM 表格可省略首尾竖线（R4 复审）：照样逐行判
+    no_edge = "路径 | 内容\n--- | ---\n`site-builder/DEPLOY.md` | 部署后验收\n`site-builder/panel/` | 控制台（可选）\n"
+    assert _console_called_optional(no_edge)
+    assert not _console_called_optional(no_edge.replace("控制台（可选）", "控制台"))
+    assert not _console_called_optional(
+        "另外两个组件：\n\n- **控制台**：标准部署包含它，验收要求它。\n- **API Key**（可选）：默认不部署。")
 
 
 def test_claude_md_status_section_points_at_a_tracked_truth_source():

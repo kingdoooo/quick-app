@@ -1,12 +1,18 @@
-# Quick Desktop MCP stdio 代理
+# 部署 MCP 的本地 stdio 代理（OAuth 登录与续期）
 
-Quick Desktop 的 Remote MCP 只支持静态 Headers，不支持 OAuth 授权码流程
-（2026-07-29 实测，直接填 AgentCore endpoint 报 401）。本目录提供 Local MCP
-（stdio）代理作为 workaround：
+这个代理替 Agent 客户端完成对部署 MCP 的 OAuth 登录，并自动续期 token。
+两类客户端默认都靠它接入：
+
+- **Claude Code**：它在 OAuth 请求里带 RFC 8707 的 `resource` 参数，在本平台的 Cognito
+  配置下换 token 会报 `invalid_grant`（单账号实测，证据等级与排查口径见
+  `site-builder/docs/client-setup.md`）。代理自己实现 OAuth、不发这个参数。
+- **Amazon Quick Desktop**：它的 Remote MCP 只支持静态 Headers，不支持 OAuth 授权码流程
+  （实测直接填 AgentCore endpoint 报 401）。平台启用了可选的 API Key 组件时，
+  Quick Desktop 也可以改走 Remote MCP + `X-API-Key`，见 `site-builder/docs/client-setup.md`。
 
 ```
 ┌───────────────┐  stdio   ┌──────────────┐  HTTPS + Bearer  ┌───────────────────┐
-│ Quick Desktop │ ◀──────▶ │  index.js    │ ───────────────▶ │ Bedrock AgentCore │
+│  Agent 客户端  │ ◀──────▶ │  index.js    │ ───────────────▶ │ Bedrock AgentCore │
 └───────────────┘          └──────────────┘                  └───────────────────┘
                                   │
                           ~/.site-builder-deploy-token.json
@@ -17,10 +23,10 @@ Quick Desktop 的 Remote MCP 只支持静态 Headers，不支持 OAuth 授权码
 ## 使用
 
 ```bash
-# 1) 首次 OAuth（浏览器飞书登录，token 落盘，之后代理自动续期）
+# 1) 首次 OAuth（浏览器走 IdP 登录，token 落盘，之后代理自动续期）
 node auth.js "<endpoint_url>" "<client_id>"
 
-# 2) 注册为 Local MCP。推荐直接编辑
+# 2) 注册为 Local MCP（以 Quick Desktop 为例；Claude Code 的注册命令见 client-setup.md）。推荐直接编辑
 #    ~/.quickwork/profiles/{profile}/mcp_config.json（重启生效）：
 #      "site-builder-deploy": {
 #        "command": "node",

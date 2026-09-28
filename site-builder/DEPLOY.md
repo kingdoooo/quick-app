@@ -1,11 +1,22 @@
-# Quick 自动化建站方案 — 部署 Runbook
+# Site-Builder 部署手册
 
-本文档是把本方案部署到**你自己的 AWS 账号**的操作手册，覆盖的是**需要真实 AWS
-资源、DNS、IdP 凭证**的部署门禁——这些无法自动化，也是单元测试覆盖不到的部分。
+这份手册讲怎么把 Site-Builder 部署到**你自己的 AWS 账号**。它覆盖的是需要真实 AWS
+资源、DNS 和 IdP 凭证的那部分操作：这些没法自动化，单元测试也覆盖不到。
 
-**部署的是当前最新版本（含二期全部里程碑：控制台、API Key 交换层、访问统计、
-blue/green 原子更新）**：照 ①→⑦ 走一遍即可（⑤b 控制台、⑤c API Key 均可选），
-无需先部旧版本再升级。
+全新账号照「部署顺序总览」走一遍即可，不需要先部署旧版本再升级。API Key 组件（⑤c）是
+可选的；控制台（⑤b）不影响站点与 MCP 通道，但「⑦ 部署后验收」要求它，所以标准部署包含它。
+
+## 怎么读这份手册
+
+1. **先备齐「0. 前置要求」**：账号与区域、域名与证书、身份源、本机工具链、CDK bootstrap。
+   部署前建议再读一遍「决定安全边界的几项配置」。
+2. **再照「部署顺序总览」执行**。①–⑦ 是组件编号，不是执行顺序；全新账号上执行器栈（④）
+   要部署两次。
+3. **每个阶段的具体操作**在「① 身份层」到「⑥ 客户端接入」各节；部署完照「⑦ 部署后验收」
+   跑验收脚本，再对一遍「部署后回填检查清单」。
+4. **部署之后才用得到的内容**：会话密钥轮转（「0. 前置要求」下的「轮转密钥」一节）、访问统计
+   运维（⑤d）、拆除平台（「把平台从账号里拆掉」）、排障（「per-site 部署租约」）与「已知限制」。
+5. 「S1 加固」一节只适用于从旧版本升级上来的环境，全新部署可以跳过。
 
 - **区域**：`us-east-1`（Lambda@Edge 与 CloudFront 用的 ACM 证书共同强制）
 - 下文 `{account_id}`、`{base_domain}` 等**花括号占位符需手工替换成你的实际值**
@@ -14,7 +25,7 @@ blue/green 原子更新）**：照 ①→⑦ 走一遍即可（⑤b 控制台、
   不需要手改；本文档里的命令是给你复制粘贴执行的，必须先替换
 - **中心配置**：`site-builder/config.ini` 与 `router/config.ini`（都从同目录
 `.example` 复制，gitignored；部署过程中逐段回填）
-- 设计文档 `docs/superpowers/specs/2026-07-21-quick-site-builder-design.md`，实施计划 `docs/superpowers/plans/2026-07-21-quick-site-builder.md`
+- 设计与实施记录在 `docs/superpowers/`，那是各阶段的历史快照，不代表当前实现；当前行为以本手册与代码为准
 
 ---
 
@@ -27,7 +38,7 @@ Step Functions / CodeBuild / Aurora DSQL 的权限。
 
 区域**必须 `us-east-1`**：Lambda@Edge 函数与 CloudFront 用的 ACM 证书强制在
 us-east-1。这不是偏好而是硬约束——
-换区需要改代码（见文末 Minor 里 region 硬编码的两处）。
+换区需要改代码（例如 Edge 给 S3 请求签名时，区域写死为 `us-east-1`）。
 
 #### 建议：部署到一个**专用**账号（是建议，不是硬要求）
 
@@ -825,6 +836,11 @@ key 只在 ⑤ 的最后一步删。
 | Python  | 3.12+（宿主 `python3` 另需 `boto3` / `pip-system-certs` / `cryptography`，见下）  |
 | Node.js | 仅 `npx`（CDK 与 MCP Inspector）                                       |
 
+**CDK 工具链的版本不随源码固定**：CLI 用 `aws-cdk@latest`，`site-builder/deployer/infra/requirements.txt`
+里的 `aws-cdk-lib` 只钉了范围（`router/infrastructure/requirements.txt` 那份是精确版本）。所以在不同时间用
+同一份源码部署，装到的 CDK CLI 与 `aws-cdk-lib` 可能不同，synth 出的模板也可能有差异。需要严格复现时，
+自己把 CLI 与两份 `aws-cdk-lib` 钉死，并把实际用到的版本记进部署记录（部署命令不会替你记）。
+
 **本地 Python 环境一条命令建齐**：`bash site-builder/scripts/bootstrap_venvs.sh`——前置检查
 （`python3.12` 必须有；不带路径的 `python3` 必须 ≥ 3.10，否则打印解法并退出）+ 五个 venv 全部
 `--clear` 重建 + 按各自清单安装；`--host-deps` 再给 `python3` 装 `boto3`、`pip-system-certs` 与
@@ -882,7 +898,7 @@ bootstrap** ⇒ 漏了这一步的症状是白跑一整趟 Docker bundling 之�
 
 
 CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只在 cache miss
-时执行），PoC 流量下成本影响可忽略；高流量场景需评估精细缓存（二期）。
+时执行），PoC 流量下成本影响可忽略；高流量站点要单独评估成本。
 
 ### 首次部署要多久，以及必然撞到的几处
 
@@ -925,17 +941,16 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
 
 ## 部署顺序总览
 
-**这份 Runbook 部署的是当前最新版本（含二期全部里程碑）。全新账号照 ①→⑦ 走一遍
-即可，不需要"先部一期再升级"。**
+**全新账号照下面的顺序走一遍即可，不需要先部署旧版本再升级。**
 
 组件间有依赖，必须按序：
 
 ```
 ①身份层 → ③DSQL → ④执行器(第一次) → 回填 [SessionKeys] → ②路由层 → 回填 edge_role_arn → ④执行器(第二次) → auth → ⑤部署MCP → ⑤b控制台 → 夹具站点 → ⑥客户端接入 → ⑦部署后验收
  deploy_pool.py    cluster   SFN+Lambda+两把CMK  session_key_       CloudFront   [Deployer]         同一条 cdk        deploy_   AgentCore   deploy_panel   ensure_      Skill+MCP        验收集（七条）
- (Task 3)          (Task 13) (Task 17)           fingerprint.py     (Task 8)     edge_role_arn      deploy 再跑一次    auth.py   (Task 20)   (二期 M3)      fixture_     (Task 22)
+                                                 fingerprint.py                  edge_role_arn      deploy 再跑一次    auth.py                              fixture_
                                                  --from-stack                                                                                              site.py
-                                             ⑤c API Key（可选，二期 M4）· ⑤d 访问统计（二期 M5）
+                                             ⑤c API Key（可选）· ⑤d 访问统计
 ```
 
 **全新账号上 ④ 要部两次，这不是笔误，是一个真实的环形依赖**：② 与 auth / ⑤b 依赖 ④ 建的两把 CMK
@@ -979,7 +994,7 @@ CloudFront 全站禁缓存是鉴权正确性的前提（origin-request 事件只
 **已经在跑的环境要单独升级到 M5，见下面的 `⑤d 访问统计` 一节——那里的顺序是硬依赖，
 反了不会报错，只会静默丢数据。**
 
-依赖关系：**② 与 auth / ⑤b 都需要 ④ 的两把 CMK**（`config.ini` 的 `[SessionKeys]` 回填之后才能部）；② 还需要 ① 的 edge role；④ 需要 ① 的 boundary、**② 的 edge_role_arn**、③ 的 DSQL endpoint；⑤ 需要 ④ 的 state_machine_arn 与 ① 的 Cognito；⑤b 另需 ② 的 edge_role_arn 与 ④ 的五张表（可选组件：不部署它只是没有控制台，站点与 MCP 通道不受影响）。
+依赖关系：**② 与 auth / ⑤b 都需要 ④ 的两把 CMK**（`config.ini` 的 `[SessionKeys]` 回填之后才能部）；② 还需要 ① 的 edge role；④ 需要 ① 的 boundary、**② 的 edge_role_arn**、③ 的 DSQL endpoint；⑤ 需要 ④ 的 state_machine_arn 与 ① 的 Cognito；⑤b 另需 ② 的 edge_role_arn 与 ④ 的五张表（不部署它站点与 MCP 通道不受影响，但 ⑦ 的验收集里有几条要求控制台在——例如 `verify_deployed_components.py` 与 `verify_console_e2e.py`——所以标准部署包含它）。
 
 **④ 与 ② 互为前置 ⇒ 全新账号上 ④ 部两次**（第一次只为建 CMK，`edge_role_arn` 空着也能部完；② 之后回填再部第二次，十个 step Lambda 这时才拿到真值）。上面的箭头图与 ④ 那一节的「前置」写的是同一件事。
 
@@ -1679,7 +1694,7 @@ PY
 
 ---
 
-## ① 身份层（Task 3）
+## ① 身份层
 
 **产出**：Cognito User Pool（平台专用）+ IdP 联邦 + site/mcp 两个 app client
 + pre-token 触发器；回填 `config.ini [Cognito]` 全部 4 项。
@@ -1912,7 +1927,7 @@ pre-token 触发器、managed login branding。命令与实测基线见前面
 
 ---
 
-## ② 路由 + 鉴权层 — WebRouterStack（Task 8）
+## ② 路由 + 鉴权层 — WebRouterStack
 
 **产出**：CloudFront 分发（`*.{base_domain}`）+ 扩展路由表 + 前端桶；回填 `config.ini [Deployer] edge_role_arn`。
 
@@ -2032,7 +2047,7 @@ name**；值必须是裸 `true`/`false`——configparser 会把行内注释并�
    > Edge 不受影响，open 后重跑。忘 apply：**没有任何症状**，只有 `verify_deployed_edge.sh` ⑤ 会红。
    > 需要的权限是操作者自己的 `cloudformation:DescribeStacks / GetTemplate / GetStackPolicy / SetStackPolicy`
    > ——CDK bootstrap 的角色没有 SetStackPolicy，脚本刻意不走它们。
-3. 记录 CfnOutput 的 **EdgeRoleArn**，回填 `site-builder/config.ini [Deployer] edge_role_arn`（Task 17 执行器需要它给站点 Function URL 授权）。记录 **DistributionDomainName**。
+3. 记录 CfnOutput 的 **EdgeRoleArn**，回填 `site-builder/config.ini [Deployer] edge_role_arn`（④ 执行器需要它给站点 Function URL 授权）。记录 **DistributionDomainName**。
 
    **换 edge role 之后**（路由层栈重建、角色重创、或修正写错的 `edge_role_arn`）：重跑 ⑤ `deploy_auth.py`、⑤b `deploy_panel.py`、⑤c `deploy_key_proxy.py` 即可——三个脚本每次都按期望集合等值收敛各自 Function URL 的 resource policy（读回、替换内容不对的同名语句、删野 Sid、写后读回核对；一致时零写入）。IAM 在角色被删时会把 policy 里的 Principal 改写成已删角色的唯一 ID，所以"同名语句已存在"不等于授权还对；`verify_deployed_components.py` 对三条都断言。
 4. **DNS：栈里没有任何 Route53 资源，这一步必须手工做。** 在 `{base_domain}` 加通配符
@@ -2062,7 +2077,7 @@ name**；值必须是裸 `true`/`false`——configparser 会把行内注释并�
 
    > **顺手核对一件事**：`aws acm describe-certificate … --query Certificate.InUseBy`
    > 现在应该出现那个分发的 ARN。这是"证书真的被用上了"最直接的判据，比读配置可靠。
-5. **部署 auth-service Lambda**（Task 5 的登录端点，依赖①的 Cognito + 本步骤的路由表；
+5. **部署 auth-service Lambda**（登录端点，依赖①的 Cognito + 本步骤的路由表；
    **还依赖上一步回填的 `[Deployer] edge_role_arn`**，脚本要用它授权 Function URL）：
   ```bash
    cd ../../site-builder/auth && python3 deploy_auth.py
@@ -2117,7 +2132,7 @@ name**；值必须是裸 `true`/`false`——configparser 会把行内注释并�
 
 ---
 
-## ③ Aurora DSQL cluster（Task 13）
+## ③ Aurora DSQL cluster
 
 **产出**：共享 DSQL cluster；回填 `config.ini [DSQL] cluster_endpoint`。
 
@@ -2182,9 +2197,11 @@ migrator role 能在本 schema 建表，但建其他 schema / 建角色 / 改 IA
 
 ---
 
-## ④ 异步执行器 — SiteDeployerStack（Task 17）
+## ④ 异步执行器 — SiteDeployerStack
 
 **产出**：jobs/sites 表、artifacts 桶、CodeBuild、状态机 `site-deploy`、10 个 step Lambda、undeploy Lambda、runtime boundary、exec role；回填 `config.ini [Deployer] state_machine_arn`。
+
+**CodeBuild 角色收窄**：装站点依赖的 CodeBuild 跑的是不可信代码，所以它在 S3 上只有两条权限：`validated/*` 只读（validate 产出的不可变工件，不是 owner 上传的原包）、`artifacts/*` 只写；对 CDK bootstrap 桶零权限。这组权限由 `deployer/tests/security_contracts.py` 按等值断言守着。
 
 **前置**：`[DSQL] cluster_endpoint`（来自③）必须已回填。`[Deployer] edge_role_arn`（来自②）分两种情况：
 
@@ -2242,7 +2259,7 @@ python3 site-builder/scripts/deploy_fixture.py site-builder/fixtures/static-hell
 
 ---
 
-## ⑤ 部署 MCP — AgentCore Runtime（Task 20）
+## ⑤ 部署 MCP — AgentCore Runtime
 
 **代码已就绪并在本地真实容器里验证过**（ARM64 镜像构建 → 起容器 → 完整 MCP
 握手 → Bearer token 的 email claim 被 `_caller_email()` 正确解出 → 平台注入的
@@ -2333,7 +2350,7 @@ AgentCore 校验不认。`deploy_agentcore.py` 已带 `--provenance=false` 规�
 - 部署三件套：`deploy_site` / `confirm_upload` / `get_deploy_status`
 - 管理五件套：`list_my_sites` / `undeploy_site` / `update_site_permissions` /
   `manage_collaborators` / `get_site_permissions`
-- 统计（二期 M5）：`get_site_analytics`
+- 统计：`get_site_analytics`
 
 <!-- tool-list:end -->
 
@@ -2376,7 +2393,7 @@ MCP runtime 角色靠 `dynamodb:Attributes` 条件把可写字段收窄。**这�
 
 ---
 
-## ⑤b 自助管理控制台 — panel（二期 M3）
+## ⑤b 自助管理控制台 — panel
 
 业务人员在 `https://console.{base_domain}/` 自助管理站点权限/协作者/所有权/
 部署历史/下线；平台管理员另有全局站点视图与管理员名单。**站点仍然只能在 Agent
@@ -2437,7 +2454,7 @@ DNS 都只有 `*.{base_domain}` 通配，apex 上没有任何东西在听，落�
 
 ---
 
-## ⑤c API Key 组件（二期 M4，**可选**）
+## ⑤c API Key 组件（**可选**）
 
 给"只能配静态 Header 的 MCP 客户端"（如 Quick Desktop 的 Remote MCP）一条不走
 浏览器 OAuth 的路：客户端把 `X-API-Key: sk-…` 打到 `https://mcp.{base_domain}/`，
@@ -2647,7 +2664,7 @@ protection，不会也不该被删**（历史 Key 行是审计证据）；断言
 
 ---
 
-## ⑤d 访问统计（二期 M5）
+## ⑤d 访问统计
 
 站点 owner 在控制台看自己站点的 PV/UV 趋势与访问明细，Agent 侧同一组数字由 MCP 的
 `get_site_analytics` 返回。数据来自 **Edge 主动埋点**（不是 CloudFront 访问日志）：
@@ -2799,7 +2816,7 @@ python3 site-builder/scripts/verify_analytics_e2e.py
 rollup **重算即修复**、**绝不封今天**、封口后面板读的是聚合表、panel 与 MCP 返回
 **字段级相同**的 series。
 
-**它的 MCP 那一段要求用户 OAuth token 是新鲜的**（二期把 refresh TTL 收到 1 天）。
+**它的 MCP 那一段要求用户 OAuth token 是新鲜的**（refresh token 有效期为 1 天）。
 过期时先登录一次：`node site-builder/clients/quick-desktop-proxy/auth.js`。
 拿不到 token **不 SKIP 而是记 FAIL**（设计如此：`MIN_CHECKS` 达不到就
 `sys.exit(1)`，「验收未完成」不能长得像「验收通过」）。
@@ -3187,7 +3204,7 @@ python3 site-builder/scripts/ensure_fixture_site.py   # 幂等：site_id=e2e-pro
 
 ---
 
-## ⑥ 客户端接入（Task 22）
+## ⑥ 客户端接入
 
 **Claude Code（先做，自动化程度高）**：
 
@@ -3571,7 +3588,7 @@ SSM 参数：`/site-builder/site-client-secret`（① 的 `deploy_pool.py` 写�
 `/site-builder/login-flow-secret`（`deploy_auth.py` 的 `ensure_secret` 缺省补建）。
 **会话签名密钥不在 SSM**：两把 KMS CMK 由 ④ 的栈创建，指纹回填在 `[SessionKeys]`。
 
-## per-site 部署租约（M7 加固；排障必读）
+## per-site 部署租约（排障必读）
 
 同一站点同时只允许**一次**部署或下线。实现是 jobs 表里一条 `site-lease#<site_id>`
 行（不是 job；故意不带 site_id/owner/status，所以不进任何 GSI、也不被 sweeper
@@ -3589,36 +3606,34 @@ SSM 参数：`/site-builder/site-client-secret`（① 的 `deploy_pool.py` 写�
   只升级一部分 = 互斥只对一部分入口生效（另一部分是后门）。升级窗口内避免
   并发部署同一站点。
 
-## 合同收紧：frontend/index.html 必须存在且非空
+## 站点包必须带非空的 frontend/index.html
 
-`contract/redlines.py` 新增要求：任何 tier 的站点包必须带非空的
-`frontend/index.html`（Edge 把 `/` 固定改写为 `/{prefix}/index.html`，缺它则
-首页**永久 403**，而健康门/冒烟都发现不了）。**升级后的行为变化**：此前能部署
-成功（但首页 403）的包，现在在 validate 一步就被拒，错误信息点名 index.html。
-存量六个真实站点都带 index.html，不受影响；若有用户报"以前能部署现在不行"，
-先看是不是这一条。
+任何 tier 的站点包都必须带非空的 `frontend/index.html`，否则在 validate 一步就被拒，
+错误信息会点名 index.html（规则在 `contract/redlines.py`）。原因：Edge 把 `/` 固定改写为
+`/{prefix}/index.html`，缺了它首页会**永久 403**，而健康检查和冒烟测试都发现不了。
 
-## 已知限制与延后项（向客户声明）
+## 已知限制（向使用方说明）
 
-- 顶域 cookie 使所有 `app-*.{base_domain}` 站点共享一次登录（PoC 可接受，产品化需按站点隔离会话）
-- PoC 仅 Node.js 后端（Python 3.13 延后）
-- MCP 接入有 OAuth 与 **API Key** 两条路（API Key 走可选组件 key-proxy，二期 M4 已交付；
-  无 `[ApiKey]` 段时该组件整体不存在）
-- CloudFront 全站禁缓存（正确性优先；精细缓存延后）
-- 详见设计文档 §8 风险 / §9 范围外
+- 所有 `app-*.{base_domain}` 站点共享一次登录：会话 cookie 下发在顶域。
+- 站点后端只支持 Node.js（`nodejs22.x`，Express），不支持 Python 等其它运行时。
+- CloudFront 全站禁缓存（鉴权正确性的前提），高流量站点要单独评估成本。
+- 只能部署在 `us-east-1`。
+- CDK 工具链版本不随源码固定（见「本机工具链」），同一份源码在不同时间部署可能 synth 出不同的模板。
+- 站点网址固定为 `app-{site_id}.{base_domain}`，不支持给单个站点绑定自定义域名。
+- 部署脚本只自动接入 OIDC IdP；SAML IdP 要按「① 身份层」里的官方文档手工添加 provider。
+- 平台防谁、不防谁，见 `docs/security/account-trust-boundary.md`。
 
-### 状态机级超时/中止的落账（二期 M3 已闭合，此节保留说明机制）
+### 状态机级超时/中止的落账
 
 各步骤都挂了 `add_catch(States.ALL) → MarkFailed`，所以**步骤内**的失败都会把
-job 写成 FAILED（真机核对过：历史 3 个 FAILED 执行的 job 都是
-`status=FAILED, phase=provision-db`，没有卡住的）。
+job 写成 FAILED。
 
 但有两类终止**不执行任何 State**，因此 `mark_job` 根本不会被调用：
 
 - 状态机级 `TimeoutSeconds=1800`（30 分钟）到点 → 执行 `TIMED_OUT`；
 - 人工 `StopExecution` → 执行 `ABORTED`。
 
-**二期 M3 已闭合这个缺口（原先 job 会永久停在 `RUNNING`）。** 现在是两层收敛，
+这两类终止由两层收敛兜住（否则 job 会永久停在 `RUNNING`），两层
 共用同一个条件更新函数（`deployer/functions/reconcile_job.py`）：
 
 - **实时层**：EventBridge 规则 `site-deploy-terminal-status` 订阅本状态机的
@@ -3659,8 +3674,8 @@ aws lambda get-function --function-name site-deployer-reconcile-job --query 'Con
    命名空间，通配会同时命中 `site-panel` / `site-auth-service` / `site-deployer-*`，
    后果是**所有部署与下线立刻失效**。模板用显式 ARN 列表占位符，README 给了生成命令
    （按 `PLATFORM_FUNCTION_NAMES` 排除平台函数）。
-3. 例外名单里 `site-deployer-exec-role` **必须在**——M7 的健康门会直接 invoke 候选
-   颜色，漏了它每次部署都在健康门失败。
+3. 例外名单里 `site-deployer-exec-role` **必须在**——健康检查会直接 invoke 备用
+   别名，漏了它每次部署都在健康检查这一步失败。
 
 代码侧的 `functions/edge_caller.py` 只挡得住**经 Function URL** 的那条路
 （`callerId` 由 STS 填写、不可伪造）；**直接 `lambda:Invoke` 可以自造整个 payload
@@ -3716,31 +3731,3 @@ manifest（因为 AgentCore 的 CreateAgentRuntime 校验不认，见 ⑤ 的坑
 把 push 权限收敛到 CI 主体。
 
 容器内不执行站点提供的代码（站点代码只经 CodeBuild 打包，不进 MCP 容器）。
-
-## 独立审查后的修复（已实证验证，部署前必读）
-
-两轮独立审查（本机 + Codex）确认的 P0 已修复并用真实 AWS API 验证：
-
-
-| 问题                                                        | 修复                                                                                            | 验证方式                                                           |
-| --------------------------------------------------------- | --------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| Edge S3 签名缺 `x-amz-content-sha256`，所有静态页 400              | 改用 `S3SigV4Auth`                                                                              | 真实 us-east-1 桶探针：修前 400 InvalidRequest，修后 404 NoSuchKey（签名被接受） |
-| 顶域 `sb_session` 被转发给不可信站点后端，可跨站重放                         | Edge 验签后按 origin 剥除；新增 origin-response 剥除站点写的平台 cookie                                        | 4 个场景单测（站点剥除/站点自有 cookie 保留/auth 子域保留/伪造标记被剥）                  |
-| Function URL 缺 2025-10 起要求的第二个权限                          | 三处各加 `lambda:InvokeFunction` + `InvokedViaFunctionUrl`                                        | AWS 官方文档 urls-auth 明确要求两者                                      |
-| exec role 缺 `lambda:GetFunctionConfiguration`（waiter 轮询它） | 补该 action                                                                                     | `aws iam simulate-custom-policy`：修前 implicitDeny，修后 allowed    |
-| `site_name` 未校验 → DSQL admin SQL 注入 + IAM/Lambda 命名炸裂     | `common.validate_site_name` 入口卡 `^[a-z][a-z0-9-]{1,29}$`                                      | 单测覆盖注入串/空格/大写等 9 种非法输入                                         |
-| `npm ci` 执行站点 preinstall 脚本（CodeBuild 内任意代码执行）       | `--ignore-scripts` + 红线 8（lockfile 必须存在且只含公共 registry 条目、package.json 禁 file:/git/URL 规格）+ 删 `.npmrc` + 红线拦生命周期脚本 + CodeBuild 角色收窄到 `validated/*` 只读（validate 产出的不可变工件，非 owner 上传的原包）、`artifacts/*` 只写 | 红线单测 + synth 确认无整桶读写                                           |
-| 站点 SQL 以 DSQL admin 执行，可跨 schema 读写/销毁                    | 拆两个连接：admin 只引导 schema/role；站点提交的 SQL 以 per-site migrator role 执行                             | 单测断言站点 DDL 绝不出现在 admin 连接；bootstrap SQL 过 DSQL linter          |
-| `CREATE ROLE`/`AWS IAM GRANT` 裸 `except: pass` 吞真实错误      | 只容忍 duplicate（SQLSTATE 42710/42P06），其余抛出                                                      | 单测覆盖 42601 语法错/42501 权限不足必抛                                    |
-| 回跳白名单可被 `https://evil.com\.{base_domain}/` 绕过             | 拒反斜杠 + 强制 https                                                                               | 8 组用例；Python urlparse 与 Node WHATWG 解析差异实测                     |
-
-
-**仍需真机验证**：`AWS IAM GRANT` 对真实 DSQL 的语法与幂等 sqlstate（③ 冒烟覆盖）；
-migrator role 的 `ALTER DEFAULT PRIVILEGES FOR ROLE` 是否被接受（失败无损，末尾有显式 GRANT 兜底）。
-
-## 待部署时验证的 Minor（来自各任务审查，记录在 .superpowers/sdd/progress.md）
-
-- `_add_s3_sigv4_auth` 用 `quote(uri)` 签名但转发原样 URI：非 ASCII 文件名（中文/空格）可能 SignatureDoesNotMatch。PoC 生成的资产路径均 ASCII，不受影响；若客户站点用非 ASCII 静态文件名需修。
-- `_site_policy` 与 Edge S3 签名 region 硬编码 us-east-1（与部署区一致，换区需改）。
-- `provision_dsql` 的 `migrations/*.sql` 不经红线扫描（只扫 schema.sql）；migration 里的禁用 DDL 会在 provision-db 阶段才失败（可读报错，非静默）。
-- 跑测试的 venv：`site-builder/auth` 无自己的 venv，用 `site-builder/contract/.venv/bin/pytest tests`（含 pyjwt）；`site-builder/deployer` 必须 `pytest tests`（裸 `pytest -q` 会误收集 `infra/cdk.out` 里的 asset 副本）。

@@ -34,5 +34,8 @@ site-builder/scripts/account_trust_baseline.json
 # `probe_impersonation_surface.py`（只读）重新生成（ADR 0005 / 工单 12）。
 docs/security/3c-impersonation-surface.json
 
+# 博客草稿与配图产物（含实测截图，不入库）
+docs/blog/
+
 # phase-3 后续方向（维护者本机的候选清单，不是状态真源；取代原 docs/phase2-requirements.md）
 docs/phase3.md

@@ -2,7 +2,7 @@
 import re
 
 TIERS = {"static", "fullstack-nosql", "fullstack-sql"}
-RUNTIMES = {"nodejs22.x"}  # Python 3.13 记为二期（需 db.py 模板/fixture/E2E 支撑）
+RUNTIMES = {"nodejs22.x"}  # 只支持 Node.js；加 Python 需要 db.py 模板、fixture 与 E2E 一起配套
 TIER_ENGINE = {"static": "none", "fullstack-nosql": "dynamodb", "fullstack-sql": "dsql"}
 # 合同侧只管字符集。站点名还有一条**保留前缀**规则（平台自己的 Lambda 也叫
 # site-*，见 M7-SPEC §2.1），它由入口的 `common.validate_site_name` 单点拦下——

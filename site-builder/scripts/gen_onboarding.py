@@ -22,8 +22,9 @@ endpoint = CFG["MCP"]["endpoint_url"]
 client_id = CFG["Cognito"]["mcp_client_id"]
 pool = CFG["Cognito"]["user_pool_id"]
 region = CFG["Platform"]["region"]
-# 两条客户端通道都走这个 stdio 代理（Claude Code 直连会因 RFC 8707 resource
-# 参数被 Cognito 拒，Quick Desktop 的 Remote MCP 不支持 OAuth）。
+# 两条客户端通道都走这个 stdio 代理（Claude Code 直连时带 RFC 8707 resource 参数、
+# 在本平台的 Cognito 配置下换 token 失败——单账号实测，原因未查清，口径见
+# site-builder/docs/client-setup.md；Quick Desktop 的 Remote MCP 不支持 OAuth）。
 # **两种路径形态各有理由，别统一**：
 #   · `auth.js` 那条（下面 Claude Code 段）用**仓库相对路径 + "从仓库根执行"**——
 #     插值成绝对路径的话，产物里带的是**生成这份指引的那台机器**的路径，换台机器
@@ -89,8 +90,10 @@ OUT.write_text(f"""# Site Builder 接入指引（组织内用户）
 在仓库根目录（或任何拿到 `site-builder/skills/` 目录拷贝的位置）执行：
 
 **MCP 走本地 stdio 代理，不要用 HTTP transport 直连**：Claude Code 会在 OAuth
-请求里带 RFC 8707 的 `resource` 参数，而 Cognito 不支持——授权页能走完但换
-token 报 `invalid_grant`，状态卡在 `! Needs authentication`（2026-08-06 实测）。
+请求里带 RFC 8707 的 `resource` 参数；在本平台的 Cognito 配置下，授权页能走完但换
+token 报 `invalid_grant`，状态卡在 `! Needs authentication`（2026-08-06 单账号实测，
+Cognito 侧的具体原因未查清；别把其它 `invalid_grant` 都归到它，排查口径见仓库里的
+`site-builder/docs/client-setup.md`）。
 
 ```bash
 # 1) 安装建站 Skill

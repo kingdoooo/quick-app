@@ -38,15 +38,19 @@ mkdir -p ~/.claude/skills
 cp -r site-builder/skills/site-builder ~/.claude/skills/
 ```
 
-**MCP 必须走 stdio 代理，不能用 HTTP transport 直连**（实测）。
-原因：Claude Code 按 MCP 新版规范在 OAuth 请求里带 RFC 8707 的 `resource`
-参数（Resource Indicator），而 **Cognito 不支持它**——授权页能走完、拿到
+**MCP 必须走 stdio 代理，不能用 HTTP transport 直连**（单账号实测）。
+现象：Claude Code 按 MCP 新版规范在 OAuth 请求里带 RFC 8707 的 `resource`
+参数（Resource Indicator）；在本平台的 Cognito 配置下，授权页能走完、拿到
 授权码，但换 token 时返回 `invalid_grant`，客户端日志里是
 `Error during auth completion`，状态卡在 `! Needs authentication`。
 
 > 三次对照实验定位（带 scope 无 resource → 成功；无 scope 无 resource → 成功；
-> 带 resource → 失败）。**scope 缺失不是原因**，`resource` 才是。这与本平台
-> 的配置无关，任何用 Cognito 当 authorization server 的 MCP 部署都会遇到。
+> 带 resource → 失败）。**scope 缺失不是原因**，`resource` 才是。
+> **证据等级**：单账号、当时那个 Claude Code 版本的实测，Cognito 侧具体为什么拒绝没有查清。
+> Cognito 文档说明它的授权端点支持 `resource`（resource binding：把请求的 URL 写进
+> access token 的 `aud`），所以别把这条读成"Cognito 不支持 resource"，也别把任何
+> `invalid_grant` 都归到它头上（例如 app client 读不到 `email` 属性时同样报这个错）。
+> 换了客户端版本或平台配置想试直连，要重新做有 / 无 `resource` 的对照。
 
 代理（`site-builder/clients/quick-desktop-proxy/`，纯 Node 18+ 内置模块，
 免 npm install）自己实现 OAuth 且**不发 `resource`**，正好绕过：
@@ -78,7 +82,7 @@ print(d['projects']['$PWD']['mcpServers']['site-builder-deploy']['args'])"
 代理需要 `http://localhost:18765/callback` 已在 mcp client 的 CallbackURLs 里
 （`deploy_pool.py` 默认就注册了；端口选 18765 是因为 8765/8766 被 Quick Desktop
 的 quickwork-agent 常驻占用）。**不要用 `aws cognito-idp update-user-pool-client`
-手工改这个 client**——该 API 是整体替换语义，漏掉任一字段就会把二期收紧的边界
+手工改这个 client**——该 API 是整体替换语义，漏掉任一字段就会把收紧过的边界
 打回默认（原生认证 flow 被重开、refresh TTL 回到 30 天）。要改就重跑
 `deploy_pool.py`。
 
@@ -119,7 +123,7 @@ print(d['projects']['$PWD']['mcpServers']['site-builder-deploy']['args'])"
    均可；UI 亦有 env 区域，可改用 `SITE_BUILDER_MCP_ENDPOINT` /
    `SITE_BUILDER_MCP_CLIENT_ID`（代理 argv 与 env 都认）。
    代理自动注入并续期 Bearer token；坑清单见该目录 README。
-## Quick Desktop Remote MCP + API Key（二期 M4，**仅在平台启用了该组件时可用**）
+## Quick Desktop Remote MCP + API Key（**仅在平台启用了该组件时可用**）
 
 上面那条 stdio 代理是**兼容方案**——它存在的唯一原因是 Remote MCP 不支持 OAuth。
 平台配了 `[ApiKey]` 段之后，Quick Desktop 可以直接用 Remote MCP：
@@ -169,7 +173,7 @@ npx @modelcontextprotocol/inspector
 - 部署：`deploy_site` → `confirm_upload` → `get_deploy_status`
 - 管理：`list_my_sites` / `get_site_permissions` / `update_site_permissions` /
   `manage_collaborators` / `undeploy_site`
-- 统计：`get_site_analytics`（二期 M5）
+- 统计：`get_site_analytics`
 
 <!-- tool-list:end -->
 
@@ -177,16 +181,16 @@ npx @modelcontextprotocol/inspector
 
 **两条通道现在都走同一个 stdio 代理**——原本只有 Quick Desktop 需要它
 （Remote MCP 不支持 OAuth），实测发现 Claude Code 也必须用
-（它发的 `resource` 参数 Cognito 不认，见上面 Claude Code 一节）。
+（它带 `resource` 参数时换 token 失败，见上面 Claude Code 一节）。
 
 | | Claude Code | Quick Desktop |
 |---|---|---|
 | MCP 接入 | Local stdio 代理 | Local stdio 代理 |
-| 不能直连的原因 | 发 RFC 8707 `resource`，Cognito 返回 `invalid_grant` | Remote MCP 只支持静态 Headers，不支持 OAuth |
+| 不能直连的原因 | 带 RFC 8707 `resource` 时换 token 返回 `invalid_grant`（实测） | Remote MCP 只支持静态 Headers，不支持 OAuth |
 | OAuth | 代理的 auth.js（RFC 9728 发现 + PKCE，不发 resource） | 同左 |
 | token 管理 | 代理落盘 `~/.site-builder-deploy-token.json` + 自动续期 | 同左 |
 | Skill 导入 | `cp -r` 到 `~/.claude/skills/` | profile 的 skills 目录（如 `~/.quickwork/profiles/{profile}/skills/`） |
-| 免代理方案 | 无（`resource` 参数问题绕不开） | **Remote MCP + `X-API-Key`**（需平台启用 `[ApiKey]` 组件，见上一节） |
+| 免代理方案 | 无（直连未重新验收） | **Remote MCP + `X-API-Key`**（需平台启用 `[ApiKey]` 组件，见上一节） |
 
 不少客户端对 MCP 工具调用有几十秒级超时（Quick 实测为 60 秒），这是本方案
 异步化的原因——所有工具秒级返回，长任务在 Step Functions 里跑，不受此限
