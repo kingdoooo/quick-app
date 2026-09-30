@@ -220,7 +220,9 @@ def main() -> int:
                        1: "结果：检查未能完成 —— 状态不可信",
                        2: "结果：发现鉴权字段不一致"}[rc])
                 return rc
-        time.sleep(5)  # nosemgrep: arbitrary-sleep —— 轮询间隔（循环有截止条件）
+        # 只有 `--watch` 能走到这里：该模式就是"一直刷到用户自己停"，**刻意没有**
+        # 退出条件（不带 --watch 时上面每条分支都 return）。别把它写成"有截止条件"。
+        time.sleep(5)  # nosemgrep: arbitrary-sleep —— --watch 的刷新间隔：持续监视直到用户中断，刻意无上限
 
 
 if __name__ == "__main__":

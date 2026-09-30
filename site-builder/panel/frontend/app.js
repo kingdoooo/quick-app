@@ -121,12 +121,18 @@ const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
 
 /* 控制台是**管理界面**：在这里执行脚本就能改权限。站点名 / 邮箱 / job 错误串
  * 都来自他人，一律经 esc() 才能进 innerHTML。 */
-/* 全页唯一的 HTML 写入点。传进来的串都由本文件的模板函数拼成，动态值一律经 esc()——
- * test_frontend_contract 的 test_all_interpolated_values_go_through_esc 逐行卡死这一点。
+/* 全页唯一的 HTML 写入点。传进来的串都由本文件的模板函数拼成，动态值一律经 esc()。
  * 静态扫描（semgrep 的 insecure-innerhtml / insecure-document-method）看不见 esc()，所以把
- * 原先散在各处的 sink 收成这一处、在这一处标注；新代码不要直接写 `.innerHTML`（有守卫）。 */
+ * 原先散在各处的 sink 收成这一处、在这一处标注。**这条标注的前提由三层守着**：
+ *   · 唯一写入点：test_frontend_contract::test_html_is_written_only_through_sethtml；
+ *   · 静态预筛（按写法）：同文件的 test_all_interpolated_values_go_through_esc 与
+ *     test_sethtml_arguments_are_templates_not_raw_values（已知边界写在 _expr_is_unsafe 里）；
+ *   · 行为（与写法无关）：test_frontend_boot 的污点场景——后端文本字段注入含 `<>"'` 的惰性标记、
+ *     另跑一遍等长惰性对照，两遍每次写入里这四个字符的个数必须相等（数据未转义即不等），
+ *     且**每一处** setHTML 调用（按 行:列）都要被执行到。
+ * 新代码不要直接写 `.innerHTML`；新加 setHTML 调用要让某个污点场景走到它（否则覆盖面那条红）。 */
 function setHTML(el, html) {
-  el.innerHTML = html; // nosemgrep: insecure-innerhtml, insecure-document-method —— 动态值已逐个 esc()，见上
+  el.innerHTML = html; // nosemgrep: insecure-innerhtml, insecure-document-method —— 动态值经 esc()，由上面三层守卫约束
 }
 
 function esc(v) {

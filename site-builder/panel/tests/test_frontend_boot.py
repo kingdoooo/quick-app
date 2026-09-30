@@ -18,6 +18,7 @@ import json
 import re
 import shutil
 import subprocess
+from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
@@ -26,19 +27,26 @@ PANEL = Path(__file__).parents[1]
 HARNESS = Path(__file__).parent / "boot_harness.js"
 APP = PANEL / "frontend" / "app.js"
 
+from test_frontend_contract import _strip_js_comments  # noqa: E402  同一个已验证的剥注释器，不另写一份
+
 pytestmark = pytest.mark.skipif(shutil.which("node") is None,
                                 reason="环境里没有 node —— 本用例未执行（不是通过）")
 
 
-def run_boot(scenario: str, app: Path | None = None,
-             cases: Path | None = None) -> tuple[int, dict]:
-    argv = ["node", str(HARNESS), str(app or APP), scenario]
-    if cases is not None:
-        argv.append(str(cases))     # 只有 report-error 场景认这个参数
-    proc = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+def _node_json(argv: list) -> tuple[int, dict]:
+    """跑一次 node，取 stdout 最后一行的 JSON。本文件唯一的子进程调用点。"""
+    proc = subprocess.run(["node", *argv], capture_output=True, text=True, timeout=60)
     line = (proc.stdout or "").strip().splitlines()
-    assert line, f"harness 没有输出 JSON（stderr: {proc.stderr[:400]}）"
+    assert line, f"node 没有输出 JSON（stderr: {proc.stderr[:400]}）"
     return proc.returncode, json.loads(line[-1])
+
+
+def run_boot(scenario: str, app: Path | None = None,
+             cases: "Path | str | None" = None) -> tuple[int, dict]:
+    argv = [str(HARNESS), str(app or APP), scenario]
+    if cases is not None:
+        argv.append(str(cases))     # report-error：用例文件路径；taint：场景规格 JSON
+    return _node_json(argv)
 
 
 # ── 正向：两个场景都必须取到身份且不抛 ────────────────────────────────
@@ -1152,3 +1160,513 @@ def test_harness_catches_the_unconditional_reassurance_coming_back(tmp_path):
     rows = _failed_rows(last)
     assert rows and any("不影响线上" in t for t in rows.values()), \
         "变形没生效——元用例空转"
+
+
+# ── 污点场景：拼进 HTML 的动态值必须被转义（行为，不是写法）──────────────────
+#
+# setHTML 上那条行内抑制（semgrep 的 insecure-innerhtml / insecure-document-method）的前提是
+# "拼进去的动态值都经过 esc()"。静态文本守卫（test_frontend_contract）只能按写法判，Codex
+# R1/R2 两轮构造出的绕过——`'' || job.error`、`esc(a) || job.error`、透传函数、单行模板里夹一个
+# 裸字段——每一种都是合法 JS、都能让文本判据全绿。这里改判**行为**（harness 的 taint 场景）：
+#
+# **四个观察器，任一报警即红**（每个规格跑两遍：实验组的标记含 `<>"'`，对照组 `control` 把这四个
+# 字符换成等长惰性字符、其余字节相同）：
+#   ⓪ 支持范围（fail-closed，两组都查）：写入里只许有数据、开始 / 结束标签、属性、字符引用。
+#      注释 / DOCTYPE / CDATA / 伪注释（`<!`、`<?`、`</` 后不是字母）与原始文本 / RCDATA 元素
+#      （script、style、textarea、title…）一律红——`html.parser` **不是**浏览器的 HTML5 tokenizer，
+#      这几类正是两者的终止规则不同的地方。Codex R5：实验组 `<!--><x-tain>-->`、对照组
+#      `<!--<x-tain>-->>`，计数同为 (2,3,0,0)、`html.parser` 两组都只是一个 comment、截短的标记
+#      也不命中③——而本机 Chrome 154.0.8037.58 实测前者在 `<!-->` 处就结束注释、生成真实的
+#      `x-tain` 元素。app.js 自己从不写这几类构造，所以范围收窄不误伤；
+#   ① 计数差分：同一次写入里 `<>"'` 的个数两组必须相等——`toUpperCase()` / `slice` / `split` 之类
+#      的变换对两组作用相同，所以与变换无关（Codex R3：第一版只找 `<x-taint` 子串，这些变换一做就看不见）；
+#   ② 结构差分：同一次写入用标准库 `html.parser` 解析出的标签 / 属性名事件序列两组必须相同
+#      （Codex R4：实验组取数据里的 `<x-taint>`、对照组回退到静态 `<br>`，计数恰好相等——①被抵消）；
+#   ③ 原样标记：实验组里出现（不分大小写的）`<x-taint` 标签就红——②③ 与 ① 互补，不互相替代。
+# 转义过的数据：⓪不含这些构造、①两组都是零个、②两组都只是文本、③不会出现。
+# ② 只在⓪划定的范围内可信：范围之内 `html.parser` 与浏览器对"哪里是标签、哪里是属性名"的切分
+# 一致（R5 在本机 Chrome 上逐项对照过 21 个惰性输入，差异只剩树构造层——隐式闭合、非 void 的
+# `/>`——那不改变标签是不是从数据里长出来的）；范围之外一律交给⓪拒绝，不去逐个补状态。
+# 名字的大小写按 HTML5 只折叠 ASCII（`_ascii_names`，Codex R6：`html.parser` 用 `str.lower()`）。
+#
+# **覆盖面按调用位置（行:列）记账**，与静态提取的集合**双向等值**：每一处 `setHTML` 调用都要被
+# 执行到，且运行期不许出现静态不认识的位置（第一版按行记，同一行两处调用、`setHTML` 与 `(`
+# 分行时会漏账——Codex R3）。
+#
+# 已知边界（写明，别当成保证）：同一处调用里没走到的三元分支；openModal 的 body / footer 由
+# 点击处理器拼（harness 不点击），那部分只有静态守卫。
+# **差分方法本身的上限**：观察器只看输出，所以只能看见**随数据变化**的结构。对照分支用代码里的
+# 静态字符复刻出与实验组**逐字相同**的写入，或代码认出测试标记后特判——任何只看输出的观察器都
+# 无从区分（两组输出本来就一样）。这类有意构造只有静态守卫对它有效，不是能再补一个观察器的洞。
+
+_BASE_SPECS = [
+    # 七个路由的正常态
+    {"route": "#/sites"}, {"route": "#/sites/s-taint"}, {"route": "#/sites/s-taint/access"},
+    {"route": "#/sites/s-taint/deploys"}, {"route": "#/sites/s-taint/analytics"},
+    {"route": "#/keys"}, {"route": "#/admin", "direct": True},
+    # 失败态：错误文案同样被注入（errorCard / catch 分支）
+    {"route": "#/sites", "fail": "/api/sites"},
+    {"route": "#/sites/s-taint", "fail": "/api/sites/s-taint"},
+    {"route": "#/sites/s-taint/deploys", "fail": "/jobs"},
+    {"route": "#/sites/s-taint/analytics", "fail": "/visitors"},
+    {"route": "#/keys", "fail": "/api/keys"},
+    {"route": "#/admin", "fail": "/api/admins"},
+    {"route": "#/sites", "fail": "/api/me"},
+    # 空态、非管理员、组件未部署
+    {"route": "#/sites/s-taint/access", "empty": True},
+    {"route": "#/sites/s-taint/deploys", "empty": True},
+    {"route": "#/sites", "empty": True}, {"route": "#/keys", "empty": True},
+    {"route": "#/admin", "admin": False},
+    {"route": "#/keys", "api_key": {"deployed": False, "enabled": False}},
+]
+# 枚举也注入：走 statusBadge / jobBadge / roleTag / 各映射表的未知值回退（Codex R3：只有主路径时，
+# 删掉 statusBadge 里的 esc(label) 两层都绿）。**另加**而不是替换——主路径（FAILED、owner…）
+# 仍由上面那组覆盖。
+_ENUM_SPECS = [dict(s, poison_enums=True) for s in _BASE_SPECS[:7]]
+TAINT_SPECS = _BASE_SPECS + _ENUM_SPECS
+TAINT_ESCAPED = "&lt;x-taint"
+_META_CHARS = "<>\"'"
+
+
+def run_taint(spec: dict, app: Path | None = None) -> dict:
+    # 第 4 个参数在 taint 场景里是一段 JSON（harness 按场景名解释它），复用 run_boot 的那一处调用
+    return run_boot("taint", app, json.dumps(spec))[1]
+
+
+def _meta_counts(w: str) -> tuple:
+    return tuple(w.count(c) for c in _META_CHARS)
+
+
+class _Structure(HTMLParser):
+    """标签 / 属性名 / 注释 / 声明的事件序列（文本不计）。标准库，零外部依赖。"""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.events = []
+
+    def handle_starttag(self, tag, attrs):
+        self.events.append(("start", tag, tuple(sorted(k for k, _ in attrs))))
+
+    def handle_startendtag(self, tag, attrs):
+        self.events.append(("startend", tag, tuple(sorted(k for k, _ in attrs))))
+
+    def handle_endtag(self, tag):
+        self.events.append(("end", tag))
+
+    def handle_comment(self, data):
+        self.events.append(("comment",))
+
+    def handle_decl(self, decl):
+        self.events.append(("decl",))
+
+    def handle_pi(self, data):
+        self.events.append(("pi",))
+
+    def unknown_decl(self, data):
+        self.events.append(("unknown_decl",))
+
+
+def _ascii_names(w: str) -> str:
+    """非 ASCII 字符换成只含小写 ASCII 的占位 `_u<hex>_`（`_` 自身写成 `__`，保证单射）。
+
+    HTML5 的 tokenizer 只把 **ASCII** 大写折成小写，`html.parser` 却对标签名与属性名用 `str.lower()`
+    ——`K`（U+212A）→ `k`、`İ` → `i̇`（Codex R6：浏览器里不同的名字，②看成同一个）。换成占位后它能
+    折叠的只剩 ASCII，与浏览器一致；占位不含空白与 `<>"'/=`，不改变任何切分。文本与属性值不进事件，
+    所以其中的中文等不受影响。"""
+    return "".join("__" if c == "_" else c if ord(c) < 0x80 else f"_u{ord(c):x}_" for c in w)
+
+
+def _html_structure(w: str) -> list:
+    p = _Structure()
+    p.feed(_ascii_names(w))
+    p.close()
+    return p.events
+
+
+_RAW_MARK_RE = re.compile(r"<\s*/?\s*x-taint", re.IGNORECASE)
+# ⓪ 结构观察器的支持范围之外（见本段开头）；宁可过宽——多拒只会是响亮的红
+_UNSUPPORTED_MARKUP_RE = re.compile(
+    r"<[!?]"                         # 注释 / DOCTYPE / CDATA / 伪注释 / 处理指令
+    r"|</(?![A-Za-z])"               # `</` 后不是字母：伪注释，或被整个丢掉
+    r"|<(?:script|style|textarea|title|xmp|iframe|noembed|noframes|noscript|plaintext)(?![^\s/>])",
+    re.IGNORECASE)
+
+
+def _pair_problem(a: str, b: str) -> str | None:
+    """同一次写入的实验组 a / 对照组 b：哪个观察器报警（None = 这一对是转义过的）。"""
+    if _UNSUPPORTED_MARKUP_RE.search(a) or _UNSUPPORTED_MARKUP_RE.search(b):
+        return "超出支持范围"
+    if _meta_counts(a) != _meta_counts(b):
+        return "计数差分"
+    if _html_structure(a) != _html_structure(b):
+        return "结构差分"
+    if _RAW_MARK_RE.search(a):
+        return "原样标记"
+    return None
+
+
+def _unescaped_writes(spec: dict, app: Path | None = None) -> list:
+    """四个观察器（见本段开头）。返回 [(调用位置, 哪个观察器, 实验组片段, 对照组片段)]，空 = 全部转义。"""
+    hot, cold = run_taint(spec, app), run_taint(dict(spec, control=True), app)
+    assert not hot["errors"] and not cold["errors"], (
+        f"渲染时抛异常（场景空转了）: {hot['errors'] or cold['errors']}")
+    # 调用位置相等只证明"写入的次数与发起位置相同"，不证明同一次调用里走了同一条表达式路径
+    # ——那一层由②结构差分兜（Codex R4 的计数抵消就发生在同一个调用位置里）。
+    assert hot["html_callers"] == cold["html_callers"], (
+        "实验组与对照组的写入次数或发起位置不同——对照不可比，差分判据失效")
+    bad = []
+    for pos, a, b in zip(hot["html_callers"], hot["html_writes"], cold["html_writes"]):
+        i = next((k for k, (x, y) in enumerate(zip(a, b)) if x != y), 0)
+        clip = (a[max(0, i - 60):i + 40], b[max(0, i - 60):i + 40])
+        problem = _pair_problem(a, b)
+        if problem:
+            bad.append((pos, problem, *clip))
+    return bad
+
+
+_JS_LINE_BREAK_RE = re.compile("\r\n|[\n\r\u2028\u2029]")
+
+
+def _js_line_col(src: str, i: int) -> str:
+    """原文下标 i 的 "行:列"，按 **ECMAScript / V8 栈帧**的口径：LF、CR、CRLF（算一次）、LS、PS 都换行，
+    列从 1 起、按 UTF-16 码元数。静态提取、定义位置与 acorn 名称都走这一个函数（Codex R7：
+    原来只数 LF，CR-only 的源码全落在第 1 行，而 `read_text()` 又把 CR 归一成 LF——两边口径不同）。"""
+    line, start = 1, 0
+    for m in _JS_LINE_BREAK_RE.finditer(src, 0, i):
+        line, start = line + 1, m.end()
+    return f"{line}:{sum(2 if ord(c) > 0xFFFF else 1 for c in src[start:i]) + 1}"
+
+
+def _sethtml_call_positions(app: Path) -> set:
+    """app.js 里每一处 `setHTML` 调用的 "行:列"（`_js_line_col` 口径；V8 报的正是被调标识符的起点）。
+
+    跨行匹配（`setHTML` 与 `(` 之间允许换行），定义本身不算。在**保长剥注释**后的文本上找，
+    所以 `setHTML /* … */ (` 也提得到、坐标仍是原文的（Codex R4）；注释里的提及不算。
+    起别名 / 可选调用这类提不到的写法由 test_frontend_contract 的引用政策直接拒绝。"""
+    # 按原始字节解码、不做换行归一：保长剥注释后坐标仍是 eval 进 V8 的那份原文的
+    src = _strip_js_comments(app.read_bytes().decode("utf-8"), keep_layout=True)
+    out = set()
+    for m in re.finditer(r"\bsetHTML\s*\(", src):
+        if src[max(0, m.start() - 9):m.start()] == "function ":
+            continue
+        out.add(_js_line_col(src, m.start()))
+    return out
+
+
+def _covered_positions(app: Path | None = None) -> set:
+    covered = set()
+    for spec in TAINT_SPECS:
+        covered |= set(run_taint(spec, app)["html_callers"])
+    return covered
+
+
+@pytest.mark.parametrize("spec", TAINT_SPECS, ids=lambda s: json.dumps(s, ensure_ascii=False))
+def test_no_tainted_value_reaches_the_dom_unescaped(spec):
+    bad = _unescaped_writes(spec)
+    assert not bad, ("数据里的 HTML 元字符原样进了 innerHTML（存储型 XSS）——"
+                     f"[调用位置, 观察器, 实验组, 对照组]：{bad[:3]}")
+
+
+def test_taint_actually_reaches_the_rendered_pages():
+    """正对照：标记确实被渲染出来了（转义形态）。否则"差分为零"可能只是"什么都没渲染"。"""
+    hits = {json.dumps(s): sum(TAINT_ESCAPED in w.lower() for w in run_taint(s)["html_writes"])
+            for s in TAINT_SPECS[:7]}
+    assert all(hits.values()), f"这些路由上注入的标记一次都没出现在页面里（夹具空转）：{hits}"
+
+
+def test_taint_matrix_executes_every_sethtml_call_site():
+    """每一处 setHTML 调用都至少在一个污点场景里被执行——按 "行:列" **双向**等值。
+
+    新加一处 setHTML 而没有让任何场景走到它，这条就红——那等于抑制之前 semgrep 对每个
+    sink 报的那条 ERROR：一处新写入 = 一个必须有人看的信号。"""
+    covered = _covered_positions()
+    sites = _sethtml_call_positions(APP)
+    assert len(sites) >= 30, f"只找到 {len(sites)} 处 setHTML 调用——提取口径坏了"
+    assert "-1" not in covered, "有写入取不到调用位置——harness 的栈解析跟不上了"
+    assert not (covered - sites), f"运行期出现了静态不认识的调用位置（两边口径不一致）：{sorted(covered - sites)}"
+    missing = sorted(sites - covered)
+    assert not missing, f"这些 setHTML 调用点没有任何污点场景执行到（补场景，别加豁免）：{missing}"
+
+
+# ── 剥注释器与真实 JS 词法器逐字符对账 ────────────────────────────────────
+#
+# 引用政策、上面的调用位置提取、test_frontend_contract 的全部文本断言都建在 `_strip_js_comments`
+# 上。它是零依赖的手写状态机，词法分歧的后果是**把真代码当注释抹掉**——抹掉的调用对引用政策和
+# 覆盖面都不可见（Codex R5：关键字后的正则、U+2028）。逐个补状态不收敛，所以这里拿 node 自带的
+# acorn（`--expose-internals` 下的内部模块，不新增依赖）在**真实前端源码**上核对：每个非空白
+# 字符"被剥掉"当且仅当 acorn 说它在注释里。按经典脚本解析（index.html 用的是不带 type 的
+# `<script src>`），所以 Annex B 的 HTML 式注释也按浏览器的算。剥注释器没建模的写法（见它的
+# docstring）一旦进了源码，这条就红。
+
+_ACORN_LEX_JS = r"""
+const acorn = require('internal/deps/acorn/acorn/dist/acorn');
+const src = require('fs').readFileSync(process.argv[process.argv.length - 1], 'utf8');
+const comments = [], names = [];
+for (const t of acorn.tokenizer(src, {ecmaVersion: 'latest', sourceType: 'script', allowHashBang: true,
+                                      onComment: (block, text, s, e) => comments.push([s, e])}))
+  if (t.type.label === 'name' && t.value === 'setHTML') names.push(t.start);
+console.log(JSON.stringify({version: acorn.version, comments, names}));
+"""
+
+
+def _stripper_vs_js_lexer(path: Path) -> tuple[list, dict]:
+    """(分歧列表, acorn 结果)。acorn 的偏移是 UTF-16 码元，这里换回 Python 下标；
+    `names` 换成与 `_sethtml_call_positions` 同口径的 "行:列"。"""
+    # 按原始字节解码、不做换行归一——`read_text()` 会把 CRLF 缩成 LF，acorn 的偏移却按原文算
+    # （Codex R6：CRLF 的有效源码在这里抛 IndexError）
+    src = path.read_bytes().decode("utf-8")
+    code, lex = _node_json(["--expose-internals", "-e", _ACORN_LEX_JS, str(path)])
+    assert code == 0, f"acorn 词法分析失败：{lex}"
+    u16 = []
+    for i, c in enumerate(src):
+        u16 += [i, i] if ord(c) > 0xFFFF else [i]
+    u16.append(len(src))
+    in_comment = [False] * len(src)
+    for start, end in lex["comments"]:
+        for k in range(u16[start], u16[end]):
+            in_comment[k] = True
+    lex["names"] = {_js_line_col(src, u16[t]) for t in lex["names"]}
+    out = _strip_js_comments(src, keep_layout=True)
+    if len(out) != len(src):
+        return [f"保长被破坏：{len(src)} → {len(out)}"], lex
+    bad = []
+    for k, (c, o) in enumerate(zip(src, out)):
+        if not c.isspace() and (c != o) != in_comment[k]:
+            kind = "代码被当注释抹掉" if c != o else "注释被当代码留下"
+            bad.append(f"{_js_line_col(src, k)}: {kind}：{src[max(0, k - 30):k + 30]!r}")
+    return bad, lex
+
+
+def test_comment_stripper_agrees_with_the_real_js_lexer_on_the_frontend_sources():
+    files = sorted((PANEL / "frontend").rglob("*.js"))
+    assert APP in files
+    for f in files:
+        bad, lex = _stripper_vs_js_lexer(f)
+        assert lex["comments"], f"{f.name}：acorn 一条注释都没报——词法器没真跑起来"
+        assert not bad, (f"{f.name}：剥注释器与 acorn {lex['version']} 的注释判定不一致"
+                         "（剥注释器没建模的写法进了源码？见它的 docstring）：\n  " + "\n  ".join(bad[:5]))
+
+
+def test_js_lexer_sees_exactly_the_static_call_sites_plus_the_definition():
+    """独立于剥注释器的交叉核对：acorn 认出的每个 `setHTML` 标识符，要么是定义，要么是静态提取到的
+    直接调用位置——别名、当值传都会让两边对不上（引用政策之外的第二道）。"""
+    _, lex = _stripper_vs_js_lexer(APP)
+    src = APP.read_bytes().decode("utf-8")
+    definition = _js_line_col(src, src.index("function setHTML(") + len("function "))
+    assert lex["names"] == _sethtml_call_positions(APP) | {definition}, (
+        f"只在 acorn 里：{sorted(lex['names'] - _sethtml_call_positions(APP) - {definition})}；"
+        f"只在静态提取里：{sorted(_sethtml_call_positions(APP) - lex['names'])}")
+
+
+def test_js_lexer_gate_reads_crlf_mixed_and_astral_sources_exactly(tmp_path):
+    """Codex R6：CRLF 的有效源码曾让对账门抛 IndexError；R7：CR-only 的坐标曾全落在第 1 行。
+    LF / CRLF / 混用 / CR / LS·PS 都必须 0 分歧、标识符位置相同、且与静态提取同口径；astral 字符在前
+    （UTF-16 占两个码元）时位置整体下移一行、列不变。"""
+    base = APP.read_text(encoding="utf-8")
+    _, ref = _stripper_vs_js_lexer(APP)
+    shifted = {f"{int(n.split(':')[0]) + 1}:{n.split(':')[1]}" for n in ref["names"]}
+    for name, src, want in (("crlf", base.replace("\n", "\r\n"), ref["names"]),
+                            ("mixed", base.replace("\n", "\r\n", 200), ref["names"]),
+                            ("cr", base.replace("\n", "\r"), ref["names"]),
+                            ("ls-ps", base.replace("\n", "\u2028", 100).replace("\n", "\u2029", 100), ref["names"]),
+                            ("astral", "/* \U0001f600 */ const e = '\U0001f600';\n" + base, shifted)):
+        f = tmp_path / f"{name}.js"
+        f.write_bytes(src.encode("utf-8"))
+        bad, lex = _stripper_vs_js_lexer(f)
+        assert not bad, f"{name}：{bad[:2]}"
+        assert lex["names"] == want, f"{name}：标识符位置对不上"
+        definition = _js_line_col(src, src.index("function setHTML(") + len("function "))
+        assert lex["names"] == _sethtml_call_positions(f) | {definition}, f"{name}：acorn 名称与静态提取口径不一"
+
+
+def test_js_line_col_follows_ecmascript_line_terminators_and_utf16_columns():
+    src = "a\r\nb\rc\u2028d\u2029e\nX"
+    assert _js_line_col(src, src.index("X")) == "6:1", "CRLF 算一次、CR / LS / PS / LF 各算一次"
+    src = "'\U0001f600' X"
+    assert _js_line_col(src, src.index("X")) == "1:6", "列按 UTF-16 码元（astral 占两个）"
+
+
+@pytest.mark.parametrize("name, sep", [("cr", "\r"), ("crlf", "\r\n"), ("ls", "\u2028")])
+def test_static_call_positions_match_v8_on_every_line_terminator(tmp_path, name, sep):
+    """静态提取与 **V8 运行期**报的位置同口径：换行换成 CR / CRLF / LS 后，运行期出现的每个调用位置都在
+    静态集合里（否则覆盖面那条会拿两种口径互相对账）。LS 只换代码区（模板字面量里的换行会改内容）。"""
+    base = APP.read_text(encoding="utf-8")
+    app = tmp_path / "app.js"
+    app.write_bytes((base.replace("\n", sep) if sep != "\u2028" else base.replace(";\n", ";\u2028")).encode("utf-8"))
+    callers = set(run_taint({"route": "#/sites/s-taint"}, app)["html_callers"])
+    assert callers and "-1" not in callers, "运行期没取到调用位置"
+    assert callers <= _sethtml_call_positions(app), f"{name}：V8 报了静态不认识的位置 {sorted(callers - _sethtml_call_positions(app))[:3]}"
+
+
+@pytest.mark.parametrize("name, tail", [
+    ("Annex B 的 <!-- 注释", "\n<!-- /* html-open\nsetHTML(a, b);\n// */\n"),
+    ("Annex B 的行首 --> 注释", "\n  --> /* html-close\nsetHTML(a, b);\n// */\n"),
+    ("控制语句右括号后的正则", "\nif (a) /[/*]/.test(b);\nsetHTML(a, b);\n// */\n"),
+])
+def test_js_lexer_gate_catches_what_the_stripper_does_not_model(tmp_path, name, tail):
+    """元用例：剥注释器**有意没建模**的三种写法接在真实 app.js 后面，对账门必须报"真代码被抹掉"。"""
+    app = tmp_path / "app.js"
+    app.write_text(APP.read_text(encoding="utf-8") + tail, encoding="utf-8")
+    bad, _ = _stripper_vs_js_lexer(app)
+    assert any("代码被当注释抹掉" in b for b in bad), f"{name}：对账门没看出真代码被抹掉"
+
+
+def test_r5_hidden_sink_variants_are_visible_again(tmp_path):
+    """正对照：R5 的四个反例接在 app.js 后面，剥注释器与 acorn 一致；直接调用那一处进了静态
+    位置集合（于是覆盖面那条会报 missing），别名那几处由引用政策拒（test_frontend_contract）。"""
+    from test_frontend_contract import _R5_HIDDEN_SINK_SOURCES
+    base = len(_sethtml_call_positions(APP))
+    for k, (name, tail) in enumerate(sorted(_R5_HIDDEN_SINK_SOURCES.items())):
+        app = tmp_path / f"v{k}.js"
+        app.write_text(APP.read_text(encoding="utf-8") + "\n" + tail, encoding="utf-8")
+        bad, _ = _stripper_vs_js_lexer(app)
+        assert not bad, f"{name}：剥注释器仍与 acorn 不一致：{bad[:2]}"
+        if "直接调用" in name:
+            assert len(_sethtml_call_positions(app)) == base + 1, f"{name}：新增的直接调用没被静态提取到"
+
+
+# 变异元用例：注入**会被执行**的渲染函数（`renderOverviewTab` 开头），差分必须红。
+# 前五条是 Codex R2 的静态绕过 + when() 原样返回输入；后面是 R3 证明"找子串"看不见的变换。
+_TAINT_BYPASSES = [
+    "setHTML(panel, '' || site.name);",
+    "setHTML(panel, esc('') || site.name);",
+    "setHTML(panel, (function (x) { return x; })(site.name));",
+    "setHTML(panel, '<p>' + esc(site.owner) + site.name + '</p>');",
+    "setHTML(panel, '<td>' + when(site.name) + '</td>');",
+    "{ const html = site.name; setHTML(panel, html); }",
+    "{ const v = site.name; setHTML(panel, '<p>' + v.toUpperCase() + '</p>'); }",
+    "{ const v = site.name; setHTML(panel, '<p>' + v.slice(0, 10) + '</p>'); }",
+    "{ const v = site.name; setHTML(panel, '<p>' + v.split('-')[0] + '</p>'); }",
+    "setHTML(panel, [site.name].map((it) => it.toUpperCase()).join(''));",
+]
+
+
+@pytest.mark.parametrize("inject", _TAINT_BYPASSES)
+def test_taint_catches_the_forms_static_checks_cannot_see(tmp_path, inject):
+    app = _mutated(tmp_path, "function renderOverviewTab(panel, site, st) {\n",
+                   "function renderOverviewTab(panel, site, st) {\n  " + inject + "\n")
+    assert _unescaped_writes({"route": "#/sites/s-taint"}, app), (
+        f"注入了 {inject!r} 但差分判据仍然绿——它什么都没盯")
+
+
+def test_structure_observer_catches_count_cancelling_fallback(tmp_path):
+    """Codex R4：实验组取数据里的原样标签、对照组回退到静态 `<br>`，`<>"'` 计数恰好相等。
+    只有结构差分 / 原样标记能看见；转义过的同一写法必须保持绿（正对照）。"""
+    body = ("{ const lab = site.name.match(/<[^>]*>/)?.[0] || '<br>';"
+            " setHTML(panel, '<p>' + %s + '</p>'); }")
+    raw = _mutated(tmp_path, "function renderOverviewTab(panel, site, st) {\n",
+                   "function renderOverviewTab(panel, site, st) {\n  " + body % "lab.trim()" + "\n")
+    hits = _unescaped_writes({"route": "#/sites/s-taint"}, raw)
+    assert hits, "计数抵消的回退形态仍然绿"
+    assert {h[1] for h in hits} != {"计数差分"}, f"应由结构/标记观察器发现，而不是计数：{hits[:2]}"
+    ok_dir = tmp_path / "ok"
+    ok_dir.mkdir()
+    ok = _mutated(ok_dir, "function renderOverviewTab(panel, site, st) {\n",
+                  "function renderOverviewTab(panel, site, st) {\n  " + body % "esc(lab.trim())" + "\n")
+    # 转义版本：两臂（数据里的标签 / 静态回退）都经 esc 成了纯文本 ⇒ 三个观察器都必须绿
+    assert not _unescaped_writes({"route": "#/sites/s-taint"}, ok), "转义过的同一写法被误报"
+
+
+# Codex R5：HTML5 的"突然结束的空注释"。实验组从数据里截出标签（截短后③不命中）、对照组回退到
+# 同计数的静态串；`html.parser` 两组都只看到一个 comment。
+_ABRUPT_HOT, _ABRUPT_COLD = "<!--><x-tain>-->", "<!--<x-tain>-->>"
+
+
+def _html_escape(t: str) -> str:
+    return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def test_supported_range_observer_is_what_catches_the_html5_abrupt_comment():
+    """固定输入：①②③ 对这一对全都失明（这正是⓪存在的理由），⓪必须拒；转义后的同一对全绿。"""
+    assert _meta_counts(_ABRUPT_HOT) == _meta_counts(_ABRUPT_COLD)
+    assert _html_structure(_ABRUPT_HOT) == _html_structure(_ABRUPT_COLD), (
+        "html.parser 对 `<!-->` 的处理变了——更新本段说明；⓪仍要保留，它拒的是一整类构造")
+    assert not _RAW_MARK_RE.search(_ABRUPT_HOT)
+    assert _pair_problem(_ABRUPT_HOT, _ABRUPT_COLD) == "超出支持范围"
+    assert _pair_problem(_html_escape(_ABRUPT_HOT), _html_escape(_ABRUPT_COLD)) is None
+
+
+def test_supported_range_rejects_every_construct_outside_it_and_nothing_inside():
+    outside = ("<!---><x>", "<!-- a -->", "<![CDATA[><x-tain>]]>", '<!DOCTYPE a "><x-tain>">',
+               "<!x-probe>", "<?x><x-tain>", "</ x><x-tain>", "</><x-tain>", "</1>",
+               "<textarea><x-tain></textarea>", "<SCRIPT>", "<style/>", "<title >", "<Xmp>",
+               "<iframe", "<noscript>", "<plaintext>", "<noembed>", "<noframes>")
+    for w in outside:
+        assert _pair_problem(w, w) == "超出支持范围", f"没拒：{w!r}"
+    inside = ('<p class="a">x</p>', '<svg viewBox="0 0 1 1"><path d="M0"/></svg>', "<scripts>",
+              "<titles>", "a &lt;!-- b", "x < y", "<br/>", '<a href="/p?q=1&amp;r=2">t</a>')
+    for w in inside:
+        assert _pair_problem(w, w) is None, f"误伤：{w!r} → {_pair_problem(w, w)}"
+
+
+def test_structure_observer_keeps_non_ascii_names_distinct_like_html5():
+    """Codex R6 的固定输入：HTML5 只折叠 ASCII，这几对在浏览器里是不同的标签 / 属性名，②必须分得开。"""
+    K, I = "\u212a", "\u0130"
+    for hot, cold in ((f"<x-{K}>", "<x-k>"), (f"<x-{I}>", "<x-i\u0307>"),
+                      (f"<p data-{K}=1>", "<p data-k=1>"), (f"<x-{K}>", "<x-_u212a_>")):
+        assert _pair_problem(hot, cold) == "结构差分", f"{hot!r} 与 {cold!r} 被当成同一个名字"
+    # 正对照：ASCII 大小写本来就等价（浏览器同样折叠）；文本与属性值里的非 ASCII 不影响结构
+    for a, b in (("<P CLASS=a>", "<p class=a>"), ("<p>\u4e2d\u6587 K</p>", "<p>\u4e2d\u6587 k</p>"),
+                 (f'<p title="{I}">', '<p title="i">')):
+        assert _pair_problem(a, b) is None, f"误报：{a!r} / {b!r}"
+
+
+def test_taint_catches_the_html5_abrupt_comment_bypass(tmp_path):
+    """R5 的完整反例：在会被执行的 renderOverviewTab 里新增 sink——只能由⓪发现；整体 esc 的版本全绿。"""
+    body = ("{ const lab = site.name.match(/<[^>]*>/)?.[0];"
+            " const frag = lab ? '<!-->' + lab.slice(0, -2) + '>-->' : '<!--<x-tain>-->>';"
+            " setHTML(panel, %s); }")
+    head = "function renderOverviewTab(panel, site, st) {\n"
+    raw = _mutated(tmp_path, head, head + "  " + body % "frag.trim()" + "\n")
+    hits = _unescaped_writes({"route": "#/sites/s-taint"}, raw)
+    assert hits, "HTML5 突然结束的空注释仍然绿"
+    assert {h[1] for h in hits} == {"超出支持范围"}, f"应由⓪发现：{hits[:2]}"
+    ok_dir = tmp_path / "ok"
+    ok_dir.mkdir()
+    ok = _mutated(ok_dir, head, head + "  " + body % "esc(frag.trim())" + "\n")
+    assert not _unescaped_writes({"route": "#/sites/s-taint"}, ok), "转义过的同一写法被误报"
+
+
+def test_taint_catches_dropping_esc_on_the_job_error(tmp_path):
+    """真实回归的形态——把概览页上 job.error 外面那层 esc 去掉。"""
+    app = _mutated(tmp_path, "'<span>' + esc(job.error) + '</span></div>'",
+                   "'<span>' + job.error + '</span></div>'")
+    assert _unescaped_writes({"route": "#/sites/s-taint"}, app), "去掉 esc(job.error) 之后仍然绿"
+
+
+def test_taint_catches_a_whitelisted_template_returning_its_input(tmp_path):
+    """白名单模板（静态守卫整体信任它）提前原样返回参数——Codex R3 的反例，差分必须红。"""
+    app = _mutated(tmp_path, "function errorCard(title, err) {\n",
+                   "function errorCard(title, err) {\n"
+                   "  if (err && err.message) return err.message.toUpperCase();\n")
+    assert _unescaped_writes({"route": "#/sites", "fail": "/api/sites"}, app), (
+        "errorCard 原样返回错误文案，但差分仍然绿")
+
+
+def test_taint_catches_dropping_esc_inside_a_trusted_badge(tmp_path):
+    """statusBadge 被静态守卫整体信任；删掉它内部的 esc，只有枚举注入的场景能看见。"""
+    anchor = ("  const label = STATUS_LABEL[status] || status || '未知';\n"
+              "  return '<span class=\"badge ' + cls + '\"><span class=\"dot\"></span>' + esc(label) + '</span>';")
+    app = _mutated(tmp_path, anchor, anchor.replace("esc(label)", "label"))
+    assert any(_unescaped_writes(s, app) for s in _ENUM_SPECS[:2]), (
+        "statusBadge 去掉 esc(label) 之后枚举注入场景仍然绿")
+    assert not _unescaped_writes(_BASE_SPECS[0], app), (
+        "主路径上看不见它才对（合法枚举走映射表）——如果这里也红，说明上面那条的判别力来源不是枚举注入")
+
+
+_OVERVIEW_HEAD = "function renderOverviewTab(panel, site, st) {\n"
+
+
+@pytest.mark.parametrize("extra", [
+    # 同一行两处调用，其中一处永远不执行（第一版按行记账会被那一行的另一处代记）
+    (_OVERVIEW_HEAD, _OVERVIEW_HEAD
+     + "  function neverRendered(el) { setHTML(el, esc('x')); } setHTML(panel, '');\n"),
+    # `setHTML` 与 `(` 分行、从不执行（第一版逐行正则提不到它）
+    (_OVERVIEW_HEAD, "function neverRendered(el) { setHTML\n(el, esc('x')); }\n" + _OVERVIEW_HEAD),
+    # 标识符与 `(` 之间夹注释、从不执行（Codex R4；在原文上正则提不到它）
+    (_OVERVIEW_HEAD, "function neverRendered(el) { setHTML /* gap */ (el, esc('x')); }\n" + _OVERVIEW_HEAD),
+])
+def test_coverage_check_catches_a_sethtml_call_no_scenario_reaches(tmp_path, extra):
+    app = _mutated(tmp_path, *extra)
+    sites, covered = _sethtml_call_positions(app), _covered_positions(app)
+    assert sites - covered, f"新加的调用点没被执行，但覆盖面检查没发现：sites={len(sites)} covered={len(covered)}"

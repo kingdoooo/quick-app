@@ -104,6 +104,26 @@ class _FakeAWS:
         return json.loads(self.sfn.start_execution.call_args.kwargs["input"])
 
 
+class _NoRealAWS:
+    """`common` 模块里那个 boto3 名字的默认替身：一旦被用到就**响亮地**失败。
+
+    `deploy_fixture` 的部署租约走的是 `common` **自己模块里**的 boto3，只 patch `df.boto3`
+    的用例会拿真凭据去读真表（`test_site_id_defaults_to_a_fresh_random_id` 就这样活了很久：
+    有网络时它是绿的、断网沙箱里才 DNS 失败——Codex R3 复审在离线副本里撞出来的）。
+    默认把它换成这个替身之后，漏打桩 = 当场红，而不是悄悄打到线上账号。"""
+
+    def _refuse(self, *a, **kw):
+        raise AssertionError("未打桩的真 AWS 调用（deploy_fixture 经 common.boto3）——"
+                             "用 aws fixture，或同时 patch df.boto3 与 df.sb_common.boto3")
+
+    client = resource = _refuse
+
+
+@pytest.fixture(autouse=True)
+def _forbid_real_aws_via_common(monkeypatch):
+    monkeypatch.setattr(df.sb_common, "boto3", _NoRealAWS())
+
+
 @pytest.fixture
 def aws(monkeypatch):
     fake = _FakeAWS()
@@ -403,6 +423,7 @@ def test_site_id_defaults_to_a_fresh_random_id(monkeypatch):
     for _ in range(2):
         fake = _FakeAWS()
         monkeypatch.setattr(df, "boto3", fake.boto3)
+        monkeypatch.setattr(df.sb_common, "boto3", fake.boto3)   # 租约走的是 common 的 boto3
         monkeypatch.setattr(df, "_CFG", _fake_cfg())
         _run(NOSQL)
         seen.append(fake.sfn_input()["site_id"])
@@ -919,3 +940,86 @@ def test_fixture_write_refuses_to_take_over_a_foreign_owner():
     row = t.get_item(Key={"site_id": "victim"})["Item"]
     assert row == {"site_id": "victim", "owner": "real-user@corp.com",
                    "name": "Real Site", "status": "ACTIVE"}
+
+
+# ---- 等终态：本地兜底上限（Codex R1 复审第 7 项）----
+#
+# 原版是裸 `while True`，只在 job 到 SUCCEEDED/FAILED 时退。终态由**远端**给（SFN，
+# 异常时 sweeper ≤45 分钟），远端没跑时这个循环永不退，而 `main` 被 E2E 与
+# `ensure_fixture_site` 在**进程内**调用 ⇒ 整套验收挂死。抑制标注当时还写着
+# "循环有截止条件"，与代码不符（假理由比没理由更坏：下一个人会信它）。
+
+
+def _wait_forever(aws, monkeypatch, *, elapsed_per_sleep: float):
+    """让 job 永远停在 RUNNING，并用虚拟时钟替掉真 sleep。
+
+    **sleep 次数有硬上限**：没有它的话，一旦 deadline 被删掉（正是这几条要防的回归），
+    本用例会跟着被测代码一起无限循环——CI 里表现为"卡住"而不是红。超上限直接抛，
+    于是回归的症状是一条明确失败的断言。
+    """
+    aws.table.get_item.return_value = {"Item": {"status": "RUNNING", "phase": "package"}}
+    # 预算是**固定上限**，不从 elapsed_per_sleep 反推：第一版按 `TIMEOUT / 间隔` 算，
+    # 间隔被改成 0 时预算变成天文数字、虚拟时钟不走 ⇒ 用例卡住而不是红（Codex R2）。
+    assert elapsed_per_sleep > 0, "虚拟时钟必须前进，否则 deadline 永远到不了"
+    budget = min(int(df.WAIT_TIMEOUT_S / elapsed_per_sleep) + 5, 5000)
+    clock = {"t": 0.0, "sleeps": 0}
+
+    def _sleep(_s):
+        clock["sleeps"] += 1
+        assert clock["sleeps"] <= budget, (
+            f"轮询了 {clock['sleeps']} 次仍没退出（预算 {budget}）——"
+            f"本地兜底上限没生效，`main` 会在真机上挂死")
+        clock["t"] += elapsed_per_sleep
+
+    monkeypatch.setattr(df.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(df.time, "sleep", _sleep)
+    return clock
+
+
+def test_wait_gives_up_after_the_local_deadline_instead_of_hanging(tmp_path, aws, monkeypatch, capsys):
+    clock = _wait_forever(aws, monkeypatch, elapsed_per_sleep=df.WAIT_POLL_S)
+    with pytest.raises(SystemExit) as e:
+        df.main(str(_copy_fixture(tmp_path)), site_id="hang-abc123")
+    assert e.value.code == 2, "超时必须是自己的退出码（0=成功 / 1=部署失败 / 2=放弃等待）"
+    err = capsys.readouterr().err
+    assert "放弃等待" in err and "不取消远端执行" in err, err
+    # 事后核查要用的两个标识必须打出来
+    assert "hang-abc123" in err, "没打 site_id"
+    assert clock["t"] >= df.WAIT_TIMEOUT_S, "没等满预算就放弃了"
+
+
+def _sweeper_worst_case_minutes() -> int:
+    """兜底路径的最坏收敛 = 状态机上限 + 超龄阈值 + sweeper 调度间隔，**三个数都从真源读**。
+
+    不从 deploy_fixture 的注释抄：那样断言的期望值就与被测代码同源了。
+    """
+    import reconcile_job                        # functions/ 已由 deploy_fixture 放上 sys.path
+    app = (Path(__file__).parents[1] / "infra" / "app.py").read_text()
+    sm = re.search(r'state_machine_name="site-deploy".*?timeout=Duration\.minutes\((\d+)\)', app, re.S)
+    sweep = re.search(r'"JobSweepRule".*?Schedule\.rate\(Duration\.minutes\((\d+)\)\)', app, re.S)
+    assert sm and sweep, "从 infra/app.py 读不出状态机超时或 sweeper 调度——正则跟不上源码了"
+    return int(sm[1]) + reconcile_job.STALE_MINUTES + int(sweep[1])
+
+
+def test_wait_deadline_covers_the_sweeper_worst_case_convergence():
+    """上限必须覆盖 sweeper 兜底路径的**最坏**收敛，否则远端还在正常收敛时本地先
+    "放弃等待"。第一版只和 45 分钟的超龄阈值比，漏了前后两段。"""
+    worst = _sweeper_worst_case_minutes()
+    assert worst >= 100, f"读出来的最坏收敛只有 {worst} 分钟——多半是正则取错了数"
+    assert df.WAIT_TIMEOUT_S > worst * 60, (
+        f"本地上限 {df.WAIT_TIMEOUT_S // 60} 分钟 ≤ 兜底路径最坏收敛 {worst} 分钟")
+    assert 0 < df.WAIT_POLL_S <= 30
+
+
+def test_wait_still_returns_the_terminal_status_promptly(tmp_path, aws, monkeypatch):
+    """正对照：终态照原样退（0 / 1），且不受新上限影响。"""
+    clock = _wait_forever(aws, monkeypatch, elapsed_per_sleep=df.WAIT_POLL_S)
+    aws.table.get_item.return_value = {"Item": {"status": "SUCCEEDED", "phase": "done"}}
+    with pytest.raises(SystemExit) as e:
+        df.main(str(_copy_fixture(tmp_path)), site_id="ok-abc123")
+    assert e.value.code == 0 and clock["t"] == 0.0, "成功路径一次都不该 sleep"
+
+    aws.table.get_item.return_value = {"Item": {"status": "FAILED", "phase": "validate"}}
+    with pytest.raises(SystemExit) as e:
+        df.main(str(_copy_fixture(tmp_path / "b")), site_id="bad-abc123")
+    assert e.value.code == 1

@@ -38,6 +38,21 @@ const hashListeners = [];
  * "发过请求"。DOM stub 每次 querySelector 都返回**新的** Proxy，所以事后从
  * 元素上读不回来，只能在赋值那一刻录。 */
 const htmlWrites = [];
+/* 每一次 HTML 写入是**谁**发起的：写入时取调用栈，记 setHTML 被调用的位置（行:列）。
+ * 污点场景（taint）用它证明"33 处 setHTML 调用点里哪些真的执行到了"——没执行到的
+ * 调用点，"渲染结果里没有未转义标记"对它什么都没证明。 */
+const htmlCallers = [];
+
+function recordCaller() {
+  const frames = String(new Error().stack).split('\n').map((l) => l.trim());
+  const i = frames.findIndex((l) => /^at setHTML \(/.test(l));
+  const caller = i >= 0 ? frames[i + 1] || '' : '';
+  /* 记**调用点的 行:列**（eval 进来的代码，帧尾是 `<anonymous>:行:列`；V8 报的是被调标识符
+   * `setHTML` 的起点）。只记行不够：同一行两处调用、或 `setHTML` 与 `(` 分行时会漏账（Codex R3）。
+   * 函数名也不行：匿名闭包只会给出 `eval`。 */
+  const m = /<anonymous>:(\d+):(\d+)\)?$/.exec(caller);
+  htmlCallers.push(m ? m[1] + ':' + m[2] : '-1');
+}
 
 function stubEl() {
   return new Proxy({}, {
@@ -57,7 +72,7 @@ function stubEl() {
       return t[k];
     },
     set(t, k, v) {
-      if (k === 'innerHTML') htmlWrites.push(String(v));
+      if (k === 'innerHTML') { htmlWrites.push(String(v)); recordCaller(); }
       t[k] = v;
       return true;
     },
@@ -170,11 +185,112 @@ const SITE_SCENARIOS = {
 };
 const SCASE = SITE_SCENARIOS[SCENARIO] || null;
 
+/* ── 污点场景（taint）：`node boot_harness.js <app.js> taint '<JSON 规格>'` ─────────────
+ *
+ * 为什么需要：`setHTML` 上那条行内抑制的前提是"拼进 HTML 的动态值都经过 esc()"。
+ * 静态文本守卫（test_frontend_contract）只能按写法判，而写法是无穷的——Codex R1/R2 两轮
+ * 构造出的绕过形态（`'' || job.error`、`esc(a) || job.error`、透传函数、单行模板里夹一个
+ * 裸字段……）每一种都合法、都能让文本判据全绿。这里改判**行为**：把后端返回的自由文本
+ * 字段都包上一个含 HTML 元字符的惰性标记，逐路由真渲染，然后看写进 DOM 的串。
+ *
+ * **判据是差分，不是找子串**（Codex R3：只找 `<x-taint` 时，`toUpperCase()` / `slice` /
+ * `split` 之类的正常变换就能让未转义输出"看不见"）。同一规格跑两遍：一遍标记含 `<>"'`，
+ * 一遍（`control: true`）把这四个字符换成等长的惰性字符，其余字节完全相同。判定在
+ * test_frontend_boot 里，用**三个**观察器（计数差分 / html.parser 结构差分 / 原样标记）——
+ * 单靠计数会被"同一次调用里两组走不同回退、计数恰好相等"抵消（Codex R4）。
+ *
+ * 枚举 / 结构字段（TAINT_SKIP）默认不注入：它们驱动分支（`status === 'FAILED'` 之类），
+ * 注进去页面就走进"未知值"分支，主路径反而不执行。`poison_enums: true` 的规格**另外**把它们
+ * 也注入，专门走 statusBadge / jobBadge / roleTag / 各映射表的未知值回退（Codex R3：
+ * 只有主路径时，删掉 statusBadge 里的 esc(label) 两层都绿）。 */
+const TAINT = SCENARIO === 'taint';
+/* 第 4 个参数是一段 JSON：{route, fail, empty, admin, api_key, direct, control, poison_enums}
+ *   route        —— 落在哪个路由（默认 #/sites）
+ *   fail         —— URL 含这个子串的请求返回 500，错误文案同样注入标记（走 errorCard / catch 分支）
+ *   empty        —— 列表类响应一律给空（走空态分支）
+ *   admin        —— /api/me 的 is_admin（默认 true）
+ *   api_key      —— /api/me 的 features.api_key（默认已部署且开闸）
+ *   direct       —— 启动完后直接调 toast / openModal / closeModal：它们只在点击里被调，harness 不点击
+ *   control      —— 对照组：标记里的 `<>"'` 换成等长惰性字符（见上面的差分判据）
+ *   poison_enums —— 枚举字段也注入（走未知值回退分支） */
+const TSPEC = TAINT ? Object.assign({ route: '#/sites', fail: null, empty: false, admin: true,
+                                      api_key: { deployed: true, enabled: true }, direct: false,
+                                      control: false, poison_enums: false },
+                                    JSON.parse(process.argv[4] || '{}')) : null;
+const TAINT_ROUTE = TAINT ? TSPEC.route : '';
+/* 两个标记**等长**、只差四个元字符：对照组必须与实验组走完全相同的代码路径与截断位置。 */
+const TAINT_MARK = TAINT && TSPEC.control ? '~^)(x-taint)' : '"\'><x-taint>';
+const TAINT_SKIP = TAINT && TSPEC.poison_enums ? new Set()
+  : new Set(['status', 'role', 'phase', 'decision', 'period']);
+
+/* 标记加在**两端**：`when()` 之类会截断（`slice(0, 19)`），只加在尾部会被截掉。 */
+function taint(v, key) {
+  if (typeof v === 'string') return TAINT_SKIP.has(key) ? v : TAINT_MARK + v + TAINT_MARK;
+  if (Array.isArray(v)) return v.map((x) => taint(x, key));
+  if (v && typeof v === 'object') {
+    const o = {};
+    for (const [k, x] of Object.entries(v)) o[k] = taint(x, k);
+    return o;
+  }
+  return v;
+}
+
+/* 访问明细：**不复用** A_ROWS——那组夹具的 path 本身就带 `<`，实验组与对照组里一模一样，
+ * 差分看不出它有没有被转义（它归 test_visitor_supplied_path_is_escaped_at_render_time 管）。 */
+const T_ROWS = [
+  { ts: '2026-08-14T09:15:00', email: 'someone@example.com', path: '/', decision: 'allow' },
+  { ts: '2026-08-14T09:17:00', email: '', path: '/p', decision: 'redirect_login' },
+];
+
+const T_SITE_ID = 's-taint';
+function taintSite(id, over) {
+  return Object.assign({
+    site_id: id, name: '污点站', status: 'ACTIVE', subdomain: 'app-' + id,
+    url: 'https://app-' + id + '.example.com', owner: 'owner@example.com',
+    created_at: '2026-08-01T00:00:00', require_login: true,
+    allowed_users: ['a@example.com', 'b@example.com'], collaborators: ['c@example.com'],
+    ever_live: true, role: 'owner', pv7: S_BUSY,
+  }, over || {});
+}
+const T_JOBS = [
+  { job_id: 'jt-failed', status: 'FAILED', phase: 'provision-db', by: 'x@example.com',
+    created_at: '2026-08-14T10:00:00', duration_s: 30, error: '迁移失败' },
+  { job_id: 'jt-ok', status: 'SUCCEEDED', phase: 'smoke-test', by: 'y@example.com',
+    created_at: '2026-08-13T10:00:00', finished_at: '2026-08-13T10:01:30',
+    duration_s: 90, error: '' },
+];
+function taintResponseFor(u) {
+  const E = TSPEC.empty;
+  if (u.includes('/api/me')) {
+    return taint({ email: 'me@example.com', name: 'Me', is_admin: TSPEC.admin,
+                   features: { api_key: TSPEC.api_key } });
+  }
+  if (u.includes('/api/settings/api-key')) return TSPEC.api_key;
+  if (u.includes('/api/keys')) {
+    return taint({ keys: E ? [] : [{ key_id: 'k1', name: '我的钥匙', prefix: 'sk-a1b2',
+                                     created_at: '2026-08-12T03:04:05', last_used_at: '',
+                                     revoked: false }] });
+  }
+  if (u.includes('/api/admins')) return taint({ admins: E ? [] : ['root@example.com'] });
+  if (u.includes('/analytics')) return taint({ period: 'day', series: E ? [] : A_SERIES });
+  if (u.includes('/visitors')) return taint({ rows: E ? [] : T_ROWS, next: null });
+  if (u.includes('/jobs')) return taint({ jobs: E ? [] : T_JOBS });
+  if (u.endsWith('/api/sites') || u.includes('/api/sites?')) {
+    return taint({ sites: E ? [] : [taintSite('s-a'),
+                                    taintSite('s-b', { status: 'DEPLOYING', ever_live: false,
+                                                       allowed_users: 'org', collaborators: [] })] });
+  }
+  if (u.includes('/api/sites/' + T_SITE_ID)) {
+    return taint(taintSite(T_SITE_ID, E ? { allowed_users: [], collaborators: [] } : {}));
+  }
+  return taint({ email: 'me@example.com', name: 'Me', is_admin: true });
+}
+
 /* Key / analytics / deploys-failed 场景要直接落在自己的路由上，且不能被"先去升级面板会话"
  * 截住——所以预置一个**新鲜的**升级标记。键名必须是 app.js 的 UPGRADE_MARK
  * （`sb_console_upgraded_at`）：写错的话 boot 会跳去 /console-session 然后
  * return，场景退化成 first-visit，那一组用例全部静默空转。 */
-const localSeed = (KEYCASE || ACASE || SCASE || SCENARIO === 'deploys-failed')
+const localSeed = (KEYCASE || ACASE || SCASE || TAINT || SCENARIO === 'deploys-failed')
   ? new Map([['sb_console_upgraded_at', String(Date.now())]])
   : new Map();
 
@@ -264,7 +380,7 @@ global.sessionStorage = store(sessionSeed);
 global.confirm = () => true;
 
 const loc = {
-  _hash: KEYCASE ? '#/keys'
+  _hash: TAINT ? TAINT_ROUTE : KEYCASE ? '#/keys'
     : ACASE ? '#/sites/' + A_SITE_ID + '/analytics'
       : DEPLOYS_FAILED ? '#/sites/' + A_SITE_ID + '/deploys'
         : SCASE ? '#/sites' : '',
@@ -348,6 +464,12 @@ global.fetch = async (url) => {
    * "访问明细读取失败（探针注入）"，于是它把"访问明细"这个词带进了页面——
    * 而"失败态不得渲染出访问明细那张表"正是要断言的东西，那条断言就有了两个
    * 满足来源。夹具自己制造字样碰撞，与本轮记录的假绿是同一族。 */
+  if (TAINT) {
+    if (TSPEC.fail && u.includes(TSPEC.fail)) {
+      return { ok: false, status: 500, json: async () => taint({ error: '后端失败' }) };
+    }
+    return { ok: true, status: 200, json: async () => taintResponseFor(u) };
+  }
   if (ACASE && ACASE.fail && u.includes(ACASE.fail)) {
     return { ok: false, status: 500,
              json: async () => ({ error: 'PROBE-E500-SENTINEL' }) };
@@ -494,6 +616,21 @@ if (SCENARIO === 'm15-stale') {
   })();
 }
 
+/* 污点场景的 direct：toast / openModal / closeModal 只在点击处理器里被调，而 harness 不点击。
+ * 在启动之后直接调一次，参数全用注入过标记的串——它们的**文本参数**必须被转义。
+ * openModal 的 body / footer 按契约是调用方拼好的 HTML，不在这里注入（那部分归点击处理器，
+ * 见 test_frontend_boot 里写明的覆盖边界）。 */
+if (TAINT && TSPEC.direct) {
+  setTimeout(() => {
+    try {
+      const t = TAINT_MARK + '文本' + TAINT_MARK;
+      toast(t, t, 'err');
+      openModal({ title: t, desc: t, body: '', footer: '' });
+      closeModal();
+    } catch (e) { errors.push('direct: ' + ((e && e.message) || e)); }
+  }, 100);
+}
+
 // m15-stale 自带 setTimeout 节拍并自行 exit；下面这个默认收尾器 delay 0 会抢在它
 // 前面 exit，所以对该场景跳过。
 if (SCENARIO !== 'm15-stale') setTimeout(() => {
@@ -506,6 +643,8 @@ if (SCENARIO !== 'm15-stale') setTimeout(() => {
      * 断言在它上面是不精确的：加载中的占位、上一次渲染的内容都还在里面。
      * 最终态要看 html_writes[-1]（统计页三态的判据全是"最后渲染出了什么"）。 */
     html_writes: htmlWrites,
+    /* 与 html_writes 一一对应：第 i 次写入是 app.js 哪个位置（"行:列"）的 setHTML 发起的（"-1" = 取不到） */
+    html_callers: htmlCallers,
     /* 明文只应活在创建响应的那个闭包里。这两份是"有没有被存起来"的证据面
      * ——harness 里没有点击，所以创建流程不会跑，这两个断言在**本文件**只能
      * 证明启动路径没写；真正盯住明文的是 test_frontend_contract 的白名单

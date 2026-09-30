@@ -25,9 +25,19 @@ PANEL = Path(__file__).parents[1]
 FE = PANEL / "frontend"
 REPO = PANEL.parents[1]
 
+# ECMAScript 的全部行终止符（LF / CR / LS / PS）——行注释在任何一个处结束
+_JS_LINE_TERMINATORS = "\n\r\u2028\u2029"
+_JS_LINE_TERMINATOR_RE = re.compile("[\n\r\u2028\u2029]")
+# 这些关键字之后的 `/` 开始的是正则字面量（`return /x/`），不是除号
+_REGEX_AFTER_KEYWORDS = frozenset({"return", "typeof", "instanceof", "in", "new", "delete",
+                                   "void", "throw", "case", "do", "else", "yield", "await"})
 
-def _strip_js_comments(src: str) -> str:
+
+def _strip_js_comments(src: str, keep_layout: bool = False) -> str:
     """去掉 JS 注释，**但不破坏字符串字面量**。
+
+    `keep_layout=True`：注释字符换成空格、行终止符照留——结果与原文**逐字符等长、行列不变**，
+    给需要在原文坐标上判断"这个位置在不在注释里"的检查用（setHTML 的调用位置与引用政策）。
 
     为什么需要它：本文件第一版直接在原文上做文本断言，结果三条用例被我自己
     写的注释命中而假红（注释里写了"不要请求 /api/analytics"、"tier 字段没有"、
@@ -43,24 +53,47 @@ def _strip_js_comments(src: str) -> str:
     `/[&<>"']/g` 打败——扫描器把那个 `"` 当成字符串开头，从此错位，后面的
     块注释一个都没剥掉，于是三条用例继续假红。修它时才意识到：一个"剥注释"
     的工具本身就需要被验证，见下面的 test_comment_stripper_*。
+
+    Codex R5 又找到两处把**真代码**当注释抹掉的词法分歧（抹掉的代码对引用政策和覆盖面都不可见）：
+    `return /[/*]/` 这种**关键字后**的正则（第一版只看前一个字符，`n` 不在表里 ⇒ 当成除号，
+    字符类里的 `/*` 被当成块注释起点）；以及 JS 的行终止符不只 LF——CR、U+2028、U+2029 都结束
+    行注释。两处都已按 ECMAScript 处理。
+
+    **仍未建模**（写明，别当成保证）：Annex B 的 HTML 式注释（经典脚本里的 `<!--` 与行首 `-->`）、
+    `if (…) /re/` 这种控制语句右括号后的正则、模板字面量里 `${…}` 的嵌套。它们不靠本函数兜：
+    test_frontend_boot 用 node 自带的 acorn 词法器在**真实前端源码**上逐字符核对本函数的注释判定，
+    这几种写法一旦进了 app.js 就是响亮的红，而不是静默抹掉后文。
     """
     # 这些字符之后出现的 `/` 是正则字面量的开头，而不是除号
     REGEX_OK_AFTER = set("(,=:[!&|?{};+-*%~^<>\n\r\t ")
+    LT = _JS_LINE_TERMINATORS
     out = []
     i, n = 0, len(src)
     prev = ""           # 上一个有意义的字符（用于区分正则与除法）
+    word = ""           # 紧挨在 prev 上的标识符 / 关键字（`return /x/` 要按正则处理）
+    word_after_dot = False  # 该标识符前面是 `.`（`a.return / b` 是属性后的除法）
+    glued = False       # 上一个字符是标识符字符（中间没隔空白 / 注释）
     while i < n:
         ch = src[i]
         nxt = src[i + 1] if i + 1 < n else ""
 
         if ch == "/" and nxt == "*":                     # 块注释
             end = src.find("*/", i + 2)
-            i = n if end < 0 else end + 2
-            out.append("\n")
+            stop = n if end < 0 else end + 2
+            if keep_layout:
+                out.append("".join(c if c in LT else " " for c in src[i:stop]))
+            else:
+                out.append("\n")
+            glued = False
+            i = stop
             continue
-        if ch == "/" and nxt == "/":                     # 行注释
-            end = src.find("\n", i)
-            i = n if end < 0 else end
+        if ch == "/" and nxt == "/":                     # 行注释：到任一行终止符为止
+            end = _JS_LINE_TERMINATOR_RE.search(src, i)
+            stop = n if end is None else end.start()
+            if keep_layout:
+                out.append(" " * (stop - i))
+            glued = False
+            i = stop
             continue
 
         if ch in "'\"`":                                 # 字符串字面量
@@ -76,10 +109,11 @@ def _strip_js_comments(src: str) -> str:
                 i += 1
                 if c == ch:
                     break
-            prev = ch
+            prev, word, glued = ch, "", False
             continue
 
-        if ch == "/" and (prev == "" or prev in REGEX_OK_AFTER):
+        if ch == "/" and (prev == "" or prev in REGEX_OK_AFTER
+                          or (word in _REGEX_AFTER_KEYWORDS and not word_after_dot)):
             # 正则字面量：整体照抄，内部的引号/斜杠都不参与状态机
             out.append(ch)
             i += 1
@@ -98,16 +132,25 @@ def _strip_js_comments(src: str) -> str:
                     in_class = False
                 elif c == "/" and not in_class:
                     break
-                elif c == "\n":
+                elif c in LT:
                     break        # 未闭合：当普通字符处理，别把后文全吃掉
-            prev = "/"
+            prev, word, glued = "/", "", False
             continue
 
         out.append(ch)
-        if not ch.isspace():
+        if ch.isspace():
+            glued = False
+            if ch in LT:
+                prev = "\n"
+        else:
+            if ch.isalnum() or ch in "_$":
+                if not glued:
+                    word, word_after_dot = "", prev == "."
+                word += ch
+                glued = True
+            else:
+                word, glued = "", False
             prev = ch
-        elif ch == "\n":
-            prev = "\n"
         i += 1
     return "".join(out)
 
@@ -124,6 +167,18 @@ def test_comment_stripper_removes_comments():
     assert "tier" not in out, "行注释没剥掉"
     for kept in ("a()", "b()", "c()"):
         assert kept in out, f"把代码 {kept} 也吃掉了"
+
+
+def test_comment_stripper_keep_layout_preserves_coordinates():
+    """`keep_layout=True` 必须逐字符等长、换行位置不变，且注释内容确实被抹掉。"""
+    src = ('a(); /* x\n y */ setHTML /* gap */ (el);\n'
+           'const r = s.replace(/[&<>"\']/g, f); // 行尾\nz();')
+    out = _strip_js_comments(src, keep_layout=True)
+    assert len(out) == len(src), "长度变了——下游按原文算的行列号会错位"
+    assert [i for i, c in enumerate(out) if c == "\n"] == [i for i, c in enumerate(src) if c == "\n"]
+    assert "gap" not in out and "行尾" not in out and " y " not in out, "注释没抹掉"
+    assert out.index("setHTML") == src.index("setHTML"), "代码位置漂了"
+    assert '/[&<>"\']/g' in out, "正则字面量被破坏"
 
 
 def test_comment_stripper_keeps_regex_and_string_literals():
@@ -148,6 +203,53 @@ def test_comment_stripper_keeps_regex_and_string_literals():
     assert "除法不是正则" not in out, "行注释没剥掉"
 
 
+# Codex R5 的四个反例：合法 JS、`node --check` 为 0，第一版把其中的真代码当注释抹掉，
+# 新增 sink 于是同时逃过引用政策与覆盖面（静态 32 == 运行期 32）。
+_R5_HIDDEN_SINK_SOURCES = {
+    "关键字后的正则 + 直接调用":
+        "function m() { return /[/*]/; }\nfunction x(el, d) { setHTML(el, d.name); }\n// */\n",
+    "关键字后的正则 + 别名":
+        "function m() { return /[/*]/; }\nfunction x(el, d) { const f = setHTML; f(el, d.name); }\n// */\n",
+    "U+2028 结束行注释 + 别名":
+        "// harmless\u2028function x(el, d) { const f = setHTML; f(el, d.name); }\n",
+    "U+2029 结束行注释 + 别名":
+        "// harmless\u2029function x(el, d) { const f = setHTML; f(el, d.name); }\n",
+}
+
+
+@pytest.mark.parametrize("name", sorted(_R5_HIDDEN_SINK_SOURCES))
+def test_comment_stripper_keeps_code_after_keyword_regex_and_all_line_terminators(name):
+    src = _R5_HIDDEN_SINK_SOURCES[name]
+    for keep in (False, True):
+        out = _strip_js_comments(src, keep_layout=keep)
+        assert "setHTML" in out, f"{name}：真代码里的 setHTML 被当注释抹掉了（keep_layout={keep}）"
+    out = _strip_js_comments(src, keep_layout=True)
+    assert len(out) == len(src), "保长被破坏"
+    assert [i for i, c in enumerate(out) if c in _JS_LINE_TERMINATORS] == \
+        [i for i, c in enumerate(src) if c in _JS_LINE_TERMINATORS], "行终止符位置变了"
+    assert "harmless" not in out and "*/" not in out.replace("/[/*]/", ""), "注释本身没抹掉"
+    if "别名" in name:
+        base = "function setHTML(el, html) { el.innerHTML = html; }\n"
+        assert _sethtml_reference_problems(base + src), f"{name}：别名没被引用政策拒绝"
+
+
+def test_comment_stripper_keyword_regex_does_not_misread_division_or_properties():
+    """正对照：关键字识别只对**关键字本身**生效——属性名、较长的标识符、真的除法都不能被当成正则
+    （否则会把 `/ b; // c` 当正则体照抄，后面的行注释就剥不掉了）。"""
+    src = ("const a = o.return / b; // 注释甲\n"
+           "const r = myreturn / 2; // 注释乙\n"
+           "function f(x) { return x / 2; } // 注释丙\n"
+           "function g(x) { throw /a\\/b/.source; } // 注释丁\n"
+           "const s = typeof /x/; const u = '//不是注释'; const t = `/*也不是*/`; // 注释戊\n")
+    out = _strip_js_comments(src, keep_layout=True)
+    assert len(out) == len(src)
+    for gone in ("注释甲", "注释乙", "注释丙", "注释丁", "注释戊"):
+        assert gone not in out, f"{gone} 没剥掉——前面某个 `/` 的判定错位了"
+    for kept in ("o.return / b", "myreturn / 2", "x / 2", "/a\\/b/.source", "typeof /x/",
+                 "'//不是注释'", "`/*也不是*/`"):
+        assert kept in out, f"代码 {kept!r} 被改动"
+
+
 def _js(strip_comments: bool = True) -> str:
     """全部前端 JS 拼一起（默认已剥注释）。
 
@@ -165,6 +267,47 @@ def _js(strip_comments: bool = True) -> str:
         "剥注释后代码剩得太少——扫描器可能把字符串当注释吃掉了")
     assert "function esc(" in code, "剥注释后连 esc() 都不见了，扫描器坏了"
     return code
+
+
+def _split_top_level_plus(line: str) -> list[str]:
+    """按**顶层** `+` 切分（不进字符串、不进括号）。
+
+    不能用 `re.findall(r"\\+\\s*([^+;]+?)\\s*\\+")`：那要求表达式**两侧都有**
+    `+`，于是续行开头的表达式（前一行以 `+` 结尾）永远被跳过。实测就是这样
+    漏掉的——`esc(job.error || '…')` 改成 `(job.error)` 之后用例仍然绿，
+    而那正是把他人 job 的错误串未转义塞进 innerHTML 的形态。
+    """
+    parts, buf, depth, quote = [], [], 0, ""
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            buf.append(ch)
+            if ch == "\\" and i + 1 < len(line):
+                buf.append(line[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch in "'\"`":
+            quote = ch
+            buf.append(ch)
+        elif ch in "([{":
+            depth += 1
+            buf.append(ch)
+        elif ch in ")]}":
+            depth -= 1
+            buf.append(ch)
+        elif ch == "+" and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    parts.append("".join(buf))
+    return parts
 
 
 def _all_text() -> str:
@@ -944,6 +1087,202 @@ def test_deploying_site_derives_failure_badge_from_latest_job():
 
 
 # ── ⑪ XSS：所有插值都要转义 ────────────────────────────────────────────
+#
+# 下面这组函数是"一个表达式拼进 HTML 安全吗"的**唯一**判定，逐行 esc 那条与 setHTML 实参那条
+# 共用（判定只许有一份）。它是**文本启发式**，不是 JS 解析器，已知边界写在
+# `_expr_is_unsafe` 的 docstring 里；语义上的兜底是 test_frontend_boot 的污点场景（真渲染、
+# 看写进 DOM 的串，与写法无关）。
+
+# 输出**已转义**或**恒为受控内容**的函数：整段调用在判定前被换成占位符。
+# 只列真的转义 / 只产出数字或常量的；`when` / `phaseText` / `dur` / `initials` **不在这里**——
+# 它们原样返回输入（`when` 只截前 19 个字符），安全与否全看调用点外面有没有再套 esc()。
+# 第一版把它们也列成"会转义的包装"，于是 `'<td>' + when(site.created_at) + '</td>'` 静态全绿。
+_ESCAPING_CALLS = (
+    "esc", "statusBadge", "jobBadge", "roleTag", "avatarStack", "policySummary",
+    # 恒为数字：`Number(n).toLocaleString()`
+    "fmt",
+    # M5 Task 9b：`sparkline(item.pv7)` 的插值**全是数字**（宽高、`.toFixed(1)` 的坐标、
+    # `fmt()` 过的总数），产不出调用方给的字符串。这条豁免不是白给的——
+    # test_frontend_boot 的 `sites-list-hostile` 场景往 pv7 里塞可执行串真跑一遍，
+    # 证明它渲染不出标签（被豁免的前提必须自己被盯住）。
+    "sparkline",
+    # URL 段：进的是 href/fetch 路径，且本身就是编码函数
+    "encodeURIComponent",
+)
+# 前端自造、不含用户数据的片段（图标常量、已拼好的 HTML 变量、计数）
+_SAFE_NAMES_RE = re.compile(r"^(ICON|html|out|opts|scopeToggle|searchBox|tabs|refs)\b")
+# "读了某个对象的字段"——它才可能承载用户数据。`row` 是 Key 列表的行（M4）：备注名
+# `row.name` 是用户自己填的，漏在这个清单外就等于新页面完全不在本条断言的覆盖面里。
+_USER_FIELD_RE = re.compile(r"\b(site|job|admins?|item|row|v|d|res|err|state)\.[a-z_]")
+_STRING_LIT_RE = re.compile(r"'(?:[^'\\\n]|\\.)*'|\"(?:[^\"\\\n]|\\.)*\"")
+_ESCAPING_CALL_RE = re.compile(r"(?<![\w$.])(?:" + "|".join(_ESCAPING_CALLS) + r")\s*\(")
+
+
+def _blank_strings(e: str) -> str:
+    """字符串字面量的内容换成**等长**空白（引号保留）——等长是为了下标还能对回原串。"""
+    return _STRING_LIT_RE.sub(
+        lambda m: m.group(0)[0] + " " * (len(m.group(0)) - 2) + m.group(0)[0], e)
+
+
+def _matching_close(s: str, i: int) -> int:
+    """`s[i]` 是开括号；返回配对闭括号的下标（跳过字符串）。没有就 -1。"""
+    depth, quote, j = 0, "", i
+    while j < len(s):
+        c = s[j]
+        if quote:
+            if c == "\\":
+                j += 2
+                continue
+            if c == quote:
+                quote = ""
+        elif c in "'\"`":
+            quote = c
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                return j
+        j += 1
+    return -1
+
+
+def _split_top_level_ternary(e: str):
+    """顶层 `c ? a : b` → (c, a, b)；不是顶层三元就 None。跳过 `?.` 与 `??`，认嵌套三元。"""
+    b = _blank_strings(e)
+
+    def is_q(i):
+        return b[i] == "?" and b[i + 1:i + 2] not in (".", "?") and (i == 0 or b[i - 1] != "?")
+
+    depth, q = 0, -1
+    for i, c in enumerate(b):
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif depth == 0 and is_q(i):
+            q = i
+            break
+    if q < 0:
+        return None
+    depth, nest = 0, 0
+    for j in range(q + 1, len(b)):
+        c = b[j]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif depth == 0 and is_q(j):
+            nest += 1
+        elif depth == 0 and c == ":":
+            if nest == 0:
+                return e[:q], e[q + 1:j], e[j + 1:]
+            nest -= 1
+    return None
+
+
+def _blank_escaping_calls(e: str) -> str:
+    """字符串内容清空后，把每一段 `esc(...)` 之类的**整段调用**换成 `_`。
+
+    必须是整段替换，不能是"含有 `esc(` 就算安全"：第一版就是后者，于是
+    `esc(a) || job.error` 因为含 `esc(` 被整条放过（Codex R2 的反例）。"""
+    b = _blank_strings(e)
+    out, i = [], 0
+    while True:
+        m = _ESCAPING_CALL_RE.search(b, i)
+        if not m:
+            out.append(b[i:])
+            return "".join(out)
+        close = _matching_close(b, m.end() - 1)
+        if close < 0:
+            out.append(b[i:])
+            return "".join(out)
+        out.append(b[i:m.start()] + "_")
+        i = close + 1
+
+
+_MAP_CALL_RE = re.compile(r"[\w$.()\[\]| ]+?\.map\(")
+_JOIN_TAIL_RE = re.compile(r"\s*(?:\.join\(\s*(?:'[^']*'|\"[^\"]*\")?\s*\))?\s*")
+_ARROW_HEAD_RE = re.compile(r"\s*(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>\s*")
+
+
+def _returns_in(body: str) -> list:
+    """块体里每条 `return EXPR;` 的 EXPR（到**顶层** `;` 为止，跳过字符串）。"""
+    b, out = _blank_strings(body), []
+    for m in re.finditer(r"\breturn\b", b):
+        depth, i = 0, m.end()
+        while i < len(b):
+            c = b[i]
+            if c in "([{":
+                depth += 1
+            elif c in ")]}":
+                depth -= 1
+                if depth < 0:
+                    break
+            elif c == ";" and depth == 0:
+                break
+            i += 1
+        out.append(body[m.end():i])
+    return out
+
+
+def _arrow_is_unsafe(arrow: str) -> bool:
+    """`.map()` 的回调产出的东西拼进 HTML 安全吗。`esc` 本身当回调 = 逐项转义。"""
+    a = arrow.strip()
+    if a == "esc":
+        return False
+    m = _ARROW_HEAD_RE.match(a)
+    if not m:                            # 看不懂的回调形态：退回字段启发式
+        return bool(_USER_FIELD_RE.search(_blank_escaping_calls(a)))
+    body = a[m.end():].strip()
+    if not body.startswith("{"):
+        return _expr_is_unsafe(body)
+    close = _matching_close(body, 0)
+    return any(_expr_is_unsafe(r) for r in _returns_in(body[1:close]))
+
+
+def _expr_is_unsafe(expr: str) -> bool:
+    """这个表达式拼进 HTML，可能带着未转义的用户数据吗。
+
+    递归下降只处理三种结构，**按 JS 优先级**：先三元（优先级最低；条件不进输出，只判两个
+    分支）、再顶层 `+`、再外层括号。剩下的（方法链、箭头函数、普通调用……）落到启发式：
+    把已转义的整段调用换成占位、字符串内容清空、计数（`.length`）与逐项 esc（`.map(esc)`）
+    去掉之后，还读了 `_USER_FIELD_RE` 里那些对象的字段就算不安全。
+
+    **已知边界**（静态判据给不了，别当成保证）：裸局部变量（`const v = job.error; … + v`）、
+    清单外的对象名（`it.x`）、透传函数的嵌套调用（`'<b>' + id(v)`）。这些归运行期污点场景
+    （test_frontend_boot 的 taint 系列：真渲染，实验组与惰性对照组差分比较元字符个数）。
+    """
+    e = expr.strip().rstrip(",;").strip()
+    if not e or _STRING_LIT_RE.fullmatch(e):
+        return False                    # 完整的字符串字面量（**完整**：`'' || x` 不算）
+    b = _blank_strings(e)
+    # 跨行拼接被切成的片段（自身还带着未闭合的三元/括号）无法在单行上判定；这些片段的
+    # 内层表达式会在它们各自所在的行被单独检查，所以跳过而不是误报。
+    if any(b.count(o) != b.count(c) for o, c in ("()", "[]", "{}")) or ("?" in b and ":" not in b):
+        return False
+    t = _split_top_level_ternary(e)
+    if t:
+        return _expr_is_unsafe(t[1]) or _expr_is_unsafe(t[2])
+    parts = _split_top_level_plus(e)
+    if len(parts) > 1:
+        return any(_expr_is_unsafe(x) for x in parts)
+    if e[0] == "(" and _matching_close(e, 0) == len(e) - 1:
+        return _expr_is_unsafe(e[1:-1])
+    # `集合.map(回调)[.join(字面量)]`：判回调**产出**什么；被迭代的集合本身不进输出
+    m = _MAP_CALL_RE.match(e)
+    if m:
+        close = _matching_close(e, m.end() - 1)
+        if close > 0 and _JOIN_TAIL_RE.fullmatch(e[close + 1:]):
+            return _arrow_is_unsafe(e[m.end():close])
+    if _SAFE_NAMES_RE.match(e):
+        return False
+    rest = _blank_escaping_calls(e)
+    rest = re.sub(r"[\w$.()\[\]| ]+\.length\b", "_", rest)      # 计数是数字
+    rest = re.sub(r"[\w$.]+\.map\(\s*esc\s*\)", "_", rest)      # 逐项 esc
+    return bool(_USER_FIELD_RE.search(rest))
+
+
 
 def test_all_interpolated_values_go_through_esc():
     """innerHTML 拼接里的动态值必须过 esc()。
@@ -959,47 +1298,6 @@ def test_all_interpolated_values_go_through_esc():
     blob = _js()
     assert "function esc(" in blob or "const esc =" in blob, "没有 esc 实现"
 
-    # 自身会转义的包装：esc 之外，这些函数内部只产出受控内容或自己调 esc
-    SAFE_WRAPPERS = ("esc(", "fmt(", "dur(", "when(", "initials(",
-                     "statusBadge(", "jobBadge(", "roleTag(", "phaseText(",
-                     "avatarStack(", "policySummary(",
-                     # M5 Task 9b：`sparkline(item.pv7)` 的插值**全是数字**
-                     # （宽高、`.toFixed(1)` 的坐标、`fmt()` 过的总数），产不出
-                     # 调用方给的字符串。这条豁免不是白给的——
-                     # test_frontend_boot 的 `sites-list-hostile` 场景往 pv7 里
-                     # 塞可执行串真跑一遍，证明它渲染不出标签（同 toast/
-                     # openModal 那条：被豁免的前提必须自己被盯住）。
-                     "sparkline(",
-                     # URL 段：进的是 href/fetch 路径，且本身就是编码函数
-                     "encodeURIComponent(")
-    # 前端自造、不含用户数据的片段（图标常量、已拼好的 HTML 变量、计数）
-    SAFE_NAMES = r"^(ICON|html|out|opts|scopeToggle|searchBox|tabs|refs)\b"
-    # 三元的两个分支都是字符串字面量 → 取值恒为字面量，用户数据进不来
-    LITERAL_TERNARY = re.compile(
-        r"""\?\s*(['"]).*?\1\s*:\s*(['"]).*?\2\s*\)?\s*$""", re.S)
-
-    def unsafe(expr: str) -> bool:
-        e = expr.strip()
-        if not e or any(w in e for w in SAFE_WRAPPERS):
-            return False
-        if re.match(SAFE_NAMES, e) or LITERAL_TERNARY.search(e):
-            return False
-        # `.length` 是数字，`.map(esc)` 已逐项转义 —— 都进不去标记
-        if re.search(r"\.length\b", e) and "esc(" not in e:
-            return False
-        if re.search(r"\.map\(\s*esc\s*\)", e):
-            return False
-        # 跨行拼接被切成的片段（自身还带着未闭合的三元/括号）无法在单行上判定；
-        # 这些片段的内层表达式会在它们各自所在的行被单独检查，所以跳过而不是
-        # 误报。判据：片段里含 `?` 但没有对应的 `:`，或括号明显不平衡。
-        if e.count("(") != e.count(")") or ("?" in e and ":" not in e):
-            return False
-        # 只关心"读了某个对象的字段"这种形态——它才可能承载用户数据。
-        # `row` 是 Key 列表的行（M4）：备注名 `row.name` 是用户自己填的，
-        # 漏在这个清单外就等于新页面完全不在本条断言的覆盖面里。
-        return bool(re.search(r"\b(site|job|admins?|item|row|v|d|res|err|state)\."
-                              r"[a-z_]", e))
-
     def builds_html(line: str) -> bool:
         """这一行是否在拼 HTML。
 
@@ -1010,46 +1308,6 @@ def test_all_interpolated_values_go_through_esc():
         """
         return bool(re.search(r"<\s*/?[a-zA-Z]", line))
 
-    def split_top_level_plus(line: str) -> list[str]:
-        """按**顶层** `+` 切分（不进字符串、不进括号）。
-
-        不能用 `re.findall(r"\\+\\s*([^+;]+?)\\s*\\+")`：那要求表达式**两侧都有**
-        `+`，于是续行开头的表达式（前一行以 `+` 结尾）永远被跳过。实测就是这样
-        漏掉的——`esc(job.error || '…')` 改成 `(job.error)` 之后用例仍然绿，
-        而那正是把他人 job 的错误串未转义塞进 innerHTML 的形态。
-        """
-        parts, buf, depth, quote = [], [], 0, ""
-        i = 0
-        while i < len(line):
-            ch = line[i]
-            if quote:
-                buf.append(ch)
-                if ch == "\\" and i + 1 < len(line):
-                    buf.append(line[i + 1])
-                    i += 2
-                    continue
-                if ch == quote:
-                    quote = ""
-                i += 1
-                continue
-            if ch in "'\"`":
-                quote = ch
-                buf.append(ch)
-            elif ch in "([{":
-                depth += 1
-                buf.append(ch)
-            elif ch in ")]}":
-                depth -= 1
-                buf.append(ch)
-            elif ch == "+" and depth == 0:
-                parts.append("".join(buf))
-                buf = []
-            else:
-                buf.append(ch)
-            i += 1
-        parts.append("".join(buf))
-        return parts
-
     bad = set()
     for raw_line in blob.splitlines():
         line = raw_line.strip()
@@ -1057,23 +1315,47 @@ def test_all_interpolated_values_go_through_esc():
             continue
         # 形态 A：模板字符串插值
         for expr in re.findall(r"\$\{([^}]+)\}", line):
-            if unsafe(expr):
+            if _expr_is_unsafe(expr):
                 bad.add(expr.strip())
         # 形态 B：字符串拼接（本前端实际用的形态）
         if "+" in line:
-            for expr in split_top_level_plus(line):
+            for expr in _split_top_level_plus(line):
                 e = expr.strip().rstrip(",;")
-                if not e or e.startswith(("'", '"', "`")):
-                    continue                    # 字面量片段
-                if unsafe(e):
+                if not e or e.startswith("`"):
+                    continue                    # 模板字面量归形态 A
+                if _expr_is_unsafe(e):          # 完整字符串字面量在判定里放行
                     bad.add(e)
     assert not bad, (
         f"未转义就进 HTML（存储型 XSS，控制台里执行脚本能改权限）: "
         f"{sorted(bad)[:8]}")
 
 
+# HTML 写入点的形态表。**点访问与字符串计算属性都要覆盖**，赋值也不止 `=` / `+=`：
+# `el['innerHTML'] = x` 与 `el.innerHTML ||= x` 都是合法 JS、都是写入点，而且实测
+# semgrep 1.58.0 的 insecure-innerhtml / insecure-document-method **抓不到计算属性**
+# ⇒ 这两种形态既绕开本守卫、也绕开扫描器（Codex R1 复审的反例）。
+#
+# **不覆盖**（已知边界，别当成保证）：`Object.assign(el, {innerHTML: x})`、
+# `Reflect.set(el, 'innerHTML', x)`、变量中转的属性名（`const k='innerHTML'; el[k]=x`）。
+# 本文件刻意零外部依赖（见模块 docstring：要在单测里秒级无人值守），所以判据是文本
+# 形态而不是 JS AST；上面三种形态只能靠 review 与 `test_frontend_boot` 的运行期场景挡。
+#
+# **不剥字符串字面量**，于是 `log('el.innerHTML = a')` 这种串会被数成写入点（假红）。
+# 这是刻意选的方向：剥字符串要正确处理正则字面量（本文件的 `esc()` 里就有 `/[&<>"']/g`，
+# 里面同时有单双引号），配对一错位就把后面整段当成字符串清掉 ⇒ 计算属性那类绕过变成
+# **假绿**（第一版实测就是这样：单独判对、全文件判漏）。假红响、假绿静默，宁可假红。
+_HTML_PROP = r"(?:innerHTML|outerHTML)"
+_HTML_METHOD = r"(?:insertAdjacentHTML|setHTMLUnsafe)"
+_ASSIGN_OPS = r"(?:\|\||&&|\?\?|\+)?="
 _HTML_SINK_RE = re.compile(
-    r"\.(?:innerHTML|outerHTML)\s*(?:\+)?=(?!=)|\binsertAdjacentHTML\s*\(|\bdocument\.write(?:ln)?\s*\(")
+    # ① 属性写入：`.innerHTML =` / `['innerHTML'] =` / `… ||=` / `… +=`
+    rf"(?:\.\s*{_HTML_PROP}|\[\s*['\"]{_HTML_PROP}['\"]\s*\])\s*{_ASSIGN_OPS}(?!=)"
+    # ② HTML 专用方法：点访问或字符串计算属性
+    rf"|\.\s*{_HTML_METHOD}\s*\("
+    rf"|\[\s*['\"]{_HTML_METHOD}['\"]\s*\]\s*\("
+    # ③ document.write / writeln（含计算属性形态）
+    r"|\bdocument\s*\.\s*write(?:ln)?\s*\("
+    r"|\bdocument\s*\[\s*['\"]write(?:ln)?['\"]\s*\]\s*\(")
 
 
 def _html_sinks(code: str) -> list:
@@ -1095,11 +1377,240 @@ def test_html_is_written_only_through_sethtml():
 
 
 def test_html_sink_guard_counts_every_sink_form():
-    """元用例：每种写入形态都要被数到（否则上一条在新形态上空转）。"""
+    """元用例：每种写入形态都要被数到（否则上一条在新形态上空转）。
+
+    后六条是 Codex R1 复审构造出来的绕过形态：字符串计算属性与逻辑赋值都是合法 JS、
+    都能写 HTML，而**原版正则与 semgrep 的两条规则都抓不到**。
+    """
     for extra in ("x.innerHTML = a;", "x.innerHTML += a;", "x.outerHTML = a;",
-                  "x.insertAdjacentHTML('beforeend', a);", "document.write(a);"):
+                  "x.insertAdjacentHTML('beforeend', a);", "document.write(a);",
+                  "x['innerHTML'] = a;", 'x["outerHTML"] = a;',
+                  "x.innerHTML ||= a;", "x.innerHTML ??= a;", "x.innerHTML &&= a;",
+                  "x['insertAdjacentHTML']('beforeend', a);",
+                  "document['write'](a);", "x.setHTMLUnsafe(a);"):
         assert len(_html_sinks("el.innerHTML = html;\n" + extra)) == 2, extra
-    assert len(_html_sinks("if (x.innerHTML == y) {}")) == 0, "比较不是写入"
+    for benign in ("if (x.innerHTML == y) {}", "if (x.innerHTML === y) {}",
+                   "const v = x.innerHTML;", "const k = 'innerHTML';"):
+        assert len(_html_sinks(benign)) == 0, f"不是写入却被数到：{benign}"
+
+
+# setHTML 顶层实参里允许**整体调用**的函数：返回 HTML 模板的那几个。显式清单，不从
+# "文件里定义过的函数"推导——第一版那样推，于是 `function id(x){return x}` +
+# `setHTML(el, id(job.error))` 整条放过（Codex R2 的透传函数反例）。
+# 加新的模板函数要进这张表，那一刻就是 review 点（它替代的是抑制之前 semgrep 对每个
+# sink 报的那条 ERROR：一处新写入 = 一个必须有人看的信号）。
+_TEMPLATE_FUNCS = (
+    # 整页 / 整卡
+    "skeletonPage", "skeletonTable", "errorCard", "keysHeader", "keysUndeployedCard",
+    "keysCreateCard", "keysListCard", "dangerZone", "trendBody", "visitorTable",
+    # 内联模板里直接拼进来的片段
+    "siteStatusBadge", "deployHint", "neverLiveCallout",
+)
+_PREBUILT_HTML_NAMES = ("html", "out")
+_SETHTML_CALL_RE = re.compile(r"\bsetHTML\s*\(")
+_IDENT_RE = re.compile(r"[A-Za-z_$][\w$]*")
+_WHOLE_CALL_RE = re.compile(r"([A-Za-z_$][\w$]*)\s*\(")
+
+
+def _setHTML_args(code: str) -> list:
+    """每处 `setHTML(...)` 的实参原文（按引号/括号配平切，允许跨行）。定义本身不算。"""
+    calls = []
+    for m in _SETHTML_CALL_RE.finditer(code):
+        if code[max(0, m.start() - 9):m.start()] == "function ":
+            continue
+        close = _matching_close(code, m.end() - 1)
+        assert close > 0, f"setHTML( 之后找不到配对的 )：{code[m.start():m.start() + 60]!r}"
+        inner = code[m.end():close]
+        b = _blank_strings(inner)
+        depth, cut = 0, []
+        for i, c in enumerate(b):
+            if c in "([{":
+                depth += 1
+            elif c in ")]}":
+                depth -= 1
+            elif c == "," and depth == 0:
+                cut.append(i)
+        bounds = [0] + [i + 1 for i in cut] + [len(inner) + 1]
+        calls.append([inner[a:z - 1].strip() for a, z in zip(bounds, bounds[1:])])
+    return calls
+
+
+def _sethtml_arg_problems(arg: str) -> list:
+    """setHTML 第二实参的问题（空 = 合格）。
+
+    **顶层每一段**（按顶层 `+` 切）必须是下面之一：完整字符串字面量、`html` / `out`、
+    `_TEMPLATE_FUNCS` 或 `_ESCAPING_CALLS` 里函数的**整体**调用；其余的（括号、三元、带标签
+    的模板片段……）交给共用判定 `_expr_is_unsafe`。与逐行那条的区别：这里拿到的是**完整**
+    实参，不会因为模板写在一行里、整个被 `setHTML(` 的括号包住而切不开（Codex R2：单行
+    模板里夹一个裸字段，逐行那条看到的是一个带着 `esc(` 的大片段，于是放过）。
+    """
+    probs = []
+    for part in _split_top_level_plus(arg):
+        e = part.strip()
+        if not e or _STRING_LIT_RE.fullmatch(e) or e in _PREBUILT_HTML_NAMES:
+            continue
+        m = _WHOLE_CALL_RE.match(e)
+        if m and _matching_close(e, m.end() - 1) == len(e) - 1:
+            if m.group(1) not in _TEMPLATE_FUNCS + _ESCAPING_CALLS:
+                probs.append(f"顶层调用了不在模板白名单里的函数：{m.group(1)}()")
+            continue
+        if _IDENT_RE.fullmatch(e):
+            probs.append(f"顶层是裸变量（只许 html / out）：{e}")
+            continue
+        if _expr_is_unsafe(e):
+            probs.append(f"未转义：{e.replace(chr(10), ' ')[:70]}")
+    return probs
+
+
+def test_sethtml_arguments_are_templates_not_raw_values():
+    """`setHTML` 的第二实参不能是"别人给的裸值"。
+
+    **这一条是 setHTML 上那条行内抑制（`insecure-innerhtml` / `insecure-document-method`）
+    的前提之一**——Codex R1 复审证明：抑制之后 `setHTML(el, job.error)` 同时绕过 semgrep
+    的两条规则、"唯一写入点"那条与逐行 esc 那条。它是静态**预筛**（已知边界见
+    `_expr_is_unsafe`）；语义兜底是 test_frontend_boot 的污点场景。
+    """
+    calls = _setHTML_args(_js())
+    assert len(calls) >= 30, f"只找到 {len(calls)} 处 setHTML 调用——切分口径坏了，本条空转"
+    bad = []
+    for args in calls:
+        assert len(args) == 2, f"setHTML 的实参个数不是 2：{args[:1]}"
+        bad += _sethtml_arg_problems(args[1])
+    assert not bad, "setHTML 收到了未经模板/转义的值（存储型 XSS）：\n  " + "\n  ".join(bad)
+
+
+_PREBUILT_ASSIGN_RE = re.compile(r"(?<![\w$.])(?:(?:const|let|var)\s+)?(?:html|out)\s*\+?=(?!=)\s*")
+
+
+def _prebuilt_assignments(code: str) -> list:
+    """每一处对 `html` / `out` 的赋值（`=` 与 `+=`）的右侧表达式（到顶层 `;` 为止）。"""
+    b, out = _blank_strings(code), []
+    for m in _PREBUILT_ASSIGN_RE.finditer(b):
+        depth, i = 0, m.end()
+        while i < len(b):
+            c = b[i]
+            if c in "([{":
+                depth += 1
+            elif c in ")]}":
+                depth -= 1
+                if depth < 0:
+                    break
+            elif c == ";" and depth == 0:
+                break
+            i += 1
+        out.append(code[m.end():i])
+    return out
+
+
+def test_prebuilt_html_variables_are_only_assigned_escaped_values():
+    """`html` / `out` 在 setHTML 那条里按名字放行，所以**给它们赋的值**必须同样过判定。
+
+    Codex R2：`const html = job.error; setHTML(el, html);` 三条守卫全绿——变量名是被信任的，
+    而它的来源没人看。逐行那条也看不见（那一行没有标签）。"""
+    rhs = _prebuilt_assignments(_js())
+    assert len(rhs) >= 20, f"只找到 {len(rhs)} 处 html/out 赋值——提取口径坏了，本条空转"
+    bad = [r.replace("\n", " ")[:80] for r in rhs if _expr_is_unsafe(r)]
+    assert not bad, "html / out 被赋了未转义的值：\n  " + "\n  ".join(bad)
+
+
+def test_prebuilt_assignment_extraction_sees_the_bypass_form():
+    """元用例：R2 的那个反例必须被提取到、并被判成不安全。"""
+    code = "function f(el, job) {\n  const html = job.error;\n  setHTML(el, html);\n}\n"
+    rhs = _prebuilt_assignments(code)
+    assert rhs == ["job.error"], rhs
+    assert _expr_is_unsafe(rhs[0])
+    assert _prebuilt_assignments("x.html = 1; if (html === y) {}") == [], "属性写入与比较不算"
+
+
+def _sethtml_reference_problems(raw: str) -> list:
+    """注释外的每个 `setHTML` 标识符：要么是定义（`function setHTML(`），要么**紧跟** `(` 的直接调用。
+
+    其余一律违规：起别名（`const f = setHTML`）、当值传（`[setHTML][0](…)`、`setHTML.call(…)`）、
+    可选调用（`setHTML?.(…)`）。Codex R4：这些写法里的调用对"按位置对账覆盖面"那条完全不可见——
+    静态提取不认、运行期没执行就不出现，双向等值照样成立。`setHTML /*…*/ (` 在剥注释后就是
+    直接调用，由覆盖面那条在原文坐标上补提（test_frontend_boot 用 keep_layout 版本提取）。
+    """
+    code = _strip_js_comments(raw, keep_layout=True)
+    bad = []
+    for m in re.finditer(r"\bsetHTML\b", code):
+        before, after = code[max(0, m.start() - 9):m.start()], code[m.end():]
+        if before == "function " or re.match(r"\s*\(", after):
+            continue
+        line = code.count("\n", 0, m.start()) + 1
+        bad.append(f"L{line}: {code[max(0, m.start() - 20):m.end() + 20].strip()!r}")
+    return bad
+
+
+def test_sethtml_is_only_defined_or_called_directly():
+    raw = (FE / "app.js").read_text(encoding="utf-8")
+    assert "function setHTML(" in raw
+    bad = _sethtml_reference_problems(raw)
+    assert not bad, "setHTML 被当成值用 / 起别名 / 可选调用（覆盖面对账看不见它）：\n  " + "\n  ".join(bad)
+
+
+def test_sethtml_reference_policy_catches_the_r4_forms():
+    """元用例：R4 的三种未执行新增调用里，别名与可选调用必须被引用政策拒绝；直接调用、
+    `window.setHTML(`、注释与字符串里的提及不被误伤（后两种由覆盖面那条响亮处理）。"""
+    base = "function setHTML(el, html) { el.innerHTML = html; }\n"
+    for bad in ("function x(el, d) { const f = setHTML; f(el, d.name); }",
+                "function x(el, d) { setHTML?.(el, d.name); }",
+                "function x(el, d) { [setHTML][0](el, d.name); }",
+                "function x(el, d) { setHTML.call(null, el, d.name); }",
+                "window.setHTML = setHTML;"):
+        assert _sethtml_reference_problems(base + bad + "\n"), f"没拦住：{bad}"
+    for ok in ("function x(el) { setHTML(el, ''); }",
+               "function x(el) { setHTML\n  (el, ''); }",
+               "function x(el) { window.setHTML(el, ''); }",
+               "// 注释里提到 setHTML 不算\nfunction x() {}",
+               "/* 块注释里 setHTML 也不算 */ function x() {}"):
+        assert not _sethtml_reference_problems(base + ok + "\n"), f"误伤：{ok}"
+
+
+def test_sethtml_argument_checker_rejects_raw_values_and_accepts_templates():
+    """元用例：判据在裸值上必须红、在现有几种形态上必须绿。
+
+    前四条裸值是 Codex R2 构造的绕过（原版全放过）；后面是 R1 就有的。"""
+    for raw in ("'' || job.error",                       # 不完整的字面量开头
+                "esc(site.name) || job.error",           # 含 esc( 但不是整段
+                "id(job.error)",                         # 透传函数
+                "'<p>' + esc(site.name) + job.error + '</p>'",   # 单行模板夹裸字段
+                "job.error", "site.name", "err.message", "(job.error)",
+                "keysHeader() + job.error", "v", "`${job.error}`",
+                "'<td>' + when(site.created_at) + '</td>'",      # when 原样返回输入
+                "'<b>' + (x ? job.error : '') + '</b>'"):
+        assert _sethtml_arg_problems(raw), f"裸值没被拒：{raw}"
+    for ok in ("''", "html", "skeletonPage()", "errorCard('无法加载', err)",
+               "keysHeader() + skeletonTable(3, 6)",
+               "'<span>' + esc(site.name) + '</span>'",
+               "'<td>' + esc(when(site.created_at)) + '</td>'",
+               "'<b>' + (site.require_login ? '<i>是</i>' : '<i>否</i>') + '</b>'",
+               "'<p>' + draft.allowed_users.length + '</p>'",
+               "'<p>' + site.collaborators.map(esc).join(', ') + '</p>'",
+               "`<p>${esc(job.error)}</p>`"):
+        assert not _sethtml_arg_problems(ok), f"合法形态被误拒：{ok} → {_sethtml_arg_problems(ok)}"
+
+
+def test_template_whitelist_has_no_dead_or_passthrough_entries():
+    """白名单里的每个函数都必须真的被用到、真的存在、且**是模板**（函数体里有带标签的字面量）。
+
+    否则白名单会慢慢长出多余条目（放行了没人用的函数）、死条目（改名后永远不匹配）或
+    透传函数（进了白名单就等于把 `setHTML(el, f(job.error))` 整条放过）。"""
+    code = _js()
+    used = set()
+    for args in _setHTML_args(code):
+        for part in _split_top_level_plus(args[1]):
+            e = part.strip()
+            m = _WHOLE_CALL_RE.match(e)
+            if m and _matching_close(e, m.end() - 1) == len(e) - 1:
+                used.add(m.group(1))
+    unused = sorted(set(_TEMPLATE_FUNCS) - used)
+    assert not unused, f"白名单里这些函数没有在任何 setHTML 实参的顶层被整体调用（多余的放行）：{unused}"
+    for name in _TEMPLATE_FUNCS:
+        m = re.search(r"\bfunction\s+" + name + r"\s*\(", code)
+        assert m, f"白名单里的 {name} 在 app.js 里不存在（改名了？）"
+        brace = code.index("{", _matching_close(code, m.end() - 1))
+        body = code[brace:_matching_close(code, brace) + 1]
+        assert re.search(r"['\"][^'\"]*<\s*/?[a-zA-Z]", body), f"{name} 的函数体里没有 HTML 标签——它不是模板"
 
 
 def test_toast_and_modal_escape_their_text_arguments():

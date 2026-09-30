@@ -79,6 +79,17 @@ _CFG: configparser.ConfigParser | None = None
 # marker 落在响应对象的这个字段上。E2E 只按**随机串出现在响应体里**断言，不依赖
 # 字段名——所以改名不会悄悄让那些断言失效，但保留一个固定名字便于人工 curl 排查。
 MARKER_FIELD = "sb_marker"
+# 等终态的轮询节奏与**本地兜底上限**（见 main 末尾那段注释：远端的终态保证不在本进程里，
+# 裸 `while True` 会让 E2E / ensure_fixture_site 挂死而不是失败）。
+# 上限按**兜底路径的最坏收敛**算，不是按"正常要多久"：
+#   状态机上限 30 分钟（infra/app.py 的 DeploySM `timeout`）——job 最后一次被写可能就在这时；
+#   + sweeper 的超龄阈值 45 分钟（reconcile_job.STALE_MINUTES）——超过它才算陈旧；
+#   + sweeper 调度间隔 30 分钟（JobSweepRule 的 `rate`）——陈旧之后最多再等一轮才被扫到
+#   = 105 分钟，取 120。第一版写的是 60 分钟、理由是"> 45"，把阈值当成了收敛时间，
+#   漏了前后两段（Codex R2：最后进度在 t=20 时 t=60 仍未处理、t=90 才收敛）。
+#   三个数由 test_deploy_fixture_flags 从各自的真源读出来核对，任何一个变大这里就红。
+WAIT_POLL_S = 10
+WAIT_TIMEOUT_S = 120 * 60
 # marker 会被写进一个 JS 字符串字面量。带引号/空白/换行的值不是安全问题（值由跑
 # 测试的人给），而是**站点起不来**：真机上表现为莫名的 BackendUnhealthy，根因离
 # 症状隔了整条流水线。所以在这里就拒掉。
@@ -278,13 +289,28 @@ def main(fixture_dir: str, owner: str = "fixture@e2e.invalid", *,
 
     jobs = boto3.resource("dynamodb", region_name="us-east-1").Table(
         conf["Deployer"]["jobs_table"])
+    # **本地兜底上限**：第一版是裸 `while True`，只等终态。终态通常由 SFN 给、
+    # 异常时由 sweeper 在 ≤45 分钟内收敛，但那两者都在**远端**——它们没跑（栈没部、
+    # sweeper 被停、job 行被改坏）时这个循环永远不退，而本函数被 E2E 与
+    # `ensure_fixture_site` 在进程内调用 ⇒ 整套验收挂死，症状是"卡住"而不是失败。
+    # 上限见 WAIT_TIMEOUT_S 的注释（覆盖 sweeper 兜底路径的最坏收敛）。超时**只放弃
+    # 等待**，不取消远端执行（结果未知时不动状态是本仓库的既定处置），并把
+    # job_id / site_id 打出来供事后核查。
+    deadline = time.monotonic() + WAIT_TIMEOUT_S
     while True:
         job = jobs.get_item(Key={"job_id": job_id})["Item"]
         print(f"  [{job['status']}] {job['phase']}")
         if job["status"] in ("SUCCEEDED", "FAILED"):
             print(json.dumps(job, indent=2, ensure_ascii=False, default=str))
             sys.exit(0 if job["status"] == "SUCCEEDED" else 1)
-        time.sleep(10)  # nosemgrep: arbitrary-sleep —— 轮询间隔（循环有截止条件）
+        if time.monotonic() >= deadline:
+            print(f"  ⚠️  等了 {WAIT_TIMEOUT_S // 60} 分钟仍未到终态（末次 "
+                  f"{job['status']}/{job['phase']}）：**放弃等待，不取消远端执行**。"
+                  f"job_id={job_id} site_id={site_id} —— 自己去 jobs 表与 SFN 执行"
+                  f"历史里核查（sweeper 是最后一道兜底，它若也没收敛说明远端本身有问题）。",
+                  file=sys.stderr)
+            sys.exit(2)
+        time.sleep(WAIT_POLL_S)  # nosemgrep: arbitrary-sleep —— 轮询间隔（上面那个 deadline 是循环的截止条件）
 
 
 def cli(argv=None) -> None:

@@ -742,7 +742,24 @@ def route_api_target(site_id: str) -> str:
     return item.get("api_target", {}).get("S", "")
 
 
+# **fullmatch**，不是 `match` + `$`：`$` 在尾部换行之前也算匹配（`"x\n"` 会被放过）。
+_DSQL_SAFE_SITE_ID = re.compile(r"[a-z0-9][a-z0-9-]*")
+
+
 def dsql_schema_for(site_id: str) -> str:
+    """per-site schema 名。**这是 DSQL 里全部裸 SQL 标识符的唯一来源。**
+
+    这里**自己校验字符集**，而不是假定调用方已经校验过。`provision_dsql` / `undeploy`
+    里那些 `nosemgrep: sqlalchemy-execute-raw-query` 的理由写的是"标识符来自已校验的
+    site_id"——原先那句话靠的是"只有 MCP 会建站，而它有 `SITE_ID_RE.fullmatch`"，
+    可 `dsql_schema_for` 本身不挡任何值，`scripts/deploy_fixture.py --site-id` 那条路
+    也不过 MCP 的正则（Codex R1 复审点出这个缺口，但没把它算成已证明可达的注入）。
+    在唯一定义点上把前提变成**强制**，抑制的理由才是自洽的：DDL 与 `AWS IAM
+    GRANT/REVOKE` 不能参数化，所以字符集就是这里唯一的防线。
+    """
+    if not isinstance(site_id, str) or not _DSQL_SAFE_SITE_ID.fullmatch(site_id):
+        raise ValueError(
+            f"site_id 不能用作 SQL 标识符（只许小写字母、数字、连字符）：{site_id!r}")
     return "site_" + site_id.replace("-", "")
 
 

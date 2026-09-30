@@ -47,6 +47,26 @@ def test_id_helpers():
     assert common.dsql_schema_for("x-1a2b3c") == "site_x1a2b3c"
 
 
+def test_dsql_schema_for_rejects_identifiers_that_would_break_out_of_raw_sql():
+    """`dsql_schema_for` 是 DSQL 全部裸 SQL 标识符的唯一来源，必须自己挡字符集。
+
+    provision_dsql / undeploy 里那几条 `nosemgrep: sqlalchemy-execute-raw-query` 的理由是
+    "标识符来自已校验的 site_id"。那句话原先只在"经 MCP 建站"这条路上成立：
+    `scripts/deploy_fixture.py --site-id` 直接起状态机、不过 MCP 的 `SITE_ID_RE`。
+    DDL 与 `AWS IAM GRANT/REVOKE` 不能参数化 ⇒ 这里就是唯一防线。
+    """
+    import pytest
+    for bad in ('x"; DROP SCHEMA public CASCADE; --', "x'y", "x y", "x;y", "X-UPPER",
+                "x$y", "-leading", "", None, 'a"b',
+                # 尾换行：`re.match(r"^…$")` 会放过它（`$` 在末尾 `\n` 之前也匹配）
+                "demo-abc123\n", "demo\nabc", 123):
+        with pytest.raises(ValueError):
+            common.dsql_schema_for(bad)
+    # 正对照：真实形态的 site_id 照旧
+    assert common.dsql_schema_for("demo-abc123") == "site_demoabc123"
+    assert common.dsql_schema_for("a1") == "site_a1"
+
+
 def test_site_name_rejects_sql_and_resource_name_hazards():
     """site_name 会成为 DSQL 标识符与 IAM/Lambda 资源名，必须在入口拦下。"""
     import pytest
