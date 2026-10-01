@@ -818,7 +818,7 @@ def test_the_fixture_flag_is_read_through_deploy_auths_own_parser():
 # 所以本轮里两处必须读同一个版本，而不是各定位一次。顺带去掉了那个预签名 URL 的第二次下载
 # （实测会 RemoteDisconnected）。
 
-def test_the_edge_source_is_downloaded_once_per_run(monkeypatch):
+def test_the_edge_source_is_downloaded_once_per_run(monkeypatch, tmp_path):
     """缓存命中时直接返回，**一个 AWS 调用都不发**；缓存为空时同样的替身会炸（负向控制）。
 
     替身是个假 `boto3` 模块，`client()` 直接抛。两个方向都跑：
@@ -839,6 +839,12 @@ def test_the_edge_source_is_downloaded_once_per_run(monkeypatch):
     assert g._edge_deployed_source() == "SENTINEL-SOURCE"
 
     g._edge_source_cache = None
+    # 负向控制不能依赖 gitignored 的 router/config.ini：新 clone 里没有它，`_parsed_cfg` 会先抛
+    # RuntimeError，这一半测到的就成了"读不到配置"而不是"替身承重"。给一份最小配置，让执行走到 boto3。
+    cfg = tmp_path / "router-config.ini"
+    cfg.write_text("[CDK]\nstack_name = S\n[LambdaEdge]\norigin_request_function_name = F\n",
+                   encoding="utf-8")
+    monkeypatch.setattr(g, "ROUTER_CFG_PATH", cfg)
     with pytest.raises(AssertionError, match="缓存命中时不该"):
         g._edge_deployed_source()
 
